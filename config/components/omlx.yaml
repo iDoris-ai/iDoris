@@ -1,0 +1,16 @@
+provider:
+  id: omlx
+  family: local
+  tier: local
+  capabilities: [chat, embedding]
+  privacy_class: local_only
+  cost: { input_per_m: 0, output_per_m: 0 }
+  locality: loopback
+form: http_service
+endpoint: "http://127.0.0.1:8088"
+version_pin: "omlx@0.6.4"
+privacy_class: local_only
+allowed_egress: [loopback]
+fallback_policy: fail_closed
+fail_closed: true
+load_policy: { mode: on_demand, keepalive: { idle_ttl_s: 300 }, admission: requires_eviction }

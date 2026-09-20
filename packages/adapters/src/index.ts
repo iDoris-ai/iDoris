@@ -10,3 +10,4 @@ export type {
 } from "./backend.js";
 export { detectBackend, currentHostFacts } from "./detect.js";
 export type { BackendChoice, BackendKind, HostArch, HostFacts, HostPlatform } from "./detect.js";
+export { createBackend } from "./factory.js";

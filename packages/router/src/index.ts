@@ -1,5 +1,5 @@
-/**
- * @idoris/router — iDoris Router 进程（T1.3.1 起）。
- * T1.1.1 只建骨架。
- */
-export {};
+export { HealthTracker, FAILURE_THRESHOLD, COOLDOWN_MS } from "./health.js";
+export { loadComponents } from "./registry.js";
+export type { Registered } from "./registry.js";
+export { startRouter } from "./server.js";
+export type { Router, RouterOptions } from "./server.js";
