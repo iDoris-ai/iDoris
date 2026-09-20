@@ -1,11 +1,18 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
+import type { RoutingPolicy } from "@idoris/contracts";
+import { dispatch, type EgressCounter } from "./dispatch.js";
 import { HealthTracker } from "./health.js";
+import { decide, loadRoutingPolicy } from "./policy.js";
+import { parseProfile, ProfileError } from "./profile.js";
+import { ChatProxy } from "./proxy.js";
 import { loadComponents, type Registered } from "./registry.js";
 
 export interface RouterOptions {
   componentsDir: string;
+  routingPolicyPath?: string;
   port?: number;
   health?: HealthTracker;
+  proxy?: ChatProxy;
 }
 
 export interface Router {
@@ -28,8 +35,11 @@ function json(res: ServerResponse, status: number, body: unknown): void {
 export async function startRouter(opts: RouterOptions): Promise<Router> {
   const registered = loadComponents(opts.componentsDir);
   const health = opts.health ?? new HealthTracker();
+  const policy = opts.routingPolicyPath === undefined ? undefined : loadRoutingPolicy(opts.routingPolicyPath);
+  const proxy = opts.proxy ?? new ChatProxy();
+  const egress: EgressCounter = { count: 0 };
   const server = createServer((req, res) => {
-    void handle(req, res, registered, health);
+    void handle(req, res, registered, health, policy, proxy, egress);
   });
   await new Promise<void>((resolve, reject) => {
     server.once("error", reject);
@@ -47,11 +57,23 @@ export async function startRouter(opts: RouterOptions): Promise<Router> {
   };
 }
 
+function readBody(req: IncomingMessage): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    req.on("data", (c: Buffer) => chunks.push(c));
+    req.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
+    req.on("error", reject);
+  });
+}
+
 async function handle(
   req: IncomingMessage,
   res: ServerResponse,
   registered: Registered[],
   health: HealthTracker,
+  policy: RoutingPolicy | undefined,
+  proxy: ChatProxy,
+  egress: EgressCounter,
 ): Promise<void> {
   if (req.method === "GET" && req.url === "/health") {
     json(res, 200, { status: "ok", components: registered.length });
@@ -72,5 +94,83 @@ async function handle(
     json(res, 200, { object: "list", data });
     return;
   }
+  if (req.method === "POST" && req.url === "/v1/chat/completions") {
+    await handleChat(req, res, registered, policy, proxy, egress);
+    return;
+  }
   json(res, 404, { error: { type: "not_found" } });
+}
+
+async function handleChat(
+  req: IncomingMessage,
+  res: ServerResponse,
+  registered: Registered[],
+  policy: RoutingPolicy | undefined,
+  proxy: ChatProxy,
+  egress: EgressCounter,
+): Promise<void> {
+  let body: Record<string, unknown>;
+  try {
+    body = JSON.parse((await readBody(req)) || "{}") as Record<string, unknown>;
+  } catch {
+    json(res, 400, { error: { type: "invalid_json" } });
+    return;
+  }
+  if (policy === undefined) {
+    json(res, 503, { error: { type: "policy_unconfigured" } });
+    return;
+  }
+  let profile;
+  try {
+    profile = parseProfile(req.headers).profile;
+  } catch (err) {
+    if (err instanceof ProfileError) {
+      json(res, err.status, { error: { type: err.code, message: err.message } });
+      return;
+    }
+    throw err;
+  }
+  const outcome = dispatch(profile, decide(policy, profile), registered, egress);
+  if (outcome.status !== 200 || outcome.providerId === undefined) {
+    json(res, outcome.status, outcome.body);
+    return;
+  }
+  const target = registered.find((r) => r.card.provider.id === outcome.providerId);
+  if (!target) {
+    json(res, 503, { error: { type: "no_candidate" } });
+    return;
+  }
+
+  const controller = new AbortController();
+  req.on("close", () => controller.abort());
+  const requestId = req.headers["x-idoris-request-id"];
+  const result = await proxy.forward(
+    target.card.endpoint,
+    undefined,
+    body,
+    {
+      stream: body.stream === true,
+      ...(typeof requestId === "string" ? { requestId } : {}),
+      signal: controller.signal,
+    },
+  );
+
+  if (result.stream !== null) {
+    res.writeHead(result.status, { "content-type": "text/event-stream" });
+    const reader = result.stream.getReader();
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (value !== undefined) res.write(Buffer.from(value));
+      }
+    } catch {
+      // 客户端断开：reader.read 抛错或 controller 已 abort
+    } finally {
+      res.end();
+    }
+    return;
+  }
+  res.writeHead(result.status, { "content-type": "application/json" });
+  res.end(result.text);
 }
