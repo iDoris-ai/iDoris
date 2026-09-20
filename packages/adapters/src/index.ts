@@ -8,3 +8,5 @@ export type {
   ModelInfo,
   Pressure,
 } from "./backend.js";
+export { detectBackend, currentHostFacts } from "./detect.js";
+export type { BackendChoice, BackendKind, HostArch, HostFacts, HostPlatform } from "./detect.js";
