@@ -9,3 +9,5 @@ export { startRouter } from "./server.js";
 export type { Router, RouterOptions } from "./server.js";
 export { dispatch, isLocalCapable } from "./dispatch.js";
 export type { DispatchOutcome, EgressCounter } from "./dispatch.js";
+export { decisionReason, requireReason, reasonHeader, MissingReasonError, REASON_KINDS } from "./reason.js";
+export type { DecisionReason, ReasonKind } from "./reason.js";
