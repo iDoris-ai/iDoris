@@ -11,3 +11,5 @@ export type {
 export { detectBackend, currentHostFacts } from "./detect.js";
 export type { BackendChoice, BackendKind, HostArch, HostFacts, HostPlatform } from "./detect.js";
 export { createBackend } from "./factory.js";
+export { MockBackend } from "../mock/mock-backend.js";
+export { OmlxBackend } from "../omlx/omlx-backend.js";
