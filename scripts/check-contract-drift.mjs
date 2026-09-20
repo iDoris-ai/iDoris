@@ -13,7 +13,8 @@ const tmp = mkdtempSync(join(tmpdir(), "idoris-contracts-"));
 try {
   generateInto(tmp);
   let drift = false;
-  const committed = readdirSync(committedDir).filter((f) => f.endsWith(".ts"));
+  const isSource = (f) => f.endsWith(".ts") && !f.endsWith(".d.ts") && !f.endsWith(".d.ts.map");
+  const committed = readdirSync(committedDir).filter(isSource);
   for (const f of committed) {
     const a = readFileSync(join(committedDir, f), "utf8");
     const b = existsSync(join(tmp, f)) ? readFileSync(join(tmp, f), "utf8") : "";
@@ -23,7 +24,7 @@ try {
     }
   }
   for (const f of readdirSync(tmp)) {
-    if (f.endsWith(".ts") && !committed.includes(f)) {
+    if (isSource(f) && !committed.includes(f)) {
       console.error("MISSING committed generated file: " + f);
       drift = true;
     }
