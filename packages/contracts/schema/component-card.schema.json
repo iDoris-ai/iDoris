@@ -65,6 +65,10 @@
     },
     "load_policy": {
       "$ref": "load-policy.schema.json"
+    },
+    "extensions": {
+      "type": "object",
+      "additionalProperties": true
     }
   }
 }

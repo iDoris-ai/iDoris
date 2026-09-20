@@ -80,6 +80,10 @@
         "lan",
         "remote"
       ]
+    },
+    "extensions": {
+      "type": "object",
+      "additionalProperties": true
     }
   }
 }

@@ -71,9 +71,11 @@
               "then": {
                 "type": "object",
                 "additionalProperties": false,
+                "minProperties": 1,
                 "properties": {
                   "tiers": {
                     "type": "array",
+                    "minItems": 1,
                     "items": {
                       "enum": [
                         "local",
@@ -112,9 +114,11 @@
         "default": {
           "type": "object",
           "additionalProperties": false,
+          "minProperties": 1,
           "properties": {
             "tiers": {
               "type": "array",
+              "minItems": 1,
               "items": {
                 "enum": [
                   "local",

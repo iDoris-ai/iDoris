@@ -20,6 +20,18 @@ describe("RoutingPolicy", () => {
     const res = routingPolicySchema.safeParse({ routing_policy: { version: 1, rules: [] } });
     expect(res.success).toBe(false);
   });
+  it("rejects an empty default strategy", () => {
+    const bad = { routing_policy: { version: 1, rules: [], default: {} } };
+    expect(routingPolicySchema.safeParse(bad).success).toBe(false);
+  });
+  it("rejects an empty then", () => {
+    const bad = { routing_policy: { version: 1, rules: [{ if: {}, then: {} }], default: { tiers: ["local"] } } };
+    expect(routingPolicySchema.safeParse(bad).success).toBe(false);
+  });
+  it("rejects an empty tiers list", () => {
+    const bad = { routing_policy: { version: 1, rules: [], default: { tiers: [] } } };
+    expect(routingPolicySchema.safeParse(bad).success).toBe(false);
+  });
   it("rejects an unknown tier in a rule", () => {
     const bad = { routing_policy: { ...valid.routing_policy, rules: [{ if: {}, then: { tiers: ["local", "cloud"] } }] } };
     expect(routingPolicySchema.safeParse(bad).success).toBe(false);

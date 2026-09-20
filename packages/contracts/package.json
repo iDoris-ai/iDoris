@@ -14,8 +14,8 @@
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "vitest run --passWithNoTests",
-    "test:contract": "vitest run --passWithNoTests"
+    "test": "vitest run",
+    "test:contract": "vitest run"
   },
   "dependencies": {
     "zod": "^4.6.5"
