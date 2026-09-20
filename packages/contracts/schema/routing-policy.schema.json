@@ -1,0 +1,153 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://idoris.ai/schema/routing-policy.schema.json",
+  "title": "RoutingPolicy",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "routing_policy"
+  ],
+  "properties": {
+    "routing_policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "version",
+        "rules",
+        "default"
+      ],
+      "properties": {
+        "version": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "rules": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "if",
+              "then"
+            ],
+            "properties": {
+              "if": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "privacy": {
+                    "enum": [
+                      "local_only",
+                      "any"
+                    ]
+                  },
+                  "intent": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "complexity": {
+                    "enum": [
+                      "simple",
+                      "complex"
+                    ]
+                  },
+                  "capabilities": {
+                    "type": "array",
+                    "items": {
+                      "enum": [
+                        "chat",
+                        "reasoning",
+                        "vision",
+                        "asr",
+                        "tts",
+                        "coding",
+                        "embedding",
+                        "rerank"
+                      ]
+                    }
+                  }
+                }
+              },
+              "then": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "tiers": {
+                    "type": "array",
+                    "items": {
+                      "enum": [
+                        "local",
+                        "remote",
+                        "lora"
+                      ]
+                    }
+                  },
+                  "fail_closed": {
+                    "type": "boolean"
+                  },
+                  "capability": {
+                    "enum": [
+                      "chat",
+                      "reasoning",
+                      "vision",
+                      "asr",
+                      "tts",
+                      "coding",
+                      "embedding",
+                      "rerank"
+                    ]
+                  },
+                  "load": {
+                    "enum": [
+                      "resident",
+                      "on_demand",
+                      "evict_to_load"
+                    ]
+                  }
+                }
+              }
+            }
+          }
+        },
+        "default": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "tiers": {
+              "type": "array",
+              "items": {
+                "enum": [
+                  "local",
+                  "remote",
+                  "lora"
+                ]
+              }
+            },
+            "fail_closed": {
+              "type": "boolean"
+            },
+            "capability": {
+              "enum": [
+                "chat",
+                "reasoning",
+                "vision",
+                "asr",
+                "tts",
+                "coding",
+                "embedding",
+                "rerank"
+              ]
+            },
+            "load": {
+              "enum": [
+                "resident",
+                "on_demand",
+                "evict_to_load"
+              ]
+            }
+          }
+        }
+      }
+    }
+  }
+}

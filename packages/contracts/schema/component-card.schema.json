@@ -1,0 +1,70 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://idoris.ai/schema/component-card.schema.json",
+  "title": "ComponentCard",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "provider",
+    "form",
+    "endpoint",
+    "version_pin",
+    "privacy_class",
+    "allowed_egress",
+    "fallback_policy",
+    "fail_closed"
+  ],
+  "properties": {
+    "provider": {
+      "$ref": "provider.schema.json"
+    },
+    "form": {
+      "enum": [
+        "http_service",
+        "spawn_cli",
+        "bundled_binary",
+        "nostr_node",
+        "mitm_proxy",
+        "batch_job"
+      ]
+    },
+    "endpoint": {
+      "type": "string",
+      "minLength": 1
+    },
+    "version_pin": {
+      "type": "string",
+      "minLength": 1
+    },
+    "privacy_class": {
+      "enum": [
+        "local_only",
+        "any"
+      ]
+    },
+    "allowed_egress": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "enum": [
+          "none",
+          "loopback",
+          "lan",
+          "internet"
+        ]
+      }
+    },
+    "fallback_policy": {
+      "enum": [
+        "fail_closed",
+        "next_in_chain"
+      ]
+    },
+    "fail_closed": {
+      "type": "boolean"
+    },
+    "load_policy": {
+      "$ref": "load-policy.schema.json"
+    }
+  }
+}

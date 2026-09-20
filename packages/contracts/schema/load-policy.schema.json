@@ -1,0 +1,56 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://idoris.ai/schema/load-policy.schema.json",
+  "title": "LoadPolicy",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "mode",
+    "keepalive",
+    "admission"
+  ],
+  "properties": {
+    "mode": {
+      "enum": [
+        "resident",
+        "on_demand",
+        "evict_to_load"
+      ]
+    },
+    "keepalive": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "pinned"
+          ],
+          "properties": {
+            "pinned": {
+              "type": "boolean"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "idle_ttl_s"
+          ],
+          "properties": {
+            "idle_ttl_s": {
+              "type": "integer",
+              "minimum": 1
+            }
+          }
+        }
+      ]
+    },
+    "admission": {
+      "enum": [
+        "coexist",
+        "requires_eviction"
+      ]
+    }
+  }
+}

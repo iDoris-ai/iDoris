@@ -1,38 +1,7 @@
-import { z } from "zod";
-import { loadModeSchema } from "./load-policy.js";
-import { capabilitySchema, privacyClassSchema, tierSchema } from "./provider.js";
+// 手写薄封装：把 JSON Schema 生成的 zod 再导出，并派生 TS 类型。
+// 真源：packages/contracts/schema/routing-policy.schema.json；产物：src/generated/routing-policy.ts。
+import type { z } from "zod";
+import { routingPolicySchema } from "./generated/routing-policy.js";
 
-const conditionSchema = z
-  .object({
-    privacy: privacyClassSchema.optional(),
-    intent: z.string().min(1).optional(),
-    complexity: z.enum(["simple", "complex"]).optional(),
-    capabilities: z.array(capabilitySchema).optional(),
-  })
-  .strict();
-
-const thenSchema = z
-  .object({
-    tiers: z.array(tierSchema).optional(),
-    fail_closed: z.boolean().optional(),
-    capability: capabilitySchema.optional(),
-    load: loadModeSchema.optional(),
-  })
-  .strict();
-
-export const routingRuleSchema = z.object({ if: conditionSchema, then: thenSchema }).strict();
-
-/** RoutingPolicy：声明式、版本化；规则按序匹配、首条命中即用；default 必填（spec.md）。 */
-export const routingPolicySchema = z
-  .object({
-    routing_policy: z
-      .object({
-        version: z.number().int().positive(),
-        rules: z.array(routingRuleSchema),
-        default: thenSchema,
-      })
-      .strict(),
-  })
-  .strict();
-
+export { routingPolicySchema };
 export type RoutingPolicy = z.infer<typeof routingPolicySchema>;
