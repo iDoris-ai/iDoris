@@ -15,7 +15,8 @@
     "check:contract-drift": "node scripts/check-contract-drift.mjs",
     "test:golden": "pnpm --filter @idoris/adapters test:golden",
     "smoke": "pnpm build && node scripts/smoke.mjs",
-    "test:privacy": "pnpm --filter @idoris/router test tests/privacy.test.ts"
+    "test:privacy": "pnpm --filter @idoris/router test tests/privacy.test.ts",
+    "test:tenancy": "pnpm --filter @idoris/tenancy test"
   },
   "devDependencies": {
     "@eslint/js": "^9.14.0",
