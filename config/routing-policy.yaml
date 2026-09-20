@@ -1,0 +1,10 @@
+routing_policy:
+  version: 1
+  rules:
+    - if: { privacy: local_only }
+      then: { tiers: [local, lora], fail_closed: true }
+    - if: { intent: banner }
+      then: { capability: vision, load: on_demand }
+    - if: { complexity: complex }
+      then: { tiers: [local, remote] }
+  default: { tiers: [local], fail_closed: true }
