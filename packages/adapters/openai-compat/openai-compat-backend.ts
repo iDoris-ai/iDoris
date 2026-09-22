@@ -1,3 +1,4 @@
+import type { LoadPolicy } from "@idoris/contracts";
 import type {
   Admission,
   BackendStatus,
@@ -7,10 +8,10 @@ import type {
   ModelInfo,
 } from "../src/backend.js";
 
+/** 只声明真正被用到的成员，测试桩不必实现无关方法。 */
 export interface FetchResponseLike {
   status: number;
   ok: boolean;
-  text(): Promise<string>;
   json(): Promise<unknown>;
 }
 export type FetchLike = (
@@ -19,6 +20,7 @@ export type FetchLike = (
 ) => Promise<FetchResponseLike>;
 
 export interface OpenAiCompatOptions {
+  /** 上游 origin，例如 https://api.openai.com —— 不要带 /v1，本类自己拼 /v1/...。 */
   baseUrl: string;
   apiKey?: string;
   fetchImpl?: FetchLike;
@@ -26,7 +28,11 @@ export interface OpenAiCompatOptions {
 
 /**
  * 通用 OpenAI-compat 上游槽位（T2.5.1）。只证明外部槽位可接，不做选型。
- * 外部 API 没有显式 load/unload：load/unload 为 no-op；status 反映远端可用。
+ *
+ * - 外部 API 无常驻概念：load/unload 为 no-op，admission 恒为 coexist。
+ * - status() 返回静态的「无本地压力」占位值，**不探测上游健康**；上游不可用时
+ *   由 list()/chat() 抛错暴露（本仓状态机不依赖外部 provider 的 status）。
+ * - list() 的 memoryGb 恒为 0：不占用本地内存，不参与驱逐。
  */
 export class OpenAiCompatBackend implements ModelBackend {
   private readonly baseUrl: string;
@@ -36,7 +42,10 @@ export class OpenAiCompatBackend implements ModelBackend {
   constructor(opts: OpenAiCompatOptions) {
     this.baseUrl = opts.baseUrl.replace(/\/$/, "");
     this.apiKey = opts.apiKey;
-    this.fetchImpl = opts.fetchImpl ?? ((globalThis as unknown as { fetch: FetchLike }).fetch);
+    const globalFetch = (globalThis as unknown as { fetch?: FetchLike }).fetch;
+    const impl = opts.fetchImpl ?? globalFetch;
+    if (impl === undefined) throw new Error("OpenAiCompatBackend: no fetch available; pass fetchImpl");
+    this.fetchImpl = impl;
   }
 
   async list(): Promise<ModelInfo[]> {
@@ -46,15 +55,15 @@ export class OpenAiCompatBackend implements ModelBackend {
       .map((m) => ({ id: m.id, memoryGb: 0 }));
   }
 
-  async load(): Promise<void> {
+  async load(_id: string, _policy?: LoadPolicy): Promise<void> {
     /* 外部 API 无常驻概念 */
   }
 
-  async unload(): Promise<void> {
+  async unload(_id: string): Promise<void> {
     /* no-op */
   }
 
-  async admission(): Promise<Admission> {
+  async admission(_id: string): Promise<Admission> {
     return "coexist";
   }
 
@@ -63,17 +72,24 @@ export class OpenAiCompatBackend implements ModelBackend {
   }
 
   async chat(req: ChatRequest): Promise<ChatResponse> {
-    const body = (await this.json("POST", "/chat/completions", { model: req.model, messages: req.messages })) as {
-      choices?: Array<{ message?: { content?: string } }>;
-    };
+    const body = (await this.json(
+      "POST",
+      "/chat/completions",
+      { model: req.model, messages: req.messages },
+      req.signal,
+    )) as { choices?: Array<{ message?: { content?: string } }> };
     return { model: req.model, content: body.choices?.[0]?.message?.content ?? "" };
   }
 
-  private async json(method: string, path: string, payload?: unknown): Promise<unknown> {
+  private async json(method: string, path: string, payload?: unknown, signal?: AbortSignal): Promise<unknown> {
     const headers: Record<string, string> = { "content-type": "application/json" };
     if (this.apiKey !== undefined) headers.authorization = "Bearer " + this.apiKey;
-    const init: { method: string; headers: Record<string, string>; body?: string } = { method, headers };
+    const init: { method: string; headers: Record<string, string>; body?: string; signal?: AbortSignal } = {
+      method,
+      headers,
+    };
     if (payload !== undefined) init.body = JSON.stringify(payload);
+    if (signal !== undefined) init.signal = signal;
     const res = await this.fetchImpl(this.baseUrl + "/v1" + path, init);
     if (!res.ok) throw new Error("openai-compat upstream " + method + " " + path + " failed: HTTP " + res.status);
     return res.json();

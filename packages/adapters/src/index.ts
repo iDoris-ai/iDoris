@@ -15,5 +15,4 @@ export { MockBackend } from "../mock/mock-backend.js";
 export { OmlxBackend } from "../omlx/omlx-backend.js";
 // T1.4.1 订阅中转（能力①，fail-closed）
 export * from "../subscription/index.js";
-export { OpenAiCompatBackend } from "../openai-compat/openai-compat-backend.js";
-export type { OpenAiCompatOptions } from "../openai-compat/openai-compat-backend.js";
+export * from "../openai-compat/index.js";
