@@ -3,12 +3,26 @@ export { parseProfile, currentDeployMode, ProfileError } from "./profile.js";
 export type { HeaderBag, ProfileParseResult } from "./profile.js";
 export { decide, loadRoutingPolicy } from "./policy.js";
 export type { RouteDecision } from "./policy.js";
-export { loadComponents } from "./registry.js";
-export type { Registered } from "./registry.js";
+export { loadComponents, ComponentRegistrationError } from "./registry.js";
+export type { LoadComponentsOptions, Registered } from "./registry.js";
 export { startRouter } from "./server.js";
 export type { Router, RouterOptions } from "./server.js";
 export { dispatch, isLocalCapable } from "./dispatch.js";
 export type { DispatchOutcome, EgressCounter } from "./dispatch.js";
+export {
+  EgressGuardError,
+  assertSubscriptionSource,
+  isAllowedSubscriptionSource,
+  isLoopbackAddress,
+  isNonPersonalDeployMode,
+  isTailscaleAddress,
+  subscriptionStartupGate,
+} from "./egress-guard.js";
+export type {
+  EgressGuardErrorCode,
+  SubscriptionStartupAction,
+  SubscriptionStartupDecision,
+} from "./egress-guard.js";
 export { decisionReason, requireReason, reasonHeader, MissingReasonError, REASON_KINDS } from "./reason.js";
 export type { DecisionReason, ReasonKind } from "./reason.js";
 export { ChatProxy } from "./proxy.js";

@@ -9,7 +9,7 @@
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
-    "test:integration": "vitest run tests/integration",
+    "test:integration": "IDORIS_SUBSCRIPTION_INTEGRATION=1 vitest run tests/integration",
     "test:golden": "vitest run tests/golden"
   },
   "dependencies": {
@@ -26,6 +26,10 @@
     "./mock": {
       "types": "./dist/mock/index.d.ts",
       "import": "./dist/mock/index.js"
+    },
+    "./subscription": {
+      "types": "./dist/subscription/index.d.ts",
+      "import": "./dist/subscription/index.js"
     }
   }
 }

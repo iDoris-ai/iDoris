@@ -1,0 +1,28 @@
+# T1.4.2 能力①：订阅中转组件卡（个人模式，best-effort）
+#
+# 安全语义（不要照抄到多租户部署）：
+#  - provider.tier=remote + privacy_class=any ⇒ 永不被 local_only 请求选中，
+#    也永不出现在 routing-policy 的 default 链（default 只有 local）。
+#  - allowed_egress 固定 [loopback]：订阅请求的来源必须是 loopback。
+#  - 真正注册还需 deploy_mode=personal 且显式 IDORIS_ENABLE_SUBSCRIPTION=1
+#    + IDORIS_SUBSCRIPTION_SANDBOX；否则 registry 跳过或拒绝启动。
+provider:
+  id: subscription
+  family: other
+  tier: remote
+  capabilities: [chat, reasoning, coding]
+  privacy_class: any
+  cost: { input_per_m: 0, output_per_m: 0 }
+  locality: loopback
+form: spawn_cli
+endpoint: "spawn://subscription"
+version_pin: "subscription-relay@0.1.0"
+privacy_class: any
+allowed_egress: [loopback]
+fallback_policy: next_in_chain
+fail_closed: false
+extensions:
+  _degradation: "订阅中转不可用时降级到本地模型或已配置的外部 API 槽位；不使用 CLI 的任何原生特性"
+  subscription:
+    sandbox_profile: "idoris-subscription-no-tools-readonly-v1"
+    default_cli: claude

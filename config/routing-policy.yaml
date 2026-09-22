@@ -7,4 +7,6 @@ routing_policy:
       then: { capability: vision, load: on_demand }
     - if: { complexity: complex }
       then: { tiers: [local, remote] }
+  # 能力①（订阅中转）是 best-effort：default 链只有 local，订阅 provider（tier=remote）
+  # 绝不作为默认回退出现，禁用订阅后所有非订阅场景必须仍然全绿（T1.4.3）。
   default: { tiers: [local], fail_closed: true }

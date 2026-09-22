@@ -27,6 +27,8 @@ export interface ChatMessage {
 export interface ChatRequest {
   model: string;
   messages: ChatMessage[];
+  /** 可选取消信号：spawn 型后端据此杀掉整个进程组。 */
+  signal?: AbortSignal;
 }
 
 export interface ChatResponse {
