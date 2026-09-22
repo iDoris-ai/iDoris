@@ -4,7 +4,7 @@ import {
   openAIChatCompletion,
   type ChatMessage,
 } from "@idoris/adapters";
-import type { RoutingPolicy } from "@idoris/contracts";
+import type { RoutingPolicy, TaskProfile } from "@idoris/contracts";
 import {
   DefaultCapabilitiesProvider,
   type CapabilitiesProvider,
@@ -13,7 +13,8 @@ import { dispatch, type EgressCounter } from "./dispatch.js";
 import { assertSubscriptionSource, EgressGuardError } from "./egress-guard.js";
 import { HealthTracker } from "./health.js";
 import { decide, loadRoutingPolicy } from "./policy.js";
-import { parseProfile, ProfileError } from "./profile.js";
+import { defaultIntentDetector, resolveProfile, type IntentDetector } from "./intent.js";
+import { ProfileError } from "./profile.js";
 import { ChatProxy } from "./proxy.js";
 import { loadComponents, type Registered } from "./registry.js";
 
@@ -29,6 +30,8 @@ export interface RouterOptions {
   env?: NodeJS.ProcessEnv;
   /** 测试注入已注册组件（生产路径始终走 loadComponents 的 fail-closed 门禁）。 */
   registered?: Registered[];
+  /** 未显式声明 X-iDoris-Intent 时的兜底识别器（T2.4.1）；缺省用内置话术路由。 */
+  intentDetector?: IntentDetector;
 }
 
 export interface Router {
@@ -55,13 +58,14 @@ export async function startRouter(opts: RouterOptions): Promise<Router> {
   const policy = opts.routingPolicyPath === undefined ? undefined : loadRoutingPolicy(opts.routingPolicyPath);
   const proxy = opts.proxy ?? new ChatProxy();
   const egress: EgressCounter = { count: 0 };
+  const intentDetector = opts.intentDetector ?? defaultIntentDetector();
   let capabilities = opts.capabilities;
   const getCapabilities = (): CapabilitiesProvider => {
     if (capabilities === undefined) capabilities = new DefaultCapabilitiesProvider({ registered });
     return capabilities;
   };
   const server = createServer((req, res) => {
-    void handle(req, res, registered, health, policy, proxy, egress, getCapabilities, env);
+    void handle(req, res, registered, health, policy, proxy, egress, getCapabilities, intentDetector, env);
   });
   await new Promise<void>((resolve, reject) => {
     server.once("error", reject);
@@ -110,6 +114,7 @@ async function handle(
   proxy: ChatProxy,
   egress: EgressCounter,
   getCapabilities: () => CapabilitiesProvider,
+  intentDetector: IntentDetector,
   env: NodeJS.ProcessEnv,
 ): Promise<void> {
   if (req.method === "GET" && req.url === "/health") {
@@ -146,7 +151,7 @@ async function handle(
     return;
   }
   if (req.method === "POST" && req.url === "/v1/chat/completions") {
-    await handleChat(req, res, registered, policy, proxy, egress, env);
+    await handleChat(req, res, registered, policy, proxy, egress, intentDetector, env);
     return;
   }
   json(res, 404, { error: { type: "not_found" } });
@@ -159,6 +164,7 @@ async function handleChat(
   policy: RoutingPolicy | undefined,
   proxy: ChatProxy,
   egress: EgressCounter,
+  intentDetector: IntentDetector,
   env: NodeJS.ProcessEnv,
 ): Promise<void> {
   let body: Record<string, unknown>;
@@ -172,9 +178,10 @@ async function handleChat(
     json(res, 503, { error: { type: "policy_unconfigured" } });
     return;
   }
-  let profile;
+  let profile: TaskProfile;
   try {
-    profile = parseProfile(req.headers).profile;
+    profile = (await resolveProfile(req.headers, { messages: toMessages(body.messages) }, intentDetector))
+      .profile;
   } catch (err) {
     if (err instanceof ProfileError) {
       json(res, err.status, { error: { type: err.code, message: err.message } });

@@ -1,6 +1,25 @@
 export { HealthTracker, FAILURE_THRESHOLD, COOLDOWN_MS } from "./health.js";
 export { parseProfile, currentDeployMode, ProfileError } from "./profile.js";
 export type { HeaderBag, ProfileParseResult } from "./profile.js";
+export {
+  UtteranceIntentDetector,
+  cosine,
+  defaultIntentDetector,
+  hashingEmbedder,
+  queryText,
+  resolveProfile,
+  DEFAULT_INTENT_ROUTES,
+} from "./intent.js";
+export type {
+  Embedder,
+  IntentContext,
+  IntentDetector,
+  IntentHit,
+  IntentSource,
+  ResolvedProfile,
+  UtteranceDetectorOptions,
+  UtteranceRoute,
+} from "./intent.js";
 export { decide, loadRoutingPolicy } from "./policy.js";
 export type { RouteDecision } from "./policy.js";
 export { loadComponents, ComponentRegistrationError } from "./registry.js";
