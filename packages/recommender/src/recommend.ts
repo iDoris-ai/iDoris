@@ -248,6 +248,8 @@ export interface BlockedChoice {
   id: string;
   status: "BLOCKED";
   min_ram_gb: number;
+  /** 最低 footprint 量化下的估算内存（含 KV + 开销）；供 T2.2.1 /capabilities 使用。 */
+  estimated_memory_gb: number;
   reason: string;
 }
 
@@ -364,6 +366,7 @@ export function recommend(input: RecommendInput): Recommendation {
         id: model.id,
         status: "BLOCKED",
         min_ram_gb: model.min_ram_gb,
+        estimated_memory_gb: lowestFootprintPick(model, policy).footprint_gb,
         reason: `min_ram_gb=${model.min_ram_gb} > ram_gb=${hardware.ram_gb}`,
       });
     }

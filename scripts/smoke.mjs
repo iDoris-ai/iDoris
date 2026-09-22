@@ -59,6 +59,29 @@ try {
   const list = await (await fetch("http://127.0.0.1:" + router.port + "/v1/models")).json();
   check("/v1/models non-empty", Array.isArray(list.data) && list.data.length > 0);
 
+  // T2.2.1：/capabilities 必须是顶层数组，每项带容量字段且 admission_status 在枚举内。
+  const ADMISSION = ["ready", "requires_eviction", "blocked"];
+  const caps = await (await fetch("http://127.0.0.1:" + router.port + "/capabilities")).json();
+  check("/capabilities is a non-empty top-level array", Array.isArray(caps) && caps.length > 0);
+  check(
+    "/capabilities entries carry the capacity contract fields",
+    Array.isArray(caps) &&
+      caps.every(
+        (e) =>
+          typeof e.id === "string" &&
+          typeof e.capability === "string" &&
+          typeof e.resident === "boolean" &&
+          typeof e.estimated_memory_gb === "number" &&
+          typeof e.ctx_limit === "number" &&
+          typeof e.queue_depth === "number" &&
+          ADMISSION.includes(e.admission_status),
+      ),
+  );
+  check(
+    "/capabilities exposes at least one admission_status",
+    Array.isArray(caps) && caps.some((e) => typeof e.admission_status === "string" && e.admission_status.length > 0),
+  );
+
   const chat = await fetch("http://127.0.0.1:" + router.port + "/v1/chat/completions", {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -84,6 +107,6 @@ try {
 } finally {
   await router.close();
   upstream.close();
-  if (failures === 0) console.log("smoke OK: models + non-stream + stream(first token) + abort propagated");
+  if (failures === 0) console.log("smoke OK: models + capabilities + non-stream + stream(first token) + abort propagated");
   else process.exitCode = 1;
 }

@@ -71,6 +71,12 @@ importers:
       '@idoris/contracts':
         specifier: workspace:*
         version: link:../contracts
+      '@idoris/recommender':
+        specifier: workspace:*
+        version: link:../recommender
+      '@idoris/tenancy':
+        specifier: workspace:*
+        version: link:../tenancy
       yaml:
         specifier: ^2.6.1
         version: 2.9.1

@@ -20,7 +20,8 @@ export type PolicyErrorCode =
   | "LOAD_POLICY_MODE_KEEPALIVE_MISMATCH"
   | "EGRESS_NONE_MUST_BE_EXCLUSIVE"
   | "LOCAL_ONLY_CANNOT_ALLOW_INTERNET"
-  | "LOCAL_ONLY_EGRESS_MUST_BE_LOOPBACK";
+  | "LOCAL_ONLY_EGRESS_MUST_BE_LOOPBACK"
+  | "EXTENSIONS_MISSING_DEGRADATION";
 
 /** 组件卡策略校验失败。带类型（code + path），调用方按 code 判定。 */
 export class ComponentCardPolicyError extends Error {
@@ -31,6 +32,30 @@ export class ComponentCardPolicyError extends Error {
   ) {
     super(message);
     this.name = "ComponentCardPolicyError";
+  }
+}
+
+/**
+ * T2.2.2（06 §10.7）native 特性收进 extensions 命名空间。
+ *
+ * 非空 extensions（组件卡级或 provider 级）**必须**声明字符串 `_degradation`，
+ * 说明「换 provider 时该原生特性如何降级」。缺声明即拒绝注册——原生特性不得裸用。
+ * 空对象 `{}` 视为未声明任何扩展，放行。
+ */
+function assertExtensionsDeclared(extensions: unknown, path: string): void {
+  if (extensions === undefined || extensions === null) return;
+  if (typeof extensions !== "object" || Array.isArray(extensions)) {
+    throw new ComponentCardPolicyError("INVALID_SCHEMA", path, "extensions must be an object");
+  }
+  const record = extensions as Record<string, unknown>;
+  if (Object.keys(record).length === 0) return;
+  const degradation = record["_degradation"];
+  if (typeof degradation !== "string" || degradation.trim() === "") {
+    throw new ComponentCardPolicyError(
+      "EXTENSIONS_MISSING_DEGRADATION",
+      path,
+      "non-empty extensions must declare a non-empty string _degradation (06 §10.7)",
+    );
   }
 }
 
@@ -66,6 +91,10 @@ export function validateComponentCard(input: unknown): ComponentCard {
     );
   }
   const card: ComponentCard = parsed.data;
+
+  // T2.2.2：原生特性必须带降级声明（组件卡级 + provider 级）。
+  assertExtensionsDeclared(card.extensions, "extensions");
+  assertExtensionsDeclared(card.provider.extensions, "provider.extensions");
 
   if (card.privacy_class === "local_only" && card.fail_closed !== true) {
     throw new ComponentCardPolicyError("LOCAL_ONLY_REQUIRES_FAIL_CLOSED", "fail_closed", "privacy_class=local_only requires fail_closed=true");
