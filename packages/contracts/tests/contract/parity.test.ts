@@ -6,18 +6,20 @@ import loadPolicyJson from "../../schema/load-policy.schema.json";
 import providerJson from "../../schema/provider.schema.json";
 import routingPolicyJson from "../../schema/routing-policy.schema.json";
 import taskProfileJson from "../../schema/task-profile.schema.json";
+import trainingSampleJson from "../../schema/training-sample.schema.json";
 import { adapterManifestSchema } from "../../src/adapter-manifest.js";
 import { componentCardSchema } from "../../src/component-card.js";
 import { loadPolicySchema } from "../../src/load-policy.js";
 import { providerDescriptorSchema } from "../../src/provider.js";
 import { routingPolicySchema } from "../../src/routing-policy.js";
 import { taskProfileSchema } from "../../src/task-profile.js";
+import { trainingSampleSchema } from "../../src/training-sample.js";
 
 const ajv = new Ajv2020({ allErrors: true, strict: false });
 const jsonByName = {
   "adapter-manifest": adapterManifestJson,
   provider: providerJson, "load-policy": loadPolicyJson, "component-card": componentCardJson,
-  "routing-policy": routingPolicyJson, "task-profile": taskProfileJson,
+  "routing-policy": routingPolicyJson, "task-profile": taskProfileJson, "training-sample": trainingSampleJson,
 } as const;
 type Name = keyof typeof jsonByName;
 for (const schema of Object.values(jsonByName)) ajv.addSchema(schema as object);
@@ -26,6 +28,7 @@ const zodByName: Record<Name, { safeParse: (d: unknown) => { success: boolean } 
   "adapter-manifest": adapterManifestSchema,
   provider: providerDescriptorSchema, "load-policy": loadPolicySchema, "component-card": componentCardSchema,
   "routing-policy": routingPolicySchema, "task-profile": taskProfileSchema,
+  "training-sample": trainingSampleSchema,
 };
 
 const validProvider = {
@@ -45,7 +48,19 @@ const validManifest = {
   tokenizer_digest: digest("b"), rank: 16, data_class: "synthetic",
 };
 
+const validSample = {
+  sample_id: "s-1",
+  data_class: "synthetic",
+  source: { kind: "refined_from_synthetic" },
+  messages: [{ role: "user", content: "hi" }, { role: "assistant", content: "hello" }],
+};
+
 const corpus: Array<[Name, unknown]> = [
+  ["training-sample", validSample],
+  ["training-sample", { ...validSample, data_class: "nope" }],
+  ["training-sample", { ...validSample, messages: [{ role: "user", content: "hi" }] }],
+  ["training-sample", { ...validSample, source: { kind: "from_the_internet" } }],
+  ["training-sample", { ...validSample, sample_id: "" }],
   ["adapter-manifest", validManifest],
   ["adapter-manifest", { ...validManifest, adapter_id: "" }],
   ["adapter-manifest", { ...validManifest, base_digest: "sha256:abc" }],
