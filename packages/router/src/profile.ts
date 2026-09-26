@@ -1,3 +1,4 @@
+import { isPersonalDeployMode } from "@idoris/adapters";
 import { taskProfileSchema, type DeployMode, type TaskProfile } from "@idoris/contracts";
 
 export type HeaderBag = Record<string, string | string[] | undefined>;
@@ -19,8 +20,13 @@ export class ProfileError extends Error {
   }
 }
 
+/**
+ * 部署模式（fail-closed）。只有显式 `personal` 才是个人模式；
+ * `tenant` / `community` / `city` 以及任何未知取值都按 tenant 处理
+ * （未知值绝不静默当 personal —— 那会让租户模式缺 tenant header 时不报错）。
+ */
 export function currentDeployMode(): DeployMode {
-  return process.env.IDORIS_DEPLOY_MODE === "tenant" ? "tenant" : "personal";
+  return isPersonalDeployMode(process.env) ? "personal" : "tenant";
 }
 
 const header = (headers: HeaderBag, name: string): string | undefined => {
