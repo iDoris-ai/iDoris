@@ -126,8 +126,35 @@ describe("validateComponentCard - 结构非法", () => {
   it("rejects a non-object", () => {
     expectCode(() => validateComponentCard("nope"), "INVALID_SCHEMA");
   });
-  it("accepts extensions (06 §10.7)", () => {
-    const card = { ...base(), extensions: { "provider.anthropic.prompt_cache": { ttl: 5 } } };
+  it("accepts extensions that declare _degradation (06 §10.7)", () => {
+    const card = {
+      ...base(),
+      extensions: {
+        _degradation: "prompt cache 降级为无缓存，行为已声明",
+        "provider.anthropic.prompt_cache": { ttl: 5 },
+      },
+    };
     expect(validateComponentCard(card).provider.tier).toBe("local");
+  });
+  it("accepts an empty extensions object without _degradation", () => {
+    const card = { ...base(), extensions: {} };
+    expect(validateComponentCard(card).extensions).toEqual({});
+  });
+  it("rejects non-empty extensions without _degradation", () => {
+    const card = { ...base(), extensions: { "provider.anthropic.prompt_cache": { ttl: 5 } } };
+    expectCode(() => validateComponentCard(card), "EXTENSIONS_MISSING_DEGRADATION");
+  });
+  it("rejects a non-string _degradation", () => {
+    const card = { ...base(), extensions: { _degradation: 42, "provider.anthropic.prompt_cache": {} } };
+    expectCode(() => validateComponentCard(card), "EXTENSIONS_MISSING_DEGRADATION");
+  });
+  it("rejects a blank _degradation", () => {
+    const card = { ...base(), extensions: { _degradation: "   ", "provider.anthropic.prompt_cache": {} } };
+    expectCode(() => validateComponentCard(card), "EXTENSIONS_MISSING_DEGRADATION");
+  });
+  it("rejects provider-level extensions without _degradation", () => {
+    const card = base();
+    (card.provider as Record<string, unknown>).extensions = { "provider.gemini.grounding": {} };
+    expectCode(() => validateComponentCard(card), "EXTENSIONS_MISSING_DEGRADATION");
   });
 });

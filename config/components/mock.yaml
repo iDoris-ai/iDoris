@@ -15,6 +15,7 @@ fallback_policy: fail_closed
 fail_closed: true
 load_policy: { mode: resident, keepalive: { pinned: true }, admission: coexist }
 extensions:
+  _degradation: "mock 内存态适配器；换 provider 时按新组件卡 endpoint 重新映射，无原生特性残留"
   mock:
     memoryMaxGb: 16
     models:

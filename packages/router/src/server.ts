@@ -1,5 +1,9 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { RoutingPolicy } from "@idoris/contracts";
+import {
+  DefaultCapabilitiesProvider,
+  type CapabilitiesProvider,
+} from "./capabilities.js";
 import { dispatch, type EgressCounter } from "./dispatch.js";
 import { HealthTracker } from "./health.js";
 import { decide, loadRoutingPolicy } from "./policy.js";
@@ -13,6 +17,8 @@ export interface RouterOptions {
   port?: number;
   health?: HealthTracker;
   proxy?: ChatProxy;
+  /** 容量接口提供者；缺省时首次请求 /capabilities 时按 config/catalog.yaml 构造。 */
+  capabilities?: CapabilitiesProvider;
 }
 
 export interface Router {
@@ -38,8 +44,13 @@ export async function startRouter(opts: RouterOptions): Promise<Router> {
   const policy = opts.routingPolicyPath === undefined ? undefined : loadRoutingPolicy(opts.routingPolicyPath);
   const proxy = opts.proxy ?? new ChatProxy();
   const egress: EgressCounter = { count: 0 };
+  let capabilities = opts.capabilities;
+  const getCapabilities = (): CapabilitiesProvider => {
+    if (capabilities === undefined) capabilities = new DefaultCapabilitiesProvider({ registered });
+    return capabilities;
+  };
   const server = createServer((req, res) => {
-    void handle(req, res, registered, health, policy, proxy, egress);
+    void handle(req, res, registered, health, policy, proxy, egress, getCapabilities);
   });
   await new Promise<void>((resolve, reject) => {
     server.once("error", reject);
@@ -74,6 +85,7 @@ async function handle(
   policy: RoutingPolicy | undefined,
   proxy: ChatProxy,
   egress: EgressCounter,
+  getCapabilities: () => CapabilitiesProvider,
 ): Promise<void> {
   if (req.method === "GET" && req.url === "/health") {
     json(res, 200, { status: "ok", components: registered.length });
@@ -92,6 +104,20 @@ async function handle(
       }
     }
     json(res, 200, { object: "list", data });
+    return;
+  }
+  if (req.method === "GET" && req.url === "/capabilities") {
+    // T2.2.1：顶层 JSON 数组；每项附容量字段（06 §10.8）。
+    try {
+      json(res, 200, await getCapabilities().snapshot());
+    } catch (err) {
+      json(res, 503, {
+        error: {
+          type: "capabilities_unavailable",
+          message: err instanceof Error ? err.message : String(err),
+        },
+      });
+    }
     return;
   }
   if (req.method === "POST" && req.url === "/v1/chat/completions") {

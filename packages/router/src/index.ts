@@ -14,3 +14,24 @@ export type { DecisionReason, ReasonKind } from "./reason.js";
 export { ChatProxy } from "./proxy.js";
 export type { FetchLike, FetchResponseLike, ForwardResult, ReadableStreamLike } from "./proxy.js";
 export { EvictionLock, OomError } from "./evict-lock.js";
+export { DefaultCapabilitiesProvider, defaultCatalogPath } from "./capabilities.js";
+export type {
+  AdmissionStatus,
+  CapabilityEntry,
+  CapabilitiesProvider,
+  CapabilitiesOptions,
+} from "./capabilities.js";
+export {
+  AuditWriter,
+  AUDIT_FIELDS,
+  CONTENT_FIELD_BLACKLIST,
+  MAX_FIELD_CHARS,
+  validateAuditReason,
+  AuditError,
+  ContentLeakError,
+  UnknownAuditFieldError,
+  FieldTooLongError,
+  NonScalarAuditValueError,
+  InvalidReasonError,
+} from "./audit.js";
+export type { AuditField, AuditInput, AuditRecord, AuditScalar } from "./audit.js";
