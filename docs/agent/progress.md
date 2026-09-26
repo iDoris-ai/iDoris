@@ -28,17 +28,17 @@
 另三次：#32 的故障注入打错了 `embed()` 调用（`detect()` 里有两次用途不同的调用）· #25 的「插入序不变式」测试因时间推进太快而场景没构造出来 · #23 的正对照用了被 patch 的同一个 API。
 → 已并入 FU-8，并新立 FU-15 作为护栏。
 
-## 仓库基线（2026-09-07 盘点）
+## 历史基线（2026-09-07 盘点，已被上方「仓库基线（2026-09-26）」取代，保留作过程留档）
 - 集成分支 `preview` 已建立并推送；`main` 有 active ruleset 保护，只由 `preview` 经受控 PR 进入。
 - PR #3（十篇规划文档 + U0 spike log）已 squash 合并进 `preview`；本地分支 `docs/idoris-unified-model-plan` 已清理。
 - **仓库尚无任何代码**——只有 `docs/`（规划）与 `spike/u0/`（实测日志）。M1 的第一个 task 就是起 pnpm workspace 骨架。
 - 遗留分支 `test/cla-action-check`：对应 PR #1 已 CLOSED **未合并**，safe-cleanup 正确地不动它，是否废弃待人决定。
 
 ## 进行中 / 待回执的 PR
-| Task | PR | 状态 | 备注 |
-|:---|:---|:---|:---|
-| —（规划台账）| 待开 | — | `docs/agent-ledger` → `preview` |
-| —（跨仓库需求）| [#4](https://github.com/iDoris-ai/iDoris/pull/4) | PR_OPEN | iDoris-website 提的 R0–R6；**base 是 `main`，需改成 `preview`**；且分支基于 PR #3 合并前的点，diff 里混进了 01–10 全部文档，真实新增只有 `docs/11-来自Starter-Kit的需求.md` |
+
+**无。** open PR 归零，`preview` 上没有在途分支。
+
+> 历史留档：上表原记录的两条已闭合 —— 规划台账经 PR #5 合入；PR #4（iDoris-website 提的 R0–R6）已修正 base 为 `preview` 并合入，R1–R6 的采纳结论见本文下方。
 
 ## 阻塞项（BLOCKED）
 
