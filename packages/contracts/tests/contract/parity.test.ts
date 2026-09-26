@@ -1,10 +1,12 @@
 import Ajv2020 from "ajv/dist/2020.js";
 import { describe, expect, it } from "vitest";
+import adapterManifestJson from "../../schema/adapter-manifest.schema.json";
 import componentCardJson from "../../schema/component-card.schema.json";
 import loadPolicyJson from "../../schema/load-policy.schema.json";
 import providerJson from "../../schema/provider.schema.json";
 import routingPolicyJson from "../../schema/routing-policy.schema.json";
 import taskProfileJson from "../../schema/task-profile.schema.json";
+import { adapterManifestSchema } from "../../src/adapter-manifest.js";
 import { componentCardSchema } from "../../src/component-card.js";
 import { loadPolicySchema } from "../../src/load-policy.js";
 import { providerDescriptorSchema } from "../../src/provider.js";
@@ -13,6 +15,7 @@ import { taskProfileSchema } from "../../src/task-profile.js";
 
 const ajv = new Ajv2020({ allErrors: true, strict: false });
 const jsonByName = {
+  "adapter-manifest": adapterManifestJson,
   provider: providerJson, "load-policy": loadPolicyJson, "component-card": componentCardJson,
   "routing-policy": routingPolicyJson, "task-profile": taskProfileJson,
 } as const;
@@ -20,6 +23,7 @@ type Name = keyof typeof jsonByName;
 for (const schema of Object.values(jsonByName)) ajv.addSchema(schema as object);
 const ajvOk = (n: Name, data: unknown) => ajv.validate(`https://idoris.ai/schema/${n}.schema.json`, data);
 const zodByName: Record<Name, { safeParse: (d: unknown) => { success: boolean } }> = {
+  "adapter-manifest": adapterManifestSchema,
   provider: providerDescriptorSchema, "load-policy": loadPolicySchema, "component-card": componentCardSchema,
   "routing-policy": routingPolicySchema, "task-profile": taskProfileSchema,
 };
@@ -35,7 +39,18 @@ const validCard = {
   load_policy: { mode: "resident", keepalive: { pinned: true }, admission: "coexist" },
 };
 
+const digest = (c: string): string => "sha256:" + c.repeat(64);
+const validManifest = {
+  adapter_id: "lora-1", base_model_id: "Qwen3-4B-mlx", base_digest: digest("a"),
+  tokenizer_digest: digest("b"), rank: 16, data_class: "synthetic",
+};
+
 const corpus: Array<[Name, unknown]> = [
+  ["adapter-manifest", validManifest],
+  ["adapter-manifest", { ...validManifest, adapter_id: "" }],
+  ["adapter-manifest", { ...validManifest, base_digest: "sha256:abc" }],
+  ["adapter-manifest", { ...validManifest, rank: 0 }],
+  ["adapter-manifest", { ...validManifest, data_class: "nope" }],
   ["provider", validProvider],
   ["provider", { ...validProvider, capabilities: [] }],
   ["provider", { ...validProvider, tier: "cloud" }],

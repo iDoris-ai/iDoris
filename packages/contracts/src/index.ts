@@ -12,3 +12,5 @@ export * from "./routing-policy.js";
 export * from "./task-profile.js";
 export * from "./validate.js";
 export * from "./tenant.js";
+export * from "./adapter-manifest.js";
+export * from "./adapter-gate.js";
