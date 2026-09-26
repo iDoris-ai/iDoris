@@ -1,0 +1,6 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://idoris.ai/schema/deploy-mode.schema.json",
+  "title": "DeployMode",
+  "enum": ["personal", "tenant"]
+}

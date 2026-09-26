@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://idoris.ai/schema/tenant.schema.json",
+  "title": "TenantContext",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["tenant_id", "budget", "billing_timezone"],
+  "properties": {
+    "tenant_id": { "type": "string", "minLength": 1, "pattern": "\\S" },
+    "budget": {
+      "type": "object", "additionalProperties": false,
+      "required": ["limit_minor", "spent_minor"],
+      "properties": {
+        "limit_minor": { "type": "integer", "minimum": 0 },
+        "spent_minor": { "type": "integer", "minimum": 0 },
+        "scope": { "enum": ["paid_only", "all"], "default": "paid_only" }
+      }
+    },
+    "billing_timezone": { "type": "string", "minLength": 1, "pattern": "\\S", "format": "iana-timezone" },
+    "quota": {
+      "type": "object", "additionalProperties": false,
+      "properties": { "rpm": { "type": "integer", "minimum": 1 }, "tpm": { "type": "integer", "minimum": 1 } }
+    }
+  }
+}
