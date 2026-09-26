@@ -13,3 +13,4 @@ export { decisionReason, requireReason, reasonHeader, MissingReasonError, REASON
 export type { DecisionReason, ReasonKind } from "./reason.js";
 export { ChatProxy } from "./proxy.js";
 export type { FetchLike, FetchResponseLike, ForwardResult, ReadableStreamLike } from "./proxy.js";
+export { EvictionLock, OomError } from "./evict-lock.js";
