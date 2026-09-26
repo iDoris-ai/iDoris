@@ -21,7 +21,8 @@
     "test:billing": "pnpm --filter @idoris/tenancy test tests/billing.test.ts",
     "test:egress": "pnpm --filter @idoris/router test:egress",
     "smoke:agent24": "pnpm build && node scripts/smoke-agent24.mjs",
-    "smoke:external": "pnpm --filter @idoris/adapters build && node scripts/smoke-external.mjs"
+    "smoke:external": "pnpm --filter @idoris/adapters build && node scripts/smoke-external.mjs",
+    "test:growth": "pnpm --filter @idoris/growth test"
   },
   "devDependencies": {
     "@eslint/js": "^9.14.0",
