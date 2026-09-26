@@ -1,4 +1,8 @@
 export { HealthTracker, FAILURE_THRESHOLD, COOLDOWN_MS } from "./health.js";
+export { parseProfile, currentDeployMode, ProfileError } from "./profile.js";
+export type { HeaderBag, ProfileParseResult } from "./profile.js";
+export { decide, loadRoutingPolicy } from "./policy.js";
+export type { RouteDecision } from "./policy.js";
 export { loadComponents } from "./registry.js";
 export type { Registered } from "./registry.js";
 export { startRouter } from "./server.js";
