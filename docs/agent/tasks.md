@@ -10,7 +10,7 @@
 
 ## F1.1 — 契约层落地
 
-### T1.1.1 pnpm workspace 骨架 + 门禁流水线  `PR_OPEN`
+### T1.1.1 pnpm workspace 骨架 + 门禁流水线  `DONE`
 - **优先级**：high
 - **目标**：起一个能跑 lint/typecheck/build/test 的 TS monorepo，后续所有 task 有落点。
 - **开发范围**：`pnpm-workspace.yaml`；`packages/contracts` `packages/router` 两个空包；tsconfig（strict）、eslint、vitest、`.github/workflows/ci.yml` 跑同一套门禁。
@@ -22,7 +22,7 @@
 - **风险/回滚**：无（纯新增）
 - **证据**：PR #9（栈内 OPEN，未合并；本机门禁全绿）
 
-### T1.1.2 五份契约的 TS 类型 + zod schema  `PR_OPEN`
+### T1.1.2 五份契约的 TS 类型 + zod schema  `DONE`
 - **优先级**：high
 - **目标**：把 06 §10 的契约片段变成可执行、可校验的类型。
 - **开发范围**：`ProviderDescriptor` / `ComponentCard` / `LoadPolicy` / `RoutingPolicy` / `TaskProfile` 五份的 TS 类型与 zod schema，字段与取值严格按 [`spec.md`](spec.md) 数据模型章节。
@@ -34,7 +34,7 @@
 - **风险/回滚**：契约变更影响所有下游 → 本 task 内定版为 v1，后续改动走版本化
 - **证据**：PR #10（栈内 OPEN，未合并；本机门禁全绿）
 
-### T1.1.3 组件卡策略校验器（缺字段即拒绝注册）  `PR_OPEN`
+### T1.1.3 组件卡策略校验器（缺字段即拒绝注册）  `DONE`
 - **优先级**：high
 - **目标**：让「协议兼容 ≠ 路由安全」成为代码保证——缺策略字段的组件卡进不了 registry。
 - **开发范围**：`validateComponentCard()`：强制 `privacy_class` / `allowed_egress` / `fallback_policy` / `fail_closed` / `version_pin` 存在；**交叉规则**：`privacy_class=local_only` 必须 `fail_closed=true`；`tier=local` 且 `locality=remote` 为非法；`allowed_egress` 含 `internet` 时 `privacy_class` 不得为 `local_only`。
@@ -46,7 +46,7 @@
 - **风险/回滚**：**涉安全**——校验器漏判等于隐私门禁失效；反例测试是唯一凭证，不得跳过
 - **证据**：PR #11（栈内 OPEN，未合并；本机门禁全绿）
 
-### T1.1.4 契约成熟度标注与 README  `PR_OPEN`
+### T1.1.4 契约成熟度标注与 README  `DONE`
 - **优先级**：low
 - **目标**：按 06 §10.10 诚实标注每份契约当前是 L0/L1/L2/L3，不假装可替换。
 - **开发范围**：`packages/contracts/README.md` 成熟度表 + 每份 schema 顶部注释标注级别
@@ -58,7 +58,7 @@
 
 ## F1.2 — 能力③ 本地模型编排
 
-### T1.2.1 LoadPolicy 抽象接口 + mock 适配器  `PR_OPEN`
+### T1.2.1 LoadPolicy 抽象接口 + mock 适配器  `DONE`
 - **优先级**：high
 - **目标**：先定义引擎无关的 `ModelBackend` 接口并用 mock 实现，保证 Router 不依赖任何具体引擎。
 - **开发范围**：接口 `list() / load(id) / unload(id) / status() / chat(req)`；mock 适配器维护内存中的 loaded 集合 + 可配置内存上限，模拟 `ok/soft/hard/ceiling` 压力分级与 LRU 驱逐。
@@ -70,7 +70,7 @@
 - **风险/回滚**：无
 - **证据**：PR #14（栈内 OPEN，未合并；本机门禁全绿）
 
-### T1.2.2 oMLX 适配器  `PR_OPEN`
+### T1.2.2 oMLX 适配器  `DONE`
 - **优先级**：high
 - **目标**：把 LoadPolicy 抽象映射到 oMLX v0.4.3 的真实 knob（U0 已实测全部端点）。
 - **开发范围**：`mode:resident → model_settings.is_pinned=true`；`on_demand → unpinned`；`evict_to_load → 依赖 ProcessMemoryEnforcer`；显式 `POST /v1/models/{id}/load` `/unload`；`admission` 读 `GET /api/status` 的 `model_memory_max` 与 loaded 列表。
@@ -82,7 +82,7 @@
 - **风险/回滚**：v0.4.3 已知小限制——VLM 引擎 guard 传播告警（`could not resolve scheduler for VLMBatchedEngine`），不阻塞，记 followup
 - **证据**：PR #16（栈内 OPEN，未合并；本机门禁全绿）
 
-### T1.2.3 跨平台后端探测骨架  `PR_OPEN`
+### T1.2.3 跨平台后端探测骨架  `DONE`
 - **优先级**：mid
 - **目标**：启动时按 OS/硬件选后端，**Router 核心不出现 `omlx` 字样**。
 - **开发范围**：`detectBackend()`：macOS+Apple Silicon → oMLX；Win/Linux+NVIDIA → vLLM 槽位；否则 llama.cpp/Ollama 槽位。非 macOS 的实现可先是 `NotImplemented` 占位，但**接口必须齐**。
@@ -94,7 +94,7 @@
 - **风险/回滚**：无
 - **证据**：PR #15（栈内 OPEN，未合并；本机门禁全绿）
 
-### T1.2.4 LoadPolicy 黄金一致性测试（L3）  `PR_OPEN`
+### T1.2.4 LoadPolicy 黄金一致性测试（L3）  `DONE`
 - **优先级**：mid
 - **目标**：让「可替换」从承诺变成可验证的凭证——同一组序列打 mock 与 oMLX 语义等价。
 - **开发范围**：一份共享测试套件，参数化跑在两个适配器上。
@@ -106,7 +106,7 @@
 
 ## F1.3 — iDoris Router 薄编排层
 
-### T1.3.1 Router 骨架：HTTP 服务 + ProviderRegistry + `/v1/models`  `PR_OPEN`
+### T1.3.1 Router 骨架：HTTP 服务 + ProviderRegistry + `/v1/models`  `DONE`
 - **优先级**：high
 - **目标**：起一个监听 `127.0.0.1:PORT` 的进程，从 `config/components/*.yaml` 加载组件卡（经 T1.1.3 校验）并暴露 `/v1/models`。
 - **开发范围**：HTTP server；组件卡加载 + 校验 + registry；`/v1/models` 聚合各 backend 的模型清单；health/cooldown（连续 3 次失败进 30s cooldown）。
@@ -118,7 +118,7 @@
 - **风险/回滚**：**涉安全**——绑定地址必须硬编码 loopback，测试断言不监听 `0.0.0.0`
 - **证据**：PR #18（栈内 OPEN，未合并；本机门禁全绿）
 
-### T1.3.2 控制面 header 解析 + routing policy 解释引擎  `PR_OPEN`
+### T1.3.2 控制面 header 解析 + routing policy 解释引擎  `DONE`
 - **优先级**：high
 - **目标**：意图/隐私/复杂度走 header 不走 prompt；路由规则是 YAML 数据不是代码。
 - **开发范围**：解析 `X-iDoris-Privacy/Intent/Complexity/Capabilities/Fallback/Tenant` → `TaskProfile` + `TenantContext`（**缺省 privacy = `local_only`**，保守默认；`deploy_mode=tenant` 时缺 `X-iDoris-Tenant` → 400，**不得回落到「默认租户」**）；加载 `config/routing-policy.yaml`，按序匹配首条命中，`default` 必填；**严格按 [`spec.md`](spec.md)「路由决策的执行顺序」实现：隐私判定 → 预算闸门 → 意图/能力匹配**；产出候选 provider 列表。
@@ -130,7 +130,7 @@
 - **风险/回滚**：策略文件版本化，破坏性改动升 `version`
 - **证据**：PR #19（栈内 OPEN，未合并；本机门禁全绿）
 
-### T1.3.3 fail-closed 隐私门禁 + 降级链  `PR_OPEN`
+### T1.3.3 fail-closed 隐私门禁 + 降级链  `DONE`
 - **优先级**：high
 - **目标**：`local_only` 任务在本地不可用时**报错而非外泄**——这是产品承诺的落地点。
 - **开发范围**：按 [`spec.md`](spec.md) 的请求路由状态机实现：`NO_CANDIDATE` 时若 `fail_closed` → 终态 503 `local_only_unavailable`；否则按 `next_in_chain` 走降级，且降级候选必须通过 `privacy_class` 与 `allowed_egress` 复核（**不信任 policy，二次校验**）。
@@ -142,7 +142,7 @@
 - **风险/回滚**：**阻断级**——此测试失败不接受「已知问题」标注，必须修到过
 - **证据**：PR #20（栈内 OPEN，未合并；本机门禁全绿）
 
-### T1.3.4 `/v1/chat/completions` 转发：streaming、重试、幂等、取消  `PR_OPEN`
+### T1.3.4 `/v1/chat/completions` 转发：streaming、重试、幂等、取消  `DONE`
 - **优先级**：high
 - **目标**：让标准 openai SDK 不改代码即可调通，且失败行为可预期。
 - **开发范围**：非流式 + SSE 流式转发；非流式最多 2 次退避重试（250ms→1s + jitter），**流式已吐 token 后不重试**，以 SSE error 事件终止；可选 `X-iDoris-Request-Id` 幂等键（60s 窗口）；客户端断开时向上游传播取消。
@@ -154,7 +154,7 @@
 - **风险/回滚**：流式重试会导致重复 token —— 测试显式断言「已吐 token 后不重试」
 - **证据**：PR #25（栈内 OPEN，未合并；本机门禁全绿）
 
-### T1.3.5 驱逐竞态互斥锁  `PR_OPEN`
+### T1.3.5 驱逐竞态互斥锁  `DONE`
 - **优先级**：mid
 - **目标**：防止两个请求同时驱逐彼此需要的模型形成活锁。
 - **开发范围**：per-backend 互斥锁，`evict_to_load` 全程持锁；等待超时 10s → 返回 `oom` 而非无限等待。
@@ -162,7 +162,7 @@
 - **验收命令**：`pnpm --filter @idoris/router test`（并发 10 个需要互相驱逐的请求，断言无死锁、无超过 10s 的等待、全部有终态）
 - **证据**：PR #26（栈内 OPEN，未合并；本机门禁全绿）
 
-### T1.3.6 出网启动断言（启动期部署配置，与运行期路由是两个洞）  `PR_OPEN`
+### T1.3.6 出网启动断言（启动期部署配置，与运行期路由是两个洞）  `DONE`
 - **优先级**：mid
 - **目标**：证明 Router 进程在**处理任何请求之前**不会自己出网——`test:privacy` 测的是运行期路由，这条测的是启动期部署配置，两者抓不到对方的问题。
 - **开发范围**：socket 层打桩拒绝所有非本机连接，启动 Router 后断言零出网；**必须配正对照**：一个刻意出网的用例要被探针抓到——抓不到出网的探针，它报的「零出网」什么都不证明。
@@ -178,7 +178,7 @@
 
 ## F1.4 — 能力① 订阅中转（可选 / best-effort）
 
-### T1.4.1 subprocess 中转适配器  `PR_OPEN`
+### T1.4.1 subprocess 中转适配器  `DONE`
 - **优先级**：mid
 - **目标**：把已登录的 `claude` / `codex` 订阅态封成 OpenAI-compat provider（U0 已验证 `claude -p` 与 `codex exec` 可行）。
 - **开发范围**：spawn CLI → 解析输出 → 封 OpenAI-compat 响应；120s 超时；取消/超时走 `SIGTERM → 5s → SIGKILL`，**不留孤儿进程**。
@@ -191,7 +191,7 @@
 - **风险/回滚**：孤儿进程会吃满机器 —— 清理断言是硬性验收项
 - **证据**：PR #30（栈内 OPEN，未合并；本机门禁全绿）
 
-### T1.4.2 loopback + 单用户门禁（合规红线落地）  `PR_OPEN`
+### T1.4.2 loopback + 单用户门禁（合规红线落地）  `DONE`
 - **优先级**：high
 - **目标**：让「社区端/城市端绝不转发个人订阅」成为代码约束而非文档劝告。
 - **开发范围**：订阅 provider 的组件卡固定 `allowed_egress: [loopback]`；Router 在 dispatch 前复核请求来源为 loopback（或用户显式开启的 Tailscale 私网白名单）；**`deploy_mode != personal`（即 `tenant` / `community` / `city`）时该 provider 拒绝注册并明确报错**——多租户不是放开这条红线的理由，组织租户用组织自己的 API（能力②）或本地模型（能力③）。
@@ -203,7 +203,7 @@
 - **风险/回滚**：**涉合规**——此门禁是能力①得以存在的前提，测试不得跳过
 - **证据**：PR #30（栈内 OPEN，未合并；本机门禁全绿）
 
-### T1.4.3 订阅中转不作必需 fallback 的断言  `PR_OPEN`
+### T1.4.3 订阅中转不作必需 fallback 的断言  `DONE`
 - **优先级**：mid
 - **目标**：落实 U0 决策 S3——能力①是 best-effort，核心正确性不依赖它。
 - **开发范围**：routing policy 中订阅 provider 永不出现在 `default` 链；测试断言禁用订阅 provider 后所有非订阅场景仍全绿。
@@ -218,7 +218,7 @@
 > 2026-09-07 拍板 R0 新增：多租户是 iDoris 定位的一部分（「iDoris 是组织大脑，未来为组织提供服务」），不是为单个业务开的后门。
 > **下游 iDoris-website 已把自己的 `products/gateway/` 降级为消费者并挂起等本节的接口契约**，故 T1.5.1 优先级最高。
 
-### T1.5.1 `deploy_mode` + TenantContext 契约  `PR_OPEN`
+### T1.5.1 `deploy_mode` + TenantContext 契约  `DONE`
 - **优先级**：high
 - **目标**：先把**接口契约**定下来对外发布——下游已停工等它，契约不定他们改完还要再改一遍。
 - **开发范围**：`deploy_mode: personal | tenant` 配置项；`TenantContext` 的 TS 类型 + zod schema（`tenant_id` / `budget{limit_minor,spent_minor,scope}` / `billing_timezone` / `quota`）；`X-iDoris-Tenant` header 语义（tenant 模式必填，缺失 400，**不得回落默认租户**；personal 模式忽略）；产出一份对外契约文档。
@@ -230,7 +230,7 @@
 - **风险/回滚**：契约发布后下游会照着写，破坏性改动要升版本 —— 本 task 内定版 v1
 - **证据**：PR #12（栈内 OPEN，未合并；本机门禁全绿）
 
-### T1.5.2 预算闸门（终态拒绝，非降级）  `PR_OPEN`
+### T1.5.2 预算闸门（终态拒绝，非降级）  `DONE`
 - **优先级**：high
 - **目标**：预算耗尽 → 拒绝调用并返回明确错误，**不产生任何计费调用**，也不自动降级到便宜档。
 - **开发范围**：`BUDGET_CHECK` 节点置于 `POLICY_MATCHED` 之后、`CANDIDATES` 之前；超限返回 402 `budget_exceeded`，错误信息**必须说清「是预算不是故障」**；实现 `budget.scope` 两种语义——`paid_only`（默认，只闸 `cost>0` 的候选，本地模型不受影响）与 `all`（一律拒绝）。
@@ -241,7 +241,7 @@
 - **风险/回滚**：**涉钱**——闸门失效等于替客户花钱；计费计数器断言不可省
 - **证据**：PR #22（栈内 OPEN，未合并；本机门禁全绿）
 
-### T1.5.3 租户硬隔离的数据访问层  `PR_OPEN`
+### T1.5.3 租户硬隔离的数据访问层  `DONE`
 - **优先级**：high
 - **目标**：A 租户查不到 B 租户的**任何一条**用量/预算/审计记录。
 - **开发范围**：用量/预算/审计三类数据的访问层强制携带 tenant 作用域；**缺 tenant 上下文的查询直接抛错，而非返回全量**——靠调用方每次记得加 `where tenant_id = ?` 是失败开放。
@@ -252,7 +252,7 @@
 - **风险/回滚**：**涉隐私/涉钱**——隔离失效等于跨客户数据泄漏
 - **证据**：PR #21（栈内 OPEN，未合并；本机门禁全绿）
 
-### T1.5.4 决策 reason 可解释  `PR_OPEN`
+### T1.5.4 决策 reason 可解释  `DONE`
 - **优先级**：mid
 - **目标**：每次路由决策带非空 `reason`，能区分「隐私强制 / 预算 / 意图匹配 / 降级」四类。
 - **开发范围**：决策链各节点产出结构化 reason，进审计记录并可在响应头回传。
@@ -265,7 +265,7 @@
 
 ## F2.1 — HardwareAwareModelRecommender
 
-### T2.1.1 硬件探测 + 内存公式  `PR_OPEN`
+### T2.1.1 硬件探测 + 内存公式  `DONE`
 - **优先级**：high
 - **目标**：实现 07 §1–§3 的公式：`footprint = params × bpp + KV(ctx) + 开销`，Apple 预算三档。
 - **开发范围**：`system_profiler`/`sysctl`/`os.cpus` 探测 `ram_gb/chip/gpu_cores`；量化 bpp 与质量表；KV 估算（层数×KV头×head_dim×ctx×kv_quant）。
@@ -277,7 +277,7 @@
 - **风险/回滚**：公式偏差会导致 OOM —— 用 U0 实测数据作回归基线
 - **证据**：PR #27（栈内 OPEN，未合并；本机门禁全绿）
 
-### T2.1.2 打分与推荐算法 + `IDORIS_CORE_MODEL` override  `PR_OPEN`
+### T2.1.2 打分与推荐算法 + `IDORIS_CORE_MODEL` override  `DONE`
 - **优先级**：high
 - **目标**：按 07 §5.3 伪代码选出常驻 + 临时组合。
 - **开发范围**：`catalog.yaml` 加载；常驻选 `capability.reasoning × quant.quality` 最高且放得下的；临时按需求能力逐个 admission；不下则标 `requires_eviction`；`IDORIS_CORE_MODEL` 强制时推荐模块让路但仍输出警告。
@@ -287,7 +287,7 @@
 - **风险/回滚**：目录数据错误会推荐出跑不动的组合 —— catalog 每条附 `min_ram_gb` 硬门槛
 - **证据**：PR #27（栈内 OPEN，未合并；本机门禁全绿）
 
-### T2.1.3 可读 tradeoff 输出 + sysctl 建议  `PR_OPEN`
+### T2.1.3 可读 tradeoff 输出 + sysctl 建议  `DONE`
 - **优先级**：mid
 - **目标**：推荐不是黑箱打分，要能解释为什么这么选。
 - **依赖**：T2.1.2
@@ -298,7 +298,7 @@
 
 ## F2.2 — 容量接口与可观测
 
-### T2.2.1 `GET /capabilities`  `PR_OPEN`
+### T2.2.1 `GET /capabilities`  `DONE`
 - **优先级**：high
 - **目标**：把容量变成接口（06 §10.8），业务据此知道能否共存/要不要驱逐。
 - **开发范围**：每个能力附 `resident/estimated_memory_gb/ctx_limit/queue_depth/admission_status(ready|requires_eviction|blocked)`；数据源为 recommender + backend `status()`。
@@ -306,14 +306,14 @@
 - **验收命令**：`pnpm smoke`（`curl /capabilities | jq -e '.[]|select(.admission_status)'` 非空且取值在枚举内）
 - **证据**：PR #28（栈内 OPEN，未合并；本机门禁全绿）
 
-### T2.2.2 native 特性收进 extensions 命名空间  `PR_OPEN`
+### T2.2.2 native 特性收进 extensions 命名空间  `DONE`
 - **优先级**：low
 - **目标**：防 provider 锁定（06 §10.7）——原生特性不得裸用，必须带降级声明。
 - **依赖**：T1.1.2
 - **验收命令**：`pnpm --filter @idoris/contracts test:contract`（无 `_degradation` 声明的 extension 被拒绝）
 - **证据**：PR #28（栈内 OPEN，未合并；本机门禁全绿）
 
-### T2.2.3 路由决策审计日志  `PR_OPEN`
+### T2.2.3 路由决策审计日志  `DONE`
 - **优先级**：mid
 - **目标**：每次路由留下「选了谁、为什么、是否降级」的记录（acceptance「可审计」），且 tenant 模式下按租户隔离。
 - **开发范围**：结构化审计记录，字段**穷举白名单**见 [`spec.md`](spec.md)「审计记录（AuditRecord）」：`request_id / tenant_id / component / intent / privacy / tier / provider_id / model_id / tokens_in / tokens_out / cost_minor / latency_ms / status / reason / ts_utc`。**`reason` 必须非空且能区分四类**（`privacy_enforced` / `budget` / `intent_match` / `degraded`）——一句「routed」不合格。写入走 tenant 作用域（见 T1.5.3）。**两道防线**（来自 iDoris-website 实现，Apache-2.0 可直接移植）：① 写入前对记录的**字段名**逐个比对黑名单（`prompt/prompts/input/content/text/body/messages/document/file/payload` 等 frozenset），命中即抛 `ContentLeakError` **拒绝写入**——不是静默丢弃（静默丢弃会让人以为内容被存下来了）；② 单字段 500 字符上限——长文本出现在元数据里，本身就是「有人把内容塞进来了」的信号。
@@ -327,7 +327,7 @@
 
 ## F2.3 — Agent24 集成交接
 
-### T2.3.1 交出 R1–R6 需求并确认接口  `PR_OPEN`
+### T2.3.1 交出 R1–R6 需求并确认接口  `DONE`
 - **优先级**：mid
 - **目标**：按 [`../09-对Agent24的需求.md`](../09-对Agent24的需求.md) 与 Agent24 侧确认 `IDORIS_URL` provider 接入方式（纯加法零回归）。
 - **明确不做**：**不改 Agent24 内核代码**——iDoris 只提需求。
@@ -335,7 +335,7 @@
 - **验收命令**：`test -f docs/agent/handoff-agent24.md`（含 R1–R6 逐条的接口约定与联调命令）
 - **证据**：PR #31（栈内 OPEN，未合并；本机门禁全绿）
 
-### T2.3.2 端到端联调冒烟  `PR_OPEN`
+### T2.3.2 端到端联调冒烟  `DONE`
 - **优先级**：mid
 - **目标**：Agent24 把 `IDORIS_URL` 指过来后原有功能零回归且能用到本地模型。
 - **依赖**：T2.3.1
@@ -346,7 +346,7 @@
 
 ## F2.4 — 语义意图路由
 
-### T2.4.1 引入 semantic-router 做意图识别  `PR_OPEN`
+### T2.4.1 引入 semantic-router 做意图识别  `DONE`
 - **优先级**：low
 - **目标**：把 `X-iDoris-Intent` 从「调用方必须声明」升级为「未声明时可自动识别」（[`../10-入口路由模型-调研对比.md`](../10-入口路由模型-调研对比.md) 首选方案）。
 - **明确不做**：不替代 header —— **显式声明永远优先于识别结果**；隐私字段绝不自动推断。
@@ -358,7 +358,7 @@
 
 ## F2.5 — 能力② 外部 API 槽位
 
-### T2.5.1 OpenAI-compat 上游槽位 + 冒烟  `PR_OPEN`
+### T2.5.1 OpenAI-compat 上游槽位 + 冒烟  `DONE`
 - **优先级**：low
 - **目标**：只证明「外部槽位可接」，不做选型。
 - **开发范围**：通用 OpenAI-compat 上游适配器；用 `.env` 的 `OPENAI_API_KEY` 做一次冒烟。
@@ -380,7 +380,7 @@
 
 ## F2.6 — 计费与账期
 
-### T2.6.1 按 tenant 的月度用量聚合 + 显式账期时区  `PR_OPEN`
+### T2.6.1 按 tenant 的月度用量聚合 + 显式账期时区  `DONE`
 - **优先级**：mid
 - **目标**：下游按此计费，所以「换台机器账单就变」是不可接受的失败模式。
 - **开发范围**：按 `tenant_id` 聚合月度用量与成本；月份边界**用租户显式配置的 `billing_timezone`**（不取服务器时区，也不接受调用方在查询里另指定），`ts_utc` 存 UTC epoch，聚合时才做时区换算；提供余额与月度用量查询接口。**响应必须回显 `billing_timezone` 与解析出的 `range_utc` 边界**——让调用方能断言而不是只能信任。
@@ -397,27 +397,27 @@
 
 > 严格按 03 §5 的 F0 → F1 → F2 推进。**硬门禁：F3.4 隐私层就位前，真实个人数据不得进入联邦；F3.1/F3.3 只用合成/脱敏数据。**
 
-### T3.1.1 本地数据湖 + 提炼管线（合成数据）  `PR_OPEN`
+### T3.1.1 本地数据湖 + 提炼管线（合成数据）  `DONE`
 - **优先级**：low ｜ **依赖**：T2.2.3 ｜ **验收命令**：`pnpm --filter @idoris/growth test`（合成语料跑通 使用→数据湖→提炼 三段，断言产出的训练样本 schema 合法且**不含真实数据标记**）
 - **证据**：PR #35（栈内 OPEN，未合并；本机门禁全绿）
 
-### T3.1.2 MLX-LoRA 本地训练 + 热挂载  `PR_OPEN`
+### T3.1.2 MLX-LoRA 本地训练 + 热挂载  `DONE`
 - **优先级**：low ｜ **依赖**：T3.1.1、T3.2.1 ｜ **风险**：python 3.9.6 可能不满足 mlx-lm（需 3.10+），U0 已记 ｜ **验收命令**：`pnpm --filter @idoris/growth test:integration`（训练出一个 rank=16 的 adapter 并经 Router 热挂载后可推理；无 MLX 环境打印 SKIPPED）
 - **证据**：PR #36（栈内 OPEN，未合并；本机门禁全绿）
 
-### T3.2.1 AdapterManifest + base 一致性门禁  `PR_OPEN`
+### T3.2.1 AdapterManifest + base 一致性门禁  `DONE`
 - **优先级**：low ｜ **依赖**：T1.1.2 ｜ **风险**：**涉正确性**——指纹校验失效会「一次静默升级毁掉整批 LoRA」 ｜ **验收命令**：`pnpm --filter @idoris/contracts test:contract`（断言 base/tokenizer digest 不匹配的 manifest 被拒绝挂载与聚合）
 - **证据**：PR #34（栈内 OPEN，未合并；本机门禁全绿）
 
-### T3.3.1 Flower 最小联邦（同 base、只传 LoRA、FedAvg）  `PR_OPEN`
+### T3.3.1 Flower 最小联邦（同 base、只传 LoRA、FedAvg）  `DONE`
 - **优先级**：low ｜ **依赖**：T3.1.2、T3.2.1 ｜ **验收命令**：`pnpm --filter @idoris/federation test:integration`（两个本地客户端 + 合成数据跑通一轮聚合；断言传输载荷**只含 adapter 权重、不含原始样本**）
 - **证据**：PR #37（栈内 OPEN，未合并；本机门禁全绿）
 
-### T3.4.1 DP-FedLoRA 加噪 + 安全聚合  `PR_OPEN`
+### T3.4.1 DP-FedLoRA 加噪 + 安全聚合  `DONE`
 - **优先级**：low ｜ **依赖**：T3.3.1 ｜ **验收命令**：`pnpm --filter @idoris/federation test tests/dp.test.ts`（① ε 越小 σ 越大且与解析式一致；② 同 seed 同噪声、σ=0 原样返回；③ 掩码上传量 ≠ 明文而求和与明文和一致，即 δ_ij=-δ_ji 真的抵消）
 - **证据**：PR #37（栈内 OPEN，未合并；本机门禁全绿）
 
-### T3.4.2 真实数据准入门禁  `PR_OPEN`
+### T3.4.2 真实数据准入门禁  `DONE`
 - **优先级**：low ｜ **依赖**：T3.4.1 ｜ **验收命令**：`pnpm --filter @idoris/federation test`（断言隐私层未启用时，标记为真实数据的样本**无法**进入联邦管线，报错而非跳过）
 - **证据**：PR #37（栈内 OPEN，未合并；本机门禁全绿）
 
@@ -436,6 +436,9 @@
 | FU-7 | 跨仓库移交 | 接收 iDoris-website 的 `routing.py`(10 条变异) / `audit.py` / `egress_guard.py`(16 条变异)，Apache-2.0；对方保留一份直到我方跑通，避免出现「两边都没有」的窗口 | OPEN |
 | FU-9 | 生态边界 | [`ecosystem-boundaries.md`](ecosystem-boundaries.md) §7 四条待拍板：B1 双 harness 二选一（**最迫近**，下游已在跑 B）· B2 MemPalace 独立与否 · B3 agentEar 立项与归属 · B4 模型制品层时机 | OPEN |
 | FU-10 | 跨仓库 | iDoris-website `docs/business/INDEX-产品设计总览.md` §3 的「113 条变异」与「没有一条连过模型」范围不符：Documents 72 + Creative 15 = **87** 才是该句点名的范围；Assistant 16 + Gateway 10 那 26 条不在「连没连过模型」这个轴上（测的是启动期环境变量与路由顺序），被那句话罩住反显得更空。已转告作者 | OPEN |
+| FU-13 | 接口缺口（本轮核 Agent24 ADR-032 时暴露）| **没有生产默认端口**：`startRouter` 的 `port` 默认 `0`（随机，供测试并行），于是下游无法据此写 `IDORIS_URL`，而我们既没有 `IDORIS_PORT` 也没有固定默认值。部署方目前只能自己钉死端口 | OPEN |
+| FU-14 | 架构缺口 | **personal 模式没有「调用方身份」概念**：loopback 绑定限制的是**可达范围**不是授权，同机任何进程都能调、不需任何凭据。所以「同一实例按调用方区分策略」（如本人聊天可用订阅、Agent24 模块不可用）目前做不到，只能靠起第二个 Router 实例（进程边界=授权边界）。要做就得在 routing policy 加规则维度并升契约版本，**不走 caller header**（调用方自带排除项是失败开放） | OPEN |
+| FU-15 | 护栏（三次同类事故后立的）| **新增带状态的组件必须主动过一遍 tenancy 层**。#21/#22 建立的「租户硬隔离」只覆盖数据访问层(usage/budget/audit)；此后 #25 的响应缓存、以及合并 #32 时的 deployMode 透传，都是**全新状态没有自动继承那套隔离**。硬隔离目前是一条**约定**，不是新代码会自动撞上的护栏 —— 在它成为机械强制之前，每新增一处状态都要手工核对 | OPEN |
 | FU-12 | 评审 | codex 指出 B1 最可能在六个月后被推翻，**触发条件很低**：出现第一条同时依赖内容+收件人+渠道+副作用的策略即可（如「金额超 ฿10,000 或群聊含非客户成员时，发账单必须人工批准」）。届时会改成「Python 提供签名的领域校验证据，Rust 持唯一授权状态机与最终否决权」——本稿已按这个形状写，但要盯着别退回「动作/输出互不重叠」的旧说法 | OPEN |
 | FU-11 | License 红线（自下游 `oss-due-diligence.md` 引入）| **LiteLLM `enterprise/` 目录绝不引用**（若将来做能力②）· **Dify 禁多租户**——多租户现已归 iDoris，此条直接约束选型 · ComfyUI GPL 只能隔离进程调用 | OPEN |
 | FU-8 | 验收方法论 | **「绿灯不代表你以为的那件事成立」**——两半：① **断言错了**（异常子类被父类 `expect_raises` 吞掉；无出处答案被数字校验误接住，换成不含数字的答案就放行）；② **检查不承重**（某步骤去掉后整套自检仍全绿）。<br>**根因常是量纲不匹配**：判据全写成「至少有 N 个」，而想抓的错误方向是「你多算了」——「至少」型判据测不出多算，那格正对照**从一开始就不可能承重**。**检查的量纲要和它想抓的错误方向对得上。**<br>我方对应防御：`test:privacy` 的出站计数器（不只断言 503）、`test:billing` 的 `range_utc`（不只断言 totals）、`test:egress` 的正对照、T1.5.2/3/4 的配对变异测试。共同点是**不给自己留一条「看起来做了」的退路**。<br>**待办**：把这条写进未来每个 task 的验收设计检查——新增验收命令时问一句「这个断言能不能因为别的原因变绿？它的量纲对得上要抓的错误方向吗？」 | OPEN |
