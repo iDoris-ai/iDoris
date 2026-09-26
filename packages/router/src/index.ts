@@ -7,3 +7,5 @@ export { loadComponents } from "./registry.js";
 export type { Registered } from "./registry.js";
 export { startRouter } from "./server.js";
 export type { Router, RouterOptions } from "./server.js";
+export { dispatch, isLocalCapable } from "./dispatch.js";
+export type { DispatchOutcome, EgressCounter } from "./dispatch.js";
