@@ -50,6 +50,19 @@ importers:
         specifier: ^8.20.0
         version: 8.20.0
 
+  packages/federation:
+    dependencies:
+      '@idoris/contracts':
+        specifier: workspace:*
+        version: link:../contracts
+      '@idoris/growth':
+        specifier: workspace:*
+        version: link:../growth
+    devDependencies:
+      '@types/node':
+        specifier: ^22.0.0
+        version: 22.20.4
+
   packages/growth:
     dependencies:
       '@idoris/contracts':
