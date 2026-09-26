@@ -18,6 +18,7 @@
     "test:privacy": "pnpm --filter @idoris/router test tests/privacy.test.ts",
     "test:audit": "pnpm --filter @idoris/router test tests/audit.test.ts",
     "test:tenancy": "pnpm --filter @idoris/tenancy test",
+    "test:billing": "pnpm --filter @idoris/tenancy test tests/billing.test.ts",
     "test:egress": "pnpm --filter @idoris/router test:egress"
   },
   "devDependencies": {
