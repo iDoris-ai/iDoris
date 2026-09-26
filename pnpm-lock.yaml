@@ -66,6 +66,16 @@ importers:
         specifier: ^22.0.0
         version: 22.20.4
 
+  packages/tenancy:
+    dependencies:
+      '@idoris/contracts':
+        specifier: workspace:*
+        version: link:../contracts
+    devDependencies:
+      '@types/node':
+        specifier: ^22.0.0
+        version: 22.20.4
+
 packages:
 
   '@esbuild/aix-ppc64@0.21.5':
