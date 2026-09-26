@@ -187,3 +187,55 @@ describe("startRouter 接线", () => {
     expect(seen).toEqual(["hi there"]);
   });
 });
+
+describe("编码失败不得污染缓存（回归：评审 PR #32 的静默功能性失能）", () => {
+  /**
+   * 断言的是**恢复能力**，不是「catch 挂上了」—— 后者是实现细节。
+   *
+   * ⚠️ **故障注入必须精确瞄准 encode() 那一次 embed()**。`detect()` 里有两次
+   * 用途不同的 `embed()` 调用：先 `embed([query])` 编查询，再 `encode()` 编路由
+   * 话术。笼统地「让第一次 embed 失败」打中的是**查询编码**，`encode()` 压根
+   * 没跑到 —— 那样写出来的测试，把修复去掉也照样绿（我第一版正是这样，
+   * 变异验证才抓出来；评审在本 PR 里也记过同一条教训）。
+   * 所以下面按**话术内容**判定：只有编码 ROUTE_UTTERANCE 的那次才抛错。
+   */
+  const ROUTE_UTTERANCE = "ROUTE_UTTERANCE_SENTINEL";
+
+  it("encode() 第一次抛错后，第二次 detect 能重新编码并成功", async () => {
+    let encodeAttempts = 0;
+    const d = new UtteranceIntentDetector({
+      routes: [{ intent: "alpha", utterances: [ROUTE_UTTERANCE] }],
+      embed: async (texts: readonly string[]) => {
+        if (texts.includes(ROUTE_UTTERANCE)) {
+          encodeAttempts += 1;
+          if (encodeAttempts === 1) throw new Error("transient embedding outage");
+        }
+        return texts.map(() => [1, 0]);
+      },
+      minScore: 0.5,
+    });
+
+    await expect(d.detect(user("QUERY"))).rejects.toThrow("transient embedding outage");
+    expect(encodeAttempts).toBe(1);
+
+    // 关键：encode() 必须被**再试一次**（attempts 增加），而不是拿回缓存的失败。
+    const hit = await d.detect(user("QUERY"));
+    expect(encodeAttempts).toBe(2);
+    expect(hit?.intent).toBe("alpha");
+  });
+
+  it("成功之后路由话术不再重编（缓存没被修坏）", async () => {
+    let encodeAttempts = 0;
+    const d = new UtteranceIntentDetector({
+      routes: [{ intent: "alpha", utterances: [ROUTE_UTTERANCE] }],
+      embed: async (texts: readonly string[]) => {
+        if (texts.includes(ROUTE_UTTERANCE)) encodeAttempts += 1;
+        return texts.map(() => [1, 0]);
+      },
+      minScore: 0.5,
+    });
+    await d.detect(user("QUERY"));
+    await d.detect(user("QUERY"));
+    expect(encodeAttempts).toBe(1);
+  });
+});

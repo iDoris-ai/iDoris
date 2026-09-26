@@ -80,27 +80,53 @@ export class UtteranceIntentDetector implements IntentDetector {
     this.minScore = opts.minScore ?? 0.6;
   }
 
+  /**
+   * 编码路由话术，结果缓存（只编码一次）。
+   *
+   * ⚠️ **失败不得进缓存**（评审 PR #32，真实可复现）。
+   * 原来是 `this.encoded ??= (async () => {…})()`：一旦第一次 `embed()` 抛错，
+   * `this.encoded` 就被赋成一个**已经 reject 的 Promise**，之后每次 `detect()`
+   * 都拿到同一个 rejected promise 再抛一次 —— **即使 `embed()` 早已恢复正常也
+   * 没有机会重跑**。
+   *
+   * 影响不止单次请求：`defaultIntentDetector()` 是**进程级单例**，所以一次
+   * 瞬时抖动会让整个进程生命周期内的意图识别永久失效；而 `resolveProfile`
+   * 的 catch 会吞掉异常回落默认意图，于是它**不崩、不报错**，是**静默的功能
+   * 性失能** —— 生产上很难诊断出「意图识别其实已经坏了一整天」。
+   *
+   * PR 自己的「已知残留」写着生产嵌入要接 `/v1/embeddings` —— 一旦接上真实
+   * 网络端点，失败概率从「哈希兜底几乎不可能」变成「随时可能抖动」。
+   */
   private encode(): Promise<Array<{ intent: string; vectors: number[][] }>> {
-    this.encoded ??= (async () => {
-      const flat: string[] = [];
-      for (const route of this.routes) for (const u of route.utterances) flat.push(u);
-      const vectors = await this.embed(flat);
-      if (vectors.length !== flat.length) {
-        throw new Error("embedder returned " + vectors.length + " vectors for " + flat.length + " texts");
-      }
-      const out: Array<{ intent: string; vectors: number[][] }> = [];
-      let i = 0;
-      for (const route of this.routes) {
-        const own: number[][] = [];
-        for (let k = 0; k < route.utterances.length; k += 1) {
-          const v = vectors[i];
-          i += 1;
-          if (v !== undefined) own.push(v);
+    if (this.encoded === undefined) {
+      const attempt: Promise<Array<{ intent: string; vectors: number[][] }>> = (async () => {
+        const flat: string[] = [];
+        for (const route of this.routes) for (const u of route.utterances) flat.push(u);
+        const vectors = await this.embed(flat);
+        if (vectors.length !== flat.length) {
+          throw new Error("embedder returned " + vectors.length + " vectors for " + flat.length + " texts");
         }
-        out.push({ intent: route.intent, vectors: own });
-      }
-      return out;
-    })();
+        const out: Array<{ intent: string; vectors: number[][] }> = [];
+        let i = 0;
+        for (const route of this.routes) {
+          const own: number[][] = [];
+          for (let k = 0; k < route.utterances.length; k += 1) {
+            const v = vectors[i];
+            i += 1;
+            if (v !== undefined) own.push(v);
+          }
+          out.push({ intent: route.intent, vectors: own });
+        }
+        return out;
+      })().catch((err: unknown) => {
+        // 失败即清缓存，让下一次 detect() 重新尝试；只有成功的结果才留下。
+        // 比对 `attempt` 本身（即 .catch 之后的这个 promise，也就是存进
+        // this.encoded 的那一个）——若期间已被别人替换过，就不要误清他人的缓存。
+        if (this.encoded === attempt) this.encoded = undefined;
+        throw err;
+      });
+      this.encoded = attempt;
+    }
     return this.encoded;
   }
 
