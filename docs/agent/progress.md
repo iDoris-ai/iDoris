@@ -11,7 +11,7 @@
 
 ## 仓库基线（2026-09-26 合并收尾后）
 - `preview` = `79487c3`，**38 个 PR 全部合入**，open PR 归零。
-- 7 个包（contracts / adapters / router / tenancy / recommender / growth / federation），135 个源文件。
+- 7 个包（contracts / adapters / router / tenancy / recommender / growth / federation）；`packages/*/src` 下 61 个 `.ts`，测试 64 个 `.ts`（实测计数，非估算）。
 - 全门禁在干净安装且**不先 build** 的条件下绿：`lint` / `typecheck` / `check:contract-drift` / `build` / `test` **375 条**（contracts 105 · router 120 · adapters 54 · recommender 37 · growth 22 · federation 21 · tenancy 16）/ `smoke`。
 - 分支已清理（29 个已合并分支 + 3 个 worktree 回收）。遗留两个待人决定：`test/cla-action-check`（PR #1 已 CLOSED 未合并）、`docs/model-capability-design-agent24`（squash 合入 PR #8，`-d` 判不出，删除需人敲 `-D`）。
 - ⚠️ **`preview` → `main` 尚未进行**：`main` 仍是 `1be703c`，落后 preview 全部内容。这一步要单独走受控 PR。
