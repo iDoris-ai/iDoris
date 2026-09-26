@@ -1,0 +1,89 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://idoris.ai/schema/provider.schema.json",
+  "title": "ProviderDescriptor",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "id",
+    "family",
+    "tier",
+    "capabilities",
+    "privacy_class",
+    "cost",
+    "locality"
+  ],
+  "properties": {
+    "id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "family": {
+      "enum": [
+        "idoris",
+        "claude",
+        "openai",
+        "local",
+        "other"
+      ]
+    },
+    "tier": {
+      "enum": [
+        "local",
+        "remote",
+        "lora"
+      ]
+    },
+    "capabilities": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "enum": [
+          "chat",
+          "reasoning",
+          "vision",
+          "asr",
+          "tts",
+          "coding",
+          "embedding",
+          "rerank"
+        ]
+      }
+    },
+    "privacy_class": {
+      "enum": [
+        "local_only",
+        "any"
+      ]
+    },
+    "cost": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "input_per_m",
+        "output_per_m"
+      ],
+      "properties": {
+        "input_per_m": {
+          "type": "number",
+          "minimum": 0
+        },
+        "output_per_m": {
+          "type": "number",
+          "minimum": 0
+        }
+      }
+    },
+    "locality": {
+      "enum": [
+        "loopback",
+        "lan",
+        "remote"
+      ]
+    },
+    "extensions": {
+      "type": "object",
+      "additionalProperties": true
+    }
+  }
+}
