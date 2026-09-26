@@ -8,3 +8,4 @@ export * from "./load-policy.js";
 export * from "./component-card.js";
 export * from "./routing-policy.js";
 export * from "./task-profile.js";
+export * from "./validate.js";
