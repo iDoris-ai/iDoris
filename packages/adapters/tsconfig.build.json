@@ -1,5 +1,12 @@
 {
   "extends": "./tsconfig.json",
-  "compilerOptions": { "rootDir": ".", "outDir": "dist" },
-  "include": ["src/**/*.ts", "mock/**/*.ts"]
+  "compilerOptions": {
+    "rootDir": ".",
+    "outDir": "dist",
+    "paths": {}
+  },
+  "include": [
+    "src/**/*.ts",
+    "mock/**/*.ts"
+  ]
 }
