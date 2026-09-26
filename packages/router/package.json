@@ -8,12 +8,15 @@
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "vitest run"
+    "test": "vitest run",
+    "test:egress": "vitest run test/egress.test.ts"
   },
   "dependencies": {
     "@idoris/adapters": "workspace:*",
     "@idoris/contracts": "workspace:*",
     "yaml": "^2.6.1"
   },
-  "devDependencies": { "@types/node": "^22.0.0" }
+  "devDependencies": {
+    "@types/node": "^22.0.0"
+  }
 }
