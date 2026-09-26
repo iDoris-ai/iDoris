@@ -11,3 +11,5 @@ export { dispatch, isLocalCapable } from "./dispatch.js";
 export type { DispatchOutcome, EgressCounter } from "./dispatch.js";
 export { decisionReason, requireReason, reasonHeader, MissingReasonError, REASON_KINDS } from "./reason.js";
 export type { DecisionReason, ReasonKind } from "./reason.js";
+export { ChatProxy } from "./proxy.js";
+export type { FetchLike, FetchResponseLike, ForwardResult, ReadableStreamLike } from "./proxy.js";
