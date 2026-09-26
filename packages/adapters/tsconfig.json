@@ -3,6 +3,9 @@
   "compilerOptions": {
     "outDir": "dist",
     "tsBuildInfoFile": "dist/.tsbuildinfo",
+    "types": [
+      "node"
+    ],
     "baseUrl": ".",
     "paths": {
       "@idoris/contracts": [

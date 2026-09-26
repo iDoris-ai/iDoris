@@ -8,9 +8,13 @@
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "vitest run"
+    "test": "vitest run",
+    "test:integration": "vitest run tests/integration"
   },
   "dependencies": {
     "@idoris/contracts": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0"
   }
 }
