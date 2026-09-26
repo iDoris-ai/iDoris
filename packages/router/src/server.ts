@@ -121,8 +121,12 @@ async function handleChat(
     return;
   }
   let profile;
+  let tenantId: string | undefined;
   try {
-    profile = parseProfile(req.headers).profile;
+    const parsedProfile = parseProfile(req.headers);
+    profile = parsedProfile.profile;
+    // ★ 不要只取 .profile —— tenantId 丢在这里就等于幂等缓存跨租户共享（评审 PR #25）。
+    tenantId = parsedProfile.tenantId;
   } catch (err) {
     if (err instanceof ProfileError) {
       json(res, err.status, { error: { type: err.code, message: err.message } });
@@ -151,6 +155,7 @@ async function handleChat(
     {
       stream: body.stream === true,
       ...(typeof requestId === "string" ? { requestId } : {}),
+      ...(tenantId !== undefined ? { tenantId } : {}),
       signal: controller.signal,
     },
   );
