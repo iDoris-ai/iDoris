@@ -1,0 +1,24 @@
+{
+  "name": "@idoris/router",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "test:egress": "vitest run test/egress.test.ts"
+  },
+  "dependencies": {
+    "@idoris/adapters": "workspace:*",
+    "@idoris/contracts": "workspace:*",
+    "@idoris/recommender": "workspace:*",
+    "@idoris/tenancy": "workspace:*",
+    "yaml": "^2.6.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0"
+  }
+}

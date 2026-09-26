@@ -1,0 +1,79 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://idoris.ai/schema/training-sample.schema.json",
+  "title": "TrainingSample",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "sample_id",
+    "data_class",
+    "source",
+    "messages"
+  ],
+  "properties": {
+    "sample_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "group_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "data_class": {
+      "enum": [
+        "synthetic",
+        "anonymized",
+        "real"
+      ]
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind"
+      ],
+      "properties": {
+        "kind": {
+          "enum": [
+            "synthetic_seed",
+            "refined_from_synthetic",
+            "human_reviewed"
+          ]
+        },
+        "generator": {
+          "type": "string",
+          "minLength": 1
+        },
+        "intent": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "messages": {
+      "type": "array",
+      "minItems": 2,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "role",
+          "content"
+        ],
+        "properties": {
+          "role": {
+            "enum": [
+              "system",
+              "user",
+              "assistant"
+            ]
+          },
+          "content": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    }
+  }
+}

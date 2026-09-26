@@ -37,7 +37,7 @@ MushroomDAO 的源代码根据 Apache 许可证 2.0 版开放——这是一个�
 - **AirAccount**
 - **SuperPaymaster**
 - **OpenNest**
-- **AuraAI**
+- **iDoris.ai**
 
 ### 公司与组织名称
 - **HyperCapital**
@@ -50,7 +50,7 @@ MushroomDAO 的源代码根据 Apache 许可证 2.0 版开放——这是一个�
 
 - MushroomDAO 标志（蘑菇图标 + 文字标识）
 - AAStar 标志
-- AuraAI 标志
+- iDoris.ai 标志
 - Mycelium Protocol 标志
 - GToken 符号
 

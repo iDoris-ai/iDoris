@@ -1,0 +1,7 @@
+# pilot 仓库配置 — iDoris
+base_branch: main            # 受 GitHub ruleset 保护，禁止直推
+integration_branch: preview  # 所有 PR 合并进这里；preview → main 单独走受控 PR
+protect_patterns: [release, hotfix]
+remote: origin
+docs_dir: docs/agent
+planning_source: docs        # 规划七件套在 docs/agent/，门禁按 --strict 检查
