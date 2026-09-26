@@ -1,5 +1,6 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import {
+  isPersonalDeployMode,
   isSubscriptionProviderId,
   openAIChatCompletion,
   type ChatMessage,
@@ -179,9 +180,27 @@ async function handleChat(
     return;
   }
   let profile: TaskProfile;
+  let tenantId: string | undefined;
   try {
-    profile = (await resolveProfile(req.headers, { messages: toMessages(body.messages) }, intentDetector))
-      .profile;
+    // 语义冲突的正确解法是**两者都要**，不是二选一：
+    //   · resolveProfile 带来 #32 的语义意图路由兜底；
+    //   · .tenantId 是 #25 修跨租户幂等缓存泄漏的那一半 —— 丢了它泄漏就回来了。
+    // resolveProfile 本身透传 tenantId（intent.ts:230），所以两件事不冲突。
+    // #32 原本只取 .profile 并不是 bug：它的 base 当时还没有 tenantId 这条线。
+    // ★ 必须把 deployMode 从注入的 env 算出来传进去。
+    // resolveProfile 的 deployMode 默认值是 currentDeployMode()，它读的是
+    // **process.env**；不传就会绕过 RouterOptions.env。后果不是测试不方便：
+    // 部署方若用注入 env 配 tenant 模式，会静默降级成 personal → X-iDoris-Tenant
+    // 被忽略 → 跨租户共享幂等缓存。env 那条注释本来就承诺了「读取 deploy_mode」。
+    const deployMode = isPersonalDeployMode(env) ? "personal" : "tenant";
+    const resolved = await resolveProfile(
+      req.headers,
+      { messages: toMessages(body.messages) },
+      intentDetector,
+      deployMode,
+    );
+    profile = resolved.profile;
+    tenantId = resolved.tenantId;
   } catch (err) {
     if (err instanceof ProfileError) {
       json(res, err.status, { error: { type: err.code, message: err.message } });
@@ -240,6 +259,7 @@ async function handleChat(
     {
       stream: body.stream === true,
       ...(typeof requestId === "string" ? { requestId } : {}),
+      ...(tenantId !== undefined ? { tenantId } : {}),
       signal: controller.signal,
     },
   );
