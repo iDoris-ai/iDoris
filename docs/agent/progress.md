@@ -1,26 +1,44 @@
 # iDoris 统一模型服务 实时状态 — progress
 
 > 「此刻仓库真实发生了什么」。由 `pilot run` 每一步更新。
-> 更新时间：2026-09-07 11:30
+> 更新时间：2026-09-26
 
 ## 当前聚焦
-- **Milestone**：M1 统一网关 MVP
-- **Feature**：F1.1 契约层落地
-- **正在开发的 Task**：无（规划刚落地，尚未开工任何 task）
-- **分支 / worktree**：`docs/agent-ledger` / `../iDoris-plan`（规划专属 worktree，不属于任何 Feature）
-- **PR**：本台账自身待开 PR 进 `preview`
+- **Milestone**：M1/M2/M3 的 task 全部 `DONE`（38 个），代码已在集成分支
+- **正在开发的 Task**：无
+- **分支 / worktree**：`preview`（干净，无 worktree 残留）
+- **PR**：**0 open**
 
-## 仓库基线（2026-09-07 盘点）
+## 仓库基线（2026-09-26 合并收尾后）
+- `preview` = `79487c3`，**38 个 PR 全部合入**，open PR 归零。
+- 7 个包（contracts / adapters / router / tenancy / recommender / growth / federation）；`packages/*/src` 下 61 个 `.ts`，测试 64 个 `.ts`（实测计数，非估算）。
+- 全门禁在干净安装且**不先 build** 的条件下绿：`lint` / `typecheck` / `check:contract-drift` / `build` / `test` **375 条**（contracts 105 · router 120 · adapters 54 · recommender 37 · growth 22 · federation 21 · tenancy 16）/ `smoke`。
+- 分支已清理（29 个已合并分支 + 3 个 worktree 回收）。遗留两个待人决定：`test/cla-action-check`（PR #1 已 CLOSED 未合并）、`docs/model-capability-design-agent24`（squash 合入 PR #8，`-d` 判不出，删除需人敲 `-D`）。
+- ⚠️ **`preview` → `main` 尚未进行**：`main` 仍是 `1be703c`，落后 preview 全部内容。这一步要单独走受控 PR。
+
+## 本轮修掉的三个静默失效（形状相同：边界处的断线，都不崩不报错）
+| PR | 断在哪 | 后果 |
+|:---|:---|:---|
+| #25 | `parseProfile().profile` 丢掉 `.tenantId` | 跨租户幂等缓存泄漏（评审实测 B 拿到 A 的响应正文）|
+| 合并 #32 时 | `resolveProfile` 未收到由注入 `env` 算出的 `deployMode` | tenant 模式静默降级成 personal → `X-iDoris-Tenant` 被忽略 → 缓存又串 |
+| #23 | 探针函数被调用了，但 `describeTarget` 把实参静默丢弃（Node `_normalizeArgs` 把参数包成数组；`path: null` 被当 unix socket）| 出网探针对 `fetch`/`http.request` 完全失明，而「零出网」断言照样绿 |
+
+## 方法论留档：变异测试在本轮四次抓到「测试不承重」
+四次**没有一次**是靠读代码发现的。最险的一次是合并 #32：解完语义冲突后 119/119 全绿，按理就该继续合，是变异证明「删掉 `tenantId` 赋值照样全绿」——**server 层接线从来没有测试**（那四条跨租户测试测的是 `ChatProxy` 单元、显式传参），差点把跨租户泄漏放回生产。
+另三次：#32 的故障注入打错了 `embed()` 调用（`detect()` 里有两次用途不同的调用）· #25 的「插入序不变式」测试因时间推进太快而场景没构造出来 · #23 的正对照用了被 patch 的同一个 API。
+→ 已并入 FU-8，并新立 FU-15 作为护栏。
+
+## 历史基线（2026-09-07 盘点，已被上方「仓库基线（2026-09-26）」取代，保留作过程留档）
 - 集成分支 `preview` 已建立并推送；`main` 有 active ruleset 保护，只由 `preview` 经受控 PR 进入。
 - PR #3（十篇规划文档 + U0 spike log）已 squash 合并进 `preview`；本地分支 `docs/idoris-unified-model-plan` 已清理。
 - **仓库尚无任何代码**——只有 `docs/`（规划）与 `spike/u0/`（实测日志）。M1 的第一个 task 就是起 pnpm workspace 骨架。
 - 遗留分支 `test/cla-action-check`：对应 PR #1 已 CLOSED **未合并**，safe-cleanup 正确地不动它，是否废弃待人决定。
 
 ## 进行中 / 待回执的 PR
-| Task | PR | 状态 | 备注 |
-|:---|:---|:---|:---|
-| —（规划台账）| 待开 | — | `docs/agent-ledger` → `preview` |
-| —（跨仓库需求）| [#4](https://github.com/iDoris-ai/iDoris/pull/4) | PR_OPEN | iDoris-website 提的 R0–R6；**base 是 `main`，需改成 `preview`**；且分支基于 PR #3 合并前的点，diff 里混进了 01–10 全部文档，真实新增只有 `docs/11-来自Starter-Kit的需求.md` |
+
+**无。** open PR 归零，`preview` 上没有在途分支。
+
+> 历史留档：上表原记录的两条已闭合 —— 规划台账经 PR #5 合入；PR #4（iDoris-website 提的 R0–R6）已修正 base 为 `preview` 并合入，R1–R6 的采纳结论见本文下方。
 
 ## 阻塞项（BLOCKED）
 
