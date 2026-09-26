@@ -1,0 +1,22 @@
+provider:
+  id: mock
+  family: local
+  tier: local
+  capabilities: [chat]
+  privacy_class: local_only
+  cost: { input_per_m: 0, output_per_m: 0 }
+  locality: loopback
+form: http_service
+endpoint: "mock://in-memory"
+version_pin: "mock@0.1.0"
+privacy_class: local_only
+allowed_egress: [none]
+fallback_policy: fail_closed
+fail_closed: true
+load_policy: { mode: resident, keepalive: { pinned: true }, admission: coexist }
+extensions:
+  mock:
+    memoryMaxGb: 16
+    models:
+      - { id: mock-small, memoryGb: 2 }
+      - { id: mock-large, memoryGb: 8 }

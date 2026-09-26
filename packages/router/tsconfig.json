@@ -1,9 +1,20 @@
 {
   "extends": "../../tsconfig.base.json",
   "compilerOptions": {
-    "rootDir": ".",
     "outDir": "dist",
-    "tsBuildInfoFile": "dist/.tsbuildinfo"
+    "types": [
+      "node"
+    ],
+    "tsBuildInfoFile": "dist/.tsbuildinfo",
+    "baseUrl": ".",
+    "paths": {
+      "@idoris/contracts": [
+        "../contracts/src/index.ts"
+      ],
+      "@idoris/adapters": [
+        "../adapters/src/index.ts"
+      ]
+    }
   },
   "include": [
     "src/**/*.ts",
