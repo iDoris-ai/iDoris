@@ -4,7 +4,7 @@
 > 每个 Task 自包含，可独立开发与验收。**验收标准必须可机器验证**（跑命令能判定）。
 > 状态：BACKLOG · READY · IN_PROGRESS · BLOCKED · PR_OPEN · CHANGES_REQUESTED · APPROVED · DONE
 > 记录日期：2026-09-07
-> 台账同步：2026-09-22（F1.x/F2.x 共 32 个 Task 已落 PR #9–#32，均为栈内 OPEN；F3.x 与 T2.5.2 未动）
+> 台账同步：2026-09-22（F1.x/F2.x/F3.x 共 38 个 Task 已落 PR #9–#37，均为栈内 OPEN；T2.5.2 仍 BLOCKED）
 
 ---
 
@@ -20,7 +20,7 @@
 - **验收命令**：`pnpm install && pnpm lint && pnpm typecheck && pnpm build && pnpm test`（全部退出 0；test 允许 0 用例但脚本必须存在且成功）
 - **涉及文件**：仓库根、`packages/contracts/`、`packages/router/`、`.github/workflows/ci.yml`
 - **风险/回滚**：无（纯新增）
-- **证据**：PR #9（栈内 OPEN，未合并；本机门禁 14 项全绿）
+- **证据**：PR #9（栈内 OPEN，未合并；本机门禁全绿）
 
 ### T1.1.2 五份契约的 TS 类型 + zod schema  `PR_OPEN`
 - **优先级**：high
@@ -32,7 +32,7 @@
 - **验收命令**：`pnpm --filter @idoris/contracts test`（每份契约至少 1 条合法样例通过 + 1 条缺必填字段样例被拒绝）
 - **涉及文件**：`packages/contracts/`
 - **风险/回滚**：契约变更影响所有下游 → 本 task 内定版为 v1，后续改动走版本化
-- **证据**：PR #10（栈内 OPEN，未合并；本机门禁 14 项全绿）
+- **证据**：PR #10（栈内 OPEN，未合并；本机门禁全绿）
 
 ### T1.1.3 组件卡策略校验器（缺字段即拒绝注册）  `PR_OPEN`
 - **优先级**：high
@@ -44,7 +44,7 @@
 - **验收命令**：`pnpm --filter @idoris/contracts test:contract`（每条交叉规则至少 1 条反例被拒绝，断言错误类型而非仅断言抛错）
 - **涉及文件**：`packages/contracts/src/validate.ts`
 - **风险/回滚**：**涉安全**——校验器漏判等于隐私门禁失效；反例测试是唯一凭证，不得跳过
-- **证据**：PR #11（栈内 OPEN，未合并；本机门禁 14 项全绿）
+- **证据**：PR #11（栈内 OPEN，未合并；本机门禁全绿）
 
 ### T1.1.4 契约成熟度标注与 README  `PR_OPEN`
 - **优先级**：low
@@ -52,7 +52,7 @@
 - **开发范围**：`packages/contracts/README.md` 成熟度表 + 每份 schema 顶部注释标注级别
 - **依赖**：T1.1.2
 - **验收命令**：`test -f packages/contracts/README.md && grep -qE 'L[0-3]' packages/contracts/README.md`
-- **证据**：PR #13（栈内 OPEN，未合并；本机门禁 14 项全绿）
+- **证据**：PR #13（栈内 OPEN，未合并；本机门禁全绿）
 
 ---
 
@@ -68,7 +68,7 @@
 - **验收命令**：`pnpm --filter @idoris/adapters test`（断言：pinned 模型在 ceiling 压力下不被驱逐；unpinned 按 LRU 驱逐；`admission` 正确返回 `coexist|requires_eviction`）
 - **涉及文件**：`packages/adapters/`
 - **风险/回滚**：无
-- **证据**：PR #14（栈内 OPEN，未合并；本机门禁 14 项全绿）
+- **证据**：PR #14（栈内 OPEN，未合并；本机门禁全绿）
 
 ### T1.2.2 oMLX 适配器  `PR_OPEN`
 - **优先级**：high
@@ -80,7 +80,7 @@
 - **验收命令**：`pnpm --filter @idoris/adapters test:integration`（本机有 oMLX 时真起 `omlx serve --memory-guard balanced --memory-guard-gb 16` 跑 load→warm-hit→evict 序列；**无 oMLX 时必须打印 SKIPPED 并以非零以外方式明示跳过，不得静默通过**）
 - **涉及文件**：`packages/adapters/omlx/`
 - **风险/回滚**：v0.4.3 已知小限制——VLM 引擎 guard 传播告警（`could not resolve scheduler for VLMBatchedEngine`），不阻塞，记 followup
-- **证据**：PR #16（栈内 OPEN，未合并；本机门禁 14 项全绿）
+- **证据**：PR #16（栈内 OPEN，未合并；本机门禁全绿）
 
 ### T1.2.3 跨平台后端探测骨架  `PR_OPEN`
 - **优先级**：mid
@@ -92,7 +92,7 @@
 - **验收命令**：`pnpm --filter @idoris/adapters test` + `! grep -rn "omlx" packages/router/src`（Router 核心零引用即通过）
 - **涉及文件**：`packages/adapters/src/detect.ts`
 - **风险/回滚**：无
-- **证据**：PR #15（栈内 OPEN，未合并；本机门禁 14 项全绿）
+- **证据**：PR #15（栈内 OPEN，未合并；本机门禁全绿）
 
 ### T1.2.4 LoadPolicy 黄金一致性测试（L3）  `PR_OPEN`
 - **优先级**：mid
@@ -100,7 +100,7 @@
 - **开发范围**：一份共享测试套件，参数化跑在两个适配器上。
 - **依赖**：T1.2.2、T1.2.1
 - **验收命令**：`pnpm test:golden`
-- **证据**：PR #17（栈内 OPEN，未合并；本机门禁 14 项全绿）
+- **证据**：PR #17（栈内 OPEN，未合并；本机门禁全绿）
 
 ---
 
@@ -116,7 +116,7 @@
 - **验收命令**：`pnpm --filter @idoris/router test && pnpm smoke`（`curl -s localhost:$PORT/v1/models | jq -e '.data|length>0'`；且注入一张缺 `privacy_class` 的组件卡时**启动失败并退出非 0**）
 - **涉及文件**：`packages/router/`、`config/components/`
 - **风险/回滚**：**涉安全**——绑定地址必须硬编码 loopback，测试断言不监听 `0.0.0.0`
-- **证据**：PR #18（栈内 OPEN，未合并；本机门禁 14 项全绿）
+- **证据**：PR #18（栈内 OPEN，未合并；本机门禁全绿）
 
 ### T1.3.2 控制面 header 解析 + routing policy 解释引擎  `PR_OPEN`
 - **优先级**：high
@@ -128,7 +128,7 @@
 - **验收命令**：`pnpm --filter @idoris/router test`（覆盖：header 缺省 → local_only；非法值 → 400；规则按序首条命中；无 `default` 的 policy 文件加载失败；**tenant 模式缺 tenant header → 400 而非默认租户**）+ `pnpm test:privacy` 的顺序用例（`privacy=local_only` 且意图指向外部能力 → 走本地或报错，**证明隐私判定排在意图匹配之前**）
 - **涉及文件**：`packages/router/src/`、`config/routing-policy.yaml`
 - **风险/回滚**：策略文件版本化，破坏性改动升 `version`
-- **证据**：PR #19（栈内 OPEN，未合并；本机门禁 14 项全绿）
+- **证据**：PR #19（栈内 OPEN，未合并；本机门禁全绿）
 
 ### T1.3.3 fail-closed 隐私门禁 + 降级链  `PR_OPEN`
 - **优先级**：high
@@ -140,7 +140,7 @@
 - **验收命令**：`pnpm test:privacy` —— 停掉全部本地 provider，发 20 条 `local_only` 请求，断言 **20 条全部 503 且假上游出站计数器 == 0**；任一条出站即失败
 - **涉及文件**：`packages/router/src/dispatch.ts`
 - **风险/回滚**：**阻断级**——此测试失败不接受「已知问题」标注，必须修到过
-- **证据**：PR #20（栈内 OPEN，未合并；本机门禁 14 项全绿）
+- **证据**：PR #20（栈内 OPEN，未合并；本机门禁全绿）
 
 ### T1.3.4 `/v1/chat/completions` 转发：streaming、重试、幂等、取消  `PR_OPEN`
 - **优先级**：high
@@ -152,7 +152,7 @@
 - **验收命令**：`pnpm smoke`（用 openai SDK 跑非流式 + 流式各一次，断言首 token 到达；断开连接后断言上游收到 abort）
 - **涉及文件**：`packages/router/src/proxy.ts`
 - **风险/回滚**：流式重试会导致重复 token —— 测试显式断言「已吐 token 后不重试」
-- **证据**：PR #25（栈内 OPEN，未合并；本机门禁 14 项全绿）
+- **证据**：PR #25（栈内 OPEN，未合并；本机门禁全绿）
 
 ### T1.3.5 驱逐竞态互斥锁  `PR_OPEN`
 - **优先级**：mid
@@ -160,7 +160,7 @@
 - **开发范围**：per-backend 互斥锁，`evict_to_load` 全程持锁；等待超时 10s → 返回 `oom` 而非无限等待。
 - **依赖**：T1.3.4、T1.2.1
 - **验收命令**：`pnpm --filter @idoris/router test`（并发 10 个需要互相驱逐的请求，断言无死锁、无超过 10s 的等待、全部有终态）
-- **证据**：PR #26（栈内 OPEN，未合并；本机门禁 14 项全绿）
+- **证据**：PR #26（栈内 OPEN，未合并；本机门禁全绿）
 
 ### T1.3.6 出网启动断言（启动期部署配置，与运行期路由是两个洞）  `PR_OPEN`
 - **优先级**：mid
@@ -172,7 +172,7 @@
 - **验收命令**：`pnpm test:egress`（零出网断言通过 **且** 正对照用例确实被探针捕获；正对照不红即判本 task 未完成）
 - **涉及文件**：`packages/router/test/`
 - **风险/回滚**：**涉隐私**——参考实测：某些库不设变量时零出网，但设了 tracing 类环境变量后会连外部端点。风险不在库，在部署配置
-- **证据**：PR #23（栈内 OPEN，未合并；本机门禁 14 项全绿）
+- **证据**：PR #23（栈内 OPEN，未合并；本机门禁全绿）
 
 ---
 
@@ -189,7 +189,7 @@
 - **验收命令**：`pnpm --filter @idoris/adapters test:integration`（① 本机有 `claude` 时断言 `claude -p "reply with exactly: IDORIS_RELAY_OK"` 经网关返回该字符串；② 进程清理断言 `ps` 无残留子进程；③ **沙箱断言**：喂一个诱导写文件/调工具的 prompt，断言文件系统无变化；**子进程断言是「只有那个固定二进制及其必要运行时被 spawn」，不是「零子进程」**（CLI 自己要联网读凭据，零子进程跑不起来）；另断言网络目的地、输入目录、凭据范围、输出大小四项限制生效；④ 无 CLI 时打印 SKIPPED）
 - **涉及文件**：`packages/adapters/subscription/`
 - **风险/回滚**：孤儿进程会吃满机器 —— 清理断言是硬性验收项
-- **证据**：PR #30（栈内 OPEN，未合并；本机门禁 14 项全绿）
+- **证据**：PR #30（栈内 OPEN，未合并；本机门禁全绿）
 
 ### T1.4.2 loopback + 单用户门禁（合规红线落地）  `PR_OPEN`
 - **优先级**：high
@@ -201,7 +201,7 @@
 - **验收命令**：`pnpm --filter @idoris/router test`（断言：非 loopback 来源的订阅请求被拒；`IDORIS_DEPLOY_MODE` 取 `tenant` / `community` / `city` **三者中任一**时，启动即拒绝注册订阅 provider 并退出非 0）
 - **涉及文件**：`packages/router/src/egress-guard.ts`
 - **风险/回滚**：**涉合规**——此门禁是能力①得以存在的前提，测试不得跳过
-- **证据**：PR #30（栈内 OPEN，未合并；本机门禁 14 项全绿）
+- **证据**：PR #30（栈内 OPEN，未合并；本机门禁全绿）
 
 ### T1.4.3 订阅中转不作必需 fallback 的断言  `PR_OPEN`
 - **优先级**：mid
@@ -209,7 +209,7 @@
 - **开发范围**：routing policy 中订阅 provider 永不出现在 `default` 链；测试断言禁用订阅 provider 后所有非订阅场景仍全绿。
 - **依赖**：T1.4.2
 - **验收命令**：`IDORIS_DISABLE_SUBSCRIPTION=1 pnpm test`（全绿）
-- **证据**：PR #30（栈内 OPEN，未合并；本机门禁 14 项全绿）
+- **证据**：PR #30（栈内 OPEN，未合并；本机门禁全绿）
 
 ---
 
@@ -228,7 +228,7 @@
 - **验收命令**：`pnpm --filter @idoris/contracts test:contract`（合法/非法 TenantContext 各若干；`billing_timezone` 缺失或非 IANA 名 → 拒绝；`budget.scope` 非枚举值 → 拒绝）且 `test -f docs/agent/contract-tenancy.md`
 - **涉及文件**：`packages/contracts/src/tenant.ts`
 - **风险/回滚**：契约发布后下游会照着写，破坏性改动要升版本 —— 本 task 内定版 v1
-- **证据**：PR #12（栈内 OPEN，未合并；本机门禁 14 项全绿）
+- **证据**：PR #12（栈内 OPEN，未合并；本机门禁全绿）
 
 ### T1.5.2 预算闸门（终态拒绝，非降级）  `PR_OPEN`
 - **优先级**：high
@@ -239,7 +239,7 @@
 - **交付物**：`packages/tenancy/src/budget.ts`
 - **验收命令**：`pnpm --filter @idoris/tenancy test`（① 超预算 → 402 且**假上游计费计数器 == 0**；② 错误体含明确的预算语义标识，不与 5xx 故障混淆；③ `scope=paid_only` 时超预算仍可调本地零成本模型；④ `scope=all` 时一律拒绝；⑤ 变异测试：把「超预算拒绝」改成「降级到便宜档」必须变红）
 - **风险/回滚**：**涉钱**——闸门失效等于替客户花钱；计费计数器断言不可省
-- **证据**：PR #22（栈内 OPEN，未合并；本机门禁 14 项全绿）
+- **证据**：PR #22（栈内 OPEN，未合并；本机门禁全绿）
 
 ### T1.5.3 租户硬隔离的数据访问层  `PR_OPEN`
 - **优先级**：high
@@ -250,7 +250,7 @@
 - **交付物**：`packages/tenancy/src/store.ts`
 - **验收命令**：`pnpm test:tenancy`（① 造两个 tenant 的三类数据，断言 A 查不到 B 的任何一条；② **不带 tenant 上下文的查询抛错**而非返回全量；③ 变异测试：把作用域校验去掉必须变红）
 - **风险/回滚**：**涉隐私/涉钱**——隔离失效等于跨客户数据泄漏
-- **证据**：PR #21（栈内 OPEN，未合并；本机门禁 14 项全绿）
+- **证据**：PR #21（栈内 OPEN，未合并；本机门禁全绿）
 
 ### T1.5.4 决策 reason 可解释  `PR_OPEN`
 - **优先级**：mid
@@ -259,7 +259,7 @@
 - **明确不做**：不做自然语言解释生成（枚举 + 结构化字段即可）。
 - **依赖**：T1.3.3
 - **验收命令**：`pnpm --filter @idoris/router test`（四类 reason 各一条用例；**reason 为空的决策被拒绝**；变异测试：把 reason 置空必须变红）
-- **证据**：PR #24（栈内 OPEN，未合并；本机门禁 14 项全绿）
+- **证据**：PR #24（栈内 OPEN，未合并；本机门禁全绿）
 
 ---
 
@@ -275,7 +275,7 @@
 - **验收命令**：`pnpm --filter @idoris/recommender test`（对照 U0 实测值断言：Qwen3-8B 4bit ≈4.48GB、VL-7B ≈8.50GB、8B 的 KV ≈9.00MB/64token，误差 <5%）
 - **涉及文件**：`packages/recommender/`
 - **风险/回滚**：公式偏差会导致 OOM —— 用 U0 实测数据作回归基线
-- **证据**：PR #27（栈内 OPEN，未合并；本机门禁 14 项全绿）
+- **证据**：PR #27（栈内 OPEN，未合并；本机门禁全绿）
 
 ### T2.1.2 打分与推荐算法 + `IDORIS_CORE_MODEL` override  `PR_OPEN`
 - **优先级**：high
@@ -285,14 +285,14 @@
 - **交付物**：`packages/recommender/src/recommend.ts`、`config/catalog.yaml`
 - **验收命令**：`pnpm --filter @idoris/recommender test`（断言 M4/24GB profile 输出 `resident=ornith-1.0-9b@q6_k` 且 `agents-a1-35b` 判 `BLOCKED`；16GB 降到 q4/q5；32GB 允许 35B）
 - **风险/回滚**：目录数据错误会推荐出跑不动的组合 —— catalog 每条附 `min_ram_gb` 硬门槛
-- **证据**：PR #27（栈内 OPEN，未合并；本机门禁 14 项全绿）
+- **证据**：PR #27（栈内 OPEN，未合并；本机门禁全绿）
 
 ### T2.1.3 可读 tradeoff 输出 + sysctl 建议  `PR_OPEN`
 - **优先级**：mid
 - **目标**：推荐不是黑箱打分，要能解释为什么这么选。
 - **依赖**：T2.1.2
 - **验收命令**：`pnpm --filter @idoris/recommender test`（断言输出含 `warnings[]`、`recommended_sysctl.iogpu_wired_limit_mb`、非空 `tradeoff` 文本）
-- **证据**：PR #27（栈内 OPEN，未合并；本机门禁 14 项全绿）
+- **证据**：PR #27（栈内 OPEN，未合并；本机门禁全绿）
 
 ---
 
@@ -304,14 +304,14 @@
 - **开发范围**：每个能力附 `resident/estimated_memory_gb/ctx_limit/queue_depth/admission_status(ready|requires_eviction|blocked)`；数据源为 recommender + backend `status()`。
 - **依赖**：T2.1.2、T1.3.1
 - **验收命令**：`pnpm smoke`（`curl /capabilities | jq -e '.[]|select(.admission_status)'` 非空且取值在枚举内）
-- **证据**：PR #28（栈内 OPEN，未合并；本机门禁 14 项全绿）
+- **证据**：PR #28（栈内 OPEN，未合并；本机门禁全绿）
 
 ### T2.2.2 native 特性收进 extensions 命名空间  `PR_OPEN`
 - **优先级**：low
 - **目标**：防 provider 锁定（06 §10.7）——原生特性不得裸用，必须带降级声明。
 - **依赖**：T1.1.2
 - **验收命令**：`pnpm --filter @idoris/contracts test:contract`（无 `_degradation` 声明的 extension 被拒绝）
-- **证据**：PR #28（栈内 OPEN，未合并；本机门禁 14 项全绿）
+- **证据**：PR #28（栈内 OPEN，未合并；本机门禁全绿）
 
 ### T2.2.3 路由决策审计日志  `PR_OPEN`
 - **优先级**：mid
@@ -321,7 +321,7 @@
 - **依赖**：T1.3.3、T1.5.3
 - **验收命令**：`pnpm test:audit`（① 哨兵字符串不出现在日志；② 含黑名单字段名的记录**抛错**而非被清洗后写入；③ 超 500 字符的字段被拒绝。对照 iDoris-website 的两条变异测试：「字段名不再比对禁用清单」「取消 500 字符上限」，改坏后必须变红）；④ **`reason` 为空的记录被拒绝**，且四类 reason 各有一条用例
 - **风险/回滚**：**涉隐私**——内容入日志等于隐私承诺作废，哨兵测试是硬性验收项
-- **证据**：PR #28（栈内 OPEN，未合并；本机门禁 14 项全绿）
+- **证据**：PR #28（栈内 OPEN，未合并；本机门禁全绿）
 
 ---
 
@@ -333,14 +333,14 @@
 - **明确不做**：**不改 Agent24 内核代码**——iDoris 只提需求。
 - **依赖**：T1.3.4
 - **验收命令**：`test -f docs/agent/handoff-agent24.md`（含 R1–R6 逐条的接口约定与联调命令）
-- **证据**：PR #31（栈内 OPEN，未合并；本机门禁 14 项全绿）
+- **证据**：PR #31（栈内 OPEN，未合并；本机门禁全绿）
 
 ### T2.3.2 端到端联调冒烟  `PR_OPEN`
 - **优先级**：mid
 - **目标**：Agent24 把 `IDORIS_URL` 指过来后原有功能零回归且能用到本地模型。
 - **依赖**：T2.3.1
 - **验收命令**：`pnpm smoke:agent24`（Agent24 provider 列表出现 iDoris；一次 `local_only` 调用落到本地模型）
-- **证据**：PR #31（栈内 OPEN，未合并；本机门禁 14 项全绿）
+- **证据**：PR #31（栈内 OPEN，未合并；本机门禁全绿）
 
 ---
 
@@ -352,7 +352,7 @@
 - **明确不做**：不替代 header —— **显式声明永远优先于识别结果**；隐私字段绝不自动推断。
 - **依赖**：T1.3.2
 - **验收命令**：`pnpm --filter @idoris/router test`（断言：显式 header 存在时识别结果被忽略；`privacy` 永不被自动推断）
-- **证据**：PR #32（栈内 OPEN，未合并；本机门禁 14 项全绿）
+- **证据**：PR #32（栈内 OPEN，未合并；本机门禁全绿）
 
 ---
 
@@ -365,7 +365,7 @@
 - **明确不做**：不做 Anthropic/Gemini 翻译；不引入 LiteLLM/ClawRouter/OmniRoute。
 - **依赖**：T1.3.4
 - **验收命令**：`pnpm smoke:external`（有 key 时调通一次；无 key 时打印 SKIPPED 而非失败）
-- **证据**：PR #31（栈内 OPEN，未合并；本机门禁 14 项全绿）
+- **证据**：PR #31（栈内 OPEN，未合并；本机门禁全绿）
 
 ### T2.5.2 三路由保真度矩阵（OmniRoute / ClawRouter / LiteLLM）  `BLOCKED`
 - **优先级**：low
@@ -389,15 +389,53 @@
 - **交付物**：`packages/tenancy/src/billing.ts`
 - **验收命令**：`pnpm test:billing` —— 同一批数据在 `TZ=UTC` / `TZ=Asia/Bangkok` / `TZ=Pacific/Midway` 下聚合，断言 `totals` **与 `range_utc` 都完全一致**（只断言 totals 不够：两个错误的边界也可能凑出相同的总数）。测试**必须真的切换进程时区**（`TZ` + `tzset()`）造数据；只在测试内部造时间戳的写法抓不到这个 bug。变异测试：把边界换算改成服务器时区必须变红
 - **风险/回滚**：**涉钱**——上游 iDoris-website 踩过真坑：月份边界用本地时区而时间戳存 UTC，同一笔曼谷 10-01 06:00 的调用在 UTC 算 9 月、在曼谷算 10 月，换机器账单就变且无任何报错；更阴的是当时测试也用本地时区造时间戳，两边一起漂，在任何时区都自洽地全绿
-- **证据**：PR #29（栈内 OPEN，未合并；本机门禁 14 项全绿）
+- **证据**：PR #29（栈内 OPEN，未合并；本机门禁全绿）
 
 ---
 
-## F3.x — 自增长与联邦（M3，全部 BACKLOG）
+## F3.x — 自增长与联邦（M3）
 
 > 严格按 03 §5 的 F0 → F1 → F2 推进。**硬门禁：F3.4 隐私层就位前，真实个人数据不得进入联邦；F3.1/F3.3 只用合成/脱敏数据。**
 
 ### T3.1.1 本地数据湖 + 提炼管线（合成数据）  `PR_OPEN`
 - **优先级**：low ｜ **依赖**：T2.2.3 ｜ **验收命令**：`pnpm --filter @idoris/growth test`（合成语料跑通 使用→数据湖→提炼 三段，断言产出的训练样本 schema 合法且**不含真实数据标记**）
-
 - **证据**：PR #35（栈内 OPEN，未合并；本机门禁全绿）
+
+### T3.1.2 MLX-LoRA 本地训练 + 热挂载  `PR_OPEN`
+- **优先级**：low ｜ **依赖**：T3.1.1、T3.2.1 ｜ **风险**：python 3.9.6 可能不满足 mlx-lm（需 3.10+），U0 已记 ｜ **验收命令**：`pnpm --filter @idoris/growth test:integration`（训练出一个 rank=16 的 adapter 并经 Router 热挂载后可推理；无 MLX 环境打印 SKIPPED）
+- **证据**：PR #36（栈内 OPEN，未合并；本机门禁全绿）
+
+### T3.2.1 AdapterManifest + base 一致性门禁  `PR_OPEN`
+- **优先级**：low ｜ **依赖**：T1.1.2 ｜ **风险**：**涉正确性**——指纹校验失效会「一次静默升级毁掉整批 LoRA」 ｜ **验收命令**：`pnpm --filter @idoris/contracts test:contract`（断言 base/tokenizer digest 不匹配的 manifest 被拒绝挂载与聚合）
+- **证据**：PR #34（栈内 OPEN，未合并；本机门禁全绿）
+
+### T3.3.1 Flower 最小联邦（同 base、只传 LoRA、FedAvg）  `PR_OPEN`
+- **优先级**：low ｜ **依赖**：T3.1.2、T3.2.1 ｜ **验收命令**：`pnpm --filter @idoris/federation test:integration`（两个本地客户端 + 合成数据跑通一轮聚合；断言传输载荷**只含 adapter 权重、不含原始样本**）
+- **证据**：PR #37（栈内 OPEN，未合并；本机门禁全绿）
+
+### T3.4.1 DP-FedLoRA 加噪 + 安全聚合  `PR_OPEN`
+- **优先级**：low ｜ **依赖**：T3.3.1 ｜ **验收命令**：`pnpm --filter @idoris/federation test tests/dp.test.ts`（① ε 越小 σ 越大且与解析式一致；② 同 seed 同噪声、σ=0 原样返回；③ 掩码上传量 ≠ 明文而求和与明文和一致，即 δ_ij=-δ_ji 真的抵消）
+- **证据**：PR #37（栈内 OPEN，未合并；本机门禁全绿）
+
+### T3.4.2 真实数据准入门禁  `PR_OPEN`
+- **优先级**：low ｜ **依赖**：T3.4.1 ｜ **验收命令**：`pnpm --filter @idoris/federation test`（断言隐私层未启用时，标记为真实数据的样本**无法**进入联邦管线，报错而非跳过）
+- **证据**：PR #37（栈内 OPEN，未合并；本机门禁全绿）
+
+---
+
+## 跟进项账本（followups）
+
+| # | 来源 | 内容 | 状态 |
+|:---|:---|:---|:---|
+| FU-1 | U0 实测 | oMLX v0.4.3 VLM 引擎 guard 传播告警（`could not resolve scheduler for VLMBatchedEngine`），不阻塞，等新版 .app | OPEN |
+| FU-2 | U0 环境探测 | 本机 python 3.9.6，mlx-lm 训练可能需 3.10+，M3 开工前处理 | OPEN |
+| FU-3 | 05 §8 第 5 条 | 凭证网关（onecli 式 MITM）2026-09-07 拍板记 BACKLOG；architecture 已留 `CredentialProvider` 抽象位 | OPEN |
+| FU-4 | 跨仓库 | iDoris-website PR #4 的 R0（网关归属 + 多租户语义）**已拍板归 iDoris**（2026-09-07），落为 F1.5 + F2.6；下游 `products/gateway/` 降级为消费者 | CLOSED |
+| FU-5 | 跨仓库 R6 | 账期/时区：R0 归 iDoris 后，多租户用量聚合就在本层，**已从跟进项升为正式 task T2.6.1** | CLOSED |
+| FU-6 | 跨仓库 R1 | `budget_exceeded` 终态已写进 spec 状态机，**已落为 T1.5.2**；本仓库另加了一处细化：`budget.scope` 区分 `paid_only`/`all`，因为 iDoris 有零成本本地模型，一刀切会让超预算租户连不花钱的本地推理都用不了 | CLOSED |
+| FU-7 | 跨仓库移交 | 接收 iDoris-website 的 `routing.py`(10 条变异) / `audit.py` / `egress_guard.py`(16 条变异)，Apache-2.0；对方保留一份直到我方跑通，避免出现「两边都没有」的窗口 | OPEN |
+| FU-9 | 生态边界 | [`ecosystem-boundaries.md`](ecosystem-boundaries.md) §7 四条待拍板：B1 双 harness 二选一（**最迫近**，下游已在跑 B）· B2 MemPalace 独立与否 · B3 agentEar 立项与归属 · B4 模型制品层时机 | OPEN |
+| FU-10 | 跨仓库 | iDoris-website `docs/business/INDEX-产品设计总览.md` §3 的「113 条变异」与「没有一条连过模型」范围不符：Documents 72 + Creative 15 = **87** 才是该句点名的范围；Assistant 16 + Gateway 10 那 26 条不在「连没连过模型」这个轴上（测的是启动期环境变量与路由顺序），被那句话罩住反显得更空。已转告作者 | OPEN |
+| FU-12 | 评审 | codex 指出 B1 最可能在六个月后被推翻，**触发条件很低**：出现第一条同时依赖内容+收件人+渠道+副作用的策略即可（如「金额超 ฿10,000 或群聊含非客户成员时，发账单必须人工批准」）。届时会改成「Python 提供签名的领域校验证据，Rust 持唯一授权状态机与最终否决权」——本稿已按这个形状写，但要盯着别退回「动作/输出互不重叠」的旧说法 | OPEN |
+| FU-11 | License 红线（自下游 `oss-due-diligence.md` 引入）| **LiteLLM `enterprise/` 目录绝不引用**（若将来做能力②）· **Dify 禁多租户**——多租户现已归 iDoris，此条直接约束选型 · ComfyUI GPL 只能隔离进程调用 | OPEN |
+| FU-8 | 验收方法论 | **「绿灯不代表你以为的那件事成立」**——两半：① **断言错了**（异常子类被父类 `expect_raises` 吞掉；无出处答案被数字校验误接住，换成不含数字的答案就放行）；② **检查不承重**（某步骤去掉后整套自检仍全绿）。<br>**根因常是量纲不匹配**：判据全写成「至少有 N 个」，而想抓的错误方向是「你多算了」——「至少」型判据测不出多算，那格正对照**从一开始就不可能承重**。**检查的量纲要和它想抓的错误方向对得上。**<br>我方对应防御：`test:privacy` 的出站计数器（不只断言 503）、`test:billing` 的 `range_utc`（不只断言 totals）、`test:egress` 的正对照、T1.5.2/3/4 的配对变异测试。共同点是**不给自己留一条「看起来做了」的退路**。<br>**待办**：把这条写进未来每个 task 的验收设计检查——新增验收命令时问一句「这个断言能不能因为别的原因变绿？它的量纲对得上要抓的错误方向吗？」 | OPEN |
