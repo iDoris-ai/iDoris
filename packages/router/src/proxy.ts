@@ -24,6 +24,8 @@ export interface ProxyDeps {
   now?: () => number;
   sleep?: (ms: number) => Promise<void>;
   idempotencyWindowMs?: number;
+  /** 幂等缓存的条目上限（默认 1000）。超出后按插入序淘汰最旧的。 */
+  maxCacheEntries?: number;
   retryDelaysMs?: number[];
 }
 
@@ -66,6 +68,7 @@ export class ChatProxy {
   private readonly sleep: (ms: number) => Promise<void>;
   private readonly windowMs: number;
   private readonly retryDelays: number[];
+  private readonly maxCacheEntries: number;
   private readonly cache = new Map<string, { at: number; status: number; text: string }>();
 
   constructor(deps: ProxyDeps = {}) {
@@ -74,6 +77,46 @@ export class ChatProxy {
     this.sleep = deps.sleep ?? defaultSleep;
     this.windowMs = deps.idempotencyWindowMs ?? 60_000;
     this.retryDelays = deps.retryDelaysMs ?? [250, 1000];
+    this.maxCacheEntries = deps.maxCacheEntries ?? 1000;
+  }
+
+  /**
+   * 写入缓存并回收 —— **不能只写不清**（评审 PR #25 第 2 项，真实复现）。
+   *
+   * 原实现只有 `cache.set()`，没有任何过期回收或上限：构造 1000 个各自不同、
+   * 全部立即过期的 requestId，`cache.size` 依然是 1000，一个都没回收 ——
+   * 这是**廉价的内存 DoS 面**（`X-iDoris-Request-Id` 由调用方自填，刷不同值即可）。
+   *
+   * ⚠️ 只在读命中时删过期条目是**不够的**：从不被再读的键永远不会被访问到。
+   * 所以回收必须挂在**写**路径上。
+   */
+  private remember(key: string, value: { at: number; status: number; text: string }): void {
+    // 先 delete 再 set：Map 对已存在的键做 set **不会**把它移到末尾，
+    // 那会打破下面 prune() 依赖的「插入序 == 过期序」不变式。
+    this.cache.delete(key);
+    this.cache.set(key, value);
+    this.prune();
+  }
+
+  private prune(): void {
+    // 所有条目共用同一个 windowMs，且 remember() 维持了插入序 == 过期序，
+    // 所以从头扫到第一个未过期的即可停 —— 摊销 O(已过期数)，不是每次 O(n)。
+    const cutoff = this.now() - this.windowMs;
+    for (const [k, v] of this.cache) {
+      if (v.at > cutoff) break;
+      this.cache.delete(k);
+    }
+    // 兜住「全都没过期但数量爆了」这种情况：按插入序淘汰最旧的。
+    while (this.cache.size > this.maxCacheEntries) {
+      const oldest = this.cache.keys().next();
+      if (oldest.done === true) break;
+      this.cache.delete(oldest.value);
+    }
+  }
+
+  /** 仅供测试断言回收行为；生产代码不读它。 */
+  cacheSizeForTest(): number {
+    return this.cache.size;
   }
 
   async forward(
@@ -120,7 +163,7 @@ export class ChatProxy {
         }
         const text = await res.text();
         if (opts.requestId !== undefined)
-          this.cache.set(cacheKey(tenantScope, url, opts.requestId), { at: this.now(), status: res.status, text });
+          this.remember(cacheKey(tenantScope, url, opts.requestId), { at: this.now(), status: res.status, text });
         return { status: res.status, text, stream: null, retries: attempt, cached: false };
       } catch (err) {
         if (opts.signal?.aborted === true) {

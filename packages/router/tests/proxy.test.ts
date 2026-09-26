@@ -120,3 +120,72 @@ describe("幂等缓存的租户隔离（回归：评审 PR #25 实测到的跨�
     expect(t.cached).toBe(false);
   });
 });
+
+describe("幂等缓存必须有界（回归：评审 PR #25 第 2 项实测的内存 DoS 面）", () => {
+  const mkProxy = (opts: { windowMs?: number; max?: number; now?: () => number } = {}): ChatProxy =>
+    new ChatProxy({
+      fetchImpl: async () => ({ ok: true, status: 200, text: async () => "BODY", body: null }),
+      ...(opts.now !== undefined ? { now: opts.now } : { now: () => 1_000 }),
+      ...(opts.windowMs !== undefined ? { idempotencyWindowMs: opts.windowMs } : {}),
+      ...(opts.max !== undefined ? { maxCacheEntries: opts.max } : {}),
+    });
+
+  const fire = async (p: ChatProxy, id: string): Promise<void> => {
+    await p.forward("http://up", undefined, {}, { stream: false, requestId: id, tenantId: "t" });
+  };
+
+  it("1000 个各自不同且立即过期的 requestId → 缓存不会留下 1000 条", async () => {
+    // 评审的原始复现：windowMs=1 让每条写完即过期。
+    let clock = 0;
+    const proxy = mkProxy({ windowMs: 1, now: () => (clock += 10) });
+    for (let i = 0; i < 1000; i += 1) await fire(proxy, "id-" + String(i));
+    // 修复前这里是 1000。过期回收挂在写路径上，所以从不被再读的键也会被清掉。
+    expect(proxy.cacheSizeForTest()).toBeLessThanOrEqual(1);
+  });
+
+  it("全都没过期但数量爆了 → 按上限淘汰最旧的（时间回收兜不住这种情况）", async () => {
+    const proxy = mkProxy({ windowMs: 60_000, max: 10 });
+    for (let i = 0; i < 50; i += 1) await fire(proxy, "id-" + String(i));
+    expect(proxy.cacheSizeForTest()).toBe(10);
+  });
+
+  it("回收没把幂等语义修坏：窗口内同键仍然命中", async () => {
+    const proxy = new ChatProxy({
+      fetchImpl: async () => ({ ok: true, status: 200, text: async () => "ONCE", body: null }),
+      now: () => 1_000,
+      maxCacheEntries: 10,
+    });
+    const a = await proxy.forward("http://up", undefined, {}, { stream: false, requestId: "k", tenantId: "t" });
+    const b = await proxy.forward("http://up", undefined, {}, { stream: false, requestId: "k", tenantId: "t" });
+    expect(a.cached).toBe(false);
+    expect(b.cached).toBe(true);
+  });
+
+  it("重写同一个键不会打破「插入序 == 过期序」—— 它身后的旧过期条目仍被清掉", async () => {
+    // 精确构造 bug 场景（第一版没构造出来，变异测试抓到了）：
+    //   Map 里顺序为 [A(已过期), B(被重写→at 变新但位置仍在中间), C(已过期)]
+    //   prune() 从头扫：A 过期→删；B 未过期→break；**C 永远扫不到，泄漏**。
+    // 有那句 delete 时顺序变成 [A, C, B]，A/C 都被清掉，只剩 B。
+    let clock = 0;
+    const proxy = new ChatProxy({
+      fetchImpl: async () => ({ ok: true, status: 200, text: async () => "BODY", body: null }),
+      now: () => clock,
+      idempotencyWindowMs: 100,
+      maxCacheEntries: 1000, // 调高，确保测的是时间回收而不是被上限顺手淘汰
+    });
+    const at = async (t: number, id: string): Promise<void> => {
+      clock = t;
+      await proxy.forward("http://up", undefined, {}, { stream: false, requestId: id, tenantId: "t" });
+    };
+
+    await at(0, "A");
+    await at(1, "B");
+    await at(2, "C");
+    // 推进到 A/B/C 全部过期，然后只重写 B。
+    await at(500, "B");
+
+    // 修好时：A、C 都被回收，只剩重写后的 B。
+    // 有 bug 时：prune 在 B 处提前 break，C 留下 → size 2。
+    expect(proxy.cacheSizeForTest()).toBe(1);
+  });
+});
