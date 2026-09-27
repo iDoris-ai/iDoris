@@ -16,11 +16,10 @@
 //! split these into two types (`AdapterError` + a `SupervisorError` that
 //! wraps it) so the type system — not just doc comments — stops an adapter
 //! implementation from fabricating `SupervisorUnavailable`. We are not
-//! doing that split yet: today there is exactly one backend implementation
-//! in this crate (`mock.rs`'s test double, soon renamed `MockAdapter` when
-//! the R2-A `RuntimeAdapter` trait lands in a follow-up PR — plain text,
-//! not an intra-doc link, since those types don't exist in this crate yet)
-//! and no external consumer of `BackendError`, so the split's benefit is
+//! doing that split yet: today there is exactly one implementation of
+//! [`crate::adapter::RuntimeAdapter`] in this crate ([`crate::mock::MockAdapter`],
+//! a test double) and no external consumer of `BackendError`, so the
+//! split's benefit is
 //! currently theoretical while its cost (touching every signature in the
 //! adapter trait, its implementations, and the Supervisor) is not. Revisit
 //! this once a second real adapter (e.g. oMLX) or an external consumer
@@ -55,18 +54,25 @@ pub enum BackendError {
     #[error("model unavailable: {model_id}")]
     ModelUnavailable { model_id: String },
 
-    /// The eviction-planning step (`plan_eviction`, landing in a follow-up
-    /// PR) determined that even evicting every evictable (non-pinned,
-    /// `Ready`) model still would not free enough budget for `model_id`.
-    /// (Plain text, not an intra-doc link, until that module exists in this
-    /// crate — see the module doc history.) This is the *only* intended use
-    /// of this variant — construct it exclusively via
-    /// [`BackendError::eviction_impossible`], never as a general-purpose
-    /// "admission denied for some other reason" (there is no such reason
-    /// yet; if one appears, it gets its own variant instead of overloading
-    /// this one).
+    /// [`crate::eviction::plan_eviction`] determined that even evicting
+    /// every evictable (non-pinned, `Ready`) model still would not free
+    /// enough budget for `model_id` — a *planning*-time rejection: no
+    /// viable plan exists at all. Construct exclusively via
+    /// [`BackendError::eviction_impossible`]. Distinct from
+    /// [`BackendError::EvictionFailed`], the *execution*-time counterpart
+    /// (a plan existed, but carrying it out failed).
     #[error("cannot admit {model_id}: no viable eviction plan")]
     EvictionImpossible { model_id: String },
+
+    /// A viable plan existed and was chosen, but a chosen victim's
+    /// `unload` itself failed while making room for `model_id`. Kept
+    /// distinct from [`BackendError::EvictionImpossible`] on purpose: this
+    /// is an adapter/IO-layer failure a caller should treat as transient
+    /// and worth retrying, not "give up, there is no capacity" (retrying
+    /// an `EvictionImpossible` is pointless until the situation changes;
+    /// retrying this might just work).
+    #[error("eviction failed while admitting {model_id}: a chosen victim's unload failed")]
+    EvictionFailed { model_id: String },
 
     /// The adapter reported an out-of-memory condition while loading
     /// `model_id`. The Supervisor self-heals with exactly one retry
@@ -79,6 +85,23 @@ pub enum BackendError {
     #[error("timed out waiting for {model_id} to become ready")]
     ProbeTimedOut { model_id: String },
 
+    /// A single `RuntimeAdapter` call (`load`/`unload`/`probe_ready`) did
+    /// not finish within `SupervisorConfig::adapter_call_timeout`. Distinct
+    /// from [`BackendError::ProbeTimedOut`]: that means "polled N times,
+    /// never observed `Ready`"; this means "one specific call itself hung."
+    /// Existing to close llama-swap Issue #946's failure mode: without a
+    /// bound here, a hanging adapter call would hold the Supervisor's
+    /// global load/evict mutex forever.
+    #[error("adapter call for {model_id} timed out")]
+    AdapterTimedOut { model_id: String },
+
+    /// A `RuntimeAdapter` call's background task panicked instead of
+    /// returning normally. Kept distinct from `AdapterTimedOut`: a panic is
+    /// an adapter implementation bug (actionable, should be reported/fixed)
+    /// where a timeout is more often transient latency (retry-worthy).
+    #[error("adapter call for {model_id} panicked: {message}")]
+    AdapterPanicked { model_id: String, message: String },
+
     #[error("upstream error: {message}")]
     Upstream { message: String },
 
@@ -86,6 +109,14 @@ pub enum BackendError {
     /// before/while the request was in flight.
     #[error("request cancelled")]
     Cancelled,
+
+    /// The caller's request itself is malformed independent of any
+    /// Supervisor state — e.g. a non-finite or negative `memory_gb`. Kept
+    /// distinct from `Internal`: this is the *caller's* mistake to fix
+    /// (retrying the identical request will never succeed), not a
+    /// Supervisor-side bug.
+    #[error("invalid request: {message}")]
+    InvalidRequest { message: String },
 
     /// The Supervisor's event loop task is gone (panicked, or the handle
     /// outlived it) — the command channel is closed. Distinct from
@@ -95,6 +126,34 @@ pub enum BackendError {
     /// never construct this.
     #[error("supervisor is not running")]
     SupervisorUnavailable,
+
+    /// The Supervisor rejected the call fast rather than queueing or
+    /// blocking it — either the bounded concurrency limit for in-flight
+    /// adapter calls (`SupervisorConfig::max_concurrent_adapter_calls`) is
+    /// exhausted, or a conflicting load/evict/unload mutex is already held
+    /// for a *different* id (see `crate::supervisor`'s module doc). Distinct
+    /// from `SupervisorUnavailable`: the Supervisor *is* running, it's just
+    /// momentarily saturated or contended — retrying shortly is the right
+    /// response, not treating it as down. **Supervisor-only** — see the
+    /// module doc comment's design note; a backend/adapter implementation
+    /// must never construct this.
+    #[error("supervisor busy: {reason}")]
+    Busy {
+        /// Human-readable cause (e.g. "a different id is mid-load",
+        /// "concurrent-call limit reached") — free text, not itself a
+        /// stable machine-readable code (`reason_code()` already covers
+        /// that at `"supervisor_busy"`).
+        reason: String,
+        /// The id currently holding the load/evict/unload mutex, when the
+        /// cause is mutex contention rather than concurrency-limit
+        /// exhaustion (which isn't tied to any single id).
+        active_id: Option<String>,
+        /// A suggested backoff, when the Supervisor has one to offer.
+        /// `None`, not a fabricated number, when it genuinely doesn't know
+        /// (neither mutex contention nor semaphore exhaustion carry an
+        /// estimate of how long the current holder will take).
+        retry_after_ms: Option<u64>,
+    },
 
     /// A state inconsistency the Supervisor's single-writer loop detected
     /// in itself — e.g. a completion message referencing a model id the
@@ -134,11 +193,16 @@ impl BackendError {
             BackendError::ModelLoading { .. } => "model_loading",
             BackendError::ModelUnavailable { .. } => "model_unavailable",
             BackendError::EvictionImpossible { .. } => "eviction_impossible",
+            BackendError::EvictionFailed { .. } => "eviction_failed",
             BackendError::Oom { .. } => "oom",
             BackendError::ProbeTimedOut { .. } => "probe_timed_out",
+            BackendError::AdapterTimedOut { .. } => "adapter_timed_out",
+            BackendError::AdapterPanicked { .. } => "adapter_panicked",
             BackendError::Upstream { .. } => "upstream_error",
             BackendError::Cancelled => "cancelled",
+            BackendError::InvalidRequest { .. } => "invalid_request",
             BackendError::SupervisorUnavailable => "supervisor_unavailable",
+            BackendError::Busy { .. } => "supervisor_busy",
             BackendError::InvariantViolation { .. } => "state_invariant_violated",
             BackendError::LockPoisoned { .. } => "internal_lock_poisoned",
             BackendError::Internal { .. } => "internal",
@@ -183,6 +247,12 @@ impl BackendError {
         }
     }
 
+    pub fn eviction_failed(model_id: impl Into<String>) -> Self {
+        Self::EvictionFailed {
+            model_id: model_id.into(),
+        }
+    }
+
     pub fn oom(model_id: impl Into<String>) -> Self {
         Self::Oom {
             model_id: model_id.into(),
@@ -195,12 +265,43 @@ impl BackendError {
         }
     }
 
+    pub fn adapter_timed_out(model_id: impl Into<String>) -> Self {
+        Self::AdapterTimedOut {
+            model_id: model_id.into(),
+        }
+    }
+
+    pub fn adapter_panicked(model_id: impl Into<String>, message: impl Into<String>) -> Self {
+        Self::AdapterPanicked {
+            model_id: model_id.into(),
+            message: message.into(),
+        }
+    }
+
     pub fn cancelled() -> Self {
         Self::Cancelled
     }
 
+    pub fn invalid_request(message: impl Into<String>) -> Self {
+        Self::InvalidRequest {
+            message: message.into(),
+        }
+    }
+
     pub fn supervisor_unavailable() -> Self {
         Self::SupervisorUnavailable
+    }
+
+    pub fn busy(
+        reason: impl Into<String>,
+        active_id: Option<String>,
+        retry_after_ms: Option<u64>,
+    ) -> Self {
+        Self::Busy {
+            reason: reason.into(),
+            active_id,
+            retry_after_ms,
+        }
     }
 
     pub fn invariant_violation(message: impl Into<String>) -> Self {

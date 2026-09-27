@@ -41,14 +41,6 @@ impl Pressure {
     }
 }
 
-/// Can this model load without evicting something else?
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Admission {
-    Coexist,
-    RequiresEviction,
-}
-
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BackendStatus {
     pub pressure: Pressure,
@@ -64,7 +56,7 @@ pub struct ChatMessage {
 }
 
 /// No `signal`/`AbortSignal` field here, unlike the TS `ChatRequest` —
-/// cancellation is a first-class parameter on [`crate::ModelBackend::chat`]
+/// cancellation is a first-class parameter on [`crate::RuntimeAdapter::chat`]
 /// via `tokio_util::sync::CancellationToken` instead of living on the
 /// request value. A `CancellationToken` isn't `Serialize`/meaningful as
 /// wire data, and Rust's ownership makes "the caller dropped its handle" a
