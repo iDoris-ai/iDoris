@@ -97,8 +97,11 @@ fn settling_an_expired_reservation_is_rejected() {
     ));
 }
 
+/// L3 (Opus Tier-2 acceptance): releasing an already-expired reservation is
+/// `Ok(())`, not an error — no charge was ever recorded for it, so
+/// "release" (no charge is due) is already true.
 #[test]
-fn releasing_an_expired_reservation_is_rejected() {
+fn releasing_an_expired_reservation_succeeds() {
     let path = temp_db_path("expiry-release");
     let clock = FakeClock::new(0);
     let ledger = BudgetLedger::open_with(&path, clock.clone(), TTL_MS).expect("open");
@@ -107,8 +110,26 @@ fn releasing_an_expired_reservation_is_rejected() {
 
     let id = ledger.reserve(&scope, Price::Known(50)).expect("reserve");
     clock.advance(TTL_MS + 1);
+    assert!(ledger.release(&id).is_ok());
+    // No charge was recorded.
+    assert_eq!(ledger.balance(&scope).expect("balance"), 100);
+}
+
+/// Negative control: once released (even post-expiry), settling it must
+/// still be rejected — release is a terminal outcome too.
+#[test]
+fn settling_after_releasing_an_expired_reservation_is_rejected() {
+    let path = temp_db_path("expiry-release-then-settle");
+    let clock = FakeClock::new(0);
+    let ledger = BudgetLedger::open_with(&path, clock.clone(), TTL_MS).expect("open");
+    let scope = BudgetScope::new("acme-co", "key-1", "openai", "gpt-5");
+    ledger.configure(&scope, 100, "UTC").expect("configure");
+
+    let id = ledger.reserve(&scope, Price::Known(50)).expect("reserve");
+    clock.advance(TTL_MS + 1);
+    ledger.release(&id).expect("release");
     assert!(matches!(
-        ledger.release(&id),
+        ledger.settle(&id, 50),
         Err(BudgetError::ReservationNotActive { .. })
     ));
 }

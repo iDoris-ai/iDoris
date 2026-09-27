@@ -22,6 +22,44 @@ use super::error::BudgetError;
 use super::period::billing_period_key;
 use super::scope::BudgetScope;
 
+/// Reservation lifecycle state. Opus Tier-2 acceptance L3: this used to be
+/// raw `&str`/`String` comparisons against the SQL `status` column's TEXT
+/// values scattered across `settle`/`release`, which is exactly the kind of
+/// thing a typo (`"Active"` vs `"active"`) slips through silently. The SQL
+/// column itself stays `TEXT` (with a `CHECK` constraint — see
+/// `migrations/0001_init.sql`) since that's what every existing row already
+/// is; this enum is the single place that maps to/from it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReservationStatus {
+    Active,
+    Settled,
+    Released,
+    Expired,
+}
+
+impl ReservationStatus {
+    fn as_sql(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Settled => "settled",
+            Self::Released => "released",
+            Self::Expired => "expired",
+        }
+    }
+
+    fn parse(s: &str) -> Result<Self, BudgetError> {
+        match s {
+            "active" => Ok(Self::Active),
+            "settled" => Ok(Self::Settled),
+            "released" => Ok(Self::Released),
+            "expired" => Ok(Self::Expired),
+            other => Err(BudgetError::Storage(format!(
+                "unknown reservations.status value {other:?}"
+            ))),
+        }
+    }
+}
+
 const SCHEMA_MIGRATIONS: &[&str] = &[include_str!("migrations/0001_init.sql")];
 
 /// Default reservation TTL: long enough to cover a slow upstream call,
@@ -247,7 +285,7 @@ impl BudgetLedger {
             "INSERT INTO reservations \
                 (id, tenant_id, key_id, provider_id, model_id, period, reserved_minor, \
                  status, created_at_ms, expires_at_ms, actual_cost_minor) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'active', ?8, ?9, NULL)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, NULL)",
             rusqlite::params![
                 id,
                 scope.tenant_id,
@@ -256,6 +294,7 @@ impl BudgetLedger {
                 scope.model_id,
                 period,
                 estimated_cost_minor,
+                ReservationStatus::Active.as_sql(),
                 now_ms,
                 expires_at_ms,
             ],
@@ -274,8 +313,12 @@ impl BudgetLedger {
         let now_ms = self.clock.now_ms();
         let conn = self.lock();
         let n = conn.execute(
-            "UPDATE reservations SET status='expired' WHERE status='active' AND expires_at_ms <= ?1",
-            [now_ms],
+            "UPDATE reservations SET status=?1 WHERE status=?2 AND expires_at_ms <= ?3",
+            rusqlite::params![
+                ReservationStatus::Expired.as_sql(),
+                ReservationStatus::Active.as_sql(),
+                now_ms
+            ],
         )?;
         Ok(n)
     }
@@ -288,16 +331,18 @@ fn sweep_expired_scope(
     now_ms: i64,
 ) -> Result<usize, BudgetError> {
     let n = conn.execute(
-        "UPDATE reservations SET status='expired' \
+        "UPDATE reservations SET status=?7 \
          WHERE tenant_id=?1 AND key_id=?2 AND provider_id=?3 AND model_id=?4 AND period=?5 \
-           AND status='active' AND expires_at_ms <= ?6",
+           AND status=?6 AND expires_at_ms <= ?8",
         rusqlite::params![
             scope.tenant_id,
             scope.key_id,
             scope.provider_id,
             scope.model_id,
             period,
-            now_ms
+            ReservationStatus::Active.as_sql(),
+            ReservationStatus::Expired.as_sql(),
+            now_ms,
         ],
     )?;
     Ok(n)
@@ -323,8 +368,9 @@ impl BudgetLedger {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
 
         let row = find_reservation(&tx, reservation_id)?;
+        let status = ReservationStatus::parse(&row.status)?;
 
-        if row.status != "active" {
+        if status != ReservationStatus::Active {
             return Err(BudgetError::ReservationNotActive {
                 reservation_id: reservation_id.0.clone(),
                 status: row.status,
@@ -332,13 +378,13 @@ impl BudgetLedger {
         }
         if row.expires_at_ms <= now_ms {
             tx.execute(
-                "UPDATE reservations SET status='expired' WHERE id=?1",
-                [&reservation_id.0],
+                "UPDATE reservations SET status=?2 WHERE id=?1",
+                rusqlite::params![reservation_id.0, ReservationStatus::Expired.as_sql()],
             )?;
             tx.commit()?;
             return Err(BudgetError::ReservationNotActive {
                 reservation_id: reservation_id.0.clone(),
-                status: "expired".to_string(),
+                status: ReservationStatus::Expired.as_sql().to_string(),
             });
         }
 
@@ -375,41 +421,57 @@ impl BudgetLedger {
     /// candidate. Idempotent when the reservation is already `released`;
     /// erroring on `settled`/`expired` prevents un-settling a completed
     /// charge.
+    /// L3 (Opus Tier-2 acceptance): releasing an already-`expired` (but not
+    /// yet settled/released) reservation succeeds (`Ok(())`) instead of
+    /// erroring — no charge was ever recorded against it, so "release" (no
+    /// charge is due) is already true; only `settled` is a genuine
+    /// "you can't undo this" rejection. This used to reject with
+    /// `ReservationNotActive` on the mistaken assumption that "expired"
+    /// meant "too late to touch" — but release never charges anything, so
+    /// there was nothing for the TTL to have made "too late".
     pub fn release(&self, reservation_id: &ReservationId) -> Result<(), BudgetError> {
         let now_ms = self.clock.now_ms();
         let mut conn = self.lock();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
 
         let row = find_reservation(&tx, reservation_id)?;
+        let status = ReservationStatus::parse(&row.status)?;
 
-        match row.status.as_str() {
-            "released" => {
+        match status {
+            ReservationStatus::Released => {
                 tx.commit()?;
                 Ok(())
             }
-            "active" if row.expires_at_ms > now_ms => {
+            ReservationStatus::Active if row.expires_at_ms > now_ms => {
                 tx.execute(
-                    "UPDATE reservations SET status='released' WHERE id=?1",
-                    [&reservation_id.0],
+                    "UPDATE reservations SET status=?2 WHERE id=?1",
+                    rusqlite::params![reservation_id.0, ReservationStatus::Released.as_sql()],
                 )?;
                 tx.commit()?;
                 Ok(())
             }
-            "active" => {
+            ReservationStatus::Active => {
+                // TTL lapsed between the SELECT above and now — flip it to
+                // `expired` for hygiene, but still succeed (see doc comment
+                // above): no money was ever recorded for this reservation.
                 tx.execute(
-                    "UPDATE reservations SET status='expired' WHERE id=?1",
-                    [&reservation_id.0],
+                    "UPDATE reservations SET status=?2 WHERE id=?1",
+                    rusqlite::params![reservation_id.0, ReservationStatus::Expired.as_sql()],
                 )?;
                 tx.commit()?;
+                Ok(())
+            }
+            ReservationStatus::Expired => {
+                tx.commit()?;
+                Ok(())
+            }
+            ReservationStatus::Settled => {
+                tx.rollback().ok();
                 Err(BudgetError::ReservationNotActive {
                     reservation_id: reservation_id.0.clone(),
-                    status: "expired".to_string(),
+                    status: row.status,
                 })
             }
-            other => Err(BudgetError::ReservationNotActive {
-                reservation_id: reservation_id.0.clone(),
-                status: other.to_string(),
-            }),
         }
     }
 }
