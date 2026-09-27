@@ -24,15 +24,20 @@
 
 use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Instant;
 
 use async_trait::async_trait;
+use futures_core::Stream;
 use genai::Client;
 use genai::adapter::AdapterKind;
-use genai::chat::{ChatMessage as GenaiChatMessage, ChatRequest as GenaiChatRequest, ChatRole};
+use genai::chat::{
+    ChatMessage as GenaiChatMessage, ChatRequest as GenaiChatRequest, ChatRole, ChatStream,
+    ChatStreamEvent,
+};
 use genai::resolver::{AuthData, AuthResolver, Endpoint, ServiceTargetResolver};
 
-use crate::chat::{ChatChunkStream, ChatRequest, ChatResponse, RemoteChat};
+use crate::chat::{ChatChunk, ChatChunkStream, ChatRequest, ChatResponse, RemoteChat};
 use crate::error::UpstreamError;
 use crate::remote::CredentialSource;
 
@@ -144,6 +149,18 @@ fn to_genai_role(role: &str) -> ChatRole {
     }
 }
 
+impl RemoteClient {
+    fn to_genai_request(&self, req: &ChatRequest) -> (genai::ModelIden, GenaiChatRequest) {
+        let model_iden = genai::ModelIden::new(self.adapter_kind, req.model.clone());
+        let messages: Vec<GenaiChatMessage> = req
+            .messages
+            .iter()
+            .map(|m| GenaiChatMessage::new(to_genai_role(&m.role), m.content.clone()))
+            .collect();
+        (model_iden, GenaiChatRequest::new(messages))
+    }
+}
+
 #[async_trait]
 impl RemoteChat for RemoteClient {
     async fn chat(
@@ -154,13 +171,7 @@ impl RemoteChat for RemoteClient {
         if Instant::now() >= deadline {
             return Err(UpstreamError::timeout());
         }
-        let model_iden = genai::ModelIden::new(self.adapter_kind, req.model.clone());
-        let messages: Vec<GenaiChatMessage> = req
-            .messages
-            .iter()
-            .map(|m| GenaiChatMessage::new(to_genai_role(&m.role), m.content.clone()))
-            .collect();
-        let genai_req = GenaiChatRequest::new(messages);
+        let (model_iden, genai_req) = self.to_genai_request(&req);
         let remaining = deadline.saturating_duration_since(Instant::now());
         let call = self.client.exec_chat(model_iden, genai_req, None);
         match tokio::time::timeout(remaining, call).await {
@@ -173,17 +184,30 @@ impl RemoteChat for RemoteClient {
         }
     }
 
+    /// Sets up the stream, itself bounded by `deadline` like [`Self::chat`];
+    /// once streaming, [`DeadlineStream`] takes over enforcing the same
+    /// `deadline` against the whole rest of the stream — see its doc
+    /// comment.
     async fn chat_stream(
         &self,
-        _req: ChatRequest,
-        _deadline: Instant,
+        req: ChatRequest,
+        deadline: Instant,
     ) -> Result<ChatChunkStream, UpstreamError> {
-        // Streaming lands in a follow-up PR on this branch stack (the
-        // `RemoteChat` trait's own PR landed the signature specifically so
-        // this could be built incrementally — see `chat.rs`'s module doc).
-        Err(UpstreamError::internal(
-            "RemoteClient::chat_stream is not implemented yet",
-        ))
+        if Instant::now() >= deadline {
+            return Err(UpstreamError::timeout());
+        }
+        let (model_iden, genai_req) = self.to_genai_request(&req);
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let setup = self.client.exec_chat_stream(model_iden, genai_req, None);
+        let stream_response = tokio::time::timeout(remaining, setup)
+            .await
+            .map_err(|_elapsed| UpstreamError::timeout())?
+            .map_err(map_genai_error)?;
+        Ok(Box::pin(DeadlineStream {
+            inner: stream_response.stream,
+            deadline,
+            finished: false,
+        }))
     }
 }
 
@@ -241,6 +265,86 @@ fn map_webc_error(err: genai::webc::Error) -> UpstreamError {
         | genai::webc::Error::JsonValueExt(_) => UpstreamError::malformed_response(),
     }
 }
+
+/// Maps one `genai` stream event to zero or one [`ChatChunk`]s. `None`
+/// means "filtered, poll again" — [`ChatStreamEvent::Start`] carries no
+/// text, and reasoning/thought-signature/tool-call chunks have no
+/// representation in [`ChatChunk`] yet ([`crate::chat`]'s `ChatChunk` is
+/// deliberately minimal — text-only — as landed in its own PR; extending it
+/// to carry richer event kinds is a separate, later change, not something
+/// to smuggle in here by inventing an ad hoc encoding).
+fn event_to_chunk(event: ChatStreamEvent) -> Option<ChatChunk> {
+    match event {
+        ChatStreamEvent::Chunk(c) => Some(ChatChunk {
+            delta: c.content,
+            done: false,
+        }),
+        ChatStreamEvent::End(_) => Some(ChatChunk {
+            delta: String::new(),
+            done: true,
+        }),
+        ChatStreamEvent::Start
+        | ChatStreamEvent::ReasoningChunk(_)
+        | ChatStreamEvent::ThoughtSignatureChunk(_)
+        | ChatStreamEvent::ToolCallChunk(_) => None,
+    }
+}
+
+/// Wraps a `genai` [`ChatStream`], translating each event via
+/// [`event_to_chunk`] and enforcing `deadline` against the **whole
+/// stream**, not per item — matches [`crate::chat::RemoteChat::chat_stream`]'s
+/// documented contract. Checked on every poll (including between
+/// internally-filtered events, so a stream that yields nothing but
+/// `Start`/reasoning chunks forever still can't dodge the deadline by
+/// never producing a chunk this type surfaces).
+struct DeadlineStream {
+    inner: ChatStream,
+    deadline: Instant,
+    /// Once `true`, every subsequent poll returns `Ready(None)` — a stream
+    /// must not keep yielding items after it has already reported a fatal
+    /// error or its own natural end.
+    finished: bool,
+}
+
+impl Stream for DeadlineStream {
+    type Item = Result<ChatChunk, UpstreamError>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if self.finished {
+            return Poll::Ready(None);
+        }
+        loop {
+            if Instant::now() >= self.deadline {
+                self.finished = true;
+                return Poll::Ready(Some(Err(UpstreamError::timeout())));
+            }
+            match Pin::new(&mut self.inner).poll_next(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(None) => {
+                    self.finished = true;
+                    return Poll::Ready(None);
+                }
+                Poll::Ready(Some(Err(err))) => {
+                    self.finished = true;
+                    return Poll::Ready(Some(Err(map_genai_error(err))));
+                }
+                Poll::Ready(Some(Ok(event))) => match event_to_chunk(event) {
+                    Some(chunk) => {
+                        if chunk.done {
+                            self.finished = true;
+                        }
+                        return Poll::Ready(Some(Ok(chunk)));
+                    }
+                    // Filtered event (Start/reasoning/...) — poll `inner`
+                    // again rather than returning `Pending`: it may have
+                    // more already-buffered events ready right now.
+                    None => continue,
+                },
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -442,24 +546,7 @@ mod tests {
         );
     }
 
-    /// Locks in the explicit placeholder contract until a follow-up PR
-    /// replaces it with a real implementation: `chat_stream` must fail
-    /// with a typed error, not panic, and must not attempt any HTTP call.
-    #[tokio::test]
-    async fn chat_stream_reports_not_implemented_without_calling_out() {
-        let server = MockServer::start().await;
-        let client = client_for(&server, Arc::new(FixedKey("k")));
-        client
-            .chat_stream(request(), far_future_deadline())
-            .await
-            .map(|_stream| ()) // `ChatChunkStream` isn't `Debug`; discard it before `expect_err`.
-            .expect_err("chat_stream must fail, not panic, until it is implemented");
-        assert!(
-            server
-                .received_requests()
-                .await
-                .expect("recording enabled")
-                .is_empty()
-        );
-    }
+    // `chat_stream` itself is exercised by a follow-up PR's tests, once a
+    // real streaming server double exists — see this module's `DeadlineStream`
+    // doc comment for the implementation this PR adds.
 }
