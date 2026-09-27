@@ -7,10 +7,12 @@
 
 mod clock;
 mod error;
+mod estimator;
 mod period;
 mod scope;
 
 pub use clock::{Clock, SystemClock};
 pub use error::{BUDGET_EXCEEDED_REASON_CODE, Budget402Body, BudgetError};
+pub use estimator::{ConservativeTokenEstimator, TokenEstimator, estimate_tokens};
 pub use period::billing_period_key;
 pub use scope::BudgetScope;
