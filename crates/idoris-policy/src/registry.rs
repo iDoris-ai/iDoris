@@ -75,16 +75,21 @@ fn declares_network_endpoint(form: Form) -> bool {
     matches!(form, Form::HttpService | Form::NostrNode | Form::MitmProxy)
 }
 
-/// 仅供本 crate 自身测试使用的"内存 mock 后端"scheme——纯进程内计算，
-/// `locality: loopback` 本身没有说谎，允许跳过 host 校验。**不对生产配置
-/// 开放**：真实的 `config/components/*.yaml` 永远不会在非测试构建里出现
-/// `mock://` scheme，`cfg(test)` 之外一律按未知 scheme 拒绝。
-#[cfg(test)]
-fn is_test_only_mock_scheme(scheme: &str) -> bool {
+/// "内存 mock 后端"scheme——纯进程内计算，`locality: loopback` 本身没有
+/// 说谎，允许跳过 host 校验。**A-1 更正**：`config/components/mock.yaml`
+/// 这份真实配置就是 `http_service + loopback + mock://in-memory`（R2-D 接线
+/// 会用到），不是"真实 yaml 永远不会出现 mock://"——之前那句注释是错的。
+/// 用 `cfg(test)` 放行会导致这份真实 yaml 在非测试构建里被 `UnsupportedScheme`
+/// 拒掉；改用显式的 `dev-mock` cargo feature（默认关闭）控制，本单测仍然
+/// 需要放行（`cfg(test)` 保留，方便本 crate 自身的注册校验测试），生产构建
+/// 必须两者都不开，才会一律按未知 scheme 拒绝。是否放行跟"是不是在跑测试"
+/// 无关，跟"有没有显式打开 mock 开关"有关。
+#[cfg(any(test, feature = "dev-mock"))]
+fn is_dev_mock_scheme_allowed(scheme: &str) -> bool {
     scheme == "mock"
 }
-#[cfg(not(test))]
-fn is_test_only_mock_scheme(_scheme: &str) -> bool {
+#[cfg(not(any(test, feature = "dev-mock")))]
+fn is_dev_mock_scheme_allowed(_scheme: &str) -> bool {
     false
 }
 
@@ -100,11 +105,25 @@ fn is_test_only_mock_scheme(_scheme: &str) -> bool {
 /// http(s)，白名单之外的 scheme 必须显式拒绝，不能靠"反正我们只认识
 /// http(s)"这种默认放行的逻辑蒙混过去。
 fn assert_endpoint_locality_consistent(card: &Card) -> Result<(), RegistrationError> {
+    parse_loopback_endpoint_url(card).map(|_| ())
+}
+
+/// L1：注册校验和"执行层"（真正拿这张卡去发起连接的调用方）必须共用**同一个**
+/// 解析结果，不能各自 `Url::parse` 一遍——两处分别解析曾经在 H1 里就是隐患的
+/// 根源（手写解析和这里用的 WHATWG 解析器行为不一致）。这是唯一允许对
+/// `component.endpoint` 调用 `Url::parse` 的地方；执行层需要这张卡的
+/// endpoint URL 时应该调用这个函数复用校验阶段的解析/判定逻辑，而不是自己
+/// 再解析一次字符串。
+///
+/// 返回值：`Ok(None)` 表示这张卡不需要（也没有）做 loopback URL 校验（非网络
+/// 端点 form、非 loopback、或测试专用 `mock` scheme）；`Ok(Some(url))` 是校验
+/// 通过后解析出的 URL；`Err` 是注册校验失败。
+pub fn parse_loopback_endpoint_url(card: &Card) -> Result<Option<Url>, RegistrationError> {
     let component = &card.component;
     if !declares_network_endpoint(component.form)
         || component.provider.locality != Locality::Loopback
     {
-        return Ok(());
+        return Ok(None);
     }
     let unparseable = || RegistrationError::EndpointUnparseable {
         id: card.id().to_string(),
@@ -114,8 +133,8 @@ fn assert_endpoint_locality_consistent(card: &Card) -> Result<(), RegistrationEr
         return Err(unparseable());
     };
     let scheme = parsed.scheme();
-    if is_test_only_mock_scheme(scheme) {
-        return Ok(());
+    if is_dev_mock_scheme_allowed(scheme) {
+        return Ok(None);
     }
     if !matches!(scheme, "http" | "https" | "ws" | "wss") {
         return Err(RegistrationError::UnsupportedScheme {
@@ -126,13 +145,13 @@ fn assert_endpoint_locality_consistent(card: &Card) -> Result<(), RegistrationEr
     let Some(host) = parsed.host_str() else {
         return Err(unparseable());
     };
-    if LOOPBACK_HOSTS.contains(&host) {
-        return Ok(());
+    if !LOOPBACK_HOSTS.contains(&host) {
+        return Err(RegistrationError::LoopbackHostMismatch {
+            id: card.id().to_string(),
+            host: host.to_string(),
+        });
     }
-    Err(RegistrationError::LoopbackHostMismatch {
-        id: card.id().to_string(),
-        host: host.to_string(),
-    })
+    Ok(Some(parsed))
 }
 
 /// H1：`spawn_cli`/订阅类 provider 声明 `local_only`/`tier: local` 会被
@@ -181,6 +200,25 @@ mod tests {
     fn accepts_a_well_formed_registry() {
         let cards = [sample_card("a", &[]), sample_card("b", &[])];
         assert_eq!(validate_registration(&cards), Ok(()));
+    }
+
+    /// L1：`parse_loopback_endpoint_url` 是唯一允许解析 `endpoint` 的地方，
+    /// "执行层"要复用这个解析结果，不能自己再 `Url::parse` 一遍——这里验证
+    /// 它确实把校验通过后的 `Url` 原样交还给调用方（host/scheme 都对得上）。
+    #[test]
+    fn parse_loopback_endpoint_url_returns_the_parsed_url_on_success() {
+        let card = sample_card("loopback-1", &[]);
+        match parse_loopback_endpoint_url(&card) {
+            Ok(Some(parsed)) => {
+                assert_eq!(parsed.scheme(), "http");
+                assert_eq!(parsed.host_str(), Some("127.0.0.1"));
+            }
+            other => panic!("expected Ok(Some(url)), got {other:?}"),
+        }
+
+        let mut lan = sample_card("lan-1", &[]);
+        lan.component.provider.locality = Locality::Lan;
+        assert_eq!(parse_loopback_endpoint_url(&lan), Ok(None));
     }
 
     #[test]

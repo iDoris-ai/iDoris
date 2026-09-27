@@ -170,6 +170,8 @@ fn negative_price_candidate_is_treated_like_unknown_price_never_selected() {
     assert_eq!(decision.chosen_id, "known-free");
 }
 
+/// H2 场景 C：唯一候选就是付费的，它自然就是 `pick()` 会选中的路径——预算
+/// 超限且没有 Fallback，终态拒绝。
 #[test]
 fn intent_needs_remote_budget_exhausted_without_fallback_is_terminal_402() {
     let req = any_privacy_profile(Some(Role::Deep));
@@ -196,8 +198,14 @@ fn intent_needs_remote_budget_exhausted_without_fallback_is_terminal_402() {
 
 #[test]
 fn intent_needs_remote_budget_exhausted_with_fallback_degrades_to_local() {
+    // H2：`deep-local` 必须是唯一"本来就会输给付费候选"的那种（admission
+    // 更差：RequiresEviction vs 付费候选的 Ready），不然 pick() 会因为它更
+    // 便宜而本来就选中它——那样这次"回落"就是假的（H2 修复前的旧版本正是
+    // 靠这个巧合让这个测试通过：不管付费候选会不会真的被选中，只要预算
+    // 超限就无条件打上 BudgetFallback，见下面 `degrades_to_local` 反例）。
     let req = with_fallback(any_privacy_profile(Some(Role::Deep)));
-    let local_alt = sample_card("deep-local", &[Role::Deep]);
+    let mut local_alt = sample_card("deep-local", &[Role::Deep]);
+    local_alt.admission_status = AdmissionStatus::RequiresEviction;
     let remote = remote_card("deep-remote", &[Role::Deep], Some(500));
     let cards = [remote, local_alt];
     let over_budget = FixedBudget(BudgetSnapshot {
@@ -216,6 +224,142 @@ fn intent_needs_remote_budget_exhausted_with_fallback_degrades_to_local() {
         vec![Degradation::BudgetFallback {
             estimated_cost_minor: 500
         }]
+    );
+}
+
+/// M4 变异防护：跟上面那个测试用同样的候选集合（付费候选才是 `pick()` 会
+/// 自然选中的那条路径），唯一区别是**没有**声明 Fallback——一定不能静默
+/// 回落到免费候选（那样"不需要请求头就能回落"或者"没声明也悄悄回落"这两个
+/// 变异都测不出来），必须终态 402。
+#[test]
+fn budget_exceeded_natural_pick_is_paid_without_declared_fallback_is_terminal_402() {
+    let req = any_privacy_profile(Some(Role::Deep)); // 没有 with_fallback
+    let mut local_alt = sample_card("deep-local", &[Role::Deep]);
+    local_alt.admission_status = AdmissionStatus::RequiresEviction;
+    let remote = remote_card("deep-remote", &[Role::Deep], Some(500));
+    let cards = [remote, local_alt];
+    let over_budget = FixedBudget(BudgetSnapshot {
+        limit_minor: 100,
+        spent_minor: 100,
+        scope: BudgetScope::PaidOnly,
+    });
+    let ctx = PolicyCtx {
+        min_ram_gb: None,
+        budget: Some(&over_budget),
+    };
+    match decide(&req, &cards, &ctx) {
+        Err(Rejection::BudgetExceeded {
+            estimated_cost_minor,
+            ..
+        }) => assert_eq!(estimated_cost_minor, 500),
+        other => panic!("expected BudgetExceeded, got {other:?}"),
+    }
+}
+
+/// H2 场景 A：免费 Ready + 付费远程，预算超限，**没有**声明 Fallback——
+/// `pick()` 本来就会选中免费的那个（admission 排位相同、成本更低），预算
+/// 超限跟它无关，不该报 402，也不该产生降级标记。
+#[test]
+fn budget_exceeded_without_fallback_still_succeeds_when_the_natural_pick_is_free() {
+    let req = any_privacy_profile(Some(Role::Deep)); // 没有 with_fallback
+    let local_alt = sample_card("deep-local", &[Role::Deep]);
+    let remote = remote_card("deep-remote", &[Role::Deep], Some(500));
+    let cards = [remote, local_alt];
+    let over_budget = FixedBudget(BudgetSnapshot {
+        limit_minor: 100,
+        spent_minor: 100,
+        scope: BudgetScope::PaidOnly,
+    });
+    let ctx = PolicyCtx {
+        min_ram_gb: None,
+        budget: Some(&over_budget),
+    };
+    let decision = decide(&req, &cards, &ctx).unwrap();
+    assert_eq!(decision.chosen_id, "deep-local");
+    assert!(!decision.is_degraded());
+}
+
+/// H2 场景 B：付费候选是 Blocked，免费候选 Ready——旧实现在 admission 之前
+/// 就跑预算闸，会因为"候选集合里存在付费项"而误判；现在 admission 先排除
+/// Blocked，预算阶段根本看不到这个付费候选，自然不会报 402。
+#[test]
+fn blocked_paid_candidate_never_reaches_the_budget_gate() {
+    let req = any_privacy_profile(Some(Role::Deep));
+    let local_alt = sample_card("deep-local", &[Role::Deep]);
+    let mut remote = remote_card("deep-remote", &[Role::Deep], Some(500));
+    remote.admission_status = AdmissionStatus::Blocked;
+    let cards = [remote, local_alt];
+    let over_budget = FixedBudget(BudgetSnapshot {
+        limit_minor: 100,
+        spent_minor: 100,
+        scope: BudgetScope::PaidOnly,
+    });
+    let ctx = PolicyCtx {
+        min_ram_gb: None,
+        budget: Some(&over_budget),
+    };
+    let decision = decide(&req, &cards, &ctx).unwrap();
+    assert_eq!(decision.chosen_id, "deep-local");
+    assert!(!decision.is_degraded());
+}
+
+/// M2：即使租户还没有整体 `is_over()`，只要这一笔的成本超过剩余余额，也要
+/// 按同样的规则处理（无 Fallback → 402）。
+#[test]
+fn balance_less_than_this_picks_cost_rejects_even_when_not_globally_over() {
+    let req = any_privacy_profile(Some(Role::Deep));
+    let remote = remote_card("deep-remote", &[Role::Deep], Some(500));
+    let ctx_budget = FixedBudget(BudgetSnapshot {
+        limit_minor: 1_000_000,
+        spent_minor: 999_600, // balance_minor() == 400 < 500，但没有 is_over()
+        scope: BudgetScope::PaidOnly,
+    });
+    let ctx = PolicyCtx {
+        min_ram_gb: None,
+        budget: Some(&ctx_budget),
+    };
+    match decide(&req, &[remote], &ctx) {
+        Err(Rejection::BudgetExceeded {
+            estimated_cost_minor,
+            ..
+        }) => assert_eq!(estimated_cost_minor, 500),
+        other => panic!("expected BudgetExceeded, got {other:?}"),
+    }
+}
+
+/// M1：角色/能力匹配后剩下的候选全部因为价格未知/非法被剔除——阶段码要
+/// 落在 `Stage::Pricing`，不能被误判成 `Stage::Admission`（旧版本会因为
+/// `priced_known` 提前变空、后面 `admission_eligible` 也跟着空而报错，
+/// 但那样调用方会去查 admission 配置而不是定价数据源）。
+#[test]
+fn all_candidates_excluded_for_unknown_price_reports_the_pricing_stage() {
+    let req = any_privacy_profile(Some(Role::Daily));
+    let unknown = remote_card("unknown-price", &[Role::Daily], None);
+    let cards = [unknown];
+    let ctx = PolicyCtx::default();
+    assert_eq!(
+        decide(&req, &cards, &ctx),
+        Err(Rejection::NoEligibleCandidate {
+            stage: Stage::Pricing
+        })
+    );
+}
+
+/// M1：只有部分候选因为价格未知被剔除时，要在成功结果的 reason_codes 里
+/// 留痕，而不是悄悄丢掉。
+#[test]
+fn partial_price_unknown_exclusion_is_recorded_as_a_reason_code() {
+    let req = any_privacy_profile(Some(Role::Daily));
+    let unknown = remote_card("a-unknown-price", &[Role::Daily], None);
+    let known_free = sample_card("known-free", &[Role::Daily]);
+    let cards = [unknown, known_free];
+    let ctx = PolicyCtx::default();
+    let decision = decide(&req, &cards, &ctx).unwrap();
+    assert_eq!(decision.chosen_id, "known-free");
+    assert!(
+        decision
+            .reason_codes
+            .contains(&ReasonCode::PriceUnknownExcluded)
     );
 }
 
