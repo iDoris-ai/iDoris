@@ -110,6 +110,14 @@ pub enum BackendError {
     #[error("request cancelled")]
     Cancelled,
 
+    /// The caller's request itself is malformed independent of any
+    /// Supervisor state — e.g. a non-finite or negative `memory_gb`. Kept
+    /// distinct from `Internal`: this is the *caller's* mistake to fix
+    /// (retrying the identical request will never succeed), not a
+    /// Supervisor-side bug.
+    #[error("invalid request: {message}")]
+    InvalidRequest { message: String },
+
     /// The Supervisor's event loop task is gone (panicked, or the handle
     /// outlived it) — the command channel is closed. Distinct from
     /// `Internal` because it means *no* command can be serviced, not that
@@ -192,6 +200,7 @@ impl BackendError {
             BackendError::AdapterPanicked { .. } => "adapter_panicked",
             BackendError::Upstream { .. } => "upstream_error",
             BackendError::Cancelled => "cancelled",
+            BackendError::InvalidRequest { .. } => "invalid_request",
             BackendError::SupervisorUnavailable => "supervisor_unavailable",
             BackendError::Busy { .. } => "supervisor_busy",
             BackendError::InvariantViolation { .. } => "state_invariant_violated",
@@ -271,6 +280,12 @@ impl BackendError {
 
     pub fn cancelled() -> Self {
         Self::Cancelled
+    }
+
+    pub fn invalid_request(message: impl Into<String>) -> Self {
+        Self::InvalidRequest {
+            message: message.into(),
+        }
     }
 
     pub fn supervisor_unavailable() -> Self {
