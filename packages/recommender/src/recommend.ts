@@ -13,7 +13,7 @@
 
 import { readFileSync } from "node:fs";
 import { parse } from "yaml";
-import type { TaskProfile } from "@idoris/contracts";
+import { CATALOG_ROLES, type TaskProfile } from "@idoris/contracts";
 import {
   appleReserveGb,
   appleUsableGb,
@@ -36,6 +36,11 @@ export interface CatalogQuant {
   quality: number;
 }
 
+/** catalog 条目可声明的加载策略提示：`on_demand` = 按需加载，不参与角色路由/常驻推荐。
+ *  T4.2：取代旧的 `roles: [temp]`（temp 不是角色，语义等价于
+ *  @idoris/contracts LoadPolicy.mode=on_demand，此处先用薄字段占位）。 */
+export type LoadHint = "on_demand";
+
 export interface CatalogModel {
   id: string;
   family?: string;
@@ -43,7 +48,9 @@ export interface CatalogModel {
   params_active_b?: number;
   arch: ModelArch;
   modality?: string[];
+  /** idoris/<role> 枚举子集（不含 auto）；未知角色显式报错，不静默忽略。 */
   roles?: string[];
+  load_hint?: LoadHint;
   capability?: Partial<Record<Capability, number>>;
   quant_options: CatalogQuant[];
   license?: string;
@@ -143,6 +150,23 @@ function parseModel(value: unknown, path: string): CatalogModel {
   if (rolesRaw !== undefined && !Array.isArray(rolesRaw)) {
     throw new CatalogError("roles 必须是数组", `${path}.roles`);
   }
+  const roles = rolesRaw === undefined
+    ? undefined
+    : rolesRaw.map((r, i) => {
+        const role = reqString(r, `${path}.roles[${i}]`);
+        if (!(CATALOG_ROLES as readonly string[]).includes(role)) {
+          throw new CatalogError(
+            `未知角色 "${role}"；catalog 角色枚举为 ${CATALOG_ROLES.join("|")}` +
+              `（旧值 core→daily 已改名；temp 不是角色，改用 load_hint: on_demand）`,
+            `${path}.roles[${i}]`,
+          );
+        }
+        return role;
+      });
+  const loadHintRaw = value.load_hint;
+  if (loadHintRaw !== undefined && loadHintRaw !== "on_demand") {
+    throw new CatalogError(`未知 load_hint "${String(loadHintRaw)}"；目前只支持 on_demand`, `${path}.load_hint`);
+  }
   return {
     id,
     params_total_b: reqNumber(value.params_total_b, `${path}.params_total_b`),
@@ -153,7 +177,8 @@ function parseModel(value: unknown, path: string): CatalogModel {
     ...(optNumber(value.params_active_b, `${path}.params_active_b`) === undefined
       ? {}
       : { params_active_b: optNumber(value.params_active_b, `${path}.params_active_b`) as number }),
-    ...(rolesRaw === undefined ? {} : { roles: rolesRaw.map((r, i) => reqString(r, `${path}.roles[${i}]`)) }),
+    ...(roles === undefined ? {} : { roles }),
+    ...(loadHintRaw === undefined ? {} : { load_hint: loadHintRaw as LoadHint }),
     ...(value.modality === undefined
       ? {}
       : { modality: (value.modality as unknown[]).map((m, i) => reqString(m, `${path}.modality[${i}]`)) }),
@@ -282,8 +307,9 @@ function mergePolicy(partial: Partial<RecommenderPolicy> | undefined): Recommend
   return { ...DEFAULT_POLICY, ...(partial ?? {}) };
 }
 
-function isCore(model: CatalogModel): boolean {
-  return model.roles === undefined || model.roles.includes("core");
+/** 仅 daily 角色参与常驻自动推荐（T4.2：旧角色名 core 已更名 daily，行为不变）。 */
+function isDaily(model: CatalogModel): boolean {
+  return model.roles === undefined || model.roles.includes("daily");
 }
 
 function pickQuant(
@@ -381,7 +407,7 @@ export function recommend(input: RecommendInput): Recommendation {
   let resident: ResidentChoice | null = null;
   let residentModel: CatalogModel | null = null;
   for (const model of eligible) {
-    if (!isCore(model)) continue;
+    if (!isDaily(model)) continue;
     const pick = pickQuant(model, residentBudget, policy, policy.quality_threshold);
     if (pick === undefined) continue;
     const score = (model.capability?.reasoning ?? 0) * pick.quality;
@@ -518,7 +544,7 @@ function buildTradeoff(input: TradeoffInput): string {
         `${fmt(input.resident.footprint_gb)}GB，预算 ${fmt(input.residentBudget)}GB；能力×质量=${input.resident.score.toFixed(4)}`,
     );
   } else {
-    lines.push(`常驻：无（预算 ${fmt(input.residentBudget)}GB 放不下任何 core 模型）`);
+    lines.push(`常驻：无（预算 ${fmt(input.residentBudget)}GB 放不下任何 daily 模型）`);
   }
   const ready = input.temp.filter((t) => t.status === "ready");
   const evict = input.temp.filter((t) => t.status === "requires_eviction");

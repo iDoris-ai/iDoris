@@ -46,7 +46,7 @@
 
 | 层 | 管什么 | 现在的实现 |
 |:---|:---|:---|
-| **选哪个** | `config/catalog.yaml` 按架构参数现算 KV，`min_ram_gb` 是硬门槛；角色分 `fast/core/deep/temp` | `recommender` 包 |
+| **选哪个** | `config/catalog.yaml` 按架构参数现算 KV，`min_ram_gb` 是硬门槛；角色分 `fast/core/deep/temp`（T4.2 已更名：`core`→`daily`，`temp` 不是角色改用 `load_hint: on_demand`；完整枚举见 docs/interfaces/iDoris-Agent24-边界与接口规范.md §3.3/§3.12） | `recommender` 包 |
 | **怎么装卸** | `LoadPolicy{mode: resident\|on_demand\|evict_to_load, keepalive, admission}`，加一把每个后端独立的驱逐互斥锁 | `contracts` + `router/evict-lock` |
 | **谁执行** | `ModelBackend` 接口（list/load/unload/admission/status/chat），Router 核心里不出现任何引擎名 | `adapters`：mock + oMLX |
 

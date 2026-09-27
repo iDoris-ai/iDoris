@@ -1,4 +1,6 @@
+import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+import { parse } from "yaml";
 import { describe, expect, it } from "vitest";
 import { CatalogError, loadCatalog, parseCatalog, recommend } from "../src/recommend.js";
 import { makeHostFacts } from "../src/probe.js";
@@ -135,5 +137,111 @@ describe("T2.1.2 IDORIS_CORE_MODEL override", () => {
     expect(rec.override).toBeNull();
     expect(rec.resident_label).toBe("ornith-1.0-9b@q6_k");
     expect(rec.warnings.some((w) => w.includes("不在目录中"))).toBe(true);
+  });
+});
+
+describe("T4.2 角色枚举统一（core→daily，temp→load_hint）", () => {
+  it("config/catalog.yaml 数据区不再残留旧角色名 core/temp", () => {
+    const raw = parse(readFileSync(CATALOG_PATH, "utf8")) as { catalog: Array<{ roles?: string[] }> };
+    for (const model of raw.catalog) {
+      for (const role of model.roles ?? []) {
+        expect(role).not.toBe("core");
+        expect(role).not.toBe("temp");
+      }
+    }
+  });
+
+  it("旧 core 角色条目已改名为 daily，且仍参与常驻自动推荐", () => {
+    const ornith = catalog.catalog.find((m) => m.id === "ornith-1.0-9b");
+    expect(ornith?.roles).toEqual(["daily"]);
+    // 24GB 档验收基线：ornith-1.0-9b 仍被选为常驻（改名未改变行为）。
+    const rec = recommend({ hardware: m4(24), catalog });
+    expect(rec.resident?.id).toBe("ornith-1.0-9b");
+  });
+
+  it("旧 temp 角色条目已移出 roles（空数组，不落入「未声明 roles=daily」的默认档），改用 load_hint: on_demand", () => {
+    const vl = catalog.catalog.find((m) => m.id === "qwen2.5-vl-7b");
+    expect(vl?.roles).toEqual([]);
+    expect(vl?.load_hint).toBe("on_demand");
+    const coder = catalog.catalog.find((m) => m.id === "qwen2.5-coder-14b");
+    expect(coder?.roles).toEqual([]);
+    expect(coder?.load_hint).toBe("on_demand");
+  });
+
+  it("load_hint: on_demand 条目不参与常驻自动推荐（roles=[] 排除在 daily 之外）", () => {
+    const rec = recommend({ hardware: m4(24), catalog });
+    expect(rec.resident?.id).not.toBe("qwen2.5-vl-7b");
+    expect(rec.resident?.id).not.toBe("qwen2.5-coder-14b");
+  });
+
+  it("未知角色显式报错，不静默忽略", () => {
+    const bad = {
+      version: 1,
+      catalog: [
+        {
+          id: "x",
+          params_total_b: 1,
+          arch: { n_layers: 1, n_kv_heads: 1, head_dim: 1 },
+          quant_options: [{ label: "q4_k_m", weights_gb: 1, quality: 0.98 }],
+          min_ram_gb: 8,
+          roles: ["core"],
+        },
+      ],
+    };
+    expect(() => parseCatalog(bad)).toThrow(CatalogError);
+    expect(() => parseCatalog(bad)).toThrow(/未知角色/);
+  });
+
+  it("旧 temp 角色值同样显式报错", () => {
+    const bad = {
+      version: 1,
+      catalog: [
+        {
+          id: "x",
+          params_total_b: 1,
+          arch: { n_layers: 1, n_kv_heads: 1, head_dim: 1 },
+          quant_options: [{ label: "q4_k_m", weights_gb: 1, quality: 0.98 }],
+          min_ram_gb: 8,
+          roles: ["temp"],
+        },
+      ],
+    };
+    expect(() => parseCatalog(bad)).toThrow(/未知角色/);
+  });
+
+  it("未知 load_hint 显式报错", () => {
+    const bad = {
+      version: 1,
+      catalog: [
+        {
+          id: "x",
+          params_total_b: 1,
+          arch: { n_layers: 1, n_kv_heads: 1, head_dim: 1 },
+          quant_options: [{ label: "q4_k_m", weights_gb: 1, quality: 0.98 }],
+          min_ram_gb: 8,
+          load_hint: "resident",
+        },
+      ],
+    };
+    expect(() => parseCatalog(bad)).toThrow(/load_hint/);
+  });
+
+  it("合法角色枚举（fast|daily|deep|vision|embed|rerank|decide）全部被接受", () => {
+    for (const role of ["fast", "daily", "deep", "vision", "embed", "rerank", "decide"]) {
+      const ok = {
+        version: 1,
+        catalog: [
+          {
+            id: "x",
+            params_total_b: 1,
+            arch: { n_layers: 1, n_kv_heads: 1, head_dim: 1 },
+            quant_options: [{ label: "q4_k_m", weights_gb: 1, quality: 0.98 }],
+            min_ram_gb: 8,
+            roles: [role],
+          },
+        ],
+      };
+      expect(() => parseCatalog(ok)).not.toThrow();
+    }
   });
 });

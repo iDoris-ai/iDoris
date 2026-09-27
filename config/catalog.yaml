@@ -11,7 +11,14 @@
 # 与 docs/07 §5.2 的旧 arch（36/8/128）不同——用旧值会把 KV 高估 12.5%。
 #
 # 字段：
-#   roles: [fast|core|deep|temp]  仅 core 参与常驻自动推荐
+#   roles: [fast|daily|deep|vision|embed|rerank|decide]  仅 daily 参与常驻自动推荐；
+#     省略此字段等价于「未声明角色，按 daily 处理」（历史兼容默认值，新条目请显式写全）；
+#     不想落入这个默认档的条目（例如按需加载槽）请显式写 roles: []。
+#     （T4.2：角色枚举统一到 docs/interfaces/iDoris-Agent24-边界与接口规范.md §3.3/§3.12——
+#      旧值 core 已更名 daily；旧值 temp 不是角色，改用 load_hint 表达加载策略）
+#   load_hint: on_demand  可选。标记该条目按需加载（不参与角色路由/常驻推荐），
+#     语义等价于 @idoris/contracts 的 LoadPolicy.mode=on_demand（catalog 尚未直接建模
+#     完整 LoadPolicy，先用这个薄字段占位）
 #   min_ram_gb: 硬门槛，ram_gb < min_ram_gb 一律 BLOCKED（docs/13 §9.2 ①）
 #   status: experiment 的条目不进自动推荐（docs/13 §1.4 Ornith 系警告）
 version: 1
@@ -67,7 +74,7 @@ catalog:
   params_active_b: 3.0
   arch: {n_layers: 22, n_kv_heads: 8, head_dim: 128}
   context: 262144
-  roles: [fast, core]
+  roles: [fast, daily]
   scenarios: {s3: 0.95, s1: 0.8, s5: 0.75}
   capability: {instruct: 0.80, agent: 0.75, reasoning: 0.70, longctx: 0.75, zh: 0.80, coding: 0.72}
   quant_options: [{label: q4_k_m, weights_gb: 2.30, quality: 0.98}]
@@ -75,7 +82,7 @@ catalog:
   min_ram_gb: 8
   note: "3B 级最强 agent；需 trust_remote_code"
 
-# ---------- Tier D · 日常主力（core） ----------
+# ---------- Tier D · 日常主力（daily） ----------
 - id: qwen3.5-9b
   family: qwen
   params_total_b: 9.0
@@ -83,7 +90,7 @@ catalog:
   arch: {n_layers: 32, n_kv_heads: 4, head_dim: 256}
   context: 262144
   modality: [text, vision]
-  roles: [core]
+  roles: [daily]
   scenarios: {s1: 0.9, s2: 0.95, s4: 0.8, s5: 0.85}
   capability: {instruct: 0.92, agent: 0.66, reasoning: 0.83, longctx: 0.85, zh: 0.92, coding: 0.66}
   quant_options: [{label: mlx_4bit, weights_gb: 5.95, quality: 0.98},
@@ -98,7 +105,7 @@ catalog:
   params_active_b: 9.41
   arch: {n_layers: 32, n_kv_heads: 4, head_dim: 256}
   context: 262144
-  roles: [core]
+  roles: [daily]
   scenarios: {s1: 0.85, s3: 0.9}
   capability: {instruct: 0.86, agent: 0.78, reasoning: 0.85, longctx: 0.82, zh: 0.75, coding: 0.88}
   quant_options: [{label: q4_k_m, weights_gb: 5.63, quality: 0.98},
@@ -114,7 +121,7 @@ catalog:
   params_active_b: 9.65
   arch: {n_layers: 32, n_kv_heads: 4, head_dim: 256}
   context: 262144
-  roles: [core]
+  roles: [daily]
   status: experiment
   capability: {instruct: 0.88, agent: 0.82, reasoning: 0.86, longctx: 0.85, zh: 0.75, coding: 0.88}
   quant_options: [{label: q4_k_m, weights_gb: 5.78, quality: 0.98},
@@ -130,7 +137,7 @@ catalog:
   params_active_b: 3.0
   arch: {n_layers: 40, n_kv_heads: 8, head_dim: 64}
   context: 131072
-  roles: [core]
+  roles: [daily]
   scenarios: {s5: 0.9, s1: 0.6}
   capability: {instruct: 0.86, agent: 0.52, reasoning: 0.68, longctx: 0.70, zh: 0.55, coding: 0.45}
   quant_options: [{label: q4_k_m, weights_gb: 2.24, quality: 0.98},
@@ -145,7 +152,7 @@ catalog:
   params_active_b: 11.95
   arch: {n_layers: 48, n_kv_heads: 8, head_dim: 256}
   context: 262144
-  roles: [core]
+  roles: [daily]
   scenarios: {s1: 0.8, s3: 0.8}
   capability: {instruct: 0.88, agent: 0.69, reasoning: 0.79, longctx: 0.60, zh: 0.70, coding: 0.72}
   quant_options: [{label: qat_q4_0, weights_gb: 6.98, quality: 0.98}]
@@ -159,7 +166,7 @@ catalog:
   params_active_b: 8.19
   arch: {n_layers: 36, n_kv_heads: 8, head_dim: 128}
   context: 32768
-  roles: [fast, core]
+  roles: [fast, daily]
   capability: {instruct: 0.82, agent: 0.60, reasoning: 0.75, longctx: 0.78, zh: 0.85, coding: 0.62}
   quant_options: [{label: q4_k_m, bpp: 0.55, quality: 0.98},
                   {label: q8_0, bpp: 1.0, quality: 0.998}]
@@ -215,7 +222,7 @@ catalog:
   min_ram_gb: 32
   note: "深度推理最强；KV 重，32K 上限；32GB 上需降到 UD-IQ4_XS"
 
-# ---------- 专用能力（临时槽） ----------
+# ---------- 专用能力（临时槽，load_hint: on_demand，不参与角色路由） ----------
 - id: qwen2.5-vl-7b
   family: qwen
   params_total_b: 8.29
@@ -223,7 +230,8 @@ catalog:
   arch: {n_layers: 28, n_kv_heads: 4, head_dim: 128}
   context: 32768
   modality: [text, vision]
-  roles: [temp]
+  roles: []
+  load_hint: on_demand
   capability: {instruct: 0.78, reasoning: 0.65, longctx: 0.70, zh: 0.82, vision: 0.88}
   quant_options: [{label: q8_0, weights_gb: 8.29, quality: 0.998}]
   license: Apache-2.0
@@ -236,7 +244,8 @@ catalog:
   params_active_b: 14.7
   arch: {n_layers: 48, n_kv_heads: 8, head_dim: 128}
   context: 32768
-  roles: [temp]
+  roles: []
+  load_hint: on_demand
   capability: {instruct: 0.80, reasoning: 0.72, coding: 0.82}
   quant_options: [{label: q4_k_m, weights_gb: 8.0, quality: 0.98}]
   license: Apache-2.0

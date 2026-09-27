@@ -4,6 +4,7 @@ import adapterManifestJson from "../../schema/adapter-manifest.schema.json";
 import componentCardJson from "../../schema/component-card.schema.json";
 import loadPolicyJson from "../../schema/load-policy.schema.json";
 import providerJson from "../../schema/provider.schema.json";
+import roleJson from "../../schema/role.schema.json";
 import routingPolicyJson from "../../schema/routing-policy.schema.json";
 import taskProfileJson from "../../schema/task-profile.schema.json";
 import trainingSampleJson from "../../schema/training-sample.schema.json";
@@ -11,6 +12,7 @@ import { adapterManifestSchema } from "../../src/adapter-manifest.js";
 import { componentCardSchema } from "../../src/component-card.js";
 import { loadPolicySchema } from "../../src/load-policy.js";
 import { providerDescriptorSchema } from "../../src/provider.js";
+import { roleSchema } from "../../src/role.js";
 import { routingPolicySchema } from "../../src/routing-policy.js";
 import { taskProfileSchema } from "../../src/task-profile.js";
 import { trainingSampleSchema } from "../../src/training-sample.js";
@@ -20,6 +22,7 @@ const jsonByName = {
   "adapter-manifest": adapterManifestJson,
   provider: providerJson, "load-policy": loadPolicyJson, "component-card": componentCardJson,
   "routing-policy": routingPolicyJson, "task-profile": taskProfileJson, "training-sample": trainingSampleJson,
+  role: roleJson,
 } as const;
 type Name = keyof typeof jsonByName;
 for (const schema of Object.values(jsonByName)) ajv.addSchema(schema as object);
@@ -29,6 +32,7 @@ const zodByName: Record<Name, { safeParse: (d: unknown) => { success: boolean } 
   provider: providerDescriptorSchema, "load-policy": loadPolicySchema, "component-card": componentCardSchema,
   "routing-policy": routingPolicySchema, "task-profile": taskProfileSchema,
   "training-sample": trainingSampleSchema,
+  role: roleSchema,
 };
 
 const validProvider = {
@@ -86,6 +90,12 @@ const corpus: Array<[Name, unknown]> = [
   ["task-profile", {}],
   ["task-profile", { privacy: "nope" }],
   ["task-profile", { capabilities: [] }],
+  ["role", "fast"],
+  ["role", "daily"],
+  ["role", "auto"],
+  ["role", "core"],
+  ["role", "temp"],
+  ["role", "nope"],
 ];
 
 describe("JSON Schema <-> 生成的 zod 一致性（零漂移语义门）", () => {

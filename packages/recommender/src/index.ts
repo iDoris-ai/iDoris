@@ -46,6 +46,7 @@ export type {
   CatalogModel,
   CatalogExcluded,
   Catalog,
+  LoadHint,
   RecommenderPolicy,
   QuantPick,
   ResidentChoice,
