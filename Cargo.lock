@@ -603,7 +603,11 @@ dependencies = [
 name = "idoris-upstream"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
+ "futures-core",
+ "idoris-backend",
  "thiserror",
+ "tokio",
 ]
 
 [[package]]
