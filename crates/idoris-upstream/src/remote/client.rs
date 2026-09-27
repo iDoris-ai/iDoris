@@ -441,4 +441,25 @@ mod tests {
                 .is_empty()
         );
     }
+
+    /// Locks in the explicit placeholder contract until a follow-up PR
+    /// replaces it with a real implementation: `chat_stream` must fail
+    /// with a typed error, not panic, and must not attempt any HTTP call.
+    #[tokio::test]
+    async fn chat_stream_reports_not_implemented_without_calling_out() {
+        let server = MockServer::start().await;
+        let client = client_for(&server, Arc::new(FixedKey("k")));
+        client
+            .chat_stream(request(), far_future_deadline())
+            .await
+            .map(|_stream| ()) // `ChatChunkStream` isn't `Debug`; discard it before `expect_err`.
+            .expect_err("chat_stream must fail, not panic, until it is implemented");
+        assert!(
+            server
+                .received_requests()
+                .await
+                .expect("recording enabled")
+                .is_empty()
+        );
+    }
 }
