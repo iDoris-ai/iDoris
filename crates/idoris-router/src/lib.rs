@@ -17,6 +17,11 @@ pub mod components;
 /// into `AppState` in a follow-up PR.
 pub mod routing_policy;
 
+/// The local decision + execution path (R2-D task 3): `decide()` → (if
+/// needed) `Supervisor` load → `Supervisor` chat. Not yet wired into the
+/// `/v1/chat/completions` handler — a follow-up PR does that.
+pub mod dispatch;
+
 use std::net::IpAddr;
 use std::sync::Arc;
 
