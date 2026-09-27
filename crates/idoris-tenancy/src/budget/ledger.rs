@@ -22,6 +22,46 @@ use super::error::{BudgetError, checked_add_i64, checked_sub_i64};
 use super::period::billing_period_key;
 use super::scope::BudgetScope;
 
+/// Opus Tier-2 re-review B-8: a deterministic way to prove the concurrency
+/// tests in `tests/budget_concurrency.rs` would actually catch a "split the
+/// atomic check-and-deduct transaction" regression class — without hand-
+/// editing `reserve()` and adding a sleep to widen the race window (which
+/// only proves the bug is catchable *with help*, not that the test suite
+/// reliably catches an unmitigated real mutation). Gated behind the
+/// `mutation-test-hooks` feature, off by default: with the feature disabled
+/// this module doesn't exist and `reserve()`'s check is a no-op `cfg`
+/// branch that compiles away entirely, so there is no production cost or
+/// risk from this existing.
+#[cfg(feature = "mutation-test-hooks")]
+pub mod test_hooks {
+    use std::sync::{Barrier, OnceLock};
+
+    /// When armed (via [`arm`]), `reserve` commits its balance-check
+    /// transaction and rendezvous on this barrier before opening a *new*
+    /// transaction for the insert — reproducing the split-transaction bug
+    /// class on demand. Every participating thread blocks here until all of
+    /// them have arrived, i.e. until all of them have passed their own
+    /// balance check, which is what forces the over-spend deterministically
+    /// (no thread can "get lucky" and slip through before the others catch
+    /// up, and no thread can proceed to its insert before the others have
+    /// all committed their checks).
+    static BARRIER: OnceLock<Barrier> = OnceLock::new();
+
+    /// Arm the hook for `thread_count` participants. Call once before
+    /// spawning the threads that will call `reserve`; each of them must
+    /// actually call `reserve` exactly once for the barrier to release.
+    pub fn arm(thread_count: usize) {
+        BARRIER
+            .set(Barrier::new(thread_count))
+            .unwrap_or_else(|_| panic!("test_hooks::arm called more than once per process"));
+    }
+
+    /// `None` when not armed — `reserve` skips the hook entirely.
+    pub(super) fn barrier() -> Option<&'static Barrier> {
+        BARRIER.get()
+    }
+}
+
 /// Reservation lifecycle state. Opus Tier-2 acceptance L3: this used to be
 /// raw `&str`/`String` comparisons against the SQL `status` column's TEXT
 /// values scattered across `settle`/`release`, which is exactly the kind of
@@ -495,11 +535,28 @@ impl BudgetLedger {
         // clear `ReservationNotActive` instead of silently succeeding.
         sweep_expired_scope(&tx, scope, &period, now_ms)?;
 
-        if let Some(sub_cfg) = &sub_config {
+        // B-6: the `SpendGate` is a tenant-level setting, but its free-
+        // request bypass applies uniformly to *both* dimensions — an
+        // unconfigured tenant defaults to `PaidOnly` (matching
+        // `SpendGate::PaidOnly`'s own "default" doc comment), so the
+        // sub-scope check also skips a free request unless a tenant has
+        // explicitly opted into `All`.
+        let effective_gate = tenant_cfg
+            .as_ref()
+            .map(|t| t.gate)
+            .unwrap_or(SpendGate::PaidOnly);
+        let skip_zero_cost = effective_gate == SpendGate::PaidOnly && estimated_cost_minor == 0;
+
+        if !skip_zero_cost && let Some(sub_cfg) = &sub_config {
             let sub_spent = spent_for(&tx, scope, &period)?;
             let sub_reserved = active_reserved_for(&tx, scope, &period, now_ms)?;
             let sub_committed = checked_add_i64(sub_spent, sub_reserved);
-            if estimated_cost_minor > checked_sub_i64(sub_cfg.limit_minor, sub_committed) {
+            if exceeds_limit(
+                estimated_cost_minor,
+                sub_cfg.limit_minor,
+                sub_committed,
+                effective_gate,
+            ) {
                 tx.commit()?; // nothing written yet, but keep the sweep above.
                 return Err(BudgetError::exceeded(
                     scope.tenant_id.clone(),
@@ -513,25 +570,41 @@ impl BudgetLedger {
         // H2: the tenant-level dimension, checked in the same transaction as
         // the sub-scope one above, so either insufficient rejects the whole
         // `reserve` atomically with the other.
-        if let Some(tenant_cfg) = &tenant_cfg {
-            let skip_zero_cost =
-                tenant_cfg.gate == SpendGate::PaidOnly && estimated_cost_minor == 0;
-            if !skip_zero_cost {
-                let tenant_spent = tenant_spent_for(&tx, &scope.tenant_id, &tenant_period)?;
-                let tenant_reserved =
-                    tenant_active_reserved_for(&tx, &scope.tenant_id, &tenant_period, now_ms)?;
-                let tenant_committed = checked_add_i64(tenant_spent, tenant_reserved);
-                if estimated_cost_minor > checked_sub_i64(tenant_cfg.limit_minor, tenant_committed)
-                {
-                    tx.commit()?;
-                    return Err(BudgetError::exceeded(
-                        scope.tenant_id.clone(),
-                        tenant_cfg.limit_minor,
-                        tenant_committed,
-                        estimated_cost_minor,
-                    ));
-                }
+        if !skip_zero_cost && let Some(tenant_cfg) = &tenant_cfg {
+            let tenant_spent = tenant_spent_for(&tx, &scope.tenant_id, &tenant_period)?;
+            let tenant_reserved =
+                tenant_active_reserved_for(&tx, &scope.tenant_id, &tenant_period, now_ms)?;
+            let tenant_committed = checked_add_i64(tenant_spent, tenant_reserved);
+            if exceeds_limit(
+                estimated_cost_minor,
+                tenant_cfg.limit_minor,
+                tenant_committed,
+                effective_gate,
+            ) {
+                tx.commit()?;
+                return Err(BudgetError::exceeded(
+                    scope.tenant_id.clone(),
+                    tenant_cfg.limit_minor,
+                    tenant_committed,
+                    estimated_cost_minor,
+                ));
             }
+        }
+
+        // B-8 mutation-testing hook (see `test_hooks` doc comment) — a
+        // no-op unless a test has explicitly armed it. When armed, this
+        // reproduces the split-transaction bug class on purpose: commit the
+        // check we just did, rendezvous with every other participating
+        // thread, then open a *new* transaction for the insert below —
+        // exactly the non-atomic check-then-deduct this crate exists to
+        // prevent.
+        #[cfg(feature = "mutation-test-hooks")]
+        let mut tx = tx;
+        #[cfg(feature = "mutation-test-hooks")]
+        if let Some(barrier) = test_hooks::barrier() {
+            tx.commit()?;
+            barrier.wait();
+            tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         }
 
         // Overflow would wrap to a past instant (release) and make the
@@ -755,13 +828,25 @@ impl BudgetLedger {
     /// `expired` one should be re-reserved instead (extending it would
     /// resurrect a reservation other code may have already treated as
     /// freed).
+    /// B-5 (Opus Tier-2 re-review) hardening:
+    /// - `additional_ttl_ms` may not exceed this ledger's own `ttl_ms` — one
+    ///   `extend` call can renew for at most as long as a fresh `reserve`
+    ///   would have granted, not an arbitrary caller-chosen amount.
+    /// - the reservation's total lifetime (`created_at_ms` to the *new*
+    ///   `expires_at_ms`) may not exceed 4x `ttl_ms` — bounds how many times
+    ///   `extend` can be chained, so a caller can't keep a reservation (and
+    ///   the budget it holds) alive indefinitely.
+    /// - a reservation whose TTL has already lapsed (`expires_at_ms <=
+    ///   now_ms`) is rejected even if its DB `status` is still `active`
+    ///   (lazily not yet swept) — extending a reservation other code may
+    ///   already be treating as freed would resurrect it unexpectedly.
     pub fn extend(
         &self,
         tenant_id: &str,
         reservation_id: &ReservationId,
         additional_ttl_ms: i64,
     ) -> Result<(), BudgetError> {
-        if additional_ttl_ms <= 0 {
+        if additional_ttl_ms <= 0 || additional_ttl_ms > self.ttl_ms {
             return Err(BudgetError::InvalidTtl {
                 ttl_ms: additional_ttl_ms,
             });
@@ -772,7 +857,7 @@ impl BudgetLedger {
 
         let row = find_reservation(&tx, tenant_id, reservation_id)?;
         let status = ReservationStatus::parse(&row.status)?;
-        if status != ReservationStatus::Active {
+        if status != ReservationStatus::Active || row.expires_at_ms <= now_ms {
             tx.rollback().ok();
             return Err(BudgetError::ReservationNotActive {
                 reservation_id: reservation_id.0.clone(),
@@ -783,6 +868,20 @@ impl BudgetLedger {
         let new_expires_at_ms = now_ms
             .checked_add(additional_ttl_ms)
             .ok_or(BudgetError::InvalidTimestamp { now_ms })?;
+        let max_lifetime_ms = self.ttl_ms.checked_mul(4).ok_or(BudgetError::InvalidTtl {
+            ttl_ms: additional_ttl_ms,
+        })?;
+        let max_expires_at_ms = row
+            .created_at_ms
+            .checked_add(max_lifetime_ms)
+            .ok_or(BudgetError::InvalidTimestamp { now_ms })?;
+        if new_expires_at_ms > max_expires_at_ms {
+            tx.rollback().ok();
+            return Err(BudgetError::InvalidTtl {
+                ttl_ms: additional_ttl_ms,
+            });
+        }
+
         tx.execute(
             "UPDATE reservations SET expires_at_ms=?2 WHERE id=?1",
             rusqlite::params![reservation_id.0, new_expires_at_ms],
@@ -863,6 +962,9 @@ struct ReservationRow {
     reserved_minor: i64,
     status: String,
     expires_at_ms: i64,
+    /// B-5: needed to cap a reservation's total lifetime across repeated
+    /// `extend` calls.
+    created_at_ms: i64,
 }
 
 /// M2 (Opus Tier-2 acceptance): filters by `tenant_id` in the `WHERE`
@@ -881,7 +983,7 @@ fn find_reservation(
     let found = conn
         .query_row(
             "SELECT tenant_id, key_id, provider_id, model_id, period, reserved_minor, status, \
-                    expires_at_ms, tenant_period \
+                    expires_at_ms, tenant_period, created_at_ms \
              FROM reservations WHERE id = ?1 AND tenant_id = ?2",
             rusqlite::params![reservation_id.0, tenant_id],
             |r| {
@@ -895,6 +997,7 @@ fn find_reservation(
                     status: r.get(6)?,
                     expires_at_ms: r.get(7)?,
                     tenant_period: r.get(8)?,
+                    created_at_ms: r.get(9)?,
                 })
             },
         )
@@ -985,6 +1088,29 @@ fn load_config(conn: &Connection, scope: &BudgetScope) -> Result<Option<ScopeCon
     )
     .optional()
     .map_err(BudgetError::from)
+}
+
+/// B-6/B-7: whether `estimated_cost_minor` leaves no room against
+/// `limit_minor - committed`, honoring `gate`. A priced request
+/// (`estimated_cost_minor > 0`) is unaffected by `gate` — plain
+/// `cost > balance`. A *free* request under `SpendGate::All` instead
+/// matches policy's `is_over()` semantics: `committed >= limit` (not just
+/// strictly over) counts as "no room left" too. `SpendGate::PaidOnly`'s
+/// free-request bypass is handled by the caller *before* this is invoked
+/// (see `reserve`'s `skip_zero_cost`), so in practice `gate` here is only
+/// ever `All` on the `estimated_cost_minor == 0` path.
+fn exceeds_limit(
+    estimated_cost_minor: i64,
+    limit_minor: i64,
+    committed: i64,
+    gate: SpendGate,
+) -> bool {
+    let balance = checked_sub_i64(limit_minor, committed);
+    if estimated_cost_minor == 0 && gate == SpendGate::All {
+        balance <= 0
+    } else {
+        estimated_cost_minor > balance
+    }
 }
 
 /// B-2: the `billing_timezone` any *other* `(key, provider, model)`
@@ -1649,6 +1775,63 @@ mod tests {
         ledger.configure(&scope, 100, "UTC").expect("configure");
         assert!(ledger.reserve(&scope, Price::Known(0)).is_ok());
         assert_eq!(ledger.balance(&scope).expect("balance"), 100);
+    }
+
+    /// B-6: `paid_only` (the implicit default with no tenant configured at
+    /// all) bypasses the *sub-scope* check for a free request too, not just
+    /// the tenant-level one — even once the sub-scope's own balance has
+    /// gone negative (via an M1 overage).
+    #[test]
+    fn paid_only_default_bypasses_zero_cost_at_the_sub_scope_even_with_negative_balance() {
+        let path = temp_db_path("b6-sub-scope-paid-only");
+        let ledger = BudgetLedger::open(&path).expect("open");
+        let scope = BudgetScope::new("acme-co", "key-1", "openai", "gpt-5");
+        ledger.configure(&scope, 100, "UTC").expect("configure");
+        let id = ledger.reserve(&scope, Price::Known(100)).expect("reserve");
+        ledger
+            .settle(&scope.tenant_id, &id, 150)
+            .expect("settle overage pushes sub-scope balance negative");
+        assert!(ledger.balance(&scope).expect("balance") < 0);
+        assert!(ledger.reserve(&scope, Price::Known(0)).is_ok());
+    }
+
+    /// B-7: under `SpendGate::All`, a free request is rejected once
+    /// `committed` reaches the limit *exactly* — matching policy's
+    /// `is_over()` (`committed >= limit`), not just `committed > limit`.
+    #[test]
+    fn all_gate_rejects_zero_cost_when_committed_exactly_equals_limit() {
+        let path = temp_db_path("b7-all-gate-exact-limit");
+        let ledger = BudgetLedger::open(&path).expect("open");
+        let scope = BudgetScope::new("acme-co", "key-1", "openai", "gpt-5");
+        ledger.configure(&scope, 1_000, "UTC").expect("configure");
+        ledger
+            .configure_tenant("acme-co", 100, "UTC", SpendGate::All)
+            .expect("configure_tenant");
+        let id = ledger.reserve(&scope, Price::Known(100)).expect("reserve");
+        ledger
+            .settle(&scope.tenant_id, &id, 100)
+            .expect("settle exactly at the tenant limit");
+        assert_eq!(ledger.tenant_balance("acme-co").expect("tenant_balance"), 0);
+        assert!(matches!(
+            ledger.reserve(&scope, Price::Known(0)),
+            Err(BudgetError::Exceeded { .. })
+        ));
+    }
+
+    /// Negative control mirroring B-7: with balance strictly positive
+    /// (committed < limit), a free request under `All` still succeeds.
+    #[test]
+    fn all_gate_allows_zero_cost_when_balance_is_still_positive() {
+        let path = temp_db_path("b7-all-gate-positive-balance");
+        let ledger = BudgetLedger::open(&path).expect("open");
+        let scope = BudgetScope::new("acme-co", "key-1", "openai", "gpt-5");
+        ledger.configure(&scope, 1_000, "UTC").expect("configure");
+        ledger
+            .configure_tenant("acme-co", 100, "UTC", SpendGate::All)
+            .expect("configure_tenant");
+        let id = ledger.reserve(&scope, Price::Known(50)).expect("reserve");
+        ledger.settle(&scope.tenant_id, &id, 50).expect("settle");
+        assert!(ledger.reserve(&scope, Price::Known(0)).is_ok());
     }
 
     #[test]
