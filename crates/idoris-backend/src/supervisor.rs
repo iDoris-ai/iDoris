@@ -1281,6 +1281,48 @@ mod tests {
         assert_eq!(adapter.load_call_count("a"), 1);
     }
 
+    /// M5: when a singleflight-merged load fails, *every* waiter must get
+    /// the *same* error (a mutation that only notified the first waiter
+    /// must be caught) — and a later, separate `load` call must actually
+    /// retry the adapter, not keep replaying the old failure forever.
+    #[tokio::test(start_paused = true)]
+    async fn singleflight_failure_notifies_every_waiter_identically_and_a_later_load_retries() {
+        let adapter = Arc::new(MockAdapter::new(catalog()));
+        adapter.set_load_delay("a", std::time::Duration::from_millis(50));
+        adapter.set_load_script("a", vec![crate::mock::LoadOutcome::Fail]);
+        let handle = Supervisor::spawn(adapter.clone(), SupervisorConfig::default())
+            .expect("spawn should succeed");
+        let h1 = handle.clone();
+        let h2 = handle.clone();
+        let f1 = tokio::spawn(async move { h1.load("a", 4.0, on_demand_policy()).await });
+        let f2 = tokio::spawn(async move { h2.load("a", 4.0, on_demand_policy()).await });
+        let err1 = f1
+            .await
+            .unwrap()
+            .expect_err("the scripted Fail outcome must surface as an error");
+        let err2 = f2
+            .await
+            .unwrap()
+            .expect_err("the merged waiter must see the same failure, not silently succeed");
+        assert_eq!(
+            err1, err2,
+            "both waiters of a merged, failed load must get an identical error"
+        );
+        assert_eq!(
+            adapter.load_call_count("a"),
+            1,
+            "the failed attempt must still have been exactly one adapter call"
+        );
+        // The script queue is now empty (defaults to `Ok`): a later, plain
+        // `load` must actually re-invoke the adapter, proving the failure
+        // wasn't cached or replayed instead of genuinely retried.
+        handle
+            .load("a", 4.0, on_demand_policy())
+            .await
+            .expect("a later load must retry, not replay the earlier failure");
+        assert_eq!(adapter.load_call_count("a"), 2);
+    }
+
     /// Negative contrast: a *different* policy for the same id must not be
     /// silently merged — it fails fast with `Busy` instead (queueing lands
     /// in a follow-up PR).
