@@ -13,7 +13,7 @@
 
 import { readFileSync } from "node:fs";
 import { parse } from "yaml";
-import { CATALOG_ROLES, type TaskProfile } from "@idoris/contracts";
+import { CATALOG_ROLES, type CatalogRole, type TaskProfile } from "@idoris/contracts";
 import {
   appleReserveGb,
   appleUsableGb,
@@ -48,8 +48,9 @@ export interface CatalogModel {
   params_active_b?: number;
   arch: ModelArch;
   modality?: string[];
-  /** idoris/<role> 枚举子集（不含 auto）；未知角色显式报错，不静默忽略。 */
-  roles?: string[];
+  /** idoris/<role> 枚举子集（不含 auto）；**必填**——未知角色 / 缺失都显式报错，不静默默认。
+   *  不想让某条目参与任何角色路由（例如按需加载槽）请显式写 `roles: []`。 */
+  roles: CatalogRole[];
   load_hint?: LoadHint;
   capability?: Partial<Record<Capability, number>>;
   quant_options: CatalogQuant[];
@@ -147,22 +148,35 @@ function parseModel(value: unknown, path: string): CatalogModel {
     throw new CatalogError("quant_options 不能为空", `${path}.quant_options`);
   }
   const rolesRaw = value.roles;
-  if (rolesRaw !== undefined && !Array.isArray(rolesRaw)) {
+  if (rolesRaw === undefined) {
+    // M1：roles 是必填字段——不想参与任何角色路由的条目（如按需加载槽）也要显式写 roles: []，
+    // 不再有「省略 = daily」的隐式默认（那条默认值曾让 load_hint: on_demand 槽误入常驻推荐）。
+    throw new CatalogError(
+      "roles 是必填字段（不参与角色路由的条目请显式写 roles: []，不要省略）",
+      `${path}.roles`,
+    );
+  }
+  if (!Array.isArray(rolesRaw)) {
     throw new CatalogError("roles 必须是数组", `${path}.roles`);
   }
-  const roles = rolesRaw === undefined
-    ? undefined
-    : rolesRaw.map((r, i) => {
-        const role = reqString(r, `${path}.roles[${i}]`);
-        if (!(CATALOG_ROLES as readonly string[]).includes(role)) {
-          throw new CatalogError(
-            `未知角色 "${role}"；catalog 角色枚举为 ${CATALOG_ROLES.join("|")}` +
-              `（旧值 core→daily 已改名；temp 不是角色，改用 load_hint: on_demand）`,
-            `${path}.roles[${i}]`,
-          );
-        }
-        return role;
-      });
+  const roles = rolesRaw.map((r, i) => {
+    const role = reqString(r, `${path}.roles[${i}]`);
+    if (!(CATALOG_ROLES as readonly string[]).includes(role)) {
+      throw new CatalogError(
+        `未知角色 "${role}"；catalog 角色枚举为 ${CATALOG_ROLES.join("|")}` +
+          `（旧值 core→daily 已改名；temp 不是角色，改用 load_hint: on_demand）`,
+        `${path}.roles[${i}]`,
+      );
+    }
+    return role as CatalogRole;
+  });
+  const rolesSeen = new Set<CatalogRole>();
+  for (const role of roles) {
+    if (rolesSeen.has(role)) {
+      throw new CatalogError(`roles 里重复的角色 "${role}"`, `${path}.roles`);
+    }
+    rolesSeen.add(role);
+  }
   const loadHintRaw = value.load_hint;
   if (loadHintRaw !== undefined && loadHintRaw !== "on_demand") {
     throw new CatalogError(`未知 load_hint "${String(loadHintRaw)}"；目前只支持 on_demand`, `${path}.load_hint`);
@@ -173,11 +187,11 @@ function parseModel(value: unknown, path: string): CatalogModel {
     arch: parseArch(value.arch, `${path}.arch`),
     quant_options: quantRaw.map((q, i) => parseQuant(q, `${path}.quant_options[${i}]`)),
     min_ram_gb: reqNumber(value.min_ram_gb, `${path}.min_ram_gb`),
+    roles,
     ...(typeof value.family === "string" ? { family: value.family } : {}),
     ...(optNumber(value.params_active_b, `${path}.params_active_b`) === undefined
       ? {}
       : { params_active_b: optNumber(value.params_active_b, `${path}.params_active_b`) as number }),
-    ...(roles === undefined ? {} : { roles }),
     ...(loadHintRaw === undefined ? {} : { load_hint: loadHintRaw as LoadHint }),
     ...(value.modality === undefined
       ? {}
@@ -307,9 +321,22 @@ function mergePolicy(partial: Partial<RecommenderPolicy> | undefined): Recommend
   return { ...DEFAULT_POLICY, ...(partial ?? {}) };
 }
 
-/** 仅 daily 角色参与常驻自动推荐（T4.2：旧角色名 core 已更名 daily，行为不变）。 */
-function isDaily(model: CatalogModel): boolean {
-  return model.roles === undefined || model.roles.includes("daily");
+/**
+ * 角色候选筛选（T4.2）：某模型是否可以作为 `role` 的候选。
+ *
+ * 与 `packages/router/src/roles.ts` 的 `resolveRoleToCandidates` **共用同一个函数**，
+ * 避免「常驻自动推荐」和「按角色查候选」在 experiment / min_ram_gb 上各写一套判断、
+ * 悄悄漂移出两套口径。
+ *
+ * - `status: experiment` 的条目一律排除（跨 harness 基准不迁移，不进自动候选）。
+ * - `minRamGb` 省略时不做硬件门槛过滤（router 侧「先列出全部候选」的用法）；
+ *   传入时要求 `model.min_ram_gb <= minRamGb`（recommender 侧按硬件 facts 过滤）。
+ * - 角色匹配严格按 `model.roles`（T4.2 起 roles 必填，不再有「省略角色」的隐式默认）。
+ */
+export function isEligibleForRole(model: CatalogModel, role: CatalogRole, minRamGb?: number): boolean {
+  if (model.status === "experiment") return false;
+  if (minRamGb !== undefined && model.min_ram_gb > minRamGb) return false;
+  return model.roles.includes(role);
 }
 
 function pickQuant(
@@ -404,10 +431,13 @@ export function recommend(input: RecommendInput): Recommendation {
   const eligible = catalog.catalog.filter((m) => m.status !== "experiment" && hardware.ram_gb >= m.min_ram_gb);
 
   // ---- 常驻：reasoning × quality 最高（docs/07 §5.3）----------------------
+  // 按角色筛选常驻候选（daily）：直接走 catalog.catalog + isEligibleForRole，
+  // 不复用下面 `eligible`（那份只管 experiment/min_ram_gb，不管角色），
+  // 好让这里和 router 侧 resolveRoleToCandidates 走同一个判定函数。
   let resident: ResidentChoice | null = null;
   let residentModel: CatalogModel | null = null;
-  for (const model of eligible) {
-    if (!isDaily(model)) continue;
+  for (const model of catalog.catalog) {
+    if (!isEligibleForRole(model, "daily", hardware.ram_gb)) continue;
     const pick = pickQuant(model, residentBudget, policy, policy.quality_threshold);
     if (pick === undefined) continue;
     const score = (model.capability?.reasoning ?? 0) * pick.quality;

@@ -11,16 +11,27 @@
 # 与 docs/07 §5.2 的旧 arch（36/8/128）不同——用旧值会把 KV 高估 12.5%。
 #
 # 字段：
-#   roles: [fast|daily|deep|vision|embed|rerank|decide]  仅 daily 参与常驻自动推荐；
-#     省略此字段等价于「未声明角色，按 daily 处理」（历史兼容默认值，新条目请显式写全）；
-#     不想落入这个默认档的条目（例如按需加载槽）请显式写 roles: []。
+#   roles: [fast|daily|deep|vision|embed|rerank|decide]  **必填**，仅 daily 参与常驻自动推荐。
+#     不想参与任何角色路由的条目（例如下面的按需加载槽）也要显式写 roles: []，
+#     不允许省略——省略即报错（M1：曾经「省略 = 按 daily 处理」的隐式默认已废弃，
+#     那条默认值会让 load_hint: on_demand 槽悄悄混进常驻推荐）。
 #     （T4.2：角色枚举统一到 docs/interfaces/iDoris-Agent24-边界与接口规范.md §3.3/§3.12——
 #      旧值 core 已更名 daily；旧值 temp 不是角色，改用 load_hint 表达加载策略）
-#   load_hint: on_demand  可选。标记该条目按需加载（不参与角色路由/常驻推荐），
-#     语义等价于 @idoris/contracts 的 LoadPolicy.mode=on_demand（catalog 尚未直接建模
-#     完整 LoadPolicy，先用这个薄字段占位）
+#   load_hint: on_demand  可选，与 roles 是两个独立的轴：roles 回答「这个模型服务哪些
+#     角色请求」，load_hint 回答「常驻还是按需加载」——一个条目可以既有具体角色、又标
+#     on_demand（如下面的 qwen2.5-vl-7b：服务 vision 角色，但不常驻）。语义等价于
+#     @idoris/contracts 的 LoadPolicy.mode=on_demand（catalog 尚未直接建模完整
+#     LoadPolicy，先用这个薄字段占位；**目前没有代码读取 load_hint**，纯声明）。
 #   min_ram_gb: 硬门槛，ram_gb < min_ram_gb 一律 BLOCKED（docs/13 §9.2 ①）
 #   status: experiment 的条目不进自动推荐（docs/13 §1.4 Ornith 系警告）
+#
+# 已知冲突（T4.2 评审 M4，本 PR 不改推荐结果，只记录）：
+#   规范定义 fast=常驻 1-4B 延迟优先、daily=7-12B 质量优先（docs/interfaces/
+#   iDoris-Agent24-边界与接口规范.md §3.12），但下面几条是把旧枚举做**机械改名**
+#   （core→daily）搬过来的，参数量不在这个区间：nanbeige4.2-3b（约 4B，标了 daily）、
+#   granite-4.2-3b（3B，标了 daily）、qwen3-8b（8.19B，标了 fast）。按规范重标会改变
+#   常驻自动推荐结果（哪个模型被选为常驻），需要 jason 拍板，见 docs/agent/tasks.md
+#   跟进项账本 FU-17（OPEN）。
 version: 1
 catalog:
 
@@ -222,7 +233,7 @@ catalog:
   min_ram_gb: 32
   note: "深度推理最强；KV 重，32K 上限；32GB 上需降到 UD-IQ4_XS"
 
-# ---------- 专用能力（临时槽，load_hint: on_demand，不参与角色路由） ----------
+# ---------- 专用能力（按需加载槽：load_hint: on_demand） ----------
 - id: qwen2.5-vl-7b
   family: qwen
   params_total_b: 8.29
@@ -230,7 +241,7 @@ catalog:
   arch: {n_layers: 28, n_kv_heads: 4, head_dim: 128}
   context: 32768
   modality: [text, vision]
-  roles: []
+  roles: [vision]
   load_hint: on_demand
   capability: {instruct: 0.78, reasoning: 0.65, longctx: 0.70, zh: 0.82, vision: 0.88}
   quant_options: [{label: q8_0, weights_gb: 8.29, quality: 0.998}]
@@ -238,6 +249,10 @@ catalog:
   min_ram_gb: 16
   note: "U0 实测 8.50GB（8bit）；视觉临时槽"
 
+# coding 不新增角色：iDoris 的方向不是编程场景（已拍板，docs/iDoris-总体规划.md P-7）。
+# 这条按需加载槽只服务 needed_capabilities: coding（recommender 的能力匹配，与 roles 无关），
+# 不声明任何 idoris/<role>；未来如果真的需要按角色路由 coding，走 X-iDoris-Capabilities
+# 表达能力需求，不新增角色（docs/interfaces/iDoris-Agent24-边界与接口规范.md §3.12）。
 - id: qwen2.5-coder-14b
   family: qwen
   params_total_b: 14.7

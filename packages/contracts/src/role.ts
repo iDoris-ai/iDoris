@@ -16,8 +16,10 @@ export const ROLES: readonly Role[] = roleSchema.options;
  * catalog 目录条目可声明的角色：排除 `auto`——`auto` 是「交给 iDoris 选」，
  * 不是某个具体模型的静态属性，任何 catalog 条目都不应该声明它。
  */
-export const CATALOG_ROLES: readonly Exclude<Role, "auto">[] = ROLES.filter(
-  (r): r is Exclude<Role, "auto"> => r !== "auto",
+export type CatalogRole = Exclude<Role, "auto">;
+
+export const CATALOG_ROLES: readonly CatalogRole[] = ROLES.filter(
+  (r): r is CatalogRole => r !== "auto",
 );
 
 export function isRole(value: string): value is Role {

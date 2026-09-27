@@ -96,6 +96,10 @@ const corpus: Array<[Name, unknown]> = [
   ["role", "core"],
   ["role", "temp"],
   ["role", "nope"],
+  ["role", ""],
+  ["role", null],
+  ["role", 1],
+  ["role", "FAST"],
 ];
 
 describe("JSON Schema <-> 生成的 zod 一致性（零漂移语义门）", () => {

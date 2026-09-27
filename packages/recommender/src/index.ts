@@ -35,6 +35,7 @@ export {
   loadCatalog,
   recommend,
   recommendFromFile,
+  isEligibleForRole,
   DEFAULT_POLICY,
   TEMP_SLOT_RESERVE_GB,
   HEADROOM_GB,
