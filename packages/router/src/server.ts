@@ -58,11 +58,19 @@ const SERVED_LOCALITIES: ReadonlySet<string> = new Set(["loopback", "lan", "remo
 /**
  * `X-iDoris-Served-Locality` 取值（T4.1，接口规范 §3.5/§3.12）。
  *
- * **fail-closed，不默认 loopback**：locality 缺失或不是三值之一时一律按
- * `remote` 回报——因为 Agent24 的 `idoris-local` 逻辑 provider 只认 loopback，
- * 把一个未知/异常值误判成 loopback 会让本该拒绝的调用被当成本地放行。
+ * **`provider.locality` 不等于「推理实际发生在哪里」**：对 `http_service` 卡，
+ * 组件卡的 `provider.locality` 就是它自己网络地址的可达范围，两者一致；但对
+ * `spawn_cli`（订阅中转）这类卡，`provider.locality: loopback` 表达的是**调用来源**
+ * 必须是 loopback（见 config/components/subscription.yaml 的注释），跟这次推理
+ * 实际在哪里执行毫无关系——订阅中转背后调的是云端 CLI，真实推理发生在远端。
+ * 同理，凡是已知走"订阅/中转"这条子协议的 provider，也不能直接信它卡上的 locality。
+ *
+ * 所以这里不能无条件读 `card.provider.locality` 当作既成事实：spawn_cli 或订阅类
+ * provider 一律按 `remote` 回报；其余情况才用卡上的 locality，且缺失/非三值之一时
+ * 同样 fail-closed 按 `remote`（不默认 loopback——Agent24 的 `idoris-local` 只认 loopback）。
  */
 function servedLocalityOf(card: ComponentCard): ServedLocality {
+  if (card.form === "spawn_cli" || isSubscriptionProviderId(card.provider.id)) return "remote";
   const locality: unknown = card.provider.locality;
   return typeof locality === "string" && SERVED_LOCALITIES.has(locality) ? (locality as ServedLocality) : "remote";
 }
@@ -70,6 +78,25 @@ function servedLocalityOf(card: ComponentCard): ServedLocality {
 function json(res: ServerResponse, status: number, body: unknown): void {
   res.writeHead(status, { "content-type": "application/json" });
   res.end(JSON.stringify(body));
+}
+
+/** M5：每请求一行结构化审计日志，写 stderr。严禁塞请求/响应内容——只留可查的元数据。 */
+interface AuditEntry {
+  record_id: string;
+  provider: string | null;
+  served_locality: ServedLocality | null;
+  status: number;
+  duration_ms: number;
+}
+
+function writeAuditLog(entry: AuditEntry): void {
+  process.stderr.write(JSON.stringify(entry) + "\n");
+}
+
+/** handleChat 用来把「选中了哪个 provider / 判定的 locality」回报给上面的审计日志。 */
+interface RequestMeta {
+  providerId?: string;
+  servedLocality?: ServedLocality;
 }
 
 export async function startRouter(opts: RouterOptions): Promise<Router> {
@@ -142,54 +169,90 @@ async function handle(
   instanceId: string,
 ): Promise<void> {
   // T4.1：每个请求生成独立的 Record-Id，写在所有响应上（含错误、含流式）——
-  // 由服务端生成，跟调用方填的 X-iDoris-Request-Id 无关，调用方不能指定它。
-  res.setHeader("X-iDoris-Record-Id", randomUUID());
+  // 由服务端生成，跟调用方填的 X-iDoris-Request-Id（或任何调用方自己塞的
+  // X-iDoris-Record-Id）都无关，调用方指定不了它。
+  const recordId = randomUUID();
+  res.setHeader("X-iDoris-Record-Id", recordId);
 
-  if (req.method === "GET" && req.url === "/health") {
-    json(res, 200, {
-      status: "ok",
-      service: "idoris",
-      version: ROUTER_VERSION,
-      contract_version: CONTRACT_VERSION,
-      instance_id: instanceId,
-      components: registered.length,
+  // M5：审计日志——不管走哪条分支、成功还是报错，响应一结束（正常 finish 或
+  // 客户端异常断开的 close）都打一行。用 meta 让 handleChat 事后回填 provider/locality。
+  const start = Date.now();
+  const meta: RequestMeta = {};
+  let logged = false;
+  const logOnce = (): void => {
+    if (logged) return;
+    logged = true;
+    writeAuditLog({
+      record_id: recordId,
+      provider: meta.providerId ?? null,
+      served_locality: meta.servedLocality ?? null,
+      status: res.statusCode,
+      duration_ms: Date.now() - start,
     });
-    return;
-  }
-  if (req.method === "GET" && req.url === "/v1/models") {
-    const data: Array<{ id: string; object: string; owned_by: string }> = [];
-    for (const { card, backend } of registered) {
-      if (health.isCoolingDown(card.provider.id)) continue;
-      try {
-        const models = await backend.list();
-        health.record(card.provider.id, true);
-        for (const m of models) data.push({ id: m.id, object: "model", owned_by: card.provider.id });
-      } catch {
-        health.record(card.provider.id, false);
-      }
-    }
-    json(res, 200, { object: "list", data });
-    return;
-  }
-  if (req.method === "GET" && req.url === "/capabilities") {
-    // T2.2.1：顶层 JSON 数组；每项附容量字段（06 §10.8）。
-    try {
-      json(res, 200, await getCapabilities().snapshot());
-    } catch (err) {
-      json(res, 503, {
-        error: {
-          type: "capabilities_unavailable",
-          message: err instanceof Error ? err.message : String(err),
-        },
+  };
+  res.once("finish", logOnce);
+  res.once("close", logOnce);
+
+  try {
+    if (req.method === "GET" && req.url === "/health") {
+      json(res, 200, {
+        status: "ok",
+        service: "idoris",
+        version: ROUTER_VERSION,
+        contract_version: CONTRACT_VERSION,
+        instance_id: instanceId,
+        components: registered.length,
       });
+      return;
     }
-    return;
+    if (req.method === "GET" && req.url === "/v1/models") {
+      const data: Array<{ id: string; object: string; owned_by: string }> = [];
+      for (const { card, backend } of registered) {
+        if (health.isCoolingDown(card.provider.id)) continue;
+        try {
+          const models = await backend.list();
+          health.record(card.provider.id, true);
+          for (const m of models) data.push({ id: m.id, object: "model", owned_by: card.provider.id });
+        } catch {
+          health.record(card.provider.id, false);
+        }
+      }
+      json(res, 200, { object: "list", data });
+      return;
+    }
+    if (req.method === "GET" && req.url === "/capabilities") {
+      // T2.2.1：顶层 JSON 数组；每项附容量字段（06 §10.8）。
+      try {
+        json(res, 200, await getCapabilities().snapshot());
+      } catch (err) {
+        json(res, 503, {
+          error: {
+            type: "capabilities_unavailable",
+            message: err instanceof Error ? err.message : String(err),
+          },
+        });
+      }
+      return;
+    }
+    if (req.method === "POST" && req.url === "/v1/chat/completions") {
+      await handleChat(req, res, registered, policy, proxy, egress, intentDetector, env, recordId, meta);
+      return;
+    }
+    json(res, 404, { error: { type: "not_found" } });
+  } catch (err) {
+    // H2：单个请求的未预期异常绝不能带垮整个进程——`void handle(...)` 调用点不会
+    // catch 拒绝的 Promise，所以这道兜底必须在这里，兜住的是"没想到的 bug"而不是
+    // 已知业务错误（那些在各自分支里已经用 json() 处理完了）。
+    console.error(
+      "[idoris-router] 未捕获的请求处理异常（已用 500 应答，未回显给调用方）：" +
+        (err instanceof Error ? (err.stack ?? err.message) : String(err)),
+    );
+    if (res.headersSent || res.writableEnded) {
+      res.destroy();
+    } else {
+      json(res, 500, { error: { type: "internal_error", message: "internal server error" } });
+    }
   }
-  if (req.method === "POST" && req.url === "/v1/chat/completions") {
-    await handleChat(req, res, registered, policy, proxy, egress, intentDetector, env);
-    return;
-  }
-  json(res, 404, { error: { type: "not_found" } });
 }
 
 async function handleChat(
@@ -201,14 +264,24 @@ async function handleChat(
   egress: EgressCounter,
   intentDetector: IntentDetector,
   env: NodeJS.ProcessEnv,
+  recordId: string,
+  meta: RequestMeta,
 ): Promise<void> {
-  let body: Record<string, unknown>;
+  let parsedBody: unknown;
   try {
-    body = JSON.parse((await readBody(req)) || "{}") as Record<string, unknown>;
+    parsedBody = JSON.parse((await readBody(req)) || "{}");
   } catch {
     json(res, 400, { error: { type: "invalid_json" } });
     return;
   }
+  // H2：请求体必须是一个 JSON 对象——`null`/数组/数字都是合法 JSON，但不是我们能
+  // 当 Record<string, unknown> 用的形状。不挡在这里的话，下面第一次 `body.xxx`
+  // 就会在 null 上抛 TypeError，顺着 Promise 链一路冒到进程外层。
+  if (typeof parsedBody !== "object" || parsedBody === null || Array.isArray(parsedBody)) {
+    json(res, 400, { error: { type: "invalid_body", message: "request body must be a JSON object" } });
+    return;
+  }
+  const body = parsedBody as Record<string, unknown>;
   if (policy === undefined) {
     json(res, 503, { error: { type: "policy_unconfigured" } });
     return;
@@ -269,7 +342,10 @@ async function handleChat(
   // T4.1：走到这里说明确实由 target 这个后端服务；此后所有响应（成功/该后端自身
   // 报错）都带实际服务方的 Served-Locality。在此之前的错误（无候选、策略未配置、
   // 订阅来源复核拒绝……）都还没有落到具体后端，不带这个头。
-  res.setHeader("X-iDoris-Served-Locality", servedLocalityOf(target.card));
+  const servedLocality = servedLocalityOf(target.card);
+  res.setHeader("X-iDoris-Served-Locality", servedLocality);
+  meta.providerId = target.card.provider.id;
+  meta.servedLocality = servedLocality;
 
   const controller = new AbortController();
   req.on("close", () => controller.abort());
@@ -300,8 +376,16 @@ async function handleChat(
       ...(typeof requestId === "string" ? { requestId } : {}),
       ...(tenantId !== undefined ? { tenantId } : {}),
       signal: controller.signal,
+      recordId,
     },
   );
+
+  // L1：命中幂等缓存时如实回报——调用方能看出这不是一次新的推理，而是同一个
+  // X-iDoris-Request-Id 在缓存窗口内的重放，Origin-Record-Id 指回第一次落地的记录。
+  if (result.cached) {
+    res.setHeader("X-iDoris-Cached", "true");
+    if (result.originRecordId !== undefined) res.setHeader("X-iDoris-Origin-Record-Id", result.originRecordId);
+  }
 
   if (result.stream !== null) {
     res.writeHead(result.status, { "content-type": "text/event-stream" });

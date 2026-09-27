@@ -10,7 +10,12 @@ import { fileURLToPath } from "node:url";
  * 且不需要处理 ESM JSON import attributes 在不同 Node/TS 组合下的兼容性。
  */
 export function readRouterVersion(): string {
-  const pkgPath = join(dirname(fileURLToPath(import.meta.url)), "..", "package.json");
-  const pkg = JSON.parse(readFileSync(pkgPath, "utf8")) as { version?: unknown };
-  return typeof pkg.version === "string" ? pkg.version : "0.0.0";
+  try {
+    const pkgPath = join(dirname(fileURLToPath(import.meta.url)), "..", "package.json");
+    const pkg = JSON.parse(readFileSync(pkgPath, "utf8")) as { version?: unknown };
+    return typeof pkg.version === "string" ? pkg.version : "unknown";
+  } catch {
+    // L3：/health 是运行期身份探针，读版本号失败（打包异常、权限问题……）不该让它整个挂掉。
+    return "unknown";
+  }
 }

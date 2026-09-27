@@ -35,6 +35,8 @@ export interface ForwardResult {
   stream: ReadableStreamLike | null;
   retries: number;
   cached: boolean;
+  /** 命中幂等缓存时，写入该缓存条目那次请求的 Record-Id（L1：X-iDoris-Origin-Record-Id）。 */
+  originRecordId?: string;
 }
 
 const defaultSleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
@@ -69,7 +71,7 @@ export class ChatProxy {
   private readonly windowMs: number;
   private readonly retryDelays: number[];
   private readonly maxCacheEntries: number;
-  private readonly cache = new Map<string, { at: number; status: number; text: string }>();
+  private readonly cache = new Map<string, { at: number; status: number; text: string; recordId?: string }>();
 
   constructor(deps: ProxyDeps = {}) {
     this.fetchImpl = deps.fetchImpl ?? ((globalThis as unknown as { fetch: FetchLike }).fetch);
@@ -90,7 +92,7 @@ export class ChatProxy {
    * ⚠️ 只在读命中时删过期条目是**不够的**：从不被再读的键永远不会被访问到。
    * 所以回收必须挂在**写**路径上。
    */
-  private remember(key: string, value: { at: number; status: number; text: string }): void {
+  private remember(key: string, value: { at: number; status: number; text: string; recordId?: string }): void {
     // 先 delete 再 set：Map 对已存在的键做 set **不会**把它移到末尾，
     // 那会打破下面 prune() 依赖的「插入序 == 过期序」不变式。
     this.cache.delete(key);
@@ -123,7 +125,7 @@ export class ChatProxy {
     endpoint: string,
     apiKey: string | undefined,
     body: Record<string, unknown>,
-    opts: { stream: boolean; requestId?: string; tenantId?: string; signal?: AbortSignal },
+    opts: { stream: boolean; requestId?: string; tenantId?: string; signal?: AbortSignal; recordId?: string },
   ): Promise<ForwardResult> {
     const url = endpoint.replace(/\/$/, "") + "/v1/chat/completions";
     const headers: Record<string, string> = { "content-type": "application/json" };
@@ -135,7 +137,14 @@ export class ChatProxy {
     if (!opts.stream && opts.requestId !== undefined) {
       const hit = this.cache.get(cacheKey(tenantScope, url, opts.requestId));
       if (hit && this.now() - hit.at < this.windowMs) {
-        return { status: hit.status, text: hit.text, stream: null, retries: 0, cached: true };
+        return {
+          status: hit.status,
+          text: hit.text,
+          stream: null,
+          retries: 0,
+          cached: true,
+          ...(hit.recordId !== undefined ? { originRecordId: hit.recordId } : {}),
+        };
       }
     }
 
@@ -163,7 +172,12 @@ export class ChatProxy {
         }
         const text = await res.text();
         if (opts.requestId !== undefined)
-          this.remember(cacheKey(tenantScope, url, opts.requestId), { at: this.now(), status: res.status, text });
+          this.remember(cacheKey(tenantScope, url, opts.requestId), {
+            at: this.now(),
+            status: res.status,
+            text,
+            ...(opts.recordId !== undefined ? { recordId: opts.recordId } : {}),
+          });
         return { status: res.status, text, stream: null, retries: attempt, cached: false };
       } catch (err) {
         if (opts.signal?.aborted === true) {

@@ -1,8 +1,10 @@
+import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
-import { MockBackend } from "@idoris/adapters";
-import type { ComponentCard } from "@idoris/contracts";
+import { MockBackend, type ModelBackend } from "@idoris/adapters";
+import { validateComponentCard, type ComponentCard } from "@idoris/contracts";
+import { parse } from "yaml";
 import { ChatProxy, type FetchResponseLike } from "../src/proxy.js";
 import type { Registered } from "../src/registry.js";
 import { startRouter, type Router } from "../src/server.js";
@@ -36,6 +38,19 @@ function nonStreamFakeProxy(): ChatProxy {
       text: async () => JSON.stringify({ choices: [{ message: { content: "hello" } }] }),
       body: null,
     }),
+  });
+}
+
+/** M3：上游真的响应了但状态码非 2xx——依然是"某后端服务了这次请求"，得带 Served-Locality。 */
+function failingUpstreamProxy(): ChatProxy {
+  return new ChatProxy({
+    fetchImpl: async () => ({
+      ok: false,
+      status: 500,
+      text: async () => JSON.stringify({ error: { type: "upstream_error" } }),
+      body: null,
+    }),
+    retryDelaysMs: [], // 测试不等重试退避
   });
 }
 
@@ -82,6 +97,32 @@ function makeRegisteredWithLocality(locality: unknown): Registered[] {
   } as unknown as ComponentCard;
   return [{ card, backend: new MockBackend({ memoryMaxGb: 16, models: [{ id: "mock-small", memoryGb: 2 }] }) }];
 }
+
+// C1：加载真实的 config/components/subscription.yaml——它的 provider.locality
+// 写的是 loopback，但那个字段在这张卡上表达的是"调用来源必须是 loopback"
+// （见文件里的注释），不是"推理发生在本机"；真实推理由 form: spawn_cli 背后的
+// 云端 CLI 完成。servedLocalityOf 必须认出这一点，不能被卡面上的 locality 字段骗到。
+const subscriptionCardFromRealConfig = validateComponentCard(
+  parse(readFileSync(join(repoRoot, "config", "components", "subscription.yaml"), "utf8")),
+);
+
+function subscriptionRegistered(chat: ModelBackend["chat"]): Registered[] {
+  const backend: ModelBackend = {
+    list: async () => [],
+    load: async () => undefined,
+    unload: async () => undefined,
+    admission: async () => "coexist",
+    status: async () => ({ pressure: "ok", usedGb: 0, modelMemoryMaxGb: 0, loaded: [] }),
+    chat,
+  };
+  return [{ card: subscriptionCardFromRealConfig, backend }];
+}
+
+// 订阅卡 tier=remote，要走 routing-policy.yaml 的 { complexity: complex } 规则
+// （tiers: [local, remote]）才会进候选集；privacy: any 是因为 local_only 请求
+// 允许的 tier 集合根本不含 remote（policy.ts）。
+const subscriptionChatHeaders = { "content-type": "application/json", "x-idoris-privacy": "any", "x-idoris-complexity": "complex" };
+const subscriptionChatBody = JSON.stringify({ model: "subscription", messages: [{ role: "user", content: "hi" }] });
 
 /**
  * T4.1：`X-iDoris-Served-Locality`（接口规范 §3.5/§3.12）——只在真的有后端服务
@@ -134,5 +175,47 @@ describe("X-iDoris-Served-Locality", () => {
     const res = await fetch(url(running, "/v1/chat/completions"), { method: "POST", headers: chatHeaders, body: chatBody });
     expect(res.status).toBe(503);
     expect(res.headers.get("x-idoris-served-locality")).toBeNull();
+  });
+
+  it("M3：上游返回非 2xx 时状态码透传，但依然带 Served-Locality（已经落到具体后端了）", async () => {
+    running = await startRouter({ componentsDir: fixtures, routingPolicyPath, proxy: failingUpstreamProxy() });
+    const res = await fetch(url(running, "/v1/chat/completions"), { method: "POST", headers: chatHeaders, body: chatBody });
+    expect(res.status).toBe(500);
+    expect(res.headers.get("x-idoris-served-locality")).toBe("loopback");
+  });
+
+  it("C1 回归：真实 subscription.yaml（provider.locality: loopback）推理成功也回报 remote，不是 loopback", async () => {
+    running = await startRouter({
+      componentsDir: fixtures,
+      routingPolicyPath,
+      registered: subscriptionRegistered(async (req) => ({ model: req.model, content: "ok" })),
+      env: { IDORIS_DEPLOY_MODE: "personal" },
+    });
+    const res = await fetch(url(running, "/v1/chat/completions"), {
+      method: "POST",
+      headers: subscriptionChatHeaders,
+      body: subscriptionChatBody,
+    });
+    expect(res.status).toBe(200);
+    expect(res.headers.get("x-idoris-served-locality")).toBe("remote");
+  });
+
+  it("M3：订阅中转失败（502）也带 Record-Id，且 Served-Locality 仍是 remote", async () => {
+    running = await startRouter({
+      componentsDir: fixtures,
+      routingPolicyPath,
+      registered: subscriptionRegistered(async () => {
+        throw new Error("cli crashed");
+      }),
+      env: { IDORIS_DEPLOY_MODE: "personal" },
+    });
+    const res = await fetch(url(running, "/v1/chat/completions"), {
+      method: "POST",
+      headers: subscriptionChatHeaders,
+      body: subscriptionChatBody,
+    });
+    expect(res.status).toBe(502);
+    expect(res.headers.get("x-idoris-served-locality")).toBe("remote");
+    expect(res.headers.get("x-idoris-record-id")).toBeTruthy();
   });
 });
