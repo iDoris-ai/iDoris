@@ -5,10 +5,12 @@
 //! **one tokio task holds all state**; every other task talks to it only
 //! through [`SupervisorHandle`]'s mpsc-backed commands.
 //!
-//! This PR adds `unload` alongside the `load` from the previous PR, both
-//! sharing the same global load/evict mutex (§4). Eviction execution and a
-//! real wait queue are follow-ups — a second id fails fast with
-//! `BackendError::Busy` meanwhile, and capacity still isn't checked.
+//! This PR wires [`crate::eviction::plan_eviction`] into `load`: capacity
+//! is now actually checked, and if a plan says to evict, the victims are
+//! unloaded before the new model is loaded — all still behind the one
+//! global load/evict mutex, so nothing else can touch a victim mid-flight.
+//! A real wait queue is still a follow-up — a second id fails fast with
+//! `BackendError::Busy` meanwhile.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -19,7 +21,10 @@ use tokio_util::sync::CancellationToken;
 
 use crate::adapter::RuntimeAdapter;
 use crate::error::BackendError;
-use crate::eviction::{ModelState, occupies_budget};
+use crate::eviction::{
+    EvictionPlan, ModelEntry, ModelReq, ModelState, PlanEvictionError, Snapshot, occupies_budget,
+    plan_eviction,
+};
 use crate::types::{BackendStatus, ChatRequest, ChatResponse, ModelInfo, Pressure};
 
 type LoadReply = oneshot::Sender<Result<(), BackendError>>;
@@ -87,8 +92,15 @@ enum Command {
 /// What a background op reports to the single-writer loop; only the loop
 /// applies this to `models`.
 enum OpOutcome {
-    Load { result: Result<(), BackendError> },
-    Unload { result: Result<(), BackendError> },
+    Load {
+        result: Result<(), BackendError>,
+        /// Every victim `plan_eviction` chose, and how its `unload` went —
+        /// applied to the ledger by `OpDone` alongside `result`.
+        victim_results: Vec<VictimResult>,
+    },
+    Unload {
+        result: Result<(), BackendError>,
+    },
 }
 
 enum ActorMsg {
@@ -256,14 +268,41 @@ fn set_state_or_panic(models: &mut HashMap<String, ModelSlot>, id: &str, state: 
     }
 }
 
-/// The pure-IO side of a load: calls the adapter and reports the outcome.
-/// Capacity isn't checked yet — that lands with eviction in a follow-up.
+/// A victim's `unload` outcome, reported alongside the main load result so
+/// the single-writer loop can apply both atomically in `OpDone`.
+type VictimResult = (String, Result<(), BackendError>);
+
+/// The pure-IO side of a load: attempts every victim in `evict` (even
+/// after an earlier one fails — see the loop below), then, only if all
+/// succeeded, calls the adapter and reports the outcome. Any eviction
+/// failure means the capacity assumption behind this load no longer
+/// holds, so the load itself must not proceed.
 async fn run_load_flow(
     adapter: Arc<dyn RuntimeAdapter>,
     config: SupervisorConfig,
     id: String,
     policy: LoadPolicy,
+    evict: Vec<String>,
 ) -> OpOutcome {
+    // Every chosen victim gets an actual unload attempt, even after an
+    // earlier one fails: `OpDone` only resolves ids present in
+    // `victim_results`, so stopping early would leave later victims stuck
+    // in `Stopping` forever (occupying budget with no in-flight op to ever
+    // resolve them) instead of landing on `Stopped`/`Error` like the rest.
+    let mut victim_results: Vec<VictimResult> = Vec::with_capacity(evict.len());
+    let mut eviction_failed = false;
+    for victim in evict {
+        let result = adapter.unload(&victim).await;
+        eviction_failed |= result.is_err();
+        victim_results.push((victim, result));
+    }
+    if eviction_failed {
+        return OpOutcome::Load {
+            result: Err(BackendError::eviction_failed(&id)),
+            victim_results,
+        };
+    }
+
     // OOM circuit breaker: exactly one self-healing retry, never more.
     let mut attempt = adapter.load(&id, Some(&policy)).await;
     if let Err(err) = &attempt
@@ -272,18 +311,32 @@ async fn run_load_flow(
         attempt = adapter.load(&id, Some(&policy)).await;
     }
     if let Err(err) = attempt {
-        return OpOutcome::Load { result: Err(err) };
+        return OpOutcome::Load {
+            result: Err(err),
+            victim_results,
+        };
     }
 
     for _ in 0..config.probe_max_attempts {
         match adapter.probe_ready(&id).await {
-            Ok(true) => return OpOutcome::Load { result: Ok(()) },
+            Ok(true) => {
+                return OpOutcome::Load {
+                    result: Ok(()),
+                    victim_results,
+                };
+            }
             Ok(false) => tokio::time::sleep(config.probe_interval).await,
-            Err(err) => return OpOutcome::Load { result: Err(err) },
+            Err(err) => {
+                return OpOutcome::Load {
+                    result: Err(err),
+                    victim_results,
+                };
+            }
         }
     }
     OpOutcome::Load {
         result: Err(BackendError::probe_timed_out(id)),
+        victim_results,
     }
 }
 
@@ -294,9 +347,51 @@ struct Env<'a> {
     self_tx: &'a mpsc::Sender<ActorMsg>,
 }
 
+/// `models` as [`crate::eviction::plan_eviction`] sees it — every entry
+/// *except* `exclude` (the id being requested; see [`Snapshot`]'s doc
+/// comment on why it must not describe itself).
+fn build_snapshot(models: &HashMap<String, ModelSlot>, budget_gb: f64, exclude: &str) -> Snapshot {
+    let entries = models
+        .iter()
+        .filter(|(id, _)| id.as_str() != exclude)
+        .map(|(id, slot)| ModelEntry {
+            id: id.clone(),
+            memory_gb: slot.memory_gb,
+            state: slot.state,
+            pinned: matches!(
+                slot.policy.keepalive,
+                idoris_contracts::load_policy::Keepalive::Pinned { pinned: true }
+            ),
+            last_used_seq: slot.last_used_seq,
+        })
+        .collect();
+    Snapshot {
+        budget_gb,
+        models: entries,
+    }
+}
+
+/// `InsufficientCapacity` is a real, expected admission outcome
+/// (`eviction_impossible`); the other two variants mean the Supervisor
+/// handed `plan_eviction` a contract-violating input of its own making
+/// (`budget_gb` is validated at `spawn`, and `build_snapshot` always
+/// excludes `id`) — an invariant violation, not a normal rejection.
+fn map_plan_error(err: PlanEvictionError, id: &str) -> BackendError {
+    match err {
+        PlanEvictionError::InsufficientCapacity { .. } => BackendError::eviction_impossible(id),
+        PlanEvictionError::InvalidCapacity { field, value } => {
+            BackendError::internal(format!("invalid capacity for {field}: {value}"))
+        }
+        PlanEvictionError::SnapshotContainsRequestedModel { .. } => {
+            panic!("Supervisor invariant violated: snapshot for {id:?} contained itself")
+        }
+    }
+}
+
 fn start_load(
     id: String,
     policy: LoadPolicy,
+    evict: Vec<String>,
     models: &mut HashMap<String, ModelSlot>,
     env: &Env<'_>,
 ) {
@@ -306,7 +401,7 @@ fn start_load(
     let self_tx = env.self_tx.clone();
     let id_for_task = id.clone();
     tokio::spawn(async move {
-        let outcome = run_load_flow(adapter, config, id_for_task.clone(), policy).await;
+        let outcome = run_load_flow(adapter, config, id_for_task.clone(), policy, evict).await;
         let _ = self_tx
             .send(ActorMsg::OpDone {
                 id: id_for_task,
@@ -317,8 +412,9 @@ fn start_load(
 }
 
 /// Handles `Command::Load`, the single decision point every load path
-/// funnels through (§4); no queueing yet — a different id than the
-/// active op fails fast with `BackendError::Busy`.
+/// funnels through (§4), now backed by [`plan_eviction`] for a real
+/// capacity check; no queueing yet — a different id than the active op
+/// fails fast with `BackendError::Busy`.
 fn handle_load(
     id: String,
     memory_gb: f64,
@@ -357,6 +453,25 @@ fn handle_load(
         return;
     }
 
+    let snapshot = build_snapshot(models, env.config.budget_gb, &id);
+    let evict = match plan_eviction(
+        &snapshot,
+        ModelReq {
+            id: id.clone(),
+            memory_gb,
+        },
+    ) {
+        Ok(EvictionPlan::NotNeeded) => Vec::new(),
+        Ok(EvictionPlan::Evict(victims)) => victims,
+        Err(err) => {
+            let _ = reply.send(Err(map_plan_error(err, &id)));
+            return;
+        }
+    };
+    for victim in &evict {
+        set_state_or_panic(models, victim, ModelState::Stopping);
+    }
+
     let last_used_seq = models.get(&id).map_or(0, |s| s.last_used_seq);
     models.insert(
         id.clone(),
@@ -374,7 +489,7 @@ fn handle_load(
             waiters: vec![reply],
         },
     });
-    start_load(id, policy, models, env);
+    start_load(id, policy, evict, models, env);
 }
 
 /// The pure-IO side of an unload. Post-unload memory-release confirmation
@@ -548,10 +663,21 @@ async fn run_actor(
             }
 
             ActorMsg::OpDone { id, outcome } => {
-                let (result, done_state) = match outcome {
-                    OpOutcome::Load { result } => (result, ModelState::Ready),
-                    OpOutcome::Unload { result } => (result, ModelState::Stopped),
+                let (result, done_state, victim_results) = match outcome {
+                    OpOutcome::Load {
+                        result,
+                        victim_results,
+                    } => (result, ModelState::Ready, victim_results),
+                    OpOutcome::Unload { result } => (result, ModelState::Stopped, Vec::new()),
                 };
+                for (victim_id, victim_result) in victim_results {
+                    let victim_state = if victim_result.is_ok() {
+                        ModelState::Stopped
+                    } else {
+                        ModelState::Error
+                    };
+                    set_state_or_panic(&mut models, &victim_id, victim_state);
+                }
                 match &result {
                     Ok(()) => {
                         next_seq += 1;

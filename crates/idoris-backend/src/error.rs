@@ -54,18 +54,25 @@ pub enum BackendError {
     #[error("model unavailable: {model_id}")]
     ModelUnavailable { model_id: String },
 
-    /// The eviction-planning step (`plan_eviction`, landing in a follow-up
-    /// PR) determined that even evicting every evictable (non-pinned,
-    /// `Ready`) model still would not free enough budget for `model_id`.
-    /// (Plain text, not an intra-doc link, until that module exists in this
-    /// crate — see the module doc history.) This is the *only* intended use
-    /// of this variant — construct it exclusively via
-    /// [`BackendError::eviction_impossible`], never as a general-purpose
-    /// "admission denied for some other reason" (there is no such reason
-    /// yet; if one appears, it gets its own variant instead of overloading
-    /// this one).
+    /// [`crate::eviction::plan_eviction`] determined that even evicting
+    /// every evictable (non-pinned, `Ready`) model still would not free
+    /// enough budget for `model_id` — a *planning*-time rejection: no
+    /// viable plan exists at all. Construct exclusively via
+    /// [`BackendError::eviction_impossible`]. Distinct from
+    /// [`BackendError::EvictionFailed`], the *execution*-time counterpart
+    /// (a plan existed, but carrying it out failed).
     #[error("cannot admit {model_id}: no viable eviction plan")]
     EvictionImpossible { model_id: String },
+
+    /// A viable plan existed and was chosen, but a chosen victim's
+    /// `unload` itself failed while making room for `model_id`. Kept
+    /// distinct from [`BackendError::EvictionImpossible`] on purpose: this
+    /// is an adapter/IO-layer failure a caller should treat as transient
+    /// and worth retrying, not "give up, there is no capacity" (retrying
+    /// an `EvictionImpossible` is pointless until the situation changes;
+    /// retrying this might just work).
+    #[error("eviction failed while admitting {model_id}: a chosen victim's unload failed")]
+    EvictionFailed { model_id: String },
 
     /// The adapter reported an out-of-memory condition while loading
     /// `model_id`. The Supervisor self-heals with exactly one retry
@@ -143,6 +150,7 @@ impl BackendError {
             BackendError::ModelLoading { .. } => "model_loading",
             BackendError::ModelUnavailable { .. } => "model_unavailable",
             BackendError::EvictionImpossible { .. } => "eviction_impossible",
+            BackendError::EvictionFailed { .. } => "eviction_failed",
             BackendError::Oom { .. } => "oom",
             BackendError::ProbeTimedOut { .. } => "probe_timed_out",
             BackendError::Upstream { .. } => "upstream_error",
@@ -189,6 +197,12 @@ impl BackendError {
     /// denied" helper.
     pub fn eviction_impossible(model_id: impl Into<String>) -> Self {
         Self::EvictionImpossible {
+            model_id: model_id.into(),
+        }
+    }
+
+    pub fn eviction_failed(model_id: impl Into<String>) -> Self {
+        Self::EvictionFailed {
             model_id: model_id.into(),
         }
     }
