@@ -90,7 +90,7 @@ enum Command {
         reply: oneshot::Sender<Result<Vec<ModelInfo>, BackendError>>,
     },
     Status {
-        reply: oneshot::Sender<BackendStatus>,
+        reply: oneshot::Sender<Result<BackendStatus, BackendError>>,
     },
     Chat {
         req: ChatRequest,
@@ -188,7 +188,8 @@ impl SupervisorHandle {
     pub async fn status(&self) -> Result<BackendStatus, BackendError> {
         let (reply, rx) = oneshot::channel();
         self.send(ActorMsg::Cmd(Command::Status { reply })).await?;
-        rx.await.map_err(|_| BackendError::supervisor_unavailable())
+        rx.await
+            .map_err(|_| BackendError::supervisor_unavailable())?
     }
 
     pub async fn chat(
@@ -321,13 +322,53 @@ fn not_ready_error(model_id: &str, state: ModelState) -> BackendError {
     }
 }
 
-/// Ledger entries are only transitioned, never removed, so every id here
-/// is guaranteed present; a missing entry means "不静默" must fail loudly.
+/// Ledger entries are only transitioned, never removed, so every id here is
+/// guaranteed present. Used only from `handle_load`/`handle_unload`, where
+/// `id` was read from `models` (directly, or via `plan_eviction`'s output —
+/// itself built from `models`) *synchronously*, with no `.await` in
+/// between — a missing entry here would mean this crate's own logic is
+/// self-contradictory in a single, uninterrupted step, not a real runtime
+/// race. Panicking (rather than the fail-closed `set_state_or_poison`
+/// below, used from `OpDone`/`ChatDone` where a real `.await` gap exists
+/// for something else to have gone wrong in) matches Rust's own convention
+/// for asserting an invariant provably true by construction.
 fn set_state_or_panic(models: &mut HashMap<String, ModelSlot>, id: &str, state: ModelState) {
     match models.get_mut(id) {
         Some(slot) => slot.state = state,
         None => panic!("Supervisor invariant violated: ledger has no entry for {id:?}"),
     }
+}
+
+/// The `OpDone`/`ChatDone` counterpart of `set_state_or_panic`: after a
+/// real `.await` gap (waiting on a background adapter call), a missing
+/// entry is a genuine — if still supposed-to-be-impossible — runtime
+/// invariant violation, not a same-step logic contradiction. Returns `Err`
+/// instead of panicking (M3, Opus Tier-2 review): panicking here would
+/// kill the *entire* actor task over one corrupted entry, taking down
+/// every other in-flight and future caller with it, not just the one
+/// operation that surfaced the corruption.
+fn set_state_or_poison(
+    models: &mut HashMap<String, ModelSlot>,
+    id: &str,
+    state: ModelState,
+) -> Result<(), String> {
+    match models.get_mut(id) {
+        Some(slot) => {
+            slot.state = state;
+            Ok(())
+        }
+        None => Err(format!("ledger has no entry for {id:?}")),
+    }
+}
+
+/// Takes and unwraps the current active op's waiters, regardless of
+/// whether it was a `Load` or `Unload` — `None` means `active_op` was
+/// already empty, which `OpDone`'s caller treats as its own invariant
+/// violation (an `OpDone` must always correspond to a real active op).
+fn take_waiters(active_op: &mut Option<ActiveOp>) -> Option<Vec<LoadReply>> {
+    active_op.take().map(|op| match op.kind {
+        ActiveKind::Load { waiters, .. } | ActiveKind::Unload { waiters, .. } => waiters,
+    })
 }
 
 /// A victim's `unload` outcome, reported alongside the main load result so
@@ -846,6 +887,15 @@ async fn run_actor(
     let mut models: HashMap<String, ModelSlot> = HashMap::new();
     let mut active_op: Option<ActiveOp> = None;
     let mut next_seq: u64 = 0;
+    // Once `Some`, the actor refuses all further ledger-touching work
+    // rather than risk operating on state whose integrity is no longer
+    // trusted (M3, Opus Tier-2 review) — every `Command` gets an immediate
+    // `invariant_violation` reply instead of being processed, and any
+    // `OpDone` still in flight has its waiters notified the same way. This
+    // replaces `panic!`ing on a detected invariant violation, which killed
+    // the *entire* actor task (and, with it, every other in-flight and
+    // future caller) over a single corrupted entry.
+    let mut poisoned: Option<String> = None;
     let env = Env {
         adapter: &adapter,
         config: &config,
@@ -854,6 +904,27 @@ async fn run_actor(
 
     while let Some(msg) = rx.recv().await {
         match msg {
+            ActorMsg::Cmd(cmd) if poisoned.is_some() => {
+                let msg = poisoned.clone().unwrap_or_default();
+                match cmd {
+                    Command::List { reply } => {
+                        let _ = reply.send(Err(BackendError::invariant_violation(msg)));
+                    }
+                    Command::Status { reply } => {
+                        let _ = reply.send(Err(BackendError::invariant_violation(msg)));
+                    }
+                    Command::Chat { reply, .. } => {
+                        let _ = reply.send(Err(BackendError::invariant_violation(msg)));
+                    }
+                    Command::Load { reply, .. } => {
+                        let _ = reply.send(Err(BackendError::invariant_violation(msg)));
+                    }
+                    Command::Unload { reply, .. } => {
+                        let _ = reply.send(Err(BackendError::invariant_violation(msg)));
+                    }
+                }
+            }
+
             ActorMsg::Cmd(Command::List { reply }) => {
                 let Ok(permit) = call_slots.clone().try_acquire_owned() else {
                     let _ = reply.send(Err(BackendError::busy(
@@ -889,12 +960,12 @@ async fn run_actor(
                     .filter(|(_, slot)| slot.state == ModelState::Ready)
                     .map(|(id, _)| id.clone())
                     .collect();
-                let _ = reply.send(BackendStatus {
+                let _ = reply.send(Ok(BackendStatus {
                     pressure,
                     used_gb,
                     model_memory_max_gb: config.budget_gb,
                     loaded,
-                });
+                }));
             }
 
             ActorMsg::Cmd(Command::Chat { req, cancel, reply }) => match models.get(&req.model) {
@@ -955,6 +1026,17 @@ async fn run_actor(
                 handle_unload(id, reply, &mut models, &mut active_op, &env);
             }
 
+            ActorMsg::OpDone { id, outcome } if poisoned.is_some() => {
+                let msg = poisoned.clone().unwrap_or_default();
+                if let Some(waiters) = take_waiters(&mut active_op) {
+                    for waiter in waiters {
+                        let _ = waiter.send(Err(BackendError::invariant_violation(msg.clone())));
+                    }
+                }
+                let _ = id; // already covered by `msg`; nothing id-specific left to do
+                let _ = outcome;
+            }
+
             ActorMsg::OpDone { id, outcome } => {
                 let (result, done_state, failure_state, victim_results) = match outcome {
                     OpOutcome::Load {
@@ -966,63 +1048,89 @@ async fn run_actor(
                         (result, ModelState::Stopped, ModelState::Error, Vec::new())
                     }
                 };
+
+                let mut violation: Option<String> = None;
                 for (victim_id, victim_result) in victim_results {
                     let victim_state = if victim_result.is_ok() {
                         ModelState::Stopped
                     } else {
                         ModelState::Error
                     };
-                    set_state_or_panic(&mut models, &victim_id, victim_state);
+                    if violation.is_none()
+                        && let Err(e) = set_state_or_poison(&mut models, &victim_id, victim_state)
+                    {
+                        violation = Some(e);
+                    }
                 }
-                match &result {
-                    Ok(()) => {
-                        next_seq += 1;
-                        if let Some(slot) = models.get_mut(&id) {
-                            slot.state = done_state;
-                            if done_state == ModelState::Ready {
-                                slot.last_used_seq = next_seq;
+                if violation.is_none() {
+                    match &result {
+                        Ok(()) => {
+                            next_seq += 1;
+                            match models.get_mut(&id) {
+                                Some(slot) => {
+                                    slot.state = done_state;
+                                    if done_state == ModelState::Ready {
+                                        slot.last_used_seq = next_seq;
+                                    }
+                                }
+                                None => violation = Some(format!("ledger lost {id:?} mid-op")),
                             }
-                        } else {
-                            panic!("Supervisor invariant violated: ledger lost {id:?} mid-op");
+                        }
+                        Err(_) => {
+                            if let Err(e) = set_state_or_poison(&mut models, &id, failure_state) {
+                                violation = Some(e);
+                            }
                         }
                     }
-                    Err(_) => set_state_or_panic(&mut models, &id, failure_state),
                 }
-                let waiters = match active_op.take() {
-                    Some(ActiveOp {
-                        kind: ActiveKind::Load { waiters, .. } | ActiveKind::Unload { waiters, .. },
-                        ..
-                    }) => waiters,
-                    None => panic!("Supervisor invariant violated: OpDone with no active op"),
-                };
-                for waiter in waiters {
-                    let _ = waiter.send(result.clone());
+
+                let waiters = take_waiters(&mut active_op);
+                if waiters.is_none() && violation.is_none() {
+                    violation = Some(format!("OpDone for {id:?} with no active op"));
+                }
+                match (violation, waiters) {
+                    (Some(msg), Some(waiters)) => {
+                        poisoned = Some(msg.clone());
+                        for waiter in waiters {
+                            let _ =
+                                waiter.send(Err(BackendError::invariant_violation(msg.clone())));
+                        }
+                    }
+                    (Some(msg), None) => poisoned = Some(msg),
+                    (None, Some(waiters)) => {
+                        for waiter in waiters {
+                            let _ = waiter.send(result.clone());
+                        }
+                    }
+                    (None, None) => unreachable!("violation is set whenever waiters is None"),
                 }
             }
 
+            ActorMsg::ChatDone { model } if poisoned.is_some() => {
+                // No reply channel is waiting on a `ChatDone` — nothing
+                // more to do than already-being-poisoned covers.
+                let _ = model;
+            }
+
             ActorMsg::ChatDone { model } => {
-                // Ledger entries are only ever transitioned, never removed
-                // (the same invariant `set_state_or_panic` enforces for
-                // `state`), so a `ChatDone` for an id `chat` was actually
-                // dispatched to must find an entry — a missing one means
-                // that discipline was violated somewhere.
-                let inflight = match models.get_mut(&model) {
+                // Ledger entries are only ever transitioned, never removed,
+                // so a `ChatDone` for an id `chat` was actually dispatched
+                // to must find an entry.
+                match models.get_mut(&model) {
                     Some(slot) => {
                         slot.inflight = slot.inflight.saturating_sub(1);
-                        slot.inflight
+                        let inflight = slot.inflight;
+                        if inflight == 0
+                            && let Some(active) = active_op.as_mut()
+                            && active.id == model
+                            && let ActiveKind::Unload { started, .. } = &mut active.kind
+                            && !*started
+                        {
+                            *started = true;
+                            start_unload(model, &env);
+                        }
                     }
-                    None => {
-                        panic!("Supervisor invariant violated: ledger has no entry for {model:?}")
-                    }
-                };
-                if inflight == 0
-                    && let Some(active) = active_op.as_mut()
-                    && active.id == model
-                    && let ActiveKind::Unload { started, .. } = &mut active.kind
-                    && !*started
-                {
-                    *started = true;
-                    start_unload(model, &env);
+                    None => poisoned = Some(format!("ledger has no entry for {model:?}")),
                 }
             }
         }
@@ -1947,5 +2055,46 @@ mod tests {
             .await
             .expect("the actor task must exit shortly after the last handle is dropped")
             .expect("the actor task must not panic on exit");
+    }
+
+    /// M3: a detected invariant violation must poison the actor and make it
+    /// fail closed for every future call, not `panic!` and take the whole
+    /// actor task down with it. Feeds a fabricated `OpDone` for an id the
+    /// ledger has never heard of directly into the actor's internal
+    /// channel — real code can never produce this (see
+    /// `set_state_or_poison`'s doc comment), but it is exactly the class of
+    /// corruption M3 is about.
+    #[tokio::test]
+    async fn an_invariant_violation_poisons_the_actor_and_future_calls_fail_closed() {
+        let adapter: Arc<dyn RuntimeAdapter> = Arc::new(MockAdapter::new(catalog()));
+        let (tx, _join) = spawn_actor(adapter, SupervisorConfig::default());
+        let handle = SupervisorHandle { tx: tx.clone() };
+
+        // No `sleep` needed: `tx` is a single-consumer mpsc channel, so this
+        // message is guaranteed processed strictly before the `load` call
+        // below, whose own `send` only starts after this `.await` completes.
+        tx.send(ActorMsg::OpDone {
+            id: "ghost".to_string(),
+            outcome: OpOutcome::Load {
+                result: Ok(()),
+                victim_results: Vec::new(),
+                failure_state: ModelState::Error,
+            },
+        })
+        .await
+        .expect("the internal channel should accept the message");
+
+        let err = handle
+            .load("a", 4.0, on_demand_policy())
+            .await
+            .expect_err("a poisoned actor must fail closed, not silently keep operating");
+        assert_eq!(err.reason_code(), "state_invariant_violated");
+        // Negative contrast: `list`/`status` must fail closed too, not just
+        // `load` — poisoning is actor-wide, not per-command-type.
+        let status_err = handle
+            .status()
+            .await
+            .expect_err("status must also fail closed once poisoned");
+        assert_eq!(status_err.reason_code(), "state_invariant_violated");
     }
 }
