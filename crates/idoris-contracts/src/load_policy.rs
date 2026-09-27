@@ -15,11 +15,14 @@ pub enum LoadMode {
     EvictToLoad,
 }
 
-/// Note: this is a *separate* Rust type from `idoris_backend::Admission`,
-/// deliberately — the TS side has the same duplication: `LoadPolicy.admission`
-/// (`@idoris/contracts`) and `ModelBackend`'s `Admission` (`backend.ts`) are
-/// two independent string-union declarations that happen to share the same
-/// two values.
+/// Note: `idoris_backend` no longer has a Rust `Admission` type to compare
+/// this against — as of R2-A, the admission decision moved to a
+/// Supervisor-level `plan_eviction` function instead of living on the
+/// engine-agnostic adapter trait. The TS side still has the historical
+/// duplication this comment used to describe: `LoadPolicy.admission`
+/// (`@idoris/contracts`) and `ModelBackend`'s `Admission` (`backend.ts`)
+/// are two independent string-union declarations that happen to share the
+/// same two values — that duplication is a TS-only concern now.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Admission {
