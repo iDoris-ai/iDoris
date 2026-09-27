@@ -495,11 +495,28 @@ impl BudgetLedger {
         // clear `ReservationNotActive` instead of silently succeeding.
         sweep_expired_scope(&tx, scope, &period, now_ms)?;
 
-        if let Some(sub_cfg) = &sub_config {
+        // B-6: the `SpendGate` is a tenant-level setting, but its free-
+        // request bypass applies uniformly to *both* dimensions — an
+        // unconfigured tenant defaults to `PaidOnly` (matching
+        // `SpendGate::PaidOnly`'s own "default" doc comment), so the
+        // sub-scope check also skips a free request unless a tenant has
+        // explicitly opted into `All`.
+        let effective_gate = tenant_cfg
+            .as_ref()
+            .map(|t| t.gate)
+            .unwrap_or(SpendGate::PaidOnly);
+        let skip_zero_cost = effective_gate == SpendGate::PaidOnly && estimated_cost_minor == 0;
+
+        if !skip_zero_cost && let Some(sub_cfg) = &sub_config {
             let sub_spent = spent_for(&tx, scope, &period)?;
             let sub_reserved = active_reserved_for(&tx, scope, &period, now_ms)?;
             let sub_committed = checked_add_i64(sub_spent, sub_reserved);
-            if estimated_cost_minor > checked_sub_i64(sub_cfg.limit_minor, sub_committed) {
+            if exceeds_limit(
+                estimated_cost_minor,
+                sub_cfg.limit_minor,
+                sub_committed,
+                effective_gate,
+            ) {
                 tx.commit()?; // nothing written yet, but keep the sweep above.
                 return Err(BudgetError::exceeded(
                     scope.tenant_id.clone(),
@@ -513,24 +530,24 @@ impl BudgetLedger {
         // H2: the tenant-level dimension, checked in the same transaction as
         // the sub-scope one above, so either insufficient rejects the whole
         // `reserve` atomically with the other.
-        if let Some(tenant_cfg) = &tenant_cfg {
-            let skip_zero_cost =
-                tenant_cfg.gate == SpendGate::PaidOnly && estimated_cost_minor == 0;
-            if !skip_zero_cost {
-                let tenant_spent = tenant_spent_for(&tx, &scope.tenant_id, &tenant_period)?;
-                let tenant_reserved =
-                    tenant_active_reserved_for(&tx, &scope.tenant_id, &tenant_period, now_ms)?;
-                let tenant_committed = checked_add_i64(tenant_spent, tenant_reserved);
-                if estimated_cost_minor > checked_sub_i64(tenant_cfg.limit_minor, tenant_committed)
-                {
-                    tx.commit()?;
-                    return Err(BudgetError::exceeded(
-                        scope.tenant_id.clone(),
-                        tenant_cfg.limit_minor,
-                        tenant_committed,
-                        estimated_cost_minor,
-                    ));
-                }
+        if !skip_zero_cost && let Some(tenant_cfg) = &tenant_cfg {
+            let tenant_spent = tenant_spent_for(&tx, &scope.tenant_id, &tenant_period)?;
+            let tenant_reserved =
+                tenant_active_reserved_for(&tx, &scope.tenant_id, &tenant_period, now_ms)?;
+            let tenant_committed = checked_add_i64(tenant_spent, tenant_reserved);
+            if exceeds_limit(
+                estimated_cost_minor,
+                tenant_cfg.limit_minor,
+                tenant_committed,
+                effective_gate,
+            ) {
+                tx.commit()?;
+                return Err(BudgetError::exceeded(
+                    scope.tenant_id.clone(),
+                    tenant_cfg.limit_minor,
+                    tenant_committed,
+                    estimated_cost_minor,
+                ));
             }
         }
 
@@ -985,6 +1002,29 @@ fn load_config(conn: &Connection, scope: &BudgetScope) -> Result<Option<ScopeCon
     )
     .optional()
     .map_err(BudgetError::from)
+}
+
+/// B-6/B-7: whether `estimated_cost_minor` leaves no room against
+/// `limit_minor - committed`, honoring `gate`. A priced request
+/// (`estimated_cost_minor > 0`) is unaffected by `gate` — plain
+/// `cost > balance`. A *free* request under `SpendGate::All` instead
+/// matches policy's `is_over()` semantics: `committed >= limit` (not just
+/// strictly over) counts as "no room left" too. `SpendGate::PaidOnly`'s
+/// free-request bypass is handled by the caller *before* this is invoked
+/// (see `reserve`'s `skip_zero_cost`), so in practice `gate` here is only
+/// ever `All` on the `estimated_cost_minor == 0` path.
+fn exceeds_limit(
+    estimated_cost_minor: i64,
+    limit_minor: i64,
+    committed: i64,
+    gate: SpendGate,
+) -> bool {
+    let balance = checked_sub_i64(limit_minor, committed);
+    if estimated_cost_minor == 0 && gate == SpendGate::All {
+        balance <= 0
+    } else {
+        estimated_cost_minor > balance
+    }
 }
 
 /// B-2: the `billing_timezone` any *other* `(key, provider, model)`
@@ -1649,6 +1689,63 @@ mod tests {
         ledger.configure(&scope, 100, "UTC").expect("configure");
         assert!(ledger.reserve(&scope, Price::Known(0)).is_ok());
         assert_eq!(ledger.balance(&scope).expect("balance"), 100);
+    }
+
+    /// B-6: `paid_only` (the implicit default with no tenant configured at
+    /// all) bypasses the *sub-scope* check for a free request too, not just
+    /// the tenant-level one — even once the sub-scope's own balance has
+    /// gone negative (via an M1 overage).
+    #[test]
+    fn paid_only_default_bypasses_zero_cost_at_the_sub_scope_even_with_negative_balance() {
+        let path = temp_db_path("b6-sub-scope-paid-only");
+        let ledger = BudgetLedger::open(&path).expect("open");
+        let scope = BudgetScope::new("acme-co", "key-1", "openai", "gpt-5");
+        ledger.configure(&scope, 100, "UTC").expect("configure");
+        let id = ledger.reserve(&scope, Price::Known(100)).expect("reserve");
+        ledger
+            .settle(&scope.tenant_id, &id, 150)
+            .expect("settle overage pushes sub-scope balance negative");
+        assert!(ledger.balance(&scope).expect("balance") < 0);
+        assert!(ledger.reserve(&scope, Price::Known(0)).is_ok());
+    }
+
+    /// B-7: under `SpendGate::All`, a free request is rejected once
+    /// `committed` reaches the limit *exactly* — matching policy's
+    /// `is_over()` (`committed >= limit`), not just `committed > limit`.
+    #[test]
+    fn all_gate_rejects_zero_cost_when_committed_exactly_equals_limit() {
+        let path = temp_db_path("b7-all-gate-exact-limit");
+        let ledger = BudgetLedger::open(&path).expect("open");
+        let scope = BudgetScope::new("acme-co", "key-1", "openai", "gpt-5");
+        ledger.configure(&scope, 1_000, "UTC").expect("configure");
+        ledger
+            .configure_tenant("acme-co", 100, "UTC", SpendGate::All)
+            .expect("configure_tenant");
+        let id = ledger.reserve(&scope, Price::Known(100)).expect("reserve");
+        ledger
+            .settle(&scope.tenant_id, &id, 100)
+            .expect("settle exactly at the tenant limit");
+        assert_eq!(ledger.tenant_balance("acme-co").expect("tenant_balance"), 0);
+        assert!(matches!(
+            ledger.reserve(&scope, Price::Known(0)),
+            Err(BudgetError::Exceeded { .. })
+        ));
+    }
+
+    /// Negative control mirroring B-7: with balance strictly positive
+    /// (committed < limit), a free request under `All` still succeeds.
+    #[test]
+    fn all_gate_allows_zero_cost_when_balance_is_still_positive() {
+        let path = temp_db_path("b7-all-gate-positive-balance");
+        let ledger = BudgetLedger::open(&path).expect("open");
+        let scope = BudgetScope::new("acme-co", "key-1", "openai", "gpt-5");
+        ledger.configure(&scope, 1_000, "UTC").expect("configure");
+        ledger
+            .configure_tenant("acme-co", 100, "UTC", SpendGate::All)
+            .expect("configure_tenant");
+        let id = ledger.reserve(&scope, Price::Known(50)).expect("reserve");
+        ledger.settle(&scope.tenant_id, &id, 50).expect("settle");
+        assert!(ledger.reserve(&scope, Price::Known(0)).is_ok());
     }
 
     #[test]
