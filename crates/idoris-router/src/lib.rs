@@ -42,7 +42,7 @@ use serde::Serialize;
 use serde_json::json;
 use uuid::Uuid;
 
-use dispatch::{DispatchError, dispatch_local, reason_header_value};
+use dispatch::{DispatchError, DispatchFailure, dispatch_local, reason_header_value};
 use profile::{ProfileError, parse_profile};
 
 const HEADER_SERVED_LOCALITY: &str = "X-iDoris-Served-Locality";
@@ -342,6 +342,30 @@ fn rejection_response(rejection: Rejection) -> Response {
     )
 }
 
+/// A budget-ledger failure gating a *paid* candidate (R2-D task 4).
+/// **Placeholder mapping**: `AppState` has no `BudgetLedger` field yet
+/// (follow-up PR adds it, plus the real 402 `budget_exceeded` body and
+/// `X-iDoris-Cost-Minor`) — kept separate to stay under the line gate.
+/// `X-iDoris-Served-Locality` is still set, since a candidate was chosen.
+fn dispatch_failure_response(
+    failure: &DispatchFailure,
+    outcome: &dispatch::ChatOutcome,
+) -> Response {
+    match failure {
+        DispatchFailure::Backend(err) => backend_error_response(err, outcome),
+        DispatchFailure::Budget(err) => {
+            let mut response = error_envelope_with_reason(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+                "budget_ledger_error",
+                err.to_string(),
+            );
+            apply_decision_headers(&mut response, outcome);
+            response
+        }
+    }
+}
+
 /// `POST /v1/chat/completions`. Order (locked by conformance): non-JSON
 /// body -> `invalid_json`; valid JSON that isn't an object -> `invalid_body`;
 /// only then are control-plane headers parsed (see [`profile::parse_profile`]),
@@ -383,13 +407,24 @@ async fn chat_completions(
         .collect::<Vec<_>>()
         .join("\n");
 
-    match dispatch_local(&state.cards, state.supervisor.as_ref(), &parsed, messages).await {
+    // No BudgetLedger wired yet (follow-up PR); a paid candidate fails via
+    // dispatch_failure_response's placeholder mapping until then.
+    match dispatch_local(
+        &state.cards,
+        state.supervisor.as_ref(),
+        None,
+        &parsed,
+        &prompt,
+        messages,
+    )
+    .await
+    {
         Err(DispatchError::Rejection(rejection)) => rejection_response(rejection),
         Err(DispatchError::Internal(message)) => {
             error_envelope(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", message)
         }
         Ok(outcome) => match &outcome.result {
-            Err(backend_err) => backend_error_response(backend_err, &outcome),
+            Err(failure) => dispatch_failure_response(failure, &outcome),
             Ok(chat_response) => {
                 let requested_model = model.unwrap_or(chat_response.model.as_str());
                 let body = openai_chat_completion(&chat_response.content, requested_model, &prompt);

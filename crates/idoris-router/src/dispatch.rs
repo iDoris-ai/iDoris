@@ -15,8 +15,10 @@ use idoris_policy::{
     AdmissionStatus, Card, Decision, PolicyCtx, ROLES, ReasonCode, Rejection, RequestProfile,
     decide, effective_served_locality,
 };
+use idoris_tenancy::budget::{BudgetError, BudgetLedger, ReservationId};
 use tokio_util::sync::CancellationToken;
 
+use crate::budget;
 use crate::profile::ParsedProfile;
 
 /// Fallback for a card that doesn't declare its own `load_policy` — cards
@@ -37,19 +39,12 @@ fn default_load_policy() -> LoadPolicy {
 /// equally cheap to load for now.
 const PLACEHOLDER_MEMORY_GB: f64 = 1.0;
 
-/// R2-D simplification (documented, revisited once idoris-recommender's
-/// catalog is wired in): every loaded component card is treated as
-/// eligible for every catalog role and always `Ready` for admission
-/// purposes at `decide()` time — role→component catalog mapping isn't
-/// wired yet, and *real* admission state is only known after actually
-/// asking the Supervisor, which only happens after `decide()` has already
-/// picked a candidate (see [`dispatch_local`]). `estimated_cost_minor` is
-/// `Some(0)` when the provider's declared cost is exactly zero and `None`
-/// (price unknown → excluded, invariant #3) otherwise — real per-request
-/// cost estimation from actual token counts is R2-D task 4's job.
-fn candidate(component: &ComponentCard) -> Card {
-    let free =
-        component.provider.cost.input_per_m == 0.0 && component.provider.cost.output_per_m == 0.0;
+/// R2-D simplification: every loaded component card is eligible for every
+/// catalog role and always `Ready` at `decide()` time — role→catalog
+/// mapping isn't wired yet, and real admission state is only known after
+/// asking the Supervisor (post-selection, see [`dispatch_local`]).
+/// `estimated_cost_minor` comes from [`budget::estimate_cost_minor`].
+fn candidate(component: &ComponentCard, prompt: &str) -> Card {
     Card {
         component: component.clone(),
         roles: ROLES
@@ -59,22 +54,30 @@ fn candidate(component: &ComponentCard) -> Card {
             .collect(),
         experiment: false,
         min_ram_gb: 0.0,
-        estimated_cost_minor: if free { Some(0) } else { None },
+        estimated_cost_minor: budget::estimate_cost_minor(&component.provider.cost, prompt),
         admission_status: AdmissionStatus::Ready,
     }
 }
 
-/// What [`dispatch_local`] returns on a successful `decide()` — the
-/// decision plus which locality actually served (or attempted to serve)
-/// the request, alongside the backend's own result. Callers need
-/// `served_locality` even when `result` is `Err`: once a candidate is
-/// chosen, `X-iDoris-Served-Locality` must be set regardless of what
-/// happens next (interface spec §3.12).
+/// A local backend failure, or a budget-ledger failure gating a *paid*
+/// candidate — both only occur after a candidate was already chosen.
+#[derive(Debug)]
+pub enum DispatchFailure {
+    Backend(BackendError),
+    Budget(BudgetError),
+}
+
+/// What [`dispatch_local`] returns on a successful `decide()`.
+/// `served_locality` is set even when `result` is `Err` (interface spec
+/// §3.12). `actual_cost_minor` is `Some` only after a successful `settle`
+/// on a paid candidate — `None` for free/failed/settle-also-failed
+/// (best-effort; the response still succeeds either way).
 #[derive(Debug)]
 pub struct ChatOutcome {
     pub decision: Decision,
     pub served_locality: Locality,
-    pub result: Result<ChatResponse, BackendError>,
+    pub result: Result<ChatResponse, DispatchFailure>,
+    pub actual_cost_minor: Option<i64>,
 }
 
 #[derive(Debug)]
@@ -89,26 +92,45 @@ pub enum DispatchError {
     Internal(String),
 }
 
+/// Best-effort release (swallows its own error) for a call that's already
+/// failing for its own reason -- an unreleased reservation self-heals via
+/// its TTL regardless.
+fn best_effort_release(
+    ledger: Option<&BudgetLedger>,
+    tenant_id: Option<&str>,
+    reservation: &Option<ReservationId>,
+) {
+    if let (Some(ledger), Some(id)) = (ledger, reservation) {
+        let _ = budget::release(ledger, tenant_id, id);
+    }
+}
+
 /// Runs the local decision + execution path for one request: builds
 /// decision-time [`Card`]s from `cards` (R2-D simplification, see
-/// `candidate`), calls [`idoris_policy::decide`] with no budget context
-/// (atomic reserve/settle around a *paid* candidate is R2-D task 4's job,
-/// layered on top of this function rather than inside it), then — if a
-/// local backend is wired (`supervisor.is_some()`) — loads the chosen
-/// model if the Supervisor doesn't already report it loaded, and finally
-/// calls `chat`.
+/// `candidate`), calls [`idoris_policy::decide`], reserves budget for a
+/// *paid* candidate (`budget_ledger: None` fails closed via
+/// [`DispatchFailure::Budget`] exactly as an unconfigured ledger would —
+/// free candidates are unaffected), loads the chosen model via the
+/// Supervisor if not already loaded, calls `chat`, then settles (success)
+/// or releases (failure) the reservation. `prompt` is the caller's own
+/// concatenated message text, passed in rather than recomputed here so
+/// there's one place deciding how "the prompt" is derived from `messages`.
 pub async fn dispatch_local(
     cards: &[ComponentCard],
     supervisor: Option<&SupervisorHandle>,
+    budget_ledger: Option<&BudgetLedger>,
     profile: &ParsedProfile,
+    prompt: &str,
     messages: Vec<ChatMessage>,
 ) -> Result<ChatOutcome, DispatchError> {
+    let tenant_id = profile.tenant_id.as_deref();
+
     // Scoped so `candidates`/`ctx` (which holds a `PolicyCtx<'_>` — not
     // `Send` because `dyn BudgetView` isn't `Sync` — see its own doc) are
     // dropped before any `.await` below; otherwise the whole function's
     // future would stop being `Send`, which axum's `Handler` trait requires.
-    let (decision, served_locality, model_id, load_policy) = {
-        let candidates: Vec<Card> = cards.iter().map(candidate).collect();
+    let (decision, served_locality, model_id, load_policy, cost, estimated_cost_minor) = {
+        let candidates: Vec<Card> = cards.iter().map(|c| candidate(c, prompt)).collect();
         let request_profile = RequestProfile {
             task: profile.task.clone(),
             role: profile.role,
@@ -133,19 +155,60 @@ pub async fn dispatch_local(
             .component
             .load_policy
             .unwrap_or_else(default_load_policy);
+        // decide()'s pricing stage already excluded any None/negative
+        // estimate, so this is always Some(v >= 0); unwrap_or(0) is
+        // defense in depth, not a path expected to actually trigger.
+        let estimated_cost_minor = chosen.estimated_cost_minor.unwrap_or(0);
         (
             decision,
             served_locality,
             chosen.id().to_string(),
             load_policy,
+            chosen.component.provider.cost,
+            estimated_cost_minor,
         )
     };
 
+    let is_paid = budget::is_paid(Some(estimated_cost_minor));
+    let reservation = if is_paid {
+        match budget_ledger {
+            None => {
+                return Ok(ChatOutcome {
+                    decision,
+                    served_locality,
+                    result: Err(DispatchFailure::Budget(budget::ledger_unavailable_error(
+                        tenant_id, &model_id,
+                    ))),
+                    actual_cost_minor: None,
+                });
+            }
+            Some(ledger) => {
+                match budget::reserve(ledger, tenant_id, &model_id, estimated_cost_minor) {
+                    Ok(id) => Some(id),
+                    Err(err) => {
+                        return Ok(ChatOutcome {
+                            decision,
+                            served_locality,
+                            result: Err(DispatchFailure::Budget(err)),
+                            actual_cost_minor: None,
+                        });
+                    }
+                }
+            }
+        }
+    } else {
+        None
+    };
+
     let Some(supervisor) = supervisor else {
+        best_effort_release(budget_ledger, tenant_id, &reservation);
         return Ok(ChatOutcome {
             decision,
             served_locality,
-            result: Err(BackendError::supervisor_unavailable()),
+            result: Err(DispatchFailure::Backend(
+                BackendError::supervisor_unavailable(),
+            )),
+            actual_cost_minor: None,
         });
     };
 
@@ -156,14 +219,16 @@ pub async fn dispatch_local(
             .load(model_id.clone(), PLACEHOLDER_MEMORY_GB, load_policy)
             .await
     {
+        best_effort_release(budget_ledger, tenant_id, &reservation);
         return Ok(ChatOutcome {
             decision,
             served_locality,
-            result: Err(err),
+            result: Err(DispatchFailure::Backend(err)),
+            actual_cost_minor: None,
         });
     }
 
-    let result = supervisor
+    let chat_result = supervisor
         .chat(
             ChatRequest {
                 model: model_id,
@@ -172,11 +237,41 @@ pub async fn dispatch_local(
             CancellationToken::new(),
         )
         .await;
-    Ok(ChatOutcome {
-        decision,
-        served_locality,
-        result,
-    })
+
+    match chat_result {
+        Err(err) => {
+            best_effort_release(budget_ledger, tenant_id, &reservation);
+            Ok(ChatOutcome {
+                decision,
+                served_locality,
+                result: Err(DispatchFailure::Backend(err)),
+                actual_cost_minor: None,
+            })
+        }
+        Ok(response) => {
+            // Settling is best-effort (see `ChatOutcome::actual_cost_minor`'s
+            // doc): a successful chat response is never withheld just
+            // because the ledger write afterward had a problem.
+            let actual_cost_minor = match (budget_ledger, &reservation) {
+                (Some(ledger), Some(id)) => {
+                    let actual = budget::estimate_actual_cost_minor(
+                        &cost,
+                        prompt,
+                        &response.content,
+                        estimated_cost_minor,
+                    );
+                    budget::settle(ledger, tenant_id, id, actual).ok()
+                }
+                _ => None,
+            };
+            Ok(ChatOutcome {
+                decision,
+                served_locality,
+                result: Ok(response),
+                actual_cost_minor,
+            })
+        }
+    }
 }
 
 /// Debug-formatted, comma-joined reason codes — observability-only, not
@@ -241,7 +336,7 @@ mod tests {
 
     #[tokio::test]
     async fn no_cards_rejects_as_local_only_unavailable() {
-        let err = dispatch_local(&[], None, &empty_profile(), Vec::new())
+        let err = dispatch_local(&[], None, None, &empty_profile(), "", Vec::new())
             .await
             .unwrap_err();
         assert!(matches!(
@@ -252,12 +347,23 @@ mod tests {
 
     #[tokio::test]
     async fn a_candidate_with_no_supervisor_reports_supervisor_unavailable() {
-        let outcome = dispatch_local(&[local_card("a")], None, &empty_profile(), Vec::new())
-            .await
-            .unwrap();
+        let outcome = dispatch_local(
+            &[local_card("a")],
+            None,
+            None,
+            &empty_profile(),
+            "",
+            Vec::new(),
+        )
+        .await
+        .unwrap();
         assert_eq!(outcome.served_locality, Locality::Loopback);
-        let err = outcome.result.unwrap_err();
-        assert_eq!(err.reason_code(), "supervisor_unavailable");
+        match outcome.result.unwrap_err() {
+            DispatchFailure::Backend(err) => {
+                assert_eq!(err.reason_code(), "supervisor_unavailable")
+            }
+            other => panic!("expected a Backend failure, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -274,12 +380,15 @@ mod tests {
         let outcome = dispatch_local(
             &[local_card("a")],
             Some(&supervisor),
+            None,
             &empty_profile(),
+            "hello",
             messages,
         )
         .await
         .unwrap();
         assert_eq!(outcome.served_locality, Locality::Loopback);
+        assert_eq!(outcome.actual_cost_minor, None); // free candidate: nothing to charge
         let response = outcome.result.unwrap();
         assert_eq!(response.model, "a");
         assert!(response.content.contains("hello"));
