@@ -124,13 +124,32 @@ enum OpOutcome {
         /// Every victim `plan_eviction` chose, and how its `unload` went —
         /// applied to the ledger by `OpDone` alongside `result`.
         victim_results: Vec<VictimResult>,
-        /// Only consulted when `result` is `Err` — see `run_load_flow`'s
-        /// doc comment on why this varies instead of always being `Error`.
-        failure_state: ModelState,
+        /// Only consulted when `result` is `Err` — see
+        /// [`LoadFailureOutcome`]'s doc comment.
+        failure_outcome: LoadFailureOutcome,
     },
     Unload {
         result: Result<(), BackendError>,
     },
+}
+
+/// What `OpDone` applies to `id`'s ledger entry when a load's `result` is
+/// `Err` (on `Ok`, unused — `handle_load` already put the right
+/// policy/memory_gb in the slot for the newly-`Ready` state).
+enum LoadFailureOutcome {
+    /// Land on this state, keeping whatever policy/memory_gb `handle_load`
+    /// already wrote into the slot.
+    Settle(ModelState),
+    /// This was a reload of a previously-`Ready` model — restore that old
+    /// state instead of guessing `Stopped`/`Error` (Medium, follow-up Opus
+    /// review; prdaemon-observed: 6 GiB budget, engine actually still
+    /// holding 8 GiB). A failed reload call most likely left the existing
+    /// instance untouched; blanket-assuming `Stopped` would tell the
+    /// ledger that instance's memory is free when it almost certainly
+    /// still isn't — and a later `unload` would then short-circuit on the
+    /// wrongly-`Stopped` entry, so that memory could never be reclaimed
+    /// through the public API again.
+    RestorePreviousReady { policy: LoadPolicy, memory_gb: f64 },
 }
 
 enum ActorMsg {
@@ -468,6 +487,7 @@ async fn run_load_flow(
     id: String,
     policy: LoadPolicy,
     evict: Vec<String>,
+    was_ready: Option<(LoadPolicy, f64)>,
 ) -> OpOutcome {
     // Every chosen victim gets an actual unload attempt, even after an
     // earlier one fails: `OpDone` only resolves ids present in
@@ -499,10 +519,13 @@ async fn run_load_flow(
         victim_results.push((victim, result));
     }
     if eviction_failed {
+        let err = BackendError::eviction_failed(&id);
+        let failure_outcome =
+            resolve_load_failure(&adapter, &id, &err, was_ready, config.adapter_call_timeout).await;
         return OpOutcome::Load {
-            result: Err(BackendError::eviction_failed(&id)),
+            result: Err(err),
             victim_results,
-            failure_state: ModelState::Stopped,
+            failure_outcome,
         };
     }
     // Confirm before proceeding to `load`, not after: the whole point is
@@ -544,12 +567,12 @@ async fn run_load_flow(
         .await;
     }
     if let Err(err) = attempt {
+        let failure_outcome =
+            resolve_load_failure(&adapter, &id, &err, was_ready, config.adapter_call_timeout).await;
         return OpOutcome::Load {
             result: Err(err),
             victim_results,
-            // `adapter.load` itself explicitly rejected the request — no
-            // real allocation to have happened.
-            failure_state: ModelState::Stopped,
+            failure_outcome,
         };
     }
 
@@ -560,24 +583,29 @@ async fn run_load_flow(
                 return OpOutcome::Load {
                     result: Ok(()),
                     victim_results,
-                    failure_state: ModelState::Error, // unused: `result` is `Ok`
+                    failure_outcome: LoadFailureOutcome::Settle(ModelState::Error), // unused: `result` is `Ok`
                 };
             }
             Ok(false) => tokio::time::sleep(config.probe_interval).await,
             Err(err) => {
+                // `adapter.load` itself already succeeded by this point, so
+                // (unlike the two branches above) a reload's *old* instance
+                // is not assumed to still be untouched — confirm via
+                // best-effort release the same way a fresh load would.
+                let state = best_effort_release(&adapter, &id, config.adapter_call_timeout).await;
                 return OpOutcome::Load {
                     result: Err(err),
                     victim_results,
-                    failure_state: best_effort_release(&adapter, &id, config.adapter_call_timeout)
-                        .await,
+                    failure_outcome: LoadFailureOutcome::Settle(state),
                 };
             }
         }
     }
+    let state = best_effort_release(&adapter, &id, config.adapter_call_timeout).await;
     OpOutcome::Load {
         result: Err(BackendError::probe_timed_out(id.clone())),
         victim_results,
-        failure_state: best_effort_release(&adapter, &id, config.adapter_call_timeout).await,
+        failure_outcome: LoadFailureOutcome::Settle(state),
     }
 }
 
@@ -594,6 +622,33 @@ async fn best_effort_release(
     match with_adapter_timeout(adapter.unload(id), timeout, id).await {
         Ok(()) => ModelState::Stopped,
         Err(_) => ModelState::Error,
+    }
+}
+
+/// Decides `id`'s [`LoadFailureOutcome`] after `err` (Medium, follow-up
+/// Opus review). If this was a reload of a previously-`Ready` model
+/// (`was_ready.is_some()`), always restores that old state regardless of
+/// the specific error — see `LoadFailureOutcome::RestorePreviousReady`'s
+/// doc comment; a failed reload call is not the same as a failed *fresh*
+/// load, since something was already genuinely resident beforehand.
+/// Otherwise: an explicit adapter rejection means no real allocation
+/// happened (`Stopped`, H1's original reasoning, still valid for a fresh
+/// load); a timeout is genuinely uncertain, not a rejection, so it is
+/// confirmed via [`best_effort_release`] instead of assumed `Stopped`.
+async fn resolve_load_failure(
+    adapter: &Arc<dyn RuntimeAdapter>,
+    id: &str,
+    err: &BackendError,
+    was_ready: Option<(LoadPolicy, f64)>,
+    timeout: std::time::Duration,
+) -> LoadFailureOutcome {
+    if let Some((policy, memory_gb)) = was_ready {
+        return LoadFailureOutcome::RestorePreviousReady { policy, memory_gb };
+    }
+    if matches!(err, BackendError::AdapterTimedOut { .. }) {
+        LoadFailureOutcome::Settle(best_effort_release(adapter, id, timeout).await)
+    } else {
+        LoadFailureOutcome::Settle(ModelState::Stopped)
     }
 }
 
@@ -655,6 +710,7 @@ fn start_load(
     id: String,
     policy: LoadPolicy,
     evict: Vec<String>,
+    was_ready: Option<(LoadPolicy, f64)>,
     models: &mut HashMap<String, ModelSlot>,
     env: &Env<'_>,
 ) {
@@ -681,6 +737,7 @@ fn start_load(
             id_for_task.clone(),
             policy,
             evict,
+            was_ready,
         ));
         let outcome = match inner.await {
             Ok(outcome) => outcome,
@@ -708,8 +765,11 @@ fn start_load(
                     .collect(),
                 // A panic mid-flow leaves real state genuinely unknown —
                 // conservative like a failed best-effort release, not the
-                // "confirmed nothing happened" case.
-                failure_state: ModelState::Error,
+                // "confirmed nothing happened" case. Deliberately *not*
+                // `was_ready`-aware even for a reload: unlike a clean
+                // rejection or timeout, a panic gives no assurance the old
+                // instance was left untouched either.
+                failure_outcome: LoadFailureOutcome::Settle(ModelState::Error),
             },
         };
         // If `upgrade` fails, every `SupervisorHandle` is already gone and
@@ -816,6 +876,17 @@ fn handle_load(
     // safety net). Blocking such a reload until drained is a further
     // improvement left for later — not required to avoid the underflow.
     let inflight = models.get(&id).map_or(0, |s| s.inflight);
+    // Captured *before* the `models.insert` below overwrites the slot: if
+    // this is a reload of a model that's already `Ready`, its old
+    // policy/memory_gb must survive a failed reload attempt (Medium,
+    // follow-up Opus review) — see `LoadFailureOutcome::RestorePreviousReady`.
+    // `None` for a fresh id or one that wasn't `Ready` (Error/Stopped/
+    // Stopping): those cases keep H1's original "no real allocation on
+    // failure" reasoning.
+    let was_ready = models
+        .get(&id)
+        .filter(|slot| slot.state == ModelState::Ready)
+        .map(|slot| (slot.policy, slot.memory_gb));
     models.insert(
         id.clone(),
         ModelSlot {
@@ -834,7 +905,7 @@ fn handle_load(
             waiters: vec![reply],
         },
     });
-    start_load(id, policy, evict, models, env);
+    start_load(id, policy, evict, was_ready, models, env);
 }
 
 /// The pure-IO side of a standalone `unload`. Unlike an eviction's own
@@ -1114,15 +1185,18 @@ async fn run_actor(
             }
 
             ActorMsg::OpDone { id, outcome } => {
-                let (result, done_state, failure_state, victim_results) = match outcome {
+                let (result, done_state, failure_outcome, victim_results) = match outcome {
                     OpOutcome::Load {
                         result,
                         victim_results,
-                        failure_state,
-                    } => (result, ModelState::Ready, failure_state, victim_results),
-                    OpOutcome::Unload { result } => {
-                        (result, ModelState::Stopped, ModelState::Error, Vec::new())
-                    }
+                        failure_outcome,
+                    } => (result, ModelState::Ready, failure_outcome, victim_results),
+                    OpOutcome::Unload { result } => (
+                        result,
+                        ModelState::Stopped,
+                        LoadFailureOutcome::Settle(ModelState::Error),
+                        Vec::new(),
+                    ),
                 };
 
                 let mut violation: Option<String> = None;
@@ -1152,11 +1226,26 @@ async fn run_actor(
                                 None => violation = Some(format!("ledger lost {id:?} mid-op")),
                             }
                         }
-                        Err(_) => {
-                            if let Err(e) = set_state_or_poison(&mut models, &id, failure_state) {
-                                violation = Some(e);
+                        Err(_) => match failure_outcome {
+                            LoadFailureOutcome::Settle(state) => {
+                                if let Err(e) = set_state_or_poison(&mut models, &id, state) {
+                                    violation = Some(e);
+                                }
                             }
-                        }
+                            LoadFailureOutcome::RestorePreviousReady { policy, memory_gb } => {
+                                match models.get_mut(&id) {
+                                    Some(slot) => {
+                                        slot.state = ModelState::Ready;
+                                        slot.policy = policy;
+                                        slot.memory_gb = memory_gb;
+                                    }
+                                    None => {
+                                        violation =
+                                            Some(format!("ledger lost {id:?} mid-op (reload)"));
+                                    }
+                                }
+                            }
+                        },
                     }
                 }
 
@@ -2314,6 +2403,116 @@ mod tests {
         );
     }
 
+    /// Medium (follow-up Opus review, prdaemon probe): a reload of an
+    /// already-`Ready` model with a *different* policy that then fails
+    /// must restore the old `Ready` state (policy + memory_gb), not settle
+    /// on `Stopped` — the old instance was never actually torn down, so
+    /// `Stopped` would tell the ledger its memory is free when it almost
+    /// certainly still isn't (prdaemon-observed: 6 GiB budget, engine
+    /// actually still holding 8 GiB).
+    #[tokio::test]
+    async fn a_failed_reload_restores_the_previous_ready_state_not_stopped() {
+        let adapter = Arc::new(MockAdapter::new(evictable_catalog()));
+        let handle = Supervisor::spawn(adapter.clone(), tight_budget_config())
+            .expect("spawn should succeed");
+        no_hang(handle.load("a", 20.0, on_demand_policy()))
+            .await
+            .expect("initial load of a should succeed");
+        adapter.set_load_script("a", vec![crate::mock::LoadOutcome::Fail]);
+        no_hang(handle.load("a", 20.0, resident_policy()))
+            .await
+            .expect_err("the reload with a different (scripted-to-fail) policy must fail");
+        // Decisive check: used_gb must still reflect a's original
+        // footprint, not have dropped as if a were freed.
+        let status = no_hang(handle.status())
+            .await
+            .expect("status should succeed");
+        assert_eq!(
+            status.used_gb, 20.0,
+            "a failed reload must not silently free a's ledger entry"
+        );
+        assert_eq!(status.loaded, vec!["a".to_string()]);
+        // a must still genuinely be servable, not just accounted-for.
+        no_hang(handle.chat(
+            ChatRequest {
+                model: "a".to_string(),
+                messages: vec![],
+            },
+            CancellationToken::new(),
+        ))
+        .await
+        .expect("a must still be chattable after the failed reload");
+        // A second model needing the same space must trigger *real*
+        // eviction (adapter.unload("a") actually called), not wrongly
+        // succeed as if a's space were already free.
+        no_hang(handle.load("b", 20.0, on_demand_policy()))
+            .await
+            .expect("b should be admitted by evicting the still-genuinely-Ready a");
+        assert_eq!(
+            adapter.unload_call_count("a"),
+            1,
+            "a must be genuinely evicted (unload actually called), not treated as already-free"
+        );
+        let status2 = no_hang(handle.status())
+            .await
+            .expect("status should succeed");
+        assert_eq!(status2.loaded, vec!["b".to_string()]);
+    }
+
+    /// Medium (follow-up Opus review): a reload's restored `Ready` state
+    /// must not be short-circuited as an already-`Stopped` no-op when
+    /// explicitly `unload`ed — that would make the still-genuinely-loaded
+    /// instance unrecoverable through the public API.
+    #[tokio::test]
+    async fn a_restored_ready_model_after_a_failed_reload_can_still_be_unloaded_for_real() {
+        let adapter = Arc::new(MockAdapter::new(catalog()));
+        let handle = Supervisor::spawn(adapter.clone(), SupervisorConfig::default())
+            .expect("spawn should succeed");
+        no_hang(handle.load("a", 4.0, on_demand_policy()))
+            .await
+            .expect("initial load of a should succeed");
+        adapter.set_load_script("a", vec![crate::mock::LoadOutcome::Fail]);
+        no_hang(handle.load("a", 4.0, resident_policy()))
+            .await
+            .expect_err("the reload must fail");
+        no_hang(handle.unload("a"))
+            .await
+            .expect("unload of the restored a should succeed");
+        assert_eq!(
+            adapter.unload_call_count("a"),
+            1,
+            "unload must actually call the adapter for real, not short-circuit as if a were already Stopped"
+        );
+    }
+
+    /// Medium (follow-up Opus review): a *fresh* (non-reload) load whose
+    /// `adapter.load` call times out is genuinely uncertain — not a
+    /// confirmed rejection — so it must be confirmed via
+    /// `best_effort_release` (an actual `unload` attempt), not settled on
+    /// `Stopped` outright.
+    #[tokio::test(start_paused = true)]
+    async fn a_timed_out_first_load_is_confirmed_via_best_effort_release_not_assumed_free() {
+        let adapter = Arc::new(MockAdapter::new(catalog()));
+        adapter.set_load_delay("a", std::time::Duration::from_secs(3600));
+        let handle = Supervisor::spawn(
+            adapter.clone(),
+            SupervisorConfig {
+                adapter_call_timeout: std::time::Duration::from_millis(50),
+                ..SupervisorConfig::default()
+            },
+        )
+        .expect("spawn should succeed");
+        let err = no_hang(handle.load("a", 4.0, on_demand_policy()))
+            .await
+            .expect_err("a timed-out first load must surface as an error, not hang");
+        assert_eq!(err.reason_code(), "adapter_timed_out");
+        assert_eq!(
+            adapter.unload_call_count("a"),
+            1,
+            "a timeout must trigger a best-effort release attempt, not assume nothing happened"
+        );
+    }
+
     /// A minimal `RuntimeAdapter`: `load` always succeeds but
     /// `probe_ready` always fails — exercises H1's "probe fails, but a
     /// best-effort `unload` confirms release" path. `unload_ok` controls
@@ -2554,7 +2753,7 @@ mod tests {
             outcome: OpOutcome::Load {
                 result: Ok(()),
                 victim_results: Vec::new(),
-                failure_state: ModelState::Error,
+                failure_outcome: LoadFailureOutcome::Settle(ModelState::Error),
             },
         })
         .await
