@@ -7,8 +7,10 @@
 
 mod clock;
 mod error;
+mod period;
 mod scope;
 
 pub use clock::{Clock, SystemClock};
 pub use error::{BUDGET_EXCEEDED_REASON_CODE, Budget402Body, BudgetError};
+pub use period::billing_period_key;
 pub use scope::BudgetScope;
