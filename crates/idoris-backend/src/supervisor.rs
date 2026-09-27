@@ -5,15 +5,16 @@
 //! **one tokio task holds all state**; every other task talks to it only
 //! through [`SupervisorHandle`]'s mpsc-backed commands.
 //!
-//! This PR lands the scaffolding and the read-only/serving commands
-//! (`list`/`status`/`chat`) — `load`/`unload`, the eviction integration,
-//! singleflight, and the global load/evict mutex land in follow-up PRs.
-//! Until then the ledger is always empty, so `chat` can only ever report
-//! `model_not_found`.
+//! This PR adds `load`: singleflight (same-id + identical policy merge),
+//! an OOM circuit breaker (one self-healing retry, §4 "熔断"), and
+//! `probe_ready` polling for `Loading -> Ready`. `unload`, eviction, and
+//! a real wait queue are follow-ups — a different id fails fast with
+//! `BackendError::Busy` meanwhile, and capacity isn't checked yet.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use idoris_contracts::LoadPolicy;
 use tokio::sync::{Semaphore, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
@@ -22,11 +23,10 @@ use crate::error::BackendError;
 use crate::eviction::{ModelState, occupies_budget};
 use crate::types::{BackendStatus, ChatRequest, ChatResponse, ModelInfo, Pressure};
 
-/// Tunables for the (future) load/probe/eviction-confirm loops. `budget_gb`
-/// is the global memory ledger's ceiling (§4: "全局内存账本：budget_gb 由
-/// 配置给定"). Already present here (even though `load` doesn't land until
-/// a follow-up PR) because [`SupervisorConfig::budget_gb`] also drives this
-/// PR's `status` pressure computation.
+type LoadReply = oneshot::Sender<Result<(), BackendError>>;
+
+/// Tunables for the load/probe loops. `budget_gb` is the global memory
+/// ledger's ceiling (§4: "全局内存账本：budget_gb 由配置给定").
 #[derive(Debug, Clone)]
 pub struct SupervisorConfig {
     pub budget_gb: f64,
@@ -36,6 +36,9 @@ pub struct SupervisorConfig {
     /// capacity: that one bounds queued *commands*, this one bounds
     /// in-flight *adapter calls*.
     pub max_concurrent_adapter_calls: usize,
+    /// `probe_ready` poll interval; `probe_max_attempts` bounds retries.
+    pub probe_interval: std::time::Duration,
+    pub probe_max_attempts: u32,
 }
 
 impl Default for SupervisorConfig {
@@ -43,6 +46,8 @@ impl Default for SupervisorConfig {
         Self {
             budget_gb: 24.0,
             max_concurrent_adapter_calls: 64,
+            probe_interval: std::time::Duration::from_millis(20),
+            probe_max_attempts: 50,
         }
     }
 }
@@ -50,6 +55,10 @@ impl Default for SupervisorConfig {
 struct ModelSlot {
     memory_gb: f64,
     state: ModelState,
+    /// Reserved for eviction (LRU) bookkeeping, landing in a follow-up PR.
+    last_used_seq: u64,
+    /// Policy last accepted; compared by exact equality to decide merge vs. a new op.
+    policy: LoadPolicy,
 }
 
 enum Command {
@@ -64,6 +73,35 @@ enum Command {
         cancel: CancellationToken,
         reply: oneshot::Sender<Result<ChatResponse, BackendError>>,
     },
+    Load {
+        id: String,
+        memory_gb: f64,
+        policy: LoadPolicy,
+        reply: LoadReply,
+    },
+}
+
+/// What a background load op reports to the single-writer loop; only the
+/// loop applies this to `models` (`unload` lands in a follow-up PR).
+enum OpOutcome {
+    Load { result: Result<(), BackendError> },
+}
+
+enum ActorMsg {
+    Cmd(Command),
+    OpDone { id: String, outcome: OpOutcome },
+}
+
+enum ActiveKind {
+    Load {
+        policy: LoadPolicy,
+        waiters: Vec<LoadReply>,
+    },
+}
+
+struct ActiveOp {
+    id: String,
+    kind: ActiveKind,
 }
 
 /// A cheaply-`Clone`-able front door to a running [`Supervisor`]. Every
@@ -73,27 +111,27 @@ enum Command {
 /// reference and got dropped mid-flight).
 #[derive(Debug, Clone)]
 pub struct SupervisorHandle {
-    tx: mpsc::Sender<Command>,
+    tx: mpsc::Sender<ActorMsg>,
 }
 
 impl SupervisorHandle {
-    async fn send(&self, cmd: Command) -> Result<(), BackendError> {
+    async fn send(&self, msg: ActorMsg) -> Result<(), BackendError> {
         self.tx
-            .send(cmd)
+            .send(msg)
             .await
             .map_err(|_| BackendError::supervisor_unavailable())
     }
 
     pub async fn list(&self) -> Result<Vec<ModelInfo>, BackendError> {
         let (reply, rx) = oneshot::channel();
-        self.send(Command::List { reply }).await?;
+        self.send(ActorMsg::Cmd(Command::List { reply })).await?;
         rx.await
             .map_err(|_| BackendError::supervisor_unavailable())?
     }
 
     pub async fn status(&self) -> Result<BackendStatus, BackendError> {
         let (reply, rx) = oneshot::channel();
-        self.send(Command::Status { reply }).await?;
+        self.send(ActorMsg::Cmd(Command::Status { reply })).await?;
         rx.await.map_err(|_| BackendError::supervisor_unavailable())
     }
 
@@ -103,7 +141,26 @@ impl SupervisorHandle {
         cancel: CancellationToken,
     ) -> Result<ChatResponse, BackendError> {
         let (reply, rx) = oneshot::channel();
-        self.send(Command::Chat { req, cancel, reply }).await?;
+        self.send(ActorMsg::Cmd(Command::Chat { req, cancel, reply }))
+            .await?;
+        rx.await
+            .map_err(|_| BackendError::supervisor_unavailable())?
+    }
+
+    pub async fn load(
+        &self,
+        id: impl Into<String>,
+        memory_gb: f64,
+        policy: LoadPolicy,
+    ) -> Result<(), BackendError> {
+        let (reply, rx) = oneshot::channel();
+        self.send(ActorMsg::Cmd(Command::Load {
+            id: id.into(),
+            memory_gb,
+            policy,
+            reply,
+        }))
+        .await?;
         rx.await
             .map_err(|_| BackendError::supervisor_unavailable())?
     }
@@ -151,7 +208,8 @@ impl Supervisor {
         }
         let (tx, rx) = mpsc::channel(64);
         let call_slots = Arc::new(Semaphore::new(config.max_concurrent_adapter_calls.max(1)));
-        tokio::spawn(run_actor(adapter, config, rx, call_slots));
+        let self_tx = tx.clone();
+        tokio::spawn(run_actor(adapter, config, rx, call_slots, self_tx));
         Ok(SupervisorHandle { tx })
     }
 }
@@ -171,19 +229,155 @@ fn not_ready_error(model_id: &str, state: ModelState) -> BackendError {
     }
 }
 
+/// Ledger entries are only transitioned, never removed, so every id here
+/// is guaranteed present; a missing entry means "不静默" must fail loudly.
+fn set_state_or_panic(models: &mut HashMap<String, ModelSlot>, id: &str, state: ModelState) {
+    match models.get_mut(id) {
+        Some(slot) => slot.state = state,
+        None => panic!("Supervisor invariant violated: ledger has no entry for {id:?}"),
+    }
+}
+
+/// The pure-IO side of a load: calls the adapter and reports the outcome,
+/// keeping the actor loop free for other commands. Capacity isn't
+/// checked yet — that lands with eviction in a follow-up PR.
+async fn run_load_flow(
+    adapter: Arc<dyn RuntimeAdapter>,
+    config: SupervisorConfig,
+    id: String,
+    policy: LoadPolicy,
+) -> OpOutcome {
+    // OOM circuit breaker: exactly one self-healing retry, never more.
+    let mut attempt = adapter.load(&id, Some(&policy)).await;
+    if let Err(err) = &attempt
+        && err.is_oom()
+    {
+        attempt = adapter.load(&id, Some(&policy)).await;
+    }
+    if let Err(err) = attempt {
+        return OpOutcome::Load { result: Err(err) };
+    }
+
+    for _ in 0..config.probe_max_attempts {
+        match adapter.probe_ready(&id).await {
+            Ok(true) => return OpOutcome::Load { result: Ok(()) },
+            Ok(false) => tokio::time::sleep(config.probe_interval).await,
+            Err(err) => return OpOutcome::Load { result: Err(err) },
+        }
+    }
+    OpOutcome::Load {
+        result: Err(BackendError::probe_timed_out(id)),
+    }
+}
+
+/// Bundles what dispatch helpers need but never mutate (clippy arg-count).
+struct Env<'a> {
+    adapter: &'a Arc<dyn RuntimeAdapter>,
+    config: &'a SupervisorConfig,
+    self_tx: &'a mpsc::Sender<ActorMsg>,
+}
+
+fn start_load(
+    id: String,
+    policy: LoadPolicy,
+    models: &mut HashMap<String, ModelSlot>,
+    env: &Env<'_>,
+) {
+    set_state_or_panic(models, &id, ModelState::Loading);
+    let adapter = env.adapter.clone();
+    let config = env.config.clone();
+    let self_tx = env.self_tx.clone();
+    let id_for_task = id.clone();
+    tokio::spawn(async move {
+        let outcome = run_load_flow(adapter, config, id_for_task.clone(), policy).await;
+        let _ = self_tx
+            .send(ActorMsg::OpDone {
+                id: id_for_task,
+                outcome,
+            })
+            .await;
+    });
+}
+
+/// Handles `Command::Load`, the single decision point every load path
+/// funnels through (§4); no queueing yet — a different id than the
+/// active op fails fast with `BackendError::Busy`.
+fn handle_load(
+    id: String,
+    memory_gb: f64,
+    policy: LoadPolicy,
+    reply: LoadReply,
+    models: &mut HashMap<String, ModelSlot>,
+    active_op: &mut Option<ActiveOp>,
+    env: &Env<'_>,
+) {
+    if let Some(active) = active_op.as_mut()
+        && active.id == id
+    {
+        if let ActiveKind::Load {
+            policy: active_policy,
+            waiters,
+        } = &mut active.kind
+            && *active_policy == policy
+        {
+            waiters.push(reply);
+        } else {
+            let _ = reply.send(Err(BackendError::busy()));
+        }
+        return;
+    }
+    if active_op.is_some() {
+        let _ = reply.send(Err(BackendError::busy()));
+        return;
+    }
+
+    if let Some(slot) = models.get(&id)
+        && slot.state == ModelState::Ready
+        && slot.policy == policy
+    {
+        let _ = reply.send(Ok(()));
+        return;
+    }
+
+    let last_used_seq = models.get(&id).map_or(0, |s| s.last_used_seq);
+    models.insert(
+        id.clone(),
+        ModelSlot {
+            memory_gb,
+            state: ModelState::Launching,
+            last_used_seq,
+            policy,
+        },
+    );
+    *active_op = Some(ActiveOp {
+        id: id.clone(),
+        kind: ActiveKind::Load {
+            policy,
+            waiters: vec![reply],
+        },
+    });
+    start_load(id, policy, models, env);
+}
+
 async fn run_actor(
     adapter: Arc<dyn RuntimeAdapter>,
     config: SupervisorConfig,
-    mut rx: mpsc::Receiver<Command>,
+    mut rx: mpsc::Receiver<ActorMsg>,
     call_slots: Arc<Semaphore>,
+    self_tx: mpsc::Sender<ActorMsg>,
 ) {
-    // Always empty until a follow-up PR adds `load`/`unload` — see the
-    // module doc comment.
-    let models: HashMap<String, ModelSlot> = HashMap::new();
+    let mut models: HashMap<String, ModelSlot> = HashMap::new();
+    let mut active_op: Option<ActiveOp> = None;
+    let mut next_seq: u64 = 0;
+    let env = Env {
+        adapter: &adapter,
+        config: &config,
+        self_tx: &self_tx,
+    };
 
-    while let Some(cmd) = rx.recv().await {
-        match cmd {
-            Command::List { reply } => {
+    while let Some(msg) = rx.recv().await {
+        match msg {
+            ActorMsg::Cmd(Command::List { reply }) => {
                 let Ok(permit) = call_slots.clone().try_acquire_owned() else {
                     let _ = reply.send(Err(BackendError::busy()));
                     continue;
@@ -195,7 +389,7 @@ async fn run_actor(
                 });
             }
 
-            Command::Status { reply } => {
+            ActorMsg::Cmd(Command::Status { reply }) => {
                 let used_gb: f64 = models
                     .values()
                     .filter(|slot| occupies_budget(slot.state))
@@ -221,7 +415,7 @@ async fn run_actor(
                 });
             }
 
-            Command::Chat { req, cancel, reply } => match models.get(&req.model) {
+            ActorMsg::Cmd(Command::Chat { req, cancel, reply }) => match models.get(&req.model) {
                 None => {
                     let _ = reply.send(Err(BackendError::model_not_found(&req.model)));
                 }
@@ -233,6 +427,10 @@ async fn run_actor(
                         let _ = reply.send(Err(BackendError::busy()));
                         continue;
                     };
+                    next_seq += 1;
+                    if let Some(slot) = models.get_mut(&req.model) {
+                        slot.last_used_seq = next_seq;
+                    }
                     let adapter = adapter.clone();
                     tokio::spawn(async move {
                         let _permit = permit;
@@ -240,6 +438,49 @@ async fn run_actor(
                     });
                 }
             },
+
+            ActorMsg::Cmd(Command::Load {
+                id,
+                memory_gb,
+                policy,
+                reply,
+            }) => {
+                handle_load(
+                    id,
+                    memory_gb,
+                    policy,
+                    reply,
+                    &mut models,
+                    &mut active_op,
+                    &env,
+                );
+            }
+
+            ActorMsg::OpDone { id, outcome } => {
+                let OpOutcome::Load { result } = outcome;
+                match &result {
+                    Ok(()) => {
+                        next_seq += 1;
+                        if let Some(slot) = models.get_mut(&id) {
+                            slot.state = ModelState::Ready;
+                            slot.last_used_seq = next_seq;
+                        } else {
+                            panic!("Supervisor invariant violated: ledger lost {id:?} mid-load");
+                        }
+                    }
+                    Err(_) => set_state_or_panic(&mut models, &id, ModelState::Error),
+                }
+                let waiters = match active_op.take() {
+                    Some(ActiveOp {
+                        kind: ActiveKind::Load { waiters, .. },
+                        ..
+                    }) => waiters,
+                    None => panic!("Supervisor invariant violated: OpDone with no active op"),
+                };
+                for waiter in waiters {
+                    let _ = waiter.send(result.clone());
+                }
+            }
         }
     }
 }
@@ -278,9 +519,7 @@ mod tests {
         assert_eq!(status.pressure, Pressure::Ok);
     }
 
-    /// Negative contrast: `chat` for a model that has never been loaded
-    /// (impossible to have been, since `load` doesn't exist yet in this
-    /// PR) must fail with `model_not_found`, not silently succeed.
+    /// Negative contrast: `chat` before any `load` fails `model_not_found`.
     #[tokio::test]
     async fn chat_before_any_load_lands_is_not_found() {
         let adapter = Arc::new(MockAdapter::new(catalog()));
@@ -322,4 +561,7 @@ mod tests {
         Supervisor::spawn(adapter, SupervisorConfig::default())
             .expect("a valid default config must be accepted");
     }
+
+    // Concurrency tests (singleflight, OOM retry, load/unload round-trip,
+    // "different id -> Busy") land in the next PR.
 }
