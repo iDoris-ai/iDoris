@@ -834,4 +834,108 @@ mod tests {
             .unwrap()
             .expect("load b should eventually succeed");
     }
+
+    #[tokio::test]
+    async fn unload_after_load_then_chat_becomes_unavailable() {
+        let adapter = Arc::new(MockAdapter::new(catalog()));
+        let handle = Supervisor::spawn(adapter.clone(), SupervisorConfig::default())
+            .expect("spawn should succeed");
+        handle
+            .load("a", 4.0, on_demand_policy())
+            .await
+            .expect("load should succeed");
+        handle.unload("a").await.expect("unload should succeed");
+        assert_eq!(adapter.unload_call_count("a"), 1);
+        let err = handle
+            .chat(
+                ChatRequest {
+                    model: "a".to_string(),
+                    messages: vec![],
+                },
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("chat after unload must fail");
+        assert_eq!(err.reason_code(), "model_unavailable");
+    }
+
+    /// Negative contrast: unloading an id that was never loaded is
+    /// `model_not_found`, not silently accepted or confused with `Busy`.
+    #[tokio::test]
+    async fn unload_of_an_unknown_id_is_not_found() {
+        let adapter = Arc::new(MockAdapter::new(catalog()));
+        let handle =
+            Supervisor::spawn(adapter, SupervisorConfig::default()).expect("spawn should succeed");
+        let err = handle
+            .unload("a")
+            .await
+            .expect_err("unload before any load must fail");
+        assert_eq!(err.reason_code(), "model_not_found");
+    }
+
+    /// A second unload of an already-`Stopped` model is a no-op: no second
+    /// adapter call, no error.
+    #[tokio::test]
+    async fn a_second_unload_of_an_already_stopped_model_is_a_noop() {
+        let adapter = Arc::new(MockAdapter::new(catalog()));
+        let handle = Supervisor::spawn(adapter.clone(), SupervisorConfig::default())
+            .expect("spawn should succeed");
+        handle
+            .load("a", 4.0, on_demand_policy())
+            .await
+            .expect("load should succeed");
+        handle
+            .unload("a")
+            .await
+            .expect("first unload should succeed");
+        handle
+            .unload("a")
+            .await
+            .expect("second unload of an already-Stopped model must be a no-op");
+        assert_eq!(adapter.unload_call_count("a"), 1);
+    }
+
+    /// Singleflight: concurrent unloads of the same id merge into one
+    /// adapter call.
+    #[tokio::test(start_paused = true)]
+    async fn concurrent_unloads_of_the_same_id_merge_into_one_adapter_call() {
+        let adapter = Arc::new(MockAdapter::new(catalog()));
+        adapter.set_unload_delay("a", std::time::Duration::from_millis(50));
+        let handle = Supervisor::spawn(adapter.clone(), SupervisorConfig::default())
+            .expect("spawn should succeed");
+        handle
+            .load("a", 4.0, on_demand_policy())
+            .await
+            .expect("load should succeed");
+        let h2 = handle.clone();
+        let f1 = tokio::spawn(async move { handle.unload("a").await });
+        let f2 = tokio::spawn(async move { h2.unload("a").await });
+        f1.await.unwrap().expect("first unload should succeed");
+        f2.await.unwrap().expect("merged unload should succeed");
+        assert_eq!(adapter.unload_call_count("a"), 1);
+    }
+
+    /// Negative contrast: unloading a genuinely unknown id must stay
+    /// `model_not_found` even while an *unrelated* id is mid-load — that
+    /// fact is decidable without the mutex and must not be masked as
+    /// `Busy` (mirrors the fix in #85 for `load`'s already-Ready check).
+    #[tokio::test(start_paused = true)]
+    async fn unknown_id_unload_is_not_found_even_while_another_id_loads() {
+        let adapter = Arc::new(MockAdapter::new(two_model_catalog()));
+        adapter.set_load_delay("a", std::time::Duration::from_millis(200));
+        let handle =
+            Supervisor::spawn(adapter, SupervisorConfig::default()).expect("spawn should succeed");
+        let h2 = handle.clone();
+        let load_a = tokio::spawn(async move { h2.load("a", 4.0, on_demand_policy()).await });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let err = handle
+            .unload("nonexistent")
+            .await
+            .expect_err("unloading a genuinely unknown id must be not_found, not busy");
+        assert_eq!(err.reason_code(), "model_not_found");
+        load_a
+            .await
+            .unwrap()
+            .expect("load a should eventually succeed");
+    }
 }
