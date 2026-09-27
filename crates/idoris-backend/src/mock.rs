@@ -53,6 +53,7 @@ struct ModelScript {
     load_outcomes: VecDeque<LoadOutcome>,
     unload_delay: Duration,
     unload_outcomes: VecDeque<UnloadOutcome>,
+    chat_delay: Duration,
 }
 
 struct MockState {
@@ -142,6 +143,12 @@ impl MockAdapter {
     pub fn set_unload_script(&self, id: &str, outcomes: Vec<UnloadOutcome>) {
         if let Ok(mut state) = self.state.lock() {
             Self::script_mut(&mut state, id).unload_outcomes = outcomes.into();
+        }
+    }
+
+    pub fn set_chat_delay(&self, id: &str, delay: Duration) {
+        if let Ok(mut state) = self.state.lock() {
+            Self::script_mut(&mut state, id).chat_delay = delay;
         }
     }
 
@@ -313,8 +320,8 @@ impl RuntimeAdapter for MockAdapter {
         if cancel.is_cancelled() {
             return Err(BackendError::cancelled());
         }
-        {
-            let state = self.lock()?;
+        let delay = {
+            let mut state = self.lock()?;
             if !state.catalog.iter().any(|m| m.id == req.model) {
                 return Err(BackendError::model_not_found(&req.model));
             }
@@ -326,6 +333,10 @@ impl RuntimeAdapter for MockAdapter {
             if !state.loaded.iter().any(|loaded| loaded == &req.model) {
                 return Err(BackendError::model_unavailable(&req.model));
             }
+            Self::script_mut(&mut state, &req.model).chat_delay
+        };
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
         }
         let last_user_message = req
             .messages

@@ -68,6 +68,11 @@ struct ModelSlot {
     last_used_seq: u64,
     /// Policy last accepted; compared by exact equality to decide merge vs. a new op.
     policy: LoadPolicy,
+    /// Number of `chat` calls currently dispatched to this model — see
+    /// `ActorMsg::ChatDone`. Excludes it from eviction while nonzero, and
+    /// an explicit `unload` defers its actual adapter call until this
+    /// drains to 0 (see `handle_unload`).
+    inflight: u32,
 }
 
 enum Command {
@@ -110,7 +115,16 @@ enum OpOutcome {
 
 enum ActorMsg {
     Cmd(Command),
-    OpDone { id: String, outcome: OpOutcome },
+    OpDone {
+        id: String,
+        outcome: OpOutcome,
+    },
+    /// A dispatched `chat` call finished — the single-writer loop
+    /// decrements `ModelSlot::inflight` here, never the spawned `chat`
+    /// task itself (which only touches the adapter, not `models`).
+    ChatDone {
+        model: String,
+    },
 }
 
 enum ActiveKind {
@@ -120,6 +134,11 @@ enum ActiveKind {
     },
     Unload {
         waiters: Vec<LoadReply>,
+        /// `false` while draining: the id had in-flight `chat` calls when
+        /// `unload` was requested, so the actual adapter call is deferred
+        /// (state is already `Stopping`, blocking *new* chats) until
+        /// `ActorMsg::ChatDone` observes `inflight` reach 0 and flips this.
+        started: bool,
     },
 }
 
@@ -415,6 +434,7 @@ fn build_snapshot(models: &HashMap<String, ModelSlot>, budget_gb: f64, exclude: 
                 idoris_contracts::load_policy::Keepalive::Pinned { pinned: true }
             ),
             last_used_seq: slot.last_used_seq,
+            inflight: slot.inflight,
         })
         .collect();
     Snapshot {
@@ -547,6 +567,14 @@ fn handle_load(
     }
 
     let last_used_seq = models.get(&id).map_or(0, |s| s.last_used_seq);
+    // Carried forward, not reset to 0: a policy-changing reload of a
+    // currently-Ready model with chats still in flight against its
+    // previous instance must not let `ChatDone` underflow the fresh
+    // slot's counter once those in-flight calls finish (see
+    // `ActorMsg::ChatDone`'s `saturating_sub`, the other half of this
+    // safety net). Blocking such a reload until drained is a further
+    // improvement left for later — not required to avoid the underflow.
+    let inflight = models.get(&id).map_or(0, |s| s.inflight);
     models.insert(
         id.clone(),
         ModelSlot {
@@ -554,6 +582,7 @@ fn handle_load(
             state: ModelState::Launching,
             last_used_seq,
             policy,
+            inflight,
         },
     );
     *active_op = Some(ActiveOp {
@@ -609,7 +638,7 @@ fn handle_unload(
         && active.id == id
     {
         match &mut active.kind {
-            ActiveKind::Unload { waiters } => waiters.push(reply),
+            ActiveKind::Unload { waiters, .. } => waiters.push(reply),
             ActiveKind::Load { .. } => {
                 let _ = reply.send(Err(BackendError::busy()));
             }
@@ -634,14 +663,23 @@ fn handle_unload(
         let _ = reply.send(Err(BackendError::busy()));
         return;
     }
+    // Setting `Stopping` here already blocks *new* chats (the `Chat`
+    // handler's `slot.state != Ready` check) — but any chats already
+    // dispatched must be allowed to finish before the adapter is actually
+    // told to unload. If any are in flight, defer `start_unload` to
+    // `ActorMsg::ChatDone`, which will call it once `inflight` reaches 0.
     set_state_or_panic(models, &id, ModelState::Stopping);
+    let inflight = models.get(&id).map_or(0, |s| s.inflight);
     *active_op = Some(ActiveOp {
         id: id.clone(),
         kind: ActiveKind::Unload {
             waiters: vec![reply],
+            started: inflight == 0,
         },
     });
-    start_unload(id, env);
+    if inflight == 0 {
+        start_unload(id, env);
+    }
 }
 
 async fn run_actor(
@@ -716,15 +754,18 @@ async fn run_actor(
                     next_seq += 1;
                     if let Some(slot) = models.get_mut(&req.model) {
                         slot.last_used_seq = next_seq;
+                        slot.inflight += 1;
                     }
                     let adapter = adapter.clone();
                     let timeout = config.adapter_call_timeout;
+                    let self_tx = self_tx.clone();
                     tokio::spawn(async move {
                         let _permit = permit;
                         let model = req.model.clone();
                         let _ = reply.send(
                             with_adapter_timeout(adapter.chat(req, cancel), timeout, &model).await,
                         );
+                        let _ = self_tx.send(ActorMsg::ChatDone { model }).await;
                     });
                 }
             },
@@ -782,13 +823,39 @@ async fn run_actor(
                 }
                 let waiters = match active_op.take() {
                     Some(ActiveOp {
-                        kind: ActiveKind::Load { waiters, .. } | ActiveKind::Unload { waiters },
+                        kind: ActiveKind::Load { waiters, .. } | ActiveKind::Unload { waiters, .. },
                         ..
                     }) => waiters,
                     None => panic!("Supervisor invariant violated: OpDone with no active op"),
                 };
                 for waiter in waiters {
                     let _ = waiter.send(result.clone());
+                }
+            }
+
+            ActorMsg::ChatDone { model } => {
+                // Ledger entries are only ever transitioned, never removed
+                // (the same invariant `set_state_or_panic` enforces for
+                // `state`), so a `ChatDone` for an id `chat` was actually
+                // dispatched to must find an entry — a missing one means
+                // that discipline was violated somewhere.
+                let inflight = match models.get_mut(&model) {
+                    Some(slot) => {
+                        slot.inflight = slot.inflight.saturating_sub(1);
+                        slot.inflight
+                    }
+                    None => {
+                        panic!("Supervisor invariant violated: ledger has no entry for {model:?}")
+                    }
+                };
+                if inflight == 0
+                    && let Some(active) = active_op.as_mut()
+                    && active.id == model
+                    && let ActiveKind::Unload { started, .. } = &mut active.kind
+                    && !*started
+                {
+                    *started = true;
+                    start_unload(model, &env);
                 }
             }
         }
@@ -1373,5 +1440,98 @@ mod tests {
         // — a stuck `active_op` would make this also fail with `Busy`.
         let models = handle.list().await.expect("list must still work");
         assert_eq!(models, catalog());
+    }
+
+    /// C2: a model with an in-flight `chat` is never chosen as an
+    /// eviction victim, even when it would otherwise be the LRU pick —
+    /// unloading it mid-`chat` would abort real, in-progress work.
+    #[tokio::test(start_paused = true)]
+    async fn inflight_chats_exclude_a_model_from_eviction() {
+        let adapter = Arc::new(MockAdapter::new(evictable_catalog()));
+        let handle = Supervisor::spawn(adapter.clone(), tight_budget_config())
+            .expect("spawn should succeed");
+        handle
+            .load("a", 20.0, on_demand_policy())
+            .await
+            .expect("load a should succeed");
+        adapter.set_chat_delay("a", std::time::Duration::from_millis(200));
+        let h2 = handle.clone();
+        let chat_a = tokio::spawn(async move {
+            h2.chat(
+                ChatRequest {
+                    model: "a".to_string(),
+                    messages: vec![],
+                },
+                CancellationToken::new(),
+            )
+            .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let err = handle
+            .load("b", 20.0, on_demand_policy())
+            .await
+            .expect_err("a has an in-flight chat: nothing evictable, b cannot be admitted");
+        assert_eq!(err.reason_code(), "eviction_impossible");
+        assert_eq!(adapter.unload_call_count("a"), 0);
+        chat_a
+            .await
+            .unwrap()
+            .expect("the in-flight chat should still complete normally");
+    }
+
+    /// C2 + M4: an explicit `unload` defers the actual adapter call until
+    /// in-flight `chat`s drain to 0, but immediately blocks *new* ones
+    /// (`Stopping` -> `model_unavailable`) — the drain lesson also covers
+    /// the eviction case, since both go through the same `Stopping` state.
+    #[tokio::test(start_paused = true)]
+    async fn unload_drains_inflight_chats_before_calling_the_adapter() {
+        let adapter = Arc::new(MockAdapter::new(catalog()));
+        let handle = Supervisor::spawn(adapter.clone(), SupervisorConfig::default())
+            .expect("spawn should succeed");
+        handle
+            .load("a", 4.0, on_demand_policy())
+            .await
+            .expect("load a should succeed");
+        adapter.set_chat_delay("a", std::time::Duration::from_millis(200));
+        let h2 = handle.clone();
+        let chat_a = tokio::spawn(async move {
+            h2.chat(
+                ChatRequest {
+                    model: "a".to_string(),
+                    messages: vec![],
+                },
+                CancellationToken::new(),
+            )
+            .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let h3 = handle.clone();
+        let unload_a = tokio::spawn(async move { h3.unload("a").await });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert_eq!(
+            adapter.unload_call_count("a"),
+            0,
+            "unload must not call the adapter while a chat is still in flight"
+        );
+        let err = handle
+            .chat(
+                ChatRequest {
+                    model: "a".to_string(),
+                    messages: vec![],
+                },
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("a new chat during the drain (Stopping) must be rejected");
+        assert_eq!(err.reason_code(), "model_unavailable");
+        chat_a
+            .await
+            .unwrap()
+            .expect("the original in-flight chat should still complete");
+        unload_a
+            .await
+            .unwrap()
+            .expect("unload should complete once the drain finishes");
+        assert_eq!(adapter.unload_call_count("a"), 1);
     }
 }

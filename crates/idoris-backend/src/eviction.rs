@@ -44,6 +44,11 @@ pub struct ModelEntry {
     /// eviction regardless of how stale its `last_used_seq` is.
     pub pinned: bool,
     pub last_used_seq: u64,
+    /// Number of `chat` calls currently dispatched to this model. Nonzero
+    /// means real, in-progress work would be aborted mid-flight — never a
+    /// candidate for eviction, same as `pinned`, regardless of how stale
+    /// `last_used_seq` is.
+    pub inflight: u32,
 }
 
 /// The ledger `plan_eviction` reasons over. `budget_gb` is the configured
@@ -69,7 +74,8 @@ pub enum EvictionPlan {
     /// Enough budget is free; load without evicting anything.
     NotNeeded,
     /// Evict exactly these ids, in this order (oldest-used first), then
-    /// load. Every id here is `Ready` and unpinned at snapshot time.
+    /// load. Every id here is `Ready`, unpinned, and had no in-flight
+    /// `chat` calls at snapshot time.
     Evict(Vec<String>),
 }
 
@@ -217,7 +223,9 @@ pub fn plan_eviction(state: &Snapshot, need: ModelReq) -> Result<EvictionPlan, P
         // block reaching a candidate that actually matters. Excluding them
         // here, not just relying on them naturally sorting last, keeps the
         // loop below from ever choosing a no-op eviction.
-        .filter(|m| m.state == ModelState::Ready && !m.pinned && m.memory_gb > 0.0)
+        .filter(|m| {
+            m.state == ModelState::Ready && !m.pinned && m.memory_gb > 0.0 && m.inflight == 0
+        })
         .collect();
     // LRU: evict the least-recently-used first. `last_used_seq` is a
     // Supervisor-maintained monotonic counter, never wall-clock time (see
@@ -263,6 +271,7 @@ mod tests {
             state,
             pinned,
             last_used_seq: seq,
+            inflight: 0,
         }
     }
 
