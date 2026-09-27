@@ -18,7 +18,7 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 use uuid::Uuid;
 
 use super::clock::{Clock, SystemClock};
-use super::error::BudgetError;
+use super::error::{BudgetError, checked_add_i64, checked_sub_i64};
 use super::period::billing_period_key;
 use super::scope::BudgetScope;
 
@@ -335,7 +335,10 @@ impl BudgetLedger {
         let reserved = active_reserved_for(&tx, scope, &period, now_ms)?;
         // Pure read; roll back explicitly rather than relying on drop.
         tx.rollback()?;
-        Ok(config.limit_minor - spent - reserved)
+        Ok(checked_sub_i64(
+            config.limit_minor,
+            checked_add_i64(spent, reserved),
+        ))
     }
 
     /// As `balance`, but for the tenant-level total (H2).
@@ -352,7 +355,10 @@ impl BudgetLedger {
         let spent = tenant_spent_for(&tx, tenant_id, &period)?;
         let reserved = tenant_active_reserved_for(&tx, tenant_id, &period, now_ms)?;
         tx.rollback()?;
-        Ok(config.limit_minor - spent - reserved)
+        Ok(checked_sub_i64(
+            config.limit_minor,
+            checked_add_i64(spent, reserved),
+        ))
     }
 
     /// Atomically check-and-deduct: inside one `BEGIN IMMEDIATE` transaction,
@@ -394,9 +400,9 @@ impl BudgetLedger {
 
         let sub_spent = spent_for(&tx, scope, &period)?;
         let sub_reserved = active_reserved_for(&tx, scope, &period, now_ms)?;
-        let sub_committed = sub_spent + sub_reserved;
+        let sub_committed = checked_add_i64(sub_spent, sub_reserved);
 
-        if estimated_cost_minor > config.limit_minor - sub_committed {
+        if estimated_cost_minor > checked_sub_i64(config.limit_minor, sub_committed) {
             tx.commit()?; // nothing written yet, but keep the sweep above.
             return Err(BudgetError::exceeded(
                 scope.tenant_id.clone(),
@@ -419,8 +425,9 @@ impl BudgetLedger {
                 let tenant_spent = tenant_spent_for(&tx, &scope.tenant_id, &tenant_period)?;
                 let tenant_reserved =
                     tenant_active_reserved_for(&tx, &scope.tenant_id, &tenant_period, now_ms)?;
-                let tenant_committed = tenant_spent + tenant_reserved;
-                if estimated_cost_minor > tenant_cfg.limit_minor - tenant_committed {
+                let tenant_committed = checked_add_i64(tenant_spent, tenant_reserved);
+                if estimated_cost_minor > checked_sub_i64(tenant_cfg.limit_minor, tenant_committed)
+                {
                     tx.commit()?;
                     return Err(BudgetError::exceeded(
                         scope.tenant_id.clone(),
@@ -554,7 +561,7 @@ impl BudgetLedger {
         // M1: track overage independently of the receipt returned below —
         // `settle` can return `Err(OverageTooLarge)` further down, and the
         // charge must still be recorded/auditable even on that path.
-        let overage_minor = (actual_cost_minor - row.reserved_minor).max(0);
+        let overage_minor = checked_sub_i64(actual_cost_minor, row.reserved_minor).max(0);
         // i128 to avoid the multiply overflowing i64 for a maliciously (or
         // just very wrongly) large `actual_cost_minor`.
         let too_large = (actual_cost_minor as i128) > (row.reserved_minor as i128) * 4;
@@ -628,7 +635,7 @@ impl BudgetLedger {
             });
         }
 
-        let refunded_minor = (row.reserved_minor - actual_cost_minor).max(0);
+        let refunded_minor = checked_sub_i64(row.reserved_minor, actual_cost_minor).max(0);
         Ok(SettleReceipt {
             reserved_minor: row.reserved_minor,
             actual_cost_minor,
