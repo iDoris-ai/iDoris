@@ -866,6 +866,8 @@ dependencies = [
  "async-trait",
  "futures-core",
  "idoris-backend",
+ "idoris-contracts",
+ "percent-encoding",
  "reqwest",
  "serde_json",
  "thiserror",

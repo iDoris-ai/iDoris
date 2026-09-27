@@ -12,6 +12,7 @@ workspace = true
 
 [dependencies]
 idoris-backend = { workspace = true }
+idoris-contracts = { workspace = true }
 thiserror = { workspace = true }
 async-trait = { workspace = true }
 # Only the `Stream` trait — not the full `futures` umbrella crate — to keep
@@ -29,6 +30,10 @@ serde_json = { workspace = true }
 # `charset`/`http2`/`system-proxy` (reqwest's own defaults) are dropped:
 # oMLX is a local HTTP/1.1 process on 127.0.0.1, none of them apply.
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+# Model ids go into URL path segments (`/v1/models/{id}/load`); encoding
+# them (like the TS reference's `encodeURIComponent`) keeps an id with a
+# `/` or space from being misread as a path separator or breaking the URL.
+percent-encoding = "2"
 
 [dev-dependencies]
 # `io-util` (for `AsyncWriteExt`) is test-only: the raw-TCP regression test

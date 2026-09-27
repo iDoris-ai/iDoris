@@ -74,10 +74,6 @@ pub(super) async fn get_json(
 /// A send()-only timeout is correct here (unlike [`send_and_parse`]):
 /// nothing reads the body afterward, so there is no unbounded read left
 /// unguarded once `send()` resolves.
-///
-/// `#[allow(dead_code)]`: `OmlxAdapter::load`/`unload` (follow-up PR) call
-/// this for real; exercised directly by this module's own tests until then.
-#[allow(dead_code)]
 pub(super) async fn post_empty(
     client: &reqwest::Client,
     base_url: &str,
@@ -92,7 +88,6 @@ pub(super) async fn post_empty(
 
 /// `PUT path` with a JSON body, discarding the response body. See
 /// [`post_empty`]'s doc on why a send()-only timeout is correct here too.
-#[allow(dead_code)]
 pub(super) async fn put_json(
     client: &reqwest::Client,
     base_url: &str,
@@ -106,7 +101,6 @@ pub(super) async fn put_json(
     send_and_discard("PUT", path, req, call_timeout).await
 }
 
-#[allow(dead_code)]
 async fn send_and_discard(
     method: &'static str,
     path: &str,
