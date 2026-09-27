@@ -18,11 +18,32 @@ workspace = true
 # (see `.github/workflows/ci.yml`), so this is opt-in at the Cargo level,
 # not skippable as a CI gate (M4).
 test-bins = []
+# Opus Tier-2 re-review B-8: a deterministic (no-sleep) way to prove the
+# existing concurrency tests would actually catch a "split the atomic
+# check-and-deduct transaction" regression, instead of relying on manually
+# editing `reserve()` and an artificial sleep to widen the race window by
+# hand each time. Compiles a barrier-synchronized hook into `reserve()`
+# that's a no-op unless a test explicitly arms it — see
+# `budget::ledger::test_hooks` and `tests/budget_concurrency.rs`.
+mutation-test-hooks = []
 
 [[bin]]
 name = "budget_mp_worker"
 path = "src/bin/budget_mp_worker.rs"
 required-features = ["test-bins"]
+
+# Isolated in its own test binary/process (Opus Tier-2 re-review B-8): the
+# mutation-testing hook is process-global `OnceLock` state that, once armed,
+# would corrupt every *other* concurrent `reserve()` call in the same test
+# process — including the other concurrency tests in
+# `tests/budget_concurrency.rs`, which `cargo test` runs as separate threads
+# within one process by default. `required-features` also means this file
+# doesn't even attempt to compile without the feature (it references the
+# feature-gated `test_hooks` module unconditionally).
+[[test]]
+name = "budget_mutation_hooks"
+path = "tests/budget_mutation_hooks.rs"
+required-features = ["mutation-test-hooks"]
 
 [dependencies]
 idoris-contracts = { workspace = true }

@@ -341,3 +341,158 @@ fn busy_timeout_surfaces_as_busy_not_a_generic_storage_error() {
         "expected Busy, got {result:?}"
     );
 }
+
+/// B-8: the same deterministic busy-timeout proof as above, but against
+/// `reserve` specifically (the method the split-transaction concern is
+/// actually about) rather than `configure`.
+#[test]
+fn reserve_returns_busy_under_short_busy_timeout_when_lock_is_held() {
+    let path = temp_db_path("busy-timeout-reserve");
+    let scope = BudgetScope::new("acme-co", "key-busy-reserve", "openai", "gpt-5");
+    let ledger = BudgetLedger::open_with_busy_timeout(
+        &path,
+        Arc::new(idoris_tenancy::budget::SystemClock),
+        idoris_tenancy::budget::DEFAULT_RESERVATION_TTL_MS,
+        Duration::from_millis(50),
+    )
+    .expect("open with short busy_timeout");
+    ledger.configure(&scope, 1_000, "UTC").expect("configure");
+
+    let blocker = rusqlite::Connection::open(&path).expect("open raw blocker connection");
+    blocker
+        .execute_batch("BEGIN IMMEDIATE;")
+        .expect("hold a write transaction open");
+
+    let result = ledger.reserve(&scope, Price::Known(100));
+
+    let _ = blocker.execute_batch("ROLLBACK;");
+    drop(blocker);
+
+    assert!(
+        matches!(result, Err(BudgetError::Busy)),
+        "expected Busy, got {result:?}"
+    );
+}
+
+/// B-8: the tenant-level limit must be enforced atomically across *both*
+/// multiple sub-scopes *and* multiple OS processes at once — not just one
+/// sub-scope (the existing multi-process test above) or one process
+/// (`tenant_level_limit_aggregates_across_sub_scopes` in `ledger.rs`'s own
+/// unit tests). `SUB_SCOPES` different `key_id`s, each individually
+/// configured with a limit far above what the shared tenant limit actually
+/// allows, so only the tenant-level check is ever the binding constraint.
+#[cfg(feature = "test-bins")]
+#[test]
+fn tenant_limit_is_enforced_across_multiple_sub_scopes_and_processes() {
+    const SUB_SCOPES: i64 = 4;
+
+    let path = temp_db_path("tenant-multi-subscope-processes");
+    let scopes: Vec<BudgetScope> = (0..SUB_SCOPES)
+        .map(|i| BudgetScope::new("acme-co", format!("key-{i}"), "openai", "gpt-5"))
+        .collect();
+    {
+        let ledger = BudgetLedger::open(&path).expect("open");
+        for scope in &scopes {
+            // Deliberately far above the tenant limit below, so a sub-scope
+            // never independently blocks a reserve on its own.
+            ledger
+                .configure(scope, 10_000, "UTC")
+                .expect("configure sub-scope");
+        }
+        ledger
+            .configure_tenant(
+                "acme-co",
+                LIMIT_MINOR,
+                "UTC",
+                idoris_tenancy::budget::SpendGate::PaidOnly,
+            )
+            .expect("configure_tenant");
+    }
+
+    let go_file = temp_db_path("tenant-multi-subscope-go");
+    let worker = env!("CARGO_BIN_EXE_budget_mp_worker");
+
+    let mut children: Vec<_> = (0..THREADS)
+        .map(|i| {
+            let scope = &scopes[(i % SUB_SCOPES) as usize];
+            let args = [
+                path.0.to_str().expect("utf8 path").to_string(),
+                scope.tenant_id.clone(),
+                scope.key_id.clone(),
+                scope.provider_id.clone(),
+                scope.model_id.clone(),
+                PER_RESERVE_MINOR.to_string(),
+                go_file.0.to_str().expect("utf8 go path").to_string(),
+            ];
+            Command::new(worker)
+                .args(&args)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("spawn worker")
+        })
+        .collect();
+
+    std::fs::write(&go_file, b"go").expect("write go file");
+
+    struct KillRemainingOnDrop<'a>(&'a mut Vec<std::process::Child>);
+    impl Drop for KillRemainingOnDrop<'_> {
+        fn drop(&mut self) {
+            if !std::thread::panicking() {
+                return;
+            }
+            for child in self.0.iter_mut() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+    let mut succeeded: i64 = 0;
+    let mut rejected: i64 = 0;
+    let per_child_deadline = Duration::from_secs(15);
+    while let Some(mut child) = children.pop() {
+        let _guard = KillRemainingOnDrop(&mut children);
+        let start = Instant::now();
+        let status = loop {
+            match child.try_wait().expect("try_wait") {
+                Some(status) => break status,
+                None if start.elapsed() >= per_child_deadline => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("worker process timed out after {per_child_deadline:?} and was killed");
+                }
+                None => thread::sleep(Duration::from_millis(5)),
+            }
+        };
+
+        let mut stdout = String::new();
+        if let Some(mut out) = child.stdout.take() {
+            use std::io::Read as _;
+            let _ = out.read_to_string(&mut stdout);
+        }
+        let mut stderr = String::new();
+        if let Some(mut err) = child.stderr.take() {
+            use std::io::Read as _;
+            let _ = err.read_to_string(&mut stderr);
+        }
+
+        assert!(
+            status.success(),
+            "worker exited non-zero ({status}): {stderr}"
+        );
+        match stdout.trim() {
+            s if s.starts_with("RESERVED") => succeeded += 1,
+            "EXCEEDED" => rejected += 1,
+            other => panic!("unexpected worker stdout: {other:?} (stderr: {stderr})"),
+        }
+    }
+
+    assert_eq!(
+        succeeded, EXPECTED_SUCCESSES,
+        "expected exactly {EXPECTED_SUCCESSES} successes shared across {SUB_SCOPES} sub-scopes"
+    );
+    assert_eq!(
+        rejected, EXPECTED_REJECTIONS,
+        "expected exactly {EXPECTED_REJECTIONS} tenant-level rejections"
+    );
+}
