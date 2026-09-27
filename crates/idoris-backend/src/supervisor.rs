@@ -1064,4 +1064,135 @@ mod tests {
             .unwrap()
             .expect("load a should eventually succeed");
     }
+
+    fn evictable_catalog() -> Vec<ModelInfo> {
+        vec![
+            ModelInfo {
+                id: "a".to_string(),
+                memory_gb: 20.0,
+            },
+            ModelInfo {
+                id: "b".to_string(),
+                memory_gb: 20.0,
+            },
+        ]
+    }
+
+    fn tight_budget_config() -> SupervisorConfig {
+        SupervisorConfig {
+            budget_gb: 24.0,
+            ..SupervisorConfig::default()
+        }
+    }
+
+    /// LRU eviction frees exactly enough capacity to admit the new model.
+    #[tokio::test]
+    async fn eviction_frees_capacity_for_the_new_model() {
+        let adapter = Arc::new(MockAdapter::new(evictable_catalog()));
+        let handle = Supervisor::spawn(adapter.clone(), tight_budget_config())
+            .expect("spawn should succeed");
+        handle
+            .load("a", 20.0, on_demand_policy())
+            .await
+            .expect("load a should succeed");
+        handle
+            .load("b", 20.0, on_demand_policy())
+            .await
+            .expect("load b should succeed after evicting a");
+        assert_eq!(adapter.unload_call_count("a"), 1);
+        let status = handle.status().await.expect("status should succeed");
+        assert_eq!(status.loaded, vec!["b".to_string()]);
+    }
+
+    /// Negative contrast: a pinned model is never chosen as a victim — the
+    /// load fails outright instead of silently evicting it anyway.
+    #[tokio::test]
+    async fn pinned_model_is_not_evicted_load_fails_instead() {
+        let adapter = Arc::new(MockAdapter::new(evictable_catalog()));
+        let handle = Supervisor::spawn(adapter.clone(), tight_budget_config())
+            .expect("spawn should succeed");
+        handle
+            .load("a", 20.0, resident_policy())
+            .await
+            .expect("pinned load of a should succeed");
+        let err = handle
+            .load("b", 20.0, on_demand_policy())
+            .await
+            .expect_err("b cannot be admitted: a is pinned, nothing evictable");
+        assert_eq!(err.reason_code(), "eviction_impossible");
+        assert_eq!(adapter.unload_call_count("a"), 0);
+    }
+
+    /// A request that would not fit even after evicting everything
+    /// evictable is rejected before ever calling the adapter.
+    #[tokio::test]
+    async fn a_request_too_big_for_the_budget_is_rejected_without_calling_the_adapter() {
+        let adapter = Arc::new(MockAdapter::new(evictable_catalog()));
+        let handle = Supervisor::spawn(adapter.clone(), tight_budget_config())
+            .expect("spawn should succeed");
+        let err = handle
+            .load("a", 100.0, on_demand_policy())
+            .await
+            .expect_err("100 GiB can never fit a 24 GiB budget");
+        assert_eq!(err.reason_code(), "eviction_impossible");
+        assert_eq!(adapter.load_call_count("a"), 0);
+    }
+
+    /// If a chosen victim's `unload` itself fails, the whole load fails
+    /// with a distinct `eviction_failed` reason code (not the planning-time
+    /// `eviction_impossible`), the new model is never admitted, and the
+    /// failure does not block unrelated follow-up operations.
+    #[tokio::test]
+    async fn a_failed_eviction_reports_eviction_failed_and_admits_nothing() {
+        let adapter = Arc::new(MockAdapter::new(evictable_catalog()));
+        let handle = Supervisor::spawn(adapter.clone(), tight_budget_config())
+            .expect("spawn should succeed");
+        handle
+            .load("a", 20.0, on_demand_policy())
+            .await
+            .expect("load a should succeed");
+        adapter.set_unload_script("a", vec![crate::mock::UnloadOutcome::Fail]);
+        let err = handle
+            .load("b", 20.0, on_demand_policy())
+            .await
+            .expect_err("b must not be admitted when evicting a fails");
+        assert_eq!(err.reason_code(), "eviction_failed");
+        let status = handle.status().await.expect("status should succeed");
+        assert!(!status.loaded.contains(&"b".to_string()));
+        // The failure must not leave the Supervisor stuck: a's ledger entry
+        // was resolved (not left dangling), so a plain follow-up unload
+        // (this time succeeding, since the one-shot script is spent) works.
+        handle
+            .unload("a")
+            .await
+            .expect("a follow-up unload of a must still work after the failed eviction");
+    }
+
+    /// Nothing interleaves with an in-flight load that is evicting a
+    /// victim: a concurrent request touching the victim while it's mid
+    /// -eviction fails fast with `Busy`, the same as any other unrelated
+    /// id would.
+    #[tokio::test(start_paused = true)]
+    async fn nothing_interleaves_with_an_in_flight_eviction() {
+        let adapter = Arc::new(MockAdapter::new(evictable_catalog()));
+        adapter.set_load_delay("b", std::time::Duration::from_millis(200));
+        let handle = Supervisor::spawn(adapter.clone(), tight_budget_config())
+            .expect("spawn should succeed");
+        handle
+            .load("a", 20.0, on_demand_policy())
+            .await
+            .expect("load a should succeed");
+        let h2 = handle.clone();
+        let load_b = tokio::spawn(async move { h2.load("b", 20.0, on_demand_policy()).await });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let err = handle
+            .unload("a")
+            .await
+            .expect_err("a is mid-eviction (Stopping): touching it must not interleave");
+        assert_eq!(err.reason_code(), "supervisor_busy");
+        load_b
+            .await
+            .unwrap()
+            .expect("load b should eventually succeed");
+    }
 }
