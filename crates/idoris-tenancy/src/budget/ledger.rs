@@ -303,6 +303,158 @@ fn sweep_expired_scope(
     Ok(n)
 }
 
+impl BudgetLedger {
+    /// Finalize a reservation with the *actual* cost: adds `actual_cost_minor`
+    /// to the scope's settled spend for the reservation's period and marks it
+    /// `settled`. Only call this for calls that actually completed — a
+    /// failed or fallback call must call [`release`](Self::release) instead
+    /// (LoopX's lesson: "may I call" and "charge me" are separate, so a
+    /// caller can never accidentally charge for a call it didn't make).
+    pub fn settle(
+        &self,
+        reservation_id: &ReservationId,
+        actual_cost_minor: i64,
+    ) -> Result<SettleReceipt, BudgetError> {
+        if actual_cost_minor < 0 {
+            return Err(BudgetError::InvalidActualCost { actual_cost_minor });
+        }
+        let now_ms = self.clock.now_ms();
+        let mut conn = self.lock();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        let row = find_reservation(&tx, reservation_id)?;
+
+        if row.status != "active" {
+            return Err(BudgetError::ReservationNotActive {
+                reservation_id: reservation_id.0.clone(),
+                status: row.status,
+            });
+        }
+        if row.expires_at_ms <= now_ms {
+            tx.execute(
+                "UPDATE reservations SET status='expired' WHERE id=?1",
+                [&reservation_id.0],
+            )?;
+            tx.commit()?;
+            return Err(BudgetError::ReservationNotActive {
+                reservation_id: reservation_id.0.clone(),
+                status: "expired".to_string(),
+            });
+        }
+
+        tx.execute(
+            "INSERT INTO budget_periods (tenant_id, key_id, provider_id, model_id, period, spent_minor) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+             ON CONFLICT (tenant_id, key_id, provider_id, model_id, period) \
+             DO UPDATE SET spent_minor = spent_minor + excluded.spent_minor",
+            rusqlite::params![
+                row.tenant_id,
+                row.key_id,
+                row.provider_id,
+                row.model_id,
+                row.period,
+                actual_cost_minor
+            ],
+        )?;
+        tx.execute(
+            "UPDATE reservations SET status='settled', actual_cost_minor=?2 WHERE id=?1",
+            rusqlite::params![reservation_id.0, actual_cost_minor],
+        )?;
+        tx.commit()?;
+
+        let refunded_minor = (row.reserved_minor - actual_cost_minor).max(0);
+        Ok(SettleReceipt {
+            reserved_minor: row.reserved_minor,
+            actual_cost_minor,
+            refunded_minor,
+        })
+    }
+
+    /// Fully release a reservation without charging anything — for calls
+    /// that failed or that fell back to a different (separately reserved)
+    /// candidate. Idempotent when the reservation is already `released`;
+    /// erroring on `settled`/`expired` prevents un-settling a completed
+    /// charge.
+    pub fn release(&self, reservation_id: &ReservationId) -> Result<(), BudgetError> {
+        let now_ms = self.clock.now_ms();
+        let mut conn = self.lock();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        let row = find_reservation(&tx, reservation_id)?;
+
+        match row.status.as_str() {
+            "released" => {
+                tx.commit()?;
+                Ok(())
+            }
+            "active" if row.expires_at_ms > now_ms => {
+                tx.execute(
+                    "UPDATE reservations SET status='released' WHERE id=?1",
+                    [&reservation_id.0],
+                )?;
+                tx.commit()?;
+                Ok(())
+            }
+            "active" => {
+                tx.execute(
+                    "UPDATE reservations SET status='expired' WHERE id=?1",
+                    [&reservation_id.0],
+                )?;
+                tx.commit()?;
+                Err(BudgetError::ReservationNotActive {
+                    reservation_id: reservation_id.0.clone(),
+                    status: "expired".to_string(),
+                })
+            }
+            other => Err(BudgetError::ReservationNotActive {
+                reservation_id: reservation_id.0.clone(),
+                status: other.to_string(),
+            }),
+        }
+    }
+}
+
+/// A reservation row looked up by id — named fields instead of a tuple so a
+/// column reorder in the `SELECT` can't silently swap two same-typed values
+/// (e.g. `tenant_id`/`key_id`) without the compiler noticing (Codex review).
+struct ReservationRow {
+    tenant_id: String,
+    key_id: String,
+    provider_id: String,
+    model_id: String,
+    period: String,
+    reserved_minor: i64,
+    status: String,
+    expires_at_ms: i64,
+}
+
+fn find_reservation(
+    conn: &Connection,
+    reservation_id: &ReservationId,
+) -> Result<ReservationRow, BudgetError> {
+    conn.query_row(
+        "SELECT tenant_id, key_id, provider_id, model_id, period, reserved_minor, status, expires_at_ms \
+         FROM reservations WHERE id = ?1",
+        [&reservation_id.0],
+        |r| {
+            Ok(ReservationRow {
+                tenant_id: r.get(0)?,
+                key_id: r.get(1)?,
+                provider_id: r.get(2)?,
+                model_id: r.get(3)?,
+                period: r.get(4)?,
+                reserved_minor: r.get(5)?,
+                status: r.get(6)?,
+                expires_at_ms: r.get(7)?,
+            })
+        },
+    )
+    .optional()?
+    .ok_or_else(|| BudgetError::ReservationNotFound {
+        reservation_id: reservation_id.0.clone(),
+    })
+}
+
 fn run_migrations(conn: &mut Connection) -> Result<(), BudgetError> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     tx.execute_batch(
