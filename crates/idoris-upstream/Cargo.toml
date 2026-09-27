@@ -30,6 +30,8 @@ serde_json = { workspace = true }
 # `charset`/`http2`/`system-proxy` (reqwest's own defaults) are dropped:
 # oMLX is a local HTTP/1.1 process on 127.0.0.1, none of them apply.
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+# `RuntimeAdapter::chat`'s `CancellationToken` parameter.
+tokio-util = { workspace = true }
 # Model ids go into URL path segments (`/v1/models/{id}/load`); encoding
 # them (like the TS reference's `encodeURIComponent`) keeps an id with a
 # `/` or space from being misread as a path separator or breaking the URL.

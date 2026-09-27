@@ -1,6 +1,6 @@
 //! Low-level HTTP plumbing for the oMLX adapter: every request goes through
-//! [`get_json`]/[`post_empty`]/[`put_json`], each of which applies a
-//! per-call timeout and turns a failure into a [`BackendError`] that never
+//! [`get_json`]/[`post_empty`]/[`put_json`]/[`post_and_parse`], each of
+//! which applies a per-call timeout and turns a failure into a [`BackendError`] that never
 //! carries the response body or API key — every error here is built from
 //! method/path/status only, never by formatting the response body or the
 //! underlying `reqwest::Error` (mirroring `RuntimeAdapter::probe_ready`'s
@@ -99,6 +99,23 @@ pub(super) async fn put_json(
     let url = format!("{base_url}{path}");
     let req = auth_header(client.put(&url), api_key).json(body);
     send_and_discard("PUT", path, req, call_timeout).await
+}
+
+/// `POST path` with a JSON body, parsed as JSON — used for `/v1/chat/
+/// completions`. Unlike [`post_empty`]/[`put_json`], the response body
+/// *is* read, so this goes through [`send_and_parse`] (full-round-trip
+/// timeout), not `send_and_discard`.
+pub(super) async fn post_and_parse(
+    client: &reqwest::Client,
+    base_url: &str,
+    path: &str,
+    api_key: Option<&str>,
+    call_timeout: Duration,
+    body: &serde_json::Value,
+) -> Result<serde_json::Value, BackendError> {
+    let url = format!("{base_url}{path}");
+    let req = auth_header(client.post(&url), api_key).json(body);
+    send_and_parse("POST", path, req, call_timeout).await
 }
 
 async fn send_and_discard(
