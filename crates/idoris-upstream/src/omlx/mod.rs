@@ -239,6 +239,54 @@ impl OmlxAdapter {
             Ok(())
         }
     }
+
+    /// `RuntimeAdapter::probe_ready` support: polls `GET
+    /// /v1/models/status` for `id`'s `loaded` field.
+    ///
+    /// Deliberately **lenient**, the opposite of
+    /// [`pin::parse_model_state`]: that function is fail-closed because by
+    /// the time it's called the caller already believes the model is
+    /// loaded, so an unparseable response is itself a problem. Here, a
+    /// `Loading` model may legitimately not appear in the list yet, or the
+    /// call may hit a transient blip — per `RuntimeAdapter::probe_ready`'s
+    /// contract, `Ok(false)` ("not ready yet, keep polling") is correct for
+    /// all of those, and only a condition polling again truly cannot fix
+    /// should be `Err`.
+    ///
+    /// **Known limitation (not silently accepted):** this adapter cannot
+    /// currently distinguish a terminal failure (auth rejected, id
+    /// genuinely unknown to oMLX) from a transient one using only the
+    /// boolean success/failure [`Self::get`] exposes — doing so needs a
+    /// structured status code, which would mean widening `http`'s
+    /// boundary. Until then, every failure here is `Ok(false)`; a
+    /// misconfigured API key surfaces as `ProbeTimedOut` once
+    /// `probe_max_attempts` is exhausted, rather than failing immediately.
+    /// This is the documented safer-wrong direction (see
+    /// `RuntimeAdapter::probe_ready`'s own doc: treating a transient blip
+    /// as `Err` aborts a load that was actually still in progress, which
+    /// is worse than one extra retry cycle).
+    pub async fn probe_ready(&self, id: &str) -> Result<bool, BackendError> {
+        match self.get("/v1/models/status").await {
+            Ok(raw) => Ok(is_ready(&raw, id)),
+            Err(_) => Ok(false),
+        }
+    }
+}
+
+/// `true` iff `raw`'s `models` array has an entry for `id` with
+/// `loaded: true`. Any other shape (missing/malformed `models`, no
+/// matching entry, `loaded` absent or not `true`) is `false`, not an
+/// error — see [`OmlxAdapter::probe_ready`]'s doc for why leniency is
+/// correct here specifically.
+fn is_ready(raw: &serde_json::Value, id: &str) -> bool {
+    raw.get("models")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+        .any(|m| {
+            m.get("id").and_then(|v| v.as_str()) == Some(id)
+                && m.get("loaded").and_then(|v| v.as_bool()) == Some(true)
+        })
 }
 
 #[cfg(test)]
@@ -496,5 +544,59 @@ mod tests {
             .unload("weird/id")
             .await
             .expect("a '/' in the id must be percent-encoded, not split the path");
+    }
+
+    #[tokio::test]
+    async fn probe_ready_is_false_while_still_loading() {
+        let server = MockServer::start().await;
+        let resp = ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "models": [{"id": "qwen3-8b", "loaded": false, "pinned": false}]
+        }));
+        mount_all(&server, vec![("GET", VERIFY_PATH, resp)]).await;
+        let adapter = adapter_for(&server).await;
+        assert!(
+            !adapter
+                .probe_ready("qwen3-8b")
+                .await
+                .expect("must not error")
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_ready_is_true_once_loaded() {
+        let server = MockServer::start().await;
+        let resp = ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "models": [{"id": "qwen3-8b", "loaded": true, "pinned": false}]
+        }));
+        mount_all(&server, vec![("GET", VERIFY_PATH, resp)]).await;
+        let adapter = adapter_for(&server).await;
+        assert!(
+            adapter
+                .probe_ready("qwen3-8b")
+                .await
+                .expect("must not error")
+        );
+    }
+
+    /// Not-yet-registered id, a malformed response, and an unreachable
+    /// server are all "can't tell yet" — none of them may surface as
+    /// `Err`, which the Supervisor would treat as a terminal load failure
+    /// rather than "poll again".
+    #[tokio::test]
+    async fn probe_ready_never_errors_on_missing_entry_malformed_body_or_5xx() {
+        for resp in [
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({"models": []})),
+            ResponseTemplate::new(200).set_body_string("not json"),
+            ResponseTemplate::new(500),
+        ] {
+            let server = MockServer::start().await;
+            mount_all(&server, vec![("GET", VERIFY_PATH, resp)]).await;
+            let adapter = adapter_for(&server).await;
+            assert_eq!(
+                adapter.probe_ready("qwen3-8b").await,
+                Ok(false),
+                "must report not-ready, never Err, while still possibly loading"
+            );
+        }
     }
 }
