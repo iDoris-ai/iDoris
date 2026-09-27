@@ -5,12 +5,17 @@
 //! **one tokio task holds all state**; every other task talks to it only
 //! through [`SupervisorHandle`]'s mpsc-backed commands.
 //!
-//! This PR wires [`crate::eviction::plan_eviction`] into `load`: capacity
-//! is now actually checked, and if a plan says to evict, the victims are
-//! unloaded before the new model is loaded — all still behind the one
-//! global load/evict mutex, so nothing else can touch a victim mid-flight.
-//! A real wait queue is still a follow-up — a second id fails fast with
-//! `BackendError::Busy` meanwhile.
+//! `load`/`unload` share one global mutex (`active_op`): same-id,
+//! same-request concurrent calls singleflight-merge; a different id (or a
+//! same-id call that differs in policy/`memory_gb`) fails fast with
+//! `BackendError::Busy` — there is no real wait queue yet, a deliberate
+//! simplification. Every `load` is checked against
+//! [`crate::eviction::plan_eviction`] for real capacity, evicting chosen
+//! victims (in-flight-aware, never a model mid-`chat`) before the new
+//! model is admitted. Every adapter call is timeout-bounded and
+//! panic-isolated (see [`with_adapter_timeout`]); a detected internal
+//! invariant violation poisons the actor into failing closed rather than
+//! panicking the whole event loop.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -74,7 +79,9 @@ impl Default for SupervisorConfig {
 struct ModelSlot {
     memory_gb: f64,
     state: ModelState,
-    /// Reserved for eviction (LRU) bookkeeping, landing in a follow-up PR.
+    /// Monotonic "last used" counter (bumped on load-completion and on
+    /// `chat`) — `plan_eviction`'s LRU ordering reads this via
+    /// [`build_snapshot`].
     last_used_seq: u64,
     /// Policy last accepted; compared by exact equality to decide merge vs. a new op.
     policy: LoadPolicy,
@@ -143,6 +150,14 @@ enum ActorMsg {
 enum ActiveKind {
     Load {
         policy: LoadPolicy,
+        /// Compared alongside `policy` (both must match exactly) to decide
+        /// singleflight-merge vs. a conflicting concurrent request for the
+        /// same id (Low, Opus Tier-2 review) — two callers racing to load
+        /// the same id with the same policy but *different* `memory_gb`
+        /// must not be silently merged into whichever happened to arrive
+        /// first, since the eviction plan (and therefore the outcome
+        /// either caller can trust) was built against only one of them.
+        memory_gb: f64,
         waiters: Vec<LoadReply>,
     },
     Unload {
@@ -619,8 +634,13 @@ fn build_snapshot(models: &HashMap<String, ModelSlot>, budget_gb: f64, exclude: 
 fn map_plan_error(err: PlanEvictionError, id: &str) -> BackendError {
     match err {
         PlanEvictionError::InsufficientCapacity { .. } => BackendError::eviction_impossible(id),
+        // `handle_load` validates `memory_gb` up front (Low, Opus Tier-2
+        // review), so reaching this at all should be structurally
+        // impossible — kept as defense-in-depth, mapped the same way a
+        // caller-supplied bad value would be rather than as an internal
+        // Supervisor bug.
         PlanEvictionError::InvalidCapacity { field, value } => {
-            BackendError::internal(format!("invalid capacity for {field}: {value}"))
+            BackendError::invalid_request(format!("invalid capacity for {field}: {value}"))
         }
         PlanEvictionError::SnapshotContainsRequestedModel { .. } => {
             panic!("Supervisor invariant violated: snapshot for {id:?} contained itself")
@@ -694,19 +714,32 @@ fn handle_load(
     active_op: &mut Option<ActiveOp>,
     env: &Env<'_>,
 ) {
+    // Decided before the mutex, same as the already-Ready/already-Stopped
+    // checks elsewhere: a malformed request is the caller's mistake
+    // regardless of what else is in flight, and must never be silently
+    // accepted into an eviction/budget calculation that then produces a
+    // meaningless result (Low, Opus Tier-2 review).
+    if !memory_gb.is_finite() || memory_gb < 0.0 {
+        let _ = reply.send(Err(BackendError::invalid_request(format!(
+            "memory_gb must be finite and >= 0, got {memory_gb}"
+        ))));
+        return;
+    }
     if let Some(active) = active_op.as_mut()
         && active.id == id
     {
         if let ActiveKind::Load {
             policy: active_policy,
+            memory_gb: active_memory_gb,
             waiters,
         } = &mut active.kind
             && *active_policy == policy
+            && *active_memory_gb == memory_gb
         {
             waiters.push(reply);
         } else {
             let _ = reply.send(Err(BackendError::busy(
-                "a load for this id with a different policy is already in flight",
+                "a load for this id with a different policy or memory_gb is already in flight",
                 Some(id.clone()),
                 None,
             )));
@@ -773,6 +806,7 @@ fn handle_load(
         id: id.clone(),
         kind: ActiveKind::Load {
             policy,
+            memory_gb,
             waiters: vec![reply],
         },
     });
@@ -1281,6 +1315,36 @@ mod tests {
         assert_eq!(adapter.load_call_count("a"), 1);
     }
 
+    /// Low (Opus Tier-2 review): the same singleflight-merge guarantee must
+    /// hold under a *real* multi-thread runtime — every other test above
+    /// uses the default single-threaded test runtime, whose cooperative,
+    /// non-preemptive scheduling could hide a race that only manifests
+    /// under true OS-thread parallelism (the actor task and every one of
+    /// these 8 callers can each land on a different worker thread here).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn singleflight_merge_holds_under_a_real_multi_thread_runtime() {
+        let adapter = Arc::new(MockAdapter::new(catalog()));
+        adapter.set_load_delay("a", std::time::Duration::from_millis(50));
+        let handle = Supervisor::spawn(adapter.clone(), SupervisorConfig::default())
+            .expect("spawn should succeed");
+        let tasks: Vec<_> = (0..8)
+            .map(|_| {
+                let h = handle.clone();
+                tokio::spawn(async move { h.load("a", 4.0, on_demand_policy()).await })
+            })
+            .collect();
+        for task in tasks {
+            task.await
+                .unwrap()
+                .expect("every concurrently-merged load should succeed");
+        }
+        assert_eq!(
+            adapter.load_call_count("a"),
+            1,
+            "singleflight must merge all 8 concurrent loads into exactly one adapter call, even across real OS threads"
+        );
+    }
+
     /// M5: when a singleflight-merged load fails, *every* waiter must get
     /// the *same* error (a mutation that only notified the first waiter
     /// must be caught) — and a later, separate `load` call must actually
@@ -1343,6 +1407,59 @@ mod tests {
         f1.await
             .unwrap()
             .expect("the original load should still succeed");
+    }
+
+    /// Low (Opus Tier-2 review): the same id, the same policy, but a
+    /// *different* `memory_gb` must not be silently merged either — only
+    /// exact equality on both fields singleflight-merges.
+    #[tokio::test(start_paused = true)]
+    async fn concurrent_loads_with_a_different_memory_gb_do_not_merge() {
+        let adapter = Arc::new(MockAdapter::new(catalog()));
+        adapter.set_load_delay("a", std::time::Duration::from_millis(50));
+        let handle = Supervisor::spawn(adapter.clone(), SupervisorConfig::default())
+            .expect("spawn should succeed");
+        let h2 = handle.clone();
+        let f1 = tokio::spawn(async move { handle.load("a", 4.0, on_demand_policy()).await });
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        let err = h2
+            .load("a", 8.0, on_demand_policy())
+            .await
+            .expect_err("a different memory_gb for the same in-flight id must not merge");
+        assert_eq!(err.reason_code(), "supervisor_busy");
+        f1.await
+            .unwrap()
+            .expect("the original load should still succeed");
+    }
+
+    /// Low (Opus Tier-2 review): a non-finite or negative `memory_gb` is
+    /// the caller's mistake, rejected up front — never silently accepted
+    /// into an eviction/budget calculation.
+    #[tokio::test]
+    async fn a_non_finite_memory_gb_is_an_invalid_request() {
+        let adapter = Arc::new(MockAdapter::new(catalog()));
+        let handle =
+            Supervisor::spawn(adapter, SupervisorConfig::default()).expect("spawn should succeed");
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.0] {
+            let err = handle
+                .load("a", bad, on_demand_policy())
+                .await
+                .expect_err("a non-finite or negative memory_gb must be rejected");
+            assert_eq!(err.reason_code(), "invalid_request");
+        }
+    }
+
+    /// Negative contrast: the boundary value `0.0` is finite and
+    /// non-negative, so it is accepted — isolates that it was specifically
+    /// non-finite/negative values being rejected, not zero itself.
+    #[tokio::test]
+    async fn a_zero_memory_gb_is_accepted() {
+        let adapter = Arc::new(MockAdapter::new(catalog()));
+        let handle =
+            Supervisor::spawn(adapter, SupervisorConfig::default()).expect("spawn should succeed");
+        handle
+            .load("a", 0.0, on_demand_policy())
+            .await
+            .expect("a zero memory_gb is a valid (if unusual) request");
     }
 
     /// OOM circuit breaker: exactly one self-healing retry.

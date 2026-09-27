@@ -4,9 +4,8 @@
 //! for R2-A per `docs/research/Rust基础选型-2026-09-27.md` §4
 //! ("原来的 `ModelBackend` trait 下沉为『运行时适配器』，上面加一层 Runtime
 //! Supervisor"). `admission` is deliberately **not** part of this trait any
-//! more — that decision now lives one layer up, in a pure `plan_eviction`
-//! function landing in a follow-up PR (plain text, not an intra-doc link,
-//! since that module doesn't exist in this crate yet), so every load path
+//! more — that decision now lives one layer up, in the pure
+//! [`crate::eviction::plan_eviction`] function, so every load path
 //! (manual, auto, API, CLI) funnels through the same decision point instead
 //! of letting each adapter reimplement its own admission heuristic (LM
 //! Studio #2051).
