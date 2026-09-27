@@ -1,4 +1,5 @@
 import type { TaskProfile } from "@idoris/contracts";
+import { effectiveServedLocality } from "./locality.js";
 import type { RouteDecision } from "./policy.js";
 import type { Registered } from "./registry.js";
 
@@ -13,10 +14,17 @@ export interface DispatchOutcome {
   providerId?: string;
 }
 
-/** 组件卡层面的「可信本地」：loopback + 只承载 local_only + 出站只 none/loopback。 */
+/**
+ * 组件卡层面的「可信本地」：loopback + 只承载 local_only + 出站只 none/loopback。
+ *
+ * **必须用 `effectiveServedLocality`，不能直接读 `card.provider.locality`**
+ * （PR #46 复审 H1，真实复现）：后者只是卡自己声明的值，对 `spawn_cli`/订阅类
+ * provider 这类"实际推理在别处发生"的卡不可信——直接读它会让这类卡只要声明
+ * `locality: loopback` 就能通过 local_only 门禁，实际却把请求转发到了外部。
+ */
 export function isLocalCapable(r: Registered): boolean {
   return (
-    r.card.provider.locality === "loopback" &&
+    effectiveServedLocality(r.card) === "loopback" &&
     r.card.privacy_class === "local_only" &&
     r.card.allowed_egress.every((e) => e === "none" || e === "loopback")
   );
@@ -49,6 +57,8 @@ export function dispatch(
 
   const chosen = candidates[0];
   if (!chosen) return { status: 503, body: { error: { type: "no_candidate" } } };
-  if (chosen.card.provider.locality !== "loopback") egress.count += 1;
+  // 同样必须用 effectiveServedLocality：否则一张 spawn_cli/订阅类卡声明
+  // locality: loopback 时，真实出站会被计数器漏记（跟 isLocalCapable 是同一类问题）。
+  if (effectiveServedLocality(chosen.card) !== "loopback") egress.count += 1;
   return { status: 200, body: { provider: chosen.card.provider.id }, providerId: chosen.card.provider.id };
 }
