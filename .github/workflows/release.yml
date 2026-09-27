@@ -1,0 +1,102 @@
+name: release
+
+# 触发方式：
+#   1) push 一个 `v*` tag —— 真正发版：build → test → package → 建 GitHub Release。
+#   2) workflow_dispatch —— 手动干跑：build → test → package，但不建 Release，
+#      用来在合并/改动这个 workflow 后验证流程本身是否能跑通。
+#      `dry_run` 输入目前恒为“干跑”（release job 只在 tag push 时才跑），
+#      保留这个输入是为了在 Actions 界面上明确告诉触发者这次不会发版，
+#      并为未来需要区分干跑细节时留一个开关位。
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "干跑：只构建和打包，不创建 Release（当前 workflow_dispatch 触发下始终如此）"
+        type: boolean
+        default: true
+
+# 顶层只给最小权限；真正需要写权限（创建 Release）的 job 单独声明。
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build + test + package (aarch64-apple-darwin)
+    runs-on: macos-14
+    outputs:
+      archive: ${{ steps.package.outputs.archive }}
+      checksum: ${{ steps.package.outputs.checksum }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      # 与 .github/workflows/ci.yml 的 rust job 保持一致：显式安装
+      # rust-toolchain.toml 里钉住的版本，不依赖 runner 预装的默认工具链。
+      - name: Install Rust toolchain
+        run: rustup toolchain install 1.95 --profile minimal --component rustfmt,clippy
+
+      # 发版前置门禁：测试不过，后面的 build/package 步骤不会执行，
+      # release job（needs: build）也就不会跑，不会发出一个没过测试的版本。
+      - name: cargo test --workspace
+        run: cargo test --workspace --locked
+
+      - name: cargo build --release -p idoris-router
+        run: cargo build --release --locked -p idoris-router
+
+      - name: Determine version string
+        id: version
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "push" ]; then
+            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=dryrun-${GITHUB_SHA:0:7}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Package binary + sha256
+        id: package
+        run: |
+          set -euo pipefail
+          tag="${{ steps.version.outputs.tag }}"
+          archive="idoris-${tag}-aarch64-apple-darwin.tar.gz"
+          checksum="${archive}.sha256"
+          tar czf "$archive" -C target/release idoris
+          shasum -a 256 "$archive" > "$checksum"
+          echo "archive=${archive}" >> "$GITHUB_OUTPUT"
+          echo "checksum=${checksum}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-assets
+          path: |
+            ${{ steps.package.outputs.archive }}
+            ${{ steps.package.outputs.checksum }}
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: create GitHub Release
+    needs: build
+    # 只有真正的 `v*` tag push 才发版；workflow_dispatch（干跑）永远停在 build。
+    if: ${{ github.event_name == 'push' }}
+    runs-on: macos-14
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-assets
+
+      - name: gh release create
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release create "${{ github.ref_name }}" \
+            "${{ needs.build.outputs.archive }}" \
+            "${{ needs.build.outputs.checksum }}" \
+            --repo "${{ github.repository }}" \
+            --title "${{ github.ref_name }}" \
+            --generate-notes
