@@ -462,14 +462,14 @@ docs/15 的设计**保留并作为落地依据**。调研补充如下：
 - Runtime Supervisor：oMLX + **mlx_lm.server 保底** + **llama.cpp GGUF**，加全局内存账本和会话亲和。
 - 协议面：`/v1/messages`、`/v1/embeddings`、`/v1/rerank`；字段兑现矩阵测试；统一错误体（rule_id + remediation）。
 - **Event Log 骨架** + `X-iDoris-Record-Id` + trace 关联头 + **`/v1/feedback`**；审计改为 Event Log 的投影。
-- 管理 API v0 + `idoris` CLI + 只读状态页（管理面 P0）。
+- Admin API v0 + `idoris` CLI + iDoris 极简控制台；Agent24 状态卡片（§6.1）。
 - **验收**：换掉任一后端或核心模型，调用方零改动；非 loopback 且无 key 时拒绝启动；任一请求都能由 record id 查到完整决策链。
 
 ### M5 隐私与预算真正落地
 - **闸一 `INSPECTED`**：L0 中文规则 + 校验和 + 二次扫描 fail-closed；REDACT 稳定占位符 + 流式还原；**kill switch**；出站字节可视化。
 - **闸二**：Keychain 凭证代理；能力②真实 provider（Anthropic/OpenAI/DeepSeek/Qwen 白名单）；出站去关联。
 - 预算 reserve/settle + 价格表 + 价格未知 fail-closed + 影子价格 + 审批队列；三粒度断路器。
-- 管理面 P1：总览、隐私、预算、请求详情页。
+- Admin API v1；Agent24 管理页：隐私、预算、审批；iDoris 控制台加 kill switch 与请求决策轨迹。
 - **验收**：往请求里注入身份证号或手机号，远程出站为 0 字节或已被脱敏（出站计数器验证）；并发 100 个请求不会击穿预算；kill switch 触发后远程请求为 0。
 
 ### M6 轨迹金库与入口判定
@@ -483,7 +483,7 @@ docs/15 的设计**保留并作为落地依据**。调研补充如下：
 - 策展流水线 + 数据集卡 + 血缘表；对比样本生成；本地 verifier 预评分。
 - 按顺序训练：**决策模型** → fast/daily 角色的**本地教师 OPD** → KTO/DPO 偏好 → 有了可计算奖励再做 RL。
 - 晋升门禁：docs/16 场景评测 + 贪心逐 token 比对 + 安全/越狱回归 + 位置偏差；空闲/夜间调度，训练让位于推理。
-- 管理面 P2：学习页、Tauri 壳。
+- Admin API v2；Agent24 管理页：轨迹、学习、路由回放。
 - **验收**：用自有轨迹训练的判定器在自有测试集上，校准后 ECE 和准确率优于基线，并且比较结论跨过 docs/16 ST-2 的统计门槛；晋升失败时自动回到 known-good。
 
 ### M8 组织版与联邦
