@@ -27,4 +27,6 @@ pub use privacy::{
     is_subscription_provider_id,
 };
 pub use registry::{RegistrationError, validate_registration};
-pub use role::{ROLES, Role, RoleParseError, is_eligible_for_role, parse_model_role};
+pub use role::{
+    ROLES, Role, RoleParseError, is_catalog_eligible, is_eligible_for_role, parse_model_role,
+};

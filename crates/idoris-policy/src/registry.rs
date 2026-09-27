@@ -24,6 +24,10 @@ pub enum RegistrationError {
     EndpointUnparseable { id: String, endpoint: String },
     /// endpoint host 不在 loopback 白名单——会让 Served-Locality 谎报。
     LoopbackHostMismatch { id: String, host: String },
+    /// `locality: loopback` 的网络端点卡用了不在白名单里的 scheme——不能靠
+    /// "反正不是 http(s)" 就整体放行，那等于放行 `ftp://`/`file://` 之类
+    /// 可能真的指向外部的地址。
+    UnsupportedScheme { id: String, scheme: String },
     /// `spawn_cli`/订阅类 provider 却声明 `local_only`/`tier: local`：语义矛盾。
     ContradictoryRelayClaim { id: String },
 }
@@ -46,6 +50,12 @@ impl std::fmt::Display for RegistrationError {
                     "组件卡 \"{id}\" 声明 locality: loopback，但 endpoint host 是 \"{host}\"，不是 127.0.0.1/::1/localhost"
                 )
             }
+            RegistrationError::UnsupportedScheme { id, scheme } => {
+                write!(
+                    f,
+                    "组件卡 \"{id}\" 的 endpoint scheme \"{scheme}\" 不在白名单（http/https/ws/wss）"
+                )
+            }
             RegistrationError::ContradictoryRelayClaim { id } => {
                 write!(
                     f,
@@ -58,14 +68,42 @@ impl std::fmt::Display for RegistrationError {
 
 impl std::error::Error for RegistrationError {}
 
-/// M6：`locality: loopback` 的 `http_service` 卡，endpoint 必须指向允许的
-/// loopback host，否则拒绝注册。用真正的 WHATWG URL 解析器（不是手写
-/// `split(':')`，后者曾被 userinfo 绕过）。**顺序关键**：先看 scheme 再要求
-/// host——`mock:in-memory` 这种没有 host 的合法非 http(s) URL 必须先放行，
-/// 不能被误判成 `EndpointUnparseable`。
+/// 声明了真实网络端点的 form——`endpoint` 是一个网络地址，需要做 locality
+/// 一致性校验。`spawn_cli`/`bundled_binary`/`batch_job` 的 `endpoint` 是
+/// argv 模板/二进制路径/任务定义，不是网络地址，不在这个集合里。
+fn declares_network_endpoint(form: Form) -> bool {
+    matches!(form, Form::HttpService | Form::NostrNode | Form::MitmProxy)
+}
+
+/// 仅供本 crate 自身测试使用的"内存 mock 后端"scheme——纯进程内计算，
+/// `locality: loopback` 本身没有说谎，允许跳过 host 校验。**不对生产配置
+/// 开放**：真实的 `config/components/*.yaml` 永远不会在非测试构建里出现
+/// `mock://` scheme，`cfg(test)` 之外一律按未知 scheme 拒绝。
+#[cfg(test)]
+fn is_test_only_mock_scheme(scheme: &str) -> bool {
+    scheme == "mock"
+}
+#[cfg(not(test))]
+fn is_test_only_mock_scheme(_scheme: &str) -> bool {
+    false
+}
+
+/// M6 + H1：`locality: loopback` 的网络端点卡（见 [`declares_network_endpoint`]），
+/// endpoint scheme 必须在白名单里（`http`/`https`/`ws`/`wss`），host 必须在
+/// [`LOOPBACK_HOSTS`] 里，否则拒绝注册（fail-closed）。用真正的 WHATWG URL
+/// 解析器（不是手写 `split(':')`，后者曾被 userinfo 绕过）。**顺序关键**：
+/// 先看 scheme 再要求 host——`mock:in-memory` 这种没有 host 的合法非
+/// http(s) URL 必须先放行，不能被误判成 `EndpointUnparseable`。
+///
+/// 之前的实现对"非 http(s) scheme"一律跳过校验，等价于放行任意
+/// `ws://evil.example`/`file://…`/`ftp://…` 的 loopback 声明——不能只挡
+/// http(s)，白名单之外的 scheme 必须显式拒绝，不能靠"反正我们只认识
+/// http(s)"这种默认放行的逻辑蒙混过去。
 fn assert_endpoint_locality_consistent(card: &Card) -> Result<(), RegistrationError> {
     let component = &card.component;
-    if component.form != Form::HttpService || component.provider.locality != Locality::Loopback {
+    if !declares_network_endpoint(component.form)
+        || component.provider.locality != Locality::Loopback
+    {
         return Ok(());
     }
     let unparseable = || RegistrationError::EndpointUnparseable {
@@ -75,9 +113,15 @@ fn assert_endpoint_locality_consistent(card: &Card) -> Result<(), RegistrationEr
     let Ok(parsed) = Url::parse(&component.endpoint) else {
         return Err(unparseable());
     };
-    // 非 http(s) scheme（如 mock://）一律跳过——原样对齐 TS `registry.ts`。
-    if parsed.scheme() != "http" && parsed.scheme() != "https" {
+    let scheme = parsed.scheme();
+    if is_test_only_mock_scheme(scheme) {
         return Ok(());
+    }
+    if !matches!(scheme, "http" | "https" | "ws" | "wss") {
+        return Err(RegistrationError::UnsupportedScheme {
+            id: card.id().to_string(),
+            scheme: scheme.to_string(),
+        });
     }
     let Some(host) = parsed.host_str() else {
         return Err(unparseable());
@@ -227,6 +271,59 @@ mod tests {
                 })
             );
         }
+    }
+
+    /// H1 回归：非白名单 scheme（`ftp://`/`file://`）不能靠"反正不是
+    /// http(s)"整体跳过校验就放行——之前的实现会把这些都当成"跳过"。
+    #[test]
+    fn rejects_endpoints_with_schemes_outside_the_allowlist() {
+        for (id, endpoint) in [
+            ("ftp-evil", "ftp://evil.example/"),
+            ("file-evil", "file:///etc/passwd"),
+        ] {
+            let mut card = sample_card(id, &[]);
+            card.component.endpoint = endpoint.to_string();
+            let scheme = endpoint.split(':').next().unwrap_or_default().to_string();
+            assert_eq!(
+                validate_registration(&[card]),
+                Err(RegistrationError::UnsupportedScheme {
+                    id: id.to_string(),
+                    scheme,
+                })
+            );
+        }
+    }
+
+    /// H1 + M3：`ws`/`wss` 在白名单里，且 `NostrNode`/`MitmProxy` 这两个
+    /// "声明了真实网络端点"的 form 也要做 locality 校验，不能只校验
+    /// `HttpService`。
+    #[test]
+    fn ws_scheme_and_non_http_service_network_forms_are_validated() {
+        let mut ws_loopback = sample_card("ws-ok", &[]);
+        ws_loopback.component.endpoint = "ws://127.0.0.1:8740".to_string();
+        assert_eq!(validate_registration(&[ws_loopback]), Ok(()));
+
+        let mut nostr_evil = sample_card("nostr-evil", &[]);
+        nostr_evil.component.form = Form::NostrNode;
+        nostr_evil.component.endpoint = "wss://evil.example/relay".to_string();
+        assert_eq!(
+            validate_registration(&[nostr_evil]),
+            Err(RegistrationError::LoopbackHostMismatch {
+                id: "nostr-evil".to_string(),
+                host: "evil.example".to_string(),
+            })
+        );
+
+        let mut proxy_evil = sample_card("proxy-evil", &[]);
+        proxy_evil.component.form = Form::MitmProxy;
+        proxy_evil.component.endpoint = "ftp://evil.example/".to_string();
+        assert_eq!(
+            validate_registration(&[proxy_evil]),
+            Err(RegistrationError::UnsupportedScheme {
+                id: "proxy-evil".to_string(),
+                scheme: "ftp".to_string(),
+            })
+        );
     }
 
     #[test]

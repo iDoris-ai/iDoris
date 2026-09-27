@@ -76,6 +76,39 @@ fn local_only_succeeds_with_a_loopback_candidate() {
             .contains(&ReasonCode::PrivacyLoopbackOnly)
     );
     assert!(!decision.is_degraded());
+    // L3：下限本来就是 local_only（不是内容检查收紧出来的），不该被打上
+    // PrivacyTightenedByContent——这条请求压根没有声明 content_tightening。
+    assert!(
+        !decision
+            .reason_codes
+            .contains(&ReasonCode::PrivacyTightenedByContent)
+    );
+}
+
+/// L3：下限本来就是 `local_only`，即使内容检查也返回 `local_only`，也不该
+/// 算作"内容检查起了收紧作用"——它本来就没有放宽的空间。
+#[test]
+fn privacy_tightened_reason_code_only_fires_when_floor_actually_changes() {
+    let mut req = local_only_profile(None);
+    req.content_tightening = Some(PrivacyClass::LocalOnly);
+    let cards = [sample_card("local-1", &[])];
+    let ctx = PolicyCtx::default();
+    let decision = decide(&req, &cards, &ctx).unwrap();
+    assert!(
+        !decision
+            .reason_codes
+            .contains(&ReasonCode::PrivacyTightenedByContent)
+    );
+
+    // 反例：下限是 any，内容检查真的收紧成 local_only——这次要打上标记。
+    let mut req = any_privacy_profile(None);
+    req.content_tightening = Some(PrivacyClass::LocalOnly);
+    let decision = decide(&req, &cards, &ctx).unwrap();
+    assert!(
+        decision
+            .reason_codes
+            .contains(&ReasonCode::PrivacyTightenedByContent)
+    );
 }
 
 #[test]
@@ -108,8 +141,13 @@ fn role_requested_without_any_match_degrades_to_capability_only_with_fallback() 
 
 #[test]
 fn unknown_price_candidate_is_never_selected() {
+    // L5：`a-unknown-price` 的 id 字典序排在 `known-free` 之前——如果"价格
+    // 未知按 None.unwrap_or(0) 当成免费"这个不变式 #3 检查被去掉，
+    // `pick()` 的 tie-break 会因为 id 更小而错误选中它，这个测试才真正
+    // 抓得住那个变异（旧的 id 顺序里"未知价"恰好字典序更大，去掉检查也测
+    // 不出来）。
     let req = any_privacy_profile(Some(Role::Daily));
-    let cheap_but_unknown = remote_card("mystery", &[Role::Daily], None);
+    let cheap_but_unknown = remote_card("a-unknown-price", &[Role::Daily], None);
     let known_free = sample_card("known-free", &[Role::Daily]);
     let cards = [cheap_but_unknown, known_free];
     let ctx = PolicyCtx::default();
@@ -121,6 +159,8 @@ fn unknown_price_candidate_is_never_selected() {
 fn negative_price_candidate_is_treated_like_unknown_price_never_selected() {
     // 调用方不应该产出负成本，但 Card 的类型层面不禁止——按不变式 #3 一律
     // 当「价格未知」处理，绝不能当成「比免费还便宜」被优先选中。
+    // （`bogus-negative` 的 id 字典序已经排在 `known-free` 之前，这个测试
+    // 本身就能抓住"负成本当成免费"的变异，不需要像 L5 那样额外调整 id。）
     let req = any_privacy_profile(Some(Role::Daily));
     let bogus_negative = remote_card("bogus-negative", &[Role::Daily], Some(-1));
     let known_free = sample_card("known-free", &[Role::Daily]);
@@ -237,6 +277,56 @@ fn tie_break_picks_the_lexicographically_smaller_id() {
     let ctx = PolicyCtx::default();
     let decision = decide(&req, &[a, b], &ctx).unwrap();
     assert_eq!(decision.chosen_id, "alpha");
+}
+
+/// H3 回归：无角色声明时，`experiment` 候选不能靠"没有具体角色可查"绕过——
+/// 这三条路径（无角色、`idoris/auto`、角色降级）曾经完全不查 experiment/
+/// min_ram_gb，只有走具体角色匹配（`is_eligible_for_role`）才会查。
+#[test]
+fn no_role_requested_still_excludes_experiment_candidates() {
+    let mut experimental = sample_card("experimental", &[]);
+    experimental.experiment = true;
+    let req = any_privacy_profile(None);
+    let ctx = PolicyCtx::default();
+    assert_eq!(
+        decide(&req, &[experimental], &ctx),
+        Err(Rejection::NoEligibleCandidate {
+            stage: Stage::RoleCapability
+        })
+    );
+}
+
+/// H3 回归：`idoris/auto` 同样要经过 min_ram_gb 硬门槛。
+#[test]
+fn auto_role_still_applies_min_ram_gb_threshold() {
+    let mut too_big = sample_card("too-big", &[]);
+    too_big.min_ram_gb = 64.0;
+    let req = any_privacy_profile(Some(Role::Auto));
+    let ctx = PolicyCtx {
+        min_ram_gb: Some(16.0),
+        budget: None,
+    };
+    assert_eq!(
+        decide(&req, &[too_big], &ctx),
+        Err(Rejection::NoEligibleCandidate {
+            stage: Stage::RoleCapability
+        })
+    );
+}
+
+/// H3 回归：角色降级（有 Fallback）也不能放行 experiment 候选。
+#[test]
+fn role_fallback_still_excludes_experiment_candidates() {
+    let mut experimental = sample_card("experimental", &[Role::Daily]);
+    experimental.experiment = true;
+    let req = with_fallback(any_privacy_profile(Some(Role::Deep)));
+    let ctx = PolicyCtx::default();
+    assert_eq!(
+        decide(&req, &[experimental], &ctx),
+        Err(Rejection::NoEligibleCandidate {
+            stage: Stage::RoleCapability
+        })
+    );
 }
 
 #[test]

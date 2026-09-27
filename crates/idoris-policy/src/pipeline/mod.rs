@@ -19,7 +19,7 @@ use idoris_contracts::tenant::BudgetScope;
 use crate::budget::BudgetSnapshot;
 use crate::card::{AdmissionStatus, Card};
 use crate::privacy::effective_served_locality;
-use crate::role::{Role, is_eligible_for_role};
+use crate::role::{Role, is_catalog_eligible, is_eligible_for_role};
 
 fn admission_rank(status: AdmissionStatus) -> u8 {
     match status {
@@ -149,8 +149,11 @@ pub fn decide(
 
     // ---- ① 隐私（不变式 #2：只能收紧，不能放宽） --------------------------
     let privacy = req.effective_privacy();
-    if privacy == PrivacyClass::LocalOnly && req.content_tightening == Some(PrivacyClass::LocalOnly)
-    {
+    // 只有下限本来是 `Any`、真的被内容检查收紧成 `LocalOnly` 时才记这个
+    // reason_code——下限本来就是 `LocalOnly` 时，内容检查同样返回
+    // `LocalOnly` 不代表它"起了作用"，不该被算作一次收紧事件。
+    let floor = req.task.privacy.unwrap_or(PrivacyClass::LocalOnly);
+    if floor == PrivacyClass::Any && privacy == PrivacyClass::LocalOnly {
         reasons.push(ReasonCode::PrivacyTightenedByContent);
     }
     let privacy_ok: Vec<&Card> = if privacy == PrivacyClass::LocalOnly {
@@ -169,6 +172,13 @@ pub fn decide(
 
     // ---- ② 角色 / 能力匹配 -------------------------------------------------
     let needed_capabilities = req.effective_capabilities();
+    // 三条不查具体角色成员关系的路径（无角色、`idoris/auto`、角色降级）都要
+    // 经过同一个健康门槛（`is_catalog_eligible`：experiment/min_ram_gb），不能
+    // 因为"没有指定角色"就绕过它——`is_eligible_for_role` 内部已经调用它，
+    // 这里显式再调一次，保证四条路径口径一致。
+    let is_capability_candidate = |c: &&Card| {
+        is_catalog_eligible(c, ctx.min_ram_gb) && has_capabilities(c, &needed_capabilities)
+    };
     let role_matched: Vec<&Card> = match req.role {
         Some(role) if role.is_catalog_role() => privacy_ok
             .iter()
@@ -197,7 +207,7 @@ pub fn decide(
         let capability_only: Vec<&Card> = privacy_ok
             .iter()
             .copied()
-            .filter(|c| has_capabilities(c, &needed_capabilities))
+            .filter(is_capability_candidate)
             .collect();
         if capability_only.is_empty() {
             return Err(Rejection::NoEligibleCandidate {
@@ -214,7 +224,7 @@ pub fn decide(
         let capability_only: Vec<&Card> = privacy_ok
             .iter()
             .copied()
-            .filter(|c| has_capabilities(c, &needed_capabilities))
+            .filter(is_capability_candidate)
             .collect();
         if capability_only.is_empty() {
             return Err(Rejection::NoEligibleCandidate {
