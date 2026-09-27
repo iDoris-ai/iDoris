@@ -12,9 +12,12 @@
 //!   this stack), with a stable `reason_code()` that keeps authentication
 //!   failure and dependency failure from ever collapsing into the same
 //!   code.
+//! - [`omlx`] — the oMLX `RuntimeAdapter` implementation (landing across
+//!   several PRs on this stack; this PR has `list`/`status` only).
 
 pub mod chat;
 pub mod error;
+pub mod omlx;
 
 pub use chat::{
     ChatChunk, ChatChunkStream, ChatMessage, ChatRequest, ChatResponse, RemoteChat,

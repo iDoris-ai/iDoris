@@ -20,6 +20,16 @@ async-trait = { workspace = true }
 # the remote `genai`-backed client does) arrive in a later PR alongside
 # whatever runtime (`genai` already pulls in `futures`) they need.
 futures-core = "0.3"
+# `tokio::time::timeout` wraps every oMLX HTTP call — production code, so
+# a normal (not dev-only) dependency; `test-util` is added below instead.
+tokio = { workspace = true }
+serde_json = { workspace = true }
+# rustls, not the system TLS backend — no OpenSSL, and matches the `genai`
+# remote client's own default (later PR) so the crate has one TLS stack.
+# `charset`/`http2`/`system-proxy` (reqwest's own defaults) are dropped:
+# oMLX is a local HTTP/1.1 process on 127.0.0.1, none of them apply.
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
+wiremock = "0.6"
