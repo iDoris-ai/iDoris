@@ -76,22 +76,10 @@ pub(super) async fn get_json(
 // `post_empty`/`put_json` (load/unload/pin) land in the follow-up PR that
 // actually calls them — keeping this PR to exactly what `list`/`status`
 // need avoids `cargo clippy -D warnings` failing on dead code in the
-// meantime.
-
-async fn dispatch(
-    method: &'static str,
-    path: &str,
-    req: reqwest::RequestBuilder,
-    call_timeout: Duration,
-) -> Result<reqwest::Response, BackendError> {
-    match tokio::time::timeout(call_timeout, req.send()).await {
-        Err(_elapsed) => Err(upstream_error(format!(
-            "oMLX {method} {path} timed out after {call_timeout:?}"
-        ))),
-        Ok(Err(err)) => Err(transport_error(method, path, &err)),
-        Ok(Ok(resp)) => Ok(resp),
-    }
-}
+// meantime. Each will need its own `tokio::time::timeout` wrap sized to
+// what it actually awaits (see `send_and_parse`'s doc comment on why that
+// must cover body reads, not just `send()`) — not a blind copy of either
+// existing shape here.
 
 fn check_status(
     method: &'static str,
@@ -112,22 +100,39 @@ fn check_status(
     }
 }
 
+/// **`call_timeout` covers the whole round trip, not just `req.send()`.**
+/// `reqwest::RequestBuilder::send`'s future resolves once headers arrive —
+/// a server that sends headers promptly and then drips the body forever
+/// would make a send()-only timeout useless, since the still-unbounded
+/// `resp.json()` read happens after it.
 async fn send_and_parse(
     method: &'static str,
     path: &str,
     req: reqwest::RequestBuilder,
     call_timeout: Duration,
 ) -> Result<serde_json::Value, BackendError> {
-    let resp = dispatch(method, path, req, call_timeout).await?;
-    check_status(method, path, &resp)?;
-    // A malformed/non-JSON body is reported with only the field name that
-    // failed to parse and the transport-level fact "not valid JSON" — never
-    // the body itself, which may contain content we should not echo.
-    resp.json::<serde_json::Value>().await.map_err(|_| {
-        upstream_error(format!(
-            "oMLX {method} {path} returned a body that was not valid JSON"
-        ))
-    })
+    let attempt = async {
+        let resp = req
+            .send()
+            .await
+            .map_err(|err| transport_error(method, path, &err))?;
+        check_status(method, path, &resp)?;
+        // A malformed/non-JSON body is reported with only the field name
+        // and the fact "not valid JSON" — never the body itself, which may
+        // contain content we should not echo.
+        resp.json::<serde_json::Value>().await.map_err(|_| {
+            upstream_error(format!(
+                "oMLX {method} {path} returned a body that was not valid JSON"
+            ))
+        })
+    };
+    tokio::time::timeout(call_timeout, attempt)
+        .await
+        .unwrap_or_else(|_elapsed| {
+            Err(upstream_error(format!(
+                "oMLX {method} {path} timed out after {call_timeout:?}"
+            )))
+        })
 }
 
 #[cfg(test)]
