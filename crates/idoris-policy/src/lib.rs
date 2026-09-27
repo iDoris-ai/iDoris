@@ -6,9 +6,9 @@
 //! `git show origin/main:<path>` 而不是假设它们在本分支的工作区里存在。
 //!
 //! 目前有决策候选类型 [`Card`]、完整的 `role` 模块（解析 + 目录候选筛选）、
-//! 隐私判定 [`privacy`]、注册校验 [`registry`]、以及预算查询接口
-//! [`budget`] + 管道数据类型 [`pipeline`]；管道逻辑 `decide()` 在后续 PR
-//! 里加入（这个 crate 按依赖顺序叠加的多个 PR landing，见各 PR 描述）。
+//! 隐私判定 [`privacy`]、注册校验 [`registry`]、预算查询接口 [`budget`]、
+//! 以及完整的决策管道 [`decide`]（这个 crate 按依赖顺序叠加的多个 PR
+//! landing，场景测试在下一个 PR 里加入）。
 
 pub mod budget;
 pub mod card;
@@ -20,7 +20,7 @@ pub mod role;
 pub use budget::{BudgetSnapshot, BudgetView};
 pub use card::{AdmissionStatus, Card};
 pub use pipeline::{
-    Decision, Degradation, PolicyCtx, ReasonCode, Rejection, RequestProfile, Stage,
+    Decision, Degradation, PolicyCtx, ReasonCode, Rejection, RequestProfile, Stage, decide,
 };
 pub use privacy::{
     SUBSCRIPTION_PROVIDER_ID, effective_privacy, effective_served_locality,

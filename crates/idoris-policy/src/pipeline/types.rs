@@ -26,10 +26,6 @@ pub struct RequestProfile {
     pub content_tightening: Option<PrivacyClass>,
 }
 
-// 这几个方法目前只被 `pipeline::decide()` 使用，而 `decide()` 在下一个 PR
-// 里才加入（这个 PR 只落地数据类型）——`pub(super)` 已经限定了可见性范围，
-// 这里的 `dead_code` allow 只是暂时的，等 mod.rs 落地 decide() 就会自然解除。
-#[allow(dead_code)]
 impl RequestProfile {
     pub(super) fn effective_privacy(&self) -> PrivacyClass {
         effective_privacy(
