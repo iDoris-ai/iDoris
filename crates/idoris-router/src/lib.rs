@@ -18,12 +18,12 @@ pub mod components;
 pub mod routing_policy;
 
 /// The local decision + execution path (R2-D task 3): `decide()` → (if
-/// needed) `Supervisor` load → `Supervisor` chat. Not yet wired into the
-/// `/v1/chat/completions` handler — a follow-up PR does that.
+/// needed) `Supervisor` load → `Supervisor` chat.
 pub mod dispatch;
 
 use std::net::IpAddr;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::body::{Body, Bytes};
 use axum::extract::{Request, State};
@@ -32,11 +32,18 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use idoris_backend::{BackendError, ChatMessage};
+use idoris_policy::Rejection;
 use serde::Serialize;
 use serde_json::json;
 use uuid::Uuid;
 
+use dispatch::{DispatchError, dispatch_local, reason_header_value};
 use profile::{ProfileError, parse_profile};
+
+const HEADER_SERVED_LOCALITY: &str = "X-iDoris-Served-Locality";
+const HEADER_REASON: &str = "X-iDoris-Reason";
+const HEADER_DEGRADED: &str = "X-iDoris-Degraded";
 
 /// Production default port (T4.1/FU-13, PR #46): `IDORIS_PORT` unset/blank
 /// falls back to this. `8765`/`8796`/`8088`/`11434` were all already taken by
@@ -192,11 +199,25 @@ fn error_envelope(
     error_type: &'static str,
     remediation: impl Into<String>,
 ) -> Response {
+    error_envelope_with_reason(status, error_type, error_type, remediation)
+}
+
+/// As [`error_envelope`], but with a `reason_code` distinct from `type` —
+/// for a local backend failure, `type` stays the spec-level
+/// `local_only_unavailable` while `reason_code` carries the backend's own
+/// more granular [`BackendError::reason_code`] (e.g. `model_not_found`,
+/// `oom`) for diagnostics.
+fn error_envelope_with_reason(
+    status: StatusCode,
+    error_type: &'static str,
+    reason_code: &str,
+    remediation: impl Into<String>,
+) -> Response {
     let body = json!({
         "error": {
             "type": error_type,
             "rule_id": null,
-            "reason_code": error_type,
+            "reason_code": reason_code,
             "evidence": null,
             "remediation": remediation.into(),
         }
@@ -210,11 +231,118 @@ impl IntoResponse for ProfileError {
     }
 }
 
-/// `POST /v1/chat/completions` — request-profile parsing only for now
-/// (component loading, decision, and backend dispatch land in follow-up
-/// R2-D PRs). Order (locked by conformance): non-JSON body -> `invalid_json`;
-/// valid JSON that isn't an object -> `invalid_body`; only then are
-/// control-plane headers parsed (see [`profile::parse_profile`]).
+/// Request body `messages` → backend [`ChatMessage`]s — only entries whose
+/// `role`/`content` are both strings are kept, matching `server.ts`'s
+/// `toMessages` (malformed entries are silently dropped, not a 400).
+fn extract_messages(object: &serde_json::Map<String, serde_json::Value>) -> Vec<ChatMessage> {
+    let Some(raw) = object.get("messages").and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+    raw.iter()
+        .filter_map(|item| {
+            let role = item.get("role")?.as_str()?.to_string();
+            let content = item.get("content")?.as_str()?.to_string();
+            Some(ChatMessage { role, content })
+        })
+        .collect()
+}
+
+/// Very rough token estimate (`ceil(chars / 4)`), matching the same
+/// order-of-magnitude heuristic `packages/adapters/subscription/relay.ts`
+/// uses for its own OpenAI-shaped response — a real per-model tokenizer
+/// isn't wired in at this layer. Purely informational (`usage` in the
+/// response body); no billing decision reads this.
+fn rough_token_estimate(text: &str) -> u64 {
+    if text.is_empty() {
+        0
+    } else {
+        (text.chars().count() as u64).div_ceil(4).max(1)
+    }
+}
+
+/// Builds an OpenAI `chat.completion`-shaped body, mirroring
+/// `openAIChatCompletion` (`packages/adapters/subscription/relay.ts`).
+/// `requested_model` is the caller's own `model` field when present (echoed
+/// back, matching that TS helper's call site for a locally-served model),
+/// falling back to the resolved backend id.
+fn openai_chat_completion(content: &str, requested_model: &str, prompt: &str) -> serde_json::Value {
+    let created = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let prompt_tokens = rough_token_estimate(prompt);
+    let completion_tokens = rough_token_estimate(content);
+    json!({
+        "id": format!("chatcmpl-idoris-{}", Uuid::new_v4()),
+        "object": "chat.completion",
+        "created": created,
+        "model": requested_model,
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": content}, "finish_reason": "stop"}],
+        "usage": {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
+        },
+    })
+}
+
+/// Sets `X-iDoris-Served-Locality` (always, once a candidate is chosen —
+/// interface spec §3.12) plus best-effort `X-iDoris-Reason`/`X-iDoris-Degraded`
+/// (observability, not yet a formal wire contract) on `response`.
+fn apply_decision_headers(response: &mut Response, outcome: &dispatch::ChatOutcome) {
+    let headers = response.headers_mut();
+    if let Ok(v) = HeaderValue::from_str(locality_str(outcome.served_locality)) {
+        headers.insert(HEADER_SERVED_LOCALITY, v);
+    }
+    let reason = reason_header_value(&outcome.decision.reason_codes);
+    if !reason.is_empty()
+        && let Ok(v) = HeaderValue::from_str(&reason)
+    {
+        headers.insert(HEADER_REASON, v);
+    }
+    if outcome.decision.is_degraded() {
+        headers.insert(HEADER_DEGRADED, HeaderValue::from_static("true"));
+    }
+}
+
+fn locality_str(locality: idoris_contracts::provider::Locality) -> &'static str {
+    match locality {
+        idoris_contracts::provider::Locality::Loopback => "loopback",
+        idoris_contracts::provider::Locality::Lan => "lan",
+        idoris_contracts::provider::Locality::Remote => "remote",
+    }
+}
+
+/// A local backend failure after a candidate was already chosen: per R2-D
+/// task 3, this always surfaces as 503 `local_only_unavailable` (the
+/// spec-level outcome from the caller's point of view is indistinguishable
+/// from "no usable local candidate"), carrying the backend's own
+/// `reason_code()` for diagnostics and — critically — still setting
+/// `X-iDoris-Served-Locality`, since a candidate genuinely was selected.
+fn backend_error_response(err: &BackendError, outcome: &dispatch::ChatOutcome) -> Response {
+    let mut response = error_envelope_with_reason(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "local_only_unavailable",
+        err.reason_code(),
+        err.to_string(),
+    );
+    apply_decision_headers(&mut response, outcome);
+    response
+}
+
+fn rejection_response(rejection: Rejection) -> Response {
+    error_envelope(
+        StatusCode::from_u16(rejection.http_status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+        rejection.error_type(),
+        format!("{rejection:?}"),
+    )
+}
+
+/// `POST /v1/chat/completions`. Order (locked by conformance): non-JSON
+/// body -> `invalid_json`; valid JSON that isn't an object -> `invalid_body`;
+/// only then are control-plane headers parsed (see [`profile::parse_profile`]),
+/// followed by the local decision + execution path
+/// ([`dispatch::dispatch_local`]).
 async fn chat_completions(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -239,9 +367,33 @@ async fn chat_completions(
     };
     let model = object.get("model").and_then(|v| v.as_str());
 
-    match parse_profile(&headers, model, state.deploy_mode) {
-        Ok(_parsed) => not_implemented().await.into_response(),
-        Err(err) => err.into_response(),
+    let parsed = match parse_profile(&headers, model, state.deploy_mode) {
+        Ok(parsed) => parsed,
+        Err(err) => return err.into_response(),
+    };
+
+    let messages = extract_messages(object);
+    let prompt = messages
+        .iter()
+        .map(|m| m.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    match dispatch_local(&state.cards, state.supervisor.as_ref(), &parsed, messages).await {
+        Err(DispatchError::Rejection(rejection)) => rejection_response(rejection),
+        Err(DispatchError::Internal(message)) => {
+            error_envelope(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", message)
+        }
+        Ok(outcome) => match &outcome.result {
+            Err(backend_err) => backend_error_response(backend_err, &outcome),
+            Ok(chat_response) => {
+                let requested_model = model.unwrap_or(chat_response.model.as_str());
+                let body = openai_chat_completion(&chat_response.content, requested_model, &prompt);
+                let mut response = (StatusCode::OK, Json(body)).into_response();
+                apply_decision_headers(&mut response, &outcome);
+                response
+            }
+        },
     }
 }
 
@@ -485,10 +637,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn chat_completions_valid_request_is_not_yet_implemented_but_well_formed() {
-        // R2-D task 1 scope: profile parsing only. A well-formed request
-        // still answers 501 (dispatch lands in a follow-up PR) but must
-        // have already passed every 400-producing check.
+    async fn chat_completions_no_components_is_local_only_unavailable() {
+        // No cards at all: decide() rejects before any candidate is
+        // chosen, so there's no X-iDoris-Served-Locality to set, and per
+        // R2-D task 3, zero remote egress is trivially true (no remote
+        // path exists yet).
         let app = build_app(AppState::default());
         let response = app
             .oneshot(post_chat(
@@ -497,8 +650,86 @@ mod tests {
             ))
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(!response.headers().contains_key(HEADER_SERVED_LOCALITY));
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["error"]["type"], "local_only_unavailable");
+    }
+
+    /// A candidate was chosen (decide() succeeded) but no Supervisor is
+    /// wired: still 503 local_only_unavailable, but now WITH
+    /// X-iDoris-Served-Locality set, since a candidate genuinely was
+    /// selected before the failure.
+    #[tokio::test]
+    async fn chat_completions_candidate_chosen_but_no_supervisor_still_sets_served_locality() {
+        let state = AppState {
+            cards: vec![sample_component_card("local-1")],
+            ..AppState::default()
+        };
+        let app = build_app(state);
+        let response = app
+            .oneshot(post_chat(
+                r#"{"model":"idoris/daily","messages":[{"role":"user","content":"hi"}]}"#,
+                &[],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response.headers().get(HEADER_SERVED_LOCALITY).unwrap(),
+            "loopback"
+        );
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["error"]["type"], "local_only_unavailable");
+        // reason_code carries the specific backend error, distinct from
+        // the spec-level `type` -- here it's supervisor_unavailable, not
+        // some other reason a real backend call could fail for.
+        assert_eq!(json["error"]["reason_code"], "supervisor_unavailable");
+    }
+
+    #[tokio::test]
+    async fn chat_completions_succeeds_against_a_mock_supervisor() {
+        let card = sample_component_card("local-1");
+        let adapter = std::sync::Arc::new(idoris_backend::MockAdapter::new(vec![
+            idoris_backend::ModelInfo {
+                id: "local-1".to_string(),
+                memory_gb: 1.0,
+            },
+        ]));
+        let supervisor =
+            idoris_backend::Supervisor::spawn(adapter, idoris_backend::SupervisorConfig::default())
+                .unwrap();
+        let state = AppState {
+            cards: vec![card],
+            supervisor: Some(supervisor),
+            ..AppState::default()
+        };
+        let app = build_app(state);
+        let response = app
+            .oneshot(post_chat(
+                r#"{"model":"idoris/daily","messages":[{"role":"user","content":"hello there"}]}"#,
+                &[],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(HEADER_SERVED_LOCALITY).unwrap(),
+            "loopback"
+        );
         assert!(response.headers().contains_key(HEADER_RECORD_ID));
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["object"], "chat.completion");
+        assert_eq!(json["model"], "idoris/daily");
+        assert!(
+            json["choices"][0]["message"]["content"]
+                .as_str()
+                .unwrap()
+                .contains("hello there")
+        );
     }
 
     #[tokio::test]
