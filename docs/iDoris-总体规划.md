@@ -82,20 +82,22 @@
    - **隐私**：按隐私要求硬性淘汰候选（`local_only` 只保留 loopback 候选），并对内容过闸。它在最前，意图判断不能放宽隐私要求。
    - **意图**：根据任务画像和意图，确定所需能力、路径或工具链，得到候选集。本地优先，本地能满足就不走付费路径。
    - **预算**：只作用于**选中路径里有成本的候选**，在准入时原子 reserve。路径需要付费、但预算不足时返回 402，这是终态拒绝；只有调用方显式声明 `X-iDoris-Fallback` 时才退回本地，并在响应头里明示。**不在意图之前做全局预算闸**，因为那样既会误伤零成本的本地路径，又会让"预算先剔除远程、再由意图在剩余候选里挑"变成一次静默降级。
+   - **唯一例外**：全局 kill switch 和账户熔断这类 O(1) 检查，作为最外层兜底放在最前面。〔Pipelock、OmniRoute〕这一顺序在 blog 全量重读中有 5 篇独立文章支持（semantic-router、ClawRouter、OpenSquilla、treg、openminis），没有找到支持"预算先于意图"的文章。
    - 为什么不能被绕过：意图只负责"选路"，不负责"放行"。凡是付费候选，都必须通过预算的原子 reserve 才能执行，意图没有能力跳过这一步。
 2. **隐私只能收紧，不能放宽**：`local_only` fail-closed。不管是意图推断、模型判定、下层策略还是调用方自述，都只能让隐私要求更严，不能让它更松。★
-3. **预算是拒绝不是降级**；★ **价格未知 ≠ 免费**：远程模型价格未知时，要么拒绝，要么按保守上限估算。
+3. **预算是拒绝不是降级**；★ **价格未知 ≠ 免费**：远程模型价格未知时，要么拒绝，要么按保守上限估算。（对照：TokenTracker 这类只读统计工具在价格未知时按 $0 计，但 iDoris 是准入网关，后果不同，所以不采用。）
 4. **租户硬隔离**在数据访问层实现；FU-15：新增有状态组件时必须主动接入 tenancy 层。
 5. **审计账本只存元数据**（字段白名单 + 黑名单闸门）。★ 轨迹是另一个模块，客户可选，与审计物理分离（§5）。
 6. **策略是数据**，★ 而且所有写入都走「**提议 → diff → 人批准 → 版本化 → 可撤销**」。〔exxperts、Virtual AI Infra Team〕
 7. ★ **可信网关 / 不可信执行 / 确定性策略**：凭证和策略留在网关侧；后端和订阅 CLI 都视为不可信执行。〔openclaw-gateway〕
-8. ★ **不静默**：不支持的请求参数要么真实兑现，要么显式 400；配置写了但不会生效，就拒绝启动；降级必须在响应头里回传。〔localagi 拆解、Pipelock 实测、Rapid-MLX、Krill〕
+8. ★ **不静默**：不支持的请求参数要么真实兑现，要么显式 400；配置写了但不会生效，就拒绝启动；降级必须在响应头里回传。〔localagi 拆解、Pipelock 实测、Rapid-MLX、Krill〕**判定器不可用时**，`/v1/systemone` 和意图判定默认**拒绝**（`reason_code: judge_unavailable`）。只有调用方显式接受时，才允许用宿主模型模拟判定，此时响应必须带 `judge_mode: simulated` 和 `calibrated: false`。〔jev-skill〕另外，由模型给出的阈值或置信度**只能收紧，不能放宽**（做 clamp）。〔virtual-ai-infra-team〕fail-closed 必须是**默认值**，不能是需要手动打开的选项。〔openclaw-gateway"默认不开启硬化"的反例〕
 9. ★ **日志即运行时**：每个请求一条追加式事件流。审计、用量、UI、轨迹、回放都是这条流的**投影**，不各写一份。〔maka「Log is the Runtime」〕
 10. ★ **模型只提议，代码判决**：路由学习、模型升级、adapter 晋升，最终结论都由确定性代码给出；**没有合格候选时保留现状，这算正常结果**。〔virtual-ai-infra-team〕
 11. ★ **本地优先不等于只用本地**：按敏感度分路由；远程路径要去关联，不带用户和租户标识出站。〔vitalik-ai-survival-guide〕
 12. ★ **授权结构化**：调用方的自我声明永远不能放宽授权；只接白名单 provider，未审核的中转站不得注册。〔pentest-harness 拆穿〕
 13. **License 红线**（扩充）：LiteLLM `enterprise/`、Dify 多租户、ComfyUI GPL、★ LobeHub 社区许可、HugAgentOS 的「禁竞争性多租户 SaaS」条款，都不得引入代码。
 14. **进程边界即授权边界**；不 vendor 第三方源码；版本一律钉死。
+15. ★ **元数据小、始终在场；内容大、按需加载**：路由、判定、审计只依赖元数据；内容只在确实需要时才进入上下文或存储访问。"Context is not history"：发给模型的上下文可以裁剪，但完整的决策证据链不能丢。〔Agent Skills 渐进披露、Maka〕（2026-09-27 blog 重读新增）
 
 ---
 
@@ -167,7 +169,7 @@
 | **Runtime Supervisor** | 从「一个平台一个后端」改为「**一个平台多个后端，按任务分派**」：oMLX 跑大模型、mlx_lm.server 做 Apple 官方保底、**llama.cpp GGUF 跑长上下文和 Windows**（MLX 的 `--kv-bits` 会禁用批处理）、Apple Foundation Models 当系统自带的零预算小脑、嵌入/重排进程单独跑 | M1 Max 64GB 方案（用户本人）、WWDC26、docs/13 §3.3 |
 | **全局内存账本** | oMLX 的 `model_memory_max` 只管它自己；Supervisor 汇总所有后端占用，作为 admission 的唯一依据 | M1 Max 64GB 方案 |
 | catalog 增维 | 新增 `task`（chat/embed/rerank/asr/ocr/guard/decide）、`format×platform` 可用矩阵、`agent/tool_use` 能力维度、「自报 vs 实测」标记；发布前核对实际文件是否存在 | SIE、QUASAR、spark-x、needle2 |
-| 会话亲和 | 同一会话路由到同一个已加载实例，保住 prefix/KV 缓存；隐私脱敏必须确定性（同一实体用同一个占位符），否则会破坏缓存 | LIM、omniroute cache-optimized、tare |
+| 会话亲和 | 同一会话路由到同一个已加载实例，保住 prefix/KV 缓存；隐私脱敏必须确定性（同一实体用同一个占位符），否则会破坏缓存。组装 prompt 时按**全局层 → 会话层 → 易变层**排列；request-id、时间戳这类易变元数据只走 header，**不得进入前两层** | LIM、omniroute cache-optimized、Anthropic commerce-agents；"稳定占位符"这条是由 tare 的"前缀缓存对字节敏感"推导出来的（tare 原文没有直接讨论脱敏） |
 | **内置基准并存库** | tok/s、TTFT、峰值内存、并发曲线，记录均值 ± 95% CI 和测试条件，按硬件 × 量化 × 版本存档，用来校准推荐器 | llm-dock、ferrum |
 | **升级/切换流程** | 候选 → 预检 → 基线 → **计划冻结** → 维护窗口 → 实验 → Selector 判决（门槛取最严，**默认保留现状**）→ 同端口晋升 → 在线复验 → 提交或回滚；门禁包含**贪心输出逐 token 比对**和场景评测；全程产出可复算的证据包 | virtual-ai-infra-team |
 | 真模型 live 测试层 | 适配器除了 mock 黄金测试，还要有每周或手动触发的真模型一致性测试（oMLX 在场时才跑）。这是 FU-16 的长期解 | krill（日常 CI 绿、真模型测试连续 6 周失败） |
@@ -584,6 +586,38 @@ docs/15 的设计**保留并作为落地依据**。调研补充如下：
 | 沿用 | B6（动作审批 sunset 条件）、B7（跨组件 tenant 凭据）、W-1 | 不变，M8 前定 |
 
 ---
+
+## 10.1 blog 全量重读后的修订（2026-09-27）
+
+**为什么要重读**：blog MCP 的 `search_posts` 无论 `limit` 设多少，最多只返回 20 条，而且按时间倒序而不是按相关度排序。之前按关键词检索时，较早的文章被截掉了。这次改为从 RSS 取得全量 729 篇的索引，粗筛后逐篇判断相关性，相关文章全文精读：路由类 58 篇、隐私与预算类 39 篇、审计与学习类 51 篇。原文与过筛表见 [`research/blog-reread/`](research/blog-reread/)。
+
+**结论**：没有颠覆性冲突。前一轮 106 篇的结论已经被规划吸收。以下是采纳的补充，标 ★ 的已直接写进上面的不变式：
+
+| # | 修订 | 落点 | 来源 |
+|:---|:---|:---|:---|
+| B-1 ★ | 处理顺序改为 隐私 → 意图 → 预算，kill switch 作为 O(1) 例外 | 不变式 #1 | semantic-router、ClawRouter、OpenSquilla、treg、openminis |
+| B-2 ★ | 判定器不可用时默认拒绝；模拟判定必须显式声明并标注；模型给出的阈值只能收紧 | 不变式 #8、§4.4 | jev-skill、virtual-ai-infra-team |
+| B-3 ★ | 元数据与内容分离升为通用不变式 | 不变式 #15 | Agent Skills、Maka |
+| B-4 ★ | prompt 缓存三层分段，易变元数据不进前两层 | §4.3 会话亲和、R2 | Anthropic commerce-agents |
+| B-5 | 模型升级的"计划冻结"要把 harness（提示词模板、工具描述、判定 prompt）一起版本化；晋升报告要给出"是否需要调整 harness" | §4.3 升级流程 | CMU harness 论文 |
+| B-6 | 402 响应体结构化：`balance_minor`、`estimated_cost_minor`、`topup_hint` | §4.6、接口规范下一版 | treg |
+| B-7 | reserve（能否发起）与 settle（扣费）拆成两个接口，分别调用、分别测试 | §4.6 | LoopX |
+| B-8 | 断路器默认参数：OAuth 3 次、API Key 5 次、本地 2 次；恢复窗口 60s/30s/15s | §4.6 | OmniRoute |
+| B-9 | 敏感确认令牌绑定"操作 + 上下文哈希"；外部凭证按次派发，短 TTL（约 10 分钟），落盘只存哈希 | §4.2、§4.5 闸二 | openclaw-gateway、onecli、dsh-remote |
+| B-10 | "本地存储"与"本地推理/出站"是两个维度，UI 和文档必须分开表述 | §4.5、§6 | vitalik、exxperts、garmin-mcp-local、openminis |
+| B-11 | 学习层在 ① 之前插入 **⓪ 轨迹反思**：用误判轨迹改 prompt 或规则，产物是可审查的文本 diff，不改权重 | §4.8 | GEPA、learning-from-failure |
+| B-12 | RL 奖励加路径惩罚：超预算尝试、绕过隐私闸的重试、反复触碰授权边界都要扣分 | §4.8 | RLVP |
+| B-13 | 删除分两类：用户行使删除权时，硬删除并留墓碑；非合规的失效（效果差、误判、回滚）只改状态，不删证据 | §5.6 | Dense-Mem、WikiSkill |
+| B-14 | 决策账本增加 `causal_ref: [decision_id]`；可解释的判定器额外记录贡献最大的 1–3 条依据 | §4.7 | Semantica、Belief Context Graph |
+| B-15 | 策展时按来源（key/tenant）隔离候选池，批准时逐个来源确认 | §5.6 | Memory Harness |
+| B-16 | 管理面"请求详情"支持分叉：在某个决策点改判，做只读的假设性重放；审批用分阶段看板 | §6.2 | Retrace、织影 |
+| B-17 | 本地训练：数据干净比数量多更重要；多存 checkpoint，挑最佳的一个；上线前必须过 eval 门禁 | §5.8、M7 | train-character-lora-flux-mac 等 |
+| B-18 | SQLite → Postgres 的非破坏性迁移四步：起并行实例 → 复制并校验 → 短暂切换 → 原文件不再写入 | M8 | Trinity |
+| B-19 | 组合风险检测（Lethal Trifecta）归 Agent24。iDoris 只提供单请求原语（`/v1/systemone`、`/v1/inspect`） | 接口规范下一版（需与 Agent24 协商） | archestra |
+| B-20 | capabilities 预留负向路由字段 `avoid_for` | M7+ 技术债 | google/skills（67% 负向路由） |
+| B-21 | 转发到上游必须有超时（TS 参考实现目前没有，R0 套件发现） | R2、FU | R0 conformance todo |
+
+**对 blog MCP 的建议**：给 `search_posts` 加上按相关度排序和分页（offset），否则今后所有检索都会碰到同样的截断问题。
 
 ## 11. 文档治理
 
