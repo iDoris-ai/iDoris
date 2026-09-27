@@ -60,6 +60,10 @@ pub struct PolicyCtx<'a> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stage {
     RoleCapability,
+    /// M1：候选在角色/能力匹配后全部因为价格未知/非法（不变式 #3）被剔除。
+    /// 之前这种情况会落到 `Admission`（甚至 `RoleCapability`）阶段码上，
+    /// 让调用方去错误的地方排查——真正原因是定价，不是准入或角色匹配。
+    Pricing,
     Admission,
 }
 
@@ -70,6 +74,9 @@ pub enum ReasonCode {
     PrivacyTightenedByContent,
     RoleMatched(Role),
     RoleFallbackCapabilityOnly,
+    /// M1：至少有一个角色/能力匹配的候选因为价格未知/非法被剔除（不代表全部
+    /// 被剔除——全部被剔除见 [`Stage::Pricing`]）。
+    PriceUnknownExcluded,
     BudgetWithinLimit,
     BudgetNoTenantContext,
     BudgetFallbackToFreeCandidate,
