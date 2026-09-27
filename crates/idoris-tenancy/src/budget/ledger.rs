@@ -402,10 +402,36 @@ impl BudgetLedger {
         let mut conn = self.lock();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
 
-        let config = load_config(&tx, scope)?.ok_or_else(|| BudgetError::NotConfigured {
-            scope: scope.clone(),
-        })?;
-        let period = billing_period_key(now_ms, &config.billing_timezone)?;
+        // B-3 (Opus Tier-2 re-review): the sub-scope four-tuple config is
+        // the *optional* finer layer, the tenant-level total is the
+        // (contract-tenancy §3) primary dimension — not the other way
+        // around. `NotConfigured` only fires when *neither* is set; a
+        // tenant with no sub-scope config at all can still `reserve` purely
+        // against its tenant-level total.
+        let sub_config = load_config(&tx, scope)?;
+        let tenant_cfg = load_tenant_config(&tx, &scope.tenant_id)?;
+        if sub_config.is_none() && tenant_cfg.is_none() {
+            return Err(BudgetError::NotConfigured {
+                scope: scope.clone(),
+            });
+        }
+
+        // Period bucketing prefers the sub-scope's own zone when it exists
+        // (unchanged from before); with no sub-scope config, falls back to
+        // the tenant's zone. Both `None` was already rejected above, so one
+        // of the two branches below always has a `billing_timezone` to use;
+        // the `NotConfigured` fallback in the `None`/`None` arm is
+        // unreachable in practice but keeps this total instead of relying
+        // on a panic-capable `expect`.
+        let period = match (&sub_config, &tenant_cfg) {
+            (Some(cfg), _) => billing_period_key(now_ms, &cfg.billing_timezone)?,
+            (None, Some(tenant)) => billing_period_key(now_ms, &tenant.billing_timezone)?,
+            (None, None) => {
+                return Err(BudgetError::NotConfigured {
+                    scope: scope.clone(),
+                });
+            }
+        };
 
         // Expired reservations already stop counting toward the balance sum
         // below (it filters `expires_at_ms > now_ms`); flipping their status
@@ -413,26 +439,25 @@ impl BudgetLedger {
         // clear `ReservationNotActive` instead of silently succeeding.
         sweep_expired_scope(&tx, scope, &period, now_ms)?;
 
-        let sub_spent = spent_for(&tx, scope, &period)?;
-        let sub_reserved = active_reserved_for(&tx, scope, &period, now_ms)?;
-        let sub_committed = checked_add_i64(sub_spent, sub_reserved);
-
-        if estimated_cost_minor > checked_sub_i64(config.limit_minor, sub_committed) {
-            tx.commit()?; // nothing written yet, but keep the sweep above.
-            return Err(BudgetError::exceeded(
-                scope.tenant_id.clone(),
-                config.limit_minor,
-                sub_committed,
-                estimated_cost_minor,
-            ));
+        if let Some(sub_cfg) = &sub_config {
+            let sub_spent = spent_for(&tx, scope, &period)?;
+            let sub_reserved = active_reserved_for(&tx, scope, &period, now_ms)?;
+            let sub_committed = checked_add_i64(sub_spent, sub_reserved);
+            if estimated_cost_minor > checked_sub_i64(sub_cfg.limit_minor, sub_committed) {
+                tx.commit()?; // nothing written yet, but keep the sweep above.
+                return Err(BudgetError::exceeded(
+                    scope.tenant_id.clone(),
+                    sub_cfg.limit_minor,
+                    sub_committed,
+                    estimated_cost_minor,
+                ));
+            }
         }
 
-        // H2: the tenant-level dimension is *optional* — only enforced if
-        // `configure_tenant` was ever called for this tenant. Both
-        // dimensions are checked in this same transaction, so either one
-        // insufficient rejects the whole `reserve` atomically with the
-        // other.
-        if let Some(tenant_cfg) = load_tenant_config(&tx, &scope.tenant_id)? {
+        // H2: the tenant-level dimension, checked in the same transaction as
+        // the sub-scope one above, so either insufficient rejects the whole
+        // `reserve` atomically with the other.
+        if let Some(tenant_cfg) = &tenant_cfg {
             let skip_zero_cost =
                 tenant_cfg.gate == SpendGate::PaidOnly && estimated_cost_minor == 0;
             if !skip_zero_cost {
@@ -1198,6 +1223,25 @@ mod tests {
         let scope = BudgetScope::new("acme-co", "key-1", "openai", "gpt-5");
         ledger.configure(&scope, 1_000, "UTC").expect("configure");
         assert!(ledger.reserve(&scope, Price::Known(1_000)).is_ok());
+    }
+
+    /// B-3 (Opus Tier-2 re-review): the reverse of the test above — a
+    /// tenant with *only* `configure_tenant` called (no sub-scope
+    /// `configure` at all) can still `reserve`. `NotConfigured` must only
+    /// fire when neither dimension is set up.
+    #[test]
+    fn reserve_with_only_tenant_config_succeeds() {
+        let path = temp_db_path("b3-only-tenant-config");
+        let ledger = BudgetLedger::open(&path).expect("open");
+        let scope = BudgetScope::new("acme-co", "key-1", "openai", "gpt-5");
+        ledger
+            .configure_tenant("acme-co", 1_000, "UTC", SpendGate::PaidOnly)
+            .expect("configure_tenant");
+        assert!(ledger.reserve(&scope, Price::Known(400)).is_ok());
+        assert_eq!(
+            ledger.tenant_balance("acme-co").expect("tenant_balance"),
+            600
+        );
     }
 
     /// H2: a tight tenant-level limit rejects even though the sub-scope
