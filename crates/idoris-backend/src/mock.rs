@@ -1,13 +1,14 @@
-//! A test-only [`RuntimeAdapter`] implementation with an in-memory catalog
-//! and load/unload bookkeeping, so router/tenancy code — and, in a
-//! follow-up PR, the Supervisor event loop — can be tested against the
-//! trait without a real inference engine. A later PR adds injectable
-//! latency/failure/OOM scripting on top of this; this version only carries
-//! over the R1 skeleton's behavior onto the renamed [`RuntimeAdapter`]
-//! trait.
+//! A test-only [`RuntimeAdapter`] implementation with an in-memory catalog,
+//! load/unload bookkeeping, and **injectable latency/OOM/failure
+//! scripting**, so the [`crate::supervisor`] event loop can be tested
+//! against realistic adapter misbehavior without a real inference engine.
+//! Configure with the `set_*` methods before sharing the adapter
+//! (typically via `Arc`) — the scripts and counters are interior-mutable
+//! so they keep working once shared.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use idoris_contracts::LoadPolicy;
@@ -16,6 +17,27 @@ use tokio_util::sync::CancellationToken;
 use crate::RuntimeAdapter;
 use crate::error::BackendError;
 use crate::types::{BackendStatus, ChatRequest, ChatResponse, ModelInfo, Pressure};
+
+/// One scripted result for a `load()` call. Consumed in order from the
+/// per-model queue set by [`MockAdapter::set_load_script`]; once the queue
+/// is empty every further call defaults to `Ok`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoadOutcome {
+    Ok,
+    /// Simulates the engine reporting an out-of-memory condition —
+    /// [`BackendError::oom`], which the Supervisor's load flow is allowed
+    /// to retry exactly once.
+    Oom,
+    /// A generic, non-retryable failure.
+    Fail,
+}
+
+#[derive(Default)]
+struct ModelScript {
+    load_delay: Duration,
+    load_outcomes: VecDeque<LoadOutcome>,
+    unload_delay: Duration,
+}
 
 struct MockState {
     catalog: Vec<ModelInfo>,
@@ -27,6 +49,13 @@ struct MockState {
     /// silently treating every repeat `load` as a no-op regardless of
     /// whether the requested policy changed.
     policies: HashMap<String, LoadPolicy>,
+    scripts: HashMap<String, ModelScript>,
+    load_calls: HashMap<String, u32>,
+    unload_calls: HashMap<String, u32>,
+    /// Ordered `"{op}:{id}:{phase}"` records (e.g. `"load:a:start"`,
+    /// `"load:a:end"`) — lets concurrency tests assert two operations'
+    /// effects never interleave, without depending on wall-clock timing.
+    event_log: Vec<String>,
     pressure: Pressure,
     model_memory_max_gb: f64,
 }
@@ -46,6 +75,10 @@ impl MockAdapter {
                 catalog,
                 loaded: Vec::new(),
                 policies: HashMap::new(),
+                scripts: HashMap::new(),
+                load_calls: HashMap::new(),
+                unload_calls: HashMap::new(),
+                event_log: Vec::new(),
                 pressure: Pressure::Ok,
                 model_memory_max_gb: 24.0,
             }),
@@ -58,9 +91,59 @@ impl MockAdapter {
             .map_err(|_| BackendError::lock_poisoned("MockAdapter's lock was poisoned by a panic"))
     }
 
+    fn script_mut<'a>(state: &'a mut MockState, id: &str) -> &'a mut ModelScript {
+        state.scripts.entry(id.to_string()).or_default()
+    }
+
     pub fn set_pressure(&self, pressure: Pressure) -> Result<(), BackendError> {
         self.lock()?.pressure = pressure;
         Ok(())
+    }
+
+    /// These `set_*`/`*_count`/`event_log` helpers are test-only
+    /// configuration/inspection points, not part of [`RuntimeAdapter`]. A
+    /// poisoned lock here only happens after some other assertion already
+    /// panicked mid-test, so they degrade to a no-op/default rather than
+    /// unwrapping — never introducing a *second*, confusing panic.
+    pub fn set_load_delay(&self, id: &str, delay: Duration) {
+        if let Ok(mut state) = self.state.lock() {
+            Self::script_mut(&mut state, id).load_delay = delay;
+        }
+    }
+
+    pub fn set_load_script(&self, id: &str, outcomes: Vec<LoadOutcome>) {
+        if let Ok(mut state) = self.state.lock() {
+            Self::script_mut(&mut state, id).load_outcomes = outcomes.into();
+        }
+    }
+
+    pub fn set_unload_delay(&self, id: &str, delay: Duration) {
+        if let Ok(mut state) = self.state.lock() {
+            Self::script_mut(&mut state, id).unload_delay = delay;
+        }
+    }
+
+    pub fn load_call_count(&self, id: &str) -> u32 {
+        self.state
+            .lock()
+            .ok()
+            .and_then(|state| state.load_calls.get(id).copied())
+            .unwrap_or(0)
+    }
+
+    pub fn unload_call_count(&self, id: &str) -> u32 {
+        self.state
+            .lock()
+            .ok()
+            .and_then(|state| state.unload_calls.get(id).copied())
+            .unwrap_or(0)
+    }
+
+    pub fn event_log(&self) -> Vec<String> {
+        self.state
+            .lock()
+            .map(|state| state.event_log.clone())
+            .unwrap_or_default()
     }
 
     /// The policy most recently applied to `id` via `load`, or `None` if it
@@ -85,9 +168,35 @@ impl RuntimeAdapter for MockAdapter {
     }
 
     async fn load(&self, id: &str, policy: Option<&LoadPolicy>) -> Result<(), BackendError> {
+        let (delay, outcome) = {
+            let mut state = self.lock()?;
+            if !state.catalog.iter().any(|m| m.id == id) {
+                return Err(BackendError::model_not_found(id));
+            }
+            *state.load_calls.entry(id.to_string()).or_insert(0) += 1;
+            state.event_log.push(format!("load:{id}:start"));
+            let script = Self::script_mut(&mut state, id);
+            let delay = script.load_delay;
+            let outcome = script.load_outcomes.pop_front().unwrap_or(LoadOutcome::Ok);
+            (delay, outcome)
+        };
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
+        }
+
         let mut state = self.lock()?;
-        if !state.catalog.iter().any(|m| m.id == id) {
-            return Err(BackendError::model_not_found(id));
+        match outcome {
+            LoadOutcome::Oom => {
+                state.event_log.push(format!("load:{id}:oom"));
+                return Err(BackendError::oom(id));
+            }
+            LoadOutcome::Fail => {
+                state.event_log.push(format!("load:{id}:fail"));
+                return Err(BackendError::Upstream {
+                    message: format!("mock adapter scripted failure loading {id}"),
+                });
+            }
+            LoadOutcome::Ok => {}
         }
         if !state.loaded.iter().any(|loaded| loaded == id) {
             state.loaded.push(id.to_string());
@@ -104,13 +213,25 @@ impl RuntimeAdapter for MockAdapter {
                 state.policies.remove(id);
             }
         }
+        state.event_log.push(format!("load:{id}:end"));
         Ok(())
     }
 
     async fn unload(&self, id: &str) -> Result<(), BackendError> {
+        let delay = {
+            let mut state = self.lock()?;
+            *state.unload_calls.entry(id.to_string()).or_insert(0) += 1;
+            state.event_log.push(format!("unload:{id}:start"));
+            Self::script_mut(&mut state, id).unload_delay
+        };
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
+        }
+
         let mut state = self.lock()?;
         state.loaded.retain(|loaded| loaded != id);
         state.policies.remove(id);
+        state.event_log.push(format!("unload:{id}:end"));
         Ok(())
     }
 
