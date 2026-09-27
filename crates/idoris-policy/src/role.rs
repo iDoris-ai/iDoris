@@ -163,20 +163,18 @@ pub fn parse_model_role(model: &str) -> Result<Option<Role>, RoleParseError> {
         .ok_or_else(|| RoleParseError::new(role_part))
 }
 
-/// 目录角色候选筛选（`roles.ts` / `recommend.ts` 共用的 `isEligibleForRole`
-/// 移植——两处历史 TS 实现就是同一个函数，这里同样只保留一份）。
+/// 是否是「健康、可以被任何路径考虑」的候选——不管最终要不要按具体角色筛选。
+/// 这是 `is_eligible_for_role` 和"无角色/auto/角色降级"这几条不查具体角色
+/// 成员关系的路径**共用**的门槛，抽出来是因为它们曾经各查各的：只有
+/// `is_eligible_for_role` 查了 `experiment`/`min_ram_gb`，另外三条路径（决策
+/// 管道 ②阶段的无角色分支、`idoris/auto` 分支、角色降级分支）完全没查，
+/// 意味着一张 `status: experiment` 或硬件不够的卡可以靠"不声明具体角色"绕过
+/// 硬门槛——这不是某条路径的 bug，是四条路径本该共用同一个门槛却没共用。
 ///
-/// - `role: Role::Auto` 一律不合格：`Auto` 没有对应候选列表（TS 的
-///   `CatalogRole = Exclude<Role, "auto">`），即使有张（不合规的）卡在
-///   `roles` 里错误声明了它，也不能靠这个巧合通过。
 /// - `status: experiment` 一律排除（跨 harness 基准不迁移）。
 /// - `min_ram_gb` 省略时不做硬件门槛过滤；传入时要求 `card.min_ram_gb <=
 ///   min_ram_gb`——任一是 `NaN` 时显式拒绝，不能让损坏数据静默 fail-open。
-/// - 角色匹配严格按 `card.roles`（第一条规则对 `Auto` 兜底）。
-pub fn is_eligible_for_role(card: &Card, role: Role, min_ram_gb: Option<f64>) -> bool {
-    if !role.is_catalog_role() {
-        return false;
-    }
+pub fn is_catalog_eligible(card: &Card, min_ram_gb: Option<f64>) -> bool {
     if card.experiment {
         return false;
     }
@@ -190,6 +188,24 @@ pub fn is_eligible_for_role(card: &Card, role: Role, min_ram_gb: Option<f64>) ->
     if let Some(min_ram_gb) = min_ram_gb
         && (min_ram_gb.is_nan() || card.min_ram_gb > min_ram_gb)
     {
+        return false;
+    }
+    true
+}
+
+/// 目录角色候选筛选（`roles.ts` / `recommend.ts` 共用的 `isEligibleForRole`
+/// 移植——两处历史 TS 实现就是同一个函数，这里同样只保留一份）。
+///
+/// - `role: Role::Auto` 一律不合格：`Auto` 没有对应候选列表（TS 的
+///   `CatalogRole = Exclude<Role, "auto">`），即使有张（不合规的）卡在
+///   `roles` 里错误声明了它，也不能靠这个巧合通过。
+/// - 健康门槛见 [`is_catalog_eligible`]。
+/// - 角色匹配严格按 `card.roles`（第一条规则对 `Auto` 兜底）。
+pub fn is_eligible_for_role(card: &Card, role: Role, min_ram_gb: Option<f64>) -> bool {
+    if !role.is_catalog_role() {
+        return false;
+    }
+    if !is_catalog_eligible(card, min_ram_gb) {
         return false;
     }
     card.roles.contains(&role)
@@ -369,5 +385,30 @@ mod tests {
 
         let card = sample_card("c1", &[Role::Daily]);
         assert!(!is_eligible_for_role(&card, Role::Daily, Some(f64::NAN)));
+    }
+
+    #[test]
+    fn is_catalog_eligible_matches_is_eligible_for_role_minus_the_role_check() {
+        // is_catalog_eligible 是 is_eligible_for_role 去掉角色成员检查后剩下
+        // 的那部分——两者对 experiment/min_ram_gb/NaN 的判断必须完全一致，
+        // 否则"无角色/auto/角色降级"这几条路径复用它就没有意义。
+        let mut experimental = sample_card("c1", &[Role::Daily]);
+        experimental.experiment = true;
+        assert!(!is_catalog_eligible(&experimental, None));
+
+        let mut too_big = sample_card("c1", &[Role::Daily]);
+        too_big.min_ram_gb = 64.0;
+        assert!(is_catalog_eligible(&too_big, None));
+        assert!(!is_catalog_eligible(&too_big, Some(16.0)));
+        assert!(is_catalog_eligible(&too_big, Some(64.0)));
+
+        let mut nan_card = sample_card("c1", &[Role::Daily]);
+        nan_card.min_ram_gb = f64::NAN;
+        assert!(!is_catalog_eligible(&nan_card, None));
+        assert!(!is_catalog_eligible(&nan_card, Some(16.0)));
+
+        let healthy = sample_card("c1", &[Role::Daily]);
+        assert!(!is_catalog_eligible(&healthy, Some(f64::NAN)));
+        assert!(is_catalog_eligible(&healthy, None));
     }
 }
