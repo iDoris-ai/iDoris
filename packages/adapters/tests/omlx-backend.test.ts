@@ -16,28 +16,39 @@ describe("OmlxBackend", () => {
     expect(f.mock.calls[0]?.[0]).toBe("http://127.0.0.1:8088/v1/models");
   });
 
-  it("load(resident) pins and pins=on_demand unpins", async () => {
-    const calls: Array<[string, unknown]> = [];
-    const f = vi.fn(async (url: string, init?: { body?: string }) => {
-      calls.push([url, init?.body]);
+  it("load(resident) pins and pins=on_demand unpins (0.6.4: PUT /admin/api/models/{id}/settings, flat body)", async () => {
+    const calls: Array<[string, string | undefined, unknown]> = [];
+    const f = vi.fn(async (url: string, init?: { method?: string; body?: string }) => {
+      calls.push([url, init?.method, init?.body]);
       return jsonRes({});
     });
     const b = new OmlxBackend({ fetchImpl: f as never });
     await b.load("Qwen3-8B", { mode: "resident", keepalive: { pinned: true }, admission: "coexist" });
     await b.load("VL-7B", { mode: "on_demand", keepalive: { idle_ttl_s: 300 }, admission: "requires_eviction" });
     expect(calls[0]?.[0]).toBe("http://127.0.0.1:8088/v1/models/Qwen3-8B/load");
-    expect(String(calls[1]?.[1])).toContain('"is_pinned":true');
-    expect(String(calls[3]?.[1])).toContain('"is_pinned":false');
+    expect(calls[1]?.[0]).toBe("http://127.0.0.1:8088/admin/api/models/Qwen3-8B/settings");
+    expect(calls[1]?.[1]).toBe("PUT");
+    expect(String(calls[1]?.[2])).toBe('{"is_pinned":true}');
+    expect(calls[3]?.[0]).toBe("http://127.0.0.1:8088/admin/api/models/VL-7B/settings");
+    expect(String(calls[3]?.[2])).toBe('{"is_pinned":false}');
   });
 
-  it("maps /api/status", async () => {
-    const f = vi.fn(async () => jsonRes({ model_memory_max: 16, model_memory_used: 13.25, loaded: ["Qwen3-8B"], pressure: "soft" }));
+  it("maps /api/status (0.6.4 field name: loaded_models)", async () => {
+    const f = vi.fn(async () =>
+      jsonRes({ model_memory_max: 16, model_memory_used: 13.25, loaded_models: ["Qwen3-8B"], pressure: "soft" }),
+    );
     const b = new OmlxBackend({ fetchImpl: f as never });
     expect(await b.status()).toMatchObject({ pressure: "soft", usedGb: 13.25, modelMemoryMaxGb: 16, loaded: ["Qwen3-8B"] });
   });
 
+  it("maps /api/status: falls back to legacy `loaded` field when `loaded_models` is absent", async () => {
+    const f = vi.fn(async () => jsonRes({ model_memory_max: 16, model_memory_used: 0, loaded: ["Qwen3-8B"] }));
+    const b = new OmlxBackend({ fetchImpl: f as never });
+    expect(await b.status()).toMatchObject({ loaded: ["Qwen3-8B"] });
+  });
+
   it("admission=coexist when loaded, else requires_eviction", async () => {
-    const f = vi.fn(async () => jsonRes({ loaded: ["A"], model_memory_max: 16 }));
+    const f = vi.fn(async () => jsonRes({ loaded_models: ["A"], model_memory_max: 16 }));
     const b = new OmlxBackend({ fetchImpl: f as never });
     expect(await b.admission("A")).toBe("coexist");
     expect(await b.admission("B")).toBe("requires_eviction");

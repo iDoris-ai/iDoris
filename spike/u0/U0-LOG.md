@@ -100,3 +100,34 @@
 1. U0-② 本地编排（免下载，可立即做）。
 2. U0-① 需你给 Anthropic/Gemini key（或确认"只测免费层+本地"）。
 3. U0-④ 待前两项就绪后串起来测。
+
+## 0.6.4 复测（2026-09-27）
+
+> 触发：FU-16（`config/components/omlx.yaml` pin 的是 `omlx@0.6.4`，但适配器与本日志此前只覆盖过 v0.4.3）。
+> 环境：本机 `/Applications/oMLX.app` `CFBundleShortVersionString = 0.6.4`；`omlx serve` 已在跑（未带 `--memory-guard`，`:8088`，鉴权 `Authorization: Bearer $OMLX_API_KEY`，key 读自本机 `Agent24/omlx.sh`，未写入任何文件/日志）。
+> 原则：不卸载用户当前已加载的模型（复测前 `loaded_models = ["GLM-OCR-bf16", "Qwen3.8-27B-OptiQ-4bit"]`）；只对未加载的小模型（`Qwen3-0.6B-4bit`）做 load/unload 并在结束后恢复原状。
+
+### 端到端结果表
+
+| 端点 | 0.4.3 行为（本日志此前记录/适配器假设） | 0.6.4 实测行为 | 是否变化 |
+|---|---|---|---|
+| `GET /v1/models` | `{data:[{id,...}]}` | 同形，`data[].id` 不变（18 个模型，含 builtin `MarkItDown`） | 否 |
+| `POST /v1/models/{id}/load` | 显式装载 | `curl -X POST .../v1/models/Qwen3-0.6B-4bit/load` → `200 {"status":"ok","model_id":...,"message":"Loaded ..."}`  | 否 |
+| `POST /v1/models/{id}/unload` | 显式卸载 | `curl -X POST .../v1/models/Qwen3-0.6B-4bit/unload` → `200 {"status":"ok","model_id":...}` | 否 |
+| `GET /api/status` 的 `model_memory_max`/`model_memory_used` | 内存核算字段 | 字段名不变，实测 `model_memory_max=55662788608`(51.84GB) `model_memory_used=22722550241`(21.16GB) | 否 |
+| `GET /api/status` 已加载模型列表 | 适配器/本日志假设字段名 `loaded` | **实测字段名是 `loaded_models`**（`["GLM-OCR-bf16","Qwen3.8-27B-OptiQ-4bit"]`），响应里**没有 `loaded` 键** | **是（字段改名，已修适配器）** |
+| `GET /api/status` 的 `pressure`（ok/soft/hard/ceiling） | 06 §10.3 抽象对应字段 | 本次实测实例未带 `--memory-guard` 启动，响应中**不含 `pressure` 字段**；是否在 0.6.4 的 memory-guard 模式下字段名不变，本次未验证（重启会连带卸载用户正在用的两个模型，按约束未做） | 未定（需要专门起隔离进程或征得同意重启，记为遗留缺口） |
+| `GET /v1/models/status`（补充端点，openapi 里仍存在） | U0 表中列过但未展开 | `{final_ceiling, current_model_memory, model_count, loaded_count, models:[{id,loaded,pinned,estimated_size,...}]}`；每模型 `pinned` 字段与 `is_pinned` 语义一致 | 否（形状更丰富，字段兼容） |
+| pin/unpin (`is_pinned`) | `POST /admin/settings` body `{model_settings:{id:{is_pinned}}}` | **`POST /admin/settings` → `404 Not Found`（路由已移除）**。经 `GET /openapi.json` 核对，新路由是 `PUT /admin/api/models/{id}/settings`，body 拍平为 `{is_pinned: bool}`（schema `ModelSettingsRequest`）；但实测 `PUT /admin/api/models/Qwen3-0.6B-4bit/settings` 用同一把推理 API key 调用返回 **`401 {"detail":"Admin authentication required"}`**——`/admin/api/*` 在 0.6.4 上要求独立 admin 会话认证（另有 `/admin/api/login`），推理 API key 不适用 | **是（端点搬家 + 新增鉴权门槛，已修适配器指向新端点；pin 语义本身在 0.6.4 上未打通，记为已知缺口）** |
+| `POST /v1/chat/completions`（非流式） | `{choices:[{message:{content}}]}` | 同形，`curl` 实测 `choices[0].message.content` 正常返回 | 否 |
+| `POST /v1/chat/completions`（流式 `stream:true`） | 未在 0.4.3 记录中展开 | SSE `data: {...choices:[{delta:{...}}]}` + 末尾 `data: [DONE]`，标准 OpenAI-compat chunk 形状（含 `reasoning_content` delta，adapter 目前不支持流式，行为未受影响） | 否（首次记录，形状是标准 OpenAI-compat） |
+
+### 复测后状态核对（确认无残留改动）
+- 复测前：`loaded_models=["GLM-OCR-bf16","Qwen3.8-27B-OptiQ-4bit"]`，`model_memory_used=22722550241`。
+- 复测后：`loaded_models=["GLM-OCR-bf16","Qwen3.8-27B-OptiQ-4bit"]`，`model_memory_used=22722550241`（与复测前完全一致；`Qwen3-0.6B-4bit` 已按预期卸载，pin 尝试因 401 未生效，无残留状态）。
+
+### 结论
+1. **`GET /v1/models`、显式 `load`/`unload`、`/api/status` 的内存字段、chat completions（非流式/流式）在 0.4.3 → 0.6.4 之间语义未变**，可以放心复用。
+2. **`/api/status` 已加载列表字段名从假设的 `loaded` 变成 `loaded_models`**——`packages/adapters/omlx/omlx-backend.ts` 的 `status()` 已改为优先读 `loaded_models`、兼容回退 `loaded`；这修复了一个实质 bug：修复前 `admission()` 会因为读不到已加载列表而**对已加载模型也一律误判成 `requires_eviction`**。
+3. **`is_pinned` 的设置端点搬家**（`POST /admin/settings` → `PUT /admin/api/models/{id}/settings`），适配器已切到新端点；但新端点在 0.6.4 上要求独立 admin 会话认证，**仅凭推理 API key 无法完成 pin**，这是一个新增的能力缺口，不是简单的路径改名能解决的——已在 `OmlxBackend` 头部注释、T1.2.2、本行分别记录，留给后续任务补 admin 会话支持。
+4. `pressure` 字段（ok/soft/hard/ceiling）本次未在 memory-guard 模式下复测（避免重启导致用户正在用的模型被卸载），是本轮复测唯一遗留的未验证项。

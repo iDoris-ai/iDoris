@@ -72,15 +72,15 @@
 
 ### T1.2.2 oMLX 适配器  `DONE`
 - **优先级**：high
-- **目标**：把 LoadPolicy 抽象映射到 oMLX v0.4.3 的真实 knob（U0 已实测全部端点）。
-- **开发范围**：`mode:resident → model_settings.is_pinned=true`；`on_demand → unpinned`；`evict_to_load → 依赖 ProcessMemoryEnforcer`；显式 `POST /v1/models/{id}/load` `/unload`；`admission` 读 `GET /api/status` 的 `model_memory_max` 与 loaded 列表。
+- **目标**：把 LoadPolicy 抽象映射到 oMLX 的真实 knob。**0.4.3 与 0.6.4 均已实测**（0.6.4 复测见 FU-16 / `spike/u0/U0-LOG.md`「0.6.4 复测」一节，2026-09-27）。
+- **开发范围**：`mode:resident → is_pinned=true`；`on_demand → unpinned`；`evict_to_load → 依赖 ProcessMemoryEnforcer`；显式 `POST /v1/models/{id}/load` `/unload`；`admission` 读 `GET /api/status` 的 `model_memory_max` 与已加载列表。**0.6.4 复测发现两处端点/字段漂移，已修**：① `/api/status` 已加载列表字段名是 `loaded_models`（不是 0.4.3 假设的 `loaded`，两者兼容解析）；② 设置 `is_pinned` 从 `POST /admin/settings`（0.6.4 上已 404）搬到了 `PUT /admin/api/models/{id}/settings`（body 拍平为 `{is_pinned}`）。**已知缺口**：该 admin 端点在 0.6.4 上要求独立 admin 会话认证，仅推理 API key 会被拒绝（401），pin 语义因此在 0.6.4 上未真正打通，需要新增 admin 会话能力才能修复，不在本次复测范围内。
 - **明确不做**：不封装 oMLX 的 `/v1/embeddings` `/v1/rerank` `/v1/responses`（M3 再说）；不处理 oMLX 升级（手动换 .app，用户操作）。
 - **依赖**：T1.2.1
 - **交付物**：`packages/adapters/omlx/`
 - **验收命令**：`pnpm --filter @idoris/adapters test:integration`（本机有 oMLX 时真起 `omlx serve --memory-guard balanced --memory-guard-gb 16` 跑 load→warm-hit→evict 序列；**无 oMLX 时必须打印 SKIPPED 并以非零以外方式明示跳过，不得静默通过**）
 - **涉及文件**：`packages/adapters/omlx/`
-- **风险/回滚**：v0.4.3 已知小限制——VLM 引擎 guard 传播告警（`could not resolve scheduler for VLMBatchedEngine`），不阻塞，记 followup
-- **证据**：PR #16（已合并进 `preview`；门禁全绿）
+- **风险/回滚**：v0.4.3 已知小限制——VLM 引擎 guard 传播告警（`could not resolve scheduler for VLMBatchedEngine`），不阻塞，记 followup。v0.6.4 已知缺口——pin (`is_pinned`) 端点需要 admin 会话认证，适配器暂无该能力，`load(id,{mode:"resident"})` 在 0.6.4 上会因 401 抛错
+- **证据**：PR #16（已合并进 `preview`；门禁全绿）；0.6.4 复测证据见 FU-16 对应 PR
 
 ### T1.2.3 跨平台后端探测骨架  `DONE`
 - **优先级**：mid
@@ -427,7 +427,7 @@
 
 | # | 来源 | 内容 | 状态 |
 |:---|:---|:---|:---|
-| FU-1 | U0 实测 | oMLX v0.4.3 VLM 引擎 guard 传播告警（`could not resolve scheduler for VLMBatchedEngine`），不阻塞，等新版 .app | OPEN |
+| FU-1 | U0 实测 | oMLX v0.4.3 VLM 引擎 guard 传播告警（`could not resolve scheduler for VLMBatchedEngine`），不阻塞，等新版 .app。**2026-09-27 复测**：本机已是 0.6.4（`/Applications/oMLX.app`），该告警未复现验证（本次复测未跑 memory-guard 场景，见 FU-16）；0.4.3 与 0.6.4 均已实测端点 | OPEN |
 | FU-2 | U0 环境探测 | 本机 python 3.9.6，mlx-lm 训练可能需 3.10+，M3 开工前处理 | OPEN |
 | FU-3 | 05 §8 第 5 条 | 凭证网关（onecli 式 MITM）2026-09-07 拍板记 BACKLOG；architecture 已留 `CredentialProvider` 抽象位 | OPEN |
 | FU-4 | 跨仓库 | iDoris-website PR #4 的 R0（网关归属 + 多租户语义）**已拍板归 iDoris**（2026-09-07），落为 F1.5 + F2.6；下游 `products/gateway/` 降级为消费者 | CLOSED |
@@ -439,7 +439,7 @@
 | FU-13 | 接口缺口（本轮核 Agent24 ADR-032 时暴露）| **没有生产默认端口**：`startRouter` 的 `port` 默认 `0`（随机，供测试并行），于是下游无法据此写 `IDORIS_URL`，而我们既没有 `IDORIS_PORT` 也没有固定默认值。部署方目前只能自己钉死端口 | OPEN |
 | FU-14 | 架构缺口 | **personal 模式没有「调用方身份」概念**：loopback 绑定限制的是**可达范围**不是授权，同机任何进程都能调、不需任何凭据。所以「同一实例按调用方区分策略」（如本人聊天可用订阅、Agent24 模块不可用）目前做不到，只能靠起第二个 Router 实例（进程边界=授权边界）。要做就得在 routing policy 加规则维度并升契约版本，**不走 caller header**（调用方自带排除项是失败开放） | OPEN |
 | FU-15 | 护栏（三次同类事故后立的）| **新增带状态的组件必须主动过一遍 tenancy 层**。#21/#22 建立的「租户硬隔离」只覆盖数据访问层(usage/budget/audit)；此后 #25 的响应缓存、以及合并 #32 时的 deployMode 透传，都是**全新状态没有自动继承那套隔离**。硬隔离目前是一条**约定**，不是新代码会自动撞上的护栏 —— 在它成为机械强制之前，每新增一处状态都要手工核对 | OPEN |
-| FU-16 | 版本漂移（本轮评审发现）| **`version_pin` 指向一个从未复测过端点的版本**：`config/components/omlx.yaml` pin 的是 `omlx@0.6.4`（与本机 `/Applications/oMLX.app` 实测一致），但 T1.2.2 的适配器是照 **v0.4.3** 的 knob 写的，U0 实测日志也只覆盖 0.4.3。两者之间隔着两个 minor 版本，没有任何证据说明端点未变。**待办**：拿 API key 重跑一遍 U0 的端点清单打在 0.6.4 上，确认 `is_pinned` / `/v1/models/{id}/load|unload` / `/api/status` 的 `model_memory_max` 语义没变，然后把 T1.2.2、FU-1、`spike/u0/U0-LOG.md` 的版本号一并更正；在此之前，「已实测全部端点」这句只对 0.4.3 成立 | OPEN |
+| FU-16 | 版本漂移（本轮评审发现）| **`version_pin` 指向一个从未复测过端点的版本**：`config/components/omlx.yaml` pin 的是 `omlx@0.6.4`（与本机 `/Applications/oMLX.app` 实测一致），但 T1.2.2 的适配器是照 **v0.4.3** 的 knob 写的，U0 实测日志也只覆盖 0.4.3。两者之间隔着两个 minor 版本，没有任何证据说明端点未变。**待办**：拿 API key 重跑一遍 U0 的端点清单打在 0.6.4 上，确认 `is_pinned` / `/v1/models/{id}/load|unload` / `/api/status` 的 `model_memory_max` 语义没变，然后把 T1.2.2、FU-1、`spike/u0/U0-LOG.md` 的版本号一并更正；在此之前，「已实测全部端点」这句只对 0.4.3 成立。**2026-09-27 复测结论**：`GET /v1/models`、`/v1/models/{id}/load\|unload`、`/api/status` 的 `model_memory_max`、chat completions（流式+非流式）均未变；但发现两处真实漂移并已修——① `/api/status` 已加载列表字段名从（假设的）`loaded` 变成 `loaded_models`；② 设置 `is_pinned` 的端点从 `POST /admin/settings`（0.6.4 已 404）搬到 `PUT /admin/api/models/{id}/settings`，且该 admin 路由在 0.6.4 上要求独立 admin 会话认证，仅推理 API key 不可用（401），pin 语义目前对 0.6.4 未完全打通（需要新增 admin 会话能力，记在本行未来跟进）。详见 `spike/u0/U0-LOG.md`「0.6.4 复测（2026-09-27）」与 PR | PR_OPEN |
 | FU-12 | 评审 | codex 指出 B1 最可能在六个月后被推翻，**触发条件很低**：出现第一条同时依赖内容+收件人+渠道+副作用的策略即可（如「金额超 ฿10,000 或群聊含非客户成员时，发账单必须人工批准」）。届时会改成「Python 提供签名的领域校验证据，Rust 持唯一授权状态机与最终否决权」——本稿已按这个形状写，但要盯着别退回「动作/输出互不重叠」的旧说法 | OPEN |
 | FU-11 | License 红线（自下游 `oss-due-diligence.md` 引入）| **LiteLLM `enterprise/` 目录绝不引用**（若将来做能力②）· **Dify 禁多租户**——多租户现已归 iDoris，此条直接约束选型 · ComfyUI GPL 只能隔离进程调用 | OPEN |
 | FU-8 | 验收方法论 | **「绿灯不代表你以为的那件事成立」**——两半：① **断言错了**（异常子类被父类 `expect_raises` 吞掉；无出处答案被数字校验误接住，换成不含数字的答案就放行）；② **检查不承重**（某步骤去掉后整套自检仍全绿）。<br>**根因常是量纲不匹配**：判据全写成「至少有 N 个」，而想抓的错误方向是「你多算了」——「至少」型判据测不出多算，那格正对照**从一开始就不可能承重**。**检查的量纲要和它想抓的错误方向对得上。**<br>我方对应防御：`test:privacy` 的出站计数器（不只断言 503）、`test:billing` 的 `range_utc`（不只断言 totals）、`test:egress` 的正对照、T1.5.2/3/4 的配对变异测试。共同点是**不给自己留一条「看起来做了」的退路**。<br>**待办**：把这条写进未来每个 task 的验收设计检查——新增验收命令时问一句「这个断言能不能因为别的原因变绿？它的量纲对得上要抓的错误方向吗？」 | OPEN |

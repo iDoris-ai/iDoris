@@ -26,11 +26,21 @@ const DEFAULT_URL = "http://127.0.0.1:8088";
 
 /**
  * oMLX 适配器（T1.2.2）：把 LoadPolicy 抽象映射到 oMLX 实测端点（spike/u0/U0-LOG.md）。
- * - resident → model_settings.is_pinned=true；on_demand → unpinned
+ * - resident → is_pinned=true；on_demand → unpinned
  * - 显式 POST /v1/models/{id}/load | /unload
- * - admission / status 读 GET /api/status（model_memory_max + loaded）
+ * - admission / status 读 GET /api/status（model_memory_max + loaded_models）
  *
  * ⚠️ 本适配器是本仓内唯一允许出现 "omlx" 字样的实现层；Router 核心不得引用它。
+ *
+ * 版本注记（FU-16，0.6.4 复测，见 spike/u0/U0-LOG.md「0.6.4 复测」一节）：
+ * - `/api/status` 的已加载模型字段在 0.6.4 上是 `loaded_models`（不是 v0.4.3 假设的 `loaded`）；
+ *   两个字段名都兼容解析，防止将来再次改名时静默退化成空数组。
+ * - 设置 `is_pinned` 的端点在 0.6.4 上从 `POST /admin/settings`（已 404）搬到了
+ *   `PUT /admin/api/models/{id}/settings`（body 从 `{model_settings:{id:{is_pinned}}}` 拍平成 `{is_pinned}`）。
+ *   **已知缺口**：`/admin/api/*` 在 0.6.4 要求独立的 admin 会话认证，仅凭 `/v1/*` 用的推理 API key
+ *   会被拒绝（`401 Admin authentication required`，已实测）。本适配器没有 admin 会话能力，
+ *   因此 `load(id, { mode: "resident" })` 目前在 0.6.4 上会因这个 401 而抛错，而不是真的把模型 pin 住；
+ *   pin 语义在拿到 admin 会话支持前对 0.6.4 是未打通的（需要新增能力，不在本次复测范围内修复）。
  */
 export class OmlxBackend implements ModelBackend {
   private readonly baseUrl: string;
@@ -71,7 +81,9 @@ export class OmlxBackend implements ModelBackend {
 
   async status(): Promise<BackendStatus> {
     const body = (await this.json("GET", "/api/status")) as Record<string, unknown>;
-    const loaded = Array.isArray(body.loaded) ? body.loaded.filter((x): x is string => typeof x === "string") : [];
+    // 0.6.4 实测字段名是 loaded_models；loaded 是 v0.4.3 假设的旧名，两者都兼容解析（见头部注记）。
+    const rawLoaded = body.loaded_models ?? body.loaded;
+    const loaded = Array.isArray(rawLoaded) ? rawLoaded.filter((x): x is string => typeof x === "string") : [];
     const max = Number(body.model_memory_max ?? 0);
     const used = Number(body.model_memory_used ?? 0);
     const pressure = typeof body.pressure === "string" ? (body.pressure as Pressure) : "ok";
@@ -87,7 +99,9 @@ export class OmlxBackend implements ModelBackend {
   }
 
   private async setPinned(id: string, pinned: boolean): Promise<void> {
-    await this.json("POST", "/admin/settings", { model_settings: { [id]: { is_pinned: pinned } } });
+    // 0.6.4：POST /admin/settings 已 404；换成 PUT /admin/api/models/{id}/settings，body 拍平为 {is_pinned}。
+    // 该端点在 0.6.4 上要求 admin 会话认证，仅推理 API key 会被拒绝（401）——见头部版本注记。
+    await this.json("PUT", `/admin/api/models/${encodeURIComponent(id)}/settings`, { is_pinned: pinned });
   }
 
   private headers(): Record<string, string> {
