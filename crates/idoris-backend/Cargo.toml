@@ -16,12 +16,17 @@ serde = { workspace = true }
 thiserror = { workspace = true }
 async-trait = { workspace = true }
 tokio-util = { workspace = true }
-# `test-util` (for `#[tokio::test(start_paused = true)]`'s virtual clock) is
-# only exercised by this crate's own tests, but the Supervisor event loop
-# itself (`spawn`/`sync::{mpsc,oneshot}`/`time::sleep`) is regular `src`
-# code, not test-only — so `tokio` has to be a normal dependency here, not
-# a dev-dependency.
-tokio = { workspace = true, features = ["test-util"] }
+# The Supervisor event loop itself (`spawn`/`sync::{mpsc,oneshot}`) is
+# regular `src` code, not test-only — so `tokio` has to be a normal
+# dependency here, not a dev-dependency. Only the workspace's default
+# features; `test-util` (for a future PR's `#[tokio::test(start_paused =
+# true)]`) belongs on the dev-dependency below instead, not here — Cargo
+# unifies features across `[dependencies]`/`[dev-dependencies]` of the same
+# package for test builds, so it's still available to tests, but a
+# `cargo build` (no dev-deps) doesn't carry test-only behavior into the
+# production dependency.
+tokio = { workspace = true }
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 serde_json = { workspace = true }

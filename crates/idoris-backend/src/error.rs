@@ -95,6 +95,16 @@ pub enum BackendError {
     #[error("supervisor is not running")]
     SupervisorUnavailable,
 
+    /// The Supervisor's bounded concurrency limit for in-flight adapter
+    /// calls (`SupervisorConfig::max_concurrent_adapter_calls`) is
+    /// currently exhausted. Distinct from `SupervisorUnavailable`: the
+    /// Supervisor *is* running, it's just momentarily saturated — retrying
+    /// shortly is the right response, not treating it as down.
+    /// **Supervisor-only** — see the module doc comment's design note; a
+    /// backend/adapter implementation must never construct this.
+    #[error("supervisor is at its concurrent-call limit")]
+    Busy,
+
     /// A state inconsistency the Supervisor's single-writer loop detected
     /// in itself — e.g. a completion message referencing a model id the
     /// ledger no longer has an entry for. Per the "不静默" invariant this
@@ -138,6 +148,7 @@ impl BackendError {
             BackendError::Upstream { .. } => "upstream_error",
             BackendError::Cancelled => "cancelled",
             BackendError::SupervisorUnavailable => "supervisor_unavailable",
+            BackendError::Busy => "supervisor_busy",
             BackendError::InvariantViolation { .. } => "state_invariant_violated",
             BackendError::LockPoisoned { .. } => "internal_lock_poisoned",
             BackendError::Internal { .. } => "internal",
@@ -200,6 +211,10 @@ impl BackendError {
 
     pub fn supervisor_unavailable() -> Self {
         Self::SupervisorUnavailable
+    }
+
+    pub fn busy() -> Self {
+        Self::Busy
     }
 
     pub fn invariant_violation(message: impl Into<String>) -> Self {

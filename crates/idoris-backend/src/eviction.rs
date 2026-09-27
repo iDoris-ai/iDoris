@@ -157,7 +157,7 @@ fn validate_capacity(field: &'static str, value: f64) -> Result<(), PlanEviction
 /// - `Launching` (queued, adapter never yet called) and `Stopped`
 ///   (confirmed released) are the only states that do **not** occupy
 ///   budget.
-fn occupies_budget(state: ModelState) -> bool {
+pub(crate) fn occupies_budget(state: ModelState) -> bool {
     matches!(
         state,
         ModelState::Loading | ModelState::Ready | ModelState::Stopping | ModelState::Error
