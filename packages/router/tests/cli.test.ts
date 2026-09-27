@@ -159,6 +159,18 @@ describe("serve()（进程内注入 deps）", () => {
     expect(opts.registered.map((r) => r.card.provider.id)).toEqual(["real"]);
   });
 
+  it("M1 回归（PR #46 复审）：provider.id 是 mock 但 endpoint 看起来正常的卡也会被拦下", async () => {
+    // @idoris/adapters 的 factory.ts createBackend 只认 provider.id === "mock"
+    // 来决定要不要解析成 MockBackend，完全不看 endpoint 长什么样——按 endpoint
+    // 前缀过滤会被这种卡绕过（endpoint 写成人畜无害的样子，但 id 还是 mock）。
+    const disguisedMock = makeCard("mock", "http://127.0.0.1:9999");
+    const backend = { list: async () => [], load: async () => undefined, unload: async () => undefined, admission: async () => "coexist" as const, status: async () => ({ pressure: "ok" as const, usedGb: 0, modelMemoryMaxGb: 0, loaded: [] }), chat: async () => ({ model: "x", content: "x" }) };
+    const captured: { startOpts?: unknown } = {};
+    await serve({} as NodeJS.ProcessEnv, fakeDeps({ loadComponents: () => [{ card: disguisedMock, backend }], captured }));
+    const opts = captured.startOpts as { registered: Registered[] };
+    expect(opts.registered).toHaveLength(0);
+  });
+
   it("M1：IDORIS_ALLOW_MOCK=1 时放行 mock 组件", async () => {
     const mock = makeCard("mock", "mock://in-memory");
     const backend = { list: async () => [], load: async () => undefined, unload: async () => undefined, admission: async () => "coexist" as const, status: async () => ({ pressure: "ok" as const, usedGb: 0, modelMemoryMaxGb: 0, loaded: [] }), chat: async () => ({ model: "x", content: "x" }) };

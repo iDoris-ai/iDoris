@@ -56,9 +56,18 @@ export function resolveRepoPath(value: string): string {
   return isAbsolute(value) ? value : join(REPO_ROOT, value);
 }
 
-/** mock:// 是纯内存测试后端的私有 scheme，不是真实组件——生产 CLI 默认不装它。 */
+/**
+ * 是否会被解析成 MockBackend——生产 CLI 默认不装它。
+ *
+ * PR #46 复审 M1：原判断只看 `endpoint.startsWith("mock://")`，但
+ * `@idoris/adapters` 的 `createBackend`（factory.ts）**只认 `provider.id === "mock"`**，
+ * 完全不看 endpoint 长什么样。按 endpoint 前缀判断，一张 `provider.id: mock`
+ * 但 endpoint 写成看起来人畜无害的真实地址（如 `http://127.0.0.1:9999`）的卡就能
+ * 绕过这道过滤，照样被解析成内存态的 MockBackend——现在改成跟 factory 同一个
+ * 判定依据，两边永远不会走岔。
+ */
 function isMockCard(card: ComponentCard): boolean {
-  return card.endpoint.startsWith("mock://");
+  return card.provider.id === "mock";
 }
 
 export interface ServeDeps {

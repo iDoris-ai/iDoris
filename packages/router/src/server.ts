@@ -4,6 +4,7 @@ import {
   isPersonalDeployMode,
   isSubscriptionProviderId,
   openAIChatCompletion,
+  SubscriptionRelayError,
   type ChatMessage,
 } from "@idoris/adapters";
 import { CONTRACT_VERSION, type ComponentCard, type RoutingPolicy, type TaskProfile } from "@idoris/contracts";
@@ -359,8 +360,22 @@ async function handleChat(
       const prompt = messages.map((m) => m.content).join("\n");
       json(res, 200, openAIChatCompletion(chat.content, model, prompt));
     } catch (err) {
+      // M2：订阅 CLI 的原始报错（可能带栈、路径、CLI 自己的诊断输出——哪怕
+      // relay.ts 已经把 stderr 摘要挪进了 internalDetail，这里也不假设"所有
+      // 错误路径都干净"）只写服务端 stderr，绝不透传给调用方。对外只给一个
+      // 固定错误码 + `reason_code`。
+      const reasonCode = err instanceof SubscriptionRelayError ? err.code : "RELAY_UNKNOWN";
+      const detail =
+        err instanceof SubscriptionRelayError && err.internalDetail !== undefined ? " | detail: " + err.internalDetail : "";
+      console.error(
+        "[idoris-router] 订阅中转失败（reason_code=" +
+          reasonCode +
+          "）：" +
+          (err instanceof Error ? err.message : String(err)) +
+          detail,
+      );
       json(res, 502, {
-        error: { type: "subscription_relay_failed", message: err instanceof Error ? err.message : String(err) },
+        error: { type: "subscription_relay_failed", reason_code: reasonCode, message: "subscription relay failed" },
       });
     }
     return;
@@ -377,6 +392,12 @@ async function handleChat(
       ...(tenantId !== undefined ? { tenantId } : {}),
       signal: controller.signal,
       recordId,
+      // C1：provider id 进缓存键 + 存进缓存条目，命中时用条目里记录的
+      // Served-Locality 回放，不用这次重新选中的卡片现算；privacy 用于
+      // fail-closed 复核（local_only 请求不能命中来源不是 loopback 的缓存）。
+      providerId: target.card.provider.id,
+      servedLocality,
+      privacy: profile.privacy,
     },
   );
 
@@ -385,6 +406,14 @@ async function handleChat(
   if (result.cached) {
     res.setHeader("X-iDoris-Cached", "true");
     if (result.originRecordId !== undefined) res.setHeader("X-iDoris-Origin-Record-Id", result.originRecordId);
+    // C1：Served-Locality 必须用缓存条目里记录的值覆盖——那才是当初真正产生
+    // 这条响应时的值，不是"这次又重新算了一遍、恰好可能不一样"的值。缺失/
+    // 非三值之一时按 remote fail-closed，跟 servedLocalityOf() 的口径一致。
+    const cachedLocality = result.servedLocality;
+    const resolvedCachedLocality: ServedLocality =
+      typeof cachedLocality === "string" && SERVED_LOCALITIES.has(cachedLocality) ? (cachedLocality as ServedLocality) : "remote";
+    res.setHeader("X-iDoris-Served-Locality", resolvedCachedLocality);
+    meta.servedLocality = resolvedCachedLocality;
   }
 
   if (result.stream !== null) {

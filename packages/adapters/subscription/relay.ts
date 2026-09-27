@@ -45,10 +45,30 @@ export class SubscriptionRelayError extends Error {
   constructor(
     readonly code: SubscriptionRelayErrorCode,
     message: string,
+    /**
+     * 供服务端日志排障用的原始细节（如 CLI stderr 摘要，已脱敏+截断）。
+     * **绝不能**透传给外部调用方——`message` 本身刻意不含这些内容，就是为了
+     * 让"直接把 Error.message 塞进 HTTP 响应"这种常见写法也不会泄露
+     * （PR #46 复审 M2：曾经 message 里直接拼了最多 500 字节的原始 CLI stderr）。
+     */
+    readonly internalDetail?: string,
   ) {
     super(message);
     this.name = "SubscriptionRelayError";
   }
+}
+
+/**
+ * 极简脱敏：替换掉看起来像本机用户主目录的片段和长 token/密钥形状的子串。
+ * 不是通用的 DLP，只覆盖"CLI 报错里最常见会带出来的敏感内容"这两类；
+ * 仍然只应该写进服务端日志，不对外暴露。
+ */
+function redactForLog(text: string): string {
+  const home = process.env.HOME ?? process.env.USERPROFILE;
+  let out = text;
+  if (home !== undefined && home !== "") out = out.split(home).join("~");
+  out = out.replace(/[A-Za-z0-9_-]{24,}/g, "[redacted]");
+  return out;
 }
 
 export interface OpenAIChatCompletion {
@@ -264,9 +284,12 @@ export class SubscriptionRelay implements ModelBackend {
     }
     text = text.trim();
     if (run.code !== 0) {
+      // M2：message 只带退出码，不带任何 CLI 输出——stderr 摘要单独放
+      // internalDetail，且已脱敏+截断，只供服务端日志使用（见类定义注释）。
       throw new SubscriptionRelayError(
         "RELAY_CLI_FAILED",
-        "subscription CLI exited with code " + String(run.code) + ": " + run.stderr.trim().slice(0, 500),
+        "subscription CLI exited with code " + String(run.code),
+        redactForLog(run.stderr.trim().slice(0, 500)),
       );
     }
     if (text === "") {

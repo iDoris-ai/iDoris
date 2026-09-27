@@ -1,8 +1,8 @@
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { afterEach, describe, expect, it } from "vitest";
-import { MockBackend, type ModelBackend } from "@idoris/adapters";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { MockBackend, SubscriptionRelayError, type ModelBackend } from "@idoris/adapters";
 import { validateComponentCard, type ComponentCard } from "@idoris/contracts";
 import { parse } from "yaml";
 import { ChatProxy, type FetchResponseLike } from "../src/proxy.js";
@@ -217,5 +217,46 @@ describe("X-iDoris-Served-Locality", () => {
     expect(res.status).toBe(502);
     expect(res.headers.get("x-idoris-served-locality")).toBe("remote");
     expect(res.headers.get("x-idoris-record-id")).toBeTruthy();
+  });
+
+  /**
+   * M2（PR #46 复审）：订阅 CLI 的原始诊断内容（stderr 摘要，可能带路径/栈）
+   * 绝不能透传给调用方——只允许写服务端 stderr 日志。用一个哨兵字符串模拟
+   * "CLI 报错里带了敏感细节"，断言它只出现在服务端日志里，不出现在 HTTP 响应里。
+   */
+  it("M2：订阅 CLI 的原始 stderr 细节不出现在 HTTP 响应里，只写服务端日志", async () => {
+    const sentinel = "SENTINEL_STDERR_LEAK_CHECK_98765_at_/Users/attacker/secret/path";
+    const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      running = await startRouter({
+        componentsDir: fixtures,
+        routingPolicyPath,
+        registered: subscriptionRegistered(async () => {
+          throw new SubscriptionRelayError("RELAY_CLI_FAILED", "subscription CLI exited with code 1", sentinel);
+        }),
+        env: { IDORIS_DEPLOY_MODE: "personal" },
+      });
+      const res = await fetch(url(running, "/v1/chat/completions"), {
+        method: "POST",
+        headers: subscriptionChatHeaders,
+        body: subscriptionChatBody,
+      });
+      expect(res.status).toBe(502);
+      const text = await res.text();
+      expect(text).not.toContain(sentinel);
+      expect(text).not.toContain("attacker");
+      const payload = JSON.parse(text) as { error: { type: string; reason_code: string; message: string } };
+      expect(payload.error.type).toBe("subscription_relay_failed");
+      expect(payload.error.reason_code).toBe("RELAY_CLI_FAILED");
+      expect(payload.error.message).toBe("subscription relay failed"); // 固定文案，不是 CLI 原始输出
+
+      // 正对照：哨兵字符串确实存在——只是被写进了服务端日志，不是凭空消失。
+      const loggedSomewhere = consoleErrorSpy.mock.calls.some((call) =>
+        call.some((arg) => typeof arg === "string" && arg.includes(sentinel)),
+      );
+      expect(loggedSomewhere).toBe(true);
+    } finally {
+      consoleErrorSpy.mockRestore();
+    }
   });
 });

@@ -121,6 +121,141 @@ describe("幂等缓存的租户隔离（回归：评审 PR #25 实测到的跨�
   });
 });
 
+describe("幂等缓存按 provider id 隔离（回归：PR #46 复审 C1，真实复现）", () => {
+  /**
+   * 真实场景：两张组件卡共用同一个物理 endpoint 字符串（比如本地隧道转发到
+   * 云端——同一个 127.0.0.1 端口，一张卡声明 locality: loopback，另一张声明
+   * locality: remote）。只按 tenant+endpoint+requestId 做缓存键时，后一张卡的
+   * 请求会命中前一张卡写下的缓存，把远程产生的内容当成本地响应吐回去。
+   */
+  it("同一个 endpoint、同一个 requestId，但 provider id 不同 → 不会互相命中缓存", async () => {
+    const bodies = ["FROM_PROVIDER_REMOTE", "FROM_PROVIDER_LOOPBACK"];
+    let i = 0;
+    const proxy = new ChatProxy({
+      fetchImpl: async () => ({ ok: true, status: 200, text: async () => bodies[i++] ?? "EXHAUSTED", body: null }),
+      now: () => 1_000,
+    });
+    const remote = await proxy.forward("http://127.0.0.1:9500", undefined, {}, {
+      stream: false,
+      requestId: "same-id",
+      providerId: "provider-remote",
+      servedLocality: "remote",
+    });
+    const loopback = await proxy.forward("http://127.0.0.1:9500", undefined, {}, {
+      stream: false,
+      requestId: "same-id",
+      providerId: "provider-loopback",
+      servedLocality: "loopback",
+    });
+    expect(remote.text).toBe("FROM_PROVIDER_REMOTE");
+    // 修复前：loopback.cached === true 且 loopback.text === "FROM_PROVIDER_REMOTE"。
+    expect(loopback.cached).toBe(false);
+    expect(loopback.text).toBe("FROM_PROVIDER_LOOPBACK");
+  });
+
+  it("正对照：同一个 provider id 重复请求仍然正常命中缓存（隔离没有误伤幂等语义）", async () => {
+    const proxy = new ChatProxy({
+      fetchImpl: async () => ({ ok: true, status: 200, text: async () => "ONCE", body: null }),
+      now: () => 1_000,
+    });
+    const a = await proxy.forward("http://127.0.0.1:9500", undefined, {}, { stream: false, requestId: "same-id", providerId: "p" });
+    const b = await proxy.forward("http://127.0.0.1:9500", undefined, {}, { stream: false, requestId: "same-id", providerId: "p" });
+    expect(a.cached).toBe(false);
+    expect(b.cached).toBe(true);
+  });
+
+  it("缓存命中时回放的是写入时记录的 Served-Locality，不是这次调用传入的", async () => {
+    const proxy = new ChatProxy({
+      fetchImpl: async () => ({ ok: true, status: 200, text: async () => "BODY", body: null }),
+      now: () => 1_000,
+    });
+    await proxy.forward("http://127.0.0.1:9500", undefined, {}, {
+      stream: false,
+      requestId: "same-id",
+      providerId: "p",
+      servedLocality: "loopback",
+    });
+    const hit = await proxy.forward("http://127.0.0.1:9500", undefined, {}, {
+      stream: false,
+      requestId: "same-id",
+      providerId: "p",
+      servedLocality: "remote", // 故意传一个跟写入时不同的值，验证不会被采信
+    });
+    expect(hit.cached).toBe(true);
+    expect(hit.servedLocality).toBe("loopback");
+  });
+});
+
+describe("local_only 请求不得命中来源不是 loopback 的缓存条目（C1 fail-closed）", () => {
+  it("来源是 remote 的缓存条目，local_only 请求命中不到——转去走真实请求", async () => {
+    const bodies = ["REMOTE_ORIGIN", "FRESH_LOCAL_ONLY_RESPONSE"];
+    let i = 0;
+    const f = vi.fn(async () => ({ ok: true, status: 200, text: async () => bodies[i++] ?? "EXHAUSTED", body: null }));
+    const proxy = new ChatProxy({ fetchImpl: f as never, now: () => 1_000 });
+    const first = await proxy.forward("http://127.0.0.1:9500", undefined, {}, {
+      stream: false,
+      requestId: "same-id",
+      providerId: "p",
+      servedLocality: "remote",
+      privacy: "any",
+    });
+    expect(first.cached).toBe(false);
+    const second = await proxy.forward("http://127.0.0.1:9500", undefined, {}, {
+      stream: false,
+      requestId: "same-id",
+      providerId: "p",
+      servedLocality: "loopback",
+      privacy: "local_only",
+    });
+    // 修复前：second.cached === true，直接吐回 REMOTE_ORIGIN 给一个 local_only 请求。
+    expect(second.cached).toBe(false);
+    expect(second.text).toBe("FRESH_LOCAL_ONLY_RESPONSE");
+    expect(f).toHaveBeenCalledTimes(2);
+  });
+
+  it("正对照：来源本来就是 loopback 的缓存条目，local_only 请求正常命中", async () => {
+    const f = vi.fn(async () => ({ ok: true, status: 200, text: async () => "LOOPBACK_ORIGIN", body: null }));
+    const proxy = new ChatProxy({ fetchImpl: f as never, now: () => 1_000 });
+    await proxy.forward("http://127.0.0.1:9500", undefined, {}, {
+      stream: false,
+      requestId: "same-id",
+      providerId: "p",
+      servedLocality: "loopback",
+      privacy: "local_only",
+    });
+    const second = await proxy.forward("http://127.0.0.1:9500", undefined, {}, {
+      stream: false,
+      requestId: "same-id",
+      providerId: "p",
+      servedLocality: "loopback",
+      privacy: "local_only",
+    });
+    expect(second.cached).toBe(true);
+    expect(f).toHaveBeenCalledTimes(1);
+  });
+
+  it("负对照：这条限制只管 local_only——privacy: any 的请求正常命中来源是 remote 的缓存", async () => {
+    const f = vi.fn(async () => ({ ok: true, status: 200, text: async () => "REMOTE_ORIGIN", body: null }));
+    const proxy = new ChatProxy({ fetchImpl: f as never, now: () => 1_000 });
+    await proxy.forward("http://127.0.0.1:9500", undefined, {}, {
+      stream: false,
+      requestId: "same-id",
+      providerId: "p",
+      servedLocality: "remote",
+      privacy: "any",
+    });
+    const second = await proxy.forward("http://127.0.0.1:9500", undefined, {}, {
+      stream: false,
+      requestId: "same-id",
+      providerId: "p",
+      servedLocality: "remote",
+      privacy: "any",
+    });
+    expect(second.cached).toBe(true);
+    expect(f).toHaveBeenCalledTimes(1);
+  });
+});
+
 describe("幂等缓存必须有界（回归：评审 PR #25 第 2 项实测的内存 DoS 面）", () => {
   const mkProxy = (opts: { windowMs?: number; max?: number; now?: () => number } = {}): ChatProxy =>
     new ChatProxy({

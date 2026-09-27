@@ -224,6 +224,34 @@ describe("SubscriptionRelay process lifecycle", () => {
     relay.dispose();
   });
 
+  it("M2（PR #46 复审）：CLI 原始 stderr 不进 message，只进已脱敏的 internalDetail", async () => {
+    const script = writeScript(
+      "fail-with-secret.mjs",
+      'process.stderr.write("boom SENTINEL_ABCDEFGHIJKLMNOPQRSTUVWX12345"); process.exit(3);',
+    );
+    const relay = makeRelay(script);
+    try {
+      await relay.complete([{ role: "user", content: "hi" }], "m");
+      throw new Error("should have thrown");
+    } catch (err) {
+      expect(err).toBeInstanceOf(SubscriptionRelayError);
+      const relayErr = err as SubscriptionRelayError;
+      expect(relayErr.code).toBe("RELAY_CLI_FAILED");
+      // message 只带退出码——不管调用方是不是直接把 Error.message 塞进 HTTP 响应
+      // （历史上就是这么出的事），都不会带出 CLI 自己的输出内容。
+      expect(relayErr.message).toContain("exited with code 3");
+      expect(relayErr.message).not.toContain("boom");
+      expect(relayErr.message).not.toContain("SENTINEL");
+      // 原始摘要单独放 internalDetail，供服务端日志用；长 token 已被脱敏。
+      expect(relayErr.internalDetail).toBeDefined();
+      expect(relayErr.internalDetail).toContain("boom");
+      expect(relayErr.internalDetail).not.toContain("SENTINEL_ABCDEFGHIJKLMNOPQRSTUVWX12345");
+      expect(relayErr.internalDetail).toContain("[redacted]");
+    } finally {
+      relay.dispose();
+    }
+  });
+
   it("kills the WHOLE process group on timeout - no orphans", async () => {
     const pidFile = join(scratch, "slow.pid");
     const script = writeScript(
