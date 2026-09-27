@@ -562,6 +562,180 @@ mod tests {
             .expect("a valid default config must be accepted");
     }
 
-    // Concurrency tests (singleflight, OOM retry, load/unload round-trip,
-    // "different id -> Busy") land in the next PR.
+    fn on_demand_policy() -> LoadPolicy {
+        LoadPolicy {
+            mode: idoris_contracts::load_policy::LoadMode::OnDemand,
+            keepalive: idoris_contracts::load_policy::Keepalive::IdleTtl { idle_ttl_s: 60 },
+            admission: idoris_contracts::load_policy::Admission::Coexist,
+        }
+    }
+
+    fn resident_policy() -> LoadPolicy {
+        LoadPolicy {
+            mode: idoris_contracts::load_policy::LoadMode::Resident,
+            keepalive: idoris_contracts::load_policy::Keepalive::Pinned { pinned: true },
+            admission: idoris_contracts::load_policy::Admission::Coexist,
+        }
+    }
+
+    fn two_model_catalog() -> Vec<ModelInfo> {
+        vec![
+            ModelInfo {
+                id: "a".to_string(),
+                memory_gb: 4.0,
+            },
+            ModelInfo {
+                id: "b".to_string(),
+                memory_gb: 4.0,
+            },
+        ]
+    }
+
+    #[tokio::test]
+    async fn load_then_chat_succeeds() {
+        let adapter = Arc::new(MockAdapter::new(catalog()));
+        let handle =
+            Supervisor::spawn(adapter, SupervisorConfig::default()).expect("spawn should succeed");
+        handle
+            .load("a", 4.0, on_demand_policy())
+            .await
+            .expect("load should succeed");
+        let resp = handle
+            .chat(
+                ChatRequest {
+                    model: "a".to_string(),
+                    messages: vec![],
+                },
+                CancellationToken::new(),
+            )
+            .await
+            .expect("chat after a successful load should succeed");
+        assert_eq!(resp.model, "a");
+    }
+
+    /// Singleflight: two concurrent loads of the same id with an *identical*
+    /// policy must merge into exactly one adapter call.
+    #[tokio::test]
+    async fn concurrent_identical_policy_loads_merge_into_one_adapter_call() {
+        let adapter = Arc::new(MockAdapter::new(catalog()));
+        adapter.set_load_delay("a", std::time::Duration::from_millis(50));
+        let handle = Supervisor::spawn(adapter.clone(), SupervisorConfig::default())
+            .expect("spawn should succeed");
+        let h2 = handle.clone();
+        let f1 = tokio::spawn(async move { handle.load("a", 4.0, on_demand_policy()).await });
+        let f2 = tokio::spawn(async move { h2.load("a", 4.0, on_demand_policy()).await });
+        f1.await.unwrap().expect("first load should succeed");
+        f2.await.unwrap().expect("merged load should succeed");
+        assert_eq!(adapter.load_call_count("a"), 1);
+    }
+
+    /// Negative contrast: a *different* policy for the same id must not be
+    /// silently merged — it fails fast with `Busy` instead (queueing lands
+    /// in a follow-up PR).
+    #[tokio::test]
+    async fn concurrent_different_policy_loads_do_not_merge() {
+        let adapter = Arc::new(MockAdapter::new(catalog()));
+        adapter.set_load_delay("a", std::time::Duration::from_millis(50));
+        let handle = Supervisor::spawn(adapter.clone(), SupervisorConfig::default())
+            .expect("spawn should succeed");
+        let h2 = handle.clone();
+        let f1 = tokio::spawn(async move { handle.load("a", 4.0, on_demand_policy()).await });
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        let err = h2
+            .load("a", 4.0, resident_policy())
+            .await
+            .expect_err("a different policy for the same in-flight id must not merge");
+        assert_eq!(err.reason_code(), "supervisor_busy");
+        f1.await
+            .unwrap()
+            .expect("the original load should still succeed");
+    }
+
+    /// OOM circuit breaker: exactly one self-healing retry.
+    #[tokio::test]
+    async fn oom_self_heals_with_exactly_one_retry() {
+        let adapter = Arc::new(MockAdapter::new(catalog()));
+        adapter.set_load_script(
+            "a",
+            vec![crate::mock::LoadOutcome::Oom, crate::mock::LoadOutcome::Ok],
+        );
+        let handle = Supervisor::spawn(adapter.clone(), SupervisorConfig::default())
+            .expect("spawn should succeed");
+        handle
+            .load("a", 4.0, on_demand_policy())
+            .await
+            .expect("load should self-heal after exactly one OOM retry");
+        assert_eq!(adapter.load_call_count("a"), 2);
+    }
+
+    /// Negative contrast: a *second* OOM must not trigger a third attempt.
+    #[tokio::test]
+    async fn a_second_oom_is_not_retried_again() {
+        let adapter = Arc::new(MockAdapter::new(catalog()));
+        adapter.set_load_script(
+            "a",
+            vec![
+                crate::mock::LoadOutcome::Oom,
+                crate::mock::LoadOutcome::Oom,
+                crate::mock::LoadOutcome::Ok,
+            ],
+        );
+        let handle = Supervisor::spawn(adapter.clone(), SupervisorConfig::default())
+            .expect("spawn should succeed");
+        let err = handle
+            .load("a", 4.0, on_demand_policy())
+            .await
+            .expect_err("a second OOM must surface, not be retried a third time");
+        assert_eq!(err.reason_code(), "oom");
+        assert_eq!(adapter.load_call_count("a"), 2);
+    }
+
+    /// A different id than whatever is currently active fails fast — no
+    /// queueing yet (see the module doc comment).
+    #[tokio::test]
+    async fn a_different_id_is_busy_while_one_load_is_in_flight() {
+        let adapter = Arc::new(MockAdapter::new(two_model_catalog()));
+        adapter.set_load_delay("a", std::time::Duration::from_millis(200));
+        let handle =
+            Supervisor::spawn(adapter, SupervisorConfig::default()).expect("spawn should succeed");
+        let h2 = handle.clone();
+        let load_a = tokio::spawn(async move { h2.load("a", 4.0, on_demand_policy()).await });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let err = handle
+            .load("b", 4.0, on_demand_policy())
+            .await
+            .expect_err("a different id while a load is active must be busy");
+        assert_eq!(err.reason_code(), "supervisor_busy");
+        load_a
+            .await
+            .unwrap()
+            .expect("load a should eventually succeed");
+    }
+
+    /// Negative contrast: an already-`Ready` id with a matching policy must
+    /// stay a no-op even while an *unrelated* id is mid-load — confirming
+    /// the fix in this PR (an earlier version wrongly reported `Busy` here).
+    #[tokio::test]
+    async fn already_ready_load_is_noop_even_while_another_id_loads() {
+        let adapter = Arc::new(MockAdapter::new(two_model_catalog()));
+        let handle = Supervisor::spawn(adapter.clone(), SupervisorConfig::default())
+            .expect("spawn should succeed");
+        handle
+            .load("a", 4.0, on_demand_policy())
+            .await
+            .expect("initial load of a should succeed");
+        adapter.set_load_delay("b", std::time::Duration::from_millis(200));
+        let h2 = handle.clone();
+        let load_b = tokio::spawn(async move { h2.load("b", 4.0, on_demand_policy()).await });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        handle
+            .load("a", 4.0, on_demand_policy())
+            .await
+            .expect("already-Ready a with a matching policy must stay a no-op");
+        assert_eq!(adapter.load_call_count("a"), 1);
+        load_b
+            .await
+            .unwrap()
+            .expect("load b should eventually succeed");
+    }
 }
