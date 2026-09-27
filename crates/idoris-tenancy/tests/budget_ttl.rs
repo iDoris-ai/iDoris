@@ -97,7 +97,7 @@ fn settling_an_expired_reservation_still_charges_and_is_marked_late() {
     let id = ledger.reserve(&scope, Price::Known(50)).expect("reserve");
     clock.advance(TTL_MS + 1);
     let receipt = ledger
-        .settle(&id, 50)
+        .settle(&scope.tenant_id, &id, 50)
         .expect("settle after expiry must still charge");
     assert!(receipt.late);
     assert_eq!(ledger.balance(&scope).expect("balance"), 50);
@@ -117,9 +117,11 @@ fn settling_an_expired_reservation_twice_only_charges_once() {
 
     let id = ledger.reserve(&scope, Price::Known(50)).expect("reserve");
     clock.advance(TTL_MS + 1);
-    ledger.settle(&id, 50).expect("first settle");
+    ledger
+        .settle(&scope.tenant_id, &id, 50)
+        .expect("first settle");
     assert!(matches!(
-        ledger.settle(&id, 50),
+        ledger.settle(&scope.tenant_id, &id, 50),
         Err(BudgetError::ReservationNotActive { .. })
     ));
     assert_eq!(ledger.balance(&scope).expect("balance"), 50);
@@ -138,7 +140,7 @@ fn releasing_an_expired_reservation_succeeds() {
 
     let id = ledger.reserve(&scope, Price::Known(50)).expect("reserve");
     clock.advance(TTL_MS + 1);
-    assert!(ledger.release(&id).is_ok());
+    assert!(ledger.release(&scope.tenant_id, &id).is_ok());
     // No charge was recorded.
     assert_eq!(ledger.balance(&scope).expect("balance"), 100);
 }
@@ -155,9 +157,9 @@ fn settling_after_releasing_an_expired_reservation_is_rejected() {
 
     let id = ledger.reserve(&scope, Price::Known(50)).expect("reserve");
     clock.advance(TTL_MS + 1);
-    ledger.release(&id).expect("release");
+    ledger.release(&scope.tenant_id, &id).expect("release");
     assert!(matches!(
-        ledger.settle(&id, 50),
+        ledger.settle(&scope.tenant_id, &id, 50),
         Err(BudgetError::ReservationNotActive { .. })
     ));
 }
@@ -192,13 +194,15 @@ fn extend_renews_an_active_reservations_deadline() {
 
     let id = ledger.reserve(&scope, Price::Known(50)).expect("reserve");
     // Extend well before the original TTL would lapse.
-    ledger.extend(&id, TTL_MS * 10).expect("extend");
+    ledger
+        .extend(&scope.tenant_id, &id, TTL_MS * 10)
+        .expect("extend");
 
     // Advance past the *original* deadline — the extend should have pushed
     // it out, so settling now must not be `late`.
     clock.advance(TTL_MS + 1);
     let receipt = ledger
-        .settle(&id, 50)
+        .settle(&scope.tenant_id, &id, 50)
         .expect("settle before the extended deadline");
     assert!(!receipt.late, "extend should have prevented a late settle");
 }
@@ -214,9 +218,9 @@ fn extend_on_settled_reservation_errors() {
     ledger.configure(&scope, 100, "UTC").expect("configure");
 
     let id = ledger.reserve(&scope, Price::Known(50)).expect("reserve");
-    ledger.settle(&id, 50).expect("settle");
+    ledger.settle(&scope.tenant_id, &id, 50).expect("settle");
     assert!(matches!(
-        ledger.extend(&id, 1_000),
+        ledger.extend(&scope.tenant_id, &id, 1_000),
         Err(BudgetError::ReservationNotActive { .. })
     ));
 }
@@ -233,7 +237,7 @@ fn extend_rejects_non_positive_ttl() {
 
     let id = ledger.reserve(&scope, Price::Known(50)).expect("reserve");
     assert!(matches!(
-        ledger.extend(&id, 0),
+        ledger.extend(&scope.tenant_id, &id, 0),
         Err(BudgetError::InvalidTtl { .. })
     ));
 }

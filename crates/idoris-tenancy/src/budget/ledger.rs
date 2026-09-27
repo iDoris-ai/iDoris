@@ -375,6 +375,7 @@ impl BudgetLedger {
     /// lapses, for a caller that anticipates running long.
     pub fn settle(
         &self,
+        tenant_id: &str,
         reservation_id: &ReservationId,
         actual_cost_minor: i64,
     ) -> Result<SettleReceipt, BudgetError> {
@@ -385,7 +386,7 @@ impl BudgetLedger {
         let mut conn = self.lock();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
 
-        let row = find_reservation(&tx, reservation_id)?;
+        let row = find_reservation(&tx, tenant_id, reservation_id)?;
         let status = ReservationStatus::parse(&row.status)?;
 
         let late = match status {
@@ -446,6 +447,7 @@ impl BudgetLedger {
     /// freed).
     pub fn extend(
         &self,
+        tenant_id: &str,
         reservation_id: &ReservationId,
         additional_ttl_ms: i64,
     ) -> Result<(), BudgetError> {
@@ -458,7 +460,7 @@ impl BudgetLedger {
         let mut conn = self.lock();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
 
-        let row = find_reservation(&tx, reservation_id)?;
+        let row = find_reservation(&tx, tenant_id, reservation_id)?;
         let status = ReservationStatus::parse(&row.status)?;
         if status != ReservationStatus::Active {
             tx.rollback().ok();
@@ -499,11 +501,15 @@ impl BudgetLedger {
     /// racing/late `settle()` on the same id succeed and charge it anyway.
     /// `Released` is the one status H1's `settle` always rejects, so it's
     /// the only correct terminal state for this method to leave behind.
-    pub fn release(&self, reservation_id: &ReservationId) -> Result<(), BudgetError> {
+    pub fn release(
+        &self,
+        tenant_id: &str,
+        reservation_id: &ReservationId,
+    ) -> Result<(), BudgetError> {
         let mut conn = self.lock();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
 
-        let row = find_reservation(&tx, reservation_id)?;
+        let row = find_reservation(&tx, tenant_id, reservation_id)?;
         let status = ReservationStatus::parse(&row.status)?;
 
         match status {
@@ -544,31 +550,56 @@ struct ReservationRow {
     expires_at_ms: i64,
 }
 
+/// M2 (Opus Tier-2 acceptance): filters by `tenant_id` in the `WHERE`
+/// clause, not just by `id` — a caller from a different tenant guessing a
+/// valid reservation id must not be able to settle/release/extend it. When
+/// the row exists but under a different tenant, this returns
+/// [`BudgetError::TenantMismatch`] rather than `ReservationNotFound`, purely
+/// so this crate's own tests can assert isolation held; the two variants
+/// render identical error text (see `TenantMismatch`'s doc comment), so
+/// nothing observable leaks cross-tenant existence to an external caller.
 fn find_reservation(
     conn: &Connection,
+    tenant_id: &str,
     reservation_id: &ReservationId,
 ) -> Result<ReservationRow, BudgetError> {
-    conn.query_row(
-        "SELECT tenant_id, key_id, provider_id, model_id, period, reserved_minor, status, expires_at_ms \
-         FROM reservations WHERE id = ?1",
-        [&reservation_id.0],
-        |r| {
-            Ok(ReservationRow {
-                tenant_id: r.get(0)?,
-                key_id: r.get(1)?,
-                provider_id: r.get(2)?,
-                model_id: r.get(3)?,
-                period: r.get(4)?,
-                reserved_minor: r.get(5)?,
-                status: r.get(6)?,
-                expires_at_ms: r.get(7)?,
-            })
-        },
-    )
-    .optional()?
-    .ok_or_else(|| BudgetError::ReservationNotFound {
-        reservation_id: reservation_id.0.clone(),
-    })
+    let found = conn
+        .query_row(
+            "SELECT tenant_id, key_id, provider_id, model_id, period, reserved_minor, status, expires_at_ms \
+             FROM reservations WHERE id = ?1 AND tenant_id = ?2",
+            rusqlite::params![reservation_id.0, tenant_id],
+            |r| {
+                Ok(ReservationRow {
+                    tenant_id: r.get(0)?,
+                    key_id: r.get(1)?,
+                    provider_id: r.get(2)?,
+                    model_id: r.get(3)?,
+                    period: r.get(4)?,
+                    reserved_minor: r.get(5)?,
+                    status: r.get(6)?,
+                    expires_at_ms: r.get(7)?,
+                })
+            },
+        )
+        .optional()?;
+    if let Some(row) = found {
+        return Ok(row);
+    }
+    let exists_elsewhere: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM reservations WHERE id = ?1",
+            [&reservation_id.0],
+            |r| r.get(0),
+        )
+        .optional()?;
+    match exists_elsewhere {
+        Some(_) => Err(BudgetError::TenantMismatch {
+            reservation_id: reservation_id.0.clone(),
+        }),
+        None => Err(BudgetError::ReservationNotFound {
+            reservation_id: reservation_id.0.clone(),
+        }),
+    }
 }
 
 fn run_migrations(conn: &mut Connection) -> Result<(), BudgetError> {
@@ -904,7 +935,7 @@ mod tests {
         let scope = BudgetScope::new("acme-co", "key-1", "openai", "gpt-5");
         ledger.configure(&scope, 1_000, "UTC").expect("configure");
         let id = ledger.reserve(&scope, Price::Known(500)).expect("reserve");
-        let receipt = ledger.settle(&id, 300).expect("settle");
+        let receipt = ledger.settle(&scope.tenant_id, &id, 300).expect("settle");
         assert_eq!(receipt.reserved_minor, 500);
         assert_eq!(receipt.actual_cost_minor, 300);
         assert_eq!(receipt.refunded_minor, 200);
@@ -922,7 +953,7 @@ mod tests {
         let scope = BudgetScope::new("acme-co", "key-1", "openai", "gpt-5");
         ledger.configure(&scope, 1_000, "UTC").expect("configure");
         let id = ledger.reserve(&scope, Price::Known(100)).expect("reserve");
-        let receipt = ledger.settle(&id, 250).expect("settle");
+        let receipt = ledger.settle(&scope.tenant_id, &id, 250).expect("settle");
         assert_eq!(receipt.refunded_minor, 0);
         assert_eq!(ledger.balance(&scope).expect("balance"), 750);
     }
@@ -936,9 +967,11 @@ mod tests {
         let scope = BudgetScope::new("acme-co", "key-1", "openai", "gpt-5");
         ledger.configure(&scope, 1_000, "UTC").expect("configure");
         let id = ledger.reserve(&scope, Price::Known(100)).expect("reserve");
-        ledger.settle(&id, 100).expect("first settle");
+        ledger
+            .settle(&scope.tenant_id, &id, 100)
+            .expect("first settle");
         assert!(matches!(
-            ledger.settle(&id, 100),
+            ledger.settle(&scope.tenant_id, &id, 100),
             Err(BudgetError::ReservationNotActive { .. })
         ));
     }
@@ -948,9 +981,47 @@ mod tests {
         let path = temp_db_path("settle-unknown");
         let ledger = BudgetLedger::open(&path).expect("open");
         assert!(matches!(
-            ledger.settle(&ReservationId("does-not-exist".to_string()), 1),
+            ledger.settle("acme-co", &ReservationId("does-not-exist".to_string()), 1),
             Err(BudgetError::ReservationNotFound { .. })
         ));
+    }
+
+    /// M2: a reservation belongs to the tenant that created it — a
+    /// different tenant guessing the id must not be able to settle it, and
+    /// must see the same error shape as a truly unknown id (no leak).
+    #[test]
+    fn settle_with_wrong_tenant_is_rejected_like_not_found() {
+        let path = temp_db_path("settle-wrong-tenant");
+        let ledger = BudgetLedger::open(&path).expect("open");
+        let scope = BudgetScope::new("acme-co", "key-1", "openai", "gpt-5");
+        ledger.configure(&scope, 100, "UTC").expect("configure");
+        let id = ledger.reserve(&scope, Price::Known(50)).expect("reserve");
+        assert!(matches!(
+            ledger.settle("someone-else", &id, 50),
+            Err(BudgetError::TenantMismatch { .. })
+        ));
+        // The reservation is untouched — still settleable by its own tenant.
+        assert!(ledger.settle(&scope.tenant_id, &id, 50).is_ok());
+    }
+
+    /// M2 mirror: `release`/`extend` apply the same tenant filter.
+    #[test]
+    fn release_and_extend_with_wrong_tenant_are_rejected_like_not_found() {
+        let path = temp_db_path("release-extend-wrong-tenant");
+        let ledger = BudgetLedger::open(&path).expect("open");
+        let scope = BudgetScope::new("acme-co", "key-1", "openai", "gpt-5");
+        ledger.configure(&scope, 100, "UTC").expect("configure");
+        let id = ledger.reserve(&scope, Price::Known(50)).expect("reserve");
+        assert!(matches!(
+            ledger.release("someone-else", &id),
+            Err(BudgetError::TenantMismatch { .. })
+        ));
+        assert!(matches!(
+            ledger.extend("someone-else", &id, 1_000),
+            Err(BudgetError::TenantMismatch { .. })
+        ));
+        // Untouched by the rejected cross-tenant attempts.
+        assert!(ledger.release(&scope.tenant_id, &id).is_ok());
     }
 
     #[test]
@@ -963,7 +1034,7 @@ mod tests {
         // Negative control: while the reservation is active it really does
         // hold the budget — a second reserve must fail.
         assert!(ledger.reserve(&scope, Price::Known(1)).is_err());
-        ledger.release(&id).expect("release");
+        ledger.release(&scope.tenant_id, &id).expect("release");
         assert_eq!(ledger.balance(&scope).expect("balance"), 100);
         assert!(ledger.reserve(&scope, Price::Known(100)).is_ok());
     }
@@ -975,8 +1046,10 @@ mod tests {
         let scope = BudgetScope::new("acme-co", "key-1", "openai", "gpt-5");
         ledger.configure(&scope, 100, "UTC").expect("configure");
         let id = ledger.reserve(&scope, Price::Known(50)).expect("reserve");
-        ledger.release(&id).expect("first release");
-        assert!(ledger.release(&id).is_ok());
+        ledger
+            .release(&scope.tenant_id, &id)
+            .expect("first release");
+        assert!(ledger.release(&scope.tenant_id, &id).is_ok());
     }
 
     /// Negative control: a settled reservation can't be released — that
@@ -988,9 +1061,9 @@ mod tests {
         let scope = BudgetScope::new("acme-co", "key-1", "openai", "gpt-5");
         ledger.configure(&scope, 100, "UTC").expect("configure");
         let id = ledger.reserve(&scope, Price::Known(50)).expect("reserve");
-        ledger.settle(&id, 50).expect("settle");
+        ledger.settle(&scope.tenant_id, &id, 50).expect("settle");
         assert!(matches!(
-            ledger.release(&id),
+            ledger.release(&scope.tenant_id, &id),
             Err(BudgetError::ReservationNotActive { .. })
         ));
     }
