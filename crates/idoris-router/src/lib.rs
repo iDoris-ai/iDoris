@@ -6,22 +6,24 @@
 //! backend dispatch, or policy logic is ported here — see the root
 //! `README.md`.
 
-/// Control-plane header parsing (R2-D task 1); wired into a route in a follow-up PR.
+/// Control-plane header parsing (R2-D task 1).
 pub mod profile;
 
 use std::net::IpAddr;
 use std::sync::Arc;
 
-use axum::body::Body;
+use axum::body::{Body, Bytes};
 use axum::extract::{Request, State};
-use axum::http::{HeaderValue, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Serialize;
 use serde_json::json;
 use uuid::Uuid;
+
+use profile::{ProfileError, parse_profile};
 
 /// Production default port (T4.1/FU-13, PR #46): `IDORIS_PORT` unset/blank
 /// falls back to this. `8765`/`8796`/`8088`/`11434` were all already taken by
@@ -96,6 +98,12 @@ pub struct AppState {
     /// Number of registered components. Always `0` in the R1 skeleton —
     /// nothing loads `config/components/*.yaml` yet.
     pub components: usize,
+    /// Resolved once at construction (from `IDORIS_DEPLOY_MODE`), not
+    /// re-read per request — mirrors `RouterOptions.env` in `server.ts`:
+    /// production reads real process env exactly once; tests override this
+    /// field directly instead of mutating process-global env (which would
+    /// race across parallel tests).
+    pub deploy_mode: idoris_contracts::DeployMode,
 }
 
 impl Default for AppState {
@@ -103,15 +111,20 @@ impl Default for AppState {
         Self {
             instance_id: Uuid::new_v4().to_string(),
             components: 0,
+            deploy_mode: profile::deploy_mode_from_env(
+                std::env::var("IDORIS_DEPLOY_MODE").ok().as_deref(),
+            ),
         }
     }
 }
 
-/// Builds the full axum app: `GET /health`, a `501` fallback for everything
-/// else, and the `X-iDoris-Record-Id` middleware applied to every response.
+/// Builds the full axum app: `GET /health`, `POST /v1/chat/completions`, a
+/// `501` fallback for everything else, and the `X-iDoris-Record-Id`
+/// middleware applied to every response.
 pub fn build_app(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
+        .route("/v1/chat/completions", post(chat_completions))
         .fallback(not_implemented)
         .with_state(Arc::new(state))
         .layer(middleware::from_fn(record_id_middleware))
@@ -137,16 +150,74 @@ async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 /// exist yet in the Rust build. Same envelope shape, a type value scoped to
 /// this skeleton.
 async fn not_implemented() -> impl IntoResponse {
+    error_envelope(
+        StatusCode::NOT_IMPLEMENTED,
+        "not_implemented",
+        "This route is not implemented yet in the Rust skeleton (R1); packages/router (TS) is the reference implementation.",
+    )
+}
+
+/// The unified error envelope from the interface spec §3.11:
+/// `{error: {type, rule_id, reason_code, evidence, remediation}}`.
+/// `reason_code` mirrors `error_type` here — this crate doesn't yet have a
+/// richer machine-readable code distinct from the `type` value itself, and
+/// `rule_id`/`evidence` stay `null` until a rule engine produces them.
+fn error_envelope(
+    status: StatusCode,
+    error_type: &'static str,
+    remediation: impl Into<String>,
+) -> Response {
     let body = json!({
         "error": {
-            "type": "not_implemented",
+            "type": error_type,
             "rule_id": null,
-            "reason_code": "NOT_IMPLEMENTED",
+            "reason_code": error_type,
             "evidence": null,
-            "remediation": "This route is not implemented yet in the Rust skeleton (R1); packages/router (TS) is the reference implementation.",
+            "remediation": remediation.into(),
         }
     });
-    (StatusCode::NOT_IMPLEMENTED, Json(body))
+    (status, Json(body)).into_response()
+}
+
+impl IntoResponse for ProfileError {
+    fn into_response(self) -> Response {
+        error_envelope(self.status, self.error_type, self.message)
+    }
+}
+
+/// `POST /v1/chat/completions` — request-profile parsing only for now
+/// (component loading, decision, and backend dispatch land in follow-up
+/// R2-D PRs). Order (locked by conformance): non-JSON body -> `invalid_json`;
+/// valid JSON that isn't an object -> `invalid_body`; only then are
+/// control-plane headers parsed (see [`profile::parse_profile`]).
+async fn chat_completions(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let value: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(_) => {
+            return error_envelope(
+                StatusCode::BAD_REQUEST,
+                "invalid_json",
+                "request body is not valid JSON",
+            );
+        }
+    };
+    let Some(object) = value.as_object() else {
+        return error_envelope(
+            StatusCode::BAD_REQUEST,
+            "invalid_body",
+            "request body must be a JSON object",
+        );
+    };
+    let model = object.get("model").and_then(|v| v.as_str());
+
+    match parse_profile(&headers, model, state.deploy_mode) {
+        Ok(_parsed) => not_implemented().await.into_response(),
+        Err(err) => err.into_response(),
+    }
 }
 
 /// Server-generated on every response, success or error, streaming or not
@@ -225,11 +296,14 @@ mod tests {
 
     #[tokio::test]
     async fn unimplemented_routes_return_501_with_the_unified_envelope() {
+        // `/v1/chat/completions` is now a real route (profile parsing —
+        // see the `chat_completions_*` tests below); `/v1/models` is still
+        // genuinely unimplemented and exercises the `fallback` path.
         let app = build_app(AppState::default());
         let response = app
             .oneshot(
                 Request::builder()
-                    .uri("/v1/chat/completions")
+                    .uri("/v1/models")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -240,7 +314,114 @@ mod tests {
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(json["error"]["type"], "not_implemented");
-        assert_eq!(json["error"]["reason_code"], "NOT_IMPLEMENTED");
+        assert_eq!(json["error"]["reason_code"], "not_implemented");
+    }
+
+    fn post_chat(body: &'static str, headers: &[(&str, &str)]) -> Request<Body> {
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json");
+        for (k, v) in headers {
+            builder = builder.header(*k, *v);
+        }
+        builder.body(Body::from(body)).unwrap()
+    }
+
+    #[tokio::test]
+    async fn chat_completions_rejects_invalid_json() {
+        let app = build_app(AppState::default());
+        let response = app
+            .oneshot(post_chat("{not valid json", &[]))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["error"]["type"], "invalid_json");
+    }
+
+    #[tokio::test]
+    async fn chat_completions_rejects_a_non_object_body() {
+        let app = build_app(AppState::default());
+        for body in ["null", "[]", "1"] {
+            let response = app.clone().oneshot(post_chat(body, &[])).await.unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(json["error"]["type"], "invalid_body");
+        }
+    }
+
+    /// Ordering lock: an invalid body shape must be reported before header
+    /// validation runs, even when a header is also invalid.
+    #[tokio::test]
+    async fn chat_completions_invalid_body_outranks_invalid_headers() {
+        let app = build_app(AppState::default());
+        let response = app
+            .oneshot(post_chat("[]", &[("x-idoris-privacy", "bogus")]))
+            .await
+            .unwrap();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["error"]["type"], "invalid_body");
+    }
+
+    #[tokio::test]
+    async fn chat_completions_rejects_invalid_privacy_header() {
+        let app = build_app(AppState::default());
+        let response = app
+            .oneshot(post_chat("{}", &[("x-idoris-privacy", "bogus")]))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["error"]["type"], "invalid_privacy");
+    }
+
+    #[tokio::test]
+    async fn chat_completions_rejects_unknown_role() {
+        let app = build_app(AppState::default());
+        let response = app
+            .oneshot(post_chat(r#"{"model":"idoris/nope"}"#, &[]))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["error"]["type"], "unknown_role");
+    }
+
+    #[tokio::test]
+    async fn chat_completions_tenant_mode_requires_tenant_header() {
+        let state = AppState {
+            deploy_mode: idoris_contracts::DeployMode::Tenant,
+            ..AppState::default()
+        };
+        let app = build_app(state);
+        let response = app.oneshot(post_chat("{}", &[])).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["error"]["type"], "tenant_missing");
+    }
+
+    #[tokio::test]
+    async fn chat_completions_valid_request_is_not_yet_implemented_but_well_formed() {
+        // R2-D task 1 scope: profile parsing only. A well-formed request
+        // still answers 501 (dispatch lands in a follow-up PR) but must
+        // have already passed every 400-producing check.
+        let app = build_app(AppState::default());
+        let response = app
+            .oneshot(post_chat(
+                r#"{"model":"idoris/daily","messages":[{"role":"user","content":"hi"}]}"#,
+                &[],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+        assert!(response.headers().contains_key(HEADER_RECORD_ID));
     }
 
     #[tokio::test]
