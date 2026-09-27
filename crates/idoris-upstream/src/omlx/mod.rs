@@ -2,14 +2,15 @@
 //! omlx-backend.ts` on `main` (FU-16) behavior, ported onto
 //! `idoris_backend::RuntimeAdapter`. Talks to `http://127.0.0.1:8088` by
 //! default. Split across submodules landing across several PRs on this
-//! stack: [`http`] (this PR, GET/POST/PUT + timeout + safe errors),
-//! `status` (parsing, next), `pin` (resident/admin-session gap), then the
-//! `OmlxAdapter` struct wiring it all into `RuntimeAdapter`.
+//! stack: [`http`] (GET/POST/PUT + timeout + safe errors), [`status`]
+//! (this PR, `list`/`status` parsing), `pin` (resident/admin-session gap),
+//! then the `OmlxAdapter` struct wiring it all into `RuntimeAdapter`.
 //!
 //! **The API key is read from an env var and never logged** — see
 //! [`OMLX_API_KEY_ENV`] and `http`'s module doc.
 
 mod http;
+mod status;
 
 use std::time::Duration;
 
@@ -29,8 +30,7 @@ pub const DEFAULT_CALL_TIMEOUT: Duration = Duration::from_secs(10);
 pub const OMLX_API_KEY_ENV: &str = "IDORIS_OMLX_API_KEY";
 
 /// `BackendError` has no `upstream()` constructor (only `Upstream
-/// { message }`) — shorthand shared by `http` and (follow-up PR) `status`.
-#[allow(dead_code)]
+/// { message }`) — shorthand shared by `http` and `status`.
 pub(crate) fn upstream_error(message: impl Into<String>) -> BackendError {
     BackendError::Upstream {
         message: message.into(),
