@@ -122,7 +122,7 @@
 - **法律边界**：组织内部共享付费账号可以；**跨用户转售托管账号不做**（PGL「平台不充当资金池」）。
 - **Agent24 侧前置（J-6）**：在 M4 接入 iDoris 之前，Agent24 修补 `shell_exec` 与 MCP 子进程继承环境变量的缺口（`env_clear` + 白名单，mcp.json 支持按 server 配置 env），防止 `IDORIS_API_KEY` 外泄。
 
-- 请求头：`Authorization: Bearer idk_<key>`（M4 起。loopback 可配置为免 key；非 loopback 必须带 key）；`X-iDoris-Tenant`（tenant 模式必填，沿用 contract-tenancy v1.3）。
+- 请求头：`Authorization: Bearer idk_<key>`（M4 起，**缺省必须带 key**。loopback ≠ 授权：同一台机器上的任何进程都能连 loopback。「loopback 免 key」只作为**显式开启的开发者选项**（`IDORIS_DEV_NO_KEY=1`）。开启后，无 key 请求一律视为 `allowed_privacy=[local_only]`，不能使用付费或远程路径，启动日志和 `/health` 会明示。非 loopback 在任何情况下都必须带 key。v1.1，采纳 Agent24 的审阅意见）；`X-iDoris-Tenant`（tenant 模式必填，沿用 contract-tenancy v1.3）。
 - key 的 scope（草案）：`{key_id, owner, allowed_privacy[], allowed_roles[], budget_ref, expires_at, admin_scopes[]}`。Agent24 管理页使用的 key 需要 `admin_scopes`。
 
 ### 3.3 模型、角色目录与容量
@@ -358,3 +358,4 @@
 | R5 | 2026-09-27 | iDoris | v1.0.1 措辞澄清（T4.1 验收时发现）：Served-Locality 只在已选定后端时才带；它表示推理实际发生的位置；缓存命中带 Cached 和 Origin-Record-Id。都是加法兼容 | **Agent24 无异议**：接入时按 Cached + Origin-Record-Id 去重记账，这条写进它们的 P4 设计 |
 | R6 | 2026-09-27 | iDoris | jason 提出，iDoris 提议：请求阶段职责划分 S0–S7；统一凭证模块 vault | Agent24 方向同意，提出措辞修订与五个条件 |
 | R7 | 2026-09-27 | 双方 | iDoris 采纳全部措辞修订与条件，并对 J-4、J-2 各加一处限定；Agent24 确认；jason 拍板 J-1…J-8 全部选 (a) | **v1.1** |
+| R8 | 2026-09-27 | Agent24 | 审阅 v1.1：无异议；建议 loopback 免 key 仅作为显式开发者选项，免 key 时视为 local_only | 已采纳，写入 §3.2 |
