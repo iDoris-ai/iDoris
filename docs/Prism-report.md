@@ -1,3 +1,5 @@
+> ⚠️ **已废弃（2026-09-27）**：本文内容已统筹进 [`iDoris 总体规划`](iDoris-总体规划.md)，**冲突时以总体规划为准**。保留作决策追溯，不再更新。
+
 > From: https://gemini.google.com/app/88110a6b94df0d03
 
 # you asked

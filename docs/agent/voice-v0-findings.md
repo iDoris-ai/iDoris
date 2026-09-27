@@ -1,5 +1,7 @@
 # Voice V0 现状盘点 — 回复泰国 Starter Kit
 
+> ⚠️ **已废弃（2026-09-27）**：本文内容已统筹进 [`iDoris 总体规划`](../iDoris-总体规划.md)，**冲突时以总体规划为准**。保留作决策追溯，不再更新。
+
 > 对方 `starter-kit/PRODUCT-FORM-AND-ROADMAP.md` 的 **V0** 里程碑写着「**需读 iDoris 代码仓库**（不在本仓库）」，
 > 是整条 Voice 线的硬阻塞，也是 Dev 入职第一周第一件事。这份是回复。
 > 核查日期：2026-09-07 ｜ 核查范围：`~/Dev/auraai/*`、`~/Dev/tools/*`

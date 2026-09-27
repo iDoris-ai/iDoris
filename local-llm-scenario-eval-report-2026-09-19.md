@@ -1,5 +1,7 @@
 # Selecting Local LLMs Against Real User Scenarios (2026-09-19)
 
+> ⚠️ **已废弃（2026-09-27）**：本文内容已统筹进 [`iDoris 总体规划`](docs/iDoris-总体规划.md)，**冲突时以总体规划为准**。保留作决策追溯，不再更新。
+
 **Headline recommendation.** Don't pick models off a leaderboard. Build a small versioned scenario suite per role and run it through **Inspect AI** (UK AISI) — or **promptfoo** for YAML+CI ergonomics — with **deterministic checks first and one calibrated rubric judge second**. From public benchmarks run exactly two: **BFCL v4 non-live** and **τ²-bench `airline`/`retail`**. Spend the saved effort on scenario authoring and the human feedback loop; that is where role selection is actually decided.
 
 ## 1. Frameworks — offline against a local OpenAI-compatible endpoint

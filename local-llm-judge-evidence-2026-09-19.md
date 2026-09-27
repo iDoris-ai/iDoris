@@ -1,4 +1,7 @@
 # Local LLM-as-a-Judge for Local LLMs (2B–35B, Apple Silicon) — Evidence Review
+
+> ⚠️ **已废弃（2026-09-27）**：本文内容已统筹进 [`iDoris 总体规划`](docs/iDoris-总体规划.md)，**冲突时以总体规划为准**。保留作决策追溯，不再更新。
+
 *Compiled 2026-09-19. All claims fetched from primary sources unless marked SECONDARY. Two arXiv IDs initially surfaced by search (2410.06158, 2504.00013) were wrong papers and were discarded.*
 
 ## Headline verdict
