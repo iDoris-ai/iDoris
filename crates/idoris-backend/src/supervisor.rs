@@ -238,9 +238,8 @@ fn set_state_or_panic(models: &mut HashMap<String, ModelSlot>, id: &str, state: 
     }
 }
 
-/// The pure-IO side of a load: calls the adapter and reports the outcome,
-/// keeping the actor loop free for other commands. Capacity isn't
-/// checked yet — that lands with eviction in a follow-up PR.
+/// The pure-IO side of a load: calls the adapter and reports the outcome.
+/// Capacity isn't checked yet — that lands with eviction in a follow-up.
 async fn run_load_flow(
     adapter: Arc<dyn RuntimeAdapter>,
     config: SupervisorConfig,
@@ -326,16 +325,17 @@ fn handle_load(
         }
         return;
     }
-    if active_op.is_some() {
-        let _ = reply.send(Err(BackendError::busy()));
-        return;
-    }
-
+    // Before the busy-fallback: an already-Ready model with a matching
+    // policy is a no-op, even while an unrelated id is mid-load.
     if let Some(slot) = models.get(&id)
         && slot.state == ModelState::Ready
         && slot.policy == policy
     {
         let _ = reply.send(Ok(()));
+        return;
+    }
+    if active_op.is_some() {
+        let _ = reply.send(Err(BackendError::busy()));
         return;
     }
 
