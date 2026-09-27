@@ -1,6 +1,6 @@
 # iDoris × Agent24 分工边界与接口数据规范
 
-> **状态**：草案 **v0.2**（2026-09-27）。v0.1 由 iDoris 起草，R1 已吸收 Agent24 的答复（[`negotiation/R1-Agent24-答复.md`](negotiation/R1-Agent24-答复.md)）。**D-1…D-7 待 jason 拍板**，拍板后定稿。
+> **状态**：草案 **v0.2**（2026-09-27）。v0.1 由 iDoris 起草，R1 已吸收 Agent24 的答复（[`negotiation/R1-Agent24-答复.md`](negotiation/R1-Agent24-答复.md)）。**D-1…D-7 已由 jason 拍板，全部选 (a)（2026-09-27）**。等 Agent24 对 R2 无异议后定稿。
 > **权威**：沿用 docs/17 D0。iDoris 是能力提供方，负责主持本规范；Agent24 是需求方，负责提需求、审阅、确认。定稿后以 **JSON Schema** 为真源，放入 `iDoris/packages/contracts/schema/`，Markdown 只是说明。
 > **上位**：[`../iDoris-总体规划.md`](../iDoris-总体规划.md)（§6 管理面分工、§8 服务目录、§12 协商流程）。
 > **承接**：Agent24 `docs/design/INTEGRATION-AGENTEAR-IDORIS.md`（ADR-032）§9 与附录 B 中**已经和 iDoris 谈定的条款全部继承**，本规范不重新谈。
@@ -309,3 +309,4 @@
 | R0 | 2026-09-27 | iDoris | 本草案 v0.1 发给 Agent24（agent24-13）review | Agent24 已确认收到，正在对照代码与 ADR-032/ME4-S2/A3 起草 Q-1…Q-9、§3 逐条意见与 ATIF 对齐评估；需 jason 拍板的点将单列；同意把 ADR-032 §9「一行都没合并」标为过期 |
 | R1 | 2026-09-27 | Agent24 | 答复全文见 [`negotiation/R1-Agent24-答复.md`](negotiation/R1-Agent24-答复.md)。<br>• Q-9：同意模型管理全部归 iDoris。<br>• 更正两处事实：L3 从未实现；v0.1 漏列 Desktop 的 oMLX 管理。<br>• 分歧一处：Evolver 的数据源。<br>• §3 逐条意见。<br>• 另列 D-1…D-7 请 jason 拍板。 | — |
 | R2 | 2026-09-27 | iDoris | **全部采纳** R1 的意见，包括撤回「Evolver 读 iDoris 导出」。<br>• 新增 §3.12。<br>• 回答 fast/daily 的区分标准。<br>• D-1…D-7：iDoris 同意 Agent24 的推荐选项（均为 (a)）。 | **待 jason 拍板 D-1…D-7**；拍板后转 JSON Schema，定稿 |
+| R3 | 2026-09-27 | jason | **D-1…D-7 全部选 (a)**：配置 IDORIS_URL 后独占（不留直连 oMLX 的通道）；等 M4 前置完成再接入；Evolver 主数据源是 Agent24 事件日志；敏感确认只在 iDoris 控制台完成；Desktop main 进程直连 Admin 端口；每个实例两把 key；原型阶段只承诺 M4 状态卡片。同时同意 Agent24 那约 20 行文档修改 | 等 Agent24 回复「R2 无异议」后定稿 → 转 JSON Schema |
