@@ -393,4 +393,84 @@ mod tests {
         assert_eq!(response.model, "a");
         assert!(response.content.contains("hello"));
     }
+
+    fn paid_card(id: &str) -> ComponentCard {
+        let mut card = local_card(id);
+        card.provider.cost = Cost {
+            input_per_m: 1_000_000.0,
+            output_per_m: 2_000_000.0,
+        };
+        card
+    }
+
+    // TempDir must outlive the BudgetLedger using its path.
+    fn configured_ledger(limit_minor: i64) -> (tempfile::TempDir, BudgetLedger) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ledger = BudgetLedger::open(dir.path().join("b.sqlite3")).unwrap();
+        ledger
+            .configure_tenant(
+                budget::PERSONAL_TENANT_ID,
+                limit_minor,
+                "UTC",
+                idoris_tenancy::budget::SpendGate::PaidOnly,
+            )
+            .unwrap();
+        (dir, ledger)
+    }
+
+    // "No ledger wired" (trivial branch) is covered at the budget.rs unit
+    // level; these focus on the two integration paths below.
+    #[tokio::test]
+    async fn paid_candidate_over_budget_is_rejected_and_nothing_is_charged() {
+        let (_dir, ledger) = configured_ledger(1);
+        let outcome = dispatch_local(
+            &[paid_card("p")],
+            None,
+            Some(&ledger),
+            &empty_profile(),
+            "hi",
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        match outcome.result.unwrap_err() {
+            DispatchFailure::Budget(BudgetError::Exceeded { .. }) => {}
+            other => panic!("expected Budget(Exceeded), got {other:?}"),
+        }
+        assert_eq!(
+            ledger.tenant_balance(budget::PERSONAL_TENANT_ID).unwrap(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn paid_candidate_settles_the_actual_cost_on_success() {
+        let (_dir, ledger) = configured_ledger(1_000_000);
+        let adapter = Arc::new(MockAdapter::new(vec![ModelInfo {
+            id: "p".to_string(),
+            memory_gb: 1.0,
+        }]));
+        let supervisor = Supervisor::spawn(adapter, SupervisorConfig::default()).unwrap();
+        let messages = vec![ChatMessage {
+            role: "user".to_string(),
+            content: "hi".to_string(),
+        }];
+        let outcome = dispatch_local(
+            &[paid_card("p")],
+            Some(&supervisor),
+            Some(&ledger),
+            &empty_profile(),
+            "hi",
+            messages,
+        )
+        .await
+        .unwrap();
+        assert!(outcome.result.is_ok());
+        let charged = outcome.actual_cost_minor.unwrap();
+        assert!(charged > 0);
+        assert_eq!(
+            ledger.tenant_balance(budget::PERSONAL_TENANT_ID).unwrap(),
+            1_000_000 - charged
+        );
+    }
 }

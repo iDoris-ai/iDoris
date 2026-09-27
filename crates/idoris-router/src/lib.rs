@@ -38,6 +38,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use idoris_backend::{BackendError, ChatMessage};
 use idoris_policy::Rejection;
+use idoris_tenancy::budget::{BUDGET_EXCEEDED_REASON_CODE, BudgetError};
 use serde::Serialize;
 use serde_json::json;
 use uuid::Uuid;
@@ -48,6 +49,7 @@ use profile::{ProfileError, parse_profile};
 const HEADER_SERVED_LOCALITY: &str = "X-iDoris-Served-Locality";
 const HEADER_REASON: &str = "X-iDoris-Reason";
 const HEADER_DEGRADED: &str = "X-iDoris-Degraded";
+const HEADER_COST_MINOR: &str = "X-iDoris-Cost-Minor";
 
 /// Production default port (T4.1/FU-13, PR #46): `IDORIS_PORT` unset/blank
 /// falls back to this. `8765`/`8796`/`8088`/`11434` were all already taken by
@@ -116,7 +118,9 @@ pub struct HealthResponse {
 
 /// Shared server state. `instance_id` is generated once per process and
 /// reported by `/health` — Agent24 uses it to detect a router restart.
-#[derive(Debug, Clone)]
+/// `Debug` is hand-written (below) since `BudgetLedger` doesn't implement
+/// it.
+#[derive(Clone)]
 pub struct AppState {
     pub instance_id: String,
     /// Resolved once at construction (from `IDORIS_DEPLOY_MODE`), not
@@ -132,10 +136,30 @@ pub struct AppState {
     /// count is always `cards.len()` — a single source of truth instead of
     /// a separately-tracked counter that could drift from this list.
     pub cards: Vec<idoris_contracts::ComponentCard>,
-    /// Backs the local dispatch path (R2-D task 3, a follow-up PR); `None`
-    /// means no local backend is wired — dispatch then fails closed as
+    /// Backs the local dispatch path (R2-D task 3); `None` means no local
+    /// backend is wired — dispatch then fails closed as
     /// `local_only_unavailable` rather than panicking on a missing handle.
     pub supervisor: Option<idoris_backend::SupervisorHandle>,
+    /// Backs atomic reserve/settle/release for a *paid* candidate (R2-D
+    /// task 4); `None` fails a paid candidate closed identically to an
+    /// unconfigured ledger scope (free candidates unaffected). `Arc`
+    /// because `BudgetLedger` (wraps a `Mutex<Connection>`) isn't `Clone`.
+    pub budget_ledger: Option<Arc<idoris_tenancy::budget::BudgetLedger>>,
+}
+
+impl std::fmt::Debug for AppState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AppState")
+            .field("instance_id", &self.instance_id)
+            .field("deploy_mode", &self.deploy_mode)
+            .field("cards", &self.cards)
+            .field("supervisor", &self.supervisor)
+            .field(
+                "budget_ledger",
+                &self.budget_ledger.as_ref().map(|_| "BudgetLedger { .. }"),
+            )
+            .finish()
+    }
 }
 
 impl Default for AppState {
@@ -147,6 +171,7 @@ impl Default for AppState {
             ),
             cards: Vec::new(),
             supervisor: None,
+            budget_ledger: None,
         }
     }
 }
@@ -334,36 +359,56 @@ fn backend_error_response(err: &BackendError, outcome: &dispatch::ChatOutcome) -
     response
 }
 
-fn rejection_response(rejection: Rejection) -> Response {
-    error_envelope(
-        StatusCode::from_u16(rejection.http_status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
-        rejection.error_type(),
-        format!("{rejection:?}"),
-    )
+/// A budget-ledger failure gating a *paid* candidate (R2-D task 4).
+/// `BudgetError::Exceeded` is the one genuine spend decision — 402
+/// `budget_exceeded` with `Budget402Body`'s fields folded in (contract-
+/// tenancy §4's "结构化" requirement). Every other variant is a setup/
+/// defensive gap, not expected against a correctly configured ledger, so
+/// it maps to a generic 500. `X-iDoris-Served-Locality` is still set.
+fn budget_error_response(err: &BudgetError, outcome: &dispatch::ChatOutcome) -> Response {
+    let mut response = match err.to_402_body() {
+        Some(body) => {
+            #[allow(clippy::unwrap_used)] // Budget402Body's fields all serialize infallibly
+            let mut value = serde_json::to_value(body).unwrap();
+            if let Some(obj) = value.as_object_mut() {
+                obj.insert("type".to_string(), json!(BUDGET_EXCEEDED_REASON_CODE));
+                obj.insert("rule_id".to_string(), json!(null));
+                obj.insert("evidence".to_string(), json!(null));
+                obj.insert("remediation".to_string(), json!(err.to_string()));
+            }
+            (
+                StatusCode::PAYMENT_REQUIRED,
+                Json(json!({ "error": value })),
+            )
+                .into_response()
+        }
+        None => error_envelope_with_reason(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal_error",
+            "budget_ledger_error",
+            err.to_string(),
+        ),
+    };
+    apply_decision_headers(&mut response, outcome);
+    response
 }
 
-/// A budget-ledger failure gating a *paid* candidate (R2-D task 4).
-/// **Placeholder mapping**: `AppState` has no `BudgetLedger` field yet
-/// (follow-up PR adds it, plus the real 402 `budget_exceeded` body and
-/// `X-iDoris-Cost-Minor`) — kept separate to stay under the line gate.
-/// `X-iDoris-Served-Locality` is still set, since a candidate was chosen.
 fn dispatch_failure_response(
     failure: &DispatchFailure,
     outcome: &dispatch::ChatOutcome,
 ) -> Response {
     match failure {
         DispatchFailure::Backend(err) => backend_error_response(err, outcome),
-        DispatchFailure::Budget(err) => {
-            let mut response = error_envelope_with_reason(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "internal_error",
-                "budget_ledger_error",
-                err.to_string(),
-            );
-            apply_decision_headers(&mut response, outcome);
-            response
-        }
+        DispatchFailure::Budget(err) => budget_error_response(err, outcome),
     }
+}
+
+fn rejection_response(rejection: Rejection) -> Response {
+    error_envelope(
+        StatusCode::from_u16(rejection.http_status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+        rejection.error_type(),
+        format!("{rejection:?}"),
+    )
 }
 
 /// `POST /v1/chat/completions`. Order (locked by conformance): non-JSON
@@ -407,12 +452,11 @@ async fn chat_completions(
         .collect::<Vec<_>>()
         .join("\n");
 
-    // No BudgetLedger wired yet (follow-up PR); a paid candidate fails via
-    // dispatch_failure_response's placeholder mapping until then.
+    let budget_ledger = state.budget_ledger.as_deref();
     match dispatch_local(
         &state.cards,
         state.supervisor.as_ref(),
-        None,
+        budget_ledger,
         &parsed,
         &prompt,
         messages,
@@ -430,6 +474,13 @@ async fn chat_completions(
                 let body = openai_chat_completion(&chat_response.content, requested_model, &prompt);
                 let mut response = (StatusCode::OK, Json(body)).into_response();
                 apply_decision_headers(&mut response, &outcome);
+                // X-iDoris-Cost-Minor: only set for a genuinely paid,
+                // settled candidate -- omitted for free/local calls.
+                if let Some(cost_minor) = outcome.actual_cost_minor
+                    && let Ok(v) = HeaderValue::from_str(&cost_minor.to_string())
+                {
+                    response.headers_mut().insert(HEADER_COST_MINOR, v);
+                }
                 response
             }
         },
@@ -487,6 +538,15 @@ mod tests {
             load_policy: None,
             extensions: None,
         }
+    }
+
+    fn paid_component_card(id: &str) -> ComponentCard {
+        let mut card = sample_component_card(id);
+        card.provider.cost = Cost {
+            input_per_m: 1_000_000.0,
+            output_per_m: 2_000_000.0,
+        };
+        card
     }
 
     #[test]
@@ -759,6 +819,7 @@ mod tests {
             "loopback"
         );
         assert!(response.headers().contains_key(HEADER_RECORD_ID));
+        assert!(!response.headers().contains_key(HEADER_COST_MINOR)); // free: no charge
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(json["object"], "chat.completion");
@@ -769,6 +830,111 @@ mod tests {
                 .unwrap()
                 .contains("hello there")
         );
+    }
+
+    #[tokio::test]
+    async fn chat_completions_paid_candidate_without_a_ledger_is_a_server_error() {
+        let state = AppState {
+            cards: vec![paid_component_card("paid-1")],
+            ..AppState::default()
+        };
+        let app = build_app(state);
+        let response = app
+            .oneshot(post_chat(
+                r#"{"model":"idoris/daily","messages":[{"role":"user","content":"hi"}]}"#,
+                &[],
+            ))
+            .await
+            .unwrap();
+        // Not 402: no ledger at all is a setup gap, not a spend decision.
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            response.headers().get(HEADER_SERVED_LOCALITY).unwrap(),
+            "loopback"
+        );
+    }
+
+    // TempDir must outlive the BudgetLedger using its path.
+    fn configured_budget_ledger(
+        limit_minor: i64,
+    ) -> (tempfile::TempDir, idoris_tenancy::budget::BudgetLedger) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ledger =
+            idoris_tenancy::budget::BudgetLedger::open(dir.path().join("b.sqlite3")).unwrap();
+        ledger
+            .configure_tenant(
+                budget::PERSONAL_TENANT_ID,
+                limit_minor,
+                "UTC",
+                idoris_tenancy::budget::SpendGate::PaidOnly,
+            )
+            .unwrap();
+        (dir, ledger)
+    }
+
+    #[tokio::test]
+    async fn chat_completions_paid_candidate_over_budget_is_402_with_a_structured_body() {
+        let (_dir, ledger) = configured_budget_ledger(1);
+        let state = AppState {
+            cards: vec![paid_component_card("paid-1")],
+            budget_ledger: Some(std::sync::Arc::new(ledger)),
+            ..AppState::default()
+        };
+        let app = build_app(state);
+        let response = app
+            .oneshot(post_chat(
+                r#"{"model":"idoris/daily","messages":[{"role":"user","content":"hi"}]}"#,
+                &[],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
+        assert_eq!(
+            response.headers().get(HEADER_SERVED_LOCALITY).unwrap(),
+            "loopback"
+        );
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["error"]["type"], "budget_exceeded");
+        assert_eq!(json["error"]["reason_code"], "budget_exceeded");
+        assert_eq!(json["error"]["tenant_id"], budget::PERSONAL_TENANT_ID);
+        assert!(json["error"]["topup_hint"].is_string());
+    }
+
+    #[tokio::test]
+    async fn chat_completions_paid_candidate_settles_and_sets_the_cost_header() {
+        let (_dir, ledger) = configured_budget_ledger(1_000_000);
+        let adapter = std::sync::Arc::new(idoris_backend::MockAdapter::new(vec![
+            idoris_backend::ModelInfo {
+                id: "paid-1".to_string(),
+                memory_gb: 1.0,
+            },
+        ]));
+        let supervisor =
+            idoris_backend::Supervisor::spawn(adapter, idoris_backend::SupervisorConfig::default())
+                .unwrap();
+        let state = AppState {
+            cards: vec![paid_component_card("paid-1")],
+            supervisor: Some(supervisor),
+            budget_ledger: Some(std::sync::Arc::new(ledger)),
+            ..AppState::default()
+        };
+        let app = build_app(state);
+        let response = app
+            .oneshot(post_chat(
+                r#"{"model":"idoris/daily","messages":[{"role":"user","content":"hi"}]}"#,
+                &[],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let cost_header = response
+            .headers()
+            .get(HEADER_COST_MINOR)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(cost_header.parse::<i64>().unwrap() > 0);
     }
 
     #[tokio::test]
