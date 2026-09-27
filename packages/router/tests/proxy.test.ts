@@ -4,12 +4,22 @@ import { ChatProxy, type FetchResponseLike } from "../src/proxy.js";
 const ok = (text: string): FetchResponseLike => ({ status: 200, ok: true, text: async () => text, body: null });
 const err = (status: number): FetchResponseLike => ({ status, ok: false, text: async () => "boom", body: null });
 
+/**
+ * M1（PR #46 复审）：`providerId`/`servedLocality`/`privacy` 现在是 `forward()`
+ * 的必填参数（漏传会 fail-open，见 proxy.ts 的 `assertForwardOpts`）。这组测试
+ * 大部分测的是重试/流式/租户隔离/缓存回收，不关心这三个字段具体取什么值，
+ * 用这份缺省值铺底，省得每条用例都重复写一遍跟测试意图无关的样板。
+ * 真正关心这三个字段的用例（provider 隔离、privacy fail-closed 那两组）
+ * 照样显式传自己的值，会覆盖掉这里的缺省。
+ */
+const DEFAULT_FORWARD_OPTS = { providerId: "p", servedLocality: "loopback" as const, privacy: "any" as const };
+
 describe("ChatProxy (T1.3.4)", () => {
   it("retries a 5xx up to 2 times, then succeeds", async () => {
     const f = vi.fn<(url: string) => Promise<FetchResponseLike>>();
     f.mockResolvedValueOnce(err(503)).mockResolvedValueOnce(err(503)).mockResolvedValueOnce(ok("done"));
     const proxy = new ChatProxy({ fetchImpl: f as never, sleep: async () => {} , now: () => 0 });
-    const r = await proxy.forward("http://up", undefined, { model: "m" }, { stream: false });
+    const r = await proxy.forward("http://up", undefined, { model: "m" }, { stream: false, ...DEFAULT_FORWARD_OPTS });
     expect(r.status).toBe(200);
     expect(r.retries).toBe(2);
     expect(f).toHaveBeenCalledTimes(3);
@@ -19,7 +29,7 @@ describe("ChatProxy (T1.3.4)", () => {
     const body = { getReader: () => ({ read: async () => ({ done: true }), cancel: async () => {} }) };
     const f = vi.fn(async () => ({ status: 200, ok: true, text: async () => "", body }));
     const proxy = new ChatProxy({ fetchImpl: f as never });
-    const r = await proxy.forward("http://up", undefined, { model: "m" }, { stream: true });
+    const r = await proxy.forward("http://up", undefined, { model: "m" }, { stream: true, ...DEFAULT_FORWARD_OPTS });
     expect(r.stream).not.toBeNull();
     expect(f).toHaveBeenCalledTimes(1);
   });
@@ -27,8 +37,8 @@ describe("ChatProxy (T1.3.4)", () => {
   it("caches an idempotent non-stream result by request id", async () => {
     const f = vi.fn(async () => ok("cached-body"));
     const proxy = new ChatProxy({ fetchImpl: f as never, now: () => 1000 });
-    const a = await proxy.forward("http://up", undefined, { model: "m" }, { stream: false, requestId: "r1" });
-    const b = await proxy.forward("http://up", undefined, { model: "m" }, { stream: false, requestId: "r1" });
+    const a = await proxy.forward("http://up", undefined, { model: "m" }, { stream: false, requestId: "r1", ...DEFAULT_FORWARD_OPTS });
+    const b = await proxy.forward("http://up", undefined, { model: "m" }, { stream: false, requestId: "r1", ...DEFAULT_FORWARD_OPTS });
     expect(a.cached).toBe(false);
     expect(b.cached).toBe(true);
     expect(f).toHaveBeenCalledTimes(1);
@@ -41,7 +51,11 @@ describe("ChatProxy (T1.3.4)", () => {
       throw new Error("aborted");
     });
     const proxy = new ChatProxy({ fetchImpl: f as never, sleep: async () => {}, now: () => 0 });
-    const r = await proxy.forward("http://up", undefined, { model: "m" }, { stream: false, signal: controller.signal });
+    const r = await proxy.forward("http://up", undefined, { model: "m" }, {
+      stream: false,
+      signal: controller.signal,
+      ...DEFAULT_FORWARD_OPTS,
+    });
     expect(r.status).toBe(499);
     expect(f).toHaveBeenCalledTimes(1);
   });
@@ -68,10 +82,10 @@ describe("幂等缓存的租户隔离（回归：评审 PR #25 实测到的跨�
   it("同一个 requestId、不同租户 → 各自拿到自己的响应，绝不互串", async () => {
     const proxy = mkProxy(["TENANT_A_SECRET", "TENANT_B_SECRET"]);
     const a = await proxy.forward("http://up", undefined, {}, {
-      stream: false, requestId: "shared-id", tenantId: "tenant-a",
+      stream: false, requestId: "shared-id", tenantId: "tenant-a", ...DEFAULT_FORWARD_OPTS,
     });
     const b = await proxy.forward("http://up", undefined, {}, {
-      stream: false, requestId: "shared-id", tenantId: "tenant-b",
+      stream: false, requestId: "shared-id", tenantId: "tenant-b", ...DEFAULT_FORWARD_OPTS,
     });
     expect(a.text).toBe("TENANT_A_SECRET");
     expect(a.cached).toBe(false);
@@ -84,10 +98,10 @@ describe("幂等缓存的租户隔离（回归：评审 PR #25 实测到的跨�
   it("同一个租户 + 同一个 requestId → 仍然命中缓存（幂等语义不被修坏）", async () => {
     const proxy = mkProxy(["ONCE", "SHOULD_NOT_BE_FETCHED"]);
     const first = await proxy.forward("http://up", undefined, {}, {
-      stream: false, requestId: "same-id", tenantId: "tenant-a",
+      stream: false, requestId: "same-id", tenantId: "tenant-a", ...DEFAULT_FORWARD_OPTS,
     });
     const second = await proxy.forward("http://up", undefined, {}, {
-      stream: false, requestId: "same-id", tenantId: "tenant-a",
+      stream: false, requestId: "same-id", tenantId: "tenant-a", ...DEFAULT_FORWARD_OPTS,
     });
     expect(first.cached).toBe(false);
     expect(second.cached).toBe(true);
@@ -97,10 +111,10 @@ describe("幂等缓存的租户隔离（回归：评审 PR #25 实测到的跨�
   it("同一个租户、同一个 requestId，但路由到不同 provider → 不返回另一个 provider 的响应", async () => {
     const proxy = mkProxy(["FROM_UPSTREAM_1", "FROM_UPSTREAM_2"]);
     const one = await proxy.forward("http://up1", undefined, {}, {
-      stream: false, requestId: "same-id", tenantId: "tenant-a",
+      stream: false, requestId: "same-id", tenantId: "tenant-a", ...DEFAULT_FORWARD_OPTS,
     });
     const two = await proxy.forward("http://up2", undefined, {}, {
-      stream: false, requestId: "same-id", tenantId: "tenant-a",
+      stream: false, requestId: "same-id", tenantId: "tenant-a", ...DEFAULT_FORWARD_OPTS,
     });
     expect(one.text).toBe("FROM_UPSTREAM_1");
     expect(two.text).toBe("FROM_UPSTREAM_2");
@@ -110,10 +124,10 @@ describe("幂等缓存的租户隔离（回归：评审 PR #25 实测到的跨�
   it("personal 模式（无 tenantId）不与任何具名租户共享键空间", async () => {
     const proxy = mkProxy(["PERSONAL", "NAMED_TENANT"]);
     const p = await proxy.forward("http://up", undefined, {}, {
-      stream: false, requestId: "same-id",
+      stream: false, requestId: "same-id", ...DEFAULT_FORWARD_OPTS,
     });
     const t = await proxy.forward("http://up", undefined, {}, {
-      stream: false, requestId: "same-id", tenantId: "tenant-a",
+      stream: false, requestId: "same-id", tenantId: "tenant-a", ...DEFAULT_FORWARD_OPTS,
     });
     expect(p.text).toBe("PERSONAL");
     expect(t.text).toBe("NAMED_TENANT");
@@ -140,12 +154,14 @@ describe("幂等缓存按 provider id 隔离（回归：PR #46 复审 C1，真�
       requestId: "same-id",
       providerId: "provider-remote",
       servedLocality: "remote",
+      privacy: "any",
     });
     const loopback = await proxy.forward("http://127.0.0.1:9500", undefined, {}, {
       stream: false,
       requestId: "same-id",
       providerId: "provider-loopback",
       servedLocality: "loopback",
+      privacy: "any",
     });
     expect(remote.text).toBe("FROM_PROVIDER_REMOTE");
     // 修复前：loopback.cached === true 且 loopback.text === "FROM_PROVIDER_REMOTE"。
@@ -158,8 +174,8 @@ describe("幂等缓存按 provider id 隔离（回归：PR #46 复审 C1，真�
       fetchImpl: async () => ({ ok: true, status: 200, text: async () => "ONCE", body: null }),
       now: () => 1_000,
     });
-    const a = await proxy.forward("http://127.0.0.1:9500", undefined, {}, { stream: false, requestId: "same-id", providerId: "p" });
-    const b = await proxy.forward("http://127.0.0.1:9500", undefined, {}, { stream: false, requestId: "same-id", providerId: "p" });
+    const a = await proxy.forward("http://127.0.0.1:9500", undefined, {}, { stream: false, requestId: "same-id", ...DEFAULT_FORWARD_OPTS });
+    const b = await proxy.forward("http://127.0.0.1:9500", undefined, {}, { stream: false, requestId: "same-id", ...DEFAULT_FORWARD_OPTS });
     expect(a.cached).toBe(false);
     expect(b.cached).toBe(true);
   });
@@ -174,12 +190,14 @@ describe("幂等缓存按 provider id 隔离（回归：PR #46 复审 C1，真�
       requestId: "same-id",
       providerId: "p",
       servedLocality: "loopback",
+      privacy: "any",
     });
     const hit = await proxy.forward("http://127.0.0.1:9500", undefined, {}, {
       stream: false,
       requestId: "same-id",
       providerId: "p",
       servedLocality: "remote", // 故意传一个跟写入时不同的值，验证不会被采信
+      privacy: "any",
     });
     expect(hit.cached).toBe(true);
     expect(hit.servedLocality).toBe("loopback");
@@ -266,7 +284,7 @@ describe("幂等缓存必须有界（回归：评审 PR #25 第 2 项实测的�
     });
 
   const fire = async (p: ChatProxy, id: string): Promise<void> => {
-    await p.forward("http://up", undefined, {}, { stream: false, requestId: id, tenantId: "t" });
+    await p.forward("http://up", undefined, {}, { stream: false, requestId: id, tenantId: "t", ...DEFAULT_FORWARD_OPTS });
   };
 
   it("1000 个各自不同且立即过期的 requestId → 缓存不会留下 1000 条", async () => {
@@ -290,8 +308,8 @@ describe("幂等缓存必须有界（回归：评审 PR #25 第 2 项实测的�
       now: () => 1_000,
       maxCacheEntries: 10,
     });
-    const a = await proxy.forward("http://up", undefined, {}, { stream: false, requestId: "k", tenantId: "t" });
-    const b = await proxy.forward("http://up", undefined, {}, { stream: false, requestId: "k", tenantId: "t" });
+    const a = await proxy.forward("http://up", undefined, {}, { stream: false, requestId: "k", tenantId: "t", ...DEFAULT_FORWARD_OPTS });
+    const b = await proxy.forward("http://up", undefined, {}, { stream: false, requestId: "k", tenantId: "t", ...DEFAULT_FORWARD_OPTS });
     expect(a.cached).toBe(false);
     expect(b.cached).toBe(true);
   });
@@ -310,7 +328,7 @@ describe("幂等缓存必须有界（回归：评审 PR #25 第 2 项实测的�
     });
     const at = async (t: number, id: string): Promise<void> => {
       clock = t;
-      await proxy.forward("http://up", undefined, {}, { stream: false, requestId: id, tenantId: "t" });
+      await proxy.forward("http://up", undefined, {}, { stream: false, requestId: id, tenantId: "t", ...DEFAULT_FORWARD_OPTS });
     };
 
     await at(0, "A");

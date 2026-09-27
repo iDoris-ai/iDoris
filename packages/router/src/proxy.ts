@@ -48,6 +48,34 @@ export interface ForwardResult {
 
 const defaultSleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
+const VALID_SERVED_LOCALITIES: ReadonlySet<string> = new Set(["loopback", "lan", "remote"]);
+const VALID_PRIVACY: ReadonlySet<string> = new Set(["local_only", "any"]);
+
+/**
+ * M1（PR #46 复审）：`providerId`/`servedLocality`/`privacy` 曾经是可选参数，
+ * 漏传就会**静默 fail-open**——所有调用共用同一个 `no-provider` sentinel（缓存
+ * 隔离形同虚设），`privacy` 缺失等价于 `"any"`（local_only 的 fail-closed 复核
+ * 直接失效）。改成必填之后光靠 TS 类型还不够（调用方可能用 `as never`/`any`
+ * 绕过类型检查，或者干脆是运行时拼装的对象），这里再做一遍运行时校验，
+ * 缺失或非法值直接抛错——不静默回落到某个"看起来安全"的默认值。
+ */
+function assertForwardOpts(opts: { providerId: string; servedLocality: string; privacy: string }): void {
+  if (typeof opts.providerId !== "string" || opts.providerId.length === 0) {
+    throw new Error("ChatProxy.forward: opts.providerId is required and must be a non-empty string");
+  }
+  if (!VALID_SERVED_LOCALITIES.has(opts.servedLocality)) {
+    throw new Error(
+      "ChatProxy.forward: opts.servedLocality is required and must be one of loopback|lan|remote, got: " +
+        JSON.stringify(opts.servedLocality),
+    );
+  }
+  if (!VALID_PRIVACY.has(opts.privacy)) {
+    throw new Error(
+      "ChatProxy.forward: opts.privacy is required and must be one of local_only|any, got: " + JSON.stringify(opts.privacy),
+    );
+  }
+}
+
 /**
  * 幂等缓存键。**必须含 tenant、endpoint 与 provider id，不能只用 requestId。**
  *
@@ -86,7 +114,7 @@ export class ChatProxy {
   private readonly maxCacheEntries: number;
   private readonly cache = new Map<
     string,
-    { at: number; status: number; text: string; recordId?: string; providerId?: string; servedLocality?: string }
+    { at: number; status: number; text: string; recordId?: string; providerId: string; servedLocality: string }
   >();
 
   constructor(deps: ProxyDeps = {}) {
@@ -110,7 +138,7 @@ export class ChatProxy {
    */
   private remember(
     key: string,
-    value: { at: number; status: number; text: string; recordId?: string; providerId?: string; servedLocality?: string },
+    value: { at: number; status: number; text: string; recordId?: string; providerId: string; servedLocality: string },
   ): void {
     // 先 delete 再 set：Map 对已存在的键做 set **不会**把它移到末尾，
     // 那会打破下面 prune() 依赖的「插入序 == 过期序」不变式。
@@ -150,14 +178,25 @@ export class ChatProxy {
       tenantId?: string;
       signal?: AbortSignal;
       recordId?: string;
-      /** 这次请求实际选中的 provider（进缓存键，也存进缓存条目——C1）。 */
-      providerId?: string;
-      /** 这次请求实际的 Served-Locality（写缓存时存下来；C1 命中时原样回放，不重算）。 */
-      servedLocality?: string;
-      /** 这次请求的隐私级别；命中时用来做 fail-closed 复核（C1）。 */
-      privacy?: "local_only" | "any";
+      /**
+       * 这次请求实际选中的 provider（进缓存键，也存进缓存条目——C1）。
+       * **必填**（M1）：漏传会 fail-open，所有调用共用同一个 sentinel 键，
+       * provider 间的缓存隔离形同虚设。
+       */
+      providerId: string;
+      /**
+       * 这次请求实际的 Served-Locality（写缓存时存下来；C1 命中时原样回放，
+       * 不重算）。**必填**（M1）：漏传等于放弃 fail-closed 判据。
+       */
+      servedLocality: "loopback" | "lan" | "remote";
+      /**
+       * 这次请求的隐私级别；命中时用来做 fail-closed 复核（C1）。**必填**
+       * （M1）：漏传等价于 `"any"`，local_only 请求就可能命中 remote 来源的缓存。
+       */
+      privacy: "local_only" | "any";
     },
   ): Promise<ForwardResult> {
+    assertForwardOpts(opts);
     const url = endpoint.replace(/\/$/, "") + "/v1/chat/completions";
     const headers: Record<string, string> = { "content-type": "application/json" };
     if (apiKey !== undefined) headers.authorization = "Bearer " + apiKey;
@@ -165,11 +204,8 @@ export class ChatProxy {
     // deploy_mode=tenant 时 profile.ts 已保证 tenantId 存在（缺则 400 tenant_missing）；
     // personal 模式无租户维度，用固定 sentinel。两者永不共享键空间。
     const tenantScope = opts.tenantId ?? "\u0000personal";
-    // 没有 providerId 的调用（理论上不该发生——server.ts 现在总会传）也不能落进
-    // 同一个空字符串键，用固定 sentinel 隔开，避免意外互相命中。
-    const providerScope = opts.providerId ?? "\u0000no-provider";
     if (!opts.stream && opts.requestId !== undefined) {
-      const hit = this.cache.get(cacheKey(tenantScope, url, providerScope, opts.requestId));
+      const hit = this.cache.get(cacheKey(tenantScope, url, opts.providerId, opts.requestId));
       if (hit && this.now() - hit.at < this.windowMs) {
         // C1 fail-closed：这次请求若是 local_only，而这条缓存记录当初实际的
         // Served-Locality 不是 loopback（含压根没记录到，一律按不安全处理），
@@ -213,13 +249,13 @@ export class ChatProxy {
         }
         const text = await res.text();
         if (opts.requestId !== undefined)
-          this.remember(cacheKey(tenantScope, url, providerScope, opts.requestId), {
+          this.remember(cacheKey(tenantScope, url, opts.providerId, opts.requestId), {
             at: this.now(),
             status: res.status,
             text,
             ...(opts.recordId !== undefined ? { recordId: opts.recordId } : {}),
-            ...(opts.providerId !== undefined ? { providerId: opts.providerId } : {}),
-            ...(opts.servedLocality !== undefined ? { servedLocality: opts.servedLocality } : {}),
+            providerId: opts.providerId,
+            servedLocality: opts.servedLocality,
           });
         return { status: res.status, text, stream: null, retries: attempt, cached: false };
       } catch (err) {

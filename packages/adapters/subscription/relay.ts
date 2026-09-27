@@ -13,10 +13,10 @@
  * **不保证**网络目的地与凭据隔离 —— CLI 必须联网读取自己的登录态。
  */
 import { spawn } from "node:child_process";
+import { createHash, randomUUID } from "node:crypto";
 import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { randomUUID } from "node:crypto";
 import type {
   Admission,
   BackendStatus,
@@ -41,34 +41,46 @@ export type SubscriptionRelayErrorCode =
   | "RELAY_TIMEOUT"
   | "RELAY_CANCELLED";
 
+/**
+ * PR #46 复审 H2：**不做自由文本脱敏**——之前的 `redactForLog`（替换本机用户名
+ * 目录、替换看起来像 token 的长子串）不可靠，正则覆盖不到短密钥、prompt 原样
+ * 回显、或者任何没匹配上启发式规则的敏感内容。唯一可靠的做法是**压根不记录
+ * 自由文本**，只留白名单元数据：退出码、stderr 字节数、stderr 的 sha256 摘要
+ * 前 12 位（不可逆，用于跨请求关联同一份 stderr，不泄露内容本身）。
+ */
+export interface SubscriptionRelayDiagnostics {
+  exitCode: number | null;
+  /** 原始 stderr 的字节数（不是字符数——多字节字符会更明显地体现差异）。 */
+  stderrBytes: number;
+  /** sha256(stderr) 的十六进制前 12 位；不可逆，只用于关联诊断。 */
+  stderrDigest: string;
+}
+
 export class SubscriptionRelayError extends Error {
   constructor(
     readonly code: SubscriptionRelayErrorCode,
     message: string,
     /**
-     * 供服务端日志排障用的原始细节（如 CLI stderr 摘要，已脱敏+截断）。
-     * **绝不能**透传给外部调用方——`message` 本身刻意不含这些内容，就是为了
-     * 让"直接把 Error.message 塞进 HTTP 响应"这种常见写法也不会泄露
-     * （PR #46 复审 M2：曾经 message 里直接拼了最多 500 字节的原始 CLI stderr）。
+     * 供服务端日志排障用的白名单元数据（退出码/字节数/摘要）。**绝不含任何
+     * stderr 自由文本**——`message` 本身也刻意不含这些内容，就是为了让
+     * "直接把 Error.message 塞进 HTTP 响应"这种常见写法也不会泄露
+     * （PR #46 复审 M2：曾经 message 里直接拼了最多 500 字节的原始 CLI stderr；
+     * H2：后来改成"脱敏后的摘要"也不够——脱敏正则本身就靠不住）。
      */
-    readonly internalDetail?: string,
+    readonly diagnostics?: SubscriptionRelayDiagnostics,
   ) {
     super(message);
     this.name = "SubscriptionRelayError";
   }
 }
 
-/**
- * 极简脱敏：替换掉看起来像本机用户主目录的片段和长 token/密钥形状的子串。
- * 不是通用的 DLP，只覆盖"CLI 报错里最常见会带出来的敏感内容"这两类；
- * 仍然只应该写进服务端日志，不对外暴露。
- */
-function redactForLog(text: string): string {
-  const home = process.env.HOME ?? process.env.USERPROFILE;
-  let out = text;
-  if (home !== undefined && home !== "") out = out.split(home).join("~");
-  out = out.replace(/[A-Za-z0-9_-]{24,}/g, "[redacted]");
-  return out;
+function stderrDiagnostics(stderr: string, exitCode: number | null): SubscriptionRelayDiagnostics {
+  const buf = Buffer.from(stderr, "utf8");
+  return {
+    exitCode,
+    stderrBytes: buf.length,
+    stderrDigest: createHash("sha256").update(buf).digest("hex").slice(0, 12),
+  };
 }
 
 export interface OpenAIChatCompletion {
@@ -284,12 +296,12 @@ export class SubscriptionRelay implements ModelBackend {
     }
     text = text.trim();
     if (run.code !== 0) {
-      // M2：message 只带退出码，不带任何 CLI 输出——stderr 摘要单独放
-      // internalDetail，且已脱敏+截断，只供服务端日志使用（见类定义注释）。
+      // M2/H2：message 只带退出码，不带任何 CLI 输出；diagnostics 只有白名单
+      // 元数据（退出码/字节数/sha256 摘要），不含 stderr 原文——见类定义注释。
       throw new SubscriptionRelayError(
         "RELAY_CLI_FAILED",
         "subscription CLI exited with code " + String(run.code),
-        redactForLog(run.stderr.trim().slice(0, 500)),
+        stderrDiagnostics(run.stderr, run.code),
       );
     }
     if (text === "") {

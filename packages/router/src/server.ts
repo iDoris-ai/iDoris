@@ -7,7 +7,7 @@ import {
   SubscriptionRelayError,
   type ChatMessage,
 } from "@idoris/adapters";
-import { CONTRACT_VERSION, type ComponentCard, type RoutingPolicy, type TaskProfile } from "@idoris/contracts";
+import { CONTRACT_VERSION, type RoutingPolicy, type TaskProfile } from "@idoris/contracts";
 import {
   DefaultCapabilitiesProvider,
   type CapabilitiesProvider,
@@ -15,6 +15,7 @@ import {
 import { dispatch, type EgressCounter } from "./dispatch.js";
 import { assertSubscriptionSource, EgressGuardError } from "./egress-guard.js";
 import { HealthTracker } from "./health.js";
+import { effectiveServedLocality, SERVED_LOCALITY_VALUES, type ServedLocality } from "./locality.js";
 import { decide, loadRoutingPolicy } from "./policy.js";
 import { defaultIntentDetector, resolveProfile, type IntentDetector } from "./intent.js";
 import { ProfileError } from "./profile.js";
@@ -52,29 +53,6 @@ const BIND_HOST = "127.0.0.1";
 
 /** 本包 package.json 的 version；进程内只需读一次。 */
 const ROUTER_VERSION = readRouterVersion();
-
-type ServedLocality = "loopback" | "lan" | "remote";
-const SERVED_LOCALITIES: ReadonlySet<string> = new Set(["loopback", "lan", "remote"]);
-
-/**
- * `X-iDoris-Served-Locality` 取值（T4.1，接口规范 §3.5/§3.12）。
- *
- * **`provider.locality` 不等于「推理实际发生在哪里」**：对 `http_service` 卡，
- * 组件卡的 `provider.locality` 就是它自己网络地址的可达范围，两者一致；但对
- * `spawn_cli`（订阅中转）这类卡，`provider.locality: loopback` 表达的是**调用来源**
- * 必须是 loopback（见 config/components/subscription.yaml 的注释），跟这次推理
- * 实际在哪里执行毫无关系——订阅中转背后调的是云端 CLI，真实推理发生在远端。
- * 同理，凡是已知走"订阅/中转"这条子协议的 provider，也不能直接信它卡上的 locality。
- *
- * 所以这里不能无条件读 `card.provider.locality` 当作既成事实：spawn_cli 或订阅类
- * provider 一律按 `remote` 回报；其余情况才用卡上的 locality，且缺失/非三值之一时
- * 同样 fail-closed 按 `remote`（不默认 loopback——Agent24 的 `idoris-local` 只认 loopback）。
- */
-function servedLocalityOf(card: ComponentCard): ServedLocality {
-  if (card.form === "spawn_cli" || isSubscriptionProviderId(card.provider.id)) return "remote";
-  const locality: unknown = card.provider.locality;
-  return typeof locality === "string" && SERVED_LOCALITIES.has(locality) ? (locality as ServedLocality) : "remote";
-}
 
 function json(res: ServerResponse, status: number, body: unknown): void {
   res.writeHead(status, { "content-type": "application/json" });
@@ -343,7 +321,7 @@ async function handleChat(
   // T4.1：走到这里说明确实由 target 这个后端服务；此后所有响应（成功/该后端自身
   // 报错）都带实际服务方的 Served-Locality。在此之前的错误（无候选、策略未配置、
   // 订阅来源复核拒绝……）都还没有落到具体后端，不带这个头。
-  const servedLocality = servedLocalityOf(target.card);
+  const servedLocality = effectiveServedLocality(target.card);
   res.setHeader("X-iDoris-Served-Locality", servedLocality);
   meta.providerId = target.card.provider.id;
   meta.servedLocality = servedLocality;
@@ -360,19 +338,22 @@ async function handleChat(
       const prompt = messages.map((m) => m.content).join("\n");
       json(res, 200, openAIChatCompletion(chat.content, model, prompt));
     } catch (err) {
-      // M2：订阅 CLI 的原始报错（可能带栈、路径、CLI 自己的诊断输出——哪怕
-      // relay.ts 已经把 stderr 摘要挪进了 internalDetail，这里也不假设"所有
-      // 错误路径都干净"）只写服务端 stderr，绝不透传给调用方。对外只给一个
-      // 固定错误码 + `reason_code`。
+      // M2/H2：对外只给固定错误码 + `reason_code`，绝不透传调用方任何 CLI
+      // 原始输出。服务端日志也**只记白名单元数据**（reason_code、message——
+      // relay.ts 保证 message 不含 stderr 原文、退出码、stderr 字节数、
+      // stderr 的 sha256 摘要前 12 位），不记任何自由文本形式的 stderr 内容——
+      // 早先"脱敏后的摘要"那版本身就靠不住（正则覆盖不到短密钥/prompt 回显）。
       const reasonCode = err instanceof SubscriptionRelayError ? err.code : "RELAY_UNKNOWN";
-      const detail =
-        err instanceof SubscriptionRelayError && err.internalDetail !== undefined ? " | detail: " + err.internalDetail : "";
+      const diagnostics = err instanceof SubscriptionRelayError ? err.diagnostics : undefined;
       console.error(
-        "[idoris-router] 订阅中转失败（reason_code=" +
-          reasonCode +
-          "）：" +
-          (err instanceof Error ? err.message : String(err)) +
-          detail,
+        "[idoris-router] 订阅中转失败：" +
+          JSON.stringify({
+            reason_code: reasonCode,
+            message: err instanceof Error ? err.message : String(err),
+            exit_code: diagnostics?.exitCode ?? null,
+            stderr_bytes: diagnostics?.stderrBytes ?? null,
+            stderr_sha256_12: diagnostics?.stderrDigest ?? null,
+          }),
       );
       json(res, 502, {
         error: { type: "subscription_relay_failed", reason_code: reasonCode, message: "subscription relay failed" },
@@ -408,10 +389,10 @@ async function handleChat(
     if (result.originRecordId !== undefined) res.setHeader("X-iDoris-Origin-Record-Id", result.originRecordId);
     // C1：Served-Locality 必须用缓存条目里记录的值覆盖——那才是当初真正产生
     // 这条响应时的值，不是"这次又重新算了一遍、恰好可能不一样"的值。缺失/
-    // 非三值之一时按 remote fail-closed，跟 servedLocalityOf() 的口径一致。
+    // 非三值之一时按 remote fail-closed，跟 effectiveServedLocality() 的口径一致。
     const cachedLocality = result.servedLocality;
     const resolvedCachedLocality: ServedLocality =
-      typeof cachedLocality === "string" && SERVED_LOCALITIES.has(cachedLocality) ? (cachedLocality as ServedLocality) : "remote";
+      typeof cachedLocality === "string" && SERVED_LOCALITY_VALUES.has(cachedLocality) ? (cachedLocality as ServedLocality) : "remote";
     res.setHeader("X-iDoris-Served-Locality", resolvedCachedLocality);
     meta.servedLocality = resolvedCachedLocality;
   }

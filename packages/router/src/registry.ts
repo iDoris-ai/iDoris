@@ -55,6 +55,32 @@ function assertEndpointLocalityConsistent(card: ComponentCard, file: string): vo
 }
 
 /**
+ * H1（PR #46 复审，真实复现）：`spawn_cli` 或订阅类 provider 不允许声明
+ * `privacy_class: local_only`，也不允许 `tier: local`。
+ *
+ * 这类卡的推理实际发生在它背后的外部 CLI/服务里（`effectiveServedLocality`
+ * 对它们一律判成 `remote`），如果同时声明 `local_only`/`tier: local`，
+ * `dispatch.ts` 的 `isLocalCapable` 早先只看 `card.provider.locality` 时会把它
+ * 当"可信本地"放行过 local_only 门禁——不需要 form 是 spawn_cli，
+ * `provider.id === "subscription"` 的 `form: http_service` 卡一样会触发，因为
+ * `isSubscriptionProviderId` 只认 id 不认 form。`isLocalCapable` 现在已经改
+ * 用 `effectiveServedLocality`（运行时第二道防线），但从注册源头直接拒绝这种
+ * 自相矛盾的卡更好——语义矛盾的配置不应该有机会启动。
+ */
+function assertNoContradictoryRelayClaim(card: ComponentCard, file: string): void {
+  const isRelayLike = card.form === "spawn_cli" || isSubscriptionProviderId(card.provider.id);
+  if (!isRelayLike) return;
+  if (card.privacy_class !== "local_only" && card.provider.tier !== "local") return;
+  throw new Error(
+    `组件卡 "${card.provider.id}"（${file}）语义矛盾：` +
+      (card.form === "spawn_cli" ? "form: spawn_cli" : "订阅类 provider（isSubscriptionProviderId）") +
+      " 的推理实际发生在它背后的外部 CLI/服务里，不允许同时声明 privacy_class: local_only 或 tier: local——" +
+      "那会让路由的 local_only 门禁把它当「可信本地」放行，实际却会把请求转发到外部。" +
+      "如果这张卡确实需要本地语义，请改用真正本地的 http_service 后端。",
+  );
+}
+
+/**
  * 从 config/components/*.yaml 加载组件卡；校验不过则抛错 → 启动失败。
  *
  * 订阅 provider 先过分层门禁（T1.4.2）：
@@ -81,6 +107,7 @@ export function loadComponents(dir: string, opts: LoadComponentsOptions = {}): R
     }
     seenIds.add(card.provider.id);
     assertEndpointLocalityConsistent(card, f);
+    assertNoContradictoryRelayClaim(card, f);
     if (isSubscriptionProviderId(card.provider.id)) {
       const gate = subscriptionStartupGate(card.provider.id, env);
       if (gate.action === "refuse") {
