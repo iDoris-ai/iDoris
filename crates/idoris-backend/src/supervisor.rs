@@ -2042,6 +2042,95 @@ mod tests {
         assert_eq!(models, catalog());
     }
 
+    /// A minimal `RuntimeAdapter` whose `unload` always panics — the M13
+    /// (Opus Tier-2 review) counterpart of `PanickingAdapter`, isolating
+    /// `start_unload`'s own panic-isolation path from an eviction's own
+    /// unloads (already covered by `run_load_flow`'s tests).
+    struct UnloadAlwaysPanicsAdapter;
+
+    #[async_trait::async_trait]
+    impl RuntimeAdapter for UnloadAlwaysPanicsAdapter {
+        async fn list(&self) -> Result<Vec<ModelInfo>, BackendError> {
+            Ok(two_model_catalog())
+        }
+        async fn load(&self, _id: &str, _policy: Option<&LoadPolicy>) -> Result<(), BackendError> {
+            Ok(())
+        }
+        async fn unload(&self, _id: &str) -> Result<(), BackendError> {
+            panic!("UnloadAlwaysPanicsAdapter::unload always panics (test double)");
+        }
+        async fn status(&self) -> Result<BackendStatus, BackendError> {
+            Ok(BackendStatus {
+                pressure: Pressure::Ok,
+                used_gb: 0.0,
+                model_memory_max_gb: 0.0,
+                loaded: Vec::new(),
+            })
+        }
+        async fn probe_ready(&self, _id: &str) -> Result<bool, BackendError> {
+            Ok(true)
+        }
+        async fn chat(
+            &self,
+            req: ChatRequest,
+            _cancel: CancellationToken,
+        ) -> Result<ChatResponse, BackendError> {
+            Ok(ChatResponse {
+                model: req.model,
+                content: String::new(),
+            })
+        }
+    }
+
+    /// M13 (Opus Tier-2 review): a standalone `unload`'s own panic
+    /// isolation (`start_unload`) must not wedge the Supervisor either —
+    /// same guarantee C1 gave `load`, verified independently here.
+    #[tokio::test]
+    async fn a_panicking_standalone_unload_does_not_wedge_the_supervisor() {
+        let adapter = Arc::new(UnloadAlwaysPanicsAdapter);
+        let handle =
+            Supervisor::spawn(adapter, SupervisorConfig::default()).expect("spawn should succeed");
+        no_hang(handle.load("a", 4.0, on_demand_policy()))
+            .await
+            .expect("load a should succeed");
+        let err = no_hang(handle.unload("a"))
+            .await
+            .expect_err("a panicking unload must surface as an error, not hang");
+        assert_eq!(err.reason_code(), "adapter_panicked");
+        // Negative contrast: if `active_op` had stayed stuck on "a", this
+        // would report `Busy` instead of succeeding.
+        no_hang(handle.load("b", 4.0, on_demand_policy()))
+            .await
+            .expect("a different id must not be busy after the panicking unload");
+    }
+
+    /// M13 (Opus Tier-2 review): a standalone `unload` call that never
+    /// returns must not hold `active_op` forever either — bounded by
+    /// `adapter_call_timeout`, same as `load`.
+    #[tokio::test(start_paused = true)]
+    async fn a_hanging_standalone_unload_times_out_and_does_not_wedge_the_supervisor() {
+        let adapter = Arc::new(MockAdapter::new(two_model_catalog()));
+        let handle = Supervisor::spawn(
+            adapter.clone(),
+            SupervisorConfig {
+                adapter_call_timeout: std::time::Duration::from_millis(50),
+                ..SupervisorConfig::default()
+            },
+        )
+        .expect("spawn should succeed");
+        no_hang(handle.load("a", 4.0, on_demand_policy()))
+            .await
+            .expect("load a should succeed");
+        adapter.set_unload_delay("a", std::time::Duration::from_secs(3600));
+        let err = no_hang(handle.unload("a"))
+            .await
+            .expect_err("a hanging unload call must time out, not hang forever");
+        assert_eq!(err.reason_code(), "adapter_timed_out");
+        no_hang(handle.load("b", 4.0, on_demand_policy()))
+            .await
+            .expect("a different id must not be busy after the timed-out unload");
+    }
+
     /// A minimal `RuntimeAdapter` whose `chat` always panics (`load`/
     /// `unload`/`probe_ready` all succeed normally) — for exercising the
     /// panic-isolation path in the `Chat` dispatch specifically.
