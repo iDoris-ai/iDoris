@@ -392,13 +392,44 @@ impl BudgetLedger {
         // clear `ReservationNotActive` instead of silently succeeding.
         sweep_expired_scope(&tx, scope, &period, now_ms)?;
 
-        let spent = spent_for(&tx, scope, &period)?;
-        let reserved = active_reserved_for(&tx, scope, &period, now_ms)?;
-        let balance_minor = config.limit_minor - spent - reserved;
+        let sub_spent = spent_for(&tx, scope, &period)?;
+        let sub_reserved = active_reserved_for(&tx, scope, &period, now_ms)?;
+        let sub_committed = sub_spent + sub_reserved;
 
-        if estimated_cost_minor > balance_minor {
+        if estimated_cost_minor > config.limit_minor - sub_committed {
             tx.commit()?; // nothing written yet, but keep the sweep above.
-            return Err(BudgetError::exceeded(balance_minor, estimated_cost_minor));
+            return Err(BudgetError::exceeded(
+                scope.tenant_id.clone(),
+                config.limit_minor,
+                sub_committed,
+                estimated_cost_minor,
+            ));
+        }
+
+        // H2: the tenant-level dimension is *optional* — only enforced if
+        // `configure_tenant` was ever called for this tenant. Both
+        // dimensions are checked in this same transaction, so either one
+        // insufficient rejects the whole `reserve` atomically with the
+        // other.
+        if let Some(tenant_cfg) = load_tenant_config(&tx, &scope.tenant_id)? {
+            let skip_zero_cost =
+                tenant_cfg.gate == SpendGate::PaidOnly && estimated_cost_minor == 0;
+            if !skip_zero_cost {
+                let tenant_period = billing_period_key(now_ms, &tenant_cfg.billing_timezone)?;
+                let tenant_spent = tenant_spent_for(&tx, &scope.tenant_id, &tenant_period)?;
+                let tenant_reserved =
+                    tenant_active_reserved_for(&tx, &scope.tenant_id, &tenant_period, now_ms)?;
+                let tenant_committed = tenant_spent + tenant_reserved;
+                if estimated_cost_minor > tenant_cfg.limit_minor - tenant_committed {
+                    tx.commit()?;
+                    return Err(BudgetError::exceeded(
+                        scope.tenant_id.clone(),
+                        tenant_cfg.limit_minor,
+                        tenant_committed,
+                        estimated_cost_minor,
+                    ));
+                }
+            }
         }
 
         // Overflow would wrap to a past instant (release) and make the
@@ -550,6 +581,19 @@ impl BudgetLedger {
                 actual_cost_minor
             ],
         )?;
+
+        // H2: also credit the tenant-level total, if configured — same
+        // transaction, so `reserve`'s dual-dimension check never sees a
+        // half-updated state.
+        if load_tenant_config(&tx, tenant_id)?.is_some() {
+            tx.execute(
+                "INSERT INTO tenant_periods (tenant_id, period, spent_minor) \
+                 VALUES (?1, ?2, ?3) \
+                 ON CONFLICT (tenant_id, period) \
+                 DO UPDATE SET spent_minor = spent_minor + excluded.spent_minor",
+                rusqlite::params![tenant_id, row.period, actual_cost_minor],
+            )?;
+        }
 
         if overage_minor > 0 {
             tx.execute(
@@ -1123,6 +1167,123 @@ mod tests {
         ));
     }
 
+    /// H2: an unconfigured tenant has no tenant-level check at all —
+    /// `reserve` behaves exactly as before `configure_tenant` existed.
+    #[test]
+    fn reserve_without_tenant_config_only_checks_sub_scope() {
+        let path = temp_db_path("h2-no-tenant-config");
+        let ledger = BudgetLedger::open(&path).expect("open");
+        let scope = BudgetScope::new("acme-co", "key-1", "openai", "gpt-5");
+        ledger.configure(&scope, 1_000, "UTC").expect("configure");
+        assert!(ledger.reserve(&scope, Price::Known(1_000)).is_ok());
+    }
+
+    /// H2: a tight tenant-level limit rejects even though the sub-scope
+    /// alone would allow it — both dimensions must pass.
+    #[test]
+    fn reserve_rejected_by_tenant_level_limit_even_when_sub_scope_allows() {
+        let path = temp_db_path("h2-tenant-rejects");
+        let ledger = BudgetLedger::open(&path).expect("open");
+        let scope = BudgetScope::new("acme-co", "key-1", "openai", "gpt-5");
+        ledger.configure(&scope, 1_000, "UTC").expect("configure");
+        ledger
+            .configure_tenant("acme-co", 50, "UTC", SpendGate::PaidOnly)
+            .expect("configure_tenant");
+        assert!(matches!(
+            ledger.reserve(&scope, Price::Known(100)),
+            Err(BudgetError::Exceeded {
+                limit_minor: 50,
+                spent_minor: 0,
+                ..
+            })
+        ));
+    }
+
+    /// H2: the reverse — a tight sub-scope limit rejects even though the
+    /// tenant-level total alone would allow it.
+    #[test]
+    fn reserve_rejected_by_sub_scope_limit_even_when_tenant_level_allows() {
+        let path = temp_db_path("h2-sub-scope-rejects");
+        let ledger = BudgetLedger::open(&path).expect("open");
+        let scope = BudgetScope::new("acme-co", "key-1", "openai", "gpt-5");
+        ledger.configure(&scope, 50, "UTC").expect("configure");
+        ledger
+            .configure_tenant("acme-co", 10_000, "UTC", SpendGate::PaidOnly)
+            .expect("configure_tenant");
+        assert!(matches!(
+            ledger.reserve(&scope, Price::Known(100)),
+            Err(BudgetError::Exceeded { .. })
+        ));
+    }
+
+    /// H2: the tenant-level total aggregates across multiple sub-scopes.
+    #[test]
+    fn tenant_level_limit_aggregates_across_sub_scopes() {
+        let path = temp_db_path("h2-aggregate");
+        let ledger = BudgetLedger::open(&path).expect("open");
+        let scope_a = BudgetScope::new("acme-co", "key-a", "openai", "gpt-5");
+        let scope_b = BudgetScope::new("acme-co", "key-b", "openai", "gpt-5");
+        ledger
+            .configure(&scope_a, 1_000, "UTC")
+            .expect("configure a");
+        ledger
+            .configure(&scope_b, 1_000, "UTC")
+            .expect("configure b");
+        ledger
+            .configure_tenant("acme-co", 150, "UTC", SpendGate::PaidOnly)
+            .expect("configure_tenant");
+        ledger
+            .reserve(&scope_a, Price::Known(100))
+            .expect("first reserve fits tenant total");
+        assert!(matches!(
+            ledger.reserve(&scope_b, Price::Known(100)),
+            Err(BudgetError::Exceeded { .. })
+        ));
+    }
+
+    /// H2: `paid_only` (the default) lets a zero-cost candidate through even
+    /// when the tenant-level balance is already exhausted.
+    #[test]
+    fn paid_only_gate_bypasses_zero_cost_even_when_tenant_exhausted() {
+        let path = temp_db_path("h2-paid-only");
+        let ledger = BudgetLedger::open(&path).expect("open");
+        let scope = BudgetScope::new("acme-co", "key-1", "openai", "gpt-5");
+        ledger.configure(&scope, 1_000, "UTC").expect("configure");
+        ledger
+            .configure_tenant("acme-co", 0, "UTC", SpendGate::PaidOnly)
+            .expect("configure_tenant");
+        assert!(ledger.reserve(&scope, Price::Known(0)).is_ok());
+    }
+
+    /// H2 negative control: `all` gates every candidate, including
+    /// zero-cost ones, once the tenant-level balance actually goes
+    /// negative — resolves the ambiguity `paid_only` leaves open. A
+    /// `settle` overage (M1) is the way to drive the tenant balance
+    /// negative in the first place, since `reserve` itself never lets a
+    /// reservation through that would push it there.
+    #[test]
+    fn all_gate_rejects_zero_cost_once_tenant_balance_is_negative() {
+        let path = temp_db_path("h2-all-gate");
+        let ledger = BudgetLedger::open(&path).expect("open");
+        let scope = BudgetScope::new("acme-co", "key-1", "openai", "gpt-5");
+        ledger.configure(&scope, 1_000, "UTC").expect("configure");
+        ledger
+            .configure_tenant("acme-co", 100, "UTC", SpendGate::All)
+            .expect("configure_tenant");
+        let id = ledger.reserve(&scope, Price::Known(100)).expect("reserve");
+        ledger
+            .settle(&scope.tenant_id, &id, 150)
+            .expect("settle overage");
+        assert!(matches!(
+            ledger.tenant_balance("acme-co"),
+            Ok(balance) if balance < 0
+        ));
+        assert!(matches!(
+            ledger.reserve(&scope, Price::Known(0)),
+            Err(BudgetError::Exceeded { .. })
+        ));
+    }
+
     /// L2: changing `billing_timezone` while a reservation is still active
     /// is rejected — the active reservation's period was already fixed
     /// under the old zone.
@@ -1192,12 +1353,18 @@ mod tests {
             .expect_err("must reject over-balance reserve");
         match err {
             BudgetError::Exceeded {
+                tenant_id,
                 balance_minor,
                 estimated_cost_minor,
+                limit_minor,
+                spent_minor,
                 ..
             } => {
+                assert_eq!(tenant_id, "acme-co");
                 assert_eq!(balance_minor, 100);
                 assert_eq!(estimated_cost_minor, 150);
+                assert_eq!(limit_minor, 100);
+                assert_eq!(spent_minor, 0);
             }
             other => panic!("expected Exceeded, got {other:?}"),
         }

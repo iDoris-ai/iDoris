@@ -28,12 +28,23 @@ pub enum BudgetError {
     /// balance for the current billing period. **Terminal rejection, not a
     /// downgrade** (总体规划 §4.6 / 不变式 #3) — the caller must surface a
     /// 402, not silently retry with a cheaper candidate itself.
+    ///
+    /// `tenant_id`/`limit_minor`/`spent_minor` (Opus Tier-2 acceptance H2)
+    /// describe whichever dimension actually failed the check — the
+    /// tenant-level total (contract-tenancy §3) if that's what rejected, or
+    /// the finer `(key, provider, model)` sub-scope if the tenant-level
+    /// check passed but the sub-scope one didn't. `tenant_id` is always
+    /// populated; `limit_minor`/`spent_minor` always describe the same
+    /// dimension as `balance_minor`.
     #[error(
-        "budget exceeded: balance_minor={balance_minor}, estimated_cost_minor={estimated_cost_minor}"
+        "budget exceeded: tenant_id={tenant_id:?}, balance_minor={balance_minor}, estimated_cost_minor={estimated_cost_minor}"
     )]
     Exceeded {
+        tenant_id: String,
         balance_minor: i64,
         estimated_cost_minor: i64,
+        limit_minor: i64,
+        spent_minor: i64,
         topup_hint: String,
     },
 
@@ -155,12 +166,24 @@ impl From<rusqlite::Error> for BudgetError {
 impl BudgetError {
     /// Build `Exceeded` with a computed, human-readable `topup_hint` — the
     /// one constructor call sites should use instead of hand-rolling the
-    /// hint text differently in different places.
-    pub fn exceeded(balance_minor: i64, estimated_cost_minor: i64) -> Self {
+    /// hint text differently in different places. `limit_minor`/
+    /// `spent_minor` describe whichever dimension (tenant-level or sub-
+    /// scope) actually rejected; `balance_minor` is derived from them so the
+    /// two can never silently disagree.
+    pub fn exceeded(
+        tenant_id: impl Into<String>,
+        limit_minor: i64,
+        spent_minor: i64,
+        estimated_cost_minor: i64,
+    ) -> Self {
+        let balance_minor = checked_sub_i64(limit_minor, spent_minor);
         let shortfall = checked_sub_i64(estimated_cost_minor, balance_minor).max(0);
         BudgetError::Exceeded {
+            tenant_id: tenant_id.into(),
             balance_minor,
             estimated_cost_minor,
+            limit_minor,
+            spent_minor,
             topup_hint: format!(
                 "余额不足：还差 {shortfall} minor units 才能覆盖本次预估成本，请充值或提升预算上限后重试"
             ),
@@ -173,12 +196,18 @@ impl BudgetError {
     pub fn to_402_body(&self) -> Option<Budget402Body> {
         match self {
             BudgetError::Exceeded {
+                tenant_id,
                 balance_minor,
                 estimated_cost_minor,
+                limit_minor,
+                spent_minor,
                 topup_hint,
             } => Some(Budget402Body {
+                tenant_id: tenant_id.clone(),
                 balance_minor: *balance_minor,
                 estimated_cost_minor: *estimated_cost_minor,
+                limit_minor: *limit_minor,
+                spent_minor: *spent_minor,
                 topup_hint: topup_hint.clone(),
                 reason_code: BUDGET_EXCEEDED_REASON_CODE,
             }),
@@ -187,25 +216,20 @@ impl BudgetError {
     }
 }
 
-/// The four fields a `budget_exceeded` rejection carries. This crate has no
-/// notion of HTTP, so it is deliberately *not* contract-tenancy §4's full
-/// wire envelope (`{"error": {"type": "budget_exceeded", "message": ...,
-/// "tenant_id": ..., "limit_minor": ..., "spent_minor": ...}}`) — the router
-/// is the layer that knows about HTTP status codes and the
-/// tenant/limit/spent fields (which this ledger-level type doesn't have: it
-/// only ever sees a `BudgetScope`, not the wider `TenantContext`).
-/// Serializing this struct directly as an HTTP response body would
-/// therefore not match that envelope shape; a router integration is
-/// expected to fold these fields into its own `error` object rather than
-/// emit this JSON verbatim.
-///
-/// Opus Tier-2 acceptance H2 (landing in a follow-up PR) adds
-/// `tenant_id`/`limit_minor`/`spent_minor` here too, closing most of that
-/// gap.
+/// The fields a `budget_exceeded` rejection carries. Since Opus Tier-2
+/// acceptance H2 this includes `tenant_id`/`limit_minor`/`spent_minor`,
+/// matching contract-tenancy §4's 402 fields; this crate still has no
+/// notion of HTTP, so it is deliberately *not* the full wire envelope
+/// (`{"error": {"type": "budget_exceeded", "message": ..., ...}}`) — a
+/// router integration is expected to fold these fields into its own
+/// `error` object rather than emit this JSON verbatim.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Budget402Body {
+    pub tenant_id: String,
     pub balance_minor: i64,
     pub estimated_cost_minor: i64,
+    pub limit_minor: i64,
+    pub spent_minor: i64,
     pub topup_hint: String,
     pub reason_code: &'static str,
 }
@@ -218,12 +242,32 @@ mod tests {
 
     #[test]
     fn exceeded_402_body_is_structured_and_carries_reason_code() {
-        let err = BudgetError::exceeded(100, 250);
+        let err = BudgetError::exceeded("acme-co", 100, 0, 250);
         let body = err.to_402_body().expect("Exceeded must yield a 402 body");
+        assert_eq!(body.tenant_id, "acme-co");
         assert_eq!(body.balance_minor, 100);
         assert_eq!(body.estimated_cost_minor, 250);
+        assert_eq!(body.limit_minor, 100);
+        assert_eq!(body.spent_minor, 0);
         assert_eq!(body.reason_code, "budget_exceeded");
         assert!(body.topup_hint.contains("150"));
+    }
+
+    /// `limit_minor`/`spent_minor` can disagree with a naively-recomputed
+    /// `balance_minor` only if the constructor's own arithmetic is wrong —
+    /// pin the derived relationship down explicitly.
+    #[test]
+    fn exceeded_balance_is_always_limit_minus_spent() {
+        let err = BudgetError::exceeded("t1", 1_000, 400, 700);
+        match err {
+            BudgetError::Exceeded {
+                balance_minor,
+                limit_minor,
+                spent_minor,
+                ..
+            } => assert_eq!(balance_minor, limit_minor - spent_minor),
+            other => panic!("expected Exceeded, got {other:?}"),
+        }
     }
 
     /// Negative control: a non-`Exceeded` variant has no 402 body — callers
