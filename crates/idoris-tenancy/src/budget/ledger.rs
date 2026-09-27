@@ -64,6 +64,7 @@ const SCHEMA_MIGRATIONS: &[&str] = &[
     include_str!("migrations/0001_init.sql"),
     include_str!("migrations/0002_overage_events.sql"),
     include_str!("migrations/0003_tenant_scope.sql"),
+    include_str!("migrations/0004_tenant_period_column.sql"),
 ];
 
 /// Default reservation TTL: long enough to cover a slow upstream call,
@@ -260,6 +261,30 @@ impl BudgetLedger {
         let now_ms = self.clock.now_ms();
         let mut conn = self.lock();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // B-2: every configure/configure_tenant call for one tenant must
+        // agree on a single billing_timezone. Checked against the *other*
+        // dimensions only (this scope's own prior value is what the L2
+        // check right below governs, not this one).
+        if let Some(tenant_cfg) = load_tenant_config(&tx, &scope.tenant_id)?
+            && tenant_cfg.billing_timezone != billing_timezone
+        {
+            tx.rollback().ok();
+            return Err(BudgetError::InvalidConfig {
+                tenant_id: scope.tenant_id.clone(),
+                existing: tenant_cfg.billing_timezone,
+                requested: billing_timezone.to_string(),
+            });
+        }
+        if let Some(sibling_tz) = sibling_sub_scope_timezone(&tx, &scope.tenant_id, Some(scope))?
+            && sibling_tz != billing_timezone
+        {
+            tx.rollback().ok();
+            return Err(BudgetError::InvalidConfig {
+                tenant_id: scope.tenant_id.clone(),
+                existing: sibling_tz,
+                requested: billing_timezone.to_string(),
+            });
+        }
         if let Some(existing) = load_config(&tx, scope)?
             && existing.billing_timezone != billing_timezone
             && has_active_reservations_for_scope(&tx, scope, now_ms)?
@@ -310,6 +335,20 @@ impl BudgetLedger {
         let now_ms = self.clock.now_ms();
         let mut conn = self.lock();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // B-2: same cross-dimension timezone agreement as `configure`,
+        // checked against sub-scope configs only — this tenant_config's own
+        // prior value is what the L2 check right below governs, not this
+        // one (changing your own value can't conflict with itself).
+        if let Some(sibling_tz) = sibling_sub_scope_timezone(&tx, tenant_id, None)?
+            && sibling_tz != billing_timezone
+        {
+            tx.rollback().ok();
+            return Err(BudgetError::InvalidConfig {
+                tenant_id: tenant_id.to_string(),
+                existing: sibling_tz,
+                requested: billing_timezone.to_string(),
+            });
+        }
         if let Some(existing) = load_tenant_config(&tx, tenant_id)?
             && existing.billing_timezone != billing_timezone
             && has_active_reservations_for_tenant(&tx, tenant_id, now_ms)?
@@ -433,6 +472,23 @@ impl BudgetLedger {
             }
         };
 
+        // B-2/B-4: the tenant-level period bucket, computed independently of
+        // `period` above and stored on the row (`tenant_period`) so tenant
+        // aggregation never has to reuse a value computed under a
+        // *different* zone. Prefers the tenant's own zone; falls back to
+        // the sub-scope's if `configure_tenant` hasn't happened yet (B-4 —
+        // spend recorded before a tenant is configured must still land in a
+        // real bucket, so it's visible once `configure_tenant` does happen).
+        let tenant_period = match (&tenant_cfg, &sub_config) {
+            (Some(tenant), _) => billing_period_key(now_ms, &tenant.billing_timezone)?,
+            (None, Some(_)) => period.clone(),
+            (None, None) => {
+                return Err(BudgetError::NotConfigured {
+                    scope: scope.clone(),
+                });
+            }
+        };
+
         // Expired reservations already stop counting toward the balance sum
         // below (it filters `expires_at_ms > now_ms`); flipping their status
         // here too means a later `settle`/`release` on the same id gets a
@@ -461,7 +517,6 @@ impl BudgetLedger {
             let skip_zero_cost =
                 tenant_cfg.gate == SpendGate::PaidOnly && estimated_cost_minor == 0;
             if !skip_zero_cost {
-                let tenant_period = billing_period_key(now_ms, &tenant_cfg.billing_timezone)?;
                 let tenant_spent = tenant_spent_for(&tx, &scope.tenant_id, &tenant_period)?;
                 let tenant_reserved =
                     tenant_active_reserved_for(&tx, &scope.tenant_id, &tenant_period, now_ms)?;
@@ -488,8 +543,8 @@ impl BudgetLedger {
         tx.execute(
             "INSERT INTO reservations \
                 (id, tenant_id, key_id, provider_id, model_id, period, reserved_minor, \
-                 status, created_at_ms, expires_at_ms, actual_cost_minor) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, NULL)",
+                 status, created_at_ms, expires_at_ms, actual_cost_minor, tenant_period) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, NULL, ?11)",
             rusqlite::params![
                 id,
                 scope.tenant_id,
@@ -501,6 +556,7 @@ impl BudgetLedger {
                 ReservationStatus::Active.as_sql(),
                 now_ms,
                 expires_at_ms,
+                tenant_period,
             ],
         )?;
         tx.commit()?;
@@ -629,18 +685,21 @@ impl BudgetLedger {
             ],
         )?;
 
-        // H2: also credit the tenant-level total, if configured — same
-        // transaction, so `reserve`'s dual-dimension check never sees a
-        // half-updated state.
-        if load_tenant_config(&tx, tenant_id)?.is_some() {
-            tx.execute(
-                "INSERT INTO tenant_periods (tenant_id, period, spent_minor) \
-                 VALUES (?1, ?2, ?3) \
-                 ON CONFLICT (tenant_id, period) \
-                 DO UPDATE SET spent_minor = spent_minor + excluded.spent_minor",
-                rusqlite::params![tenant_id, row.period, actual_cost_minor],
-            )?;
-        }
+        // H2/B-4: also credit the tenant-level total — *unconditionally*,
+        // not only when `configure_tenant` has already been called. Spend
+        // that happens before a tenant is configured must still land in a
+        // real `tenant_period` bucket (populated by `reserve`, see B-4's
+        // doc comment there) so it's already accounted for the moment
+        // `configure_tenant` does happen, rather than silently missing.
+        // Same transaction as the writes above, so `reserve`'s
+        // dual-dimension check never sees a half-updated state.
+        tx.execute(
+            "INSERT INTO tenant_periods (tenant_id, period, spent_minor) \
+             VALUES (?1, ?2, ?3) \
+             ON CONFLICT (tenant_id, period) \
+             DO UPDATE SET spent_minor = spent_minor + excluded.spent_minor",
+            rusqlite::params![tenant_id, row.tenant_period, actual_cost_minor],
+        )?;
 
         if overage_minor > 0 {
             tx.execute(
@@ -796,6 +855,11 @@ struct ReservationRow {
     provider_id: String,
     model_id: String,
     period: String,
+    /// B-2: the period bucket for *tenant-level* aggregation, computed
+    /// independently of `period` (see `migrations/0004_tenant_period_column.sql`).
+    /// Always populated by `reserve` (falls back to the sub-scope's own
+    /// zone if no tenant config existed yet at reserve time — B-4).
+    tenant_period: String,
     reserved_minor: i64,
     status: String,
     expires_at_ms: i64,
@@ -816,7 +880,8 @@ fn find_reservation(
 ) -> Result<ReservationRow, BudgetError> {
     let found = conn
         .query_row(
-            "SELECT tenant_id, key_id, provider_id, model_id, period, reserved_minor, status, expires_at_ms \
+            "SELECT tenant_id, key_id, provider_id, model_id, period, reserved_minor, status, \
+                    expires_at_ms, tenant_period \
              FROM reservations WHERE id = ?1 AND tenant_id = ?2",
             rusqlite::params![reservation_id.0, tenant_id],
             |r| {
@@ -829,6 +894,7 @@ fn find_reservation(
                     reserved_minor: r.get(5)?,
                     status: r.get(6)?,
                     expires_at_ms: r.get(7)?,
+                    tenant_period: r.get(8)?,
                 })
             },
         )
@@ -921,6 +987,43 @@ fn load_config(conn: &Connection, scope: &BudgetScope) -> Result<Option<ScopeCon
     .map_err(BudgetError::from)
 }
 
+/// B-2: the `billing_timezone` any *other* `(key, provider, model)`
+/// sub-scope already uses for this tenant, excluding `exclude` if given
+/// (the scope currently being configured, which can't conflict with
+/// itself). Assumes at most one distinct value exists among the remaining
+/// rows — an invariant this same check enforces on every write, so there's
+/// nothing to reconcile between multiple disagreeing siblings.
+fn sibling_sub_scope_timezone(
+    conn: &Connection,
+    tenant_id: &str,
+    exclude: Option<&BudgetScope>,
+) -> Result<Option<String>, BudgetError> {
+    let mut stmt = conn.prepare(
+        "SELECT key_id, provider_id, model_id, billing_timezone \
+         FROM budget_config WHERE tenant_id = ?1",
+    )?;
+    let rows = stmt.query_map([tenant_id], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+            r.get::<_, String>(3)?,
+        ))
+    })?;
+    for row in rows {
+        let (key_id, provider_id, model_id, billing_timezone) = row?;
+        if let Some(ex) = exclude
+            && ex.key_id == key_id
+            && ex.provider_id == provider_id
+            && ex.model_id == model_id
+        {
+            continue;
+        }
+        return Ok(Some(billing_timezone));
+    }
+    Ok(None)
+}
+
 fn has_active_reservations_for_scope(
     conn: &Connection,
     scope: &BudgetScope,
@@ -980,15 +1083,15 @@ fn tenant_spent_for(conn: &Connection, tenant_id: &str, period: &str) -> Result<
 fn tenant_active_reserved_for(
     conn: &Connection,
     tenant_id: &str,
-    period: &str,
+    tenant_period: &str,
     now_ms: i64,
 ) -> Result<i64, BudgetError> {
     conn.query_row(
         "SELECT COALESCE(SUM(reserved_minor), 0) FROM reservations \
-         WHERE tenant_id=?1 AND period=?2 AND status=?3 AND expires_at_ms > ?4",
+         WHERE tenant_id=?1 AND tenant_period=?2 AND status=?3 AND expires_at_ms > ?4",
         rusqlite::params![
             tenant_id,
-            period,
+            tenant_period,
             ReservationStatus::Active.as_sql(),
             now_ms
         ],
@@ -1307,6 +1410,87 @@ mod tests {
         ));
     }
 
+    /// B-2: two sub-scopes for the same tenant must agree on a
+    /// `billing_timezone` — this is what actually prevents the bug the
+    /// probe found (a tenant limit silently not enforced because one
+    /// sub-scope's period bucket disagreed with another's), by making the
+    /// disagreement impossible to configure in the first place rather than
+    /// papering over it after the fact.
+    #[test]
+    fn configure_rejects_mismatched_timezone_against_sibling_sub_scope() {
+        let path = temp_db_path("b2-sibling-mismatch");
+        let ledger = BudgetLedger::open(&path).expect("open");
+        let scope_a = BudgetScope::new("acme-co", "key-a", "openai", "gpt-5");
+        let scope_b = BudgetScope::new("acme-co", "key-b", "openai", "gpt-5");
+        ledger
+            .configure(&scope_a, 1_000, "UTC")
+            .expect("configure a");
+        let err = ledger
+            .configure(&scope_b, 1_000, "Asia/Bangkok")
+            .expect_err("mismatched sibling timezone must be rejected");
+        assert!(matches!(err, BudgetError::InvalidConfig { .. }));
+        // Same tenant, same zone as the sibling: still fine.
+        assert!(ledger.configure(&scope_b, 1_000, "UTC").is_ok());
+    }
+
+    /// B-2 mirror: a sub-scope's timezone must also agree with the
+    /// tenant-level config, in both directions.
+    #[test]
+    fn configure_and_configure_tenant_reject_mismatched_timezones_both_directions() {
+        let path = temp_db_path("b2-tenant-sub-mismatch");
+        let ledger = BudgetLedger::open(&path).expect("open");
+        let scope = BudgetScope::new("acme-co", "key-1", "openai", "gpt-5");
+
+        ledger
+            .configure_tenant("acme-co", 1_000, "UTC", SpendGate::PaidOnly)
+            .expect("configure_tenant");
+        assert!(matches!(
+            ledger.configure(&scope, 1_000, "Asia/Bangkok"),
+            Err(BudgetError::InvalidConfig { .. })
+        ));
+        ledger
+            .configure(&scope, 1_000, "UTC")
+            .expect("configure matching zone");
+
+        let scope2 = BudgetScope::new("acme-co", "key-2", "openai", "gpt-5");
+        ledger.configure(&scope2, 1_000, "UTC").expect("configure");
+        assert!(matches!(
+            ledger.configure_tenant("acme-co", 1_000, "Asia/Bangkok", SpendGate::PaidOnly),
+            Err(BudgetError::InvalidConfig { .. })
+        ));
+    }
+
+    /// B-4: spend recorded *before* a tenant is ever configured still lands
+    /// in a real tenant-level bucket (via the row's `tenant_period`,
+    /// falling back to the sub-scope's own zone — B-2), so it's already
+    /// counted the moment `configure_tenant` happens, rather than silently
+    /// missing.
+    #[test]
+    fn settle_before_configure_tenant_is_still_counted_once_tenant_is_configured() {
+        let path = temp_db_path("b4-spend-before-tenant-config");
+        let ledger = BudgetLedger::open(&path).expect("open");
+        let scope = BudgetScope::new("acme-co", "key-1", "openai", "gpt-5");
+        ledger.configure(&scope, 1_000, "UTC").expect("configure");
+
+        let id = ledger.reserve(&scope, Price::Known(400)).expect("reserve");
+        ledger
+            .settle(&scope.tenant_id, &id, 400)
+            .expect("settle before any configure_tenant call");
+
+        ledger
+            .configure_tenant("acme-co", 500, "UTC", SpendGate::PaidOnly)
+            .expect("configure_tenant after the fact");
+        assert_eq!(
+            ledger.tenant_balance("acme-co").expect("tenant_balance"),
+            100,
+            "the earlier 400 spend must already be reflected"
+        );
+        assert!(matches!(
+            ledger.reserve(&scope, Price::Known(200)),
+            Err(BudgetError::Exceeded { .. })
+        ));
+    }
+
     /// H2: `paid_only` (the default) lets a zero-cost candidate through even
     /// when the tenant-level balance is already exhausted.
     #[test]
@@ -1369,10 +1553,13 @@ mod tests {
 
     #[test]
     fn configure_tenant_rejects_timezone_change_with_active_reservations() {
+        // No `configure()` sub-scope at all here (relies on B-3's "tenant
+        // dimension alone is enough to reserve"), so B-2's cross-dimension
+        // timezone-agreement check has nothing to compare against and this
+        // isolates the L2 active-reservations guard specifically.
         let path = temp_db_path("l2-tenant-tz-change");
         let ledger = BudgetLedger::open(&path).expect("open");
         let scope = BudgetScope::new("acme-co", "key-1", "openai", "gpt-5");
-        ledger.configure(&scope, 1_000, "UTC").expect("configure");
         ledger
             .configure_tenant("acme-co", 1_000, "UTC", SpendGate::PaidOnly)
             .expect("configure_tenant");
