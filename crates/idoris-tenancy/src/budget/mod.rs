@@ -15,6 +15,6 @@ mod scope;
 pub use clock::{Clock, SystemClock};
 pub use error::{BUDGET_EXCEEDED_REASON_CODE, Budget402Body, BudgetError};
 pub use estimator::{ConservativeTokenEstimator, TokenEstimator, estimate_tokens};
-pub use ledger::BudgetLedger;
+pub use ledger::{BudgetLedger, DEFAULT_RESERVATION_TTL_MS, Price, ReservationId, SettleReceipt};
 pub use period::billing_period_key;
 pub use scope::BudgetScope;

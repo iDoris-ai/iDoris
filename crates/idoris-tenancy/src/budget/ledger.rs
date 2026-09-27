@@ -1,12 +1,21 @@
 //! SQLite-backed budget ledger. See `budget/mod.rs`/`README.md` for how
-//! this relates to `packages/tenancy/src/budget.ts`. Storage plumbing
-//! (`open`, migrations, `configure`, `balance`) lands here first; atomic
-//! `reserve`/`settle`/`release` follow in later changes.
+//! this relates to `packages/tenancy/src/budget.ts`.
+//!
+//! `reserve` only ever answers "can this scope still spend `estimated_cost`
+//! minor units in the current period" — it does not decide whether the call
+//! itself may proceed (privacy/intent/admission are the router's job, ahead
+//! of this in the chain per 总体规划 §2 不变式 #1). Conversely, being
+//! allowed to call never implies being charged: LoopX's lesson
+//! (总体规划 §4.6) is to keep "may I call" (`reserve`) and "charge me"
+//! (`settle`) independently callable, independently testable operations —
+//! which is why they're two methods here, not one.
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
+use uuid::Uuid;
 
 use super::clock::{Clock, SystemClock};
 use super::error::BudgetError;
@@ -14,6 +23,44 @@ use super::period::billing_period_key;
 use super::scope::BudgetScope;
 
 const SCHEMA_MIGRATIONS: &[&str] = &[include_str!("migrations/0001_init.sql")];
+
+/// Default reservation TTL: long enough to cover a slow upstream call,
+/// short enough that an abandoned reservation (a caller that crashes before
+/// `settle`/`release`) doesn't lock up budget for long. Override via
+/// [`BudgetLedger::open_with`] — e.g. a short TTL in TTL-expiry tests.
+pub const DEFAULT_RESERVATION_TTL_MS: i64 = 5 * 60 * 1000;
+
+/// A caller-supplied cost estimate, or `Unknown`. `reserve` refuses
+/// `Unknown` outright (总体规划 §4.6 / 不变式 #3: "价格未知 ≠ 免费") instead
+/// of silently treating it as `0`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Price {
+    Known(i64),
+    Unknown,
+}
+
+/// Opaque reservation handle returned by [`BudgetLedger::reserve`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ReservationId(pub String);
+
+impl std::fmt::Display for ReservationId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// Result of [`BudgetLedger::settle`]: what was reserved vs. actually
+/// charged, and how much of the reservation was refunded back to the
+/// scope's balance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SettleReceipt {
+    pub reserved_minor: i64,
+    pub actual_cost_minor: i64,
+    /// `reserved_minor - actual_cost_minor`, clamped to `>= 0` — settling
+    /// for *more* than was reserved still charges the real amount (billing
+    /// truth, not a cap), it just refunds nothing.
+    pub refunded_minor: i64,
+}
 
 /// SQLite-backed budget ledger: atomic reserve/settle/release scoped to
 /// `(tenant, key, provider, model)`, bucketed per billing period.
@@ -27,6 +74,7 @@ const SCHEMA_MIGRATIONS: &[&str] = &[include_str!("migrations/0001_init.sql")];
 pub struct BudgetLedger {
     conn: Mutex<Connection>,
     clock: Arc<dyn Clock>,
+    ttl_ms: i64,
 }
 
 /// Per-scope configuration: the period limit and the explicit IANA zone its
@@ -38,21 +86,33 @@ struct ScopeConfig {
 
 impl BudgetLedger {
     /// Open (creating if needed) a ledger at `path`, with the real system
-    /// clock. Trust boundary: `path` is trusted verbatim — source it from
-    /// trusted config, never tenant/request input.
+    /// clock and [`DEFAULT_RESERVATION_TTL_MS`]. Trust boundary: `path` is
+    /// trusted verbatim — source it from trusted config, never
+    /// tenant/request input.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, BudgetError> {
-        Self::open_with(path, Arc::new(SystemClock))
+        Self::open_with(path, Arc::new(SystemClock), DEFAULT_RESERVATION_TTL_MS)
     }
 
-    /// Full control for tests: inject a [`Clock`] so tests don't sleep.
-    pub fn open_with(path: impl AsRef<Path>, clock: Arc<dyn Clock>) -> Result<Self, BudgetError> {
+    /// Full control for tests: inject a [`Clock`] (so TTL/billing-period-
+    /// boundary tests don't need to sleep real wall-clock time) and a
+    /// reservation TTL. `ttl_ms <= 0` is rejected: a reservation already
+    /// expired at creation would never count against the balance.
+    pub fn open_with(
+        path: impl AsRef<Path>,
+        clock: Arc<dyn Clock>,
+        ttl_ms: i64,
+    ) -> Result<Self, BudgetError> {
+        if ttl_ms <= 0 {
+            return Err(BudgetError::InvalidTtl { ttl_ms });
+        }
         let mut conn = Connection::open(path.as_ref())?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
-        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        conn.busy_timeout(Duration::from_secs(5))?;
         run_migrations(&mut conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
             clock,
+            ttl_ms,
         })
     }
 
@@ -130,6 +190,117 @@ impl BudgetLedger {
         tx.rollback()?;
         Ok(config.limit_minor - spent - reserved)
     }
+
+    /// Atomically check-and-deduct: inside one `BEGIN IMMEDIATE` transaction,
+    /// compute the scope's remaining balance for the current period and, if
+    /// `estimated_cost` fits, insert an `active` reservation holding that
+    /// amount until it's settled, released, or its TTL expires. Two
+    /// concurrent callers can never both succeed past the same last unit of
+    /// budget, because the second one's `BEGIN IMMEDIATE` blocks (up to the
+    /// `busy_timeout`) until the first commits or rolls back.
+    pub fn reserve(
+        &self,
+        scope: &BudgetScope,
+        estimated_cost: Price,
+    ) -> Result<ReservationId, BudgetError> {
+        let estimated_cost_minor = match estimated_cost {
+            Price::Unknown => return Err(BudgetError::PriceUnknown),
+            Price::Known(v) if v < 0 => {
+                return Err(BudgetError::InvalidEstimate {
+                    estimated_cost_minor: v,
+                });
+            }
+            Price::Known(v) => v,
+        };
+
+        let now_ms = self.clock.now_ms();
+        let mut conn = self.lock();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        let config = load_config(&tx, scope)?.ok_or_else(|| BudgetError::NotConfigured {
+            scope: scope.clone(),
+        })?;
+        let period = billing_period_key(now_ms, &config.billing_timezone)?;
+
+        // Expired reservations already stop counting toward the balance sum
+        // below (it filters `expires_at_ms > now_ms`); flipping their status
+        // here too means a later `settle`/`release` on the same id gets a
+        // clear `ReservationNotActive` instead of silently succeeding.
+        sweep_expired_scope(&tx, scope, &period, now_ms)?;
+
+        let spent = spent_for(&tx, scope, &period)?;
+        let reserved = active_reserved_for(&tx, scope, &period, now_ms)?;
+        let balance_minor = config.limit_minor - spent - reserved;
+
+        if estimated_cost_minor > balance_minor {
+            tx.commit()?; // nothing written yet, but keep the sweep above.
+            return Err(BudgetError::exceeded(balance_minor, estimated_cost_minor));
+        }
+
+        // Overflow would wrap to a past instant (release) and make the
+        // reservation invisible to the balance sum — reject instead.
+        let expires_at_ms = now_ms
+            .checked_add(self.ttl_ms)
+            .ok_or(BudgetError::InvalidTimestamp { now_ms })?;
+        let id = Uuid::new_v4().to_string();
+        tx.execute(
+            "INSERT INTO reservations \
+                (id, tenant_id, key_id, provider_id, model_id, period, reserved_minor, \
+                 status, created_at_ms, expires_at_ms, actual_cost_minor) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'active', ?8, ?9, NULL)",
+            rusqlite::params![
+                id,
+                scope.tenant_id,
+                scope.key_id,
+                scope.provider_id,
+                scope.model_id,
+                period,
+                estimated_cost_minor,
+                now_ms,
+                expires_at_ms,
+            ],
+        )?;
+        tx.commit()?;
+        Ok(ReservationId(id))
+    }
+
+    /// Sweep every scope/period for expired-but-still-`active` reservations
+    /// and flip them to `expired`. `reserve` already excludes expired rows
+    /// from its balance check via the `expires_at_ms` filter, so nothing
+    /// over-reserves even if this is never called; it exists for hygiene
+    /// (bounded table growth) and so tests can assert TTL rows actually
+    /// transition rather than merely becoming invisible to the sum.
+    pub fn sweep_expired(&self) -> Result<usize, BudgetError> {
+        let now_ms = self.clock.now_ms();
+        let conn = self.lock();
+        let n = conn.execute(
+            "UPDATE reservations SET status='expired' WHERE status='active' AND expires_at_ms <= ?1",
+            [now_ms],
+        )?;
+        Ok(n)
+    }
+}
+
+fn sweep_expired_scope(
+    conn: &Connection,
+    scope: &BudgetScope,
+    period: &str,
+    now_ms: i64,
+) -> Result<usize, BudgetError> {
+    let n = conn.execute(
+        "UPDATE reservations SET status='expired' \
+         WHERE tenant_id=?1 AND key_id=?2 AND provider_id=?3 AND model_id=?4 AND period=?5 \
+           AND status='active' AND expires_at_ms <= ?6",
+        rusqlite::params![
+            scope.tenant_id,
+            scope.key_id,
+            scope.provider_id,
+            scope.model_id,
+            period,
+            now_ms
+        ],
+    )?;
+    Ok(n)
 }
 
 fn run_migrations(conn: &mut Connection) -> Result<(), BudgetError> {
@@ -358,5 +529,20 @@ mod tests {
                 other => panic!("{expected}: expected InvalidScope, got {other:?}"),
             }
         }
+    }
+
+    /// Negative control: a non-positive TTL would create reservations that
+    /// are already expired and never count against the balance.
+    #[test]
+    fn open_with_rejects_non_positive_ttl() {
+        for ttl_ms in [0, -1, i64::MIN] {
+            let path = temp_db_path("bad-ttl");
+            assert!(matches!(
+                BudgetLedger::open_with(&path, Arc::new(SystemClock), ttl_ms),
+                Err(BudgetError::InvalidTtl { .. })
+            ));
+        }
+        let path = temp_db_path("good-ttl");
+        assert!(BudgetLedger::open_with(&path, Arc::new(SystemClock), 1).is_ok());
     }
 }

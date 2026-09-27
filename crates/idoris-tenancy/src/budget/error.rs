@@ -70,6 +70,12 @@ pub enum BudgetError {
     #[error("timestamp out of range: {now_ms}")]
     InvalidTimestamp { now_ms: i64 },
 
+    /// Reservation TTL must be positive: a zero/negative TTL would create
+    /// reservations that are already expired, never counting against the
+    /// balance (fail-open budget bypass).
+    #[error("invalid reservation ttl_ms: {ttl_ms} (must be > 0)")]
+    InvalidTtl { ttl_ms: i64 },
+
     #[error("sqlite storage error: {0}")]
     Storage(String),
 }
