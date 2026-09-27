@@ -26,10 +26,6 @@ pub struct RequestProfile {
     pub content_tightening: Option<PrivacyClass>,
 }
 
-// 这几个方法目前只被 `pipeline::decide()` 使用，而 `decide()` 在下一个 PR
-// 里才加入（这个 PR 只落地数据类型）——`pub(super)` 已经限定了可见性范围，
-// 这里的 `dead_code` allow 只是暂时的，等 mod.rs 落地 decide() 就会自然解除。
-#[allow(dead_code)]
 impl RequestProfile {
     pub(super) fn effective_privacy(&self) -> PrivacyClass {
         effective_privacy(
@@ -64,6 +60,10 @@ pub struct PolicyCtx<'a> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stage {
     RoleCapability,
+    /// M1：候选在角色/能力匹配后全部因为价格未知/非法（不变式 #3）被剔除。
+    /// 之前这种情况会落到 `Admission`（甚至 `RoleCapability`）阶段码上，
+    /// 让调用方去错误的地方排查——真正原因是定价，不是准入或角色匹配。
+    Pricing,
     Admission,
 }
 
@@ -74,6 +74,9 @@ pub enum ReasonCode {
     PrivacyTightenedByContent,
     RoleMatched(Role),
     RoleFallbackCapabilityOnly,
+    /// M1：至少有一个角色/能力匹配的候选因为价格未知/非法被剔除（不代表全部
+    /// 被剔除——全部被剔除见 [`Stage::Pricing`]）。
+    PriceUnknownExcluded,
     BudgetWithinLimit,
     BudgetNoTenantContext,
     BudgetFallbackToFreeCandidate,
