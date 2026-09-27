@@ -179,7 +179,9 @@
 
 **接入（§3.1）**
 - `IDORIS_URL` 没有默认端口，必须显式配置。
-- **所有响应都带 `X-iDoris-Served-Locality` 和 `X-iDoris-Record-Id`**，包括非流式 JSON 响应（Agent24 这一跳目前是非流式）。
+- **所有响应都带 `X-iDoris-Record-Id`**，包括非流式 JSON、错误响应和缓存命中。缓存命中时，另外带 `X-iDoris-Cached: true` 和 `X-iDoris-Origin-Record-Id`。
+- **凡是已经选定后端的响应，都带 `X-iDoris-Served-Locality`**，包括成功响应和该后端返回的错误，流式与非流式都算。还没选定后端就被拒绝的请求（400/402/403/503 等）不带这个头；Agent24 遇到头缺失时，按 §3.5 视为错误或 remote，所以方向是保守的。
+- Served-Locality 表示**推理实际发生的位置**，不是组件的来源地址。例如订阅中转 CLI 进程在本机，但推理在云端，所以报 `remote`。（v1.0.1 澄清，来自 T4.1 验收）
 - `GET /health` 返回服务身份 `{service:"idoris", version, contract_version, instance_id}`，Agent24 启动时校验。
 - 以上两项，加上「main 已合并」和「`IDORIS_PORT`」，合称 **M4 接入前置**。前置完成之前 Agent24 不接入（D-2）。
 
@@ -311,3 +313,4 @@
 | R2 | 2026-09-27 | iDoris | **全部采纳** R1 的意见，包括撤回「Evolver 读 iDoris 导出」。<br>• 新增 §3.12。<br>• 回答 fast/daily 的区分标准。<br>• D-1…D-7：iDoris 同意 Agent24 的推荐选项（均为 (a)）。 | **待 jason 拍板 D-1…D-7**；拍板后转 JSON Schema，定稿 |
 | R3 | 2026-09-27 | jason | **D-1…D-7 全部选 (a)**：配置 IDORIS_URL 后独占（不留直连 oMLX 的通道）；等 M4 前置完成再接入；Evolver 主数据源是 Agent24 事件日志；敏感确认只在 iDoris 控制台完成；Desktop main 进程直连 Admin 端口；每个实例两把 key；原型阶段只承诺 M4 状态卡片。同时同意 Agent24 那约 20 行文档修改 | 等 Agent24 回复「R2 无异议」后定稿 → 转 JSON Schema |
 | R4 | 2026-09-27 | Agent24 | 「已读 §3.12，与我方 R1 一致，**R2 无异议**」。Agent24 开始修订自己的约 20 行文档：L3 改为 ATIF v1.8 交换格式；ADR-032 §9 标为过期；引用本规范。见 [Agent24 PR #540](https://github.com/iDoris-ai/Agent24/pull/540) | **定稿 v1.0** |
+| R5 | 2026-09-27 | iDoris | v1.0.1 措辞澄清（T4.1 验收时发现）：Served-Locality 只在已选定后端时才带；它表示推理实际发生的位置；缓存命中带 Cached 和 Origin-Record-Id。都是加法兼容 | 已通知 Agent24 |
