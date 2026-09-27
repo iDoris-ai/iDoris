@@ -2573,4 +2573,130 @@ mod tests {
             .expect_err("status must also fail closed once poisoned");
         assert_eq!(status_err.reason_code(), "state_invariant_violated");
     }
+
+    /// A minimal `RuntimeAdapter` recording the timestamp of every `load`/
+    /// `status` call: `load` OOMs on its first call, succeeds on every
+    /// later one — for asserting exactly *when* the OOM retry and its
+    /// confirmation actually happen relative to each other (M10/M11, Opus
+    /// Tier-2 review).
+    struct OomRetryTimingAdapter {
+        load_times: std::sync::Mutex<Vec<tokio::time::Instant>>,
+        status_times: std::sync::Mutex<Vec<tokio::time::Instant>>,
+    }
+
+    #[async_trait::async_trait]
+    impl RuntimeAdapter for OomRetryTimingAdapter {
+        async fn list(&self) -> Result<Vec<ModelInfo>, BackendError> {
+            Ok(catalog())
+        }
+        async fn load(&self, id: &str, _policy: Option<&LoadPolicy>) -> Result<(), BackendError> {
+            let mut times = self
+                .load_times
+                .lock()
+                .expect("test mutex is never poisoned");
+            let is_first = times.is_empty();
+            times.push(tokio::time::Instant::now());
+            if is_first {
+                Err(BackendError::oom(id))
+            } else {
+                Ok(())
+            }
+        }
+        async fn unload(&self, _id: &str) -> Result<(), BackendError> {
+            Ok(())
+        }
+        async fn status(&self) -> Result<BackendStatus, BackendError> {
+            let mut times = self
+                .status_times
+                .lock()
+                .expect("test mutex is never poisoned");
+            // First call (the retry's `used_gb_before_retry` baseline)
+            // reports high; every later call reports the drop already
+            // confirmed — so `confirm_memory_released` succeeds on its
+            // very first poll and contributes ~0 delay of its own,
+            // isolating `oom_retry_backoff`'s contribution to the gap
+            // between the two `load` calls (M10 needs this: without it,
+            // `confirm_memory_released`'s own up-to-`release_confirm_
+            // max_attempts` polling could coincidentally cover for a
+            // missing backoff and mask the mutation).
+            let used_gb = if times.is_empty() { 100.0 } else { 0.0 };
+            times.push(tokio::time::Instant::now());
+            Ok(BackendStatus {
+                pressure: Pressure::Ok,
+                used_gb,
+                model_memory_max_gb: 0.0,
+                loaded: Vec::new(),
+            })
+        }
+        async fn probe_ready(&self, _id: &str) -> Result<bool, BackendError> {
+            Ok(true)
+        }
+        async fn chat(
+            &self,
+            req: ChatRequest,
+            _cancel: CancellationToken,
+        ) -> Result<ChatResponse, BackendError> {
+            Ok(ChatResponse {
+                model: req.model,
+                content: String::new(),
+            })
+        }
+    }
+
+    /// M10 + M11 (Opus Tier-2 review): the OOM circuit breaker's one retry
+    /// must (a) wait at least `oom_retry_backoff` before retrying, and
+    /// (b) call `confirm_memory_released` (i.e. poll `status()`) at least
+    /// once *between* the OOM'd attempt and the retry — not skip either
+    /// step. Uses `tokio::time::Instant` (respects the paused clock) rather
+    /// than a real wall-clock measurement.
+    #[tokio::test(start_paused = true)]
+    async fn oom_retry_confirms_release_and_backs_off_before_retrying() {
+        let adapter = Arc::new(OomRetryTimingAdapter {
+            load_times: std::sync::Mutex::new(Vec::new()),
+            status_times: std::sync::Mutex::new(Vec::new()),
+        });
+        let backoff = std::time::Duration::from_millis(200);
+        let handle = Supervisor::spawn(
+            adapter.clone(),
+            SupervisorConfig {
+                oom_retry_backoff: backoff,
+                ..SupervisorConfig::default()
+            },
+        )
+        .expect("spawn should succeed");
+        no_hang(handle.load("a", 4.0, on_demand_policy()))
+            .await
+            .expect("load should self-heal after the OOM retry");
+
+        let load_times = adapter
+            .load_times
+            .lock()
+            .expect("test mutex is never poisoned")
+            .clone();
+        assert_eq!(load_times.len(), 2, "exactly one OOM retry must happen");
+        let gap = load_times[1] - load_times[0];
+        assert!(
+            gap >= backoff,
+            "M10: the retry must wait at least oom_retry_backoff ({backoff:?}), got {gap:?}"
+        );
+
+        let status_times = adapter
+            .status_times
+            .lock()
+            .expect("test mutex is never poisoned")
+            .clone();
+        // At least 2, not just 1: the baseline `used_gb_before_retry`
+        // read is itself one `status()` call that would happen even
+        // without ever calling `confirm_memory_released` — only a
+        // *second* call in this window proves the confirmation loop
+        // itself actually ran.
+        let calls_in_window = status_times
+            .iter()
+            .filter(|t| **t >= load_times[0] && **t < load_times[1])
+            .count();
+        assert!(
+            calls_in_window >= 2,
+            "M11: confirm_memory_released must actually poll status() (not just read the baseline) between the OOM'd attempt and the retry, got {calls_in_window} call(s)"
+        );
+    }
 }
