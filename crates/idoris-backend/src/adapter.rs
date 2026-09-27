@@ -4,9 +4,8 @@
 //! for R2-A per `docs/research/Rust基础选型-2026-09-27.md` §4
 //! ("原来的 `ModelBackend` trait 下沉为『运行时适配器』，上面加一层 Runtime
 //! Supervisor"). `admission` is deliberately **not** part of this trait any
-//! more — that decision now lives one layer up, in a pure `plan_eviction`
-//! function landing in a follow-up PR (plain text, not an intra-doc link,
-//! since that module doesn't exist in this crate yet), so every load path
+//! more — that decision now lives one layer up, in the pure
+//! [`crate::eviction::plan_eviction`] function, so every load path
 //! (manual, auto, API, CLI) funnels through the same decision point instead
 //! of letting each adapter reimplement its own admission heuristic (LM
 //! Studio #2051).
@@ -53,8 +52,52 @@ pub trait RuntimeAdapter: Send + Sync {
     /// the model to become servable; that is what [`Self::probe_ready`] is
     /// for. A `policy` of `None` means "use the engine's default"; the
     /// Supervisor always passes `Some` in practice.
+    ///
+    /// **Concurrency contract** (owned by the Supervisor, not this trait):
+    /// the Supervisor never issues two `load`/`unload` calls for the *same*
+    /// `id` concurrently, and never overlaps a `load`/`unload` for `id`
+    /// with another `load`/`unload` for `id` — the global load/evict mutex
+    /// serializes all of that (see the crate-level Supervisor docs). An
+    /// implementation may therefore assume calls for a given `id` arrive
+    /// strictly one at a time and never needs to defend against concurrent
+    /// duplicate calls for the same `id`.
+    ///
+    /// **Idempotency is policy-scoped, not blanket, and "equivalent" means
+    /// exactly equal.** Two concurrent requests to load the *same
+    /// not-yet-loaded* `id` are singleflight-merged into one `load` call —
+    /// and both callers get that call's outcome — **only if their
+    /// [`LoadPolicy`]s are `==`**. Merging on some coarser notion of
+    /// "close enough" (e.g. "same pinned-ness, ignore `idle_ttl_s`/
+    /// `admission`") is explicitly wrong: this engine-agnostic layer has no
+    /// way to know which policy fields a given engine actually treats as
+    /// consequential, so any two policies that differ *at all* must be
+    /// treated as genuinely different. Concurrent requests for the same
+    /// `id` whose policies are not `==` are **not** merged — but there is
+    /// no wait queue yet (a deliberately deferred simplification, see the
+    /// crate-level Supervisor docs), so the second caller does not get
+    /// serialized behind the first: it fails fast with
+    /// [`BackendError::Busy`], the same as a request for a wholly
+    /// *different* id would while the mutex is held. The caller is
+    /// responsible for retrying with their own exact policy once the
+    /// first `load` completes; a policy is never silently dropped or
+    /// merged into someone else's, but it is also never queued for the
+    /// Supervisor to apply automatically.
+    ///
+    /// The same exact-equality rule defines the no-op case: a repeat
+    /// `load(id, policy)` call for an `id` that is already loaded is a
+    /// no-op **only when `policy` is `==`** to what is already in effect.
+    /// It is **not** a no-op when the policy differs at all — e.g. an `id`
+    /// currently loaded `on_demand`/unpinned, re-requested as
+    /// `resident`/pinned, must
+    /// actually update the engine's pin state (mirroring
+    /// `packages/adapters/omlx/omlx-backend.ts`'s own `load()`, which
+    /// always hits the load endpoint and then conditionally (un)pins).
+    /// Silently treating every repeat call as a no-op would leave a model
+    /// the caller explicitly asked to pin still evictable.
     async fn load(&self, id: &str, policy: Option<&LoadPolicy>) -> Result<(), BackendError>;
 
+    /// See [`Self::load`]'s concurrency contract — the same non-overlap
+    /// guarantee applies here.
     async fn unload(&self, id: &str) -> Result<(), BackendError>;
 
     /// Current engine-observed status: which models are loaded and the
@@ -100,6 +143,14 @@ pub trait RuntimeAdapter: Send + Sync {
     /// A spawn-type adapter implementation should additionally treat
     /// `cancel` firing as a signal to kill its whole process group, not just
     /// stop reading its output (mirrors the TS `signal` doc comment).
+    ///
+    /// The Supervisor only routes `chat` to a model it believes is `Ready`,
+    /// but an implementation must not simply trust that: it should still
+    /// report an unknown/not-actually-loaded model as an error rather than
+    /// serving the request anyway, exactly as a real engine would reject a
+    /// request for a model it hasn't loaded. A test double that served
+    /// `chat` unconditionally would mask a Supervisor bug that forwards
+    /// requests to a `Loading`/`Stopped` model.
     async fn chat(
         &self,
         req: ChatRequest,
