@@ -592,6 +592,7 @@ dependencies = [
  "idoris-backend",
  "idoris-contracts",
  "idoris-policy",
+ "idoris-tenancy",
  "serde",
  "serde_json",
  "serde_yaml",

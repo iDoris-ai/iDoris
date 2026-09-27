@@ -21,6 +21,10 @@ pub mod routing_policy;
 /// needed) `Supervisor` load → `Supervisor` chat.
 pub mod dispatch;
 
+/// Atomic reserve/settle/release around a paid candidate (R2-D task 4); not
+/// yet wired into `dispatch`/the request path — a follow-up PR does that.
+pub mod budget;
+
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
