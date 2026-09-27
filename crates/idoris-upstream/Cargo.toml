@@ -1,0 +1,14 @@
+[package]
+name = "idoris-upstream"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Upstream inference clients: local RuntimeAdapter implementations (oMLX) and remote RemoteChat provider clients (OpenAI/Anthropic-compatible), behind stable, non-spoofable error reason codes."
+
+[lints]
+workspace = true
+
+[dependencies]
+thiserror = { workspace = true }
