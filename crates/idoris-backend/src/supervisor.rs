@@ -43,6 +43,10 @@ pub struct SupervisorConfig {
     /// `probe_ready` poll interval; `probe_max_attempts` bounds retries.
     pub probe_interval: std::time::Duration,
     pub probe_max_attempts: u32,
+    /// Bounds a single `load`/`unload`/`probe_ready` adapter call. Without
+    /// this, a hanging call would hold `active_op` (the global load/evict
+    /// mutex) forever — llama-swap Issue #946's root cause.
+    pub adapter_call_timeout: std::time::Duration,
 }
 
 impl Default for SupervisorConfig {
@@ -52,6 +56,7 @@ impl Default for SupervisorConfig {
             max_concurrent_adapter_calls: 64,
             probe_interval: std::time::Duration::from_millis(20),
             probe_max_attempts: 50,
+            adapter_call_timeout: std::time::Duration::from_secs(30),
         }
     }
 }
@@ -210,9 +215,13 @@ impl SupervisorHandle {
 /// spawning a task that would just sit blocked on the semaphore — that
 /// distinction matters, since a task blocked *inside* `acquire().await`
 /// would still count as one more accumulating detached task, defeating the
-/// point of bounding concurrency in the first place. A permanently-hanging
-/// adapter therefore stalls at most `max_concurrent_adapter_calls` real
-/// calls, never an unbounded number of tasks. Full graceful-shutdown task
+/// point of bounding concurrency in the first place. A hanging adapter call
+/// is additionally bounded in *time* by `config.adapter_call_timeout` (see
+/// [`with_adapter_timeout`]), applied to every `list`/`chat`/`load`/
+/// `unload`/`probe_ready` call — so a permanently-hanging adapter stalls at
+/// most `max_concurrent_adapter_calls` real calls, each for at most that
+/// timeout, never an unbounded number of tasks held forever. Full
+/// graceful-shutdown task
 /// tracking/cancellation (stopping still-running spawned calls when the
 /// last handle drops) is a deliberately deferred concern for a future PR —
 /// today those tasks simply run to completion and their (by-then-unwanted)
@@ -272,11 +281,38 @@ fn set_state_or_panic(models: &mut HashMap<String, ModelSlot>, id: &str, state: 
 /// the single-writer loop can apply both atomically in `OpDone`.
 type VictimResult = (String, Result<(), BackendError>);
 
+/// Bounds one `RuntimeAdapter` call so a hang can't hold `active_op` (the
+/// global load/evict mutex) forever — see [`SupervisorConfig::adapter_call_timeout`].
+async fn with_adapter_timeout<F, T>(
+    fut: F,
+    timeout: std::time::Duration,
+    model_id: &str,
+) -> Result<T, BackendError>
+where
+    F: std::future::Future<Output = Result<T, BackendError>>,
+{
+    match tokio::time::timeout(timeout, fut).await {
+        Ok(result) => result,
+        Err(_) => Err(BackendError::adapter_timed_out(model_id)),
+    }
+}
+
 /// The pure-IO side of a load: attempts every victim in `evict` (even
 /// after an earlier one fails — see the loop below), then, only if all
 /// succeeded, calls the adapter and reports the outcome. Any eviction
 /// failure means the capacity assumption behind this load no longer
-/// holds, so the load itself must not proceed.
+/// holds, so the load itself must not proceed. Every adapter call is
+/// timeout-bounded (see [`with_adapter_timeout`]); a panic inside this
+/// function is caught by the `tokio::spawn` wrapper in `start_load`, not
+/// here — see its doc comment. **Known accepted gap**: if the panic lands
+/// mid-eviction-loop, this function's local `victim_results` (including any
+/// victims already successfully unloaded before the panic) is lost with
+/// the panicking stack frame, so those victims are left in `Stopping`
+/// rather than resolved to `Stopped` — recoverable via a manual follow-up
+/// `unload`, not a permanent wedge, but not self-healing either. A full fix
+/// needs `catch_unwind`-based partial-state recovery across `.await`
+/// points, which is disproportionate to this already-rare (adapter panics
+/// at all) x (specifically mid-loop) edge case.
 async fn run_load_flow(
     adapter: Arc<dyn RuntimeAdapter>,
     config: SupervisorConfig,
@@ -292,7 +328,12 @@ async fn run_load_flow(
     let mut victim_results: Vec<VictimResult> = Vec::with_capacity(evict.len());
     let mut eviction_failed = false;
     for victim in evict {
-        let result = adapter.unload(&victim).await;
+        let result = with_adapter_timeout(
+            adapter.unload(&victim),
+            config.adapter_call_timeout,
+            &victim,
+        )
+        .await;
         eviction_failed |= result.is_err();
         victim_results.push((victim, result));
     }
@@ -304,11 +345,21 @@ async fn run_load_flow(
     }
 
     // OOM circuit breaker: exactly one self-healing retry, never more.
-    let mut attempt = adapter.load(&id, Some(&policy)).await;
+    let mut attempt = with_adapter_timeout(
+        adapter.load(&id, Some(&policy)),
+        config.adapter_call_timeout,
+        &id,
+    )
+    .await;
     if let Err(err) = &attempt
         && err.is_oom()
     {
-        attempt = adapter.load(&id, Some(&policy)).await;
+        attempt = with_adapter_timeout(
+            adapter.load(&id, Some(&policy)),
+            config.adapter_call_timeout,
+            &id,
+        )
+        .await;
     }
     if let Err(err) = attempt {
         return OpOutcome::Load {
@@ -318,7 +369,8 @@ async fn run_load_flow(
     }
 
     for _ in 0..config.probe_max_attempts {
-        match adapter.probe_ready(&id).await {
+        match with_adapter_timeout(adapter.probe_ready(&id), config.adapter_call_timeout, &id).await
+        {
             Ok(true) => {
                 return OpOutcome::Load {
                     result: Ok(()),
@@ -401,7 +453,29 @@ fn start_load(
     let self_tx = env.self_tx.clone();
     let id_for_task = id.clone();
     tokio::spawn(async move {
-        let outcome = run_load_flow(adapter, config, id_for_task.clone(), policy, evict).await;
+        // `run_load_flow` runs as its OWN spawned task so a panic inside it
+        // (an adapter implementation bug) is isolated to that task — tokio
+        // reports it here as `Err(JoinError)` on `.await` rather than
+        // unwinding straight through this outer task and skipping the
+        // `OpDone` send below. Without this, a single panicking adapter
+        // call would leave `active_op` set forever (llama-swap Issue #946).
+        let inner = tokio::spawn(run_load_flow(
+            adapter,
+            config,
+            id_for_task.clone(),
+            policy,
+            evict,
+        ));
+        let outcome = match inner.await {
+            Ok(outcome) => outcome,
+            Err(join_err) => OpOutcome::Load {
+                result: Err(BackendError::adapter_panicked(
+                    &id_for_task,
+                    join_err.to_string(),
+                )),
+                victim_results: Vec::new(),
+            },
+        };
         let _ = self_tx
             .send(ActorMsg::OpDone {
                 id: id_for_task,
@@ -499,8 +573,17 @@ fn handle_load(
 fn start_unload(id: String, env: &Env<'_>) {
     let adapter = env.adapter.clone();
     let self_tx = env.self_tx.clone();
+    let timeout = env.config.adapter_call_timeout;
     tokio::spawn(async move {
-        let result = adapter.unload(&id).await;
+        // Same panic-isolation shape as `start_load` — see its doc comment.
+        let id_for_inner = id.clone();
+        let inner = tokio::spawn(async move {
+            with_adapter_timeout(adapter.unload(&id_for_inner), timeout, &id_for_inner).await
+        });
+        let result = match inner.await {
+            Ok(result) => result,
+            Err(join_err) => Err(BackendError::adapter_panicked(&id, join_err.to_string())),
+        };
         let _ = self_tx
             .send(ActorMsg::OpDone {
                 id,
@@ -585,9 +668,10 @@ async fn run_actor(
                     continue;
                 };
                 let adapter = adapter.clone();
+                let timeout = config.adapter_call_timeout;
                 tokio::spawn(async move {
                     let _permit = permit;
-                    let _ = reply.send(adapter.list().await);
+                    let _ = reply.send(with_adapter_timeout(adapter.list(), timeout, "list").await);
                 });
             }
 
@@ -634,9 +718,13 @@ async fn run_actor(
                         slot.last_used_seq = next_seq;
                     }
                     let adapter = adapter.clone();
+                    let timeout = config.adapter_call_timeout;
                     tokio::spawn(async move {
                         let _permit = permit;
-                        let _ = reply.send(adapter.chat(req, cancel).await);
+                        let model = req.model.clone();
+                        let _ = reply.send(
+                            with_adapter_timeout(adapter.chat(req, cancel), timeout, &model).await,
+                        );
                     });
                 }
             },
@@ -1194,5 +1282,96 @@ mod tests {
             .await
             .unwrap()
             .expect("load b should eventually succeed");
+    }
+
+    /// A minimal `RuntimeAdapter` whose `load` always panics — for
+    /// exercising the panic-isolation path in `start_load` without adding
+    /// panic-injection scripting to `MockAdapter` itself.
+    struct PanickingAdapter;
+
+    #[async_trait::async_trait]
+    impl RuntimeAdapter for PanickingAdapter {
+        async fn list(&self) -> Result<Vec<ModelInfo>, BackendError> {
+            Ok(catalog())
+        }
+        async fn load(&self, _id: &str, _policy: Option<&LoadPolicy>) -> Result<(), BackendError> {
+            panic!("PanickingAdapter::load always panics (test double)");
+        }
+        async fn unload(&self, _id: &str) -> Result<(), BackendError> {
+            Ok(())
+        }
+        async fn status(&self) -> Result<BackendStatus, BackendError> {
+            Ok(BackendStatus {
+                pressure: Pressure::Ok,
+                used_gb: 0.0,
+                model_memory_max_gb: 0.0,
+                loaded: Vec::new(),
+            })
+        }
+        async fn probe_ready(&self, _id: &str) -> Result<bool, BackendError> {
+            Ok(true)
+        }
+        async fn chat(
+            &self,
+            req: ChatRequest,
+            _cancel: CancellationToken,
+        ) -> Result<ChatResponse, BackendError> {
+            Ok(ChatResponse {
+                model: req.model,
+                content: String::new(),
+            })
+        }
+    }
+
+    /// C1: a panicking adapter call must not leave `active_op` set forever
+    /// — the caller gets `adapter_panicked` instead of hanging, and the
+    /// Supervisor accepts further requests right after (this is exactly
+    /// llama-swap Issue #946's failure mode).
+    #[tokio::test]
+    async fn a_panicking_load_reports_adapter_panicked_and_does_not_wedge_the_supervisor() {
+        let adapter = Arc::new(PanickingAdapter);
+        let handle =
+            Supervisor::spawn(adapter, SupervisorConfig::default()).expect("spawn should succeed");
+        let err = handle
+            .load("a", 4.0, on_demand_policy())
+            .await
+            .expect_err("a panicking adapter call must surface as an error, not hang");
+        assert_eq!(err.reason_code(), "adapter_panicked");
+        // Negative contrast baked into the same test: if the panic *had*
+        // wedged the Supervisor (active_op stuck `Some` forever), this
+        // second, unrelated load would also fail with `Busy` — it must not.
+        handle
+            .load("a", 4.0, on_demand_policy())
+            .await
+            .expect_err("still fails (PanickingAdapter always panics)");
+    }
+
+    /// C1: a single adapter call that never returns must not hold
+    /// `active_op` forever — `adapter_call_timeout` cuts it off, and the
+    /// Supervisor keeps serving other requests afterward.
+    #[tokio::test(start_paused = true)]
+    async fn a_hanging_load_times_out_and_does_not_wedge_the_supervisor() {
+        let adapter = Arc::new(MockAdapter::new(catalog()));
+        // Far longer than the adapter_call_timeout below: from the
+        // Supervisor's point of view this is indistinguishable from a
+        // permanent hang.
+        adapter.set_load_delay("a", std::time::Duration::from_secs(3600));
+        let handle = Supervisor::spawn(
+            adapter,
+            SupervisorConfig {
+                adapter_call_timeout: std::time::Duration::from_millis(50),
+                ..SupervisorConfig::default()
+            },
+        )
+        .expect("spawn should succeed");
+        let err = handle
+            .load("a", 4.0, on_demand_policy())
+            .await
+            .expect_err("a hanging adapter call must time out, not hang forever");
+        assert_eq!(err.reason_code(), "adapter_timed_out");
+        // Negative contrast: the Supervisor must still be usable afterward
+        // — a stuck `active_op` would make this also fail with `Busy`.
+        let models = handle.list().await.expect("list must still work");
+        assert_eq!(models, catalog());
     }
 }

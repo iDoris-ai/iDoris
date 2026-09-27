@@ -85,6 +85,23 @@ pub enum BackendError {
     #[error("timed out waiting for {model_id} to become ready")]
     ProbeTimedOut { model_id: String },
 
+    /// A single `RuntimeAdapter` call (`load`/`unload`/`probe_ready`) did
+    /// not finish within `SupervisorConfig::adapter_call_timeout`. Distinct
+    /// from [`BackendError::ProbeTimedOut`]: that means "polled N times,
+    /// never observed `Ready`"; this means "one specific call itself hung."
+    /// Existing to close llama-swap Issue #946's failure mode: without a
+    /// bound here, a hanging adapter call would hold the Supervisor's
+    /// global load/evict mutex forever.
+    #[error("adapter call for {model_id} timed out")]
+    AdapterTimedOut { model_id: String },
+
+    /// A `RuntimeAdapter` call's background task panicked instead of
+    /// returning normally. Kept distinct from `AdapterTimedOut`: a panic is
+    /// an adapter implementation bug (actionable, should be reported/fixed)
+    /// where a timeout is more often transient latency (retry-worthy).
+    #[error("adapter call for {model_id} panicked: {message}")]
+    AdapterPanicked { model_id: String, message: String },
+
     #[error("upstream error: {message}")]
     Upstream { message: String },
 
@@ -153,6 +170,8 @@ impl BackendError {
             BackendError::EvictionFailed { .. } => "eviction_failed",
             BackendError::Oom { .. } => "oom",
             BackendError::ProbeTimedOut { .. } => "probe_timed_out",
+            BackendError::AdapterTimedOut { .. } => "adapter_timed_out",
+            BackendError::AdapterPanicked { .. } => "adapter_panicked",
             BackendError::Upstream { .. } => "upstream_error",
             BackendError::Cancelled => "cancelled",
             BackendError::SupervisorUnavailable => "supervisor_unavailable",
@@ -216,6 +235,19 @@ impl BackendError {
     pub fn probe_timed_out(model_id: impl Into<String>) -> Self {
         Self::ProbeTimedOut {
             model_id: model_id.into(),
+        }
+    }
+
+    pub fn adapter_timed_out(model_id: impl Into<String>) -> Self {
+        Self::AdapterTimedOut {
+            model_id: model_id.into(),
+        }
+    }
+
+    pub fn adapter_panicked(model_id: impl Into<String>, message: impl Into<String>) -> Self {
+        Self::AdapterPanicked {
+            model_id: model_id.into(),
+            message: message.into(),
         }
     }
 
