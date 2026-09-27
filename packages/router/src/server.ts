@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import {
   isPersonalDeployMode,
@@ -5,7 +6,7 @@ import {
   openAIChatCompletion,
   type ChatMessage,
 } from "@idoris/adapters";
-import type { RoutingPolicy, TaskProfile } from "@idoris/contracts";
+import { CONTRACT_VERSION, type ComponentCard, type RoutingPolicy, type TaskProfile } from "@idoris/contracts";
 import {
   DefaultCapabilitiesProvider,
   type CapabilitiesProvider,
@@ -18,6 +19,7 @@ import { defaultIntentDetector, resolveProfile, type IntentDetector } from "./in
 import { ProfileError } from "./profile.js";
 import { ChatProxy } from "./proxy.js";
 import { loadComponents, type Registered } from "./registry.js";
+import { readRouterVersion } from "./version.js";
 
 export interface RouterOptions {
   componentsDir: string;
@@ -47,6 +49,24 @@ export interface Router {
 /** 绑定点硬编码 loopback（涉安全）：不监听非本机地址。 */
 const BIND_HOST = "127.0.0.1";
 
+/** 本包 package.json 的 version；进程内只需读一次。 */
+const ROUTER_VERSION = readRouterVersion();
+
+type ServedLocality = "loopback" | "lan" | "remote";
+const SERVED_LOCALITIES: ReadonlySet<string> = new Set(["loopback", "lan", "remote"]);
+
+/**
+ * `X-iDoris-Served-Locality` 取值（T4.1，接口规范 §3.5/§3.12）。
+ *
+ * **fail-closed，不默认 loopback**：locality 缺失或不是三值之一时一律按
+ * `remote` 回报——因为 Agent24 的 `idoris-local` 逻辑 provider 只认 loopback，
+ * 把一个未知/异常值误判成 loopback 会让本该拒绝的调用被当成本地放行。
+ */
+function servedLocalityOf(card: ComponentCard): ServedLocality {
+  const locality: unknown = card.provider.locality;
+  return typeof locality === "string" && SERVED_LOCALITIES.has(locality) ? (locality as ServedLocality) : "remote";
+}
+
 function json(res: ServerResponse, status: number, body: unknown): void {
   res.writeHead(status, { "content-type": "application/json" });
   res.end(JSON.stringify(body));
@@ -65,8 +85,10 @@ export async function startRouter(opts: RouterOptions): Promise<Router> {
     if (capabilities === undefined) capabilities = new DefaultCapabilitiesProvider({ registered });
     return capabilities;
   };
+  // T4.1：/health 的 instance_id——进程内每个 Router 实例生成一次，实例生命周期内不变。
+  const instanceId = randomUUID();
   const server = createServer((req, res) => {
-    void handle(req, res, registered, health, policy, proxy, egress, getCapabilities, intentDetector, env);
+    void handle(req, res, registered, health, policy, proxy, egress, getCapabilities, intentDetector, env, instanceId);
   });
   await new Promise<void>((resolve, reject) => {
     server.once("error", reject);
@@ -117,9 +139,21 @@ async function handle(
   getCapabilities: () => CapabilitiesProvider,
   intentDetector: IntentDetector,
   env: NodeJS.ProcessEnv,
+  instanceId: string,
 ): Promise<void> {
+  // T4.1：每个请求生成独立的 Record-Id，写在所有响应上（含错误、含流式）——
+  // 由服务端生成，跟调用方填的 X-iDoris-Request-Id 无关，调用方不能指定它。
+  res.setHeader("X-iDoris-Record-Id", randomUUID());
+
   if (req.method === "GET" && req.url === "/health") {
-    json(res, 200, { status: "ok", components: registered.length });
+    json(res, 200, {
+      status: "ok",
+      service: "idoris",
+      version: ROUTER_VERSION,
+      contract_version: CONTRACT_VERSION,
+      instance_id: instanceId,
+      components: registered.length,
+    });
     return;
   }
   if (req.method === "GET" && req.url === "/v1/models") {
@@ -231,6 +265,11 @@ async function handleChat(
       throw err;
     }
   }
+
+  // T4.1：走到这里说明确实由 target 这个后端服务；此后所有响应（成功/该后端自身
+  // 报错）都带实际服务方的 Served-Locality。在此之前的错误（无候选、策略未配置、
+  // 订阅来源复核拒绝……）都还没有落到具体后端，不带这个头。
+  res.setHeader("X-iDoris-Served-Locality", servedLocalityOf(target.card));
 
   const controller = new AbortController();
   req.on("close", () => controller.abort());
