@@ -1,12 +1,15 @@
 //! oMLX `RuntimeAdapter` — mirrors `packages/adapters/omlx/
 //! omlx-backend.ts` on `main` (FU-16) behavior, ported onto
 //! `idoris_backend::RuntimeAdapter`. Talks to `http://127.0.0.1:8088` by
-//! default. Split across submodules landing across several PRs on this
+//! default. Split across submodules that landed across several PRs on this
 //! stack: [`http`] (GET/POST/PUT + timeout + safe errors), [`status`]
-//! (`list`/`status` parsing), [`pin`] (this PR, resident/admin-session
-//! gap), and [`OmlxAdapter`] wiring `list`/`status` together —
-//! `load`/`unload`/`probe_ready`/`chat`, and the actual `RuntimeAdapter`
-//! impl, follow in the next PRs.
+//! (`list`/`status` parsing), [`pin`] (resident/admin-session gap), and
+//! [`OmlxAdapter`], which wires all of it into a full
+//! [`idoris_backend::RuntimeAdapter`] impl (this PR) — `OmlxAdapter`'s own
+//! inherent methods (used directly by this module's tests throughout the
+//! stack) and the trait impl are the same logic; the trait impl exists so
+//! `OmlxAdapter` can be used as `Box<dyn RuntimeAdapter>` by the
+//! Supervisor.
 //!
 //! **The API key is read from an env var and never logged** — see
 //! [`OMLX_API_KEY_ENV`] and `http`'s module doc.
@@ -17,7 +20,9 @@ mod status;
 
 use std::time::Duration;
 
-use idoris_backend::{BackendError, BackendStatus, ChatRequest, ChatResponse, ModelInfo};
+use idoris_backend::{
+    BackendError, BackendStatus, ChatRequest, ChatResponse, ModelInfo, RuntimeAdapter,
+};
 use idoris_contracts::LoadPolicy;
 use idoris_contracts::load_policy::LoadMode;
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
@@ -353,6 +358,46 @@ fn is_ready(raw: &serde_json::Value, id: &str) -> bool {
             m.get("id").and_then(|v| v.as_str()) == Some(id)
                 && m.get("loaded").and_then(|v| v.as_bool()) == Some(true)
         })
+}
+
+/// Thin delegation to `OmlxAdapter`'s own inherent methods (used directly,
+/// throughout this module's tests, by every PR on this branch stack) —
+/// this impl exists so a `Box<dyn RuntimeAdapter>` can hold an
+/// `OmlxAdapter`. Delegating through `Self::method(self, ...)` rather than
+/// `self.method(...)` is not just style: an inherent method always shadows
+/// a trait method of the same name in method-call syntax, so `self.list()`
+/// here would in fact resolve to the inherent `list` anyway — spelling it
+/// as `Self::list(self)` makes that explicit instead of relying on that
+/// shadowing rule silently doing the right thing.
+#[async_trait::async_trait]
+impl RuntimeAdapter for OmlxAdapter {
+    async fn list(&self) -> Result<Vec<ModelInfo>, BackendError> {
+        Self::list(self).await
+    }
+
+    async fn load(&self, id: &str, policy: Option<&LoadPolicy>) -> Result<(), BackendError> {
+        Self::load(self, id, policy).await
+    }
+
+    async fn unload(&self, id: &str) -> Result<(), BackendError> {
+        Self::unload(self, id).await
+    }
+
+    async fn status(&self) -> Result<BackendStatus, BackendError> {
+        Self::status(self).await
+    }
+
+    async fn probe_ready(&self, id: &str) -> Result<bool, BackendError> {
+        Self::probe_ready(self, id).await
+    }
+
+    async fn chat(
+        &self,
+        req: ChatRequest,
+        cancel: CancellationToken,
+    ) -> Result<ChatResponse, BackendError> {
+        Self::chat(self, req, cancel).await
+    }
 }
 
 #[cfg(test)]
@@ -775,5 +820,32 @@ mod tests {
         assert!(msg.contains("400"));
         assert!(!msg.contains("bad-request-body-should-not-leak"));
         assert!(!msg.contains("test-key-should-never-leak"));
+    }
+
+    /// `OmlxAdapter` must be usable as `Box<dyn RuntimeAdapter>` — the
+    /// whole point of the trait impl added in this PR — and the trait
+    /// method must produce the same result as calling the inherent method
+    /// directly (they delegate to the same code).
+    #[tokio::test]
+    async fn omlx_adapter_is_usable_as_a_dyn_runtime_adapter() {
+        let server = MockServer::start().await;
+        mount_all(
+            &server,
+            vec![(
+                "GET",
+                "/v1/models",
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "data": [{"id": "qwen3-8b"}]
+                })),
+            )],
+        )
+        .await;
+        let adapter: Box<dyn RuntimeAdapter> = Box::new(adapter_for(&server).await);
+        let models = adapter
+            .list()
+            .await
+            .expect("list via trait object must succeed");
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "qwen3-8b");
     }
 }

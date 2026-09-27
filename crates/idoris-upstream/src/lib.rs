@@ -12,8 +12,8 @@
 //!   this stack), with a stable `reason_code()` that keeps authentication
 //!   failure and dependency failure from ever collapsing into the same
 //!   code.
-//! - [`omlx`] — the oMLX `RuntimeAdapter` implementation (landing across
-//!   several PRs on this stack; this PR has `list`/`status` only).
+//! - [`omlx`] — [`omlx::OmlxAdapter`], a complete `RuntimeAdapter`
+//!   implementation (built up across the PRs on this branch stack).
 
 pub mod chat;
 pub mod error;
@@ -24,3 +24,4 @@ pub use chat::{
     ensure_terminated,
 };
 pub use error::UpstreamError;
+pub use omlx::{OmlxAdapter, OmlxAdapterConfig};
