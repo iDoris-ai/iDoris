@@ -1,0 +1,12 @@
+-- R2-C-fix migration 0004: decouple tenant-level period bucketing from the
+-- sub-scope's own `period` column (Opus Tier-2 re-review B-2).
+--
+-- Reusing `period` (computed from the sub-scope's billing_timezone) for
+-- tenant-level aggregation silently breaks once a tenant's billing_timezone
+-- diverges from a sub-scope's: two reservations that are genuinely in the
+-- same real-world period, viewed through the tenant's own zone, could carry
+-- different `period` strings and never sum together. `tenant_period` is
+-- computed independently, from whichever config actually determined it at
+-- reserve time (see `ledger.rs` `reserve`), and is what tenant-level sums
+-- and `settle`'s `tenant_periods` credit now key off — see B-2/B-4.
+ALTER TABLE reservations ADD COLUMN tenant_period TEXT;
