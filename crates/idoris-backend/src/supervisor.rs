@@ -437,15 +437,18 @@ async fn confirm_memory_released(
 /// holds, so the load itself must not proceed. Every adapter call is
 /// timeout-bounded (see [`with_adapter_timeout`]); a panic inside this
 /// function is caught by the `tokio::spawn` wrapper in `start_load`, not
-/// here — see its doc comment. **Known accepted gap**: if the panic lands
-/// mid-eviction-loop, this function's local `victim_results` (including any
-/// victims already successfully unloaded before the panic) is lost with
-/// the panicking stack frame, so those victims are left in `Stopping`
-/// rather than resolved to `Stopped` — recoverable via a manual follow-up
-/// `unload`, not a permanent wedge, but not self-healing either. A full fix
-/// needs `catch_unwind`-based partial-state recovery across `.await`
-/// points, which is disproportionate to this already-rare (adapter panics
-/// at all) x (specifically mid-loop) edge case.
+/// here — see its doc comment. If the panic lands mid-eviction-loop, this
+/// function's local `victim_results` is lost with the panicking stack
+/// frame — `start_load`'s `JoinError` arm resolves every chosen victim to
+/// `Error` anyway (not distinguishing "already freed" from "never
+/// attempted"), so none dangle in `Stopping` forever: `Error` is itself a
+/// valid eviction candidate (H1), so this self-heals rather than requiring
+/// a manual `unload`. **Known accepted imprecision**: a victim that
+/// actually succeeded right before the panic is still reported `Error`
+/// (occupying budget) instead of the more accurate `Stopped` — recovering
+/// that needs `catch_unwind`-based partial-state recovery across `.await`
+/// points, disproportionate to this already-rare (panics at all) x
+/// (specifically mid-loop) edge case.
 ///
 /// **`failure_state` on error** (H1 in the Opus Tier-2 review): an
 /// eviction failure or an explicit `adapter.load` rejection means the
@@ -660,6 +663,11 @@ fn start_load(
     let config = env.config.clone();
     let self_tx = env.self_tx.clone();
     let id_for_task = id.clone();
+    // Kept alongside `evict` (which is moved into `run_load_flow` below) so
+    // the panic-fallback arm can still resolve every chosen victim even
+    // though `run_load_flow`'s own `victim_results` was lost with its
+    // panicking stack frame (Medium, Opus Tier-2 review — see below).
+    let evict_for_panic_fallback = evict.clone();
     tokio::spawn(async move {
         // `run_load_flow` runs as its OWN spawned task so a panic inside it
         // (an adapter implementation bug) is isolated to that task — tokio
@@ -681,7 +689,23 @@ fn start_load(
                     &id_for_task,
                     join_err.to_string(),
                 )),
-                victim_results: Vec::new(),
+                // Every victim `plan_eviction` chose must still be
+                // resolved, not left dangling in `Stopping` forever just
+                // because the panic happened to land mid-eviction-loop:
+                // report each as `Err` so `OpDone` settles it on `Error`
+                // (still occupying budget, conservative — but `Error` is
+                // itself a valid eviction candidate per H1, so it can
+                // self-heal via a later eviction or a manual `unload`).
+                victim_results: evict_for_panic_fallback
+                    .into_iter()
+                    .map(|victim| {
+                        let err = BackendError::adapter_panicked(
+                            victim.clone(),
+                            "load task panicked mid-eviction; this victim's real state is unknown",
+                        );
+                        (victim, Err(err))
+                    })
+                    .collect(),
                 // A panic mid-flow leaves real state genuinely unknown —
                 // conservative like a failed best-effort release, not the
                 // "confirmed nothing happened" case.
@@ -1029,9 +1053,27 @@ async fn run_actor(
                     tokio::spawn(async move {
                         let _permit = permit;
                         let model = req.model.clone();
-                        let _ = reply.send(
-                            with_adapter_timeout(adapter.chat(req, cancel), timeout, &model).await,
-                        );
+                        // Same isolation shape as `start_load`/`start_unload`:
+                        // a panic in `adapter.chat` must not skip the
+                        // `ChatDone` send below, or `inflight` leaks forever
+                        // — wedging any pending drain and, with it,
+                        // `active_op` (Critical, Opus Tier-2 review, P6).
+                        let model_for_chat = model.clone();
+                        let inner = tokio::spawn(async move {
+                            with_adapter_timeout(
+                                adapter.chat(req, cancel),
+                                timeout,
+                                &model_for_chat,
+                            )
+                            .await
+                        });
+                        let result = match inner.await {
+                            Ok(result) => result,
+                            Err(join_err) => {
+                                Err(BackendError::adapter_panicked(&model, join_err.to_string()))
+                            }
+                        };
+                        let _ = reply.send(result);
                         if let Some(tx) = self_tx.upgrade() {
                             let _ = tx.send(ActorMsg::ChatDone { model }).await;
                         }
@@ -1178,6 +1220,19 @@ mod tests {
     use super::*;
     use crate::mock::MockAdapter;
     use crate::types::ModelInfo;
+
+    /// Wraps a call that a regression could make hang forever, so a
+    /// reintroduced bug fails *this test* (fast, whether real- or
+    /// paused-clock) instead of hanging the whole `cargo test` run — Opus
+    /// Tier-2 review, following up on the C1/C2 fixes.
+    async fn no_hang<F, T>(fut: F) -> T
+    where
+        F: std::future::Future<Output = T>,
+    {
+        tokio::time::timeout(std::time::Duration::from_secs(5), fut)
+            .await
+            .expect("must not hang")
+    }
 
     fn catalog() -> Vec<ModelInfo> {
         vec![ModelInfo {
@@ -1765,6 +1820,112 @@ mod tests {
             .expect("a follow-up unload of a must still work after the failed eviction");
     }
 
+    /// A minimal `RuntimeAdapter` whose `unload` panics for exactly one id
+    /// and succeeds for everything else — for exercising a panic that lands
+    /// *mid*-eviction-loop, after an earlier victim was already
+    /// successfully unloaded.
+    struct UnloadPanicsForOneIdAdapter {
+        panics_for: &'static str,
+        /// Panics exactly once, then behaves normally — a one-shot fault,
+        /// not a permanent one, so a later retry of the *same* id (e.g.
+        /// evicting it again for a different request) can still succeed.
+        already_panicked: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl RuntimeAdapter for UnloadPanicsForOneIdAdapter {
+        async fn list(&self) -> Result<Vec<ModelInfo>, BackendError> {
+            Ok(["a", "b", "c", "d"]
+                .into_iter()
+                .map(|id| ModelInfo {
+                    id: id.to_string(),
+                    memory_gb: 10.0,
+                })
+                .collect())
+        }
+        async fn load(&self, _id: &str, _policy: Option<&LoadPolicy>) -> Result<(), BackendError> {
+            Ok(())
+        }
+        async fn unload(&self, id: &str) -> Result<(), BackendError> {
+            if id == self.panics_for
+                && !self
+                    .already_panicked
+                    .swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                panic!("UnloadPanicsForOneIdAdapter panics once for {id} (test double)");
+            }
+            Ok(())
+        }
+        async fn status(&self) -> Result<BackendStatus, BackendError> {
+            Ok(BackendStatus {
+                pressure: Pressure::Ok,
+                used_gb: 0.0,
+                model_memory_max_gb: 0.0,
+                loaded: Vec::new(),
+            })
+        }
+        async fn probe_ready(&self, _id: &str) -> Result<bool, BackendError> {
+            Ok(true)
+        }
+        async fn chat(
+            &self,
+            req: ChatRequest,
+            _cancel: CancellationToken,
+        ) -> Result<ChatResponse, BackendError> {
+            Ok(ChatResponse {
+                model: req.model,
+                content: String::new(),
+            })
+        }
+    }
+
+    /// Medium (Opus Tier-2 review, probe P1d): a panic that lands
+    /// *mid*-eviction-loop (after "a" was already successfully unloaded,
+    /// before "b"'s own unload panics) must still resolve *every* chosen
+    /// victim, not just leave the not-yet-attempted ones dangling in
+    /// `Stopping` forever.
+    #[tokio::test]
+    async fn a_panic_mid_eviction_still_resolves_every_victim() {
+        let adapter = Arc::new(UnloadPanicsForOneIdAdapter {
+            panics_for: "b",
+            already_panicked: std::sync::atomic::AtomicBool::new(false),
+        });
+        let handle = Supervisor::spawn(
+            adapter,
+            SupervisorConfig {
+                budget_gb: 20.0,
+                ..SupervisorConfig::default()
+            },
+        )
+        .expect("spawn should succeed");
+        no_hang(handle.load("a", 10.0, on_demand_policy()))
+            .await
+            .expect("load a should succeed");
+        no_hang(handle.load("b", 10.0, on_demand_policy()))
+            .await
+            .expect("load b should succeed");
+        // c(20) requires evicting both a and b (LRU order: a, then b) —
+        // a's unload succeeds, b's panics mid-loop. c's own load is never
+        // even attempted, so it also settles on `Error` (unknown state).
+        let err = no_hang(handle.load("c", 20.0, on_demand_policy()))
+            .await
+            .expect_err("the panic mid-eviction must surface, not silently succeed");
+        assert_eq!(err.reason_code(), "adapter_panicked");
+        // The decisive check: `occupies_budget` treats `Stopping` and
+        // `Error` identically (both conservative), so `used_gb` alone
+        // can't tell "resolved to Error" apart from "left dangling in
+        // Stopping forever" — but *evictability* can: only `Error` (not
+        // `Stopping`) is a valid eviction candidate (H1). If any victim
+        // were left un-resolved in `Stopping`, only `c` (20 GiB, already
+        // `Error`) would be evictable — not enough to admit a 15 GiB
+        // request on top of an already-over-budget ledger. Every victim
+        // actually resolving to `Error` makes all 40 GiB (a+b+c)
+        // evictable, which is enough.
+        no_hang(handle.load("d", 15.0, on_demand_policy()))
+            .await
+            .expect("d must be admittable: a, b, and c must all have resolved to the (evictable) Error state, not be stuck un-resolved in Stopping");
+    }
+
     /// Nothing interleaves with an in-flight load that is evicting a
     /// victim: a concurrent request touching the victim while it's mid
     /// -eviction fails fast with `Busy`, the same as any other unrelated
@@ -1841,16 +2002,14 @@ mod tests {
         let adapter = Arc::new(PanickingAdapter);
         let handle =
             Supervisor::spawn(adapter, SupervisorConfig::default()).expect("spawn should succeed");
-        let err = handle
-            .load("a", 4.0, on_demand_policy())
+        let err = no_hang(handle.load("a", 4.0, on_demand_policy()))
             .await
             .expect_err("a panicking adapter call must surface as an error, not hang");
         assert_eq!(err.reason_code(), "adapter_panicked");
         // Negative contrast baked into the same test: if the panic *had*
         // wedged the Supervisor (active_op stuck `Some` forever), this
         // second, unrelated load would also fail with `Busy` — it must not.
-        handle
-            .load("a", 4.0, on_demand_policy())
+        no_hang(handle.load("a", 4.0, on_demand_policy()))
             .await
             .expect_err("still fails (PanickingAdapter always panics)");
     }
@@ -1873,15 +2032,86 @@ mod tests {
             },
         )
         .expect("spawn should succeed");
-        let err = handle
-            .load("a", 4.0, on_demand_policy())
+        let err = no_hang(handle.load("a", 4.0, on_demand_policy()))
             .await
             .expect_err("a hanging adapter call must time out, not hang forever");
         assert_eq!(err.reason_code(), "adapter_timed_out");
         // Negative contrast: the Supervisor must still be usable afterward
         // — a stuck `active_op` would make this also fail with `Busy`.
-        let models = handle.list().await.expect("list must still work");
+        let models = no_hang(handle.list()).await.expect("list must still work");
         assert_eq!(models, catalog());
+    }
+
+    /// A minimal `RuntimeAdapter` whose `chat` always panics (`load`/
+    /// `unload`/`probe_ready` all succeed normally) — for exercising the
+    /// panic-isolation path in the `Chat` dispatch specifically.
+    struct ChatPanicsAdapter;
+
+    #[async_trait::async_trait]
+    impl RuntimeAdapter for ChatPanicsAdapter {
+        async fn list(&self) -> Result<Vec<ModelInfo>, BackendError> {
+            Ok(two_model_catalog())
+        }
+        async fn load(&self, _id: &str, _policy: Option<&LoadPolicy>) -> Result<(), BackendError> {
+            Ok(())
+        }
+        async fn unload(&self, _id: &str) -> Result<(), BackendError> {
+            Ok(())
+        }
+        async fn status(&self) -> Result<BackendStatus, BackendError> {
+            Ok(BackendStatus {
+                pressure: Pressure::Ok,
+                used_gb: 0.0,
+                model_memory_max_gb: 0.0,
+                loaded: Vec::new(),
+            })
+        }
+        async fn probe_ready(&self, _id: &str) -> Result<bool, BackendError> {
+            Ok(true)
+        }
+        async fn chat(
+            &self,
+            _req: ChatRequest,
+            _cancel: CancellationToken,
+        ) -> Result<ChatResponse, BackendError> {
+            panic!("ChatPanicsAdapter::chat always panics (test double)");
+        }
+    }
+
+    /// Critical (Opus Tier-2 review, probe P6): a panicking `chat` call
+    /// must not leak `inflight` forever — otherwise a pending drain
+    /// (`unload` deferred behind it) never completes, `active_op` stays
+    /// stuck, and every *other* id reports `Busy` forever too. This is the
+    /// same class of bug as C1, but in the `Chat` dispatch, which C1's
+    /// original fix (`start_load`/`start_unload` only) didn't cover.
+    #[tokio::test]
+    async fn a_panicking_chat_does_not_leak_inflight_unload_completes_and_other_ids_stay_free() {
+        let adapter = Arc::new(ChatPanicsAdapter);
+        let handle =
+            Supervisor::spawn(adapter, SupervisorConfig::default()).expect("spawn should succeed");
+        no_hang(handle.load("a", 4.0, on_demand_policy()))
+            .await
+            .expect("load a should succeed");
+        let err = no_hang(handle.chat(
+            ChatRequest {
+                model: "a".to_string(),
+                messages: vec![],
+            },
+            CancellationToken::new(),
+        ))
+        .await
+        .expect_err("a panicking chat call must surface as an error, not hang");
+        assert_eq!(err.reason_code(), "adapter_panicked");
+        // If `inflight` had leaked, this would hang forever waiting for a
+        // drain that can never observe it reach 0.
+        no_hang(handle.unload("a"))
+            .await
+            .expect("unload must complete after the panicking chat, not hang forever");
+        // If `active_op` had stayed stuck on "a", this would report `Busy`
+        // instead of succeeding.
+        no_hang(handle.load("b", 4.0, on_demand_policy()))
+            .await
+            .expect("a different id must not be busy after the panicking chat");
     }
 
     /// C2: a model with an in-flight `chat` is never chosen as an
@@ -1909,13 +2139,12 @@ mod tests {
             .await
         });
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        let err = handle
-            .load("b", 20.0, on_demand_policy())
+        let err = no_hang(handle.load("b", 20.0, on_demand_policy()))
             .await
             .expect_err("a has an in-flight chat: nothing evictable, b cannot be admitted");
         assert_eq!(err.reason_code(), "eviction_impossible");
         assert_eq!(adapter.unload_call_count("a"), 0);
-        chat_a
+        no_hang(chat_a)
             .await
             .unwrap()
             .expect("the in-flight chat should still complete normally");
@@ -1955,22 +2184,21 @@ mod tests {
             0,
             "unload must not call the adapter while a chat is still in flight"
         );
-        let err = handle
-            .chat(
-                ChatRequest {
-                    model: "a".to_string(),
-                    messages: vec![],
-                },
-                CancellationToken::new(),
-            )
-            .await
-            .expect_err("a new chat during the drain (Stopping) must be rejected");
+        let err = no_hang(handle.chat(
+            ChatRequest {
+                model: "a".to_string(),
+                messages: vec![],
+            },
+            CancellationToken::new(),
+        ))
+        .await
+        .expect_err("a new chat during the drain (Stopping) must be rejected");
         assert_eq!(err.reason_code(), "model_unavailable");
-        chat_a
+        no_hang(chat_a)
             .await
             .unwrap()
             .expect("the original in-flight chat should still complete");
-        unload_a
+        no_hang(unload_a)
             .await
             .unwrap()
             .expect("unload should complete once the drain finishes");
