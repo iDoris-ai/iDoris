@@ -14,3 +14,6 @@ workspace = true
 idoris-contracts = { workspace = true }
 # 校验 endpoint host 需要真正的 WHATWG URL 解析——见 registry.rs::parse_endpoint。
 url = "2"
+
+[dev-dependencies]
+proptest = "1"
