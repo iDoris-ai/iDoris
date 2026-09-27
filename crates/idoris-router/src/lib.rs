@@ -103,25 +103,34 @@ pub struct HealthResponse {
 #[derive(Debug, Clone)]
 pub struct AppState {
     pub instance_id: String,
-    /// Number of registered components. Always `0` in the R1 skeleton —
-    /// nothing loads `config/components/*.yaml` yet.
-    pub components: usize,
     /// Resolved once at construction (from `IDORIS_DEPLOY_MODE`), not
     /// re-read per request — mirrors `RouterOptions.env` in `server.ts`:
     /// production reads real process env exactly once; tests override this
     /// field directly instead of mutating process-global env (which would
     /// race across parallel tests).
     pub deploy_mode: idoris_contracts::DeployMode,
+    /// Loaded once at startup via [`components::load_components`]; empty by
+    /// default (`AppState::default()` does no filesystem/env I/O, matching
+    /// every existing test's expectation of a `components: 0` `/health`
+    /// response with no real directory involved). `/health`'s `components`
+    /// count is always `cards.len()` — a single source of truth instead of
+    /// a separately-tracked counter that could drift from this list.
+    pub cards: Vec<idoris_contracts::ComponentCard>,
+    /// Backs the local dispatch path (R2-D task 3, a follow-up PR); `None`
+    /// means no local backend is wired — dispatch then fails closed as
+    /// `local_only_unavailable` rather than panicking on a missing handle.
+    pub supervisor: Option<idoris_backend::SupervisorHandle>,
 }
 
 impl Default for AppState {
     fn default() -> Self {
         Self {
             instance_id: Uuid::new_v4().to_string(),
-            components: 0,
             deploy_mode: profile::deploy_mode_from_env(
                 std::env::var("IDORIS_DEPLOY_MODE").ok().as_deref(),
             ),
+            cards: Vec::new(),
+            supervisor: None,
         }
     }
 }
@@ -148,7 +157,7 @@ async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         version: env!("CARGO_PKG_VERSION").to_string(),
         contract_version: idoris_contracts::CONTRACT_VERSION,
         instance_id: state.instance_id.clone(),
-        components: state.components,
+        components: state.cards.len(),
     })
 }
 
@@ -249,9 +258,40 @@ mod tests {
     use axum::body::Body;
     use axum::http::Request;
     use http_body_util::BodyExt;
+    use idoris_contracts::ComponentCard;
+    use idoris_contracts::common::{FallbackPolicy, PrivacyClass};
+    use idoris_contracts::component_card::{Egress, Form};
+    use idoris_contracts::provider::{Cost, Family, Locality, ProviderDescriptor};
     use tower::ServiceExt;
 
     use super::*;
+
+    fn sample_component_card(id: &str) -> ComponentCard {
+        ComponentCard {
+            provider: ProviderDescriptor {
+                id: id.to_string(),
+                family: Family::Local,
+                tier: idoris_contracts::common::Tier::Local,
+                capabilities: vec![idoris_contracts::common::Capability::Chat],
+                privacy_class: PrivacyClass::LocalOnly,
+                cost: Cost {
+                    input_per_m: 0.0,
+                    output_per_m: 0.0,
+                },
+                locality: Locality::Loopback,
+                extensions: None,
+            },
+            form: Form::HttpService,
+            endpoint: "http://127.0.0.1:8740".to_string(),
+            version_pin: "0.0.0".to_string(),
+            privacy_class: PrivacyClass::LocalOnly,
+            allowed_egress: vec![Egress::Loopback],
+            fallback_policy: FallbackPolicy::FailClosed,
+            fail_closed: true,
+            load_policy: None,
+            extensions: None,
+        }
+    }
 
     #[test]
     fn parse_port_defaults_when_unset_or_blank() {
@@ -303,6 +343,27 @@ mod tests {
         assert!(json["version"].is_string());
         assert!(json["instance_id"].is_string());
         assert_eq!(json["components"], 0);
+    }
+
+    #[tokio::test]
+    async fn health_components_count_reflects_loaded_cards() {
+        let state = AppState {
+            cards: vec![sample_component_card("a"), sample_component_card("b")],
+            ..AppState::default()
+        };
+        let app = build_app(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["components"], 2);
     }
 
     #[tokio::test]

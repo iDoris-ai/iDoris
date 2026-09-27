@@ -21,6 +21,7 @@ dev-mock = ["idoris-policy/dev-mock"]
 [dependencies]
 idoris-contracts = { workspace = true }
 idoris-policy = { workspace = true }
+idoris-backend = { workspace = true }
 axum = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }

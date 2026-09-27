@@ -589,6 +589,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "http-body-util",
+ "idoris-backend",
  "idoris-contracts",
  "idoris-policy",
  "serde",
