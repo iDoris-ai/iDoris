@@ -27,6 +27,8 @@ pub use types::{BackendStatus, ChatMessage, ChatRequest, ChatResponse, ModelInfo
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+    use idoris_contracts::LoadPolicy;
+    use idoris_contracts::load_policy::{Admission, Keepalive, LoadMode};
     use tokio_util::sync::CancellationToken;
 
     use super::*;
@@ -36,6 +38,22 @@ mod tests {
             id: "qwen3-8b".to_string(),
             memory_gb: 8.5,
         }]
+    }
+
+    fn on_demand_policy() -> LoadPolicy {
+        LoadPolicy {
+            mode: LoadMode::OnDemand,
+            keepalive: Keepalive::IdleTtl { idle_ttl_s: 300 },
+            admission: Admission::Coexist,
+        }
+    }
+
+    fn resident_policy() -> LoadPolicy {
+        LoadPolicy {
+            mode: LoadMode::Resident,
+            keepalive: Keepalive::Pinned { pinned: true },
+            admission: Admission::Coexist,
+        }
     }
 
     #[tokio::test]
@@ -80,6 +98,50 @@ mod tests {
             .expect("unload should succeed");
         let status = adapter.status().await.expect("status should succeed");
         assert!(status.loaded.is_empty());
+    }
+
+    /// A repeat `load` for an already-loaded model with a *different*
+    /// policy must actually take effect (see `adapter.rs`'s policy-scoped
+    /// idempotency contract) — not be silently swallowed as a no-op just
+    /// because the model was already loaded.
+    #[tokio::test]
+    async fn reloading_with_a_different_policy_updates_the_effective_policy() {
+        let adapter = MockAdapter::new(catalog());
+        adapter
+            .load("qwen3-8b", Some(&on_demand_policy()))
+            .await
+            .expect("load should succeed");
+        assert_eq!(
+            adapter.effective_policy("qwen3-8b"),
+            Ok(Some(on_demand_policy()))
+        );
+
+        adapter
+            .load("qwen3-8b", Some(&resident_policy()))
+            .await
+            .expect("re-load with a new policy should succeed");
+        assert_eq!(
+            adapter.effective_policy("qwen3-8b"),
+            Ok(Some(resident_policy())),
+            "the second load's policy must actually apply, not be dropped as a no-op"
+        );
+    }
+
+    /// Negative contrast: `unload` clears the recorded policy — a
+    /// subsequently reloaded model starts from a clean slate, not the
+    /// previous policy lingering around.
+    #[tokio::test]
+    async fn unload_clears_the_effective_policy() {
+        let adapter = MockAdapter::new(catalog());
+        adapter
+            .load("qwen3-8b", Some(&resident_policy()))
+            .await
+            .expect("load should succeed");
+        adapter
+            .unload("qwen3-8b")
+            .await
+            .expect("unload should succeed");
+        assert_eq!(adapter.effective_policy("qwen3-8b"), Ok(None));
     }
 
     #[tokio::test]
@@ -132,6 +194,10 @@ mod tests {
     #[tokio::test]
     async fn chat_echoes_the_last_message() {
         let adapter = MockAdapter::new(catalog());
+        adapter
+            .load("qwen3-8b", None)
+            .await
+            .expect("load should succeed");
         let response = adapter
             .chat(
                 ChatRequest {
@@ -147,6 +213,47 @@ mod tests {
             .expect("chat should succeed");
         assert_eq!(response.model, "qwen3-8b");
         assert!(response.content.contains("hello there"));
+    }
+
+    /// Negative contrast: the identical request, but the model was never
+    /// `load`ed — a real engine would reject this, so the test double must
+    /// too, rather than serving `chat` for any catalog id regardless of
+    /// whether it is actually loaded.
+    #[tokio::test]
+    async fn chat_to_a_known_but_unloaded_model_is_unavailable_not_served() {
+        let adapter = MockAdapter::new(catalog());
+        let err = adapter
+            .chat(
+                ChatRequest {
+                    model: "qwen3-8b".to_string(),
+                    messages: vec![ChatMessage {
+                        role: "user".to_string(),
+                        content: "hello there".to_string(),
+                    }],
+                },
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("chat to an unloaded model must not be served");
+        assert_eq!(err.reason_code(), "model_unavailable");
+    }
+
+    /// Further negative contrast: a model the catalog has never heard of at
+    /// all gets the more specific `model_not_found`, not `model_unavailable`.
+    #[tokio::test]
+    async fn chat_to_an_unknown_model_is_not_found() {
+        let adapter = MockAdapter::new(catalog());
+        let err = adapter
+            .chat(
+                ChatRequest {
+                    model: "does-not-exist".to_string(),
+                    messages: vec![],
+                },
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("chat to an unknown model must fail");
+        assert_eq!(err.reason_code(), "model_not_found");
     }
 
     #[test]

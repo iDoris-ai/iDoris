@@ -16,11 +16,10 @@
 //! split these into two types (`AdapterError` + a `SupervisorError` that
 //! wraps it) so the type system — not just doc comments — stops an adapter
 //! implementation from fabricating `SupervisorUnavailable`. We are not
-//! doing that split yet: today there is exactly one backend implementation
-//! in this crate (`mock.rs`'s test double, soon renamed `MockAdapter` when
-//! the R2-A `RuntimeAdapter` trait lands in a follow-up PR — plain text,
-//! not an intra-doc link, since those types don't exist in this crate yet)
-//! and no external consumer of `BackendError`, so the split's benefit is
+//! doing that split yet: today there is exactly one implementation of
+//! [`crate::adapter::RuntimeAdapter`] in this crate ([`crate::mock::MockAdapter`],
+//! a test double) and no external consumer of `BackendError`, so the
+//! split's benefit is
 //! currently theoretical while its cost (touching every signature in the
 //! adapter trait, its implementations, and the Supervisor) is not. Revisit
 //! this once a second real adapter (e.g. oMLX) or an external consumer

@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-description = "Engine-agnostic ModelBackend trait — 1:1 with packages/adapters/src/backend.ts."
+description = "Engine-agnostic RuntimeAdapter trait for local inference runtimes (formerly ModelBackend), loosely mirroring packages/adapters/src/backend.ts."
 
 [lints]
 workspace = true
