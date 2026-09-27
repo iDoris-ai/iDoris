@@ -3,15 +3,16 @@
 //! `idoris_backend::RuntimeAdapter`. Talks to `http://127.0.0.1:8088` by
 //! default. Split across submodules landing across several PRs on this
 //! stack: [`http`] (GET/POST/PUT + timeout + safe errors), [`status`]
-//! (`list`/`status` parsing), `pin` (follow-up PR, resident/admin-session
-//! gap), and [`OmlxAdapter`] (this PR) wiring `list`/`status` together —
+//! (`list`/`status` parsing), [`pin`] (this PR, resident/admin-session
+//! gap), and [`OmlxAdapter`] wiring `list`/`status` together —
 //! `load`/`unload`/`probe_ready`/`chat`, and the actual `RuntimeAdapter`
-//! impl, follow once `pin` lands.
+//! impl, follow in the next PRs.
 //!
 //! **The API key is read from an env var and never logged** — see
 //! [`OMLX_API_KEY_ENV`] and `http`'s module doc.
 
 mod http;
+mod pin;
 mod status;
 
 use std::time::Duration;
