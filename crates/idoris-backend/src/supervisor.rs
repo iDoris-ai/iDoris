@@ -5,11 +5,10 @@
 //! **one tokio task holds all state**; every other task talks to it only
 //! through [`SupervisorHandle`]'s mpsc-backed commands.
 //!
-//! This PR adds `load`: singleflight (same-id + identical policy merge),
-//! an OOM circuit breaker (one self-healing retry, §4 "熔断"), and
-//! `probe_ready` polling for `Loading -> Ready`. `unload`, eviction, and
-//! a real wait queue are follow-ups — a different id fails fast with
-//! `BackendError::Busy` meanwhile, and capacity isn't checked yet.
+//! This PR adds `unload` alongside the `load` from the previous PR, both
+//! sharing the same global load/evict mutex (§4). Eviction execution and a
+//! real wait queue are follow-ups — a second id fails fast with
+//! `BackendError::Busy` meanwhile, and capacity still isn't checked.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -79,12 +78,17 @@ enum Command {
         policy: LoadPolicy,
         reply: LoadReply,
     },
+    Unload {
+        id: String,
+        reply: LoadReply,
+    },
 }
 
-/// What a background load op reports to the single-writer loop; only the
-/// loop applies this to `models` (`unload` lands in a follow-up PR).
+/// What a background op reports to the single-writer loop; only the loop
+/// applies this to `models`.
 enum OpOutcome {
     Load { result: Result<(), BackendError> },
+    Unload { result: Result<(), BackendError> },
 }
 
 enum ActorMsg {
@@ -95,6 +99,9 @@ enum ActorMsg {
 enum ActiveKind {
     Load {
         policy: LoadPolicy,
+        waiters: Vec<LoadReply>,
+    },
+    Unload {
         waiters: Vec<LoadReply>,
     },
 }
@@ -158,6 +165,17 @@ impl SupervisorHandle {
             id: id.into(),
             memory_gb,
             policy,
+            reply,
+        }))
+        .await?;
+        rx.await
+            .map_err(|_| BackendError::supervisor_unavailable())?
+    }
+
+    pub async fn unload(&self, id: impl Into<String>) -> Result<(), BackendError> {
+        let (reply, rx) = oneshot::channel();
+        self.send(ActorMsg::Cmd(Command::Unload {
+            id: id.into(),
             reply,
         }))
         .await?;
@@ -359,6 +377,75 @@ fn handle_load(
     start_load(id, policy, models, env);
 }
 
+/// The pure-IO side of an unload. Post-unload memory-release confirmation
+/// (poll, fall back to an estimate on timeout) has no consumer yet — it
+/// lands with eviction execution in a follow-up PR, which is what actually
+/// needs to know freed capacity is real before admitting a new load.
+fn start_unload(id: String, env: &Env<'_>) {
+    let adapter = env.adapter.clone();
+    let self_tx = env.self_tx.clone();
+    tokio::spawn(async move {
+        let result = adapter.unload(&id).await;
+        let _ = self_tx
+            .send(ActorMsg::OpDone {
+                id,
+                outcome: OpOutcome::Unload { result },
+            })
+            .await;
+    });
+}
+
+/// Handles `Command::Unload`, sharing `handle_load`'s global mutex and
+/// singleflight discipline: concurrent unloads of the same id merge, an
+/// unrelated id in flight fails fast with `Busy`, and an already-`Stopped`
+/// id is a no-op checked before the busy-fallback (same ordering lesson as
+/// `handle_load`'s already-Ready check).
+fn handle_unload(
+    id: String,
+    reply: LoadReply,
+    models: &mut HashMap<String, ModelSlot>,
+    active_op: &mut Option<ActiveOp>,
+    env: &Env<'_>,
+) {
+    if let Some(active) = active_op.as_mut()
+        && active.id == id
+    {
+        match &mut active.kind {
+            ActiveKind::Unload { waiters } => waiters.push(reply),
+            ActiveKind::Load { .. } => {
+                let _ = reply.send(Err(BackendError::busy()));
+            }
+        }
+        return;
+    }
+    // Decided without the mutex, and before it, so neither answer can be
+    // masked by an unrelated id's `Busy` (mirrors `handle_load`'s ordering
+    // lesson: a decidable-without-IO fact must not be hidden behind it).
+    match models.get(&id).map(|slot| slot.state) {
+        None => {
+            let _ = reply.send(Err(BackendError::model_not_found(&id)));
+            return;
+        }
+        Some(ModelState::Stopped) => {
+            let _ = reply.send(Ok(()));
+            return;
+        }
+        Some(_) => {}
+    }
+    if active_op.is_some() {
+        let _ = reply.send(Err(BackendError::busy()));
+        return;
+    }
+    set_state_or_panic(models, &id, ModelState::Stopping);
+    *active_op = Some(ActiveOp {
+        id: id.clone(),
+        kind: ActiveKind::Unload {
+            waiters: vec![reply],
+        },
+    });
+    start_unload(id, env);
+}
+
 async fn run_actor(
     adapter: Arc<dyn RuntimeAdapter>,
     config: SupervisorConfig,
@@ -456,23 +543,32 @@ async fn run_actor(
                 );
             }
 
+            ActorMsg::Cmd(Command::Unload { id, reply }) => {
+                handle_unload(id, reply, &mut models, &mut active_op, &env);
+            }
+
             ActorMsg::OpDone { id, outcome } => {
-                let OpOutcome::Load { result } = outcome;
+                let (result, done_state) = match outcome {
+                    OpOutcome::Load { result } => (result, ModelState::Ready),
+                    OpOutcome::Unload { result } => (result, ModelState::Stopped),
+                };
                 match &result {
                     Ok(()) => {
                         next_seq += 1;
                         if let Some(slot) = models.get_mut(&id) {
-                            slot.state = ModelState::Ready;
-                            slot.last_used_seq = next_seq;
+                            slot.state = done_state;
+                            if done_state == ModelState::Ready {
+                                slot.last_used_seq = next_seq;
+                            }
                         } else {
-                            panic!("Supervisor invariant violated: ledger lost {id:?} mid-load");
+                            panic!("Supervisor invariant violated: ledger lost {id:?} mid-op");
                         }
                     }
                     Err(_) => set_state_or_panic(&mut models, &id, ModelState::Error),
                 }
                 let waiters = match active_op.take() {
                     Some(ActiveOp {
-                        kind: ActiveKind::Load { waiters, .. },
+                        kind: ActiveKind::Load { waiters, .. } | ActiveKind::Unload { waiters },
                         ..
                     }) => waiters,
                     None => panic!("Supervisor invariant violated: OpDone with no active op"),
