@@ -272,4 +272,5 @@ pub fn decide(
     })
 }
 
-// 场景测试（`tests.rs`）在下一个 PR 里加入。
+#[cfg(test)]
+mod tests;
