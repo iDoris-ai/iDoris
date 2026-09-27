@@ -44,6 +44,11 @@ pub struct ModelEntry {
     /// eviction regardless of how stale its `last_used_seq` is.
     pub pinned: bool,
     pub last_used_seq: u64,
+    /// Number of `chat` calls currently dispatched to this model. Nonzero
+    /// means real, in-progress work would be aborted mid-flight — never a
+    /// candidate for eviction, same as `pinned`, regardless of how stale
+    /// `last_used_seq` is.
+    pub inflight: u32,
 }
 
 /// The ledger `plan_eviction` reasons over. `budget_gb` is the configured
@@ -69,7 +74,8 @@ pub enum EvictionPlan {
     /// Enough budget is free; load without evicting anything.
     NotNeeded,
     /// Evict exactly these ids, in this order (oldest-used first), then
-    /// load. Every id here is `Ready` and unpinned at snapshot time.
+    /// load. Every id here is `Ready` or `Error`, unpinned, and had no
+    /// in-flight `chat` calls at snapshot time.
     Evict(Vec<String>),
 }
 
@@ -157,7 +163,7 @@ fn validate_capacity(field: &'static str, value: f64) -> Result<(), PlanEviction
 /// - `Launching` (queued, adapter never yet called) and `Stopped`
 ///   (confirmed released) are the only states that do **not** occupy
 ///   budget.
-fn occupies_budget(state: ModelState) -> bool {
+pub(crate) fn occupies_budget(state: ModelState) -> bool {
     matches!(
         state,
         ModelState::Loading | ModelState::Ready | ModelState::Stopping | ModelState::Error
@@ -217,7 +223,18 @@ pub fn plan_eviction(state: &Snapshot, need: ModelReq) -> Result<EvictionPlan, P
         // block reaching a candidate that actually matters. Excluding them
         // here, not just relying on them naturally sorting last, keeps the
         // loop below from ever choosing a no-op eviction.
-        .filter(|m| m.state == ModelState::Ready && !m.pinned && m.memory_gb > 0.0)
+        .filter(|m| {
+            // `Error` is included (Opus Tier-2 review, H1): a model stuck
+            // in `Error` is doing no useful work and, unlike `Ready`, was
+            // never a candidate before — meaning it could occupy budget
+            // forever with no automatic way to reclaim it, surfacing as a
+            // misleading `EvictionImpossible` for some unrelated future
+            // load instead of the real problem (a stuck, uncleaned entry).
+            (m.state == ModelState::Ready || m.state == ModelState::Error)
+                && !m.pinned
+                && m.memory_gb > 0.0
+                && m.inflight == 0
+        })
         .collect();
     // LRU: evict the least-recently-used first. `last_used_seq` is a
     // Supervisor-maintained monotonic counter, never wall-clock time (see
@@ -248,4 +265,304 @@ pub fn plan_eviction(state: &Snapshot, need: ModelReq) -> Result<EvictionPlan, P
     }
 
     Ok(EvictionPlan::Evict(chosen))
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+
+    fn entry(id: &str, memory_gb: f64, state: ModelState, pinned: bool, seq: u64) -> ModelEntry {
+        ModelEntry {
+            id: id.to_string(),
+            memory_gb,
+            state,
+            pinned,
+            last_used_seq: seq,
+            inflight: 0,
+        }
+    }
+
+    fn req(id: &str, memory_gb: f64) -> ModelReq {
+        ModelReq {
+            id: id.to_string(),
+            memory_gb,
+        }
+    }
+
+    #[test]
+    fn sufficient_capacity_needs_no_eviction() {
+        let snap = Snapshot {
+            budget_gb: 24.0,
+            models: vec![entry("a", 8.0, ModelState::Ready, false, 1)],
+        };
+        assert_eq!(
+            plan_eviction(&snap, req("b", 8.0)),
+            Ok(EvictionPlan::NotNeeded)
+        );
+    }
+
+    /// Negative contrast: same layout, but the request no longer fits.
+    #[test]
+    fn insufficient_capacity_triggers_a_plan() {
+        let snap = Snapshot {
+            budget_gb: 24.0,
+            models: vec![entry("a", 20.0, ModelState::Ready, false, 1)],
+        };
+        assert_eq!(
+            plan_eviction(&snap, req("b", 8.0)),
+            Ok(EvictionPlan::Evict(vec!["a".to_string()]))
+        );
+    }
+
+    #[test]
+    fn lru_evicts_the_oldest_used_model_first() {
+        let snap = Snapshot {
+            budget_gb: 10.0,
+            models: vec![
+                entry("a", 4.0, ModelState::Ready, false, 1),
+                entry("b", 4.0, ModelState::Ready, false, 2),
+            ],
+        };
+        // Only one of the two needs to go to fit "need"; LRU picks the
+        // lower `last_used_seq`, "a".
+        let plan = plan_eviction(&snap, req("need", 5.0)).expect("plan should succeed");
+        assert_eq!(plan, EvictionPlan::Evict(vec!["a".to_string()]));
+    }
+
+    /// Negative contrast: same ids/vec order, swapped seqs — the choice
+    /// must flip too, ruling out sorting by id/vec order instead of seq.
+    #[test]
+    fn lru_follows_last_used_seq_not_id_or_vec_order() {
+        let snap = Snapshot {
+            budget_gb: 10.0,
+            models: vec![
+                entry("a", 4.0, ModelState::Ready, false, 2),
+                entry("b", 4.0, ModelState::Ready, false, 1),
+            ],
+        };
+        let plan = plan_eviction(&snap, req("need", 5.0)).expect("plan should succeed");
+        assert_eq!(plan, EvictionPlan::Evict(vec!["b".to_string()]));
+    }
+
+    /// Must pick as many LRU candidates as needed and stop once covered.
+    #[test]
+    fn lru_evicts_multiple_oldest_models_until_the_shortfall_is_covered() {
+        let snap = Snapshot {
+            budget_gb: 12.0,
+            models: vec![
+                entry("oldest", 4.0, ModelState::Ready, false, 1),
+                entry("middle", 4.0, ModelState::Ready, false, 2),
+                entry("newest", 4.0, ModelState::Ready, false, 3),
+            ],
+        };
+        // occupied=12, available=0, need=7 => shortfall=7: "oldest" alone
+        // (4.0) isn't enough, "oldest"+"middle" (8.0) is — "newest" must
+        // not be touched.
+        let plan = plan_eviction(&snap, req("need", 7.0)).expect("plan should succeed");
+        assert_eq!(
+            plan,
+            EvictionPlan::Evict(vec!["oldest".to_string(), "middle".to_string()])
+        );
+    }
+
+    #[test]
+    fn pinned_models_are_never_evicted_even_when_oldest() {
+        let snap = Snapshot {
+            budget_gb: 10.0,
+            models: vec![
+                entry("pinned-old", 4.0, ModelState::Ready, true, 1),
+                entry("unpinned-newer", 4.0, ModelState::Ready, false, 2),
+            ],
+        };
+        let plan = plan_eviction(&snap, req("need", 5.0)).expect("plan should succeed");
+        assert_eq!(
+            plan,
+            EvictionPlan::Evict(vec!["unpinned-newer".to_string()])
+        );
+    }
+
+    /// Negative contrast: un-pin it and it becomes the LRU choice again.
+    #[test]
+    fn unpinning_the_oldest_model_makes_it_evictable_again() {
+        let snap = Snapshot {
+            budget_gb: 10.0,
+            models: vec![
+                entry("formerly-pinned-old", 4.0, ModelState::Ready, false, 1),
+                entry("unpinned-newer", 4.0, ModelState::Ready, false, 2),
+            ],
+        };
+        let plan = plan_eviction(&snap, req("need", 5.0)).expect("plan should succeed");
+        assert_eq!(
+            plan,
+            EvictionPlan::Evict(vec!["formerly-pinned-old".to_string()])
+        );
+    }
+
+    #[test]
+    fn no_evictable_candidates_is_an_explicit_error() {
+        let snap = Snapshot {
+            budget_gb: 10.0,
+            models: vec![entry("pinned", 8.0, ModelState::Ready, true, 1)],
+        };
+        let err = plan_eviction(&snap, req("need", 5.0)).expect_err("must fail, not guess");
+        assert_eq!(err.reason_code(), "eviction_impossible");
+        assert_eq!(
+            err,
+            PlanEvictionError::InsufficientCapacity {
+                model_id: "need".to_string(),
+                shortfall_gb: 3.0,
+                budget_gb: 10.0,
+                evictable_gb: 0.0,
+            }
+        );
+    }
+
+    /// Negative contrast: same pinned model, but enough spare budget that
+    /// no eviction is needed at all.
+    #[test]
+    fn sufficient_budget_needs_no_eviction_even_with_a_pinned_model_present() {
+        let snap = Snapshot {
+            budget_gb: 20.0,
+            models: vec![entry("pinned", 8.0, ModelState::Ready, true, 1)],
+        };
+        assert_eq!(
+            plan_eviction(&snap, req("need", 5.0)),
+            Ok(EvictionPlan::NotNeeded)
+        );
+    }
+
+    #[test]
+    fn launching_models_do_not_count_against_the_budget() {
+        // A model queued behind another op ("Launching") hasn't started
+        // consuming memory yet, so it must not block admission.
+        let snap = Snapshot {
+            budget_gb: 10.0,
+            models: vec![entry("queued", 9.0, ModelState::Launching, false, 1)],
+        };
+        assert_eq!(
+            plan_eviction(&snap, req("need", 5.0)),
+            Ok(EvictionPlan::NotNeeded)
+        );
+    }
+
+    #[test]
+    fn loading_models_do_count_against_the_budget() {
+        let snap = Snapshot {
+            budget_gb: 10.0,
+            models: vec![entry("in-flight", 9.0, ModelState::Loading, false, 1)],
+        };
+        let err = plan_eviction(&snap, req("need", 5.0)).expect_err("must fail, not guess");
+        assert_eq!(err.reason_code(), "eviction_impossible");
+    }
+
+    /// `Stopping` (not yet confirmed released) must still count.
+    #[test]
+    fn stopping_models_still_count_against_the_budget() {
+        let snap = Snapshot {
+            budget_gb: 10.0,
+            models: vec![entry("mid-unload", 9.0, ModelState::Stopping, false, 1)],
+        };
+        let err = plan_eviction(&snap, req("need", 5.0)).expect_err("must fail, not guess");
+        assert_eq!(err.reason_code(), "eviction_impossible");
+    }
+
+    /// Negative contrast: once `Stopped`, it no longer counts.
+    #[test]
+    fn stopped_models_do_not_count_against_the_budget() {
+        let snap = Snapshot {
+            budget_gb: 10.0,
+            models: vec![entry("released", 9.0, ModelState::Stopped, false, 1)],
+        };
+        assert_eq!(
+            plan_eviction(&snap, req("need", 5.0)),
+            Ok(EvictionPlan::NotNeeded)
+        );
+    }
+
+    /// `Error` state is uncertain — conservatively, it must still count.
+    #[test]
+    fn error_state_models_still_count_against_the_budget() {
+        let snap = Snapshot {
+            budget_gb: 10.0,
+            models: vec![entry("uncertain", 9.0, ModelState::Error, false, 1)],
+        };
+        // If `Error` didn't occupy budget, all 10 GiB would be free and
+        // this would need no eviction at all (`NotNeeded`). Because `Error`
+        // still counts (`occupies_budget`'s documented conservatism), only
+        // 1 GiB is free, forcing eviction — and per H1 (Opus Tier-2
+        // review), an `Error` entry is itself now a valid candidate rather
+        // than occupying budget forever with no way to reclaim it.
+        let plan = plan_eviction(&snap, req("need", 5.0)).expect("uncertain is now evictable");
+        assert_eq!(plan, EvictionPlan::Evict(vec!["uncertain".to_string()]));
+    }
+
+    #[test]
+    fn zero_capacity_candidates_are_never_chosen() {
+        let snap = Snapshot {
+            budget_gb: 10.0,
+            models: vec![
+                entry("zero", 0.0, ModelState::Ready, false, 1),
+                entry("nonzero", 6.0, ModelState::Ready, false, 2),
+            ],
+        };
+        // "zero" is older (lower seq), so a buggy implementation that
+        // doesn't exclude it would pick it *first*, producing
+        // `Evict(["zero", "nonzero"])` (freeing 0 from "zero" never
+        // satisfies the shortfall on its own, so it would fall through to
+        // "nonzero" too). Excluding "zero" up front means only "nonzero" is
+        // ever a candidate.
+        let plan = plan_eviction(&snap, req("need", 5.0)).expect("plan should succeed");
+        assert_eq!(plan, EvictionPlan::Evict(vec!["nonzero".to_string()]));
+    }
+
+    /// Negative contrast: give it real capacity — now a valid candidate.
+    #[test]
+    fn a_formerly_zero_capacity_model_becomes_evictable_once_it_has_real_capacity() {
+        let snap = Snapshot {
+            budget_gb: 10.0,
+            models: vec![
+                entry("was-zero", 6.0, ModelState::Ready, false, 1),
+                entry("nonzero", 6.0, ModelState::Ready, false, 2),
+            ],
+        };
+        let plan = plan_eviction(&snap, req("need", 3.0)).expect("plan should succeed");
+        assert_eq!(plan, EvictionPlan::Evict(vec!["was-zero".to_string()]));
+    }
+
+    #[test]
+    fn nan_budget_is_rejected_not_silently_miscomputed() {
+        let snap = Snapshot {
+            budget_gb: f64::NAN,
+            models: vec![],
+        };
+        let err = plan_eviction(&snap, req("need", 5.0)).expect_err("NaN must be rejected");
+        assert_eq!(err.reason_code(), "invalid_capacity_value");
+    }
+
+    #[test]
+    fn negative_model_memory_is_rejected() {
+        let snap = Snapshot {
+            budget_gb: 10.0,
+            models: vec![entry("bogus", -1.0, ModelState::Ready, false, 1)],
+        };
+        let err = plan_eviction(&snap, req("need", 5.0)).expect_err("negative must be rejected");
+        assert_eq!(err.reason_code(), "invalid_capacity_value");
+    }
+
+    // (Negative contrast — valid values succeeding — is already covered by
+    // every other test in this module, e.g. `sufficient_capacity_needs_no_eviction`.)
+
+    /// Negative contrast: every other test above omits `need.id`.
+    #[test]
+    fn snapshot_containing_the_requested_model_is_a_hard_error() {
+        let snap = Snapshot {
+            budget_gb: 10.0,
+            models: vec![entry("need", 5.0, ModelState::Ready, false, 1)],
+        };
+        let err =
+            plan_eviction(&snap, req("need", 5.0)).expect_err("must fail, not silently filter");
+        assert_eq!(err.reason_code(), "snapshot_contains_requested_model");
+    }
 }
