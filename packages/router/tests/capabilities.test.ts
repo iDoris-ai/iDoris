@@ -1,7 +1,7 @@
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { describe, expect, it } from "vitest";
-import { MockBackend } from "@idoris/adapters";
+import { describe, expect, it, vi } from "vitest";
+import { MockBackend, type ModelBackend } from "@idoris/adapters";
 import { validateComponentCard } from "@idoris/contracts";
 import type { Catalog, HostFacts, RecommenderPolicy } from "@idoris/recommender";
 import { DefaultCapabilitiesProvider, type CapabilityEntry } from "../src/capabilities.js";
@@ -129,6 +129,54 @@ describe("T2.2.1 /capabilities 条目", () => {
       for (const entry of entries) assertEntry(entry);
     } finally {
       await router.close();
+    }
+  });
+
+  it("M-b: 一个后端 status() 抛错时，queueDepth 不计它但会 console.warn 一行（带后端名和错误类型，不带内容）", async () => {
+    const registered = makeRegistered();
+    const failingBackend: ModelBackend = {
+      list: async () => [],
+      load: async () => {},
+      unload: async () => {},
+      admission: async () => "requires_eviction",
+      status: async () => {
+        throw new Error("secret internal detail that must not leak into the log");
+      },
+      chat: async (req) => ({ model: req.model, content: "" }),
+    };
+    const brokenCard = validateComponentCard({
+      provider: {
+        id: "omlx",
+        family: "local",
+        tier: "local",
+        capabilities: ["chat"],
+        privacy_class: "local_only",
+        cost: { input_per_m: 0, output_per_m: 0 },
+        locality: "loopback",
+      },
+      form: "http_service",
+      endpoint: "http://127.0.0.1:8088",
+      version_pin: "omlx@0.6.4",
+      privacy_class: "local_only",
+      allowed_egress: ["loopback"],
+      fallback_policy: "fail_closed",
+      fail_closed: true,
+      load_policy: { mode: "on_demand", keepalive: { idle_ttl_s: 300 }, admission: "requires_eviction" },
+    });
+    registered.push({ card: brokenCard, backend: failingBackend });
+
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const provider = new DefaultCapabilitiesProvider({ registered, catalog, hardware, policy });
+      const entries = await provider.snapshot();
+      expect(entries.length).toBeGreaterThan(0); // 容量接口仍可用
+      expect(warnSpy).toHaveBeenCalledTimes(1);
+      const warned = String(warnSpy.mock.calls[0]?.[0]);
+      expect(warned).toContain("omlx"); // 带后端名
+      expect(warned).toContain("Error"); // 带错误类型
+      expect(warned).not.toContain("secret internal detail"); // 不带内容
+    } finally {
+      warnSpy.mockRestore();
     }
   });
 });

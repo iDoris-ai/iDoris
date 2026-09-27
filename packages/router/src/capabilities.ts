@@ -152,12 +152,18 @@ export class DefaultCapabilitiesProvider implements CapabilitiesProvider {
   /** backend.status() → 队列深度。单个后端不可达不阻塞整个容量接口。 */
   private async queueDepth(): Promise<number> {
     let depth = 0;
-    for (const { backend } of this.registered) {
+    for (const { card, backend } of this.registered) {
       try {
         const status = await backend.status();
         depth += status.loaded.length;
-      } catch {
-        // 忽略：不可达后端不贡献队列深度，容量接口仍可用。
+      } catch (err) {
+        // 不可达/出错的后端不贡献队列深度，容量接口仍可用；但静默吞掉会让排查无从下手（M-b），
+        // 所以至少打一行警告——只带后端名和错误类型，不带 err.message/内容，避免把后端的
+        // 原始响应细节当日志泄露出去。
+        console.warn(
+          `[idoris] capabilities: backend "${card.provider.id}".status() failed ` +
+            `(${err instanceof Error ? err.constructor.name : typeof err}), excluded from queue depth`,
+        );
       }
     }
     return depth;

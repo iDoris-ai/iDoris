@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { OmlxBackend, OmlxPinUnavailableError } from "../omlx/omlx-backend.js";
+import { OmlxBackend, OmlxPinUnavailableError, OmlxUnexpectedlyPinnedError } from "../omlx/omlx-backend.js";
 
 const jsonRes = (body: unknown, status = 200) => ({
   ok: status < 400,
@@ -7,6 +7,9 @@ const jsonRes = (body: unknown, status = 200) => ({
   json: async () => body,
   text: async () => JSON.stringify(body),
 });
+
+/** `/v1/models/status` 的最小合法响应：只声明测试关心的那一个模型的 pinned 状态。 */
+const modelsStatusRes = (id: string, pinned: boolean) => jsonRes({ models: [{ id, pinned }] });
 
 describe("OmlxBackend", () => {
   it("lists models from /v1/models", async () => {
@@ -17,7 +20,7 @@ describe("OmlxBackend", () => {
   });
 
   describe("load(resident) pin via PUT /admin/api/models/{id}/settings (0.6.4, body only per openapi schema, untested)", () => {
-    it("PUTs the flat {is_pinned:true} body to the new endpoint", async () => {
+    it("PUTs the flat {is_pinned:true} body to the new endpoint, and does NOT check /v1/models/status afterwards", async () => {
       const calls: Array<[string, string | undefined, unknown]> = [];
       const f = vi.fn(async (url: string, init?: { method?: string; body?: string }) => {
         calls.push([url, init?.method, init?.body]);
@@ -25,8 +28,10 @@ describe("OmlxBackend", () => {
       });
       const b = new OmlxBackend({ fetchImpl: f as never });
       await b.load("Qwen3-8B", { mode: "resident", keepalive: { pinned: true }, admission: "coexist" });
-      expect(calls[0]?.[0]).toBe("http://127.0.0.1:8088/v1/models/Qwen3-8B/load");
-      expect(calls[1]?.[0]).toBe("http://127.0.0.1:8088/admin/api/models/Qwen3-8B/settings");
+      expect(calls.map((c) => c[0])).toEqual([
+        "http://127.0.0.1:8088/v1/models/Qwen3-8B/load",
+        "http://127.0.0.1:8088/admin/api/models/Qwen3-8B/settings",
+      ]);
       expect(calls[1]?.[1]).toBe("PUT"); // L2: 显式断言 method=PUT，不是 POST
       expect(String(calls[1]?.[2])).toBe('{"is_pinned":true}');
     });
@@ -51,26 +56,79 @@ describe("OmlxBackend", () => {
     });
   });
 
-  it("load(on_demand) does NOT call the pin/settings endpoint at all (H1: unpinned is 0.6.4's default state for a freshly-loaded model)", async () => {
-    const calls: string[] = [];
-    const f = vi.fn(async (url: string) => {
-      calls.push(url);
-      return jsonRes({});
+  describe("load(non-resident) 加载完成后核对是否被外部 pin 住（H-a）", () => {
+    it("on_demand: 不调用 pin/settings 端点，但会读 GET /v1/models/status", async () => {
+      const calls: string[] = [];
+      const f = vi.fn(async (url: string) => {
+        calls.push(url);
+        if (url.endsWith("/v1/models/status")) return modelsStatusRes("VL-7B", false);
+        return jsonRes({});
+      });
+      const b = new OmlxBackend({ fetchImpl: f as never });
+      await b.load("VL-7B", { mode: "on_demand", keepalive: { idle_ttl_s: 300 }, admission: "requires_eviction" });
+      expect(calls).toEqual([
+        "http://127.0.0.1:8088/v1/models/VL-7B/load",
+        "http://127.0.0.1:8088/v1/models/status",
+      ]);
     });
-    const b = new OmlxBackend({ fetchImpl: f as never });
-    await b.load("VL-7B", { mode: "on_demand", keepalive: { idle_ttl_s: 300 }, admission: "requires_eviction" });
-    expect(calls).toEqual(["http://127.0.0.1:8088/v1/models/VL-7B/load"]);
-  });
 
-  it("load(no policy) does NOT call the pin/settings endpoint either", async () => {
-    const calls: string[] = [];
-    const f = vi.fn(async (url: string) => {
-      calls.push(url);
-      return jsonRes({});
+    it("未传 policy 时同样会核对 /v1/models/status", async () => {
+      const calls: string[] = [];
+      const f = vi.fn(async (url: string) => {
+        calls.push(url);
+        if (url.endsWith("/v1/models/status")) return modelsStatusRes("VL-7B", false);
+        return jsonRes({});
+      });
+      const b = new OmlxBackend({ fetchImpl: f as never });
+      await b.load("VL-7B");
+      expect(calls).toEqual([
+        "http://127.0.0.1:8088/v1/models/VL-7B/load",
+        "http://127.0.0.1:8088/v1/models/status",
+      ]);
     });
-    const b = new OmlxBackend({ fetchImpl: f as never });
-    await b.load("VL-7B");
-    expect(calls).toEqual(["http://127.0.0.1:8088/v1/models/VL-7B/load"]);
+
+    it("H-a 正对照：/v1/models/status 报告 pinned:false 时 load(on_demand) 正常 resolve", async () => {
+      const f = vi.fn(async (url: string) => {
+        if (url.endsWith("/load")) return jsonRes({ status: "ok" });
+        if (url.endsWith("/v1/models/status")) return modelsStatusRes("Qwen3-8B", false);
+        throw new Error("unexpected url: " + url);
+      });
+      const b = new OmlxBackend({ fetchImpl: f as never });
+      await expect(
+        b.load("Qwen3-8B", { mode: "on_demand", keepalive: { idle_ttl_s: 300 }, admission: "requires_eviction" }),
+      ).resolves.toBeUndefined();
+    });
+
+    it("H-a 负对照：/v1/models/status 报告 pinned:true 时 load(on_demand) 以 OmlxUnexpectedlyPinnedError reject（模型可能是被 oMLX 管理页手动 pin 过，或 pin 状态跨重启保留）", async () => {
+      const f = vi.fn(async (url: string) => {
+        if (url.endsWith("/load")) return jsonRes({ status: "ok" });
+        if (url.endsWith("/v1/models/status")) return modelsStatusRes("Qwen3-8B", true);
+        throw new Error("unexpected url: " + url);
+      });
+      const b = new OmlxBackend({ fetchImpl: f as never });
+      const promise = b.load("Qwen3-8B", {
+        mode: "on_demand",
+        keepalive: { idle_ttl_s: 300 },
+        admission: "requires_eviction",
+      });
+      await expect(promise).rejects.toBeInstanceOf(OmlxUnexpectedlyPinnedError);
+      await expect(promise.catch((e) => e)).resolves.toMatchObject({
+        modelId: "Qwen3-8B",
+        message: expect.stringContaining("pinned"),
+      });
+    });
+
+    it("evict_to_load 模式也会核对 pinned 状态", async () => {
+      const f = vi.fn(async (url: string) => {
+        if (url.endsWith("/load")) return jsonRes({ status: "ok" });
+        if (url.endsWith("/v1/models/status")) return modelsStatusRes("Qwen3-8B", true);
+        throw new Error("unexpected url: " + url);
+      });
+      const b = new OmlxBackend({ fetchImpl: f as never });
+      await expect(
+        b.load("Qwen3-8B", { mode: "evict_to_load", keepalive: { idle_ttl_s: 300 }, admission: "requires_eviction" }),
+      ).rejects.toBeInstanceOf(OmlxUnexpectedlyPinnedError);
+    });
   });
 
   describe("maps /api/status", () => {
@@ -98,12 +156,21 @@ describe("OmlxBackend", () => {
       expect((await b.status()).pressure).toBe("unknown");
     });
 
-    it("H3: pressure not in the ok/soft/hard/ceiling whitelist -> throws instead of `as Pressure`", async () => {
-      const f = vi.fn(async () =>
-        jsonRes({ model_memory_max: 0, model_memory_used: 0, loaded_models: [], pressure: "critical" }),
-      );
-      const b = new OmlxBackend({ fetchImpl: f as never });
-      await expect(b.status()).rejects.toThrow(/不认识的 pressure/);
+    it("M-c: pressure not in the ok/soft/hard/ceiling whitelist -> returns 'unknown' + warns, does NOT throw (and loaded is still parsed)", async () => {
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        const f = vi.fn(async () =>
+          jsonRes({ model_memory_max: 0, model_memory_used: 0, loaded_models: ["A"], pressure: "critical" }),
+        );
+        const b = new OmlxBackend({ fetchImpl: f as never });
+        const status = await b.status();
+        expect(status.pressure).toBe("unknown");
+        expect(status.loaded).toEqual(["A"]); // pressure 解析失败不连带炸掉 loaded
+        expect(warnSpy).toHaveBeenCalledTimes(1);
+        expect(String(warnSpy.mock.calls[0]?.[0])).toContain("critical");
+      } finally {
+        warnSpy.mockRestore();
+      }
     });
 
     it("M2: both loaded_models and loaded present -> loaded_models wins", async () => {
@@ -134,6 +201,36 @@ describe("OmlxBackend", () => {
       const f = vi.fn(async () => jsonRes({ model_memory_max: 0, model_memory_used: 0 }));
       const b = new OmlxBackend({ fetchImpl: f as never });
       await expect(b.status()).rejects.toThrow(/缺少 loaded_models 与 loaded/);
+    });
+
+    it("M-a: loaded_models 里有非字符串元素时抛错，不能用 filter 静默丢弃", async () => {
+      const f = vi.fn(async () =>
+        jsonRes({ model_memory_max: 0, model_memory_used: 0, loaded_models: [{ id: "A" }] }),
+      );
+      const b = new OmlxBackend({ fetchImpl: f as never });
+      await expect(b.status()).rejects.toThrow(/不是字符串/);
+    });
+
+    it("L-a: model_memory_max 缺失时抛错（fail-closed，不当成 0）", async () => {
+      const f = vi.fn(async () => jsonRes({ model_memory_used: 0, loaded_models: [] }));
+      const b = new OmlxBackend({ fetchImpl: f as never });
+      await expect(b.status()).rejects.toThrow(/缺少 model_memory_max/);
+    });
+
+    it("L-a: model_memory_used 不是有限数字时抛错", async () => {
+      const f = vi.fn(async () =>
+        jsonRes({ model_memory_max: 0, model_memory_used: "not-a-number", loaded_models: [] }),
+      );
+      const b = new OmlxBackend({ fetchImpl: f as never });
+      await expect(b.status()).rejects.toThrow(/不是有限数字/);
+    });
+
+    it("L-a: model_memory_max 为 Infinity 时抛错", async () => {
+      const f = vi.fn(async () =>
+        jsonRes({ model_memory_max: Number.POSITIVE_INFINITY, model_memory_used: 0, loaded_models: [] }),
+      );
+      const b = new OmlxBackend({ fetchImpl: f as never });
+      await expect(b.status()).rejects.toThrow(/不是有限数字/);
     });
   });
 

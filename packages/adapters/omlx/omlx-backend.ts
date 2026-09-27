@@ -52,8 +52,35 @@ export class OmlxPinUnavailableError extends Error {
 }
 
 /**
+ * 非 resident（`on_demand` / `evict_to_load` / 未传 policy）加载完成后，实测发现该模型
+ * 其实处于 `pinned` 状态——这不是本适配器造成的（本适配器只有 `mode:"resident"` 才会
+ * 尝试 pin，而那条路径在 0.6.4 上必然因 401 抛 `OmlxPinUnavailableError`，不会"悄悄成功"），
+ * 而是**外部状态漂移**：用户在 oMLX 管理页手动 pin 过、pin 状态跨重启持久化保留、或者
+ * 模型之前被切换成过 `resident`（H-a）。
+ *
+ * 0.6.4 上取消 pin 同样需要 admin 会话认证（见 `OmlxPinUnavailableError`），本适配器没有
+ * 该能力，**无法自动纠正**，只能如实抛错，把这个 LoadPolicy 与实际状态不一致的事实报告给调用方。
+ */
+export class OmlxUnexpectedlyPinnedError extends Error {
+  readonly modelId: string;
+
+  constructor(modelId: string) {
+    super(
+      `oMLX 模型 "${modelId}" 已加载，但处于 pinned 状态，与所请求的 LoadPolicy（非 resident）不符：` +
+        `可能是被本适配器管辖范围之外的操作 pin 住的（如 oMLX 管理页手动 pin、pin 状态跨重启持久化、` +
+        `或曾经切换成过 resident）。0.6.4 上 unpin 需要 admin 会话认证（见 FU-17），本适配器暂无该能力，` +
+        `无法自动纠正，只能如实报告这个不一致。`,
+    );
+    this.name = "OmlxUnexpectedlyPinnedError";
+    this.modelId = modelId;
+  }
+}
+
+/**
  * oMLX 适配器（T1.2.2）：把 LoadPolicy 抽象映射到 oMLX 实测端点（spike/u0/U0-LOG.md）。
- * - resident → is_pinned=true；on_demand/evict_to_load → 不主动调用 pin 端点（见 load() 注释）
+ * - resident → is_pinned=true（0.6.4 上会抛 `OmlxPinUnavailableError`，见下）
+ * - on_demand/evict_to_load/未传 policy → 不主动调用 pin 端点，但会核对该模型实际是否
+ *   被外部 pin 住，不一致时抛 `OmlxUnexpectedlyPinnedError`（见 `load()` 注释，H-a）
  * - 显式 POST /v1/models/{id}/load | /unload
  * - admission / status 读 GET /api/status（model_memory_max + loaded_models）
  *
@@ -61,12 +88,15 @@ export class OmlxPinUnavailableError extends Error {
  *
  * 版本注记（FU-16，0.6.4 复测，见 spike/u0/U0-LOG.md「0.6.4 复测」一节，2026-09-27）：
  * - `/api/status` 的已加载模型字段在 0.6.4 上是 `loaded_models`（不是 v0.4.3 假设的 `loaded`）；
- *   两个字段名都兼容解析，但**缺失或类型不对时会抛错，不会静默退化成空数组**（见 `parseLoaded`，M2）。
+ *   两个字段名都兼容解析，但**缺失/类型不对时会抛错，元素不是字符串也会抛错**，不会静默
+ *   退化成空数组或悄悄丢元素（见 `parseLoaded`，M2/M-a）。
  * - `/api/status` 的 `model_memory_max` / `model_memory_used` 实测单位是**字节**，已换算成
- *   `ModelBackend` 契约要求的 GiB 口径（÷1024³，见 `status()`，M1）——修复前是直接把字节数
- *   塞进 `*Gb` 字段，数值被夸大了 2^30 倍，**这个字段之前不能被当成"已验证可用"**。
+ *   `ModelBackend` 契约要求的 GiB 口径（÷1024³，见 `status()`/`parseMemoryGb`，M1）——修复前是
+ *   直接把字节数塞进 `*Gb` 字段，数值被夸大了 2^30 倍，**这个字段之前不能被当成"已验证可用"**；
+ *   缺失或不是有限数字时抛错，不当成 0（L-a，fail-closed）。
  * - `pressure` 字段缺失时返回显式的 `"unknown"`（不是 fail-open 地当成 `"ok"`）；不在
- *   `ok/soft/hard/ceiling` 白名单里的非法值会直接抛错，不会被无脑 `as Pressure`（见 `parsePressure`，H3）。
+ *   `ok/soft/hard/ceiling` 白名单里的值会 warn 一行后按 `"unknown"` 处理，不抛错、不影响
+ *   同一次 `status()` 里 `loaded` 字段的解析，也不会被无脑 `as Pressure`（见 `parsePressure`，H3/M-c）。
  * - 设置 `is_pinned` 的端点在 0.6.4 上从 `POST /admin/settings`（已 404）搬到了
  *   `PUT /admin/api/models/{id}/settings`（body 从 `{model_settings:{id:{is_pinned}}}` 拍平成 `{is_pinned}`）。
  *   **该 body 形状只是照 `GET /openapi.json` 的 `ModelSettingsRequest` schema 编的，从未实测跑通过**
@@ -74,7 +104,9 @@ export class OmlxPinUnavailableError extends Error {
  *   **已知缺口**：`/admin/api/*` 在 0.6.4 要求独立的 admin 会话认证，仅凭 `/v1/*` 用的推理 API key
  *   会被拒绝（`401 Admin authentication required`，已实测）。本适配器没有 admin 会话能力，
  *   因此 `load(id, { mode: "resident" })` 目前在 0.6.4 上会抛出 `OmlxPinUnavailableError`，而不是
- *   真的把模型 pin 住；pin 语义在拿到 admin 会话支持前对 0.6.4 是未打通的（跟进见 FU-17）。
+ *   真的把模型 pin 住；pin 语义（包括反向的 unpin）在拿到 admin 会话支持前对 0.6.4 是未打通的
+ *   （跟进见 FU-17）。`GET /v1/models/status` 则**已实测确认**推理 API key 可以正常读（200，
+ *   只读），本适配器用它检测"非 resident 加载的模型是否其实被外部 pin 住"（H-a）。
  *   `pressure` 在 `--memory-guard` 模式下的字段名是否不变也未验证（跟进见 FU-18）。
  */
 export class OmlxBackend implements ModelBackend {
@@ -107,16 +139,28 @@ export class OmlxBackend implements ModelBackend {
       } catch (err) {
         throw new OmlxPinUnavailableError(id, err);
       }
+      return;
     }
     // 其余分支（on_demand / evict_to_load，以及未传 policy）刻意不调用 setPinned(id, false)：
     // - 已实测 `POST /v1/models/{id}/load` 本身不会把模型隐式 pin 住
-    //   （2026-09-27 复测：刚 load 的 Qwen3-0.6B-4bit 在 `/v1/models/status` 里 `pinned:false`）；
+    //   （2026-09-27 复测：刚 load 的 Qwen3-0.6B-4bit 在 `/v1/models/status` 里 `pinned:false`，
+    //   记录见 spike/u0/U0-LOG.md）；
     // - 本适配器是这套状态里唯一会把 `is_pinned` 设成 true 的地方，而那条路径在 0.6.4 上
     //   会直接抛 `OmlxPinUnavailableError`、不会"悄悄成功"——所以只要调用方没见过这个错误，
-    //   就说明本适配器从来没有真正把这个模型 pin 住过，也就不存在需要"反悔取消 pin"的状态；
+    //   就说明本适配器从来没有真正把这个模型 pin 住过；
     // - 这样也避免了 on_demand 这个最常见的路径在 0.6.4 上每次 load 都白打一次必 401 的 admin 端点。
-    // 已知限制（记入 FU-17）：如果模型是被本适配器管辖范围之外的东西（例如 oMLX 自带管理页）
-    // 手动 pin 过的，我们不会主动替它 unpin——那属于跨面板状态漂移，不在本次修复范围内。
+    //
+    // 但"本适配器没 pin 过"不等于"这个模型现在真的是 unpinned"——它可能早就被外部 pin 住
+    // （用户在 oMLX 管理页手动 pin、pin 状态跨重启持久化、或者曾经被切换成过 resident）。
+    // 对这种情况保持沉默会让调用方以为自己拿到的是 on_demand 语义的模型，实际上却是个不会
+    // 被驱逐的 pinned 模型（H-a）。所以 load 完成后主动查一次 `GET /v1/models/status`（已实测
+    // 2026-09-27：用推理 API key 就能读，200，只读，不改变任何状态，见 U0-LOG），核对该模型的
+    // `pinned` 字段；不一致就抛 `OmlxUnexpectedlyPinnedError`，而不是悄悄放行。
+    // 已知限制（记入 FU-17）：发现被外部 pin 住后，本适配器**无法自动 unpin**（同样需要 admin
+    // 会话），只能检测并报告，不能纠正。
+    if (await this.isActuallyPinned(id)) {
+      throw new OmlxUnexpectedlyPinnedError(id);
+    }
   }
 
   async unload(id: string): Promise<void> {
@@ -136,10 +180,24 @@ export class OmlxBackend implements ModelBackend {
     // 0.6.4 实测 model_memory_max/model_memory_used 单位是字节（例如 55662788608 = 51.84GB，
     // 与响应里自带的 model_memory_max_formatted 对得上）；ModelBackend 契约的 *Gb 字段是 GiB
     // 口径，这里必须除以 1024^3 换算，不能把字节数直接塞进去（M1——修复前会夸大 2^30 倍）。
-    const max = Number(body.model_memory_max ?? 0) / BYTES_PER_GIB;
-    const used = Number(body.model_memory_used ?? 0) / BYTES_PER_GIB;
+    const max = this.parseMemoryGb(body.model_memory_max, "model_memory_max");
+    const used = this.parseMemoryGb(body.model_memory_used, "model_memory_used");
     const pressure = this.parsePressure(body.pressure);
     return { pressure, usedGb: used, modelMemoryMaxGb: max, loaded };
+  }
+
+  /**
+   * 查一次 `GET /v1/models/status`，看某个模型当前是否真的处于 `pinned` 状态（H-a）。
+   * 已实测（2026-09-27）：这个端点用推理 API key 就能读（200），是只读操作，不会
+   * 改变任何状态——不像 `PUT /admin/api/models/{id}/settings` 那样需要 admin 会话。
+   * 找不到对应模型条目、或响应形状不是预期的 `{models:[{id,pinned}]}` 时，保守地
+   * 当作"未被 pin"（不在这里额外抛错——H-a 只要求检测"确实被 pin 住"这一种偏差，
+   * 响应解析异常已经会在别处（例如 `/api/status`）被更严格的校验捕获）。
+   */
+  private async isActuallyPinned(id: string): Promise<boolean> {
+    const body = (await this.json("GET", "/v1/models/status")) as { models?: Array<Record<string, unknown>> };
+    const entry = (body.models ?? []).find((m) => m.id === id);
+    return entry?.pinned === true;
   }
 
   /**
@@ -160,23 +218,48 @@ export class OmlxBackend implements ModelBackend {
     if (!Array.isArray(raw)) {
       throw new Error(`oMLX /api/status 的已加载模型字段不是数组：${JSON.stringify(raw)}`);
     }
-    return raw.filter((x): x is string => typeof x === "string");
+    // M-a：元素不是字符串时直接抛错，不能用 filter 静默丢弃——丢弃掉的那个模型 id
+    // 就从"已加载列表"里凭空消失了，会让 admission()/驱逐决策看到一个偏小的已加载集合。
+    return raw.map((x, i) => {
+      if (typeof x !== "string") {
+        throw new Error(`oMLX /api/status 的已加载模型列表第 ${i} 项不是字符串：${JSON.stringify(x)}`);
+      }
+      return x;
+    });
   }
 
   /**
-   * 解析 `/api/status` 的 `pressure` 字段（H3）。
+   * 解析 `/api/status` 的 `model_memory_max` / `model_memory_used`（L-a，字节，见 `status()`）。
+   * 缺失或不是有限数字时直接抛错（fail-closed）——一个解析不出来的内存数字不该被
+   * 悄悄当成 0 处理，那会让 admission/驱逐决策以为后端还有一整块内存可用。
+   */
+  private parseMemoryGb(value: unknown, fieldName: string): number {
+    if (value === undefined || value === null) {
+      throw new Error(`oMLX /api/status 缺少 ${fieldName} 字段`);
+    }
+    const bytes = Number(value);
+    if (!Number.isFinite(bytes)) {
+      throw new Error(`oMLX /api/status 的 ${fieldName} 不是有限数字：${JSON.stringify(value)}`);
+    }
+    return bytes / BYTES_PER_GIB;
+  }
+
+  /**
+   * 解析 `/api/status` 的 `pressure` 字段（H3，M-c）。
    * - 缺失（undefined/null，例如本次复测用的实例没带 `--memory-guard` 启动）时返回
    *   显式的 `"unknown"`——**不是** fail-open 地当成 `"ok"`；`"unknown"` 的消费方必须按
-   *   保守方向处理（见 `Pressure` 类型定义）。
-   * - 值存在但不在 `ok/soft/hard/ceiling` 白名单里（类型不对或拼写变了）时**直接抛错**，
-   *   不会被无脑 `as Pressure` 静默接受一个我们不认识的压力等级。
+   *   保守方向处理（见 `Pressure` 类型定义 / FU-18）。
+   * - 值存在但不在 `ok/soft/hard/ceiling` 白名单里（类型不对或拼写变了）时**不抛错**，
+   *   warn 一行后按 `"unknown"` 处理——`pressure` 只是 `status()` 里的一个字段，不该让它
+   *   的解析失败连带炸掉同一次调用里已经解析好的 `loaded` 列表（M-c）。
    */
   private parsePressure(value: unknown): Pressure {
     if (value === undefined || value === null) return "unknown";
     if (typeof value === "string" && (KNOWN_PRESSURE_VALUES as readonly string[]).includes(value)) {
       return value as Pressure;
     }
-    throw new Error(`oMLX /api/status 返回了不认识的 pressure 值：${JSON.stringify(value)}`);
+    console.warn(`[idoris] oMLX /api/status 返回了不认识的 pressure 值，按 "unknown" 处理：${JSON.stringify(value)}`);
+    return "unknown";
   }
 
   async chat(req: ChatRequest): Promise<ChatResponse> {

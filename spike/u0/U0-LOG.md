@@ -130,5 +130,13 @@
 ### 结论
 1. **`GET /v1/models`、显式 `load`/`unload`、chat completions（非流式/流式）在 0.4.3 → 0.6.4 之间语义未变**。`model_memory_max`/`model_memory_used` 字段名也未变，但**单位是字节、需要换算成 GiB**——这一条**不能说"放心复用"**，本节初版这么写过，是错的，已在适配器里修正并在此更正。
 2. **`/api/status` 已加载列表字段名从假设的 `loaded` 变成 `loaded_models`**——`packages/adapters/omlx/omlx-backend.ts` 的 `status()` 已改为 `loaded_models` 非 null 时优先、`null` 才回退 `loaded`，两者都缺失或类型不对时**抛错**（不再静默返回 `[]`）。这修复了两个实质 bug：① 修复前 `admission()` 会因为读不到已加载列表而对已加载模型也一律误判成 `requires_eviction`；② "看不懂响应" 和 "这个模型确实没加载" 被之前的实现混为一谈。
-3. **`is_pinned` 的设置端点搬家**（`POST /admin/settings` → `PUT /admin/api/models/{id}/settings`），适配器已切到新端点，且收窄成只在 `mode:"resident"` 时才调用；但新端点在 0.6.4 上要求独立 admin 会话认证，**仅凭推理 API key 无法完成 pin**——这是一个新增的能力缺口，不是简单的路径改名能解决的，**pin 语义在 0.6.4 上完全不可用**，已拆成 FU-17 单独跟进。调用失败时适配器抛 `OmlxPinUnavailableError`（模型已加载但未 pin），不会把"部分成功"状态吞掉或伪装成"整体失败"。
-4. `pressure` 字段（ok/soft/hard/ceiling）本次未在 memory-guard 模式下复测（避免重启导致用户正在用的模型被卸载），拆成 FU-18 单独跟进；适配器对"字段缺失"的默认行为已从 fail-open 的 `"ok"` 改成显式的 `"unknown"`，对"字段值不在白名单里"的情况从静默 `as Pressure` 改成抛错。
+3. **`is_pinned` 的设置端点搬家**（`POST /admin/settings` → `PUT /admin/api/models/{id}/settings`），适配器已切到新端点，且收窄成只在 `mode:"resident"` 时才调用；但新端点在 0.6.4 上要求独立 admin 会话认证，**仅凭推理 API key 无法完成 pin**——这是一个新增的能力缺口，不是简单的路径改名能解决的，**pin 语义在 0.6.4 上完全不可用**，已拆成 FU-17 单独跟进。调用失败时适配器抛 `OmlxPinUnavailableError`（模型已加载但未 pin），不会把"部分成功"状态吞掉或伪装成"整体失败"。**这个缺口是双向的**：`on_demand`/`evict_to_load` 加载完成后，适配器会读 `GET /v1/models/status`（已实测确认推理 API key 就能读，见下方「第二轮补充复测」）核对该模型是否被外部 pin 住，一致性被打破时抛 `OmlxUnexpectedlyPinnedError`，但**检测到之后同样没有能力去 unpin**——pin 得上读不出真状态是一种缺口，pin 上了想摘不掉是另一种，根因都是缺 admin 会话（FU-17）。
+4. `pressure` 字段（ok/soft/hard/ceiling）本次未在 memory-guard 模式下复测（避免重启导致用户正在用的模型被卸载），拆成 FU-18 单独跟进；适配器对"字段缺失"的默认行为已从 fail-open 的 `"ok"` 改成显式的 `"unknown"`。对"字段值不在白名单里"的情况，**几经调整**：最初改成抛错，第二轮 Opus 评审指出这样会连带让同一次 `status()` 调用里已经解析好的 `loaded` 列表也拿不到（一个不认识的 pressure 值不该阻塞已经解析成功的其它字段），所以改成 **warn 一行 + 按 `"unknown"` 处理**，不抛错。`"unknown"` 要求消费方按保守方向处理（至少视同 `soft`），但这**只是类型注释里的约定，没有编译期/运行期机制强制**——记入 FU-18。
+
+### 第二轮补充复测（2026-09-27，回应 Opus 第二轮 CHANGES_REQUESTED）
+
+> 触发：H-a——`on_demand`/`evict_to_load` 不再调用 unpin 之后，如果模型本来就被外部 pin 住（用户在 oMLX 管理页手动 pin、pin 状态跨重启持久化、或曾经切换成过 resident），`load()` 会静默成功，调用方拿不到任何信号。修法要求先实测确认：能否用推理 API key 读 `GET /v1/models/status` 来检测 pinned 状态（只读，不改变任何状态）。
+
+- **实测结果**：`curl -H "Authorization: Bearer $OMLX_API_KEY" http://127.0.0.1:8088/v1/models/status` → `HTTP 200`，与 `/admin/api/*` 的 401 形成对照——**这个端点不受 admin 会话限制，推理 API key 就能读**。已据此在 `OmlxBackend.isActuallyPinned()` 里实现 H-a 的检测逻辑。
+- **顺带观测**（复测时刻的真实状态，不是本次操作造成的）：这次读到的 `loaded_models` 比第一轮复测结束时多了 `Qwen3-0.6B-4bit`、`Qwen3-8B-4bit`——两次复测之间用户/其它进程加载了这些模型，本次全程只做了这一次只读 `GET`，**没有 load/unload 任何模型，没有改变任何状态**。当时读到的全部已加载模型 `pinned` 字段都是 `false`（`GLM-OCR-bf16`、`Qwen3-0.6B-4bit`、`Qwen3-8B-4bit`、`Qwen3.8-27B-OptiQ-4bit`、`MarkItDown`），与下面 L-b 的观测一致，没有发现被外部 pin 住的模型。
+- **L-b 补记（第一轮复测时的观测，此前只记在代码注释里，这里正式记录进日志）**：第一轮复测中，`POST /v1/models/Qwen3-0.6B-4bit/load` 成功后，立刻 `GET /v1/models/status` 核对该模型条目，**`pinned` 字段是 `false`**——这是「`POST /v1/models/{id}/load` 本身不会隐式把模型 pin 住」这一判断的直接实测依据，`load()` 里"on_demand/evict_to_load 不主动调用 unpin"这段设计正是建立在这条观测之上。
