@@ -277,12 +277,33 @@ impl Supervisor {
                 config.budget_gb
             )));
         }
-        let (tx, rx) = mpsc::channel(64);
-        let call_slots = Arc::new(Semaphore::new(config.max_concurrent_adapter_calls.max(1)));
-        let self_tx = tx.clone();
-        tokio::spawn(run_actor(adapter, config, rx, call_slots, self_tx));
+        let (tx, _join) = spawn_actor(adapter, config);
         Ok(SupervisorHandle { tx })
     }
+}
+
+/// Builds the channel and spawns the actor task, returning both the
+/// command sender and the task's own `JoinHandle`. Kept private and
+/// separate from `Supervisor::spawn` (which discards the `JoinHandle`,
+/// matching its documented "fire and forget, reachable only via
+/// `SupervisorHandle`" contract) purely so a test can assert the task
+/// actually exits once every handle is dropped (M1, Opus Tier-2 review)
+/// without adding an internal implementation detail to the public API.
+fn spawn_actor(
+    adapter: Arc<dyn RuntimeAdapter>,
+    config: SupervisorConfig,
+) -> (mpsc::Sender<ActorMsg>, tokio::task::JoinHandle<()>) {
+    let (tx, rx) = mpsc::channel(64);
+    let call_slots = Arc::new(Semaphore::new(config.max_concurrent_adapter_calls.max(1)));
+    // `downgrade`, not `clone`: a *strong* self-clone would mean the actor
+    // always holds one live sender on its own channel, so `rx.recv()`
+    // could never return `None` — the actor would run forever even after
+    // every `SupervisorHandle` is dropped. A `WeakSender` doesn't count
+    // toward keeping the channel open, so `rx.recv()` correctly returns
+    // `None`, and the loop exits, once the last external handle goes away.
+    let self_tx = tx.downgrade();
+    let join = tokio::spawn(run_actor(adapter, config, rx, call_slots, self_tx));
+    (tx, join)
 }
 
 /// Maps a model's lifecycle state to the error `chat` reports for it.
@@ -521,7 +542,7 @@ async fn best_effort_release(
 struct Env<'a> {
     adapter: &'a Arc<dyn RuntimeAdapter>,
     config: &'a SupervisorConfig,
-    self_tx: &'a mpsc::Sender<ActorMsg>,
+    self_tx: &'a mpsc::WeakSender<ActorMsg>,
 }
 
 /// `models` as [`crate::eviction::plan_eviction`] sees it — every entry
@@ -606,12 +627,16 @@ fn start_load(
                 failure_state: ModelState::Error,
             },
         };
-        let _ = self_tx
-            .send(ActorMsg::OpDone {
-                id: id_for_task,
-                outcome,
-            })
-            .await;
+        // If `upgrade` fails, every `SupervisorHandle` is already gone and
+        // the actor itself has exited — nothing is left to deliver this to.
+        if let Some(tx) = self_tx.upgrade() {
+            let _ = tx
+                .send(ActorMsg::OpDone {
+                    id: id_for_task,
+                    outcome,
+                })
+                .await;
+        }
     });
 }
 
@@ -724,12 +749,14 @@ fn start_unload(id: String, env: &Env<'_>) {
             Ok(result) => result,
             Err(join_err) => Err(BackendError::adapter_panicked(&id, join_err.to_string())),
         };
-        let _ = self_tx
-            .send(ActorMsg::OpDone {
-                id,
-                outcome: OpOutcome::Unload { result },
-            })
-            .await;
+        if let Some(tx) = self_tx.upgrade() {
+            let _ = tx
+                .send(ActorMsg::OpDone {
+                    id,
+                    outcome: OpOutcome::Unload { result },
+                })
+                .await;
+        }
     });
 }
 
@@ -798,7 +825,7 @@ async fn run_actor(
     config: SupervisorConfig,
     mut rx: mpsc::Receiver<ActorMsg>,
     call_slots: Arc<Semaphore>,
-    self_tx: mpsc::Sender<ActorMsg>,
+    self_tx: mpsc::WeakSender<ActorMsg>,
 ) {
     let mut models: HashMap<String, ModelSlot> = HashMap::new();
     let mut active_op: Option<ActiveOp> = None;
@@ -876,7 +903,9 @@ async fn run_actor(
                         let _ = reply.send(
                             with_adapter_timeout(adapter.chat(req, cancel), timeout, &model).await,
                         );
-                        let _ = self_tx.send(ActorMsg::ChatDone { model }).await;
+                        if let Some(tx) = self_tx.upgrade() {
+                            let _ = tx.send(ActorMsg::ChatDone { model }).await;
+                        }
                     });
                 }
             },
@@ -1861,5 +1890,30 @@ mod tests {
             .load("b", 20.0, on_demand_policy())
             .await
             .expect("load b must still proceed once confirmation gives up, not hang forever");
+    }
+
+    /// M1: the actor task itself must exit once every `SupervisorHandle` is
+    /// dropped, not run forever. Bypasses `Supervisor::spawn` to capture the
+    /// actor's own `JoinHandle` (which the public API doesn't expose, on
+    /// purpose — this is an internal detail, not something callers should
+    /// depend on).
+    #[tokio::test]
+    async fn actor_exits_once_every_handle_is_dropped() {
+        let adapter: Arc<dyn RuntimeAdapter> = Arc::new(MockAdapter::new(catalog()));
+        // Goes through the exact same `spawn_actor` helper `Supervisor::
+        // spawn` itself uses (rather than reimplementing its setup here),
+        // so this actually exercises the real `downgrade`-not-`clone`
+        // choice instead of only the test's own copy of it.
+        let (tx, join) = spawn_actor(adapter, SupervisorConfig::default());
+        let handle = SupervisorHandle { tx };
+        handle
+            .list()
+            .await
+            .expect("the actor should be responsive while a handle exists");
+        drop(handle);
+        tokio::time::timeout(std::time::Duration::from_secs(1), join)
+            .await
+            .expect("the actor task must exit shortly after the last handle is dropped")
+            .expect("the actor task must not panic on exit");
     }
 }
