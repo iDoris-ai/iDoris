@@ -81,8 +81,13 @@ fn expired_reservation_frees_its_budget_on_the_next_reserve() {
     );
 }
 
+/// H1 (Opus Tier-2 acceptance): settling a reservation whose TTL has
+/// already lapsed must still charge — real money may already have been
+/// spent by a slow upstream call, and the TTL exists to free budget held by
+/// *abandoned* calls, not to make a late-but-real charge disappear.
+/// `SettleReceipt::late` reports it happened past the deadline.
 #[test]
-fn settling_an_expired_reservation_is_rejected() {
+fn settling_an_expired_reservation_still_charges_and_is_marked_late() {
     let path = temp_db_path("expiry-settle");
     let clock = FakeClock::new(0);
     let ledger = BudgetLedger::open_with(&path, clock.clone(), TTL_MS).expect("open");
@@ -91,10 +96,33 @@ fn settling_an_expired_reservation_is_rejected() {
 
     let id = ledger.reserve(&scope, Price::Known(50)).expect("reserve");
     clock.advance(TTL_MS + 1);
+    let receipt = ledger
+        .settle(&id, 50)
+        .expect("settle after expiry must still charge");
+    assert!(receipt.late);
+    assert_eq!(ledger.balance(&scope).expect("balance"), 50);
+}
+
+/// Negative control: settling an expired reservation *twice* still only
+/// charges once — the first settle finalizes it (`status='settled'`), so a
+/// second attempt is rejected exactly like the non-expired double-settle
+/// case.
+#[test]
+fn settling_an_expired_reservation_twice_only_charges_once() {
+    let path = temp_db_path("expiry-settle-twice");
+    let clock = FakeClock::new(0);
+    let ledger = BudgetLedger::open_with(&path, clock.clone(), TTL_MS).expect("open");
+    let scope = BudgetScope::new("acme-co", "key-1", "openai", "gpt-5");
+    ledger.configure(&scope, 100, "UTC").expect("configure");
+
+    let id = ledger.reserve(&scope, Price::Known(50)).expect("reserve");
+    clock.advance(TTL_MS + 1);
+    ledger.settle(&id, 50).expect("first settle");
     assert!(matches!(
         ledger.settle(&id, 50),
         Err(BudgetError::ReservationNotActive { .. })
     ));
+    assert_eq!(ledger.balance(&scope).expect("balance"), 50);
 }
 
 /// L3 (Opus Tier-2 acceptance): releasing an already-expired reservation is
@@ -150,4 +178,62 @@ fn sweep_expired_reports_and_flips_expired_reservations() {
     assert_eq!(ledger.sweep_expired().expect("sweep"), 1);
     // Idempotent: a second sweep finds nothing left to flip.
     assert_eq!(ledger.sweep_expired().expect("sweep"), 0);
+}
+
+/// `extend` renews a still-active reservation's deadline so a slower-than-
+/// anticipated upstream call doesn't lose its held budget to the TTL.
+#[test]
+fn extend_renews_an_active_reservations_deadline() {
+    let path = temp_db_path("extend-renews");
+    let clock = FakeClock::new(0);
+    let ledger = BudgetLedger::open_with(&path, clock.clone(), TTL_MS).expect("open");
+    let scope = BudgetScope::new("acme-co", "key-1", "openai", "gpt-5");
+    ledger.configure(&scope, 100, "UTC").expect("configure");
+
+    let id = ledger.reserve(&scope, Price::Known(50)).expect("reserve");
+    // Extend well before the original TTL would lapse.
+    ledger.extend(&id, TTL_MS * 10).expect("extend");
+
+    // Advance past the *original* deadline — the extend should have pushed
+    // it out, so settling now must not be `late`.
+    clock.advance(TTL_MS + 1);
+    let receipt = ledger
+        .settle(&id, 50)
+        .expect("settle before the extended deadline");
+    assert!(!receipt.late, "extend should have prevented a late settle");
+}
+
+/// Negative control: `extend` on an already-settled reservation is
+/// rejected — extending a finalized reservation makes no sense.
+#[test]
+fn extend_on_settled_reservation_errors() {
+    let path = temp_db_path("extend-settled");
+    let clock = FakeClock::new(0);
+    let ledger = BudgetLedger::open_with(&path, clock.clone(), TTL_MS).expect("open");
+    let scope = BudgetScope::new("acme-co", "key-1", "openai", "gpt-5");
+    ledger.configure(&scope, 100, "UTC").expect("configure");
+
+    let id = ledger.reserve(&scope, Price::Known(50)).expect("reserve");
+    ledger.settle(&id, 50).expect("settle");
+    assert!(matches!(
+        ledger.extend(&id, 1_000),
+        Err(BudgetError::ReservationNotActive { .. })
+    ));
+}
+
+/// Negative control: a non-positive extension is rejected, same
+/// fail-closed reasoning as the original TTL validation.
+#[test]
+fn extend_rejects_non_positive_ttl() {
+    let path = temp_db_path("extend-bad-ttl");
+    let clock = FakeClock::new(0);
+    let ledger = BudgetLedger::open_with(&path, clock.clone(), TTL_MS).expect("open");
+    let scope = BudgetScope::new("acme-co", "key-1", "openai", "gpt-5");
+    ledger.configure(&scope, 100, "UTC").expect("configure");
+
+    let id = ledger.reserve(&scope, Price::Known(50)).expect("reserve");
+    assert!(matches!(
+        ledger.extend(&id, 0),
+        Err(BudgetError::InvalidTtl { .. })
+    ));
 }

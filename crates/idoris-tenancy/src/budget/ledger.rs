@@ -98,6 +98,13 @@ pub struct SettleReceipt {
     /// for *more* than was reserved still charges the real amount (billing
     /// truth, not a cap), it just refunds nothing.
     pub refunded_minor: i64,
+    /// `true` if this reservation's TTL had already lapsed by the time
+    /// `settle` ran (Opus Tier-2 acceptance H1) — the call still gets
+    /// charged (money doesn't become fictional just because a slow upstream
+    /// call took longer than the TTL anticipated), but callers/observability
+    /// may want to know a call ran unusually long, or that its TTL sizing
+    /// needs revisiting.
+    pub late: bool,
 }
 
 /// SQLite-backed budget ledger: atomic reserve/settle/release scoped to
@@ -355,6 +362,17 @@ impl BudgetLedger {
     /// failed or fallback call must call [`release`](Self::release) instead
     /// (LoopX's lesson: "may I call" and "charge me" are separate, so a
     /// caller can never accidentally charge for a call it didn't make).
+    ///
+    /// H1 (Opus Tier-2 acceptance): an *expired* reservation (its TTL lapsed
+    /// before `settle` ran) still gets charged here — `SettleReceipt::late`
+    /// is `true` in that case — because a slow upstream call may have
+    /// genuinely spent real money by the time it returns; the TTL exists to
+    /// free budget held by *abandoned* calls, not to make a late-but-real
+    /// charge disappear. Only an already-`settled` or already-`released`
+    /// reservation is rejected, since settling either again would
+    /// double-charge or un-release a completed outcome. See
+    /// [`extend`](Self::extend) for renewing a reservation before its TTL
+    /// lapses, for a caller that anticipates running long.
     pub fn settle(
         &self,
         reservation_id: &ReservationId,
@@ -370,23 +388,17 @@ impl BudgetLedger {
         let row = find_reservation(&tx, reservation_id)?;
         let status = ReservationStatus::parse(&row.status)?;
 
-        if status != ReservationStatus::Active {
-            return Err(BudgetError::ReservationNotActive {
-                reservation_id: reservation_id.0.clone(),
-                status: row.status,
-            });
-        }
-        if row.expires_at_ms <= now_ms {
-            tx.execute(
-                "UPDATE reservations SET status=?2 WHERE id=?1",
-                rusqlite::params![reservation_id.0, ReservationStatus::Expired.as_sql()],
-            )?;
-            tx.commit()?;
-            return Err(BudgetError::ReservationNotActive {
-                reservation_id: reservation_id.0.clone(),
-                status: ReservationStatus::Expired.as_sql().to_string(),
-            });
-        }
+        let late = match status {
+            ReservationStatus::Active => row.expires_at_ms <= now_ms,
+            ReservationStatus::Expired => true,
+            ReservationStatus::Settled | ReservationStatus::Released => {
+                tx.rollback().ok();
+                return Err(BudgetError::ReservationNotActive {
+                    reservation_id: reservation_id.0.clone(),
+                    status: row.status,
+                });
+            }
+        };
 
         tx.execute(
             "INSERT INTO budget_periods (tenant_id, key_id, provider_id, model_id, period, spent_minor) \
@@ -403,8 +415,12 @@ impl BudgetLedger {
             ],
         )?;
         tx.execute(
-            "UPDATE reservations SET status='settled', actual_cost_minor=?2 WHERE id=?1",
-            rusqlite::params![reservation_id.0, actual_cost_minor],
+            "UPDATE reservations SET status=?2, actual_cost_minor=?3 WHERE id=?1",
+            rusqlite::params![
+                reservation_id.0,
+                ReservationStatus::Settled.as_sql(),
+                actual_cost_minor
+            ],
         )?;
         tx.commit()?;
 
@@ -413,24 +429,77 @@ impl BudgetLedger {
             reserved_minor: row.reserved_minor,
             actual_cost_minor,
             refunded_minor,
+            late,
         })
+    }
+
+    /// Renew a still-`active` reservation's TTL by `additional_ttl_ms` from
+    /// now (H1) — for a caller whose upstream call is running longer than
+    /// anticipated and wants to keep holding the budget rather than risk a
+    /// concurrent `sweep_expired`/another `reserve` treating it as freed.
+    /// Size `additional_ttl_ms` from the upstream's own timeout plus margin,
+    /// the same way the original TTL should be sized. Only valid on a
+    /// reservation still in `active` status; a reservation already
+    /// `settled`/`released` can't be extended, and an already-swept
+    /// `expired` one should be re-reserved instead (extending it would
+    /// resurrect a reservation other code may have already treated as
+    /// freed).
+    pub fn extend(
+        &self,
+        reservation_id: &ReservationId,
+        additional_ttl_ms: i64,
+    ) -> Result<(), BudgetError> {
+        if additional_ttl_ms <= 0 {
+            return Err(BudgetError::InvalidTtl {
+                ttl_ms: additional_ttl_ms,
+            });
+        }
+        let now_ms = self.clock.now_ms();
+        let mut conn = self.lock();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        let row = find_reservation(&tx, reservation_id)?;
+        let status = ReservationStatus::parse(&row.status)?;
+        if status != ReservationStatus::Active {
+            tx.rollback().ok();
+            return Err(BudgetError::ReservationNotActive {
+                reservation_id: reservation_id.0.clone(),
+                status: row.status,
+            });
+        }
+
+        let new_expires_at_ms = now_ms
+            .checked_add(additional_ttl_ms)
+            .ok_or(BudgetError::InvalidTimestamp { now_ms })?;
+        tx.execute(
+            "UPDATE reservations SET expires_at_ms=?2 WHERE id=?1",
+            rusqlite::params![reservation_id.0, new_expires_at_ms],
+        )?;
+        tx.commit()?;
+        Ok(())
     }
 
     /// Fully release a reservation without charging anything — for calls
     /// that failed or that fell back to a different (separately reserved)
     /// candidate. Idempotent when the reservation is already `released`;
-    /// erroring on `settled`/`expired` prevents un-settling a completed
-    /// charge.
+    /// erroring on `settled` prevents un-settling a completed charge.
+    ///
     /// L3 (Opus Tier-2 acceptance): releasing an already-`expired` (but not
     /// yet settled/released) reservation succeeds (`Ok(())`) instead of
     /// erroring — no charge was ever recorded against it, so "release" (no
     /// charge is due) is already true; only `settled` is a genuine
-    /// "you can't undo this" rejection. This used to reject with
-    /// `ReservationNotActive` on the mistaken assumption that "expired"
-    /// meant "too late to touch" — but release never charges anything, so
-    /// there was nothing for the TTL to have made "too late".
+    /// "you can't undo this" rejection.
+    ///
+    /// Every success path here writes `Released`, **never** leaves a row as
+    /// `Expired` — this matters as of H1 (a follow-up PR makes `settle`
+    /// still charge an `Expired`-but-not-yet-finalized reservation): if
+    /// `release` left an expired row's status as `Expired` instead of
+    /// explicitly finalizing it to `Released`, a caller could `release()` a
+    /// reservation (declaring "no charge is due") and then still have a
+    /// racing/late `settle()` on the same id succeed and charge it anyway.
+    /// `Released` is the one status H1's `settle` always rejects, so it's
+    /// the only correct terminal state for this method to leave behind.
     pub fn release(&self, reservation_id: &ReservationId) -> Result<(), BudgetError> {
-        let now_ms = self.clock.now_ms();
         let mut conn = self.lock();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
 
@@ -442,26 +511,11 @@ impl BudgetLedger {
                 tx.commit()?;
                 Ok(())
             }
-            ReservationStatus::Active if row.expires_at_ms > now_ms => {
+            ReservationStatus::Active | ReservationStatus::Expired => {
                 tx.execute(
                     "UPDATE reservations SET status=?2 WHERE id=?1",
                     rusqlite::params![reservation_id.0, ReservationStatus::Released.as_sql()],
                 )?;
-                tx.commit()?;
-                Ok(())
-            }
-            ReservationStatus::Active => {
-                // TTL lapsed between the SELECT above and now — flip it to
-                // `expired` for hygiene, but still succeed (see doc comment
-                // above): no money was ever recorded for this reservation.
-                tx.execute(
-                    "UPDATE reservations SET status=?2 WHERE id=?1",
-                    rusqlite::params![reservation_id.0, ReservationStatus::Expired.as_sql()],
-                )?;
-                tx.commit()?;
-                Ok(())
-            }
-            ReservationStatus::Expired => {
                 tx.commit()?;
                 Ok(())
             }
