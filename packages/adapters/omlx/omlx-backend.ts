@@ -35,6 +35,8 @@ const KNOWN_PRESSURE_VALUES = ["ok", "soft", "hard", "ceiling"] as const;
  * 压力大时可能被 LRU 驱逐。
  */
 export class OmlxPinUnavailableError extends Error {
+  /** 稳定错误码（M2），供调用方判断，不依赖 `instanceof` 跨包比较。 */
+  readonly code = "OMLX_PIN_UNAVAILABLE" as const;
   readonly modelId: string;
 
   constructor(modelId: string, cause: unknown) {
@@ -62,6 +64,7 @@ export class OmlxPinUnavailableError extends Error {
  * 该能力，**无法自动纠正**，只能如实抛错，把这个 LoadPolicy 与实际状态不一致的事实报告给调用方。
  */
 export class OmlxUnexpectedlyPinnedError extends Error {
+  readonly code = "OMLX_UNEXPECTEDLY_PINNED" as const;
   readonly modelId: string;
 
   constructor(modelId: string) {
@@ -77,14 +80,68 @@ export class OmlxUnexpectedlyPinnedError extends Error {
 }
 
 /**
+ * `GET /v1/models/status` 的响应没能让我们**放心确认**某个模型的 `loaded`/`pinned` 状态
+ * （H1）：可能是 `models` 字段整个缺失、找不到/找到多个 id 匹配的条目、`loaded`/`pinned`
+ * 字段类型不对，或者最关键的一种——**`loaded===false`**（模型在我们 `POST .../load` 成功
+ * 之后、读这次 status 之前，被并发 unload 掉了）。
+ *
+ * 这些情况下**一律 fail-closed 抛错，不猜测、不当成"未 pin"处理**：一个读不懂/读不到干净
+ * 状态的校验，不能被静默折叠成"看起来没问题"。`reason` 是稳定的枚举值，`message` 只描述
+ * 字段名和期望/实际的类型，**不包含后端返回的任何原始值**（H2：日志与错误不带载荷）。
+ */
+export type OmlxVerificationFailureReason =
+  | "models_missing"
+  | "model_not_found"
+  | "duplicate_model_entries"
+  | "loaded_field_invalid"
+  | "not_loaded"
+  | "pinned_field_invalid";
+
+const VERIFICATION_FAILURE_DETAIL: Record<OmlxVerificationFailureReason, string> = {
+  models_missing: "GET /v1/models/status 响应的 models 字段缺失或不是数组",
+  model_not_found: "models 数组中没有找到 id 匹配的条目",
+  duplicate_model_entries: "models 数组中有多个 id 匹配的条目（期望恰好一个）",
+  loaded_field_invalid: "匹配到的条目的 loaded 字段不是 boolean 类型",
+  not_loaded: "匹配到的条目 loaded=false（可能是在校验窗口内被并发卸载）",
+  pinned_field_invalid: "匹配到的条目的 pinned 字段不是 boolean 类型",
+};
+
+export class OmlxVerificationError extends Error {
+  readonly code = "OMLX_VERIFICATION_FAILED" as const;
+  readonly modelId: string;
+  readonly reason: OmlxVerificationFailureReason;
+
+  constructor(modelId: string, reason: OmlxVerificationFailureReason) {
+    super(
+      `oMLX 模型 "${modelId}" 的状态校验失败（reason=${reason}）：${VERIFICATION_FAILURE_DETAIL[reason]}。` +
+        `这是部分成功/校验失败，不是"确认未被 pin"，调用方不应把它当成正常的 on_demand 结果处理。`,
+    );
+    this.name = "OmlxVerificationError";
+    this.modelId = modelId;
+    this.reason = reason;
+  }
+}
+
+function isRecord(x: unknown): x is Record<string, unknown> {
+  return typeof x === "object" && x !== null;
+}
+
+/**
  * oMLX 适配器（T1.2.2）：把 LoadPolicy 抽象映射到 oMLX 实测端点（spike/u0/U0-LOG.md）。
- * - resident → is_pinned=true（0.6.4 上会抛 `OmlxPinUnavailableError`，见下）
- * - on_demand/evict_to_load/未传 policy → 不主动调用 pin 端点，但会核对该模型实际是否
- *   被外部 pin 住，不一致时抛 `OmlxUnexpectedlyPinnedError`（见 `load()` 注释，H-a）
+ * - resident → is_pinned=true，PUT 成功后还会用 `verifyModelState()` 复核 pinned===true
+ *   才算数（M1），复核/设置失败都抛 `OmlxPinUnavailableError`（见下）
+ * - on_demand/evict_to_load/未传 policy → 不主动调用 pin 端点，但会用 `verifyModelState()`
+ *   严格核对该模型实际的 loaded/pinned 状态，不一致时抛 `OmlxUnexpectedlyPinnedError`
+ *   （见 `load()` 注释，H-a）；`verifyModelState()` 本身解析失败（响应畸形、找不到条目、
+ *   或模型被并发卸载）会抛 `OmlxVerificationError`，**一律 fail-closed，不当成"未被 pin"**（H1）
  * - 显式 POST /v1/models/{id}/load | /unload
  * - admission / status 读 GET /api/status（model_memory_max + loaded_models）
  *
  * ⚠️ 本适配器是本仓内唯一允许出现 "omlx" 字样的实现层；Router 核心不得引用它。
+ *
+ * ⚠️ **日志/错误不带载荷**（H2）：本文件所有抛出的错误信息和 `console.warn` 只写字段名、
+ * 期望的类型、实际收到的类型或下标，**从不把后端返回的原始值字符串化写进去**——后端的响应
+ * 内容可能包含不该出现在日志里的东西。改这个文件时新增校验分支要延续这条规则。
  *
  * 版本注记（FU-16，0.6.4 复测，见 spike/u0/U0-LOG.md「0.6.4 复测」一节，2026-09-27）：
  * - `/api/status` 的已加载模型字段在 0.6.4 上是 `loaded_models`（不是 v0.4.3 假设的 `loaded`）；
@@ -93,10 +150,12 @@ export class OmlxUnexpectedlyPinnedError extends Error {
  * - `/api/status` 的 `model_memory_max` / `model_memory_used` 实测单位是**字节**，已换算成
  *   `ModelBackend` 契约要求的 GiB 口径（÷1024³，见 `status()`/`parseMemoryGb`，M1）——修复前是
  *   直接把字节数塞进 `*Gb` 字段，数值被夸大了 2^30 倍，**这个字段之前不能被当成"已验证可用"**；
- *   缺失或不是有限数字时抛错，不当成 0（L-a，fail-closed）。
+ *   要求严格是 `number` 类型、有限、`>=0`，不做 `Number(value)` 那种会接受字符串/布尔/数组的
+ *   宽松转换（L-a/M3，fail-closed）。
  * - `pressure` 字段缺失时返回显式的 `"unknown"`（不是 fail-open 地当成 `"ok"`）；不在
- *   `ok/soft/hard/ceiling` 白名单里的值会 warn 一行后按 `"unknown"` 处理，不抛错、不影响
- *   同一次 `status()` 里 `loaded` 字段的解析，也不会被无脑 `as Pressure`（见 `parsePressure`，H3/M-c）。
+ *   `ok/soft/hard/ceiling` 白名单里的值会 warn 一行（固定脱敏文案，只报告类型）后按
+ *   `"unknown"` 处理，不抛错、不影响同一次 `status()` 里 `loaded` 字段的解析，也不会被无脑
+ *   `as Pressure`（见 `parsePressure`，H3/M-c）。
  * - 设置 `is_pinned` 的端点在 0.6.4 上从 `POST /admin/settings`（已 404）搬到了
  *   `PUT /admin/api/models/{id}/settings`（body 从 `{model_settings:{id:{is_pinned}}}` 拍平成 `{is_pinned}`）。
  *   **该 body 形状只是照 `GET /openapi.json` 的 `ModelSettingsRequest` schema 编的，从未实测跑通过**
@@ -106,7 +165,8 @@ export class OmlxUnexpectedlyPinnedError extends Error {
  *   因此 `load(id, { mode: "resident" })` 目前在 0.6.4 上会抛出 `OmlxPinUnavailableError`，而不是
  *   真的把模型 pin 住；pin 语义（包括反向的 unpin）在拿到 admin 会话支持前对 0.6.4 是未打通的
  *   （跟进见 FU-17）。`GET /v1/models/status` 则**已实测确认**推理 API key 可以正常读（200，
- *   只读），本适配器用它检测"非 resident 加载的模型是否其实被外部 pin 住"（H-a）。
+ *   只读），本适配器用它严格核对"非 resident 加载的模型是否其实被外部 pin 住"（H-a），
+ *   以及 resident 分支 pin 是否真的生效（M1）。
  *   `pressure` 在 `--memory-guard` 模式下的字段名是否不变也未验证（跟进见 FU-18）。
  */
 export class OmlxBackend implements ModelBackend {
@@ -139,6 +199,21 @@ export class OmlxBackend implements ModelBackend {
       } catch (err) {
         throw new OmlxPinUnavailableError(id, err);
       }
+      // M1：PUT 返回 2xx 不等于真的 pin 上了——用同一个严格状态解析器复核，
+      // 要求 loaded===true 且 pinned===true，否则也算"没能确认 pin 成功"，
+      // 同样包成 OmlxPinUnavailableError（部分成功：模型已加载，但 pin 状态没坐实）。
+      let verified: { loaded: boolean; pinned: boolean };
+      try {
+        verified = await this.verifyModelState(id);
+      } catch (err) {
+        throw new OmlxPinUnavailableError(id, err);
+      }
+      if (!verified.pinned) {
+        throw new OmlxPinUnavailableError(
+          id,
+          new Error("PUT /admin/api/models/{id}/settings 返回成功，但复核 GET /v1/models/status 后 pinned 仍为 false"),
+        );
+      }
       return;
     }
     // 其余分支（on_demand / evict_to_load，以及未传 policy）刻意不调用 setPinned(id, false)：
@@ -156,9 +231,14 @@ export class OmlxBackend implements ModelBackend {
     // 被驱逐的 pinned 模型（H-a）。所以 load 完成后主动查一次 `GET /v1/models/status`（已实测
     // 2026-09-27：用推理 API key 就能读，200，只读，不改变任何状态，见 U0-LOG），核对该模型的
     // `pinned` 字段；不一致就抛 `OmlxUnexpectedlyPinnedError`，而不是悄悄放行。
+    // H1：这里**不吞掉**校验本身的失败——`verifyModelState` 在响应畸形、找不到条目，或者
+    // 最关键的"模型在校验窗口内被并发卸载"（loaded===false）时会抛 `OmlxVerificationError`，
+    // 直接向上传播，不当成"未被 pin"处理（fail-closed；修复前是 fail-open：解析不出 pinned
+    // 字段就默认 false，等于假装"没问题"）。
     // 已知限制（记入 FU-17）：发现被外部 pin 住后，本适配器**无法自动 unpin**（同样需要 admin
     // 会话），只能检测并报告，不能纠正。
-    if (await this.isActuallyPinned(id)) {
+    const { pinned } = await this.verifyModelState(id);
+    if (pinned) {
       throw new OmlxUnexpectedlyPinnedError(id);
     }
   }
@@ -187,17 +267,40 @@ export class OmlxBackend implements ModelBackend {
   }
 
   /**
-   * 查一次 `GET /v1/models/status`，看某个模型当前是否真的处于 `pinned` 状态（H-a）。
+   * 查一次 `GET /v1/models/status`，**严格**核对某个模型当前的 `loaded`/`pinned` 状态（H-a/H1）。
    * 已实测（2026-09-27）：这个端点用推理 API key 就能读（200），是只读操作，不会
    * 改变任何状态——不像 `PUT /admin/api/models/{id}/settings` 那样需要 admin 会话。
-   * 找不到对应模型条目、或响应形状不是预期的 `{models:[{id,pinned}]}` 时，保守地
-   * 当作"未被 pin"（不在这里额外抛错——H-a 只要求检测"确实被 pin 住"这一种偏差，
-   * 响应解析异常已经会在别处（例如 `/api/status`）被更严格的校验捕获）。
+   *
+   * **fail-closed，不 fail-open**：要求 `models` 是数组、里面恰好有一条 `id` 匹配的条目、
+   * `loaded` 是 boolean 且为 `true`（`loaded===false` 说明模型在我们 `POST .../load` 成功之后、
+   * 读这次 status 之前被并发 unload 掉了，这本身就是一种校验失败，不能被吞掉）、`pinned`
+   * 是 boolean。任何一步不满足都抛 `OmlxVerificationError`（H1，修复前是 fail-open：找不到
+   * 条目/字段缺失就默认 `false`=="未被 pin"，等于假装状态正常）。
    */
-  private async isActuallyPinned(id: string): Promise<boolean> {
-    const body = (await this.json("GET", "/v1/models/status")) as { models?: Array<Record<string, unknown>> };
-    const entry = (body.models ?? []).find((m) => m.id === id);
-    return entry?.pinned === true;
+  private async verifyModelState(id: string): Promise<{ loaded: boolean; pinned: boolean }> {
+    const body = (await this.json("GET", "/v1/models/status")) as Record<string, unknown>;
+    const models = body.models;
+    if (!Array.isArray(models)) {
+      throw new OmlxVerificationError(id, "models_missing");
+    }
+    const matches = models.filter((m): m is Record<string, unknown> => isRecord(m) && m.id === id);
+    if (matches.length === 0) {
+      throw new OmlxVerificationError(id, "model_not_found");
+    }
+    if (matches.length > 1) {
+      throw new OmlxVerificationError(id, "duplicate_model_entries");
+    }
+    const entry = matches[0]!;
+    if (typeof entry.loaded !== "boolean") {
+      throw new OmlxVerificationError(id, "loaded_field_invalid");
+    }
+    if (!entry.loaded) {
+      throw new OmlxVerificationError(id, "not_loaded");
+    }
+    if (typeof entry.pinned !== "boolean") {
+      throw new OmlxVerificationError(id, "pinned_field_invalid");
+    }
+    return { loaded: entry.loaded, pinned: entry.pinned };
   }
 
   /**
@@ -208,6 +311,9 @@ export class OmlxBackend implements ModelBackend {
    * - 两个键都缺失/为 `null`，或者选中的值不是数组，都**必须抛错**——
    *   不能像修复前那样静默退化成 `[]`（那会让 `admission()` 把"看不懂响应"
    *   和"这个模型确实没加载"混为一谈，进而一律误判成 `requires_eviction`）。
+   *
+   * H2：错误信息只写字段名和实际类型/下标，**不把收到的原始值字符串化写进去**——
+   * 后端返回的内容可能包含不该出现在日志/错误里的东西，这里只报告"长什么样"，不报告"是什么"。
    */
   private parseLoaded(body: Record<string, unknown>): string[] {
     const loadedModels = body.loaded_models;
@@ -216,32 +322,29 @@ export class OmlxBackend implements ModelBackend {
       throw new Error("oMLX /api/status 缺少 loaded_models 与 loaded 字段，无法确定已加载模型列表");
     }
     if (!Array.isArray(raw)) {
-      throw new Error(`oMLX /api/status 的已加载模型字段不是数组：${JSON.stringify(raw)}`);
+      throw new Error(`oMLX /api/status 的已加载模型字段不是数组（实际类型：${typeof raw}）`);
     }
     // M-a：元素不是字符串时直接抛错，不能用 filter 静默丢弃——丢弃掉的那个模型 id
     // 就从"已加载列表"里凭空消失了，会让 admission()/驱逐决策看到一个偏小的已加载集合。
     return raw.map((x, i) => {
       if (typeof x !== "string") {
-        throw new Error(`oMLX /api/status 的已加载模型列表第 ${i} 项不是字符串：${JSON.stringify(x)}`);
+        throw new Error(`oMLX /api/status 的已加载模型列表第 ${i} 项不是字符串（实际类型：${typeof x}）`);
       }
       return x;
     });
   }
 
   /**
-   * 解析 `/api/status` 的 `model_memory_max` / `model_memory_used`（L-a，字节，见 `status()`）。
-   * 缺失或不是有限数字时直接抛错（fail-closed）——一个解析不出来的内存数字不该被
-   * 悄悄当成 0 处理，那会让 admission/驱逐决策以为后端还有一整块内存可用。
+   * 解析 `/api/status` 的 `model_memory_max` / `model_memory_used`（L-a/M3，字节，见 `status()`）。
+   * 要求**必须已经是** `number` 类型、是有限数字、且 `>= 0`（M3：不做 `Number(value)` 那种宽松转换，
+   * 否则会接受 `"17179869184"` 这样的字符串、`true`/`false`、`[]` 甚至负数）；不满足就抛错
+   * （fail-closed，不当成 0）。错误信息只写实际类型，不把原始值字符串化（H2）。
    */
   private parseMemoryGb(value: unknown, fieldName: string): number {
-    if (value === undefined || value === null) {
-      throw new Error(`oMLX /api/status 缺少 ${fieldName} 字段`);
+    if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
+      throw new Error(`oMLX /api/status 的 ${fieldName} 必须是 >=0 的有限 number（实际类型：${typeof value}）`);
     }
-    const bytes = Number(value);
-    if (!Number.isFinite(bytes)) {
-      throw new Error(`oMLX /api/status 的 ${fieldName} 不是有限数字：${JSON.stringify(value)}`);
-    }
-    return bytes / BYTES_PER_GIB;
+    return value / BYTES_PER_GIB;
   }
 
   /**
@@ -252,13 +355,14 @@ export class OmlxBackend implements ModelBackend {
    * - 值存在但不在 `ok/soft/hard/ceiling` 白名单里（类型不对或拼写变了）时**不抛错**，
    *   warn 一行后按 `"unknown"` 处理——`pressure` 只是 `status()` 里的一个字段，不该让它
    *   的解析失败连带炸掉同一次调用里已经解析好的 `loaded` 列表（M-c）。
+   *   H2：warn 文案是固定的脱敏文案，只报告实际类型，**不把收到的原始值写进日志**。
    */
   private parsePressure(value: unknown): Pressure {
     if (value === undefined || value === null) return "unknown";
     if (typeof value === "string" && (KNOWN_PRESSURE_VALUES as readonly string[]).includes(value)) {
       return value as Pressure;
     }
-    console.warn(`[idoris] oMLX /api/status 返回了不认识的 pressure 值，按 "unknown" 处理：${JSON.stringify(value)}`);
+    console.warn(`[idoris] oMLX /api/status 返回了不认识的 pressure 值（实际类型：${typeof value}），已按 "unknown" 处理`);
     return "unknown";
   }
 

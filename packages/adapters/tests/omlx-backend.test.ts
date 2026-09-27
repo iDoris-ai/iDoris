@@ -1,5 +1,10 @@
 import { describe, expect, it, vi } from "vitest";
-import { OmlxBackend, OmlxPinUnavailableError, OmlxUnexpectedlyPinnedError } from "../omlx/omlx-backend.js";
+import {
+  OmlxBackend,
+  OmlxPinUnavailableError,
+  OmlxUnexpectedlyPinnedError,
+  OmlxVerificationError,
+} from "../omlx/omlx-backend.js";
 
 const jsonRes = (body: unknown, status = 200) => ({
   ok: status < 400,
@@ -8,8 +13,10 @@ const jsonRes = (body: unknown, status = 200) => ({
   text: async () => JSON.stringify(body),
 });
 
-/** `/v1/models/status` 的最小合法响应：只声明测试关心的那一个模型的 pinned 状态。 */
-const modelsStatusRes = (id: string, pinned: boolean) => jsonRes({ models: [{ id, pinned }] });
+/** `/v1/models/status` 的最小合法响应：一条严格通过校验的条目（loaded+pinned 都是 boolean）。 */
+const modelsStatusRes = (id: string, loaded: boolean, pinned: boolean) => jsonRes({ models: [{ id, loaded, pinned }] });
+
+const SENTINEL = "SECRET_SENTINEL_DO_NOT_LEAK";
 
 describe("OmlxBackend", () => {
   it("lists models from /v1/models", async () => {
@@ -20,10 +27,11 @@ describe("OmlxBackend", () => {
   });
 
   describe("load(resident) pin via PUT /admin/api/models/{id}/settings (0.6.4, body only per openapi schema, untested)", () => {
-    it("PUTs the flat {is_pinned:true} body to the new endpoint, and does NOT check /v1/models/status afterwards", async () => {
+    it("PUTs the flat {is_pinned:true} body, then复核 GET /v1/models/status 确认 pinned===true 才算成功（M1）", async () => {
       const calls: Array<[string, string | undefined, unknown]> = [];
       const f = vi.fn(async (url: string, init?: { method?: string; body?: string }) => {
         calls.push([url, init?.method, init?.body]);
+        if (url.endsWith("/v1/models/status")) return modelsStatusRes("Qwen3-8B", true, true);
         return jsonRes({});
       });
       const b = new OmlxBackend({ fetchImpl: f as never });
@@ -31,6 +39,7 @@ describe("OmlxBackend", () => {
       expect(calls.map((c) => c[0])).toEqual([
         "http://127.0.0.1:8088/v1/models/Qwen3-8B/load",
         "http://127.0.0.1:8088/admin/api/models/Qwen3-8B/settings",
+        "http://127.0.0.1:8088/v1/models/status",
       ]);
       expect(calls[1]?.[1]).toBe("PUT"); // L2: 显式断言 method=PUT，不是 POST
       expect(String(calls[1]?.[2])).toBe('{"is_pinned":true}');
@@ -49,19 +58,59 @@ describe("OmlxBackend", () => {
       await expect(promise).rejects.toBeInstanceOf(OmlxPinUnavailableError);
       await expect(promise.catch((e) => e)).resolves.toMatchObject({
         modelId: "Qwen3-8B",
+        code: "OMLX_PIN_UNAVAILABLE",
         message: expect.stringContaining("已加载"),
       });
       // 一份"把 401 吞掉"的改法（例如 setPinned 内部 catch 后什么都不做）会让上面两个 await 都失败，
       // 因为 promise 会 resolve 而不是 reject —— 这正是这条负对照要抓的回归。
     });
+
+    it("M1 负对照：PUT /settings 返回 200，但复核 GET /v1/models/status 后 pinned 仍是 false -> 以 OmlxPinUnavailableError reject（不能把任意 2xx 当成 pin 成功）", async () => {
+      const f = vi.fn(async (url: string) => {
+        if (url.endsWith("/load")) return jsonRes({ status: "ok" });
+        if (url.includes("/admin/api/models/")) return jsonRes({}); // PUT 200，但没真的生效
+        if (url.endsWith("/v1/models/status")) return modelsStatusRes("Qwen3-8B", true, false); // 复核发现仍是 unpinned
+        throw new Error("unexpected url: " + url);
+      });
+      const b = new OmlxBackend({ fetchImpl: f as never });
+      await expect(
+        b.load("Qwen3-8B", { mode: "resident", keepalive: { pinned: true }, admission: "coexist" }),
+      ).rejects.toBeInstanceOf(OmlxPinUnavailableError);
+    });
+
+    it("M1 正对照：PUT 200 且复核后 pinned===true -> resolve", async () => {
+      const f = vi.fn(async (url: string) => {
+        if (url.endsWith("/load")) return jsonRes({ status: "ok" });
+        if (url.includes("/admin/api/models/")) return jsonRes({});
+        if (url.endsWith("/v1/models/status")) return modelsStatusRes("Qwen3-8B", true, true);
+        throw new Error("unexpected url: " + url);
+      });
+      const b = new OmlxBackend({ fetchImpl: f as never });
+      await expect(
+        b.load("Qwen3-8B", { mode: "resident", keepalive: { pinned: true }, admission: "coexist" }),
+      ).resolves.toBeUndefined();
+    });
+
+    it("M1：复核请求本身失败（例如复核时模型被并发卸载）也算 pin 没坐实 -> OmlxPinUnavailableError", async () => {
+      const f = vi.fn(async (url: string) => {
+        if (url.endsWith("/load")) return jsonRes({ status: "ok" });
+        if (url.includes("/admin/api/models/")) return jsonRes({});
+        if (url.endsWith("/v1/models/status")) return modelsStatusRes("Qwen3-8B", false, false); // 并发卸载
+        throw new Error("unexpected url: " + url);
+      });
+      const b = new OmlxBackend({ fetchImpl: f as never });
+      await expect(
+        b.load("Qwen3-8B", { mode: "resident", keepalive: { pinned: true }, admission: "coexist" }),
+      ).rejects.toBeInstanceOf(OmlxPinUnavailableError);
+    });
   });
 
-  describe("load(non-resident) 加载完成后核对是否被外部 pin 住（H-a）", () => {
+  describe("load(non-resident) 加载完成后严格核对是否被外部 pin 住（H-a/H1）", () => {
     it("on_demand: 不调用 pin/settings 端点，但会读 GET /v1/models/status", async () => {
       const calls: string[] = [];
       const f = vi.fn(async (url: string) => {
         calls.push(url);
-        if (url.endsWith("/v1/models/status")) return modelsStatusRes("VL-7B", false);
+        if (url.endsWith("/v1/models/status")) return modelsStatusRes("VL-7B", true, false);
         return jsonRes({});
       });
       const b = new OmlxBackend({ fetchImpl: f as never });
@@ -76,7 +125,7 @@ describe("OmlxBackend", () => {
       const calls: string[] = [];
       const f = vi.fn(async (url: string) => {
         calls.push(url);
-        if (url.endsWith("/v1/models/status")) return modelsStatusRes("VL-7B", false);
+        if (url.endsWith("/v1/models/status")) return modelsStatusRes("VL-7B", true, false);
         return jsonRes({});
       });
       const b = new OmlxBackend({ fetchImpl: f as never });
@@ -87,10 +136,10 @@ describe("OmlxBackend", () => {
       ]);
     });
 
-    it("H-a 正对照：/v1/models/status 报告 pinned:false 时 load(on_demand) 正常 resolve", async () => {
+    it("H-a 正对照：/v1/models/status 报告 loaded:true, pinned:false 时 load(on_demand) 正常 resolve", async () => {
       const f = vi.fn(async (url: string) => {
         if (url.endsWith("/load")) return jsonRes({ status: "ok" });
-        if (url.endsWith("/v1/models/status")) return modelsStatusRes("Qwen3-8B", false);
+        if (url.endsWith("/v1/models/status")) return modelsStatusRes("Qwen3-8B", true, false);
         throw new Error("unexpected url: " + url);
       });
       const b = new OmlxBackend({ fetchImpl: f as never });
@@ -99,10 +148,10 @@ describe("OmlxBackend", () => {
       ).resolves.toBeUndefined();
     });
 
-    it("H-a 负对照：/v1/models/status 报告 pinned:true 时 load(on_demand) 以 OmlxUnexpectedlyPinnedError reject（模型可能是被 oMLX 管理页手动 pin 过，或 pin 状态跨重启保留）", async () => {
+    it("H-a 负对照：pinned:true 时 load(on_demand) 以 OmlxUnexpectedlyPinnedError reject（模型可能是被 oMLX 管理页手动 pin 过，或 pin 状态跨重启保留）", async () => {
       const f = vi.fn(async (url: string) => {
         if (url.endsWith("/load")) return jsonRes({ status: "ok" });
-        if (url.endsWith("/v1/models/status")) return modelsStatusRes("Qwen3-8B", true);
+        if (url.endsWith("/v1/models/status")) return modelsStatusRes("Qwen3-8B", true, true);
         throw new Error("unexpected url: " + url);
       });
       const b = new OmlxBackend({ fetchImpl: f as never });
@@ -114,6 +163,7 @@ describe("OmlxBackend", () => {
       await expect(promise).rejects.toBeInstanceOf(OmlxUnexpectedlyPinnedError);
       await expect(promise.catch((e) => e)).resolves.toMatchObject({
         modelId: "Qwen3-8B",
+        code: "OMLX_UNEXPECTEDLY_PINNED",
         message: expect.stringContaining("pinned"),
       });
     });
@@ -121,13 +171,117 @@ describe("OmlxBackend", () => {
     it("evict_to_load 模式也会核对 pinned 状态", async () => {
       const f = vi.fn(async (url: string) => {
         if (url.endsWith("/load")) return jsonRes({ status: "ok" });
-        if (url.endsWith("/v1/models/status")) return modelsStatusRes("Qwen3-8B", true);
+        if (url.endsWith("/v1/models/status")) return modelsStatusRes("Qwen3-8B", true, true);
         throw new Error("unexpected url: " + url);
       });
       const b = new OmlxBackend({ fetchImpl: f as never });
       await expect(
         b.load("Qwen3-8B", { mode: "evict_to_load", keepalive: { idle_ttl_s: 300 }, admission: "requires_eviction" }),
       ).rejects.toBeInstanceOf(OmlxUnexpectedlyPinnedError);
+    });
+
+    describe("H1 负对照：verifyModelState 严格校验，fail-closed 而不是 fail-open", () => {
+      it("并发卸载（loaded:false）-> OmlxVerificationError(reason=not_loaded)，不当成'未被 pin'放行", async () => {
+        const f = vi.fn(async (url: string) => {
+          if (url.endsWith("/load")) return jsonRes({ status: "ok" });
+          if (url.endsWith("/v1/models/status")) return modelsStatusRes("Qwen3-8B", false, false);
+          throw new Error("unexpected url: " + url);
+        });
+        const b = new OmlxBackend({ fetchImpl: f as never });
+        const promise = b.load("Qwen3-8B", {
+          mode: "on_demand",
+          keepalive: { idle_ttl_s: 300 },
+          admission: "requires_eviction",
+        });
+        await expect(promise).rejects.toBeInstanceOf(OmlxVerificationError);
+        await expect(promise.catch((e) => e)).resolves.toMatchObject({ reason: "not_loaded" });
+      });
+
+      it("模型不在 models 列表里 -> OmlxVerificationError(reason=model_not_found)", async () => {
+        const f = vi.fn(async (url: string) => {
+          if (url.endsWith("/load")) return jsonRes({ status: "ok" });
+          if (url.endsWith("/v1/models/status")) return jsonRes({ models: [{ id: "someone-else", loaded: true, pinned: false }] });
+          throw new Error("unexpected url: " + url);
+        });
+        const b = new OmlxBackend({ fetchImpl: f as never });
+        const promise = b.load("Qwen3-8B", {
+          mode: "on_demand",
+          keepalive: { idle_ttl_s: 300 },
+          admission: "requires_eviction",
+        });
+        await expect(promise).rejects.toBeInstanceOf(OmlxVerificationError);
+        await expect(promise.catch((e) => e)).resolves.toMatchObject({ reason: "model_not_found" });
+      });
+
+      it("models 字段缺失 -> OmlxVerificationError(reason=models_missing)", async () => {
+        const f = vi.fn(async (url: string) => {
+          if (url.endsWith("/load")) return jsonRes({ status: "ok" });
+          if (url.endsWith("/v1/models/status")) return jsonRes({}); // 没有 models 字段
+          throw new Error("unexpected url: " + url);
+        });
+        const b = new OmlxBackend({ fetchImpl: f as never });
+        const promise = b.load("Qwen3-8B", {
+          mode: "on_demand",
+          keepalive: { idle_ttl_s: 300 },
+          admission: "requires_eviction",
+        });
+        await expect(promise).rejects.toBeInstanceOf(OmlxVerificationError);
+        await expect(promise.catch((e) => e)).resolves.toMatchObject({ reason: "models_missing" });
+      });
+
+      it("pinned 字段不是 boolean -> OmlxVerificationError(reason=pinned_field_invalid)", async () => {
+        const f = vi.fn(async (url: string) => {
+          if (url.endsWith("/load")) return jsonRes({ status: "ok" });
+          if (url.endsWith("/v1/models/status")) return jsonRes({ models: [{ id: "Qwen3-8B", loaded: true, pinned: "yes" }] });
+          throw new Error("unexpected url: " + url);
+        });
+        const b = new OmlxBackend({ fetchImpl: f as never });
+        const promise = b.load("Qwen3-8B", {
+          mode: "on_demand",
+          keepalive: { idle_ttl_s: 300 },
+          admission: "requires_eviction",
+        });
+        await expect(promise).rejects.toBeInstanceOf(OmlxVerificationError);
+        await expect(promise.catch((e) => e)).resolves.toMatchObject({ reason: "pinned_field_invalid" });
+      });
+
+      it("loaded 字段不是 boolean -> OmlxVerificationError(reason=loaded_field_invalid)", async () => {
+        const f = vi.fn(async (url: string) => {
+          if (url.endsWith("/load")) return jsonRes({ status: "ok" });
+          if (url.endsWith("/v1/models/status")) return jsonRes({ models: [{ id: "Qwen3-8B", loaded: "yes", pinned: false }] });
+          throw new Error("unexpected url: " + url);
+        });
+        const b = new OmlxBackend({ fetchImpl: f as never });
+        const promise = b.load("Qwen3-8B", {
+          mode: "on_demand",
+          keepalive: { idle_ttl_s: 300 },
+          admission: "requires_eviction",
+        });
+        await expect(promise).rejects.toBeInstanceOf(OmlxVerificationError);
+        await expect(promise.catch((e) => e)).resolves.toMatchObject({ reason: "loaded_field_invalid" });
+      });
+
+      it("models 数组中有重复 id -> OmlxVerificationError(reason=duplicate_model_entries)", async () => {
+        const f = vi.fn(async (url: string) => {
+          if (url.endsWith("/load")) return jsonRes({ status: "ok" });
+          if (url.endsWith("/v1/models/status"))
+            return jsonRes({
+              models: [
+                { id: "Qwen3-8B", loaded: true, pinned: false },
+                { id: "Qwen3-8B", loaded: true, pinned: true },
+              ],
+            });
+          throw new Error("unexpected url: " + url);
+        });
+        const b = new OmlxBackend({ fetchImpl: f as never });
+        const promise = b.load("Qwen3-8B", {
+          mode: "on_demand",
+          keepalive: { idle_ttl_s: 300 },
+          admission: "requires_eviction",
+        });
+        await expect(promise).rejects.toBeInstanceOf(OmlxVerificationError);
+        await expect(promise.catch((e) => e)).resolves.toMatchObject({ reason: "duplicate_model_entries" });
+      });
     });
   });
 
@@ -167,7 +321,9 @@ describe("OmlxBackend", () => {
         expect(status.pressure).toBe("unknown");
         expect(status.loaded).toEqual(["A"]); // pressure 解析失败不连带炸掉 loaded
         expect(warnSpy).toHaveBeenCalledTimes(1);
-        expect(String(warnSpy.mock.calls[0]?.[0])).toContain("critical");
+        const warned = String(warnSpy.mock.calls[0]?.[0]);
+        expect(warned).toContain("string"); // H2: 只报告类型
+        expect(warned).not.toContain("critical"); // H2: 不把原值写进日志
       } finally {
         warnSpy.mockRestore();
       }
@@ -211,26 +367,108 @@ describe("OmlxBackend", () => {
       await expect(b.status()).rejects.toThrow(/不是字符串/);
     });
 
-    it("L-a: model_memory_max 缺失时抛错（fail-closed，不当成 0）", async () => {
-      const f = vi.fn(async () => jsonRes({ model_memory_used: 0, loaded_models: [] }));
-      const b = new OmlxBackend({ fetchImpl: f as never });
-      await expect(b.status()).rejects.toThrow(/缺少 model_memory_max/);
-    });
+    describe("M3: model_memory_max/used 必须严格是 number（不能用 Number(value) 那种宽松转换）", () => {
+      it("缺失时抛错（fail-closed，不当成 0）", async () => {
+        const f = vi.fn(async () => jsonRes({ model_memory_used: 0, loaded_models: [] }));
+        const b = new OmlxBackend({ fetchImpl: f as never });
+        await expect(b.status()).rejects.toThrow(/model_memory_max/);
+      });
 
-    it("L-a: model_memory_used 不是有限数字时抛错", async () => {
+      it("数字字符串（例如 \"17179869184\"）被拒绝，不当成合法数字接受", async () => {
+        const f = vi.fn(async () =>
+          jsonRes({ model_memory_max: "17179869184", model_memory_used: 0, loaded_models: [] }),
+        );
+        const b = new OmlxBackend({ fetchImpl: f as never });
+        await expect(b.status()).rejects.toThrow(/model_memory_max/);
+      });
+
+      it("boolean（true）被拒绝", async () => {
+        const f = vi.fn(async () => jsonRes({ model_memory_max: true, model_memory_used: 0, loaded_models: [] }));
+        const b = new OmlxBackend({ fetchImpl: f as never });
+        await expect(b.status()).rejects.toThrow(/model_memory_max/);
+      });
+
+      it("数组（[]）被拒绝", async () => {
+        const f = vi.fn(async () => jsonRes({ model_memory_max: [], model_memory_used: 0, loaded_models: [] }));
+        const b = new OmlxBackend({ fetchImpl: f as never });
+        await expect(b.status()).rejects.toThrow(/model_memory_max/);
+      });
+
+      it("负数被拒绝", async () => {
+        const f = vi.fn(async () => jsonRes({ model_memory_max: -1, model_memory_used: 0, loaded_models: [] }));
+        const b = new OmlxBackend({ fetchImpl: f as never });
+        await expect(b.status()).rejects.toThrow(/model_memory_max/);
+      });
+
+      it("Infinity 被拒绝（不是有限数字）", async () => {
+        const f = vi.fn(async () =>
+          jsonRes({ model_memory_max: Number.POSITIVE_INFINITY, model_memory_used: 0, loaded_models: [] }),
+        );
+        const b = new OmlxBackend({ fetchImpl: f as never });
+        await expect(b.status()).rejects.toThrow(/model_memory_max/);
+      });
+    });
+  });
+
+  describe("H2 哨兵测试：错误信息与 console 输出不含后端原始载荷", () => {
+    it("parseLoaded 的\"不是数组\"错误不包含响应中的哨兵字符串", async () => {
       const f = vi.fn(async () =>
-        jsonRes({ model_memory_max: 0, model_memory_used: "not-a-number", loaded_models: [] }),
+        jsonRes({ model_memory_max: 0, model_memory_used: 0, loaded_models: SENTINEL }),
       );
       const b = new OmlxBackend({ fetchImpl: f as never });
-      await expect(b.status()).rejects.toThrow(/不是有限数字/);
+      const err = await b.status().catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(Error);
+      expect((err as Error).message).not.toContain(SENTINEL);
     });
 
-    it("L-a: model_memory_max 为 Infinity 时抛错", async () => {
+    it("parseLoaded 的\"元素不是字符串\"错误不包含响应中的哨兵字符串", async () => {
       const f = vi.fn(async () =>
-        jsonRes({ model_memory_max: Number.POSITIVE_INFINITY, model_memory_used: 0, loaded_models: [] }),
+        jsonRes({ model_memory_max: 0, model_memory_used: 0, loaded_models: [{ note: SENTINEL }] }),
       );
       const b = new OmlxBackend({ fetchImpl: f as never });
-      await expect(b.status()).rejects.toThrow(/不是有限数字/);
+      const err = await b.status().catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(Error);
+      expect((err as Error).message).not.toContain(SENTINEL);
+    });
+
+    it("parseMemoryGb 的错误不包含响应中的哨兵字符串", async () => {
+      const f = vi.fn(async () =>
+        jsonRes({ model_memory_max: SENTINEL, model_memory_used: 0, loaded_models: [] }),
+      );
+      const b = new OmlxBackend({ fetchImpl: f as never });
+      const err = await b.status().catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(Error);
+      expect((err as Error).message).not.toContain(SENTINEL);
+    });
+
+    it("parsePressure 的 console.warn 不包含响应中的哨兵字符串", async () => {
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        const f = vi.fn(async () =>
+          jsonRes({ model_memory_max: 0, model_memory_used: 0, loaded_models: [], pressure: SENTINEL }),
+        );
+        const b = new OmlxBackend({ fetchImpl: f as never });
+        await b.status();
+        expect(warnSpy).toHaveBeenCalledTimes(1);
+        expect(String(warnSpy.mock.calls[0]?.[0])).not.toContain(SENTINEL);
+      } finally {
+        warnSpy.mockRestore();
+      }
+    });
+
+    it("verifyModelState 的 OmlxVerificationError 不包含响应中的哨兵字符串（即便哨兵出现在无关字段里）", async () => {
+      const f = vi.fn(async (url: string) => {
+        if (url.endsWith("/load")) return jsonRes({ status: "ok" });
+        if (url.endsWith("/v1/models/status"))
+          return jsonRes({ models: [{ id: "Qwen3-8B", loaded: true, pinned: SENTINEL, note: SENTINEL }] });
+        throw new Error("unexpected url: " + url);
+      });
+      const b = new OmlxBackend({ fetchImpl: f as never });
+      const err = await b
+        .load("Qwen3-8B", { mode: "on_demand", keepalive: { idle_ttl_s: 300 }, admission: "requires_eviction" })
+        .catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(OmlxVerificationError);
+      expect((err as Error).message).not.toContain(SENTINEL);
     });
   });
 
