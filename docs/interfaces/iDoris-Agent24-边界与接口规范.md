@@ -1,6 +1,6 @@
 # iDoris × Agent24 分工边界与接口数据规范
 
-> **状态**：✅ **定稿 v1.0（2026-09-27）**。经 R0–R4 四轮协商，双方一致同意；D-1…D-7 由 jason 拍板，全部选 (a)。下一步是把 §4 转成 `packages/contracts/schema/` 下的 JSON Schema。之后的任何修改都走「提议 → 双方同意 → 升版本」，按加法兼容处理。
+> **状态**：✅ **v1.1（2026-09-27）**。本版在 v1.0 基础上做加法修订：新增 G-8（按请求阶段划分职责）、§3.2 凭证模块 vault、§3.12 J-2 澄清，并同步修订处理顺序为 隐私 → 意图 → 预算。依据是 R6/R7 协商结果，以及 jason 对 J-1…J-8 的拍板（全部选 (a)）。之后的修改仍然走「提议 → 双方同意 → 升版本」。
 > **权威**：沿用 docs/17 D0。iDoris 是能力提供方，负责主持本规范；Agent24 是需求方，负责提需求、审阅、确认。定稿后以 **JSON Schema** 为真源，放入 `iDoris/packages/contracts/schema/`，Markdown 只是说明。
 > **上位**：[`../iDoris-总体规划.md`](../iDoris-总体规划.md)（§6 管理面分工、§8 服务目录、§12 协商流程）。
 > **承接**：Agent24 `docs/design/INTEGRATION-AGENTEAR-IDORIS.md`（ADR-032）§9 与附录 B 中**已经和 iDoris 谈定的条款全部继承**，本规范不重新谈。
@@ -27,6 +27,25 @@
 | G-5 | 加法优先、零回归：新能力以新端点、新 header、新字段的形式出现；破坏性变更走契约大版本 | docs/09 R1、docs/17 |
 | G-6 | 不静默：不支持的字段显式拒绝；降级和实际落点在响应头里回传 | iDoris 总体规划不变式 8 |
 | G-7 | 敏感开关的最终确认**留在 iDoris**，Agent24 可以发起 | 总体规划 §6.1 |
+| G-8 | **按请求阶段划分职责**（v1.1，见 §1.1）。一句话：Agent24 决定「做什么、用什么工具、能不能做」；iDoris 决定「这一次模型调用用哪个模型、在哪里跑、花不花钱、记不记」。**本阶段视图不新增、也不改变 §3 的职责划分；如有冲突，以 §3/§3.12 为准** | R6/R7、J-1 |
+
+### 1.1 请求阶段与负责方（G-8）
+
+| 阶段 | 内容 | 负责方 |
+|:---|:---|:---|
+| S0 接入交互 | 渠道、会话 | Agent24 |
+| S1 任务理解与规划 | 用户要做什么、拆成哪些步骤、选用哪些工具/技能/模块（**任务级意图**） | Agent24 |
+| S2 动作授权 | tier 门、Guardian 风险闸、人工审批；可以调用 iDoris 的 `/v1/systemone` 取判定原语。**组合风险检测**（Lethal Trifecta 一类）归 Agent24，目前尚未实现，不写时间承诺（J-3） | Agent24 |
+| S3 工具执行 | 非 LLM 的 HTTP、本地文件、CLI；第三方凭证经 vault 部署 (b) 注入（§3.2） | Agent24 |
+| S4 发起模型调用 | 把任务映射为 role，设置 Privacy、Complexity 等请求头，产出请求并交给 iDoris | Agent24 |
+| S5 模型调用内部 | **按 Agent24 声明的角色与能力需求选模型与路径**：隐私闸 → 角色/能力匹配 → 预算（只对付费候选做原子 reserve）→ 容量（加载/驱逐）→ 执行（本地运行时，或远程 + 凭证注入）→ 回传 Served-Locality 与 Record-Id。角色内可以降级；**跨角色**降级必须由 Agent24 用 `X-iDoris-Fallback` 声明，并在响应中如实回传（J-2） | iDoris |
+| S6 结果返回 | 检查 Served-Locality 绊线，继续执行计划，写入记忆 | Agent24 |
+| S7 记录与学习 | Agent24：事件日志 → Evolver 学技能。iDoris：审计元数据与可选轨迹 → 学路由与判定。两边以 `record_id` 关联 | 各自负责 |
+
+**三个典型场景**
+1. **总结今天的微信群聊**（敏感、只能在本机处理）。Agent24 先用本地工具取消息，再以 `idoris/daily` + `local_only` 发起调用。iDoris 过隐私闸后选本地 daily 模型，必要时驱逐空闲模型再加载；本地调用不涉及预算，响应回传 `loopback`。如果本地模型加载不起来，返回 **503 fail-closed**，**不会改走云端**。
+2. **查资料写竞品分析报告**（公开数据，复杂任务）。Agent24 执行搜索和抓取工具，凭证由 vault (b) 注入。之后以 `idoris/deep` + `any` 发起调用。iDoris 选远程 deep 模型，对预算做原子 reserve（额度不足返回 402；只有调用方声明了 Fallback 才回落，并回传说明），注入 provider 凭证（vault (a)），结算后回传 `X-iDoris-Cost-Minor`，Agent24 记入按模块的用量账本。
+3. **转账或删除文件**（高风险动作）。Agent24 的 Guardian 调用 `/v1/systemone`（`local_only`），iDoris 用本地判定器返回概率，并如实回报 `judge.engine`。判定器不可用时**拒绝**（`judge_unavailable`），Agent24 转人工确认。资产类签名只能走 AirAccount + passkey（J-7）。双方以 `record_id` 与 `approval_id` 关联记录。
 
 ---
 
@@ -85,7 +104,23 @@
 | | iDoris | Agent24 |
 |:---|:---|:---|
 | 负责 | **签发虚拟 key**（每个 Agent24 实例或模块一把，带 scope）；tenant 策略权威；签发跨组件 tenant 能力凭据（B7，M8） | 在 Keychain 保存 iDoris 签发的 key；按模块选用 key；把用户或组织身份映射成 tenant |
-| 不负责 | 用户认证（归 AirAccount / 组织 IdP）；Agent24 的工具凭证 | provider 真实 key（归 iDoris 闸二） |
+| 不负责 | 用户认证（归 AirAccount / 组织 IdP）；Agent24 工具凭证的**使用授权**（归 Agent24，J-4） | provider 真实 key（归 iDoris 闸二） |
+
+#### 3.2.1 凭证模块 vault（v1.1，J-4/J-5/J-7/J-8）
+
+- **定位**：独立的 Rust crate，由 iDoris 开发，Agent24 作为消费方参与接口设计。一份加密存储（主密钥放在 Keychain，条目加密，只存密文），支持两种部署形态：
+  - **(a) 嵌入 iDoris**：用于模型 provider 出站时注入凭证。**谁能用哪个 provider 由 iDoris 的虚拟 key 策略决定**（本节上文）。个人版仍然只有一个二进制。
+  - **(b) 独立守护进程 / 出站代理**：供 Agent24 的工具、CLI、MCP 使用。**与 iDoris 网关是不同的进程/实例**。**谁能用哪把凭证由 Agent24 的 grant/审批签发调用方 token 与 scope 决定**，vault 只负责校验、注入和审计（单一策略源，G-1/G-2）。
+- **覆盖范围（J-5）**：只管**出站第三方凭证**。Agent24 的内部令牌（daemon bearer、模块握手、A3 附着、Desktop host secret）和模块 actor key **不进 vault**。
+- **凭证类别（J-7）**：
+  - bearer 类：注入。
+  - 身份/服务类签名（Nostr、SSH、HMAC/SigV4）：vault 代签，私钥不出模块。
+  - **资产类**（钱包 owner key、EOA、AirAccount 签名）：只归 AirAccount（TEE KMS + passkey）。vault **不托管、不代签**；Agent24 只负责发起和过审批门，最终确认在用户的 passkey 上完成。
+- **注入方式**：v1 先实现显式代理 + 请求头替换（OneCLI 模式：调用方只持有占位符）。之后补「启动时注入环境变量」模式，覆盖读环境变量的 MCP/CLI 和非 HTTP 协议。
+- **fail-closed**：解析或注入失败时一律拒绝，**不回退去读环境变量**。
+- **机制**：按次派发，短 TTL，落盘只存哈希；凭证优先级为 自有 key > 团队 key > 托管 key（借鉴 treg，只借鉴设计：treg 许可证有「禁止托管销售」条款）；余额不足返回结构化 402；审计只记元数据。
+- **法律边界**：组织内部共享付费账号可以；**跨用户转售托管账号不做**（PGL「平台不充当资金池」）。
+- **Agent24 侧前置（J-6）**：在 M4 接入 iDoris 之前，Agent24 修补 `shell_exec` 与 MCP 子进程继承环境变量的缺口（`env_clear` + 白名单，mcp.json 支持按 server 配置 env），防止 `IDORIS_API_KEY` 外泄。
 
 - 请求头：`Authorization: Bearer idk_<key>`（M4 起。loopback 可配置为免 key；非 loopback 必须带 key）；`X-iDoris-Tenant`（tenant 模式必填，沿用 contract-tenancy v1.3）。
 - key 的 scope（草案）：`{key_id, owner, allowed_privacy[], allowed_roles[], budget_ref, expires_at, admin_scopes[]}`。Agent24 管理页使用的 key 需要 `admin_scopes`。
@@ -271,6 +306,13 @@
   - 授权 tier 门；
   - 按模块的用量账本：只计次数和 token；费用只记录 iDoris 回传的 `X-iDoris-Cost-Minor`，自己不算。
 
+### 3.13 v1.1 补充约定（J-2，与上文冲突时以本节为准）
+
+- **privacy 的下限来自请求头**。iDoris 的隐私闸可以检查内容，但**只能收紧**（脱敏，或拒绝出本机），永不放宽；`local_only` 绝不会因为内容而被放宽。
+- 「不从内容推断任务意图/角色」**只约束声明了角色的调用方**（Agent24）。Agent24 显式发送 `idoris/auto` 时，等于把选角色的权力交给 iDoris，此时 privacy 仍然只能以请求头为下限。
+- 未声明角色的其他调用方：iDoris 按静态规则或判定器选角色，并在响应中回传所选角色。
+- **处理顺序**：隐私 → 角色/能力匹配 → 预算（只作用于付费候选）→ 容量 → 选择/降级。所选路径需要付费而预算不足时，返回 **402，终态**，不会在预算剔除远程候选后再静默改选本地模型。
+
 ## 4. 数据规范清单（定稿后进入 `packages/contracts/schema/`）
 
 | Schema | 状态 |
@@ -314,3 +356,5 @@
 | R3 | 2026-09-27 | jason | **D-1…D-7 全部选 (a)**：配置 IDORIS_URL 后独占（不留直连 oMLX 的通道）；等 M4 前置完成再接入；Evolver 主数据源是 Agent24 事件日志；敏感确认只在 iDoris 控制台完成；Desktop main 进程直连 Admin 端口；每个实例两把 key；原型阶段只承诺 M4 状态卡片。同时同意 Agent24 那约 20 行文档修改 | 等 Agent24 回复「R2 无异议」后定稿 → 转 JSON Schema |
 | R4 | 2026-09-27 | Agent24 | 「已读 §3.12，与我方 R1 一致，**R2 无异议**」。Agent24 开始修订自己的约 20 行文档：L3 改为 ATIF v1.8 交换格式；ADR-032 §9 标为过期；引用本规范。见 [Agent24 PR #540](https://github.com/iDoris-ai/Agent24/pull/540) | **定稿 v1.0** |
 | R5 | 2026-09-27 | iDoris | v1.0.1 措辞澄清（T4.1 验收时发现）：Served-Locality 只在已选定后端时才带；它表示推理实际发生的位置；缓存命中带 Cached 和 Origin-Record-Id。都是加法兼容 | **Agent24 无异议**：接入时按 Cached + Origin-Record-Id 去重记账，这条写进它们的 P4 设计 |
+| R6 | 2026-09-27 | iDoris | jason 提出，iDoris 提议：请求阶段职责划分 S0–S7；统一凭证模块 vault | Agent24 方向同意，提出措辞修订与五个条件 |
+| R7 | 2026-09-27 | 双方 | iDoris 采纳全部措辞修订与条件，并对 J-4、J-2 各加一处限定；Agent24 确认；jason 拍板 J-1…J-8 全部选 (a) | **v1.1** |
