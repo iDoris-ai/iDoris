@@ -13,6 +13,10 @@ pub mod profile;
 /// into `AppState`/`/health`'s `components` count in a follow-up PR.
 pub mod components;
 
+/// Routing-policy loading from `IDORIS_ROUTING_POLICY` (R2-D task 2); wired
+/// into `AppState` in a follow-up PR.
+pub mod routing_policy;
+
 use std::net::IpAddr;
 use std::sync::Arc;
 
