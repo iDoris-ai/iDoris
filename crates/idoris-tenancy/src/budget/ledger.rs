@@ -22,6 +22,46 @@ use super::error::{BudgetError, checked_add_i64, checked_sub_i64};
 use super::period::billing_period_key;
 use super::scope::BudgetScope;
 
+/// Opus Tier-2 re-review B-8: a deterministic way to prove the concurrency
+/// tests in `tests/budget_concurrency.rs` would actually catch a "split the
+/// atomic check-and-deduct transaction" regression class — without hand-
+/// editing `reserve()` and adding a sleep to widen the race window (which
+/// only proves the bug is catchable *with help*, not that the test suite
+/// reliably catches an unmitigated real mutation). Gated behind the
+/// `mutation-test-hooks` feature, off by default: with the feature disabled
+/// this module doesn't exist and `reserve()`'s check is a no-op `cfg`
+/// branch that compiles away entirely, so there is no production cost or
+/// risk from this existing.
+#[cfg(feature = "mutation-test-hooks")]
+pub mod test_hooks {
+    use std::sync::{Barrier, OnceLock};
+
+    /// When armed (via [`arm`]), `reserve` commits its balance-check
+    /// transaction and rendezvous on this barrier before opening a *new*
+    /// transaction for the insert — reproducing the split-transaction bug
+    /// class on demand. Every participating thread blocks here until all of
+    /// them have arrived, i.e. until all of them have passed their own
+    /// balance check, which is what forces the over-spend deterministically
+    /// (no thread can "get lucky" and slip through before the others catch
+    /// up, and no thread can proceed to its insert before the others have
+    /// all committed their checks).
+    static BARRIER: OnceLock<Barrier> = OnceLock::new();
+
+    /// Arm the hook for `thread_count` participants. Call once before
+    /// spawning the threads that will call `reserve`; each of them must
+    /// actually call `reserve` exactly once for the barrier to release.
+    pub fn arm(thread_count: usize) {
+        BARRIER
+            .set(Barrier::new(thread_count))
+            .unwrap_or_else(|_| panic!("test_hooks::arm called more than once per process"));
+    }
+
+    /// `None` when not armed — `reserve` skips the hook entirely.
+    pub(super) fn barrier() -> Option<&'static Barrier> {
+        BARRIER.get()
+    }
+}
+
 /// Reservation lifecycle state. Opus Tier-2 acceptance L3: this used to be
 /// raw `&str`/`String` comparisons against the SQL `status` column's TEXT
 /// values scattered across `settle`/`release`, which is exactly the kind of
@@ -551,6 +591,22 @@ impl BudgetLedger {
             }
         }
 
+        // B-8 mutation-testing hook (see `test_hooks` doc comment) — a
+        // no-op unless a test has explicitly armed it. When armed, this
+        // reproduces the split-transaction bug class on purpose: commit the
+        // check we just did, rendezvous with every other participating
+        // thread, then open a *new* transaction for the insert below —
+        // exactly the non-atomic check-then-deduct this crate exists to
+        // prevent.
+        #[cfg(feature = "mutation-test-hooks")]
+        let mut tx = tx;
+        #[cfg(feature = "mutation-test-hooks")]
+        if let Some(barrier) = test_hooks::barrier() {
+            tx.commit()?;
+            barrier.wait();
+            tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        }
+
         // Overflow would wrap to a past instant (release) and make the
         // reservation invisible to the balance sum — reject instead.
         let expires_at_ms = now_ms
@@ -772,13 +828,25 @@ impl BudgetLedger {
     /// `expired` one should be re-reserved instead (extending it would
     /// resurrect a reservation other code may have already treated as
     /// freed).
+    /// B-5 (Opus Tier-2 re-review) hardening:
+    /// - `additional_ttl_ms` may not exceed this ledger's own `ttl_ms` — one
+    ///   `extend` call can renew for at most as long as a fresh `reserve`
+    ///   would have granted, not an arbitrary caller-chosen amount.
+    /// - the reservation's total lifetime (`created_at_ms` to the *new*
+    ///   `expires_at_ms`) may not exceed 4x `ttl_ms` — bounds how many times
+    ///   `extend` can be chained, so a caller can't keep a reservation (and
+    ///   the budget it holds) alive indefinitely.
+    /// - a reservation whose TTL has already lapsed (`expires_at_ms <=
+    ///   now_ms`) is rejected even if its DB `status` is still `active`
+    ///   (lazily not yet swept) — extending a reservation other code may
+    ///   already be treating as freed would resurrect it unexpectedly.
     pub fn extend(
         &self,
         tenant_id: &str,
         reservation_id: &ReservationId,
         additional_ttl_ms: i64,
     ) -> Result<(), BudgetError> {
-        if additional_ttl_ms <= 0 {
+        if additional_ttl_ms <= 0 || additional_ttl_ms > self.ttl_ms {
             return Err(BudgetError::InvalidTtl {
                 ttl_ms: additional_ttl_ms,
             });
@@ -789,7 +857,7 @@ impl BudgetLedger {
 
         let row = find_reservation(&tx, tenant_id, reservation_id)?;
         let status = ReservationStatus::parse(&row.status)?;
-        if status != ReservationStatus::Active {
+        if status != ReservationStatus::Active || row.expires_at_ms <= now_ms {
             tx.rollback().ok();
             return Err(BudgetError::ReservationNotActive {
                 reservation_id: reservation_id.0.clone(),
@@ -800,6 +868,20 @@ impl BudgetLedger {
         let new_expires_at_ms = now_ms
             .checked_add(additional_ttl_ms)
             .ok_or(BudgetError::InvalidTimestamp { now_ms })?;
+        let max_lifetime_ms = self.ttl_ms.checked_mul(4).ok_or(BudgetError::InvalidTtl {
+            ttl_ms: additional_ttl_ms,
+        })?;
+        let max_expires_at_ms = row
+            .created_at_ms
+            .checked_add(max_lifetime_ms)
+            .ok_or(BudgetError::InvalidTimestamp { now_ms })?;
+        if new_expires_at_ms > max_expires_at_ms {
+            tx.rollback().ok();
+            return Err(BudgetError::InvalidTtl {
+                ttl_ms: additional_ttl_ms,
+            });
+        }
+
         tx.execute(
             "UPDATE reservations SET expires_at_ms=?2 WHERE id=?1",
             rusqlite::params![reservation_id.0, new_expires_at_ms],
@@ -880,6 +962,9 @@ struct ReservationRow {
     reserved_minor: i64,
     status: String,
     expires_at_ms: i64,
+    /// B-5: needed to cap a reservation's total lifetime across repeated
+    /// `extend` calls.
+    created_at_ms: i64,
 }
 
 /// M2 (Opus Tier-2 acceptance): filters by `tenant_id` in the `WHERE`
@@ -898,7 +983,7 @@ fn find_reservation(
     let found = conn
         .query_row(
             "SELECT tenant_id, key_id, provider_id, model_id, period, reserved_minor, status, \
-                    expires_at_ms, tenant_period \
+                    expires_at_ms, tenant_period, created_at_ms \
              FROM reservations WHERE id = ?1 AND tenant_id = ?2",
             rusqlite::params![reservation_id.0, tenant_id],
             |r| {
@@ -912,6 +997,7 @@ fn find_reservation(
                     status: r.get(6)?,
                     expires_at_ms: r.get(7)?,
                     tenant_period: r.get(8)?,
+                    created_at_ms: r.get(9)?,
                 })
             },
         )
