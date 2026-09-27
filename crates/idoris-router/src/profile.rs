@@ -2,8 +2,9 @@
 //! `X-iDoris-*` headers, mirroring `packages/router/src/profile.ts`'s
 //! header→`TaskProfile` mapping (T1.3.2) — **privacy defaults to
 //! `local_only`, non-`personal` deploy modes require `X-iDoris-Tenant`, no
-//! default tenant fallback**. `idoris/<role>` model resolution (T4.2,
-//! Rust-only, no TS equivalent) is a separate follow-up PR on top of this.
+//! default tenant fallback** — plus the Rust-only `idoris/<role>` model
+//! resolution (T4.2); `profile.ts` has no equivalent since role-based
+//! routing hasn't landed on the TS side.
 //!
 //! Order matters (locked by the conformance suite's `顺序锁定` cases plus
 //! `profile.ts`'s own precedence): callers must run [`parse_profile`] only
@@ -15,6 +16,7 @@ use idoris_contracts::Contract;
 use idoris_contracts::DeployMode;
 use idoris_contracts::common::{Capability, Complexity, FallbackPolicy, PrivacyClass};
 use idoris_contracts::task_profile::TaskProfile;
+use idoris_policy::{Role, RoleParseError, parse_model_role};
 
 /// One control-plane parse failure: a fixed HTTP status plus the unified
 /// error envelope's `type` (interface spec §3.11).
@@ -39,10 +41,12 @@ fn invalid_header(message: impl Into<String>) -> ProfileError {
     ProfileError::new(StatusCode::BAD_REQUEST, "invalid_header", message)
 }
 
-/// Parsed control-plane profile: task metadata + optional tenant id.
+/// Parsed control-plane profile: task metadata + optional resolved role +
+/// optional tenant id.
 #[derive(Debug, Clone)]
 pub struct ParsedProfile {
     pub task: TaskProfile,
+    pub role: Option<Role>,
     pub tenant_id: Option<String>,
 }
 
@@ -139,13 +143,28 @@ fn parse_fallback(headers: &HeaderMap) -> Result<Option<FallbackPolicy>, Profile
     }
 }
 
-/// Builds the control-plane profile from headers. **Callers must have
-/// already rejected invalid JSON / a non-object body** — that ordering is
-/// enforced by the caller, not here. Internal order: privacy →
-/// complexity/capabilities/fallback → tenant (`profile.ts`'s own
-/// precedence).
+/// `model` request-body field → optional resolved [`Role`]. `Ok(None)`
+/// means "not an `idoris/<role>` model name" — an opaque model id, passed
+/// through unconstrained by role.
+fn parse_role(model: Option<&str>) -> Result<Option<Role>, ProfileError> {
+    let Some(model) = model else {
+        return Ok(None);
+    };
+    parse_model_role(model).map_err(|err: RoleParseError| {
+        ProfileError::new(StatusCode::BAD_REQUEST, "unknown_role", err.to_string())
+    })
+}
+
+/// Builds the control-plane profile from headers + the parsed request
+/// body's `model` field. **Callers must have already rejected invalid JSON
+/// / a non-object body** — that ordering is enforced by the caller, not
+/// here. Internal order: privacy → complexity/capabilities/fallback → role
+/// → tenant (`profile.ts`'s own precedence, with role slotted in just
+/// before the tenant check since it has nothing on the TS side to stay
+/// ordered against).
 pub fn parse_profile(
     headers: &HeaderMap,
+    model: Option<&str>,
     deploy_mode: DeployMode,
 ) -> Result<ParsedProfile, ProfileError> {
     let privacy = parse_privacy(headers)?;
@@ -153,6 +172,7 @@ pub fn parse_profile(
     let complexity = parse_complexity(headers)?;
     let capabilities = parse_capabilities(headers)?;
     let fallback = parse_fallback(headers)?;
+    let role = parse_role(model)?;
 
     let task = TaskProfile {
         privacy: Some(privacy),
@@ -178,7 +198,11 @@ pub fn parse_profile(
         }
     };
 
-    Ok(ParsedProfile { task, tenant_id })
+    Ok(ParsedProfile {
+        task,
+        role,
+        tenant_id,
+    })
 }
 
 #[cfg(test)]
@@ -202,7 +226,7 @@ mod tests {
 
     #[test]
     fn defaults_privacy_to_local_only_when_header_absent() {
-        let parsed = parse_profile(&headers(&[]), DeployMode::Personal).unwrap();
+        let parsed = parse_profile(&headers(&[]), None, DeployMode::Personal).unwrap();
         assert_eq!(parsed.task.privacy, Some(PrivacyClass::LocalOnly));
         assert_eq!(parsed.task.intent, Some("chat".to_string()));
         assert_eq!(parsed.task.complexity, Some(Complexity::Simple));
@@ -215,6 +239,7 @@ mod tests {
     fn rejects_invalid_privacy() {
         let err = parse_profile(
             &headers(&[("x-idoris-privacy", "bogus")]),
+            None,
             DeployMode::Personal,
         )
         .unwrap_err();
@@ -226,6 +251,7 @@ mod tests {
     fn accepts_any_privacy() {
         let parsed = parse_profile(
             &headers(&[("x-idoris-privacy", "any")]),
+            None,
             DeployMode::Personal,
         )
         .unwrap();
@@ -239,7 +265,7 @@ mod tests {
             ("x-idoris-capabilities", "chat,teleport"),
             ("x-idoris-fallback", "yolo"),
         ] {
-            let err = parse_profile(&headers(&[(header, value)]), DeployMode::Personal)
+            let err = parse_profile(&headers(&[(header, value)]), None, DeployMode::Personal)
                 .expect_err(&format!("{header}={value} must be rejected"));
             assert_eq!(err.status, StatusCode::BAD_REQUEST);
             assert_eq!(err.error_type, "invalid_header");
@@ -254,6 +280,7 @@ mod tests {
                 ("x-idoris-capabilities", "chat, coding"),
                 ("x-idoris-fallback", "next_in_chain"),
             ]),
+            None,
             DeployMode::Personal,
         )
         .unwrap();
@@ -269,6 +296,7 @@ mod tests {
     fn accepts_any_non_empty_intent_without_enum_validation() {
         let parsed = parse_profile(
             &headers(&[("x-idoris-intent", "totally-made-up-intent")]),
+            None,
             DeployMode::Personal,
         )
         .unwrap();
@@ -280,15 +308,40 @@ mod tests {
 
     #[test]
     fn tenant_mode_requires_tenant_header() {
-        let err = parse_profile(&headers(&[]), DeployMode::Tenant).unwrap_err();
+        let err = parse_profile(&headers(&[]), None, DeployMode::Tenant).unwrap_err();
         assert_eq!(err.status, StatusCode::BAD_REQUEST);
         assert_eq!(err.error_type, "tenant_missing");
     }
 
     #[test]
     fn tenant_mode_passes_through_the_declared_tenant() {
-        let parsed =
-            parse_profile(&headers(&[("x-idoris-tenant", "acme")]), DeployMode::Tenant).unwrap();
+        let parsed = parse_profile(
+            &headers(&[("x-idoris-tenant", "acme")]),
+            None,
+            DeployMode::Tenant,
+        )
+        .unwrap();
         assert_eq!(parsed.tenant_id, Some("acme".to_string()));
+    }
+
+    #[test]
+    fn resolves_idoris_role_from_model() {
+        let parsed =
+            parse_profile(&headers(&[]), Some("idoris/daily"), DeployMode::Personal).unwrap();
+        assert_eq!(parsed.role, Some(Role::Daily));
+    }
+
+    #[test]
+    fn non_idoris_model_has_no_role_constraint() {
+        let parsed = parse_profile(&headers(&[]), Some("gpt-4o"), DeployMode::Personal).unwrap();
+        assert_eq!(parsed.role, None);
+    }
+
+    #[test]
+    fn unknown_role_is_a_400() {
+        let err =
+            parse_profile(&headers(&[]), Some("idoris/nope"), DeployMode::Personal).unwrap_err();
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert_eq!(err.error_type, "unknown_role");
     }
 }
