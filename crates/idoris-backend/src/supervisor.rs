@@ -107,6 +107,9 @@ enum OpOutcome {
         /// Every victim `plan_eviction` chose, and how its `unload` went —
         /// applied to the ledger by `OpDone` alongside `result`.
         victim_results: Vec<VictimResult>,
+        /// Only consulted when `result` is `Err` — see `run_load_flow`'s
+        /// doc comment on why this varies instead of always being `Error`.
+        failure_state: ModelState,
     },
     Unload {
         result: Result<(), BackendError>,
@@ -332,6 +335,19 @@ where
 /// needs `catch_unwind`-based partial-state recovery across `.await`
 /// points, which is disproportionate to this already-rare (adapter panics
 /// at all) x (specifically mid-loop) edge case.
+///
+/// **`failure_state` on error** (H1 in the Opus Tier-2 review): an
+/// eviction failure or an explicit `adapter.load` rejection means the
+/// adapter almost certainly never allocated anything for `id` — settling
+/// on `Error` there would occupy the budget forever for a model that was
+/// never actually resident, and a *different* future load could then fail
+/// with a misleading `eviction_impossible` (no viable plan) when the real
+/// problem is a stuck, never-cleaned-up ledger entry. Those two cases
+/// settle on `Stopped` instead. Only a `probe_ready` failure/timeout is
+/// genuinely ambiguous (the `load` call itself DID succeed) — there, a
+/// best-effort `unload` is attempted first; `Stopped` if that confirms
+/// release, `Error` (occupying budget, matching `occupies_budget`'s
+/// documented conservatism) only if even that fails.
 async fn run_load_flow(
     adapter: Arc<dyn RuntimeAdapter>,
     config: SupervisorConfig,
@@ -360,6 +376,7 @@ async fn run_load_flow(
         return OpOutcome::Load {
             result: Err(BackendError::eviction_failed(&id)),
             victim_results,
+            failure_state: ModelState::Stopped,
         };
     }
 
@@ -384,6 +401,9 @@ async fn run_load_flow(
         return OpOutcome::Load {
             result: Err(err),
             victim_results,
+            // `adapter.load` itself explicitly rejected the request — no
+            // real allocation to have happened.
+            failure_state: ModelState::Stopped,
         };
     }
 
@@ -394,6 +414,7 @@ async fn run_load_flow(
                 return OpOutcome::Load {
                     result: Ok(()),
                     victim_results,
+                    failure_state: ModelState::Error, // unused: `result` is `Ok`
                 };
             }
             Ok(false) => tokio::time::sleep(config.probe_interval).await,
@@ -401,13 +422,32 @@ async fn run_load_flow(
                 return OpOutcome::Load {
                     result: Err(err),
                     victim_results,
+                    failure_state: best_effort_release(&adapter, &id, config.adapter_call_timeout)
+                        .await,
                 };
             }
         }
     }
     OpOutcome::Load {
-        result: Err(BackendError::probe_timed_out(id)),
+        result: Err(BackendError::probe_timed_out(id.clone())),
         victim_results,
+        failure_state: best_effort_release(&adapter, &id, config.adapter_call_timeout).await,
+    }
+}
+
+/// After a `probe_ready` failure/timeout, `id`'s real state is ambiguous —
+/// `adapter.load` itself succeeded, so something may genuinely be
+/// resident. A best-effort `unload` resolves it: `Stopped` if that
+/// confirms release, `Error` (still occupying budget, matching
+/// `occupies_budget`'s documented conservatism) only if even that fails.
+async fn best_effort_release(
+    adapter: &Arc<dyn RuntimeAdapter>,
+    id: &str,
+    timeout: std::time::Duration,
+) -> ModelState {
+    match with_adapter_timeout(adapter.unload(id), timeout, id).await {
+        Ok(()) => ModelState::Stopped,
+        Err(_) => ModelState::Error,
     }
 }
 
@@ -494,6 +534,10 @@ fn start_load(
                     join_err.to_string(),
                 )),
                 victim_results: Vec::new(),
+                // A panic mid-flow leaves real state genuinely unknown —
+                // conservative like a failed best-effort release, not the
+                // "confirmed nothing happened" case.
+                failure_state: ModelState::Error,
             },
         };
         let _ = self_tx
@@ -792,12 +836,15 @@ async fn run_actor(
             }
 
             ActorMsg::OpDone { id, outcome } => {
-                let (result, done_state, victim_results) = match outcome {
+                let (result, done_state, failure_state, victim_results) = match outcome {
                     OpOutcome::Load {
                         result,
                         victim_results,
-                    } => (result, ModelState::Ready, victim_results),
-                    OpOutcome::Unload { result } => (result, ModelState::Stopped, Vec::new()),
+                        failure_state,
+                    } => (result, ModelState::Ready, failure_state, victim_results),
+                    OpOutcome::Unload { result } => {
+                        (result, ModelState::Stopped, ModelState::Error, Vec::new())
+                    }
                 };
                 for (victim_id, victim_result) in victim_results {
                     let victim_state = if victim_result.is_ok() {
@@ -819,7 +866,7 @@ async fn run_actor(
                             panic!("Supervisor invariant violated: ledger lost {id:?} mid-op");
                         }
                     }
-                    Err(_) => set_state_or_panic(&mut models, &id, ModelState::Error),
+                    Err(_) => set_state_or_panic(&mut models, &id, failure_state),
                 }
                 let waiters = match active_op.take() {
                     Some(ActiveOp {
@@ -1533,5 +1580,116 @@ mod tests {
             .unwrap()
             .expect("unload should complete once the drain finishes");
         assert_eq!(adapter.unload_call_count("a"), 1);
+    }
+
+    /// H1: an explicit `adapter.load` rejection must not occupy the ledger
+    /// forever — settling on `Stopped` (not `Error`) so it doesn't keep
+    /// hoarding budget a later, unrelated load might need.
+    #[tokio::test]
+    async fn a_load_failure_does_not_occupy_the_ledger() {
+        let adapter = Arc::new(MockAdapter::new(catalog()));
+        adapter.set_load_script("a", vec![crate::mock::LoadOutcome::Fail]);
+        let handle =
+            Supervisor::spawn(adapter, SupervisorConfig::default()).expect("spawn should succeed");
+        handle
+            .load("a", 4.0, on_demand_policy())
+            .await
+            .expect_err("the scripted Fail outcome must surface as an error");
+        let status = handle.status().await.expect("status should succeed");
+        assert_eq!(
+            status.used_gb, 0.0,
+            "a rejected load must not occupy budget"
+        );
+    }
+
+    /// A minimal `RuntimeAdapter`: `load` always succeeds but
+    /// `probe_ready` always fails — exercises H1's "probe fails, but a
+    /// best-effort `unload` confirms release" path. `unload_ok` controls
+    /// whether that best-effort release itself succeeds.
+    struct ProbeAlwaysFailsAdapter {
+        unload_ok: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl RuntimeAdapter for ProbeAlwaysFailsAdapter {
+        async fn list(&self) -> Result<Vec<ModelInfo>, BackendError> {
+            Ok(catalog())
+        }
+        async fn load(&self, _id: &str, _policy: Option<&LoadPolicy>) -> Result<(), BackendError> {
+            Ok(())
+        }
+        async fn unload(&self, id: &str) -> Result<(), BackendError> {
+            if self.unload_ok {
+                Ok(())
+            } else {
+                Err(BackendError::Upstream {
+                    message: format!(
+                        "ProbeAlwaysFailsAdapter refuses to unload {id} (test double)"
+                    ),
+                })
+            }
+        }
+        async fn status(&self) -> Result<BackendStatus, BackendError> {
+            Ok(BackendStatus {
+                pressure: Pressure::Ok,
+                used_gb: 0.0,
+                model_memory_max_gb: 0.0,
+                loaded: Vec::new(),
+            })
+        }
+        async fn probe_ready(&self, id: &str) -> Result<bool, BackendError> {
+            Err(BackendError::Upstream {
+                message: format!(
+                    "ProbeAlwaysFailsAdapter's probe for {id} always fails (test double)"
+                ),
+            })
+        }
+        async fn chat(
+            &self,
+            req: ChatRequest,
+            _cancel: CancellationToken,
+        ) -> Result<ChatResponse, BackendError> {
+            Ok(ChatResponse {
+                model: req.model,
+                content: String::new(),
+            })
+        }
+    }
+
+    /// H1: a `probe_ready` failure that a best-effort `unload` *confirms*
+    /// released must settle on `Stopped`, not the conservative `Error`.
+    #[tokio::test]
+    async fn probe_failure_confirmed_released_does_not_occupy_the_ledger() {
+        let adapter = Arc::new(ProbeAlwaysFailsAdapter { unload_ok: true });
+        let handle =
+            Supervisor::spawn(adapter, SupervisorConfig::default()).expect("spawn should succeed");
+        handle
+            .load("a", 4.0, on_demand_policy())
+            .await
+            .expect_err("probe_ready always fails, so load must fail too");
+        let status = handle.status().await.expect("status should succeed");
+        assert_eq!(
+            status.used_gb, 0.0,
+            "a confirmed-released model must not occupy budget"
+        );
+    }
+
+    /// Negative contrast: the same probe failure, but the best-effort
+    /// `unload` *also* fails — real state is genuinely unknown, so it must
+    /// stay `Error` (occupying budget), never guessed as free.
+    #[tokio::test]
+    async fn probe_failure_with_failed_release_still_occupies_the_ledger() {
+        let adapter = Arc::new(ProbeAlwaysFailsAdapter { unload_ok: false });
+        let handle =
+            Supervisor::spawn(adapter, SupervisorConfig::default()).expect("spawn should succeed");
+        handle
+            .load("a", 4.0, on_demand_policy())
+            .await
+            .expect_err("probe_ready always fails, so load must fail too");
+        let status = handle.status().await.expect("status should succeed");
+        assert_eq!(
+            status.used_gb, 4.0,
+            "an unconfirmed-release model must stay conservatively occupying budget"
+        );
     }
 }
