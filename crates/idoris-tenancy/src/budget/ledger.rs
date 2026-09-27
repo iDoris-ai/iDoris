@@ -240,3 +240,123 @@ fn active_reserved_for(
     )
     .map_err(BudgetError::from)
 }
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+
+    /// Temp SQLite path that deletes the database and its `-wal`/`-shm`
+    /// sidecars on drop — including when the test panics. Bind it *before*
+    /// the ledger so the ledger (and its open connection) drops first.
+    struct TempDb(std::path::PathBuf);
+
+    impl AsRef<Path> for TempDb {
+        fn as_ref(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDb {
+        fn drop(&mut self) {
+            for suffix in ["", "-wal", "-shm"] {
+                let mut p = self.0.clone().into_os_string();
+                p.push(suffix);
+                let _ = std::fs::remove_file(p);
+            }
+        }
+    }
+
+    fn temp_db_path(tag: &str) -> TempDb {
+        TempDb(std::env::temp_dir().join(format!(
+            "idoris-tenancy-budget-{tag}-{}-{}.sqlite3",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        )))
+    }
+
+    #[test]
+    fn configure_then_balance_reports_full_limit() {
+        let path = temp_db_path("configure-balance");
+        let ledger = BudgetLedger::open(&path).expect("open");
+        let scope = BudgetScope::new("acme-co", "key-1", "openai", "gpt-5");
+        ledger
+            .configure(&scope, 1_000, "Asia/Bangkok")
+            .expect("configure");
+        assert_eq!(ledger.balance(&scope).expect("balance"), 1_000);
+    }
+
+    /// Negative control: querying balance for an unconfigured scope must
+    /// error, not silently report a limit of zero (which would be
+    /// indistinguishable from "budget deliberately set to zero").
+    #[test]
+    fn balance_on_unconfigured_scope_errors() {
+        let path = temp_db_path("unconfigured");
+        let ledger = BudgetLedger::open(&path).expect("open");
+        let scope = BudgetScope::new("acme-co", "key-1", "openai", "gpt-5");
+        assert!(matches!(
+            ledger.balance(&scope),
+            Err(BudgetError::NotConfigured { .. })
+        ));
+    }
+
+    /// Negative control: an invalid time zone name must be rejected at
+    /// `configure` time, not accepted and silently misinterpreted later.
+    #[test]
+    fn configure_rejects_unknown_time_zone() {
+        let path = temp_db_path("bad-tz");
+        let ledger = BudgetLedger::open(&path).expect("open");
+        let scope = BudgetScope::new("acme-co", "key-1", "openai", "gpt-5");
+        assert!(matches!(
+            ledger.configure(&scope, 1_000, "Not/AZone"),
+            Err(BudgetError::InvalidTimeZone { .. })
+        ));
+    }
+
+    #[test]
+    fn configure_rejects_negative_limit() {
+        let path = temp_db_path("neg-limit");
+        let ledger = BudgetLedger::open(&path).expect("open");
+        let scope = BudgetScope::new("acme-co", "key-1", "openai", "gpt-5");
+        assert!(matches!(
+            ledger.configure(&scope, -1, "Asia/Bangkok"),
+            Err(BudgetError::InvalidLimit { .. })
+        ));
+    }
+
+    #[test]
+    fn reopening_the_same_file_reuses_existing_config() {
+        let path = temp_db_path("reopen");
+        let scope = BudgetScope::new("acme-co", "key-1", "openai", "gpt-5");
+        {
+            let ledger = BudgetLedger::open(&path).expect("open");
+            ledger.configure(&scope, 500, "UTC").expect("configure");
+        }
+        let reopened = BudgetLedger::open(&path).expect("reopen");
+        assert_eq!(reopened.balance(&scope).expect("balance"), 500);
+    }
+
+    /// Negative control: a blank scope field is rejected at `configure`
+    /// time, not silently accepted into the SQL composite key (Codex
+    /// review — see `validate_scope`).
+    #[test]
+    fn configure_rejects_blank_scope_field() {
+        let path = temp_db_path("blank-scope");
+        let ledger = BudgetLedger::open(&path).expect("open");
+        // One case per field (empty and whitespace-only alternate), so a
+        // field accidentally dropped from `validate_scope` fails here.
+        let cases = [
+            (BudgetScope::new("", "k", "p", "m"), "tenant_id"),
+            (BudgetScope::new("t", "  ", "p", "m"), "key_id"),
+            (BudgetScope::new("t", "k", "", "m"), "provider_id"),
+            (BudgetScope::new("t", "k", "p", "\t"), "model_id"),
+        ];
+        for (scope, expected) in cases {
+            match ledger.configure(&scope, 100, "UTC") {
+                Err(BudgetError::InvalidScope { field }) => assert_eq!(field, expected),
+                other => panic!("{expected}: expected InvalidScope, got {other:?}"),
+            }
+        }
+    }
+}
