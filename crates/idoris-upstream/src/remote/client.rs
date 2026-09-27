@@ -241,3 +241,172 @@ fn map_webc_error(err: genai::webc::Error) -> UpstreamError {
         | genai::webc::Error::JsonValueExt(_) => UpstreamError::malformed_response(),
     }
 }
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use std::time::Duration;
+
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use super::*;
+    use crate::chat::ChatMessage;
+
+    struct FixedKey(&'static str);
+
+    #[async_trait]
+    impl CredentialSource for FixedKey {
+        async fn api_key(&self, _provider: &str) -> Result<String, UpstreamError> {
+            Ok(self.0.to_string())
+        }
+    }
+
+    struct AlwaysFails;
+
+    #[async_trait]
+    impl CredentialSource for AlwaysFails {
+        async fn api_key(&self, _provider: &str) -> Result<String, UpstreamError> {
+            Err(UpstreamError::auth_failed())
+        }
+    }
+
+    fn client_for(server: &MockServer, credentials: Arc<dyn CredentialSource>) -> RemoteClient {
+        RemoteClient::new(
+            RemoteClientConfig {
+                kind: RemoteProviderKind::OpenAiCompatible,
+                base_url: format!("{}/v1/", server.uri()),
+                provider_label: "test-provider".to_string(),
+            },
+            credentials,
+        )
+    }
+
+    fn request() -> ChatRequest {
+        ChatRequest {
+            model: "test-model".to_string(),
+            messages: vec![ChatMessage {
+                role: "user".to_string(),
+                content: "hi".to_string(),
+            }],
+        }
+    }
+
+    fn far_future_deadline() -> Instant {
+        Instant::now() + Duration::from_secs(30)
+    }
+
+    #[tokio::test]
+    async fn chat_returns_content_and_sends_only_model_and_messages() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "model": "test-model",
+                "choices": [{"message": {"content": "hello there"}, "finish_reason": "stop"}]
+            })))
+            .mount(&server)
+            .await;
+        let client = client_for(&server, Arc::new(FixedKey("test-key-should-never-leak")));
+        let resp = client
+            .chat(request(), far_future_deadline())
+            .await
+            .expect("chat must succeed");
+        assert_eq!(resp.content, "hello there");
+
+        // De-association + credential wiring: exactly one request, carrying
+        // the auth header and the request's own model/messages — nothing
+        // this client adds itself (no tenant/user id, no extra headers).
+        let received = server
+            .received_requests()
+            .await
+            .expect("recording must be enabled");
+        assert_eq!(received.len(), 1);
+        let req = &received[0];
+        assert_eq!(
+            req.headers
+                .get("authorization")
+                .map(|v| v.to_str().unwrap()),
+            Some("Bearer test-key-should-never-leak")
+        );
+        let body: serde_json::Value = serde_json::from_slice(&req.body).expect("body must be JSON");
+        assert_eq!(body["model"], "test-model");
+        assert_eq!(body["messages"][0]["content"], "hi");
+    }
+
+    #[tokio::test]
+    async fn chat_maps_401_to_auth_failed_without_leaking_the_body_or_key() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(401).set_body_string("unauthorized-body-should-not-leak"),
+            )
+            .mount(&server)
+            .await;
+        let client = client_for(&server, Arc::new(FixedKey("test-key-should-never-leak")));
+        let err = client
+            .chat(request(), far_future_deadline())
+            .await
+            .expect_err("401 must fail");
+        assert_eq!(err.reason_code(), "auth_failed");
+        let msg = err.to_string();
+        assert!(!msg.contains("unauthorized-body-should-not-leak"));
+        assert!(!msg.contains("test-key-should-never-leak"));
+    }
+
+    #[tokio::test]
+    async fn chat_maps_500_to_server_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        let client = client_for(&server, Arc::new(FixedKey("k")));
+        let err = client
+            .chat(request(), far_future_deadline())
+            .await
+            .expect_err("500 must fail");
+        assert_eq!(err.reason_code(), "upstream_server_error");
+    }
+
+    #[tokio::test]
+    async fn chat_reports_auth_failed_when_the_credential_source_itself_fails() {
+        let server = MockServer::start().await;
+        // No mock mounted: a credential failure must short-circuit before
+        // any HTTP call is attempted.
+        let client = client_for(&server, Arc::new(AlwaysFails));
+        let err = client
+            .chat(request(), far_future_deadline())
+            .await
+            .expect_err("must fail when no credential is available");
+        assert_eq!(err.reason_code(), "auth_failed");
+        assert!(
+            server
+                .received_requests()
+                .await
+                .expect("recording enabled")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_fails_fast_on_an_already_passed_deadline_without_calling_out() {
+        let server = MockServer::start().await;
+        let client = client_for(&server, Arc::new(FixedKey("k")));
+        let past = Instant::now() - Duration::from_secs(1);
+        let err = client
+            .chat(request(), past)
+            .await
+            .expect_err("must time out immediately");
+        assert_eq!(err.reason_code(), "timeout");
+        assert!(
+            server
+                .received_requests()
+                .await
+                .expect("recording enabled")
+                .is_empty()
+        );
+    }
+}
