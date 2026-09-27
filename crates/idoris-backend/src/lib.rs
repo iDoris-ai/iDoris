@@ -3,10 +3,14 @@
 //! owns lifecycle state across all models of that engine), per
 //! `docs/research/Rust基础选型-2026-09-27.md` §4.
 //!
-//! This PR lands the first half: [`adapter`] ([`RuntimeAdapter`], the
-//! engine-agnostic trait a real integration implements) and [`mock`]
-//! ([`MockAdapter`], a test double). `eviction`'s pure `plan_eviction`
-//! function and the `supervisor` event loop itself land in follow-up PRs.
+//! [`adapter`] ([`RuntimeAdapter`]) and [`mock`] ([`MockAdapter`]) define
+//! and exercise the engine-agnostic adapter contract; [`eviction`]'s pure
+//! [`plan_eviction`] decides what to evict with no IO of its own; the
+//! [`supervisor`] event loop is the single writer that ties them
+//! together — `list`/`status`/`chat`/`load`/`unload`, singleflight, the
+//! global load/evict mutex, real capacity checking, in-flight-aware
+//! eviction, and the actor's own fail-closed handling of a detected
+//! invariant violation are all in place.
 //!
 //! - [`error`] — [`BackendError`], with a stable `reason_code()`.
 //! - [`types`] — wire/value types mirroring `packages/adapters/src/backend.ts`,
@@ -15,12 +19,18 @@
 
 pub mod adapter;
 pub mod error;
+pub mod eviction;
 pub mod mock;
+pub mod supervisor;
 pub mod types;
 
 pub use adapter::RuntimeAdapter;
 pub use error::BackendError;
+pub use eviction::{
+    EvictionPlan, ModelEntry, ModelReq, ModelState, PlanEvictionError, Snapshot, plan_eviction,
+};
 pub use mock::MockAdapter;
+pub use supervisor::{Supervisor, SupervisorConfig, SupervisorHandle};
 pub use types::{BackendStatus, ChatMessage, ChatRequest, ChatResponse, ModelInfo, Pressure};
 
 #[cfg(test)]
