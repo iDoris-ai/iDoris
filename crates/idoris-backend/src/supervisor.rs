@@ -5,12 +5,17 @@
 //! **one tokio task holds all state**; every other task talks to it only
 //! through [`SupervisorHandle`]'s mpsc-backed commands.
 //!
-//! This PR wires [`crate::eviction::plan_eviction`] into `load`: capacity
-//! is now actually checked, and if a plan says to evict, the victims are
-//! unloaded before the new model is loaded — all still behind the one
-//! global load/evict mutex, so nothing else can touch a victim mid-flight.
-//! A real wait queue is still a follow-up — a second id fails fast with
-//! `BackendError::Busy` meanwhile.
+//! `load`/`unload` share one global mutex (`active_op`): same-id,
+//! same-request concurrent calls singleflight-merge; a different id (or a
+//! same-id call that differs in policy/`memory_gb`) fails fast with
+//! `BackendError::Busy` — there is no real wait queue yet, a deliberate
+//! simplification. Every `load` is checked against
+//! [`crate::eviction::plan_eviction`] for real capacity, evicting chosen
+//! victims (in-flight-aware, never a model mid-`chat`) before the new
+//! model is admitted. Every adapter call is timeout-bounded and
+//! panic-isolated (see [`with_adapter_timeout`]); a detected internal
+//! invariant violation poisons the actor into failing closed rather than
+//! panicking the whole event loop.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -74,7 +79,9 @@ impl Default for SupervisorConfig {
 struct ModelSlot {
     memory_gb: f64,
     state: ModelState,
-    /// Reserved for eviction (LRU) bookkeeping, landing in a follow-up PR.
+    /// Monotonic "last used" counter (bumped on load-completion and on
+    /// `chat`) — `plan_eviction`'s LRU ordering reads this via
+    /// [`build_snapshot`].
     last_used_seq: u64,
     /// Policy last accepted; compared by exact equality to decide merge vs. a new op.
     policy: LoadPolicy,
@@ -143,6 +150,14 @@ enum ActorMsg {
 enum ActiveKind {
     Load {
         policy: LoadPolicy,
+        /// Compared alongside `policy` (both must match exactly) to decide
+        /// singleflight-merge vs. a conflicting concurrent request for the
+        /// same id (Low, Opus Tier-2 review) — two callers racing to load
+        /// the same id with the same policy but *different* `memory_gb`
+        /// must not be silently merged into whichever happened to arrive
+        /// first, since the eviction plan (and therefore the outcome
+        /// either caller can trust) was built against only one of them.
+        memory_gb: f64,
         waiters: Vec<LoadReply>,
     },
     Unload {
@@ -422,15 +437,18 @@ async fn confirm_memory_released(
 /// holds, so the load itself must not proceed. Every adapter call is
 /// timeout-bounded (see [`with_adapter_timeout`]); a panic inside this
 /// function is caught by the `tokio::spawn` wrapper in `start_load`, not
-/// here — see its doc comment. **Known accepted gap**: if the panic lands
-/// mid-eviction-loop, this function's local `victim_results` (including any
-/// victims already successfully unloaded before the panic) is lost with
-/// the panicking stack frame, so those victims are left in `Stopping`
-/// rather than resolved to `Stopped` — recoverable via a manual follow-up
-/// `unload`, not a permanent wedge, but not self-healing either. A full fix
-/// needs `catch_unwind`-based partial-state recovery across `.await`
-/// points, which is disproportionate to this already-rare (adapter panics
-/// at all) x (specifically mid-loop) edge case.
+/// here — see its doc comment. If the panic lands mid-eviction-loop, this
+/// function's local `victim_results` is lost with the panicking stack
+/// frame — `start_load`'s `JoinError` arm resolves every chosen victim to
+/// `Error` anyway (not distinguishing "already freed" from "never
+/// attempted"), so none dangle in `Stopping` forever: `Error` is itself a
+/// valid eviction candidate (H1), so this self-heals rather than requiring
+/// a manual `unload`. **Known accepted imprecision**: a victim that
+/// actually succeeded right before the panic is still reported `Error`
+/// (occupying budget) instead of the more accurate `Stopped` — recovering
+/// that needs `catch_unwind`-based partial-state recovery across `.await`
+/// points, disproportionate to this already-rare (panics at all) x
+/// (specifically mid-loop) edge case.
 ///
 /// **`failure_state` on error** (H1 in the Opus Tier-2 review): an
 /// eviction failure or an explicit `adapter.load` rejection means the
@@ -619,8 +637,13 @@ fn build_snapshot(models: &HashMap<String, ModelSlot>, budget_gb: f64, exclude: 
 fn map_plan_error(err: PlanEvictionError, id: &str) -> BackendError {
     match err {
         PlanEvictionError::InsufficientCapacity { .. } => BackendError::eviction_impossible(id),
+        // `handle_load` validates `memory_gb` up front (Low, Opus Tier-2
+        // review), so reaching this at all should be structurally
+        // impossible — kept as defense-in-depth, mapped the same way a
+        // caller-supplied bad value would be rather than as an internal
+        // Supervisor bug.
         PlanEvictionError::InvalidCapacity { field, value } => {
-            BackendError::internal(format!("invalid capacity for {field}: {value}"))
+            BackendError::invalid_request(format!("invalid capacity for {field}: {value}"))
         }
         PlanEvictionError::SnapshotContainsRequestedModel { .. } => {
             panic!("Supervisor invariant violated: snapshot for {id:?} contained itself")
@@ -640,6 +663,11 @@ fn start_load(
     let config = env.config.clone();
     let self_tx = env.self_tx.clone();
     let id_for_task = id.clone();
+    // Kept alongside `evict` (which is moved into `run_load_flow` below) so
+    // the panic-fallback arm can still resolve every chosen victim even
+    // though `run_load_flow`'s own `victim_results` was lost with its
+    // panicking stack frame (Medium, Opus Tier-2 review — see below).
+    let evict_for_panic_fallback = evict.clone();
     tokio::spawn(async move {
         // `run_load_flow` runs as its OWN spawned task so a panic inside it
         // (an adapter implementation bug) is isolated to that task — tokio
@@ -661,7 +689,23 @@ fn start_load(
                     &id_for_task,
                     join_err.to_string(),
                 )),
-                victim_results: Vec::new(),
+                // Every victim `plan_eviction` chose must still be
+                // resolved, not left dangling in `Stopping` forever just
+                // because the panic happened to land mid-eviction-loop:
+                // report each as `Err` so `OpDone` settles it on `Error`
+                // (still occupying budget, conservative — but `Error` is
+                // itself a valid eviction candidate per H1, so it can
+                // self-heal via a later eviction or a manual `unload`).
+                victim_results: evict_for_panic_fallback
+                    .into_iter()
+                    .map(|victim| {
+                        let err = BackendError::adapter_panicked(
+                            victim.clone(),
+                            "load task panicked mid-eviction; this victim's real state is unknown",
+                        );
+                        (victim, Err(err))
+                    })
+                    .collect(),
                 // A panic mid-flow leaves real state genuinely unknown —
                 // conservative like a failed best-effort release, not the
                 // "confirmed nothing happened" case.
@@ -694,19 +738,32 @@ fn handle_load(
     active_op: &mut Option<ActiveOp>,
     env: &Env<'_>,
 ) {
+    // Decided before the mutex, same as the already-Ready/already-Stopped
+    // checks elsewhere: a malformed request is the caller's mistake
+    // regardless of what else is in flight, and must never be silently
+    // accepted into an eviction/budget calculation that then produces a
+    // meaningless result (Low, Opus Tier-2 review).
+    if !memory_gb.is_finite() || memory_gb < 0.0 {
+        let _ = reply.send(Err(BackendError::invalid_request(format!(
+            "memory_gb must be finite and >= 0, got {memory_gb}"
+        ))));
+        return;
+    }
     if let Some(active) = active_op.as_mut()
         && active.id == id
     {
         if let ActiveKind::Load {
             policy: active_policy,
+            memory_gb: active_memory_gb,
             waiters,
         } = &mut active.kind
             && *active_policy == policy
+            && *active_memory_gb == memory_gb
         {
             waiters.push(reply);
         } else {
             let _ = reply.send(Err(BackendError::busy(
-                "a load for this id with a different policy is already in flight",
+                "a load for this id with a different policy or memory_gb is already in flight",
                 Some(id.clone()),
                 None,
             )));
@@ -773,6 +830,7 @@ fn handle_load(
         id: id.clone(),
         kind: ActiveKind::Load {
             policy,
+            memory_gb,
             waiters: vec![reply],
         },
     });
@@ -995,9 +1053,27 @@ async fn run_actor(
                     tokio::spawn(async move {
                         let _permit = permit;
                         let model = req.model.clone();
-                        let _ = reply.send(
-                            with_adapter_timeout(adapter.chat(req, cancel), timeout, &model).await,
-                        );
+                        // Same isolation shape as `start_load`/`start_unload`:
+                        // a panic in `adapter.chat` must not skip the
+                        // `ChatDone` send below, or `inflight` leaks forever
+                        // — wedging any pending drain and, with it,
+                        // `active_op` (Critical, Opus Tier-2 review, P6).
+                        let model_for_chat = model.clone();
+                        let inner = tokio::spawn(async move {
+                            with_adapter_timeout(
+                                adapter.chat(req, cancel),
+                                timeout,
+                                &model_for_chat,
+                            )
+                            .await
+                        });
+                        let result = match inner.await {
+                            Ok(result) => result,
+                            Err(join_err) => {
+                                Err(BackendError::adapter_panicked(&model, join_err.to_string()))
+                            }
+                        };
+                        let _ = reply.send(result);
                         if let Some(tx) = self_tx.upgrade() {
                             let _ = tx.send(ActorMsg::ChatDone { model }).await;
                         }
@@ -1145,6 +1221,19 @@ mod tests {
     use crate::mock::MockAdapter;
     use crate::types::ModelInfo;
 
+    /// Wraps a call that a regression could make hang forever, so a
+    /// reintroduced bug fails *this test* (fast, whether real- or
+    /// paused-clock) instead of hanging the whole `cargo test` run — Opus
+    /// Tier-2 review, following up on the C1/C2 fixes.
+    async fn no_hang<F, T>(fut: F) -> T
+    where
+        F: std::future::Future<Output = T>,
+    {
+        tokio::time::timeout(std::time::Duration::from_secs(5), fut)
+            .await
+            .expect("must not hang")
+    }
+
     fn catalog() -> Vec<ModelInfo> {
         vec![ModelInfo {
             id: "a".to_string(),
@@ -1281,6 +1370,78 @@ mod tests {
         assert_eq!(adapter.load_call_count("a"), 1);
     }
 
+    /// Low (Opus Tier-2 review): the same singleflight-merge guarantee must
+    /// hold under a *real* multi-thread runtime — every other test above
+    /// uses the default single-threaded test runtime, whose cooperative,
+    /// non-preemptive scheduling could hide a race that only manifests
+    /// under true OS-thread parallelism (the actor task and every one of
+    /// these 8 callers can each land on a different worker thread here).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn singleflight_merge_holds_under_a_real_multi_thread_runtime() {
+        let adapter = Arc::new(MockAdapter::new(catalog()));
+        adapter.set_load_delay("a", std::time::Duration::from_millis(50));
+        let handle = Supervisor::spawn(adapter.clone(), SupervisorConfig::default())
+            .expect("spawn should succeed");
+        let tasks: Vec<_> = (0..8)
+            .map(|_| {
+                let h = handle.clone();
+                tokio::spawn(async move { h.load("a", 4.0, on_demand_policy()).await })
+            })
+            .collect();
+        for task in tasks {
+            task.await
+                .unwrap()
+                .expect("every concurrently-merged load should succeed");
+        }
+        assert_eq!(
+            adapter.load_call_count("a"),
+            1,
+            "singleflight must merge all 8 concurrent loads into exactly one adapter call, even across real OS threads"
+        );
+    }
+
+    /// M5: when a singleflight-merged load fails, *every* waiter must get
+    /// the *same* error (a mutation that only notified the first waiter
+    /// must be caught) — and a later, separate `load` call must actually
+    /// retry the adapter, not keep replaying the old failure forever.
+    #[tokio::test(start_paused = true)]
+    async fn singleflight_failure_notifies_every_waiter_identically_and_a_later_load_retries() {
+        let adapter = Arc::new(MockAdapter::new(catalog()));
+        adapter.set_load_delay("a", std::time::Duration::from_millis(50));
+        adapter.set_load_script("a", vec![crate::mock::LoadOutcome::Fail]);
+        let handle = Supervisor::spawn(adapter.clone(), SupervisorConfig::default())
+            .expect("spawn should succeed");
+        let h1 = handle.clone();
+        let h2 = handle.clone();
+        let f1 = tokio::spawn(async move { h1.load("a", 4.0, on_demand_policy()).await });
+        let f2 = tokio::spawn(async move { h2.load("a", 4.0, on_demand_policy()).await });
+        let err1 = f1
+            .await
+            .unwrap()
+            .expect_err("the scripted Fail outcome must surface as an error");
+        let err2 = f2
+            .await
+            .unwrap()
+            .expect_err("the merged waiter must see the same failure, not silently succeed");
+        assert_eq!(
+            err1, err2,
+            "both waiters of a merged, failed load must get an identical error"
+        );
+        assert_eq!(
+            adapter.load_call_count("a"),
+            1,
+            "the failed attempt must still have been exactly one adapter call"
+        );
+        // The script queue is now empty (defaults to `Ok`): a later, plain
+        // `load` must actually re-invoke the adapter, proving the failure
+        // wasn't cached or replayed instead of genuinely retried.
+        handle
+            .load("a", 4.0, on_demand_policy())
+            .await
+            .expect("a later load must retry, not replay the earlier failure");
+        assert_eq!(adapter.load_call_count("a"), 2);
+    }
+
     /// Negative contrast: a *different* policy for the same id must not be
     /// silently merged — it fails fast with `Busy` instead (queueing lands
     /// in a follow-up PR).
@@ -1301,6 +1462,59 @@ mod tests {
         f1.await
             .unwrap()
             .expect("the original load should still succeed");
+    }
+
+    /// Low (Opus Tier-2 review): the same id, the same policy, but a
+    /// *different* `memory_gb` must not be silently merged either — only
+    /// exact equality on both fields singleflight-merges.
+    #[tokio::test(start_paused = true)]
+    async fn concurrent_loads_with_a_different_memory_gb_do_not_merge() {
+        let adapter = Arc::new(MockAdapter::new(catalog()));
+        adapter.set_load_delay("a", std::time::Duration::from_millis(50));
+        let handle = Supervisor::spawn(adapter.clone(), SupervisorConfig::default())
+            .expect("spawn should succeed");
+        let h2 = handle.clone();
+        let f1 = tokio::spawn(async move { handle.load("a", 4.0, on_demand_policy()).await });
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        let err = h2
+            .load("a", 8.0, on_demand_policy())
+            .await
+            .expect_err("a different memory_gb for the same in-flight id must not merge");
+        assert_eq!(err.reason_code(), "supervisor_busy");
+        f1.await
+            .unwrap()
+            .expect("the original load should still succeed");
+    }
+
+    /// Low (Opus Tier-2 review): a non-finite or negative `memory_gb` is
+    /// the caller's mistake, rejected up front — never silently accepted
+    /// into an eviction/budget calculation.
+    #[tokio::test]
+    async fn a_non_finite_memory_gb_is_an_invalid_request() {
+        let adapter = Arc::new(MockAdapter::new(catalog()));
+        let handle =
+            Supervisor::spawn(adapter, SupervisorConfig::default()).expect("spawn should succeed");
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.0] {
+            let err = handle
+                .load("a", bad, on_demand_policy())
+                .await
+                .expect_err("a non-finite or negative memory_gb must be rejected");
+            assert_eq!(err.reason_code(), "invalid_request");
+        }
+    }
+
+    /// Negative contrast: the boundary value `0.0` is finite and
+    /// non-negative, so it is accepted — isolates that it was specifically
+    /// non-finite/negative values being rejected, not zero itself.
+    #[tokio::test]
+    async fn a_zero_memory_gb_is_accepted() {
+        let adapter = Arc::new(MockAdapter::new(catalog()));
+        let handle =
+            Supervisor::spawn(adapter, SupervisorConfig::default()).expect("spawn should succeed");
+        handle
+            .load("a", 0.0, on_demand_policy())
+            .await
+            .expect("a zero memory_gb is a valid (if unusual) request");
     }
 
     /// OOM circuit breaker: exactly one self-healing retry.
@@ -1606,6 +1820,112 @@ mod tests {
             .expect("a follow-up unload of a must still work after the failed eviction");
     }
 
+    /// A minimal `RuntimeAdapter` whose `unload` panics for exactly one id
+    /// and succeeds for everything else — for exercising a panic that lands
+    /// *mid*-eviction-loop, after an earlier victim was already
+    /// successfully unloaded.
+    struct UnloadPanicsForOneIdAdapter {
+        panics_for: &'static str,
+        /// Panics exactly once, then behaves normally — a one-shot fault,
+        /// not a permanent one, so a later retry of the *same* id (e.g.
+        /// evicting it again for a different request) can still succeed.
+        already_panicked: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl RuntimeAdapter for UnloadPanicsForOneIdAdapter {
+        async fn list(&self) -> Result<Vec<ModelInfo>, BackendError> {
+            Ok(["a", "b", "c", "d"]
+                .into_iter()
+                .map(|id| ModelInfo {
+                    id: id.to_string(),
+                    memory_gb: 10.0,
+                })
+                .collect())
+        }
+        async fn load(&self, _id: &str, _policy: Option<&LoadPolicy>) -> Result<(), BackendError> {
+            Ok(())
+        }
+        async fn unload(&self, id: &str) -> Result<(), BackendError> {
+            if id == self.panics_for
+                && !self
+                    .already_panicked
+                    .swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                panic!("UnloadPanicsForOneIdAdapter panics once for {id} (test double)");
+            }
+            Ok(())
+        }
+        async fn status(&self) -> Result<BackendStatus, BackendError> {
+            Ok(BackendStatus {
+                pressure: Pressure::Ok,
+                used_gb: 0.0,
+                model_memory_max_gb: 0.0,
+                loaded: Vec::new(),
+            })
+        }
+        async fn probe_ready(&self, _id: &str) -> Result<bool, BackendError> {
+            Ok(true)
+        }
+        async fn chat(
+            &self,
+            req: ChatRequest,
+            _cancel: CancellationToken,
+        ) -> Result<ChatResponse, BackendError> {
+            Ok(ChatResponse {
+                model: req.model,
+                content: String::new(),
+            })
+        }
+    }
+
+    /// Medium (Opus Tier-2 review, probe P1d): a panic that lands
+    /// *mid*-eviction-loop (after "a" was already successfully unloaded,
+    /// before "b"'s own unload panics) must still resolve *every* chosen
+    /// victim, not just leave the not-yet-attempted ones dangling in
+    /// `Stopping` forever.
+    #[tokio::test]
+    async fn a_panic_mid_eviction_still_resolves_every_victim() {
+        let adapter = Arc::new(UnloadPanicsForOneIdAdapter {
+            panics_for: "b",
+            already_panicked: std::sync::atomic::AtomicBool::new(false),
+        });
+        let handle = Supervisor::spawn(
+            adapter,
+            SupervisorConfig {
+                budget_gb: 20.0,
+                ..SupervisorConfig::default()
+            },
+        )
+        .expect("spawn should succeed");
+        no_hang(handle.load("a", 10.0, on_demand_policy()))
+            .await
+            .expect("load a should succeed");
+        no_hang(handle.load("b", 10.0, on_demand_policy()))
+            .await
+            .expect("load b should succeed");
+        // c(20) requires evicting both a and b (LRU order: a, then b) —
+        // a's unload succeeds, b's panics mid-loop. c's own load is never
+        // even attempted, so it also settles on `Error` (unknown state).
+        let err = no_hang(handle.load("c", 20.0, on_demand_policy()))
+            .await
+            .expect_err("the panic mid-eviction must surface, not silently succeed");
+        assert_eq!(err.reason_code(), "adapter_panicked");
+        // The decisive check: `occupies_budget` treats `Stopping` and
+        // `Error` identically (both conservative), so `used_gb` alone
+        // can't tell "resolved to Error" apart from "left dangling in
+        // Stopping forever" — but *evictability* can: only `Error` (not
+        // `Stopping`) is a valid eviction candidate (H1). If any victim
+        // were left un-resolved in `Stopping`, only `c` (20 GiB, already
+        // `Error`) would be evictable — not enough to admit a 15 GiB
+        // request on top of an already-over-budget ledger. Every victim
+        // actually resolving to `Error` makes all 40 GiB (a+b+c)
+        // evictable, which is enough.
+        no_hang(handle.load("d", 15.0, on_demand_policy()))
+            .await
+            .expect("d must be admittable: a, b, and c must all have resolved to the (evictable) Error state, not be stuck un-resolved in Stopping");
+    }
+
     /// Nothing interleaves with an in-flight load that is evicting a
     /// victim: a concurrent request touching the victim while it's mid
     /// -eviction fails fast with `Busy`, the same as any other unrelated
@@ -1682,16 +2002,14 @@ mod tests {
         let adapter = Arc::new(PanickingAdapter);
         let handle =
             Supervisor::spawn(adapter, SupervisorConfig::default()).expect("spawn should succeed");
-        let err = handle
-            .load("a", 4.0, on_demand_policy())
+        let err = no_hang(handle.load("a", 4.0, on_demand_policy()))
             .await
             .expect_err("a panicking adapter call must surface as an error, not hang");
         assert_eq!(err.reason_code(), "adapter_panicked");
         // Negative contrast baked into the same test: if the panic *had*
         // wedged the Supervisor (active_op stuck `Some` forever), this
         // second, unrelated load would also fail with `Busy` — it must not.
-        handle
-            .load("a", 4.0, on_demand_policy())
+        no_hang(handle.load("a", 4.0, on_demand_policy()))
             .await
             .expect_err("still fails (PanickingAdapter always panics)");
     }
@@ -1714,15 +2032,175 @@ mod tests {
             },
         )
         .expect("spawn should succeed");
-        let err = handle
-            .load("a", 4.0, on_demand_policy())
+        let err = no_hang(handle.load("a", 4.0, on_demand_policy()))
             .await
             .expect_err("a hanging adapter call must time out, not hang forever");
         assert_eq!(err.reason_code(), "adapter_timed_out");
         // Negative contrast: the Supervisor must still be usable afterward
         // — a stuck `active_op` would make this also fail with `Busy`.
-        let models = handle.list().await.expect("list must still work");
+        let models = no_hang(handle.list()).await.expect("list must still work");
         assert_eq!(models, catalog());
+    }
+
+    /// A minimal `RuntimeAdapter` whose `unload` always panics — the M13
+    /// (Opus Tier-2 review) counterpart of `PanickingAdapter`, isolating
+    /// `start_unload`'s own panic-isolation path from an eviction's own
+    /// unloads (already covered by `run_load_flow`'s tests).
+    struct UnloadAlwaysPanicsAdapter;
+
+    #[async_trait::async_trait]
+    impl RuntimeAdapter for UnloadAlwaysPanicsAdapter {
+        async fn list(&self) -> Result<Vec<ModelInfo>, BackendError> {
+            Ok(two_model_catalog())
+        }
+        async fn load(&self, _id: &str, _policy: Option<&LoadPolicy>) -> Result<(), BackendError> {
+            Ok(())
+        }
+        async fn unload(&self, _id: &str) -> Result<(), BackendError> {
+            panic!("UnloadAlwaysPanicsAdapter::unload always panics (test double)");
+        }
+        async fn status(&self) -> Result<BackendStatus, BackendError> {
+            Ok(BackendStatus {
+                pressure: Pressure::Ok,
+                used_gb: 0.0,
+                model_memory_max_gb: 0.0,
+                loaded: Vec::new(),
+            })
+        }
+        async fn probe_ready(&self, _id: &str) -> Result<bool, BackendError> {
+            Ok(true)
+        }
+        async fn chat(
+            &self,
+            req: ChatRequest,
+            _cancel: CancellationToken,
+        ) -> Result<ChatResponse, BackendError> {
+            Ok(ChatResponse {
+                model: req.model,
+                content: String::new(),
+            })
+        }
+    }
+
+    /// M13 (Opus Tier-2 review): a standalone `unload`'s own panic
+    /// isolation (`start_unload`) must not wedge the Supervisor either —
+    /// same guarantee C1 gave `load`, verified independently here.
+    #[tokio::test]
+    async fn a_panicking_standalone_unload_does_not_wedge_the_supervisor() {
+        let adapter = Arc::new(UnloadAlwaysPanicsAdapter);
+        let handle =
+            Supervisor::spawn(adapter, SupervisorConfig::default()).expect("spawn should succeed");
+        no_hang(handle.load("a", 4.0, on_demand_policy()))
+            .await
+            .expect("load a should succeed");
+        let err = no_hang(handle.unload("a"))
+            .await
+            .expect_err("a panicking unload must surface as an error, not hang");
+        assert_eq!(err.reason_code(), "adapter_panicked");
+        // Negative contrast: if `active_op` had stayed stuck on "a", this
+        // would report `Busy` instead of succeeding.
+        no_hang(handle.load("b", 4.0, on_demand_policy()))
+            .await
+            .expect("a different id must not be busy after the panicking unload");
+    }
+
+    /// M13 (Opus Tier-2 review): a standalone `unload` call that never
+    /// returns must not hold `active_op` forever either — bounded by
+    /// `adapter_call_timeout`, same as `load`.
+    #[tokio::test(start_paused = true)]
+    async fn a_hanging_standalone_unload_times_out_and_does_not_wedge_the_supervisor() {
+        let adapter = Arc::new(MockAdapter::new(two_model_catalog()));
+        let handle = Supervisor::spawn(
+            adapter.clone(),
+            SupervisorConfig {
+                adapter_call_timeout: std::time::Duration::from_millis(50),
+                ..SupervisorConfig::default()
+            },
+        )
+        .expect("spawn should succeed");
+        no_hang(handle.load("a", 4.0, on_demand_policy()))
+            .await
+            .expect("load a should succeed");
+        adapter.set_unload_delay("a", std::time::Duration::from_secs(3600));
+        let err = no_hang(handle.unload("a"))
+            .await
+            .expect_err("a hanging unload call must time out, not hang forever");
+        assert_eq!(err.reason_code(), "adapter_timed_out");
+        no_hang(handle.load("b", 4.0, on_demand_policy()))
+            .await
+            .expect("a different id must not be busy after the timed-out unload");
+    }
+
+    /// A minimal `RuntimeAdapter` whose `chat` always panics (`load`/
+    /// `unload`/`probe_ready` all succeed normally) — for exercising the
+    /// panic-isolation path in the `Chat` dispatch specifically.
+    struct ChatPanicsAdapter;
+
+    #[async_trait::async_trait]
+    impl RuntimeAdapter for ChatPanicsAdapter {
+        async fn list(&self) -> Result<Vec<ModelInfo>, BackendError> {
+            Ok(two_model_catalog())
+        }
+        async fn load(&self, _id: &str, _policy: Option<&LoadPolicy>) -> Result<(), BackendError> {
+            Ok(())
+        }
+        async fn unload(&self, _id: &str) -> Result<(), BackendError> {
+            Ok(())
+        }
+        async fn status(&self) -> Result<BackendStatus, BackendError> {
+            Ok(BackendStatus {
+                pressure: Pressure::Ok,
+                used_gb: 0.0,
+                model_memory_max_gb: 0.0,
+                loaded: Vec::new(),
+            })
+        }
+        async fn probe_ready(&self, _id: &str) -> Result<bool, BackendError> {
+            Ok(true)
+        }
+        async fn chat(
+            &self,
+            _req: ChatRequest,
+            _cancel: CancellationToken,
+        ) -> Result<ChatResponse, BackendError> {
+            panic!("ChatPanicsAdapter::chat always panics (test double)");
+        }
+    }
+
+    /// Critical (Opus Tier-2 review, probe P6): a panicking `chat` call
+    /// must not leak `inflight` forever — otherwise a pending drain
+    /// (`unload` deferred behind it) never completes, `active_op` stays
+    /// stuck, and every *other* id reports `Busy` forever too. This is the
+    /// same class of bug as C1, but in the `Chat` dispatch, which C1's
+    /// original fix (`start_load`/`start_unload` only) didn't cover.
+    #[tokio::test]
+    async fn a_panicking_chat_does_not_leak_inflight_unload_completes_and_other_ids_stay_free() {
+        let adapter = Arc::new(ChatPanicsAdapter);
+        let handle =
+            Supervisor::spawn(adapter, SupervisorConfig::default()).expect("spawn should succeed");
+        no_hang(handle.load("a", 4.0, on_demand_policy()))
+            .await
+            .expect("load a should succeed");
+        let err = no_hang(handle.chat(
+            ChatRequest {
+                model: "a".to_string(),
+                messages: vec![],
+            },
+            CancellationToken::new(),
+        ))
+        .await
+        .expect_err("a panicking chat call must surface as an error, not hang");
+        assert_eq!(err.reason_code(), "adapter_panicked");
+        // If `inflight` had leaked, this would hang forever waiting for a
+        // drain that can never observe it reach 0.
+        no_hang(handle.unload("a"))
+            .await
+            .expect("unload must complete after the panicking chat, not hang forever");
+        // If `active_op` had stayed stuck on "a", this would report `Busy`
+        // instead of succeeding.
+        no_hang(handle.load("b", 4.0, on_demand_policy()))
+            .await
+            .expect("a different id must not be busy after the panicking chat");
     }
 
     /// C2: a model with an in-flight `chat` is never chosen as an
@@ -1750,13 +2228,12 @@ mod tests {
             .await
         });
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        let err = handle
-            .load("b", 20.0, on_demand_policy())
+        let err = no_hang(handle.load("b", 20.0, on_demand_policy()))
             .await
             .expect_err("a has an in-flight chat: nothing evictable, b cannot be admitted");
         assert_eq!(err.reason_code(), "eviction_impossible");
         assert_eq!(adapter.unload_call_count("a"), 0);
-        chat_a
+        no_hang(chat_a)
             .await
             .unwrap()
             .expect("the in-flight chat should still complete normally");
@@ -1796,22 +2273,21 @@ mod tests {
             0,
             "unload must not call the adapter while a chat is still in flight"
         );
-        let err = handle
-            .chat(
-                ChatRequest {
-                    model: "a".to_string(),
-                    messages: vec![],
-                },
-                CancellationToken::new(),
-            )
-            .await
-            .expect_err("a new chat during the drain (Stopping) must be rejected");
+        let err = no_hang(handle.chat(
+            ChatRequest {
+                model: "a".to_string(),
+                messages: vec![],
+            },
+            CancellationToken::new(),
+        ))
+        .await
+        .expect_err("a new chat during the drain (Stopping) must be rejected");
         assert_eq!(err.reason_code(), "model_unavailable");
-        chat_a
+        no_hang(chat_a)
             .await
             .unwrap()
             .expect("the original in-flight chat should still complete");
-        unload_a
+        no_hang(unload_a)
             .await
             .unwrap()
             .expect("unload should complete once the drain finishes");
@@ -2096,5 +2572,131 @@ mod tests {
             .await
             .expect_err("status must also fail closed once poisoned");
         assert_eq!(status_err.reason_code(), "state_invariant_violated");
+    }
+
+    /// A minimal `RuntimeAdapter` recording the timestamp of every `load`/
+    /// `status` call: `load` OOMs on its first call, succeeds on every
+    /// later one — for asserting exactly *when* the OOM retry and its
+    /// confirmation actually happen relative to each other (M10/M11, Opus
+    /// Tier-2 review).
+    struct OomRetryTimingAdapter {
+        load_times: std::sync::Mutex<Vec<tokio::time::Instant>>,
+        status_times: std::sync::Mutex<Vec<tokio::time::Instant>>,
+    }
+
+    #[async_trait::async_trait]
+    impl RuntimeAdapter for OomRetryTimingAdapter {
+        async fn list(&self) -> Result<Vec<ModelInfo>, BackendError> {
+            Ok(catalog())
+        }
+        async fn load(&self, id: &str, _policy: Option<&LoadPolicy>) -> Result<(), BackendError> {
+            let mut times = self
+                .load_times
+                .lock()
+                .expect("test mutex is never poisoned");
+            let is_first = times.is_empty();
+            times.push(tokio::time::Instant::now());
+            if is_first {
+                Err(BackendError::oom(id))
+            } else {
+                Ok(())
+            }
+        }
+        async fn unload(&self, _id: &str) -> Result<(), BackendError> {
+            Ok(())
+        }
+        async fn status(&self) -> Result<BackendStatus, BackendError> {
+            let mut times = self
+                .status_times
+                .lock()
+                .expect("test mutex is never poisoned");
+            // First call (the retry's `used_gb_before_retry` baseline)
+            // reports high; every later call reports the drop already
+            // confirmed — so `confirm_memory_released` succeeds on its
+            // very first poll and contributes ~0 delay of its own,
+            // isolating `oom_retry_backoff`'s contribution to the gap
+            // between the two `load` calls (M10 needs this: without it,
+            // `confirm_memory_released`'s own up-to-`release_confirm_
+            // max_attempts` polling could coincidentally cover for a
+            // missing backoff and mask the mutation).
+            let used_gb = if times.is_empty() { 100.0 } else { 0.0 };
+            times.push(tokio::time::Instant::now());
+            Ok(BackendStatus {
+                pressure: Pressure::Ok,
+                used_gb,
+                model_memory_max_gb: 0.0,
+                loaded: Vec::new(),
+            })
+        }
+        async fn probe_ready(&self, _id: &str) -> Result<bool, BackendError> {
+            Ok(true)
+        }
+        async fn chat(
+            &self,
+            req: ChatRequest,
+            _cancel: CancellationToken,
+        ) -> Result<ChatResponse, BackendError> {
+            Ok(ChatResponse {
+                model: req.model,
+                content: String::new(),
+            })
+        }
+    }
+
+    /// M10 + M11 (Opus Tier-2 review): the OOM circuit breaker's one retry
+    /// must (a) wait at least `oom_retry_backoff` before retrying, and
+    /// (b) call `confirm_memory_released` (i.e. poll `status()`) at least
+    /// once *between* the OOM'd attempt and the retry — not skip either
+    /// step. Uses `tokio::time::Instant` (respects the paused clock) rather
+    /// than a real wall-clock measurement.
+    #[tokio::test(start_paused = true)]
+    async fn oom_retry_confirms_release_and_backs_off_before_retrying() {
+        let adapter = Arc::new(OomRetryTimingAdapter {
+            load_times: std::sync::Mutex::new(Vec::new()),
+            status_times: std::sync::Mutex::new(Vec::new()),
+        });
+        let backoff = std::time::Duration::from_millis(200);
+        let handle = Supervisor::spawn(
+            adapter.clone(),
+            SupervisorConfig {
+                oom_retry_backoff: backoff,
+                ..SupervisorConfig::default()
+            },
+        )
+        .expect("spawn should succeed");
+        no_hang(handle.load("a", 4.0, on_demand_policy()))
+            .await
+            .expect("load should self-heal after the OOM retry");
+
+        let load_times = adapter
+            .load_times
+            .lock()
+            .expect("test mutex is never poisoned")
+            .clone();
+        assert_eq!(load_times.len(), 2, "exactly one OOM retry must happen");
+        let gap = load_times[1] - load_times[0];
+        assert!(
+            gap >= backoff,
+            "M10: the retry must wait at least oom_retry_backoff ({backoff:?}), got {gap:?}"
+        );
+
+        let status_times = adapter
+            .status_times
+            .lock()
+            .expect("test mutex is never poisoned")
+            .clone();
+        // At least 2, not just 1: the baseline `used_gb_before_retry`
+        // read is itself one `status()` call that would happen even
+        // without ever calling `confirm_memory_released` — only a
+        // *second* call in this window proves the confirmation loop
+        // itself actually ran.
+        let calls_in_window = status_times
+            .iter()
+            .filter(|t| **t >= load_times[0] && **t < load_times[1])
+            .count();
+        assert!(
+            calls_in_window >= 2,
+            "M11: confirm_memory_released must actually poll status() (not just read the baseline) between the OOM'd attempt and the retry, got {calls_in_window} call(s)"
+        );
     }
 }
