@@ -5,10 +5,45 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-description = "Rust port of packages/tenancy (tenant scoping, budget, billing). R2-C is landing a SQLite-backed budget ledger (reserve/settle/release) across a stack of follow-up PRs on top of this one, which only wires up its dependencies; store/billing are still skeletons — see README.md."
+description = "Rust design for packages/tenancy (tenant scoping, budget, billing). R2-C implements a new SQLite-backed budget ledger (atomic reserve/settle/release), informed by but not a line-for-line port of packages/tenancy/src/budget.ts; store/billing are still skeletons — see README.md."
 
 [lints]
 workspace = true
+
+[features]
+# Opus Tier-2 acceptance L6: `budget_mp_worker` exists only to be spawned by
+# the multi-process concurrency test (`tests/budget_concurrency.rs`) — it
+# has no reason to be built as part of a normal `cargo build`/publish of
+# this crate. CI passes `--features idoris-tenancy/test-bins` explicitly
+# (see `.github/workflows/ci.yml`), so this is opt-in at the Cargo level,
+# not skippable as a CI gate (M4).
+test-bins = []
+# Opus Tier-2 re-review B-8: a deterministic (no-sleep) way to prove the
+# existing concurrency tests would actually catch a "split the atomic
+# check-and-deduct transaction" regression, instead of relying on manually
+# editing `reserve()` and an artificial sleep to widen the race window by
+# hand each time. Compiles a barrier-synchronized hook into `reserve()`
+# that's a no-op unless a test explicitly arms it — see
+# `budget::ledger::test_hooks` and `tests/budget_concurrency.rs`.
+mutation-test-hooks = []
+
+[[bin]]
+name = "budget_mp_worker"
+path = "src/bin/budget_mp_worker.rs"
+required-features = ["test-bins"]
+
+# Isolated in its own test binary/process (Opus Tier-2 re-review B-8): the
+# mutation-testing hook is process-global `OnceLock` state that, once armed,
+# would corrupt every *other* concurrent `reserve()` call in the same test
+# process — including the other concurrency tests in
+# `tests/budget_concurrency.rs`, which `cargo test` runs as separate threads
+# within one process by default. `required-features` also means this file
+# doesn't even attempt to compile without the feature (it references the
+# feature-gated `test_hooks` module unconditionally).
+[[test]]
+name = "budget_mutation_hooks"
+path = "tests/budget_mutation_hooks.rs"
+required-features = ["mutation-test-hooks"]
 
 [dependencies]
 idoris-contracts = { workspace = true }
