@@ -36,8 +36,15 @@ jobs:
             target
           key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
       - run: cargo fmt --check
-      - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo test
+      # idoris-tenancy/test-bins gates the budget_mp_worker test helper
+      # binary out of default builds (Opus Tier-2 acceptance L6); enabling
+      # it here keeps its multi-process concurrency tests a required part of
+      # this gate rather than something a plain local `cargo test` happens
+      # to skip (M4). idoris-tenancy/mutation-test-hooks gates a
+      # deterministic split-transaction mutation-testing hook the same way
+      # (Opus Tier-2 re-review B-8) — also required here, not optional.
+      - run: cargo clippy --all-targets --features idoris-tenancy/test-bins,idoris-tenancy/mutation-test-hooks -- -D warnings
+      - run: cargo test --features idoris-tenancy/test-bins,idoris-tenancy/mutation-test-hooks
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check licenses bans
