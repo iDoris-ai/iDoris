@@ -1,7 +1,7 @@
 //! [`UpstreamError`] — the stable error surface every upstream client in
 //! this crate returns, whether the upstream is a local runtime engine
-//! (oMLX, via [`idoris_backend::RuntimeAdapter`]) or a remote HTTP provider
-//! (via [`crate::chat::RemoteChat`]).
+//! (oMLX, via an `idoris_backend::RuntimeAdapter` impl landing in a
+//! follow-up PR) or a remote HTTP provider (a `RemoteChat` client, same).
 //!
 //! **Why this exists:** a well-known OpenRouter incident folded an auth
 //! rejection and a genuine upstream dependency failure into one generic
@@ -12,10 +12,21 @@
 //! code**: `timeout`, `upstream_client_error`/`upstream_server_error`
 //! (4xx/5xx, 401/403 excluded), `network_error` (never reached the
 //! upstream at all), `auth_failed` (401/403, or no credential resolved).
-//! [`UpstreamError::from_status`] is the single call site that classifies
-//! a raw status code, and it routes 401/403 to `auth_failed`
-//! unconditionally — no other path may build `ClientError`/`ServerError`
+//! [`UpstreamError::from_status`] is the single *intended* call site that
+//! classifies a raw status code, and it routes 401/403 to `auth_failed`
+//! unconditionally — no other path should build `ClientError`/`ServerError`
 //! for what is actually an auth rejection.
+//!
+//! **Known limitation (accepted, same trade-off `idoris_backend::BackendError`
+//! documents for its own Supervisor-only variants):** `ClientError`/
+//! `ServerError`'s fields are public, so nothing in the type system stops a
+//! call site from constructing `UpstreamError::ClientError { status: 401 }`
+//! directly instead of going through `from_status` — the guarantee above is
+//! enforced by convention (route every raw status through `from_status`),
+//! not by the compiler. Every call site added by this crate's own PRs
+//! follows that convention; revisit with a stricter (e.g. private-field)
+//! encoding if an external caller is ever found constructing these variants
+//! directly.
 //!
 //! **No response bodies in `Display`/logs** — every variant carries only
 //! machine-safe metadata (a status code, a fixed reason string), never the
