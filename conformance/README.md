@@ -6,11 +6,9 @@ R0：语言无关的黑盒 HTTP 契约测试套件。
 iDoris 从 TypeScript 迁移到 Rust 期间，同时锁住 TS 参考实现（`packages/router`）
 和将来的 Rust 版的行为。谁通不过，谁就是有问题的那一个。
 
-> 本套件基于 `feat/m4-t4.1-agent24-prereqs`（PR #46：T4.1 Agent24 接入前置）
-> 编写，覆盖规范 v1.0.1 已落地的 `/health` 服务身份、`X-iDoris-Record-Id`、
-> `X-iDoris-Served-Locality`、`X-iDoris-Cached`/`X-iDoris-Origin-Record-Id`。
-> 这条分支还没合并进 `main`，所以本 PR 的 base 也设成了
-> `feat/m4-t4.1-agent24-prereqs`，等它合并后再改基到 `main`。
+> 本套件覆盖 PR #46（T4.1 Agent24 接入前置，规范 v1.0.1）落地的 `/health` 服务
+> 身份、`X-iDoris-Record-Id`、`X-iDoris-Served-Locality`、`X-iDoris-Cached`/
+> `X-iDoris-Origin-Record-Id`——#46 已合并进 `main`，本套件直接基于 `main` 编写。
 
 ## 怎么跑
 
@@ -47,6 +45,15 @@ IDORIS_CONFORMANCE_CMD="/path/to/idoris-router-rs serve" \
   pnpm --filter @idoris/conformance test:conformance
 ```
 
+`IDORIS_CONFORMANCE_CMD` 用一个极简的、支持基本引号的分词器解析，不是真正的 shell；
+命令本身很简单（没有带空格的路径/参数）时够用。参数比较复杂、或者想彻底避免任何
+解析歧义时，改用 `IDORIS_CONFORMANCE_ARGV`（JSON 字符串数组，优先级更高）：
+
+```bash
+IDORIS_CONFORMANCE_ARGV='["/path/to/idoris-router-rs","serve","--flag","value with spaces"]' \
+  pnpm --filter @idoris/conformance test:conformance
+```
+
 `conformance/src/harness.ts`、`conformance/tests/*.ts` 不需要改一行。
 
 ## 环境变量约定（被测进程需要遵守）
@@ -78,7 +85,9 @@ IDORIS_CONFORMANCE_CMD="/path/to/idoris-router-rs serve" \
 - 上游 5xx：重试到成功、持续失败原样透传，均锁定"最多重试 2 次（共 3 次尝试）"
 - `X-iDoris-Request-Id` 幂等：60s 窗口内同一 Request-Id 只打一次上游
 - 慢响应：上游延迟但最终成功时不会被提前掐断
-- 取消传播：客户端断开连接会让 iDoris 侧的上游请求也被 abort
+- 取消传播：**目前锁定的是"不工作"这个已知 bug**（客户端 abort 后上游不会被 abort），
+  见下面「已知的规范 vs TS 现状落差」第一条；负对照（不主动断开也不该被误判成已取消）
+  仍然是真正在验证的行为
 - 流式 SSE：正常透传；上游直接 5xx 时不重试，改以 JSON 错误响应（而不是 SSE）返回
 - `deploy_mode=tenant` 缺 `X-iDoris-Tenant` → 400 `tenant_missing`；带了则放行
 - `X-iDoris-Record-Id`：所有响应都带（成功、400、404、503……），服务端生成，调用方
@@ -95,12 +104,21 @@ TS 实现里还没有对应代码，等这部分定稿并落地后再补测试�
 
 ## 已知的规范 vs TS 现状落差（`it.todo`）
 
-见 `tests/known-spec-conflicts.test.ts`：统一错误体缺 `rule_id/reason_code/evidence/remediation`
-字段、TS 用了规范 §3.11 枚举之外的错误 `type`（含新出现的 `invalid_body`/`internal_error`）、
-完全没有 §3.2 的虚拟 key 鉴权、`ChatProxy` 对上游请求没有任何超时（只有客户端主动断开
-才会 abort）、`/v1/messages`、`/v1/embeddings`、`/v1/rerank`、`/v1/systemone`、
-`/v1/inspect`、`/v1/feedback`、`/v1/trajectories`、`/admin/api/v1/*` 均未实现。
-这些只是记录下来，**没有改动任何 TS 实现代码**。
+见 `tests/known-spec-conflicts.test.ts`：
+
+1. **【真实 bug，本轮 conformance 复审发现】取消传播不工作**——
+   `packages/router/src/server.ts:330` 的 `req.on("close", () => controller.abort())`
+   监听的是请求对象（客户端→路由器）的 close，不是响应对象/socket 的 close；请求体
+   读完之后 `req` 会自己触发一次 'close'，跟客户端有没有真的断开连接无关，等这行代码
+   挂上监听器时往往已经错过了真正的断开事件。已用变异测试验证（改一行 `req`→`res`
+   就能让取消传播工作，细节见本次 PR 描述），改动已还原，**没有改动任何 TS 实现代码**。
+2. 统一错误体缺 `rule_id/reason_code/evidence/remediation` 字段。
+3. TS 用了规范 §3.11 枚举之外的错误 `type`（含新出现的 `invalid_body`/`internal_error`）。
+4. 完全没有 §3.2 的虚拟 key 鉴权。
+5. `ChatProxy` 对上游请求没有任何超时（本来设想只有客户端主动断开才会 abort，
+   但见第 1 条，这条防线本身也没工作）。
+6. `/v1/messages`、`/v1/embeddings`、`/v1/rerank`、`/v1/systemone`、`/v1/inspect`、
+   `/v1/feedback`、`/v1/trajectories`、`/admin/api/v1/*` 均未实现。
 
 ## 设计约束
 
@@ -115,3 +133,9 @@ TS 实现里还没有对应代码，等这部分定稿并落地后再补测试�
   HTTP 地址，这样 `form: http_service` 才会真的发出一次网络请求。
 - 每个 fixture 目录只放一张组件卡：TS 参考实现（L5）现在拒绝同一个 `provider.id`
   出现两次；需要"同时有本地+远程候选"的场景不在本轮覆盖范围内。
+- 被测子进程以 `detached: true` 起（POSIX 上即新进程组的组长），杀的时候按
+  `-pid` 杀整个进程组，不是只杀顶层那一个 pid——被测实现如果自己又 fork 了
+  子进程，不会留下孤儿。
+- 传给被测子进程的环境变量会先剥掉当前进程（跑 `pnpm conformance` 的那个 shell）
+  自己带的所有 `IDORIS_*`，再叠加套件显式要传的那几个——避免开发者本机环境里
+  偶然导出的 `IDORIS_DEPLOY_MODE` 之类的变量意外泄漏进被测进程，污染测试隔离性。

@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { startFakeUpstream, type FakeUpstream } from "../src/fake-upstream.js";
-import { spawnConformanceServer, type RunningServer } from "../src/harness.js";
+import { ConformanceStartupError, spawnConformanceServer, type RunningServer } from "../src/harness.js";
 import { localComponent, makeComponentsDir } from "../src/fixtures.js";
 
 /**
@@ -44,14 +44,31 @@ describe("不传 IDORIS_ROUTING_POLICY 时的缺省行为", () => {
 });
 
 describe("IDORIS_ROUTING_POLICY 指向不存在的文件", () => {
-  it("启动直接失败（fail-fast），不是延迟到运行期才报错", async () => {
+  it("启动直接失败（fail-fast）：非零退出码、且明显快于 healthTimeoutMs，不是靠等超时才报错", async () => {
     const componentsDir = makeComponentsDir([localComponent(upstream.url)]);
-    await expect(
-      spawnConformanceServer({
+    const start = Date.now();
+    let caught: unknown;
+    try {
+      await spawnConformanceServer({
         componentsDir,
         routingPolicyPath: "/no/such/path/routing-policy.yaml",
-        healthTimeoutMs: 5_000,
-      }),
-    ).rejects.toThrow();
+        // 特意给一个远大于"真的 fail-fast"所需时间的超时：如果实现退化成
+        // "挂到超时才报错"，这条用例会直接测出耗时接近 10s，而不是被短
+        // healthTimeoutMs 掩盖成"反正都失败了看不出区别"。
+        healthTimeoutMs: 10_000,
+      });
+    } catch (err) {
+      caught = err;
+    }
+    const elapsed = Date.now() - start;
+
+    expect(caught).toBeInstanceOf(ConformanceStartupError);
+    const err = caught as ConformanceStartupError;
+    // 是 CLI 自己检测到坏路径后主动退出（exited_early，非零退出码），
+    // 不是被我们的健康检查耗尽超时后强杀（health_timeout，exitCode 为 null）。
+    expect(err.kind).toBe("exited_early");
+    expect(err.exitCode).not.toBeNull();
+    expect(err.exitCode).not.toBe(0);
+    expect(elapsed).toBeLessThan(2_000);
   });
 });

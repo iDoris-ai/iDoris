@@ -9,6 +9,22 @@ import { describe, it } from "vitest";
  */
 describe("已知的规范 vs TS 现状落差（it.todo，不改实现）", () => {
   it.todo(
+    "【真实 bug，不只是规范措辞差异】§3.11 说『取消：客户端断开连接即向上游传播取消（已实现）』，" +
+      "但 packages/router/src/server.ts:330 的 `req.on(\"close\", () => controller.abort())` " +
+      "监听的是**请求对象**（客户端→路由器方向）的 close，不是响应对象/socket 的 close。" +
+      "请求体在走到这行之前已经被 `readBody(req)` 完整读完，Node 的 IncomingMessage 读完之后会" +
+      "自己很快再触发一次 'close'，跟客户端有没有真的断开连接毫无关系；等这行代码执行、挂上监听器时，" +
+      "那次『自然 close』通常已经发生过了（实测 `req.destroyed`/`req.complete` 在挂监听器之前就已经是 " +
+      "true/true）。净效果：真实客户端断开时 `controller.abort()` 基本不会被调用，取消不会传播到上游。" +
+      "已用变异测试验证（细节见 PR 描述，两次改动都已还原、未进最终 diff）：" +
+      "(1) 把这行临时改成 `res.on(\"close\", () => { if (!res.writableEnded) controller.abort(); })` " +
+      "→ conformance/tests/upstream-behavior.test.ts 的取消传播用例约 300ms 内变绿；" +
+      "(2) 在这个修好的基础上再临时去掉 proxy.ts 里 `init.signal = opts.signal` 那一行 → 又变红，" +
+      "证明这两处都是必要环节。建议修法：req.on(\"close\") 改成 res.on(\"close\")，" +
+      "且要判断 !res.writableEnded（避免把正常收尾误判成取消）。",
+  );
+
+  it.todo(
     "§3.11 统一错误体要求 {error:{type,rule_id,reason_code,evidence,remediation}}；" +
       "TS 现状绝大多数错误体只有 {error:{type,message?}}——PR #46 给 subscription_relay_failed " +
       "加上了 reason_code（唯一的例外），但 rule_id/evidence/remediation 全线都还没有，" +
@@ -33,11 +49,12 @@ describe("已知的规范 vs TS 现状落差（it.todo，不改实现）", () =>
   );
 
   it.todo(
-    "规范设想 iDoris 要能对慢/挂起的上游做 fail-closed；" +
-      "packages/router/src/proxy.ts 的 ChatProxy 对上游请求没有设置任何超时，只有『客户端主动断开连接』" +
-      "才会 abort 转发给上游的那个请求——如果上游一直不回应而客户端也不断开，iDoris 会一直挂着等，" +
-      "不会主动熔断。conformance/tests/upstream-behavior.test.ts 的『慢响应』用例只验证了" +
-      "『没有被提前误杀』，没有验证『上游长期挂起时最终会不会超时』，因为现状就是不会。",
+    "规范设想 iDoris 要能对慢/挂起的上游做 fail-closed；packages/router/src/proxy.ts 的 ChatProxy " +
+      "对上游请求没有设置任何超时，**理论上**只在『客户端主动断开连接』时才会 abort 转发给上游的那个" +
+      "请求——但见上一条：这条『客户端断开 → abort 上游』的链路本身现在也是坏的（server.ts 监听错了" +
+      "对象），所以实际情况比『只在客户端断开时兜底』更差：上游一直不回应时，不管客户端断不断开，" +
+      "iDoris 都会一直挂着等，不会主动熔断。conformance/tests/upstream-behavior.test.ts 的『慢响应』" +
+      "用例只验证了『没有被提前误杀』，没有验证『上游长期挂起时最终会不会超时』，因为现状就是不会。",
   );
 
   it.todo(

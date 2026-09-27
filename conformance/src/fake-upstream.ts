@@ -23,15 +23,27 @@ export interface ReceivedRequest {
   bodyText: string;
 }
 
+/** 一次 queueChat() 调用对应的那次请求（可能还没被消费）的句柄。 */
+export interface ChatHandle {
+  /**
+   * 这条请求的连接是否在收到完整响应之前就被关闭（客户端/被测服务主动取消）。
+   * 只对 `kind: "hang"` 有意义——其它 kind 都会正常 `res.end()`，连接关闭
+   * 属于正常收尾，不代表取消。
+   */
+  wasAborted(): boolean;
+}
+
 export interface FakeUpstream {
   readonly url: string;
   readonly port: number;
   chatCount(): number;
   modelsCount(): number;
-  /** 最近一次 hang 请求是否被客户端断开（用于验证取消传播）。 */
-  wasChatAborted(): boolean;
-  /** 先进先出：下一次 /v1/chat/completions 命中队首；队空则用默认成功响应兜底。 */
-  queueChat(behavior: ChatBehavior): void;
+  /**
+   * 先进先出：下一次 /v1/chat/completions 命中队首；队空则用默认成功响应兜底。
+   * 返回值只对应**这一条**排队的行为——不是全局共享状态，多个 hang 请求的
+   * 取消状态互不影响。
+   */
+  queueChat(behavior: ChatBehavior): ChatHandle;
   setModels(models: Array<{ id: string }>): void;
   requests(): readonly ReceivedRequest[];
   close(): Promise<void>;
@@ -47,28 +59,51 @@ function defaultChatBody(): unknown {
   };
 }
 
+/** 队列里的一条条目：行为本身 + 它专属的取消状态（不跨请求共享）。 */
+interface QueuedEntry {
+  behavior: ChatBehavior;
+  aborted: boolean;
+}
+
 export async function startFakeUpstream(): Promise<FakeUpstream> {
-  const queue: ChatBehavior[] = [];
+  const queue: QueuedEntry[] = [];
   let models: Array<{ id: string }> = [{ id: "fake-model-1" }];
   let chatCount = 0;
   let modelsCount = 0;
-  let aborted = false;
   const received: ReceivedRequest[] = [];
 
   async function handleChat(req: IncomingMessage, res: ServerResponse): Promise<void> {
     chatCount += 1;
-    const behavior = queue.shift() ?? { kind: "json" as const, status: 200, body: defaultChatBody() };
+    const entry: QueuedEntry = queue.shift() ?? {
+      behavior: { kind: "json", status: 200, body: defaultChatBody() },
+      aborted: false,
+    };
+    const behavior = entry.behavior;
     if (behavior.kind === "hang") {
-      req.on("close", () => {
-        aborted = true;
+      // 用 res（不是 req）的 'close' 事件判断连接是否被提前关闭。
+      //
+      // 之前这里监听的是 req 的 'close'——**这是错的**：这次请求的 body 在
+      // 走到这里之前已经在外层 req.on('end', …) 里读完了，而 Node 的可读流
+      // （IncomingMessage 也是一个）在 'end' 之后，只要还开着 emitClose（默认
+      // 就是开的），很快会自己再触发一次 'close'，跟客户端到底有没有断开
+      // 连接毫无关系。结果是 wasAborted() 曾经**永远是 true**——不管测试
+      // 有没有真的调用 abort()，这条测试对"取消没有传播"这个真实回归完全
+      // 没有识别力（已用变异测试验证，见 PR 描述）。
+      //
+      // res 的 'close' 不一样：hang 分支永远不会调用 res.end()，所以它只会在
+      // 底层连接被提前断开（客户端主动取消，或代理它的路由器把取消传播过来）
+      // 时才触发；`!res.writableEnded` 这层判断是双保险——万一将来这个分支
+      // 又加了别的路径会调用 res.end()，也不会把"正常收尾"误判成"被取消"。
+      res.on("close", () => {
+        if (!res.writableEnded) entry.aborted = true;
       });
       return; // 故意永不响应：模拟上游挂起。
     }
     if (behavior.delayMs !== undefined && behavior.delayMs > 0) await sleep(behavior.delayMs);
     // 客户端可能在慢响应/流式分片中途断开（被测服务把取消传播过来时就是这样）；
-    // 断开之后再 res.write()/res.end() 会在底层 socket 上抛错。这不是"上游出了
-    // 什么问题"，是预期之内的正常收尾，不该让假上游这个共享 vitest worker 进程
-    // 因为一次未捕获异常就整个崩掉、殃及同一个 worker 里其它测试文件。
+    // 断开之后再 res.write()/res.end() 可能会在底层 socket 上触发错误。这不是
+    // "上游出了什么问题"，是预期之内的正常收尾，不该让假上游这个共享 vitest
+    // worker 进程因为一次未处理异常就整个崩掉、殃及同一个 worker 里其它测试文件。
     if (res.writableEnded || res.destroyed) return;
     if (behavior.kind === "sse") {
       res.writeHead(behavior.status ?? 200, { "content-type": "text/event-stream" });
@@ -133,9 +168,10 @@ export async function startFakeUpstream(): Promise<FakeUpstream> {
     port,
     chatCount: () => chatCount,
     modelsCount: () => modelsCount,
-    wasChatAborted: () => aborted,
     queueChat: (behavior) => {
-      queue.push(behavior);
+      const entry: QueuedEntry = { behavior, aborted: false };
+      queue.push(entry);
+      return { wasAborted: () => entry.aborted };
     },
     setModels: (m) => {
       models = m;
