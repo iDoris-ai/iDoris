@@ -1,7 +1,10 @@
-//! A test-only [`ModelBackend`] implementation with an in-memory catalog and
-//! load/unload bookkeeping, so router/tenancy code can be tested against the
-//! trait without a real inference engine — the Rust equivalent of hand
-//! rolling a fake in a TS test file, but shared as one crate-level type.
+//! A test-only [`RuntimeAdapter`] implementation with an in-memory catalog
+//! and load/unload bookkeeping, so router/tenancy code — and, in a
+//! follow-up PR, the Supervisor event loop — can be tested against the
+//! trait without a real inference engine. A later PR adds injectable
+//! latency/failure/OOM scripting on top of this; this version only carries
+//! over the R1 skeleton's behavior onto the renamed [`RuntimeAdapter`]
+//! trait.
 
 use std::sync::Mutex;
 
@@ -9,9 +12,9 @@ use async_trait::async_trait;
 use idoris_contracts::LoadPolicy;
 use tokio_util::sync::CancellationToken;
 
-use crate::ModelBackend;
+use crate::RuntimeAdapter;
 use crate::error::BackendError;
-use crate::types::{Admission, BackendStatus, ChatRequest, ChatResponse, ModelInfo, Pressure};
+use crate::types::{BackendStatus, ChatRequest, ChatResponse, ModelInfo, Pressure};
 
 struct MockState {
     catalog: Vec<ModelInfo>,
@@ -20,15 +23,15 @@ struct MockState {
     model_memory_max_gb: f64,
 }
 
-/// Configurable in-memory [`ModelBackend`]. `catalog` fixes what
-/// [`ModelBackend::list`]/`load`/`admission` will recognize;
-/// [`MockBackend::set_pressure`] lets a test drive [`ModelBackend::status`]'s
+/// Configurable in-memory [`RuntimeAdapter`]. `catalog` fixes what
+/// [`RuntimeAdapter::list`]/`load` will recognize;
+/// [`MockAdapter::set_pressure`] lets a test drive [`RuntimeAdapter::status`]'s
 /// `pressure` field without needing a real memory-pressure signal.
-pub struct MockBackend {
+pub struct MockAdapter {
     state: Mutex<MockState>,
 }
 
-impl MockBackend {
+impl MockAdapter {
     pub fn new(catalog: Vec<ModelInfo>) -> Self {
         Self {
             state: Mutex::new(MockState {
@@ -41,11 +44,9 @@ impl MockBackend {
     }
 
     fn lock(&self) -> Result<std::sync::MutexGuard<'_, MockState>, BackendError> {
-        self.state.lock().map_err(|_| {
-            BackendError::lock_poisoned(
-                "MockBackend's internal lock was poisoned by a panicking test",
-            )
-        })
+        self.state
+            .lock()
+            .map_err(|_| BackendError::lock_poisoned("MockAdapter's lock was poisoned by a panic"))
     }
 
     pub fn set_pressure(&self, pressure: Pressure) -> Result<(), BackendError> {
@@ -55,7 +56,7 @@ impl MockBackend {
 }
 
 #[async_trait]
-impl ModelBackend for MockBackend {
+impl RuntimeAdapter for MockAdapter {
     async fn list(&self) -> Result<Vec<ModelInfo>, BackendError> {
         Ok(self.lock()?.catalog.clone())
     }
@@ -76,14 +77,6 @@ impl ModelBackend for MockBackend {
         Ok(())
     }
 
-    async fn admission(&self, id: &str) -> Result<Admission, BackendError> {
-        let state = self.lock()?;
-        if !state.catalog.iter().any(|m| m.id == id) {
-            return Err(BackendError::model_not_found(id));
-        }
-        Ok(Admission::Coexist)
-    }
-
     async fn status(&self) -> Result<BackendStatus, BackendError> {
         let state = self.lock()?;
         Ok(BackendStatus {
@@ -92,6 +85,18 @@ impl ModelBackend for MockBackend {
             model_memory_max_gb: state.model_memory_max_gb,
             loaded: state.loaded.clone(),
         })
+    }
+
+    async fn probe_ready(&self, id: &str) -> Result<bool, BackendError> {
+        let state = self.lock()?;
+        if !state.catalog.iter().any(|m| m.id == id) {
+            // An unknown id must fail loudly, not `Ok(false)` — the
+            // Supervisor treats `Ok(false)` as "keep polling", which for a
+            // model that will never exist would eventually surface as a
+            // misleading `ProbeTimedOut` instead of the real problem.
+            return Err(BackendError::model_not_found(id));
+        }
+        Ok(state.loaded.iter().any(|loaded| loaded == id))
     }
 
     async fn chat(
