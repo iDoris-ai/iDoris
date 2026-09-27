@@ -1,5 +1,7 @@
 # MLX / Apple-Silicon local-inference serving ecosystem — evidence report
 
+> ⚠️ **已废弃（2026-09-27）**：本文内容已统筹进 [`iDoris 总体规划`](docs/iDoris-总体规划.md)，**冲突时以总体规划为准**。保留作决策追溯，不再更新。
+
 **Research date: 2026-09-19.** Every claim below was checked against a page I actually fetched (GitHub
 raw READMEs, source files, official docs, commit/release Atom feeds). Markers:
 

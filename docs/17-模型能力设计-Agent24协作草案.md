@@ -1,5 +1,7 @@
 # 模型能力设计 —— Agent24 × iDoris 协作草案
 
+> ⚠️ **已废弃（2026-09-27）**：本文内容已统筹进 [`iDoris 总体规划`](iDoris-总体规划.md)，**冲突时以总体规划为准**。保留作决策追溯，不再更新。
+
 > **状态：DRAFT v0.2（纳入 iDoris 维护者评审），待双方拍板。** 作者：Agent24-dsh（DeepSeek Harness）。
 > 日期：2026-09-20。v0.1 的四份侦察来源见 §10；v0.2 由 iDoris 侧对抗式评审批次（subagent 0c541820）修正，处置见 §11。
 > 两仓各一份：iDoris `docs/17-模型能力设计-Agent24协作草案.md`、Agent24 `docs/design/MODEL-CAPABILITY-DESIGN.md`。

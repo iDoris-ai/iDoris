@@ -1,5 +1,7 @@
 # iDoris 对 Agent24 的需求（Requirements，非实现）
 
+> ⚠️ **已废弃（2026-09-27）**：本文内容已统筹进 [`iDoris 总体规划`](iDoris-总体规划.md)，**冲突时以总体规划为准**。保留作决策追溯，不再更新。
+
 > 文档类型：跨仓库需求（iDoris → Agent24）
 > 日期：2026-07-30 ｜ 维护者：iDoris.ai / @jhfnetboy
 >

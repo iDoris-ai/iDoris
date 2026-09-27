@@ -1,5 +1,7 @@
 # iDoris 对统一模型服务的需求（来自泰国 Starter Kit）
 
+> ⚠️ **已废弃（2026-09-27）**：本文内容已统筹进 [`iDoris 总体规划`](iDoris-总体规划.md)，**冲突时以总体规划为准**。保留作决策追溯，不再更新。
+
 > 文档类型：跨仓库需求（iDoris-website / Starter Kit → iDoris 统一模型服务）
 > 日期：2026-09-07 ｜ 提出方：iDoris-website 仓库（泰国落地业务）
 >
