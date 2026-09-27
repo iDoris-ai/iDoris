@@ -615,7 +615,7 @@ mod tests {
 
     /// Singleflight: two concurrent loads of the same id with an *identical*
     /// policy must merge into exactly one adapter call.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn concurrent_identical_policy_loads_merge_into_one_adapter_call() {
         let adapter = Arc::new(MockAdapter::new(catalog()));
         adapter.set_load_delay("a", std::time::Duration::from_millis(50));
@@ -632,7 +632,7 @@ mod tests {
     /// Negative contrast: a *different* policy for the same id must not be
     /// silently merged — it fails fast with `Busy` instead (queueing lands
     /// in a follow-up PR).
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn concurrent_different_policy_loads_do_not_merge() {
         let adapter = Arc::new(MockAdapter::new(catalog()));
         adapter.set_load_delay("a", std::time::Duration::from_millis(50));
@@ -692,7 +692,7 @@ mod tests {
 
     /// A different id than whatever is currently active fails fast — no
     /// queueing yet (see the module doc comment).
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_different_id_is_busy_while_one_load_is_in_flight() {
         let adapter = Arc::new(MockAdapter::new(two_model_catalog()));
         adapter.set_load_delay("a", std::time::Duration::from_millis(200));
@@ -715,7 +715,7 @@ mod tests {
     /// Negative contrast: an already-`Ready` id with a matching policy must
     /// stay a no-op even while an *unrelated* id is mid-load — confirming
     /// the fix in this PR (an earlier version wrongly reported `Busy` here).
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn already_ready_load_is_noop_even_while_another_id_loads() {
         let adapter = Arc::new(MockAdapter::new(two_model_catalog()));
         let handle = Supervisor::spawn(adapter.clone(), SupervisorConfig::default())
