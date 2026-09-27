@@ -88,7 +88,7 @@ fn spend_does_not_carry_across_a_period_boundary() {
 
     // Spend in the August (Bangkok) period.
     let id = ledger.reserve(&scope, Price::Known(900)).expect("reserve");
-    ledger.settle(&id, 900).expect("settle");
+    ledger.settle(&scope.tenant_id, &id, 900).expect("settle");
     assert_eq!(ledger.balance(&scope).expect("balance"), 100);
 
     // Cross into the September (Bangkok) period.
@@ -120,13 +120,17 @@ fn spend_within_the_same_period_accumulates() {
     let id1 = ledger
         .reserve(&scope, Price::Known(400))
         .expect("reserve 1");
-    ledger.settle(&id1, 400).expect("settle 1");
+    ledger
+        .settle(&scope.tenant_id, &id1, 400)
+        .expect("settle 1");
 
     clock.set(day_two);
     let id2 = ledger
         .reserve(&scope, Price::Known(400))
         .expect("reserve 2");
-    ledger.settle(&id2, 400).expect("settle 2");
+    ledger
+        .settle(&scope.tenant_id, &id2, 400)
+        .expect("settle 2");
 
     assert_eq!(
         ledger.balance(&scope).expect("balance"),
