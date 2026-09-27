@@ -130,6 +130,22 @@ pub enum BudgetError {
     #[error("cannot change billing_timezone while reservations are still active")]
     TimeZoneChangeWithActiveReservations,
 
+    /// `configure`/`configure_tenant` used a `billing_timezone` that
+    /// disagrees with the one already in force elsewhere for the same
+    /// tenant (Opus Tier-2 re-review B-2) — every `configure`/
+    /// `configure_tenant` call for one tenant must agree on a single zone.
+    /// Without this, a tenant-level sum computed under the tenant's own
+    /// zone can silently disagree with a sub-scope's reservations bucketed
+    /// under a different zone, especially near a period boundary.
+    #[error(
+        "tenant {tenant_id:?} already uses billing_timezone {existing:?}, cannot also use {requested:?}"
+    )]
+    InvalidConfig {
+        tenant_id: String,
+        existing: String,
+        requested: String,
+    },
+
     #[error("timestamp out of range: {now_ms}")]
     InvalidTimestamp { now_ms: i64 },
 
