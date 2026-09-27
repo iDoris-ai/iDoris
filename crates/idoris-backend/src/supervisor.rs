@@ -664,7 +664,11 @@ fn handle_load(
         {
             waiters.push(reply);
         } else {
-            let _ = reply.send(Err(BackendError::busy()));
+            let _ = reply.send(Err(BackendError::busy(
+                "a load for this id with a different policy is already in flight",
+                Some(id.clone()),
+                None,
+            )));
         }
         return;
     }
@@ -677,8 +681,12 @@ fn handle_load(
         let _ = reply.send(Ok(()));
         return;
     }
-    if active_op.is_some() {
-        let _ = reply.send(Err(BackendError::busy()));
+    if let Some(active) = active_op.as_ref() {
+        let _ = reply.send(Err(BackendError::busy(
+            "a different id currently holds the load/evict/unload mutex",
+            Some(active.id.clone()),
+            None,
+        )));
         return;
     }
 
@@ -778,7 +786,11 @@ fn handle_unload(
         match &mut active.kind {
             ActiveKind::Unload { waiters, .. } => waiters.push(reply),
             ActiveKind::Load { .. } => {
-                let _ = reply.send(Err(BackendError::busy()));
+                let _ = reply.send(Err(BackendError::busy(
+                    "a load for this id is already in flight",
+                    Some(id.clone()),
+                    None,
+                )));
             }
         }
         return;
@@ -797,8 +809,12 @@ fn handle_unload(
         }
         Some(_) => {}
     }
-    if active_op.is_some() {
-        let _ = reply.send(Err(BackendError::busy()));
+    if let Some(active) = active_op.as_ref() {
+        let _ = reply.send(Err(BackendError::busy(
+            "a different id currently holds the load/evict/unload mutex",
+            Some(active.id.clone()),
+            None,
+        )));
         return;
     }
     // Setting `Stopping` here already blocks *new* chats (the `Chat`
@@ -840,7 +856,11 @@ async fn run_actor(
         match msg {
             ActorMsg::Cmd(Command::List { reply }) => {
                 let Ok(permit) = call_slots.clone().try_acquire_owned() else {
-                    let _ = reply.send(Err(BackendError::busy()));
+                    let _ = reply.send(Err(BackendError::busy(
+                        "concurrent adapter-call limit reached",
+                        None,
+                        None,
+                    )));
                     continue;
                 };
                 let adapter = adapter.clone();
@@ -886,7 +906,11 @@ async fn run_actor(
                 }
                 Some(_) => {
                     let Ok(permit) = call_slots.clone().try_acquire_owned() else {
-                        let _ = reply.send(Err(BackendError::busy()));
+                        let _ = reply.send(Err(BackendError::busy(
+                            "concurrent adapter-call limit reached",
+                            None,
+                            None,
+                        )));
                         continue;
                     };
                     next_seq += 1;
@@ -1226,6 +1250,14 @@ mod tests {
             .await
             .expect_err("a different id while a load is active must be busy");
         assert_eq!(err.reason_code(), "supervisor_busy");
+        // M2 (Opus Tier-2 review): `Busy` must name which id is actually
+        // holding the mutex, not just say "busy" with no context.
+        match &err {
+            BackendError::Busy { active_id, .. } => {
+                assert_eq!(active_id.as_deref(), Some("a"));
+            }
+            other => panic!("expected BackendError::Busy, got {other:?}"),
+        }
         load_a
             .await
             .unwrap()

@@ -119,15 +119,33 @@ pub enum BackendError {
     #[error("supervisor is not running")]
     SupervisorUnavailable,
 
-    /// The Supervisor's bounded concurrency limit for in-flight adapter
-    /// calls (`SupervisorConfig::max_concurrent_adapter_calls`) is
-    /// currently exhausted. Distinct from `SupervisorUnavailable`: the
-    /// Supervisor *is* running, it's just momentarily saturated — retrying
-    /// shortly is the right response, not treating it as down.
-    /// **Supervisor-only** — see the module doc comment's design note; a
-    /// backend/adapter implementation must never construct this.
-    #[error("supervisor is at its concurrent-call limit")]
-    Busy,
+    /// The Supervisor rejected the call fast rather than queueing or
+    /// blocking it — either the bounded concurrency limit for in-flight
+    /// adapter calls (`SupervisorConfig::max_concurrent_adapter_calls`) is
+    /// exhausted, or a conflicting load/evict/unload mutex is already held
+    /// for a *different* id (see `crate::supervisor`'s module doc). Distinct
+    /// from `SupervisorUnavailable`: the Supervisor *is* running, it's just
+    /// momentarily saturated or contended — retrying shortly is the right
+    /// response, not treating it as down. **Supervisor-only** — see the
+    /// module doc comment's design note; a backend/adapter implementation
+    /// must never construct this.
+    #[error("supervisor busy: {reason}")]
+    Busy {
+        /// Human-readable cause (e.g. "a different id is mid-load",
+        /// "concurrent-call limit reached") — free text, not itself a
+        /// stable machine-readable code (`reason_code()` already covers
+        /// that at `"supervisor_busy"`).
+        reason: String,
+        /// The id currently holding the load/evict/unload mutex, when the
+        /// cause is mutex contention rather than concurrency-limit
+        /// exhaustion (which isn't tied to any single id).
+        active_id: Option<String>,
+        /// A suggested backoff, when the Supervisor has one to offer.
+        /// `None`, not a fabricated number, when it genuinely doesn't know
+        /// (neither mutex contention nor semaphore exhaustion carry an
+        /// estimate of how long the current holder will take).
+        retry_after_ms: Option<u64>,
+    },
 
     /// A state inconsistency the Supervisor's single-writer loop detected
     /// in itself — e.g. a completion message referencing a model id the
@@ -175,7 +193,7 @@ impl BackendError {
             BackendError::Upstream { .. } => "upstream_error",
             BackendError::Cancelled => "cancelled",
             BackendError::SupervisorUnavailable => "supervisor_unavailable",
-            BackendError::Busy => "supervisor_busy",
+            BackendError::Busy { .. } => "supervisor_busy",
             BackendError::InvariantViolation { .. } => "state_invariant_violated",
             BackendError::LockPoisoned { .. } => "internal_lock_poisoned",
             BackendError::Internal { .. } => "internal",
@@ -259,8 +277,16 @@ impl BackendError {
         Self::SupervisorUnavailable
     }
 
-    pub fn busy() -> Self {
-        Self::Busy
+    pub fn busy(
+        reason: impl Into<String>,
+        active_id: Option<String>,
+        retry_after_ms: Option<u64>,
+    ) -> Self {
+        Self::Busy {
+            reason: reason.into(),
+            active_id,
+            retry_after_ms,
+        }
     }
 
     pub fn invariant_violation(message: impl Into<String>) -> Self {

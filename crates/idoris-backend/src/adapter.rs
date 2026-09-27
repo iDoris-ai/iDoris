@@ -73,13 +73,16 @@ pub trait RuntimeAdapter: Send + Sync {
     /// way to know which policy fields a given engine actually treats as
     /// consequential, so any two policies that differ *at all* must be
     /// treated as genuinely different. Concurrent requests for the same
-    /// `id` whose policies are not `==` are **not** merged: the Supervisor
-    /// lets the first `load` proceed, then serializes the second caller's
-    /// own distinct `load` call (with their own exact policy) right after
-    /// it via the same queue used for unrelated ids — every caller's
-    /// requested policy is guaranteed to actually be applied for real
-    /// before their call returns, never silently dropped in favor of
-    /// "whoever got there first".
+    /// `id` whose policies are not `==` are **not** merged — but there is
+    /// no wait queue yet (a deliberately deferred simplification, see the
+    /// crate-level Supervisor docs), so the second caller does not get
+    /// serialized behind the first: it fails fast with
+    /// [`BackendError::Busy`], the same as a request for a wholly
+    /// *different* id would while the mutex is held. The caller is
+    /// responsible for retrying with their own exact policy once the
+    /// first `load` completes; a policy is never silently dropped or
+    /// merged into someone else's, but it is also never queued for the
+    /// Supervisor to apply automatically.
     ///
     /// The same exact-equality rule defines the no-op case: a repeat
     /// `load(id, policy)` call for an `id` that is already loaded is a
