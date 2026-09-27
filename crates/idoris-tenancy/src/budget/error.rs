@@ -22,6 +22,14 @@ pub(crate) fn checked_sub_i64(a: i64, b: i64) -> i64 {
     wide.clamp(i64::MIN as i128, i64::MAX as i128) as i64
 }
 
+/// Same widen-then-saturate pattern as [`checked_sub_i64`], for sums of two
+/// independently-sourced amounts (e.g. settled spend + active reservations)
+/// that plain i64 addition could overflow (L1).
+pub(crate) fn checked_add_i64(a: i64, b: i64) -> i64 {
+    let wide = a as i128 + b as i128;
+    wide.clamp(i64::MIN as i128, i64::MAX as i128) as i64
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum BudgetError {
     /// Reserving `estimated_cost_minor` would exceed the scope's remaining
@@ -121,6 +129,22 @@ pub enum BudgetError {
     /// to tell which period's bucket it belongs to.
     #[error("cannot change billing_timezone while reservations are still active")]
     TimeZoneChangeWithActiveReservations,
+
+    /// `configure`/`configure_tenant` used a `billing_timezone` that
+    /// disagrees with the one already in force elsewhere for the same
+    /// tenant (Opus Tier-2 re-review B-2) — every `configure`/
+    /// `configure_tenant` call for one tenant must agree on a single zone.
+    /// Without this, a tenant-level sum computed under the tenant's own
+    /// zone can silently disagree with a sub-scope's reservations bucketed
+    /// under a different zone, especially near a period boundary.
+    #[error(
+        "tenant {tenant_id:?} already uses billing_timezone {existing:?}, cannot also use {requested:?}"
+    )]
+    InvalidConfig {
+        tenant_id: String,
+        existing: String,
+        requested: String,
+    },
 
     #[error("timestamp out of range: {now_ms}")]
     InvalidTimestamp { now_ms: i64 },
@@ -291,6 +315,13 @@ mod tests {
     fn checked_sub_i64_saturates_instead_of_overflowing() {
         assert_eq!(checked_sub_i64(i64::MIN, i64::MAX), i64::MIN);
         assert_eq!(checked_sub_i64(i64::MAX, i64::MIN), i64::MAX);
+    }
+
+    /// Negative control: overflowing i64 addition must saturate too (L1).
+    #[test]
+    fn checked_add_i64_saturates_instead_of_overflowing() {
+        assert_eq!(checked_add_i64(i64::MAX, i64::MAX), i64::MAX);
+        assert_eq!(checked_add_i64(i64::MIN, i64::MIN), i64::MIN);
     }
 
     /// L4: a raw `SQLITE_BUSY` failure maps to the dedicated `Busy` variant,
