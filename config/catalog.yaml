@@ -31,7 +31,7 @@
 #   （core→daily）搬过来的，参数量不在这个区间：nanbeige4.2-3b（约 4B，标了 daily）、
 #   granite-4.2-3b（3B，标了 daily）、qwen3-8b（8.19B，标了 fast）。按规范重标会改变
 #   常驻自动推荐结果（哪个模型被选为常驻），需要 jason 拍板，见 docs/agent/tasks.md
-#   跟进项账本 FU-17（OPEN）。
+#   跟进项账本 FU-19（OPEN）。
 version: 1
 catalog:
 
