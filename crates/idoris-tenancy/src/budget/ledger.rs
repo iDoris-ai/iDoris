@@ -772,13 +772,25 @@ impl BudgetLedger {
     /// `expired` one should be re-reserved instead (extending it would
     /// resurrect a reservation other code may have already treated as
     /// freed).
+    /// B-5 (Opus Tier-2 re-review) hardening:
+    /// - `additional_ttl_ms` may not exceed this ledger's own `ttl_ms` — one
+    ///   `extend` call can renew for at most as long as a fresh `reserve`
+    ///   would have granted, not an arbitrary caller-chosen amount.
+    /// - the reservation's total lifetime (`created_at_ms` to the *new*
+    ///   `expires_at_ms`) may not exceed 4x `ttl_ms` — bounds how many times
+    ///   `extend` can be chained, so a caller can't keep a reservation (and
+    ///   the budget it holds) alive indefinitely.
+    /// - a reservation whose TTL has already lapsed (`expires_at_ms <=
+    ///   now_ms`) is rejected even if its DB `status` is still `active`
+    ///   (lazily not yet swept) — extending a reservation other code may
+    ///   already be treating as freed would resurrect it unexpectedly.
     pub fn extend(
         &self,
         tenant_id: &str,
         reservation_id: &ReservationId,
         additional_ttl_ms: i64,
     ) -> Result<(), BudgetError> {
-        if additional_ttl_ms <= 0 {
+        if additional_ttl_ms <= 0 || additional_ttl_ms > self.ttl_ms {
             return Err(BudgetError::InvalidTtl {
                 ttl_ms: additional_ttl_ms,
             });
@@ -789,7 +801,7 @@ impl BudgetLedger {
 
         let row = find_reservation(&tx, tenant_id, reservation_id)?;
         let status = ReservationStatus::parse(&row.status)?;
-        if status != ReservationStatus::Active {
+        if status != ReservationStatus::Active || row.expires_at_ms <= now_ms {
             tx.rollback().ok();
             return Err(BudgetError::ReservationNotActive {
                 reservation_id: reservation_id.0.clone(),
@@ -800,6 +812,20 @@ impl BudgetLedger {
         let new_expires_at_ms = now_ms
             .checked_add(additional_ttl_ms)
             .ok_or(BudgetError::InvalidTimestamp { now_ms })?;
+        let max_lifetime_ms = self.ttl_ms.checked_mul(4).ok_or(BudgetError::InvalidTtl {
+            ttl_ms: additional_ttl_ms,
+        })?;
+        let max_expires_at_ms = row
+            .created_at_ms
+            .checked_add(max_lifetime_ms)
+            .ok_or(BudgetError::InvalidTimestamp { now_ms })?;
+        if new_expires_at_ms > max_expires_at_ms {
+            tx.rollback().ok();
+            return Err(BudgetError::InvalidTtl {
+                ttl_ms: additional_ttl_ms,
+            });
+        }
+
         tx.execute(
             "UPDATE reservations SET expires_at_ms=?2 WHERE id=?1",
             rusqlite::params![reservation_id.0, new_expires_at_ms],
@@ -880,6 +906,9 @@ struct ReservationRow {
     reserved_minor: i64,
     status: String,
     expires_at_ms: i64,
+    /// B-5: needed to cap a reservation's total lifetime across repeated
+    /// `extend` calls.
+    created_at_ms: i64,
 }
 
 /// M2 (Opus Tier-2 acceptance): filters by `tenant_id` in the `WHERE`
@@ -898,7 +927,7 @@ fn find_reservation(
     let found = conn
         .query_row(
             "SELECT tenant_id, key_id, provider_id, model_id, period, reserved_minor, status, \
-                    expires_at_ms, tenant_period \
+                    expires_at_ms, tenant_period, created_at_ms \
              FROM reservations WHERE id = ?1 AND tenant_id = ?2",
             rusqlite::params![reservation_id.0, tenant_id],
             |r| {
@@ -912,6 +941,7 @@ fn find_reservation(
                     status: r.get(6)?,
                     expires_at_ms: r.get(7)?,
                     tenant_period: r.get(8)?,
+                    created_at_ms: r.get(9)?,
                 })
             },
         )

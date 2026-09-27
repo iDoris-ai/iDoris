@@ -193,14 +193,17 @@ fn extend_renews_an_active_reservations_deadline() {
     ledger.configure(&scope, 100, "UTC").expect("configure");
 
     let id = ledger.reserve(&scope, Price::Known(50)).expect("reserve");
-    // Extend well before the original TTL would lapse.
+    // Advance partway through the original TTL, then extend by the maximum
+    // a single call allows (B-5: at most `ttl_ms`) — pushes the deadline
+    // past the *original* one without exceeding it outright at call time.
+    clock.advance(TTL_MS / 2);
     ledger
-        .extend(&scope.tenant_id, &id, TTL_MS * 10)
+        .extend(&scope.tenant_id, &id, TTL_MS)
         .expect("extend");
 
     // Advance past the *original* deadline — the extend should have pushed
     // it out, so settling now must not be `late`.
-    clock.advance(TTL_MS + 1);
+    clock.advance(TTL_MS / 2 + 1);
     let receipt = ledger
         .settle(&scope.tenant_id, &id, 50)
         .expect("settle before the extended deadline");
@@ -238,6 +241,74 @@ fn extend_rejects_non_positive_ttl() {
     let id = ledger.reserve(&scope, Price::Known(50)).expect("reserve");
     assert!(matches!(
         ledger.extend(&scope.tenant_id, &id, 0),
+        Err(BudgetError::InvalidTtl { .. })
+    ));
+}
+
+/// B-5: `extend` on an already-lapsed reservation is rejected even though
+/// its DB `status` is still `active` (lazily not yet swept to `expired`) —
+/// extending it would resurrect a reservation other code may already be
+/// treating as freed.
+#[test]
+fn extend_rejects_a_reservation_whose_ttl_already_lapsed() {
+    let path = temp_db_path("b5-extend-lapsed");
+    let clock = FakeClock::new(0);
+    let ledger = BudgetLedger::open_with(&path, clock.clone(), TTL_MS).expect("open");
+    let scope = BudgetScope::new("acme-co", "key-1", "openai", "gpt-5");
+    ledger.configure(&scope, 100, "UTC").expect("configure");
+
+    let id = ledger.reserve(&scope, Price::Known(50)).expect("reserve");
+    clock.advance(TTL_MS + 1);
+    assert!(matches!(
+        ledger.extend(&scope.tenant_id, &id, TTL_MS),
+        Err(BudgetError::ReservationNotActive { .. })
+    ));
+}
+
+/// B-5: a single `extend` call cannot grant more than `ttl_ms` — the same
+/// amount a fresh `reserve` would have gotten.
+#[test]
+fn extend_rejects_more_than_ttl_ms_in_a_single_call() {
+    let path = temp_db_path("b5-extend-single-call-cap");
+    let clock = FakeClock::new(0);
+    let ledger = BudgetLedger::open_with(&path, clock.clone(), TTL_MS).expect("open");
+    let scope = BudgetScope::new("acme-co", "key-1", "openai", "gpt-5");
+    ledger.configure(&scope, 100, "UTC").expect("configure");
+
+    let id = ledger.reserve(&scope, Price::Known(50)).expect("reserve");
+    assert!(matches!(
+        ledger.extend(&scope.tenant_id, &id, TTL_MS + 1),
+        Err(BudgetError::InvalidTtl { .. })
+    ));
+    // The maximum allowed (exactly `ttl_ms`) still succeeds.
+    assert!(ledger.extend(&scope.tenant_id, &id, TTL_MS).is_ok());
+}
+
+/// B-5: a reservation's total lifetime (from `created_at_ms` to the *new*
+/// `expires_at_ms`) cannot exceed 4x `ttl_ms`, even across several
+/// individually-valid `extend` calls.
+#[test]
+fn extend_rejects_pushing_total_lifetime_past_four_times_ttl() {
+    let path = temp_db_path("b5-extend-total-lifetime-cap");
+    let clock = FakeClock::new(0);
+    let ledger = BudgetLedger::open_with(&path, clock.clone(), TTL_MS).expect("open");
+    let scope = BudgetScope::new("acme-co", "key-1", "openai", "gpt-5");
+    ledger.configure(&scope, 100, "UTC").expect("configure");
+
+    let id = ledger.reserve(&scope, Price::Known(50)).expect("reserve");
+    // created_at = 0, cap = 4 * TTL_MS = 4000. Four extends of TTL_MS each,
+    // advancing the clock by just under TTL_MS between them (staying active
+    // throughout), land at expires_at_ms = 3997 — under the cap, all four
+    // succeed.
+    for _ in 0..4 {
+        ledger
+            .extend(&scope.tenant_id, &id, TTL_MS)
+            .expect("extend within cap");
+        clock.advance(TTL_MS - 1);
+    }
+    // A fifth extend would push expires_at_ms to 4996, past the 4000 cap.
+    assert!(matches!(
+        ledger.extend(&scope.tenant_id, &id, TTL_MS),
         Err(BudgetError::InvalidTtl { .. })
     ));
 }
