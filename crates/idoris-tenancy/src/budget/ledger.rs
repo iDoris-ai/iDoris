@@ -63,6 +63,7 @@ impl ReservationStatus {
 const SCHEMA_MIGRATIONS: &[&str] = &[
     include_str!("migrations/0001_init.sql"),
     include_str!("migrations/0002_overage_events.sql"),
+    include_str!("migrations/0003_tenant_scope.sql"),
 ];
 
 /// Default reservation TTL: long enough to cover a slow upstream call,
@@ -116,6 +117,34 @@ pub struct SettleReceipt {
     pub overage_minor: i64,
 }
 
+/// Whether a tenant's check gates every candidate or only priced ones (H2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpendGate {
+    /// Default: a zero-cost candidate bypasses the tenant-level check.
+    PaidOnly,
+    /// Every candidate is checked, including zero-cost ones.
+    All,
+}
+
+impl SpendGate {
+    fn as_sql(self) -> &'static str {
+        match self {
+            Self::PaidOnly => "paid_only",
+            Self::All => "all",
+        }
+    }
+
+    fn parse(s: &str) -> Result<Self, BudgetError> {
+        match s {
+            "paid_only" => Ok(Self::PaidOnly),
+            "all" => Ok(Self::All),
+            other => Err(BudgetError::Storage(format!(
+                "unknown tenant_config.scope value {other:?}"
+            ))),
+        }
+    }
+}
+
 /// SQLite-backed budget ledger: atomic reserve/settle/release scoped to
 /// `(tenant, key, provider, model)`, bucketed per billing period.
 ///
@@ -136,6 +165,15 @@ pub struct BudgetLedger {
 struct ScopeConfig {
     limit_minor: i64,
     billing_timezone: String,
+}
+
+/// Per-tenant configuration (H2), independent of any sub-scope's config.
+struct TenantConfig {
+    limit_minor: i64,
+    billing_timezone: String,
+    // Consumed by `reserve`'s dual-dimension check, wired up in the next PR.
+    #[allow(dead_code)]
+    gate: SpendGate,
 }
 
 impl BudgetLedger {
@@ -187,6 +225,8 @@ impl BudgetLedger {
     /// Set (or update) the per-scope period limit and billing time zone.
     /// Takes effect for the *current* and future periods; already-settled
     /// spend in past periods is untouched.
+    /// L2: rejects a `billing_timezone` change while this scope has active
+    /// reservations — their `period` was fixed under the *old* zone.
     pub fn configure(
         &self,
         scope: &BudgetScope,
@@ -202,8 +242,17 @@ impl BudgetLedger {
                 billing_timezone: billing_timezone.to_string(),
             });
         }
-        let conn = self.lock();
-        conn.execute(
+        let now_ms = self.clock.now_ms();
+        let mut conn = self.lock();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(existing) = load_config(&tx, scope)?
+            && existing.billing_timezone != billing_timezone
+            && has_active_reservations_for_scope(&tx, scope, now_ms)?
+        {
+            tx.rollback().ok();
+            return Err(BudgetError::TimeZoneChangeWithActiveReservations);
+        }
+        tx.execute(
             "INSERT INTO budget_config \
                 (tenant_id, key_id, provider_id, model_id, limit_minor, billing_timezone) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
@@ -219,6 +268,50 @@ impl BudgetLedger {
                 billing_timezone,
             ],
         )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Tenant-level total and billing zone (H2), optional layer on top of
+    /// `configure`'s sub-scope limits. Same L2 timezone rule.
+    pub fn configure_tenant(
+        &self,
+        tenant_id: &str,
+        limit_minor: i64,
+        billing_timezone: &str,
+        gate: SpendGate,
+    ) -> Result<(), BudgetError> {
+        if tenant_id.trim().is_empty() {
+            return Err(BudgetError::InvalidScope { field: "tenant_id" });
+        }
+        if limit_minor < 0 {
+            return Err(BudgetError::InvalidLimit { limit_minor });
+        }
+        if !idoris_contracts::tenant::is_iana_time_zone(billing_timezone) {
+            return Err(BudgetError::InvalidTimeZone {
+                billing_timezone: billing_timezone.to_string(),
+            });
+        }
+        let now_ms = self.clock.now_ms();
+        let mut conn = self.lock();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(existing) = load_tenant_config(&tx, tenant_id)?
+            && existing.billing_timezone != billing_timezone
+            && has_active_reservations_for_tenant(&tx, tenant_id, now_ms)?
+        {
+            tx.rollback().ok();
+            return Err(BudgetError::TimeZoneChangeWithActiveReservations);
+        }
+        tx.execute(
+            "INSERT INTO tenant_config (tenant_id, limit_minor, billing_timezone, scope) \
+             VALUES (?1, ?2, ?3, ?4) \
+             ON CONFLICT (tenant_id) \
+             DO UPDATE SET limit_minor = excluded.limit_minor, \
+                           billing_timezone = excluded.billing_timezone, \
+                           scope = excluded.scope",
+            rusqlite::params![tenant_id, limit_minor, billing_timezone, gate.as_sql()],
+        )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -241,6 +334,23 @@ impl BudgetLedger {
         let spent = spent_for(&tx, scope, &period)?;
         let reserved = active_reserved_for(&tx, scope, &period, now_ms)?;
         // Pure read; roll back explicitly rather than relying on drop.
+        tx.rollback()?;
+        Ok(config.limit_minor - spent - reserved)
+    }
+
+    /// As `balance`, but for the tenant-level total (H2).
+    pub fn tenant_balance(&self, tenant_id: &str) -> Result<i64, BudgetError> {
+        let now_ms = self.clock.now_ms();
+        let mut conn = self.lock();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        let config = load_tenant_config(&tx, tenant_id)?.ok_or_else(|| {
+            BudgetError::TenantNotConfigured {
+                tenant_id: tenant_id.to_string(),
+            }
+        })?;
+        let period = billing_period_key(now_ms, &config.billing_timezone)?;
+        let spent = tenant_spent_for(&tx, tenant_id, &period)?;
+        let reserved = tenant_active_reserved_for(&tx, tenant_id, &period, now_ms)?;
         tx.rollback()?;
         Ok(config.limit_minor - spent - reserved)
     }
@@ -720,6 +830,96 @@ fn load_config(conn: &Connection, scope: &BudgetScope) -> Result<Option<ScopeCon
     .map_err(BudgetError::from)
 }
 
+fn has_active_reservations_for_scope(
+    conn: &Connection,
+    scope: &BudgetScope,
+    now_ms: i64,
+) -> Result<bool, BudgetError> {
+    let exists: i64 = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM reservations \
+         WHERE tenant_id=?1 AND key_id=?2 AND provider_id=?3 AND model_id=?4 \
+           AND status=?5 AND expires_at_ms > ?6)",
+        rusqlite::params![
+            scope.tenant_id,
+            scope.key_id,
+            scope.provider_id,
+            scope.model_id,
+            ReservationStatus::Active.as_sql(),
+            now_ms
+        ],
+        |row| row.get(0),
+    )?;
+    Ok(exists != 0)
+}
+
+fn load_tenant_config(
+    conn: &Connection,
+    tenant_id: &str,
+) -> Result<Option<TenantConfig>, BudgetError> {
+    let row: Option<(i64, String, String)> = conn
+        .query_row(
+            "SELECT limit_minor, billing_timezone, scope FROM tenant_config WHERE tenant_id = ?1",
+            [tenant_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    row.map(|(limit_minor, billing_timezone, gate_text)| {
+        Ok(TenantConfig {
+            limit_minor,
+            billing_timezone,
+            gate: SpendGate::parse(&gate_text)?,
+        })
+    })
+    .transpose()
+}
+
+fn tenant_spent_for(conn: &Connection, tenant_id: &str, period: &str) -> Result<i64, BudgetError> {
+    let spent: Option<i64> = conn
+        .query_row(
+            "SELECT spent_minor FROM tenant_periods WHERE tenant_id=?1 AND period=?2",
+            rusqlite::params![tenant_id, period],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(spent.unwrap_or(0))
+}
+
+/// Tenant-level active-reservation sum (H2): aggregates across every
+/// sub-scope for `tenant_id`, matched by `period`.
+fn tenant_active_reserved_for(
+    conn: &Connection,
+    tenant_id: &str,
+    period: &str,
+    now_ms: i64,
+) -> Result<i64, BudgetError> {
+    conn.query_row(
+        "SELECT COALESCE(SUM(reserved_minor), 0) FROM reservations \
+         WHERE tenant_id=?1 AND period=?2 AND status=?3 AND expires_at_ms > ?4",
+        rusqlite::params![
+            tenant_id,
+            period,
+            ReservationStatus::Active.as_sql(),
+            now_ms
+        ],
+        |row| row.get(0),
+    )
+    .map_err(BudgetError::from)
+}
+
+fn has_active_reservations_for_tenant(
+    conn: &Connection,
+    tenant_id: &str,
+    now_ms: i64,
+) -> Result<bool, BudgetError> {
+    let exists: i64 = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM reservations \
+         WHERE tenant_id=?1 AND status=?2 AND expires_at_ms > ?3)",
+        rusqlite::params![tenant_id, ReservationStatus::Active.as_sql(), now_ms],
+        |row| row.get(0),
+    )?;
+    Ok(exists != 0)
+}
+
 fn spent_for(conn: &Connection, scope: &BudgetScope, period: &str) -> Result<i64, BudgetError> {
     let spent: Option<i64> = conn
         .query_row(
@@ -878,6 +1078,82 @@ mod tests {
                 other => panic!("{expected}: expected InvalidScope, got {other:?}"),
             }
         }
+    }
+
+    /// H2: `configure_tenant`/`tenant_balance` exercised directly.
+    #[test]
+    fn configure_tenant_then_tenant_balance_reports_full_limit() {
+        let path = temp_db_path("h2-configure-tenant");
+        let ledger = BudgetLedger::open(&path).expect("open");
+        ledger
+            .configure_tenant("acme-co", 500, "UTC", SpendGate::PaidOnly)
+            .expect("configure_tenant");
+        assert_eq!(
+            ledger.tenant_balance("acme-co").expect("tenant_balance"),
+            500
+        );
+    }
+
+    /// Negative control: an unconfigured tenant errors, not a silent zero.
+    #[test]
+    fn tenant_balance_on_unconfigured_tenant_errors() {
+        let path = temp_db_path("h2-tenant-unconfigured");
+        let ledger = BudgetLedger::open(&path).expect("open");
+        assert!(matches!(
+            ledger.tenant_balance("acme-co"),
+            Err(BudgetError::TenantNotConfigured { .. })
+        ));
+    }
+
+    #[test]
+    fn configure_tenant_rejects_invalid_input() {
+        let path = temp_db_path("h2-tenant-invalid");
+        let ledger = BudgetLedger::open(&path).expect("open");
+        assert!(matches!(
+            ledger.configure_tenant("  ", 100, "UTC", SpendGate::PaidOnly),
+            Err(BudgetError::InvalidScope { field: "tenant_id" })
+        ));
+        assert!(matches!(
+            ledger.configure_tenant("acme-co", -1, "UTC", SpendGate::PaidOnly),
+            Err(BudgetError::InvalidLimit { .. })
+        ));
+        assert!(matches!(
+            ledger.configure_tenant("acme-co", 100, "Not/AZone", SpendGate::PaidOnly),
+            Err(BudgetError::InvalidTimeZone { .. })
+        ));
+    }
+
+    /// L2: changing `billing_timezone` while a reservation is still active
+    /// is rejected — the active reservation's period was already fixed
+    /// under the old zone.
+    #[test]
+    fn configure_rejects_timezone_change_with_active_reservations() {
+        let path = temp_db_path("l2-tz-change");
+        let ledger = BudgetLedger::open(&path).expect("open");
+        let scope = BudgetScope::new("acme-co", "key-1", "openai", "gpt-5");
+        ledger.configure(&scope, 1_000, "UTC").expect("configure");
+        ledger.reserve(&scope, Price::Known(100)).expect("reserve");
+        assert!(matches!(
+            ledger.configure(&scope, 1_000, "Asia/Bangkok"),
+            Err(BudgetError::TimeZoneChangeWithActiveReservations)
+        ));
+        assert!(ledger.configure(&scope, 2_000, "UTC").is_ok());
+    }
+
+    #[test]
+    fn configure_tenant_rejects_timezone_change_with_active_reservations() {
+        let path = temp_db_path("l2-tenant-tz-change");
+        let ledger = BudgetLedger::open(&path).expect("open");
+        let scope = BudgetScope::new("acme-co", "key-1", "openai", "gpt-5");
+        ledger.configure(&scope, 1_000, "UTC").expect("configure");
+        ledger
+            .configure_tenant("acme-co", 1_000, "UTC", SpendGate::PaidOnly)
+            .expect("configure_tenant");
+        ledger.reserve(&scope, Price::Known(100)).expect("reserve");
+        assert!(matches!(
+            ledger.configure_tenant("acme-co", 1_000, "Asia/Bangkok", SpendGate::PaidOnly),
+            Err(BudgetError::TimeZoneChangeWithActiveReservations)
+        ));
     }
 
     /// Negative control: a non-positive TTL would create reservations that
