@@ -6,6 +6,9 @@
 //! backend dispatch, or policy logic is ported here — see the root
 //! `README.md`.
 
+/// Control-plane header parsing (R2-D task 1); wired into a route in a follow-up PR.
+pub mod profile;
+
 use std::net::IpAddr;
 use std::sync::Arc;
 
