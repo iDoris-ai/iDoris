@@ -60,7 +60,10 @@ impl ReservationStatus {
     }
 }
 
-const SCHEMA_MIGRATIONS: &[&str] = &[include_str!("migrations/0001_init.sql")];
+const SCHEMA_MIGRATIONS: &[&str] = &[
+    include_str!("migrations/0001_init.sql"),
+    include_str!("migrations/0002_overage_events.sql"),
+];
 
 /// Default reservation TTL: long enough to cover a slow upstream call,
 /// short enough that an abandoned reservation (a caller that crashes before
@@ -105,6 +108,12 @@ pub struct SettleReceipt {
     /// may want to know a call ran unusually long, or that its TTL sizing
     /// needs revisiting.
     pub late: bool,
+    /// `actual_cost_minor - reserved_minor`, clamped to `>= 0` (Opus Tier-2
+    /// acceptance M1) — the mirror of `refunded_minor` for the overspend
+    /// case. A non-zero value here also writes a `budget_overage_events`
+    /// row (see `migrations/0002_overage_events.sql`) for independent
+    /// auditing.
+    pub overage_minor: i64,
 }
 
 /// SQLite-backed budget ledger: atomic reserve/settle/release scoped to
@@ -401,6 +410,14 @@ impl BudgetLedger {
             }
         };
 
+        // M1: track overage independently of the receipt returned below —
+        // `settle` can return `Err(OverageTooLarge)` further down, and the
+        // charge must still be recorded/auditable even on that path.
+        let overage_minor = (actual_cost_minor - row.reserved_minor).max(0);
+        // i128 to avoid the multiply overflowing i64 for a maliciously (or
+        // just very wrongly) large `actual_cost_minor`.
+        let too_large = (actual_cost_minor as i128) > (row.reserved_minor as i128) * 4;
+
         tx.execute(
             "INSERT INTO budget_periods (tenant_id, key_id, provider_id, model_id, period, spent_minor) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
@@ -423,7 +440,39 @@ impl BudgetLedger {
                 actual_cost_minor
             ],
         )?;
+
+        if overage_minor > 0 {
+            tx.execute(
+                "INSERT INTO budget_overage_events \
+                    (id, tenant_id, reservation_id, reserved_minor, actual_cost_minor, \
+                     overage_minor, created_at_ms) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                rusqlite::params![
+                    Uuid::new_v4().to_string(),
+                    tenant_id,
+                    reservation_id.0,
+                    row.reserved_minor,
+                    actual_cost_minor,
+                    overage_minor,
+                    now_ms,
+                ],
+            )?;
+        }
+
         tx.commit()?;
+
+        // M1: the charge above is already committed at this point — an
+        // extreme overage (>4x reserved) is a loud "something upstream is
+        // very wrong" signal, but the money owed is real and must not
+        // vanish just because this call returns `Err` instead of the
+        // receipt.
+        if too_large {
+            return Err(BudgetError::OverageTooLarge {
+                reservation_id: reservation_id.0.clone(),
+                reserved_minor: row.reserved_minor,
+                actual_cost_minor,
+            });
+        }
 
         let refunded_minor = (row.reserved_minor - actual_cost_minor).max(0);
         Ok(SettleReceipt {
@@ -431,6 +480,7 @@ impl BudgetLedger {
             actual_cost_minor,
             refunded_minor,
             late,
+            overage_minor,
         })
     }
 
@@ -955,7 +1005,31 @@ mod tests {
         let id = ledger.reserve(&scope, Price::Known(100)).expect("reserve");
         let receipt = ledger.settle(&scope.tenant_id, &id, 250).expect("settle");
         assert_eq!(receipt.refunded_minor, 0);
+        assert_eq!(receipt.overage_minor, 150);
         assert_eq!(ledger.balance(&scope).expect("balance"), 750);
+    }
+
+    /// M1 negative control: overage beyond 4x the reserved amount still
+    /// records the charge (balance reflects it) but reports
+    /// `OverageTooLarge` instead of a receipt.
+    #[test]
+    fn settle_more_than_four_times_reserved_records_charge_but_errors() {
+        let path = temp_db_path("settle-overage-too-large");
+        let ledger = BudgetLedger::open(&path).expect("open");
+        let scope = BudgetScope::new("acme-co", "key-1", "openai", "gpt-5");
+        ledger.configure(&scope, 10_000, "UTC").expect("configure");
+        let id = ledger.reserve(&scope, Price::Known(100)).expect("reserve");
+        let err = ledger
+            .settle(&scope.tenant_id, &id, 500)
+            .expect_err("4x+ overage must error");
+        assert!(matches!(err, BudgetError::OverageTooLarge { .. }));
+        // The charge was still recorded despite the Err.
+        assert_eq!(ledger.balance(&scope).expect("balance"), 9_500);
+        // And the reservation is finalized, not left dangling as `active`.
+        assert!(matches!(
+            ledger.settle(&scope.tenant_id, &id, 1),
+            Err(BudgetError::ReservationNotActive { .. })
+        ));
     }
 
     /// Negative control: settling the same reservation twice must fail, not
