@@ -8,11 +8,36 @@
 use idoris_contracts::common::{Capability, FallbackPolicy, PrivacyClass, Tier};
 use idoris_contracts::component_card::{Egress, Form};
 use idoris_contracts::provider::{Cost, Family, Locality, ProviderDescriptor};
+use idoris_contracts::tenant::BudgetScope;
 use idoris_contracts::{ComponentCard, TaskProfile};
 use idoris_policy::{
-    AdmissionStatus, Card, PolicyCtx, RequestProfile, Role, decide, effective_served_locality,
+    AdmissionStatus, BudgetSnapshot, BudgetView, Card, PolicyCtx, ReasonCode, Rejection,
+    RequestProfile, Role, decide, effective_privacy, effective_served_locality,
 };
 use proptest::prelude::*;
+
+struct FixedBudget(BudgetSnapshot);
+
+impl BudgetView for FixedBudget {
+    fn snapshot(&self, _tenant_id: &str) -> Option<BudgetSnapshot> {
+        Some(self.0)
+    }
+}
+
+fn budget_snapshot_strategy() -> impl Strategy<Value = BudgetSnapshot> {
+    (
+        // 跟 spent_minor 同一个量级，让 is_over() 大致五五开——避免全是超支，
+        // 这样"成功且真正走过预算路径"的分支才有机会被采样到。
+        0i64..=1000,
+        0i64..=1000,
+        prop_oneof![Just(BudgetScope::PaidOnly), Just(BudgetScope::All)],
+    )
+        .prop_map(|(limit_minor, spent_minor, scope)| BudgetSnapshot {
+            limit_minor,
+            spent_minor,
+            scope,
+        })
+}
 
 fn role_strategy() -> impl Strategy<Value = Role> {
     prop_oneof![
@@ -65,7 +90,13 @@ fn card_fields_strategy() -> impl Strategy<Value = CardFields> {
         form_strategy(),
         prop::collection::vec(role_strategy(), 0..3),
         admission_strategy(),
-        prop::option::of(0i64..=1000),
+        // 显式给 0（免费）一个不小的权重——连续区间 `1..=1000` 里精确采样到 0
+        // 的概率可以忽略不计，如果只用 `0..=1000` 均匀采样，"存在免费候选"
+        // 这个场景在性质测试里几乎不会被真正覆盖到。
+        prop::option::of(prop_oneof![
+            3 => Just(0i64),
+            7 => 1i64..=1000,
+        ]),
         any::<bool>(),
     )
 }
@@ -179,5 +210,117 @@ proptest! {
         let first = decide(&req, &cards, &ctx);
         let second = decide(&req, &cards, &ctx);
         prop_assert_eq!(first, second);
+    }
+
+    /// M4：打乱候选顺序（这里用反转——把所有两两相对顺序都倒过来，比单次
+    /// 交换更容易暴露"结果偷偷依赖了 `Vec` 迭代顺序"这类 bug）不改变结果：
+    /// `pick()` 的确定性 tie-break、`reason_codes` 的推导都不该看 `cards`
+    /// 数组本身的物理顺序。
+    #[test]
+    fn shuffling_card_order_does_not_change_the_decision(
+        cards in cards_strategy(),
+        req in request_strategy(false),
+    ) {
+        let mut reversed = cards.clone();
+        reversed.reverse();
+        let ctx = PolicyCtx::default();
+        prop_assert_eq!(decide(&req, &cards, &ctx), decide(&req, &reversed, &ctx));
+    }
+
+    /// M4：被选中的候选，价格一定是已知且非负的（不变式 #3）——`decide()`
+    /// 绝不会选出一个 `estimated_cost_minor` 是 `None` 或负数的候选。
+    #[test]
+    fn chosen_candidate_price_is_always_known_and_non_negative(
+        cards in cards_strategy(),
+        req in request_strategy(false),
+    ) {
+        let ctx = PolicyCtx::default();
+        if let Ok(decision) = decide(&req, &cards, &ctx) {
+            let chosen = cards.iter().find(|c| c.id() == decision.chosen_id);
+            prop_assert!(chosen.is_some());
+            if let Some(chosen) = chosen {
+                prop_assert!(chosen.estimated_cost_minor.is_some_and(|v| v >= 0));
+            }
+        }
+    }
+
+    /// M4：只要成功结果打上了"降级已发生"的原因码（角色降级或预算回落），
+    /// `degradations` 就必须非空——不能有名无实的降级标记，也不能有隐瞒的
+    /// 降级（三个变异防护测试已经在 pipeline::tests 里手工验证过这条不变式
+    /// 的具体场景，这里是跨随机输入的通用性质）。
+    #[test]
+    fn a_fallback_reason_code_always_comes_with_a_non_empty_degradations_list(
+        cards in cards_strategy(),
+        req in request_strategy(false),
+    ) {
+        let ctx = PolicyCtx::default();
+        if let Ok(decision) = decide(&req, &cards, &ctx) {
+            let claims_fallback = decision.reason_codes.iter().any(|r| {
+                matches!(
+                    r,
+                    ReasonCode::RoleFallbackCapabilityOnly | ReasonCode::BudgetFallbackToFreeCandidate
+                )
+            });
+            if claims_fallback {
+                prop_assert!(!decision.degradations.is_empty());
+            }
+        }
+    }
+
+    /// M4：内容检查的收紧结果只能让隐私更严格——`floor` 已经是 `LocalOnly`
+    /// 时，无论 `content_tightening` 传什么，`effective_privacy` 都不能变成
+    /// `Any`（对 `decide()` 用到的同一个公开函数做性质测试，而不仅是
+    /// `privacy` 模块内部的单元测试）。
+    #[test]
+    fn content_tightening_never_loosens_a_local_only_floor(
+        tightening in prop::option::of(prop_oneof![Just(PrivacyClass::Any), Just(PrivacyClass::LocalOnly)]),
+    ) {
+        prop_assert_eq!(
+            effective_privacy(PrivacyClass::LocalOnly, tightening),
+            PrivacyClass::LocalOnly
+        );
+    }
+
+    /// M4：`tenant_id` + `ctx.budget` 都给了的时候，预算阶段必须真正跑过——
+    /// 不能因为某处疏漏（比如忘了传 tenant_id）而悄悄跳过预算判断。成功结果
+    /// 一定带有预算相关的 reason_code（不会是"没有租户上下文"那个），
+    /// 402 本身也是预算路径生效的证据。
+    #[test]
+    fn tenant_and_budget_context_genuinely_enters_the_budget_stage(
+        cards in cards_strategy(),
+        role in prop::option::of(role_strategy()),
+        allow_fallback in any::<bool>(),
+        snapshot in budget_snapshot_strategy(),
+    ) {
+        let req = RequestProfile {
+            task: TaskProfile {
+                privacy: Some(PrivacyClass::Any),
+                intent: None,
+                complexity: None,
+                capabilities: Some(vec![Capability::Chat]),
+                fallback: if allow_fallback { Some(FallbackPolicy::NextInChain) } else { None },
+            },
+            role,
+            tenant_id: Some("tenant-1".to_string()),
+            content_tightening: None,
+        };
+        let budget = FixedBudget(snapshot);
+        let ctx = PolicyCtx { min_ram_gb: None, budget: Some(&budget) };
+        match decide(&req, &cards, &ctx) {
+            Ok(decision) => {
+                prop_assert!(!decision.reason_codes.contains(&ReasonCode::BudgetNoTenantContext));
+                let has_budget_reason = decision.reason_codes.iter().any(|r| {
+                    matches!(r, ReasonCode::BudgetWithinLimit | ReasonCode::BudgetFallbackToFreeCandidate)
+                });
+                prop_assert!(has_budget_reason);
+            }
+            Err(Rejection::BudgetExceeded { .. }) => {
+                // 402 本身就是预算路径真正生效（而不是被跳过）的证明。
+            }
+            Err(_) => {
+                // 更早的阶段（隐私/角色/价格/admission）就被拒绝了，还没轮到
+                // 预算——不是这条性质要断言的范围。
+            }
+        }
     }
 }

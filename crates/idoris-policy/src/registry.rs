@@ -100,11 +100,25 @@ fn is_test_only_mock_scheme(_scheme: &str) -> bool {
 /// http(s)，白名单之外的 scheme 必须显式拒绝，不能靠"反正我们只认识
 /// http(s)"这种默认放行的逻辑蒙混过去。
 fn assert_endpoint_locality_consistent(card: &Card) -> Result<(), RegistrationError> {
+    parse_loopback_endpoint_url(card).map(|_| ())
+}
+
+/// L1：注册校验和"执行层"（真正拿这张卡去发起连接的调用方）必须共用**同一个**
+/// 解析结果，不能各自 `Url::parse` 一遍——两处分别解析曾经在 H1 里就是隐患的
+/// 根源（手写解析和这里用的 WHATWG 解析器行为不一致）。这是唯一允许对
+/// `component.endpoint` 调用 `Url::parse` 的地方；执行层需要这张卡的
+/// endpoint URL 时应该调用这个函数复用校验阶段的解析/判定逻辑，而不是自己
+/// 再解析一次字符串。
+///
+/// 返回值：`Ok(None)` 表示这张卡不需要（也没有）做 loopback URL 校验（非网络
+/// 端点 form、非 loopback、或测试专用 `mock` scheme）；`Ok(Some(url))` 是校验
+/// 通过后解析出的 URL；`Err` 是注册校验失败。
+pub fn parse_loopback_endpoint_url(card: &Card) -> Result<Option<Url>, RegistrationError> {
     let component = &card.component;
     if !declares_network_endpoint(component.form)
         || component.provider.locality != Locality::Loopback
     {
-        return Ok(());
+        return Ok(None);
     }
     let unparseable = || RegistrationError::EndpointUnparseable {
         id: card.id().to_string(),
@@ -115,7 +129,7 @@ fn assert_endpoint_locality_consistent(card: &Card) -> Result<(), RegistrationEr
     };
     let scheme = parsed.scheme();
     if is_test_only_mock_scheme(scheme) {
-        return Ok(());
+        return Ok(None);
     }
     if !matches!(scheme, "http" | "https" | "ws" | "wss") {
         return Err(RegistrationError::UnsupportedScheme {
@@ -126,13 +140,13 @@ fn assert_endpoint_locality_consistent(card: &Card) -> Result<(), RegistrationEr
     let Some(host) = parsed.host_str() else {
         return Err(unparseable());
     };
-    if LOOPBACK_HOSTS.contains(&host) {
-        return Ok(());
+    if !LOOPBACK_HOSTS.contains(&host) {
+        return Err(RegistrationError::LoopbackHostMismatch {
+            id: card.id().to_string(),
+            host: host.to_string(),
+        });
     }
-    Err(RegistrationError::LoopbackHostMismatch {
-        id: card.id().to_string(),
-        host: host.to_string(),
-    })
+    Ok(Some(parsed))
 }
 
 /// H1：`spawn_cli`/订阅类 provider 声明 `local_only`/`tier: local` 会被
@@ -181,6 +195,25 @@ mod tests {
     fn accepts_a_well_formed_registry() {
         let cards = [sample_card("a", &[]), sample_card("b", &[])];
         assert_eq!(validate_registration(&cards), Ok(()));
+    }
+
+    /// L1：`parse_loopback_endpoint_url` 是唯一允许解析 `endpoint` 的地方，
+    /// "执行层"要复用这个解析结果，不能自己再 `Url::parse` 一遍——这里验证
+    /// 它确实把校验通过后的 `Url` 原样交还给调用方（host/scheme 都对得上）。
+    #[test]
+    fn parse_loopback_endpoint_url_returns_the_parsed_url_on_success() {
+        let card = sample_card("loopback-1", &[]);
+        match parse_loopback_endpoint_url(&card) {
+            Ok(Some(parsed)) => {
+                assert_eq!(parsed.scheme(), "http");
+                assert_eq!(parsed.host_str(), Some("127.0.0.1"));
+            }
+            other => panic!("expected Ok(Some(url)), got {other:?}"),
+        }
+
+        let mut lan = sample_card("lan-1", &[]);
+        lan.component.provider.locality = Locality::Lan;
+        assert_eq!(parse_loopback_endpoint_url(&lan), Ok(None));
     }
 
     #[test]
