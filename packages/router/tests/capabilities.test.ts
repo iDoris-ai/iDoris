@@ -22,10 +22,10 @@ const catalog = {
   version: 1,
   catalog: [
     {
-      id: "core-9b",
+      id: "daily-9b",
       params_total_b: 9,
       arch: { n_layers: 2, n_kv_heads: 2, head_dim: 8 },
-      roles: ["core"],
+      roles: ["daily"],
       capability: { reasoning: 0.9, coding: 0.8 },
       quant_options: [{ label: "q4", weights_gb: 5, quality: 0.98 }],
       min_ram_gb: 8,
@@ -34,7 +34,8 @@ const catalog = {
       id: "vl-3b",
       params_total_b: 3,
       arch: { n_layers: 2, n_kv_heads: 2, head_dim: 8 },
-      roles: ["temp"],
+      roles: [],
+      load_hint: "on_demand",
       capability: { vision: 0.9 },
       quant_options: [{ label: "q4", weights_gb: 2, quality: 0.98 }],
       min_ram_gb: 8,
@@ -99,7 +100,7 @@ describe("T2.2.1 /capabilities 条目", () => {
     for (const entry of entries) assertEntry(entry);
 
     const resident = entries.find((e) => e.resident === true);
-    expect(resident?.id).toBe("core-9b");
+    expect(resident?.id).toBe("daily-9b");
     expect(resident?.admission_status).toBe("ready");
 
     const vision = entries.find((e) => e.capability === "vision");
