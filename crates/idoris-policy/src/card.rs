@@ -6,8 +6,7 @@
 //!
 //! 本 crate 没有独立的 catalog/registry 类型（那些留在 `idoris-recommender`
 //! 或未来的注册表 crate），这里只取决策管道实际需要的字段，避免跨 crate 的
-//! 循环/多余依赖。目录角色相关字段（`roles`/`experiment`/`min_ram_gb`）由
-//! 后续 PR（`role` 模块）加入。
+//! 循环/多余依赖。
 //!
 //! **一个 `Card` = 一个可路由的服务实例**（provider + 它能服务的角色集合），
 //! 不是「一个具体模型」。同一个物理后端（例如一个 oMLX 进程）如果要以不同
@@ -27,6 +26,8 @@
 //! 不止是绕过注册校验这一条路。
 
 use idoris_contracts::ComponentCard;
+
+use crate::role::Role;
 
 /// 路由候选的准入状态。**这是决策层的动态状态**，和
 /// `component.load_policy.admission`（[`idoris_contracts::load_policy::Admission`]，
@@ -56,6 +57,19 @@ pub enum AdmissionStatus {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Card {
     pub component: ComponentCard,
+    /// 目录角色（不含 `Role::Auto`——不遵守这条约束由调用方负责：
+    /// [`crate::role::is_eligible_for_role`] 不会校验整个列表的内容/去重，
+    /// 只用 `.contains()` 判断成员；查询角色本身若是 `Auto` 则一律 fail-closed）。
+    pub roles: Vec<Role>,
+    /// catalog `status: experiment`（跨 harness 基准不迁移，不进自动候选）。
+    pub experiment: bool,
+    /// catalog 硬门槛（`docs/13-本地模型候选-硬件与场景匹配.md` §9.2；该文件
+    /// 已标记废弃、内容并入 `docs/iDoris-总体规划.md`，但章节编号本身仍是
+    /// `recommend.ts` 注释引用的原始出处）。调用方负责保证
+    /// 这是一个有限、非负的值——[`crate::role::is_eligible_for_role`] 会对
+    /// `NaN` 无条件 fail-closed（拒绝该候选），但不会替调用方把负数或 `±inf`
+    /// 这类同样不合理的值当场纠正成别的什么。
+    pub min_ram_gb: f64,
     /// 本次请求走这张卡的估算成本（最小货币单位，例如分）。
     ///
     /// `None` 表示价格未知——按不变式 #3（价格未知 ≠ 免费），预算阶段会
@@ -84,11 +98,13 @@ pub(crate) mod test_support {
     use idoris_contracts::provider::{Cost, Family, Locality, ProviderDescriptor};
 
     use super::{AdmissionStatus, Card};
+    use crate::role::Role;
 
-    /// 测试夹具：一张健康、本地、免费、`Ready` 的 `http_service` 卡——
-    /// `tier: local` 的卡按接口规范需要声明 `load_policy`，这里给一个常驻
-    /// + 可与其他候选共存（`coexist`）的最小合法配置。各测试按需覆盖单个字段。
-    pub(crate) fn sample_card(id: &str) -> Card {
+    /// 测试夹具：一张健康、本地、免费、`Ready` 的 `http_service` 卡，声明给定
+    /// 的目录角色——`tier: local` 的卡按接口规范需要声明 `load_policy`，这里
+    /// 给一个常驻 + 可与其他候选共存（`coexist`）的最小合法配置。各测试按需
+    /// 覆盖单个字段。
+    pub(crate) fn sample_card(id: &str, roles: &[Role]) -> Card {
         Card {
             component: ComponentCard {
                 provider: ProviderDescriptor {
@@ -118,6 +134,9 @@ pub(crate) mod test_support {
                 }),
                 extensions: None,
             },
+            roles: roles.to_vec(),
+            experiment: false,
+            min_ram_gb: 0.0,
             estimated_cost_minor: Some(0),
             admission_status: AdmissionStatus::Ready,
         }
@@ -125,7 +144,7 @@ pub(crate) mod test_support {
 
     #[test]
     fn sample_card_is_a_trusted_local_free_ready_candidate() {
-        let card = sample_card("probe");
+        let card = sample_card("probe", &[]);
         assert_eq!(card.id(), "probe");
         assert_eq!(card.estimated_cost_minor, Some(0));
         assert_eq!(card.admission_status, AdmissionStatus::Ready);
@@ -134,5 +153,6 @@ pub(crate) mod test_support {
         assert_eq!(card.component.allowed_egress, vec![Egress::Loopback]);
         assert!(card.component.fail_closed);
         assert!(card.component.load_policy.is_some());
+        assert!(!card.experiment);
     }
 }
