@@ -24,6 +24,10 @@ pub enum RegistrationError {
     EndpointUnparseable { id: String, endpoint: String },
     /// endpoint host 不在 loopback 白名单——会让 Served-Locality 谎报。
     LoopbackHostMismatch { id: String, host: String },
+    /// `locality: loopback` 的网络端点卡用了不在白名单里的 scheme——不能靠
+    /// "反正不是 http(s)" 就整体放行，那等于放行 `ftp://`/`file://` 之类
+    /// 可能真的指向外部的地址。
+    UnsupportedScheme { id: String, scheme: String },
     /// `spawn_cli`/订阅类 provider 却声明 `local_only`/`tier: local`：语义矛盾。
     ContradictoryRelayClaim { id: String },
 }
@@ -46,6 +50,12 @@ impl std::fmt::Display for RegistrationError {
                     "组件卡 \"{id}\" 声明 locality: loopback，但 endpoint host 是 \"{host}\"，不是 127.0.0.1/::1/localhost"
                 )
             }
+            RegistrationError::UnsupportedScheme { id, scheme } => {
+                write!(
+                    f,
+                    "组件卡 \"{id}\" 的 endpoint scheme \"{scheme}\" 不在白名单（http/https/ws/wss）"
+                )
+            }
             RegistrationError::ContradictoryRelayClaim { id } => {
                 write!(
                     f,
@@ -58,15 +68,62 @@ impl std::fmt::Display for RegistrationError {
 
 impl std::error::Error for RegistrationError {}
 
-/// M6：`locality: loopback` 的 `http_service` 卡，endpoint 必须指向允许的
-/// loopback host，否则拒绝注册。用真正的 WHATWG URL 解析器（不是手写
-/// `split(':')`，后者曾被 userinfo 绕过）。**顺序关键**：先看 scheme 再要求
-/// host——`mock:in-memory` 这种没有 host 的合法非 http(s) URL 必须先放行，
-/// 不能被误判成 `EndpointUnparseable`。
+/// 声明了真实网络端点的 form——`endpoint` 是一个网络地址，需要做 locality
+/// 一致性校验。`spawn_cli`/`bundled_binary`/`batch_job` 的 `endpoint` 是
+/// argv 模板/二进制路径/任务定义，不是网络地址，不在这个集合里。
+fn declares_network_endpoint(form: Form) -> bool {
+    matches!(form, Form::HttpService | Form::NostrNode | Form::MitmProxy)
+}
+
+/// "内存 mock 后端"scheme——纯进程内计算，`locality: loopback` 本身没有
+/// 说谎，允许跳过 host 校验。**A-1 更正**：`config/components/mock.yaml`
+/// 这份真实配置就是 `http_service + loopback + mock://in-memory`（R2-D 接线
+/// 会用到），不是"真实 yaml 永远不会出现 mock://"——之前那句注释是错的。
+/// 用 `cfg(test)` 放行会导致这份真实 yaml 在非测试构建里被 `UnsupportedScheme`
+/// 拒掉；改用显式的 `dev-mock` cargo feature（默认关闭）控制，本单测仍然
+/// 需要放行（`cfg(test)` 保留，方便本 crate 自身的注册校验测试），生产构建
+/// 必须两者都不开，才会一律按未知 scheme 拒绝。是否放行跟"是不是在跑测试"
+/// 无关，跟"有没有显式打开 mock 开关"有关。
+#[cfg(any(test, feature = "dev-mock"))]
+fn is_dev_mock_scheme_allowed(scheme: &str) -> bool {
+    scheme == "mock"
+}
+#[cfg(not(any(test, feature = "dev-mock")))]
+fn is_dev_mock_scheme_allowed(_scheme: &str) -> bool {
+    false
+}
+
+/// M6 + H1：`locality: loopback` 的网络端点卡（见 [`declares_network_endpoint`]），
+/// endpoint scheme 必须在白名单里（`http`/`https`/`ws`/`wss`），host 必须在
+/// [`LOOPBACK_HOSTS`] 里，否则拒绝注册（fail-closed）。用真正的 WHATWG URL
+/// 解析器（不是手写 `split(':')`，后者曾被 userinfo 绕过）。**顺序关键**：
+/// 先看 scheme 再要求 host——`mock:in-memory` 这种没有 host 的合法非
+/// http(s) URL 必须先放行，不能被误判成 `EndpointUnparseable`。
+///
+/// 之前的实现对"非 http(s) scheme"一律跳过校验，等价于放行任意
+/// `ws://evil.example`/`file://…`/`ftp://…` 的 loopback 声明——不能只挡
+/// http(s)，白名单之外的 scheme 必须显式拒绝，不能靠"反正我们只认识
+/// http(s)"这种默认放行的逻辑蒙混过去。
 fn assert_endpoint_locality_consistent(card: &Card) -> Result<(), RegistrationError> {
+    parse_loopback_endpoint_url(card).map(|_| ())
+}
+
+/// L1：注册校验和"执行层"（真正拿这张卡去发起连接的调用方）必须共用**同一个**
+/// 解析结果，不能各自 `Url::parse` 一遍——两处分别解析曾经在 H1 里就是隐患的
+/// 根源（手写解析和这里用的 WHATWG 解析器行为不一致）。这是唯一允许对
+/// `component.endpoint` 调用 `Url::parse` 的地方；执行层需要这张卡的
+/// endpoint URL 时应该调用这个函数复用校验阶段的解析/判定逻辑，而不是自己
+/// 再解析一次字符串。
+///
+/// 返回值：`Ok(None)` 表示这张卡不需要（也没有）做 loopback URL 校验（非网络
+/// 端点 form、非 loopback、或测试专用 `mock` scheme）；`Ok(Some(url))` 是校验
+/// 通过后解析出的 URL；`Err` 是注册校验失败。
+pub fn parse_loopback_endpoint_url(card: &Card) -> Result<Option<Url>, RegistrationError> {
     let component = &card.component;
-    if component.form != Form::HttpService || component.provider.locality != Locality::Loopback {
-        return Ok(());
+    if !declares_network_endpoint(component.form)
+        || component.provider.locality != Locality::Loopback
+    {
+        return Ok(None);
     }
     let unparseable = || RegistrationError::EndpointUnparseable {
         id: card.id().to_string(),
@@ -75,20 +132,26 @@ fn assert_endpoint_locality_consistent(card: &Card) -> Result<(), RegistrationEr
     let Ok(parsed) = Url::parse(&component.endpoint) else {
         return Err(unparseable());
     };
-    // 非 http(s) scheme（如 mock://）一律跳过——原样对齐 TS `registry.ts`。
-    if parsed.scheme() != "http" && parsed.scheme() != "https" {
-        return Ok(());
+    let scheme = parsed.scheme();
+    if is_dev_mock_scheme_allowed(scheme) {
+        return Ok(None);
+    }
+    if !matches!(scheme, "http" | "https" | "ws" | "wss") {
+        return Err(RegistrationError::UnsupportedScheme {
+            id: card.id().to_string(),
+            scheme: scheme.to_string(),
+        });
     }
     let Some(host) = parsed.host_str() else {
         return Err(unparseable());
     };
-    if LOOPBACK_HOSTS.contains(&host) {
-        return Ok(());
+    if !LOOPBACK_HOSTS.contains(&host) {
+        return Err(RegistrationError::LoopbackHostMismatch {
+            id: card.id().to_string(),
+            host: host.to_string(),
+        });
     }
-    Err(RegistrationError::LoopbackHostMismatch {
-        id: card.id().to_string(),
-        host: host.to_string(),
-    })
+    Ok(Some(parsed))
 }
 
 /// H1：`spawn_cli`/订阅类 provider 声明 `local_only`/`tier: local` 会被
@@ -137,6 +200,25 @@ mod tests {
     fn accepts_a_well_formed_registry() {
         let cards = [sample_card("a", &[]), sample_card("b", &[])];
         assert_eq!(validate_registration(&cards), Ok(()));
+    }
+
+    /// L1：`parse_loopback_endpoint_url` 是唯一允许解析 `endpoint` 的地方，
+    /// "执行层"要复用这个解析结果，不能自己再 `Url::parse` 一遍——这里验证
+    /// 它确实把校验通过后的 `Url` 原样交还给调用方（host/scheme 都对得上）。
+    #[test]
+    fn parse_loopback_endpoint_url_returns_the_parsed_url_on_success() {
+        let card = sample_card("loopback-1", &[]);
+        match parse_loopback_endpoint_url(&card) {
+            Ok(Some(parsed)) => {
+                assert_eq!(parsed.scheme(), "http");
+                assert_eq!(parsed.host_str(), Some("127.0.0.1"));
+            }
+            other => panic!("expected Ok(Some(url)), got {other:?}"),
+        }
+
+        let mut lan = sample_card("lan-1", &[]);
+        lan.component.provider.locality = Locality::Lan;
+        assert_eq!(parse_loopback_endpoint_url(&lan), Ok(None));
     }
 
     #[test]
@@ -227,6 +309,59 @@ mod tests {
                 })
             );
         }
+    }
+
+    /// H1 回归：非白名单 scheme（`ftp://`/`file://`）不能靠"反正不是
+    /// http(s)"整体跳过校验就放行——之前的实现会把这些都当成"跳过"。
+    #[test]
+    fn rejects_endpoints_with_schemes_outside_the_allowlist() {
+        for (id, endpoint) in [
+            ("ftp-evil", "ftp://evil.example/"),
+            ("file-evil", "file:///etc/passwd"),
+        ] {
+            let mut card = sample_card(id, &[]);
+            card.component.endpoint = endpoint.to_string();
+            let scheme = endpoint.split(':').next().unwrap_or_default().to_string();
+            assert_eq!(
+                validate_registration(&[card]),
+                Err(RegistrationError::UnsupportedScheme {
+                    id: id.to_string(),
+                    scheme,
+                })
+            );
+        }
+    }
+
+    /// H1 + M3：`ws`/`wss` 在白名单里，且 `NostrNode`/`MitmProxy` 这两个
+    /// "声明了真实网络端点"的 form 也要做 locality 校验，不能只校验
+    /// `HttpService`。
+    #[test]
+    fn ws_scheme_and_non_http_service_network_forms_are_validated() {
+        let mut ws_loopback = sample_card("ws-ok", &[]);
+        ws_loopback.component.endpoint = "ws://127.0.0.1:8740".to_string();
+        assert_eq!(validate_registration(&[ws_loopback]), Ok(()));
+
+        let mut nostr_evil = sample_card("nostr-evil", &[]);
+        nostr_evil.component.form = Form::NostrNode;
+        nostr_evil.component.endpoint = "wss://evil.example/relay".to_string();
+        assert_eq!(
+            validate_registration(&[nostr_evil]),
+            Err(RegistrationError::LoopbackHostMismatch {
+                id: "nostr-evil".to_string(),
+                host: "evil.example".to_string(),
+            })
+        );
+
+        let mut proxy_evil = sample_card("proxy-evil", &[]);
+        proxy_evil.component.form = Form::MitmProxy;
+        proxy_evil.component.endpoint = "ftp://evil.example/".to_string();
+        assert_eq!(
+            validate_registration(&[proxy_evil]),
+            Err(RegistrationError::UnsupportedScheme {
+                id: "proxy-evil".to_string(),
+                scheme: "ftp".to_string(),
+            })
+        );
     }
 
     #[test]
