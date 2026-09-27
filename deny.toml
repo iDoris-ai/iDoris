@@ -1,0 +1,28 @@
+# cargo-deny config — 与 Agent24（/Users/jason/Dev/auraai/Agent24/rust/deny.toml）
+# 保持一致的 license 白名单：不允许 GPL/AGPL 进依赖树。
+# CI 跑 `cargo deny check licenses bans`（见 .github/workflows/ci.yml 的 rust job）。
+
+[licenses]
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Zlib",
+  "Unicode-3.0",
+  # webpki-roots（Mozilla CA 数据，经 rustls/reqwest 传入）——宽松的数据许可证
+  "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.9
+
+[bans]
+multiple-versions = "warn"
+
+[advisories]
+yanked = "warn"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

@@ -1,0 +1,23 @@
+[package]
+name = "idoris-router"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Rust skeleton for the iDoris router: axum HTTP server, GET /health, IDORIS_PORT — 1:1 with packages/router's production-facing surface (T4.1/PR #46)."
+
+[lints]
+workspace = true
+
+[dependencies]
+idoris-contracts = { workspace = true }
+axum = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
