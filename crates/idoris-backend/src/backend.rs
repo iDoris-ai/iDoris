@@ -24,7 +24,7 @@ pub trait ModelBackend: Send + Sync {
     async fn status(&self) -> Result<BackendStatus, BackendError>;
 
     /// `cancel` fires when the caller wants to abort — the request has
-    /// already ended when this returns `Err(BackendError::Cancelled { .. })`.
+    /// already ended when this returns `Err(BackendError::Cancelled)`.
     /// A spawn-type backend implementation should additionally treat
     /// `cancel` firing as a signal to kill its whole process group, not just
     /// stop reading its output (mirrors the TS `signal` doc comment).

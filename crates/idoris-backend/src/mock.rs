@@ -41,9 +41,10 @@ impl MockBackend {
     }
 
     fn lock(&self) -> Result<std::sync::MutexGuard<'_, MockState>, BackendError> {
-        self.state.lock().map_err(|_| BackendError::Internal {
-            message: "MockBackend's internal lock was poisoned by a panicking test".to_string(),
-            reason_code: "internal_lock_poisoned".to_string(),
+        self.state.lock().map_err(|_| {
+            BackendError::lock_poisoned(
+                "MockBackend's internal lock was poisoned by a panicking test",
+            )
         })
     }
 
