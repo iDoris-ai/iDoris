@@ -332,6 +332,38 @@ mod tests {
         let body: serde_json::Value = serde_json::from_slice(&req.body).expect("body must be JSON");
         assert_eq!(body["model"], "test-model");
         assert_eq!(body["messages"][0]["content"], "hi");
+        // Every top-level body field must be an ordinary chat-completion
+        // request field — none of them a tenant/user identifier. Not an
+        // exact-field-count check: `genai` is free to add ordinary
+        // protocol fields (e.g. `stream`) as it evolves; what must never
+        // appear is anything identity-shaped.
+        const ALLOWED_BODY_FIELDS: &[&str] = &["model", "messages", "stream", "stream_options"];
+        for key in body.as_object().expect("body must be an object").keys() {
+            assert!(
+                ALLOWED_BODY_FIELDS.contains(&key.as_str()),
+                "unexpected request body field {key:?} — every field sent must be accounted for here"
+            );
+        }
+        // Every header name is a plain transport/protocol header — none of
+        // them encode a tenant/user identity (the de-association
+        // requirement: "出站请求不携带用户或租户标识").
+        const ALLOWED_HEADERS: &[&str] = &[
+            "authorization",
+            "content-type",
+            "content-length",
+            "host",
+            "accept",
+            "accept-encoding",
+            "user-agent",
+        ];
+        for name in req.headers.keys() {
+            let name = name.as_str().to_ascii_lowercase();
+            assert!(
+                ALLOWED_HEADERS.contains(&name.as_str()),
+                "unexpected outbound header {name:?} — every header sent must be accounted for here, \
+                 to catch a future change accidentally adding a tenant/user-identifying one"
+            );
+        }
     }
 
     #[tokio::test]
