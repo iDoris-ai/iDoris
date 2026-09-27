@@ -16,60 +16,51 @@ pub trait TokenEstimator: Send + Sync {
     fn estimate_tokens(&self, text: &str, model_family: &str) -> u64;
 }
 
-/// ASCII-vs-non-ASCII conservative estimator (Opus Tier-2 acceptance M3
-/// replaces the original CJK-Unicode-range approach):
+/// ASCII-vs-non-ASCII conservative estimator:
 /// - the ASCII portion is priced at `bytes / 3` rounded up (ASCII bytes ==
 ///   ASCII chars, so this is also `chars / 3`);
-/// - the non-ASCII portion is priced at `max(chars, ceil(bytes / 2))`, then
-///   multiplied by a 1.2 safety factor rounded up.
+/// - the non-ASCII portion is priced at 1 token per UTF-8 byte (Opus Tier-2
+///   re-review B-9 — see below for why this replaced the earlier
+///   `max(chars, ceil(bytes/2)) * 1.2` formula).
 ///
-/// The original implementation classified codepoints via an explicit list
-/// of CJK Unicode ranges. That list, however carefully extended, is
-/// necessarily incomplete: Thai, Devanagari, and other non-Latin scripts
-/// fell through to the ASCII-style `bytes/3` path even though they are not
-/// 1-byte-per-char in UTF-8, and a multi-codepoint emoji (e.g. a ZWJ family
-/// sequence) is several rarely-1-token codepoints that a range list has no
-/// principled way to price. Splitting on ASCII vs. not sidesteps the
-/// classification problem entirely: *anything* outside the ASCII range
-/// (which real tokenizers reliably spend >= 1 token per byte-heavy
-/// codepoint on) gets the conservative `max(chars, bytes/2)` treatment,
-/// with no per-script allowlist to keep up to date.
+/// The original implementation (before Opus Tier-2 acceptance M3) classified
+/// codepoints via an explicit list of CJK Unicode ranges — necessarily
+/// incomplete (Thai, Devanagari, multi-codepoint emoji all fell through it
+/// one way or another). M3 replaced that with the ASCII-vs-not split above,
+/// which sidesteps the classification problem: anything outside ASCII is
+/// non-ASCII, no per-script allowlist required. M3's non-ASCII formula was
+/// `max(chars, ceil(bytes/2)) * 1.2`, a coefficient combination chosen
+/// without a documented derivation. B-9 replaces it with the simplest
+/// possible conservative rule instead: 1 token per byte. A real tokenizer
+/// virtually never spends *more* than one token per raw UTF-8 byte (a BPE
+/// vocabulary's whole point is to spend *fewer* tokens than bytes on
+/// anything it has seen before), so this is generously conservative without
+/// needing a specific safety-factor coefficient to justify.
 ///
-/// This is a **conservative upper-bound heuristic**, not a claim that it
-/// never under-counts every possible input against every possible real
-/// tokenizer — no fixed formula can promise that against an unknown future
-/// vocabulary. Swap in a real tokenizer via [`TokenEstimator`] where that
-/// stronger guarantee actually matters.
+/// This is still a **heuristic**, not a guarantee that it never under-counts
+/// against every possible future tokenizer/vocabulary — swap in a real
+/// tokenizer via [`TokenEstimator`] where that stronger guarantee actually
+/// matters.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ConservativeTokenEstimator;
 
 impl TokenEstimator for ConservativeTokenEstimator {
     fn estimate_tokens(&self, text: &str, _model_family: &str) -> u64 {
         let mut ascii_bytes: u64 = 0;
-        let mut non_ascii_chars: u64 = 0;
         let mut non_ascii_bytes: u64 = 0;
         for c in text.chars() {
             if c.is_ascii() {
                 // An ASCII char is always exactly 1 byte.
                 ascii_bytes += 1;
             } else {
-                non_ascii_chars += 1;
                 non_ascii_bytes += c.len_utf8() as u64;
             }
         }
 
         let ascii_tokens = ascii_bytes.div_ceil(3);
+        // B-9: 1 token per non-ASCII byte, no further multiplier.
+        let non_ascii_tokens = non_ascii_bytes;
 
-        let non_ascii_raw = non_ascii_chars.max(non_ascii_bytes.div_ceil(2));
-        // `ceil(non_ascii_raw * 6 / 5)` computed as `raw + ceil(raw / 5)`
-        // instead of `(raw * 6).div_ceil(5)` — algebraically identical
-        // (6/5 = 1 + 1/5) but avoids the multiply-by-6 overflowing `u64` for
-        // `raw` values near `u64::MAX / 6`.
-        let non_ascii_tokens = non_ascii_raw + non_ascii_raw.div_ceil(5);
-
-        // Both terms are independently conservative; summing (rather than
-        // safety-factoring the combined total again) keeps the ASCII
-        // portion's contribution unchanged from a pure-ASCII input.
         ascii_tokens + non_ascii_tokens
     }
 }
@@ -99,11 +90,9 @@ mod tests {
         n_bytes.div_ceil(3)
     }
 
-    /// Exact value for the non-ASCII portion alone:
-    /// `ceil(max(chars, ceil(bytes/2)) * 6 / 5)`.
-    fn expected_non_ascii(chars: u64, bytes: u64) -> u64 {
-        let raw = chars.max(bytes.div_ceil(2));
-        raw + raw.div_ceil(5)
+    /// Exact value for the non-ASCII portion alone (B-9): 1 token per byte.
+    fn expected_non_ascii(bytes: u64) -> u64 {
+        bytes
     }
 
     /// Negative control establishing the baseline is actually flawed: for
@@ -155,7 +144,7 @@ mod tests {
         for n in [0u64, 1, 2, 4, 5, 6, 20, 39] {
             let text = "中".repeat(n as usize);
             // "中" is 3 UTF-8 bytes.
-            let expected = expected_non_ascii(n, n * 3);
+            let expected = expected_non_ascii(n * 3);
             assert_eq!(estimate_tokens(&text, "qwen"), expected, "n={n}");
         }
     }
@@ -173,7 +162,7 @@ mod tests {
     fn cjk_punctuation_only_text_matches_the_exact_formula() {
         let text = "，。！？"; // 4 fullwidth/CJK punctuation marks, 3 bytes each
         let n = text.chars().count() as u64;
-        assert_eq!(estimate_tokens(text, "qwen"), expected_non_ascii(n, n * 3));
+        assert_eq!(estimate_tokens(text, "qwen"), expected_non_ascii(n * 3));
     }
 
     #[test]
@@ -208,10 +197,7 @@ mod tests {
     #[test]
     fn long_cjk_text_matches_the_exact_formula() {
         let text = "中".repeat(500);
-        assert_eq!(
-            estimate_tokens(&text, "qwen"),
-            expected_non_ascii(500, 1500)
-        );
+        assert_eq!(estimate_tokens(&text, "qwen"), expected_non_ascii(1500));
     }
 
     #[test]
@@ -230,7 +216,7 @@ mod tests {
     #[test]
     fn mixed_ascii_and_non_ascii_text_matches_the_exact_formula() {
         let text = "hello 世界"; // 6 ASCII bytes ("hello "), 2 CJK chars/6 bytes
-        let expected = expected_ascii_only(6) + expected_non_ascii(2, 6);
+        let expected = expected_ascii_only(6) + expected_non_ascii(6);
         assert_eq!(estimate_tokens(text, "qwen"), expected);
     }
 
@@ -243,12 +229,8 @@ mod tests {
     #[test]
     fn thai_script_text_matches_the_non_ascii_formula() {
         let text = "สวัสดีครับ";
-        let chars = text.chars().count() as u64;
         let bytes = text.len() as u64;
-        assert_eq!(
-            estimate_tokens(text, "qwen"),
-            expected_non_ascii(chars, bytes)
-        );
+        assert_eq!(estimate_tokens(text, "qwen"), expected_non_ascii(bytes));
     }
 
     /// Devanagari script (Hindi): same argument as Thai above — 3 bytes/char
@@ -256,12 +238,8 @@ mod tests {
     #[test]
     fn devanagari_script_text_matches_the_non_ascii_formula() {
         let text = "नमस्ते";
-        let chars = text.chars().count() as u64;
         let bytes = text.len() as u64;
-        assert_eq!(
-            estimate_tokens(text, "qwen"),
-            expected_non_ascii(chars, bytes)
-        );
+        assert_eq!(estimate_tokens(text, "qwen"), expected_non_ascii(bytes));
     }
 
     /// CJK Extension B (supplementary plane, 4 bytes/char in UTF-8): the old
@@ -271,12 +249,8 @@ mod tests {
     #[test]
     fn cjk_extension_b_character_matches_the_non_ascii_formula() {
         let text = "\u{20000}"; // CJK Extension B, first codepoint
-        let chars = 1u64;
         let bytes = text.len() as u64; // 4 bytes
-        assert_eq!(
-            estimate_tokens(text, "qwen"),
-            expected_non_ascii(chars, bytes)
-        );
+        assert_eq!(estimate_tokens(text, "qwen"), expected_non_ascii(bytes));
     }
 
     /// A multi-codepoint emoji ZWJ sequence (family: man, woman, girl, boy)
@@ -288,11 +262,7 @@ mod tests {
     #[test]
     fn emoji_zwj_sequence_matches_the_non_ascii_formula() {
         let text = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}\u{200D}\u{1F466}";
-        let chars = text.chars().count() as u64; // 7 codepoints
-        let bytes = text.len() as u64;
-        assert_eq!(
-            estimate_tokens(text, "qwen"),
-            expected_non_ascii(chars, bytes)
-        );
+        let bytes = text.len() as u64; // 7 codepoints, several bytes each
+        assert_eq!(estimate_tokens(text, "qwen"), expected_non_ascii(bytes));
     }
 }
