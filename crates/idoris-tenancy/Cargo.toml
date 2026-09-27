@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-description = "Rust port of packages/tenancy (tenant scoping, budget, billing). R2-C is landing a SQLite-backed budget ledger (reserve/settle/release) across a stack of follow-up PRs on top of this one, which only wires up its dependencies; store/billing are still skeletons — see README.md."
+description = "Rust design for packages/tenancy (tenant scoping, budget, billing). R2-C implements a new SQLite-backed budget ledger (atomic reserve/settle/release), informed by but not a line-for-line port of packages/tenancy/src/budget.ts; store/billing are still skeletons — see README.md."
 
 [lints]
 workspace = true
