@@ -73,13 +73,9 @@ pub(super) async fn get_json(
     send_and_parse("GET", path, req, call_timeout).await
 }
 
-// `post_empty`/`put_json` (load/unload/pin) land in the follow-up PR that
-// actually calls them — keeping this PR to exactly what `list`/`status`
-// need avoids `cargo clippy -D warnings` failing on dead code in the
-// meantime. Each will need its own `tokio::time::timeout` wrap sized to
-// what it actually awaits (see `send_and_parse`'s doc comment on why that
-// must cover body reads, not just `send()`) — not a blind copy of either
-// existing shape here.
+// `post_empty`/`put_json` (load/unload/pin) land in a follow-up PR, each
+// with its own `tokio::time::timeout` sized to what it actually awaits
+// (see `send_and_parse`'s doc: must cover body reads, not just `send()`).
 
 fn check_status(
     method: &'static str,
