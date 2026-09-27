@@ -6,7 +6,9 @@
 //! SQLite-backed `BudgetLedger` itself in follow-up changes on top.
 
 mod clock;
+mod error;
 mod scope;
 
 pub use clock::{Clock, SystemClock};
+pub use error::{BUDGET_EXCEEDED_REASON_CODE, Budget402Body, BudgetError};
 pub use scope::BudgetScope;
