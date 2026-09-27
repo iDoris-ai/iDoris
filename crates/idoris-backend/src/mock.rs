@@ -32,11 +32,28 @@ pub enum LoadOutcome {
     Fail,
 }
 
+/// One scripted result for an `unload()` call, consumed the same way as
+/// [`LoadOutcome`] (in order, defaulting to `Ok` once the queue is empty).
+/// A separate type from `LoadOutcome` rather than reusing it: `unload` has
+/// no OOM-retry concept, so an `Oom` variant here would be meaningless and
+/// invite a caller to write a test that can't actually happen in practice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnloadOutcome {
+    Ok,
+    /// A generic, non-retryable failure — e.g. simulating the engine
+    /// itself erroring out while tearing a model down, which
+    /// `run_load_flow`'s eviction step must surface as
+    /// `BackendError::eviction_failed`, not silently swallow.
+    Fail,
+}
+
 #[derive(Default)]
 struct ModelScript {
     load_delay: Duration,
     load_outcomes: VecDeque<LoadOutcome>,
     unload_delay: Duration,
+    unload_outcomes: VecDeque<UnloadOutcome>,
+    chat_delay: Duration,
 }
 
 struct MockState {
@@ -120,6 +137,18 @@ impl MockAdapter {
     pub fn set_unload_delay(&self, id: &str, delay: Duration) {
         if let Ok(mut state) = self.state.lock() {
             Self::script_mut(&mut state, id).unload_delay = delay;
+        }
+    }
+
+    pub fn set_unload_script(&self, id: &str, outcomes: Vec<UnloadOutcome>) {
+        if let Ok(mut state) = self.state.lock() {
+            Self::script_mut(&mut state, id).unload_outcomes = outcomes.into();
+        }
+    }
+
+    pub fn set_chat_delay(&self, id: &str, delay: Duration) {
+        if let Ok(mut state) = self.state.lock() {
+            Self::script_mut(&mut state, id).chat_delay = delay;
         }
     }
 
@@ -218,17 +247,33 @@ impl RuntimeAdapter for MockAdapter {
     }
 
     async fn unload(&self, id: &str) -> Result<(), BackendError> {
-        let delay = {
+        let (delay, outcome) = {
             let mut state = self.lock()?;
             *state.unload_calls.entry(id.to_string()).or_insert(0) += 1;
             state.event_log.push(format!("unload:{id}:start"));
-            Self::script_mut(&mut state, id).unload_delay
+            let script = Self::script_mut(&mut state, id);
+            let delay = script.unload_delay;
+            let outcome = script
+                .unload_outcomes
+                .pop_front()
+                .unwrap_or(UnloadOutcome::Ok);
+            (delay, outcome)
         };
         if !delay.is_zero() {
             tokio::time::sleep(delay).await;
         }
 
         let mut state = self.lock()?;
+        if outcome == UnloadOutcome::Fail {
+            // A failed unload leaves the model as-loaded — a real engine
+            // that errors out mid-teardown hasn't necessarily actually
+            // freed it, so silently clearing `loaded`/`policies` here
+            // would make the Supervisor's ledger disagree with reality.
+            state.event_log.push(format!("unload:{id}:fail"));
+            return Err(BackendError::Upstream {
+                message: format!("mock adapter scripted failure unloading {id}"),
+            });
+        }
         state.loaded.retain(|loaded| loaded != id);
         state.policies.remove(id);
         state.event_log.push(format!("unload:{id}:end"));
@@ -275,8 +320,8 @@ impl RuntimeAdapter for MockAdapter {
         if cancel.is_cancelled() {
             return Err(BackendError::cancelled());
         }
-        {
-            let state = self.lock()?;
+        let delay = {
+            let mut state = self.lock()?;
             if !state.catalog.iter().any(|m| m.id == req.model) {
                 return Err(BackendError::model_not_found(&req.model));
             }
@@ -288,6 +333,10 @@ impl RuntimeAdapter for MockAdapter {
             if !state.loaded.iter().any(|loaded| loaded == &req.model) {
                 return Err(BackendError::model_unavailable(&req.model));
             }
+            Self::script_mut(&mut state, &req.model).chat_delay
+        };
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
         }
         let last_user_message = req
             .messages
