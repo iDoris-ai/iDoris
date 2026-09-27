@@ -6,6 +6,7 @@ members = [
     "crates/idoris-router",
     "crates/idoris-tenancy",
     "crates/idoris-recommender",
+    "crates/idoris-policy",
 ]
 
 [workspace.package]
