@@ -19,10 +19,15 @@ import { startRouter, type Router } from "../src/server.js";
 import type { Registered } from "../src/registry.js";
 
 const testsDir = dirname(fileURLToPath(import.meta.url));
-const helpers = join(testsDir, "helpers");
-const registerPath = join(helpers, "ts-register.mjs");
-const cliPath = join(testsDir, "..", "src", "cli.ts");
+// 子进程测试跑编译产物 dist/cli.js，不是 src/cli.ts + --experimental-transform-types：
+// 后者依赖的实验特性在 Node 22/24/26 上行为不一致（Node 26 直接 bad option 崩掉，
+// Node 22 加载时会打一行含 " at any time" 的 ExperimentalWarning，污染 stderr 断言）。
+// CI 的 `pnpm build` 已经在 `pnpm test` 之前跑过，dist/ 在测试时总是存在；本地手跑
+// 这个文件前也需要先 `pnpm --filter @idoris/router build`。
+const distCliPath = join(testsDir, "..", "dist", "cli.js");
 const goodFixtures = join(testsDir, "fixtures", "good");
+/** 双保险：子进程一律禁用 process warning，避免任何未来的警告污染 stderr 断言。 */
+const NO_WARNINGS_ENV = { NODE_NO_WARNINGS: "1" };
 
 /** FU-13：IDORIS_PORT 校验——非法值必须直接失败，绝不静默回落到默认端口。 */
 describe("parsePort", () => {
@@ -259,18 +264,24 @@ describe("serve()（进程内注入 deps）", () => {
 /** 真实子进程：验证 main() 的退出码与「不是裸 stack trace」这两件事，光测纯函数覆盖不到。 */
 describe("idoris-router serve（真实子进程）", () => {
   it("IDORIS_PORT=abc → 启动失败、退出码非 0、错误信息说人话", () => {
-    const res = spawnSync(process.execPath, ["--experimental-transform-types", "--import", registerPath, cliPath, "serve"], {
-      env: { ...process.env, IDORIS_PORT: "abc", IDORIS_COMPONENTS_DIR: goodFixtures },
+    const res = spawnSync(process.execPath, [distCliPath, "serve"], {
+      env: { ...process.env, ...NO_WARNINGS_ENV, IDORIS_PORT: "abc", IDORIS_COMPONENTS_DIR: goodFixtures },
       encoding: "utf8",
       timeout: 30_000,
     });
     expect(res.status).not.toBe(0);
     expect(res.stderr).toContain("IDORIS_PORT");
-    expect(res.stderr).not.toContain(" at "); // 不是甩给用户的裸 stack trace
+    // 不是甩给用户的裸 stack trace——真正的 V8 栈帧行长这样：`    at foo (file:1:2)`，
+    // 用 `/^\s+at /m` 而不是裸子串 " at "：后者会被"Transform Types ... at any time"
+    // 这类完全无关的提示句误伤（这条提示现在也不会再出现了，因为压根不用那个实验标志）。
+    expect(res.stderr).not.toMatch(/^\s+at /m);
+    const stderrLines = res.stderr.trim().split("\n");
+    expect(stderrLines.at(-1)).toMatch(/^\[idoris-router\] 启动失败：/);
   });
 
   it("负对照：不带 serve 子命令 → 打印用法、非 0 退出（不是默默什么都不做）", () => {
-    const res = spawnSync(process.execPath, ["--experimental-transform-types", "--import", registerPath, cliPath], {
+    const res = spawnSync(process.execPath, [distCliPath], {
+      env: { ...process.env, ...NO_WARNINGS_ENV },
       encoding: "utf8",
       timeout: 30_000,
     });
@@ -283,14 +294,16 @@ describe("idoris-router serve（真实子进程）", () => {
  * H1 回归：cli.ts 之前用 `import.meta.url === pathToFileURL(process.argv[1]).href`
  * 判断是否直接执行，经软链调用时两边路径不相等，`main()` 从不跑、进程静默退出码 0。
  * 现在 cli.ts 无条件执行，这里用真实软链复现原来会失效的场景，证明确实能起服务。
+ * 软链指向编译产物 dist/cli.js——跟真实 bin 用法（`node_modules/.bin/idoris-router`
+ * 本身就是指向 dist/cli.js 的软链）完全一致，也不需要任何实验性加载标志。
  */
 describe("cli.ts 经软链调用（H1 回归）", () => {
-  it("通过指向 cli.ts 的软链启动，也能真正监听并响应 /health", async () => {
+  it("通过指向 dist/cli.js 的软链启动，也能真正监听并响应 /health", async () => {
     const linkDir = mkdtempSync(join(tmpdir(), "idoris-cli-symlink-"));
-    const linkPath = join(linkDir, "idoris-router-via-symlink.ts");
-    symlinkSync(cliPath, linkPath);
-    const child = spawn(process.execPath, ["--experimental-transform-types", "--import", registerPath, linkPath, "serve"], {
-      env: { ...process.env, IDORIS_PORT: "18743", IDORIS_COMPONENTS_DIR: goodFixtures, IDORIS_ALLOW_MOCK: "1" },
+    const linkPath = join(linkDir, "idoris-router-via-symlink.js");
+    symlinkSync(distCliPath, linkPath);
+    const child = spawn(process.execPath, [linkPath, "serve"], {
+      env: { ...process.env, ...NO_WARNINGS_ENV, IDORIS_PORT: "18743", IDORIS_COMPONENTS_DIR: goodFixtures, IDORIS_ALLOW_MOCK: "1" },
     });
     let stdout = "";
     try {

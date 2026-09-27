@@ -73,6 +73,14 @@ describe("loadComponents：endpoint host 与 locality 一致性校验（M6）", 
     writeCard(dir, "mock.yaml", HTTP_CARD("mock", "mock://in-memory", "loopback"));
     expect(() => loadComponents(dir)).not.toThrow();
   });
+
+  it("负对照（后续复审补）：locality: loopback 但 endpoint 压根不是能解析的 URL → 拒绝注册，不是静默放行", () => {
+    // 之前这里 new URL() 抛错时被静默 return（当"跳过校验"），等于对一个连
+    // URL 都解析不出来的 endpoint 直接放行；现在必须 fail-closed 拒绝。
+    dir = mkdtempSync(join(tmpdir(), "idoris-registry-m6-"));
+    writeCard(dir, "unparseable.yaml", HTTP_CARD("mock", "not a valid url at all", "loopback"));
+    expect(() => loadComponents(dir)).toThrow(/不是一个能解析的 URL/);
+  });
 });
 
 /** L5：同一个 provider.id 出现两次 → 拒绝启动（谁生效是未定义行为，不如直接报错）。 */

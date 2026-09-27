@@ -42,8 +42,15 @@ function assertEndpointLocalityConsistent(card: ComponentCard, file: string): vo
   let parsed: URL;
   try {
     parsed = new URL(card.endpoint);
-  } catch {
-    return;
+  } catch (err) {
+    // 之前这里静默 return（当作"跳过校验"），等于对一个声明了 locality: loopback
+    // 却连 URL 都解析不出来的 endpoint 直接放行——既验证不了它是不是真的指向本机，
+    // 也不该假装它没问题。fail-closed：解析不出来就直接拒绝注册，报人话错误。
+    throw new Error(
+      `组件卡 "${card.provider.id}"（${file}）声明 provider.locality: loopback，` +
+        `但 endpoint "${card.endpoint}" 不是一个能解析的 URL（${err instanceof Error ? err.message : String(err)}）。` +
+        "无法确认它是否真的指向本机，按 fail-closed 拒绝注册——请把 endpoint 改成合法的 http(s) 地址。",
+    );
   }
   if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return;
   if (LOOPBACK_HOSTS.has(parsed.hostname)) return;
