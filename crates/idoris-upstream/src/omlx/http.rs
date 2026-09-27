@@ -5,11 +5,6 @@
 //! formatting the response body or the underlying `reqwest::Error`
 //! (mirroring `RuntimeAdapter::probe_ready`'s "apply your own timeout"
 //! doc, and H1/H2 from the TS reference: no payload in errors/logs).
-//!
-//! `#![allow(dead_code)]`: the `OmlxAdapter` struct that wires `get_json`
-//! into `list`/`status` lands in a follow-up PR; exercised directly by
-//! this module's own tests until then — remove once `mod.rs` calls it.
-#![allow(dead_code)]
 
 use std::time::Duration;
 
