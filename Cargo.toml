@@ -29,6 +29,64 @@ axum = "0.8"
 # encounters by hand. Disabling default features keeps the dependency (and
 # cargo-deny license/bans surface) much smaller.
 jsonschema = { version = "0.30", default-features = false }
+# `bundled` compiles SQLite from the vendored amalgamation (public-domain
+# source) instead of linking a system libsqlite3, so `idoris-tenancy`'s
+# budget ledger builds as part of a single self-contained binary — no
+# separate SQLite install/version to pin per platform (R2-C planned work).
+# Pinned to `0.40` (not `0.37`): `0.37.0` bundles SQLite 3.50.2, which is
+# older than the SQLite releases carrying fixes for CVE-2025-7709 and
+# CVE-2026-11822/11824; `0.40.2` (the latest release as of this writing)
+# bundles SQLite 3.53.2, which covers both. Because `bundled` vendors the
+# amalgamation, SQLite security fixes only arrive by bumping this crate
+# version and rebuilding — there is no OS-level patch path — so this pin
+# should be revisited whenever a new SQLite CVE lands, not just at
+# `cargo update` time.
+#
+# Known residual gap (accepted, not silently ignored, re-litigated in R2-C
+# code review round 3 — do not weaken this note without another round):
+# SQLite 3.53.2 has a since-fixed (3.53.3/3.53.4) issue where a crafted
+# hot-journal can make SQLite delete an **arbitrary file the process can
+# write**, not just corrupt this database — so the blast radius is whatever
+# the *running process's* file permissions allow, not limited to this one
+# SQLite file. No `libsqlite3-sys` release bundling >= 3.53.3 exists on
+# crates.io yet as of this writing, so there is no version bump available
+# that closes this today. Accepting this gap requires — and this repo does
+# not yet enforce — that the process's data directory (and any directory
+# its user/group can write to) excludes anything a hot-journal-delete
+# shouldn't be able to reach: not group- or world-writable, not a shared/
+# untrusted volume, ideally a dedicated service account distinct from
+# whatever owns the binary. That is a deployment/ops property, not
+# something this Cargo.toml can prove or guarantee by itself. Until it is
+# written down as an enforced deployment constraint, treat this as an open
+# risk, not a closed one. Also missing, and *not* the same gap as the one
+# above: an automated way to notice when `libsqlite3-sys` ships a release
+# bundling SQLite >= 3.53.3, so the bump above isn't left to someone
+# happening to re-read this comment. `cargo deny check advisories`/`sources`
+# would NOT catch this specific issue even if wired into CI — `advisories`
+# only flags crates with an existing RustSec entry (this SQLite issue predates
+# any RustSec advisory for it), and `sources` only checks dependency
+# provenance, not version freshness. What's actually missing is a dependency-
+# update watcher (Dependabot/Renovate, or a scheduled check against
+# libsqlite3-sys's release feed) — out of scope for this change (CI/tooling
+# edits are outside this PR's mandate) but should be picked up as explicit
+# follow-up work, not silently dropped, and not conflated with the
+# advisories/sources gates (which solve a different, narrower problem: known
+# advisories and source-registry policy, not "is a newer version out").
+# Track and bump `rusqlite`/`libsqlite3-sys` the moment a release bundling
+# SQLite >= 3.53.3 is available.
+rusqlite = { version = "0.40", default-features = false, features = ["bundled"] }
+# Billing-period boundaries need the tenant's explicit IANA time zone
+# (contract-tenancy §3/§6, `billing_timezone`); `chrono-tz` carries the real
+# IANA tzdata (public domain), which is what makes DST/offset math track
+# the TS reference implementation's `Intl.DateTimeFormat`-based rules
+# instead of a fixed UTC offset. Caveat: `chrono-tz`'s tzdata is baked in at
+# its own release (currently IANA 2025b) and only updates when this crate
+# is bumped — it is not a live/self-updating tzdb, so a rules change IANA
+# ships after that release won't be reflected until the next `chrono-tz`
+# bump. `idoris_contracts::tenant::is_iana_time_zone` is still the source of
+# truth for *which* zone names this crate accepts.
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+chrono-tz = "0.10"
 
 idoris-contracts = { path = "crates/idoris-contracts" }
 idoris-backend = { path = "crates/idoris-backend" }
