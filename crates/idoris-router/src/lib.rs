@@ -124,7 +124,10 @@ impl Default for AppState {
 pub fn build_app(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
-        .route("/v1/chat/completions", post(chat_completions))
+        .route(
+            "/v1/chat/completions",
+            post(chat_completions).fallback(not_implemented),
+        )
         .fallback(not_implemented)
         .with_state(Arc::new(state))
         .layer(middleware::from_fn(record_id_middleware))
@@ -455,5 +458,32 @@ mod tests {
                 .to_string()
         };
         assert_ne!(id_of(&first), id_of(&second));
+    }
+
+    /// Regression: axum's default behavior for a matched path with the
+    /// wrong method is a bare 405 with no body and no unified envelope —
+    /// that would violate "every response uses the §3.11 envelope"
+    /// (`build_app` wires `.fallback(not_implemented)` onto this specific
+    /// route to override that default, see below). Locking status *and*
+    /// envelope shape here catches a regression to axum's default if that
+    /// wiring is ever accidentally dropped.
+    #[tokio::test]
+    async fn wrong_method_on_chat_completions_still_uses_the_unified_envelope() {
+        let app = build_app(AppState::default());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/v1/chat/completions")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+        assert!(response.headers().contains_key(HEADER_RECORD_ID));
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["error"]["type"], "not_implemented");
     }
 }
