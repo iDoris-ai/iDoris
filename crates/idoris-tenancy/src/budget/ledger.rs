@@ -188,18 +188,33 @@ impl BudgetLedger {
     /// Full control for tests: inject a [`Clock`] (so TTL/billing-period-
     /// boundary tests don't need to sleep real wall-clock time) and a
     /// reservation TTL. `ttl_ms <= 0` is rejected: a reservation already
-    /// expired at creation would never count against the balance.
+    /// expired at creation would never count against the balance. Uses a 5s
+    /// `busy_timeout`; see
+    /// [`open_with_busy_timeout`](Self::open_with_busy_timeout) to override
+    /// that too (e.g. a short one in a busy-timeout test).
     pub fn open_with(
         path: impl AsRef<Path>,
         clock: Arc<dyn Clock>,
         ttl_ms: i64,
+    ) -> Result<Self, BudgetError> {
+        Self::open_with_busy_timeout(path, clock, ttl_ms, Duration::from_secs(5))
+    }
+
+    /// As [`open_with`](Self::open_with), with an explicit `busy_timeout`
+    /// (Opus Tier-2 acceptance L4's busy-timeout test needs this shorter
+    /// than the 5s default so it doesn't take 5 real seconds to run).
+    pub fn open_with_busy_timeout(
+        path: impl AsRef<Path>,
+        clock: Arc<dyn Clock>,
+        ttl_ms: i64,
+        busy_timeout: Duration,
     ) -> Result<Self, BudgetError> {
         if ttl_ms <= 0 {
             return Err(BudgetError::InvalidTtl { ttl_ms });
         }
         let mut conn = Connection::open(path.as_ref())?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
-        conn.busy_timeout(Duration::from_secs(5))?;
+        conn.busy_timeout(busy_timeout)?;
         run_migrations(&mut conn)?;
         Ok(Self {
             conn: Mutex::new(conn),

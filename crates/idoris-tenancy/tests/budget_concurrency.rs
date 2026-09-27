@@ -15,14 +15,31 @@
 //! reserve, **exactly 10** of the 16 concurrent attempts can ever succeed
 //! (10 * 100 = 1000, an 11th would need 1100) — always exactly 10/6, never
 //! just "some succeed, some don't".
+//!
+//! The multi-process variant needs the `budget_mp_worker` binary, which is
+//! gated behind the `test-bins` feature (Opus Tier-2 acceptance L6 — it has
+//! no reason to ship in a default build/publish of this crate). This makes
+//! it *opt-in at the Cargo-feature level*, not *skippable as a CI gate*: the
+//! `rust` job in `.github/workflows/ci.yml` always passes
+//! `--features idoris-tenancy/test-bins`, so it still runs on every push/PR
+//! (M4) — a contributor running plain `cargo test` locally without that flag
+//! just doesn't build the worker binary or this one test (running it
+//! without the feature fails at runtime with "No such file or directory"
+//! rather than being skipped at compile time, which is why the test itself
+//! — not just the `[[bin]]` target — must be `#[cfg]`-gated).
 
+#![cfg_attr(not(feature = "test-bins"), allow(dead_code, unused_imports))]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::path::Path;
-use std::process::{Command, Stdio};
 use std::sync::{Arc, Barrier};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+#[cfg(feature = "test-bins")]
+use std::process::{Command, Stdio};
+#[cfg(feature = "test-bins")]
+use std::time::Instant;
 
 use idoris_tenancy::budget::{BudgetError, BudgetLedger, BudgetScope, Price};
 
@@ -118,6 +135,7 @@ fn concurrent_reserve_never_overspends_single_process() {
     );
 }
 
+#[cfg(feature = "test-bins")]
 #[test]
 fn concurrent_reserve_never_overspends_multi_process() {
     let path = temp_db_path("processes");
@@ -219,5 +237,107 @@ fn concurrent_reserve_never_overspends_multi_process() {
     assert_eq!(
         rejected, EXPECTED_REJECTIONS,
         "expected exactly {EXPECTED_REJECTIONS} cross-process budget-exceeded rejections"
+    );
+}
+
+/// M4: concurrent `settle` and `release` racing on the *same* reservation id
+/// must never both succeed — SQLite's own locking (not an in-process mutex:
+/// two independently-opened ledgers race here) serializes the two
+/// transactions, and whichever runs second sees the reservation already
+/// finalized by the first and is rejected with `ReservationNotActive`.
+#[test]
+fn concurrent_settle_and_release_on_same_reservation_exactly_one_wins() {
+    let path = temp_db_path("settle-release-race");
+    let scope = BudgetScope::new("acme-co", "key-race", "openai", "gpt-5");
+    let id = {
+        let ledger = BudgetLedger::open(&path).expect("open");
+        ledger.configure(&scope, 1_000, "UTC").expect("configure");
+        ledger.reserve(&scope, Price::Known(100)).expect("reserve")
+    };
+
+    let barrier = Arc::new(Barrier::new(2));
+
+    let settle_handle = {
+        let path = path.0.clone();
+        let tenant_id = scope.tenant_id.clone();
+        let id = id.clone();
+        let barrier = Arc::clone(&barrier);
+        thread::spawn(move || {
+            let ledger = BudgetLedger::open(&path).expect("open in settle thread");
+            barrier.wait();
+            ledger.settle(&tenant_id, &id, 100)
+        })
+    };
+    let release_handle = {
+        let path = path.0.clone();
+        let tenant_id = scope.tenant_id.clone();
+        let id = id.clone();
+        let barrier = Arc::clone(&barrier);
+        thread::spawn(move || {
+            let ledger = BudgetLedger::open(&path).expect("open in release thread");
+            barrier.wait();
+            ledger.release(&tenant_id, &id)
+        })
+    };
+
+    let settle_result = settle_handle.join().expect("settle thread panicked");
+    let release_result = release_handle.join().expect("release thread panicked");
+
+    let settle_won = settle_result.is_ok();
+    let release_won = release_result.is_ok();
+    assert!(
+        settle_won ^ release_won,
+        "exactly one of settle/release must win: settle={settle_result:?}, release={release_result:?}"
+    );
+    if !settle_won {
+        assert!(matches!(
+            settle_result,
+            Err(BudgetError::ReservationNotActive { .. })
+        ));
+    }
+    if !release_won {
+        assert!(matches!(
+            release_result,
+            Err(BudgetError::ReservationNotActive { .. })
+        ));
+    }
+}
+
+/// L4: SQLite reporting `SQLITE_BUSY` even after the configured
+/// `busy_timeout` elapses must surface as `BudgetError::Busy`, not a generic
+/// `Storage` error, so a caller can tell "contended, maybe retry" apart from
+/// "something is actually broken". A raw connection holds an exclusive write
+/// transaction open for the whole test, so the ledger's own `BEGIN
+/// IMMEDIATE` inside `configure` is guaranteed to time out waiting for it —
+/// a short (50ms) `busy_timeout` keeps the test fast.
+#[test]
+fn busy_timeout_surfaces_as_busy_not_a_generic_storage_error() {
+    let path = temp_db_path("busy-timeout");
+    // Open (running migrations) *before* the blocker below takes its lock,
+    // so this doesn't also need to win a race against the blocker itself.
+    let ledger = BudgetLedger::open_with_busy_timeout(
+        &path,
+        Arc::new(idoris_tenancy::budget::SystemClock),
+        idoris_tenancy::budget::DEFAULT_RESERVATION_TTL_MS,
+        Duration::from_millis(50),
+    )
+    .expect("open with short busy_timeout");
+
+    let blocker = rusqlite::Connection::open(&path).expect("open raw blocker connection");
+    blocker
+        .execute_batch("BEGIN IMMEDIATE;")
+        .expect("hold a write transaction open");
+
+    let scope = BudgetScope::new("acme-co", "key-busy", "openai", "gpt-5");
+    let result = ledger.configure(&scope, 100, "UTC");
+
+    // Release the blocker regardless of the assertion outcome below, so a
+    // failing assertion doesn't leave a stray lock behind.
+    let _ = blocker.execute_batch("ROLLBACK;");
+    drop(blocker);
+
+    assert!(
+        matches!(result, Err(BudgetError::Busy)),
+        "expected Busy, got {result:?}"
     );
 }

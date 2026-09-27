@@ -10,6 +10,20 @@ description = "Rust design for packages/tenancy (tenant scoping, budget, billing
 [lints]
 workspace = true
 
+[features]
+# Opus Tier-2 acceptance L6: `budget_mp_worker` exists only to be spawned by
+# the multi-process concurrency test (`tests/budget_concurrency.rs`) — it
+# has no reason to be built as part of a normal `cargo build`/publish of
+# this crate. CI passes `--features idoris-tenancy/test-bins` explicitly
+# (see `.github/workflows/ci.yml`), so this is opt-in at the Cargo level,
+# not skippable as a CI gate (M4).
+test-bins = []
+
+[[bin]]
+name = "budget_mp_worker"
+path = "src/bin/budget_mp_worker.rs"
+required-features = ["test-bins"]
+
 [dependencies]
 idoris-contracts = { workspace = true }
 rusqlite = { workspace = true }
