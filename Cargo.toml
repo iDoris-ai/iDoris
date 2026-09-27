@@ -90,6 +90,7 @@ chrono-tz = "0.10"
 
 idoris-contracts = { path = "crates/idoris-contracts" }
 idoris-backend = { path = "crates/idoris-backend" }
+idoris-policy = { path = "crates/idoris-policy" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
