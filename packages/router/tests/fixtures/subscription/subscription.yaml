@@ -1,0 +1,20 @@
+provider:
+  id: subscription
+  family: other
+  tier: remote
+  capabilities: [chat, reasoning]
+  privacy_class: any
+  cost: { input_per_m: 0, output_per_m: 0 }
+  locality: loopback
+form: spawn_cli
+endpoint: "spawn://subscription"
+version_pin: "subscription-relay@0.1.0"
+privacy_class: any
+allowed_egress: [loopback]
+fallback_policy: next_in_chain
+fail_closed: false
+extensions:
+  _degradation: "test fixture; subscription relay degradation"
+  subscription:
+    sandbox_profile: "idoris-subscription-no-tools-readonly-v1"
+    default_cli: claude

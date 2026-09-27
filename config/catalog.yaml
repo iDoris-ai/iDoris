@@ -1,0 +1,263 @@
+# iDoris 模型目录 · v1（T2.1.2）
+#
+# 真源：
+#   - docs/13-本地模型候选-硬件与场景匹配.md 附录 A（2026-09-19 HF 字节数核验）
+#   - docs/07-模型量化内存评估与动态推荐.md §5.2（ornith-1.0-9b / agents-a1-35b 两条，验收基线）
+#
+# 体积口径：weights_gb = HF 实测文件字节数（十进制 GB）；只有 bpp 时按 docs/07 §2 表。
+# KV 不写死在目录里，由 arch 现算：
+#   kv_bytes = 2 * n_layers * n_kv_heads * head_dim * ctx * kv_bytes_per_element
+#   （docs/13 §10.1 修正：Ornith/Qwen3.5 9B 系 arch = 32 层 / 4 KV head / head_dim 256）
+# 与 docs/07 §5.2 的旧 arch（36/8/128）不同——用旧值会把 KV 高估 12.5%。
+#
+# 字段：
+#   roles: [fast|core|deep|temp]  仅 core 参与常驻自动推荐
+#   min_ram_gb: 硬门槛，ram_gb < min_ram_gb 一律 BLOCKED（docs/13 §9.2 ①）
+#   status: experiment 的条目不进自动推荐（docs/13 §1.4 Ornith 系警告）
+version: 1
+catalog:
+
+# ---------- Tier R · 常驻小脑（fast） ----------
+- id: minicpm5-2b
+  family: minicpm
+  params_total_b: 2.52
+  params_active_b: 2.52
+  arch: {n_layers: 42, n_kv_heads: 2, head_dim: 128}
+  context: 131072
+  roles: [fast]
+  scenarios: {s1: 0.9, s6: 1.0, s7: 0.9}
+  capability: {instruct: 0.87, agent: 0.67, reasoning: 0.71, longctx: 0.80, zh: 0.75, coding: 0.55}
+  quant_options: [{label: q4_k_m, weights_gb: 1.561, quality: 0.98},
+                  {label: q8_0, weights_gb: 2.680, quality: 0.998}]
+  license: Apache-2.0
+  min_ram_gb: 8
+  note: "小脑首选（厂商自报基准，待复现）"
+
+- id: minicpm5-1b
+  family: minicpm
+  params_total_b: 1.08
+  params_active_b: 1.08
+  arch: {n_layers: 24, n_kv_heads: 2, head_dim: 128}
+  context: 131072
+  roles: [fast]
+  scenarios: {s6: 1.0, s7: 1.0}
+  capability: {instruct: 0.75, agent: 0.50, reasoning: 0.55, longctx: 0.75, zh: 0.65, coding: 0.35}
+  quant_options: [{label: q4_k_m, weights_gb: 0.75, quality: 0.97}]
+  license: Apache-2.0
+  min_ram_gb: 8
+  note: "8GB 档唯一现实解"
+
+- id: qwen3.5-2b
+  family: qwen
+  params_total_b: 2.0
+  params_active_b: 2.0
+  arch: {n_layers: 24, n_kv_heads: 2, head_dim: 256}
+  context: 262144
+  roles: [fast]
+  scenarios: {s1: 0.85, s5: 0.8, s7: 0.85}
+  capability: {instruct: 0.80, agent: 0.44, reasoning: 0.67, longctx: 0.85, zh: 0.85, coding: 0.40}
+  quant_options: [{label: q4_k_m, weights_gb: 1.30, quality: 0.98}]
+  license: Apache-2.0
+  min_ram_gb: 8
+  note: "生态最稳，卡自述有 thinking-loop 倾向"
+
+- id: nanbeige4.2-3b
+  family: nanbeige
+  params_total_b: 4.0
+  params_active_b: 3.0
+  arch: {n_layers: 22, n_kv_heads: 8, head_dim: 128}
+  context: 262144
+  roles: [fast, core]
+  scenarios: {s3: 0.95, s1: 0.8, s5: 0.75}
+  capability: {instruct: 0.80, agent: 0.75, reasoning: 0.70, longctx: 0.75, zh: 0.80, coding: 0.72}
+  quant_options: [{label: q4_k_m, weights_gb: 2.30, quality: 0.98}]
+  license: Apache-2.0
+  min_ram_gb: 8
+  note: "3B 级最强 agent；需 trust_remote_code"
+
+# ---------- Tier D · 日常主力（core） ----------
+- id: qwen3.5-9b
+  family: qwen
+  params_total_b: 9.0
+  params_active_b: 9.0
+  arch: {n_layers: 32, n_kv_heads: 4, head_dim: 256}
+  context: 262144
+  modality: [text, vision]
+  roles: [core]
+  scenarios: {s1: 0.9, s2: 0.95, s4: 0.8, s5: 0.85}
+  capability: {instruct: 0.92, agent: 0.66, reasoning: 0.83, longctx: 0.85, zh: 0.92, coding: 0.66}
+  quant_options: [{label: mlx_4bit, weights_gb: 5.95, quality: 0.98},
+                  {label: mlx_8bit, weights_gb: 10.43, quality: 0.998}]
+  license: Apache-2.0
+  min_ram_gb: 16
+  note: "全项 HF 核验通过；多模态+201 语言"
+
+- id: ornith-1.0-9b
+  family: ornith
+  params_total_b: 9.41
+  params_active_b: 9.41
+  arch: {n_layers: 32, n_kv_heads: 4, head_dim: 256}
+  context: 262144
+  roles: [core]
+  scenarios: {s1: 0.85, s3: 0.9}
+  capability: {instruct: 0.86, agent: 0.78, reasoning: 0.85, longctx: 0.82, zh: 0.75, coding: 0.88}
+  quant_options: [{label: q4_k_m, weights_gb: 5.63, quality: 0.98},
+                  {label: q6_k, weights_gb: 7.36, quality: 0.995},
+                  {label: q8_0, weights_gb: 9.53, quality: 0.998}]
+  license: MIT
+  min_ram_gb: 16
+  note: "仓库现选；24GB conservative 下 Q6_K 为最优（07 §4.1）。arch 已按 docs/13 §10.1 修正"
+
+- id: ornith-1.5-9b
+  family: ornith
+  params_total_b: 9.65
+  params_active_b: 9.65
+  arch: {n_layers: 32, n_kv_heads: 4, head_dim: 256}
+  context: 262144
+  roles: [core]
+  status: experiment
+  capability: {instruct: 0.88, agent: 0.82, reasoning: 0.86, longctx: 0.85, zh: 0.75, coding: 0.88}
+  quant_options: [{label: q4_k_m, weights_gb: 5.78, quality: 0.98},
+                  {label: q6_k, weights_gb: 7.56, quality: 0.995},
+                  {label: q8_0, weights_gb: 9.79, quality: 0.998}]
+  license: MIT
+  min_ram_gb: 16
+  note: "实验项：跨 harness 基准不迁移 + 12.6% think 链不终止（docs/13 §1.4）"
+
+- id: granite-4.2-3b
+  family: granite
+  params_total_b: 3.0
+  params_active_b: 3.0
+  arch: {n_layers: 40, n_kv_heads: 8, head_dim: 64}
+  context: 131072
+  roles: [core]
+  scenarios: {s5: 0.9, s1: 0.6}
+  capability: {instruct: 0.86, agent: 0.52, reasoning: 0.68, longctx: 0.70, zh: 0.55, coding: 0.45}
+  quant_options: [{label: q4_k_m, weights_gb: 2.24, quality: 0.98},
+                  {label: q8_0, weights_gb: 3.89, quality: 0.998}]
+  license: Apache-2.0
+  min_ram_gb: 8
+  note: "结构化输出/流程稳；SWE-bench = NA，不作 coding agent"
+
+- id: gemma-4-12b-it
+  family: gemma
+  params_total_b: 11.95
+  params_active_b: 11.95
+  arch: {n_layers: 48, n_kv_heads: 8, head_dim: 256}
+  context: 262144
+  roles: [core]
+  scenarios: {s1: 0.8, s3: 0.8}
+  capability: {instruct: 0.88, agent: 0.69, reasoning: 0.79, longctx: 0.60, zh: 0.70, coding: 0.72}
+  quant_options: [{label: qat_q4_0, weights_gb: 6.98, quality: 0.98}]
+  license: Gemma-4
+  min_ram_gb: 16
+  note: "KV 是 9B 的 3 倍；仅在需要其多模态时选"
+
+- id: qwen3-8b
+  family: qwen
+  params_total_b: 8.19
+  params_active_b: 8.19
+  arch: {n_layers: 36, n_kv_heads: 8, head_dim: 128}
+  context: 32768
+  roles: [fast, core]
+  capability: {instruct: 0.82, agent: 0.60, reasoning: 0.75, longctx: 0.78, zh: 0.85, coding: 0.62}
+  quant_options: [{label: q4_k_m, bpp: 0.55, quality: 0.98},
+                  {label: q8_0, bpp: 1.0, quality: 0.998}]
+  license: Apache-2.0
+  min_ram_gb: 12
+  note: "U0 spike 基线（Ornith-9B 替身）：4bit ≈4.48GB、KV 9.00MiB/64token（36/8/128）"
+
+# ---------- Tier X · 本地深度（deep / 按需） ----------
+- id: agents-a1-35b
+  family: agents
+  params_total_b: 35
+  params_active_b: 3
+  arch: {n_layers: 40, n_kv_heads: 2, head_dim: 256}
+  context: 262144
+  roles: [deep]
+  scenarios: {s1: 0.85, s3: 0.9}
+  capability: {instruct: 0.85, agent: 0.82, reasoning: 0.86, longctx: 0.85, zh: 0.80, coding: 0.95}
+  quant_options: [{label: q4_k_m, weights_gb: 19.3, quality: 0.98},
+                  {label: q3_k, weights_gb: 15.0, quality: 0.95}]
+  license: MIT
+  min_ram_gb: 32
+  note: "docs/07 §4.2：24GB 不实用；32GB+ 且需驱逐常驻 + 短上下文"
+
+- id: qwen3.6-35b-a3b
+  family: qwen
+  params_total_b: 35
+  params_active_b: 3
+  arch: {n_layers: 40, n_kv_heads: 2, head_dim: 256}
+  context: 262144
+  roles: [deep]
+  scenarios: {s1: 0.9, s3: 0.9, s5: 0.9}
+  capability: {instruct: 0.85, agent: 0.80, reasoning: 0.86, longctx: 0.85, zh: 0.88, coding: 0.85}
+  quant_options: [{label: ud_q4_k_m, weights_gb: 22.13, quality: 0.98},
+                  {label: ud_q6_k, weights_gb: 29.31, quality: 0.995},
+                  {label: q8_0, weights_gb: 36.90, quality: 0.998}]
+  license: Apache-2.0
+  min_ram_gb: 48
+  note: "64GB 最佳 MoE；内存按 35B 算、速度按 3B 算"
+
+- id: qwen3.8-27b
+  family: qwen
+  params_total_b: 27
+  params_active_b: 27
+  arch: {n_layers: 64, n_kv_heads: 4, head_dim: 256}
+  context: 262144
+  roles: [deep]
+  scenarios: {s2: 0.95, s4: 0.9, s1: 0.85}
+  capability: {instruct: 0.90, agent: 0.78, reasoning: 0.89, longctx: 0.90, zh: 0.90, coding: 0.83}
+  quant_options: [{label: ud_iq4_xs, weights_gb: 14.25, quality: 0.97},
+                  {label: ud_q4_k_m, weights_gb: 16.46, quality: 0.98},
+                  {label: ud_q6_k, weights_gb: 21.98, quality: 0.995}]
+  license: Apache-2.0
+  min_ram_gb: 32
+  note: "深度推理最强；KV 重，32K 上限；32GB 上需降到 UD-IQ4_XS"
+
+# ---------- 专用能力（临时槽） ----------
+- id: qwen2.5-vl-7b
+  family: qwen
+  params_total_b: 8.29
+  params_active_b: 8.29
+  arch: {n_layers: 28, n_kv_heads: 4, head_dim: 128}
+  context: 32768
+  modality: [text, vision]
+  roles: [temp]
+  capability: {instruct: 0.78, reasoning: 0.65, longctx: 0.70, zh: 0.82, vision: 0.88}
+  quant_options: [{label: q8_0, weights_gb: 8.29, quality: 0.998}]
+  license: Apache-2.0
+  min_ram_gb: 16
+  note: "U0 实测 8.50GB（8bit）；视觉临时槽"
+
+- id: qwen2.5-coder-14b
+  family: qwen
+  params_total_b: 14.7
+  params_active_b: 14.7
+  arch: {n_layers: 48, n_kv_heads: 8, head_dim: 128}
+  context: 32768
+  roles: [temp]
+  capability: {instruct: 0.80, reasoning: 0.72, coding: 0.82}
+  quant_options: [{label: q4_k_m, weights_gb: 8.0, quality: 0.98}]
+  license: Apache-2.0
+  min_ram_gb: 24
+  note: "重 coding 临时槽；docs/07 §4.3 称可与 9B 共存（临界）"
+
+# ---------- 排除项（许可红线 / arch 未核验） ----------
+excluded:
+- id: lfm2.5-2.6b
+  reason: "license lfm1.0 — 年营收超 $10M 不得商用；组织托管场景排除"
+- id: nvidia-nemotron-nano-9b-v2
+  reason: "NVIDIA Open Model License 可撤销（revocable）"
+- id: gemma-3-*
+  reason: "Gemma ToU 条件式再分发；改用 Apache-2.0 的 gemma-4 系"
+- id: glm-4-9b-chat
+  reason: "自定义可撤销许可；同族 GLM-4.7 为 MIT"
+- id: muse-glimmer-30b
+  reason: "docs/13 §5.3 未给出 config.json arch，KV 无法现算；补齐后再入目录"
+- id: glm-4.7-flash
+  reason: "docs/13 §5.3 未给出 config.json arch"
+- id: nemotron-3.5-lightning-30b-a3b
+  reason: "docs/13 §5.3 未给出 config.json arch"
+- id: ling-3.0-tiny
+  reason: "基准未核验（scenarios 为空），暂不自动推荐"

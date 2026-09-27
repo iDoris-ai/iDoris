@@ -1,0 +1,30 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "outDir": "dist",
+    "types": [
+      "node"
+    ],
+    "tsBuildInfoFile": "dist/.tsbuildinfo",
+    "baseUrl": ".",
+    "paths": {
+      "@idoris/contracts": [
+        "../contracts/src/index.ts"
+      ],
+      "@idoris/adapters": [
+        "../adapters/src/index.ts"
+      ],
+      "@idoris/recommender": [
+        "../recommender/src/index.ts"
+      ],
+      "@idoris/tenancy": [
+        "../tenancy/src/index.ts"
+      ]
+    }
+  },
+  "include": [
+    "src/**/*.ts",
+    "tests/**/*.ts",
+    "test/**/*.ts"
+  ]
+}

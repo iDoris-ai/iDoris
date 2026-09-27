@@ -1,0 +1,11 @@
+node_modules/
+dist/
+coverage/
+*.tsbuildinfo
+.DS_Store
+
+# tsc leftovers next to generated contract sources (drift gate compares .ts sources only)
+packages/contracts/src/generated/*.js
+packages/contracts/src/generated/*.js.map
+packages/contracts/src/generated/*.d.ts
+packages/contracts/src/generated/*.d.ts.map

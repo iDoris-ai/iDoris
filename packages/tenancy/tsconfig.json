@@ -1,0 +1,5 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": { "outDir": "dist", "types": ["node"], "baseUrl": ".", "paths": { "@idoris/contracts": ["../contracts/src/index.ts"] }, "tsBuildInfoFile": "dist/.tsbuildinfo" },
+  "include": ["src/**/*.ts", "tests/**/*.ts"]
+}

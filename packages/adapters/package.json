@@ -1,0 +1,35 @@
+{
+  "name": "@idoris/adapters",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/src/index.js",
+  "types": "./dist/src/index.d.ts",
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "test:integration": "IDORIS_SUBSCRIPTION_INTEGRATION=1 vitest run tests/integration",
+    "test:golden": "vitest run tests/golden"
+  },
+  "dependencies": {
+    "@idoris/contracts": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/src/index.d.ts",
+      "import": "./dist/src/index.js"
+    },
+    "./mock": {
+      "types": "./dist/mock/index.d.ts",
+      "import": "./dist/mock/index.js"
+    },
+    "./subscription": {
+      "types": "./dist/subscription/index.d.ts",
+      "import": "./dist/subscription/index.js"
+    }
+  }
+}
