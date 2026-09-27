@@ -26,5 +26,10 @@ pub use privacy::{
     SUBSCRIPTION_PROVIDER_ID, effective_privacy, effective_served_locality,
     is_subscription_provider_id,
 };
-pub use registry::{RegistrationError, validate_registration};
-pub use role::{ROLES, Role, RoleParseError, is_eligible_for_role, parse_model_role};
+pub use registry::{RegistrationError, parse_loopback_endpoint_url, validate_registration};
+pub use role::{
+    ROLES, Role, RoleParseError, is_catalog_eligible, is_eligible_for_role, parse_model_role,
+};
+/// 重新导出，好让"执行层"调用 [`parse_loopback_endpoint_url`] 时不需要自己
+/// 再引入 `url` 依赖（也避免两边的 `url` 版本不一致导致类型对不上）。
+pub use url::Url;
