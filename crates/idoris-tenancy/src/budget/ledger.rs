@@ -22,6 +22,46 @@ use super::error::{BudgetError, checked_add_i64, checked_sub_i64};
 use super::period::billing_period_key;
 use super::scope::BudgetScope;
 
+/// Opus Tier-2 re-review B-8: a deterministic way to prove the concurrency
+/// tests in `tests/budget_concurrency.rs` would actually catch a "split the
+/// atomic check-and-deduct transaction" regression class — without hand-
+/// editing `reserve()` and adding a sleep to widen the race window (which
+/// only proves the bug is catchable *with help*, not that the test suite
+/// reliably catches an unmitigated real mutation). Gated behind the
+/// `mutation-test-hooks` feature, off by default: with the feature disabled
+/// this module doesn't exist and `reserve()`'s check is a no-op `cfg`
+/// branch that compiles away entirely, so there is no production cost or
+/// risk from this existing.
+#[cfg(feature = "mutation-test-hooks")]
+pub mod test_hooks {
+    use std::sync::{Barrier, OnceLock};
+
+    /// When armed (via [`arm`]), `reserve` commits its balance-check
+    /// transaction and rendezvous on this barrier before opening a *new*
+    /// transaction for the insert — reproducing the split-transaction bug
+    /// class on demand. Every participating thread blocks here until all of
+    /// them have arrived, i.e. until all of them have passed their own
+    /// balance check, which is what forces the over-spend deterministically
+    /// (no thread can "get lucky" and slip through before the others catch
+    /// up, and no thread can proceed to its insert before the others have
+    /// all committed their checks).
+    static BARRIER: OnceLock<Barrier> = OnceLock::new();
+
+    /// Arm the hook for `thread_count` participants. Call once before
+    /// spawning the threads that will call `reserve`; each of them must
+    /// actually call `reserve` exactly once for the barrier to release.
+    pub fn arm(thread_count: usize) {
+        BARRIER
+            .set(Barrier::new(thread_count))
+            .unwrap_or_else(|_| panic!("test_hooks::arm called more than once per process"));
+    }
+
+    /// `None` when not armed — `reserve` skips the hook entirely.
+    pub(super) fn barrier() -> Option<&'static Barrier> {
+        BARRIER.get()
+    }
+}
+
 /// Reservation lifecycle state. Opus Tier-2 acceptance L3: this used to be
 /// raw `&str`/`String` comparisons against the SQL `status` column's TEXT
 /// values scattered across `settle`/`release`, which is exactly the kind of
@@ -549,6 +589,22 @@ impl BudgetLedger {
                     estimated_cost_minor,
                 ));
             }
+        }
+
+        // B-8 mutation-testing hook (see `test_hooks` doc comment) — a
+        // no-op unless a test has explicitly armed it. When armed, this
+        // reproduces the split-transaction bug class on purpose: commit the
+        // check we just did, rendezvous with every other participating
+        // thread, then open a *new* transaction for the insert below —
+        // exactly the non-atomic check-then-deduct this crate exists to
+        // prevent.
+        #[cfg(feature = "mutation-test-hooks")]
+        let mut tx = tx;
+        #[cfg(feature = "mutation-test-hooks")]
+        if let Some(barrier) = test_hooks::barrier() {
+            tx.commit()?;
+            barrier.wait();
+            tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         }
 
         // Overflow would wrap to a past instant (release) and make the
