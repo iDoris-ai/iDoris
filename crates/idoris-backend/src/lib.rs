@@ -3,11 +3,14 @@
 //! owns lifecycle state across all models of that engine), per
 //! `docs/research/Rust基础选型-2026-09-27.md` §4.
 //!
-//! [`adapter`] ([`RuntimeAdapter`]), [`mock`] ([`MockAdapter`]), and
-//! [`eviction`]'s pure [`plan_eviction`] landed first; this PR adds the
-//! [`supervisor`] event loop's scaffolding plus its read-only/serving
-//! commands (`list`/`status`/`chat`). `load`/`unload`, singleflight, and
-//! the global load/evict mutex land in follow-up PRs.
+//! [`adapter`] ([`RuntimeAdapter`]) and [`mock`] ([`MockAdapter`]) define
+//! and exercise the engine-agnostic adapter contract; [`eviction`]'s pure
+//! [`plan_eviction`] decides what to evict with no IO of its own; the
+//! [`supervisor`] event loop is the single writer that ties them
+//! together — `list`/`status`/`chat`/`load`/`unload`, singleflight, the
+//! global load/evict mutex, real capacity checking, in-flight-aware
+//! eviction, and the actor's own fail-closed handling of a detected
+//! invariant violation are all in place.
 //!
 //! - [`error`] — [`BackendError`], with a stable `reason_code()`.
 //! - [`types`] — wire/value types mirroring `packages/adapters/src/backend.ts`,
