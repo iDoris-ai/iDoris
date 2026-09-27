@@ -397,10 +397,104 @@ mod tests {
         assert!(!msg.contains("test-key-should-never-leak"));
     }
 
-    // The remaining scenarios (external-pin detection, PUT+verify both
-    // confirming pinned, PUT 2xx but verify still unpinned, `unload`, and
-    // the id-encoding regression guard) land in the next PR on this
-    // stack — `load`/`unload`/`pin` themselves are `pub`/reachable from
-    // `load` (a `pub` method), so leaving them for now doesn't trip
-    // `dead_code`; splitting keeps this PR under the 300-line cap.
+    #[tokio::test]
+    async fn load_on_demand_fails_when_externally_pinned() {
+        let server = MockServer::start().await;
+        mount_all(
+            &server,
+            vec![
+                (LOAD_METHOD, LOAD_PATH, ResponseTemplate::new(200)),
+                ("GET", VERIFY_PATH, status_mock(true)),
+            ],
+        )
+        .await;
+        let adapter = adapter_for(&server).await;
+        let err = adapter
+            .load("qwen3-8b", None)
+            .await
+            .expect_err("must fail on undeclared external pin");
+        assert!(err.to_string().contains("unexpectedly pinned"));
+    }
+
+    #[tokio::test]
+    async fn load_resident_succeeds_when_put_and_verify_both_confirm_pinned() {
+        let server = MockServer::start().await;
+        mount_all(
+            &server,
+            vec![
+                (LOAD_METHOD, LOAD_PATH, ResponseTemplate::new(200)),
+                ("PUT", SETTINGS_PATH, ResponseTemplate::new(200)),
+                ("GET", VERIFY_PATH, status_mock(true)),
+            ],
+        )
+        .await;
+        let adapter = adapter_for(&server).await;
+        adapter
+            .load("qwen3-8b", Some(&resident_policy()))
+            .await
+            .expect("must succeed when PUT and verify agree it's pinned");
+    }
+
+    #[tokio::test]
+    async fn load_resident_fails_when_verify_still_reports_unpinned() {
+        let server = MockServer::start().await;
+        mount_all(
+            &server,
+            vec![
+                (LOAD_METHOD, LOAD_PATH, ResponseTemplate::new(200)),
+                ("PUT", SETTINGS_PATH, ResponseTemplate::new(200)),
+                ("GET", VERIFY_PATH, status_mock(false)),
+            ],
+        )
+        .await;
+        let adapter = adapter_for(&server).await;
+        let err = adapter
+            .load("qwen3-8b", Some(&resident_policy()))
+            .await
+            .expect_err("PUT 2xx must not be trusted without verification");
+        assert!(err.to_string().contains("still reports pinned=false"));
+    }
+
+    #[tokio::test]
+    async fn unload_calls_the_unload_endpoint() {
+        let server = MockServer::start().await;
+        mount_all(
+            &server,
+            vec![(
+                LOAD_METHOD,
+                "/v1/models/qwen3-8b/unload",
+                ResponseTemplate::new(200),
+            )],
+        )
+        .await;
+        let adapter = adapter_for(&server).await;
+        adapter
+            .unload("qwen3-8b")
+            .await
+            .expect("unload must succeed");
+    }
+
+    /// Regression guard: a hyphen (common in real model ids, e.g.
+    /// `qwen3-8b`) must NOT be escaped, but a character that would
+    /// actually break the path (`/`) still must be — caught by the
+    /// previous PR's own tests initially 404ing against a hyphenated id
+    /// before the `PATH_SEGMENT` fix (plain `NON_ALPHANUMERIC` over-escapes `-`).
+    #[tokio::test]
+    async fn model_id_encoding_leaves_hyphens_alone_but_escapes_slashes() {
+        let server = MockServer::start().await;
+        mount_all(
+            &server,
+            vec![(
+                LOAD_METHOD,
+                "/v1/models/weird%2Fid/unload",
+                ResponseTemplate::new(200),
+            )],
+        )
+        .await;
+        let adapter = adapter_for(&server).await;
+        adapter
+            .unload("weird/id")
+            .await
+            .expect("a '/' in the id must be percent-encoded, not split the path");
+    }
 }
