@@ -44,6 +44,11 @@ pub struct ModelEntry {
     /// eviction regardless of how stale its `last_used_seq` is.
     pub pinned: bool,
     pub last_used_seq: u64,
+    /// Number of `chat` calls currently dispatched to this model. Nonzero
+    /// means real, in-progress work would be aborted mid-flight — never a
+    /// candidate for eviction, same as `pinned`, regardless of how stale
+    /// `last_used_seq` is.
+    pub inflight: u32,
 }
 
 /// The ledger `plan_eviction` reasons over. `budget_gb` is the configured
@@ -69,7 +74,8 @@ pub enum EvictionPlan {
     /// Enough budget is free; load without evicting anything.
     NotNeeded,
     /// Evict exactly these ids, in this order (oldest-used first), then
-    /// load. Every id here is `Ready` and unpinned at snapshot time.
+    /// load. Every id here is `Ready` or `Error`, unpinned, and had no
+    /// in-flight `chat` calls at snapshot time.
     Evict(Vec<String>),
 }
 
@@ -217,7 +223,18 @@ pub fn plan_eviction(state: &Snapshot, need: ModelReq) -> Result<EvictionPlan, P
         // block reaching a candidate that actually matters. Excluding them
         // here, not just relying on them naturally sorting last, keeps the
         // loop below from ever choosing a no-op eviction.
-        .filter(|m| m.state == ModelState::Ready && !m.pinned && m.memory_gb > 0.0)
+        .filter(|m| {
+            // `Error` is included (Opus Tier-2 review, H1): a model stuck
+            // in `Error` is doing no useful work and, unlike `Ready`, was
+            // never a candidate before — meaning it could occupy budget
+            // forever with no automatic way to reclaim it, surfacing as a
+            // misleading `EvictionImpossible` for some unrelated future
+            // load instead of the real problem (a stuck, uncleaned entry).
+            (m.state == ModelState::Ready || m.state == ModelState::Error)
+                && !m.pinned
+                && m.memory_gb > 0.0
+                && m.inflight == 0
+        })
         .collect();
     // LRU: evict the least-recently-used first. `last_used_seq` is a
     // Supervisor-maintained monotonic counter, never wall-clock time (see
@@ -263,6 +280,7 @@ mod tests {
             state,
             pinned,
             last_used_seq: seq,
+            inflight: 0,
         }
     }
 
@@ -470,8 +488,14 @@ mod tests {
             budget_gb: 10.0,
             models: vec![entry("uncertain", 9.0, ModelState::Error, false, 1)],
         };
-        let err = plan_eviction(&snap, req("need", 5.0)).expect_err("must fail, not guess");
-        assert_eq!(err.reason_code(), "eviction_impossible");
+        // If `Error` didn't occupy budget, all 10 GiB would be free and
+        // this would need no eviction at all (`NotNeeded`). Because `Error`
+        // still counts (`occupies_budget`'s documented conservatism), only
+        // 1 GiB is free, forcing eviction — and per H1 (Opus Tier-2
+        // review), an `Error` entry is itself now a valid candidate rather
+        // than occupying budget forever with no way to reclaim it.
+        let plan = plan_eviction(&snap, req("need", 5.0)).expect("uncertain is now evictable");
+        assert_eq!(plan, EvictionPlan::Evict(vec!["uncertain".to_string()]));
     }
 
     #[test]
