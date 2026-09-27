@@ -697,4 +697,185 @@ mod tests {
         let path = temp_db_path("good-ttl");
         assert!(BudgetLedger::open_with(&path, Arc::new(SystemClock), 1).is_ok());
     }
+
+    #[test]
+    fn reserve_deducts_from_balance() {
+        let path = temp_db_path("reserve-deducts");
+        let ledger = BudgetLedger::open(&path).expect("open");
+        let scope = BudgetScope::new("acme-co", "key-1", "openai", "gpt-5");
+        ledger.configure(&scope, 1_000, "UTC").expect("configure");
+        ledger.reserve(&scope, Price::Known(400)).expect("reserve");
+        assert_eq!(ledger.balance(&scope).expect("balance"), 600);
+    }
+
+    #[test]
+    fn reserve_over_balance_is_rejected_with_structured_error() {
+        let path = temp_db_path("reserve-exceeded");
+        let ledger = BudgetLedger::open(&path).expect("open");
+        let scope = BudgetScope::new("acme-co", "key-1", "openai", "gpt-5");
+        ledger.configure(&scope, 100, "UTC").expect("configure");
+        let err = ledger
+            .reserve(&scope, Price::Known(150))
+            .expect_err("must reject over-balance reserve");
+        match err {
+            BudgetError::Exceeded {
+                balance_minor,
+                estimated_cost_minor,
+                ..
+            } => {
+                assert_eq!(balance_minor, 100);
+                assert_eq!(estimated_cost_minor, 150);
+            }
+            other => panic!("expected Exceeded, got {other:?}"),
+        }
+        // Negative control: the rejected reserve must not have touched the
+        // balance — a naive "deduct on error path" bug would leave it < 100.
+        assert_eq!(ledger.balance(&scope).expect("balance"), 100);
+    }
+
+    /// Negative control: `Price::Unknown` must never be treated as free —
+    /// checked before the scope even needs to be configured.
+    #[test]
+    fn reserve_rejects_unknown_price_even_when_unconfigured() {
+        let path = temp_db_path("reserve-price-unknown");
+        let ledger = BudgetLedger::open(&path).expect("open");
+        let scope = BudgetScope::new("acme-co", "key-1", "openai", "gpt-5");
+        assert!(matches!(
+            ledger.reserve(&scope, Price::Unknown),
+            Err(BudgetError::PriceUnknown)
+        ));
+    }
+
+    /// Negative control: a zero-cost candidate is *not* "unknown price" —
+    /// don't conflate free with unpriced.
+    #[test]
+    fn reserve_allows_zero_cost() {
+        let path = temp_db_path("reserve-zero-cost");
+        let ledger = BudgetLedger::open(&path).expect("open");
+        let scope = BudgetScope::new("acme-co", "key-1", "openai", "gpt-5");
+        ledger.configure(&scope, 100, "UTC").expect("configure");
+        assert!(ledger.reserve(&scope, Price::Known(0)).is_ok());
+        assert_eq!(ledger.balance(&scope).expect("balance"), 100);
+    }
+
+    #[test]
+    fn reserve_rejects_negative_estimate() {
+        let path = temp_db_path("reserve-negative");
+        let ledger = BudgetLedger::open(&path).expect("open");
+        let scope = BudgetScope::new("acme-co", "key-1", "openai", "gpt-5");
+        ledger.configure(&scope, 100, "UTC").expect("configure");
+        assert!(matches!(
+            ledger.reserve(&scope, Price::Known(-1)),
+            Err(BudgetError::InvalidEstimate { .. })
+        ));
+    }
+
+    #[test]
+    fn reserve_on_unconfigured_scope_errors() {
+        let path = temp_db_path("reserve-unconfigured");
+        let ledger = BudgetLedger::open(&path).expect("open");
+        let scope = BudgetScope::new("acme-co", "key-1", "openai", "gpt-5");
+        assert!(matches!(
+            ledger.reserve(&scope, Price::Known(1)),
+            Err(BudgetError::NotConfigured { .. })
+        ));
+    }
+
+    #[test]
+    fn settle_for_less_than_reserved_refunds_the_difference() {
+        let path = temp_db_path("settle-refund");
+        let ledger = BudgetLedger::open(&path).expect("open");
+        let scope = BudgetScope::new("acme-co", "key-1", "openai", "gpt-5");
+        ledger.configure(&scope, 1_000, "UTC").expect("configure");
+        let id = ledger.reserve(&scope, Price::Known(500)).expect("reserve");
+        let receipt = ledger.settle(&id, 300).expect("settle");
+        assert_eq!(receipt.reserved_minor, 500);
+        assert_eq!(receipt.actual_cost_minor, 300);
+        assert_eq!(receipt.refunded_minor, 200);
+        // 1000 limit - 300 settled spend - 0 active reservations left.
+        assert_eq!(ledger.balance(&scope).expect("balance"), 700);
+    }
+
+    /// Negative control: settling for *more* than was reserved still charges
+    /// the real amount — this is billing truth, not a cap — and refunds
+    /// nothing.
+    #[test]
+    fn settle_for_more_than_reserved_charges_the_real_amount() {
+        let path = temp_db_path("settle-overage");
+        let ledger = BudgetLedger::open(&path).expect("open");
+        let scope = BudgetScope::new("acme-co", "key-1", "openai", "gpt-5");
+        ledger.configure(&scope, 1_000, "UTC").expect("configure");
+        let id = ledger.reserve(&scope, Price::Known(100)).expect("reserve");
+        let receipt = ledger.settle(&id, 250).expect("settle");
+        assert_eq!(receipt.refunded_minor, 0);
+        assert_eq!(ledger.balance(&scope).expect("balance"), 750);
+    }
+
+    /// Negative control: settling the same reservation twice must fail, not
+    /// double-charge.
+    #[test]
+    fn settling_twice_is_rejected() {
+        let path = temp_db_path("settle-twice");
+        let ledger = BudgetLedger::open(&path).expect("open");
+        let scope = BudgetScope::new("acme-co", "key-1", "openai", "gpt-5");
+        ledger.configure(&scope, 1_000, "UTC").expect("configure");
+        let id = ledger.reserve(&scope, Price::Known(100)).expect("reserve");
+        ledger.settle(&id, 100).expect("first settle");
+        assert!(matches!(
+            ledger.settle(&id, 100),
+            Err(BudgetError::ReservationNotActive { .. })
+        ));
+    }
+
+    #[test]
+    fn settle_unknown_reservation_errors() {
+        let path = temp_db_path("settle-unknown");
+        let ledger = BudgetLedger::open(&path).expect("open");
+        assert!(matches!(
+            ledger.settle(&ReservationId("does-not-exist".to_string()), 1),
+            Err(BudgetError::ReservationNotFound { .. })
+        ));
+    }
+
+    #[test]
+    fn release_fully_frees_the_reservation() {
+        let path = temp_db_path("release-frees");
+        let ledger = BudgetLedger::open(&path).expect("open");
+        let scope = BudgetScope::new("acme-co", "key-1", "openai", "gpt-5");
+        ledger.configure(&scope, 100, "UTC").expect("configure");
+        let id = ledger.reserve(&scope, Price::Known(100)).expect("reserve");
+        // Negative control: while the reservation is active it really does
+        // hold the budget — a second reserve must fail.
+        assert!(ledger.reserve(&scope, Price::Known(1)).is_err());
+        ledger.release(&id).expect("release");
+        assert_eq!(ledger.balance(&scope).expect("balance"), 100);
+        assert!(ledger.reserve(&scope, Price::Known(100)).is_ok());
+    }
+
+    #[test]
+    fn releasing_twice_is_idempotent() {
+        let path = temp_db_path("release-twice");
+        let ledger = BudgetLedger::open(&path).expect("open");
+        let scope = BudgetScope::new("acme-co", "key-1", "openai", "gpt-5");
+        ledger.configure(&scope, 100, "UTC").expect("configure");
+        let id = ledger.reserve(&scope, Price::Known(50)).expect("reserve");
+        ledger.release(&id).expect("first release");
+        assert!(ledger.release(&id).is_ok());
+    }
+
+    /// Negative control: a settled reservation can't be released — that
+    /// would un-settle a completed charge.
+    #[test]
+    fn releasing_a_settled_reservation_errors() {
+        let path = temp_db_path("release-settled");
+        let ledger = BudgetLedger::open(&path).expect("open");
+        let scope = BudgetScope::new("acme-co", "key-1", "openai", "gpt-5");
+        ledger.configure(&scope, 100, "UTC").expect("configure");
+        let id = ledger.reserve(&scope, Price::Known(50)).expect("reserve");
+        ledger.settle(&id, 50).expect("settle");
+        assert!(matches!(
+            ledger.release(&id),
+            Err(BudgetError::ReservationNotActive { .. })
+        ));
+    }
 }
