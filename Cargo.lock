@@ -487,6 +487,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "idoris-policy"
+version = "0.1.0"
+dependencies = [
+ "idoris-contracts",
+]
+
+[[package]]
 name = "idoris-recommender"
 version = "0.1.0"
 dependencies = [
