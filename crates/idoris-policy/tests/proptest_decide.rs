@@ -11,8 +11,8 @@ use idoris_contracts::provider::{Cost, Family, Locality, ProviderDescriptor};
 use idoris_contracts::tenant::BudgetScope;
 use idoris_contracts::{ComponentCard, TaskProfile};
 use idoris_policy::{
-    AdmissionStatus, BudgetSnapshot, BudgetView, Card, PolicyCtx, ReasonCode, Rejection,
-    RequestProfile, Role, decide, effective_privacy, effective_served_locality,
+    AdmissionStatus, BudgetSnapshot, BudgetView, Card, Degradation, PolicyCtx, ReasonCode,
+    Rejection, RequestProfile, Role, decide, effective_privacy, effective_served_locality,
 };
 use proptest::prelude::*;
 
@@ -37,6 +37,31 @@ fn budget_snapshot_strategy() -> impl Strategy<Value = BudgetSnapshot> {
             spent_minor,
             scope,
         })
+}
+
+/// 镜像 `pipeline::mod.rs` 里私有的 `admission_rank`——只用来在测试里独立
+/// 判断"两张卡谁的 admission 排位更好"，不复用生产代码本身。
+fn admission_rank_for_test(status: AdmissionStatus) -> u8 {
+    match status {
+        AdmissionStatus::Ready => 0,
+        AdmissionStatus::RequiresEviction => 1,
+        AdmissionStatus::Blocked => 2,
+    }
+}
+
+/// A-2：`(付费候选的 admission, 免费候选的 admission)`——**提高**"免费候选
+/// admission 更差"（付费候选严格更好）这类组合的采样权重：这是"自然选中
+/// 的本应是付费候选，但预算超限时改选了免费候选"这个场景成立的必要条件，
+/// 均匀采样时这个组合很少见（大多数时候免费候选靠更低成本已经自然获胜，
+/// 不需要经过预算回落）。
+fn paid_wins_admission_pair_strategy() -> impl Strategy<Value = (AdmissionStatus, AdmissionStatus)>
+{
+    prop_oneof![
+        7 => Just((AdmissionStatus::Ready, AdmissionStatus::RequiresEviction)),
+        1 => Just((AdmissionStatus::Ready, AdmissionStatus::Ready)),
+        1 => Just((AdmissionStatus::RequiresEviction, AdmissionStatus::Ready)),
+        1 => Just((AdmissionStatus::RequiresEviction, AdmissionStatus::RequiresEviction)),
+    ]
 }
 
 fn role_strategy() -> impl Strategy<Value = Role> {
@@ -321,6 +346,91 @@ proptest! {
                 // 更早的阶段（隐私/角色/价格/admission）就被拒绝了，还没轮到
                 // 预算——不是这条性质要断言的范围。
             }
+        }
+    }
+
+    /// A-2 第一条：没有声明 `X-iDoris-Fallback` 时，成功结果绝不能带
+    /// `BudgetFallback` 降级——那是"无头回落"（不看请求头就回落）的变异
+    /// 会破坏的不变式。同时，被选中的候选要么免费，要么成本没有超过预算
+    /// 快照的剩余余额——这是"静默回落"（选了一个其实超支的候选却不留痕迹）
+    /// 的变异会破坏的不变式。
+    #[test]
+    fn without_declared_fallback_a_success_never_carries_budget_fallback_or_exceeds_the_balance(
+        cards in cards_strategy(),
+        role in prop::option::of(role_strategy()),
+        snapshot in budget_snapshot_strategy(),
+    ) {
+        let req = RequestProfile {
+            task: TaskProfile {
+                privacy: Some(PrivacyClass::Any),
+                intent: None,
+                complexity: None,
+                capabilities: Some(vec![Capability::Chat]),
+                fallback: None, // 关键：没有声明 fallback。
+            },
+            role,
+            tenant_id: Some("tenant-1".to_string()),
+            content_tightening: None,
+        };
+        let budget = FixedBudget(snapshot);
+        let ctx = PolicyCtx { min_ram_gb: None, budget: Some(&budget) };
+        if let Ok(decision) = decide(&req, &cards, &ctx) {
+            let has_budget_fallback = decision
+                .degradations
+                .iter()
+                .any(|d| matches!(d, Degradation::BudgetFallback { .. }));
+            prop_assert!(!has_budget_fallback);
+            let chosen = cards.iter().find(|c| c.id() == decision.chosen_id);
+            prop_assert!(chosen.is_some());
+            if let Some(chosen) = chosen {
+                let cost = chosen.estimated_cost_minor.unwrap_or(0);
+                prop_assert!(cost == 0 || cost <= snapshot.balance_minor());
+            }
+        }
+    }
+
+    /// A-2 第二条："静默回落"变异的直接反例：自然应该选中的是付费候选
+    /// （admission 排位严格更好），但实际选中的却是免费候选——只有一种
+    /// 合法解释：预算闸真的把它换掉了，那就必须留下 `BudgetFallback`
+    /// 降级记录，不能悄悄换而不留痕迹。
+    #[test]
+    fn choosing_the_free_alternative_over_a_naturally_better_paid_candidate_always_leaves_a_fallback_trace(
+        admission_pair in paid_wins_admission_pair_strategy(),
+        paid_cost in 1i64..=1000,
+        snapshot in budget_snapshot_strategy(),
+    ) {
+        let (paid_admission, free_admission) = admission_pair;
+        prop_assume!(admission_rank_for_test(paid_admission) < admission_rank_for_test(free_admission));
+        let paid = build_card(
+            "paid".to_string(),
+            (Locality::Loopback, Form::HttpService, Vec::new(), paid_admission, Some(paid_cost), false),
+        );
+        let free = build_card(
+            "free".to_string(),
+            (Locality::Loopback, Form::HttpService, Vec::new(), free_admission, Some(0), false),
+        );
+        let req = RequestProfile {
+            task: TaskProfile {
+                privacy: Some(PrivacyClass::Any),
+                intent: None,
+                complexity: None,
+                capabilities: Some(vec![Capability::Chat]),
+                fallback: Some(FallbackPolicy::NextInChain),
+            },
+            role: None,
+            tenant_id: Some("tenant-1".to_string()),
+            content_tightening: None,
+        };
+        let budget = FixedBudget(snapshot);
+        let ctx = PolicyCtx { min_ram_gb: None, budget: Some(&budget) };
+        if let Ok(decision) = decide(&req, &[paid, free], &ctx)
+            && decision.chosen_id == "free"
+        {
+            let has_budget_fallback = decision
+                .degradations
+                .iter()
+                .any(|d| matches!(d, Degradation::BudgetFallback { .. }));
+            prop_assert!(has_budget_fallback);
         }
     }
 }

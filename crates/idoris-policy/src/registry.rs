@@ -75,16 +75,21 @@ fn declares_network_endpoint(form: Form) -> bool {
     matches!(form, Form::HttpService | Form::NostrNode | Form::MitmProxy)
 }
 
-/// 仅供本 crate 自身测试使用的"内存 mock 后端"scheme——纯进程内计算，
-/// `locality: loopback` 本身没有说谎，允许跳过 host 校验。**不对生产配置
-/// 开放**：真实的 `config/components/*.yaml` 永远不会在非测试构建里出现
-/// `mock://` scheme，`cfg(test)` 之外一律按未知 scheme 拒绝。
-#[cfg(test)]
-fn is_test_only_mock_scheme(scheme: &str) -> bool {
+/// "内存 mock 后端"scheme——纯进程内计算，`locality: loopback` 本身没有
+/// 说谎，允许跳过 host 校验。**A-1 更正**：`config/components/mock.yaml`
+/// 这份真实配置就是 `http_service + loopback + mock://in-memory`（R2-D 接线
+/// 会用到），不是"真实 yaml 永远不会出现 mock://"——之前那句注释是错的。
+/// 用 `cfg(test)` 放行会导致这份真实 yaml 在非测试构建里被 `UnsupportedScheme`
+/// 拒掉；改用显式的 `dev-mock` cargo feature（默认关闭）控制，本单测仍然
+/// 需要放行（`cfg(test)` 保留，方便本 crate 自身的注册校验测试），生产构建
+/// 必须两者都不开，才会一律按未知 scheme 拒绝。是否放行跟"是不是在跑测试"
+/// 无关，跟"有没有显式打开 mock 开关"有关。
+#[cfg(any(test, feature = "dev-mock"))]
+fn is_dev_mock_scheme_allowed(scheme: &str) -> bool {
     scheme == "mock"
 }
-#[cfg(not(test))]
-fn is_test_only_mock_scheme(_scheme: &str) -> bool {
+#[cfg(not(any(test, feature = "dev-mock")))]
+fn is_dev_mock_scheme_allowed(_scheme: &str) -> bool {
     false
 }
 
@@ -128,7 +133,7 @@ pub fn parse_loopback_endpoint_url(card: &Card) -> Result<Option<Url>, Registrat
         return Err(unparseable());
     };
     let scheme = parsed.scheme();
-    if is_test_only_mock_scheme(scheme) {
+    if is_dev_mock_scheme_allowed(scheme) {
         return Ok(None);
     }
     if !matches!(scheme, "http" | "https" | "ws" | "wss") {

@@ -10,6 +10,13 @@ description = "R2-B: pure admission/routing decision pipeline (privacy -> role/c
 [lints]
 workspace = true
 
+[features]
+# 默认关闭：只有显式打开这个 feature，`registry::validate_registration` 才会
+# 放行 `mock://` scheme 的 loopback 端点（`config/components/mock.yaml` 用的
+# 就是 `mock://in-memory`）。R2-D 接线本地 mock 组件卡时打开它；生产构建
+# 绝不能带这个 feature。
+dev-mock = []
+
 [dependencies]
 idoris-contracts = { workspace = true }
 # 校验 endpoint host 需要真正的 WHATWG URL 解析——见 registry.rs::parse_endpoint。
