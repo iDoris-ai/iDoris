@@ -7,10 +7,18 @@
 
 mod clock;
 mod error;
+mod estimator;
+mod ledger;
 mod period;
 mod scope;
 
 pub use clock::{Clock, SystemClock};
 pub use error::{BUDGET_EXCEEDED_REASON_CODE, Budget402Body, BudgetError};
+pub use estimator::{ConservativeTokenEstimator, TokenEstimator, estimate_tokens};
+#[cfg(feature = "mutation-test-hooks")]
+pub use ledger::test_hooks;
+pub use ledger::{
+    BudgetLedger, DEFAULT_RESERVATION_TTL_MS, Price, ReservationId, SettleReceipt, SpendGate,
+};
 pub use period::billing_period_key;
 pub use scope::BudgetScope;
