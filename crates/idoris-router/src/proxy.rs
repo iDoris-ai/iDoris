@@ -393,6 +393,161 @@ mod tests {
         assert!(cache.contains_key("k1004"));
     }
 
+    fn opts<'a>(request_id: Option<&'a str>, record_id: &'a str) -> ForwardOpts<'a> {
+        ForwardOpts {
+            request_id,
+            tenant_id: None,
+            record_id,
+            provider_id: "omlx",
+            served_locality: Locality::Loopback,
+            privacy: PrivacyClass::Any,
+        }
+    }
+
+    fn chat_body() -> Value {
+        serde_json::json!({"model": "idoris/daily", "messages": [{"role": "user", "content": "hi"}]})
+    }
+
+    #[tokio::test]
+    async fn a_successful_call_is_forwarded_byte_for_byte() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/v1/chat/completions"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"marker": "raw-passthrough"})),
+            )
+            .mount(&server)
+            .await;
+        let proxy = ChatProxy::new(reqwest::Client::new());
+        let out = proxy
+            .forward_buffered(&server.uri(), &chat_body(), &opts(None, "rec-1"))
+            .await;
+        assert_eq!(out.status, 200);
+        assert!(!out.cached);
+        assert_eq!(out.retries, 0);
+        let body: Value = serde_json::from_slice(&out.body).unwrap();
+        assert_eq!(body["marker"], "raw-passthrough");
+    }
+
+    /// Counts requests received so the test can assert an exact retry
+    /// count and return a different response per attempt.
+    struct CountingRespond {
+        calls: std::sync::atomic::AtomicU32,
+        responses: Vec<wiremock::ResponseTemplate>,
+    }
+
+    impl wiremock::Respond for CountingRespond {
+        fn respond(&self, _req: &wiremock::Request) -> wiremock::ResponseTemplate {
+            let i = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) as usize;
+            self.responses
+                .get(i)
+                .cloned()
+                .unwrap_or_else(|| self.responses[self.responses.len() - 1].clone())
+        }
+    }
+
+    fn fast_retry_proxy() -> ChatProxy {
+        ChatProxy::with_config(
+            reqwest::Client::new(),
+            Duration::from_secs(60),
+            vec![Duration::from_millis(5), Duration::from_millis(5)],
+        )
+    }
+
+    #[tokio::test]
+    async fn retries_up_to_twice_on_5xx_then_succeeds() {
+        let server = wiremock::MockServer::start().await;
+        let responder = CountingRespond {
+            calls: std::sync::atomic::AtomicU32::new(0),
+            responses: vec![
+                wiremock::ResponseTemplate::new(500),
+                wiremock::ResponseTemplate::new(500),
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})),
+            ],
+        };
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/v1/chat/completions"))
+            .respond_with(responder)
+            .mount(&server)
+            .await;
+        let out = fast_retry_proxy()
+            .forward_buffered(&server.uri(), &chat_body(), &opts(None, "rec-1"))
+            .await;
+        assert_eq!(out.status, 200);
+        assert_eq!(out.retries, 2);
+    }
+
+    #[tokio::test]
+    async fn persistent_5xx_is_passed_through_verbatim_after_exhausting_retries() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/v1/chat/completions"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(503)
+                    .set_body_json(serde_json::json!({"error": "always-503"})),
+            )
+            .mount(&server)
+            .await;
+        let out = fast_retry_proxy()
+            .forward_buffered(&server.uri(), &chat_body(), &opts(None, "rec-1"))
+            .await;
+        assert_eq!(out.status, 503);
+        let body: Value = serde_json::from_slice(&out.body).unwrap();
+        assert_eq!(body["error"], "always-503");
+    }
+
+    #[tokio::test]
+    async fn same_request_id_hits_the_cache_and_a_local_only_hit_never_replays_a_remote_entry() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/v1/chat/completions"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"marker": "idem"})),
+            )
+            .expect(3) // first + remote_opts + local_only_opts (C1 forces a real call, no cache hit)
+            .mount(&server)
+            .await;
+        let proxy = ChatProxy::new(reqwest::Client::new());
+        let first = proxy
+            .forward_buffered(&server.uri(), &chat_body(), &opts(Some("req-1"), "rec-1"))
+            .await;
+        assert!(!first.cached);
+        let second = proxy
+            .forward_buffered(&server.uri(), &chat_body(), &opts(Some("req-1"), "rec-2"))
+            .await;
+        assert!(second.cached);
+        assert_eq!(second.origin_record_id.as_deref(), Some("rec-1"));
+        assert_eq!(second.body, first.body);
+
+        // PR #46 review finding C1: a local_only request must not replay a
+        // cache entry whose recorded Served-Locality isn't loopback.
+        let mut remote_opts = opts(Some("req-remote"), "rec-3");
+        remote_opts.served_locality = Locality::Remote;
+        proxy
+            .forward_buffered(&server.uri(), &chat_body(), &remote_opts)
+            .await;
+        let mut local_only_opts = opts(Some("req-remote"), "rec-4");
+        local_only_opts.privacy = PrivacyClass::LocalOnly;
+        let third = proxy
+            .forward_buffered(&server.uri(), &chat_body(), &local_only_opts)
+            .await;
+        assert!(!third.cached);
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn a_transport_error_maps_to_502_upstream_unavailable_after_retries() {
+        // No mock mounted at all -- every connection attempt fails outright.
+        let out = fast_retry_proxy()
+            .forward_buffered("http://127.0.0.1:1", &chat_body(), &opts(None, "rec-1"))
+            .await;
+        assert_eq!(out.status, 502);
+        let body: Value = serde_json::from_slice(&out.body).unwrap();
+        assert_eq!(body["error"]["type"], "upstream_unavailable");
+    }
+
     #[test]
     fn cache_key_includes_all_four_components_distinctly() {
         let a = cache_key("tenant-a", "http://x", "omlx", "req-1");
