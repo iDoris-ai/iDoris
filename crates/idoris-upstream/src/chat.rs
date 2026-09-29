@@ -15,8 +15,29 @@
 //! at. `Instant` (absolute), not `Duration`, so a caller chaining several
 //! calls against one overall budget hands every leg the same instant
 //! instead of re-deriving "how much is left" each time.
+//!
+//! ## Stream termination contract
+//!
+//! A well-formed [`ChatChunkStream`] must yield **exactly one terminal
+//! item as its last item**, then end (`None`) — never end for any other
+//! reason:
+//! - an `Ok(ChatChunk { done: true, .. })`, meaning the response
+//!   completed normally, or
+//! - an `Err(_)`, meaning it failed.
+//!
+//! No further items may follow an `Err`, and no further items may follow
+//! the `done: true` chunk. **A bare `None` that was not preceded by one of
+//! these two is truncation, not success** — a connection that drops
+//! mid-stream looks, from the caller's side, identical to one that simply
+//! finished, *unless* every implementation and every caller agree on this
+//! rule. A caller must never treat a bare `None` as "the response
+//! completed" on its own; [`ensure_terminated`] is the enforcement point
+//! that turns an implementation's possible mistake here into a guaranteed
+//! `Err` instead of a silent truncation a caller has to remember to check
+//! for itself.
 
 use std::pin::Pin;
+use std::task::{Context, Poll};
 use std::time::Instant;
 
 use async_trait::async_trait;
@@ -62,11 +83,75 @@ pub trait RemoteChat: Send + Sync {
     /// itself starts yielding items, a later failure (including the
     /// deadline elapsing mid-stream) is reported as an `Err` item on the
     /// stream instead, not by dropping it silently.
+    ///
+    /// The returned stream must follow this module's doc comment's
+    /// "stream termination contract" — end with exactly one `done: true`
+    /// `Ok` or one `Err`, never a bare `None`. Implementations that cannot
+    /// yet guarantee this themselves should return
+    /// `ensure_terminated(the_real_stream)` rather than the raw stream.
     async fn chat_stream(
         &self,
         req: ChatRequest,
         deadline: Instant,
     ) -> Result<ChatChunkStream, UpstreamError>;
+}
+
+/// Wraps `stream` so that ending (`None`) without first having produced a
+/// terminal item (an `Ok` chunk with `done: true`, or an `Err`) is itself
+/// turned into an `Err(UpstreamError::network())` item instead of a silent
+/// `None` — see this module's "stream termination contract". Mapped to
+/// `network_error` (not a dedicated "truncated" code) deliberately: an
+/// upstream stream ending abnormally without a clean `done`/error signal
+/// is, in practice, almost always a dropped connection — the same
+/// dependency-failure family `network_error` already names, not a new
+/// failure class a caller needs to distinguish from it.
+///
+/// Once a stream is known-good (guarantees the contract on its own), this
+/// wrapper is redundant but harmless — it only ever forwards items
+/// unchanged and adds exactly one synthetic item in the one case the
+/// underlying stream got wrong.
+pub fn ensure_terminated(stream: ChatChunkStream) -> ChatChunkStream {
+    Box::pin(EnsureTerminated {
+        inner: stream,
+        terminated: false,
+    })
+}
+
+struct EnsureTerminated {
+    inner: ChatChunkStream,
+    /// Set once a terminal item (`done: true` or `Err`) has been observed
+    /// — once terminated, every later poll returns `None` unconditionally,
+    /// so this wrapper itself never violates the contract it enforces.
+    terminated: bool,
+}
+
+impl Stream for EnsureTerminated {
+    type Item = Result<ChatChunk, UpstreamError>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if self.terminated {
+            return Poll::Ready(None);
+        }
+        match self.inner.as_mut().poll_next(cx) {
+            Poll::Pending => Poll::Pending,
+            // The contract violation this wrapper exists to catch: the
+            // inner stream ended without ever producing a terminal item.
+            Poll::Ready(None) => {
+                self.terminated = true;
+                Poll::Ready(Some(Err(UpstreamError::network())))
+            }
+            Poll::Ready(Some(Err(err))) => {
+                self.terminated = true;
+                Poll::Ready(Some(Err(err)))
+            }
+            Poll::Ready(Some(Ok(chunk))) => {
+                if chunk.done {
+                    self.terminated = true;
+                }
+                Poll::Ready(Some(Ok(chunk)))
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -186,5 +271,76 @@ mod tests {
         assert_eq!(items.len(), 1);
         assert!(items[0].done);
         assert_eq!(items[0].delta, "ok");
+    }
+
+    /// Yields each item of a fixed `Vec` in order (via `VecDeque::pop_front`),
+    /// then `None` — unlike `OnceReady`, lets a test stream end with a bare
+    /// `None` (no terminal item), exactly the case `ensure_terminated`
+    /// exists to catch.
+    struct FromVec<T>(std::collections::VecDeque<T>);
+
+    impl<T: Unpin> futures_core::Stream for FromVec<T> {
+        type Item = T;
+        fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<T>> {
+            Poll::Ready(self.get_mut().0.pop_front())
+        }
+    }
+
+    async fn drain(mut stream: ChatChunkStream) -> Vec<Result<ChatChunk, UpstreamError>> {
+        let mut items = Vec::new();
+        while let Some(item) = std::future::poll_fn(|cx| stream.as_mut().poll_next(cx)).await {
+            items.push(item);
+        }
+        items
+    }
+
+    #[tokio::test]
+    async fn ensure_terminated_passes_through_a_well_formed_done_stream_unchanged() {
+        let chunk = ChatChunk {
+            delta: "hi".to_string(),
+            done: true,
+        };
+        let inner: ChatChunkStream = Box::pin(FromVec(std::collections::VecDeque::from([Ok(
+            chunk.clone(),
+        )])));
+        let items = drain(ensure_terminated(inner)).await;
+        assert_eq!(items, vec![Ok(chunk)]);
+    }
+
+    #[tokio::test]
+    async fn ensure_terminated_passes_through_an_err_unchanged_and_stops_there() {
+        let inner: ChatChunkStream = Box::pin(FromVec(std::collections::VecDeque::from([Err(
+            UpstreamError::timeout(),
+        )])));
+        let items = drain(ensure_terminated(inner)).await;
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].as_ref().unwrap_err().reason_code(), "timeout");
+    }
+
+    /// The regression this whole mechanism exists to prevent: a stream that
+    /// ends (`None`) without ever producing a `done: true` chunk or an
+    /// `Err` must not be silently treated as a successful, complete
+    /// response — `ensure_terminated` must turn that bare `None` into an
+    /// explicit `Err`.
+    #[tokio::test]
+    async fn ensure_terminated_turns_a_bare_none_into_a_network_error() {
+        let not_done = ChatChunk {
+            delta: "partial".to_string(),
+            done: false,
+        };
+        let inner: ChatChunkStream = Box::pin(FromVec(std::collections::VecDeque::from([Ok(
+            not_done.clone(),
+        )])));
+        let items = drain(ensure_terminated(inner)).await;
+        assert_eq!(
+            items.len(),
+            2,
+            "the partial chunk, then the synthesized error"
+        );
+        assert_eq!(items[0], Ok(not_done));
+        assert_eq!(
+            items[1].as_ref().unwrap_err().reason_code(),
+            "network_error"
+        );
     }
 }

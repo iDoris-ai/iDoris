@@ -16,5 +16,8 @@
 pub mod chat;
 pub mod error;
 
-pub use chat::{ChatChunk, ChatChunkStream, ChatMessage, ChatRequest, ChatResponse, RemoteChat};
+pub use chat::{
+    ChatChunk, ChatChunkStream, ChatMessage, ChatRequest, ChatResponse, RemoteChat,
+    ensure_terminated,
+};
 pub use error::UpstreamError;
