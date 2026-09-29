@@ -22,6 +22,9 @@ use std::path::{Path, PathBuf};
 use idoris_contracts::{ComponentCard, Contract};
 use idoris_policy::{AdmissionStatus, Card, RegistrationError, validate_registration};
 
+use crate::budget;
+use crate::dispatch::is_resident_http_service;
+
 /// `serve.ts`'s `DEFAULT_COMPONENTS_DIR`.
 pub const DEFAULT_COMPONENTS_DIR: &str = "config/components";
 
@@ -40,10 +43,32 @@ pub fn resolve_components_dir(raw: Option<&str>) -> PathBuf {
 #[derive(Debug)]
 pub enum LoadError {
     NotADirectory(String),
-    Io { file: String, message: String },
-    Parse { file: String, message: String },
-    Invalid { file: String, message: String },
+    Io {
+        file: String,
+        message: String,
+    },
+    Parse {
+        file: String,
+        message: String,
+    },
+    Invalid {
+        file: String,
+        message: String,
+    },
     Registration(RegistrationError),
+    /// A `LoadMode::Resident` `http_service` card (R2-G's direct-forward
+    /// path — `proxy::ChatProxy`, never the Supervisor) whose price isn't
+    /// provably `0`. That path has no budget wiring at all (unlike the
+    /// Supervisor path, matching `packages/router/src/proxy.ts`, which
+    /// never touches budget either) — admitting a paid or price-unknown
+    /// card here would let every request against it bypass reserve/settle
+    /// entirely, violating invariant #3 ("price unknown ≠ free"). A known
+    /// v0.x limitation (README's R2-G section) with a registered
+    /// follow-up: wire reserve/settle into the direct-forward path so this
+    /// gate can be lifted.
+    PaidResidentUnsupported {
+        id: String,
+    },
 }
 
 impl std::fmt::Display for LoadError {
@@ -60,11 +85,28 @@ impl std::fmt::Display for LoadError {
                 write!(f, "组件卡文件 \"{file}\" 校验失败：{message}")
             }
             LoadError::Registration(err) => write!(f, "组件注册校验失败：{err}"),
+            LoadError::PaidResidentUnsupported { id } => write!(
+                f,
+                "付费 provider {id} 暂不支持直连转发（会绕过预算），请配置为 on_demand 或等待后续版本"
+            ),
         }
     }
 }
 
 impl std::error::Error for LoadError {}
+
+/// Whether `card`'s declared price is provably `0` — the only value the
+/// direct-forward path (no budget wiring) may admit for a
+/// `LoadMode::Resident` `http_service` card. Reuses
+/// [`budget::estimate_cost_minor`]'s own free/paid/unknown classification
+/// (invariant #3: "price unknown ≠ free") rather than re-deriving it here;
+/// the prompt argument doesn't affect the answer — zero rates price at `0`
+/// regardless of token count, and a malformed rate (negative already
+/// rejected by `ComponentCard::validate`, but also NaN/infinite, which
+/// isn't) is `None` regardless of token count either.
+fn resident_card_is_provably_free(card: &ComponentCard) -> bool {
+    budget::estimate_cost_minor(&card.provider.cost, "") == Some(0)
+}
 
 fn is_mock_card(card: &ComponentCard) -> bool {
     card.provider.id == "mock"
@@ -138,6 +180,14 @@ pub fn load_components(dir: &Path, allow_mock_env: bool) -> Result<Vec<Component
         })?;
         if is_mock_card(&card) && !allow_mock {
             continue;
+        }
+        // R2-G: fail closed at startup, not per-request, on a paid or
+        // price-unknown card the direct-forward path would otherwise
+        // silently serve for free forever (see LoadError::PaidResidentUnsupported).
+        if is_resident_http_service(&card) && !resident_card_is_provably_free(&card) {
+            return Err(LoadError::PaidResidentUnsupported {
+                id: card.provider.id,
+            });
         }
         cards.push(card);
     }
@@ -294,5 +344,106 @@ fail_closed: true
         let cards = load_components(dir.path(), false).unwrap();
         assert_eq!(cards.len(), 1);
         assert_eq!(cards[0].provider.id, "omlx");
+    }
+
+    /// A `LoadMode::Resident` `http_service` card — the shape R2-G's
+    /// direct-forward path serves. `cost` is templated in so the same
+    /// builder covers free/paid/unknown-price fixtures below.
+    fn resident_card(id: &str, cost_yaml: &str) -> String {
+        format!(
+            r#"
+provider:
+  id: {id}
+  family: other
+  tier: remote
+  capabilities: [chat]
+  privacy_class: any
+  cost: {cost_yaml}
+  locality: remote
+form: http_service
+endpoint: "http://127.0.0.1:9"
+version_pin: "{id}@0.0.0"
+privacy_class: any
+allowed_egress: [internet]
+fallback_policy: fail_closed
+fail_closed: true
+load_policy: {{ mode: resident, keepalive: {{ pinned: true }}, admission: coexist }}
+"#
+        )
+    }
+
+    #[test]
+    fn a_free_resident_http_service_card_is_admitted() {
+        let dir = TempDir::new().unwrap();
+        write_card(
+            &dir,
+            "proxy.yaml",
+            &resident_card("proxy-free", "{ input_per_m: 0, output_per_m: 0 }"),
+        );
+        let cards = load_components(dir.path(), false).unwrap();
+        assert_eq!(cards.len(), 1);
+        assert_eq!(cards[0].provider.id, "proxy-free");
+    }
+
+    #[test]
+    fn a_paid_resident_http_service_card_is_rejected_at_load_time() {
+        let dir = TempDir::new().unwrap();
+        write_card(
+            &dir,
+            "proxy.yaml",
+            &resident_card(
+                "proxy-paid",
+                "{ input_per_m: 1000000, output_per_m: 2000000 }",
+            ),
+        );
+        let err = load_components(dir.path(), false).unwrap_err();
+        assert!(err_display_mentions_id(&err, "proxy-paid"));
+        match err {
+            LoadError::PaidResidentUnsupported { id } => assert_eq!(id, "proxy-paid"),
+            other => panic!("expected PaidResidentUnsupported, got {other:?}"),
+        }
+    }
+
+    /// A rate that isn't provably `0` and isn't a real, finite positive
+    /// price either (NaN — negative is already caught by
+    /// `ComponentCard::validate` before this gate runs) must be treated as
+    /// "unknown", not "free" (invariant #3).
+    #[test]
+    fn a_resident_http_service_card_with_an_unknown_price_is_rejected() {
+        let dir = TempDir::new().unwrap();
+        write_card(
+            &dir,
+            "proxy.yaml",
+            &resident_card(
+                "proxy-unknown-cost",
+                "{ input_per_m: .nan, output_per_m: 0 }",
+            ),
+        );
+        let err = load_components(dir.path(), false).unwrap_err();
+        match err {
+            LoadError::PaidResidentUnsupported { id } => assert_eq!(id, "proxy-unknown-cost"),
+            other => panic!("expected PaidResidentUnsupported, got {other:?}"),
+        }
+    }
+
+    /// A non-Resident card is never subject to this gate, however
+    /// expensive it's priced — the Supervisor path still reserves/settles
+    /// against it normally, so nothing bypasses the budget here.
+    #[test]
+    fn a_paid_on_demand_card_is_unaffected_by_this_gate() {
+        let dir = TempDir::new().unwrap();
+        let card = resident_card(
+            "omlx-paid",
+            "{ input_per_m: 1000000, output_per_m: 2000000 }",
+        )
+        .replace("mode: resident", "mode: on_demand");
+        write_card(&dir, "omlx.yaml", &card);
+        let cards = load_components(dir.path(), false).unwrap();
+        assert_eq!(cards.len(), 1);
+        assert_eq!(cards[0].provider.id, "omlx-paid");
+    }
+
+    fn err_display_mentions_id(err: &LoadError, id: &str) -> bool {
+        err.to_string().contains(id)
     }
 }
