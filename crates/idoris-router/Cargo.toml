@@ -23,6 +23,11 @@ idoris-contracts = { workspace = true }
 idoris-policy = { workspace = true }
 idoris-backend = { workspace = true }
 idoris-tenancy = { workspace = true }
+# R2-G task 1 (CLI wiring): a real oMLX-shaped card (LoadMode::OnDemand/
+# EvictToLoad, needing the Supervisor's explicit load/unload lifecycle) is
+# served via OmlxAdapter, distinct from the direct-forward `proxy` path
+# below (which only applies to a LoadMode::Resident http_service card).
+idoris-upstream = { workspace = true }
 axum = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
@@ -30,8 +35,30 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = "0.9"
 uuid = { workspace = true }
+# R2-G: direct HTTP forwarding for a generic (non-oMLX) `http_service`
+# component card — `GET /v1/models` (this PR) and `POST
+# /v1/chat/completions` (follow-up PR) both need an outbound HTTP client.
+# Same version/feature choice as idoris-upstream's own `reqwest` dependency
+# (rustls, not the system TLS backend; `charset`/`http2`/`system-proxy`
+# dropped as unneeded) so the workspace has one TLS stack, not two.
+# R2-G streaming (PR7): `stream` enables `Response::bytes_stream()`, needed
+# for genuine incremental SSE pass-through (as opposed to `forward_buffered`,
+# which downloads the full body before returning).
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "stream"] }
+# The idempotency cache's insertion-order == expiry-order invariant
+# (`ChatProxy::remember`'s doc) needs a map that preserves insertion order
+# and lets a re-insert move a key to the back — `std::HashMap` has neither;
+# `IndexMap` already resolves in the workspace (transitively, e.g. via
+# `jsonschema`/`tower`), so this adds no new dependency *tree*, just a
+# direct `idoris-router` edge onto an already-vendored crate.
+indexmap = "2"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 tempfile = "3"
+wiremock = "0.6"
+# Real-time (not virtual/paused) retry-delay tests take ~1.25s each
+# (250ms + 1000ms) instead of needing `tokio::time::pause()` plumbed
+# through the whole call chain — acceptable for the handful of tests that
+# exercise the retry path.

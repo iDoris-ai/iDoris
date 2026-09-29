@@ -92,6 +92,84 @@ pub enum DispatchError {
     Internal(String),
 }
 
+/// What [`select`] returns: everything a caller needs to route between the
+/// two request-execution paths (R2-G) *before* committing to either one.
+#[derive(Debug)]
+pub struct Selected {
+    pub decision: Decision,
+    pub served_locality: Locality,
+    pub card: ComponentCard,
+    pub load_policy: LoadPolicy,
+    pub estimated_cost_minor: i64,
+}
+
+/// Runs `decide()` and resolves the chosen candidate — the same selection
+/// step [`dispatch_local`] runs internally, factored out so a caller can
+/// inspect *which* candidate would be used without committing to the
+/// Supervisor execution path. R2-G: a chosen candidate whose
+/// `load_policy.mode` is [`LoadMode::Resident`] and whose `form` is
+/// `http_service` is a generic OpenAI-compatible backend (including a
+/// conformance fixture pointing at a fake upstream) — the caller forwards
+/// to it directly via `proxy::ChatProxy` instead of calling
+/// [`dispatch_local`], which always goes through the Supervisor and is only
+/// correct for a real oMLX-shaped backend (`LoadMode::OnDemand`/
+/// `EvictToLoad`, needing an explicit load/unload lifecycle a plain HTTP
+/// passthrough backend has no equivalent of — see `proxy.rs`'s module doc).
+///
+/// Known, accepted duplication: [`dispatch_local`] calls `decide()` again
+/// internally rather than taking a pre-computed [`Selected`] — avoiding a
+/// larger signature change to an already width-tested function for this PR.
+/// `decide()` is a small, pure, side-effect-free function over an in-memory
+/// candidate list; the caller (`lib.rs`'s `chat_completions`) calls this
+/// twice only on the Supervisor-path branch, never on the (more latency-
+/// sensitive, real-network-call) proxy-path branch.
+pub fn select(
+    cards: &[ComponentCard],
+    profile: &ParsedProfile,
+    prompt: &str,
+) -> Result<Selected, DispatchError> {
+    let candidates: Vec<Card> = cards.iter().map(|c| candidate(c, prompt)).collect();
+    let request_profile = RequestProfile {
+        task: profile.task.clone(),
+        role: profile.role,
+        tenant_id: profile.tenant_id.clone(),
+        content_tightening: None,
+    };
+    let ctx = PolicyCtx {
+        min_ram_gb: None,
+        budget: None,
+    };
+    let decision = decide(&request_profile, &candidates, &ctx).map_err(DispatchError::Rejection)?;
+    let Some(chosen) = candidates.iter().find(|c| c.id() == decision.chosen_id) else {
+        return Err(DispatchError::Internal(format!(
+            "decide() returned chosen_id {:?} absent from its own candidate list",
+            decision.chosen_id
+        )));
+    };
+    let served_locality = effective_served_locality(chosen);
+    let load_policy = chosen
+        .component
+        .load_policy
+        .unwrap_or_else(default_load_policy);
+    let estimated_cost_minor = chosen.estimated_cost_minor.unwrap_or(0);
+    Ok(Selected {
+        decision,
+        served_locality,
+        card: chosen.component.clone(),
+        load_policy,
+        estimated_cost_minor,
+    })
+}
+
+/// Whether `card` should be forwarded directly (R2-G's `proxy::ChatProxy`)
+/// rather than dispatched through the Supervisor — see [`select`]'s doc.
+pub fn is_resident_http_service(card: &ComponentCard) -> bool {
+    card.form == idoris_contracts::component_card::Form::HttpService
+        && card
+            .load_policy
+            .is_some_and(|lp| lp.mode == LoadMode::Resident)
+}
+
 /// RAII guard: on `Drop`, releases the reservation unless [`Self::take`]
 /// already removed it. This covers two cases a scattering of explicit
 /// `release()` calls at each early-`return` site cannot: an `Err` return
