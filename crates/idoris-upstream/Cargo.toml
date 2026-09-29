@@ -12,6 +12,7 @@ workspace = true
 
 [dependencies]
 idoris-backend = { workspace = true }
+idoris-contracts = { workspace = true }
 thiserror = { workspace = true }
 async-trait = { workspace = true }
 # Only the `Stream` trait — not the full `futures` umbrella crate — to keep
@@ -29,6 +30,21 @@ serde_json = { workspace = true }
 # `charset`/`http2`/`system-proxy` (reqwest's own defaults) are dropped:
 # oMLX is a local HTTP/1.1 process on 127.0.0.1, none of them apply.
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+# `RuntimeAdapter::chat`'s `CancellationToken` parameter.
+tokio-util = { workspace = true }
+# Model ids go into URL path segments (`/v1/models/{id}/load`); encoding
+# them (like the TS reference's `encodeURIComponent`) keeps an id with a
+# `/` or space from being misread as a path separator or breaking the URL.
+percent-encoding = "2"
+# Remote (OpenAI/Anthropic-compatible) provider client. License: MIT OR
+# Apache-2.0 (verified against its published Cargo.toml before adding).
+# Pinned to `0.6.5` (latest stable 0.6.x as of writing, not a `0.7.0-betaN`
+# pre-release) per the task's "lock to a 0.6.x stable release" requirement;
+# default features (`rustls-tls` only, no `bedrock-sigv4`) match this
+# crate's own rustls-everywhere choice (see the `reqwest` entry above) and
+# keep the AWS SigV4/aws-config dependency chain out entirely — nothing
+# here uses the Bedrock adapter.
+genai = "0.6.5"
 
 [dev-dependencies]
 # `io-util` (for `AsyncWriteExt`) is test-only: the raw-TCP regression test
