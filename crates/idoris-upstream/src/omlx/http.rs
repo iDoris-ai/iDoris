@@ -1,6 +1,6 @@
 //! Low-level HTTP plumbing for the oMLX adapter: every request goes through
-//! [`get_json`]/[`post_empty`]/[`put_json`], each of which applies a
-//! per-call timeout and turns a failure into a [`BackendError`] that never
+//! [`get_json`]/[`post_empty`]/[`put_json`]/[`post_and_parse`], each of
+//! which applies a per-call timeout and turns a failure into a [`BackendError`] that never
 //! carries the response body or API key — every error here is built from
 //! method/path/status only, never by formatting the response body or the
 //! underlying `reqwest::Error` (mirroring `RuntimeAdapter::probe_ready`'s
@@ -74,10 +74,6 @@ pub(super) async fn get_json(
 /// A send()-only timeout is correct here (unlike [`send_and_parse`]):
 /// nothing reads the body afterward, so there is no unbounded read left
 /// unguarded once `send()` resolves.
-///
-/// `#[allow(dead_code)]`: `OmlxAdapter::load`/`unload` (follow-up PR) call
-/// this for real; exercised directly by this module's own tests until then.
-#[allow(dead_code)]
 pub(super) async fn post_empty(
     client: &reqwest::Client,
     base_url: &str,
@@ -92,7 +88,6 @@ pub(super) async fn post_empty(
 
 /// `PUT path` with a JSON body, discarding the response body. See
 /// [`post_empty`]'s doc on why a send()-only timeout is correct here too.
-#[allow(dead_code)]
 pub(super) async fn put_json(
     client: &reqwest::Client,
     base_url: &str,
@@ -106,7 +101,23 @@ pub(super) async fn put_json(
     send_and_discard("PUT", path, req, call_timeout).await
 }
 
-#[allow(dead_code)]
+/// `POST path` with a JSON body, parsed as JSON — used for `/v1/chat/
+/// completions`. Unlike [`post_empty`]/[`put_json`], the response body
+/// *is* read, so this goes through [`send_and_parse`] (full-round-trip
+/// timeout), not `send_and_discard`.
+pub(super) async fn post_and_parse(
+    client: &reqwest::Client,
+    base_url: &str,
+    path: &str,
+    api_key: Option<&str>,
+    call_timeout: Duration,
+    body: &serde_json::Value,
+) -> Result<serde_json::Value, BackendError> {
+    let url = format!("{base_url}{path}");
+    let req = auth_header(client.post(&url), api_key).json(body);
+    send_and_parse("POST", path, req, call_timeout).await
+}
+
 async fn send_and_discard(
     method: &'static str,
     path: &str,

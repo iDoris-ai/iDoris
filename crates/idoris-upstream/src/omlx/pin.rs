@@ -13,10 +13,6 @@
 //! evicted between `load` and this check) is an error, never guessed at as
 //! "probably not pinned". Ported from `packages/adapters/omlx/
 //! omlx-backend.ts`'s `verifyModelState`.
-//!
-//! `#![allow(dead_code)]`: wired into `OmlxAdapter::load` in a follow-up
-//! PR; exercised directly by this module's own tests until then.
-#![allow(dead_code)]
 
 use idoris_backend::BackendError;
 
