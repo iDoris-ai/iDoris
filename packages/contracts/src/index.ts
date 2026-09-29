@@ -15,3 +15,5 @@ export * from "./tenant.js";
 export * from "./adapter-manifest.js";
 export * from "./training-sample.js";
 export * from "./adapter-gate.js";
+export * from "./role.js";
+export * from "./version.js";

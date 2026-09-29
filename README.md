@@ -36,7 +36,7 @@ curl http://127.0.0.1:8740/health
 
 ## 已知限制（v0.x）
 
-- **付费的 `Resident` 直连转发卡目前不支持，启动时直接拒绝**：`form: http_service` + `load_policy.mode: resident` 的组件卡（例如指向一个通用 OpenAI 兼容后端）由 `idoris-router::proxy::ChatProxy` 直接转发，这条路径完全没有接预算 reserve/settle。为了不让付费候选悄悄绕过预算，启动加载组件卡时会硬性拒绝任何价格不是可证明为 `0`（付费，或价格未知/畸形）的 `Resident` `http_service` 卡，报错里会点名是哪个 `provider.id`。本地免费卡（`cost.input_per_m`/`output_per_m` 均为 `0`）不受影响；`on_demand`/`evict_to_load`（Supervisor + oMLX）路径也不受影响，不管价格多少都照常走预算。跟进项见 [`docs/agent/tasks.md`](docs/agent/tasks.md) FU-17。
+- **付费的 `Resident` 直连转发卡目前不支持，启动时直接拒绝**：`form: http_service` + `load_policy.mode: resident` 的组件卡（例如指向一个通用 OpenAI 兼容后端）由 `idoris-router::proxy::ChatProxy` 直接转发，这条路径完全没有接预算 reserve/settle。为了不让付费候选悄悄绕过预算，启动加载组件卡时会硬性拒绝任何价格不是可证明为 `0`（付费，或价格未知/畸形）的 `Resident` `http_service` 卡，报错里会点名是哪个 `provider.id`。本地免费卡（`cost.input_per_m`/`output_per_m` 均为 `0`）不受影响；`on_demand`/`evict_to_load`（Supervisor + oMLX）路径也不受影响，不管价格多少都照常走预算。跟进项见 [`docs/agent/tasks.md`](docs/agent/tasks.md) FU-22。
 
 ## License
 

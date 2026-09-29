@@ -13,10 +13,10 @@
  * **不保证**网络目的地与凭据隔离 —— CLI 必须联网读取自己的登录态。
  */
 import { spawn } from "node:child_process";
+import { createHash, randomUUID } from "node:crypto";
 import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { randomUUID } from "node:crypto";
 import type {
   Admission,
   BackendStatus,
@@ -41,14 +41,46 @@ export type SubscriptionRelayErrorCode =
   | "RELAY_TIMEOUT"
   | "RELAY_CANCELLED";
 
+/**
+ * PR #46 复审 H2：**不做自由文本脱敏**——之前的 `redactForLog`（替换本机用户名
+ * 目录、替换看起来像 token 的长子串）不可靠，正则覆盖不到短密钥、prompt 原样
+ * 回显、或者任何没匹配上启发式规则的敏感内容。唯一可靠的做法是**压根不记录
+ * 自由文本**，只留白名单元数据：退出码、stderr 字节数、stderr 的 sha256 摘要
+ * 前 12 位（不可逆，用于跨请求关联同一份 stderr，不泄露内容本身）。
+ */
+export interface SubscriptionRelayDiagnostics {
+  exitCode: number | null;
+  /** 原始 stderr 的字节数（不是字符数——多字节字符会更明显地体现差异）。 */
+  stderrBytes: number;
+  /** sha256(stderr) 的十六进制前 12 位；不可逆，只用于关联诊断。 */
+  stderrDigest: string;
+}
+
 export class SubscriptionRelayError extends Error {
   constructor(
     readonly code: SubscriptionRelayErrorCode,
     message: string,
+    /**
+     * 供服务端日志排障用的白名单元数据（退出码/字节数/摘要）。**绝不含任何
+     * stderr 自由文本**——`message` 本身也刻意不含这些内容，就是为了让
+     * "直接把 Error.message 塞进 HTTP 响应"这种常见写法也不会泄露
+     * （PR #46 复审 M2：曾经 message 里直接拼了最多 500 字节的原始 CLI stderr；
+     * H2：后来改成"脱敏后的摘要"也不够——脱敏正则本身就靠不住）。
+     */
+    readonly diagnostics?: SubscriptionRelayDiagnostics,
   ) {
     super(message);
     this.name = "SubscriptionRelayError";
   }
+}
+
+function stderrDiagnostics(stderr: string, exitCode: number | null): SubscriptionRelayDiagnostics {
+  const buf = Buffer.from(stderr, "utf8");
+  return {
+    exitCode,
+    stderrBytes: buf.length,
+    stderrDigest: createHash("sha256").update(buf).digest("hex").slice(0, 12),
+  };
 }
 
 export interface OpenAIChatCompletion {
@@ -264,9 +296,12 @@ export class SubscriptionRelay implements ModelBackend {
     }
     text = text.trim();
     if (run.code !== 0) {
+      // M2/H2：message 只带退出码，不带任何 CLI 输出；diagnostics 只有白名单
+      // 元数据（退出码/字节数/sha256 摘要），不含 stderr 原文——见类定义注释。
       throw new SubscriptionRelayError(
         "RELAY_CLI_FAILED",
-        "subscription CLI exited with code " + String(run.code) + ": " + run.stderr.trim().slice(0, 500),
+        "subscription CLI exited with code " + String(run.code),
+        stderrDiagnostics(run.stderr, run.code),
       );
     }
     if (text === "") {

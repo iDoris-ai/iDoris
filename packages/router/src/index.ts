@@ -68,3 +68,5 @@ export {
   InvalidReasonError,
 } from "./audit.js";
 export type { AuditField, AuditInput, AuditRecord, AuditScalar } from "./audit.js";
+export { parseModelRole, resolveRoleToCandidates, RoleParseError } from "./roles.js";
+export type { RoleParseErrorCode } from "./roles.js";

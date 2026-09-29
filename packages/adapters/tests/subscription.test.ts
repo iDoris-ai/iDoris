@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -222,6 +223,39 @@ describe("SubscriptionRelay process lifecycle", () => {
       code: "RELAY_CLI_FAILED",
     });
     relay.dispose();
+  });
+
+  it("M2/H2（PR #46 复审）：CLI 原始 stderr 不进 message，diagnostics 只有白名单元数据", async () => {
+    // H2：之前那版靠正则"脱敏"stderr 摘要不可靠（覆盖不到短密钥、prompt 回显等）。
+    // 现在压根不传递任何 stderr 自由文本——只有退出码/字节数/sha256 摘要前 12 位。
+    const stderrText = "boom SENTINEL_ABCDEFGHIJKLMNOPQRSTUVWX12345";
+    const script = writeScript("fail-with-secret.mjs", "process.stderr.write(" + JSON.stringify(stderrText) + "); process.exit(3);");
+    const relay = makeRelay(script);
+    try {
+      await relay.complete([{ role: "user", content: "hi" }], "m");
+      throw new Error("should have thrown");
+    } catch (err) {
+      expect(err).toBeInstanceOf(SubscriptionRelayError);
+      const relayErr = err as SubscriptionRelayError;
+      expect(relayErr.code).toBe("RELAY_CLI_FAILED");
+      // message 只带退出码——不管调用方是不是直接把 Error.message 塞进 HTTP 响应
+      // （历史上就是这么出的事），都不会带出 CLI 自己的输出内容。
+      expect(relayErr.message).toContain("exited with code 3");
+      expect(relayErr.message).not.toContain("boom");
+      expect(relayErr.message).not.toContain("SENTINEL");
+      // diagnostics 只有白名单字段：退出码、字节数、sha256 摘要前 12 位——不含任何原文。
+      expect(relayErr.diagnostics).toBeDefined();
+      expect(relayErr.diagnostics?.exitCode).toBe(3);
+      expect(relayErr.diagnostics?.stderrBytes).toBe(Buffer.byteLength(stderrText, "utf8"));
+      const expectedDigest = createHash("sha256").update(Buffer.from(stderrText, "utf8")).digest("hex").slice(0, 12);
+      expect(relayErr.diagnostics?.stderrDigest).toBe(expectedDigest);
+      // 负对照：整个错误对象（含 diagnostics）序列化后也不带出哨兵——
+      // 防止以后有人不小心往 diagnostics 里加自由文本字段。
+      expect(JSON.stringify({ message: relayErr.message, diagnostics: relayErr.diagnostics })).not.toContain("SENTINEL");
+      expect(JSON.stringify({ message: relayErr.message, diagnostics: relayErr.diagnostics })).not.toContain("boom");
+    } finally {
+      relay.dispose();
+    }
   });
 
   it("kills the WHOLE process group on timeout - no orphans", async () => {

@@ -9,7 +9,7 @@
 
 ## 0. 一句话
 
-> **iDoris 是本地优先的「模型与策略层」**：对上游只有一个地址（OpenAI / Anthropic 兼容 + 决策端点 + 反馈端点）；对内管理多个异构模型运行时；每个请求按**隐私 → 预算 → 意图 → 容量**的固定顺序确定性地准入与路由；全程记录可审计的元数据；**客户可选**把请求轨迹沉淀下来，反哺自有小模型。
+> **iDoris 是本地优先的「模型与策略层」**：对上游只有一个地址（OpenAI / Anthropic 兼容 + 决策端点 + 反馈端点）；对内管理多个异构模型运行时；每个请求按**隐私 → 意图 → 预算 → 容量**的固定顺序确定性地准入与路由；全程记录可审计的元数据；**客户可选**把请求轨迹沉淀下来，反哺自有小模型。
 >
 > iDoris 的边界按**权限**划定，不按「智能」划定：它决定「谁、在什么隐私与预算约束下、能用哪些推理资源」，不做 agent 执行、不做长期记忆、不做聊天产品。
 
@@ -39,14 +39,14 @@
 包的职责：`contracts`（契约 + zod + 组件卡校验器）· `adapters`（引擎无关后端）· `router`（编排）· `tenancy`（deploy_mode、租户硬隔离、预算）· `recommender`（选型）· `growth`（数据湖 + MLX-LoRA）· `federation`（联邦聚合 + DP）。
 
 两条贯穿全局的设计：
-- **控制面走 header，不走 prompt**：`X-iDoris-Privacy/Intent/Complexity/Capabilities/Fallback/Tenant/Request-Id`。执行顺序固定为**隐私判定 → 预算闸门 → 意图/能力匹配**。privacy 缺省是 `local_only`；tenant 模式缺 tenant header 直接 400。
+- **控制面走 header，不走 prompt**：`X-iDoris-Privacy/Intent/Complexity/Capabilities/Fallback/Tenant/Request-Id`。执行顺序固定为**隐私判定 → 意图/能力匹配 → 预算闸门**（2026-09-27 修订；TS 参考实现目前仍是旧顺序，但 `checkBudget` 默认 `scope=paid_only`，只作用于有成本的候选）。privacy 缺省是 `local_only`；tenant 模式缺 tenant header 直接 400。
 - **fail-closed 靠代码保证**：`local_only` 请求在本地跑不了时返回 503，不会降级到外部；降级候选还会二次复核 `privacy_class` 和 `allowed_egress`。
 
 ### 1.3 模型怎么管：三层
 
 | 层 | 管什么 | 现在的实现 |
 |:---|:---|:---|
-| **选哪个** | `config/catalog.yaml` 按架构参数现算 KV，`min_ram_gb` 是硬门槛；角色分 `fast/core/deep/temp` | `recommender` 包 |
+| **选哪个** | `config/catalog.yaml` 按架构参数现算 KV，`min_ram_gb` 是硬门槛；角色分 `fast/core/deep/temp`（T4.2 已更名：`core`→`daily`，`temp` 不是角色改用 `load_hint: on_demand`；完整枚举见 docs/interfaces/iDoris-Agent24-边界与接口规范.md §3.3/§3.12） | `recommender` 包 |
 | **怎么装卸** | `LoadPolicy{mode: resident\|on_demand\|evict_to_load, keepalive, admission}`，加一把每个后端独立的驱逐互斥锁 | `contracts` + `router/evict-lock` |
 | **谁执行** | `ModelBackend` 接口（list/load/unload/admission/status/chat），Router 核心里不出现任何引擎名 | `adapters`：mock + oMLX |
 
@@ -78,20 +78,26 @@
 
 原有的边界全部保留，另外加入这轮调研得出的几条新纪律（★ 为新增）。
 
-1. **顺序即语义**：隐私 → 预算 → 意图 → admission → 降级。顺序反了就是漏洞，必须有测试。
+1. **顺序即语义**：**隐私 → 意图 → 预算 → admission → 选择/降级**。顺序反了就是漏洞，必须有测试。〔2026-09-27 修订，由 jason 提出。原顺序是「隐私 → 预算 → 意图」。〕
+   - **隐私**：按隐私要求硬性淘汰候选（`local_only` 只保留 loopback 候选），并对内容过闸。它在最前，意图判断不能放宽隐私要求。
+   - **意图**：根据任务画像和意图，确定所需能力、路径或工具链，得到候选集。本地优先，本地能满足就不走付费路径。
+   - **预算**：只作用于**选中路径里有成本的候选**，在准入时原子 reserve。路径需要付费、但预算不足时返回 402，这是终态拒绝；只有调用方显式声明 `X-iDoris-Fallback` 时才退回本地，并在响应头里明示。**不在意图之前做全局预算闸**，因为那样既会误伤零成本的本地路径，又会让"预算先剔除远程、再由意图在剩余候选里挑"变成一次静默降级。
+   - **唯一例外**：全局 kill switch 和账户熔断这类 O(1) 检查，作为最外层兜底放在最前面。〔Pipelock、OmniRoute〕这一顺序在 blog 全量重读中有 5 篇独立文章支持（semantic-router、ClawRouter、OpenSquilla、treg、openminis），没有找到支持"预算先于意图"的文章。
+   - 为什么不能被绕过：意图只负责"选路"，不负责"放行"。凡是付费候选，都必须通过预算的原子 reserve 才能执行，意图没有能力跳过这一步。
 2. **隐私只能收紧，不能放宽**：`local_only` fail-closed。不管是意图推断、模型判定、下层策略还是调用方自述，都只能让隐私要求更严，不能让它更松。★
-3. **预算是拒绝不是降级**；★ **价格未知 ≠ 免费**：远程模型价格未知时，要么拒绝，要么按保守上限估算。
+3. **预算是拒绝不是降级**；★ **价格未知 ≠ 免费**：远程模型价格未知时，要么拒绝，要么按保守上限估算。（对照：TokenTracker 这类只读统计工具在价格未知时按 $0 计，但 iDoris 是准入网关，后果不同，所以不采用。）
 4. **租户硬隔离**在数据访问层实现；FU-15：新增有状态组件时必须主动接入 tenancy 层。
 5. **审计账本只存元数据**（字段白名单 + 黑名单闸门）。★ 轨迹是另一个模块，客户可选，与审计物理分离（§5）。
 6. **策略是数据**，★ 而且所有写入都走「**提议 → diff → 人批准 → 版本化 → 可撤销**」。〔exxperts、Virtual AI Infra Team〕
 7. ★ **可信网关 / 不可信执行 / 确定性策略**：凭证和策略留在网关侧；后端和订阅 CLI 都视为不可信执行。〔openclaw-gateway〕
-8. ★ **不静默**：不支持的请求参数要么真实兑现，要么显式 400；配置写了但不会生效，就拒绝启动；降级必须在响应头里回传。〔localagi 拆解、Pipelock 实测、Rapid-MLX、Krill〕
+8. ★ **不静默**：不支持的请求参数要么真实兑现，要么显式 400；配置写了但不会生效，就拒绝启动；降级必须在响应头里回传。〔localagi 拆解、Pipelock 实测、Rapid-MLX、Krill〕**判定器不可用时**，`/v1/systemone` 和意图判定默认**拒绝**（`reason_code: judge_unavailable`）。只有调用方显式接受时，才允许用宿主模型模拟判定，此时响应必须带 `judge_mode: simulated` 和 `calibrated: false`。〔jev-skill〕另外，由模型给出的阈值或置信度**只能收紧，不能放宽**（做 clamp）。〔virtual-ai-infra-team〕fail-closed 必须是**默认值**，不能是需要手动打开的选项。〔openclaw-gateway"默认不开启硬化"的反例〕
 9. ★ **日志即运行时**：每个请求一条追加式事件流。审计、用量、UI、轨迹、回放都是这条流的**投影**，不各写一份。〔maka「Log is the Runtime」〕
 10. ★ **模型只提议，代码判决**：路由学习、模型升级、adapter 晋升，最终结论都由确定性代码给出；**没有合格候选时保留现状，这算正常结果**。〔virtual-ai-infra-team〕
 11. ★ **本地优先不等于只用本地**：按敏感度分路由；远程路径要去关联，不带用户和租户标识出站。〔vitalik-ai-survival-guide〕
 12. ★ **授权结构化**：调用方的自我声明永远不能放宽授权；只接白名单 provider，未审核的中转站不得注册。〔pentest-harness 拆穿〕
 13. **License 红线**（扩充）：LiteLLM `enterprise/`、Dify 多租户、ComfyUI GPL、★ LobeHub 社区许可、HugAgentOS 的「禁竞争性多租户 SaaS」条款，都不得引入代码。
 14. **进程边界即授权边界**；不 vendor 第三方源码；版本一律钉死。
+15. ★ **元数据小、始终在场；内容大、按需加载**：路由、判定、审计只依赖元数据；内容只在确实需要时才进入上下文或存储访问。"Context is not history"：发给模型的上下文可以裁剪，但完整的决策证据链不能丢。〔Agent Skills 渐进披露、Maka〕（2026-09-27 blog 重读新增）
 
 ---
 
@@ -109,7 +115,7 @@
 ┌───────────────▼──────────────────────────── iDoris Router ─────────────────────────────┐
 │ ① 接入：协议适配 · 字段兑现矩阵 · 虚拟 key → 调用方身份 · trace 关联头                         │
 │ ② 入口判定层 INSPECT：L0 确定性规则 → L1 System-1 判定（intent/privacy/complexity，校准概率）  │
-│ ③ 策略引擎：隐私 → 预算(reserve) → 意图/能力 → admission → 降级（policy 版本化）                │
+│ ③ 策略引擎：隐私 → 意图/能力 → 预算(reserve) → admission → 降级（policy 版本化）                │
 │ ④ 调度：会话亲和(保 KV/前缀缓存) · 三粒度断路器(provider/connection/model) · 驱逐锁            │
 │ ⑤ 执行：闸二凭证注入点（只见 secret:// 引用）· 出站去关联 · 流式回填 · 预算 settle           │
 │ ⑥ Event Log（追加式）──投影──▶ 审计账本 · 用量账本 · 决策账本 · 运维指标(OTel) · 轨迹金库(可选) │
@@ -163,7 +169,7 @@
 | **Runtime Supervisor** | 从「一个平台一个后端」改为「**一个平台多个后端，按任务分派**」：oMLX 跑大模型、mlx_lm.server 做 Apple 官方保底、**llama.cpp GGUF 跑长上下文和 Windows**（MLX 的 `--kv-bits` 会禁用批处理）、Apple Foundation Models 当系统自带的零预算小脑、嵌入/重排进程单独跑 | M1 Max 64GB 方案（用户本人）、WWDC26、docs/13 §3.3 |
 | **全局内存账本** | oMLX 的 `model_memory_max` 只管它自己；Supervisor 汇总所有后端占用，作为 admission 的唯一依据 | M1 Max 64GB 方案 |
 | catalog 增维 | 新增 `task`（chat/embed/rerank/asr/ocr/guard/decide）、`format×platform` 可用矩阵、`agent/tool_use` 能力维度、「自报 vs 实测」标记；发布前核对实际文件是否存在 | SIE、QUASAR、spark-x、needle2 |
-| 会话亲和 | 同一会话路由到同一个已加载实例，保住 prefix/KV 缓存；隐私脱敏必须确定性（同一实体用同一个占位符），否则会破坏缓存 | LIM、omniroute cache-optimized、tare |
+| 会话亲和 | 同一会话路由到同一个已加载实例，保住 prefix/KV 缓存；隐私脱敏必须确定性（同一实体用同一个占位符），否则会破坏缓存。组装 prompt 时按**全局层 → 会话层 → 易变层**排列；request-id、时间戳这类易变元数据只走 header，**不得进入前两层** | LIM、omniroute cache-optimized、Anthropic commerce-agents；"稳定占位符"这条是由 tare 的"前缀缓存对字节敏感"推导出来的（tare 原文没有直接讨论脱敏） |
 | **内置基准并存库** | tok/s、TTFT、峰值内存、并发曲线，记录均值 ± 95% CI 和测试条件，按硬件 × 量化 × 版本存档，用来校准推荐器 | llm-dock、ferrum |
 | **升级/切换流程** | 候选 → 预检 → 基线 → **计划冻结** → 维护窗口 → 实验 → Selector 判决（门槛取最严，**默认保留现状**）→ 同端口晋升 → 在线复验 → 提交或回滚；门禁包含**贪心输出逐 token 比对**和场景评测；全程产出可复算的证据包 | virtual-ai-infra-team |
 | 真模型 live 测试层 | 适配器除了 mock 黄金测试，还要有每周或手动触发的真模型一致性测试（oMLX 在场时才跑）。这是 FU-16 的长期解 | krill（日常 CI 绿、真模型测试连续 6 周失败） |
@@ -457,6 +463,39 @@ docs/15 的设计**保留并作为落地依据**。调研补充如下：
 
 每个里程碑都是**端到端可验证的纵切**，不一次建完。验收以用户视角表述，每条都配可机器验证的命令和负对照（沿用 FU-8 纪律）。
 
+### 7.0 Rust 迁移（2026-09-27 决定，与 M4 并行）
+
+> ▶️ **2026-09-27 jason 拍板**：D-R1 选 C（自建精简内核）、D-R2 用 CEL、D-R3 用 genai，恢复开发。R1 先恢复基础设施部分；运行时与路由的重设计要等 blog 全量重读完成后再做。
+> ⏸ （此前曾暂停）：R0、R1 已暂停。先按 [`Rust 基础选型`](research/Rust基础选型-2026-09-27.md) 完成开源调研和重新设计，等 jason 拍板 D-R1…D-R3 后再恢复。
+
+**原则**
+- 行为以 `conformance/` 黑盒 HTTP 套件为准，TS 与 Rust 两个实现必须同时通过。
+- Rust 版通过全部用例后，成为默认的生产实现；`packages/` 下的 TS 版保留为参考实现，不删除。
+- 契约真源仍是 JSON Schema，Rust 类型由它生成，并做 drift 检查。
+- 工程约定与 Agent24 的 Rust 工程对齐：edition 2024、禁用 unsafe、禁止 unwrap/expect、cargo-deny 禁 GPL。
+- 训练和联邦（`growth`/`federation`）不在请求路径上，暂不迁移，M7 再定。
+
+**分工**
+- Sonnet 子 agent 负责编码。
+- Codex 评审（第一档）；Codex 不可用时由 Opus 本地评审。
+- 主会话负责规划、拆解、成本控制与验收。
+
+**任务**
+
+| 任务 | 内容 | 依赖 | 并行 |
+|:---|:---|:---|:---|
+| R0 | 黑盒契约套件，锁定 TS 参考实现的行为 | — | 与 R1 并行 |
+| R1 | Cargo workspace 骨架、`idoris-contracts`（由 schema 生成）、`ModelBackend` trait、`/health`、CI | — | 与 R0 并行 |
+| R2 | 请求处理核心：头解析、策略、准入顺序、dispatch、proxy（重试、幂等）、egress guard、Served-Locality | R1 | 与 R3、R4、R5 并行 |
+| R3 | oMLX 适配器（含 FU-16 结论）、订阅中转（spawn、进程组、沙箱）、后端探测 | R1 | 同上 |
+| R4 | tenancy、预算、账单（SQLite） | R1 | 同上 |
+| R5 | catalog 与推荐器、角色解析 | R1 | 同上 |
+| R6 | 切换：Rust 版通过 conformance 全部用例，并成为默认；TS 版在文档中标为参考实现 | R0、R2–R5 | — |
+
+此后 M4 的新功能（FU-14 虚拟 key、Event Log、Admin API、Runtime Supervisor 等）**只在 Rust 版上开发**，TS 版不再跟进。
+
+**估算**：约 6–8 个 PR，墙钟时间约 1–1.5 周。v1（M4 完成）的预计时间从 1–1.5 周推迟到约 2–2.5 周。
+
 ### M4 可托付的底座（约 4–6 周）
 - 合并 `preview → main`；解决 FU-13（生产端口，`IDORIS_PORT`）、**FU-14（虚拟 key + 绑定规则）**、**FU-16（oMLX 0.6.4 端点复测）**、FU-15 落成 lint/测试护栏。
 - Runtime Supervisor：oMLX + **mlx_lm.server 保底** + **llama.cpp GGUF**，加全局内存账本和会话亲和。
@@ -529,6 +568,7 @@ docs/15 的设计**保留并作为落地依据**。调研补充如下：
 | C-5 | 能力② 只保留槽位 | M5 接入真实白名单 provider，加闸二凭证代理 | 云端强模型当「编译期老师」需要它 |
 | C-6 | 意图路由只由 Agent24 负责（D3） | 待拍板（P-2） | T2.4 已经实现了兜底，且用户这次把「意图」列为 iDoris 的能力 |
 | C-7 | 管理面没有规划 | §6 四阶段 | 本次新需求 |
+| C-8 | P-4 原定 TS | 服务端改为 Rust，TS 保留为参考实现（§7.0） | 分发（单二进制、妈妈测试、Windows）、与 Agent24 同栈、常驻进程占内存少；现在迁移成本最低 |
 
 ---
 
@@ -539,13 +579,45 @@ docs/15 的设计**保留并作为落地依据**。调研补充如下：
 | **P-1** ✅ | 轨迹采集的**出厂默认值** | **已拍板（2026-09-27）**：personal 与 tenant **默认都是 `metadata`（开，只记元数据）**；记录内容（`full`）须用户/租户管理员主动开启；训练开关一律默认关（含义见 §5.8） |
 | **P-2** ✅ | D3 与 T2.4 的冲突：iDoris 要不要做意图推断 | **已拍板（2026-09-27）**：显式 header 永远优先；判定层作为能力对外提供（`/v1/systemone`），**判定引擎可选 Jev 类模型：外部 API（TypeSafe Jev，仅限 privacy 允许出本机的请求）或本地开源实现（SemIf/LLM2Jev/Kev/AgentJev 类，`local_only` 请求只能用本地）**；自身兜底推断是 policy 开关，默认静态缺省。**附加要求**：规划确认后，按层界定与 Agent24 的分工边界和接口数据规范，经跨会话与 Agent24 多轮协商定稿（见 §12） |
 | **P-3** ✅ | 管理界面形态与 iDoris×Agent24 关系 | **已拍板（2026-09-27）**：两个独立组件 + 深度定制契约。iDoris 自带**极简控制台**（状态、应急、安全开关）；**全部管理能力以 Admin API 暴露**，完整管理页由 Agent24 提供。iDoris 不再做 Tauri 壳。详见 §6 |
-| **P-4** ✅ | 实现语言 | **已拍板**：用 TypeScript；Rust 重写以后再议 |
+| **P-4** ✅（2026-09-27 改判） | 实现语言 | **改为 Rust 生产实现**（jason 2026-09-27 拍板）。TS 版保留为参考实现，留给他人借鉴。迁移方案见 §7.0 |
 | **P-5** ✅ | llama.cpp GGUF 后端放进 M4 | **已拍板**：放进 M4。注意这**不是把模型管理框架换成 llama.cpp**——框架是 iDoris 自己的 Runtime Supervisor + `ModelBackend` 抽象，oMLX 仍是 Mac 默认后端；llama.cpp 是第二个后端，理由：① MLX 的 KV 量化会禁用连续批处理，长上下文/高并发要靠它（docs/13 §3.3 已核实）；② Windows/Linux 无 MLX；③ GGUF 生态覆盖最广 |
 | **P-6** ✅ | 训练能否离机（租 GPU） | **已拍板（2026-09-27）**：**可选离机**，但须满足两条硬条件：① 每次离机都要**用户明确确认许可**（逐次或按数据集版本授权，记入同意记录与血缘）；② **离机数据必须全部经过闸一隐私过滤**（BLOCK/REDACT 后的派生版本才可导出，二次扫描不过则拒绝）。缺任一条件 → 拒绝导出 |
 | **P-7** ✅ | 导入本机历史会话（Claude Code/Codex） | **已拍板：不导入**。iDoris 的方向不是编程场景 |
 | 沿用 | B6（动作审批 sunset 条件）、B7（跨组件 tenant 凭据）、W-1 | 不变，M8 前定 |
 
 ---
+
+## 10.1 blog 全量重读后的修订（2026-09-27）
+
+**为什么要重读**：blog MCP 的 `search_posts` 无论 `limit` 设多少，最多只返回 20 条，而且按时间倒序而不是按相关度排序。之前按关键词检索时，较早的文章被截掉了。这次改为从 RSS 取得全量 729 篇的索引，粗筛后逐篇判断相关性，相关文章全文精读：路由类 58 篇、隐私与预算类 39 篇、审计与学习类 51 篇。原文与过筛表见 [`research/blog-reread/`](research/blog-reread/)。
+
+**结论**：没有颠覆性冲突。前一轮 106 篇的结论已经被规划吸收。以下是采纳的补充，标 ★ 的已直接写进上面的不变式：
+
+| # | 修订 | 落点 | 来源 |
+|:---|:---|:---|:---|
+| B-1 ★ | 处理顺序改为 隐私 → 意图 → 预算，kill switch 作为 O(1) 例外 | 不变式 #1 | semantic-router、ClawRouter、OpenSquilla、treg、openminis |
+| B-2 ★ | 判定器不可用时默认拒绝；模拟判定必须显式声明并标注；模型给出的阈值只能收紧 | 不变式 #8、§4.4 | jev-skill、virtual-ai-infra-team |
+| B-3 ★ | 元数据与内容分离升为通用不变式 | 不变式 #15 | Agent Skills、Maka |
+| B-4 ★ | prompt 缓存三层分段，易变元数据不进前两层 | §4.3 会话亲和、R2 | Anthropic commerce-agents |
+| B-5 | 模型升级的"计划冻结"要把 harness（提示词模板、工具描述、判定 prompt）一起版本化；晋升报告要给出"是否需要调整 harness" | §4.3 升级流程 | CMU harness 论文 |
+| B-6 | 402 响应体结构化：`balance_minor`、`estimated_cost_minor`、`topup_hint` | §4.6、接口规范下一版 | treg |
+| B-7 | reserve（能否发起）与 settle（扣费）拆成两个接口，分别调用、分别测试 | §4.6 | LoopX |
+| B-8 | 断路器默认参数：OAuth 3 次、API Key 5 次、本地 2 次；恢复窗口 60s/30s/15s | §4.6 | OmniRoute |
+| B-9 | 敏感确认令牌绑定"操作 + 上下文哈希"；外部凭证按次派发，短 TTL（约 10 分钟），落盘只存哈希 | §4.2、§4.5 闸二 | openclaw-gateway、onecli、dsh-remote |
+| B-10 | "本地存储"与"本地推理/出站"是两个维度，UI 和文档必须分开表述 | §4.5、§6 | vitalik、exxperts、garmin-mcp-local、openminis |
+| B-11 | 学习层在 ① 之前插入 **⓪ 轨迹反思**：用误判轨迹改 prompt 或规则，产物是可审查的文本 diff，不改权重 | §4.8 | GEPA、learning-from-failure |
+| B-12 | RL 奖励加路径惩罚：超预算尝试、绕过隐私闸的重试、反复触碰授权边界都要扣分 | §4.8 | RLVP |
+| B-13 | 删除分两类：用户行使删除权时，硬删除并留墓碑；非合规的失效（效果差、误判、回滚）只改状态，不删证据 | §5.6 | Dense-Mem、WikiSkill |
+| B-14 | 决策账本增加 `causal_ref: [decision_id]`；可解释的判定器额外记录贡献最大的 1–3 条依据 | §4.7 | Semantica、Belief Context Graph |
+| B-15 | 策展时按来源（key/tenant）隔离候选池，批准时逐个来源确认 | §5.6 | Memory Harness |
+| B-16 | 管理面"请求详情"支持分叉：在某个决策点改判，做只读的假设性重放；审批用分阶段看板 | §6.2 | Retrace、织影 |
+| B-17 | 本地训练：数据干净比数量多更重要；多存 checkpoint，挑最佳的一个；上线前必须过 eval 门禁 | §5.8、M7 | train-character-lora-flux-mac 等 |
+| B-18 | SQLite → Postgres 的非破坏性迁移四步：起并行实例 → 复制并校验 → 短暂切换 → 原文件不再写入 | M8 | Trinity |
+| B-19 | 组合风险检测（Lethal Trifecta）归 Agent24。iDoris 只提供单请求原语（`/v1/systemone`、`/v1/inspect`） | 接口规范下一版（需与 Agent24 协商） | archestra |
+| B-20 | capabilities 预留负向路由字段 `avoid_for` | M7+ 技术债 | google/skills（67% 负向路由） |
+| B-21 | 转发到上游必须有超时（TS 参考实现目前没有，R0 套件发现） | R2、FU | R0 conformance todo |
+
+**对 blog MCP 的建议**：给 `search_posts` 加上按相关度排序和分页（offset），否则今后所有检索都会碰到同样的截断问题。
 
 ## 11. 文档治理
 

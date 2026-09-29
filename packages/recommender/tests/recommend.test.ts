@@ -1,6 +1,8 @@
+import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+import { parse } from "yaml";
 import { describe, expect, it } from "vitest";
-import { CatalogError, loadCatalog, parseCatalog, recommend } from "../src/recommend.js";
+import { CatalogError, isEligibleForRole, loadCatalog, parseCatalog, recommend } from "../src/recommend.js";
 import { makeHostFacts } from "../src/probe.js";
 
 const CATALOG_PATH = fileURLToPath(new URL("../../../config/catalog.yaml", import.meta.url));
@@ -49,6 +51,7 @@ describe("T2.1.2 catalog 加载与硬门槛", () => {
       arch: { n_layers: 1, n_kv_heads: 1, head_dim: 1 },
       quant_options: [{ label: "q4_k_m", weights_gb: 1, quality: 0.98 }],
       min_ram_gb: 8,
+      roles: [],
     };
     expect(() => parseCatalog({ version: 1, catalog: [model, model] })).toThrow(/重复/);
   });
@@ -135,5 +138,114 @@ describe("T2.1.2 IDORIS_CORE_MODEL override", () => {
     expect(rec.override).toBeNull();
     expect(rec.resident_label).toBe("ornith-1.0-9b@q6_k");
     expect(rec.warnings.some((w) => w.includes("不在目录中"))).toBe(true);
+  });
+});
+
+function minimalModel(overrides: Record<string, unknown>): Record<string, unknown> {
+  return {
+    id: "x",
+    params_total_b: 1,
+    arch: { n_layers: 1, n_kv_heads: 1, head_dim: 1 },
+    quant_options: [{ label: "q4_k_m", weights_gb: 1, quality: 0.98 }],
+    min_ram_gb: 8,
+    ...overrides,
+  };
+}
+
+describe("T4.2 角色枚举统一（core→daily，temp→load_hint）", () => {
+  it("config/catalog.yaml 数据区不再残留旧角色名 core/temp", () => {
+    const raw = parse(readFileSync(CATALOG_PATH, "utf8")) as { catalog: Array<{ roles?: string[] }> };
+    for (const model of raw.catalog) {
+      for (const role of model.roles ?? []) {
+        expect(role).not.toBe("core");
+        expect(role).not.toBe("temp");
+      }
+    }
+  });
+
+  it("旧 core 角色条目已改名为 daily，且仍参与常驻自动推荐", () => {
+    const ornith = catalog.catalog.find((m) => m.id === "ornith-1.0-9b");
+    expect(ornith?.roles).toEqual(["daily"]);
+    // 24GB 档验收基线：ornith-1.0-9b 仍被选为常驻（改名未改变行为）。
+    const rec = recommend({ hardware: m4(24), catalog });
+    expect(rec.resident?.id).toBe("ornith-1.0-9b");
+  });
+
+  it("H1：qwen2.5-vl-7b 声明 roles: [vision] + load_hint: on_demand（角色和加载策略是独立的轴）", () => {
+    const vl = catalog.catalog.find((m) => m.id === "qwen2.5-vl-7b");
+    expect(vl?.roles).toEqual(["vision"]);
+    expect(vl?.load_hint).toBe("on_demand");
+  });
+
+  it("H1：qwen2.5-coder-14b 保留 roles: []（编程不是本产品方向，P-7），load_hint: on_demand", () => {
+    const coder = catalog.catalog.find((m) => m.id === "qwen2.5-coder-14b");
+    expect(coder?.roles).toEqual([]);
+    expect(coder?.load_hint).toBe("on_demand");
+  });
+
+  it("load_hint: on_demand 条目不参与常驻自动推荐（daily 角色候选靠 roles，不靠 load_hint）", () => {
+    const rec = recommend({ hardware: m4(24), catalog });
+    expect(rec.resident?.id).not.toBe("qwen2.5-vl-7b");
+    expect(rec.resident?.id).not.toBe("qwen2.5-coder-14b");
+  });
+
+  it("未知角色显式报错，不静默忽略", () => {
+    const bad = { version: 1, catalog: [minimalModel({ roles: ["core"] })] };
+    expect(() => parseCatalog(bad)).toThrow(CatalogError);
+    expect(() => parseCatalog(bad)).toThrow(/未知角色/);
+  });
+
+  it("旧 temp 角色值同样显式报错", () => {
+    const bad = { version: 1, catalog: [minimalModel({ roles: ["temp"] })] };
+    expect(() => parseCatalog(bad)).toThrow(/未知角色/);
+  });
+
+  it("未知 load_hint 显式报错", () => {
+    const bad = { version: 1, catalog: [minimalModel({ roles: [], load_hint: "resident" })] };
+    expect(() => parseCatalog(bad)).toThrow(/load_hint/);
+  });
+
+  it("合法角色枚举（fast|daily|deep|vision|embed|rerank|decide）全部被接受", () => {
+    for (const role of ["fast", "daily", "deep", "vision", "embed", "rerank", "decide"]) {
+      const ok = { version: 1, catalog: [minimalModel({ roles: [role] })] };
+      expect(() => parseCatalog(ok)).not.toThrow();
+    }
+  });
+
+  it("M1：roles 缺失时显式报错（不再有「省略 = daily」的隐式默认）", () => {
+    const bad = { version: 1, catalog: [minimalModel({})] };
+    expect(() => parseCatalog(bad)).toThrow(CatalogError);
+    expect(() => parseCatalog(bad)).toThrow(/roles.*必填|必填.*roles/);
+  });
+
+  it("M1：roles: [] 是合法的「不参与任何角色」声明，不等同于缺失", () => {
+    const ok = { version: 1, catalog: [minimalModel({ roles: [] })] };
+    const parsed = parseCatalog(ok);
+    expect(parsed.catalog[0]?.roles).toEqual([]);
+  });
+
+  it("L3：roles 里出现重复角色值时报错", () => {
+    const bad = { version: 1, catalog: [minimalModel({ roles: ["daily", "daily"] })] };
+    expect(() => parseCatalog(bad)).toThrow(CatalogError);
+    expect(() => parseCatalog(bad)).toThrow(/重复/);
+  });
+
+  it("H2：isEligibleForRole 与常驻推荐共用同一个筛选口径——排除 experiment，min_ram_gb 可选参与过滤", () => {
+    const catalogWithExperiment = parseCatalog({
+      version: 1,
+      catalog: [
+        minimalModel({ id: "daily-normal", roles: ["daily"], min_ram_gb: 8 }),
+        minimalModel({ id: "daily-experiment", roles: ["daily"], min_ram_gb: 8, status: "experiment" }),
+        minimalModel({ id: "daily-too-big", roles: ["daily"], min_ram_gb: 64 }),
+      ],
+    });
+    expect(isEligibleForRole(catalogWithExperiment.catalog[0]!, "daily")).toBe(true);
+    expect(isEligibleForRole(catalogWithExperiment.catalog[1]!, "daily")).toBe(false);
+    // 不传 minRamGb 时不做硬件门槛过滤。
+    expect(isEligibleForRole(catalogWithExperiment.catalog[2]!, "daily")).toBe(true);
+    expect(isEligibleForRole(catalogWithExperiment.catalog[2]!, "daily", 8)).toBe(false);
+    expect(isEligibleForRole(catalogWithExperiment.catalog[2]!, "daily", 64)).toBe(true);
+    // 角色不匹配时同样为 false。
+    expect(isEligibleForRole(catalogWithExperiment.catalog[0]!, "vision")).toBe(false);
   });
 });

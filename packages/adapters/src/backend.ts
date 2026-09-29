@@ -6,8 +6,17 @@ export interface ModelInfo {
   memoryGb: number;
 }
 
-/** 压力分级，与 oMLX 的 ok/soft/hard/ceiling 同形（06 §10.3）。 */
-export type Pressure = "ok" | "soft" | "hard" | "ceiling";
+/**
+ * 压力分级，与 oMLX 的 ok/soft/hard/ceiling 同形（06 §10.3）。
+ *
+ * `"unknown"`：后端没有报告压力状态（字段缺失/后端不支持），**不等于 `"ok"`**——
+ * 一个不知道自己压力状态的后端不能被当成"压力正常"。任何消费方（router 的
+ * admission/驱逐决策等）遇到 `"unknown"` 必须按**保守方向**处理，即视同至少
+ * `"soft"`（宁可多驱逐/少接纳，不能当 `"ok"` 用）。截至本次修复，仓库内还没有
+ * 任何消费方真正读 `.pressure` 做决策（`packages/router/src/capabilities.ts`
+ * 只读 `.loaded.length`），所以这里先把类型和语义钉死，留给将来第一个消费方实现。
+ */
+export type Pressure = "ok" | "soft" | "hard" | "ceiling" | "unknown";
 
 /** 能否在不驱逐的情况下加载。 */
 export type Admission = "coexist" | "requires_eviction";
