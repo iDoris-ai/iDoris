@@ -203,11 +203,10 @@ impl RemoteChat for RemoteClient {
             .await
             .map_err(|_elapsed| UpstreamError::timeout())?
             .map_err(map_genai_error)?;
-        Ok(Box::pin(DeadlineStream {
-            inner: stream_response.stream,
+        Ok(Box::pin(DeadlineStream::new(
+            stream_response.stream,
             deadline,
-            finished: false,
-        }))
+        )))
     }
 }
 
@@ -299,22 +298,48 @@ fn event_to_chunk(event: ChatStreamEvent) -> Option<ChatChunk> {
 /// never producing a chunk this type surfaces).
 struct DeadlineStream {
     inner: ChatStream,
-    deadline: Instant,
+    /// A real timer, not just a `deadline: Instant` field checked at poll
+    /// time. **This is load-bearing, not decoration**: an `Instant`-only
+    /// check only fires when something else happens to poll this stream
+    /// again — and if `inner` goes `Pending` waiting on a slow/hung
+    /// upstream and never wakes the task again before the deadline, a
+    /// bare-`Instant` version would never get polled again either, and
+    /// would wait forever instead of timing out. Polling this `Sleep`
+    /// registers its own waker with the tokio timer, so the task gets
+    /// woken purely from the deadline elapsing, independent of `inner`.
+    sleep: Pin<Box<tokio::time::Sleep>>,
     /// Once `true`, every subsequent poll returns `Ready(None)` — a stream
     /// must not keep yielding items after it has already reported a fatal
     /// error or its own natural end.
     finished: bool,
 }
 
+impl DeadlineStream {
+    fn new(inner: ChatStream, deadline: Instant) -> Self {
+        Self {
+            inner,
+            sleep: Box::pin(tokio::time::sleep_until(tokio::time::Instant::from_std(
+                deadline,
+            ))),
+            finished: false,
+        }
+    }
+}
+
 impl Stream for DeadlineStream {
     type Item = Result<ChatChunk, UpstreamError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        use std::future::Future;
+
         if self.finished {
             return Poll::Ready(None);
         }
         loop {
-            if Instant::now() >= self.deadline {
+            // Poll the timer *every* iteration, including after a filtered
+            // event — see the field doc: this is what actually wakes the
+            // task when `inner` itself never does.
+            if self.sleep.as_mut().poll(cx).is_ready() {
                 self.finished = true;
                 return Poll::Ready(Some(Err(UpstreamError::timeout())));
             }
@@ -546,7 +571,97 @@ mod tests {
         );
     }
 
-    // `chat_stream` itself is exercised by a follow-up PR's tests, once a
-    // real streaming server double exists — see this module's `DeadlineStream`
-    // doc comment for the implementation this PR adds.
+    /// A minimal OpenAI-shaped SSE body: two content chunks then a
+    /// `finish_reason` chunk, terminated by the spec's `data: [DONE]`.
+    fn sse_body(chunks: &[&str]) -> String {
+        let mut body = String::new();
+        for chunk in chunks {
+            body.push_str(&format!(
+                "data: {{\"choices\":[{{\"delta\":{{\"content\":\"{chunk}\"}},\"finish_reason\":null}}]}}\n\n"
+            ));
+        }
+        body.push_str("data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n");
+        body.push_str("data: [DONE]\n\n");
+        body
+    }
+
+    async fn drain(mut stream: ChatChunkStream) -> Result<Vec<ChatChunk>, UpstreamError> {
+        let mut items = Vec::new();
+        loop {
+            match std::future::poll_fn(|cx| stream.as_mut().poll_next(cx)).await {
+                Some(Ok(chunk)) => items.push(chunk),
+                Some(Err(err)) => return Err(err),
+                None => return Ok(items),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn chat_stream_yields_text_chunks_then_a_done_marker() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(sse_body(&["Hello", " world"]), "text/event-stream"),
+            )
+            .mount(&server)
+            .await;
+        let client = client_for(&server, Arc::new(FixedKey("k")));
+        let stream = client
+            .chat_stream(request(), far_future_deadline())
+            .await
+            .expect("stream setup must succeed");
+        let chunks = drain(stream).await.expect("stream must not error");
+        let text: String = chunks.iter().map(|c| c.delta.as_str()).collect();
+        assert_eq!(text, "Hello world");
+        assert!(chunks.last().expect("at least one chunk").done);
+    }
+
+    #[tokio::test]
+    async fn chat_stream_fails_fast_on_an_already_passed_deadline_without_calling_out() {
+        let server = MockServer::start().await;
+        let client = client_for(&server, Arc::new(FixedKey("k")));
+        let past = Instant::now() - Duration::from_secs(1);
+        client
+            .chat_stream(request(), past)
+            .await
+            .map(|_stream| ())
+            .expect_err("must time out immediately");
+        assert!(
+            server
+                .received_requests()
+                .await
+                .expect("recording enabled")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_stream_reports_timeout_when_the_server_never_responds_in_time() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(sse_body(&["late"]), "text/event-stream")
+                    .set_delay(Duration::from_secs(5)),
+            )
+            .mount(&server)
+            .await;
+        let client = client_for(&server, Arc::new(FixedKey("k")));
+        let deadline = Instant::now() + Duration::from_millis(50);
+        let outcome = tokio::time::timeout(Duration::from_secs(2), async {
+            match client.chat_stream(request(), deadline).await {
+                Err(err) => Err(err),
+                Ok(stream) => drain(stream).await,
+            }
+        })
+        .await
+        .expect("the test itself must not hang");
+        let err = outcome.expect_err("must report timeout, not hang for the full 5s delay");
+        assert_eq!(err.reason_code(), "timeout");
+    }
 }
