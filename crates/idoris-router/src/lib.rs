@@ -184,9 +184,9 @@ pub fn build_app(state: AppState) -> Router {
         .route("/health", get(health))
         .route(
             "/v1/chat/completions",
-            post(chat_completions).fallback(not_implemented),
+            post(chat_completions).fallback(not_found),
         )
-        .fallback(not_implemented)
+        .fallback(not_found)
         .with_state(Arc::new(state))
         .layer(middleware::from_fn(record_id_middleware))
 }
@@ -202,20 +202,22 @@ async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     })
 }
 
-/// Every not-yet-implemented route (i.e. everything but `/health` in this
-/// skeleton) answers `501` with the unified error envelope from the
-/// interface spec §3.11 (`{error: {type, rule_id, reason_code, evidence,
-/// remediation}}`). `not_implemented` isn't one of the spec's own `type`
-/// values (`local_only_unavailable`, `budget_exceeded`, ...) — those describe
-/// runtime routing/policy outcomes, whereas this route genuinely doesn't
-/// exist yet in the Rust build. Same envelope shape, a type value scoped to
-/// this skeleton.
-async fn not_implemented() -> impl IntoResponse {
-    error_envelope(
-        StatusCode::NOT_IMPLEMENTED,
-        "not_implemented",
-        "This route is not implemented yet in the Rust skeleton (R1); packages/router (TS) is the reference implementation.",
+/// Every unmatched route/method combination (interface spec's routes are
+/// exhaustively wired below; there is no separate "known but not
+/// implemented yet" tier). Mirrors `packages/router/src/server.ts`'s own
+/// catch-all exactly: `json(res, 404, { error: { type: "not_found" } })` —
+/// plain `404`, no `rule_id`/`reason_code`/`evidence`/`remediation` fields
+/// (`conformance/tests/response-headers.test.ts` locks `404` for an unknown
+/// path). This used to be a Rust-only `501 not_implemented` placeholder for
+/// routes the R1 skeleton hadn't ported yet; every route the TS reference
+/// actually has is now wired (R2-G), so the only thing left to fall through
+/// to this handler is genuinely "no such route", same as TS.
+async fn not_found() -> impl IntoResponse {
+    (
+        StatusCode::NOT_FOUND,
+        Json(json!({ "error": { "type": "not_found" } })),
     )
+        .into_response()
 }
 
 /// The unified error envelope from the interface spec §3.11:
@@ -634,26 +636,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unimplemented_routes_return_501_with_the_unified_envelope() {
-        // `/v1/chat/completions` is now a real route (profile parsing —
-        // see the `chat_completions_*` tests below); `/v1/models` is still
-        // genuinely unimplemented and exercises the `fallback` path.
+    async fn unknown_routes_return_404_not_found() {
+        // Matches `packages/router/src/server.ts`'s own catch-all exactly
+        // (`conformance/tests/response-headers.test.ts` locks 404 for an
+        // unknown path); `/v1/models` has its own real-route tests
+        // elsewhere and is no longer a stand-in for "genuinely unimplemented".
         let app = build_app(AppState::default());
         let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/v1/models")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(Request::builder().uri("/nope").body(Body::empty()).unwrap())
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
         assert!(response.headers().contains_key(HEADER_RECORD_ID));
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(json["error"]["type"], "not_implemented");
-        assert_eq!(json["error"]["reason_code"], "not_implemented");
+        assert_eq!(json["error"]["type"], "not_found");
     }
 
     fn post_chat(body: &'static str, headers: &[(&str, &str)]) -> Request<Body> {
@@ -982,12 +979,12 @@ mod tests {
     }
 
     /// Regression: axum's default behavior for a matched path with the
-    /// wrong method is a bare 405 with no body and no unified envelope —
-    /// that would violate "every response uses the §3.11 envelope"
-    /// (`build_app` wires `.fallback(not_implemented)` onto this specific
-    /// route to override that default, see below). Locking status *and*
-    /// envelope shape here catches a regression to axum's default if that
-    /// wiring is ever accidentally dropped.
+    /// wrong method is a bare 405 with no body and no envelope at all —
+    /// `build_app` wires `.fallback(not_found)` onto this specific route to
+    /// override that default, matching `server.ts`'s own behavior exactly
+    /// (its sequential `if` checks never match `GET /v1/chat/completions`
+    /// either, so it falls through to the same 404 catch-all a genuinely
+    /// unknown path gets — TS has no separate "405 wrong method" case).
     #[tokio::test]
     async fn wrong_method_on_chat_completions_still_uses_the_unified_envelope() {
         let app = build_app(AppState::default());
@@ -1001,10 +998,10 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
         assert!(response.headers().contains_key(HEADER_RECORD_ID));
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(json["error"]["type"], "not_implemented");
+        assert_eq!(json["error"]["type"], "not_found");
     }
 }
