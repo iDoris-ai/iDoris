@@ -11,10 +11,6 @@
 //! leniency there: a missing `data` field is treated as an empty catalog,
 //! not an error — that field genuinely comes back absent on some oMLX
 //! configurations and isn't itself a parse failure.
-//!
-//! `#![allow(dead_code)]`: wired into `OmlxAdapter::list`/`status` in a
-//! follow-up PR; exercised directly by this module's own tests until then.
-#![allow(dead_code)]
 
 use idoris_backend::{BackendError, BackendStatus, ModelInfo, Pressure};
 

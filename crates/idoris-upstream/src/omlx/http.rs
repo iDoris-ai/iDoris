@@ -1,15 +1,11 @@
 //! Low-level HTTP plumbing for the oMLX adapter: every request goes through
-//! [`get_json`], which applies a per-call timeout and turns a failure into
-//! a [`BackendError`] that never carries the response body or API key —
-//! every error here is built from method/path/status only, never by
-//! formatting the response body or the underlying `reqwest::Error`
-//! (mirroring `RuntimeAdapter::probe_ready`'s "apply your own timeout"
-//! doc, and H1/H2 from the TS reference: no payload in errors/logs).
-//!
-//! `#![allow(dead_code)]`: the `OmlxAdapter` struct that wires `get_json`
-//! into `list`/`status` lands in a follow-up PR; exercised directly by
-//! this module's own tests until then — remove once `mod.rs` calls it.
-#![allow(dead_code)]
+//! [`get_json`]/[`post_empty`]/[`put_json`]/[`post_and_parse`], each of
+//! which applies a per-call timeout and turns a failure into a [`BackendError`] that never
+//! carries the response body or API key — every error here is built from
+//! method/path/status only, never by formatting the response body or the
+//! underlying `reqwest::Error` (mirroring `RuntimeAdapter::probe_ready`'s
+//! "apply your own timeout" doc, and H1/H2 from the TS reference: no
+//! payload in errors/logs).
 
 use std::time::Duration;
 
@@ -73,9 +69,76 @@ pub(super) async fn get_json(
     send_and_parse("GET", path, req, call_timeout).await
 }
 
-// `post_empty`/`put_json` (load/unload/pin) land in a follow-up PR, each
-// with its own `tokio::time::timeout` sized to what it actually awaits
-// (see `send_and_parse`'s doc: must cover body reads, not just `send()`).
+/// `POST path` with no body, discarding the response body — used for the
+/// oMLX load/unload endpoints, which return no payload this adapter reads.
+/// A send()-only timeout is correct here (unlike [`send_and_parse`]):
+/// nothing reads the body afterward, so there is no unbounded read left
+/// unguarded once `send()` resolves.
+pub(super) async fn post_empty(
+    client: &reqwest::Client,
+    base_url: &str,
+    path: &str,
+    api_key: Option<&str>,
+    call_timeout: Duration,
+) -> Result<(), BackendError> {
+    let url = format!("{base_url}{path}");
+    let req = auth_header(client.post(&url), api_key);
+    send_and_discard("POST", path, req, call_timeout).await
+}
+
+/// `PUT path` with a JSON body, discarding the response body. See
+/// [`post_empty`]'s doc on why a send()-only timeout is correct here too.
+pub(super) async fn put_json(
+    client: &reqwest::Client,
+    base_url: &str,
+    path: &str,
+    api_key: Option<&str>,
+    call_timeout: Duration,
+    body: &serde_json::Value,
+) -> Result<(), BackendError> {
+    let url = format!("{base_url}{path}");
+    let req = auth_header(client.put(&url), api_key).json(body);
+    send_and_discard("PUT", path, req, call_timeout).await
+}
+
+/// `POST path` with a JSON body, parsed as JSON — used for `/v1/chat/
+/// completions`. Unlike [`post_empty`]/[`put_json`], the response body
+/// *is* read, so this goes through [`send_and_parse`] (full-round-trip
+/// timeout), not `send_and_discard`.
+pub(super) async fn post_and_parse(
+    client: &reqwest::Client,
+    base_url: &str,
+    path: &str,
+    api_key: Option<&str>,
+    call_timeout: Duration,
+    body: &serde_json::Value,
+) -> Result<serde_json::Value, BackendError> {
+    let url = format!("{base_url}{path}");
+    let req = auth_header(client.post(&url), api_key).json(body);
+    send_and_parse("POST", path, req, call_timeout).await
+}
+
+async fn send_and_discard(
+    method: &'static str,
+    path: &str,
+    req: reqwest::RequestBuilder,
+    call_timeout: Duration,
+) -> Result<(), BackendError> {
+    let attempt = async {
+        let resp = req
+            .send()
+            .await
+            .map_err(|err| transport_error(method, path, &err))?;
+        check_status(method, path, &resp)
+    };
+    tokio::time::timeout(call_timeout, attempt)
+        .await
+        .unwrap_or_else(|_elapsed| {
+            Err(upstream_error(format!(
+                "oMLX {method} {path} timed out after {call_timeout:?}"
+            )))
+        })
+}
 
 fn check_status(
     method: &'static str,
@@ -225,6 +288,66 @@ mod tests {
                 .expect_err("must fail, not panic or silently succeed");
             assert!(err.to_string().contains(want));
         }
+    }
+
+    async fn mock_method(m: &'static str, path_str: &str, resp: ResponseTemplate) -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(http_method(m))
+            .and(http_path(path_str))
+            .respond_with(resp)
+            .mount(&server)
+            .await;
+        server
+    }
+
+    #[tokio::test]
+    async fn post_empty_and_put_json_succeed_and_fail_closed_on_4xx() {
+        let server = mock_method("POST", "/load", ResponseTemplate::new(200)).await;
+        let client = reqwest::Client::new();
+        post_empty(
+            &client,
+            &server.uri(),
+            "/load",
+            None,
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("POST 200 must succeed");
+
+        let server = mock_method("PUT", "/pin", ResponseTemplate::new(401)).await;
+        let err = put_json(
+            &client,
+            &server.uri(),
+            "/pin",
+            Some("do-not-leak-this-key"),
+            Duration::from_secs(1),
+            &serde_json::json!({"is_pinned": true}),
+        )
+        .await
+        .expect_err("PUT 401 must fail");
+        let msg = err.to_string();
+        assert!(msg.contains("401") && !msg.contains("do-not-leak-this-key"));
+    }
+
+    #[tokio::test]
+    async fn send_and_discard_times_out_instead_of_hanging() {
+        let server = mock_method(
+            "POST",
+            "/slow",
+            ResponseTemplate::new(200).set_delay(Duration::from_secs(5)),
+        )
+        .await;
+        let client = reqwest::Client::new();
+        let err = post_empty(
+            &client,
+            &server.uri(),
+            "/slow",
+            None,
+            Duration::from_millis(50),
+        )
+        .await
+        .expect_err("must time out, not hang");
+        assert!(err.to_string().contains("timed out"));
     }
 
     #[tokio::test]
