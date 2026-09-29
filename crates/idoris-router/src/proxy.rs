@@ -317,6 +317,73 @@ impl ChatProxy {
             }
         }
     }
+
+    /// Streaming variant of [`Self::forward_buffered`]. **Never retries**
+    /// (mirrors `proxy.ts`'s own `!opts.stream` guard on its retry branch —
+    /// once a streaming request has started, retrying would duplicate
+    /// tokens the client already received) and never touches the
+    /// idempotency cache (a streamed response is not a replay candidate).
+    /// A non-2xx initial response is returned **buffered**, not streamed —
+    /// this matches `proxy.ts` exactly: its `if (!res.ok) { ... return
+    /// {status, text, stream: null, ...} }` block runs unconditionally on
+    /// `opts.stream` (only the *retry* sub-branch inside it is gated on
+    /// `!opts.stream`), so a streaming request whose upstream call fails
+    /// outright still gets a plain JSON/text error body, never an SSE
+    /// stream carrying an error.
+    pub async fn forward_stream(&self, endpoint: &str, body: &Value) -> StreamOutcome {
+        let url = format!("{}/v1/chat/completions", endpoint.trim_end_matches('/'));
+        let mut payload = body.clone();
+        if let Some(obj) = payload.as_object_mut() {
+            obj.insert("stream".to_string(), Value::Bool(true));
+        }
+        match self.client.post(&url).json(&payload).send().await {
+            Ok(resp) => {
+                let status = resp.status().as_u16();
+                let content_type = resp
+                    .headers()
+                    .get(reqwest::header::CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_string);
+                if (200..300).contains(&status) {
+                    StreamOutcome::Stream {
+                        status,
+                        content_type,
+                        response: resp,
+                    }
+                } else {
+                    let body = resp.bytes().await.unwrap_or_default();
+                    StreamOutcome::Buffered {
+                        status,
+                        body,
+                        content_type,
+                    }
+                }
+            }
+            Err(_err) => StreamOutcome::Buffered {
+                status: 502,
+                body: Bytes::from_static(br#"{"error":{"type":"upstream_unavailable"}}"#),
+                content_type: Some("application/json".to_string()),
+            },
+        }
+    }
+}
+
+/// [`ChatProxy::forward_stream`]'s result: either the initial response
+/// wasn't ok (returned buffered, see that method's doc) or it was, in which
+/// case the caller streams `response`'s body onward incrementally (never
+/// buffering it — see `lib.rs`'s `chat_via_proxy` for the explicit-error-
+/// on-truncation / cancel-on-drop pass-through).
+pub enum StreamOutcome {
+    Buffered {
+        status: u16,
+        body: Bytes,
+        content_type: Option<String>,
+    },
+    Stream {
+        status: u16,
+        content_type: Option<String>,
+        response: reqwest::Response,
+    },
 }
 
 #[cfg(test)]
@@ -546,6 +613,66 @@ mod tests {
         assert_eq!(out.status, 502);
         let body: Value = serde_json::from_slice(&out.body).unwrap();
         assert_eq!(body["error"]["type"], "upstream_unavailable");
+    }
+
+    #[tokio::test]
+    async fn forward_stream_returns_the_stream_variant_on_a_2xx_response() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/v1/chat/completions"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw("data: hi\n\n", "text/event-stream"),
+            )
+            .mount(&server)
+            .await;
+        let proxy = ChatProxy::new(reqwest::Client::new());
+        match proxy.forward_stream(&server.uri(), &chat_body()).await {
+            StreamOutcome::Stream {
+                status,
+                content_type,
+                ..
+            } => {
+                assert_eq!(status, 200);
+                assert_eq!(content_type.as_deref(), Some("text/event-stream"));
+            }
+            StreamOutcome::Buffered { .. } => {
+                panic!("expected a Stream outcome for a 2xx response")
+            }
+        }
+    }
+
+    /// Conformance parity (`streaming.test.ts`'s negative control): a
+    /// streaming request whose upstream call fails outright must NOT retry
+    /// and must come back buffered, not as a stream.
+    #[tokio::test]
+    async fn forward_stream_never_retries_and_is_buffered_on_a_5xx_response() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/v1/chat/completions"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(502)
+                    .set_body_json(serde_json::json!({"error": "upstream-down"})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let proxy = ChatProxy::new(reqwest::Client::new());
+        match proxy.forward_stream(&server.uri(), &chat_body()).await {
+            StreamOutcome::Buffered {
+                status,
+                body,
+                content_type,
+            } => {
+                assert_eq!(status, 502);
+                assert_eq!(content_type.as_deref(), Some("application/json"));
+                let json: Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(json["error"], "upstream-down");
+            }
+            StreamOutcome::Stream { .. } => panic!("a non-2xx response must not be streamed"),
+        }
+        server.verify().await;
     }
 
     #[test]

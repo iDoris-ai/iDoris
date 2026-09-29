@@ -568,6 +568,92 @@ async fn chat_via_proxy(
     body_value: &serde_json::Value,
     record_id: &str,
 ) -> Response {
+    let stream_requested = body_value
+        .get("stream")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    if stream_requested {
+        return chat_via_proxy_stream(state, selected, body_value).await;
+    }
+    chat_via_proxy_buffered(state, selected, headers, parsed, body_value, record_id).await
+}
+
+/// The streaming half of [`chat_via_proxy`]. Never touches the idempotency
+/// cache or `X-iDoris-Cached`/`X-iDoris-Origin-Record-Id` — matches
+/// `proxy.ts`: a streamed response is never a cache candidate.
+async fn chat_via_proxy_stream(
+    state: &AppState,
+    selected: &Selected,
+    body_value: &serde_json::Value,
+) -> Response {
+    match state
+        .proxy
+        .forward_stream(&selected.card.endpoint, body_value)
+        .await
+    {
+        proxy::StreamOutcome::Buffered {
+            status,
+            body,
+            content_type,
+        } => {
+            let status = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
+            let mut response = (status, body).into_response();
+            let content_type = content_type.as_deref().unwrap_or("application/json");
+            if let Ok(v) = HeaderValue::from_str(content_type) {
+                response
+                    .headers_mut()
+                    .insert(axum::http::header::CONTENT_TYPE, v);
+            }
+            if let Ok(v) = HeaderValue::from_str(locality_str(selected.served_locality)) {
+                response.headers_mut().insert(HEADER_SERVED_LOCALITY, v);
+            }
+            response
+        }
+        proxy::StreamOutcome::Stream {
+            status,
+            content_type,
+            response: upstream,
+        } => {
+            let status = StatusCode::from_u16(status).unwrap_or(StatusCode::OK);
+            // Genuine incremental pass-through (never buffered), which gets
+            // both R2-G streaming requirements "for free" via Rust's
+            // ownership model -- no TS-style req.on("close") needed (same
+            // pattern as dispatch.rs's CancelOnDrop): reqwest surfaces an
+            // upstream connection dropping mid-body as an `Err` item, not a
+            // silent `None`, so `Body::from_stream` makes hyper abort *our*
+            // client's connection too (explicit error, never a disguised
+            // normal end); and when our client disconnects, axum drops this
+            // stream, which drops `upstream` (owns the real connection),
+            // which reqwest/hyper tears down -- genuinely cancelled.
+            let body = Body::from_stream(upstream.bytes_stream());
+            let mut response = Response::builder()
+                .status(status)
+                .body(body)
+                .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+            let content_type = content_type.as_deref().unwrap_or("text/event-stream");
+            if let Ok(v) = HeaderValue::from_str(content_type) {
+                response
+                    .headers_mut()
+                    .insert(axum::http::header::CONTENT_TYPE, v);
+            }
+            if let Ok(v) = HeaderValue::from_str(locality_str(selected.served_locality)) {
+                response.headers_mut().insert(HEADER_SERVED_LOCALITY, v);
+            }
+            response
+        }
+    }
+}
+
+/// The non-streaming half of [`chat_via_proxy`] (this PR's predecessor —
+/// idempotency cache read/write, `X-iDoris-Cached`/`X-iDoris-Origin-Record-Id`).
+async fn chat_via_proxy_buffered(
+    state: &AppState,
+    selected: &Selected,
+    headers: &HeaderMap,
+    parsed: &ParsedProfile,
+    body_value: &serde_json::Value,
+    record_id: &str,
+) -> Response {
     let request_id = headers.get(HEADER_REQUEST_ID).and_then(|v| v.to_str().ok());
     let privacy = parsed.task.privacy.unwrap_or(PrivacyClass::LocalOnly);
     let opts = proxy::ForwardOpts {
@@ -1223,5 +1309,86 @@ mod tests {
             first_record_id
         );
         server.verify().await;
+    }
+
+    /// Conformance parity (`streaming.test.ts`'s negative control): a
+    /// `stream: true` request whose upstream call returns a 5xx must not
+    /// retry and must come back as a plain JSON error, not an SSE stream.
+    #[tokio::test]
+    async fn resident_http_service_streaming_5xx_is_buffered_json_not_sse() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/v1/chat/completions"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(502)
+                    .set_body_json(serde_json::json!({"error": "upstream-down"})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let state = AppState {
+            cards: vec![resident_component_card("omlx", &server.uri())],
+            ..AppState::default()
+        };
+        let app = build_app(state);
+        let response = app
+            .oneshot(post_chat(
+                r#"{"model":"idoris/daily","stream":true,"messages":[{"role":"user","content":"hi"}]}"#,
+                &[],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .unwrap(),
+            "application/json"
+        );
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["error"], "upstream-down");
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn resident_http_service_streaming_2xx_passes_sse_bytes_through() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/v1/chat/completions"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw("data: hel\n\ndata: [DONE]\n\n", "text/event-stream"),
+            )
+            .mount(&server)
+            .await;
+        let state = AppState {
+            cards: vec![resident_component_card("omlx", &server.uri())],
+            ..AppState::default()
+        };
+        let app = build_app(state);
+        let response = app
+            .oneshot(post_chat(
+                r#"{"model":"idoris/daily","stream":true,"messages":[{"role":"user","content":"hi"}]}"#,
+                &[],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            response
+                .headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .contains("text/event-stream")
+        );
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(text.contains("hel"));
+        assert!(text.contains("[DONE]"));
     }
 }
