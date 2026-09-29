@@ -29,6 +29,13 @@ pub mod budget;
 /// card's own model listing.
 pub mod models;
 
+/// Direct HTTP forwarding for a generic `http_service` component card's
+/// `POST /v1/chat/completions` (R2-G) — retries, idempotency cache; not yet
+/// wired into `chat_completions`/`AppState`, a follow-up PR does that (see
+/// the module's own doc for why this is a genuinely separate path from
+/// `dispatch::dispatch_local`).
+pub mod proxy;
+
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
