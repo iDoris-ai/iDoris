@@ -62,4 +62,12 @@ describe("已知的规范 vs TS 现状落差（it.todo，不改实现）", () =>
       "/v1/inspect、/v1/feedback、/v1/trajectories、GET /admin/api/v1/* 均未实现（分别排到 M4/M5/M6/M8）；" +
       "packages/router/src/server.ts 目前只有 /health、/v1/models、/capabilities、/v1/chat/completions 四个端点。",
   );
+
+  it.todo(
+    "TS dispatch 不按 X-iDoris-Capabilities 过滤候选（规范要求按能力匹配，Rust 已实现）：" +
+      "packages/router/src/dispatch.ts 选候选只看 tier/privacy_class/allowed_egress，完全不看请求的 " +
+      "profile.capabilities 与组件卡的 provider.capabilities 是否匹配——声明了卡不具备的能力（例如卡只有 " +
+      "[chat, coding]，请求要 vision）依然会正常路由到这张卡，不会 503。对应的负对照见 " +
+      "conformance/tests/core.test.ts 里那条同名 it.todo（仅 Rust 实现满足）。",
+  );
 });

@@ -17,7 +17,12 @@ const postChat = (headers: Record<string, string> = {}, body?: string) =>
 
 beforeAll(async () => {
   upstream = await startFakeUpstream();
-  const componentsDir = makeComponentsDir([localComponent(upstream.url)]);
+  // capabilities 补上 coding：不是为了测能力匹配（TS dispatch 目前根本不按
+  // X-iDoris-Capabilities 过滤候选，见 known-spec-conflicts.test.ts），而是让
+  // 下面"合法值均放行"那条用例真正只测 header 解析这一件事——请求声明
+  // `Capabilities: chat,coding`，卡上就该有这两项，不然按规范应该实现的
+  // 能力匹配（Rust 已实现）会把这条测成 503，跟"header 解析对不对"没关系。
+  const componentsDir = makeComponentsDir([localComponent(upstream.url, { capabilities: ["chat", "coding"] })]);
   server = await spawnConformanceServer({ componentsDir, routingPolicyPath: routingPolicyFixturePath });
 });
 
@@ -146,6 +151,17 @@ describe("控制面 header 解析（非法值处理，以现有 TS 行为为准�
     });
     expect(res.status).toBe(200);
   });
+
+  // 负对照（仅 Rust 实现满足，见 known-spec-conflicts.test.ts 对应条目）：
+  // X-iDoris-Capabilities 声明了这张卡不具备的能力（本文件的 fixture 只有
+  // [chat, coding]，这里声明 vision）时，按规范应该按能力过滤候选、无候选
+  // 就 503；TS dispatch 目前完全不按 X-iDoris-Capabilities 过滤，会照样 200。
+  it.todo(
+    "负对照（仅 Rust 实现满足）：X-iDoris-Capabilities 声明了组件卡不具备的能力" +
+      "（本文件 fixture 只有 [chat, coding]，例如声明 vision）=> 503" +
+      "（no_candidate 或 local_only_unavailable，取决于隐私档位）；" +
+      "TS dispatch 目前不按能力过滤候选，会返回 200。",
+  );
 
   it("X-iDoris-Intent 接受任意非空字符串（不做枚举校验，正控）", async () => {
     upstream.queueChat({ kind: "json", status: 200, body: { choices: [{ message: { content: "hi" } }] } });
