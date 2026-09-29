@@ -452,6 +452,16 @@ async fn chat_completions(
         .collect::<Vec<_>>()
         .join("\n");
 
+    // R0 finding: TS's cancellation propagation (server.ts's req.on("close"))
+    // never actually fires -- by the time it's attached, the request body
+    // (and with it, that stream's own "close") has already completed. This
+    // token has no client-disconnect signal wired to it from axum/hyper
+    // yet either, but dispatch_local's own drop-based guards (see its doc)
+    // still correctly release a budget reservation and propagate
+    // cancellation into the Supervisor call if *this handler's own future*
+    // is dropped mid-request (e.g. a future connection-level timeout or
+    // abort layered on top) -- genuinely different from, and strictly
+    // better than, a listener that structurally can never fire.
     let budget_ledger = state.budget_ledger.as_deref();
     match dispatch_local(
         &state.cards,
@@ -460,6 +470,7 @@ async fn chat_completions(
         &parsed,
         &prompt,
         messages,
+        tokio_util::sync::CancellationToken::new(),
     )
     .await
     {
