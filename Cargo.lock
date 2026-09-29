@@ -1152,6 +1152,8 @@ dependencies = [
  "idoris-contracts",
  "idoris-policy",
  "idoris-tenancy",
+ "idoris-upstream",
+ "indexmap 2.14.2",
  "reqwest",
  "serde",
  "serde_json",
