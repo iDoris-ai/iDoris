@@ -30,10 +30,9 @@ pub mod budget;
 pub mod models;
 
 /// Direct HTTP forwarding for a generic `http_service` component card's
-/// `POST /v1/chat/completions` (R2-G) — retries, idempotency cache; not yet
-/// wired into `chat_completions`/`AppState`, a follow-up PR does that (see
-/// the module's own doc for why this is a genuinely separate path from
-/// `dispatch::dispatch_local`).
+/// `POST /v1/chat/completions` (R2-G) — retries, idempotency cache; wired
+/// into `chat_completions`/`AppState` below (see the module's own doc for
+/// why this is a genuinely separate path from `dispatch::dispatch_local`).
 pub mod proxy;
 
 use std::net::IpAddr;
@@ -41,26 +40,30 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::body::{Body, Bytes};
-use axum::extract::{Request, State};
+use axum::extract::{Extension, Request, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use idoris_backend::{BackendError, ChatMessage};
+use idoris_contracts::common::PrivacyClass;
 use idoris_policy::Rejection;
 use idoris_tenancy::budget::{BUDGET_EXCEEDED_REASON_CODE, BudgetError};
 use serde::Serialize;
 use serde_json::json;
 use uuid::Uuid;
 
-use dispatch::{DispatchError, DispatchFailure, dispatch_local, reason_header_value};
-use profile::{ProfileError, parse_profile};
+use dispatch::{DispatchError, DispatchFailure, Selected, dispatch_local, reason_header_value};
+use profile::{ParsedProfile, ProfileError, parse_profile};
 
 const HEADER_SERVED_LOCALITY: &str = "X-iDoris-Served-Locality";
 const HEADER_REASON: &str = "X-iDoris-Reason";
 const HEADER_DEGRADED: &str = "X-iDoris-Degraded";
 const HEADER_COST_MINOR: &str = "X-iDoris-Cost-Minor";
+const HEADER_REQUEST_ID: &str = "x-idoris-request-id";
+const HEADER_CACHED: &str = "X-iDoris-Cached";
+const HEADER_ORIGIN_RECORD_ID: &str = "X-iDoris-Origin-Record-Id";
 
 /// Production default port (T4.1/FU-13, PR #46): `IDORIS_PORT` unset/blank
 /// falls back to this. `8765`/`8796`/`8088`/`11434` were all already taken by
@@ -162,6 +165,11 @@ pub struct AppState {
     /// matching `reqwest::Client`'s own documented cloning contract (cheap,
     /// `Arc`-backed clone, not a new connection pool per clone).
     pub http_client: reqwest::Client,
+    /// R2-G: direct-forward path for a `LoadMode::Resident` `http_service`
+    /// candidate (see `dispatch::select`/`is_resident_http_service`'s doc).
+    /// `Arc` because `ChatProxy` holds a `Mutex`-guarded cache, same reason
+    /// `budget_ledger` above is `Arc`-wrapped rather than `Clone`.
+    pub proxy: Arc<proxy::ChatProxy>,
 }
 
 impl std::fmt::Debug for AppState {
@@ -176,6 +184,7 @@ impl std::fmt::Debug for AppState {
                 &self.budget_ledger.as_ref().map(|_| "BudgetLedger { .. }"),
             )
             .field("http_client", &self.http_client)
+            .field("proxy", &"ChatProxy { .. }")
             .finish()
     }
 }
@@ -191,6 +200,7 @@ impl Default for AppState {
             supervisor: None,
             budget_ledger: None,
             http_client: reqwest::Client::new(),
+            proxy: Arc::new(proxy::ChatProxy::new(reqwest::Client::new())),
         }
     }
 }
@@ -444,11 +454,14 @@ fn rejection_response(rejection: Rejection) -> Response {
 /// `POST /v1/chat/completions`. Order (locked by conformance): non-JSON
 /// body -> `invalid_json`; valid JSON that isn't an object -> `invalid_body`;
 /// only then are control-plane headers parsed (see [`profile::parse_profile`]),
-/// followed by the local decision + execution path
-/// ([`dispatch::dispatch_local`]).
+/// followed by [`dispatch::select`] to choose between the two
+/// request-execution paths: a `LoadMode::Resident` `http_service` candidate
+/// forwards directly ([`chat_via_proxy`]); everything else goes through the
+/// local decision + execution path ([`dispatch::dispatch_local`]).
 async fn chat_completions(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    Extension(RequestRecordId(record_id)): Extension<RequestRecordId>,
     body: Bytes,
 ) -> Response {
     let value: serde_json::Value = match serde_json::from_slice(&body) {
@@ -481,6 +494,18 @@ async fn chat_completions(
         .map(|m| m.content.as_str())
         .collect::<Vec<_>>()
         .join("\n");
+
+    // R2-G: a Resident-mode http_service candidate (a generic
+    // OpenAI-compatible backend, including a conformance fixture pointing
+    // at a fake upstream) is forwarded directly -- never through the
+    // Supervisor, which only makes sense for a real oMLX-shaped backend
+    // with an explicit load/unload lifecycle. See dispatch::select's doc
+    // for the accepted double-decide() tradeoff this branch makes.
+    if let Ok(selected) = dispatch::select(&state.cards, &parsed, &prompt)
+        && dispatch::is_resident_http_service(&selected.card)
+    {
+        return chat_via_proxy(&state, &selected, &headers, &parsed, &value, &record_id).await;
+    }
 
     // R0 finding: TS's cancellation propagation (server.ts's req.on("close"))
     // never actually fires -- by the time it's attached, the request body
@@ -528,11 +553,172 @@ async fn chat_completions(
     }
 }
 
+/// The R2-G direct-forward path: `selected.card` is a `LoadMode::Resident`
+/// `http_service` candidate (see `dispatch::select`/`is_resident_http_service`),
+/// so the request goes straight to `proxy::ChatProxy` instead of the
+/// Supervisor. The upstream response is forwarded byte-for-byte (status +
+/// body + its own `content-type`) — **never** re-wrapped into
+/// [`openai_chat_completion`]'s shape, matching `proxy.ts`'s own behavior:
+/// a transparent proxy, not a backend `RuntimeAdapter` call.
+async fn chat_via_proxy(
+    state: &AppState,
+    selected: &Selected,
+    headers: &HeaderMap,
+    parsed: &ParsedProfile,
+    body_value: &serde_json::Value,
+    record_id: &str,
+) -> Response {
+    let stream_requested = body_value
+        .get("stream")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    if stream_requested {
+        return chat_via_proxy_stream(state, selected, body_value).await;
+    }
+    chat_via_proxy_buffered(state, selected, headers, parsed, body_value, record_id).await
+}
+
+/// The streaming half of [`chat_via_proxy`]. Never touches the idempotency
+/// cache or `X-iDoris-Cached`/`X-iDoris-Origin-Record-Id` — matches
+/// `proxy.ts`: a streamed response is never a cache candidate.
+async fn chat_via_proxy_stream(
+    state: &AppState,
+    selected: &Selected,
+    body_value: &serde_json::Value,
+) -> Response {
+    match state
+        .proxy
+        .forward_stream(&selected.card.endpoint, body_value)
+        .await
+    {
+        proxy::StreamOutcome::Buffered {
+            status,
+            body,
+            content_type,
+        } => {
+            let status = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
+            let mut response = (status, body).into_response();
+            let content_type = content_type.as_deref().unwrap_or("application/json");
+            if let Ok(v) = HeaderValue::from_str(content_type) {
+                response
+                    .headers_mut()
+                    .insert(axum::http::header::CONTENT_TYPE, v);
+            }
+            if let Ok(v) = HeaderValue::from_str(locality_str(selected.served_locality)) {
+                response.headers_mut().insert(HEADER_SERVED_LOCALITY, v);
+            }
+            response
+        }
+        proxy::StreamOutcome::Stream {
+            status,
+            content_type,
+            response: upstream,
+        } => {
+            let status = StatusCode::from_u16(status).unwrap_or(StatusCode::OK);
+            // Genuine incremental pass-through (never buffered), which gets
+            // both R2-G streaming requirements "for free" via Rust's
+            // ownership model -- no TS-style req.on("close") needed (same
+            // pattern as dispatch.rs's CancelOnDrop): reqwest surfaces an
+            // upstream connection dropping mid-body as an `Err` item, not a
+            // silent `None`, so `Body::from_stream` makes hyper abort *our*
+            // client's connection too (explicit error, never a disguised
+            // normal end); and when our client disconnects, axum drops this
+            // stream, which drops `upstream` (owns the real connection),
+            // which reqwest/hyper tears down -- genuinely cancelled.
+            let body = Body::from_stream(upstream.bytes_stream());
+            let mut response = Response::builder()
+                .status(status)
+                .body(body)
+                .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+            let content_type = content_type.as_deref().unwrap_or("text/event-stream");
+            if let Ok(v) = HeaderValue::from_str(content_type) {
+                response
+                    .headers_mut()
+                    .insert(axum::http::header::CONTENT_TYPE, v);
+            }
+            if let Ok(v) = HeaderValue::from_str(locality_str(selected.served_locality)) {
+                response.headers_mut().insert(HEADER_SERVED_LOCALITY, v);
+            }
+            response
+        }
+    }
+}
+
+/// The non-streaming half of [`chat_via_proxy`] (this PR's predecessor —
+/// idempotency cache read/write, `X-iDoris-Cached`/`X-iDoris-Origin-Record-Id`).
+async fn chat_via_proxy_buffered(
+    state: &AppState,
+    selected: &Selected,
+    headers: &HeaderMap,
+    parsed: &ParsedProfile,
+    body_value: &serde_json::Value,
+    record_id: &str,
+) -> Response {
+    let request_id = headers.get(HEADER_REQUEST_ID).and_then(|v| v.to_str().ok());
+    let privacy = parsed.task.privacy.unwrap_or(PrivacyClass::LocalOnly);
+    let opts = proxy::ForwardOpts {
+        request_id,
+        tenant_id: parsed.tenant_id.as_deref(),
+        record_id,
+        provider_id: selected.card.provider.id.as_str(),
+        served_locality: selected.served_locality,
+        privacy,
+    };
+    let outcome = state
+        .proxy
+        .forward_buffered(&selected.card.endpoint, body_value, &opts)
+        .await;
+
+    let status = StatusCode::from_u16(outcome.status).unwrap_or(StatusCode::BAD_GATEWAY);
+    let mut response = (status, outcome.body).into_response();
+    let content_type = outcome
+        .content_type
+        .as_deref()
+        .unwrap_or("application/json");
+    if let Ok(v) = HeaderValue::from_str(content_type) {
+        response
+            .headers_mut()
+            .insert(axum::http::header::CONTENT_TYPE, v);
+    }
+    // C1: on a cache hit, the *replayed* Served-Locality (recorded when the
+    // entry was written) wins, never this request's freshly-computed one
+    // (proxy.rs's cache-key doc) — `selected.served_locality` is only the
+    // fallback for a genuine (non-cached) call.
+    let served_locality = outcome
+        .replayed_served_locality
+        .unwrap_or(selected.served_locality);
+    if let Ok(v) = HeaderValue::from_str(locality_str(served_locality)) {
+        response.headers_mut().insert(HEADER_SERVED_LOCALITY, v);
+    }
+    if outcome.cached {
+        response
+            .headers_mut()
+            .insert(HEADER_CACHED, HeaderValue::from_static("true"));
+        if let Some(origin) = outcome.origin_record_id
+            && let Ok(v) = HeaderValue::from_str(&origin)
+        {
+            response.headers_mut().insert(HEADER_ORIGIN_RECORD_ID, v);
+        }
+    }
+    response
+}
+
+/// Request-scoped wrapper so a handler can read *this request's own*
+/// server-generated record id via `Extension<RequestRecordId>` — R2-G's
+/// `chat_via_proxy` needs it before the response exists (to stash it in a
+/// freshly-written idempotency-cache entry, and to know what to compare a
+/// cache hit's `X-iDoris-Origin-Record-Id` against). Generated once, here,
+/// *before* the handler runs — not re-derived from the response afterward.
+#[derive(Clone)]
+struct RequestRecordId(String);
+
 /// Server-generated on every response, success or error, streaming or not
 /// (interface spec §3.12) — never taken from a caller-supplied header.
-async fn record_id_middleware(req: Request<Body>, next: Next) -> Response {
-    let mut response = next.run(req).await;
+async fn record_id_middleware(mut req: Request<Body>, next: Next) -> Response {
     let record_id = Uuid::new_v4().to_string();
+    req.extensions_mut()
+        .insert(RequestRecordId(record_id.clone()));
+    let mut response = next.run(req).await;
     if let Ok(value) = HeaderValue::from_str(&record_id) {
         response.headers_mut().insert(HEADER_RECORD_ID, value);
     }
@@ -1031,5 +1217,178 @@ mod tests {
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(json["error"]["type"], "not_found");
+    }
+
+    /// A `LoadMode::Resident` `http_service` card (R2-G) — forwarded via
+    /// `chat_via_proxy`, never through the (unconfigured, in these tests)
+    /// Supervisor.
+    fn resident_component_card(id: &str, endpoint: &str) -> ComponentCard {
+        ComponentCard {
+            load_policy: Some(idoris_contracts::load_policy::LoadPolicy {
+                mode: idoris_contracts::load_policy::LoadMode::Resident,
+                keepalive: idoris_contracts::load_policy::Keepalive::Pinned { pinned: true },
+                admission: idoris_contracts::load_policy::Admission::Coexist,
+            }),
+            endpoint: endpoint.to_string(),
+            ..sample_component_card(id)
+        }
+    }
+
+    #[tokio::test]
+    async fn resident_http_service_candidate_forwards_via_proxy_byte_for_byte() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/v1/chat/completions"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"marker": "proxied"})),
+            )
+            .mount(&server)
+            .await;
+        let state = AppState {
+            cards: vec![resident_component_card("omlx", &server.uri())],
+            ..AppState::default()
+        };
+        let app = build_app(state);
+        let response = app
+            .oneshot(post_chat(
+                r#"{"model":"idoris/daily","messages":[{"role":"user","content":"hi"}]}"#,
+                &[],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(HEADER_SERVED_LOCALITY).unwrap(),
+            "loopback"
+        );
+        assert!(response.headers().get(HEADER_CACHED).is_none());
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        // Raw pass-through, never re-wrapped into openai_chat_completion's
+        // {object: "chat.completion", choices: [...]} shape.
+        assert_eq!(json["marker"], "proxied");
+        assert!(json.get("object").is_none());
+    }
+
+    #[tokio::test]
+    async fn resident_http_service_second_call_with_same_request_id_is_cached() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/v1/chat/completions"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({"n": 1})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let state = AppState {
+            cards: vec![resident_component_card("omlx", &server.uri())],
+            ..AppState::default()
+        };
+        let app = build_app(state);
+        let body = r#"{"model":"idoris/daily","messages":[{"role":"user","content":"hi"}]}"#;
+        let headers: &[(&str, &str)] = &[("x-idoris-request-id", "lib-cache-1")];
+        let first = app.clone().oneshot(post_chat(body, headers)).await.unwrap();
+        let first_record_id = first
+            .headers()
+            .get(HEADER_RECORD_ID)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        let second = app.oneshot(post_chat(body, headers)).await.unwrap();
+        assert_eq!(second.headers().get(HEADER_CACHED).unwrap(), "true");
+        assert_eq!(
+            second
+                .headers()
+                .get(HEADER_ORIGIN_RECORD_ID)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            first_record_id
+        );
+        server.verify().await;
+    }
+
+    /// Conformance parity (`streaming.test.ts`'s negative control): a
+    /// `stream: true` request whose upstream call returns a 5xx must not
+    /// retry and must come back as a plain JSON error, not an SSE stream.
+    #[tokio::test]
+    async fn resident_http_service_streaming_5xx_is_buffered_json_not_sse() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/v1/chat/completions"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(502)
+                    .set_body_json(serde_json::json!({"error": "upstream-down"})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let state = AppState {
+            cards: vec![resident_component_card("omlx", &server.uri())],
+            ..AppState::default()
+        };
+        let app = build_app(state);
+        let response = app
+            .oneshot(post_chat(
+                r#"{"model":"idoris/daily","stream":true,"messages":[{"role":"user","content":"hi"}]}"#,
+                &[],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .unwrap(),
+            "application/json"
+        );
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["error"], "upstream-down");
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn resident_http_service_streaming_2xx_passes_sse_bytes_through() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/v1/chat/completions"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw("data: hel\n\ndata: [DONE]\n\n", "text/event-stream"),
+            )
+            .mount(&server)
+            .await;
+        let state = AppState {
+            cards: vec![resident_component_card("omlx", &server.uri())],
+            ..AppState::default()
+        };
+        let app = build_app(state);
+        let response = app
+            .oneshot(post_chat(
+                r#"{"model":"idoris/daily","stream":true,"messages":[{"role":"user","content":"hi"}]}"#,
+                &[],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            response
+                .headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .contains("text/event-stream")
+        );
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(text.contains("hel"));
+        assert!(text.contains("[DONE]"));
     }
 }
