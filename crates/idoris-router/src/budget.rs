@@ -33,13 +33,12 @@ const DEFAULT_KEY_ID: &str = "default";
 /// "tenant mode requires X-iDoris-Tenant" gate in `profile.rs`.
 pub const PERSONAL_TENANT_ID: &str = "personal";
 
-/// A per-request, per-candidate cost estimate in minor currency units.
-/// `Some(0)` for an exactly-free candidate; `Some(n > 0)` for a priced one;
-/// `None` when the provider's declared cost is malformed (negative or
-/// non-finite) — invariant #3 ("price unknown ≠ free") means a malformed
-/// cost must exclude the candidate at the `decide()` pricing stage, not
-/// quietly become "free".
-pub fn estimate_cost_minor(cost: &Cost, prompt: &str) -> Option<i64> {
+/// Shared math for [`estimate_cost_minor`]/[`estimate_actual_cost_minor`]:
+/// `Some(0)` for exactly-free, `None` for malformed (negative/non-finite)
+/// cost data (invariant #3: "price unknown ≠ free" — a malformed cost must
+/// exclude the candidate, never quietly become "free"), else the priced
+/// total for the given token counts.
+fn priced_minor(cost: &Cost, input_tokens: u64, output_tokens: u64) -> Option<i64> {
     if cost.input_per_m == 0.0 && cost.output_per_m == 0.0 {
         return Some(0);
     }
@@ -50,17 +49,51 @@ pub fn estimate_cost_minor(cost: &Cost, prompt: &str) -> Option<i64> {
     {
         return None;
     }
-    let prompt_tokens = estimate_tokens(prompt, "unknown");
     #[allow(clippy::cast_precision_loss)] // token counts are nowhere near f64's precision ceiling
-    let input_minor = prompt_tokens as f64 / 1_000_000.0 * cost.input_per_m;
+    let input_minor = input_tokens as f64 / 1_000_000.0 * cost.input_per_m;
     #[allow(clippy::cast_precision_loss)]
-    let output_minor = RESERVED_COMPLETION_TOKENS as f64 / 1_000_000.0 * cost.output_per_m;
+    let output_minor = output_tokens as f64 / 1_000_000.0 * cost.output_per_m;
     let total = (input_minor + output_minor).ceil();
     if total.is_finite() && (0.0..=(i64::MAX as f64)).contains(&total) {
         #[allow(clippy::cast_possible_truncation)] // range-checked just above
         Some(total as i64)
     } else {
         None
+    }
+}
+
+/// A per-request, per-candidate cost estimate in minor currency units, used
+/// to size a [`reserve`] call *before* the real usage is known — see
+/// `RESERVED_COMPLETION_TOKENS`'s doc for why the completion side is a
+/// fixed placeholder here.
+pub fn estimate_cost_minor(cost: &Cost, prompt: &str) -> Option<i64> {
+    let prompt_tokens = estimate_tokens(prompt, "unknown");
+    priced_minor(cost, prompt_tokens, RESERVED_COMPLETION_TOKENS)
+}
+
+/// The *actual* cost once both the prompt and the real completion text are
+/// known — used to size a [`settle`] call. Falls back to `reserved_minor`
+/// (the amount actually reserved) if the real token counts somehow produce
+/// `None` here (defensive only — the same cost data already passed this
+/// same check once to be reserved in the first place).
+pub fn estimate_actual_cost_minor(
+    cost: &Cost,
+    prompt: &str,
+    completion: &str,
+    reserved_minor: i64,
+) -> i64 {
+    let input_tokens = estimate_tokens(prompt, "unknown");
+    let output_tokens = estimate_tokens(completion, "unknown");
+    priced_minor(cost, input_tokens, output_tokens).unwrap_or(reserved_minor)
+}
+
+/// The [`BudgetError`] a paid candidate produces when no [`BudgetLedger`]
+/// is wired at all — same shape `reserve` would fail with against an
+/// unconfigured scope, so callers can treat "no ledger" and "ledger has no
+/// config for this scope" identically.
+pub fn ledger_unavailable_error(tenant_id: Option<&str>, provider_id: &str) -> BudgetError {
+    BudgetError::NotConfigured {
+        scope: scope(tenant_id, provider_id),
     }
 }
 
@@ -130,9 +163,12 @@ mod tests {
     }
 
     fn paid_cost() -> Cost {
+        // Minor units (e.g. cents) per million tokens; large enough that
+        // a 1024-token placeholder reservation and a 1-token real
+        // completion round to visibly different totals after `ceil()`.
         Cost {
-            input_per_m: 100.0,
-            output_per_m: 200.0,
+            input_per_m: 1_000_000.0,
+            output_per_m: 2_000_000.0,
         }
     }
 
@@ -170,6 +206,24 @@ mod tests {
         ] {
             assert_eq!(estimate_cost_minor(&bad, "hi"), None);
         }
+    }
+
+    #[test]
+    fn actual_cost_reflects_the_real_completion_length_not_the_reservation_placeholder() {
+        let cost = paid_cost();
+        let reserved = estimate_cost_minor(&cost, "hi").unwrap();
+        // A one-word completion should settle for less than the fixed
+        // RESERVED_COMPLETION_TOKENS placeholder the reservation assumed.
+        let actual = estimate_actual_cost_minor(&cost, "hi", "ok", reserved);
+        assert!(actual < reserved);
+    }
+
+    #[test]
+    fn ledger_unavailable_error_matches_a_real_not_configured_rejection() {
+        let (_dir, ledger) = ledger();
+        let via_helper = ledger_unavailable_error(Some("acme"), "omlx");
+        let via_real_call = reserve(&ledger, Some("acme"), "omlx", 500).unwrap_err();
+        assert_eq!(via_helper, via_real_call);
     }
 
     fn ledger() -> (TempDir, BudgetLedger) {
