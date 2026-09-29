@@ -10,15 +10,28 @@ description = "Rust skeleton for the iDoris router: axum HTTP server, GET /healt
 [lints]
 workspace = true
 
+[features]
+# Forwards to idoris-policy's own dev-mock feature (its `mock://` scheme
+# gate) — R2-D's component loader (components.rs) additionally requires
+# this feature (compile-time) *and* IDORIS_ALLOW_MOCK=1 (runtime) before it
+# will register a `provider.id: mock` component card. Default off; never
+# enabled in a production build.
+dev-mock = ["idoris-policy/dev-mock"]
+
 [dependencies]
 idoris-contracts = { workspace = true }
 idoris-policy = { workspace = true }
+idoris-backend = { workspace = true }
+idoris-tenancy = { workspace = true }
 axum = { workspace = true }
 tokio = { workspace = true }
+tokio-util = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+serde_yaml = "0.9"
 uuid = { workspace = true }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
+tempfile = "3"
