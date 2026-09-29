@@ -1152,6 +1152,7 @@ dependencies = [
  "idoris-contracts",
  "idoris-policy",
  "idoris-tenancy",
+ "reqwest",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -1160,6 +1161,7 @@ dependencies = [
  "tokio-util",
  "tower",
  "uuid",
+ "wiremock",
 ]
 
 [[package]]

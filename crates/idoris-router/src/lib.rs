@@ -25,6 +25,10 @@ pub mod dispatch;
 /// yet wired into `dispatch`/the request path — a follow-up PR does that.
 pub mod budget;
 
+/// `GET /v1/models` (R2-G): aggregates every registered `http_service`
+/// card's own model listing.
+pub mod models;
+
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -145,6 +149,12 @@ pub struct AppState {
     /// unconfigured ledger scope (free candidates unaffected). `Arc`
     /// because `BudgetLedger` (wraps a `Mutex<Connection>`) isn't `Clone`.
     pub budget_ledger: Option<Arc<idoris_tenancy::budget::BudgetLedger>>,
+    /// Outbound HTTP client for `GET /v1/models` (this PR) and the direct
+    /// `http_service` chat-forwarding path (follow-up PR) — one client
+    /// shared across requests so its connection pool is actually reused,
+    /// matching `reqwest::Client`'s own documented cloning contract (cheap,
+    /// `Arc`-backed clone, not a new connection pool per clone).
+    pub http_client: reqwest::Client,
 }
 
 impl std::fmt::Debug for AppState {
@@ -158,6 +168,7 @@ impl std::fmt::Debug for AppState {
                 "budget_ledger",
                 &self.budget_ledger.as_ref().map(|_| "BudgetLedger { .. }"),
             )
+            .field("http_client", &self.http_client)
             .finish()
     }
 }
@@ -172,6 +183,7 @@ impl Default for AppState {
             cards: Vec::new(),
             supervisor: None,
             budget_ledger: None,
+            http_client: reqwest::Client::new(),
         }
     }
 }
@@ -182,6 +194,7 @@ impl Default for AppState {
 pub fn build_app(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
+        .route("/v1/models", get(list_models).fallback(not_found))
         .route(
             "/v1/chat/completions",
             post(chat_completions).fallback(not_found),
@@ -189,6 +202,14 @@ pub fn build_app(state: AppState) -> Router {
         .fallback(not_found)
         .with_state(Arc::new(state))
         .layer(middleware::from_fn(record_id_middleware))
+}
+
+/// `GET /v1/models` (interface spec — `owned_by` is each card's
+/// `provider.id`, matching `server.ts`). Delegates to [`models::list_models`];
+/// see that module's doc for the per-card best-effort/skip-on-failure
+/// semantics.
+async fn list_models(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    Json(models::list_models(&state.http_client, &state.cards).await)
 }
 
 async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {

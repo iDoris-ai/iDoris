@@ -30,8 +30,16 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = "0.9"
 uuid = { workspace = true }
+# R2-G: direct HTTP forwarding for a generic (non-oMLX) `http_service`
+# component card — `GET /v1/models` (this PR) and `POST
+# /v1/chat/completions` (follow-up PR) both need an outbound HTTP client.
+# Same version/feature choice as idoris-upstream's own `reqwest` dependency
+# (rustls, not the system TLS backend; `charset`/`http2`/`system-proxy`
+# dropped as unneeded) so the workspace has one TLS stack, not two.
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 tempfile = "3"
+wiremock = "0.6"
