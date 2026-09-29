@@ -17,10 +17,25 @@
 //! that function's own (unrelated to this gate) scheme check.
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use idoris_contracts::{ComponentCard, Contract};
 use idoris_policy::{AdmissionStatus, Card, RegistrationError, validate_registration};
+
+/// `serve.ts`'s `DEFAULT_COMPONENTS_DIR`.
+pub const DEFAULT_COMPONENTS_DIR: &str = "config/components";
+
+/// `IDORIS_COMPONENTS_DIR` (blank/unset → [`DEFAULT_COMPONENTS_DIR`]) → the
+/// directory to load from. Relative paths resolve against the current
+/// working directory (see `routing_policy`'s module doc for why this
+/// differs from `serve.ts`'s repo-root resolution).
+pub fn resolve_components_dir(raw: Option<&str>) -> PathBuf {
+    let value = match raw.map(str::trim) {
+        None | Some("") => DEFAULT_COMPONENTS_DIR,
+        Some(v) => v,
+    };
+    PathBuf::from(value)
+}
 
 #[derive(Debug)]
 pub enum LoadError {
@@ -142,6 +157,24 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+
+    #[test]
+    fn resolve_components_dir_defaults_when_env_is_absent_or_blank() {
+        for raw in [None, Some(""), Some("   ")] {
+            assert_eq!(
+                resolve_components_dir(raw),
+                PathBuf::from(DEFAULT_COMPONENTS_DIR)
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_components_dir_uses_the_given_path_when_set() {
+        assert_eq!(
+            resolve_components_dir(Some("custom/dir")),
+            PathBuf::from("custom/dir")
+        );
+    }
 
     fn write_card(dir: &TempDir, filename: &str, contents: &str) {
         fs::write(dir.path().join(filename), contents).unwrap();

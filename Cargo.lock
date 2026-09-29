@@ -589,13 +589,16 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "http-body-util",
+ "idoris-backend",
  "idoris-contracts",
  "idoris-policy",
+ "idoris-tenancy",
  "serde",
  "serde_json",
  "serde_yaml",
  "tempfile",
  "tokio",
+ "tokio-util",
  "tower",
  "uuid",
 ]
