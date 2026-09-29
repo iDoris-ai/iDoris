@@ -212,8 +212,6 @@ struct ScopeConfig {
 struct TenantConfig {
     limit_minor: i64,
     billing_timezone: String,
-    // Consumed by `reserve`'s dual-dimension check, wired up in the next PR.
-    #[allow(dead_code)]
     gate: SpendGate,
 }
 
@@ -467,6 +465,19 @@ impl BudgetLedger {
         scope: &BudgetScope,
         estimated_cost: Price,
     ) -> Result<ReservationId, BudgetError> {
+        // prdaemon review on #48: since B-3 made the sub-scope `configure`
+        // call optional, `reserve` could be called for a tenant that only
+        // ever called `configure_tenant` — with `scope.key_id`/
+        // `provider_id`/`model_id` left blank. Without this check, a blank
+        // field is a valid composite-key value, so every caller who left a
+        // field blank (accidentally or otherwise) would silently share the
+        // same `(tenant_id, "", "", "")` sub-scope row instead of erroring.
+        // `configure`'s own `validate_scope` call no longer guards this
+        // path once configuring the sub-scope became optional, so `reserve`
+        // must validate it directly instead of relying on `configure`
+        // having been called first.
+        validate_scope(scope)?;
+
         let estimated_cost_minor = match estimated_cost {
             Price::Unknown => return Err(BudgetError::PriceUnknown),
             Price::Known(v) if v < 0 => {
@@ -1471,6 +1482,39 @@ mod tests {
             ledger.tenant_balance("acme-co").expect("tenant_balance"),
             600
         );
+    }
+
+    /// prdaemon review on #48: since B-3 made the sub-scope `configure`
+    /// call optional, a caller could `reserve` against a tenant-only setup
+    /// with a blank `key_id`/`provider_id`/`model_id` — without
+    /// `reserve` validating the scope itself, that blank field would
+    /// silently become part of the composite key (merging unrelated calls
+    /// onto the same sub-scope row) instead of being rejected the way
+    /// `configure` has always rejected it.
+    #[test]
+    fn reserve_rejects_blank_scope_field_even_with_only_tenant_configured() {
+        let path = temp_db_path("prdaemon-reserve-blank-scope");
+        let ledger = BudgetLedger::open(&path).expect("open");
+        ledger
+            .configure_tenant("acme-co", 1_000, "UTC", SpendGate::PaidOnly)
+            .expect("configure_tenant");
+        let cases = [
+            (BudgetScope::new("acme-co", "", "openai", "gpt-5"), "key_id"),
+            (
+                BudgetScope::new("acme-co", "key-1", "  ", "gpt-5"),
+                "provider_id",
+            ),
+            (
+                BudgetScope::new("acme-co", "key-1", "openai", "\t"),
+                "model_id",
+            ),
+        ];
+        for (scope, expected) in cases {
+            match ledger.reserve(&scope, Price::Known(1)) {
+                Err(BudgetError::InvalidScope { field }) => assert_eq!(field, expected),
+                other => panic!("{expected}: expected InvalidScope, got {other:?}"),
+            }
+        }
     }
 
     /// H2: a tight tenant-level limit rejects even though the sub-scope

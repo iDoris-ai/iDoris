@@ -7,6 +7,7 @@ members = [
     "crates/idoris-tenancy",
     "crates/idoris-recommender",
     "crates/idoris-policy",
+    "crates/idoris-upstream",
 ]
 
 [workspace.package]
@@ -92,6 +93,7 @@ idoris-contracts = { path = "crates/idoris-contracts" }
 idoris-backend = { path = "crates/idoris-backend" }
 idoris-tenancy = { path = "crates/idoris-tenancy" }
 idoris-policy = { path = "crates/idoris-policy" }
+idoris-upstream = { path = "crates/idoris-upstream" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

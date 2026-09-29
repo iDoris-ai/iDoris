@@ -22,6 +22,18 @@ multiple-versions = "warn"
 
 [advisories]
 yanked = "warn"
+ignore = [
+  # RUSTSEC-2024-0436 — `paste` (dtolnay) is archived/no-longer-maintained,
+  # not a vulnerability (no CVE, no exploit, the advisory itself says
+  # "No safe upgrade is available"). It's a compile-time-only proc-macro
+  # crate with no runtime code shipped into the built binary, pulled in
+  # transitively via `genai` (R2-E remote client, `idoris-upstream`) — not
+  # a direct dependency we could swap for `pastey` ourselves without
+  # `genai` doing so upstream first. Revisit if `genai` drops it or a
+  # CVE is ever filed against `paste` itself (this entry only silences the
+  # maintenance-status notice, not an actual vulnerability class).
+  "RUSTSEC-2024-0436",
+]
 
 [sources]
 unknown-registry = "deny"
