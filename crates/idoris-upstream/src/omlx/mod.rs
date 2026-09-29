@@ -1,12 +1,15 @@
 //! oMLX `RuntimeAdapter` — mirrors `packages/adapters/omlx/
 //! omlx-backend.ts` on `main` (FU-16) behavior, ported onto
 //! `idoris_backend::RuntimeAdapter`. Talks to `http://127.0.0.1:8088` by
-//! default. Split across submodules landing across several PRs on this
+//! default. Split across submodules that landed across several PRs on this
 //! stack: [`http`] (GET/POST/PUT + timeout + safe errors), [`status`]
-//! (`list`/`status` parsing), [`pin`] (this PR, resident/admin-session
-//! gap), and [`OmlxAdapter`] wiring `list`/`status` together —
-//! `load`/`unload`/`probe_ready`/`chat`, and the actual `RuntimeAdapter`
-//! impl, follow in the next PRs.
+//! (`list`/`status` parsing), [`pin`] (resident/admin-session gap), and
+//! [`OmlxAdapter`], which wires all of it into a full
+//! [`idoris_backend::RuntimeAdapter`] impl (this PR) — `OmlxAdapter`'s own
+//! inherent methods (used directly by this module's tests throughout the
+//! stack) and the trait impl are the same logic; the trait impl exists so
+//! `OmlxAdapter` can be used as `Box<dyn RuntimeAdapter>` by the
+//! Supervisor.
 //!
 //! **The API key is read from an env var and never logged** — see
 //! [`OMLX_API_KEY_ENV`] and `http`'s module doc.
@@ -17,10 +20,13 @@ mod status;
 
 use std::time::Duration;
 
-use idoris_backend::{BackendError, BackendStatus, ModelInfo};
+use idoris_backend::{
+    BackendError, BackendStatus, ChatRequest, ChatResponse, ModelInfo, RuntimeAdapter,
+};
 use idoris_contracts::LoadPolicy;
 use idoris_contracts::load_policy::LoadMode;
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
+use tokio_util::sync::CancellationToken;
 
 /// Percent-encode a model id for a URL path segment. Plain
 /// [`NON_ALPHANUMERIC`] is *too* aggressive here: it also escapes `-`,
@@ -134,6 +140,22 @@ impl OmlxAdapter {
 
     async fn put(&self, path: &str, body: &serde_json::Value) -> Result<(), BackendError> {
         http::put_json(
+            &self.client,
+            &self.base_url,
+            path,
+            self.api_key(),
+            self.call_timeout,
+            body,
+        )
+        .await
+    }
+
+    async fn post_parse(
+        &self,
+        path: &str,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value, BackendError> {
+        http::post_and_parse(
             &self.client,
             &self.base_url,
             path,
@@ -271,6 +293,55 @@ impl OmlxAdapter {
             Err(_) => Ok(false),
         }
     }
+
+    /// `POST /v1/chat/completions`. `cancel` races the HTTP call itself:
+    /// whichever resolves first wins, and the loser is dropped — dropping
+    /// the HTTP call future aborts the in-flight request (no separate
+    /// "kill the process group" step applies here, unlike a spawn-type
+    /// adapter, since this is a plain HTTP client with nothing else to
+    /// clean up). Does not itself check whether `id` is loaded: the real
+    /// oMLX server rejects a request for a model it hasn't loaded on its
+    /// own, and that rejection propagates as an ordinary `Upstream` error
+    /// — there is no local ledger here to consult instead.
+    pub async fn chat(
+        &self,
+        req: ChatRequest,
+        cancel: CancellationToken,
+    ) -> Result<ChatResponse, BackendError> {
+        if cancel.is_cancelled() {
+            return Err(BackendError::cancelled());
+        }
+        let messages: Vec<serde_json::Value> = req
+            .messages
+            .iter()
+            .map(|m| serde_json::json!({"role": m.role, "content": m.content}))
+            .collect();
+        let body = serde_json::json!({"model": req.model.clone(), "messages": messages});
+        let call = self.post_parse("/v1/chat/completions", &body);
+        tokio::select! {
+            _ = cancel.cancelled() => Err(BackendError::cancelled()),
+            result = call => {
+                let raw = result?;
+                Ok(ChatResponse { model: req.model, content: extract_content(&raw) })
+            }
+        }
+    }
+}
+
+/// `body.choices[0].message.content`, defaulting to `""` when any step of
+/// that path is missing or the wrong type — matches the TS reference's own
+/// `body.choices?.[0]?.message?.content ?? ""` leniency (deliberately not
+/// fail-closed here, unlike `status`/`pin`'s parsing: an empty completion
+/// is a valid, if unhelpful, chat response, not a broken one).
+fn extract_content(raw: &serde_json::Value) -> String {
+    raw.get("choices")
+        .and_then(|c| c.as_array())
+        .and_then(|choices| choices.first())
+        .and_then(|choice| choice.get("message"))
+        .and_then(|message| message.get("content"))
+        .and_then(|content| content.as_str())
+        .unwrap_or("")
+        .to_string()
 }
 
 /// `true` iff `raw`'s `models` array has an entry for `id` with
@@ -287,6 +358,46 @@ fn is_ready(raw: &serde_json::Value, id: &str) -> bool {
             m.get("id").and_then(|v| v.as_str()) == Some(id)
                 && m.get("loaded").and_then(|v| v.as_bool()) == Some(true)
         })
+}
+
+/// Thin delegation to `OmlxAdapter`'s own inherent methods (used directly,
+/// throughout this module's tests, by every PR on this branch stack) —
+/// this impl exists so a `Box<dyn RuntimeAdapter>` can hold an
+/// `OmlxAdapter`. Delegating through `Self::method(self, ...)` rather than
+/// `self.method(...)` is not just style: an inherent method always shadows
+/// a trait method of the same name in method-call syntax, so `self.list()`
+/// here would in fact resolve to the inherent `list` anyway — spelling it
+/// as `Self::list(self)` makes that explicit instead of relying on that
+/// shadowing rule silently doing the right thing.
+#[async_trait::async_trait]
+impl RuntimeAdapter for OmlxAdapter {
+    async fn list(&self) -> Result<Vec<ModelInfo>, BackendError> {
+        Self::list(self).await
+    }
+
+    async fn load(&self, id: &str, policy: Option<&LoadPolicy>) -> Result<(), BackendError> {
+        Self::load(self, id, policy).await
+    }
+
+    async fn unload(&self, id: &str) -> Result<(), BackendError> {
+        Self::unload(self, id).await
+    }
+
+    async fn status(&self) -> Result<BackendStatus, BackendError> {
+        Self::status(self).await
+    }
+
+    async fn probe_ready(&self, id: &str) -> Result<bool, BackendError> {
+        Self::probe_ready(self, id).await
+    }
+
+    async fn chat(
+        &self,
+        req: ChatRequest,
+        cancel: CancellationToken,
+    ) -> Result<ChatResponse, BackendError> {
+        Self::chat(self, req, cancel).await
+    }
 }
 
 #[cfg(test)]
@@ -598,5 +709,143 @@ mod tests {
                 "must report not-ready, never Err, while still possibly loading"
             );
         }
+    }
+
+    fn chat_request() -> ChatRequest {
+        ChatRequest {
+            model: "qwen3-8b".to_string(),
+            messages: vec![idoris_backend::ChatMessage {
+                role: "user".to_string(),
+                content: "hi".to_string(),
+            }],
+        }
+    }
+
+    #[tokio::test]
+    async fn chat_returns_the_completion_content() {
+        let server = MockServer::start().await;
+        let resp = ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{"message": {"content": "hello there"}}]
+        }));
+        mount_all(&server, vec![("POST", "/v1/chat/completions", resp)]).await;
+        let adapter = adapter_for(&server).await;
+        let out = adapter
+            .chat(chat_request(), CancellationToken::new())
+            .await
+            .expect("chat must succeed");
+        assert_eq!(out.model, "qwen3-8b");
+        assert_eq!(out.content, "hello there");
+    }
+
+    /// Matches the TS reference's own leniency: a response missing the
+    /// `choices`/`message`/`content` path is a valid (if unhelpful) empty
+    /// completion, not a parse failure.
+    #[tokio::test]
+    async fn chat_defaults_to_empty_content_when_choices_are_missing() {
+        let server = MockServer::start().await;
+        mount_all(
+            &server,
+            vec![(
+                "POST",
+                "/v1/chat/completions",
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({})),
+            )],
+        )
+        .await;
+        let adapter = adapter_for(&server).await;
+        let out = adapter
+            .chat(chat_request(), CancellationToken::new())
+            .await
+            .expect("must still succeed");
+        assert_eq!(out.content, "");
+    }
+
+    #[tokio::test]
+    async fn chat_fails_immediately_on_an_already_cancelled_token() {
+        let server = MockServer::start().await;
+        let adapter = adapter_for(&server).await;
+        let token = CancellationToken::new();
+        token.cancel();
+        let err = adapter
+            .chat(chat_request(), token)
+            .await
+            .expect_err("a pre-cancelled token must short-circuit chat");
+        assert_eq!(err.reason_code(), "cancelled");
+    }
+
+    #[tokio::test]
+    async fn chat_is_cancelled_mid_flight_instead_of_waiting_for_a_slow_response() {
+        let server = MockServer::start().await;
+        mount_all(
+            &server,
+            vec![(
+                "POST",
+                "/v1/chat/completions",
+                ResponseTemplate::new(200).set_delay(Duration::from_secs(5)),
+            )],
+        )
+        .await;
+        let adapter = adapter_for(&server).await;
+        let token = CancellationToken::new();
+        let child = token.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            child.cancel();
+        });
+        let err = tokio::time::timeout(Duration::from_secs(1), adapter.chat(chat_request(), token))
+            .await
+            .expect("select! must not itself hang waiting on the slow response")
+            .expect_err("must report cancellation, not wait out the 5s delay");
+        assert_eq!(err.reason_code(), "cancelled");
+    }
+
+    #[tokio::test]
+    async fn chat_on_4xx_reports_upstream_error_without_leaking_the_api_key() {
+        let server = MockServer::start().await;
+        mount_all(
+            &server,
+            vec![(
+                "POST",
+                "/v1/chat/completions",
+                ResponseTemplate::new(400).set_body_string("bad-request-body-should-not-leak"),
+            )],
+        )
+        .await;
+        let adapter = adapter_for(&server).await;
+        let err = adapter
+            .chat(chat_request(), CancellationToken::new())
+            .await
+            .expect_err("4xx must fail");
+        let msg = err.to_string();
+        assert!(msg.contains("400"));
+        assert!(!msg.contains("bad-request-body-should-not-leak"));
+        assert!(!msg.contains("test-key-should-never-leak"));
+    }
+
+    /// `OmlxAdapter` must be usable as `Box<dyn RuntimeAdapter>` — the
+    /// whole point of the trait impl added in this PR — and the trait
+    /// method must produce the same result as calling the inherent method
+    /// directly (they delegate to the same code).
+    #[tokio::test]
+    async fn omlx_adapter_is_usable_as_a_dyn_runtime_adapter() {
+        let server = MockServer::start().await;
+        mount_all(
+            &server,
+            vec![(
+                "GET",
+                "/v1/models",
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "data": [{"id": "qwen3-8b"}]
+                })),
+            )],
+        )
+        .await;
+        let adapter: Box<dyn RuntimeAdapter> = Box::new(adapter_for(&server).await);
+        let models = adapter
+            .list()
+            .await
+            .expect("list via trait object must succeed");
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "qwen3-8b");
     }
 }
