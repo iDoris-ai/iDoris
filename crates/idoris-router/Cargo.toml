@@ -36,7 +36,10 @@ uuid = { workspace = true }
 # Same version/feature choice as idoris-upstream's own `reqwest` dependency
 # (rustls, not the system TLS backend; `charset`/`http2`/`system-proxy`
 # dropped as unneeded) so the workspace has one TLS stack, not two.
-reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+# R2-G streaming (PR7): `stream` enables `Response::bytes_stream()`, needed
+# for genuine incremental SSE pass-through (as opposed to `forward_buffered`,
+# which downloads the full body before returning).
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "stream"] }
 # The idempotency cache's insertion-order == expiry-order invariant
 # (`ChatProxy::remember`'s doc) needs a map that preserves insertion order
 # and lets a re-insert move a key to the back — `std::HashMap` has neither;
