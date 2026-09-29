@@ -22,8 +22,10 @@ dev-mock = ["idoris-policy/dev-mock"]
 idoris-contracts = { workspace = true }
 idoris-policy = { workspace = true }
 idoris-backend = { workspace = true }
+idoris-tenancy = { workspace = true }
 axum = { workspace = true }
 tokio = { workspace = true }
+tokio-util = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = "0.9"
