@@ -23,6 +23,11 @@ idoris-contracts = { workspace = true }
 idoris-policy = { workspace = true }
 idoris-backend = { workspace = true }
 idoris-tenancy = { workspace = true }
+# R2-G task 1 (CLI wiring): a real oMLX-shaped card (LoadMode::OnDemand/
+# EvictToLoad, needing the Supervisor's explicit load/unload lifecycle) is
+# served via OmlxAdapter, distinct from the direct-forward `proxy` path
+# below (which only applies to a LoadMode::Resident http_service card).
+idoris-upstream = { workspace = true }
 axum = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
