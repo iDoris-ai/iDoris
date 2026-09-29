@@ -246,4 +246,57 @@ mod tests {
         .expect_err("must time out, not hang");
         assert!(err.to_string().contains("timed out"));
     }
+
+    /// Regression test for the round-1 fix in this PR's own history
+    /// (`send_and_parse`'s timeout must cover the body read, not just
+    /// `send()`): `wiremock`'s `set_delay` (used by the test above) delays
+    /// the *entire* response, headers included, so it can't actually catch
+    /// a "headers arrive promptly, body stalls" regression — the old,
+    /// broken `dispatch`-only-wraps-`send()` shape would have passed that
+    /// test too. This uses a raw TCP listener instead: writes valid
+    /// headers + `Content-Length: 100` immediately, then only ever sends 1
+    /// body byte before stalling, so the only way this test passes is if
+    /// the timeout genuinely covers the body read.
+    #[tokio::test]
+    async fn get_json_times_out_on_a_stalled_body_not_just_slow_headers() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind must succeed");
+        let addr = listener.local_addr().expect("local_addr must succeed");
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                use tokio::io::AsyncWriteExt;
+                // Valid status line + a `Content-Length` promising 100
+                // bytes, then exactly 1 of them — headers are complete,
+                // the body is not.
+                let _ = socket
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nX")
+                    .await;
+                // Never send the other 99 bytes. Sleep well past this
+                // test's own timeout instead of closing the socket, so a
+                // broken implementation would hang on the read, not merely
+                // see a clean EOF/connection-reset shortcut it might
+                // handle differently.
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            }
+        });
+
+        let client = reqwest::Client::new();
+        let base_url = format!("http://{addr}");
+        let start = std::time::Instant::now();
+        let err = get_json(
+            &client,
+            &base_url,
+            "/status",
+            None,
+            Duration::from_millis(200),
+        )
+        .await
+        .expect_err("a stalled body must time out, not hang");
+        assert!(err.to_string().contains("timed out"));
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "must time out promptly per call_timeout (200ms), not wait anywhere near the 30s stall"
+        );
+    }
 }

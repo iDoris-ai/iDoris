@@ -31,5 +31,9 @@ serde_json = { workspace = true }
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["test-util"] }
+# `io-util` (for `AsyncWriteExt`) is test-only: the raw-TCP regression test
+# for the body-read timeout (see `omlx::http`'s tests) writes a partial
+# HTTP response by hand instead of going through `reqwest`/`wiremock`,
+# which can't otherwise simulate "headers arrive promptly, body stalls".
+tokio = { workspace = true, features = ["test-util", "io-util"] }
 wiremock = "0.6"
