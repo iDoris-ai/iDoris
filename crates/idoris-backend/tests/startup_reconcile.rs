@@ -35,6 +35,7 @@ struct TestAdapter {
     catalog: Vec<ModelInfo>,
     state: Mutex<State>,
     block_next_status: Mutex<bool>,
+    fail_next_status: Mutex<bool>,
     status_entered: Notify,
     status_release: Notify,
     block_chat: Mutex<bool>,
@@ -54,6 +55,7 @@ impl TestAdapter {
                 loads: Vec::new(),
             }),
             block_next_status: Mutex::new(false),
+            fail_next_status: Mutex::new(false),
             status_entered: Notify::new(),
             status_release: Notify::new(),
             block_chat: Mutex::new(false),
@@ -65,6 +67,10 @@ impl TestAdapter {
 
     fn block_status(&self) {
         *self.block_next_status.lock().unwrap() = true;
+    }
+
+    fn fail_status_once(&self) {
+        *self.fail_next_status.lock().unwrap() = true;
     }
 
     fn add_external_usage(&self, id: &str, gb: f64) {
@@ -129,6 +135,18 @@ impl RuntimeAdapter for TestAdapter {
     async fn status(&self) -> Result<BackendStatus, BackendError> {
         self.status_calls
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let fail = {
+            let mut fail = self.fail_next_status.lock().unwrap();
+            let value = *fail;
+            *fail = false;
+            value
+        };
+        if fail {
+            return Err(BackendError::Upstream {
+                message: "injected status failure".into(),
+            });
+        }
+
         let captured = {
             let state = self.state.lock().unwrap();
             (
@@ -202,15 +220,43 @@ async fn repeat_load_unload_then_reload_keeps_only_unknown_residency_reserved() 
     handle.load("a", 4.0, policy()).await.unwrap();
     handle.load("a", 4.0, policy()).await.unwrap();
     assert_eq!(handle.status().await.unwrap().used_gb, 24.0);
+
+    // The unknown 20 GB plus A's 4 GB fills the budget, so B must be
+    // rejected before the unload creates room for A to be loaded again.
+    assert_eq!(
+        handle
+            .load("b", 8.0, policy())
+            .await
+            .unwrap_err()
+            .reason_code(),
+        "eviction_impossible"
+    );
+    assert_eq!(adapter.load_count("b"), 0);
+
     handle.unload("a").await.unwrap();
-    assert_eq!(handle.status().await.unwrap().used_gb, 20.0);
+    // Unload leaves the actor's old reservation in place. A later load
+    // needs a valid sample before it can rebuild that reservation.
+    assert_eq!(handle.status().await.unwrap().used_gb, 24.0);
+    adapter.fail_status_once();
+    assert_eq!(
+        handle
+            .load("a", 4.0, policy())
+            .await
+            .unwrap_err()
+            .reason_code(),
+        "upstream_error"
+    );
+    assert_eq!(adapter.load_count("a"), 1);
+    assert_eq!(
+        handle.status().await.unwrap_err().reason_code(),
+        "upstream_error"
+    );
+
+    // The one-shot sampling failure has cleared; a fresh sample now permits
+    // rebuilding the reservation from the 20 GB unknown residency.
     handle.load("a", 4.0, policy()).await.unwrap();
     assert_eq!(handle.status().await.unwrap().used_gb, 24.0);
-
-    // Keep this repeat/unload/reload sequence isolated from the capacity
-    // rejection below: a true admission request may conservatively reserve
-    // the full observed total for unknown residents for the actor lifetime.
-    assert!(handle.load("b", 8.0, policy()).await.is_err());
+    assert_eq!(adapter.load_count("a"), 2);
     assert_eq!(adapter.load_count("b"), 0);
     assert_eq!(adapter.unload_count("inherited"), 0);
 }

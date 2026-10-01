@@ -1033,12 +1033,14 @@ fn handle_unload(
 }
 
 /// Engine residency outside this actor's ledger has no trustworthy policy
-/// or per-model estimate. Reserve the unexplained total without evicting it;
-/// never reduce that reservation on a later sample (restart to reconcile a
-/// manually cleaned engine). When unknown residents are present, keep the
-/// full observed total in the floor: a managed estimate is not proof of actual
-/// memory released by eviction. This can conservatively double-count managed
-/// memory while it remains loaded, but avoids admitting beyond the budget.
+/// or per-model estimate. Reserve the unexplained total without evicting it.
+/// When no managed ledger entries occupy the budget, rebuild the reservation
+/// from a valid sample of full engine residency, including residual residency.
+/// While managed models remain, keep the reservation monotonic. If unknown
+/// residents are present, retain the full observed total because a managed
+/// estimate does not prove an eviction actually freed memory. This may
+/// conservatively double-count managed memory while loaded, but avoids
+/// admitting beyond the budget.
 async fn reconcile_reserved_gb(
     adapter: Arc<dyn RuntimeAdapter>,
     timeout: std::time::Duration,
@@ -1065,6 +1067,9 @@ async fn reconcile_reserved_gb(
         return Err(BackendError::internal(
             "engine residency has no valid memory measurement",
         ));
+    }
+    if managed.is_empty() {
+        return Ok(status.used_gb);
     }
     let has_unknown_residents = status.loaded.iter().any(|loaded_id| {
         !managed
@@ -1572,6 +1577,121 @@ mod tests {
         let status = handle.status().await.expect("status should succeed");
         assert!(status.loaded.is_empty());
         assert_eq!(status.pressure, Pressure::Ok);
+    }
+
+    struct HeldStatusAdapter {
+        inner: MockAdapter,
+        hold: std::sync::atomic::AtomicBool,
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+
+    #[async_trait::async_trait]
+    impl RuntimeAdapter for HeldStatusAdapter {
+        async fn list(&self) -> Result<Vec<ModelInfo>, BackendError> {
+            self.inner.list().await
+        }
+        async fn load(&self, id: &str, policy: Option<&LoadPolicy>) -> Result<(), BackendError> {
+            self.inner.load(id, policy).await
+        }
+        async fn unload(&self, id: &str) -> Result<(), BackendError> {
+            self.inner.unload(id).await
+        }
+        async fn status(&self) -> Result<BackendStatus, BackendError> {
+            if self.hold.load(std::sync::atomic::Ordering::SeqCst) {
+                self.entered.notify_one();
+                self.release.notified().await;
+            }
+            self.inner.status().await
+        }
+        async fn probe_ready(&self, id: &str) -> Result<bool, BackendError> {
+            self.inner.probe_ready(id).await
+        }
+        async fn chat(
+            &self,
+            req: ChatRequest,
+            cancel: CancellationToken,
+        ) -> Result<ChatResponse, BackendError> {
+            self.inner.chat(req, cancel).await
+        }
+    }
+
+    #[tokio::test]
+    async fn stale_reconcile_completions_cannot_consume_a_new_pending_reconcile() {
+        for stale_result in [
+            Ok(0.0),
+            Err(BackendError::Upstream {
+                message: "stale failure".into(),
+            }),
+        ] {
+            let inner = MockAdapter::new(catalog());
+            let adapter = Arc::new(HeldStatusAdapter {
+                inner,
+                hold: std::sync::atomic::AtomicBool::new(false),
+                entered: tokio::sync::Notify::new(),
+                release: tokio::sync::Notify::new(),
+            });
+            let (tx, _join) = spawn_actor(adapter.clone(), SupervisorConfig::default());
+            let handle = SupervisorHandle { tx: tx.clone() };
+            no_hang(handle.status())
+                .await
+                .expect("startup reconciliation should finish before holding status");
+            // Complete generation 1 without starting a load, then hold the
+            // next admission at generation 2 before injecting its predecessor.
+            assert_eq!(
+                no_hang(handle.load("a", 25.0, on_demand_policy()))
+                    .await
+                    .unwrap_err()
+                    .reason_code(),
+                "eviction_impossible"
+            );
+            adapter
+                .hold
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            let (load_tx, mut load_rx) = oneshot::channel();
+            tx.send(ActorMsg::Cmd(Command::Load {
+                id: "a".into(),
+                memory_gb: 4.0,
+                policy: on_demand_policy(),
+                reply: load_tx,
+            }))
+            .await
+            .expect("actor channel should accept load");
+            no_hang(adapter.entered.notified()).await;
+
+            // The blocked status call proves this request owns a pending
+            // reconcile. Inject an older generation directly into the actor,
+            // then use a channel-ordered request as a processing barrier.
+            tx.send(ActorMsg::ReconcileDone {
+                generation: 1,
+                result: stale_result,
+            })
+            .await
+            .expect("actor channel should accept stale completion");
+            let (barrier_tx, barrier_rx) = oneshot::channel();
+            tx.send(ActorMsg::Cmd(Command::Status { reply: barrier_tx }))
+                .await
+                .expect("actor channel should accept barrier command");
+            let status = no_hang(barrier_rx)
+                .await
+                .expect("actor should answer the barrier command")
+                .expect("status should remain available while reconciling");
+            assert_eq!(
+                status.used_gb, 0.0,
+                "stale completion must not admit the load"
+            );
+            assert!(
+                matches!(load_rx.try_recv(), Err(oneshot::error::TryRecvError::Empty)),
+                "stale completion must not finish new request"
+            );
+            assert_eq!(adapter.inner.load_call_count("a"), 0);
+            adapter.release.notify_one();
+            no_hang(load_rx)
+                .await
+                .expect("load reply sender should remain connected")
+                .expect("current generation should reconcile and load successfully");
+            assert_eq!(adapter.inner.load_call_count("a"), 1);
+        }
     }
 
     struct ReconcileAdapter {
