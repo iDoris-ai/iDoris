@@ -7,7 +7,9 @@
 //! that calls `dispatch_local`, not here (this module has no axum/HTTP
 //! dependency on purpose, so it's testable without spinning up the app).
 
-use idoris_backend::{BackendError, ChatMessage, ChatRequest, ChatResponse, SupervisorHandle};
+use idoris_backend::{
+    BackendError, ChatFailure, ChatMessage, ChatRequest, ChatResponse, SupervisorHandle,
+};
 use idoris_contracts::ComponentCard;
 use idoris_contracts::load_policy::{Admission, Keepalive, LoadMode, LoadPolicy};
 use idoris_contracts::provider::Locality;
@@ -398,7 +400,7 @@ pub async fn dispatch_local(
     }
 
     let chat_result = supervisor
-        .chat(
+        .chat_with_execution(
             ChatRequest {
                 model: model_id,
                 messages,
@@ -408,13 +410,39 @@ pub async fn dispatch_local(
         .await;
 
     match chat_result {
-        Err(err) => Ok(ChatOutcome {
-            decision,
-            served_locality,
-            result: Err(DispatchFailure::Backend(err)),
-            actual_cost_minor: None,
-            settlement_status: SettlementStatus::NotRequired,
-        }),
+        Err(failure) => {
+            let err = match failure {
+                ChatFailure::NotExecuted(err) => {
+                    if let (Some(ledger), Some(id)) = (budget_ledger, reservation_guard.id.as_ref())
+                        && let Err(release_err) = ledger.release_confirmed_unexecuted(
+                            tenant_id.unwrap_or(budget::PERSONAL_TENANT_ID),
+                            id,
+                        )
+                    {
+                        // Leave the guard armed: its ordinary release keeps
+                        // the unresolved intent fenced if confirmation could
+                        // not be persisted.
+                        return Ok(ChatOutcome {
+                            decision,
+                            served_locality,
+                            result: Err(DispatchFailure::Budget(release_err)),
+                            actual_cost_minor: None,
+                            settlement_status: SettlementStatus::NotRequired,
+                        });
+                    }
+                    reservation_guard.take();
+                    err
+                }
+                ChatFailure::OutcomeUnknown(err) => err,
+            };
+            Ok(ChatOutcome {
+                decision,
+                served_locality,
+                result: Err(DispatchFailure::Backend(err)),
+                actual_cost_minor: None,
+                settlement_status: SettlementStatus::NotRequired,
+            })
+        }
         Ok(response) => {
             // A completed upstream response is always returned. The durable
             // journal distinguishes a committed charge from one awaiting

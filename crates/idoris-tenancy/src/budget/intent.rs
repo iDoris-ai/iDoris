@@ -47,7 +47,7 @@ impl BudgetLedger {
         self.live_settlement_intents
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .insert(id.0.clone());
+            .insert(id.0.clone(), tenant.to_owned());
         Ok(())
     }
 
@@ -56,6 +56,16 @@ impl BudgetLedger {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .remove(&id.0);
+    }
+
+    pub(super) fn finish_settlement_intent_for_tenant(&self, tenant: &str, id: &ReservationId) {
+        let mut live = self
+            .live_settlement_intents
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if live.get(&id.0).is_some_and(|owner| owner == tenant) {
+            live.remove(&id.0);
+        }
     }
 
     pub(super) fn check_settlement_intents(
@@ -85,7 +95,7 @@ impl BudgetLedger {
                     [&id],
                 )?;
                 live.remove(&id);
-            } else if !live.contains(&id) {
+            } else if !live.contains_key(&id) {
                 return Err(BudgetError::Storage(format!(
                     "unconfirmed dispatch outcome for reservation {id}; reconcile before admitting spending"
                 )));
@@ -156,6 +166,78 @@ mod tests {
         assert_eq!(restarted.tenant_balance("t").unwrap(), 69);
         drop(restarted);
         drop(primary);
+        drop(sidecar);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_added_extension("settlements.sqlite3"));
+    }
+
+    #[test]
+    fn busy_release_drops_live_exemption_but_keeps_intent_fenced_after_ttl() {
+        let path = std::env::temp_dir().join(format!(
+            "idoris-intent-busy-{}.sqlite3",
+            uuid::Uuid::new_v4()
+        ));
+        let clock = Arc::new(TestClock(AtomicI64::new(0)));
+        let ledger =
+            BudgetLedger::open_with_busy_timeout(&path, clock.clone(), 100, Duration::ZERO)
+                .unwrap();
+        ledger
+            .configure_tenant("t", 100, "UTC", SpendGate::All)
+            .unwrap();
+        let scope = BudgetScope::new("t", "k", "p", "m");
+        let id = ledger.reserve(&scope, Price::Known(40)).unwrap();
+        ledger.begin_settlement("t", &id).unwrap();
+
+        let mut sidecar =
+            rusqlite::Connection::open(path.with_added_extension("settlements.sqlite3")).unwrap();
+        let tx = sidecar
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+
+        // A wrong tenant cannot clear the live exemption, even if the sidecar
+        // is currently busy and cannot confirm ownership from durable state.
+        assert!(matches!(
+            ledger.release("other", &id),
+            Err(BudgetError::Busy)
+        ));
+        assert!(
+            ledger
+                .live_settlement_intents
+                .lock()
+                .unwrap()
+                .contains_key(&id.0)
+        );
+
+        // The real request ending during Busy clears only its volatile
+        // exemption. Its durable intent remains for outcome reconciliation.
+        assert!(matches!(ledger.release("t", &id), Err(BudgetError::Busy)));
+        assert!(
+            !ledger
+                .live_settlement_intents
+                .lock()
+                .unwrap()
+                .contains_key(&id.0)
+        );
+        let durable_intent: i64 = ledger
+            .settlements
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM settlement_intents WHERE reservation_id=?1 AND tenant_id=?2",
+                rusqlite::params![id.0, "t"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(durable_intent, 1);
+        clock.0.store(101, Ordering::SeqCst);
+        tx.rollback().unwrap();
+
+        assert!(matches!(
+            ledger.reserve(&scope, Price::Known(1)),
+            Err(BudgetError::Storage(message))
+                if message.contains("unconfirmed dispatch outcome")
+        ));
+        drop(ledger);
         drop(sidecar);
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(path.with_added_extension("settlements.sqlite3"));

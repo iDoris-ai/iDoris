@@ -202,7 +202,7 @@ pub struct BudgetLedger {
         Mutex<std::collections::HashMap<ReservationId, (String, i64)>>,
     pub(super) unverified_settlements:
         Mutex<std::collections::HashMap<(ReservationId, String), i64>>,
-    pub(super) live_settlement_intents: Mutex<std::collections::HashSet<String>>,
+    pub(super) live_settlement_intents: Mutex<std::collections::HashMap<String, String>>,
     pub(super) clock: Arc<dyn Clock>,
     ttl_ms: i64,
 }
@@ -272,7 +272,7 @@ impl BudgetLedger {
             settlements: Mutex::new(super::settlement::open(path.as_ref(), busy_timeout)?),
             emergency_settlements: Mutex::new(std::collections::HashMap::new()),
             unverified_settlements: Mutex::new(std::collections::HashMap::new()),
-            live_settlement_intents: Mutex::new(std::collections::HashSet::new()),
+            live_settlement_intents: Mutex::new(std::collections::HashMap::new()),
             clock,
             ttl_ms,
         };
@@ -1071,6 +1071,11 @@ impl BudgetLedger {
         reservation_id: &ReservationId,
         confirmed_unexecuted: bool,
     ) -> Result<(), BudgetError> {
+        // The in-memory exemption represents the request lifetime, not the
+        // database transaction. Once this request ends, remove its exemption
+        // even if BEGIN IMMEDIATE below fails with Busy. The durable intent
+        // remains and will then fence admission as an unknown outcome.
+        self.finish_settlement_intent_for_tenant(tenant_id, reservation_id);
         let mut journal = self.settlements.lock().unwrap_or_else(|p| p.into_inner());
         let tx = journal.transaction_with_behavior(TransactionBehavior::Immediate)?;
         if let Some((queued_tenant, queued_actual)) = self

@@ -2,7 +2,7 @@
 
 use std::sync::{
     Arc,
-    atomic::{AtomicI64, Ordering},
+    atomic::{AtomicI64, AtomicUsize, Ordering},
 };
 use std::time::Duration;
 
@@ -23,7 +23,7 @@ use idoris_contracts::{
     provider::{Cost, Family, Locality, ProviderDescriptor},
 };
 use idoris_router::{AppState, build_app};
-use idoris_tenancy::budget::{BudgetLedger, BudgetScope, Clock, SpendGate};
+use idoris_tenancy::budget::{BudgetLedger, BudgetScope, Clock, Price, SpendGate};
 use rusqlite::Connection;
 use tokio::sync::Notify;
 use tower::ServiceExt;
@@ -50,6 +50,7 @@ struct GatedAdapter {
     mock: MockAdapter,
     entered: Arc<Notify>,
     continue_chat: Arc<Notify>,
+    chat_calls: Option<Arc<AtomicUsize>>,
 }
 
 #[async_trait]
@@ -78,6 +79,9 @@ impl RuntimeAdapter for GatedAdapter {
         req: ChatRequest,
         cancel: tokio_util::sync::CancellationToken,
     ) -> Result<ChatResponse, BackendError> {
+        if let Some(calls) = &self.chat_calls {
+            calls.fetch_add(1, Ordering::SeqCst);
+        }
         self.entered.notify_one();
         self.continue_chat.notified().await;
         self.mock.chat(req, cancel).await
@@ -138,6 +142,7 @@ async fn successful_chat_leaves_durable_pending_charge_until_reopen_recovers_it_
         }]),
         entered: entered.clone(),
         continue_chat: continue_chat.clone(),
+        chat_calls: None,
     });
     let supervisor = Supervisor::spawn(adapter, SupervisorConfig::default()).unwrap();
     let app = build_app(AppState {
@@ -402,6 +407,7 @@ async fn settlement_intent_persistence_failure_blocks_upstream_and_releases_rese
         }]),
         entered: entered.clone(),
         continue_chat,
+        chat_calls: None,
     });
     let supervisor = Supervisor::spawn(adapter, SupervisorConfig::default()).unwrap();
     let app = build_app(AppState {
@@ -440,4 +446,257 @@ async fn settlement_intent_persistence_failure_blocks_upstream_and_releases_rese
         .unwrap();
     assert_eq!(status, "released");
     assert_eq!(actual, None);
+}
+
+#[tokio::test]
+async fn cancelled_dispatch_with_busy_sidecar_keeps_unknown_intent_fenced_after_ttl() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let db_path = dir.path().join("budget.sqlite3");
+    let clock = Arc::new(TestClock::default());
+    let ledger = Arc::new(build_ledger(&db_path, clock.clone()));
+    let entered = Arc::new(Notify::new());
+    let adapter = Arc::new(GatedAdapter {
+        mock: MockAdapter::new(vec![ModelInfo {
+            id: PROVIDER.into(),
+            memory_gb: 1.0,
+        }]),
+        entered: entered.clone(),
+        continue_chat: Arc::new(Notify::new()),
+        chat_calls: None,
+    });
+    let supervisor = Supervisor::spawn(adapter, SupervisorConfig::default()).unwrap();
+    let app = build_app(AppState {
+        cards: vec![card()],
+        supervisor: Some(supervisor),
+        budget_ledger: Some(ledger.clone()),
+        ..AppState::default()
+    });
+    let request = Request::post("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(BODY))
+        .unwrap();
+    let task = tokio::spawn(app.clone().oneshot(request));
+    tokio::time::timeout(Duration::from_secs(2), entered.notified())
+        .await
+        .expect("paid request should enter adapter");
+
+    let mut sidecar =
+        Connection::open(db_path.with_added_extension("settlements.sqlite3")).unwrap();
+    sidecar.busy_timeout(Duration::from_millis(80)).unwrap();
+    let tx = sidecar
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .unwrap();
+    task.abort();
+    let _ = task.await;
+    let intents: i64 = tx
+        .query_row("SELECT COUNT(*) FROM settlement_intents", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(intents, 1, "unknown execution intent must remain durable");
+    drop(tx);
+    drop(sidecar);
+
+    // The reservation is expired now, but an unresolved durable intent must
+    // continue to block the next paid dispatch.
+    clock.0.store(1_000_000, Ordering::SeqCst);
+    let admission = ledger.reserve(&scope(), Price::Known(1));
+    assert!(
+        admission
+            .expect_err("expired reservation with unresolved intent must remain fenced")
+            .to_string()
+            .contains("unconfirmed dispatch outcome")
+    );
+    let request = Request::post("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(BODY))
+        .unwrap();
+    let response = tokio::time::timeout(Duration::from_secs(2), app.oneshot(request))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(body["error"]["type"], "internal_error");
+    let intents: i64 = Connection::open(db_path.with_added_extension("settlements.sqlite3"))
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM settlement_intents", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(intents, 1);
+}
+
+#[tokio::test]
+async fn supervisor_adapter_limit_rejection_releases_confirmed_intent() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let db_path = dir.path().join("budget.sqlite3");
+    let clock = Arc::new(TestClock::default());
+    let ledger = Arc::new(build_ledger(&db_path, clock));
+    let entered = Arc::new(Notify::new());
+    let continue_chat = Arc::new(Notify::new());
+    let chat_calls = Arc::new(AtomicUsize::new(0));
+    let adapter = Arc::new(GatedAdapter {
+        mock: MockAdapter::new(vec![ModelInfo {
+            id: PROVIDER.into(),
+            memory_gb: 1.0,
+        }]),
+        entered: entered.clone(),
+        continue_chat: continue_chat.clone(),
+        chat_calls: Some(chat_calls.clone()),
+    });
+    let config = SupervisorConfig {
+        max_concurrent_adapter_calls: 1,
+        ..SupervisorConfig::default()
+    };
+    let supervisor = Supervisor::spawn(adapter, config).unwrap();
+    let app = build_app(AppState {
+        cards: vec![card()],
+        supervisor: Some(supervisor),
+        budget_ledger: Some(ledger.clone()),
+        ..AppState::default()
+    });
+
+    let first = tokio::spawn(
+        app.clone().oneshot(
+            Request::post("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(BODY))
+                .unwrap(),
+        ),
+    );
+    tokio::time::timeout(Duration::from_secs(2), entered.notified())
+        .await
+        .expect("first paid request should occupy the adapter permit");
+
+    let second = app.clone().oneshot(
+        Request::post("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(BODY))
+            .unwrap(),
+    );
+    let response = tokio::time::timeout(Duration::from_secs(2), second)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let error: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(error["error"]["reason_code"], "supervisor_busy");
+    assert_eq!(chat_calls.load(Ordering::SeqCst), 1);
+    let primary = Connection::open(&db_path).unwrap();
+    let rejected_status: String = primary
+        .query_row(
+            "SELECT status FROM reservations ORDER BY rowid DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(rejected_status, "released");
+    let intents: i64 = Connection::open(db_path.with_added_extension("settlements.sqlite3"))
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM settlement_intents", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        intents, 1,
+        "only the still-running first request stays fenced"
+    );
+    drop(primary);
+
+    continue_chat.notify_one();
+    let first_response = tokio::time::timeout(Duration::from_secs(2), first)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(first_response.status(), StatusCode::OK);
+
+    // Once the adapter permit is free, the previously rejected request's
+    // reservation and intent must not prevent another request from running.
+    let third = tokio::spawn(
+        app.oneshot(
+            Request::post("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(BODY))
+                .unwrap(),
+        ),
+    );
+    tokio::time::timeout(Duration::from_secs(2), entered.notified())
+        .await
+        .expect("new paid request should enter the adapter after first completes");
+    continue_chat.notify_one();
+    let third_response = tokio::time::timeout(Duration::from_secs(2), third)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(third_response.status(), StatusCode::OK);
+    assert_eq!(chat_calls.load(Ordering::SeqCst), 2);
+}
+
+struct BusyAdapter(MockAdapter);
+
+#[async_trait]
+impl RuntimeAdapter for BusyAdapter {
+    async fn list(&self) -> Result<Vec<ModelInfo>, BackendError> {
+        self.0.list().await
+    }
+    async fn load(
+        &self,
+        id: &str,
+        policy: Option<&idoris_contracts::LoadPolicy>,
+    ) -> Result<(), BackendError> {
+        self.0.load(id, policy).await
+    }
+    async fn unload(&self, id: &str) -> Result<(), BackendError> {
+        self.0.unload(id).await
+    }
+    async fn status(&self) -> Result<BackendStatus, BackendError> {
+        self.0.status().await
+    }
+    async fn probe_ready(&self, id: &str) -> Result<bool, BackendError> {
+        self.0.probe_ready(id).await
+    }
+    async fn chat(
+        &self,
+        _req: ChatRequest,
+        _cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<ChatResponse, BackendError> {
+        Err(BackendError::Busy {
+            reason: "adapter busy".into(),
+            active_id: None,
+            retry_after_ms: None,
+        })
+    }
+}
+
+#[tokio::test]
+async fn adapter_busy_error_remains_unknown_and_fences_next_dispatch() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let db_path = dir.path().join("budget.sqlite3");
+    let clock = Arc::new(TestClock::default());
+    let ledger = Arc::new(build_ledger(&db_path, clock));
+    let adapter = Arc::new(BusyAdapter(MockAdapter::new(vec![ModelInfo {
+        id: PROVIDER.into(),
+        memory_gb: 1.0,
+    }])));
+    let supervisor = Supervisor::spawn(adapter, SupervisorConfig::default()).unwrap();
+    let app = build_app(AppState {
+        cards: vec![card()],
+        supervisor: Some(supervisor),
+        budget_ledger: Some(ledger.clone()),
+        ..AppState::default()
+    });
+    let request = || {
+        Request::post("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(BODY))
+            .unwrap()
+    };
+    let response = app.clone().oneshot(request()).await.unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let intents: i64 = Connection::open(db_path.with_added_extension("settlements.sqlite3"))
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM settlement_intents", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(intents, 1, "adapter Busy may follow an executed request");
+    let next = app.oneshot(request()).await.unwrap();
+    assert_eq!(next.status(), StatusCode::INTERNAL_SERVER_ERROR);
 }

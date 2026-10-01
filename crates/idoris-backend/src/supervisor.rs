@@ -34,6 +34,23 @@ use crate::types::{BackendStatus, ChatRequest, ChatResponse, ModelInfo, Pressure
 
 type LoadReply = oneshot::Sender<Result<(), BackendError>>;
 
+/// Whether a chat error proves the adapter did not execute the request.
+#[derive(Debug)]
+pub enum ChatFailure {
+    /// The Supervisor rejected the request before calling the adapter.
+    NotExecuted(BackendError),
+    /// The adapter may have acted, so callers must reconcile the outcome.
+    OutcomeUnknown(BackendError),
+}
+
+impl ChatFailure {
+    fn into_backend_error(self) -> BackendError {
+        match self {
+            Self::NotExecuted(error) | Self::OutcomeUnknown(error) => error,
+        }
+    }
+}
+
 /// Tunables for the load/probe loops. `budget_gb` is the global memory
 /// ledger's ceiling (§4: "全局内存账本：budget_gb 由配置给定").
 #[derive(Debug, Clone)]
@@ -102,7 +119,7 @@ enum Command {
     Chat {
         req: ChatRequest,
         cancel: CancellationToken,
-        reply: oneshot::Sender<Result<ChatResponse, BackendError>>,
+        reply: oneshot::Sender<Result<ChatResponse, ChatFailure>>,
     },
     Load {
         id: String,
@@ -231,11 +248,23 @@ impl SupervisorHandle {
         req: ChatRequest,
         cancel: CancellationToken,
     ) -> Result<ChatResponse, BackendError> {
+        self.chat_with_execution(req, cancel)
+            .await
+            .map_err(ChatFailure::into_backend_error)
+    }
+
+    /// Chat while preserving whether an error happened before adapter execution.
+    pub async fn chat_with_execution(
+        &self,
+        req: ChatRequest,
+        cancel: CancellationToken,
+    ) -> Result<ChatResponse, ChatFailure> {
         let (reply, rx) = oneshot::channel();
         self.send(ActorMsg::Cmd(Command::Chat { req, cancel, reply }))
-            .await?;
+            .await
+            .map_err(ChatFailure::NotExecuted)?;
         rx.await
-            .map_err(|_| BackendError::supervisor_unavailable())?
+            .map_err(|_| ChatFailure::OutcomeUnknown(BackendError::supervisor_unavailable()))?
     }
 
     pub async fn load(
@@ -1048,7 +1077,9 @@ async fn run_actor(
                         let _ = reply.send(Err(BackendError::invariant_violation(msg)));
                     }
                     Command::Chat { reply, .. } => {
-                        let _ = reply.send(Err(BackendError::invariant_violation(msg)));
+                        let _ = reply.send(Err(ChatFailure::NotExecuted(
+                            BackendError::invariant_violation(msg),
+                        )));
                     }
                     Command::Load { reply, .. } => {
                         let _ = reply.send(Err(BackendError::invariant_violation(msg)));
@@ -1104,18 +1135,22 @@ async fn run_actor(
 
             ActorMsg::Cmd(Command::Chat { req, cancel, reply }) => match models.get(&req.model) {
                 None => {
-                    let _ = reply.send(Err(BackendError::model_not_found(&req.model)));
+                    let _ = reply.send(Err(ChatFailure::NotExecuted(
+                        BackendError::model_not_found(&req.model),
+                    )));
                 }
                 Some(slot) if slot.state != ModelState::Ready => {
-                    let _ = reply.send(Err(not_ready_error(&req.model, slot.state)));
+                    let _ = reply.send(Err(ChatFailure::NotExecuted(not_ready_error(
+                        &req.model, slot.state,
+                    ))));
                 }
                 Some(_) => {
                     let Ok(permit) = call_slots.clone().try_acquire_owned() else {
-                        let _ = reply.send(Err(BackendError::busy(
+                        let _ = reply.send(Err(ChatFailure::NotExecuted(BackendError::busy(
                             "concurrent adapter-call limit reached",
                             None,
                             None,
-                        )));
+                        ))));
                         continue;
                     };
                     next_seq += 1;
@@ -1149,6 +1184,7 @@ async fn run_actor(
                                 Err(BackendError::adapter_panicked(&model, join_err.to_string()))
                             }
                         };
+                        let result = result.map_err(ChatFailure::OutcomeUnknown);
                         let _ = reply.send(result);
                         if let Some(tx) = self_tx.upgrade() {
                             let _ = tx.send(ActorMsg::ChatDone { model }).await;
@@ -1371,6 +1407,31 @@ mod tests {
             .await
             .expect_err("chat before load must fail");
         assert_eq!(err.reason_code(), "model_not_found");
+    }
+
+    #[tokio::test]
+    async fn chat_with_execution_marks_pre_adapter_rejection_as_not_executed() {
+        let adapter = Arc::new(MockAdapter::new(catalog()));
+        let handle =
+            Supervisor::spawn(adapter, SupervisorConfig::default()).expect("spawn should succeed");
+        let failure = handle
+            .chat_with_execution(
+                ChatRequest {
+                    model: "a".to_string(),
+                    messages: vec![],
+                },
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("chat before load must fail");
+        match failure {
+            ChatFailure::NotExecuted(error) => {
+                assert_eq!(error.reason_code(), "model_not_found");
+            }
+            ChatFailure::OutcomeUnknown(error) => {
+                panic!("pre-adapter rejection was classified unknown: {error:?}");
+            }
+        }
     }
 
     #[test]
