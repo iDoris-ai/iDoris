@@ -52,6 +52,8 @@ reqwest = { version = "0.13", default-features = false, features = ["json", "rus
 # `jsonschema`/`tower`), so this adds no new dependency *tree*, just a
 # direct `idoris-router` edge onto an already-vendored crate.
 indexmap = "2"
+# Incremental SSE termination guard; already present in the dependency tree.
+futures-util = "0.3"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

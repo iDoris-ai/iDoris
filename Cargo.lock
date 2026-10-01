@@ -1147,6 +1147,7 @@ name = "idoris-router"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "futures-util",
  "http-body-util",
  "idoris-backend",
  "idoris-contracts",

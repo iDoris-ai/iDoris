@@ -35,6 +35,8 @@ pub mod models;
 /// why this is a genuinely separate path from `dispatch::dispatch_local`).
 pub mod proxy;
 
+mod sse;
+
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -615,17 +617,10 @@ async fn chat_via_proxy_stream(
             response: upstream,
         } => {
             let status = StatusCode::from_u16(status).unwrap_or(StatusCode::OK);
-            // Genuine incremental pass-through (never buffered), which gets
-            // both R2-G streaming requirements "for free" via Rust's
-            // ownership model -- no TS-style req.on("close") needed (same
-            // pattern as dispatch.rs's CancelOnDrop): reqwest surfaces an
-            // upstream connection dropping mid-body as an `Err` item, not a
-            // silent `None`, so `Body::from_stream` makes hyper abort *our*
-            // client's connection too (explicit error, never a disguised
-            // normal end); and when our client disconnects, axum drops this
-            // stream, which drops `upstream` (owns the real connection),
-            // which reqwest/hyper tears down -- genuinely cancelled.
-            let body = Body::from_stream(upstream.bytes_stream());
+            // The guard preserves incremental bytes and connection ownership:
+            // dropping the body still cancels upstream; an application-level
+            // truncation aborts the downstream body just like a transport error.
+            let body = Body::from_stream(sse::ensure_terminated(upstream.bytes_stream()));
             let mut response = Response::builder()
                 .status(status)
                 .body(body)
@@ -1350,6 +1345,41 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(json["error"], "upstream-down");
         server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn resident_http_service_stream_rejects_unterminated_eof() {
+        for body in [
+            "data: partial\n\n",
+            "",
+            "data: [DONE]",
+            ": data: [DONE]\n\n",
+            "data: [DONE]\ndata: extra\n\n",
+            "data: {\"content\":\"[DONE]\"}\n\n",
+        ] {
+            let server = wiremock::MockServer::start().await;
+            wiremock::Mock::given(wiremock::matchers::method("POST"))
+                .respond_with(
+                    wiremock::ResponseTemplate::new(200).set_body_raw(body, "text/event-stream"),
+                )
+                .mount(&server)
+                .await;
+            let app = build_app(AppState {
+                cards: vec![resident_component_card("omlx", &server.uri())],
+                ..AppState::default()
+            });
+            let response = app.oneshot(post_chat(
+                r#"{"model":"idoris/daily","stream":true,"messages":[{"role":"user","content":"hi"}]}"#,
+                &[],
+            )).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let err = response
+                .into_body()
+                .collect()
+                .await
+                .expect_err("bare EOF must fail");
+            assert!(err.to_string().contains("unterminated upstream SSE"));
+        }
     }
 
     #[tokio::test]

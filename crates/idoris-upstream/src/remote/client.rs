@@ -37,7 +37,9 @@ use genai::chat::{
 };
 use genai::resolver::{AuthData, AuthResolver, Endpoint, ServiceTargetResolver};
 
-use crate::chat::{ChatChunk, ChatChunkStream, ChatRequest, ChatResponse, RemoteChat};
+use crate::chat::{
+    ChatChunk, ChatChunkStream, ChatRequest, ChatResponse, RemoteChat, ensure_terminated,
+};
 use crate::error::UpstreamError;
 use crate::remote::CredentialSource;
 
@@ -203,10 +205,10 @@ impl RemoteChat for RemoteClient {
             .await
             .map_err(|_elapsed| UpstreamError::timeout())?
             .map_err(map_genai_error)?;
-        Ok(Box::pin(DeadlineStream::new(
+        Ok(ensure_terminated(Box::pin(DeadlineStream::new(
             stream_response.stream,
             deadline,
-        )))
+        ))))
     }
 }
 
@@ -617,6 +619,78 @@ mod tests {
         let text: String = chunks.iter().map(|c| c.delta.as_str()).collect();
         assert_eq!(text, "Hello world");
         assert!(chunks.last().expect("at least one chunk").done);
+    }
+
+    #[tokio::test]
+    async fn chat_stream_rejects_unterminated_eof() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"},\"finish_reason\":null}]}\n\n",
+                "text/event-stream",
+            ))
+            .mount(&server).await;
+        let client = client_for(&server, Arc::new(FixedKey("k")));
+        let mut stream = client
+            .chat_stream(request(), far_future_deadline())
+            .await
+            .unwrap();
+        let chunk = std::future::poll_fn(|cx| stream.as_mut().poll_next(cx))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(chunk.delta, "partial");
+        assert!(!chunk.done);
+        let terminal = std::future::poll_fn(|cx| stream.as_mut().poll_next(cx)).await;
+        assert!(
+            matches!(terminal, Some(Err(ref err)) if err.reason_code() == "network_error"),
+            "unexpected terminal: {terminal:?}"
+        );
+        assert!(
+            std::future::poll_fn(|cx| stream.as_mut().poll_next(cx))
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn anthropic_stream_requires_message_stop() {
+        let partial = "event: content_block_start\ndata: {\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\nevent: content_block_delta\ndata: {\"delta\":{\"text\":\"partial\"}}\n\n";
+        for complete in [false, true] {
+            let server = MockServer::start().await;
+            let body = if complete {
+                format!("{partial}event: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n")
+            } else {
+                partial.to_string()
+            };
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(200).set_body_raw(body, "text/event-stream"))
+                .mount(&server)
+                .await;
+            let client = RemoteClient::new(
+                RemoteClientConfig {
+                    kind: RemoteProviderKind::AnthropicCompatible,
+                    base_url: format!("{}/v1/", server.uri()),
+                    provider_label: "test-provider".to_string(),
+                },
+                Arc::new(FixedKey("k")),
+            );
+            let stream = client
+                .chat_stream(request(), far_future_deadline())
+                .await
+                .unwrap();
+            let result = drain(stream).await;
+            if complete {
+                let chunks = result.unwrap();
+                assert_eq!(
+                    chunks.iter().map(|c| c.delta.as_str()).collect::<String>(),
+                    "partial"
+                );
+                assert!(chunks.last().unwrap().done);
+            } else {
+                assert_eq!(result.unwrap_err().reason_code(), "network_error");
+            }
+        }
     }
 
     #[tokio::test]
