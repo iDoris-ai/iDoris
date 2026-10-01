@@ -1081,6 +1081,152 @@ mod tests {
         assert_eq!(pending, 0);
     }
 
+    #[tokio::test]
+    async fn missing_reservations_table_during_settlement_keeps_success_and_recovers_charge() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("b.sqlite3");
+        let clock = Arc::new(TestClock::default());
+        let ledger = Arc::new(BudgetLedger::open_with(path.clone(), clock.clone(), 1).unwrap());
+        ledger
+            .configure_tenant(
+                budget::PERSONAL_TENANT_ID,
+                1_000_000,
+                "UTC",
+                idoris_tenancy::budget::SpendGate::PaidOnly,
+            )
+            .unwrap();
+        let adapter = Arc::new(MockAdapter::new(vec![ModelInfo {
+            id: "p".to_string(),
+            memory_gb: 1.0,
+        }]));
+        adapter.set_chat_delay("p", std::time::Duration::from_millis(100));
+        let supervisor = Supervisor::spawn(adapter, SupervisorConfig::default()).unwrap();
+        let cards = [paid_card("p")];
+        // The mock echoes the prompt in its response. This prompt makes
+        // actual completion usage exceed the fixed 1024-token reservation.
+        let prompt = "hi ".repeat(5_000);
+        let profile = empty_profile();
+        let mut call = Box::pin(dispatch_local(
+            &cards,
+            Some(&supervisor),
+            Some(&ledger),
+            &profile,
+            &prompt,
+            vec![ChatMessage {
+                role: "user".to_string(),
+                content: prompt.clone(),
+            }],
+            CancellationToken::new(),
+        ));
+        // The first poll reserves and marks the intent before yielding to
+        // the upstream call. Renaming the table then makes settlement's
+        // ownership SELECT fail without blocking the upstream response.
+        std::future::poll_fn(|cx| {
+            assert!(call.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        let fault = rusqlite::Connection::open(&path).unwrap();
+        fault
+            .execute_batch("ALTER TABLE reservations RENAME TO reservations_unavailable")
+            .unwrap();
+
+        let outcome = call.await.unwrap();
+        assert!(outcome.result.is_ok());
+        assert_eq!(
+            outcome.result.unwrap().content,
+            format!("mock reply to: {prompt}")
+        );
+        assert_eq!(outcome.actual_cost_minor, None);
+
+        let journal_path = path.with_added_extension("settlements.sqlite3");
+        let journal = rusqlite::Connection::open(&journal_path).unwrap();
+        let (pending, intents): (i64, i64) = journal
+            .query_row(
+                "SELECT (SELECT count(*) FROM pending_settlements),\n                        (SELECT count(*) FROM settlement_intents)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(pending, 1, "completed amount must be durable for retry");
+        assert_eq!(intents, 1, "intent must remain until settlement commits");
+
+        let (retry_sender, mut retry_events) = tokio::sync::mpsc::unbounded_channel();
+        crate::spawn_settlement_worker(Arc::downgrade(&ledger), Some(retry_sender));
+        let first_retry =
+            tokio::time::timeout(std::time::Duration::from_secs(2), retry_events.recv())
+                .await
+                .unwrap()
+                .unwrap();
+        assert!(first_retry.is_err(), "table fault must reach the worker");
+
+        fault
+            .execute_batch("ALTER TABLE reservations_unavailable RENAME TO reservations")
+            .unwrap();
+        // The periodic router worker must apply the saved amount without
+        // requiring a reserve or another dispatch to trigger recovery.
+        let recovered = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                if retry_events.recv().await.expect("retry worker stopped") == Ok(()) {
+                    break;
+                }
+            }
+        })
+        .await;
+        assert!(
+            recovered.is_ok(),
+            "periodic retry did not recover settlement"
+        );
+
+        let actual = budget::estimate_actual_cost_minor(
+            &paid_card("p").provider.cost,
+            &prompt,
+            &format!("mock reply to: {prompt}"),
+            0,
+        );
+        let estimate = budget::estimate_cost_minor(&paid_card("p").provider.cost, &prompt).unwrap();
+        assert!(
+            actual > estimate,
+            "test must exercise actual cost above reserve"
+        );
+        assert_eq!(
+            ledger.tenant_balance(budget::PERSONAL_TENANT_ID).unwrap(),
+            1_000_000 - actual
+        );
+        let (status, recorded_actual): (String, i64) = fault
+            .query_row(
+                "SELECT status, actual_cost_minor FROM reservations",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "settled");
+        assert_eq!(recorded_actual, actual);
+        let (pending, intents): (i64, i64) = journal
+            .query_row(
+                "SELECT (SELECT count(*) FROM pending_settlements),\n                        (SELECT count(*) FROM settlement_intents)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((pending, intents), (0, 0));
+
+        // A second periodic pass must not charge the completed call again.
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(3), retry_events.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            Ok(())
+        );
+        assert_eq!(
+            ledger.tenant_balance(budget::PERSONAL_TENANT_ID).unwrap(),
+            1_000_000 - actual
+        );
+        let id = budget::reserve(&ledger, None, "p", 500).unwrap();
+        budget::release(&ledger, None, &id).unwrap();
+    }
+
     /// R0 finding: the TS reference's cancellation propagation
     /// (`server.ts`'s `req.on("close")`) never actually fires, since the
     /// listener is attached after the request body — and with it, that
