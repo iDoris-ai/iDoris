@@ -310,6 +310,99 @@ fn foreign_instance_cannot_settle_claimed_dispatch_before_owner_records_actual()
 }
 
 #[test]
+fn public_settle_rejects_foreign_dispatch_owner_and_preserves_intent() {
+    let path = db("foreign-public-settle");
+    let clock = Arc::new(TestClock(AtomicI64::new(0)));
+    let a = open(&path, clock.clone(), 60_000);
+    let b = open(&path, clock, 60_000);
+    let s = scope("tenant");
+    a.configure(&s, 100, "UTC").unwrap();
+    let id = a.reserve(&s, Price::Known(30)).unwrap();
+    a.begin_settlement("tenant", &id).unwrap();
+
+    let error = b.settle("tenant", &id, 0).unwrap_err();
+    assert!(
+        matches!(&error, BudgetError::Storage(message) if message.contains("requires its live owner")),
+        "unexpected rejection: {error}"
+    );
+    assert_claimed_reservation_unchanged(&path, &id);
+    b.retry_settlements().unwrap();
+    assert_claimed_reservation_unchanged(&path, &id);
+
+    let receipt = a.settle("tenant", &id, 27).unwrap();
+    assert_eq!(receipt.actual_cost_minor, 27);
+    assert_eq!(a.balance(&s).unwrap(), 73);
+    let actual: i64 = Connection::open(path.as_ref())
+        .unwrap()
+        .query_row(
+            "SELECT actual_cost_minor FROM reservations WHERE id=?1",
+            [&id.0],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(actual, 27);
+    a.retry_settlements().unwrap();
+    a.retry_settlements().unwrap();
+    assert_eq!(a.balance(&s).unwrap(), 73);
+}
+
+#[test]
+fn public_settle_cannot_bypass_dispatch_owner_while_sidecar_is_busy() {
+    let path = db("foreign-public-settle-busy");
+    let clock = Arc::new(TestClock(AtomicI64::new(0)));
+    let a = open(&path, clock.clone(), 60_000);
+    let b = open(&path, clock, 60_000);
+    let s = scope("tenant");
+    a.configure(&s, 100, "UTC").unwrap();
+    let id = a.reserve(&s, Price::Known(30)).unwrap();
+    a.begin_settlement("tenant", &id).unwrap();
+
+    let sidecar_path = path.as_ref().with_added_extension("settlements.sqlite3");
+    let mut sidecar = Connection::open(sidecar_path).unwrap();
+    let sidecar_tx = sidecar
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .unwrap();
+    assert!(matches!(b.settle("tenant", &id, 0), Err(BudgetError::Busy)));
+    drop(sidecar_tx);
+
+    assert_claimed_reservation_unchanged(&path, &id);
+    b.retry_settlements().unwrap();
+    assert_claimed_reservation_unchanged(&path, &id);
+    assert_eq!(a.settle_durable("tenant", &id, 27).unwrap(), Some(27));
+    assert_eq!(a.balance(&s).unwrap(), 73);
+}
+
+fn assert_claimed_reservation_unchanged(path: &TempDb, id: &idoris_tenancy::budget::ReservationId) {
+    let (status, actual): (String, Option<i64>) = Connection::open(path.as_ref())
+        .unwrap()
+        .query_row(
+            "SELECT status, actual_cost_minor FROM reservations WHERE id=?1",
+            [&id.0],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    let sidecar_path = path.as_ref().with_added_extension("settlements.sqlite3");
+    let sidecar = Connection::open(sidecar_path).unwrap();
+    let intents: i64 = sidecar
+        .query_row(
+            "SELECT count(*) FROM settlement_intents WHERE reservation_id=?1",
+            [&id.0],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let owners: i64 = sidecar
+        .query_row(
+            "SELECT count(*) FROM dispatch_owners WHERE reservation_id=?1 AND tenant_id='tenant'",
+            [&id.0],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!((status.as_str(), actual), ("active", None));
+    assert_eq!(intents, 1, "foreign settle must preserve the intent");
+    assert_eq!(owners, 1, "foreign settle must preserve the owner claim");
+}
+
+#[test]
 fn unclaimed_settlement_insert_failure_does_not_write_primary_fallback() {
     let path = db("unclaimed-insert-failure");
     let clock = Arc::new(TestClock(AtomicI64::new(0)));

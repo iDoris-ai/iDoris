@@ -834,6 +834,17 @@ impl BudgetLedger {
         reservation_id: &ReservationId,
         actual_cost_minor: i64,
     ) -> Result<SettleReceipt, BudgetError> {
+        self.settle_public(tenant_id, reservation_id, actual_cost_minor)
+    }
+
+    /// Commit a settlement after the sidecar has serialized dispatch ownership.
+    /// This is internal so callers cannot bypass that ownership protocol.
+    pub(super) fn settle_primary(
+        &self,
+        tenant_id: &str,
+        reservation_id: &ReservationId,
+        actual_cost_minor: i64,
+    ) -> Result<SettleReceipt, BudgetError> {
         if actual_cost_minor < 0 {
             return Err(BudgetError::InvalidActualCost { actual_cost_minor });
         }

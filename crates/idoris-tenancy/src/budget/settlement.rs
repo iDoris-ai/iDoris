@@ -292,6 +292,102 @@ impl BudgetLedger {
         Ok(())
     }
 
+    /// Serialize public settlements with dispatch claims and verify any live
+    /// claim before committing to primary. Replay uses the private primary
+    /// method directly while already holding the sidecar writer transaction.
+    pub(super) fn settle_public(
+        &self,
+        tenant: &str,
+        id: &ReservationId,
+        actual: i64,
+    ) -> Result<super::ledger::SettleReceipt, BudgetError> {
+        if actual < 0 {
+            return Err(BudgetError::InvalidActualCost {
+                actual_cost_minor: actual,
+            });
+        }
+        let outcomes = self
+            .settlement_outcomes
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if let Some((known_tenant, known_actual)) = outcomes.get(&id.0)
+            && (known_tenant != tenant || *known_actual != actual)
+        {
+            return Err(BudgetError::Storage(
+                "in-memory settlement outcome mismatch".into(),
+            ));
+        }
+        let live = self.live_intents.lock().unwrap_or_else(|p| p.into_inner());
+        let live_owner = live.get(&id.0).cloned();
+        if live_owner.as_deref().is_some_and(|owner| owner != tenant) {
+            return Err(BudgetError::TenantMismatch {
+                reservation_id: id.0.clone(),
+            });
+        }
+        let mut journal = self.settlements.lock().unwrap_or_else(|p| p.into_inner());
+        let tx = journal.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let claimed: Option<String> = tx
+            .query_row(
+                "SELECT tenant_id FROM dispatch_owners WHERE reservation_id=?1",
+                [&id.0],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if claimed.as_deref().is_some_and(|owner| owner != tenant) {
+            return Err(BudgetError::TenantMismatch {
+                reservation_id: id.0.clone(),
+            });
+        }
+        if claimed.is_some() && live_owner.as_deref() != Some(tenant) {
+            return Err(BudgetError::Storage(
+                "dispatch settlement requires its live owner".into(),
+            ));
+        }
+        let pending: Option<(String, i64)> = tx.query_row(
+            "SELECT tenant_id, actual_cost_minor FROM pending_settlements WHERE reservation_id=?1",
+            [&id.0], |r| Ok((r.get(0)?, r.get(1)?)),
+        ).optional()?;
+        if pending
+            .as_ref()
+            .is_some_and(|(owner, cost)| owner != tenant || *cost != actual)
+        {
+            return Err(BudgetError::Storage(
+                "settlement journal outcome mismatch".into(),
+            ));
+        }
+        let primary: Option<(String, String, Option<i64>)> = {
+            let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+            conn.query_row(
+                "SELECT tenant_id, status, actual_cost_minor FROM reservations WHERE id=?1",
+                [&id.0],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?
+        };
+        if let Some((owner, status, recorded)) = primary {
+            if owner != tenant {
+                return Err(BudgetError::TenantMismatch {
+                    reservation_id: id.0.clone(),
+                });
+            }
+            if matches!(status.as_str(), "active" | "expired") {
+                if recorded.is_some_and(|recorded| recorded != actual) {
+                    return Err(BudgetError::Storage(
+                        "primary settlement outcome mismatch".into(),
+                    ));
+                }
+                if recorded.is_some() {
+                    return Err(BudgetError::Storage(
+                        "primary settlement outcome is pending recovery".into(),
+                    ));
+                }
+            }
+        }
+        // Keep the sidecar writer lock through the primary commit. Recovery
+        // retires terminal intents, including committed overage outcomes.
+        self.settle_primary(tenant, id, actual)
+    }
+
     /// Persist before attempting settlement. None means durable retry is
     /// pending. If the journal write fails, retain the outcome in memory and
     /// store it on the reservation when the primary ledger remains writable.
@@ -798,6 +894,21 @@ impl BudgetLedger {
                 Err(error) => return Err(error.into_budget_error()),
             }
         }
+        // Commit durable outcomes independently before attempting any primary
+        // replay. A Busy primary write must not roll back their journal rows.
+        tx.commit()?;
+        for (id, token) in retired.drain(..) {
+            self.live_intents
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(&id);
+            self.dispatch_locks
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(&id);
+            let _ = fs::remove_file(self.dispatch_lock_dir.join(format!("{token}.lock")));
+        }
+        let tx = journal.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let rows = {
             let mut stmt = tx.prepare(
                 "SELECT reservation_id, tenant_id, actual_cost_minor
@@ -813,7 +924,7 @@ impl BudgetLedger {
             .collect::<Result<Vec<_>, _>>()?
         };
         for (id, tenant, actual) in rows {
-            match self.settle(&tenant, &id, actual) {
+            match self.settle_primary(&tenant, &id, actual) {
                 Ok(_) => {}
                 Err(err @ BudgetError::OverageTooLarge { .. }) => {
                     // Already committed; retrying must not double charge.
