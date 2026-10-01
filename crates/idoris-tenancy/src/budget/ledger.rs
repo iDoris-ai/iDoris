@@ -723,6 +723,52 @@ impl BudgetLedger {
         reservation_id: &ReservationId,
         actual_cost_minor: i64,
     ) -> Result<SettleReceipt, BudgetError> {
+        let mut journal = self.settlements.lock().unwrap_or_else(|p| p.into_inner());
+        let tx = journal.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let queued: Option<i64> = tx.query_row(
+            "SELECT actual_cost_minor FROM pending_settlements WHERE reservation_id=?1 AND tenant_id=?2",
+            rusqlite::params![reservation_id.0, tenant_id],
+            |row| row.get(0),
+        ).optional()?;
+        if let Some(queued) = queued
+            && queued != actual_cost_minor
+        {
+            tx.rollback()?;
+            return Err(BudgetError::SettlementConflict {
+                reservation_id: reservation_id.0.clone(),
+                reason: format!("pending cost is {queued}, requested {actual_cost_minor}"),
+            });
+        }
+        let result = self.settle_uncoordinated(tenant_id, reservation_id, actual_cost_minor);
+        let committed = matches!(&result, Ok(_) | Err(BudgetError::OverageTooLarge { .. }));
+        let cleanup = if committed {
+            tx.execute(
+                "DELETE FROM pending_settlements WHERE reservation_id=?1 AND tenant_id=?2",
+                rusqlite::params![reservation_id.0, tenant_id],
+            )
+            .and_then(|_| tx.commit())
+        } else {
+            tx.commit()
+        };
+        if let Err(err) = cleanup {
+            if committed {
+                eprintln!(
+                    "committed settlement sidecar cleanup failed: reservation={} error={err}",
+                    reservation_id.0
+                );
+                return result;
+            }
+            return Err(err.into());
+        }
+        result
+    }
+
+    pub(super) fn settle_uncoordinated(
+        &self,
+        tenant_id: &str,
+        reservation_id: &ReservationId,
+        actual_cost_minor: i64,
+    ) -> Result<SettleReceipt, BudgetError> {
         if actual_cost_minor < 0 {
             return Err(BudgetError::InvalidActualCost { actual_cost_minor });
         }
@@ -929,6 +975,30 @@ impl BudgetLedger {
     /// `Released` is the one status H1's `settle` always rejects, so it's
     /// the only correct terminal state for this method to leave behind.
     pub fn release(
+        &self,
+        tenant_id: &str,
+        reservation_id: &ReservationId,
+    ) -> Result<(), BudgetError> {
+        let mut journal = self.settlements.lock().unwrap_or_else(|p| p.into_inner());
+        let tx = journal.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let pending: Option<i64> = tx.query_row(
+            "SELECT actual_cost_minor FROM pending_settlements WHERE reservation_id=?1 AND tenant_id=?2",
+            rusqlite::params![reservation_id.0, tenant_id],
+            |row| row.get(0),
+        ).optional()?;
+        if let Some(pending) = pending {
+            tx.rollback()?;
+            return Err(BudgetError::SettlementConflict {
+                reservation_id: reservation_id.0.clone(),
+                reason: format!("settlement of {pending} is pending"),
+            });
+        }
+        let result = self.release_uncoordinated(tenant_id, reservation_id);
+        tx.commit()?;
+        result
+    }
+
+    pub(super) fn release_uncoordinated(
         &self,
         tenant_id: &str,
         reservation_id: &ReservationId,

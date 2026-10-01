@@ -123,7 +123,8 @@ pub fn reserve(
 }
 
 /// Finalizes a reservation with the actual cost, returning the amount
-/// actually charged.
+/// actually charged. Use [`settle_durable`] for completed production usage
+/// so a transient primary-ledger failure can be retried safely.
 pub fn settle(
     ledger: &BudgetLedger,
     tenant_id: Option<&str>,
@@ -136,8 +137,27 @@ pub fn settle(
         .map(|r| r.actual_cost_minor)
 }
 
+/// Durably settles completed usage. `Some` means the ledger committed the
+/// charge, `None` means the durable retry journal owns the pending charge,
+/// and `Err` reports a settlement anomaly. In particular,
+/// [`BudgetError::OverageTooLarge`] means the charge was committed despite the
+/// error; other errors do not confirm a commit or durable queue entry.
+pub fn settle_durable(
+    ledger: &BudgetLedger,
+    tenant_id: Option<&str>,
+    reservation_id: &ReservationId,
+    actual_cost_minor: i64,
+) -> Result<Option<i64>, BudgetError> {
+    ledger.settle_durable(
+        tenant_id.unwrap_or(PERSONAL_TENANT_ID),
+        reservation_id,
+        actual_cost_minor,
+    )
+}
+
 /// Releases a reservation for a call that didn't happen (backend failure)
-/// — never call this for a call that actually completed (use [`settle`]).
+/// — never call this for a call that actually completed (use
+/// [`settle_durable`]).
 pub fn release(
     ledger: &BudgetLedger,
     tenant_id: Option<&str>,

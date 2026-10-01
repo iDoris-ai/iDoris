@@ -58,6 +58,8 @@ tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 tempfile = "3"
 wiremock = "0.6"
+rusqlite = { workspace = true }
+async-trait = { workspace = true }
 # Real-time (not virtual/paused) retry-delay tests take ~1.25s each
 # (250ms + 1000ms) instead of needing `tokio::time::pause()` plumbed
 # through the whole call chain — acceptable for the handful of tests that
