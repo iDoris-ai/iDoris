@@ -136,7 +136,7 @@ impl PlanEvictionError {
 /// actually fit. `1e-6` GiB (~1 KiB) is far below any real model/engine
 /// memory measurement's precision, so it only absorbs float noise, never
 /// a real difference.
-const CAPACITY_EPSILON_GB: f64 = 1e-6;
+pub(crate) const CAPACITY_EPSILON_GB: f64 = 1e-6;
 
 fn validate_capacity(field: &'static str, value: f64) -> Result<(), PlanEvictionError> {
     if value.is_finite() && value >= 0.0 {

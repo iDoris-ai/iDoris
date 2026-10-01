@@ -35,6 +35,8 @@ pub mod models;
 /// why this is a genuinely separate path from `dispatch::dispatch_local`).
 pub mod proxy;
 
+pub mod write_timeout;
+
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -153,10 +155,10 @@ pub struct AppState {
     /// Backs the local dispatch path (R2-D task 3); `None` means no local
     /// backend is wired — dispatch then fails closed as
     /// `local_only_unavailable` rather than panicking on a missing handle.
-    pub supervisor: Option<idoris_backend::SupervisorHandle>,
-    /// Backs atomic reserve/settle/release for a *paid* candidate (R2-D
-    /// task 4); `None` fails a paid candidate closed identically to an
-    /// unconfigured ledger scope (free candidates unaffected). `Arc`
+    pub supervisor: Option<dispatch::BoundSupervisor>,
+    /// Gates every candidate, including zero cost, through the ledger's
+    /// SpendGate. `None` fails paid candidates closed while free candidates
+    /// remain usable without a ledger. `Arc`
     /// because `BudgetLedger` (wraps a `Mutex<Connection>`) isn't `Clone`.
     pub budget_ledger: Option<Arc<idoris_tenancy::budget::BudgetLedger>>,
     /// Outbound HTTP client for `GET /v1/models` (this PR) and the direct
@@ -191,13 +193,10 @@ impl std::fmt::Debug for AppState {
 
 impl Default for AppState {
     fn default() -> Self {
-        // K13's connect-only retries require K01's no-redirect policy:
-        // a failed redirected connection may follow an already executed POST.
-        let proxy_client = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .no_proxy()
-            .build()
-            .unwrap_or_else(|err| panic!("failed to build the router HTTP client: {err}"));
+        let http_client = match idoris_upstream::http_client() {
+            Ok(client) => client,
+            Err(_) => panic!("failed to build the router upstream HTTP client"),
+        };
         Self {
             instance_id: Uuid::new_v4().to_string(),
             deploy_mode: profile::deploy_mode_from_env(
@@ -206,8 +205,8 @@ impl Default for AppState {
             cards: Vec::new(),
             supervisor: None,
             budget_ledger: None,
-            http_client: reqwest::Client::new(),
-            proxy: Arc::new(proxy::ChatProxy::new(proxy_client)),
+            proxy: Arc::new(proxy::ChatProxy::new(http_client.clone())),
+            http_client,
         }
     }
 }
@@ -406,7 +405,7 @@ fn backend_error_response(err: &BackendError, outcome: &dispatch::ChatOutcome) -
     response
 }
 
-/// A budget-ledger failure gating a *paid* candidate (R2-D task 4).
+/// A budget-ledger failure gating a selected candidate.
 /// `BudgetError::Exceeded` is the one genuine spend decision — 402
 /// `budget_exceeded` with `Budget402Body`'s fields folded in (contract-
 /// tenancy §4's "结构化" requirement). Every other variant is a setup/
@@ -575,6 +574,34 @@ async fn chat_via_proxy(
     body_value: &serde_json::Value,
     record_id: &str,
 ) -> Response {
+    let _reservation = match dispatch::ReservationGuard::reserve(
+        state.budget_ledger.as_deref(),
+        parsed.tenant_id.as_deref(),
+        &selected.card.provider.id,
+        selected.estimated_cost_minor,
+    ) {
+        Ok(guard) => guard,
+        Err(err) => {
+            return budget_error_response(
+                &err,
+                &dispatch::ChatOutcome {
+                    decision: selected.decision.clone(),
+                    served_locality: selected.served_locality,
+                    result: Err(DispatchFailure::Budget(err.clone())),
+                    actual_cost_minor: None,
+                },
+            );
+        }
+    };
+    // Direct forwarding has no actual-usage settlement yet. Do not admit
+    // a paid call whose reservation would otherwise be released uncharged.
+    if budget::is_paid(Some(selected.estimated_cost_minor)) {
+        return error_envelope(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "paid_proxy_unavailable",
+            "付费直连尚不支持预算结算，请使用支持结算的后端",
+        );
+    }
     let stream_requested = body_value
         .get("stream")
         .and_then(serde_json::Value::as_bool)
@@ -622,20 +649,9 @@ async fn chat_via_proxy_stream(
             response: upstream,
         } => {
             let status = StatusCode::from_u16(status).unwrap_or(StatusCode::OK);
-            // Genuine incremental pass-through (never buffered), which gets
-            // both R2-G streaming requirements "for free" via Rust's
-            // ownership model -- no TS-style req.on("close") needed (same
-            // pattern as dispatch.rs's CancelOnDrop): reqwest surfaces an
-            // upstream connection dropping mid-body as an `Err` item, not a
-            // silent `None`, so `Body::from_stream` makes hyper abort *our*
-            // client's connection too (explicit error, never a disguised
-            // normal end); and when our client disconnects, axum drops this
-            // stream, which drops `upstream` (owns the real connection),
-            // which reqwest/hyper tears down -- genuinely cancelled.
-            let body = Body::from_stream(upstream.bytes_stream());
             let mut response = Response::builder()
                 .status(status)
-                .body(body)
+                .body(upstream)
                 .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
             let content_type = content_type.as_deref().unwrap_or("text/event-stream");
             if let Ok(v) = HeaderValue::from_str(content_type) {
@@ -874,7 +890,7 @@ mod tests {
         assert_eq!(json["error"]["type"], "not_found");
     }
 
-    fn post_chat(body: &'static str, headers: &[(&str, &str)]) -> Request<Body> {
+    fn post_chat(body: &str, headers: &[(&str, &str)]) -> Request<Body> {
         let mut builder = Request::builder()
             .method("POST")
             .uri("/v1/chat/completions")
@@ -882,7 +898,7 @@ mod tests {
         for (k, v) in headers {
             builder = builder.header(*k, *v);
         }
-        builder.body(Body::from(body)).unwrap()
+        builder.body(Body::from(body.to_owned())).unwrap()
     }
 
     #[tokio::test]
@@ -1030,8 +1046,8 @@ mod tests {
             idoris_backend::Supervisor::spawn(adapter, idoris_backend::SupervisorConfig::default())
                 .unwrap();
         let state = AppState {
-            cards: vec![card],
-            supervisor: Some(supervisor),
+            cards: vec![card.clone()],
+            supervisor: Some(dispatch::BoundSupervisor::new(&card, supervisor)),
             ..AppState::default()
         };
         let app = build_app(state);
@@ -1144,7 +1160,10 @@ mod tests {
                 .unwrap();
         let state = AppState {
             cards: vec![paid_component_card("paid-1")],
-            supervisor: Some(supervisor),
+            supervisor: Some(dispatch::BoundSupervisor::new(
+                &paid_component_card("paid-1"),
+                supervisor,
+            )),
             budget_ledger: Some(std::sync::Arc::new(ledger)),
             ..AppState::default()
         };
@@ -1238,6 +1257,75 @@ mod tests {
             }),
             endpoint: endpoint.to_string(),
             ..sample_component_card(id)
+        }
+    }
+
+    #[tokio::test]
+    async fn paid_proxy_without_settlement_fails_closed_before_forwarding() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let (_dir, ledger) = configured_budget_ledger(1_000_000);
+        let mut card = resident_component_card("paid", &server.uri());
+        card.provider.cost = paid_component_card("paid").provider.cost;
+        let app = build_app(AppState {
+            cards: vec![card],
+            budget_ledger: Some(std::sync::Arc::new(ledger)),
+            ..AppState::default()
+        });
+        let response = app
+            .oneshot(post_chat(r#"{"messages":[]}"#, &[]))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn free_proxy_obeys_spend_gate_for_buffered_streaming_and_cached_calls() {
+        use idoris_tenancy::budget::SpendGate;
+        for stream in [false, true] {
+            let server = wiremock::MockServer::start().await;
+            wiremock::Mock::given(wiremock::matchers::method("POST"))
+                .respond_with(
+                    wiremock::ResponseTemplate::new(200).set_body_json(json!({"ok": true})),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+            let (_dir, ledger) = configured_budget_ledger(0);
+            let ledger = std::sync::Arc::new(ledger);
+            let app = build_app(AppState {
+                cards: vec![resident_component_card("omlx", &server.uri())],
+                budget_ledger: Some(ledger.clone()),
+                ..AppState::default()
+            });
+            let body =
+                json!({"model": "idoris/daily", "messages": [], "stream": stream}).to_string();
+            // Positive control also primes the buffered idempotency cache.
+            let response = app
+                .clone()
+                .oneshot(post_chat(&body, &[("X-iDoris-Request-Id", "same")]))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert!(!response.headers().contains_key(HEADER_COST_MINOR));
+            response.into_body().collect().await.unwrap();
+            ledger
+                .configure_tenant(budget::PERSONAL_TENANT_ID, 0, "UTC", SpendGate::All)
+                .unwrap();
+            let response = app
+                .oneshot(post_chat(&body, &[("X-iDoris-Request-Id", "same")]))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            let error: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(error["error"]["reason_code"], "budget_exceeded");
+            server.verify().await;
         }
     }
 

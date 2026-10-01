@@ -1,8 +1,7 @@
 //! Direct HTTP forwarding for a generic (non-oMLX) `http_service` component
 //! card's `POST /v1/chat/completions` — a Rust port of
-//! `packages/router/src/proxy.ts`'s `ChatProxy` (buffered/non-streaming
-//! half only; streaming pass-through is a follow-up PR). The upstream
-//! response body is forwarded byte-for-byte — **never** re-wrapped into the
+//! `packages/router/src/proxy.ts`'s `ChatProxy` (buffered and streaming).
+//! The upstream response body is forwarded byte-for-byte — **never** re-wrapped into the
 //! local-dispatch path's `openai_chat_completion` shape, matching TS: a
 //! `form: http_service` candidate is a transparent proxy, not a backend
 //! `RuntimeAdapter` call.
@@ -34,12 +33,33 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use axum::body::Bytes;
+use axum::body::{Body, Bytes};
+use futures_util::stream;
 use idoris_contracts::common::PrivacyClass;
 use idoris_contracts::provider::Locality;
 use indexmap::IndexMap;
 use serde_json::Value;
 use tokio::time::Instant;
+
+/// Keeps the in-flight response permit attached to the allocation handed to
+/// hyper. `Bytes` clones and slices retain this owner until their last drop.
+struct PermittedBytes {
+    bytes: Bytes,
+    _permit: Arc<tokio::sync::OwnedSemaphorePermit>,
+}
+
+impl AsRef<[u8]> for PermittedBytes {
+    fn as_ref(&self) -> &[u8] {
+        self.bytes.as_ref()
+    }
+}
+
+fn with_permit(bytes: Bytes, permit: Arc<tokio::sync::OwnedSemaphorePermit>) -> Bytes {
+    Bytes::from_owner(PermittedBytes {
+        bytes,
+        _permit: permit,
+    })
+}
 
 /// TS default (`proxy.ts`'s `ProxyDeps.idempotencyWindowMs` default).
 const DEFAULT_WINDOW: Duration = Duration::from_secs(60);
@@ -152,6 +172,12 @@ pub struct ChatProxy {
     pub(crate) client: reqwest::Client,
     pub(crate) window: Duration,
     max_entries: usize,
+    header_timeout: Duration,
+    body_timeout: Duration,
+    max_body_bytes: usize,
+    max_cache_bytes: usize,
+    permits: std::sync::Arc<tokio::sync::Semaphore>,
+    stream_idle_timeout: Duration,
     pub(crate) retry_delays: Vec<Duration>,
     pub(crate) cache: Mutex<IndexMap<String, CacheEntry>>,
     flights: Mutex<IndexMap<String, Arc<Flight>>>,
@@ -166,6 +192,12 @@ impl ChatProxy {
             client,
             window: DEFAULT_WINDOW,
             max_entries: DEFAULT_MAX_ENTRIES,
+            header_timeout: Duration::from_secs(10),
+            body_timeout: Duration::from_secs(60),
+            max_body_bytes: 8 * 1024 * 1024,
+            max_cache_bytes: 32 * 1024 * 1024,
+            permits: std::sync::Arc::new(tokio::sync::Semaphore::new(32)),
+            stream_idle_timeout: Duration::from_secs(60),
             // TS default (`proxy.ts`'s `ProxyDeps.retryDelaysMs` default).
             retry_delays: vec![Duration::from_millis(250), Duration::from_secs(1)],
             cache: Mutex::new(IndexMap::new()),
@@ -189,14 +221,10 @@ impl ChatProxy {
         window: Duration,
         retry_delays: Vec<Duration>,
     ) -> Self {
-        Self {
-            client,
-            window,
-            max_entries: DEFAULT_MAX_ENTRIES,
-            retry_delays,
-            cache: Mutex::new(IndexMap::new()),
-            flights: Mutex::new(IndexMap::new()),
-        }
+        let mut proxy = Self::new(client);
+        proxy.window = window;
+        proxy.retry_delays = retry_delays;
+        proxy
     }
 
     #[cfg(test)]
@@ -219,7 +247,9 @@ impl ChatProxy {
         #[allow(clippy::unwrap_used)] // poisoning would already have failed a concurrent caller
         let mut cache = self.cache.lock().unwrap();
         cache.shift_remove(&key);
-        cache.insert(key, entry);
+        if Self::entry_bytes(&key, &entry) <= self.max_cache_bytes {
+            cache.insert(key, entry);
+        }
         self.prune(&mut cache);
     }
 
@@ -237,8 +267,72 @@ impl ChatProxy {
             }
             cache.shift_remove_index(0);
         }
-        while cache.len() > self.max_entries {
-            cache.shift_remove_index(0);
+        let mut bytes = cache.iter().fold(0usize, |total, (key, entry)| {
+            total.saturating_add(Self::entry_bytes(key, entry))
+        });
+        while cache.len() > self.max_entries || bytes > self.max_cache_bytes {
+            if let Some((key, entry)) = cache.shift_remove_index(0) {
+                bytes = bytes.saturating_sub(Self::entry_bytes(&key, &entry));
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn entry_bytes(key: &str, entry: &CacheEntry) -> usize {
+        key.len()
+            .saturating_add(entry.record_id.len())
+            .saturating_add(entry.body.len())
+    }
+
+    fn failure(status: u16, retries: u32) -> ForwardOutcome {
+        ForwardOutcome {
+            status,
+            body: Bytes::from_static(br#"{"error":{"type":"upstream_unavailable"}}"#),
+            content_type: Some("application/json".into()),
+            cached: false,
+            origin_record_id: None,
+            replayed_served_locality: None,
+            retries,
+        }
+    }
+
+    // A total deadline prevents a slow trickle from retaining a buffered
+    // request forever. Check both declared length and actual chunk bytes.
+    async fn read_buffered(&self, mut response: reqwest::Response) -> Result<Bytes, u16> {
+        if response
+            .content_length()
+            .is_some_and(|n| n > self.max_body_bytes as u64)
+        {
+            return Err(502);
+        }
+        tokio::time::timeout(self.body_timeout, async {
+            let mut bytes = Vec::new();
+            while let Some(chunk) = response
+                .chunk()
+                .await
+                .map_err(|error| if error.is_timeout() { 504u16 } else { 502u16 })?
+            {
+                if chunk.len() > self.max_body_bytes.saturating_sub(bytes.len()) {
+                    return Err(502);
+                }
+                bytes.extend_from_slice(&chunk);
+            }
+            Ok(Bytes::from(bytes))
+        })
+        .await
+        .map_err(|_| 504u16)?
+    }
+
+    async fn send_headers(
+        &self,
+        request: reqwest::RequestBuilder,
+    ) -> Result<reqwest::Response, u16> {
+        match tokio::time::timeout(self.header_timeout, request.send()).await {
+            Ok(Ok(response)) => Ok(response),
+            Ok(Err(error)) if error.is_timeout() => Err(504),
+            Ok(Err(_)) => Err(502),
+            Err(_) => Err(504),
         }
     }
 
@@ -255,6 +349,24 @@ impl ChatProxy {
     /// `{endpoint}/v1/chat/completions`. See this module's doc for the
     /// retry/cache/pass-through contract.
     pub async fn forward_buffered(
+        &self,
+        endpoint: &str,
+        body: &Value,
+        opts: &ForwardOpts<'_>,
+    ) -> ForwardOutcome {
+        // Every caller, including a cache hit or singleflight waiter, owns a
+        // permit until its final outgoing bytes are dropped. Retained results
+        // below stay unbound so the registries cannot hold permits indefinitely.
+        let permit = match self.permits.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => return Self::failure(503, 0),
+        };
+        let mut outcome = self.forward_buffered_inner(endpoint, body, opts).await;
+        outcome.body = with_permit(outcome.body, Arc::new(permit));
+        outcome
+    }
+
+    async fn forward_buffered_inner(
         &self,
         endpoint: &str,
         body: &Value,
@@ -287,7 +399,7 @@ impl ChatProxy {
         }
         let flight = {
             let Ok(mut flights) = self.flights.lock() else {
-                return Self::failure(502, "upstream_unavailable");
+                return Self::flight_failure(502, "upstream_unavailable");
             };
             // Completed calls without other callers can be dropped. An
             // uncertain result stays through the idempotency window.
@@ -316,7 +428,7 @@ impl ChatProxy {
                     if let Some(hit) = self.lookup_cached(&key, &fingerprint, opts) {
                         return hit;
                     }
-                    return Self::failure(503, "upstream_unavailable");
+                    return Self::flight_failure(503, "upstream_unavailable");
                 }
                 let flight = Arc::new(Flight {
                     fingerprint: fingerprint.clone(),
@@ -328,14 +440,14 @@ impl ChatProxy {
             }
         };
         if flight.fingerprint != fingerprint {
-            return Self::failure(409, "request_id_conflict");
+            return Self::flight_failure(409, "request_id_conflict");
         }
         let mut result = flight.outcome.lock().await;
         if let Some(outcome) = result.as_ref() {
             return outcome.clone();
         }
         // If the leader is cancelled, waiting calls fail closed instead of resending.
-        *result = Some(Self::failure(502, "upstream_unavailable"));
+        *result = Some(Self::flight_failure(502, "upstream_unavailable"));
         let mut cancellation_guard = FlightCancellationGuard::new(Arc::clone(&flight));
         let mut uncertain = false;
         let outcome = self
@@ -354,7 +466,7 @@ impl ChatProxy {
         outcome
     }
 
-    fn failure(status: u16, kind: &str) -> ForwardOutcome {
+    fn flight_failure(status: u16, kind: &str) -> ForwardOutcome {
         ForwardOutcome {
             status,
             body: Bytes::from(serde_json::json!({"error": {"type": kind}}).to_string()),
@@ -376,7 +488,7 @@ impl ChatProxy {
         let hit = self.cache.lock().unwrap().get(key).cloned();
         let entry = hit.filter(|entry| Instant::now().duration_since(entry.at) < self.window)?;
         if entry.fingerprint != *fingerprint {
-            return Some(Self::failure(409, "request_id_conflict"));
+            return Some(Self::flight_failure(409, "request_id_conflict"));
         }
         // A local_only request must never replay a cache entry whose recorded
         // Served-Locality isn't loopback. Let it proceed through forwarding.
@@ -414,9 +526,15 @@ impl ChatProxy {
 
         let mut attempt = 0usize;
         loop {
-            let sent = self.client.post(&url).json(payload).send().await;
+            // Keep the transport error until retry classification: only a
+            // connection failure proves that this POST was not executed.
+            let sent = tokio::time::timeout(
+                self.header_timeout,
+                self.client.post(&url).json(payload).send(),
+            )
+            .await;
             match sent {
-                Ok(resp) => {
+                Ok(Ok(resp)) => {
                     let status = resp.status().as_u16();
                     let content_type = resp
                         .headers()
@@ -431,19 +549,12 @@ impl ChatProxy {
                     // for 60s — a 2xx with a truncated/empty body
                     // (prdaemon #48 round 2, Low). Not retried: the
                     // upstream already accepted and processed this call.
-                    let Ok(body_bytes) = resp.bytes().await else {
-                        *uncertain = true;
-                        return ForwardOutcome {
-                            status: 502,
-                            body: Bytes::from_static(
-                                br#"{"error":{"type":"upstream_unavailable"}}"#,
-                            ),
-                            content_type: Some("application/json".to_string()),
-                            cached: false,
-                            origin_record_id: None,
-                            replayed_served_locality: None,
-                            retries,
-                        };
+                    let body_bytes = match self.read_buffered(resp).await {
+                        Ok(bytes) => bytes,
+                        Err(status) => {
+                            *uncertain = true;
+                            return Self::failure(status, retries);
+                        }
                     };
                     // Only a genuinely successful (2xx) call is cached —
                     // matches TS's own `res.ok` gate on the `remember()`
@@ -460,6 +571,7 @@ impl ChatProxy {
                                 at: Instant::now(),
                                 fingerprint: fingerprint.clone(),
                                 status,
+                                // Only outgoing bytes own the permit; cache retention must not.
                                 body: body_bytes.clone(),
                                 record_id: opts.record_id.to_string(),
                                 served_locality: opts.served_locality,
@@ -481,28 +593,19 @@ impl ChatProxy {
                         retries,
                     };
                 }
-                Err(err) => {
+                Ok(Err(err)) => {
                     // A send/read timeout or lost headers may follow an executed POST.
                     if err.is_connect() && attempt < self.retry_delays.len() {
                         self.sleep_retry(attempt).await;
                         attempt += 1;
                         continue;
                     }
-                    #[allow(clippy::cast_possible_truncation)]
-                    let retries = attempt as u32;
-                    let body = Bytes::from_static(br#"{"error":{"type":"upstream_unavailable"}}"#);
-                    if !err.is_connect() {
-                        *uncertain = true;
-                    }
-                    return ForwardOutcome {
-                        status: 502,
-                        body,
-                        content_type: Some("application/json".to_string()),
-                        cached: false,
-                        origin_record_id: None,
-                        replayed_served_locality: None,
-                        retries,
-                    };
+                    *uncertain = !err.is_connect();
+                    return Self::failure(if err.is_timeout() { 504 } else { 502 }, attempt as u32);
+                }
+                Err(_) => {
+                    *uncertain = true;
+                    return Self::failure(504, attempt as u32);
                 }
             }
         }
@@ -521,12 +624,25 @@ impl ChatProxy {
     /// outright still gets a plain JSON/text error body, never an SSE
     /// stream carrying an error.
     pub async fn forward_stream(&self, endpoint: &str, body: &Value) -> StreamOutcome {
+        let permit = match self.permits.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                return StreamOutcome::Buffered {
+                    status: 503,
+                    body: Bytes::from_static(br#"{"error":{"type":"upstream_unavailable"}}"#),
+                    content_type: Some("application/json".into()),
+                };
+            }
+        };
         let url = format!("{}/v1/chat/completions", endpoint.trim_end_matches('/'));
         let mut payload = body.clone();
         if let Some(obj) = payload.as_object_mut() {
             obj.insert("stream".to_string(), Value::Bool(true));
         }
-        match self.client.post(&url).json(&payload).send().await {
+        match self
+            .send_headers(self.client.post(&url).json(&payload))
+            .await
+        {
             Ok(resp) => {
                 let status = resp.status().as_u16();
                 let content_type = resp
@@ -535,22 +651,58 @@ impl ChatProxy {
                     .and_then(|v| v.to_str().ok())
                     .map(str::to_string);
                 if (200..300).contains(&status) {
+                    let idle_timeout = self.stream_idle_timeout;
+                    // The stream and each emitted chunk share the permit.
+                    // Hyper may retain chunks after polling EOF, so the final
+                    // chunk owner must release the permit only when it drops.
+                    // The server's WriteTimeoutListener bounds stalled downstream
+                    // writes even while hyper stops polling this body.
+                    let permit = Arc::new(permit);
+                    let chunks = stream::unfold(Some((resp, permit)), move |state| async move {
+                        let (mut response, permit) = state?;
+                        match tokio::time::timeout(idle_timeout, response.chunk()).await {
+                            Ok(Ok(Some(chunk))) => Some((
+                                Ok(with_permit(chunk, Arc::clone(&permit))),
+                                Some((response, permit)),
+                            )),
+                            Ok(Ok(None)) => None,
+                            Ok(Err(error)) => {
+                                Some((Err(std::io::Error::other(error.to_string())), None))
+                            }
+                            Err(_) => Some((
+                                Err(std::io::Error::new(
+                                    std::io::ErrorKind::TimedOut,
+                                    "upstream stream idle timeout",
+                                )),
+                                None,
+                            )),
+                        }
+                    });
+                    let body = Body::from_stream(chunks);
                     StreamOutcome::Stream {
                         status,
                         content_type,
-                        response: resp,
+                        response: body,
                     }
                 } else {
-                    let body = resp.bytes().await.unwrap_or_default();
-                    StreamOutcome::Buffered {
-                        status,
-                        body,
-                        content_type,
+                    match self.read_buffered(resp).await {
+                        Ok(body) => StreamOutcome::Buffered {
+                            status,
+                            body: with_permit(body, Arc::new(permit)),
+                            content_type,
+                        },
+                        Err(error_status) => StreamOutcome::Buffered {
+                            status: error_status,
+                            body: Bytes::from_static(
+                                br#"{"error":{"type":"upstream_unavailable"}}"#,
+                            ),
+                            content_type: Some("application/json".into()),
+                        },
                     }
                 }
             }
-            Err(_err) => StreamOutcome::Buffered {
-                status: 502,
+            Err(status) => StreamOutcome::Buffered {
+                status,
                 body: Bytes::from_static(br#"{"error":{"type":"upstream_unavailable"}}"#),
                 content_type: Some("application/json".to_string()),
             },
@@ -560,9 +712,10 @@ impl ChatProxy {
 
 /// [`ChatProxy::forward_stream`]'s result: either the initial response
 /// wasn't ok (returned buffered, see that method's doc) or it was, in which
-/// case the caller streams `response`'s body onward incrementally (never
-/// buffering it — see `lib.rs`'s `chat_via_proxy` for the explicit-error-
-/// on-truncation / cancel-on-drop pass-through).
+/// case `response` is an incremental body that enforces idle timeouts and
+/// forwards upstream read errors. The stream and its emitted output `Bytes`
+/// share the concurrency permit. It is released after the stream finishes or is
+/// dropped and the last output owner is dropped.
 pub enum StreamOutcome {
     Buffered {
         status: u16,
@@ -572,7 +725,7 @@ pub enum StreamOutcome {
     Stream {
         status: u16,
         content_type: Option<String>,
-        response: reqwest::Response,
+        response: Body,
     },
 }
 
@@ -583,6 +736,22 @@ mod cancellation_tests;
 #[cfg(test)]
 #[path = "proxy_review_tests.rs"]
 mod review_tests;
+
+#[cfg(test)]
+#[path = "proxy_singleflight_limits_tests.rs"]
+mod singleflight_limits_tests;
+
+#[cfg(test)]
+#[path = "proxy_limits_tests.rs"]
+mod limits_tests;
+
+#[cfg(test)]
+#[path = "proxy_concurrency_tests.rs"]
+mod concurrency_tests;
+
+#[cfg(test)]
+#[path = "proxy_slow_reader_tests.rs"]
+mod slow_reader_tests;
 
 #[cfg(test)]
 mod tests {
@@ -838,6 +1007,104 @@ mod tests {
             .forward_buffered(&endpoint, &chat_body(), &opts(Some("req-1"), "rec-2"))
             .await;
         assert!(!again.cached, "nothing may be replayed from a failed read");
+    }
+
+    // K14 / M5: inject short deadlines and small byte budgets, without
+    // process-global configuration or waiting for production deadlines.
+    #[tokio::test]
+    async fn k14_header_deadline_returns_504_without_retry() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_delay(Duration::from_millis(200)),
+            )
+            .mount(&server)
+            .await;
+        let mut proxy = fast_retry_proxy();
+        proxy.header_timeout = Duration::from_millis(20);
+        let out = tokio::time::timeout(
+            Duration::from_millis(100),
+            proxy.forward_buffered(&server.uri(), &chat_body(), &opts(Some("req"), "rec")),
+        )
+        .await
+        .expect("response headers must have a deadline");
+        assert_eq!(
+            (out.status, out.retries, proxy.cache_size_for_test()),
+            (504, 0, 0)
+        );
+    }
+
+    #[tokio::test]
+    async fn k14_buffered_body_deadline_returns_504() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let _ = socket.read(&mut [0; 4096]);
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 100\r\n\r\nx")
+                .unwrap();
+            std::thread::sleep(Duration::from_millis(200));
+        });
+        let mut proxy = fast_retry_proxy();
+        proxy.body_timeout = Duration::from_millis(20);
+        let out = tokio::time::timeout(
+            Duration::from_millis(100),
+            proxy.forward_buffered(
+                &format!("http://{addr}"),
+                &chat_body(),
+                &opts(Some("req"), "rec"),
+            ),
+        )
+        .await
+        .expect("buffered body must have a total deadline");
+        assert_eq!((out.status, proxy.cache_size_for_test()), (504, 0));
+    }
+
+    #[tokio::test]
+    async fn k14_oversize_body_is_502_and_never_cached() {
+        use std::io::{Read, Write};
+        // Cover both declared and unknown lengths (chunked).
+        for headers in ["content-length: 5", "transfer-encoding: chunked"] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                let _ = socket.read(&mut [0; 4096]);
+                let body = if headers.starts_with("content") {
+                    "12345"
+                } else {
+                    "5\r\n12345\r\n0\r\n\r\n"
+                };
+                write!(socket, "HTTP/1.1 200 OK\r\n{headers}\r\n\r\n{body}").unwrap();
+            });
+            let mut proxy = fast_retry_proxy();
+            proxy.max_body_bytes = 4;
+            let out = proxy
+                .forward_buffered(
+                    &format!("http://{addr}"),
+                    &chat_body(),
+                    &opts(Some("req"), "rec"),
+                )
+                .await;
+            assert_eq!((out.status, proxy.cache_size_for_test()), (502, 0));
+        }
+    }
+
+    #[test]
+    fn k14_cache_evicts_by_bytes_and_rejects_an_oversize_entry() {
+        let mut proxy = ChatProxy::new(reqwest::Client::new());
+        proxy.max_cache_bytes = 12;
+        proxy.remember("a".into(), entry(200));
+        proxy.remember("b".into(), entry(200));
+        assert!(!proxy.cache.lock().unwrap().contains_key("a"));
+        assert_eq!(proxy.cache.lock().unwrap()["b"].body.as_ref(), b"{}");
+        let mut large = entry(200);
+        large.body = Bytes::from(vec![0; 17]);
+        proxy.remember("huge".into(), large);
+        assert!(!proxy.cache.lock().unwrap().contains_key("huge"));
+        assert_eq!(proxy.cache.lock().unwrap()["b"].body.as_ref(), b"{}");
     }
 
     /// Counts requests received so the test can assert an exact retry
