@@ -41,6 +41,8 @@ use crate::chat::{ChatChunk, ChatChunkStream, ChatRequest, ChatResponse, RemoteC
 use crate::error::UpstreamError;
 use crate::remote::CredentialSource;
 
+const CREDENTIAL_SOURCE_FAILED: &str = "upstream credential source failed";
+
 /// Which upstream protocol family a [`RemoteClient`] speaks. Each value is
 /// a distinct, single adapter kind — a `RemoteClient` is bound to exactly
 /// one via `genai`'s `with_adapter_kind` (see [`RemoteClient::new`]), not
@@ -92,20 +94,21 @@ impl RemoteClient {
         let provider_label = config.provider_label;
 
         // Bridges `CredentialSource` (this crate's abstraction) into
-        // `genai`'s own resolver mechanism. `Ok(None)` — not an `Err` —
-        // when the source fails: that is exactly how you tell `genai`
-        // "no credential available", which it then reports as its own
-        // `NoAuthData` error, mapped back to `UpstreamError::AuthFailed`
-        // by `map_genai_error`. The credential itself never appears in a
-        // log line here — it flows straight from `CredentialSource` into
-        // `AuthData::from_single`, never through a `{}`/`{:?}` format.
+        // `genai`'s own resolver mechanism. A source failure must return
+        // `Err`: `Ok(None)` makes genai fall back to its default environment
+        // credentials. Use a fixed marker mapped to `AuthFailed` below,
+        // never the source's error text (which may contain secret data).
+        // The key flows straight into `AuthData::from_single`, never
+        // through a `{}`/`{:?}` format.
         let auth_resolver = AuthResolver::from_resolver_async_fn(move |_model_iden| {
             let credentials = Arc::clone(&credentials);
             let provider_label = provider_label.clone();
             Box::pin(async move {
                 match credentials.api_key(&provider_label).await {
                     Ok(key) => Ok(Some(AuthData::from_single(key))),
-                    Err(_) => Ok(None),
+                    Err(_) => Err(genai::resolver::Error::Custom(
+                        CREDENTIAL_SOURCE_FAILED.to_string(),
+                    )),
                 }
             })
                 as Pin<Box<dyn Future<Output = genai::resolver::Result<Option<AuthData>>> + Send>>
@@ -119,7 +122,12 @@ impl RemoteClient {
                 Ok(target)
             });
 
+        let http_client = match crate::http_client() {
+            Ok(client) => client,
+            Err(_) => panic!("failed to build the remote HTTP client"),
+        };
         let client = Client::builder()
+            .with_reqwest(http_client)
             .with_adapter_kind(adapter_kind)
             .with_auth_resolver(auth_resolver)
             .with_service_target_resolver(target_resolver)
@@ -227,6 +235,9 @@ fn map_genai_error(err: genai::Error) -> UpstreamError {
 
         genai::Error::Resolver { resolver_error, .. } => match resolver_error {
             genai::resolver::Error::ApiKeyEnvNotFound { .. } => UpstreamError::auth_failed(),
+            genai::resolver::Error::Custom(message) if message == CREDENTIAL_SOURCE_FAILED => {
+                UpstreamError::auth_failed()
+            }
             _ => UpstreamError::internal("upstream credential resolver failed"),
         },
 
@@ -398,6 +409,119 @@ mod tests {
         async fn api_key(&self, _provider: &str) -> Result<String, UpstreamError> {
             Err(UpstreamError::auth_failed())
         }
+    }
+
+    struct SourceError(UpstreamError);
+
+    #[async_trait]
+    impl CredentialSource for SourceError {
+        async fn api_key(&self, _provider: &str) -> Result<String, UpstreamError> {
+            Err(self.0.clone())
+        }
+    }
+
+    async fn assert_source_failure_ignores_environment(
+        test_name: &str,
+        kind: RemoteProviderKind,
+        streaming: bool,
+    ) {
+        const CHILD: &str = "IDORIS_CREDENTIAL_REGRESSION_CHILD";
+        const HOST_KEY: &str = "host-key-must-not-be-used";
+        // Set env only in a fresh process: Rust 2024 env mutation is
+        // unsafe and would race the other credential tests.
+        if std::env::var(CHILD).as_deref() != Ok(test_name) {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", test_name, "--nocapture"])
+                .env(CHILD, test_name)
+                .env("OPENAI_API_KEY", HOST_KEY)
+                .env("ANTHROPIC_API_KEY", HOST_KEY)
+                .status()
+                .expect("credential regression child must run");
+            assert!(status.success(), "credential regression child failed");
+            return;
+        }
+        assert_eq!(std::env::var("OPENAI_API_KEY").unwrap(), HOST_KEY);
+        assert_eq!(std::env::var("ANTHROPIC_API_KEY").unwrap(), HOST_KEY);
+        for source_error in [
+            UpstreamError::auth_failed(),
+            UpstreamError::internal("credential-store-detail-must-not-leak"),
+        ] {
+            let server = MockServer::start().await;
+            // Even if the upstream would reject the host key, reaching
+            // it has already crossed the credential source's boundary.
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(401))
+                .mount(&server)
+                .await;
+            let client = RemoteClient::new(
+                RemoteClientConfig {
+                    kind,
+                    base_url: format!("{}/v1/", server.uri()),
+                    provider_label: "test-provider".to_string(),
+                },
+                Arc::new(SourceError(source_error)),
+            );
+            let result = if streaming {
+                client
+                    .chat_stream(request(), far_future_deadline())
+                    .await
+                    .map(|_| ())
+            } else {
+                client
+                    .chat(request(), far_future_deadline())
+                    .await
+                    .map(|_| ())
+            };
+            assert_eq!(
+                server.received_requests().await.unwrap().len(),
+                0,
+                "credential source rejection must prevent all outbound requests"
+            );
+            let err = result.expect_err("credential source failure must reject the call");
+            assert_eq!(err, UpstreamError::AuthFailed);
+            assert!(!err.to_string().contains(HOST_KEY));
+            assert!(!err.to_string().contains("credential-store-detail"));
+        }
+    }
+
+    #[tokio::test]
+    async fn openai_chat_source_failure_ignores_environment() {
+        assert_source_failure_ignores_environment(
+            "remote::client::tests::openai_chat_source_failure_ignores_environment",
+            RemoteProviderKind::OpenAiCompatible,
+            false,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn openai_stream_source_failure_ignores_environment() {
+        assert_source_failure_ignores_environment(
+            "remote::client::tests::openai_stream_source_failure_ignores_environment",
+            RemoteProviderKind::OpenAiCompatible,
+            true,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn anthropic_chat_source_failure_ignores_environment() {
+        assert_source_failure_ignores_environment(
+            "remote::client::tests::anthropic_chat_source_failure_ignores_environment",
+            RemoteProviderKind::AnthropicCompatible,
+            false,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn anthropic_stream_source_failure_ignores_environment() {
+        assert_source_failure_ignores_environment(
+            "remote::client::tests::anthropic_stream_source_failure_ignores_environment",
+            RemoteProviderKind::AnthropicCompatible,
+            true,
+        )
+        .await;
     }
 
     fn client_for(server: &MockServer, credentials: Arc<dyn CredentialSource>) -> RemoteClient {

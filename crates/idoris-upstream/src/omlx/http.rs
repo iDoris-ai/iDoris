@@ -83,7 +83,20 @@ pub(super) async fn post_empty(
 ) -> Result<(), BackendError> {
     let url = format!("{base_url}{path}");
     let req = auth_header(client.post(&url), api_key);
-    send_and_discard("POST", path, req, call_timeout).await
+    send_and_discard("POST", path, req, call_timeout, None).await
+}
+
+/// Load mutates engine state: a missing response cannot prove rejection.
+pub(super) async fn post_load(
+    client: &reqwest::Client,
+    base_url: &str,
+    path: &str,
+    api_key: Option<&str>,
+    call_timeout: Duration,
+    model_id: &str,
+) -> Result<(), BackendError> {
+    let req = auth_header(client.post(format!("{base_url}{path}")), api_key);
+    send_and_discard("POST", path, req, call_timeout, Some(model_id)).await
 }
 
 /// `PUT path` with a JSON body, discarding the response body. See
@@ -98,7 +111,7 @@ pub(super) async fn put_json(
 ) -> Result<(), BackendError> {
     let url = format!("{base_url}{path}");
     let req = auth_header(client.put(&url), api_key).json(body);
-    send_and_discard("PUT", path, req, call_timeout).await
+    send_and_discard("PUT", path, req, call_timeout, None).await
 }
 
 /// `POST path` with a JSON body, parsed as JSON — used for `/v1/chat/
@@ -123,21 +136,40 @@ async fn send_and_discard(
     path: &str,
     req: reqwest::RequestBuilder,
     call_timeout: Duration,
+    load_id: Option<&str>,
 ) -> Result<(), BackendError> {
     let attempt = async {
         let resp = req
             .send()
             .await
-            .map_err(|err| transport_error(method, path, &err))?;
-        check_status(method, path, &resp)
+            .map_err(|err| unconfirmed_load_error(load_id, transport_error(method, path, &err)))?;
+        let result = check_status(method, path, &resp);
+        // Only an explicit client rejection proves no allocation. 408
+        // and server errors may arrive after the engine started loading.
+        if resp.status().is_client_error() && resp.status() != reqwest::StatusCode::REQUEST_TIMEOUT
+        {
+            result
+        } else {
+            result.map_err(|err| unconfirmed_load_error(load_id, err))
+        }
     };
     tokio::time::timeout(call_timeout, attempt)
         .await
         .unwrap_or_else(|_elapsed| {
-            Err(upstream_error(format!(
-                "oMLX {method} {path} timed out after {call_timeout:?}"
-            )))
+            Err(unconfirmed_load_error(
+                load_id,
+                upstream_error(format!(
+                    "oMLX {method} {path} timed out after {call_timeout:?}"
+                )),
+            ))
         })
+}
+
+fn unconfirmed_load_error(load_id: Option<&str>, err: BackendError) -> BackendError {
+    match load_id {
+        Some(id) => BackendError::load_unconfirmed(id, err.to_string()),
+        None => err,
+    }
 }
 
 fn check_status(
