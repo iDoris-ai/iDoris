@@ -102,6 +102,17 @@ pub enum BackendError {
     #[error("adapter call for {model_id} panicked: {message}")]
     AdapterPanicked { model_id: String, message: String },
 
+    /// `RuntimeAdapter::load` got far enough that the engine **may already
+    /// hold the model in memory** (e.g. oMLX's `POST .../load` returned 2xx),
+    /// but a follow-up step in the same call failed (pin, or verifying the
+    /// pin state). Distinct from a plain rejection: the Supervisor must not
+    /// assume nothing was allocated — it routes this, like
+    /// [`BackendError::AdapterTimedOut`], through a best-effort `unload` so
+    /// the ledger never forgets memory the engine is really using
+    /// (prdaemon #48 round 2, M1).
+    #[error("load of {model_id} not confirmed after the engine accepted it: {message}")]
+    LoadUnconfirmed { model_id: String, message: String },
+
     #[error("upstream error: {message}")]
     Upstream { message: String },
 
@@ -198,6 +209,7 @@ impl BackendError {
             BackendError::ProbeTimedOut { .. } => "probe_timed_out",
             BackendError::AdapterTimedOut { .. } => "adapter_timed_out",
             BackendError::AdapterPanicked { .. } => "adapter_panicked",
+            BackendError::LoadUnconfirmed { .. } => "load_unconfirmed",
             BackendError::Upstream { .. } => "upstream_error",
             BackendError::Cancelled => "cancelled",
             BackendError::InvalidRequest { .. } => "invalid_request",
@@ -273,6 +285,13 @@ impl BackendError {
 
     pub fn adapter_panicked(model_id: impl Into<String>, message: impl Into<String>) -> Self {
         Self::AdapterPanicked {
+            model_id: model_id.into(),
+            message: message.into(),
+        }
+    }
+
+    pub fn load_unconfirmed(model_id: impl Into<String>, message: impl Into<String>) -> Self {
+        Self::LoadUnconfirmed {
             model_id: model_id.into(),
             message: message.into(),
         }

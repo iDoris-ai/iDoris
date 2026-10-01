@@ -186,14 +186,20 @@ impl OmlxAdapter {
     /// matches `policy` (see [`Self::pin`]/[`Self::check_not_unexpectedly_pinned`]).
     /// A `policy` of `None`, or any mode other than `Resident`, takes the
     /// non-resident path.
+    ///
+    /// Once the `POST` has succeeded the model is (or may be) really
+    /// resident, so any later failure is reported as
+    /// [`BackendError::LoadUnconfirmed`], never as a plain rejection — see
+    /// `RuntimeAdapter::load`'s error contract.
     pub async fn load(&self, id: &str, policy: Option<&LoadPolicy>) -> Result<(), BackendError> {
         self.post(&self.encoded_path("/v1/models/", id, "/load"))
             .await?;
-        if policy.map(|p| p.mode) == Some(LoadMode::Resident) {
+        let confirmed = if policy.map(|p| p.mode) == Some(LoadMode::Resident) {
             self.pin(id).await
         } else {
             self.check_not_unexpectedly_pinned(id).await
-        }
+        };
+        confirmed.map_err(|err| BackendError::load_unconfirmed(id, err.to_string()))
     }
 
     /// `POST /v1/models/{id}/unload`.
@@ -612,6 +618,51 @@ mod tests {
             .await
             .expect_err("PUT 2xx must not be trusted without verification");
         assert!(err.to_string().contains("still reports pinned=false"));
+    }
+
+    /// prdaemon #48 round 2, M1: once `POST .../load` has succeeded, a
+    /// failing follow-up check must be reported as `LoadUnconfirmed` (the
+    /// model may be resident), not as a plain rejection.
+    #[tokio::test]
+    async fn a_failure_after_the_load_post_is_reported_as_unconfirmed() {
+        for (verify, label) in [
+            (ResponseTemplate::new(503), "status 503"),
+            (status_mock(true), "external pin drift"),
+        ] {
+            let server = MockServer::start().await;
+            mount_all(
+                &server,
+                vec![
+                    (LOAD_METHOD, LOAD_PATH, ResponseTemplate::new(200)),
+                    ("GET", VERIFY_PATH, verify),
+                ],
+            )
+            .await;
+            let err = adapter_for(&server)
+                .await
+                .load("qwen3-8b", None)
+                .await
+                .expect_err(label);
+            assert_eq!(err.reason_code(), "load_unconfirmed", "{label}: {err}");
+        }
+    }
+
+    /// Negative contrast: a rejected `POST .../load` allocated nothing and
+    /// stays a plain upstream error.
+    #[tokio::test]
+    async fn a_rejected_load_post_is_not_reported_as_unconfirmed() {
+        let server = MockServer::start().await;
+        mount_all(
+            &server,
+            vec![(LOAD_METHOD, LOAD_PATH, ResponseTemplate::new(500))],
+        )
+        .await;
+        let err = adapter_for(&server)
+            .await
+            .load("qwen3-8b", None)
+            .await
+            .expect_err("a 500 from POST load must fail");
+        assert_ne!(err.reason_code(), "load_unconfirmed");
     }
 
     #[tokio::test]

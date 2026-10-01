@@ -53,6 +53,14 @@ pub trait RuntimeAdapter: Send + Sync {
     /// for. A `policy` of `None` means "use the engine's default"; the
     /// Supervisor always passes `Some` in practice.
     ///
+    /// **Error contract.** A plain `Err` means "nothing was allocated" (or
+    /// it was already released): the Supervisor settles the slot on
+    /// `Stopped` and frees its budget. An implementation whose load can fail
+    /// *after* the engine may already hold the model (e.g. a two-step
+    /// load-then-pin/verify) must return [`BackendError::LoadUnconfirmed`]
+    /// for that case instead, so the Supervisor confirms release with a
+    /// real `unload` rather than forgetting memory still in use.
+    ///
     /// **Concurrency contract** (owned by the Supervisor, not this trait):
     /// the Supervisor never issues two `load`/`unload` calls for the *same*
     /// `id` concurrently, and never overlaps a `load`/`unload` for `id`

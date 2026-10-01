@@ -633,7 +633,9 @@ async fn best_effort_release(
 /// load, since something was already genuinely resident beforehand.
 /// Otherwise: an explicit adapter rejection means no real allocation
 /// happened (`Stopped`, H1's original reasoning, still valid for a fresh
-/// load); a timeout is genuinely uncertain, not a rejection, so it is
+/// load); a timeout — or an adapter reporting
+/// [`BackendError::LoadUnconfirmed`] (the engine accepted the load, a later
+/// step failed) — is genuinely uncertain, not a rejection, so it is
 /// confirmed via [`best_effort_release`] instead of assumed `Stopped`.
 async fn resolve_load_failure(
     adapter: &Arc<dyn RuntimeAdapter>,
@@ -645,7 +647,10 @@ async fn resolve_load_failure(
     if let Some((policy, memory_gb)) = was_ready {
         return LoadFailureOutcome::RestorePreviousReady { policy, memory_gb };
     }
-    if matches!(err, BackendError::AdapterTimedOut { .. }) {
+    if matches!(
+        err,
+        BackendError::AdapterTimedOut { .. } | BackendError::LoadUnconfirmed { .. }
+    ) {
         LoadFailureOutcome::Settle(best_effort_release(adapter, id, timeout).await)
     } else {
         LoadFailureOutcome::Settle(ModelState::Stopped)
@@ -2601,6 +2606,112 @@ mod tests {
         assert_eq!(
             status.used_gb, 4.0,
             "an unconfirmed-release model must stay conservatively occupying budget"
+        );
+    }
+
+    /// A minimal `RuntimeAdapter` whose `load` reports
+    /// `BackendError::LoadUnconfirmed` — the engine accepted the load, a
+    /// later step (pin / verify) failed — as a real oMLX two-step load can.
+    /// `unload_ok` controls whether the follow-up best-effort release works.
+    struct LoadUnconfirmedAdapter {
+        unload_ok: bool,
+        unload_calls: std::sync::atomic::AtomicU32,
+    }
+
+    impl LoadUnconfirmedAdapter {
+        fn new(unload_ok: bool) -> Self {
+            Self {
+                unload_ok,
+                unload_calls: std::sync::atomic::AtomicU32::new(0),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl RuntimeAdapter for LoadUnconfirmedAdapter {
+        async fn list(&self) -> Result<Vec<ModelInfo>, BackendError> {
+            Ok(catalog())
+        }
+        async fn load(&self, id: &str, _policy: Option<&LoadPolicy>) -> Result<(), BackendError> {
+            Err(BackendError::load_unconfirmed(
+                id,
+                "status check after POST load failed (test double)",
+            ))
+        }
+        async fn unload(&self, id: &str) -> Result<(), BackendError> {
+            self.unload_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.unload_ok {
+                Ok(())
+            } else {
+                Err(BackendError::Upstream {
+                    message: format!("LoadUnconfirmedAdapter refuses to unload {id} (test double)"),
+                })
+            }
+        }
+        async fn status(&self) -> Result<BackendStatus, BackendError> {
+            Ok(BackendStatus {
+                pressure: Pressure::Ok,
+                used_gb: 0.0,
+                model_memory_max_gb: 0.0,
+                loaded: Vec::new(),
+            })
+        }
+        async fn probe_ready(&self, _id: &str) -> Result<bool, BackendError> {
+            Ok(true)
+        }
+        async fn chat(
+            &self,
+            req: ChatRequest,
+            _cancel: CancellationToken,
+        ) -> Result<ChatResponse, BackendError> {
+            Ok(ChatResponse {
+                model: req.model,
+                content: String::new(),
+            })
+        }
+    }
+
+    /// prdaemon #48 round 2, M1: a load the engine accepted but whose
+    /// follow-up step failed must be confirmed via a real `unload`, not
+    /// assumed `Stopped` — here the release succeeds, so the ledger is free.
+    #[tokio::test]
+    async fn an_unconfirmed_load_is_released_via_a_real_unload() {
+        let adapter = Arc::new(LoadUnconfirmedAdapter::new(true));
+        let handle = Supervisor::spawn(adapter.clone(), SupervisorConfig::default())
+            .expect("spawn should succeed");
+        let err = handle
+            .load("a", 4.0, on_demand_policy())
+            .await
+            .expect_err("an unconfirmed load must surface as an error");
+        assert_eq!(err.reason_code(), "load_unconfirmed");
+        assert_eq!(
+            adapter
+                .unload_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "an unconfirmed load must trigger exactly one best-effort release"
+        );
+        let status = handle.status().await.expect("status should succeed");
+        assert_eq!(status.used_gb, 0.0);
+    }
+
+    /// Negative contrast: if that release also fails, the memory may still
+    /// be in use — the slot must keep occupying the ledger (`Error`), never
+    /// be guessed free.
+    #[tokio::test]
+    async fn an_unconfirmed_load_whose_release_fails_still_occupies_the_ledger() {
+        let adapter = Arc::new(LoadUnconfirmedAdapter::new(false));
+        let handle = Supervisor::spawn(adapter.clone(), SupervisorConfig::default())
+            .expect("spawn should succeed");
+        handle
+            .load("a", 4.0, on_demand_policy())
+            .await
+            .expect_err("an unconfirmed load must surface as an error");
+        let status = handle.status().await.expect("status should succeed");
+        assert_eq!(
+            status.used_gb, 4.0,
+            "memory that could not be confirmed released must stay on the ledger"
         );
     }
 
