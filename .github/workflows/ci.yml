@@ -48,7 +48,7 @@ jobs:
       - run: cargo clippy --all-targets --features idoris-tenancy/test-bins,idoris-tenancy/mutation-test-hooks -- -D warnings
       - run: cargo test --features idoris-tenancy/test-bins,idoris-tenancy/mutation-test-hooks
       # The vendored SSE framing and field parsing fixes are outside the workspace test set.
-      - run: cargo test -p genai --lib webc::
+      - run: cargo test -p genai --lib 'webc::'
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check licenses bans
