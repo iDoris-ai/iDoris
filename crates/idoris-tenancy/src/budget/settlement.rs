@@ -142,19 +142,6 @@ impl BudgetLedger {
         id: &ReservationId,
         actual: i64,
     ) -> Result<Option<i64>, BudgetError> {
-        // Validate ownership before persisting; reads work under a WAL writer.
-        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
-        let owner: String = conn.query_row(
-            "SELECT tenant_id FROM reservations WHERE id=?1",
-            [&id.0],
-            |r| r.get(0),
-        )?;
-        if owner != tenant {
-            return Err(BudgetError::TenantMismatch {
-                reservation_id: id.0.clone(),
-            });
-        }
-        drop(conn);
         if actual < 0 {
             return Err(BudgetError::InvalidActualCost {
                 actual_cost_minor: actual,
@@ -164,6 +151,24 @@ impl BudgetLedger {
             .settlement_outcomes
             .lock()
             .unwrap_or_else(|p| p.into_inner());
+        // Validate ownership before persisting; reads work under a WAL writer.
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let (owner, primary_actual): (String, Option<i64>) = conn.query_row(
+            "SELECT tenant_id, actual_cost_minor FROM reservations WHERE id=?1",
+            [&id.0],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        if owner != tenant {
+            return Err(BudgetError::TenantMismatch {
+                reservation_id: id.0.clone(),
+            });
+        }
+        drop(conn);
+        if primary_actual.is_some_and(|recorded| recorded != actual) {
+            return Err(BudgetError::Storage(
+                "primary settlement outcome mismatch".into(),
+            ));
+        }
         self.live_intents
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -185,32 +190,40 @@ impl BudgetLedger {
                 "in-memory settlement outcome mismatch".into(),
             ));
         }
-        outcomes.insert(id.0.clone(), (tenant.to_string(), actual));
         let journal = self.settlements.lock().unwrap_or_else(|p| p.into_inner());
         let journal_result = insert_pending(&journal, &id.0, tenant, actual);
-        if let Err(journal_error) = journal_result {
-            drop(journal);
-            // The independent journal may be Busy. Persist the known actual
-            // on the reservation as a second recovery source before returning
-            // the journal error. Keep the in-memory copy too until a journal
-            // write succeeds in this process.
-            let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
-            let fallback = conn.execute(
-                "UPDATE reservations SET actual_cost_minor=?3
+        match journal_result {
+            Err(PendingInsertError::Conflict) => {
+                return Err(BudgetError::Storage(
+                    "settlement journal outcome mismatch".into(),
+                ));
+            }
+            Err(PendingInsertError::Storage(journal_error)) => {
+                drop(journal);
+                // The independent journal may be Busy. Persist the known actual
+                // on the reservation as a second recovery source before returning
+                // the journal error. Keep the in-memory copy too until a journal
+                // write succeeds in this process.
+                outcomes.insert(id.0.clone(), (tenant.to_string(), actual));
+                let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+                let fallback = conn.execute(
+                    "UPDATE reservations SET actual_cost_minor=?3
                  WHERE id=?1 AND tenant_id=?2 AND status IN ('active','expired')
                    AND (actual_cost_minor IS NULL OR actual_cost_minor=?3)",
-                params![id.0, tenant, actual],
-            );
-            if matches!(fallback, Ok(1)) {
-                drop(conn);
-                drop(outcomes);
+                    params![id.0, tenant, actual],
+                );
+                if matches!(fallback, Ok(1)) {
+                    drop(conn);
+                    drop(outcomes);
+                    return Err(journal_error);
+                }
+                eprintln!(
+                    "budget settlement fallback failed: reservation={} journal={journal_error} fallback={fallback:?}",
+                    id.0
+                );
                 return Err(journal_error);
             }
-            eprintln!(
-                "budget settlement fallback failed: reservation={} journal={journal_error} fallback={fallback:?}",
-                id.0
-            );
-            return Err(journal_error);
+            Ok(()) => {}
         }
         drop(journal);
         outcomes.remove(&id.0);
@@ -302,6 +315,7 @@ impl BudgetLedger {
             .lock()
             .unwrap_or_else(|p| p.into_inner());
         let mut journal = self.settlements.lock().unwrap_or_else(|p| p.into_inner());
+        let tx = journal.transaction_with_behavior(TransactionBehavior::Immediate)?;
         // A failed journal write may have stored the known outcome on the
         // reservation. Rehydrate it before replay so an immediate restart
         // after journal Busy can still recover the actual charge.
@@ -321,6 +335,10 @@ impl BudgetLedger {
             .collect::<Result<Vec<_>, _>>()?
         };
         for (id, tenant, actual) in fallback_rows {
+            if self.discard_conflicting_fallback(&tx, &id, &tenant, actual)? {
+                outcomes.remove(&id);
+                continue;
+            }
             if let Some((known_tenant, known_actual)) = outcomes.get(&id)
                 && (known_tenant != &tenant || *known_actual != actual)
             {
@@ -334,7 +352,7 @@ impl BudgetLedger {
         // journal Busy. Complete that deletion on the next retry.
         let intents = {
             let mut stmt =
-                journal.prepare("SELECT reservation_id, tenant_id FROM settlement_intents")?;
+                tx.prepare("SELECT reservation_id, tenant_id FROM settlement_intents")?;
             stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
                 .collect::<Result<Vec<_>, _>>()?
         };
@@ -356,16 +374,24 @@ impl BudgetLedger {
             released
         };
         for (id, tenant) in finished_intents {
-            journal.execute(
+            tx.execute(
                 "DELETE FROM settlement_intents WHERE reservation_id=?1 AND tenant_id=?2",
                 params![id, tenant],
             )?;
         }
         for (id, (tenant, actual)) in outcomes.iter() {
-            insert_pending(&journal, id, tenant, *actual)?;
+            match insert_pending(&tx, id, tenant, *actual) {
+                Ok(()) => {}
+                Err(PendingInsertError::Conflict) => {
+                    if !self.discard_conflicting_fallback(&tx, id, tenant, *actual)? {
+                        return Err(BudgetError::Storage(
+                            "settlement journal outcome mismatch".into(),
+                        ));
+                    }
+                }
+                Err(error) => return Err(error.into_budget_error()),
+            }
         }
-        outcomes.clear();
-        let tx = journal.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let rows = {
             let mut stmt = tx.prepare(
                 "SELECT reservation_id, tenant_id, actual_cost_minor
@@ -412,7 +438,88 @@ impl BudgetLedger {
             )?;
         }
         tx.commit()?;
+        outcomes.clear();
         Ok(())
+    }
+
+    /// A durable journal entry wins over a stale in-memory or primary-ledger
+    /// fallback after a conflicting submission could not read the journal.
+    /// Never rewrite a terminal reservation or accept a tenant mismatch.
+    fn discard_conflicting_fallback(
+        &self,
+        journal: &Connection,
+        id: &str,
+        tenant: &str,
+        fallback_actual: i64,
+    ) -> Result<bool, BudgetError> {
+        let recorded: Option<(String, i64)> = journal
+            .query_row(
+                "SELECT tenant_id, actual_cost_minor FROM pending_settlements WHERE reservation_id=?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let Some((recorded_tenant, recorded_actual)) = recorded else {
+            return Ok(false);
+        };
+        if recorded_tenant != tenant {
+            return Err(BudgetError::TenantMismatch {
+                reservation_id: id.to_string(),
+            });
+        }
+        if recorded_actual == fallback_actual {
+            return Ok(false);
+        }
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let cleared = conn.execute(
+            "UPDATE reservations SET actual_cost_minor=NULL
+             WHERE id=?1 AND tenant_id=?2 AND status IN ('active','expired')
+               AND actual_cost_minor=?3",
+            params![id, tenant, fallback_actual],
+        )?;
+        if cleared == 1 {
+            eprintln!(
+                "discarded conflicting settlement fallback: reservation={id} fallback={fallback_actual} journal={recorded_actual}"
+            );
+            return Ok(true);
+        }
+        let primary: Option<(String, Option<i64>)> = conn
+            .query_row(
+                "SELECT status, actual_cost_minor FROM reservations WHERE id=?1 AND tenant_id=?2",
+                params![id, tenant],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let disposable = match primary {
+            Some((status, actual)) if matches!(status.as_str(), "active" | "expired") => {
+                actual.is_none() || actual == Some(recorded_actual)
+            }
+            Some((status, actual)) => status == "settled" && actual == Some(recorded_actual),
+            None => false,
+        };
+        if !disposable {
+            return Err(BudgetError::Storage(
+                "conflicting settlement fallback could not be cleared".into(),
+            ));
+        }
+        eprintln!(
+            "discarded stale settlement outcome: reservation={id} fallback={fallback_actual} journal={recorded_actual}"
+        );
+        Ok(true)
+    }
+}
+
+enum PendingInsertError {
+    Conflict,
+    Storage(BudgetError),
+}
+
+impl PendingInsertError {
+    fn into_budget_error(self) -> BudgetError {
+        match self {
+            Self::Conflict => BudgetError::Storage("settlement journal outcome mismatch".into()),
+            Self::Storage(error) => error,
+        }
     }
 }
 
@@ -421,21 +528,36 @@ fn insert_pending(
     id: &str,
     tenant: &str,
     actual: i64,
-) -> Result<(), BudgetError> {
-    journal.execute(
-        "INSERT INTO pending_settlements VALUES (?1, ?2, ?3)
+) -> Result<(), PendingInsertError> {
+    let existing: Option<(String, i64)> = journal
+        .query_row(
+            "SELECT tenant_id, actual_cost_minor FROM pending_settlements WHERE reservation_id=?1",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()
+        .map_err(|error| PendingInsertError::Storage(error.into()))?;
+    if let Some(recorded) = existing
+        && recorded != (tenant.to_string(), actual)
+    {
+        return Err(PendingInsertError::Conflict);
+    }
+    journal
+        .execute(
+            "INSERT INTO pending_settlements VALUES (?1, ?2, ?3)
          ON CONFLICT(reservation_id) DO NOTHING",
-        params![id, tenant, actual],
-    )?;
-    let recorded: (String, i64) = journal.query_row(
-        "SELECT tenant_id, actual_cost_minor FROM pending_settlements WHERE reservation_id=?1",
-        [id],
-        |r| Ok((r.get(0)?, r.get(1)?)),
-    )?;
+            params![id, tenant, actual],
+        )
+        .map_err(|error| PendingInsertError::Storage(error.into()))?;
+    let recorded: (String, i64) = journal
+        .query_row(
+            "SELECT tenant_id, actual_cost_minor FROM pending_settlements WHERE reservation_id=?1",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .map_err(|error| PendingInsertError::Storage(error.into()))?;
     if recorded != (tenant.to_string(), actual) {
-        return Err(BudgetError::Storage(
-            "settlement journal outcome mismatch".into(),
-        ));
+        return Err(PendingInsertError::Conflict);
     }
     Ok(())
 }
@@ -899,6 +1021,165 @@ mod tests {
             )
             .unwrap();
         assert_eq!(recorded, 20);
+    }
+
+    #[test]
+    fn conflicting_outcome_does_not_poison_recovery_or_other_tenants() {
+        for retry_before_restart in [false, true] {
+            let db = TestDb::new();
+            let path = db.path();
+            let ledger = BudgetLedger::open(&path).unwrap();
+            ledger
+                .configure_tenant("t", 1000, "UTC", SpendGate::All)
+                .unwrap();
+            ledger
+                .configure_tenant("other", 1000, "UTC", SpendGate::All)
+                .unwrap();
+            let id = ledger
+                .reserve(&BudgetScope::new("t", "k", "p", "m"), Price::Known(10))
+                .unwrap();
+            ledger.begin_settlement("t", &id).unwrap();
+            ledger
+                .settlements
+                .lock()
+                .unwrap()
+                .execute(
+                    "INSERT INTO pending_settlements VALUES (?1, 't', 20)",
+                    [&id.0],
+                )
+                .unwrap();
+
+            assert!(matches!(
+                ledger.settle_durable("t", &id, 21),
+                Err(BudgetError::Storage(_))
+            ));
+            assert!(
+                !ledger
+                    .settlement_outcomes
+                    .lock()
+                    .unwrap()
+                    .contains_key(&id.0)
+            );
+            let primary: Option<i64> = ledger
+                .conn
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT actual_cost_minor FROM reservations WHERE id=?1",
+                    [&id.0],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(primary, None);
+            if retry_before_restart {
+                assert!(
+                    ledger
+                        .reserve(&BudgetScope::new("other", "k", "p", "m"), Price::Known(10))
+                        .is_ok()
+                );
+                assert_eq!(ledger.tenant_balance("t").unwrap(), 980);
+            }
+            drop(ledger);
+
+            let recovered = BudgetLedger::open(&path).unwrap();
+            assert_eq!(recovered.tenant_balance("t").unwrap(), 980);
+            assert_eq!(
+                recovered.tenant_balance("other").unwrap(),
+                if retry_before_restart { 990 } else { 1000 }
+            );
+            if !retry_before_restart {
+                assert!(
+                    recovered
+                        .reserve(&BudgetScope::new("other", "k", "p", "m"), Price::Known(10))
+                        .is_ok()
+                );
+            }
+            assert_eq!(recovered.tenant_balance("t").unwrap(), 980);
+            // A settled primary record must reject conflicting resubmissions too.
+            assert!(recovered.settle_durable("t", &id, 21).is_err());
+            assert_eq!(pending(&recovered), 0);
+            assert_eq!(recovered.settle_durable("t", &id, 20).unwrap(), Some(20));
+            drop(recovered);
+
+            let recovered_again = BudgetLedger::open(&path).unwrap();
+            assert_eq!(recovered_again.tenant_balance("t").unwrap(), 980);
+            assert_eq!(recovered_again.tenant_balance("other").unwrap(), 990);
+        }
+    }
+
+    #[test]
+    fn exclusive_journal_lock_conflict_recovers_authoritative_cost() {
+        for restart_first in [false, true] {
+            for primary_locked in [false, true] {
+                let db = TestDb::new();
+                let path = db.path();
+                let timeout = Duration::from_millis(10);
+                let clock = Arc::new(TestClock(AtomicI64::new(1_000)));
+                let ledger =
+                    BudgetLedger::open_with_busy_timeout(&path, clock.clone(), 10, timeout)
+                        .unwrap();
+                ledger
+                    .configure_tenant("t", 1000, "UTC", SpendGate::All)
+                    .unwrap();
+                ledger
+                    .configure_tenant("other", 1000, "UTC", SpendGate::All)
+                    .unwrap();
+                let id = ledger
+                    .reserve(&BudgetScope::new("t", "k", "p", "m"), Price::Known(10))
+                    .unwrap();
+                ledger.begin_settlement("t", &id).unwrap();
+                ledger
+                    .settlements
+                    .lock()
+                    .unwrap()
+                    .execute(
+                        "INSERT INTO pending_settlements VALUES (?1, 't', 20)",
+                        [&id.0],
+                    )
+                    .unwrap();
+
+                let journal_path = path.with_added_extension("settlements.sqlite3");
+                let blocker = Connection::open(journal_path).unwrap();
+                blocker.busy_timeout(timeout).unwrap();
+                blocker.execute_batch("BEGIN EXCLUSIVE").unwrap();
+                let primary_blocker = if primary_locked {
+                    let conn = Connection::open(&path).unwrap();
+                    conn.busy_timeout(timeout).unwrap();
+                    conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+                    Some(conn)
+                } else {
+                    None
+                };
+                assert!(matches!(
+                    ledger.settle_durable("t", &id, 21),
+                    Err(BudgetError::Busy)
+                ));
+                if let Some(primary_blocker) = primary_blocker {
+                    primary_blocker.execute_batch("ROLLBACK").unwrap();
+                }
+                blocker.execute_batch("ROLLBACK").unwrap();
+                drop(blocker);
+
+                if restart_first {
+                    drop(ledger);
+                } else {
+                    ledger.retry_settlements().unwrap();
+                    assert_eq!(ledger.tenant_balance("t").unwrap(), 980);
+                    drop(ledger);
+                }
+                let recovered =
+                    BudgetLedger::open_with_busy_timeout(&path, clock.clone(), 10, timeout)
+                        .unwrap();
+                assert_eq!(recovered.tenant_balance("t").unwrap(), 980);
+                assert!(
+                    recovered
+                        .reserve(&BudgetScope::new("other", "k", "p", "m"), Price::Known(10))
+                        .is_ok()
+                );
+                assert_eq!(recovered.tenant_balance("t").unwrap(), 980);
+                drop(recovered);
+            }
+        }
     }
 
     #[test]

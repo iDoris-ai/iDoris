@@ -1137,6 +1137,15 @@ mod tests {
 
     #[tokio::test]
     async fn cancelled_release_under_main_db_lock_is_retried_by_live_worker() {
+        assert_cancelled_release_lock_is_retried(false).await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_release_under_sidecar_exclusive_lock_is_retried_by_live_worker() {
+        assert_cancelled_release_lock_is_retried(true).await;
+    }
+
+    async fn assert_cancelled_release_lock_is_retried(sidecar_lock: bool) {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("b.sqlite3");
         let ledger = Arc::new(
@@ -1191,28 +1200,56 @@ mod tests {
             std::task::Poll::Ready(())
         })
         .await;
-        let blocker = rusqlite::Connection::open(&path).unwrap();
-        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
-        drop(call);
 
-        let err = tokio::time::timeout(std::time::Duration::from_secs(3), retries.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(
-            err.is_err(),
-            "worker should report the locked-main-db retry failure"
-        );
+        let journal_path = path.with_added_extension("settlements.sqlite3");
+        let lock_path = if sidecar_lock { &journal_path } else { &path };
+        let blocker = rusqlite::Connection::open(lock_path).unwrap();
+        if sidecar_lock {
+            let mode: String = blocker
+                .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+                .unwrap();
+            assert_ne!(mode.to_ascii_lowercase(), "wal");
+            blocker.execute_batch("BEGIN EXCLUSIVE").unwrap();
+            let probe = rusqlite::Connection::open(&journal_path).unwrap();
+            probe.busy_timeout(std::time::Duration::ZERO).unwrap();
+            let error = probe
+                .query_row("SELECT count(*) FROM settlement_intents", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap_err();
+            assert!(matches!(BudgetError::from(error), BudgetError::Busy));
+        } else {
+            blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+        }
+
         let main = rusqlite::Connection::open(&path).unwrap();
-        let active: i64 = main
+        let hold: i64 = main
             .query_row(
-                "SELECT count(*) FROM reservations WHERE status='active'",
+                "SELECT dispatch_hold FROM reservations WHERE status='active'",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(active, 1);
+        assert_eq!(
+            hold, 1,
+            "paid dispatch must hold its reservation before await"
+        );
+        if sidecar_lock {
+            let intents: i64 = blocker
+                .query_row("SELECT count(*) FROM settlement_intents", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(intents, 1, "paid dispatch must persist its intent");
+        }
         drop(main);
+
+        drop(call);
+        let failed = tokio::time::timeout(std::time::Duration::from_secs(3), retries.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(failed.is_err(), "worker should observe the locked-db retry");
         blocker.execute_batch("ROLLBACK").unwrap();
 
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -1231,9 +1268,18 @@ mod tests {
         .expect("worker should automatically retry the known release");
         assert_eq!(
             ledger.tenant_balance(budget::PERSONAL_TENANT_ID).unwrap(),
-            1_000_000
+            1_000_000,
+            "cancellation must release without charging"
         );
         let main = rusqlite::Connection::open(&path).unwrap();
+        let active: i64 = main
+            .query_row(
+                "SELECT count(*) FROM reservations WHERE status='active'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(active, 0);
         let released: i64 = main
             .query_row(
                 "SELECT count(*) FROM reservations WHERE status='released'",
@@ -1243,14 +1289,19 @@ mod tests {
             .unwrap();
         assert_eq!(released, 1);
         drop(main);
-        let journal =
-            rusqlite::Connection::open(path.with_added_extension("settlements.sqlite3")).unwrap();
+        let journal = rusqlite::Connection::open(&journal_path).unwrap();
         let intents: i64 = journal
             .query_row("SELECT count(*) FROM settlement_intents", [], |row| {
                 row.get(0)
             })
             .unwrap();
+        let pending_releases: i64 = journal
+            .query_row("SELECT count(*) FROM pending_releases", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
         assert_eq!(intents, 0);
+        assert_eq!(pending_releases, 0);
         let id = budget::reserve(&ledger, None, "p", 500).unwrap();
         budget::release(&ledger, None, &id).unwrap();
     }

@@ -991,6 +991,14 @@ impl BudgetLedger {
                 ));
             }
         }
+        // Preserve a retryable cancellation before reading the independent
+        // journal: an exclusive sidecar lock can make even this read Busy.
+        // The worker rechecks both stores before it releases the reservation.
+        self.release_outcomes
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(reservation_id.0.clone(), tenant_id.to_string());
+        live.remove(&reservation_id.0);
         let journal = self.settlements.lock().unwrap_or_else(|p| p.into_inner());
         let pending_actual: i64 = journal.query_row(
             "SELECT count(*) FROM pending_settlements WHERE reservation_id=?1",
@@ -998,17 +1006,16 @@ impl BudgetLedger {
             |r| r.get(0),
         )?;
         if pending_actual > 0 {
+            self.release_outcomes
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(&reservation_id.0);
             return Err(BudgetError::Storage(
                 "cannot release reservation with a pending actual outcome".into(),
             ));
         }
-        // Keep a retryable outcome even when both databases are Busy.
-        // After a crash, the pre-call intent still fails closed.
-        self.release_outcomes
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .insert(reservation_id.0.clone(), tenant_id.to_string());
-        live.remove(&reservation_id.0);
+        // Keep a retryable outcome even when either database is Busy. After
+        // a crash, the durable pre-call intent still fails closed.
         let queue_result = journal.execute(
             "INSERT INTO pending_releases VALUES (?1, ?2) ON CONFLICT(reservation_id) DO NOTHING",
             rusqlite::params![reservation_id.0, tenant_id],
@@ -1440,6 +1447,12 @@ mod tests {
         fn drop(&mut self) {
             for suffix in ["", "-wal", "-shm"] {
                 let mut p = self.0.clone().into_os_string();
+                p.push(suffix);
+                let _ = std::fs::remove_file(p);
+            }
+            let sidecar = self.0.with_added_extension("settlements.sqlite3");
+            for suffix in ["", "-wal", "-shm"] {
+                let mut p = sidecar.clone().into_os_string();
                 p.push(suffix);
                 let _ = std::fs::remove_file(p);
             }
@@ -2174,6 +2187,76 @@ mod tests {
             .release(&scope.tenant_id, &id)
             .expect("first release");
         assert!(ledger.release(&scope.tenant_id, &id).is_ok());
+    }
+
+    #[test]
+    fn cancellation_does_not_release_pending_actual_after_exclusive_read_failure() {
+        let path = temp_db_path("release-sidecar-exclusive");
+        let ledger = BudgetLedger::open_with_busy_timeout(
+            &path,
+            Arc::new(SystemClock),
+            60_000,
+            Duration::ZERO,
+        )
+        .expect("open");
+        let scope = BudgetScope::new("acme-co", "key-1", "openai", "gpt-5");
+        ledger.configure(&scope, 1_000, "UTC").expect("configure");
+        let id = ledger.reserve(&scope, Price::Known(100)).expect("reserve");
+        ledger
+            .begin_settlement(&scope.tenant_id, &id)
+            .expect("begin settlement");
+        ledger
+            .settlements
+            .lock()
+            .expect("settlement journal")
+            .execute(
+                "INSERT INTO pending_settlements VALUES (?1, ?2, 20)",
+                rusqlite::params![id.0, scope.tenant_id],
+            )
+            .expect("record actual outcome");
+
+        let blocker = Connection::open(path.as_ref().with_added_extension("settlements.sqlite3"))
+            .expect("open sidecar blocker");
+        blocker.busy_timeout(Duration::ZERO).expect("busy timeout");
+        blocker
+            .execute_batch("BEGIN EXCLUSIVE")
+            .expect("lock sidecar");
+
+        assert!(matches!(
+            ledger.release(&scope.tenant_id, &id),
+            Err(BudgetError::Busy)
+        ));
+        assert!(matches!(ledger.retry_settlements(), Err(BudgetError::Busy)));
+        assert_eq!(ledger.balance(&scope).expect("balance while pending"), 900);
+
+        blocker.execute_batch("ROLLBACK").expect("unlock sidecar");
+        ledger.retry_settlements().expect("recover actual outcome");
+        assert_eq!(ledger.balance(&scope).expect("recovered balance"), 980);
+        assert!(
+            !ledger
+                .release_outcomes
+                .lock()
+                .expect("release outcomes")
+                .contains_key(&id.0)
+        );
+        assert!(
+            !ledger
+                .live_intents
+                .lock()
+                .expect("live intents")
+                .contains(&id.0)
+        );
+        let (status, actual): (String, Option<i64>) = ledger
+            .conn
+            .lock()
+            .expect("ledger connection")
+            .query_row(
+                "SELECT status, actual_cost_minor FROM reservations WHERE id=?1",
+                [&id.0],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("reservation outcome");
+        assert_eq!((status.as_str(), actual), ("settled", Some(20)));
     }
 
     /// Negative control: a settled reservation can't be released — that
