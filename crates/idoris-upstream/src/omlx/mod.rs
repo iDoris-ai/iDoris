@@ -187,13 +187,20 @@ impl OmlxAdapter {
     /// A `policy` of `None`, or any mode other than `Resident`, takes the
     /// non-resident path.
     ///
-    /// Once the `POST` has succeeded the model is (or may be) really
-    /// resident, so any later failure is reported as
+    /// If the `POST` result is unknown, or it succeeds and a later step
+    /// fails, the model may be resident. Such failures are reported as
     /// [`BackendError::LoadUnconfirmed`], never as a plain rejection — see
     /// `RuntimeAdapter::load`'s error contract.
     pub async fn load(&self, id: &str, policy: Option<&LoadPolicy>) -> Result<(), BackendError> {
-        self.post(&self.encoded_path("/v1/models/", id, "/load"))
-            .await?;
+        http::post_load(
+            &self.client,
+            &self.base_url,
+            &self.encoded_path("/v1/models/", id, "/load"),
+            self.api_key(),
+            self.call_timeout,
+            id,
+        )
+        .await?;
         let confirmed = if policy.map(|p| p.mode) == Some(LoadMode::Resident) {
             self.pin(id).await
         } else {
@@ -215,7 +222,7 @@ impl OmlxAdapter {
     /// `resident` path: `PUT /admin/api/models/{id}/settings` then confirm
     /// via [`Self::verify_model_state`]. On 0.6.4 the PUT itself always
     /// fails (401, no admin session) — see the crate module doc — so this
-    /// reports a confirmed pin failure (model loaded, running unpinned)
+    /// reports a pin failure (model loaded, pin state unconfirmed)
     /// rather than silently treating the load as fully successful.
     async fn pin(&self, id: &str) -> Result<(), BackendError> {
         let path = self.encoded_path("/admin/api/models/", id, "/settings");
@@ -224,7 +231,7 @@ impl OmlxAdapter {
             upstream_error(format!(
                 "oMLX pin unavailable for {id}: {err} (0.6.4 requires an admin \
                      session the inference API key can't provide; model is loaded \
-                     but running unpinned)"
+                     but pin state is unconfirmed)"
             ))
         })?;
         // A 2xx from PUT doesn't itself confirm the pin took effect —
@@ -654,15 +661,123 @@ mod tests {
         let server = MockServer::start().await;
         mount_all(
             &server,
-            vec![(LOAD_METHOD, LOAD_PATH, ResponseTemplate::new(500))],
+            vec![(LOAD_METHOD, LOAD_PATH, ResponseTemplate::new(400))],
         )
         .await;
         let err = adapter_for(&server)
             .await
             .load("qwen3-8b", None)
             .await
-            .expect_err("a 500 from POST load must fail");
-        assert_ne!(err.reason_code(), "load_unconfirmed");
+            .expect_err("a 400 from POST load must fail");
+        assert_eq!(err.reason_code(), "upstream_error");
+    }
+
+    #[tokio::test]
+    async fn k09_load_and_pin_timeouts_are_unconfirmed() {
+        for pin_timeout in [false, true] {
+            let server = MockServer::start().await;
+            let slow = ResponseTemplate::new(200).set_delay(Duration::from_secs(1));
+            mount_all(
+                &server,
+                vec![
+                    (
+                        LOAD_METHOD,
+                        LOAD_PATH,
+                        if pin_timeout {
+                            ResponseTemplate::new(200)
+                        } else {
+                            slow.clone()
+                        },
+                    ),
+                    ("PUT", SETTINGS_PATH, slow),
+                ],
+            )
+            .await;
+            let adapter = OmlxAdapter::new(OmlxAdapterConfig {
+                base_url: server.uri(),
+                api_key: Some("test-key-should-never-leak".into()),
+                call_timeout: Duration::from_millis(100),
+            })
+            .expect("adapter");
+            let policy = pin_timeout.then(resident_policy);
+            let err = adapter
+                .load("qwen3-8b", policy.as_ref())
+                .await
+                .expect_err("timeout");
+            assert_eq!(err.reason_code(), "load_unconfirmed", "{err}");
+            assert!(!err.to_string().contains("test-key-should-never-leak"));
+            let requests = server.received_requests().await.expect("requests");
+            assert_eq!(requests.len(), if pin_timeout { 2 } else { 1 });
+        }
+    }
+
+    #[tokio::test]
+    async fn k09_load_and_pin_connections_closed_after_receipt_are_unconfirmed() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for pin_disconnect in [false, true] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind");
+            let addr = listener.local_addr().expect("address");
+            let received = tokio::spawn(async move {
+                let paths: &[&[u8]] = if pin_disconnect {
+                    &[
+                        b"POST /v1/models/qwen3-8b/load ",
+                        b"PUT /admin/api/models/qwen3-8b/settings ",
+                    ]
+                } else {
+                    &[b"POST /v1/models/qwen3-8b/load "]
+                };
+                for (index, prefix) in paths.iter().enumerate() {
+                    let (mut socket, _) = listener.accept().await.expect("accept");
+                    let mut request = Vec::new();
+                    while !request.ends_with(b"\r\n\r\n") {
+                        request.push(socket.read_u8().await.expect("request headers"));
+                    }
+                    assert!(request.starts_with(prefix));
+                    if pin_disconnect && index == 0 {
+                        socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.expect("load response");
+                    }
+                    // Close the mutation connection before returning headers.
+                }
+            });
+            let adapter = OmlxAdapter::new(OmlxAdapterConfig {
+                base_url: format!("http://{addr}"),
+                api_key: None,
+                call_timeout: Duration::from_secs(1),
+            })
+            .expect("adapter");
+            let policy = pin_disconnect.then(resident_policy);
+            let err = adapter
+                .load("qwen3-8b", policy.as_ref())
+                .await
+                .expect_err("connection closed");
+            received.await.expect("server received the mutation");
+            assert_eq!(err.reason_code(), "load_unconfirmed", "{err}");
+        }
+    }
+
+    #[tokio::test]
+    async fn k09_ambiguous_load_http_status_is_unconfirmed() {
+        for status in [408, 500, 503] {
+            let server = MockServer::start().await;
+            mount_all(
+                &server,
+                vec![(
+                    LOAD_METHOD,
+                    LOAD_PATH,
+                    ResponseTemplate::new(status).set_body_string("do-not-leak-body"),
+                )],
+            )
+            .await;
+            let err = adapter_for(&server)
+                .await
+                .load("qwen3-8b", None)
+                .await
+                .expect_err("ambiguous response");
+            assert_eq!(err.reason_code(), "load_unconfirmed", "{status}: {err}");
+            assert!(!err.to_string().contains("do-not-leak-body"));
+        }
     }
 
     #[tokio::test]
