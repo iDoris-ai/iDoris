@@ -87,15 +87,87 @@ async fn live_stream_uses_the_shared_permit_until_body_completion() {
         "rejected calls must not go upstream"
     );
 
-    let bytes = body.collect().await.unwrap().to_bytes();
+    let mut body = body;
+    let frame = body.frame().await.unwrap().unwrap();
+    let bytes = frame.into_data().unwrap();
     assert_eq!(bytes.as_ref(), b"hello");
+    assert!(
+        body.frame().await.is_none(),
+        "the finite response reached EOF"
+    );
+    drop(body);
+
+    // The body reached EOF, but the retained output frame still owns the permit.
+    assert_eq!(proxy.permits.available_permits(), 0);
+    assert_eq!(
+        proxy
+            .forward_buffered(&url, &serde_json::json!({}), &opts())
+            .await
+            .status,
+        503
+    );
+    assert!(matches!(
+        proxy.forward_stream(&url, &serde_json::json!({})).await,
+        StreamOutcome::Buffered { status: 503, .. }
+    ));
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+
+    let cloned = bytes.clone();
+    let slice = cloned.slice(1..);
+    drop(bytes);
+    drop(cloned);
+    assert_eq!(proxy.permits.available_permits(), 0);
+    drop(slice);
     assert_eq!(proxy.permits.available_permits(), 1);
     server.verify().await;
 }
 
 #[tokio::test]
+async fn finite_chunked_stream_keeps_permit_after_eof_while_output_is_retained() {
+    let url =
+        one_response(b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n3\r\nend\r\n0\r\n\r\n");
+    let proxy = test_proxy();
+    let mut body = match proxy.forward_stream(&url, &serde_json::json!({})).await {
+        StreamOutcome::Stream { response, .. } => response,
+        StreamOutcome::Buffered { status, .. } => panic!("expected stream, got {status}"),
+    };
+    let bytes = body.frame().await.unwrap().unwrap().into_data().unwrap();
+    assert_eq!(bytes.as_ref(), b"end");
+    assert!(
+        body.frame().await.is_none(),
+        "the terminating chunk reached EOF"
+    );
+    drop(body);
+
+    assert_eq!(proxy.permits.available_permits(), 0);
+    assert_eq!(
+        proxy
+            .forward_buffered(&url, &serde_json::json!({}), &opts())
+            .await
+            .status,
+        503
+    );
+    assert!(matches!(
+        proxy.forward_stream(&url, &serde_json::json!({})).await,
+        StreamOutcome::Buffered { status: 503, .. }
+    ));
+    drop(bytes);
+    assert_eq!(proxy.permits.available_permits(), 1);
+}
+
+#[tokio::test]
 async fn stream_errors_and_unpolled_or_polled_body_drops_release_the_permit() {
-    // A body idle timeout is emitted as an explicit error and releases the permit.
+    // A response with no output has no frame to retain, so EOF releases immediately.
+    let url = one_response(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n");
+    let proxy = test_proxy();
+    let mut body = match proxy.forward_stream(&url, &serde_json::json!({})).await {
+        StreamOutcome::Stream { response, .. } => response,
+        StreamOutcome::Buffered { status, .. } => panic!("expected stream, got {status}"),
+    };
+    assert!(body.frame().await.is_none());
+    assert_eq!(proxy.permits.available_permits(), 1);
+
+    // An idle timeout releases the stream owner, but retained output still holds it.
     let url = one_response_for(
         b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n1\r\nx\r\n",
         Duration::from_millis(180),
@@ -105,7 +177,7 @@ async fn stream_errors_and_unpolled_or_polled_body_drops_release_the_permit() {
         StreamOutcome::Stream { response, .. } => response,
         StreamOutcome::Buffered { status, .. } => panic!("expected stream, got {status}"),
     };
-    assert!(body.frame().await.unwrap().unwrap().into_data().is_ok());
+    let bytes = body.frame().await.unwrap().unwrap().into_data().unwrap();
     assert!(
         tokio::time::timeout(Duration::from_millis(250), body.frame())
             .await
@@ -113,17 +185,21 @@ async fn stream_errors_and_unpolled_or_polled_body_drops_release_the_permit() {
             .unwrap()
             .is_err()
     );
+    assert_eq!(proxy.permits.available_permits(), 0);
+    drop(bytes);
     assert_eq!(proxy.permits.available_permits(), 1);
 
-    // A truncated upstream body yields a read error, then releases its permit.
+    // A truncated body yields a read error while retained output keeps its permit.
     let url = one_response(b"HTTP/1.1 200 OK\r\ncontent-length: 10\r\n\r\nx");
     let proxy = test_proxy();
     let mut body = match proxy.forward_stream(&url, &serde_json::json!({})).await {
         StreamOutcome::Stream { response, .. } => response,
         StreamOutcome::Buffered { status, .. } => panic!("expected stream, got {status}"),
     };
-    assert!(body.frame().await.unwrap().unwrap().into_data().is_ok());
+    let bytes = body.frame().await.unwrap().unwrap().into_data().unwrap();
     assert!(body.frame().await.unwrap().is_err());
+    assert_eq!(proxy.permits.available_permits(), 0);
+    drop(bytes);
     assert_eq!(proxy.permits.available_permits(), 1);
 
     // Dropping before the first poll still drops the body-owned permit.
@@ -137,7 +213,7 @@ async fn stream_errors_and_unpolled_or_polled_body_drops_release_the_permit() {
     drop(body);
     assert_eq!(proxy.permits.available_permits(), 1);
 
-    // Dropping after one chunk has been polled also releases it.
+    // Dropping a polled body still leaves the emitted chunk holding the permit.
     let url = one_response(
         b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n1\r\ny\r\n1\r\nz\r\n0\r\n\r\n",
     );
@@ -146,9 +222,11 @@ async fn stream_errors_and_unpolled_or_polled_body_drops_release_the_permit() {
         StreamOutcome::Stream { response, .. } => response,
         StreamOutcome::Buffered { status, .. } => panic!("expected stream, got {status}"),
     };
-    assert!(body.frame().await.unwrap().unwrap().into_data().is_ok());
+    let bytes = body.frame().await.unwrap().unwrap().into_data().unwrap();
     assert_eq!(proxy.permits.available_permits(), 0);
     drop(body);
+    assert_eq!(proxy.permits.available_permits(), 0);
+    drop(bytes);
     assert_eq!(proxy.permits.available_permits(), 1);
 }
 

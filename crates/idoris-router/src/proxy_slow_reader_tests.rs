@@ -17,7 +17,7 @@ fn opts() -> ForwardOpts<'static> {
     }
 }
 
-async fn read_head(stream: &mut tokio::net::TcpStream) -> Vec<u8> {
+async fn read_head(stream: &mut (impl tokio::io::AsyncRead + Unpin)) -> Vec<u8> {
     let mut bytes = Vec::new();
     let mut byte = [0; 1];
     loop {
@@ -73,6 +73,25 @@ async fn slow_upstream(
     let mut probe = [0; 1];
     assert!(!matches!(socket.read(&mut probe).await, Ok(1..)));
     let _ = closed.send(());
+}
+
+struct DuplexListener(Option<tokio::io::DuplexStream>);
+
+impl Listener for DuplexListener {
+    type Io = tokio::io::DuplexStream;
+    type Addr = ();
+
+    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+        if let Some(stream) = self.0.take() {
+            (stream, ())
+        } else {
+            std::future::pending().await
+        }
+    }
+
+    fn local_addr(&self) -> std::io::Result<Self::Addr> {
+        Ok(())
+    }
 }
 
 async fn buffered_slow_response_holds_permit(stream_error: bool, cancel_reader: bool) {
@@ -210,6 +229,131 @@ async fn buffered_success_holds_permit_until_slow_reader_finishes() {
 #[tokio::test]
 async fn buffered_stream_error_holds_permit_until_slow_reader_cancels() {
     buffered_slow_response_holds_permit(true, true).await;
+}
+
+async fn finite_stream_holds_permit_after_eof(cancel_reader: bool) {
+    let upstream = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(vec![b'x'; 16 * 1024]))
+        .expect(1)
+        .mount(&upstream)
+        .await;
+    let slow_url = upstream.uri();
+    let quick = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_string("ok"))
+        .expect(1)
+        .mount(&quick)
+        .await;
+
+    let mut proxy = ChatProxy::new(reqwest::Client::new());
+    proxy.permits = Arc::new(tokio::sync::Semaphore::new(1));
+    let proxy = Arc::new(proxy);
+    let handler_proxy = proxy.clone();
+    let (body_eof_tx, mut body_eof_rx) = tokio::sync::oneshot::channel();
+    let body_eof_tx = Arc::new(std::sync::Mutex::new(Some(body_eof_tx)));
+    let app = Router::new().route(
+        "/",
+        any(move || {
+            let proxy = handler_proxy.clone();
+            let url = slow_url.clone();
+            let body_eof_tx = body_eof_tx.clone();
+            async move {
+                match proxy.forward_stream(&url, &serde_json::json!({})).await {
+                    StreamOutcome::Stream { response, .. } => {
+                        use futures_util::StreamExt;
+                        let chunks = Box::pin(response.into_data_stream());
+                        let signal = body_eof_tx.lock().unwrap().take();
+                        let body = Body::from_stream(stream::unfold(
+                            (chunks, signal),
+                            |(mut chunks, signal)| async move {
+                                match chunks.next().await {
+                                    Some(chunk) => Some((chunk, (chunks, signal))),
+                                    None => {
+                                        if let Some(signal) = signal {
+                                            let _ = signal.send(());
+                                        }
+                                        None
+                                    }
+                                }
+                            },
+                        ));
+                        (StatusCode::OK, body).into_response()
+                    }
+                    StreamOutcome::Buffered { status, body, .. } => {
+                        (StatusCode::from_u16(status).unwrap(), body).into_response()
+                    }
+                }
+            }
+        }),
+    );
+    // The finite body fits in Hyper's queue but exceeds the transport capacity.
+    // Duplex supports vectored writes, preserving queued Bytes owners like TCP.
+    let (server_io, mut client_io) = tokio::io::duplex(1024);
+    let listener = DuplexListener(Some(server_io));
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    client_io
+        .write_all(
+            b"POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        )
+        .await
+        .unwrap();
+    let head = tokio::time::timeout(Duration::from_secs(3), read_head(&mut client_io))
+        .await
+        .unwrap();
+    assert!(String::from_utf8_lossy(&head).starts_with("HTTP/1.1 200"));
+    tokio::time::timeout(Duration::from_secs(5), &mut body_eof_rx)
+        .await
+        .expect("proxy should consume the finite upstream response through EOF")
+        .expect("upstream EOF signal sender should remain alive");
+    assert_eq!(proxy.permits.available_permits(), 0);
+    let result = proxy
+        .forward_buffered(&quick.uri(), &serde_json::json!({}), &opts())
+        .await;
+    assert_eq!(result.status, 503);
+
+    assert!(quick.received_requests().await.unwrap().is_empty());
+    if cancel_reader {
+        drop(client_io);
+    } else {
+        let mut wire = Vec::new();
+        tokio::time::timeout(Duration::from_secs(3), client_io.read_to_end(&mut wire))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(wire.iter().filter(|&&byte| byte == b'x').count(), 16 * 1024);
+        assert!(wire.ends_with(b"0\r\n\r\n"));
+    }
+    let permit = tokio::time::timeout(
+        Duration::from_secs(3),
+        proxy.permits.clone().acquire_owned(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    drop(permit);
+    let result = proxy
+        .forward_buffered(&quick.uri(), &serde_json::json!({}), &opts())
+        .await;
+    assert_eq!(
+        (result.status, result.body.as_ref()),
+        (200, b"ok".as_slice())
+    );
+
+    server.abort();
+    let _ = server.await;
+    quick.verify().await;
+    upstream.verify().await;
+}
+
+#[tokio::test]
+async fn finite_stream_keeps_permit_after_eof_until_slow_reader_cancels() {
+    finite_stream_holds_permit_after_eof(true).await;
+}
+
+#[tokio::test]
+async fn finite_stream_keeps_permit_after_eof_until_slow_reader_finishes() {
+    finite_stream_holds_permit_after_eof(false).await;
 }
 
 #[tokio::test]

@@ -30,7 +30,7 @@
 //! value, so there is no `tenant="a:b"+id="c"` vs `tenant="a"+id="b:c"`
 //! collision ambiguity.
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::body::{Body, Bytes};
@@ -45,7 +45,7 @@ use tokio::time::Instant;
 /// hyper. `Bytes` clones and slices retain this owner until their last drop.
 struct PermittedBytes {
     bytes: Bytes,
-    _permit: tokio::sync::OwnedSemaphorePermit,
+    _permit: Arc<tokio::sync::OwnedSemaphorePermit>,
 }
 
 impl AsRef<[u8]> for PermittedBytes {
@@ -54,7 +54,7 @@ impl AsRef<[u8]> for PermittedBytes {
     }
 }
 
-fn with_permit(bytes: Bytes, permit: tokio::sync::OwnedSemaphorePermit) -> Bytes {
+fn with_permit(bytes: Bytes, permit: Arc<tokio::sync::OwnedSemaphorePermit>) -> Bytes {
     Bytes::from_owner(PermittedBytes {
         bytes,
         _permit: permit,
@@ -332,7 +332,7 @@ impl ChatProxy {
                 if !unsafe_for_local_only {
                     return ForwardOutcome {
                         status: entry.status,
-                        body: with_permit(entry.body, permit),
+                        body: with_permit(entry.body, Arc::new(permit)),
                         content_type: Some("application/json".to_string()),
                         cached: true,
                         origin_record_id: Some(entry.record_id),
@@ -403,7 +403,7 @@ impl ChatProxy {
                     }
                     return ForwardOutcome {
                         status,
-                        body: with_permit(body_bytes, permit),
+                        body: with_permit(body_bytes, Arc::new(permit)),
                         content_type,
                         cached: false,
                         origin_record_id: None,
@@ -478,14 +478,19 @@ impl ChatProxy {
                     .map(str::to_string);
                 if (200..300).contains(&status) {
                     let idle_timeout = self.stream_idle_timeout;
-                    // The body owns the permit before its first poll and
-                    // carries it through each chunk until EOF, error, or drop.
+                    // The stream and each emitted chunk share the permit.
+                    // Hyper may retain chunks after polling EOF, so the final
+                    // chunk owner must release the permit only when it drops.
                     // The server's WriteTimeoutListener bounds stalled downstream
                     // writes even while hyper stops polling this body.
+                    let permit = Arc::new(permit);
                     let chunks = stream::unfold(Some((resp, permit)), move |state| async move {
                         let (mut response, permit) = state?;
                         match tokio::time::timeout(idle_timeout, response.chunk()).await {
-                            Ok(Ok(Some(chunk))) => Some((Ok(chunk), Some((response, permit)))),
+                            Ok(Ok(Some(chunk))) => Some((
+                                Ok(with_permit(chunk, Arc::clone(&permit))),
+                                Some((response, permit)),
+                            )),
                             Ok(Ok(None)) => None,
                             Ok(Err(error)) => {
                                 Some((Err(std::io::Error::other(error.to_string())), None))
@@ -509,7 +514,7 @@ impl ChatProxy {
                     match self.read_buffered(resp).await {
                         Ok(body) => StreamOutcome::Buffered {
                             status,
-                            body: with_permit(body, permit),
+                            body: with_permit(body, Arc::new(permit)),
                             content_type,
                         },
                         Err(error_status) => StreamOutcome::Buffered {
@@ -534,8 +539,9 @@ impl ChatProxy {
 /// [`ChatProxy::forward_stream`]'s result: either the initial response
 /// wasn't ok (returned buffered, see that method's doc) or it was, in which
 /// case `response` is an incremental body that enforces idle timeouts and
-/// forwards upstream read errors, while retaining its permit until completion
-/// or drop.
+/// forwards upstream read errors. The stream and its emitted output `Bytes`
+/// share the concurrency permit. It is released after the stream finishes or is
+/// dropped and the last output owner is dropped.
 pub enum StreamOutcome {
     Buffered {
         status: u16,
