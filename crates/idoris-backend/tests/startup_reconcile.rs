@@ -202,13 +202,45 @@ async fn repeat_load_unload_then_reload_keeps_only_unknown_residency_reserved() 
     handle.load("a", 4.0, policy()).await.unwrap();
     handle.load("a", 4.0, policy()).await.unwrap();
     assert_eq!(handle.status().await.unwrap().used_gb, 24.0);
-    assert!(handle.load("b", 8.0, policy()).await.is_err());
-    assert_eq!(adapter.load_count("b"), 0);
-    assert_eq!(adapter.unload_count("inherited"), 0);
     handle.unload("a").await.unwrap();
     assert_eq!(handle.status().await.unwrap().used_gb, 20.0);
     handle.load("a", 4.0, policy()).await.unwrap();
     assert_eq!(handle.status().await.unwrap().used_gb, 24.0);
+
+    // Keep this repeat/unload/reload sequence isolated from the capacity
+    // rejection below: a true admission request may conservatively reserve
+    // the full observed total for unknown residents for the actor lifetime.
+    assert!(handle.load("b", 8.0, policy()).await.is_err());
+    assert_eq!(adapter.load_count("b"), 0);
+    assert_eq!(adapter.unload_count("inherited"), 0);
+}
+
+#[tokio::test]
+async fn estimated_managed_memory_cannot_offset_unknown_residency_after_eviction() {
+    let adapter = TestAdapter::new(
+        vec![
+            ModelInfo {
+                id: "a".into(),
+                memory_gb: 4.0,
+            },
+            ModelInfo {
+                id: "b".into(),
+                memory_gb: 8.0,
+            },
+        ],
+        &[],
+    );
+    let handle = Supervisor::spawn(adapter.clone(), config(24.0)).unwrap();
+    let estimated_evictable = LoadPolicy {
+        mode: LoadMode::EvictToLoad,
+        admission: Admission::RequiresEviction,
+        ..policy()
+    };
+    handle.load("a", 8.0, estimated_evictable).await.unwrap();
+    adapter.add_external_usage("unknown", 20.0);
+
+    assert!(handle.load("b", 8.0, policy()).await.is_err());
+    assert_eq!(adapter.load_count("b"), 0);
 }
 
 #[tokio::test(start_paused = true)]
@@ -383,4 +415,58 @@ async fn reconcile_is_singleflight_or_fast_busy_and_never_reuses_pre_unload_snap
     );
     assert_eq!(handle.status().await.unwrap().used_gb, 8.0);
     assert_eq!(adapter.load_count("b"), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn ready_same_policy_load_is_noop_during_another_models_reconciliation() {
+    let adapter = TestAdapter::new(catalog(), &[]);
+    let handle = Supervisor::spawn(adapter.clone(), config(24.0)).unwrap();
+    handle.load("a", 4.0, policy()).await.unwrap();
+    let a_loads = adapter.load_count("a");
+    adapter.block_status();
+    let loading_b = {
+        let handle = handle.clone();
+        tokio::spawn(async move { handle.load("b", 4.0, policy()).await })
+    };
+    adapter.status_entered.notified().await;
+
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            handle.load("a", 4.0, policy()),
+        )
+        .await
+        .unwrap()
+        .is_ok()
+    );
+    assert_eq!(adapter.load_count("a"), a_loads);
+
+    let different_policy = LoadPolicy {
+        keepalive: Keepalive::IdleTtl { idle_ttl_s: 301 },
+        ..policy()
+    };
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            handle.load("a", 4.0, different_policy),
+        )
+        .await
+        .unwrap()
+        .is_err()
+    );
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            handle.load("b", 5.0, policy()),
+        )
+        .await
+        .unwrap()
+        .is_err()
+    );
+    assert!(handle.load("a", f64::NAN, policy()).await.is_err());
+    assert_eq!(adapter.load_count("a"), a_loads);
+
+    adapter.status_release.notify_one();
+    assert!(loading_b.await.unwrap().is_ok());
+    assert_eq!(adapter.load_count("b"), 1);
 }

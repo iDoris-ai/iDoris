@@ -25,16 +25,20 @@ fn on_demand() -> LoadPolicy {
     }
 }
 
-async fn run(verify: ResponseTemplate, unload_status: u16) -> f64 {
-    let server = MockServer::start().await;
+async fn mock_empty_engine(server: &MockServer) {
     // Reconciliation sees an empty engine before the scripted load failure.
     Mock::given(method("GET"))
         .and(path("/api/status"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "loaded_models": [], "model_memory_used": 0, "model_memory_max": 25769803776_u64
         })))
-        .mount(&server)
+        .mount(server)
         .await;
+}
+
+async fn run(verify: ResponseTemplate, unload_status: u16) -> f64 {
+    let server = MockServer::start().await;
+    mock_empty_engine(&server).await;
     Mock::given(method("POST"))
         .and(path("/v1/models/qwen3-8b/load"))
         .respond_with(ResponseTemplate::new(200))
@@ -87,4 +91,41 @@ async fn external_pin_drift_after_load_triggers_a_real_unload() {
 #[tokio::test]
 async fn a_failed_release_keeps_the_memory_on_the_ledger() {
     assert_eq!(run(ResponseTemplate::new(503), 500).await, 20.0);
+}
+
+/// K09/H1: the adapter deadline fires before the Supervisor's outer
+/// deadline. A received load may still allocate memory after that point.
+#[tokio::test]
+async fn k09_load_timeout_triggers_release_and_preserves_unreleased_memory() {
+    for (unload_status, expected_gb) in [(200, 0.0), (500, 20.0)] {
+        let server = MockServer::start().await;
+        mock_empty_engine(&server).await;
+        Mock::given(method("POST"))
+            .and(path("/v1/models/qwen3-8b/load"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(1)))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/models/qwen3-8b/unload"))
+            .respond_with(ResponseTemplate::new(unload_status))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let adapter = OmlxAdapter::new(OmlxAdapterConfig {
+            base_url: server.uri(),
+            api_key: None,
+            call_timeout: Duration::from_millis(100),
+        })
+        .expect("adapter");
+        let handle =
+            Supervisor::spawn(Arc::new(adapter), SupervisorConfig::default()).expect("spawn");
+        let err = handle
+            .load("qwen3-8b", 20.0, on_demand())
+            .await
+            .expect_err("timeout");
+        assert_eq!(err.reason_code(), "load_unconfirmed", "{err}");
+        assert_eq!(handle.status().await.expect("status").used_gb, expected_gb);
+        server.verify().await;
+    }
 }

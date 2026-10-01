@@ -1035,9 +1035,10 @@ fn handle_unload(
 /// Engine residency outside this actor's ledger has no trustworthy policy
 /// or per-model estimate. Reserve the unexplained total without evicting it;
 /// never reduce that reservation on a later sample (restart to reconcile a
-/// manually cleaned engine). Managed occupancy is deducted even when other
-/// unknown residents exist: the unexplained remainder, rather than the full
-/// engine total, is folded into the monotonic reservation floor.
+/// manually cleaned engine). When unknown residents are present, keep the
+/// full observed total in the floor: a managed estimate is not proof of actual
+/// memory released by eviction. This can conservatively double-count managed
+/// memory while it remains loaded, but avoids admitting beyond the budget.
 async fn reconcile_reserved_gb(
     adapter: Arc<dyn RuntimeAdapter>,
     timeout: std::time::Duration,
@@ -1065,8 +1066,16 @@ async fn reconcile_reserved_gb(
             "engine residency has no valid memory measurement",
         ));
     }
-    // Subtract only models the engine explicitly reports as loaded. The
-    // ledger plus the remaining reserve still covers the observed total.
+    let has_unknown_residents = status.loaded.iter().any(|loaded_id| {
+        !managed
+            .iter()
+            .any(|(managed_id, _)| managed_id == loaded_id)
+    });
+    if has_unknown_residents {
+        return Ok(reserved_gb.max(status.used_gb));
+    }
+    // With no unknown residents, subtract estimates for loaded managed
+    // models as before. These estimates do not establish actual release.
     let managed_gb: f64 = managed
         .iter()
         .filter(|(id, _)| status.loaded.contains(id))
@@ -1244,6 +1253,25 @@ async fn run_actor(
                 policy,
                 reply,
             }) => {
+                // Local validation and Ready no-ops need no residency I/O.
+                // handle_load retains same-id active-operation precedence.
+                if !memory_gb.is_finite()
+                    || memory_gb < 0.0
+                    || models.get(&id).is_some_and(|slot| {
+                        slot.state == ModelState::Ready && slot.policy == policy
+                    })
+                {
+                    handle_load(
+                        id,
+                        memory_gb,
+                        policy,
+                        reply,
+                        &mut models,
+                        &mut active_op,
+                        &env,
+                    );
+                    continue;
+                }
                 if let Some(pending) = pending_reconcile.as_mut() {
                     if pending.id == id
                         && pending.policy == policy
