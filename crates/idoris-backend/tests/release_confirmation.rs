@@ -8,8 +8,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use idoris_backend::{
-    BackendError, BackendStatus, ChatRequest, ChatResponse, MockAdapter, ModelInfo, RuntimeAdapter,
-    Supervisor, SupervisorConfig, SupervisorHandle,
+    BackendError, BackendStatus, ChatMessage, ChatRequest, ChatResponse, MockAdapter, ModelInfo,
+    RuntimeAdapter, Supervisor, SupervisorConfig, SupervisorHandle,
 };
 use idoris_contracts::{
     LoadPolicy,
@@ -205,6 +205,61 @@ async fn failed_different_policy_oom_reload_keeps_original_capacity_reserved() {
             old_gb.max(replacement_gb)
         );
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn different_policy_oom_reload_is_rejected_while_chat_is_inflight() {
+    use idoris_backend::mock::LoadOutcome;
+
+    let adapter = Arc::new(MockAdapter::new(models(&[("a", 4.0)])));
+    adapter.set_load_script("a", vec![LoadOutcome::Ok, LoadOutcome::Oom]);
+    adapter.set_chat_delay("a", Duration::from_millis(200));
+    let handle = Supervisor::spawn(adapter.clone(), config(8.0)).unwrap();
+
+    handle.load("a", 4.0, resident()).await.unwrap();
+    let chat_handle = handle.clone();
+    let chat = tokio::spawn(async move {
+        chat_handle
+            .chat(
+                ChatRequest {
+                    model: "a".into(),
+                    messages: vec![ChatMessage {
+                        role: "user".into(),
+                        content: "hello".into(),
+                    }],
+                },
+                CancellationToken::new(),
+            )
+            .await
+    });
+    // With paused time, advancing partway through the adapter delay gives
+    // the spawned chat time to enter the adapter while leaving it in flight.
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    assert!(!chat.is_finished());
+    let busy = handle.load("a", 4.0, on_demand()).await.unwrap_err();
+    assert_eq!(busy.reason_code(), "supervisor_busy");
+    assert_eq!(adapter.load_call_count("a"), 1);
+    assert_eq!(adapter.unload_call_count("a"), 0);
+    let status = handle.status().await.unwrap();
+    assert_eq!(status.used_gb, 4.0);
+    assert_eq!(status.loaded, vec!["a"]);
+
+    // Reapplying the current policy is a Ready no-op even while chat runs.
+    handle.load("a", 4.0, resident()).await.unwrap();
+    assert_eq!(adapter.load_call_count("a"), 1);
+
+    assert!(!chat.is_finished());
+    assert_eq!(adapter.unload_call_count("a"), 0);
+    let response = chat.await.unwrap().unwrap();
+    assert_eq!(response.model, "a");
+    assert_eq!(response.content, "mock reply to: hello");
+
+    // Once the chat drains, the changed policy reaches the adapter and its
+    // scripted OOM follows the ordinary cleanup path.
+    assert!(handle.load("a", 4.0, on_demand()).await.is_err());
+    assert_eq!(adapter.load_call_count("a"), 2);
+    assert_eq!(adapter.unload_call_count("a"), 1);
 }
 
 #[tokio::test(start_paused = true)]

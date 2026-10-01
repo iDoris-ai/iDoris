@@ -932,6 +932,17 @@ fn handle_load(
         let _ = reply.send(Ok(()));
         return;
     }
+    if let Some(slot) = models.get(&id)
+        && slot.state == ModelState::Ready
+        && slot.inflight > 0
+    {
+        let _ = reply.send(Err(BackendError::busy(
+            "cannot reload a ready model while chats are in flight",
+            Some(id),
+            None,
+        )));
+        return;
+    }
     if let Some(active) = active_op.as_ref() {
         let _ = reply.send(Err(BackendError::busy(
             "a different id currently holds the load/evict/unload mutex",
@@ -961,13 +972,9 @@ fn handle_load(
     }
 
     let last_used_seq = models.get(&id).map_or(0, |s| s.last_used_seq);
-    // Carried forward, not reset to 0: a policy-changing reload of a
-    // currently-Ready model with chats still in flight against its
-    // previous instance must not let `ChatDone` underflow the fresh
-    // slot's counter once those in-flight calls finish (see
-    // `ActorMsg::ChatDone`'s `saturating_sub`, the other half of this
-    // safety net). Blocking such a reload until drained is a further
-    // improvement left for later — not required to avoid the underflow.
+    // Preserve the count for non-Ready states whose chat task has not yet
+    // reported completion. Ready policy reloads with in-flight chats were
+    // rejected above.
     let inflight = models.get(&id).map_or(0, |s| s.inflight);
     // Captured *before* the `models.insert` below overwrites the slot: if
     // this is a reload of a model that's already `Ready`, its old
