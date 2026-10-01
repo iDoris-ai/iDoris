@@ -112,6 +112,10 @@ pub struct ChatProxy {
     pub(crate) client: reqwest::Client,
     pub(crate) window: Duration,
     max_entries: usize,
+    header_timeout: Duration,
+    body_timeout: Duration,
+    max_body_bytes: usize,
+    max_cache_bytes: usize,
     pub(crate) retry_delays: Vec<Duration>,
     pub(crate) cache: Mutex<IndexMap<String, CacheEntry>>,
 }
@@ -122,6 +126,10 @@ impl ChatProxy {
             client,
             window: DEFAULT_WINDOW,
             max_entries: DEFAULT_MAX_ENTRIES,
+            header_timeout: Duration::from_secs(10),
+            body_timeout: Duration::from_secs(60),
+            max_body_bytes: 8 * 1024 * 1024,
+            max_cache_bytes: 32 * 1024 * 1024,
             // TS default (`proxy.ts`'s `ProxyDeps.retryDelaysMs` default).
             retry_delays: vec![Duration::from_millis(250), Duration::from_secs(1)],
             cache: Mutex::new(IndexMap::new()),
@@ -141,13 +149,10 @@ impl ChatProxy {
         window: Duration,
         retry_delays: Vec<Duration>,
     ) -> Self {
-        Self {
-            client,
-            window,
-            max_entries: DEFAULT_MAX_ENTRIES,
-            retry_delays,
-            cache: Mutex::new(IndexMap::new()),
-        }
+        let mut proxy = Self::new(client);
+        proxy.window = window;
+        proxy.retry_delays = retry_delays;
+        proxy
     }
 
     #[cfg(test)]
@@ -170,7 +175,9 @@ impl ChatProxy {
         #[allow(clippy::unwrap_used)] // poisoning would already have failed a concurrent caller
         let mut cache = self.cache.lock().unwrap();
         cache.shift_remove(&key);
-        cache.insert(key, entry);
+        if Self::entry_bytes(&key, &entry) <= self.max_cache_bytes {
+            cache.insert(key, entry);
+        }
         self.prune(&mut cache);
     }
 
@@ -188,9 +195,57 @@ impl ChatProxy {
             }
             cache.shift_remove_index(0);
         }
-        while cache.len() > self.max_entries {
-            cache.shift_remove_index(0);
+        let mut bytes = cache.iter().fold(0usize, |total, (key, entry)| {
+            total.saturating_add(Self::entry_bytes(key, entry))
+        });
+        while cache.len() > self.max_entries || bytes > self.max_cache_bytes {
+            if let Some((key, entry)) = cache.shift_remove_index(0) {
+                bytes = bytes.saturating_sub(Self::entry_bytes(&key, &entry));
+            } else {
+                break;
+            }
         }
+    }
+
+    fn entry_bytes(key: &str, entry: &CacheEntry) -> usize {
+        key.len()
+            .saturating_add(entry.record_id.len())
+            .saturating_add(entry.body.len())
+    }
+
+    fn failure(status: u16, retries: u32) -> ForwardOutcome {
+        ForwardOutcome {
+            status,
+            body: Bytes::from_static(br#"{"error":{"type":"upstream_unavailable"}}"#),
+            content_type: Some("application/json".into()),
+            cached: false,
+            origin_record_id: None,
+            replayed_served_locality: None,
+            retries,
+        }
+    }
+
+    // A total deadline prevents a slow trickle from retaining a buffered
+    // request forever. Check both declared length and actual chunk bytes.
+    async fn read_buffered(&self, mut response: reqwest::Response) -> Result<Bytes, u16> {
+        if response
+            .content_length()
+            .is_some_and(|n| n > self.max_body_bytes as u64)
+        {
+            return Err(502);
+        }
+        tokio::time::timeout(self.body_timeout, async {
+            let mut bytes = Vec::new();
+            while let Some(chunk) = response.chunk().await.map_err(|_| 502u16)? {
+                if chunk.len() > self.max_body_bytes.saturating_sub(bytes.len()) {
+                    return Err(502);
+                }
+                bytes.extend_from_slice(&chunk);
+            }
+            Ok(Bytes::from(bytes))
+        })
+        .await
+        .map_err(|_| 504u16)?
     }
 
     async fn sleep_retry(&self, attempt: usize) {
@@ -248,7 +303,17 @@ impl ChatProxy {
 
         let mut attempt = 0usize;
         loop {
-            let sent = self.client.post(&url).json(&payload).send().await;
+            // One deadline covers connection establishment and response
+            // headers. An expired POST is uncertain: do not retry it.
+            let sent = match tokio::time::timeout(
+                self.header_timeout,
+                self.client.post(&url).json(&payload).send(),
+            )
+            .await
+            {
+                Ok(sent) => sent,
+                Err(_) => return Self::failure(504, attempt as u32),
+            };
             match sent {
                 Ok(resp) => {
                     let status = resp.status().as_u16();
@@ -270,18 +335,9 @@ impl ChatProxy {
                     // for 60s — a 2xx with a truncated/empty body
                     // (prdaemon #48 round 2, Low). Not retried: the
                     // upstream already accepted and processed this call.
-                    let Ok(body_bytes) = resp.bytes().await else {
-                        return ForwardOutcome {
-                            status: 502,
-                            body: Bytes::from_static(
-                                br#"{"error":{"type":"upstream_unavailable"}}"#,
-                            ),
-                            content_type: Some("application/json".to_string()),
-                            cached: false,
-                            origin_record_id: None,
-                            replayed_served_locality: None,
-                            retries,
-                        };
+                    let body_bytes = match self.read_buffered(resp).await {
+                        Ok(bytes) => bytes,
+                        Err(status) => return Self::failure(status, retries),
                     };
                     // Only a genuinely successful (2xx) call is cached —
                     // matches TS's own `res.ok` gate on the `remember()`
@@ -313,7 +369,10 @@ impl ChatProxy {
                         retries,
                     };
                 }
-                Err(_err) => {
+                Err(err) => {
+                    if err.is_timeout() {
+                        return Self::failure(504, attempt as u32);
+                    }
                     if attempt < self.retry_delays.len() {
                         self.sleep_retry(attempt).await;
                         attempt += 1;
@@ -549,6 +608,102 @@ mod tests {
             .forward_buffered(&endpoint, &chat_body(), &opts(Some("req-1"), "rec-2"))
             .await;
         assert!(!again.cached, "nothing may be replayed from a failed read");
+    }
+
+    // K14 / M5: inject short deadlines and small byte budgets, without
+    // process-global configuration or waiting for production deadlines.
+    #[tokio::test]
+    async fn k14_header_deadline_returns_504_without_retry() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_delay(Duration::from_millis(200)),
+            )
+            .mount(&server)
+            .await;
+        let mut proxy = fast_retry_proxy();
+        proxy.header_timeout = Duration::from_millis(20);
+        let out = tokio::time::timeout(
+            Duration::from_millis(100),
+            proxy.forward_buffered(&server.uri(), &chat_body(), &opts(Some("req"), "rec")),
+        )
+        .await
+        .expect("response headers must have a deadline");
+        assert_eq!(
+            (out.status, out.retries, proxy.cache_size_for_test()),
+            (504, 0, 0)
+        );
+    }
+
+    #[tokio::test]
+    async fn k14_buffered_body_deadline_returns_504() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let _ = socket.read(&mut [0; 4096]);
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 100\r\n\r\nx")
+                .unwrap();
+            std::thread::sleep(Duration::from_millis(200));
+        });
+        let mut proxy = fast_retry_proxy();
+        proxy.body_timeout = Duration::from_millis(20);
+        let out = tokio::time::timeout(
+            Duration::from_millis(100),
+            proxy.forward_buffered(
+                &format!("http://{addr}"),
+                &chat_body(),
+                &opts(Some("req"), "rec"),
+            ),
+        )
+        .await
+        .expect("buffered body must have a total deadline");
+        assert_eq!((out.status, proxy.cache_size_for_test()), (504, 0));
+    }
+
+    #[tokio::test]
+    async fn k14_oversize_body_is_502_and_never_cached() {
+        use std::io::{Read, Write};
+        // Cover both declared and unknown lengths (chunked).
+        for headers in ["content-length: 5", "transfer-encoding: chunked"] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                let _ = socket.read(&mut [0; 4096]);
+                let body = if headers.starts_with("content") {
+                    "12345"
+                } else {
+                    "5\r\n12345\r\n0\r\n\r\n"
+                };
+                write!(socket, "HTTP/1.1 200 OK\r\n{headers}\r\n\r\n{body}").unwrap();
+            });
+            let mut proxy = fast_retry_proxy();
+            proxy.max_body_bytes = 4;
+            let out = proxy
+                .forward_buffered(
+                    &format!("http://{addr}"),
+                    &chat_body(),
+                    &opts(Some("req"), "rec"),
+                )
+                .await;
+            assert_eq!((out.status, proxy.cache_size_for_test()), (502, 0));
+        }
+    }
+
+    #[test]
+    fn k14_cache_evicts_by_bytes_and_rejects_an_oversize_entry() {
+        let mut proxy = ChatProxy::new(reqwest::Client::new());
+        proxy.max_cache_bytes = 12;
+        proxy.remember("a".into(), entry(200));
+        proxy.remember("b".into(), entry(200));
+        assert!(!proxy.cache.lock().unwrap().contains_key("a"));
+        let mut large = entry(200);
+        large.body = Bytes::from(vec![0; 17]);
+        proxy.remember("huge".into(), large);
+        assert!(!proxy.cache.lock().unwrap().contains_key("huge"));
     }
 
     /// Counts requests received so the test can assert an exact retry
