@@ -983,21 +983,36 @@ impl BudgetLedger {
                 "cannot release reservation with a known actual outcome".into(),
             ));
         }
-        {
+        let deferred_primary_error = {
             let conn = self.lock();
-            let row = find_reservation(&conn, tenant_id, reservation_id)?;
-            if row.status == ReservationStatus::Settled.as_sql() {
-                return Err(BudgetError::ReservationNotActive {
-                    reservation_id: reservation_id.0.clone(),
-                    status: row.status,
-                });
+            match find_reservation(&conn, tenant_id, reservation_id) {
+                Ok(row) => {
+                    if row.status == ReservationStatus::Settled.as_sql() {
+                        return Err(BudgetError::ReservationNotActive {
+                            reservation_id: reservation_id.0.clone(),
+                            status: row.status,
+                        });
+                    }
+                    if row.actual_cost_minor.is_some() {
+                        return Err(BudgetError::Storage(
+                            "cannot release reservation with a recorded actual outcome".into(),
+                        ));
+                    }
+                    None
+                }
+                Err(err @ (BudgetError::Busy | BudgetError::Storage(_)))
+                    if live
+                        .get(&reservation_id.0)
+                        .is_some_and(|owner| owner == tenant_id) =>
+                {
+                    // begin_settlement already validated this owner. If the
+                    // primary lookup is temporarily unavailable, keep the
+                    // cancellation retryable instead of orphaning its intent.
+                    Some(err)
+                }
+                Err(err) => return Err(err),
             }
-            if row.actual_cost_minor.is_some() {
-                return Err(BudgetError::Storage(
-                    "cannot release reservation with a recorded actual outcome".into(),
-                ));
-            }
-        }
+        };
         // Preserve a retryable cancellation before reading the independent
         // journal: an exclusive sidecar lock can make even this read Busy.
         // The worker rechecks both stores before it releases the reservation.
@@ -1026,6 +1041,9 @@ impl BudgetLedger {
             return Err(BudgetError::TenantMismatch {
                 reservation_id: reservation_id.0.clone(),
             });
+        }
+        if let Some(err) = deferred_primary_error {
+            return Err(err);
         }
         // Hold the sidecar write transaction across the primary terminal
         // commit. Durable settlements use the same lock order, so no writer
@@ -1463,6 +1481,14 @@ mod tests {
     /// sidecars on drop — including when the test panics. Bind it *before*
     /// the ledger so the ledger (and its open connection) drops first.
     struct TempDb(std::path::PathBuf);
+
+    struct TestClock(std::sync::atomic::AtomicI64);
+
+    impl Clock for TestClock {
+        fn now_ms(&self) -> i64 {
+            self.0.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
 
     impl AsRef<Path> for TempDb {
         fn as_ref(&self) -> &Path {
@@ -2404,6 +2430,96 @@ mod tests {
             )
             .expect("reservation outcome");
         assert_eq!((status.as_str(), actual), ("settled", Some(20)));
+    }
+
+    #[test]
+    fn cancellation_primary_read_failure_recovers_after_ttl_and_restart() {
+        let path = temp_db_path("release-primary-read-failure");
+        let ttl_ms = 25;
+        let clock = Arc::new(TestClock(std::sync::atomic::AtomicI64::new(
+            SystemClock.now_ms(),
+        )));
+        let ledger = BudgetLedger::open_with(&path, clock.clone(), ttl_ms).expect("open");
+        let scope = BudgetScope::new("acme-co", "key-1", "openai", "gpt-5");
+        ledger.configure(&scope, 100, "UTC").expect("configure");
+        let id = ledger.reserve(&scope, Price::Known(50)).expect("reserve");
+        ledger
+            .begin_settlement(&scope.tenant_id, &id)
+            .expect("begin settlement");
+
+        Connection::open(path.as_ref())
+            .expect("open primary database")
+            .execute_batch("ALTER TABLE reservations RENAME TO reservations_unavailable")
+            .expect("hide reservations table");
+        assert!(ledger.release("someone-else", &id).is_err());
+        assert_eq!(
+            ledger.live_intents.lock().expect("live intents").get(&id.0),
+            Some(&scope.tenant_id)
+        );
+        let no_wrong_tenant_release: i64 = ledger
+            .settlements
+            .lock()
+            .expect("settlement journal")
+            .query_row("SELECT count(*) FROM pending_releases", [], |r| r.get(0))
+            .expect("pending release count");
+        assert_eq!(no_wrong_tenant_release, 0);
+        assert!(matches!(
+            ledger.release(&scope.tenant_id, &id),
+            Err(BudgetError::Storage(_))
+        ));
+        assert!(
+            !ledger
+                .live_intents
+                .lock()
+                .expect("live intents")
+                .contains_key(&id.0)
+        );
+        let pending_release: Option<String> = ledger
+            .settlements
+            .lock()
+            .expect("settlement journal")
+            .query_row(
+                "SELECT tenant_id FROM pending_releases WHERE reservation_id=?1",
+                [&id.0],
+                |r| r.get(0),
+            )
+            .optional()
+            .expect("pending release query");
+        assert_eq!(pending_release.as_deref(), Some(scope.tenant_id.as_str()));
+
+        drop(ledger);
+        clock
+            .0
+            .fetch_add(ttl_ms + 1, std::sync::atomic::Ordering::SeqCst);
+        Connection::open(path.as_ref())
+            .expect("open primary database")
+            .execute_batch("ALTER TABLE reservations_unavailable RENAME TO reservations")
+            .expect("restore reservations table");
+
+        // Opening the worker retries its durable cancellation even though
+        // the reservation's dispatch hold outlived its normal TTL.
+        let recovered = BudgetLedger::open_with(&path, clock, ttl_ms).expect("restart ledger");
+        let (status, actual): (String, Option<i64>) = recovered
+            .lock()
+            .query_row(
+                "SELECT status, actual_cost_minor FROM reservations WHERE id=?1",
+                [&id.0],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("recovered reservation");
+        assert_eq!((status.as_str(), actual), ("released", None));
+        assert_eq!(recovered.balance(&scope).expect("released balance"), 100);
+        let intent_count: i64 = recovered
+            .settlements
+            .lock()
+            .expect("settlement journal")
+            .query_row(
+                "SELECT count(*) FROM settlement_intents WHERE reservation_id=?1",
+                [&id.0],
+                |r| r.get(0),
+            )
+            .expect("intent count");
+        assert_eq!(intent_count, 0);
     }
 
     /// Negative control: a settled reservation can't be released — that

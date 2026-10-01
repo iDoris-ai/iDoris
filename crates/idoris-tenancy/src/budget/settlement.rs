@@ -503,6 +503,17 @@ impl BudgetLedger {
                     {
                         obsolete_outcomes.push(id.clone());
                     }
+                    Some((_, status, Some(recorded))) if status == "settled" => {
+                        // Another instance may have recovered the journal's
+                        // authoritative amount after this instance cached a
+                        // conflicting Busy fallback. The terminal primary row
+                        // decides the outcome; quarantine this stale cache so
+                        // it cannot make every later reserve fail.
+                        eprintln!(
+                            "discarded conflicting terminal settlement cache: reservation={id} cached={actual} settled={recorded}"
+                        );
+                        obsolete_outcomes.push(id.clone());
+                    }
                     Some((_, status, _)) if matches!(status.as_str(), "active" | "expired") => {}
                     Some(_) => {
                         return Err(BudgetError::Storage(
@@ -1424,6 +1435,83 @@ mod tests {
                 drop(recovered);
             }
         }
+    }
+
+    #[test]
+    fn another_instance_recovery_quarantines_conflicting_busy_cache() {
+        let db = TestDb::new();
+        let path = db.path();
+        let timeout = Duration::from_millis(10);
+        let clock = Arc::new(TestClock(AtomicI64::new(1_000)));
+        let a = BudgetLedger::open_with_busy_timeout(&path, clock.clone(), 10, timeout).unwrap();
+        a.configure_tenant("t", 1000, "UTC", SpendGate::All)
+            .unwrap();
+        a.configure_tenant("other", 1000, "UTC", SpendGate::All)
+            .unwrap();
+        let id = a
+            .reserve(&BudgetScope::new("t", "k", "p", "m"), Price::Known(10))
+            .unwrap();
+        a.begin_settlement("t", &id).unwrap();
+        a.settlements
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO pending_settlements VALUES (?1, 't', 20)",
+                [&id.0],
+            )
+            .unwrap();
+
+        let journal_path = path.with_added_extension("settlements.sqlite3");
+        let blocker = Connection::open(journal_path).unwrap();
+        blocker.busy_timeout(timeout).unwrap();
+        blocker.execute_batch("BEGIN EXCLUSIVE").unwrap();
+        assert!(matches!(
+            a.settle_durable("t", &id, 21),
+            Err(BudgetError::Busy)
+        ));
+        assert_eq!(
+            a.settlement_outcomes.lock().unwrap().get(&id.0),
+            Some(&("t".to_string(), 21))
+        );
+        blocker.execute_batch("ROLLBACK").unwrap();
+        drop(blocker);
+
+        // Instance B recovers the authoritative journal amount before A gets
+        // another chance to retry its stale in-memory Busy fallback.
+        let b = BudgetLedger::open_with_busy_timeout(&path, clock.clone(), 10, timeout).unwrap();
+        b.retry_settlements().unwrap();
+        assert_eq!(b.tenant_balance("t").unwrap(), 980);
+        assert_eq!(pending(&b), 0);
+        let authoritative: (String, Option<i64>) = b
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT status, actual_cost_minor FROM reservations WHERE id=?1",
+                [&id.0],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(authoritative, ("settled".to_string(), Some(20)));
+
+        a.retry_settlements().unwrap();
+        assert!(!a.settlement_outcomes.lock().unwrap().contains_key(&id.0));
+        assert_eq!(a.tenant_balance("t").unwrap(), 980);
+        assert!(
+            a.reserve(&BudgetScope::new("other", "k", "p", "m"), Price::Known(10))
+                .is_ok()
+        );
+        a.retry_settlements().unwrap();
+        b.retry_settlements().unwrap();
+        assert_eq!(a.tenant_balance("t").unwrap(), 980);
+        assert_eq!(b.tenant_balance("t").unwrap(), 980);
+        drop(a);
+        drop(b);
+
+        let recovered = BudgetLedger::open_with_busy_timeout(&path, clock, 10, timeout).unwrap();
+        recovered.retry_settlements().unwrap();
+        assert_eq!(recovered.tenant_balance("t").unwrap(), 980);
+        assert_eq!(recovered.tenant_balance("other").unwrap(), 990);
     }
 
     #[test]

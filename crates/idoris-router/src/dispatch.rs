@@ -1283,22 +1283,35 @@ mod tests {
 
     #[tokio::test]
     async fn cancelled_release_under_main_db_lock_is_retried_by_live_worker() {
-        assert_cancelled_release_lock_is_retried(false).await;
+        assert_cancelled_release_retried(CancelReleaseFault::MainWriteLock).await;
     }
 
     #[tokio::test]
     async fn cancelled_release_under_sidecar_exclusive_lock_is_retried_by_live_worker() {
-        assert_cancelled_release_lock_is_retried(true).await;
+        assert_cancelled_release_retried(CancelReleaseFault::SidecarExclusiveLock).await;
     }
 
-    async fn assert_cancelled_release_lock_is_retried(sidecar_lock: bool) {
+    #[tokio::test]
+    async fn cancelled_release_after_main_db_read_error_is_retried_by_live_worker() {
+        assert_cancelled_release_retried(CancelReleaseFault::MainReadError).await;
+    }
+
+    #[derive(Clone, Copy)]
+    enum CancelReleaseFault {
+        MainWriteLock,
+        SidecarExclusiveLock,
+        MainReadError,
+    }
+
+    async fn assert_cancelled_release_retried(fault: CancelReleaseFault) {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("b.sqlite3");
+        let clock = Arc::new(TestClock::default());
         let ledger = Arc::new(
             BudgetLedger::open_with_busy_timeout(
                 &path,
-                Arc::new(idoris_tenancy::budget::SystemClock),
-                60_000,
+                clock.clone(),
+                1,
                 std::time::Duration::ZERO,
             )
             .unwrap(),
@@ -1348,24 +1361,33 @@ mod tests {
         .await;
 
         let journal_path = path.with_added_extension("settlements.sqlite3");
-        let lock_path = if sidecar_lock { &journal_path } else { &path };
-        let blocker = rusqlite::Connection::open(lock_path).unwrap();
-        if sidecar_lock {
-            let mode: String = blocker
-                .query_row("PRAGMA journal_mode", [], |row| row.get(0))
-                .unwrap();
-            assert_ne!(mode.to_ascii_lowercase(), "wal");
-            blocker.execute_batch("BEGIN EXCLUSIVE").unwrap();
-            let probe = rusqlite::Connection::open(&journal_path).unwrap();
-            probe.busy_timeout(std::time::Duration::ZERO).unwrap();
-            let error = probe
-                .query_row("SELECT count(*) FROM settlement_intents", [], |row| {
-                    row.get::<_, i64>(0)
-                })
-                .unwrap_err();
-            assert!(matches!(BudgetError::from(error), BudgetError::Busy));
-        } else {
-            blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let mut blocker = None;
+        match fault {
+            CancelReleaseFault::MainWriteLock => {
+                let connection = rusqlite::Connection::open(&path).unwrap();
+                connection.execute_batch("BEGIN IMMEDIATE").unwrap();
+                blocker = Some(connection);
+            }
+            CancelReleaseFault::SidecarExclusiveLock => {
+                let connection = rusqlite::Connection::open(&journal_path).unwrap();
+                let mode: String = connection
+                    .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+                    .unwrap();
+                assert_ne!(mode.to_ascii_lowercase(), "wal");
+                connection.execute_batch("BEGIN EXCLUSIVE").unwrap();
+                let probe = rusqlite::Connection::open(&journal_path).unwrap();
+                probe.busy_timeout(std::time::Duration::ZERO).unwrap();
+                let error = probe
+                    .query_row("SELECT count(*) FROM settlement_intents", [], |row| {
+                        row.get::<_, i64>(0)
+                    })
+                    .unwrap_err();
+                assert!(matches!(BudgetError::from(error), BudgetError::Busy));
+                blocker = Some(connection);
+            }
+            CancelReleaseFault::MainReadError => {
+                // Rename after verifying the live hold below.
+            }
         }
 
         let main = rusqlite::Connection::open(&path).unwrap();
@@ -1380,23 +1402,57 @@ mod tests {
             hold, 1,
             "paid dispatch must hold its reservation before await"
         );
-        if sidecar_lock {
-            let intents: i64 = blocker
+        let intents: i64 = if matches!(fault, CancelReleaseFault::SidecarExclusiveLock) {
+            blocker
+                .as_ref()
+                .unwrap()
                 .query_row("SELECT count(*) FROM settlement_intents", [], |row| {
                     row.get(0)
                 })
-                .unwrap();
-            assert_eq!(intents, 1, "paid dispatch must persist its intent");
-        }
+                .unwrap()
+        } else {
+            let journal = rusqlite::Connection::open(&journal_path).unwrap();
+            journal
+                .query_row("SELECT count(*) FROM settlement_intents", [], |row| {
+                    row.get(0)
+                })
+                .unwrap()
+        };
+        assert_eq!(intents, 1, "paid dispatch must persist its intent");
         drop(main);
+
+        if matches!(fault, CancelReleaseFault::MainReadError) {
+            let main = rusqlite::Connection::open(&path).unwrap();
+            main.execute_batch("ALTER TABLE reservations RENAME TO reservations_unavailable")
+                .unwrap();
+        }
 
         drop(call);
         let failed = tokio::time::timeout(std::time::Duration::from_secs(3), retries.recv())
             .await
             .unwrap()
             .unwrap();
-        assert!(failed.is_err(), "worker should observe the locked-db retry");
-        blocker.execute_batch("ROLLBACK").unwrap();
+        assert!(failed.is_err(), "worker should observe the injected fault");
+        match fault {
+            CancelReleaseFault::MainWriteLock | CancelReleaseFault::SidecarExclusiveLock => {
+                blocker.as_ref().unwrap().execute_batch("ROLLBACK").unwrap();
+            }
+            CancelReleaseFault::MainReadError => {
+                // Advancing past the TTL must not expire an active dispatch hold.
+                clock.0.store(2, Ordering::SeqCst);
+                let main = rusqlite::Connection::open(&path).unwrap();
+                let (status, hold): (String, i64) = main
+                    .query_row(
+                        "SELECT status, dispatch_hold FROM reservations_unavailable",
+                        [],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .unwrap();
+                assert_eq!((status.as_str(), hold), ("active", 1));
+                main.execute_batch("ALTER TABLE reservations_unavailable RENAME TO reservations")
+                    .unwrap();
+            }
+        }
 
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
