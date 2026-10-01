@@ -98,8 +98,7 @@ pub struct OmlxAdapter {
 
 impl OmlxAdapter {
     pub fn new(config: OmlxAdapterConfig) -> Result<Self, BackendError> {
-        let client = reqwest::Client::builder()
-            .build()
+        let client = crate::http_client()
             .map_err(|_| BackendError::internal("failed to build the oMLX HTTP client"))?;
         Ok(Self {
             base_url: config.base_url.trim_end_matches('/').to_string(),

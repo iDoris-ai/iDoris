@@ -191,6 +191,10 @@ impl std::fmt::Debug for AppState {
 
 impl Default for AppState {
     fn default() -> Self {
+        let http_client = match idoris_upstream::http_client() {
+            Ok(client) => client,
+            Err(_) => panic!("failed to build the router upstream HTTP client"),
+        };
         Self {
             instance_id: Uuid::new_v4().to_string(),
             deploy_mode: profile::deploy_mode_from_env(
@@ -199,8 +203,8 @@ impl Default for AppState {
             cards: Vec::new(),
             supervisor: None,
             budget_ledger: None,
-            http_client: reqwest::Client::new(),
-            proxy: Arc::new(proxy::ChatProxy::new(reqwest::Client::new())),
+            proxy: Arc::new(proxy::ChatProxy::new(http_client.clone())),
+            http_client,
         }
     }
 }

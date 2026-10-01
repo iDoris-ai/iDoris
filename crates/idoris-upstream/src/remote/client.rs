@@ -119,7 +119,12 @@ impl RemoteClient {
                 Ok(target)
             });
 
+        let http_client = match crate::http_client() {
+            Ok(client) => client,
+            Err(_) => panic!("failed to build the remote HTTP client"),
+        };
         let client = Client::builder()
+            .with_reqwest(http_client)
             .with_adapter_kind(adapter_kind)
             .with_auth_resolver(auth_resolver)
             .with_service_target_resolver(target_resolver)
