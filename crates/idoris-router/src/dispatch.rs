@@ -307,7 +307,19 @@ pub async fn dispatch_local(
             }
             Some(ledger) => {
                 match budget::reserve(ledger, tenant_id, &model_id, estimated_cost_minor) {
-                    Ok(id) => reservation_guard.id = Some(id),
+                    Ok(id) => {
+                        let durable_tenant = tenant_id.unwrap_or(budget::PERSONAL_TENANT_ID);
+                        let begin_result = ledger.begin_settlement(durable_tenant, &id);
+                        reservation_guard.id = Some(id);
+                        if let Err(err) = begin_result {
+                            return Ok(ChatOutcome {
+                                decision,
+                                served_locality,
+                                result: Err(DispatchFailure::Budget(err)),
+                                actual_cost_minor: None,
+                            });
+                        }
+                    }
                     Err(err) => {
                         return Ok(ChatOutcome {
                             decision,
@@ -432,6 +444,7 @@ mod tests {
     use idoris_contracts::component_card::{Egress, Form};
     use idoris_contracts::provider::{Cost, Family, ProviderDescriptor};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicI64, Ordering};
 
     use super::*;
 
@@ -565,6 +578,15 @@ mod tests {
         (dir, ledger)
     }
 
+    #[derive(Default)]
+    struct TestClock(AtomicI64);
+
+    impl idoris_tenancy::budget::Clock for TestClock {
+        fn now_ms(&self) -> i64 {
+            self.0.load(Ordering::SeqCst)
+        }
+    }
+
     // "No ledger wired" (trivial branch) is covered at the budget.rs unit
     // level; these focus on the two integration paths below.
     #[tokio::test]
@@ -624,12 +646,73 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn busy_settlement_survives_restart_and_ttl_without_losing_the_charge() {
+    async fn failed_intent_prevents_upstream_dispatch_and_releases_reservation() {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("b.sqlite3");
+        let ledger =
+            BudgetLedger::open_with(&path, Arc::new(idoris_tenancy::budget::SystemClock), 1)
+                .unwrap();
+        ledger
+            .configure_tenant(
+                budget::PERSONAL_TENANT_ID,
+                1_000_000,
+                "UTC",
+                idoris_tenancy::budget::SpendGate::PaidOnly,
+            )
+            .unwrap();
+        let adapter = Arc::new(MockAdapter::new(vec![ModelInfo {
+            id: "p".to_string(),
+            memory_gb: 1.0,
+        }]));
+        let supervisor = Supervisor::spawn(adapter.clone(), SupervisorConfig::default()).unwrap();
+        let journal =
+            rusqlite::Connection::open(path.with_added_extension("settlements.sqlite3")).unwrap();
+        journal
+            .execute_batch(
+                "CREATE TRIGGER fail_intent BEFORE INSERT ON settlement_intents
+                 BEGIN SELECT RAISE(ABORT, 'injected intent failure'); END;",
+            )
+            .unwrap();
+
+        let outcome = dispatch_local(
+            &[paid_card("p")],
+            Some(&supervisor),
+            Some(&ledger),
+            &empty_profile(),
+            "hi",
+            vec![ChatMessage {
+                role: "user".to_string(),
+                content: "hi".to_string(),
+            }],
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(outcome.result, Err(DispatchFailure::Budget(_))));
+        assert!(adapter.event_log().is_empty());
+        let main = rusqlite::Connection::open(&path).unwrap();
+        let reservations: (i64, i64) = main
+            .query_row(
+                "SELECT count(*), sum(status='released') FROM reservations",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(reservations, (1, 1));
+        assert_eq!(
+            ledger.tenant_balance(budget::PERSONAL_TENANT_ID).unwrap(),
+            1_000_000
+        );
+    }
+
+    #[tokio::test]
+    async fn busy_journal_preserves_intent_across_ttl_and_restart() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("b.sqlite3");
+        let clock = Arc::new(TestClock::default());
         let ledger = BudgetLedger::open_with_busy_timeout(
             &path,
-            Arc::new(idoris_tenancy::budget::SystemClock),
+            clock.clone(),
             1,
             std::time::Duration::ZERO,
         )
@@ -669,6 +752,191 @@ mod tests {
             std::task::Poll::Ready(())
         })
         .await;
+        let blocker =
+            rusqlite::Connection::open(path.with_added_extension("settlements.sqlite3")).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let outcome = call.await.unwrap();
+        assert!(matches!(outcome.result, Err(DispatchFailure::Budget(_))));
+        assert_eq!(outcome.actual_cost_minor, None);
+        let main = rusqlite::Connection::open(&path).unwrap();
+        let actual: i64 = main
+            .query_row(
+                "SELECT actual_cost_minor FROM reservations WHERE actual_cost_minor IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let expected_actual = budget::estimate_actual_cost_minor(
+            &paid_card("p").provider.cost,
+            "hi",
+            "mock reply to: hi",
+            0,
+        );
+        assert_eq!(actual, expected_actual);
+        drop(main);
+
+        // The reservation itself has expired, but the durable pre-call
+        // intent still blocks another paid request after the journal write
+        // failed. This also proves the first operation happened before the
+        // upstream await: the lock was acquired only after the first poll.
+        clock.0.store(2, Ordering::SeqCst);
+        assert!(budget::reserve(&ledger, None, "p", 500).is_err());
+
+        drop(ledger);
+        // Restart while the journal is still locked. The durable intent and
+        // fallback actual keep admission closed until recovery can finish.
+        let restarted = BudgetLedger::open_with_busy_timeout(
+            &path,
+            clock.clone(),
+            1,
+            std::time::Duration::ZERO,
+        )
+        .unwrap();
+        assert!(budget::reserve(&restarted, None, "p", 500).is_err());
+        drop(restarted);
+        blocker.execute_batch("ROLLBACK").unwrap();
+
+        // With the journal available, retry can complete the settlement.
+        // Reopening repeatedly must not apply the same charge twice, and
+        // admission must resume once recovery has cleared the intent.
+        for _ in 0..2 {
+            let recovered = BudgetLedger::open_with(path.clone(), clock.clone(), 1).unwrap();
+            let balance = recovered
+                .tenant_balance(budget::PERSONAL_TENANT_ID)
+                .unwrap();
+            assert_eq!(balance, 1_000_000 - actual);
+            let id = budget::reserve(&recovered, None, "p", 500).unwrap();
+            budget::release(&recovered, None, &id).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn busy_journal_and_main_db_keep_durable_intent_fail_closed_after_restart() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("b.sqlite3");
+        let clock = Arc::new(TestClock::default());
+        let ledger = BudgetLedger::open_with_busy_timeout(
+            &path,
+            clock.clone(),
+            1,
+            std::time::Duration::ZERO,
+        )
+        .unwrap();
+        ledger
+            .configure_tenant(
+                budget::PERSONAL_TENANT_ID,
+                1_000_000,
+                "UTC",
+                idoris_tenancy::budget::SpendGate::PaidOnly,
+            )
+            .unwrap();
+        let adapter = Arc::new(MockAdapter::new(vec![ModelInfo {
+            id: "p".to_string(),
+            memory_gb: 1.0,
+        }]));
+        adapter.set_chat_delay("p", std::time::Duration::from_millis(20));
+        let supervisor = Supervisor::spawn(adapter, SupervisorConfig::default()).unwrap();
+        let cards = [paid_card("p")];
+        let profile = empty_profile();
+        let mut call = Box::pin(dispatch_local(
+            &cards,
+            Some(&supervisor),
+            Some(&ledger),
+            &profile,
+            "hi",
+            vec![ChatMessage {
+                role: "user".to_string(),
+                content: "hi".to_string(),
+            }],
+            CancellationToken::new(),
+        ));
+        std::future::poll_fn(|cx| {
+            assert!(call.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        let journal_lock =
+            rusqlite::Connection::open(path.with_added_extension("settlements.sqlite3")).unwrap();
+        journal_lock.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let main_lock = rusqlite::Connection::open(&path).unwrap();
+        main_lock.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+        let outcome = call.await.unwrap();
+        assert!(matches!(outcome.result, Err(DispatchFailure::Budget(_))));
+        let main = rusqlite::Connection::open(&path).unwrap();
+        let actuals: i64 = main
+            .query_row(
+                "SELECT count(*) FROM reservations WHERE actual_cost_minor IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(actuals, 0);
+        drop(main);
+
+        // Neither durable outcome store accepted the amount. After TTL and
+        // process restart, the intent alone must continue blocking spends.
+        clock.0.store(2, Ordering::SeqCst);
+        drop(ledger);
+        main_lock.execute_batch("ROLLBACK").unwrap();
+        let restarted = BudgetLedger::open_with_busy_timeout(
+            &path,
+            clock.clone(),
+            1,
+            std::time::Duration::ZERO,
+        )
+        .unwrap();
+        assert!(budget::reserve(&restarted, None, "p", 500).is_err());
+        drop(restarted);
+        journal_lock.execute_batch("ROLLBACK").unwrap();
+        let recovered = BudgetLedger::open_with(path, clock, 1).unwrap();
+        assert!(budget::reserve(&recovered, None, "p", 500).is_err());
+    }
+
+    #[tokio::test]
+    async fn busy_main_database_journals_and_recovers_the_charge() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("b.sqlite3");
+        let ledger = BudgetLedger::open_with_busy_timeout(
+            &path,
+            Arc::new(idoris_tenancy::budget::SystemClock),
+            1,
+            std::time::Duration::ZERO,
+        )
+        .unwrap();
+        ledger
+            .configure_tenant(
+                budget::PERSONAL_TENANT_ID,
+                1_000_000,
+                "UTC",
+                idoris_tenancy::budget::SpendGate::PaidOnly,
+            )
+            .unwrap();
+        let adapter = Arc::new(MockAdapter::new(vec![ModelInfo {
+            id: "p".to_string(),
+            memory_gb: 1.0,
+        }]));
+        adapter.set_chat_delay("p", std::time::Duration::from_millis(20));
+        let supervisor = Supervisor::spawn(adapter, SupervisorConfig::default()).unwrap();
+        let cards = [paid_card("p")];
+        let profile = empty_profile();
+        let mut call = Box::pin(dispatch_local(
+            &cards,
+            Some(&supervisor),
+            Some(&ledger),
+            &profile,
+            "hi",
+            vec![ChatMessage {
+                role: "user".to_string(),
+                content: "hi".to_string(),
+            }],
+            CancellationToken::new(),
+        ));
+        std::future::poll_fn(|cx| {
+            assert!(call.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
         let blocker = rusqlite::Connection::open(&path).unwrap();
         blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
         let outcome = call.await.unwrap();
@@ -680,15 +948,21 @@ mod tests {
             .query_row(
                 "SELECT count(*), actual_cost_minor FROM pending_settlements",
                 [],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
         assert_eq!(pending, 1);
-        assert!(actual > 0);
+        assert_eq!(
+            actual,
+            budget::estimate_actual_cost_minor(
+                &paid_card("p").provider.cost,
+                "hi",
+                "mock reply to: hi",
+                0,
+            )
+        );
         drop(ledger);
         blocker.execute_batch("ROLLBACK").unwrap();
-        // A fresh process/connection recovers the durable result even though
-        // the reservation TTL has elapsed. Reopening twice must charge once.
         for _ in 0..2 {
             let recovered = BudgetLedger::open(&path).unwrap();
             assert_eq!(
@@ -699,7 +973,9 @@ mod tests {
             );
         }
         let pending: i64 = journal
-            .query_row("SELECT count(*) FROM pending_settlements", [], |r| r.get(0))
+            .query_row("SELECT count(*) FROM pending_settlements", [], |row| {
+                row.get(0)
+            })
             .unwrap();
         assert_eq!(pending, 0);
     }

@@ -209,21 +209,14 @@ impl Default for AppState {
 /// `501` fallback for everything else, and the `X-iDoris-Record-Id`
 /// middleware applied to every response.
 pub fn build_app(state: AppState) -> Router {
+    build_app_inner(state, None)
+}
+
+type SettlementRetryObserver = tokio::sync::mpsc::UnboundedSender<Result<(), String>>;
+
+fn build_app_inner(state: AppState, observer: Option<SettlementRetryObserver>) -> Router {
     if let Some(ledger) = &state.budget_ledger {
-        let ledger = Arc::downgrade(ledger);
-        tokio::spawn(async move {
-            loop {
-                let Some(ledger) = ledger.upgrade() else {
-                    break;
-                };
-                let result = tokio::task::spawn_blocking(move || ledger.retry_settlements()).await;
-                match result {
-                    Ok(Ok(())) => {}
-                    other => eprintln!("budget settlement retry failed: {other:?}"),
-                }
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-            }
-        });
+        spawn_settlement_worker(Arc::downgrade(ledger), observer);
     }
     Router::new()
         .route("/health", get(health))
@@ -235,6 +228,46 @@ pub fn build_app(state: AppState) -> Router {
         .fallback(not_found)
         .with_state(Arc::new(state))
         .layer(middleware::from_fn(record_id_middleware))
+}
+
+fn spawn_settlement_worker(
+    ledger: std::sync::Weak<idoris_tenancy::budget::BudgetLedger>,
+    observer: Option<SettlementRetryObserver>,
+) {
+    tokio::spawn(async move {
+        loop {
+            let Some(ledger) = ledger.upgrade() else {
+                break;
+            };
+            let result = tokio::task::spawn_blocking(move || ledger.retry_settlements()).await;
+            if let Some(observer) = &observer {
+                let event = match &result {
+                    Ok(Ok(())) => Ok(()),
+                    Ok(Err(err)) => Err(format!("{err:?}")),
+                    Err(err) => Err(err.to_string()),
+                };
+                let _ = observer.send(event);
+            }
+            match result {
+                Ok(Ok(())) => {}
+                other => {
+                    eprintln!("budget settlement retry failed: {other:?}");
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+    });
+}
+
+#[cfg(test)]
+fn build_observed_app(
+    state: AppState,
+) -> (
+    Router,
+    tokio::sync::mpsc::UnboundedReceiver<Result<(), String>>,
+) {
+    let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+    (build_app_inner(state, Some(sender)), receiver)
 }
 
 /// `GET /v1/models` (interface spec — `owned_by` is each card's

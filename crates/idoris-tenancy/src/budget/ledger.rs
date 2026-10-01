@@ -10,6 +10,7 @@
 //! (`settle`) independently callable, independently testable operations —
 //! which is why they're two methods here, not one.
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -198,6 +199,7 @@ impl SpendGate {
 pub struct BudgetLedger {
     pub(super) conn: Mutex<Connection>,
     pub(super) settlements: Mutex<Connection>,
+    pub(super) settlement_outcomes: Mutex<HashMap<String, (String, i64)>>,
     clock: Arc<dyn Clock>,
     ttl_ms: i64,
 }
@@ -259,6 +261,7 @@ impl BudgetLedger {
         let ledger = Self {
             conn: Mutex::new(conn),
             settlements: Mutex::new(super::settlement::open(path.as_ref(), busy_timeout)?),
+            settlement_outcomes: Mutex::new(HashMap::new()),
             clock,
             ttl_ms,
         };
@@ -495,6 +498,25 @@ impl BudgetLedger {
         };
 
         self.retry_settlements()?;
+        // Serialize intent checks with local begin_settlement calls. An
+        // unresolved intent globally pauses new spending as a conservative
+        // recovery policy.
+        let _outcomes = self
+            .settlement_outcomes
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let journal = self.settlements.lock().unwrap_or_else(|p| p.into_inner());
+        let unresolved: i64 =
+            journal.query_row("SELECT count(*) FROM settlement_intents", [], |r| r.get(0))?;
+        if unresolved > 0 {
+            return Err(BudgetError::Storage(
+                "dispatch has an unresolved settlement intent".into(),
+            ));
+        }
+        drop(journal);
+        // Keep this process-local gate until the reservation transaction is
+        // finished. Otherwise begin_settlement could insert an intent after
+        // this check but before this request commits its reservation.
         let now_ms = self.clock.now_ms();
         let mut conn = self.lock();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -942,7 +964,8 @@ impl BudgetLedger {
         match status {
             ReservationStatus::Released => {
                 tx.commit()?;
-                Ok(())
+                drop(conn);
+                self.cancel_settlement(tenant_id, reservation_id)
             }
             ReservationStatus::Active | ReservationStatus::Expired => {
                 tx.execute(
@@ -950,7 +973,8 @@ impl BudgetLedger {
                     rusqlite::params![reservation_id.0, ReservationStatus::Released.as_sql()],
                 )?;
                 tx.commit()?;
-                Ok(())
+                drop(conn);
+                self.cancel_settlement(tenant_id, reservation_id)
             }
             ReservationStatus::Settled => {
                 tx.rollback().ok();
