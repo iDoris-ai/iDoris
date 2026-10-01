@@ -10,7 +10,11 @@ pub(super) fn open(path: &Path, timeout: Duration) -> Result<Connection, BudgetE
     let conn = if path == Path::new(":memory:") {
         Connection::open_in_memory()?
     } else {
-        Connection::open(path.with_added_extension("settlements.sqlite3"))?
+        // The primary ledger already exists. Resolve aliases so every opener
+        // shares the same durable intents and pending settlement records.
+        let canonical_path =
+            std::fs::canonicalize(path).map_err(|err| BudgetError::Storage(err.to_string()))?;
+        Connection::open(canonical_path.with_added_extension("settlements.sqlite3"))?
     };
     conn.busy_timeout(timeout)?;
     conn.pragma_update(None, "synchronous", "FULL")?;

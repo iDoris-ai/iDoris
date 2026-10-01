@@ -1,7 +1,8 @@
 # 结算待办与恢复（K06）
 
-文件账本 `budget.sqlite3` 的持久待办位于同目录
-`budget.sqlite3.settlements.sqlite3`。备份与恢复时应停写并同时保留两库；
+文件账本路径先解析符号链接并规范化，再追加 `.settlements.sqlite3` 作为持久待办路径。
+例如真实文件 `budget.sqlite3` 使用同目录的 `budget.sqlite3.settlements.sqlite3`；
+通过真实路径或文件符号链接打开的实例共享该 sidecar。备份与恢复时应停写并同时保留两库；
 不能仅恢复主账本或删除 sidecar。内存账本仅用于测试。
 
 成功的上游响应仍正常返回，`ChatOutcome.settlement_status` 区分：
