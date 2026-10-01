@@ -120,6 +120,10 @@ pub struct ChatProxy {
     max_cache_bytes: usize,
     pub(crate) retry_delays: Vec<Duration>,
     pub(crate) cache: Mutex<IndexMap<String, CacheEntry>>,
+    #[cfg(test)]
+    pub(crate) stream_eof_observed: Option<Arc<tokio::sync::Notify>>,
+    #[cfg(test)]
+    pub(crate) stream_read_waiting: Option<Arc<tokio::sync::Notify>>,
 }
 
 impl ChatProxy {
@@ -137,6 +141,10 @@ impl ChatProxy {
             // TS default (`proxy.ts`'s `ProxyDeps.retryDelaysMs` default).
             retry_delays: vec![Duration::from_millis(250), Duration::from_secs(1)],
             cache: Mutex::new(IndexMap::new()),
+            #[cfg(test)]
+            stream_eof_observed: None,
+            #[cfg(test)]
+            stream_read_waiting: None,
         }
     }
 
@@ -444,16 +452,22 @@ impl ChatProxy {
                     .map(str::to_string);
                 if (200..300).contains(&status) {
                     let idle = self.idle_timeout;
+                    #[cfg(test)]
+                    let eof_observed = self.stream_eof_observed.clone();
+                    #[cfg(test)]
+                    let read_waiting = self.stream_read_waiting.clone();
                     // Keep upstream reads running independently of downstream
                     // body polling. A single queued chunk bounds buffering;
                     // both reading and waiting for queue capacity have an
                     // idle deadline. Dropping the body closes the receiver,
-                    // which cancels this task and drops the response/permit.
+                    // which cancels the task and releases the permit.
                     let (tx, rx) = tokio::sync::mpsc::channel(1);
-                    let (error_tx, error_rx) = tokio::sync::oneshot::channel();
+                    let (terminal_tx, terminal_rx) = tokio::sync::oneshot::channel();
+                    let (drained_tx, drained_rx) = tokio::sync::oneshot::channel();
                     tokio::spawn(async move {
                         let mut resp = resp;
                         let mut terminal_error = None;
+                        let mut reached_eof = false;
                         loop {
                             let read = tokio::select! {
                                 _ = tx.closed() => break,
@@ -471,7 +485,14 @@ impl ChatProxy {
                                     terminal_error = Some(std::io::Error::other(err));
                                     break;
                                 }
-                                Ok(Ok(None)) => break,
+                                Ok(Ok(None)) => {
+                                    reached_eof = true;
+                                    #[cfg(test)]
+                                    if let Some(eof_observed) = &eof_observed {
+                                        eof_observed.notify_one();
+                                    }
+                                    break;
+                                }
                                 Ok(Ok(Some(chunk))) => chunk,
                             };
                             let reserve = tokio::select! {
@@ -490,22 +511,55 @@ impl ChatProxy {
                                 }
                             };
                             slot.send(chunk);
+                            #[cfg(test)]
+                            if let Some(read_waiting) = &read_waiting {
+                                read_waiting.notify_one();
+                            }
                         }
                         drop(resp);
-                        drop(permit);
                         if let Some(error) = terminal_error {
-                            let _ = error_tx.send(error);
+                            drop(permit);
+                            let _ = terminal_tx.send(Err(error));
+                        } else if reached_eof {
+                            // Wait for downstream EOF too. This bounds the
+                            // lifetime of an unread final chunk after upstream
+                            // EOF, and lets the body observe the idle failure.
+                            drop(tx);
+                            match tokio::time::timeout(idle, drained_rx).await {
+                                Ok(Ok(())) => {
+                                    let _ = terminal_tx.send(Ok(permit));
+                                }
+                                Ok(Err(_)) => drop(permit),
+                                Err(_) => {
+                                    drop(permit);
+                                    let _ = terminal_tx.send(Err(std::io::Error::new(
+                                        std::io::ErrorKind::TimedOut,
+                                        "downstream stream idle timeout after upstream EOF",
+                                    )));
+                                }
+                            }
+                        } else {
+                            // The receiver was dropped, so cancellation releases
+                            // the upstream connection and permit immediately.
+                            drop(permit);
                         }
                     });
                     let stream = futures_util::stream::unfold(
-                        (rx, Some(error_rx)),
-                        |(mut rx, error_rx)| async move {
+                        (rx, Some(terminal_rx), Some(drained_tx)),
+                        |(mut rx, terminal_rx, drained_tx)| async move {
                             if let Some(chunk) = rx.recv().await {
-                                return Some((Ok(chunk), (rx, error_rx)));
+                                return Some((Ok(chunk), (rx, terminal_rx, drained_tx)));
                             }
-                            let error_rx = error_rx?;
-                            match error_rx.await {
-                                Ok(error) => Some((Err(error), (rx, None))),
+                            if let Some(drained_tx) = drained_tx {
+                                let _ = drained_tx.send(());
+                            }
+                            let terminal_rx = terminal_rx?;
+                            match terminal_rx.await {
+                                Ok(Ok(permit)) => {
+                                    drop(permit);
+                                    None
+                                }
+                                Ok(Err(error)) => Some((Err(error), (rx, None, None))),
                                 Err(_) => None,
                             }
                         },
@@ -542,9 +596,10 @@ impl ChatProxy {
 
 /// [`ChatProxy::forward_stream`]'s result: either the initial response
 /// wasn't ok (returned buffered, see that method's doc) or it was, in which
-/// case a background producer owns the upstream connection and permit while
-/// `response` provides bounded buffering and cancels that producer on drop.
-/// Truncation or idle timeout remains visible as a body read error.
+/// case a background producer owns the upstream connection while `response`
+/// provides bounded buffering and cancels that producer on drop. The permit
+/// remains held until the downstream body reaches EOF or is dropped. Truncation
+/// or idle timeout remains visible as a body read error.
 pub enum StreamOutcome {
     Buffered {
         status: u16,
@@ -834,87 +889,6 @@ mod tests {
             assert_eq!(status, expected);
             assert_ne!(body.as_ref(), b"12345");
         }
-    }
-
-    #[tokio::test]
-    async fn k14_stream_idle_timeout_errors_and_releases_permit() {
-        use http_body_util::BodyExt;
-        use std::io::{Read, Write};
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        std::thread::spawn(move || {
-            let (mut socket, _) = listener.accept().unwrap();
-            let _ = socket.read(&mut [0; 4096]);
-            socket
-                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 100\r\n\r\nx")
-                .unwrap();
-            std::thread::sleep(Duration::from_millis(200));
-        });
-        let mut proxy = fast_retry_proxy();
-        proxy.idle_timeout = Duration::from_millis(20);
-        proxy.permits = Arc::new(tokio::sync::Semaphore::new(1));
-        let StreamOutcome::Stream { mut response, .. } = proxy
-            .forward_stream(&format!("http://{addr}"), &chat_body())
-            .await
-        else {
-            panic!("expected stream");
-        };
-        assert_eq!(
-            response
-                .frame()
-                .await
-                .unwrap()
-                .unwrap()
-                .into_data()
-                .unwrap(),
-            "x"
-        );
-        let error = tokio::time::timeout(Duration::from_millis(100), response.frame())
-            .await
-            .expect("an idle stream must fail")
-            .unwrap()
-            .unwrap_err();
-        assert!(error.to_string().contains("idle"));
-        assert_eq!(proxy.permits.available_permits(), 1);
-    }
-
-    #[tokio::test]
-    async fn k14_stream_holds_permit_until_body_drop_or_eof() {
-        use http_body_util::BodyExt;
-        let server = wiremock::MockServer::start().await;
-        wiremock::Mock::given(wiremock::matchers::method("POST"))
-            .respond_with(wiremock::ResponseTemplate::new(200).set_body_string("ok"))
-            .expect(2)
-            .mount(&server)
-            .await;
-        let mut proxy = fast_retry_proxy();
-        proxy.permits = Arc::new(tokio::sync::Semaphore::new(1));
-        let out = proxy.forward_stream(&server.uri(), &chat_body()).await;
-        let denied = proxy
-            .forward_buffered(&server.uri(), &chat_body(), &opts(None, "r"))
-            .await;
-        assert_eq!(denied.status, 503);
-        assert!(matches!(
-            proxy.forward_stream(&server.uri(), &chat_body()).await,
-            StreamOutcome::Buffered { status: 503, .. }
-        ));
-        drop(out);
-        let _released = tokio::time::timeout(
-            Duration::from_millis(100),
-            proxy.permits.clone().acquire_owned(),
-        )
-        .await
-        .expect("dropping the body must cancel its producer and release the permit")
-        .expect("semaphore remains open");
-        drop(_released);
-        assert_eq!(proxy.permits.available_permits(), 1);
-        let StreamOutcome::Stream { response, .. } =
-            proxy.forward_stream(&server.uri(), &chat_body()).await
-        else {
-            panic!("expected stream");
-        };
-        assert_eq!(response.collect().await.unwrap().to_bytes(), "ok");
-        assert_eq!(proxy.permits.available_permits(), 1);
     }
 
     #[tokio::test]

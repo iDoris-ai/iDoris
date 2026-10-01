@@ -11,6 +11,17 @@ fn request_body() -> Value {
     serde_json::json!({"model":"test","messages":[]})
 }
 
+fn forward_opts() -> ForwardOpts<'static> {
+    ForwardOpts {
+        request_id: None,
+        tenant_id: None,
+        record_id: "eof-held",
+        provider_id: "omlx",
+        served_locality: Locality::Loopback,
+        privacy: PrivacyClass::Any,
+    }
+}
+
 fn accept_request(stream: &mut TcpStream) {
     stream
         .set_read_timeout(Some(Duration::from_secs(3)))
@@ -90,6 +101,146 @@ async fn normal_upstream_eof_remains_normal_eof() {
     .await
     .expect("normal upstream EOF should complete");
     assert_eq!(body, b"abc");
+    assert_eq!(proxy.permits.available_permits(), 1);
+    server.join().unwrap();
+}
+
+#[tokio::test]
+async fn unconsumed_eof_keeps_permit_until_idle_deadline_then_errors() {
+    let (endpoint, listener) = tcp_server();
+    let server = thread::spawn(move || {
+        let (mut socket, _) = listener.accept().unwrap();
+        accept_request(&mut socket);
+        socket
+            .write_all(b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n1\r\nx\r\n0\r\n\r\n")
+            .unwrap();
+    });
+    let mut proxy = test_proxy(Duration::from_millis(200));
+    let eof_observed = Arc::new(tokio::sync::Notify::new());
+    proxy.stream_eof_observed = Some(eof_observed.clone());
+    let StreamOutcome::Stream { mut response, .. } =
+        proxy.forward_stream(&endpoint, &request_body()).await
+    else {
+        panic!("expected streaming response");
+    };
+
+    // The hook fires only after the producer's next resp.chunk() returned
+    // None. The queued byte remains deliberately unconsumed by the caller.
+    timeout(Duration::from_secs(2), eof_observed.notified())
+        .await
+        .expect("producer should observe upstream EOF");
+    assert_eq!(proxy.permits.available_permits(), 0);
+    assert!(matches!(
+        proxy.forward_stream(&endpoint, &request_body()).await,
+        StreamOutcome::Buffered { status: 503, .. }
+    ));
+    assert_eq!(
+        proxy
+            .forward_buffered(&endpoint, &request_body(), &forward_opts())
+            .await
+            .status,
+        503
+    );
+
+    // Even though upstream EOF is known, a stalled downstream body keeps its
+    // permit until the idle deadline. Resuming then reports the timeout.
+    take_permit(&proxy).await;
+    assert_eq!(proxy.permits.available_permits(), 1);
+    assert_eq!(
+        response
+            .frame()
+            .await
+            .unwrap()
+            .unwrap()
+            .into_data()
+            .unwrap(),
+        "x"
+    );
+    let error = timeout(Duration::from_secs(1), response.frame())
+        .await
+        .expect("stalled body should deliver its terminal error")
+        .unwrap()
+        .unwrap_err();
+    assert!(error.to_string().to_lowercase().contains("idle"));
+    drop(response);
+    server.join().unwrap();
+}
+
+#[tokio::test]
+async fn dropping_body_closes_upstream_and_releases_permit_before_idle_deadline() {
+    let (endpoint, listener) = tcp_server();
+    let (closed_tx, closed_rx) = tokio::sync::oneshot::channel();
+    let server = thread::spawn(move || {
+        let (mut socket, _) = listener.accept().unwrap();
+        accept_request(&mut socket);
+        socket
+            .write_all(b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n1\r\nx\r\n")
+            .unwrap();
+        socket.flush().unwrap();
+        let _ = closed_tx.send(wait_for_peer_close(&mut socket));
+    });
+
+    let mut proxy = test_proxy(Duration::from_secs(5));
+    let read_waiting = Arc::new(tokio::sync::Notify::new());
+    proxy.stream_read_waiting = Some(read_waiting.clone());
+    let StreamOutcome::Stream { mut response, .. } =
+        proxy.forward_stream(&endpoint, &request_body()).await
+    else {
+        panic!("expected streaming response");
+    };
+    let first = timeout(Duration::from_secs(2), response.frame())
+        .await
+        .expect("first chunk should arrive")
+        .unwrap()
+        .unwrap();
+    assert_eq!(first.into_data().unwrap(), "x");
+    // The server keeps the response open after this chunk, so the producer
+    // has no upstream EOF to finish on. Wait for its read hook before drop.
+    timeout(Duration::from_secs(1), read_waiting.notified())
+        .await
+        .expect("producer should return to waiting for the next upstream chunk");
+    drop(response);
+
+    timeout(Duration::from_millis(500), async {
+        assert!(closed_rx.await.unwrap());
+        take_permit(&proxy).await;
+    })
+    .await
+    .expect("drop should close upstream and release permit before idle timeout");
+    assert_eq!(proxy.permits.available_permits(), 1);
+    server.join().unwrap();
+}
+
+#[tokio::test]
+async fn dropping_body_after_upstream_eof_releases_permit_without_idle_wait() {
+    let (endpoint, listener) = tcp_server();
+    let server = thread::spawn(move || {
+        let (mut socket, _) = listener.accept().unwrap();
+        accept_request(&mut socket);
+        socket
+            .write_all(b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n0\r\n\r\n")
+            .unwrap();
+    });
+
+    let mut proxy = test_proxy(Duration::from_secs(5));
+    let eof_observed = Arc::new(tokio::sync::Notify::new());
+    proxy.stream_eof_observed = Some(eof_observed.clone());
+    let StreamOutcome::Stream { response, .. } =
+        proxy.forward_stream(&endpoint, &request_body()).await
+    else {
+        panic!("expected streaming response");
+    };
+    timeout(Duration::from_secs(2), eof_observed.notified())
+        .await
+        .expect("producer should observe upstream EOF");
+    drop(response);
+
+    timeout(Duration::from_millis(500), async {
+        let permit = proxy.permits.clone().acquire_owned().await.unwrap();
+        drop(permit);
+    })
+    .await
+    .expect("dropping an EOF body should release its permit immediately");
     assert_eq!(proxy.permits.available_permits(), 1);
     server.join().unwrap();
 }
