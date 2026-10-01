@@ -309,9 +309,9 @@ async fn cancelled_post_is_remembered_until_window_expires() {
         "same-id waiter should be pending behind the leader"
     );
 
-    // Keep the request active beyond its original start time's idempotency
-    // window. Cancellation must start a fresh unknown-result window.
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Let the original idempotency window expire while the request is active.
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_millis(100)).await;
     leader.abort();
     let Err(error) = leader.await else {
         panic!("cancelled leader unexpectedly completed");
@@ -329,7 +329,10 @@ async fn cancelled_post_is_remembered_until_window_expires() {
     assert_eq!(changed.status, 409);
     assert_eq!(upstream.calls.load(Ordering::SeqCst), 1);
 
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Keep the cancellation window active for the replay assertions above,
+    // then expire it on the virtual clock.
+    tokio::time::advance(Duration::from_millis(100)).await;
+    tokio::time::resume();
     let retry_proxy = proxy.clone();
     let retry_endpoint = endpoint.clone();
     let retry_body = original.clone();
@@ -365,7 +368,10 @@ async fn active_flight_survives_window_expiration_without_duplicate_post() {
             .await
     });
     received(&upstream).await;
-    tokio::time::sleep(Duration::from_millis(70)).await;
+    tokio::time::pause();
+    // The active flight remains authoritative even when its original start
+    // time is older than the cache window.
+    tokio::time::advance(Duration::from_millis(60)).await;
 
     let waiter_body = body("same");
     let waiter_options = options("active");
@@ -377,6 +383,7 @@ async fn active_flight_survives_window_expiration_without_duplicate_post() {
     .await;
     assert_eq!(upstream.calls.load(Ordering::SeqCst), 1);
 
+    tokio::time::resume();
     upstream.release.add_permits(1);
     let leader_out = tokio::time::timeout(Duration::from_secs(2), leader)
         .await
