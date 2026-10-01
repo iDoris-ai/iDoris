@@ -113,8 +113,9 @@ pub struct ForwardOutcome {
 struct Flight {
     fingerprint: Value,
     outcome: tokio::sync::Mutex<Option<ForwardOutcome>>,
-    /// Set when execution may have happened without a complete response, or
-    /// when the leader future is dropped before forwarding completes.
+    /// Set when execution may have happened without a complete response, a
+    /// complete 5xx response was received, or the leader future was dropped
+    /// before forwarding completes.
     /// The registry keeps this uncertainty record through the idempotency window.
     cancelled_at: Mutex<Option<Instant>>,
 }
@@ -444,6 +445,11 @@ impl ChatProxy {
                                 served_locality: opts.served_locality,
                             },
                         );
+                    }
+                    // A 5xx may follow execution; retain this flight through
+                    // the idempotency window.
+                    if (500..600).contains(&status) {
+                        *uncertain = true;
                     }
                     return ForwardOutcome {
                         status,

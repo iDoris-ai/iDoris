@@ -77,6 +77,8 @@ async fn forward(proxy: &ChatProxy, endpoint: &str, payload: &Value, id: &str) -
 enum RawFault {
     DropBeforeResponse,
     TruncateResponse,
+    Complete500,
+    Complete503,
 }
 
 async fn read_complete_post(stream: &mut tokio::net::TcpStream) {
@@ -129,6 +131,17 @@ async fn start_raw_fault_upstream(
                             .await
                             .unwrap();
                     }
+                    RawFault::Complete500 | RawFault::Complete503 => {
+                        let (status, reason) = match fault {
+                            RawFault::Complete500 => (500, "Internal Server Error"),
+                            RawFault::Complete503 => (503, "Service Unavailable"),
+                            _ => unreachable!(),
+                        };
+                        let response = format!(
+                            "HTTP/1.1 {status} {reason}\r\nContent-Type: application/problem+json\r\nContent-Length: 31\r\nConnection: close\r\n\r\n{{\"error\":\"upstream overloaded\"}}"
+                        );
+                        stream.write_all(response.as_bytes()).await.unwrap();
+                    }
                 }
                 // Closing after the complete POST leaves the proxy unable to
                 // know whether the upstream executed it.
@@ -153,14 +166,39 @@ async fn assert_uncertain_post_is_remembered(fault: RawFault, id: &str) {
         vec![Duration::from_millis(1)],
     );
     let original = body("same");
+    let expected_status = match fault {
+        RawFault::Complete500 => 500,
+        RawFault::Complete503 => 503,
+        RawFault::DropBeforeResponse | RawFault::TruncateResponse => 502,
+    };
+    let expected_body = match fault {
+        RawFault::Complete500 | RawFault::Complete503 => {
+            Some(br#"{"error":"upstream overloaded"}"#.as_slice())
+        }
+        RawFault::DropBeforeResponse | RawFault::TruncateResponse => None,
+    };
     let first = forward(&proxy, &endpoint, &original, id).await;
-    assert_eq!(first.status, 502);
+    assert_eq!(first.status, expected_status);
+    if let Some(expected_body) = expected_body {
+        assert_eq!(first.body.as_ref(), expected_body);
+        assert_eq!(
+            first.content_type.as_deref(),
+            Some("application/problem+json")
+        );
+    }
     assert_eq!(first.retries, 0);
     assert!(!first.cached);
     assert_eq!(calls.load(Ordering::SeqCst), 1);
 
     let replay = forward(&proxy, &endpoint, &original, id).await;
-    assert_eq!(replay.status, 502);
+    assert_eq!(replay.status, expected_status);
+    if let Some(expected_body) = expected_body {
+        assert_eq!(replay.body.as_ref(), expected_body);
+        assert_eq!(
+            replay.content_type.as_deref(),
+            Some("application/problem+json")
+        );
+    }
     assert_eq!(replay.retries, 0);
     assert!(!replay.cached);
     assert_eq!(calls.load(Ordering::SeqCst), 1);
@@ -172,7 +210,7 @@ async fn assert_uncertain_post_is_remembered(fault: RawFault, id: &str) {
     );
     assert_eq!(calls.load(Ordering::SeqCst), 1);
 
-    // Advance the retained unknown-result entry beyond its configured window
+    // Advance the retained entry beyond its configured window
     // without relying on wall-clock sleeps.
     {
         let mut flights = proxy.flights.lock().unwrap();
@@ -180,7 +218,7 @@ async fn assert_uncertain_post_is_remembered(fault: RawFault, id: &str) {
         let key = cache_key("tenant-a", &url, "provider", id);
         let entry = flights
             .get_mut(&key)
-            .expect("uncertain flight should be retained");
+            .expect("failed POST flight should be retained");
         *entry.cancelled_at.lock().unwrap() = Some(Instant::now() - Duration::from_secs(61));
     }
     assert_eq!(forward(&proxy, &endpoint, &original, id).await.status, 200);
@@ -196,6 +234,16 @@ async fn consumed_post_with_lost_headers_is_remembered() {
 #[tokio::test]
 async fn consumed_post_with_truncated_body_is_remembered() {
     assert_uncertain_post_is_remembered(RawFault::TruncateResponse, "truncated-body").await;
+}
+
+#[tokio::test]
+async fn complete_500_is_remembered_for_same_id_until_window_expires() {
+    assert_uncertain_post_is_remembered(RawFault::Complete500, "complete-500").await;
+}
+
+#[tokio::test]
+async fn complete_503_is_remembered_for_same_id_until_window_expires() {
+    assert_uncertain_post_is_remembered(RawFault::Complete503, "complete-503").await;
 }
 
 #[tokio::test]
