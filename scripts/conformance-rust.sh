@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# scripts/conformance-rust.sh — 用 Rust `idoris` 二进制作被测对象跑 conformance 套件。
+#
+# 前提：
+#   `conformance/` 目录 + 根 package.json 的 `pnpm conformance` 脚本来自
+#   PR #49（2026-10-01 已合并进 main）。当前分支要包含它们，否则第一步就会报错退出。
+#
+# 用法：
+#   bash scripts/conformance-rust.sh
+#
+# 现状（R2-D 把 idoris-policy/idoris-tenancy 接进 idoris-router 之前）：Rust
+# `idoris` 二进制只实现了 GET /health，其余路由一律 501，所以除了 /health 相关
+# 断言之外，conformance 套件里绝大多数用例都会失败——这是当前阶段的预期状态，
+# 不是这个脚本或套件本身的 bug。细节和"怎么解读一次失败的跑批"见
+# docs/rust/conformance.md。
+set -euo pipefail
+
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$root"
+
+if [ ! -d conformance ]; then
+  echo "[conformance-rust] 找不到 conformance/ 目录。" >&2
+  echo "[conformance-rust] 当前分支缺少 conformance/（PR #49 已于 2026-10-01 合并进 main），先同步 main。" >&2
+  exit 1
+fi
+
+echo "[conformance-rust] cargo build --release -p idoris-router" >&2
+cargo build --release --locked -p idoris-router
+
+bin="$root/target/release/idoris"
+if [ ! -x "$bin" ]; then
+  echo "[conformance-rust] 构建产物不存在或不可执行：$bin" >&2
+  exit 1
+fi
+
+# idoris-router 当前的骨架不解析 argv（只读 IDORIS_PORT 等环境变量，见
+# crates/idoris-router/src/bin/idoris.rs），conformance harness 又是用
+# IDORIS_CONFORMANCE_CMD 按空白切分出 bin + args 来 spawn 子进程的（见
+# conformance/src/harness.ts），所以这里直接给可执行文件的绝对路径，不追加
+# 任何参数——不是漏写了 `serve`，是这个二进制目前压根没有子命令可言。
+export IDORIS_CONFORMANCE_CMD="$bin"
+
+echo "[conformance-rust] IDORIS_CONFORMANCE_CMD=$IDORIS_CONFORMANCE_CMD" >&2
+echo "[conformance-rust] pnpm conformance" >&2
+exec pnpm conformance
