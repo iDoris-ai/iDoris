@@ -1,0 +1,13 @@
+# 与仓库 config/routing-policy.yaml 内容一致，复制一份到这里，
+# 免得契约套件的行为随生产配置改动而意外漂移——套件锁定的是"这份策略下的行为"，
+# 不是"当前生产配置长什么样"。
+routing_policy:
+  version: 1
+  rules:
+    - if: { privacy: local_only }
+      then: { tiers: [local, lora], fail_closed: true }
+    - if: { intent: banner }
+      then: { capability: vision, load: on_demand }
+    - if: { complexity: complex }
+      then: { tiers: [local, remote] }
+  default: { tiers: [local], fail_closed: true }
