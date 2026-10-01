@@ -2,7 +2,7 @@
 //! + 隐私下限只能收紧、绝不放宽（接口规范 v1.1 §3.13）。
 
 use idoris_contracts::common::PrivacyClass;
-use idoris_contracts::component_card::Form;
+use idoris_contracts::component_card::{Egress, Form};
 use idoris_contracts::provider::Locality;
 
 use crate::card::Card;
@@ -38,6 +38,18 @@ pub fn effective_served_locality(card: &Card) -> Locality {
     card.component.provider.locality
 }
 
+/// 可信本地三条件（TS `dispatch.ts:isLocalCapable`）：实际 loopback、卡只承载
+/// local_only、出站仅 none/loopback。运行时复核不依赖注册校验已执行。
+pub fn is_local_capable(card: &Card) -> bool {
+    effective_served_locality(card) == Locality::Loopback
+        && card.component.privacy_class == PrivacyClass::LocalOnly
+        && card
+            .component
+            .allowed_egress
+            .iter()
+            .all(|e| matches!(e, Egress::None | Egress::Loopback))
+}
+
 /// 请求声明的隐私下限与「闸一」内容检查收紧结果的合并（v1.1 §3.13）：内容检查
 /// 的结果只能让隐私更严格，绝不会让 `local_only` 的下限被放宽——`floor` 已经是
 /// `LocalOnly` 时，无论 `content_tightening` 说什么，结果始终是 `LocalOnly`。
@@ -56,6 +68,48 @@ mod tests {
     use super::*;
     use crate::card::test_support::sample_card;
     use idoris_contracts::component_card::Form;
+
+    #[test]
+    fn local_capable_accepts_trusted_none_or_loopback_egress() {
+        let mut card = sample_card("local", &[]);
+        for egress in [Egress::None, Egress::Loopback] {
+            card.component.allowed_egress = vec![egress];
+            assert!(is_local_capable(&card));
+        }
+    }
+
+    #[test]
+    fn local_capable_rejects_any_privacy_on_a_loopback_card() {
+        let mut card = sample_card("local", &[]);
+        card.component.privacy_class = PrivacyClass::Any;
+        assert!(!is_local_capable(&card));
+    }
+
+    #[test]
+    fn local_capable_rechecks_egress_without_registration() {
+        let mut card = sample_card("local", &[]);
+        for egress in [Egress::Lan, Egress::Internet] {
+            for allowed in [vec![egress], vec![Egress::Loopback, egress]] {
+                card.component.allowed_egress = allowed;
+                assert!(!is_local_capable(&card));
+            }
+        }
+    }
+
+    #[test]
+    fn local_capable_requires_effective_loopback_even_for_relays() {
+        let mut card = sample_card("local", &[]);
+        for locality in [Locality::Lan, Locality::Remote] {
+            card.component.provider.locality = locality;
+            assert!(!is_local_capable(&card));
+        }
+        card.component.provider.locality = Locality::Loopback;
+        card.component.form = Form::SpawnCli;
+        assert!(!is_local_capable(&card));
+        card.component.form = Form::HttpService;
+        card.component.provider.id = SUBSCRIPTION_PROVIDER_ID.to_string();
+        assert!(!is_local_capable(&card));
+    }
 
     #[test]
     fn effective_served_locality_passes_through_normal_http_service_cards() {
