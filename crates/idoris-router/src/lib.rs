@@ -21,6 +21,9 @@ pub mod routing_policy;
 /// needed) `Supervisor` load → `Supervisor` chat.
 pub mod dispatch;
 
+/// Per-card runtime construction for lifecycle-managed providers.
+pub mod runtime;
+
 /// Atomic reserve/settle/release around a paid candidate (R2-D task 4); not
 /// yet wired into `dispatch`/the request path — a follow-up PR does that.
 pub mod budget;
