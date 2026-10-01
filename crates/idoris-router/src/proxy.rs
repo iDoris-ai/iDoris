@@ -165,10 +165,10 @@ pub struct ForwardOutcome {
 struct Flight {
     fingerprint: [u8; 32],
     outcome: tokio::sync::Mutex<Option<ForwardOutcome>>,
-    /// Set when execution may have happened without a complete response, a
-    /// complete 5xx response was received, or the leader future was dropped
-    /// before forwarding completes.
-    /// The registry keeps this uncertainty record through the idempotency window.
+    /// Set for completed successful calls, or when execution may have happened
+    /// without a complete response, a complete 5xx response was received, or
+    /// the leader future was dropped before forwarding completes. The registry
+    /// keeps these completed/uncertain records through the idempotency window.
     cancelled_at: Mutex<Option<Instant>>,
     retained_bytes: AtomicUsize,
     flight_bytes: Arc<AtomicUsize>,
@@ -199,6 +199,13 @@ impl FlightCancellationGuard {
 
     fn disarm(&mut self) {
         self.armed = false;
+    }
+
+    fn retain_completed(&mut self) {
+        if let Ok(mut cancelled_at) = self.flight.cancelled_at.lock() {
+            *cancelled_at = Some(Instant::now());
+        }
+        self.disarm();
     }
 }
 
@@ -482,8 +489,8 @@ impl ChatProxy {
             let Ok(mut flights) = self.flights.lock() else {
                 return Self::flight_failure(502, "upstream_unavailable");
             };
-            // Completed calls without other callers can be dropped. An
-            // uncertain result stays through the idempotency window.
+            // Successful and uncertain calls stay through the idempotency
+            // window, independently of response cache eviction.
             let now = Instant::now();
             flights.retain(|_, flight| {
                 if Arc::strong_count(flight) > 1 {
@@ -493,7 +500,7 @@ impl ChatProxy {
                     Ok(cancelled_at) => {
                         cancelled_at.is_some_and(|at| now.duration_since(at) < self.window)
                     }
-                    // A poisoned cancellation marker is uncertainty too; keep
+                    // A poisoned retention marker is uncertainty too; keep
                     // it permanently rather than allowing a duplicate POST.
                     Err(_) => true,
                 }
@@ -554,7 +561,11 @@ impl ChatProxy {
             uncertain = true;
             replay = Self::flight_failure(502, "upstream_unavailable");
         }
-        if !uncertain {
+        if !uncertain && (200..300).contains(&outcome.status) {
+            // Keep the request fingerprint through the idempotency window,
+            // even if independent cache pruning removes the replay body.
+            cancellation_guard.retain_completed();
+        } else if !uncertain {
             cancellation_guard.disarm();
         }
         *result = Some(replay);

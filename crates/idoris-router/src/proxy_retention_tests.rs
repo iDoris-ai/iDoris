@@ -65,6 +65,164 @@ fn cache_retained_bytes(proxy: &ChatProxy) -> usize {
         .sum()
 }
 
+async fn forward_live(
+    proxy: &ChatProxy,
+    endpoint: &str,
+    body: &Value,
+    request: &ForwardOpts<'_>,
+) -> ForwardOutcome {
+    tokio::time::resume();
+    let outcome = proxy.forward_buffered(endpoint, body, request).await;
+    tokio::time::pause();
+    outcome
+}
+
+fn cache_only_entry(body: &'static [u8]) -> CacheEntry {
+    CacheEntry {
+        at: Instant::now(),
+        fingerprint: [0; 32],
+        status: 200,
+        body: Bytes::from_static(body),
+        record_id: "cache-only".to_string(),
+        served_locality: Locality::Loopback,
+    }
+}
+
+async fn successful_flight_survives_eviction(entry_limit: bool) {
+    let response = "success".repeat(80);
+    let (endpoint, upstream, server) = upstream(200, response.clone()).await;
+    let mut proxy = proxy();
+    proxy.window = Duration::from_secs(60);
+    proxy.max_cache_bytes = if entry_limit { usize::MAX } else { 1400 };
+    proxy.max_entries = 2;
+    let first_body = serde_json::json!({"message":"first"});
+    let second_body = serde_json::json!({"message":"second"});
+
+    let first = forward_live(&proxy, &endpoint, &first_body, &opts("evicted")).await;
+    assert_eq!(first.status, 200);
+    assert_eq!(first.body.as_ref(), response.as_bytes());
+    drop(first);
+    let first_key = cache_key(
+        "tenant-a",
+        &format!("{endpoint}/v1/chat/completions"),
+        "provider",
+        "evicted",
+    );
+    assert!(proxy.cache.lock().unwrap().contains_key(&first_key));
+    let first_flight = proxy
+        .flights
+        .lock()
+        .unwrap()
+        .get(&first_key)
+        .cloned()
+        .unwrap();
+    assert_eq!(
+        first_flight
+            .outcome
+            .try_lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .status,
+        200,
+        "the complete successful outcome must have reserved flight capacity"
+    );
+    assert!(first_flight.retained_bytes.load(Ordering::Relaxed) > 0);
+    drop(first_flight);
+
+    // The byte case prunes on the second successful response write.
+    let second = forward_live(&proxy, &endpoint, &second_body, &opts("filler")).await;
+    assert_eq!(second.status, 200);
+    drop(second);
+    assert!(cache_retained_bytes(&proxy) <= proxy.max_cache_bytes);
+    let second_key = cache_key(
+        "tenant-a",
+        &format!("{endpoint}/v1/chat/completions"),
+        "provider",
+        "filler",
+    );
+    if entry_limit {
+        // `max_entries` also bounds flights, so inject cache-only entries to
+        // exercise cache entry pruning without consuming flight slots.
+        proxy.remember("cache-only-1".into(), cache_only_entry(b"1"));
+        proxy.remember("cache-only-2".into(), cache_only_entry(b"2"));
+    }
+    assert!(!proxy.cache.lock().unwrap().contains_key(&first_key));
+    assert_eq!(
+        proxy.cache.lock().unwrap().contains_key(&second_key),
+        !entry_limit
+    );
+    assert_eq!(upstream.calls.load(Ordering::SeqCst), 2);
+    // Retention must survive almost the entire window, not just an immediate replay.
+    tokio::time::advance(Duration::from_secs(59)).await;
+    let replay = forward_live(&proxy, &endpoint, &first_body, &opts("evicted")).await;
+    assert_eq!(
+        upstream.calls.load(Ordering::SeqCst),
+        2,
+        "replay must not POST"
+    );
+    assert_eq!(replay.status, 200);
+    assert_eq!(replay.body.as_ref(), response.as_bytes());
+    assert_eq!(replay.origin_record_id.as_deref(), Some("record"));
+    assert_eq!(replay.replayed_served_locality, Some(Locality::Loopback));
+    assert!(replay.cached);
+    drop(replay);
+    let conflict = forward_live(
+        &proxy,
+        &endpoint,
+        &serde_json::json!({"message":"changed"}),
+        &opts("evicted"),
+    )
+    .await;
+    assert_eq!(conflict.status, 409);
+    drop(conflict);
+    assert_eq!(upstream.calls.load(Ordering::SeqCst), 2);
+    let blocked = forward_live(
+        &proxy,
+        &endpoint,
+        &serde_json::json!({"message":"new"}),
+        &opts("slot-blocked"),
+    )
+    .await;
+    assert_eq!(blocked.status, 503);
+    drop(blocked);
+    let slot_conflict = forward_live(
+        &proxy,
+        &endpoint,
+        &serde_json::json!({"message":"changed"}),
+        &opts("filler"),
+    )
+    .await;
+    assert_eq!(slot_conflict.status, 409);
+    drop(slot_conflict);
+    assert_eq!(upstream.calls.load(Ordering::SeqCst), 2);
+
+    let bytes_before_expiry = proxy.flight_bytes.load(Ordering::Relaxed);
+    tokio::time::advance(Duration::from_secs(2)).await;
+    let expired = forward_live(
+        &proxy,
+        &endpoint,
+        &serde_json::json!({"message":"after expiry"}),
+        &opts("filler"),
+    )
+    .await;
+    assert_eq!(expired.status, 200);
+    drop(expired);
+    assert_eq!(upstream.calls.load(Ordering::SeqCst), 3);
+    assert!(proxy.flight_bytes.load(Ordering::Relaxed) < bytes_before_expiry);
+    server.abort();
+}
+
+#[tokio::test(start_paused = true)]
+async fn successful_flight_survives_byte_cache_eviction() {
+    successful_flight_survives_eviction(false).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn successful_flight_survives_entry_eviction_and_expires() {
+    successful_flight_survives_eviction(true).await;
+}
+
 #[tokio::test]
 async fn flight_retention_is_byte_bounded_and_expires_without_reposting_ids() {
     let response_size = 64 * 1024;

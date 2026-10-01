@@ -67,7 +67,10 @@ fn proxy() -> ChatProxy {
         .build()
         .unwrap();
     let mut proxy = ChatProxy::with_config(client, Duration::from_secs(60), vec![]);
-    proxy.max_entries = 1;
+    // Successful calls now retain their fingerprint through the idempotency
+    // window, so the seeded success occupies one flight slot alongside the
+    // later complete 503 or active flight under test.
+    proxy.max_entries = 2;
     proxy
 }
 
@@ -106,6 +109,7 @@ async fn cached_replay_survives_full_complete_503_flight() {
             .status,
         503
     );
+    assert_eq!(proxy.flights.lock().unwrap().len(), 2);
     assert_replay(&proxy, &endpoint, &upstream.calls).await;
     let mut changed = opts("a", "record-changed");
     changed.privacy = PrivacyClass::LocalOnly;
@@ -140,12 +144,15 @@ async fn cached_replay_survives_full_complete_503_flight() {
         );
         cache.get_mut(&key).unwrap().at = Instant::now() - Duration::from_secs(61);
     }
+    let expired_cache_replay = proxy
+        .forward_buffered(&endpoint, &body("A"), &opts("a", "record-expired"))
+        .await;
+    assert_eq!(expired_cache_replay.status, 200);
+    assert_eq!(expired_cache_replay.body.as_ref(), b"origin-body");
+    assert!(expired_cache_replay.cached);
     assert_eq!(
-        proxy
-            .forward_buffered(&endpoint, &body("A"), &opts("a", "record-expired"))
-            .await
-            .status,
-        503
+        expired_cache_replay.origin_record_id.as_deref(),
+        Some("record-a")
     );
     assert_eq!(upstream.calls.load(Ordering::SeqCst), 2);
     server.abort();
@@ -166,6 +173,7 @@ async fn cached_replay_survives_another_complete_post_pending() {
     tokio::time::timeout(Duration::from_secs(2), upstream.received.notified())
         .await
         .expect("B POST did not reach upstream");
+    assert_eq!(proxy.flights.lock().unwrap().len(), 2);
     assert_replay(&proxy, &endpoint, &upstream.calls).await;
     assert_eq!(
         proxy
