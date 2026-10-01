@@ -544,7 +544,7 @@ impl ChatProxy {
                     flight_bytes: Arc::clone(&self.flight_bytes),
                     base_bytes,
                 });
-                flights.insert(key, Arc::clone(&flight));
+                flights.insert(key.clone(), Arc::clone(&flight));
                 flight
             }
         };
@@ -553,6 +553,15 @@ impl ChatProxy {
         }
         let mut result = flight.outcome.lock().await;
         if let Some(outcome) = result.as_ref() {
+            // The leader may have cached a successful response but failed to
+            // retain its body in the bounded flight result. Prefer that valid
+            // cache entry for waiters before returning the fail-closed marker.
+            if outcome.status == 502
+                && !outcome.cached
+                && let Some(hit) = self.lookup_cached(&key, &fingerprint, opts)
+            {
+                return hit;
+            }
             return outcome.clone();
         }
         // If the leader is cancelled, waiting calls fail closed instead of resending.

@@ -423,6 +423,99 @@ async fn unretained_success_stays_fail_closed_after_cache_eviction() {
     server.abort();
 }
 
+#[tokio::test]
+async fn concurrent_uncacheable_flight_waiter_replays_success_from_cache() {
+    use std::future::{Future, poll_fn};
+    use std::task::Poll;
+    use tokio::sync::{Notify, Semaphore};
+
+    async fn hold_response(
+        State(state): State<Arc<(Notify, Semaphore, AtomicUsize, String)>>,
+        _: Bytes,
+    ) -> Response {
+        state.2.fetch_add(1, Ordering::SeqCst);
+        state.0.notify_one();
+        state.1.acquire().await.unwrap().forget();
+        Response::builder()
+            .status(200)
+            .body(Body::from(state.3.clone()))
+            .unwrap()
+    }
+
+    let response = "x".repeat(64 * 1024);
+    let state = Arc::new((
+        Notify::new(),
+        Semaphore::new(0),
+        AtomicUsize::new(0),
+        response.clone(),
+    ));
+    let app = Router::new()
+        .route("/v1/chat/completions", post(hold_response))
+        .with_state(state.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let mut proxy = proxy();
+    proxy.max_cache_bytes = 128 * 1024;
+    proxy.max_flight_bytes = 2 * 1024;
+    proxy.window = Duration::from_secs(60);
+    let proxy = Arc::new(proxy);
+    let request_body = serde_json::json!({"message":"same"});
+    let leader_proxy = proxy.clone();
+    let leader_endpoint = endpoint.clone();
+    let leader_body = request_body.clone();
+    let leader = tokio::spawn(async move {
+        leader_proxy
+            .forward_buffered(&leader_endpoint, &leader_body, &opts("concurrent"))
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(2), state.0.notified())
+        .await
+        .expect("upstream did not receive the leader POST");
+
+    // The upstream is held, so the leader still owns the outcome mutex. Poll
+    // the follower once and prove it reached that lock before releasing it.
+    let follower_opts = opts("concurrent");
+    let mut follower =
+        std::pin::pin!(proxy.forward_buffered(&endpoint, &request_body, &follower_opts));
+    let first_poll = poll_fn(|cx| std::task::Poll::Ready(follower.as_mut().poll(cx))).await;
+    assert!(matches!(first_poll, Poll::Pending));
+
+    state.1.add_permits(1);
+    let leader_result = tokio::time::timeout(Duration::from_secs(2), leader)
+        .await
+        .expect("leader did not finish")
+        .unwrap();
+    let follower_result = tokio::time::timeout(Duration::from_secs(2), follower)
+        .await
+        .expect("follower did not finish");
+
+    assert_eq!(leader_result.status, 200);
+    assert_eq!(leader_result.body.as_ref(), response.as_bytes());
+    assert_eq!(follower_result.status, 200);
+    assert_eq!(follower_result.body.as_ref(), response.as_bytes());
+    assert!(follower_result.cached);
+    assert_eq!(follower_result.origin_record_id.as_deref(), Some("record"));
+    assert_eq!(
+        follower_result.replayed_served_locality,
+        Some(Locality::Loopback)
+    );
+    assert_eq!(state.2.load(Ordering::SeqCst), 1);
+    assert_flight_budget(&proxy);
+    drop(leader_result);
+    drop(follower_result);
+
+    proxy.cache.lock().unwrap().clear();
+    let fail_closed = proxy
+        .forward_buffered(&endpoint, &request_body, &opts("concurrent"))
+        .await;
+    assert_eq!(fail_closed.status, 502);
+    assert!(fail_closed.body.len() < 128);
+    assert_eq!(state.2.load(Ordering::SeqCst), 1);
+    server.abort();
+}
+
 fn assert_flight_budget(proxy: &ChatProxy) -> usize {
     // Measure the actual retained keys and results, independently of the
     // production accounting helpers (including cancellation/fallback records).
