@@ -458,6 +458,8 @@ impl ChatProxy {
                     let idle_timeout = self.stream_idle_timeout;
                     // The body owns the permit before its first poll and
                     // carries it through each chunk until EOF, error, or drop.
+                    // The server's WriteTimeoutListener bounds stalled downstream
+                    // writes even while hyper stops polling this body.
                     let chunks = stream::unfold(Some((resp, permit)), move |state| async move {
                         let (mut response, permit) = state?;
                         match tokio::time::timeout(idle_timeout, response.chunk()).await {
@@ -532,6 +534,10 @@ mod limits_tests;
 #[cfg(test)]
 #[path = "proxy_concurrency_tests.rs"]
 mod concurrency_tests;
+
+#[cfg(test)]
+#[path = "proxy_slow_reader_tests.rs"]
+mod slow_reader_tests;
 
 #[cfg(test)]
 mod tests {
@@ -770,10 +776,12 @@ mod tests {
         proxy.remember("a".into(), entry(200));
         proxy.remember("b".into(), entry(200));
         assert!(!proxy.cache.lock().unwrap().contains_key("a"));
+        assert_eq!(proxy.cache.lock().unwrap()["b"].body.as_ref(), b"{}");
         let mut large = entry(200);
         large.body = Bytes::from(vec![0; 17]);
         proxy.remember("huge".into(), large);
         assert!(!proxy.cache.lock().unwrap().contains_key("huge"));
+        assert_eq!(proxy.cache.lock().unwrap()["b"].body.as_ref(), b"{}");
     }
 
     /// Counts requests received so the test can assert an exact retry
