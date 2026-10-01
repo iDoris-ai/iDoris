@@ -30,6 +30,8 @@
 //! value, so there is no `tenant="a:b"+id="c"` vs `tenant="a"+id="b:c"`
 //! collision ambiguity.
 
+use std::io::{self, Write};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -40,6 +42,36 @@ use idoris_contracts::provider::Locality;
 use indexmap::IndexMap;
 use serde_json::Value;
 use tokio::time::Instant;
+
+const FINGERPRINT_BYTES: usize = 32;
+struct DigestWriter(ring::digest::Context);
+
+impl Write for DigestWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0.update(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn fingerprint(
+    payload: &Value,
+    privacy: PrivacyClass,
+    locality: Locality,
+) -> Result<[u8; 32], serde_json::Error> {
+    // serde_json's default Map is key ordered (the preserve_order feature is
+    // disabled), so semantically identical JSON objects hash identically.
+    // Writing directly into SHA-256 avoids retaining a second serialized body.
+    let mut writer = DigestWriter(ring::digest::Context::new(&ring::digest::SHA256));
+    serde_json::to_writer(&mut writer, &(payload, privacy, locality))?;
+    let digest = writer.0.finish();
+    let mut output = [0; FINGERPRINT_BYTES];
+    output.copy_from_slice(digest.as_ref());
+    Ok(output)
+}
 
 /// Keeps the in-flight response permit attached to the allocation handed to
 /// hyper. `Bytes` clones and slices retain this owner until their last drop.
@@ -71,7 +103,7 @@ const DEFAULT_MAX_ENTRIES: usize = 1000;
 #[derive(Debug, Clone)]
 pub(crate) struct CacheEntry {
     pub(crate) at: Instant,
-    fingerprint: Value,
+    fingerprint: [u8; 32],
     pub(crate) status: u16,
     pub(crate) body: Bytes,
     /// `X-iDoris-Record-Id` of the request that first produced this entry
@@ -131,13 +163,25 @@ pub struct ForwardOutcome {
 }
 
 struct Flight {
-    fingerprint: Value,
+    fingerprint: [u8; 32],
     outcome: tokio::sync::Mutex<Option<ForwardOutcome>>,
     /// Set when execution may have happened without a complete response, a
     /// complete 5xx response was received, or the leader future was dropped
     /// before forwarding completes.
     /// The registry keeps this uncertainty record through the idempotency window.
     cancelled_at: Mutex<Option<Instant>>,
+    retained_bytes: AtomicUsize,
+    flight_bytes: Arc<AtomicUsize>,
+    key_bytes: usize,
+}
+
+impl Drop for Flight {
+    fn drop(&mut self) {
+        self.flight_bytes.fetch_sub(
+            self.retained_bytes.load(Ordering::Relaxed),
+            Ordering::AcqRel,
+        );
+    }
 }
 
 struct FlightCancellationGuard {
@@ -176,6 +220,11 @@ pub struct ChatProxy {
     body_timeout: Duration,
     max_body_bytes: usize,
     max_cache_bytes: usize,
+    /// Independent cap for full flight outcomes retained during the window.
+    /// Small uncertainty outcomes remain bounded by `max_entries`; full
+    /// response bodies/headers are charged to this 32 MiB pool.
+    max_flight_bytes: usize,
+    flight_bytes: Arc<AtomicUsize>,
     permits: std::sync::Arc<tokio::sync::Semaphore>,
     stream_idle_timeout: Duration,
     pub(crate) retry_delays: Vec<Duration>,
@@ -196,6 +245,9 @@ impl ChatProxy {
             body_timeout: Duration::from_secs(60),
             max_body_bytes: 8 * 1024 * 1024,
             max_cache_bytes: 32 * 1024 * 1024,
+            // Full flight outcomes and cache entries each have a 32 MiB pool.
+            max_flight_bytes: 32 * 1024 * 1024,
+            flight_bytes: Arc::new(AtomicUsize::new(0)),
             permits: std::sync::Arc::new(tokio::sync::Semaphore::new(32)),
             stream_idle_timeout: Duration::from_secs(60),
             // TS default (`proxy.ts`'s `ProxyDeps.retryDelaysMs` default).
@@ -283,6 +335,35 @@ impl ChatProxy {
         key.len()
             .saturating_add(entry.record_id.len())
             .saturating_add(entry.body.len())
+            .saturating_add(std::mem::size_of::<CacheEntry>())
+    }
+
+    fn outcome_bytes(outcome: &ForwardOutcome, flight: &Flight) -> usize {
+        outcome
+            .body
+            .len()
+            .saturating_add(outcome.content_type.as_ref().map_or(0, String::len))
+            .saturating_add(outcome.origin_record_id.as_ref().map_or(0, String::len))
+            .saturating_add(std::mem::size_of::<Flight>())
+            .saturating_add(flight.key_bytes)
+    }
+
+    fn reserve_flight_bytes(&self, bytes: usize) -> bool {
+        let mut current = self.flight_bytes.load(Ordering::Acquire);
+        loop {
+            if bytes > self.max_flight_bytes.saturating_sub(current) {
+                return false;
+            }
+            match self.flight_bytes.compare_exchange_weak(
+                current,
+                current + bytes,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => current = actual,
+            }
+        }
     }
 
     fn failure(status: u16, retries: u32) -> ForwardOutcome {
@@ -377,9 +458,9 @@ impl ChatProxy {
             obj.insert("stream".to_string(), Value::Bool(false));
         }
         // Record ids differ on replay; payload and safety context must not.
-        let fingerprint = serde_json::json!({
-            "body": payload, "privacy": opts.privacy, "locality": opts.served_locality,
-        });
+        let Ok(fingerprint) = fingerprint(&payload, opts.privacy, opts.served_locality) else {
+            return Self::failure(502, 0);
+        };
         let Some(request_id) = opts.request_id else {
             let mut uncertain = false;
             return self
@@ -431,9 +512,12 @@ impl ChatProxy {
                     return Self::flight_failure(503, "upstream_unavailable");
                 }
                 let flight = Arc::new(Flight {
-                    fingerprint: fingerprint.clone(),
+                    fingerprint,
                     outcome: tokio::sync::Mutex::new(None),
                     cancelled_at: Mutex::new(None),
+                    retained_bytes: AtomicUsize::new(0),
+                    flight_bytes: Arc::clone(&self.flight_bytes),
+                    key_bytes: key.len(),
                 });
                 flights.insert(key, Arc::clone(&flight));
                 flight
@@ -453,14 +537,25 @@ impl ChatProxy {
         let outcome = self
             .forward_once(endpoint, &payload, opts, &fingerprint, &mut uncertain)
             .await;
-        if !uncertain {
-            cancellation_guard.disarm();
-        }
         let mut replay = outcome.clone();
         if (200..300).contains(&replay.status) && !replay.cached {
             replay.cached = true;
             replay.origin_record_id = Some(opts.record_id.to_string());
             replay.replayed_served_locality = Some(opts.served_locality);
+        }
+        let retained_bytes = Self::outcome_bytes(&replay, &flight);
+        if self.reserve_flight_bytes(retained_bytes) {
+            flight
+                .retained_bytes
+                .store(retained_bytes, Ordering::Release);
+        } else {
+            // Keep a bounded uncertainty marker until expiry. Dropping a
+            // completed but uncacheable result could permit a duplicate POST.
+            uncertain = true;
+            replay = Self::flight_failure(502, "upstream_unavailable");
+        }
+        if !uncertain {
+            cancellation_guard.disarm();
         }
         *result = Some(replay);
         outcome
@@ -481,7 +576,7 @@ impl ChatProxy {
     fn lookup_cached(
         &self,
         key: &str,
-        fingerprint: &Value,
+        fingerprint: &[u8; 32],
         opts: &ForwardOpts<'_>,
     ) -> Option<ForwardOutcome> {
         #[allow(clippy::unwrap_used)]
@@ -511,7 +606,7 @@ impl ChatProxy {
         endpoint: &str,
         payload: &Value,
         opts: &ForwardOpts<'_>,
-        fingerprint: &Value,
+        fingerprint: &[u8; 32],
         uncertain: &mut bool,
     ) -> ForwardOutcome {
         let url = format!("{}/v1/chat/completions", endpoint.trim_end_matches('/'));
@@ -569,7 +664,7 @@ impl ChatProxy {
                             cache_key(tenant_scope, &url, opts.provider_id, request_id),
                             CacheEntry {
                                 at: Instant::now(),
-                                fingerprint: fingerprint.clone(),
+                                fingerprint: *fingerprint,
                                 status,
                                 // Only outgoing bytes own the permit; cache retention must not.
                                 body: body_bytes.clone(),
@@ -742,6 +837,10 @@ mod review_tests;
 mod singleflight_limits_tests;
 
 #[cfg(test)]
+#[path = "proxy_retention_tests.rs"]
+mod retention_tests;
+
+#[cfg(test)]
 #[path = "proxy_limits_tests.rs"]
 mod limits_tests;
 
@@ -762,7 +861,7 @@ mod tests {
     fn entry(status: u16) -> CacheEntry {
         CacheEntry {
             at: Instant::now(),
-            fingerprint: Value::Null,
+            fingerprint: [0; 32],
             status,
             body: Bytes::from_static(b"{}"),
             record_id: "rec-1".to_string(),
@@ -1095,7 +1194,7 @@ mod tests {
     #[test]
     fn k14_cache_evicts_by_bytes_and_rejects_an_oversize_entry() {
         let mut proxy = ChatProxy::new(reqwest::Client::new());
-        proxy.max_cache_bytes = 12;
+        proxy.max_cache_bytes = ChatProxy::entry_bytes("b", &entry(200));
         proxy.remember("a".into(), entry(200));
         proxy.remember("b".into(), entry(200));
         assert!(!proxy.cache.lock().unwrap().contains_key("a"));

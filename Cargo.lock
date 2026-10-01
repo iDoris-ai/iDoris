@@ -1157,6 +1157,7 @@ dependencies = [
  "idoris-upstream",
  "indexmap 2.14.2",
  "reqwest",
+ "ring",
  "serde",
  "serde_json",
  "serde_yaml",
