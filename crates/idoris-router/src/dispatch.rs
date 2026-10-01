@@ -59,7 +59,7 @@ fn candidate(component: &ComponentCard, prompt: &str) -> Card {
     }
 }
 
-/// A local backend failure, or a budget-ledger failure gating a *paid*
+/// A local backend failure, or a budget-ledger failure gating a selected
 /// candidate — both only occur after a candidate was already chosen.
 #[derive(Debug)]
 pub enum DispatchFailure {
@@ -183,13 +183,38 @@ pub fn is_resident_http_service(card: &ComponentCard) -> bool {
 /// fires, since by the time it's attached the request body — and with it,
 /// that stream's own `close` — has already completed; this guard doesn't
 /// depend on any such listener at all).
-struct ReservationGuard<'a> {
+pub(crate) struct ReservationGuard<'a> {
     ledger: Option<&'a BudgetLedger>,
     tenant_id: Option<&'a str>,
     id: Option<ReservationId>,
 }
 
-impl ReservationGuard<'_> {
+impl<'a> ReservationGuard<'a> {
+    pub(crate) fn reserve(
+        ledger: Option<&'a BudgetLedger>,
+        tenant_id: Option<&'a str>,
+        provider_id: &str,
+        estimated_cost_minor: i64,
+    ) -> Result<Self, BudgetError> {
+        let id = match ledger {
+            Some(ledger) => Some(budget::reserve(
+                ledger,
+                tenant_id,
+                provider_id,
+                estimated_cost_minor,
+            )?),
+            None if budget::is_paid(Some(estimated_cost_minor)) => {
+                return Err(budget::ledger_unavailable_error(tenant_id, provider_id));
+            }
+            None => None,
+        };
+        Ok(Self {
+            ledger,
+            tenant_id,
+            id,
+        })
+    }
+
     /// Takes the id for settling — after this, `Drop` is a no-op.
     fn take(&mut self) -> Option<ReservationId> {
         self.id.take()
@@ -222,10 +247,10 @@ impl Drop for CancelOnDrop {
 /// Runs the local decision + execution path for one request: builds
 /// decision-time [`Card`]s from `cards` (R2-D simplification, see
 /// `candidate`), calls [`idoris_policy::decide`], reserves budget for a
-/// *paid* candidate (`budget_ledger: None` fails closed via
-/// [`DispatchFailure::Budget`] exactly as an unconfigured ledger would —
-/// free candidates are unaffected), loads the chosen model via the
-/// Supervisor if not already loaded, calls `chat`, then settles (success)
+/// selected candidate whenever a ledger is wired, including zero cost
+/// (`SpendGate` is enforced by the ledger). With no ledger, paid candidates
+/// fail closed and free candidates remain usable. Loads the chosen model
+/// via the Supervisor if not already loaded, calls `chat`, then settles (success)
 /// or releases (failure) the reservation. `prompt` is the caller's own
 /// concatenated message text, passed in rather than recomputed here so
 /// there's one place deciding how "the prompt" is derived from `messages`.
@@ -289,38 +314,22 @@ pub async fn dispatch_local(
     };
 
     let is_paid = budget::is_paid(Some(estimated_cost_minor));
-    let mut reservation_guard = ReservationGuard {
-        ledger: budget_ledger,
+    let mut reservation_guard = match ReservationGuard::reserve(
+        budget_ledger,
         tenant_id,
-        id: None,
-    };
-    if is_paid {
-        match budget_ledger {
-            None => {
-                return Ok(ChatOutcome {
-                    decision,
-                    served_locality,
-                    result: Err(DispatchFailure::Budget(budget::ledger_unavailable_error(
-                        tenant_id, &model_id,
-                    ))),
-                    actual_cost_minor: None,
-                });
-            }
-            Some(ledger) => {
-                match budget::reserve(ledger, tenant_id, &model_id, estimated_cost_minor) {
-                    Ok(id) => reservation_guard.id = Some(id),
-                    Err(err) => {
-                        return Ok(ChatOutcome {
-                            decision,
-                            served_locality,
-                            result: Err(DispatchFailure::Budget(err)),
-                            actual_cost_minor: None,
-                        });
-                    }
-                }
-            }
+        &model_id,
+        estimated_cost_minor,
+    ) {
+        Ok(guard) => guard,
+        Err(err) => {
+            return Ok(ChatOutcome {
+                decision,
+                served_locality,
+                result: Err(DispatchFailure::Budget(err)),
+                actual_cost_minor: None,
+            });
         }
-    }
+    };
     // From here on, `reservation_guard`'s Drop releases the reservation on
     // any early return *and* on this future being dropped mid-`.await`
     // (client disconnect) — see its doc. Only the success path below
@@ -388,7 +397,9 @@ pub async fn dispatch_local(
                         &response.content,
                         estimated_cost_minor,
                     );
-                    budget::settle(ledger, tenant_id, &id, actual).ok()
+                    budget::settle(ledger, tenant_id, &id, actual)
+                        .ok()
+                        .filter(|_| is_paid)
                 }
                 _ => None,
             };
@@ -554,6 +565,86 @@ mod tests {
             )
             .unwrap();
         (dir, ledger)
+    }
+
+    #[tokio::test]
+    async fn free_candidate_obeys_all_gate_before_loading() {
+        let (_dir, ledger) = configured_ledger(0);
+        ledger
+            .configure_tenant("acme", 0, "UTC", idoris_tenancy::budget::SpendGate::All)
+            .unwrap();
+        let mut profile = empty_profile();
+        profile.tenant_id = Some("acme".to_string());
+        let adapter = Arc::new(MockAdapter::new(vec![ModelInfo {
+            id: "a".to_string(),
+            memory_gb: 1.0,
+        }]));
+        let supervisor = Supervisor::spawn(adapter.clone(), SupervisorConfig::default()).unwrap();
+        let outcome = dispatch_local(
+            &[local_card("a")],
+            Some(&supervisor),
+            Some(&ledger),
+            &profile,
+            "hi",
+            Vec::new(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            outcome.result,
+            Err(DispatchFailure::Budget(BudgetError::Exceeded { .. }))
+        ));
+        assert_eq!(adapter.load_call_count("a"), 0);
+        assert_eq!(ledger.tenant_balance("acme").unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn free_candidate_obeys_paid_only_gate_and_preserves_no_charge_header() {
+        let (_dir, ledger) = configured_ledger(0);
+        let adapter = Arc::new(MockAdapter::new(vec![ModelInfo {
+            id: "a".to_string(),
+            memory_gb: 1.0,
+        }]));
+        let supervisor = Supervisor::spawn(adapter, SupervisorConfig::default()).unwrap();
+        let outcome = dispatch_local(
+            &[local_card("a")],
+            Some(&supervisor),
+            Some(&ledger),
+            &empty_profile(),
+            "hi",
+            Vec::new(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert!(outcome.result.is_ok());
+        assert_eq!(outcome.actual_cost_minor, None);
+        assert_eq!(
+            ledger.tenant_balance(budget::PERSONAL_TENANT_ID).unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn free_candidate_with_unconfigured_ledger_fails_closed() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ledger = BudgetLedger::open(dir.path().join("b.sqlite3")).unwrap();
+        let outcome = dispatch_local(
+            &[local_card("a")],
+            None,
+            Some(&ledger),
+            &empty_profile(),
+            "hi",
+            Vec::new(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            outcome.result,
+            Err(DispatchFailure::Budget(BudgetError::NotConfigured { .. }))
+        ));
     }
 
     // "No ledger wired" (trivial branch) is covered at the budget.rs unit
