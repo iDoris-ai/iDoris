@@ -218,19 +218,25 @@ impl BudgetLedger {
         {
             hook();
         }
-        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
-        let hold_result = conn.execute(
+        let mut conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let hold_result = (|| {
+            // Acquire SQLite's writer lock before reading the clock. A hold
+            // must not use a timestamp sampled while waiting for this lock.
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let now_ms = self.clock.now_ms();
+            let held = tx.execute(
             "UPDATE reservations SET dispatch_hold=1 WHERE id=?1 AND tenant_id=?2 AND status='active' AND actual_cost_minor IS NULL AND (expires_at_ms>?3 OR dispatch_hold=1)",
-            params![id.0, tenant, self.clock.now_ms()],
-        ).map_err(BudgetError::from).and_then(|held| {
+                params![id.0, tenant, now_ms],
+            )?;
             if held == 1 {
+                tx.commit()?;
                 Ok(())
             } else {
                 Err(BudgetError::Storage(
                     "reservation could not be held for dispatch".into(),
                 ))
             }
-        });
+        })();
         drop(conn);
         if let Err(error) = hold_result {
             drop(live);
@@ -1148,6 +1154,23 @@ mod tests {
         Arc,
         atomic::{AtomicI64, Ordering},
     };
+
+    thread_local! {
+        static BUSY_WAIT: std::cell::RefCell<Option<(
+            std::sync::mpsc::SyncSender<()>,
+            std::sync::mpsc::Receiver<()>,
+        )>> = const { std::cell::RefCell::new(None) };
+    }
+
+    fn test_busy_handler(_: i32) -> bool {
+        BUSY_WAIT.with(|wait| {
+            if let Some((waiting, resume)) = wait.borrow_mut().take() {
+                return waiting.send(()).is_ok()
+                    && resume.recv_timeout(Duration::from_secs(5)).is_ok();
+            }
+            true
+        })
+    }
 
     struct TestClock(AtomicI64);
 
@@ -2085,4 +2108,60 @@ mod tests {
             let _ = std::fs::remove_file(file);
         }
     }
+
+    #[test]
+    fn dispatch_hold_checks_expiry_after_waiting_for_primary_writer() {
+        use std::{sync::mpsc, thread};
+
+        let db = TestDb::new();
+        let path = db.path();
+        let clock = Arc::new(TestClock(AtomicI64::new(0)));
+        let a = Arc::new(
+            BudgetLedger::open_with_busy_timeout(&path, clock.clone(), 10, Duration::from_secs(5))
+                .unwrap(),
+        );
+        let b =
+            BudgetLedger::open_with_busy_timeout(&path, clock.clone(), 10, Duration::from_secs(5))
+                .unwrap();
+        a.configure_tenant("t", 100, "UTC", SpendGate::All).unwrap();
+        let id = a
+            .reserve(&BudgetScope::new("t", "k1", "p", "m"), Price::Known(100))
+            .unwrap();
+
+        let blocker = Connection::open(&path).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let (waiting_tx, waiting_rx) = mpsc::sync_channel(1);
+        let (continue_tx, continue_rx) = mpsc::sync_channel(1);
+        let worker_ledger = a.clone();
+        let worker_id = id.clone();
+        let worker = thread::spawn(move || {
+            BUSY_WAIT.with(|wait| {
+                *wait.borrow_mut() = Some((waiting_tx, continue_rx));
+            });
+            worker_ledger
+                .conn
+                .lock()
+                .unwrap()
+                .busy_handler(Some(test_busy_handler))
+                .unwrap();
+            worker_ledger.begin_settlement("t", &worker_id)
+        });
+        waiting_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        // The handler confirms A is blocked acquiring the writer lock. Let B
+        // consume the newly expired reservation's freed quota on another scope.
+        clock.0.store(11, Ordering::SeqCst);
+        blocker.execute_batch("ROLLBACK").unwrap();
+        assert!(
+            b.reserve(&BudgetScope::new("t", "k2", "p", "m"), Price::Known(100))
+                .is_ok()
+        );
+        continue_tx.send(()).unwrap();
+
+        assert!(matches!(
+            worker.join().unwrap(),
+            Err(BudgetError::Storage(_))
+        ));
+        assert_eq!(b.tenant_balance("t").unwrap(), 0);
+    }
+
 }
