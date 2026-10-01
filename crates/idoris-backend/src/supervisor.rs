@@ -27,8 +27,8 @@ use tokio_util::sync::CancellationToken;
 use crate::adapter::RuntimeAdapter;
 use crate::error::BackendError;
 use crate::eviction::{
-    EvictionPlan, ModelEntry, ModelReq, ModelState, PlanEvictionError, Snapshot, occupies_budget,
-    plan_eviction,
+    CAPACITY_EPSILON_GB, EvictionPlan, ModelEntry, ModelReq, ModelState, PlanEvictionError,
+    Snapshot, occupies_budget, plan_eviction,
 };
 use crate::types::{BackendStatus, ChatRequest, ChatResponse, ModelInfo, Pressure};
 
@@ -140,16 +140,29 @@ enum LoadFailureOutcome {
     /// Land on this state, keeping whatever policy/memory_gb `handle_load`
     /// already wrote into the slot.
     Settle(ModelState),
-    /// This was a reload of a previously-`Ready` model — restore that old
-    /// state instead of guessing `Stopped`/`Error` (Medium, follow-up Opus
-    /// review; prdaemon-observed: 6 GiB budget, engine actually still
-    /// holding 8 GiB). A failed reload call most likely left the existing
-    /// instance untouched; blanket-assuming `Stopped` would tell the
-    /// ledger that instance's memory is free when it almost certainly
-    /// still isn't — and a later `unload` would then short-circuit on the
-    /// wrongly-`Stopped` entry, so that memory could never be reclaimed
-    /// through the public API again.
-    RestorePreviousReady { policy: LoadPolicy, memory_gb: f64 },
+    /// A definite rejection leaves the previous instance's state, policy,
+    /// and footprint untouched.
+    RestorePrevious(PreviousModel),
+    /// An uncertain release keeps Error and the larger footprint.
+    RetainPreviousOnError(PreviousModel),
+}
+
+#[derive(Clone, Copy)]
+struct PreviousModel {
+    state: ModelState,
+    policy: LoadPolicy,
+    memory_gb: f64,
+}
+
+impl LoadFailureOutcome {
+    /// Unconfirmed release retains the larger of the old and retry estimates.
+    /// The state stays Error, never Ready.
+    fn after_release(state: ModelState, previous: Option<PreviousModel>) -> Self {
+        match previous {
+            Some(previous) if occupies_budget(state) => Self::RetainPreviousOnError(previous),
+            _ => Self::Settle(state),
+        }
+    }
 }
 
 enum ActorMsg {
@@ -164,22 +177,6 @@ enum ActorMsg {
     ChatDone {
         model: String,
     },
-    ReconcileDone {
-        generation: u64,
-        result: Result<f64, BackendError>,
-    },
-}
-
-// Mutually exclusive with `active_op`. An unload cancels this read before
-// changing the ledger; generations keep its late completion from admitting
-// a load against a stale sample.
-struct PendingReconcile {
-    generation: u64,
-    id: String,
-    memory_gb: f64,
-    policy: LoadPolicy,
-    waiters: Vec<LoadReply>,
-    cancel: CancellationToken,
 }
 
 enum ActiveKind {
@@ -208,6 +205,14 @@ enum ActiveKind {
 struct ActiveOp {
     id: String,
     kind: ActiveKind,
+}
+
+#[derive(Clone, Copy)]
+struct ReleaseLimits {
+    /// Ledger total excluding the requested target and selected victims.
+    target_absent_gb: f64,
+    /// Same remainder plus the previous target, which may survive eviction.
+    after_eviction_gb: f64,
 }
 
 /// A cheaply-`Clone`-able front door to a running [`Supervisor`]. Every
@@ -441,28 +446,29 @@ where
     }
 }
 
-/// Polls `adapter.status().used_gb` until it's confirmed to have dropped
-/// below `before_gb`, or gives up after
-/// `SupervisorConfig::release_confirm_max_attempts` and falls back to
-/// trusting the caller's own estimate that memory was actually freed (H2,
-/// Opus Tier-2 review) — never blocks a load forever on a confirmation
-/// that may never come. No logging facility exists in this crate yet, so
-/// the "and warn" half of H2 is, for now, only this doc comment; wiring it
-/// into real telemetry is left for whenever this crate adopts one.
+/// K11/H3: require every target to be absent and enough capacity to remain.
+/// Missing/invalid evidence or exhausted polling fails closed.
 async fn confirm_memory_released(
     adapter: &Arc<dyn RuntimeAdapter>,
-    before_gb: f64,
+    targets: &[String],
+    max_used_gb: f64,
     config: &SupervisorConfig,
-) {
+) -> Result<(), BackendError> {
     for _ in 0..config.release_confirm_max_attempts {
         if let Ok(status) =
             with_adapter_timeout(adapter.status(), config.adapter_call_timeout, "status").await
-            && status.used_gb < before_gb
+            && status.used_gb.is_finite()
+            && status.used_gb >= 0.0
+            && status.used_gb <= max_used_gb + CAPACITY_EPSILON_GB
+            && targets.iter().all(|id| !status.loaded.contains(id))
         {
-            return;
+            return Ok(());
         }
         tokio::time::sleep(config.release_confirm_interval).await;
     }
+    Err(BackendError::internal(
+        "memory release could not be confirmed",
+    ))
 }
 
 /// The pure-IO side of a load: attempts every victim in `evict` (even
@@ -492,36 +498,26 @@ async fn confirm_memory_released(
 /// never actually resident, and a *different* future load could then fail
 /// with a misleading `eviction_impossible` (no viable plan) when the real
 /// problem is a stuck, never-cleaned-up ledger entry. Those two cases
-/// settle on `Stopped` instead. Only a `probe_ready` failure/timeout is
-/// genuinely ambiguous (the `load` call itself DID succeed) — there, a
-/// best-effort `unload` is attempted first; `Stopped` if that confirms
-/// release, `Error` (occupying budget, matching `occupies_budget`'s
-/// documented conservatism) only if even that fails.
+/// settle a fresh load on `Stopped`, or restore a retry's previous slot.
+/// A load timeout, `LoadUnconfirmed`, or `probe_ready` failure/timeout
+/// may leave memory allocated — attempt a best-effort `unload` first.
+/// Successful release settles on `Stopped`; failure keeps `Error` and
+/// the larger of the previous and current estimates.
 async fn run_load_flow(
     adapter: Arc<dyn RuntimeAdapter>,
     config: SupervisorConfig,
     id: String,
     policy: LoadPolicy,
     evict: Vec<String>,
-    was_ready: Option<(LoadPolicy, f64)>,
+    mut previous: Option<PreviousModel>,
+    release_limits: ReleaseLimits,
 ) -> OpOutcome {
     // Every chosen victim gets an actual unload attempt, even after an
     // earlier one fails: `OpDone` only resolves ids present in
     // `victim_results`, so stopping early would leave later victims stuck
     // in `Stopping` forever (occupying budget with no in-flight op to ever
     // resolve them) instead of landing on `Stopped`/`Error` like the rest.
-    // H2 (Opus Tier-2 review): captured *before* any victim is unloaded,
-    // so the confirmation below has a real baseline to compare against —
-    // "did used_gb actually drop", not just "adapter.unload() returned
-    // Ok" (which is only ever an estimate of what really happened).
-    let used_gb_before_eviction = if evict.is_empty() {
-        None
-    } else {
-        with_adapter_timeout(adapter.status(), config.adapter_call_timeout, &id)
-            .await
-            .ok()
-            .map(|s| s.used_gb)
-    };
+    let targets = evict.clone();
     let mut victim_results: Vec<VictimResult> = Vec::with_capacity(evict.len());
     let mut eviction_failed = false;
     for victim in evict {
@@ -534,22 +530,38 @@ async fn run_load_flow(
         eviction_failed |= result.is_err();
         victim_results.push((victim, result));
     }
+    if !targets.is_empty()
+        && confirm_memory_released(
+            &adapter,
+            &targets,
+            release_limits.after_eviction_gb,
+            &config,
+        )
+        .await
+        .is_err()
+    {
+        // Keep all selected victims charged until the whole release is confirmed.
+        for (_, result) in &mut victim_results {
+            *result = Err(BackendError::eviction_failed(&id));
+        }
+        eviction_failed = true;
+    }
     if eviction_failed {
         let err = BackendError::eviction_failed(&id);
-        let failure_outcome =
-            resolve_load_failure(&adapter, &id, &err, was_ready, config.adapter_call_timeout).await;
+        let failure_outcome = resolve_load_failure(
+            &adapter,
+            &id,
+            &err,
+            previous,
+            release_limits.target_absent_gb,
+            &config,
+        )
+        .await;
         return OpOutcome::Load {
             result: Err(err),
             victim_results,
             failure_outcome,
         };
-    }
-    // Confirm before proceeding to `load`, not after: the whole point is
-    // that the new model's admission was predicated on this freed
-    // capacity actually existing, not merely on `unload()` having returned
-    // `Ok`.
-    if let Some(before) = used_gb_before_eviction {
-        confirm_memory_released(&adapter, before, &config).await;
     }
 
     // OOM circuit breaker: exactly one self-healing retry, never more.
@@ -562,18 +574,27 @@ async fn run_load_flow(
     if let Err(err) = &attempt
         && err.is_oom()
     {
-        // H2: confirm whatever the OOM'd attempt may have partially
-        // allocated is actually released, then back off, before retrying
-        // — retrying immediately into the same memory pressure is likely
-        // to just OOM again.
-        let used_gb_before_retry =
-            with_adapter_timeout(adapter.status(), config.adapter_call_timeout, &id)
-                .await
-                .ok()
-                .map(|s| s.used_gb);
-        if let Some(before) = used_gb_before_retry {
-            confirm_memory_released(&adapter, before, &config).await;
+        // Never retry an OOM while allocation/release remains unconfirmed.
+        if confirm_memory_released(
+            &adapter,
+            std::slice::from_ref(&id),
+            release_limits.target_absent_gb,
+            &config,
+        )
+        .await
+        .is_err()
+        {
+            let state =
+                best_effort_release(&adapter, &id, release_limits.target_absent_gb, &config).await;
+            return OpOutcome::Load {
+                result: attempt,
+                victim_results,
+                failure_outcome: LoadFailureOutcome::after_release(state, previous),
+            };
         }
+        // The old instance is now confirmed absent, so subsequent retry
+        // failures must not restore its former Ready ledger entry.
+        previous = None;
         tokio::time::sleep(config.oom_retry_backoff).await;
         attempt = with_adapter_timeout(
             adapter.load(&id, Some(&policy)),
@@ -583,8 +604,15 @@ async fn run_load_flow(
         .await;
     }
     if let Err(err) = attempt {
-        let failure_outcome =
-            resolve_load_failure(&adapter, &id, &err, was_ready, config.adapter_call_timeout).await;
+        let failure_outcome = resolve_load_failure(
+            &adapter,
+            &id,
+            &err,
+            previous,
+            release_limits.target_absent_gb,
+            &config,
+        )
+        .await;
         return OpOutcome::Load {
             result: Err(err),
             victim_results,
@@ -608,20 +636,22 @@ async fn run_load_flow(
                 // (unlike the two branches above) a reload's *old* instance
                 // is not assumed to still be untouched — confirm via
                 // best-effort release the same way a fresh load would.
-                let state = best_effort_release(&adapter, &id, config.adapter_call_timeout).await;
+                let state =
+                    best_effort_release(&adapter, &id, release_limits.target_absent_gb, &config)
+                        .await;
                 return OpOutcome::Load {
                     result: Err(err),
                     victim_results,
-                    failure_outcome: LoadFailureOutcome::Settle(state),
+                    failure_outcome: LoadFailureOutcome::after_release(state, previous),
                 };
             }
         }
     }
-    let state = best_effort_release(&adapter, &id, config.adapter_call_timeout).await;
+    let state = best_effort_release(&adapter, &id, release_limits.target_absent_gb, &config).await;
     OpOutcome::Load {
         result: Err(BackendError::probe_timed_out(id.clone())),
         victim_results,
-        failure_outcome: LoadFailureOutcome::Settle(state),
+        failure_outcome: LoadFailureOutcome::after_release(state, previous),
     }
 }
 
@@ -633,41 +663,42 @@ async fn run_load_flow(
 async fn best_effort_release(
     adapter: &Arc<dyn RuntimeAdapter>,
     id: &str,
-    timeout: std::time::Duration,
+    max_used_gb: f64,
+    config: &SupervisorConfig,
 ) -> ModelState {
-    match with_adapter_timeout(adapter.unload(id), timeout, id).await {
-        Ok(()) => ModelState::Stopped,
-        Err(_) => ModelState::Error,
+    if with_adapter_timeout(adapter.unload(id), config.adapter_call_timeout, id)
+        .await
+        .is_ok()
+        && confirm_memory_released(adapter, &[id.to_string()], max_used_gb, config)
+            .await
+            .is_ok()
+    {
+        ModelState::Stopped
+    } else {
+        ModelState::Error
     }
 }
 
-/// Decides `id`'s [`LoadFailureOutcome`] after `err` (Medium, follow-up
-/// Opus review). If this was a reload of a previously-`Ready` model
-/// (`was_ready.is_some()`), always restores that old state regardless of
-/// the specific error — see `LoadFailureOutcome::RestorePreviousReady`'s
-/// doc comment; a failed reload call is not the same as a failed *fresh*
-/// load, since something was already genuinely resident beforehand.
-/// Otherwise: an explicit adapter rejection means no real allocation
-/// happened (`Stopped`, H1's original reasoning, still valid for a fresh
-/// load); a timeout — or an adapter reporting
-/// [`BackendError::LoadUnconfirmed`] (the engine accepted the load, a later
-/// step failed) — is genuinely uncertain, not a rejection, so it is
-/// confirmed via [`best_effort_release`] instead of assumed `Stopped`.
+/// A rejected retry restores any previous budget-occupying state, including
+/// Error (K10/H2). Only a fresh load may treat an explicit rejection as free.
+/// A timeout or [`BackendError::LoadUnconfirmed`] instead attempts
+/// [`best_effort_release`] because allocation may already have happened.
 async fn resolve_load_failure(
     adapter: &Arc<dyn RuntimeAdapter>,
     id: &str,
     err: &BackendError,
-    was_ready: Option<(LoadPolicy, f64)>,
-    timeout: std::time::Duration,
+    previous: Option<PreviousModel>,
+    release_limit_gb: f64,
+    config: &SupervisorConfig,
 ) -> LoadFailureOutcome {
-    if let Some((policy, memory_gb)) = was_ready {
-        return LoadFailureOutcome::RestorePreviousReady { policy, memory_gb };
-    }
     if matches!(
         err,
         BackendError::AdapterTimedOut { .. } | BackendError::LoadUnconfirmed { .. }
     ) {
-        LoadFailureOutcome::Settle(best_effort_release(adapter, id, timeout).await)
+        let state = best_effort_release(adapter, id, release_limit_gb, config).await;
+        LoadFailureOutcome::after_release(state, previous)
+    } else if let Some(previous) = previous {
+        LoadFailureOutcome::RestorePrevious(previous)
     } else {
         LoadFailureOutcome::Settle(ModelState::Stopped)
     }
@@ -678,7 +709,9 @@ struct Env<'a> {
     adapter: &'a Arc<dyn RuntimeAdapter>,
     config: &'a SupervisorConfig,
     self_tx: &'a mpsc::WeakSender<ActorMsg>,
+    // Unknown startup residency is fixed; managed estimates are charged separately.
     reserved_gb: f64,
+    startup_error: Option<BackendError>,
 }
 
 /// `models` as [`crate::eviction::plan_eviction`] sees it — every entry
@@ -704,6 +737,14 @@ fn build_snapshot(models: &HashMap<String, ModelSlot>, budget_gb: f64, exclude: 
         budget_gb,
         models: entries,
     }
+}
+
+fn ledger_used_except(models: &HashMap<String, ModelSlot>, exclude: &str) -> f64 {
+    models
+        .iter()
+        .filter(|(id, slot)| id.as_str() != exclude && occupies_budget(slot.state))
+        .map(|(_, slot)| slot.memory_gb)
+        .sum()
 }
 
 /// `InsufficientCapacity` is a real, expected admission outcome
@@ -732,11 +773,26 @@ fn start_load(
     id: String,
     policy: LoadPolicy,
     evict: Vec<String>,
-    was_ready: Option<(LoadPolicy, f64)>,
+    previous: Option<PreviousModel>,
     models: &mut HashMap<String, ModelSlot>,
     env: &Env<'_>,
 ) {
     set_state_or_panic(models, &id, ModelState::Loading);
+    let previous_memory_gb = previous.map_or(0.0, |model| model.memory_gb);
+    let evicted_ids: std::collections::HashSet<&str> = evict.iter().map(String::as_str).collect();
+    let release_limit_gb: f64 = models
+        .iter()
+        .filter(|(model_id, slot)| {
+            model_id.as_str() != id
+                && !evicted_ids.contains(model_id.as_str())
+                && occupies_budget(slot.state)
+        })
+        .map(|(_, slot)| slot.memory_gb)
+        .sum();
+    let release_limits = ReleaseLimits {
+        target_absent_gb: release_limit_gb + env.reserved_gb,
+        after_eviction_gb: release_limit_gb + previous_memory_gb + env.reserved_gb,
+    };
     let adapter = env.adapter.clone();
     let config = env.config.clone();
     let self_tx = env.self_tx.clone();
@@ -759,7 +815,8 @@ fn start_load(
             id_for_task.clone(),
             policy,
             evict,
-            was_ready,
+            previous,
+            release_limits,
         ));
         let outcome = match inner.await {
             Ok(outcome) => outcome,
@@ -785,13 +842,9 @@ fn start_load(
                         (victim, Err(err))
                     })
                     .collect(),
-                // A panic mid-flow leaves real state genuinely unknown —
-                // conservative like a failed best-effort release, not the
-                // "confirmed nothing happened" case. Deliberately *not*
-                // `was_ready`-aware even for a reload: unlike a clean
-                // rejection or timeout, a panic gives no assurance the old
-                // instance was left untouched either.
-                failure_outcome: LoadFailureOutcome::Settle(ModelState::Error),
+                // A panic leaves state unknown; retain the larger footprint
+                // while marking Error rather than restoring a Ready instance.
+                failure_outcome: LoadFailureOutcome::after_release(ModelState::Error, previous),
             },
         };
         // If `upgrade` fails, every `SupervisorHandle` is already gone and
@@ -861,6 +914,14 @@ fn handle_load(
         let _ = reply.send(Ok(()));
         return;
     }
+    if models.get(&id).is_some_and(|slot| slot.inflight != 0) {
+        let _ = reply.send(Err(BackendError::busy(
+            "model has chats in flight",
+            Some(id),
+            None,
+        )));
+        return;
+    }
     if let Some(active) = active_op.as_ref() {
         let _ = reply.send(Err(BackendError::busy(
             "a different id currently holds the load/evict/unload mutex",
@@ -894,25 +955,16 @@ fn handle_load(
     }
 
     let last_used_seq = models.get(&id).map_or(0, |s| s.last_used_seq);
-    // Carried forward, not reset to 0: a policy-changing reload of a
-    // currently-Ready model with chats still in flight against its
-    // previous instance must not let `ChatDone` underflow the fresh
-    // slot's counter once those in-flight calls finish (see
-    // `ActorMsg::ChatDone`'s `saturating_sub`, the other half of this
-    // safety net). Blocking such a reload until drained is a further
-    // improvement left for later — not required to avoid the underflow.
-    let inflight = models.get(&id).map_or(0, |s| s.inflight);
-    // Captured *before* the `models.insert` below overwrites the slot: if
-    // this is a reload of a model that's already `Ready`, its old
-    // policy/memory_gb must survive a failed reload attempt (Medium,
-    // follow-up Opus review) — see `LoadFailureOutcome::RestorePreviousReady`.
-    // `None` for a fresh id or one that wasn't `Ready` (Error/Stopped/
-    // Stopping): those cases keep H1's original "no real allocation on
-    // failure" reasoning.
-    let was_ready = models
+    // Capture every budget-occupying state before overwriting the slot:
+    // an Error retry is not a fresh load (K10/H2).
+    let previous = models
         .get(&id)
-        .filter(|slot| slot.state == ModelState::Ready)
-        .map(|slot| (slot.policy, slot.memory_gb));
+        .filter(|slot| occupies_budget(slot.state))
+        .map(|slot| PreviousModel {
+            state: slot.state,
+            policy: slot.policy,
+            memory_gb: slot.memory_gb,
+        });
     models.insert(
         id.clone(),
         ModelSlot {
@@ -920,7 +972,7 @@ fn handle_load(
             state: ModelState::Launching,
             last_used_seq,
             policy,
-            inflight,
+            inflight: 0,
         },
     );
     *active_op = Some(ActiveOp {
@@ -931,23 +983,25 @@ fn handle_load(
             waiters: vec![reply],
         },
     });
-    start_load(id, policy, evict, was_ready, models, env);
+    start_load(id, policy, evict, previous, models, env);
 }
 
-/// The pure-IO side of a standalone `unload`. Unlike an eviction's own
-/// `unload`s (see [`confirm_memory_released`] in `run_load_flow`), nothing
-/// here is waiting on the freed capacity being real — a bare `unload`
-/// command has no follow-on `load` whose admission depended on it — so
-/// there is nothing to poll-confirm before proceeding.
-fn start_unload(id: String, env: &Env<'_>) {
+/// Standalone unloads also confirm release before freeing ledger capacity.
+fn start_unload(id: String, max_used_gb: f64, env: &Env<'_>) {
     let adapter = env.adapter.clone();
     let self_tx = env.self_tx.clone();
-    let timeout = env.config.adapter_call_timeout;
+    let config = env.config.clone();
     tokio::spawn(async move {
         // Same panic-isolation shape as `start_load` — see its doc comment.
         let id_for_inner = id.clone();
         let inner = tokio::spawn(async move {
-            with_adapter_timeout(adapter.unload(&id_for_inner), timeout, &id_for_inner).await
+            with_adapter_timeout(
+                adapter.unload(&id_for_inner),
+                config.adapter_call_timeout,
+                &id_for_inner,
+            )
+            .await?;
+            confirm_memory_released(&adapter, &[id_for_inner], max_used_gb, &config).await
         });
         let result = match inner.await {
             Ok(result) => result,
@@ -1028,65 +1082,9 @@ fn handle_unload(
         },
     });
     if inflight == 0 {
-        start_unload(id, env);
+        let max_used_gb = ledger_used_except(models, &id) + env.reserved_gb;
+        start_unload(id, max_used_gb, env);
     }
-}
-
-/// Engine residency outside this actor's ledger has no trustworthy policy
-/// or per-model estimate. Reserve the unexplained total without evicting it.
-/// When no managed ledger entries occupy the budget, rebuild the reservation
-/// from a valid sample of full engine residency, including residual residency.
-/// While managed models remain, keep the reservation monotonic. If unknown
-/// residents are present, retain the full observed total because a managed
-/// estimate does not prove an eviction actually freed memory. This may
-/// conservatively double-count managed memory while loaded, but avoids
-/// admitting beyond the budget.
-async fn reconcile_reserved_gb(
-    adapter: Arc<dyn RuntimeAdapter>,
-    timeout: std::time::Duration,
-    managed: Vec<(String, f64)>,
-    reserved_gb: f64,
-    cancel: CancellationToken,
-) -> Result<f64, BackendError> {
-    let mut status_task = tokio::spawn(async move {
-        with_adapter_timeout(adapter.status(), timeout, "startup/reconcile").await
-    });
-    let status = tokio::select! {
-        result = &mut status_task => result
-            .map_err(|err| BackendError::adapter_panicked("startup/reconcile", err.to_string()))??,
-        _ = cancel.cancelled() => {
-            status_task.abort();
-            let _ = status_task.await;
-            return Err(BackendError::busy("reconciliation cancelled by unload", None, None));
-        }
-    };
-    if !status.used_gb.is_finite()
-        || status.used_gb < 0.0
-        || (status.used_gb == 0.0 && !status.loaded.is_empty())
-    {
-        return Err(BackendError::internal(
-            "engine residency has no valid memory measurement",
-        ));
-    }
-    if managed.is_empty() {
-        return Ok(status.used_gb);
-    }
-    let has_unknown_residents = status.loaded.iter().any(|loaded_id| {
-        !managed
-            .iter()
-            .any(|(managed_id, _)| managed_id == loaded_id)
-    });
-    if has_unknown_residents {
-        return Ok(reserved_gb.max(status.used_gb));
-    }
-    // With no unknown residents, subtract estimates for loaded managed
-    // models as before. These estimates do not establish actual release.
-    let managed_gb: f64 = managed
-        .iter()
-        .filter(|(id, _)| status.loaded.contains(id))
-        .map(|(_, gb)| gb)
-        .sum();
-    Ok(reserved_gb.max((status.used_gb - managed_gb).max(0.0)))
 }
 
 async fn run_actor(
@@ -1098,8 +1096,6 @@ async fn run_actor(
 ) {
     let mut models: HashMap<String, ModelSlot> = HashMap::new();
     let mut active_op: Option<ActiveOp> = None;
-    let mut pending_reconcile: Option<PendingReconcile> = None;
-    let mut next_reconcile_generation: u64 = 0;
     let mut next_seq: u64 = 0;
     // Once `Some`, the actor refuses all further ledger-touching work
     // rather than risk operating on state whose integrity is no longer
@@ -1110,20 +1106,35 @@ async fn run_actor(
     // the *entire* actor task (and, with it, every other in-flight and
     // future caller) over a single corrupted entry.
     let mut poisoned: Option<String> = None;
-    let initial = reconcile_reserved_gb(
-        adapter.clone(),
-        config.adapter_call_timeout,
-        Vec::new(),
-        0.0,
-        CancellationToken::new(),
-    )
-    .await;
-    let mut reconciliation_error = initial.as_ref().err().cloned();
-    let mut env = Env {
+    // Sample engine residency once, before accepting commands. Spawning the
+    // adapter call isolates panic; the timeout bounds startup even when the
+    // adapter never returns.
+    let startup_adapter = adapter.clone();
+    let timeout = config.adapter_call_timeout;
+    let startup = tokio::spawn(async move {
+        with_adapter_timeout(startup_adapter.status(), timeout, "startup/status").await
+    })
+    .await
+    .map_err(|err| BackendError::adapter_panicked("startup/status", err.to_string()))
+    .and_then(|result| result);
+    let startup = startup.and_then(|status| {
+        if !status.used_gb.is_finite()
+            || status.used_gb < 0.0
+            || (status.used_gb == 0.0 && !status.loaded.is_empty())
+        {
+            Err(BackendError::internal(
+                "engine residency has no valid memory measurement",
+            ))
+        } else {
+            Ok(status.used_gb)
+        }
+    });
+    let env = Env {
         adapter: &adapter,
         config: &config,
         self_tx: &self_tx,
-        reserved_gb: initial.unwrap_or_default(),
+        reserved_gb: startup.as_ref().copied().unwrap_or_default(),
+        startup_error: startup.err(),
     };
 
     while let Some(msg) = rx.recv().await {
@@ -1167,16 +1178,16 @@ async fn run_actor(
             }
 
             ActorMsg::Cmd(Command::Status { reply }) => {
-                if let Some(err) = &reconciliation_error {
+                if let Some(err) = &env.startup_error {
                     let _ = reply.send(Err(err.clone()));
                     continue;
                 }
-                let used_gb: f64 = env.reserved_gb
-                    + models
-                        .values()
-                        .filter(|slot| occupies_budget(slot.state))
-                        .map(|slot| slot.memory_gb)
-                        .sum::<f64>();
+                let used_gb: f64 = models
+                    .values()
+                    .filter(|slot| occupies_budget(slot.state))
+                    .map(|slot| slot.memory_gb)
+                    .sum::<f64>()
+                    + env.reserved_gb;
                 let pressure = if used_gb >= config.budget_gb {
                     Pressure::Hard
                 } else if used_gb >= config.budget_gb * 0.8 {
@@ -1258,71 +1269,8 @@ async fn run_actor(
                 policy,
                 reply,
             }) => {
-                // Local validation and Ready no-ops need no residency I/O.
-                // handle_load retains same-id active-operation precedence.
-                if !memory_gb.is_finite()
-                    || memory_gb < 0.0
-                    || models.get(&id).is_some_and(|slot| {
-                        slot.state == ModelState::Ready && slot.policy == policy
-                    })
-                {
-                    handle_load(
-                        id,
-                        memory_gb,
-                        policy,
-                        reply,
-                        &mut models,
-                        &mut active_op,
-                        &env,
-                    );
-                    continue;
-                }
-                if let Some(pending) = pending_reconcile.as_mut() {
-                    if pending.id == id
-                        && pending.policy == policy
-                        && pending.memory_gb == memory_gb
-                    {
-                        pending.waiters.push(reply);
-                    } else {
-                        let _ = reply.send(Err(BackendError::busy(
-                            "a different load is awaiting residency reconciliation",
-                            Some(pending.id.clone()),
-                            None,
-                        )));
-                    }
-                    continue;
-                }
-                if active_op.is_none() {
-                    let managed = models
-                        .iter()
-                        .filter(|(_, slot)| occupies_budget(slot.state))
-                        .map(|(id, slot)| (id.clone(), slot.memory_gb))
-                        .collect();
-                    next_reconcile_generation = next_reconcile_generation.wrapping_add(1);
-                    let generation = next_reconcile_generation;
-                    let cancel = CancellationToken::new();
-                    pending_reconcile = Some(PendingReconcile {
-                        generation,
-                        id,
-                        memory_gb,
-                        policy,
-                        waiters: vec![reply],
-                        cancel: cancel.clone(),
-                    });
-                    let adapter = adapter.clone();
-                    let timeout = config.adapter_call_timeout;
-                    let reserved_gb = env.reserved_gb;
-                    let self_tx = self_tx.clone();
-                    tokio::spawn(async move {
-                        let result =
-                            reconcile_reserved_gb(adapter, timeout, managed, reserved_gb, cancel)
-                                .await;
-                        if let Some(tx) = self_tx.upgrade() {
-                            let _ = tx
-                                .send(ActorMsg::ReconcileDone { generation, result })
-                                .await;
-                        }
-                    });
+                if let Some(err) = &env.startup_error {
+                    let _ = reply.send(Err(err.clone()));
                     continue;
                 }
                 handle_load(
@@ -1337,67 +1285,7 @@ async fn run_actor(
             }
 
             ActorMsg::Cmd(Command::Unload { id, reply }) => {
-                let will_unload = models
-                    .get(&id)
-                    .is_some_and(|slot| slot.state != ModelState::Stopped);
-                if will_unload && let Some(pending) = pending_reconcile.take() {
-                    pending.cancel.cancel();
-                    for waiter in pending.waiters {
-                        let _ = waiter.send(Err(BackendError::busy(
-                            "load cancelled by unload",
-                            Some(pending.id.clone()),
-                            None,
-                        )));
-                    }
-                }
                 handle_unload(id, reply, &mut models, &mut active_op, &env);
-            }
-
-            ActorMsg::ReconcileDone { generation, result } => {
-                let Some(pending) = pending_reconcile.take() else {
-                    continue;
-                };
-                if pending.generation != generation {
-                    pending_reconcile = Some(pending);
-                    continue;
-                }
-                if let Some(msg) = &poisoned {
-                    for waiter in pending.waiters {
-                        let _ = waiter.send(Err(BackendError::invariant_violation(msg.clone())));
-                    }
-                    continue;
-                }
-                match result {
-                    Ok(reserved) => {
-                        env.reserved_gb = reserved;
-                        reconciliation_error = None;
-                        let (relay, result_rx) = oneshot::channel();
-                        handle_load(
-                            pending.id,
-                            pending.memory_gb,
-                            pending.policy,
-                            relay,
-                            &mut models,
-                            &mut active_op,
-                            &env,
-                        );
-                        let waiters = pending.waiters;
-                        tokio::spawn(async move {
-                            let result = result_rx
-                                .await
-                                .unwrap_or_else(|_| Err(BackendError::supervisor_unavailable()));
-                            for waiter in waiters {
-                                let _ = waiter.send(result.clone());
-                            }
-                        });
-                    }
-                    Err(err) => {
-                        reconciliation_error = Some(err.clone());
-                        for waiter in pending.waiters {
-                            let _ = waiter.send(Err(err.clone()));
-                        }
-                    }
-                }
             }
 
             ActorMsg::OpDone { id, outcome } if poisoned.is_some() => {
@@ -1459,12 +1347,21 @@ async fn run_actor(
                                     violation = Some(e);
                                 }
                             }
-                            LoadFailureOutcome::RestorePreviousReady { policy, memory_gb } => {
+                            LoadFailureOutcome::RestorePrevious(mut previous)
+                            | LoadFailureOutcome::RetainPreviousOnError(mut previous) => {
                                 match models.get_mut(&id) {
                                     Some(slot) => {
-                                        slot.state = ModelState::Ready;
-                                        slot.policy = policy;
-                                        slot.memory_gb = memory_gb;
+                                        if matches!(
+                                            failure_outcome,
+                                            LoadFailureOutcome::RetainPreviousOnError(_)
+                                        ) {
+                                            previous.state = ModelState::Error;
+                                            previous.memory_gb =
+                                                slot.memory_gb.max(previous.memory_gb);
+                                        }
+                                        slot.state = previous.state;
+                                        slot.policy = previous.policy;
+                                        slot.memory_gb = previous.memory_gb;
                                     }
                                     None => {
                                         violation =
@@ -1519,16 +1416,14 @@ async fn run_actor(
                             && !*started
                         {
                             *started = true;
-                            start_unload(model, &env);
+                            let max_used_gb = ledger_used_except(&models, &model) + env.reserved_gb;
+                            start_unload(model, max_used_gb, &env);
                         }
                     }
                     None => poisoned = Some(format!("ledger has no entry for {model:?}")),
                 }
             }
         }
-    }
-    if let Some(pending) = pending_reconcile {
-        pending.cancel.cancel();
     }
 }
 
@@ -1577,266 +1472,6 @@ mod tests {
         let status = handle.status().await.expect("status should succeed");
         assert!(status.loaded.is_empty());
         assert_eq!(status.pressure, Pressure::Ok);
-    }
-
-    struct HeldStatusAdapter {
-        inner: MockAdapter,
-        hold: std::sync::atomic::AtomicBool,
-        entered: tokio::sync::Notify,
-        release: tokio::sync::Notify,
-    }
-
-    #[async_trait::async_trait]
-    impl RuntimeAdapter for HeldStatusAdapter {
-        async fn list(&self) -> Result<Vec<ModelInfo>, BackendError> {
-            self.inner.list().await
-        }
-        async fn load(&self, id: &str, policy: Option<&LoadPolicy>) -> Result<(), BackendError> {
-            self.inner.load(id, policy).await
-        }
-        async fn unload(&self, id: &str) -> Result<(), BackendError> {
-            self.inner.unload(id).await
-        }
-        async fn status(&self) -> Result<BackendStatus, BackendError> {
-            if self.hold.load(std::sync::atomic::Ordering::SeqCst) {
-                self.entered.notify_one();
-                self.release.notified().await;
-            }
-            self.inner.status().await
-        }
-        async fn probe_ready(&self, id: &str) -> Result<bool, BackendError> {
-            self.inner.probe_ready(id).await
-        }
-        async fn chat(
-            &self,
-            req: ChatRequest,
-            cancel: CancellationToken,
-        ) -> Result<ChatResponse, BackendError> {
-            self.inner.chat(req, cancel).await
-        }
-    }
-
-    #[tokio::test]
-    async fn stale_reconcile_completions_cannot_consume_a_new_pending_reconcile() {
-        for stale_result in [
-            Ok(0.0),
-            Err(BackendError::Upstream {
-                message: "stale failure".into(),
-            }),
-        ] {
-            let inner = MockAdapter::new(catalog());
-            let adapter = Arc::new(HeldStatusAdapter {
-                inner,
-                hold: std::sync::atomic::AtomicBool::new(false),
-                entered: tokio::sync::Notify::new(),
-                release: tokio::sync::Notify::new(),
-            });
-            let (tx, _join) = spawn_actor(adapter.clone(), SupervisorConfig::default());
-            let handle = SupervisorHandle { tx: tx.clone() };
-            no_hang(handle.status())
-                .await
-                .expect("startup reconciliation should finish before holding status");
-            // Complete generation 1 without starting a load, then hold the
-            // next admission at generation 2 before injecting its predecessor.
-            assert_eq!(
-                no_hang(handle.load("a", 25.0, on_demand_policy()))
-                    .await
-                    .unwrap_err()
-                    .reason_code(),
-                "eviction_impossible"
-            );
-            adapter
-                .hold
-                .store(true, std::sync::atomic::Ordering::SeqCst);
-            let (load_tx, mut load_rx) = oneshot::channel();
-            tx.send(ActorMsg::Cmd(Command::Load {
-                id: "a".into(),
-                memory_gb: 4.0,
-                policy: on_demand_policy(),
-                reply: load_tx,
-            }))
-            .await
-            .expect("actor channel should accept load");
-            no_hang(adapter.entered.notified()).await;
-
-            // The blocked status call proves this request owns a pending
-            // reconcile. Inject an older generation directly into the actor,
-            // then use a channel-ordered request as a processing barrier.
-            tx.send(ActorMsg::ReconcileDone {
-                generation: 1,
-                result: stale_result,
-            })
-            .await
-            .expect("actor channel should accept stale completion");
-            let (barrier_tx, barrier_rx) = oneshot::channel();
-            tx.send(ActorMsg::Cmd(Command::Status { reply: barrier_tx }))
-                .await
-                .expect("actor channel should accept barrier command");
-            let status = no_hang(barrier_rx)
-                .await
-                .expect("actor should answer the barrier command")
-                .expect("status should remain available while reconciling");
-            assert_eq!(
-                status.used_gb, 0.0,
-                "stale completion must not admit the load"
-            );
-            assert!(
-                matches!(load_rx.try_recv(), Err(oneshot::error::TryRecvError::Empty)),
-                "stale completion must not finish new request"
-            );
-            assert_eq!(adapter.inner.load_call_count("a"), 0);
-            adapter.release.notify_one();
-            no_hang(load_rx)
-                .await
-                .expect("load reply sender should remain connected")
-                .expect("current generation should reconcile and load successfully");
-            assert_eq!(adapter.inner.load_call_count("a"), 1);
-        }
-    }
-
-    struct ReconcileAdapter {
-        inner: MockAdapter,
-        fault: std::sync::atomic::AtomicU8,
-    }
-
-    #[async_trait::async_trait]
-    impl RuntimeAdapter for ReconcileAdapter {
-        async fn list(&self) -> Result<Vec<ModelInfo>, BackendError> {
-            // The inherited resident is deliberately absent from the catalog.
-            Ok(catalog())
-        }
-        async fn load(&self, id: &str, policy: Option<&LoadPolicy>) -> Result<(), BackendError> {
-            self.inner.load(id, policy).await
-        }
-        async fn unload(&self, id: &str) -> Result<(), BackendError> {
-            self.inner.unload(id).await
-        }
-        async fn status(&self) -> Result<BackendStatus, BackendError> {
-            use std::sync::atomic::Ordering;
-            let mut status = self.inner.status().await?;
-            match self.fault.load(Ordering::SeqCst) {
-                1 => {
-                    return Err(BackendError::Upstream {
-                        message: "status unavailable".into(),
-                    });
-                }
-                2 => return std::future::pending().await,
-                3 => panic!("status panic"),
-                4 => status.used_gb = f64::NAN,
-                5 => status.used_gb = -1.0,
-                6 => status.used_gb = f64::INFINITY,
-                7 => status.used_gb = 0.0,
-                _ => {}
-            }
-            Ok(status)
-        }
-        async fn probe_ready(&self, id: &str) -> Result<bool, BackendError> {
-            self.inner.probe_ready(id).await
-        }
-        async fn chat(
-            &self,
-            req: ChatRequest,
-            cancel: CancellationToken,
-        ) -> Result<ChatResponse, BackendError> {
-            self.inner.chat(req, cancel).await
-        }
-    }
-
-    fn reconcile_adapter(fault: u8) -> Arc<ReconcileAdapter> {
-        Arc::new(ReconcileAdapter {
-            inner: MockAdapter::new(vec![
-                ModelInfo {
-                    id: "inherited".into(),
-                    memory_gb: 20.0,
-                },
-                ModelInfo {
-                    id: "a".into(),
-                    memory_gb: 4.0,
-                },
-            ]),
-            fault: std::sync::atomic::AtomicU8::new(fault),
-        })
-    }
-
-    #[tokio::test]
-    async fn startup_reconcile_counts_unknown_residents_and_rejects_overcommit() {
-        let adapter = reconcile_adapter(0);
-        adapter.inner.load("inherited", None).await.unwrap();
-        let handle = Supervisor::spawn(adapter.clone(), SupervisorConfig::default()).unwrap();
-        assert_eq!(handle.status().await.unwrap().used_gb, 20.0);
-        assert_eq!(
-            handle
-                .load("a", 8.0, on_demand_policy())
-                .await
-                .unwrap_err()
-                .reason_code(),
-            "eviction_impossible"
-        );
-        assert_eq!(adapter.inner.load_call_count("a"), 0);
-        assert_eq!(adapter.inner.unload_call_count("inherited"), 0);
-        // Positive control: the remaining 4 GiB is usable, without forgetting
-        // inherited occupancy when a managed model is unloaded.
-        handle.load("a", 4.0, on_demand_policy()).await.unwrap();
-        assert_eq!(handle.status().await.unwrap().used_gb, 24.0);
-        handle.unload("a").await.unwrap();
-        assert_eq!(handle.status().await.unwrap().used_gb, 20.0);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn startup_reconcile_faults_block_admission() {
-        for fault in 1..=6 {
-            let adapter = reconcile_adapter(fault);
-            let handle = Supervisor::spawn(
-                adapter.clone(),
-                SupervisorConfig {
-                    adapter_call_timeout: std::time::Duration::from_millis(10),
-                    ..SupervisorConfig::default()
-                },
-            )
-            .unwrap();
-            assert!(no_hang(handle.status()).await.is_err(), "fault {fault}");
-            assert!(
-                no_hang(handle.load("a", 4.0, on_demand_policy()))
-                    .await
-                    .is_err(),
-                "fault {fault}"
-            );
-            assert_eq!(adapter.inner.load_call_count("a"), 0, "fault {fault}");
-        }
-    }
-
-    #[tokio::test]
-    async fn startup_reconcile_residents_without_measurement_block_admission() {
-        let adapter = reconcile_adapter(7);
-        adapter.inner.load("inherited", None).await.unwrap();
-        let handle = Supervisor::spawn(adapter.clone(), SupervisorConfig::default()).unwrap();
-        assert!(handle.load("a", 4.0, on_demand_policy()).await.is_err());
-        assert_eq!(adapter.inner.load_call_count("a"), 0);
-    }
-
-    #[tokio::test]
-    async fn startup_reconcile_later_failure_blocks_load_and_recovers_after_success() {
-        use std::sync::atomic::Ordering;
-        let adapter = reconcile_adapter(0);
-        let handle = Supervisor::spawn(adapter.clone(), SupervisorConfig::default()).unwrap();
-        assert_eq!(handle.status().await.unwrap().used_gb, 0.0);
-        adapter.fault.store(1, Ordering::SeqCst);
-        assert!(handle.load("a", 4.0, on_demand_policy()).await.is_err());
-        assert_eq!(adapter.inner.load_call_count("a"), 0);
-        adapter.fault.store(0, Ordering::SeqCst);
-        handle.load("a", 4.0, on_demand_policy()).await.unwrap();
-        assert_eq!(adapter.inner.load_call_count("a"), 1);
-    }
-
-    #[tokio::test]
-    async fn startup_reconcile_later_external_residency_blocks_overcommit() {
-        let adapter = reconcile_adapter(0);
-        let handle = Supervisor::spawn(adapter.clone(), SupervisorConfig::default()).unwrap();
-        assert_eq!(handle.status().await.unwrap().used_gb, 0.0);
-        adapter.inner.load("inherited", None).await.unwrap();
-        assert!(handle.load("a", 8.0, on_demand_policy()).await.is_err());
-        assert_eq!(handle.status().await.unwrap().used_gb, 20.0);
-        assert_eq!(adapter.inner.load_call_count("a"), 0);
     }
 
     /// Negative contrast: `chat` before any `load` fails `model_not_found`.
@@ -2893,6 +2528,83 @@ mod tests {
         );
     }
 
+    /// K10/H2: a rejected retry must preserve an Error model's old footprint
+    /// and keep a later unload from short-circuiting while it is still resident.
+    #[tokio::test]
+    async fn error_retry_rejection_preserves_old_occupancy_and_real_unload() {
+        for recover_via_load in [false, true] {
+            let adapter = Arc::new(MockAdapter::new(vec![
+                ModelInfo {
+                    id: "a".to_string(),
+                    memory_gb: 8.0,
+                },
+                ModelInfo {
+                    id: "b".to_string(),
+                    memory_gb: 20.0,
+                },
+            ]));
+            let handle = Supervisor::spawn(adapter.clone(), SupervisorConfig::default()).unwrap();
+            no_hang(handle.load("a", 8.0, resident_policy()))
+                .await
+                .unwrap();
+            adapter.set_unload_script("a", vec![crate::mock::UnloadOutcome::Fail]);
+            no_hang(handle.unload("a")).await.unwrap_err();
+            assert_eq!(handle.status().await.unwrap().used_gb, 8.0);
+            adapter.set_load_script("a", vec![crate::mock::LoadOutcome::Fail]);
+            no_hang(handle.load("a", 1.0, on_demand_policy()))
+                .await
+                .unwrap_err();
+            assert_eq!(adapter.status().await.unwrap().used_gb, 8.0);
+            assert_eq!(handle.status().await.unwrap().used_gb, 8.0);
+            let err = no_hang(handle.chat(
+                ChatRequest {
+                    model: "a".to_string(),
+                    messages: vec![],
+                },
+                CancellationToken::new(),
+            ))
+            .await
+            .unwrap_err();
+            assert_eq!(err.reason_code(), "model_unavailable");
+            assert_eq!(adapter.load_call_count("a"), 2);
+            let err = no_hang(handle.load("b", 20.0, on_demand_policy()))
+                .await
+                .unwrap_err();
+            assert_eq!(err.reason_code(), "eviction_impossible");
+            assert_eq!(adapter.load_call_count("b"), 0);
+            assert_eq!(adapter.unload_call_count("a"), 1);
+            if recover_via_load {
+                adapter.set_load_script("a", vec![crate::mock::LoadOutcome::Ok]);
+                no_hang(handle.load("a", 4.0, on_demand_policy()))
+                    .await
+                    .unwrap();
+                let status = handle.status().await.unwrap();
+                assert_eq!(status.used_gb, 4.0);
+                assert_eq!(status.loaded, vec!["a".to_string()]);
+            }
+            no_hang(handle.unload("a")).await.unwrap();
+            assert_eq!(adapter.unload_call_count("a"), 2);
+            assert_eq!(adapter.status().await.unwrap().used_gb, 0.0);
+            assert_eq!(handle.status().await.unwrap().used_gb, 0.0);
+        }
+    }
+
+    /// K10/H2: a panic during an Error retry also leaves release uncertain.
+    #[tokio::test]
+    async fn error_retry_panic_preserves_old_occupancy() {
+        let handle =
+            Supervisor::spawn(Arc::new(PanickingAdapter), SupervisorConfig::default()).unwrap();
+        for (memory_gb, expected) in [(8.0, 8.0), (1.0, 8.0), (16.0, 16.0)] {
+            let err = no_hang(handle.load("a", memory_gb, on_demand_policy()))
+                .await
+                .unwrap_err();
+            assert_eq!(err.reason_code(), "adapter_panicked");
+            assert_eq!(handle.status().await.unwrap().used_gb, expected);
+        }
+        no_hang(handle.unload("a")).await.unwrap();
+        assert_eq!(handle.status().await.unwrap().used_gb, 0.0);
+    }
+
     /// Medium (follow-up Opus review, prdaemon probe): a reload of an
     /// already-`Ready` model with a *different* policy that then fails
     /// must restore the old `Ready` state (policy + memory_gb), not settle
@@ -3094,6 +2806,20 @@ mod tests {
         );
     }
 
+    /// K10/H2: even after load succeeds, a failed probe and failed cleanup
+    /// cannot replace the old Error footprint with a smaller retry estimate.
+    #[tokio::test]
+    async fn error_retry_probe_failure_preserves_old_occupancy() {
+        let adapter = Arc::new(ProbeAlwaysFailsAdapter { unload_ok: false });
+        let handle = Supervisor::spawn(adapter, SupervisorConfig::default()).unwrap();
+        for (memory_gb, expected) in [(8.0, 8.0), (1.0, 8.0), (16.0, 16.0)] {
+            no_hang(handle.load("a", memory_gb, on_demand_policy()))
+                .await
+                .unwrap_err();
+            assert_eq!(handle.status().await.unwrap().used_gb, expected);
+        }
+    }
+
     /// A minimal `RuntimeAdapter` whose `load` reports
     /// `BackendError::LoadUnconfirmed` — the engine accepted the load, a
     /// later step (pin / verify) failed — as a real oMLX two-step load can.
@@ -3101,6 +2827,9 @@ mod tests {
     struct LoadUnconfirmedAdapter {
         unload_ok: bool,
         unload_calls: std::sync::atomic::AtomicU32,
+        ready_once: std::sync::atomic::AtomicBool,
+        chat_entered: tokio::sync::Notify,
+        release_chat: tokio::sync::Notify,
     }
 
     impl LoadUnconfirmedAdapter {
@@ -3108,6 +2837,9 @@ mod tests {
             Self {
                 unload_ok,
                 unload_calls: std::sync::atomic::AtomicU32::new(0),
+                ready_once: std::sync::atomic::AtomicBool::new(false),
+                chat_entered: tokio::sync::Notify::new(),
+                release_chat: tokio::sync::Notify::new(),
             }
         }
     }
@@ -3118,6 +2850,12 @@ mod tests {
             Ok(catalog())
         }
         async fn load(&self, id: &str, _policy: Option<&LoadPolicy>) -> Result<(), BackendError> {
+            if self
+                .ready_once
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Ok(());
+            }
             Err(BackendError::load_unconfirmed(
                 id,
                 "status check after POST load failed (test double)",
@@ -3150,11 +2888,56 @@ mod tests {
             req: ChatRequest,
             _cancel: CancellationToken,
         ) -> Result<ChatResponse, BackendError> {
+            self.chat_entered.notify_one();
+            self.release_chat.notified().await;
             Ok(ChatResponse {
                 model: req.model,
                 content: String::new(),
             })
         }
+    }
+
+    #[tokio::test]
+    async fn ready_reload_cannot_release_a_model_with_inflight_chat() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let adapter = Arc::new(LoadUnconfirmedAdapter::new(true));
+        adapter.ready_once.store(true, SeqCst);
+        let handle = Supervisor::spawn(adapter.clone(), SupervisorConfig::default()).unwrap();
+        no_hang(handle.load("a", 8.0, on_demand_policy()))
+            .await
+            .unwrap();
+        let h = handle.clone();
+        let chat = tokio::spawn(async move {
+            h.chat(
+                ChatRequest {
+                    model: "a".into(),
+                    messages: vec![],
+                },
+                CancellationToken::new(),
+            )
+            .await
+        });
+        no_hang(adapter.chat_entered.notified()).await;
+        no_hang(handle.load("a", 8.0, on_demand_policy()))
+            .await
+            .unwrap();
+        let err = no_hang(handle.load("a", 1.0, resident_policy()))
+            .await
+            .unwrap_err();
+        assert_eq!(adapter.unload_calls.load(SeqCst), 0);
+        assert_eq!(err.reason_code(), "supervisor_busy");
+        assert!(!chat.is_finished());
+        let status = handle.status().await.unwrap();
+        assert_eq!(status.used_gb, 8.0);
+        assert_eq!(status.loaded, vec!["a"]);
+        adapter.release_chat.notify_one();
+        no_hang(chat).await.unwrap().unwrap();
+        let err = no_hang(handle.load("a", 1.0, resident_policy()))
+            .await
+            .unwrap_err();
+        assert_eq!(err.reason_code(), "load_unconfirmed");
+        assert_eq!(adapter.unload_calls.load(SeqCst), 1);
+        assert_eq!(handle.status().await.unwrap().used_gb, 0.0);
     }
 
     /// prdaemon #48 round 2, M1: a load the engine accepted but whose
@@ -3232,7 +3015,6 @@ mod tests {
                 .status_calls
                 .lock()
                 .expect("test mutex is never poisoned");
-            // Startup is empty; delayed release starts only after unload.
             let releasing = self.releasing.load(std::sync::atomic::Ordering::SeqCst);
             *calls += u32::from(releasing);
             let used_gb = if !self.loaded.load(std::sync::atomic::Ordering::SeqCst)
@@ -3298,17 +3080,14 @@ mod tests {
         );
     }
 
-    /// Negative contrast: if `status()` never reflects the drop (the
-    /// confirmation can never succeed), the load must still proceed once
-    /// `release_confirm_max_attempts` is exhausted — falling back to the
-    /// caller's own estimate rather than blocking forever.
+    /// K11/H3: exhausted confirmation must reject admission and keep victims charged.
     #[tokio::test(start_paused = true)]
-    async fn eviction_proceeds_after_confirmation_gives_up() {
+    async fn eviction_rejects_after_confirmation_gives_up() {
         let adapter = Arc::new(LaggingReleaseAdapter {
             status_calls: std::sync::Mutex::new(0),
+            calls_until_drop: u32::MAX, // never drops
             loaded: std::sync::atomic::AtomicBool::new(false),
             releasing: std::sync::atomic::AtomicBool::new(false),
-            calls_until_drop: u32::MAX, // never drops
         });
         let handle = Supervisor::spawn(adapter.clone(), tight_budget_config())
             .expect("spawn should succeed");
@@ -3316,10 +3095,223 @@ mod tests {
             .load("a", 20.0, on_demand_policy())
             .await
             .expect("load a should succeed");
-        handle
+        let err = handle
             .load("b", 20.0, on_demand_policy())
             .await
-            .expect("load b must still proceed once confirmation gives up, not hang forever");
+            .expect_err("unconfirmed capacity must not admit b");
+        assert_eq!(err.reason_code(), "eviction_failed");
+        assert_eq!(handle.status().await.unwrap().used_gb, 20.0);
+    }
+
+    /// Successful unload replies with deliberately unreliable release evidence.
+    struct UnverifiedReleaseAdapter {
+        inner: MockAdapter,
+        reported: std::sync::Mutex<Option<BackendStatus>>,
+        startup: std::sync::atomic::AtomicBool,
+        probe_fails: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl RuntimeAdapter for UnverifiedReleaseAdapter {
+        async fn list(&self) -> Result<Vec<ModelInfo>, BackendError> {
+            self.inner.list().await
+        }
+        async fn load(&self, id: &str, policy: Option<&LoadPolicy>) -> Result<(), BackendError> {
+            self.inner.load(id, policy).await
+        }
+        async fn unload(&self, _id: &str) -> Result<(), BackendError> {
+            Ok(()) // Engine acknowledges without actually freeing anything.
+        }
+        async fn status(&self) -> Result<BackendStatus, BackendError> {
+            if self
+                .startup
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return self.inner.status().await;
+            }
+            self.reported
+                .lock()
+                .unwrap()
+                .clone()
+                .ok_or_else(|| BackendError::internal("status unavailable"))
+        }
+        async fn probe_ready(&self, id: &str) -> Result<bool, BackendError> {
+            if self.probe_fails {
+                Err(BackendError::internal("probe failed"))
+            } else {
+                self.inner.probe_ready(id).await
+            }
+        }
+        async fn chat(
+            &self,
+            req: ChatRequest,
+            cancel: CancellationToken,
+        ) -> Result<ChatResponse, BackendError> {
+            self.inner.chat(req, cancel).await
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn release_confirmation_accepts_rounding_but_rejects_invalid_evidence() {
+        let ledger_sum = (0.2_f64 + 0.3) + 0.1;
+        let engine_sum = (0.1_f64 + 0.2) + 0.3;
+        assert_eq!(ledger_sum, 0.6);
+        assert_eq!(engine_sum, 0.6000000000000001);
+
+        let config = SupervisorConfig {
+            release_confirm_interval: std::time::Duration::ZERO,
+            release_confirm_max_attempts: 1,
+            ..SupervisorConfig::default()
+        };
+        let adapter_for = |used_gb, loaded: Vec<String>| -> Arc<dyn RuntimeAdapter> {
+            Arc::new(UnverifiedReleaseAdapter {
+                startup: std::sync::atomic::AtomicBool::new(false),
+                inner: MockAdapter::new(catalog()),
+                reported: std::sync::Mutex::new(Some(BackendStatus {
+                    pressure: Pressure::Ok,
+                    used_gb,
+                    model_memory_max_gb: 1.0,
+                    loaded,
+                })),
+                probe_fails: false,
+            })
+        };
+
+        confirm_memory_released(
+            &adapter_for(engine_sum, vec![]),
+            &["a".into()],
+            ledger_sum,
+            &config,
+        )
+        .await
+        .expect("float summation order must not reject a fully freed target");
+
+        for (used_gb, loaded) in [
+            (ledger_sum + CAPACITY_EPSILON_GB * 2.0, vec![]),
+            (ledger_sum, vec!["a".into()]),
+            (f64::NAN, vec![]),
+            (f64::INFINITY, vec![]),
+            (-1.0, vec![]),
+        ] {
+            assert!(
+                confirm_memory_released(
+                    &adapter_for(used_gb, loaded),
+                    &["a".into()],
+                    ledger_sum,
+                    &config,
+                )
+                .await
+                .is_err(),
+                "invalid or insufficient release evidence must fail closed"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn eviction_rejects_partial_or_invalid_release_evidence() {
+        for evidence in [
+            Some((4.0, vec!["b"])), // Some memory freed, one of two victims remains.
+            Some((4.0, vec![])),    // All victims absent, still insufficient capacity.
+            Some((0.0, vec!["a"])), // Enough capacity, but a victim remains.
+            Some((f64::NAN, vec![])),
+            Some((-1.0, vec![])),
+            None, // Status failure cannot be treated as release confirmation.
+        ] {
+            let adapter = Arc::new(UnverifiedReleaseAdapter {
+                startup: std::sync::atomic::AtomicBool::new(true),
+                inner: MockAdapter::new(
+                    [("a", 4.0), ("b", 4.0), ("c", 8.0)]
+                        .into_iter()
+                        .map(|(id, memory_gb)| ModelInfo {
+                            id: id.into(),
+                            memory_gb,
+                        })
+                        .collect(),
+                ),
+                reported: std::sync::Mutex::new(Some(BackendStatus {
+                    pressure: Pressure::Ok,
+                    used_gb: 8.0,
+                    model_memory_max_gb: 8.0,
+                    loaded: vec!["a".into(), "b".into()],
+                })),
+                probe_fails: false,
+            });
+            let handle = Supervisor::spawn(
+                adapter.clone(),
+                SupervisorConfig {
+                    budget_gb: 8.0,
+                    ..SupervisorConfig::default()
+                },
+            )
+            .unwrap();
+            handle.load("a", 4.0, on_demand_policy()).await.unwrap();
+            handle.load("b", 4.0, on_demand_policy()).await.unwrap();
+            *adapter.reported.lock().unwrap() = evidence.map(|(used_gb, ids)| BackendStatus {
+                pressure: Pressure::Ok,
+                used_gb,
+                model_memory_max_gb: 8.0,
+                loaded: ids.into_iter().map(String::from).collect(),
+            });
+            let result = handle.load("c", 8.0, on_demand_policy()).await;
+            assert_eq!(result.unwrap_err().reason_code(), "eviction_failed");
+            assert_eq!(adapter.inner.load_call_count("c"), 0);
+            assert_eq!(handle.status().await.unwrap().used_gb, 8.0);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cleanup_and_standalone_unload_keep_unconfirmed_occupancy() {
+        use crate::mock::LoadOutcome;
+
+        for (probe_fails, oom, loaded) in [
+            (false, true, vec!["a".into()]),
+            (true, false, vec!["a".into()]),
+            (false, false, vec!["a".into()]),
+            (false, true, vec![]),
+            (true, false, vec![]),
+            (false, false, vec![]),
+        ] {
+            let adapter = Arc::new(UnverifiedReleaseAdapter {
+                startup: std::sync::atomic::AtomicBool::new(true),
+                inner: MockAdapter::new(two_model_catalog()),
+                reported: std::sync::Mutex::new(Some(BackendStatus {
+                    pressure: Pressure::Ok,
+                    used_gb: 4.0,
+                    model_memory_max_gb: 24.0,
+                    loaded,
+                })),
+                probe_fails,
+            });
+            if oom {
+                adapter
+                    .inner
+                    .set_load_script("a", vec![LoadOutcome::Oom, LoadOutcome::Ok]);
+            }
+            let handle = Supervisor::spawn(
+                adapter.clone(),
+                SupervisorConfig {
+                    budget_gb: 4.0,
+                    ..SupervisorConfig::default()
+                },
+            )
+            .unwrap();
+            if probe_fails || oom {
+                handle.load("a", 4.0, on_demand_policy()).await.unwrap_err();
+            } else {
+                handle.load("a", 4.0, on_demand_policy()).await.unwrap();
+                handle.unload("a").await.unwrap_err();
+            }
+            assert_eq!(
+                adapter.inner.load_call_count("a"),
+                1,
+                "unconfirmed OOM must not retry"
+            );
+            let status = handle.status().await.unwrap();
+            assert_eq!(status.used_gb, 4.0);
+            assert!(status.loaded.is_empty());
+            assert!(handle.load("b", 4.0, on_demand_policy()).await.is_err());
+            assert_eq!(adapter.inner.load_call_count("b"), 0);
+        }
     }
 
     /// M1: the actor task itself must exit once every `SupervisorHandle` is
@@ -3424,16 +3416,8 @@ mod tests {
                 .status_times
                 .lock()
                 .expect("test mutex is never poisoned");
-            // First call (the retry's `used_gb_before_retry` baseline)
-            // reports high; every later call reports the drop already
-            // confirmed — so `confirm_memory_released` succeeds on its
-            // very first poll and contributes ~0 delay of its own,
-            // isolating `oom_retry_backoff`'s contribution to the gap
-            // between the two `load` calls (M10 needs this: without it,
-            // `confirm_memory_released`'s own up-to-`release_confirm_
-            // max_attempts` polling could coincidentally cover for a
-            // missing backoff and mask the mutation).
             let before_load = self.load_times.lock().unwrap().is_empty();
+            // Startup is empty; after OOM, one poll precedes release confirmation.
             let used_gb = if !before_load && times.is_empty() {
                 100.0
             } else {
@@ -3506,18 +3490,14 @@ mod tests {
             .lock()
             .expect("test mutex is never poisoned")
             .clone();
-        // At least 2, not just 1: the baseline `used_gb_before_retry`
-        // read is itself one `status()` call that would happen even
-        // without ever calling `confirm_memory_released` — only a
-        // *second* call in this window proves the confirmation loop
-        // itself actually ran.
+        // The first poll reports high, so confirmation must poll again.
         let calls_in_window = status_times
             .iter()
             .filter(|t| **t >= load_times[0] && **t < load_times[1])
             .count();
         assert!(
             calls_in_window >= 2,
-            "M11: confirm_memory_released must actually poll status() (not just read the baseline) between the OOM'd attempt and the retry, got {calls_in_window} call(s)"
+            "M11: confirm_memory_released must poll status() until release is confirmed between the OOM'd attempt and the retry, got {calls_in_window} call(s)"
         );
     }
 }

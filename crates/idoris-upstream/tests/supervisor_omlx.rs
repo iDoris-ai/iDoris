@@ -25,20 +25,8 @@ fn on_demand() -> LoadPolicy {
     }
 }
 
-async fn mock_empty_engine(server: &MockServer) {
-    // Reconciliation sees an empty engine before the scripted load failure.
-    Mock::given(method("GET"))
-        .and(path("/api/status"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "loaded_models": [], "model_memory_used": 0, "model_memory_max": 25769803776_u64
-        })))
-        .mount(server)
-        .await;
-}
-
 async fn run(verify: ResponseTemplate, unload_status: u16) -> f64 {
     let server = MockServer::start().await;
-    mock_empty_engine(&server).await;
     Mock::given(method("POST"))
         .and(path("/v1/models/qwen3-8b/load"))
         .respond_with(ResponseTemplate::new(200))
@@ -53,6 +41,14 @@ async fn run(verify: ResponseTemplate, unload_status: u16) -> f64 {
         .and(path("/v1/models/qwen3-8b/unload"))
         .respond_with(ResponseTemplate::new(unload_status))
         .expect(1)
+        .mount(&server)
+        .await;
+    // K11/H3: cleanup needs engine release evidence beyond the POST acknowledgement.
+    Mock::given(method("GET"))
+        .and(path("/api/status"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "loaded_models": [], "model_memory_used": 0, "model_memory_max": 0
+        })))
         .mount(&server)
         .await;
 
@@ -97,9 +93,30 @@ async fn a_failed_release_keeps_the_memory_on_the_ledger() {
 /// deadline. A received load may still allocate memory after that point.
 #[tokio::test]
 async fn k09_load_timeout_triggers_release_and_preserves_unreleased_memory() {
-    for (unload_status, expected_gb) in [(200, 0.0), (500, 20.0)] {
+    let status_body = |loaded_models: &[&str], used: u64| {
+        ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "loaded_models": loaded_models, "model_memory_used": used,
+            "model_memory_max": 0
+        }))
+    };
+    let scenarios = [
+        (200, ResponseTemplate::new(503), 20.0),
+        (200, status_body(&["qwen3-8b"], 0), 20.0),
+        (200, status_body(&[], 20 * 1024 * 1024 * 1024), 20.0),
+        (500, status_body(&[], 0), 20.0),
+        (200, status_body(&[], 0), 0.0),
+    ];
+    for (unload_status, release_status, expected_gb) in scenarios {
         let server = MockServer::start().await;
-        mock_empty_engine(&server).await;
+        // Only the startup sample is empty; later polls use release_status below.
+        Mock::given(method("GET"))
+            .and(path("/api/status"))
+            .respond_with(status_body(&[], 0))
+            .with_priority(1)
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&server)
+            .await;
         Mock::given(method("POST"))
             .and(path("/v1/models/qwen3-8b/load"))
             .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(1)))
@@ -110,6 +127,11 @@ async fn k09_load_timeout_triggers_release_and_preserves_unreleased_memory() {
             .and(path("/v1/models/qwen3-8b/unload"))
             .respond_with(ResponseTemplate::new(unload_status))
             .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/status"))
+            .respond_with(release_status)
             .mount(&server)
             .await;
         let adapter = OmlxAdapter::new(OmlxAdapterConfig {
