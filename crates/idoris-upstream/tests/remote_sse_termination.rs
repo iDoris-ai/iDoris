@@ -106,6 +106,15 @@ async fn assert_stream_error(kind: RemoteProviderKind, body: String, expected_er
     assert_eq!(errors, [expected_error]);
 }
 
+async fn assert_bom_stream_error(body: String, expected_text: &str, expected_error: &str) {
+    let (client, _server) = mock_stream(RemoteProviderKind::OpenAiCompatible, body).await;
+    let (text, dones, errors) =
+        drain(client.chat_stream(request(), deadline()).await.unwrap()).await;
+    assert_eq!(text, expected_text);
+    assert!(dones.iter().all(|done| !done), "unexpected done: {dones:?}");
+    assert_eq!(errors, [expected_error]);
+}
+
 #[tokio::test]
 async fn openai_done_without_empty_line_is_truncated() {
     for ending in ["", "\n", "\r", "\r\n"] {
@@ -130,6 +139,43 @@ async fn openai_done_after_colonless_data_field_is_truncated() {
     for eol in ["\n", "\r\n", "\r"] {
         let body = format!("{}data{eol}data: [DONE]{eol}{eol}", openai_partial(eol));
         assert_malformed(RemoteProviderKind::OpenAiCompatible, body).await;
+    }
+}
+
+#[tokio::test]
+async fn openai_bom_does_not_turn_an_empty_data_event_into_done() {
+    for eol in ["\n", "\r\n", "\r"] {
+        let body = format!("\u{feff}data:{eol}data: [DONE]{eol}{eol}");
+        assert_bom_stream_error(body, "", "malformed_response").await;
+    }
+}
+
+#[tokio::test]
+async fn openai_leading_bom_allows_a_complete_done_event() {
+    for eol in ["\n", "\r\n", "\r"] {
+        let body = format!("\u{feff}data: [DONE]{eol}{eol}");
+        let (client, _server) = mock_stream(RemoteProviderKind::OpenAiCompatible, body).await;
+        let (text, dones, errors) =
+            drain(client.chat_stream(request(), deadline()).await.unwrap()).await;
+        assert!(text.is_empty());
+        assert_eq!(dones, [true]);
+        assert!(errors.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn openai_bom_after_stream_start_is_not_stripped() {
+    for eol in ["\n", "\r\n", "\r"] {
+        let body = format!("{}\u{feff}data: [DONE]{eol}{eol}", openai_partial(eol));
+        assert_bom_stream_error(body, "partial", "network_error").await;
+    }
+}
+
+#[tokio::test]
+async fn openai_second_leading_bom_is_not_stripped() {
+    for eol in ["\n", "\r\n", "\r"] {
+        let body = format!("\u{feff}\u{feff}data: [DONE]{eol}{eol}");
+        assert_bom_stream_error(body, "", "network_error").await;
     }
 }
 

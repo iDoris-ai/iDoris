@@ -31,6 +31,8 @@ pub struct WebStream {
 	// A CR ends an SSE line immediately; this flag suppresses its following LF,
 	// including when that LF arrives in a later chunk.
 	sse_after_cr: bool,
+	// The optional UTF-8 BOM is ignored only at the absolute start of an SSE stream.
+	sse_at_stream_start: bool,
 }
 
 pub enum StreamMode {
@@ -53,6 +55,7 @@ impl WebStream {
 			remaining_messages: None,
 			utf8_carry: Vec::new(),
 			sse_after_cr: false,
+		sse_at_stream_start: true,
 		}
 	}
 
@@ -66,6 +69,7 @@ impl WebStream {
 			remaining_messages: None,
 			utf8_carry: Vec::new(),
 			sse_after_cr: false,
+		sse_at_stream_start: true,
 		}
 	}
 }
@@ -146,7 +150,20 @@ impl Stream for WebStream {
 						this.utf8_carry = raw[valid_up_to..].to_vec();
 
 						// We already validated raw[..valid_up_to] is valid UTF-8 above.
-						let buff_string = String::from_utf8(raw[..valid_up_to].to_vec()).unwrap();
+						let mut buff_string = String::from_utf8(raw[..valid_up_to].to_vec()).unwrap();
+
+						// Ignore one UTF-8 BOM at the absolute start of SSE input.
+						// This runs before framing filters empty events, and after decoding
+						// has joined any BOM bytes split across transport chunks.
+						if matches!(this.stream_mode, StreamMode::Sse)
+							&& this.sse_at_stream_start
+							&& !buff_string.is_empty()
+						{
+							this.sse_at_stream_start = false;
+							if let Some(without_bom) = buff_string.strip_prefix('\u{feff}') {
+								buff_string = without_bom.to_string();
+							}
+						}
 
 						// -- Iterate through the parts
 						let buff_response = match this.stream_mode {
@@ -307,6 +324,7 @@ mod tests {
 			remaining_messages: None,
 			utf8_carry: Vec::new(),
 			sse_after_cr: false,
+			sse_at_stream_start: true,
 		}
 	}
 
@@ -355,12 +373,57 @@ mod tests {
 	}
 
 	#[test]
+	fn sse_strips_only_one_bom_at_stream_start_across_chunk_boundaries() {
+		for eol in ["\n", "\r\n", "\r"] {
+			let body = format!("\u{feff}data:{eol}data: [DONE]{eol}{eol}");
+			assert_sse_splits(&body, &["data:\ndata: [DONE]"]);
+
+			let body = format!("\u{feff}data: [DONE]{eol}{eol}");
+			assert_sse_splits(&body, &["data: [DONE]"]);
+
+			let body = format!("\u{feff}\u{feff}data: [DONE]{eol}{eol}");
+			assert_sse_splits(&body, &["\u{feff}data: [DONE]"]);
+
+			let body = format!("data: first{eol}{eol}\u{feff}data: later{eol}{eol}");
+			assert_sse_splits(&body, &["data: first", "\u{feff}data: later"]);
+
+			let body = format!("{eol}{eol}\u{feff}data: after empty frame{eol}{eol}");
+			assert_sse_splits(&body, &["\u{feff}data: after empty frame"]);
+		}
+	}
+
+	#[test]
+	fn sse_bom_survives_empty_chunks_before_and_between_its_bytes() {
+		futures::executor::block_on(async {
+			let bytes = "\u{feff}data: [DONE]\n\n".as_bytes();
+			let chunks = vec![
+				Bytes::new(),
+				Bytes::copy_from_slice(&bytes[..1]),
+				Bytes::new(),
+				Bytes::copy_from_slice(&bytes[1..2]),
+				Bytes::new(),
+				Bytes::copy_from_slice(&bytes[2..]),
+				Bytes::new(),
+			];
+			let mut web_stream = stream_from_chunks(StreamMode::Sse, chunks);
+			assert_eq!(web_stream.next().await.unwrap().unwrap(), "data: [DONE]");
+			assert!(web_stream.next().await.is_none());
+		});
+	}
+
+	#[test]
 	fn delimiter_stream_still_flushes_partial_at_eof() {
 		futures::executor::block_on(async {
 			let mut web_stream = stream_from_chunks(StreamMode::Delimiter("\n"), vec![Bytes::from("one\ntail")]);
 			assert_eq!(web_stream.next().await.unwrap().unwrap(), "one");
 			assert_eq!(web_stream.next().await.unwrap().unwrap(), "tail");
 			assert!(web_stream.next().await.is_none());
+
+			let mut web_stream = stream_from_chunks(
+				StreamMode::Delimiter("\n"),
+				vec![Bytes::from("\u{feff}data\n")],
+			);
+			assert_eq!(web_stream.next().await.unwrap().unwrap(), "\u{feff}data");
 		});
 	}
 
