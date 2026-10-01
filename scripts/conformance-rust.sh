@@ -39,6 +39,8 @@ fi
 # conformance/src/harness.ts），所以这里直接给可执行文件的绝对路径，不追加
 # 任何参数——不是漏写了 `serve`，是这个二进制目前压根没有子命令可言。
 export IDORIS_CONFORMANCE_CMD="$bin"
+# K13/M4: a 5xx does not prove the upstream POST was not executed.
+export IDORIS_CONFORMANCE_POST_RETRY=0
 
 echo "[conformance-rust] IDORIS_CONFORMANCE_CMD=$IDORIS_CONFORMANCE_CMD" >&2
 echo "[conformance-rust] pnpm conformance" >&2
