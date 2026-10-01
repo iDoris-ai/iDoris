@@ -105,6 +105,7 @@ const SCHEMA_MIGRATIONS: &[&str] = &[
     include_str!("migrations/0002_overage_events.sql"),
     include_str!("migrations/0003_tenant_scope.sql"),
     include_str!("migrations/0004_tenant_period_column.sql"),
+    include_str!("migrations/0005_integer_amounts.sql"),
 ];
 
 /// Default reservation TTL: long enough to cover a slow upstream call,
@@ -498,6 +499,7 @@ impl BudgetLedger {
         // around. `NotConfigured` only fires when *neither* is set; a
         // tenant with no sub-scope config at all can still `reserve` purely
         // against its tenant-level total.
+        reject_amount_overflow(&tx, &scope.tenant_id, None)?;
         let sub_config = load_config(&tx, scope)?;
         let tenant_cfg = load_tenant_config(&tx, &scope.tenant_id)?;
         if sub_config.is_none() && tenant_cfg.is_none() {
@@ -710,6 +712,10 @@ impl BudgetLedger {
     /// double-charge or un-release a completed outcome. See
     /// [`extend`](Self::extend) for renewing a reservation before its TTL
     /// lapses, for a caller that anticipates running long.
+    /// If either integer total would overflow, returns `AmountOverflow`
+    /// after durably retaining the cost, leaving both totals unchanged.
+    /// The tenant cannot reserve again until manual reconciliation; TTL,
+    /// release and a retry with a different cost cannot erase this record.
     pub fn settle(
         &self,
         tenant_id: &str,
@@ -738,6 +744,24 @@ impl BudgetLedger {
             }
         };
 
+        reject_amount_overflow(&tx, tenant_id, Some(&reservation_id.0))?;
+        let scope = BudgetScope::new(&row.tenant_id, &row.key_id, &row.provider_id, &row.model_id);
+        let scope_total = spent_for(&tx, &scope, &row.period)?.checked_add(actual_cost_minor);
+        let tenant_total =
+            tenant_spent_for(&tx, tenant_id, &row.tenant_period)?.checked_add(actual_cost_minor);
+        let (Some(scope_total), Some(tenant_total)) = (scope_total, tenant_total) else {
+            // Preserve the exact charge without partially updating either total.
+            tx.execute(
+                "INSERT INTO budget_amount_overflows VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![reservation_id.0, tenant_id, actual_cost_minor, now_ms],
+            )?;
+            tx.commit()?;
+            return Err(BudgetError::AmountOverflow {
+                reservation_id: reservation_id.0.clone(),
+                actual_cost_minor,
+            });
+        };
+
         // M1: track overage independently of the receipt returned below —
         // `settle` can return `Err(OverageTooLarge)` further down, and the
         // charge must still be recorded/auditable even on that path.
@@ -750,14 +774,14 @@ impl BudgetLedger {
             "INSERT INTO budget_periods (tenant_id, key_id, provider_id, model_id, period, spent_minor) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
              ON CONFLICT (tenant_id, key_id, provider_id, model_id, period) \
-             DO UPDATE SET spent_minor = spent_minor + excluded.spent_minor",
+             DO UPDATE SET spent_minor = excluded.spent_minor",
             rusqlite::params![
                 row.tenant_id,
                 row.key_id,
                 row.provider_id,
                 row.model_id,
                 row.period,
-                actual_cost_minor
+                scope_total
             ],
         )?;
         tx.execute(
@@ -781,8 +805,8 @@ impl BudgetLedger {
             "INSERT INTO tenant_periods (tenant_id, period, spent_minor) \
              VALUES (?1, ?2, ?3) \
              ON CONFLICT (tenant_id, period) \
-             DO UPDATE SET spent_minor = spent_minor + excluded.spent_minor",
-            rusqlite::params![tenant_id, row.tenant_period, actual_cost_minor],
+             DO UPDATE SET spent_minor = excluded.spent_minor",
+            rusqlite::params![tenant_id, row.tenant_period, tenant_total],
         )?;
 
         if overage_minor > 0 {
@@ -938,6 +962,7 @@ impl BudgetLedger {
                 Ok(())
             }
             ReservationStatus::Active | ReservationStatus::Expired => {
+                reject_amount_overflow(&tx, tenant_id, Some(&reservation_id.0))?;
                 tx.execute(
                     "UPDATE reservations SET status=?2 WHERE id=?1",
                     rusqlite::params![reservation_id.0, ReservationStatus::Released.as_sql()],
@@ -953,6 +978,30 @@ impl BudgetLedger {
                 })
             }
         }
+    }
+}
+
+fn reject_amount_overflow(
+    conn: &Connection,
+    tenant_id: &str,
+    reservation_id: Option<&str>,
+) -> Result<(), BudgetError> {
+    let pending = conn
+        .query_row(
+            "SELECT reservation_id, actual_cost_minor FROM budget_amount_overflows \
+         WHERE tenant_id=?1 AND (?2 IS NULL OR reservation_id=?2) LIMIT 1",
+            rusqlite::params![tenant_id, reservation_id],
+            |r| {
+                Ok(BudgetError::AmountOverflow {
+                    reservation_id: r.get(0)?,
+                    actual_cost_minor: r.get(1)?,
+                })
+            },
+        )
+        .optional()?;
+    match pending {
+        Some(err) => Err(err),
+        None => Ok(()),
     }
 }
 
@@ -1297,6 +1346,144 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+
+    #[test]
+    fn settlement_overflow_preserves_integer_totals_and_recoverable_cost() {
+        for same_scope in [true, false] {
+            let path = temp_db_path("settlement-overflow");
+            let ledger = BudgetLedger::open(&path).unwrap();
+            let first = BudgetScope::new("t1", "k1", "p1", "m1");
+            let second = BudgetScope::new("t1", "k2", "p1", "m1");
+            let target = if same_scope { &first } else { &second };
+            for scope in [&first, &second] {
+                ledger.configure(scope, i64::MAX, "UTC").unwrap();
+            }
+            let id = ledger.reserve(&first, Price::Known(1)).unwrap();
+            ledger.settle("t1", &id, 1).unwrap();
+            let id = ledger.reserve(target, Price::Known(1)).unwrap();
+            let err = ledger.settle("t1", &id, i64::MAX).unwrap_err();
+            assert_eq!(
+                err,
+                BudgetError::AmountOverflow {
+                    reservation_id: id.0.clone(),
+                    actual_cost_minor: i64::MAX,
+                }
+            );
+            assert_eq!(
+                ledger.balance(&first).unwrap(),
+                i64::MAX - 1 - i64::from(same_scope)
+            );
+            assert_eq!(
+                ledger.balance(target).unwrap(),
+                i64::MAX - 1 - i64::from(same_scope)
+            );
+            let conn = ledger.lock();
+            assert_eq!(
+                tenant_spent_for(
+                    &conn,
+                    "t1",
+                    &billing_period_key(ledger.clock.now_ms(), "UTC").unwrap()
+                )
+                .unwrap(),
+                1
+            );
+            let cost: i64 = conn
+                .query_row(
+                    "SELECT actual_cost_minor FROM budget_amount_overflows WHERE reservation_id=?1",
+                    [&id.0],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(cost, i64::MAX);
+            conn.execute(
+                "UPDATE reservations SET expires_at_ms=0 WHERE id=?1",
+                [&id.0],
+            )
+            .unwrap();
+            drop(conn);
+            drop(ledger);
+            let ledger = BudgetLedger::open(&path).unwrap();
+            assert_eq!(ledger.sweep_expired().unwrap(), 1);
+            assert_eq!(ledger.reserve(&second, Price::Known(0)), Err(err.clone()));
+            assert_eq!(ledger.release("t1", &id), Err(err.clone()));
+            assert_eq!(ledger.settle("t1", &id, 0), Err(err));
+            let other = BudgetScope::new("t2", "k1", "p1", "m1");
+            ledger.configure(&other, 10, "UTC").unwrap();
+            assert!(ledger.reserve(&other, Price::Known(1)).is_ok());
+        }
+    }
+
+    #[test]
+    fn settlement_at_integer_max_is_exact() {
+        let ledger = BudgetLedger::open(":memory:").unwrap();
+        let scope = BudgetScope::new("t1", "k1", "p1", "m1");
+        ledger.configure(&scope, i64::MAX, "UTC").unwrap();
+        for cost in [1, i64::MAX - 1] {
+            let id = ledger.reserve(&scope, Price::Known(cost)).unwrap();
+            ledger.settle("t1", &id, cost).unwrap();
+        }
+        assert_eq!(ledger.balance(&scope).unwrap(), 0);
+    }
+
+    #[test]
+    fn amount_migration_preserves_integers_and_rejects_real_totals() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        for migration in &SCHEMA_MIGRATIONS[..4] {
+            conn.execute_batch(migration).unwrap();
+        }
+        conn.execute_batch(
+            "INSERT INTO budget_periods VALUES ('t','k','p','m','1970-01',1);
+            INSERT INTO tenant_periods VALUES ('t','1970-01',1);
+            CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at_ms INTEGER);
+            INSERT INTO schema_migrations VALUES (1,0),(2,0),(3,0),(4,0);",
+        )
+        .unwrap();
+        run_migrations(&mut conn).unwrap();
+        for table in ["budget_periods", "tenant_periods"] {
+            let spent: i64 = conn
+                .query_row(&format!("SELECT spent_minor FROM {table}"), [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            assert_eq!(spent, 1);
+            conn.execute(&format!("UPDATE {table} SET spent_minor=?1"), [i64::MAX])
+                .unwrap();
+            assert!(
+                conn.execute(&format!("UPDATE {table} SET spent_minor=spent_minor+1"), [])
+                    .is_err()
+            );
+            assert!(
+                conn.execute(&format!("UPDATE {table} SET spent_minor=1.5"), [])
+                    .is_err()
+            );
+        }
+        run_migrations(&mut conn).unwrap();
+    }
+
+    #[test]
+    fn amount_migration_rejects_existing_real_without_rounding() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        for migration in &SCHEMA_MIGRATIONS[..4] {
+            conn.execute_batch(migration).unwrap();
+        }
+        conn.execute_batch(
+            "INSERT INTO tenant_periods VALUES ('t','1970-01',1.5);
+            CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at_ms INTEGER);
+            INSERT INTO schema_migrations VALUES (1,0),(2,0),(3,0),(4,0);",
+        )
+        .unwrap();
+        assert!(run_migrations(&mut conn).is_err());
+        let spent: f64 = conn
+            .query_row("SELECT spent_minor FROM tenant_periods", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(spent, 1.5);
+        let version: i64 = conn
+            .query_row("SELECT MAX(version) FROM schema_migrations", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(version, 4);
+    }
 
     /// Temp SQLite path that deletes the database and its `-wal`/`-shm`
     /// sidecars on drop — including when the test panics. Bind it *before*
