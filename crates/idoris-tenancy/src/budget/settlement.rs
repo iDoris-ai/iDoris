@@ -1,10 +1,27 @@
 //! Independent durable outbox: a writer locking the ledger cannot block
 //! recording completed usage. Keep this sidecar with the ledger on backup.
-use std::{path::Path, time::Duration};
+use std::{
+    fs::{self, File},
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 use super::{BudgetError, BudgetLedger, ReservationId};
+
+// Each claim uses a fresh token: removing a finished lease can never unlink
+// a later owner's lock. Probes only open existing files and never create them.
+pub(super) struct DispatchLease {
+    _file: File,
+    path: PathBuf,
+}
+
+impl Drop for DispatchLease {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
 
 pub(super) fn open(path: &Path, timeout: Duration) -> Result<Connection, BudgetError> {
     let conn = if path == Path::new(":memory:") {
@@ -20,6 +37,8 @@ pub(super) fn open(path: &Path, timeout: Duration) -> Result<Connection, BudgetE
         actual_cost_minor INTEGER NOT NULL CHECK(actual_cost_minor >= 0));
         CREATE TABLE IF NOT EXISTS settlement_intents (
         reservation_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS dispatch_owners (
+        reservation_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, token TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS pending_releases (
         reservation_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL)",
     )?;
@@ -39,6 +58,32 @@ impl BudgetLedger {
             .lock()
             .unwrap_or_else(|p| p.into_inner());
         let mut live = self.live_intents.lock().unwrap_or_else(|p| p.into_inner());
+        let mut locks = self
+            .dispatch_locks
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if live.contains_key(&id.0) {
+            return Err(BudgetError::Storage(
+                "dispatch already claimed by this ledger".into(),
+            ));
+        }
+        fs::create_dir_all(&self.dispatch_lock_dir)
+            .map_err(|e| BudgetError::Storage(e.to_string()))?;
+        let token = uuid::Uuid::new_v4().to_string();
+        let lock_path = self.dispatch_lock_dir.join(format!("{token}.lock"));
+        let lock_file = File::options()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .map_err(|e| BudgetError::Storage(e.to_string()))?;
+        lock_file
+            .try_lock()
+            .map_err(|e| BudgetError::Storage(format!("dispatch owner lock failed: {e:?}")))?;
+        let lease = DispatchLease {
+            _file: lock_file,
+            path: lock_path,
+        };
         let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
         let (owner, status, expires_at, actual): (String, String, i64, Option<i64>) = conn.query_row(
             "SELECT tenant_id, status, expires_at_ms, actual_cost_minor FROM reservations WHERE id=?1",
@@ -56,13 +101,34 @@ impl BudgetLedger {
             ));
         }
         drop(conn);
-        let journal = self.settlements.lock().unwrap_or_else(|p| p.into_inner());
-        journal.execute(
-            "INSERT INTO settlement_intents VALUES (?1, ?2)
-             ON CONFLICT(reservation_id) DO NOTHING",
+        let mut journal = self.settlements.lock().unwrap_or_else(|p| p.into_inner());
+        let tx = journal.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let existing_owner: Option<String> = tx
+            .query_row(
+                "SELECT tenant_id FROM dispatch_owners WHERE reservation_id=?1",
+                [&id.0],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let cancelled: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pending_releases WHERE reservation_id=?1)",
+            [&id.0],
+            |r| r.get(0),
+        )?;
+        if existing_owner.is_some() || cancelled {
+            return Err(BudgetError::Storage(
+                "dispatch is already claimed or cancellation is confirmed".into(),
+            ));
+        }
+        tx.execute(
+            "INSERT INTO settlement_intents VALUES (?1, ?2)",
             params![id.0, tenant],
         )?;
-        let recorded: String = journal.query_row(
+        tx.execute(
+            "INSERT INTO dispatch_owners VALUES (?1, ?2, ?3)",
+            params![id.0, tenant, token],
+        )?;
+        let recorded: String = tx.query_row(
             "SELECT tenant_id FROM settlement_intents WHERE reservation_id=?1",
             [&id.0],
             |r| r.get(0),
@@ -72,11 +138,14 @@ impl BudgetLedger {
                 "settlement intent tenant mismatch".into(),
             ));
         }
+        tx.commit()?;
         drop(journal);
         // Keep the validated owner proof before touching primary again. If
         // the hold update fails, release can still durably queue cancellation
         // even when its own primary lookup is unavailable.
         live.insert(id.0.clone(), tenant.to_string());
+        locks.insert(id.0.clone(), lease);
+        drop(locks);
         #[cfg(test)]
         if let Some(hook) = self
             .begin_settlement_test_hook
@@ -188,12 +257,18 @@ impl BudgetLedger {
                 reservation_id: id.0.clone(),
             });
         }
-        // The upstream operation has completed. Keep the mutex guard until
-        // the outcome is durable so same-instance release cannot pass us, but
-        // remove the live marker on every subsequent storage-error path.
-        if verified_owner.is_some() {
+        // Keep the OS lease during the write attempt, then drop it on every
+        // return. A failed write leaves the durable claim but no live lease,
+        // so other instances fail closed until the outcome is recovered.
+        let _dispatch_lease = if verified_owner.is_some() {
             live.remove(&id.0);
-        }
+            self.dispatch_locks
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(&id.0)
+        } else {
+            None
+        };
         if verified_owner.is_none() {
             // Non-dispatch callers do not have the owner proof captured by
             // begin_settlement, so they must still validate against primary.
@@ -217,7 +292,6 @@ impl BudgetLedger {
         if let Some((recorded_tenant, recorded_actual)) = outcomes.get(&id.0)
             && (recorded_tenant != tenant || *recorded_actual != actual)
         {
-            live.remove(&id.0);
             return Err(BudgetError::Storage(
                 "in-memory settlement outcome mismatch".into(),
             ));
@@ -231,7 +305,6 @@ impl BudgetLedger {
         let tx = match journal.transaction_with_behavior(TransactionBehavior::Immediate) {
             Ok(tx) => tx,
             Err(error) => {
-                live.remove(&id.0);
                 drop(live);
                 let journal_error = BudgetError::from(error);
                 // Preserve a completed cost on primary when the independent
@@ -240,10 +313,7 @@ impl BudgetLedger {
                 outcomes.insert(id.0.clone(), (tenant.to_string(), actual));
                 let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
                 let fallback = store_primary_fallback(&conn, &id.0, tenant, actual);
-                if matches!(fallback, Ok(false)) {
-                    outcomes.remove(&id.0);
-                }
-                if matches!(fallback, Ok(true)) {
+                if fallback.is_ok() {
                     drop(conn);
                     drop(outcomes);
                     eprintln!(
@@ -273,7 +343,6 @@ impl BudgetLedger {
         match intent_owner {
             Ok(Some(owner)) if owner == tenant => {}
             Ok(Some(_)) => {
-                live.remove(&id.0);
                 return Err(BudgetError::TenantMismatch {
                     reservation_id: id.0.clone(),
                 });
@@ -335,7 +404,6 @@ impl BudgetLedger {
         let journal_result = insert_pending(&tx, &id.0, tenant, actual);
         match journal_result {
             Err(PendingInsertError::Conflict) => {
-                live.remove(&id.0);
                 return Err(BudgetError::Storage(
                     "settlement journal outcome mismatch".into(),
                 ));
@@ -345,15 +413,11 @@ impl BudgetLedger {
                 // The independent journal may be Busy. Persist the known actual
                 // on the reservation as a second recovery source. Keep the
                 // in-memory copy until a journal write succeeds in this process.
-                live.remove(&id.0);
                 drop(live);
                 outcomes.insert(id.0.clone(), (tenant.to_string(), actual));
                 let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
                 let fallback = store_primary_fallback(&conn, &id.0, tenant, actual);
-                if matches!(fallback, Ok(false)) {
-                    outcomes.remove(&id.0);
-                }
-                if matches!(fallback, Ok(true)) {
+                if fallback.is_ok() {
                     drop(conn);
                     drop(outcomes);
                     eprintln!(
@@ -370,16 +434,12 @@ impl BudgetLedger {
             }
             Ok(()) => {}
         }
-        live.remove(&id.0);
         if let Err(error) = tx.commit() {
             let journal_error = BudgetError::from(error);
             outcomes.insert(id.0.clone(), (tenant.to_string(), actual));
             let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
             let fallback = store_primary_fallback(&conn, &id.0, tenant, actual);
-            if matches!(fallback, Ok(false)) {
-                outcomes.remove(&id.0);
-            }
-            if matches!(fallback, Ok(true)) {
+            if fallback.is_ok() {
                 drop(conn);
                 drop(outcomes);
                 eprintln!(
@@ -522,10 +582,9 @@ impl BudgetLedger {
             }
             outcomes.insert(id, (tenant, actual));
         }
-        // A fallback can be written while another instance owns the sidecar
-        // lock for release. Before rehydrating that in-memory outcome, inspect
-        // primary under our journal transaction: if release won first, discard
-        // the stale fallback instead of creating an unreplayable pending row.
+        // Inspect cached outcomes under the journal writer lock. A matching
+        // committed settlement is redundant; a release can never erase a real
+        // cost. Preserve that conflict durably and require reconciliation.
         let mut obsolete_outcomes = Vec::new();
         {
             let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
@@ -544,7 +603,12 @@ impl BudgetLedger {
                         });
                     }
                     Some((_, status, _)) if status == "released" => {
-                        obsolete_outcomes.push(id.clone());
+                        insert_pending(&tx, id, tenant, *actual)
+                            .map_err(PendingInsertError::into_budget_error)?;
+                        tx.commit()?;
+                        return Err(BudgetError::Storage(
+                            "actual settlement outcome conflicts with released reservation".into(),
+                        ));
                     }
                     Some((_, status, Some(recorded)))
                         if status == "settled" && recorded == *actual =>
@@ -604,11 +668,23 @@ impl BudgetLedger {
             }
             released
         };
+        let mut retired = Vec::new();
         for (id, tenant) in finished_intents {
+            if let Some(token) = tx
+                .query_row(
+                    "SELECT token FROM dispatch_owners WHERE reservation_id=?1",
+                    [&id],
+                    |r| r.get::<_, String>(0),
+                )
+                .optional()?
+            {
+                retired.push((id.clone(), token));
+            }
             tx.execute(
                 "DELETE FROM settlement_intents WHERE reservation_id=?1 AND tenant_id=?2",
                 params![id, tenant],
             )?;
+            tx.execute("DELETE FROM dispatch_owners WHERE reservation_id=?1", [&id])?;
         }
         for (id, (tenant, actual)) in outcomes.iter() {
             match insert_pending(&tx, id, tenant, *actual) {
@@ -667,9 +743,34 @@ impl BudgetLedger {
                 "DELETE FROM settlement_intents WHERE reservation_id=?1 AND tenant_id=?2",
                 params![id.0, tenant],
             )?;
+            if let Some(token) = tx
+                .query_row(
+                    "SELECT token FROM dispatch_owners WHERE reservation_id=?1",
+                    [&id.0],
+                    |r| r.get::<_, String>(0),
+                )
+                .optional()?
+            {
+                retired.push((id.0.clone(), token));
+            }
+            tx.execute(
+                "DELETE FROM dispatch_owners WHERE reservation_id=?1",
+                [&id.0],
+            )?;
         }
         tx.commit()?;
         outcomes.clear();
+        for (id, token) in retired {
+            self.live_intents
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(&id);
+            self.dispatch_locks
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(&id);
+            let _ = fs::remove_file(self.dispatch_lock_dir.join(format!("{token}.lock")));
+        }
         Ok(())
     }
 
@@ -745,14 +846,14 @@ enum PendingInsertError {
     Storage(BudgetError),
 }
 
-/// Store a known amount on the primary row if the independent journal is
-/// unavailable. `Ok(false)` means a release already reached its terminal state.
+/// Store a known amount on primary if the journal is unavailable. A released
+/// row is a conflict, never a reason to discard the caller's completed cost.
 fn store_primary_fallback(
     conn: &Connection,
     id: &str,
     tenant: &str,
     actual: i64,
-) -> Result<bool, BudgetError> {
+) -> Result<(), BudgetError> {
     let updated = conn.execute(
         "UPDATE reservations SET actual_cost_minor=?3
          WHERE id=?1 AND tenant_id=?2 AND status IN ('active','expired')
@@ -760,7 +861,7 @@ fn store_primary_fallback(
         params![id, tenant, actual],
     )?;
     if updated == 1 {
-        return Ok(true);
+        return Ok(());
     }
     let primary: Option<(String, Option<i64>)> = conn
         .query_row(
@@ -770,8 +871,7 @@ fn store_primary_fallback(
         )
         .optional()?;
     match primary {
-        Some((status, _)) if status == "released" => Ok(false),
-        Some((status, Some(recorded))) if recorded == actual && status == "settled" => Ok(true),
+        Some((status, Some(recorded))) if recorded == actual && status == "settled" => Ok(()),
         Some(_) => Err(BudgetError::Storage(
             "primary settlement fallback did not match an active outcome".into(),
         )),
@@ -941,6 +1041,7 @@ mod tests {
         let concurrent = ledger.reserve(&scope, Price::Known(1)).unwrap();
         ledger.release("t", &concurrent).unwrap();
         ledger.live_intents.lock().unwrap().remove(&id.0);
+        ledger.dispatch_locks.lock().unwrap().remove(&id.0);
         assert!(matches!(
             ledger.reserve(&BudgetScope::new("t", "k", "p", "m"), Price::Known(1)),
             Err(BudgetError::Storage(_))
@@ -1205,6 +1306,49 @@ mod tests {
     }
 
     #[test]
+    fn released_cache_is_durable_for_reconciliation_after_restart() {
+        let db = TestDb::new();
+        let ledger = BudgetLedger::open(db.path()).unwrap();
+        ledger
+            .configure_tenant("t", 1000, "UTC", SpendGate::All)
+            .unwrap();
+        let scope = BudgetScope::new("t", "k", "p", "m");
+        let id = ledger.reserve(&scope, Price::Known(10)).unwrap();
+        // Model the cache left by the old release/dual-write race. Even if
+        // primary already says released, recovery must not erase real usage.
+        ledger.release("t", &id).unwrap();
+        ledger
+            .settlement_outcomes
+            .lock()
+            .unwrap()
+            .insert(id.0, ("t".into(), 20));
+        assert!(ledger.retry_settlements().is_err());
+        assert_eq!(pending(&ledger), 1);
+        drop(ledger);
+        let recovered = BudgetLedger::open(db.path()).unwrap();
+        assert!(recovered.retry_settlements().is_err());
+        assert_eq!(pending(&recovered), 1);
+        assert!(recovered.reserve(&scope, Price::Known(1)).is_err());
+    }
+
+    #[test]
+    fn confirmed_cancellation_prevents_a_late_dispatch_claim() {
+        let (ledger, id) = reserved();
+        // Release has committed confirmation but its primary write has not
+        // happened yet. A racing begin must not turn this back into a call.
+        ledger
+            .settlements
+            .lock()
+            .unwrap()
+            .execute("INSERT INTO pending_releases VALUES (?1, 't')", [&id.0])
+            .unwrap();
+        assert!(ledger.begin_settlement("t", &id).is_err());
+        assert_eq!(intents(&ledger), 0);
+        ledger.retry_settlements().unwrap();
+        assert_eq!(ledger.tenant_balance("t").unwrap(), 1000);
+    }
+
+    #[test]
     fn failed_dispatch_hold_cancellation_recovers_across_ttl_and_restart() {
         for restart in [false, true] {
             let db = TestDb::new();
@@ -1393,14 +1537,15 @@ mod tests {
         assert_eq!(ledger.tenant_balance("t").unwrap(), 970);
         assert_eq!(intents(&ledger), 1);
         ledger.live_intents.lock().unwrap().remove(&second.0);
+        ledger.dispatch_locks.lock().unwrap().remove(&second.0);
         assert!(matches!(
             ledger.reserve(&BudgetScope::new("t", "k", "p", "m"), Price::Known(1)),
             Err(BudgetError::Storage(_))
         ));
-        ledger.release("t", &second).unwrap();
+        assert!(ledger.release("t", &second).is_err());
         ledger.retry_settlements().unwrap();
-        assert_eq!(intents(&ledger), 0);
-        assert_eq!(ledger.tenant_balance("t").unwrap(), 980);
+        assert_eq!(intents(&ledger), 1);
+        assert_eq!(ledger.tenant_balance("t").unwrap(), 970);
     }
 
     #[test]

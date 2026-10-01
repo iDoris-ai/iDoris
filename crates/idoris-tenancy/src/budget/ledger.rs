@@ -11,7 +11,8 @@
 //! which is why they're two methods here, not one.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::fs::File;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -202,9 +203,9 @@ pub struct BudgetLedger {
     pub(super) settlements: Mutex<Connection>,
     pub(super) settlement_outcomes: Mutex<HashMap<String, (String, i64)>>,
     pub(super) live_intents: Mutex<HashMap<String, String>>,
+    pub(super) dispatch_locks: Mutex<HashMap<String, super::settlement::DispatchLease>>,
+    pub(super) dispatch_lock_dir: PathBuf,
     pub(super) release_outcomes: Mutex<HashMap<String, String>>,
-    #[cfg(test)]
-    release_test_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     #[cfg(test)]
     pub(super) begin_settlement_test_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     pub(super) clock: Arc<dyn Clock>,
@@ -265,14 +266,23 @@ impl BudgetLedger {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.busy_timeout(busy_timeout)?;
         run_migrations(&mut conn)?;
+        let storage_path = if path.as_ref() == Path::new(":memory:") {
+            path.as_ref().to_path_buf()
+        } else {
+            std::fs::canonicalize(path.as_ref()).map_err(|e| BudgetError::Storage(e.to_string()))?
+        };
         let ledger = Self {
             conn: Mutex::new(conn),
             settlements: Mutex::new(super::settlement::open(path.as_ref(), busy_timeout)?),
             settlement_outcomes: Mutex::new(HashMap::new()),
             live_intents: Mutex::new(HashMap::new()),
+            dispatch_locks: Mutex::new(HashMap::new()),
+            dispatch_lock_dir: if path.as_ref() == Path::new(":memory:") {
+                std::env::temp_dir().join("idoris-dispatch-memory")
+            } else {
+                storage_path.with_added_extension("dispatch-locks")
+            },
             release_outcomes: Mutex::new(HashMap::new()),
-            #[cfg(test)]
-            release_test_hook: Mutex::new(None),
             #[cfg(test)]
             begin_settlement_test_hook: Mutex::new(None),
             clock,
@@ -519,21 +529,53 @@ impl BudgetLedger {
             .lock()
             .unwrap_or_else(|p| p.into_inner());
         let live = self.live_intents.lock().unwrap_or_else(|p| p.into_inner());
-        let journal = self.settlements.lock().unwrap_or_else(|p| p.into_inner());
+        let mut journal = self.settlements.lock().unwrap_or_else(|p| p.into_inner());
+        // Keep intent and owner reads in one snapshot; a healthy completion
+        // cannot delete the claim between its enumeration and the lock probe.
+        let snapshot = journal.transaction()?;
         let mut intent_stmt =
-            journal.prepare("SELECT reservation_id FROM settlement_intents WHERE tenant_id=?1")?;
+            snapshot.prepare("SELECT reservation_id FROM settlement_intents WHERE tenant_id=?1")?;
         let intents = intent_stmt
             .query_map([&scope.tenant_id], |r| r.get::<_, String>(0))?
             .collect::<Result<Vec<_>, _>>()?;
         drop(intent_stmt);
-        if intents
-            .iter()
-            .any(|id| live.get(id) != Some(&scope.tenant_id))
-        {
-            return Err(BudgetError::Storage(
-                "tenant has an unresolved settlement intent".into(),
-            ));
+        for id in &intents {
+            if live.get(id) == Some(&scope.tenant_id) {
+                continue;
+            }
+            let token: Option<String> = snapshot
+                .query_row(
+                    "SELECT token FROM dispatch_owners WHERE reservation_id=?1",
+                    [id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            let Some(token) = token else {
+                return Err(BudgetError::Storage(
+                    "tenant has an ownerless settlement intent".into(),
+                ));
+            };
+            let path = self.dispatch_lock_dir.join(format!("{token}.lock"));
+            let file = File::options()
+                .read(true)
+                .write(true)
+                .open(path)
+                .map_err(|e| BudgetError::Storage(e.to_string()))?;
+            match file.try_lock() {
+                Err(std::fs::TryLockError::WouldBlock) => continue,
+                Err(error) => {
+                    return Err(BudgetError::Storage(format!(
+                        "dispatch owner lock probe failed: {error:?}"
+                    )));
+                }
+                Ok(()) => {
+                    return Err(BudgetError::Storage(
+                        "tenant has an orphaned settlement intent".into(),
+                    ));
+                }
+            }
         }
+        drop(snapshot);
         drop(journal);
         drop(live);
         // Keep this process-local gate until the reservation transaction is
@@ -1017,41 +1059,72 @@ impl BudgetLedger {
                 Err(err) => return Err(err),
             }
         };
-        // Preserve a retryable cancellation before reading the independent
-        // journal: an exclusive sidecar lock can make even this read Busy.
-        // The worker rechecks both stores before it releases the reservation.
-        self.release_outcomes
+        // Only the dispatch owner can confirm that no call remains in flight.
+        // Preserve that acknowledgement even when the journal is unavailable;
+        // a foreign caller must first prove a durable acknowledgement exists.
+        let _dispatch_lease = if live
+            .get(&reservation_id.0)
+            .is_some_and(|owner| owner == tenant_id)
+        {
+            self.release_outcomes
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .insert(reservation_id.0.clone(), tenant_id.to_string());
+            live.remove(&reservation_id.0);
+            self.dispatch_locks
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(&reservation_id.0)
+        } else {
+            None
+        };
+        let local_confirmation = self
+            .release_outcomes
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .insert(reservation_id.0.clone(), tenant_id.to_string());
-        live.remove(&reservation_id.0);
-        // Persist the cancellation first so a crash or unavailable writer
-        // remains recoverable. A durable settlement may still win before
-        // this release takes the sidecar writer; the transaction below then
-        // rechecks its actual outcome before changing the primary row.
+            .get(&reservation_id.0)
+            .is_some_and(|owner| owner == tenant_id);
         let mut journal = self.settlements.lock().unwrap_or_else(|p| p.into_inner());
-        if let Err(err) = journal.execute(
-            "INSERT INTO pending_releases VALUES (?1, ?2) ON CONFLICT(reservation_id) DO NOTHING",
-            rusqlite::params![reservation_id.0, tenant_id],
-        ) {
-            return Err(BudgetError::from(err));
-        }
-        let recorded: String = journal.query_row(
-            "SELECT tenant_id FROM pending_releases WHERE reservation_id=?1",
+        let confirmation = journal.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let has_intent: bool = confirmation.query_row(
+            "SELECT EXISTS(SELECT 1 FROM settlement_intents WHERE reservation_id=?1)",
             [&reservation_id.0],
             |r| r.get(0),
         )?;
-        if recorded != tenant_id {
+        let confirmed_release: Option<String> = confirmation
+            .query_row(
+                "SELECT tenant_id FROM pending_releases WHERE reservation_id=?1",
+                [&reservation_id.0],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if confirmed_release
+            .as_deref()
+            .is_some_and(|owner| owner != tenant_id)
+        {
             return Err(BudgetError::TenantMismatch {
                 reservation_id: reservation_id.0.clone(),
             });
         }
+        if has_intent && !local_confirmation && confirmed_release.is_none() {
+            return Err(BudgetError::Storage(
+                "dispatch cancellation requires its owner's acknowledgement".into(),
+            ));
+        }
+        confirmation.execute(
+            "INSERT INTO pending_releases VALUES (?1, ?2) ON CONFLICT(reservation_id) DO NOTHING",
+            rusqlite::params![reservation_id.0, tenant_id],
+        )?;
+        // Commit confirmation before attempting the primary write: restart
+        // may replay confirmed cancellation, but never infer it from silence.
+        confirmation.commit()?;
+        self.release_outcomes
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(reservation_id.0.clone(), tenant_id.to_string());
         if let Some(err) = deferred_primary_error {
             return Err(err);
         }
-        // Hold the sidecar write transaction across the primary terminal
-        // commit. Durable settlements use the same lock order, so no writer
-        // can insert a pending actual after this check and before release.
         let journal_tx = journal.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let pending_actual: i64 = journal_tx.query_row(
             "SELECT count(*) FROM pending_settlements WHERE reservation_id=?1",
@@ -1072,15 +1145,6 @@ impl BudgetLedger {
                 "cannot release reservation with a pending actual outcome".into(),
             ));
         }
-        #[cfg(test)]
-        if let Some(hook) = self
-            .release_test_hook
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .clone()
-        {
-            hook();
-        }
         // Keep a retryable outcome even when either database is Busy. After
         // a crash, the durable pre-call intent still fails closed.
         // The terminal commit itself also retires the intent. A concurrent
@@ -1088,6 +1152,10 @@ impl BudgetLedger {
         // validate the primary row and cannot revive a released reservation.
         journal_tx.execute(
             "DELETE FROM settlement_intents WHERE reservation_id=?1 AND tenant_id=?2",
+            rusqlite::params![reservation_id.0, tenant_id],
+        )?;
+        journal_tx.execute(
+            "DELETE FROM dispatch_owners WHERE reservation_id=?1 AND tenant_id=?2",
             rusqlite::params![reservation_id.0, tenant_id],
         )?;
         let mut conn = self.lock();
@@ -1119,6 +1187,11 @@ impl BudgetLedger {
         drop(conn);
         journal_tx.commit()?;
         drop(journal);
+        live.remove(&reservation_id.0);
+        self.dispatch_locks
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&reservation_id.0);
         drop(live);
         drop(outcomes);
         self.cancel_settlement(tenant_id, reservation_id)?;
@@ -2236,120 +2309,61 @@ mod tests {
     #[test]
     fn release_and_cross_instance_settlement_serialize_without_losing_actual() {
         for primary_locked in [true, false] {
-            let path = temp_db_path(if primary_locked {
-                "release-settlement-cross-instance-locked"
-            } else {
-                "release-settlement-cross-instance-free"
-            });
-            let release_ledger = Arc::new(BudgetLedger::open(&path).expect("open release ledger"));
-            let settlement_ledger = Arc::new(
+            let path = temp_db_path("release-settlement-cross-instance");
+            let open = || {
                 BudgetLedger::open_with_busy_timeout(
                     &path,
                     Arc::new(SystemClock),
                     60_000,
                     Duration::ZERO,
                 )
-                .expect("open settlement ledger"),
-            );
-            let scope = BudgetScope::new("acme-co", "key-1", "openai", "gpt-5");
-            release_ledger
-                .configure(&scope, 1_000, "UTC")
-                .expect("configure");
-            let id = release_ledger
-                .reserve(&scope, Price::Known(100))
-                .expect("reserve");
-            release_ledger
-                .begin_settlement(&scope.tenant_id, &id)
-                .expect("begin dispatch");
-            settlement_ledger
-                .begin_settlement(&scope.tenant_id, &id)
-                .expect("begin dispatch in second instance");
-
-            let primary_blocker = if primary_locked {
-                let blocker = Connection::open(&path).expect("open primary blocker");
-                blocker
-                    .execute_batch("BEGIN IMMEDIATE")
-                    .expect("hold primary writer lock");
-                Some(blocker)
-            } else {
-                None
+                .unwrap()
             };
-
-            let reached_check = Arc::new(std::sync::Barrier::new(2));
-            let continue_release = Arc::new(std::sync::Barrier::new(2));
-            let reached = Arc::clone(&reached_check);
-            let proceed = Arc::clone(&continue_release);
-            *release_ledger
-                .release_test_hook
-                .lock()
-                .expect("release hook") = Some(Arc::new(move || {
-                reached.wait();
-                proceed.wait();
-            }));
-
-            let releasing = Arc::clone(&release_ledger);
-            let release_tenant = scope.tenant_id.clone();
-            let release_id = id.clone();
-            let release_thread =
-                std::thread::spawn(move || releasing.release(&release_tenant, &release_id));
-            reached_check.wait();
-
-            // A holds the sidecar writer. When primary is also locked, B cannot
-            // persist its fallback either; otherwise its fallback must win and
-            // release must preserve the real charge.
+            let releaser = open();
+            let owner = open();
+            let scope = BudgetScope::new("acme-co", "key-1", "openai", "gpt-5");
+            owner.configure(&scope, 1_000, "UTC").unwrap();
+            let id = owner.reserve(&scope, Price::Known(100)).unwrap();
+            owner.begin_settlement(&scope.tenant_id, &id).unwrap();
+            assert!(releaser.begin_settlement(&scope.tenant_id, &id).is_err());
+            let primary = Connection::open(&path).unwrap();
+            if primary_locked {
+                primary.execute_batch("BEGIN IMMEDIATE").unwrap();
+            }
+            let journal =
+                Connection::open(path.as_ref().with_added_extension("settlements.sqlite3"))
+                    .unwrap();
+            journal.execute_batch("BEGIN IMMEDIATE").unwrap();
+            assert!(releaser.release(&scope.tenant_id, &id).is_err());
+            assert!(releaser.release_outcomes.lock().unwrap().is_empty());
             assert!(matches!(
-                settlement_ledger.settle_durable(&scope.tenant_id, &id, 20),
+                owner.settle_durable(&scope.tenant_id, &id, 20),
                 Err(BudgetError::Busy) | Ok(None)
             ));
-            continue_release.wait();
-            if let Some(blocker) = primary_blocker {
-                blocker
-                    .execute_batch("ROLLBACK")
-                    .expect("release primary writer lock");
-            }
-            let release_result = release_thread.join().expect("release thread");
+            journal.execute_batch("ROLLBACK").unwrap();
             if primary_locked {
-                assert!(release_result.is_ok());
-            } else {
-                assert!(matches!(release_result, Err(BudgetError::Storage(_))));
-                settlement_ledger
-                    .retry_settlements()
-                    .expect("replay fallback actual");
+                primary.execute_batch("ROLLBACK").unwrap();
             }
-            let pending_actual: i64 = settlement_ledger
-                .settlements
-                .lock()
-                .expect("settlement journal")
-                .query_row(
-                    "SELECT count(*) FROM pending_settlements WHERE reservation_id=?1",
-                    [&id.0],
-                    |r| r.get(0),
-                )
-                .expect("pending outcome count");
-            assert_eq!(pending_actual, 0);
-            let row = release_ledger
+            // An unpersisted completed cost must survive a foreign release,
+            // then be charged exactly once by retry and after restart.
+            assert!(releaser.release(&scope.tenant_id, &id).is_err());
+            owner.retry_settlements().unwrap();
+            releaser.retry_settlements().unwrap();
+            let row: (String, Option<i64>) = releaser
                 .lock()
                 .query_row(
                     "SELECT status, actual_cost_minor FROM reservations WHERE id=?1",
                     [&id.0],
-                    |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<i64>>(1)?)),
+                    |r| Ok((r.get(0)?, r.get(1)?)),
                 )
-                .expect("reservation row");
-            if primary_locked {
-                assert_eq!(row, ("released".to_string(), None));
-            } else {
-                assert_eq!(row, ("settled".to_string(), Some(20)));
-                assert_eq!(
-                    release_ledger.balance(&scope).expect("charged balance"),
-                    980
-                );
-            }
-
-            let other = BudgetScope::new("another-tenant", "key-2", "openai", "gpt-5");
-            settlement_ledger
-                .configure(&other, 100, "UTC")
-                .expect("configure other tenant");
-            assert!(settlement_ledger.reserve(&other, Price::Known(10)).is_ok());
+                .unwrap();
+            assert_eq!(row, ("settled".to_string(), Some(20)));
+            assert_eq!(releaser.balance(&scope).unwrap(), 980);
+            drop(owner);
+            drop(releaser);
+            let recovered = open();
+            recovered.retry_settlements().unwrap();
+            assert_eq!(recovered.balance(&scope).unwrap(), 980);
         }
     }
 
