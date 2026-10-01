@@ -22,3 +22,31 @@ jobs:
       - run: pnpm check:contract-drift
       - run: pnpm build
       - run: pnpm test
+      # R0：语言无关的黑盒 HTTP 契约测试套件，独立 step（不并入 pnpm test，避免拖慢现有门禁）。
+      - run: pnpm conformance
+
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install 1.95 --profile minimal --component rustfmt,clippy
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+      - run: cargo fmt --check
+      # idoris-tenancy/test-bins gates the budget_mp_worker test helper
+      # binary out of default builds (Opus Tier-2 acceptance L6); enabling
+      # it here keeps its multi-process concurrency tests a required part of
+      # this gate rather than something a plain local `cargo test` happens
+      # to skip (M4). idoris-tenancy/mutation-test-hooks gates a
+      # deterministic split-transaction mutation-testing hook the same way
+      # (Opus Tier-2 re-review B-8) — also required here, not optional.
+      - run: cargo clippy --all-targets --features idoris-tenancy/test-bins,idoris-tenancy/mutation-test-hooks -- -D warnings
+      - run: cargo test --features idoris-tenancy/test-bins,idoris-tenancy/mutation-test-hooks
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check licenses bans

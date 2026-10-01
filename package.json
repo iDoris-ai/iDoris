@@ -23,7 +23,8 @@
     "smoke:agent24": "pnpm build && node scripts/smoke-agent24.mjs",
     "smoke:external": "pnpm --filter @idoris/adapters build && node scripts/smoke-external.mjs",
     "test:growth": "pnpm --filter @idoris/growth test",
-    "test:federation": "pnpm --filter @idoris/federation test"
+    "test:federation": "pnpm --filter @idoris/federation test",
+    "conformance": "pnpm --filter @idoris/router... build && pnpm --filter @idoris/conformance test:conformance"
   },
   "devDependencies": {
     "@eslint/js": "^9.14.0",
