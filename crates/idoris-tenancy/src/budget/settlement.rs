@@ -19,6 +19,8 @@ pub(super) fn open(path: &Path, timeout: Duration) -> Result<Connection, BudgetE
         reservation_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL,
         actual_cost_minor INTEGER NOT NULL CHECK(actual_cost_minor >= 0));
         CREATE TABLE IF NOT EXISTS settlement_intents (
+        reservation_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS pending_releases (
         reservation_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL)",
     )?;
     Ok(conn)
@@ -26,8 +28,8 @@ pub(super) fn open(path: &Path, timeout: Duration) -> Result<Connection, BudgetE
 
 impl BudgetLedger {
     /// Durably mark a paid dispatch before calling its upstream. An intent
-    /// without an outcome keeps admission closed until the caller settles or
-    /// explicitly cancels the reservation.
+    /// owned by a live caller keeps its budget reserved without blocking
+    /// concurrent requests. An orphan intent blocks only its tenant.
     pub fn begin_settlement(&self, tenant: &str, id: &ReservationId) -> Result<(), BudgetError> {
         // Match reserve's local serialization gate. reserve holds this gate
         // from its intent check through its ledger commit, so a dispatch
@@ -36,16 +38,22 @@ impl BudgetLedger {
             .settlement_outcomes
             .lock()
             .unwrap_or_else(|p| p.into_inner());
+        let mut live = self.live_intents.lock().unwrap_or_else(|p| p.into_inner());
         let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
-        let owner: String = conn.query_row(
-            "SELECT tenant_id FROM reservations WHERE id=?1",
+        let (owner, status, expires_at, actual): (String, String, i64, Option<i64>) = conn.query_row(
+            "SELECT tenant_id, status, expires_at_ms, actual_cost_minor FROM reservations WHERE id=?1",
             [&id.0],
-            |r| r.get(0),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )?;
         if owner != tenant {
             return Err(BudgetError::TenantMismatch {
                 reservation_id: id.0.clone(),
             });
+        }
+        if status != "active" || expires_at <= self.clock.now_ms() || actual.is_some() {
+            return Err(BudgetError::Storage(
+                "reservation is not eligible for dispatch".into(),
+            ));
         }
         drop(conn);
         let journal = self.settlements.lock().unwrap_or_else(|p| p.into_inner());
@@ -64,6 +72,18 @@ impl BudgetLedger {
                 "settlement intent tenant mismatch".into(),
             ));
         }
+        drop(journal);
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let held = conn.execute(
+            "UPDATE reservations SET dispatch_hold=1 WHERE id=?1 AND tenant_id=?2 AND status='active' AND actual_cost_minor IS NULL AND (expires_at_ms>?3 OR dispatch_hold=1)",
+            params![id.0, tenant, self.clock.now_ms()],
+        )?;
+        if held != 1 {
+            return Err(BudgetError::Storage(
+                "reservation could not be held for dispatch".into(),
+            ));
+        }
+        live.insert(id.0.clone());
         Ok(())
     }
 
@@ -144,6 +164,20 @@ impl BudgetLedger {
             .settlement_outcomes
             .lock()
             .unwrap_or_else(|p| p.into_inner());
+        self.live_intents
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&id.0);
+        if self
+            .release_outcomes
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains_key(&id.0)
+        {
+            return Err(BudgetError::Storage(
+                "reservation has a release outcome".into(),
+            ));
+        }
         if let Some((recorded_tenant, recorded_actual)) = outcomes.get(&id.0)
             && (recorded_tenant != tenant || *recorded_actual != actual)
         {
@@ -194,6 +228,75 @@ impl BudgetLedger {
     /// Retry on startup, periodically, and before admitting new spending.
     /// A journal write transaction serializes recovery across processes.
     pub fn retry_settlements(&self) -> Result<(), BudgetError> {
+        let mut releases = {
+            let journal = self.settlements.lock().unwrap_or_else(|p| p.into_inner());
+            let mut stmt =
+                journal.prepare("SELECT reservation_id, tenant_id FROM pending_releases")?;
+            stmt.query_map([], |r| {
+                Ok((ReservationId(r.get(0)?), r.get::<_, String>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?
+        };
+        // An unavailable journal must not lose a known cancellation in
+        // this process; release will persist it before retrying the ledger.
+        for (id, tenant) in self
+            .release_outcomes
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+        {
+            if !releases.iter().any(|(queued, _)| &queued.0 == id) {
+                releases.push((ReservationId(id.clone()), tenant.clone()));
+            }
+        }
+        let mut release_error = None;
+        for (id, tenant) in releases {
+            let pending_actual = {
+                let journal = self.settlements.lock().unwrap_or_else(|p| p.into_inner());
+                journal.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM pending_settlements WHERE reservation_id=?1)",
+                    [&id.0],
+                    |r| r.get::<_, bool>(0),
+                )?
+            };
+            let recorded_actual = self.conn.lock().unwrap_or_else(|p| p.into_inner()).query_row(
+                "SELECT EXISTS(SELECT 1 FROM reservations WHERE id=?1 AND tenant_id=?2 AND actual_cost_minor IS NOT NULL)",
+                params![id.0, tenant], |r| r.get::<_, bool>(0),
+            )?;
+            let known_actual = pending_actual
+                || recorded_actual
+                || self
+                    .settlement_outcomes
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .contains_key(&id.0);
+            if known_actual {
+                eprintln!(
+                    "budget release conflicts with pending settlement: reservation={}",
+                    id.0
+                );
+                let journal = self.settlements.lock().unwrap_or_else(|p| p.into_inner());
+                journal.execute(
+                    "DELETE FROM pending_releases WHERE reservation_id=?1",
+                    [&id.0],
+                )?;
+                self.release_outcomes
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .remove(&id.0);
+                continue;
+            }
+            if let Err(err) = self.release(&tenant, &id) {
+                eprintln!(
+                    "budget release retry pending: reservation={} error={err}",
+                    id.0
+                );
+                release_error.get_or_insert(err);
+            }
+        }
+        if let Some(err) = release_error {
+            return Err(err);
+        }
         let mut outcomes = self
             .settlement_outcomes
             .lock()
@@ -227,15 +330,15 @@ impl BudgetLedger {
             }
             outcomes.insert(id, (tenant, actual));
         }
-        // A release may have committed while its intent deletion hit a
-        // journal Busy error. Complete that deletion on the next retry.
+        // A terminal outcome may have committed while intent deletion hit
+        // journal Busy. Complete that deletion on the next retry.
         let intents = {
             let mut stmt =
                 journal.prepare("SELECT reservation_id, tenant_id FROM settlement_intents")?;
             stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
                 .collect::<Result<Vec<_>, _>>()?
         };
-        let released_intents = {
+        let finished_intents = {
             let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
             let mut released = Vec::new();
             for (id, tenant) in intents {
@@ -246,13 +349,13 @@ impl BudgetLedger {
                         |r| r.get(0),
                     )
                     .optional()?;
-                if status.as_deref() == Some("released") {
+                if matches!(status.as_deref(), Some("released" | "settled")) {
                     released.push((id, tenant));
                 }
             }
             released
         };
-        for (id, tenant) in released_intents {
+        for (id, tenant) in finished_intents {
             journal.execute(
                 "DELETE FROM settlement_intents WHERE reservation_id=?1 AND tenant_id=?2",
                 params![id, tenant],
@@ -308,14 +411,6 @@ impl BudgetLedger {
                 params![id.0, tenant],
             )?;
         }
-        let unresolved: i64 =
-            tx.query_row("SELECT count(*) FROM settlement_intents", [], |r| r.get(0))?;
-        if unresolved > 0 {
-            tx.commit()?;
-            return Err(BudgetError::Storage(
-                "dispatch has an unresolved settlement intent".into(),
-            ));
-        }
         tx.commit()?;
         Ok(())
     }
@@ -350,13 +445,36 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
     use crate::budget::{BudgetScope, Price, SpendGate};
-    use std::sync::atomic::{AtomicI64, Ordering};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicI64, Ordering},
+    };
 
     struct TestClock(AtomicI64);
 
     impl crate::budget::clock::Clock for TestClock {
         fn now_ms(&self) -> i64 {
             self.0.load(Ordering::SeqCst)
+        }
+    }
+
+    struct TestDb(std::path::PathBuf);
+
+    impl TestDb {
+        fn new() -> Self {
+            let dir = std::env::temp_dir().join(format!("idoris-release-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir(&dir).unwrap();
+            Self(dir)
+        }
+
+        fn path(&self) -> std::path::PathBuf {
+            self.0.join("budget.sqlite3")
+        }
+    }
+
+    impl Drop for TestDb {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
         }
     }
 
@@ -390,6 +508,62 @@ mod tests {
     }
 
     #[test]
+    fn live_intents_allow_same_and_other_tenant_reservations_while_holding_budget() {
+        let (ledger, id) = reserved();
+        ledger
+            .configure_tenant("other", 1000, "UTC", SpendGate::All)
+            .unwrap();
+        ledger.begin_settlement("t", &id).unwrap();
+        assert!(
+            ledger
+                .reserve(&BudgetScope::new("t", "k", "p", "m"), Price::Known(10))
+                .is_ok()
+        );
+        assert!(
+            ledger
+                .reserve(&BudgetScope::new("other", "k", "p", "m"), Price::Known(10))
+                .is_ok()
+        );
+        assert_eq!(ledger.tenant_balance("t").unwrap(), 980);
+    }
+
+    #[test]
+    fn intent_is_reserved_after_ttl_and_unknown_intent_only_blocks_its_tenant() {
+        let clock = Arc::new(TestClock(AtomicI64::new(100)));
+        let ledger = BudgetLedger::open_with(":memory:", clock.clone(), 10).unwrap();
+        ledger
+            .configure_tenant("t", 1000, "UTC", SpendGate::All)
+            .unwrap();
+        ledger
+            .configure_tenant("other", 1000, "UTC", SpendGate::All)
+            .unwrap();
+        let id = ledger
+            .reserve(&BudgetScope::new("t", "k", "p", "m"), Price::Known(10))
+            .unwrap();
+        ledger.begin_settlement("t", &id).unwrap();
+        clock.0.store(120, Ordering::SeqCst);
+        assert_eq!(ledger.sweep_expired().unwrap(), 0);
+        assert_eq!(ledger.tenant_balance("t").unwrap(), 990);
+        let scope = BudgetScope::new("t", "k", "p", "m");
+        assert!(matches!(
+            ledger.reserve(&scope, Price::Known(991)),
+            Err(BudgetError::Exceeded { .. })
+        ));
+        let concurrent = ledger.reserve(&scope, Price::Known(1)).unwrap();
+        ledger.release("t", &concurrent).unwrap();
+        ledger.live_intents.lock().unwrap().remove(&id.0);
+        assert!(matches!(
+            ledger.reserve(&BudgetScope::new("t", "k", "p", "m"), Price::Known(1)),
+            Err(BudgetError::Storage(_))
+        ));
+        assert!(
+            ledger
+                .reserve(&BudgetScope::new("other", "k", "p", "m"), Price::Known(1))
+                .is_ok()
+        );
+    }
+
+    #[test]
     fn storage_rollback_keeps_actual_cost_and_blocks_new_spending_until_recovery() {
         let (ledger, id) = reserved();
         ledger
@@ -418,6 +592,156 @@ mod tests {
         ledger.retry_settlements().unwrap();
         assert_eq!(pending(&ledger), 0);
         assert_eq!(ledger.tenant_balance("t").unwrap(), 980);
+    }
+
+    #[test]
+    fn cancelled_release_survives_busy_ttl_and_restart_without_charging() {
+        for restart in [false, true] {
+            let db = TestDb::new();
+            let clock = Arc::new(TestClock(AtomicI64::new(100)));
+            let ledger =
+                BudgetLedger::open_with_busy_timeout(db.path(), clock.clone(), 10, Duration::ZERO)
+                    .unwrap();
+            ledger
+                .configure_tenant("t", 1000, "UTC", SpendGate::All)
+                .unwrap();
+            let scope = BudgetScope::new("t", "k", "p", "m");
+            let id = ledger.reserve(&scope, Price::Known(100)).unwrap();
+            ledger.begin_settlement("t", &id).unwrap();
+            let blocker = Connection::open(db.path()).unwrap();
+            blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+            assert!(matches!(ledger.release("t", &id), Err(BudgetError::Busy)));
+            let queued: i64 = ledger
+                .settlements
+                .lock()
+                .unwrap()
+                .query_row("SELECT count(*) FROM pending_releases", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(queued, 1);
+            assert!(matches!(ledger.retry_settlements(), Err(BudgetError::Busy)));
+            assert_eq!(ledger.tenant_balance("t").unwrap(), 900);
+            clock.0.store(120, Ordering::SeqCst);
+            blocker.execute_batch("ROLLBACK").unwrap();
+            let recovered = if restart {
+                drop(ledger);
+                BudgetLedger::open_with(db.path(), clock.clone(), 10).unwrap()
+            } else {
+                ledger
+            };
+            for _ in 0..2 {
+                recovered.retry_settlements().unwrap();
+                assert_eq!(recovered.tenant_balance("t").unwrap(), 1000);
+                assert_eq!((pending(&recovered), intents(&recovered)), (0, 0));
+            }
+            let (status, actual): (String, Option<i64>) = recovered
+                .conn
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT status, actual_cost_minor FROM reservations WHERE id=?1",
+                    [&id.0],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!((status.as_str(), actual), ("released", None));
+            let queued: i64 = recovered
+                .settlements
+                .lock()
+                .unwrap()
+                .query_row("SELECT count(*) FROM pending_releases", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(queued, 0);
+            let next = recovered.reserve(&scope, Price::Known(1000)).unwrap();
+            recovered.release("t", &next).unwrap();
+        }
+    }
+
+    #[test]
+    fn cancellation_retries_when_both_outcome_stores_were_busy() {
+        let db = TestDb::new();
+        let ledger = BudgetLedger::open_with_busy_timeout(
+            db.path(),
+            Arc::new(TestClock(AtomicI64::new(100))),
+            10,
+            Duration::ZERO,
+        )
+        .unwrap();
+        ledger
+            .configure_tenant("t", 1000, "UTC", SpendGate::All)
+            .unwrap();
+        let id = ledger
+            .reserve(&BudgetScope::new("t", "k", "p", "m"), Price::Known(100))
+            .unwrap();
+        ledger.begin_settlement("t", &id).unwrap();
+        let main = Connection::open(db.path()).unwrap();
+        let journal =
+            Connection::open(db.path().with_added_extension("settlements.sqlite3")).unwrap();
+        main.execute_batch("BEGIN IMMEDIATE").unwrap();
+        journal.execute_batch("BEGIN IMMEDIATE").unwrap();
+        assert!(matches!(ledger.release("t", &id), Err(BudgetError::Busy)));
+        journal.execute_batch("ROLLBACK").unwrap();
+        main.execute_batch("ROLLBACK").unwrap();
+        ledger.retry_settlements().unwrap();
+        assert_eq!(ledger.tenant_balance("t").unwrap(), 1000);
+        assert_eq!(intents(&ledger), 0);
+    }
+
+    #[test]
+    fn release_rejects_foreign_tenants_and_preserves_completed_usage() {
+        let (ledger, id) = reserved();
+        ledger.begin_settlement("t", &id).unwrap();
+        assert!(matches!(
+            ledger.release("other", &id),
+            Err(BudgetError::TenantMismatch { .. })
+        ));
+        ledger.settlements.lock().unwrap().execute_batch("CREATE TRIGGER fail_journal BEFORE INSERT ON pending_settlements BEGIN SELECT RAISE(ABORT, 'injected journal failure'); END;").unwrap();
+        assert!(ledger.settle_durable("t", &id, 20).is_err());
+        assert!(ledger.release("t", &id).is_err());
+        let queued: i64 = ledger
+            .settlements
+            .lock()
+            .unwrap()
+            .query_row("SELECT count(*) FROM pending_releases", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(queued, 0);
+        ledger
+            .settlements
+            .lock()
+            .unwrap()
+            .execute_batch("DROP TRIGGER fail_journal")
+            .unwrap();
+        ledger.retry_settlements().unwrap();
+        assert_eq!(ledger.tenant_balance("t").unwrap(), 980);
+    }
+
+    #[test]
+    fn settlement_winning_a_release_race_does_not_leave_a_stuck_release() {
+        let (ledger, id) = reserved();
+        ledger.begin_settlement("t", &id).unwrap();
+        // Another connection can settle after release queued its outcome
+        // but before release acquires the primary write transaction.
+        ledger
+            .settlements
+            .lock()
+            .unwrap()
+            .execute("INSERT INTO pending_releases VALUES (?1, 't')", [&id.0])
+            .unwrap();
+        ledger.settle("t", &id, 20).unwrap();
+        ledger.retry_settlements().unwrap();
+        assert_eq!(ledger.tenant_balance("t").unwrap(), 980);
+        assert_eq!(intents(&ledger), 0);
+        let queued: i64 = ledger
+            .settlements
+            .lock()
+            .unwrap()
+            .query_row("SELECT count(*) FROM pending_releases", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(queued, 0);
+        assert!(
+            ledger
+                .reserve(&BudgetScope::new("t", "k", "p", "m"), Price::Known(1))
+                .is_ok()
+        );
     }
 
     #[test]
@@ -533,9 +857,10 @@ mod tests {
             .unwrap();
         ledger.begin_settlement("t", &first).unwrap();
         ledger.begin_settlement("t", &second).unwrap();
-        assert_eq!(ledger.settle_durable("t", &first, 20).unwrap(), None);
+        assert_eq!(ledger.settle_durable("t", &first, 20).unwrap(), Some(20));
         assert_eq!(ledger.tenant_balance("t").unwrap(), 970);
         assert_eq!(intents(&ledger), 1);
+        ledger.live_intents.lock().unwrap().remove(&second.0);
         assert!(matches!(
             ledger.reserve(&BudgetScope::new("t", "k", "p", "m"), Price::Known(1)),
             Err(BudgetError::Storage(_))

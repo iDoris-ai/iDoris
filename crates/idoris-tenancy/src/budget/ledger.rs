@@ -10,7 +10,7 @@
 //! (`settle`) independently callable, independently testable operations —
 //! which is why they're two methods here, not one.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -106,6 +106,7 @@ const SCHEMA_MIGRATIONS: &[&str] = &[
     include_str!("migrations/0002_overage_events.sql"),
     include_str!("migrations/0003_tenant_scope.sql"),
     include_str!("migrations/0004_tenant_period_column.sql"),
+    include_str!("migrations/0005_dispatch_hold.sql"),
 ];
 
 /// Default reservation TTL: long enough to cover a slow upstream call,
@@ -200,7 +201,9 @@ pub struct BudgetLedger {
     pub(super) conn: Mutex<Connection>,
     pub(super) settlements: Mutex<Connection>,
     pub(super) settlement_outcomes: Mutex<HashMap<String, (String, i64)>>,
-    clock: Arc<dyn Clock>,
+    pub(super) live_intents: Mutex<HashSet<String>>,
+    pub(super) release_outcomes: Mutex<HashMap<String, String>>,
+    pub(super) clock: Arc<dyn Clock>,
     ttl_ms: i64,
 }
 
@@ -262,6 +265,8 @@ impl BudgetLedger {
             conn: Mutex::new(conn),
             settlements: Mutex::new(super::settlement::open(path.as_ref(), busy_timeout)?),
             settlement_outcomes: Mutex::new(HashMap::new()),
+            live_intents: Mutex::new(HashSet::new()),
+            release_outcomes: Mutex::new(HashMap::new()),
             clock,
             ttl_ms,
         };
@@ -465,7 +470,8 @@ impl BudgetLedger {
     /// Atomically check-and-deduct: inside one `BEGIN IMMEDIATE` transaction,
     /// compute the scope's remaining balance for the current period and, if
     /// `estimated_cost` fits, insert an `active` reservation holding that
-    /// amount until it's settled, released, or its TTL expires. Two
+    /// amount until it's settled, released, or its TTL expires. A dispatch
+    /// hold keeps an in-flight request reserved beyond its TTL. Two
     /// concurrent callers can never both succeed past the same last unit of
     /// budget, because the second one's `BEGIN IMMEDIATE` blocks (up to the
     /// `busy_timeout`) until the first commits or rolls back.
@@ -498,22 +504,27 @@ impl BudgetLedger {
         };
 
         self.retry_settlements()?;
-        // Serialize intent checks with local begin_settlement calls. An
-        // unresolved intent globally pauses new spending as a conservative
-        // recovery policy.
+        // Live dispatches keep their reservations. Only an intent whose
+        // caller is no longer live blocks this tenant pending recovery.
         let _outcomes = self
             .settlement_outcomes
             .lock()
             .unwrap_or_else(|p| p.into_inner());
+        let live = self.live_intents.lock().unwrap_or_else(|p| p.into_inner());
         let journal = self.settlements.lock().unwrap_or_else(|p| p.into_inner());
-        let unresolved: i64 =
-            journal.query_row("SELECT count(*) FROM settlement_intents", [], |r| r.get(0))?;
-        if unresolved > 0 {
+        let mut intent_stmt =
+            journal.prepare("SELECT reservation_id FROM settlement_intents WHERE tenant_id=?1")?;
+        let intents = intent_stmt
+            .query_map([&scope.tenant_id], |r| r.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(intent_stmt);
+        if intents.iter().any(|id| !live.contains(id)) {
             return Err(BudgetError::Storage(
-                "dispatch has an unresolved settlement intent".into(),
+                "tenant has an unresolved settlement intent".into(),
             ));
         }
         drop(journal);
+        drop(live);
         // Keep this process-local gate until the reservation transaction is
         // finished. Otherwise begin_settlement could insert an intent after
         // this check but before this request commits its reservation.
@@ -686,7 +697,7 @@ impl BudgetLedger {
         let now_ms = self.clock.now_ms();
         let conn = self.lock();
         let n = conn.execute(
-            "UPDATE reservations SET status=?1 WHERE status=?2 AND expires_at_ms <= ?3",
+            "UPDATE reservations SET status=?1 WHERE status=?2 AND expires_at_ms <= ?3 AND dispatch_hold=0",
             rusqlite::params![
                 ReservationStatus::Expired.as_sql(),
                 ReservationStatus::Active.as_sql(),
@@ -706,7 +717,7 @@ fn sweep_expired_scope(
     let n = conn.execute(
         "UPDATE reservations SET status=?7 \
          WHERE tenant_id=?1 AND key_id=?2 AND provider_id=?3 AND model_id=?4 AND period=?5 \
-           AND status=?6 AND expires_at_ms <= ?8",
+           AND status=?6 AND expires_at_ms <= ?8 AND dispatch_hold=0",
         rusqlite::params![
             scope.tenant_id,
             scope.key_id,
@@ -955,35 +966,118 @@ impl BudgetLedger {
         tenant_id: &str,
         reservation_id: &ReservationId,
     ) -> Result<(), BudgetError> {
+        let outcomes = self
+            .settlement_outcomes
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let mut live = self.live_intents.lock().unwrap_or_else(|p| p.into_inner());
+        if outcomes.contains_key(&reservation_id.0) {
+            return Err(BudgetError::Storage(
+                "cannot release reservation with a known actual outcome".into(),
+            ));
+        }
+        {
+            let conn = self.lock();
+            let row = find_reservation(&conn, tenant_id, reservation_id)?;
+            if row.status == ReservationStatus::Settled.as_sql() {
+                return Err(BudgetError::ReservationNotActive {
+                    reservation_id: reservation_id.0.clone(),
+                    status: row.status,
+                });
+            }
+            if row.actual_cost_minor.is_some() {
+                return Err(BudgetError::Storage(
+                    "cannot release reservation with a recorded actual outcome".into(),
+                ));
+            }
+        }
+        let journal = self.settlements.lock().unwrap_or_else(|p| p.into_inner());
+        let pending_actual: i64 = journal.query_row(
+            "SELECT count(*) FROM pending_settlements WHERE reservation_id=?1",
+            [&reservation_id.0],
+            |r| r.get(0),
+        )?;
+        if pending_actual > 0 {
+            return Err(BudgetError::Storage(
+                "cannot release reservation with a pending actual outcome".into(),
+            ));
+        }
+        // Keep a retryable outcome even when both databases are Busy.
+        // After a crash, the pre-call intent still fails closed.
+        self.release_outcomes
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(reservation_id.0.clone(), tenant_id.to_string());
+        live.remove(&reservation_id.0);
+        let queue_result = journal.execute(
+            "INSERT INTO pending_releases VALUES (?1, ?2) ON CONFLICT(reservation_id) DO NOTHING",
+            rusqlite::params![reservation_id.0, tenant_id],
+        );
+        let queue_error = match queue_result {
+            Ok(_) => {
+                let recorded: String = journal.query_row(
+                    "SELECT tenant_id FROM pending_releases WHERE reservation_id=?1",
+                    [&reservation_id.0],
+                    |r| r.get(0),
+                )?;
+                if recorded != tenant_id {
+                    return Err(BudgetError::TenantMismatch {
+                        reservation_id: reservation_id.0.clone(),
+                    });
+                }
+                None
+            }
+            Err(err) => {
+                eprintln!(
+                    "budget release journal write failed: reservation={} error={err}",
+                    reservation_id.0
+                );
+                Some(BudgetError::from(err))
+            }
+        };
+        drop(journal);
         let mut conn = self.lock();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
 
         let row = find_reservation(&tx, tenant_id, reservation_id)?;
         let status = ReservationStatus::parse(&row.status)?;
-
+        if row.actual_cost_minor.is_some() && status != ReservationStatus::Settled {
+            return Err(BudgetError::Storage(
+                "cannot release reservation with a recorded actual outcome".into(),
+            ));
+        }
         match status {
-            ReservationStatus::Released => {
-                tx.commit()?;
-                drop(conn);
-                self.cancel_settlement(tenant_id, reservation_id)
-            }
+            ReservationStatus::Released => {}
             ReservationStatus::Active | ReservationStatus::Expired => {
                 tx.execute(
                     "UPDATE reservations SET status=?2 WHERE id=?1",
                     rusqlite::params![reservation_id.0, ReservationStatus::Released.as_sql()],
                 )?;
-                tx.commit()?;
-                drop(conn);
-                self.cancel_settlement(tenant_id, reservation_id)
             }
             ReservationStatus::Settled => {
-                tx.rollback().ok();
-                Err(BudgetError::ReservationNotActive {
+                return Err(BudgetError::ReservationNotActive {
                     reservation_id: reservation_id.0.clone(),
                     status: row.status,
-                })
+                });
             }
         }
+        tx.commit()?;
+        drop(conn);
+        drop(live);
+        drop(outcomes);
+        self.cancel_settlement(tenant_id, reservation_id)?;
+        self.settlements
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .execute(
+                "DELETE FROM pending_releases WHERE reservation_id=?1 AND tenant_id=?2",
+                rusqlite::params![reservation_id.0, tenant_id],
+            )?;
+        self.release_outcomes
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&reservation_id.0);
+        queue_error.map_or(Ok(()), Err)
     }
 }
 
@@ -1007,6 +1101,7 @@ struct ReservationRow {
     /// B-5: needed to cap a reservation's total lifetime across repeated
     /// `extend` calls.
     created_at_ms: i64,
+    actual_cost_minor: Option<i64>,
 }
 
 /// M2 (Opus Tier-2 acceptance): filters by `tenant_id` in the `WHERE`
@@ -1025,7 +1120,7 @@ fn find_reservation(
     let found = conn
         .query_row(
             "SELECT tenant_id, key_id, provider_id, model_id, period, reserved_minor, status, \
-                    expires_at_ms, tenant_period, created_at_ms \
+                    expires_at_ms, tenant_period, created_at_ms, actual_cost_minor \
              FROM reservations WHERE id = ?1 AND tenant_id = ?2",
             rusqlite::params![reservation_id.0, tenant_id],
             |r| {
@@ -1040,6 +1135,7 @@ fn find_reservation(
                     expires_at_ms: r.get(7)?,
                     tenant_period: r.get(8)?,
                     created_at_ms: r.get(9)?,
+                    actual_cost_minor: r.get(10)?,
                 })
             },
         )
@@ -1200,7 +1296,7 @@ fn has_active_reservations_for_scope(
     let exists: i64 = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM reservations \
          WHERE tenant_id=?1 AND key_id=?2 AND provider_id=?3 AND model_id=?4 \
-           AND status=?5 AND expires_at_ms > ?6)",
+           AND status=?5 AND (expires_at_ms > ?6 OR dispatch_hold=1))",
         rusqlite::params![
             scope.tenant_id,
             scope.key_id,
@@ -1256,7 +1352,7 @@ fn tenant_active_reserved_for(
 ) -> Result<i64, BudgetError> {
     conn.query_row(
         "SELECT COALESCE(SUM(reserved_minor), 0) FROM reservations \
-         WHERE tenant_id=?1 AND tenant_period=?2 AND status=?3 AND expires_at_ms > ?4",
+         WHERE tenant_id=?1 AND tenant_period=?2 AND status=?3 AND (expires_at_ms > ?4 OR dispatch_hold=1)",
         rusqlite::params![
             tenant_id,
             tenant_period,
@@ -1275,7 +1371,7 @@ fn has_active_reservations_for_tenant(
 ) -> Result<bool, BudgetError> {
     let exists: i64 = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM reservations \
-         WHERE tenant_id=?1 AND status=?2 AND expires_at_ms > ?3)",
+         WHERE tenant_id=?1 AND status=?2 AND (expires_at_ms > ?3 OR dispatch_hold=1))",
         rusqlite::params![tenant_id, ReservationStatus::Active.as_sql(), now_ms],
         |row| row.get(0),
     )?;
@@ -1309,7 +1405,7 @@ fn active_reserved_for(
     conn.query_row(
         "SELECT COALESCE(SUM(reserved_minor), 0) FROM reservations \
          WHERE tenant_id=?1 AND key_id=?2 AND provider_id=?3 AND model_id=?4 AND period=?5 \
-           AND status='active' AND expires_at_ms > ?6",
+           AND status='active' AND (expires_at_ms > ?6 OR dispatch_hold=1)",
         rusqlite::params![
             scope.tenant_id,
             scope.key_id,

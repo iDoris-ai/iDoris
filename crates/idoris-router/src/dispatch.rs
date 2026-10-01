@@ -197,8 +197,13 @@ impl ReservationGuard<'_> {
 
 impl Drop for ReservationGuard<'_> {
     fn drop(&mut self) {
-        if let (Some(ledger), Some(id)) = (self.ledger, self.id.take()) {
-            let _ = budget::release(ledger, self.tenant_id, &id);
+        if let (Some(ledger), Some(id)) = (self.ledger, self.id.take())
+            && let Err(err) = budget::release(ledger, self.tenant_id, &id)
+        {
+            eprintln!(
+                "budget reservation release deferred: reservation={} error={err}",
+                id.0
+            );
         }
     }
 }
@@ -646,6 +651,99 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn concurrent_paid_dispatches_succeed_for_same_and_different_tenants() {
+        for (first_tenant, second_tenant) in [("acme", "acme"), ("acme", "other")] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let ledger = BudgetLedger::open(dir.path().join("b.sqlite3")).unwrap();
+            for tenant in ["acme", "other"] {
+                ledger
+                    .configure_tenant(
+                        tenant,
+                        1_000_000,
+                        "UTC",
+                        idoris_tenancy::budget::SpendGate::PaidOnly,
+                    )
+                    .unwrap();
+            }
+            let adapter = Arc::new(MockAdapter::new(vec![ModelInfo {
+                id: "p".to_string(),
+                memory_gb: 1.0,
+            }]));
+            adapter.set_chat_delay("p", std::time::Duration::from_millis(100));
+            let supervisor = Supervisor::spawn(adapter, SupervisorConfig::default()).unwrap();
+            let cards = [paid_card("p")];
+            let first_profile = ParsedProfile {
+                tenant_id: Some(first_tenant.to_string()),
+                ..empty_profile()
+            };
+            let second_profile = ParsedProfile {
+                tenant_id: Some(second_tenant.to_string()),
+                ..empty_profile()
+            };
+            let mut first = Box::pin(dispatch_local(
+                &cards,
+                Some(&supervisor),
+                Some(&ledger),
+                &first_profile,
+                "hi",
+                vec![ChatMessage {
+                    role: "user".to_string(),
+                    content: "hi".to_string(),
+                }],
+                CancellationToken::new(),
+            ));
+            std::future::poll_fn(|cx| {
+                assert!(first.as_mut().poll(cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            let mut second = Box::pin(dispatch_local(
+                &cards,
+                Some(&supervisor),
+                Some(&ledger),
+                &second_profile,
+                "hi",
+                vec![ChatMessage {
+                    role: "user".to_string(),
+                    content: "hi".to_string(),
+                }],
+                CancellationToken::new(),
+            ));
+            let second_poll =
+                std::future::poll_fn(|cx| std::task::Poll::Ready(second.as_mut().poll(cx))).await;
+            assert!(
+                second_poll.is_pending(),
+                "second paid request must reserve and reach upstream while the first is in flight; got {second_poll:?}"
+            );
+
+            let (first_result, second_result) = tokio::join!(first, second);
+            let first_outcome = first_result.unwrap();
+            let second_outcome = second_result.unwrap();
+            assert!(first_outcome.result.is_ok());
+            assert!(second_outcome.result.is_ok());
+            let first_charge = first_outcome.actual_cost_minor.unwrap();
+            let second_charge = second_outcome.actual_cost_minor.unwrap();
+            assert!(first_charge > 0 && second_charge > 0);
+            assert_eq!(
+                ledger.tenant_balance(first_tenant).unwrap(),
+                1_000_000
+                    - first_charge
+                    - if first_tenant == second_tenant {
+                        second_charge
+                    } else {
+                        0
+                    }
+            );
+            if first_tenant != second_tenant {
+                assert_eq!(
+                    ledger.tenant_balance(second_tenant).unwrap(),
+                    1_000_000 - second_charge
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn failed_intent_prevents_upstream_dispatch_and_releases_reservation() {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("b.sqlite3");
@@ -729,7 +827,7 @@ mod tests {
             id: "p".to_string(),
             memory_gb: 1.0,
         }]));
-        adapter.set_chat_delay("p", std::time::Duration::from_millis(20));
+        adapter.set_chat_delay("p", std::time::Duration::from_millis(100));
         let supervisor = Supervisor::spawn(adapter, SupervisorConfig::default()).unwrap();
         let cards = [paid_card("p")];
         let profile = empty_profile();
@@ -897,9 +995,10 @@ mod tests {
     async fn busy_main_database_journals_and_recovers_the_charge() {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("b.sqlite3");
+        let clock = Arc::new(TestClock::default());
         let ledger = BudgetLedger::open_with_busy_timeout(
             &path,
-            Arc::new(idoris_tenancy::budget::SystemClock),
+            clock.clone(),
             1,
             std::time::Duration::ZERO,
         )
@@ -916,7 +1015,7 @@ mod tests {
             id: "p".to_string(),
             memory_gb: 1.0,
         }]));
-        adapter.set_chat_delay("p", std::time::Duration::from_millis(20));
+        adapter.set_chat_delay("p", std::time::Duration::from_millis(100));
         let supervisor = Supervisor::spawn(adapter, SupervisorConfig::default()).unwrap();
         let cards = [paid_card("p")];
         let profile = empty_profile();
@@ -932,11 +1031,12 @@ mod tests {
             }],
             CancellationToken::new(),
         ));
-        std::future::poll_fn(|cx| {
-            assert!(call.as_mut().poll(cx).is_pending());
-            std::task::Poll::Ready(())
-        })
-        .await;
+        let call_poll =
+            std::future::poll_fn(|cx| std::task::Poll::Ready(call.as_mut().poll(cx))).await;
+        assert!(
+            call_poll.is_pending(),
+            "expected request to remain in flight: {call_poll:?}"
+        );
         let blocker = rusqlite::Connection::open(&path).unwrap();
         blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
         let outcome = call.await.unwrap();
@@ -963,8 +1063,9 @@ mod tests {
         );
         drop(ledger);
         blocker.execute_batch("ROLLBACK").unwrap();
+        clock.0.store(2, Ordering::SeqCst);
         for _ in 0..2 {
-            let recovered = BudgetLedger::open(&path).unwrap();
+            let recovered = BudgetLedger::open_with(&path, clock.clone(), 1).unwrap();
             assert_eq!(
                 recovered
                     .tenant_balance(budget::PERSONAL_TENANT_ID)
@@ -1032,5 +1133,125 @@ mod tests {
         );
         // The same token the Supervisor/adapter call received is cancelled.
         assert!(cancel.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn cancelled_release_under_main_db_lock_is_retried_by_live_worker() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("b.sqlite3");
+        let ledger = Arc::new(
+            BudgetLedger::open_with_busy_timeout(
+                &path,
+                Arc::new(idoris_tenancy::budget::SystemClock),
+                60_000,
+                std::time::Duration::ZERO,
+            )
+            .unwrap(),
+        );
+        ledger
+            .configure_tenant(
+                budget::PERSONAL_TENANT_ID,
+                1_000_000,
+                "UTC",
+                idoris_tenancy::budget::SpendGate::PaidOnly,
+            )
+            .unwrap();
+        let (_app, mut retries) = crate::build_observed_app(crate::AppState {
+            budget_ledger: Some(ledger.clone()),
+            ..crate::AppState::default()
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(3), retries.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+
+        let adapter = Arc::new(MockAdapter::new(vec![ModelInfo {
+            id: "p".to_string(),
+            memory_gb: 1.0,
+        }]));
+        adapter.set_chat_delay("p", std::time::Duration::from_secs(5));
+        let supervisor = Supervisor::spawn(adapter, SupervisorConfig::default()).unwrap();
+        let cards = [paid_card("p")];
+        let profile = empty_profile();
+        let mut call = Box::pin(dispatch_local(
+            &cards,
+            Some(&supervisor),
+            Some(&ledger),
+            &profile,
+            "hi",
+            vec![ChatMessage {
+                role: "user".to_string(),
+                content: "hi".to_string(),
+            }],
+            CancellationToken::new(),
+        ));
+        std::future::poll_fn(|cx| {
+            assert!(call.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        let blocker = rusqlite::Connection::open(&path).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+        drop(call);
+
+        let err = tokio::time::timeout(std::time::Duration::from_secs(3), retries.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            err.is_err(),
+            "worker should report the locked-main-db retry failure"
+        );
+        let main = rusqlite::Connection::open(&path).unwrap();
+        let active: i64 = main
+            .query_row(
+                "SELECT count(*) FROM reservations WHERE status='active'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(active, 1);
+        drop(main);
+        blocker.execute_batch("ROLLBACK").unwrap();
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if retries
+                    .recv()
+                    .await
+                    .expect("worker stopped before recovery")
+                    .is_ok()
+                {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("worker should automatically retry the known release");
+        assert_eq!(
+            ledger.tenant_balance(budget::PERSONAL_TENANT_ID).unwrap(),
+            1_000_000
+        );
+        let main = rusqlite::Connection::open(&path).unwrap();
+        let released: i64 = main
+            .query_row(
+                "SELECT count(*) FROM reservations WHERE status='released'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(released, 1);
+        drop(main);
+        let journal =
+            rusqlite::Connection::open(path.with_added_extension("settlements.sqlite3")).unwrap();
+        let intents: i64 = journal
+            .query_row("SELECT count(*) FROM settlement_intents", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(intents, 0);
+        let id = budget::reserve(&ledger, None, "p", 500).unwrap();
+        budget::release(&ledger, None, &id).unwrap();
     }
 }
