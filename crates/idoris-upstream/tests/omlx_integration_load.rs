@@ -24,16 +24,19 @@
 //!   load request (or a Supervisor load task that outlived its handle) may
 //!   still finish server-side; if that never settles, the test reports the
 //!   cleanup as incomplete rather than claiming the model is gone.
-//! - After a normal phase failure, cleanup's own `Ok` can be trusted: every
-//!   operation the phase ran was awaited to completion, so nothing is left
-//!   running behind it. After a lifecycle *timeout*, that is not true — the
-//!   dropped phase future may have left a `Supervisor` load flow spawned as
-//!   an independent task, or an oMLX `POST .../load` already sent and still
-//!   completing server-side, neither of which `cleanup`'s own checks are
-//!   guaranteed to observe in time. So on a timeout, cleanup still runs
-//!   best-effort, but the test always reports it as **unconfirmed** rather
-//!   than treating a cleanup `Ok` as proof the model (and nothing else) is
-//!   settled.
+//! - Cleanup's own `Ok` is trusted only after a phase **fully succeeds**:
+//!   every operation it ran — including its own unload and verification —
+//!   was awaited to completion, so nothing is left running behind it. After
+//!   a phase `Err` *or* a lifecycle timeout, that is not true: a single HTTP
+//!   call can fail on the adapter's own per-call timeout (shorter than the
+//!   lifecycle timeout) while the oMLX server keeps processing it — an
+//!   in-flight `POST .../load` can complete after cleanup already read "not
+//!   loading, not loaded" — and a dropped phase future can likewise leave a
+//!   `Supervisor` load flow spawned as an independent task. `.await`
+//!   returning, successfully or not, never proves the server-side request is
+//!   done. So after either kind of failure, cleanup still runs best-effort,
+//!   but the test always reports it as **unconfirmed** rather than treating
+//!   a cleanup `Ok` as proof the model (and nothing else) is settled.
 //!
 //! Run on workstation A (see `docs/agent/COLLAB.md`):
 //! ```text
@@ -210,30 +213,38 @@ async fn cleanup(env: &Env) -> Outcome {
 
 /// Runs `phase` under the lifecycle timeout, then always cleans up.
 ///
-/// On a normal (non-timeout) outcome, behavior is as before: the phase's own
-/// failure is reported first, cleanup's failure second, and a plain cleanup
-/// `Ok` is trusted because every operation the phase ran was awaited to
-/// completion. On a *timeout*, the phase future is dropped while work it
-/// started (a Supervisor load flow spawned as an independent task, or an
-/// in-flight `POST .../load`) may still be running server-side, so cleanup
-/// only ever runs best-effort there and the test always fails and says so —
-/// it never reports success, or a plain cleanup `Ok`, after a timeout.
+/// Cleanup is trusted — a plain `Ok` is taken as proof the model (and
+/// nothing else) is settled — only when the phase returns `Ok(Ok(()))`:
+/// every operation it ran, including its own unload and verification, was
+/// awaited to completion, so nothing is left running behind it. After a
+/// phase `Err` *or* a lifecycle timeout, that guarantee does not hold: a
+/// single HTTP call can fail on the adapter's own per-call timeout (`CALL`,
+/// shorter than `LIFECYCLE`) while the oMLX server keeps processing it — an
+/// in-flight `POST .../load` can complete after cleanup already read "not
+/// loading, not loaded" — and a dropped timed-out phase future can likewise
+/// leave a `Supervisor` load flow spawned as an independent task. `.await`
+/// returning, successfully or not, never proves the server-side request is
+/// done. So in both failure cases cleanup still runs best-effort, but the
+/// test always panics and reports cleanup as **unconfirmed** rather than
+/// trusting a plain cleanup `Ok`.
 async fn run_phase(env: &Env, name: &str, phase: impl std::future::Future<Output = Outcome>) {
     match timeout(LIFECYCLE, phase).await {
-        Ok(outcome) => {
+        Ok(Ok(())) => {
             let cleaned = cleanup(env).await;
-            if let Err(err) = outcome {
-                panic!("{name}: {err} (cleanup: {cleaned:?})");
-            }
             cleaned.unwrap_or_else(|err| panic!("{name}: {err}"));
         }
-        Err(_) => {
+        other => {
+            let reason = match other {
+                Ok(Err(err)) => err,
+                _ => format!("timed out after {LIFECYCLE:?}"),
+            };
             let cleaned = cleanup(env).await;
             panic!(
-                "{name}: phase timed out after {LIFECYCLE:?}; best-effort cleanup returned \
-                 {cleaned:?}, but work started by the phase (a Supervisor load flow or an \
-                 in-flight POST /load) may still be running — cleanup is NOT confirmed, check \
-                 the oMLX instance by hand"
+                "{name}: {reason}; best-effort cleanup returned {cleaned:?} — a failed or \
+                 timed-out phase may have left a load in flight server-side (the adapter's own \
+                 per-call timeout can return before an oMLX POST /load finishes, or a Supervisor \
+                 load flow may still be running as an independent task) — cleanup is NOT \
+                 confirmed, check the oMLX instance by hand"
             );
         }
     }
