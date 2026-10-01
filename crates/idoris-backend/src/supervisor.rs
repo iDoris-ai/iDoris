@@ -143,8 +143,7 @@ enum LoadFailureOutcome {
     /// A definite rejection leaves the previous instance's state, policy,
     /// and footprint untouched.
     RestorePrevious(PreviousModel),
-    /// Release is unconfirmed after allocation may have happened. Keep the previous
-    /// policy and conservatively account for the larger known footprint.
+    /// An uncertain release keeps Error and the larger footprint.
     RetainPreviousOnError(PreviousModel),
 }
 
@@ -846,6 +845,14 @@ fn handle_load(
         let _ = reply.send(Ok(()));
         return;
     }
+    if models.get(&id).is_some_and(|slot| slot.inflight != 0) {
+        let _ = reply.send(Err(BackendError::busy(
+            "model has chats in flight",
+            Some(id),
+            None,
+        )));
+        return;
+    }
     if let Some(active) = active_op.as_ref() {
         let _ = reply.send(Err(BackendError::busy(
             "a different id currently holds the load/evict/unload mutex",
@@ -875,14 +882,6 @@ fn handle_load(
     }
 
     let last_used_seq = models.get(&id).map_or(0, |s| s.last_used_seq);
-    // Carried forward, not reset to 0: a policy-changing reload of a
-    // currently-Ready model with chats still in flight against its
-    // previous instance must not let `ChatDone` underflow the fresh
-    // slot's counter once those in-flight calls finish (see
-    // `ActorMsg::ChatDone`'s `saturating_sub`, the other half of this
-    // safety net). Blocking such a reload until drained is a further
-    // improvement left for later — not required to avoid the underflow.
-    let inflight = models.get(&id).map_or(0, |s| s.inflight);
     // Capture every budget-occupying state before overwriting the slot:
     // an Error retry is not a fresh load (K10/H2).
     let previous = models
@@ -900,7 +899,7 @@ fn handle_load(
             state: ModelState::Launching,
             last_used_seq,
             policy,
-            inflight,
+            inflight: 0,
         },
     );
     *active_op = Some(ActiveOp {
@@ -1238,25 +1237,21 @@ async fn run_actor(
                                     violation = Some(e);
                                 }
                             }
-                            LoadFailureOutcome::RestorePrevious(previous) => {
+                            LoadFailureOutcome::RestorePrevious(mut previous)
+                            | LoadFailureOutcome::RetainPreviousOnError(mut previous) => {
                                 match models.get_mut(&id) {
                                     Some(slot) => {
+                                        if matches!(
+                                            failure_outcome,
+                                            LoadFailureOutcome::RetainPreviousOnError(_)
+                                        ) {
+                                            previous.state = ModelState::Error;
+                                            previous.memory_gb =
+                                                slot.memory_gb.max(previous.memory_gb);
+                                        }
                                         slot.state = previous.state;
                                         slot.policy = previous.policy;
                                         slot.memory_gb = previous.memory_gb;
-                                    }
-                                    None => {
-                                        violation =
-                                            Some(format!("ledger lost {id:?} mid-op (reload)"));
-                                    }
-                                }
-                            }
-                            LoadFailureOutcome::RetainPreviousOnError(previous) => {
-                                match models.get_mut(&id) {
-                                    Some(slot) => {
-                                        slot.state = ModelState::Error;
-                                        slot.policy = previous.policy;
-                                        slot.memory_gb = slot.memory_gb.max(previous.memory_gb);
                                     }
                                     None => {
                                         violation =
@@ -2426,72 +2421,61 @@ mod tests {
     /// and keep a later unload from short-circuiting while it is still resident.
     #[tokio::test]
     async fn error_retry_rejection_preserves_old_occupancy_and_real_unload() {
-        let adapter = Arc::new(MockAdapter::new(vec![
-            ModelInfo {
-                id: "a".to_string(),
-                memory_gb: 8.0,
-            },
-            ModelInfo {
-                id: "b".to_string(),
-                memory_gb: 20.0,
-            },
-        ]));
-        let handle = Supervisor::spawn(adapter.clone(), SupervisorConfig::default()).unwrap();
-        no_hang(handle.load("a", 8.0, resident_policy()))
-            .await
-            .unwrap();
-        adapter.set_unload_script("a", vec![crate::mock::UnloadOutcome::Fail]);
-        no_hang(handle.unload("a")).await.unwrap_err();
-        assert_eq!(handle.status().await.unwrap().used_gb, 8.0);
-        adapter.set_load_script("a", vec![crate::mock::LoadOutcome::Fail]);
-        no_hang(handle.load("a", 1.0, on_demand_policy()))
-            .await
-            .unwrap_err();
-        assert_eq!(adapter.status().await.unwrap().used_gb, 8.0);
-        assert_eq!(handle.status().await.unwrap().used_gb, 8.0);
-        let err = no_hang(handle.chat(
-            ChatRequest {
-                model: "a".to_string(),
-                messages: vec![],
-            },
-            CancellationToken::new(),
-        ))
-        .await
-        .unwrap_err();
-        assert_eq!(err.reason_code(), "model_unavailable");
-        assert_eq!(adapter.load_call_count("a"), 2);
-        let err = no_hang(handle.load("b", 20.0, on_demand_policy()))
+        for recover_via_load in [false, true] {
+            let adapter = Arc::new(MockAdapter::new(vec![
+                ModelInfo {
+                    id: "a".to_string(),
+                    memory_gb: 8.0,
+                },
+                ModelInfo {
+                    id: "b".to_string(),
+                    memory_gb: 20.0,
+                },
+            ]));
+            let handle = Supervisor::spawn(adapter.clone(), SupervisorConfig::default()).unwrap();
+            no_hang(handle.load("a", 8.0, resident_policy()))
+                .await
+                .unwrap();
+            adapter.set_unload_script("a", vec![crate::mock::UnloadOutcome::Fail]);
+            no_hang(handle.unload("a")).await.unwrap_err();
+            assert_eq!(handle.status().await.unwrap().used_gb, 8.0);
+            adapter.set_load_script("a", vec![crate::mock::LoadOutcome::Fail]);
+            no_hang(handle.load("a", 1.0, on_demand_policy()))
+                .await
+                .unwrap_err();
+            assert_eq!(adapter.status().await.unwrap().used_gb, 8.0);
+            assert_eq!(handle.status().await.unwrap().used_gb, 8.0);
+            let err = no_hang(handle.chat(
+                ChatRequest {
+                    model: "a".to_string(),
+                    messages: vec![],
+                },
+                CancellationToken::new(),
+            ))
             .await
             .unwrap_err();
-        assert_eq!(err.reason_code(), "eviction_impossible");
-        assert_eq!(adapter.load_call_count("b"), 0);
-        assert_eq!(adapter.unload_call_count("a"), 1);
-        no_hang(handle.unload("a")).await.unwrap();
-        assert_eq!(adapter.unload_call_count("a"), 2);
-        assert_eq!(adapter.status().await.unwrap().used_gb, 0.0);
-        assert_eq!(handle.status().await.unwrap().used_gb, 0.0);
-    }
-
-    /// Positive contrast: a successful retry accepts the new estimate and
-    /// becomes Ready, so preserving an Error entry does not prevent recovery.
-    #[tokio::test]
-    async fn error_retry_success_updates_occupancy_and_becomes_ready() {
-        let adapter = Arc::new(MockAdapter::new(catalog()));
-        let handle = Supervisor::spawn(adapter.clone(), SupervisorConfig::default()).unwrap();
-        no_hang(handle.load("a", 8.0, resident_policy()))
-            .await
-            .unwrap();
-        adapter.set_unload_script("a", vec![crate::mock::UnloadOutcome::Fail]);
-        no_hang(handle.unload("a")).await.unwrap_err();
-        no_hang(handle.load("a", 4.0, on_demand_policy()))
-            .await
-            .unwrap();
-        let status = handle.status().await.unwrap();
-        assert_eq!(status.used_gb, 4.0);
-        assert_eq!(status.loaded, vec!["a".to_string()]);
-        no_hang(handle.unload("a")).await.unwrap();
-        assert_eq!(adapter.unload_call_count("a"), 2);
-        assert_eq!(handle.status().await.unwrap().used_gb, 0.0);
+            assert_eq!(err.reason_code(), "model_unavailable");
+            assert_eq!(adapter.load_call_count("a"), 2);
+            let err = no_hang(handle.load("b", 20.0, on_demand_policy()))
+                .await
+                .unwrap_err();
+            assert_eq!(err.reason_code(), "eviction_impossible");
+            assert_eq!(adapter.load_call_count("b"), 0);
+            assert_eq!(adapter.unload_call_count("a"), 1);
+            if recover_via_load {
+                adapter.set_load_script("a", vec![crate::mock::LoadOutcome::Ok]);
+                no_hang(handle.load("a", 4.0, on_demand_policy()))
+                    .await
+                    .unwrap();
+                let status = handle.status().await.unwrap();
+                assert_eq!(status.used_gb, 4.0);
+                assert_eq!(status.loaded, vec!["a".to_string()]);
+            }
+            no_hang(handle.unload("a")).await.unwrap();
+            assert_eq!(adapter.unload_call_count("a"), 2);
+            assert_eq!(adapter.status().await.unwrap().used_gb, 0.0);
+            assert_eq!(handle.status().await.unwrap().used_gb, 0.0);
+        }
     }
 
     /// K10/H2: a panic during an Error retry also leaves release uncertain.
@@ -2499,12 +2483,12 @@ mod tests {
     async fn error_retry_panic_preserves_old_occupancy() {
         let handle =
             Supervisor::spawn(Arc::new(PanickingAdapter), SupervisorConfig::default()).unwrap();
-        for memory_gb in [8.0, 1.0] {
+        for (memory_gb, expected) in [(8.0, 8.0), (1.0, 8.0), (16.0, 16.0)] {
             let err = no_hang(handle.load("a", memory_gb, on_demand_policy()))
                 .await
                 .unwrap_err();
             assert_eq!(err.reason_code(), "adapter_panicked");
-            assert_eq!(handle.status().await.unwrap().used_gb, 8.0);
+            assert_eq!(handle.status().await.unwrap().used_gb, expected);
         }
         no_hang(handle.unload("a")).await.unwrap();
         assert_eq!(handle.status().await.unwrap().used_gb, 0.0);
@@ -2717,14 +2701,12 @@ mod tests {
     async fn error_retry_probe_failure_preserves_old_occupancy() {
         let adapter = Arc::new(ProbeAlwaysFailsAdapter { unload_ok: false });
         let handle = Supervisor::spawn(adapter, SupervisorConfig::default()).unwrap();
-        no_hang(handle.load("a", 8.0, on_demand_policy()))
-            .await
-            .unwrap_err();
-        assert_eq!(handle.status().await.unwrap().used_gb, 8.0);
-        no_hang(handle.load("a", 1.0, resident_policy()))
-            .await
-            .unwrap_err();
-        assert_eq!(handle.status().await.unwrap().used_gb, 8.0);
+        for (memory_gb, expected) in [(8.0, 8.0), (1.0, 8.0), (16.0, 16.0)] {
+            no_hang(handle.load("a", memory_gb, on_demand_policy()))
+                .await
+                .unwrap_err();
+            assert_eq!(handle.status().await.unwrap().used_gb, expected);
+        }
     }
 
     /// A minimal `RuntimeAdapter` whose `load` reports
@@ -2734,6 +2716,9 @@ mod tests {
     struct LoadUnconfirmedAdapter {
         unload_ok: bool,
         unload_calls: std::sync::atomic::AtomicU32,
+        ready_once: std::sync::atomic::AtomicBool,
+        chat_entered: tokio::sync::Notify,
+        release_chat: tokio::sync::Notify,
     }
 
     impl LoadUnconfirmedAdapter {
@@ -2741,6 +2726,9 @@ mod tests {
             Self {
                 unload_ok,
                 unload_calls: std::sync::atomic::AtomicU32::new(0),
+                ready_once: std::sync::atomic::AtomicBool::new(false),
+                chat_entered: tokio::sync::Notify::new(),
+                release_chat: tokio::sync::Notify::new(),
             }
         }
     }
@@ -2751,6 +2739,12 @@ mod tests {
             Ok(catalog())
         }
         async fn load(&self, id: &str, _policy: Option<&LoadPolicy>) -> Result<(), BackendError> {
+            if self
+                .ready_once
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Ok(());
+            }
             Err(BackendError::load_unconfirmed(
                 id,
                 "status check after POST load failed (test double)",
@@ -2783,11 +2777,56 @@ mod tests {
             req: ChatRequest,
             _cancel: CancellationToken,
         ) -> Result<ChatResponse, BackendError> {
+            self.chat_entered.notify_one();
+            self.release_chat.notified().await;
             Ok(ChatResponse {
                 model: req.model,
                 content: String::new(),
             })
         }
+    }
+
+    #[tokio::test]
+    async fn ready_reload_cannot_release_a_model_with_inflight_chat() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let adapter = Arc::new(LoadUnconfirmedAdapter::new(true));
+        adapter.ready_once.store(true, SeqCst);
+        let handle = Supervisor::spawn(adapter.clone(), SupervisorConfig::default()).unwrap();
+        no_hang(handle.load("a", 8.0, on_demand_policy()))
+            .await
+            .unwrap();
+        let h = handle.clone();
+        let chat = tokio::spawn(async move {
+            h.chat(
+                ChatRequest {
+                    model: "a".into(),
+                    messages: vec![],
+                },
+                CancellationToken::new(),
+            )
+            .await
+        });
+        no_hang(adapter.chat_entered.notified()).await;
+        no_hang(handle.load("a", 8.0, on_demand_policy()))
+            .await
+            .unwrap();
+        let err = no_hang(handle.load("a", 1.0, resident_policy()))
+            .await
+            .unwrap_err();
+        assert_eq!(adapter.unload_calls.load(SeqCst), 0);
+        assert_eq!(err.reason_code(), "supervisor_busy");
+        assert!(!chat.is_finished());
+        let status = handle.status().await.unwrap();
+        assert_eq!(status.used_gb, 8.0);
+        assert_eq!(status.loaded, vec!["a"]);
+        adapter.release_chat.notify_one();
+        no_hang(chat).await.unwrap().unwrap();
+        let err = no_hang(handle.load("a", 1.0, resident_policy()))
+            .await
+            .unwrap_err();
+        assert_eq!(err.reason_code(), "load_unconfirmed");
+        assert_eq!(adapter.unload_calls.load(SeqCst), 1);
+        assert_eq!(handle.status().await.unwrap().used_gb, 0.0);
     }
 
     /// prdaemon #48 round 2, M1: a load the engine accepted but whose
