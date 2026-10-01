@@ -140,6 +140,9 @@ enum LoadFailureOutcome {
     /// Land on this state, keeping whatever policy/memory_gb `handle_load`
     /// already wrote into the slot.
     Settle(ModelState),
+    /// A failed cleanup after replacing a Ready model must retain at least
+    /// the old instance's footprint; the actor applies `max` with the new estimate.
+    SettleWithMemory { state: ModelState, memory_gb: f64 },
     /// This was a reload of a previously-`Ready` model — restore that old
     /// state instead of guessing `Stopped`/`Error` (Medium, follow-up Opus
     /// review; prdaemon-observed: 6 GiB budget, engine actually still
@@ -192,6 +195,14 @@ enum ActiveKind {
 struct ActiveOp {
     id: String,
     kind: ActiveKind,
+}
+
+#[derive(Clone, Copy)]
+struct ReleaseLimits {
+    /// Ledger total excluding the requested target and selected victims.
+    target_absent_gb: f64,
+    /// Same remainder plus the old Ready target, which may survive eviction.
+    after_eviction_gb: f64,
 }
 
 /// A cheaply-`Clone`-able front door to a running [`Supervisor`]. Every
@@ -487,9 +498,9 @@ async fn run_load_flow(
     config: SupervisorConfig,
     id: String,
     policy: LoadPolicy,
-    memory_gb: f64,
     evict: Vec<String>,
-    was_ready: Option<(LoadPolicy, f64)>,
+    mut was_ready: Option<(LoadPolicy, f64)>,
+    release_limits: ReleaseLimits,
 ) -> OpOutcome {
     // Every chosen victim gets an actual unload attempt, even after an
     // earlier one fails: `OpDone` only resolves ids present in
@@ -510,9 +521,14 @@ async fn run_load_flow(
         victim_results.push((victim, result));
     }
     if !targets.is_empty()
-        && confirm_memory_released(&adapter, &targets, config.budget_gb - memory_gb, &config)
-            .await
-            .is_err()
+        && confirm_memory_released(
+            &adapter,
+            &targets,
+            release_limits.after_eviction_gb,
+            &config,
+        )
+        .await
+        .is_err()
     {
         // Keep all selected victims charged until the whole release is confirmed.
         for (_, result) in &mut victim_results {
@@ -522,7 +538,15 @@ async fn run_load_flow(
     }
     if eviction_failed {
         let err = BackendError::eviction_failed(&id);
-        let failure_outcome = resolve_load_failure(&adapter, &id, &err, was_ready, &config).await;
+        let failure_outcome = resolve_load_failure(
+            &adapter,
+            &id,
+            &err,
+            was_ready,
+            release_limits.target_absent_gb,
+            &config,
+        )
+        .await;
         return OpOutcome::Load {
             result: Err(err),
             victim_results,
@@ -544,19 +568,23 @@ async fn run_load_flow(
         if confirm_memory_released(
             &adapter,
             std::slice::from_ref(&id),
-            config.budget_gb - memory_gb,
+            release_limits.target_absent_gb,
             &config,
         )
         .await
         .is_err()
         {
-            let state = best_effort_release(&adapter, &id, &config).await;
+            let state =
+                best_effort_release(&adapter, &id, release_limits.target_absent_gb, &config).await;
             return OpOutcome::Load {
                 result: attempt,
                 victim_results,
-                failure_outcome: LoadFailureOutcome::Settle(state),
+                failure_outcome: settle_after_cleanup(state, was_ready),
             };
         }
+        // The old instance is now confirmed absent, so subsequent retry
+        // failures must not restore its former Ready ledger entry.
+        was_ready = None;
         tokio::time::sleep(config.oom_retry_backoff).await;
         attempt = with_adapter_timeout(
             adapter.load(&id, Some(&policy)),
@@ -566,7 +594,15 @@ async fn run_load_flow(
         .await;
     }
     if let Err(err) = attempt {
-        let failure_outcome = resolve_load_failure(&adapter, &id, &err, was_ready, &config).await;
+        let failure_outcome = resolve_load_failure(
+            &adapter,
+            &id,
+            &err,
+            was_ready,
+            release_limits.target_absent_gb,
+            &config,
+        )
+        .await;
         return OpOutcome::Load {
             result: Err(err),
             victim_results,
@@ -590,20 +626,22 @@ async fn run_load_flow(
                 // (unlike the two branches above) a reload's *old* instance
                 // is not assumed to still be untouched — confirm via
                 // best-effort release the same way a fresh load would.
-                let state = best_effort_release(&adapter, &id, &config).await;
+                let state =
+                    best_effort_release(&adapter, &id, release_limits.target_absent_gb, &config)
+                        .await;
                 return OpOutcome::Load {
                     result: Err(err),
                     victim_results,
-                    failure_outcome: LoadFailureOutcome::Settle(state),
+                    failure_outcome: settle_after_cleanup(state, was_ready),
                 };
             }
         }
     }
-    let state = best_effort_release(&adapter, &id, &config).await;
+    let state = best_effort_release(&adapter, &id, release_limits.target_absent_gb, &config).await;
     OpOutcome::Load {
         result: Err(BackendError::probe_timed_out(id.clone())),
         victim_results,
-        failure_outcome: LoadFailureOutcome::Settle(state),
+        failure_outcome: settle_after_cleanup(state, was_ready),
     }
 }
 
@@ -615,18 +653,35 @@ async fn run_load_flow(
 async fn best_effort_release(
     adapter: &Arc<dyn RuntimeAdapter>,
     id: &str,
+    max_used_gb: f64,
     config: &SupervisorConfig,
 ) -> ModelState {
     if with_adapter_timeout(adapter.unload(id), config.adapter_call_timeout, id)
         .await
         .is_ok()
-        && confirm_memory_released(adapter, &[id.to_string()], config.budget_gb, config)
+        && confirm_memory_released(adapter, &[id.to_string()], max_used_gb, config)
             .await
             .is_ok()
     {
         ModelState::Stopped
     } else {
         ModelState::Error
+    }
+}
+
+fn settle_after_cleanup(
+    state: ModelState,
+    was_ready: Option<(LoadPolicy, f64)>,
+) -> LoadFailureOutcome {
+    if state == ModelState::Error
+        && let Some((_, old_memory_gb)) = was_ready
+    {
+        LoadFailureOutcome::SettleWithMemory {
+            state,
+            memory_gb: old_memory_gb,
+        }
+    } else {
+        LoadFailureOutcome::Settle(state)
     }
 }
 
@@ -647,6 +702,7 @@ async fn resolve_load_failure(
     id: &str,
     err: &BackendError,
     was_ready: Option<(LoadPolicy, f64)>,
+    release_limit_gb: f64,
     config: &SupervisorConfig,
 ) -> LoadFailureOutcome {
     if let Some((policy, memory_gb)) = was_ready {
@@ -656,7 +712,10 @@ async fn resolve_load_failure(
         err,
         BackendError::AdapterTimedOut { .. } | BackendError::LoadUnconfirmed { .. }
     ) {
-        LoadFailureOutcome::Settle(best_effort_release(adapter, id, config).await)
+        settle_after_cleanup(
+            best_effort_release(adapter, id, release_limit_gb, config).await,
+            was_ready,
+        )
     } else {
         LoadFailureOutcome::Settle(ModelState::Stopped)
     }
@@ -694,6 +753,14 @@ fn build_snapshot(models: &HashMap<String, ModelSlot>, budget_gb: f64, exclude: 
     }
 }
 
+fn ledger_used_except(models: &HashMap<String, ModelSlot>, exclude: &str) -> f64 {
+    models
+        .iter()
+        .filter(|(id, slot)| id.as_str() != exclude && occupies_budget(slot.state))
+        .map(|(_, slot)| slot.memory_gb)
+        .sum()
+}
+
 /// `InsufficientCapacity` is a real, expected admission outcome
 /// (`eviction_impossible`); the other two variants mean the Supervisor
 /// handed `plan_eviction` a contract-violating input of its own making
@@ -725,7 +792,21 @@ fn start_load(
     env: &Env<'_>,
 ) {
     set_state_or_panic(models, &id, ModelState::Loading);
-    let memory_gb = models.get(&id).map_or(f64::INFINITY, |slot| slot.memory_gb);
+    let previous_memory_gb = was_ready.map_or(0.0, |(_, memory_gb)| memory_gb);
+    let evicted_ids: std::collections::HashSet<&str> = evict.iter().map(String::as_str).collect();
+    let release_limit_gb: f64 = models
+        .iter()
+        .filter(|(model_id, slot)| {
+            model_id.as_str() != id
+                && !evicted_ids.contains(model_id.as_str())
+                && occupies_budget(slot.state)
+        })
+        .map(|(_, slot)| slot.memory_gb)
+        .sum();
+    let release_limits = ReleaseLimits {
+        target_absent_gb: release_limit_gb,
+        after_eviction_gb: release_limit_gb + previous_memory_gb,
+    };
     let adapter = env.adapter.clone();
     let config = env.config.clone();
     let self_tx = env.self_tx.clone();
@@ -747,9 +828,9 @@ fn start_load(
             config,
             id_for_task.clone(),
             policy,
-            memory_gb,
             evict,
             was_ready,
+            release_limits,
         ));
         let outcome = match inner.await {
             Ok(outcome) => outcome,
@@ -921,7 +1002,7 @@ fn handle_load(
 }
 
 /// Standalone unloads also confirm release before freeing ledger capacity.
-fn start_unload(id: String, env: &Env<'_>) {
+fn start_unload(id: String, max_used_gb: f64, env: &Env<'_>) {
     let adapter = env.adapter.clone();
     let self_tx = env.self_tx.clone();
     let config = env.config.clone();
@@ -935,7 +1016,7 @@ fn start_unload(id: String, env: &Env<'_>) {
                 &id_for_inner,
             )
             .await?;
-            confirm_memory_released(&adapter, &[id_for_inner], config.budget_gb, &config).await
+            confirm_memory_released(&adapter, &[id_for_inner], max_used_gb, &config).await
         });
         let result = match inner.await {
             Ok(result) => result,
@@ -1016,7 +1097,8 @@ fn handle_unload(
         },
     });
     if inflight == 0 {
-        start_unload(id, env);
+        let max_used_gb = ledger_used_except(models, &id);
+        start_unload(id, max_used_gb, env);
     }
 }
 
@@ -1246,6 +1328,13 @@ async fn run_actor(
                                     violation = Some(e);
                                 }
                             }
+                            LoadFailureOutcome::SettleWithMemory { state, memory_gb } => {
+                                if let Err(e) = set_state_or_poison(&mut models, &id, state) {
+                                    violation = Some(e);
+                                } else if let Some(slot) = models.get_mut(&id) {
+                                    slot.memory_gb = slot.memory_gb.max(memory_gb);
+                                }
+                            }
                             LoadFailureOutcome::RestorePreviousReady { policy, memory_gb } => {
                                 match models.get_mut(&id) {
                                     Some(slot) => {
@@ -1306,7 +1395,8 @@ async fn run_actor(
                             && !*started
                         {
                             *started = true;
-                            start_unload(model, &env);
+                            let max_used_gb = ledger_used_except(&models, &model);
+                            start_unload(model, max_used_gb, &env);
                         }
                     }
                     None => poisoned = Some(format!("ledger has no entry for {model:?}")),
