@@ -140,9 +140,12 @@ enum LoadFailureOutcome {
     /// Land on this state, keeping whatever policy/memory_gb `handle_load`
     /// already wrote into the slot.
     Settle(ModelState),
-    /// A failed retry cannot discard a previous resident or uncertain
-    /// instance's state, policy, or footprint without a successful release.
+    /// A definite rejection leaves the previous instance's state, policy,
+    /// and footprint untouched.
     RestorePrevious(PreviousModel),
+    /// Release is unconfirmed after allocation may have happened. Keep the previous
+    /// policy and conservatively account for the larger known footprint.
+    RetainPreviousOnError(PreviousModel),
 }
 
 #[derive(Clone, Copy)]
@@ -153,13 +156,11 @@ struct PreviousModel {
 }
 
 impl LoadFailureOutcome {
-    /// Failed cleanup leaves the old footprint occupied, even if the retry
-    /// supplied a smaller estimate. The state stays Error, never Ready.
+    /// Unconfirmed release retains the larger of the old and retry estimates.
+    /// The state stays Error, never Ready.
     fn after_release(state: ModelState, previous: Option<PreviousModel>) -> Self {
         match previous {
-            Some(previous) if occupies_budget(state) => {
-                Self::RestorePrevious(PreviousModel { state, ..previous })
-            }
+            Some(previous) if occupies_budget(state) => Self::RetainPreviousOnError(previous),
             _ => Self::Settle(state),
         }
     }
@@ -489,11 +490,11 @@ async fn confirm_memory_released(
 /// never actually resident, and a *different* future load could then fail
 /// with a misleading `eviction_impossible` (no viable plan) when the real
 /// problem is a stuck, never-cleaned-up ledger entry. Those two cases
-/// settle on `Stopped` instead. Only a `probe_ready` failure/timeout is
-/// genuinely ambiguous (the `load` call itself DID succeed) — there, a
-/// best-effort `unload` is attempted first; `Stopped` if that confirms
-/// release, `Error` (occupying budget, matching `occupies_budget`'s
-/// documented conservatism) only if even that fails.
+/// settle a fresh load on `Stopped`, or restore a retry's previous slot.
+/// A load timeout, `LoadUnconfirmed`, or `probe_ready` failure/timeout
+/// may leave memory allocated — attempt a best-effort `unload` first.
+/// Successful release settles on `Stopped`; failure keeps `Error` and
+/// the larger of the previous and current estimates.
 async fn run_load_flow(
     adapter: Arc<dyn RuntimeAdapter>,
     config: SupervisorConfig,
@@ -640,7 +641,7 @@ async fn best_effort_release(
 
 /// A rejected retry restores any previous budget-occupying state, including
 /// Error (K10/H2). Only a fresh load may treat an explicit rejection as free.
-/// A fresh timeout or [`BackendError::LoadUnconfirmed`] instead attempts
+/// A timeout or [`BackendError::LoadUnconfirmed`] instead attempts
 /// [`best_effort_release`] because allocation may already have happened.
 async fn resolve_load_failure(
     adapter: &Arc<dyn RuntimeAdapter>,
@@ -649,14 +650,14 @@ async fn resolve_load_failure(
     previous: Option<PreviousModel>,
     timeout: std::time::Duration,
 ) -> LoadFailureOutcome {
-    if let Some(previous) = previous {
-        return LoadFailureOutcome::RestorePrevious(previous);
-    }
     if matches!(
         err,
         BackendError::AdapterTimedOut { .. } | BackendError::LoadUnconfirmed { .. }
     ) {
-        LoadFailureOutcome::Settle(best_effort_release(adapter, id, timeout).await)
+        let state = best_effort_release(adapter, id, timeout).await;
+        LoadFailureOutcome::after_release(state, previous)
+    } else if let Some(previous) = previous {
+        LoadFailureOutcome::RestorePrevious(previous)
     } else {
         LoadFailureOutcome::Settle(ModelState::Stopped)
     }
@@ -773,7 +774,7 @@ fn start_load(
                         (victim, Err(err))
                     })
                     .collect(),
-                // A panic leaves state unknown; preserve the previous footprint
+                // A panic leaves state unknown; retain the larger footprint
                 // while marking Error rather than restoring a Ready instance.
                 failure_outcome: LoadFailureOutcome::after_release(ModelState::Error, previous),
             },
@@ -1243,6 +1244,19 @@ async fn run_actor(
                                         slot.state = previous.state;
                                         slot.policy = previous.policy;
                                         slot.memory_gb = previous.memory_gb;
+                                    }
+                                    None => {
+                                        violation =
+                                            Some(format!("ledger lost {id:?} mid-op (reload)"));
+                                    }
+                                }
+                            }
+                            LoadFailureOutcome::RetainPreviousOnError(previous) => {
+                                match models.get_mut(&id) {
+                                    Some(slot) => {
+                                        slot.state = ModelState::Error;
+                                        slot.policy = previous.policy;
+                                        slot.memory_gb = slot.memory_gb.max(previous.memory_gb);
                                     }
                                     None => {
                                         violation =
