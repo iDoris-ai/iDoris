@@ -22,12 +22,45 @@ pub(super) fn open(path: &Path, timeout: Duration) -> Result<Connection, BudgetE
         reservation_id TEXT NOT NULL, tenant_id TEXT NOT NULL,
         actual_cost_minor INTEGER NOT NULL, reason TEXT NOT NULL,
         quarantined_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-        PRIMARY KEY (reservation_id, tenant_id));",
+        PRIMARY KEY (reservation_id, tenant_id));
+        CREATE TABLE IF NOT EXISTS settlement_intents (
+            reservation_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL
+        );",
     )?;
     Ok(conn)
 }
 
 impl BudgetLedger {
+    fn persist_emergency_settlement(
+        &self,
+        id: &ReservationId,
+        tenant: &str,
+        actual: i64,
+    ) -> Result<(), BudgetError> {
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let changed = conn.execute(
+            "INSERT INTO budget_emergency_settlements VALUES (?1, ?2, ?3)
+             ON CONFLICT(reservation_id) DO UPDATE SET actual_cost_minor=excluded.actual_cost_minor
+             WHERE tenant_id=excluded.tenant_id AND actual_cost_minor=excluded.actual_cost_minor",
+            params![id.0, tenant, actual],
+        )?;
+        if changed != 1 {
+            return Err(BudgetError::SettlementConflict {
+                reservation_id: id.0.clone(),
+                reason: "primary recovery already contains a different tenant or cost".into(),
+            });
+        }
+        Ok(())
+    }
+
+    fn emergency_cost(&self, id: &ReservationId, tenant: &str) -> Result<Option<i64>, BudgetError> {
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        conn.query_row(
+            "SELECT actual_cost_minor FROM budget_emergency_settlements WHERE reservation_id=?1 AND tenant_id=?2",
+            params![id.0, tenant], |row| row.get(0),
+        ).optional().map_err(BudgetError::from)
+    }
+
     /// Persist before attempting settlement. None means durable retry is
     /// pending. Errors report failed persistence or an invalid outcome, except
     /// `OverageTooLarge`, which confirms that the actual charge committed.
@@ -36,6 +69,56 @@ impl BudgetLedger {
         tenant: &str,
         id: &ReservationId,
         actual: i64,
+    ) -> Result<Option<i64>, BudgetError> {
+        if let Some((owner, queued)) = self
+            .emergency_settlements
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(id)
+            .cloned()
+            && (owner != tenant || queued != actual)
+        {
+            if owner != tenant {
+                return Err(BudgetError::TenantMismatch {
+                    reservation_id: id.0.clone(),
+                });
+            }
+            return Err(BudgetError::SettlementConflict {
+                reservation_id: id.0.clone(),
+                reason: "in-memory recovery already contains a different tenant or cost".into(),
+            });
+        }
+        let result = self.settle_durable_with_hook(tenant, id, actual, || {});
+        if matches!(result, Err(BudgetError::Busy | BudgetError::Storage(_))) && actual >= 0 {
+            let mut memory = self
+                .emergency_settlements
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if let Some((queued_tenant, queued_actual)) = memory.get(id) {
+                if queued_tenant != tenant || *queued_actual != actual {
+                    return Err(BudgetError::SettlementConflict {
+                        reservation_id: id.0.clone(),
+                        reason: format!(
+                            "in-memory recovery cost is {queued_tenant}/{queued_actual}, requested {tenant}/{actual}"
+                        ),
+                    });
+                }
+            } else {
+                memory.insert(id.clone(), (tenant.to_owned(), actual));
+            }
+        }
+        result
+    }
+
+    /// Test seam for deterministically coordinating release against the
+    /// active-state read while the sidecar's cross-instance writer lock is
+    /// held. The callback is instance-local and absent from production paths.
+    pub(super) fn settle_durable_with_hook<F: FnOnce()>(
+        &self,
+        tenant: &str,
+        id: &ReservationId,
+        actual: i64,
+        after_active_read: F,
     ) -> Result<Option<i64>, BudgetError> {
         if actual < 0 {
             return Err(BudgetError::InvalidActualCost {
@@ -74,6 +157,15 @@ impl BudgetLedger {
                 reservation_id: id.0.clone(),
             });
         }
+        if let Some(queued) = self.emergency_cost(id, tenant)?
+            && queued != actual
+        {
+            return Err(BudgetError::SettlementConflict {
+                reservation_id: id.0.clone(),
+                reason: format!("emergency recovery cost is {queued}, requested {actual}"),
+            });
+        }
+        self.finish_settlement_intent(id);
         match status.as_str() {
             "released" => {
                 return Err(BudgetError::ReservationNotActive {
@@ -99,6 +191,7 @@ impl BudgetLedger {
                 )));
             }
         }
+        after_active_read();
         if let Some((queued_tenant, queued)) = tx.query_row(
             "SELECT tenant_id, actual_cost_minor FROM pending_settlements WHERE reservation_id=?1",
             [&id.0], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
@@ -107,9 +200,45 @@ impl BudgetLedger {
                 return Err(BudgetError::SettlementConflict { reservation_id: id.0.clone(), reason: format!("pending tenant/cost is {queued_tenant}/{queued}, requested {tenant}/{actual}") });
             }
         } else {
-            tx.execute("INSERT INTO pending_settlements VALUES (?1, ?2, ?3)", params![id.0, tenant, actual])?;
+            if let Err(err) = tx.execute(
+                "INSERT INTO pending_settlements VALUES (?1, ?2, ?3)",
+                params![id.0, tenant, actual],
+            ) {
+                // Keep the coordinator transaction active while applying the
+                // primary fallback, so another process cannot release first.
+                // SQLITE_FULL/IOERR or a RAISE(ROLLBACK) trigger may have
+                // rolled back implicitly; a Rust Transaction alone is no lock.
+                if tx.is_autocommit() {
+                    return Err(err.into());
+                }
+                return match self.settle_uncoordinated(tenant, id, actual) {
+                    Ok(_) => Ok(Some(actual)),
+                    Err(overage @ BudgetError::OverageTooLarge { .. }) => Err(overage),
+                    Err(primary_err) => {
+                        let persisted = self.persist_emergency_settlement(id, tenant, actual);
+                        let _ = tx.rollback();
+                        match persisted {
+                            Ok(()) => {
+                                eprintln!("budget settlement stored in primary recovery journal: reservation={} sidecar={err} primary={primary_err}", id.0);
+                                Ok(None)
+                            }
+                            Err(persist_err) => Err(BudgetError::Storage(format!(
+                                "settlement sidecar enqueue failed ({err}); primary fallback failed ({primary_err}); emergency journal failed ({})",
+                                persist_err
+                            ))),
+                        }
+                    }
+                };
+            }
         }
-        tx.commit()?; // pending is durable before touching the primary ledger
+        if let Err(err) = tx.commit() {
+            // The transaction is consumed and the cross-process lock is gone.
+            // Keep the intent active and retain the actual in memory; reserve
+            // retries durable persistence before admitting more spend.
+            return Err(BudgetError::Storage(format!(
+                "settlement sidecar commit failed: {err}"
+            )));
+        } // pending is durable before touching the primary ledger
         drop(journal);
         match self.retry_one(id, tenant, actual) {
             Ok(()) => Ok(Some(actual)),
@@ -126,6 +255,33 @@ impl BudgetLedger {
     pub fn retry_settlements(&self) -> Result<(), BudgetError> {
         let mut journal = self.settlements.lock().unwrap_or_else(|p| p.into_inner());
         let tx = journal.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let memory_rows: Vec<_> = self
+            .emergency_settlements
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .map(|(id, (tenant, actual))| (id.clone(), tenant.clone(), *actual))
+            .collect();
+        for (id, tenant, actual) in memory_rows {
+            if let Some((queued_tenant, queued_actual)) = self
+                .emergency_settlements
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .get(&id)
+                .cloned()
+                && (queued_tenant != tenant || queued_actual != actual)
+            {
+                return Err(BudgetError::SettlementConflict {
+                    reservation_id: id.0.clone(),
+                    reason: "in-memory emergency recovery changed during retry".into(),
+                });
+            }
+            self.persist_emergency_settlement(&id, &tenant, actual)?;
+            self.emergency_settlements
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(&id);
+        }
         let rows = {
             let mut stmt = tx.prepare(
                 "SELECT reservation_id, tenant_id, actual_cost_minor
@@ -163,7 +319,48 @@ impl BudgetLedger {
                 [&id.0],
             )?;
         }
+        let emergencies = {
+            let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+            let mut stmt = conn.prepare(
+                "SELECT reservation_id, tenant_id, actual_cost_minor FROM budget_emergency_settlements",
+            )?;
+            stmt.query_map([], |r| {
+                Ok((
+                    ReservationId(r.get(0)?),
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?
+        };
+        let mut completed_emergencies = Vec::new();
+        for (id, tenant, actual) in emergencies {
+            match self.apply_pending(&tx, &id, &tenant, actual) {
+                Ok(()) | Err(BudgetError::OverageTooLarge { .. }) => {
+                    completed_emergencies.push(id);
+                }
+                Err(
+                    err @ (BudgetError::ReservationNotActive { .. }
+                    | BudgetError::SettlementConflict { .. }
+                    | BudgetError::ReservationNotFound { .. }
+                    | BudgetError::TenantMismatch { .. }
+                    | BudgetError::InvalidActualCost { .. }),
+                ) => {
+                    eprintln!("emergency settlement quarantined: {err}");
+                    completed_emergencies.push(id);
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        self.check_settlement_intents(&tx)?;
         tx.commit()?;
+        for id in completed_emergencies {
+            let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+            conn.execute(
+                "DELETE FROM budget_emergency_settlements WHERE reservation_id=?1",
+                [&id.0],
+            )?;
+        }
         Ok(())
     }
 
@@ -413,7 +610,7 @@ mod tests {
     }
 
     #[test]
-    fn journal_failure_is_an_error_and_does_not_release_completed_usage() {
+    fn journal_failure_falls_back_to_primary_settlement() {
         let (ledger, id) = reserved();
         ledger
             .settlements
@@ -425,11 +622,9 @@ mod tests {
             BEGIN SELECT RAISE(ABORT, 'injected journal failure'); END;",
             )
             .unwrap();
-        assert!(matches!(
-            ledger.settle_durable("t", &id, 20),
-            Err(BudgetError::Storage(_))
-        ));
-        assert_eq!(ledger.tenant_balance("t").unwrap(), 990);
+        assert_eq!(ledger.settle_durable("t", &id, 20).unwrap(), Some(20));
+        assert_eq!(pending(&ledger), 0);
+        assert_eq!(ledger.tenant_balance("t").unwrap(), 980);
     }
 
     #[test]
@@ -469,53 +664,6 @@ mod tests {
             Err(BudgetError::SettlementConflict { .. })
         ));
         assert_eq!(pending(&ledger), 0);
-    }
-
-    #[test]
-    fn release_and_enqueue_are_serialized_across_independent_ledgers() {
-        use std::{
-            sync::{Arc, Barrier},
-            thread,
-        };
-
-        let path = std::env::temp_dir().join(format!(
-            "idoris-settlement-race-{}.sqlite3",
-            uuid::Uuid::new_v4()
-        ));
-        let first = BudgetLedger::open(&path).unwrap();
-        first
-            .configure_tenant("t", 100, "UTC", SpendGate::All)
-            .unwrap();
-        let id = first
-            .reserve(&BudgetScope::new("t", "k", "p", "m"), Price::Known(10))
-            .unwrap();
-        let second = BudgetLedger::open(&path).unwrap();
-        let barrier = Arc::new(Barrier::new(2));
-        let release_id = id.clone();
-        let release_barrier = barrier.clone();
-        let releaser = thread::spawn(move || {
-            release_barrier.wait();
-            second.release("t", &release_id)
-        });
-        barrier.wait();
-        let settled = first.settle_durable("t", &id, 8);
-        let released = releaser.join().unwrap();
-        match (settled, released) {
-            (
-                Ok(Some(8)),
-                Err(
-                    BudgetError::ReservationNotActive { .. }
-                    | BudgetError::SettlementConflict { .. },
-                ),
-            ) => {}
-            (Err(BudgetError::ReservationNotActive { .. }), Ok(())) => {}
-            (a, b) => panic!("unexpected release/settlement race outcomes: {a:?}, {b:?}"),
-        }
-        assert_eq!(pending(&first), 0);
-        drop(first);
-        std::fs::remove_file(&path).unwrap();
-        let sidecar = path.with_added_extension("settlements.sqlite3");
-        let _ = std::fs::remove_file(sidecar);
     }
 
     #[test]
@@ -655,3 +803,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "settlement/race_tests.rs"]
+mod race_tests;

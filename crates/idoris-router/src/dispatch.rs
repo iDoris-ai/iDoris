@@ -71,8 +71,9 @@ pub enum DispatchFailure {
 /// `served_locality` is set even when `result` is `Err` (interface spec
 /// §3.12). `actual_cost_minor` is `Some` only when the ledger has committed
 /// the charge, including the loud overage case. `None` with `Pending` means
-/// the sidecar owns the retry; `None` with `PersistenceFailed` means the
-/// completed usage could not be durably recorded. `NotRequired` covers free
+/// a recovery journal owns the retry; `None` with `PersistenceFailed` means
+/// usage is retained in memory and the durable dispatch fence blocks further
+/// spending until reconciliation. `NotRequired` covers free
 /// requests and requests that failed before the backend completed.
 #[derive(Debug)]
 pub struct ChatOutcome {
@@ -95,7 +96,7 @@ pub enum SettlementStatus {
     Committed,
     /// The charge is durably queued for retry.
     Pending,
-    /// Neither commit nor durable queueing was confirmed; inspect logs.
+    /// Actual cost persistence is unconfirmed; the dispatch fence stays closed.
     PersistenceFailed,
 }
 
@@ -377,6 +378,19 @@ pub async fn dispatch_local(
             decision,
             served_locality,
             result: Err(DispatchFailure::Backend(err)),
+            actual_cost_minor: None,
+            settlement_status: SettlementStatus::NotRequired,
+        });
+    }
+
+    if let (Some(ledger), Some(id)) = (budget_ledger, reservation_guard.id.as_ref())
+        && let Err(err) =
+            ledger.begin_settlement(tenant_id.unwrap_or(budget::PERSONAL_TENANT_ID), id)
+    {
+        return Ok(ChatOutcome {
+            decision,
+            served_locality,
+            result: Err(DispatchFailure::Budget(err)),
             actual_cost_minor: None,
             settlement_status: SettlementStatus::NotRequired,
         });
@@ -712,7 +726,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn successful_paid_response_reports_sidecar_persistence_failure() {
+    async fn successful_paid_response_reports_primary_fallback_commit() {
         let dir = tempfile::TempDir::new().unwrap();
         let ledger = BudgetLedger::open(dir.path().join("b.sqlite3")).unwrap();
         ledger
@@ -757,15 +771,12 @@ mod tests {
             outcome.result.is_ok(),
             "completed upstream response is retained"
         );
-        assert_eq!(outcome.actual_cost_minor, None);
-        assert_eq!(
-            outcome.settlement_status,
-            SettlementStatus::PersistenceFailed
-        );
-        let reserved = budget::estimate_cost_minor(&paid_card("p").provider.cost, "hi").unwrap();
+        assert_eq!(outcome.settlement_status, SettlementStatus::Committed);
+        let charged = outcome.actual_cost_minor.unwrap();
+        assert!(charged > 0);
         assert_eq!(
             ledger.tenant_balance(budget::PERSONAL_TENANT_ID).unwrap(),
-            1_000_000 - reserved
+            1_000_000 - charged
         );
     }
 

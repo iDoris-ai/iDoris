@@ -198,7 +198,10 @@ impl SpendGate {
 pub struct BudgetLedger {
     pub(super) conn: Mutex<Connection>,
     pub(super) settlements: Mutex<Connection>,
-    clock: Arc<dyn Clock>,
+    pub(super) emergency_settlements:
+        Mutex<std::collections::HashMap<ReservationId, (String, i64)>>,
+    pub(super) live_settlement_intents: Mutex<std::collections::HashSet<String>>,
+    pub(super) clock: Arc<dyn Clock>,
     ttl_ms: i64,
 }
 
@@ -256,9 +259,17 @@ impl BudgetLedger {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.busy_timeout(busy_timeout)?;
         run_migrations(&mut conn)?;
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS budget_emergency_settlements (
+                reservation_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL,
+                actual_cost_minor INTEGER NOT NULL CHECK(actual_cost_minor >= 0)
+            );",
+        )?;
         let ledger = Self {
             conn: Mutex::new(conn),
             settlements: Mutex::new(super::settlement::open(path.as_ref(), busy_timeout)?),
+            emergency_settlements: Mutex::new(std::collections::HashMap::new()),
+            live_settlement_intents: Mutex::new(std::collections::HashSet::new()),
             clock,
             ttl_ms,
         };
@@ -725,6 +736,47 @@ impl BudgetLedger {
     ) -> Result<SettleReceipt, BudgetError> {
         let mut journal = self.settlements.lock().unwrap_or_else(|p| p.into_inner());
         let tx = journal.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some((queued_tenant, queued_actual)) = self
+            .emergency_settlements
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(reservation_id)
+            .cloned()
+        {
+            tx.rollback()?;
+            return if queued_tenant != tenant_id {
+                Err(BudgetError::TenantMismatch {
+                    reservation_id: reservation_id.0.clone(),
+                })
+            } else if queued_actual != actual_cost_minor {
+                Err(BudgetError::SettlementConflict {
+                    reservation_id: reservation_id.0.clone(),
+                    reason: format!(
+                        "in-memory recovery cost is {queued_actual}, requested {actual_cost_minor}"
+                    ),
+                })
+            } else {
+                Err(BudgetError::SettlementConflict {
+                    reservation_id: reservation_id.0.clone(),
+                    reason: format!("settlement of {queued_actual} is awaiting durable recovery"),
+                })
+            };
+        }
+        let emergency: Option<i64> = self.lock().query_row(
+            "SELECT actual_cost_minor FROM budget_emergency_settlements WHERE reservation_id=?1 AND tenant_id=?2",
+            rusqlite::params![reservation_id.0, tenant_id], |row| row.get(0),
+        ).optional()?;
+        if let Some(pending) = emergency
+            && pending != actual_cost_minor
+        {
+            tx.rollback()?;
+            return Err(BudgetError::SettlementConflict {
+                reservation_id: reservation_id.0.clone(),
+                reason: format!(
+                    "emergency recovery cost is {pending}, requested {actual_cost_minor}"
+                ),
+            });
+        }
         let queued: Option<i64> = tx.query_row(
             "SELECT actual_cost_minor FROM pending_settlements WHERE reservation_id=?1 AND tenant_id=?2",
             rusqlite::params![reservation_id.0, tenant_id],
@@ -981,6 +1033,36 @@ impl BudgetLedger {
     ) -> Result<(), BudgetError> {
         let mut journal = self.settlements.lock().unwrap_or_else(|p| p.into_inner());
         let tx = journal.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some((queued_tenant, queued_actual)) = self
+            .emergency_settlements
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(reservation_id)
+            .cloned()
+        {
+            tx.rollback()?;
+            return if queued_tenant != tenant_id {
+                Err(BudgetError::TenantMismatch {
+                    reservation_id: reservation_id.0.clone(),
+                })
+            } else {
+                Err(BudgetError::SettlementConflict {
+                    reservation_id: reservation_id.0.clone(),
+                    reason: format!("settlement of {queued_actual} is awaiting durable recovery"),
+                })
+            };
+        }
+        let emergency: Option<i64> = self.lock().query_row(
+            "SELECT actual_cost_minor FROM budget_emergency_settlements WHERE reservation_id=?1 AND tenant_id=?2",
+            rusqlite::params![reservation_id.0, tenant_id], |row| row.get(0),
+        ).optional()?;
+        if let Some(pending) = emergency {
+            tx.rollback()?;
+            return Err(BudgetError::SettlementConflict {
+                reservation_id: reservation_id.0.clone(),
+                reason: format!("settlement of {pending} is pending in emergency recovery"),
+            });
+        }
         let pending: Option<i64> = tx.query_row(
             "SELECT actual_cost_minor FROM pending_settlements WHERE reservation_id=?1 AND tenant_id=?2",
             rusqlite::params![reservation_id.0, tenant_id],

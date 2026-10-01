@@ -298,3 +298,146 @@ async fn successful_chat_leaves_durable_pending_charge_until_reopen_recovers_it_
         .unwrap();
     assert_eq!(count, 0);
 }
+
+#[tokio::test]
+async fn sidecar_insert_failure_falls_back_to_primary_charge_and_survives_reopen() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let db_path = dir.path().join("budget.sqlite3");
+    let clock = Arc::new(TestClock::default());
+    let ledger = Arc::new(build_ledger(&db_path, clock.clone()));
+
+    let sidecar = Connection::open(db_path.with_added_extension("settlements.sqlite3")).unwrap();
+    sidecar
+        .execute_batch(
+            "CREATE TRIGGER fail_pending_insert BEFORE INSERT ON pending_settlements
+         BEGIN SELECT RAISE(FAIL, 'injected sidecar failure'); END;",
+        )
+        .unwrap();
+    drop(sidecar);
+
+    let adapter = Arc::new(MockAdapter::new(vec![ModelInfo {
+        id: PROVIDER.into(),
+        memory_gb: 1.0,
+    }]));
+    let supervisor = Supervisor::spawn(adapter, SupervisorConfig::default()).unwrap();
+    let app = build_app(AppState {
+        cards: vec![card()],
+        supervisor: Some(supervisor),
+        budget_ledger: Some(ledger.clone()),
+        ..AppState::default()
+    });
+    let request = Request::post("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(BODY))
+        .unwrap();
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let completion = json["choices"][0]["message"]["content"].as_str().unwrap();
+    let primary = Connection::open(&db_path).unwrap();
+    let reserved_minor: i64 = primary
+        .query_row(
+            "SELECT reserved_minor FROM reservations ORDER BY rowid DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let actual = idoris_router::budget::estimate_actual_cost_minor(
+        &COST,
+        PROMPT,
+        completion,
+        reserved_minor,
+    );
+    assert!(actual > 0);
+    assert_eq!(ledger.tenant_balance(TENANT).unwrap(), 1_000_000 - actual);
+    assert_eq!(ledger.balance(&scope()).unwrap(), 1_000_000 - actual);
+
+    let (status, recorded): (String, Option<i64>) = primary
+        .query_row(
+            "SELECT status, actual_cost_minor FROM reservations ORDER BY rowid DESC LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(status, "settled");
+    assert_eq!(recorded, Some(actual));
+    drop(primary);
+    drop(ledger);
+
+    clock.0.store(10_000, Ordering::SeqCst);
+    let reopened = build_ledger(&db_path, clock);
+    assert_eq!(reopened.tenant_balance(TENANT).unwrap(), 1_000_000 - actual);
+    assert_eq!(reopened.balance(&scope()).unwrap(), 1_000_000 - actual);
+    let sidecar = Connection::open(db_path.with_added_extension("settlements.sqlite3")).unwrap();
+    let pending: i64 = sidecar
+        .query_row("SELECT COUNT(*) FROM pending_settlements", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(pending, 0);
+}
+
+#[tokio::test]
+async fn settlement_intent_persistence_failure_blocks_upstream_and_releases_reservation() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let db_path = dir.path().join("budget.sqlite3");
+    let clock = Arc::new(TestClock::default());
+    let ledger = Arc::new(build_ledger(&db_path, clock));
+    let sidecar = Connection::open(db_path.with_added_extension("settlements.sqlite3")).unwrap();
+    sidecar
+        .execute_batch(
+            "CREATE TRIGGER fail_intent_insert BEFORE INSERT ON settlement_intents
+             BEGIN SELECT RAISE(FAIL, 'injected intent persistence failure'); END;",
+        )
+        .unwrap();
+    drop(sidecar);
+
+    let entered = Arc::new(Notify::new());
+    let continue_chat = Arc::new(Notify::new());
+    let adapter = Arc::new(GatedAdapter {
+        mock: MockAdapter::new(vec![ModelInfo {
+            id: PROVIDER.into(),
+            memory_gb: 1.0,
+        }]),
+        entered: entered.clone(),
+        continue_chat,
+    });
+    let supervisor = Supervisor::spawn(adapter, SupervisorConfig::default()).unwrap();
+    let app = build_app(AppState {
+        cards: vec![card()],
+        supervisor: Some(supervisor),
+        budget_ledger: Some(ledger.clone()),
+        ..AppState::default()
+    });
+    let request = Request::post("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(BODY))
+        .unwrap();
+    let request_task = tokio::spawn(app.oneshot(request));
+    let response = tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::select! {
+            _ = entered.notified() => panic!("upstream chat started without durable settlement intent"),
+            response = request_task => response.expect("request task should complete").unwrap(),
+        }
+    })
+    .await
+    .expect("request should fail before upstream chat");
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(body["error"]["type"], "internal_error");
+
+    assert_eq!(ledger.tenant_balance(TENANT).unwrap(), 1_000_000);
+    assert_eq!(ledger.balance(&scope()).unwrap(), 1_000_000);
+    let primary = Connection::open(&db_path).unwrap();
+    let (status, actual): (String, Option<i64>) = primary
+        .query_row(
+            "SELECT status, actual_cost_minor FROM reservations ORDER BY rowid DESC LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(status, "released");
+    assert_eq!(actual, None);
+}
