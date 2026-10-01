@@ -1,6 +1,6 @@
 # cargo-deny config — 与 Agent24（/Users/jason/Dev/auraai/Agent24/rust/deny.toml）
 # 保持一致的 license 白名单：不允许 GPL/AGPL 进依赖树。
-# CI 跑 `cargo deny check licenses bans`（见 .github/workflows/ci.yml 的 rust job）。
+# CI 跑 `cargo deny check advisories bans licenses sources`（见 .github/workflows/ci.yml 的 rust job）。
 
 [licenses]
 allow = [

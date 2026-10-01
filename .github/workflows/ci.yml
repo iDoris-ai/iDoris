@@ -74,4 +74,4 @@ jobs:
           grep -q '被测服务启动命令执行失败.*idoris-conformance-missing.*ENOENT' "$log"
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
-          command: check licenses bans
+          command: check advisories bans licenses sources
