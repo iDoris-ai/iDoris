@@ -86,33 +86,8 @@ describe("慢响应不会被提前掐断", () => {
 });
 
 describe("客户端断开 => 向上游传播取消", () => {
-  /**
-   * 已知 bug（本轮 conformance 复审发现，未修复，见 PR 描述与
-   * tests/known-spec-conflicts.test.ts）：接口规范 §3.11 说取消"已实现"，
-   * 但 packages/router/src/server.ts 里那行 `req.on("close", () => controller.abort())`
-   * 监听的是**请求对象**（客户端 → 路由器）的 close，不是响应对象/socket 的 close。
-   * 请求体在走到这行代码之前已经被 `readBody(req)` 完整读完，Node 的
-   * IncomingMessage 在读完之后会自己很快触发一次 'close'——跟客户端到底有没有
-   * 真的断开连接毫无关系。等这行代码执行、挂上监听器的时候，那次"自然 close"
-   * 往往已经发生过了（用 `req.destroyed`/`req.complete` 实测确认过），
-   * 监听器后挂上去不会补触发一次。净效果：`controller.abort()` 在真实客户端
-   * 断开时基本不会被调用，取消不会传播到上游。
-   *
-   * **用变异测试验证过两层**（细节见 PR 描述）：
-   * 1. 把 server.ts 那一行临时改成 `res.on("close", () => { if (!res.writableEnded)
-   *    controller.abort(); })` 再重新 build：下面这条测试如果断言 `true`，会立刻变绿
-   *    （约 300ms 内），证明取消传播只要用对监听对象就是好的，也证明本条测试本身
-   *    有识别力，不是又一次假阳性。
-   * 2. 在这个修好的基础上，再临时去掉 proxy.ts 里 `init.signal = opts.signal`
-   *    那一行：测试重新变红——证明 proxy.ts 把 signal 转发给上游 fetch 这一步
-   *    同样是必要环节，不是摆设。
-   * 两次临时改动都已还原，本 PR 不改任何 packages/router 源码。
-   *
-   * 所以这里如实锁定**当前**（有 bug 的）行为：abort 之后 `wasAborted()` 保持
-   * `false`。等 server.ts 那一行按上面验证过的方式修好后，这条测试要连同注释
-   * 一起改回正向断言（`toBe(true)`）。
-   */
-  it("已知问题：客户端 abort 后取消目前不会传播到上游（wasAborted 保持 false）", async () => {
+  // PR #153 已修复响应连接的 close 监听；通过真实 HTTP 验证取消能到达上游。
+  it("客户端 abort 后取消传播到上游", async () => {
     const handle = upstream.queueChat({ kind: "hang" });
     const before = upstream.chatCount();
     const controller = new AbortController();
@@ -136,10 +111,12 @@ describe("客户端断开 => 向上游传播取消", () => {
     controller.abort();
     await expect(pending).rejects.toBeDefined();
 
-    // 修好之后（见上面变异测试）大约 300ms 内就会变 true；这里多等一点
-    // （2s）确认它不是"还没来得及"，而是稳定停在 false。
-    await new Promise((resolve) => setTimeout(resolve, 2_000));
-    expect(handle.wasAborted()).toBe(false);
+    // 给连接关闭和上游取消传播留出时间；持续观察真实上游连接状态。
+    const abortedDeadline = Date.now() + 2_000;
+    while (!handle.wasAborted() && Date.now() < abortedDeadline) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    expect(handle.wasAborted()).toBe(true);
   });
 
   // 负对照：不主动断开时不该被误判成"已取消"——这条锁的正是原来那个 bug

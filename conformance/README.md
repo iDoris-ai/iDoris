@@ -85,9 +85,8 @@ IDORIS_CONFORMANCE_ARGV='["/path/to/idoris-router-rs","serve","--flag","value wi
 - 上游 5xx：重试到成功、持续失败原样透传，均锁定"最多重试 2 次（共 3 次尝试）"
 - `X-iDoris-Request-Id` 幂等：60s 窗口内同一 Request-Id 只打一次上游
 - 慢响应：上游延迟但最终成功时不会被提前掐断
-- 取消传播：**目前锁定的是"不工作"这个已知 bug**（客户端 abort 后上游不会被 abort），
-  见下面「已知的规范 vs TS 现状落差」第一条；负对照（不主动断开也不该被误判成已取消）
-  仍然是真正在验证的行为
+- 取消传播：客户端 abort 后上游请求也被取消（PR #153 已修复）；
+  负对照验证不主动断开时，上游请求不会被误判成已取消
 - 流式 SSE：正常透传；上游直接 5xx 时不重试，改以 JSON 错误响应（而不是 SSE）返回
 - `deploy_mode=tenant` 缺 `X-iDoris-Tenant` → 400 `tenant_missing`；带了则放行
 - `X-iDoris-Record-Id`：所有响应都带（成功、400、404、503……），服务端生成，调用方
@@ -106,18 +105,12 @@ TS 实现里还没有对应代码，等这部分定稿并落地后再补测试�
 
 见 `tests/known-spec-conflicts.test.ts`：
 
-1. **【真实 bug，本轮 conformance 复审发现】取消传播不工作**——
-   `packages/router/src/server.ts:330` 的 `req.on("close", () => controller.abort())`
-   监听的是请求对象（客户端→路由器）的 close，不是响应对象/socket 的 close；请求体
-   读完之后 `req` 会自己触发一次 'close'，跟客户端有没有真的断开连接无关，等这行代码
-   挂上监听器时往往已经错过了真正的断开事件。已用变异测试验证（改一行 `req`→`res`
-   就能让取消传播工作，细节见本次 PR 描述），改动已还原，**没有改动任何 TS 实现代码**。
-2. 统一错误体缺 `rule_id/reason_code/evidence/remediation` 字段。
-3. TS 用了规范 §3.11 枚举之外的错误 `type`（含新出现的 `invalid_body`/`internal_error`）。
-4. 完全没有 §3.2 的虚拟 key 鉴权。
-5. `ChatProxy` 对上游请求没有任何超时（本来设想只有客户端主动断开才会 abort，
-   但见第 1 条，这条防线本身也没工作）。
-6. `/v1/messages`、`/v1/embeddings`、`/v1/rerank`、`/v1/systemone`、`/v1/inspect`、
+1. 统一错误体缺 `rule_id/reason_code/evidence/remediation` 字段。
+2. TS 用了规范 §3.11 枚举之外的错误 `type`（含新出现的 `invalid_body`/`internal_error`）。
+3. 完全没有 §3.2 的虚拟 key 鉴权。
+4. `ChatProxy` 对上游请求没有任何超时；客户端断开会取消上游请求，
+   但客户端保持连接时，挂起的上游请求不会主动超时。
+5. `/v1/messages`、`/v1/embeddings`、`/v1/rerank`、`/v1/systemone`、`/v1/inspect`、
    `/v1/feedback`、`/v1/trajectories`、`/admin/api/v1/*` 均未实现。
 
 ## 设计约束
