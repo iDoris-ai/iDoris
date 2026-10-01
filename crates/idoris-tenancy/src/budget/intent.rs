@@ -1,5 +1,7 @@
 //! A pre-dispatch fence survives losing both stores before the actual cost
 //! can be recorded. Unknown outcomes require reconciliation, never TTL expiry.
+//! Callers may use `release_confirmed_unexecuted` only after independently
+//! verifying that the upstream operation did not execute.
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
 
 use super::{BudgetError, BudgetLedger, ReservationId};
@@ -7,7 +9,8 @@ use super::{BudgetError, BudgetLedger, ReservationId};
 impl BudgetLedger {
     /// Persist before starting a paid upstream call. After an unclean restart,
     /// admission stays closed until every unknown outcome is reconciled using
-    /// `settle_durable`, or `release` for a confirmed unexecuted call.
+    /// `settle_durable`, or `release_confirmed_unexecuted` after confirming
+    /// that the upstream call did not execute.
     pub fn begin_settlement(&self, tenant: &str, id: &ReservationId) -> Result<(), BudgetError> {
         let mut journal = self.settlements.lock().unwrap_or_else(|p| p.into_inner());
         let tx = journal.transaction_with_behavior(TransactionBehavior::Immediate)?;

@@ -200,6 +200,8 @@ pub struct BudgetLedger {
     pub(super) settlements: Mutex<Connection>,
     pub(super) emergency_settlements:
         Mutex<std::collections::HashMap<ReservationId, (String, i64)>>,
+    pub(super) unverified_settlements:
+        Mutex<std::collections::HashMap<(ReservationId, String), i64>>,
     pub(super) live_settlement_intents: Mutex<std::collections::HashSet<String>>,
     pub(super) clock: Arc<dyn Clock>,
     ttl_ms: i64,
@@ -269,6 +271,7 @@ impl BudgetLedger {
             conn: Mutex::new(conn),
             settlements: Mutex::new(super::settlement::open(path.as_ref(), busy_timeout)?),
             emergency_settlements: Mutex::new(std::collections::HashMap::new()),
+            unverified_settlements: Mutex::new(std::collections::HashMap::new()),
             live_settlement_intents: Mutex::new(std::collections::HashSet::new()),
             clock,
             ttl_ms,
@@ -736,6 +739,21 @@ impl BudgetLedger {
     ) -> Result<SettleReceipt, BudgetError> {
         let mut journal = self.settlements.lock().unwrap_or_else(|p| p.into_inner());
         let tx = journal.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(queued_actual) = self
+            .unverified_settlements
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&(reservation_id.clone(), tenant_id.to_owned()))
+            .copied()
+        {
+            tx.rollback()?;
+            return Err(BudgetError::SettlementConflict {
+                reservation_id: reservation_id.0.clone(),
+                reason: format!(
+                    "completed settlement of {queued_actual} is awaiting ownership verification"
+                ),
+            });
+        }
         if let Some((queued_tenant, queued_actual)) = self
             .emergency_settlements
             .lock()
@@ -1010,12 +1028,14 @@ impl BudgetLedger {
     /// that failed or that fell back to a different (separately reserved)
     /// candidate. Idempotent when the reservation is already `released`;
     /// erroring on `settled` prevents un-settling a completed charge.
+    /// A dispatch intent also prevents ordinary cancellation: use
+    /// `release_confirmed_unexecuted` only after checking upstream execution.
     ///
     /// L3 (Opus Tier-2 acceptance): releasing an already-`expired` (but not
     /// yet settled/released) reservation succeeds (`Ok(())`) instead of
     /// erroring — no charge was ever recorded against it, so "release" (no
-    /// charge is due) is already true; only `settled` is a genuine
-    /// "you can't undo this" rejection.
+    /// charge is due) is already true when no dispatch intent or completed
+    /// outcome is awaiting recovery.
     ///
     /// Every success path here writes `Released`, **never** leaves a row as
     /// `Expired` — this matters as of H1 (a follow-up PR makes `settle`
@@ -1030,6 +1050,26 @@ impl BudgetLedger {
         &self,
         tenant_id: &str,
         reservation_id: &ReservationId,
+    ) -> Result<(), BudgetError> {
+        self.release_with_intent_policy(tenant_id, reservation_id, false)
+    }
+
+    /// Release only after the caller has independently confirmed that the
+    /// upstream call did not execute. This resolves an otherwise unknown
+    /// persisted dispatch intent.
+    pub fn release_confirmed_unexecuted(
+        &self,
+        tenant_id: &str,
+        reservation_id: &ReservationId,
+    ) -> Result<(), BudgetError> {
+        self.release_with_intent_policy(tenant_id, reservation_id, true)
+    }
+
+    fn release_with_intent_policy(
+        &self,
+        tenant_id: &str,
+        reservation_id: &ReservationId,
+        confirmed_unexecuted: bool,
     ) -> Result<(), BudgetError> {
         let mut journal = self.settlements.lock().unwrap_or_else(|p| p.into_inner());
         let tx = journal.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1075,7 +1115,48 @@ impl BudgetLedger {
                 reason: format!("settlement of {pending} is pending"),
             });
         }
+        if let Some(intent_tenant) = tx
+            .query_row(
+                "SELECT tenant_id FROM settlement_intents WHERE reservation_id=?1",
+                [&reservation_id.0],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+        {
+            if intent_tenant != tenant_id {
+                tx.rollback()?;
+                return Err(BudgetError::TenantMismatch {
+                    reservation_id: reservation_id.0.clone(),
+                });
+            }
+            if !confirmed_unexecuted {
+                self.finish_settlement_intent(reservation_id);
+                tx.rollback()?;
+                return Err(BudgetError::SettlementConflict {
+                    reservation_id: reservation_id.0.clone(),
+                    reason: "dispatch outcome is unconfirmed".to_owned(),
+                });
+            }
+        }
+        if self
+            .unverified_settlements
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains_key(&(reservation_id.clone(), tenant_id.to_owned()))
+        {
+            return Err(BudgetError::SettlementConflict {
+                reservation_id: reservation_id.0.clone(),
+                reason: "completed settlement is awaiting ownership verification".into(),
+            });
+        }
         let result = self.release_uncoordinated(tenant_id, reservation_id);
+        if result.is_ok() && confirmed_unexecuted {
+            tx.execute(
+                "DELETE FROM settlement_intents WHERE reservation_id=?1 AND tenant_id=?2",
+                rusqlite::params![reservation_id.0, tenant_id],
+            )?;
+            self.finish_settlement_intent(reservation_id);
+        }
         tx.commit()?;
         result
     }

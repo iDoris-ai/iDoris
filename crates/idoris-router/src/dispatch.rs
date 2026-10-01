@@ -190,8 +190,9 @@ pub fn is_resident_http_service(card: &ComponentCard) -> bool {
             .is_some_and(|lp| lp.mode == LoadMode::Resident)
 }
 
-/// RAII guard: on `Drop`, releases the reservation unless [`Self::take`]
-/// already removed it. This covers two cases a scattering of explicit
+/// RAII guard: on `Drop`, attempts cancellation unless [`Self::take`]
+/// already removed it. Started dispatches stay fenced until their outcome
+/// is reconciled. This covers two cases a scattering of explicit
 /// `release()` calls at each early-`return` site cannot: an `Err` return
 /// (the ordinary case) *and* this whole `async fn`'s future being dropped
 /// mid-`.await` — a client disconnecting mid-request, or the task being
@@ -788,11 +789,11 @@ mod tests {
     /// mid-`.await` (simulated deterministically via `tokio::time::timeout`,
     /// which drops the inner future when it elapses -- the same mechanism
     /// a real client disconnect would trigger if this handler's own future
-    /// is dropped) must still release the budget reservation and cancel
+    /// is dropped) must keep the dispatch intent pending and cancel
     /// the caller-supplied token, even though no explicit `return` in
     /// `dispatch_local` ever runs.
     #[tokio::test]
-    async fn dropping_the_future_mid_chat_releases_the_reservation_and_cancels_the_token() {
+    async fn dropping_the_future_mid_chat_retains_the_intent_and_cancels_the_token() {
         let (_dir, ledger) = configured_ledger(1_000_000);
         let adapter = Arc::new(MockAdapter::new(vec![ModelInfo {
             id: "p".to_string(),
@@ -824,12 +825,10 @@ mod tests {
             "expected the call to still be in flight (mock chat_delay is 5s) when the 200ms timeout fired"
         );
 
-        // Not stuck reserved forever -- ReservationGuard's Drop released it
-        // even though none of dispatch_local's own `return`s ran.
-        assert_eq!(
-            ledger.tenant_balance(budget::PERSONAL_TENANT_ID).unwrap(),
-            1_000_000
-        );
+        // Dropping the future cannot confirm whether upstream executed.
+        // Ordinary cancellation must leave the intent awaiting reconciliation.
+        assert!(ledger.tenant_balance(budget::PERSONAL_TENANT_ID).unwrap() < 1_000_000);
+        assert!(ledger.retry_settlements().is_err());
         // The same token the Supervisor/adapter call received is cancelled.
         assert!(cancel.is_cancelled());
     }

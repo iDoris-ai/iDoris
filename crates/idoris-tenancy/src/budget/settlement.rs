@@ -70,6 +70,41 @@ impl BudgetLedger {
         id: &ReservationId,
         actual: i64,
     ) -> Result<Option<i64>, BudgetError> {
+        if actual < 0 {
+            return Err(BudgetError::InvalidActualCost {
+                actual_cost_minor: actual,
+            });
+        }
+        if let Some((owner, queued)) = self
+            .emergency_settlements
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(id)
+            .cloned()
+            && (owner != tenant || queued != actual)
+        {
+            if owner != tenant {
+                return Err(BudgetError::TenantMismatch {
+                    reservation_id: id.0.clone(),
+                });
+            }
+            return Err(BudgetError::SettlementConflict {
+                reservation_id: id.0.clone(),
+                reason: "in-memory recovery already contains a different tenant or cost".into(),
+            });
+        }
+        if self
+            .unverified_settlements
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&(id.clone(), tenant.to_owned()))
+            .is_some_and(|queued| *queued != actual)
+        {
+            return Err(BudgetError::SettlementConflict {
+                reservation_id: id.0.clone(),
+                reason: "ownership verification is pending for a different cost".into(),
+            });
+        }
         // Validate ownership before the sidecar transaction can return Busy.
         // In that path the caller's cost is kept in memory for recovery, so
         // only a tenant already verified against the primary ledger may reach
@@ -95,25 +130,22 @@ impl BudgetLedger {
                     reservation_id: id.0.clone(),
                 });
             }
-            Err(err) => return Err(err.into()),
-        }
-        if let Some((owner, queued)) = self
-            .emergency_settlements
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .get(id)
-            .cloned()
-            && (owner != tenant || queued != actual)
-        {
-            if owner != tenant {
-                return Err(BudgetError::TenantMismatch {
-                    reservation_id: id.0.clone(),
-                });
+            Err(err) => {
+                // The upstream call already completed. Keep its cost without
+                // trusting the caller's tenant until ownership can be read.
+                // Dropping the live marker makes the durable intent fail
+                // closed until the result can be verified and recovered.
+                let mut pending = self
+                    .unverified_settlements
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner());
+                pending
+                    .entry((id.clone(), tenant.to_owned()))
+                    .or_insert(actual);
+                drop(pending);
+                self.finish_settlement_intent(id);
+                return Err(err.into());
             }
-            return Err(BudgetError::SettlementConflict {
-                reservation_id: id.0.clone(),
-                reason: "in-memory recovery already contains a different tenant or cost".into(),
-            });
         }
         let result = self.settle_durable_with_hook(tenant, id, actual, || {});
         if matches!(result, Err(BudgetError::Busy | BudgetError::Storage(_))) && actual >= 0 {
@@ -282,6 +314,48 @@ impl BudgetLedger {
     pub fn retry_settlements(&self) -> Result<(), BudgetError> {
         let mut journal = self.settlements.lock().unwrap_or_else(|p| p.into_inner());
         let tx = journal.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // Recheck ownership before promoting any in-memory result into the
+        // durable emergency journal. A failed read leaves the result here and
+        // aborts recovery, keeping reserve fail-closed through the intent.
+        let unverified_rows: Vec<_> = self
+            .unverified_settlements
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .map(|((id, tenant), actual)| (id.clone(), tenant.clone(), *actual))
+            .collect();
+        for (id, tenant, actual) in unverified_rows {
+            let owner: Option<String> = {
+                let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+                conn.query_row(
+                    "SELECT tenant_id FROM reservations WHERE id=?1",
+                    [&id.0],
+                    |r| r.get(0),
+                )
+                .optional()?
+            };
+            match owner {
+                Some(owner) if owner == tenant => {
+                    self.persist_emergency_settlement(&id, &tenant, actual)?;
+                }
+                Some(owner) => {
+                    quarantine(
+                        &tx,
+                        &id,
+                        &tenant,
+                        actual,
+                        &format!("unverified tenant does not own reservation (owner {owner})"),
+                    )?;
+                }
+                None => {
+                    quarantine(&tx, &id, &tenant, actual, "reservation does not exist")?;
+                }
+            }
+            self.unverified_settlements
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(&(id, tenant));
+        }
         let memory_rows: Vec<_> = self
             .emergency_settlements
             .lock()

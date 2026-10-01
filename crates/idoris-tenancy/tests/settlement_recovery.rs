@@ -318,3 +318,147 @@ fn sidecar_busy_foreign_tenant_cannot_poison_real_settlement() {
         }
     }
 }
+
+#[test]
+fn failed_initial_owner_lookup_retains_cost_until_storage_recovers() {
+    let db = path();
+    let scope = BudgetScope::new("tenant", "key", "provider", "model");
+    let clock = Arc::new(TestClock(AtomicI64::new(0)));
+    let ledger = open(&db, clock.clone());
+    let id = ledger.reserve(&scope, Price::Known(40)).unwrap();
+    ledger.begin_settlement("tenant", &id).unwrap();
+
+    // Removing the table makes the ownership SELECT fail deterministically;
+    // restore it before retrying the in-memory completion record.
+    let primary = Connection::open(&db).unwrap();
+    primary
+        .execute_batch("ALTER TABLE reservations RENAME TO reservations_temporarily_hidden;")
+        .unwrap();
+    drop(primary);
+
+    assert!(ledger.settle_durable("other", &id, 7).is_err());
+    assert!(ledger.settle_durable("tenant", &id, 31).is_err());
+    assert!(ledger.reserve(&scope, Price::Known(1)).is_err());
+
+    let primary = Connection::open(&db).unwrap();
+    primary
+        .execute_batch("ALTER TABLE reservations_temporarily_hidden RENAME TO reservations;")
+        .unwrap();
+    drop(primary);
+    for result in [
+        ledger.settle_durable("tenant", &id, 32).map(|_| ()),
+        ledger.settle("tenant", &id, 32).map(|_| ()),
+        ledger.release_confirmed_unexecuted("tenant", &id),
+    ] {
+        assert!(matches!(
+            result,
+            Err(BudgetError::SettlementConflict { .. })
+        ));
+    }
+    clock.0.store(10_000, Ordering::SeqCst);
+    // Admission retries the saved charge first: the remaining 69 cannot
+    // cover 70, even though the original reservation has expired.
+    assert!(ledger.reserve(&scope, Price::Known(70)).is_err());
+
+    ledger.retry_settlements().unwrap();
+    assert_eq!(ledger.tenant_balance("tenant").unwrap(), 69);
+    assert_eq!(ledger.balance(&scope).unwrap(), 69);
+    ledger.retry_settlements().unwrap();
+    assert_eq!(ledger.tenant_balance("tenant").unwrap(), 69);
+    let primary = Connection::open(&db).unwrap();
+    let row: (String, i64) = primary
+        .query_row(
+            "SELECT status, actual_cost_minor FROM reservations WHERE id=?1",
+            [&id.0],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get::<_, Option<i64>>(1)?.unwrap_or_default(),
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(row, ("settled".into(), 31));
+    drop(primary);
+    drop(ledger);
+    for file in [&db, &db.with_added_extension("settlements.sqlite3")] {
+        for suffix in ["", "-wal", "-shm"] {
+            let mut path = file.clone().into_os_string();
+            path.push(suffix);
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+#[test]
+fn another_instance_cannot_release_volatile_settlement_intent() {
+    let db = path();
+    let sidecar_path = db.with_added_extension("settlements.sqlite3");
+    let scope = BudgetScope::new("tenant", "key", "provider", "model");
+    let clock = Arc::new(TestClock(AtomicI64::new(0)));
+    let a = BudgetLedger::open_with_busy_timeout(&db, clock.clone(), 100, Duration::ZERO).unwrap();
+    a.configure_tenant("tenant", 100, "UTC", SpendGate::PaidOnly)
+        .unwrap();
+    a.configure(&scope, 100, "UTC").unwrap();
+    let b = BudgetLedger::open_with_busy_timeout(&db, clock.clone(), 100, Duration::ZERO).unwrap();
+    let id = a.reserve(&scope, Price::Known(40)).unwrap();
+    a.begin_settlement("tenant", &id).unwrap();
+
+    let mut sidecar = Connection::open(&sidecar_path).unwrap();
+    let writer = sidecar
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .unwrap();
+    assert!(matches!(
+        a.settle_durable("tenant", &id, 31),
+        Err(BudgetError::Busy)
+    ));
+    writer.rollback().unwrap();
+
+    assert!(matches!(
+        b.release("tenant", &id),
+        Err(BudgetError::SettlementConflict { .. })
+    ));
+    clock.0.store(10_000, Ordering::SeqCst);
+    assert!(b.reserve(&scope, Price::Known(1)).is_err());
+    a.retry_settlements().unwrap();
+    assert_eq!(b.tenant_balance("tenant").unwrap(), 69);
+    a.retry_settlements().unwrap();
+    assert_eq!(b.tenant_balance("tenant").unwrap(), 69);
+
+    let confirmed = a.reserve(&scope, Price::Known(10)).unwrap();
+    a.begin_settlement("tenant", &confirmed).unwrap();
+    assert!(matches!(
+        a.release_confirmed_unexecuted("other", &confirmed),
+        Err(BudgetError::TenantMismatch { .. })
+    ));
+    a.release_confirmed_unexecuted("tenant", &confirmed)
+        .unwrap();
+    let ordinary = a.reserve(&scope, Price::Known(10)).unwrap();
+    a.release("tenant", &ordinary).unwrap();
+
+    let primary = Connection::open(&db).unwrap();
+    let row: (String, i64) = primary
+        .query_row(
+            "SELECT status, actual_cost_minor FROM reservations WHERE id=?1",
+            [&id.0],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get::<_, Option<i64>>(1)?.unwrap_or_default(),
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(row, ("settled".into(), 31));
+    drop(primary);
+    drop(sidecar);
+    drop(a);
+    drop(b);
+    for file in [&db, &sidecar_path] {
+        for suffix in ["", "-wal", "-shm"] {
+            let mut path = file.clone().into_os_string();
+            path.push(suffix);
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
