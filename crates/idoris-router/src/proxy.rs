@@ -444,21 +444,70 @@ impl ChatProxy {
                     .map(str::to_string);
                 if (200..300).contains(&status) {
                     let idle = self.idle_timeout;
-                    // The body owns both connection and permit. EOF, read
-                    // failure, idle timeout and client drop all release them.
-                    let stream = futures_util::stream::try_unfold(
-                        (resp, permit),
-                        move |(mut resp, permit)| async move {
-                            let chunk = tokio::time::timeout(idle, resp.chunk())
-                                .await
-                                .map_err(|_| {
-                                    std::io::Error::new(
+                    // Keep upstream reads running independently of downstream
+                    // body polling. A single queued chunk bounds buffering;
+                    // both reading and waiting for queue capacity have an
+                    // idle deadline. Dropping the body closes the receiver,
+                    // which cancels this task and drops the response/permit.
+                    let (tx, rx) = tokio::sync::mpsc::channel(1);
+                    let (error_tx, error_rx) = tokio::sync::oneshot::channel();
+                    tokio::spawn(async move {
+                        let mut resp = resp;
+                        let mut terminal_error = None;
+                        loop {
+                            let read = tokio::select! {
+                                _ = tx.closed() => break,
+                                read = tokio::time::timeout(idle, resp.chunk()) => read,
+                            };
+                            let chunk = match read {
+                                Err(_) => {
+                                    terminal_error = Some(std::io::Error::new(
                                         std::io::ErrorKind::TimedOut,
                                         "upstream stream idle timeout",
-                                    )
-                                })?
-                                .map_err(std::io::Error::other)?;
-                            Ok::<_, std::io::Error>(chunk.map(|chunk| (chunk, (resp, permit))))
+                                    ));
+                                    break;
+                                }
+                                Ok(Err(err)) => {
+                                    terminal_error = Some(std::io::Error::other(err));
+                                    break;
+                                }
+                                Ok(Ok(None)) => break,
+                                Ok(Ok(Some(chunk))) => chunk,
+                            };
+                            let reserve = tokio::select! {
+                                _ = tx.closed() => break,
+                                reserve = tokio::time::timeout(idle, tx.reserve()) => reserve,
+                            };
+                            let slot = match reserve {
+                                Ok(Ok(slot)) => slot,
+                                Ok(Err(_)) => break,
+                                Err(_) => {
+                                    terminal_error = Some(std::io::Error::new(
+                                        std::io::ErrorKind::TimedOut,
+                                        "upstream stream idle timeout while downstream is backpressured",
+                                    ));
+                                    break;
+                                }
+                            };
+                            slot.send(chunk);
+                        }
+                        drop(resp);
+                        drop(permit);
+                        if let Some(error) = terminal_error {
+                            let _ = error_tx.send(error);
+                        }
+                    });
+                    let stream = futures_util::stream::unfold(
+                        (rx, Some(error_rx)),
+                        |(mut rx, error_rx)| async move {
+                            if let Some(chunk) = rx.recv().await {
+                                return Some((Ok(chunk), (rx, error_rx)));
+                            }
+                            let error_rx = error_rx?;
+                            match error_rx.await {
+                                Ok(error) => Some((Err(error), (rx, None))),
+                                Err(_) => None,
+                            }
                         },
                     );
                     StreamOutcome::Stream {
@@ -493,8 +542,9 @@ impl ChatProxy {
 
 /// [`ChatProxy::forward_stream`]'s result: either the initial response
 /// wasn't ok (returned buffered, see that method's doc) or it was, in which
-/// case `response` is a body owning the upstream connection and permit,
-/// with an explicit read error on truncation or idle timeout.
+/// case a background producer owns the upstream connection and permit while
+/// `response` provides bounded buffering and cancels that producer on drop.
+/// Truncation or idle timeout remains visible as a body read error.
 pub enum StreamOutcome {
     Buffered {
         status: u16,
@@ -849,6 +899,14 @@ mod tests {
             StreamOutcome::Buffered { status: 503, .. }
         ));
         drop(out);
+        let _released = tokio::time::timeout(
+            Duration::from_millis(100),
+            proxy.permits.clone().acquire_owned(),
+        )
+        .await
+        .expect("dropping the body must cancel its producer and release the permit")
+        .expect("semaphore remains open");
+        drop(_released);
         assert_eq!(proxy.permits.available_permits(), 1);
         let StreamOutcome::Stream { response, .. } =
             proxy.forward_stream(&server.uri(), &chat_body()).await
@@ -1082,3 +1140,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "proxy/stream_limits_tests.rs"]
+mod stream_limits_tests;
