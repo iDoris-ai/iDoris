@@ -74,11 +74,39 @@ impl BudgetLedger {
         id: &ReservationId,
         actual: i64,
     ) -> Result<Option<i64>, BudgetError> {
+        self.settle_durable_with_hooks(tenant, id, actual, || {}, || {})
+    }
+
+    /// Test seam that pauses before acquiring the settlement coordinator.
+    /// The callback runs before any in-memory recovery check.
+    #[cfg(test)]
+    pub(super) fn settle_durable_before_lock_hook<F: FnOnce()>(
+        &self,
+        tenant: &str,
+        id: &ReservationId,
+        actual: i64,
+        before_lock: F,
+    ) -> Result<Option<i64>, BudgetError> {
+        self.settle_durable_with_hooks(tenant, id, actual, before_lock, || {})
+    }
+
+    fn settle_durable_with_hooks<B: FnOnce(), A: FnOnce()>(
+        &self,
+        tenant: &str,
+        id: &ReservationId,
+        actual: i64,
+        before_lock: B,
+        after_active_read: A,
+    ) -> Result<Option<i64>, BudgetError> {
         if actual < 0 {
             return Err(BudgetError::InvalidActualCost {
                 actual_cost_minor: actual,
             });
         }
+        before_lock();
+        // Serialize every in-memory observation/update with the durable
+        // settlement transaction. Keep this guard through fallback recording.
+        let mut journal = self.settlements.lock().unwrap_or_else(|p| p.into_inner());
         if let Some((owner, queued)) = self
             .emergency_settlements
             .lock()
@@ -112,8 +140,8 @@ impl BudgetLedger {
         // Validate ownership before the sidecar transaction can return Busy.
         // In that path the caller's cost is kept in memory for recovery, so
         // only a tenant already verified against the primary ledger may reach
-        // that fallback. Drop the primary connection guard before acquiring
-        // the sidecar lock below to preserve the sidecar -> primary lock order.
+        // that fallback. The in-process sidecar coordinator is already held;
+        // drop the primary guard before opening the sidecar write transaction.
         let state = {
             let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
             conn.query_row(
@@ -156,7 +184,8 @@ impl BudgetLedger {
         // fail (for example, BEGIN IMMEDIATE returning Busy). The durable
         // intent remains as the fail-closed admission fence until recovery.
         self.finish_settlement_intent(id);
-        let result = self.settle_durable_with_hook(tenant, id, actual, || {});
+        let result =
+            self.settle_durable_locked(&mut journal, tenant, id, actual, after_active_read);
         if matches!(result, Err(BudgetError::Busy | BudgetError::Storage(_))) && actual >= 0 {
             let mut memory = self
                 .emergency_settlements
@@ -181,8 +210,20 @@ impl BudgetLedger {
     /// Test seam for deterministically coordinating release against the
     /// active-state read while the sidecar's cross-instance writer lock is
     /// held. The callback is instance-local and absent from production paths.
+    #[cfg(test)]
     pub(super) fn settle_durable_with_hook<F: FnOnce()>(
         &self,
+        tenant: &str,
+        id: &ReservationId,
+        actual: i64,
+        after_active_read: F,
+    ) -> Result<Option<i64>, BudgetError> {
+        self.settle_durable_with_hooks(tenant, id, actual, || {}, after_active_read)
+    }
+
+    fn settle_durable_locked<F: FnOnce()>(
+        &self,
+        journal: &mut Connection,
         tenant: &str,
         id: &ReservationId,
         actual: i64,
@@ -193,7 +234,6 @@ impl BudgetLedger {
                 actual_cost_minor: actual,
             });
         }
-        let mut journal = self.settlements.lock().unwrap_or_else(|p| p.into_inner());
         let tx = journal.transaction_with_behavior(TransactionBehavior::Immediate)?;
         // The sidecar writer lock is acquired before touching the ledger in
         // every settlement/release path, coordinating independent processes.
@@ -319,8 +359,7 @@ impl BudgetLedger {
                 "settlement sidecar commit failed: {err}"
             )));
         } // pending is durable before touching the primary ledger
-        drop(journal);
-        match self.retry_one(id, tenant, actual) {
+        match self.retry_one(journal, id, tenant, actual) {
             Ok(()) => Ok(Some(actual)),
             Err(err @ (BudgetError::Busy | BudgetError::Storage(_))) => {
                 eprintln!("budget settlement queued: reservation={} error={err}", id.0);
@@ -498,11 +537,11 @@ impl BudgetLedger {
 
     fn retry_one(
         &self,
+        journal: &mut Connection,
         id: &ReservationId,
         expected_tenant: &str,
         expected_actual: i64,
     ) -> Result<(), BudgetError> {
-        let mut journal = self.settlements.lock().unwrap_or_else(|p| p.into_inner());
         let tx = journal.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let row: Option<(String, i64)> = tx.query_row(
             "SELECT tenant_id, actual_cost_minor FROM pending_settlements WHERE reservation_id=?1",
