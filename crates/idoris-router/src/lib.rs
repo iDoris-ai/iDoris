@@ -191,6 +191,13 @@ impl std::fmt::Debug for AppState {
 
 impl Default for AppState {
     fn default() -> Self {
+        // K13's connect-only retries require K01's no-redirect policy:
+        // a failed redirected connection may follow an already executed POST.
+        let proxy_client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .no_proxy()
+            .build()
+            .unwrap_or_else(|err| panic!("failed to build the router HTTP client: {err}"));
         Self {
             instance_id: Uuid::new_v4().to_string(),
             deploy_mode: profile::deploy_mode_from_env(
@@ -200,7 +207,7 @@ impl Default for AppState {
             supervisor: None,
             budget_ledger: None,
             http_client: reqwest::Client::new(),
-            proxy: Arc::new(proxy::ChatProxy::new(reqwest::Client::new())),
+            proxy: Arc::new(proxy::ChatProxy::new(proxy_client)),
         }
     }
 }
@@ -1269,6 +1276,47 @@ mod tests {
         // {object: "chat.completion", choices: [...]} shape.
         assert_eq!(json["marker"], "proxied");
         assert!(json.get("object").is_none());
+    }
+
+    #[tokio::test]
+    async fn resident_http_service_proxy_does_not_follow_upstream_redirects() {
+        let closed_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let refused_address = closed_listener.local_addr().unwrap();
+        drop(closed_listener);
+
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/v1/chat/completions"))
+            .and(wiremock::matchers::body_json(serde_json::json!({
+                "model": "idoris/daily",
+                "stream": false,
+                "messages": [{"role": "user", "content": "redirect guard payload"}]
+            })))
+            .respond_with(
+                wiremock::ResponseTemplate::new(303)
+                    .insert_header("Location", format!("http://{refused_address}/redirected")),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let state = AppState {
+            cards: vec![resident_component_card("omlx", &server.uri())],
+            ..AppState::default()
+        };
+        let app = build_app(state);
+        let response = app
+            .oneshot(post_chat(
+                r#"{"model":"idoris/daily","messages":[{"role":"user","content":"redirect guard payload"}]}"#,
+                &[],
+            ))
+            .await
+            .unwrap();
+
+        let received = server.received_requests().await.unwrap();
+        assert_eq!(received.len(), 1);
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        server.verify().await;
     }
 
     #[tokio::test]

@@ -158,6 +158,9 @@ pub struct ChatProxy {
 }
 
 impl ChatProxy {
+    /// Creates a proxy. The injected `client` must have redirects disabled
+    /// for connection-failure retries to be safe, since a redirect can obscure
+    /// whether the upstream accepted the POST.
     pub fn new(client: reqwest::Client) -> Self {
         Self {
             client,
@@ -177,6 +180,9 @@ impl ChatProxy {
     /// non-test build, which is fine here since nothing outside `#[cfg(test)]`
     /// calls it yet) — `#[allow(dead_code)]` instead, since a real non-test
     /// caller may legitimately want a custom window/retry policy later.
+    /// The injected `client` must have redirects disabled for
+    /// connection-failure retries to be safe, since a redirect can obscure
+    /// whether the upstream accepted the POST.
     #[allow(dead_code)]
     pub(crate) fn with_config(
         client: reqwest::Client,
@@ -275,6 +281,10 @@ impl ChatProxy {
             opts.provider_id,
             request_id,
         );
+        // A cache hit remains useful even when every flight slot is occupied.
+        if let Some(hit) = self.lookup_cached(&key, &fingerprint, opts) {
+            return hit;
+        }
         let flight = {
             let Ok(mut flights) = self.flights.lock() else {
                 return Self::failure(502, "upstream_unavailable");
@@ -301,6 +311,11 @@ impl ChatProxy {
                 // Bound all retained slots: active flights may become
                 // uncertain if their leaders are cancelled.
                 if flights.len() >= self.max_entries {
+                    // A successful call may have populated the cache after
+                    // the preflight lookup but before this capacity check.
+                    if let Some(hit) = self.lookup_cached(&key, &fingerprint, opts) {
+                        return hit;
+                    }
                     return Self::failure(503, "upstream_unavailable");
                 }
                 let flight = Arc::new(Flight {
@@ -351,6 +366,34 @@ impl ChatProxy {
         }
     }
 
+    fn lookup_cached(
+        &self,
+        key: &str,
+        fingerprint: &Value,
+        opts: &ForwardOpts<'_>,
+    ) -> Option<ForwardOutcome> {
+        #[allow(clippy::unwrap_used)]
+        let hit = self.cache.lock().unwrap().get(key).cloned();
+        let entry = hit.filter(|entry| Instant::now().duration_since(entry.at) < self.window)?;
+        if entry.fingerprint != *fingerprint {
+            return Some(Self::failure(409, "request_id_conflict"));
+        }
+        // A local_only request must never replay a cache entry whose recorded
+        // Served-Locality isn't loopback. Let it proceed through forwarding.
+        if opts.privacy == PrivacyClass::LocalOnly && entry.served_locality != Locality::Loopback {
+            return None;
+        }
+        Some(ForwardOutcome {
+            status: entry.status,
+            body: entry.body,
+            content_type: Some("application/json".to_string()),
+            cached: true,
+            origin_record_id: Some(entry.record_id),
+            replayed_served_locality: Some(entry.served_locality),
+            retries: 0,
+        })
+    }
+
     async fn forward_once(
         &self,
         endpoint: &str,
@@ -364,31 +407,8 @@ impl ChatProxy {
 
         if let Some(request_id) = opts.request_id {
             let key = cache_key(tenant_scope, &url, opts.provider_id, request_id);
-            #[allow(clippy::unwrap_used)]
-            let hit = self.cache.lock().unwrap().get(&key).cloned();
-            if let Some(entry) = hit
-                && Instant::now().duration_since(entry.at) < self.window
-            {
-                if entry.fingerprint != *fingerprint {
-                    return Self::failure(409, "request_id_conflict");
-                }
-                // C1 fail-closed: a local_only request must never replay a
-                // cache entry whose *recorded* Served-Locality isn't
-                // loopback (a missing/foreign value is treated as unsafe,
-                // not defaulted to "assume it's fine").
-                let unsafe_for_local_only = opts.privacy == PrivacyClass::LocalOnly
-                    && entry.served_locality != Locality::Loopback;
-                if !unsafe_for_local_only {
-                    return ForwardOutcome {
-                        status: entry.status,
-                        body: entry.body,
-                        content_type: Some("application/json".to_string()),
-                        cached: true,
-                        origin_record_id: Some(entry.record_id),
-                        replayed_served_locality: Some(entry.served_locality),
-                        retries: 0,
-                    };
-                }
+            if let Some(hit) = self.lookup_cached(&key, fingerprint, opts) {
+                return hit;
             }
         }
 
@@ -559,6 +579,10 @@ pub enum StreamOutcome {
 #[cfg(test)]
 #[path = "proxy_cancellation_tests.rs"]
 mod cancellation_tests;
+
+#[cfg(test)]
+#[path = "proxy_review_tests.rs"]
+mod review_tests;
 
 #[cfg(test)]
 mod tests {
