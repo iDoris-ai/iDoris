@@ -8,13 +8,13 @@ use super::{BudgetError, BudgetLedger, ReservationId};
 
 impl BudgetLedger {
     /// Persist before starting a paid upstream call. After an unclean restart,
-    /// admission stays closed until every unknown outcome is reconciled using
+    /// this tenant's admission stays closed until its unknown outcomes are reconciled using
     /// `settle_durable`, or `release_confirmed_unexecuted` after confirming
     /// that the upstream call did not execute.
     pub fn begin_settlement(&self, tenant: &str, id: &ReservationId) -> Result<(), BudgetError> {
         let mut journal = self.settlements.lock().unwrap_or_else(|p| p.into_inner());
         let tx = journal.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        self.check_settlement_intents(&tx)?;
+        self.check_settlement_intents(&tx, Some(tenant))?;
         let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
         let row: Option<(String, String, i64)> = conn
             .query_row(
@@ -71,10 +71,11 @@ impl BudgetLedger {
     pub(super) fn check_settlement_intents(
         &self,
         tx: &rusqlite::Transaction<'_>,
+        tenant_scope: Option<&str>,
     ) -> Result<(), BudgetError> {
         let rows = tx
-            .prepare("SELECT reservation_id, tenant_id FROM settlement_intents")?
-            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+            .prepare("SELECT reservation_id, tenant_id FROM settlement_intents WHERE (?1 IS NULL OR tenant_id=?1)")?
+            .query_map([tenant_scope], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
             .collect::<Result<Vec<_>, _>>()?;
         let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
         let mut live = self
@@ -96,9 +97,9 @@ impl BudgetLedger {
                 )?;
                 live.remove(&id);
             } else if !live.contains_key(&id) {
-                return Err(BudgetError::Storage(format!(
-                    "unconfirmed dispatch outcome for reservation {id}; reconcile before admitting spending"
-                )));
+                return Err(BudgetError::Storage(
+                    "unconfirmed dispatch outcome; reconcile before admitting spending".into(),
+                ));
             }
         }
         Ok(())

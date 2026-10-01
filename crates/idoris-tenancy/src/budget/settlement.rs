@@ -309,9 +309,17 @@ impl BudgetLedger {
         }
     }
 
-    /// Retry on startup, periodically, and before admitting new spending.
+    /// Recover every tenant on startup or when called explicitly. Reserve
+    /// uses the tenant-scoped variant before admitting new spending.
     /// A journal write transaction serializes recovery across processes.
     pub fn retry_settlements(&self) -> Result<(), BudgetError> {
+        self.retry_settlements_for_tenant(None)
+    }
+
+    pub(super) fn retry_settlements_for_tenant(
+        &self,
+        tenant_scope: Option<&str>,
+    ) -> Result<(), BudgetError> {
         let mut journal = self.settlements.lock().unwrap_or_else(|p| p.into_inner());
         let tx = journal.transaction_with_behavior(TransactionBehavior::Immediate)?;
         // Recheck ownership before promoting any in-memory result into the
@@ -322,6 +330,7 @@ impl BudgetLedger {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .iter()
+            .filter(|((_, tenant), _)| tenant_scope.is_none_or(|scope| tenant == scope))
             .map(|((id, tenant), actual)| (id.clone(), tenant.clone(), *actual))
             .collect();
         for (id, tenant, actual) in unverified_rows {
@@ -361,6 +370,7 @@ impl BudgetLedger {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .iter()
+            .filter(|(_, (tenant, _))| tenant_scope.is_none_or(|scope| tenant == scope))
             .map(|(id, (tenant, actual))| (id.clone(), tenant.clone(), *actual))
             .collect();
         for (id, tenant, actual) in memory_rows {
@@ -386,9 +396,9 @@ impl BudgetLedger {
         let rows = {
             let mut stmt = tx.prepare(
                 "SELECT reservation_id, tenant_id, actual_cost_minor
-                FROM pending_settlements",
+                FROM pending_settlements WHERE (?1 IS NULL OR tenant_id=?1)",
             )?;
-            stmt.query_map([], |r| {
+            stmt.query_map([tenant_scope], |r| {
                 Ok((
                     ReservationId(r.get(0)?),
                     r.get::<_, String>(1)?,
@@ -423,9 +433,9 @@ impl BudgetLedger {
         let emergencies = {
             let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
             let mut stmt = conn.prepare(
-                "SELECT reservation_id, tenant_id, actual_cost_minor FROM budget_emergency_settlements",
+                "SELECT reservation_id, tenant_id, actual_cost_minor FROM budget_emergency_settlements WHERE (?1 IS NULL OR tenant_id=?1)",
             )?;
-            stmt.query_map([], |r| {
+            stmt.query_map([tenant_scope], |r| {
                 Ok((
                     ReservationId(r.get(0)?),
                     r.get::<_, String>(1)?,
@@ -453,7 +463,7 @@ impl BudgetLedger {
                 Err(err) => return Err(err),
             }
         }
-        self.check_settlement_intents(&tx)?;
+        self.check_settlement_intents(&tx, tenant_scope)?;
         tx.commit()?;
         for id in completed_emergencies {
             let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
@@ -846,7 +856,7 @@ mod tests {
             })
             .unwrap();
         assert_eq!(quarantine_count, 3);
-        // Admission itself must also isolate legacy poison rows, without a restart.
+        // B's admission leaves A's poison row for A's retry or global maintenance.
         reopened
             .settlements
             .lock()
@@ -861,6 +871,8 @@ mod tests {
                 .reserve(&BudgetScope::new("b", "k", "p", "m"), Price::Known(1))
                 .is_ok()
         );
+        assert_eq!(pending(&reopened), 1);
+        reopened.retry_settlements().unwrap();
         assert_eq!(pending(&reopened), 0);
         drop(reopened);
         let _ = std::fs::remove_file(&path);

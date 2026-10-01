@@ -508,7 +508,7 @@ impl BudgetLedger {
             Price::Known(v) => v,
         };
 
-        self.retry_settlements()?;
+        self.retry_settlements_for_tenant(Some(&scope.tenant_id))?;
         let now_ms = self.clock.now_ms();
         let mut conn = self.lock();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;

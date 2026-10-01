@@ -454,18 +454,41 @@ async fn cancelled_dispatch_with_busy_sidecar_keeps_unknown_intent_fenced_after_
     let db_path = dir.path().join("budget.sqlite3");
     let clock = Arc::new(TestClock::default());
     let ledger = Arc::new(build_ledger(&db_path, clock.clone()));
+    ledger
+        .configure_tenant("tenant-a", 1_000_000, "UTC", SpendGate::PaidOnly)
+        .unwrap();
+    ledger
+        .configure(
+            &BudgetScope::new("tenant-a", "default", PROVIDER, PROVIDER),
+            1_000_000,
+            "UTC",
+        )
+        .unwrap();
+    ledger
+        .configure_tenant("tenant-b", 1_000_000, "UTC", SpendGate::PaidOnly)
+        .unwrap();
+    ledger
+        .configure(
+            &BudgetScope::new("tenant-b", "default", PROVIDER, PROVIDER),
+            1_000_000,
+            "UTC",
+        )
+        .unwrap();
     let entered = Arc::new(Notify::new());
+    let continue_chat = Arc::new(Notify::new());
+    let chat_calls = Arc::new(AtomicUsize::new(0));
     let adapter = Arc::new(GatedAdapter {
         mock: MockAdapter::new(vec![ModelInfo {
             id: PROVIDER.into(),
             memory_gb: 1.0,
         }]),
         entered: entered.clone(),
-        continue_chat: Arc::new(Notify::new()),
-        chat_calls: None,
+        continue_chat: continue_chat.clone(),
+        chat_calls: Some(chat_calls.clone()),
     });
     let supervisor = Supervisor::spawn(adapter, SupervisorConfig::default()).unwrap();
     let app = build_app(AppState {
+        deploy_mode: idoris_contracts::DeployMode::Tenant,
         cards: vec![card()],
         supervisor: Some(supervisor),
         budget_ledger: Some(ledger.clone()),
@@ -473,6 +496,7 @@ async fn cancelled_dispatch_with_busy_sidecar_keeps_unknown_intent_fenced_after_
     });
     let request = Request::post("/v1/chat/completions")
         .header("content-type", "application/json")
+        .header("x-idoris-tenant", "tenant-a")
         .body(Body::from(BODY))
         .unwrap();
     let task = tokio::spawn(app.clone().oneshot(request));
@@ -492,13 +516,21 @@ async fn cancelled_dispatch_with_busy_sidecar_keeps_unknown_intent_fenced_after_
         .query_row("SELECT COUNT(*) FROM settlement_intents", [], |r| r.get(0))
         .unwrap();
     assert_eq!(intents, 1, "unknown execution intent must remain durable");
+    let a_reservation: String = tx
+        .query_row(
+            "SELECT reservation_id FROM settlement_intents WHERE tenant_id='tenant-a'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
     drop(tx);
     drop(sidecar);
 
     // The reservation is expired now, but an unresolved durable intent must
     // continue to block the next paid dispatch.
     clock.0.store(1_000_000, Ordering::SeqCst);
-    let admission = ledger.reserve(&scope(), Price::Known(1));
+    let a_scope = BudgetScope::new("tenant-a", "default", PROVIDER, PROVIDER);
+    let admission = ledger.reserve(&a_scope, Price::Known(1));
     assert!(
         admission
             .expect_err("expired reservation with unresolved intent must remain fenced")
@@ -507,9 +539,10 @@ async fn cancelled_dispatch_with_busy_sidecar_keeps_unknown_intent_fenced_after_
     );
     let request = Request::post("/v1/chat/completions")
         .header("content-type", "application/json")
+        .header("x-idoris-tenant", "tenant-a")
         .body(Body::from(BODY))
         .unwrap();
-    let response = tokio::time::timeout(Duration::from_secs(2), app.oneshot(request))
+    let response = tokio::time::timeout(Duration::from_secs(2), app.clone().oneshot(request))
         .await
         .unwrap()
         .unwrap();
@@ -517,11 +550,52 @@ async fn cancelled_dispatch_with_busy_sidecar_keeps_unknown_intent_fenced_after_
     let bytes = response.into_body().collect().await.unwrap().to_bytes();
     let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(body["error"]["type"], "internal_error");
+    assert!(!String::from_utf8_lossy(&bytes).contains(&a_reservation));
     let intents: i64 = Connection::open(db_path.with_added_extension("settlements.sqlite3"))
         .unwrap()
         .query_row("SELECT COUNT(*) FROM settlement_intents", [], |r| r.get(0))
         .unwrap();
     assert_eq!(intents, 1);
+
+    let b_request = Request::post("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .header("x-idoris-tenant", "tenant-b")
+        .body(Body::from(BODY))
+        .unwrap();
+    let b_task = tokio::spawn(app.clone().oneshot(b_request));
+    tokio::time::timeout(Duration::from_secs(2), entered.notified())
+        .await
+        .expect("tenant B paid request should enter adapter despite A's intent");
+    continue_chat.notify_waiters();
+    let b_response = tokio::time::timeout(Duration::from_secs(2), b_task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(b_response.status(), StatusCode::OK);
+    assert_eq!(chat_calls.load(Ordering::SeqCst), 2);
+    assert!(ledger.tenant_balance("tenant-b").unwrap() < 1_000_000);
+    assert!(ledger.reserve(&a_scope, Price::Known(1)).is_err());
+    let primary = Connection::open(&db_path).unwrap();
+    let a_status: String = primary
+        .query_row(
+            "SELECT status FROM reservations WHERE id=?1",
+            [&a_reservation],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(a_status, "active");
+    let retained_intent: i64 = Connection::open(
+        db_path.with_added_extension("settlements.sqlite3"),
+    )
+    .unwrap()
+    .query_row(
+        "SELECT COUNT(*) FROM settlement_intents WHERE reservation_id=?1 AND tenant_id='tenant-a'",
+        [&a_reservation],
+        |r| r.get(0),
+    )
+    .unwrap();
+    assert_eq!(retained_intent, 1);
 }
 
 #[tokio::test]

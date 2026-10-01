@@ -41,6 +41,91 @@ fn open(path: &std::path::Path, clock: Arc<TestClock>) -> BudgetLedger {
 }
 
 #[test]
+fn unresolved_intent_is_scoped_to_its_tenant_across_expiry_and_restart() {
+    let db = path();
+    let clock = Arc::new(TestClock(AtomicI64::new(0)));
+    let a_scope = BudgetScope::new("tenant-a", "key", "provider", "model");
+    let b_scope = BudgetScope::new("tenant-b", "key", "provider", "model");
+    let ledger =
+        BudgetLedger::open_with_busy_timeout(&db, clock.clone(), 100, Duration::ZERO).unwrap();
+    for tenant in ["tenant-a", "tenant-b"] {
+        ledger
+            .configure_tenant(tenant, 100, "UTC", SpendGate::PaidOnly)
+            .unwrap();
+    }
+    ledger.configure(&a_scope, 100, "UTC").unwrap();
+    ledger.configure(&b_scope, 100, "UTC").unwrap();
+
+    let a_id = ledger.reserve(&a_scope, Price::Known(40)).unwrap();
+    ledger.begin_settlement("tenant-a", &a_id).unwrap();
+    let mut busy_sidecar =
+        Connection::open(db.with_added_extension("settlements.sqlite3")).unwrap();
+    let lock = busy_sidecar
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .unwrap();
+    assert!(matches!(
+        ledger.release("tenant-a", &a_id),
+        Err(BudgetError::Busy)
+    ));
+    drop(lock);
+    drop(busy_sidecar);
+    let blocked = ledger.reserve(&a_scope, Price::Known(1)).unwrap_err();
+    assert!(blocked.to_string().contains("unconfirmed dispatch outcome"));
+    assert!(!blocked.to_string().contains(&a_id.0));
+    assert!(matches!(
+        ledger.release("tenant-a", &a_id),
+        Err(BudgetError::SettlementConflict { .. })
+    ));
+
+    let b_id = ledger.reserve(&b_scope, Price::Known(20)).unwrap();
+    ledger.begin_settlement("tenant-b", &b_id).unwrap();
+    assert_eq!(
+        ledger.settle_durable("tenant-b", &b_id, 17).unwrap(),
+        Some(17)
+    );
+    // Global recovery retries both tenants; A remains unresolved while B is charged.
+    assert!(ledger.retry_settlements().is_err());
+    assert_eq!(ledger.tenant_balance("tenant-b").unwrap(), 83);
+    clock.0.store(10_000, Ordering::SeqCst);
+    assert!(ledger.reserve(&a_scope, Price::Known(1)).is_err());
+    assert!(ledger.reserve(&b_scope, Price::Known(1)).is_ok());
+    drop(ledger);
+
+    let reopened = BudgetLedger::open_with(&db, clock, 100).unwrap();
+    assert!(reopened.reserve(&a_scope, Price::Known(1)).is_err());
+    assert_eq!(reopened.tenant_balance("tenant-b").unwrap(), 82);
+    let after_restart = reopened.reserve(&b_scope, Price::Known(10)).unwrap();
+    reopened
+        .begin_settlement("tenant-b", &after_restart)
+        .unwrap();
+    assert_eq!(
+        reopened
+            .settle_durable("tenant-b", &after_restart, 9)
+            .unwrap(),
+        Some(9)
+    );
+    assert_eq!(reopened.tenant_balance("tenant-b").unwrap(), 73);
+    let sidecar = Connection::open(db.with_added_extension("settlements.sqlite3")).unwrap();
+    let retained: (String, String) = sidecar
+        .query_row(
+            "SELECT tenant_id, reservation_id FROM settlement_intents",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(retained, ("tenant-a".into(), a_id.0));
+    drop(sidecar);
+    drop(reopened);
+    for file in [&db, &db.with_added_extension("settlements.sqlite3")] {
+        for suffix in ["", "-wal", "-shm"] {
+            let mut path = file.clone().into_os_string();
+            path.push(suffix);
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+#[test]
 fn double_storage_fault_fails_closed_and_durably_recovers_after_expiry_and_restart() {
     let db = path();
     let sidecar_path = db.with_added_extension("settlements.sqlite3");
