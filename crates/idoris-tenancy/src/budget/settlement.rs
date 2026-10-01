@@ -23,8 +23,27 @@ impl Drop for DispatchLease {
     }
 }
 
-pub(super) fn open(path: &Path, timeout: Duration) -> Result<Connection, BudgetError> {
-    let conn = if path == Path::new(":memory:") {
+pub(super) fn open(
+    path: &Path,
+    requested_path: &Path,
+    primary: &Connection,
+    timeout: Duration,
+) -> Result<Connection, BudgetError> {
+    if path != Path::new(":memory:") {
+        let canonical_sidecar = path.with_added_extension("settlements.sqlite3");
+        let requested_sidecar = requested_path.with_added_extension("settlements.sqlite3");
+        if requested_sidecar.exists()
+            && fs::canonicalize(&requested_sidecar)
+                .map_err(|e| BudgetError::Storage(e.to_string()))?
+                != fs::canonicalize(&canonical_sidecar).unwrap_or(canonical_sidecar)
+        {
+            return Err(BudgetError::Storage(format!(
+                "legacy settlement sidecar found at {}; stop ledger users and recover the legacy journal into the canonical sidecar before reopening",
+                requested_sidecar.display()
+            )));
+        }
+    }
+    let mut conn = if path == Path::new(":memory:") {
         Connection::open_in_memory()?
     } else {
         Connection::open(path.with_added_extension("settlements.sqlite3"))?
@@ -42,7 +61,51 @@ pub(super) fn open(path: &Path, timeout: Duration) -> Result<Connection, BudgetE
         CREATE TABLE IF NOT EXISTS pending_releases (
         reservation_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL)",
     )?;
+    if path != Path::new(":memory:") {
+        // Read first so a healthy existing intent remains openable while an
+        // unrelated journal writer is active. If a hold has no intent, take
+        // the writer lock and recheck to serialize with begin/release and
+        // distinguish a transient cross-database observation from a legacy
+        // journal that really is missing.
+        let missing = {
+            let tx = conn.transaction()?;
+            let missing = missing_dispatch_hold(primary, &tx)?;
+            tx.commit()?;
+            missing
+        };
+        if missing.is_some() {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            if let Some(id) = missing_dispatch_hold(primary, &tx)? {
+                return Err(BudgetError::Storage(format!(
+                    "dispatch hold {id} has no canonical settlement intent; legacy settlement journal recovery is required"
+                )));
+            }
+            tx.commit()?;
+        }
+    }
     Ok(conn)
+}
+
+fn missing_dispatch_hold(
+    primary: &Connection,
+    journal: &Connection,
+) -> Result<Option<String>, BudgetError> {
+    let mut held = primary.prepare(
+        "SELECT id FROM reservations WHERE status='active' AND actual_cost_minor IS NULL AND dispatch_hold=1",
+    )?;
+    let rows = held.query_map([], |row| row.get::<_, String>(0))?;
+    for row in rows {
+        let id = row?;
+        let intent: bool = journal.query_row(
+            "SELECT EXISTS(SELECT 1 FROM settlement_intents WHERE reservation_id=?1)",
+            [&id],
+            |row| row.get(0),
+        )?;
+        if !intent {
+            return Ok(Some(id));
+        }
+    }
+    Ok(None)
 }
 
 impl BudgetLedger {

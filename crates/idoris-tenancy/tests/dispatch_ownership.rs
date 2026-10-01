@@ -384,3 +384,125 @@ fn unresolved_intent_survives_owner_restart_and_blocks_only_its_tenant() {
     assert!(recovered.reserve(&other, Price::Known(1)).is_ok());
     assert_eq!(pending_releases(&path), 0);
 }
+
+#[cfg(unix)]
+#[test]
+fn real_path_and_file_symlink_share_dispatch_ownership() {
+    let path = db("symlink-ownership");
+    let alias = db("symlink-alias");
+    std::os::unix::fs::symlink(path.as_ref(), alias.as_ref()).unwrap();
+    let clock = Arc::new(TestClock(AtomicI64::new(0)));
+    let real = open(&path, clock.clone(), 60_000);
+    let linked = open(&alias, clock, 60_000);
+    let s = scope("tenant");
+    real.configure(&s, 100, "UTC").unwrap();
+    for (owner, other) in [(&real, &linked), (&linked, &real)] {
+        let id = owner.reserve(&s, Price::Known(30)).unwrap();
+        owner.begin_settlement("tenant", &id).unwrap();
+        assert!(matches!(
+            other.begin_settlement("tenant", &id),
+            Err(BudgetError::Storage(_))
+        ));
+        assert!(other.release("tenant", &id).is_err());
+        assert_eq!(pending_releases(&path), 0);
+        assert_eq!(owner.settle_durable("tenant", &id, 25).unwrap(), Some(25));
+    }
+    assert_eq!(real.balance(&s).unwrap(), 50);
+    assert!(
+        !alias
+            .as_ref()
+            .with_added_extension("settlements.sqlite3")
+            .exists()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn directory_symlink_uses_the_same_sidecar_identity() {
+    let path = db("directory-symlink");
+    let alias = db("directory-alias");
+    std::os::unix::fs::symlink(path.as_ref().parent().unwrap(), alias.as_ref()).unwrap();
+    let real = BudgetLedger::open(&path).unwrap();
+    let linked =
+        BudgetLedger::open(alias.as_ref().join(path.as_ref().file_name().unwrap())).unwrap();
+    drop(linked);
+    drop(real);
+}
+
+#[cfg(unix)]
+#[test]
+fn dangling_database_symlink_is_rejected_without_creating_a_split_ledger() {
+    let target = db("dangling-target");
+    let alias = db("dangling-alias");
+    std::os::unix::fs::symlink(target.as_ref(), alias.as_ref()).unwrap();
+    let error = BudgetLedger::open(&alias)
+        .err()
+        .expect("reject dangling symlink");
+    assert!(error.to_string().contains("symlink target does not exist"));
+    assert!(!target.as_ref().exists());
+}
+
+#[test]
+fn relative_single_component_database_path_opens() {
+    let path = TempDb(std::path::PathBuf::from(format!(
+        "idoris-relative-{}.sqlite3",
+        uuid::Uuid::new_v4()
+    )));
+    let _ledger = BudgetLedger::open(&path).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn legacy_alias_sidecar_is_rejected_and_primary_hold_stays_fail_closed() {
+    let path = db("legacy-alias-journal");
+    let alias = db("legacy-alias");
+    std::os::unix::fs::symlink(path.as_ref(), alias.as_ref()).unwrap();
+    let clock = Arc::new(TestClock(AtomicI64::new(0)));
+    let ledger = open(&path, clock.clone(), 60_000);
+    let s = scope("tenant");
+    ledger.configure(&s, 100, "UTC").unwrap();
+    let id = ledger.reserve(&s, Price::Known(30)).unwrap();
+    ledger.begin_settlement("tenant", &id).unwrap();
+    drop(ledger);
+
+    // Reproduce the old layout: the primary hold survives but its journal
+    // lives beside the file alias, outside the canonical storage identity.
+    let old_sidecar = alias.as_ref().with_added_extension("settlements.sqlite3");
+    std::fs::rename(
+        path.as_ref().with_added_extension("settlements.sqlite3"),
+        &old_sidecar,
+    )
+    .unwrap();
+    let alias_error = BudgetLedger::open(&alias)
+        .err()
+        .expect("reject legacy alias journal");
+    assert!(
+        alias_error
+            .to_string()
+            .contains("legacy settlement sidecar")
+    );
+    assert!(
+        !path
+            .as_ref()
+            .with_added_extension("settlements.sqlite3")
+            .exists()
+    );
+    let canonical_error = BudgetLedger::open(&path)
+        .err()
+        .expect("reject missing canonical intent");
+    assert!(
+        canonical_error
+            .to_string()
+            .contains("legacy settlement journal recovery")
+    );
+    let old = Connection::open(old_sidecar).unwrap();
+    let preserved: String = old
+        .query_row("SELECT reservation_id FROM settlement_intents", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(
+        preserved, id.0,
+        "legacy data must remain available for recovery"
+    );
+}

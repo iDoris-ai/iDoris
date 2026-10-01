@@ -262,18 +262,43 @@ impl BudgetLedger {
         if ttl_ms <= 0 {
             return Err(BudgetError::InvalidTtl { ttl_ms });
         }
-        let mut conn = Connection::open(path.as_ref())?;
+        if !path.as_ref().exists()
+            && matches!(
+                std::fs::symlink_metadata(path.as_ref()),
+                Ok(metadata) if metadata.file_type().is_symlink()
+            )
+        {
+            return Err(BudgetError::Storage(
+                "database symlink target does not exist".into(),
+            ));
+        }
+        let storage_path = if path.as_ref() == Path::new(":memory:") {
+            path.as_ref().to_path_buf()
+        } else if path.as_ref().exists() {
+            std::fs::canonicalize(path.as_ref()).map_err(|e| BudgetError::Storage(e.to_string()))?
+        } else {
+            let parent = path
+                .as_ref()
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."));
+            let name = path
+                .as_ref()
+                .file_name()
+                .ok_or_else(|| BudgetError::Storage("database path has no file name".into()))?;
+            std::fs::canonicalize(parent)
+                .map_err(|e| BudgetError::Storage(e.to_string()))?
+                .join(name)
+        };
+        let mut conn = Connection::open(&storage_path)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.busy_timeout(busy_timeout)?;
         run_migrations(&mut conn)?;
-        let storage_path = if path.as_ref() == Path::new(":memory:") {
-            path.as_ref().to_path_buf()
-        } else {
-            std::fs::canonicalize(path.as_ref()).map_err(|e| BudgetError::Storage(e.to_string()))?
-        };
+        let settlements =
+            super::settlement::open(&storage_path, path.as_ref(), &conn, busy_timeout)?;
         let ledger = Self {
             conn: Mutex::new(conn),
-            settlements: Mutex::new(super::settlement::open(path.as_ref(), busy_timeout)?),
+            settlements: Mutex::new(settlements),
             settlement_outcomes: Mutex::new(HashMap::new()),
             live_intents: Mutex::new(HashMap::new()),
             dispatch_locks: Mutex::new(HashMap::new()),
