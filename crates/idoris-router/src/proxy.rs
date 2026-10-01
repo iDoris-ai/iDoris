@@ -113,7 +113,8 @@ pub struct ForwardOutcome {
 struct Flight {
     fingerprint: Value,
     outcome: tokio::sync::Mutex<Option<ForwardOutcome>>,
-    /// Set when the leader future is dropped before forwarding completes.
+    /// Set when execution may have happened without a complete response, or
+    /// when the leader future is dropped before forwarding completes.
     /// The registry keeps this uncertainty record through the idempotency window.
     cancelled_at: Mutex<Option<Instant>>,
 }
@@ -261,8 +262,9 @@ impl ChatProxy {
             "body": payload, "privacy": opts.privacy, "locality": opts.served_locality,
         });
         let Some(request_id) = opts.request_id else {
+            let mut uncertain = false;
             return self
-                .forward_once(endpoint, &payload, opts, &fingerprint)
+                .forward_once(endpoint, &payload, opts, &fingerprint, &mut uncertain)
                 .await;
         };
         let url = format!("{}/v1/chat/completions", endpoint.trim_end_matches('/'));
@@ -277,7 +279,7 @@ impl ChatProxy {
                 return Self::failure(502, "upstream_unavailable");
             };
             // Completed calls without other callers can be dropped. An
-            // uncertain cancellation stays through the idempotency window.
+            // uncertain result stays through the idempotency window.
             let now = Instant::now();
             flights.retain(|_, flight| {
                 if Arc::strong_count(flight) > 1 {
@@ -319,10 +321,13 @@ impl ChatProxy {
         // If the leader is cancelled, waiting calls fail closed instead of resending.
         *result = Some(Self::failure(502, "upstream_unavailable"));
         let mut cancellation_guard = FlightCancellationGuard::new(Arc::clone(&flight));
+        let mut uncertain = false;
         let outcome = self
-            .forward_once(endpoint, &payload, opts, &fingerprint)
+            .forward_once(endpoint, &payload, opts, &fingerprint, &mut uncertain)
             .await;
-        cancellation_guard.disarm();
+        if !uncertain {
+            cancellation_guard.disarm();
+        }
         let mut replay = outcome.clone();
         if (200..300).contains(&replay.status) && !replay.cached {
             replay.cached = true;
@@ -351,6 +356,7 @@ impl ChatProxy {
         payload: &Value,
         opts: &ForwardOpts<'_>,
         fingerprint: &Value,
+        uncertain: &mut bool,
     ) -> ForwardOutcome {
         let url = format!("{}/v1/chat/completions", endpoint.trim_end_matches('/'));
         let tenant_scope = opts.tenant_id.unwrap_or("\u{0}personal");
@@ -405,6 +411,7 @@ impl ChatProxy {
                     // (prdaemon #48 round 2, Low). Not retried: the
                     // upstream already accepted and processed this call.
                     let Ok(body_bytes) = resp.bytes().await else {
+                        *uncertain = true;
                         return ForwardOutcome {
                             status: 502,
                             body: Bytes::from_static(
@@ -458,6 +465,9 @@ impl ChatProxy {
                     #[allow(clippy::cast_possible_truncation)]
                     let retries = attempt as u32;
                     let body = Bytes::from_static(br#"{"error":{"type":"upstream_unavailable"}}"#);
+                    if !err.is_connect() {
+                        *uncertain = true;
+                    }
                     return ForwardOutcome {
                         status: 502,
                         body,

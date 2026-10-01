@@ -4,7 +4,10 @@ use super::*;
 use axum::{Json, Router, extract::State, routing::post};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::Poll;
-use tokio::sync::{Notify, Semaphore};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    sync::{Notify, Semaphore},
+};
 
 struct Upstream {
     calls: AtomicUsize,
@@ -68,6 +71,161 @@ async fn forward(proxy: &ChatProxy, endpoint: &str, payload: &Value, id: &str) -
     )
     .await
     .expect("forward_buffered did not complete")
+}
+
+#[derive(Clone, Copy)]
+enum RawFault {
+    DropBeforeResponse,
+    TruncateResponse,
+}
+
+async fn read_complete_post(stream: &mut tokio::net::TcpStream) {
+    let mut request = Vec::new();
+    let header_end = loop {
+        if let Some(end) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+            break end + 4;
+        }
+        let mut chunk = [0; 2048];
+        let size = stream.read(&mut chunk).await.unwrap();
+        assert_ne!(size, 0, "connection closed before complete request headers");
+        request.extend_from_slice(&chunk[..size]);
+    };
+    let headers = String::from_utf8_lossy(&request[..header_end]);
+    let content_length = headers
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse::<usize>().unwrap())
+        })
+        .expect("POST should have a Content-Length header");
+    while request.len() < header_end + content_length {
+        let mut chunk = [0; 2048];
+        let size = stream.read(&mut chunk).await.unwrap();
+        assert_ne!(size, 0, "connection closed before complete POST body");
+        request.extend_from_slice(&chunk[..size]);
+    }
+    assert!(request.starts_with(b"POST "));
+}
+
+async fn start_raw_fault_upstream(
+    fault: RawFault,
+) -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let server_calls = calls.clone();
+    let server = tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            read_complete_post(&mut stream).await;
+            let call = server_calls.fetch_add(1, Ordering::SeqCst);
+            if call == 0 {
+                match fault {
+                    RawFault::DropBeforeResponse => {}
+                    RawFault::TruncateResponse => {
+                        stream
+                            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\nx")
+                            .await
+                            .unwrap();
+                    }
+                }
+                // Closing after the complete POST leaves the proxy unable to
+                // know whether the upstream executed it.
+            } else {
+                stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                    )
+                    .await
+                    .unwrap();
+            }
+        }
+    });
+    (endpoint, calls, server)
+}
+
+async fn assert_uncertain_post_is_remembered(fault: RawFault, id: &str) {
+    let (endpoint, calls, server) = start_raw_fault_upstream(fault).await;
+    let proxy = ChatProxy::with_config(
+        reqwest::Client::new(),
+        Duration::from_secs(60),
+        vec![Duration::from_millis(1)],
+    );
+    let original = body("same");
+    let first = forward(&proxy, &endpoint, &original, id).await;
+    assert_eq!(first.status, 502);
+    assert_eq!(first.retries, 0);
+    assert!(!first.cached);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    let replay = forward(&proxy, &endpoint, &original, id).await;
+    assert_eq!(replay.status, 502);
+    assert_eq!(replay.retries, 0);
+    assert!(!replay.cached);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        forward(&proxy, &endpoint, &body("changed"), id)
+            .await
+            .status,
+        409
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    // Advance the retained unknown-result entry beyond its configured window
+    // without relying on wall-clock sleeps.
+    {
+        let mut flights = proxy.flights.lock().unwrap();
+        let url = format!("{}/v1/chat/completions", endpoint.trim_end_matches('/'));
+        let key = cache_key("tenant-a", &url, "provider", id);
+        let entry = flights
+            .get_mut(&key)
+            .expect("uncertain flight should be retained");
+        *entry.cancelled_at.lock().unwrap() = Some(Instant::now() - Duration::from_secs(61));
+    }
+    assert_eq!(forward(&proxy, &endpoint, &original, id).await.status, 200);
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    server.abort();
+}
+
+#[tokio::test]
+async fn consumed_post_with_lost_headers_is_remembered() {
+    assert_uncertain_post_is_remembered(RawFault::DropBeforeResponse, "lost-headers").await;
+}
+
+#[tokio::test]
+async fn consumed_post_with_truncated_body_is_remembered() {
+    assert_uncertain_post_is_remembered(RawFault::TruncateResponse, "truncated-body").await;
+}
+
+#[tokio::test]
+async fn connection_failure_can_be_retried_with_a_changed_payload() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let endpoint = format!("http://{addr}");
+    drop(listener);
+    let proxy = ChatProxy::with_config(
+        reqwest::Client::new(),
+        Duration::from_secs(60),
+        vec![Duration::from_millis(1)],
+    );
+    let failed = forward(&proxy, &endpoint, &body("first"), "connect-fail").await;
+    assert_eq!(failed.status, 502);
+    assert_eq!(failed.retries, 1);
+
+    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+    let accepted = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        read_complete_post(&mut stream).await;
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+            .await
+            .unwrap();
+    });
+    let changed = forward(&proxy, &endpoint, &body("changed"), "connect-fail").await;
+    assert_eq!(changed.status, 200);
+    assert_eq!(changed.retries, 0);
+    accepted.await.unwrap();
 }
 
 #[tokio::test]
