@@ -615,20 +615,9 @@ async fn chat_via_proxy_stream(
             response: upstream,
         } => {
             let status = StatusCode::from_u16(status).unwrap_or(StatusCode::OK);
-            // Genuine incremental pass-through (never buffered), which gets
-            // both R2-G streaming requirements "for free" via Rust's
-            // ownership model -- no TS-style req.on("close") needed (same
-            // pattern as dispatch.rs's CancelOnDrop): reqwest surfaces an
-            // upstream connection dropping mid-body as an `Err` item, not a
-            // silent `None`, so `Body::from_stream` makes hyper abort *our*
-            // client's connection too (explicit error, never a disguised
-            // normal end); and when our client disconnects, axum drops this
-            // stream, which drops `upstream` (owns the real connection),
-            // which reqwest/hyper tears down -- genuinely cancelled.
-            let body = Body::from_stream(upstream.bytes_stream());
             let mut response = Response::builder()
                 .status(status)
-                .body(body)
+                .body(upstream)
                 .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
             let content_type = content_type.as_deref().unwrap_or("text/event-stream");
             if let Ok(v) = HeaderValue::from_str(content_type) {

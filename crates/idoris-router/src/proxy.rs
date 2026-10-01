@@ -1,8 +1,7 @@
 //! Direct HTTP forwarding for a generic (non-oMLX) `http_service` component
 //! card's `POST /v1/chat/completions` — a Rust port of
-//! `packages/router/src/proxy.ts`'s `ChatProxy` (buffered/non-streaming
-//! half only; streaming pass-through is a follow-up PR). The upstream
-//! response body is forwarded byte-for-byte — **never** re-wrapped into the
+//! `packages/router/src/proxy.ts`'s `ChatProxy` (buffered and streaming).
+//! The upstream response body is forwarded byte-for-byte — **never** re-wrapped into the
 //! local-dispatch path's `openai_chat_completion` shape, matching TS: a
 //! `form: http_service` candidate is a transparent proxy, not a backend
 //! `RuntimeAdapter` call.
@@ -34,7 +33,8 @@
 use std::sync::Mutex;
 use std::time::Duration;
 
-use axum::body::Bytes;
+use axum::body::{Body, Bytes};
+use futures_util::stream;
 use idoris_contracts::common::PrivacyClass;
 use idoris_contracts::provider::Locality;
 use indexmap::IndexMap;
@@ -116,6 +116,8 @@ pub struct ChatProxy {
     body_timeout: Duration,
     max_body_bytes: usize,
     max_cache_bytes: usize,
+    permits: std::sync::Arc<tokio::sync::Semaphore>,
+    stream_idle_timeout: Duration,
     pub(crate) retry_delays: Vec<Duration>,
     pub(crate) cache: Mutex<IndexMap<String, CacheEntry>>,
 }
@@ -130,6 +132,8 @@ impl ChatProxy {
             body_timeout: Duration::from_secs(60),
             max_body_bytes: 8 * 1024 * 1024,
             max_cache_bytes: 32 * 1024 * 1024,
+            permits: std::sync::Arc::new(tokio::sync::Semaphore::new(32)),
+            stream_idle_timeout: Duration::from_secs(60),
             // TS default (`proxy.ts`'s `ProxyDeps.retryDelaysMs` default).
             retry_delays: vec![Duration::from_millis(250), Duration::from_secs(1)],
             cache: Mutex::new(IndexMap::new()),
@@ -236,7 +240,11 @@ impl ChatProxy {
         }
         tokio::time::timeout(self.body_timeout, async {
             let mut bytes = Vec::new();
-            while let Some(chunk) = response.chunk().await.map_err(|_| 502u16)? {
+            while let Some(chunk) = response
+                .chunk()
+                .await
+                .map_err(|error| if error.is_timeout() { 504u16 } else { 502u16 })?
+            {
                 if chunk.len() > self.max_body_bytes.saturating_sub(bytes.len()) {
                     return Err(502);
                 }
@@ -246,6 +254,18 @@ impl ChatProxy {
         })
         .await
         .map_err(|_| 504u16)?
+    }
+
+    async fn send_headers(
+        &self,
+        request: reqwest::RequestBuilder,
+    ) -> Result<reqwest::Response, u16> {
+        match tokio::time::timeout(self.header_timeout, request.send()).await {
+            Ok(Ok(response)) => Ok(response),
+            Ok(Err(error)) if error.is_timeout() => Err(504),
+            Ok(Err(_)) => Err(502),
+            Err(_) => Err(504),
+        }
     }
 
     async fn sleep_retry(&self, attempt: usize) {
@@ -296,6 +316,12 @@ impl ChatProxy {
             }
         }
 
+        // Fail fast at the shared 32-request cap, including requests whose
+        // buffered retries or streaming response body are still in flight.
+        let _permit = match self.permits.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => return Self::failure(503, 0),
+        };
         let mut payload = body.clone();
         if let Some(obj) = payload.as_object_mut() {
             obj.insert("stream".to_string(), Value::Bool(false));
@@ -305,16 +331,10 @@ impl ChatProxy {
         loop {
             // One deadline covers connection establishment and response
             // headers. An expired POST is uncertain: do not retry it.
-            let sent = match tokio::time::timeout(
-                self.header_timeout,
-                self.client.post(&url).json(&payload).send(),
-            )
-            .await
+            match self
+                .send_headers(self.client.post(&url).json(&payload))
+                .await
             {
-                Ok(sent) => sent,
-                Err(_) => return Self::failure(504, attempt as u32),
-            };
-            match sent {
                 Ok(resp) => {
                     let status = resp.status().as_u16();
                     if status >= 500 && attempt < self.retry_delays.len() {
@@ -369,9 +389,9 @@ impl ChatProxy {
                         retries,
                     };
                 }
-                Err(err) => {
-                    if err.is_timeout() {
-                        return Self::failure(504, attempt as u32);
+                Err(status) => {
+                    if status == 504 {
+                        return Self::failure(status, attempt as u32);
                     }
                     if attempt < self.retry_delays.len() {
                         self.sleep_retry(attempt).await;
@@ -408,12 +428,25 @@ impl ChatProxy {
     /// outright still gets a plain JSON/text error body, never an SSE
     /// stream carrying an error.
     pub async fn forward_stream(&self, endpoint: &str, body: &Value) -> StreamOutcome {
+        let permit = match self.permits.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                return StreamOutcome::Buffered {
+                    status: 503,
+                    body: Bytes::from_static(br#"{"error":{"type":"upstream_unavailable"}}"#),
+                    content_type: Some("application/json".into()),
+                };
+            }
+        };
         let url = format!("{}/v1/chat/completions", endpoint.trim_end_matches('/'));
         let mut payload = body.clone();
         if let Some(obj) = payload.as_object_mut() {
             obj.insert("stream".to_string(), Value::Bool(true));
         }
-        match self.client.post(&url).json(&payload).send().await {
+        match self
+            .send_headers(self.client.post(&url).json(&payload))
+            .await
+        {
             Ok(resp) => {
                 let status = resp.status().as_u16();
                 let content_type = resp
@@ -422,22 +455,51 @@ impl ChatProxy {
                     .and_then(|v| v.to_str().ok())
                     .map(str::to_string);
                 if (200..300).contains(&status) {
+                    let idle_timeout = self.stream_idle_timeout;
+                    // The body owns the permit before its first poll and
+                    // carries it through each chunk until EOF, error, or drop.
+                    let chunks = stream::unfold(Some((resp, permit)), move |state| async move {
+                        let (mut response, permit) = state?;
+                        match tokio::time::timeout(idle_timeout, response.chunk()).await {
+                            Ok(Ok(Some(chunk))) => Some((Ok(chunk), Some((response, permit)))),
+                            Ok(Ok(None)) => None,
+                            Ok(Err(error)) => {
+                                Some((Err(std::io::Error::other(error.to_string())), None))
+                            }
+                            Err(_) => Some((
+                                Err(std::io::Error::new(
+                                    std::io::ErrorKind::TimedOut,
+                                    "upstream stream idle timeout",
+                                )),
+                                None,
+                            )),
+                        }
+                    });
+                    let body = Body::from_stream(chunks);
                     StreamOutcome::Stream {
                         status,
                         content_type,
-                        response: resp,
+                        response: body,
                     }
                 } else {
-                    let body = resp.bytes().await.unwrap_or_default();
-                    StreamOutcome::Buffered {
-                        status,
-                        body,
-                        content_type,
+                    match self.read_buffered(resp).await {
+                        Ok(body) => StreamOutcome::Buffered {
+                            status,
+                            body,
+                            content_type,
+                        },
+                        Err(error_status) => StreamOutcome::Buffered {
+                            status: error_status,
+                            body: Bytes::from_static(
+                                br#"{"error":{"type":"upstream_unavailable"}}"#,
+                            ),
+                            content_type: Some("application/json".into()),
+                        },
                     }
                 }
             }
-            Err(_err) => StreamOutcome::Buffered {
-                status: 502,
+            Err(status) => StreamOutcome::Buffered {
+                status,
                 body: Bytes::from_static(br#"{"error":{"type":"upstream_unavailable"}}"#),
                 content_type: Some("application/json".to_string()),
             },
@@ -447,9 +509,9 @@ impl ChatProxy {
 
 /// [`ChatProxy::forward_stream`]'s result: either the initial response
 /// wasn't ok (returned buffered, see that method's doc) or it was, in which
-/// case the caller streams `response`'s body onward incrementally (never
-/// buffering it — see `lib.rs`'s `chat_via_proxy` for the explicit-error-
-/// on-truncation / cancel-on-drop pass-through).
+/// case `response` is an incremental body that enforces idle timeouts and
+/// forwards upstream read errors, while retaining its permit until completion
+/// or drop.
 pub enum StreamOutcome {
     Buffered {
         status: u16,
@@ -459,9 +521,17 @@ pub enum StreamOutcome {
     Stream {
         status: u16,
         content_type: Option<String>,
-        response: reqwest::Response,
+        response: Body,
     },
 }
+
+#[cfg(test)]
+#[path = "proxy_limits_tests.rs"]
+mod limits_tests;
+
+#[cfg(test)]
+#[path = "proxy_concurrency_tests.rs"]
+mod concurrency_tests;
 
 #[cfg(test)]
 mod tests {
