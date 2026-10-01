@@ -153,7 +153,7 @@ pub struct AppState {
     /// Backs the local dispatch path (R2-D task 3); `None` means no local
     /// backend is wired — dispatch then fails closed as
     /// `local_only_unavailable` rather than panicking on a missing handle.
-    pub supervisor: Option<idoris_backend::SupervisorHandle>,
+    pub supervisor: Option<dispatch::BoundSupervisor>,
     /// Gates every candidate, including zero cost, through the ledger's
     /// SpendGate. `None` fails paid candidates closed while free candidates
     /// remain usable without a ledger. `Arc`
@@ -1055,8 +1055,8 @@ mod tests {
             idoris_backend::Supervisor::spawn(adapter, idoris_backend::SupervisorConfig::default())
                 .unwrap();
         let state = AppState {
-            cards: vec![card],
-            supervisor: Some(supervisor),
+            cards: vec![card.clone()],
+            supervisor: Some(dispatch::BoundSupervisor::new(&card, supervisor)),
             ..AppState::default()
         };
         let app = build_app(state);
@@ -1169,7 +1169,10 @@ mod tests {
                 .unwrap();
         let state = AppState {
             cards: vec![paid_component_card("paid-1")],
-            supervisor: Some(supervisor),
+            supervisor: Some(dispatch::BoundSupervisor::new(
+                &paid_component_card("paid-1"),
+                supervisor,
+            )),
             budget_ledger: Some(std::sync::Arc::new(ledger)),
             ..AppState::default()
         };

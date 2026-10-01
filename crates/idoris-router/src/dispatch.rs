@@ -21,6 +21,48 @@ use tokio_util::sync::CancellationToken;
 use crate::budget;
 use crate::profile::ParsedProfile;
 
+/// The single lifecycle Supervisor and the backend identity it executes.
+/// Keep these together so replacing a card cannot silently retarget dispatch.
+#[derive(Debug, Clone)]
+pub struct BoundSupervisor {
+    handle: SupervisorHandle,
+    provider_id: String,
+    endpoint: String,
+    locality: Locality,
+}
+
+impl BoundSupervisor {
+    pub(crate) fn new(card: &ComponentCard, handle: SupervisorHandle) -> Self {
+        Self {
+            handle,
+            provider_id: card.provider.id.clone(),
+            endpoint: card.endpoint.clone(),
+            locality: card.provider.locality,
+        }
+    }
+
+    /// Constructs the adapter from the same card used for the binding.
+    pub fn spawn_omlx(card: &ComponentCard) -> Result<Self, String> {
+        let adapter = idoris_upstream::OmlxAdapter::new(idoris_upstream::OmlxAdapterConfig {
+            base_url: card.endpoint.clone(),
+            ..idoris_upstream::OmlxAdapterConfig::default()
+        })
+        .map_err(|err| format!("无法构造 oMLX 适配器（{}）：{err}", card.provider.id))?;
+        let handle = idoris_backend::Supervisor::spawn(
+            std::sync::Arc::new(adapter),
+            idoris_backend::SupervisorConfig::default(),
+        )
+        .map_err(|err| format!("无法启动 Supervisor（{}）：{err}", card.provider.id))?;
+        Ok(Self::new(card, handle))
+    }
+
+    fn matches(&self, card: &ComponentCard) -> bool {
+        self.provider_id == card.provider.id
+            && self.endpoint == card.endpoint
+            && self.locality == card.provider.locality
+    }
+}
+
 /// Fallback for a card that doesn't declare its own `load_policy` — cards
 /// should normally declare one (interface spec §3.3); this only covers one
 /// that omits it, so a missing field doesn't turn into a panic/`expect`.
@@ -260,7 +302,7 @@ impl Drop for CancelOnDrop {
 /// that part right itself to still get correct propagation.
 pub async fn dispatch_local(
     cards: &[ComponentCard],
-    supervisor: Option<&SupervisorHandle>,
+    supervisor: Option<&BoundSupervisor>,
     budget_ledger: Option<&BudgetLedger>,
     profile: &ParsedProfile,
     prompt: &str,
@@ -295,6 +337,17 @@ pub async fn dispatch_local(
             )));
         };
         let served_locality = effective_served_locality(chosen);
+        // Fail closed before budget reservation or any Supervisor operation.
+        if supervisor.is_some_and(|bound| !bound.matches(&chosen.component)) {
+            return Ok(ChatOutcome {
+                decision,
+                served_locality,
+                result: Err(DispatchFailure::Backend(
+                    BackendError::supervisor_unavailable(),
+                )),
+                actual_cost_minor: None,
+            });
+        }
         let load_policy = chosen
             .component
             .load_policy
@@ -353,6 +406,7 @@ pub async fn dispatch_local(
     // cancellation can stop early.
     let _cancel_guard = CancelOnDrop(cancel.clone());
 
+    let supervisor = &supervisor.handle;
     let status = supervisor.status().await;
     let already_loaded = matches!(&status, Ok(s) if s.loaded.iter().any(|m| m == &model_id));
     if !already_loaded
@@ -521,6 +575,7 @@ mod tests {
             memory_gb: 1.0,
         }]));
         let supervisor = Supervisor::spawn(adapter, SupervisorConfig::default()).unwrap();
+        let supervisor = BoundSupervisor::new(&local_card("a"), supervisor);
         let messages = vec![ChatMessage {
             role: "user".to_string(),
             content: "hello".to_string(),
@@ -580,6 +635,7 @@ mod tests {
             memory_gb: 1.0,
         }]));
         let supervisor = Supervisor::spawn(adapter.clone(), SupervisorConfig::default()).unwrap();
+        let supervisor = BoundSupervisor::new(&local_card("a"), supervisor);
         let outcome = dispatch_local(
             &[local_card("a")],
             Some(&supervisor),
@@ -607,6 +663,7 @@ mod tests {
             memory_gb: 1.0,
         }]));
         let supervisor = Supervisor::spawn(adapter, SupervisorConfig::default()).unwrap();
+        let supervisor = BoundSupervisor::new(&local_card("a"), supervisor);
         let outcome = dispatch_local(
             &[local_card("a")],
             Some(&supervisor),
@@ -681,6 +738,7 @@ mod tests {
             memory_gb: 1.0,
         }]));
         let supervisor = Supervisor::spawn(adapter, SupervisorConfig::default()).unwrap();
+        let supervisor = BoundSupervisor::new(&paid_card("p"), supervisor);
         let messages = vec![ChatMessage {
             role: "user".to_string(),
             content: "hi".to_string(),
@@ -725,6 +783,7 @@ mod tests {
         }]));
         adapter.set_chat_delay("p", std::time::Duration::from_secs(5));
         let supervisor = Supervisor::spawn(adapter, SupervisorConfig::default()).unwrap();
+        let supervisor = BoundSupervisor::new(&paid_card("p"), supervisor);
         let cancel = CancellationToken::new();
         let messages = vec![ChatMessage {
             role: "user".to_string(),
