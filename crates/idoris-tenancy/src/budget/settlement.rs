@@ -183,6 +183,16 @@ impl BudgetLedger {
                 "dispatch is already claimed or cancellation is confirmed".into(),
             ));
         }
+        let settlement_pending: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pending_settlements WHERE reservation_id=?1)",
+            [&id.0],
+            |r| r.get(0),
+        )?;
+        if settlement_pending {
+            return Err(BudgetError::Storage(
+                "dispatch already has a durable settlement result".into(),
+            ));
+        }
         tx.execute(
             "INSERT INTO settlement_intents VALUES (?1, ?2)",
             params![id.0, tenant],
@@ -2164,4 +2174,56 @@ mod tests {
         assert_eq!(b.tenant_balance("t").unwrap(), 0);
     }
 
+    #[test]
+    fn durable_pending_settlement_prevents_a_new_dispatch_claim() {
+        let db = TestDb::new();
+        let path = db.path();
+        let clock = Arc::new(TestClock(AtomicI64::new(0)));
+        let ledger =
+            BudgetLedger::open_with_busy_timeout(&path, clock.clone(), 60_000, Duration::ZERO)
+                .unwrap();
+        let other =
+            BudgetLedger::open_with_busy_timeout(&path, clock, 60_000, Duration::ZERO).unwrap();
+        ledger
+            .configure_tenant("t", 1000, "UTC", SpendGate::All)
+            .unwrap();
+        let id = ledger
+            .reserve(&BudgetScope::new("t", "k", "p", "m"), Price::Known(10))
+            .unwrap();
+        let blocker = Connection::open(&path).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+        assert_eq!(ledger.settle_durable("t", &id, 20).unwrap(), None);
+        assert_eq!(pending(&ledger), 1);
+        blocker.execute_batch("ROLLBACK").unwrap();
+        let (status, actual): (String, Option<i64>) = blocker
+            .query_row(
+                "SELECT status, actual_cost_minor FROM reservations WHERE id=?1",
+                [&id.0],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((status.as_str(), actual), ("active", None));
+        assert!(ledger.begin_settlement("t", &id).is_err());
+
+        assert!(matches!(
+            other.begin_settlement("t", &id),
+            Err(BudgetError::Storage(_))
+        ));
+        assert_eq!(pending(&ledger), 1);
+        ledger.retry_settlements().unwrap();
+        assert_eq!(pending(&ledger), 0);
+        assert_eq!(intents(&ledger), 0);
+        assert_eq!(ledger.tenant_balance("t").unwrap(), 980);
+        let (actual, held): (Option<i64>, i64) = ledger
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT actual_cost_minor, dispatch_hold FROM reservations WHERE id=?1",
+                [&id.0],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((actual, held), (Some(20), 0));
+    }
 }
