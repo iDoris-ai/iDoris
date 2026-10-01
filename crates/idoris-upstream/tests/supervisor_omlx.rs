@@ -27,6 +27,14 @@ fn on_demand() -> LoadPolicy {
 
 async fn run(verify: ResponseTemplate, unload_status: u16) -> f64 {
     let server = MockServer::start().await;
+    // Reconciliation sees an empty engine before the scripted load failure.
+    Mock::given(method("GET"))
+        .and(path("/api/status"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "loaded_models": [], "model_memory_used": 0, "model_memory_max": 25769803776_u64
+        })))
+        .mount(&server)
+        .await;
     Mock::given(method("POST"))
         .and(path("/v1/models/qwen3-8b/load"))
         .respond_with(ResponseTemplate::new(200))
