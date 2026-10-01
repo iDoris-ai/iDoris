@@ -296,6 +296,13 @@ impl BudgetLedger {
                 "in-memory settlement outcome mismatch".into(),
             ));
         }
+        let trusted_outcome =
+            outcomes
+                .get(&id.0)
+                .is_some_and(|(recorded_tenant, recorded_actual)| {
+                    recorded_tenant == tenant && *recorded_actual == actual
+                });
+        let trusted_dispatch = verified_owner.as_deref() == Some(tenant) || trusted_outcome;
 
         // Release uses the same cross-process sidecar writer lock and keeps it
         // until its primary terminal transition commits. This makes the
@@ -307,6 +314,13 @@ impl BudgetLedger {
             Err(error) => {
                 drop(live);
                 let journal_error = BudgetError::from(error);
+                // Without the journal writer lock, a dispatch claim could
+                // appear between an ownership read and the primary fallback.
+                // Only the instance that captured the live claim may use
+                // this fallback while journal serialization is unavailable.
+                if !trusted_dispatch {
+                    return Err(journal_error);
+                }
                 // Preserve a completed cost on primary when the independent
                 // journal cannot be written. If begin_settlement supplied a
                 // verified owner, a failed primary lookup must not discard it.
@@ -330,6 +344,22 @@ impl BudgetLedger {
             }
         };
 
+        // Serialize the claim check with both new claims and settlement
+        // registration. A caller without this instance's live proof cannot
+        // submit the first result for a claimed dispatch.
+        if !trusted_dispatch {
+            let claimed: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM dispatch_owners WHERE reservation_id=?1)",
+                [&id.0],
+                |r| r.get(0),
+            )?;
+            if claimed {
+                return Err(BudgetError::Storage(
+                    "dispatch settlement requires its live owner".into(),
+                ));
+            }
+        }
+
         // Check the primary terminal state while holding the same sidecar
         // transaction used by release. A verified dispatch owner lets us
         // record the completed outcome if this read alone fails.
@@ -348,7 +378,7 @@ impl BudgetLedger {
                 });
             }
             Ok(None) => {}
-            Err(error) if verified_owner.as_deref() == Some(tenant) => {
+            Err(error) if trusted_dispatch => {
                 eprintln!(
                     "budget settlement intent check deferred: reservation={} error={error}",
                     id.0
@@ -389,7 +419,7 @@ impl BudgetLedger {
                     ));
                 }
             }
-            Err(error) if verified_owner.as_deref() == Some(tenant) => {
+            Err(error) if trusted_dispatch => {
                 // `begin_settlement` checked and held this tenant's row before
                 // dispatch. Preserve its completed amount in the sidecar even
                 // while a transient primary read fault prevents replay.
@@ -410,6 +440,9 @@ impl BudgetLedger {
             }
             Err(PendingInsertError::Storage(journal_error)) => {
                 drop(tx);
+                if !trusted_dispatch {
+                    return Err(journal_error);
+                }
                 // The independent journal may be Busy. Persist the known actual
                 // on the reservation as a second recovery source. Keep the
                 // in-memory copy until a journal write succeeds in this process.
@@ -436,6 +469,9 @@ impl BudgetLedger {
         }
         if let Err(error) = tx.commit() {
             let journal_error = BudgetError::from(error);
+            if !trusted_dispatch {
+                return Err(journal_error);
+            }
             outcomes.insert(id.0.clone(), (tenant.to_string(), actual));
             let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
             let fallback = store_primary_fallback(&conn, &id.0, tenant, actual);

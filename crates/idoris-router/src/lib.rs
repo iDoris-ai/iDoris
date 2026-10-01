@@ -560,13 +560,10 @@ async fn chat_completions(
     // never actually fires -- by the time it's attached, the request body
     // (and with it, that stream's own "close") has already completed. This
     // token has no client-disconnect signal wired to it from axum/hyper
-    // yet either, but dispatch_local's own drop-based guards (see its doc)
-    // still correctly release a budget reservation and propagate
-    // cancellation into the Supervisor call if *this handler's own future*
-    // is dropped mid-request (e.g. a future connection-level timeout or
-    // abort layered on top) -- genuinely different from, and strictly
-    // better than, a listener that structurally can never fire.
-    let budget_ledger = state.budget_ledger.as_deref();
+    // yet either, but dropping this handler still propagates cancellation
+    // into the Supervisor call. A reservation is refunded only before chat
+    // submission; afterward a separate task observes and settles its result.
+    let budget_ledger = state.budget_ledger.as_ref();
     match dispatch_local(
         &state.cards,
         state.supervisor.as_ref(),

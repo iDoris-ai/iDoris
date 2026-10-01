@@ -994,10 +994,38 @@ impl BudgetLedger {
         Ok(())
     }
 
+    /// Stop advertising a live dispatch when its final cost is unknown.
+    /// Keep the durable claim, intent and hold for reconciliation; this is
+    /// not confirmation that the upstream did no work and must not refund.
+    pub fn abandon_dispatch(
+        &self,
+        tenant_id: &str,
+        reservation_id: &ReservationId,
+    ) -> Result<(), BudgetError> {
+        let mut live = self.live_intents.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(owner) = live.get(&reservation_id.0) {
+            if owner != tenant_id {
+                return Err(BudgetError::TenantMismatch {
+                    reservation_id: reservation_id.0.clone(),
+                });
+            }
+            live.remove(&reservation_id.0);
+            self.dispatch_locks
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(&reservation_id.0);
+        }
+        Ok(())
+    }
+
     /// Fully release a reservation without charging anything — for calls
     /// that failed or that fell back to a different (separately reserved)
     /// candidate. Idempotent when the reservation is already `released`;
     /// erroring on `settled` prevents un-settling a completed charge.
+    /// The dispatch owner must only call this after confirming no charge is
+    /// due (including cancellation before chat submission). Ownership alone
+    /// or a cancelled request future is not proof; unknown outcomes must use
+    /// [`Self::abandon_dispatch`] and retain their hold.
     ///
     /// L3 (Opus Tier-2 acceptance): releasing an already-`expired` (but not
     /// yet settled/released) reservation succeeds (`Ok(())`) instead of
@@ -1059,7 +1087,8 @@ impl BudgetLedger {
                 Err(err) => return Err(err),
             }
         };
-        // Only the dispatch owner can confirm that no call remains in flight.
+        // The caller explicitly confirms no charge is due; ownership only
+        // authorizes that confirmation, it cannot establish cancellation.
         // Preserve that acknowledgement even when the journal is unavailable;
         // a foreign caller must first prove a durable acknowledgement exists.
         let _dispatch_lease = if live
@@ -1595,6 +1624,36 @@ mod tests {
             std::process::id(),
             uuid::Uuid::new_v4()
         )))
+    }
+
+    #[test]
+    fn unknown_dispatch_retains_hold_and_blocks_new_spend_after_ttl() {
+        let path = temp_db_path("unknown-dispatch");
+        let clock = Arc::new(TestClock(std::sync::atomic::AtomicI64::new(0)));
+        let ledger = BudgetLedger::open_with(&path, clock.clone(), 100).unwrap();
+        let scope = BudgetScope::new("tenant", "key", "provider", "model");
+        ledger.configure(&scope, 100, "UTC").unwrap();
+        let id = ledger.reserve(&scope, Price::Known(30)).unwrap();
+        ledger.begin_settlement("tenant", &id).unwrap();
+        assert!(matches!(
+            ledger.abandon_dispatch("other", &id),
+            Err(BudgetError::TenantMismatch { .. })
+        ));
+        ledger.abandon_dispatch("tenant", &id).unwrap();
+        clock.0.store(101, std::sync::atomic::Ordering::SeqCst);
+        ledger.retry_settlements().unwrap();
+        assert_eq!(ledger.sweep_expired().unwrap(), 0);
+        assert_eq!(ledger.balance(&scope).unwrap(), 70);
+        assert!(ledger.release("tenant", &id).is_err());
+        assert!(matches!(
+            ledger.reserve(&scope, Price::Known(1)),
+            Err(BudgetError::Storage(_))
+        ));
+        drop(ledger);
+        let reopened = BudgetLedger::open_with(&path, clock, 100).unwrap();
+        assert_eq!(reopened.balance(&scope).unwrap(), 70);
+        assert!(reopened.release("tenant", &id).is_err());
+        assert!(reopened.reserve(&scope, Price::Known(1)).is_err());
     }
 
     #[test]

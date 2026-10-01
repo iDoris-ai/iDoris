@@ -1146,6 +1146,7 @@ dependencies = [
 name = "idoris-router"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "axum",
  "http-body-util",
  "idoris-backend",
