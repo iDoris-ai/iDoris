@@ -488,9 +488,12 @@ impl BudgetLedger {
             Price::Known(v) => v,
         };
 
-        let now_ms = self.clock.now_ms();
         let mut conn = self.lock();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        // K07/M2: lock contention must not consume the TTL or leave period
+        // bucketing based on a timestamp from before the writer lock wait.
+        let now_ms = self.clock.now_ms();
 
         // B-3 (Opus Tier-2 re-review): the sub-scope four-tuple config is
         // the *optional* finer layer, the tenant-level total is the
@@ -643,8 +646,28 @@ impl BudgetLedger {
                 tenant_period,
             ],
         )?;
+        self.check_reservation_deadline(&id, expires_at_ms)?;
         tx.commit()?;
+        // COMMIT itself may consume the remaining TTL. Even though the row
+        // is now persisted, it is expired and must never authorize a call.
+        self.check_reservation_deadline(&id, expires_at_ms)?;
         Ok(ReservationId(id))
+    }
+
+    /// Fail closed if transaction work consumed the TTL. Returning before
+    /// commit drops and rolls back the transaction, including its writes.
+    fn check_reservation_deadline(
+        &self,
+        reservation_id: &str,
+        expires_at_ms: i64,
+    ) -> Result<(), BudgetError> {
+        if self.clock.now_ms() >= expires_at_ms {
+            return Err(BudgetError::ReservationNotActive {
+                reservation_id: reservation_id.to_string(),
+                status: ReservationStatus::Expired.as_sql().to_string(),
+            });
+        }
+        Ok(())
     }
 
     /// Sweep every scope/period for expired-but-still-`active` reservations
@@ -862,9 +885,11 @@ impl BudgetLedger {
                 ttl_ms: additional_ttl_ms,
             });
         }
-        let now_ms = self.clock.now_ms();
         let mut conn = self.lock();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // K07/M2: validate expiry and renew from the time the write lock
+        // was acquired, never from a stale timestamp before the wait.
+        let now_ms = self.clock.now_ms();
 
         let row = find_reservation(&tx, tenant_id, reservation_id)?;
         let status = ReservationStatus::parse(&row.status)?;
@@ -897,7 +922,9 @@ impl BudgetLedger {
             "UPDATE reservations SET expires_at_ms=?2 WHERE id=?1",
             rusqlite::params![reservation_id.0, new_expires_at_ms],
         )?;
+        self.check_reservation_deadline(&reservation_id.0, new_expires_at_ms)?;
         tx.commit()?;
+        self.check_reservation_deadline(&reservation_id.0, new_expires_at_ms)?;
         Ok(())
     }
 
@@ -1297,6 +1324,194 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+    use std::cell::RefCell;
+    use std::sync::atomic::{AtomicI64, Ordering};
+    use std::sync::mpsc::{self, Receiver, Sender};
+
+    struct TestClock {
+        now: AtomicI64,
+        step: AtomicI64,
+    }
+
+    impl Clock for TestClock {
+        fn now_ms(&self) -> i64 {
+            self.now
+                .fetch_add(self.step.load(Ordering::SeqCst), Ordering::SeqCst)
+        }
+    }
+
+    thread_local! {
+        static LOCK_WAIT: RefCell<Option<(Sender<()>, Receiver<()>)>> = const { RefCell::new(None) };
+    }
+
+    fn lock_wait_fixture() -> (TempDb, Arc<BudgetLedger>, Arc<TestClock>, BudgetScope) {
+        let path = temp_db_path("lock-clock");
+        let clock = Arc::new(TestClock {
+            now: AtomicI64::new(0),
+            step: AtomicI64::new(0),
+        });
+        let ledger = Arc::new(BudgetLedger::open_with(&path, clock.clone(), 200).unwrap());
+        let scope = BudgetScope::new("acme-co", "key-1", "openai", "gpt-5");
+        ledger.configure(&scope, 100, "UTC").unwrap();
+        ledger
+            .configure_tenant(&scope.tenant_id, 100, "UTC", SpendGate::All)
+            .unwrap();
+        (path, ledger, clock, scope)
+    }
+
+    /// Use SQLite's busy callback to prove the worker reached BEGIN IMMEDIATE
+    /// while another connection owns the writer lock. Advance the fake clock
+    /// before releasing that lock; no scheduling guesses or real-time sleeps.
+    fn during_write_wait<T: Send + 'static>(
+        path: &TempDb,
+        ledger: &Arc<BudgetLedger>,
+        clock: &TestClock,
+        after_wait_ms: i64,
+        action: impl FnOnce(Arc<BudgetLedger>) -> T + Send + 'static,
+    ) -> T {
+        let mut blocker = Connection::open(path).unwrap();
+        let tx = blocker
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        let (waiting_tx, waiting_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let worker_ledger = ledger.clone();
+        let worker = std::thread::spawn(move || {
+            LOCK_WAIT.with(|slot| *slot.borrow_mut() = Some((waiting_tx, resume_rx)));
+            worker_ledger
+                .lock()
+                .busy_handler(Some(|_| {
+                    LOCK_WAIT.with(|slot| {
+                        let slot = slot.borrow();
+                        let (waiting, resume) = slot.as_ref().unwrap();
+                        waiting.send(()).unwrap();
+                        resume.recv_timeout(Duration::from_secs(5)).is_ok()
+                    })
+                }))
+                .unwrap();
+            action(worker_ledger)
+        });
+        waiting_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        clock.now.store(after_wait_ms, Ordering::SeqCst);
+        tx.commit().unwrap();
+        resume_tx.send(()).unwrap();
+        worker.join().unwrap()
+    }
+
+    #[test]
+    fn reserve_samples_ttl_and_both_periods_after_write_wait() {
+        let (path, ledger, clock, scope) = lock_wait_fixture();
+        let boundary = chrono::NaiveDate::from_ymd_opt(2026, 10, 1)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_utc()
+            .timestamp_millis();
+        clock.now.store(boundary - 100, Ordering::SeqCst);
+        let worker_scope = scope.clone();
+        let id = during_write_wait(&path, &ledger, &clock, boundary + 300, move |ledger| {
+            ledger.reserve(&worker_scope, Price::Known(100))
+        })
+        .unwrap();
+        let row = find_reservation(&ledger.lock(), &scope.tenant_id, &id).unwrap();
+        assert_eq!(row.expires_at_ms, boundary + 500);
+        assert_eq!(row.created_at_ms, boundary + 300);
+        assert_eq!(row.period, "2026-10");
+        assert_eq!(row.tenant_period, "2026-10");
+        assert_eq!(ledger.balance(&scope).unwrap(), 0);
+        assert_eq!(ledger.tenant_balance(&scope.tenant_id).unwrap(), 0);
+        assert!(matches!(
+            ledger.reserve(&scope, Price::Known(1)),
+            Err(BudgetError::Exceeded { .. })
+        ));
+    }
+
+    #[test]
+    fn extend_samples_ttl_after_write_wait() {
+        let (path, ledger, clock, scope) = lock_wait_fixture();
+        let id = ledger.reserve(&scope, Price::Known(100)).unwrap();
+        clock.now.store(50, Ordering::SeqCst);
+        let worker_id = id.clone();
+        let tenant = scope.tenant_id.clone();
+        during_write_wait(&path, &ledger, &clock, 150, move |ledger| {
+            ledger.extend(&tenant, &worker_id, 50)
+        })
+        .unwrap();
+        let row = find_reservation(&ledger.lock(), &scope.tenant_id, &id).unwrap();
+        assert_eq!(row.expires_at_ms, 200);
+        assert_eq!(ledger.balance(&scope).unwrap(), 0);
+    }
+
+    #[test]
+    fn extend_rejects_expiry_during_write_wait() {
+        let (path, ledger, clock, scope) = lock_wait_fixture();
+        let id = ledger.reserve(&scope, Price::Known(100)).unwrap();
+        clock.now.store(50, Ordering::SeqCst);
+        let worker_id = id.clone();
+        let tenant = scope.tenant_id.clone();
+        let result = during_write_wait(&path, &ledger, &clock, 200, move |ledger| {
+            ledger.extend(&tenant, &worker_id, 200)
+        });
+        assert!(matches!(
+            result,
+            Err(BudgetError::ReservationNotActive { .. })
+        ));
+        let row = find_reservation(&ledger.lock(), &scope.tenant_id, &id).unwrap();
+        assert_eq!(row.expires_at_ms, 200);
+    }
+
+    #[test]
+    fn reserve_rolls_back_if_ttl_lapses_before_commit() {
+        let (_path, ledger, clock, scope) = lock_wait_fixture();
+        clock.step.store(200, Ordering::SeqCst);
+        assert!(matches!(
+            ledger.reserve(&scope, Price::Known(100)),
+            Err(BudgetError::ReservationNotActive { .. })
+        ));
+        let count: i64 = ledger
+            .lock()
+            .query_row("SELECT COUNT(*) FROM reservations", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn extend_rolls_back_if_ttl_lapses_before_commit() {
+        let (_path, ledger, clock, scope) = lock_wait_fixture();
+        let id = ledger.reserve(&scope, Price::Known(100)).unwrap();
+        clock.now.store(50, Ordering::SeqCst);
+        clock.step.store(200, Ordering::SeqCst);
+        assert!(matches!(
+            ledger.extend(&scope.tenant_id, &id, 200),
+            Err(BudgetError::ReservationNotActive { .. })
+        ));
+        let row = find_reservation(&ledger.lock(), &scope.tenant_id, &id).unwrap();
+        assert_eq!(row.expires_at_ms, 200);
+    }
+
+    #[test]
+    fn reserve_rejects_if_ttl_lapses_during_commit() {
+        let (_path, ledger, clock, scope) = lock_wait_fixture();
+        clock.step.store(100, Ordering::SeqCst);
+        assert!(matches!(
+            ledger.reserve(&scope, Price::Known(100)),
+            Err(BudgetError::ReservationNotActive { .. })
+        ));
+        assert_eq!(ledger.balance(&scope).unwrap(), 100);
+    }
+
+    #[test]
+    fn extend_rejects_if_ttl_lapses_during_commit() {
+        let (_path, ledger, clock, scope) = lock_wait_fixture();
+        let id = ledger.reserve(&scope, Price::Known(100)).unwrap();
+        clock.now.store(50, Ordering::SeqCst);
+        clock.step.store(100, Ordering::SeqCst);
+        assert!(matches!(
+            ledger.extend(&scope.tenant_id, &id, 200),
+            Err(BudgetError::ReservationNotActive { .. })
+        ));
+        assert_eq!(ledger.balance(&scope).unwrap(), 100);
+    }
 
     /// Temp SQLite path that deletes the database and its `-wal`/`-shm`
     /// sidecars on drop — including when the test panics. Bind it *before*
