@@ -276,8 +276,20 @@ impl BudgetLedger {
                     return Err(err.into());
                 }
                 return match self.settle_uncoordinated(tenant, id, actual) {
-                    Ok(_) => Ok(Some(actual)),
-                    Err(overage @ BudgetError::OverageTooLarge { .. }) => Err(overage),
+                    Ok(_) => {
+                        eprintln!(
+                            "budget settlement sidecar enqueue failed: tenant={tenant} reservation={} sidecar={err} fallback=committed",
+                            id.0
+                        );
+                        Ok(Some(actual))
+                    }
+                    Err(overage @ BudgetError::OverageTooLarge { .. }) => {
+                        eprintln!(
+                            "budget settlement sidecar enqueue failed: tenant={tenant} reservation={} sidecar={err} fallback=committed_overage",
+                            id.0
+                        );
+                        Err(overage)
+                    }
                     Err(primary_err) => {
                         let persisted = self.persist_emergency_settlement(id, tenant, actual);
                         let _ = tx.rollback();
