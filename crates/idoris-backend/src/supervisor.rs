@@ -164,6 +164,22 @@ enum ActorMsg {
     ChatDone {
         model: String,
     },
+    ReconcileDone {
+        generation: u64,
+        result: Result<f64, BackendError>,
+    },
+}
+
+// Mutually exclusive with `active_op`. An unload cancels this read before
+// changing the ledger; generations keep its late completion from admitting
+// a load against a stale sample.
+struct PendingReconcile {
+    generation: u64,
+    id: String,
+    memory_gb: f64,
+    policy: LoadPolicy,
+    waiters: Vec<LoadReply>,
+    cancel: CancellationToken,
 }
 
 enum ActiveKind {
@@ -1019,18 +1035,28 @@ fn handle_unload(
 /// Engine residency outside this actor's ledger has no trustworthy policy
 /// or per-model estimate. Reserve the unexplained total without evicting it;
 /// never reduce that reservation on a later sample (restart to reconcile a
-/// manually cleaned engine). Sample only while no lifecycle operation runs.
+/// manually cleaned engine). Managed occupancy is deducted even when other
+/// unknown residents exist: the unexplained remainder, rather than the full
+/// engine total, is folded into the monotonic reservation floor.
 async fn reconcile_reserved_gb(
     adapter: Arc<dyn RuntimeAdapter>,
     timeout: std::time::Duration,
     managed: Vec<(String, f64)>,
     reserved_gb: f64,
+    cancel: CancellationToken,
 ) -> Result<f64, BackendError> {
-    let status = tokio::spawn(async move {
+    let mut status_task = tokio::spawn(async move {
         with_adapter_timeout(adapter.status(), timeout, "startup/reconcile").await
-    })
-    .await
-    .map_err(|err| BackendError::adapter_panicked("startup/reconcile", err.to_string()))??;
+    });
+    let status = tokio::select! {
+        result = &mut status_task => result
+            .map_err(|err| BackendError::adapter_panicked("startup/reconcile", err.to_string()))??,
+        _ = cancel.cancelled() => {
+            status_task.abort();
+            let _ = status_task.await;
+            return Err(BackendError::busy("reconciliation cancelled by unload", None, None));
+        }
+    };
     if !status.used_gb.is_finite()
         || status.used_gb < 0.0
         || (status.used_gb == 0.0 && !status.loaded.is_empty())
@@ -1039,21 +1065,13 @@ async fn reconcile_reserved_gb(
             "engine residency has no valid memory measurement",
         ));
     }
-    // With an unknown resident, total memory cannot safely be apportioned
-    // using estimates for known models: reserve the entire observed total.
-    let managed_gb = if status
-        .loaded
+    // Subtract only models the engine explicitly reports as loaded. The
+    // ledger plus the remaining reserve still covers the observed total.
+    let managed_gb: f64 = managed
         .iter()
-        .any(|id| !managed.iter().any(|(known, _)| known == id))
-    {
-        0.0
-    } else {
-        managed
-            .iter()
-            .filter(|(id, _)| status.loaded.contains(id))
-            .map(|(_, gb)| gb)
-            .sum()
-    };
+        .filter(|(id, _)| status.loaded.contains(id))
+        .map(|(_, gb)| gb)
+        .sum();
     Ok(reserved_gb.max((status.used_gb - managed_gb).max(0.0)))
 }
 
@@ -1066,6 +1084,8 @@ async fn run_actor(
 ) {
     let mut models: HashMap<String, ModelSlot> = HashMap::new();
     let mut active_op: Option<ActiveOp> = None;
+    let mut pending_reconcile: Option<PendingReconcile> = None;
+    let mut next_reconcile_generation: u64 = 0;
     let mut next_seq: u64 = 0;
     // Once `Some`, the actor refuses all further ledger-touching work
     // rather than risk operating on state whose integrity is no longer
@@ -1081,6 +1101,7 @@ async fn run_actor(
         config.adapter_call_timeout,
         Vec::new(),
         0.0,
+        CancellationToken::new(),
     )
     .await;
     let mut reconciliation_error = initial.as_ref().err().cloned();
@@ -1223,30 +1244,53 @@ async fn run_actor(
                 policy,
                 reply,
             }) => {
+                if let Some(pending) = pending_reconcile.as_mut() {
+                    if pending.id == id
+                        && pending.policy == policy
+                        && pending.memory_gb == memory_gb
+                    {
+                        pending.waiters.push(reply);
+                    } else {
+                        let _ = reply.send(Err(BackendError::busy(
+                            "a different load is awaiting residency reconciliation",
+                            Some(pending.id.clone()),
+                            None,
+                        )));
+                    }
+                    continue;
+                }
                 if active_op.is_none() {
                     let managed = models
                         .iter()
                         .filter(|(_, slot)| occupies_budget(slot.state))
                         .map(|(id, slot)| (id.clone(), slot.memory_gb))
                         .collect();
-                    match reconcile_reserved_gb(
-                        adapter.clone(),
-                        config.adapter_call_timeout,
-                        managed,
-                        env.reserved_gb,
-                    )
-                    .await
-                    {
-                        Ok(reserved) => {
-                            env.reserved_gb = reserved;
-                            reconciliation_error = None;
+                    next_reconcile_generation = next_reconcile_generation.wrapping_add(1);
+                    let generation = next_reconcile_generation;
+                    let cancel = CancellationToken::new();
+                    pending_reconcile = Some(PendingReconcile {
+                        generation,
+                        id,
+                        memory_gb,
+                        policy,
+                        waiters: vec![reply],
+                        cancel: cancel.clone(),
+                    });
+                    let adapter = adapter.clone();
+                    let timeout = config.adapter_call_timeout;
+                    let reserved_gb = env.reserved_gb;
+                    let self_tx = self_tx.clone();
+                    tokio::spawn(async move {
+                        let result =
+                            reconcile_reserved_gb(adapter, timeout, managed, reserved_gb, cancel)
+                                .await;
+                        if let Some(tx) = self_tx.upgrade() {
+                            let _ = tx
+                                .send(ActorMsg::ReconcileDone { generation, result })
+                                .await;
                         }
-                        Err(err) => {
-                            reconciliation_error = Some(err.clone());
-                            let _ = reply.send(Err(err));
-                            continue;
-                        }
-                    }
+                    });
+                    continue;
                 }
                 handle_load(
                     id,
@@ -1260,7 +1304,67 @@ async fn run_actor(
             }
 
             ActorMsg::Cmd(Command::Unload { id, reply }) => {
+                let will_unload = models
+                    .get(&id)
+                    .is_some_and(|slot| slot.state != ModelState::Stopped);
+                if will_unload && let Some(pending) = pending_reconcile.take() {
+                    pending.cancel.cancel();
+                    for waiter in pending.waiters {
+                        let _ = waiter.send(Err(BackendError::busy(
+                            "load cancelled by unload",
+                            Some(pending.id.clone()),
+                            None,
+                        )));
+                    }
+                }
                 handle_unload(id, reply, &mut models, &mut active_op, &env);
+            }
+
+            ActorMsg::ReconcileDone { generation, result } => {
+                let Some(pending) = pending_reconcile.take() else {
+                    continue;
+                };
+                if pending.generation != generation {
+                    pending_reconcile = Some(pending);
+                    continue;
+                }
+                if let Some(msg) = &poisoned {
+                    for waiter in pending.waiters {
+                        let _ = waiter.send(Err(BackendError::invariant_violation(msg.clone())));
+                    }
+                    continue;
+                }
+                match result {
+                    Ok(reserved) => {
+                        env.reserved_gb = reserved;
+                        reconciliation_error = None;
+                        let (relay, result_rx) = oneshot::channel();
+                        handle_load(
+                            pending.id,
+                            pending.memory_gb,
+                            pending.policy,
+                            relay,
+                            &mut models,
+                            &mut active_op,
+                            &env,
+                        );
+                        let waiters = pending.waiters;
+                        tokio::spawn(async move {
+                            let result = result_rx
+                                .await
+                                .unwrap_or_else(|_| Err(BackendError::supervisor_unavailable()));
+                            for waiter in waiters {
+                                let _ = waiter.send(result.clone());
+                            }
+                        });
+                    }
+                    Err(err) => {
+                        reconciliation_error = Some(err.clone());
+                        for waiter in pending.waiters {
+                            let _ = waiter.send(Err(err.clone()));
+                        }
+                    }
+                }
             }
 
             ActorMsg::OpDone { id, outcome } if poisoned.is_some() => {
@@ -1389,6 +1493,9 @@ async fn run_actor(
                 }
             }
         }
+    }
+    if let Some(pending) = pending_reconcile {
+        pending.cancel.cancel();
     }
 }
 
