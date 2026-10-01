@@ -7,8 +7,8 @@
 //! `form: http_service` candidate is a transparent proxy, not a backend
 //! `RuntimeAdapter` call.
 //!
-//! Non-streaming: up to 2 backoff retries (250ms, then 1000ms) on a `>=500`
-//! upstream status or a transport error; the 60s-window idempotency cache
+//! Non-streaming: up to 2 backoff retries (250ms, then 1000ms) only on
+//! connection establishment failures; the 60s-window idempotency cache
 //! from the previous PR is consulted first and updated on every genuinely
 //! successful (2xx) call that carries an `X-iDoris-Request-Id`.
 //!
@@ -31,7 +31,7 @@
 //! value, so there is no `tenant="a:b"+id="c"` vs `tenant="a"+id="b:c"`
 //! collision ambiguity.
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use axum::body::Bytes;
@@ -51,6 +51,7 @@ const DEFAULT_MAX_ENTRIES: usize = 1000;
 #[derive(Debug, Clone)]
 pub(crate) struct CacheEntry {
     pub(crate) at: Instant,
+    fingerprint: Value,
     pub(crate) status: u16,
     pub(crate) body: Bytes,
     /// `X-iDoris-Record-Id` of the request that first produced this entry
@@ -92,6 +93,7 @@ pub struct ForwardOpts<'a> {
 }
 
 /// [`ChatProxy::forward_buffered`]'s result.
+#[derive(Clone)]
 pub struct ForwardOutcome {
     pub status: u16,
     pub body: Bytes,
@@ -108,12 +110,18 @@ pub struct ForwardOutcome {
     pub retries: u32,
 }
 
+struct Flight {
+    fingerprint: Value,
+    outcome: tokio::sync::Mutex<Option<ForwardOutcome>>,
+}
+
 pub struct ChatProxy {
     pub(crate) client: reqwest::Client,
     pub(crate) window: Duration,
     max_entries: usize,
     pub(crate) retry_delays: Vec<Duration>,
     pub(crate) cache: Mutex<IndexMap<String, CacheEntry>>,
+    flights: Mutex<IndexMap<String, Weak<Flight>>>,
 }
 
 impl ChatProxy {
@@ -125,6 +133,7 @@ impl ChatProxy {
             // TS default (`proxy.ts`'s `ProxyDeps.retryDelaysMs` default).
             retry_delays: vec![Duration::from_millis(250), Duration::from_secs(1)],
             cache: Mutex::new(IndexMap::new()),
+            flights: Mutex::new(IndexMap::new()),
         }
     }
 
@@ -147,6 +156,7 @@ impl ChatProxy {
             max_entries: DEFAULT_MAX_ENTRIES,
             retry_delays,
             cache: Mutex::new(IndexMap::new()),
+            flights: Mutex::new(IndexMap::new()),
         }
     }
 
@@ -211,6 +221,84 @@ impl ChatProxy {
         body: &Value,
         opts: &ForwardOpts<'_>,
     ) -> ForwardOutcome {
+        let mut payload = body.clone();
+        if let Some(obj) = payload.as_object_mut() {
+            obj.insert("stream".to_string(), Value::Bool(false));
+        }
+        // Record ids differ on replay; payload and safety context must not.
+        let fingerprint = serde_json::json!({
+            "body": payload, "privacy": opts.privacy, "locality": opts.served_locality,
+        });
+        let Some(request_id) = opts.request_id else {
+            return self
+                .forward_once(endpoint, &payload, opts, &fingerprint)
+                .await;
+        };
+        let url = format!("{}/v1/chat/completions", endpoint.trim_end_matches('/'));
+        let key = cache_key(
+            opts.tenant_id.unwrap_or("\u{0}personal"),
+            &url,
+            opts.provider_id,
+            request_id,
+        );
+        let flight = {
+            let Ok(mut flights) = self.flights.lock() else {
+                return Self::failure(502, "upstream_unavailable");
+            };
+            // Keep only active calls; completed successes live in the bounded cache.
+            flights.retain(|_, flight| flight.strong_count() > 0);
+            if let Some(flight) = flights.get(&key).and_then(Weak::upgrade) {
+                flight
+            } else {
+                let flight = Arc::new(Flight {
+                    fingerprint: fingerprint.clone(),
+                    outcome: tokio::sync::Mutex::new(None),
+                });
+                flights.insert(key, Arc::downgrade(&flight));
+                flight
+            }
+        };
+        if flight.fingerprint != fingerprint {
+            return Self::failure(409, "request_id_conflict");
+        }
+        let mut result = flight.outcome.lock().await;
+        if let Some(outcome) = result.as_ref() {
+            return outcome.clone();
+        }
+        // If the leader is cancelled, waiting calls fail closed instead of resending.
+        *result = Some(Self::failure(502, "upstream_unavailable"));
+        let outcome = self
+            .forward_once(endpoint, &payload, opts, &fingerprint)
+            .await;
+        let mut replay = outcome.clone();
+        if (200..300).contains(&replay.status) && !replay.cached {
+            replay.cached = true;
+            replay.origin_record_id = Some(opts.record_id.to_string());
+            replay.replayed_served_locality = Some(opts.served_locality);
+        }
+        *result = Some(replay);
+        outcome
+    }
+
+    fn failure(status: u16, kind: &str) -> ForwardOutcome {
+        ForwardOutcome {
+            status,
+            body: Bytes::from(serde_json::json!({"error": {"type": kind}}).to_string()),
+            content_type: Some("application/json".into()),
+            cached: false,
+            origin_record_id: None,
+            replayed_served_locality: None,
+            retries: 0,
+        }
+    }
+
+    async fn forward_once(
+        &self,
+        endpoint: &str,
+        payload: &Value,
+        opts: &ForwardOpts<'_>,
+        fingerprint: &Value,
+    ) -> ForwardOutcome {
         let url = format!("{}/v1/chat/completions", endpoint.trim_end_matches('/'));
         let tenant_scope = opts.tenant_id.unwrap_or("\u{0}personal");
 
@@ -221,6 +309,9 @@ impl ChatProxy {
             if let Some(entry) = hit
                 && Instant::now().duration_since(entry.at) < self.window
             {
+                if entry.fingerprint != *fingerprint {
+                    return Self::failure(409, "request_id_conflict");
+                }
                 // C1 fail-closed: a local_only request must never replay a
                 // cache entry whose *recorded* Served-Locality isn't
                 // loopback (a missing/foreign value is treated as unsafe,
@@ -241,22 +332,12 @@ impl ChatProxy {
             }
         }
 
-        let mut payload = body.clone();
-        if let Some(obj) = payload.as_object_mut() {
-            obj.insert("stream".to_string(), Value::Bool(false));
-        }
-
         let mut attempt = 0usize;
         loop {
-            let sent = self.client.post(&url).json(&payload).send().await;
+            let sent = self.client.post(&url).json(payload).send().await;
             match sent {
                 Ok(resp) => {
                     let status = resp.status().as_u16();
-                    if status >= 500 && attempt < self.retry_delays.len() {
-                        self.sleep_retry(attempt).await;
-                        attempt += 1;
-                        continue;
-                    }
                     let content_type = resp
                         .headers()
                         .get(reqwest::header::CONTENT_TYPE)
@@ -296,6 +377,7 @@ impl ChatProxy {
                             cache_key(tenant_scope, &url, opts.provider_id, request_id),
                             CacheEntry {
                                 at: Instant::now(),
+                                fingerprint: fingerprint.clone(),
                                 status,
                                 body: body_bytes.clone(),
                                 record_id: opts.record_id.to_string(),
@@ -313,8 +395,9 @@ impl ChatProxy {
                         retries,
                     };
                 }
-                Err(_err) => {
-                    if attempt < self.retry_delays.len() {
+                Err(err) => {
+                    // A send/read timeout or lost headers may follow an executed POST.
+                    if err.is_connect() && attempt < self.retry_delays.len() {
                         self.sleep_retry(attempt).await;
                         attempt += 1;
                         continue;
@@ -413,6 +496,7 @@ mod tests {
     fn entry(status: u16) -> CacheEntry {
         CacheEntry {
             at: Instant::now(),
+            fingerprint: Value::Null,
             status,
             body: Bytes::from_static(b"{}"),
             record_id: "rec-1".to_string(),
@@ -515,6 +599,114 @@ mod tests {
         assert_eq!(body["marker"], "raw-passthrough");
     }
 
+    #[tokio::test]
+    async fn k13_concurrent_same_id_is_singleflight_and_tenants_stay_isolated() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_string("ok")
+                    .set_delay(Duration::from_millis(100)),
+            )
+            .expect(2)
+            .mount(&server)
+            .await;
+        let proxy = fast_retry_proxy();
+        let endpoint = server.uri();
+        let body = chat_body();
+        let a = opts(Some("same-id"), "rec-a");
+        let b = opts(Some("same-id"), "rec-b");
+        let mut other = opts(Some("same-id"), "rec-other");
+        other.tenant_id = Some("other-tenant");
+        let (first, second, isolated) = tokio::join!(
+            proxy.forward_buffered(&endpoint, &body, &a),
+            proxy.forward_buffered(&endpoint, &body, &b),
+            proxy.forward_buffered(&endpoint, &body, &other),
+        );
+        assert_eq!(
+            (first.status, second.status, isolated.status),
+            (200, 200, 200)
+        );
+        assert_eq!(first.body, second.body);
+        assert!(second.cached);
+        assert_eq!(second.origin_record_id.as_deref(), Some("rec-a"));
+        assert!(!isolated.cached);
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn k13_changed_payload_conflicts_in_flight_and_after_cache_write() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_string("ok")
+                    .set_delay(Duration::from_millis(100)),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let proxy = fast_retry_proxy();
+        let endpoint = server.uri();
+        let body = chat_body();
+        let mut changed = body.clone();
+        changed["messages"][0]["content"] = Value::String("different".into());
+        let options = opts(Some("same-id"), "rec-1");
+        let (first, conflict) = tokio::join!(
+            proxy.forward_buffered(&endpoint, &body, &options),
+            proxy.forward_buffered(&endpoint, &changed, &options),
+        );
+        assert_eq!(first.status, 200);
+        assert_eq!(conflict.status, 409);
+        let conflict = proxy.forward_buffered(&endpoint, &changed, &options).await;
+        assert_eq!(conflict.status, 409);
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn k13_lost_response_headers_never_retry_an_executed_post() {
+        use tokio::io::AsyncReadExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let observed = calls.clone();
+        let upstream = tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut received = Vec::new();
+                loop {
+                    let mut buf = [0u8; 4096];
+                    let n = socket.read(&mut buf).await.unwrap();
+                    assert_ne!(n, 0);
+                    received.extend_from_slice(&buf[..n]);
+                    if let Some(end) = received.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&received[..end]);
+                        let length: usize = headers
+                            .lines()
+                            .find_map(|line| {
+                                line.to_ascii_lowercase()
+                                    .strip_prefix("content-length: ")
+                                    .map(|value| value.parse().unwrap())
+                            })
+                            .unwrap();
+                        if received.len() >= end + 4 + length {
+                            break;
+                        }
+                    }
+                }
+                observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                // The POST was consumed; close without sending response headers.
+            }
+        });
+        let out = fast_retry_proxy()
+            .forward_buffered(&endpoint, &chat_body(), &opts(Some("lost"), "rec-1"))
+            .await;
+        upstream.abort();
+        assert_eq!(out.status, 502);
+        assert_eq!(out.retries, 0);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
     /// prdaemon #48 round 2 (Low): a 2xx whose body fails mid-read must
     /// become a 502 and must not be cached for replay. Raw TCP because
     /// `wiremock` can't send "headers ok, body truncated".
@@ -577,7 +769,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retries_up_to_twice_on_5xx_then_succeeds() {
+    async fn k13_5xx_is_not_proof_that_a_post_was_not_executed() {
         let server = wiremock::MockServer::start().await;
         let responder = CountingRespond {
             calls: std::sync::atomic::AtomicU32::new(0),
@@ -595,12 +787,13 @@ mod tests {
         let out = fast_retry_proxy()
             .forward_buffered(&server.uri(), &chat_body(), &opts(None, "rec-1"))
             .await;
-        assert_eq!(out.status, 200);
-        assert_eq!(out.retries, 2);
+        assert_eq!(out.status, 500);
+        assert_eq!(out.retries, 0);
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
     }
 
     #[tokio::test]
-    async fn persistent_5xx_is_passed_through_verbatim_after_exhausting_retries() {
+    async fn persistent_5xx_is_passed_through_verbatim_without_retry() {
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("POST"))
             .and(wiremock::matchers::path("/v1/chat/completions"))
@@ -627,7 +820,7 @@ mod tests {
                 wiremock::ResponseTemplate::new(200)
                     .set_body_json(serde_json::json!({"marker": "idem"})),
             )
-            .expect(3) // first + remote_opts + local_only_opts (C1 forces a real call, no cache hit)
+            .expect(2) // first + remote_opts; changed safety context is rejected
             .mount(&server)
             .await;
         let proxy = ChatProxy::new(reqwest::Client::new());
@@ -642,8 +835,8 @@ mod tests {
         assert_eq!(second.origin_record_id.as_deref(), Some("rec-1"));
         assert_eq!(second.body, first.body);
 
-        // PR #46 review finding C1: a local_only request must not replay a
-        // cache entry whose recorded Served-Locality isn't loopback.
+        // PR #46 C1 + K13/M4: changed safety context is a fingerprint conflict,
+        // never a remote cache replay or a second POST under the same id.
         let mut remote_opts = opts(Some("req-remote"), "rec-3");
         remote_opts.served_locality = Locality::Remote;
         proxy
@@ -654,6 +847,7 @@ mod tests {
         let third = proxy
             .forward_buffered(&server.uri(), &chat_body(), &local_only_opts)
             .await;
+        assert_eq!(third.status, 409);
         assert!(!third.cached);
         server.verify().await;
     }
@@ -665,6 +859,7 @@ mod tests {
             .forward_buffered("http://127.0.0.1:1", &chat_body(), &opts(None, "rec-1"))
             .await;
         assert_eq!(out.status, 502);
+        assert_eq!(out.retries, 2); // Connection refused: no POST was sent.
         let body: Value = serde_json::from_slice(&out.body).unwrap();
         assert_eq!(body["error"]["type"], "upstream_unavailable");
     }
