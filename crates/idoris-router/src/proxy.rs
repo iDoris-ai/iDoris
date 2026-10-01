@@ -31,7 +31,7 @@
 //! value, so there is no `tenant="a:b"+id="c"` vs `tenant="a"+id="b:c"`
 //! collision ambiguity.
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::body::Bytes;
@@ -112,6 +112,8 @@ pub struct ChatProxy {
     pub(crate) client: reqwest::Client,
     pub(crate) window: Duration,
     max_entries: usize,
+    idle_timeout: Duration,
+    permits: Arc<tokio::sync::Semaphore>,
     header_timeout: Duration,
     body_timeout: Duration,
     max_body_bytes: usize,
@@ -126,6 +128,8 @@ impl ChatProxy {
             client,
             window: DEFAULT_WINDOW,
             max_entries: DEFAULT_MAX_ENTRIES,
+            idle_timeout: Duration::from_secs(30),
+            permits: Arc::new(tokio::sync::Semaphore::new(32)),
             header_timeout: Duration::from_secs(10),
             body_timeout: Duration::from_secs(60),
             max_body_bytes: 8 * 1024 * 1024,
@@ -296,6 +300,10 @@ impl ChatProxy {
             }
         }
 
+        let Ok(_permit) = self.permits.clone().try_acquire_owned() else {
+            return Self::failure(503, 0);
+        };
+
         let mut payload = body.clone();
         if let Some(obj) = payload.as_object_mut() {
             obj.insert("stream".to_string(), Value::Bool(false));
@@ -408,12 +416,25 @@ impl ChatProxy {
     /// outright still gets a plain JSON/text error body, never an SSE
     /// stream carrying an error.
     pub async fn forward_stream(&self, endpoint: &str, body: &Value) -> StreamOutcome {
+        // Reject immediately rather than accumulate unbounded waiters.
+        let Ok(permit) = self.permits.clone().try_acquire_owned() else {
+            return Self::stream_failure(503);
+        };
         let url = format!("{}/v1/chat/completions", endpoint.trim_end_matches('/'));
         let mut payload = body.clone();
         if let Some(obj) = payload.as_object_mut() {
             obj.insert("stream".to_string(), Value::Bool(true));
         }
-        match self.client.post(&url).json(&payload).send().await {
+        let sent = match tokio::time::timeout(
+            self.header_timeout,
+            self.client.post(&url).json(&payload).send(),
+        )
+        .await
+        {
+            Ok(sent) => sent,
+            Err(_) => return Self::stream_failure(504),
+        };
+        match sent {
             Ok(resp) => {
                 let status = resp.status().as_u16();
                 let content_type = resp
@@ -422,34 +443,58 @@ impl ChatProxy {
                     .and_then(|v| v.to_str().ok())
                     .map(str::to_string);
                 if (200..300).contains(&status) {
+                    let idle = self.idle_timeout;
+                    // The body owns both connection and permit. EOF, read
+                    // failure, idle timeout and client drop all release them.
+                    let stream = futures_util::stream::try_unfold(
+                        (resp, permit),
+                        move |(mut resp, permit)| async move {
+                            let chunk = tokio::time::timeout(idle, resp.chunk())
+                                .await
+                                .map_err(|_| {
+                                    std::io::Error::new(
+                                        std::io::ErrorKind::TimedOut,
+                                        "upstream stream idle timeout",
+                                    )
+                                })?
+                                .map_err(std::io::Error::other)?;
+                            Ok::<_, std::io::Error>(chunk.map(|chunk| (chunk, (resp, permit))))
+                        },
+                    );
                     StreamOutcome::Stream {
                         status,
                         content_type,
-                        response: resp,
+                        response: axum::body::Body::from_stream(stream),
                     }
                 } else {
-                    let body = resp.bytes().await.unwrap_or_default();
-                    StreamOutcome::Buffered {
-                        status,
-                        body,
-                        content_type,
+                    match self.read_buffered(resp).await {
+                        Ok(body) => StreamOutcome::Buffered {
+                            status,
+                            body,
+                            content_type,
+                        },
+                        Err(status) => Self::stream_failure(status),
                     }
                 }
             }
-            Err(_err) => StreamOutcome::Buffered {
-                status: 502,
-                body: Bytes::from_static(br#"{"error":{"type":"upstream_unavailable"}}"#),
-                content_type: Some("application/json".to_string()),
-            },
+            Err(err) => Self::stream_failure(if err.is_timeout() { 504 } else { 502 }),
+        }
+    }
+
+    fn stream_failure(status: u16) -> StreamOutcome {
+        let failure = Self::failure(status, 0);
+        StreamOutcome::Buffered {
+            status,
+            body: failure.body,
+            content_type: failure.content_type,
         }
     }
 }
 
 /// [`ChatProxy::forward_stream`]'s result: either the initial response
 /// wasn't ok (returned buffered, see that method's doc) or it was, in which
-/// case the caller streams `response`'s body onward incrementally (never
-/// buffering it — see `lib.rs`'s `chat_via_proxy` for the explicit-error-
-/// on-truncation / cancel-on-drop pass-through).
+/// case `response` is a body owning the upstream connection and permit,
+/// with an explicit read error on truncation or idle timeout.
 pub enum StreamOutcome {
     Buffered {
         status: u16,
@@ -459,7 +504,7 @@ pub enum StreamOutcome {
     Stream {
         status: u16,
         content_type: Option<String>,
-        response: reqwest::Response,
+        response: axum::body::Body,
     },
 }
 
@@ -704,6 +749,144 @@ mod tests {
         large.body = Bytes::from(vec![0; 17]);
         proxy.remember("huge".into(), large);
         assert!(!proxy.cache.lock().unwrap().contains_key("huge"));
+    }
+
+    #[tokio::test]
+    async fn k14_stream_headers_and_error_body_are_bounded() {
+        for (template, expected) in [
+            (
+                wiremock::ResponseTemplate::new(200).set_delay(Duration::from_millis(200)),
+                504,
+            ),
+            (
+                wiremock::ResponseTemplate::new(502).set_body_string("12345"),
+                502,
+            ),
+        ] {
+            let server = wiremock::MockServer::start().await;
+            wiremock::Mock::given(wiremock::matchers::method("POST"))
+                .respond_with(template)
+                .expect(1)
+                .mount(&server)
+                .await;
+            let mut proxy = fast_retry_proxy();
+            proxy.header_timeout = Duration::from_millis(20);
+            proxy.max_body_bytes = 4;
+            let out = tokio::time::timeout(
+                Duration::from_millis(100),
+                proxy.forward_stream(&server.uri(), &chat_body()),
+            )
+            .await
+            .expect("stream response headers must have a deadline");
+            let StreamOutcome::Buffered { status, body, .. } = out else {
+                panic!("expected a bounded error response");
+            };
+            assert_eq!(status, expected);
+            assert_ne!(body.as_ref(), b"12345");
+        }
+    }
+
+    #[tokio::test]
+    async fn k14_stream_idle_timeout_errors_and_releases_permit() {
+        use http_body_util::BodyExt;
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let _ = socket.read(&mut [0; 4096]);
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 100\r\n\r\nx")
+                .unwrap();
+            std::thread::sleep(Duration::from_millis(200));
+        });
+        let mut proxy = fast_retry_proxy();
+        proxy.idle_timeout = Duration::from_millis(20);
+        proxy.permits = Arc::new(tokio::sync::Semaphore::new(1));
+        let StreamOutcome::Stream { mut response, .. } = proxy
+            .forward_stream(&format!("http://{addr}"), &chat_body())
+            .await
+        else {
+            panic!("expected stream");
+        };
+        assert_eq!(
+            response
+                .frame()
+                .await
+                .unwrap()
+                .unwrap()
+                .into_data()
+                .unwrap(),
+            "x"
+        );
+        let error = tokio::time::timeout(Duration::from_millis(100), response.frame())
+            .await
+            .expect("an idle stream must fail")
+            .unwrap()
+            .unwrap_err();
+        assert!(error.to_string().contains("idle"));
+        assert_eq!(proxy.permits.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn k14_stream_holds_permit_until_body_drop_or_eof() {
+        use http_body_util::BodyExt;
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_string("ok"))
+            .expect(2)
+            .mount(&server)
+            .await;
+        let mut proxy = fast_retry_proxy();
+        proxy.permits = Arc::new(tokio::sync::Semaphore::new(1));
+        let out = proxy.forward_stream(&server.uri(), &chat_body()).await;
+        let denied = proxy
+            .forward_buffered(&server.uri(), &chat_body(), &opts(None, "r"))
+            .await;
+        assert_eq!(denied.status, 503);
+        assert!(matches!(
+            proxy.forward_stream(&server.uri(), &chat_body()).await,
+            StreamOutcome::Buffered { status: 503, .. }
+        ));
+        drop(out);
+        assert_eq!(proxy.permits.available_permits(), 1);
+        let StreamOutcome::Stream { response, .. } =
+            proxy.forward_stream(&server.uri(), &chat_body()).await
+        else {
+            panic!("expected stream");
+        };
+        assert_eq!(response.collect().await.unwrap().to_bytes(), "ok");
+        assert_eq!(proxy.permits.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn k14_buffered_holds_permit_and_cancellation_releases_it() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (sent, received) = tokio::sync::oneshot::channel();
+        std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let _ = socket.read(&mut [0; 4096]);
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 100\r\n\r\nx")
+                .unwrap();
+            let _ = sent.send(());
+            std::thread::sleep(Duration::from_millis(200));
+        });
+        let mut proxy = fast_retry_proxy();
+        proxy.permits = Arc::new(tokio::sync::Semaphore::new(1));
+        let endpoint = format!("http://{addr}");
+        let body = chat_body();
+        let options = opts(None, "r");
+        let mut pending = Box::pin(proxy.forward_buffered(&endpoint, &body, &options));
+        tokio::select! {
+            _ = received => {},
+            _ = &mut pending => panic!("body must still be pending"),
+        }
+        assert_eq!(proxy.permits.available_permits(), 0);
+        drop(pending);
+        assert_eq!(proxy.permits.available_permits(), 1);
     }
 
     /// Counts requests received so the test can assert an exact retry

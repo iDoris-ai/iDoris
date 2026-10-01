@@ -625,7 +625,7 @@ async fn chat_via_proxy_stream(
             // normal end); and when our client disconnects, axum drops this
             // stream, which drops `upstream` (owns the real connection),
             // which reqwest/hyper tears down -- genuinely cancelled.
-            let body = Body::from_stream(upstream.bytes_stream());
+            let body = upstream; // Already guarded by the proxy idle timer and permit.
             let mut response = Response::builder()
                 .status(status)
                 .body(body)
