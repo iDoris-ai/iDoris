@@ -196,7 +196,8 @@ impl SpendGate {
 /// This is the LiteLLM #32614 bug class: non-atomic check-then-deduct lets N
 /// concurrent requests all pass the check before any commits, over-spending.
 pub struct BudgetLedger {
-    conn: Mutex<Connection>,
+    pub(super) conn: Mutex<Connection>,
+    pub(super) settlements: Mutex<Connection>,
     clock: Arc<dyn Clock>,
     ttl_ms: i64,
 }
@@ -255,11 +256,16 @@ impl BudgetLedger {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.busy_timeout(busy_timeout)?;
         run_migrations(&mut conn)?;
-        Ok(Self {
+        let ledger = Self {
             conn: Mutex::new(conn),
+            settlements: Mutex::new(super::settlement::open(path.as_ref(), busy_timeout)?),
             clock,
             ttl_ms,
-        })
+        };
+        if let Err(err) = ledger.retry_settlements() {
+            eprintln!("budget settlement recovery pending: {err}");
+        }
+        Ok(ledger)
     }
 
     /// A poisoned mutex only happens if a previous call panicked mid-method.
@@ -488,6 +494,7 @@ impl BudgetLedger {
             Price::Known(v) => v,
         };
 
+        self.retry_settlements()?;
         let now_ms = self.clock.now_ms();
         let mut conn = self.lock();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;

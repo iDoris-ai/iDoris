@@ -11,6 +11,7 @@ mod estimator;
 mod ledger;
 mod period;
 mod scope;
+mod settlement;
 
 pub use clock::{Clock, SystemClock};
 pub use error::{BUDGET_EXCEEDED_REASON_CODE, Budget402Body, BudgetError};
