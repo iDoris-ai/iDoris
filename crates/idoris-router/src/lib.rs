@@ -9,6 +9,9 @@
 /// Control-plane header parsing (R2-D task 1).
 pub mod profile;
 
+/// Offline intent embedding primitives (B1 task 09).
+pub mod intent;
+
 /// Component card loading from `IDORIS_COMPONENTS_DIR` (R2-D task 2); wired
 /// into `AppState`/`/health`'s `components` count in a follow-up PR.
 pub mod components;
