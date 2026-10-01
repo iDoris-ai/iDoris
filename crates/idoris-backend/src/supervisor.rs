@@ -27,8 +27,8 @@ use tokio_util::sync::CancellationToken;
 use crate::adapter::RuntimeAdapter;
 use crate::error::BackendError;
 use crate::eviction::{
-    EvictionPlan, ModelEntry, ModelReq, ModelState, PlanEvictionError, Snapshot, occupies_budget,
-    plan_eviction,
+    CAPACITY_EPSILON_GB, EvictionPlan, ModelEntry, ModelReq, ModelState, PlanEvictionError,
+    Snapshot, occupies_budget, plan_eviction,
 };
 use crate::types::{BackendStatus, ChatRequest, ChatResponse, ModelInfo, Pressure};
 
@@ -449,7 +449,7 @@ async fn confirm_memory_released(
             with_adapter_timeout(adapter.status(), config.adapter_call_timeout, "status").await
             && status.used_gb.is_finite()
             && status.used_gb >= 0.0
-            && status.used_gb <= max_used_gb
+            && status.used_gb <= max_used_gb + CAPACITY_EPSILON_GB
             && targets.iter().all(|id| !status.loaded.contains(id))
         {
             return Ok(());
@@ -2961,6 +2961,61 @@ mod tests {
             cancel: CancellationToken,
         ) -> Result<ChatResponse, BackendError> {
             self.inner.chat(req, cancel).await
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn release_confirmation_accepts_rounding_but_rejects_invalid_evidence() {
+        let ledger_sum = (0.2_f64 + 0.3) + 0.1;
+        let engine_sum = (0.1_f64 + 0.2) + 0.3;
+        assert_eq!(ledger_sum, 0.6);
+        assert_eq!(engine_sum, 0.6000000000000001);
+
+        let config = SupervisorConfig {
+            release_confirm_interval: std::time::Duration::ZERO,
+            release_confirm_max_attempts: 1,
+            ..SupervisorConfig::default()
+        };
+        let adapter_for = |used_gb, loaded: Vec<String>| -> Arc<dyn RuntimeAdapter> {
+            Arc::new(UnverifiedReleaseAdapter {
+                inner: MockAdapter::new(catalog()),
+                reported: std::sync::Mutex::new(Some(BackendStatus {
+                    pressure: Pressure::Ok,
+                    used_gb,
+                    model_memory_max_gb: 1.0,
+                    loaded,
+                })),
+                probe_fails: false,
+            })
+        };
+
+        confirm_memory_released(
+            &adapter_for(engine_sum, vec![]),
+            &["a".into()],
+            ledger_sum,
+            &config,
+        )
+        .await
+        .expect("float summation order must not reject a fully freed target");
+
+        for (used_gb, loaded) in [
+            (ledger_sum + CAPACITY_EPSILON_GB * 2.0, vec![]),
+            (ledger_sum, vec!["a".into()]),
+            (f64::NAN, vec![]),
+            (f64::INFINITY, vec![]),
+            (-1.0, vec![]),
+        ] {
+            assert!(
+                confirm_memory_released(
+                    &adapter_for(used_gb, loaded),
+                    &["a".into()],
+                    ledger_sum,
+                    &config,
+                )
+                .await
+                .is_err(),
+                "invalid or insufficient release evidence must fail closed"
+            );
         }
     }
 
