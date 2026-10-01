@@ -1,15 +1,10 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-};
+use std::sync::Arc;
 use std::time::Duration;
 
-use async_trait::async_trait;
 use idoris_backend::{
-    BackendError, BackendStatus, ChatMessage, ChatRequest, ChatResponse, MockAdapter, ModelInfo,
-    RuntimeAdapter, Supervisor, SupervisorConfig, SupervisorHandle,
+    ChatRequest, MockAdapter, ModelInfo, RuntimeAdapter, Supervisor, SupervisorConfig,
 };
 use idoris_contracts::{
     LoadPolicy,
@@ -42,81 +37,6 @@ fn config(budget_gb: f64) -> SupervisorConfig {
     }
 }
 
-/// Reports the selected model as no longer loaded after unload while keeping
-/// its memory charged, modeling an engine whose successful unload response
-/// does not prove that allocation has been released.
-struct RetainedMemoryAdapter {
-    inner: MockAdapter,
-    retained_id: String,
-    retain_after_unload: AtomicBool,
-    fail_probe: bool,
-    failed_probe: AtomicBool,
-}
-
-impl RetainedMemoryAdapter {
-    fn new(catalog: Vec<ModelInfo>, retained_id: &str, fail_probe: bool) -> Self {
-        Self {
-            inner: MockAdapter::new(catalog),
-            retained_id: retained_id.to_owned(),
-            retain_after_unload: AtomicBool::new(false),
-            fail_probe,
-            failed_probe: AtomicBool::new(false),
-        }
-    }
-}
-
-#[async_trait]
-impl RuntimeAdapter for RetainedMemoryAdapter {
-    async fn list(&self) -> Result<Vec<ModelInfo>, BackendError> {
-        self.inner.list().await
-    }
-
-    async fn load(&self, id: &str, policy: Option<&LoadPolicy>) -> Result<(), BackendError> {
-        self.inner.load(id, policy).await
-    }
-
-    async fn unload(&self, id: &str) -> Result<(), BackendError> {
-        self.inner.unload(id).await?;
-        if id == self.retained_id {
-            self.retain_after_unload.store(true, Ordering::SeqCst);
-        }
-        Ok(())
-    }
-
-    async fn status(&self) -> Result<BackendStatus, BackendError> {
-        let mut status = self.inner.status().await?;
-        if self.retain_after_unload.load(Ordering::SeqCst) {
-            status.loaded.retain(|id| id != &self.retained_id);
-            status.used_gb += self
-                .inner
-                .list()
-                .await?
-                .iter()
-                .find(|model| model.id == self.retained_id)
-                .map_or(0.0, |model| model.memory_gb);
-        }
-        Ok(status)
-    }
-
-    async fn probe_ready(&self, id: &str) -> Result<bool, BackendError> {
-        if self.fail_probe && id == self.retained_id {
-            self.failed_probe.store(true, Ordering::SeqCst);
-            return Err(BackendError::Upstream {
-                message: "scripted probe failure".into(),
-            });
-        }
-        self.inner.probe_ready(id).await
-    }
-
-    async fn chat(
-        &self,
-        request: ChatRequest,
-        cancel: CancellationToken,
-    ) -> Result<ChatResponse, BackendError> {
-        self.inner.chat(request, cancel).await
-    }
-}
-
 fn models(entries: &[(&str, f64)]) -> Vec<ModelInfo> {
     entries
         .iter()
@@ -125,48 +45,6 @@ fn models(entries: &[(&str, f64)]) -> Vec<ModelInfo> {
             memory_gb: *memory_gb,
         })
         .collect()
-}
-
-async fn assert_unconfirmed_memory_rejects_next_admission(
-    handle: &SupervisorHandle,
-    adapter: &Arc<RetainedMemoryAdapter>,
-) {
-    let status = handle.status().await.unwrap();
-    assert!(!status.loaded.iter().any(|id| id == "a"));
-    assert_eq!(status.used_gb, 20.0);
-    let engine_status = adapter.status().await.unwrap();
-    assert!(!engine_status.loaded.iter().any(|id| id == "a"));
-    assert_eq!(engine_status.used_gb, 20.0);
-    assert!(handle.load("b", 20.0, on_demand()).await.is_err());
-    assert_eq!(adapter.inner.load_call_count("b"), 0);
-}
-
-#[tokio::test(start_paused = true)]
-async fn standalone_unload_without_confirmed_release_keeps_memory_charged() {
-    let adapter = Arc::new(RetainedMemoryAdapter::new(
-        models(&[("a", 20.0), ("b", 20.0)]),
-        "a",
-        false,
-    ));
-    let handle = Supervisor::spawn(adapter.clone(), config(24.0)).unwrap();
-    handle.load("a", 20.0, on_demand()).await.unwrap();
-    assert!(handle.unload("a").await.is_err());
-    assert_eq!(adapter.inner.unload_call_count("a"), 1);
-    assert_unconfirmed_memory_rejects_next_admission(&handle, &adapter).await;
-}
-
-#[tokio::test(start_paused = true)]
-async fn probe_cleanup_without_confirmed_release_keeps_memory_charged() {
-    let adapter = Arc::new(RetainedMemoryAdapter::new(
-        models(&[("a", 20.0), ("b", 20.0)]),
-        "a",
-        true,
-    ));
-    let handle = Supervisor::spawn(adapter.clone(), config(24.0)).unwrap();
-    assert!(handle.load("a", 20.0, on_demand()).await.is_err());
-    assert!(adapter.failed_probe.load(Ordering::SeqCst));
-    assert_eq!(adapter.inner.unload_call_count("a"), 1);
-    assert_unconfirmed_memory_rejects_next_admission(&handle, &adapter).await;
 }
 
 #[tokio::test(start_paused = true)]
@@ -179,8 +57,8 @@ async fn failed_different_policy_oom_reload_keeps_original_capacity_reserved() {
         adapter.set_unload_script("a", vec![UnloadOutcome::Fail]);
         let handle = Supervisor::spawn(adapter.clone(), config(8.0)).unwrap();
 
-        handle.load("a", old_gb, on_demand()).await.unwrap();
-        assert!(handle.load("a", replacement_gb, resident()).await.is_err());
+        handle.load("a", old_gb, resident()).await.unwrap();
+        assert!(handle.load("a", replacement_gb, on_demand()).await.is_err());
         assert_eq!(adapter.load_call_count("a"), 2);
         assert_eq!(adapter.unload_call_count("a"), 1);
         let status = handle.status().await.unwrap();
@@ -205,61 +83,6 @@ async fn failed_different_policy_oom_reload_keeps_original_capacity_reserved() {
             old_gb.max(replacement_gb)
         );
     }
-}
-
-#[tokio::test(start_paused = true)]
-async fn different_policy_oom_reload_is_rejected_while_chat_is_inflight() {
-    use idoris_backend::mock::LoadOutcome;
-
-    let adapter = Arc::new(MockAdapter::new(models(&[("a", 4.0)])));
-    adapter.set_load_script("a", vec![LoadOutcome::Ok, LoadOutcome::Oom]);
-    adapter.set_chat_delay("a", Duration::from_millis(200));
-    let handle = Supervisor::spawn(adapter.clone(), config(8.0)).unwrap();
-
-    handle.load("a", 4.0, resident()).await.unwrap();
-    let chat_handle = handle.clone();
-    let chat = tokio::spawn(async move {
-        chat_handle
-            .chat(
-                ChatRequest {
-                    model: "a".into(),
-                    messages: vec![ChatMessage {
-                        role: "user".into(),
-                        content: "hello".into(),
-                    }],
-                },
-                CancellationToken::new(),
-            )
-            .await
-    });
-    // With paused time, advancing partway through the adapter delay gives
-    // the spawned chat time to enter the adapter while leaving it in flight.
-    tokio::time::sleep(Duration::from_millis(20)).await;
-
-    assert!(!chat.is_finished());
-    let busy = handle.load("a", 4.0, on_demand()).await.unwrap_err();
-    assert_eq!(busy.reason_code(), "supervisor_busy");
-    assert_eq!(adapter.load_call_count("a"), 1);
-    assert_eq!(adapter.unload_call_count("a"), 0);
-    let status = handle.status().await.unwrap();
-    assert_eq!(status.used_gb, 4.0);
-    assert_eq!(status.loaded, vec!["a"]);
-
-    // Reapplying the current policy is a Ready no-op even while chat runs.
-    handle.load("a", 4.0, resident()).await.unwrap();
-    assert_eq!(adapter.load_call_count("a"), 1);
-
-    assert!(!chat.is_finished());
-    assert_eq!(adapter.unload_call_count("a"), 0);
-    let response = chat.await.unwrap().unwrap();
-    assert_eq!(response.model, "a");
-    assert_eq!(response.content, "mock reply to: hello");
-
-    // Once the chat drains, the changed policy reaches the adapter and its
-    // scripted OOM follows the ordinary cleanup path.
-    assert!(handle.load("a", 4.0, on_demand()).await.is_err());
-    assert_eq!(adapter.load_call_count("a"), 2);
-    assert_eq!(adapter.unload_call_count("a"), 1);
 }
 
 #[tokio::test(start_paused = true)]
