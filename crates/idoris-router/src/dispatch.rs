@@ -740,10 +740,13 @@ mod tests {
         async fn chat(
             &self,
             req: ChatRequest,
-            _cancel: CancellationToken,
+            cancel: CancellationToken,
         ) -> Result<ChatResponse, BackendError> {
             let call = self.calls.fetch_add(1, Ordering::SeqCst);
             self.started.notify_one();
+            if cancel.is_cancelled() {
+                return Err(BackendError::cancelled());
+            }
             if self.busy {
                 return Err(BackendError::busy("adapter busy", None, None));
             }
@@ -1056,6 +1059,77 @@ mod tests {
             blocked.result
         );
         assert_eq!(adapter.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn cancelled_before_adapter_call_releases_intent_and_allows_retry() {
+        let (dir, ledger) = configured_ledger(1_000_000);
+        let adapter = busy_adapter(false);
+        let supervisor = Supervisor::spawn(adapter.clone(), SupervisorConfig::default()).unwrap();
+        let cards = [paid_card("p")];
+        let profile = empty_profile();
+        let dispatch = |cancel| {
+            dispatch_local(
+                &cards,
+                Some(&supervisor),
+                Some(&ledger),
+                &profile,
+                "hi",
+                vec![ChatMessage {
+                    role: "user".into(),
+                    content: "hi".into(),
+                }],
+                cancel,
+            )
+        };
+
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let outcome = dispatch(cancel).await.unwrap();
+        assert!(matches!(
+            outcome.result,
+            Err(DispatchFailure::Backend(BackendError::Cancelled))
+        ));
+        assert_eq!(adapter.calls.load(Ordering::SeqCst), 0);
+
+        let main = rusqlite::Connection::open(dir.path().join("b.sqlite3")).unwrap();
+        assert_eq!(
+            query_count(
+                &main,
+                "SELECT count(*) FROM reservations WHERE status='released'"
+            ),
+            1,
+            "the pre-call cancellation must release its durable reservation"
+        );
+        assert_eq!(
+            query_count(
+                &main,
+                "SELECT count(*) FROM reservations WHERE status='active' AND dispatch_hold=1"
+            ),
+            0,
+            "the pre-call cancellation must leave no active dispatch hold"
+        );
+        let journal = rusqlite::Connection::open(
+            dir.path()
+                .join("b.sqlite3")
+                .with_added_extension("settlements.sqlite3"),
+        )
+        .unwrap();
+        assert_eq!(
+            query_count(&journal, "SELECT count(*) FROM settlement_intents"),
+            0,
+            "the pre-call cancellation must remove its durable intent"
+        );
+        assert_eq!(
+            ledger.tenant_balance(budget::PERSONAL_TENANT_ID).unwrap(),
+            1_000_000
+        );
+
+        adapter.gate.notify_one();
+        let retry = dispatch(CancellationToken::new()).await.unwrap();
+        assert!(retry.result.is_ok());
+        assert_eq!(adapter.calls.load(Ordering::SeqCst), 1);
+        assert!(ledger.tenant_balance(budget::PERSONAL_TENANT_ID).unwrap() < 1_000_000);
     }
 
     #[tokio::test]
