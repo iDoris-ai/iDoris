@@ -22,7 +22,6 @@ use std::path::{Path, PathBuf};
 use idoris_contracts::{ComponentCard, Contract};
 use idoris_policy::{AdmissionStatus, Card, RegistrationError, validate_registration};
 
-use crate::budget;
 use crate::dispatch::is_resident_http_service;
 
 /// `serve.ts`'s `DEFAULT_COMPONENTS_DIR`.
@@ -97,15 +96,16 @@ impl std::error::Error for LoadError {}
 
 /// Whether `card`'s declared price is provably `0` — the only value the
 /// direct-forward path (no budget wiring) may admit for a
-/// `LoadMode::Resident` `http_service` card. Reuses
-/// [`budget::estimate_cost_minor`]'s own free/paid/unknown classification
-/// (invariant #3: "price unknown ≠ free") rather than re-deriving it here;
-/// the prompt argument doesn't affect the answer — zero rates price at `0`
-/// regardless of token count, and a malformed rate (negative already
-/// rejected by `ComponentCard::validate`, but also NaN/infinite, which
-/// isn't) is `None` regardless of token count either.
+/// `LoadMode::Resident` `http_service` card. Compares the rates directly
+/// rather than probing [`crate::budget::estimate_cost_minor`] with an empty prompt:
+/// that probe prices the input side at 0 tokens, so an input-only card
+/// (`input_per_m > 0, output_per_m == 0`) would come out as `Some(0)` and
+/// slip past this gate. NaN compares unequal to `0.0`, so a malformed rate
+/// is "not free" (invariant #3: "price unknown ≠ free"); negative rates are
+/// already rejected by `ComponentCard::validate`.
 fn resident_card_is_provably_free(card: &ComponentCard) -> bool {
-    budget::estimate_cost_minor(&card.provider.cost, "") == Some(0)
+    let cost = &card.provider.cost;
+    cost.input_per_m == 0.0 && cost.output_per_m == 0.0
 }
 
 fn is_mock_card(card: &ComponentCard) -> bool {
@@ -423,6 +423,48 @@ load_policy: {{ mode: resident, keepalive: {{ pinned: true }}, admission: coexis
         match err {
             LoadError::PaidResidentUnsupported { id } => assert_eq!(id, "proxy-unknown-cost"),
             other => panic!("expected PaidResidentUnsupported, got {other:?}"),
+        }
+    }
+
+    /// Regression (prdaemon #48 round 2, M2): an input-only price must not
+    /// read as "free" just because the gate's probe used an empty prompt.
+    #[test]
+    fn an_input_only_priced_resident_http_service_card_is_rejected() {
+        let dir = TempDir::new().unwrap();
+        write_card(
+            &dir,
+            "proxy.yaml",
+            &resident_card("proxy-input-only", "{ input_per_m: 5, output_per_m: 0 }"),
+        );
+        match load_components(dir.path(), false).unwrap_err() {
+            LoadError::PaidResidentUnsupported { id } => assert_eq!(id, "proxy-input-only"),
+            other => panic!("expected PaidResidentUnsupported, got {other:?}"),
+        }
+    }
+
+    /// Every pricing shape: only `0/0` may take the direct-forward path.
+    #[test]
+    fn only_a_zero_zero_price_is_provably_free() {
+        let cases = [
+            ("{ input_per_m: 0, output_per_m: 0 }", true),
+            ("{ input_per_m: 5, output_per_m: 0 }", false),
+            ("{ input_per_m: 0, output_per_m: 5 }", false),
+            ("{ input_per_m: 5, output_per_m: 5 }", false),
+            ("{ input_per_m: .nan, output_per_m: 0 }", false),
+            ("{ input_per_m: 0, output_per_m: .nan }", false),
+            ("{ input_per_m: .inf, output_per_m: 0 }", false),
+        ];
+        for (cost, admitted) in cases {
+            let dir = TempDir::new().unwrap();
+            write_card(&dir, "proxy.yaml", &resident_card("proxy-table", cost));
+            let result = load_components(dir.path(), false);
+            assert_eq!(result.is_ok(), admitted, "cost {cost}: {result:?}");
+            if !admitted {
+                assert!(matches!(
+                    result.unwrap_err(),
+                    LoadError::PaidResidentUnsupported { .. }
+                ));
+            }
         }
     }
 

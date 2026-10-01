@@ -262,9 +262,27 @@ impl ChatProxy {
                         .get(reqwest::header::CONTENT_TYPE)
                         .and_then(|v| v.to_str().ok())
                         .map(str::to_string);
-                    let body_bytes = resp.bytes().await.unwrap_or_default();
                     #[allow(clippy::cast_possible_truncation)]
                     let retries = attempt as u32;
+                    // A body that fails to read (connection dropped
+                    // mid-body, ...) is an upstream failure, not an empty
+                    // success: never surface — let alone cache and replay
+                    // for 60s — a 2xx with a truncated/empty body
+                    // (prdaemon #48 round 2, Low). Not retried: the
+                    // upstream already accepted and processed this call.
+                    let Ok(body_bytes) = resp.bytes().await else {
+                        return ForwardOutcome {
+                            status: 502,
+                            body: Bytes::from_static(
+                                br#"{"error":{"type":"upstream_unavailable"}}"#,
+                            ),
+                            content_type: Some("application/json".to_string()),
+                            cached: false,
+                            origin_record_id: None,
+                            replayed_served_locality: None,
+                            retries,
+                        };
+                    };
                     // Only a genuinely successful (2xx) call is cached —
                     // matches TS's own `res.ok` gate on the `remember()`
                     // call site exactly (a 4xx is never retried above
@@ -495,6 +513,42 @@ mod tests {
         assert_eq!(out.retries, 0);
         let body: Value = serde_json::from_slice(&out.body).unwrap();
         assert_eq!(body["marker"], "raw-passthrough");
+    }
+
+    /// prdaemon #48 round 2 (Low): a 2xx whose body fails mid-read must
+    /// become a 502 and must not be cached for replay. Raw TCP because
+    /// `wiremock` can't send "headers ok, body truncated".
+    #[tokio::test]
+    async fn a_2xx_whose_body_fails_to_read_is_a_502_and_is_not_cached() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().take(2) {
+                let mut stream = stream.unwrap();
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                // Promise 100 bytes, send 2, hang up.
+                let _ = stream.write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 100\r\n\r\n{}",
+                );
+            }
+        });
+        let proxy = ChatProxy::new(reqwest::Client::new());
+        let endpoint = format!("http://{addr}");
+        let out = proxy
+            .forward_buffered(&endpoint, &chat_body(), &opts(Some("req-1"), "rec-1"))
+            .await;
+        assert_eq!(out.status, 502);
+        assert_eq!(
+            proxy.cache_size_for_test(),
+            0,
+            "a failed read must not be cached"
+        );
+        let again = proxy
+            .forward_buffered(&endpoint, &chat_body(), &opts(Some("req-1"), "rec-2"))
+            .await;
+        assert!(!again.cached, "nothing may be replayed from a failed read");
     }
 
     /// Counts requests received so the test can assert an exact retry

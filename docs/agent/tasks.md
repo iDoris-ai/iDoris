@@ -457,3 +457,6 @@
 | FU-24 | R2-C 复验遗留（Low）| **migration 0004 没有回填 `tenant_period`**：迁移之前就处于 active 的预留，settle/release/extend 时会报 Storage 错误。目前还没有线上老库；要兼容老库时补一句 `UPDATE reservations SET tenant_period = period WHERE tenant_period IS NULL` | OPEN |
 | FU-25 | R2-A 复验遗留（Low）| **chat 与 load/unload 共用 `adapter_call_timeout`（默认 30s）**：长生成会被截断。应给 chat 单独设超时，流式场景按 token 空闲超时处理 | OPEN |
 | FU-26 | Codex 额度耗尽（2026-09-27 至 10-04）| **Rust 内核整栈要补一轮 Tier 1（Codex）复审**：R2-A/B/C/D/E/G 后段只经过 Tier 2（Opus 本地 + prdaemon）。10/04 额度恢复后，重点复审 supervisor.rs、policy/registry.rs、tenancy/ledger.rs、router/proxy.rs | OPEN |
+| FU-27 | #48 第二轮评审遗留（Low）| **reload 时 `AdapterTimedOut` 一律还原旧 Ready 状态**（`supervisor.rs` `resolve_load_failure`）：超时其实是"不确定新 policy 是否已生效"。目前 `PLACEHOLDER_MEMORY_GB=1.0` 影响有限；修法是还原前读一次 status 确认，或在文档里写明 | OPEN |
+| FU-28 | #48 第二轮评审遗留（Low，配置驱动加固）| `models.rs` 按配置端点转发的 SSRF 面、`omlx/http.rs` 把 bearer token 发给任意 `base_url`、`remote/client.rs` 的 `base_url` 缺 scheme 校验。都需要 operator 自己配出恶意值才能触发；`RemoteClient` 接进 router 前补上 | OPEN |
+| FU-29 | #48 第二轮评审建议 | **预算把关分裂成两处**（`dispatch_local::reserve()` 与 `components.rs` 启动期"确定免费"闸门），`decide()` 自己的预算阶段在生产路径上实际是死代码。付费/远程上游接入前，合并成统一的 reserve/settle 包装（与 FU-22 一起做）| OPEN |
