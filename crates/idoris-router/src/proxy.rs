@@ -31,7 +31,7 @@
 //! value, so there is no `tenant="a:b"+id="c"` vs `tenant="a"+id="b:c"`
 //! collision ambiguity.
 
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::body::Bytes;
@@ -113,6 +113,37 @@ pub struct ForwardOutcome {
 struct Flight {
     fingerprint: Value,
     outcome: tokio::sync::Mutex<Option<ForwardOutcome>>,
+    /// Set when the leader future is dropped before forwarding completes.
+    /// The registry keeps this uncertainty record through the idempotency window.
+    cancelled_at: Mutex<Option<Instant>>,
+}
+
+struct FlightCancellationGuard {
+    flight: Arc<Flight>,
+    armed: bool,
+}
+
+impl FlightCancellationGuard {
+    fn new(flight: Arc<Flight>) -> Self {
+        Self {
+            flight,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for FlightCancellationGuard {
+    fn drop(&mut self) {
+        if self.armed
+            && let Ok(mut cancelled_at) = self.flight.cancelled_at.lock()
+        {
+            *cancelled_at = Some(Instant::now());
+        }
+    }
 }
 
 pub struct ChatProxy {
@@ -121,7 +152,7 @@ pub struct ChatProxy {
     max_entries: usize,
     pub(crate) retry_delays: Vec<Duration>,
     pub(crate) cache: Mutex<IndexMap<String, CacheEntry>>,
-    flights: Mutex<IndexMap<String, Weak<Flight>>>,
+    flights: Mutex<IndexMap<String, Arc<Flight>>>,
 }
 
 impl ChatProxy {
@@ -245,16 +276,36 @@ impl ChatProxy {
             let Ok(mut flights) = self.flights.lock() else {
                 return Self::failure(502, "upstream_unavailable");
             };
-            // Keep only active calls; completed successes live in the bounded cache.
-            flights.retain(|_, flight| flight.strong_count() > 0);
-            if let Some(flight) = flights.get(&key).and_then(Weak::upgrade) {
-                flight
+            // Completed calls without other callers can be dropped. An
+            // uncertain cancellation stays through the idempotency window.
+            let now = Instant::now();
+            flights.retain(|_, flight| {
+                if Arc::strong_count(flight) > 1 {
+                    return true;
+                }
+                match flight.cancelled_at.lock() {
+                    Ok(cancelled_at) => {
+                        cancelled_at.is_some_and(|at| now.duration_since(at) < self.window)
+                    }
+                    // A poisoned cancellation marker is uncertainty too; keep
+                    // it permanently rather than allowing a duplicate POST.
+                    Err(_) => true,
+                }
+            });
+            if let Some(flight) = flights.get(&key) {
+                Arc::clone(flight)
             } else {
+                // Bound all retained slots: active flights may become
+                // uncertain if their leaders are cancelled.
+                if flights.len() >= self.max_entries {
+                    return Self::failure(503, "upstream_unavailable");
+                }
                 let flight = Arc::new(Flight {
                     fingerprint: fingerprint.clone(),
                     outcome: tokio::sync::Mutex::new(None),
+                    cancelled_at: Mutex::new(None),
                 });
-                flights.insert(key, Arc::downgrade(&flight));
+                flights.insert(key, Arc::clone(&flight));
                 flight
             }
         };
@@ -267,9 +318,11 @@ impl ChatProxy {
         }
         // If the leader is cancelled, waiting calls fail closed instead of resending.
         *result = Some(Self::failure(502, "upstream_unavailable"));
+        let mut cancellation_guard = FlightCancellationGuard::new(Arc::clone(&flight));
         let outcome = self
             .forward_once(endpoint, &payload, opts, &fingerprint)
             .await;
+        cancellation_guard.disarm();
         let mut replay = outcome.clone();
         if (200..300).contains(&replay.status) && !replay.cached {
             replay.cached = true;
@@ -486,6 +539,10 @@ pub enum StreamOutcome {
         response: reqwest::Response,
     },
 }
+
+#[cfg(test)]
+#[path = "proxy_cancellation_tests.rs"]
+mod cancellation_tests;
 
 #[cfg(test)]
 mod tests {
