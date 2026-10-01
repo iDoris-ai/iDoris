@@ -235,3 +235,86 @@ fn volatile_emergency_outcome_retries_after_primary_busy_without_cost_overwrite(
         let _ = std::fs::remove_file(file);
     }
 }
+
+#[test]
+fn sidecar_busy_foreign_tenant_cannot_poison_real_settlement() {
+    let db = path();
+    let sidecar_path = db.with_added_extension("settlements.sqlite3");
+    let scope = BudgetScope::new("tenant", "key", "provider", "model");
+    let clock = Arc::new(TestClock(AtomicI64::new(0)));
+    let ledger =
+        BudgetLedger::open_with_busy_timeout(&db, clock.clone(), 100, Duration::ZERO).unwrap();
+    ledger
+        .configure_tenant("tenant", 100, "UTC", SpendGate::PaidOnly)
+        .unwrap();
+    ledger.configure(&scope, 100, "UTC").unwrap();
+    let id = ledger.reserve(&scope, Price::Known(40)).unwrap();
+    ledger.begin_settlement("tenant", &id).unwrap();
+
+    let mut sidecar = Connection::open(&sidecar_path).unwrap();
+    let writer = sidecar
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .unwrap();
+
+    assert!(matches!(
+        ledger.settle_durable("other", &id, 7),
+        Err(BudgetError::TenantMismatch { .. })
+    ));
+    assert!(matches!(
+        ledger.settle_durable("tenant", &id, 31),
+        Err(BudgetError::Busy)
+    ));
+
+    // The persisted intent must continue to block admission after the TTL,
+    // while the real outcome is waiting for the sidecar writer.
+    clock.0.store(101, Ordering::SeqCst);
+    assert!(ledger.reserve(&scope, Price::Known(1)).is_err());
+
+    writer.rollback().unwrap();
+    ledger.retry_settlements().unwrap();
+    assert_eq!(ledger.tenant_balance("tenant").unwrap(), 69);
+    assert_eq!(ledger.balance(&scope).unwrap(), 69);
+    ledger.retry_settlements().unwrap();
+    assert_eq!(ledger.tenant_balance("tenant").unwrap(), 69);
+    assert!(ledger.reserve(&scope, Price::Known(1)).is_ok());
+
+    let primary = Connection::open(&db).unwrap();
+    let row: (String, i64) = primary
+        .query_row(
+            "SELECT status, actual_cost_minor FROM reservations WHERE id=?1",
+            [&id.0],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get::<_, Option<i64>>(1)?.unwrap_or_default(),
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(row, ("settled".into(), 31));
+    let emergency_count: i64 = primary
+        .query_row(
+            "SELECT COUNT(*) FROM budget_emergency_settlements",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(emergency_count, 0);
+    let intent_count: i64 = sidecar
+        .query_row("SELECT COUNT(*) FROM settlement_intents", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(intent_count, 0);
+
+    drop(primary);
+    drop(sidecar);
+    drop(ledger);
+    for file in [&db, &sidecar_path] {
+        for suffix in ["", "-wal", "-shm"] {
+            let mut path = file.clone().into_os_string();
+            path.push(suffix);
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}

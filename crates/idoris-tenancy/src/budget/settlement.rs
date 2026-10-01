@@ -70,6 +70,33 @@ impl BudgetLedger {
         id: &ReservationId,
         actual: i64,
     ) -> Result<Option<i64>, BudgetError> {
+        // Validate ownership before the sidecar transaction can return Busy.
+        // In that path the caller's cost is kept in memory for recovery, so
+        // only a tenant already verified against the primary ledger may reach
+        // that fallback. Drop the primary connection guard before acquiring
+        // the sidecar lock below to preserve the sidecar -> primary lock order.
+        let state = {
+            let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+            conn.query_row(
+                "SELECT tenant_id FROM reservations WHERE id=?1",
+                [&id.0],
+                |row| row.get::<_, String>(0),
+            )
+        };
+        match state {
+            Ok(owner) if owner == tenant => {}
+            Ok(_) => {
+                return Err(BudgetError::TenantMismatch {
+                    reservation_id: id.0.clone(),
+                });
+            }
+            Err(rusqlite::Error::QueryReturnedNoRows) => {
+                return Err(BudgetError::ReservationNotFound {
+                    reservation_id: id.0.clone(),
+                });
+            }
+            Err(err) => return Err(err.into()),
+        }
         if let Some((owner, queued)) = self
             .emergency_settlements
             .lock()
