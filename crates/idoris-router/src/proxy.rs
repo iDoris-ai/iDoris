@@ -166,13 +166,13 @@ struct Flight {
     fingerprint: [u8; 32],
     outcome: tokio::sync::Mutex<Option<ForwardOutcome>>,
     /// Set for completed successful calls, or when execution may have happened
-    /// without a complete response, a complete 5xx response was received, or
+    /// without a complete response, a complete 3xx/5xx response was received, or
     /// the leader future was dropped before forwarding completes. The registry
     /// keeps these completed/uncertain records through the idempotency window.
     cancelled_at: Mutex<Option<Instant>>,
     retained_bytes: AtomicUsize,
     flight_bytes: Arc<AtomicUsize>,
-    key_bytes: usize,
+    base_bytes: usize,
 }
 
 impl Drop for Flight {
@@ -227,9 +227,8 @@ pub struct ChatProxy {
     body_timeout: Duration,
     max_body_bytes: usize,
     max_cache_bytes: usize,
-    /// Independent cap for full flight outcomes retained during the window.
-    /// Small uncertainty outcomes remain bounded by `max_entries`; full
-    /// response bodies/headers are charged to this 32 MiB pool.
+    /// Independent cap for flight keys, registry records, and outcomes kept
+    /// through the idempotency window.
     max_flight_bytes: usize,
     flight_bytes: Arc<AtomicUsize>,
     permits: std::sync::Arc<tokio::sync::Semaphore>,
@@ -252,7 +251,7 @@ impl ChatProxy {
             body_timeout: Duration::from_secs(60),
             max_body_bytes: 8 * 1024 * 1024,
             max_cache_bytes: 32 * 1024 * 1024,
-            // Full flight outcomes and cache entries each have a 32 MiB pool.
+            // Flight records/outcomes and cache entries each have a 32 MiB pool.
             max_flight_bytes: 32 * 1024 * 1024,
             flight_bytes: Arc::new(AtomicUsize::new(0)),
             permits: std::sync::Arc::new(tokio::sync::Semaphore::new(32)),
@@ -345,14 +344,27 @@ impl ChatProxy {
             .saturating_add(std::mem::size_of::<CacheEntry>())
     }
 
-    fn outcome_bytes(outcome: &ForwardOutcome, flight: &Flight) -> usize {
+    fn outcome_bytes(outcome: &ForwardOutcome) -> usize {
+        // The inline outcome is already part of Flight; charge its allocations.
         outcome
             .body
             .len()
-            .saturating_add(outcome.content_type.as_ref().map_or(0, String::len))
-            .saturating_add(outcome.origin_record_id.as_ref().map_or(0, String::len))
+            .saturating_add(outcome.content_type.as_ref().map_or(0, String::capacity))
+            .saturating_add(
+                outcome
+                    .origin_record_id
+                    .as_ref()
+                    .map_or(0, String::capacity),
+            )
+    }
+
+    fn flight_base_bytes(key_capacity: usize) -> usize {
+        // Include the registry slot and Arc's strong/weak counters as well as
+        // the caller-controlled key allocation and the inline flight state.
+        key_capacity
             .saturating_add(std::mem::size_of::<Flight>())
-            .saturating_add(flight.key_bytes)
+            .saturating_add(std::mem::size_of::<(String, Arc<Flight>)>())
+            .saturating_add(2 * std::mem::size_of::<usize>())
     }
 
     fn reserve_flight_bytes(&self, bytes: usize) -> bool {
@@ -518,13 +530,19 @@ impl ChatProxy {
                     }
                     return Self::flight_failure(503, "upstream_unavailable");
                 }
+                let fallback = Self::flight_failure(502, "upstream_unavailable");
+                let base_bytes = Self::flight_base_bytes(key.capacity());
+                let initial_bytes = base_bytes.saturating_add(Self::outcome_bytes(&fallback));
+                if !self.reserve_flight_bytes(initial_bytes) {
+                    return Self::flight_failure(503, "upstream_unavailable");
+                }
                 let flight = Arc::new(Flight {
                     fingerprint,
                     outcome: tokio::sync::Mutex::new(None),
                     cancelled_at: Mutex::new(None),
-                    retained_bytes: AtomicUsize::new(0),
+                    retained_bytes: AtomicUsize::new(initial_bytes),
                     flight_bytes: Arc::clone(&self.flight_bytes),
-                    key_bytes: key.len(),
+                    base_bytes,
                 });
                 flights.insert(key, Arc::clone(&flight));
                 flight
@@ -550,8 +568,17 @@ impl ChatProxy {
             replay.origin_record_id = Some(opts.record_id.to_string());
             replay.replayed_served_locality = Some(opts.served_locality);
         }
-        let retained_bytes = Self::outcome_bytes(&replay, &flight);
-        if self.reserve_flight_bytes(retained_bytes) {
+        let retained_bytes = flight
+            .base_bytes
+            .saturating_add(Self::outcome_bytes(&replay));
+        let previous_total = flight.retained_bytes.load(Ordering::Acquire);
+        if retained_bytes <= previous_total {
+            let release = previous_total - retained_bytes;
+            self.flight_bytes.fetch_sub(release, Ordering::AcqRel);
+            flight
+                .retained_bytes
+                .store(retained_bytes, Ordering::Release);
+        } else if self.reserve_flight_bytes(retained_bytes - previous_total) {
             flight
                 .retained_bytes
                 .store(retained_bytes, Ordering::Release);
@@ -684,9 +711,9 @@ impl ChatProxy {
                             },
                         );
                     }
-                    // A 5xx may follow execution; retain this flight through
-                    // the idempotency window.
-                    if (500..600).contains(&status) {
+                    // Redirects and 5xx responses do not prove the POST was
+                    // not executed; retain their fingerprint through the window.
+                    if (300..400).contains(&status) || (500..600).contains(&status) {
                         *uncertain = true;
                     }
                     return ForwardOutcome {

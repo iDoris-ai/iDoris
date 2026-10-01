@@ -34,6 +34,11 @@ async fn gated(
     }
 }
 
+async fn see_other(State(calls): State<Arc<AtomicUsize>>, Json(_): Json<Value>) -> StatusCode {
+    calls.fetch_add(1, Ordering::SeqCst);
+    StatusCode::SEE_OTHER
+}
+
 async fn upstream(status: u16) -> (String, Arc<Gate>, tokio::task::JoinHandle<()>) {
     let gate = Arc::new(Gate {
         calls: AtomicUsize::new(0),
@@ -170,6 +175,49 @@ async fn complete_503_replay_takes_and_releases_a_fresh_permit() {
     drop(replay);
     assert_eq!(p.permits.available_permits(), 1);
     assert_eq!(gate.calls.load(Ordering::SeqCst), 1);
+    server.abort();
+}
+
+#[tokio::test]
+async fn see_other_replay_does_not_repeat_post_and_rejects_changed_payload() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let app = Router::new()
+        .route("/v1/chat/completions", post(see_other))
+        .with_state(calls.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    let p = ChatProxy::new(client);
+    let body = serde_json::json!({"messages": [{"content": "first"}]});
+
+    assert_eq!(
+        p.forward_buffered(&url, &body, &opts("redirect"))
+            .await
+            .status,
+        303
+    );
+    assert_eq!(
+        p.forward_buffered(&url, &body, &opts("redirect"))
+            .await
+            .status,
+        303
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    let changed = serde_json::json!({"messages": [{"content": "changed"}]});
+    assert_eq!(
+        p.forward_buffered(&url, &changed, &opts("redirect"))
+            .await
+            .status,
+        409
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
     server.abort();
 }
 

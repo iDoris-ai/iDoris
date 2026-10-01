@@ -248,20 +248,7 @@ async fn flight_retention_is_byte_bounded_and_expires_without_reposting_ids() {
     }
     assert_eq!(upstream.calls.load(Ordering::SeqCst), 8);
     assert!(proxy.flight_bytes.load(Ordering::Relaxed) <= proxy.max_flight_bytes);
-    let actual_outcomes_bytes: usize = {
-        let flights = proxy.flights.lock().unwrap();
-        flights
-            .values()
-            .map(|flight| {
-                let outcome = flight.outcome.try_lock().unwrap();
-                let outcome = outcome.as_ref().unwrap();
-                outcome.body.len()
-                    + outcome.content_type.as_ref().map_or(0, String::len)
-                    + outcome.origin_record_id.as_ref().map_or(0, String::len)
-            })
-            .sum()
-    };
-    assert!(actual_outcomes_bytes <= proxy.max_flight_bytes);
+    assert_flight_budget(&proxy);
 
     for i in 0..8 {
         let id = format!("large-{i}");
@@ -409,10 +396,10 @@ async fn large_payload_fingerprints_are_fixed_size_normalized_and_context_bound(
 
 #[tokio::test]
 async fn unretained_success_stays_fail_closed_after_cache_eviction() {
-    let (endpoint, upstream, server) = upstream(200, "ok".to_string()).await;
+    let (endpoint, upstream, server) = upstream(200, "x".repeat(64 * 1024)).await;
     let mut proxy = proxy();
-    proxy.max_cache_bytes = 1024;
-    proxy.max_flight_bytes = 1;
+    proxy.max_cache_bytes = 128 * 1024;
+    proxy.max_flight_bytes = 2048;
     let body = serde_json::json!({"message":"executed"});
 
     let first = proxy
@@ -433,5 +420,152 @@ async fn unretained_success_stays_fail_closed_after_cache_eviction() {
     assert!(replay.body.len() < 128);
     drop(replay);
     assert_eq!(upstream.calls.load(Ordering::SeqCst), 1);
+    server.abort();
+}
+
+fn assert_flight_budget(proxy: &ChatProxy) -> usize {
+    // Measure the actual retained keys and results, independently of the
+    // production accounting helpers (including cancellation/fallback records).
+    let flights = proxy.flights.lock().unwrap();
+    let mut accounted = 0;
+    for (key, flight) in flights.iter() {
+        let outcome = flight.outcome.try_lock().unwrap();
+        let outcome = outcome.as_ref().unwrap();
+        let actual = key.capacity()
+            + std::mem::size_of::<Flight>()
+            + std::mem::size_of::<(String, Arc<Flight>)>()
+            + 2 * std::mem::size_of::<usize>()
+            + outcome.body.len()
+            + outcome.content_type.as_ref().map_or(0, String::capacity)
+            + outcome
+                .origin_record_id
+                .as_ref()
+                .map_or(0, String::capacity);
+        let charged = flight.retained_bytes.load(Ordering::Relaxed);
+        assert!(charged >= actual);
+        accounted += charged;
+    }
+    assert_eq!(proxy.flight_bytes.load(Ordering::Relaxed), accounted);
+    assert!(accounted <= proxy.max_flight_bytes);
+    accounted
+}
+
+fn flight_key(endpoint: &str, id: &str) -> String {
+    cache_key(
+        "tenant-a",
+        &format!("{}/v1/chat/completions", endpoint.trim_end_matches('/')),
+        "provider",
+        id,
+    )
+}
+
+#[tokio::test]
+async fn long_id_budget_covers_cancelled_marker_and_rejects_new_id() {
+    use tokio::sync::{Notify, Semaphore};
+
+    async fn hold(
+        State(state): State<Arc<(Notify, Semaphore, AtomicUsize)>>,
+        _: Bytes,
+    ) -> &'static str {
+        state.2.fetch_add(1, Ordering::SeqCst);
+        state.0.notify_one();
+        state.1.acquire().await.unwrap().forget();
+        "ok"
+    }
+
+    let state = Arc::new((Notify::new(), Semaphore::new(0), AtomicUsize::new(0)));
+    let app = Router::new()
+        .route("/v1/chat/completions", post(hold))
+        .with_state(state.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let id = "i".repeat(64 * 1024);
+    let key = flight_key(&endpoint, &id);
+    let mut proxy = proxy();
+    proxy.window = Duration::from_secs(60);
+    proxy.max_flight_bytes = key.capacity() + 1024;
+    let proxy = Arc::new(proxy);
+    let leader_proxy = proxy.clone();
+    let leader_endpoint = endpoint.clone();
+    let leader_id = id.clone();
+    let leader = tokio::spawn(async move {
+        leader_proxy
+            .forward_buffered(
+                &leader_endpoint,
+                &serde_json::json!({"m":"same"}),
+                &opts(&leader_id),
+            )
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(2), state.0.notified())
+        .await
+        .expect("upstream did not receive the POST");
+    // The reservation must already exist while the POST is still active.
+    assert!(proxy.flight_bytes.load(Ordering::Relaxed) >= key.capacity());
+    leader.abort();
+    assert!(matches!(leader.await, Err(error) if error.is_cancelled()));
+
+    let charged = assert_flight_budget(&proxy);
+    for i in 0..8 {
+        let rejected = proxy
+            .forward_buffered(
+                &endpoint,
+                &serde_json::json!({"m":"other"}),
+                &opts(&format!("{i}{}", "n".repeat(64 * 1024))),
+            )
+            .await;
+        assert_eq!(rejected.status, 503);
+        assert_eq!(proxy.flights.lock().unwrap().len(), 1);
+        assert_eq!(assert_flight_budget(&proxy), charged);
+    }
+    let replay = proxy
+        .forward_buffered(&endpoint, &serde_json::json!({"m":"same"}), &opts(&id))
+        .await;
+    assert_eq!(replay.status, 502);
+    drop(replay);
+    let conflict = proxy
+        .forward_buffered(&endpoint, &serde_json::json!({"m":"changed"}), &opts(&id))
+        .await;
+    assert_eq!(conflict.status, 409);
+    drop(conflict);
+    assert_eq!(state.2.load(Ordering::SeqCst), 1);
+    server.abort();
+}
+
+#[tokio::test]
+async fn oversized_failure_keeps_bounded_marker_and_expiry_releases_budget() {
+    let (endpoint, upstream, server) = upstream(503, "x".repeat(64 * 1024)).await;
+    let id = "a".repeat(64 * 1024);
+    let key = flight_key(&endpoint, &id);
+    let mut proxy = proxy();
+    proxy.window = Duration::from_secs(60);
+    proxy.max_flight_bytes = key.capacity() + 1024;
+    let first = proxy
+        .forward_buffered(&endpoint, &serde_json::json!({"m":"first"}), &opts(&id))
+        .await;
+    assert_eq!(first.status, 503);
+    assert_eq!(first.body.len(), 64 * 1024);
+    drop(first);
+    let charged = assert_flight_budget(&proxy);
+    let replay = proxy
+        .forward_buffered(&endpoint, &serde_json::json!({"m":"first"}), &opts(&id))
+        .await;
+    assert_eq!(replay.status, 502);
+    assert!(replay.body.len() < 128);
+    assert_eq!(upstream.calls.load(Ordering::SeqCst), 1);
+    drop(replay);
+    {
+        let flights = proxy.flights.lock().unwrap();
+        let flight = flights.get(&key).unwrap();
+        *flight.cancelled_at.lock().unwrap() = Some(Instant::now() - Duration::from_secs(61));
+    }
+    let replacement = proxy
+        .forward_buffered(&endpoint, &serde_json::json!({"m":"second"}), &opts(&id))
+        .await;
+    assert_eq!(replacement.status, 503);
+    drop(replacement);
+    assert_eq!(upstream.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(assert_flight_budget(&proxy), charged);
     server.abort();
 }
