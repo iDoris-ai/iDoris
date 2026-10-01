@@ -30,6 +30,8 @@ use tower::ServiceExt;
 
 const TENANT: &str = "personal";
 const PROVIDER: &str = "paid-card";
+const PROVIDER_A: &str = "paid-a";
+const PROVIDER_B: &str = "paid-b";
 const COST: Cost = Cost {
     input_per_m: 1_000_000.0,
     output_per_m: 2_000_000.0,
@@ -112,6 +114,62 @@ fn card() -> ComponentCard {
     }
 }
 
+fn card_for(provider_id: &str, capability: Capability) -> ComponentCard {
+    let mut component = card();
+    component.provider.id = provider_id.into();
+    component.provider.capabilities = vec![capability];
+    component.endpoint = format!("mock://{provider_id}");
+    component
+}
+
+struct LoadGatedAdapter {
+    mock: MockAdapter,
+    b_load_entered: Arc<Notify>,
+    continue_b_load: Arc<Notify>,
+    a_chat_entered: Arc<Notify>,
+    continue_a_chat: Arc<Notify>,
+    chat_calls: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl RuntimeAdapter for LoadGatedAdapter {
+    async fn list(&self) -> Result<Vec<ModelInfo>, BackendError> {
+        self.mock.list().await
+    }
+    async fn load(
+        &self,
+        id: &str,
+        policy: Option<&idoris_contracts::LoadPolicy>,
+    ) -> Result<(), BackendError> {
+        if id == PROVIDER_B {
+            self.b_load_entered.notify_one();
+            self.continue_b_load.notified().await;
+        }
+        self.mock.load(id, policy).await
+    }
+    async fn unload(&self, id: &str) -> Result<(), BackendError> {
+        self.mock.unload(id).await
+    }
+    async fn status(&self) -> Result<BackendStatus, BackendError> {
+        self.mock.status().await
+    }
+    async fn probe_ready(&self, id: &str) -> Result<bool, BackendError> {
+        self.mock.probe_ready(id).await
+    }
+    async fn chat(
+        &self,
+        req: ChatRequest,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<ChatResponse, BackendError> {
+        self.chat_calls.fetch_add(1, Ordering::SeqCst);
+        if req.model == PROVIDER_A {
+            self.a_chat_entered.notify_one();
+            self.continue_a_chat.notified().await;
+        }
+        self.mock.chat(req, cancel).await
+    }
+}
+
 fn scope() -> BudgetScope {
     BudgetScope::new(TENANT, "default", PROVIDER, PROVIDER)
 }
@@ -124,6 +182,169 @@ fn build_ledger(path: &std::path::Path, clock: Arc<TestClock>) -> BudgetLedger {
         .unwrap();
     ledger.configure(&scope(), 1_000_000, "UTC").unwrap();
     ledger
+}
+
+#[tokio::test]
+async fn completed_busy_settlement_clears_live_exemption_before_waiting_dispatch() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let db_path = dir.path().join("budget.sqlite3");
+    let clock = Arc::new(TestClock::default());
+    let ledger = Arc::new(build_ledger(&db_path, clock));
+    for provider in [PROVIDER_A, PROVIDER_B] {
+        ledger
+            .configure(
+                &BudgetScope::new(TENANT, "default", provider, provider),
+                1_000_000,
+                "UTC",
+            )
+            .unwrap();
+    }
+
+    let b_load_entered = Arc::new(Notify::new());
+    let continue_b_load = Arc::new(Notify::new());
+    let a_chat_entered = Arc::new(Notify::new());
+    let continue_a_chat = Arc::new(Notify::new());
+    let chat_calls = Arc::new(AtomicUsize::new(0));
+    let adapter = Arc::new(LoadGatedAdapter {
+        mock: MockAdapter::new(
+            [PROVIDER_A, PROVIDER_B]
+                .into_iter()
+                .map(|id| ModelInfo {
+                    id: id.into(),
+                    memory_gb: 1.0,
+                })
+                .collect(),
+        ),
+        b_load_entered: b_load_entered.clone(),
+        continue_b_load: continue_b_load.clone(),
+        a_chat_entered: a_chat_entered.clone(),
+        continue_a_chat: continue_a_chat.clone(),
+        chat_calls: chat_calls.clone(),
+    });
+    let supervisor = Supervisor::spawn(adapter, SupervisorConfig::default()).unwrap();
+    let app = build_app(AppState {
+        cards: vec![
+            card_for(PROVIDER_A, Capability::Chat),
+            card_for(PROVIDER_B, Capability::Coding),
+        ],
+        supervisor: Some(supervisor),
+        budget_ledger: Some(ledger.clone()),
+        ..AppState::default()
+    });
+
+    let a_request = Request::post("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(BODY))
+        .unwrap();
+    let a_task = tokio::spawn(app.clone().oneshot(a_request));
+    tokio::time::timeout(Duration::from_secs(2), a_chat_entered.notified())
+        .await
+        .expect("A should enter upstream chat");
+
+    let b_request = Request::post("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .header("x-idoris-capabilities", "coding")
+        .body(Body::from(BODY))
+        .unwrap();
+    let b_task = tokio::spawn(app.clone().oneshot(b_request));
+    tokio::time::timeout(Duration::from_secs(2), b_load_entered.notified())
+        .await
+        .expect("B should reserve and block in its provider load");
+    let (b_reservation, b_status): (String, String) = Connection::open(&db_path)
+        .unwrap()
+        .query_row(
+            "SELECT id, status FROM reservations WHERE model_id=?1",
+            [PROVIDER_B],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(b_status, "active");
+
+    let mut sidecar =
+        Connection::open(db_path.with_added_extension("settlements.sqlite3")).unwrap();
+    sidecar.busy_timeout(Duration::from_millis(80)).unwrap();
+    let tx = sidecar
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .unwrap();
+    continue_a_chat.notify_one();
+    let a_response = tokio::time::timeout(Duration::from_secs(2), a_task)
+        .await
+        .expect("A should return after completed upstream chat")
+        .unwrap()
+        .unwrap();
+    assert_eq!(a_response.status(), StatusCode::OK);
+    assert!(!a_response.headers().contains_key("X-iDoris-Cost-Minor"));
+    let a_bytes = a_response.into_body().collect().await.unwrap().to_bytes();
+    let a_json: serde_json::Value = serde_json::from_slice(&a_bytes).unwrap();
+    let completion = a_json["choices"][0]["message"]["content"].as_str().unwrap();
+    let actual =
+        idoris_router::budget::estimate_actual_cost_minor(&COST, PROMPT, completion, 1_000_000);
+    assert!(actual > 0);
+
+    let (a_reservation, a_actual): (String, Option<i64>) = Connection::open(&db_path)
+        .unwrap()
+        .query_row(
+            "SELECT id, actual_cost_minor FROM reservations WHERE model_id=?1",
+            [PROVIDER_A],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        a_actual, None,
+        "Busy settlement must not persist the actual charge"
+    );
+    let intent_count: i64 = tx
+        .query_row(
+            "SELECT COUNT(*) FROM settlement_intents WHERE reservation_id=?1",
+            [&a_reservation],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        intent_count, 1,
+        "A's durable intent must remain for recovery"
+    );
+    drop(tx);
+    drop(sidecar);
+
+    // B's reservation predates A's failed settlement. Let B finish loading only
+    // after the sidecar lock is gone, so its dispatch check sees the durable fence.
+    continue_b_load.notify_one();
+    let b_response = tokio::time::timeout(Duration::from_secs(2), b_task)
+        .await
+        .expect("B should be rejected after its load completes")
+        .unwrap()
+        .unwrap();
+    assert_eq!(b_response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let b_bytes = b_response.into_body().collect().await.unwrap().to_bytes();
+    let b_json: serde_json::Value = serde_json::from_slice(&b_bytes).unwrap();
+    assert_eq!(b_json["error"]["type"], "internal_error");
+    assert!(
+        b_json["error"]["remediation"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("unconfirmed dispatch outcome")
+    );
+    assert_eq!(
+        chat_calls.load(Ordering::SeqCst),
+        1,
+        "only A may reach adapter chat"
+    );
+    let b_status: String = Connection::open(&db_path)
+        .unwrap()
+        .query_row(
+            "SELECT status FROM reservations WHERE id=?1",
+            [&b_reservation],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(b_status, "released");
+
+    let a_scope = BudgetScope::new(TENANT, "default", PROVIDER_A, PROVIDER_A);
+    ledger.retry_settlements().unwrap();
+    assert_eq!(ledger.balance(&a_scope).unwrap(), 1_000_000 - actual);
+    ledger.retry_settlements().unwrap();
+    assert_eq!(ledger.balance(&a_scope).unwrap(), 1_000_000 - actual);
 }
 
 #[tokio::test]

@@ -147,6 +147,11 @@ impl BudgetLedger {
                 return Err(err.into());
             }
         }
+        // The caller's upstream request has completed. Once ownership is
+        // verified, stop treating it as live before any sidecar operation can
+        // fail (for example, BEGIN IMMEDIATE returning Busy). The durable
+        // intent remains as the fail-closed admission fence until recovery.
+        self.finish_settlement_intent(id);
         let result = self.settle_durable_with_hook(tenant, id, actual, || {});
         if matches!(result, Err(BudgetError::Busy | BudgetError::Storage(_))) && actual >= 0 {
             let mut memory = self

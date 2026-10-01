@@ -334,6 +334,7 @@ fn sidecar_busy_foreign_tenant_cannot_poison_real_settlement() {
         .unwrap();
     ledger.configure(&scope, 100, "UTC").unwrap();
     let id = ledger.reserve(&scope, Price::Known(40)).unwrap();
+    let control_id = ledger.reserve(&scope, Price::Known(10)).unwrap();
     ledger.begin_settlement("tenant", &id).unwrap();
 
     let mut sidecar = Connection::open(&sidecar_path).unwrap();
@@ -345,6 +346,18 @@ fn sidecar_busy_foreign_tenant_cannot_poison_real_settlement() {
         ledger.settle_durable("other", &id, 7),
         Err(BudgetError::TenantMismatch { .. })
     ));
+    writer.rollback().unwrap();
+
+    // A foreign tenant's rejected settlement must not erase A's live marker.
+    // C can begin only while that real in-flight exemption is still present.
+    ledger.begin_settlement("tenant", &control_id).unwrap();
+    ledger
+        .release_confirmed_unexecuted("tenant", &control_id)
+        .unwrap();
+
+    let writer = sidecar
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .unwrap();
     assert!(matches!(
         ledger.settle_durable("tenant", &id, 31),
         Err(BudgetError::Busy)
@@ -393,6 +406,66 @@ fn sidecar_busy_foreign_tenant_cannot_poison_real_settlement() {
     assert_eq!(intent_count, 0);
 
     drop(primary);
+    drop(sidecar);
+    drop(ledger);
+    for file in [&db, &sidecar_path] {
+        for suffix in ["", "-wal", "-shm"] {
+            let mut path = file.clone().into_os_string();
+            path.push(suffix);
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+#[test]
+fn sidecar_busy_completed_settlement_fences_other_dispatch_until_recovered() {
+    let db = path();
+    let sidecar_path = db.with_added_extension("settlements.sqlite3");
+    let scope = BudgetScope::new("tenant", "key", "provider", "model");
+    let clock = Arc::new(TestClock(AtomicI64::new(0)));
+    let ledger = BudgetLedger::open_with_busy_timeout(&db, clock, 100, Duration::ZERO).unwrap();
+    ledger
+        .configure_tenant("tenant", 100, "UTC", SpendGate::PaidOnly)
+        .unwrap();
+    ledger.configure(&scope, 100, "UTC").unwrap();
+    let a_id = ledger.reserve(&scope, Price::Known(40)).unwrap();
+    let b_id = ledger.reserve(&scope, Price::Known(20)).unwrap();
+    ledger.begin_settlement("tenant", &a_id).unwrap();
+
+    let mut sidecar = Connection::open(&sidecar_path).unwrap();
+    let writer = sidecar
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .unwrap();
+    assert!(matches!(
+        ledger.settle_durable("tenant", &a_id, 31),
+        Err(BudgetError::Busy)
+    ));
+    drop(writer);
+
+    // A completed request retains its durable intent but loses its volatile
+    // live exemption after Busy. B must not dispatch on its earlier reserve.
+    let intent_count: i64 = sidecar
+        .query_row(
+            "SELECT COUNT(*) FROM settlement_intents WHERE reservation_id=?1 AND tenant_id='tenant'",
+            [&a_id.0],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(intent_count, 1);
+    let blocked = ledger.begin_settlement("tenant", &b_id).unwrap_err();
+    assert!(matches!(
+        blocked,
+        BudgetError::Storage(ref message) if message.contains("unconfirmed dispatch outcome")
+    ));
+
+    // retry_settlements must recover the actual cost retained from A's Busy
+    // completion without another settle_durable call.
+    ledger.retry_settlements().unwrap();
+    assert_eq!(ledger.tenant_balance("tenant").unwrap(), 49);
+    ledger.retry_settlements().unwrap();
+    assert_eq!(ledger.tenant_balance("tenant").unwrap(), 49);
+    ledger.begin_settlement("tenant", &b_id).unwrap();
+
     drop(sidecar);
     drop(ledger);
     for file in [&db, &sidecar_path] {
