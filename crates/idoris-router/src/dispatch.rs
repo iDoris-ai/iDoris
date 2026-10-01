@@ -854,7 +854,12 @@ mod tests {
             rusqlite::Connection::open(path.with_added_extension("settlements.sqlite3")).unwrap();
         blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
         let outcome = call.await.unwrap();
-        assert!(matches!(outcome.result, Err(DispatchFailure::Budget(_))));
+        let response = outcome
+            .result
+            .expect("durable primary fallback preserves the successful response");
+        assert_eq!(response.content, "mock reply to: hi");
+        // The primary fallback is durable, but recovery has not yet
+        // completed the journal settlement.
         assert_eq!(outcome.actual_cost_minor, None);
         let main = rusqlite::Connection::open(&path).unwrap();
         let actual: i64 = main
@@ -875,7 +880,7 @@ mod tests {
 
         // The reservation itself has expired, but the durable pre-call
         // intent still blocks another paid request after the journal write
-        // failed. This also proves the first operation happened before the
+        // was blocked. This also proves the first operation happened before the
         // upstream await: the lock was acquired only after the first poll.
         clock.0.store(2, Ordering::SeqCst);
         assert!(budget::reserve(&ledger, None, "p", 500).is_err());

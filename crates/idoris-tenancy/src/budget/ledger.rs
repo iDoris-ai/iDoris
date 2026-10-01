@@ -205,6 +205,8 @@ pub struct BudgetLedger {
     pub(super) release_outcomes: Mutex<HashMap<String, String>>,
     #[cfg(test)]
     release_test_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    #[cfg(test)]
+    pub(super) begin_settlement_test_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     pub(super) clock: Arc<dyn Clock>,
     ttl_ms: i64,
 }
@@ -271,6 +273,8 @@ impl BudgetLedger {
             release_outcomes: Mutex::new(HashMap::new()),
             #[cfg(test)]
             release_test_hook: Mutex::new(None),
+            #[cfg(test)]
+            begin_settlement_test_hook: Mutex::new(None),
             clock,
             ttl_ms,
         };

@@ -34,7 +34,7 @@ impl BudgetLedger {
         // Match reserve's local serialization gate. reserve holds this gate
         // from its intent check through its ledger commit, so a dispatch
         // intent cannot race past an already-admitted reservation.
-        let _outcomes = self
+        let outcomes = self
             .settlement_outcomes
             .lock()
             .unwrap_or_else(|p| p.into_inner());
@@ -73,17 +73,44 @@ impl BudgetLedger {
             ));
         }
         drop(journal);
+        // Keep the validated owner proof before touching primary again. If
+        // the hold update fails, release can still durably queue cancellation
+        // even when its own primary lookup is unavailable.
+        live.insert(id.0.clone(), tenant.to_string());
+        #[cfg(test)]
+        if let Some(hook) = self
+            .begin_settlement_test_hook
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+        {
+            hook();
+        }
         let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
-        let held = conn.execute(
+        let hold_result = conn.execute(
             "UPDATE reservations SET dispatch_hold=1 WHERE id=?1 AND tenant_id=?2 AND status='active' AND actual_cost_minor IS NULL AND (expires_at_ms>?3 OR dispatch_hold=1)",
             params![id.0, tenant, self.clock.now_ms()],
-        )?;
-        if held != 1 {
-            return Err(BudgetError::Storage(
-                "reservation could not be held for dispatch".into(),
-            ));
+        ).map_err(BudgetError::from).and_then(|held| {
+            if held == 1 {
+                Ok(())
+            } else {
+                Err(BudgetError::Storage(
+                    "reservation could not be held for dispatch".into(),
+                ))
+            }
+        });
+        drop(conn);
+        if let Err(error) = hold_result {
+            drop(live);
+            drop(outcomes);
+            if let Err(release_error) = self.release(tenant, id) {
+                eprintln!(
+                    "budget dispatch cancellation queued: reservation={} error={release_error}",
+                    id.0
+                );
+            }
+            return Err(error);
         }
-        live.insert(id.0.clone(), tenant.to_string());
         Ok(())
     }
 
@@ -216,6 +243,15 @@ impl BudgetLedger {
                 if matches!(fallback, Ok(false)) {
                     outcomes.remove(&id.0);
                 }
+                if matches!(fallback, Ok(true)) {
+                    drop(conn);
+                    drop(outcomes);
+                    eprintln!(
+                        "budget settlement journal write failed; primary fallback is durable: reservation={} error={journal_error}",
+                        id.0
+                    );
+                    return Ok(None);
+                }
                 eprintln!(
                     "budget settlement fallback failed: reservation={} journal={journal_error} fallback={fallback:?}",
                     id.0
@@ -307,9 +343,8 @@ impl BudgetLedger {
             Err(PendingInsertError::Storage(journal_error)) => {
                 drop(tx);
                 // The independent journal may be Busy. Persist the known actual
-                // on the reservation as a second recovery source before returning
-                // the journal error. Keep the in-memory copy too until a journal
-                // write succeeds in this process.
+                // on the reservation as a second recovery source. Keep the
+                // in-memory copy until a journal write succeeds in this process.
                 live.remove(&id.0);
                 drop(live);
                 outcomes.insert(id.0.clone(), (tenant.to_string(), actual));
@@ -321,7 +356,11 @@ impl BudgetLedger {
                 if matches!(fallback, Ok(true)) {
                     drop(conn);
                     drop(outcomes);
-                    return Err(journal_error);
+                    eprintln!(
+                        "budget settlement journal insert failed; primary fallback is durable: reservation={} error={journal_error}",
+                        id.0
+                    );
+                    return Ok(None);
                 }
                 eprintln!(
                     "budget settlement fallback failed: reservation={} journal={journal_error} fallback={fallback:?}",
@@ -339,6 +378,15 @@ impl BudgetLedger {
             let fallback = store_primary_fallback(&conn, &id.0, tenant, actual);
             if matches!(fallback, Ok(false)) {
                 outcomes.remove(&id.0);
+            }
+            if matches!(fallback, Ok(true)) {
+                drop(conn);
+                drop(outcomes);
+                eprintln!(
+                    "budget settlement journal commit failed; primary fallback is durable: reservation={} error={journal_error}",
+                    id.0
+                );
+                return Ok(None);
             }
             eprintln!(
                 "budget settlement journal commit failed: reservation={} error={journal_error} fallback={fallback:?}",
@@ -1072,7 +1120,7 @@ mod tests {
             Err(BudgetError::TenantMismatch { .. })
         ));
         ledger.settlements.lock().unwrap().execute_batch("CREATE TRIGGER fail_journal BEFORE INSERT ON pending_settlements BEGIN SELECT RAISE(ABORT, 'injected journal failure'); END;").unwrap();
-        assert!(ledger.settle_durable("t", &id, 20).is_err());
+        assert_eq!(ledger.settle_durable("t", &id, 20).unwrap(), None);
         assert!(ledger.release("t", &id).is_err());
         let queued: i64 = ledger
             .settlements
@@ -1157,7 +1205,117 @@ mod tests {
     }
 
     #[test]
-    fn journal_failure_is_an_error_and_does_not_release_completed_usage() {
+    fn failed_dispatch_hold_cancellation_recovers_across_ttl_and_restart() {
+        for restart in [false, true] {
+            let db = TestDb::new();
+            let path = db.path();
+            let clock = Arc::new(TestClock(AtomicI64::new(100)));
+            let ledger = BudgetLedger::open_with(&path, clock.clone(), 10).unwrap();
+            ledger
+                .configure_tenant("t", 1000, "UTC", SpendGate::All)
+                .unwrap();
+            let scope = BudgetScope::new("t", "k", "p", "m");
+            let id = ledger.reserve(&scope, Price::Known(100)).unwrap();
+            let hook_path = path.clone();
+            *ledger.begin_settlement_test_hook.lock().unwrap() = Some(Arc::new(move || {
+                // Fail both the hold UPDATE and release's ownership SELECT,
+                // after the independent intent has already committed.
+                Connection::open(&hook_path)
+                    .unwrap()
+                    .execute_batch("ALTER TABLE reservations RENAME TO reservations_unavailable")
+                    .unwrap();
+            }));
+
+            assert!(matches!(
+                ledger.begin_settlement("t", &id),
+                Err(BudgetError::Storage(_))
+            ));
+            assert_eq!(intents(&ledger), 1);
+            assert!(!ledger.live_intents.lock().unwrap().contains_key(&id.0));
+            let queued: i64 = ledger
+                .settlements
+                .lock()
+                .unwrap()
+                .query_row("SELECT count(*) FROM pending_releases", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(queued, 1);
+            // The guard's second cancellation attempt cannot discard the
+            // durable retry while the primary table is still unavailable.
+            assert!(ledger.release("t", &id).is_err());
+            assert!(ledger.retry_settlements().is_err());
+            let held: i64 = ledger
+                .conn
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT dispatch_hold FROM reservations_unavailable WHERE id=?1",
+                    [&id.0],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(held, 0);
+            ledger
+                .conn
+                .lock()
+                .unwrap()
+                .execute_batch("ALTER TABLE reservations_unavailable RENAME TO reservations")
+                .unwrap();
+            clock.0.store(120, Ordering::SeqCst);
+            let recovered = if restart {
+                drop(ledger);
+                BudgetLedger::open_with(&path, clock.clone(), 10).unwrap()
+            } else {
+                ledger
+            };
+            for _ in 0..2 {
+                recovered.retry_settlements().unwrap();
+                assert_eq!(recovered.tenant_balance("t").unwrap(), 1000);
+                assert_eq!((pending(&recovered), intents(&recovered)), (0, 0));
+            }
+            let (status, actual): (String, Option<i64>) = recovered
+                .conn
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT status, actual_cost_minor FROM reservations WHERE id=?1",
+                    [&id.0],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!((status.as_str(), actual), ("released", None));
+            let queued: i64 = recovered
+                .settlements
+                .lock()
+                .unwrap()
+                .query_row("SELECT count(*) FROM pending_releases", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(queued, 0);
+            let next = recovered.reserve(&scope, Price::Known(1000)).unwrap();
+            recovered.release("t", &next).unwrap();
+        }
+    }
+
+    #[test]
+    fn dispatch_expiring_before_hold_is_cancelled() {
+        let clock = Arc::new(TestClock(AtomicI64::new(100)));
+        let ledger = BudgetLedger::open_with(":memory:", clock.clone(), 10).unwrap();
+        ledger
+            .configure_tenant("t", 1000, "UTC", SpendGate::All)
+            .unwrap();
+        let scope = BudgetScope::new("t", "k", "p", "m");
+        let id = ledger.reserve(&scope, Price::Known(100)).unwrap();
+        *ledger.begin_settlement_test_hook.lock().unwrap() = Some(Arc::new(move || {
+            clock.0.store(120, Ordering::SeqCst);
+        }));
+        assert!(ledger.begin_settlement("t", &id).is_err());
+        assert_eq!(intents(&ledger), 0);
+        assert!(!ledger.live_intents.lock().unwrap().contains_key(&id.0));
+        let next = ledger.reserve(&scope, Price::Known(1000)).unwrap();
+        ledger.release("t", &next).unwrap();
+    }
+
+    #[test]
+    fn journal_failure_with_primary_fallback_returns_success_and_recovers_charge() {
         let (ledger, id) = reserved();
         ledger.begin_settlement("t", &id).unwrap();
         ledger
@@ -1170,10 +1328,7 @@ mod tests {
             BEGIN SELECT RAISE(ABORT, 'injected journal failure'); END;",
             )
             .unwrap();
-        assert!(matches!(
-            ledger.settle_durable("t", &id, 20),
-            Err(BudgetError::Storage(_))
-        ));
+        assert_eq!(ledger.settle_durable("t", &id, 20).unwrap(), None);
         assert_eq!(ledger.tenant_balance("t").unwrap(), 990);
         let fallback_actual: i64 = ledger
             .conn
@@ -1405,10 +1560,12 @@ mod tests {
                 } else {
                     None
                 };
-                assert!(matches!(
-                    ledger.settle_durable("t", &id, 21),
-                    Err(BudgetError::Busy)
-                ));
+                let result = ledger.settle_durable("t", &id, 21);
+                if primary_locked {
+                    assert!(matches!(result, Err(BudgetError::Busy)));
+                } else {
+                    assert_eq!(result.unwrap(), None);
+                }
                 if let Some(primary_blocker) = primary_blocker {
                     primary_blocker.execute_batch("ROLLBACK").unwrap();
                 }
@@ -1465,10 +1622,7 @@ mod tests {
         let blocker = Connection::open(journal_path).unwrap();
         blocker.busy_timeout(timeout).unwrap();
         blocker.execute_batch("BEGIN EXCLUSIVE").unwrap();
-        assert!(matches!(
-            a.settle_durable("t", &id, 21),
-            Err(BudgetError::Busy)
-        ));
+        assert_eq!(a.settle_durable("t", &id, 21).unwrap(), None);
         assert_eq!(
             a.settlement_outcomes.lock().unwrap().get(&id.0),
             Some(&("t".to_string(), 21))
@@ -1550,10 +1704,7 @@ mod tests {
         let blocker = Connection::open(journal_path).unwrap();
         blocker.busy_timeout(Duration::from_millis(10)).unwrap();
         blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
-        assert!(matches!(
-            ledger.settle_durable("t", &id, 20),
-            Err(BudgetError::Busy)
-        ));
+        assert_eq!(ledger.settle_durable("t", &id, 20).unwrap(), None);
         drop(blocker);
         drop(ledger);
 
