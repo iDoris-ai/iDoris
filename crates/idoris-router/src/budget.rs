@@ -123,17 +123,15 @@ pub fn reserve(
 }
 
 /// Finalizes a reservation with the actual cost, returning the amount
-/// actually charged.
+/// actually charged, or None when durably queued for retry.
 pub fn settle(
     ledger: &BudgetLedger,
     tenant_id: Option<&str>,
     reservation_id: &ReservationId,
     actual_cost_minor: i64,
-) -> Result<i64, BudgetError> {
+) -> Result<Option<i64>, BudgetError> {
     let tenant_id = tenant_id.unwrap_or(PERSONAL_TENANT_ID);
-    ledger
-        .settle(tenant_id, reservation_id, actual_cost_minor)
-        .map(|r| r.actual_cost_minor)
+    ledger.settle_durable(tenant_id, reservation_id, actual_cost_minor)
 }
 
 /// Releases a reservation for a call that didn't happen (backend failure)
@@ -241,7 +239,7 @@ mod tests {
 
         let id = reserve(&ledger, Some("acme"), "omlx", 500).unwrap();
         let charged = settle(&ledger, Some("acme"), &id, 400).unwrap();
-        assert_eq!(charged, 400);
+        assert_eq!(charged, Some(400));
 
         // A second reservation, released instead of settled, must not count
         // against the balance afterward.
@@ -249,6 +247,40 @@ mod tests {
         release(&ledger, Some("acme"), &id2).unwrap();
         let balance = ledger.tenant_balance("acme").unwrap();
         assert_eq!(balance, 10_000 - 400);
+    }
+
+    #[tokio::test]
+    async fn app_retries_pending_usage_without_another_request_or_restart() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("budget.sqlite3");
+        let ledger = std::sync::Arc::new(
+            BudgetLedger::open_with_busy_timeout(
+                &path,
+                std::sync::Arc::new(idoris_tenancy::budget::SystemClock),
+                60_000,
+                std::time::Duration::ZERO,
+            )
+            .unwrap(),
+        );
+        ledger
+            .configure_tenant("acme", 1000, "UTC", SpendGate::All)
+            .unwrap();
+        let id = reserve(&ledger, Some("acme"), "p", 100).unwrap();
+        let blocker = rusqlite::Connection::open(&path).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+        assert_eq!(settle(&ledger, Some("acme"), &id, 80).unwrap(), None);
+        let _app = crate::build_app(crate::AppState {
+            budget_ledger: Some(ledger.clone()),
+            ..crate::AppState::default()
+        });
+        blocker.execute_batch("ROLLBACK").unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while ledger.tenant_balance("acme").unwrap() != 920 {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
     }
 
     #[test]

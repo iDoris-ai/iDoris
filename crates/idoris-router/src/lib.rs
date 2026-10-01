@@ -209,6 +209,22 @@ impl Default for AppState {
 /// `501` fallback for everything else, and the `X-iDoris-Record-Id`
 /// middleware applied to every response.
 pub fn build_app(state: AppState) -> Router {
+    if let Some(ledger) = &state.budget_ledger {
+        let ledger = Arc::downgrade(ledger);
+        tokio::spawn(async move {
+            loop {
+                let Some(ledger) = ledger.upgrade() else {
+                    break;
+                };
+                let result = tokio::task::spawn_blocking(move || ledger.retry_settlements()).await;
+                match result {
+                    Ok(Ok(())) => {}
+                    other => eprintln!("budget settlement retry failed: {other:?}"),
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+        });
+    }
     Router::new()
         .route("/health", get(health))
         .route("/v1/models", get(list_models).fallback(not_found))

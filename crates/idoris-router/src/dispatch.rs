@@ -70,8 +70,7 @@ pub enum DispatchFailure {
 /// What [`dispatch_local`] returns on a successful `decide()`.
 /// `served_locality` is set even when `result` is `Err` (interface spec
 /// §3.12). `actual_cost_minor` is `Some` only after a successful `settle`
-/// on a paid candidate — `None` for free/failed/settle-also-failed
-/// (best-effort; the response still succeeds either way).
+/// on a paid candidate — `None` for free/failed or durably queued settlement.
 #[derive(Debug)]
 pub struct ChatOutcome {
     pub decision: Decision,
@@ -377,9 +376,9 @@ pub async fn dispatch_local(
             actual_cost_minor: None,
         }),
         Ok(response) => {
-            // Settling is best-effort (see `ChatOutcome::actual_cost_minor`'s
-            // doc): a successful chat response is never withheld just
-            // because the ledger write afterward had a problem.
+            // Disarm release: a completed call must never be refunded.
+            // Busy/Storage after journaling keeps the successful response;
+            // failure to persist the actual cost fails closed.
             let actual_cost_minor = match (budget_ledger, reservation_guard.take()) {
                 (Some(ledger), Some(id)) => {
                     let actual = budget::estimate_actual_cost_minor(
@@ -388,7 +387,17 @@ pub async fn dispatch_local(
                         &response.content,
                         estimated_cost_minor,
                     );
-                    budget::settle(ledger, tenant_id, &id, actual).ok()
+                    match budget::settle(ledger, tenant_id, &id, actual) {
+                        Ok(charged) => charged,
+                        Err(err) => {
+                            return Ok(ChatOutcome {
+                                decision,
+                                served_locality,
+                                result: Err(DispatchFailure::Budget(err)),
+                                actual_cost_minor: None,
+                            });
+                        }
+                    }
                 }
                 _ => None,
             };
@@ -612,6 +621,87 @@ mod tests {
             ledger.tenant_balance(budget::PERSONAL_TENANT_ID).unwrap(),
             1_000_000 - charged
         );
+    }
+
+    #[tokio::test]
+    async fn busy_settlement_survives_restart_and_ttl_without_losing_the_charge() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("b.sqlite3");
+        let ledger = BudgetLedger::open_with_busy_timeout(
+            &path,
+            Arc::new(idoris_tenancy::budget::SystemClock),
+            1,
+            std::time::Duration::ZERO,
+        )
+        .unwrap();
+        ledger
+            .configure_tenant(
+                budget::PERSONAL_TENANT_ID,
+                1_000_000,
+                "UTC",
+                idoris_tenancy::budget::SpendGate::PaidOnly,
+            )
+            .unwrap();
+        let adapter = Arc::new(MockAdapter::new(vec![ModelInfo {
+            id: "p".to_string(),
+            memory_gb: 1.0,
+        }]));
+        adapter.set_chat_delay("p", std::time::Duration::from_millis(20));
+        let supervisor = Supervisor::spawn(adapter, SupervisorConfig::default()).unwrap();
+        let cards = [paid_card("p")];
+        let profile = empty_profile();
+        let mut call = Box::pin(dispatch_local(
+            &cards,
+            Some(&supervisor),
+            Some(&ledger),
+            &profile,
+            "hi",
+            vec![ChatMessage {
+                role: "user".to_string(),
+                content: "hi".to_string(),
+            }],
+            CancellationToken::new(),
+        ));
+        // First poll reserves budget, then yields to the Supervisor. Lock
+        // only afterward so reserve succeeds but settle deterministically fails.
+        std::future::poll_fn(|cx| {
+            assert!(call.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        let blocker = rusqlite::Connection::open(&path).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let outcome = call.await.unwrap();
+        assert!(outcome.result.is_ok());
+        assert_eq!(outcome.actual_cost_minor, None);
+        let journal =
+            rusqlite::Connection::open(path.with_added_extension("settlements.sqlite3")).unwrap();
+        let (pending, actual): (i64, i64) = journal
+            .query_row(
+                "SELECT count(*), actual_cost_minor FROM pending_settlements",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(pending, 1);
+        assert!(actual > 0);
+        drop(ledger);
+        blocker.execute_batch("ROLLBACK").unwrap();
+        // A fresh process/connection recovers the durable result even though
+        // the reservation TTL has elapsed. Reopening twice must charge once.
+        for _ in 0..2 {
+            let recovered = BudgetLedger::open(&path).unwrap();
+            assert_eq!(
+                recovered
+                    .tenant_balance(budget::PERSONAL_TENANT_ID)
+                    .unwrap(),
+                1_000_000 - actual
+            );
+        }
+        let pending: i64 = journal
+            .query_row("SELECT count(*) FROM pending_settlements", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(pending, 0);
     }
 
     /// R0 finding: the TS reference's cancellation propagation
