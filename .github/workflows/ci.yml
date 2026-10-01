@@ -47,6 +47,8 @@ jobs:
       # (Opus Tier-2 re-review B-8) — also required here, not optional.
       - run: cargo clippy --all-targets --features idoris-tenancy/test-bins,idoris-tenancy/mutation-test-hooks -- -D warnings
       - run: cargo test --features idoris-tenancy/test-bins,idoris-tenancy/mutation-test-hooks
+      # The vendored SSE framing fix is outside the workspace test set.
+      - run: cargo test -p genai --lib webc::web_stream
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check licenses bans

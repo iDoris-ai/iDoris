@@ -1,5 +1,6 @@
 [workspace]
 resolver = "2"
+exclude = ["vendor/genai"]
 members = [
     "crates/idoris-contracts",
     "crates/idoris-backend",
@@ -102,3 +103,9 @@ unsafe_code = "forbid"
 # R1 骨架约定：核心路径禁 unwrap/expect（测试内允许，见各 crate 的 `[lints]` 覆盖）。
 unwrap_used = "deny"
 expect_used = "deny"
+
+# genai 0.6.5 dispatches incomplete SSE frames at EOF. Keep provider
+# request/event conversion unchanged while fixing framing before conversion.
+# Source provenance and the narrow patch are documented in vendor/genai/PATCHES.md.
+[patch.crates-io]
+genai = { path = "vendor/genai" }
