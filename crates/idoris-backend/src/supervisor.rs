@@ -425,28 +425,29 @@ where
     }
 }
 
-/// Polls `adapter.status().used_gb` until it's confirmed to have dropped
-/// below `before_gb`, or gives up after
-/// `SupervisorConfig::release_confirm_max_attempts` and falls back to
-/// trusting the caller's own estimate that memory was actually freed (H2,
-/// Opus Tier-2 review) — never blocks a load forever on a confirmation
-/// that may never come. No logging facility exists in this crate yet, so
-/// the "and warn" half of H2 is, for now, only this doc comment; wiring it
-/// into real telemetry is left for whenever this crate adopts one.
+/// K11/H3: require every target to be absent and enough capacity to remain.
+/// Missing/invalid evidence or exhausted polling fails closed.
 async fn confirm_memory_released(
     adapter: &Arc<dyn RuntimeAdapter>,
-    before_gb: f64,
+    targets: &[String],
+    max_used_gb: f64,
     config: &SupervisorConfig,
-) {
+) -> Result<(), BackendError> {
     for _ in 0..config.release_confirm_max_attempts {
         if let Ok(status) =
             with_adapter_timeout(adapter.status(), config.adapter_call_timeout, "status").await
-            && status.used_gb < before_gb
+            && status.used_gb.is_finite()
+            && status.used_gb >= 0.0
+            && status.used_gb <= max_used_gb
+            && targets.iter().all(|id| !status.loaded.contains(id))
         {
-            return;
+            return Ok(());
         }
         tokio::time::sleep(config.release_confirm_interval).await;
     }
+    Err(BackendError::internal(
+        "memory release could not be confirmed",
+    ))
 }
 
 /// The pure-IO side of a load: attempts every victim in `evict` (even
@@ -486,6 +487,7 @@ async fn run_load_flow(
     config: SupervisorConfig,
     id: String,
     policy: LoadPolicy,
+    memory_gb: f64,
     evict: Vec<String>,
     was_ready: Option<(LoadPolicy, f64)>,
 ) -> OpOutcome {
@@ -494,18 +496,7 @@ async fn run_load_flow(
     // `victim_results`, so stopping early would leave later victims stuck
     // in `Stopping` forever (occupying budget with no in-flight op to ever
     // resolve them) instead of landing on `Stopped`/`Error` like the rest.
-    // H2 (Opus Tier-2 review): captured *before* any victim is unloaded,
-    // so the confirmation below has a real baseline to compare against —
-    // "did used_gb actually drop", not just "adapter.unload() returned
-    // Ok" (which is only ever an estimate of what really happened).
-    let used_gb_before_eviction = if evict.is_empty() {
-        None
-    } else {
-        with_adapter_timeout(adapter.status(), config.adapter_call_timeout, &id)
-            .await
-            .ok()
-            .map(|s| s.used_gb)
-    };
+    let targets = evict.clone();
     let mut victim_results: Vec<VictimResult> = Vec::with_capacity(evict.len());
     let mut eviction_failed = false;
     for victim in evict {
@@ -518,22 +509,25 @@ async fn run_load_flow(
         eviction_failed |= result.is_err();
         victim_results.push((victim, result));
     }
+    if !targets.is_empty()
+        && confirm_memory_released(&adapter, &targets, config.budget_gb - memory_gb, &config)
+            .await
+            .is_err()
+    {
+        // Keep all selected victims charged until the whole release is confirmed.
+        for (_, result) in &mut victim_results {
+            *result = Err(BackendError::eviction_failed(&id));
+        }
+        eviction_failed = true;
+    }
     if eviction_failed {
         let err = BackendError::eviction_failed(&id);
-        let failure_outcome =
-            resolve_load_failure(&adapter, &id, &err, was_ready, config.adapter_call_timeout).await;
+        let failure_outcome = resolve_load_failure(&adapter, &id, &err, was_ready, &config).await;
         return OpOutcome::Load {
             result: Err(err),
             victim_results,
             failure_outcome,
         };
-    }
-    // Confirm before proceeding to `load`, not after: the whole point is
-    // that the new model's admission was predicated on this freed
-    // capacity actually existing, not merely on `unload()` having returned
-    // `Ok`.
-    if let Some(before) = used_gb_before_eviction {
-        confirm_memory_released(&adapter, before, &config).await;
     }
 
     // OOM circuit breaker: exactly one self-healing retry, never more.
@@ -546,17 +540,22 @@ async fn run_load_flow(
     if let Err(err) = &attempt
         && err.is_oom()
     {
-        // H2: confirm whatever the OOM'd attempt may have partially
-        // allocated is actually released, then back off, before retrying
-        // — retrying immediately into the same memory pressure is likely
-        // to just OOM again.
-        let used_gb_before_retry =
-            with_adapter_timeout(adapter.status(), config.adapter_call_timeout, &id)
-                .await
-                .ok()
-                .map(|s| s.used_gb);
-        if let Some(before) = used_gb_before_retry {
-            confirm_memory_released(&adapter, before, &config).await;
+        // Never retry an OOM while allocation/release remains unconfirmed.
+        if confirm_memory_released(
+            &adapter,
+            std::slice::from_ref(&id),
+            config.budget_gb - memory_gb,
+            &config,
+        )
+        .await
+        .is_err()
+        {
+            let state = best_effort_release(&adapter, &id, &config).await;
+            return OpOutcome::Load {
+                result: attempt,
+                victim_results,
+                failure_outcome: LoadFailureOutcome::Settle(state),
+            };
         }
         tokio::time::sleep(config.oom_retry_backoff).await;
         attempt = with_adapter_timeout(
@@ -567,8 +566,7 @@ async fn run_load_flow(
         .await;
     }
     if let Err(err) = attempt {
-        let failure_outcome =
-            resolve_load_failure(&adapter, &id, &err, was_ready, config.adapter_call_timeout).await;
+        let failure_outcome = resolve_load_failure(&adapter, &id, &err, was_ready, &config).await;
         return OpOutcome::Load {
             result: Err(err),
             victim_results,
@@ -592,7 +590,7 @@ async fn run_load_flow(
                 // (unlike the two branches above) a reload's *old* instance
                 // is not assumed to still be untouched — confirm via
                 // best-effort release the same way a fresh load would.
-                let state = best_effort_release(&adapter, &id, config.adapter_call_timeout).await;
+                let state = best_effort_release(&adapter, &id, &config).await;
                 return OpOutcome::Load {
                     result: Err(err),
                     victim_results,
@@ -601,7 +599,7 @@ async fn run_load_flow(
             }
         }
     }
-    let state = best_effort_release(&adapter, &id, config.adapter_call_timeout).await;
+    let state = best_effort_release(&adapter, &id, &config).await;
     OpOutcome::Load {
         result: Err(BackendError::probe_timed_out(id.clone())),
         victim_results,
@@ -617,11 +615,18 @@ async fn run_load_flow(
 async fn best_effort_release(
     adapter: &Arc<dyn RuntimeAdapter>,
     id: &str,
-    timeout: std::time::Duration,
+    config: &SupervisorConfig,
 ) -> ModelState {
-    match with_adapter_timeout(adapter.unload(id), timeout, id).await {
-        Ok(()) => ModelState::Stopped,
-        Err(_) => ModelState::Error,
+    if with_adapter_timeout(adapter.unload(id), config.adapter_call_timeout, id)
+        .await
+        .is_ok()
+        && confirm_memory_released(adapter, &[id.to_string()], config.budget_gb, config)
+            .await
+            .is_ok()
+    {
+        ModelState::Stopped
+    } else {
+        ModelState::Error
     }
 }
 
@@ -642,7 +647,7 @@ async fn resolve_load_failure(
     id: &str,
     err: &BackendError,
     was_ready: Option<(LoadPolicy, f64)>,
-    timeout: std::time::Duration,
+    config: &SupervisorConfig,
 ) -> LoadFailureOutcome {
     if let Some((policy, memory_gb)) = was_ready {
         return LoadFailureOutcome::RestorePreviousReady { policy, memory_gb };
@@ -651,7 +656,7 @@ async fn resolve_load_failure(
         err,
         BackendError::AdapterTimedOut { .. } | BackendError::LoadUnconfirmed { .. }
     ) {
-        LoadFailureOutcome::Settle(best_effort_release(adapter, id, timeout).await)
+        LoadFailureOutcome::Settle(best_effort_release(adapter, id, config).await)
     } else {
         LoadFailureOutcome::Settle(ModelState::Stopped)
     }
@@ -720,6 +725,7 @@ fn start_load(
     env: &Env<'_>,
 ) {
     set_state_or_panic(models, &id, ModelState::Loading);
+    let memory_gb = models.get(&id).map_or(f64::INFINITY, |slot| slot.memory_gb);
     let adapter = env.adapter.clone();
     let config = env.config.clone();
     let self_tx = env.self_tx.clone();
@@ -741,6 +747,7 @@ fn start_load(
             config,
             id_for_task.clone(),
             policy,
+            memory_gb,
             evict,
             was_ready,
         ));
@@ -913,20 +920,22 @@ fn handle_load(
     start_load(id, policy, evict, was_ready, models, env);
 }
 
-/// The pure-IO side of a standalone `unload`. Unlike an eviction's own
-/// `unload`s (see [`confirm_memory_released`] in `run_load_flow`), nothing
-/// here is waiting on the freed capacity being real — a bare `unload`
-/// command has no follow-on `load` whose admission depended on it — so
-/// there is nothing to poll-confirm before proceeding.
+/// Standalone unloads also confirm release before freeing ledger capacity.
 fn start_unload(id: String, env: &Env<'_>) {
     let adapter = env.adapter.clone();
     let self_tx = env.self_tx.clone();
-    let timeout = env.config.adapter_call_timeout;
+    let config = env.config.clone();
     tokio::spawn(async move {
         // Same panic-isolation shape as `start_load` — see its doc comment.
         let id_for_inner = id.clone();
         let inner = tokio::spawn(async move {
-            with_adapter_timeout(adapter.unload(&id_for_inner), timeout, &id_for_inner).await
+            with_adapter_timeout(
+                adapter.unload(&id_for_inner),
+                config.adapter_call_timeout,
+                &id_for_inner,
+            )
+            .await?;
+            confirm_memory_released(&adapter, &[id_for_inner], config.budget_gb, &config).await
         });
         let result = match inner.await {
             Ok(result) => result,
@@ -2796,12 +2805,9 @@ mod tests {
         );
     }
 
-    /// Negative contrast: if `status()` never reflects the drop (the
-    /// confirmation can never succeed), the load must still proceed once
-    /// `release_confirm_max_attempts` is exhausted — falling back to the
-    /// caller's own estimate rather than blocking forever.
+    /// K11/H3: exhausted confirmation must reject admission and keep victims charged.
     #[tokio::test(start_paused = true)]
-    async fn eviction_proceeds_after_confirmation_gives_up() {
+    async fn eviction_rejects_after_confirmation_gives_up() {
         let adapter = Arc::new(LaggingReleaseAdapter {
             status_calls: std::sync::Mutex::new(0),
             calls_until_drop: u32::MAX, // never drops
@@ -2812,10 +2818,140 @@ mod tests {
             .load("a", 20.0, on_demand_policy())
             .await
             .expect("load a should succeed");
-        handle
+        let err = handle
             .load("b", 20.0, on_demand_policy())
             .await
-            .expect("load b must still proceed once confirmation gives up, not hang forever");
+            .expect_err("unconfirmed capacity must not admit b");
+        assert_eq!(err.reason_code(), "eviction_failed");
+        assert_eq!(handle.status().await.unwrap().used_gb, 20.0);
+    }
+
+    /// Successful unload replies with deliberately unreliable release evidence.
+    struct UnverifiedReleaseAdapter {
+        inner: MockAdapter,
+        reported: std::sync::Mutex<Option<BackendStatus>>,
+        probe_fails: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl RuntimeAdapter for UnverifiedReleaseAdapter {
+        async fn list(&self) -> Result<Vec<ModelInfo>, BackendError> {
+            self.inner.list().await
+        }
+        async fn load(&self, id: &str, policy: Option<&LoadPolicy>) -> Result<(), BackendError> {
+            self.inner.load(id, policy).await
+        }
+        async fn unload(&self, _id: &str) -> Result<(), BackendError> {
+            Ok(()) // Engine acknowledges without actually freeing anything.
+        }
+        async fn status(&self) -> Result<BackendStatus, BackendError> {
+            self.reported
+                .lock()
+                .unwrap()
+                .clone()
+                .ok_or_else(|| BackendError::internal("status unavailable"))
+        }
+        async fn probe_ready(&self, id: &str) -> Result<bool, BackendError> {
+            if self.probe_fails {
+                Err(BackendError::internal("probe failed"))
+            } else {
+                self.inner.probe_ready(id).await
+            }
+        }
+        async fn chat(
+            &self,
+            req: ChatRequest,
+            cancel: CancellationToken,
+        ) -> Result<ChatResponse, BackendError> {
+            self.inner.chat(req, cancel).await
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn eviction_rejects_partial_or_invalid_release_evidence() {
+        for evidence in [
+            Some((4.0, vec!["b"])), // Some memory freed, one of two victims remains.
+            Some((4.0, vec![])),    // All victims absent, still insufficient capacity.
+            Some((0.0, vec!["a"])), // Enough capacity, but a victim remains.
+            Some((f64::NAN, vec![])),
+            Some((-1.0, vec![])),
+            None, // Status failure cannot be treated as release confirmation.
+        ] {
+            let adapter = Arc::new(UnverifiedReleaseAdapter {
+                inner: MockAdapter::new(
+                    [("a", 4.0), ("b", 4.0), ("c", 8.0)]
+                        .into_iter()
+                        .map(|(id, memory_gb)| ModelInfo {
+                            id: id.into(),
+                            memory_gb,
+                        })
+                        .collect(),
+                ),
+                reported: std::sync::Mutex::new(Some(BackendStatus {
+                    pressure: Pressure::Ok,
+                    used_gb: 8.0,
+                    model_memory_max_gb: 8.0,
+                    loaded: vec!["a".into(), "b".into()],
+                })),
+                probe_fails: false,
+            });
+            let handle = Supervisor::spawn(
+                adapter.clone(),
+                SupervisorConfig {
+                    budget_gb: 8.0,
+                    ..SupervisorConfig::default()
+                },
+            )
+            .unwrap();
+            handle.load("a", 4.0, on_demand_policy()).await.unwrap();
+            handle.load("b", 4.0, on_demand_policy()).await.unwrap();
+            *adapter.reported.lock().unwrap() = evidence.map(|(used_gb, ids)| BackendStatus {
+                pressure: Pressure::Ok,
+                used_gb,
+                model_memory_max_gb: 8.0,
+                loaded: ids.into_iter().map(String::from).collect(),
+            });
+            let result = handle.load("c", 8.0, on_demand_policy()).await;
+            assert_eq!(result.unwrap_err().reason_code(), "eviction_failed");
+            assert_eq!(adapter.inner.load_call_count("c"), 0);
+            assert_eq!(handle.status().await.unwrap().used_gb, 8.0);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cleanup_and_standalone_unload_keep_unconfirmed_occupancy() {
+        use crate::mock::LoadOutcome;
+
+        for (probe_fails, oom) in [(false, true), (true, false), (false, false)] {
+            let adapter = Arc::new(UnverifiedReleaseAdapter {
+                inner: MockAdapter::new(catalog()),
+                reported: std::sync::Mutex::new(Some(BackendStatus {
+                    pressure: Pressure::Ok,
+                    used_gb: 4.0,
+                    model_memory_max_gb: 24.0,
+                    loaded: vec!["a".into()],
+                })),
+                probe_fails,
+            });
+            if oom {
+                adapter
+                    .inner
+                    .set_load_script("a", vec![LoadOutcome::Oom, LoadOutcome::Ok]);
+            }
+            let handle = Supervisor::spawn(adapter.clone(), SupervisorConfig::default()).unwrap();
+            if probe_fails || oom {
+                handle.load("a", 4.0, on_demand_policy()).await.unwrap_err();
+            } else {
+                handle.load("a", 4.0, on_demand_policy()).await.unwrap();
+                handle.unload("a").await.unwrap_err();
+            }
+            assert_eq!(
+                adapter.inner.load_call_count("a"),
+                1,
+                "unconfirmed OOM must not retry"
+            );
+            assert_eq!(handle.status().await.unwrap().used_gb, 4.0);
+        }
     }
 
     /// M1: the actor task itself must exit once every `SupervisorHandle` is
@@ -2920,15 +3056,8 @@ mod tests {
                 .status_times
                 .lock()
                 .expect("test mutex is never poisoned");
-            // First call (the retry's `used_gb_before_retry` baseline)
-            // reports high; every later call reports the drop already
-            // confirmed — so `confirm_memory_released` succeeds on its
-            // very first poll and contributes ~0 delay of its own,
-            // isolating `oom_retry_backoff`'s contribution to the gap
-            // between the two `load` calls (M10 needs this: without it,
-            // `confirm_memory_released`'s own up-to-`release_confirm_
-            // max_attempts` polling could coincidentally cover for a
-            // missing backoff and mask the mutation).
+            // First confirmation poll reports high; the next confirms release.
+            // One poll interval is shorter than the backoff asserted below.
             let used_gb = if times.is_empty() { 100.0 } else { 0.0 };
             times.push(tokio::time::Instant::now());
             Ok(BackendStatus {
@@ -2995,18 +3124,14 @@ mod tests {
             .lock()
             .expect("test mutex is never poisoned")
             .clone();
-        // At least 2, not just 1: the baseline `used_gb_before_retry`
-        // read is itself one `status()` call that would happen even
-        // without ever calling `confirm_memory_released` — only a
-        // *second* call in this window proves the confirmation loop
-        // itself actually ran.
+        // The first poll reports high, so confirmation must poll again.
         let calls_in_window = status_times
             .iter()
             .filter(|t| **t >= load_times[0] && **t < load_times[1])
             .count();
         assert!(
             calls_in_window >= 2,
-            "M11: confirm_memory_released must actually poll status() (not just read the baseline) between the OOM'd attempt and the retry, got {calls_in_window} call(s)"
+            "M11: confirm_memory_released must poll status() until release is confirmed between the OOM'd attempt and the retry, got {calls_in_window} call(s)"
         );
     }
 }

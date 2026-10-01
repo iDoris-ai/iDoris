@@ -43,6 +43,14 @@ async fn run(verify: ResponseTemplate, unload_status: u16) -> f64 {
         .expect(1)
         .mount(&server)
         .await;
+    // K11/H3: cleanup needs engine release evidence beyond the POST acknowledgement.
+    Mock::given(method("GET"))
+        .and(path("/api/status"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "loaded_models": [], "model_memory_used": 0, "model_memory_max": 0
+        })))
+        .mount(&server)
+        .await;
 
     let adapter = OmlxAdapter::new(OmlxAdapterConfig {
         base_url: server.uri(),
