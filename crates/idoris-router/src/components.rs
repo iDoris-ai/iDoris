@@ -246,6 +246,7 @@ privacy_class: local_only
 allowed_egress: [loopback]
 fallback_policy: fail_closed
 fail_closed: true
+load_policy: { mode: on_demand, keepalive: { pinned: false }, admission: coexist }
 "#;
 
     const MOCK_CARD: &str = r#"
@@ -264,6 +265,7 @@ privacy_class: local_only
 allowed_egress: [none]
 fallback_policy: fail_closed
 fail_closed: true
+load_policy: { mode: resident, keepalive: { pinned: true }, admission: coexist }
 "#;
 
     #[test]
@@ -478,7 +480,8 @@ load_policy: {{ mode: resident, keepalive: {{ pinned: true }}, admission: coexis
             "omlx-paid",
             "{ input_per_m: 1000000, output_per_m: 2000000 }",
         )
-        .replace("mode: resident", "mode: on_demand");
+        .replace("mode: resident", "mode: on_demand")
+        .replace("pinned: true", "pinned: false");
         write_card(&dir, "omlx.yaml", &card);
         let cards = load_components(dir.path(), false).unwrap();
         assert_eq!(cards.len(), 1);
