@@ -1,6 +1,6 @@
 use std::{
     future::Future,
-    io,
+    io::{self, IoSlice},
     pin::Pin,
     task::{Context, Poll},
     time::Duration,
@@ -83,6 +83,25 @@ impl WriteTimeoutStream {
         self.timer = None;
     }
 
+    fn poll_write_with(
+        &mut self,
+        cx: &mut Context<'_>,
+        poll: impl FnOnce(Pin<&mut TcpStream>, &mut Context<'_>) -> Poll<io::Result<usize>>,
+    ) -> Poll<io::Result<usize>> {
+        if self.check_timeout(cx) {
+            return Poll::Ready(Err(Self::timeout_error()));
+        }
+        match poll(Pin::new(&mut self.stream), cx) {
+            Poll::Pending if self.pending(cx) => Poll::Ready(Err(Self::timeout_error())),
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Ok(n)) if n > 0 => {
+                self.clear_timer();
+                Poll::Ready(Ok(n))
+            }
+            Poll::Ready(result) => Poll::Ready(result),
+        }
+    }
+
     fn poll_control(
         &mut self,
         cx: &mut Context<'_>,
@@ -114,18 +133,21 @@ impl AsyncWrite for WriteTimeoutStream {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        if self.check_timeout(cx) {
-            return Poll::Ready(Err(Self::timeout_error()));
-        }
-        match Pin::new(&mut self.stream).poll_write(cx, buf) {
-            Poll::Pending if self.pending(cx) => Poll::Ready(Err(Self::timeout_error())),
-            Poll::Pending => Poll::Pending,
-            Poll::Ready(Ok(n)) if n > 0 => {
-                self.clear_timer();
-                Poll::Ready(Ok(n))
-            }
-            Poll::Ready(result) => Poll::Ready(result),
-        }
+        self.poll_write_with(cx, |stream, cx| stream.poll_write(cx, buf))
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        // Keep hyper's queued Bytes owners alive through writes; its fallback
+        // flattens whole bodies into an unguarded buffer and drops their permits.
+        self.stream.is_write_vectored()
+    }
+
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        self.poll_write_with(cx, |stream, cx| stream.poll_write_vectored(cx, bufs))
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {

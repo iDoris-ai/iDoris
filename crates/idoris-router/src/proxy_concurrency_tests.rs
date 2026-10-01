@@ -216,3 +216,53 @@ async fn buffered_complete_failure_and_cancel_release_the_shared_permit() {
     let _ = in_flight.await;
     assert_eq!(proxy.permits.available_permits(), 1);
 }
+
+#[tokio::test]
+async fn cached_buffered_bytes_keep_the_permit_until_the_last_clone_is_dropped() {
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/v1/chat/completions"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({"marker": "cached"})),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let proxy = test_proxy();
+    let request = serde_json::json!({});
+    let mut request_opts = opts();
+    request_opts.request_id = Some("req-cache-permit");
+    let first = proxy
+        .forward_buffered(&server.uri(), &request, &request_opts)
+        .await;
+    assert_eq!(first.status, 200);
+    assert!(!first.cached);
+    let expected = first.body.to_vec();
+    let cloned = first.body.clone();
+    let slice = cloned.slice(1..);
+    drop(cloned);
+    assert_eq!(proxy.permits.available_permits(), 0);
+    drop(first);
+
+    let blocked = proxy
+        .forward_buffered(&server.uri(), &request, &request_opts)
+        .await;
+    assert_eq!(blocked.status, 503);
+    assert_eq!(proxy.permits.available_permits(), 0);
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    drop(slice);
+
+    // The cache owns unbound bytes and therefore does not consume a permit.
+    assert_eq!(proxy.permits.available_permits(), 1);
+    let replay = proxy
+        .forward_buffered(&server.uri(), &request, &request_opts)
+        .await;
+    assert!(replay.cached);
+    assert_eq!(replay.body, expected);
+    assert_eq!(proxy.permits.available_permits(), 0);
+    drop(replay);
+    assert_eq!(proxy.permits.available_permits(), 1);
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    server.verify().await;
+}

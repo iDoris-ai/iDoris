@@ -75,6 +75,143 @@ async fn slow_upstream(
     let _ = closed.send(());
 }
 
+async fn buffered_slow_response_holds_permit(stream_error: bool, cancel_reader: bool) {
+    let upstream = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(if stream_error { 502 } else { 200 })
+                .set_body_bytes(vec![b'x'; 8 * 1024 * 1024]),
+        )
+        .expect(1)
+        .mount(&upstream)
+        .await;
+    let quick = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_string("ok"))
+        .expect(1)
+        .mount(&quick)
+        .await;
+
+    let mut proxy = ChatProxy::new(reqwest::Client::new());
+    proxy.permits = Arc::new(tokio::sync::Semaphore::new(1));
+    let proxy = Arc::new(proxy);
+    let slow_proxy = proxy.clone();
+    let slow_url = upstream.uri();
+    let quick_proxy = proxy.clone();
+    let quick_url = quick.uri();
+    let app = Router::new()
+        .route(
+            "/slow",
+            any(move || {
+                let proxy = slow_proxy.clone();
+                let url = slow_url.clone();
+                async move {
+                    if stream_error {
+                        match proxy.forward_stream(&url, &serde_json::json!({})).await {
+                            StreamOutcome::Stream { response, .. } => response.into_response(),
+                            StreamOutcome::Buffered { status, body, .. } => {
+                                (StatusCode::from_u16(status).unwrap(), body).into_response()
+                            }
+                        }
+                    } else {
+                        let result = proxy
+                            .forward_buffered(&url, &serde_json::json!({}), &opts())
+                            .await;
+                        (StatusCode::from_u16(result.status).unwrap(), result.body).into_response()
+                    }
+                }
+            }),
+        )
+        .route(
+            "/quick",
+            any(move || {
+                let proxy = quick_proxy.clone();
+                let url = quick_url.clone();
+                async move {
+                    let result = proxy
+                        .forward_buffered(&url, &serde_json::json!({}), &opts())
+                        .await;
+                    (StatusCode::from_u16(result.status).unwrap(), result.body).into_response()
+                }
+            }),
+        );
+    let listener = crate::write_timeout::WriteTimeoutListener::new(
+        tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap(),
+        Duration::from_secs(5),
+    );
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let mut stalled = tokio::net::TcpStream::connect(addr).await.unwrap();
+    stalled
+        .write_all(b"POST /slow HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    let head = tokio::time::timeout(Duration::from_secs(3), read_head(&mut stalled))
+        .await
+        .unwrap();
+    assert!(String::from_utf8_lossy(&head).starts_with(if stream_error {
+        "HTTP/1.1 502"
+    } else {
+        "HTTP/1.1 200"
+    }));
+    tokio::time::sleep(Duration::from_millis(250)).await;
+
+    let mut second = tokio::net::TcpStream::connect(addr).await.unwrap();
+    second
+        .write_all(b"POST /quick HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    let second_head = tokio::time::timeout(Duration::from_secs(3), read_head(&mut second))
+        .await
+        .unwrap();
+    assert!(String::from_utf8_lossy(&second_head).starts_with("HTTP/1.1 503"));
+    assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
+    assert!(quick.received_requests().await.unwrap().is_empty());
+    if cancel_reader {
+        drop(stalled);
+    } else {
+        let mut body = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), stalled.read_to_end(&mut body))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(body.len(), 8 * 1024 * 1024);
+        assert!(body.iter().all(|&byte| byte == b'x'));
+    }
+    let permit = tokio::time::timeout(
+        Duration::from_secs(3),
+        proxy.permits.clone().acquire_owned(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    drop(permit);
+
+    let mut next = tokio::net::TcpStream::connect(addr).await.unwrap();
+    next.write_all(b"POST /quick HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    let next_head = tokio::time::timeout(Duration::from_secs(3), read_head(&mut next))
+        .await
+        .unwrap();
+    assert!(String::from_utf8_lossy(&next_head).starts_with("HTTP/1.1 200"));
+    server.abort();
+    let _ = server.await;
+    quick.verify().await;
+    upstream.verify().await;
+}
+
+#[tokio::test]
+async fn buffered_success_holds_permit_until_slow_reader_finishes() {
+    buffered_slow_response_holds_permit(false, false).await;
+}
+
+#[tokio::test]
+async fn buffered_stream_error_holds_permit_until_slow_reader_cancels() {
+    buffered_slow_response_holds_permit(true, true).await;
+}
+
 #[tokio::test]
 async fn slow_reader_hits_write_deadline_and_releases_proxy_permit() {
     let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -153,6 +290,7 @@ async fn slow_reader_hits_write_deadline_and_releases_proxy_permit() {
         (result.status, result.body.as_ref()),
         (200, b"ok".as_slice())
     );
+    drop(result);
     assert_eq!(proxy.permits.available_permits(), 1);
 
     // Draining after the deadline observes EOF/reset before any terminal chunk.

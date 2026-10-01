@@ -41,6 +41,26 @@ use indexmap::IndexMap;
 use serde_json::Value;
 use tokio::time::Instant;
 
+/// Keeps the in-flight response permit attached to the allocation handed to
+/// hyper. `Bytes` clones and slices retain this owner until their last drop.
+struct PermittedBytes {
+    bytes: Bytes,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl AsRef<[u8]> for PermittedBytes {
+    fn as_ref(&self) -> &[u8] {
+        self.bytes.as_ref()
+    }
+}
+
+fn with_permit(bytes: Bytes, permit: tokio::sync::OwnedSemaphorePermit) -> Bytes {
+    Bytes::from_owner(PermittedBytes {
+        bytes,
+        _permit: permit,
+    })
+}
+
 /// TS default (`proxy.ts`'s `ProxyDeps.idempotencyWindowMs` default).
 const DEFAULT_WINDOW: Duration = Duration::from_secs(60);
 /// TS default (`proxy.ts`'s `ProxyDeps.maxCacheEntries` default) — caps the
@@ -289,6 +309,13 @@ impl ChatProxy {
         let url = format!("{}/v1/chat/completions", endpoint.trim_end_matches('/'));
         let tenant_scope = opts.tenant_id.unwrap_or("\u{0}personal");
 
+        // Acquire before checking the cache too: cache hits can otherwise
+        // enqueue arbitrarily many large buffered responses concurrently.
+        let permit = match self.permits.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => return Self::failure(503, 0),
+        };
+
         if let Some(request_id) = opts.request_id {
             let key = cache_key(tenant_scope, &url, opts.provider_id, request_id);
             #[allow(clippy::unwrap_used)]
@@ -305,7 +332,7 @@ impl ChatProxy {
                 if !unsafe_for_local_only {
                     return ForwardOutcome {
                         status: entry.status,
-                        body: entry.body,
+                        body: with_permit(entry.body, permit),
                         content_type: Some("application/json".to_string()),
                         cached: true,
                         origin_record_id: Some(entry.record_id),
@@ -316,12 +343,6 @@ impl ChatProxy {
             }
         }
 
-        // Fail fast at the shared 32-request cap, including requests whose
-        // buffered retries or streaming response body are still in flight.
-        let _permit = match self.permits.clone().try_acquire_owned() {
-            Ok(permit) => permit,
-            Err(_) => return Self::failure(503, 0),
-        };
         let mut payload = body.clone();
         if let Some(obj) = payload.as_object_mut() {
             obj.insert("stream".to_string(), Value::Bool(false));
@@ -373,6 +394,7 @@ impl ChatProxy {
                             CacheEntry {
                                 at: Instant::now(),
                                 status,
+                                // Only outgoing bytes own the permit; cache retention must not.
                                 body: body_bytes.clone(),
                                 record_id: opts.record_id.to_string(),
                                 served_locality: opts.served_locality,
@@ -381,7 +403,7 @@ impl ChatProxy {
                     }
                     return ForwardOutcome {
                         status,
-                        body: body_bytes,
+                        body: with_permit(body_bytes, permit),
                         content_type,
                         cached: false,
                         origin_record_id: None,
@@ -487,7 +509,7 @@ impl ChatProxy {
                     match self.read_buffered(resp).await {
                         Ok(body) => StreamOutcome::Buffered {
                             status,
-                            body,
+                            body: with_permit(body, permit),
                             content_type,
                         },
                         Err(error_status) => StreamOutcome::Buffered {
