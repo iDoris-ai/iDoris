@@ -23,6 +23,40 @@ pub struct Message {
 	pub data: String,
 }
 
+fn parse_event_block(raw_event: &str) -> Option<Message> {
+	let mut event = "message".to_string();
+	let mut data_lines = Vec::new();
+
+	for line in raw_event.lines() {
+		if line.starts_with(':') {
+			continue;
+		}
+
+		let (field, value) = line.split_once(':').unwrap_or((line, ""));
+		// The SSE format removes exactly one optional ASCII space after the colon.
+		let value = value.strip_prefix(' ').unwrap_or(value);
+
+		match field {
+			"event" => {
+				event = if value.is_empty() {
+					"message".to_string()
+				} else {
+					value.to_string()
+				}
+			}
+			"data" => data_lines.push(value),
+			_ => {}
+		}
+	}
+
+	if data_lines.is_empty() {
+		return None;
+	}
+
+	let data = data_lines.join("\n");
+	Some(Message { event, data })
+}
+
 impl EventSourceStream {
 	pub fn new(reqwest_builder: RequestBuilder) -> Self {
 		// SSE event separator is `\n\n`, `\r\n\r\n`, or `\r\r`. WebStream's Sse mode
@@ -52,31 +86,12 @@ impl Stream for EventSourceStream {
 
 			match nx {
 				Poll::Ready(Some(Ok(raw_event))) => {
-					let mut event = "message".to_string();
-					let mut data = String::new();
-					for line in raw_event.lines() {
-						let line = line.trim();
-						// Skip empty lines or comments (starting with :)
-						if line.is_empty() || line.starts_with(':') {
-							continue;
-						}
-
-						if let Some(e) = line.strip_prefix("event:") {
-							event = e.trim().to_string();
-						} else if let Some(d) = line.strip_prefix("data:") {
-							if !data.is_empty() {
-								data.push('\n');
-							}
-							data.push_str(d.trim());
-						}
-					}
-
-					// If no data found in this block, poll for the next one
-					if data.is_empty() {
+					// If no data found in this block, poll for the next one.
+					let Some(message) = parse_event_block(&raw_event) else {
 						continue;
-					}
+					};
 
-					return Poll::Ready(Some(Ok(Event::Message(Message { event, data }))));
+					return Poll::Ready(Some(Ok(Event::Message(message))));
 				}
 				Poll::Ready(Some(Err(e))) => {
 					return Poll::Ready(Some(Err(e)));
@@ -85,5 +100,59 @@ impl Stream for EventSourceStream {
 				Poll::Pending => return Poll::Pending,
 			}
 		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::parse_event_block;
+
+	#[test]
+	fn preserves_empty_data_fields_and_inter_field_newlines() {
+		let message = parse_event_block("data:\ndata: [DONE]").unwrap();
+		assert_eq!(message.data, "\n[DONE]");
+	}
+
+	#[test]
+	fn accepts_colonless_data_fields() {
+		let message = parse_event_block("data\ndata: [DONE]").unwrap();
+		assert_eq!(message.data, "\n[DONE]");
+	}
+
+	#[test]
+	fn removes_only_one_optional_space_after_colon() {
+		let message = parse_event_block("data:  [DONE]").unwrap();
+		assert_eq!(message.data, " [DONE]");
+	}
+
+	#[test]
+	fn ordinary_done_payload_is_preserved() {
+		let message = parse_event_block("data: [DONE]").unwrap();
+		assert_eq!(message.data, "[DONE]");
+	}
+
+	#[test]
+	fn dispatches_empty_data_values_but_skips_blocks_without_data_fields() {
+		assert_eq!(parse_event_block("data:").unwrap().data, "");
+		assert_eq!(parse_event_block("data").unwrap().data, "");
+		assert!(parse_event_block(": comment\nevent: update").is_none());
+	}
+
+	#[test]
+	fn preserves_leading_middle_and_trailing_empty_data_values() {
+		let message = parse_event_block("data:\ndata: first\ndata\ndata: last\ndata:").unwrap();
+		assert_eq!(message.data, "\nfirst\n\nlast\n");
+	}
+
+	#[test]
+	fn preserves_trailing_data_whitespace_and_ignores_leading_field_whitespace() {
+		let message = parse_event_block(" data: ignored\ndata: value  ").unwrap();
+		assert_eq!(message.data, "value  ");
+	}
+
+	#[test]
+	fn empty_event_value_uses_default_event_name() {
+		let message = parse_event_block("event:\ndata: payload").unwrap();
+		assert_eq!(message.event, "message");
 	}
 }

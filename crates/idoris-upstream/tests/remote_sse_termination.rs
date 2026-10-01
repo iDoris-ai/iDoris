@@ -87,6 +87,14 @@ async fn mock_stream(kind: RemoteProviderKind, body: String) -> (RemoteClient, M
 }
 
 async fn assert_truncated(kind: RemoteProviderKind, body: String) {
+    assert_stream_error(kind, body, "network_error").await;
+}
+
+async fn assert_malformed(kind: RemoteProviderKind, body: String) {
+    assert_stream_error(kind, body, "malformed_response").await;
+}
+
+async fn assert_stream_error(kind: RemoteProviderKind, body: String, expected_error: &str) {
     let (client, _server) = mock_stream(kind, body).await;
     let (text, dones, errors) =
         drain(client.chat_stream(request(), deadline()).await.unwrap()).await;
@@ -95,7 +103,7 @@ async fn assert_truncated(kind: RemoteProviderKind, body: String) {
         dones.iter().all(|done| !done),
         "truncated stream emitted done: {dones:?}"
     );
-    assert_eq!(errors, ["network_error"]);
+    assert_eq!(errors, [expected_error]);
 }
 
 #[tokio::test]
@@ -106,6 +114,22 @@ async fn openai_done_without_empty_line_is_truncated() {
             format!("{}data: [DONE]{ending}", openai_partial("\n")),
         )
         .await;
+    }
+}
+
+#[tokio::test]
+async fn openai_done_after_empty_colon_data_field_is_truncated() {
+    for eol in ["\n", "\r\n", "\r"] {
+        let body = format!("{}data:{eol}data: [DONE]{eol}{eol}", openai_partial(eol));
+        assert_malformed(RemoteProviderKind::OpenAiCompatible, body).await;
+    }
+}
+
+#[tokio::test]
+async fn openai_done_after_colonless_data_field_is_truncated() {
+    for eol in ["\n", "\r\n", "\r"] {
+        let body = format!("{}data{eol}data: [DONE]{eol}{eol}", openai_partial(eol));
+        assert_malformed(RemoteProviderKind::OpenAiCompatible, body).await;
     }
 }
 
