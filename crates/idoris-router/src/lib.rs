@@ -14,7 +14,7 @@ pub mod profile;
 pub mod components;
 
 /// Routing-policy loading from `IDORIS_ROUTING_POLICY` (R2-D task 2); wired
-/// into `AppState` in a follow-up PR.
+/// into `AppState` and applied before either execution path.
 pub mod routing_policy;
 
 /// The local decision + execution path (R2-D task 3): `decide()` → (if
@@ -150,6 +150,9 @@ pub struct AppState {
     /// count is always `cards.len()` — a single source of truth instead of
     /// a separately-tracked counter that could drift from this list.
     pub cards: Vec<idoris_contracts::ComponentCard>,
+    /// Startup-validated YAML policy. Library construction defaults to a
+    /// local-only tier set without filesystem I/O; the binary replaces it.
+    pub routing_policy: idoris_contracts::RoutingPolicy,
     /// Backs the local dispatch path (R2-D task 3); `None` means no local
     /// backend is wired — dispatch then fails closed as
     /// `local_only_unavailable` rather than panicking on a missing handle.
@@ -178,6 +181,7 @@ impl std::fmt::Debug for AppState {
             .field("instance_id", &self.instance_id)
             .field("deploy_mode", &self.deploy_mode)
             .field("cards", &self.cards)
+            .field("routing_policy", &self.routing_policy)
             .field("supervisor", &self.supervisor)
             .field(
                 "budget_ledger",
@@ -197,6 +201,17 @@ impl Default for AppState {
                 std::env::var("IDORIS_DEPLOY_MODE").ok().as_deref(),
             ),
             cards: Vec::new(),
+            routing_policy: idoris_contracts::RoutingPolicy {
+                routing_policy: idoris_contracts::routing_policy::RoutingPolicyInner {
+                    version: 1,
+                    rules: Vec::new(),
+                    default: idoris_contracts::routing_policy::Action {
+                        tiers: Some(vec![idoris_contracts::common::Tier::Local]),
+                        fail_closed: Some(true),
+                        ..Default::default()
+                    },
+                },
+            },
             supervisor: None,
             budget_ledger: None,
             http_client: reqwest::Client::new(),
@@ -501,7 +516,20 @@ async fn chat_completions(
     // Supervisor, which only makes sense for a real oMLX-shaped backend
     // with an explicit load/unload lifecycle. See dispatch::select's doc
     // for the accepted double-decide() tradeoff this branch makes.
-    if let Ok(selected) = dispatch::select(&state.cards, &parsed, &prompt)
+    let (cards, fail_closed) = dispatch::policy_cards(&state.cards, &state.routing_policy, &parsed);
+    if cards.is_empty() {
+        // Match TS's two empty-candidate errors; neither permits egress.
+        return if fail_closed {
+            rejection_response(idoris_policy::Rejection::LocalOnlyUnavailable)
+        } else {
+            error_envelope(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "no_candidate",
+                "no candidate matches routing policy",
+            )
+        };
+    }
+    if let Ok(selected) = dispatch::select(&cards, &parsed, &prompt)
         && dispatch::is_resident_http_service(&selected.card)
     {
         return chat_via_proxy(&state, &selected, &headers, &parsed, &value, &record_id).await;
@@ -519,7 +547,7 @@ async fn chat_completions(
     // better than, a listener that structurally can never fire.
     let budget_ledger = state.budget_ledger.as_deref();
     match dispatch_local(
-        &state.cards,
+        &cards,
         state.supervisor.as_ref(),
         budget_ledger,
         &parsed,
@@ -1231,6 +1259,118 @@ mod tests {
             }),
             endpoint: endpoint.to_string(),
             ..sample_component_card(id)
+        }
+    }
+
+    #[tokio::test]
+    async fn yaml_policy_gates_proxy_and_supervisor_before_backend_calls() {
+        for resident in [false, true] {
+            for (tier, fail_closed, expected) in [
+                ("local", true, StatusCode::OK),
+                ("remote", true, StatusCode::OK),
+                ("lora", true, StatusCode::SERVICE_UNAVAILABLE),
+                ("lora", false, StatusCode::SERVICE_UNAVAILABLE),
+            ] {
+                let upstream = wiremock::MockServer::start().await;
+                let remote_upstream = wiremock::MockServer::start().await;
+                wiremock::Mock::given(wiremock::matchers::method("POST"))
+                    .respond_with(
+                        wiremock::ResponseTemplate::new(200)
+                            .set_body_json(serde_json::json!({"marker": "policy-ok"})),
+                    )
+                    .expect(if resident && tier == "local" { 1 } else { 0 })
+                    .mount(&upstream)
+                    .await;
+                wiremock::Mock::given(wiremock::matchers::method("POST"))
+                    .respond_with(
+                        wiremock::ResponseTemplate::new(200)
+                            .set_body_json(serde_json::json!({"marker": "policy-ok"})),
+                    )
+                    .expect(if resident && tier == "remote" { 1 } else { 0 })
+                    .mount(&remote_upstream)
+                    .await;
+                let adapter = Arc::new(idoris_backend::MockAdapter::new(
+                    ["a-local", "z-remote"]
+                        .map(|id| idoris_backend::ModelInfo {
+                            id: id.into(),
+                            memory_gb: 1.0,
+                        })
+                        .to_vec(),
+                ));
+                let supervisor =
+                    idoris_backend::Supervisor::spawn(adapter.clone(), Default::default()).unwrap();
+                let card = |id: &str, endpoint: &str| {
+                    if resident {
+                        resident_component_card(id, endpoint)
+                    } else {
+                        sample_component_card(id)
+                    }
+                };
+                let mut remote = card("z-remote", &remote_upstream.uri());
+                remote.provider.tier = idoris_contracts::common::Tier::Remote;
+                remote.provider.locality = Locality::Remote;
+                remote.provider.privacy_class = idoris_contracts::common::PrivacyClass::Any;
+                remote.privacy_class = idoris_contracts::common::PrivacyClass::Any;
+                remote.allowed_egress = vec![idoris_contracts::component_card::Egress::Internet];
+                let state = AppState {
+                    cards: vec![card("a-local", &upstream.uri()), remote],
+                    supervisor: Some(supervisor),
+                    routing_policy: serde_yaml::from_str(&format!(
+                        "routing_policy:\n  version: 1\n  rules: []\n  default: {{ tiers: [{tier}], fail_closed: {fail_closed} }}\n"
+                    )).unwrap(),
+                    ..AppState::default()
+                };
+                let response = build_app(state).oneshot(post_chat(
+                    r#"{"model":"idoris/daily","messages":[{"role":"user","content":"policy-ok"}]}"#,
+                    &[("x-idoris-privacy", "any")],
+                )).await.unwrap();
+                assert_eq!(
+                    response.status(),
+                    expected,
+                    "resident={resident}, tier={tier}"
+                );
+                assert_eq!(
+                    adapter.load_call_count("a-local"),
+                    u32::from(!resident && tier == "local")
+                );
+                assert_eq!(
+                    adapter.load_call_count("z-remote"),
+                    u32::from(!resident && tier == "remote")
+                );
+                if expected == StatusCode::OK {
+                    assert_eq!(
+                        response.headers().get(HEADER_SERVED_LOCALITY).unwrap(),
+                        if tier == "remote" {
+                            "remote"
+                        } else {
+                            "loopback"
+                        }
+                    );
+                }
+                let bytes = response.into_body().collect().await.unwrap().to_bytes();
+                let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                if tier == "lora" {
+                    assert_eq!(
+                        json["error"]["type"],
+                        if fail_closed {
+                            "local_only_unavailable"
+                        } else {
+                            "no_candidate"
+                        }
+                    );
+                } else if resident {
+                    assert_eq!(json["marker"], "policy-ok");
+                } else {
+                    assert!(
+                        json["choices"][0]["message"]["content"]
+                            .as_str()
+                            .unwrap()
+                            .contains("policy-ok")
+                    );
+                }
+                upstream.verify().await;
+                remote_upstream.verify().await;
+            }
         }
     }
 
