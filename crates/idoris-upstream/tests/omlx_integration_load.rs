@@ -8,17 +8,22 @@
 //! is set, whatever the opt-in says.
 //!
 //! What it does and does not guarantee:
-//! - Within this test binary the whole check → load → verify → unload
-//!   lifecycle is one sequential test, so the adapter phase and the
-//!   Supervisor phase can never unload each other's model.
+//! - The whole check → load → verify → unload lifecycle is one sequential
+//!   test, and it holds an exclusive lock file (`<tmp>/idoris-omlx-it-<model>.lock`,
+//!   `std::fs::File::lock`) from before the initial check until cleanup has
+//!   finished — so neither the two phases nor two concurrent test processes
+//!   on this machine can unload each other's model.
 //! - If the target model is already loaded when the test starts, it skips.
 //!   That is a best-effort guard, **not** exclusive ownership: another client
 //!   can still load or use the model after the check. Point the test at a
 //!   model nothing else uses (the default is chosen for that), or at a
 //!   dedicated oMLX instance via `IDORIS_OMLX_BASE_URL`.
 //! - Every phase is bounded by a lifecycle timeout, and the model is unloaded
-//!   (under its own timeout) before any failure is reported — so a failed
-//!   run does not leave the model resident and make the next run skip.
+//!   (under its own timeout) before any failure is reported. Cleanup first
+//!   waits until the engine reports no load in flight, because a timed-out
+//!   load request (or a Supervisor load task that outlived its handle) may
+//!   still finish server-side; if that never settles, the test reports the
+//!   cleanup as incomplete rather than claiming the model is gone.
 //!
 //! Run on workstation A (see `docs/agent/COLLAB.md`):
 //! ```text
@@ -88,34 +93,61 @@ fn on_demand() -> LoadPolicy {
     }
 }
 
-/// The engine's own view of `id`, read straight from `GET
-/// /v1/models/status` — independent of the adapter code under test.
-/// `None` when the id is not listed at all.
-async fn engine_state(env: &Env) -> Result<Option<(bool, bool)>, String> {
-    let url = format!("{}/v1/models/status", env.base_url.trim_end_matches('/'));
+async fn get_json(env: &Env, path: &str) -> Result<serde_json::Value, String> {
+    let url = format!("{}{path}", env.base_url.trim_end_matches('/'));
     let mut req = reqwest::Client::new().get(url).timeout(CALL);
     if let Some(key) = &env.api_key {
         req = req.bearer_auth(key);
     }
-    let body: serde_json::Value = req
-        .send()
+    req.send()
         .await
         .and_then(reqwest::Response::error_for_status)
-        .map_err(|err| format!("GET /v1/models/status failed: {err}"))?
+        .map_err(|err| format!("GET {path} failed: {err}"))?
         .json()
         .await
-        .map_err(|err| format!("GET /v1/models/status returned non-JSON: {err}"))?;
-    let entry = body["models"]
+        .map_err(|err| format!("GET {path} returned non-JSON: {err}"))
+}
+
+/// The engine's own view of `id`, read straight from `GET
+/// /v1/models/status` — independent of the adapter code under test, and
+/// strict: at most one entry may match, and `loaded`/`pinned` must both be
+/// real booleans (a missing/`null`/string field is an error, never `false`).
+/// `None` when the id is not listed at all.
+async fn engine_state(env: &Env) -> Result<Option<(bool, bool)>, String> {
+    let body = get_json(env, "/v1/models/status").await?;
+    let matches: Vec<&serde_json::Value> = body["models"]
         .as_array()
         .ok_or("GET /v1/models/status has no `models` array")?
         .iter()
-        .find(|m| m["id"].as_str() == Some(env.id.as_str()));
-    Ok(entry.map(|m| {
-        (
-            m["loaded"].as_bool() == Some(true),
-            m["pinned"].as_bool() == Some(true),
-        )
-    }))
+        .filter(|m| m["id"].as_str() == Some(env.id.as_str()))
+        .collect();
+    match matches.as_slice() {
+        [] => Ok(None),
+        [m] => {
+            let field = |name: &str| {
+                m[name]
+                    .as_bool()
+                    .ok_or_else(|| format!("{}: `{name}` is not a boolean: {}", env.id, m[name]))
+            };
+            Ok(Some((field("loaded")?, field("pinned")?)))
+        }
+        _ => Err(format!("{} is listed {} times", env.id, matches.len())),
+    }
+}
+
+/// `true` while the engine reports any model load in flight
+/// (`GET /api/status`'s `models_loading`).
+async fn engine_loading(env: &Env) -> Result<bool, String> {
+    let body = get_json(env, "/api/status").await?;
+    body["models_loading"]
+        .as_u64()
+        .map(|n| n > 0)
+        .ok_or_else(|| {
+            format!(
+                "/api/status `models_loading` is not a count: {}",
+                body["models_loading"]
+            )
+        })
 }
 
 async fn engine_loaded(env: &Env) -> Result<bool, String> {
@@ -142,6 +174,11 @@ async fn wait_engine_loaded(env: &Env, want: bool, deadline: Instant) -> Outcome
 /// after a `LoadUnconfirmed`, where it may well be resident), unload it.
 async fn cleanup(env: &Env) -> Outcome {
     timeout(CLEANUP, async {
+        // A load that timed out on our side may still complete server-side:
+        // wait until nothing is loading before deciding whether to unload.
+        while engine_loading(env).await? {
+            sleep(Duration::from_millis(500)).await;
+        }
         if engine_loaded(env).await? {
             adapter(env)
                 .unload(&env.id)
@@ -152,7 +189,13 @@ async fn cleanup(env: &Env) -> Outcome {
         Ok(())
     })
     .await
-    .map_err(|_| format!("cleanup of {} timed out", env.id))?
+    .map_err(|_| {
+        format!(
+            "cleanup of {} incomplete: a load was still in flight or the unload did not settle \
+             within {CLEANUP:?} — check the oMLX instance by hand",
+            env.id
+        )
+    })?
 }
 
 /// Runs `phase` under the lifecycle timeout, then always cleans up, then
@@ -237,7 +280,7 @@ async fn supervisor_phase(env: &Env) -> Outcome {
         .await
         .map_err(|err| format!("Supervisor unload failed: {err}"))?;
     let status = handle.status().await.map_err(|e| e.to_string())?;
-    if status.used_gb != 0.0 || status.loaded.contains(&env.id) {
+    if status.used_gb != 0.0 || !status.loaded.is_empty() {
         return Err(format!(
             "after unload, Supervisor status must be empty, got {status:?}"
         ));
@@ -250,6 +293,11 @@ async fn supervisor_phase(env: &Env) -> Outcome {
 #[tokio::test]
 async fn real_omlx_load_unload_lifecycle() {
     let Some(env) = env() else { return };
+    let lock_path =
+        std::env::temp_dir().join(format!("idoris-omlx-it-{}.lock", env.id.replace('/', "_")));
+    let lock = std::fs::File::create(&lock_path).expect("lock file must be creatable");
+    lock.lock()
+        .expect("must acquire the cross-process test lock");
     if engine_loaded(&env).await.expect("oMLX must be reachable") {
         eprintln!(
             "skipping: {} is already loaded — refusing to unload a model someone else may be using",
@@ -259,4 +307,5 @@ async fn real_omlx_load_unload_lifecycle() {
     }
     run_phase(&env, "adapter phase", adapter_phase(&env)).await;
     run_phase(&env, "supervisor phase", supervisor_phase(&env)).await;
+    drop(lock); // held until every phase and its cleanup have finished
 }
