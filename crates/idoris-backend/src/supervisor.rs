@@ -140,16 +140,29 @@ enum LoadFailureOutcome {
     /// Land on this state, keeping whatever policy/memory_gb `handle_load`
     /// already wrote into the slot.
     Settle(ModelState),
-    /// This was a reload of a previously-`Ready` model — restore that old
-    /// state instead of guessing `Stopped`/`Error` (Medium, follow-up Opus
-    /// review; prdaemon-observed: 6 GiB budget, engine actually still
-    /// holding 8 GiB). A failed reload call most likely left the existing
-    /// instance untouched; blanket-assuming `Stopped` would tell the
-    /// ledger that instance's memory is free when it almost certainly
-    /// still isn't — and a later `unload` would then short-circuit on the
-    /// wrongly-`Stopped` entry, so that memory could never be reclaimed
-    /// through the public API again.
-    RestorePreviousReady { policy: LoadPolicy, memory_gb: f64 },
+    /// A definite rejection leaves the previous instance's state, policy,
+    /// and footprint untouched.
+    RestorePrevious(PreviousModel),
+    /// An uncertain release keeps Error and the larger footprint.
+    RetainPreviousOnError(PreviousModel),
+}
+
+#[derive(Clone, Copy)]
+struct PreviousModel {
+    state: ModelState,
+    policy: LoadPolicy,
+    memory_gb: f64,
+}
+
+impl LoadFailureOutcome {
+    /// Unconfirmed release retains the larger of the old and retry estimates.
+    /// The state stays Error, never Ready.
+    fn after_release(state: ModelState, previous: Option<PreviousModel>) -> Self {
+        match previous {
+            Some(previous) if occupies_budget(state) => Self::RetainPreviousOnError(previous),
+            _ => Self::Settle(state),
+        }
+    }
 }
 
 enum ActorMsg {
@@ -476,18 +489,18 @@ async fn confirm_memory_released(
 /// never actually resident, and a *different* future load could then fail
 /// with a misleading `eviction_impossible` (no viable plan) when the real
 /// problem is a stuck, never-cleaned-up ledger entry. Those two cases
-/// settle on `Stopped` instead. Only a `probe_ready` failure/timeout is
-/// genuinely ambiguous (the `load` call itself DID succeed) — there, a
-/// best-effort `unload` is attempted first; `Stopped` if that confirms
-/// release, `Error` (occupying budget, matching `occupies_budget`'s
-/// documented conservatism) only if even that fails.
+/// settle a fresh load on `Stopped`, or restore a retry's previous slot.
+/// A load timeout, `LoadUnconfirmed`, or `probe_ready` failure/timeout
+/// may leave memory allocated — attempt a best-effort `unload` first.
+/// Successful release settles on `Stopped`; failure keeps `Error` and
+/// the larger of the previous and current estimates.
 async fn run_load_flow(
     adapter: Arc<dyn RuntimeAdapter>,
     config: SupervisorConfig,
     id: String,
     policy: LoadPolicy,
     evict: Vec<String>,
-    was_ready: Option<(LoadPolicy, f64)>,
+    previous: Option<PreviousModel>,
 ) -> OpOutcome {
     // Every chosen victim gets an actual unload attempt, even after an
     // earlier one fails: `OpDone` only resolves ids present in
@@ -521,7 +534,7 @@ async fn run_load_flow(
     if eviction_failed {
         let err = BackendError::eviction_failed(&id);
         let failure_outcome =
-            resolve_load_failure(&adapter, &id, &err, was_ready, config.adapter_call_timeout).await;
+            resolve_load_failure(&adapter, &id, &err, previous, config.adapter_call_timeout).await;
         return OpOutcome::Load {
             result: Err(err),
             victim_results,
@@ -568,7 +581,7 @@ async fn run_load_flow(
     }
     if let Err(err) = attempt {
         let failure_outcome =
-            resolve_load_failure(&adapter, &id, &err, was_ready, config.adapter_call_timeout).await;
+            resolve_load_failure(&adapter, &id, &err, previous, config.adapter_call_timeout).await;
         return OpOutcome::Load {
             result: Err(err),
             victim_results,
@@ -596,7 +609,7 @@ async fn run_load_flow(
                 return OpOutcome::Load {
                     result: Err(err),
                     victim_results,
-                    failure_outcome: LoadFailureOutcome::Settle(state),
+                    failure_outcome: LoadFailureOutcome::after_release(state, previous),
                 };
             }
         }
@@ -605,7 +618,7 @@ async fn run_load_flow(
     OpOutcome::Load {
         result: Err(BackendError::probe_timed_out(id.clone())),
         victim_results,
-        failure_outcome: LoadFailureOutcome::Settle(state),
+        failure_outcome: LoadFailureOutcome::after_release(state, previous),
     }
 }
 
@@ -625,33 +638,25 @@ async fn best_effort_release(
     }
 }
 
-/// Decides `id`'s [`LoadFailureOutcome`] after `err` (Medium, follow-up
-/// Opus review). If this was a reload of a previously-`Ready` model
-/// (`was_ready.is_some()`), always restores that old state regardless of
-/// the specific error — see `LoadFailureOutcome::RestorePreviousReady`'s
-/// doc comment; a failed reload call is not the same as a failed *fresh*
-/// load, since something was already genuinely resident beforehand.
-/// Otherwise: an explicit adapter rejection means no real allocation
-/// happened (`Stopped`, H1's original reasoning, still valid for a fresh
-/// load); a timeout — or an adapter reporting
-/// [`BackendError::LoadUnconfirmed`] (the engine accepted the load, a later
-/// step failed) — is genuinely uncertain, not a rejection, so it is
-/// confirmed via [`best_effort_release`] instead of assumed `Stopped`.
+/// A rejected retry restores any previous budget-occupying state, including
+/// Error (K10/H2). Only a fresh load may treat an explicit rejection as free.
+/// A timeout or [`BackendError::LoadUnconfirmed`] instead attempts
+/// [`best_effort_release`] because allocation may already have happened.
 async fn resolve_load_failure(
     adapter: &Arc<dyn RuntimeAdapter>,
     id: &str,
     err: &BackendError,
-    was_ready: Option<(LoadPolicy, f64)>,
+    previous: Option<PreviousModel>,
     timeout: std::time::Duration,
 ) -> LoadFailureOutcome {
-    if let Some((policy, memory_gb)) = was_ready {
-        return LoadFailureOutcome::RestorePreviousReady { policy, memory_gb };
-    }
     if matches!(
         err,
         BackendError::AdapterTimedOut { .. } | BackendError::LoadUnconfirmed { .. }
     ) {
-        LoadFailureOutcome::Settle(best_effort_release(adapter, id, timeout).await)
+        let state = best_effort_release(adapter, id, timeout).await;
+        LoadFailureOutcome::after_release(state, previous)
+    } else if let Some(previous) = previous {
+        LoadFailureOutcome::RestorePrevious(previous)
     } else {
         LoadFailureOutcome::Settle(ModelState::Stopped)
     }
@@ -715,7 +720,7 @@ fn start_load(
     id: String,
     policy: LoadPolicy,
     evict: Vec<String>,
-    was_ready: Option<(LoadPolicy, f64)>,
+    previous: Option<PreviousModel>,
     models: &mut HashMap<String, ModelSlot>,
     env: &Env<'_>,
 ) {
@@ -742,7 +747,7 @@ fn start_load(
             id_for_task.clone(),
             policy,
             evict,
-            was_ready,
+            previous,
         ));
         let outcome = match inner.await {
             Ok(outcome) => outcome,
@@ -768,13 +773,9 @@ fn start_load(
                         (victim, Err(err))
                     })
                     .collect(),
-                // A panic mid-flow leaves real state genuinely unknown —
-                // conservative like a failed best-effort release, not the
-                // "confirmed nothing happened" case. Deliberately *not*
-                // `was_ready`-aware even for a reload: unlike a clean
-                // rejection or timeout, a panic gives no assurance the old
-                // instance was left untouched either.
-                failure_outcome: LoadFailureOutcome::Settle(ModelState::Error),
+                // A panic leaves state unknown; retain the larger footprint
+                // while marking Error rather than restoring a Ready instance.
+                failure_outcome: LoadFailureOutcome::after_release(ModelState::Error, previous),
             },
         };
         // If `upgrade` fails, every `SupervisorHandle` is already gone and
@@ -844,6 +845,14 @@ fn handle_load(
         let _ = reply.send(Ok(()));
         return;
     }
+    if models.get(&id).is_some_and(|slot| slot.inflight != 0) {
+        let _ = reply.send(Err(BackendError::busy(
+            "model has chats in flight",
+            Some(id),
+            None,
+        )));
+        return;
+    }
     if let Some(active) = active_op.as_ref() {
         let _ = reply.send(Err(BackendError::busy(
             "a different id currently holds the load/evict/unload mutex",
@@ -873,25 +882,16 @@ fn handle_load(
     }
 
     let last_used_seq = models.get(&id).map_or(0, |s| s.last_used_seq);
-    // Carried forward, not reset to 0: a policy-changing reload of a
-    // currently-Ready model with chats still in flight against its
-    // previous instance must not let `ChatDone` underflow the fresh
-    // slot's counter once those in-flight calls finish (see
-    // `ActorMsg::ChatDone`'s `saturating_sub`, the other half of this
-    // safety net). Blocking such a reload until drained is a further
-    // improvement left for later — not required to avoid the underflow.
-    let inflight = models.get(&id).map_or(0, |s| s.inflight);
-    // Captured *before* the `models.insert` below overwrites the slot: if
-    // this is a reload of a model that's already `Ready`, its old
-    // policy/memory_gb must survive a failed reload attempt (Medium,
-    // follow-up Opus review) — see `LoadFailureOutcome::RestorePreviousReady`.
-    // `None` for a fresh id or one that wasn't `Ready` (Error/Stopped/
-    // Stopping): those cases keep H1's original "no real allocation on
-    // failure" reasoning.
-    let was_ready = models
+    // Capture every budget-occupying state before overwriting the slot:
+    // an Error retry is not a fresh load (K10/H2).
+    let previous = models
         .get(&id)
-        .filter(|slot| slot.state == ModelState::Ready)
-        .map(|slot| (slot.policy, slot.memory_gb));
+        .filter(|slot| occupies_budget(slot.state))
+        .map(|slot| PreviousModel {
+            state: slot.state,
+            policy: slot.policy,
+            memory_gb: slot.memory_gb,
+        });
     models.insert(
         id.clone(),
         ModelSlot {
@@ -899,7 +899,7 @@ fn handle_load(
             state: ModelState::Launching,
             last_used_seq,
             policy,
-            inflight,
+            inflight: 0,
         },
     );
     *active_op = Some(ActiveOp {
@@ -910,7 +910,7 @@ fn handle_load(
             waiters: vec![reply],
         },
     });
-    start_load(id, policy, evict, was_ready, models, env);
+    start_load(id, policy, evict, previous, models, env);
 }
 
 /// The pure-IO side of a standalone `unload`. Unlike an eviction's own
@@ -1237,12 +1237,21 @@ async fn run_actor(
                                     violation = Some(e);
                                 }
                             }
-                            LoadFailureOutcome::RestorePreviousReady { policy, memory_gb } => {
+                            LoadFailureOutcome::RestorePrevious(mut previous)
+                            | LoadFailureOutcome::RetainPreviousOnError(mut previous) => {
                                 match models.get_mut(&id) {
                                     Some(slot) => {
-                                        slot.state = ModelState::Ready;
-                                        slot.policy = policy;
-                                        slot.memory_gb = memory_gb;
+                                        if matches!(
+                                            failure_outcome,
+                                            LoadFailureOutcome::RetainPreviousOnError(_)
+                                        ) {
+                                            previous.state = ModelState::Error;
+                                            previous.memory_gb =
+                                                slot.memory_gb.max(previous.memory_gb);
+                                        }
+                                        slot.state = previous.state;
+                                        slot.policy = previous.policy;
+                                        slot.memory_gb = previous.memory_gb;
                                     }
                                     None => {
                                         violation =
@@ -2408,6 +2417,83 @@ mod tests {
         );
     }
 
+    /// K10/H2: a rejected retry must preserve an Error model's old footprint
+    /// and keep a later unload from short-circuiting while it is still resident.
+    #[tokio::test]
+    async fn error_retry_rejection_preserves_old_occupancy_and_real_unload() {
+        for recover_via_load in [false, true] {
+            let adapter = Arc::new(MockAdapter::new(vec![
+                ModelInfo {
+                    id: "a".to_string(),
+                    memory_gb: 8.0,
+                },
+                ModelInfo {
+                    id: "b".to_string(),
+                    memory_gb: 20.0,
+                },
+            ]));
+            let handle = Supervisor::spawn(adapter.clone(), SupervisorConfig::default()).unwrap();
+            no_hang(handle.load("a", 8.0, resident_policy()))
+                .await
+                .unwrap();
+            adapter.set_unload_script("a", vec![crate::mock::UnloadOutcome::Fail]);
+            no_hang(handle.unload("a")).await.unwrap_err();
+            assert_eq!(handle.status().await.unwrap().used_gb, 8.0);
+            adapter.set_load_script("a", vec![crate::mock::LoadOutcome::Fail]);
+            no_hang(handle.load("a", 1.0, on_demand_policy()))
+                .await
+                .unwrap_err();
+            assert_eq!(adapter.status().await.unwrap().used_gb, 8.0);
+            assert_eq!(handle.status().await.unwrap().used_gb, 8.0);
+            let err = no_hang(handle.chat(
+                ChatRequest {
+                    model: "a".to_string(),
+                    messages: vec![],
+                },
+                CancellationToken::new(),
+            ))
+            .await
+            .unwrap_err();
+            assert_eq!(err.reason_code(), "model_unavailable");
+            assert_eq!(adapter.load_call_count("a"), 2);
+            let err = no_hang(handle.load("b", 20.0, on_demand_policy()))
+                .await
+                .unwrap_err();
+            assert_eq!(err.reason_code(), "eviction_impossible");
+            assert_eq!(adapter.load_call_count("b"), 0);
+            assert_eq!(adapter.unload_call_count("a"), 1);
+            if recover_via_load {
+                adapter.set_load_script("a", vec![crate::mock::LoadOutcome::Ok]);
+                no_hang(handle.load("a", 4.0, on_demand_policy()))
+                    .await
+                    .unwrap();
+                let status = handle.status().await.unwrap();
+                assert_eq!(status.used_gb, 4.0);
+                assert_eq!(status.loaded, vec!["a".to_string()]);
+            }
+            no_hang(handle.unload("a")).await.unwrap();
+            assert_eq!(adapter.unload_call_count("a"), 2);
+            assert_eq!(adapter.status().await.unwrap().used_gb, 0.0);
+            assert_eq!(handle.status().await.unwrap().used_gb, 0.0);
+        }
+    }
+
+    /// K10/H2: a panic during an Error retry also leaves release uncertain.
+    #[tokio::test]
+    async fn error_retry_panic_preserves_old_occupancy() {
+        let handle =
+            Supervisor::spawn(Arc::new(PanickingAdapter), SupervisorConfig::default()).unwrap();
+        for (memory_gb, expected) in [(8.0, 8.0), (1.0, 8.0), (16.0, 16.0)] {
+            let err = no_hang(handle.load("a", memory_gb, on_demand_policy()))
+                .await
+                .unwrap_err();
+            assert_eq!(err.reason_code(), "adapter_panicked");
+            assert_eq!(handle.status().await.unwrap().used_gb, expected);
+        }
+        no_hang(handle.unload("a")).await.unwrap();
+        assert_eq!(handle.status().await.unwrap().used_gb, 0.0);
+    }
+
     /// Medium (follow-up Opus review, prdaemon probe): a reload of an
     /// already-`Ready` model with a *different* policy that then fails
     /// must restore the old `Ready` state (policy + memory_gb), not settle
@@ -2609,6 +2695,20 @@ mod tests {
         );
     }
 
+    /// K10/H2: even after load succeeds, a failed probe and failed cleanup
+    /// cannot replace the old Error footprint with a smaller retry estimate.
+    #[tokio::test]
+    async fn error_retry_probe_failure_preserves_old_occupancy() {
+        let adapter = Arc::new(ProbeAlwaysFailsAdapter { unload_ok: false });
+        let handle = Supervisor::spawn(adapter, SupervisorConfig::default()).unwrap();
+        for (memory_gb, expected) in [(8.0, 8.0), (1.0, 8.0), (16.0, 16.0)] {
+            no_hang(handle.load("a", memory_gb, on_demand_policy()))
+                .await
+                .unwrap_err();
+            assert_eq!(handle.status().await.unwrap().used_gb, expected);
+        }
+    }
+
     /// A minimal `RuntimeAdapter` whose `load` reports
     /// `BackendError::LoadUnconfirmed` — the engine accepted the load, a
     /// later step (pin / verify) failed — as a real oMLX two-step load can.
@@ -2616,6 +2716,9 @@ mod tests {
     struct LoadUnconfirmedAdapter {
         unload_ok: bool,
         unload_calls: std::sync::atomic::AtomicU32,
+        ready_once: std::sync::atomic::AtomicBool,
+        chat_entered: tokio::sync::Notify,
+        release_chat: tokio::sync::Notify,
     }
 
     impl LoadUnconfirmedAdapter {
@@ -2623,6 +2726,9 @@ mod tests {
             Self {
                 unload_ok,
                 unload_calls: std::sync::atomic::AtomicU32::new(0),
+                ready_once: std::sync::atomic::AtomicBool::new(false),
+                chat_entered: tokio::sync::Notify::new(),
+                release_chat: tokio::sync::Notify::new(),
             }
         }
     }
@@ -2633,6 +2739,12 @@ mod tests {
             Ok(catalog())
         }
         async fn load(&self, id: &str, _policy: Option<&LoadPolicy>) -> Result<(), BackendError> {
+            if self
+                .ready_once
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Ok(());
+            }
             Err(BackendError::load_unconfirmed(
                 id,
                 "status check after POST load failed (test double)",
@@ -2665,11 +2777,56 @@ mod tests {
             req: ChatRequest,
             _cancel: CancellationToken,
         ) -> Result<ChatResponse, BackendError> {
+            self.chat_entered.notify_one();
+            self.release_chat.notified().await;
             Ok(ChatResponse {
                 model: req.model,
                 content: String::new(),
             })
         }
+    }
+
+    #[tokio::test]
+    async fn ready_reload_cannot_release_a_model_with_inflight_chat() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let adapter = Arc::new(LoadUnconfirmedAdapter::new(true));
+        adapter.ready_once.store(true, SeqCst);
+        let handle = Supervisor::spawn(adapter.clone(), SupervisorConfig::default()).unwrap();
+        no_hang(handle.load("a", 8.0, on_demand_policy()))
+            .await
+            .unwrap();
+        let h = handle.clone();
+        let chat = tokio::spawn(async move {
+            h.chat(
+                ChatRequest {
+                    model: "a".into(),
+                    messages: vec![],
+                },
+                CancellationToken::new(),
+            )
+            .await
+        });
+        no_hang(adapter.chat_entered.notified()).await;
+        no_hang(handle.load("a", 8.0, on_demand_policy()))
+            .await
+            .unwrap();
+        let err = no_hang(handle.load("a", 1.0, resident_policy()))
+            .await
+            .unwrap_err();
+        assert_eq!(adapter.unload_calls.load(SeqCst), 0);
+        assert_eq!(err.reason_code(), "supervisor_busy");
+        assert!(!chat.is_finished());
+        let status = handle.status().await.unwrap();
+        assert_eq!(status.used_gb, 8.0);
+        assert_eq!(status.loaded, vec!["a"]);
+        adapter.release_chat.notify_one();
+        no_hang(chat).await.unwrap().unwrap();
+        let err = no_hang(handle.load("a", 1.0, resident_policy()))
+            .await
+            .unwrap_err();
+        assert_eq!(err.reason_code(), "load_unconfirmed");
+        assert_eq!(adapter.unload_calls.load(SeqCst), 1);
+        assert_eq!(handle.status().await.unwrap().used_gb, 0.0);
     }
 
     /// prdaemon #48 round 2, M1: a load the engine accepted but whose
