@@ -2,9 +2,8 @@
 # scripts/conformance-rust.sh — 用 Rust `idoris` 二进制作被测对象跑 conformance 套件。
 #
 # 前提：
-#   `conformance/` 目录 + 根 package.json 的 `pnpm conformance` 脚本目前都在
-#   origin/feat/r0-conformance（PR #49），还没合并进本分支/main。本脚本假定
-#   那条分支已经合并进来（或已经 cherry-pick 过），否则第一步就会报错退出。
+#   `conformance/` 目录 + 根 package.json 的 `pnpm conformance` 脚本来自
+#   PR #49（2026-10-01 已合并进 main）。当前分支要包含它们，否则第一步就会报错退出。
 #
 # 用法：
 #   bash scripts/conformance-rust.sh
@@ -21,8 +20,7 @@ cd "$root"
 
 if [ ! -d conformance ]; then
   echo "[conformance-rust] 找不到 conformance/ 目录。" >&2
-  echo "[conformance-rust] 这个套件目前在 origin/feat/r0-conformance 分支，还没合并进本分支/main。" >&2
-  echo "[conformance-rust] 先合并/cherry-pick 那条分支的 conformance/ 目录，再重跑本脚本。" >&2
+  echo "[conformance-rust] 当前分支缺少 conformance/（PR #49 已于 2026-10-01 合并进 main），先同步 main。" >&2
   exit 1
 fi
 
