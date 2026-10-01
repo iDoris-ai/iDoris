@@ -167,6 +167,23 @@ pub enum SpendGate {
     All,
 }
 
+/// Read-only tenant budget snapshot. This is observability data, not an
+/// admission decision: it may be stale as soon as it is returned.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TenantBudgetReadView {
+    pub tenant_id: String,
+    pub period: String,
+    pub limit_minor: i64,
+    pub spent_minor: i64,
+    pub reserved_minor: i64,
+    /// Limit minus settled spend; reservations do not reduce this amount.
+    pub remaining_minor: i64,
+    /// Remaining minus active, unexpired reservations. May be negative.
+    pub available_minor: i64,
+    pub billing_timezone: String,
+    pub scope: SpendGate,
+}
+
 impl SpendGate {
     fn as_sql(self) -> &'static str {
         match self {
@@ -451,6 +468,40 @@ impl BudgetLedger {
             config.limit_minor,
             checked_add_i64(spent, reserved),
         ))
+    }
+
+    /// Return a consistent, read-only snapshot of a tenant's current-period
+    /// budget. This snapshot is not an admission decision and may become
+    /// stale immediately; use `reserve` to decide whether spending can proceed.
+    pub fn tenant_readview(&self, tenant_id: &str) -> Result<TenantBudgetReadView, BudgetError> {
+        if tenant_id.trim().is_empty() {
+            return Err(BudgetError::InvalidScope { field: "tenant_id" });
+        }
+        let now_ms = self.clock.now_ms();
+        let mut conn = self.lock();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        let config = load_tenant_config(&tx, tenant_id)?.ok_or_else(|| {
+            BudgetError::TenantNotConfigured {
+                tenant_id: tenant_id.to_string(),
+            }
+        })?;
+        let period = billing_period_key(now_ms, &config.billing_timezone)?;
+        let spent = tenant_spent_for(&tx, tenant_id, &period)?;
+        let reserved = tenant_active_reserved_for(&tx, tenant_id, &period, now_ms)?;
+        tx.rollback()?;
+        let remaining = checked_sub_i64(config.limit_minor, spent);
+        let available = checked_sub_i64(remaining, reserved);
+        Ok(TenantBudgetReadView {
+            tenant_id: tenant_id.to_string(),
+            period,
+            limit_minor: config.limit_minor,
+            spent_minor: spent,
+            reserved_minor: reserved,
+            remaining_minor: remaining,
+            available_minor: available,
+            billing_timezone: config.billing_timezone,
+            scope: config.gate,
+        })
     }
 
     /// Atomically check-and-deduct: inside one `BEGIN IMMEDIATE` transaction,
