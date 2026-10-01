@@ -34,6 +34,7 @@ use super::scope::BudgetScope;
 /// risk from this existing.
 #[cfg(feature = "mutation-test-hooks")]
 pub mod test_hooks {
+    use std::cell::RefCell;
     use std::sync::{Barrier, OnceLock};
 
     /// When armed (via [`arm`]), `reserve` commits its balance-check
@@ -47,6 +48,12 @@ pub mod test_hooks {
     /// all committed their checks).
     static BARRIER: OnceLock<Barrier> = OnceLock::new();
 
+    // Thread-local scheduling keeps unrelated tests in this process isolated;
+    // the callback only schedules an interleaving and does not split a transaction.
+    thread_local! {
+        static READVIEW_AFTER_SPENT: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+    }
+
     /// Arm the hook for `thread_count` participants. Call once before
     /// spawning the threads that will call `reserve`; each of them must
     /// actually call `reserve` exactly once for the barrier to release.
@@ -59,6 +66,22 @@ pub mod test_hooks {
     /// `None` when not armed — `reserve` skips the hook entirely.
     pub(super) fn barrier() -> Option<&'static Barrier> {
         BARRIER.get()
+    }
+
+    /// Arm a one-shot callback after `tenant_readview` reads settled spend.
+    pub fn arm_readview_after_spent(hook: impl FnOnce() + 'static) {
+        READVIEW_AFTER_SPENT.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            assert!(slot.is_none(), "readview hook already armed on this thread");
+            *slot = Some(Box::new(hook));
+        });
+    }
+
+    pub(super) fn after_readview_spent() {
+        let hook = READVIEW_AFTER_SPENT.with(|slot| slot.borrow_mut().take());
+        if let Some(hook) = hook {
+            hook();
+        }
     }
 }
 
@@ -487,6 +510,8 @@ impl BudgetLedger {
         })?;
         let period = billing_period_key(now_ms, &config.billing_timezone)?;
         let spent = tenant_spent_for(&tx, tenant_id, &period)?;
+        #[cfg(feature = "mutation-test-hooks")]
+        test_hooks::after_readview_spent();
         let reserved = tenant_active_reserved_for(&tx, tenant_id, &period, now_ms)?;
         tx.rollback()?;
         let remaining = checked_sub_i64(config.limit_minor, spent);

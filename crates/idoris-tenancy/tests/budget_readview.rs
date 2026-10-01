@@ -147,3 +147,55 @@ fn unavailable_storage_returns_an_error_instead_of_a_zero_view() {
         Err(BudgetError::Storage(_))
     ));
 }
+
+#[cfg(feature = "mutation-test-hooks")]
+#[test]
+fn readview_keeps_spent_and_reserved_from_one_snapshot() {
+    use idoris_tenancy::budget::test_hooks::arm_readview_after_spent;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let (path, ledger) = setup("snapshot-race");
+    let scope = BudgetScope::new("acme", "key", "openai", "model");
+    ledger
+        .configure(&scope, 1_000, "UTC")
+        .expect("scope config");
+    ledger
+        .configure_tenant("acme", 1_000, "UTC", SpendGate::All)
+        .expect("tenant config");
+    let id = ledger.reserve(&scope, Price::Known(300)).expect("reserve");
+    let old = ledger.tenant_readview("acme").expect("old view");
+    assert_eq!(old.available_minor, 700);
+
+    let clock = Arc::new(FakeClock(AtomicI64::new(1_788_199_200_000)));
+    let writer = BudgetLedger::open_with(&path, clock, 60_000).expect("open writer ledger");
+    let (start_tx, start_rx) = mpsc::channel();
+    let (ack_tx, ack_rx) = mpsc::channel();
+    // WAL lets the reader retain its snapshot; the channels place settlement between both reads.
+    let writer_thread = std::thread::spawn(move || {
+        start_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("reader did not reach the spent/reserved boundary");
+        writer
+            .settle("acme", &id, 300)
+            .expect("settle on writer connection");
+        ack_tx.send(()).expect("reader hook is still waiting");
+    });
+
+    arm_readview_after_spent(move || {
+        start_tx.send(()).expect("writer is still waiting");
+        ack_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("writer did not finish settlement");
+    });
+    let during = ledger.tenant_readview("acme").expect("read during settle");
+    writer_thread.join().expect("writer thread");
+    assert_eq!(during, old);
+    assert_eq!(during.available_minor, 700);
+
+    let settled = ledger.tenant_readview("acme").expect("settled view");
+    assert_eq!(settled.spent_minor, 300);
+    assert_eq!(settled.reserved_minor, 0);
+    assert_eq!(settled.remaining_minor, 700);
+    assert_eq!(settled.available_minor, 700);
+}
