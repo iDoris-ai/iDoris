@@ -326,8 +326,20 @@ async function handleChat(
   meta.providerId = target.card.provider.id;
   meta.servedLocality = servedLocality;
 
+  // §3.11 取消传播：必须监听 res（响应对象/底层 socket）的 close，不能监听 req。
+  // req 的可读流在 readBody() 把请求体完整读完之后，会因为 Node 可读流默认的
+  // autoDestroy 自己很快触发一次 'close'——这跟客户端有没有真的断开连接毫无
+  // 关系。到这行代码执行、挂上监听器的时候，那次"自然 close"通常已经发生过了
+  // （req.destroyed/req.complete 在这里已经是 true/true），监听器补挂上去也
+  // 不会再收到一次，于是真实客户端断开时 controller.abort() 基本不会被调用，
+  // 取消实际上不会传播给上游。res 不一样：只要还没写完响应（!res.writableEnded），
+  // res 的 'close' 只会在底层连接被提前关闭（客户端主动取消）时触发——这正是
+  // R0 conformance 套件（conformance/tests/upstream-behavior.test.ts）用变异测试
+  // 抓出来的真实 bug，见 packages/router/tests/cancel-propagation.test.ts。
   const controller = new AbortController();
-  req.on("close", () => controller.abort());
+  res.on("close", () => {
+    if (!res.writableEnded) controller.abort();
+  });
 
   // spawn_cli 型（订阅中转）：直接调后端进程，不经过 HTTP 转发。
   if (target.card.form === "spawn_cli") {
