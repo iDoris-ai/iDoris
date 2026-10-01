@@ -10,9 +10,8 @@
 //! of letting each adapter reimplement its own admission heuristic (LM
 //! Studio #2051).
 //!
-//! This crate does **not** ship an oMLX adapter yet (planned for the next
-//! wave) — only [`crate::mock::MockAdapter`], a test double. Known oMLX
-//! 0.6.4 quirks a future adapter must account for (see PR #44/#45,
+//! The oMLX implementation lives in `idoris-upstream`; this crate supplies
+//! [`crate::mock::MockAdapter`] for tests. oMLX 0.6.4 details (see PR #44/#45,
 //! `packages/adapters/omlx/omlx-backend.ts`, `spike/u0/U0-LOG.md`):
 //! - `GET /api/status`'s loaded-model list field is `loaded_models`, not
 //!   `loaded` (0.4.3's assumed name) — a real `status()` impl must read the
@@ -20,8 +19,12 @@
 //! - Pinning (`resident` keepalive) needs `PUT
 //!   /admin/api/models/{id}/settings`, and as of 0.6.4 that endpoint demands
 //!   a *separate admin session* — the plain inference API key gets a bare
-//!   401. Pin support is therefore a known gap, not something a `load()`
-//!   impl can silently paper over.
+//!   401. `idoris-upstream` logs in with the main API key, caches the admin
+//!   cookie and reauthenticates once on 401, then verifies the pin via
+//!   `/v1/models/status`. Sub keys cannot establish an admin session.
+//! - Pressure prefers `/admin/api/activity`'s `active_models.memory_pressure`;
+//!   disabled enforcement means `Ok`, unknown tiers mean `Unknown`. If admin
+//!   access fails, the legacy `/api/status` pressure behavior is preserved.
 //! - `mlx_lm.server` (and therefore oMLX) exposes **no `/health` endpoint**.
 //!   [`RuntimeAdapter::probe_ready`] exists specifically so the Supervisor
 //!   never has to know that — a real adapter's `probe_ready` must poll an

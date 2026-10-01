@@ -2,8 +2,9 @@
 //! omlx-backend.ts` on `main` (FU-16) behavior, ported onto
 //! `idoris_backend::RuntimeAdapter`. Talks to `http://127.0.0.1:8088` by
 //! default. Split across submodules that landed across several PRs on this
-//! stack: [`http`] (GET/POST/PUT + timeout + safe errors), [`status`]
-//! (`list`/`status` parsing), [`pin`] (resident/admin-session gap), and
+//! stack: [`http`] (GET/POST + timeout + safe errors), [`status`]
+//! (`list`/`status` parsing), [`pin`] (pin verification), [`admin`]
+//! (cached admin session), and
 //! [`OmlxAdapter`], which wires all of it into a full
 //! [`idoris_backend::RuntimeAdapter`] impl (this PR) — `OmlxAdapter`'s own
 //! inherent methods (used directly by this module's tests throughout the
@@ -14,6 +15,9 @@
 //! **The API key is read from an env var and never logged** — see
 //! [`OMLX_API_KEY_ENV`] and `http`'s module doc.
 
+mod admin;
+#[cfg(test)]
+mod admin_tests;
 mod http;
 mod pin;
 mod status;
@@ -68,11 +72,21 @@ pub(crate) fn upstream_error(message: impl Into<String>) -> BackendError {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct OmlxAdapterConfig {
     pub base_url: String,
     pub api_key: Option<String>,
     pub call_timeout: Duration,
+}
+
+impl std::fmt::Debug for OmlxAdapterConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OmlxAdapterConfig")
+            .field("base_url", &self.base_url)
+            .field("api_key", &self.api_key.as_ref().map(|_| "[REDACTED]"))
+            .field("call_timeout", &self.call_timeout)
+            .finish()
+    }
 }
 
 impl Default for OmlxAdapterConfig {
@@ -94,11 +108,13 @@ pub struct OmlxAdapter {
     api_key: Option<String>,
     call_timeout: Duration,
     client: reqwest::Client,
+    admin_session: tokio::sync::Mutex<Option<reqwest::header::HeaderValue>>,
 }
 
 impl OmlxAdapter {
     pub fn new(config: OmlxAdapterConfig) -> Result<Self, BackendError> {
         let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|_| BackendError::internal("failed to build the oMLX HTTP client"))?;
         Ok(Self {
@@ -106,6 +122,7 @@ impl OmlxAdapter {
             api_key: config.api_key,
             call_timeout: config.call_timeout,
             client,
+            admin_session: tokio::sync::Mutex::new(None),
         })
     }
 
@@ -138,18 +155,6 @@ impl OmlxAdapter {
         .await
     }
 
-    async fn put(&self, path: &str, body: &serde_json::Value) -> Result<(), BackendError> {
-        http::put_json(
-            &self.client,
-            &self.base_url,
-            path,
-            self.api_key(),
-            self.call_timeout,
-            body,
-        )
-        .await
-    }
-
     async fn post_parse(
         &self,
         path: &str,
@@ -176,10 +181,18 @@ impl OmlxAdapter {
         Ok(status::parse_list(&self.get("/v1/models").await?))
     }
 
-    /// `GET /api/status` — engine-wide memory/pressure signal and the
-    /// currently-loaded model list (see `status::parse_status`'s doc).
+    /// Memory/loaded models from `/api/status`; pressure prefers admin
+    /// activity. Missing main key, login rejection or activity failure
+    /// preserves the legacy pressure (missing/invalid → `Unknown`).
     pub async fn status(&self) -> Result<BackendStatus, BackendError> {
-        status::parse_status(&self.get("/api/status").await?)
+        let mut result = status::parse_status(&self.get("/api/status").await?)?;
+        if let Ok(activity) = self
+            .admin_request(reqwest::Method::GET, "/admin/api/activity", None)
+            .await
+        {
+            result.pressure = status::parse_activity_pressure(&activity);
+        }
+        Ok(result)
     }
 
     /// `POST /v1/models/{id}/load`, then confirm the resulting pin state
@@ -213,20 +226,18 @@ impl OmlxAdapter {
     }
 
     /// `resident` path: `PUT /admin/api/models/{id}/settings` then confirm
-    /// via [`Self::verify_model_state`]. On 0.6.4 the PUT itself always
-    /// fails (401, no admin session) — see the crate module doc — so this
-    /// reports a confirmed pin failure (model loaded, running unpinned)
-    /// rather than silently treating the load as fully successful.
+    /// via [`Self::verify_model_state`]. Uses a lazy admin session; only
+    /// the main API key can log in (sub keys cannot).
     async fn pin(&self, id: &str) -> Result<(), BackendError> {
         let path = self.encoded_path("/admin/api/models/", id, "/settings");
         let body = serde_json::json!({ "is_pinned": true });
-        self.put(&path, &body).await.map_err(|err| {
-            upstream_error(format!(
-                "oMLX pin unavailable for {id}: {err} (0.6.4 requires an admin \
-                     session the inference API key can't provide; model is loaded \
-                     but running unpinned)"
-            ))
-        })?;
+        self.admin_request(reqwest::Method::PUT, &path, Some(&body))
+            .await
+            .map_err(|err| {
+                upstream_error(format!(
+                    "oMLX pin unavailable for {id}: {err} (model is loaded; pin state unconfirmed)"
+                ))
+            })?;
         // A 2xx from PUT doesn't itself confirm the pin took effect —
         // re-check via the read-only status endpoint. A failure at *this*
         // step is a different, weaker claim than the one above: we don't
@@ -492,6 +503,17 @@ mod tests {
         server: &MockServer,
         routes: Vec<(&'static str, &'static str, ResponseTemplate)>,
     ) {
+        if routes.iter().any(|(m, _, _)| *m == "PUT") {
+            Mock::given(method("POST"))
+                .and(path("/admin/api/login"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("set-cookie", "omlx_admin_session=test-session; HttpOnly")
+                        .set_body_json(serde_json::json!({"success": true})),
+                )
+                .mount(server)
+                .await;
+        }
         for (m, p, resp) in routes {
             Mock::given(method(m))
                 .and(path(p))
@@ -540,15 +562,13 @@ mod tests {
 
     #[tokio::test]
     async fn load_resident_fails_when_admin_session_is_rejected() {
-        // The realistic 0.6.4 outcome: PUT .../settings 401s (no admin
-        // session) — the model is loaded but pinning is confirmed to have
-        // failed, not silently treated as a full success.
+        // A sub key cannot establish the required admin session.
         let server = MockServer::start().await;
         mount_all(
             &server,
             vec![
                 (LOAD_METHOD, LOAD_PATH, ResponseTemplate::new(200)),
-                ("PUT", SETTINGS_PATH, ResponseTemplate::new(401)),
+                ("POST", "/admin/api/login", ResponseTemplate::new(401)),
             ],
         )
         .await;
