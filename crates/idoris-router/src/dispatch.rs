@@ -7,7 +7,9 @@
 //! that calls `dispatch_local`, not here (this module has no axum/HTTP
 //! dependency on purpose, so it's testable without spinning up the app).
 
-use idoris_backend::{BackendError, ChatMessage, ChatRequest, ChatResponse, SupervisorHandle};
+use idoris_backend::{
+    BackendError, ChatCallOutcome, ChatMessage, ChatRequest, ChatResponse, SupervisorHandle,
+};
 use idoris_contracts::ComponentCard;
 use idoris_contracts::load_policy::{Admission, Keepalive, LoadMode, LoadPolicy};
 use idoris_contracts::provider::Locality;
@@ -203,8 +205,8 @@ impl Drop for ReservationGuard<'_> {
 
 /// Owns a submitted dispatch while its result is being observed. Dropping
 /// this guard retires only this process's live lease; the durable hold and
-/// intent remain for recovery because a chat error does not prove that the
-/// upstream did no work.
+/// intent remain for recovery unless the Supervisor explicitly confirms
+/// that the adapter was never called.
 struct SubmittedDispatchGuard {
     ledger: Arc<BudgetLedger>,
     tenant_id: String,
@@ -389,9 +391,9 @@ pub async fn dispatch_local(
         });
     }
 
-    // From this point onward an error or caller cancellation cannot prove
-    // that the upstream did not execute. Move both result observation and
-    // settlement to a task independent of this request future.
+    // The request future no longer owns the reservation once submitted. Move
+    // result observation and settlement to an independent task; only an
+    // explicit NotSubmitted outcome can safely release the hold.
     let reservation = reservation_guard.take();
     let (reply, result_rx) = tokio::sync::oneshot::channel();
     let worker_supervisor = supervisor.clone();
@@ -408,8 +410,8 @@ pub async fn dispatch_local(
     };
     tokio::spawn(async move {
         let submitted = submitted_guard;
-        let chat_result = worker_supervisor
-            .chat(
+        let chat_call = worker_supervisor
+            .chat_with_outcome(
                 ChatRequest {
                     model: model_id,
                     messages,
@@ -417,6 +419,25 @@ pub async fn dispatch_local(
                 worker_cancel,
             )
             .await;
+        let chat_result = match chat_call {
+            ChatCallOutcome::NotSubmitted(error) => {
+                if let Some(submitted) = &submitted
+                    && let Err(release_error) = budget::release(
+                        &submitted.ledger,
+                        Some(&submitted.tenant_id),
+                        &submitted.id,
+                    )
+                {
+                    eprintln!(
+                        "budget non-submitted dispatch release deferred: reservation={} error={release_error}",
+                        submitted.id.0
+                    );
+                }
+                let _ = reply.send((Err(DispatchFailure::Backend(error)), None));
+                return;
+            }
+            ChatCallOutcome::Submitted(result) => result,
+        };
         let actual_cost_minor = match (&submitted, &chat_result) {
             (Some(submitted), Ok(response)) => {
                 let actual = budget::estimate_actual_cost_minor(
@@ -485,7 +506,7 @@ mod tests {
     use idoris_contracts::component_card::{Egress, Form};
     use idoris_contracts::provider::{Cost, Family, ProviderDescriptor};
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicI64, Ordering};
+    use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
     use tokio::sync::Notify;
 
     use super::*;
@@ -620,6 +641,10 @@ mod tests {
         (dir, ledger)
     }
 
+    fn query_count(connection: &rusqlite::Connection, sql: &str) -> i64 {
+        connection.query_row(sql, [], |row| row.get(0)).unwrap()
+    }
+
     struct SignaledAdapter {
         started: Notify,
         finished: Notify,
@@ -671,6 +696,64 @@ mod tests {
             };
             self.finished.notify_one();
             result
+        }
+    }
+
+    struct BusyOrGatedAdapter {
+        inner: MockAdapter,
+        calls: AtomicUsize,
+        started: Notify,
+        gate: Notify,
+        busy: bool,
+    }
+
+    fn busy_adapter(busy: bool) -> Arc<BusyOrGatedAdapter> {
+        Arc::new(BusyOrGatedAdapter {
+            inner: MockAdapter::new(vec![ModelInfo {
+                id: "p".to_string(),
+                memory_gb: 1.0,
+            }]),
+            calls: AtomicUsize::new(0),
+            started: Notify::new(),
+            gate: Notify::new(),
+            busy,
+        })
+    }
+
+    #[async_trait::async_trait]
+    impl RuntimeAdapter for BusyOrGatedAdapter {
+        async fn list(&self) -> Result<Vec<ModelInfo>, BackendError> {
+            self.inner.list().await
+        }
+        async fn load(&self, id: &str, policy: Option<&LoadPolicy>) -> Result<(), BackendError> {
+            self.inner.load(id, policy).await
+        }
+        async fn unload(&self, id: &str) -> Result<(), BackendError> {
+            self.inner.unload(id).await
+        }
+        async fn status(&self) -> Result<BackendStatus, BackendError> {
+            self.inner.status().await
+        }
+        async fn probe_ready(&self, id: &str) -> Result<bool, BackendError> {
+            self.inner.probe_ready(id).await
+        }
+        async fn chat(
+            &self,
+            req: ChatRequest,
+            _cancel: CancellationToken,
+        ) -> Result<ChatResponse, BackendError> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            self.started.notify_one();
+            if self.busy {
+                return Err(BackendError::busy("adapter busy", None, None));
+            }
+            if call == 0 {
+                self.gate.notified().await;
+            }
+            Ok(ChatResponse {
+                model: req.model,
+                content: "a completed response".to_string(),
+            })
         }
     }
 
@@ -832,6 +915,147 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn slot_busy_releases_second_hold_and_same_tenant_can_retry() {
+        let (dir, ledger) = configured_ledger(1_000_000);
+        let adapter = busy_adapter(false);
+        let supervisor = Supervisor::spawn(
+            adapter.clone(),
+            SupervisorConfig {
+                max_concurrent_adapter_calls: 1,
+                ..SupervisorConfig::default()
+            },
+        )
+        .unwrap();
+        let cards = [paid_card("p")];
+        let profile = empty_profile();
+        let dispatch = || {
+            dispatch_local(
+                &cards,
+                Some(&supervisor),
+                Some(&ledger),
+                &profile,
+                "hi",
+                vec![ChatMessage {
+                    role: "user".into(),
+                    content: "hi".into(),
+                }],
+                CancellationToken::new(),
+            )
+        };
+        let mut first = Box::pin(dispatch());
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            tokio::select! {
+                biased;
+                result = &mut first => panic!("first request completed before adapter gate: {result:?}"),
+                _ = adapter.started.notified() => (),
+            }
+        })
+        .await
+        .unwrap();
+
+        let second = dispatch().await.unwrap();
+        assert!(matches!(
+            second.result,
+            Err(DispatchFailure::Backend(BackendError::Busy { .. }))
+        ));
+        assert_eq!(adapter.calls.load(Ordering::SeqCst), 1);
+        let connection = rusqlite::Connection::open(dir.path().join("b.sqlite3")).unwrap();
+        assert_eq!(
+            query_count(
+                &connection,
+                "SELECT count(*) FROM reservations WHERE status='released'"
+            ),
+            1,
+            "the rejected second request's reservation should be released"
+        );
+        assert_eq!(
+            query_count(
+                &connection,
+                "SELECT count(*) FROM reservations WHERE status='active' AND dispatch_hold=1"
+            ),
+            1,
+            "only the blocked first request should retain a hold"
+        );
+
+        adapter.gate.notify_one();
+        let first_outcome = first.await.unwrap();
+        assert!(first_outcome.result.is_ok());
+        let third = dispatch().await.unwrap();
+        assert!(third.result.is_ok());
+        assert_eq!(adapter.calls.load(Ordering::SeqCst), 2);
+        let cost = budget::estimate_actual_cost_minor(
+            &cards[0].provider.cost,
+            "hi",
+            "a completed response",
+            0,
+        );
+        assert_eq!(
+            ledger.tenant_balance(budget::PERSONAL_TENANT_ID).unwrap(),
+            1_000_000 - cost * 2
+        );
+        assert_eq!(
+            query_count(
+                &connection,
+                "SELECT count(*) FROM reservations WHERE status='active' AND dispatch_hold=1"
+            ),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn adapter_busy_is_submitted_and_keeps_the_hold() {
+        let cards = [paid_card("p")];
+        let reserve = budget::estimate_cost_minor(&cards[0].provider.cost, "hi").unwrap();
+        let (dir, ledger) = configured_ledger(1_000_000);
+        let adapter = busy_adapter(true);
+        let supervisor = Supervisor::spawn(adapter.clone(), SupervisorConfig::default()).unwrap();
+        let profile = empty_profile();
+        let dispatch = || {
+            dispatch_local(
+                &cards,
+                Some(&supervisor),
+                Some(&ledger),
+                &profile,
+                "hi",
+                vec![ChatMessage {
+                    role: "user".into(),
+                    content: "hi".into(),
+                }],
+                CancellationToken::new(),
+            )
+        };
+        let outcome = dispatch().await.unwrap();
+        assert!(matches!(
+            outcome.result,
+            Err(DispatchFailure::Backend(BackendError::Busy { .. }))
+        ));
+        assert_eq!(adapter.calls.load(Ordering::SeqCst), 1);
+        let connection = rusqlite::Connection::open(dir.path().join("b.sqlite3")).unwrap();
+        assert_eq!(
+            query_count(
+                &connection,
+                "SELECT count(*) FROM reservations WHERE status='active' AND dispatch_hold=1"
+            ),
+            1,
+            "adapter Busy is an unknown result after submission"
+        );
+        assert_eq!(
+            ledger.tenant_balance(budget::PERSONAL_TENANT_ID).unwrap(),
+            1_000_000 - reserve
+        );
+        let blocked = dispatch().await.unwrap();
+        assert!(
+            matches!(
+                &blocked.result,
+                Err(DispatchFailure::Budget(BudgetError::Storage(_)))
+            ),
+            "the unresolved adapter call must block another paid dispatch: {:?}",
+            blocked.result
+        );
+        assert_eq!(adapter.calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

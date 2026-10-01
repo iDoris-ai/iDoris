@@ -34,6 +34,14 @@ use crate::types::{BackendStatus, ChatRequest, ChatResponse, ModelInfo, Pressure
 
 type LoadReply = oneshot::Sender<Result<(), BackendError>>;
 
+/// Whether a chat command reached the adapter. Adapter errors have an
+/// unknown execution outcome; command rejections are known not to have run.
+#[derive(Debug)]
+pub enum ChatCallOutcome {
+    NotSubmitted(BackendError),
+    Submitted(Result<ChatResponse, BackendError>),
+}
+
 /// Tunables for the load/probe loops. `budget_gb` is the global memory
 /// ledger's ceiling (§4: "全局内存账本：budget_gb 由配置给定").
 #[derive(Debug, Clone)]
@@ -102,7 +110,7 @@ enum Command {
     Chat {
         req: ChatRequest,
         cancel: CancellationToken,
-        reply: oneshot::Sender<Result<ChatResponse, BackendError>>,
+        reply: oneshot::Sender<ChatCallOutcome>,
     },
     Load {
         id: String,
@@ -231,11 +239,30 @@ impl SupervisorHandle {
         req: ChatRequest,
         cancel: CancellationToken,
     ) -> Result<ChatResponse, BackendError> {
+        match self.chat_with_outcome(req, cancel).await {
+            ChatCallOutcome::NotSubmitted(err) => Err(err),
+            ChatCallOutcome::Submitted(result) => result,
+        }
+    }
+
+    /// Calls chat and preserves whether the Supervisor actually invoked the
+    /// adapter. A closed reply channel after enqueue is treated as submitted,
+    /// since the actor may already have called upstream.
+    pub async fn chat_with_outcome(
+        &self,
+        req: ChatRequest,
+        cancel: CancellationToken,
+    ) -> ChatCallOutcome {
         let (reply, rx) = oneshot::channel();
-        self.send(ActorMsg::Cmd(Command::Chat { req, cancel, reply }))
-            .await?;
-        rx.await
-            .map_err(|_| BackendError::supervisor_unavailable())?
+        if let Err(err) = self
+            .send(ActorMsg::Cmd(Command::Chat { req, cancel, reply }))
+            .await
+        {
+            return ChatCallOutcome::NotSubmitted(err);
+        }
+        rx.await.unwrap_or_else(|_| {
+            ChatCallOutcome::Submitted(Err(BackendError::supervisor_unavailable()))
+        })
     }
 
     pub async fn load(
@@ -1048,7 +1075,9 @@ async fn run_actor(
                         let _ = reply.send(Err(BackendError::invariant_violation(msg)));
                     }
                     Command::Chat { reply, .. } => {
-                        let _ = reply.send(Err(BackendError::invariant_violation(msg)));
+                        let _ = reply.send(ChatCallOutcome::NotSubmitted(
+                            BackendError::invariant_violation(msg),
+                        ));
                     }
                     Command::Load { reply, .. } => {
                         let _ = reply.send(Err(BackendError::invariant_violation(msg)));
@@ -1104,14 +1133,18 @@ async fn run_actor(
 
             ActorMsg::Cmd(Command::Chat { req, cancel, reply }) => match models.get(&req.model) {
                 None => {
-                    let _ = reply.send(Err(BackendError::model_not_found(&req.model)));
+                    let _ = reply.send(ChatCallOutcome::NotSubmitted(
+                        BackendError::model_not_found(&req.model),
+                    ));
                 }
                 Some(slot) if slot.state != ModelState::Ready => {
-                    let _ = reply.send(Err(not_ready_error(&req.model, slot.state)));
+                    let _ = reply.send(ChatCallOutcome::NotSubmitted(not_ready_error(
+                        &req.model, slot.state,
+                    )));
                 }
                 Some(_) => {
                     let Ok(permit) = call_slots.clone().try_acquire_owned() else {
-                        let _ = reply.send(Err(BackendError::busy(
+                        let _ = reply.send(ChatCallOutcome::NotSubmitted(BackendError::busy(
                             "concurrent adapter-call limit reached",
                             None,
                             None,
@@ -1149,7 +1182,7 @@ async fn run_actor(
                                 Err(BackendError::adapter_panicked(&model, join_err.to_string()))
                             }
                         };
-                        let _ = reply.send(result);
+                        let _ = reply.send(ChatCallOutcome::Submitted(result));
                         if let Some(tx) = self_tx.upgrade() {
                             let _ = tx.send(ActorMsg::ChatDone { model }).await;
                         }
