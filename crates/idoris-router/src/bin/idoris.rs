@@ -114,6 +114,10 @@ async fn run() -> Result<(), String> {
             &component_list
         }
     );
+    let listener = idoris_router::write_timeout::WriteTimeoutListener::new(
+        listener,
+        std::time::Duration::from_secs(60),
+    );
     axum::serve(listener, app)
         .await
         .map_err(|err| format!("server error: {err}"))
