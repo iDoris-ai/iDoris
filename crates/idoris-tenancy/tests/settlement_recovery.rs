@@ -76,7 +76,9 @@ fn sidecar_retry_persists_actual_before_primary_recovers_and_survives_restart() 
     let scope = BudgetScope::new("tenant", "key", "provider", "model");
     ledger.configure(&scope, 100, "UTC").unwrap();
     let id = ledger.reserve(&scope, Price::Known(40)).unwrap();
+    let cancelled_id = ledger.reserve(&scope, Price::Known(30)).unwrap();
     ledger.begin_settlement("tenant", &id).unwrap();
+    ledger.begin_settlement("tenant", &cancelled_id).unwrap();
 
     let mut primary = Connection::open(path.as_ref()).unwrap();
     primary.busy_timeout(Duration::ZERO).unwrap();
@@ -93,12 +95,26 @@ fn sidecar_retry_persists_actual_before_primary_recovers_and_survives_restart() 
         ledger.settle_durable("tenant", &id, 25),
         Err(BudgetError::Busy)
     ));
+    assert!(matches!(
+        ledger.release("tenant", &cancelled_id),
+        Err(BudgetError::Busy)
+    ));
 
     // The original sidecar contention has cleared, while the primary writer
-    // remains blocked. The retry must commit the actual amount independently.
+    // remains blocked. A's actual amount must persist despite B's release retry.
     drop(journal_lock);
     assert!(matches!(ledger.retry_settlements(), Err(BudgetError::Busy)));
     assert_eq!(pending_actual(&path, &id.0), Some(25));
+    let pending_release: Option<String> = Connection::open(sidecar(&path))
+        .unwrap()
+        .query_row(
+            "SELECT tenant_id FROM pending_releases WHERE reservation_id=?1",
+            [&cancelled_id.0],
+            |row| row.get(0),
+        )
+        .optional()
+        .unwrap();
+    assert_eq!(pending_release.as_deref(), Some("tenant"));
 
     // Simulate process loss while the primary remains locked. Verify the
     // actual amount is durable before releasing the lock; reopening performs
@@ -119,6 +135,19 @@ fn sidecar_retry_persists_actual_before_primary_recovers_and_survives_restart() 
         )
         .unwrap();
     assert_eq!((status.as_str(), actual), ("settled", Some(25)));
+    let (cancelled_status, cancelled_actual): (String, Option<i64>) =
+        Connection::open(path.as_ref())
+            .unwrap()
+            .query_row(
+                "SELECT status, actual_cost_minor FROM reservations WHERE id=?1",
+                [&cancelled_id.0],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+    assert_eq!(
+        (cancelled_status.as_str(), cancelled_actual),
+        ("released", None)
+    );
     assert_eq!(pending_actual(&path, &id.0), None);
     let journal = Connection::open(sidecar(&path)).unwrap();
     let intents: i64 = journal
@@ -137,6 +166,21 @@ fn sidecar_retry_persists_actual_before_primary_recovers_and_survives_restart() 
         )
         .unwrap();
     assert_eq!(owners, 0);
+    for table in [
+        "settlement_intents",
+        "dispatch_owners",
+        "pending_releases",
+        "pending_settlements",
+    ] {
+        let count: i64 = journal
+            .query_row(
+                &format!("SELECT count(*) FROM {table} WHERE reservation_id=?1"),
+                [&cancelled_id.0],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0, "{table} should be cleaned for released dispatch");
+    }
     assert_eq!(recovered.balance(&scope).unwrap(), 75);
 
     let next = recovered.reserve(&scope, Price::Known(20)).unwrap();

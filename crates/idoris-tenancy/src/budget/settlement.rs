@@ -686,74 +686,85 @@ impl BudgetLedger {
     /// Retry on startup, periodically, and before admitting new spending.
     /// A journal write transaction serializes recovery across processes.
     pub fn retry_settlements(&self) -> Result<(), BudgetError> {
-        let mut releases = {
-            let journal = self.settlements.lock().unwrap_or_else(|p| p.into_inner());
-            let mut stmt =
-                journal.prepare("SELECT reservation_id, tenant_id FROM pending_releases")?;
-            stmt.query_map([], |r| {
-                Ok((ReservationId(r.get(0)?), r.get::<_, String>(1)?))
-            })?
-            .collect::<Result<Vec<_>, _>>()?
-        };
-        // An unavailable journal must not lose a known cancellation in
-        // this process; release will persist it before retrying the ledger.
-        for (id, tenant) in self
-            .release_outcomes
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .iter()
-        {
-            if !releases.iter().any(|(queued, _)| &queued.0 == id) {
-                releases.push((ReservationId(id.clone()), tenant.clone()));
-            }
-        }
-        let mut release_error = None;
-        for (id, tenant) in releases {
-            let pending_actual = {
+        let release_error = (|| {
+            let mut releases = {
                 let journal = self.settlements.lock().unwrap_or_else(|p| p.into_inner());
-                journal.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM pending_settlements WHERE reservation_id=?1)",
-                    [&id.0],
-                    |r| r.get::<_, bool>(0),
-                )?
+                let mut stmt =
+                    journal.prepare("SELECT reservation_id, tenant_id FROM pending_releases")?;
+                stmt.query_map([], |r| {
+                    Ok((ReservationId(r.get(0)?), r.get::<_, String>(1)?))
+                })?
+                .collect::<Result<Vec<_>, _>>()?
             };
-            let recorded_actual = self.conn.lock().unwrap_or_else(|p| p.into_inner()).query_row(
-                "SELECT EXISTS(SELECT 1 FROM reservations WHERE id=?1 AND tenant_id=?2 AND actual_cost_minor IS NOT NULL)",
-                params![id.0, tenant], |r| r.get::<_, bool>(0),
-            )?;
-            let known_actual = pending_actual
-                || recorded_actual
-                || self
-                    .settlement_outcomes
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .contains_key(&id.0);
-            if known_actual {
-                eprintln!(
-                    "budget release conflicts with pending settlement: reservation={}",
-                    id.0
-                );
-                let journal = self.settlements.lock().unwrap_or_else(|p| p.into_inner());
-                journal.execute(
-                    "DELETE FROM pending_releases WHERE reservation_id=?1",
-                    [&id.0],
-                )?;
-                self.release_outcomes
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .remove(&id.0);
-                continue;
+            // An unavailable journal must not lose a known cancellation in
+            // this process; release will persist it before retrying the ledger.
+            for (id, tenant) in self
+                .release_outcomes
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .iter()
+            {
+                if !releases.iter().any(|(queued, _)| &queued.0 == id) {
+                    releases.push((ReservationId(id.clone()), tenant.clone()));
+                }
             }
-            if let Err(err) = self.release(&tenant, &id) {
-                eprintln!(
-                    "budget release retry pending: reservation={} error={err}",
-                    id.0
-                );
-                release_error.get_or_insert(err);
+            let mut release_error = None;
+            for (id, tenant) in releases {
+                let result = (|| {
+                    let pending_actual = {
+                        let journal = self.settlements.lock().unwrap_or_else(|p| p.into_inner());
+                        journal.query_row(
+                            "SELECT EXISTS(SELECT 1 FROM pending_settlements WHERE reservation_id=?1)",
+                            [&id.0],
+                            |r| r.get::<_, bool>(0),
+                        )?
+                    };
+                    let recorded_actual = self.conn.lock().unwrap_or_else(|p| p.into_inner()).query_row(
+                        "SELECT EXISTS(SELECT 1 FROM reservations WHERE id=?1 AND tenant_id=?2 AND actual_cost_minor IS NOT NULL)",
+                        params![id.0, tenant], |r| r.get::<_, bool>(0),
+                    )?;
+                    let known_actual = pending_actual
+                        || recorded_actual
+                        || self
+                            .settlement_outcomes
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .contains_key(&id.0);
+                    if known_actual {
+                        eprintln!(
+                            "budget release conflicts with pending settlement: reservation={}",
+                            id.0
+                        );
+                        let journal = self.settlements.lock().unwrap_or_else(|p| p.into_inner());
+                        journal.execute(
+                            "DELETE FROM pending_releases WHERE reservation_id=?1",
+                            [&id.0],
+                        )?;
+                        self.release_outcomes
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .remove(&id.0);
+                        return Ok(());
+                    }
+                    self.release(&tenant, &id)
+                })();
+                if let Err(err) = result {
+                    eprintln!(
+                        "budget release retry pending: reservation={} error={err}",
+                        id.0
+                    );
+                    release_error.get_or_insert(err);
+                }
             }
-        }
-        if let Some(err) = release_error {
-            return Err(err);
+            if let Some(err) = release_error {
+                Err(err)
+            } else {
+                Ok(())
+            }
+        })()
+        .err();
+        if let Some(err) = &release_error {
+            eprintln!("budget release retry deferred while settlements are recovered: {err}");
         }
         let mut outcomes = self
             .settlement_outcomes
@@ -997,7 +1008,11 @@ impl BudgetLedger {
                 .remove(&id);
             let _ = fs::remove_file(self.dispatch_lock_dir.join(format!("{token}.lock")));
         }
-        Ok(())
+        if let Some(err) = release_error {
+            Err(err)
+        } else {
+            Ok(())
+        }
     }
 
     /// A durable journal entry wins over a stale in-memory or primary-ledger
