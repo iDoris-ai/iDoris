@@ -1,8 +1,9 @@
 //! See `README.md` in this directory for scope and the TS package this
 //! crate corresponds to. R1 staked out the module layout; R2-C (this and
 //! follow-up changes) fills in `budget` with a SQLite-backed, atomic
-//! reserve/settle budget ledger. `store` has an initial record-schema
-//! migration; record operations and `billing` remain future work.
+//! reserve/settle budget ledger. `billing` resolves monthly UTC ranges;
+//! `store` has an initial record-schema migration; record operations
+//! remain future work.
 
 /// Tenant-scoped record store: `TenantStore`, `TenantScopeError`
 /// (`packages/tenancy/src/store.ts`). A query without tenant context must
@@ -20,4 +21,4 @@ pub mod budget;
 /// (`packages/tenancy/src/billing.ts`, T2.6.1). Month boundaries are always
 /// resolved in the tenant's configured `billing_timezone`, never the
 /// server's local time or a caller-supplied override.
-pub mod billing {}
+pub mod billing;
