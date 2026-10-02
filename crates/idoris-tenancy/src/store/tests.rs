@@ -121,6 +121,40 @@ fn request_ids_repeat_and_primary_key_scopes_tenant_and_kind() {
 }
 
 #[test]
+fn required_record_fields_reject_null() {
+    for kind in ["usage", "audit"] {
+        for (index, field) in ["tenant_id", "kind", "record_id", "request_id", "payload"]
+            .into_iter()
+            .enumerate()
+        {
+            let mut conn = Connection::open_in_memory().unwrap();
+            initialize_record_schema(&mut conn).unwrap();
+            let mut values = [Some("t"), Some(kind), Some("r"), Some("q"), Some("{}")];
+            values[index] = None;
+            let result = insert(
+                &conn,
+                params![
+                    values[0],
+                    values[1],
+                    values[2],
+                    values[3],
+                    None::<String>,
+                    values[4]
+                ],
+            );
+            assert!(result.is_err(), "{kind}.{field} must reject NULL");
+            let error = result.unwrap_err();
+            assert_eq!(
+                error.sqlite_error().unwrap().extended_code,
+                rusqlite::ffi::SQLITE_CONSTRAINT_NOTNULL,
+                "{kind}.{field}: {error}"
+            );
+            insert(&conn, params!["t", kind, "r", "q", None::<String>, "{}"]).unwrap();
+        }
+    }
+}
+
+#[test]
 fn required_fields_kind_and_object_payload_are_constrained() {
     let mut conn = Connection::open_in_memory().unwrap();
     initialize_record_schema(&mut conn).unwrap();
