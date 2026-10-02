@@ -6,9 +6,12 @@ use std::io;
 use axum::body::Bytes;
 use futures_util::{Stream, StreamExt, stream};
 
-pub(crate) fn ensure_terminated(
-    inner: impl Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
-) -> impl Stream<Item = Result<Bytes, io::Error>> + Send {
+pub(crate) fn ensure_terminated<E>(
+    inner: impl Stream<Item = Result<Bytes, E>> + Send + 'static,
+) -> impl Stream<Item = Result<Bytes, io::Error>> + Send
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
     stream::unfold(
         (Box::pin(inner), TerminalEvent::default(), false),
         |(mut inner, mut marker, finished)| async move {
@@ -108,7 +111,7 @@ mod tests {
         ] {
             for split in 0..=body.len() {
                 let inner = stream::iter([
-                    Ok(Bytes::copy_from_slice(&body.as_bytes()[..split])),
+                    Ok::<_, reqwest::Error>(Bytes::copy_from_slice(&body.as_bytes()[..split])),
                     Ok(Bytes::copy_from_slice(&body.as_bytes()[split..])),
                 ]);
                 let guarded = ensure_terminated(inner);
