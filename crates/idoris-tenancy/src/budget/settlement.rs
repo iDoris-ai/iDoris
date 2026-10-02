@@ -1,8 +1,10 @@
 //! Independent durable outbox: a writer locking the ledger cannot block
 //! recording completed usage. Keep this sidecar with the ledger on backup.
 use std::{
+    collections::HashMap,
     fs::{self, File},
     path::{Path, PathBuf},
+    sync::Mutex,
     time::Duration,
 };
 
@@ -951,7 +953,14 @@ impl BudgetLedger {
         // Persist verified results independently of ALL primary reads, including
         // the verification of unrelated untrusted submissions. A later failure
         // must not roll this transaction back.
-        let promotion = journal.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let promotion = match journal.transaction_with_behavior(TransactionBehavior::Immediate) {
+            Ok(tx) => tx,
+            Err(error) => {
+                let sidecar_error: BudgetError = error.into();
+                fallback_verified_outcomes(&self.conn, &mut outcomes, tenant_scope);
+                return Err(sidecar_error);
+            }
+        };
         let mut deferred = Vec::new();
         for (id, (tenant, actual)) in outcomes
             .iter()
@@ -961,18 +970,32 @@ impl BudgetLedger {
                 Ok(()) | Err(PendingInsertError::Conflict) => {}
                 Err(error) => {
                     if promotion.is_autocommit() {
-                        return Err(error.into_budget_error());
+                        let sidecar_error = error.into_budget_error();
+                        drop(promotion);
+                        fallback_verified_outcomes(&self.conn, &mut outcomes, tenant_scope);
+                        return Err(sidecar_error);
                     }
                     deferred.push((id.clone(), tenant.clone(), *actual));
                 }
             }
         }
-        promotion.commit()?;
+        if let Err(error) = promotion.commit() {
+            let sidecar_error: BudgetError = error.into();
+            fallback_verified_outcomes(&self.conn, &mut outcomes, tenant_scope);
+            return Err(sidecar_error);
+        }
         // A row-specific INSERT fault must not roll back other known costs.
         // Retry these verified results against primary only after the independent
         // promotion above committed, retaining memory until a durable write.
         if !deferred.is_empty() {
-            let tx = journal.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let tx = match journal.transaction_with_behavior(TransactionBehavior::Immediate) {
+                Ok(tx) => tx,
+                Err(error) => {
+                    let sidecar_error: BudgetError = error.into();
+                    fallback_verified_outcomes(&self.conn, &mut outcomes, tenant_scope);
+                    return Err(sidecar_error);
+                }
+            };
             let mut deferred_error = None;
             for (id, tenant, actual) in deferred {
                 match self.settle_primary(&tenant, &ReservationId(id.clone()), actual) {
@@ -1338,6 +1361,34 @@ fn quarantine(
         id.0
     );
     Ok(())
+}
+
+/// Preserve every verified outcome on primary when the sidecar cannot accept
+/// a write. Successful durable fallbacks leave memory; failures remain queued.
+fn fallback_verified_outcomes(
+    primary: &Mutex<Connection>,
+    outcomes: &mut HashMap<String, (String, i64)>,
+    tenant_scope: Option<&str>,
+) {
+    outcomes.retain(|id, (tenant, actual)| {
+        if tenant_scope.is_some_and(|scope| tenant != scope) {
+            return true;
+        }
+        match store_primary_fallback(
+            &primary.lock().unwrap_or_else(|p| p.into_inner()),
+            id,
+            tenant,
+            *actual,
+        ) {
+            Ok(()) => false,
+            Err(error) => {
+                eprintln!(
+                    "budget settlement recovery remains in memory: reservation={id} fallback={error}"
+                );
+                true
+            }
+        }
+    });
 }
 
 enum PendingInsertError {
