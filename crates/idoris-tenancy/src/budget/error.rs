@@ -104,12 +104,6 @@ pub enum BudgetError {
     #[error("invalid actual_cost_minor: {actual_cost_minor} (must be >= 0)")]
     InvalidActualCost { actual_cost_minor: i64 },
 
-    #[error("settlement conflict for reservation {reservation_id}: {reason}")]
-    SettlementConflict {
-        reservation_id: String,
-        reason: String,
-    },
-
     /// `actual_cost_minor` charged in `settle` exceeded 4x the reserved
     /// amount (Opus Tier-2 acceptance M1, wired up in a follow-up PR). The
     /// charge is still recorded — this is a loud "something upstream is

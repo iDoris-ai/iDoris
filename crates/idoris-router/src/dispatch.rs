@@ -7,9 +7,7 @@
 //! that calls `dispatch_local`, not here (this module has no axum/HTTP
 //! dependency on purpose, so it's testable without spinning up the app).
 
-use idoris_backend::{
-    BackendError, ChatCallOutcome, ChatMessage, ChatRequest, ChatResponse, SupervisorHandle,
-};
+use idoris_backend::{BackendError, ChatMessage, ChatRequest, ChatResponse, SupervisorHandle};
 use idoris_contracts::ComponentCard;
 use idoris_contracts::load_policy::{Admission, Keepalive, LoadMode, LoadPolicy};
 use idoris_contracts::provider::Locality;
@@ -18,7 +16,6 @@ use idoris_policy::{
     decide, effective_served_locality,
 };
 use idoris_tenancy::budget::{BudgetError, BudgetLedger, ReservationId};
-use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 use crate::budget;
@@ -72,24 +69,15 @@ pub enum DispatchFailure {
 
 /// What [`dispatch_local`] returns on a successful `decide()`.
 /// `served_locality` is set even when `result` is `Err` (interface spec
-/// §3.12). `actual_cost_minor` is `Some` only after the ledger committed the
-/// charge. A durable retry journal or unresolved persistence error is reported
-/// through `settlement_status` while the successful response is still returned.
+/// §3.12). `actual_cost_minor` is `Some` only after a successful `settle`
+/// on a paid candidate — `None` for free/failed/settle-also-failed
+/// (best-effort; the response still succeeds either way).
 #[derive(Debug)]
 pub struct ChatOutcome {
     pub decision: Decision,
     pub served_locality: Locality,
     pub result: Result<ChatResponse, DispatchFailure>,
     pub actual_cost_minor: Option<i64>,
-    pub settlement_status: SettlementStatus,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SettlementStatus {
-    NotRequired,
-    Committed,
-    Pending,
-    PersistenceFailed,
 }
 
 #[derive(Debug)]
@@ -182,13 +170,21 @@ pub fn is_resident_http_service(card: &ComponentCard) -> bool {
             .is_some_and(|lp| lp.mode == LoadMode::Resident)
 }
 
-/// RAII guard for the not-yet-submitted reservation. Dropping it releases
-/// the hold only while chat is known not to have been submitted. Before
-/// submission, early returns and future cancellation are confirmed no-call
-/// outcomes; after submission, ownership moves to [`SubmittedDispatchGuard`]
-/// in an independent task.
+/// RAII guard: on `Drop`, releases the reservation unless [`Self::take`]
+/// already removed it. This covers two cases a scattering of explicit
+/// `release()` calls at each early-`return` site cannot: an `Err` return
+/// (the ordinary case) *and* this whole `async fn`'s future being dropped
+/// mid-`.await` — a client disconnecting mid-request, or the task being
+/// cancelled some other way. Rust's cancellation model is drop-based: no
+/// code "after" an interrupted `.await` point ever runs, but every live
+/// value's `Drop` impl still does, which is exactly what a reservation
+/// leaking real budget on a lost connection needs (R0 finding: the TS
+/// reference's `req.on("close")` cancellation listener never actually
+/// fires, since by the time it's attached the request body — and with it,
+/// that stream's own `close` — has already completed; this guard doesn't
+/// depend on any such listener at all).
 struct ReservationGuard<'a> {
-    ledger: Option<&'a Arc<BudgetLedger>>,
+    ledger: Option<&'a BudgetLedger>,
     tenant_id: Option<&'a str>,
     id: Option<ReservationId>,
 }
@@ -202,34 +198,8 @@ impl ReservationGuard<'_> {
 
 impl Drop for ReservationGuard<'_> {
     fn drop(&mut self) {
-        if let (Some(ledger), Some(id)) = (self.ledger, self.id.take())
-            && let Err(err) = budget::release(ledger, self.tenant_id, &id)
-        {
-            eprintln!(
-                "budget reservation release deferred: reservation={} error={err}",
-                id.0
-            );
-        }
-    }
-}
-
-/// Owns a submitted dispatch while its result is being observed. Dropping
-/// this guard retires only this process's live lease; the durable hold and
-/// intent remain for recovery unless the Supervisor explicitly confirms
-/// that the adapter was never called.
-struct SubmittedDispatchGuard {
-    ledger: Arc<BudgetLedger>,
-    tenant_id: String,
-    id: ReservationId,
-}
-
-impl Drop for SubmittedDispatchGuard {
-    fn drop(&mut self) {
-        if let Err(err) = self.ledger.abandon_dispatch(&self.tenant_id, &self.id) {
-            eprintln!(
-                "budget dispatch lease retirement deferred: reservation={} error={err}",
-                self.id.0
-            );
+        if let (Some(ledger), Some(id)) = (self.ledger, self.id.take()) {
+            let _ = budget::release(ledger, self.tenant_id, &id);
         }
     }
 }
@@ -255,10 +225,8 @@ impl Drop for CancelOnDrop {
 /// *paid* candidate (`budget_ledger: None` fails closed via
 /// [`DispatchFailure::Budget`] exactly as an unconfigured ledger would —
 /// free candidates are unaffected), loads the chosen model via the
-/// Supervisor if not already loaded, then calls `chat` in a task independent
-/// of the request future. That task settles the reservation on success.
-/// Failures after chat submission retain the durable hold because they do
-/// not prove the upstream did no work. `prompt` is the caller's own
+/// Supervisor if not already loaded, calls `chat`, then settles (success)
+/// or releases (failure) the reservation. `prompt` is the caller's own
 /// concatenated message text, passed in rather than recomputed here so
 /// there's one place deciding how "the prompt" is derived from `messages`.
 /// `cancel` is caller-owned (e.g. tied to the HTTP request's lifetime) --
@@ -268,7 +236,7 @@ impl Drop for CancelOnDrop {
 pub async fn dispatch_local(
     cards: &[ComponentCard],
     supervisor: Option<&SupervisorHandle>,
-    budget_ledger: Option<&Arc<BudgetLedger>>,
+    budget_ledger: Option<&BudgetLedger>,
     profile: &ParsedProfile,
     prompt: &str,
     messages: Vec<ChatMessage>,
@@ -336,40 +304,27 @@ pub async fn dispatch_local(
                         tenant_id, &model_id,
                     ))),
                     actual_cost_minor: None,
-                    settlement_status: SettlementStatus::NotRequired,
                 });
             }
             Some(ledger) => {
                 match budget::reserve(ledger, tenant_id, &model_id, estimated_cost_minor) {
-                    Ok(id) => {
-                        let durable_tenant = tenant_id.unwrap_or(budget::PERSONAL_TENANT_ID);
-                        let begin_result = ledger.begin_settlement(durable_tenant, &id);
-                        reservation_guard.id = Some(id);
-                        if let Err(err) = begin_result {
-                            return Ok(ChatOutcome {
-                                decision,
-                                served_locality,
-                                result: Err(DispatchFailure::Budget(err)),
-                                actual_cost_minor: None,
-                                settlement_status: SettlementStatus::NotRequired,
-                            });
-                        }
-                    }
+                    Ok(id) => reservation_guard.id = Some(id),
                     Err(err) => {
                         return Ok(ChatOutcome {
                             decision,
                             served_locality,
                             result: Err(DispatchFailure::Budget(err)),
                             actual_cost_minor: None,
-                            settlement_status: SettlementStatus::NotRequired,
                         });
                     }
                 }
             }
         }
     }
-    // Until chat is submitted, dropping the guard is a confirmed no-dispatch
-    // path and can safely release the reservation.
+    // From here on, `reservation_guard`'s Drop releases the reservation on
+    // any early return *and* on this future being dropped mid-`.await`
+    // (client disconnect) — see its doc. Only the success path below
+    // disarms it (via `take`) to settle instead.
 
     let Some(supervisor) = supervisor else {
         return Ok(ChatOutcome {
@@ -379,7 +334,6 @@ pub async fn dispatch_local(
                 BackendError::supervisor_unavailable(),
             )),
             actual_cost_minor: None,
-            settlement_status: SettlementStatus::NotRequired,
         });
     };
 
@@ -402,120 +356,50 @@ pub async fn dispatch_local(
             served_locality,
             result: Err(DispatchFailure::Backend(err)),
             actual_cost_minor: None,
-            settlement_status: SettlementStatus::NotRequired,
         });
     }
 
-    // The request future no longer owns the reservation once submitted. Move
-    // result observation and settlement to an independent task; only an
-    // explicit NotSubmitted outcome can safely release the hold.
-    let reservation = reservation_guard.take();
-    let (reply, result_rx) = tokio::sync::oneshot::channel();
-    let worker_supervisor = supervisor.clone();
-    let worker_cancel = cancel.clone();
-    let worker_ledger = budget_ledger.cloned();
-    let worker_prompt = prompt.to_string();
-    let submitted_guard = match (worker_ledger, reservation) {
-        (Some(ledger), Some(id)) => Some(SubmittedDispatchGuard {
-            ledger,
-            tenant_id: tenant_id.unwrap_or(budget::PERSONAL_TENANT_ID).to_string(),
-            id,
-        }),
-        _ => None,
-    };
-    tokio::spawn(async move {
-        let submitted = submitted_guard;
-        let chat_call = worker_supervisor
-            .chat_with_outcome(
-                ChatRequest {
-                    model: model_id,
-                    messages,
-                },
-                worker_cancel,
-            )
-            .await;
-        let chat_result = match chat_call {
-            ChatCallOutcome::NotSubmitted(error) => {
-                if let Some(submitted) = &submitted
-                    && let Err(release_error) = budget::release_confirmed_unexecuted(
-                        &submitted.ledger,
-                        Some(&submitted.tenant_id),
-                        &submitted.id,
-                    )
-                {
-                    eprintln!(
-                        "budget non-submitted dispatch release deferred: reservation={} error={release_error}",
-                        submitted.id.0
-                    );
-                }
-                let _ = reply.send((
-                    Err(DispatchFailure::Backend(error)),
-                    None,
-                    SettlementStatus::NotRequired,
-                ));
-                return;
-            }
-            ChatCallOutcome::Submitted(result) => result,
-        };
-        let (actual_cost_minor, settlement_status) = match (&submitted, &chat_result) {
-            (Some(submitted), Ok(response)) => {
-                let actual = budget::estimate_actual_cost_minor(
-                    &cost,
-                    &worker_prompt,
-                    &response.content,
-                    estimated_cost_minor,
-                );
-                match budget::settle_durable(
-                    &submitted.ledger,
-                    Some(&submitted.tenant_id),
-                    &submitted.id,
-                    actual,
-                ) {
-                    Ok(Some(charged)) => (Some(charged), SettlementStatus::Committed),
-                    Ok(None) => (None, SettlementStatus::Pending),
-                    Err(
-                        err @ BudgetError::OverageTooLarge {
-                            actual_cost_minor, ..
-                        },
-                    ) => {
-                        eprintln!(
-                            "budget settlement overage committed: reservation={} actual_cost_minor={} error={err}",
-                            submitted.id.0, actual_cost_minor
-                        );
-                        (Some(actual_cost_minor), SettlementStatus::Committed)
-                    }
-                    Err(err) => {
-                        eprintln!(
-                            "budget settlement persistence failed: reservation={} actual_cost_minor={} error={err}",
-                            submitted.id.0, actual
-                        );
-                        (None, SettlementStatus::PersistenceFailed)
-                    }
-                }
-            }
-            _ => (None, SettlementStatus::NotRequired),
-        };
-        let result = chat_result.map_err(DispatchFailure::Backend);
-        let _ = reply.send((result, actual_cost_minor, settlement_status));
-    });
+    let chat_result = supervisor
+        .chat(
+            ChatRequest {
+                model: model_id,
+                messages,
+            },
+            cancel,
+        )
+        .await;
 
-    let (result, actual_cost_minor, settlement_status) = match result_rx.await {
-        Ok(result) => result,
-        Err(_) => (
-            Err(DispatchFailure::Backend(
-                BackendError::supervisor_unavailable(),
-            )),
-            None,
-            SettlementStatus::PersistenceFailed,
-        ),
-    };
-    Ok(ChatOutcome {
-        decision,
-        served_locality,
-        result,
-        actual_cost_minor,
-        settlement_status,
-    })
+    match chat_result {
+        Err(err) => Ok(ChatOutcome {
+            decision,
+            served_locality,
+            result: Err(DispatchFailure::Backend(err)),
+            actual_cost_minor: None,
+        }),
+        Ok(response) => {
+            // Settling is best-effort (see `ChatOutcome::actual_cost_minor`'s
+            // doc): a successful chat response is never withheld just
+            // because the ledger write afterward had a problem.
+            let actual_cost_minor = match (budget_ledger, reservation_guard.take()) {
+                (Some(ledger), Some(id)) => {
+                    let actual = budget::estimate_actual_cost_minor(
+                        &cost,
+                        prompt,
+                        &response.content,
+                        estimated_cost_minor,
+                    );
+                    budget::settle(ledger, tenant_id, &id, actual).ok()
+                }
+                _ => None,
+            };
+            Ok(ChatOutcome {
+                decision,
+                served_locality,
+                result: Ok(response),
+                actual_cost_minor,
+            })
+        }
+    }
 }
 
 /// Debug-formatted, comma-joined reason codes — observability-only, not
@@ -532,18 +416,13 @@ pub fn reason_header_value(reasons: &[ReasonCode]) -> String {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-    use idoris_backend::{
-        BackendStatus, MockAdapter, ModelInfo, Pressure, RuntimeAdapter, Supervisor,
-        SupervisorConfig,
-    };
+    use idoris_backend::{MockAdapter, ModelInfo, Supervisor, SupervisorConfig};
     use idoris_contracts::TaskProfile;
     use idoris_contracts::common::PrivacyClass;
     use idoris_contracts::common::Tier;
     use idoris_contracts::component_card::{Egress, Form};
     use idoris_contracts::provider::{Cost, Family, ProviderDescriptor};
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
-    use tokio::sync::Notify;
 
     use super::*;
 
@@ -663,9 +542,9 @@ mod tests {
     }
 
     // TempDir must outlive the BudgetLedger using its path.
-    fn configured_ledger(limit_minor: i64) -> (tempfile::TempDir, Arc<BudgetLedger>) {
+    fn configured_ledger(limit_minor: i64) -> (tempfile::TempDir, BudgetLedger) {
         let dir = tempfile::TempDir::new().unwrap();
-        let ledger = Arc::new(BudgetLedger::open(dir.path().join("b.sqlite3")).unwrap());
+        let ledger = BudgetLedger::open(dir.path().join("b.sqlite3")).unwrap();
         ledger
             .configure_tenant(
                 budget::PERSONAL_TENANT_ID,
@@ -675,134 +554,6 @@ mod tests {
             )
             .unwrap();
         (dir, ledger)
-    }
-
-    fn query_count(connection: &rusqlite::Connection, sql: &str) -> i64 {
-        connection.query_row(sql, [], |row| row.get(0)).unwrap()
-    }
-
-    struct SignaledAdapter {
-        started: Notify,
-        finished: Notify,
-        fail: bool,
-        wait_cancel: bool,
-    }
-
-    #[async_trait::async_trait]
-    impl RuntimeAdapter for SignaledAdapter {
-        async fn list(&self) -> Result<Vec<ModelInfo>, BackendError> {
-            Ok(vec![ModelInfo {
-                id: "p".to_string(),
-                memory_gb: 1.0,
-            }])
-        }
-        async fn load(&self, _id: &str, _policy: Option<&LoadPolicy>) -> Result<(), BackendError> {
-            Ok(())
-        }
-        async fn unload(&self, _id: &str) -> Result<(), BackendError> {
-            Ok(())
-        }
-        async fn status(&self) -> Result<BackendStatus, BackendError> {
-            Ok(BackendStatus {
-                pressure: Pressure::Ok,
-                used_gb: 1.0,
-                model_memory_max_gb: 24.0,
-                loaded: vec!["p".to_string()],
-            })
-        }
-        async fn probe_ready(&self, _id: &str) -> Result<bool, BackendError> {
-            Ok(true)
-        }
-        async fn chat(
-            &self,
-            _req: ChatRequest,
-            cancel: CancellationToken,
-        ) -> Result<ChatResponse, BackendError> {
-            self.started.notify_one();
-            let result = if self.wait_cancel {
-                cancel.cancelled().await;
-                Err(BackendError::cancelled())
-            } else if self.fail {
-                Err(BackendError::cancelled())
-            } else {
-                Ok(ChatResponse {
-                    model: "p".to_string(),
-                    content: "a completed response".to_string(),
-                })
-            };
-            self.finished.notify_one();
-            result
-        }
-    }
-
-    struct BusyOrGatedAdapter {
-        inner: MockAdapter,
-        calls: AtomicUsize,
-        started: Notify,
-        gate: Notify,
-        busy: bool,
-    }
-
-    fn busy_adapter(busy: bool) -> Arc<BusyOrGatedAdapter> {
-        Arc::new(BusyOrGatedAdapter {
-            inner: MockAdapter::new(vec![ModelInfo {
-                id: "p".to_string(),
-                memory_gb: 1.0,
-            }]),
-            calls: AtomicUsize::new(0),
-            started: Notify::new(),
-            gate: Notify::new(),
-            busy,
-        })
-    }
-
-    #[async_trait::async_trait]
-    impl RuntimeAdapter for BusyOrGatedAdapter {
-        async fn list(&self) -> Result<Vec<ModelInfo>, BackendError> {
-            self.inner.list().await
-        }
-        async fn load(&self, id: &str, policy: Option<&LoadPolicy>) -> Result<(), BackendError> {
-            self.inner.load(id, policy).await
-        }
-        async fn unload(&self, id: &str) -> Result<(), BackendError> {
-            self.inner.unload(id).await
-        }
-        async fn status(&self) -> Result<BackendStatus, BackendError> {
-            self.inner.status().await
-        }
-        async fn probe_ready(&self, id: &str) -> Result<bool, BackendError> {
-            self.inner.probe_ready(id).await
-        }
-        async fn chat(
-            &self,
-            req: ChatRequest,
-            cancel: CancellationToken,
-        ) -> Result<ChatResponse, BackendError> {
-            let call = self.calls.fetch_add(1, Ordering::SeqCst);
-            self.started.notify_one();
-            if cancel.is_cancelled() {
-                return Err(BackendError::cancelled());
-            }
-            if self.busy {
-                return Err(BackendError::busy("adapter busy", None, None));
-            }
-            if call == 0 {
-                self.gate.notified().await;
-            }
-            Ok(ChatResponse {
-                model: req.model,
-                content: "a completed response".to_string(),
-            })
-        }
-    }
-
-    #[derive(Default)]
-    struct TestClock(AtomicI64);
-
-    impl idoris_tenancy::budget::Clock for TestClock {
-        fn now_ms(&self) -> i64 {
-            self.0.load(Ordering::SeqCst)
-        }
     }
 
     // "No ledger wired" (trivial branch) is covered at the budget.rs unit
@@ -863,1324 +614,57 @@ mod tests {
         );
     }
 
+    /// R0 finding: the TS reference's cancellation propagation
+    /// (`server.ts`'s `req.on("close")`) never actually fires, since the
+    /// listener is attached after the request body — and with it, that
+    /// stream's own `close` — has already completed. This asserts the
+    /// Rust replacement actually works: dropping `dispatch_local`'s future
+    /// mid-`.await` (simulated deterministically via `tokio::time::timeout`,
+    /// which drops the inner future when it elapses -- the same mechanism
+    /// a real client disconnect would trigger if this handler's own future
+    /// is dropped) must still release the budget reservation and cancel
+    /// the caller-supplied token, even though no explicit `return` in
+    /// `dispatch_local` ever runs.
     #[tokio::test]
-    async fn successful_paid_response_keeps_a_committed_overage_as_success() {
+    async fn dropping_the_future_mid_chat_releases_the_reservation_and_cancels_the_token() {
         let (_dir, ledger) = configured_ledger(1_000_000);
-        let adapter = Arc::new(MockAdapter::new(vec![ModelInfo {
-            id: "p".to_string(),
-            memory_gb: 1.0,
-        }]));
-        let supervisor = Supervisor::spawn(adapter, SupervisorConfig::default()).unwrap();
-        let prompt = "x".repeat(20_000);
-        let mut card = paid_card("p");
-        card.provider.cost.input_per_m = 0.0;
-        let outcome = dispatch_local(
-            &[card.clone()],
-            Some(&supervisor),
-            Some(&ledger),
-            &empty_profile(),
-            &prompt,
-            vec![ChatMessage {
-                role: "user".into(),
-                content: prompt.clone(),
-            }],
-            CancellationToken::new(),
-        )
-        .await
-        .unwrap();
-        assert!(outcome.result.is_ok());
-        assert_eq!(outcome.settlement_status, SettlementStatus::Committed);
-        let charged = outcome.actual_cost_minor.unwrap();
-        let reserved = budget::estimate_cost_minor(&card.provider.cost, &prompt).unwrap();
-        assert!(
-            charged > reserved * 4,
-            "charge {charged}, reserve {reserved}"
-        );
-        assert_eq!(
-            ledger.tenant_balance(budget::PERSONAL_TENANT_ID).unwrap(),
-            1_000_000 - charged
-        );
-    }
-
-    #[tokio::test]
-    async fn successful_paid_response_reports_primary_fallback_commit() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let ledger = Arc::new(BudgetLedger::open(dir.path().join("b.sqlite3")).unwrap());
-        ledger
-            .configure_tenant(
-                budget::PERSONAL_TENANT_ID,
-                1_000_000,
-                "UTC",
-                idoris_tenancy::budget::SpendGate::PaidOnly,
-            )
-            .unwrap();
-        let sidecar_path = dir.path().join("b.sqlite3.settlements.sqlite3");
-        rusqlite::Connection::open(sidecar_path)
-            .unwrap()
-            .execute_batch(
-                "CREATE TRIGGER fail_pending_insert BEFORE INSERT ON pending_settlements
-             BEGIN SELECT RAISE(ABORT, 'injected sidecar failure'); END;",
-            )
-            .unwrap();
-        let adapter = Arc::new(MockAdapter::new(vec![ModelInfo {
-            id: "p".into(),
-            memory_gb: 1.0,
-        }]));
-        let supervisor = Supervisor::spawn(adapter, SupervisorConfig::default()).unwrap();
-        let outcome = dispatch_local(
-            &[paid_card("p")],
-            Some(&supervisor),
-            Some(&ledger),
-            &empty_profile(),
-            "hi",
-            vec![ChatMessage {
-                role: "user".into(),
-                content: "hello".into(),
-            }],
-            CancellationToken::new(),
-        )
-        .await
-        .unwrap();
-        assert!(
-            outcome.result.is_ok(),
-            "completed upstream response is retained"
-        );
-        assert_eq!(outcome.settlement_status, SettlementStatus::Committed);
-        let charged = outcome.actual_cost_minor.unwrap();
-        assert!(charged > 0);
-        assert_eq!(
-            ledger.tenant_balance(budget::PERSONAL_TENANT_ID).unwrap(),
-            1_000_000 - charged
-        );
-    }
-
-    #[tokio::test]
-    async fn concurrent_paid_dispatches_succeed_for_same_and_different_tenants() {
-        for (first_tenant, second_tenant) in [("acme", "acme"), ("acme", "other")] {
-            let dir = tempfile::TempDir::new().unwrap();
-            let ledger = Arc::new(BudgetLedger::open(dir.path().join("b.sqlite3")).unwrap());
-            for tenant in ["acme", "other"] {
-                ledger
-                    .configure_tenant(
-                        tenant,
-                        1_000_000,
-                        "UTC",
-                        idoris_tenancy::budget::SpendGate::PaidOnly,
-                    )
-                    .unwrap();
-            }
-            let adapter = Arc::new(MockAdapter::new(vec![ModelInfo {
-                id: "p".to_string(),
-                memory_gb: 1.0,
-            }]));
-            adapter.set_chat_delay("p", std::time::Duration::from_millis(100));
-            let supervisor = Supervisor::spawn(adapter, SupervisorConfig::default()).unwrap();
-            let cards = [paid_card("p")];
-            let first_profile = ParsedProfile {
-                tenant_id: Some(first_tenant.to_string()),
-                ..empty_profile()
-            };
-            let second_profile = ParsedProfile {
-                tenant_id: Some(second_tenant.to_string()),
-                ..empty_profile()
-            };
-            let mut first = Box::pin(dispatch_local(
-                &cards,
-                Some(&supervisor),
-                Some(&ledger),
-                &first_profile,
-                "hi",
-                vec![ChatMessage {
-                    role: "user".to_string(),
-                    content: "hi".to_string(),
-                }],
-                CancellationToken::new(),
-            ));
-            std::future::poll_fn(|cx| {
-                assert!(first.as_mut().poll(cx).is_pending());
-                std::task::Poll::Ready(())
-            })
-            .await;
-            let mut second = Box::pin(dispatch_local(
-                &cards,
-                Some(&supervisor),
-                Some(&ledger),
-                &second_profile,
-                "hi",
-                vec![ChatMessage {
-                    role: "user".to_string(),
-                    content: "hi".to_string(),
-                }],
-                CancellationToken::new(),
-            ));
-            let second_poll =
-                std::future::poll_fn(|cx| std::task::Poll::Ready(second.as_mut().poll(cx))).await;
-            assert!(
-                second_poll.is_pending(),
-                "second paid request must reserve and reach upstream while the first is in flight; got {second_poll:?}"
-            );
-
-            let (first_result, second_result) = tokio::join!(first, second);
-            let first_outcome = first_result.unwrap();
-            let second_outcome = second_result.unwrap();
-            assert!(first_outcome.result.is_ok());
-            assert!(second_outcome.result.is_ok());
-            let first_charge = first_outcome.actual_cost_minor.unwrap();
-            let second_charge = second_outcome.actual_cost_minor.unwrap();
-            assert!(first_charge > 0 && second_charge > 0);
-            assert_eq!(
-                ledger.tenant_balance(first_tenant).unwrap(),
-                1_000_000
-                    - first_charge
-                    - if first_tenant == second_tenant {
-                        second_charge
-                    } else {
-                        0
-                    }
-            );
-            if first_tenant != second_tenant {
-                assert_eq!(
-                    ledger.tenant_balance(second_tenant).unwrap(),
-                    1_000_000 - second_charge
-                );
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn slot_busy_releases_second_hold_and_same_tenant_can_retry() {
-        let (dir, ledger) = configured_ledger(1_000_000);
-        let adapter = busy_adapter(false);
-        let supervisor = Supervisor::spawn(
-            adapter.clone(),
-            SupervisorConfig {
-                max_concurrent_adapter_calls: 1,
-                ..SupervisorConfig::default()
-            },
-        )
-        .unwrap();
-        let cards = [paid_card("p")];
-        let profile = empty_profile();
-        let dispatch = || {
-            dispatch_local(
-                &cards,
-                Some(&supervisor),
-                Some(&ledger),
-                &profile,
-                "hi",
-                vec![ChatMessage {
-                    role: "user".into(),
-                    content: "hi".into(),
-                }],
-                CancellationToken::new(),
-            )
-        };
-        let mut first = Box::pin(dispatch());
-        tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            tokio::select! {
-                biased;
-                result = &mut first => panic!("first request completed before adapter gate: {result:?}"),
-                _ = adapter.started.notified() => (),
-            }
-        })
-        .await
-        .unwrap();
-
-        let second = dispatch().await.unwrap();
-        assert!(matches!(
-            second.result,
-            Err(DispatchFailure::Backend(BackendError::Busy { .. }))
-        ));
-        assert_eq!(adapter.calls.load(Ordering::SeqCst), 1);
-        let connection = rusqlite::Connection::open(dir.path().join("b.sqlite3")).unwrap();
-        assert_eq!(
-            query_count(
-                &connection,
-                "SELECT count(*) FROM reservations WHERE status='released'"
-            ),
-            1,
-            "the rejected second request's reservation should be released"
-        );
-        assert_eq!(
-            query_count(
-                &connection,
-                "SELECT count(*) FROM reservations WHERE status='active' AND dispatch_hold=1"
-            ),
-            1,
-            "only the blocked first request should retain a hold"
-        );
-
-        adapter.gate.notify_one();
-        let first_outcome = first.await.unwrap();
-        assert!(first_outcome.result.is_ok());
-        let third = dispatch().await.unwrap();
-        assert!(third.result.is_ok());
-        assert_eq!(adapter.calls.load(Ordering::SeqCst), 2);
-        let cost = budget::estimate_actual_cost_minor(
-            &cards[0].provider.cost,
-            "hi",
-            "a completed response",
-            0,
-        );
-        assert_eq!(
-            ledger.tenant_balance(budget::PERSONAL_TENANT_ID).unwrap(),
-            1_000_000 - cost * 2
-        );
-        assert_eq!(
-            query_count(
-                &connection,
-                "SELECT count(*) FROM reservations WHERE status='active' AND dispatch_hold=1"
-            ),
-            0
-        );
-    }
-
-    #[tokio::test]
-    async fn adapter_busy_is_submitted_and_keeps_the_hold() {
-        let cards = [paid_card("p")];
-        let reserve = budget::estimate_cost_minor(&cards[0].provider.cost, "hi").unwrap();
-        let (dir, ledger) = configured_ledger(1_000_000);
-        let adapter = busy_adapter(true);
-        let supervisor = Supervisor::spawn(adapter.clone(), SupervisorConfig::default()).unwrap();
-        let profile = empty_profile();
-        let dispatch = || {
-            dispatch_local(
-                &cards,
-                Some(&supervisor),
-                Some(&ledger),
-                &profile,
-                "hi",
-                vec![ChatMessage {
-                    role: "user".into(),
-                    content: "hi".into(),
-                }],
-                CancellationToken::new(),
-            )
-        };
-        let outcome = dispatch().await.unwrap();
-        assert!(matches!(
-            outcome.result,
-            Err(DispatchFailure::Backend(BackendError::Busy { .. }))
-        ));
-        assert_eq!(adapter.calls.load(Ordering::SeqCst), 1);
-        let connection = rusqlite::Connection::open(dir.path().join("b.sqlite3")).unwrap();
-        assert_eq!(
-            query_count(
-                &connection,
-                "SELECT count(*) FROM reservations WHERE status='active' AND dispatch_hold=1"
-            ),
-            1,
-            "adapter Busy is an unknown result after submission"
-        );
-        assert_eq!(
-            ledger.tenant_balance(budget::PERSONAL_TENANT_ID).unwrap(),
-            1_000_000 - reserve
-        );
-        let blocked = dispatch().await.unwrap();
-        assert!(
-            matches!(
-                &blocked.result,
-                Err(DispatchFailure::Budget(BudgetError::Storage(_)))
-            ),
-            "the unresolved adapter call must block another paid dispatch: {:?}",
-            blocked.result
-        );
-        assert_eq!(adapter.calls.load(Ordering::SeqCst), 1);
-    }
-
-    #[tokio::test]
-    async fn cancelled_before_adapter_call_releases_intent_and_allows_retry() {
-        let (dir, ledger) = configured_ledger(1_000_000);
-        let adapter = busy_adapter(false);
-        let supervisor = Supervisor::spawn(adapter.clone(), SupervisorConfig::default()).unwrap();
-        let cards = [paid_card("p")];
-        let profile = empty_profile();
-        let dispatch = |cancel| {
-            dispatch_local(
-                &cards,
-                Some(&supervisor),
-                Some(&ledger),
-                &profile,
-                "hi",
-                vec![ChatMessage {
-                    role: "user".into(),
-                    content: "hi".into(),
-                }],
-                cancel,
-            )
-        };
-
-        let cancel = CancellationToken::new();
-        cancel.cancel();
-        let outcome = dispatch(cancel).await.unwrap();
-        assert!(matches!(
-            outcome.result,
-            Err(DispatchFailure::Backend(BackendError::Cancelled))
-        ));
-        assert_eq!(adapter.calls.load(Ordering::SeqCst), 0);
-
-        let main = rusqlite::Connection::open(dir.path().join("b.sqlite3")).unwrap();
-        assert_eq!(
-            query_count(
-                &main,
-                "SELECT count(*) FROM reservations WHERE status='released'"
-            ),
-            1,
-            "the pre-call cancellation must release its durable reservation"
-        );
-        assert_eq!(
-            query_count(
-                &main,
-                "SELECT count(*) FROM reservations WHERE status='active' AND dispatch_hold=1"
-            ),
-            0,
-            "the pre-call cancellation must leave no active dispatch hold"
-        );
-        let journal = rusqlite::Connection::open(
-            dir.path()
-                .join("b.sqlite3")
-                .with_added_extension("settlements.sqlite3"),
-        )
-        .unwrap();
-        assert_eq!(
-            query_count(&journal, "SELECT count(*) FROM settlement_intents"),
-            0,
-            "the pre-call cancellation must remove its durable intent"
-        );
-        assert_eq!(
-            ledger.tenant_balance(budget::PERSONAL_TENANT_ID).unwrap(),
-            1_000_000
-        );
-
-        adapter.gate.notify_one();
-        let retry = dispatch(CancellationToken::new()).await.unwrap();
-        assert!(retry.result.is_ok());
-        assert_eq!(adapter.calls.load(Ordering::SeqCst), 1);
-        assert!(ledger.tenant_balance(budget::PERSONAL_TENANT_ID).unwrap() < 1_000_000);
-    }
-
-    #[tokio::test]
-    async fn failed_intent_prevents_upstream_dispatch_and_releases_reservation() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("b.sqlite3");
-        let clock = Arc::new(TestClock::default());
-        let ledger = Arc::new(BudgetLedger::open_with(&path, clock, 1).unwrap());
-        ledger
-            .configure_tenant(
-                budget::PERSONAL_TENANT_ID,
-                1_000_000,
-                "UTC",
-                idoris_tenancy::budget::SpendGate::PaidOnly,
-            )
-            .unwrap();
-        let adapter = Arc::new(MockAdapter::new(vec![ModelInfo {
-            id: "p".to_string(),
-            memory_gb: 1.0,
-        }]));
-        let supervisor = Supervisor::spawn(adapter.clone(), SupervisorConfig::default()).unwrap();
-        let journal =
-            rusqlite::Connection::open(path.with_added_extension("settlements.sqlite3")).unwrap();
-        journal
-            .execute_batch(
-                "CREATE TRIGGER fail_intent BEFORE INSERT ON settlement_intents
-                 BEGIN SELECT RAISE(ABORT, 'injected intent failure'); END;",
-            )
-            .unwrap();
-
-        let outcome = dispatch_local(
-            &[paid_card("p")],
-            Some(&supervisor),
-            Some(&ledger),
-            &empty_profile(),
-            "hi",
-            vec![ChatMessage {
-                role: "user".to_string(),
-                content: "hi".to_string(),
-            }],
-            CancellationToken::new(),
-        )
-        .await
-        .unwrap();
-        assert!(matches!(
-            outcome.result,
-            Err(DispatchFailure::Budget(BudgetError::Storage(message)))
-                if message.contains("injected intent failure")
-        ));
-        assert!(adapter.event_log().is_empty());
-        let main = rusqlite::Connection::open(&path).unwrap();
-        let reservations: (i64, i64) = main
-            .query_row(
-                "SELECT count(*), sum(status='released') FROM reservations",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .unwrap();
-        assert_eq!(reservations, (1, 1));
-        assert_eq!(
-            ledger.tenant_balance(budget::PERSONAL_TENANT_ID).unwrap(),
-            1_000_000
-        );
-    }
-
-    #[tokio::test]
-    async fn busy_journal_preserves_intent_across_ttl_and_restart() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("b.sqlite3");
-        let clock = Arc::new(TestClock::default());
-        let ledger = Arc::new(
-            BudgetLedger::open_with_busy_timeout(
-                &path,
-                clock.clone(),
-                1,
-                std::time::Duration::ZERO,
-            )
-            .unwrap(),
-        );
-        ledger
-            .configure_tenant(
-                budget::PERSONAL_TENANT_ID,
-                1_000_000,
-                "UTC",
-                idoris_tenancy::budget::SpendGate::PaidOnly,
-            )
-            .unwrap();
-        let adapter = Arc::new(MockAdapter::new(vec![ModelInfo {
-            id: "p".to_string(),
-            memory_gb: 1.0,
-        }]));
-        adapter.set_chat_delay("p", std::time::Duration::from_millis(100));
-        let supervisor = Supervisor::spawn(adapter, SupervisorConfig::default()).unwrap();
-        let cards = [paid_card("p")];
-        let profile = empty_profile();
-        let mut call = Box::pin(dispatch_local(
-            &cards,
-            Some(&supervisor),
-            Some(&ledger),
-            &profile,
-            "hi",
-            vec![ChatMessage {
-                role: "user".to_string(),
-                content: "hi".to_string(),
-            }],
-            CancellationToken::new(),
-        ));
-        // First poll reserves budget, then yields to the Supervisor. Lock
-        // only afterward so reserve succeeds but settle deterministically fails.
-        std::future::poll_fn(|cx| {
-            assert!(call.as_mut().poll(cx).is_pending());
-            std::task::Poll::Ready(())
-        })
-        .await;
-        let blocker =
-            rusqlite::Connection::open(path.with_added_extension("settlements.sqlite3")).unwrap();
-        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
-        let outcome = call.await.unwrap();
-        let response = outcome
-            .result
-            .expect("durable primary fallback preserves the successful response");
-        assert_eq!(response.content, "mock reply to: hi");
-        // The primary fallback is durable, but recovery has not yet
-        // completed the journal settlement.
-        assert_eq!(outcome.actual_cost_minor, None);
-        let main = rusqlite::Connection::open(&path).unwrap();
-        let actual: i64 = main
-            .query_row(
-                "SELECT actual_cost_minor FROM reservations WHERE actual_cost_minor IS NOT NULL",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        let expected_actual = budget::estimate_actual_cost_minor(
-            &paid_card("p").provider.cost,
-            "hi",
-            "mock reply to: hi",
-            0,
-        );
-        assert_eq!(actual, expected_actual);
-        drop(main);
-
-        // The reservation itself has expired, but the durable pre-call
-        // intent still blocks another paid request after the journal write
-        // was blocked. This also proves the first operation happened before the
-        // upstream await: the lock was acquired only after the first poll.
-        clock.0.store(2, Ordering::SeqCst);
-        assert!(budget::reserve(&ledger, None, "p", 500).is_err());
-
-        drop(ledger);
-        // Restart while the journal is still locked. The durable intent and
-        // fallback actual keep admission closed until recovery can finish.
-        let restarted = BudgetLedger::open_with_busy_timeout(
-            &path,
-            clock.clone(),
-            1,
-            std::time::Duration::ZERO,
-        )
-        .unwrap();
-        assert!(budget::reserve(&restarted, None, "p", 500).is_err());
-        drop(restarted);
-        blocker.execute_batch("ROLLBACK").unwrap();
-
-        // With the journal available, retry can complete the settlement.
-        // Reopening repeatedly must not apply the same charge twice, and
-        // admission must resume once recovery has cleared the intent.
-        for _ in 0..2 {
-            let recovered = BudgetLedger::open_with(path.clone(), clock.clone(), 1).unwrap();
-            let balance = recovered
-                .tenant_balance(budget::PERSONAL_TENANT_ID)
-                .unwrap();
-            assert_eq!(balance, 1_000_000 - actual);
-            let id = budget::reserve(&recovered, None, "p", 500).unwrap();
-            budget::release(&recovered, None, &id).unwrap();
-        }
-    }
-
-    #[tokio::test]
-    async fn busy_journal_and_main_db_keep_durable_intent_fail_closed_after_restart() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("b.sqlite3");
-        let clock = Arc::new(TestClock::default());
-        let ledger = Arc::new(
-            BudgetLedger::open_with_busy_timeout(
-                &path,
-                clock.clone(),
-                1,
-                std::time::Duration::ZERO,
-            )
-            .unwrap(),
-        );
-        ledger
-            .configure_tenant(
-                budget::PERSONAL_TENANT_ID,
-                1_000_000,
-                "UTC",
-                idoris_tenancy::budget::SpendGate::PaidOnly,
-            )
-            .unwrap();
-        let adapter = Arc::new(MockAdapter::new(vec![ModelInfo {
-            id: "p".to_string(),
-            memory_gb: 1.0,
-        }]));
-        adapter.set_chat_delay("p", std::time::Duration::from_millis(20));
-        let supervisor = Supervisor::spawn(adapter, SupervisorConfig::default()).unwrap();
-        let cards = [paid_card("p")];
-        let profile = empty_profile();
-        let mut call = Box::pin(dispatch_local(
-            &cards,
-            Some(&supervisor),
-            Some(&ledger),
-            &profile,
-            "hi",
-            vec![ChatMessage {
-                role: "user".to_string(),
-                content: "hi".to_string(),
-            }],
-            CancellationToken::new(),
-        ));
-        std::future::poll_fn(|cx| {
-            assert!(call.as_mut().poll(cx).is_pending());
-            std::task::Poll::Ready(())
-        })
-        .await;
-        let journal_lock =
-            rusqlite::Connection::open(path.with_added_extension("settlements.sqlite3")).unwrap();
-        journal_lock.execute_batch("BEGIN IMMEDIATE").unwrap();
-        let main_lock = rusqlite::Connection::open(&path).unwrap();
-        main_lock.execute_batch("BEGIN IMMEDIATE").unwrap();
-
-        let outcome = call.await.unwrap();
-        assert!(
-            outcome.result.is_ok(),
-            "completed upstream response is retained"
-        );
-        assert_eq!(outcome.actual_cost_minor, None);
-        assert_eq!(
-            outcome.settlement_status,
-            SettlementStatus::PersistenceFailed
-        );
-        let main = rusqlite::Connection::open(&path).unwrap();
-        let actuals: i64 = main
-            .query_row(
-                "SELECT count(*) FROM reservations WHERE actual_cost_minor IS NOT NULL",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(actuals, 0);
-        drop(main);
-
-        // Neither durable outcome store accepted the amount. After TTL and
-        // process restart, the intent alone must continue blocking spends.
-        clock.0.store(2, Ordering::SeqCst);
-        drop(ledger);
-        main_lock.execute_batch("ROLLBACK").unwrap();
-        let restarted = BudgetLedger::open_with_busy_timeout(
-            &path,
-            clock.clone(),
-            1,
-            std::time::Duration::ZERO,
-        )
-        .unwrap();
-        assert!(budget::reserve(&restarted, None, "p", 500).is_err());
-        drop(restarted);
-        journal_lock.execute_batch("ROLLBACK").unwrap();
-        let recovered = BudgetLedger::open_with(path, clock, 1).unwrap();
-        assert!(budget::reserve(&recovered, None, "p", 500).is_err());
-    }
-
-    #[tokio::test]
-    async fn busy_main_database_journals_and_recovers_the_charge() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("b.sqlite3");
-        let clock = Arc::new(TestClock::default());
-        let ledger = Arc::new(
-            BudgetLedger::open_with_busy_timeout(
-                &path,
-                clock.clone(),
-                1,
-                std::time::Duration::ZERO,
-            )
-            .unwrap(),
-        );
-        ledger
-            .configure_tenant(
-                budget::PERSONAL_TENANT_ID,
-                1_000_000,
-                "UTC",
-                idoris_tenancy::budget::SpendGate::PaidOnly,
-            )
-            .unwrap();
-        let adapter = Arc::new(MockAdapter::new(vec![ModelInfo {
-            id: "p".to_string(),
-            memory_gb: 1.0,
-        }]));
-        adapter.set_chat_delay("p", std::time::Duration::from_millis(100));
-        let supervisor = Supervisor::spawn(adapter, SupervisorConfig::default()).unwrap();
-        let cards = [paid_card("p")];
-        let profile = empty_profile();
-        let mut call = Box::pin(dispatch_local(
-            &cards,
-            Some(&supervisor),
-            Some(&ledger),
-            &profile,
-            "hi",
-            vec![ChatMessage {
-                role: "user".to_string(),
-                content: "hi".to_string(),
-            }],
-            CancellationToken::new(),
-        ));
-        let call_poll =
-            std::future::poll_fn(|cx| std::task::Poll::Ready(call.as_mut().poll(cx))).await;
-        assert!(
-            call_poll.is_pending(),
-            "expected request to remain in flight: {call_poll:?}"
-        );
-        let blocker = rusqlite::Connection::open(&path).unwrap();
-        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
-        let outcome = call.await.unwrap();
-        assert!(outcome.result.is_ok());
-        assert_eq!(outcome.actual_cost_minor, None);
-        let journal =
-            rusqlite::Connection::open(path.with_added_extension("settlements.sqlite3")).unwrap();
-        let (pending, actual): (i64, i64) = journal
-            .query_row(
-                "SELECT count(*), actual_cost_minor FROM pending_settlements",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .unwrap();
-        assert_eq!(pending, 1);
-        assert_eq!(
-            actual,
-            budget::estimate_actual_cost_minor(
-                &paid_card("p").provider.cost,
-                "hi",
-                "mock reply to: hi",
-                0,
-            )
-        );
-        drop(ledger);
-        blocker.execute_batch("ROLLBACK").unwrap();
-        clock.0.store(2, Ordering::SeqCst);
-        for _ in 0..2 {
-            let recovered = BudgetLedger::open_with(&path, clock.clone(), 1).unwrap();
-            assert_eq!(
-                recovered
-                    .tenant_balance(budget::PERSONAL_TENANT_ID)
-                    .unwrap(),
-                1_000_000 - actual
-            );
-        }
-        let pending: i64 = journal
-            .query_row("SELECT count(*) FROM pending_settlements", [], |row| {
-                row.get(0)
-            })
-            .unwrap();
-        assert_eq!(pending, 0);
-    }
-
-    #[tokio::test]
-    async fn missing_reservations_table_during_settlement_keeps_success_and_recovers_charge() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("b.sqlite3");
-        let clock = Arc::new(TestClock::default());
-        let ledger = Arc::new(BudgetLedger::open_with(path.clone(), clock.clone(), 1).unwrap());
-        ledger
-            .configure_tenant(
-                budget::PERSONAL_TENANT_ID,
-                1_000_000,
-                "UTC",
-                idoris_tenancy::budget::SpendGate::PaidOnly,
-            )
-            .unwrap();
-        let adapter = Arc::new(MockAdapter::new(vec![ModelInfo {
-            id: "p".to_string(),
-            memory_gb: 1.0,
-        }]));
-        adapter.set_chat_delay("p", std::time::Duration::from_millis(100));
-        let supervisor = Supervisor::spawn(adapter, SupervisorConfig::default()).unwrap();
-        let cards = [paid_card("p")];
-        // The mock echoes the prompt in its response. This prompt makes
-        // actual completion usage exceed the fixed 1024-token reservation.
-        let prompt = "hi ".repeat(5_000);
-        let profile = empty_profile();
-        let mut call = Box::pin(dispatch_local(
-            &cards,
-            Some(&supervisor),
-            Some(&ledger),
-            &profile,
-            &prompt,
-            vec![ChatMessage {
-                role: "user".to_string(),
-                content: prompt.clone(),
-            }],
-            CancellationToken::new(),
-        ));
-        // The first poll reserves and marks the intent before yielding to
-        // the upstream call. Renaming the table then makes settlement's
-        // ownership SELECT fail without blocking the upstream response.
-        std::future::poll_fn(|cx| {
-            assert!(call.as_mut().poll(cx).is_pending());
-            std::task::Poll::Ready(())
-        })
-        .await;
-        let fault = rusqlite::Connection::open(&path).unwrap();
-        fault
-            .execute_batch("ALTER TABLE reservations RENAME TO reservations_unavailable")
-            .unwrap();
-
-        let outcome = call.await.unwrap();
-        assert!(outcome.result.is_ok());
-        assert_eq!(
-            outcome.result.unwrap().content,
-            format!("mock reply to: {prompt}")
-        );
-        assert_eq!(outcome.actual_cost_minor, None);
-
-        let journal_path = path.with_added_extension("settlements.sqlite3");
-        let journal = rusqlite::Connection::open(&journal_path).unwrap();
-        let (pending, intents): (i64, i64) = journal
-            .query_row(
-                "SELECT (SELECT count(*) FROM pending_settlements),\n                        (SELECT count(*) FROM settlement_intents)",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .unwrap();
-        assert_eq!(pending, 1, "completed amount must be durable for retry");
-        assert_eq!(intents, 1, "intent must remain until settlement commits");
-
-        let (retry_sender, mut retry_events) = tokio::sync::mpsc::unbounded_channel();
-        crate::spawn_settlement_worker(Arc::downgrade(&ledger), Some(retry_sender));
-        let first_retry =
-            tokio::time::timeout(std::time::Duration::from_secs(2), retry_events.recv())
-                .await
-                .unwrap()
-                .unwrap();
-        assert!(first_retry.is_err(), "table fault must reach the worker");
-
-        fault
-            .execute_batch("ALTER TABLE reservations_unavailable RENAME TO reservations")
-            .unwrap();
-        // The periodic router worker must apply the saved amount without
-        // requiring a reserve or another dispatch to trigger recovery.
-        let recovered = tokio::time::timeout(std::time::Duration::from_secs(3), async {
-            loop {
-                if retry_events.recv().await.expect("retry worker stopped") == Ok(()) {
-                    break;
-                }
-            }
-        })
-        .await;
-        assert!(
-            recovered.is_ok(),
-            "periodic retry did not recover settlement"
-        );
-
-        let actual = budget::estimate_actual_cost_minor(
-            &paid_card("p").provider.cost,
-            &prompt,
-            &format!("mock reply to: {prompt}"),
-            0,
-        );
-        let estimate = budget::estimate_cost_minor(&paid_card("p").provider.cost, &prompt).unwrap();
-        assert!(
-            actual > estimate,
-            "test must exercise actual cost above reserve"
-        );
-        assert_eq!(
-            ledger.tenant_balance(budget::PERSONAL_TENANT_ID).unwrap(),
-            1_000_000 - actual
-        );
-        let (status, recorded_actual): (String, i64) = fault
-            .query_row(
-                "SELECT status, actual_cost_minor FROM reservations",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .unwrap();
-        assert_eq!(status, "settled");
-        assert_eq!(recorded_actual, actual);
-        let (pending, intents): (i64, i64) = journal
-            .query_row(
-                "SELECT (SELECT count(*) FROM pending_settlements),\n                        (SELECT count(*) FROM settlement_intents)",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .unwrap();
-        assert_eq!((pending, intents), (0, 0));
-
-        // A second periodic pass must not charge the completed call again.
-        assert_eq!(
-            tokio::time::timeout(std::time::Duration::from_secs(3), retry_events.recv())
-                .await
-                .unwrap()
-                .unwrap(),
-            Ok(())
-        );
-        assert_eq!(
-            ledger.tenant_balance(budget::PERSONAL_TENANT_ID).unwrap(),
-            1_000_000 - actual
-        );
-        let id = budget::reserve(&ledger, None, "p", 500).unwrap();
-        budget::release(&ledger, None, &id).unwrap();
-    }
-
-    /// Dropping after the adapter confirms chat start cancels upstream, but
-    /// its Cancelled result leaves an unknown outcome and therefore a hold.
-    #[tokio::test(flavor = "current_thread")]
-    async fn dropping_after_chat_starts_keeps_the_hold_and_cancels_the_token() {
-        let (_dir, ledger) = configured_ledger(1_000_000);
-        let adapter = Arc::new(SignaledAdapter {
-            started: Notify::new(),
-            finished: Notify::new(),
-            fail: false,
-            wait_cancel: true,
-        });
-        let supervisor = Supervisor::spawn(adapter.clone(), SupervisorConfig::default()).unwrap();
-        let cancel = CancellationToken::new();
-        let cards = [paid_card("p")];
-        let profile = empty_profile();
-        let mut call = Box::pin(dispatch_local(
-            &cards,
-            Some(&supervisor),
-            Some(&ledger),
-            &profile,
-            "hi",
-            vec![ChatMessage {
-                role: "user".to_string(),
-                content: "hi".to_string(),
-            }],
-            cancel.clone(),
-        ));
-        tokio::time::timeout(std::time::Duration::from_secs(3), async {
-            tokio::select! {
-                biased;
-                _ = adapter.started.notified() => {},
-                outcome = &mut call => panic!("chat returned before start signal: {outcome:?}"),
-            }
-        })
-        .await
-        .unwrap();
-        drop(call);
-        tokio::time::timeout(
-            std::time::Duration::from_secs(3),
-            adapter.finished.notified(),
-        )
-        .await
-        .unwrap();
-
-        // Chat has been submitted, so cancellation cannot establish that
-        // the provider did no work. Its durable hold remains reserved.
-        assert_eq!(
-            ledger.tenant_balance(budget::PERSONAL_TENANT_ID).unwrap(),
-            1_000_000 - budget::estimate_cost_minor(&cards[0].provider.cost, "hi").unwrap()
-        );
-        // The same token the Supervisor/adapter call received is cancelled.
-        assert!(cancel.is_cancelled());
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn submitted_success_is_settled_even_when_request_drops_before_receiving_it() {
-        let (_dir, ledger) = configured_ledger(1_000_000);
-        let adapter = Arc::new(SignaledAdapter {
-            started: Notify::new(),
-            finished: Notify::new(),
-            fail: false,
-            wait_cancel: false,
-        });
-        let supervisor = Supervisor::spawn(adapter.clone(), SupervisorConfig::default()).unwrap();
-        let cards = [paid_card("p")];
-        let profile = empty_profile();
-        let mut call = Box::pin(dispatch_local(
-            &cards,
-            Some(&supervisor),
-            Some(&ledger),
-            &profile,
-            "hi",
-            vec![ChatMessage {
-                role: "user".to_string(),
-                content: "hi".to_string(),
-            }],
-            CancellationToken::new(),
-        ));
-        tokio::time::timeout(std::time::Duration::from_secs(3), async {
-            tokio::select! {
-                biased;
-                _ = adapter.started.notified() => {},
-                outcome = &mut call => panic!("request completed before adapter start: {outcome:?}"),
-            }
-            tokio::select! {
-                biased;
-                _ = adapter.finished.notified() => {},
-                outcome = &mut call => panic!("request completed before test could drop it: {outcome:?}"),
-            }
-        }).await.unwrap();
-        // finished is signaled as chat returns. Since this single-threaded
-        // test has not polled `call` again after the signal, the Router has
-        // not consumed its oneshot result.
-        let actual = budget::estimate_actual_cost_minor(
-            &cards[0].provider.cost,
-            "hi",
-            "a completed response",
-            0,
-        );
-        drop(call);
-        let connection = rusqlite::Connection::open(_dir.path().join("b.sqlite3")).unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(3), async {
-            while connection
-                .query_row("SELECT status='active' FROM reservations", [], |row| {
-                    row.get::<_, bool>(0)
-                })
-                .unwrap()
-            {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
-        assert_eq!(
-            ledger.tenant_balance(budget::PERSONAL_TENANT_ID).unwrap(),
-            1_000_000 - actual
-        );
-        let settled: (i64, i64) = connection
-            .query_row(
-                "SELECT count(*), sum(status='settled' AND actual_cost_minor=?1) FROM reservations",
-                [actual],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .unwrap();
-        assert_eq!(settled, (1, 1));
-        ledger.retry_settlements().unwrap();
-        assert_eq!(
-            ledger.tenant_balance(budget::PERSONAL_TENANT_ID).unwrap(),
-            1_000_000 - actual
-        );
-    }
-
-    #[tokio::test]
-    async fn submitted_unknown_error_keeps_the_reservation_held() {
-        let (_dir, ledger) = configured_ledger(1_000_000);
-        let adapter = Arc::new(SignaledAdapter {
-            started: Notify::new(),
-            finished: Notify::new(),
-            fail: true,
-            wait_cancel: false,
-        });
-        let supervisor = Supervisor::spawn(adapter, SupervisorConfig::default()).unwrap();
-        let cards = [paid_card("p")];
-        let profile = empty_profile();
-        let outcome = dispatch_local(
-            &cards,
-            Some(&supervisor),
-            Some(&ledger),
-            &profile,
-            "hi",
-            vec![ChatMessage {
-                role: "user".to_string(),
-                content: "hi".to_string(),
-            }],
-            CancellationToken::new(),
-        )
-        .await
-        .unwrap();
-        assert!(matches!(
-            outcome.result,
-            Err(DispatchFailure::Backend(BackendError::Cancelled))
-        ));
-        assert_eq!(
-            ledger.tenant_balance(budget::PERSONAL_TENANT_ID).unwrap(),
-            1_000_000 - budget::estimate_cost_minor(&cards[0].provider.cost, "hi").unwrap()
-        );
-        let connection = rusqlite::Connection::open(_dir.path().join("b.sqlite3")).unwrap();
-        let held: i64 = connection
-            .query_row(
-                "SELECT dispatch_hold FROM reservations WHERE status='active'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        let journal = rusqlite::Connection::open(
-            _dir.path()
-                .join("b.sqlite3")
-                .with_added_extension("settlements.sqlite3"),
-        )
-        .unwrap();
-        let intents: i64 = journal
-            .query_row("SELECT count(*) FROM settlement_intents", [], |row| {
-                row.get(0)
-            })
-            .unwrap();
-        assert_eq!((held, intents), (1, 1));
-        assert!(matches!(
-            budget::reserve(&ledger, None, "p", 1),
-            Err(BudgetError::Storage(_))
-        ));
-    }
-
-    #[tokio::test]
-    async fn cancelled_release_under_main_db_lock_is_retried_by_live_worker() {
-        assert_cancelled_release_retried(CancelReleaseFault::MainWriteLock).await;
-    }
-
-    #[tokio::test]
-    async fn cancelled_release_under_sidecar_exclusive_lock_is_retried_by_live_worker() {
-        assert_cancelled_release_retried(CancelReleaseFault::SidecarExclusiveLock).await;
-    }
-
-    #[tokio::test]
-    async fn cancelled_release_after_main_db_read_error_is_retried_by_live_worker() {
-        assert_cancelled_release_retried(CancelReleaseFault::MainReadError).await;
-    }
-
-    #[derive(Clone, Copy)]
-    enum CancelReleaseFault {
-        MainWriteLock,
-        SidecarExclusiveLock,
-        MainReadError,
-    }
-
-    async fn assert_cancelled_release_retried(fault: CancelReleaseFault) {
-        let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("b.sqlite3");
-        let clock = Arc::new(TestClock::default());
-        let ledger = Arc::new(
-            BudgetLedger::open_with_busy_timeout(
-                &path,
-                clock.clone(),
-                1,
-                std::time::Duration::ZERO,
-            )
-            .unwrap(),
-        );
-        ledger
-            .configure_tenant(
-                budget::PERSONAL_TENANT_ID,
-                1_000_000,
-                "UTC",
-                idoris_tenancy::budget::SpendGate::PaidOnly,
-            )
-            .unwrap();
-        let (_app, mut retries) = crate::build_observed_app(crate::AppState {
-            budget_ledger: Some(ledger.clone()),
-            ..crate::AppState::default()
-        });
-        tokio::time::timeout(std::time::Duration::from_secs(3), retries.recv())
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
-
         let adapter = Arc::new(MockAdapter::new(vec![ModelInfo {
             id: "p".to_string(),
             memory_gb: 1.0,
         }]));
         adapter.set_chat_delay("p", std::time::Duration::from_secs(5));
         let supervisor = Supervisor::spawn(adapter, SupervisorConfig::default()).unwrap();
-        let cards = [paid_card("p")];
-        let profile = empty_profile();
-        let mut call = Box::pin(dispatch_local(
-            &cards,
-            Some(&supervisor),
-            Some(&ledger),
-            &profile,
-            "hi",
-            vec![ChatMessage {
-                role: "user".to_string(),
-                content: "hi".to_string(),
-            }],
-            CancellationToken::new(),
-        ));
-        std::future::poll_fn(|cx| {
-            assert!(call.as_mut().poll(cx).is_pending());
-            std::task::Poll::Ready(())
-        })
+        let cancel = CancellationToken::new();
+        let messages = vec![ChatMessage {
+            role: "user".to_string(),
+            content: "hi".to_string(),
+        }];
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            dispatch_local(
+                &[paid_card("p")],
+                Some(&supervisor),
+                Some(&ledger),
+                &empty_profile(),
+                "hi",
+                messages,
+                cancel.clone(),
+            ),
+        )
         .await;
-
-        let journal_path = path.with_added_extension("settlements.sqlite3");
-        let mut blocker = None;
-        match fault {
-            CancelReleaseFault::MainWriteLock => {
-                let connection = rusqlite::Connection::open(&path).unwrap();
-                connection.execute_batch("BEGIN IMMEDIATE").unwrap();
-                blocker = Some(connection);
-            }
-            CancelReleaseFault::SidecarExclusiveLock => {
-                let connection = rusqlite::Connection::open(&journal_path).unwrap();
-                let mode: String = connection
-                    .query_row("PRAGMA journal_mode", [], |row| row.get(0))
-                    .unwrap();
-                assert_ne!(mode.to_ascii_lowercase(), "wal");
-                connection.execute_batch("BEGIN EXCLUSIVE").unwrap();
-                let probe = rusqlite::Connection::open(&journal_path).unwrap();
-                probe.busy_timeout(std::time::Duration::ZERO).unwrap();
-                let error = probe
-                    .query_row("SELECT count(*) FROM settlement_intents", [], |row| {
-                        row.get::<_, i64>(0)
-                    })
-                    .unwrap_err();
-                assert!(matches!(BudgetError::from(error), BudgetError::Busy));
-                blocker = Some(connection);
-            }
-            CancelReleaseFault::MainReadError => {
-                // Rename after verifying the live hold below.
-            }
-        }
-
-        let main = rusqlite::Connection::open(&path).unwrap();
-        let hold: i64 = main
-            .query_row(
-                "SELECT dispatch_hold FROM reservations WHERE status='active'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(
-            hold, 1,
-            "paid dispatch must hold its reservation before await"
+        assert!(
+            outcome.is_err(),
+            "expected the call to still be in flight (mock chat_delay is 5s) when the 200ms timeout fired"
         );
-        let intents: i64 = if matches!(fault, CancelReleaseFault::SidecarExclusiveLock) {
-            blocker
-                .as_ref()
-                .unwrap()
-                .query_row("SELECT count(*) FROM settlement_intents", [], |row| {
-                    row.get(0)
-                })
-                .unwrap()
-        } else {
-            let journal = rusqlite::Connection::open(&journal_path).unwrap();
-            journal
-                .query_row("SELECT count(*) FROM settlement_intents", [], |row| {
-                    row.get(0)
-                })
-                .unwrap()
-        };
-        assert_eq!(intents, 1, "paid dispatch must persist its intent");
-        drop(main);
 
-        if matches!(fault, CancelReleaseFault::MainReadError) {
-            let main = rusqlite::Connection::open(&path).unwrap();
-            main.execute_batch("ALTER TABLE reservations RENAME TO reservations_unavailable")
-                .unwrap();
-        }
-
-        drop(call);
-        let failed = tokio::time::timeout(std::time::Duration::from_secs(3), retries.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(failed.is_err(), "worker should observe the injected fault");
-        match fault {
-            CancelReleaseFault::MainWriteLock | CancelReleaseFault::SidecarExclusiveLock => {
-                blocker.as_ref().unwrap().execute_batch("ROLLBACK").unwrap();
-            }
-            CancelReleaseFault::MainReadError => {
-                // Advancing past the TTL must not expire an active dispatch hold.
-                clock.0.store(2, Ordering::SeqCst);
-                let main = rusqlite::Connection::open(&path).unwrap();
-                let (status, hold): (String, i64) = main
-                    .query_row(
-                        "SELECT status, dispatch_hold FROM reservations_unavailable",
-                        [],
-                        |row| Ok((row.get(0)?, row.get(1)?)),
-                    )
-                    .unwrap();
-                assert_eq!((status.as_str(), hold), ("active", 1));
-                main.execute_batch("ALTER TABLE reservations_unavailable RENAME TO reservations")
-                    .unwrap();
-            }
-        }
-
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            loop {
-                if retries
-                    .recv()
-                    .await
-                    .expect("worker stopped before recovery")
-                    .is_ok()
-                {
-                    break;
-                }
-            }
-        })
-        .await
-        .expect("worker should automatically retry the known release");
+        // Not stuck reserved forever -- ReservationGuard's Drop released it
+        // even though none of dispatch_local's own `return`s ran.
         assert_eq!(
             ledger.tenant_balance(budget::PERSONAL_TENANT_ID).unwrap(),
-            1_000_000,
-            "cancellation must release without charging"
+            1_000_000
         );
-        let main = rusqlite::Connection::open(&path).unwrap();
-        let active: i64 = main
-            .query_row(
-                "SELECT count(*) FROM reservations WHERE status='active'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(active, 0);
-        let released: i64 = main
-            .query_row(
-                "SELECT count(*) FROM reservations WHERE status='released'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(released, 1);
-        drop(main);
-        let journal = rusqlite::Connection::open(&journal_path).unwrap();
-        let intents: i64 = journal
-            .query_row("SELECT count(*) FROM settlement_intents", [], |row| {
-                row.get(0)
-            })
-            .unwrap();
-        let pending_releases: i64 = journal
-            .query_row("SELECT count(*) FROM pending_releases", [], |row| {
-                row.get(0)
-            })
-            .unwrap();
-        assert_eq!(intents, 0);
-        assert_eq!(pending_releases, 0);
-        let id = budget::reserve(&ledger, None, "p", 500).unwrap();
-        budget::release(&ledger, None, &id).unwrap();
+        // The same token the Supervisor/adapter call received is cancelled.
+        assert!(cancel.is_cancelled());
     }
 }

@@ -30,7 +30,7 @@ pub use eviction::{
     EvictionPlan, ModelEntry, ModelReq, ModelState, PlanEvictionError, Snapshot, plan_eviction,
 };
 pub use mock::MockAdapter;
-pub use supervisor::{ChatCallOutcome, Supervisor, SupervisorConfig, SupervisorHandle};
+pub use supervisor::{Supervisor, SupervisorConfig, SupervisorHandle};
 pub use types::{BackendStatus, ChatMessage, ChatRequest, ChatResponse, ModelInfo, Pressure};
 
 #[cfg(test)]
