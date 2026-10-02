@@ -973,6 +973,7 @@ impl BudgetLedger {
         // promotion above committed, retaining memory until a durable write.
         if !deferred.is_empty() {
             let tx = journal.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let mut deferred_error = None;
             for (id, tenant, actual) in deferred {
                 match self.settle_primary(&tenant, &ReservationId(id.clone()), actual) {
                     Ok(_) | Err(BudgetError::OverageTooLarge { .. }) => {
@@ -984,17 +985,32 @@ impl BudgetLedger {
                         outcomes.remove(&id);
                     }
                     Err(error) => {
-                        store_primary_fallback(
+                        let fallback = store_primary_fallback(
                             &self.conn.lock().unwrap_or_else(|p| p.into_inner()),
                             &id,
                             &tenant,
                             actual,
-                        )?;
-                        return Err(error);
+                        );
+                        match fallback {
+                            Ok(()) => {
+                                // Either the primary settlement or the fallback
+                                // now owns this amount durably.
+                                outcomes.remove(&id);
+                            }
+                            Err(fallback_error) => {
+                                eprintln!(
+                                    "budget settlement recovery remains in memory: reservation={id} primary={error} fallback={fallback_error}"
+                                );
+                            }
+                        }
+                        deferred_error.get_or_insert(error);
                     }
                 }
             }
             tx.commit()?;
+            if let Some(error) = deferred_error {
+                return Err(error);
+            }
         }
 
         let tx = journal.transaction_with_behavior(TransactionBehavior::Immediate)?;

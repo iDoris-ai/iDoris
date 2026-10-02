@@ -212,12 +212,53 @@ pub fn build_app(state: AppState) -> Router {
     build_app_inner(state, None)
 }
 
+/// Builds the app and returns control over its settlement retry worker.
+/// Call [`SettlementWorker::stop`] during orderly shutdown to wait for any
+/// in-flight blocking retry to finish.
+pub fn build_app_with_settlement_worker(state: AppState) -> (Router, SettlementWorker) {
+    let worker = state
+        .budget_ledger
+        .as_ref()
+        .map(|ledger| spawn_settlement_worker(Arc::downgrade(ledger), None));
+    let app = build_router(state);
+    (app, worker.unwrap_or_else(SettlementWorker::finished))
+}
+
+/// Handle for the settlement retry task started by
+/// [`build_app_with_settlement_worker`].
+pub struct SettlementWorker {
+    stop: Arc<tokio::sync::Notify>,
+    task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl SettlementWorker {
+    fn finished() -> Self {
+        Self {
+            stop: Arc::new(tokio::sync::Notify::new()),
+            task: None,
+        }
+    }
+
+    /// Stops future retries and waits until the current `spawn_blocking`
+    /// retry has actually completed.
+    pub async fn stop(mut self) {
+        self.stop.notify_one();
+        if let Some(task) = self.task.take() {
+            let _ = task.await;
+        }
+    }
+}
+
 type SettlementRetryObserver = tokio::sync::mpsc::UnboundedSender<Result<(), String>>;
 
 fn build_app_inner(state: AppState, observer: Option<SettlementRetryObserver>) -> Router {
     if let Some(ledger) = &state.budget_ledger {
-        spawn_settlement_worker(Arc::downgrade(ledger), observer);
+        drop(spawn_settlement_worker(Arc::downgrade(ledger), observer));
     }
+    build_router(state)
+}
+
+fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/v1/models", get(list_models).fallback(not_found))
@@ -233,8 +274,10 @@ fn build_app_inner(state: AppState, observer: Option<SettlementRetryObserver>) -
 fn spawn_settlement_worker(
     ledger: std::sync::Weak<idoris_tenancy::budget::BudgetLedger>,
     observer: Option<SettlementRetryObserver>,
-) {
-    tokio::spawn(async move {
+) -> SettlementWorker {
+    let stop = Arc::new(tokio::sync::Notify::new());
+    let task_stop = stop.clone();
+    let task = tokio::spawn(async move {
         loop {
             let Some(ledger) = ledger.upgrade() else {
                 break;
@@ -254,9 +297,16 @@ fn spawn_settlement_worker(
                     eprintln!("budget settlement retry failed: {other:?}");
                 }
             }
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            tokio::select! {
+                _ = task_stop.notified() => break,
+                _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
+            }
         }
     });
+    SettlementWorker {
+        stop,
+        task: Some(task),
+    }
 }
 
 #[cfg(test)]
@@ -785,6 +835,38 @@ mod tests {
     use tower::ServiceExt;
 
     use super::*;
+
+    #[tokio::test]
+    async fn settlement_worker_stop_waits_for_running_blocking_job() {
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let ledger = Arc::new(());
+        let blocking_ledger = ledger.clone();
+        let task = tokio::spawn(async move {
+            let blocking = tokio::task::spawn_blocking(move || {
+                let _ledger = blocking_ledger;
+                started_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            });
+            blocking.await.unwrap();
+        });
+        tokio::task::spawn_blocking(move || started_rx.recv().unwrap())
+            .await
+            .unwrap();
+        let worker = SettlementWorker {
+            stop: Arc::new(tokio::sync::Notify::new()),
+            task: Some(task),
+        };
+        let mut stopping = tokio::spawn(worker.stop());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), &mut stopping)
+                .await
+                .is_err()
+        );
+        release_tx.send(()).unwrap();
+        stopping.await.unwrap();
+        assert_eq!(Arc::strong_count(&ledger), 1);
+    }
 
     fn sample_component_card(id: &str) -> ComponentCard {
         ComponentCard {

@@ -23,6 +23,175 @@ fn pending(ledger: &BudgetLedger) -> i64 {
         .unwrap()
 }
 
+fn reserve_pair(ledger: &BudgetLedger) -> [ReservationId; 2] {
+    let scope = BudgetScope::new("t", "k", "p", "m");
+    [
+        ledger.reserve(&scope, Price::Known(10)).unwrap(),
+        ledger.reserve(&scope, Price::Known(10)).unwrap(),
+    ]
+}
+
+fn fail_both_stores(ledger: &BudgetLedger, ids: &[ReservationId; 2]) {
+    for id in ids {
+        ledger.begin_settlement("t", id).unwrap();
+    }
+    ledger
+        .settlements
+        .lock()
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER fail_pending BEFORE INSERT ON pending_settlements
+             BEGIN SELECT RAISE(ABORT, 'injected journal failure'); END;",
+        )
+        .unwrap();
+    ledger
+        .conn
+        .lock()
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER fail_formal BEFORE UPDATE OF status ON reservations
+             WHEN NEW.status='settled' BEGIN SELECT RAISE(ABORT, 'injected settle failure'); END;
+             CREATE TRIGGER fail_fallback BEFORE UPDATE OF actual_cost_minor ON reservations
+             BEGIN SELECT RAISE(ABORT, 'injected fallback failure'); END;",
+        )
+        .unwrap();
+    for (id, actual) in ids.iter().zip([20, 30]) {
+        assert!(ledger.settle_durable("t", id, actual).is_err());
+    }
+}
+
+#[test]
+fn one_fallback_failure_does_not_block_the_other_cost() {
+    let (ledger, _) = reserved();
+    let ids = reserve_pair(&ledger);
+    fail_both_stores(&ledger, &ids);
+    let failing_id = ledger
+        .settlement_outcomes
+        .lock()
+        .unwrap()
+        .keys()
+        .next()
+        .unwrap()
+        .clone();
+    let successful_id = ids.iter().find(|id| id.0 != failing_id).unwrap().0.clone();
+    let successful_actual = if ids[0].0 == successful_id { 20 } else { 30 };
+    ledger
+        .conn
+        .lock()
+        .unwrap()
+        .execute_batch("DROP TRIGGER fail_fallback")
+        .unwrap();
+    let fail_one = format!(
+        "CREATE TRIGGER fail_fallback BEFORE UPDATE OF actual_cost_minor ON reservations
+         WHEN OLD.id='{failing_id}' BEGIN SELECT RAISE(ABORT, 'injected fallback failure'); END;"
+    );
+    ledger
+        .conn
+        .lock()
+        .unwrap()
+        .execute_batch(&fail_one)
+        .unwrap();
+    let before_retry: Option<i64> = ledger
+        .conn
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT actual_cost_minor FROM reservations WHERE id=?1",
+            [&successful_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(before_retry, None);
+
+    assert!(ledger.retry_settlements().is_err());
+    let outcomes = ledger.settlement_outcomes.lock().unwrap();
+    assert!(outcomes.contains_key(&failing_id));
+    assert!(!outcomes.contains_key(&successful_id));
+    let actual: i64 = ledger
+        .conn
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT actual_cost_minor FROM reservations WHERE id=?1",
+            [&successful_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(actual, successful_actual);
+}
+
+#[test]
+fn retry_falls_back_for_all_costs_and_restart_charges_each_once() {
+    let dir = std::env::temp_dir().join(format!(
+        "idoris-settlement-fallback-{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir(&dir).unwrap();
+    let path = dir.join("budget.sqlite3");
+    let ledger = BudgetLedger::open(&path).unwrap();
+    ledger
+        .configure_tenant("t", 1000, "UTC", SpendGate::All)
+        .unwrap();
+    let ids = reserve_pair(&ledger);
+    fail_both_stores(&ledger, &ids);
+    ledger
+        .conn
+        .lock()
+        .unwrap()
+        .execute_batch("DROP TRIGGER fail_fallback")
+        .unwrap();
+
+    assert!(ledger.retry_settlements().is_err());
+    assert!(ledger.settlement_outcomes.lock().unwrap().is_empty());
+    let actuals: Vec<i64> = ids
+        .iter()
+        .map(|id| {
+            ledger
+                .conn
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT actual_cost_minor FROM reservations WHERE id=?1",
+                    [&id.0],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        })
+        .collect();
+    assert_eq!(actuals, [20, 30]);
+    drop(ledger);
+
+    Connection::open(path.with_added_extension("settlements.sqlite3"))
+        .unwrap()
+        .execute_batch("DROP TRIGGER fail_pending")
+        .unwrap();
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch("DROP TRIGGER fail_formal")
+        .unwrap();
+    let reopened = BudgetLedger::open(&path).unwrap();
+    reopened.retry_settlements().unwrap();
+    assert_eq!(reopened.tenant_balance("t").unwrap(), 950);
+    for (id, expected_actual) in ids.iter().zip([20, 30]) {
+        let (status, actual): (String, i64) = reopened
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT status, actual_cost_minor FROM reservations WHERE id=?1",
+                [&id.0],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "settled");
+        assert_eq!(actual, expected_actual);
+    }
+    reopened.retry_settlements().unwrap();
+    assert_eq!(reopened.tenant_balance("t").unwrap(), 950);
+    drop(reopened);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 #[test]
 fn storage_rollback_keeps_actual_cost_and_blocks_new_spending_until_recovery() {
     let (ledger, id) = reserved();

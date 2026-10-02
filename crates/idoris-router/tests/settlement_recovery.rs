@@ -22,7 +22,7 @@ use idoris_contracts::{
     component_card::{Egress, Form},
     provider::{Cost, Family, Locality, ProviderDescriptor},
 };
-use idoris_router::{AppState, build_app};
+use idoris_router::{AppState, build_app, build_app_with_settlement_worker};
 use idoris_tenancy::budget::{BudgetLedger, BudgetScope, Clock, Price, SpendGate};
 use rusqlite::Connection;
 use tokio::sync::Notify;
@@ -372,7 +372,7 @@ async fn successful_chat_leaves_durable_pending_charge_until_reopen_recovers_it_
         chat_calls: None,
     });
     let supervisor = Supervisor::spawn(adapter, SupervisorConfig::default()).unwrap();
-    let app = build_app(AppState {
+    let (app, settlement_worker) = build_app_with_settlement_worker(AppState {
         cards: vec![card()],
         supervisor: Some(supervisor),
         budget_ledger: Some(ledger.clone()),
@@ -480,6 +480,7 @@ async fn successful_chat_leaves_durable_pending_charge_until_reopen_recovers_it_
     drop(sidecar);
     drop(tx); // release the writer lock
     drop(primary);
+    settlement_worker.stop().await;
     assert_eq!(
         Arc::strong_count(&ledger),
         1,
