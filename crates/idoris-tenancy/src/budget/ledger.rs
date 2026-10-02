@@ -202,6 +202,7 @@ pub struct BudgetLedger {
     pub(super) conn: Mutex<Connection>,
     pub(super) settlements: Mutex<Connection>,
     pub(super) settlement_outcomes: Mutex<HashMap<String, (String, i64)>>,
+    pub(super) unverified_settlements: Mutex<HashMap<(ReservationId, String), i64>>,
     pub(super) live_intents: Mutex<HashMap<String, String>>,
     pub(super) dispatch_locks: Mutex<HashMap<String, super::settlement::DispatchLease>>,
     pub(super) dispatch_lock_dir: PathBuf,
@@ -294,12 +295,19 @@ impl BudgetLedger {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.busy_timeout(busy_timeout)?;
         run_migrations(&mut conn)?;
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS budget_emergency_settlements (
+                reservation_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL,
+                actual_cost_minor INTEGER NOT NULL CHECK(actual_cost_minor >= 0)
+            );",
+        )?;
         let settlements =
             super::settlement::open(&storage_path, path.as_ref(), &conn, busy_timeout)?;
         let ledger = Self {
             conn: Mutex::new(conn),
             settlements: Mutex::new(settlements),
             settlement_outcomes: Mutex::new(HashMap::new()),
+            unverified_settlements: Mutex::new(HashMap::new()),
             live_intents: Mutex::new(HashMap::new()),
             dispatch_locks: Mutex::new(HashMap::new()),
             dispatch_lock_dir: if path.as_ref() == Path::new(":memory:") {
@@ -546,7 +554,7 @@ impl BudgetLedger {
             Price::Known(v) => v,
         };
 
-        self.retry_settlements()?;
+        self.retry_settlements_for_tenant(Some(&scope.tenant_id))?;
         // Live dispatches keep their reservations. Only an intent whose
         // caller is no longer live blocks this tenant pending recovery.
         let _outcomes = self
@@ -1054,6 +1062,16 @@ impl BudgetLedger {
         Ok(())
     }
 
+    /// Confirm that the upstream call did not execute, using the same
+    /// dispatch ownership checks and durable cancellation retry as release.
+    pub fn release_confirmed_unexecuted(
+        &self,
+        tenant_id: &str,
+        reservation_id: &ReservationId,
+    ) -> Result<(), BudgetError> {
+        self.release(tenant_id, reservation_id)
+    }
+
     /// Fully release a reservation without charging anything — for calls
     /// that failed or that fell back to a different (separately reserved)
     /// candidate. Idempotent when the reservation is already `released`;
@@ -1066,8 +1084,8 @@ impl BudgetLedger {
     /// L3 (Opus Tier-2 acceptance): releasing an already-`expired` (but not
     /// yet settled/released) reservation succeeds (`Ok(())`) instead of
     /// erroring — no charge was ever recorded against it, so "release" (no
-    /// charge is due) is already true; only `settled` is a genuine
-    /// "you can't undo this" rejection.
+    /// charge is due) is already true when no dispatch intent or completed
+    /// outcome is awaiting recovery.
     ///
     /// Every success path here writes `Released`, **never** leaves a row as
     /// `Expired` — this matters as of H1 (a follow-up PR makes `settle`
@@ -1087,6 +1105,17 @@ impl BudgetLedger {
             .settlement_outcomes
             .lock()
             .unwrap_or_else(|p| p.into_inner());
+        if self
+            .unverified_settlements
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains_key(&(reservation_id.clone(), tenant_id.to_owned()))
+        {
+            return Err(BudgetError::SettlementConflict {
+                reservation_id: reservation_id.0.clone(),
+                reason: "completed settlement is awaiting ownership verification".into(),
+            });
+        }
         let mut live = self.live_intents.lock().unwrap_or_else(|p| p.into_inner());
         if outcomes.contains_key(&reservation_id.0) {
             return Err(BudgetError::Storage(
@@ -1107,6 +1136,16 @@ impl BudgetLedger {
                         return Err(BudgetError::Storage(
                             "cannot release reservation with a recorded actual outcome".into(),
                         ));
+                    }
+                    let emergency: bool = conn.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM budget_emergency_settlements WHERE reservation_id=?1)",
+                        [&reservation_id.0], |r| r.get(0),
+                    )?;
+                    if emergency {
+                        return Err(BudgetError::SettlementConflict {
+                            reservation_id: reservation_id.0.clone(),
+                            reason: "completed settlement is pending emergency recovery".into(),
+                        });
                     }
                     None
                 }

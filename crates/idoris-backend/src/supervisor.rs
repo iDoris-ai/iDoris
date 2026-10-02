@@ -1514,6 +1514,28 @@ mod tests {
         assert_eq!(err.reason_code(), "model_not_found");
     }
 
+    /// The durable dispatch caller must distinguish a Supervisor rejection
+    /// from a request that may have reached the adapter.
+    #[tokio::test]
+    async fn chat_outcome_classifies_pre_adapter_rejection_as_not_submitted() {
+        let adapter = Arc::new(MockAdapter::new(catalog()));
+        let handle =
+            Supervisor::spawn(adapter, SupervisorConfig::default()).expect("spawn should succeed");
+        let outcome = handle
+            .chat_with_outcome(
+                ChatRequest {
+                    model: "a".to_string(),
+                    messages: vec![],
+                },
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(matches!(
+            outcome,
+            ChatCallOutcome::NotSubmitted(err) if err.reason_code() == "model_not_found"
+        ));
+    }
+
     #[test]
     fn spawn_rejects_a_non_finite_budget() {
         let adapter = Arc::new(MockAdapter::new(catalog()));

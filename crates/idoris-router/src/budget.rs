@@ -123,7 +123,8 @@ pub fn reserve(
 }
 
 /// Finalizes a reservation with the actual cost, returning the amount
-/// actually charged, or None when durably queued for retry.
+/// actually charged, or None when durably queued for retry. This remains as
+/// the concise request glue used by existing callers.
 pub fn settle(
     ledger: &BudgetLedger,
     tenant_id: Option<&str>,
@@ -134,6 +135,17 @@ pub fn settle(
     ledger.settle_durable(tenant_id, reservation_id, actual_cost_minor)
 }
 
+/// Explicit name for production call sites that need the durable retry
+/// semantics of [`BudgetLedger::settle_durable`].
+pub fn settle_durable(
+    ledger: &BudgetLedger,
+    tenant_id: Option<&str>,
+    reservation_id: &ReservationId,
+    actual_cost_minor: i64,
+) -> Result<Option<i64>, BudgetError> {
+    settle(ledger, tenant_id, reservation_id, actual_cost_minor)
+}
+
 /// Releases a reservation for a call that didn't happen (backend failure)
 /// — never call this for a call that actually completed (use [`settle`]).
 pub fn release(
@@ -142,6 +154,16 @@ pub fn release(
     reservation_id: &ReservationId,
 ) -> Result<(), BudgetError> {
     ledger.release(tenant_id.unwrap_or(PERSONAL_TENANT_ID), reservation_id)
+}
+
+/// Releases a reservation only after the Supervisor confirms the request was
+/// rejected before adapter execution.
+pub fn release_confirmed_unexecuted(
+    ledger: &BudgetLedger,
+    tenant_id: Option<&str>,
+    reservation_id: &ReservationId,
+) -> Result<(), BudgetError> {
+    ledger.release_confirmed_unexecuted(tenant_id.unwrap_or(PERSONAL_TENANT_ID), reservation_id)
 }
 
 #[cfg(test)]

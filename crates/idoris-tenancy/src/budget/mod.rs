@@ -8,6 +8,7 @@
 mod clock;
 mod error;
 mod estimator;
+mod intent;
 mod ledger;
 mod period;
 mod scope;

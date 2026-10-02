@@ -403,7 +403,7 @@ fn assert_claimed_reservation_unchanged(path: &TempDb, id: &idoris_tenancy::budg
 }
 
 #[test]
-fn unclaimed_settlement_insert_failure_does_not_write_primary_fallback() {
+fn unclaimed_settlement_rollback_does_not_write_primary_fallback() {
     let path = db("unclaimed-insert-failure");
     let clock = Arc::new(TestClock(AtomicI64::new(0)));
     let ledger = open(&path, clock, 60_000);
@@ -411,13 +411,16 @@ fn unclaimed_settlement_insert_failure_does_not_write_primary_fallback() {
     ledger.configure(&s, 100, "UTC").unwrap();
     let id = ledger.reserve(&s, Price::Known(30)).unwrap();
 
+    // ABORT leaves the journal writer held and permits the target branch's
+    // serialized primary fallback. ROLLBACK drops that ownership fence; an
+    // unclaimed caller must not write primary after losing it.
     let sidecar_path = path.as_ref().with_added_extension("settlements.sqlite3");
     let sidecar = Connection::open(&sidecar_path).unwrap();
     sidecar
         .execute_batch(
             "CREATE TRIGGER fail_pending_insert
              BEFORE INSERT ON pending_settlements
-             BEGIN SELECT RAISE(ABORT, 'injected journal insert failure'); END;",
+             BEGIN SELECT RAISE(ROLLBACK, 'injected journal insert failure'); END;",
         )
         .unwrap();
     assert!(ledger.settle_durable("tenant", &id, 27).is_err());

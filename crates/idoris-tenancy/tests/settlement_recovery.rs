@@ -188,3 +188,69 @@ fn sidecar_retry_persists_actual_before_primary_recovers_and_survives_restart() 
     recovered.settle_durable("tenant", &next, 20).unwrap();
     assert_eq!(recovered.balance(&scope).unwrap(), 55);
 }
+
+#[test]
+fn unreadable_primary_and_locked_sidecar_persist_actual_before_restart() {
+    let path = db();
+    let ledger = open(&path);
+    let scope = BudgetScope::new("tenant", "key", "provider", "model");
+    ledger.configure(&scope, 100, "UTC").unwrap();
+    let id = ledger.reserve(&scope, Price::Known(40)).unwrap();
+    ledger.begin_settlement("tenant", &id).unwrap();
+
+    // Hide the primary table only after begin_settlement established the
+    // dispatch ownership that authorizes this in-memory actual outcome.
+    let primary = Connection::open(path.as_ref()).unwrap();
+    primary
+        .execute_batch("ALTER TABLE reservations RENAME TO reservations_temporarily_hidden;")
+        .unwrap();
+    drop(primary);
+
+    let mut journal = Connection::open(sidecar(&path)).unwrap();
+    journal.busy_timeout(Duration::ZERO).unwrap();
+    let journal_lock = journal
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .unwrap();
+    assert!(ledger.settle_durable("tenant", &id, 31).is_err());
+
+    // Once the sidecar lock clears, retry must durably record the verified
+    // in-memory outcome before the primary lookup fails on the hidden table.
+    drop(journal_lock);
+    assert!(ledger.retry_settlements().is_err());
+    assert_eq!(pending_actual(&path, &id.0), Some(31));
+    drop(journal);
+    drop(ledger);
+    assert_eq!(pending_actual(&path, &id.0), Some(31));
+
+    let primary = Connection::open(path.as_ref()).unwrap();
+    primary
+        .execute_batch("ALTER TABLE reservations_temporarily_hidden RENAME TO reservations;")
+        .unwrap();
+    drop(primary);
+
+    let recovered = open(&path);
+    recovered.retry_settlements().unwrap();
+    recovered.retry_settlements().unwrap();
+    assert_eq!(recovered.balance(&scope).unwrap(), 69);
+    let (status, actual): (String, Option<i64>) = Connection::open(path.as_ref())
+        .unwrap()
+        .query_row(
+            "SELECT status, actual_cost_minor FROM reservations WHERE id=?1",
+            [&id.0],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!((status.as_str(), actual), ("settled", Some(31)));
+    assert_eq!(pending_actual(&path, &id.0), None);
+    let journal = Connection::open(sidecar(&path)).unwrap();
+    for table in ["settlement_intents", "dispatch_owners"] {
+        let count: i64 = journal
+            .query_row(
+                &format!("SELECT count(*) FROM {table} WHERE reservation_id=?1"),
+                [&id.0],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0, "{table} should be cleaned after recovery");
+    }
+}

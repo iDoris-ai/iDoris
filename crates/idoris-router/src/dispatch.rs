@@ -72,14 +72,24 @@ pub enum DispatchFailure {
 
 /// What [`dispatch_local`] returns on a successful `decide()`.
 /// `served_locality` is set even when `result` is `Err` (interface spec
-/// §3.12). `actual_cost_minor` is `Some` only after a successful `settle`
-/// on a paid candidate — `None` for free/failed or durably queued settlement.
+/// §3.12). `actual_cost_minor` is `Some` only after the ledger committed the
+/// charge. A durable retry journal or unresolved persistence error is reported
+/// through `settlement_status` while the successful response is still returned.
 #[derive(Debug)]
 pub struct ChatOutcome {
     pub decision: Decision,
     pub served_locality: Locality,
     pub result: Result<ChatResponse, DispatchFailure>,
     pub actual_cost_minor: Option<i64>,
+    pub settlement_status: SettlementStatus,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SettlementStatus {
+    NotRequired,
+    Committed,
+    Pending,
+    PersistenceFailed,
 }
 
 #[derive(Debug)]
@@ -326,6 +336,7 @@ pub async fn dispatch_local(
                         tenant_id, &model_id,
                     ))),
                     actual_cost_minor: None,
+                    settlement_status: SettlementStatus::NotRequired,
                 });
             }
             Some(ledger) => {
@@ -340,6 +351,7 @@ pub async fn dispatch_local(
                                 served_locality,
                                 result: Err(DispatchFailure::Budget(err)),
                                 actual_cost_minor: None,
+                                settlement_status: SettlementStatus::NotRequired,
                             });
                         }
                     }
@@ -349,6 +361,7 @@ pub async fn dispatch_local(
                             served_locality,
                             result: Err(DispatchFailure::Budget(err)),
                             actual_cost_minor: None,
+                            settlement_status: SettlementStatus::NotRequired,
                         });
                     }
                 }
@@ -366,6 +379,7 @@ pub async fn dispatch_local(
                 BackendError::supervisor_unavailable(),
             )),
             actual_cost_minor: None,
+            settlement_status: SettlementStatus::NotRequired,
         });
     };
 
@@ -388,6 +402,7 @@ pub async fn dispatch_local(
             served_locality,
             result: Err(DispatchFailure::Backend(err)),
             actual_cost_minor: None,
+            settlement_status: SettlementStatus::NotRequired,
         });
     }
 
@@ -422,7 +437,7 @@ pub async fn dispatch_local(
         let chat_result = match chat_call {
             ChatCallOutcome::NotSubmitted(error) => {
                 if let Some(submitted) = &submitted
-                    && let Err(release_error) = budget::release(
+                    && let Err(release_error) = budget::release_confirmed_unexecuted(
                         &submitted.ledger,
                         Some(&submitted.tenant_id),
                         &submitted.id,
@@ -433,12 +448,16 @@ pub async fn dispatch_local(
                         submitted.id.0
                     );
                 }
-                let _ = reply.send((Err(DispatchFailure::Backend(error)), None));
+                let _ = reply.send((
+                    Err(DispatchFailure::Backend(error)),
+                    None,
+                    SettlementStatus::NotRequired,
+                ));
                 return;
             }
             ChatCallOutcome::Submitted(result) => result,
         };
-        let actual_cost_minor = match (&submitted, &chat_result) {
+        let (actual_cost_minor, settlement_status) = match (&submitted, &chat_result) {
             (Some(submitted), Ok(response)) => {
                 let actual = budget::estimate_actual_cost_minor(
                     &cost,
@@ -446,32 +465,48 @@ pub async fn dispatch_local(
                     &response.content,
                     estimated_cost_minor,
                 );
-                match budget::settle(
+                match budget::settle_durable(
                     &submitted.ledger,
                     Some(&submitted.tenant_id),
                     &submitted.id,
                     actual,
                 ) {
-                    Ok(charged) => charged,
+                    Ok(Some(charged)) => (Some(charged), SettlementStatus::Committed),
+                    Ok(None) => (None, SettlementStatus::Pending),
+                    Err(
+                        err @ BudgetError::OverageTooLarge {
+                            actual_cost_minor, ..
+                        },
+                    ) => {
+                        eprintln!(
+                            "budget settlement overage committed: reservation={} actual_cost_minor={} error={err}",
+                            submitted.id.0, actual_cost_minor
+                        );
+                        (Some(actual_cost_minor), SettlementStatus::Committed)
+                    }
                     Err(err) => {
-                        let _ = reply.send((Err(DispatchFailure::Budget(err)), None));
-                        return;
+                        eprintln!(
+                            "budget settlement persistence failed: reservation={} actual_cost_minor={} error={err}",
+                            submitted.id.0, actual
+                        );
+                        (None, SettlementStatus::PersistenceFailed)
                     }
                 }
             }
-            _ => None,
+            _ => (None, SettlementStatus::NotRequired),
         };
         let result = chat_result.map_err(DispatchFailure::Backend);
-        let _ = reply.send((result, actual_cost_minor));
+        let _ = reply.send((result, actual_cost_minor, settlement_status));
     });
 
-    let (result, actual_cost_minor) = match result_rx.await {
+    let (result, actual_cost_minor, settlement_status) = match result_rx.await {
         Ok(result) => result,
         Err(_) => (
             Err(DispatchFailure::Backend(
                 BackendError::supervisor_unavailable(),
             )),
             None,
+            SettlementStatus::PersistenceFailed,
         ),
     };
     Ok(ChatOutcome {
@@ -479,6 +514,7 @@ pub async fn dispatch_local(
         served_locality,
         result,
         actual_cost_minor,
+        settlement_status,
     })
 }
 
@@ -819,6 +855,97 @@ mod tests {
         .await
         .unwrap();
         assert!(outcome.result.is_ok());
+        let charged = outcome.actual_cost_minor.unwrap();
+        assert!(charged > 0);
+        assert_eq!(
+            ledger.tenant_balance(budget::PERSONAL_TENANT_ID).unwrap(),
+            1_000_000 - charged
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_paid_response_keeps_a_committed_overage_as_success() {
+        let (_dir, ledger) = configured_ledger(1_000_000);
+        let adapter = Arc::new(MockAdapter::new(vec![ModelInfo {
+            id: "p".to_string(),
+            memory_gb: 1.0,
+        }]));
+        let supervisor = Supervisor::spawn(adapter, SupervisorConfig::default()).unwrap();
+        let prompt = "x".repeat(20_000);
+        let mut card = paid_card("p");
+        card.provider.cost.input_per_m = 0.0;
+        let outcome = dispatch_local(
+            &[card.clone()],
+            Some(&supervisor),
+            Some(&ledger),
+            &empty_profile(),
+            &prompt,
+            vec![ChatMessage {
+                role: "user".into(),
+                content: prompt.clone(),
+            }],
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert!(outcome.result.is_ok());
+        assert_eq!(outcome.settlement_status, SettlementStatus::Committed);
+        let charged = outcome.actual_cost_minor.unwrap();
+        let reserved = budget::estimate_cost_minor(&card.provider.cost, &prompt).unwrap();
+        assert!(
+            charged > reserved * 4,
+            "charge {charged}, reserve {reserved}"
+        );
+        assert_eq!(
+            ledger.tenant_balance(budget::PERSONAL_TENANT_ID).unwrap(),
+            1_000_000 - charged
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_paid_response_reports_primary_fallback_commit() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ledger = Arc::new(BudgetLedger::open(dir.path().join("b.sqlite3")).unwrap());
+        ledger
+            .configure_tenant(
+                budget::PERSONAL_TENANT_ID,
+                1_000_000,
+                "UTC",
+                idoris_tenancy::budget::SpendGate::PaidOnly,
+            )
+            .unwrap();
+        let sidecar_path = dir.path().join("b.sqlite3.settlements.sqlite3");
+        rusqlite::Connection::open(sidecar_path)
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER fail_pending_insert BEFORE INSERT ON pending_settlements
+             BEGIN SELECT RAISE(ABORT, 'injected sidecar failure'); END;",
+            )
+            .unwrap();
+        let adapter = Arc::new(MockAdapter::new(vec![ModelInfo {
+            id: "p".into(),
+            memory_gb: 1.0,
+        }]));
+        let supervisor = Supervisor::spawn(adapter, SupervisorConfig::default()).unwrap();
+        let outcome = dispatch_local(
+            &[paid_card("p")],
+            Some(&supervisor),
+            Some(&ledger),
+            &empty_profile(),
+            "hi",
+            vec![ChatMessage {
+                role: "user".into(),
+                content: "hello".into(),
+            }],
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            outcome.result.is_ok(),
+            "completed upstream response is retained"
+        );
+        assert_eq!(outcome.settlement_status, SettlementStatus::Committed);
         let charged = outcome.actual_cost_minor.unwrap();
         assert!(charged > 0);
         assert_eq!(
@@ -1361,7 +1488,15 @@ mod tests {
         main_lock.execute_batch("BEGIN IMMEDIATE").unwrap();
 
         let outcome = call.await.unwrap();
-        assert!(matches!(outcome.result, Err(DispatchFailure::Budget(_))));
+        assert!(
+            outcome.result.is_ok(),
+            "completed upstream response is retained"
+        );
+        assert_eq!(outcome.actual_cost_minor, None);
+        assert_eq!(
+            outcome.settlement_status,
+            SettlementStatus::PersistenceFailed
+        );
         let main = rusqlite::Connection::open(&path).unwrap();
         let actuals: i64 = main
             .query_row(
