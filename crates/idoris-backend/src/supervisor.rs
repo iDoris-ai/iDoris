@@ -709,6 +709,9 @@ struct Env<'a> {
     adapter: &'a Arc<dyn RuntimeAdapter>,
     config: &'a SupervisorConfig,
     self_tx: &'a mpsc::WeakSender<ActorMsg>,
+    // Unknown startup residency is fixed; managed estimates are charged separately.
+    reserved_gb: f64,
+    startup_error: Option<BackendError>,
 }
 
 /// `models` as [`crate::eviction::plan_eviction`] sees it — every entry
@@ -787,8 +790,8 @@ fn start_load(
         .map(|(_, slot)| slot.memory_gb)
         .sum();
     let release_limits = ReleaseLimits {
-        target_absent_gb: release_limit_gb,
-        after_eviction_gb: release_limit_gb + previous_memory_gb,
+        target_absent_gb: release_limit_gb + env.reserved_gb,
+        after_eviction_gb: release_limit_gb + previous_memory_gb + env.reserved_gb,
     };
     let adapter = env.adapter.clone();
     let config = env.config.clone();
@@ -928,7 +931,11 @@ fn handle_load(
         return;
     }
 
-    let snapshot = build_snapshot(models, env.config.budget_gb, &id);
+    if env.reserved_gb > env.config.budget_gb {
+        let _ = reply.send(Err(BackendError::eviction_impossible(&id)));
+        return;
+    }
+    let snapshot = build_snapshot(models, env.config.budget_gb - env.reserved_gb, &id);
     let evict = match plan_eviction(
         &snapshot,
         ModelReq {
@@ -1075,7 +1082,7 @@ fn handle_unload(
         },
     });
     if inflight == 0 {
-        let max_used_gb = ledger_used_except(models, &id);
+        let max_used_gb = ledger_used_except(models, &id) + env.reserved_gb;
         start_unload(id, max_used_gb, env);
     }
 }
@@ -1099,10 +1106,35 @@ async fn run_actor(
     // the *entire* actor task (and, with it, every other in-flight and
     // future caller) over a single corrupted entry.
     let mut poisoned: Option<String> = None;
+    // Sample engine residency once, before accepting commands. Spawning the
+    // adapter call isolates panic; the timeout bounds startup even when the
+    // adapter never returns.
+    let startup_adapter = adapter.clone();
+    let timeout = config.adapter_call_timeout;
+    let startup = tokio::spawn(async move {
+        with_adapter_timeout(startup_adapter.status(), timeout, "startup/status").await
+    })
+    .await
+    .map_err(|err| BackendError::adapter_panicked("startup/status", err.to_string()))
+    .and_then(|result| result);
+    let startup = startup.and_then(|status| {
+        if !status.used_gb.is_finite()
+            || status.used_gb < 0.0
+            || (status.used_gb == 0.0 && !status.loaded.is_empty())
+        {
+            Err(BackendError::internal(
+                "engine residency has no valid memory measurement",
+            ))
+        } else {
+            Ok(status.used_gb)
+        }
+    });
     let env = Env {
         adapter: &adapter,
         config: &config,
         self_tx: &self_tx,
+        reserved_gb: startup.as_ref().copied().unwrap_or_default(),
+        startup_error: startup.err(),
     };
 
     while let Some(msg) = rx.recv().await {
@@ -1146,11 +1178,16 @@ async fn run_actor(
             }
 
             ActorMsg::Cmd(Command::Status { reply }) => {
+                if let Some(err) = &env.startup_error {
+                    let _ = reply.send(Err(err.clone()));
+                    continue;
+                }
                 let used_gb: f64 = models
                     .values()
                     .filter(|slot| occupies_budget(slot.state))
                     .map(|slot| slot.memory_gb)
-                    .sum();
+                    .sum::<f64>()
+                    + env.reserved_gb;
                 let pressure = if used_gb >= config.budget_gb {
                     Pressure::Hard
                 } else if used_gb >= config.budget_gb * 0.8 {
@@ -1232,6 +1269,10 @@ async fn run_actor(
                 policy,
                 reply,
             }) => {
+                if let Some(err) = &env.startup_error {
+                    let _ = reply.send(Err(err.clone()));
+                    continue;
+                }
                 handle_load(
                     id,
                     memory_gb,
@@ -1375,7 +1416,7 @@ async fn run_actor(
                             && !*started
                         {
                             *started = true;
-                            let max_used_gb = ledger_used_except(&models, &model);
+                            let max_used_gb = ledger_used_except(&models, &model) + env.reserved_gb;
                             start_unload(model, max_used_gb, &env);
                         }
                     }
@@ -2949,6 +2990,8 @@ mod tests {
     struct LaggingReleaseAdapter {
         status_calls: std::sync::Mutex<u32>,
         calls_until_drop: u32,
+        loaded: std::sync::atomic::AtomicBool,
+        releasing: std::sync::atomic::AtomicBool,
     }
 
     #[async_trait::async_trait]
@@ -2957,9 +3000,14 @@ mod tests {
             Ok(evictable_catalog())
         }
         async fn load(&self, _id: &str, _policy: Option<&LoadPolicy>) -> Result<(), BackendError> {
+            self.loaded.store(true, std::sync::atomic::Ordering::SeqCst);
+            self.releasing
+                .store(false, std::sync::atomic::Ordering::SeqCst);
             Ok(())
         }
         async fn unload(&self, _id: &str) -> Result<(), BackendError> {
+            self.releasing
+                .store(true, std::sync::atomic::Ordering::SeqCst);
             Ok(())
         }
         async fn status(&self) -> Result<BackendStatus, BackendError> {
@@ -2967,17 +3015,24 @@ mod tests {
                 .status_calls
                 .lock()
                 .expect("test mutex is never poisoned");
-            *calls += 1;
-            let used_gb = if *calls >= self.calls_until_drop {
+            let releasing = self.releasing.load(std::sync::atomic::Ordering::SeqCst);
+            *calls += u32::from(releasing);
+            let used_gb = if !self.loaded.load(std::sync::atomic::Ordering::SeqCst)
+                || (releasing && *calls >= self.calls_until_drop)
+            {
                 0.0
             } else {
-                100.0
+                20.0
             };
             Ok(BackendStatus {
                 pressure: Pressure::Ok,
                 used_gb,
                 model_memory_max_gb: 100.0,
-                loaded: Vec::new(),
+                loaded: if used_gb > 0.0 {
+                    vec!["a".into()]
+                } else {
+                    Vec::new()
+                },
             })
         }
         async fn probe_ready(&self, _id: &str) -> Result<bool, BackendError> {
@@ -3002,6 +3057,8 @@ mod tests {
         let adapter = Arc::new(LaggingReleaseAdapter {
             status_calls: std::sync::Mutex::new(0),
             calls_until_drop: 4,
+            loaded: std::sync::atomic::AtomicBool::new(false),
+            releasing: std::sync::atomic::AtomicBool::new(false),
         });
         let handle = Supervisor::spawn(adapter.clone(), tight_budget_config())
             .expect("spawn should succeed");
@@ -3029,6 +3086,8 @@ mod tests {
         let adapter = Arc::new(LaggingReleaseAdapter {
             status_calls: std::sync::Mutex::new(0),
             calls_until_drop: u32::MAX, // never drops
+            loaded: std::sync::atomic::AtomicBool::new(false),
+            releasing: std::sync::atomic::AtomicBool::new(false),
         });
         let handle = Supervisor::spawn(adapter.clone(), tight_budget_config())
             .expect("spawn should succeed");
@@ -3048,6 +3107,7 @@ mod tests {
     struct UnverifiedReleaseAdapter {
         inner: MockAdapter,
         reported: std::sync::Mutex<Option<BackendStatus>>,
+        startup: std::sync::atomic::AtomicBool,
         probe_fails: bool,
     }
 
@@ -3063,6 +3123,12 @@ mod tests {
             Ok(()) // Engine acknowledges without actually freeing anything.
         }
         async fn status(&self) -> Result<BackendStatus, BackendError> {
+            if self
+                .startup
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return self.inner.status().await;
+            }
             self.reported
                 .lock()
                 .unwrap()
@@ -3099,6 +3165,7 @@ mod tests {
         };
         let adapter_for = |used_gb, loaded: Vec<String>| -> Arc<dyn RuntimeAdapter> {
             Arc::new(UnverifiedReleaseAdapter {
+                startup: std::sync::atomic::AtomicBool::new(false),
                 inner: MockAdapter::new(catalog()),
                 reported: std::sync::Mutex::new(Some(BackendStatus {
                     pressure: Pressure::Ok,
@@ -3151,6 +3218,7 @@ mod tests {
             None, // Status failure cannot be treated as release confirmation.
         ] {
             let adapter = Arc::new(UnverifiedReleaseAdapter {
+                startup: std::sync::atomic::AtomicBool::new(true),
                 inner: MockAdapter::new(
                     [("a", 4.0), ("b", 4.0), ("c", 8.0)]
                         .into_iter()
@@ -3204,6 +3272,7 @@ mod tests {
             (false, false, vec![]),
         ] {
             let adapter = Arc::new(UnverifiedReleaseAdapter {
+                startup: std::sync::atomic::AtomicBool::new(true),
                 inner: MockAdapter::new(two_model_catalog()),
                 reported: std::sync::Mutex::new(Some(BackendStatus {
                     pressure: Pressure::Ok,
@@ -3347,10 +3416,16 @@ mod tests {
                 .status_times
                 .lock()
                 .expect("test mutex is never poisoned");
-            // First confirmation poll reports high; the next confirms release.
-            // One poll interval is shorter than the backoff asserted below.
-            let used_gb = if times.is_empty() { 100.0 } else { 0.0 };
-            times.push(tokio::time::Instant::now());
+            let before_load = self.load_times.lock().unwrap().is_empty();
+            // Startup is empty; after OOM, one poll precedes release confirmation.
+            let used_gb = if !before_load && times.is_empty() {
+                100.0
+            } else {
+                0.0
+            };
+            if !before_load {
+                times.push(tokio::time::Instant::now());
+            }
             Ok(BackendStatus {
                 pressure: Pressure::Ok,
                 used_gb,

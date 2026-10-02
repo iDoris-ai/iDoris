@@ -108,6 +108,15 @@ async fn k09_load_timeout_triggers_release_and_preserves_unreleased_memory() {
     ];
     for (unload_status, release_status, expected_gb) in scenarios {
         let server = MockServer::start().await;
+        // Only the startup sample is empty; later polls use release_status below.
+        Mock::given(method("GET"))
+            .and(path("/api/status"))
+            .respond_with(status_body(&[], 0))
+            .with_priority(1)
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&server)
+            .await;
         Mock::given(method("POST"))
             .and(path("/v1/models/qwen3-8b/load"))
             .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(1)))
