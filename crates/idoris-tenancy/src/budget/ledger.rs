@@ -875,6 +875,40 @@ impl BudgetLedger {
         })
     }
 
+    /// Replay a settlement whose completed call's actual cost is already known.
+    /// `OverageTooLarge` means `settle` committed the charge and audit event,
+    /// so it counts as complete here. A settled row is accepted only when its
+    /// stored amount matches exactly, covering a crash after commit but before
+    /// the caller cleared its pending work. This API stores no pending work,
+    /// does not route calls, and does not retry automatically.
+    pub fn replay_settlement(
+        &self,
+        tenant_id: &str,
+        reservation_id: &ReservationId,
+        actual_cost_minor: i64,
+    ) -> Result<(), BudgetError> {
+        match self.settle(tenant_id, reservation_id, actual_cost_minor) {
+            Ok(_) | Err(BudgetError::OverageTooLarge { .. }) => Ok(()),
+            Err(err @ BudgetError::ReservationNotActive { .. }) => {
+                let conn = self.lock();
+                let settled_amount = conn
+                    .query_row(
+                        "SELECT actual_cost_minor FROM reservations \
+                         WHERE id=?1 AND tenant_id=?2 AND status='settled'",
+                        rusqlite::params![reservation_id.0, tenant_id],
+                        |row| row.get::<_, Option<i64>>(0),
+                    )
+                    .optional()?;
+                if settled_amount == Some(Some(actual_cost_minor)) {
+                    Ok(())
+                } else {
+                    Err(err)
+                }
+            }
+            Err(err) => Err(err),
+        }
+    }
+
     /// Renew a still-`active` reservation's TTL by `additional_ttl_ms` from
     /// now (H1) — for a caller whose upstream call is running longer than
     /// anticipated and wants to keep holding the budget rather than risk a
