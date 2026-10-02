@@ -76,18 +76,18 @@ fn assert_busy<T>(result: Result<T, BudgetError>) {
     assert!(matches!(result, Err(BudgetError::Busy)));
 }
 
-fn recover_after_sidecar_unlock(unverified: bool, block_commit: bool) {
+fn recover_after_sidecar_unlock(primary_unreadable: bool, block_commit: bool) {
     let (db, ledger, clock, scope, id) = setup();
     let mut primary = Connection::open(&db.0).unwrap();
     let mut sidecar = Connection::open(db.0.with_added_extension("settlements.sqlite3")).unwrap();
-    if unverified {
+    if primary_unreadable {
         primary
             .execute_batch("ALTER TABLE reservations RENAME TO reservations_hidden;")
             .unwrap();
-        assert!(matches!(
-            ledger.settle_durable("tenant", &id, 31),
-            Err(BudgetError::Storage(_))
-        ));
+        // begin_settlement captured this ledger's verified dispatch owner.
+        // The unreadable primary blocks replay, but the actual cost must still
+        // reach the sidecar before retry attempts that primary read.
+        assert_eq!(ledger.settle_durable("tenant", &id, 31).unwrap(), None);
         primary
             .execute_batch("ALTER TABLE reservations_hidden RENAME TO reservations;")
             .unwrap();
@@ -95,7 +95,7 @@ fn recover_after_sidecar_unlock(unverified: bool, block_commit: bool) {
     let primary_lock = primary
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .unwrap();
-    if !unverified {
+    if !primary_unreadable {
         let writer = sidecar
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .unwrap();
@@ -110,9 +110,10 @@ fn recover_after_sidecar_unlock(unverified: bool, block_commit: bool) {
             .unwrap();
         assert_eq!(mode, "delete");
         let reader = sidecar.transaction().unwrap();
-        assert_pending(&reader, &id.0, None);
+        let expected = primary_unreadable.then_some(("tenant", 31));
+        assert_pending(&reader, &id.0, expected);
         assert_busy(ledger.retry_settlements());
-        assert_pending(&reader, &id.0, None);
+        assert_pending(&reader, &id.0, expected);
         reader.rollback().unwrap();
     }
     // Only the sidecar has recovered; the primary writer remains held.
@@ -157,7 +158,7 @@ fn verified_cost_survives_sidecar_recovery_before_primary_unlock() {
 }
 
 #[test]
-fn unverified_cost_survives_sidecar_recovery_before_primary_unlock() {
+fn primary_unreadable_verified_cost_survives_sidecar_recovery_before_primary_unlock() {
     recover_after_sidecar_unlock(true, false);
 }
 
@@ -167,6 +168,6 @@ fn verified_cost_survives_retry_sidecar_commit_busy() {
 }
 
 #[test]
-fn unverified_cost_survives_retry_sidecar_commit_busy() {
+fn primary_unreadable_verified_cost_survives_retry_sidecar_commit_busy() {
     recover_after_sidecar_unlock(true, true);
 }

@@ -85,7 +85,11 @@ impl RuntimeAdapter for GatedAdapter {
             calls.fetch_add(1, Ordering::SeqCst);
         }
         self.entered.notify_one();
-        self.continue_chat.notified().await;
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err(BackendError::cancelled()),
+            _ = self.continue_chat.notified() => (),
+        }
         self.mock.chat(req, cancel).await
     }
 }
@@ -290,8 +294,9 @@ async fn completed_busy_settlement_clears_live_exemption_before_waiting_dispatch
         )
         .unwrap();
     assert_eq!(
-        a_actual, None,
-        "Busy settlement must not persist the actual charge"
+        a_actual,
+        Some(actual),
+        "completed usage must fall back to a durable primary-ledger charge"
     );
     let intent_count: i64 = tx
         .query_row(
@@ -307,28 +312,19 @@ async fn completed_busy_settlement_clears_live_exemption_before_waiting_dispatch
     drop(tx);
     drop(sidecar);
 
-    // B's reservation predates A's failed settlement. Let B finish loading only
-    // after the sidecar lock is gone, so its dispatch check sees the durable fence.
+    // B's reservation predates A's settlement. Once the sidecar lock is gone,
+    // recovery observes the primary fallback charge and admits B exactly once.
     continue_b_load.notify_one();
     let b_response = tokio::time::timeout(Duration::from_secs(2), b_task)
         .await
-        .expect("B should be rejected after its load completes")
+        .expect("B should complete after its load completes")
         .unwrap()
         .unwrap();
-    assert_eq!(b_response.status(), StatusCode::INTERNAL_SERVER_ERROR);
-    let b_bytes = b_response.into_body().collect().await.unwrap().to_bytes();
-    let b_json: serde_json::Value = serde_json::from_slice(&b_bytes).unwrap();
-    assert_eq!(b_json["error"]["type"], "internal_error");
-    assert!(
-        b_json["error"]["remediation"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("unconfirmed dispatch outcome")
-    );
+    assert_eq!(b_response.status(), StatusCode::OK);
     assert_eq!(
         chat_calls.load(Ordering::SeqCst),
-        1,
-        "only A may reach adapter chat"
+        2,
+        "both completed dispatches may reach adapter chat after primary fallback"
     );
     let b_status: String = Connection::open(&db_path)
         .unwrap()
@@ -338,11 +334,21 @@ async fn completed_busy_settlement_clears_live_exemption_before_waiting_dispatch
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(b_status, "released");
+    assert_eq!(b_status, "settled");
 
     let a_scope = BudgetScope::new(TENANT, "default", PROVIDER_A, PROVIDER_A);
+    let b_scope = BudgetScope::new(TENANT, "default", PROVIDER_B, PROVIDER_B);
+    let b_actual: i64 = Connection::open(&db_path)
+        .unwrap()
+        .query_row(
+            "SELECT actual_cost_minor FROM reservations WHERE id=?1",
+            [&b_reservation],
+            |row| row.get(0),
+        )
+        .unwrap();
     ledger.retry_settlements().unwrap();
     assert_eq!(ledger.balance(&a_scope).unwrap(), 1_000_000 - actual);
+    assert_eq!(ledger.balance(&b_scope).unwrap(), 1_000_000 - b_actual);
     ledger.retry_settlements().unwrap();
     assert_eq!(ledger.balance(&a_scope).unwrap(), 1_000_000 - actual);
 }
@@ -747,17 +753,31 @@ async fn cancelled_dispatch_with_busy_sidecar_keeps_unknown_intent_fenced_after_
     drop(tx);
     drop(sidecar);
 
-    // The reservation is expired now, but an unresolved durable intent must
-    // continue to block the next paid dispatch.
+    // Advance past the reservation TTL, then probe admission until the
+    // independent dispatch worker retires its live lease. While it is live,
+    // same-tenant retries may pass, so release those probes immediately.
     clock.0.store(1_000_000, Ordering::SeqCst);
     let a_scope = BudgetScope::new("tenant-a", "default", PROVIDER, PROVIDER);
-    let admission = ledger.reserve(&a_scope, Price::Known(1));
+    let orphan_error = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            match ledger.reserve(&a_scope, Price::Known(1)) {
+                Err(error) => break error.to_string(),
+                Ok(probe) => ledger.release("tenant-a", &probe).unwrap(),
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("cancelled dispatch worker should retire its live lease");
     assert!(
-        admission
-            .expect_err("expired reservation with unresolved intent must remain fenced")
-            .to_string()
-            .contains("unconfirmed dispatch outcome")
+        !orphan_error.contains(&a_reservation),
+        "public admission error must not expose the reservation id"
     );
+
+    // The reservation is expired now, but an unresolved durable intent must
+    // continue to block the next paid dispatch.
+    let admission = ledger.reserve(&a_scope, Price::Known(1));
+    assert!(admission.is_err(), "orphan intent must remain fenced");
     let request = Request::post("/v1/chat/completions")
         .header("content-type", "application/json")
         .header("x-idoris-tenant", "tenant-a")

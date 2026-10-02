@@ -209,6 +209,15 @@ impl Default for AppState {
 /// `501` fallback for everything else, and the `X-iDoris-Record-Id`
 /// middleware applied to every response.
 pub fn build_app(state: AppState) -> Router {
+    build_app_inner(state, None)
+}
+
+type SettlementRetryObserver = tokio::sync::mpsc::UnboundedSender<Result<(), String>>;
+
+fn build_app_inner(state: AppState, observer: Option<SettlementRetryObserver>) -> Router {
+    if let Some(ledger) = &state.budget_ledger {
+        spawn_settlement_worker(Arc::downgrade(ledger), observer);
+    }
     Router::new()
         .route("/health", get(health))
         .route("/v1/models", get(list_models).fallback(not_found))
@@ -219,6 +228,46 @@ pub fn build_app(state: AppState) -> Router {
         .fallback(not_found)
         .with_state(Arc::new(state))
         .layer(middleware::from_fn(record_id_middleware))
+}
+
+fn spawn_settlement_worker(
+    ledger: std::sync::Weak<idoris_tenancy::budget::BudgetLedger>,
+    observer: Option<SettlementRetryObserver>,
+) {
+    tokio::spawn(async move {
+        loop {
+            let Some(ledger) = ledger.upgrade() else {
+                break;
+            };
+            let result = tokio::task::spawn_blocking(move || ledger.retry_settlements()).await;
+            if let Some(observer) = &observer {
+                let event = match &result {
+                    Ok(Ok(())) => Ok(()),
+                    Ok(Err(err)) => Err(format!("{err:?}")),
+                    Err(err) => Err(err.to_string()),
+                };
+                let _ = observer.send(event);
+            }
+            match result {
+                Ok(Ok(())) => {}
+                other => {
+                    eprintln!("budget settlement retry failed: {other:?}");
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+    });
+}
+
+#[cfg(test)]
+fn build_observed_app(
+    state: AppState,
+) -> (
+    Router,
+    tokio::sync::mpsc::UnboundedReceiver<Result<(), String>>,
+) {
+    let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+    (build_app_inner(state, Some(sender)), receiver)
 }
 
 /// `GET /v1/models` (interface spec — `owned_by` is each card's
@@ -511,13 +560,10 @@ async fn chat_completions(
     // never actually fires -- by the time it's attached, the request body
     // (and with it, that stream's own "close") has already completed. This
     // token has no client-disconnect signal wired to it from axum/hyper
-    // yet either, but dispatch_local's own drop-based guards (see its doc)
-    // still correctly release a budget reservation and propagate
-    // cancellation into the Supervisor call if *this handler's own future*
-    // is dropped mid-request (e.g. a future connection-level timeout or
-    // abort layered on top) -- genuinely different from, and strictly
-    // better than, a listener that structurally can never fire.
-    let budget_ledger = state.budget_ledger.as_deref();
+    // yet either, but dropping this handler still propagates cancellation
+    // into the Supervisor call. A reservation is refunded only before chat
+    // submission; afterward a separate task observes and settles its result.
+    let budget_ledger = state.budget_ledger.as_ref();
     match dispatch_local(
         &state.cards,
         state.supervisor.as_ref(),

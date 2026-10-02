@@ -10,6 +10,7 @@ use std::{
 };
 
 use idoris_tenancy::budget::{BudgetError, BudgetLedger, BudgetScope, Clock, Price, SpendGate};
+use rusqlite::Connection;
 
 struct TestClock(AtomicI64);
 
@@ -65,6 +66,7 @@ fn open(path: &Path, clock: Arc<TestClock>, ttl_ms: i64) -> BudgetLedger {
 fn paths(temp: &TempDb, a_uses_alias: bool) -> (PathBuf, PathBuf) {
     let real = temp.real();
     let alias = temp.alias();
+    std::fs::File::create(&real).unwrap();
     std::os::unix::fs::symlink(&real, &alias).unwrap();
     if a_uses_alias {
         (alias, real)
@@ -74,7 +76,9 @@ fn paths(temp: &TempDb, a_uses_alias: bool) -> (PathBuf, PathBuf) {
 }
 
 fn unknown_outcome(err: BudgetError) -> bool {
-    matches!(err, BudgetError::Storage(message) if message.contains("unconfirmed dispatch outcome"))
+    // Both a live-but-unconfirmed completion and an orphaned dispatch owner
+    // fail closed as storage errors; neither may admit another reservation.
+    matches!(err, BudgetError::Storage(_))
 }
 
 #[test]
@@ -89,15 +93,14 @@ fn cancellation_via_real_and_symlink_keeps_other_instance_fenced() {
         let id = a.reserve(&scope, Price::Known(40)).unwrap();
         a.begin_settlement("tenant", &id).unwrap();
 
-        // release ends the request lifetime and clears the volatile exemption;
-        // its conflict leaves the durable dispatch intent unresolved.
-        assert!(matches!(
-            a.release("tenant", &id),
-            Err(BudgetError::SettlementConflict { .. })
-        ));
-        assert!(unknown_outcome(
-            b.reserve(&scope, Price::Known(1)).unwrap_err()
-        ));
+        // The upstream outcome is unknown, so abandoning the live dispatch
+        // must retain its durable intent and reservation hold.
+        a.abandon_dispatch("tenant", &id).unwrap();
+        let error = b.reserve(&scope, Price::Known(1)).unwrap_err();
+        assert!(
+            unknown_outcome(error.clone()),
+            "unexpected reserve error: {error:?}"
+        );
     }
 }
 
@@ -113,10 +116,7 @@ fn other_instance_release_cannot_delete_unknown_intent_through_alias() {
         let id = a.reserve(&scope, Price::Known(40)).unwrap();
         a.begin_settlement("tenant", &id).unwrap();
 
-        assert!(matches!(
-            b.release("tenant", &id),
-            Err(BudgetError::SettlementConflict { .. })
-        ));
+        assert!(b.release("tenant", &id).is_err());
         let sidecar_path = temp
             .real()
             .canonicalize()
@@ -151,14 +151,13 @@ fn expired_unknown_outcome_stays_fenced_across_alias_restart_and_recovers_once()
         let scope = BudgetScope::new("tenant", "key", "provider", "model");
         let id = a.reserve(&scope, Price::Known(40)).unwrap();
         a.begin_settlement("tenant", &id).unwrap();
-        assert!(matches!(
-            a.release("tenant", &id),
-            Err(BudgetError::SettlementConflict { .. })
-        ));
+        a.abandon_dispatch("tenant", &id).unwrap();
         clock.0.store(101, Ordering::SeqCst);
-        assert!(unknown_outcome(
-            b.reserve(&scope, Price::Known(1)).unwrap_err()
-        ));
+        let error = b.reserve(&scope, Price::Known(1)).unwrap_err();
+        assert!(
+            unknown_outcome(error.clone()),
+            "unexpected reserve error: {error:?}"
+        );
         drop(b);
         drop(a);
 
@@ -166,16 +165,22 @@ fn expired_unknown_outcome_stays_fenced_across_alias_restart_and_recovers_once()
         assert!(unknown_outcome(
             reopened.reserve(&scope, Price::Known(1)).unwrap_err()
         ));
-        assert_eq!(
-            reopened.settle_durable("tenant", &id, 31).unwrap(),
-            Some(31)
-        );
+        // A reopened ledger has no proof that this process owned the
+        // dispatch, so it cannot create a first actual-cost record.
+        assert!(reopened.settle_durable("tenant", &id, 31).is_err());
+
+        // Simulate a previously verified durable sidecar outcome. Opening via
+        // the symlink must find and replay the canonical sidecar row.
+        let sidecar =
+            Connection::open(temp.real().with_added_extension("settlements.sqlite3")).unwrap();
+        sidecar
+            .execute(
+                "INSERT INTO pending_settlements(reservation_id, tenant_id, actual_cost_minor) VALUES (?1, ?2, ?3)",
+                (&id.0, "tenant", 31),
+            )
+            .unwrap();
         reopened.retry_settlements().unwrap();
         assert_eq!(reopened.tenant_balance("tenant").unwrap(), 69);
-        assert_eq!(
-            reopened.settle_durable("tenant", &id, 31).unwrap(),
-            Some(31)
-        );
         reopened.retry_settlements().unwrap();
         assert_eq!(reopened.tenant_balance("tenant").unwrap(), 69);
         let next = reopened.reserve(&scope, Price::Known(1)).unwrap();

@@ -123,41 +123,31 @@ pub fn reserve(
 }
 
 /// Finalizes a reservation with the actual cost, returning the amount
-/// actually charged. Use [`settle_durable`] for completed production usage
-/// so a transient primary-ledger failure can be retried safely.
+/// actually charged, or None when durably queued for retry. This remains as
+/// the concise request glue used by existing callers.
 pub fn settle(
     ledger: &BudgetLedger,
     tenant_id: Option<&str>,
     reservation_id: &ReservationId,
     actual_cost_minor: i64,
-) -> Result<i64, BudgetError> {
+) -> Result<Option<i64>, BudgetError> {
     let tenant_id = tenant_id.unwrap_or(PERSONAL_TENANT_ID);
-    ledger
-        .settle(tenant_id, reservation_id, actual_cost_minor)
-        .map(|r| r.actual_cost_minor)
+    ledger.settle_durable(tenant_id, reservation_id, actual_cost_minor)
 }
 
-/// Durably settles completed usage. `Some` means the ledger committed the
-/// charge, `None` means the durable retry journal owns the pending charge,
-/// and `Err` reports a settlement anomaly. In particular,
-/// [`BudgetError::OverageTooLarge`] means the charge was committed despite the
-/// error; other errors do not confirm a commit or durable queue entry.
+/// Explicit name for production call sites that need the durable retry
+/// semantics of [`BudgetLedger::settle_durable`].
 pub fn settle_durable(
     ledger: &BudgetLedger,
     tenant_id: Option<&str>,
     reservation_id: &ReservationId,
     actual_cost_minor: i64,
 ) -> Result<Option<i64>, BudgetError> {
-    ledger.settle_durable(
-        tenant_id.unwrap_or(PERSONAL_TENANT_ID),
-        reservation_id,
-        actual_cost_minor,
-    )
+    settle(ledger, tenant_id, reservation_id, actual_cost_minor)
 }
 
 /// Releases a reservation for a call that didn't happen (backend failure)
-/// — never call this for a call that actually completed (use
-/// [`settle_durable`]).
+/// — never call this for a call that actually completed (use [`settle`]).
 pub fn release(
     ledger: &BudgetLedger,
     tenant_id: Option<&str>,
@@ -166,14 +156,33 @@ pub fn release(
     ledger.release(tenant_id.unwrap_or(PERSONAL_TENANT_ID), reservation_id)
 }
 
+/// Releases a reservation only after the Supervisor confirms the request was
+/// rejected before adapter execution.
+pub fn release_confirmed_unexecuted(
+    ledger: &BudgetLedger,
+    tenant_id: Option<&str>,
+    reservation_id: &ReservationId,
+) -> Result<(), BudgetError> {
+    ledger.release_confirmed_unexecuted(tenant_id.unwrap_or(PERSONAL_TENANT_ID), reservation_id)
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use idoris_tenancy::budget::SpendGate;
+    use std::sync::atomic::{AtomicI64, Ordering};
     use tempfile::TempDir;
 
     use super::*;
+
+    struct TestClock(AtomicI64);
+
+    impl idoris_tenancy::budget::Clock for TestClock {
+        fn now_ms(&self) -> i64 {
+            self.0.load(Ordering::SeqCst)
+        }
+    }
 
     fn free_cost() -> Cost {
         Cost {
@@ -261,7 +270,7 @@ mod tests {
 
         let id = reserve(&ledger, Some("acme"), "omlx", 500).unwrap();
         let charged = settle(&ledger, Some("acme"), &id, 400).unwrap();
-        assert_eq!(charged, 400);
+        assert_eq!(charged, Some(400));
 
         // A second reservation, released instead of settled, must not count
         // against the balance afterward.
@@ -269,6 +278,173 @@ mod tests {
         release(&ledger, Some("acme"), &id2).unwrap();
         let balance = ledger.tenant_balance("acme").unwrap();
         assert_eq!(balance, 10_000 - 400);
+    }
+
+    #[tokio::test]
+    async fn app_retries_pending_usage_without_another_request_or_restart() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("budget.sqlite3");
+        let ledger = std::sync::Arc::new(
+            BudgetLedger::open_with_busy_timeout(
+                &path,
+                std::sync::Arc::new(idoris_tenancy::budget::SystemClock),
+                60_000,
+                std::time::Duration::ZERO,
+            )
+            .unwrap(),
+        );
+        ledger
+            .configure_tenant("acme", 1000, "UTC", SpendGate::All)
+            .unwrap();
+        let id = reserve(&ledger, Some("acme"), "p", 100).unwrap();
+        let blocker = rusqlite::Connection::open(&path).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+        assert_eq!(settle(&ledger, Some("acme"), &id, 80).unwrap(), None);
+        let (_app, mut retries) = crate::build_observed_app(crate::AppState {
+            budget_ledger: Some(ledger.clone()),
+            ..crate::AppState::default()
+        });
+        let first = tokio::time::timeout(std::time::Duration::from_secs(3), retries.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let Err(first_error) = first else {
+            panic!("expected first retry to fail with Busy");
+        };
+        assert!(
+            first_error.contains("Busy"),
+            "expected Busy, got {first_error}"
+        );
+        blocker.execute_batch("ROLLBACK").unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(3), retries.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(ledger.tenant_balance("acme").unwrap(), 920);
+    }
+
+    #[tokio::test]
+    async fn app_retries_usage_created_after_worker_startup() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("budget.sqlite3");
+        let ledger = std::sync::Arc::new(
+            BudgetLedger::open_with_busy_timeout(
+                &path,
+                std::sync::Arc::new(idoris_tenancy::budget::SystemClock),
+                60_000,
+                std::time::Duration::ZERO,
+            )
+            .unwrap(),
+        );
+        ledger
+            .configure_tenant("acme", 1000, "UTC", SpendGate::All)
+            .unwrap();
+        let (_app, mut retries) = crate::build_observed_app(crate::AppState {
+            budget_ledger: Some(ledger.clone()),
+            ..crate::AppState::default()
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(3), retries.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+
+        let id = reserve(&ledger, Some("acme"), "p", 100).unwrap();
+        let blocker = rusqlite::Connection::open(&path).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+        assert_eq!(settle(&ledger, Some("acme"), &id, 80).unwrap(), None);
+        blocker.execute_batch("ROLLBACK").unwrap();
+
+        tokio::time::timeout(std::time::Duration::from_secs(3), retries.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(ledger.tenant_balance("acme").unwrap(), 920);
+    }
+
+    #[tokio::test]
+    async fn failed_journal_write_stays_blocked_past_ttl_and_worker_recovers_it() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("budget.sqlite3");
+        let clock = std::sync::Arc::new(TestClock(AtomicI64::new(1_800_000_000_000)));
+        let ledger = std::sync::Arc::new(
+            BudgetLedger::open_with_busy_timeout(
+                &path,
+                clock.clone(),
+                1_000,
+                std::time::Duration::ZERO,
+            )
+            .unwrap(),
+        );
+        ledger
+            .configure_tenant("acme", 1000, "UTC", SpendGate::All)
+            .unwrap();
+        let (_app, mut retries) = crate::build_observed_app(crate::AppState {
+            budget_ledger: Some(ledger.clone()),
+            ..crate::AppState::default()
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(3), retries.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+
+        let id = reserve(&ledger, Some("acme"), "p", 100).unwrap();
+        ledger.begin_settlement("acme", &id).unwrap();
+        let blocker = rusqlite::Connection::open(&path).unwrap();
+        blocker.busy_timeout(std::time::Duration::ZERO).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let journal_path = path.with_added_extension("settlements.sqlite3");
+        let journal_blocker = rusqlite::Connection::open(&journal_path).unwrap();
+        journal_blocker
+            .busy_timeout(std::time::Duration::ZERO)
+            .unwrap();
+        journal_blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+        assert!(matches!(
+            ledger.settle_durable("acme", &id, 80),
+            Err(BudgetError::Busy)
+        ));
+        let first = tokio::time::timeout(std::time::Duration::from_secs(3), retries.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let Err(first_error) = first else {
+            panic!("expected retry to fail while both databases are locked");
+        };
+        assert!(
+            first_error.contains("Busy"),
+            "expected Busy, got {first_error}"
+        );
+
+        clock.0.fetch_add(2_000, Ordering::SeqCst);
+        assert!(matches!(
+            reserve(&ledger, Some("acme"), "p", 100),
+            Err(BudgetError::Busy)
+        ));
+        journal_blocker.execute_batch("ROLLBACK").unwrap();
+        blocker.execute_batch("ROLLBACK").unwrap();
+
+        tokio::time::timeout(std::time::Duration::from_secs(3), retries.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(ledger.tenant_balance("acme").unwrap(), 920);
+        let journal = rusqlite::Connection::open(journal_path).unwrap();
+        let pending: i64 = journal
+            .query_row("SELECT count(*) FROM pending_settlements", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let intents: i64 = journal
+            .query_row("SELECT count(*) FROM settlement_intents", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!((pending, intents), (0, 0));
     }
 
     #[test]

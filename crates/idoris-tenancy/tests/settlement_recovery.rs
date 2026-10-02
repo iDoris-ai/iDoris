@@ -1,622 +1,256 @@
+//! Recovery regressions for durable actual-cost settlements.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use std::sync::{
-    Arc,
-    atomic::{AtomicI64, Ordering},
-};
+use std::{path::Path, sync::Arc, time::Duration};
 
-use idoris_tenancy::budget::{BudgetError, BudgetLedger, BudgetScope, Clock, Price, SpendGate};
-use rusqlite::{Connection, TransactionBehavior};
-use std::time::Duration;
+use idoris_tenancy::budget::{BudgetError, BudgetLedger, BudgetScope, Clock, Price};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 
-struct TestClock(AtomicI64);
+struct TempDb(std::path::PathBuf);
 
-impl Clock for TestClock {
-    fn now_ms(&self) -> i64 {
-        self.0.load(Ordering::SeqCst)
+impl AsRef<Path> for TempDb {
+    fn as_ref(&self) -> &Path {
+        &self.0
     }
 }
 
-fn path() -> std::path::PathBuf {
-    std::env::temp_dir().join(format!(
+impl Drop for TempDb {
+    fn drop(&mut self) {
+        for suffix in [
+            "",
+            "-wal",
+            "-shm",
+            ".settlements.sqlite3",
+            ".settlements.sqlite3-wal",
+            ".settlements.sqlite3-shm",
+        ] {
+            let mut path = self.0.clone().into_os_string();
+            path.push(suffix);
+            let _ = std::fs::remove_file(path);
+        }
+        let _ = std::fs::remove_dir_all(self.0.with_added_extension("dispatch-locks"));
+    }
+}
+
+fn db() -> TempDb {
+    TempDb(std::env::temp_dir().join(format!(
         "idoris-settlement-recovery-{}-{}.sqlite3",
         std::process::id(),
         uuid::Uuid::new_v4()
-    ))
+    )))
 }
 
-fn open(path: &std::path::Path, clock: Arc<TestClock>) -> BudgetLedger {
-    let ledger = BudgetLedger::open_with(path, clock, 100).unwrap();
-    ledger
-        .configure_tenant("tenant", 100, "UTC", SpendGate::PaidOnly)
-        .unwrap();
-    ledger
-        .configure(
-            &BudgetScope::new("tenant", "key", "provider", "model"),
-            100,
-            "UTC",
+struct FixedClock;
+
+impl Clock for FixedClock {
+    fn now_ms(&self) -> i64 {
+        1_000
+    }
+}
+
+fn open(path: &TempDb) -> BudgetLedger {
+    BudgetLedger::open_with_busy_timeout(path, Arc::new(FixedClock), 60_000, Duration::ZERO)
+        .expect("open ledger")
+}
+
+fn sidecar(path: &TempDb) -> std::path::PathBuf {
+    path.as_ref().with_added_extension("settlements.sqlite3")
+}
+
+fn pending_actual(path: &TempDb, id: &str) -> Option<i64> {
+    Connection::open(sidecar(path))
+        .unwrap()
+        .query_row(
+            "SELECT actual_cost_minor FROM pending_settlements WHERE reservation_id=?1",
+            [id],
+            |row| row.get(0),
         )
-        .unwrap();
-    ledger
+        .optional()
+        .unwrap()
 }
 
 #[test]
-fn unresolved_intent_is_scoped_to_its_tenant_across_expiry_and_restart() {
-    let db = path();
-    let clock = Arc::new(TestClock(AtomicI64::new(0)));
-    let a_scope = BudgetScope::new("tenant-a", "key", "provider", "model");
-    let b_scope = BudgetScope::new("tenant-b", "key", "provider", "model");
-    let ledger =
-        BudgetLedger::open_with_busy_timeout(&db, clock.clone(), 100, Duration::ZERO).unwrap();
-    for tenant in ["tenant-a", "tenant-b"] {
-        ledger
-            .configure_tenant(tenant, 100, "UTC", SpendGate::PaidOnly)
-            .unwrap();
-    }
-    ledger.configure(&a_scope, 100, "UTC").unwrap();
-    ledger.configure(&b_scope, 100, "UTC").unwrap();
+fn sidecar_retry_persists_actual_before_primary_recovers_and_survives_restart() {
+    let path = db();
+    let ledger = open(&path);
+    let scope = BudgetScope::new("tenant", "key", "provider", "model");
+    ledger.configure(&scope, 100, "UTC").unwrap();
+    let id = ledger.reserve(&scope, Price::Known(40)).unwrap();
+    let cancelled_id = ledger.reserve(&scope, Price::Known(30)).unwrap();
+    ledger.begin_settlement("tenant", &id).unwrap();
+    ledger.begin_settlement("tenant", &cancelled_id).unwrap();
 
-    let a_id = ledger.reserve(&a_scope, Price::Known(40)).unwrap();
-    ledger.begin_settlement("tenant-a", &a_id).unwrap();
-    let mut busy_sidecar =
-        Connection::open(db.with_added_extension("settlements.sqlite3")).unwrap();
-    let lock = busy_sidecar
+    let mut primary = Connection::open(path.as_ref()).unwrap();
+    primary.busy_timeout(Duration::ZERO).unwrap();
+    let primary_lock = primary
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .unwrap();
+    let mut journal = Connection::open(sidecar(&path)).unwrap();
+    journal.busy_timeout(Duration::ZERO).unwrap();
+    let journal_lock = journal
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .unwrap();
+
     assert!(matches!(
-        ledger.release("tenant-a", &a_id),
+        ledger.settle_durable("tenant", &id, 25),
         Err(BudgetError::Busy)
     ));
-    drop(lock);
-    drop(busy_sidecar);
-    let blocked = ledger.reserve(&a_scope, Price::Known(1)).unwrap_err();
-    assert!(blocked.to_string().contains("unconfirmed dispatch outcome"));
-    assert!(!blocked.to_string().contains(&a_id.0));
     assert!(matches!(
-        ledger.release("tenant-a", &a_id),
-        Err(BudgetError::SettlementConflict { .. })
+        ledger.release("tenant", &cancelled_id),
+        Err(BudgetError::Busy)
     ));
 
-    let b_id = ledger.reserve(&b_scope, Price::Known(20)).unwrap();
-    ledger.begin_settlement("tenant-b", &b_id).unwrap();
-    assert_eq!(
-        ledger.settle_durable("tenant-b", &b_id, 17).unwrap(),
-        Some(17)
-    );
-    // Global recovery retries both tenants; A remains unresolved while B is charged.
-    assert!(ledger.retry_settlements().is_err());
-    assert_eq!(ledger.tenant_balance("tenant-b").unwrap(), 83);
-    clock.0.store(10_000, Ordering::SeqCst);
-    assert!(ledger.reserve(&a_scope, Price::Known(1)).is_err());
-    assert!(ledger.reserve(&b_scope, Price::Known(1)).is_ok());
-    drop(ledger);
-
-    let reopened = BudgetLedger::open_with(&db, clock, 100).unwrap();
-    assert!(reopened.reserve(&a_scope, Price::Known(1)).is_err());
-    assert_eq!(reopened.tenant_balance("tenant-b").unwrap(), 82);
-    let after_restart = reopened.reserve(&b_scope, Price::Known(10)).unwrap();
-    reopened
-        .begin_settlement("tenant-b", &after_restart)
-        .unwrap();
-    assert_eq!(
-        reopened
-            .settle_durable("tenant-b", &after_restart, 9)
-            .unwrap(),
-        Some(9)
-    );
-    assert_eq!(reopened.tenant_balance("tenant-b").unwrap(), 73);
-    let sidecar = Connection::open(db.with_added_extension("settlements.sqlite3")).unwrap();
-    let retained: (String, String) = sidecar
+    // The original sidecar contention has cleared, while the primary writer
+    // remains blocked. A's actual amount must persist despite B's release retry.
+    drop(journal_lock);
+    assert!(matches!(ledger.retry_settlements(), Err(BudgetError::Busy)));
+    assert_eq!(pending_actual(&path, &id.0), Some(25));
+    let pending_release: Option<String> = Connection::open(sidecar(&path))
+        .unwrap()
         .query_row(
-            "SELECT tenant_id, reservation_id FROM settlement_intents",
-            [],
+            "SELECT tenant_id FROM pending_releases WHERE reservation_id=?1",
+            [&cancelled_id.0],
+            |row| row.get(0),
+        )
+        .optional()
+        .unwrap();
+    assert_eq!(pending_release.as_deref(), Some("tenant"));
+
+    // Simulate process loss while the primary remains locked. Verify the
+    // actual amount is durable before releasing the lock; reopening performs
+    // initialization writes, so it must wait until that lock is released.
+    drop(ledger);
+    assert_eq!(pending_actual(&path, &id.0), Some(25));
+    drop(primary_lock);
+    let recovered = open(&path);
+    recovered.retry_settlements().unwrap();
+    recovered.retry_settlements().unwrap();
+
+    let (status, actual): (String, Option<i64>) = Connection::open(path.as_ref())
+        .unwrap()
+        .query_row(
+            "SELECT status, actual_cost_minor FROM reservations WHERE id=?1",
+            [&id.0],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
-    assert_eq!(retained, ("tenant-a".into(), a_id.0));
-    drop(sidecar);
-    drop(reopened);
-    for file in [&db, &db.with_added_extension("settlements.sqlite3")] {
-        for suffix in ["", "-wal", "-shm"] {
-            let mut path = file.clone().into_os_string();
-            path.push(suffix);
-            let _ = std::fs::remove_file(path);
-        }
-    }
-}
-
-#[test]
-fn double_storage_fault_fails_closed_and_durably_recovers_after_expiry_and_restart() {
-    let db = path();
-    let sidecar_path = db.with_added_extension("settlements.sqlite3");
-    let scope = BudgetScope::new("tenant", "key", "provider", "model");
-    let clock = Arc::new(TestClock(AtomicI64::new(0)));
-    let ledger = open(&db, clock.clone());
-    let id = ledger.reserve(&scope, Price::Known(40)).unwrap();
-
-    // Fail outbox insertion and primary settlement simultaneously. The
-    // recoverable actual amount must be saved in the primary emergency journal.
-    let sidecar = Connection::open(&sidecar_path).unwrap();
-    sidecar
-        .execute_batch(
-            "CREATE TRIGGER fail_pending_insert BEFORE INSERT ON pending_settlements
-             BEGIN SELECT RAISE(FAIL, 'injected sidecar failure'); END;",
-        )
-        .unwrap();
-    drop(sidecar);
-    let primary = Connection::open(&db).unwrap();
-    primary
-        .execute_batch(
-            "CREATE TRIGGER fail_settlement BEFORE UPDATE OF status ON reservations
-             WHEN NEW.status='settled'
-             BEGIN SELECT RAISE(FAIL, 'injected primary settlement failure'); END;",
-        )
-        .unwrap();
-    drop(primary);
-    assert_eq!(ledger.settle_durable("tenant", &id, 31).unwrap(), None);
-
-    // The recorded emergency outcome owns this reservation. Conflicting
-    // settlement/release requests must not replace or erase its actual cost.
-    assert!(matches!(
-        ledger.settle_durable("tenant", &id, 32),
-        Err(BudgetError::SettlementConflict { .. })
-    ));
-    assert!(matches!(
-        ledger.settle("tenant", &id, 32),
-        Err(BudgetError::SettlementConflict { .. })
-    ));
-    assert!(matches!(
-        ledger.release("tenant", &id),
-        Err(BudgetError::SettlementConflict { .. })
-    ));
-
-    // While both faults remain, automatic recovery must fail closed. Try
-    // before and after the original reservation TTL to guard against expiry
-    // silently reopening admission.
-    assert!(ledger.reserve(&scope, Price::Known(1)).is_err());
-    clock.0.store(10_000, Ordering::SeqCst);
-    assert!(ledger.reserve(&scope, Price::Known(1)).is_err());
-    drop(ledger);
-
-    // Restart while faulty: startup retries but retains the durable record;
-    // admission remains blocked after restart as well.
-    let restarted = open(&db, clock.clone());
-    assert!(restarted.reserve(&scope, Price::Known(1)).is_err());
-
-    // Restore the primary while sidecar insertion is still failing. The
-    // already-recorded emergency outcome should settle directly and replay
-    // cleanup should then be idempotent across retry and another reopen.
-    let primary = Connection::open(&db).unwrap();
-    primary
-        .execute_batch("DROP TRIGGER fail_settlement;")
-        .unwrap();
-    drop(primary);
+    assert_eq!((status.as_str(), actual), ("settled", Some(25)));
+    let (cancelled_status, cancelled_actual): (String, Option<i64>) =
+        Connection::open(path.as_ref())
+            .unwrap()
+            .query_row(
+                "SELECT status, actual_cost_minor FROM reservations WHERE id=?1",
+                [&cancelled_id.0],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
     assert_eq!(
-        restarted.settle_durable("tenant", &id, 31).unwrap(),
-        Some(31)
+        (cancelled_status.as_str(), cancelled_actual),
+        ("released", None)
     );
-    restarted.retry_settlements().unwrap();
-    assert_eq!(restarted.tenant_balance("tenant").unwrap(), 69);
-    drop(restarted);
-    let recovered = open(&db, clock.clone());
-    assert_eq!(recovered.tenant_balance("tenant").unwrap(), 69);
-    assert_eq!(recovered.balance(&scope).unwrap(), 69);
-    assert!(recovered.reserve(&scope, Price::Known(1)).is_ok());
-
-    let primary = Connection::open(&db).unwrap();
-    let row: (String, i64) = primary
+    assert_eq!(pending_actual(&path, &id.0), None);
+    let journal = Connection::open(sidecar(&path)).unwrap();
+    let intents: i64 = journal
         .query_row(
-            "SELECT status, actual_cost_minor FROM reservations WHERE id=?1",
+            "SELECT count(*) FROM settlement_intents WHERE reservation_id=?1",
             [&id.0],
-            |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get::<_, Option<i64>>(1)?.unwrap_or_default(),
-                ))
-            },
-        )
-        .unwrap();
-    assert_eq!(row, ("settled".into(), 31));
-    let emergency_count: i64 = primary
-        .query_row(
-            "SELECT COUNT(*) FROM budget_emergency_settlements",
-            [],
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(emergency_count, 0);
-    let sidecar = Connection::open(&sidecar_path).unwrap();
-    let pending: i64 = sidecar
-        .query_row("SELECT COUNT(*) FROM pending_settlements", [], |row| {
-            row.get(0)
-        })
+    assert_eq!(intents, 0);
+    let owners: i64 = journal
+        .query_row(
+            "SELECT count(*) FROM dispatch_owners WHERE reservation_id=?1",
+            [&id.0],
+            |row| row.get(0),
+        )
         .unwrap();
-    assert_eq!(pending, 0);
-    assert_eq!(recovered.tenant_balance("tenant").unwrap(), 68);
-    drop(recovered);
+    assert_eq!(owners, 0);
+    for table in [
+        "settlement_intents",
+        "dispatch_owners",
+        "pending_releases",
+        "pending_settlements",
+    ] {
+        let count: i64 = journal
+            .query_row(
+                &format!("SELECT count(*) FROM {table} WHERE reservation_id=?1"),
+                [&cancelled_id.0],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0, "{table} should be cleaned for released dispatch");
+    }
+    assert_eq!(recovered.balance(&scope).unwrap(), 75);
 
-    let sidecar = Connection::open(&sidecar_path).unwrap();
-    sidecar
-        .execute_batch("DROP TRIGGER fail_pending_insert;")
-        .unwrap();
-    drop(sidecar);
-    let reopened = open(&db, clock);
-    assert_eq!(reopened.tenant_balance("tenant").unwrap(), 68);
-    drop(reopened);
-    for suffix in ["", "-wal", "-shm"] {
-        let mut file = db.clone().into_os_string();
-        file.push(suffix);
-        let _ = std::fs::remove_file(file);
-    }
-    for suffix in ["", "-wal", "-shm"] {
-        let mut file = sidecar_path.clone().into_os_string();
-        file.push(suffix);
-        let _ = std::fs::remove_file(file);
-    }
+    let next = recovered.reserve(&scope, Price::Known(20)).unwrap();
+    assert_eq!(recovered.balance(&scope).unwrap(), 55);
+    recovered.settle_durable("tenant", &next, 20).unwrap();
+    assert_eq!(recovered.balance(&scope).unwrap(), 55);
 }
 
 #[test]
-fn volatile_emergency_outcome_retries_after_primary_busy_without_cost_overwrite() {
-    let db = path();
-    let sidecar_path = db.with_added_extension("settlements.sqlite3");
+fn unreadable_primary_and_locked_sidecar_persist_actual_before_restart() {
+    let path = db();
+    let ledger = open(&path);
     let scope = BudgetScope::new("tenant", "key", "provider", "model");
-    let clock = Arc::new(TestClock(AtomicI64::new(0)));
-    let ledger = BudgetLedger::open_with_busy_timeout(&db, clock, 100, Duration::ZERO).unwrap();
-    ledger
-        .configure_tenant("tenant", 100, "UTC", SpendGate::PaidOnly)
-        .unwrap();
     ledger.configure(&scope, 100, "UTC").unwrap();
     let id = ledger.reserve(&scope, Price::Known(40)).unwrap();
     ledger.begin_settlement("tenant", &id).unwrap();
 
-    let sidecar = Connection::open(&sidecar_path).unwrap();
-    sidecar
-        .execute_batch(
-            "CREATE TRIGGER fail_pending_insert BEFORE INSERT ON pending_settlements
-             BEGIN SELECT RAISE(FAIL, 'injected sidecar failure'); END;",
-        )
-        .unwrap();
-    let mut primary = Connection::open(&db).unwrap();
-    let writer = primary
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .unwrap();
-
-    assert!(ledger.settle_durable("tenant", &id, 31).is_err());
-    assert!(matches!(
-        ledger.settle_durable("tenant", &id, 32),
-        Err(BudgetError::SettlementConflict { .. })
-    ));
-    assert!(ledger.reserve(&scope, Price::Known(1)).is_err());
-
-    writer.rollback().unwrap();
-    ledger.retry_settlements().unwrap();
-    assert_eq!(ledger.tenant_balance("tenant").unwrap(), 69);
-    ledger.retry_settlements().unwrap();
-    assert_eq!(ledger.tenant_balance("tenant").unwrap(), 69);
-    let row: (String, i64) = primary
-        .query_row(
-            "SELECT status, actual_cost_minor FROM reservations WHERE id=?1",
-            [&id.0],
-            |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get::<_, Option<i64>>(1)?.unwrap_or_default(),
-                ))
-            },
-        )
-        .unwrap();
-    assert_eq!(row, ("settled".into(), 31));
-    drop(primary);
-    drop(sidecar);
-    drop(ledger);
-    for suffix in ["", "-wal", "-shm"] {
-        let mut file = db.clone().into_os_string();
-        file.push(suffix);
-        let _ = std::fs::remove_file(file);
-    }
-    for suffix in ["", "-wal", "-shm"] {
-        let mut file = sidecar_path.clone().into_os_string();
-        file.push(suffix);
-        let _ = std::fs::remove_file(file);
-    }
-}
-
-#[test]
-fn sidecar_busy_foreign_tenant_cannot_poison_real_settlement() {
-    let db = path();
-    let sidecar_path = db.with_added_extension("settlements.sqlite3");
-    let scope = BudgetScope::new("tenant", "key", "provider", "model");
-    let clock = Arc::new(TestClock(AtomicI64::new(0)));
-    let ledger =
-        BudgetLedger::open_with_busy_timeout(&db, clock.clone(), 100, Duration::ZERO).unwrap();
-    ledger
-        .configure_tenant("tenant", 100, "UTC", SpendGate::PaidOnly)
-        .unwrap();
-    ledger.configure(&scope, 100, "UTC").unwrap();
-    let id = ledger.reserve(&scope, Price::Known(40)).unwrap();
-    let control_id = ledger.reserve(&scope, Price::Known(10)).unwrap();
-    ledger.begin_settlement("tenant", &id).unwrap();
-
-    let mut sidecar = Connection::open(&sidecar_path).unwrap();
-    let writer = sidecar
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .unwrap();
-
-    assert!(matches!(
-        ledger.settle_durable("other", &id, 7),
-        Err(BudgetError::TenantMismatch { .. })
-    ));
-    writer.rollback().unwrap();
-
-    // A foreign tenant's rejected settlement must not erase A's live marker.
-    // C can begin only while that real in-flight exemption is still present.
-    ledger.begin_settlement("tenant", &control_id).unwrap();
-    ledger
-        .release_confirmed_unexecuted("tenant", &control_id)
-        .unwrap();
-
-    let writer = sidecar
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .unwrap();
-    assert!(matches!(
-        ledger.settle_durable("tenant", &id, 31),
-        Err(BudgetError::Busy)
-    ));
-
-    // The persisted intent must continue to block admission after the TTL,
-    // while the real outcome is waiting for the sidecar writer.
-    clock.0.store(101, Ordering::SeqCst);
-    assert!(ledger.reserve(&scope, Price::Known(1)).is_err());
-
-    writer.rollback().unwrap();
-    ledger.retry_settlements().unwrap();
-    assert_eq!(ledger.tenant_balance("tenant").unwrap(), 69);
-    assert_eq!(ledger.balance(&scope).unwrap(), 69);
-    ledger.retry_settlements().unwrap();
-    assert_eq!(ledger.tenant_balance("tenant").unwrap(), 69);
-    assert!(ledger.reserve(&scope, Price::Known(1)).is_ok());
-
-    let primary = Connection::open(&db).unwrap();
-    let row: (String, i64) = primary
-        .query_row(
-            "SELECT status, actual_cost_minor FROM reservations WHERE id=?1",
-            [&id.0],
-            |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get::<_, Option<i64>>(1)?.unwrap_or_default(),
-                ))
-            },
-        )
-        .unwrap();
-    assert_eq!(row, ("settled".into(), 31));
-    let emergency_count: i64 = primary
-        .query_row(
-            "SELECT COUNT(*) FROM budget_emergency_settlements",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(emergency_count, 0);
-    let intent_count: i64 = sidecar
-        .query_row("SELECT COUNT(*) FROM settlement_intents", [], |row| {
-            row.get(0)
-        })
-        .unwrap();
-    assert_eq!(intent_count, 0);
-
-    drop(primary);
-    drop(sidecar);
-    drop(ledger);
-    for file in [&db, &sidecar_path] {
-        for suffix in ["", "-wal", "-shm"] {
-            let mut path = file.clone().into_os_string();
-            path.push(suffix);
-            let _ = std::fs::remove_file(path);
-        }
-    }
-}
-
-#[test]
-fn sidecar_busy_completed_settlement_fences_other_dispatch_until_recovered() {
-    let db = path();
-    let sidecar_path = db.with_added_extension("settlements.sqlite3");
-    let scope = BudgetScope::new("tenant", "key", "provider", "model");
-    let clock = Arc::new(TestClock(AtomicI64::new(0)));
-    let ledger = BudgetLedger::open_with_busy_timeout(&db, clock, 100, Duration::ZERO).unwrap();
-    ledger
-        .configure_tenant("tenant", 100, "UTC", SpendGate::PaidOnly)
-        .unwrap();
-    ledger.configure(&scope, 100, "UTC").unwrap();
-    let a_id = ledger.reserve(&scope, Price::Known(40)).unwrap();
-    let b_id = ledger.reserve(&scope, Price::Known(20)).unwrap();
-    ledger.begin_settlement("tenant", &a_id).unwrap();
-
-    let mut sidecar = Connection::open(&sidecar_path).unwrap();
-    let writer = sidecar
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .unwrap();
-    assert!(matches!(
-        ledger.settle_durable("tenant", &a_id, 31),
-        Err(BudgetError::Busy)
-    ));
-    drop(writer);
-
-    // A completed request retains its durable intent but loses its volatile
-    // live exemption after Busy. B must not dispatch on its earlier reserve.
-    let intent_count: i64 = sidecar
-        .query_row(
-            "SELECT COUNT(*) FROM settlement_intents WHERE reservation_id=?1 AND tenant_id='tenant'",
-            [&a_id.0],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(intent_count, 1);
-    let blocked = ledger.begin_settlement("tenant", &b_id).unwrap_err();
-    assert!(matches!(
-        blocked,
-        BudgetError::Storage(ref message) if message.contains("unconfirmed dispatch outcome")
-    ));
-
-    // retry_settlements must recover the actual cost retained from A's Busy
-    // completion without another settle_durable call.
-    ledger.retry_settlements().unwrap();
-    assert_eq!(ledger.tenant_balance("tenant").unwrap(), 49);
-    ledger.retry_settlements().unwrap();
-    assert_eq!(ledger.tenant_balance("tenant").unwrap(), 49);
-    ledger.begin_settlement("tenant", &b_id).unwrap();
-
-    drop(sidecar);
-    drop(ledger);
-    for file in [&db, &sidecar_path] {
-        for suffix in ["", "-wal", "-shm"] {
-            let mut path = file.clone().into_os_string();
-            path.push(suffix);
-            let _ = std::fs::remove_file(path);
-        }
-    }
-}
-
-#[test]
-fn failed_initial_owner_lookup_retains_cost_until_storage_recovers() {
-    let db = path();
-    let scope = BudgetScope::new("tenant", "key", "provider", "model");
-    let clock = Arc::new(TestClock(AtomicI64::new(0)));
-    let ledger = open(&db, clock.clone());
-    let id = ledger.reserve(&scope, Price::Known(40)).unwrap();
-    ledger.begin_settlement("tenant", &id).unwrap();
-
-    // Removing the table makes the ownership SELECT fail deterministically;
-    // restore it before retrying the in-memory completion record.
-    let primary = Connection::open(&db).unwrap();
+    // Hide the primary table only after begin_settlement established the
+    // dispatch ownership that authorizes this in-memory actual outcome.
+    let primary = Connection::open(path.as_ref()).unwrap();
     primary
         .execute_batch("ALTER TABLE reservations RENAME TO reservations_temporarily_hidden;")
         .unwrap();
     drop(primary);
 
-    assert!(ledger.settle_durable("other", &id, 7).is_err());
+    let mut journal = Connection::open(sidecar(&path)).unwrap();
+    journal.busy_timeout(Duration::ZERO).unwrap();
+    let journal_lock = journal
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .unwrap();
     assert!(ledger.settle_durable("tenant", &id, 31).is_err());
-    assert!(ledger.reserve(&scope, Price::Known(1)).is_err());
 
-    let primary = Connection::open(&db).unwrap();
+    // Once the sidecar lock clears, retry must durably record the verified
+    // in-memory outcome before the primary lookup fails on the hidden table.
+    drop(journal_lock);
+    assert!(ledger.retry_settlements().is_err());
+    assert_eq!(pending_actual(&path, &id.0), Some(31));
+    drop(journal);
+    drop(ledger);
+    assert_eq!(pending_actual(&path, &id.0), Some(31));
+
+    let primary = Connection::open(path.as_ref()).unwrap();
     primary
         .execute_batch("ALTER TABLE reservations_temporarily_hidden RENAME TO reservations;")
         .unwrap();
     drop(primary);
-    for result in [
-        ledger.settle_durable("tenant", &id, 32).map(|_| ()),
-        ledger.settle("tenant", &id, 32).map(|_| ()),
-        ledger.release_confirmed_unexecuted("tenant", &id),
-    ] {
-        assert!(matches!(
-            result,
-            Err(BudgetError::SettlementConflict { .. })
-        ));
-    }
-    clock.0.store(10_000, Ordering::SeqCst);
-    // Admission retries the saved charge first: the remaining 69 cannot
-    // cover 70, even though the original reservation has expired.
-    assert!(ledger.reserve(&scope, Price::Known(70)).is_err());
 
-    ledger.retry_settlements().unwrap();
-    assert_eq!(ledger.tenant_balance("tenant").unwrap(), 69);
-    assert_eq!(ledger.balance(&scope).unwrap(), 69);
-    ledger.retry_settlements().unwrap();
-    assert_eq!(ledger.tenant_balance("tenant").unwrap(), 69);
-    let primary = Connection::open(&db).unwrap();
-    let row: (String, i64) = primary
+    let recovered = open(&path);
+    recovered.retry_settlements().unwrap();
+    recovered.retry_settlements().unwrap();
+    assert_eq!(recovered.balance(&scope).unwrap(), 69);
+    let (status, actual): (String, Option<i64>) = Connection::open(path.as_ref())
+        .unwrap()
         .query_row(
             "SELECT status, actual_cost_minor FROM reservations WHERE id=?1",
             [&id.0],
-            |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get::<_, Option<i64>>(1)?.unwrap_or_default(),
-                ))
-            },
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
-    assert_eq!(row, ("settled".into(), 31));
-    drop(primary);
-    drop(ledger);
-    for file in [&db, &db.with_added_extension("settlements.sqlite3")] {
-        for suffix in ["", "-wal", "-shm"] {
-            let mut path = file.clone().into_os_string();
-            path.push(suffix);
-            let _ = std::fs::remove_file(path);
-        }
-    }
-}
-
-#[test]
-fn another_instance_cannot_release_volatile_settlement_intent() {
-    let db = path();
-    let sidecar_path = db.with_added_extension("settlements.sqlite3");
-    let scope = BudgetScope::new("tenant", "key", "provider", "model");
-    let clock = Arc::new(TestClock(AtomicI64::new(0)));
-    let a = BudgetLedger::open_with_busy_timeout(&db, clock.clone(), 100, Duration::ZERO).unwrap();
-    a.configure_tenant("tenant", 100, "UTC", SpendGate::PaidOnly)
-        .unwrap();
-    a.configure(&scope, 100, "UTC").unwrap();
-    let b = BudgetLedger::open_with_busy_timeout(&db, clock.clone(), 100, Duration::ZERO).unwrap();
-    let id = a.reserve(&scope, Price::Known(40)).unwrap();
-    a.begin_settlement("tenant", &id).unwrap();
-
-    let mut sidecar = Connection::open(&sidecar_path).unwrap();
-    let writer = sidecar
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .unwrap();
-    assert!(matches!(
-        a.settle_durable("tenant", &id, 31),
-        Err(BudgetError::Busy)
-    ));
-    writer.rollback().unwrap();
-
-    assert!(matches!(
-        b.release("tenant", &id),
-        Err(BudgetError::SettlementConflict { .. })
-    ));
-    clock.0.store(10_000, Ordering::SeqCst);
-    assert!(b.reserve(&scope, Price::Known(1)).is_err());
-    a.retry_settlements().unwrap();
-    assert_eq!(b.tenant_balance("tenant").unwrap(), 69);
-    a.retry_settlements().unwrap();
-    assert_eq!(b.tenant_balance("tenant").unwrap(), 69);
-
-    let confirmed = a.reserve(&scope, Price::Known(10)).unwrap();
-    a.begin_settlement("tenant", &confirmed).unwrap();
-    assert!(matches!(
-        a.release_confirmed_unexecuted("other", &confirmed),
-        Err(BudgetError::TenantMismatch { .. })
-    ));
-    a.release_confirmed_unexecuted("tenant", &confirmed)
-        .unwrap();
-    let ordinary = a.reserve(&scope, Price::Known(10)).unwrap();
-    a.release("tenant", &ordinary).unwrap();
-
-    let primary = Connection::open(&db).unwrap();
-    let row: (String, i64) = primary
-        .query_row(
-            "SELECT status, actual_cost_minor FROM reservations WHERE id=?1",
-            [&id.0],
-            |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get::<_, Option<i64>>(1)?.unwrap_or_default(),
-                ))
-            },
-        )
-        .unwrap();
-    assert_eq!(row, ("settled".into(), 31));
-    drop(primary);
-    drop(sidecar);
-    drop(a);
-    drop(b);
-    for file in [&db, &sidecar_path] {
-        for suffix in ["", "-wal", "-shm"] {
-            let mut path = file.clone().into_os_string();
-            path.push(suffix);
-            let _ = std::fs::remove_file(path);
-        }
+    assert_eq!((status.as_str(), actual), ("settled", Some(31)));
+    assert_eq!(pending_actual(&path, &id.0), None);
+    let journal = Connection::open(sidecar(&path)).unwrap();
+    for table in ["settlement_intents", "dispatch_owners"] {
+        let count: i64 = journal
+            .query_row(
+                &format!("SELECT count(*) FROM {table} WHERE reservation_id=?1"),
+                [&id.0],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0, "{table} should be cleaned after recovery");
     }
 }

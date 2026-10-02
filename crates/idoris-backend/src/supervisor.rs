@@ -34,21 +34,12 @@ use crate::types::{BackendStatus, ChatRequest, ChatResponse, ModelInfo, Pressure
 
 type LoadReply = oneshot::Sender<Result<(), BackendError>>;
 
-/// Whether a chat error proves the adapter did not execute the request.
+/// Whether a chat command reached the adapter. Adapter errors have an
+/// unknown execution outcome; command rejections are known not to have run.
 #[derive(Debug)]
-pub enum ChatFailure {
-    /// The Supervisor rejected the request before calling the adapter.
-    NotExecuted(BackendError),
-    /// The adapter may have acted, so callers must reconcile the outcome.
-    OutcomeUnknown(BackendError),
-}
-
-impl ChatFailure {
-    fn into_backend_error(self) -> BackendError {
-        match self {
-            Self::NotExecuted(error) | Self::OutcomeUnknown(error) => error,
-        }
-    }
+pub enum ChatCallOutcome {
+    NotSubmitted(BackendError),
+    Submitted(Result<ChatResponse, BackendError>),
 }
 
 /// Tunables for the load/probe loops. `budget_gb` is the global memory
@@ -119,7 +110,7 @@ enum Command {
     Chat {
         req: ChatRequest,
         cancel: CancellationToken,
-        reply: oneshot::Sender<Result<ChatResponse, ChatFailure>>,
+        reply: oneshot::Sender<ChatCallOutcome>,
     },
     Load {
         id: String,
@@ -248,23 +239,30 @@ impl SupervisorHandle {
         req: ChatRequest,
         cancel: CancellationToken,
     ) -> Result<ChatResponse, BackendError> {
-        self.chat_with_execution(req, cancel)
-            .await
-            .map_err(ChatFailure::into_backend_error)
+        match self.chat_with_outcome(req, cancel).await {
+            ChatCallOutcome::NotSubmitted(err) => Err(err),
+            ChatCallOutcome::Submitted(result) => result,
+        }
     }
 
-    /// Chat while preserving whether an error happened before adapter execution.
-    pub async fn chat_with_execution(
+    /// Calls chat and preserves whether the Supervisor actually invoked the
+    /// adapter. A closed reply channel after enqueue is treated as submitted,
+    /// since the actor may already have called upstream.
+    pub async fn chat_with_outcome(
         &self,
         req: ChatRequest,
         cancel: CancellationToken,
-    ) -> Result<ChatResponse, ChatFailure> {
+    ) -> ChatCallOutcome {
         let (reply, rx) = oneshot::channel();
-        self.send(ActorMsg::Cmd(Command::Chat { req, cancel, reply }))
+        if let Err(err) = self
+            .send(ActorMsg::Cmd(Command::Chat { req, cancel, reply }))
             .await
-            .map_err(ChatFailure::NotExecuted)?;
-        rx.await
-            .map_err(|_| ChatFailure::OutcomeUnknown(BackendError::supervisor_unavailable()))?
+        {
+            return ChatCallOutcome::NotSubmitted(err);
+        }
+        rx.await.unwrap_or_else(|_| {
+            ChatCallOutcome::Submitted(Err(BackendError::supervisor_unavailable()))
+        })
     }
 
     pub async fn load(
@@ -1077,9 +1075,9 @@ async fn run_actor(
                         let _ = reply.send(Err(BackendError::invariant_violation(msg)));
                     }
                     Command::Chat { reply, .. } => {
-                        let _ = reply.send(Err(ChatFailure::NotExecuted(
+                        let _ = reply.send(ChatCallOutcome::NotSubmitted(
                             BackendError::invariant_violation(msg),
-                        )));
+                        ));
                     }
                     Command::Load { reply, .. } => {
                         let _ = reply.send(Err(BackendError::invariant_violation(msg)));
@@ -1135,22 +1133,22 @@ async fn run_actor(
 
             ActorMsg::Cmd(Command::Chat { req, cancel, reply }) => match models.get(&req.model) {
                 None => {
-                    let _ = reply.send(Err(ChatFailure::NotExecuted(
+                    let _ = reply.send(ChatCallOutcome::NotSubmitted(
                         BackendError::model_not_found(&req.model),
-                    )));
+                    ));
                 }
                 Some(slot) if slot.state != ModelState::Ready => {
-                    let _ = reply.send(Err(ChatFailure::NotExecuted(not_ready_error(
+                    let _ = reply.send(ChatCallOutcome::NotSubmitted(not_ready_error(
                         &req.model, slot.state,
-                    ))));
+                    )));
                 }
                 Some(_) => {
                     let Ok(permit) = call_slots.clone().try_acquire_owned() else {
-                        let _ = reply.send(Err(ChatFailure::NotExecuted(BackendError::busy(
+                        let _ = reply.send(ChatCallOutcome::NotSubmitted(BackendError::busy(
                             "concurrent adapter-call limit reached",
                             None,
                             None,
-                        ))));
+                        )));
                         continue;
                     };
                     next_seq += 1;
@@ -1171,20 +1169,25 @@ async fn run_actor(
                         // `active_op` (Critical, Opus Tier-2 review, P6).
                         let model_for_chat = model.clone();
                         let inner = tokio::spawn(async move {
-                            with_adapter_timeout(
-                                adapter.chat(req, cancel),
-                                timeout,
-                                &model_for_chat,
-                            )
-                            .await
+                            if cancel.is_cancelled() {
+                                ChatCallOutcome::NotSubmitted(BackendError::cancelled())
+                            } else {
+                                ChatCallOutcome::Submitted(
+                                    with_adapter_timeout(
+                                        adapter.chat(req, cancel),
+                                        timeout,
+                                        &model_for_chat,
+                                    )
+                                    .await,
+                                )
+                            }
                         });
                         let result = match inner.await {
-                            Ok(result) => result,
-                            Err(join_err) => {
-                                Err(BackendError::adapter_panicked(&model, join_err.to_string()))
-                            }
+                            Ok(outcome) => outcome,
+                            Err(join_err) => ChatCallOutcome::Submitted(Err(
+                                BackendError::adapter_panicked(&model, join_err.to_string()),
+                            )),
                         };
-                        let result = result.map_err(ChatFailure::OutcomeUnknown);
                         let _ = reply.send(result);
                         if let Some(tx) = self_tx.upgrade() {
                             let _ = tx.send(ActorMsg::ChatDone { model }).await;
@@ -1371,6 +1374,108 @@ mod tests {
         }]
     }
 
+    struct CountingChatAdapter {
+        inner: MockAdapter,
+        chat_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl RuntimeAdapter for CountingChatAdapter {
+        async fn list(&self) -> Result<Vec<ModelInfo>, BackendError> {
+            self.inner.list().await
+        }
+
+        async fn load(&self, id: &str, policy: Option<&LoadPolicy>) -> Result<(), BackendError> {
+            self.inner.load(id, policy).await
+        }
+
+        async fn unload(&self, id: &str) -> Result<(), BackendError> {
+            self.inner.unload(id).await
+        }
+
+        async fn status(&self) -> Result<BackendStatus, BackendError> {
+            self.inner.status().await
+        }
+
+        async fn probe_ready(&self, id: &str) -> Result<bool, BackendError> {
+            self.inner.probe_ready(id).await
+        }
+
+        async fn chat(
+            &self,
+            req: ChatRequest,
+            cancel: CancellationToken,
+        ) -> Result<ChatResponse, BackendError> {
+            self.chat_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.chat(req, cancel).await
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_chat_before_adapter_call_is_not_submitted_and_releases_inflight() {
+        let adapter = Arc::new(CountingChatAdapter {
+            inner: MockAdapter::new(catalog()),
+            chat_calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let handle = Supervisor::spawn(
+            adapter.clone(),
+            SupervisorConfig {
+                max_concurrent_adapter_calls: 1,
+                ..SupervisorConfig::default()
+            },
+        )
+        .expect("spawn should succeed");
+        handle
+            .load("a", 4.0, on_demand_policy())
+            .await
+            .expect("load should succeed");
+
+        let cancelled = CancellationToken::new();
+        let (reply, outcome_rx) = oneshot::channel();
+        handle
+            .send(ActorMsg::Cmd(Command::Chat {
+                req: ChatRequest {
+                    model: "a".to_string(),
+                    messages: vec![],
+                },
+                cancel: cancelled.clone(),
+                reply,
+            }))
+            .await
+            .expect("chat command should enqueue");
+        // Cancellation after enqueue but before yielding lets the actor
+        // schedule its independent worker while the token is already set.
+        cancelled.cancel();
+        let outcome = outcome_rx.await.expect("chat worker should reply");
+        assert!(
+            matches!(outcome, ChatCallOutcome::NotSubmitted(err) if err.reason_code() == "cancelled")
+        );
+        assert_eq!(
+            adapter.chat_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+
+        let response = handle
+            .chat(
+                ChatRequest {
+                    model: "a".to_string(),
+                    messages: vec![],
+                },
+                CancellationToken::new(),
+            )
+            .await
+            .expect("a later chat should still be admitted");
+        assert_eq!(response.model, "a");
+        no_hang(handle.unload("a"))
+            .await
+            .expect("cancelled chat must not leak inflight state");
+        assert_eq!(
+            adapter.chat_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+    }
+
     #[tokio::test]
     async fn list_forwards_to_the_adapter() {
         let adapter = Arc::new(MockAdapter::new(catalog()));
@@ -1409,29 +1514,26 @@ mod tests {
         assert_eq!(err.reason_code(), "model_not_found");
     }
 
+    /// The durable dispatch caller must distinguish a Supervisor rejection
+    /// from a request that may have reached the adapter.
     #[tokio::test]
-    async fn chat_with_execution_marks_pre_adapter_rejection_as_not_executed() {
+    async fn chat_outcome_classifies_pre_adapter_rejection_as_not_submitted() {
         let adapter = Arc::new(MockAdapter::new(catalog()));
         let handle =
             Supervisor::spawn(adapter, SupervisorConfig::default()).expect("spawn should succeed");
-        let failure = handle
-            .chat_with_execution(
+        let outcome = handle
+            .chat_with_outcome(
                 ChatRequest {
                     model: "a".to_string(),
                     messages: vec![],
                 },
                 CancellationToken::new(),
             )
-            .await
-            .expect_err("chat before load must fail");
-        match failure {
-            ChatFailure::NotExecuted(error) => {
-                assert_eq!(error.reason_code(), "model_not_found");
-            }
-            ChatFailure::OutcomeUnknown(error) => {
-                panic!("pre-adapter rejection was classified unknown: {error:?}");
-            }
-        }
+            .await;
+        assert!(matches!(
+            outcome,
+            ChatCallOutcome::NotSubmitted(err) if err.reason_code() == "model_not_found"
+        ));
     }
 
     #[test]

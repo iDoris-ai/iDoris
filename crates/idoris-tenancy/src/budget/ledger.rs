@@ -10,7 +10,9 @@
 //! (`settle`) independently callable, independently testable operations —
 //! which is why they're two methods here, not one.
 
-use std::path::Path;
+use std::collections::HashMap;
+use std::fs::File;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -105,6 +107,7 @@ const SCHEMA_MIGRATIONS: &[&str] = &[
     include_str!("migrations/0002_overage_events.sql"),
     include_str!("migrations/0003_tenant_scope.sql"),
     include_str!("migrations/0004_tenant_period_column.sql"),
+    include_str!("migrations/0005_dispatch_hold.sql"),
 ];
 
 /// Default reservation TTL: long enough to cover a slow upstream call,
@@ -198,11 +201,14 @@ impl SpendGate {
 pub struct BudgetLedger {
     pub(super) conn: Mutex<Connection>,
     pub(super) settlements: Mutex<Connection>,
-    pub(super) emergency_settlements:
-        Mutex<std::collections::HashMap<ReservationId, (String, i64)>>,
-    pub(super) unverified_settlements:
-        Mutex<std::collections::HashMap<(ReservationId, String), i64>>,
-    pub(super) live_settlement_intents: Mutex<std::collections::HashMap<String, String>>,
+    pub(super) settlement_outcomes: Mutex<HashMap<String, (String, i64)>>,
+    pub(super) unverified_settlements: Mutex<HashMap<(ReservationId, String), i64>>,
+    pub(super) live_intents: Mutex<HashMap<String, String>>,
+    pub(super) dispatch_locks: Mutex<HashMap<String, super::settlement::DispatchLease>>,
+    pub(super) dispatch_lock_dir: PathBuf,
+    pub(super) release_outcomes: Mutex<HashMap<String, String>>,
+    #[cfg(test)]
+    pub(super) begin_settlement_test_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     pub(super) clock: Arc<dyn Clock>,
     ttl_ms: i64,
 }
@@ -257,7 +263,35 @@ impl BudgetLedger {
         if ttl_ms <= 0 {
             return Err(BudgetError::InvalidTtl { ttl_ms });
         }
-        let mut conn = Connection::open(path.as_ref())?;
+        if !path.as_ref().exists()
+            && matches!(
+                std::fs::symlink_metadata(path.as_ref()),
+                Ok(metadata) if metadata.file_type().is_symlink()
+            )
+        {
+            return Err(BudgetError::Storage(
+                "database symlink target does not exist".into(),
+            ));
+        }
+        let storage_path = if path.as_ref() == Path::new(":memory:") {
+            path.as_ref().to_path_buf()
+        } else if path.as_ref().exists() {
+            std::fs::canonicalize(path.as_ref()).map_err(|e| BudgetError::Storage(e.to_string()))?
+        } else {
+            let parent = path
+                .as_ref()
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."));
+            let name = path
+                .as_ref()
+                .file_name()
+                .ok_or_else(|| BudgetError::Storage("database path has no file name".into()))?;
+            std::fs::canonicalize(parent)
+                .map_err(|e| BudgetError::Storage(e.to_string()))?
+                .join(name)
+        };
+        let mut conn = Connection::open(&storage_path)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.busy_timeout(busy_timeout)?;
         run_migrations(&mut conn)?;
@@ -267,12 +301,23 @@ impl BudgetLedger {
                 actual_cost_minor INTEGER NOT NULL CHECK(actual_cost_minor >= 0)
             );",
         )?;
+        let settlements =
+            super::settlement::open(&storage_path, path.as_ref(), &conn, busy_timeout)?;
         let ledger = Self {
             conn: Mutex::new(conn),
-            settlements: Mutex::new(super::settlement::open(path.as_ref(), busy_timeout)?),
-            emergency_settlements: Mutex::new(std::collections::HashMap::new()),
-            unverified_settlements: Mutex::new(std::collections::HashMap::new()),
-            live_settlement_intents: Mutex::new(std::collections::HashMap::new()),
+            settlements: Mutex::new(settlements),
+            settlement_outcomes: Mutex::new(HashMap::new()),
+            unverified_settlements: Mutex::new(HashMap::new()),
+            live_intents: Mutex::new(HashMap::new()),
+            dispatch_locks: Mutex::new(HashMap::new()),
+            dispatch_lock_dir: if path.as_ref() == Path::new(":memory:") {
+                std::env::temp_dir().join("idoris-dispatch-memory")
+            } else {
+                storage_path.with_added_extension("dispatch-locks")
+            },
+            release_outcomes: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            begin_settlement_test_hook: Mutex::new(None),
             clock,
             ttl_ms,
         };
@@ -476,7 +521,8 @@ impl BudgetLedger {
     /// Atomically check-and-deduct: inside one `BEGIN IMMEDIATE` transaction,
     /// compute the scope's remaining balance for the current period and, if
     /// `estimated_cost` fits, insert an `active` reservation holding that
-    /// amount until it's settled, released, or its TTL expires. Two
+    /// amount until it's settled, released, or its TTL expires. A dispatch
+    /// hold keeps an in-flight request reserved beyond its TTL. Two
     /// concurrent callers can never both succeed past the same last unit of
     /// budget, because the second one's `BEGIN IMMEDIATE` blocks (up to the
     /// `busy_timeout`) until the first commits or rolls back.
@@ -509,6 +555,65 @@ impl BudgetLedger {
         };
 
         self.retry_settlements_for_tenant(Some(&scope.tenant_id))?;
+        // Live dispatches keep their reservations. Only an intent whose
+        // caller is no longer live blocks this tenant pending recovery.
+        let _outcomes = self
+            .settlement_outcomes
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let live = self.live_intents.lock().unwrap_or_else(|p| p.into_inner());
+        let mut journal = self.settlements.lock().unwrap_or_else(|p| p.into_inner());
+        // Keep intent and owner reads in one snapshot; a healthy completion
+        // cannot delete the claim between its enumeration and the lock probe.
+        let snapshot = journal.transaction()?;
+        let mut intent_stmt =
+            snapshot.prepare("SELECT reservation_id FROM settlement_intents WHERE tenant_id=?1")?;
+        let intents = intent_stmt
+            .query_map([&scope.tenant_id], |r| r.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(intent_stmt);
+        for id in &intents {
+            if live.get(id) == Some(&scope.tenant_id) {
+                continue;
+            }
+            let token: Option<String> = snapshot
+                .query_row(
+                    "SELECT token FROM dispatch_owners WHERE reservation_id=?1",
+                    [id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            let Some(token) = token else {
+                return Err(BudgetError::Storage(
+                    "tenant has an ownerless settlement intent".into(),
+                ));
+            };
+            let path = self.dispatch_lock_dir.join(format!("{token}.lock"));
+            let file = File::options()
+                .read(true)
+                .write(true)
+                .open(path)
+                .map_err(|e| BudgetError::Storage(e.to_string()))?;
+            match file.try_lock() {
+                Err(std::fs::TryLockError::WouldBlock) => continue,
+                Err(error) => {
+                    return Err(BudgetError::Storage(format!(
+                        "dispatch owner lock probe failed: {error:?}"
+                    )));
+                }
+                Ok(()) => {
+                    return Err(BudgetError::Storage(
+                        "tenant has an orphaned settlement intent".into(),
+                    ));
+                }
+            }
+        }
+        drop(snapshot);
+        drop(journal);
+        drop(live);
+        // Keep this process-local gate until the reservation transaction is
+        // finished. Otherwise begin_settlement could insert an intent after
+        // this check but before this request commits its reservation.
         let now_ms = self.clock.now_ms();
         let mut conn = self.lock();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -678,7 +783,7 @@ impl BudgetLedger {
         let now_ms = self.clock.now_ms();
         let conn = self.lock();
         let n = conn.execute(
-            "UPDATE reservations SET status=?1 WHERE status=?2 AND expires_at_ms <= ?3",
+            "UPDATE reservations SET status=?1 WHERE status=?2 AND expires_at_ms <= ?3 AND dispatch_hold=0",
             rusqlite::params![
                 ReservationStatus::Expired.as_sql(),
                 ReservationStatus::Active.as_sql(),
@@ -698,7 +803,7 @@ fn sweep_expired_scope(
     let n = conn.execute(
         "UPDATE reservations SET status=?7 \
          WHERE tenant_id=?1 AND key_id=?2 AND provider_id=?3 AND model_id=?4 AND period=?5 \
-           AND status=?6 AND expires_at_ms <= ?8",
+           AND status=?6 AND expires_at_ms <= ?8 AND dispatch_hold=0",
         rusqlite::params![
             scope.tenant_id,
             scope.key_id,
@@ -737,103 +842,12 @@ impl BudgetLedger {
         reservation_id: &ReservationId,
         actual_cost_minor: i64,
     ) -> Result<SettleReceipt, BudgetError> {
-        let mut journal = self.settlements.lock().unwrap_or_else(|p| p.into_inner());
-        let tx = journal.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        if let Some(queued_actual) = self
-            .unverified_settlements
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .get(&(reservation_id.clone(), tenant_id.to_owned()))
-            .copied()
-        {
-            tx.rollback()?;
-            return Err(BudgetError::SettlementConflict {
-                reservation_id: reservation_id.0.clone(),
-                reason: format!(
-                    "completed settlement of {queued_actual} is awaiting ownership verification"
-                ),
-            });
-        }
-        if let Some((queued_tenant, queued_actual)) = self
-            .emergency_settlements
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .get(reservation_id)
-            .cloned()
-        {
-            tx.rollback()?;
-            return if queued_tenant != tenant_id {
-                Err(BudgetError::TenantMismatch {
-                    reservation_id: reservation_id.0.clone(),
-                })
-            } else if queued_actual != actual_cost_minor {
-                Err(BudgetError::SettlementConflict {
-                    reservation_id: reservation_id.0.clone(),
-                    reason: format!(
-                        "in-memory recovery cost is {queued_actual}, requested {actual_cost_minor}"
-                    ),
-                })
-            } else {
-                Err(BudgetError::SettlementConflict {
-                    reservation_id: reservation_id.0.clone(),
-                    reason: format!("settlement of {queued_actual} is awaiting durable recovery"),
-                })
-            };
-        }
-        let emergency: Option<i64> = self.lock().query_row(
-            "SELECT actual_cost_minor FROM budget_emergency_settlements WHERE reservation_id=?1 AND tenant_id=?2",
-            rusqlite::params![reservation_id.0, tenant_id], |row| row.get(0),
-        ).optional()?;
-        if let Some(pending) = emergency
-            && pending != actual_cost_minor
-        {
-            tx.rollback()?;
-            return Err(BudgetError::SettlementConflict {
-                reservation_id: reservation_id.0.clone(),
-                reason: format!(
-                    "emergency recovery cost is {pending}, requested {actual_cost_minor}"
-                ),
-            });
-        }
-        let queued: Option<i64> = tx.query_row(
-            "SELECT actual_cost_minor FROM pending_settlements WHERE reservation_id=?1 AND tenant_id=?2",
-            rusqlite::params![reservation_id.0, tenant_id],
-            |row| row.get(0),
-        ).optional()?;
-        if let Some(queued) = queued
-            && queued != actual_cost_minor
-        {
-            tx.rollback()?;
-            return Err(BudgetError::SettlementConflict {
-                reservation_id: reservation_id.0.clone(),
-                reason: format!("pending cost is {queued}, requested {actual_cost_minor}"),
-            });
-        }
-        let result = self.settle_uncoordinated(tenant_id, reservation_id, actual_cost_minor);
-        let committed = matches!(&result, Ok(_) | Err(BudgetError::OverageTooLarge { .. }));
-        let cleanup = if committed {
-            tx.execute(
-                "DELETE FROM pending_settlements WHERE reservation_id=?1 AND tenant_id=?2",
-                rusqlite::params![reservation_id.0, tenant_id],
-            )
-            .and_then(|_| tx.commit())
-        } else {
-            tx.commit()
-        };
-        if let Err(err) = cleanup {
-            if committed {
-                eprintln!(
-                    "committed settlement sidecar cleanup failed: reservation={} error={err}",
-                    reservation_id.0
-                );
-                return result;
-            }
-            return Err(err.into());
-        }
-        result
+        self.settle_public(tenant_id, reservation_id, actual_cost_minor)
     }
 
-    pub(super) fn settle_uncoordinated(
+    /// Commit a settlement after the sidecar has serialized dispatch ownership.
+    /// This is internal so callers cannot bypass that ownership protocol.
+    pub(super) fn settle_primary(
         &self,
         tenant_id: &str,
         reservation_id: &ReservationId,
@@ -1024,12 +1038,48 @@ impl BudgetLedger {
         Ok(())
     }
 
+    /// Stop advertising a live dispatch when its final cost is unknown.
+    /// Keep the durable claim, intent and hold for reconciliation; this is
+    /// not confirmation that the upstream did no work and must not refund.
+    pub fn abandon_dispatch(
+        &self,
+        tenant_id: &str,
+        reservation_id: &ReservationId,
+    ) -> Result<(), BudgetError> {
+        let mut live = self.live_intents.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(owner) = live.get(&reservation_id.0) {
+            if owner != tenant_id {
+                return Err(BudgetError::TenantMismatch {
+                    reservation_id: reservation_id.0.clone(),
+                });
+            }
+            live.remove(&reservation_id.0);
+            self.dispatch_locks
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(&reservation_id.0);
+        }
+        Ok(())
+    }
+
+    /// Confirm that the upstream call did not execute, using the same
+    /// dispatch ownership checks and durable cancellation retry as release.
+    pub fn release_confirmed_unexecuted(
+        &self,
+        tenant_id: &str,
+        reservation_id: &ReservationId,
+    ) -> Result<(), BudgetError> {
+        self.release(tenant_id, reservation_id)
+    }
+
     /// Fully release a reservation without charging anything — for calls
     /// that failed or that fell back to a different (separately reserved)
     /// candidate. Idempotent when the reservation is already `released`;
     /// erroring on `settled` prevents un-settling a completed charge.
-    /// A dispatch intent also prevents ordinary cancellation: use
-    /// `release_confirmed_unexecuted` only after checking upstream execution.
+    /// The dispatch owner must only call this after confirming no charge is
+    /// due (including cancellation before chat submission). Ownership alone
+    /// or a cancelled request future is not proof; unknown outcomes must use
+    /// [`Self::abandon_dispatch`] and retain their hold.
     ///
     /// L3 (Opus Tier-2 acceptance): releasing an already-`expired` (but not
     /// yet settled/released) reservation succeeds (`Ok(())`) instead of
@@ -1051,98 +1101,10 @@ impl BudgetLedger {
         tenant_id: &str,
         reservation_id: &ReservationId,
     ) -> Result<(), BudgetError> {
-        self.release_with_intent_policy(tenant_id, reservation_id, false)
-    }
-
-    /// Release only after the caller has independently confirmed that the
-    /// upstream call did not execute. This resolves an otherwise unknown
-    /// persisted dispatch intent.
-    pub fn release_confirmed_unexecuted(
-        &self,
-        tenant_id: &str,
-        reservation_id: &ReservationId,
-    ) -> Result<(), BudgetError> {
-        self.release_with_intent_policy(tenant_id, reservation_id, true)
-    }
-
-    fn release_with_intent_policy(
-        &self,
-        tenant_id: &str,
-        reservation_id: &ReservationId,
-        confirmed_unexecuted: bool,
-    ) -> Result<(), BudgetError> {
-        // The in-memory exemption represents the request lifetime, not the
-        // database transaction. Once this request ends, remove its exemption
-        // even if BEGIN IMMEDIATE below fails with Busy. The durable intent
-        // remains and will then fence admission as an unknown outcome.
-        self.finish_settlement_intent_for_tenant(tenant_id, reservation_id);
-        let mut journal = self.settlements.lock().unwrap_or_else(|p| p.into_inner());
-        let tx = journal.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        if let Some((queued_tenant, queued_actual)) = self
-            .emergency_settlements
+        let outcomes = self
+            .settlement_outcomes
             .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .get(reservation_id)
-            .cloned()
-        {
-            tx.rollback()?;
-            return if queued_tenant != tenant_id {
-                Err(BudgetError::TenantMismatch {
-                    reservation_id: reservation_id.0.clone(),
-                })
-            } else {
-                Err(BudgetError::SettlementConflict {
-                    reservation_id: reservation_id.0.clone(),
-                    reason: format!("settlement of {queued_actual} is awaiting durable recovery"),
-                })
-            };
-        }
-        let emergency: Option<i64> = self.lock().query_row(
-            "SELECT actual_cost_minor FROM budget_emergency_settlements WHERE reservation_id=?1 AND tenant_id=?2",
-            rusqlite::params![reservation_id.0, tenant_id], |row| row.get(0),
-        ).optional()?;
-        if let Some(pending) = emergency {
-            tx.rollback()?;
-            return Err(BudgetError::SettlementConflict {
-                reservation_id: reservation_id.0.clone(),
-                reason: format!("settlement of {pending} is pending in emergency recovery"),
-            });
-        }
-        let pending: Option<i64> = tx.query_row(
-            "SELECT actual_cost_minor FROM pending_settlements WHERE reservation_id=?1 AND tenant_id=?2",
-            rusqlite::params![reservation_id.0, tenant_id],
-            |row| row.get(0),
-        ).optional()?;
-        if let Some(pending) = pending {
-            tx.rollback()?;
-            return Err(BudgetError::SettlementConflict {
-                reservation_id: reservation_id.0.clone(),
-                reason: format!("settlement of {pending} is pending"),
-            });
-        }
-        if let Some(intent_tenant) = tx
-            .query_row(
-                "SELECT tenant_id FROM settlement_intents WHERE reservation_id=?1",
-                [&reservation_id.0],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?
-        {
-            if intent_tenant != tenant_id {
-                tx.rollback()?;
-                return Err(BudgetError::TenantMismatch {
-                    reservation_id: reservation_id.0.clone(),
-                });
-            }
-            if !confirmed_unexecuted {
-                self.finish_settlement_intent(reservation_id);
-                tx.rollback()?;
-                return Err(BudgetError::SettlementConflict {
-                    reservation_id: reservation_id.0.clone(),
-                    reason: "dispatch outcome is unconfirmed".to_owned(),
-                });
-            }
-        }
+            .unwrap_or_else(|p| p.into_inner());
         if self
             .unverified_settlements
             .lock()
@@ -1154,50 +1116,201 @@ impl BudgetLedger {
                 reason: "completed settlement is awaiting ownership verification".into(),
             });
         }
-        let result = self.release_uncoordinated(tenant_id, reservation_id);
-        if result.is_ok() && confirmed_unexecuted {
-            tx.execute(
-                "DELETE FROM settlement_intents WHERE reservation_id=?1 AND tenant_id=?2",
+        let mut live = self.live_intents.lock().unwrap_or_else(|p| p.into_inner());
+        if outcomes.contains_key(&reservation_id.0) {
+            return Err(BudgetError::Storage(
+                "cannot release reservation with a known actual outcome".into(),
+            ));
+        }
+        let deferred_primary_error = {
+            let conn = self.lock();
+            match find_reservation(&conn, tenant_id, reservation_id) {
+                Ok(row) => {
+                    if row.status == ReservationStatus::Settled.as_sql() {
+                        return Err(BudgetError::ReservationNotActive {
+                            reservation_id: reservation_id.0.clone(),
+                            status: row.status,
+                        });
+                    }
+                    if row.actual_cost_minor.is_some() {
+                        return Err(BudgetError::Storage(
+                            "cannot release reservation with a recorded actual outcome".into(),
+                        ));
+                    }
+                    let emergency: bool = conn.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM budget_emergency_settlements WHERE reservation_id=?1)",
+                        [&reservation_id.0], |r| r.get(0),
+                    )?;
+                    if emergency {
+                        return Err(BudgetError::SettlementConflict {
+                            reservation_id: reservation_id.0.clone(),
+                            reason: "completed settlement is pending emergency recovery".into(),
+                        });
+                    }
+                    None
+                }
+                Err(err @ (BudgetError::Busy | BudgetError::Storage(_)))
+                    if live
+                        .get(&reservation_id.0)
+                        .is_some_and(|owner| owner == tenant_id) =>
+                {
+                    // begin_settlement already validated this owner. If the
+                    // primary lookup is temporarily unavailable, keep the
+                    // cancellation retryable instead of orphaning its intent.
+                    Some(err)
+                }
+                Err(err) => return Err(err),
+            }
+        };
+        // The caller explicitly confirms no charge is due; ownership only
+        // authorizes that confirmation, it cannot establish cancellation.
+        // Preserve that acknowledgement even when the journal is unavailable;
+        // a foreign caller must first prove a durable acknowledgement exists.
+        let _dispatch_lease = if live
+            .get(&reservation_id.0)
+            .is_some_and(|owner| owner == tenant_id)
+        {
+            self.release_outcomes
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .insert(reservation_id.0.clone(), tenant_id.to_string());
+            live.remove(&reservation_id.0);
+            self.dispatch_locks
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(&reservation_id.0)
+        } else {
+            None
+        };
+        let local_confirmation = self
+            .release_outcomes
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&reservation_id.0)
+            .is_some_and(|owner| owner == tenant_id);
+        let mut journal = self.settlements.lock().unwrap_or_else(|p| p.into_inner());
+        let confirmation = journal.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let has_intent: bool = confirmation.query_row(
+            "SELECT EXISTS(SELECT 1 FROM settlement_intents WHERE reservation_id=?1)",
+            [&reservation_id.0],
+            |r| r.get(0),
+        )?;
+        let confirmed_release: Option<String> = confirmation
+            .query_row(
+                "SELECT tenant_id FROM pending_releases WHERE reservation_id=?1",
+                [&reservation_id.0],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if confirmed_release
+            .as_deref()
+            .is_some_and(|owner| owner != tenant_id)
+        {
+            return Err(BudgetError::TenantMismatch {
+                reservation_id: reservation_id.0.clone(),
+            });
+        }
+        if has_intent && !local_confirmation && confirmed_release.is_none() {
+            return Err(BudgetError::Storage(
+                "dispatch cancellation requires its owner's acknowledgement".into(),
+            ));
+        }
+        confirmation.execute(
+            "INSERT INTO pending_releases VALUES (?1, ?2) ON CONFLICT(reservation_id) DO NOTHING",
+            rusqlite::params![reservation_id.0, tenant_id],
+        )?;
+        // Commit confirmation before attempting the primary write: restart
+        // may replay confirmed cancellation, but never infer it from silence.
+        confirmation.commit()?;
+        self.release_outcomes
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(reservation_id.0.clone(), tenant_id.to_string());
+        if let Some(err) = deferred_primary_error {
+            return Err(err);
+        }
+        let journal_tx = journal.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let pending_actual: i64 = journal_tx.query_row(
+            "SELECT count(*) FROM pending_settlements WHERE reservation_id=?1",
+            [&reservation_id.0],
+            |r| r.get(0),
+        )?;
+        if pending_actual > 0 {
+            journal_tx.execute(
+                "DELETE FROM pending_releases WHERE reservation_id=?1 AND tenant_id=?2",
                 rusqlite::params![reservation_id.0, tenant_id],
             )?;
-            self.finish_settlement_intent(reservation_id);
+            journal_tx.commit()?;
+            self.release_outcomes
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(&reservation_id.0);
+            return Err(BudgetError::Storage(
+                "cannot release reservation with a pending actual outcome".into(),
+            ));
         }
-        tx.commit()?;
-        result
-    }
-
-    pub(super) fn release_uncoordinated(
-        &self,
-        tenant_id: &str,
-        reservation_id: &ReservationId,
-    ) -> Result<(), BudgetError> {
+        // Keep a retryable outcome even when either database is Busy. After
+        // a crash, the durable pre-call intent still fails closed.
+        // The terminal commit itself also retires the intent. A concurrent
+        // durable settlement that starts after this transaction commits must
+        // validate the primary row and cannot revive a released reservation.
+        journal_tx.execute(
+            "DELETE FROM settlement_intents WHERE reservation_id=?1 AND tenant_id=?2",
+            rusqlite::params![reservation_id.0, tenant_id],
+        )?;
+        journal_tx.execute(
+            "DELETE FROM dispatch_owners WHERE reservation_id=?1 AND tenant_id=?2",
+            rusqlite::params![reservation_id.0, tenant_id],
+        )?;
         let mut conn = self.lock();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
 
         let row = find_reservation(&tx, tenant_id, reservation_id)?;
         let status = ReservationStatus::parse(&row.status)?;
-
+        if row.actual_cost_minor.is_some() && status != ReservationStatus::Settled {
+            return Err(BudgetError::Storage(
+                "cannot release reservation with a recorded actual outcome".into(),
+            ));
+        }
         match status {
-            ReservationStatus::Released => {
-                tx.commit()?;
-                Ok(())
-            }
+            ReservationStatus::Released => {}
             ReservationStatus::Active | ReservationStatus::Expired => {
                 tx.execute(
                     "UPDATE reservations SET status=?2 WHERE id=?1",
                     rusqlite::params![reservation_id.0, ReservationStatus::Released.as_sql()],
                 )?;
-                tx.commit()?;
-                Ok(())
             }
             ReservationStatus::Settled => {
-                tx.rollback().ok();
-                Err(BudgetError::ReservationNotActive {
+                return Err(BudgetError::ReservationNotActive {
                     reservation_id: reservation_id.0.clone(),
                     status: row.status,
-                })
+                });
             }
         }
+        tx.commit()?;
+        drop(conn);
+        journal_tx.commit()?;
+        drop(journal);
+        live.remove(&reservation_id.0);
+        self.dispatch_locks
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&reservation_id.0);
+        drop(live);
+        drop(outcomes);
+        self.cancel_settlement(tenant_id, reservation_id)?;
+        self.settlements
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .execute(
+                "DELETE FROM pending_releases WHERE reservation_id=?1 AND tenant_id=?2",
+                rusqlite::params![reservation_id.0, tenant_id],
+            )?;
+        self.release_outcomes
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&reservation_id.0);
+        Ok(())
     }
 }
 
@@ -1221,6 +1334,7 @@ struct ReservationRow {
     /// B-5: needed to cap a reservation's total lifetime across repeated
     /// `extend` calls.
     created_at_ms: i64,
+    actual_cost_minor: Option<i64>,
 }
 
 /// M2 (Opus Tier-2 acceptance): filters by `tenant_id` in the `WHERE`
@@ -1239,7 +1353,7 @@ fn find_reservation(
     let found = conn
         .query_row(
             "SELECT tenant_id, key_id, provider_id, model_id, period, reserved_minor, status, \
-                    expires_at_ms, tenant_period, created_at_ms \
+                    expires_at_ms, tenant_period, created_at_ms, actual_cost_minor \
              FROM reservations WHERE id = ?1 AND tenant_id = ?2",
             rusqlite::params![reservation_id.0, tenant_id],
             |r| {
@@ -1254,6 +1368,7 @@ fn find_reservation(
                     expires_at_ms: r.get(7)?,
                     tenant_period: r.get(8)?,
                     created_at_ms: r.get(9)?,
+                    actual_cost_minor: r.get(10)?,
                 })
             },
         )
@@ -1414,7 +1529,7 @@ fn has_active_reservations_for_scope(
     let exists: i64 = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM reservations \
          WHERE tenant_id=?1 AND key_id=?2 AND provider_id=?3 AND model_id=?4 \
-           AND status=?5 AND expires_at_ms > ?6)",
+           AND status=?5 AND (expires_at_ms > ?6 OR dispatch_hold=1))",
         rusqlite::params![
             scope.tenant_id,
             scope.key_id,
@@ -1470,7 +1585,7 @@ fn tenant_active_reserved_for(
 ) -> Result<i64, BudgetError> {
     conn.query_row(
         "SELECT COALESCE(SUM(reserved_minor), 0) FROM reservations \
-         WHERE tenant_id=?1 AND tenant_period=?2 AND status=?3 AND expires_at_ms > ?4",
+         WHERE tenant_id=?1 AND tenant_period=?2 AND status=?3 AND (expires_at_ms > ?4 OR dispatch_hold=1)",
         rusqlite::params![
             tenant_id,
             tenant_period,
@@ -1489,7 +1604,7 @@ fn has_active_reservations_for_tenant(
 ) -> Result<bool, BudgetError> {
     let exists: i64 = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM reservations \
-         WHERE tenant_id=?1 AND status=?2 AND expires_at_ms > ?3)",
+         WHERE tenant_id=?1 AND status=?2 AND (expires_at_ms > ?3 OR dispatch_hold=1))",
         rusqlite::params![tenant_id, ReservationStatus::Active.as_sql(), now_ms],
         |row| row.get(0),
     )?;
@@ -1523,7 +1638,7 @@ fn active_reserved_for(
     conn.query_row(
         "SELECT COALESCE(SUM(reserved_minor), 0) FROM reservations \
          WHERE tenant_id=?1 AND key_id=?2 AND provider_id=?3 AND model_id=?4 AND period=?5 \
-           AND status='active' AND expires_at_ms > ?6",
+           AND status='active' AND (expires_at_ms > ?6 OR dispatch_hold=1)",
         rusqlite::params![
             scope.tenant_id,
             scope.key_id,
@@ -1548,6 +1663,14 @@ mod tests {
     /// the ledger so the ledger (and its open connection) drops first.
     struct TempDb(std::path::PathBuf);
 
+    struct TestClock(std::sync::atomic::AtomicI64);
+
+    impl Clock for TestClock {
+        fn now_ms(&self) -> i64 {
+            self.0.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
     impl AsRef<Path> for TempDb {
         fn as_ref(&self) -> &Path {
             &self.0
@@ -1561,6 +1684,12 @@ mod tests {
                 p.push(suffix);
                 let _ = std::fs::remove_file(p);
             }
+            let sidecar = self.0.with_added_extension("settlements.sqlite3");
+            for suffix in ["", "-wal", "-shm"] {
+                let mut p = sidecar.clone().into_os_string();
+                p.push(suffix);
+                let _ = std::fs::remove_file(p);
+            }
         }
     }
 
@@ -1570,6 +1699,36 @@ mod tests {
             std::process::id(),
             uuid::Uuid::new_v4()
         )))
+    }
+
+    #[test]
+    fn unknown_dispatch_retains_hold_and_blocks_new_spend_after_ttl() {
+        let path = temp_db_path("unknown-dispatch");
+        let clock = Arc::new(TestClock(std::sync::atomic::AtomicI64::new(0)));
+        let ledger = BudgetLedger::open_with(&path, clock.clone(), 100).unwrap();
+        let scope = BudgetScope::new("tenant", "key", "provider", "model");
+        ledger.configure(&scope, 100, "UTC").unwrap();
+        let id = ledger.reserve(&scope, Price::Known(30)).unwrap();
+        ledger.begin_settlement("tenant", &id).unwrap();
+        assert!(matches!(
+            ledger.abandon_dispatch("other", &id),
+            Err(BudgetError::TenantMismatch { .. })
+        ));
+        ledger.abandon_dispatch("tenant", &id).unwrap();
+        clock.0.store(101, std::sync::atomic::Ordering::SeqCst);
+        ledger.retry_settlements().unwrap();
+        assert_eq!(ledger.sweep_expired().unwrap(), 0);
+        assert_eq!(ledger.balance(&scope).unwrap(), 70);
+        assert!(ledger.release("tenant", &id).is_err());
+        assert!(matches!(
+            ledger.reserve(&scope, Price::Known(1)),
+            Err(BudgetError::Storage(_))
+        ));
+        drop(ledger);
+        let reopened = BudgetLedger::open_with(&path, clock, 100).unwrap();
+        assert_eq!(reopened.balance(&scope).unwrap(), 70);
+        assert!(reopened.release("tenant", &id).is_err());
+        assert!(reopened.reserve(&scope, Price::Known(1)).is_err());
     }
 
     #[test]
@@ -2282,6 +2441,67 @@ mod tests {
     }
 
     #[test]
+    fn release_and_cross_instance_settlement_serialize_without_losing_actual() {
+        for primary_locked in [true, false] {
+            let path = temp_db_path("release-settlement-cross-instance");
+            let open = || {
+                BudgetLedger::open_with_busy_timeout(
+                    &path,
+                    Arc::new(SystemClock),
+                    60_000,
+                    Duration::ZERO,
+                )
+                .unwrap()
+            };
+            let releaser = open();
+            let owner = open();
+            let scope = BudgetScope::new("acme-co", "key-1", "openai", "gpt-5");
+            owner.configure(&scope, 1_000, "UTC").unwrap();
+            let id = owner.reserve(&scope, Price::Known(100)).unwrap();
+            owner.begin_settlement(&scope.tenant_id, &id).unwrap();
+            assert!(releaser.begin_settlement(&scope.tenant_id, &id).is_err());
+            let primary = Connection::open(&path).unwrap();
+            if primary_locked {
+                primary.execute_batch("BEGIN IMMEDIATE").unwrap();
+            }
+            let journal =
+                Connection::open(path.as_ref().with_added_extension("settlements.sqlite3"))
+                    .unwrap();
+            journal.execute_batch("BEGIN IMMEDIATE").unwrap();
+            assert!(releaser.release(&scope.tenant_id, &id).is_err());
+            assert!(releaser.release_outcomes.lock().unwrap().is_empty());
+            assert!(matches!(
+                owner.settle_durable(&scope.tenant_id, &id, 20),
+                Err(BudgetError::Busy) | Ok(None)
+            ));
+            journal.execute_batch("ROLLBACK").unwrap();
+            if primary_locked {
+                primary.execute_batch("ROLLBACK").unwrap();
+            }
+            // An unpersisted completed cost must survive a foreign release,
+            // then be charged exactly once by retry and after restart.
+            assert!(releaser.release(&scope.tenant_id, &id).is_err());
+            owner.retry_settlements().unwrap();
+            releaser.retry_settlements().unwrap();
+            let row: (String, Option<i64>) = releaser
+                .lock()
+                .query_row(
+                    "SELECT status, actual_cost_minor FROM reservations WHERE id=?1",
+                    [&id.0],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(row, ("settled".to_string(), Some(20)));
+            assert_eq!(releaser.balance(&scope).unwrap(), 980);
+            drop(owner);
+            drop(releaser);
+            let recovered = open();
+            recovered.retry_settlements().unwrap();
+            assert_eq!(recovered.balance(&scope).unwrap(), 980);
+        }
+    }
+
+    #[test]
     fn releasing_twice_is_idempotent() {
         let path = temp_db_path("release-twice");
         let ledger = BudgetLedger::open(&path).expect("open");
@@ -2292,6 +2512,166 @@ mod tests {
             .release(&scope.tenant_id, &id)
             .expect("first release");
         assert!(ledger.release(&scope.tenant_id, &id).is_ok());
+    }
+
+    #[test]
+    fn cancellation_does_not_release_pending_actual_after_exclusive_read_failure() {
+        let path = temp_db_path("release-sidecar-exclusive");
+        let ledger = BudgetLedger::open_with_busy_timeout(
+            &path,
+            Arc::new(SystemClock),
+            60_000,
+            Duration::ZERO,
+        )
+        .expect("open");
+        let scope = BudgetScope::new("acme-co", "key-1", "openai", "gpt-5");
+        ledger.configure(&scope, 1_000, "UTC").expect("configure");
+        let id = ledger.reserve(&scope, Price::Known(100)).expect("reserve");
+        ledger
+            .begin_settlement(&scope.tenant_id, &id)
+            .expect("begin settlement");
+        ledger
+            .settlements
+            .lock()
+            .expect("settlement journal")
+            .execute(
+                "INSERT INTO pending_settlements VALUES (?1, ?2, 20)",
+                rusqlite::params![id.0, scope.tenant_id],
+            )
+            .expect("record actual outcome");
+
+        let blocker = Connection::open(path.as_ref().with_added_extension("settlements.sqlite3"))
+            .expect("open sidecar blocker");
+        blocker.busy_timeout(Duration::ZERO).expect("busy timeout");
+        blocker
+            .execute_batch("BEGIN EXCLUSIVE")
+            .expect("lock sidecar");
+
+        assert!(matches!(
+            ledger.release(&scope.tenant_id, &id),
+            Err(BudgetError::Busy)
+        ));
+        assert!(matches!(ledger.retry_settlements(), Err(BudgetError::Busy)));
+        assert_eq!(ledger.balance(&scope).expect("balance while pending"), 900);
+
+        blocker.execute_batch("ROLLBACK").expect("unlock sidecar");
+        ledger.retry_settlements().expect("recover actual outcome");
+        assert_eq!(ledger.balance(&scope).expect("recovered balance"), 980);
+        assert!(
+            !ledger
+                .release_outcomes
+                .lock()
+                .expect("release outcomes")
+                .contains_key(&id.0)
+        );
+        assert!(
+            !ledger
+                .live_intents
+                .lock()
+                .expect("live intents")
+                .contains_key(&id.0)
+        );
+        let (status, actual): (String, Option<i64>) = ledger
+            .conn
+            .lock()
+            .expect("ledger connection")
+            .query_row(
+                "SELECT status, actual_cost_minor FROM reservations WHERE id=?1",
+                [&id.0],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("reservation outcome");
+        assert_eq!((status.as_str(), actual), ("settled", Some(20)));
+    }
+
+    #[test]
+    fn cancellation_primary_read_failure_recovers_after_ttl_and_restart() {
+        let path = temp_db_path("release-primary-read-failure");
+        let ttl_ms = 25;
+        let clock = Arc::new(TestClock(std::sync::atomic::AtomicI64::new(
+            SystemClock.now_ms(),
+        )));
+        let ledger = BudgetLedger::open_with(&path, clock.clone(), ttl_ms).expect("open");
+        let scope = BudgetScope::new("acme-co", "key-1", "openai", "gpt-5");
+        ledger.configure(&scope, 100, "UTC").expect("configure");
+        let id = ledger.reserve(&scope, Price::Known(50)).expect("reserve");
+        ledger
+            .begin_settlement(&scope.tenant_id, &id)
+            .expect("begin settlement");
+
+        Connection::open(path.as_ref())
+            .expect("open primary database")
+            .execute_batch("ALTER TABLE reservations RENAME TO reservations_unavailable")
+            .expect("hide reservations table");
+        assert!(ledger.release("someone-else", &id).is_err());
+        assert_eq!(
+            ledger.live_intents.lock().expect("live intents").get(&id.0),
+            Some(&scope.tenant_id)
+        );
+        let no_wrong_tenant_release: i64 = ledger
+            .settlements
+            .lock()
+            .expect("settlement journal")
+            .query_row("SELECT count(*) FROM pending_releases", [], |r| r.get(0))
+            .expect("pending release count");
+        assert_eq!(no_wrong_tenant_release, 0);
+        assert!(matches!(
+            ledger.release(&scope.tenant_id, &id),
+            Err(BudgetError::Storage(_))
+        ));
+        assert!(
+            !ledger
+                .live_intents
+                .lock()
+                .expect("live intents")
+                .contains_key(&id.0)
+        );
+        let pending_release: Option<String> = ledger
+            .settlements
+            .lock()
+            .expect("settlement journal")
+            .query_row(
+                "SELECT tenant_id FROM pending_releases WHERE reservation_id=?1",
+                [&id.0],
+                |r| r.get(0),
+            )
+            .optional()
+            .expect("pending release query");
+        assert_eq!(pending_release.as_deref(), Some(scope.tenant_id.as_str()));
+
+        drop(ledger);
+        clock
+            .0
+            .fetch_add(ttl_ms + 1, std::sync::atomic::Ordering::SeqCst);
+        Connection::open(path.as_ref())
+            .expect("open primary database")
+            .execute_batch("ALTER TABLE reservations_unavailable RENAME TO reservations")
+            .expect("restore reservations table");
+
+        // Opening the worker retries its durable cancellation even though
+        // the reservation's dispatch hold outlived its normal TTL.
+        let recovered = BudgetLedger::open_with(&path, clock, ttl_ms).expect("restart ledger");
+        let (status, actual): (String, Option<i64>) = recovered
+            .lock()
+            .query_row(
+                "SELECT status, actual_cost_minor FROM reservations WHERE id=?1",
+                [&id.0],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("recovered reservation");
+        assert_eq!((status.as_str(), actual), ("released", None));
+        assert_eq!(recovered.balance(&scope).expect("released balance"), 100);
+        let intent_count: i64 = recovered
+            .settlements
+            .lock()
+            .expect("settlement journal")
+            .query_row(
+                "SELECT count(*) FROM settlement_intents WHERE reservation_id=?1",
+                [&id.0],
+                |r| r.get(0),
+            )
+            .expect("intent count");
+        assert_eq!(intent_count, 0);
     }
 
     /// Negative control: a settled reservation can't be released — that

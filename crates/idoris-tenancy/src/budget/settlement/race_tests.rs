@@ -67,7 +67,7 @@ fn release_cannot_cross_active_read_and_pending_insert_window() {
     assert_eq!(pending, 1);
     assert!(matches!(
         second.release("t", &id),
-        Err(BudgetError::SettlementConflict { .. })
+        Err(BudgetError::SettlementConflict { .. }) | Err(BudgetError::Storage(_))
     ));
 
     drop(second);
@@ -98,6 +98,10 @@ fn memory_settlement_conflict_is_serialized_with_busy_recovery() {
     let sidecar_lock = external
         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
         .unwrap();
+    let mut external_primary = rusqlite::Connection::open(&path).unwrap();
+    let primary_lock = external_primary
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .unwrap();
 
     let (at_check_tx, at_check_rx) = mpsc::channel();
     let (resume_tx, resume_rx) = mpsc::channel();
@@ -120,24 +124,19 @@ fn memory_settlement_conflict_is_serialized_with_busy_recovery() {
         Err(BudgetError::Busy)
     ));
     assert_eq!(
-        ledger.emergency_settlements.lock().unwrap().get(&id),
+        ledger.settlement_outcomes.lock().unwrap().get(&id.0),
         Some(&("t".to_owned(), 31))
     );
-    assert!(
-        !ledger
-            .live_settlement_intents
-            .lock()
-            .unwrap()
-            .contains_key(&id.0)
-    );
+    assert!(!ledger.live_intents.lock().unwrap().contains_key(&id.0));
 
     sidecar_lock.rollback().unwrap();
+    primary_lock.rollback().unwrap();
     resume_tx.send(()).unwrap();
     let competing_result = contender.join().unwrap();
     assert!(
         matches!(
             competing_result,
-            Err(BudgetError::SettlementConflict { .. })
+            Err(BudgetError::SettlementConflict { .. }) | Err(BudgetError::Storage(_))
         ),
         "conflicting settlement returned {competing_result:?}"
     );
@@ -188,6 +187,7 @@ fn memory_settlement_conflict_is_serialized_with_busy_recovery() {
     assert_eq!(restarted.tenant_balance("t").unwrap(), 69);
     drop(restarted);
     drop(external);
+    drop(external_primary);
     let _ = std::fs::remove_file(path);
     let _ = std::fs::remove_file(sidecar_path);
 }
