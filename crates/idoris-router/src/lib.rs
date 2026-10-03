@@ -166,6 +166,9 @@ pub struct AppState {
     /// count is always `cards.len()` — a single source of truth instead of
     /// a separately-tracked counter that could drift from this list.
     pub cards: Vec<idoris_contracts::ComponentCard>,
+    /// Startup-validated YAML routing policy. Tests use an in-memory local
+    /// default so `AppState::default()` performs no filesystem I/O.
+    pub routing_policy: idoris_contracts::RoutingPolicy,
     /// Backs the local dispatch path (R2-D task 3); `None` means no local
     /// backend is wired — dispatch then fails closed as
     /// `local_only_unavailable` rather than panicking on a missing handle.
@@ -196,6 +199,7 @@ impl std::fmt::Debug for AppState {
             .field("instance_id", &self.instance_id)
             .field("deploy_mode", &self.deploy_mode)
             .field("cards", &self.cards)
+            .field("routing_policy", &self.routing_policy)
             .field("supervisor", &self.supervisor)
             .field(
                 "budget_ledger",
@@ -219,6 +223,17 @@ impl Default for AppState {
                 std::env::var("IDORIS_DEPLOY_MODE").ok().as_deref(),
             ),
             cards: Vec::new(),
+            routing_policy: idoris_contracts::RoutingPolicy {
+                routing_policy: idoris_contracts::routing_policy::RoutingPolicyInner {
+                    version: 1,
+                    rules: Vec::new(),
+                    default: idoris_contracts::routing_policy::Action {
+                        tiers: Some(vec![idoris_contracts::common::Tier::Local]),
+                        fail_closed: Some(true),
+                        ..Default::default()
+                    },
+                },
+            },
             supervisor: None,
             budget_ledger: None,
             models_health: Arc::new(health::HealthTracker::default()),
@@ -489,11 +504,11 @@ fn rejection_response(rejection: Rejection) -> Response {
 
 /// `POST /v1/chat/completions`. Order (locked by conformance): non-JSON
 /// body -> `invalid_json`; valid JSON that isn't an object -> `invalid_body`;
-/// only then are control-plane headers parsed (see [`profile::parse_profile`]),
-/// followed by [`dispatch::select`] to choose between the two
-/// request-execution paths: a `LoadMode::Resident` `http_service` candidate
-/// forwards directly ([`chat_via_proxy`]); everything else goes through the
-/// local decision + execution path ([`dispatch::dispatch_local`]).
+/// only then are control-plane headers parsed (see [`profile::parse_profile`]).
+/// YAML tier policy constrains candidates before selection; privacy and intent
+/// remain enforced by the policy pipeline. Resident `http_service` candidates
+/// forward directly ([`chat_via_proxy`]); all others use
+/// [`dispatch::dispatch_local`].
 async fn chat_completions(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -531,13 +546,26 @@ async fn chat_completions(
         .collect::<Vec<_>>()
         .join("\n");
 
+    let (cards, fail_closed) = dispatch::policy_cards(&state.cards, &state.routing_policy, &parsed);
+    if cards.is_empty() {
+        return if fail_closed {
+            rejection_response(idoris_policy::Rejection::LocalOnlyUnavailable)
+        } else {
+            error_envelope(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "no_candidate",
+                "no candidate matches routing policy",
+            )
+        };
+    }
+
     // R2-G: a Resident-mode http_service candidate (a generic
     // OpenAI-compatible backend, including a conformance fixture pointing
     // at a fake upstream) is forwarded directly -- never through the
     // Supervisor, which only makes sense for a real oMLX-shaped backend
     // with an explicit load/unload lifecycle. See dispatch::select's doc
     // for the accepted double-decide() tradeoff this branch makes.
-    if let Ok(selected) = dispatch::select(&state.cards, &parsed, &prompt) {
+    if let Ok(selected) = dispatch::select(&cards, &parsed, &prompt) {
         if dispatch::is_resident_http_service(&selected.card) {
             return chat_via_proxy(&state, &selected, &headers, &parsed, &value, &record_id).await;
         }
@@ -575,7 +603,7 @@ async fn chat_completions(
     // the selected card. Do so after selection so the response truthfully
     // reports the selected locality. Resident HTTP proxies retain upstream
     // model handling above (including arbitrary conformance fixture IDs).
-    if let Ok(selected) = dispatch::select(&state.cards, &parsed, &prompt)
+    if let Ok(selected) = dispatch::select(&cards, &parsed, &prompt)
         && object.contains_key("model")
         && (model.is_none_or(str::is_empty)
             || model.is_some_and(|requested_model| {
@@ -621,7 +649,7 @@ async fn chat_completions(
     // better than, a listener that structurally can never fire.
     let budget_ledger = state.budget_ledger.as_deref();
     match dispatch_local(
-        &state.cards,
+        &cards,
         state.supervisor.as_ref(),
         budget_ledger,
         &parsed,
@@ -857,6 +885,9 @@ async fn record_id_middleware(mut req: Request<Body>, next: Next) -> Response {
 mod local_privacy_tests;
 
 #[cfg(test)]
+mod policy_wiring_tests;
+
+#[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -898,7 +929,7 @@ mod tests {
         }
     }
 
-    fn paid_component_card(id: &str) -> ComponentCard {
+    pub(super) fn paid_component_card(id: &str) -> ComponentCard {
         let mut card = sample_component_card(id);
         card.provider.cost = Cost {
             input_per_m: 1_000_000.0,
@@ -1208,7 +1239,7 @@ mod tests {
     }
 
     // TempDir must outlive the BudgetLedger using its path.
-    fn configured_budget_ledger(
+    pub(super) fn configured_budget_ledger(
         limit_minor: i64,
     ) -> (tempfile::TempDir, idoris_tenancy::budget::BudgetLedger) {
         let dir = tempfile::TempDir::new().unwrap();
