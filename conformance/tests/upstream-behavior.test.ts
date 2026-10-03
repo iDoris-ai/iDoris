@@ -5,6 +5,8 @@ import { localComponent, makeComponentsDir } from "../src/fixtures.js";
 
 let upstream: FakeUpstream;
 let server: RunningServer;
+// K13/M4: Rust only retries connection establishment; TS retains its legacy policy.
+const postRetry = process.env.IDORIS_CONFORMANCE_POST_RETRY !== "0";
 let reqSeq = 0;
 const nextRequestId = (): string => "ub-" + String(reqSeq++);
 
@@ -27,24 +29,26 @@ afterAll(async () => {
 });
 
 describe("上游 5xx 重试与错误映射", () => {
-  it("前两次 500，第三次成功 => 客户端拿到 200，上游总共被打 3 次", async () => {
+  it("5xx 按被测实现的 POST 重试策略处理（Rust 不重试不确定执行）", async () => {
     const before = upstream.chatCount();
     upstream.queueChat({ kind: "json", status: 500, body: { error: "boom-1" } });
-    upstream.queueChat({ kind: "json", status: 500, body: { error: "boom-2" } });
-    upstream.queueChat({ kind: "json", status: 200, body: { choices: [{ message: { content: "ok" } }] } });
+    if (postRetry) {
+      upstream.queueChat({ kind: "json", status: 500, body: { error: "boom-2" } });
+      upstream.queueChat({ kind: "json", status: 200, body: { choices: [{ message: { content: "ok" } }] } });
+    }
     const res = await postChat();
-    expect(res.status).toBe(200);
-    expect(upstream.chatCount() - before).toBe(3);
+    expect(res.status).toBe(postRetry ? 200 : 500);
+    expect(upstream.chatCount() - before).toBe(postRetry ? 3 : 1);
   });
 
-  it("持续 5xx（超过重试上限）=> 原样透传最后一次的响应体，仍只打 3 次（1 次 + 2 次重试）", async () => {
+  it("持续 5xx 原样透传，调用数符合 POST 重试策略", async () => {
     const before = upstream.chatCount();
-    for (let i = 0; i < 3; i += 1) upstream.queueChat({ kind: "json", status: 503, body: { error: "always-503" } });
+    for (let i = 0; i < (postRetry ? 3 : 1); i += 1) upstream.queueChat({ kind: "json", status: 503, body: { error: "always-503" } });
     const res = await postChat();
     expect(res.status).toBe(503);
     const body = (await res.json()) as { error: string };
     expect(body.error).toBe("always-503");
-    expect(upstream.chatCount() - before).toBe(3);
+    expect(upstream.chatCount() - before).toBe(postRetry ? 3 : 1);
   });
 });
 

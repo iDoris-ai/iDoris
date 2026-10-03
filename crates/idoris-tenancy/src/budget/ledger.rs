@@ -128,6 +128,7 @@ const SCHEMA_MIGRATIONS: &[&str] = &[
     include_str!("migrations/0002_overage_events.sql"),
     include_str!("migrations/0003_tenant_scope.sql"),
     include_str!("migrations/0004_tenant_period_column.sql"),
+    include_str!("migrations/0005_integer_amounts.sql"),
 ];
 
 /// Default reservation TTL: long enough to cover a slow upstream call,
@@ -564,9 +565,12 @@ impl BudgetLedger {
             Price::Known(v) => v,
         };
 
-        let now_ms = self.clock.now_ms();
         let mut conn = self.lock();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        // K07/M2: lock contention must not consume the TTL or leave period
+        // bucketing based on a timestamp from before the writer lock wait.
+        let now_ms = self.clock.now_ms();
 
         // B-3 (Opus Tier-2 re-review): the sub-scope four-tuple config is
         // the *optional* finer layer, the tenant-level total is the
@@ -574,6 +578,7 @@ impl BudgetLedger {
         // around. `NotConfigured` only fires when *neither* is set; a
         // tenant with no sub-scope config at all can still `reserve` purely
         // against its tenant-level total.
+        reject_amount_overflow(&tx, &scope.tenant_id, None)?;
         let sub_config = load_config(&tx, scope)?;
         let tenant_cfg = load_tenant_config(&tx, &scope.tenant_id)?;
         if sub_config.is_none() && tenant_cfg.is_none() {
@@ -719,8 +724,28 @@ impl BudgetLedger {
                 tenant_period,
             ],
         )?;
+        self.check_reservation_deadline(&id, expires_at_ms)?;
         tx.commit()?;
+        // COMMIT itself may consume the remaining TTL. Even though the row
+        // is now persisted, it is expired and must never authorize a call.
+        self.check_reservation_deadline(&id, expires_at_ms)?;
         Ok(ReservationId(id))
+    }
+
+    /// Fail closed if transaction work consumed the TTL. Returning before
+    /// commit drops and rolls back the transaction, including its writes.
+    fn check_reservation_deadline(
+        &self,
+        reservation_id: &str,
+        expires_at_ms: i64,
+    ) -> Result<(), BudgetError> {
+        if self.clock.now_ms() >= expires_at_ms {
+            return Err(BudgetError::ReservationNotActive {
+                reservation_id: reservation_id.to_string(),
+                status: ReservationStatus::Expired.as_sql().to_string(),
+            });
+        }
+        Ok(())
     }
 
     /// Sweep every scope/period for expired-but-still-`active` reservations
@@ -786,6 +811,10 @@ impl BudgetLedger {
     /// double-charge or un-release a completed outcome. See
     /// [`extend`](Self::extend) for renewing a reservation before its TTL
     /// lapses, for a caller that anticipates running long.
+    /// If either integer total would overflow, returns `AmountOverflow`
+    /// after durably retaining the cost, leaving both totals unchanged.
+    /// The tenant cannot reserve again until manual reconciliation; TTL,
+    /// release and a retry with a different cost cannot erase this record.
     pub fn settle(
         &self,
         tenant_id: &str,
@@ -814,6 +843,24 @@ impl BudgetLedger {
             }
         };
 
+        reject_amount_overflow(&tx, tenant_id, Some(&reservation_id.0))?;
+        let scope = BudgetScope::new(&row.tenant_id, &row.key_id, &row.provider_id, &row.model_id);
+        let scope_total = spent_for(&tx, &scope, &row.period)?.checked_add(actual_cost_minor);
+        let tenant_total =
+            tenant_spent_for(&tx, tenant_id, &row.tenant_period)?.checked_add(actual_cost_minor);
+        let (Some(scope_total), Some(tenant_total)) = (scope_total, tenant_total) else {
+            // Preserve the exact charge without partially updating either total.
+            tx.execute(
+                "INSERT INTO budget_amount_overflows VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![reservation_id.0, tenant_id, actual_cost_minor, now_ms],
+            )?;
+            tx.commit()?;
+            return Err(BudgetError::AmountOverflow {
+                reservation_id: reservation_id.0.clone(),
+                actual_cost_minor,
+            });
+        };
+
         // M1: track overage independently of the receipt returned below —
         // `settle` can return `Err(OverageTooLarge)` further down, and the
         // charge must still be recorded/auditable even on that path.
@@ -826,14 +873,14 @@ impl BudgetLedger {
             "INSERT INTO budget_periods (tenant_id, key_id, provider_id, model_id, period, spent_minor) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
              ON CONFLICT (tenant_id, key_id, provider_id, model_id, period) \
-             DO UPDATE SET spent_minor = spent_minor + excluded.spent_minor",
+             DO UPDATE SET spent_minor = excluded.spent_minor",
             rusqlite::params![
                 row.tenant_id,
                 row.key_id,
                 row.provider_id,
                 row.model_id,
                 row.period,
-                actual_cost_minor
+                scope_total
             ],
         )?;
         tx.execute(
@@ -857,8 +904,8 @@ impl BudgetLedger {
             "INSERT INTO tenant_periods (tenant_id, period, spent_minor) \
              VALUES (?1, ?2, ?3) \
              ON CONFLICT (tenant_id, period) \
-             DO UPDATE SET spent_minor = spent_minor + excluded.spent_minor",
-            rusqlite::params![tenant_id, row.tenant_period, actual_cost_minor],
+             DO UPDATE SET spent_minor = excluded.spent_minor",
+            rusqlite::params![tenant_id, row.tenant_period, tenant_total],
         )?;
 
         if overage_minor > 0 {
@@ -904,6 +951,40 @@ impl BudgetLedger {
         })
     }
 
+    /// Replay a settlement whose completed call's actual cost is already known.
+    /// `OverageTooLarge` means `settle` committed the charge and audit event,
+    /// so it counts as complete here. A settled row is accepted only when its
+    /// stored amount matches exactly, covering a crash after commit but before
+    /// the caller cleared its pending work. This API stores no pending work,
+    /// does not route calls, and does not retry automatically.
+    pub fn replay_settlement(
+        &self,
+        tenant_id: &str,
+        reservation_id: &ReservationId,
+        actual_cost_minor: i64,
+    ) -> Result<(), BudgetError> {
+        match self.settle(tenant_id, reservation_id, actual_cost_minor) {
+            Ok(_) | Err(BudgetError::OverageTooLarge { .. }) => Ok(()),
+            Err(err @ BudgetError::ReservationNotActive { .. }) => {
+                let conn = self.lock();
+                let settled_amount = conn
+                    .query_row(
+                        "SELECT actual_cost_minor FROM reservations \
+                         WHERE id=?1 AND tenant_id=?2 AND status='settled'",
+                        rusqlite::params![reservation_id.0, tenant_id],
+                        |row| row.get::<_, Option<i64>>(0),
+                    )
+                    .optional()?;
+                if settled_amount == Some(Some(actual_cost_minor)) {
+                    Ok(())
+                } else {
+                    Err(err)
+                }
+            }
+            Err(err) => Err(err),
+        }
+    }
+
     /// Renew a still-`active` reservation's TTL by `additional_ttl_ms` from
     /// now (H1) — for a caller whose upstream call is running longer than
     /// anticipated and wants to keep holding the budget rather than risk a
@@ -938,9 +1019,11 @@ impl BudgetLedger {
                 ttl_ms: additional_ttl_ms,
             });
         }
-        let now_ms = self.clock.now_ms();
         let mut conn = self.lock();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // K07/M2: validate expiry and renew from the time the write lock
+        // was acquired, never from a stale timestamp before the wait.
+        let now_ms = self.clock.now_ms();
 
         let row = find_reservation(&tx, tenant_id, reservation_id)?;
         let status = ReservationStatus::parse(&row.status)?;
@@ -973,7 +1056,9 @@ impl BudgetLedger {
             "UPDATE reservations SET expires_at_ms=?2 WHERE id=?1",
             rusqlite::params![reservation_id.0, new_expires_at_ms],
         )?;
+        self.check_reservation_deadline(&reservation_id.0, new_expires_at_ms)?;
         tx.commit()?;
+        self.check_reservation_deadline(&reservation_id.0, new_expires_at_ms)?;
         Ok(())
     }
 
@@ -1014,6 +1099,7 @@ impl BudgetLedger {
                 Ok(())
             }
             ReservationStatus::Active | ReservationStatus::Expired => {
+                reject_amount_overflow(&tx, tenant_id, Some(&reservation_id.0))?;
                 tx.execute(
                     "UPDATE reservations SET status=?2 WHERE id=?1",
                     rusqlite::params![reservation_id.0, ReservationStatus::Released.as_sql()],
@@ -1029,6 +1115,30 @@ impl BudgetLedger {
                 })
             }
         }
+    }
+}
+
+fn reject_amount_overflow(
+    conn: &Connection,
+    tenant_id: &str,
+    reservation_id: Option<&str>,
+) -> Result<(), BudgetError> {
+    let pending = conn
+        .query_row(
+            "SELECT reservation_id, actual_cost_minor FROM budget_amount_overflows \
+         WHERE tenant_id=?1 AND (?2 IS NULL OR reservation_id=?2) LIMIT 1",
+            rusqlite::params![tenant_id, reservation_id],
+            |r| {
+                Ok(BudgetError::AmountOverflow {
+                    reservation_id: r.get(0)?,
+                    actual_cost_minor: r.get(1)?,
+                })
+            },
+        )
+        .optional()?;
+    match pending {
+        Some(err) => Err(err),
+        None => Ok(()),
     }
 }
 
@@ -1373,6 +1483,332 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+    use std::cell::RefCell;
+    use std::sync::atomic::{AtomicI64, Ordering};
+    use std::sync::mpsc::{self, Receiver, Sender};
+
+    struct TestClock {
+        now: AtomicI64,
+        step: AtomicI64,
+    }
+
+    impl Clock for TestClock {
+        fn now_ms(&self) -> i64 {
+            self.now
+                .fetch_add(self.step.load(Ordering::SeqCst), Ordering::SeqCst)
+        }
+    }
+
+    thread_local! {
+        static LOCK_WAIT: RefCell<Option<(Sender<()>, Receiver<()>)>> = const { RefCell::new(None) };
+    }
+
+    fn lock_wait_fixture() -> (TempDb, Arc<BudgetLedger>, Arc<TestClock>, BudgetScope) {
+        let path = temp_db_path("lock-clock");
+        let clock = Arc::new(TestClock {
+            now: AtomicI64::new(0),
+            step: AtomicI64::new(0),
+        });
+        let ledger = Arc::new(BudgetLedger::open_with(&path, clock.clone(), 200).unwrap());
+        let scope = BudgetScope::new("acme-co", "key-1", "openai", "gpt-5");
+        ledger.configure(&scope, 100, "UTC").unwrap();
+        ledger
+            .configure_tenant(&scope.tenant_id, 100, "UTC", SpendGate::All)
+            .unwrap();
+        (path, ledger, clock, scope)
+    }
+
+    /// Use SQLite's busy callback to prove the worker reached BEGIN IMMEDIATE
+    /// while another connection owns the writer lock. Advance the fake clock
+    /// before releasing that lock; no scheduling guesses or real-time sleeps.
+    fn during_write_wait<T: Send + 'static>(
+        path: &TempDb,
+        ledger: &Arc<BudgetLedger>,
+        clock: &TestClock,
+        after_wait_ms: i64,
+        action: impl FnOnce(Arc<BudgetLedger>) -> T + Send + 'static,
+    ) -> T {
+        let mut blocker = Connection::open(path).unwrap();
+        let tx = blocker
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        let (waiting_tx, waiting_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let worker_ledger = ledger.clone();
+        let worker = std::thread::spawn(move || {
+            LOCK_WAIT.with(|slot| *slot.borrow_mut() = Some((waiting_tx, resume_rx)));
+            worker_ledger
+                .lock()
+                .busy_handler(Some(|_| {
+                    LOCK_WAIT.with(|slot| {
+                        let slot = slot.borrow();
+                        let (waiting, resume) = slot.as_ref().unwrap();
+                        waiting.send(()).unwrap();
+                        resume.recv_timeout(Duration::from_secs(5)).is_ok()
+                    })
+                }))
+                .unwrap();
+            action(worker_ledger)
+        });
+        waiting_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        clock.now.store(after_wait_ms, Ordering::SeqCst);
+        tx.commit().unwrap();
+        resume_tx.send(()).unwrap();
+        worker.join().unwrap()
+    }
+
+    #[test]
+    fn reserve_samples_ttl_and_both_periods_after_write_wait() {
+        let (path, ledger, clock, scope) = lock_wait_fixture();
+        let boundary = chrono::NaiveDate::from_ymd_opt(2026, 10, 1)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_utc()
+            .timestamp_millis();
+        clock.now.store(boundary - 100, Ordering::SeqCst);
+        let worker_scope = scope.clone();
+        let id = during_write_wait(&path, &ledger, &clock, boundary + 300, move |ledger| {
+            ledger.reserve(&worker_scope, Price::Known(100))
+        })
+        .unwrap();
+        let row = find_reservation(&ledger.lock(), &scope.tenant_id, &id).unwrap();
+        assert_eq!(row.expires_at_ms, boundary + 500);
+        assert_eq!(row.created_at_ms, boundary + 300);
+        assert_eq!(row.period, "2026-10");
+        assert_eq!(row.tenant_period, "2026-10");
+        assert_eq!(ledger.balance(&scope).unwrap(), 0);
+        assert_eq!(ledger.tenant_balance(&scope.tenant_id).unwrap(), 0);
+        assert!(matches!(
+            ledger.reserve(&scope, Price::Known(1)),
+            Err(BudgetError::Exceeded { .. })
+        ));
+    }
+
+    #[test]
+    fn extend_samples_ttl_after_write_wait() {
+        let (path, ledger, clock, scope) = lock_wait_fixture();
+        let id = ledger.reserve(&scope, Price::Known(100)).unwrap();
+        clock.now.store(50, Ordering::SeqCst);
+        let worker_id = id.clone();
+        let tenant = scope.tenant_id.clone();
+        during_write_wait(&path, &ledger, &clock, 150, move |ledger| {
+            ledger.extend(&tenant, &worker_id, 50)
+        })
+        .unwrap();
+        let row = find_reservation(&ledger.lock(), &scope.tenant_id, &id).unwrap();
+        assert_eq!(row.expires_at_ms, 200);
+        assert_eq!(ledger.balance(&scope).unwrap(), 0);
+    }
+
+    #[test]
+    fn extend_rejects_expiry_during_write_wait() {
+        let (path, ledger, clock, scope) = lock_wait_fixture();
+        let id = ledger.reserve(&scope, Price::Known(100)).unwrap();
+        clock.now.store(50, Ordering::SeqCst);
+        let worker_id = id.clone();
+        let tenant = scope.tenant_id.clone();
+        let result = during_write_wait(&path, &ledger, &clock, 200, move |ledger| {
+            ledger.extend(&tenant, &worker_id, 200)
+        });
+        assert!(matches!(
+            result,
+            Err(BudgetError::ReservationNotActive { .. })
+        ));
+        let row = find_reservation(&ledger.lock(), &scope.tenant_id, &id).unwrap();
+        assert_eq!(row.expires_at_ms, 200);
+    }
+
+    #[test]
+    fn reserve_rolls_back_if_ttl_lapses_before_commit() {
+        let (_path, ledger, clock, scope) = lock_wait_fixture();
+        clock.step.store(200, Ordering::SeqCst);
+        assert!(matches!(
+            ledger.reserve(&scope, Price::Known(100)),
+            Err(BudgetError::ReservationNotActive { .. })
+        ));
+        let count: i64 = ledger
+            .lock()
+            .query_row("SELECT COUNT(*) FROM reservations", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn extend_rolls_back_if_ttl_lapses_before_commit() {
+        let (_path, ledger, clock, scope) = lock_wait_fixture();
+        let id = ledger.reserve(&scope, Price::Known(100)).unwrap();
+        clock.now.store(50, Ordering::SeqCst);
+        clock.step.store(200, Ordering::SeqCst);
+        assert!(matches!(
+            ledger.extend(&scope.tenant_id, &id, 200),
+            Err(BudgetError::ReservationNotActive { .. })
+        ));
+        let row = find_reservation(&ledger.lock(), &scope.tenant_id, &id).unwrap();
+        assert_eq!(row.expires_at_ms, 200);
+    }
+
+    #[test]
+    fn reserve_rejects_if_ttl_lapses_during_commit() {
+        let (_path, ledger, clock, scope) = lock_wait_fixture();
+        clock.step.store(100, Ordering::SeqCst);
+        assert!(matches!(
+            ledger.reserve(&scope, Price::Known(100)),
+            Err(BudgetError::ReservationNotActive { .. })
+        ));
+        assert_eq!(ledger.balance(&scope).unwrap(), 100);
+    }
+
+    #[test]
+    fn extend_rejects_if_ttl_lapses_during_commit() {
+        let (_path, ledger, clock, scope) = lock_wait_fixture();
+        let id = ledger.reserve(&scope, Price::Known(100)).unwrap();
+        clock.now.store(50, Ordering::SeqCst);
+        clock.step.store(100, Ordering::SeqCst);
+        assert!(matches!(
+            ledger.extend(&scope.tenant_id, &id, 200),
+            Err(BudgetError::ReservationNotActive { .. })
+        ));
+        assert_eq!(ledger.balance(&scope).unwrap(), 100);
+    }
+
+    #[test]
+    fn settlement_overflow_preserves_integer_totals_and_recoverable_cost() {
+        for same_scope in [true, false] {
+            let path = temp_db_path("settlement-overflow");
+            let ledger = BudgetLedger::open(&path).unwrap();
+            let first = BudgetScope::new("t1", "k1", "p1", "m1");
+            let second = BudgetScope::new("t1", "k2", "p1", "m1");
+            let target = if same_scope { &first } else { &second };
+            for scope in [&first, &second] {
+                ledger.configure(scope, i64::MAX, "UTC").unwrap();
+            }
+            let id = ledger.reserve(&first, Price::Known(1)).unwrap();
+            ledger.settle("t1", &id, 1).unwrap();
+            let id = ledger.reserve(target, Price::Known(1)).unwrap();
+            let err = ledger.settle("t1", &id, i64::MAX).unwrap_err();
+            assert_eq!(
+                err,
+                BudgetError::AmountOverflow {
+                    reservation_id: id.0.clone(),
+                    actual_cost_minor: i64::MAX,
+                }
+            );
+            assert_eq!(
+                ledger.balance(&first).unwrap(),
+                i64::MAX - 1 - i64::from(same_scope)
+            );
+            assert_eq!(
+                ledger.balance(target).unwrap(),
+                i64::MAX - 1 - i64::from(same_scope)
+            );
+            let conn = ledger.lock();
+            assert_eq!(
+                tenant_spent_for(
+                    &conn,
+                    "t1",
+                    &billing_period_key(ledger.clock.now_ms(), "UTC").unwrap()
+                )
+                .unwrap(),
+                1
+            );
+            let cost: i64 = conn
+                .query_row(
+                    "SELECT actual_cost_minor FROM budget_amount_overflows WHERE reservation_id=?1",
+                    [&id.0],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(cost, i64::MAX);
+            conn.execute(
+                "UPDATE reservations SET expires_at_ms=0 WHERE id=?1",
+                [&id.0],
+            )
+            .unwrap();
+            drop(conn);
+            drop(ledger);
+            let ledger = BudgetLedger::open(&path).unwrap();
+            assert_eq!(ledger.sweep_expired().unwrap(), 1);
+            assert_eq!(ledger.reserve(&second, Price::Known(0)), Err(err.clone()));
+            assert_eq!(ledger.release("t1", &id), Err(err.clone()));
+            assert_eq!(ledger.settle("t1", &id, 0), Err(err));
+            let other = BudgetScope::new("t2", "k1", "p1", "m1");
+            ledger.configure(&other, 10, "UTC").unwrap();
+            assert!(ledger.reserve(&other, Price::Known(1)).is_ok());
+        }
+    }
+
+    #[test]
+    fn settlement_at_integer_max_is_exact() {
+        let ledger = BudgetLedger::open(":memory:").unwrap();
+        let scope = BudgetScope::new("t1", "k1", "p1", "m1");
+        ledger.configure(&scope, i64::MAX, "UTC").unwrap();
+        for cost in [1, i64::MAX - 1] {
+            let id = ledger.reserve(&scope, Price::Known(cost)).unwrap();
+            ledger.settle("t1", &id, cost).unwrap();
+        }
+        assert_eq!(ledger.balance(&scope).unwrap(), 0);
+    }
+
+    #[test]
+    fn amount_migration_preserves_integers_and_rejects_real_totals() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        for migration in &SCHEMA_MIGRATIONS[..4] {
+            conn.execute_batch(migration).unwrap();
+        }
+        conn.execute_batch(
+            "INSERT INTO budget_periods VALUES ('t','k','p','m','1970-01',1);
+            INSERT INTO tenant_periods VALUES ('t','1970-01',1);
+            CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at_ms INTEGER);
+            INSERT INTO schema_migrations VALUES (1,0),(2,0),(3,0),(4,0);",
+        )
+        .unwrap();
+        run_migrations(&mut conn).unwrap();
+        for table in ["budget_periods", "tenant_periods"] {
+            let spent: i64 = conn
+                .query_row(&format!("SELECT spent_minor FROM {table}"), [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            assert_eq!(spent, 1);
+            conn.execute(&format!("UPDATE {table} SET spent_minor=?1"), [i64::MAX])
+                .unwrap();
+            assert!(
+                conn.execute(&format!("UPDATE {table} SET spent_minor=spent_minor+1"), [])
+                    .is_err()
+            );
+            assert!(
+                conn.execute(&format!("UPDATE {table} SET spent_minor=1.5"), [])
+                    .is_err()
+            );
+        }
+        run_migrations(&mut conn).unwrap();
+    }
+
+    #[test]
+    fn amount_migration_rejects_existing_real_without_rounding() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        for migration in &SCHEMA_MIGRATIONS[..4] {
+            conn.execute_batch(migration).unwrap();
+        }
+        conn.execute_batch(
+            "INSERT INTO tenant_periods VALUES ('t','1970-01',1.5);
+            CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at_ms INTEGER);
+            INSERT INTO schema_migrations VALUES (1,0),(2,0),(3,0),(4,0);",
+        )
+        .unwrap();
+        assert!(run_migrations(&mut conn).is_err());
+        let spent: f64 = conn
+            .query_row("SELECT spent_minor FROM tenant_periods", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(spent, 1.5);
+        let version: i64 = conn
+            .query_row("SELECT MAX(version) FROM schema_migrations", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(version, 4);
+    }
 
     /// Temp SQLite path that deletes the database and its `-wal`/`-shm`
     /// sidecars on drop — including when the test panics. Bind it *before*
