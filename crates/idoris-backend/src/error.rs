@@ -104,14 +104,26 @@ pub enum BackendError {
 
     /// `RuntimeAdapter::load` got far enough that the engine **may already
     /// hold the model in memory** (e.g. oMLX's `POST .../load` returned 2xx),
-    /// or its response was lost, or a follow-up step failed (pin, verifying
-    /// pin state). Distinct from a plain rejection: the Supervisor must not
+    /// or its response was lost, or it otherwise cannot establish whether
+    /// the engine-side load completed. Distinct from both a plain rejection
+    /// and [`BackendError::LoadPostconditionFailed`]: the Supervisor must not
     /// assume nothing was allocated — it routes this, like
-    /// [`BackendError::AdapterTimedOut`], through a best-effort `unload` so
-    /// the ledger never forgets memory the engine is really using
-    /// (prdaemon #48 round 2, M1).
+    /// [`BackendError::AdapterTimedOut`], as an operation whose eventual
+    /// allocation cannot be disproved by an unload acknowledgement or an
+    /// empty status snapshot. The Supervisor retains its Error slot and
+    /// budget until the runtime is known to be quiescent/reset; restarting
+    /// only the Supervisor is not sufficient because the old load may still
+    /// be running in the engine (K09/K11).
     #[error("load of {model_id} not confirmed: {message}")]
     LoadUnconfirmed { model_id: String, message: String },
+
+    /// The engine confirmed that `load` completed, but a deterministic
+    /// postcondition (such as pinning or verifying the requested policy)
+    /// failed. Unlike [`BackendError::LoadUnconfirmed`], no delayed load can
+    /// still allocate after cleanup; the Supervisor may release the durable
+    /// load fence once it has attempted to unload the model.
+    #[error("load postcondition failed for {model_id}: {message}")]
+    LoadPostconditionFailed { model_id: String, message: String },
 
     #[error("upstream error: {message}")]
     Upstream { message: String },
@@ -210,6 +222,7 @@ impl BackendError {
             BackendError::AdapterTimedOut { .. } => "adapter_timed_out",
             BackendError::AdapterPanicked { .. } => "adapter_panicked",
             BackendError::LoadUnconfirmed { .. } => "load_unconfirmed",
+            BackendError::LoadPostconditionFailed { .. } => "load_postcondition_failed",
             BackendError::Upstream { .. } => "upstream_error",
             BackendError::Cancelled => "cancelled",
             BackendError::InvalidRequest { .. } => "invalid_request",
@@ -292,6 +305,16 @@ impl BackendError {
 
     pub fn load_unconfirmed(model_id: impl Into<String>, message: impl Into<String>) -> Self {
         Self::LoadUnconfirmed {
+            model_id: model_id.into(),
+            message: message.into(),
+        }
+    }
+
+    pub fn load_postcondition_failed(
+        model_id: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Self {
+        Self::LoadPostconditionFailed {
             model_id: model_id.into(),
             message: message.into(),
         }

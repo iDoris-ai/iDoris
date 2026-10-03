@@ -54,6 +54,10 @@ struct StartupAdapter {
 
 #[async_trait]
 impl RuntimeAdapter for StartupAdapter {
+    fn load_fence_path(&self) -> Result<std::path::PathBuf, BackendError> {
+        self.mock.load_fence_path()
+    }
+
     async fn list(&self) -> Result<Vec<ModelInfo>, BackendError> {
         self.mock.list().await
     }

@@ -1,12 +1,18 @@
 #!/usr/bin/env bash
 # scripts/conformance-rust.sh — 用 Rust `idoris` 二进制作被测对象跑 conformance 套件。
 #
-# 前提：已安装 Rust 工具链、Node 和 pnpm，并执行 pnpm install --frozen-lockfile。
+# 前提：
+#   `conformance/` 目录 + 根 package.json 的 `pnpm conformance` 脚本来自
+#   PR #49（2026-10-01 已合并进 main）。当前分支要包含它们，否则第一步就会报错退出。
 #
 # 用法：
 #   bash scripts/conformance-rust.sh
 #
-# 始终测试本次构建的 release 二进制；构建或契约断言失败直接返回非零。
+# 现状（R2-D 把 idoris-policy/idoris-tenancy 接进 idoris-router 之前）：Rust
+# `idoris` 二进制只实现了 GET /health，其余路由一律 501，所以除了 /health 相关
+# 断言之外，conformance 套件里绝大多数用例都会失败——这是当前阶段的预期状态，
+# 不是这个脚本或套件本身的 bug。细节和"怎么解读一次失败的跑批"见
+# docs/rust/conformance.md。
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -18,17 +24,24 @@ if [ ! -d conformance ]; then
   exit 1
 fi
 
-echo "[conformance-rust] cargo build --release --locked -p idoris-router --bin idoris" >&2
-cargo build --release --locked -p idoris-router --bin idoris
+echo "[conformance-rust] cargo build --release -p idoris-router" >&2
+cargo build --release --locked -p idoris-router
 
-bin="$root/target/release/idoris"
+bin="${CARGO_TARGET_DIR:-$root/target}/release/idoris"
 if [ ! -x "$bin" ]; then
   echo "[conformance-rust] 构建产物不存在或不可执行：$bin" >&2
   exit 1
 fi
 
-# 二进制通过环境变量配置启动，不追加 CLI 参数。harness 优先读取 ARGV，
-# 显式生成 JSON 数组，既覆盖外部命令配置，也支持路径含空格。
+# 与 release 布局一致：默认策略从可执行文件旁读取，而非仓库 cwd。
+mkdir -p "$(dirname "$bin")/config"
+cp config/routing-policy.yaml "$(dirname "$bin")/config/routing-policy.yaml"
+
+# idoris-router 当前的骨架不解析 argv（只读 IDORIS_PORT 等环境变量，见
+# crates/idoris-router/src/bin/idoris.rs），conformance harness 又是用
+# IDORIS_CONFORMANCE_CMD 按空白切分出 bin + args 来 spawn 子进程的（见
+# conformance/src/harness.ts），所以这里直接给可执行文件的绝对路径，不追加
+# 任何参数——不是漏写了 `serve`，是这个二进制目前压根没有子命令可言。
 export IDORIS_CONFORMANCE_CMD="$bin"
 export IDORIS_CONFORMANCE_ARGV
 IDORIS_CONFORMANCE_ARGV="$(node -e 'process.stdout.write(JSON.stringify([process.argv[1]]))' "$bin")"

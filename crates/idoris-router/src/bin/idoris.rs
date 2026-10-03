@@ -23,6 +23,7 @@ use idoris_router::{
     AppState, BIND_HOST, build_app, components, parse_port, routing_policy,
     write_timeout::{DEFAULT_WRITE_TIMEOUT, WriteTimeoutListener},
 };
+use std::path::PathBuf;
 
 #[tokio::main]
 async fn main() {
@@ -34,6 +35,28 @@ async fn main() {
 
 fn env_flag(name: &str) -> bool {
     std::env::var(name).is_ok_and(|v| v == "1")
+}
+
+fn env_path(name: &str) -> Result<Option<String>, String> {
+    std::env::var_os(name)
+        .map(|value| {
+            value
+                .into_string()
+                .map_err(|_| format!("环境变量 {name} 不是有效的 Unicode 路径"))
+        })
+        .transpose()
+}
+
+fn resolve_bundle_path(raw: Option<&str>, default_relative: &str) -> Result<PathBuf, String> {
+    if let Some(value) = raw.map(str::trim).filter(|value| !value.is_empty()) {
+        return Ok(PathBuf::from(value));
+    }
+    let executable =
+        std::env::current_exe().map_err(|err| format!("无法定位当前可执行文件：{err}"))?;
+    let parent = executable
+        .parent()
+        .ok_or_else(|| "当前可执行文件没有父目录".to_string())?;
+    Ok(parent.join(default_relative))
 }
 
 /// Until there is a per-provider registry, accept at most one lifecycle
@@ -65,8 +88,11 @@ async fn run() -> Result<(), String> {
     let port =
         parse_port(std::env::var("IDORIS_PORT").ok().as_deref()).map_err(|err| err.to_string())?;
 
-    let components_dir =
-        components::resolve_components_dir(std::env::var("IDORIS_COMPONENTS_DIR").ok().as_deref());
+    let components_env = env_path("IDORIS_COMPONENTS_DIR")?;
+    let components_dir = resolve_bundle_path(
+        components_env.as_deref(),
+        components::DEFAULT_COMPONENTS_DIR,
+    )?;
     let allow_mock = env_flag("IDORIS_ALLOW_MOCK");
     let cards = components::load_components(&components_dir, allow_mock).map_err(|err| {
         format!(
@@ -79,9 +105,11 @@ async fn run() -> Result<(), String> {
     // policy rules yet (see routing_policy's module doc) -- this just
     // guarantees a bad/missing IDORIS_ROUTING_POLICY is caught at startup,
     // not silently ignored.
-    let routing_policy_path = routing_policy::resolve_routing_policy_path(
-        std::env::var("IDORIS_ROUTING_POLICY").ok().as_deref(),
-    );
+    let policy_env = env_path("IDORIS_ROUTING_POLICY")?;
+    let routing_policy_path = resolve_bundle_path(
+        policy_env.as_deref(),
+        routing_policy::DEFAULT_ROUTING_POLICY_PATH,
+    )?;
     routing_policy::load_routing_policy(&routing_policy_path).map_err(|err| {
         format!(
             "无法加载路由策略 \"{}\"（IDORIS_ROUTING_POLICY）：{err}",
