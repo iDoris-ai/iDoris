@@ -1,8 +1,6 @@
-//! Atomic reserve/settle/release around a *paid* candidate (R2-D task 4).
-//! Every component card this codebase ships today declares zero cost, so a
-//! paid candidate can't actually occur yet outside a test that injects one
-//! — this exists to make the wiring correct and testable ahead of a real
-//! paid/remote candidate (R2-E's upstream trait) landing on top of it.
+//! Atomic reserve/settle/release around every selected candidate. A wired
+//! ledger enforces SpendGate even for zero-cost calls; an unwired ledger
+//! leaves free deployments usable and rejects paid calls.
 //!
 //! No `packages/tenancy/src/budget.ts` 1:1 port here: this crate's
 //! `idoris-tenancy::BudgetLedger` (R2-C) is a Rust-native atomic ledger the

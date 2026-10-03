@@ -7,8 +7,13 @@
 //! so they keep working once shared.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::Mutex;
+use std::path::PathBuf;
+use std::sync::{
+    Mutex,
+    atomic::{AtomicU64, Ordering},
+};
 use std::time::Duration;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use idoris_contracts::LoadPolicy;
@@ -83,6 +88,30 @@ struct MockState {
 /// `pressure` field without needing a real memory-pressure signal.
 pub struct MockAdapter {
     state: Mutex<MockState>,
+    load_fence_path: PathBuf,
+}
+
+static TEMP_PATH_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+/// Allocates a unique temporary path for a test adapter's durable load fence.
+pub fn temporary_load_fence_path() -> PathBuf {
+    let time = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let root = std::env::temp_dir();
+    loop {
+        let sequence = TEMP_PATH_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let dir = root.join(format!(
+            "idoris-load-fence-{}-{time}-{sequence}",
+            std::process::id()
+        ));
+        match std::fs::create_dir(&dir) {
+            Ok(()) => return dir.join("load-fence"),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(_) => return dir.join("load-fence"),
+        }
+    }
 }
 
 impl MockAdapter {
@@ -99,6 +128,7 @@ impl MockAdapter {
                 pressure: Pressure::Ok,
                 model_memory_max_gb: 24.0,
             }),
+            load_fence_path: temporary_load_fence_path(),
         }
     }
 
@@ -192,6 +222,10 @@ impl MockAdapter {
 
 #[async_trait]
 impl RuntimeAdapter for MockAdapter {
+    fn load_fence_path(&self) -> Result<PathBuf, BackendError> {
+        Ok(self.load_fence_path.clone())
+    }
+
     async fn list(&self) -> Result<Vec<ModelInfo>, BackendError> {
         Ok(self.lock()?.catalog.clone())
     }

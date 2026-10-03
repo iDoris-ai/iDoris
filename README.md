@@ -36,6 +36,9 @@ curl http://127.0.0.1:8740/health
 
 ## 已知限制（v0.x）
 
+- **未确认的本地加载会持久阻止新的加载**：Supervisor 在发送加载请求前写入围栏；加载超时、探测失败或进程中断后，仅重启 Router 或看到空引擎快照不会解除围栏。oMLX 默认使用 `$HOME/.local/state/idoris/omlx/<编码后的引擎地址>/load.pending`，可用绝对路径 `IDORIS_STATE_DIR` 指定状态根目录。同一引擎的所有 Router 必须保持相同的状态目录和地址；容器部署须持久挂载该目录。恢复时先停止 Router，再停止并确认旧 oMLX 进程及其加载任务已退出，随后删除错误中指定的 `load.pending`，重启引擎和 Router。不要仅凭 unload 成功或空 status 删除围栏。
+- **已确认加载后的 pin 配置失败可恢复**：例如 sub-key 被 admin 登录明确拒绝，但模型状态确认已加载，此时返回 `load_postcondition_failed` 并尝试卸载。确认释放后恢复预算；释放失败仍保留该模型占用，可稍后卸载或修正配置后重试。这类已完成加载不保留全局加载围栏，重启会按引擎实际驻留重新对账。pin 请求超时、连接中断或模型状态无法确认时，仍按 `load_unconfirmed` 保守处理。
+
 - **付费的 `Resident` 直连转发卡目前不支持，启动时直接拒绝**：`form: http_service` + `load_policy.mode: resident` 的组件卡（例如指向一个通用 OpenAI 兼容后端）由 `idoris-router::proxy::ChatProxy` 直接转发，这条路径完全没有接预算 reserve/settle。为了不让付费候选悄悄绕过预算，启动加载组件卡时会硬性拒绝任何价格不是可证明为 `0`（付费，或价格未知/畸形）的 `Resident` `http_service` 卡，报错里会点名是哪个 `provider.id`。本地免费卡（`cost.input_per_m`/`output_per_m` 均为 `0`）不受影响；`on_demand`/`evict_to_load`（Supervisor + oMLX）路径也不受影响，不管价格多少都照常走预算。跟进项见 [`docs/agent/tasks.md`](docs/agent/tasks.md) FU-22。
 
 ## License

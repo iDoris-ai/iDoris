@@ -45,6 +45,10 @@ use crate::types::{BackendStatus, ChatRequest, ChatResponse, ModelInfo};
 
 #[async_trait]
 pub trait RuntimeAdapter: Send + Sync {
+    /// Stable, engine-bound location for the durable load fence. Implementors
+    /// must return the same path across process restarts for the same engine.
+    fn load_fence_path(&self) -> Result<std::path::PathBuf, BackendError>;
+
     /// Every model this engine instance *could* route to, whether or not it
     /// is currently loaded (mirrors `/v1/models`'s "list routable models"
     /// semantics per `docs/research/Rust基础选型-2026-09-27.md` §4).
@@ -57,12 +61,20 @@ pub trait RuntimeAdapter: Send + Sync {
     /// Supervisor always passes `Some` in practice.
     ///
     /// **Error contract.** A plain `Err` means "nothing was allocated" (or
-    /// it was already released): the Supervisor settles the slot on
-    /// `Stopped` and frees its budget. An implementation whose load can fail
-    /// *after* the engine may already hold the model (e.g. a two-step
-    /// load-then-pin/verify) must return [`BackendError::LoadUnconfirmed`]
-    /// for that case instead, so the Supervisor confirms release with a
-    /// real `unload` rather than forgetting memory still in use.
+    /// it was already released), except for the two post-load variants
+    /// described below. For an ordinary rejection, the Supervisor settles
+    /// the slot on `Stopped` and frees its budget. A timeout of this future does not
+    /// prove the engine-side operation stopped; the Supervisor retains the
+    /// slot as `Error` because no completion evidence exists. An
+    /// implementation whose load can fail *after* the engine may already
+    /// hold the model must distinguish whether the engine-side load is
+    /// complete. Return [`BackendError::LoadPostconditionFailed`] when the
+    /// engine confirmed completion but a deterministic follow-up such as
+    /// pinning failed; the Supervisor attempts release and can clear the
+    /// durable load fence. Return [`BackendError::LoadUnconfirmed`] when
+    /// completion is unknown (for example, the response was lost), because
+    /// the Supervisor must retain its budget and fence against delayed
+    /// allocation.
     ///
     /// **Concurrency contract** (owned by the Supervisor, not this trait):
     /// the Supervisor never issues two `load`/`unload` calls for the *same*
