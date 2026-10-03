@@ -99,7 +99,9 @@ async fn upstream_redirects_never_reach_the_other_origin() {
             .mount(&origin)
             .await;
         let state = AppState::default();
-        let listed = models::list_models(&state.http_client, &[card(&origin.uri())]).await;
+        let listed = models::list_models(&state.http_client, &[card(&origin.uri())])
+            .await
+            .unwrap();
         let buffered = state
             .proxy
             .forward_buffered(&origin.uri(), &json!({"messages": []}), &opts())

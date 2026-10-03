@@ -105,6 +105,50 @@ async fn bundled_config_starts_from_an_unrelated_working_directory() {
     assert_eq!(response.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
     let error: serde_json::Value = response.json().await.unwrap();
     assert_eq!(error["error"]["type"], "local_only_unavailable");
+
+    // The bundled lifecycle card must retain OpenAI admission checks even
+    // when its backend is unavailable and cwd contains unrelated config.
+    for (field, value, reason) in [
+        ("stream", serde_json::json!(true), "unsupported_stream"),
+        (
+            "temperature",
+            serde_json::json!(0.2),
+            "unsupported_parameter",
+        ),
+        ("max_tokens", serde_json::json!(64), "unsupported_parameter"),
+        (
+            "model",
+            serde_json::json!("another-model"),
+            "unsupported_model",
+        ),
+    ] {
+        let mut body = serde_json::json!({
+            "model": "idoris/daily",
+            "messages": [{"role":"user","content":"hi"}]
+        });
+        body[field] = value;
+        let response = client
+            .post(format!("http://127.0.0.1:{port}/v1/chat/completions"))
+            .json(&body)
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            reqwest::StatusCode::BAD_REQUEST,
+            "{field}"
+        );
+        let error: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(error["error"]["type"], "unsupported_field", "{field}");
+        assert_eq!(error["error"]["reason_code"], reason, "{field}");
+        assert!(
+            error["error"]["remediation"]
+                .as_str()
+                .unwrap()
+                .contains(field)
+        );
+    }
 }
 
 #[test]

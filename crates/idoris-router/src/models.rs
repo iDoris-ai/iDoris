@@ -1,15 +1,17 @@
 //! `GET /v1/models`: aggregates every registered `http_service` card's own
 //! `/v1/models` listing, mirroring `packages/router/src/server.ts`'s
-//! handler — best-effort per card: a card whose upstream call fails (network
-//! error, non-2xx, unparseable body) is silently skipped, never fails the
-//! whole request (TS: `try { ... } catch { health.record(id, false) }`,
-//! looping to the next `Registered` entry either way).
+//! handler — best-effort per card, except authentication failures, which
+//! fail the request to prevent an incomplete list from appearing complete.
 
+use std::ffi::OsStr;
 use std::time::Duration;
 
 use idoris_contracts::ComponentCard;
 use idoris_contracts::component_card::Form;
+use idoris_contracts::provider::Locality;
+use reqwest::header::{AUTHORIZATION, HeaderValue};
 use serde::Serialize;
+use serde_json::Value;
 
 /// TS's reference loop (`server.ts`'s `/v1/models` handler) applies no
 /// timeout at all to each backend's `list()` call — an unresponsive
@@ -33,27 +35,85 @@ pub struct ModelsResponse {
     pub data: Vec<ModelEntry>,
 }
 
-/// One card's contribution — `Vec::new()` on any failure (wrong `form`,
-/// transport error, non-2xx, unparseable/unshaped body): best-effort, never
-/// surfaced to the caller as a partial-failure error.
-async fn list_one(client: &reqwest::Client, card: &ComponentCard) -> Vec<ModelEntry> {
+#[derive(Debug)]
+pub enum ModelsError {
+    UpstreamAuthenticationFailed { locality: Locality },
+}
+
+fn auth_failure(card: &ComponentCard, field: &str, value: Value) -> ModelsError {
+    let mut event = serde_json::json!({
+        "event": "upstream_model_listing_authentication_failed",
+        "provider_id": card.provider.id,
+        "locality": crate::locality_str(card.provider.locality),
+    });
+    event[field] = value;
+    eprintln!("{event}");
+    ModelsError::UpstreamAuthenticationFailed {
+        locality: card.provider.locality,
+    }
+}
+
+fn is_loopback_omlx(card: &ComponentCard) -> bool {
+    if card.provider.family != idoris_contracts::provider::Family::Local
+        || card.provider.locality != Locality::Loopback
+        || !card.version_pin.starts_with("omlx@")
+    {
+        return false;
+    }
+    let Ok(url) = reqwest::Url::parse(&card.endpoint) else {
+        return false;
+    };
+    matches!(url.scheme(), "http" | "https")
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.query().is_none()
+        && url.fragment().is_none()
+        && url.host_str().is_some_and(|host| {
+            host.eq_ignore_ascii_case("localhost")
+                || host
+                    .trim_matches(['[', ']'])
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|ip| ip.is_loopback())
+        })
+}
+
+async fn list_one(
+    client: &reqwest::Client,
+    card: &ComponentCard,
+    api_key: Option<&OsStr>,
+) -> Result<Vec<ModelEntry>, ModelsError> {
     if card.form != Form::HttpService {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     let url = format!("{}/v1/models", card.endpoint.trim_end_matches('/'));
-    let Ok(resp) = client.get(&url).timeout(MODELS_TIMEOUT).send().await else {
-        return Vec::new();
+    let mut request = client.get(&url).timeout(MODELS_TIMEOUT);
+    if is_loopback_omlx(card)
+        && let Some(key) = api_key.filter(|key| !key.is_empty())
+    {
+        // A present non-UTF-8 key is invalid, never an absent credential.
+        let mut authorization = key
+            .to_str()
+            .and_then(|key| HeaderValue::from_str(&format!("Bearer {key}")).ok())
+            .ok_or_else(|| auth_failure(card, "reason", "invalid_authorization_header".into()))?;
+        authorization.set_sensitive(true);
+        request = request.header(AUTHORIZATION, authorization);
+    }
+    let Ok(resp) = request.send().await else {
+        return Ok(Vec::new());
     };
+    if matches!(resp.status().as_u16(), 401 | 403) {
+        return Err(auth_failure(card, "status", resp.status().as_u16().into()));
+    }
     if !resp.status().is_success() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     let Ok(body) = resp.json::<serde_json::Value>().await else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
     let Some(items) = body.get("data").and_then(|v| v.as_array()) else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
-    items
+    Ok(items
         .iter()
         .filter_map(|m| m.get("id").and_then(|v| v.as_str()))
         .map(|id| ModelEntry {
@@ -61,22 +121,26 @@ async fn list_one(client: &reqwest::Client, card: &ComponentCard) -> Vec<ModelEn
             object: "model",
             owned_by: card.provider.id.clone(),
         })
-        .collect()
+        .collect())
 }
 
 /// Sequential, matching TS's own `for (const { card, backend } of
 /// registered)` loop — not a locked ordering contract, just parity with the
 /// reference (a concurrent `join_all` would be a valid follow-up, not a
 /// behavior change any test here depends on).
-pub async fn list_models(client: &reqwest::Client, cards: &[ComponentCard]) -> ModelsResponse {
+pub async fn list_models(
+    client: &reqwest::Client,
+    cards: &[ComponentCard],
+) -> Result<ModelsResponse, ModelsError> {
+    let api_key = std::env::var_os(idoris_upstream::omlx::OMLX_API_KEY_ENV);
     let mut data = Vec::new();
     for card in cards {
-        data.extend(list_one(client, card).await);
+        data.extend(list_one(client, card, api_key.as_deref()).await?);
     }
-    ModelsResponse {
+    Ok(ModelsResponse {
         object: "list",
         data,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -131,7 +195,7 @@ mod tests {
             .await;
         let client = reqwest::Client::new();
         let cards = vec![card("omlx", &server.uri(), Form::HttpService)];
-        let resp = list_models(&client, &cards).await;
+        let resp = list_models(&client, &cards).await.unwrap();
         assert_eq!(resp.object, "list");
         let ids: Vec<&str> = resp.data.iter().map(|m| m.id.as_str()).collect();
         assert_eq!(ids, vec!["model-a", "model-b"]);
@@ -151,7 +215,7 @@ mod tests {
             .await;
         let client = reqwest::Client::new();
         let cards = vec![card("omlx", &server.uri(), Form::HttpService)];
-        let resp = list_models(&client, &cards).await;
+        let resp = list_models(&client, &cards).await.unwrap();
         assert!(resp.data.is_empty());
     }
 
@@ -159,7 +223,7 @@ mod tests {
     async fn a_non_http_service_card_is_skipped_without_any_network_call() {
         let client = reqwest::Client::new();
         let cards = vec![card("subscription", "spawn://x", Form::SpawnCli)];
-        let resp = list_models(&client, &cards).await;
+        let resp = list_models(&client, &cards).await.unwrap();
         assert!(resp.data.is_empty());
     }
 }

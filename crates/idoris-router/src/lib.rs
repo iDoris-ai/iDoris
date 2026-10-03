@@ -36,6 +36,8 @@ pub mod models;
 pub mod proxy;
 
 mod sse;
+mod supervisor_parameters;
+mod supervisor_stream;
 
 /// Per-connection deadlines for stalled HTTP response writes.
 pub mod write_timeout;
@@ -232,10 +234,24 @@ pub fn build_app(state: AppState) -> Router {
 
 /// `GET /v1/models` (interface spec — `owned_by` is each card's
 /// `provider.id`, matching `server.ts`). Delegates to [`models::list_models`];
-/// see that module's doc for the per-card best-effort/skip-on-failure
-/// semantics.
+/// authentication failures surface as structured upstream errors.
 async fn list_models(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    Json(models::list_models(&state.http_client, &state.cards).await)
+    match models::list_models(&state.http_client, &state.cards).await {
+        Ok(models) => Json(models).into_response(),
+        Err(models::ModelsError::UpstreamAuthenticationFailed { locality, .. }) => {
+            let mut response = error_envelope_with_reason(
+                StatusCode::BAD_GATEWAY,
+                "upstream_error",
+                "upstream_authentication_failed",
+                "Model discovery authentication failed; check the upstream credential configuration",
+            );
+            response.headers_mut().insert(
+                HEADER_SERVED_LOCALITY,
+                HeaderValue::from_static(locality_str(locality)),
+            );
+            response
+        }
+    }
 }
 
 async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
@@ -340,10 +356,9 @@ fn rough_token_estimate(text: &str) -> u64 {
 
 /// Builds an OpenAI `chat.completion`-shaped body, mirroring
 /// `openAIChatCompletion` (`packages/adapters/subscription/relay.ts`).
-/// `requested_model` is the caller's own `model` field when present (echoed
-/// back, matching that TS helper's call site for a locally-served model),
-/// falling back to the resolved backend id.
-fn openai_chat_completion(content: &str, requested_model: &str, prompt: &str) -> serde_json::Value {
+/// The returned model is the backend's resolved identity, never the caller's
+/// alias or requested value.
+fn openai_chat_completion(content: &str, served_model: &str, prompt: &str) -> serde_json::Value {
     let created = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -354,7 +369,7 @@ fn openai_chat_completion(content: &str, requested_model: &str, prompt: &str) ->
         "id": format!("chatcmpl-idoris-{}", Uuid::new_v4()),
         "object": "chat.completion",
         "created": created,
-        "model": requested_model,
+        "model": served_model,
         "choices": [{"index": 0, "message": {"role": "assistant", "content": content}, "finish_reason": "stop"}],
         "usage": {
             "prompt_tokens": prompt_tokens,
@@ -510,10 +525,76 @@ async fn chat_completions(
     // Supervisor, which only makes sense for a real oMLX-shaped backend
     // with an explicit load/unload lifecycle. See dispatch::select's doc
     // for the accepted double-decide() tradeoff this branch makes.
+    if let Ok(selected) = dispatch::select(&state.cards, &parsed, &prompt) {
+        if dispatch::is_resident_http_service(&selected.card) {
+            return chat_via_proxy(&state, &selected, &headers, &parsed, &value, &record_id).await;
+        }
+        if let Err(message) = supervisor_stream::validate(object) {
+            let mut response = error_envelope_with_reason(
+                StatusCode::BAD_REQUEST,
+                "unsupported_field",
+                "unsupported_stream",
+                message,
+            );
+            response.headers_mut().insert(
+                HEADER_SERVED_LOCALITY,
+                HeaderValue::from_static(locality_str(selected.served_locality)),
+            );
+            return response;
+        }
+        if let Err(message) = supervisor_parameters::validate(object) {
+            let mut response = error_envelope_with_reason(
+                StatusCode::BAD_REQUEST,
+                "unsupported_field",
+                "unsupported_parameter",
+                message,
+            );
+            response.headers_mut().insert(
+                HEADER_SERVED_LOCALITY,
+                HeaderValue::from_static(locality_str(selected.served_locality)),
+            );
+            return response;
+        }
+    }
+
+    // Concrete model IDs are informational in the iDoris × Agent24 contract;
+    // callers select a stable role and iDoris chooses its model. For this
+    // Supervisor-bound path we can verify that an explicit concrete ID names
+    // the selected card. Do so after selection so the response truthfully
+    // reports the selected locality. Resident HTTP proxies retain upstream
+    // model handling above (including arbitrary conformance fixture IDs).
     if let Ok(selected) = dispatch::select(&state.cards, &parsed, &prompt)
-        && dispatch::is_resident_http_service(&selected.card)
+        && object.contains_key("model")
+        && (model.is_none_or(str::is_empty)
+            || model.is_some_and(|requested_model| {
+                parsed.role.is_none() && requested_model != selected.card.provider.id
+            }))
     {
-        return chat_via_proxy(&state, &selected, &headers, &parsed, &value, &record_id).await;
+        let requested_model = model.unwrap_or("");
+        let mut response = error_envelope_with_reason(
+            StatusCode::BAD_REQUEST,
+            "unsupported_field",
+            "unsupported_model",
+            format!(
+                "model '{requested_model}' is not a supported role alias or the selected model '{}'; use a supported idoris/<role> alias or the selected provider.id",
+                selected.card.provider.id
+            ),
+        );
+        if let Ok(value) = HeaderValue::from_str(locality_str(selected.served_locality)) {
+            response.headers_mut().insert(HEADER_SERVED_LOCALITY, value);
+        }
+        let reason = reason_header_value(&selected.decision.reason_codes);
+        if !reason.is_empty()
+            && let Ok(value) = HeaderValue::from_str(&reason)
+        {
+            response.headers_mut().insert(HEADER_REASON, value);
+        }
+        if selected.decision.is_degraded() {
+            response
+                .headers_mut()
+                .insert(HEADER_DEGRADED, HeaderValue::from_static("true"));
+        }
+        return response;
     }
 
     // R0 finding: TS's cancellation propagation (server.ts's req.on("close"))
@@ -545,8 +626,8 @@ async fn chat_completions(
         Ok(outcome) => match &outcome.result {
             Err(failure) => dispatch_failure_response(failure, &outcome),
             Ok(chat_response) => {
-                let requested_model = model.unwrap_or(chat_response.model.as_str());
-                let body = openai_chat_completion(&chat_response.content, requested_model, &prompt);
+                let body =
+                    openai_chat_completion(&chat_response.content, &chat_response.model, &prompt);
                 let mut response = (StatusCode::OK, Json(body)).into_response();
                 apply_decision_headers(&mut response, &outcome);
                 // X-iDoris-Cost-Minor: only set for a genuinely paid,
@@ -1080,7 +1161,7 @@ mod tests {
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(json["object"], "chat.completion");
-        assert_eq!(json["model"], "idoris/daily");
+        assert_eq!(json["model"], "local-1");
         assert!(
             json["choices"][0]["message"]["content"]
                 .as_str()

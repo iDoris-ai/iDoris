@@ -462,3 +462,7 @@
 | FU-29 | #48 第二轮评审建议 | **预算把关分裂成两处**（`dispatch_local::reserve()` 与 `components.rs` 启动期"确定免费"闸门），`decide()` 自己的预算阶段在生产路径上实际是死代码。付费/远程上游接入前，合并成统一的 reserve/settle 包装（与 FU-22 一起做）| OPEN |
 | FU-200 | Release 下载即用（工作站 B） | v0.1.0/v0.1.1 缺失运行配置：发布包仅附免费 oMLX 卡和默认策略，默认从二进制目录加载；macOS 解包冒烟校验 health/tag 版本并阻止坏包发布 | PR_OPEN |
 | FU-201 | Release 验收发现的基线缺口（工作站 B） | Rust routing-policy 目前仅做 schema 校验，规则未接决策管线；接线前应拒绝无法兑现的策略配置，不能把发布包可启动误认为自定义策略已生效 | OPEN |
+| FU-204 | A 机 v0.1.1 冒烟 | 模型身份：Supervisor 响应 model 使用实际服务模型；不匹配的具体模型名显式 400；HTTP 回归与回显/校验变异验证 | PR_OPEN（feat/openai-compat-01） |
+| FU-205 | A 机 v0.1.1 冒烟 | Supervisor 流式：stream=true 及非法类型显式 400，false 保留整块响应；HTTP 回归与绕过校验变异验证 | PR_OPEN（feat/openai-compat-02） |
+| FU-206 | A 机 v0.1.1 冒烟 | Supervisor 参数：文本消息之外未支持参数（含 max_tokens）显式 400；参数清单、HTTP 回归与放行 max_tokens 变异验证 | PR_OPEN（feat/openai-compat-03） |
+| FU-207 | A 机 v0.1.1 冒烟 | 模型目录鉴权：loopback oMLX 复用 IDORIS_OMLX_API_KEY，401/403 显式 502 并记录安全日志；凭证隔离回归与变异验证 | PR_OPEN（feat/openai-compat-04） |
