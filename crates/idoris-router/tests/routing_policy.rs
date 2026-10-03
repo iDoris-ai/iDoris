@@ -172,3 +172,18 @@ fn absent_privacy_fails_closed_even_for_remote_default() {
     assert!(decision.tiers.is_empty());
     assert!(decision.fail_closed);
 }
+
+#[test]
+fn absent_privacy_matches_local_only_conditions_fail_closed() {
+    let policy = policy(
+        json!([
+            {"if": {"privacy": "local_only"}, "then": {"tiers": ["local"]}},
+            {"if": {"privacy": "any"}, "then": {"tiers": ["remote"]}}
+        ]),
+        json!({"tiers": ["remote"], "fail_closed": false}),
+    );
+    let decision = decide(&policy, &TaskProfile::default());
+    assert_eq!(decision.matched_rule, MatchedRule::Rule(0));
+    assert_eq!(decision.tiers, [Tier::Local]);
+    assert!(decision.fail_closed);
+}

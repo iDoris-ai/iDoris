@@ -10,8 +10,8 @@
 //! directory. [`resolve_routing_policy_path`] remains a cwd-relative path
 //! helper for library callers.
 //!
-//! [`decide`] evaluates rules as a pure function. The request dispatch
-//! pipeline doesn't consume these results yet (B1 task 07 wires them in).
+//! [`decide`] evaluates rules as a pure function. The request pipeline applies
+//! its tier restrictions before candidate selection on both execution paths.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -47,7 +47,8 @@ fn matches(condition: &Condition, profile: &TaskProfile) -> bool {
         complexity,
         capabilities,
     } = condition;
-    privacy.is_none_or(|v| profile.privacy == Some(v))
+    let profile_privacy = profile.privacy.unwrap_or(PrivacyClass::LocalOnly);
+    privacy.is_none_or(|v| profile_privacy == v)
         && intent
             .as_ref()
             .is_none_or(|v| profile.intent.as_ref() == Some(v))
