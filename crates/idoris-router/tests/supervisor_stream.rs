@@ -55,7 +55,7 @@ async fn stream_true_is_400_before_any_omlx_request() {
     let supervisor = BoundSupervisor::spawn_omlx(&card(&upstream.uri())).unwrap();
     let app = build_app(AppState {
         cards: vec![card(&upstream.uri())],
-        supervisor: Some(supervisor),
+        runtimes: Some(supervisor).into(),
         ..AppState::default()
     });
 
@@ -125,7 +125,7 @@ async fn stream_false_uses_buffered_omlx_completion() {
     let supervisor = BoundSupervisor::spawn_omlx(&card(&upstream.uri())).unwrap();
     let app = build_app(AppState {
         cards: vec![card(&upstream.uri())],
-        supervisor: Some(supervisor),
+        runtimes: Some(supervisor).into(),
         ..AppState::default()
     });
 

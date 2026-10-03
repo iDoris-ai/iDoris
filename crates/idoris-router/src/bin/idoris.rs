@@ -16,11 +16,9 @@
 //! lifecycle) never touches this Supervisor at all — `AppState.proxy`
 //! forwards to it directly per-request instead.
 
-use idoris_contracts::ComponentCard;
-use idoris_contracts::component_card::Form;
-use idoris_router::dispatch::{BoundSupervisor, is_resident_http_service};
 use idoris_router::{
     AppState, BIND_HOST, build_app, components, parse_port, routing_policy,
+    runtime::RuntimeRegistry,
     write_timeout::{DEFAULT_WRITE_TIMEOUT, WriteTimeoutListener},
 };
 use std::path::PathBuf;
@@ -59,31 +57,6 @@ fn resolve_bundle_path(raw: Option<&str>, default_relative: &str) -> Result<Path
     Ok(parent.join(default_relative))
 }
 
-/// Until there is a per-provider registry, accept at most one lifecycle
-/// backend. Resident HTTP services are forwarded directly and do not count.
-fn spawn_supervisor_for_omlx_card(
-    cards: &[ComponentCard],
-) -> Result<Option<BoundSupervisor>, String> {
-    let lifecycle: Vec<_> = cards
-        .iter()
-        .filter(|c| c.form == Form::HttpService && !is_resident_http_service(c))
-        .collect();
-    if lifecycle.len() > 1 {
-        let providers = lifecycle
-            .iter()
-            .map(|c| c.provider.id.as_str())
-            .collect::<Vec<_>>()
-            .join(", ");
-        return Err(format!(
-            "暂不支持多个 lifecycle 后端（{providers}）；请仅配置一个非 Resident 的 http_service 后端"
-        ));
-    }
-    lifecycle
-        .first()
-        .map(|card| BoundSupervisor::spawn_omlx(card))
-        .transpose()
-}
-
 async fn run() -> Result<(), String> {
     let port =
         parse_port(std::env::var("IDORIS_PORT").ok().as_deref()).map_err(|err| err.to_string())?;
@@ -115,7 +88,7 @@ async fn run() -> Result<(), String> {
             )
         })?;
 
-    let supervisor = spawn_supervisor_for_omlx_card(&cards)?;
+    let runtimes = RuntimeRegistry::spawn(&cards)?;
 
     let component_list = cards
         .iter()
@@ -125,7 +98,7 @@ async fn run() -> Result<(), String> {
     let state = AppState {
         cards,
         routing_policy,
-        supervisor,
+        runtimes,
         ..AppState::default()
     };
 
@@ -150,36 +123,4 @@ async fn run() -> Result<(), String> {
     )
     .await
     .map_err(|err| format!("server error: {err}"))
-}
-
-#[cfg(test)]
-#[allow(clippy::unwrap_used)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn k03_missing_policy_counts_but_resident_http_does_not() {
-        let mut lifecycle: ComponentCard =
-            serde_yaml::from_str(include_str!("../../../../config/components/omlx.yaml")).unwrap();
-        lifecycle.load_policy = None;
-        let mut second = lifecycle.clone();
-        second.provider.id = "second".to_string();
-        assert!(spawn_supervisor_for_omlx_card(&[lifecycle.clone(), second]).is_err());
-        let mut resident: ComponentCard =
-            serde_yaml::from_str(include_str!("../../../../config/components/omlx.yaml")).unwrap();
-        resident.provider.id = "resident".to_string();
-        resident.load_policy.as_mut().unwrap().mode =
-            idoris_contracts::load_policy::LoadMode::Resident;
-        assert!(
-            spawn_supervisor_for_omlx_card(&[lifecycle, resident.clone()])
-                .unwrap()
-                .is_some()
-        );
-        assert!(
-            spawn_supervisor_for_omlx_card(&[resident])
-                .unwrap()
-                .is_none()
-        );
-        assert!(spawn_supervisor_for_omlx_card(&[]).unwrap().is_none());
-    }
 }

@@ -23,7 +23,7 @@ async fn app(server: &MockServer) -> axum::Router {
     let supervisor = BoundSupervisor::spawn_omlx(&card).unwrap();
     build_app(AppState {
         cards: vec![card],
-        supervisor: Some(supervisor),
+        runtimes: Some(supervisor).into(),
         ..AppState::default()
     })
 }
