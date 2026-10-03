@@ -232,10 +232,24 @@ pub fn build_app(state: AppState) -> Router {
 
 /// `GET /v1/models` (interface spec — `owned_by` is each card's
 /// `provider.id`, matching `server.ts`). Delegates to [`models::list_models`];
-/// see that module's doc for the per-card best-effort/skip-on-failure
-/// semantics.
+/// authentication failures surface as structured upstream errors.
 async fn list_models(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    Json(models::list_models(&state.http_client, &state.cards).await)
+    match models::list_models(&state.http_client, &state.cards).await {
+        Ok(models) => Json(models).into_response(),
+        Err(models::ModelsError::UpstreamAuthenticationFailed { locality, .. }) => {
+            let mut response = error_envelope_with_reason(
+                StatusCode::BAD_GATEWAY,
+                "upstream_error",
+                "upstream_authentication_failed",
+                "Model discovery authentication failed; check the upstream credential configuration",
+            );
+            response.headers_mut().insert(
+                HEADER_SERVED_LOCALITY,
+                HeaderValue::from_static(locality_str(locality)),
+            );
+            response
+        }
+    }
 }
 
 async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
