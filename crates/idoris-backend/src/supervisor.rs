@@ -239,7 +239,7 @@ struct ReleaseLimits {
 struct LoadFlowContext {
     release_limits: ReleaseLimits,
     inherited: bool,
-    load_fence: Option<Arc<crate::load_fence::LoadFence>>,
+    load_fence: Arc<crate::load_fence::LoadFence>,
 }
 
 /// A cheaply-`Clone`-able front door to a running [`Supervisor`]. Every
@@ -549,32 +549,6 @@ async fn run_load_flow(
         inherited,
         load_fence,
     } = context;
-    // Persist before the first adapter IO (including victim eviction), so a
-    // Supervisor restart cannot admit another load while this operation is
-    // unresolved. Existing markers fail closed and are never overwritten.
-    let load_fence = match load_fence
-        .ok_or_else(|| BackendError::internal("load fence is unavailable"))
-        .and_then(|fence| {
-            fence.begin()?;
-            Ok(fence)
-        }) {
-        Ok(fence) => fence,
-        Err(err) => {
-            return OpOutcome::Load {
-                result: Err(err),
-                victim_results: evict
-                    .iter()
-                    .map(|victim| (victim.clone(), Err(BackendError::eviction_failed(&id))))
-                    .collect(),
-                aggregate_status: None,
-                aggregate_target_credit_gb,
-                failure_outcome: previous.map_or(
-                    LoadFailureOutcome::Settle(ModelState::Stopped),
-                    LoadFailureOutcome::RestorePrevious,
-                ),
-            };
-        }
-    };
     // Every chosen victim gets an actual unload attempt, even after an
     // earlier one fails: `OpDone` only resolves ids present in
     // `victim_results`, so stopping early would leave later victims stuck
@@ -1027,6 +1001,7 @@ fn start_load(
     policy: LoadPolicy,
     evict: Vec<String>,
     previous: Option<PreviousModel>,
+    load_fence: Arc<crate::load_fence::LoadFence>,
     models: &mut HashMap<String, ModelSlot>,
     env: &Env<'_>,
 ) {
@@ -1051,8 +1026,7 @@ fn start_load(
     let inherited = previous.is_some_and(|model| model.inherited);
     let adapter = env.adapter.clone();
     let config = env.config.clone();
-    let load_fence = env.load_fence.cloned();
-    let ownership = env.load_fence.cloned();
+    let ownership = load_fence.clone();
     let self_tx = env.self_tx.clone();
     let id_for_task = id.clone();
     // Kept alongside `evict` (which is moved into `run_load_flow` below) so
@@ -1228,6 +1202,22 @@ fn handle_load(
             return;
         }
     };
+    // Claim the durable fence before changing any ledger or operation state.
+    // A rejected claim is a pure admission failure: chosen victims remain
+    // untouched and no active operation is installed.
+    let load_fence = match env.load_fence {
+        Some(fence) => {
+            if let Err(err) = fence.begin() {
+                let _ = reply.send(Err(err));
+                return;
+            }
+            fence.clone()
+        }
+        None => {
+            let _ = reply.send(Err(BackendError::internal("load fence is unavailable")));
+            return;
+        }
+    };
     for victim in &evict {
         set_state_or_panic(models, victim, ModelState::Stopping);
     }
@@ -1264,7 +1254,7 @@ fn handle_load(
             waiters: vec![reply],
         },
     });
-    start_load(id, policy, evict, previous, models, env);
+    start_load(id, policy, evict, previous, load_fence, models, env);
 }
 
 /// Standalone unloads also confirm release before freeing ledger capacity.
