@@ -87,7 +87,7 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
-    use crate::dispatch::{DispatchFailure, dispatch_local};
+    use crate::dispatch::{DispatchFailure, DispatchInput, dispatch_local};
     use crate::profile::{IntentSource, ParsedProfile};
     use idoris_backend::{ChatMessage, MockAdapter, ModelInfo};
     use idoris_contracts::TaskProfile;
@@ -187,7 +187,7 @@ mod tests {
                 registry.get(&card.provider.id),
                 None,
                 &profile(),
-                "hello",
+                DispatchInput::new("hello"),
                 vec![ChatMessage {
                     role: "user".into(),
                     content: "hello".into(),
@@ -211,7 +211,7 @@ mod tests {
             registry.get("b"),
             None,
             &profile(),
-            "",
+            DispatchInput::new(""),
             Vec::new(),
             CancellationToken::new(),
         )
@@ -228,7 +228,7 @@ mod tests {
             registry.get("a"),
             None,
             &profile(),
-            "hello",
+            DispatchInput::new("hello"),
             vec![ChatMessage {
                 role: "user".into(),
                 content: "hello".into(),
