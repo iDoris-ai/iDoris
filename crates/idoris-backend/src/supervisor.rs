@@ -132,6 +132,10 @@ enum OpOutcome {
         /// Every victim `plan_eviction` chose, and how its `unload` went —
         /// applied to the ledger by `OpDone` alongside `result`.
         victim_results: Vec<VictimResult>,
+        /// Fresh aggregate snapshot proving the selected victims were gone.
+        aggregate_status: Option<BackendStatus>,
+        /// Amount attributed to the requested ID in that pre-load snapshot.
+        aggregate_target_credit_gb: f64,
         /// Only consulted when `result` is `Err` — see
         /// [`LoadFailureOutcome`]'s doc comment.
         failure_outcome: LoadFailureOutcome,
@@ -539,6 +543,7 @@ async fn run_load_flow(
     evict: Vec<String>,
     mut previous: Option<PreviousModel>,
 ) -> OpOutcome {
+    let aggregate_target_credit_gb = previous.as_ref().map_or(0.0, |model| model.memory_gb);
     let LoadFlowContext {
         release_limits,
         inherited,
@@ -561,6 +566,8 @@ async fn run_load_flow(
                     .iter()
                     .map(|victim| (victim.clone(), Err(BackendError::eviction_failed(&id))))
                     .collect(),
+                aggregate_status: None,
+                aggregate_target_credit_gb,
                 failure_outcome: previous.map_or(
                     LoadFailureOutcome::Settle(ModelState::Stopped),
                     LoadFailureOutcome::RestorePrevious,
@@ -586,22 +593,28 @@ async fn run_load_flow(
         eviction_failed |= result.is_err();
         victim_results.push((victim, result));
     }
-    if !targets.is_empty()
-        && confirm_memory_released(
+    let aggregate_status = if !targets.is_empty() {
+        match confirm_memory_released(
             &adapter,
             &targets,
             release_limits.after_eviction_gb,
             &config,
         )
         .await
-        .is_err()
-    {
-        // Keep all selected victims charged until the whole release is confirmed.
-        for (_, result) in &mut victim_results {
-            *result = Err(BackendError::eviction_failed(&id));
+        {
+            Ok(status) => Some(status),
+            Err(_) => {
+                // Keep all selected victims charged until the whole release is confirmed.
+                for (_, result) in &mut victim_results {
+                    *result = Err(BackendError::eviction_failed(&id));
+                }
+                eviction_failed = true;
+                None
+            }
         }
-        eviction_failed = true;
-    }
+    } else {
+        None
+    };
     if eviction_failed {
         let err = BackendError::eviction_failed(&id);
         let failure_outcome = resolve_load_failure(
@@ -621,6 +634,8 @@ async fn run_load_flow(
         return OpOutcome::Load {
             result: Err(err),
             victim_results,
+            aggregate_status,
+            aggregate_target_credit_gb,
             failure_outcome,
         };
     }
@@ -659,6 +674,8 @@ async fn run_load_flow(
             return OpOutcome::Load {
                 result: Err(BackendError::model_unavailable(&id)),
                 victim_results,
+                aggregate_status,
+                aggregate_target_credit_gb,
                 failure_outcome,
             };
         }
@@ -696,6 +713,8 @@ async fn run_load_flow(
             return OpOutcome::Load {
                 result: attempt,
                 victim_results,
+                aggregate_status,
+                aggregate_target_credit_gb,
                 failure_outcome,
             };
         }
@@ -713,6 +732,8 @@ async fn run_load_flow(
             return OpOutcome::Load {
                 result: attempt,
                 victim_results,
+                aggregate_status,
+                aggregate_target_credit_gb,
                 failure_outcome,
             };
         }
@@ -750,6 +771,8 @@ async fn run_load_flow(
         return OpOutcome::Load {
             result: Err(err),
             victim_results,
+            aggregate_status,
+            aggregate_target_credit_gb,
             failure_outcome,
         };
     }
@@ -762,12 +785,16 @@ async fn run_load_flow(
                     return OpOutcome::Load {
                         result: Err(err),
                         victim_results,
+                        aggregate_status,
+                        aggregate_target_credit_gb,
                         failure_outcome: LoadFailureOutcome::RetainUnconfirmedLoad(previous),
                     };
                 }
                 return OpOutcome::Load {
                     result: Ok(()),
                     victim_results,
+                    aggregate_status,
+                    aggregate_target_credit_gb,
                     failure_outcome: LoadFailureOutcome::Settle(ModelState::Error), // unused: `result` is `Ok`
                 };
             }
@@ -782,6 +809,8 @@ async fn run_load_flow(
                 return OpOutcome::Load {
                     result: Err(err),
                     victim_results,
+                    aggregate_status,
+                    aggregate_target_credit_gb,
                     failure_outcome: LoadFailureOutcome::RetainUnconfirmedLoad(previous),
                 };
             }
@@ -794,6 +823,8 @@ async fn run_load_flow(
     OpOutcome::Load {
         result: Err(BackendError::probe_timed_out(id.clone())),
         victim_results,
+        aggregate_status,
+        aggregate_target_credit_gb,
         failure_outcome: LoadFailureOutcome::RetainUnconfirmedLoad(previous),
     }
 }
@@ -855,10 +886,72 @@ struct Env<'a> {
     config: &'a SupervisorConfig,
     self_tx: &'a mpsc::WeakSender<ActorMsg>,
     load_fence: Option<&'a Arc<crate::load_fence::LoadFence>>,
-    // Startup residency is an aggregate; inherited identities never split it
-    // using unverified per-model estimates.
+    // Latest aggregate engine residency. `aggregate_covered` records IDs
+    // that the same snapshot proves are represented by independent slots.
     reserved_gb: f64,
+    aggregate_covered: HashMap<String, f64>,
     startup_error: Option<BackendError>,
+}
+
+impl Env<'_> {
+    // Keep the raw total so unknown residency can be recovered after a
+    // covered slot is later removed. Credits are frozen at snapshot time;
+    // they must never grow with a later request estimate.
+    fn effective_reserved_gb(&self, models: &HashMap<String, ModelSlot>) -> f64 {
+        self.effective_reserved_gb_except(models, None)
+    }
+
+    // Excluding a target preserves the aggregate as a release-proof bound;
+    // admission always uses the ordinary total, including its coverage.
+    fn effective_reserved_gb_except(
+        &self,
+        models: &HashMap<String, ModelSlot>,
+        excluded_id: Option<&str>,
+    ) -> f64 {
+        let covered_slots_gb: f64 = self
+            .aggregate_covered
+            .iter()
+            .filter(|(id, _)| excluded_id != Some(id.as_str()))
+            .filter_map(|(id, credited_gb)| models.get(id).map(|slot| (slot, credited_gb)))
+            .filter(|(slot, _)| occupies_budget(slot.state) && !slot.load_unconfirmed)
+            .map(|(slot, credited_gb)| slot.memory_gb.min(*credited_gb))
+            .sum();
+        (self.reserved_gb - covered_slots_gb).max(0.0)
+    }
+
+    fn refresh_aggregate(&mut self, models: &HashMap<String, ModelSlot>, status: &BackendStatus) {
+        self.refresh_aggregate_except(models, status, None, 0.0);
+    }
+
+    fn refresh_aggregate_except(
+        &mut self,
+        models: &HashMap<String, ModelSlot>,
+        status: &BackendStatus,
+        excluded_id: Option<&str>,
+        excluded_credit_gb: f64,
+    ) {
+        self.reserved_gb = status.used_gb;
+        self.aggregate_covered = status
+            .loaded
+            .iter()
+            .filter(|id| {
+                excluded_id != Some(id.as_str())
+                    && models
+                        .get(*id)
+                        .is_some_and(|slot| occupies_budget(slot.state) && !slot.load_unconfirmed)
+            })
+            .filter_map(|id| models.get(id).map(|slot| (id.clone(), slot.memory_gb)))
+            .collect();
+        // This snapshot predates the target reload. Only its old charge
+        // overlaps the aggregate, even if its new estimate is much larger.
+        if let Some(id) = excluded_id
+            && excluded_credit_gb > 0.0
+            && status.loaded.iter().any(|loaded_id| loaded_id == id)
+        {
+            self.aggregate_covered
+                .insert(id.to_string(), excluded_credit_gb);
+        }
+    }
 }
 
 /// `models` as [`crate::eviction::plan_eviction`] sees it — every entry
@@ -939,8 +1032,10 @@ fn start_load(
         .map(|(_, slot)| slot.memory_gb)
         .sum();
     let release_limits = ReleaseLimits {
-        target_absent_gb: release_limit_gb + env.reserved_gb,
-        after_eviction_gb: release_limit_gb + previous_memory_gb + env.reserved_gb,
+        target_absent_gb: release_limit_gb + env.effective_reserved_gb(models),
+        after_eviction_gb: release_limit_gb
+            + previous_memory_gb
+            + env.effective_reserved_gb(models),
     };
     let inherited = previous.is_some_and(|model| model.inherited);
     let adapter = env.adapter.clone();
@@ -998,6 +1093,8 @@ fn start_load(
                         (victim, Err(err))
                     })
                     .collect(),
+                aggregate_status: None,
+                aggregate_target_credit_gb: 0.0,
                 // A panic may have happened after the engine accepted the
                 // request. Keep its durable marker and ledger fence.
                 failure_outcome: LoadFailureOutcome::RetainUnconfirmedLoad(previous),
@@ -1095,7 +1192,7 @@ fn handle_load(
     }
 
     let inherited = models.get(&id).is_some_and(|slot| slot.inherited);
-    let reservation = env.reserved_gb;
+    let reservation = env.effective_reserved_gb(models);
     if reservation > env.config.budget_gb {
         let _ = reply.send(Err(BackendError::eviction_impossible(&id)));
         return;
@@ -1267,7 +1364,8 @@ fn handle_unload(
         },
     });
     if inflight == 0 {
-        let max_used_gb = ledger_used_except(models, &id) + env.reserved_gb;
+        let max_used_gb =
+            ledger_used_except(models, &id) + env.effective_reserved_gb_except(models, Some(&id));
         start_unload(id, max_used_gb, env);
     }
 }
@@ -1357,6 +1455,7 @@ async fn run_actor(
         self_tx: &self_tx,
         load_fence: load_fence.as_ref(),
         reserved_gb: initial_reserved_gb,
+        aggregate_covered: HashMap::new(),
         startup_error: load_fence_error.or_else(|| startup.err()),
     };
 
@@ -1416,7 +1515,7 @@ async fn run_actor(
                     .filter(|slot| occupies_budget(slot.state))
                     .map(|slot| slot.memory_gb)
                     .sum::<f64>()
-                    + env.reserved_gb;
+                    + env.effective_reserved_gb(&models);
                 let pressure = if used_gb >= config.budget_gb {
                     Pressure::Hard
                 } else if used_gb >= config.budget_gb * 0.8 {
@@ -1547,27 +1646,40 @@ async fn run_actor(
             }
 
             ActorMsg::OpDone { id, outcome } => {
-                let (result, done_state, failure_outcome, victim_results, unload_status) =
-                    match outcome {
-                        OpOutcome::Load {
-                            result,
-                            victim_results,
-                            failure_outcome,
-                        } => (
-                            result,
-                            ModelState::Ready,
-                            failure_outcome,
-                            victim_results,
-                            None,
-                        ),
-                        OpOutcome::Unload { result, status } => (
-                            result,
-                            ModelState::Stopped,
-                            LoadFailureOutcome::Settle(ModelState::Error),
-                            Vec::new(),
-                            status,
-                        ),
-                    };
+                let (
+                    result,
+                    done_state,
+                    failure_outcome,
+                    victim_results,
+                    aggregate_status,
+                    aggregate_target_credit_gb,
+                    unload_status,
+                ) = match outcome {
+                    OpOutcome::Load {
+                        result,
+                        victim_results,
+                        aggregate_status,
+                        aggregate_target_credit_gb,
+                        failure_outcome,
+                    } => (
+                        result,
+                        ModelState::Ready,
+                        failure_outcome,
+                        victim_results,
+                        aggregate_status,
+                        aggregate_target_credit_gb,
+                        None,
+                    ),
+                    OpOutcome::Unload { result, status } => (
+                        result,
+                        ModelState::Stopped,
+                        LoadFailureOutcome::Settle(ModelState::Error),
+                        Vec::new(),
+                        None,
+                        0.0,
+                        status,
+                    ),
+                };
 
                 let mut violation: Option<String> = None;
                 for (victim_id, victim_result) in victim_results {
@@ -1581,6 +1693,16 @@ async fn run_actor(
                     {
                         violation = Some(e);
                     }
+                }
+                if violation.is_none()
+                    && let Some(status) = &aggregate_status
+                {
+                    env.refresh_aggregate_except(
+                        &models,
+                        status,
+                        Some(&id),
+                        aggregate_target_credit_gb,
+                    );
                 }
                 if violation.is_none() {
                     match &result {
@@ -1609,7 +1731,7 @@ async fn run_actor(
                                 match set_state_or_poison(&mut models, &id, ModelState::Stopped) {
                                     Err(e) => violation = Some(e),
                                     Ok(()) => {
-                                        env.reserved_gb = env.reserved_gb.min(status.used_gb);
+                                        env.refresh_aggregate(&models, &status);
                                     }
                                 }
                             }
@@ -1658,10 +1780,7 @@ async fn run_actor(
                 }
 
                 if let Some(status) = unload_status {
-                    let current = env.reserved_gb;
-                    // Fresh status bounds inherited and anonymous residency
-                    // together; never subtract request estimates here.
-                    env.reserved_gb = current.min(status.used_gb);
+                    env.refresh_aggregate(&models, &status);
                 }
 
                 let waiters = take_waiters(&mut active_op);
@@ -1707,7 +1826,8 @@ async fn run_actor(
                             && !*started
                         {
                             *started = true;
-                            let max_used_gb = ledger_used_except(&models, &model) + env.reserved_gb;
+                            let max_used_gb = ledger_used_except(&models, &model)
+                                + env.effective_reserved_gb_except(&models, Some(&model));
                             start_unload(model, max_used_gb, &env);
                         }
                     }
@@ -3939,6 +4059,8 @@ mod tests {
             outcome: OpOutcome::Load {
                 result: Ok(()),
                 victim_results: Vec::new(),
+                aggregate_status: None,
+                aggregate_target_credit_gb: 0.0,
                 failure_outcome: LoadFailureOutcome::Settle(ModelState::Error),
             },
         })
