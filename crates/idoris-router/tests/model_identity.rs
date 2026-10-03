@@ -146,6 +146,21 @@ async fn role_alias_reports_actual_model_identity() {
 }
 
 #[tokio::test]
+async fn uppercase_role_prefix_reports_actual_model_identity() {
+    assert_served_model("IDORIS/daily").await;
+}
+
+#[tokio::test]
+async fn mixed_case_role_prefix_reports_actual_model_identity() {
+    assert_served_model("Idoris/fast").await;
+}
+
+#[tokio::test]
+async fn whitespace_padded_role_alias_reports_actual_model_identity() {
+    assert_served_model("  idoris/daily  ").await;
+}
+
+#[tokio::test]
 async fn matching_concrete_model_is_accepted_and_reported() {
     assert_served_model("Qwen3-0.6B-4bit").await;
 }

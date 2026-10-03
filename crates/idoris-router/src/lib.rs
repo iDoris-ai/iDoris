@@ -525,8 +525,7 @@ async fn chat_completions(
         && object.contains_key("model")
         && (model.is_none_or(str::is_empty)
             || model.is_some_and(|requested_model| {
-                !requested_model.starts_with("idoris/")
-                    && requested_model != selected.card.provider.id
+                parsed.role.is_none() && requested_model != selected.card.provider.id
             }))
     {
         let requested_model = model.unwrap_or("");
