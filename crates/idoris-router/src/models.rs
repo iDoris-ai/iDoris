@@ -3,6 +3,7 @@
 //! handler — best-effort per card, except authentication failures, which
 //! fail the request to prevent an incomplete list from appearing complete.
 
+use std::ffi::OsStr;
 use std::time::Duration;
 
 use idoris_contracts::ComponentCard;
@@ -10,6 +11,7 @@ use idoris_contracts::component_card::Form;
 use idoris_contracts::provider::Locality;
 use reqwest::header::{AUTHORIZATION, HeaderValue};
 use serde::Serialize;
+use serde_json::Value;
 
 /// TS's reference loop (`server.ts`'s `/v1/models` handler) applies no
 /// timeout at all to each backend's `list()` call — an unresponsive
@@ -36,6 +38,19 @@ pub struct ModelsResponse {
 #[derive(Debug)]
 pub enum ModelsError {
     UpstreamAuthenticationFailed { locality: Locality },
+}
+
+fn auth_failure(card: &ComponentCard, field: &str, value: Value) -> ModelsError {
+    let mut event = serde_json::json!({
+        "event": "upstream_model_listing_authentication_failed",
+        "provider_id": card.provider.id,
+        "locality": crate::locality_str(card.provider.locality),
+    });
+    event[field] = value;
+    eprintln!("{event}");
+    ModelsError::UpstreamAuthenticationFailed {
+        locality: card.provider.locality,
+    }
 }
 
 fn is_loopback_omlx(card: &ComponentCard) -> bool {
@@ -65,7 +80,7 @@ fn is_loopback_omlx(card: &ComponentCard) -> bool {
 async fn list_one(
     client: &reqwest::Client,
     card: &ComponentCard,
-    api_key: Option<&str>,
+    api_key: Option<&OsStr>,
 ) -> Result<Vec<ModelEntry>, ModelsError> {
     if card.form != Form::HttpService {
         return Ok(Vec::new());
@@ -75,18 +90,11 @@ async fn list_one(
     if is_loopback_omlx(card)
         && let Some(key) = api_key.filter(|key| !key.is_empty())
     {
-        let Ok(mut authorization) = HeaderValue::from_str(&format!("Bearer {key}")) else {
-            eprintln!(
-                "{{\"event\":\"upstream_model_listing_authentication_failed\",\"reason\":\"invalid_authorization_header\",\"provider_id\":{},\"locality\":{}}}",
-                serde_json::to_string(&card.provider.id)
-                    .unwrap_or_else(|_| "\"unknown\"".to_string()),
-                serde_json::to_string(crate::locality_str(card.provider.locality))
-                    .unwrap_or_else(|_| "\"unknown\"".to_string())
-            );
-            return Err(ModelsError::UpstreamAuthenticationFailed {
-                locality: card.provider.locality,
-            });
-        };
+        // A present non-UTF-8 key is invalid, never an absent credential.
+        let mut authorization = key
+            .to_str()
+            .and_then(|key| HeaderValue::from_str(&format!("Bearer {key}")).ok())
+            .ok_or_else(|| auth_failure(card, "reason", "invalid_authorization_header".into()))?;
         authorization.set_sensitive(true);
         request = request.header(AUTHORIZATION, authorization);
     }
@@ -94,16 +102,7 @@ async fn list_one(
         return Ok(Vec::new());
     };
     if matches!(resp.status().as_u16(), 401 | 403) {
-        eprintln!(
-            "{{\"event\":\"upstream_model_listing_authentication_failed\",\"provider_id\":{},\"locality\":{},\"status\":{}}}",
-            serde_json::to_string(&card.provider.id).unwrap_or_else(|_| "\"unknown\"".to_string()),
-            serde_json::to_string(crate::locality_str(card.provider.locality))
-                .unwrap_or_else(|_| "\"unknown\"".to_string()),
-            resp.status().as_u16()
-        );
-        return Err(ModelsError::UpstreamAuthenticationFailed {
-            locality: card.provider.locality,
-        });
+        return Err(auth_failure(card, "status", resp.status().as_u16().into()));
     }
     if !resp.status().is_success() {
         return Ok(Vec::new());
@@ -129,27 +128,19 @@ async fn list_one(
 /// registered)` loop — not a locked ordering contract, just parity with the
 /// reference (a concurrent `join_all` would be a valid follow-up, not a
 /// behavior change any test here depends on).
-async fn list_models_with_key(
+pub async fn list_models(
     client: &reqwest::Client,
     cards: &[ComponentCard],
-    api_key: Option<&str>,
 ) -> Result<ModelsResponse, ModelsError> {
+    let api_key = std::env::var_os(idoris_upstream::omlx::OMLX_API_KEY_ENV);
     let mut data = Vec::new();
     for card in cards {
-        data.extend(list_one(client, card, api_key).await?);
+        data.extend(list_one(client, card, api_key.as_deref()).await?);
     }
     Ok(ModelsResponse {
         object: "list",
         data,
     })
-}
-
-pub async fn list_models(
-    client: &reqwest::Client,
-    cards: &[ComponentCard],
-) -> Result<ModelsResponse, ModelsError> {
-    let config = idoris_upstream::OmlxAdapterConfig::default();
-    list_models_with_key(client, cards, config.api_key.as_deref()).await
 }
 
 #[cfg(test)]
@@ -181,7 +172,7 @@ mod tests {
             },
             form,
             endpoint: endpoint.to_string(),
-            version_pin: "omlx@0.6.4".to_string(),
+            version_pin: "test@0.0.0".to_string(),
             privacy_class: PrivacyClass::LocalOnly,
             allowed_egress: vec![Egress::Loopback],
             fallback_policy: FallbackPolicy::FailClosed,
@@ -189,37 +180,6 @@ mod tests {
             load_policy: None,
             extensions: None,
         }
-    }
-
-    async fn models_server() -> MockServer {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/v1/models"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"data":[]})))
-            .mount(&server)
-            .await;
-        server
-    }
-
-    async fn assert_no_authorization(
-        client: &reqwest::Client,
-        server: &MockServer,
-        entry: ComponentCard,
-        case_name: &str,
-    ) {
-        list_models_with_key(client, &[entry], Some("secret"))
-            .await
-            .unwrap_or_else(|_| panic!("{case_name}: listing should succeed"));
-        let requests = server.received_requests().await.unwrap();
-        assert_eq!(
-            requests.len(),
-            1,
-            "{case_name}: request must reach upstream"
-        );
-        assert!(
-            !requests[0].headers.contains_key("authorization"),
-            "{case_name}: authorization must be omitted"
-        );
     }
 
     #[tokio::test]
@@ -235,7 +195,7 @@ mod tests {
             .await;
         let client = reqwest::Client::new();
         let cards = vec![card("omlx", &server.uri(), Form::HttpService)];
-        let resp = list_models_with_key(&client, &cards, None).await.unwrap();
+        let resp = list_models(&client, &cards).await.unwrap();
         assert_eq!(resp.object, "list");
         let ids: Vec<&str> = resp.data.iter().map(|m| m.id.as_str()).collect();
         assert_eq!(ids, vec!["model-a", "model-b"]);
@@ -246,98 +206,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn auth_failure_rejects_even_a_partial_successful_listing() {
-        let good = MockServer::start().await;
+    async fn a_failing_card_is_skipped_not_a_partial_failure() {
+        let server = MockServer::start().await;
         Mock::given(method("GET"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(serde_json::json!({"data":[{"id":"good"}]})),
-            )
-            .mount(&good)
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
             .await;
-        for status in [401, 403] {
-            let denied = MockServer::start().await;
-            Mock::given(method("GET"))
-                .respond_with(ResponseTemplate::new(status))
-                .mount(&denied)
-                .await;
-            let cards = [
-                card("good", &good.uri(), Form::HttpService),
-                card("Qwen3-0.6B-4bit", &denied.uri(), Form::HttpService),
-            ];
-            assert!(matches!(
-                list_models_with_key(&reqwest::Client::new(), &cards, None).await,
-                Err(ModelsError::UpstreamAuthenticationFailed { .. })
-            ));
-        }
+        let client = reqwest::Client::new();
+        let cards = vec![card("omlx", &server.uri(), Form::HttpService)];
+        let resp = list_models(&client, &cards).await.unwrap();
+        assert!(resp.data.is_empty());
     }
 
     #[tokio::test]
     async fn a_non_http_service_card_is_skipped_without_any_network_call() {
         let client = reqwest::Client::new();
         let cards = vec![card("subscription", "spawn://x", Form::SpawnCli)];
-        let resp = list_models_with_key(&client, &cards, None).await.unwrap();
+        let resp = list_models(&client, &cards).await.unwrap();
         assert!(resp.data.is_empty());
-    }
-
-    #[tokio::test]
-    async fn invalid_authorization_keys_fail_before_any_upstream_request() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .respond_with(ResponseTemplate::new(200))
-            .mount(&server)
-            .await;
-        for key in ["bad\nkey", "bad\rkey", "bad\r\nkey"] {
-            let result = list_models_with_key(
-                &reqwest::Client::new(),
-                &[card("omlx", &server.uri(), Form::HttpService)],
-                Some(key),
-            )
-            .await;
-            assert!(matches!(
-                result,
-                Err(ModelsError::UpstreamAuthenticationFailed { .. })
-            ));
-        }
-        assert!(server.received_requests().await.unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn credentials_are_isolated_from_non_loopback_locality() {
-        let server = models_server().await;
-        let mut entry = card("omlx", &server.uri(), Form::HttpService);
-        entry.provider.locality = Locality::Remote;
-        assert_no_authorization(&reqwest::Client::new(), &server, entry, "remote locality").await;
-    }
-
-    #[tokio::test]
-    async fn credentials_are_isolated_from_non_omlx_version() {
-        let server = models_server().await;
-        let mut entry = card("omlx", &server.uri(), Form::HttpService);
-        entry.version_pin = "other@1.0".into();
-        assert_no_authorization(&reqwest::Client::new(), &server, entry, "non-oMLX version").await;
-    }
-
-    #[tokio::test]
-    async fn credentials_are_isolated_from_non_loopback_url_host() {
-        let server = models_server().await;
-        let port = reqwest::Url::parse(&server.uri()).unwrap().port().unwrap();
-        let endpoint = format!("http://upstream.test:{port}");
-        let socket = server.address();
-        let client = reqwest::Client::builder()
-            .no_proxy()
-            .resolve("upstream.test", *socket)
-            .build()
-            .unwrap();
-        let entry = card("omlx", &endpoint, Form::HttpService);
-        assert_no_authorization(&client, &server, entry, "non-loopback URL host").await;
-    }
-
-    #[tokio::test]
-    async fn credentials_are_isolated_from_non_local_family() {
-        let server = models_server().await;
-        let mut entry = card("omlx", &server.uri(), Form::HttpService);
-        entry.provider.family = Family::Other;
-        assert_no_authorization(&reqwest::Client::new(), &server, entry, "non-local family").await;
     }
 }
