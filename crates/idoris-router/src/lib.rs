@@ -36,6 +36,7 @@ pub mod models;
 pub mod proxy;
 
 mod sse;
+mod supervisor_parameters;
 mod supervisor_stream;
 
 /// Per-connection deadlines for stalled HTTP response writes.
@@ -519,6 +520,19 @@ async fn chat_completions(
                 StatusCode::BAD_REQUEST,
                 "unsupported_field",
                 "unsupported_stream",
+                message,
+            );
+            response.headers_mut().insert(
+                HEADER_SERVED_LOCALITY,
+                HeaderValue::from_static(locality_str(selected.served_locality)),
+            );
+            return response;
+        }
+        if let Err(message) = supervisor_parameters::validate(object) {
+            let mut response = error_envelope_with_reason(
+                StatusCode::BAD_REQUEST,
+                "unsupported_field",
+                "unsupported_parameter",
                 message,
             );
             response.headers_mut().insert(

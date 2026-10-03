@@ -462,3 +462,4 @@
 | FU-29 | #48 第二轮评审建议 | **预算把关分裂成两处**（`dispatch_local::reserve()` 与 `components.rs` 启动期"确定免费"闸门），`decide()` 自己的预算阶段在生产路径上实际是死代码。付费/远程上游接入前，合并成统一的 reserve/settle 包装（与 FU-22 一起做）| OPEN |
 | FU-200 | A 机 v0.1.1 冒烟 | 模型身份：Supervisor 响应 model 使用实际服务模型；不匹配的具体模型名显式 400；HTTP 回归与回显/校验变异验证 | PR_OPEN（feat/openai-compat-01） |
 | FU-201 | A 机 v0.1.1 冒烟 | Supervisor 流式：stream=true 及非法类型显式 400，false 保留整块响应；HTTP 回归与绕过校验变异验证 | PR_OPEN（feat/openai-compat-02） |
+| FU-202 | A 机 v0.1.1 冒烟 | Supervisor 参数：文本消息之外未支持参数（含 max_tokens）显式 400；参数清单、HTTP 回归与放行 max_tokens 变异验证 | PR_OPEN（feat/openai-compat-03） |
