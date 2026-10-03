@@ -104,7 +104,8 @@ async fn upstream_redirects_never_reach_the_other_origin() {
             &[card(&origin.uri())],
             &state.models_health,
         )
-        .await;
+        .await
+        .unwrap();
         let buffered = state
             .proxy
             .forward_buffered(&origin.uri(), &json!({"messages": []}), &opts())

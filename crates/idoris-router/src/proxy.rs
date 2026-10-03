@@ -716,9 +716,11 @@ impl ChatProxy {
                             },
                         );
                     }
-                    // Redirects and 5xx responses do not prove the POST was
-                    // not executed; retain their fingerprint through the window.
-                    if (300..400).contains(&status) || (500..600).contains(&status) {
+                    // Redirects, request timeouts, and 5xx responses do not
+                    // prove the POST was not executed; retain their
+                    // fingerprint through the window.
+                    if (300..400).contains(&status) || status == 408 || (500..600).contains(&status)
+                    {
                         *uncertain = true;
                     }
                     return ForwardOutcome {

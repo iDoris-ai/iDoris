@@ -2,8 +2,9 @@
 //! omlx-backend.ts` on `main` (FU-16) behavior, ported onto
 //! `idoris_backend::RuntimeAdapter`. Talks to `http://127.0.0.1:8088` by
 //! default. Split across submodules that landed across several PRs on this
-//! stack: [`http`] (GET/POST/PUT + timeout + safe errors), [`status`]
-//! (`list`/`status` parsing), [`pin`] (resident/admin-session gap), and
+//! stack: [`http`] (GET/POST + timeout + safe errors), [`status`]
+//! (`list`/`status` parsing), [`pin`] (pin verification), [`admin`]
+//! (cached admin session), and
 //! [`OmlxAdapter`], which wires all of it into a full
 //! [`idoris_backend::RuntimeAdapter`] impl (this PR) — `OmlxAdapter`'s own
 //! inherent methods (used directly by this module's tests throughout the
@@ -14,11 +15,16 @@
 //! **The API key is read from an env var and never logged** — see
 //! [`OMLX_API_KEY_ENV`] and `http`'s module doc.
 
+mod admin;
+#[cfg(test)]
+mod admin_tests;
 mod http;
 mod pin;
 mod status;
 
 use std::time::Duration;
+
+use admin::AdminRequestError;
 
 use idoris_backend::{
     BackendError, BackendStatus, ChatRequest, ChatResponse, ModelInfo, RuntimeAdapter,
@@ -68,11 +74,21 @@ pub(crate) fn upstream_error(message: impl Into<String>) -> BackendError {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct OmlxAdapterConfig {
     pub base_url: String,
     pub api_key: Option<String>,
     pub call_timeout: Duration,
+}
+
+impl std::fmt::Debug for OmlxAdapterConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OmlxAdapterConfig")
+            .field("base_url", &self.base_url)
+            .field("api_key", &self.api_key.as_ref().map(|_| "[REDACTED]"))
+            .field("call_timeout", &self.call_timeout)
+            .finish()
+    }
 }
 
 impl Default for OmlxAdapterConfig {
@@ -94,6 +110,8 @@ pub struct OmlxAdapter {
     api_key: Option<String>,
     call_timeout: Duration,
     client: reqwest::Client,
+    admin_session: tokio::sync::Mutex<Option<reqwest::header::HeaderValue>>,
+    load_fence_path: Option<std::path::PathBuf>,
 }
 
 impl OmlxAdapter {
@@ -105,7 +123,17 @@ impl OmlxAdapter {
             api_key: config.api_key,
             call_timeout: config.call_timeout,
             client,
+            admin_session: tokio::sync::Mutex::new(None),
+            load_fence_path: None,
         })
+    }
+
+    /// Override the durable Supervisor load marker location. Every adapter
+    /// controlling the same engine must use the same persistent path, including
+    /// after a Router restart. A fresh path is only safe for a fresh engine.
+    pub fn with_load_fence_path(mut self, path: std::path::PathBuf) -> Self {
+        self.load_fence_path = Some(path);
+        self
     }
 
     fn api_key(&self) -> Option<&str> {
@@ -137,18 +165,6 @@ impl OmlxAdapter {
         .await
     }
 
-    async fn put(&self, path: &str, body: &serde_json::Value) -> Result<(), BackendError> {
-        http::put_json(
-            &self.client,
-            &self.base_url,
-            path,
-            self.api_key(),
-            self.call_timeout,
-            body,
-        )
-        .await
-    }
-
     async fn post_parse(
         &self,
         path: &str,
@@ -175,10 +191,18 @@ impl OmlxAdapter {
         Ok(status::parse_list(&self.get("/v1/models").await?))
     }
 
-    /// `GET /api/status` — engine-wide memory/pressure signal and the
-    /// currently-loaded model list (see `status::parse_status`'s doc).
+    /// Memory/loaded models from `/api/status`; pressure prefers admin
+    /// activity. Missing main key, login rejection or activity failure
+    /// preserves the legacy pressure (missing/invalid → `Unknown`).
     pub async fn status(&self) -> Result<BackendStatus, BackendError> {
-        status::parse_status(&self.get("/api/status").await?)
+        let mut result = status::parse_status(&self.get("/api/status").await?)?;
+        if let Ok(activity) = self
+            .admin_request(reqwest::Method::GET, "/admin/api/activity", None)
+            .await
+        {
+            result.pressure = status::parse_activity_pressure(&activity);
+        }
+        Ok(result)
     }
 
     /// `POST /v1/models/{id}/load`, then confirm the resulting pin state
@@ -186,10 +210,10 @@ impl OmlxAdapter {
     /// A `policy` of `None`, or any mode other than `Resident`, takes the
     /// non-resident path.
     ///
-    /// If the `POST` result is unknown, or it succeeds and a later step
-    /// fails, the model may be resident. Such failures are reported as
-    /// [`BackendError::LoadUnconfirmed`], never as a plain rejection — see
-    /// `RuntimeAdapter::load`'s error contract.
+    /// If the `POST` result is unknown, or a later check cannot establish
+    /// loaded state, the model may be resident and the error is
+    /// [`BackendError::LoadUnconfirmed`]. Once loaded state is confirmed,
+    /// deterministic policy failures use `LoadPostconditionFailed`.
     pub async fn load(&self, id: &str, policy: Option<&LoadPolicy>) -> Result<(), BackendError> {
         http::post_load(
             &self.client,
@@ -205,7 +229,10 @@ impl OmlxAdapter {
         } else {
             self.check_not_unexpectedly_pinned(id).await
         };
-        confirmed.map_err(|err| BackendError::load_unconfirmed(id, err.to_string()))
+        confirmed.map_err(|err| match err {
+            BackendError::LoadPostconditionFailed { .. } => err,
+            other => BackendError::load_unconfirmed(id, other.to_string()),
+        })
     }
 
     /// `POST /v1/models/{id}/unload`.
@@ -219,20 +246,34 @@ impl OmlxAdapter {
     }
 
     /// `resident` path: `PUT /admin/api/models/{id}/settings` then confirm
-    /// via [`Self::verify_model_state`]. On 0.6.4 the PUT itself always
-    /// fails (401, no admin session) — see the crate module doc — so this
-    /// reports a pin failure (model loaded, pin state unconfirmed)
-    /// rather than silently treating the load as fully successful.
+    /// via [`Self::verify_model_state`]. Uses a lazy admin session; only
+    /// the main API key can log in (sub keys cannot).
     async fn pin(&self, id: &str) -> Result<(), BackendError> {
         let path = self.encoded_path("/admin/api/models/", id, "/settings");
         let body = serde_json::json!({ "is_pinned": true });
-        self.put(&path, &body).await.map_err(|err| {
-            upstream_error(format!(
-                "oMLX pin unavailable for {id}: {err} (0.6.4 requires an admin \
-                     session the inference API key can't provide; model is loaded \
-                     but pin state is unconfirmed)"
-            ))
-        })?;
+        match self
+            .admin_request_classified(reqwest::Method::PUT, &path, Some(&body))
+            .await
+        {
+            Ok(_) => {}
+            Err(AdminRequestError::Definite(err)) => {
+                self.verify_model_state(id).await.map_err(|verify_err| {
+                    upstream_error(format!(
+                        "oMLX pin rejection was definite ({err}), \
+                         but loaded state could not be verified ({verify_err})"
+                    ))
+                })?;
+                return Err(BackendError::load_postcondition_failed(
+                    id,
+                    format!("oMLX confirmed {id} loaded, but pin policy was rejected: {err}"),
+                ));
+            }
+            Err(AdminRequestError::Unknown(err)) => {
+                return Err(upstream_error(format!(
+                    "oMLX pin state unconfirmed for {id}: {err} (admin mutation outcome is unknown)"
+                )));
+            }
+        }
         // A 2xx from PUT doesn't itself confirm the pin took effect —
         // re-check via the read-only status endpoint. A failure at *this*
         // step is a different, weaker claim than the one above: we don't
@@ -248,10 +289,13 @@ impl OmlxAdapter {
         if state.pinned {
             Ok(())
         } else {
-            Err(upstream_error(format!(
-                "oMLX pin unavailable for {id}: PUT succeeded but GET \
+            Err(BackendError::load_postcondition_failed(
+                id,
+                format!(
+                    "oMLX pin unavailable for {id}: PUT succeeded but GET \
                  /v1/models/status still reports pinned=false"
-            )))
+                ),
+            ))
         }
     }
 
@@ -264,11 +308,14 @@ impl OmlxAdapter {
     async fn check_not_unexpectedly_pinned(&self, id: &str) -> Result<(), BackendError> {
         let state = self.verify_model_state(id).await?;
         if state.pinned {
-            Err(upstream_error(format!(
-                "oMLX model {id} is unexpectedly pinned: loaded with a \
+            Err(BackendError::load_postcondition_failed(
+                id,
+                format!(
+                    "oMLX model {id} is unexpectedly pinned: loaded with a \
                  non-resident policy but oMLX reports pinned=true (external \
                  pin state drift)"
-            )))
+                ),
+            ))
         } else {
             Ok(())
         }
@@ -383,6 +430,32 @@ fn is_ready(raw: &serde_json::Value, id: &str) -> bool {
 /// shadowing rule silently doing the right thing.
 #[async_trait::async_trait]
 impl RuntimeAdapter for OmlxAdapter {
+    fn load_fence_path(&self) -> Result<std::path::PathBuf, BackendError> {
+        if let Some(path) = &self.load_fence_path {
+            return Ok(path.clone());
+        }
+        let root = std::env::var_os("IDORIS_STATE_DIR")
+            .map(std::path::PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("HOME")
+                    .map(|home| std::path::PathBuf::from(home).join(".local/state/idoris"))
+            })
+            .filter(|path| path.is_absolute())
+            .ok_or_else(|| {
+                BackendError::internal(
+                    "a persistent absolute IDORIS_STATE_DIR or HOME is required for the load fence",
+                )
+            })?;
+        let mut endpoint = reqwest::Url::parse(&self.base_url)
+            .map_err(|_| BackendError::internal("invalid oMLX endpoint for load fence"))?;
+        // Credentials and fragments do not identify a different engine.
+        let _ = endpoint.set_username("");
+        let _ = endpoint.set_password(None);
+        endpoint.set_fragment(None);
+        let key = utf8_percent_encode(endpoint.as_str().trim_end_matches('/'), NON_ALPHANUMERIC);
+        Ok(root.join("omlx").join(key.to_string()).join("load.pending"))
+    }
+
     async fn list(&self) -> Result<Vec<ModelInfo>, BackendError> {
         Self::list(self).await
     }
@@ -420,6 +493,33 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::*;
+
+    #[test]
+    fn load_fence_identity_survives_adapter_reconstruction() {
+        let make = |base_url: &str| {
+            OmlxAdapter::new(OmlxAdapterConfig {
+                base_url: base_url.into(),
+                api_key: None,
+                call_timeout: DEFAULT_CALL_TIMEOUT,
+            })
+            .unwrap()
+        };
+        let first = make("http://localhost:8088").load_fence_path().unwrap();
+        let restarted = make("http://LOCALHOST:8088/").load_fence_path().unwrap();
+        assert_eq!(first, restarted);
+        assert_ne!(
+            first,
+            make("http://localhost:8089").load_fence_path().unwrap()
+        );
+        let explicit = idoris_backend::mock::temporary_load_fence_path();
+        assert_eq!(
+            make("http://localhost:8088")
+                .with_load_fence_path(explicit.clone())
+                .load_fence_path()
+                .unwrap(),
+            explicit
+        );
+    }
 
     async fn adapter_for(server: &MockServer) -> OmlxAdapter {
         OmlxAdapter::new(OmlxAdapterConfig {
@@ -498,6 +598,17 @@ mod tests {
         server: &MockServer,
         routes: Vec<(&'static str, &'static str, ResponseTemplate)>,
     ) {
+        if routes.iter().any(|(m, _, _)| *m == "PUT") {
+            Mock::given(method("POST"))
+                .and(path("/admin/api/login"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("set-cookie", "omlx_admin_session=test-session; HttpOnly")
+                        .set_body_json(serde_json::json!({"success": true})),
+                )
+                .mount(server)
+                .await;
+        }
         for (m, p, resp) in routes {
             Mock::given(method(m))
                 .and(path(p))
@@ -546,15 +657,14 @@ mod tests {
 
     #[tokio::test]
     async fn load_resident_fails_when_admin_session_is_rejected() {
-        // The realistic 0.6.4 outcome: PUT .../settings 401s (no admin
-        // session) — the model is loaded but pinning is confirmed to have
-        // failed, not silently treated as a full success.
+        // A sub key cannot establish the required admin session.
         let server = MockServer::start().await;
         mount_all(
             &server,
             vec![
                 (LOAD_METHOD, LOAD_PATH, ResponseTemplate::new(200)),
-                ("PUT", SETTINGS_PATH, ResponseTemplate::new(401)),
+                ("POST", "/admin/api/login", ResponseTemplate::new(401)),
+                ("GET", VERIFY_PATH, status_mock(false)),
             ],
         )
         .await;
@@ -564,8 +674,114 @@ mod tests {
             .await
             .expect_err("must fail when the admin session is rejected");
         let msg = err.to_string();
-        assert!(msg.contains("pin unavailable") && msg.contains("401"));
+        assert_eq!(err.reason_code(), "load_postcondition_failed");
+        assert!(msg.contains("pin policy was rejected") && msg.contains("401"));
         assert!(!msg.contains("test-key-should-never-leak"));
+    }
+
+    #[tokio::test]
+    async fn deterministic_pin_rejections_require_strict_loaded_confirmation() {
+        let rejected_login = ResponseTemplate::new(403);
+        let rejected_put = ResponseTemplate::new(404);
+        for (case, loaded_status) in [
+            ("login 401", status_mock(false)),
+            ("login 403", status_mock(true)),
+            ("missing key", status_mock(false)),
+            ("PUT 404", status_mock(true)),
+        ] {
+            let server = MockServer::start().await;
+            let mut routes = vec![
+                (LOAD_METHOD, LOAD_PATH, ResponseTemplate::new(200)),
+                ("GET", VERIFY_PATH, loaded_status),
+            ];
+            match case {
+                "login 401" => {
+                    routes.push(("POST", "/admin/api/login", ResponseTemplate::new(401)))
+                }
+                "login 403" => routes.push(("POST", "/admin/api/login", rejected_login.clone())),
+                "PUT 404" => {
+                    routes.push(("PUT", SETTINGS_PATH, rejected_put.clone()));
+                }
+                _ => {}
+            }
+            mount_all(&server, routes).await;
+            let mut adapter = adapter_for(&server).await;
+            if case == "missing key" {
+                adapter.api_key = None;
+            }
+            let err = adapter
+                .load("qwen3-8b", Some(&resident_policy()))
+                .await
+                .unwrap_err();
+            assert_eq!(
+                err.reason_code(),
+                "load_postcondition_failed",
+                "{case}: {err}"
+            );
+        }
+
+        for verification in [
+            ResponseTemplate::new(404),
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({"models": [{"id":"another-model", "loaded":true, "pinned":false}]})),
+            ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"models": [{"id":"qwen3-8b", "loaded":false, "pinned":false}]}),
+            ),
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({"models": [
+                {"id":"qwen3-8b", "loaded":true, "pinned":false},
+                {"id":"qwen3-8b", "loaded":true, "pinned":true}
+            ]})),
+            ResponseTemplate::new(200).set_body_string("not-json"),
+        ] {
+            let server = MockServer::start().await;
+            mount_all(
+                &server,
+                vec![
+                    (LOAD_METHOD, LOAD_PATH, ResponseTemplate::new(200)),
+                    ("POST", "/admin/api/login", ResponseTemplate::new(401)),
+                    ("GET", VERIFY_PATH, verification),
+                ],
+            )
+            .await;
+            let err = adapter_for(&server)
+                .await
+                .load("qwen3-8b", Some(&resident_policy()))
+                .await
+                .unwrap_err();
+            assert_eq!(err.reason_code(), "load_unconfirmed", "{err}");
+        }
+    }
+
+    #[tokio::test]
+    async fn ambiguous_pin_mutations_stay_unconfirmed_even_if_status_is_loaded() {
+        for response in [
+            ResponseTemplate::new(408),
+            ResponseTemplate::new(500),
+            ResponseTemplate::new(200).set_delay(Duration::from_secs(1)),
+        ] {
+            let server = MockServer::start().await;
+            mount_all(
+                &server,
+                vec![
+                    (LOAD_METHOD, LOAD_PATH, ResponseTemplate::new(200)),
+                    ("PUT", SETTINGS_PATH, response),
+                    ("GET", VERIFY_PATH, status_mock(true)),
+                ],
+            )
+            .await;
+            let adapter = adapter_for(&server).await;
+            let err = adapter
+                .load("qwen3-8b", Some(&resident_policy()))
+                .await
+                .unwrap_err();
+            assert_eq!(err.reason_code(), "load_unconfirmed", "{err}");
+            let requests = server.received_requests().await.unwrap();
+            assert!(
+                !requests
+                    .iter()
+                    .any(|request| request.url.path() == VERIFY_PATH)
+            );
+        }
     }
 
     #[tokio::test]
@@ -585,6 +801,7 @@ mod tests {
             .await
             .expect_err("must fail on undeclared external pin");
         assert!(err.to_string().contains("unexpectedly pinned"));
+        assert_eq!(err.reason_code(), "load_postcondition_failed");
     }
 
     #[tokio::test]
@@ -624,33 +841,29 @@ mod tests {
             .await
             .expect_err("PUT 2xx must not be trusted without verification");
         assert!(err.to_string().contains("still reports pinned=false"));
+        assert_eq!(err.reason_code(), "load_postcondition_failed");
     }
 
-    /// prdaemon #48 round 2, M1: once `POST .../load` has succeeded, a
-    /// failing follow-up check must be reported as `LoadUnconfirmed` (the
-    /// model may be resident), not as a plain rejection.
+    /// Once `POST .../load` has succeeded, unknown verification results
+    /// remain unconfirmed; a fully parsed
+    /// loaded entry with externally pinned state is a known policy failure.
     #[tokio::test]
     async fn a_failure_after_the_load_post_is_reported_as_unconfirmed() {
-        for (verify, label) in [
-            (ResponseTemplate::new(503), "status 503"),
-            (status_mock(true), "external pin drift"),
-        ] {
-            let server = MockServer::start().await;
-            mount_all(
-                &server,
-                vec![
-                    (LOAD_METHOD, LOAD_PATH, ResponseTemplate::new(200)),
-                    ("GET", VERIFY_PATH, verify),
-                ],
-            )
-            .await;
-            let err = adapter_for(&server)
-                .await
-                .load("qwen3-8b", None)
-                .await
-                .expect_err(label);
-            assert_eq!(err.reason_code(), "load_unconfirmed", "{label}: {err}");
-        }
+        let server = MockServer::start().await;
+        mount_all(
+            &server,
+            vec![
+                (LOAD_METHOD, LOAD_PATH, ResponseTemplate::new(200)),
+                ("GET", VERIFY_PATH, ResponseTemplate::new(503)),
+            ],
+        )
+        .await;
+        let err = adapter_for(&server)
+            .await
+            .load("qwen3-8b", None)
+            .await
+            .unwrap_err();
+        assert_eq!(err.reason_code(), "load_unconfirmed");
     }
 
     /// Negative contrast: a rejected `POST .../load` allocated nothing and
@@ -706,7 +919,11 @@ mod tests {
             assert_eq!(err.reason_code(), "load_unconfirmed", "{err}");
             assert!(!err.to_string().contains("test-key-should-never-leak"));
             let requests = server.received_requests().await.expect("requests");
-            assert_eq!(requests.len(), if pin_timeout { 2 } else { 1 });
+            assert_eq!(requests.len(), if pin_timeout { 3 } else { 1 });
+            if pin_timeout {
+                assert_eq!(requests[1].url.path(), "/admin/api/login");
+                assert_eq!(requests[2].url.path(), SETTINGS_PATH);
+            }
         }
     }
 
@@ -722,6 +939,7 @@ mod tests {
                 let paths: &[&[u8]] = if pin_disconnect {
                     &[
                         b"POST /v1/models/qwen3-8b/load ",
+                        b"POST /admin/api/login ",
                         b"PUT /admin/api/models/qwen3-8b/settings ",
                     ]
                 } else {
@@ -734,15 +952,40 @@ mod tests {
                         request.push(socket.read_u8().await.expect("request headers"));
                     }
                     assert!(request.starts_with(prefix));
-                    if pin_disconnect && index == 0 {
-                        socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.expect("load response");
+                    if pin_disconnect && index == 1 {
+                        let headers = String::from_utf8_lossy(&request);
+                        let content_length = headers
+                            .lines()
+                            .find_map(|line| {
+                                line.to_ascii_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .and_then(|value| value.trim().parse::<usize>().ok())
+                            })
+                            .expect("login content length");
+                        let body_start = request.len();
+                        while request.len() - body_start < content_length {
+                            request.push(socket.read_u8().await.expect("login body"));
+                        }
+                        socket
+                            .write_all(
+                                b"HTTP/1.1 200 OK\r\nContent-Length: 16\r\nSet-Cookie: omlx_admin_session=test-cookie; Path=/\r\nConnection: close\r\n\r\n{\"success\":true}",
+                            )
+                            .await
+                            .expect("login response");
+                    } else if pin_disconnect && index == 0 {
+                        socket
+                            .write_all(
+                                b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                            )
+                            .await
+                            .expect("load response");
                     }
                     // Close the mutation connection before returning headers.
                 }
             });
             let adapter = OmlxAdapter::new(OmlxAdapterConfig {
                 base_url: format!("http://{addr}"),
-                api_key: None,
+                api_key: Some("test-admin-key".into()),
                 call_timeout: Duration::from_secs(1),
             })
             .expect("adapter");
@@ -751,7 +994,10 @@ mod tests {
                 .load("qwen3-8b", policy.as_ref())
                 .await
                 .expect_err("connection closed");
-            received.await.expect("server received the mutation");
+            tokio::time::timeout(Duration::from_secs(3), received)
+                .await
+                .expect("server request sequence timed out")
+                .expect("server received the mutation");
             assert_eq!(err.reason_code(), "load_unconfirmed", "{err}");
         }
     }

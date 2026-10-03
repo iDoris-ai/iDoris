@@ -407,12 +407,14 @@ pub async fn dispatch_local(
     let _cancel_guard = CancelOnDrop(cancel.clone());
 
     let supervisor = &supervisor.handle;
-    let status = supervisor.status().await;
-    let already_loaded = matches!(&status, Ok(s) if s.loaded.iter().any(|m| m == &model_id));
-    if !already_loaded
-        && let Err(err) = supervisor
-            .load(model_id.clone(), PLACEHOLDER_MEMORY_GB, load_policy)
-            .await
+    // `status.loaded` reports engine residency, which may have been
+    // inherited after a Supervisor restart while the model is still in
+    // Error (not yet adopted and policy-checked). Always pass through the
+    // Supervisor's idempotent load path before chatting so it can establish
+    // readiness and apply the requested policy.
+    if let Err(err) = supervisor
+        .load(model_id.clone(), PLACEHOLDER_MEMORY_GB, load_policy)
+        .await
     {
         return Ok(ChatOutcome {
             decision,
@@ -481,7 +483,7 @@ pub fn reason_header_value(reasons: &[ReasonCode]) -> String {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-    use idoris_backend::{MockAdapter, ModelInfo, Supervisor, SupervisorConfig};
+    use idoris_backend::{MockAdapter, ModelInfo, RuntimeAdapter, Supervisor, SupervisorConfig};
     use idoris_contracts::TaskProfile;
     use idoris_contracts::common::PrivacyClass;
     use idoris_contracts::common::Tier;
@@ -596,6 +598,61 @@ mod tests {
         let response = outcome.result.unwrap();
         assert_eq!(response.model, "a");
         assert!(response.content.contains("hello"));
+    }
+
+    #[tokio::test]
+    async fn dispatch_adopts_inherited_residency_and_applies_policy() {
+        let adapter = Arc::new(MockAdapter::new(vec![ModelInfo {
+            id: "a".to_string(),
+            memory_gb: 1.0,
+        }]));
+        let inherited_policy = LoadPolicy {
+            mode: LoadMode::OnDemand,
+            keepalive: Keepalive::IdleTtl { idle_ttl_s: 60 },
+            admission: Admission::Coexist,
+        };
+        // Simulate an engine that kept the model resident while its
+        // Supervisor was restarted.
+        adapter.load("a", Some(&inherited_policy)).await.unwrap();
+
+        let mut card = local_card("a");
+        let requested_policy = LoadPolicy {
+            mode: LoadMode::Resident,
+            keepalive: Keepalive::Pinned { pinned: true },
+            admission: Admission::Coexist,
+        };
+        card.load_policy = Some(requested_policy);
+        let supervisor = Supervisor::spawn(adapter.clone(), SupervisorConfig::default()).unwrap();
+        let supervisor = BoundSupervisor::new(&card, supervisor);
+        let messages = vec![ChatMessage {
+            role: "user".to_string(),
+            content: "hello".to_string(),
+        }];
+
+        for _ in 0..2 {
+            let outcome = dispatch_local(
+                &[card.clone()],
+                Some(&supervisor),
+                None,
+                &empty_profile(),
+                "hello",
+                messages.clone(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            let response = outcome.result.unwrap();
+            assert_eq!(response.model, "a");
+            assert!(response.content.contains("hello"));
+        }
+
+        assert_eq!(
+            adapter.effective_policy("a").unwrap(),
+            Some(requested_policy)
+        );
+        // One adapter load adopts the inherited model and applies the new
+        // policy; the repeated dispatch is an idempotent no-op.
+        assert_eq!(adapter.load_call_count("a"), 2); // one pre-spawn, one adoption
     }
 
     fn paid_card(id: &str) -> ComponentCard {

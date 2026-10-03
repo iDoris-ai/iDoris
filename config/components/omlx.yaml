@@ -7,7 +7,7 @@ provider:
   cost: { input_per_m: 0, output_per_m: 0 }
   locality: loopback
 form: http_service
-endpoint: "http://127.0.0.1:8088"
+endpoint: "http://127.0.0.1:8000"
 version_pin: "omlx@0.6.4"
 privacy_class: local_only
 allowed_egress: [loopback]
