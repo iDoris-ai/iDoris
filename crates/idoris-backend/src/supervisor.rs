@@ -149,6 +149,9 @@ enum LoadFailureOutcome {
     /// Land on this state, keeping whatever policy/memory_gb `handle_load`
     /// already wrote into the slot.
     Settle(ModelState),
+    /// Settle after a confirmed release and use its fresh aggregate snapshot
+    /// to rebase startup residency accounting.
+    SettleReleased(BackendStatus),
     /// A definite rejection leaves the previous instance's state, policy,
     /// and footprint untouched.
     RestorePrevious(PreviousModel),
@@ -430,6 +433,9 @@ fn set_state_or_poison(
     match models.get_mut(id) {
         Some(slot) => {
             slot.state = state;
+            if state == ModelState::Stopped {
+                slot.inherited = false;
+            }
             Ok(())
         }
         None => Err(format!("ledger has no entry for {id:?}")),
@@ -669,19 +675,38 @@ async fn run_load_flow(
         && err.is_oom()
     {
         // Never retry an OOM while allocation/release remains unconfirmed.
-        if confirm_memory_released(
+        let release = confirm_memory_released(
             &adapter,
             std::slice::from_ref(&id),
             release_limits.target_absent_gb,
             &config,
         )
-        .await
-        .is_err()
-        {
-            let state =
+        .await;
+        if release.is_err() {
+            let cleanup_status =
                 best_effort_release(&adapter, &id, release_limits.target_absent_gb, &config).await;
             let failure_outcome = if load_fence.clear().is_ok() {
-                LoadFailureOutcome::after_release(state, previous)
+                match cleanup_status {
+                    Some(status) => LoadFailureOutcome::SettleReleased(status),
+                    None => LoadFailureOutcome::after_release(ModelState::Error, previous),
+                }
+            } else {
+                LoadFailureOutcome::RetainUnconfirmedLoad(previous)
+            };
+            return OpOutcome::Load {
+                result: attempt,
+                victim_results,
+                failure_outcome,
+            };
+        }
+        // An inherited request was admitted with a discount for residency
+        // already included in the startup aggregate. Once OOM cleanup proves
+        // that residency is gone, the same discounted charge cannot safely
+        // be used for an immediate retry. End this attempt and let a later
+        // request enter normal admission with a fresh estimate.
+        if inherited && let Ok(status) = release {
+            let failure_outcome = if load_fence.clear().is_ok() {
+                LoadFailureOutcome::SettleReleased(status)
             } else {
                 LoadFailureOutcome::RetainUnconfirmedLoad(previous)
             };
@@ -783,17 +808,16 @@ async fn best_effort_release(
     id: &str,
     max_used_gb: f64,
     config: &SupervisorConfig,
-) -> ModelState {
+) -> Option<BackendStatus> {
     if with_adapter_timeout(adapter.unload(id), config.adapter_call_timeout, id)
         .await
         .is_ok()
-        && confirm_memory_released(adapter, &[id.to_string()], max_used_gb, config)
-            .await
-            .is_ok()
+        && let Ok(status) =
+            confirm_memory_released(adapter, &[id.to_string()], max_used_gb, config).await
     {
-        ModelState::Stopped
+        Some(status)
     } else {
-        ModelState::Error
+        None
     }
 }
 
@@ -1579,6 +1603,14 @@ async fn run_actor(
                             LoadFailureOutcome::Settle(state) => {
                                 if let Err(e) = set_state_or_poison(&mut models, &id, state) {
                                     violation = Some(e);
+                                }
+                            }
+                            LoadFailureOutcome::SettleReleased(status) => {
+                                match set_state_or_poison(&mut models, &id, ModelState::Stopped) {
+                                    Err(e) => violation = Some(e),
+                                    Ok(()) => {
+                                        env.reserved_gb = env.reserved_gb.min(status.used_gb);
+                                    }
                                 }
                             }
                             LoadFailureOutcome::RestorePrevious(mut previous)

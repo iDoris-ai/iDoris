@@ -266,11 +266,123 @@ async fn inherited_cleanup_after_oom_can_release_remaining_reservation() {
     assert!(handle.load("a", 20.0, policy()).await.is_err());
     assert_eq!(adapter.status().await.unwrap().used_gb, 0.0);
     assert!(handle.status().await.unwrap().loaded.is_empty());
-    // Cleanup stopped A, but the aggregate reservation still needs a
-    // confirmed refresh. An explicit unload must not take the no-op path.
-    handle.unload("a").await.unwrap();
-    assert_eq!(handle.status().await.unwrap().used_gb, 0.0);
+    // Confirmed cleanup releases A's inherited reservation immediately.
     handle.load("b", 24.0, policy()).await.unwrap();
+}
+
+#[tokio::test]
+async fn confirmed_oom_cleanup_does_not_reuse_inherited_reservation_on_retry() {
+    let adapter = Arc::new(MockAdapter::new(models(&[
+        ("a", 8.0),
+        ("b", 8.0),
+        ("c", 8.0),
+        ("d", 16.0),
+    ])));
+    for id in ["a", "b", "c"] {
+        adapter.load(id, Some(&inherited_policy())).await.unwrap();
+    }
+    adapter.set_load_script("a", vec![LoadOutcome::Oom]);
+
+    let mut limits = config(24.0);
+    limits.release_confirm_max_attempts = 1;
+    limits.release_confirm_interval = Duration::ZERO;
+    let handle = Supervisor::spawn(adapter.clone(), limits).unwrap();
+    assert_eq!(handle.status().await.unwrap().used_gb, 24.0);
+
+    assert!(handle.load("a", 8.0, policy()).await.is_err());
+    assert_eq!(adapter.status().await.unwrap().used_gb, 16.0);
+    assert_eq!(handle.status().await.unwrap().used_gb, 16.0);
+
+    handle.unload("b").await.unwrap();
+    assert_eq!(adapter.status().await.unwrap().used_gb, 8.0);
+    assert_eq!(handle.status().await.unwrap().used_gb, 8.0);
+
+    // Retry A directly after confirmed cleanup; no explicit unload(A) should
+    // be needed to clear its inherited identity or reservation.
+    handle.load("a", 8.0, policy()).await.unwrap();
+    assert_eq!(adapter.status().await.unwrap().used_gb, 16.0);
+    assert_eq!(handle.status().await.unwrap().used_gb, 16.0);
+
+    // C and retried A use 16GB, so D's 16GB cannot fit in the 24GB budget.
+    assert!(handle.load("d", 16.0, policy()).await.is_err());
+    assert_eq!(adapter.load_call_count("d"), 0);
+    assert_eq!(adapter.status().await.unwrap().used_gb, 16.0);
+}
+
+/// Models engines that free an inherited allocation as part of rejecting an
+/// OOM load, before the Supervisor can issue a cleanup unload.
+struct OomReleasesBeforeReturnAdapter {
+    mock: MockAdapter,
+}
+
+#[async_trait::async_trait]
+impl RuntimeAdapter for OomReleasesBeforeReturnAdapter {
+    fn load_fence_path(&self) -> Result<std::path::PathBuf, BackendError> {
+        self.mock.load_fence_path()
+    }
+
+    async fn list(&self) -> Result<Vec<ModelInfo>, BackendError> {
+        self.mock.list().await
+    }
+
+    async fn load(&self, id: &str, load_policy: Option<&LoadPolicy>) -> Result<(), BackendError> {
+        let result = self.mock.load(id, load_policy).await;
+        if result.as_ref().is_err_and(|err| err.is_oom()) {
+            self.mock.unload(id).await?;
+        }
+        result
+    }
+
+    async fn unload(&self, id: &str) -> Result<(), BackendError> {
+        self.mock.unload(id).await
+    }
+
+    async fn status(&self) -> Result<BackendStatus, BackendError> {
+        self.mock.status().await
+    }
+
+    async fn probe_ready(&self, id: &str) -> Result<bool, BackendError> {
+        self.mock.probe_ready(id).await
+    }
+
+    async fn chat(
+        &self,
+        req: ChatRequest,
+        cancel: CancellationToken,
+    ) -> Result<ChatResponse, BackendError> {
+        self.mock.chat(req, cancel).await
+    }
+}
+
+#[tokio::test]
+async fn inherited_oom_released_by_engine_requires_fresh_admission() {
+    let mock = MockAdapter::new(models(&[("a", 8.0), ("b", 8.0), ("c", 8.0), ("d", 16.0)]));
+    for id in ["a", "b", "c"] {
+        mock.load(id, Some(&inherited_policy())).await.unwrap();
+    }
+    let initial_a_loads = mock.load_call_count("a");
+    mock.set_load_script("a", vec![LoadOutcome::Oom]);
+    let adapter = Arc::new(OomReleasesBeforeReturnAdapter { mock });
+
+    let mut limits = config(24.0);
+    limits.release_confirm_max_attempts = 1;
+    limits.release_confirm_interval = Duration::ZERO;
+    let handle = Supervisor::spawn(adapter.clone(), limits).unwrap();
+    assert_eq!(handle.status().await.unwrap().used_gb, 24.0);
+
+    assert!(handle.load("a", 8.0, policy()).await.is_err());
+    assert_eq!(adapter.mock.load_call_count("a"), initial_a_loads + 1);
+    assert_eq!(adapter.status().await.unwrap().used_gb, 16.0);
+    assert_eq!(handle.status().await.unwrap().used_gb, 16.0);
+
+    handle.unload("b").await.unwrap();
+    handle.load("a", 8.0, policy()).await.unwrap();
+    assert_eq!(adapter.status().await.unwrap().used_gb, 16.0);
+    assert_eq!(handle.status().await.unwrap().used_gb, 16.0);
+
+    assert!(handle.load("d", 16.0, policy()).await.is_err());
+    assert_eq!(adapter.mock.load_call_count("d"), 0);
+    assert_eq!(adapter.status().await.unwrap().used_gb, 16.0);
 }
 
 #[tokio::test]
