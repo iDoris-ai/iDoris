@@ -63,23 +63,6 @@ impl BoundSupervisor {
     }
 }
 
-/// Restrict candidates using YAML before selection on either execution
-/// path. The existing pipeline still enforces trusted-local privacy and
-/// its deterministic ordering. `capability`/`load` remain TS metadata.
-pub fn policy_cards(
-    cards: &[ComponentCard],
-    policy: &idoris_contracts::RoutingPolicy,
-    profile: &ParsedProfile,
-) -> (Vec<ComponentCard>, bool) {
-    let route = crate::routing_policy::decide(policy, &profile.task);
-    let cards = cards
-        .iter()
-        .filter(|card| route.tiers.contains(&card.provider.tier))
-        .cloned()
-        .collect();
-    (cards, route.fail_closed)
-}
-
 /// Fallback for a card that doesn't declare its own `load_policy` — cards
 /// should normally declare one (interface spec §3.3); this only covers one
 /// that omits it, so a missing field doesn't turn into a panic/`expect`.

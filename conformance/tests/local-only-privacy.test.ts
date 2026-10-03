@@ -26,6 +26,12 @@ const postChat = (headers: Record<string, string> = {}) =>
     headers: { "content-type": "application/json", ...headers },
     body: JSON.stringify({ model: "idoris/daily", messages: [{ role: "user", content: "hi" }] }),
   });
+const postLocalChat = (baseUrl: string) =>
+  fetch(baseUrl + "/v1/chat/completions", {
+    method: "POST",
+    headers: { "content-type": "application/json", "x-idoris-privacy": "local_only" },
+    body: JSON.stringify({ model: "idoris/daily", messages: [{ role: "user", content: "hi" }] }),
+  });
 
 describe("privacy=local_only fail-closed（唯一候选是远程后端）", () => {
   it("缺省（未带 Privacy header）按 local_only 处理 => 503，远程出站 0 次", async () => {
@@ -70,11 +76,7 @@ describe("loopback 卡的 provider/card privacy=any 不满足 local_only", () =>
         componentsDir: makeComponentsDir([anyCard]),
         routingPolicyPath: routingPolicyFixturePath,
       });
-      const rejected = await fetch(localServer.baseUrl + "/v1/chat/completions", {
-        method: "POST",
-        headers: { "content-type": "application/json", "x-idoris-privacy": "local_only" },
-        body: JSON.stringify({ model: "idoris/daily", messages: [{ role: "user", content: "hi" }] }),
-      });
+      const rejected = await postLocalChat(localServer.baseUrl);
       expect(rejected.status).toBe(503);
       expect((await rejected.json() as { error: { type: string } }).error.type).toBe("local_only_unavailable");
       expect(localUpstream.chatCount()).toBe(0);
@@ -84,11 +86,7 @@ describe("loopback 卡的 provider/card privacy=any 不满足 local_only", () =>
         routingPolicyPath: routingPolicyFixturePath,
       });
       localUpstream.queueChat({ kind: "json", body: { choices: [{ message: { content: "local-ok" } }] } });
-      const accepted = await fetch(localServer.baseUrl + "/v1/chat/completions", {
-        method: "POST",
-        headers: { "content-type": "application/json", "x-idoris-privacy": "local_only" },
-        body: JSON.stringify({ model: "idoris/daily", messages: [{ role: "user", content: "hi" }] }),
-      });
+      const accepted = await postLocalChat(localServer.baseUrl);
       expect(accepted.status).toBe(200);
       expect(accepted.headers.get("x-idoris-served-locality")).toBe("loopback");
       expect(await accepted.json()).toMatchObject({ choices: [{ message: { content: "local-ok" } }] });

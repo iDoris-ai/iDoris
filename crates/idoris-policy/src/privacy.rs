@@ -79,26 +79,18 @@ mod tests {
     }
 
     #[test]
-    fn local_capable_rejects_any_privacy_on_a_loopback_card() {
+    fn local_capable_rejects_privacy_egress_and_effective_locality_violations() {
         let mut card = sample_card("local", &[]);
         card.component.privacy_class = PrivacyClass::Any;
         assert!(!is_local_capable(&card));
-    }
-
-    #[test]
-    fn local_capable_rechecks_egress_without_registration() {
-        let mut card = sample_card("local", &[]);
+        card.component.privacy_class = PrivacyClass::LocalOnly;
         for egress in [Egress::Lan, Egress::Internet] {
             for allowed in [vec![egress], vec![Egress::Loopback, egress]] {
                 card.component.allowed_egress = allowed;
                 assert!(!is_local_capable(&card));
             }
         }
-    }
-
-    #[test]
-    fn local_capable_requires_effective_loopback_even_for_relays() {
-        let mut card = sample_card("local", &[]);
+        card.component.allowed_egress = vec![Egress::None];
         for locality in [Locality::Lan, Locality::Remote] {
             card.component.provider.locality = locality;
             assert!(!is_local_capable(&card));

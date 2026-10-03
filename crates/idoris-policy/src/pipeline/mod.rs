@@ -369,14 +369,8 @@ mod local_capable_tests {
                 .unwrap();
                 assert_eq!(chosen.chosen_id, "trusted");
             }
-            assert!(
-                decide(
-                    &request(Some(PrivacyClass::Any)),
-                    &[card],
-                    &PolicyCtx::default()
-                )
-                .is_ok()
-            );
+            let unrestricted = request(Some(PrivacyClass::Any));
+            assert!(decide(&unrestricted, &[card], &PolicyCtx::default()).is_ok());
         }
     }
 
