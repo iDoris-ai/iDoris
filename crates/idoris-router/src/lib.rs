@@ -169,10 +169,9 @@ pub struct AppState {
     /// Startup-validated YAML routing policy. Tests use an in-memory local
     /// default so `AppState::default()` performs no filesystem I/O.
     pub routing_policy: idoris_contracts::RoutingPolicy,
-    /// Backs the local dispatch path (R2-D task 3); `None` means no local
-    /// backend is wired — dispatch then fails closed as
-    /// `local_only_unavailable` rather than panicking on a missing handle.
-    pub supervisor: Option<dispatch::BoundSupervisor>,
+    /// Lifecycle runtimes keyed by provider id. Missing selected providers
+    /// fail closed instead of falling through to another backend.
+    pub runtimes: runtime::RuntimeRegistry,
     /// Gates every candidate, including zero cost, through the ledger's
     /// SpendGate. `None` fails paid candidates closed while free candidates
     /// remain usable without a ledger. `Arc`
@@ -200,7 +199,7 @@ impl std::fmt::Debug for AppState {
             .field("deploy_mode", &self.deploy_mode)
             .field("cards", &self.cards)
             .field("routing_policy", &self.routing_policy)
-            .field("supervisor", &self.supervisor)
+            .field("runtimes", &self.runtimes)
             .field(
                 "budget_ledger",
                 &self.budget_ledger.as_ref().map(|_| "BudgetLedger { .. }"),
@@ -234,7 +233,7 @@ impl Default for AppState {
                     },
                 },
             },
-            supervisor: None,
+            runtimes: runtime::RuntimeRegistry::default(),
             budget_ledger: None,
             models_health: Arc::new(health::HealthTracker::default()),
             proxy: Arc::new(proxy::ChatProxy::new(http_client.clone())),
@@ -648,10 +647,13 @@ async fn chat_completions(
     // is dropped mid-request (e.g. a future connection-level timeout or
     // abort layered on top) -- genuinely different from, and strictly
     // better than, a listener that structurally can never fire.
+    let supervisor = dispatch::select(&cards, &parsed, &prompt)
+        .ok()
+        .and_then(|selected| state.runtimes.get(&selected.card.provider.id));
     let budget_ledger = state.budget_ledger.as_deref();
     match dispatch_local(
         &cards,
-        state.supervisor.as_ref(),
+        supervisor,
         budget_ledger,
         &parsed,
         &prompt,
@@ -1187,7 +1189,7 @@ mod tests {
                 .unwrap();
         let state = AppState {
             cards: vec![card.clone()],
-            supervisor: Some(dispatch::BoundSupervisor::new(&card, supervisor)),
+            runtimes: Some(dispatch::BoundSupervisor::new(&card, supervisor)).into(),
             ..AppState::default()
         };
         let app = build_app(state);
@@ -1300,10 +1302,11 @@ mod tests {
                 .unwrap();
         let state = AppState {
             cards: vec![paid_component_card("paid-1")],
-            supervisor: Some(dispatch::BoundSupervisor::new(
+            runtimes: Some(dispatch::BoundSupervisor::new(
                 &paid_component_card("paid-1"),
                 supervisor,
-            )),
+            ))
+            .into(),
             budget_ledger: Some(std::sync::Arc::new(ledger)),
             ..AppState::default()
         };

@@ -96,7 +96,7 @@ async fn yaml_policy_gates_proxy_and_supervisor_and_preserves_privacy() {
             };
             let app = build_app(AppState {
                 cards,
-                supervisor: bound,
+                runtimes: bound.into(),
                 routing_policy: policy(tier, fail_closed),
                 ..AppState::default()
             });
@@ -194,7 +194,7 @@ async fn local_only_request_cannot_use_policy_selected_remote_candidate() {
         let bound = dispatch::BoundSupervisor::new(&card, supervisor);
         let response = build_app(AppState {
             cards: vec![card],
-            supervisor: Some(bound),
+            runtimes: Some(bound).into(),
             routing_policy: policy("remote", false),
             budget_ledger: Some(Arc::new(ledger)),
             ..AppState::default()
@@ -238,7 +238,7 @@ async fn concrete_model_validation_uses_the_policy_filtered_candidate() {
         idoris_backend::Supervisor::spawn(adapter.clone(), Default::default()).unwrap();
     let response = build_app(AppState {
         cards: vec![local, remote.clone()],
-        supervisor: Some(dispatch::BoundSupervisor::new(&remote, supervisor)),
+        runtimes: Some(dispatch::BoundSupervisor::new(&remote, supervisor)).into(),
         routing_policy: policy("remote", false),
         ..AppState::default()
     })
@@ -296,7 +296,7 @@ async fn yaml_policy_precedes_budget_on_both_execution_paths() {
             let bound = dispatch::BoundSupervisor::new(&card, supervisor);
             let response = build_app(AppState {
                 cards: vec![card],
-                supervisor: Some(bound),
+                runtimes: Some(bound).into(),
                 routing_policy: policy(tier, false),
                 budget_ledger: Some(Arc::new(ledger)),
                 ..AppState::default()
@@ -338,7 +338,7 @@ async fn yaml_selected_paid_candidate_reaches_supervisor_admission_after_budget(
         idoris_backend::Supervisor::spawn(adapter.clone(), Default::default()).unwrap();
     let response = build_app(AppState {
         cards: vec![card.clone()],
-        supervisor: Some(dispatch::BoundSupervisor::new(&card, supervisor)),
+        runtimes: Some(dispatch::BoundSupervisor::new(&card, supervisor)).into(),
         routing_policy: policy("local", true),
         budget_ledger: Some(Arc::new(ledger)),
         ..AppState::default()

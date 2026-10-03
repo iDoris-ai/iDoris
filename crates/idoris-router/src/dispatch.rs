@@ -41,6 +41,10 @@ impl BoundSupervisor {
         }
     }
 
+    pub(crate) fn provider_id(&self) -> &str {
+        &self.provider_id
+    }
+
     /// Constructs the adapter from the same card used for the binding.
     pub fn spawn_omlx(card: &ComponentCard) -> Result<Self, String> {
         let adapter = idoris_upstream::OmlxAdapter::new(idoris_upstream::OmlxAdapterConfig {

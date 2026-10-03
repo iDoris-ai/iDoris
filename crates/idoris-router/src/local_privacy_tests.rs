@@ -65,7 +65,7 @@ async fn local_only_loopback_requires_trusted_privacy_on_both_paths() {
         let bound = (!resident).then(|| dispatch::BoundSupervisor::new(&card, supervisor));
         let rejected = build_app(AppState {
             cards: vec![card.clone()],
-            supervisor: bound.clone(),
+            runtimes: bound.clone().into(),
             ..AppState::default()
         })
         .oneshot(post_chat(
@@ -89,7 +89,7 @@ async fn local_only_loopback_requires_trusted_privacy_on_both_paths() {
         assert_eq!(validate_registration(&[registration(card.clone())]), Ok(()));
         let response = build_app(AppState {
             cards: vec![card],
-            supervisor: bound,
+            runtimes: bound.into(),
             ..AppState::default()
         })
         .oneshot(post_chat(
