@@ -43,6 +43,8 @@ cp config/routing-policy.yaml "$(dirname "$bin")/config/routing-policy.yaml"
 # conformance/src/harness.ts），所以这里直接给可执行文件的绝对路径，不追加
 # 任何参数——不是漏写了 `serve`，是这个二进制目前压根没有子命令可言。
 export IDORIS_CONFORMANCE_CMD="$bin"
+IDORIS_CONFORMANCE_ARGV="$(node -e 'process.stdout.write(JSON.stringify([process.argv[1]]))' "$bin")"
+export IDORIS_CONFORMANCE_ARGV
 # K13/M4: a 5xx does not prove the upstream POST was not executed.
 export IDORIS_CONFORMANCE_POST_RETRY=0
 

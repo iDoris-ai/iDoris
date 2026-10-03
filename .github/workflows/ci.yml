@@ -29,6 +29,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
       - run: rustup toolchain install 1.95 --profile minimal --component rustfmt,clippy
       - uses: actions/cache@v4
         with:
@@ -49,6 +55,25 @@ jobs:
       - run: cargo test --features idoris-tenancy/test-bins,idoris-tenancy/mutation-test-hooks
       # The vendored SSE framing and field parsing fixes are outside the workspace test set.
       - run: cargo test -p genai --lib 'webc::'
+      - name: Rust release conformance
+        # Poison both external command knobs: the wrapper must still select
+        # the release binary it just built.
+        env:
+          IDORIS_CONFORMANCE_CMD: /idoris-conformance-missing
+          IDORIS_CONFORMANCE_ARGV: '["/idoris-conformance-missing"]'
+        run: bash scripts/conformance-rust.sh
+      - name: Conformance bad-command negative control
+        shell: bash
+        run: |
+          log="$(mktemp)"
+          trap 'rm -f "$log"' EXIT
+          if IDORIS_CONFORMANCE_ARGV='["/idoris-conformance-missing"]' pnpm conformance >"$log" 2>&1; then
+            cat "$log"
+            echo "invalid conformance command unexpectedly succeeded" >&2
+            exit 1
+          fi
+          cat "$log"
+          grep -q '被测服务启动命令执行失败.*idoris-conformance-missing.*ENOENT' "$log"
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
-          command: check licenses bans
+          command: check advisories bans licenses sources
