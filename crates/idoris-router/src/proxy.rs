@@ -1122,3 +1122,7 @@ mod tests {
 #[cfg(test)]
 #[path = "proxy/stream_limits_tests.rs"]
 mod stream_limits_tests;
+
+#[cfg(test)]
+#[path = "proxy/slow_reader_tests.rs"]
+mod slow_reader_tests;
