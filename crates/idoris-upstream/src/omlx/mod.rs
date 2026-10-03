@@ -113,9 +113,7 @@ pub struct OmlxAdapter {
 
 impl OmlxAdapter {
     pub fn new(config: OmlxAdapterConfig) -> Result<Self, BackendError> {
-        let client = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
+        let client = crate::http_client()
             .map_err(|_| BackendError::internal("failed to build the oMLX HTTP client"))?;
         Ok(Self {
             base_url: config.base_url.trim_end_matches('/').to_string(),
@@ -200,13 +198,20 @@ impl OmlxAdapter {
     /// A `policy` of `None`, or any mode other than `Resident`, takes the
     /// non-resident path.
     ///
-    /// Once the `POST` has succeeded the model is (or may be) really
-    /// resident, so any later failure is reported as
+    /// If the `POST` result is unknown, or it succeeds and a later step
+    /// fails, the model may be resident. Such failures are reported as
     /// [`BackendError::LoadUnconfirmed`], never as a plain rejection — see
     /// `RuntimeAdapter::load`'s error contract.
     pub async fn load(&self, id: &str, policy: Option<&LoadPolicy>) -> Result<(), BackendError> {
-        self.post(&self.encoded_path("/v1/models/", id, "/load"))
-            .await?;
+        http::post_load(
+            &self.client,
+            &self.base_url,
+            &self.encoded_path("/v1/models/", id, "/load"),
+            self.api_key(),
+            self.call_timeout,
+            id,
+        )
+        .await?;
         let confirmed = if policy.map(|p| p.mode) == Some(LoadMode::Resident) {
             self.pin(id).await
         } else {
@@ -674,15 +679,156 @@ mod tests {
         let server = MockServer::start().await;
         mount_all(
             &server,
-            vec![(LOAD_METHOD, LOAD_PATH, ResponseTemplate::new(500))],
+            vec![(LOAD_METHOD, LOAD_PATH, ResponseTemplate::new(400))],
         )
         .await;
         let err = adapter_for(&server)
             .await
             .load("qwen3-8b", None)
             .await
-            .expect_err("a 500 from POST load must fail");
-        assert_ne!(err.reason_code(), "load_unconfirmed");
+            .expect_err("a 400 from POST load must fail");
+        assert_eq!(err.reason_code(), "upstream_error");
+    }
+
+    #[tokio::test]
+    async fn k09_load_and_pin_timeouts_are_unconfirmed() {
+        for pin_timeout in [false, true] {
+            let server = MockServer::start().await;
+            let slow = ResponseTemplate::new(200).set_delay(Duration::from_secs(1));
+            mount_all(
+                &server,
+                vec![
+                    (
+                        LOAD_METHOD,
+                        LOAD_PATH,
+                        if pin_timeout {
+                            ResponseTemplate::new(200)
+                        } else {
+                            slow.clone()
+                        },
+                    ),
+                    ("PUT", SETTINGS_PATH, slow),
+                ],
+            )
+            .await;
+            let adapter = OmlxAdapter::new(OmlxAdapterConfig {
+                base_url: server.uri(),
+                api_key: Some("test-key-should-never-leak".into()),
+                call_timeout: Duration::from_millis(100),
+            })
+            .expect("adapter");
+            let policy = pin_timeout.then(resident_policy);
+            let err = adapter
+                .load("qwen3-8b", policy.as_ref())
+                .await
+                .expect_err("timeout");
+            assert_eq!(err.reason_code(), "load_unconfirmed", "{err}");
+            assert!(!err.to_string().contains("test-key-should-never-leak"));
+            let requests = server.received_requests().await.expect("requests");
+            assert_eq!(requests.len(), if pin_timeout { 3 } else { 1 });
+            if pin_timeout {
+                assert_eq!(requests[1].url.path(), "/admin/api/login");
+                assert_eq!(requests[2].url.path(), SETTINGS_PATH);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn k09_load_and_pin_connections_closed_after_receipt_are_unconfirmed() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for pin_disconnect in [false, true] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind");
+            let addr = listener.local_addr().expect("address");
+            let received = tokio::spawn(async move {
+                let paths: &[&[u8]] = if pin_disconnect {
+                    &[
+                        b"POST /v1/models/qwen3-8b/load ",
+                        b"POST /admin/api/login ",
+                        b"PUT /admin/api/models/qwen3-8b/settings ",
+                    ]
+                } else {
+                    &[b"POST /v1/models/qwen3-8b/load "]
+                };
+                for (index, prefix) in paths.iter().enumerate() {
+                    let (mut socket, _) = listener.accept().await.expect("accept");
+                    let mut request = Vec::new();
+                    while !request.ends_with(b"\r\n\r\n") {
+                        request.push(socket.read_u8().await.expect("request headers"));
+                    }
+                    assert!(request.starts_with(prefix));
+                    if pin_disconnect && index == 1 {
+                        let headers = String::from_utf8_lossy(&request);
+                        let content_length = headers
+                            .lines()
+                            .find_map(|line| {
+                                line.to_ascii_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .and_then(|value| value.trim().parse::<usize>().ok())
+                            })
+                            .expect("login content length");
+                        let body_start = request.len();
+                        while request.len() - body_start < content_length {
+                            request.push(socket.read_u8().await.expect("login body"));
+                        }
+                        socket
+                            .write_all(
+                                b"HTTP/1.1 200 OK\r\nContent-Length: 16\r\nSet-Cookie: omlx_admin_session=test-cookie; Path=/\r\nConnection: close\r\n\r\n{\"success\":true}",
+                            )
+                            .await
+                            .expect("login response");
+                    } else if pin_disconnect && index == 0 {
+                        socket
+                            .write_all(
+                                b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                            )
+                            .await
+                            .expect("load response");
+                    }
+                    // Close the mutation connection before returning headers.
+                }
+            });
+            let adapter = OmlxAdapter::new(OmlxAdapterConfig {
+                base_url: format!("http://{addr}"),
+                api_key: Some("test-admin-key".into()),
+                call_timeout: Duration::from_secs(1),
+            })
+            .expect("adapter");
+            let policy = pin_disconnect.then(resident_policy);
+            let err = adapter
+                .load("qwen3-8b", policy.as_ref())
+                .await
+                .expect_err("connection closed");
+            tokio::time::timeout(Duration::from_secs(3), received)
+                .await
+                .expect("server request sequence timed out")
+                .expect("server received the mutation");
+            assert_eq!(err.reason_code(), "load_unconfirmed", "{err}");
+        }
+    }
+
+    #[tokio::test]
+    async fn k09_ambiguous_load_http_status_is_unconfirmed() {
+        for status in [408, 500, 503] {
+            let server = MockServer::start().await;
+            mount_all(
+                &server,
+                vec![(
+                    LOAD_METHOD,
+                    LOAD_PATH,
+                    ResponseTemplate::new(status).set_body_string("do-not-leak-body"),
+                )],
+            )
+            .await;
+            let err = adapter_for(&server)
+                .await
+                .load("qwen3-8b", None)
+                .await
+                .expect_err("ambiguous response");
+            assert_eq!(err.reason_code(), "load_unconfirmed", "{status}: {err}");
+            assert!(!err.to_string().contains("do-not-leak-body"));
+        }
     }
 
     #[tokio::test]

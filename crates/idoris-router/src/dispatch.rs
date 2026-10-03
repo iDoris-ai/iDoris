@@ -21,6 +21,48 @@ use tokio_util::sync::CancellationToken;
 use crate::budget;
 use crate::profile::ParsedProfile;
 
+/// The single lifecycle Supervisor and the backend identity it executes.
+/// Keep these together so replacing a card cannot silently retarget dispatch.
+#[derive(Debug, Clone)]
+pub struct BoundSupervisor {
+    handle: SupervisorHandle,
+    provider_id: String,
+    endpoint: String,
+    locality: Locality,
+}
+
+impl BoundSupervisor {
+    pub(crate) fn new(card: &ComponentCard, handle: SupervisorHandle) -> Self {
+        Self {
+            handle,
+            provider_id: card.provider.id.clone(),
+            endpoint: card.endpoint.clone(),
+            locality: card.provider.locality,
+        }
+    }
+
+    /// Constructs the adapter from the same card used for the binding.
+    pub fn spawn_omlx(card: &ComponentCard) -> Result<Self, String> {
+        let adapter = idoris_upstream::OmlxAdapter::new(idoris_upstream::OmlxAdapterConfig {
+            base_url: card.endpoint.clone(),
+            ..idoris_upstream::OmlxAdapterConfig::default()
+        })
+        .map_err(|err| format!("无法构造 oMLX 适配器（{}）：{err}", card.provider.id))?;
+        let handle = idoris_backend::Supervisor::spawn(
+            std::sync::Arc::new(adapter),
+            idoris_backend::SupervisorConfig::default(),
+        )
+        .map_err(|err| format!("无法启动 Supervisor（{}）：{err}", card.provider.id))?;
+        Ok(Self::new(card, handle))
+    }
+
+    fn matches(&self, card: &ComponentCard) -> bool {
+        self.provider_id == card.provider.id
+            && self.endpoint == card.endpoint
+            && self.locality == card.provider.locality
+    }
+}
+
 /// Fallback for a card that doesn't declare its own `load_policy` — cards
 /// should normally declare one (interface spec §3.3); this only covers one
 /// that omits it, so a missing field doesn't turn into a panic/`expect`.
@@ -59,7 +101,7 @@ fn candidate(component: &ComponentCard, prompt: &str) -> Card {
     }
 }
 
-/// A local backend failure, or a budget-ledger failure gating a *paid*
+/// A local backend failure, or a budget-ledger failure gating a selected
 /// candidate — both only occur after a candidate was already chosen.
 #[derive(Debug)]
 pub enum DispatchFailure {
@@ -183,13 +225,38 @@ pub fn is_resident_http_service(card: &ComponentCard) -> bool {
 /// fires, since by the time it's attached the request body — and with it,
 /// that stream's own `close` — has already completed; this guard doesn't
 /// depend on any such listener at all).
-struct ReservationGuard<'a> {
+pub(crate) struct ReservationGuard<'a> {
     ledger: Option<&'a BudgetLedger>,
     tenant_id: Option<&'a str>,
     id: Option<ReservationId>,
 }
 
-impl ReservationGuard<'_> {
+impl<'a> ReservationGuard<'a> {
+    pub(crate) fn reserve(
+        ledger: Option<&'a BudgetLedger>,
+        tenant_id: Option<&'a str>,
+        provider_id: &str,
+        estimated_cost_minor: i64,
+    ) -> Result<Self, BudgetError> {
+        let id = match ledger {
+            Some(ledger) => Some(budget::reserve(
+                ledger,
+                tenant_id,
+                provider_id,
+                estimated_cost_minor,
+            )?),
+            None if budget::is_paid(Some(estimated_cost_minor)) => {
+                return Err(budget::ledger_unavailable_error(tenant_id, provider_id));
+            }
+            None => None,
+        };
+        Ok(Self {
+            ledger,
+            tenant_id,
+            id,
+        })
+    }
+
     /// Takes the id for settling — after this, `Drop` is a no-op.
     fn take(&mut self) -> Option<ReservationId> {
         self.id.take()
@@ -222,10 +289,10 @@ impl Drop for CancelOnDrop {
 /// Runs the local decision + execution path for one request: builds
 /// decision-time [`Card`]s from `cards` (R2-D simplification, see
 /// `candidate`), calls [`idoris_policy::decide`], reserves budget for a
-/// *paid* candidate (`budget_ledger: None` fails closed via
-/// [`DispatchFailure::Budget`] exactly as an unconfigured ledger would —
-/// free candidates are unaffected), loads the chosen model via the
-/// Supervisor if not already loaded, calls `chat`, then settles (success)
+/// selected candidate whenever a ledger is wired, including zero cost
+/// (`SpendGate` is enforced by the ledger). With no ledger, paid candidates
+/// fail closed and free candidates remain usable. Loads the chosen model
+/// via the Supervisor if not already loaded, calls `chat`, then settles (success)
 /// or releases (failure) the reservation. `prompt` is the caller's own
 /// concatenated message text, passed in rather than recomputed here so
 /// there's one place deciding how "the prompt" is derived from `messages`.
@@ -235,7 +302,7 @@ impl Drop for CancelOnDrop {
 /// that part right itself to still get correct propagation.
 pub async fn dispatch_local(
     cards: &[ComponentCard],
-    supervisor: Option<&SupervisorHandle>,
+    supervisor: Option<&BoundSupervisor>,
     budget_ledger: Option<&BudgetLedger>,
     profile: &ParsedProfile,
     prompt: &str,
@@ -270,6 +337,17 @@ pub async fn dispatch_local(
             )));
         };
         let served_locality = effective_served_locality(chosen);
+        // Fail closed before budget reservation or any Supervisor operation.
+        if supervisor.is_some_and(|bound| !bound.matches(&chosen.component)) {
+            return Ok(ChatOutcome {
+                decision,
+                served_locality,
+                result: Err(DispatchFailure::Backend(
+                    BackendError::supervisor_unavailable(),
+                )),
+                actual_cost_minor: None,
+            });
+        }
         let load_policy = chosen
             .component
             .load_policy
@@ -289,38 +367,22 @@ pub async fn dispatch_local(
     };
 
     let is_paid = budget::is_paid(Some(estimated_cost_minor));
-    let mut reservation_guard = ReservationGuard {
-        ledger: budget_ledger,
+    let mut reservation_guard = match ReservationGuard::reserve(
+        budget_ledger,
         tenant_id,
-        id: None,
-    };
-    if is_paid {
-        match budget_ledger {
-            None => {
-                return Ok(ChatOutcome {
-                    decision,
-                    served_locality,
-                    result: Err(DispatchFailure::Budget(budget::ledger_unavailable_error(
-                        tenant_id, &model_id,
-                    ))),
-                    actual_cost_minor: None,
-                });
-            }
-            Some(ledger) => {
-                match budget::reserve(ledger, tenant_id, &model_id, estimated_cost_minor) {
-                    Ok(id) => reservation_guard.id = Some(id),
-                    Err(err) => {
-                        return Ok(ChatOutcome {
-                            decision,
-                            served_locality,
-                            result: Err(DispatchFailure::Budget(err)),
-                            actual_cost_minor: None,
-                        });
-                    }
-                }
-            }
+        &model_id,
+        estimated_cost_minor,
+    ) {
+        Ok(guard) => guard,
+        Err(err) => {
+            return Ok(ChatOutcome {
+                decision,
+                served_locality,
+                result: Err(DispatchFailure::Budget(err)),
+                actual_cost_minor: None,
+            });
         }
-    }
+    };
     // From here on, `reservation_guard`'s Drop releases the reservation on
     // any early return *and* on this future being dropped mid-`.await`
     // (client disconnect) — see its doc. Only the success path below
@@ -344,6 +406,7 @@ pub async fn dispatch_local(
     // cancellation can stop early.
     let _cancel_guard = CancelOnDrop(cancel.clone());
 
+    let supervisor = &supervisor.handle;
     let status = supervisor.status().await;
     let already_loaded = matches!(&status, Ok(s) if s.loaded.iter().any(|m| m == &model_id));
     if !already_loaded
@@ -388,7 +451,9 @@ pub async fn dispatch_local(
                         &response.content,
                         estimated_cost_minor,
                     );
-                    budget::settle(ledger, tenant_id, &id, actual).ok()
+                    budget::settle(ledger, tenant_id, &id, actual)
+                        .ok()
+                        .filter(|_| is_paid)
                 }
                 _ => None,
             };
@@ -510,6 +575,7 @@ mod tests {
             memory_gb: 1.0,
         }]));
         let supervisor = Supervisor::spawn(adapter, SupervisorConfig::default()).unwrap();
+        let supervisor = BoundSupervisor::new(&local_card("a"), supervisor);
         let messages = vec![ChatMessage {
             role: "user".to_string(),
             content: "hello".to_string(),
@@ -556,6 +622,88 @@ mod tests {
         (dir, ledger)
     }
 
+    #[tokio::test]
+    async fn free_candidate_obeys_all_gate_before_loading() {
+        let (_dir, ledger) = configured_ledger(0);
+        ledger
+            .configure_tenant("acme", 0, "UTC", idoris_tenancy::budget::SpendGate::All)
+            .unwrap();
+        let mut profile = empty_profile();
+        profile.tenant_id = Some("acme".to_string());
+        let adapter = Arc::new(MockAdapter::new(vec![ModelInfo {
+            id: "a".to_string(),
+            memory_gb: 1.0,
+        }]));
+        let supervisor = Supervisor::spawn(adapter.clone(), SupervisorConfig::default()).unwrap();
+        let supervisor = BoundSupervisor::new(&local_card("a"), supervisor);
+        let outcome = dispatch_local(
+            &[local_card("a")],
+            Some(&supervisor),
+            Some(&ledger),
+            &profile,
+            "hi",
+            Vec::new(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            outcome.result,
+            Err(DispatchFailure::Budget(BudgetError::Exceeded { .. }))
+        ));
+        assert_eq!(adapter.load_call_count("a"), 0);
+        assert_eq!(ledger.tenant_balance("acme").unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn free_candidate_obeys_paid_only_gate_and_preserves_no_charge_header() {
+        let (_dir, ledger) = configured_ledger(0);
+        let adapter = Arc::new(MockAdapter::new(vec![ModelInfo {
+            id: "a".to_string(),
+            memory_gb: 1.0,
+        }]));
+        let supervisor = Supervisor::spawn(adapter, SupervisorConfig::default()).unwrap();
+        let supervisor = BoundSupervisor::new(&local_card("a"), supervisor);
+        let outcome = dispatch_local(
+            &[local_card("a")],
+            Some(&supervisor),
+            Some(&ledger),
+            &empty_profile(),
+            "hi",
+            Vec::new(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert!(outcome.result.is_ok());
+        assert_eq!(outcome.actual_cost_minor, None);
+        assert_eq!(
+            ledger.tenant_balance(budget::PERSONAL_TENANT_ID).unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn free_candidate_with_unconfigured_ledger_fails_closed() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ledger = BudgetLedger::open(dir.path().join("b.sqlite3")).unwrap();
+        let outcome = dispatch_local(
+            &[local_card("a")],
+            None,
+            Some(&ledger),
+            &empty_profile(),
+            "hi",
+            Vec::new(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            outcome.result,
+            Err(DispatchFailure::Budget(BudgetError::NotConfigured { .. }))
+        ));
+    }
+
     // "No ledger wired" (trivial branch) is covered at the budget.rs unit
     // level; these focus on the two integration paths below.
     #[tokio::test]
@@ -590,6 +738,7 @@ mod tests {
             memory_gb: 1.0,
         }]));
         let supervisor = Supervisor::spawn(adapter, SupervisorConfig::default()).unwrap();
+        let supervisor = BoundSupervisor::new(&paid_card("p"), supervisor);
         let messages = vec![ChatMessage {
             role: "user".to_string(),
             content: "hi".to_string(),
@@ -634,6 +783,7 @@ mod tests {
         }]));
         adapter.set_chat_delay("p", std::time::Duration::from_secs(5));
         let supervisor = Supervisor::spawn(adapter, SupervisorConfig::default()).unwrap();
+        let supervisor = BoundSupervisor::new(&paid_card("p"), supervisor);
         let cancel = CancellationToken::new();
         let messages = vec![ChatMessage {
             role: "user".to_string(),

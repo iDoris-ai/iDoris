@@ -751,8 +751,6 @@ dependencies = [
 [[package]]
 name = "genai"
 version = "0.6.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1d12aba7e9dc2c4d54654566dc3dc8383b5cb52e0cfc5754989afe0480d933e3"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -1106,7 +1104,7 @@ dependencies = [
 
 [[package]]
 name = "idoris-backend"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "idoris-contracts",
@@ -1119,7 +1117,7 @@ dependencies = [
 
 [[package]]
 name = "idoris-contracts"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "jsonschema",
  "serde",
@@ -1128,7 +1126,7 @@ dependencies = [
 
 [[package]]
 name = "idoris-policy"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "idoris-contracts",
  "proptest",
@@ -1137,16 +1135,18 @@ dependencies = [
 
 [[package]]
 name = "idoris-recommender"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "idoris-contracts",
 ]
 
 [[package]]
 name = "idoris-router"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
+ "async-trait",
  "axum",
+ "futures-util",
  "http-body-util",
  "idoris-backend",
  "idoris-contracts",
@@ -1155,6 +1155,7 @@ dependencies = [
  "idoris-upstream",
  "indexmap 2.14.2",
  "reqwest",
+ "ring",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -1168,7 +1169,7 @@ dependencies = [
 
 [[package]]
 name = "idoris-tenancy"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "chrono",
  "chrono-tz",
@@ -1182,7 +1183,7 @@ dependencies = [
 
 [[package]]
 name = "idoris-upstream"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "futures-core",
