@@ -101,21 +101,19 @@ async fn run() -> Result<(), String> {
         )
     })?;
 
-    // Fail-fast only: idoris_policy::decide() doesn't consume routing
-    // policy rules yet (see routing_policy's module doc) -- this just
-    // guarantees a bad/missing IDORIS_ROUTING_POLICY is caught at startup,
-    // not silently ignored.
+    // Load once and retain the validated policy for both execution paths.
     let policy_env = env_path("IDORIS_ROUTING_POLICY")?;
     let routing_policy_path = resolve_bundle_path(
         policy_env.as_deref(),
         routing_policy::DEFAULT_ROUTING_POLICY_PATH,
     )?;
-    routing_policy::load_routing_policy(&routing_policy_path).map_err(|err| {
-        format!(
-            "无法加载路由策略 \"{}\"（IDORIS_ROUTING_POLICY）：{err}",
-            routing_policy_path.display()
-        )
-    })?;
+    let routing_policy =
+        routing_policy::load_routing_policy(&routing_policy_path).map_err(|err| {
+            format!(
+                "无法加载路由策略 \"{}\"（IDORIS_ROUTING_POLICY）：{err}",
+                routing_policy_path.display()
+            )
+        })?;
 
     let supervisor = spawn_supervisor_for_omlx_card(&cards)?;
 
@@ -126,6 +124,7 @@ async fn run() -> Result<(), String> {
         .join(", ");
     let state = AppState {
         cards,
+        routing_policy,
         supervisor,
         ..AppState::default()
     };
