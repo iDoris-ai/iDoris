@@ -36,6 +36,7 @@ pub mod models;
 pub mod proxy;
 
 mod sse;
+mod supervisor_parameters;
 
 /// Per-connection deadlines for stalled HTTP response writes.
 pub mod write_timeout;
@@ -510,10 +511,23 @@ async fn chat_completions(
     // Supervisor, which only makes sense for a real oMLX-shaped backend
     // with an explicit load/unload lifecycle. See dispatch::select's doc
     // for the accepted double-decide() tradeoff this branch makes.
-    if let Ok(selected) = dispatch::select(&state.cards, &parsed, &prompt)
-        && dispatch::is_resident_http_service(&selected.card)
-    {
-        return chat_via_proxy(&state, &selected, &headers, &parsed, &value, &record_id).await;
+    if let Ok(selected) = dispatch::select(&state.cards, &parsed, &prompt) {
+        if dispatch::is_resident_http_service(&selected.card) {
+            return chat_via_proxy(&state, &selected, &headers, &parsed, &value, &record_id).await;
+        }
+        if let Err(message) = supervisor_parameters::validate(object) {
+            let mut response = error_envelope_with_reason(
+                StatusCode::BAD_REQUEST,
+                "unsupported_field",
+                "unsupported_parameter",
+                message,
+            );
+            response.headers_mut().insert(
+                HEADER_SERVED_LOCALITY,
+                HeaderValue::from_static(locality_str(selected.served_locality)),
+            );
+            return response;
+        }
     }
 
     // R0 finding: TS's cancellation propagation (server.ts's req.on("close"))
