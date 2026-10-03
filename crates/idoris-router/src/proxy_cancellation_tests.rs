@@ -77,6 +77,7 @@ async fn forward(proxy: &ChatProxy, endpoint: &str, payload: &Value, id: &str) -
 enum RawFault {
     DropBeforeResponse,
     TruncateResponse,
+    Complete408,
     Complete500,
     Complete503,
 }
@@ -131,8 +132,9 @@ async fn start_raw_fault_upstream(
                             .await
                             .unwrap();
                     }
-                    RawFault::Complete500 | RawFault::Complete503 => {
+                    RawFault::Complete408 | RawFault::Complete500 | RawFault::Complete503 => {
                         let (status, reason) = match fault {
+                            RawFault::Complete408 => (408, "Request Timeout"),
                             RawFault::Complete500 => (500, "Internal Server Error"),
                             RawFault::Complete503 => (503, "Service Unavailable"),
                             _ => unreachable!(),
@@ -167,12 +169,13 @@ async fn assert_uncertain_post_is_remembered(fault: RawFault, id: &str) {
     );
     let original = body("same");
     let expected_status = match fault {
+        RawFault::Complete408 => 408,
         RawFault::Complete500 => 500,
         RawFault::Complete503 => 503,
         RawFault::DropBeforeResponse | RawFault::TruncateResponse => 502,
     };
     let expected_body = match fault {
-        RawFault::Complete500 | RawFault::Complete503 => {
+        RawFault::Complete408 | RawFault::Complete500 | RawFault::Complete503 => {
             Some(br#"{"error":"upstream overloaded"}"#.as_slice())
         }
         RawFault::DropBeforeResponse | RawFault::TruncateResponse => None,
@@ -239,6 +242,11 @@ async fn consumed_post_with_truncated_body_is_remembered() {
 #[tokio::test]
 async fn complete_500_is_remembered_for_same_id_until_window_expires() {
     assert_uncertain_post_is_remembered(RawFault::Complete500, "complete-500").await;
+}
+
+#[tokio::test]
+async fn complete_408_is_remembered_for_same_id_until_window_expires() {
+    assert_uncertain_post_is_remembered(RawFault::Complete408, "complete-408").await;
 }
 
 #[tokio::test]
