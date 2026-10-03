@@ -37,6 +37,7 @@ pub mod proxy;
 
 mod sse;
 mod supervisor_parameters;
+mod supervisor_stream;
 
 /// Per-connection deadlines for stalled HTTP response writes.
 pub mod write_timeout;
@@ -513,6 +514,19 @@ async fn chat_completions(
     if let Ok(selected) = dispatch::select(&state.cards, &parsed, &prompt) {
         if dispatch::is_resident_http_service(&selected.card) {
             return chat_via_proxy(&state, &selected, &headers, &parsed, &value, &record_id).await;
+        }
+        if let Err(message) = supervisor_stream::validate(object) {
+            let mut response = error_envelope_with_reason(
+                StatusCode::BAD_REQUEST,
+                "unsupported_field",
+                "unsupported_stream",
+                message,
+            );
+            response.headers_mut().insert(
+                HEADER_SERVED_LOCALITY,
+                HeaderValue::from_static(locality_str(selected.served_locality)),
+            );
+            return response;
         }
         if let Err(message) = supervisor_parameters::validate(object) {
             let mut response = error_envelope_with_reason(

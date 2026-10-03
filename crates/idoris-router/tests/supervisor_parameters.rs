@@ -88,6 +88,39 @@ async fn unsupported_options_are_400_before_any_upstream_call() {
 }
 
 #[tokio::test]
+async fn stream_validation_precedes_parameter_validation() {
+    let upstream = MockServer::start().await;
+    let card = card(&upstream.uri());
+    let app = build_app(AppState {
+        supervisor: Some(BoundSupervisor::spawn_omlx(&card).unwrap()),
+        cards: vec![card],
+        ..AppState::default()
+    });
+
+    for (stream, expected_reason) in [
+        (false, "unsupported_parameter"),
+        (true, "unsupported_stream"),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(request(json!({
+                "model": "idoris/daily",
+                "stream": stream,
+                "max_tokens": 40,
+                "messages": [{"role":"user","content":"hi"}]
+            })))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body: Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(body["error"]["reason_code"], expected_reason);
+    }
+    assert!(upstream.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn message_fields_and_multimodal_content_are_not_dropped() {
     let upstream = MockServer::start().await;
     let app = build_app(AppState {
