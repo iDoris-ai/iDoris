@@ -1,5 +1,5 @@
 //! Low-level HTTP plumbing for the oMLX adapter: every request goes through
-//! [`get_json`]/[`post_empty`]/[`put_json`]/[`post_and_parse`], each of
+//! [`get_json`]/[`post_empty`]/[`post_and_parse`], each of
 //! which applies a per-call timeout and turns a failure into a [`BackendError`] that never
 //! carries the response body or API key — every error here is built from
 //! method/path/status only, never by formatting the response body or the
@@ -99,23 +99,8 @@ pub(super) async fn post_load(
     send_and_discard("POST", path, req, call_timeout, Some(model_id)).await
 }
 
-/// `PUT path` with a JSON body, discarding the response body. See
-/// [`post_empty`]'s doc on why a send()-only timeout is correct here too.
-pub(super) async fn put_json(
-    client: &reqwest::Client,
-    base_url: &str,
-    path: &str,
-    api_key: Option<&str>,
-    call_timeout: Duration,
-    body: &serde_json::Value,
-) -> Result<(), BackendError> {
-    let url = format!("{base_url}{path}");
-    let req = auth_header(client.put(&url), api_key).json(body);
-    send_and_discard("PUT", path, req, call_timeout, None).await
-}
-
 /// `POST path` with a JSON body, parsed as JSON — used for `/v1/chat/
-/// completions`. Unlike [`post_empty`]/[`put_json`], the response body
+/// completions`. Unlike [`post_empty`], the response body
 /// *is* read, so this goes through [`send_and_parse`] (full-round-trip
 /// timeout), not `send_and_discard`.
 pub(super) async fn post_and_parse(
@@ -333,7 +318,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn post_empty_and_put_json_succeed_and_fail_closed_on_4xx() {
+    async fn post_empty_succeeds_and_fails_closed_on_4xx() {
         let server = mock_method("POST", "/load", ResponseTemplate::new(200)).await;
         let client = reqwest::Client::new();
         post_empty(
@@ -346,17 +331,16 @@ mod tests {
         .await
         .expect("POST 200 must succeed");
 
-        let server = mock_method("PUT", "/pin", ResponseTemplate::new(401)).await;
-        let err = put_json(
+        let server = mock_method("POST", "/pin", ResponseTemplate::new(401)).await;
+        let err = post_empty(
             &client,
             &server.uri(),
             "/pin",
             Some("do-not-leak-this-key"),
             Duration::from_secs(1),
-            &serde_json::json!({"is_pinned": true}),
         )
         .await
-        .expect_err("PUT 401 must fail");
+        .expect_err("POST 401 must fail");
         let msg = err.to_string();
         assert!(msg.contains("401") && !msg.contains("do-not-leak-this-key"));
     }
