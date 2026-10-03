@@ -63,6 +63,23 @@ impl BoundSupervisor {
     }
 }
 
+/// Apply the YAML policy before either execution path selects a candidate.
+/// Privacy and deterministic selection remain enforced by the policy pipeline;
+/// `capability` and `load` are metadata until their dedicated tasks wire them.
+pub fn policy_cards(
+    cards: &[ComponentCard],
+    policy: &idoris_contracts::RoutingPolicy,
+    profile: &ParsedProfile,
+) -> (Vec<ComponentCard>, bool) {
+    let route = crate::routing_policy::decide(policy, &profile.task);
+    let cards = cards
+        .iter()
+        .filter(|card| route.tiers.contains(&card.provider.tier))
+        .cloned()
+        .collect();
+    (cards, route.fail_closed)
+}
+
 /// Fallback for a card that doesn't declare its own `load_policy` — cards
 /// should normally declare one (interface spec §3.3); this only covers one
 /// that omits it, so a missing field doesn't turn into a panic/`expect`.
