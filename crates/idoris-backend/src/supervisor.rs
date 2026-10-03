@@ -132,9 +132,10 @@ enum OpOutcome {
         /// Every victim `plan_eviction` chose, and how its `unload` went —
         /// applied to the ledger by `OpDone` alongside `result`.
         victim_results: Vec<VictimResult>,
-        /// Fresh aggregate snapshot proving the selected victims were gone.
+        /// Fresh aggregate snapshot proving selected victims or a released
+        /// OOM target were gone; used to rebase aggregate residency accounting.
         aggregate_status: Option<BackendStatus>,
-        /// Amount attributed to the requested ID in that pre-load snapshot.
+        /// Amount attributed to the requested ID in `aggregate_status`.
         aggregate_target_credit_gb: f64,
         /// Only consulted when `result` is `Err` — see
         /// [`LoadFailureOutcome`]'s doc comment.
@@ -543,7 +544,7 @@ async fn run_load_flow(
     evict: Vec<String>,
     mut previous: Option<PreviousModel>,
 ) -> OpOutcome {
-    let aggregate_target_credit_gb = previous.as_ref().map_or(0.0, |model| model.memory_gb);
+    let mut aggregate_target_credit_gb = previous.as_ref().map_or(0.0, |model| model.memory_gb);
     let LoadFlowContext {
         release_limits,
         inherited,
@@ -567,7 +568,7 @@ async fn run_load_flow(
         eviction_failed |= result.is_err();
         victim_results.push((victim, result));
     }
-    let aggregate_status = if !targets.is_empty() {
+    let mut aggregate_status = if !targets.is_empty() {
         match confirm_memory_released(
             &adapter,
             &targets,
@@ -697,19 +698,26 @@ async fn run_load_flow(
         // that residency is gone, the same discounted charge cannot safely
         // be used for an immediate retry. End this attempt and let a later
         // request enter normal admission with a fresh estimate.
-        if inherited && let Ok(status) = release {
-            let failure_outcome = if load_fence.clear().is_ok() {
-                LoadFailureOutcome::SettleReleased(status)
-            } else {
-                LoadFailureOutcome::RetainUnconfirmedLoad(previous)
-            };
-            return OpOutcome::Load {
-                result: attempt,
-                victim_results,
-                aggregate_status,
-                aggregate_target_credit_gb,
-                failure_outcome,
-            };
+        if let Ok(status) = release {
+            if inherited {
+                let failure_outcome = if load_fence.clear().is_ok() {
+                    LoadFailureOutcome::SettleReleased(status)
+                } else {
+                    LoadFailureOutcome::RetainUnconfirmedLoad(previous)
+                };
+                return OpOutcome::Load {
+                    result: attempt,
+                    victim_results,
+                    aggregate_status,
+                    aggregate_target_credit_gb,
+                    failure_outcome,
+                };
+            }
+            // Rebase the aggregate without the confirmed-absent retry target.
+            // Its old slot must no longer receive aggregate-residency credit if
+            // the retry is rejected after `previous` is cleared below.
+            aggregate_status = Some(status);
+            aggregate_target_credit_gb = 0.0;
         }
         // The old instance is now confirmed absent, so subsequent retry
         // failures must not restore its former Ready ledger entry.

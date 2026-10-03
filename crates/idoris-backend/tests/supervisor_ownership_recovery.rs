@@ -309,7 +309,7 @@ async fn confirmed_oom_cleanup_does_not_reuse_inherited_reservation_on_retry() {
     assert_eq!(adapter.status().await.unwrap().used_gb, 16.0);
 }
 
-/// Models engines that free an inherited allocation as part of rejecting an
+/// Models engines that free an existing allocation as part of rejecting an
 /// OOM load, before the Supervisor can issue a cleanup unload.
 struct OomReleasesBeforeReturnAdapter {
     mock: MockAdapter,
@@ -383,6 +383,59 @@ async fn inherited_oom_released_by_engine_requires_fresh_admission() {
     assert!(handle.load("d", 16.0, policy()).await.is_err());
     assert_eq!(adapter.mock.load_call_count("d"), 0);
     assert_eq!(adapter.status().await.unwrap().used_gb, 16.0);
+}
+
+#[tokio::test]
+async fn rejected_oom_retry_releases_non_inherited_reservation() {
+    let mock = MockAdapter::new(models(&[("a", 8.0), ("b", 8.0), ("c", 16.0)]));
+    let adapter = Arc::new(OomReleasesBeforeReturnAdapter { mock });
+    let mut limits = config(16.0);
+    limits.oom_retry_backoff = Duration::ZERO;
+    limits.release_confirm_interval = Duration::ZERO;
+    limits.release_confirm_max_attempts = 1;
+    let handle = Supervisor::spawn(adapter.clone(), limits).unwrap();
+
+    let startup = handle.status().await.unwrap();
+    assert!(startup.loaded.is_empty());
+    assert_eq!(startup.used_gb, 0.0);
+
+    handle.load("a", 8.0, policy()).await.unwrap();
+    handle.load("b", 8.0, policy()).await.unwrap();
+    // This release snapshot includes A, covered by its managed slot's credit.
+    handle.unload("b").await.unwrap();
+    let after_b_unload = handle.status().await.unwrap();
+    assert_eq!(after_b_unload.loaded, vec!["a"]);
+    assert_eq!(after_b_unload.used_gb, 8.0);
+
+    let a_loads_before_reload = adapter.mock.load_call_count("a");
+    adapter
+        .mock
+        .set_load_script("a", vec![LoadOutcome::Oom, LoadOutcome::Fail]);
+    let rejected = handle.load("a", 8.0, inherited_policy()).await;
+    assert!(matches!(
+        rejected,
+        Err(BackendError::Upstream { ref message })
+            if message == "mock adapter scripted failure loading a"
+    ));
+    assert_eq!(
+        adapter.mock.load_call_count("a"),
+        a_loads_before_reload + 2,
+        "the OOM must trigger exactly one adapter retry"
+    );
+    assert!(adapter.status().await.unwrap().loaded.is_empty());
+    assert_eq!(adapter.status().await.unwrap().used_gb, 0.0);
+    assert!(handle.status().await.unwrap().loaded.is_empty());
+    assert_eq!(handle.status().await.unwrap().used_gb, 0.0);
+
+    let a_unloads = adapter.mock.unload_call_count("a");
+    handle.unload("a").await.unwrap();
+    assert_eq!(adapter.mock.unload_call_count("a"), a_unloads);
+    assert_eq!(handle.status().await.unwrap().used_gb, 0.0);
+
+    handle.load("c", 16.0, policy()).await.unwrap();
+    assert_eq!(adapter.mock.load_call_count("c"), 1);
+    assert_eq!(adapter.status().await.unwrap().used_gb, 16.0);
+    assert_eq!(handle.status().await.unwrap().used_gb, 16.0);
 }
 
 #[tokio::test]
