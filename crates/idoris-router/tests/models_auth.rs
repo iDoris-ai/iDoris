@@ -102,3 +102,82 @@ async fn model_listing_uses_the_adapter_environment_credential() {
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(json["data"][0]["id"], "Qwen3-0.6B-4bit");
 }
+
+// Invalid credential bytes are isolated in child processes so concurrent tests
+// never observe a mutated process environment.
+#[tokio::test]
+async fn invalid_model_listing_environment_credential_is_rejected_without_egress() {
+    const CHILD: &str = "IDORIS_MODELS_INVALID_AUTH_CHILD";
+    if std::env::var(CHILD).is_err() {
+        for (case, key) in [
+            ("lf", "credential-fragment\nsecond-fragment"),
+            ("cr", "credential-fragment\rsecond-fragment"),
+        ] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "invalid_model_listing_environment_credential_is_rejected_without_egress",
+                    "--nocapture",
+                ])
+                .env(CHILD, case)
+                .env("IDORIS_OMLX_API_KEY", key)
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                output.status.success(),
+                "stdout:\n{stdout}\nstderr:\n{stderr}"
+            );
+            let event = stderr
+                .lines()
+                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .find(|value| value["event"] == "upstream_model_listing_authentication_failed")
+                .unwrap_or_else(|| panic!("missing structured auth event in stderr: {stderr}"));
+            assert_eq!(event["reason"], "invalid_authorization_header");
+            assert_eq!(event["provider_id"], "Qwen3-0.6B-4bit");
+            assert_eq!(event["locality"], "loopback");
+            for sensitive in ["credential-fragment", "second-fragment"] {
+                assert!(!stdout.contains(sensitive));
+                assert!(!stderr.contains(sensitive));
+            }
+        }
+        return;
+    }
+
+    let upstream = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200))
+        .with_priority(1)
+        .expect(0)
+        .mount(&upstream)
+        .await;
+    let state = AppState {
+        cards: vec![secured_card(&upstream.uri())],
+        ..AppState::default()
+    };
+    let response = build_app(state)
+        .oneshot(
+            http::Request::builder()
+                .uri("/v1/models")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), http::StatusCode::BAD_GATEWAY);
+    assert_eq!(response.headers()["x-idoris-served-locality"], "loopback");
+    assert!(!response.headers()["x-idoris-record-id"].is_empty());
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let body_text = String::from_utf8_lossy(&body);
+    for sensitive in ["credential-fragment", "second-fragment"] {
+        assert!(!body_text.contains(sensitive));
+    }
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["error"]["type"], "upstream_error");
+    assert_eq!(
+        json["error"]["reason_code"],
+        "upstream_authentication_failed"
+    );
+}

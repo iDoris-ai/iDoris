@@ -8,6 +8,7 @@ use std::time::Duration;
 use idoris_contracts::ComponentCard;
 use idoris_contracts::component_card::Form;
 use idoris_contracts::provider::Locality;
+use reqwest::header::{AUTHORIZATION, HeaderValue};
 use serde::Serialize;
 
 /// TS's reference loop (`server.ts`'s `/v1/models` handler) applies no
@@ -74,7 +75,20 @@ async fn list_one(
     if is_loopback_omlx(card)
         && let Some(key) = api_key.filter(|key| !key.is_empty())
     {
-        request = request.bearer_auth(key);
+        let Ok(mut authorization) = HeaderValue::from_str(&format!("Bearer {key}")) else {
+            eprintln!(
+                "{{\"event\":\"upstream_model_listing_authentication_failed\",\"reason\":\"invalid_authorization_header\",\"provider_id\":{},\"locality\":{}}}",
+                serde_json::to_string(&card.provider.id)
+                    .unwrap_or_else(|_| "\"unknown\"".to_string()),
+                serde_json::to_string(crate::locality_str(card.provider.locality))
+                    .unwrap_or_else(|_| "\"unknown\"".to_string())
+            );
+            return Err(ModelsError::UpstreamAuthenticationFailed {
+                locality: card.provider.locality,
+            });
+        };
+        authorization.set_sensitive(true);
+        request = request.header(AUTHORIZATION, authorization);
     }
     let Ok(resp) = request.send().await else {
         return Ok(Vec::new());
@@ -177,6 +191,37 @@ mod tests {
         }
     }
 
+    async fn models_server() -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"data":[]})))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    async fn assert_no_authorization(
+        client: &reqwest::Client,
+        server: &MockServer,
+        entry: ComponentCard,
+        case_name: &str,
+    ) {
+        list_models_with_key(client, &[entry], Some("secret"))
+            .await
+            .unwrap_or_else(|_| panic!("{case_name}: listing should succeed"));
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(
+            requests.len(),
+            1,
+            "{case_name}: request must reach upstream"
+        );
+        assert!(
+            !requests[0].headers.contains_key("authorization"),
+            "{case_name}: authorization must be omitted"
+        );
+    }
+
     #[tokio::test]
     async fn maps_id_object_owned_by_from_the_upstream_shape() {
         let server = MockServer::start().await;
@@ -236,29 +281,63 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn credentials_are_isolated_from_non_omlx_and_non_loopback_cards() {
+    async fn invalid_authorization_keys_fail_before_any_upstream_request() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
-            .and(path("/v1/models"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"data":[]})))
+            .respond_with(ResponseTemplate::new(200))
             .mount(&server)
             .await;
-        let client = reqwest::Client::new();
-        let mut remote = card("Qwen3-0.6B-4bit", &server.uri(), Form::HttpService);
-        remote.provider.locality = Locality::Remote;
-        let mut other = card("not-omlx", &server.uri(), Form::HttpService);
-        other.version_pin = "other@1.0".into();
-        for entry in [remote, other] {
-            list_models_with_key(&client, &[entry], Some("secret"))
-                .await
-                .unwrap();
+        for key in ["bad\nkey", "bad\rkey", "bad\r\nkey"] {
+            let result = list_models_with_key(
+                &reqwest::Client::new(),
+                &[card("omlx", &server.uri(), Form::HttpService)],
+                Some(key),
+            )
+            .await;
+            assert!(matches!(
+                result,
+                Err(ModelsError::UpstreamAuthenticationFailed { .. })
+            ));
         }
-        let requests = server.received_requests().await.unwrap();
-        assert_eq!(requests.len(), 2);
-        assert!(
-            requests
-                .iter()
-                .all(|r| !r.headers.contains_key("authorization"))
-        );
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn credentials_are_isolated_from_non_loopback_locality() {
+        let server = models_server().await;
+        let mut entry = card("omlx", &server.uri(), Form::HttpService);
+        entry.provider.locality = Locality::Remote;
+        assert_no_authorization(&reqwest::Client::new(), &server, entry, "remote locality").await;
+    }
+
+    #[tokio::test]
+    async fn credentials_are_isolated_from_non_omlx_version() {
+        let server = models_server().await;
+        let mut entry = card("omlx", &server.uri(), Form::HttpService);
+        entry.version_pin = "other@1.0".into();
+        assert_no_authorization(&reqwest::Client::new(), &server, entry, "non-oMLX version").await;
+    }
+
+    #[tokio::test]
+    async fn credentials_are_isolated_from_non_loopback_url_host() {
+        let server = models_server().await;
+        let port = reqwest::Url::parse(&server.uri()).unwrap().port().unwrap();
+        let endpoint = format!("http://upstream.test:{port}");
+        let socket = server.address();
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .resolve("upstream.test", *socket)
+            .build()
+            .unwrap();
+        let entry = card("omlx", &endpoint, Form::HttpService);
+        assert_no_authorization(&client, &server, entry, "non-loopback URL host").await;
+    }
+
+    #[tokio::test]
+    async fn credentials_are_isolated_from_non_local_family() {
+        let server = models_server().await;
+        let mut entry = card("omlx", &server.uri(), Form::HttpService);
+        entry.provider.family = Family::Other;
+        assert_no_authorization(&reqwest::Client::new(), &server, entry, "non-local family").await;
     }
 }
