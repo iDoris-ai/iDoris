@@ -58,11 +58,14 @@ pub trait RuntimeAdapter: Send + Sync {
     ///
     /// **Error contract.** A plain `Err` means "nothing was allocated" (or
     /// it was already released): the Supervisor settles the slot on
-    /// `Stopped` and frees its budget. An implementation whose load can fail
-    /// *after* the engine may already hold the model (e.g. a two-step
-    /// load-then-pin/verify) must return [`BackendError::LoadUnconfirmed`]
-    /// for that case instead, so the Supervisor confirms release with a
-    /// real `unload` rather than forgetting memory still in use.
+    /// `Stopped` and frees its budget. A timeout of this future does not
+    /// prove the engine-side operation stopped; the Supervisor retains the
+    /// slot as `Error` because no completion evidence exists. An
+    /// implementation whose load can fail *after* the engine may already
+    /// hold the model (e.g. a two-step load-then-pin/verify) must return
+    /// [`BackendError::LoadUnconfirmed`]
+    /// for that case instead, so the Supervisor conservatively retains its
+    /// budget if operation completion and release cannot be established.
     ///
     /// **Concurrency contract** (owned by the Supervisor, not this trait):
     /// the Supervisor never issues two `load`/`unload` calls for the *same*

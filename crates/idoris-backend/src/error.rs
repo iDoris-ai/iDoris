@@ -107,9 +107,12 @@ pub enum BackendError {
     /// or its response was lost, or a follow-up step failed (pin, verifying
     /// pin state). Distinct from a plain rejection: the Supervisor must not
     /// assume nothing was allocated — it routes this, like
-    /// [`BackendError::AdapterTimedOut`], through a best-effort `unload` so
-    /// the ledger never forgets memory the engine is really using
-    /// (prdaemon #48 round 2, M1).
+    /// [`BackendError::AdapterTimedOut`], as an operation whose eventual
+    /// allocation cannot be disproved by an unload acknowledgement or an
+    /// empty status snapshot. The Supervisor retains its Error slot and
+    /// budget until the runtime is known to be quiescent/reset; restarting
+    /// only the Supervisor is not sufficient because the old load may still
+    /// be running in the engine (K09/K11).
     #[error("load of {model_id} not confirmed: {message}")]
     LoadUnconfirmed { model_id: String, message: String },
 

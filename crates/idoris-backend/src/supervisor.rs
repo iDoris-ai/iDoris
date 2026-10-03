@@ -90,6 +90,10 @@ struct ModelSlot {
     /// an explicit `unload` defers its actual adapter call until this
     /// drains to 0 (see `handle_unload`).
     inflight: u32,
+    /// A load call timed out or reported an unconfirmed outcome. The engine
+    /// may still finish allocating after any unload/status response; without
+    /// an operation-completion signal the slot cannot safely be released.
+    load_unconfirmed: bool,
 }
 
 enum Command {
@@ -145,6 +149,10 @@ enum LoadFailureOutcome {
     RestorePrevious(PreviousModel),
     /// An uncertain release keeps Error and the larger footprint.
     RetainPreviousOnError(PreviousModel),
+    /// The original load may still allocate after this operation returns.
+    /// Keep the maximum known footprint and permanently block automatic
+    /// release/retry until the adapter can provide completion evidence.
+    RetainUnconfirmedLoad(Option<PreviousModel>),
 }
 
 #[derive(Clone, Copy)]
@@ -499,10 +507,10 @@ async fn confirm_memory_released(
 /// with a misleading `eviction_impossible` (no viable plan) when the real
 /// problem is a stuck, never-cleaned-up ledger entry. Those two cases
 /// settle a fresh load on `Stopped`, or restore a retry's previous slot.
-/// A load timeout, `LoadUnconfirmed`, or `probe_ready` failure/timeout
-/// may leave memory allocated — attempt a best-effort `unload` first.
-/// Successful release settles on `Stopped`; failure keeps `Error` and
-/// the larger of the previous and current estimates.
+/// A load timeout or `LoadUnconfirmed` may still be executing at the engine,
+/// so unload/status cannot prove the original operation will not allocate
+/// later; retain its Error slot. A probe failure occurs after load returned
+/// successfully, so its unload can still confirm release.
 async fn run_load_flow(
     adapter: Arc<dyn RuntimeAdapter>,
     config: SupervisorConfig,
@@ -681,8 +689,9 @@ async fn best_effort_release(
 
 /// A rejected retry restores any previous budget-occupying state, including
 /// Error (K10/H2). Only a fresh load may treat an explicit rejection as free.
-/// A timeout or [`BackendError::LoadUnconfirmed`] instead attempts
-/// [`best_effort_release`] because allocation may already have happened.
+/// A timeout or [`BackendError::LoadUnconfirmed`] still attempts cleanup,
+/// but keeps its budget even if [`best_effort_release`] sees an empty engine:
+/// the original operation can allocate after that snapshot.
 async fn resolve_load_failure(
     adapter: &Arc<dyn RuntimeAdapter>,
     id: &str,
@@ -695,8 +704,10 @@ async fn resolve_load_failure(
         err,
         BackendError::AdapterTimedOut { .. } | BackendError::LoadUnconfirmed { .. }
     ) {
-        let state = best_effort_release(adapter, id, release_limit_gb, config).await;
-        LoadFailureOutcome::after_release(state, previous)
+        // Try to clean up promptly, but this is not proof the original load
+        // operation has ended; its delayed allocation can still follow.
+        let _ = best_effort_release(adapter, id, release_limit_gb, config).await;
+        LoadFailureOutcome::RetainUnconfirmedLoad(previous)
     } else if let Some(previous) = previous {
         LoadFailureOutcome::RestorePrevious(previous)
     } else {
@@ -725,10 +736,11 @@ fn build_snapshot(models: &HashMap<String, ModelSlot>, budget_gb: f64, exclude: 
             id: id.clone(),
             memory_gb: slot.memory_gb,
             state: slot.state,
-            pinned: matches!(
-                slot.policy.keepalive,
-                idoris_contracts::load_policy::Keepalive::Pinned { pinned: true }
-            ),
+            pinned: slot.load_unconfirmed
+                || matches!(
+                    slot.policy.keepalive,
+                    idoris_contracts::load_policy::Keepalive::Pinned { pinned: true }
+                ),
             last_used_seq: slot.last_used_seq,
             inflight: slot.inflight,
         })
@@ -905,6 +917,13 @@ fn handle_load(
         }
         return;
     }
+    // A new attempt cannot supersede an engine-side load that may still run.
+    if let Some(slot) = models.get(&id)
+        && slot.load_unconfirmed
+    {
+        let _ = reply.send(Err(BackendError::model_unavailable(&id)));
+        return;
+    }
     // Before the busy-fallback: an already-Ready model with a matching
     // policy is a no-op, even while an unrelated id is mid-load.
     if let Some(slot) = models.get(&id)
@@ -973,6 +992,7 @@ fn handle_load(
             last_used_seq,
             policy,
             inflight: 0,
+            load_unconfirmed: false,
         },
     );
     *active_op = Some(ActiveOp {
@@ -1058,6 +1078,10 @@ fn handle_unload(
             return;
         }
         Some(_) => {}
+    }
+    if models.get(&id).is_some_and(|slot| slot.load_unconfirmed) {
+        let _ = reply.send(Err(BackendError::model_unavailable(&id)));
+        return;
     }
     if let Some(active) = active_op.as_ref() {
         let _ = reply.send(Err(BackendError::busy(
@@ -1366,6 +1390,23 @@ async fn run_actor(
                                     None => {
                                         violation =
                                             Some(format!("ledger lost {id:?} mid-op (reload)"));
+                                    }
+                                }
+                            }
+                            LoadFailureOutcome::RetainUnconfirmedLoad(previous) => {
+                                match models.get_mut(&id) {
+                                    Some(slot) => {
+                                        slot.state = ModelState::Error;
+                                        slot.load_unconfirmed = true;
+                                        if let Some(previous) = previous {
+                                            slot.policy = previous.policy;
+                                            slot.memory_gb = slot.memory_gb.max(previous.memory_gb);
+                                        }
+                                    }
+                                    None => {
+                                        violation = Some(format!(
+                                            "ledger lost {id:?} mid-op (unconfirmed load)"
+                                        ))
                                     }
                                 }
                             }
@@ -2688,12 +2729,10 @@ mod tests {
     }
 
     /// Medium (follow-up Opus review): a *fresh* (non-reload) load whose
-    /// `adapter.load` call times out is genuinely uncertain — not a
-    /// confirmed rejection — so it must be confirmed via
-    /// `best_effort_release` (an actual `unload` attempt), not settled on
-    /// `Stopped` outright.
+    /// `adapter.load` call times out is genuinely uncertain. A best-effort
+    /// unload is still sent, but its acknowledgement cannot clear the slot.
     #[tokio::test(start_paused = true)]
-    async fn a_timed_out_first_load_is_confirmed_via_best_effort_release_not_assumed_free() {
+    async fn a_timed_out_first_load_stays_charged_after_best_effort_release() {
         let adapter = Arc::new(MockAdapter::new(catalog()));
         adapter.set_load_delay("a", std::time::Duration::from_secs(3600));
         let handle = Supervisor::spawn(
@@ -2713,6 +2752,7 @@ mod tests {
             1,
             "a timeout must trigger a best-effort release attempt, not assume nothing happened"
         );
+        assert_eq!(handle.status().await.unwrap().used_gb, 4.0);
     }
 
     /// A minimal `RuntimeAdapter`: `load` always succeeds but
@@ -2937,14 +2977,13 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.reason_code(), "load_unconfirmed");
         assert_eq!(adapter.unload_calls.load(SeqCst), 1);
-        assert_eq!(handle.status().await.unwrap().used_gb, 0.0);
+        assert_eq!(handle.status().await.unwrap().used_gb, 8.0);
     }
 
-    /// prdaemon #48 round 2, M1: a load the engine accepted but whose
-    /// follow-up step failed must be confirmed via a real `unload`, not
-    /// assumed `Stopped` — here the release succeeds, so the ledger is free.
+    /// An unconfirmed load remains charged because unload/status cannot
+    /// prove the original engine operation has stopped.
     #[tokio::test]
-    async fn an_unconfirmed_load_is_released_via_a_real_unload() {
+    async fn an_unconfirmed_load_stays_charged_after_unload_and_empty_status() {
         let adapter = Arc::new(LoadUnconfirmedAdapter::new(true));
         let handle = Supervisor::spawn(adapter.clone(), SupervisorConfig::default())
             .expect("spawn should succeed");
@@ -2957,16 +2996,14 @@ mod tests {
             adapter
                 .unload_calls
                 .load(std::sync::atomic::Ordering::SeqCst),
-            1,
-            "an unconfirmed load must trigger exactly one best-effort release"
+            1
         );
         let status = handle.status().await.expect("status should succeed");
-        assert_eq!(status.used_gb, 0.0);
+        assert_eq!(status.used_gb, 4.0);
     }
 
-    /// Negative contrast: if that release also fails, the memory may still
-    /// be in use — the slot must keep occupying the ledger (`Error`), never
-    /// be guessed free.
+    /// Both successful and failed unload acknowledgements are insufficient
+    /// for an unconfirmed load.
     #[tokio::test]
     async fn an_unconfirmed_load_whose_release_fails_still_occupies_the_ledger() {
         let adapter = Arc::new(LoadUnconfirmedAdapter::new(false));
@@ -2981,6 +3018,120 @@ mod tests {
             status.used_gb, 4.0,
             "memory that could not be confirmed released must stay on the ledger"
         );
+    }
+
+    /// The adapter returns an empty snapshot and acknowledges unload while a
+    /// detached engine-side load remains pending. Releasing `finish_load`
+    /// later simulates allocation after the Supervisor's timeout.
+    struct DelayedAllocationAdapter {
+        loaded: Arc<std::sync::atomic::AtomicBool>,
+        allocation_finished: Arc<tokio::sync::Notify>,
+        finish_load: Arc<tokio::sync::Notify>,
+        load_started: tokio::sync::Notify,
+        unload_calls: std::sync::atomic::AtomicU32,
+    }
+
+    #[async_trait::async_trait]
+    impl RuntimeAdapter for DelayedAllocationAdapter {
+        async fn list(&self) -> Result<Vec<ModelInfo>, BackendError> {
+            Ok(catalog())
+        }
+        async fn load(&self, _id: &str, _policy: Option<&LoadPolicy>) -> Result<(), BackendError> {
+            self.load_started.notify_one();
+            let loaded = self.loaded.clone();
+            let finish = self.finish_load.clone();
+            let allocation_finished = self.allocation_finished.clone();
+            tokio::spawn(async move {
+                finish.notified().await;
+                loaded.store(true, std::sync::atomic::Ordering::SeqCst);
+                allocation_finished.notify_one();
+            });
+            std::future::pending().await
+        }
+        async fn unload(&self, _id: &str) -> Result<(), BackendError> {
+            self.unload_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+        async fn status(&self) -> Result<BackendStatus, BackendError> {
+            let loaded = self.loaded.load(std::sync::atomic::Ordering::SeqCst);
+            Ok(BackendStatus {
+                pressure: Pressure::Ok,
+                used_gb: if loaded { 8.0 } else { 0.0 },
+                model_memory_max_gb: 0.0,
+                loaded: if loaded { vec!["a".into()] } else { Vec::new() },
+            })
+        }
+        async fn probe_ready(&self, _id: &str) -> Result<bool, BackendError> {
+            Ok(true)
+        }
+        async fn chat(
+            &self,
+            req: ChatRequest,
+            _cancel: CancellationToken,
+        ) -> Result<ChatResponse, BackendError> {
+            Ok(ChatResponse {
+                model: req.model,
+                content: String::new(),
+            })
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn delayed_timed_out_load_stays_charged_and_cannot_be_released_retried_or_evicted() {
+        let adapter = Arc::new(DelayedAllocationAdapter {
+            loaded: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            allocation_finished: Arc::new(tokio::sync::Notify::new()),
+            finish_load: Arc::new(tokio::sync::Notify::new()),
+            load_started: tokio::sync::Notify::new(),
+            unload_calls: std::sync::atomic::AtomicU32::new(0),
+        });
+        let handle = Supervisor::spawn(
+            adapter.clone(),
+            SupervisorConfig {
+                budget_gb: 10.0,
+                adapter_call_timeout: std::time::Duration::from_millis(30),
+                ..SupervisorConfig::default()
+            },
+        )
+        .unwrap();
+        let h = handle.clone();
+        let load = tokio::spawn(async move { h.load("a", 8.0, on_demand_policy()).await });
+        no_hang(adapter.load_started.notified()).await;
+        let err = no_hang(load).await.unwrap().unwrap_err();
+        assert_eq!(err.reason_code(), "adapter_timed_out");
+
+        let initial = handle.status().await.unwrap();
+        assert_eq!(initial.used_gb, 8.0);
+        assert!(
+            initial.loaded.is_empty(),
+            "an unconfirmed model must not be advertised as Ready"
+        );
+        let engine_snapshot = adapter.status().await.unwrap();
+        assert_eq!(engine_snapshot.used_gb, 0.0);
+        assert!(engine_snapshot.loaded.is_empty());
+        let err = handle.unload("a").await.unwrap_err();
+        assert_eq!(err.reason_code(), "model_unavailable");
+        let err = handle.load("a", 1.0, on_demand_policy()).await.unwrap_err();
+        assert_eq!(err.reason_code(), "model_unavailable");
+        let err = handle.load("b", 5.0, on_demand_policy()).await.unwrap_err();
+        assert_eq!(err.reason_code(), "eviction_impossible");
+        assert_eq!(
+            adapter
+                .unload_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+
+        adapter.finish_load.notify_one();
+        no_hang(adapter.allocation_finished.notified()).await;
+        let after = handle.status().await.unwrap();
+        assert_eq!(after.used_gb, 8.0);
+        let engine_snapshot = adapter.status().await.unwrap();
+        assert_eq!(engine_snapshot.used_gb, 8.0);
+        assert_eq!(engine_snapshot.loaded, vec!["a"]);
+        let err = handle.load("b", 5.0, on_demand_policy()).await.unwrap_err();
+        assert_eq!(err.reason_code(), "eviction_impossible");
     }
 
     /// A minimal `RuntimeAdapter` whose `status().used_gb` only drops after

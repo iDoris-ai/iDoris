@@ -71,7 +71,7 @@ async fn run(verify: ResponseTemplate, unload_status: u16) -> f64 {
 
 #[tokio::test]
 async fn status_503_after_load_triggers_a_real_unload() {
-    assert_eq!(run(ResponseTemplate::new(503), 200).await, 0.0);
+    assert_eq!(run(ResponseTemplate::new(503), 200).await, 20.0);
 }
 
 #[tokio::test]
@@ -79,7 +79,7 @@ async fn external_pin_drift_after_load_triggers_a_real_unload() {
     let pinned = ResponseTemplate::new(200).set_body_json(serde_json::json!({
         "models": [{"id": "qwen3-8b", "loaded": true, "pinned": true}]
     }));
-    assert_eq!(run(pinned, 200).await, 0.0);
+    assert_eq!(run(pinned, 200).await, 20.0);
 }
 
 /// If the unload itself fails, the memory may still be held: the ledger
@@ -89,10 +89,11 @@ async fn a_failed_release_keeps_the_memory_on_the_ledger() {
     assert_eq!(run(ResponseTemplate::new(503), 500).await, 20.0);
 }
 
-/// K09/H1: the adapter deadline fires before the Supervisor's outer
-/// deadline. A received load may still allocate memory after that point.
+/// K09/K11: the adapter deadline fires before the Supervisor's outer
+/// deadline. A received load may still allocate after any unload ack and
+/// apparently empty status response, so the ledger must retain its estimate.
 #[tokio::test]
-async fn k09_load_timeout_triggers_release_and_preserves_unreleased_memory() {
+async fn k09_load_timeout_retains_occupancy_after_unload_and_empty_status() {
     let status_body = |loaded_models: &[&str], used: u64| {
         ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "loaded_models": loaded_models, "model_memory_used": used,
@@ -104,7 +105,7 @@ async fn k09_load_timeout_triggers_release_and_preserves_unreleased_memory() {
         (200, status_body(&["qwen3-8b"], 0), 20.0),
         (200, status_body(&[], 20 * 1024 * 1024 * 1024), 20.0),
         (500, status_body(&[], 0), 20.0),
-        (200, status_body(&[], 0), 0.0),
+        (200, status_body(&[], 0), 20.0),
     ];
     for (unload_status, release_status, expected_gb) in scenarios {
         let server = MockServer::start().await;
