@@ -27,11 +27,15 @@ fi
 echo "[conformance-rust] cargo build --release -p idoris-router" >&2
 cargo build --release --locked -p idoris-router
 
-bin="$root/target/release/idoris"
+bin="${CARGO_TARGET_DIR:-$root/target}/release/idoris"
 if [ ! -x "$bin" ]; then
   echo "[conformance-rust] 构建产物不存在或不可执行：$bin" >&2
   exit 1
 fi
+
+# 与 release 布局一致：默认策略从可执行文件旁读取，而非仓库 cwd。
+mkdir -p "$(dirname "$bin")/config"
+cp config/routing-policy.yaml "$(dirname "$bin")/config/routing-policy.yaml"
 
 # idoris-router 当前的骨架不解析 argv（只读 IDORIS_PORT 等环境变量，见
 # crates/idoris-router/src/bin/idoris.rs），conformance harness 又是用

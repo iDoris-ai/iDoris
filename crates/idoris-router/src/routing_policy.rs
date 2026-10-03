@@ -4,17 +4,11 @@
 //! (conformance suite: "不传时落到仓库自带的 config/routing-policy.yaml，
 //! 不是未配置；指向不存在的文件时启动直接失败").
 //!
-//! **Deviation from `serve.ts`**: relative paths resolve against the
-//! current working directory, not a computed repo root. `serve.ts` derives
-//! the repo root from its own module's location on disk specifically to
-//! survive an unusual `cwd` (e.g. a LaunchAgent's default `cwd=/`) — a
-//! compiled Rust binary has no equivalent "next to the source tree"
-//! location to introspect (`std::env::current_exe()` gives the install
-//! path, not a repo path), so resolve-against-cwd is the only option that
-//! generalizes to a real deployment, at the cost of requiring the operator
-//! to run this binary from (or point `IDORIS_ROUTING_POLICY`/
-//! `IDORIS_COMPONENTS_DIR` as absolute paths at) the intended working
-//! directory.
+//! The `idoris` binary resolves an unset/blank policy path next to its
+//! executable so a release can ship with a sibling `config/` directory.
+//! Explicit relative paths still resolve against the current working
+//! directory. [`resolve_routing_policy_path`] remains a cwd-relative path
+//! helper for library callers.
 //!
 //! This crate's decision pipeline ([`idoris_policy::decide`]) doesn't
 //! consume [`RoutingPolicy`]'s rules yet — R2-D only wires up its

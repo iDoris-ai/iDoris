@@ -88,6 +88,7 @@
 - **PR 合并顺序**：评审建议 #4 → #5 → #6（#4 是需求文档，记录的是提出时的状态，紧接 #5 即答复；反序则 `docs/11` 一落地就过期）。三个 PR 均已 APPROVE，等合并。
 
 ## 最近完成
+- 2026-10-03 **v0.1.2**（工作站 A 发版）：release PR #218 合入 `feat/release-packaging`（#213）——发布包随附 `config/`、按二进制自身路径定位，release workflow 上传前对真实 tar.gz 做零配置冒烟（health + 版本 = tag）；crate 版本升至 0.1.2。
 - 2026-10-03 **v0.1.1**（工作站 A 发版）：release PR #209 将 `feat/kernel-hardening`（K01–K15，task PR #172–#187、#207）合入 main；crate 版本升至 0.1.1。冒烟发现的四项问题（模型名回显、stream 未兑现、max_tokens 未生效、需 key 时 `/v1/models` 为空）另立跟进。
 - 2026-09-07 建立集成分支 `preview`；PR #3 retarget 到 `preview` 并 squash 合并（`dd9ae99`）；清理已合并本地分支 `docs/idoris-unified-model-plan`。
 - 2026-09-07 落地 `docs/agent/` 规划七件套（research / acceptance / architecture / spec / roadmap / tasks / progress）+ `.pilot.yml`，把 `docs/01~10` 十篇散文规划蒸馏为 M→F→T 三级台账。
