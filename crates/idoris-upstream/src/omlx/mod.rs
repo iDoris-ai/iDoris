@@ -24,6 +24,8 @@ mod status;
 
 use std::time::Duration;
 
+use admin::AdminRequestError;
+
 use idoris_backend::{
     BackendError, BackendStatus, ChatRequest, ChatResponse, ModelInfo, RuntimeAdapter,
 };
@@ -208,10 +210,10 @@ impl OmlxAdapter {
     /// A `policy` of `None`, or any mode other than `Resident`, takes the
     /// non-resident path.
     ///
-    /// If the `POST` result is unknown, or it succeeds and a later step
-    /// fails, the model may be resident. Such failures are reported as
-    /// [`BackendError::LoadUnconfirmed`], never as a plain rejection — see
-    /// `RuntimeAdapter::load`'s error contract.
+    /// If the `POST` result is unknown, or a later check cannot establish
+    /// loaded state, the model may be resident and the error is
+    /// [`BackendError::LoadUnconfirmed`]. Once loaded state is confirmed,
+    /// deterministic policy failures use `LoadPostconditionFailed`.
     pub async fn load(&self, id: &str, policy: Option<&LoadPolicy>) -> Result<(), BackendError> {
         http::post_load(
             &self.client,
@@ -227,7 +229,10 @@ impl OmlxAdapter {
         } else {
             self.check_not_unexpectedly_pinned(id).await
         };
-        confirmed.map_err(|err| BackendError::load_unconfirmed(id, err.to_string()))
+        confirmed.map_err(|err| match err {
+            BackendError::LoadPostconditionFailed { .. } => err,
+            other => BackendError::load_unconfirmed(id, other.to_string()),
+        })
     }
 
     /// `POST /v1/models/{id}/unload`.
@@ -246,13 +251,29 @@ impl OmlxAdapter {
     async fn pin(&self, id: &str) -> Result<(), BackendError> {
         let path = self.encoded_path("/admin/api/models/", id, "/settings");
         let body = serde_json::json!({ "is_pinned": true });
-        self.admin_request(reqwest::Method::PUT, &path, Some(&body))
+        match self
+            .admin_request_classified(reqwest::Method::PUT, &path, Some(&body))
             .await
-            .map_err(|err| {
-                upstream_error(format!(
-                    "oMLX pin unavailable for {id}: {err} (model is loaded; pin state unconfirmed)"
-                ))
-            })?;
+        {
+            Ok(_) => {}
+            Err(AdminRequestError::Definite(err)) => {
+                self.verify_model_state(id).await.map_err(|verify_err| {
+                    upstream_error(format!(
+                        "oMLX pin rejection was definite ({err}), \
+                         but loaded state could not be verified ({verify_err})"
+                    ))
+                })?;
+                return Err(BackendError::load_postcondition_failed(
+                    id,
+                    format!("oMLX confirmed {id} loaded, but pin policy was rejected: {err}"),
+                ));
+            }
+            Err(AdminRequestError::Unknown(err)) => {
+                return Err(upstream_error(format!(
+                    "oMLX pin state unconfirmed for {id}: {err} (admin mutation outcome is unknown)"
+                )));
+            }
+        }
         // A 2xx from PUT doesn't itself confirm the pin took effect —
         // re-check via the read-only status endpoint. A failure at *this*
         // step is a different, weaker claim than the one above: we don't
@@ -268,10 +289,13 @@ impl OmlxAdapter {
         if state.pinned {
             Ok(())
         } else {
-            Err(upstream_error(format!(
-                "oMLX pin unavailable for {id}: PUT succeeded but GET \
+            Err(BackendError::load_postcondition_failed(
+                id,
+                format!(
+                    "oMLX pin unavailable for {id}: PUT succeeded but GET \
                  /v1/models/status still reports pinned=false"
-            )))
+                ),
+            ))
         }
     }
 
@@ -284,11 +308,14 @@ impl OmlxAdapter {
     async fn check_not_unexpectedly_pinned(&self, id: &str) -> Result<(), BackendError> {
         let state = self.verify_model_state(id).await?;
         if state.pinned {
-            Err(upstream_error(format!(
-                "oMLX model {id} is unexpectedly pinned: loaded with a \
+            Err(BackendError::load_postcondition_failed(
+                id,
+                format!(
+                    "oMLX model {id} is unexpectedly pinned: loaded with a \
                  non-resident policy but oMLX reports pinned=true (external \
                  pin state drift)"
-            )))
+                ),
+            ))
         } else {
             Ok(())
         }
@@ -637,6 +664,7 @@ mod tests {
             vec![
                 (LOAD_METHOD, LOAD_PATH, ResponseTemplate::new(200)),
                 ("POST", "/admin/api/login", ResponseTemplate::new(401)),
+                ("GET", VERIFY_PATH, status_mock(false)),
             ],
         )
         .await;
@@ -646,8 +674,114 @@ mod tests {
             .await
             .expect_err("must fail when the admin session is rejected");
         let msg = err.to_string();
-        assert!(msg.contains("pin unavailable") && msg.contains("401"));
+        assert_eq!(err.reason_code(), "load_postcondition_failed");
+        assert!(msg.contains("pin policy was rejected") && msg.contains("401"));
         assert!(!msg.contains("test-key-should-never-leak"));
+    }
+
+    #[tokio::test]
+    async fn deterministic_pin_rejections_require_strict_loaded_confirmation() {
+        let rejected_login = ResponseTemplate::new(403);
+        let rejected_put = ResponseTemplate::new(404);
+        for (case, loaded_status) in [
+            ("login 401", status_mock(false)),
+            ("login 403", status_mock(true)),
+            ("missing key", status_mock(false)),
+            ("PUT 404", status_mock(true)),
+        ] {
+            let server = MockServer::start().await;
+            let mut routes = vec![
+                (LOAD_METHOD, LOAD_PATH, ResponseTemplate::new(200)),
+                ("GET", VERIFY_PATH, loaded_status),
+            ];
+            match case {
+                "login 401" => {
+                    routes.push(("POST", "/admin/api/login", ResponseTemplate::new(401)))
+                }
+                "login 403" => routes.push(("POST", "/admin/api/login", rejected_login.clone())),
+                "PUT 404" => {
+                    routes.push(("PUT", SETTINGS_PATH, rejected_put.clone()));
+                }
+                _ => {}
+            }
+            mount_all(&server, routes).await;
+            let mut adapter = adapter_for(&server).await;
+            if case == "missing key" {
+                adapter.api_key = None;
+            }
+            let err = adapter
+                .load("qwen3-8b", Some(&resident_policy()))
+                .await
+                .unwrap_err();
+            assert_eq!(
+                err.reason_code(),
+                "load_postcondition_failed",
+                "{case}: {err}"
+            );
+        }
+
+        for verification in [
+            ResponseTemplate::new(404),
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({"models": [{"id":"another-model", "loaded":true, "pinned":false}]})),
+            ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"models": [{"id":"qwen3-8b", "loaded":false, "pinned":false}]}),
+            ),
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({"models": [
+                {"id":"qwen3-8b", "loaded":true, "pinned":false},
+                {"id":"qwen3-8b", "loaded":true, "pinned":true}
+            ]})),
+            ResponseTemplate::new(200).set_body_string("not-json"),
+        ] {
+            let server = MockServer::start().await;
+            mount_all(
+                &server,
+                vec![
+                    (LOAD_METHOD, LOAD_PATH, ResponseTemplate::new(200)),
+                    ("POST", "/admin/api/login", ResponseTemplate::new(401)),
+                    ("GET", VERIFY_PATH, verification),
+                ],
+            )
+            .await;
+            let err = adapter_for(&server)
+                .await
+                .load("qwen3-8b", Some(&resident_policy()))
+                .await
+                .unwrap_err();
+            assert_eq!(err.reason_code(), "load_unconfirmed", "{err}");
+        }
+    }
+
+    #[tokio::test]
+    async fn ambiguous_pin_mutations_stay_unconfirmed_even_if_status_is_loaded() {
+        for response in [
+            ResponseTemplate::new(408),
+            ResponseTemplate::new(500),
+            ResponseTemplate::new(200).set_delay(Duration::from_secs(1)),
+        ] {
+            let server = MockServer::start().await;
+            mount_all(
+                &server,
+                vec![
+                    (LOAD_METHOD, LOAD_PATH, ResponseTemplate::new(200)),
+                    ("PUT", SETTINGS_PATH, response),
+                    ("GET", VERIFY_PATH, status_mock(true)),
+                ],
+            )
+            .await;
+            let adapter = adapter_for(&server).await;
+            let err = adapter
+                .load("qwen3-8b", Some(&resident_policy()))
+                .await
+                .unwrap_err();
+            assert_eq!(err.reason_code(), "load_unconfirmed", "{err}");
+            let requests = server.received_requests().await.unwrap();
+            assert!(
+                !requests
+                    .iter()
+                    .any(|request| request.url.path() == VERIFY_PATH)
+            );
+        }
     }
 
     #[tokio::test]
@@ -667,6 +801,7 @@ mod tests {
             .await
             .expect_err("must fail on undeclared external pin");
         assert!(err.to_string().contains("unexpectedly pinned"));
+        assert_eq!(err.reason_code(), "load_postcondition_failed");
     }
 
     #[tokio::test]
@@ -706,33 +841,29 @@ mod tests {
             .await
             .expect_err("PUT 2xx must not be trusted without verification");
         assert!(err.to_string().contains("still reports pinned=false"));
+        assert_eq!(err.reason_code(), "load_postcondition_failed");
     }
 
-    /// prdaemon #48 round 2, M1: once `POST .../load` has succeeded, a
-    /// failing follow-up check must be reported as `LoadUnconfirmed` (the
-    /// model may be resident), not as a plain rejection.
+    /// Once `POST .../load` has succeeded, unknown verification results
+    /// remain unconfirmed; a fully parsed
+    /// loaded entry with externally pinned state is a known policy failure.
     #[tokio::test]
     async fn a_failure_after_the_load_post_is_reported_as_unconfirmed() {
-        for (verify, label) in [
-            (ResponseTemplate::new(503), "status 503"),
-            (status_mock(true), "external pin drift"),
-        ] {
-            let server = MockServer::start().await;
-            mount_all(
-                &server,
-                vec![
-                    (LOAD_METHOD, LOAD_PATH, ResponseTemplate::new(200)),
-                    ("GET", VERIFY_PATH, verify),
-                ],
-            )
-            .await;
-            let err = adapter_for(&server)
-                .await
-                .load("qwen3-8b", None)
-                .await
-                .expect_err(label);
-            assert_eq!(err.reason_code(), "load_unconfirmed", "{label}: {err}");
-        }
+        let server = MockServer::start().await;
+        mount_all(
+            &server,
+            vec![
+                (LOAD_METHOD, LOAD_PATH, ResponseTemplate::new(200)),
+                ("GET", VERIFY_PATH, ResponseTemplate::new(503)),
+            ],
+        )
+        .await;
+        let err = adapter_for(&server)
+            .await
+            .load("qwen3-8b", None)
+            .await
+            .unwrap_err();
+        assert_eq!(err.reason_code(), "load_unconfirmed");
     }
 
     /// Negative contrast: a rejected `POST .../load` allocated nothing and

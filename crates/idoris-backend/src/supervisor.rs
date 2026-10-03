@@ -762,6 +762,9 @@ async fn run_load_flow(
             &err,
             BackendError::AdapterTimedOut { .. } | BackendError::LoadUnconfirmed { .. }
         );
+        // LoadPostconditionFailed is deliberately absent here: it confirms
+        // the engine load ended, so its fence can clear even when cleanup
+        // failed and `failure_outcome` keeps an Error reservation.
         let fence_resolved = !unresolved_load && load_fence.clear().is_ok();
         let failure_outcome = if unresolved_load || fence_resolved {
             failure_outcome
@@ -856,7 +859,10 @@ async fn best_effort_release(
 /// Error (K10/H2). Only a fresh load may treat an explicit rejection as free.
 /// A timeout or [`BackendError::LoadUnconfirmed`] still attempts cleanup,
 /// but keeps its budget even if [`best_effort_release`] sees an empty engine:
-/// the original operation can allocate after that snapshot.
+/// the original operation can allocate after that snapshot. A
+/// [`BackendError::LoadPostconditionFailed`] confirms that load has ended,
+/// so cleanup success releases the slot and cleanup failure retains an
+/// Error slot with the previous footprint where one existed.
 async fn resolve_load_failure(
     adapter: &Arc<dyn RuntimeAdapter>,
     id: &str,
@@ -865,7 +871,12 @@ async fn resolve_load_failure(
     release_limit_gb: f64,
     config: &SupervisorConfig,
 ) -> LoadFailureOutcome {
-    if matches!(
+    if matches!(err, BackendError::LoadPostconditionFailed { .. }) {
+        match best_effort_release(adapter, id, release_limit_gb, config).await {
+            Some(status) => LoadFailureOutcome::SettleReleased(status),
+            None => LoadFailureOutcome::after_release(ModelState::Error, previous),
+        }
+    } else if matches!(
         err,
         BackendError::AdapterTimedOut { .. } | BackendError::LoadUnconfirmed { .. }
     ) {
@@ -1845,6 +1856,60 @@ mod tests {
     use super::*;
     use crate::mock::MockAdapter;
     use crate::types::ModelInfo;
+
+    /// Simulates an engine-confirmed load followed by a deterministic
+    /// postcondition failure, while retaining MockAdapter's real unload,
+    /// status, and durable fence behavior.
+    struct PostconditionFailureAdapter {
+        inner: Arc<MockAdapter>,
+        fail_postcondition: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl RuntimeAdapter for PostconditionFailureAdapter {
+        fn load_fence_path(&self) -> Result<std::path::PathBuf, BackendError> {
+            self.inner.load_fence_path()
+        }
+
+        async fn list(&self) -> Result<Vec<ModelInfo>, BackendError> {
+            self.inner.list().await
+        }
+
+        async fn load(&self, id: &str, policy: Option<&LoadPolicy>) -> Result<(), BackendError> {
+            self.inner.load(id, policy).await?;
+            if self
+                .fail_postcondition
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                Err(BackendError::load_postcondition_failed(
+                    id,
+                    "pin confirmation failed (test double)",
+                ))
+            } else {
+                Ok(())
+            }
+        }
+
+        async fn unload(&self, id: &str) -> Result<(), BackendError> {
+            self.inner.unload(id).await
+        }
+
+        async fn status(&self) -> Result<BackendStatus, BackendError> {
+            self.inner.status().await
+        }
+
+        async fn probe_ready(&self, id: &str) -> Result<bool, BackendError> {
+            self.inner.probe_ready(id).await
+        }
+
+        async fn chat(
+            &self,
+            req: ChatRequest,
+            cancel: CancellationToken,
+        ) -> Result<ChatResponse, BackendError> {
+            self.inner.chat(req, cancel).await
+        }
+    }
 
     /// Wraps a call that a regression could make hang forever, so a
     /// reintroduced bug fails *this test* (fast, whether real- or
@@ -3465,6 +3530,101 @@ mod tests {
             status.used_gb, 4.0,
             "memory that could not be confirmed released must stay on the ledger"
         );
+    }
+
+    /// A confirmed load whose postcondition fails is released, the slot is
+    /// cleared, and the durable fence permits a later load. It consumes one
+    /// load attempt rather than entering the OOM retry path.
+    #[tokio::test]
+    async fn postcondition_failure_releases_and_allows_a_later_load() {
+        let inner = Arc::new(MockAdapter::new(catalog()));
+        let adapter = Arc::new(PostconditionFailureAdapter {
+            inner: inner.clone(),
+            fail_postcondition: std::sync::atomic::AtomicBool::new(true),
+        });
+        let handle =
+            Supervisor::spawn(adapter, SupervisorConfig::default()).expect("spawn should succeed");
+
+        let err = handle
+            .load("a", 4.0, on_demand_policy())
+            .await
+            .expect_err("postcondition failure must surface");
+        assert_eq!(err.reason_code(), "load_postcondition_failed");
+        assert_eq!(inner.load_call_count("a"), 1);
+        assert_eq!(inner.unload_call_count("a"), 1);
+        assert_eq!(handle.status().await.unwrap().used_gb, 0.0);
+
+        handle
+            .load("a", 4.0, on_demand_policy())
+            .await
+            .expect("a later load must pass after the fence was cleared");
+        assert_eq!(inner.load_call_count("a"), 2);
+        assert_eq!(inner.unload_call_count("a"), 1);
+    }
+
+    /// If release cannot be confirmed, retain an Error reservation so a
+    /// failed postcondition cannot undercount engine memory.
+    #[tokio::test]
+    async fn postcondition_failure_with_release_error_retains_occupancy() {
+        let inner = Arc::new(MockAdapter::new(catalog()));
+        inner.set_unload_script("a", vec![crate::mock::UnloadOutcome::Fail]);
+        let adapter = Arc::new(PostconditionFailureAdapter {
+            inner: inner.clone(),
+            fail_postcondition: std::sync::atomic::AtomicBool::new(true),
+        });
+        let handle =
+            Supervisor::spawn(adapter, SupervisorConfig::default()).expect("spawn should succeed");
+
+        let err = handle
+            .load("a", 4.0, on_demand_policy())
+            .await
+            .expect_err("postcondition failure must surface");
+        assert_eq!(err.reason_code(), "load_postcondition_failed");
+        assert_eq!(inner.load_call_count("a"), 1);
+        assert_eq!(inner.unload_call_count("a"), 1);
+        assert_eq!(handle.status().await.unwrap().used_gb, 4.0);
+    }
+
+    #[tokio::test]
+    async fn postcondition_cleanup_failure_preserves_previous_footprint() {
+        let inner = Arc::new(MockAdapter::new(catalog()));
+        let adapter = Arc::new(PostconditionFailureAdapter {
+            inner: inner.clone(),
+            fail_postcondition: std::sync::atomic::AtomicBool::new(false),
+        });
+        let handle = Supervisor::spawn(adapter.clone(), SupervisorConfig::default())
+            .expect("spawn should succeed");
+
+        handle
+            .load("a", 8.0, on_demand_policy())
+            .await
+            .expect("initial load should succeed");
+        inner.set_unload_script("a", vec![crate::mock::UnloadOutcome::Fail]);
+        adapter
+            .fail_postcondition
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let err = handle
+            .load("a", 2.0, resident_policy())
+            .await
+            .expect_err("postcondition failure must surface");
+        assert_eq!(err.reason_code(), "load_postcondition_failed");
+        assert_eq!(inner.load_call_count("a"), 2);
+        assert_eq!(inner.unload_call_count("a"), 1);
+        assert_eq!(handle.status().await.unwrap().used_gb, 8.0);
+
+        handle
+            .load("a", 2.0, resident_policy())
+            .await
+            .expect("an Error slot can be retried after the confirmed load ended");
+        assert_eq!(inner.load_call_count("a"), 3);
+        assert_eq!(handle.status().await.unwrap().used_gb, 2.0);
+        handle
+            .unload("a")
+            .await
+            .expect("the retried model can be unloaded");
+        assert_eq!(inner.unload_call_count("a"), 2);
+        assert_eq!(handle.status().await.unwrap().used_gb, 0.0);
     }
 
     /// The adapter returns an empty snapshot and acknowledges unload while a

@@ -25,7 +25,7 @@ fn on_demand() -> LoadPolicy {
     }
 }
 
-async fn run(verify: ResponseTemplate, unload_status: u16) -> f64 {
+async fn run(verify: ResponseTemplate, unload_status: u16) -> (String, f64) {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/v1/models/qwen3-8b/load"))
@@ -64,15 +64,18 @@ async fn run(verify: ResponseTemplate, unload_status: u16) -> f64 {
         .load("qwen3-8b", 20.0, on_demand())
         .await
         .expect_err("load must fail when the post-load check fails");
-    assert_eq!(err.reason_code(), "load_unconfirmed", "{err}");
+    let reason = err.reason_code().to_owned();
     let used_gb = handle.status().await.expect("status").used_gb;
     server.verify().await; // exactly one real unload was sent
-    used_gb
+    (reason, used_gb)
 }
 
 #[tokio::test]
 async fn status_503_after_load_triggers_a_real_unload() {
-    assert_eq!(run(ResponseTemplate::new(503), 200).await, 20.0);
+    assert_eq!(
+        run(ResponseTemplate::new(503), 200).await,
+        ("load_unconfirmed".to_owned(), 20.0)
+    );
 }
 
 #[tokio::test]
@@ -80,14 +83,20 @@ async fn external_pin_drift_after_load_triggers_a_real_unload() {
     let pinned = ResponseTemplate::new(200).set_body_json(serde_json::json!({
         "models": [{"id": "qwen3-8b", "loaded": true, "pinned": true}]
     }));
-    assert_eq!(run(pinned, 200).await, 20.0);
+    assert_eq!(
+        run(pinned, 200).await,
+        ("load_postcondition_failed".to_owned(), 0.0)
+    );
 }
 
 /// If the unload itself fails, the memory may still be held: the ledger
 /// must keep counting it instead of reporting it free.
 #[tokio::test]
 async fn a_failed_release_keeps_the_memory_on_the_ledger() {
-    assert_eq!(run(ResponseTemplate::new(503), 500).await, 20.0);
+    assert_eq!(
+        run(ResponseTemplate::new(503), 500).await,
+        ("load_unconfirmed".to_owned(), 20.0)
+    );
 }
 
 /// Startup reconciliation reserves memory already held by another client.

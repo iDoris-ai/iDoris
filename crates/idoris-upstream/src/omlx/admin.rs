@@ -8,11 +8,27 @@ use serde_json::{Value, json};
 
 use super::{OmlxAdapter, upstream_error};
 
+#[derive(Debug)]
+pub(super) enum AdminRequestError {
+    Definite(BackendError),
+    Unknown(BackendError),
+}
+
+impl AdminRequestError {
+    pub(super) fn into_backend(self) -> BackendError {
+        match self {
+            Self::Definite(err) | Self::Unknown(err) => err,
+        }
+    }
+}
+
 impl OmlxAdapter {
-    async fn admin_login(&self) -> Result<HeaderValue, BackendError> {
-        let key = self
-            .api_key()
-            .ok_or_else(|| upstream_error("oMLX admin login requires the main API key"))?;
+    async fn admin_login(&self) -> Result<HeaderValue, AdminRequestError> {
+        let key = self.api_key().ok_or_else(|| {
+            AdminRequestError::Definite(upstream_error(
+                "oMLX admin login requires the main API key",
+            ))
+        })?;
         let response = self
             .client
             .post(format!("{}/admin/api/login", self.base_url))
@@ -20,7 +36,9 @@ impl OmlxAdapter {
             .json(&json!({"api_key": key}))
             .send()
             .await
-            .map_err(|_| upstream_error("oMLX admin login transport failure"))?;
+            .map_err(|_| {
+                AdminRequestError::Unknown(upstream_error("oMLX admin login transport failure"))
+            })?;
         admin_check_status(&response)?;
         let mut cookie = response
             .headers()
@@ -33,14 +51,19 @@ impl OmlxAdapter {
                     .is_some_and(|value| !value.is_empty())
             })
             .and_then(|pair| HeaderValue::from_str(pair).ok())
-            .ok_or_else(|| upstream_error("oMLX admin login returned no session cookie"))?;
+            .ok_or_else(|| {
+                AdminRequestError::Unknown(upstream_error(
+                    "oMLX admin login returned no session cookie",
+                ))
+            })?;
         cookie.set_sensitive(true);
-        let body: Value = response
-            .json()
-            .await
-            .map_err(|_| upstream_error("oMLX admin login returned invalid JSON"))?;
+        let body: Value = response.json().await.map_err(|_| {
+            AdminRequestError::Unknown(upstream_error("oMLX admin login returned invalid JSON"))
+        })?;
         if body["success"].as_bool() != Some(true) {
-            return Err(upstream_error("oMLX admin login was not successful"));
+            return Err(AdminRequestError::Unknown(upstream_error(
+                "oMLX admin login was not successful",
+            )));
         }
         Ok(cookie)
     }
@@ -54,14 +77,25 @@ impl OmlxAdapter {
         path: &str,
         body: Option<&Value>,
     ) -> Result<Value, BackendError> {
+        self.admin_request_classified(method, path, body)
+            .await
+            .map_err(AdminRequestError::into_backend)
+    }
+
+    pub(super) async fn admin_request_classified(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<&Value>,
+    ) -> Result<Value, AdminRequestError> {
         let mut session = self.admin_session.lock().await;
         for attempt in 0..2 {
             if session.is_none() {
                 *session = Some(self.admin_login().await?);
             }
-            let cookie = session
-                .as_ref()
-                .ok_or_else(|| upstream_error("oMLX admin session unavailable"))?;
+            let cookie = session.as_ref().ok_or_else(|| {
+                AdminRequestError::Unknown(upstream_error("oMLX admin session unavailable"))
+            })?;
             let mut request = self
                 .client
                 .request(method.clone(), format!("{}{path}", self.base_url))
@@ -70,10 +104,9 @@ impl OmlxAdapter {
             if let Some(body) = body {
                 request = request.json(body);
             }
-            let response = request
-                .send()
-                .await
-                .map_err(|_| upstream_error("oMLX admin request transport failure"))?;
+            let response = request.send().await.map_err(|_| {
+                AdminRequestError::Unknown(upstream_error("oMLX admin request transport failure"))
+            })?;
             if response.status() == StatusCode::UNAUTHORIZED {
                 *session = None;
                 if attempt == 0 {
@@ -82,25 +115,38 @@ impl OmlxAdapter {
             }
             admin_check_status(&response)?;
             return if method == Method::GET {
-                response
-                    .json()
-                    .await
-                    .map_err(|_| upstream_error("oMLX admin request returned invalid JSON"))
+                response.json().await.map_err(|_| {
+                    AdminRequestError::Unknown(upstream_error(
+                        "oMLX admin request returned invalid JSON",
+                    ))
+                })
             } else {
                 Ok(Value::Null)
             };
         }
-        Err(upstream_error("oMLX admin session unavailable"))
+        Err(AdminRequestError::Unknown(upstream_error(
+            "oMLX admin session unavailable",
+        )))
     }
 }
 
-fn admin_check_status(response: &reqwest::Response) -> Result<(), BackendError> {
-    if response.status().is_success() {
+fn admin_check_status(response: &reqwest::Response) -> Result<(), AdminRequestError> {
+    let status = response.status();
+    if status.is_success() {
         Ok(())
     } else {
-        Err(upstream_error(format!(
+        let err = upstream_error(format!(
             "oMLX admin request failed: HTTP {}",
-            response.status().as_u16()
-        )))
+            status.as_u16()
+        ));
+        if is_definite_rejection(status) {
+            Err(AdminRequestError::Definite(err))
+        } else {
+            Err(AdminRequestError::Unknown(err))
+        }
     }
+}
+
+fn is_definite_rejection(status: StatusCode) -> bool {
+    status.is_client_error() && status != StatusCode::REQUEST_TIMEOUT
 }
