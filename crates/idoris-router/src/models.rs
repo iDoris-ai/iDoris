@@ -140,7 +140,14 @@ pub async fn list_models(
     let mut data = Vec::new();
     for card in cards {
         let id = &card.provider.id;
-        if card.form != Form::HttpService || health.is_cooling_down(id, Instant::now()) {
+        if card.form != Form::HttpService {
+            continue;
+        }
+        // A trusted loopback oMLX card has credential semantics that must stay
+        // fail-closed. Skipping its probe during cooldown could turn a new
+        // 401/403 (or an invalid local credential) into a misleading partial
+        // 200. Other providers retain the task-30 discovery cooldown.
+        if !is_loopback_omlx(card) && health.is_cooling_down(id, Instant::now()) {
             continue;
         }
         match list_one(client, card, api_key.as_deref()).await? {
@@ -262,6 +269,32 @@ mod tests {
             assert!(resp.data.is_empty());
         }
         assert_eq!(server.received_requests().await.unwrap().len(), 4);
+    }
+
+    #[tokio::test]
+    async fn loopback_omlx_auth_failure_is_not_hidden_by_cooldown() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(401))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = reqwest::Client::new();
+        let mut omlx = card("omlx", &server.uri(), Form::HttpService);
+        omlx.version_pin = "omlx@0.6.4".into();
+        let health = HealthTracker::default();
+        let now = Instant::now();
+        for _ in 0..3 {
+            health.record("omlx", false, now);
+        }
+        assert!(health.is_cooling_down("omlx", now));
+
+        assert!(matches!(
+            list_models(&client, &[omlx], &health).await,
+            Err(ModelsError::UpstreamAuthenticationFailed { .. })
+        ));
+        server.verify().await;
     }
 
     #[tokio::test]
