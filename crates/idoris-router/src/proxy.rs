@@ -233,6 +233,10 @@ pub struct ChatProxy {
     flight_bytes: Arc<AtomicUsize>,
     permits: std::sync::Arc<tokio::sync::Semaphore>,
     stream_idle_timeout: Duration,
+    #[cfg(test)]
+    pub(crate) stream_eof_observed: Option<Arc<tokio::sync::Notify>>,
+    #[cfg(test)]
+    pub(crate) stream_read_waiting: Option<Arc<tokio::sync::Notify>>,
     pub(crate) retry_delays: Vec<Duration>,
     pub(crate) cache: Mutex<IndexMap<String, CacheEntry>>,
     flights: Mutex<IndexMap<String, Arc<Flight>>>,
@@ -255,7 +259,11 @@ impl ChatProxy {
             max_flight_bytes: 32 * 1024 * 1024,
             flight_bytes: Arc::new(AtomicUsize::new(0)),
             permits: std::sync::Arc::new(tokio::sync::Semaphore::new(32)),
-            stream_idle_timeout: Duration::from_secs(60),
+            stream_idle_timeout: Duration::from_secs(30),
+            #[cfg(test)]
+            stream_eof_observed: None,
+            #[cfg(test)]
+            stream_read_waiting: None,
             // TS default (`proxy.ts`'s `ProxyDeps.retryDelaysMs` default).
             retry_delays: vec![Duration::from_millis(250), Duration::from_secs(1)],
             cache: Mutex::new(IndexMap::new()),
@@ -422,18 +430,6 @@ impl ChatProxy {
         })
         .await
         .map_err(|_| 504u16)?
-    }
-
-    async fn send_headers(
-        &self,
-        request: reqwest::RequestBuilder,
-    ) -> Result<reqwest::Response, u16> {
-        match tokio::time::timeout(self.header_timeout, request.send()).await {
-            Ok(Ok(response)) => Ok(response),
-            Ok(Err(error)) if error.is_timeout() => Err(504),
-            Ok(Err(_)) => Err(502),
-            Err(_) => Err(504),
-        }
     }
 
     async fn sleep_retry(&self, attempt: usize) {
@@ -766,25 +762,26 @@ impl ChatProxy {
     /// outright still gets a plain JSON/text error body, never an SSE
     /// stream carrying an error.
     pub async fn forward_stream(&self, endpoint: &str, body: &Value) -> StreamOutcome {
-        let permit = match self.permits.clone().try_acquire_owned() {
-            Ok(permit) => permit,
-            Err(_) => {
-                return StreamOutcome::Buffered {
-                    status: 503,
-                    body: Bytes::from_static(br#"{"error":{"type":"upstream_unavailable"}}"#),
-                    content_type: Some("application/json".into()),
-                };
-            }
+        // Reject immediately rather than accumulate unbounded waiters.
+        let Ok(permit) = self.permits.clone().try_acquire_owned() else {
+            return Self::stream_failure(503);
         };
+        let permit = Arc::new(permit);
         let url = format!("{}/v1/chat/completions", endpoint.trim_end_matches('/'));
         let mut payload = body.clone();
         if let Some(obj) = payload.as_object_mut() {
             obj.insert("stream".to_string(), Value::Bool(true));
         }
-        match self
-            .send_headers(self.client.post(&url).json(&payload))
-            .await
+        let sent = match tokio::time::timeout(
+            self.header_timeout,
+            self.client.post(&url).json(&payload).send(),
+        )
+        .await
         {
+            Ok(sent) => sent,
+            Err(_) => return Self::stream_failure(504),
+        };
+        match sent {
             Ok(resp) => {
                 let status = resp.status().as_u16();
                 let content_type = resp
@@ -793,61 +790,156 @@ impl ChatProxy {
                     .and_then(|v| v.to_str().ok())
                     .map(str::to_string);
                 if (200..300).contains(&status) {
-                    let idle_timeout = self.stream_idle_timeout;
-                    // The stream and each emitted chunk share the permit.
-                    // Hyper may retain chunks after polling EOF, so the final
-                    // chunk owner must release the permit only when it drops.
-                    // The server's WriteTimeoutListener bounds stalled downstream
-                    // writes even while hyper stops polling this body.
-                    let permit = Arc::new(permit);
-                    let chunks = stream::unfold(Some((resp, permit)), move |state| async move {
-                        let (mut response, permit) = state?;
-                        match tokio::time::timeout(idle_timeout, response.chunk()).await {
-                            Ok(Ok(Some(chunk))) => Some((
-                                Ok(with_permit(chunk, Arc::clone(&permit))),
-                                Some((response, permit)),
-                            )),
-                            Ok(Ok(None)) => None,
-                            Ok(Err(error)) => {
-                                Some((Err(std::io::Error::other(error.to_string())), None))
+                    let idle = self.stream_idle_timeout;
+                    #[cfg(test)]
+                    let eof_observed = self.stream_eof_observed.clone();
+                    #[cfg(test)]
+                    let read_waiting = self.stream_read_waiting.clone();
+                    // Keep upstream reads running independently of downstream
+                    // body polling. A single queued chunk bounds buffering;
+                    // both reading and waiting for queue capacity have an
+                    // idle deadline. Dropping the body closes the receiver,
+                    // which cancels the task and releases the permit.
+                    let (tx, rx) = tokio::sync::mpsc::channel(1);
+                    let (terminal_tx, terminal_rx) = tokio::sync::oneshot::channel();
+                    let (drained_tx, drained_rx) = tokio::sync::oneshot::channel();
+                    let producer_permit = Arc::clone(&permit);
+                    tokio::spawn(async move {
+                        let mut resp = resp;
+                        let mut terminal_error = None;
+                        let mut reached_eof = false;
+                        loop {
+                            let read = tokio::select! {
+                                _ = tx.closed() => break,
+                                read = tokio::time::timeout(idle, resp.chunk()) => read,
+                            };
+                            let chunk = match read {
+                                Err(_) => {
+                                    terminal_error = Some(std::io::Error::new(
+                                        std::io::ErrorKind::TimedOut,
+                                        "upstream stream idle timeout",
+                                    ));
+                                    break;
+                                }
+                                Ok(Err(err)) => {
+                                    terminal_error = Some(std::io::Error::other(err));
+                                    break;
+                                }
+                                Ok(Ok(None)) => {
+                                    reached_eof = true;
+                                    #[cfg(test)]
+                                    if let Some(eof_observed) = &eof_observed {
+                                        eof_observed.notify_one();
+                                    }
+                                    break;
+                                }
+                                Ok(Ok(Some(chunk))) => chunk,
+                            };
+                            let reserve = tokio::select! {
+                                _ = tx.closed() => break,
+                                reserve = tokio::time::timeout(idle, tx.reserve()) => reserve,
+                            };
+                            let slot = match reserve {
+                                Ok(Ok(slot)) => slot,
+                                Ok(Err(_)) => break,
+                                Err(_) => {
+                                    terminal_error = Some(std::io::Error::new(
+                                        std::io::ErrorKind::TimedOut,
+                                        "upstream stream idle timeout while downstream is backpressured",
+                                    ));
+                                    break;
+                                }
+                            };
+                            slot.send(chunk);
+                            #[cfg(test)]
+                            if let Some(read_waiting) = &read_waiting {
+                                read_waiting.notify_one();
                             }
-                            Err(_) => Some((
-                                Err(std::io::Error::new(
-                                    std::io::ErrorKind::TimedOut,
-                                    "upstream stream idle timeout",
-                                )),
-                                None,
-                            )),
                         }
+                        drop(resp);
+                        if let Some(error) = terminal_error {
+                            let _ = terminal_tx.send(Err(error));
+                        } else if reached_eof {
+                            // Wait for downstream EOF too. This bounds the
+                            // lifetime of an unread final chunk after upstream
+                            // EOF, and lets the body observe the idle failure.
+                            drop(tx);
+                            match tokio::time::timeout(idle, drained_rx).await {
+                                Ok(Ok(())) => {
+                                    let _ = terminal_tx.send(Ok(()));
+                                }
+                                Ok(Err(_)) => {}
+                                Err(_) => {
+                                    let _ = terminal_tx.send(Err(std::io::Error::new(
+                                        std::io::ErrorKind::TimedOut,
+                                        "downstream stream idle timeout after upstream EOF",
+                                    )));
+                                }
+                            }
+                        }
+                        // Producer and body hold separate references: task
+                        // completion releases the producer's, while the body
+                        // retains its permit through EOF/error consumption or
+                        // until the body is dropped.
+                        drop(producer_permit);
                     });
-                    let body = Body::from_stream(chunks);
+                    let stream = stream::unfold(
+                        (
+                            rx,
+                            Some(terminal_rx),
+                            Some(drained_tx),
+                            Some(Arc::clone(&permit)),
+                        ),
+                        |(mut rx, terminal_rx, drained_tx, permit)| async move {
+                            if let Some(chunk) = rx.recv().await {
+                                return Some((
+                                    Ok(with_permit(chunk, Arc::clone(permit.as_ref()?))),
+                                    (rx, terminal_rx, drained_tx, permit),
+                                ));
+                            }
+                            if let Some(drained_tx) = drained_tx {
+                                let _ = drained_tx.send(());
+                            }
+                            let terminal_rx = terminal_rx?;
+                            match terminal_rx.await {
+                                Ok(Ok(())) => {
+                                    drop(permit);
+                                    None
+                                }
+                                Ok(Err(error)) => {
+                                    drop(permit);
+                                    Some((Err(error), (rx, None, None, None)))
+                                }
+                                Err(_) => None,
+                            }
+                        },
+                    );
                     StreamOutcome::Stream {
                         status,
                         content_type,
-                        response: body,
+                        response: axum::body::Body::from_stream(stream),
                     }
                 } else {
                     match self.read_buffered(resp).await {
                         Ok(body) => StreamOutcome::Buffered {
                             status,
-                            body: with_permit(body, Arc::new(permit)),
+                            body: with_permit(body, Arc::clone(&permit)),
                             content_type,
                         },
-                        Err(error_status) => StreamOutcome::Buffered {
-                            status: error_status,
-                            body: Bytes::from_static(
-                                br#"{"error":{"type":"upstream_unavailable"}}"#,
-                            ),
-                            content_type: Some("application/json".into()),
-                        },
+                        Err(status) => Self::stream_failure(status),
                     }
                 }
             }
-            Err(status) => StreamOutcome::Buffered {
-                status,
-                body: Bytes::from_static(br#"{"error":{"type":"upstream_unavailable"}}"#),
-                content_type: Some("application/json".to_string()),
-            },
+            Err(err) => Self::stream_failure(if err.is_timeout() { 504 } else { 502 }),
+        }
+    }
+
+    fn stream_failure(status: u16) -> StreamOutcome {
+        let failure = Self::failure(status, 0);
+        StreamOutcome::Buffered {
+            status,
+            body: failure.body,
+            content_type: failure.content_type,
         }
     }
 }
@@ -1449,3 +1541,15 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "proxy/stream_limits_tests.rs"]
+mod stream_limits_tests;
+
+#[cfg(test)]
+#[path = "proxy/slow_reader_tests.rs"]
+mod k14_slow_reader_tests;
+
+#[cfg(test)]
+#[path = "proxy_stream_termination_tests.rs"]
+mod stream_termination_tests;

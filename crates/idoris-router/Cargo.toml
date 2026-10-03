@@ -30,7 +30,7 @@ idoris-tenancy = { workspace = true }
 idoris-upstream = { workspace = true }
 axum = { workspace = true }
 futures-util = "0.3"
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["io-util"] }
 tokio-util = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

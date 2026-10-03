@@ -36,6 +36,8 @@ pub mod models;
 pub mod proxy;
 
 mod sse;
+
+/// Per-connection deadlines for stalled HTTP response writes.
 pub mod write_timeout;
 
 use std::net::IpAddr;
@@ -650,10 +652,10 @@ async fn chat_via_proxy_stream(
             response: upstream,
         } => {
             let status = StatusCode::from_u16(status).unwrap_or(StatusCode::OK);
-            // The guard preserves incremental bytes and connection ownership:
-            // dropping the body still cancels upstream; an application-level
-            // truncation aborts the downstream body just like a transport error.
-            let body = Body::from_stream(sse::ensure_terminated(upstream.into_data_stream()));
+            // Validate application termination around the permit-owning body.
+            // Producer timeouts remain errors; only clean EOF without [DONE]
+            // becomes an explicit truncation error.
+            let body = terminated_proxy_body(upstream);
             let mut response = Response::builder()
                 .status(status)
                 .body(body)
@@ -670,6 +672,11 @@ async fn chat_via_proxy_stream(
             response
         }
     }
+}
+
+/// Preserve proxy deadlines and ownership while rejecting incomplete SSE.
+fn terminated_proxy_body(upstream: Body) -> Body {
+    Body::from_stream(sse::ensure_terminated(upstream.into_data_stream()))
 }
 
 /// The non-streaming half of [`chat_via_proxy`] (this PR's predecessor —

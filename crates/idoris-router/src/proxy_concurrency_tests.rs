@@ -202,22 +202,25 @@ async fn stream_errors_and_unpolled_or_polled_body_drops_release_the_permit() {
     drop(bytes);
     assert_eq!(proxy.permits.available_permits(), 1);
 
-    // Dropping before the first poll still drops the body-owned permit.
+    // Dropping before the first poll wakes the producer to cancel upstream.
     let url = one_response(b"HTTP/1.1 200 OK\r\ncontent-length: 1\r\n\r\nx");
-    let proxy = test_proxy();
+    let mut proxy = test_proxy();
+    proxy.stream_idle_timeout = Duration::from_secs(5);
     let body = match proxy.forward_stream(&url, &serde_json::json!({})).await {
         StreamOutcome::Stream { response, .. } => response,
         StreamOutcome::Buffered { status, .. } => panic!("expected stream, got {status}"),
     };
     assert_eq!(proxy.permits.available_permits(), 0);
     drop(body);
+    wait_for_producer_release(&proxy).await;
     assert_eq!(proxy.permits.available_permits(), 1);
 
     // Dropping a polled body still leaves the emitted chunk holding the permit.
     let url = one_response(
         b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n1\r\ny\r\n1\r\nz\r\n0\r\n\r\n",
     );
-    let proxy = test_proxy();
+    let mut proxy = test_proxy();
+    proxy.stream_idle_timeout = Duration::from_secs(5);
     let mut body = match proxy.forward_stream(&url, &serde_json::json!({})).await {
         StreamOutcome::Stream { response, .. } => response,
         StreamOutcome::Buffered { status, .. } => panic!("expected stream, got {status}"),
@@ -227,6 +230,7 @@ async fn stream_errors_and_unpolled_or_polled_body_drops_release_the_permit() {
     drop(body);
     assert_eq!(proxy.permits.available_permits(), 0);
     drop(bytes);
+    wait_for_producer_release(&proxy).await;
     assert_eq!(proxy.permits.available_permits(), 1);
 }
 
@@ -343,4 +347,16 @@ async fn cached_buffered_bytes_keep_the_permit_until_the_last_clone_is_dropped()
     assert_eq!(proxy.permits.available_permits(), 1);
     assert_eq!(server.received_requests().await.unwrap().len(), 1);
     server.verify().await;
+}
+
+// Producer cancellation is asynchronous, but must not wait for the idle timer.
+async fn wait_for_producer_release(proxy: &ChatProxy) {
+    let permit = tokio::time::timeout(
+        Duration::from_millis(500),
+        proxy.permits.clone().acquire_owned(),
+    )
+    .await
+    .expect("body drop must promptly cancel the producer")
+    .unwrap();
+    drop(permit);
 }

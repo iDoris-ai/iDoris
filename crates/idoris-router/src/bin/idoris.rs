@@ -19,7 +19,10 @@
 use idoris_contracts::ComponentCard;
 use idoris_contracts::component_card::Form;
 use idoris_router::dispatch::{BoundSupervisor, is_resident_http_service};
-use idoris_router::{AppState, BIND_HOST, build_app, components, parse_port, routing_policy};
+use idoris_router::{
+    AppState, BIND_HOST, build_app, components, parse_port, routing_policy,
+    write_timeout::{DEFAULT_WRITE_TIMEOUT, WriteTimeoutListener},
+};
 
 #[tokio::main]
 async fn main() {
@@ -114,13 +117,12 @@ async fn run() -> Result<(), String> {
             &component_list
         }
     );
-    let listener = idoris_router::write_timeout::WriteTimeoutListener::new(
-        listener,
-        std::time::Duration::from_secs(60),
-    );
-    axum::serve(listener, app)
-        .await
-        .map_err(|err| format!("server error: {err}"))
+    axum::serve(
+        WriteTimeoutListener::new(listener, DEFAULT_WRITE_TIMEOUT),
+        app,
+    )
+    .await
+    .map_err(|err| format!("server error: {err}"))
 }
 
 #[cfg(test)]
