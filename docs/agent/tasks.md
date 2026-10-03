@@ -460,3 +460,5 @@
 | FU-27 | #48 第二轮评审遗留（Low）| **reload 时 `AdapterTimedOut` 一律还原旧 Ready 状态**（`supervisor.rs` `resolve_load_failure`）：超时其实是"不确定新 policy 是否已生效"。目前 `PLACEHOLDER_MEMORY_GB=1.0` 影响有限；修法是还原前读一次 status 确认，或在文档里写明 | OPEN |
 | FU-28 | #48 第二轮评审遗留（Low，配置驱动加固）| `models.rs` 按配置端点转发的 SSRF 面、`omlx/http.rs` 把 bearer token 发给任意 `base_url`、`remote/client.rs` 的 `base_url` 缺 scheme 校验。都需要 operator 自己配出恶意值才能触发；`RemoteClient` 接进 router 前补上 | OPEN |
 | FU-29 | #48 第二轮评审建议 | **预算把关分裂成两处**（`dispatch_local::reserve()` 与 `components.rs` 启动期"确定免费"闸门），`decide()` 自己的预算阶段在生产路径上实际是死代码。付费/远程上游接入前，合并成统一的 reserve/settle 包装（与 FU-22 一起做）| OPEN |
+| FU-200 | Release 下载即用（工作站 B） | v0.1.0/v0.1.1 缺失运行配置：发布包仅附免费 oMLX 卡和默认策略，默认从二进制目录加载；macOS 解包冒烟校验 health/tag 版本并阻止坏包发布 | PR_OPEN |
+| FU-201 | Release 验收发现的基线缺口（工作站 B） | Rust routing-policy 目前仅做 schema 校验，规则未接决策管线；接线前应拒绝无法兑现的策略配置，不能把发布包可启动误认为自定义策略已生效 | OPEN |
