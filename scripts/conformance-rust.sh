@@ -32,6 +32,8 @@ fi
 export IDORIS_CONFORMANCE_CMD="$bin"
 export IDORIS_CONFORMANCE_ARGV
 IDORIS_CONFORMANCE_ARGV="$(node -e 'process.stdout.write(JSON.stringify([process.argv[1]]))' "$bin")"
+# K13/M4: a 5xx does not prove the upstream POST was not executed.
+export IDORIS_CONFORMANCE_POST_RETRY=0
 
 echo "[conformance-rust] IDORIS_CONFORMANCE_CMD=$IDORIS_CONFORMANCE_CMD" >&2
 echo "[conformance-rust] pnpm conformance" >&2

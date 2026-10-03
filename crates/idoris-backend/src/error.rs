@@ -104,13 +104,13 @@ pub enum BackendError {
 
     /// `RuntimeAdapter::load` got far enough that the engine **may already
     /// hold the model in memory** (e.g. oMLX's `POST .../load` returned 2xx),
-    /// but a follow-up step in the same call failed (pin, or verifying the
+    /// or its response was lost, or a follow-up step failed (pin, verifying
     /// pin state). Distinct from a plain rejection: the Supervisor must not
     /// assume nothing was allocated — it routes this, like
     /// [`BackendError::AdapterTimedOut`], through a best-effort `unload` so
     /// the ledger never forgets memory the engine is really using
     /// (prdaemon #48 round 2, M1).
-    #[error("load of {model_id} not confirmed after the engine accepted it: {message}")]
+    #[error("load of {model_id} not confirmed: {message}")]
     LoadUnconfirmed { model_id: String, message: String },
 
     #[error("upstream error: {message}")]

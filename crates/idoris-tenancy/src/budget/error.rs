@@ -104,6 +104,15 @@ pub enum BudgetError {
     #[error("invalid actual_cost_minor: {actual_cost_minor} (must be >= 0)")]
     InvalidActualCost { actual_cost_minor: i64 },
 
+    /// The cost is durably retained for manual recovery; totals are unchanged.
+    #[error(
+        "amount overflow for reservation {reservation_id}: cost {actual_cost_minor} retained; tenant spending blocked"
+    )]
+    AmountOverflow {
+        reservation_id: String,
+        actual_cost_minor: i64,
+    },
+
     /// `actual_cost_minor` charged in `settle` exceeded 4x the reserved
     /// amount (Opus Tier-2 acceptance M1, wired up in a follow-up PR). The
     /// charge is still recorded — this is a loud "something upstream is
