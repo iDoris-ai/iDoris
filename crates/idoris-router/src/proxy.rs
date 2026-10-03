@@ -428,6 +428,7 @@ impl ChatProxy {
         let Ok(permit) = self.permits.clone().try_acquire_owned() else {
             return Self::stream_failure(503);
         };
+        let permit = Arc::new(permit);
         let url = format!("{}/v1/chat/completions", endpoint.trim_end_matches('/'));
         let mut payload = body.clone();
         if let Some(obj) = payload.as_object_mut() {
@@ -464,6 +465,7 @@ impl ChatProxy {
                     let (tx, rx) = tokio::sync::mpsc::channel(1);
                     let (terminal_tx, terminal_rx) = tokio::sync::oneshot::channel();
                     let (drained_tx, drained_rx) = tokio::sync::oneshot::channel();
+                    let producer_permit = permit.clone();
                     tokio::spawn(async move {
                         let mut resp = resp;
                         let mut terminal_error = None;
@@ -518,7 +520,6 @@ impl ChatProxy {
                         }
                         drop(resp);
                         if let Some(error) = terminal_error {
-                            drop(permit);
                             let _ = terminal_tx.send(Err(error));
                         } else if reached_eof {
                             // Wait for downstream EOF too. This bounds the
@@ -527,39 +528,42 @@ impl ChatProxy {
                             drop(tx);
                             match tokio::time::timeout(idle, drained_rx).await {
                                 Ok(Ok(())) => {
-                                    let _ = terminal_tx.send(Ok(permit));
+                                    let _ = terminal_tx.send(Ok(()));
                                 }
-                                Ok(Err(_)) => drop(permit),
+                                Ok(Err(_)) => {}
                                 Err(_) => {
-                                    drop(permit);
                                     let _ = terminal_tx.send(Err(std::io::Error::new(
                                         std::io::ErrorKind::TimedOut,
                                         "downstream stream idle timeout after upstream EOF",
                                     )));
                                 }
                             }
-                        } else {
-                            // The receiver was dropped, so cancellation releases
-                            // the upstream connection and permit immediately.
-                            drop(permit);
                         }
+                        // Producer and body hold separate references: task
+                        // completion releases the producer's, while the body
+                        // retains its permit through EOF/error consumption or
+                        // until the body is dropped.
+                        drop(producer_permit);
                     });
                     let stream = futures_util::stream::unfold(
-                        (rx, Some(terminal_rx), Some(drained_tx)),
-                        |(mut rx, terminal_rx, drained_tx)| async move {
+                        (rx, Some(terminal_rx), Some(drained_tx), Some(permit)),
+                        |(mut rx, terminal_rx, drained_tx, permit)| async move {
                             if let Some(chunk) = rx.recv().await {
-                                return Some((Ok(chunk), (rx, terminal_rx, drained_tx)));
+                                return Some((Ok(chunk), (rx, terminal_rx, drained_tx, permit)));
                             }
                             if let Some(drained_tx) = drained_tx {
                                 let _ = drained_tx.send(());
                             }
                             let terminal_rx = terminal_rx?;
                             match terminal_rx.await {
-                                Ok(Ok(permit)) => {
+                                Ok(Ok(())) => {
                                     drop(permit);
                                     None
                                 }
-                                Ok(Err(error)) => Some((Err(error), (rx, None, None))),
+                                Ok(Err(error)) => {
+                                    drop(permit);
+                                    Some((Err(error), (rx, None, None, None)))
+                                }
                                 Err(_) => None,
                             }
                         },

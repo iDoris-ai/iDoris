@@ -106,7 +106,7 @@ async fn normal_upstream_eof_remains_normal_eof() {
 }
 
 #[tokio::test]
-async fn unconsumed_eof_keeps_permit_until_idle_deadline_then_errors() {
+async fn unconsumed_eof_keeps_permit_past_idle_deadline_until_error_consumed() {
     let (endpoint, listener) = tcp_server();
     let server = thread::spawn(move || {
         let (mut socket, _) = listener.accept().unwrap();
@@ -142,10 +142,14 @@ async fn unconsumed_eof_keeps_permit_until_idle_deadline_then_errors() {
         503
     );
 
-    // Even though upstream EOF is known, a stalled downstream body keeps its
-    // permit until the idle deadline. Resuming then reports the timeout.
-    take_permit(&proxy).await;
-    assert_eq!(proxy.permits.available_permits(), 1);
+    // The producer's idle deadline closes upstream, but the unread body still
+    // owns its permit until the terminal error is consumed or the body drops.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(proxy.permits.available_permits(), 0);
+    assert!(matches!(
+        proxy.forward_stream(&endpoint, &request_body()).await,
+        StreamOutcome::Buffered { status: 503, .. }
+    ));
     assert_eq!(
         response
             .frame()
@@ -162,6 +166,7 @@ async fn unconsumed_eof_keeps_permit_until_idle_deadline_then_errors() {
         .unwrap()
         .unwrap_err();
     assert!(error.to_string().to_lowercase().contains("idle"));
+    assert_eq!(proxy.permits.available_permits(), 1);
     drop(response);
     server.join().unwrap();
 }
@@ -298,19 +303,24 @@ async fn idle_upstream_expires_while_response_is_not_polled() {
     assert!(!first.into_data().unwrap().is_empty());
 
     // Keep `response` alive and deliberately stop polling it.
-    take_permit(&proxy).await;
     assert!(
         timeout(Duration::from_secs(3), closed_rx)
             .await
             .expect("idle timeout should close the upstream TCP connection")
             .unwrap()
     );
+    assert_eq!(proxy.permits.available_permits(), 0);
+    assert!(matches!(
+        proxy.forward_stream(&endpoint, &request_body()).await,
+        StreamOutcome::Buffered { status: 503, .. }
+    ));
     let error = timeout(Duration::from_secs(1), response.frame())
         .await
         .expect("idle terminal error should be delivered")
         .unwrap()
         .unwrap_err();
     assert!(error.to_string().to_lowercase().contains("idle"));
+    assert_eq!(proxy.permits.available_permits(), 1);
     drop(response);
     server.join().unwrap();
 }
@@ -358,13 +368,17 @@ async fn backpressured_stream_times_out_and_reports_error_when_resumed() {
     // The upstream writes enough data to fill the producer queue and socket
     // buffers. While the caller holds, but does not poll, the body, send-side
     // backpressure must have the same idle deadline as an upstream read.
-    take_permit(&proxy).await;
     assert!(
         timeout(Duration::from_secs(3), closed_rx)
             .await
             .expect("backpressure timeout should close upstream TCP")
             .unwrap()
     );
+    assert_eq!(proxy.permits.available_permits(), 0);
+    assert!(matches!(
+        proxy.forward_stream(&endpoint, &request_body()).await,
+        StreamOutcome::Buffered { status: 503, .. }
+    ));
 
     // Allow the finite queue to drain, then require a body error instead of
     // clean EOF so downstream callers can detect the truncated response.
@@ -380,6 +394,7 @@ async fn backpressured_stream_times_out_and_reports_error_when_resumed() {
     .await
     .expect("terminal stream error should arrive after queued chunks drain");
     assert!(error.to_string().to_lowercase().contains("backpressure"));
+    assert_eq!(proxy.permits.available_permits(), 1);
     assert!(
         timeout(Duration::from_secs(1), response.frame())
             .await
