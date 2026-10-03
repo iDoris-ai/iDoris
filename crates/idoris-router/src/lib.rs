@@ -35,6 +35,9 @@ pub mod models;
 /// why this is a genuinely separate path from `dispatch::dispatch_local`).
 pub mod proxy;
 
+/// Per-connection deadlines for stalled HTTP response writes.
+pub mod write_timeout;
+
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};

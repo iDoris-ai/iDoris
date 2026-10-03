@@ -20,7 +20,10 @@ use idoris_backend::{Supervisor, SupervisorConfig, SupervisorHandle};
 use idoris_contracts::ComponentCard;
 use idoris_contracts::component_card::Form;
 use idoris_router::dispatch::is_resident_http_service;
-use idoris_router::{AppState, BIND_HOST, build_app, components, parse_port, routing_policy};
+use idoris_router::{
+    AppState, BIND_HOST, build_app, components, parse_port, routing_policy,
+    write_timeout::{DEFAULT_WRITE_TIMEOUT, WriteTimeoutListener},
+};
 use idoris_upstream::{OmlxAdapter, OmlxAdapterConfig};
 
 #[tokio::main]
@@ -130,7 +133,10 @@ async fn run() -> Result<(), String> {
             &component_list
         }
     );
-    axum::serve(listener, app)
-        .await
-        .map_err(|err| format!("server error: {err}"))
+    axum::serve(
+        WriteTimeoutListener::new(listener, DEFAULT_WRITE_TIMEOUT),
+        app,
+    )
+    .await
+    .map_err(|err| format!("server error: {err}"))
 }

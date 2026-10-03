@@ -29,7 +29,7 @@ idoris-tenancy = { workspace = true }
 # below (which only applies to a LoadMode::Resident http_service card).
 idoris-upstream = { workspace = true }
 axum = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["io-util"] }
 tokio-util = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
