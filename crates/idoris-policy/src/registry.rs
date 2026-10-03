@@ -13,6 +13,9 @@ use url::Url;
 use crate::card::Card;
 use crate::privacy::is_subscription_provider_id;
 
+#[path = "card_validation.rs"]
+mod card_validation;
+
 /// M6 允许声明 `locality: loopback` 的 endpoint host（`url` 已规范化大小写）。
 const LOOPBACK_HOSTS: &[&str] = &["127.0.0.1", "[::1]", "localhost"];
 
@@ -30,6 +33,8 @@ pub enum RegistrationError {
     UnsupportedScheme { id: String, scheme: String },
     /// `spawn_cli`/订阅类 provider 却声明 `local_only`/`tier: local`：语义矛盾。
     ContradictoryRelayClaim { id: String },
+    /// 组件卡通过结构校验，但违反 TS 参考实现的交叉策略规则。
+    CardPolicyViolation { id: String, rule: &'static str },
 }
 
 impl std::fmt::Display for RegistrationError {
@@ -61,6 +66,9 @@ impl std::fmt::Display for RegistrationError {
                     f,
                     "组件卡 \"{id}\" 语义矛盾：spawn_cli/订阅类 provider 不允许同时声明 privacy_class: local_only 或 tier: local"
                 )
+            }
+            RegistrationError::CardPolicyViolation { id, rule } => {
+                write!(f, "组件卡 \"{id}\" 违反策略规则：{rule}")
             }
         }
     }
@@ -186,6 +194,7 @@ pub fn validate_registration(cards: &[Card]) -> Result<(), RegistrationError> {
     for card in cards {
         assert_endpoint_locality_consistent(card)?;
         assert_no_contradictory_relay_claim(card)?;
+        card_validation::validate_card_policy(card)?;
     }
     Ok(())
 }
@@ -376,6 +385,7 @@ mod tests {
         spawn.component.provider.locality = Locality::Loopback;
         spawn.component.endpoint = "not a url either".to_string();
         spawn.component.privacy_class = PrivacyClass::Any;
+        spawn.component.provider.privacy_class = PrivacyClass::Any;
         spawn.component.provider.tier = Tier::Remote;
         assert_eq!(validate_registration(&[spawn]), Ok(()));
 
@@ -422,6 +432,7 @@ mod tests {
         card.component.form = Form::SpawnCli;
         card.component.provider.tier = Tier::Remote;
         card.component.privacy_class = PrivacyClass::Any;
+        card.component.provider.privacy_class = PrivacyClass::Any;
         assert_eq!(validate_registration(&[card]), Ok(()));
     }
 }
