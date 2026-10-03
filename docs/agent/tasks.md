@@ -460,4 +460,5 @@
 | FU-27 | #48 第二轮评审遗留（Low）| **reload 时 `AdapterTimedOut` 一律还原旧 Ready 状态**（`supervisor.rs` `resolve_load_failure`）：超时其实是"不确定新 policy 是否已生效"。目前 `PLACEHOLDER_MEMORY_GB=1.0` 影响有限；修法是还原前读一次 status 确认，或在文档里写明 | OPEN |
 | FU-28 | #48 第二轮评审遗留（Low，配置驱动加固）| `models.rs` 按配置端点转发的 SSRF 面、`omlx/http.rs` 把 bearer token 发给任意 `base_url`、`remote/client.rs` 的 `base_url` 缺 scheme 校验。都需要 operator 自己配出恶意值才能触发；`RemoteClient` 接进 router 前补上 | OPEN |
 | FU-29 | #48 第二轮评审建议 | **预算把关分裂成两处**（`dispatch_local::reserve()` 与 `components.rs` 启动期"确定免费"闸门），`decide()` 自己的预算阶段在生产路径上实际是死代码。付费/远程上游接入前，合并成统一的 reserve/settle 包装（与 FU-22 一起做）| OPEN |
+| FU-200 | A 机 v0.1.1 冒烟 | 模型身份：Supervisor 响应 model 使用实际服务模型；不匹配的具体模型名显式 400；HTTP 回归与回显/校验变异验证 | PR_OPEN（feat/openai-compat-01） |
 | FU-203 | A 机 v0.1.1 冒烟 | 模型目录鉴权：loopback oMLX 复用 IDORIS_OMLX_API_KEY，401/403 显式 502 并记录安全日志；凭证隔离回归与变异验证 | PR_OPEN（feat/openai-compat-04） |
