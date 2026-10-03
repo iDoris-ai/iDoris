@@ -461,3 +461,4 @@
 | FU-28 | #48 第二轮评审遗留（Low，配置驱动加固）| `models.rs` 按配置端点转发的 SSRF 面、`omlx/http.rs` 把 bearer token 发给任意 `base_url`、`remote/client.rs` 的 `base_url` 缺 scheme 校验。都需要 operator 自己配出恶意值才能触发；`RemoteClient` 接进 router 前补上 | OPEN |
 | FU-29 | #48 第二轮评审建议 | **预算把关分裂成两处**（`dispatch_local::reserve()` 与 `components.rs` 启动期"确定免费"闸门），`decide()` 自己的预算阶段在生产路径上实际是死代码。付费/远程上游接入前，合并成统一的 reserve/settle 包装（与 FU-22 一起做）| OPEN |
 | FU-200 | A 机 v0.1.1 冒烟 | 模型身份：Supervisor 响应 model 使用实际服务模型；不匹配的具体模型名显式 400；HTTP 回归与回显/校验变异验证 | PR_OPEN（feat/openai-compat-01） |
+| FU-202 | A 机 v0.1.1 冒烟 | Supervisor 参数：文本消息之外未支持参数（含 max_tokens）显式 400；参数清单、HTTP 回归与放行 max_tokens 变异验证 | PR_OPEN（feat/openai-compat-03） |
