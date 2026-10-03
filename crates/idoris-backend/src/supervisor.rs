@@ -94,6 +94,10 @@ struct ModelSlot {
     /// may still finish allocating after any unload/status response; without
     /// an operation-completion signal the slot cannot safely be released.
     load_unconfirmed: bool,
+    /// This slot names a model present in the one startup residency sample.
+    /// Its memory is accounted by `reserved_gb` as one aggregate, because
+    /// status has no per-model measurements.
+    inherited: bool,
 }
 
 enum Command {
@@ -134,6 +138,7 @@ enum OpOutcome {
     },
     Unload {
         result: Result<(), BackendError>,
+        status: Option<BackendStatus>,
     },
 }
 
@@ -160,6 +165,7 @@ struct PreviousModel {
     state: ModelState,
     policy: LoadPolicy,
     memory_gb: f64,
+    inherited: bool,
 }
 
 impl LoadFailureOutcome {
@@ -225,6 +231,7 @@ struct ReleaseLimits {
 
 struct LoadFlowContext {
     release_limits: ReleaseLimits,
+    inherited: bool,
     load_fence: Option<Arc<crate::load_fence::LoadFence>>,
 }
 
@@ -466,16 +473,17 @@ async fn confirm_memory_released(
     targets: &[String],
     max_used_gb: f64,
     config: &SupervisorConfig,
-) -> Result<(), BackendError> {
+) -> Result<BackendStatus, BackendError> {
     for _ in 0..config.release_confirm_max_attempts {
         if let Ok(status) =
             with_adapter_timeout(adapter.status(), config.adapter_call_timeout, "status").await
             && status.used_gb.is_finite()
             && status.used_gb >= 0.0
+            && (status.used_gb > 0.0 || status.loaded.is_empty())
             && status.used_gb <= max_used_gb + CAPACITY_EPSILON_GB
             && targets.iter().all(|id| !status.loaded.contains(id))
         {
-            return Ok(());
+            return Ok(status);
         }
         tokio::time::sleep(config.release_confirm_interval).await;
     }
@@ -527,6 +535,7 @@ async fn run_load_flow(
 ) -> OpOutcome {
     let LoadFlowContext {
         release_limits,
+        inherited,
         load_fence,
     } = context;
     // Persist before the first adapter IO (including victim eviction), so a
@@ -608,6 +617,45 @@ async fn run_load_flow(
             victim_results,
             failure_outcome,
         };
+    }
+
+    if inherited {
+        let startup_status = with_adapter_timeout(
+            adapter.status(),
+            config.adapter_call_timeout,
+            "startup/inherited-status",
+        )
+        .await;
+        let verified_identity = startup_status.is_ok_and(|status| {
+            status.used_gb.is_finite()
+                && status.used_gb > 0.0
+                && status.used_gb <= release_limits.after_eviction_gb + CAPACITY_EPSILON_GB
+                && status.loaded.contains(&id)
+        });
+        let verified = if verified_identity {
+            matches!(
+                with_adapter_timeout(adapter.probe_ready(&id), config.adapter_call_timeout, &id)
+                    .await,
+                Ok(true)
+            )
+        } else {
+            false
+        };
+        if !verified {
+            let failure_outcome = if load_fence.clear().is_ok() {
+                previous.map_or(
+                    LoadFailureOutcome::Settle(ModelState::Stopped),
+                    LoadFailureOutcome::RestorePrevious,
+                )
+            } else {
+                LoadFailureOutcome::RetainUnconfirmedLoad(previous)
+            };
+            return OpOutcome::Load {
+                result: Err(BackendError::model_unavailable(&id)),
+                victim_results,
+                failure_outcome,
+            };
+        }
     }
 
     // OOM circuit breaker: exactly one self-healing retry, never more.
@@ -783,7 +831,8 @@ struct Env<'a> {
     config: &'a SupervisorConfig,
     self_tx: &'a mpsc::WeakSender<ActorMsg>,
     load_fence: Option<&'a Arc<crate::load_fence::LoadFence>>,
-    // Unknown startup residency is fixed; managed estimates are charged separately.
+    // Startup residency is an aggregate; inherited identities never split it
+    // using unverified per-model estimates.
     reserved_gb: f64,
     startup_error: Option<BackendError>,
 }
@@ -800,6 +849,7 @@ fn build_snapshot(models: &HashMap<String, ModelSlot>, budget_gb: f64, exclude: 
             memory_gb: slot.memory_gb,
             state: slot.state,
             pinned: slot.load_unconfirmed
+                || slot.inherited
                 || matches!(
                     slot.policy.keepalive,
                     idoris_contracts::load_policy::Keepalive::Pinned { pinned: true }
@@ -868,9 +918,11 @@ fn start_load(
         target_absent_gb: release_limit_gb + env.reserved_gb,
         after_eviction_gb: release_limit_gb + previous_memory_gb + env.reserved_gb,
     };
+    let inherited = previous.is_some_and(|model| model.inherited);
     let adapter = env.adapter.clone();
     let config = env.config.clone();
     let load_fence = env.load_fence.cloned();
+    let ownership = env.load_fence.cloned();
     let self_tx = env.self_tx.clone();
     let id_for_task = id.clone();
     // Kept alongside `evict` (which is moved into `run_load_flow` below) so
@@ -890,6 +942,7 @@ fn start_load(
             config,
             LoadFlowContext {
                 release_limits,
+                inherited,
                 load_fence,
             },
             id_for_task.clone(),
@@ -897,6 +950,7 @@ fn start_load(
             evict,
             previous,
         ));
+        let _ownership = ownership;
         let outcome = match inner.await {
             Ok(outcome) => outcome,
             Err(join_err) => OpOutcome::Load {
@@ -1016,16 +1070,23 @@ fn handle_load(
         return;
     }
 
-    if env.reserved_gb > env.config.budget_gb {
+    let inherited = models.get(&id).is_some_and(|slot| slot.inherited);
+    let reservation = env.reserved_gb;
+    if reservation > env.config.budget_gb {
         let _ = reply.send(Err(BackendError::eviction_impossible(&id)));
         return;
     }
-    let snapshot = build_snapshot(models, env.config.budget_gb - env.reserved_gb, &id);
+    let request_charge = if inherited {
+        memory_gb.max(reservation) - reservation
+    } else {
+        memory_gb
+    };
+    let snapshot = build_snapshot(models, env.config.budget_gb - reservation, &id);
     let evict = match plan_eviction(
         &snapshot,
         ModelReq {
             id: id.clone(),
-            memory_gb,
+            memory_gb: request_charge,
         },
     ) {
         Ok(EvictionPlan::NotNeeded) => Vec::new(),
@@ -1049,16 +1110,18 @@ fn handle_load(
             state: slot.state,
             policy: slot.policy,
             memory_gb: slot.memory_gb,
+            inherited: slot.inherited,
         });
     models.insert(
         id.clone(),
         ModelSlot {
-            memory_gb,
+            memory_gb: if inherited { request_charge } else { memory_gb },
             state: ModelState::Launching,
             last_used_seq,
             policy,
             inflight: 0,
             load_unconfirmed: false,
+            inherited,
         },
     );
     *active_op = Some(ActiveOp {
@@ -1077,10 +1140,13 @@ fn start_unload(id: String, max_used_gb: f64, env: &Env<'_>) {
     let adapter = env.adapter.clone();
     let self_tx = env.self_tx.clone();
     let config = env.config.clone();
+    let ownership = env.load_fence.cloned();
     tokio::spawn(async move {
         // Same panic-isolation shape as `start_load` — see its doc comment.
         let id_for_inner = id.clone();
+        let inner_ownership = ownership.clone();
         let inner = tokio::spawn(async move {
+            let _ownership = inner_ownership;
             with_adapter_timeout(
                 adapter.unload(&id_for_inner),
                 config.adapter_call_timeout,
@@ -1089,15 +1155,20 @@ fn start_unload(id: String, max_used_gb: f64, env: &Env<'_>) {
             .await?;
             confirm_memory_released(&adapter, &[id_for_inner], max_used_gb, &config).await
         });
-        let result = match inner.await {
-            Ok(result) => result,
-            Err(join_err) => Err(BackendError::adapter_panicked(&id, join_err.to_string())),
+        let (result, status) = match inner.await {
+            Ok(Ok(status)) => (Ok(()), Some(status)),
+            Ok(Err(err)) => (Err(err), None),
+            Err(join_err) => (
+                Err(BackendError::adapter_panicked(&id, join_err.to_string())),
+                None,
+            ),
         };
+        let _ownership = ownership;
         if let Some(tx) = self_tx.upgrade() {
             let _ = tx
                 .send(ActorMsg::OpDone {
                     id,
-                    outcome: OpOutcome::Unload { result },
+                    outcome: OpOutcome::Unload { result, status },
                 })
                 .await;
         }
@@ -1139,7 +1210,7 @@ fn handle_unload(
             let _ = reply.send(Err(BackendError::model_not_found(&id)));
             return;
         }
-        Some(ModelState::Stopped) => {
+        Some(ModelState::Stopped) if !models.get(&id).is_some_and(|slot| slot.inherited) => {
             let _ = reply.send(Ok(()));
             return;
         }
@@ -1198,7 +1269,8 @@ async fn run_actor(
     let mut poisoned: Option<String> = None;
     let load_fence_result = adapter
         .load_fence_path()
-        .map(|path| Arc::new(crate::load_fence::LoadFence::new(path)));
+        .and_then(crate::load_fence::LoadFence::claim)
+        .map(Arc::new);
     let load_fence_error = match &load_fence_result {
         Ok(fence) => fence.check_clear().err(),
         Err(err) => Some(err.clone()),
@@ -1208,8 +1280,10 @@ async fn run_actor(
     // adapter call isolates panic; the timeout bounds startup even when the
     // adapter never returns.
     let startup_adapter = adapter.clone();
+    let startup_ownership = load_fence.clone();
     let timeout = config.adapter_call_timeout;
     let startup = tokio::spawn(async move {
+        let _ownership = startup_ownership;
         with_adapter_timeout(startup_adapter.status(), timeout, "startup/status").await
     })
     .await
@@ -1224,15 +1298,41 @@ async fn run_actor(
                 "engine residency has no valid memory measurement",
             ))
         } else {
-            Ok(status.used_gb)
+            Ok(status)
         }
     });
-    let env = Env {
+    let initial_reserved_gb = startup
+        .as_ref()
+        .map(|status| status.used_gb)
+        .unwrap_or_default();
+    if let Ok(status) = &startup {
+        for id in &status.loaded {
+            models.insert(
+                id.clone(),
+                ModelSlot {
+                    memory_gb: 0.0,
+                    state: ModelState::Error,
+                    last_used_seq: 0,
+                    policy: LoadPolicy {
+                        mode: idoris_contracts::load_policy::LoadMode::OnDemand,
+                        keepalive: idoris_contracts::load_policy::Keepalive::Pinned {
+                            pinned: true,
+                        },
+                        admission: idoris_contracts::load_policy::Admission::Coexist,
+                    },
+                    inflight: 0,
+                    load_unconfirmed: false,
+                    inherited: true,
+                },
+            );
+        }
+    }
+    let mut env = Env {
         adapter: &adapter,
         config: &config,
         self_tx: &self_tx,
         load_fence: load_fence.as_ref(),
-        reserved_gb: startup.as_ref().copied().unwrap_or_default(),
+        reserved_gb: initial_reserved_gb,
         startup_error: load_fence_error.or_else(|| startup.err()),
     };
 
@@ -1260,6 +1360,10 @@ async fn run_actor(
             }
 
             ActorMsg::Cmd(Command::List { reply }) => {
+                if let Some(err) = &env.startup_error {
+                    let _ = reply.send(Err(err.clone()));
+                    continue;
+                }
                 let Ok(permit) = call_slots.clone().try_acquire_owned() else {
                     let _ = reply.send(Err(BackendError::busy(
                         "concurrent adapter-call limit reached",
@@ -1270,7 +1374,9 @@ async fn run_actor(
                 };
                 let adapter = adapter.clone();
                 let timeout = config.adapter_call_timeout;
+                let ownership = load_fence.clone();
                 tokio::spawn(async move {
+                    let _ownership = ownership;
                     let _permit = permit;
                     let _ = reply.send(with_adapter_timeout(adapter.list(), timeout, "list").await);
                 });
@@ -1296,7 +1402,10 @@ async fn run_actor(
                 };
                 let loaded: Vec<String> = models
                     .iter()
-                    .filter(|(_, slot)| slot.state == ModelState::Ready)
+                    .filter(|(_, slot)| {
+                        slot.state == ModelState::Ready
+                            || (slot.inherited && slot.state != ModelState::Stopped)
+                    })
                     .map(|(id, _)| id.clone())
                     .collect();
                 let _ = reply.send(Ok(BackendStatus {
@@ -1307,60 +1416,71 @@ async fn run_actor(
                 }));
             }
 
-            ActorMsg::Cmd(Command::Chat { req, cancel, reply }) => match models.get(&req.model) {
-                None => {
-                    let _ = reply.send(Err(BackendError::model_not_found(&req.model)));
+            ActorMsg::Cmd(Command::Chat { req, cancel, reply }) => {
+                if let Some(err) = &env.startup_error {
+                    let _ = reply.send(Err(err.clone()));
+                    continue;
                 }
-                Some(slot) if slot.state != ModelState::Ready => {
-                    let _ = reply.send(Err(not_ready_error(&req.model, slot.state)));
-                }
-                Some(_) => {
-                    let Ok(permit) = call_slots.clone().try_acquire_owned() else {
-                        let _ = reply.send(Err(BackendError::busy(
-                            "concurrent adapter-call limit reached",
-                            None,
-                            None,
-                        )));
-                        continue;
-                    };
-                    next_seq += 1;
-                    if let Some(slot) = models.get_mut(&req.model) {
-                        slot.last_used_seq = next_seq;
-                        slot.inflight += 1;
+                match models.get(&req.model) {
+                    None => {
+                        let _ = reply.send(Err(BackendError::model_not_found(&req.model)));
                     }
-                    let adapter = adapter.clone();
-                    let timeout = config.adapter_call_timeout;
-                    let self_tx = self_tx.clone();
-                    tokio::spawn(async move {
-                        let _permit = permit;
-                        let model = req.model.clone();
-                        // Same isolation shape as `start_load`/`start_unload`:
-                        // a panic in `adapter.chat` must not skip the
-                        // `ChatDone` send below, or `inflight` leaks forever
-                        // — wedging any pending drain and, with it,
-                        // `active_op` (Critical, Opus Tier-2 review, P6).
-                        let model_for_chat = model.clone();
-                        let inner = tokio::spawn(async move {
-                            with_adapter_timeout(
-                                adapter.chat(req, cancel),
-                                timeout,
-                                &model_for_chat,
-                            )
-                            .await
-                        });
-                        let result = match inner.await {
-                            Ok(result) => result,
-                            Err(join_err) => {
-                                Err(BackendError::adapter_panicked(&model, join_err.to_string()))
-                            }
+                    Some(slot) if slot.state != ModelState::Ready => {
+                        let _ = reply.send(Err(not_ready_error(&req.model, slot.state)));
+                    }
+                    Some(_) => {
+                        let Ok(permit) = call_slots.clone().try_acquire_owned() else {
+                            let _ = reply.send(Err(BackendError::busy(
+                                "concurrent adapter-call limit reached",
+                                None,
+                                None,
+                            )));
+                            continue;
                         };
-                        let _ = reply.send(result);
-                        if let Some(tx) = self_tx.upgrade() {
-                            let _ = tx.send(ActorMsg::ChatDone { model }).await;
+                        next_seq += 1;
+                        if let Some(slot) = models.get_mut(&req.model) {
+                            slot.last_used_seq = next_seq;
+                            slot.inflight += 1;
                         }
-                    });
+                        let adapter = adapter.clone();
+                        let timeout = config.adapter_call_timeout;
+                        let self_tx = self_tx.clone();
+                        let ownership = load_fence.clone();
+                        tokio::spawn(async move {
+                            let _ownership = ownership;
+                            let _permit = permit;
+                            let model = req.model.clone();
+                            // Same isolation shape as `start_load`/`start_unload`:
+                            // a panic in `adapter.chat` must not skip the
+                            // `ChatDone` send below, or `inflight` leaks forever
+                            // — wedging any pending drain and, with it,
+                            // `active_op` (Critical, Opus Tier-2 review, P6).
+                            let model_for_chat = model.clone();
+                            let inner_ownership = _ownership.clone();
+                            let inner = tokio::spawn(async move {
+                                let _ownership = inner_ownership;
+                                with_adapter_timeout(
+                                    adapter.chat(req, cancel),
+                                    timeout,
+                                    &model_for_chat,
+                                )
+                                .await
+                            });
+                            let result = match inner.await {
+                                Ok(result) => result,
+                                Err(join_err) => Err(BackendError::adapter_panicked(
+                                    &model,
+                                    join_err.to_string(),
+                                )),
+                            };
+                            let _ = reply.send(result);
+                            if let Some(tx) = self_tx.upgrade() {
+                                let _ = tx.send(ActorMsg::ChatDone { model }).await;
+                            }
+                        });
+                    }
                 }
-            },
+            }
 
             ActorMsg::Cmd(Command::Load {
                 id,
@@ -1384,6 +1504,10 @@ async fn run_actor(
             }
 
             ActorMsg::Cmd(Command::Unload { id, reply }) => {
+                if let Some(err) = &env.startup_error {
+                    let _ = reply.send(Err(err.clone()));
+                    continue;
+                }
                 handle_unload(id, reply, &mut models, &mut active_op, &env);
             }
 
@@ -1399,19 +1523,27 @@ async fn run_actor(
             }
 
             ActorMsg::OpDone { id, outcome } => {
-                let (result, done_state, failure_outcome, victim_results) = match outcome {
-                    OpOutcome::Load {
-                        result,
-                        victim_results,
-                        failure_outcome,
-                    } => (result, ModelState::Ready, failure_outcome, victim_results),
-                    OpOutcome::Unload { result } => (
-                        result,
-                        ModelState::Stopped,
-                        LoadFailureOutcome::Settle(ModelState::Error),
-                        Vec::new(),
-                    ),
-                };
+                let (result, done_state, failure_outcome, victim_results, unload_status) =
+                    match outcome {
+                        OpOutcome::Load {
+                            result,
+                            victim_results,
+                            failure_outcome,
+                        } => (
+                            result,
+                            ModelState::Ready,
+                            failure_outcome,
+                            victim_results,
+                            None,
+                        ),
+                        OpOutcome::Unload { result, status } => (
+                            result,
+                            ModelState::Stopped,
+                            LoadFailureOutcome::Settle(ModelState::Error),
+                            Vec::new(),
+                            status,
+                        ),
+                    };
 
                 let mut violation: Option<String> = None;
                 for (victim_id, victim_result) in victim_results {
@@ -1433,6 +1565,9 @@ async fn run_actor(
                             match models.get_mut(&id) {
                                 Some(slot) => {
                                     slot.state = done_state;
+                                    if done_state == ModelState::Stopped {
+                                        slot.inherited = false;
+                                    }
                                     if done_state == ModelState::Ready {
                                         slot.last_used_seq = next_seq;
                                     }
@@ -1461,6 +1596,7 @@ async fn run_actor(
                                         slot.state = previous.state;
                                         slot.policy = previous.policy;
                                         slot.memory_gb = previous.memory_gb;
+                                        slot.inherited = previous.inherited;
                                     }
                                     None => {
                                         violation =
@@ -1487,6 +1623,13 @@ async fn run_actor(
                             }
                         },
                     }
+                }
+
+                if let Some(status) = unload_status {
+                    let current = env.reserved_gb;
+                    // Fresh status bounds inherited and anonymous residency
+                    // together; never subtract request estimates here.
+                    env.reserved_gb = current.min(status.used_gb);
                 }
 
                 let waiters = take_waiters(&mut active_op);

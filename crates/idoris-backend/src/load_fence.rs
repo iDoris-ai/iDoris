@@ -9,11 +9,42 @@ use crate::error::BackendError;
 /// A durable, fail-closed marker associated with one runtime engine.
 pub struct LoadFence {
     path: PathBuf,
+    _owner_lock: Option<File>,
 }
 
 impl LoadFence {
     pub fn new(path: PathBuf) -> Self {
-        Self { path }
+        Self {
+            path,
+            _owner_lock: None,
+        }
+    }
+
+    /// Claims exclusive ownership of the engine associated with this marker.
+    /// The separate lock file is intentionally kept on disk: removing it could
+    /// let another process lock a different inode while this handle is alive.
+    pub fn claim(path: PathBuf) -> Result<Self, BackendError> {
+        let owner_path = owner_lock_path(&path);
+        let parent = parent_dir(&owner_path);
+        ensure_parent_durable(parent)?;
+        let owner_lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&owner_path)
+            .map_err(|error| io_error("opening owner lock", &owner_path, error))?;
+        owner_lock
+            .sync_all()
+            .map_err(|error| io_error("syncing owner lock", &owner_path, error))?;
+        sync_directory(parent).map_err(|error| io_error("syncing directory for", parent, error))?;
+        owner_lock
+            .try_lock()
+            .map_err(|error| io_error("claiming engine ownership at", &owner_path, error.into()))?;
+        Ok(Self {
+            path,
+            _owner_lock: Some(owner_lock),
+        })
     }
 
     /// Returns an error whenever the marker exists or its state cannot be
@@ -55,6 +86,12 @@ impl LoadFence {
             Err(error) => Err(io_error("removing", &self.path, error)),
         }
     }
+}
+
+fn owner_lock_path(path: &Path) -> PathBuf {
+    let mut owner_path = path.as_os_str().to_os_string();
+    owner_path.push(".owner.lock");
+    PathBuf::from(owner_path)
 }
 
 fn parent_dir(path: &Path) -> &Path {
@@ -188,5 +225,92 @@ mod tests {
         assert!(fence.check_clear().is_err());
         assert!(fence.begin().is_err());
         fs::remove_file(path).expect("remove test fixture");
+    }
+
+    #[test]
+    fn ownership_is_exclusive_even_after_marker_clear() {
+        let path = test_path("exclusive");
+        let owner = LoadFence::claim(path.clone()).expect("first claim should succeed");
+        owner.begin().expect("marker should be created");
+        owner.clear().expect("marker should be cleared");
+        assert!(LoadFence::claim(path.clone()).is_err());
+        drop(owner);
+        let next = LoadFence::claim(path.clone()).expect("claim should succeed after release");
+        drop(next);
+        fs::remove_dir_all(
+            path.parent()
+                .and_then(Path::parent)
+                .expect("nested parent exists"),
+        )
+        .expect("test directory should be removable");
+    }
+
+    #[test]
+    fn ownership_is_independent_for_distinct_paths() {
+        let first_path = test_path("independent-first");
+        let second_path = test_path("independent-second");
+        let first = LoadFence::claim(first_path.clone()).expect("first claim should succeed");
+        let second = LoadFence::claim(second_path.clone()).expect("second claim should succeed");
+        drop((first, second));
+        for path in [first_path, second_path] {
+            fs::remove_dir_all(
+                path.parent()
+                    .and_then(Path::parent)
+                    .expect("nested parent exists"),
+            )
+            .expect("test directory should be removable");
+        }
+    }
+
+    #[test]
+    fn ownership_is_exclusive_across_processes_and_released_on_drop() {
+        let path = test_path("process-exclusive");
+        let owner = LoadFence::claim(path.clone()).expect("parent claim should succeed");
+        let owner_path = owner_lock_path(&path);
+        let run_child = |should_acquire: bool| {
+            std::process::Command::new(std::env::current_exe().expect("test executable exists"))
+                .arg("--exact")
+                .arg("load_fence::tests::claim_helper_process")
+                .arg("--nocapture")
+                .env("IDORIS_TEST_OWNER_LOCK_PATH", &path)
+                .env(
+                    "IDORIS_TEST_OWNER_LOCK_AVAILABLE",
+                    should_acquire.to_string(),
+                )
+                .status()
+                .expect("child test process should start")
+        };
+
+        assert!(
+            run_child(false).success(),
+            "live owner must exclude child process"
+        );
+        drop(owner);
+        assert!(
+            run_child(true).success(),
+            "child should claim after owner drops"
+        );
+        assert!(
+            owner_path.exists(),
+            "persistent lock inode must remain on disk"
+        );
+        fs::remove_dir_all(
+            path.parent()
+                .and_then(Path::parent)
+                .expect("nested parent exists"),
+        )
+        .expect("test directory should be removable");
+    }
+
+    #[test]
+    fn claim_helper_process() {
+        let Ok(path) = std::env::var("IDORIS_TEST_OWNER_LOCK_PATH") else {
+            return;
+        };
+        let should_acquire = std::env::var("IDORIS_TEST_OWNER_LOCK_AVAILABLE")
+            .expect("parent specifies expected lock availability")
+            == "true";
+        let owner = LoadFence::claim(PathBuf::from(path));
+        assert_eq!(owner.is_ok(), should_acquire);
     }
 }
