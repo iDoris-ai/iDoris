@@ -85,7 +85,7 @@ impl axum::serve::Listener for TrackedListener {
 
 fn test_proxy(idle: Duration) -> ChatProxy {
     let mut proxy = ChatProxy::new(reqwest::Client::new());
-    proxy.idle_timeout = idle;
+    proxy.stream_idle_timeout = idle;
     proxy.permits = Arc::new(tokio::sync::Semaphore::new(1));
     proxy
 }

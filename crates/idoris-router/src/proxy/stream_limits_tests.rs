@@ -57,7 +57,7 @@ fn accept_request(stream: &mut TcpStream) {
 
 fn test_proxy(idle: Duration) -> ChatProxy {
     let mut proxy = ChatProxy::new(reqwest::Client::new());
-    proxy.idle_timeout = idle;
+    proxy.stream_idle_timeout = idle;
     proxy.permits = Arc::new(tokio::sync::Semaphore::new(1));
     proxy
 }
@@ -118,11 +118,12 @@ async fn unconsumed_eof_keeps_permit_past_idle_deadline_until_error_consumed() {
     let mut proxy = test_proxy(Duration::from_millis(200));
     let eof_observed = Arc::new(tokio::sync::Notify::new());
     proxy.stream_eof_observed = Some(eof_observed.clone());
-    let StreamOutcome::Stream { mut response, .. } =
+    let StreamOutcome::Stream { response, .. } =
         proxy.forward_stream(&endpoint, &request_body()).await
     else {
         panic!("expected streaming response");
     };
+    let mut response = crate::terminated_proxy_body(response);
 
     // The hook fires only after the producer's next resp.chunk() returned
     // None. The queued byte remains deliberately unconsumed by the caller.
@@ -290,11 +291,12 @@ async fn idle_upstream_expires_while_response_is_not_polled() {
     });
 
     let proxy = test_proxy(Duration::from_millis(150));
-    let StreamOutcome::Stream { mut response, .. } =
+    let StreamOutcome::Stream { response, .. } =
         proxy.forward_stream(&endpoint, &request_body()).await
     else {
         panic!("expected streaming response");
     };
+    let mut response = crate::terminated_proxy_body(response);
     let first = timeout(Duration::from_secs(2), response.frame())
         .await
         .expect("first chunk should arrive")
@@ -353,11 +355,12 @@ async fn backpressured_stream_times_out_and_reports_error_when_resumed() {
     });
 
     let proxy = test_proxy(Duration::from_millis(180));
-    let StreamOutcome::Stream { mut response, .. } =
+    let StreamOutcome::Stream { response, .. } =
         proxy.forward_stream(&endpoint, &request_body()).await
     else {
         panic!("expected streaming response");
     };
+    let mut response = crate::terminated_proxy_body(response);
     let first = timeout(Duration::from_secs(2), response.frame())
         .await
         .expect("first chunk should arrive")

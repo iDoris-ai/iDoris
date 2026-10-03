@@ -97,7 +97,7 @@ describe("X-iDoris-Served-Locality", () => {
   });
 
   it("上游返回 5xx（依然是“某后端服务了这次请求”）也带 Served-Locality", async () => {
-    for (let i = 0; i < 3; i += 1) upstream.queueChat({ kind: "json", status: 503, body: { error: "x" } });
+    for (let i = 0; i < (process.env.IDORIS_CONFORMANCE_POST_RETRY === "0" ? 1 : 3); i += 1) upstream.queueChat({ kind: "json", status: 503, body: { error: "x" } });
     const res = await postChat();
     expect(res.status).toBe(503);
     expect(res.headers.get("x-idoris-served-locality")).toBe("loopback");

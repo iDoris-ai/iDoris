@@ -46,6 +46,7 @@ pub struct WriteTimeoutIo<T> {
     timeout: Duration,
     deadline: Option<Pin<Box<Sleep>>>,
     flush_only_deadline: bool,
+    timed_out: bool,
 }
 
 impl<T> WriteTimeoutIo<T> {
@@ -55,19 +56,25 @@ impl<T> WriteTimeoutIo<T> {
             timeout,
             deadline: None,
             flush_only_deadline: false,
+            timed_out: false,
         }
     }
 
     fn poll_deadline(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        if let Some(deadline) = self.deadline.as_mut()
-            && deadline.as_mut().poll(cx).is_ready()
+        if self.timed_out
+            || self
+                .deadline
+                .as_mut()
+                .is_some_and(|deadline| deadline.as_mut().poll(cx).is_ready())
         {
-            return Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "connection write timed out",
-            )));
+            self.timed_out = true;
+            return Poll::Ready(Err(Self::timeout_error()));
         }
         Poll::Pending
+    }
+
+    fn timeout_error() -> io::Error {
+        io::Error::new(io::ErrorKind::TimedOut, "connection write timed out")
     }
 
     fn arm_deadline(&mut self, cx: &mut Context<'_>, flush: bool) -> Poll<io::Result<()>> {
@@ -77,6 +84,31 @@ impl<T> WriteTimeoutIo<T> {
         }
         self.poll_deadline(cx)
     }
+
+    fn poll_control(
+        &mut self,
+        cx: &mut Context<'_>,
+        flush: bool,
+        poll: impl FnOnce(Pin<&mut T>, &mut Context<'_>) -> Poll<io::Result<()>>,
+    ) -> Poll<io::Result<()>>
+    where
+        T: AsyncWrite + Unpin,
+    {
+        if let Poll::Ready(error) = self.poll_deadline(cx) {
+            return Poll::Ready(error);
+        }
+        match poll(Pin::new(&mut self.inner), cx) {
+            Poll::Pending => self.arm_deadline(cx, flush),
+            Poll::Ready(Ok(())) => {
+                if self.flush_only_deadline && flush {
+                    self.deadline = None;
+                    self.flush_only_deadline = false;
+                }
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
+        }
+    }
 }
 
 impl<T: AsyncRead + Unpin> AsyncRead for WriteTimeoutIo<T> {
@@ -85,6 +117,9 @@ impl<T: AsyncRead + Unpin> AsyncRead for WriteTimeoutIo<T> {
         cx: &mut Context<'_>,
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
+        // Reads remain fully owned by the HTTP server. In particular, this
+        // wrapper never pre-reads or consumes a request body to enforce a
+        // response write deadline.
         Pin::new(&mut self.inner).poll_read(cx, buf)
     }
 }
@@ -95,13 +130,13 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for WriteTimeoutIo<T> {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        if let Poll::Ready(result) = self.poll_deadline(cx) {
-            return Poll::Ready(result.map(|()| 0));
+        if let Poll::Ready(error) = self.poll_deadline(cx) {
+            return Poll::Ready(error.map(|()| 0));
         }
         match Pin::new(&mut self.inner).poll_write(cx, buf) {
             Poll::Pending => match self.arm_deadline(cx, false) {
                 Poll::Pending => Poll::Pending,
-                Poll::Ready(result) => Poll::Ready(result.map(|()| 0)),
+                Poll::Ready(error) => Poll::Ready(error.map(|()| 0)),
             },
             Poll::Ready(Ok(written)) => {
                 if written > 0 {
@@ -114,18 +149,24 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for WriteTimeoutIo<T> {
         }
     }
 
+    fn is_write_vectored(&self) -> bool {
+        // Keep hyper's queued Bytes owners alive through writes; its fallback
+        // flattens whole bodies into an unguarded buffer and drops their permits.
+        self.inner.is_write_vectored()
+    }
+
     fn poll_write_vectored(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         bufs: &[IoSlice<'_>],
     ) -> Poll<io::Result<usize>> {
-        if let Poll::Ready(result) = self.poll_deadline(cx) {
-            return Poll::Ready(result.map(|()| 0));
+        if let Poll::Ready(error) = self.poll_deadline(cx) {
+            return Poll::Ready(error.map(|()| 0));
         }
         match Pin::new(&mut self.inner).poll_write_vectored(cx, bufs) {
             Poll::Pending => match self.arm_deadline(cx, false) {
                 Poll::Pending => Poll::Pending,
-                Poll::Ready(result) => Poll::Ready(result.map(|()| 0)),
+                Poll::Ready(error) => Poll::Ready(error.map(|()| 0)),
             },
             Poll::Ready(Ok(written)) => {
                 if written > 0 {
@@ -139,28 +180,11 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for WriteTimeoutIo<T> {
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        if let Poll::Ready(result) = self.poll_deadline(cx) {
-            return Poll::Ready(result);
-        }
-        match Pin::new(&mut self.inner).poll_flush(cx) {
-            Poll::Pending => self.arm_deadline(cx, true),
-            Poll::Ready(Ok(())) => {
-                if self.flush_only_deadline {
-                    self.deadline = None;
-                    self.flush_only_deadline = false;
-                }
-                Poll::Ready(Ok(()))
-            }
-            Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
-        }
+        self.poll_control(cx, true, |inner, cx| inner.poll_flush(cx))
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.inner).poll_shutdown(cx)
-    }
-
-    fn is_write_vectored(&self) -> bool {
-        self.inner.is_write_vectored()
+        self.poll_control(cx, false, |inner, cx| inner.poll_shutdown(cx))
     }
 }
 
@@ -234,6 +258,42 @@ mod tests {
         fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
             Poll::Ready(Ok(()))
         }
+    }
+
+    struct ShutdownStallsButWrites;
+
+    impl AsyncWrite for ShutdownStallsButWrites {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stalled_shutdown_times_out_and_latches_for_later_writes() {
+        let mut io = WriteTimeoutIo::new(ShutdownStallsButWrites, Duration::from_secs(5));
+        let shutdown_pending =
+            poll_fn(|cx| Poll::Ready(matches!(Pin::new(&mut io).poll_shutdown(cx), Poll::Pending)))
+                .await;
+        assert!(shutdown_pending);
+
+        tokio::time::advance(Duration::from_secs(5)).await;
+        let shutdown = poll_fn(|cx| Pin::new(&mut io).poll_shutdown(cx)).await;
+        assert!(matches!(shutdown, Err(error) if error.kind() == io::ErrorKind::TimedOut));
+
+        let write = poll_fn(|cx| Pin::new(&mut io).poll_write(cx, b"ready")).await;
+        assert!(matches!(write, Err(error) if error.kind() == io::ErrorKind::TimedOut));
     }
 
     #[tokio::test]

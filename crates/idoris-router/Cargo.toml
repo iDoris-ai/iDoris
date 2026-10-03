@@ -29,6 +29,7 @@ idoris-tenancy = { workspace = true }
 # below (which only applies to a LoadMode::Resident http_service card).
 idoris-upstream = { workspace = true }
 axum = { workspace = true }
+futures-util = "0.3"
 tokio = { workspace = true, features = ["io-util"] }
 tokio-util = { workspace = true }
 serde = { workspace = true }
@@ -52,10 +53,11 @@ reqwest = { version = "0.13", default-features = false, features = ["json", "rus
 # `jsonschema`/`tower`), so this adds no new dependency *tree*, just a
 # direct `idoris-router` edge onto an already-vendored crate.
 indexmap = "2"
-# Own the upstream response and concurrency permit for the streamed body.
-futures-util = "0.3"
+ring = "0.17"
 
 [dev-dependencies]
+async-trait = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 tempfile = "3"
