@@ -842,6 +842,9 @@ async fn record_id_middleware(mut req: Request<Body>, next: Next) -> Response {
 }
 
 #[cfg(test)]
+mod local_privacy_tests;
+
+#[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -856,7 +859,7 @@ mod tests {
 
     use super::*;
 
-    fn sample_component_card(id: &str) -> ComponentCard {
+    pub(super) fn sample_component_card(id: &str) -> ComponentCard {
         ComponentCard {
             provider: ProviderDescriptor {
                 id: id.to_string(),
@@ -983,7 +986,7 @@ mod tests {
         assert_eq!(json["error"]["type"], "not_found");
     }
 
-    fn post_chat(body: &str, headers: &[(&str, &str)]) -> Request<Body> {
+    pub(super) fn post_chat(body: &str, headers: &[(&str, &str)]) -> Request<Body> {
         let mut builder = Request::builder()
             .method("POST")
             .uri("/v1/chat/completions")
@@ -1341,7 +1344,7 @@ mod tests {
     /// A `LoadMode::Resident` `http_service` card (R2-G) — forwarded via
     /// `chat_via_proxy`, never through the (unconfigured, in these tests)
     /// Supervisor.
-    fn resident_component_card(id: &str, endpoint: &str) -> ComponentCard {
+    pub(super) fn resident_component_card(id: &str, endpoint: &str) -> ComponentCard {
         ComponentCard {
             load_policy: Some(idoris_contracts::load_policy::LoadPolicy {
                 mode: idoris_contracts::load_policy::LoadMode::Resident,
