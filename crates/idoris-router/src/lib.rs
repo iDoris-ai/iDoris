@@ -540,6 +540,7 @@ async fn chat_completions(
     };
 
     let messages = extract_messages(object);
+    let parsed = intent::resolve_profile(parsed, &messages).await;
     let prompt = messages
         .iter()
         .map(|m| m.content.as_str())

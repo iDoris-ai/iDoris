@@ -56,6 +56,7 @@ fn invalid_header(message: impl Into<String>) -> ProfileError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IntentSource {
     Header,
+    Detected,
     Default,
 }
 
