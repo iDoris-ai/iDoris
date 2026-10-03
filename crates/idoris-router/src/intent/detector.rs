@@ -249,11 +249,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn nonfinite_scores_and_thresholds_fail_closed() {
-        let d = detector(&[("alpha", &["NAN"])], 0, 0);
-        assert_eq!(d.detect(&user("QUERY")).await.unwrap(), None);
-        let mut d = detector(&[("alpha", &["A"])], 0, 0);
-        d.min_score = f64::NAN;
-        assert_eq!(d.detect(&user("QUERY")).await.unwrap(), None);
+    async fn nonfinite_route_scores_are_skipped_before_valid_matches() {
+        let d = detector(&[("broken", &["NAN"]), ("alpha", &["A"])], 0, 0);
+        let hit = d.detect(&user("QUERY")).await.unwrap().unwrap();
+        assert_eq!(hit.intent, "alpha");
+        assert_eq!(hit.score, 1.0);
+    }
+
+    #[tokio::test]
+    async fn nonfinite_thresholds_fail_closed_without_embedding() {
+        for min_score in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let mut d = detector(&[("alpha", &["A"])], 0, 0);
+            d.min_score = min_score;
+            assert_eq!(d.detect(&user("QUERY")).await.unwrap(), None);
+            assert!(d.embed.calls.lock().unwrap().is_empty());
+        }
     }
 }
