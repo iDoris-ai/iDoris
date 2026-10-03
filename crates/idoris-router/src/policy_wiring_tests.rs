@@ -6,7 +6,9 @@ use std::sync::Arc;
 
 use http_body_util::BodyExt;
 use idoris_contracts::common::{PrivacyClass, Tier};
+use idoris_contracts::load_policy::{Admission, Keepalive, LoadMode, LoadPolicy};
 use idoris_contracts::provider::Locality;
+use idoris_policy::{AdmissionStatus, Card, Role, validate_registration};
 use tower::ServiceExt;
 use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
 
@@ -216,6 +218,131 @@ async fn local_only_request_cannot_use_policy_selected_remote_candidate() {
         assert_eq!(adapter.load_call_count("remote"), 0);
         upstream.verify().await;
     }
+}
+
+#[tokio::test]
+async fn local_only_loopback_privacy_any_is_rejected_by_resident_proxy() {
+    verify_local_only_loopback_privacy_gate(true).await;
+}
+
+#[tokio::test]
+async fn local_only_loopback_privacy_any_is_rejected_by_supervisor() {
+    verify_local_only_loopback_privacy_gate(false).await;
+}
+
+async fn verify_local_only_loopback_privacy_gate(resident: bool) {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({"marker":"trusted-local-ok"})),
+        )
+        .expect(u64::from(resident))
+        .mount(&upstream)
+        .await;
+
+    let mut untrusted = if resident {
+        resident_component_card("local-any", &upstream.uri())
+    } else {
+        let mut card = sample_component_card("local-any");
+        card.endpoint = upstream.uri();
+        card.load_policy = Some(LoadPolicy {
+            mode: LoadMode::OnDemand,
+            keepalive: Keepalive::IdleTtl { idle_ttl_s: 300 },
+            admission: Admission::Coexist,
+        });
+        card
+    };
+    untrusted.provider.tier = Tier::Local;
+    untrusted.provider.locality = Locality::Loopback;
+    untrusted.provider.privacy_class = PrivacyClass::Any;
+    untrusted.privacy_class = PrivacyClass::Any;
+    untrusted.allowed_egress = vec![idoris_contracts::component_card::Egress::Loopback];
+    let registration_card = Card {
+        component: untrusted.clone(),
+        roles: vec![Role::Daily],
+        experiment: false,
+        min_ram_gb: 0.0,
+        estimated_cost_minor: Some(0),
+        admission_status: AdmissionStatus::Ready,
+    };
+    assert_eq!(
+        validate_registration(std::slice::from_ref(&registration_card)),
+        Ok(())
+    );
+
+    let adapter = Arc::new(idoris_backend::MockAdapter::new(vec![
+        idoris_backend::ModelInfo {
+            id: "local-any".into(),
+            memory_gb: 1.0,
+        },
+    ]));
+    let supervisor =
+        idoris_backend::Supervisor::spawn(adapter.clone(), Default::default()).unwrap();
+    let bound = (!resident).then(|| dispatch::BoundSupervisor::new(&untrusted, supervisor));
+    let app = build_app(AppState {
+        cards: vec![untrusted.clone()],
+        supervisor: bound.clone(),
+        routing_policy: policy("local", true),
+        ..AppState::default()
+    });
+    let rejected = app
+        .oneshot(post_chat(
+            r#"{"model":"idoris/daily","messages":[{"role":"user","content":"private"}]}"#,
+            &[("x-idoris-privacy", "local_only")],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        rejected.status(),
+        axum::http::StatusCode::SERVICE_UNAVAILABLE
+    );
+    let bytes = rejected.into_body().collect().await.unwrap().to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(json["error"]["type"], "local_only_unavailable");
+    assert_eq!(adapter.load_call_count("local-any"), 0);
+    assert!(upstream.received_requests().await.unwrap().is_empty());
+
+    let mut trusted = untrusted;
+    trusted.provider.privacy_class = PrivacyClass::LocalOnly;
+    trusted.privacy_class = PrivacyClass::LocalOnly;
+    let trusted_registration = Card {
+        component: trusted.clone(),
+        ..registration_card
+    };
+    assert_eq!(validate_registration(&[trusted_registration]), Ok(()));
+    let response = build_app(AppState {
+        cards: vec![trusted],
+        supervisor: bound,
+        routing_policy: policy("local", true),
+        ..AppState::default()
+    })
+    .oneshot(post_chat(
+        r#"{"model":"idoris/daily","messages":[{"role":"user","content":"private"}]}"#,
+        &[("x-idoris-privacy", "local_only")],
+    ))
+    .await
+    .unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    assert_eq!(
+        response.headers().get(HEADER_SERVED_LOCALITY).unwrap(),
+        "loopback"
+    );
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    if resident {
+        assert_eq!(json["marker"], "trusted-local-ok");
+        assert_eq!(adapter.load_call_count("local-any"), 0);
+    } else {
+        assert!(
+            json["choices"][0]["message"]["content"]
+                .as_str()
+                .unwrap()
+                .contains("private")
+        );
+        assert_eq!(adapter.load_call_count("local-any"), 1);
+    }
+    upstream.verify().await;
 }
 
 #[tokio::test]
