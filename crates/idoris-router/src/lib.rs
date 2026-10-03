@@ -9,6 +9,9 @@
 /// Control-plane header parsing (R2-D task 1).
 pub mod profile;
 
+/// Packaged binary command-line parsing.
+pub mod cli;
+
 /// Offline intent embedding primitives (B1 task 09).
 pub mod intent;
 
