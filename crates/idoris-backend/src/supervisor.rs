@@ -90,7 +90,7 @@ struct ModelSlot {
     /// an explicit `unload` defers its actual adapter call until this
     /// drains to 0 (see `handle_unload`).
     inflight: u32,
-    /// A load call timed out or reported an unconfirmed outcome. The engine
+    /// A load or readiness probe had an unconfirmed outcome. The engine
     /// may still finish allocating after any unload/status response; without
     /// an operation-completion signal the slot cannot safely be released.
     load_unconfirmed: bool,
@@ -221,6 +221,11 @@ struct ReleaseLimits {
     target_absent_gb: f64,
     /// Same remainder plus the previous target, which may survive eviction.
     after_eviction_gb: f64,
+}
+
+struct LoadFlowContext {
+    release_limits: ReleaseLimits,
+    load_fence: Option<Arc<crate::load_fence::LoadFence>>,
 }
 
 /// A cheaply-`Clone`-able front door to a running [`Supervisor`]. Every
@@ -490,9 +495,9 @@ async fn confirm_memory_released(
 /// function's local `victim_results` is lost with the panicking stack
 /// frame — `start_load`'s `JoinError` arm resolves every chosen victim to
 /// `Error` anyway (not distinguishing "already freed" from "never
-/// attempted"), so none dangle in `Stopping` forever: `Error` is itself a
-/// valid eviction candidate (H1), so this self-heals rather than requiring
-/// a manual `unload`. **Known accepted imprecision**: a victim that
+/// attempted"), so none dangle in `Stopping` forever. Victims can still
+/// be explicitly unloaded, but the durable fence blocks new loads until
+/// engine termination is established. **Known accepted imprecision**: a victim that
 /// actually succeeded right before the panic is still reported `Error`
 /// (occupying budget) instead of the more accurate `Stopped` — recovering
 /// that needs `catch_unwind`-based partial-state recovery across `.await`
@@ -509,17 +514,45 @@ async fn confirm_memory_released(
 /// settle a fresh load on `Stopped`, or restore a retry's previous slot.
 /// A load timeout or `LoadUnconfirmed` may still be executing at the engine,
 /// so unload/status cannot prove the original operation will not allocate
-/// later; retain its Error slot. A probe failure occurs after load returned
-/// successfully, so its unload can still confirm release.
+/// later; retain its Error slot. `load` returning `Ok` only confirms
+/// acceptance, not completion, so a probe failure must retain the same fence.
 async fn run_load_flow(
     adapter: Arc<dyn RuntimeAdapter>,
     config: SupervisorConfig,
+    context: LoadFlowContext,
     id: String,
     policy: LoadPolicy,
     evict: Vec<String>,
     mut previous: Option<PreviousModel>,
-    release_limits: ReleaseLimits,
 ) -> OpOutcome {
+    let LoadFlowContext {
+        release_limits,
+        load_fence,
+    } = context;
+    // Persist before the first adapter IO (including victim eviction), so a
+    // Supervisor restart cannot admit another load while this operation is
+    // unresolved. Existing markers fail closed and are never overwritten.
+    let load_fence = match load_fence
+        .ok_or_else(|| BackendError::internal("load fence is unavailable"))
+        .and_then(|fence| {
+            fence.begin()?;
+            Ok(fence)
+        }) {
+        Ok(fence) => fence,
+        Err(err) => {
+            return OpOutcome::Load {
+                result: Err(err),
+                victim_results: evict
+                    .iter()
+                    .map(|victim| (victim.clone(), Err(BackendError::eviction_failed(&id))))
+                    .collect(),
+                failure_outcome: previous.map_or(
+                    LoadFailureOutcome::Settle(ModelState::Stopped),
+                    LoadFailureOutcome::RestorePrevious,
+                ),
+            };
+        }
+    };
     // Every chosen victim gets an actual unload attempt, even after an
     // earlier one fails: `OpDone` only resolves ids present in
     // `victim_results`, so stopping early would leave later victims stuck
@@ -565,6 +598,11 @@ async fn run_load_flow(
             &config,
         )
         .await;
+        let failure_outcome = if load_fence.clear().is_ok() {
+            failure_outcome
+        } else {
+            LoadFailureOutcome::RetainUnconfirmedLoad(previous)
+        };
         return OpOutcome::Load {
             result: Err(err),
             victim_results,
@@ -594,10 +632,15 @@ async fn run_load_flow(
         {
             let state =
                 best_effort_release(&adapter, &id, release_limits.target_absent_gb, &config).await;
+            let failure_outcome = if load_fence.clear().is_ok() {
+                LoadFailureOutcome::after_release(state, previous)
+            } else {
+                LoadFailureOutcome::RetainUnconfirmedLoad(previous)
+            };
             return OpOutcome::Load {
                 result: attempt,
                 victim_results,
-                failure_outcome: LoadFailureOutcome::after_release(state, previous),
+                failure_outcome,
             };
         }
         // The old instance is now confirmed absent, so subsequent retry
@@ -621,6 +664,16 @@ async fn run_load_flow(
             &config,
         )
         .await;
+        let unresolved_load = matches!(
+            &err,
+            BackendError::AdapterTimedOut { .. } | BackendError::LoadUnconfirmed { .. }
+        );
+        let fence_resolved = !unresolved_load && load_fence.clear().is_ok();
+        let failure_outcome = if unresolved_load || fence_resolved {
+            failure_outcome
+        } else {
+            LoadFailureOutcome::RetainUnconfirmedLoad(previous)
+        };
         return OpOutcome::Load {
             result: Err(err),
             victim_results,
@@ -632,6 +685,13 @@ async fn run_load_flow(
         match with_adapter_timeout(adapter.probe_ready(&id), config.adapter_call_timeout, &id).await
         {
             Ok(true) => {
+                if let Err(err) = load_fence.clear() {
+                    return OpOutcome::Load {
+                        result: Err(err),
+                        victim_results,
+                        failure_outcome: LoadFailureOutcome::RetainUnconfirmedLoad(previous),
+                    };
+                }
                 return OpOutcome::Load {
                     result: Ok(()),
                     victim_results,
@@ -640,34 +700,36 @@ async fn run_load_flow(
             }
             Ok(false) => tokio::time::sleep(config.probe_interval).await,
             Err(err) => {
-                // `adapter.load` itself already succeeded by this point, so
-                // (unlike the two branches above) a reload's *old* instance
-                // is not assumed to still be untouched — confirm via
-                // best-effort release the same way a fresh load would.
-                let state =
+                // `load` returning Ok means accepted, not completed. A failed
+                // probe provides no operation-termination evidence; cleanup
+                // is useful, but cannot release the ledger fence.
+                let _ =
                     best_effort_release(&adapter, &id, release_limits.target_absent_gb, &config)
                         .await;
                 return OpOutcome::Load {
                     result: Err(err),
                     victim_results,
-                    failure_outcome: LoadFailureOutcome::after_release(state, previous),
+                    failure_outcome: LoadFailureOutcome::RetainUnconfirmedLoad(previous),
                 };
             }
         }
     }
-    let state = best_effort_release(&adapter, &id, release_limits.target_absent_gb, &config).await;
+    // Exhausted readiness probes do not prove that the accepted load has
+    // stopped. Even an empty status after unload cannot prevent a delayed
+    // allocation, so keep the reservation pinned.
+    let _ = best_effort_release(&adapter, &id, release_limits.target_absent_gb, &config).await;
     OpOutcome::Load {
         result: Err(BackendError::probe_timed_out(id.clone())),
         victim_results,
-        failure_outcome: LoadFailureOutcome::after_release(state, previous),
+        failure_outcome: LoadFailureOutcome::RetainUnconfirmedLoad(previous),
     }
 }
 
 /// After a `probe_ready` failure/timeout, `id`'s real state is ambiguous —
 /// `adapter.load` itself succeeded, so something may genuinely be
-/// resident. A best-effort `unload` resolves it: `Stopped` if that
-/// confirms release, `Error` (still occupying budget, matching
-/// `occupies_budget`'s documented conservatism) only if even that fails.
+/// resident or may still allocate later. Cleanup is attempted, but its
+/// acknowledgement and an empty status snapshot cannot establish that the
+/// accepted load operation has terminated.
 async fn best_effort_release(
     adapter: &Arc<dyn RuntimeAdapter>,
     id: &str,
@@ -720,6 +782,7 @@ struct Env<'a> {
     adapter: &'a Arc<dyn RuntimeAdapter>,
     config: &'a SupervisorConfig,
     self_tx: &'a mpsc::WeakSender<ActorMsg>,
+    load_fence: Option<&'a Arc<crate::load_fence::LoadFence>>,
     // Unknown startup residency is fixed; managed estimates are charged separately.
     reserved_gb: f64,
     startup_error: Option<BackendError>,
@@ -807,6 +870,7 @@ fn start_load(
     };
     let adapter = env.adapter.clone();
     let config = env.config.clone();
+    let load_fence = env.load_fence.cloned();
     let self_tx = env.self_tx.clone();
     let id_for_task = id.clone();
     // Kept alongside `evict` (which is moved into `run_load_flow` below) so
@@ -824,11 +888,14 @@ fn start_load(
         let inner = tokio::spawn(run_load_flow(
             adapter,
             config,
+            LoadFlowContext {
+                release_limits,
+                load_fence,
+            },
             id_for_task.clone(),
             policy,
             evict,
             previous,
-            release_limits,
         ));
         let outcome = match inner.await {
             Ok(outcome) => outcome,
@@ -839,11 +906,10 @@ fn start_load(
                 )),
                 // Every victim `plan_eviction` chose must still be
                 // resolved, not left dangling in `Stopping` forever just
-                // because the panic happened to land mid-eviction-loop:
-                // report each as `Err` so `OpDone` settles it on `Error`
-                // (still occupying budget, conservative — but `Error` is
-                // itself a valid eviction candidate per H1, so it can
-                // self-heal via a later eviction or a manual `unload`).
+                // because the panic happened to land mid-eviction-loop.
+                // Report each as `Err` so `OpDone` resolves the victim;
+                // the durable marker continues to block future loads until
+                // an operator resets it or the engine is restarted safely.
                 victim_results: evict_for_panic_fallback
                     .into_iter()
                     .map(|victim| {
@@ -854,9 +920,9 @@ fn start_load(
                         (victim, Err(err))
                     })
                     .collect(),
-                // A panic leaves state unknown; retain the larger footprint
-                // while marking Error rather than restoring a Ready instance.
-                failure_outcome: LoadFailureOutcome::after_release(ModelState::Error, previous),
+                // A panic may have happened after the engine accepted the
+                // request. Keep its durable marker and ledger fence.
+                failure_outcome: LoadFailureOutcome::RetainUnconfirmedLoad(previous),
             },
         };
         // If `upgrade` fails, every `SupervisorHandle` is already gone and
@@ -1130,6 +1196,14 @@ async fn run_actor(
     // the *entire* actor task (and, with it, every other in-flight and
     // future caller) over a single corrupted entry.
     let mut poisoned: Option<String> = None;
+    let load_fence_result = adapter
+        .load_fence_path()
+        .map(|path| Arc::new(crate::load_fence::LoadFence::new(path)));
+    let load_fence_error = match &load_fence_result {
+        Ok(fence) => fence.check_clear().err(),
+        Err(err) => Some(err.clone()),
+    };
+    let load_fence = load_fence_result.ok();
     // Sample engine residency once, before accepting commands. Spawning the
     // adapter call isolates panic; the timeout bounds startup even when the
     // adapter never returns.
@@ -1157,8 +1231,9 @@ async fn run_actor(
         adapter: &adapter,
         config: &config,
         self_tx: &self_tx,
+        load_fence: load_fence.as_ref(),
         reserved_gb: startup.as_ref().copied().unwrap_or_default(),
-        startup_error: startup.err(),
+        startup_error: load_fence_error.or_else(|| startup.err()),
     };
 
     while let Some(msg) = rx.recv().await {
@@ -2085,10 +2160,17 @@ mod tests {
         /// not a permanent one, so a later retry of the *same* id (e.g.
         /// evicting it again for a different request) can still succeed.
         already_panicked: std::sync::atomic::AtomicBool,
+        fence_path: std::sync::OnceLock<std::path::PathBuf>,
     }
 
     #[async_trait::async_trait]
     impl RuntimeAdapter for UnloadPanicsForOneIdAdapter {
+        fn load_fence_path(&self) -> Result<std::path::PathBuf, BackendError> {
+            Ok(self
+                .fence_path
+                .get_or_init(crate::mock::temporary_load_fence_path)
+                .clone())
+        }
         async fn list(&self) -> Result<Vec<ModelInfo>, BackendError> {
             Ok(["a", "b", "c", "d"]
                 .into_iter()
@@ -2144,9 +2226,10 @@ mod tests {
         let adapter = Arc::new(UnloadPanicsForOneIdAdapter {
             panics_for: "b",
             already_panicked: std::sync::atomic::AtomicBool::new(false),
+            fence_path: std::sync::OnceLock::new(),
         });
         let handle = Supervisor::spawn(
-            adapter,
+            adapter.clone(),
             SupervisorConfig {
                 budget_gb: 20.0,
                 ..SupervisorConfig::default()
@@ -2166,19 +2249,26 @@ mod tests {
             .await
             .expect_err("the panic mid-eviction must surface, not silently succeed");
         assert_eq!(err.reason_code(), "adapter_panicked");
-        // The decisive check: `occupies_budget` treats `Stopping` and
-        // `Error` identically (both conservative), so `used_gb` alone
-        // can't tell "resolved to Error" apart from "left dangling in
-        // Stopping forever" — but *evictability* can: only `Error` (not
-        // `Stopping`) is a valid eviction candidate (H1). If any victim
-        // were left un-resolved in `Stopping`, only `c` (20 GiB, already
-        // `Error`) would be evictable — not enough to admit a 15 GiB
-        // request on top of an already-over-budget ledger. Every victim
-        // actually resolving to `Error` makes all 40 GiB (a+b+c)
-        // evictable, which is enough.
-        no_hang(handle.load("d", 15.0, on_demand_policy()))
+        assert!(
+            adapter
+                .load_fence_path()
+                .and_then(|path| crate::load_fence::LoadFence::new(path).check_clear())
+                .is_err()
+        );
+        for victim in ["a", "b"] {
+            no_hang(handle.unload(victim))
+                .await
+                .expect("each victim must leave Stopping and allow explicit unload");
+        }
+        assert_eq!(handle.status().await.unwrap().used_gb, 20.0);
+        drop(handle);
+        tokio::task::yield_now().await;
+        let restarted = Supervisor::spawn(adapter, SupervisorConfig::default()).unwrap();
+        let err = restarted
+            .load("d", 15.0, on_demand_policy())
             .await
-            .expect("d must be admittable: a, b, and c must all have resolved to the (evictable) Error state, not be stuck un-resolved in Stopping");
+            .unwrap_err();
+        assert_eq!(err.reason_code(), "internal");
     }
 
     /// Nothing interleaves with an in-flight load that is evicting a
@@ -2212,10 +2302,18 @@ mod tests {
     /// A minimal `RuntimeAdapter` whose `load` always panics — for
     /// exercising the panic-isolation path in `start_load` without adding
     /// panic-injection scripting to `MockAdapter` itself.
-    struct PanickingAdapter;
+    struct PanickingAdapter {
+        fence_path: std::sync::OnceLock<std::path::PathBuf>,
+    }
 
     #[async_trait::async_trait]
     impl RuntimeAdapter for PanickingAdapter {
+        fn load_fence_path(&self) -> Result<std::path::PathBuf, BackendError> {
+            Ok(self
+                .fence_path
+                .get_or_init(crate::mock::temporary_load_fence_path)
+                .clone())
+        }
         async fn list(&self) -> Result<Vec<ModelInfo>, BackendError> {
             Ok(catalog())
         }
@@ -2254,7 +2352,9 @@ mod tests {
     /// llama-swap Issue #946's failure mode).
     #[tokio::test]
     async fn a_panicking_load_reports_adapter_panicked_and_does_not_wedge_the_supervisor() {
-        let adapter = Arc::new(PanickingAdapter);
+        let adapter = Arc::new(PanickingAdapter {
+            fence_path: std::sync::OnceLock::new(),
+        });
         let handle =
             Supervisor::spawn(adapter, SupervisorConfig::default()).expect("spawn should succeed");
         let err = no_hang(handle.load("a", 4.0, on_demand_policy()))
@@ -2301,10 +2401,18 @@ mod tests {
     /// (Opus Tier-2 review) counterpart of `PanickingAdapter`, isolating
     /// `start_unload`'s own panic-isolation path from an eviction's own
     /// unloads (already covered by `run_load_flow`'s tests).
-    struct UnloadAlwaysPanicsAdapter;
+    struct UnloadAlwaysPanicsAdapter {
+        fence_path: std::sync::OnceLock<std::path::PathBuf>,
+    }
 
     #[async_trait::async_trait]
     impl RuntimeAdapter for UnloadAlwaysPanicsAdapter {
+        fn load_fence_path(&self) -> Result<std::path::PathBuf, BackendError> {
+            Ok(self
+                .fence_path
+                .get_or_init(crate::mock::temporary_load_fence_path)
+                .clone())
+        }
         async fn list(&self) -> Result<Vec<ModelInfo>, BackendError> {
             Ok(two_model_catalog())
         }
@@ -2342,7 +2450,9 @@ mod tests {
     /// same guarantee C1 gave `load`, verified independently here.
     #[tokio::test]
     async fn a_panicking_standalone_unload_does_not_wedge_the_supervisor() {
-        let adapter = Arc::new(UnloadAlwaysPanicsAdapter);
+        let adapter = Arc::new(UnloadAlwaysPanicsAdapter {
+            fence_path: std::sync::OnceLock::new(),
+        });
         let handle =
             Supervisor::spawn(adapter, SupervisorConfig::default()).expect("spawn should succeed");
         no_hang(handle.load("a", 4.0, on_demand_policy()))
@@ -2389,10 +2499,18 @@ mod tests {
     /// A minimal `RuntimeAdapter` whose `chat` always panics (`load`/
     /// `unload`/`probe_ready` all succeed normally) — for exercising the
     /// panic-isolation path in the `Chat` dispatch specifically.
-    struct ChatPanicsAdapter;
+    struct ChatPanicsAdapter {
+        fence_path: std::sync::OnceLock<std::path::PathBuf>,
+    }
 
     #[async_trait::async_trait]
     impl RuntimeAdapter for ChatPanicsAdapter {
+        fn load_fence_path(&self) -> Result<std::path::PathBuf, BackendError> {
+            Ok(self
+                .fence_path
+                .get_or_init(crate::mock::temporary_load_fence_path)
+                .clone())
+        }
         async fn list(&self) -> Result<Vec<ModelInfo>, BackendError> {
             Ok(two_model_catalog())
         }
@@ -2430,7 +2548,9 @@ mod tests {
     /// original fix (`start_load`/`start_unload` only) didn't cover.
     #[tokio::test]
     async fn a_panicking_chat_does_not_leak_inflight_unload_completes_and_other_ids_stay_free() {
-        let adapter = Arc::new(ChatPanicsAdapter);
+        let adapter = Arc::new(ChatPanicsAdapter {
+            fence_path: std::sync::OnceLock::new(),
+        });
         let handle =
             Supervisor::spawn(adapter, SupervisorConfig::default()).expect("spawn should succeed");
         no_hang(handle.load("a", 4.0, on_demand_policy()))
@@ -2630,20 +2750,27 @@ mod tests {
         }
     }
 
-    /// K10/H2: a panic during an Error retry also leaves release uncertain.
+    /// A load panic retains the durable global fence through retries and
+    /// explicit unloads because the engine operation's state is unknown.
     #[tokio::test]
     async fn error_retry_panic_preserves_old_occupancy() {
-        let handle =
-            Supervisor::spawn(Arc::new(PanickingAdapter), SupervisorConfig::default()).unwrap();
-        for (memory_gb, expected) in [(8.0, 8.0), (1.0, 8.0), (16.0, 16.0)] {
-            let err = no_hang(handle.load("a", memory_gb, on_demand_policy()))
-                .await
-                .unwrap_err();
-            assert_eq!(err.reason_code(), "adapter_panicked");
-            assert_eq!(handle.status().await.unwrap().used_gb, expected);
-        }
-        no_hang(handle.unload("a")).await.unwrap();
-        assert_eq!(handle.status().await.unwrap().used_gb, 0.0);
+        let handle = Supervisor::spawn(
+            Arc::new(PanickingAdapter {
+                fence_path: std::sync::OnceLock::new(),
+            }),
+            SupervisorConfig::default(),
+        )
+        .unwrap();
+        let err = no_hang(handle.load("a", 8.0, on_demand_policy()))
+            .await
+            .unwrap_err();
+        assert_eq!(err.reason_code(), "adapter_panicked");
+        assert_eq!(handle.status().await.unwrap().used_gb, 8.0);
+        let err = no_hang(handle.load("a", 1.0, on_demand_policy()))
+            .await
+            .unwrap_err();
+        assert_eq!(err.reason_code(), "model_unavailable");
+        assert_eq!(handle.status().await.unwrap().used_gb, 8.0);
     }
 
     /// Medium (follow-up Opus review, prdaemon probe): a reload of an
@@ -2761,10 +2888,17 @@ mod tests {
     /// whether that best-effort release itself succeeds.
     struct ProbeAlwaysFailsAdapter {
         unload_ok: bool,
+        fence_path: std::sync::OnceLock<std::path::PathBuf>,
     }
 
     #[async_trait::async_trait]
     impl RuntimeAdapter for ProbeAlwaysFailsAdapter {
+        fn load_fence_path(&self) -> Result<std::path::PathBuf, BackendError> {
+            Ok(self
+                .fence_path
+                .get_or_init(crate::mock::temporary_load_fence_path)
+                .clone())
+        }
         async fn list(&self) -> Result<Vec<ModelInfo>, BackendError> {
             Ok(catalog())
         }
@@ -2809,11 +2943,14 @@ mod tests {
         }
     }
 
-    /// H1: a `probe_ready` failure that a best-effort `unload` *confirms*
-    /// released must settle on `Stopped`, not the conservative `Error`.
+    /// A `probe_ready` failure remains fenced even when cleanup reports an
+    /// empty engine snapshot: the accepted load may still allocate later.
     #[tokio::test]
-    async fn probe_failure_confirmed_released_does_not_occupy_the_ledger() {
-        let adapter = Arc::new(ProbeAlwaysFailsAdapter { unload_ok: true });
+    async fn probe_failure_with_empty_status_still_occupies_the_ledger() {
+        let adapter = Arc::new(ProbeAlwaysFailsAdapter {
+            unload_ok: true,
+            fence_path: std::sync::OnceLock::new(),
+        });
         let handle =
             Supervisor::spawn(adapter, SupervisorConfig::default()).expect("spawn should succeed");
         handle
@@ -2822,8 +2959,8 @@ mod tests {
             .expect_err("probe_ready always fails, so load must fail too");
         let status = handle.status().await.expect("status should succeed");
         assert_eq!(
-            status.used_gb, 0.0,
-            "a confirmed-released model must not occupy budget"
+            status.used_gb, 4.0,
+            "an accepted load remains fenced without operation-termination evidence"
         );
     }
 
@@ -2832,7 +2969,10 @@ mod tests {
     /// stay `Error` (occupying budget), never guessed as free.
     #[tokio::test]
     async fn probe_failure_with_failed_release_still_occupies_the_ledger() {
-        let adapter = Arc::new(ProbeAlwaysFailsAdapter { unload_ok: false });
+        let adapter = Arc::new(ProbeAlwaysFailsAdapter {
+            unload_ok: false,
+            fence_path: std::sync::OnceLock::new(),
+        });
         let handle =
             Supervisor::spawn(adapter, SupervisorConfig::default()).expect("spawn should succeed");
         handle
@@ -2846,18 +2986,22 @@ mod tests {
         );
     }
 
-    /// K10/H2: even after load succeeds, a failed probe and failed cleanup
-    /// cannot replace the old Error footprint with a smaller retry estimate.
+    /// A failed probe fences the accepted operation, so retries cannot
+    /// replace its reservation with a smaller or larger estimate.
     #[tokio::test]
     async fn error_retry_probe_failure_preserves_old_occupancy() {
-        let adapter = Arc::new(ProbeAlwaysFailsAdapter { unload_ok: false });
+        let adapter = Arc::new(ProbeAlwaysFailsAdapter {
+            unload_ok: false,
+            fence_path: std::sync::OnceLock::new(),
+        });
         let handle = Supervisor::spawn(adapter, SupervisorConfig::default()).unwrap();
-        for (memory_gb, expected) in [(8.0, 8.0), (1.0, 8.0), (16.0, 16.0)] {
-            no_hang(handle.load("a", memory_gb, on_demand_policy()))
-                .await
-                .unwrap_err();
-            assert_eq!(handle.status().await.unwrap().used_gb, expected);
-        }
+        no_hang(handle.load("a", 8.0, on_demand_policy()))
+            .await
+            .unwrap_err();
+        assert_eq!(handle.status().await.unwrap().used_gb, 8.0);
+        let err = handle.load("a", 1.0, on_demand_policy()).await.unwrap_err();
+        assert_eq!(err.reason_code(), "model_unavailable");
+        assert_eq!(handle.status().await.unwrap().used_gb, 8.0);
     }
 
     /// A minimal `RuntimeAdapter` whose `load` reports
@@ -2870,6 +3014,7 @@ mod tests {
         ready_once: std::sync::atomic::AtomicBool,
         chat_entered: tokio::sync::Notify,
         release_chat: tokio::sync::Notify,
+        fence_path: std::sync::OnceLock<std::path::PathBuf>,
     }
 
     impl LoadUnconfirmedAdapter {
@@ -2880,12 +3025,19 @@ mod tests {
                 ready_once: std::sync::atomic::AtomicBool::new(false),
                 chat_entered: tokio::sync::Notify::new(),
                 release_chat: tokio::sync::Notify::new(),
+                fence_path: std::sync::OnceLock::new(),
             }
         }
     }
 
     #[async_trait::async_trait]
     impl RuntimeAdapter for LoadUnconfirmedAdapter {
+        fn load_fence_path(&self) -> Result<std::path::PathBuf, BackendError> {
+            Ok(self
+                .fence_path
+                .get_or_init(crate::mock::temporary_load_fence_path)
+                .clone())
+        }
         async fn list(&self) -> Result<Vec<ModelInfo>, BackendError> {
             Ok(catalog())
         }
@@ -3028,15 +3180,27 @@ mod tests {
         allocation_finished: Arc<tokio::sync::Notify>,
         finish_load: Arc<tokio::sync::Notify>,
         load_started: tokio::sync::Notify,
+        load_calls: std::sync::atomic::AtomicU32,
         unload_calls: std::sync::atomic::AtomicU32,
+        load_returns_ok: bool,
+        probe_hangs: bool,
+        fence_path: std::sync::OnceLock<std::path::PathBuf>,
     }
 
     #[async_trait::async_trait]
     impl RuntimeAdapter for DelayedAllocationAdapter {
+        fn load_fence_path(&self) -> Result<std::path::PathBuf, BackendError> {
+            Ok(self
+                .fence_path
+                .get_or_init(crate::mock::temporary_load_fence_path)
+                .clone())
+        }
         async fn list(&self) -> Result<Vec<ModelInfo>, BackendError> {
             Ok(catalog())
         }
         async fn load(&self, _id: &str, _policy: Option<&LoadPolicy>) -> Result<(), BackendError> {
+            self.load_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             self.load_started.notify_one();
             let loaded = self.loaded.clone();
             let finish = self.finish_load.clone();
@@ -3046,7 +3210,11 @@ mod tests {
                 loaded.store(true, std::sync::atomic::Ordering::SeqCst);
                 allocation_finished.notify_one();
             });
-            std::future::pending().await
+            if self.load_returns_ok {
+                Ok(())
+            } else {
+                std::future::pending().await
+            }
         }
         async fn unload(&self, _id: &str) -> Result<(), BackendError> {
             self.unload_calls
@@ -3063,7 +3231,11 @@ mod tests {
             })
         }
         async fn probe_ready(&self, _id: &str) -> Result<bool, BackendError> {
-            Ok(true)
+            if self.probe_hangs {
+                std::future::pending().await
+            } else {
+                Ok(false)
+            }
         }
         async fn chat(
             &self,
@@ -3077,61 +3249,130 @@ mod tests {
         }
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn delayed_timed_out_load_stays_charged_and_cannot_be_released_retried_or_evicted() {
+    async fn delayed_load_scenario(accepted: bool, probe_hangs: bool, restart: bool) {
         let adapter = Arc::new(DelayedAllocationAdapter {
             loaded: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             allocation_finished: Arc::new(tokio::sync::Notify::new()),
             finish_load: Arc::new(tokio::sync::Notify::new()),
             load_started: tokio::sync::Notify::new(),
+            load_calls: std::sync::atomic::AtomicU32::new(0),
             unload_calls: std::sync::atomic::AtomicU32::new(0),
+            load_returns_ok: accepted,
+            probe_hangs,
+            fence_path: std::sync::OnceLock::new(),
         });
-        let handle = Supervisor::spawn(
-            adapter.clone(),
-            SupervisorConfig {
-                budget_gb: 10.0,
-                adapter_call_timeout: std::time::Duration::from_millis(30),
-                ..SupervisorConfig::default()
-            },
-        )
-        .unwrap();
+        let config = SupervisorConfig {
+            budget_gb: 10.0,
+            adapter_call_timeout: std::time::Duration::from_millis(30),
+            probe_max_attempts: 2,
+            ..SupervisorConfig::default()
+        };
+        let (tx, actor) = spawn_actor(adapter.clone(), config.clone());
+        let handle = SupervisorHandle { tx };
         let h = handle.clone();
         let load = tokio::spawn(async move { h.load("a", 8.0, on_demand_policy()).await });
         no_hang(adapter.load_started.notified()).await;
         let err = no_hang(load).await.unwrap().unwrap_err();
-        assert_eq!(err.reason_code(), "adapter_timed_out");
-
+        assert_eq!(
+            err.reason_code(),
+            if accepted && !probe_hangs {
+                "probe_timed_out"
+            } else {
+                "adapter_timed_out"
+            }
+        );
         let initial = handle.status().await.unwrap();
         assert_eq!(initial.used_gb, 8.0);
-        assert!(
-            initial.loaded.is_empty(),
-            "an unconfirmed model must not be advertised as Ready"
-        );
-        let engine_snapshot = adapter.status().await.unwrap();
-        assert_eq!(engine_snapshot.used_gb, 0.0);
-        assert!(engine_snapshot.loaded.is_empty());
-        let err = handle.unload("a").await.unwrap_err();
-        assert_eq!(err.reason_code(), "model_unavailable");
-        let err = handle.load("a", 1.0, on_demand_policy()).await.unwrap_err();
-        assert_eq!(err.reason_code(), "model_unavailable");
-        let err = handle.load("b", 5.0, on_demand_policy()).await.unwrap_err();
-        assert_eq!(err.reason_code(), "eviction_impossible");
+        assert!(initial.loaded.is_empty(), "unconfirmed loads are not Ready");
+        let empty = adapter.status().await.unwrap();
+        assert_eq!(empty.used_gb, 0.0);
+        assert!(empty.loaded.is_empty());
         assert_eq!(
             adapter
                 .unload_calls
                 .load(std::sync::atomic::Ordering::SeqCst),
             1
         );
+        assert_eq!(
+            handle.unload("a").await.unwrap_err().reason_code(),
+            "model_unavailable"
+        );
+        assert_eq!(
+            handle
+                .load("a", 1.0, on_demand_policy())
+                .await
+                .unwrap_err()
+                .reason_code(),
+            "model_unavailable"
+        );
+        assert_eq!(
+            handle
+                .load("b", 5.0, on_demand_policy())
+                .await
+                .unwrap_err()
+                .reason_code(),
+            "eviction_impossible"
+        );
+
+        let handle = if restart {
+            drop(handle);
+            no_hang(actor).await.unwrap();
+            let restarted = Supervisor::spawn(adapter.clone(), config).unwrap();
+            let err = restarted
+                .load("b", 5.0, on_demand_policy())
+                .await
+                .unwrap_err();
+            assert_eq!(err.reason_code(), "internal");
+            assert!(err.to_string().contains("durable load fence"));
+            assert_eq!(
+                adapter.load_calls.load(std::sync::atomic::Ordering::SeqCst),
+                1
+            );
+            restarted
+        } else {
+            handle
+        };
 
         adapter.finish_load.notify_one();
         no_hang(adapter.allocation_finished.notified()).await;
-        let after = handle.status().await.unwrap();
-        assert_eq!(after.used_gb, 8.0);
-        let engine_snapshot = adapter.status().await.unwrap();
-        assert_eq!(engine_snapshot.used_gb, 8.0);
-        assert_eq!(engine_snapshot.loaded, vec!["a"]);
+        let actual = adapter.status().await.unwrap();
+        assert_eq!(actual.used_gb, 8.0);
+        assert_eq!(actual.loaded, vec!["a"]);
+        if !restart {
+            assert_eq!(handle.status().await.unwrap().used_gb, 8.0);
+        }
         let err = handle.load("b", 5.0, on_demand_policy()).await.unwrap_err();
-        assert_eq!(err.reason_code(), "eviction_impossible");
+        assert_eq!(
+            err.reason_code(),
+            if restart {
+                "internal"
+            } else {
+                "eviction_impossible"
+            }
+        );
+        assert_eq!(
+            adapter.load_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn delayed_timed_out_load_stays_charged_and_cannot_be_released_retried_or_evicted() {
+        delayed_load_scenario(false, false, false).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn accepted_load_with_probe_timeout_empty_status_and_delayed_allocation_stays_fenced() {
+        for probe_hangs in [false, true] {
+            delayed_load_scenario(true, probe_hangs, false).await;
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pending_load_fence_survives_supervisor_restart_before_delayed_allocation() {
+        for (accepted, probe_hangs) in [(false, false), (true, false), (true, true)] {
+            delayed_load_scenario(accepted, probe_hangs, true).await;
+        }
     }
 
     /// A minimal `RuntimeAdapter` whose `status().used_gb` only drops after
@@ -3143,10 +3384,17 @@ mod tests {
         calls_until_drop: u32,
         loaded: std::sync::atomic::AtomicBool,
         releasing: std::sync::atomic::AtomicBool,
+        fence_path: std::sync::OnceLock<std::path::PathBuf>,
     }
 
     #[async_trait::async_trait]
     impl RuntimeAdapter for LaggingReleaseAdapter {
+        fn load_fence_path(&self) -> Result<std::path::PathBuf, BackendError> {
+            Ok(self
+                .fence_path
+                .get_or_init(crate::mock::temporary_load_fence_path)
+                .clone())
+        }
         async fn list(&self) -> Result<Vec<ModelInfo>, BackendError> {
             Ok(evictable_catalog())
         }
@@ -3210,6 +3458,7 @@ mod tests {
             calls_until_drop: 4,
             loaded: std::sync::atomic::AtomicBool::new(false),
             releasing: std::sync::atomic::AtomicBool::new(false),
+            fence_path: std::sync::OnceLock::new(),
         });
         let handle = Supervisor::spawn(adapter.clone(), tight_budget_config())
             .expect("spawn should succeed");
@@ -3239,6 +3488,7 @@ mod tests {
             calls_until_drop: u32::MAX, // never drops
             loaded: std::sync::atomic::AtomicBool::new(false),
             releasing: std::sync::atomic::AtomicBool::new(false),
+            fence_path: std::sync::OnceLock::new(),
         });
         let handle = Supervisor::spawn(adapter.clone(), tight_budget_config())
             .expect("spawn should succeed");
@@ -3264,6 +3514,9 @@ mod tests {
 
     #[async_trait::async_trait]
     impl RuntimeAdapter for UnverifiedReleaseAdapter {
+        fn load_fence_path(&self) -> Result<std::path::PathBuf, BackendError> {
+            self.inner.load_fence_path()
+        }
         async fn list(&self) -> Result<Vec<ModelInfo>, BackendError> {
             self.inner.list().await
         }
@@ -3539,10 +3792,17 @@ mod tests {
     struct OomRetryTimingAdapter {
         load_times: std::sync::Mutex<Vec<tokio::time::Instant>>,
         status_times: std::sync::Mutex<Vec<tokio::time::Instant>>,
+        fence_path: std::sync::OnceLock<std::path::PathBuf>,
     }
 
     #[async_trait::async_trait]
     impl RuntimeAdapter for OomRetryTimingAdapter {
+        fn load_fence_path(&self) -> Result<std::path::PathBuf, BackendError> {
+            Ok(self
+                .fence_path
+                .get_or_init(crate::mock::temporary_load_fence_path)
+                .clone())
+        }
         async fn list(&self) -> Result<Vec<ModelInfo>, BackendError> {
             Ok(catalog())
         }
@@ -3610,6 +3870,7 @@ mod tests {
         let adapter = Arc::new(OomRetryTimingAdapter {
             load_times: std::sync::Mutex::new(Vec::new()),
             status_times: std::sync::Mutex::new(Vec::new()),
+            fence_path: std::sync::OnceLock::new(),
         });
         let backoff = std::time::Duration::from_millis(200);
         let handle = Supervisor::spawn(

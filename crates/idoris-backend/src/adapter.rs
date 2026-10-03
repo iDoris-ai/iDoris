@@ -45,6 +45,10 @@ use crate::types::{BackendStatus, ChatRequest, ChatResponse, ModelInfo};
 
 #[async_trait]
 pub trait RuntimeAdapter: Send + Sync {
+    /// Stable, engine-bound location for the durable load fence. Implementors
+    /// must return the same path across process restarts for the same engine.
+    fn load_fence_path(&self) -> Result<std::path::PathBuf, BackendError>;
+
     /// Every model this engine instance *could* route to, whether or not it
     /// is currently loaded (mirrors `/v1/models`'s "list routable models"
     /// semantics per `docs/research/Rust基础选型-2026-09-27.md` §4).

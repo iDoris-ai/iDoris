@@ -61,6 +61,7 @@ const LIFECYCLE: Duration = Duration::from_secs(180);
 const CLEANUP: Duration = Duration::from_secs(60);
 /// Bounds every single HTTP call this test makes.
 const CALL: Duration = Duration::from_secs(60);
+const MEMORY_EPSILON_GB: f64 = 1e-6;
 
 type Outcome = Result<(), String>;
 
@@ -301,14 +302,20 @@ async fn supervisor_phase(env: &Env) -> Outcome {
     )
     .map_err(|err| format!("spawn failed: {err}"))?;
 
+    // Startup reconciliation preserves residency owned by other clients.
+    // Compare this model's contribution against that initial ledger state.
+    let baseline = handle.status().await.map_err(|e| e.to_string())?;
+
     handle
         .load(env.id.clone(), 1.0, on_demand())
         .await
         .map_err(|err| format!("Supervisor load failed: {err}"))?;
     let status = handle.status().await.map_err(|e| e.to_string())?;
-    if status.used_gb != 1.0 || !status.loaded.contains(&env.id) {
+    if (status.used_gb - baseline.used_gb - 1.0).abs() > MEMORY_EPSILON_GB
+        || !status.loaded.contains(&env.id)
+    {
         return Err(format!(
-            "after load, Supervisor status must list {} with used_gb=1.0, got {status:?}",
+            "after load, Supervisor must add {} and 1.0 GiB to baseline {baseline:?}, got {status:?}",
             env.id
         ));
     }
@@ -319,9 +326,12 @@ async fn supervisor_phase(env: &Env) -> Outcome {
         .await
         .map_err(|err| format!("Supervisor unload failed: {err}"))?;
     let status = handle.status().await.map_err(|e| e.to_string())?;
-    if status.used_gb != 0.0 || !status.loaded.is_empty() {
+    if (status.used_gb - baseline.used_gb).abs() > MEMORY_EPSILON_GB
+        || status.loaded.contains(&env.id)
+    {
         return Err(format!(
-            "after unload, Supervisor status must be empty, got {status:?}"
+            "after unload, Supervisor must return to baseline {baseline:?} and remove {} from its loaded set, got {status:?}",
+            env.id
         ));
     }
     wait_engine_loaded(env, false, deadline).await

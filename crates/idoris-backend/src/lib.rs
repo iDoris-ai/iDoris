@@ -20,6 +20,7 @@
 pub mod adapter;
 pub mod error;
 pub mod eviction;
+pub mod load_fence;
 pub mod mock;
 pub mod supervisor;
 pub mod types;

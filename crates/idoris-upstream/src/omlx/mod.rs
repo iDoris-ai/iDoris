@@ -109,6 +109,7 @@ pub struct OmlxAdapter {
     call_timeout: Duration,
     client: reqwest::Client,
     admin_session: tokio::sync::Mutex<Option<reqwest::header::HeaderValue>>,
+    load_fence_path: Option<std::path::PathBuf>,
 }
 
 impl OmlxAdapter {
@@ -121,7 +122,16 @@ impl OmlxAdapter {
             call_timeout: config.call_timeout,
             client,
             admin_session: tokio::sync::Mutex::new(None),
+            load_fence_path: None,
         })
+    }
+
+    /// Override the durable Supervisor load marker location. Every adapter
+    /// controlling the same engine must use the same persistent path, including
+    /// after a Router restart. A fresh path is only safe for a fresh engine.
+    pub fn with_load_fence_path(mut self, path: std::path::PathBuf) -> Self {
+        self.load_fence_path = Some(path);
+        self
     }
 
     fn api_key(&self) -> Option<&str> {
@@ -393,6 +403,32 @@ fn is_ready(raw: &serde_json::Value, id: &str) -> bool {
 /// shadowing rule silently doing the right thing.
 #[async_trait::async_trait]
 impl RuntimeAdapter for OmlxAdapter {
+    fn load_fence_path(&self) -> Result<std::path::PathBuf, BackendError> {
+        if let Some(path) = &self.load_fence_path {
+            return Ok(path.clone());
+        }
+        let root = std::env::var_os("IDORIS_STATE_DIR")
+            .map(std::path::PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("HOME")
+                    .map(|home| std::path::PathBuf::from(home).join(".local/state/idoris"))
+            })
+            .filter(|path| path.is_absolute())
+            .ok_or_else(|| {
+                BackendError::internal(
+                    "a persistent absolute IDORIS_STATE_DIR or HOME is required for the load fence",
+                )
+            })?;
+        let mut endpoint = reqwest::Url::parse(&self.base_url)
+            .map_err(|_| BackendError::internal("invalid oMLX endpoint for load fence"))?;
+        // Credentials and fragments do not identify a different engine.
+        let _ = endpoint.set_username("");
+        let _ = endpoint.set_password(None);
+        endpoint.set_fragment(None);
+        let key = utf8_percent_encode(endpoint.as_str().trim_end_matches('/'), NON_ALPHANUMERIC);
+        Ok(root.join("omlx").join(key.to_string()).join("load.pending"))
+    }
+
     async fn list(&self) -> Result<Vec<ModelInfo>, BackendError> {
         Self::list(self).await
     }
@@ -430,6 +466,33 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::*;
+
+    #[test]
+    fn load_fence_identity_survives_adapter_reconstruction() {
+        let make = |base_url: &str| {
+            OmlxAdapter::new(OmlxAdapterConfig {
+                base_url: base_url.into(),
+                api_key: None,
+                call_timeout: DEFAULT_CALL_TIMEOUT,
+            })
+            .unwrap()
+        };
+        let first = make("http://localhost:8088").load_fence_path().unwrap();
+        let restarted = make("http://LOCALHOST:8088/").load_fence_path().unwrap();
+        assert_eq!(first, restarted);
+        assert_ne!(
+            first,
+            make("http://localhost:8089").load_fence_path().unwrap()
+        );
+        let explicit = idoris_backend::mock::temporary_load_fence_path();
+        assert_eq!(
+            make("http://localhost:8088")
+                .with_load_fence_path(explicit.clone())
+                .load_fence_path()
+                .unwrap(),
+            explicit
+        );
+    }
 
     async fn adapter_for(server: &MockServer) -> OmlxAdapter {
         OmlxAdapter::new(OmlxAdapterConfig {
