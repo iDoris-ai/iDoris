@@ -9,6 +9,9 @@
 /// Control-plane header parsing (R2-D task 1).
 pub mod profile;
 
+/// Offline intent embedding primitives (B1 task 09).
+pub mod intent;
+
 /// Component card loading from `IDORIS_COMPONENTS_DIR` (R2-D task 2); wired
 /// into `AppState`/`/health`'s `components` count in a follow-up PR.
 pub mod components;
@@ -21,10 +24,15 @@ pub mod routing_policy;
 /// needed) `Supervisor` load → `Supervisor` chat.
 pub mod dispatch;
 
+/// Per-card runtime construction for lifecycle-managed providers.
+pub mod runtime;
+
 /// Atomic reserve/settle/release around a paid candidate (R2-D task 4); not
 /// yet wired into `dispatch`/the request path — a follow-up PR does that.
 pub mod budget;
 
+/// Per-provider cooldown for models discovery.
+pub mod health;
 /// `GET /v1/models` (R2-G): aggregates every registered `http_service`
 /// card's own model listing.
 pub mod models;
@@ -165,6 +173,8 @@ pub struct AppState {
     /// matching `reqwest::Client`'s own documented cloning contract (cheap,
     /// `Arc`-backed clone, not a new connection pool per clone).
     pub http_client: reqwest::Client,
+    /// Shared across requests and AppState clones.
+    pub models_health: Arc<health::HealthTracker>,
     /// R2-G: direct-forward path for a `LoadMode::Resident` `http_service`
     /// candidate (see `dispatch::select`/`is_resident_http_service`'s doc).
     /// `Arc` because `ChatProxy` holds a `Mutex`-guarded cache, same reason
@@ -200,6 +210,7 @@ impl Default for AppState {
             supervisor: None,
             budget_ledger: None,
             http_client: reqwest::Client::new(),
+            models_health: Arc::new(health::HealthTracker::default()),
             proxy: Arc::new(proxy::ChatProxy::new(reqwest::Client::new())),
         }
     }
@@ -226,7 +237,7 @@ pub fn build_app(state: AppState) -> Router {
 /// see that module's doc for the per-card best-effort/skip-on-failure
 /// semantics.
 async fn list_models(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    Json(models::list_models(&state.http_client, &state.cards).await)
+    Json(models::list_models(&state.http_client, &state.cards, &state.models_health).await)
 }
 
 async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {

@@ -79,7 +79,7 @@ it("被测 CLI 接受定制 policy；坏 policy 仍真实非零提前退出", as
   })]);
   dirs.push(componentsDir);
   try {
-    const server = await spawnConformanceServer({ componentsDir, routingPolicyPath: policyFile(policy), cwd: "/" });
+    const server = await spawnConformanceServer({ componentsDir, routingPolicyPath: policyFile(policy) });
     try {
       const health = await (await fetch(server.baseUrl + "/health")).json() as { components: number };
       expect(health.components).toBe(1);

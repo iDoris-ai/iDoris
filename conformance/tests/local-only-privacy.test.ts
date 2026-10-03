@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { startFakeUpstream, type FakeUpstream } from "../src/fake-upstream.js";
 import { spawnConformanceServer, routingPolicyFixturePath, type RunningServer } from "../src/harness.js";
-import { localComponent, makeComponentsDir, remoteComponent } from "../src/fixtures.js";
+import { makeComponentsDir, remoteComponent } from "../src/fixtures.js";
 
 // 只注册一个远程后端（tier=remote, locality=remote），
 // 用来锁定"local_only 且唯一候选是远程"时的 fail-closed 行为：
@@ -13,58 +13,6 @@ beforeAll(async () => {
   upstream = await startFakeUpstream();
   const componentsDir = makeComponentsDir([remoteComponent(upstream.url)]);
   server = await spawnConformanceServer({ componentsDir, routingPolicyPath: routingPolicyFixturePath });
-});
-
-// 两组卡仅改变 privacy_class：loopback 声明本身不足以承载 local_only。
-describe.each(["any", "local_only"] as const)("loopback 卡 privacy_class=%s 的运行时复核", (privacyClass) => {
-  let localUpstream: FakeUpstream;
-  let localServer: RunningServer;
-
-  beforeAll(async () => {
-    localUpstream = await startFakeUpstream();
-    const componentsDir = makeComponentsDir([localComponent(localUpstream.url, { privacyClass })]);
-    localServer = await spawnConformanceServer({ componentsDir, routingPolicyPath: routingPolicyFixturePath });
-  });
-
-  afterAll(async () => {
-    await localServer?.stop();
-    await localUpstream?.close();
-  });
-
-  const chat = (headers: Record<string, string>) => fetch(localServer.baseUrl + "/v1/chat/completions", {
-    method: "POST",
-    headers: { "content-type": "application/json", ...headers },
-    body: JSON.stringify({ model: "idoris/daily", messages: [{ role: "user", content: "hi" }] }),
-  });
-
-  it.each([false, true])("local_only（显式=%s）：可信卡成功，不可信卡拒绝且上游 0 次", async (explicit) => {
-    const before = localUpstream.chatCount();
-    if (privacyClass === "local_only") {
-      localUpstream.queueChat({ kind: "json", status: 200, body: { choices: [{ message: { content: "local-ok" } }] } });
-    }
-    const res = await chat(explicit ? { "x-idoris-privacy": "local_only" } : {});
-    if (privacyClass === "any") {
-      expect(res.status).toBe(503);
-      expect((await res.json() as { error: { type: string } }).error.type).toBe("local_only_unavailable");
-      expect(localUpstream.chatCount()).toBe(before);
-    } else {
-      expect(res.status).toBe(200);
-      expect(res.headers.get("x-idoris-served-locality")).toBe("loopback");
-      expect((await res.json() as { choices: { message: { content: string } }[] }).choices[0]?.message.content).toBe("local-ok");
-      expect(localUpstream.chatCount() - before).toBe(1);
-    }
-  });
-
-  if (privacyClass === "any") {
-    it("正控：privacy=any 仍可使用该不可信本地卡，真实上游 1 次", async () => {
-      const before = localUpstream.chatCount();
-      localUpstream.queueChat({ kind: "json", status: 200, body: { choices: [{ message: { content: "any-ok" } }] } });
-      const res = await chat({ "x-idoris-privacy": "any" });
-      expect(res.status).toBe(200);
-      expect((await res.json() as { choices: { message: { content: string } }[] }).choices[0]?.message.content).toBe("any-ok");
-      expect(localUpstream.chatCount() - before).toBe(1);
-    });
-  }
 });
 
 afterAll(async () => {

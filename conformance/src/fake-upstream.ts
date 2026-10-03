@@ -44,6 +44,8 @@ export interface FakeUpstream {
    * 取消状态互不影响。
    */
   queueChat(behavior: ChatBehavior): ChatHandle;
+  /** 先进先出：下一次 /v1/models 使用该 HTTP 状态；队空时默认 200。 */
+  queueModels(status: number): void;
   setModels(models: Array<{ id: string }>): void;
   requests(): readonly ReceivedRequest[];
   close(): Promise<void>;
@@ -70,6 +72,7 @@ export async function startFakeUpstream(): Promise<FakeUpstream> {
   let models: Array<{ id: string }> = [{ id: "fake-model-1" }];
   let chatCount = 0;
   let modelsCount = 0;
+  const modelStatuses: number[] = [];
   const received: ReceivedRequest[] = [];
 
   async function handleChat(req: IncomingMessage, res: ServerResponse): Promise<void> {
@@ -121,7 +124,8 @@ export async function startFakeUpstream(): Promise<FakeUpstream> {
 
   function handleModels(res: ServerResponse): void {
     modelsCount += 1;
-    res.writeHead(200, { "content-type": "application/json" });
+    const status = modelStatuses.shift() ?? 200;
+    res.writeHead(status, { "content-type": "application/json" });
     res.end(JSON.stringify({ object: "list", data: models }));
   }
 
@@ -173,6 +177,7 @@ export async function startFakeUpstream(): Promise<FakeUpstream> {
       queue.push(entry);
       return { wasAborted: () => entry.aborted };
     },
+    queueModels: (status) => modelStatuses.push(status),
     setModels: (m) => {
       models = m;
     },
