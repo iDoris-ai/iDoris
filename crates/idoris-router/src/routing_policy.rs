@@ -16,8 +16,9 @@
 //! `IDORIS_COMPONENTS_DIR` as absolute paths at) the intended working
 //! directory.
 //!
-//! [`decide`] evaluates rules as a pure function. The request dispatch
-//! pipeline doesn't consume these results yet (B1 task 07 wires them in).
+//! [`decide`] evaluates rules as a pure function. The request pipeline
+//! applies its tier restrictions before intent selection on both execution
+//! paths.
 
 use std::fs;
 use std::path::{Path, PathBuf};

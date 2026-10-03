@@ -1,10 +1,6 @@
-//! Rust skeleton for the iDoris router. R1 scope only: binds to a
-//! hardcoded loopback address, serves `GET /health` in the shape PR #46
-//! settled on, tags every response with a server-generated
-//! `X-iDoris-Record-Id`, and answers every other route with `501` in the
-//! unified error envelope from the interface spec §3.11. No routing,
-//! backend dispatch, or policy logic is ported here — see the root
-//! `README.md`.
+//! Rust implementation of the iDoris router. It binds to loopback, serves
+//! health and model discovery, applies routing policy before dispatch, and
+//! tags responses with a server-generated `X-iDoris-Record-Id`.
 
 /// Control-plane header parsing (R2-D task 1).
 pub mod profile;
@@ -13,11 +9,11 @@ pub mod profile;
 pub mod intent;
 
 /// Component card loading from `IDORIS_COMPONENTS_DIR` (R2-D task 2); wired
-/// into `AppState`/`/health`'s `components` count in a follow-up PR.
+/// into `AppState` and `/health`'s `components` count.
 pub mod components;
 
 /// Routing-policy loading from `IDORIS_ROUTING_POLICY` (R2-D task 2); wired
-/// into `AppState` in a follow-up PR.
+/// into `AppState` and applied before either execution path.
 pub mod routing_policy;
 
 /// The local decision + execution path (R2-D task 3): `decide()` → (if
@@ -27,8 +23,8 @@ pub mod dispatch;
 /// Per-card runtime construction for lifecycle-managed providers.
 pub mod runtime;
 
-/// Atomic reserve/settle/release around a paid candidate (R2-D task 4); not
-/// yet wired into `dispatch`/the request path — a follow-up PR does that.
+/// Atomic reserve/settle/release around a paid candidate, used by the
+/// request execution path.
 pub mod budget;
 
 /// Per-provider cooldown for models discovery.
@@ -163,6 +159,9 @@ pub struct AppState {
     /// count is always `cards.len()` — a single source of truth instead of
     /// a separately-tracked counter that could drift from this list.
     pub cards: Vec<idoris_contracts::ComponentCard>,
+    /// Startup-validated YAML policy. Library construction defaults to a
+    /// local-only tier set without filesystem I/O; the binary replaces it.
+    pub routing_policy: idoris_contracts::RoutingPolicy,
     /// Backs the local dispatch path (R2-D task 3); `None` means no local
     /// backend is wired — dispatch then fails closed as
     /// `local_only_unavailable` rather than panicking on a missing handle.
@@ -193,6 +192,7 @@ impl std::fmt::Debug for AppState {
             .field("instance_id", &self.instance_id)
             .field("deploy_mode", &self.deploy_mode)
             .field("cards", &self.cards)
+            .field("routing_policy", &self.routing_policy)
             .field("supervisor", &self.supervisor)
             .field(
                 "budget_ledger",
@@ -216,6 +216,17 @@ impl Default for AppState {
                 std::env::var("IDORIS_DEPLOY_MODE").ok().as_deref(),
             ),
             cards: Vec::new(),
+            routing_policy: idoris_contracts::RoutingPolicy {
+                routing_policy: idoris_contracts::routing_policy::RoutingPolicyInner {
+                    version: 1,
+                    rules: Vec::new(),
+                    default: idoris_contracts::routing_policy::Action {
+                        tiers: Some(vec![idoris_contracts::common::Tier::Local]),
+                        fail_closed: Some(true),
+                        ..Default::default()
+                    },
+                },
+            },
             supervisor: None,
             budget_ledger: None,
             models_health: Arc::new(health::HealthTracker::default()),
@@ -473,11 +484,12 @@ fn rejection_response(rejection: Rejection) -> Response {
 
 /// `POST /v1/chat/completions`. Order (locked by conformance): non-JSON
 /// body -> `invalid_json`; valid JSON that isn't an object -> `invalid_body`;
-/// only then are control-plane headers parsed (see [`profile::parse_profile`]),
-/// followed by [`dispatch::select`] to choose between the two
-/// request-execution paths: a `LoadMode::Resident` `http_service` candidate
-/// forwards directly ([`chat_via_proxy`]); everything else goes through the
-/// local decision + execution path ([`dispatch::dispatch_local`]).
+/// only then are control-plane headers parsed (see [`profile::parse_profile`]).
+/// Privacy and YAML tier restrictions constrain intent-based selection;
+/// selected candidates pass budget reservation before Supervisor admission
+/// or direct proxy forwarding. Resident `http_service` candidates use
+/// [`chat_via_proxy`]; all others use [`dispatch::dispatch_local`]. The
+/// enforced order is privacy → intent → budget → admission/egress permit.
 async fn chat_completions(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -521,7 +533,20 @@ async fn chat_completions(
     // Supervisor, which only makes sense for a real oMLX-shaped backend
     // with an explicit load/unload lifecycle. See dispatch::select's doc
     // for the accepted double-decide() tradeoff this branch makes.
-    if let Ok(selected) = dispatch::select(&state.cards, &parsed, &prompt)
+    let (cards, fail_closed) = dispatch::policy_cards(&state.cards, &state.routing_policy, &parsed);
+    if cards.is_empty() {
+        // Match TS's two empty-candidate errors; neither permits egress.
+        return if fail_closed {
+            rejection_response(idoris_policy::Rejection::LocalOnlyUnavailable)
+        } else {
+            error_envelope(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "no_candidate",
+                "no candidate matches routing policy",
+            )
+        };
+    }
+    if let Ok(selected) = dispatch::select(&cards, &parsed, &prompt)
         && dispatch::is_resident_http_service(&selected.card)
     {
         return chat_via_proxy(&state, &selected, &headers, &parsed, &value, &record_id).await;
@@ -539,7 +564,7 @@ async fn chat_completions(
     // better than, a listener that structurally can never fire.
     let budget_ledger = state.budget_ledger.as_deref();
     match dispatch_local(
-        &state.cards,
+        &cards,
         state.supervisor.as_ref(),
         budget_ledger,
         &parsed,
@@ -772,6 +797,9 @@ async fn record_id_middleware(mut req: Request<Body>, next: Next) -> Response {
 }
 
 #[cfg(test)]
+mod policy_wiring_tests;
+
+#[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -786,7 +814,7 @@ mod tests {
 
     use super::*;
 
-    fn sample_component_card(id: &str) -> ComponentCard {
+    pub(super) fn sample_component_card(id: &str) -> ComponentCard {
         ComponentCard {
             provider: ProviderDescriptor {
                 id: id.to_string(),
@@ -813,7 +841,7 @@ mod tests {
         }
     }
 
-    fn paid_component_card(id: &str) -> ComponentCard {
+    pub(super) fn paid_component_card(id: &str) -> ComponentCard {
         let mut card = sample_component_card(id);
         card.provider.cost = Cost {
             input_per_m: 1_000_000.0,
@@ -913,7 +941,7 @@ mod tests {
         assert_eq!(json["error"]["type"], "not_found");
     }
 
-    fn post_chat(body: &str, headers: &[(&str, &str)]) -> Request<Body> {
+    pub(super) fn post_chat(body: &str, headers: &[(&str, &str)]) -> Request<Body> {
         let mut builder = Request::builder()
             .method("POST")
             .uri("/v1/chat/completions")
@@ -1123,7 +1151,7 @@ mod tests {
     }
 
     // TempDir must outlive the BudgetLedger using its path.
-    fn configured_budget_ledger(
+    pub(super) fn configured_budget_ledger(
         limit_minor: i64,
     ) -> (tempfile::TempDir, idoris_tenancy::budget::BudgetLedger) {
         let dir = tempfile::TempDir::new().unwrap();
@@ -1271,7 +1299,7 @@ mod tests {
     /// A `LoadMode::Resident` `http_service` card (R2-G) — forwarded via
     /// `chat_via_proxy`, never through the (unconfigured, in these tests)
     /// Supervisor.
-    fn resident_component_card(id: &str, endpoint: &str) -> ComponentCard {
+    pub(super) fn resident_component_card(id: &str, endpoint: &str) -> ComponentCard {
         ComponentCard {
             load_policy: Some(idoris_contracts::load_policy::LoadPolicy {
                 mode: idoris_contracts::load_policy::LoadMode::Resident,

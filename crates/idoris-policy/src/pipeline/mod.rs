@@ -17,12 +17,13 @@ mod types;
 pub use types::{Decision, Degradation, PolicyCtx, ReasonCode, Rejection, RequestProfile, Stage};
 
 use idoris_contracts::common::{Capability, PrivacyClass};
+#[cfg(test)]
 use idoris_contracts::provider::Locality;
 use idoris_contracts::tenant::BudgetScope;
 
 use crate::budget::BudgetSnapshot;
 use crate::card::{AdmissionStatus, Card};
-use crate::privacy::effective_served_locality;
+use crate::privacy::is_local_capable;
 use crate::role::{Role, is_catalog_eligible, is_eligible_for_role};
 
 fn admission_rank(status: AdmissionStatus) -> u8 {
@@ -177,15 +178,12 @@ pub fn decide(
         reasons.push(ReasonCode::PrivacyTightenedByContent);
     }
     let privacy_ok: Vec<&Card> = if privacy == PrivacyClass::LocalOnly {
-        let loopback: Vec<&Card> = cards
-            .iter()
-            .filter(|c| effective_served_locality(c) == Locality::Loopback)
-            .collect();
-        if loopback.is_empty() {
+        let trusted_local: Vec<&Card> = cards.iter().filter(|c| is_local_capable(c)).collect();
+        if trusted_local.is_empty() {
             return Err(Rejection::LocalOnlyUnavailable);
         }
         reasons.push(ReasonCode::PrivacyLoopbackOnly);
-        loopback
+        trusted_local
     } else {
         cards.iter().collect()
     };
@@ -323,3 +321,74 @@ pub fn decide(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod local_capable_tests {
+    #![allow(clippy::unwrap_used)]
+
+    use super::*;
+    use crate::card::test_support::sample_card;
+    use idoris_contracts::TaskProfile;
+    use idoris_contracts::common::FallbackPolicy;
+    use idoris_contracts::component_card::Egress;
+
+    fn request(privacy: Option<PrivacyClass>) -> RequestProfile {
+        RequestProfile {
+            task: TaskProfile {
+                privacy,
+                fallback: Some(FallbackPolicy::NextInChain),
+                ..Default::default()
+            },
+            role: None,
+            tenant_id: None,
+            content_tightening: None,
+        }
+    }
+
+    #[test]
+    fn local_only_pipeline_rechecks_each_condition_without_registration() {
+        let trusted = sample_card("trusted", &[]);
+        let mut untrusted = trusted.clone();
+        untrusted.component.privacy_class = PrivacyClass::Any;
+        let mut lan = trusted.clone();
+        lan.component.allowed_egress = vec![Egress::Loopback, Egress::Lan];
+        let mut internet = trusted.clone();
+        internet.component.allowed_egress = vec![Egress::Internet];
+        for mut card in [untrusted, lan, internet] {
+            card.component.provider.id = "a-untrusted".to_string();
+            for privacy in [None, Some(PrivacyClass::LocalOnly)] {
+                assert_eq!(
+                    decide(&request(privacy), &[card.clone()], &PolicyCtx::default()),
+                    Err(Rejection::LocalOnlyUnavailable)
+                );
+                let chosen = decide(
+                    &request(privacy),
+                    &[card.clone(), trusted.clone()],
+                    &PolicyCtx::default(),
+                )
+                .unwrap();
+                assert_eq!(chosen.chosen_id, "trusted");
+            }
+            assert!(
+                decide(
+                    &request(Some(PrivacyClass::Any)),
+                    &[card],
+                    &PolicyCtx::default()
+                )
+                .is_ok()
+            );
+        }
+    }
+
+    #[test]
+    fn content_tightening_uses_the_same_local_capable_gate() {
+        let mut card = sample_card("untrusted", &[]);
+        card.component.privacy_class = PrivacyClass::Any;
+        let mut req = request(Some(PrivacyClass::Any));
+        req.content_tightening = Some(PrivacyClass::LocalOnly);
+        assert_eq!(
+            decide(&req, &[card], &PolicyCtx::default()),
+            Err(Rejection::LocalOnlyUnavailable)
+        );
+    }
+}
