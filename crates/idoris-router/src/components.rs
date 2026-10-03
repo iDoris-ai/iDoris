@@ -30,8 +30,9 @@ pub const DEFAULT_COMPONENTS_DIR: &str = "config/components";
 
 /// `IDORIS_COMPONENTS_DIR` (blank/unset → [`DEFAULT_COMPONENTS_DIR`]) → the
 /// directory to load from. Relative paths resolve against the current
-/// working directory (see `routing_policy`'s module doc for why this
-/// differs from `serve.ts`'s repo-root resolution).
+/// working directory; the `idoris` binary anchors its default to the
+/// executable's directory before loading, while explicit paths keep this
+/// cwd-relative behavior.
 pub fn resolve_components_dir(raw: Option<&str>) -> PathBuf {
     let value = match raw.map(str::trim) {
         None | Some("") => DEFAULT_COMPONENTS_DIR,
