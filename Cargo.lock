@@ -751,8 +751,6 @@ dependencies = [
 [[package]]
 name = "genai"
 version = "0.6.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1d12aba7e9dc2c4d54654566dc3dc8383b5cb52e0cfc5754989afe0480d933e3"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -1146,7 +1144,9 @@ dependencies = [
 name = "idoris-router"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "axum",
+ "futures-util",
  "http-body-util",
  "idoris-backend",
  "idoris-contracts",
@@ -1155,6 +1155,7 @@ dependencies = [
  "idoris-upstream",
  "indexmap 2.14.2",
  "reqwest",
+ "ring",
  "serde",
  "serde_json",
  "serde_yaml",
