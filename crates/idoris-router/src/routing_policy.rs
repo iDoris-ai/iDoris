@@ -47,7 +47,8 @@ fn matches(condition: &Condition, profile: &TaskProfile) -> bool {
         complexity,
         capabilities,
     } = condition;
-    privacy.is_none_or(|v| profile.privacy == Some(v))
+    let profile_privacy = profile.privacy.unwrap_or(PrivacyClass::LocalOnly);
+    privacy.is_none_or(|v| profile_privacy == v)
         && intent
             .as_ref()
             .is_none_or(|v| profile.intent.as_ref() == Some(v))
