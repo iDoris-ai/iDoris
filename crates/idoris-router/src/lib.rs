@@ -41,9 +41,13 @@ pub mod health;
 /// card's own model listing.
 pub mod models;
 
+/// Metadata-only audit validation and tenant-scoped persistence (B1 task19).
+pub mod audit;
 /// Injectable `/capabilities` provider boundary (B1 task32). Live capacity
 /// aggregation is wired by task33.
 pub mod capabilities;
+/// Stable four-way routing/audit reason taxonomy.
+pub mod reason;
 
 /// Direct HTTP forwarding for a generic `http_service` component card's
 /// `POST /v1/chat/completions` (R2-G) — retries, idempotency cache; wired
