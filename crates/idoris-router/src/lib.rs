@@ -53,6 +53,7 @@ pub mod capabilities;
 pub mod reason;
 /// Persistent record/budget storage bootstrap (B1 task18).
 pub mod storage;
+mod usage;
 
 /// Direct HTTP forwarding for a generic `http_service` component card's
 /// `POST /v1/chat/completions` (R2-G) — retries, idempotency cache; wired
@@ -582,14 +583,18 @@ fn rough_token_estimate(text: &str) -> u64 {
 /// `openAIChatCompletion` (`packages/adapters/subscription/relay.ts`).
 /// The returned model is the backend's resolved identity, never the caller's
 /// alias or requested value.
-fn openai_chat_completion(content: &str, served_model: &str, prompt: &str) -> serde_json::Value {
+fn openai_chat_completion(
+    content: &str,
+    served_model: &str,
+    prompt: &str,
+) -> (serde_json::Value, u64, u64) {
     let created = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
     let prompt_tokens = rough_token_estimate(prompt);
     let completion_tokens = rough_token_estimate(content);
-    json!({
+    let body = json!({
         "id": format!("chatcmpl-idoris-{}", Uuid::new_v4()),
         "object": "chat.completion",
         "created": created,
@@ -600,7 +605,8 @@ fn openai_chat_completion(content: &str, served_model: &str, prompt: &str) -> se
             "completion_tokens": completion_tokens,
             "total_tokens": prompt_tokens + completion_tokens,
         },
-    })
+    });
+    (body, prompt_tokens, completion_tokens)
 }
 
 /// Sets `X-iDoris-Served-Locality` (always, once a candidate is chosen —
@@ -839,8 +845,12 @@ async fn chat_completions(
     // is dropped mid-request (e.g. a future connection-level timeout or
     // abort layered on top) -- genuinely different from, and strictly
     // better than, a listener that structurally can never fire.
-    let supervisor = dispatch::select(&cards, &parsed, &prompt)
-        .ok()
+    let selected_for_dispatch = dispatch::select(&cards, &parsed, &prompt).ok();
+    let selected_estimated_cost = selected_for_dispatch
+        .as_ref()
+        .map(|selected| selected.estimated_cost_minor);
+    let supervisor = selected_for_dispatch
+        .as_ref()
         .and_then(|selected| state.runtimes.get(&selected.card.provider.id));
     let budget_ledger = state.budget_ledger.as_deref();
     match dispatch_local(
@@ -861,10 +871,22 @@ async fn chat_completions(
         Ok(outcome) => match &outcome.result {
             Err(failure) => dispatch_failure_response(failure, &outcome),
             Ok(chat_response) => {
-                let body =
+                let (body, prompt_tokens, completion_tokens) =
                     openai_chat_completion(&chat_response.content, &chat_response.model, &prompt);
                 let mut response = (StatusCode::OK, Json(body)).into_response();
                 apply_decision_headers(&mut response, &outcome);
+                let usage_cost_minor = match selected_estimated_cost {
+                    Some(0) => Some(0),
+                    Some(_) => outcome.actual_cost_minor,
+                    None => None,
+                };
+                response
+                    .extensions_mut()
+                    .insert(usage::UsageFact::inference_with_tokens(
+                        usage_cost_minor,
+                        prompt_tokens,
+                        completion_tokens,
+                    ));
                 // X-iDoris-Cost-Minor: only set for a genuinely paid,
                 // settled candidate -- omitted for free/local calls.
                 if let Some(cost_minor) = outcome.actual_cost_minor
@@ -985,6 +1007,11 @@ async fn chat_via_proxy_stream(
             if let Ok(v) = HeaderValue::from_str(locality_str(selected.served_locality)) {
                 response.headers_mut().insert(HEADER_SERVED_LOCALITY, v);
             }
+            if status.is_success() {
+                response
+                    .extensions_mut()
+                    .insert(usage::UsageFact::inference(Some(0)));
+            }
             response
         }
     }
@@ -1042,6 +1069,7 @@ async fn chat_via_proxy_buffered(
         response.headers_mut().insert(HEADER_SERVED_LOCALITY, v);
     }
     if outcome.cached {
+        response.extensions_mut().insert(usage::UsageFact::cached());
         response
             .headers_mut()
             .insert(HEADER_CACHED, HeaderValue::from_static("true"));
@@ -1050,6 +1078,10 @@ async fn chat_via_proxy_buffered(
         {
             response.headers_mut().insert(HEADER_ORIGIN_RECORD_ID, v);
         }
+    } else if status.is_success() {
+        response
+            .extensions_mut()
+            .insert(usage::UsageFact::inference(Some(0)));
     }
     response
 }
@@ -1075,6 +1107,13 @@ struct BufferedAuditMeta {
     latency_ms: u64,
 }
 
+struct UsageMeta {
+    tenant_id: Option<String>,
+    request_id: Option<String>,
+    record_id: String,
+    fact: usage::UsageFact,
+}
+
 /// Server-generated on every response, success or error, streaming or not
 /// (interface spec §3.12) — never taken from a caller-supplied header.
 async fn record_id_middleware(
@@ -1096,6 +1135,16 @@ async fn record_id_middleware(
         response.headers_mut().insert(HEADER_RECORD_ID, value);
     }
     if audit_chat {
+        let usage_meta = response
+            .extensions()
+            .get::<usage::UsageFact>()
+            .copied()
+            .map(|fact| UsageMeta {
+                tenant_id: audit_tenant.clone(),
+                request_id: audit_request_id.clone(),
+                record_id: record_id.clone(),
+                fact,
+            });
         let origin_record_id = response
             .headers()
             .get(HEADER_ORIGIN_RECORD_ID)
@@ -1133,13 +1182,17 @@ async fn record_id_middleware(
                     audit_body::StreamEnd::Dropped => "degraded: stream_cancelled".into(),
                 };
                 tokio::spawn(async move {
-                    finish_buffered_audit(stream_state, meta).await;
+                    finish_buffered_audit(stream_state.clone(), meta).await;
+                    if end == audit_body::StreamEnd::Completed {
+                        finish_usage(stream_state, usage_meta).await;
+                    }
                 });
             });
             response = Response::from_parts(parts, Body::from_stream(stream));
         } else {
             meta.latency_ms = elapsed_ms(audit_started);
-            finish_buffered_audit(state, meta).await;
+            finish_buffered_audit(state.clone(), meta).await;
+            finish_usage(state, usage_meta).await;
         }
     }
     response
@@ -1249,6 +1302,51 @@ async fn finish_buffered_audit(state: Arc<AppState>, meta: BufferedAuditMeta) {
             failures.fetch_add(1, Ordering::Relaxed);
             eprintln!("idoris: audit write worker failed");
         }
+    }
+}
+
+async fn finish_usage(state: Arc<AppState>, meta: Option<UsageMeta>) {
+    let (Some(store), Some(meta)) = (state.record_store.clone(), meta) else {
+        return;
+    };
+    if !meta.fact.inference {
+        return;
+    }
+    let Some(cost_minor) = meta.fact.cost_minor else {
+        eprintln!("idoris: usage cost is unknown; refusing to persist a zero-cost guess");
+        return;
+    };
+    let Some(tenant_id) = meta.tenant_id else {
+        return;
+    };
+    let Some(ts_utc) = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_millis()).ok())
+    else {
+        eprintln!("idoris: usage timestamp is outside the supported UTC epoch range");
+        return;
+    };
+    let result = tokio::task::spawn_blocking(move || -> Result<(), String> {
+        let guard = store
+            .lock()
+            .map_err(|_| "usage record store lock poisoned".to_string())?;
+        let entry = idoris_tenancy::usage::UsageEntry {
+            ts_utc,
+            cost_minor: Some(cost_minor),
+            tokens_in: meta.fact.tokens_in,
+            tokens_out: meta.fact.tokens_out,
+            request_id: meta.request_id,
+        };
+        idoris_tenancy::usage::write_usage_record(&guard, Some(&tenant_id), &meta.record_id, &entry)
+            .map(|_| ())
+            .map_err(|err| err.to_string())
+    })
+    .await;
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(message)) => eprintln!("idoris: usage write failed: {message}"),
+        Err(_) => eprintln!("idoris: usage write worker failed"),
     }
 }
 
@@ -1447,6 +1545,16 @@ mod tests {
             .unwrap()
     }
 
+    fn usage_rows(
+        store: &Arc<std::sync::Mutex<TenantStore>>,
+    ) -> Vec<idoris_tenancy::store::TenantRecord> {
+        store
+            .lock()
+            .unwrap()
+            .list(Some(budget::PERSONAL_TENANT_ID), Some(RecordKind::Usage))
+            .unwrap()
+    }
+
     async fn wait_audit_rows(
         store: &Arc<std::sync::Mutex<TenantStore>>,
         expected: usize,
@@ -1460,6 +1568,22 @@ mod tests {
         }
         let rows = audit_rows(store);
         assert_eq!(rows.len(), expected, "audit finalizer did not settle");
+        rows
+    }
+
+    async fn wait_usage_rows(
+        store: &Arc<std::sync::Mutex<TenantStore>>,
+        expected: usize,
+    ) -> Vec<idoris_tenancy::store::TenantRecord> {
+        for _ in 0..100 {
+            let rows = usage_rows(store);
+            if rows.len() == expected {
+                return rows;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let rows = usage_rows(store);
+        assert_eq!(rows.len(), expected, "usage finalizer did not settle");
         rows
     }
 
@@ -1827,6 +1951,7 @@ mod tests {
     #[tokio::test]
     async fn chat_completions_succeeds_against_a_mock_supervisor() {
         let card = sample_component_card("local-1");
+        let store = memory_record_store();
         let adapter = std::sync::Arc::new(idoris_backend::MockAdapter::new(vec![
             idoris_backend::ModelInfo {
                 id: "local-1".to_string(),
@@ -1839,6 +1964,7 @@ mod tests {
         let state = AppState {
             cards: vec![card.clone()],
             runtimes: Some(dispatch::BoundSupervisor::new(&card, supervisor)).into(),
+            record_store: Some(store.clone()),
             ..AppState::default()
         };
         let app = build_app(state);
@@ -1865,6 +1991,17 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .contains("hello there")
+        );
+        let usage = usage_rows(&store);
+        assert_eq!(usage.len(), 1);
+        assert_eq!(usage[0].payload["cost_minor"], json!(0));
+        assert_eq!(
+            usage[0].payload["tokens_in"],
+            json["usage"]["prompt_tokens"]
+        );
+        assert_eq!(
+            usage[0].payload["tokens_out"],
+            json["usage"]["completion_tokens"]
         );
     }
 
@@ -1940,6 +2077,7 @@ mod tests {
     #[tokio::test]
     async fn chat_completions_paid_candidate_settles_and_sets_the_cost_header() {
         let (_dir, ledger) = configured_budget_ledger(1_000_000);
+        let store = memory_record_store();
         let adapter = std::sync::Arc::new(idoris_backend::MockAdapter::new(vec![
             idoris_backend::ModelInfo {
                 id: "paid-1".to_string(),
@@ -1957,6 +2095,7 @@ mod tests {
             ))
             .into(),
             budget_ledger: Some(std::sync::Arc::new(ledger)),
+            record_store: Some(store.clone()),
             ..AppState::default()
         };
         let app = build_app(state);
@@ -1968,13 +2107,20 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        let cost_header = response
+        let cost_minor = response
             .headers()
             .get(HEADER_COST_MINOR)
             .unwrap()
             .to_str()
+            .unwrap()
+            .parse::<i64>()
             .unwrap();
-        assert!(cost_header.parse::<i64>().unwrap() > 0);
+        assert!(cost_minor > 0);
+        let usage = usage_rows(&store);
+        assert_eq!(usage.len(), 1);
+        assert_eq!(usage[0].payload["cost_minor"], json!(cost_minor));
+        assert!(usage[0].payload["tokens_in"].is_number());
+        assert!(usage[0].payload["tokens_out"].is_number());
     }
 
     #[tokio::test]
@@ -2175,6 +2321,14 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].record_id, response_record_id);
         assert_eq!(rows[0].payload["reason"], json!("intent_match: routed"));
+        let usage = usage_rows(&store);
+        assert_eq!(usage.len(), 1);
+        assert_eq!(usage[0].payload["cost_minor"], json!(0));
+        assert!(
+            !usage[0].payload.contains_key("tokens_in")
+                && !usage[0].payload.contains_key("tokens_out"),
+            "proxy usage without structured token facts must omit token fields"
+        );
     }
 
     #[tokio::test]
@@ -2320,6 +2474,13 @@ mod tests {
             second_row.origin_record_id.as_deref(),
             Some(first_record_id.as_str())
         );
+        let usage = usage_rows(&store);
+        assert_eq!(
+            usage.len(),
+            1,
+            "cache replay must not duplicate inference usage"
+        );
+        assert_eq!(usage[0].record_id, first_record_id);
         server.verify().await;
     }
 
@@ -2414,6 +2575,7 @@ mod tests {
             assert!(err.to_string().contains("unterminated upstream SSE"));
             let rows = wait_audit_rows(&store, 1).await;
             assert_eq!(rows[0].payload["reason"], json!("degraded: stream_error"));
+            assert!(usage_rows(&store).is_empty());
         }
     }
 
@@ -2483,6 +2645,11 @@ mod tests {
             }),
             "stream content must never enter audit metadata"
         );
+        let usage = wait_usage_rows(&store, 1).await;
+        assert_eq!(usage[0].record_id, record_id);
+        assert_eq!(usage[0].payload["cost_minor"], json!(0));
+        assert!(!usage[0].payload.contains_key("tokens_in"));
+        assert!(!usage[0].payload.contains_key("tokens_out"));
     }
 
     #[tokio::test]
@@ -2524,5 +2691,6 @@ mod tests {
             rows[0].payload["reason"],
             json!("degraded: stream_cancelled")
         );
+        assert!(usage_rows(&store).is_empty());
     }
 }
