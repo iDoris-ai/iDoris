@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use idoris_contracts::tenant::TenantContext;
@@ -71,6 +72,7 @@ pub enum AuditError {
     FieldTooLong { field: String, units: usize },
     InvalidReason,
     InvalidTimestamp,
+    AlreadyFinished,
     Store(StoreError),
 }
 
@@ -87,6 +89,7 @@ impl std::fmt::Display for AuditError {
             }
             Self::InvalidReason => write!(f, "audit reason must identify a supported reason kind"),
             Self::InvalidTimestamp => write!(f, "ts_utc must be a finite UTC epoch number"),
+            Self::AlreadyFinished => write!(f, "audit request is already finalized"),
             Self::Store(err) => err.fmt(f),
         }
     }
@@ -118,6 +121,20 @@ impl<'a> AuditWriter<'a> {
             .map(|ctx| js_trim(&ctx.tenant_id))
             .filter(|value| !value.is_empty())
             .ok_or(AuditError::ScopeRequired)?;
+        self.write_scoped(tenant_id, None, None, input)
+    }
+
+    pub fn write_scoped(
+        &self,
+        tenant_id: &str,
+        record_id: Option<&str>,
+        origin_record_id: Option<&str>,
+        input: &Map<String, Value>,
+    ) -> Result<TenantRecord, AuditError> {
+        let tenant_id = js_trim(tenant_id);
+        if tenant_id.is_empty() {
+            return Err(AuditError::ScopeRequired);
+        }
         let mut payload = Map::new();
         for (field, value) in input {
             let lower = field.to_ascii_lowercase();
@@ -168,16 +185,38 @@ impl<'a> AuditWriter<'a> {
             .get("request_id")
             .and_then(record_id_scalar)
             .unwrap_or_else(|| fallback_id.clone());
+        let record_id = record_id.unwrap_or(&request_id).to_string();
         let record = TenantRecord {
             tenant_id: tenant_id.to_string(),
             kind: RecordKind::Audit,
-            record_id: request_id.clone(),
+            record_id,
             request_id,
-            origin_record_id: None,
+            origin_record_id: origin_record_id.map(str::to_string),
             payload,
         };
         self.store.put(Some(tenant_id), &record)?;
         Ok(record)
+    }
+}
+
+#[derive(Default)]
+pub struct AuditOnce {
+    finished: AtomicBool,
+}
+
+impl AuditOnce {
+    pub fn finish(
+        &self,
+        writer: &AuditWriter<'_>,
+        tenant_id: &str,
+        record_id: &str,
+        origin_record_id: Option<&str>,
+        input: &Map<String, Value>,
+    ) -> Result<TenantRecord, AuditError> {
+        if self.finished.swap(true, Ordering::AcqRel) {
+            return Err(AuditError::AlreadyFinished);
+        }
+        writer.write_scoped(tenant_id, Some(record_id), origin_record_id, input)
     }
 }
 

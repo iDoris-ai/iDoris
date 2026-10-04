@@ -68,11 +68,12 @@ pub mod write_timeout;
 
 use std::net::IpAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::body::{Body, Bytes};
 use axum::extract::{Extension, Request, State};
-use axum::http::{HeaderMap, HeaderValue, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -195,6 +196,9 @@ pub struct AppState {
     /// Tenant-scoped audit/usage record store. Startup installs it together
     /// with `budget_ledger` from the same SQLite path.
     pub record_store: Option<Arc<std::sync::Mutex<idoris_tenancy::store::TenantStore>>>,
+    /// Best-effort audit persistence failures. Audit must not alter the HTTP
+    /// result already produced by routing/backend execution.
+    pub audit_failures: Arc<AtomicU64>,
     /// Outbound HTTP client for `GET /v1/models` (this PR) and the direct
     /// `http_service` chat-forwarding path (follow-up PR) — one client
     /// shared across requests so its connection pool is actually reused,
@@ -228,6 +232,10 @@ impl std::fmt::Debug for AppState {
             .field(
                 "record_store",
                 &self.record_store.as_ref().map(|_| "TenantStore { .. }"),
+            )
+            .field(
+                "audit_failures",
+                &self.audit_failures.load(Ordering::Relaxed),
             )
             .field("http_client", &self.http_client)
             .field(
@@ -265,6 +273,7 @@ impl Default for AppState {
             runtimes: runtime::RuntimeRegistry::default(),
             budget_ledger: None,
             record_store: None,
+            audit_failures: Arc::new(AtomicU64::new(0)),
             models_health: Arc::new(health::HealthTracker::default()),
             capabilities: None,
             proxy: Arc::new(proxy::ChatProxy::new(http_client.clone())),
@@ -277,6 +286,7 @@ impl Default for AppState {
 /// `501` fallback for everything else, and the `X-iDoris-Record-Id`
 /// middleware applied to every response.
 pub fn build_app(state: AppState) -> Router {
+    let state = Arc::new(state);
     Router::new()
         .route("/health", get(health))
         .route("/v1/models", get(list_models).fallback(not_found))
@@ -286,8 +296,11 @@ pub fn build_app(state: AppState) -> Router {
             post(chat_completions).fallback(not_found),
         )
         .fallback(not_found)
-        .with_state(Arc::new(state))
-        .layer(middleware::from_fn(record_id_middleware))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            record_id_middleware,
+        ))
+        .with_state(state)
 }
 
 async fn get_capabilities(State(state): State<Arc<AppState>>) -> Response {
@@ -915,17 +928,157 @@ async fn chat_via_proxy_buffered(
 #[derive(Clone)]
 struct RequestRecordId(String);
 
+struct BufferedAuditMeta {
+    tenant_id: Option<String>,
+    request_id: Option<String>,
+    privacy: String,
+    intent: Option<String>,
+    record_id: String,
+    status: StatusCode,
+    origin_record_id: Option<String>,
+    reason: String,
+}
+
 /// Server-generated on every response, success or error, streaming or not
 /// (interface spec §3.12) — never taken from a caller-supplied header.
-async fn record_id_middleware(mut req: Request<Body>, next: Next) -> Response {
+async fn record_id_middleware(
+    State(state): State<Arc<AppState>>,
+    mut req: Request<Body>,
+    next: Next,
+) -> Response {
     let record_id = Uuid::new_v4().to_string();
+    let audit_chat = req.method() == Method::POST && req.uri().path() == "/v1/chat/completions";
+    let audit_tenant = audit_tenant_id(&state, req.headers());
+    let audit_request_id = header_text(req.headers(), HEADER_REQUEST_ID).map(str::to_string);
+    let audit_privacy = header_text(req.headers(), "x-idoris-privacy")
+        .unwrap_or("local_only")
+        .to_string();
+    let audit_intent = header_text(req.headers(), "x-idoris-intent").map(str::to_string);
     req.extensions_mut()
         .insert(RequestRecordId(record_id.clone()));
     let mut response = next.run(req).await;
     if let Ok(value) = HeaderValue::from_str(&record_id) {
         response.headers_mut().insert(HEADER_RECORD_ID, value);
     }
+    if audit_chat && !is_event_stream(&response) {
+        let origin_record_id = response
+            .headers()
+            .get(HEADER_ORIGIN_RECORD_ID)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        let reason = audit_reason(
+            response.status(),
+            response.headers().contains_key(HEADER_SERVED_LOCALITY),
+            response
+                .headers()
+                .get(HEADER_DEGRADED)
+                .is_some_and(|value| value == "true"),
+        );
+        finish_buffered_audit(
+            state,
+            BufferedAuditMeta {
+                tenant_id: audit_tenant,
+                request_id: audit_request_id,
+                privacy: audit_privacy,
+                intent: audit_intent,
+                record_id,
+                status: response.status(),
+                origin_record_id,
+                reason,
+            },
+        )
+        .await;
+    }
     response
+}
+
+fn header_text<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn audit_tenant_id(state: &AppState, headers: &HeaderMap) -> Option<String> {
+    match state.deploy_mode {
+        idoris_contracts::DeployMode::Personal => Some(budget::PERSONAL_TENANT_ID.to_string()),
+        idoris_contracts::DeployMode::Tenant => {
+            header_text(headers, "x-idoris-tenant").map(str::to_string)
+        }
+    }
+}
+
+fn is_event_stream(response: &Response) -> bool {
+    response
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("text/event-stream"))
+}
+
+async fn finish_buffered_audit(state: Arc<AppState>, meta: BufferedAuditMeta) {
+    let (Some(store), Some(tenant_id)) = (state.record_store.clone(), meta.tenant_id) else {
+        return;
+    };
+    let mut payload = serde_json::Map::new();
+    payload.insert(
+        "request_id".into(),
+        json!(meta.request_id.unwrap_or_else(|| meta.record_id.clone())),
+    );
+    payload.insert("component".into(), json!("router"));
+    payload.insert("privacy".into(), json!(meta.privacy));
+    if let Some(intent) = meta.intent {
+        payload.insert("intent".into(), json!(intent));
+    }
+    payload.insert("status".into(), json!(meta.status.as_u16()));
+    payload.insert("reason".into(), json!(meta.reason));
+
+    let failures = state.audit_failures.clone();
+    let result = tokio::task::spawn_blocking(move || -> Result<(), String> {
+        let guard = store
+            .lock()
+            .map_err(|_| "audit record store lock poisoned".to_string())?;
+        let writer = audit::AuditWriter::new(&guard);
+        audit::AuditOnce::default()
+            .finish(
+                &writer,
+                &tenant_id,
+                &meta.record_id,
+                meta.origin_record_id.as_deref(),
+                &payload,
+            )
+            .map(|_| ())
+            .map_err(|err| err.to_string())
+    })
+    .await;
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(message)) => {
+            failures.fetch_add(1, Ordering::Relaxed);
+            eprintln!("idoris: audit write failed: {message}");
+        }
+        Err(_) => {
+            failures.fetch_add(1, Ordering::Relaxed);
+            eprintln!("idoris: audit write worker failed");
+        }
+    }
+}
+
+fn audit_reason(status: StatusCode, served_locality: bool, degraded: bool) -> String {
+    if status == StatusCode::PAYMENT_REQUIRED {
+        return "budget: budget_exceeded".into();
+    }
+    if degraded {
+        return "degraded: routing_fallback".into();
+    }
+    if status.is_success() {
+        return "intent_match: routed".into();
+    }
+    if status == StatusCode::SERVICE_UNAVAILABLE && !served_locality {
+        return "privacy_enforced: no_eligible_candidate".into();
+    }
+    format!("degraded: http_{}", status.as_u16())
 }
 
 #[cfg(test)]
