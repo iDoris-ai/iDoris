@@ -19,7 +19,9 @@
 //!   [`remote::CredentialSource`] only).
 
 pub mod chat;
+pub mod detect;
 pub mod error;
+pub mod factory;
 pub mod omlx;
 pub mod remote;
 

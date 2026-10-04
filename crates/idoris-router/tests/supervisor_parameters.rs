@@ -36,7 +36,7 @@ async fn unsupported_options_are_400_before_any_upstream_call() {
     let upstream = MockServer::start().await;
     let card = card(&upstream.uri());
     let app = build_app(AppState {
-        supervisor: Some(BoundSupervisor::spawn_omlx(&card).unwrap()),
+        runtimes: Some(BoundSupervisor::spawn_omlx(&card).unwrap()).into(),
         cards: vec![card],
         ..AppState::default()
     });
@@ -92,7 +92,7 @@ async fn stream_validation_precedes_parameter_validation() {
     let upstream = MockServer::start().await;
     let card = card(&upstream.uri());
     let app = build_app(AppState {
-        supervisor: Some(BoundSupervisor::spawn_omlx(&card).unwrap()),
+        runtimes: Some(BoundSupervisor::spawn_omlx(&card).unwrap()).into(),
         cards: vec![card],
         ..AppState::default()
     });

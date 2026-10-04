@@ -16,6 +16,7 @@ function cardText(extra: Parameters<typeof localComponent>[1] = {}): string {
   dirs.push(dir);
   return readFileSync(join(dir, readdirSync(dir)[0] as string), "utf8");
 }
+
 it("未指定 loadPolicy 时保留 resident 默认值，extensions 默认不生成", () => {
   const text = cardText();
   expect(text).toContain("load_policy: { mode: resident, keepalive: { pinned: true }, admission: coexist }");
@@ -94,6 +95,47 @@ it("被测 CLI 接受定制 policy；坏 policy 仍真实非零提前退出", as
     expect((failure as ConformanceStartupError).exitCode).not.toBeNull();
     expect((failure as ConformanceStartupError).exitCode).not.toBe(0);
     expect(Date.now() - start).toBeLessThan(2_000);
+  } finally {
+    await upstream.close();
+  }
+});
+
+it("fake upstream 的 status 快照可动态变化并可构造失败", async () => {
+  const upstream = await startFakeUpstream();
+  try {
+    upstream.setStatus({
+      loaded_models: ["model-a"],
+      model_memory_max: 8 * 1024 ** 3,
+      model_memory_used: 2 * 1024 ** 3,
+      pressure: "soft",
+    });
+    const first = await fetch(upstream.url + "/api/status");
+    expect(first.status).toBe(200);
+    expect(await first.json()).toMatchObject({
+      loaded_models: ["model-a"],
+      pressure: "soft",
+    });
+    expect(upstream.statusCount()).toBe(1);
+
+    upstream.setStatus({
+      loaded_models: ["model-a", "model-b"],
+      model_memory_max: 8 * 1024 ** 3,
+      model_memory_used: 4 * 1024 ** 3,
+      pressure: "hard",
+    });
+    const second = await fetch(upstream.url + "/api/status");
+    expect(second.status).toBe(200);
+    expect(await second.json()).toMatchObject({
+      loaded_models: ["model-a", "model-b"],
+      pressure: "hard",
+    });
+    expect(upstream.statusCount()).toBe(2);
+
+    upstream.setStatus({ error: "status unavailable" }, 503);
+    const failed = await fetch(upstream.url + "/api/status");
+    expect(failed.status).toBe(503);
+    expect(await failed.json()).toEqual({ error: "status unavailable" });
+    expect(upstream.statusCount()).toBe(3);
   } finally {
     await upstream.close();
   }
