@@ -33,7 +33,6 @@ pub fn build_command(
             program: profile.cli.program(),
             args: vec![
                 "-p".into(),
-                prompt,
                 "--output-format".into(),
                 "text".into(),
                 "--tools".into(),
@@ -44,7 +43,10 @@ pub fn build_command(
                 "--permission-prompts".into(),
                 "none".into(),
             ],
-            stdin: None,
+            // `claude -p/--print` is a boolean switch; the prompt is not
+            // its value. Feed caller-controlled text over stdin so leading
+            // '-' content can never be reinterpreted as a CLI option.
+            stdin: Some(prompt),
         },
         SubscriptionCli::Codex => CommandSpec {
             program: profile.cli.program(),

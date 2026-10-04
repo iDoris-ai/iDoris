@@ -23,11 +23,22 @@ fn claude_and_codex_use_exact_fixed_safety_arguments() {
         "/tmp/out",
     );
     assert_eq!(claude.program, "claude");
-    assert_eq!(claude.args[0..2], ["-p", "-not-a-flag"]);
-    for flag in required_flags(SubscriptionCli::Claude) {
-        assert!(claude.args.iter().any(|arg| arg == flag));
-    }
-    assert_eq!(claude.stdin, None);
+    assert_eq!(
+        claude.args,
+        [
+            "-p",
+            "--output-format",
+            "text",
+            "--tools",
+            "",
+            "--restricted",
+            "--strict-mcp-config",
+            "--no-session-persistence",
+            "--permission-prompts",
+            "none",
+        ]
+    );
+    assert_eq!(claude.stdin.as_deref(), Some("-not-a-flag"));
 
     let codex = build_command(
         SandboxProfile::fixed(SubscriptionCli::Codex),
@@ -35,12 +46,26 @@ fn claude_and_codex_use_exact_fixed_safety_arguments() {
         "/tmp/out",
     );
     assert_eq!(codex.program, "codex");
-    assert_eq!(codex.args.last().map(String::as_str), Some("-"));
-    assert!(!codex.args.iter().any(|arg| arg == "-not-a-flag"));
+    assert_eq!(
+        codex.args,
+        [
+            "exec",
+            "--sandbox",
+            "read-only",
+            "--ephemeral",
+            "--skip-git-repo-check",
+            "--ignore-user-config",
+            "--ignore-rules",
+            "--color",
+            "never",
+            "-o",
+            "/tmp/out",
+            "-",
+        ]
+    );
     assert_eq!(codex.stdin.as_deref(), Some("-not-a-flag"));
-    for flag in required_flags(SubscriptionCli::Codex) {
-        assert!(codex.args.iter().any(|arg| arg == flag));
-    }
+    assert!(SandboxProfile::fixed(SubscriptionCli::Claude).tools_off);
+    assert!(!SandboxProfile::fixed(SubscriptionCli::Codex).tools_off);
 }
 
 #[test]
@@ -95,5 +120,21 @@ fn unsupported_safety_capability_fails_closed_without_flag_stripping() {
             },
         ),
         Err(CapabilityError::MissingFlag("--tools"))
+    );
+
+    let codex = SandboxProfile::fixed(SubscriptionCli::Codex);
+    let codex_flags = required_flags(codex.cli)
+        .iter()
+        .map(|flag| (*flag).to_string())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        validate_cli_capabilities(
+            codex,
+            &CliCapabilities {
+                tools_off: false,
+                supported_flags: codex_flags,
+            },
+        ),
+        Ok(())
     );
 }

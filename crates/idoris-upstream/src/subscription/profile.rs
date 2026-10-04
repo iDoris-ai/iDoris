@@ -30,7 +30,11 @@ impl SandboxProfile {
         Self {
             id: SANDBOX_PROFILE_ID,
             cli,
-            tools_off: true,
+            // Claude's fixed `--tools ""` profile proves no-tools. Codex's
+            // read-only sandbox limits writes but still permits read-only
+            // tool/shell use, so claiming tools_off there would overstate
+            // the enforced boundary.
+            tools_off: matches!(cli, SubscriptionCli::Claude),
             workspace_read_only: true,
         }
     }
