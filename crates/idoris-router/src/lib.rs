@@ -931,7 +931,7 @@ struct RequestRecordId(String);
 struct BufferedAuditMeta {
     tenant_id: Option<String>,
     request_id: Option<String>,
-    privacy: String,
+    privacy: Option<String>,
     intent: Option<String>,
     record_id: String,
     status: StatusCode,
@@ -949,11 +949,9 @@ async fn record_id_middleware(
     let record_id = Uuid::new_v4().to_string();
     let audit_chat = req.method() == Method::POST && req.uri().path() == "/v1/chat/completions";
     let audit_tenant = audit_tenant_id(&state, req.headers());
-    let audit_request_id = header_text(req.headers(), HEADER_REQUEST_ID).map(str::to_string);
-    let audit_privacy = header_text(req.headers(), "x-idoris-privacy")
-        .unwrap_or("local_only")
-        .to_string();
-    let audit_intent = header_text(req.headers(), "x-idoris-intent").map(str::to_string);
+    let audit_request_id = audit_header(req.headers(), HEADER_REQUEST_ID, None);
+    let audit_privacy = audit_header(req.headers(), "x-idoris-privacy", Some("local_only"));
+    let audit_intent = audit_header(req.headers(), "x-idoris-intent", None);
     req.extensions_mut()
         .insert(RequestRecordId(record_id.clone()));
     let mut response = next.run(req).await;
@@ -1000,6 +998,16 @@ fn header_text<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
         .filter(|value| !value.is_empty())
 }
 
+fn audit_header(headers: &HeaderMap, name: &str, default: Option<&str>) -> Option<String> {
+    match header_text(headers, name) {
+        Some(value) if value.encode_utf16().count() <= audit::MAX_FIELD_UTF16_UNITS => {
+            Some(value.to_string())
+        }
+        Some(_) => None,
+        None => default.map(str::to_string),
+    }
+}
+
 fn audit_tenant_id(state: &AppState, headers: &HeaderMap) -> Option<String> {
     match state.deploy_mode {
         idoris_contracts::DeployMode::Personal => Some(budget::PERSONAL_TENANT_ID.to_string()),
@@ -1027,7 +1035,9 @@ async fn finish_buffered_audit(state: Arc<AppState>, meta: BufferedAuditMeta) {
         json!(meta.request_id.unwrap_or_else(|| meta.record_id.clone())),
     );
     payload.insert("component".into(), json!("router"));
-    payload.insert("privacy".into(), json!(meta.privacy));
+    if let Some(privacy) = meta.privacy {
+        payload.insert("privacy".into(), json!(privacy));
+    }
     if let Some(intent) = meta.intent {
         payload.insert("intent".into(), json!(intent));
     }
@@ -1040,16 +1050,33 @@ async fn finish_buffered_audit(state: Arc<AppState>, meta: BufferedAuditMeta) {
             .lock()
             .map_err(|_| "audit record store lock poisoned".to_string())?;
         let writer = audit::AuditWriter::new(&guard);
-        audit::AuditOnce::default()
-            .finish(
-                &writer,
-                &tenant_id,
-                &meta.record_id,
-                meta.origin_record_id.as_deref(),
-                &payload,
-            )
-            .map(|_| ())
-            .map_err(|err| err.to_string())
+        let write = audit::AuditOnce::default().finish(
+            &writer,
+            &tenant_id,
+            &meta.record_id,
+            meta.origin_record_id.as_deref(),
+            &payload,
+        );
+        match write {
+            Ok(_) => Ok(()),
+            Err(audit::AuditError::Store(err)) => Err(err.to_string()),
+            Err(_) => {
+                let mut minimal = serde_json::Map::new();
+                minimal.insert("request_id".into(), json!(meta.record_id.clone()));
+                minimal.insert("component".into(), json!("router"));
+                minimal.insert("status".into(), json!(meta.status.as_u16()));
+                minimal.insert("reason".into(), json!(meta.reason));
+                writer
+                    .write_scoped(
+                        &tenant_id,
+                        Some(&meta.record_id),
+                        meta.origin_record_id.as_deref(),
+                        &minimal,
+                    )
+                    .map(|_| ())
+                    .map_err(|err| err.to_string())
+            }
+        }
     })
     .await;
     match result {
@@ -1284,6 +1311,36 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].record_id, response_record_id);
         assert_eq!(rows[0].payload["status"], json!(400));
+    }
+
+    #[tokio::test]
+    async fn oversized_intent_still_records_invalid_json_once() {
+        let store = memory_record_store();
+        let app = build_app(AppState {
+            record_store: Some(store.clone()),
+            ..AppState::default()
+        });
+        let long_intent = "x".repeat(audit::MAX_FIELD_UTF16_UNITS + 1);
+        let response = app
+            .oneshot(post_chat(
+                "{not valid json",
+                &[("x-idoris-intent", long_intent.as_str())],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let response_record_id = response
+            .headers()
+            .get(HEADER_RECORD_ID)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        let rows = audit_rows(&store);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].record_id, response_record_id);
+        assert_eq!(rows[0].payload["request_id"], json!(response_record_id));
+        assert!(rows[0].payload.get("intent").is_none());
     }
 
     #[tokio::test]
@@ -1774,6 +1831,46 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].record_id, response_record_id);
         assert_eq!(rows[0].payload["reason"], json!("intent_match: routed"));
+    }
+
+    #[tokio::test]
+    async fn oversized_request_id_still_records_success_once() {
+        let server = wiremock::MockServer::start().await;
+        let store = memory_record_store();
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/v1/chat/completions"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let app = build_app(AppState {
+            cards: vec![resident_component_card("omlx", &server.uri())],
+            record_store: Some(store.clone()),
+            ..AppState::default()
+        });
+        let long_request_id = "r".repeat(audit::MAX_FIELD_UTF16_UNITS + 1);
+        let body =
+            "{\"model\":\"idoris/daily\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}";
+        let response = app
+            .oneshot(post_chat(
+                body,
+                &[(HEADER_REQUEST_ID, long_request_id.as_str())],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let response_record_id = response
+            .headers()
+            .get(HEADER_RECORD_ID)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        let rows = audit_rows(&store);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].record_id, response_record_id);
+        assert_eq!(rows[0].payload["request_id"], json!(response_record_id));
+        server.verify().await;
     }
 
     #[tokio::test]
