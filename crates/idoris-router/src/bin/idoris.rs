@@ -63,8 +63,6 @@ async fn run() -> Result<(), String> {
         parse_port(std::env::var("IDORIS_PORT").ok().as_deref()).map_err(|err| err.to_string())?;
     let deploy_mode =
         profile::deploy_mode_from_env(std::env::var("IDORIS_DEPLOY_MODE").ok().as_deref());
-    let persistent = storage::bootstrap_process(deploy_mode)
-        .map_err(|err| format!("无法初始化持久化存储：{err}"))?;
 
     let components_env = env_path("IDORIS_COMPONENTS_DIR")?;
     let components_dir = resolve_bundle_path(
@@ -94,6 +92,11 @@ async fn run() -> Result<(), String> {
         })?;
 
     let runtimes = RuntimeRegistry::spawn(&cards)?;
+    // Preserve existing startup-gate precedence: component/policy/runtime
+    // validation (including the K04 subscription hard rejection) must fail
+    // before tenant storage/config bootstrap can surface a later error.
+    let persistent = storage::bootstrap_process(deploy_mode)
+        .map_err(|err| format!("无法初始化持久化存储：{err}"))?;
 
     let component_list = cards
         .iter()
