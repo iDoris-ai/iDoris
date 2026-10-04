@@ -16,6 +16,9 @@ pub mod probe {}
 /// touching any of this.
 pub mod memory;
 
+/// Typed model-catalog surface. Parsing/validation lives in follow-up task09.
+pub mod catalog;
+
 /// `HardwareAwareModelRecommender` (`packages/recommender/src/recommend.ts`,
 /// T2.1.2/T2.1.3): picks a resident + on-demand model combination given
 /// `HostFacts` + a model catalog + policy, with hard `min_ram_gb` gating and
