@@ -1513,7 +1513,7 @@ mod tests {
             if rows.len() == expected {
                 return rows;
             }
-            tokio::task::yield_now().await;
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         let rows = audit_rows(store);
         assert_eq!(rows.len(), expected, "audit finalizer did not settle");
