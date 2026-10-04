@@ -302,6 +302,10 @@ pub fn build_app(state: AppState) -> Router {
             get(get_tenant_audit).fallback(not_found),
         )
         .route(
+            "/idoris/tenants/{tenant_id}/budget",
+            get(get_tenant_budget).fallback(not_found),
+        )
+        .route(
             "/v1/chat/completions",
             post(chat_completions).fallback(not_found),
         )
@@ -432,6 +436,53 @@ async fn get_tenant_audit(
             StatusCode::INTERNAL_SERVER_ERROR,
             "audit_unavailable",
             "audit query worker failed",
+        ),
+    }
+}
+
+async fn get_tenant_budget(
+    State(state): State<Arc<AppState>>,
+    Path(tenant_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let scope_tenant = query_scope_header(&headers).map(str::to_string);
+    let Some(ledger) = state.budget_ledger.clone() else {
+        return error_envelope(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "budget_unavailable",
+            "tenant budget storage is not configured",
+        );
+    };
+    let result = tokio::task::spawn_blocking(move || {
+        queries::budget::query_budget(&ledger, &tenant_id, scope_tenant.as_deref())
+    })
+    .await;
+    match result {
+        Ok(Ok(view)) => Json(view).into_response(),
+        Ok(Err(
+            err @ (queries::budget::BudgetQueryError::ScopeRequired
+            | queries::budget::BudgetQueryError::ScopeMismatch),
+        )) => error_envelope(
+            StatusCode::BAD_REQUEST,
+            "invalid_tenant_scope",
+            err.to_string(),
+        ),
+        Ok(Err(queries::budget::BudgetQueryError::Budget(
+            idoris_tenancy::budget::BudgetError::TenantNotConfigured { tenant_id },
+        ))) => error_envelope(
+            StatusCode::NOT_FOUND,
+            "tenant_not_found",
+            format!("tenant {tenant_id:?} is not configured"),
+        ),
+        Ok(Err(err)) => error_envelope(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "budget_unavailable",
+            err.to_string(),
+        ),
+        Err(_) => error_envelope(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "budget_unavailable",
+            "budget query worker failed",
         ),
     }
 }
