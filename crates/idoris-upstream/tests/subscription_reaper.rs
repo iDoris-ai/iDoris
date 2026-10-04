@@ -93,7 +93,7 @@ async fn ignored_term_escalates_to_kill_and_reaps_direct_child() {
     let (reaper, _) = spawn(&fixture, "ignore-term");
     let group = reaper.process_group();
     wait_marker(&marker, 1).await;
-    let outcome = reaper.terminate(Duration::from_millis(100)).await.unwrap();
+    let outcome = reaper.terminate(Duration::from_millis(500)).await.unwrap();
     assert!(outcome.escalated_to_kill);
     assert!(group_is_gone(group));
 }
