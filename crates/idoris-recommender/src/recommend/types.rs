@@ -128,3 +128,16 @@ impl std::fmt::Display for ResidentError {
 }
 
 impl std::error::Error for ResidentError {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoreOverride {
+    pub id: String,
+    pub active: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ForcedResult {
+    pub resident: Option<ResidentChoice>,
+    pub override_choice: Option<CoreOverride>,
+    pub warnings: Vec<String>,
+}
