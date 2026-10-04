@@ -35,6 +35,7 @@ tokio-util = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = "0.9"
+thiserror = { workspace = true }
 uuid = { workspace = true }
 # R2-G: direct HTTP forwarding for a generic (non-oMLX) `http_service`
 # component card — `GET /v1/models` (this PR) and `POST
