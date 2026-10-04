@@ -17,7 +17,7 @@
 //! forwards to it directly per-request instead.
 
 use idoris_router::{
-    AppState, BIND_HOST, build_app, components, parse_port, profile, routing_policy,
+    AppState, BIND_HOST, build_app, cli, components, parse_port, profile, routing_policy,
     runtime::RuntimeRegistry,
     storage,
     write_timeout::{DEFAULT_WRITE_TIMEOUT, WriteTimeoutListener},
@@ -26,6 +26,10 @@ use std::path::PathBuf;
 
 #[tokio::main]
 async fn main() {
+    if let Err(message) = cli::parse_args(std::env::args_os().skip(1)) {
+        eprintln!("[idoris] {message}");
+        std::process::exit(1);
+    }
     if let Err(message) = run().await {
         eprintln!("[idoris] 启动失败：{message}");
         std::process::exit(1);

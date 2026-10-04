@@ -423,6 +423,42 @@ fn tie_break_picks_the_lexicographically_smaller_id() {
     assert_eq!(decision.chosen_id, "alpha");
 }
 
+/// B1 task08 / D-B1-1: Rust deliberately keeps deterministic candidate
+/// selection instead of the TS reference implementation's registration-order
+/// pick. Every assertion puts the eventual winner second in the input slice,
+/// so a weak "first eligible candidate" implementation fails this test.
+#[test]
+fn selection_contract_is_admission_then_cost_then_id_not_registration_order() {
+    let req = any_privacy_profile(None);
+    let ctx = PolicyCtx::default();
+
+    let mut cheaper_but_eviction = sample_card("alpha", &[]);
+    cheaper_but_eviction.admission_status = AdmissionStatus::RequiresEviction;
+    cheaper_but_eviction.estimated_cost_minor = Some(0);
+    let mut ready_but_paid = sample_card("zulu", &[]);
+    ready_but_paid.estimated_cost_minor = Some(100);
+    let decision = decide(&req, &[cheaper_but_eviction, ready_but_paid], &ctx).unwrap();
+    assert_eq!(
+        decision.chosen_id, "zulu",
+        "admission rank must win before cost"
+    );
+
+    let mut expensive_first = sample_card("alpha", &[]);
+    expensive_first.estimated_cost_minor = Some(100);
+    let mut cheap_second = sample_card("zulu", &[]);
+    cheap_second.estimated_cost_minor = Some(0);
+    let decision = decide(&req, &[expensive_first, cheap_second], &ctx).unwrap();
+    assert_eq!(decision.chosen_id, "zulu", "cost must win before id");
+
+    let first = sample_card("zulu", &[]);
+    let second = sample_card("alpha", &[]);
+    let decision = decide(&req, &[first, second], &ctx).unwrap();
+    assert_eq!(
+        decision.chosen_id, "alpha",
+        "id must deterministically break ties"
+    );
+}
+
 /// H3 回归：无角色声明时，`experiment` 候选不能靠"没有具体角色可查"绕过——
 /// 这三条路径（无角色、`idoris/auto`、角色降级）曾经完全不查 experiment/
 /// min_ram_gb，只有走具体角色匹配（`is_eligible_for_role`）才会查。

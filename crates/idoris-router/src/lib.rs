@@ -9,6 +9,9 @@
 /// Control-plane header parsing (R2-D task 1).
 pub mod profile;
 
+/// Packaged binary command-line parsing.
+pub mod cli;
+
 /// Offline intent embedding primitives (B1 task 09).
 pub mod intent;
 
@@ -38,6 +41,9 @@ pub mod health;
 /// card's own model listing.
 pub mod models;
 
+/// Injectable `/capabilities` provider boundary (B1 task32). Live capacity
+/// aggregation is wired by task33.
+pub mod capabilities;
 /// Persistent record/budget storage bootstrap (B1 task18).
 pub mod storage;
 
@@ -191,6 +197,9 @@ pub struct AppState {
     pub http_client: reqwest::Client,
     /// Shared across requests and AppState clones.
     pub models_health: Arc<health::HealthTracker>,
+    /// Capacity surface provider. `None` is deliberately unavailable rather
+    /// than a fake static snapshot; task33 installs the live implementation.
+    pub capabilities: Option<Arc<dyn capabilities::CapabilitiesProvider>>,
     /// R2-G: direct-forward path for a `LoadMode::Resident` `http_service`
     /// candidate (see `dispatch::select`/`is_resident_http_service`'s doc).
     /// `Arc` because `ChatProxy` holds a `Mutex`-guarded cache, same reason
@@ -215,6 +224,10 @@ impl std::fmt::Debug for AppState {
                 &self.record_store.as_ref().map(|_| "TenantStore { .. }"),
             )
             .field("http_client", &self.http_client)
+            .field(
+                "capabilities",
+                &self.capabilities.as_ref().map(|_| "configured"),
+            )
             .field("proxy", &"ChatProxy { .. }")
             .finish()
     }
@@ -247,6 +260,7 @@ impl Default for AppState {
             budget_ledger: None,
             record_store: None,
             models_health: Arc::new(health::HealthTracker::default()),
+            capabilities: None,
             proxy: Arc::new(proxy::ChatProxy::new(http_client.clone())),
             http_client,
         }
@@ -260,6 +274,7 @@ pub fn build_app(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/v1/models", get(list_models).fallback(not_found))
+        .route("/capabilities", get(get_capabilities).fallback(not_found))
         .route(
             "/v1/chat/completions",
             post(chat_completions).fallback(not_found),
@@ -267,6 +282,24 @@ pub fn build_app(state: AppState) -> Router {
         .fallback(not_found)
         .with_state(Arc::new(state))
         .layer(middleware::from_fn(record_id_middleware))
+}
+
+async fn get_capabilities(State(state): State<Arc<AppState>>) -> Response {
+    let Some(provider) = state.capabilities.as_ref() else {
+        return error_envelope(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "capabilities_unavailable",
+            "capacity provider is not configured",
+        );
+    };
+    match provider.snapshot().await {
+        Ok(entries) => Json(entries).into_response(),
+        Err(_) => error_envelope(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "capabilities_unavailable",
+            "capacity snapshot is unavailable",
+        ),
+    }
 }
 
 /// `GET /v1/models` (interface spec — `owned_by` is each card's
