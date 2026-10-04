@@ -46,16 +46,28 @@ fn spawn(exe: &Path, cwd: &Path, port: u16, env: &[(&str, &str)]) -> Running {
     {
         cmd.env_remove(key);
     }
-    Running(Some(
-        cmd.current_dir(cwd)
-            .env("IDORIS_PORT", port.to_string())
-            .env("IDORIS_DB_PATH", cwd.join("idoris-test.sqlite3"))
-            .envs(env.iter().copied())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap(),
-    ))
+    cmd.current_dir(cwd)
+        .env("IDORIS_PORT", port.to_string())
+        .env("IDORIS_DB_PATH", cwd.join("idoris-test.sqlite3"))
+        .envs(env.iter().copied())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        match cmd.spawn() {
+            Ok(child) => return Running(Some(child)),
+            Err(err)
+                if err.kind() == std::io::ErrorKind::ExecutableFileBusy
+                    && Instant::now() < deadline =>
+            {
+                // Linux may briefly reject exec immediately after fs::copy
+                // closes a newly written executable. Retry only ETXTBSY;
+                // every other spawn failure remains an immediate test error.
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(err) => panic!("failed to spawn copied idoris binary: {err}"),
+        }
+    }
 }
 
 fn failed(mut child: Running, expected: &str) {
