@@ -14,6 +14,7 @@ mod imp {
     use tokio::process::Child;
     use tokio::task::JoinHandle;
     use tokio::time::{Instant, sleep, timeout};
+    use tokio_util::sync::CancellationToken;
 
     use super::super::error::{SubscriptionErrorCode, SubscriptionRelayError};
 
@@ -23,6 +24,20 @@ mod imp {
     pub struct ReapOutcome {
         pub exit_code: Option<i32>,
         pub escalated_to_kill: bool,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum CompletionReason {
+        Exited,
+        Cancelled,
+        Timeout,
+        OutputLimit,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct ControlledOutcome {
+        pub reap: ReapOutcome,
+        pub reason: CompletionReason,
     }
 
     pub struct ProcessGroupReaper {
@@ -53,6 +68,13 @@ mod imp {
             mut self,
             grace: Duration,
         ) -> Result<ReapOutcome, SubscriptionRelayError> {
+            self.terminate_inner(grace).await
+        }
+
+        async fn terminate_inner(
+            &mut self,
+            grace: Duration,
+        ) -> Result<ReapOutcome, SubscriptionRelayError> {
             signal_group(self.group, Signal::SIGTERM)?;
             let (status, mut escalated) = match timeout(grace, self.child.wait()).await {
                 Ok(result) => (result.map_err(|_| cleanup_error())?, false),
@@ -77,6 +99,13 @@ mod imp {
 
         pub async fn finish_after_parent_exit(
             mut self,
+            grace: Duration,
+        ) -> Result<ReapOutcome, SubscriptionRelayError> {
+            self.finish_inner(grace).await
+        }
+
+        async fn finish_inner(
+            &mut self,
             grace: Duration,
         ) -> Result<ReapOutcome, SubscriptionRelayError> {
             let (status, mut escalated) = match timeout(grace, self.child.wait()).await {
@@ -104,6 +133,54 @@ mod imp {
                 exit_code: status.code(),
                 escalated_to_kill: escalated,
             })
+        }
+
+        pub async fn run_controlled(
+            mut self,
+            grace: Duration,
+            process_timeout: Duration,
+            cancel: CancellationToken,
+            output_limit: CancellationToken,
+        ) -> Result<ControlledOutcome, SubscriptionRelayError> {
+            enum Event {
+                Parent(std::io::Result<std::process::ExitStatus>),
+                Cancelled,
+                Timeout,
+                OutputLimit,
+            }
+
+            let mut deadline = Box::pin(tokio::time::sleep(process_timeout));
+            let event = tokio::select! {
+                result = self.child.wait() => Event::Parent(result),
+                _ = cancel.cancelled() => Event::Cancelled,
+                _ = &mut deadline => Event::Timeout,
+                _ = output_limit.cancelled() => Event::OutputLimit,
+            };
+
+            match event {
+                Event::Parent(result) => {
+                    let status = result.map_err(|_| cleanup_error())?;
+                    let escalated = cleanup_descendants(self.group, grace).await?;
+                    self.armed = false;
+                    Ok(ControlledOutcome {
+                        reap: ReapOutcome {
+                            exit_code: status.code(),
+                            escalated_to_kill: escalated,
+                        },
+                        reason: CompletionReason::Exited,
+                    })
+                }
+                Event::Cancelled | Event::Timeout | Event::OutputLimit => {
+                    let reason = match event {
+                        Event::Cancelled => CompletionReason::Cancelled,
+                        Event::Timeout => CompletionReason::Timeout,
+                        Event::OutputLimit => CompletionReason::OutputLimit,
+                        Event::Parent(_) => unreachable!(),
+                    };
+                    let reap = self.terminate_inner(grace).await?;
+                    Ok(ControlledOutcome { reap, reason })
+                }
+            }
         }
     }
 
@@ -183,7 +260,9 @@ mod imp {
 }
 
 #[cfg(unix)]
-pub use imp::{ProcessGroupReaper, ReapOutcome, await_drain_bounded};
+pub use imp::{
+    CompletionReason, ControlledOutcome, ProcessGroupReaper, ReapOutcome, await_drain_bounded,
+};
 
 #[cfg(not(unix))]
 pub async fn unsupported() -> Result<(), super::error::SubscriptionRelayError> {

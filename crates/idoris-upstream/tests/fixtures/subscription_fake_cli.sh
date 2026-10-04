@@ -57,6 +57,11 @@ case "$mode" in
     printf '%s\n' "$payload"
     exit 0
     ;;
+  limit-hang)
+    write_marker "parent:$$:$(ps -o pgid= -p $$ | tr -d ' ')"
+    printf '12345678901234567890'
+    while :; do sleep 1; done
+    ;;
   hang)
     write_marker "parent:$$:$(ps -o pgid= -p $$ | tr -d ' ')"
     while :; do sleep 1; done
