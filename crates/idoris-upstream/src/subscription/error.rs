@@ -8,6 +8,7 @@ pub enum SubscriptionErrorCode {
     OutputLimit,
     Timeout,
     Cancelled,
+    CleanupFailed,
 }
 
 impl SubscriptionErrorCode {
@@ -19,6 +20,7 @@ impl SubscriptionErrorCode {
             Self::OutputLimit => "RELAY_OUTPUT_LIMIT",
             Self::Timeout => "RELAY_TIMEOUT",
             Self::Cancelled => "RELAY_CANCELLED",
+            Self::CleanupFailed => "RELAY_CLEANUP_FAILED",
         }
     }
 }
@@ -102,6 +104,7 @@ mod tests {
             (SubscriptionErrorCode::OutputLimit, "RELAY_OUTPUT_LIMIT"),
             (SubscriptionErrorCode::Timeout, "RELAY_TIMEOUT"),
             (SubscriptionErrorCode::Cancelled, "RELAY_CANCELLED"),
+            (SubscriptionErrorCode::CleanupFailed, "RELAY_CLEANUP_FAILED"),
         ];
         for (code, expected) in cases {
             assert_eq!(code.as_str(), expected);
