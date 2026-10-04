@@ -22,6 +22,9 @@ pub mod catalog;
 /// Catalog role candidate selection, sharing the policy crate's metadata gate.
 pub mod roles;
 
+/// Public catalog-model estimate / role-candidate boundary for B1 consumers.
+pub mod model;
+
 /// `HardwareAwareModelRecommender` (`packages/recommender/src/recommend.ts`,
 /// T2.1.2/T2.1.3): picks a resident + on-demand model combination given
 /// `HostFacts` + a model catalog + policy, with hard `min_ram_gb` gating and
