@@ -12,7 +12,7 @@
     "build": "pnpm -r build",
     "test": "pnpm -r test",
     "gen:contracts": "node scripts/gen-contracts.mjs",
-    "check:contract-drift": "node scripts/check-contract-drift.mjs",
+    "check:contract-drift": "node --test scripts/contract-version.test.mjs && node scripts/check-contract-drift.mjs",
     "test:golden": "pnpm --filter @idoris/adapters test:golden",
     "smoke": "pnpm build && node scripts/smoke.mjs",
     "test:privacy": "pnpm --filter @idoris/router test tests/privacy.test.ts",

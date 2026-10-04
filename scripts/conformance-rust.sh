@@ -37,14 +37,10 @@ fi
 mkdir -p "$(dirname "$bin")/config"
 cp config/routing-policy.yaml "$(dirname "$bin")/config/routing-policy.yaml"
 
-# idoris-router 当前的骨架不解析 argv（只读 IDORIS_PORT 等环境变量，见
-# crates/idoris-router/src/bin/idoris.rs），conformance harness 又是用
-# IDORIS_CONFORMANCE_CMD 按空白切分出 bin + args 来 spawn 子进程的（见
-# conformance/src/harness.ts），所以这里直接给可执行文件的绝对路径，不追加
-# 任何参数——不是漏写了 `serve`，是这个二进制目前压根没有子命令可言。
-export IDORIS_CONFORMANCE_CMD="$bin"
+# 正式走 task34 的 `serve` 入口；裸启动继续由 portable_startup 锁定兼容性。
+export IDORIS_CONFORMANCE_CMD="$bin serve"
 export IDORIS_CONFORMANCE_ARGV
-IDORIS_CONFORMANCE_ARGV="$(node -e 'process.stdout.write(JSON.stringify([process.argv[1]]))' "$bin")"
+IDORIS_CONFORMANCE_ARGV="$(node -e 'process.stdout.write(JSON.stringify([process.argv[1], "serve"]))' "$bin")"
 # K13/M4: a 5xx does not prove the upstream POST was not executed.
 export IDORIS_CONFORMANCE_POST_RETRY=0
 

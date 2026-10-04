@@ -53,4 +53,11 @@ describe("已知的规范 vs TS 现状落差（it.todo，不改实现）", () =>
       "[chat, coding]，请求要 vision）依然会正常路由到这张卡，不会 503。对应的负对照见 " +
       "conformance/tests/core.test.ts 里那条同名 it.todo（仅 Rust 实现满足）。",
   );
+
+  it.todo(
+    "D-B1-1 允许的实现差异：多候选都通过策略门禁时，TS dispatch 取注册顺序第一张卡；" +
+      "Rust 为了同输入跨运行可复现，固定按 admission → estimated cost → provider id 字典序选最小。" +
+      "该差异不应通过共享 conformance 强迫任一实现改成另一方；Rust 的承重回归由 " +
+      "idoris-policy::pipeline::tests::selection_contract_is_admission_then_cost_then_id_not_registration_order 锁定。",
+  );
 });
