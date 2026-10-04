@@ -16,6 +16,11 @@ done
 case "$mode" in
   echo) cat ;;
   stderr) printf '%s\n' "$payload" >&2; cat >/dev/null ;;
+  split-output)
+    printf '123456'
+    printf 'abcdef' >&2
+    cat >/dev/null
+    ;;
   nonzero) cat >/dev/null; exit 23 ;;
   empty) cat >/dev/null ;;
   output-file)

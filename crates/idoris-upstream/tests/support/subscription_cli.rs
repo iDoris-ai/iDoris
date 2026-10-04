@@ -1,7 +1,7 @@
 #![allow(dead_code, clippy::expect_used, clippy::unwrap_used)]
 
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 
 pub struct FakeSubscriptionCli {
@@ -18,10 +18,11 @@ impl FakeSubscriptionCli {
             Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/subscription_fake_cli.sh");
         for name in ["codex", "claude"] {
             let target = bin_dir.join(name);
-            fs::copy(&fixture, &target).expect("copy fake CLI fixture");
-            let mut permissions = fs::metadata(&target).unwrap().permissions();
-            permissions.set_mode(0o755);
-            fs::set_permissions(&target, permissions).unwrap();
+            // Link to the stable, already-executable fixture instead of
+            // copying a just-written executable and immediately exec'ing it.
+            // Linux overlay filesystems can otherwise transiently return
+            // ETXTBSY ("Text file busy") under parallel tests.
+            symlink(&fixture, &target).expect("link fake CLI fixture");
         }
         Self { root, bin_dir }
     }
