@@ -63,6 +63,16 @@ fn group_is_gone(group: i32) -> bool {
     killpg(Pid::from_raw(group), None).is_err()
 }
 
+async fn wait_group_gone(group: i32) {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !group_is_gone(group) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("process group must disappear");
+}
+
 #[tokio::test]
 async fn term_reaps_parent_and_grandchild_as_one_group() {
     let fixture = FakeSubscriptionCli::install();
@@ -122,4 +132,42 @@ async fn bounded_drain_aborts_a_task_that_never_finishes() {
         .await
         .unwrap_err();
     assert_eq!(err.reason_code(), "RELAY_CLEANUP_FAILED");
+}
+
+#[tokio::test]
+async fn cancelling_terminate_still_kills_the_owned_process_group() {
+    let fixture = FakeSubscriptionCli::install();
+    let marker = fixture.marker("ignore-term");
+    let (reaper, _) = spawn(&fixture, "ignore-term");
+    let group = reaper.process_group();
+    wait_marker(&marker, 1).await;
+
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(20),
+            reaper.terminate(Duration::from_secs(5)),
+        )
+        .await
+        .is_err()
+    );
+    wait_group_gone(group).await;
+}
+
+#[tokio::test]
+async fn cancelling_finish_after_parent_exit_still_kills_the_owned_process_group() {
+    let fixture = FakeSubscriptionCli::install();
+    let marker = fixture.marker("hang");
+    let (reaper, _) = spawn(&fixture, "hang");
+    let group = reaper.process_group();
+    wait_marker(&marker, 1).await;
+
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(20),
+            reaper.finish_after_parent_exit(Duration::from_secs(5)),
+        )
+        .await
+        .is_err()
+    );
+    wait_group_gone(group).await;
 }

@@ -28,6 +28,7 @@ mod imp {
     pub struct ProcessGroupReaper {
         child: Child,
         group: Pid,
+        armed: bool,
     }
 
     impl ProcessGroupReaper {
@@ -40,6 +41,7 @@ mod imp {
             Ok(Self {
                 child,
                 group: Pid::from_raw(raw),
+                armed: true,
             })
         }
 
@@ -66,6 +68,7 @@ mod imp {
             if cleanup_descendants(self.group, grace).await? {
                 escalated = true;
             }
+            self.armed = false;
             Ok(ReapOutcome {
                 exit_code: status.code(),
                 escalated_to_kill: escalated,
@@ -76,12 +79,39 @@ mod imp {
             mut self,
             grace: Duration,
         ) -> Result<ReapOutcome, SubscriptionRelayError> {
-            let status = self.child.wait().await.map_err(|_| cleanup_error())?;
-            let escalated = cleanup_descendants(self.group, grace).await?;
+            let (status, mut escalated) = match timeout(grace, self.child.wait()).await {
+                Ok(result) => (result.map_err(|_| cleanup_error())?, false),
+                Err(_) => {
+                    signal_group(self.group, Signal::SIGTERM)?;
+                    match timeout(grace, self.child.wait()).await {
+                        Ok(result) => (result.map_err(|_| cleanup_error())?, false),
+                        Err(_) => {
+                            signal_group(self.group, Signal::SIGKILL)?;
+                            let status = timeout(grace, self.child.wait())
+                                .await
+                                .map_err(|_| cleanup_error())?
+                                .map_err(|_| cleanup_error())?;
+                            (status, true)
+                        }
+                    }
+                }
+            };
+            if cleanup_descendants(self.group, grace).await? {
+                escalated = true;
+            }
+            self.armed = false;
             Ok(ReapOutcome {
                 exit_code: status.code(),
                 escalated_to_kill: escalated,
             })
+        }
+    }
+
+    impl Drop for ProcessGroupReaper {
+        fn drop(&mut self) {
+            if self.armed {
+                let _ = killpg(self.group, Some(Signal::SIGKILL));
+            }
         }
     }
 
