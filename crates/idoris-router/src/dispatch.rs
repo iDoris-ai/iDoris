@@ -307,6 +307,28 @@ impl Drop for CancelOnDrop {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct DispatchInput<'a> {
+    pub requested_model: Option<&'a str>,
+    pub prompt: &'a str,
+}
+
+impl<'a> DispatchInput<'a> {
+    pub fn new(prompt: &'a str) -> Self {
+        Self {
+            requested_model: None,
+            prompt,
+        }
+    }
+
+    pub fn with_model(requested_model: Option<&'a str>, prompt: &'a str) -> Self {
+        Self {
+            requested_model,
+            prompt,
+        }
+    }
+}
+
 /// Runs the local decision + execution path for one request: builds
 /// decision-time [`Card`]s from `cards` (R2-D simplification, see
 /// `candidate`), calls [`idoris_policy::decide`], reserves budget for a
@@ -326,17 +348,27 @@ pub async fn dispatch_local(
     supervisor: Option<&BoundSupervisor>,
     budget_ledger: Option<&BudgetLedger>,
     profile: &ParsedProfile,
-    prompt: &str,
+    input: DispatchInput<'_>,
     messages: Vec<ChatMessage>,
     cancel: CancellationToken,
 ) -> Result<ChatOutcome, DispatchError> {
     let tenant_id = profile.tenant_id.as_deref();
+    let prompt = input.prompt;
+    let requested_model = input.requested_model;
 
     // Scoped so `candidates`/`ctx` (which holds a `PolicyCtx<'_>` — not
     // `Send` because `dyn BudgetView` isn't `Sync` — see its own doc) are
     // dropped before any `.await` below; otherwise the whole function's
     // future would stop being `Send`, which axum's `Handler` trait requires.
-    let (decision, served_locality, model_id, load_policy, cost, estimated_cost_minor) = {
+    let (
+        decision,
+        served_locality,
+        provider_id,
+        backend_model_id,
+        load_policy,
+        cost,
+        estimated_cost_minor,
+    ) = {
         let candidates: Vec<Card> = cards.iter().map(|c| candidate(c, prompt)).collect();
         let request_profile = RequestProfile {
             task: profile.task.clone(),
@@ -377,10 +409,17 @@ pub async fn dispatch_local(
         // estimate, so this is always Some(v >= 0); unwrap_or(0) is
         // defense in depth, not a path expected to actually trigger.
         let estimated_cost_minor = chosen.estimated_cost_minor.unwrap_or(0);
+        let provider_id = chosen.id().to_string();
+        let backend_model_id = if profile.role.is_none() {
+            requested_model.unwrap_or(&provider_id).to_string()
+        } else {
+            provider_id.clone()
+        };
         (
             decision,
             served_locality,
-            chosen.id().to_string(),
+            provider_id,
+            backend_model_id,
             load_policy,
             chosen.component.provider.cost,
             estimated_cost_minor,
@@ -391,7 +430,7 @@ pub async fn dispatch_local(
     let mut reservation_guard = match ReservationGuard::reserve(
         budget_ledger,
         tenant_id,
-        &model_id,
+        &provider_id,
         estimated_cost_minor,
     ) {
         Ok(guard) => guard,
@@ -428,13 +467,40 @@ pub async fn dispatch_local(
     let _cancel_guard = CancelOnDrop(cancel.clone());
 
     let supervisor = &supervisor.handle;
+    // A concrete model id is caller-controlled. Validate it against the
+    // runtime catalog before load(): Supervisor eviction planning happens
+    // before an adapter can reject an unknown id, so skipping this preflight
+    // would let a bogus model name evict an unrelated warm model first.
+    if backend_model_id != provider_id {
+        let catalog = match supervisor.list().await {
+            Ok(models) => models,
+            Err(err) => {
+                return Ok(ChatOutcome {
+                    decision,
+                    served_locality,
+                    result: Err(DispatchFailure::Backend(err)),
+                    actual_cost_minor: None,
+                });
+            }
+        };
+        if !catalog.iter().any(|model| model.id == backend_model_id) {
+            return Ok(ChatOutcome {
+                decision,
+                served_locality,
+                result: Err(DispatchFailure::Backend(BackendError::model_not_found(
+                    backend_model_id,
+                ))),
+                actual_cost_minor: None,
+            });
+        }
+    }
     // `status.loaded` reports engine residency, which may have been
     // inherited after a Supervisor restart while the model is still in
     // Error (not yet adopted and policy-checked). Always pass through the
     // Supervisor's idempotent load path before chatting so it can establish
     // readiness and apply the requested policy.
     if let Err(err) = supervisor
-        .load(model_id.clone(), PLACEHOLDER_MEMORY_GB, load_policy)
+        .load(backend_model_id.clone(), PLACEHOLDER_MEMORY_GB, load_policy)
         .await
     {
         return Ok(ChatOutcome {
@@ -448,7 +514,7 @@ pub async fn dispatch_local(
     let chat_result = supervisor
         .chat(
             ChatRequest {
-                model: model_id,
+                model: backend_model_id,
                 messages,
             },
             cancel,
@@ -504,7 +570,9 @@ pub fn reason_header_value(reasons: &[ReasonCode]) -> String {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-    use idoris_backend::{MockAdapter, ModelInfo, RuntimeAdapter, Supervisor, SupervisorConfig};
+    use idoris_backend::{
+        BackendStatus, MockAdapter, ModelInfo, RuntimeAdapter, Supervisor, SupervisorConfig,
+    };
     use idoris_contracts::TaskProfile;
     use idoris_contracts::common::PrivacyClass;
     use idoris_contracts::common::Tier;
@@ -513,6 +581,47 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+
+    struct FailingListAdapter {
+        inner: MockAdapter,
+    }
+
+    #[async_trait::async_trait]
+    impl RuntimeAdapter for FailingListAdapter {
+        fn load_fence_path(&self) -> Result<std::path::PathBuf, BackendError> {
+            self.inner.load_fence_path()
+        }
+
+        async fn list(&self) -> Result<Vec<ModelInfo>, BackendError> {
+            Err(BackendError::Upstream {
+                message: "catalog unavailable".into(),
+            })
+        }
+
+        async fn load(&self, id: &str, policy: Option<&LoadPolicy>) -> Result<(), BackendError> {
+            self.inner.load(id, policy).await
+        }
+
+        async fn unload(&self, id: &str) -> Result<(), BackendError> {
+            self.inner.unload(id).await
+        }
+
+        async fn status(&self) -> Result<BackendStatus, BackendError> {
+            self.inner.status().await
+        }
+
+        async fn probe_ready(&self, id: &str) -> Result<bool, BackendError> {
+            self.inner.probe_ready(id).await
+        }
+
+        async fn chat(
+            &self,
+            req: ChatRequest,
+            cancel: CancellationToken,
+        ) -> Result<ChatResponse, BackendError> {
+            self.inner.chat(req, cancel).await
+        }
+    }
 
     fn local_card(id: &str) -> ComponentCard {
         ComponentCard {
@@ -557,7 +666,7 @@ mod tests {
             None,
             None,
             &empty_profile(),
-            "",
+            DispatchInput::new(""),
             Vec::new(),
             CancellationToken::new(),
         )
@@ -576,7 +685,7 @@ mod tests {
             None,
             None,
             &empty_profile(),
-            "",
+            DispatchInput::new(""),
             Vec::new(),
             CancellationToken::new(),
         )
@@ -608,7 +717,7 @@ mod tests {
             Some(&supervisor),
             None,
             &empty_profile(),
-            "hello",
+            DispatchInput::new("hello"),
             messages,
             CancellationToken::new(),
         )
@@ -619,6 +728,139 @@ mod tests {
         let response = outcome.result.unwrap();
         assert_eq!(response.model, "a");
         assert!(response.content.contains("hello"));
+    }
+
+    #[tokio::test]
+    async fn concrete_model_is_dispatched_separately_from_provider_id() {
+        let card = local_card("omlx");
+        let adapter = Arc::new(MockAdapter::new(vec![ModelInfo {
+            id: "Qwen3-0.6B-4bit".to_string(),
+            memory_gb: 1.0,
+        }]));
+        let supervisor = Supervisor::spawn(adapter.clone(), SupervisorConfig::default()).unwrap();
+        let supervisor = BoundSupervisor::new(&card, supervisor);
+        let outcome = dispatch_local(
+            std::slice::from_ref(&card),
+            Some(&supervisor),
+            None,
+            &empty_profile(),
+            DispatchInput::with_model(Some("Qwen3-0.6B-4bit"), "hello"),
+            vec![ChatMessage {
+                role: "user".to_string(),
+                content: "hello".to_string(),
+            }],
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        let response = outcome.result.unwrap();
+        assert_eq!(response.model, "Qwen3-0.6B-4bit");
+        assert_eq!(adapter.load_call_count("Qwen3-0.6B-4bit"), 1);
+        assert_eq!(adapter.load_call_count("omlx"), 0);
+    }
+
+    #[tokio::test]
+    async fn unknown_concrete_model_is_rejected_without_provider_fallback() {
+        let card = local_card("omlx");
+        let adapter = Arc::new(MockAdapter::new(vec![ModelInfo {
+            id: "Qwen3-0.6B-4bit".to_string(),
+            memory_gb: 1.0,
+        }]));
+        let supervisor = Supervisor::spawn(adapter.clone(), SupervisorConfig::default()).unwrap();
+        let supervisor = BoundSupervisor::new(&card, supervisor);
+        let outcome = dispatch_local(
+            std::slice::from_ref(&card),
+            Some(&supervisor),
+            None,
+            &empty_profile(),
+            DispatchInput::with_model(Some("missing-model"), ""),
+            Vec::new(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        match outcome.result.unwrap_err() {
+            DispatchFailure::Backend(err) => assert_eq!(err.reason_code(), "model_not_found"),
+            other => panic!("expected Backend(model_not_found), got {other:?}"),
+        }
+        assert_eq!(adapter.load_call_count("omlx"), 0);
+    }
+
+    #[tokio::test]
+    async fn unknown_concrete_model_never_evicts_an_existing_warm_model() {
+        let card = local_card("omlx");
+        let adapter = Arc::new(MockAdapter::new(vec![ModelInfo {
+            id: "warm".to_string(),
+            memory_gb: 1.0,
+        }]));
+        let warm_policy = default_load_policy();
+        adapter.load("warm", Some(&warm_policy)).await.unwrap();
+        let supervisor = Supervisor::spawn(
+            adapter.clone(),
+            SupervisorConfig {
+                budget_gb: 1.0,
+                ..SupervisorConfig::default()
+            },
+        )
+        .unwrap();
+        let supervisor = BoundSupervisor::new(&card, supervisor);
+
+        let outcome = dispatch_local(
+            std::slice::from_ref(&card),
+            Some(&supervisor),
+            None,
+            &empty_profile(),
+            DispatchInput::with_model(Some("missing-model"), ""),
+            Vec::new(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        match outcome.result.unwrap_err() {
+            DispatchFailure::Backend(err) => assert_eq!(err.reason_code(), "model_not_found"),
+            other => panic!("expected Backend(model_not_found), got {other:?}"),
+        }
+        assert_eq!(adapter.load_call_count("missing-model"), 0);
+        assert_eq!(adapter.unload_call_count("warm"), 0);
+        assert!(
+            adapter
+                .status()
+                .await
+                .unwrap()
+                .loaded
+                .contains(&"warm".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn catalog_failure_fails_closed_before_any_concrete_model_load() {
+        let card = local_card("omlx");
+        let adapter = Arc::new(FailingListAdapter {
+            inner: MockAdapter::new(vec![ModelInfo {
+                id: "known".to_string(),
+                memory_gb: 1.0,
+            }]),
+        });
+        let supervisor = Supervisor::spawn(adapter.clone(), SupervisorConfig::default()).unwrap();
+        let supervisor = BoundSupervisor::new(&card, supervisor);
+        let outcome = dispatch_local(
+            std::slice::from_ref(&card),
+            Some(&supervisor),
+            None,
+            &empty_profile(),
+            DispatchInput::with_model(Some("known"), ""),
+            Vec::new(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        match outcome.result.unwrap_err() {
+            DispatchFailure::Backend(err) => assert_eq!(err.reason_code(), "upstream_error"),
+            other => panic!("expected Backend(upstream_error), got {other:?}"),
+        }
+        assert_eq!(adapter.inner.load_call_count("known"), 0);
     }
 
     #[tokio::test]
@@ -656,7 +898,7 @@ mod tests {
                 Some(&supervisor),
                 None,
                 &empty_profile(),
-                "hello",
+                DispatchInput::new("hello"),
                 messages.clone(),
                 CancellationToken::new(),
             )
@@ -719,7 +961,7 @@ mod tests {
             Some(&supervisor),
             Some(&ledger),
             &profile,
-            "hi",
+            DispatchInput::new("hi"),
             Vec::new(),
             CancellationToken::new(),
         )
@@ -747,7 +989,7 @@ mod tests {
             Some(&supervisor),
             Some(&ledger),
             &empty_profile(),
-            "hi",
+            DispatchInput::new("hi"),
             Vec::new(),
             CancellationToken::new(),
         )
@@ -770,7 +1012,7 @@ mod tests {
             None,
             Some(&ledger),
             &empty_profile(),
-            "hi",
+            DispatchInput::new("hi"),
             Vec::new(),
             CancellationToken::new(),
         )
@@ -792,7 +1034,7 @@ mod tests {
             None,
             Some(&ledger),
             &empty_profile(),
-            "hi",
+            DispatchInput::new("hi"),
             Vec::new(),
             CancellationToken::new(),
         )
@@ -826,7 +1068,7 @@ mod tests {
             Some(&supervisor),
             Some(&ledger),
             &empty_profile(),
-            "hi",
+            DispatchInput::new("hi"),
             messages,
             CancellationToken::new(),
         )
@@ -875,7 +1117,7 @@ mod tests {
                 Some(&supervisor),
                 Some(&ledger),
                 &empty_profile(),
-                "hi",
+                DispatchInput::new("hi"),
                 messages,
                 cancel.clone(),
             ),

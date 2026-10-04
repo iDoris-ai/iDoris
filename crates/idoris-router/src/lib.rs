@@ -631,18 +631,13 @@ async fn chat_completions(
         }
     }
 
-    // Concrete model IDs are informational in the iDoris × Agent24 contract;
-    // callers select a stable role and iDoris chooses its model. For this
-    // Supervisor-bound path we can verify that an explicit concrete ID names
-    // the selected card. Do so after selection so the response truthfully
-    // reports the selected locality. Resident HTTP proxies retain upstream
-    // model handling above (including arbitrary conformance fixture IDs).
+    // A present model field must be a non-empty string. Concrete model ids
+    // are forwarded to the selected lifecycle backend below; role aliases
+    // continue to use the selected provider id until B2 supplies role→model
+    // binding.
     if let Ok(selected) = dispatch::select(&cards, &parsed, &prompt)
         && object.contains_key("model")
-        && (model.is_none_or(str::is_empty)
-            || model.is_some_and(|requested_model| {
-                parsed.role.is_none() && requested_model != selected.card.provider.id
-            }))
+        && model.is_none_or(str::is_empty)
     {
         let requested_model = model.unwrap_or("");
         let mut response = error_envelope_with_reason(
@@ -650,8 +645,7 @@ async fn chat_completions(
             "unsupported_field",
             "unsupported_model",
             format!(
-                "model '{requested_model}' is not a supported role alias or the selected model '{}'; use a supported idoris/<role> alias or the selected provider.id",
-                selected.card.provider.id
+                "model '{requested_model}' must be a non-empty string or a supported idoris/<role> alias"
             ),
         );
         if let Ok(value) = HeaderValue::from_str(locality_str(selected.served_locality)) {
@@ -690,7 +684,7 @@ async fn chat_completions(
         supervisor,
         budget_ledger,
         &parsed,
-        &prompt,
+        dispatch::DispatchInput::with_model(model, &prompt),
         messages,
         tokio_util::sync::CancellationToken::new(),
     )

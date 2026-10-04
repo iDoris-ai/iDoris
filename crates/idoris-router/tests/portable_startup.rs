@@ -116,11 +116,6 @@ async fn bundled_config_starts_from_an_unrelated_working_directory() {
             "unsupported_parameter",
         ),
         ("max_tokens", serde_json::json!(64), "unsupported_parameter"),
-        (
-            "model",
-            serde_json::json!("another-model"),
-            "unsupported_model",
-        ),
     ] {
         let mut body = serde_json::json!({
             "model": "idoris/daily",
@@ -149,6 +144,24 @@ async fn bundled_config_starts_from_an_unrelated_working_directory() {
                 .contains(field)
         );
     }
+
+    // Task 15: a concrete model id is no longer required to equal the
+    // provider id. It reaches the selected backend, which is unavailable in
+    // this portable-startup fixture, and therefore fails closed as a backend
+    // error instead of being rejected as an unsupported field.
+    let response = client
+        .post(format!("http://127.0.0.1:{port}/v1/chat/completions"))
+        .json(&serde_json::json!({
+            "model": "another-model",
+            "messages": [{"role":"user","content":"hi"}]
+        }))
+        .timeout(Duration::from_secs(5))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+    let error: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(error["error"]["type"], "local_only_unavailable");
 }
 
 #[test]

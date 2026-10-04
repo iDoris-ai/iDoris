@@ -218,7 +218,7 @@ async fn local_only_request_cannot_use_policy_selected_remote_candidate() {
 }
 
 #[tokio::test]
-async fn concrete_model_validation_uses_the_policy_filtered_candidate() {
+async fn concrete_model_is_not_rewritten_to_the_policy_selected_provider() {
     let upstream = MockServer::start().await;
     Mock::given(method("POST"))
         .respond_with(ResponseTemplate::new(200))
@@ -249,10 +249,13 @@ async fn concrete_model_validation_uses_the_policy_filtered_candidate() {
     .await
     .unwrap();
 
-    assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+    assert_eq!(
+        response.status(),
+        axum::http::StatusCode::SERVICE_UNAVAILABLE
+    );
     let bytes = response.into_body().collect().await.unwrap().to_bytes();
     let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(json["error"]["reason_code"], "unsupported_model");
+    assert_eq!(json["error"]["reason_code"], "model_not_found");
     assert_eq!(adapter.load_call_count("z-remote"), 0);
     upstream.verify().await;
 }
