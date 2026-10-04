@@ -1140,6 +1140,10 @@ name = "idoris-recommender"
 version = "0.1.0"
 dependencies = [
  "idoris-contracts",
+ "idoris-policy",
+ "serde",
+ "serde_json",
+ "serde_yaml",
 ]
 
 [[package]]
