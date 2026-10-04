@@ -114,3 +114,54 @@ B的RAM矩阵、目录解析、角色/量化、输出与消费接口全部用注
 A2可立即采集，不必等B2写完；B1消费冒烟等接口发布及接线后再做。A以catalog/校准数据PR反馈，B完成业务修改；不直接push对方分支。涉及oMLX实测使用既有 `IDORIS_OMLX_IT=1` opt-in 流程，只在A连接真实实例。B2纯逻辑release可以先行，但实际默认模型、校准承诺及R6切换需附A实测结论，未测不能标已通过。
 
 本次规划核验：已读指定规范与B1计划，已执行§0 Rust/TS全量门禁并通过；TS推荐器50例通过，TS conformance为47 passed / 7 todo。cargo-deny通过但有已有依赖警告，未在文档任务中升级依赖；未改变路由行为，未跑Rust HTTP conformance；未做A实机验证。本次提交仅此计划文件。
+
+## 5. 2026-10-04 handoff / release evidence
+
+### Task status
+
+- tasks 01–20：已合并到 `feat/recommender-rs`。
+- task 21：本节 + crate README/metadata 收口；不新增生产行为。
+- Rust 是后续唯一维护实现；`packages/recommender` 保留为参考/PoC 与 fixture 真值来源，不再承载新的产品功能。
+
+### Published consumer contract
+
+- `catalog::{Catalog, CatalogModel, load_catalog}`
+- `probe::{HostFacts, HostProbe, inspect_host}`
+- `memory::{KvQuant, footprint_gb, apple_usable_gb}`
+- `recommend::{Recommendation, RecommenderPolicy, recommend, recommend_from_file}`
+- `model::{ModelEstimate, estimate_model, candidates_for_role}`
+
+B1 task33 应只消费这些公开边界，不复制推荐算法。模型运行时绑定仍由
+B1 保存显式 `provider_id + catalog_id + quant -> backend_model_id` 关系；
+未知绑定 fail closed，不能回退 provider id 或固定 1GB。
+
+### TS baseline / allowed differences
+
+共享 fixture 记录的参考提交为
+`49a66e86e65e9ddf26f3bf3c9d68041df49d8981`。Rust 对有效输入保持输出、
+顺序、告警文本和数值 parity；错误类型可使用 Rust 结构化错误，不复刻 JS
+TypeError/stack。加载边界对 zero/non-finite ctx/footprint 的 fail-closed 是
+允许的 Rust 安全收紧，不反向修改 TS。
+
+### Verification completed on B
+
+- `cargo fmt --all -- --check`：通过。
+- `cargo clippy -p idoris-recommender --all-targets -- -D warnings`：通过。
+- `cargo test -p idoris-recommender`：通过（含 TS fixture parity、model API、capacity consumer）。
+- task17 parity 覆盖 24GB full + 8/16/32/64/128GB projection + edge scenarios。
+- task18 证明模型/量化/ctx 改变真实 footprint，provider id 不能冒充 catalog id。
+- task19 证明 B1 七字段 capacity 映射使用 full footprint，forced resident+blocked 不去重。
+
+### Not yet real-hardware verified
+
+- 未把 injected 64GB facts 解释为 M1 Max 实机探测。
+- 未完成真实 oMLX 多模型 load/chat/status 的 catalog-id/runtime-id 绑定验收。
+- 未完成实际运行峰值与公式 footprint 的 A2 校准。
+- 未完成 B1 task33 live backend queue/capabilities 端到端验收。
+
+### A-machine calibration handoff
+
+在 M1 Max 64GB 上按 §4 表格记录 exact repo/catalog SHA、oMLX 版本、真实
+runtime model id、quant、ctx/KV、baseline/load/prefill/long-generation/unload
+内存读数。至少覆盖 fast、daily、deep 三档；预测与实测有偏差时记录分项原因，
+不得用“mock 已过”替代实机结论。
