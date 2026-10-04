@@ -1,6 +1,8 @@
 //! SQLite usage/audit storage. Every record access requires tenant scope;
 //! schema initialization alone does not expose a tenant CRUD interface.
 
+use std::path::Path;
+
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 use serde_json::{Map, Value};
 use thiserror::Error;
@@ -60,6 +62,10 @@ pub struct TenantStore {
 }
 
 impl TenantStore {
+    pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
+        Self::new(Connection::open(path)?)
+    }
+
     pub fn new(mut conn: Connection) -> Result<Self, StoreError> {
         initialize_record_schema(&mut conn)?;
         Ok(Self { conn })

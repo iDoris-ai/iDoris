@@ -49,6 +49,7 @@ fn spawn(exe: &Path, cwd: &Path, port: u16, env: &[(&str, &str)]) -> Running {
     Running(Some(
         cmd.current_dir(cwd)
             .env("IDORIS_PORT", port.to_string())
+            .env("IDORIS_DB_PATH", cwd.join("idoris-test.sqlite3"))
             .envs(env.iter().copied())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -183,4 +184,32 @@ fn explicit_missing_paths_do_not_fall_back_and_subscription_remains_rejected() {
     )
     .unwrap();
     failed(spawn(&exe, cwd.path(), port, &[]), "subscription");
+}
+
+#[test]
+fn explicit_storage_failures_do_not_fall_back() {
+    let (_root, cwd, exe, port) = fixture();
+    let blocker = cwd.path().join("not-a-directory");
+    fs::write(&blocker, "file").unwrap();
+    let bad_db = blocker.join("db.sqlite3");
+    let bad_db = bad_db.to_str().unwrap();
+    failed(
+        spawn(&exe, cwd.path(), port, &[("IDORIS_DB_PATH", bad_db)]),
+        "无法初始化持久化存储",
+    );
+
+    let missing = cwd.path().join("missing-tenants.yaml");
+    let missing = missing.to_str().unwrap();
+    failed(
+        spawn(
+            &exe,
+            cwd.path(),
+            port,
+            &[
+                ("IDORIS_DEPLOY_MODE", "tenant"),
+                ("IDORIS_TENANTS_CONFIG", missing),
+            ],
+        ),
+        "无法初始化持久化存储",
+    );
 }
