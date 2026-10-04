@@ -96,6 +96,24 @@ impl KvQuant {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WiredMode {
+    Conservative,
+    Moderate,
+    Aggressive,
+}
+
+impl WiredMode {
+    pub const fn fraction(self) -> f64 {
+        match self {
+            Self::Conservative => 0.66,
+            Self::Moderate => 0.70,
+            Self::Aggressive => 0.75,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelArch {
     pub n_layers: u32,
     pub n_kv_heads: u32,
@@ -162,4 +180,16 @@ pub fn footprint_gb(
     Ok(weights_gb(params_total_b, quant)?
         + kv_cache_gb(arch, ctx, kv_quant)
         + overhead_gb.unwrap_or(DEFAULT_OVERHEAD_GB))
+}
+
+pub fn apple_reserve_gb(ram_gb: f64) -> f64 {
+    (ram_gb * 0.30).clamp(3.0, 16.0)
+}
+
+pub fn apple_usable_gb(ram_gb: f64, mode: WiredMode) -> f64 {
+    (ram_gb * mode.fraction()).min(ram_gb - apple_reserve_gb(ram_gb))
+}
+
+pub fn recommended_wired_limit_mb(usable_gb: f64) -> i64 {
+    (usable_gb * 1024.0).round() as i64
 }
