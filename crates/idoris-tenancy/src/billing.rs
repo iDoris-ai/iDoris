@@ -6,10 +6,293 @@
 pub mod period;
 pub use period::{BillingError, BillingPeriodRange, resolve_billing_period_range};
 
+use chrono::{DateTime, SecondsFormat, Utc};
+use idoris_contracts::tenant::TenantContext;
+use serde::Serialize;
+use serde_json::Value;
+
+use crate::store::{RecordKind, StoreError, TenantRecord, TenantStore};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UsageSource {
+    Usage,
+    Audit,
+}
+
+impl UsageSource {
+    fn record_kind(self) -> RecordKind {
+        match self {
+            Self::Usage => RecordKind::Usage,
+            Self::Audit => RecordKind::Audit,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct UsageTotals {
+    pub cost_minor: f64,
+    pub tokens_in: f64,
+    pub tokens_out: f64,
+    pub calls: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RangeUtc {
+    pub from: String,
+    pub to: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct MonthlyUsage {
+    pub tenant_id: String,
+    pub period: String,
+    pub billing_timezone: String,
+    pub range_utc: RangeUtc,
+    pub totals: UsageTotals,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum BillingAggregateError {
+    #[error(transparent)]
+    Period(#[from] BillingError),
+    #[error(transparent)]
+    Store(#[from] StoreError),
+    #[error("billing query requires tenant context")]
+    ScopeRequired,
+    #[error("record {record_id:?} field {field:?} must be a finite number")]
+    InvalidRecord {
+        record_id: String,
+        field: &'static str,
+    },
+    #[error("billing range is outside the supported UTC timestamp range")]
+    InvalidRange,
+}
+
+pub fn aggregate_usage_records(
+    records: &[TenantRecord],
+    range: BillingPeriodRange,
+) -> Result<UsageTotals, BillingAggregateError> {
+    let mut totals = UsageTotals {
+        cost_minor: 0.0,
+        tokens_in: 0.0,
+        tokens_out: 0.0,
+        calls: 0,
+    };
+    for record in records {
+        let ts = required_number(record, "ts_utc")?;
+        if ts < range.from as f64 || ts >= range.to as f64 {
+            continue;
+        }
+        totals.calls = totals.calls.saturating_add(1);
+        totals.cost_minor += optional_number(record, "cost_minor")?;
+        totals.tokens_in += optional_number(record, "tokens_in")?;
+        totals.tokens_out += optional_number(record, "tokens_out")?;
+    }
+    Ok(totals)
+}
+
+pub fn query_monthly_usage(
+    store: &TenantStore,
+    context: Option<&TenantContext>,
+    period: &str,
+    source: Option<UsageSource>,
+) -> Result<MonthlyUsage, BillingAggregateError> {
+    let context = context.ok_or(BillingAggregateError::ScopeRequired)?;
+    let source = source.unwrap_or(UsageSource::Usage);
+    let records = store.list(Some(&context.tenant_id), Some(source.record_kind()))?;
+    let range = resolve_billing_period_range(period, &context.billing_timezone)?;
+    Ok(MonthlyUsage {
+        tenant_id: context.tenant_id.clone(),
+        period: period.to_string(),
+        billing_timezone: context.billing_timezone.clone(),
+        range_utc: RangeUtc {
+            from: iso_utc(range.from)?,
+            to: iso_utc(range.to)?,
+        },
+        totals: aggregate_usage_records(&records, range)?,
+    })
+}
+
+fn required_number(
+    record: &TenantRecord,
+    field: &'static str,
+) -> Result<f64, BillingAggregateError> {
+    record
+        .payload
+        .get(field)
+        .and_then(Value::as_f64)
+        .filter(|value| value.is_finite())
+        .ok_or_else(|| BillingAggregateError::InvalidRecord {
+            record_id: record.record_id.clone(),
+            field,
+        })
+}
+
+fn optional_number(
+    record: &TenantRecord,
+    field: &'static str,
+) -> Result<f64, BillingAggregateError> {
+    match record.payload.get(field) {
+        None | Some(Value::Null) => Ok(0.0),
+        Some(value) => value
+            .as_f64()
+            .filter(|value| value.is_finite())
+            .ok_or_else(|| BillingAggregateError::InvalidRecord {
+                record_id: record.record_id.clone(),
+                field,
+            }),
+    }
+}
+
+fn iso_utc(epoch_ms: i64) -> Result<String, BillingAggregateError> {
+    DateTime::<Utc>::from_timestamp_millis(epoch_ms)
+        .map(|value| value.to_rfc3339_opts(SecondsFormat::Secs, true))
+        .ok_or(BillingAggregateError::InvalidRange)
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::store::{RecordKind, TenantRecord};
+    use idoris_contracts::tenant::{Budget, BudgetScope};
+    use rusqlite::Connection;
+    use serde_json::{Map, json};
+
+    fn tenant() -> TenantContext {
+        TenantContext {
+            tenant_id: "acme-co".into(),
+            budget: Budget {
+                limit_minor: 5_000_000,
+                spent_minor: 1_234_567,
+                scope: BudgetScope::PaidOnly,
+            },
+            billing_timezone: "Asia/Bangkok".into(),
+            quota: None,
+        }
+    }
+
+    fn record(
+        kind: RecordKind,
+        id: &str,
+        ts: i64,
+        cost: i64,
+        input: i64,
+        output: i64,
+    ) -> TenantRecord {
+        let mut payload = Map::new();
+        payload.insert("ts_utc".into(), json!(ts));
+        payload.insert("cost_minor".into(), json!(cost));
+        payload.insert("tokens_in".into(), json!(input));
+        payload.insert("tokens_out".into(), json!(output));
+        TenantRecord {
+            tenant_id: "acme-co".into(),
+            kind,
+            record_id: id.into(),
+            request_id: id.into(),
+            origin_record_id: None,
+            payload,
+        }
+    }
+
+    fn put_fixture(store: &TenantStore, kind: RecordKind) {
+        for row in [
+            record(kind, "in-month", 1_789_430_400_000, 100, 1000, 500),
+            record(kind, "boundary-start", 1_788_197_400_000, 1, 10, 1),
+            record(kind, "boundary-end", 1_790_785_800_000, 2, 20, 2),
+            record(kind, "just-after-oct", 1_790_789_400_000, 1000, 9999, 9999),
+            record(kind, "just-before-sep", 1_788_193_800_000, 1000, 9999, 9999),
+        ] {
+            store.put(Some("acme-co"), &row).unwrap();
+        }
+    }
+
+    #[test]
+    fn monthly_usage_matches_the_ts_bangkok_fixture_and_half_open_edges() {
+        let store = TenantStore::new(Connection::open_in_memory().unwrap()).unwrap();
+        put_fixture(&store, RecordKind::Usage);
+        let usage = query_monthly_usage(&store, Some(&tenant()), "2026-09", None).unwrap();
+        assert_eq!(usage.tenant_id, "acme-co");
+        assert_eq!(usage.period, "2026-09");
+        assert_eq!(usage.billing_timezone, "Asia/Bangkok");
+        assert_eq!(usage.range_utc.from, "2026-08-31T17:00:00Z");
+        assert_eq!(usage.range_utc.to, "2026-09-30T17:00:00Z");
+        assert_eq!(
+            usage.totals,
+            UsageTotals {
+                cost_minor: 103.0,
+                tokens_in: 1030.0,
+                tokens_out: 503.0,
+                calls: 3
+            }
+        );
+    }
+
+    #[test]
+    fn explicit_audit_source_never_double_counts_usage_rows() {
+        let store = TenantStore::new(Connection::open_in_memory().unwrap()).unwrap();
+        put_fixture(&store, RecordKind::Usage);
+        put_fixture(&store, RecordKind::Audit);
+        let usage = query_monthly_usage(&store, Some(&tenant()), "2026-09", None).unwrap();
+        let audit =
+            query_monthly_usage(&store, Some(&tenant()), "2026-09", Some(UsageSource::Audit))
+                .unwrap();
+        assert_eq!(usage.totals.cost_minor, 103.0);
+        assert_eq!(audit.totals, usage.totals);
+    }
+
+    #[test]
+    fn exact_from_is_included_and_exact_to_is_excluded() {
+        let store = TenantStore::new(Connection::open_in_memory().unwrap()).unwrap();
+        let range = resolve_billing_period_range("2026-09", "Asia/Bangkok").unwrap();
+        for row in [
+            record(RecordKind::Usage, "at-from", range.from, 7, 1, 1),
+            record(RecordKind::Usage, "at-to", range.to, 99, 9, 9),
+        ] {
+            store.put(Some("acme-co"), &row).unwrap();
+        }
+        let usage = query_monthly_usage(&store, Some(&tenant()), "2026-09", None).unwrap();
+        assert_eq!(usage.totals.cost_minor, 7.0);
+        assert_eq!(usage.totals.calls, 1);
+    }
+
+    #[test]
+    fn malformed_time_and_in_range_numeric_fields_fail_closed() {
+        let store = TenantStore::new(Connection::open_in_memory().unwrap()).unwrap();
+        let mut bad_time = record(RecordKind::Usage, "bad-time", 1_789_430_400_000, 1, 1, 1);
+        bad_time
+            .payload
+            .insert("ts_utc".into(), json!("not-a-time"));
+        store.put(Some("acme-co"), &bad_time).unwrap();
+        assert!(matches!(
+            query_monthly_usage(&store, Some(&tenant()), "2026-09", None),
+            Err(BillingAggregateError::InvalidRecord {
+                field: "ts_utc",
+                ..
+            })
+        ));
+
+        let store = TenantStore::new(Connection::open_in_memory().unwrap()).unwrap();
+        let mut bad_cost = record(RecordKind::Usage, "bad-cost", 1_789_430_400_000, 1, 1, 1);
+        bad_cost.payload.insert("cost_minor".into(), json!("1"));
+        store.put(Some("acme-co"), &bad_cost).unwrap();
+        assert!(matches!(
+            query_monthly_usage(&store, Some(&tenant()), "2026-09", None),
+            Err(BillingAggregateError::InvalidRecord {
+                field: "cost_minor",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn missing_scope_is_rejected_before_any_unscoped_query() {
+        let store = TenantStore::new(Connection::open_in_memory().unwrap()).unwrap();
+        assert!(matches!(
+            query_monthly_usage(&store, None, "2026-09", None),
+            Err(BillingAggregateError::ScopeRequired)
+        ));
+    }
 
     #[test]
     fn bangkok_boundary_is_exact_and_differs_from_utc() {
