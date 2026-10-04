@@ -67,6 +67,20 @@ async fn combined_stdout_stderr_limit_counts_bytes_not_characters() {
 }
 
 #[tokio::test]
+async fn combined_limit_is_shared_across_stdout_and_stderr() {
+    let fixture = FakeSubscriptionCli::install();
+    let err = run_process(
+        &spec(fixture.program("claude"), None),
+        fixture.bin_dir(),
+        &env("split-output"),
+        11,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.reason_code(), "RELAY_OUTPUT_LIMIT");
+}
+
+#[tokio::test]
 async fn large_stderr_and_large_stdin_are_drained_concurrently_without_deadlock() {
     let dir = tempfile::TempDir::new().unwrap();
     let script = dir.path().join("pressure.sh");
