@@ -81,6 +81,25 @@ export function makeRoutingPolicyFile(content: string): string {
   return path;
 }
 
+/** Trusted local tenant configuration for Rust storage/bootstrap parity tests. */
+export function makeTenantConfigFile(
+  tenants: ReadonlyArray<{ tenantId: string; limitMinor?: number; billingTimezone?: string; scope?: "paid_only" | "all" }>,
+): string {
+  const dir = mkdtempSync(join(tmpdir(), "idoris-conformance-tenants-"));
+  const path = join(dir, "tenants.yaml");
+  const lines = ["tenants:"];
+  for (const tenant of tenants) {
+    lines.push(
+      "  - tenant_id: " + tenant.tenantId,
+      "    limit_minor: " + String(tenant.limitMinor ?? 1_000_000),
+      "    billing_timezone: " + (tenant.billingTimezone ?? "UTC"),
+      "    scope: " + (tenant.scope ?? "paid_only"),
+    );
+  }
+  writeFileSync(path, lines.join("\n") + "\n", "utf8");
+  return path;
+}
+
 /** 便利构造：单个 loopback + local_only 的可信本地组件，指向给定假上游 URL。 */
 export function localComponent(endpoint: string, extra: Partial<ComponentCardSpec> = {}): ComponentCardSpec {
   return {
