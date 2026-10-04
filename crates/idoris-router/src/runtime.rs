@@ -45,6 +45,31 @@ impl RuntimeRegistry {
     pub fn is_empty(&self) -> bool {
         self.supervisors.is_empty()
     }
+
+    pub async fn queue_depth(&self) -> u64 {
+        let mut depth = 0_u64;
+        for (provider_id, supervisor) in &self.supervisors {
+            depth = add_status_depth(depth, provider_id, supervisor.status().await);
+        }
+        depth
+    }
+}
+
+fn add_status_depth(
+    depth: u64,
+    provider_id: &str,
+    status: Result<idoris_backend::BackendStatus, idoris_backend::BackendError>,
+) -> u64 {
+    match status {
+        Ok(status) => depth.saturating_add(status.loaded.len() as u64),
+        Err(error) => {
+            eprintln!(
+                "[idoris] capabilities: provider {provider_id} status failed ({}), excluded from queue depth",
+                error.reason_code()
+            );
+            depth
+        }
+    }
 }
 
 impl From<BoundSupervisor> for RuntimeRegistry {
@@ -238,5 +263,22 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(healthy.result.unwrap().model, "a");
+    }
+
+    #[test]
+    fn queue_depth_excludes_a_failed_backend_without_losing_healthy_depth() {
+        let healthy = idoris_backend::BackendStatus {
+            pressure: idoris_backend::Pressure::Ok,
+            used_gb: 2.0,
+            model_memory_max_gb: 24.0,
+            loaded: vec!["a".into(), "b".into()],
+        };
+        let depth = add_status_depth(0, "healthy", Ok(healthy));
+        let depth = add_status_depth(
+            depth,
+            "failed",
+            Err(idoris_backend::BackendError::supervisor_unavailable()),
+        );
+        assert_eq!(depth, 2);
     }
 }

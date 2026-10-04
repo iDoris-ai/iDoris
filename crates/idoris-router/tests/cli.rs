@@ -42,6 +42,7 @@ fn serve_reports_an_actionable_port_conflict() {
             "IDORIS_ROUTING_POLICY",
             repo.join("config/routing-policy.yaml"),
         )
+        .env("IDORIS_CATALOG", repo.join("config/catalog.yaml"))
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(1));

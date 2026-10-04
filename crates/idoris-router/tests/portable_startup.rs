@@ -25,7 +25,11 @@ fn fixture() -> (TempDir, TempDir, std::path::PathBuf, u16) {
     fs::create_dir_all(bin.join("config/components")).unwrap();
     fs::copy(env!("CARGO_BIN_EXE_idoris"), bin.join("idoris")).unwrap();
     let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config");
-    for file in ["components/omlx.yaml", "routing-policy.yaml"] {
+    for file in [
+        "components/omlx.yaml",
+        "routing-policy.yaml",
+        "catalog.yaml",
+    ] {
         let raw = fs::read_to_string(repo.join(file)).unwrap();
         fs::write(bin.join("config").join(file), raw.replace(":8000", ":0")).unwrap();
     }

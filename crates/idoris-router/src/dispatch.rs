@@ -7,7 +7,9 @@
 //! that calls `dispatch_local`, not here (this module has no axum/HTTP
 //! dependency on purpose, so it's testable without spinning up the app).
 
-use idoris_backend::{BackendError, ChatMessage, ChatRequest, ChatResponse, SupervisorHandle};
+use idoris_backend::{
+    BackendError, BackendStatus, ChatMessage, ChatRequest, ChatResponse, SupervisorHandle,
+};
 use idoris_contracts::ComponentCard;
 use idoris_contracts::load_policy::{Admission, Keepalive, LoadMode, LoadPolicy};
 use idoris_contracts::provider::Locality;
@@ -43,6 +45,10 @@ impl BoundSupervisor {
 
     pub(crate) fn provider_id(&self) -> &str {
         &self.provider_id
+    }
+
+    pub(crate) async fn status(&self) -> Result<BackendStatus, BackendError> {
+        self.handle.status().await
     }
 
     /// Constructs the adapter from the same card used for the binding.

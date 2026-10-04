@@ -36,6 +36,7 @@ fi
 # 与 release 布局一致：默认策略从可执行文件旁读取，而非仓库 cwd。
 mkdir -p "$(dirname "$bin")/config"
 cp config/routing-policy.yaml "$(dirname "$bin")/config/routing-policy.yaml"
+cp config/catalog.yaml "$(dirname "$bin")/config/catalog.yaml"
 
 # 正式走 task34 的 `serve` 入口；裸启动继续由 portable_startup 锁定兼容性。
 export IDORIS_CONFORMANCE_CMD="$bin serve"
