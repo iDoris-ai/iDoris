@@ -388,4 +388,21 @@ mod tests {
             Err(AuditError::FieldTooLong { .. })
         ));
     }
+
+    #[test]
+    fn audit_once_rejects_duplicate_finish_without_duplicate_write() {
+        let store = TenantStore::new(Connection::open_in_memory().unwrap()).unwrap();
+        let writer = AuditWriter::new(&store);
+        let once = AuditOnce::default();
+        let payload = input("intent_match: routed");
+        once.finish(&writer, "acme", "record-1", None, &payload)
+            .unwrap();
+        assert!(matches!(
+            once.finish(&writer, "acme", "record-1", None, &payload),
+            Err(AuditError::AlreadyFinished)
+        ));
+        let rows = store.list(Some("acme"), Some(RecordKind::Audit)).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].record_id, "record-1");
+    }
 }

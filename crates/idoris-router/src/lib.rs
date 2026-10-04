@@ -1098,6 +1098,8 @@ mod tests {
     use idoris_contracts::common::{FallbackPolicy, PrivacyClass};
     use idoris_contracts::component_card::{Egress, Form};
     use idoris_contracts::provider::{Cost, Family, Locality, ProviderDescriptor};
+    use idoris_tenancy::store::{RecordKind, TenantStore};
+    use rusqlite::Connection;
     use tower::ServiceExt;
 
     use super::*;
@@ -1240,17 +1242,48 @@ mod tests {
         builder.body(Body::from(body.to_owned())).unwrap()
     }
 
+    fn memory_record_store() -> Arc<std::sync::Mutex<TenantStore>> {
+        Arc::new(std::sync::Mutex::new(
+            TenantStore::new(Connection::open_in_memory().unwrap()).unwrap(),
+        ))
+    }
+
+    fn audit_rows(
+        store: &Arc<std::sync::Mutex<TenantStore>>,
+    ) -> Vec<idoris_tenancy::store::TenantRecord> {
+        store
+            .lock()
+            .unwrap()
+            .list(Some(budget::PERSONAL_TENANT_ID), Some(RecordKind::Audit))
+            .unwrap()
+    }
+
     #[tokio::test]
     async fn chat_completions_rejects_invalid_json() {
-        let app = build_app(AppState::default());
+        let store = memory_record_store();
+        let app = build_app(AppState {
+            record_store: Some(store.clone()),
+            ..AppState::default()
+        });
         let response = app
             .oneshot(post_chat("{not valid json", &[]))
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let response_record_id = response
+            .headers()
+            .get(HEADER_RECORD_ID)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(json["error"]["type"], "invalid_json");
+        let rows = audit_rows(&store);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].record_id, response_record_id);
+        assert_eq!(rows[0].payload["status"], json!(400));
     }
 
     #[tokio::test]
@@ -1325,7 +1358,11 @@ mod tests {
         // chosen, so there's no X-iDoris-Served-Locality to set, and per
         // R2-D task 3, zero remote egress is trivially true (no remote
         // path exists yet).
-        let app = build_app(AppState::default());
+        let store = memory_record_store();
+        let app = build_app(AppState {
+            record_store: Some(store.clone()),
+            ..AppState::default()
+        });
         let response = app
             .oneshot(post_chat(
                 r#"{"model":"idoris/daily","messages":[{"role":"user","content":"hi"}]}"#,
@@ -1335,9 +1372,23 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert!(!response.headers().contains_key(HEADER_SERVED_LOCALITY));
+        let response_record_id = response
+            .headers()
+            .get(HEADER_RECORD_ID)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(json["error"]["type"], "local_only_unavailable");
+        let rows = audit_rows(&store);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].record_id, response_record_id);
+        assert_eq!(
+            rows[0].payload["reason"],
+            json!("privacy_enforced: no_eligible_candidate")
+        );
     }
 
     /// A candidate was chosen (decide() succeeded) but no Supervisor is
@@ -1678,6 +1729,7 @@ mod tests {
     #[tokio::test]
     async fn resident_http_service_candidate_forwards_via_proxy_byte_for_byte() {
         let server = wiremock::MockServer::start().await;
+        let store = memory_record_store();
         wiremock::Mock::given(wiremock::matchers::method("POST"))
             .and(wiremock::matchers::path("/v1/chat/completions"))
             .respond_with(
@@ -1688,6 +1740,7 @@ mod tests {
             .await;
         let state = AppState {
             cards: vec![resident_component_card("omlx", &server.uri())],
+            record_store: Some(store.clone()),
             ..AppState::default()
         };
         let app = build_app(state);
@@ -1699,6 +1752,13 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+        let response_record_id = response
+            .headers()
+            .get(HEADER_RECORD_ID)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
         assert_eq!(
             response.headers().get(HEADER_SERVED_LOCALITY).unwrap(),
             "loopback"
@@ -1710,6 +1770,10 @@ mod tests {
         // {object: "chat.completion", choices: [...]} shape.
         assert_eq!(json["marker"], "proxied");
         assert!(json.get("object").is_none());
+        let rows = audit_rows(&store);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].record_id, response_record_id);
+        assert_eq!(rows[0].payload["reason"], json!("intent_match: routed"));
     }
 
     #[tokio::test]
@@ -1756,6 +1820,7 @@ mod tests {
     #[tokio::test]
     async fn resident_http_service_second_call_with_same_request_id_is_cached() {
         let server = wiremock::MockServer::start().await;
+        let store = memory_record_store();
         wiremock::Mock::given(wiremock::matchers::method("POST"))
             .and(wiremock::matchers::path("/v1/chat/completions"))
             .respond_with(
@@ -1766,6 +1831,7 @@ mod tests {
             .await;
         let state = AppState {
             cards: vec![resident_component_card("omlx", &server.uri())],
+            record_store: Some(store.clone()),
             ..AppState::default()
         };
         let app = build_app(state);
@@ -1780,6 +1846,13 @@ mod tests {
             .unwrap()
             .to_string();
         let second = app.oneshot(post_chat(body, headers)).await.unwrap();
+        let second_record_id = second
+            .headers()
+            .get(HEADER_RECORD_ID)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
         assert_eq!(second.headers().get(HEADER_CACHED).unwrap(), "true");
         assert_eq!(
             second
@@ -1790,6 +1863,22 @@ mod tests {
                 .unwrap(),
             first_record_id
         );
+        assert_ne!(second_record_id, first_record_id);
+        let rows = audit_rows(&store);
+        assert_eq!(rows.len(), 2);
+        let first_row = rows
+            .iter()
+            .find(|row| row.record_id == first_record_id)
+            .unwrap();
+        let second_row = rows
+            .iter()
+            .find(|row| row.record_id == second_record_id)
+            .unwrap();
+        assert_eq!(first_row.origin_record_id, None);
+        assert_eq!(
+            second_row.origin_record_id.as_deref(),
+            Some(first_record_id.as_str())
+        );
         server.verify().await;
     }
 
@@ -1799,6 +1888,7 @@ mod tests {
     #[tokio::test]
     async fn resident_http_service_streaming_5xx_is_buffered_json_not_sse() {
         let server = wiremock::MockServer::start().await;
+        let store = memory_record_store();
         wiremock::Mock::given(wiremock::matchers::method("POST"))
             .and(wiremock::matchers::path("/v1/chat/completions"))
             .respond_with(
@@ -1810,6 +1900,7 @@ mod tests {
             .await;
         let state = AppState {
             cards: vec![resident_component_card("omlx", &server.uri())],
+            record_store: Some(store.clone()),
             ..AppState::default()
         };
         let app = build_app(state);
@@ -1821,6 +1912,13 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let response_record_id = response
+            .headers()
+            .get(HEADER_RECORD_ID)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
         assert_eq!(
             response
                 .headers()
@@ -1831,6 +1929,10 @@ mod tests {
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(json["error"], "upstream-down");
+        let rows = audit_rows(&store);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].record_id, response_record_id);
+        assert_eq!(rows[0].payload["status"], json!(502));
         server.verify().await;
     }
 
