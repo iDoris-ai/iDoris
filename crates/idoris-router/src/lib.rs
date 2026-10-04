@@ -49,6 +49,7 @@ mod audit_body;
 /// Injectable `/capabilities` provider boundary (B1 task32). Live capacity
 /// aggregation is wired by task33.
 pub mod capabilities;
+pub mod host_facts;
 /// Stable four-way routing/audit reason taxonomy.
 pub mod reason;
 /// Persistent record/budget storage bootstrap (B1 task18).

@@ -1155,6 +1155,7 @@ dependencies = [
  "idoris-backend",
  "idoris-contracts",
  "idoris-policy",
+ "idoris-recommender",
  "idoris-tenancy",
  "idoris-upstream",
  "indexmap 2.14.2",
