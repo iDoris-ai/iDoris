@@ -28,7 +28,8 @@ pub use privacy::{
 };
 pub use registry::{RegistrationError, parse_loopback_endpoint_url, validate_registration};
 pub use role::{
-    ROLES, Role, RoleParseError, is_catalog_eligible, is_eligible_for_role, parse_model_role,
+    ROLES, Role, RoleParseError, is_catalog_eligible, is_catalog_metadata_eligible,
+    is_eligible_for_role, is_role_metadata_eligible, parse_model_role,
 };
 /// 重新导出，好让"执行层"调用 [`parse_loopback_endpoint_url`] 时不需要自己
 /// 再引入 `url` 依赖（也避免两边的 `url` 版本不一致导致类型对不上）。

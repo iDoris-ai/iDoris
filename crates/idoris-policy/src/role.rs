@@ -174,23 +174,24 @@ pub fn parse_model_role(model: &str) -> Result<Option<Role>, RoleParseError> {
 /// - `status: experiment` 一律排除（跨 harness 基准不迁移）。
 /// - `min_ram_gb` 省略时不做硬件门槛过滤；传入时要求 `card.min_ram_gb <=
 ///   min_ram_gb`——任一是 `NaN` 时显式拒绝，不能让损坏数据静默 fail-open。
-pub fn is_catalog_eligible(card: &Card, min_ram_gb: Option<f64>) -> bool {
-    if card.experiment {
+pub fn is_catalog_metadata_eligible(
+    experiment: bool,
+    required_ram_gb: f64,
+    available_ram_gb: Option<f64>,
+) -> bool {
+    if experiment || required_ram_gb.is_nan() {
         return false;
     }
-    // 卡片自身的 `min_ram_gb` 是否损坏（`NaN`）是无条件检查——不能只在调用方
-    // 传了 `min_ram_gb` 阈值时才查。之前的实现把这个检查嵌在 `if let
-    // Some(...)` 里，调用方省略阈值（`None`，意为"不做硬件过滤"）时，损坏的
-    // 卡片数据就绕过检查、只靠角色匹配放行，这正是要杜绝的静默 fail-open。
-    if card.min_ram_gb.is_nan() {
-        return false;
-    }
-    if let Some(min_ram_gb) = min_ram_gb
-        && (min_ram_gb.is_nan() || card.min_ram_gb > min_ram_gb)
+    if let Some(available_ram_gb) = available_ram_gb
+        && (available_ram_gb.is_nan() || required_ram_gb > available_ram_gb)
     {
         return false;
     }
     true
+}
+
+pub fn is_catalog_eligible(card: &Card, min_ram_gb: Option<f64>) -> bool {
+    is_catalog_metadata_eligible(card.experiment, card.min_ram_gb, min_ram_gb)
 }
 
 /// 目录角色候选筛选（`roles.ts` / `recommend.ts` 共用的 `isEligibleForRole`
@@ -201,14 +202,26 @@ pub fn is_catalog_eligible(card: &Card, min_ram_gb: Option<f64>) -> bool {
 ///   `roles` 里错误声明了它，也不能靠这个巧合通过。
 /// - 健康门槛见 [`is_catalog_eligible`]。
 /// - 角色匹配严格按 `card.roles`（第一条规则对 `Auto` 兜底）。
+pub fn is_role_metadata_eligible(
+    experiment: bool,
+    required_ram_gb: f64,
+    roles: &[Role],
+    role: Role,
+    available_ram_gb: Option<f64>,
+) -> bool {
+    role.is_catalog_role()
+        && is_catalog_metadata_eligible(experiment, required_ram_gb, available_ram_gb)
+        && roles.contains(&role)
+}
+
 pub fn is_eligible_for_role(card: &Card, role: Role, min_ram_gb: Option<f64>) -> bool {
-    if !role.is_catalog_role() {
-        return false;
-    }
-    if !is_catalog_eligible(card, min_ram_gb) {
-        return false;
-    }
-    card.roles.contains(&role)
+    is_role_metadata_eligible(
+        card.experiment,
+        card.min_ram_gb,
+        &card.roles,
+        role,
+        min_ram_gb,
+    )
 }
 
 #[cfg(test)]
