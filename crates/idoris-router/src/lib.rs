@@ -45,6 +45,7 @@ pub mod models;
 
 /// Metadata-only audit validation and tenant-scoped persistence (B1 task19).
 pub mod audit;
+mod audit_body;
 /// Injectable `/capabilities` provider boundary (B1 task32). Live capacity
 /// aggregation is wired by task33.
 pub mod capabilities;
@@ -70,7 +71,7 @@ pub mod write_timeout;
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use axum::body::{Body, Bytes};
 use axum::extract::{Extension, Path, Query, Request, State};
@@ -1071,6 +1072,7 @@ struct BufferedAuditMeta {
     status: StatusCode,
     origin_record_id: Option<String>,
     reason: String,
+    latency_ms: u64,
 }
 
 /// Server-generated on every response, success or error, streaming or not
@@ -1080,6 +1082,7 @@ async fn record_id_middleware(
     mut req: Request<Body>,
     next: Next,
 ) -> Response {
+    let audit_started = Instant::now();
     let record_id = Uuid::new_v4().to_string();
     let audit_chat = req.method() == Method::POST && req.uri().path() == "/v1/chat/completions";
     let audit_tenant = audit_tenant_id(&state, req.headers());
@@ -1092,7 +1095,7 @@ async fn record_id_middleware(
     if let Ok(value) = HeaderValue::from_str(&record_id) {
         response.headers_mut().insert(HEADER_RECORD_ID, value);
     }
-    if audit_chat && !is_event_stream(&response) {
+    if audit_chat {
         let origin_record_id = response
             .headers()
             .get(HEADER_ORIGIN_RECORD_ID)
@@ -1106,22 +1109,44 @@ async fn record_id_middleware(
                 .get(HEADER_DEGRADED)
                 .is_some_and(|value| value == "true"),
         );
-        finish_buffered_audit(
-            state,
-            BufferedAuditMeta {
-                tenant_id: audit_tenant,
-                request_id: audit_request_id,
-                privacy: audit_privacy,
-                intent: audit_intent,
-                record_id,
-                status: response.status(),
-                origin_record_id,
-                reason,
-            },
-        )
-        .await;
+        let mut meta = BufferedAuditMeta {
+            tenant_id: audit_tenant,
+            request_id: audit_request_id,
+            privacy: audit_privacy,
+            intent: audit_intent,
+            record_id,
+            status: response.status(),
+            origin_record_id,
+            reason,
+            latency_ms: 0,
+        };
+        if is_event_stream(&response) {
+            let (parts, body) = response.into_parts();
+            let stream_state = state.clone();
+            let stream_started = audit_started;
+            let stream = audit_body::finalize_stream(body.into_data_stream(), move |end| {
+                let mut meta = meta;
+                meta.latency_ms = elapsed_ms(stream_started);
+                meta.reason = match end {
+                    audit_body::StreamEnd::Completed => meta.reason,
+                    audit_body::StreamEnd::Error => "degraded: stream_error".into(),
+                    audit_body::StreamEnd::Dropped => "degraded: stream_cancelled".into(),
+                };
+                tokio::spawn(async move {
+                    finish_buffered_audit(stream_state, meta).await;
+                });
+            });
+            response = Response::from_parts(parts, Body::from_stream(stream));
+        } else {
+            meta.latency_ms = elapsed_ms(audit_started);
+            finish_buffered_audit(state, meta).await;
+        }
     }
     response
+}
+
+fn elapsed_ms(started: Instant) -> u64 {
+    started.elapsed().as_millis().min(u64::MAX as u128) as u64
 }
 
 fn header_text<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
@@ -1177,6 +1202,7 @@ async fn finish_buffered_audit(state: Arc<AppState>, meta: BufferedAuditMeta) {
     }
     payload.insert("status".into(), json!(meta.status.as_u16()));
     payload.insert("reason".into(), json!(meta.reason));
+    payload.insert("latency_ms".into(), json!(meta.latency_ms));
 
     let failures = state.audit_failures.clone();
     let result = tokio::task::spawn_blocking(move || -> Result<(), String> {
@@ -1419,6 +1445,22 @@ mod tests {
             .unwrap()
             .list(Some(budget::PERSONAL_TENANT_ID), Some(RecordKind::Audit))
             .unwrap()
+    }
+
+    async fn wait_audit_rows(
+        store: &Arc<std::sync::Mutex<TenantStore>>,
+        expected: usize,
+    ) -> Vec<idoris_tenancy::store::TenantRecord> {
+        for _ in 0..100 {
+            let rows = audit_rows(store);
+            if rows.len() == expected {
+                return rows;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let rows = audit_rows(store);
+        assert_eq!(rows.len(), expected, "audit finalizer did not settle");
+        rows
     }
 
     fn usage_query_state() -> (tempfile::TempDir, AppState) {
@@ -2346,6 +2388,7 @@ mod tests {
             "data: {\"content\":\"[DONE]\"}\n\n",
         ] {
             let server = wiremock::MockServer::start().await;
+            let store = memory_record_store();
             wiremock::Mock::given(wiremock::matchers::method("POST"))
                 .respond_with(
                     wiremock::ResponseTemplate::new(200).set_body_raw(body, "text/event-stream"),
@@ -2354,6 +2397,7 @@ mod tests {
                 .await;
             let app = build_app(AppState {
                 cards: vec![resident_component_card("omlx", &server.uri())],
+                record_store: Some(store.clone()),
                 ..AppState::default()
             });
             let response = app.oneshot(post_chat(
@@ -2361,29 +2405,37 @@ mod tests {
                 &[],
             )).await.unwrap();
             assert_eq!(response.status(), StatusCode::OK);
+            assert!(audit_rows(&store).is_empty());
             let err = response
                 .into_body()
                 .collect()
                 .await
                 .expect_err("bare EOF must fail");
             assert!(err.to_string().contains("unterminated upstream SSE"));
+            let rows = wait_audit_rows(&store, 1).await;
+            assert_eq!(rows[0].payload["reason"], json!("degraded: stream_error"));
         }
     }
 
     #[tokio::test]
     async fn resident_http_service_streaming_2xx_passes_sse_bytes_through() {
         let server = wiremock::MockServer::start().await;
+        let store = memory_record_store();
         wiremock::Mock::given(wiremock::matchers::method("POST"))
             .and(wiremock::matchers::path("/v1/chat/completions"))
             .respond_with(
                 wiremock::ResponseTemplate::new(200)
                     .insert_header("content-type", "text/event-stream")
-                    .set_body_raw("data: hel\n\ndata: [DONE]\n\n", "text/event-stream"),
+                    .set_body_raw(
+                        "data: SENTINEL-STREAM-CONTENT\n\ndata: [DONE]\n\n",
+                        "text/event-stream",
+                    ),
             )
             .mount(&server)
             .await;
         let state = AppState {
             cards: vec![resident_component_card("omlx", &server.uri())],
+            record_store: Some(store.clone()),
             ..AppState::default()
         };
         let app = build_app(state);
@@ -2395,6 +2447,17 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+        let record_id = response
+            .headers()
+            .get(HEADER_RECORD_ID)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            audit_rows(&store).is_empty(),
+            "headers must not finalize SSE audit"
+        );
         assert!(
             response
                 .headers()
@@ -2406,7 +2469,60 @@ mod tests {
         );
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
         let text = String::from_utf8(bytes.to_vec()).unwrap();
-        assert!(text.contains("hel"));
+        assert!(text.contains("SENTINEL-STREAM-CONTENT"));
         assert!(text.contains("[DONE]"));
+        let rows = wait_audit_rows(&store, 1).await;
+        assert_eq!(rows[0].record_id, record_id);
+        assert_eq!(rows[0].payload["reason"], json!("intent_match: routed"));
+        assert!(rows[0].payload["latency_ms"].is_u64());
+        assert!(
+            !rows[0].payload.values().any(|value| {
+                value
+                    .as_str()
+                    .is_some_and(|text| text.contains("SENTINEL-STREAM-CONTENT"))
+            }),
+            "stream content must never enter audit metadata"
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_stream_body_finalizes_cancelled_audit_once() {
+        let server = wiremock::MockServer::start().await;
+        let store = memory_record_store();
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_raw("data: later\n\ndata: [DONE]\n\n", "text/event-stream"),
+            )
+            .mount(&server)
+            .await;
+        let app = build_app(AppState {
+            cards: vec![resident_component_card("omlx", &server.uri())],
+            record_store: Some(store.clone()),
+            ..AppState::default()
+        });
+        let response = app
+            .oneshot(post_chat(
+                r#"{"model":"idoris/daily","stream":true,"messages":[{"role":"user","content":"hi"}]}"#,
+                &[],
+            ))
+            .await
+            .unwrap();
+        let record_id = response
+            .headers()
+            .get(HEADER_RECORD_ID)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(audit_rows(&store).is_empty());
+        drop(response);
+        let rows = wait_audit_rows(&store, 1).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].record_id, record_id);
+        assert_eq!(
+            rows[0].payload["reason"],
+            json!("degraded: stream_cancelled")
+        );
     }
 }
