@@ -1445,7 +1445,7 @@ mod tests {
     use idoris_contracts::common::{FallbackPolicy, PrivacyClass};
     use idoris_contracts::component_card::{Egress, Form};
     use idoris_contracts::provider::{Cost, Family, Locality, ProviderDescriptor};
-    use idoris_tenancy::budget::{BudgetLedger, SpendGate};
+    use idoris_tenancy::budget::{BudgetLedger, BudgetScope, Price, SpendGate};
     use idoris_tenancy::store::{RecordKind, TenantRecord, TenantStore};
     use rusqlite::Connection;
     use serde_json::{Map, json};
@@ -1749,6 +1749,67 @@ mod tests {
                 "/idoris/tenants/missing/usage?period=2026-09",
                 Some("missing"),
             ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn budget_query_reports_remaining_available_and_is_read_only() {
+        let (_dir, state) = usage_query_state();
+        let ledger = state.budget_ledger.as_ref().unwrap().clone();
+        let scope = BudgetScope::new("acme", "key-1", "omlx", "model-1");
+        let reservation = ledger.reserve(&scope, Price::Known(600)).unwrap();
+        let before = ledger.tenant_readview("acme").unwrap();
+        assert_eq!(before.remaining_minor, 10_000);
+        assert_eq!(before.reserved_minor, 600);
+        assert_eq!(before.available_minor, 9_400);
+
+        let response = build_app(state)
+            .oneshot(get_usage("/idoris/tenants/acme/budget", Some("acme")))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["tenant_id"], "acme");
+        assert_eq!(json["billing_timezone"], "Asia/Bangkok");
+        assert_eq!(json["limit_minor"], 10_000);
+        assert_eq!(json["spent_minor"], 0);
+        assert_eq!(json["reserved_minor"], 600);
+        assert_eq!(json["remaining_minor"], 10_000);
+        assert_eq!(json["available_minor"], 9_400);
+        assert_eq!(json["scope"], "paid_only");
+
+        let after = ledger.tenant_readview("acme").unwrap();
+        assert_eq!(after, before);
+        ledger.release("acme", &reservation).unwrap();
+    }
+
+    #[tokio::test]
+    async fn budget_query_rejects_bad_scope_and_unknown_tenant() {
+        let (_dir, state) = usage_query_state();
+        let app = build_app(state);
+        for request in [
+            get_usage("/idoris/tenants/acme/budget", None),
+            get_usage("/idoris/tenants/acme/budget", Some("other")),
+        ] {
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+
+        let duplicate = Request::builder()
+            .method("GET")
+            .uri("/idoris/tenants/acme/budget")
+            .header("x-idoris-tenant", "acme")
+            .header("x-idoris-tenant", "other")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.clone().oneshot(duplicate).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let response = app
+            .oneshot(get_usage("/idoris/tenants/missing/budget", Some("missing")))
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
