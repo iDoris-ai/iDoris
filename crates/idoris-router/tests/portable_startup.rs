@@ -73,6 +73,65 @@ fn failed(mut child: Running, expected: &str) {
     }
 }
 
+async fn wait_health(child: &mut Running, port: u16) {
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Ok(response) = client
+            .get(format!("http://127.0.0.1:{port}/health"))
+            .timeout(Duration::from_millis(300))
+            .send()
+            .await
+            && response.status().is_success()
+        {
+            return;
+        }
+        assert!(child.0.as_mut().unwrap().try_wait().unwrap().is_none());
+        assert!(Instant::now() < deadline, "health readiness timed out");
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+#[tokio::test]
+async fn explicit_relative_and_absolute_config_paths_start() {
+    for absolute in [false, true] {
+        let (_root, cwd, exe, port) = fixture();
+        let bundled = exe.parent().unwrap().join("config");
+        let (components, policy) = if absolute {
+            (
+                bundled.join("components").to_string_lossy().into_owned(),
+                bundled
+                    .join("routing-policy.yaml")
+                    .to_string_lossy()
+                    .into_owned(),
+            )
+        } else {
+            let explicit = cwd.path().join("explicit");
+            fs::create_dir_all(explicit.join("components")).unwrap();
+            fs::copy(
+                bundled.join("components/omlx.yaml"),
+                explicit.join("components/omlx.yaml"),
+            )
+            .unwrap();
+            fs::copy(
+                bundled.join("routing-policy.yaml"),
+                explicit.join("routing-policy.yaml"),
+            )
+            .unwrap();
+            (
+                "explicit/components".to_string(),
+                "explicit/routing-policy.yaml".to_string(),
+            )
+        };
+        let env = [
+            ("IDORIS_COMPONENTS_DIR", components.as_str()),
+            ("IDORIS_ROUTING_POLICY", policy.as_str()),
+        ];
+        let mut child = spawn(&exe, cwd.path(), port, &env);
+        wait_health(&mut child, port).await;
+    }
+}
+
 #[tokio::test]
 async fn bundled_config_starts_from_an_unrelated_working_directory() {
     let (_root, cwd, exe, port) = fixture();

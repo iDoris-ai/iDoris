@@ -18,6 +18,8 @@ pub mod intent;
 /// Component card loading from `IDORIS_COMPONENTS_DIR` (R2-D task 2); wired
 /// into `AppState`/`/health`'s `components` count in a follow-up PR.
 pub mod components;
+/// Executable-relative bundled config resolution with explicit-path overrides.
+pub mod config;
 
 /// Routing-policy loading from `IDORIS_ROUTING_POLICY` (R2-D task 2); wired
 /// into `AppState` in a follow-up PR.
