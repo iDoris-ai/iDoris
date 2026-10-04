@@ -1,3 +1,6 @@
+pub mod source;
+pub use source::{HostProbe, inspect_host};
+
 use serde::{Deserialize, Serialize};
 
 pub const UNKNOWN_CHIP: &str = "unknown";
