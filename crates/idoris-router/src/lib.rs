@@ -58,6 +58,7 @@ pub mod storage;
 /// into `chat_completions`/`AppState` below (see the module's own doc for
 /// why this is a genuinely separate path from `dispatch::dispatch_local`).
 pub mod proxy;
+pub mod queries;
 
 mod sse;
 mod supervisor_parameters;
@@ -72,7 +73,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::body::{Body, Bytes};
-use axum::extract::{Extension, Request, State};
+use axum::extract::{Extension, Path, Query, Request, State};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -292,6 +293,10 @@ pub fn build_app(state: AppState) -> Router {
         .route("/v1/models", get(list_models).fallback(not_found))
         .route("/capabilities", get(get_capabilities).fallback(not_found))
         .route(
+            "/idoris/tenants/{tenant_id}/usage",
+            get(get_tenant_usage).fallback(not_found),
+        )
+        .route(
             "/v1/chat/completions",
             post(chat_completions).fallback(not_found),
         )
@@ -301,6 +306,84 @@ pub fn build_app(state: AppState) -> Router {
             record_id_middleware,
         ))
         .with_state(state)
+}
+
+async fn get_tenant_usage(
+    State(state): State<Arc<AppState>>,
+    Path(tenant_id): Path<String>,
+    headers: HeaderMap,
+    query: Result<Query<queries::usage::UsageQuery>, axum::extract::rejection::QueryRejection>,
+) -> Response {
+    let Query(query) = match query {
+        Ok(query) => query,
+        Err(_) => {
+            return error_envelope(
+                StatusCode::BAD_REQUEST,
+                "invalid_query",
+                "usage query must contain only period=YYYY-MM",
+            );
+        }
+    };
+    let scope_tenant = query_scope_header(&headers).map(str::to_string);
+    let (Some(store), Some(ledger)) = (state.record_store.clone(), state.budget_ledger.clone())
+    else {
+        return error_envelope(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "usage_unavailable",
+            "tenant usage storage is not configured",
+        );
+    };
+    let result = tokio::task::spawn_blocking(move || {
+        let guard = store
+            .lock()
+            .map_err(|_| queries::usage::UsageQueryError::StorePoisoned)?;
+        queries::usage::query_usage(&guard, &ledger, &tenant_id, scope_tenant.as_deref(), &query)
+    })
+    .await;
+    match result {
+        Ok(Ok(usage)) => Json(usage).into_response(),
+        Ok(Err(
+            err @ (queries::usage::UsageQueryError::ScopeRequired
+            | queries::usage::UsageQueryError::ScopeMismatch),
+        )) => error_envelope(
+            StatusCode::BAD_REQUEST,
+            "invalid_tenant_scope",
+            err.to_string(),
+        ),
+        Ok(Err(queries::usage::UsageQueryError::Billing(
+            idoris_tenancy::billing::BillingAggregateError::Period(err),
+        ))) => error_envelope(StatusCode::BAD_REQUEST, "invalid_query", err.to_string()),
+        Ok(Err(queries::usage::UsageQueryError::Budget(
+            idoris_tenancy::budget::BudgetError::TenantNotConfigured { tenant_id },
+        ))) => error_envelope(
+            StatusCode::NOT_FOUND,
+            "tenant_not_found",
+            format!("tenant {tenant_id:?} is not configured"),
+        ),
+        Ok(Err(err)) => error_envelope(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "usage_unavailable",
+            err.to_string(),
+        ),
+        Err(_) => error_envelope(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "usage_unavailable",
+            "usage query worker failed",
+        ),
+    }
+}
+
+fn query_scope_header(headers: &HeaderMap) -> Option<&str> {
+    let mut values = headers.get_all("x-idoris-tenant").iter();
+    let first = values.next()?;
+    if values.next().is_some() {
+        return None;
+    }
+    first
+        .to_str()
+        .ok()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
 }
 
 async fn get_capabilities(State(state): State<Arc<AppState>>) -> Response {
@@ -1125,8 +1208,10 @@ mod tests {
     use idoris_contracts::common::{FallbackPolicy, PrivacyClass};
     use idoris_contracts::component_card::{Egress, Form};
     use idoris_contracts::provider::{Cost, Family, Locality, ProviderDescriptor};
-    use idoris_tenancy::store::{RecordKind, TenantStore};
+    use idoris_tenancy::budget::{BudgetLedger, SpendGate};
+    use idoris_tenancy::store::{RecordKind, TenantRecord, TenantStore};
     use rusqlite::Connection;
+    use serde_json::{Map, json};
     use tower::ServiceExt;
 
     use super::*;
@@ -1283,6 +1368,111 @@ mod tests {
             .unwrap()
             .list(Some(budget::PERSONAL_TENANT_ID), Some(RecordKind::Audit))
             .unwrap()
+    }
+
+    fn usage_query_state() -> (tempfile::TempDir, AppState) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = dir.path().join("usage.sqlite3");
+        let store = TenantStore::open(&db).unwrap();
+        let ledger = BudgetLedger::open(&db).unwrap();
+        ledger
+            .configure_tenant("acme", 10_000, "Asia/Bangkok", SpendGate::PaidOnly)
+            .unwrap();
+        let mut payload = Map::new();
+        payload.insert("ts_utc".into(), json!(1_789_430_400_000_i64));
+        payload.insert("cost_minor".into(), json!(100));
+        payload.insert("tokens_in".into(), json!(1000));
+        payload.insert("tokens_out".into(), json!(500));
+        store
+            .put(
+                Some("acme"),
+                &TenantRecord {
+                    tenant_id: "acme".into(),
+                    kind: RecordKind::Usage,
+                    record_id: "usage-1".into(),
+                    request_id: "request-1".into(),
+                    origin_record_id: None,
+                    payload,
+                },
+            )
+            .unwrap();
+        let state = AppState {
+            record_store: Some(Arc::new(std::sync::Mutex::new(store))),
+            budget_ledger: Some(Arc::new(ledger)),
+            ..AppState::default()
+        };
+        (dir, state)
+    }
+
+    fn get_usage(uri: &str, tenant: Option<&str>) -> Request<Body> {
+        let mut builder = Request::builder().method("GET").uri(uri);
+        if let Some(tenant) = tenant {
+            builder = builder.header("x-idoris-tenant", tenant);
+        }
+        builder.body(Body::empty()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn usage_query_returns_trusted_timezone_range_and_totals() {
+        let (_dir, state) = usage_query_state();
+        let response = build_app(state)
+            .oneshot(get_usage(
+                "/idoris/tenants/acme/usage?period=2026-09",
+                Some("acme"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["tenant_id"], "acme");
+        assert_eq!(json["billing_timezone"], "Asia/Bangkok");
+        assert_eq!(json["range_utc"]["from"], "2026-08-31T17:00:00Z");
+        assert_eq!(json["range_utc"]["to"], "2026-09-30T17:00:00Z");
+        assert_eq!(json["totals"]["cost_minor"], json!(100.0));
+        assert_eq!(json["totals"]["tokens_in"], json!(1000.0));
+        assert_eq!(json["totals"]["tokens_out"], json!(500.0));
+        assert_eq!(json["totals"]["calls"], 1);
+    }
+
+    #[tokio::test]
+    async fn usage_query_rejects_missing_mismatched_duplicate_scope_and_timezone_override() {
+        let (_dir, state) = usage_query_state();
+        let app = build_app(state);
+        for request in [
+            get_usage("/idoris/tenants/acme/usage?period=2026-09", None),
+            get_usage("/idoris/tenants/acme/usage?period=2026-09", Some("other")),
+            get_usage(
+                "/idoris/tenants/acme/usage?period=2026-09&timezone=UTC",
+                Some("acme"),
+            ),
+        ] {
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+
+        let duplicate = Request::builder()
+            .method("GET")
+            .uri("/idoris/tenants/acme/usage?period=2026-09")
+            .header("x-idoris-tenant", "acme")
+            .header("x-idoris-tenant", "other")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(duplicate).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn usage_query_unknown_tenant_fails_closed() {
+        let (_dir, state) = usage_query_state();
+        let response = build_app(state)
+            .oneshot(get_usage(
+                "/idoris/tenants/missing/usage?period=2026-09",
+                Some("missing"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
