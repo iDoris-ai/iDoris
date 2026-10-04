@@ -43,6 +43,10 @@ export IDORIS_CONFORMANCE_ARGV
 IDORIS_CONFORMANCE_ARGV="$(node -e 'process.stdout.write(JSON.stringify([process.argv[1], "serve"]))' "$bin")"
 # K13/M4: a 5xx does not prove the upstream POST was not executed.
 export IDORIS_CONFORMANCE_POST_RETRY=0
+# Shared conformance normally targets the TS reference. A few explicitly
+# approved D-B1-1 edge differences are locked per implementation instead of
+# forcing one side to mimic the other.
+export IDORIS_CONFORMANCE_IMPLEMENTATION=rust
 
 echo "[conformance-rust] IDORIS_CONFORMANCE_CMD=$IDORIS_CONFORMANCE_CMD" >&2
 echo "[conformance-rust] pnpm conformance" >&2
