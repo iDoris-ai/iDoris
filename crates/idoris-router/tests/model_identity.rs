@@ -72,6 +72,13 @@ async fn rejects_present_but_empty_or_non_string_model_after_selection() {
 
 async fn mount_omlx_success(server: &MockServer) {
     Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": [{"id":"Qwen3-0.6B-4bit"}]
+        })))
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
         .and(path("/api/status"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "loaded_models": [], "model_memory_used": 0, "model_memory_max": 0
