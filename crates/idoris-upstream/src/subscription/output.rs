@@ -47,7 +47,7 @@ fn open_result(workspace: &SubscriptionWorkspace) -> Result<Option<File>, Subscr
     }
     match OpenOptions::new()
         .read(true)
-        .custom_flags(nix::libc::O_NOFOLLOW)
+        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
         .open(path)
     {
         Ok(file) => {
@@ -105,6 +105,9 @@ mod tests {
 
     use std::fs;
     use std::os::unix::fs::symlink;
+    use std::process::Command;
+    use std::sync::mpsc;
+    use std::time::Duration;
 
     use super::*;
 
@@ -186,5 +189,32 @@ mod tests {
             b"replacement".to_vec()
         );
         workspace.cleanup_after_reap().unwrap();
+    }
+
+    #[test]
+    fn fifo_swap_is_rejected_without_blocking_open() {
+        let workspace = SubscriptionWorkspace::create().unwrap();
+        fs::remove_file(workspace.result_file()).unwrap();
+        assert!(
+            Command::new("mkfifo")
+                .arg(workspace.result_file())
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let reason = select_output(&workspace, "fallback", Some(0))
+                .unwrap_err()
+                .reason_code();
+            workspace.cleanup_after_reap().unwrap();
+            tx.send(reason).unwrap();
+        });
+
+        assert_eq!(
+            rx.recv_timeout(Duration::from_millis(500)).unwrap(),
+            "RELAY_CLI_FAILED"
+        );
     }
 }
