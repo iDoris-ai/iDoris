@@ -2,8 +2,8 @@
  * 假的 OpenAI 兼容上游（node:http，不依赖被测实现的任何代码）。
  *
  * 被测服务（TS 参考实现或将来的 Rust 版）把请求转发到这里的
- * `/v1/chat/completions` / `/v1/models`；测试通过 `queueChat()` 注入
- * 500 / 慢响应 / 挂起不回，再用 `chatCount()` 断言"远程出站 N 次"。
+ * `/v1/chat/completions` / `/v1/models` / `/api/status`；测试通过
+ * `queueChat()` 注入 500 / 慢响应 / 挂起不回，再用访问计数断言实际出站。
  */
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 
@@ -38,6 +38,7 @@ export interface FakeUpstream {
   readonly port: number;
   chatCount(): number;
   modelsCount(): number;
+  statusCount(): number;
   /**
    * 先进先出：下一次 /v1/chat/completions 命中队首；队空则用默认成功响应兜底。
    * 返回值只对应**这一条**排队的行为——不是全局共享状态，多个 hang 请求的
@@ -47,6 +48,8 @@ export interface FakeUpstream {
   /** 先进先出：下一次 /v1/models 使用该 HTTP 状态；队空时默认 200。 */
   queueModels(status: number): void;
   setModels(models: Array<{ id: string }>): void;
+  /** 改写后续 /api/status 的快照；status 省略时为 200。 */
+  setStatus(body: unknown, status?: number): void;
   requests(): readonly ReceivedRequest[];
   close(): Promise<void>;
 }
@@ -70,8 +73,16 @@ interface QueuedEntry {
 export async function startFakeUpstream(): Promise<FakeUpstream> {
   const queue: QueuedEntry[] = [];
   let models: Array<{ id: string }> = [{ id: "fake-model-1" }];
+  let statusBody: unknown = {
+    loaded_models: [],
+    model_memory_max: 0,
+    model_memory_used: 0,
+    pressure: "ok",
+  };
+  let statusCode = 200;
   let chatCount = 0;
   let modelsCount = 0;
+  let statusCount = 0;
   const modelStatuses: number[] = [];
   const received: ReceivedRequest[] = [];
 
@@ -129,6 +140,12 @@ export async function startFakeUpstream(): Promise<FakeUpstream> {
     res.end(JSON.stringify({ object: "list", data: models }));
   }
 
+  function handleStatus(res: ServerResponse): void {
+    statusCount += 1;
+    res.writeHead(statusCode, { "content-type": "application/json" });
+    res.end(JSON.stringify(statusBody));
+  }
+
   const server: Server = createServer((req: IncomingMessage, res: ServerResponse) => {
     // 两处防炸：请求/响应流本身出错（客户端断开、连接重置……）不该产生
     // 无人处理的 'error' 事件——Node 对没有监听者的流 'error' 事件会直接抛出，
@@ -142,6 +159,10 @@ export async function startFakeUpstream(): Promise<FakeUpstream> {
       received.push({ method: req.method ?? "", path: req.url ?? "", bodyText });
       if (req.method === "GET" && req.url === "/v1/models") {
         handleModels(res);
+        return;
+      }
+      if (req.method === "GET" && req.url === "/api/status") {
+        handleStatus(res);
         return;
       }
       if (req.method === "POST" && req.url === "/v1/chat/completions") {
@@ -172,6 +193,7 @@ export async function startFakeUpstream(): Promise<FakeUpstream> {
     port,
     chatCount: () => chatCount,
     modelsCount: () => modelsCount,
+    statusCount: () => statusCount,
     queueChat: (behavior) => {
       const entry: QueuedEntry = { behavior, aborted: false };
       queue.push(entry);
@@ -180,6 +202,10 @@ export async function startFakeUpstream(): Promise<FakeUpstream> {
     queueModels: (status) => modelStatuses.push(status),
     setModels: (m) => {
       models = m;
+    },
+    setStatus: (body, status = 200) => {
+      statusBody = body;
+      statusCode = status;
     },
     requests: () => received,
     close: () => new Promise((resolve) => server.close(() => resolve())),
