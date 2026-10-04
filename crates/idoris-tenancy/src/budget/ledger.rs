@@ -10,6 +10,7 @@
 //! (`settle`) independently callable, independently testable operations —
 //! which is why they're two methods here, not one.
 
+use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -446,6 +447,39 @@ impl BudgetLedger {
         )?;
         tx.commit()?;
         Ok(())
+    }
+
+    /// Reconcile trusted tenant authorization at process bootstrap.
+    /// Historical spend/reservation rows are preserved; only tenant-level
+    /// and sub-scope configuration for tenants absent from `keep` is revoked.
+    pub fn retain_tenants(&self, keep: &BTreeSet<String>) -> Result<usize, BudgetError> {
+        let mut conn = self.lock();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut stale = BTreeSet::new();
+        {
+            let mut stmt = tx.prepare(
+                "SELECT tenant_id FROM tenant_config UNION SELECT tenant_id FROM budget_config",
+            )?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            for row in rows {
+                let tenant_id = row?;
+                if !keep.contains(&tenant_id) {
+                    stale.insert(tenant_id);
+                }
+            }
+        }
+        for tenant_id in &stale {
+            tx.execute(
+                "DELETE FROM budget_config WHERE tenant_id = ?1",
+                rusqlite::params![tenant_id],
+            )?;
+            tx.execute(
+                "DELETE FROM tenant_config WHERE tenant_id = ?1",
+                rusqlite::params![tenant_id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(stale.len())
     }
 
     /// Read-only remaining balance for `scope`: `limit - settled_spend -
@@ -1946,6 +1980,56 @@ mod tests {
             ledger.tenant_balance("acme-co"),
             Err(BudgetError::TenantNotConfigured { .. })
         ));
+    }
+
+    #[test]
+    fn retain_tenants_revokes_stale_config_but_keeps_spend_history() {
+        let path = temp_db_path("retain-tenants");
+        let ledger = BudgetLedger::open(&path).expect("open");
+        let beta = BudgetScope::new("beta", "key", "provider", "model");
+        ledger
+            .configure_tenant("beta", 100, "UTC", SpendGate::All)
+            .expect("configure beta tenant");
+        ledger
+            .configure(&beta, 100, "UTC")
+            .expect("configure beta scope");
+        let reservation = ledger
+            .reserve(&beta, Price::Known(10))
+            .expect("reserve beta before revocation");
+        ledger
+            .settle("beta", &reservation, 7)
+            .expect("settle beta before revocation");
+        ledger
+            .configure_tenant("acme", 100, "UTC", SpendGate::All)
+            .expect("configure acme");
+
+        let keep = BTreeSet::from(["acme".to_string()]);
+        assert_eq!(ledger.retain_tenants(&keep).expect("retain"), 1);
+        assert!(matches!(
+            ledger.tenant_readview("beta"),
+            Err(BudgetError::TenantNotConfigured { .. })
+        ));
+        assert!(matches!(
+            ledger.reserve(&beta, Price::Known(1)),
+            Err(BudgetError::NotConfigured { .. })
+        ));
+
+        let conn = ledger.lock();
+        let tenant_spent: i64 = conn
+            .query_row(
+                "SELECT spent_minor FROM tenant_periods WHERE tenant_id='beta'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("tenant spend history survives revocation");
+        let scope_spent: i64 = conn
+            .query_row(
+                "SELECT spent_minor FROM budget_periods WHERE tenant_id='beta'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("scope spend history survives revocation");
+        assert_eq!((tenant_spent, scope_spent), (7, 7));
     }
 
     #[test]

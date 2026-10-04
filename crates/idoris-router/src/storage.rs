@@ -108,6 +108,12 @@ pub fn bootstrap(
             "personal 模式必须配置固定内部租户 {PERSONAL_TENANT_ID:?}"
         ));
     }
+    let revoked = budget
+        .retain_tenants(&seen)
+        .map_err(|err| format!("无法对账可信租户清单：{err}"))?;
+    if revoked > 0 {
+        eprintln!("idoris: 已撤销 {revoked} 个不再存在于可信配置中的租户");
+    }
 
     Ok(StorageBootstrap {
         records: Arc::new(Mutex::new(records)),
@@ -200,7 +206,7 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
-    use idoris_tenancy::budget::BudgetError;
+    use idoris_tenancy::budget::{BudgetError, BudgetScope, Price};
     use idoris_tenancy::store::{RecordKind, TenantRecord};
     use serde_json::Map;
 
@@ -275,5 +281,37 @@ mod tests {
         .err()
         .unwrap();
         assert!(err.contains("无法创建数据库目录"), "{err}");
+    }
+
+    #[test]
+    fn trusted_tenant_list_revokes_removed_tenant_on_restart() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = dir.path().join("tenant.sqlite3");
+        let config = dir.path().join("tenants.yaml");
+        std::fs::write(
+            &config,
+            "tenants:\n  - tenant_id: acme\n    limit_minor: 100\n    billing_timezone: UTC\n    scope: all\n  - tenant_id: beta\n    limit_minor: 100\n    billing_timezone: UTC\n    scope: all\n",
+        )
+        .unwrap();
+        let first = bootstrap(&db, Some(&config), DeployMode::Tenant).unwrap();
+        let beta_scope = BudgetScope::new("beta", "key", "provider", "model");
+        first.budget.reserve(&beta_scope, Price::Known(1)).unwrap();
+        drop(first);
+
+        std::fs::write(
+            &config,
+            "tenants:\n  - tenant_id: acme\n    limit_minor: 100\n    billing_timezone: UTC\n    scope: all\n",
+        )
+        .unwrap();
+        let reopened = bootstrap(&db, Some(&config), DeployMode::Tenant).unwrap();
+        assert!(matches!(
+            reopened.budget.tenant_readview("beta"),
+            Err(BudgetError::TenantNotConfigured { .. })
+        ));
+        assert!(matches!(
+            reopened.budget.reserve(&beta_scope, Price::Known(1)),
+            Err(BudgetError::NotConfigured { .. })
+        ));
+        assert!(reopened.budget.tenant_readview("acme").is_ok());
     }
 }
