@@ -1,8 +1,26 @@
 # idoris-recommender
 
-Skeleton only — module layout staked out for a later task to fill in. Ported
-from (and must stay behaviorally equivalent to) **`packages/recommender`**
+Rust recommender port, kept behaviorally equivalent to **`packages/recommender`**
 (TS, kept as the reference implementation; see the root `README.md`).
+
+## B1 `/capabilities` consumer mapping
+
+The recommender intentionally does not own HTTP or backend queue state. B1 can
+map public `Recommendation` output onto the seven-field TS
+`CapabilityEntry`:
+
+| CapabilityEntry | Recommender source |
+|---|---|
+| `id` | resident/temp/blocked `id` |
+| `capability` | resident=`reasoning`; temp=`capability`; blocked=highest catalog capability |
+| `resident` | true only for the resident choice |
+| `estimated_memory_gb` | **`footprint_gb`** (weights + KV + overhead), never weights alone |
+| `ctx_limit` | resident `ctx`; otherwise recommendation policy `context_target` |
+| `queue_depth` | **B1 runtime/backend status only**; B2 must not fabricate it |
+| `admission_status` | resident=`ready`; temp status; blocked=`blocked` |
+
+A forced model may intentionally appear both as resident and blocked; consumers
+must preserve both rows rather than deduplicate away the warning/evidence.
 
 ## Scope (mirrors `packages/recommender/src/*`)
 
