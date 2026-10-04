@@ -65,3 +65,66 @@ pub struct QuantPick {
     pub kv_gb: f64,
     pub footprint_gb: f64,
 }
+
+pub const TEMP_SLOT_RESERVE_GB: f64 = 3.5;
+pub const HEADROOM_GB: f64 = 1.0;
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BudgetBreakdown {
+    pub reserve_gb: f64,
+    pub usable_gb: f64,
+    pub temp_reserve_gb: f64,
+    pub resident_budget_gb: f64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResidentChoice {
+    pub id: String,
+    pub ctx: u64,
+    pub score: f64,
+    pub label: String,
+    pub quality: f64,
+    pub weights_gb: f64,
+    pub kv_gb: f64,
+    pub footprint_gb: f64,
+}
+
+impl ResidentChoice {
+    pub fn from_pick(id: String, ctx: u64, score: f64, pick: QuantPick) -> Self {
+        Self {
+            id,
+            ctx,
+            score,
+            label: pick.label,
+            quality: pick.quality,
+            weights_gb: pick.weights_gb,
+            kv_gb: pick.kv_gb,
+            footprint_gb: pick.footprint_gb,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct BlockedChoice {
+    pub id: String,
+    pub min_ram_gb: f64,
+    pub estimated_memory_gb: f64,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResidentError {
+    EmptyQuantOptions { id: String },
+}
+
+impl std::fmt::Display for ResidentError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EmptyQuantOptions { id } => {
+                write!(f, "catalog model {id:?} has no quant options")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ResidentError {}
