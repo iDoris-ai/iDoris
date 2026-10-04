@@ -14,7 +14,7 @@ pub mod probe {}
 /// conventions (decimal GB for weights, MiB for KV, Apple RAM budget table)
 /// must be preserved exactly — see the TS source's header comment before
 /// touching any of this.
-pub mod memory {}
+pub mod memory;
 
 /// `HardwareAwareModelRecommender` (`packages/recommender/src/recommend.ts`,
 /// T2.1.2/T2.1.3): picks a resident + on-demand model combination given
