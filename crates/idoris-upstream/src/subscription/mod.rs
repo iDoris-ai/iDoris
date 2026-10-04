@@ -5,4 +5,5 @@ pub mod output;
 pub mod process;
 pub mod profile;
 pub mod reaper;
+pub mod relay;
 pub mod workspace;
