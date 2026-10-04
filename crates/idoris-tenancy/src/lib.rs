@@ -22,3 +22,6 @@ pub mod budget;
 /// resolved in the tenant's configured `billing_timezone`, never the
 /// server's local time or a caller-supplied override.
 pub mod billing;
+
+/// Tenant-scoped usage records consumed by monthly billing aggregation.
+pub mod usage;
