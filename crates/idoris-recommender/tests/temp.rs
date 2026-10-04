@@ -69,6 +69,8 @@ fn highest_capability_model_is_kept_even_when_weaker_model_would_fit() {
     assert_eq!(result.choices.len(), 1);
     assert_eq!(result.choices[0].id, "strong-big");
     assert_eq!(result.choices[0].status, TempStatus::RequiresEviction);
+    assert!(result.choices[0].reason.contains("需驱逐常驻后加载"));
+    assert!(result.warnings[0].contains("需驱逐常驻"));
 }
 
 #[test]

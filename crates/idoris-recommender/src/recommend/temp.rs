@@ -31,7 +31,7 @@ pub fn temp_admission(
                 status: TempStatus::Ready,
                 min_ram_gb: model.min_ram_gb,
                 reason: format!(
-                    "footprint {:.2}GB <= remaining {:.2}GB",
+                    "footprint {:.2}GB ≤ 剩余 {:.2}GB，可与常驻共存",
                     quant.footprint_gb, remaining
                 ),
                 quant,
@@ -45,7 +45,7 @@ pub fn temp_admission(
             continue;
         };
         warnings.push(format!(
-            "{key}: {} requires resident eviction ({:.2}GB > remaining {:.2}GB)",
+            "{key}: {} 需驱逐常驻（{:.2}GB > 剩余 {:.2}GB）",
             model.id, quant.footprint_gb, remaining
         ));
         choices.push(TempChoice {
@@ -54,7 +54,7 @@ pub fn temp_admission(
             status: TempStatus::RequiresEviction,
             min_ram_gb: model.min_ram_gb,
             reason: format!(
-                "footprint {:.2}GB > remaining {:.2}GB; evict resident before load",
+                "footprint {:.2}GB > 剩余 {:.2}GB，需驱逐常驻后加载",
                 quant.footprint_gb, remaining
             ),
             quant,
