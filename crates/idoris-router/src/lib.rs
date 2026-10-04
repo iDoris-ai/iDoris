@@ -35,6 +35,9 @@ pub mod models;
 /// why this is a genuinely separate path from `dispatch::dispatch_local`).
 pub mod proxy;
 
+/// Pure subscription registration gates. Production stays K04-locked until B3 task24.
+pub mod subscription;
+
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
