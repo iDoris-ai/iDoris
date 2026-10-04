@@ -141,3 +141,25 @@ pub struct ForcedResult {
     pub override_choice: Option<CoreOverride>,
     pub warnings: Vec<String>,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TempStatus {
+    Ready,
+    RequiresEviction,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TempChoice {
+    pub id: String,
+    pub capability: Capability,
+    pub status: TempStatus,
+    pub min_ram_gb: f64,
+    pub quant: QuantPick,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TempResult {
+    pub choices: Vec<TempChoice>,
+    pub warnings: Vec<String>,
+}
