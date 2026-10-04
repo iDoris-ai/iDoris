@@ -113,11 +113,11 @@ impl WiredMode {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct ModelArch {
-    pub n_layers: u32,
-    pub n_kv_heads: u32,
-    pub head_dim: u32,
+    pub n_layers: f64,
+    pub n_kv_heads: f64,
+    pub head_dim: f64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -158,9 +158,9 @@ pub fn weights_gb(params_total_b: f64, spec: &QuantSpec) -> Result<f64, MemoryEr
 }
 
 pub fn kv_bytes(arch: ModelArch, ctx: u64, kv_quant: KvQuant) -> f64 {
-    2.0 * f64::from(arch.n_layers)
-        * f64::from(arch.n_kv_heads)
-        * f64::from(arch.head_dim)
+    2.0 * arch.n_layers
+        * arch.n_kv_heads
+        * arch.head_dim
         * ctx as f64
         * kv_quant.bytes_per_element()
 }

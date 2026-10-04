@@ -14,9 +14,9 @@ fn model() -> CatalogModel {
         params_total_b: 9.0,
         params_active_b: None,
         arch: ModelArch {
-            n_layers: 32,
-            n_kv_heads: 4,
-            head_dim: 256,
+            n_layers: 32.0,
+            n_kv_heads: 4.0,
+            head_dim: 256.0,
         },
         modality: Some(vec!["text".into()]),
         roles: vec![CatalogRole::new(Role::Daily).unwrap()],
