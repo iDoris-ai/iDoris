@@ -23,4 +23,4 @@ pub mod catalog;
 /// T2.1.2/T2.1.3): picks a resident + on-demand model combination given
 /// `HostFacts` + a model catalog + policy, with hard `min_ram_gb` gating and
 /// `IDORIS_CORE_MODEL` override support.
-pub mod recommend {}
+pub mod recommend;
