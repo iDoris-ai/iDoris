@@ -7,7 +7,7 @@
 /// `system_profiler` on macOS). Decisions only ever read `HostFacts` — real
 /// probing is an adapter, so recommendation logic can be tested against
 /// injected facts without depending on the test machine's hardware.
-pub mod probe {}
+pub mod probe;
 
 /// Memory footprint formulas (`packages/recommender/src/memory.ts`, T2.1.1):
 /// `footprint(GB) = params_total_b * bpp(quant) + KV(ctx) + overhead`. Unit
