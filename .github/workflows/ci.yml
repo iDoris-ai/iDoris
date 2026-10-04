@@ -60,6 +60,12 @@ jobs:
           IDORIS_CONFORMANCE_CMD: /idoris-conformance-missing
           IDORIS_CONFORMANCE_ARGV: '["/idoris-conformance-missing"]'
         run: bash scripts/conformance-rust.sh
+      - name: Rust startup egress assertion
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y strace
+          bash scripts/check-rust-egress.sh
       - name: Conformance 错误命令负对照
         shell: bash
         run: |
