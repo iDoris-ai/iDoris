@@ -156,16 +156,8 @@ pub async fn run_process_controlled(
             .await?
             .map_err(|_| SubscriptionRelayError::new(SubscriptionErrorCode::SpawnFailed))?;
     }
-    let stdout_bytes = await_drain_bounded(stdout_task, grace)
-        .await?
-        .map_err(|_| SubscriptionRelayError::new(SubscriptionErrorCode::CliFailed))?;
-    let stderr_bytes = await_drain_bounded(stderr_task, grace)
-        .await?
-        .map_err(|_| SubscriptionRelayError::new(SubscriptionErrorCode::CliFailed))?;
-
-    if let Some(error) = terminal_error {
-        return Err(error);
-    }
+    let (stdout_bytes, stderr_bytes) =
+        finish_output_drains(stdout_task, stderr_task, grace, terminal_error).await?;
     let exit_code = completion.reap.exit_code;
 
     if exceeded.load(Ordering::Acquire) {
@@ -184,6 +176,28 @@ pub async fn run_process_controlled(
         exit_code,
         process_group,
     })
+}
+
+async fn finish_output_drains(
+    stdout_task: tokio::task::JoinHandle<Result<Vec<u8>, std::io::Error>>,
+    stderr_task: tokio::task::JoinHandle<Result<Vec<u8>, std::io::Error>>,
+    grace: Duration,
+    terminal_error: Option<SubscriptionRelayError>,
+) -> Result<(Vec<u8>, Vec<u8>), SubscriptionRelayError> {
+    let (stdout_result, stderr_result) = tokio::join!(
+        await_drain_bounded(stdout_task, grace),
+        await_drain_bounded(stderr_task, grace),
+    );
+
+    if let Some(error) = terminal_error {
+        return Err(error);
+    }
+
+    let stdout = stdout_result?
+        .map_err(|_| SubscriptionRelayError::new(SubscriptionErrorCode::CliFailed))?;
+    let stderr = stderr_result?
+        .map_err(|_| SubscriptionRelayError::new(SubscriptionErrorCode::CliFailed))?;
+    Ok((stdout, stderr))
 }
 
 async fn read_limited<R: AsyncRead + Unpin>(
@@ -214,4 +228,46 @@ async fn read_limited<R: AsyncRead + Unpin>(
         }
     }
     Ok(kept)
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+
+    use super::*;
+
+    fn pending_reader() -> tokio::task::JoinHandle<Result<Vec<u8>, std::io::Error>> {
+        tokio::spawn(async {
+            std::future::pending::<()>().await;
+            Ok(Vec::new())
+        })
+    }
+
+    #[tokio::test]
+    async fn terminal_reason_survives_bounded_drain_abort() {
+        let error = finish_output_drains(
+            pending_reader(),
+            pending_reader(),
+            Duration::from_millis(1),
+            Some(SubscriptionRelayError::new(
+                SubscriptionErrorCode::Cancelled,
+            )),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.reason_code(), "RELAY_CANCELLED");
+    }
+
+    #[tokio::test]
+    async fn successful_path_still_reports_drain_cleanup_failure() {
+        let error = finish_output_drains(
+            pending_reader(),
+            pending_reader(),
+            Duration::from_millis(1),
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.reason_code(), "RELAY_CLEANUP_FAILED");
+    }
 }
