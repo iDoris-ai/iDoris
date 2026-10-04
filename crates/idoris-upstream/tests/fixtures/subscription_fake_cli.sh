@@ -41,7 +41,7 @@ case "$mode" in
     ;;
   ignore-term)
     write_marker "parent:$$:$(ps -o pgid= -p $$ | tr -d ' ')"
-    trap ':' TERM
+    trap '' TERM
     while :; do sleep 1; done
     ;;
   hold-pipe)
