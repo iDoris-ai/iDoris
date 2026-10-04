@@ -17,12 +17,11 @@
 //! forwards to it directly per-request instead.
 
 use idoris_router::{
-    AppState, BIND_HOST, build_app, cli, components, parse_port, profile, routing_policy,
+    AppState, BIND_HOST, build_app, cli, components, config, parse_port, profile, routing_policy,
     runtime::RuntimeRegistry,
     storage,
     write_timeout::{DEFAULT_WRITE_TIMEOUT, WriteTimeoutListener},
 };
-use std::path::PathBuf;
 
 #[tokio::main]
 async fn main() {
@@ -40,39 +39,14 @@ fn env_flag(name: &str) -> bool {
     std::env::var(name).is_ok_and(|v| v == "1")
 }
 
-fn env_path(name: &str) -> Result<Option<String>, String> {
-    std::env::var_os(name)
-        .map(|value| {
-            value
-                .into_string()
-                .map_err(|_| format!("环境变量 {name} 不是有效的 Unicode 路径"))
-        })
-        .transpose()
-}
-
-fn resolve_bundle_path(raw: Option<&str>, default_relative: &str) -> Result<PathBuf, String> {
-    if let Some(value) = raw.map(str::trim).filter(|value| !value.is_empty()) {
-        return Ok(PathBuf::from(value));
-    }
-    let executable =
-        std::env::current_exe().map_err(|err| format!("无法定位当前可执行文件：{err}"))?;
-    let parent = executable
-        .parent()
-        .ok_or_else(|| "当前可执行文件没有父目录".to_string())?;
-    Ok(parent.join(default_relative))
-}
-
 async fn run() -> Result<(), String> {
     let port =
         parse_port(std::env::var("IDORIS_PORT").ok().as_deref()).map_err(|err| err.to_string())?;
     let deploy_mode =
         profile::deploy_mode_from_env(std::env::var("IDORIS_DEPLOY_MODE").ok().as_deref());
 
-    let components_env = env_path("IDORIS_COMPONENTS_DIR")?;
-    let components_dir = resolve_bundle_path(
-        components_env.as_deref(),
-        components::DEFAULT_COMPONENTS_DIR,
-    )?;
+    let components_dir =
+        config::resolve_env("IDORIS_COMPONENTS_DIR", components::DEFAULT_COMPONENTS_DIR)?;
     let allow_mock = env_flag("IDORIS_ALLOW_MOCK");
     let cards = components::load_components(&components_dir, allow_mock).map_err(|err| {
         format!(
@@ -82,9 +56,8 @@ async fn run() -> Result<(), String> {
     })?;
 
     // Load once and retain the validated policy for both execution paths.
-    let policy_env = env_path("IDORIS_ROUTING_POLICY")?;
-    let routing_policy_path = resolve_bundle_path(
-        policy_env.as_deref(),
+    let routing_policy_path = config::resolve_env(
+        "IDORIS_ROUTING_POLICY",
         routing_policy::DEFAULT_ROUTING_POLICY_PATH,
     )?;
     let routing_policy =

@@ -10,22 +10,26 @@ use tower::ServiceExt;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-fn card(endpoint: &str) -> ComponentCard {
+fn card_with_provider(provider_id: &str, endpoint: &str) -> ComponentCard {
     let mut card: ComponentCard =
         serde_yaml::from_str(include_str!("../../../config/components/omlx.yaml")).unwrap();
-    card.provider.id = "Qwen3-0.6B-4bit".into();
+    card.provider.id = provider_id.into();
     card.endpoint = endpoint.into();
     card
 }
 
-async fn app(server: &MockServer) -> axum::Router {
-    let card = card(&server.uri());
+async fn app_with_provider(server: &MockServer, provider_id: &str) -> axum::Router {
+    let card = card_with_provider(provider_id, &server.uri());
     let supervisor = BoundSupervisor::spawn_omlx(&card).unwrap();
     build_app(AppState {
         cards: vec![card],
         runtimes: Some(supervisor).into(),
         ..AppState::default()
     })
+}
+
+async fn app(server: &MockServer) -> axum::Router {
+    app_with_provider(server, "Qwen3-0.6B-4bit").await
 }
 
 fn request(model: &str) -> Request<Body> {
@@ -38,28 +42,6 @@ fn request(model: &str) -> Request<Body> {
             r#"{{"model":"{model}","messages":[{{"role":"user","content":"hi"}}]}}"#
         )))
         .unwrap()
-}
-
-#[tokio::test]
-async fn rejects_unselected_concrete_model_after_selection_without_backend_calls() {
-    let upstream = MockServer::start().await;
-    let response = app(&upstream)
-        .await
-        .oneshot(request("gpt-4o"))
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(response.headers()["X-iDoris-Served-Locality"], "loopback");
-    let body = response.into_body().collect().await.unwrap().to_bytes();
-    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(body["error"]["type"], "unsupported_field");
-    assert!(
-        body["error"]["remediation"]
-            .as_str()
-            .unwrap()
-            .contains("idoris/<role>")
-    );
-    assert!(upstream.received_requests().await.unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -89,6 +71,13 @@ async fn rejects_present_but_empty_or_non_string_model_after_selection() {
 }
 
 async fn mount_omlx_success(server: &MockServer) {
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": [{"id":"Qwen3-0.6B-4bit"}]
+        })))
+        .mount(server)
+        .await;
     Mock::given(method("GET"))
         .and(path("/api/status"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -163,4 +152,35 @@ async fn whitespace_padded_role_alias_reports_actual_model_identity() {
 #[tokio::test]
 async fn matching_concrete_model_is_accepted_and_reported() {
     assert_served_model("Qwen3-0.6B-4bit").await;
+}
+
+#[tokio::test]
+async fn concrete_model_is_forwarded_when_provider_id_differs() {
+    let upstream = MockServer::start().await;
+    mount_omlx_success(&upstream).await;
+    let response = app_with_provider(&upstream, "omlx")
+        .await
+        .oneshot(request("Qwen3-0.6B-4bit"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let requests = upstream.received_requests().await.unwrap();
+    assert!(
+        requests
+            .iter()
+            .any(|request| request.url.path() == "/v1/models/Qwen3-0.6B-4bit/load")
+    );
+    assert!(
+        !requests
+            .iter()
+            .any(|request| request.url.path().contains("/omlx/"))
+    );
+    let chat = requests
+        .iter()
+        .find(|request| request.url.path() == "/v1/chat/completions")
+        .unwrap();
+    assert_eq!(
+        chat.body_json::<serde_json::Value>().unwrap()["model"],
+        "Qwen3-0.6B-4bit"
+    );
 }

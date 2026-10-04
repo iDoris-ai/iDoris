@@ -57,6 +57,7 @@ ring = "0.17"
 
 [dev-dependencies]
 async-trait = { workspace = true }
+rusqlite = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
