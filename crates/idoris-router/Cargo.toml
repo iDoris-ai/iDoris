@@ -23,6 +23,7 @@ idoris-contracts = { workspace = true }
 idoris-policy = { workspace = true }
 idoris-backend = { workspace = true }
 idoris-tenancy = { workspace = true }
+idoris-recommender = { workspace = true }
 # R2-G task 1 (CLI wiring): a real oMLX-shaped card (LoadMode::OnDemand/
 # EvictToLoad, needing the Supervisor's explicit load/unload lifecycle) is
 # served via OmlxAdapter, distinct from the direct-forward `proxy` path
@@ -35,6 +36,7 @@ tokio-util = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = "0.9"
+thiserror = { workspace = true }
 uuid = { workspace = true }
 # R2-G: direct HTTP forwarding for a generic (non-oMLX) `http_service`
 # component card — `GET /v1/models` (this PR) and `POST
@@ -57,6 +59,7 @@ ring = "0.17"
 
 [dev-dependencies]
 async-trait = { workspace = true }
+rusqlite = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"

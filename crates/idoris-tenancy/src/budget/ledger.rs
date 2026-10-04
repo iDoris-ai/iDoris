@@ -10,6 +10,7 @@
 //! (`settle`) independently callable, independently testable operations —
 //! which is why they're two methods here, not one.
 
+use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -34,6 +35,7 @@ use super::scope::BudgetScope;
 /// risk from this existing.
 #[cfg(feature = "mutation-test-hooks")]
 pub mod test_hooks {
+    use std::cell::RefCell;
     use std::sync::{Barrier, OnceLock};
 
     /// When armed (via [`arm`]), `reserve` commits its balance-check
@@ -47,6 +49,12 @@ pub mod test_hooks {
     /// all committed their checks).
     static BARRIER: OnceLock<Barrier> = OnceLock::new();
 
+    // Thread-local scheduling keeps unrelated tests in this process isolated;
+    // the callback only schedules an interleaving and does not split a transaction.
+    thread_local! {
+        static READVIEW_AFTER_SPENT: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+    }
+
     /// Arm the hook for `thread_count` participants. Call once before
     /// spawning the threads that will call `reserve`; each of them must
     /// actually call `reserve` exactly once for the barrier to release.
@@ -59,6 +67,22 @@ pub mod test_hooks {
     /// `None` when not armed — `reserve` skips the hook entirely.
     pub(super) fn barrier() -> Option<&'static Barrier> {
         BARRIER.get()
+    }
+
+    /// Arm a one-shot callback after `tenant_readview` reads settled spend.
+    pub fn arm_readview_after_spent(hook: impl FnOnce() + 'static) {
+        READVIEW_AFTER_SPENT.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            assert!(slot.is_none(), "readview hook already armed on this thread");
+            *slot = Some(Box::new(hook));
+        });
+    }
+
+    pub(super) fn after_readview_spent() {
+        let hook = READVIEW_AFTER_SPENT.with(|slot| slot.borrow_mut().take());
+        if let Some(hook) = hook {
+            hook();
+        }
     }
 }
 
@@ -166,6 +190,23 @@ pub enum SpendGate {
     PaidOnly,
     /// Every candidate is checked, including zero-cost ones.
     All,
+}
+
+/// Read-only tenant budget snapshot. This is observability data, not an
+/// admission decision: it may be stale as soon as it is returned.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TenantBudgetReadView {
+    pub tenant_id: String,
+    pub period: String,
+    pub limit_minor: i64,
+    pub spent_minor: i64,
+    pub reserved_minor: i64,
+    /// Limit minus settled spend; reservations do not reduce this amount.
+    pub remaining_minor: i64,
+    /// Remaining minus active, unexpired reservations. May be negative.
+    pub available_minor: i64,
+    pub billing_timezone: String,
+    pub scope: SpendGate,
 }
 
 impl SpendGate {
@@ -408,6 +449,39 @@ impl BudgetLedger {
         Ok(())
     }
 
+    /// Reconcile trusted tenant authorization at process bootstrap.
+    /// Historical spend/reservation rows are preserved; only tenant-level
+    /// and sub-scope configuration for tenants absent from `keep` is revoked.
+    pub fn retain_tenants(&self, keep: &BTreeSet<String>) -> Result<usize, BudgetError> {
+        let mut conn = self.lock();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut stale = BTreeSet::new();
+        {
+            let mut stmt = tx.prepare(
+                "SELECT tenant_id FROM tenant_config UNION SELECT tenant_id FROM budget_config",
+            )?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            for row in rows {
+                let tenant_id = row?;
+                if !keep.contains(&tenant_id) {
+                    stale.insert(tenant_id);
+                }
+            }
+        }
+        for tenant_id in &stale {
+            tx.execute(
+                "DELETE FROM budget_config WHERE tenant_id = ?1",
+                rusqlite::params![tenant_id],
+            )?;
+            tx.execute(
+                "DELETE FROM tenant_config WHERE tenant_id = ?1",
+                rusqlite::params![tenant_id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(stale.len())
+    }
+
     /// Read-only remaining balance for `scope`: `limit - settled_spend -
     /// active_reservations`. All three reads share one `BEGIN DEFERRED`
     /// transaction for a consistent snapshot — otherwise a racing `settle()`
@@ -452,6 +526,42 @@ impl BudgetLedger {
             config.limit_minor,
             checked_add_i64(spent, reserved),
         ))
+    }
+
+    /// Return a consistent, read-only snapshot of a tenant's current-period
+    /// budget. This snapshot is not an admission decision and may become
+    /// stale immediately; use `reserve` to decide whether spending can proceed.
+    pub fn tenant_readview(&self, tenant_id: &str) -> Result<TenantBudgetReadView, BudgetError> {
+        if tenant_id.trim().is_empty() {
+            return Err(BudgetError::InvalidScope { field: "tenant_id" });
+        }
+        let now_ms = self.clock.now_ms();
+        let mut conn = self.lock();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        let config = load_tenant_config(&tx, tenant_id)?.ok_or_else(|| {
+            BudgetError::TenantNotConfigured {
+                tenant_id: tenant_id.to_string(),
+            }
+        })?;
+        let period = billing_period_key(now_ms, &config.billing_timezone)?;
+        let spent = tenant_spent_for(&tx, tenant_id, &period)?;
+        #[cfg(feature = "mutation-test-hooks")]
+        test_hooks::after_readview_spent();
+        let reserved = tenant_active_reserved_for(&tx, tenant_id, &period, now_ms)?;
+        tx.rollback()?;
+        let remaining = checked_sub_i64(config.limit_minor, spent);
+        let available = checked_sub_i64(remaining, reserved);
+        Ok(TenantBudgetReadView {
+            tenant_id: tenant_id.to_string(),
+            period,
+            limit_minor: config.limit_minor,
+            spent_minor: spent,
+            reserved_minor: reserved,
+            remaining_minor: remaining,
+            available_minor: available,
+            billing_timezone: config.billing_timezone,
+            scope: config.gate,
+        })
     }
 
     /// Atomically check-and-deduct: inside one `BEGIN IMMEDIATE` transaction,
@@ -1870,6 +1980,56 @@ mod tests {
             ledger.tenant_balance("acme-co"),
             Err(BudgetError::TenantNotConfigured { .. })
         ));
+    }
+
+    #[test]
+    fn retain_tenants_revokes_stale_config_but_keeps_spend_history() {
+        let path = temp_db_path("retain-tenants");
+        let ledger = BudgetLedger::open(&path).expect("open");
+        let beta = BudgetScope::new("beta", "key", "provider", "model");
+        ledger
+            .configure_tenant("beta", 100, "UTC", SpendGate::All)
+            .expect("configure beta tenant");
+        ledger
+            .configure(&beta, 100, "UTC")
+            .expect("configure beta scope");
+        let reservation = ledger
+            .reserve(&beta, Price::Known(10))
+            .expect("reserve beta before revocation");
+        ledger
+            .settle("beta", &reservation, 7)
+            .expect("settle beta before revocation");
+        ledger
+            .configure_tenant("acme", 100, "UTC", SpendGate::All)
+            .expect("configure acme");
+
+        let keep = BTreeSet::from(["acme".to_string()]);
+        assert_eq!(ledger.retain_tenants(&keep).expect("retain"), 1);
+        assert!(matches!(
+            ledger.tenant_readview("beta"),
+            Err(BudgetError::TenantNotConfigured { .. })
+        ));
+        assert!(matches!(
+            ledger.reserve(&beta, Price::Known(1)),
+            Err(BudgetError::NotConfigured { .. })
+        ));
+
+        let conn = ledger.lock();
+        let tenant_spent: i64 = conn
+            .query_row(
+                "SELECT spent_minor FROM tenant_periods WHERE tenant_id='beta'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("tenant spend history survives revocation");
+        let scope_spent: i64 = conn
+            .query_row(
+                "SELECT spent_minor FROM budget_periods WHERE tenant_id='beta'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("scope spend history survives revocation");
+        assert_eq!((tenant_spent, scope_spent), (7, 7));
     }
 
     #[test]

@@ -1,7 +1,5 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use std::time::{Duration, Instant};
-
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use idoris_contracts::ComponentCard;
@@ -16,45 +14,6 @@ fn card(id: &str, endpoint: &str) -> ComponentCard {
     card.provider.id = id.to_string();
     card.endpoint = endpoint.to_string();
     card
-}
-
-#[test]
-fn k03_two_lifecycle_cards_exit_nonzero_before_listening() {
-    let dir = tempfile::tempdir().unwrap();
-    for id in ["a", "b"] {
-        std::fs::write(
-            dir.path().join(format!("{id}.yaml")),
-            serde_yaml::to_string(&card(id, "http://127.0.0.1:8088")).unwrap(),
-        )
-        .unwrap();
-    }
-    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_idoris"))
-        .current_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/../.."))
-        .env("IDORIS_COMPONENTS_DIR", dir.path())
-        .env("IDORIS_ROUTING_POLICY", "config/routing-policy.yaml")
-        .env("IDORIS_PORT", "19873")
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(2);
-    while child.try_wait().unwrap().is_none() && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    let timed_out = child.try_wait().unwrap().is_none();
-    if timed_out {
-        child.kill().unwrap();
-    }
-    let output = child.wait_with_output().unwrap();
-    assert!(
-        !timed_out,
-        "two lifecycle cards were accepted and server kept running"
-    );
-    assert!(!output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("多个 lifecycle"), "{stderr}");
-    assert!(stderr.contains("a") && stderr.contains("b"), "{stderr}");
-    assert!(!String::from_utf8_lossy(&output.stdout).contains("listening"));
 }
 
 async fn mismatch_is_blocked(same_provider: bool, same_endpoint: bool) {
@@ -74,7 +33,7 @@ async fn mismatch_is_blocked(same_provider: bool, same_endpoint: bool) {
     let supervisor = BoundSupervisor::spawn_omlx(&bound_card).unwrap();
     let app = build_app(AppState {
         cards: vec![selected],
-        supervisor: Some(supervisor),
+        runtimes: Some(supervisor).into(),
         ..AppState::default()
     });
     let response = app

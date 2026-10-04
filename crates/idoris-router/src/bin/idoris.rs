@@ -16,17 +16,22 @@
 //! lifecycle) never touches this Supervisor at all — `AppState.proxy`
 //! forwards to it directly per-request instead.
 
-use idoris_contracts::ComponentCard;
-use idoris_contracts::component_card::Form;
-use idoris_router::dispatch::{BoundSupervisor, is_resident_http_service};
 use idoris_router::{
-    AppState, BIND_HOST, build_app, components, parse_port, routing_policy,
+    AppState, BIND_HOST, build_app,
+    capabilities::{CapabilitiesProvider, LiveCapabilitiesProvider},
+    cli, components, config, host_facts, parse_port, profile, routing_policy,
+    runtime::RuntimeRegistry,
+    storage,
     write_timeout::{DEFAULT_WRITE_TIMEOUT, WriteTimeoutListener},
 };
-use std::path::PathBuf;
+use std::sync::Arc;
 
 #[tokio::main]
 async fn main() {
+    if let Err(message) = cli::parse_args(std::env::args_os().skip(1)) {
+        eprintln!("[idoris] {message}");
+        std::process::exit(1);
+    }
     if let Err(message) = run().await {
         eprintln!("[idoris] 启动失败：{message}");
         std::process::exit(1);
@@ -37,62 +42,14 @@ fn env_flag(name: &str) -> bool {
     std::env::var(name).is_ok_and(|v| v == "1")
 }
 
-fn env_path(name: &str) -> Result<Option<String>, String> {
-    std::env::var_os(name)
-        .map(|value| {
-            value
-                .into_string()
-                .map_err(|_| format!("环境变量 {name} 不是有效的 Unicode 路径"))
-        })
-        .transpose()
-}
-
-fn resolve_bundle_path(raw: Option<&str>, default_relative: &str) -> Result<PathBuf, String> {
-    if let Some(value) = raw.map(str::trim).filter(|value| !value.is_empty()) {
-        return Ok(PathBuf::from(value));
-    }
-    let executable =
-        std::env::current_exe().map_err(|err| format!("无法定位当前可执行文件：{err}"))?;
-    let parent = executable
-        .parent()
-        .ok_or_else(|| "当前可执行文件没有父目录".to_string())?;
-    Ok(parent.join(default_relative))
-}
-
-/// Until there is a per-provider registry, accept at most one lifecycle
-/// backend. Resident HTTP services are forwarded directly and do not count.
-fn spawn_supervisor_for_omlx_card(
-    cards: &[ComponentCard],
-) -> Result<Option<BoundSupervisor>, String> {
-    let lifecycle: Vec<_> = cards
-        .iter()
-        .filter(|c| c.form == Form::HttpService && !is_resident_http_service(c))
-        .collect();
-    if lifecycle.len() > 1 {
-        let providers = lifecycle
-            .iter()
-            .map(|c| c.provider.id.as_str())
-            .collect::<Vec<_>>()
-            .join(", ");
-        return Err(format!(
-            "暂不支持多个 lifecycle 后端（{providers}）；请仅配置一个非 Resident 的 http_service 后端"
-        ));
-    }
-    lifecycle
-        .first()
-        .map(|card| BoundSupervisor::spawn_omlx(card))
-        .transpose()
-}
-
 async fn run() -> Result<(), String> {
     let port =
         parse_port(std::env::var("IDORIS_PORT").ok().as_deref()).map_err(|err| err.to_string())?;
+    let deploy_mode =
+        profile::deploy_mode_from_env(std::env::var("IDORIS_DEPLOY_MODE").ok().as_deref());
 
-    let components_env = env_path("IDORIS_COMPONENTS_DIR")?;
-    let components_dir = resolve_bundle_path(
-        components_env.as_deref(),
-        components::DEFAULT_COMPONENTS_DIR,
-    )?;
+    let components_dir =
+        config::resolve_env("IDORIS_COMPONENTS_DIR", components::DEFAULT_COMPONENTS_DIR)?;
     let allow_mock = env_flag("IDORIS_ALLOW_MOCK");
     let cards = components::load_components(&components_dir, allow_mock).map_err(|err| {
         format!(
@@ -102,9 +59,8 @@ async fn run() -> Result<(), String> {
     })?;
 
     // Load once and retain the validated policy for both execution paths.
-    let policy_env = env_path("IDORIS_ROUTING_POLICY")?;
-    let routing_policy_path = resolve_bundle_path(
-        policy_env.as_deref(),
+    let routing_policy_path = config::resolve_env(
+        "IDORIS_ROUTING_POLICY",
         routing_policy::DEFAULT_ROUTING_POLICY_PATH,
     )?;
     let routing_policy =
@@ -115,7 +71,34 @@ async fn run() -> Result<(), String> {
             )
         })?;
 
-    let supervisor = spawn_supervisor_for_omlx_card(&cards)?;
+    let runtimes = RuntimeRegistry::spawn(&cards)?;
+    // Preserve existing startup-gate precedence: component/policy/runtime
+    // validation (including the K04 subscription hard rejection) must fail
+    // before tenant storage/config bootstrap can surface a later error.
+    let persistent = storage::bootstrap_process(deploy_mode)
+        .map_err(|err| format!("无法初始化持久化存储：{err}"))?;
+
+    let catalog_path = config::resolve_env("IDORIS_CATALOG", "config/catalog.yaml")?;
+    let capabilities = match host_facts::current_host_facts() {
+        Ok(facts) => {
+            let catalog =
+                idoris_recommender::catalog::load_catalog(&catalog_path).map_err(|error| {
+                    format!(
+                        "无法加载模型目录 \"{}\"（IDORIS_CATALOG）：{error}",
+                        catalog_path.display()
+                    )
+                })?;
+            Some(Arc::new(LiveCapabilitiesProvider::new(
+                catalog,
+                facts,
+                runtimes.clone(),
+            )) as Arc<dyn CapabilitiesProvider>)
+        }
+        Err(error) => {
+            eprintln!("[idoris] capabilities unavailable: {error}");
+            None
+        }
+    };
 
     let component_list = cards
         .iter()
@@ -123,9 +106,13 @@ async fn run() -> Result<(), String> {
         .collect::<Vec<_>>()
         .join(", ");
     let state = AppState {
+        deploy_mode,
         cards,
         routing_policy,
-        supervisor,
+        runtimes,
+        capabilities,
+        budget_ledger: Some(persistent.budget),
+        record_store: Some(persistent.records),
         ..AppState::default()
     };
 
@@ -150,36 +137,4 @@ async fn run() -> Result<(), String> {
     )
     .await
     .map_err(|err| format!("server error: {err}"))
-}
-
-#[cfg(test)]
-#[allow(clippy::unwrap_used)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn k03_missing_policy_counts_but_resident_http_does_not() {
-        let mut lifecycle: ComponentCard =
-            serde_yaml::from_str(include_str!("../../../../config/components/omlx.yaml")).unwrap();
-        lifecycle.load_policy = None;
-        let mut second = lifecycle.clone();
-        second.provider.id = "second".to_string();
-        assert!(spawn_supervisor_for_omlx_card(&[lifecycle.clone(), second]).is_err());
-        let mut resident: ComponentCard =
-            serde_yaml::from_str(include_str!("../../../../config/components/omlx.yaml")).unwrap();
-        resident.provider.id = "resident".to_string();
-        resident.load_policy.as_mut().unwrap().mode =
-            idoris_contracts::load_policy::LoadMode::Resident;
-        assert!(
-            spawn_supervisor_for_omlx_card(&[lifecycle, resident.clone()])
-                .unwrap()
-                .is_some()
-        );
-        assert!(
-            spawn_supervisor_for_omlx_card(&[resident])
-                .unwrap()
-                .is_none()
-        );
-        assert!(spawn_supervisor_for_omlx_card(&[]).unwrap().is_none());
-    }
 }

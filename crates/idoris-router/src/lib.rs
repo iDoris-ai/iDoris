@@ -9,9 +9,17 @@
 /// Control-plane header parsing (R2-D task 1).
 pub mod profile;
 
+/// Packaged binary command-line parsing.
+pub mod cli;
+
+/// Offline intent embedding primitives (B1 task 09).
+pub mod intent;
+
 /// Component card loading from `IDORIS_COMPONENTS_DIR` (R2-D task 2); wired
 /// into `AppState`/`/health`'s `components` count in a follow-up PR.
 pub mod components;
+/// Executable-relative bundled config resolution with explicit-path overrides.
+pub mod config;
 
 /// Routing-policy loading from `IDORIS_ROUTING_POLICY` (R2-D task 2); wired
 /// into `AppState` in a follow-up PR.
@@ -21,19 +29,39 @@ pub mod routing_policy;
 /// needed) `Supervisor` load → `Supervisor` chat.
 pub mod dispatch;
 
+/// Per-card runtime construction for lifecycle-managed providers.
+pub mod runtime;
+
 /// Atomic reserve/settle/release around a paid candidate (R2-D task 4); not
 /// yet wired into `dispatch`/the request path — a follow-up PR does that.
 pub mod budget;
 
+/// Per-provider cooldown for models discovery.
+pub mod health;
+
 /// `GET /v1/models` (R2-G): aggregates every registered `http_service`
 /// card's own model listing.
 pub mod models;
+
+/// Metadata-only audit validation and tenant-scoped persistence (B1 task19).
+pub mod audit;
+mod audit_body;
+/// Injectable `/capabilities` provider boundary (B1 task32). Live capacity
+/// aggregation is wired by task33.
+pub mod capabilities;
+pub mod host_facts;
+/// Stable four-way routing/audit reason taxonomy.
+pub mod reason;
+/// Persistent record/budget storage bootstrap (B1 task18).
+pub mod storage;
+mod usage;
 
 /// Direct HTTP forwarding for a generic `http_service` component card's
 /// `POST /v1/chat/completions` (R2-G) — retries, idempotency cache; wired
 /// into `chat_completions`/`AppState` below (see the module's own doc for
 /// why this is a genuinely separate path from `dispatch::dispatch_local`).
 pub mod proxy;
+pub mod queries;
 
 mod sse;
 mod supervisor_parameters;
@@ -44,11 +72,12 @@ pub mod write_timeout;
 
 use std::net::IpAddr;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use axum::body::{Body, Bytes};
-use axum::extract::{Extension, Request, State};
-use axum::http::{HeaderMap, HeaderValue, StatusCode};
+use axum::extract::{Extension, Path, Query, Request, State};
+use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -160,21 +189,31 @@ pub struct AppState {
     /// Startup-validated YAML routing policy. Tests use an in-memory local
     /// default so `AppState::default()` performs no filesystem I/O.
     pub routing_policy: idoris_contracts::RoutingPolicy,
-    /// Backs the local dispatch path (R2-D task 3); `None` means no local
-    /// backend is wired — dispatch then fails closed as
-    /// `local_only_unavailable` rather than panicking on a missing handle.
-    pub supervisor: Option<dispatch::BoundSupervisor>,
+    /// Lifecycle runtimes keyed by provider id. Missing selected providers
+    /// fail closed instead of falling through to another backend.
+    pub runtimes: runtime::RuntimeRegistry,
     /// Gates every candidate, including zero cost, through the ledger's
     /// SpendGate. `None` fails paid candidates closed while free candidates
     /// remain usable without a ledger. `Arc`
     /// because `BudgetLedger` (wraps a `Mutex<Connection>`) isn't `Clone`.
     pub budget_ledger: Option<Arc<idoris_tenancy::budget::BudgetLedger>>,
+    /// Tenant-scoped audit/usage record store. Startup installs it together
+    /// with `budget_ledger` from the same SQLite path.
+    pub record_store: Option<Arc<std::sync::Mutex<idoris_tenancy::store::TenantStore>>>,
+    /// Best-effort audit persistence failures. Audit must not alter the HTTP
+    /// result already produced by routing/backend execution.
+    pub audit_failures: Arc<AtomicU64>,
     /// Outbound HTTP client for `GET /v1/models` (this PR) and the direct
     /// `http_service` chat-forwarding path (follow-up PR) — one client
     /// shared across requests so its connection pool is actually reused,
     /// matching `reqwest::Client`'s own documented cloning contract (cheap,
     /// `Arc`-backed clone, not a new connection pool per clone).
     pub http_client: reqwest::Client,
+    /// Shared across requests and AppState clones.
+    pub models_health: Arc<health::HealthTracker>,
+    /// Capacity surface provider. `None` is deliberately unavailable rather
+    /// than a fake static snapshot; task33 installs the live implementation.
+    pub capabilities: Option<Arc<dyn capabilities::CapabilitiesProvider>>,
     /// R2-G: direct-forward path for a `LoadMode::Resident` `http_service`
     /// candidate (see `dispatch::select`/`is_resident_http_service`'s doc).
     /// `Arc` because `ChatProxy` holds a `Mutex`-guarded cache, same reason
@@ -189,12 +228,24 @@ impl std::fmt::Debug for AppState {
             .field("deploy_mode", &self.deploy_mode)
             .field("cards", &self.cards)
             .field("routing_policy", &self.routing_policy)
-            .field("supervisor", &self.supervisor)
+            .field("runtimes", &self.runtimes)
             .field(
                 "budget_ledger",
                 &self.budget_ledger.as_ref().map(|_| "BudgetLedger { .. }"),
             )
+            .field(
+                "record_store",
+                &self.record_store.as_ref().map(|_| "TenantStore { .. }"),
+            )
+            .field(
+                "audit_failures",
+                &self.audit_failures.load(Ordering::Relaxed),
+            )
             .field("http_client", &self.http_client)
+            .field(
+                "capabilities",
+                &self.capabilities.as_ref().map(|_| "configured"),
+            )
             .field("proxy", &"ChatProxy { .. }")
             .finish()
     }
@@ -223,8 +274,12 @@ impl Default for AppState {
                     },
                 },
             },
-            supervisor: None,
+            runtimes: runtime::RuntimeRegistry::default(),
             budget_ledger: None,
+            record_store: None,
+            audit_failures: Arc::new(AtomicU64::new(0)),
+            models_health: Arc::new(health::HealthTracker::default()),
+            capabilities: None,
             proxy: Arc::new(proxy::ChatProxy::new(http_client.clone())),
             http_client,
         }
@@ -235,23 +290,241 @@ impl Default for AppState {
 /// `501` fallback for everything else, and the `X-iDoris-Record-Id`
 /// middleware applied to every response.
 pub fn build_app(state: AppState) -> Router {
+    let state = Arc::new(state);
     Router::new()
         .route("/health", get(health))
         .route("/v1/models", get(list_models).fallback(not_found))
+        .route("/capabilities", get(get_capabilities).fallback(not_found))
+        .route(
+            "/idoris/tenants/{tenant_id}/usage",
+            get(get_tenant_usage).fallback(not_found),
+        )
+        .route(
+            "/idoris/tenants/{tenant_id}/audit",
+            get(get_tenant_audit).fallback(not_found),
+        )
+        .route(
+            "/idoris/tenants/{tenant_id}/budget",
+            get(get_tenant_budget).fallback(not_found),
+        )
         .route(
             "/v1/chat/completions",
             post(chat_completions).fallback(not_found),
         )
         .fallback(not_found)
-        .with_state(Arc::new(state))
-        .layer(middleware::from_fn(record_id_middleware))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            record_id_middleware,
+        ))
+        .with_state(state)
+}
+
+async fn get_tenant_usage(
+    State(state): State<Arc<AppState>>,
+    Path(tenant_id): Path<String>,
+    headers: HeaderMap,
+    query: Result<Query<queries::usage::UsageQuery>, axum::extract::rejection::QueryRejection>,
+) -> Response {
+    let Query(query) = match query {
+        Ok(query) => query,
+        Err(_) => {
+            return error_envelope(
+                StatusCode::BAD_REQUEST,
+                "invalid_query",
+                "usage query must contain only period=YYYY-MM",
+            );
+        }
+    };
+    let scope_tenant = query_scope_header(&headers).map(str::to_string);
+    let (Some(store), Some(ledger)) = (state.record_store.clone(), state.budget_ledger.clone())
+    else {
+        return error_envelope(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "usage_unavailable",
+            "tenant usage storage is not configured",
+        );
+    };
+    let result = tokio::task::spawn_blocking(move || {
+        let guard = store
+            .lock()
+            .map_err(|_| queries::usage::UsageQueryError::StorePoisoned)?;
+        queries::usage::query_usage(&guard, &ledger, &tenant_id, scope_tenant.as_deref(), &query)
+    })
+    .await;
+    match result {
+        Ok(Ok(usage)) => Json(usage).into_response(),
+        Ok(Err(
+            err @ (queries::usage::UsageQueryError::ScopeRequired
+            | queries::usage::UsageQueryError::ScopeMismatch),
+        )) => error_envelope(
+            StatusCode::BAD_REQUEST,
+            "invalid_tenant_scope",
+            err.to_string(),
+        ),
+        Ok(Err(queries::usage::UsageQueryError::Billing(
+            idoris_tenancy::billing::BillingAggregateError::Period(err),
+        ))) => error_envelope(StatusCode::BAD_REQUEST, "invalid_query", err.to_string()),
+        Ok(Err(queries::usage::UsageQueryError::Budget(
+            idoris_tenancy::budget::BudgetError::TenantNotConfigured { tenant_id },
+        ))) => error_envelope(
+            StatusCode::NOT_FOUND,
+            "tenant_not_found",
+            format!("tenant {tenant_id:?} is not configured"),
+        ),
+        Ok(Err(err)) => error_envelope(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "usage_unavailable",
+            err.to_string(),
+        ),
+        Err(_) => error_envelope(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "usage_unavailable",
+            "usage query worker failed",
+        ),
+    }
+}
+
+async fn get_tenant_audit(
+    State(state): State<Arc<AppState>>,
+    Path(tenant_id): Path<String>,
+    headers: HeaderMap,
+    query: Result<Query<queries::audit::AuditQuery>, axum::extract::rejection::QueryRejection>,
+) -> Response {
+    let Query(query) = match query {
+        Ok(query) => query,
+        Err(_) => {
+            return error_envelope(
+                StatusCode::BAD_REQUEST,
+                "invalid_query",
+                "audit query accepts only from, to, limit, and record_id",
+            );
+        }
+    };
+    let scope_tenant = query_scope_header(&headers).map(str::to_string);
+    let Some(store) = state.record_store.clone() else {
+        return error_envelope(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "audit_unavailable",
+            "tenant audit storage is not configured",
+        );
+    };
+    let result = tokio::task::spawn_blocking(move || {
+        let guard = store
+            .lock()
+            .map_err(|_| queries::audit::AuditQueryError::StorePoisoned)?;
+        queries::audit::query_audit(&guard, &tenant_id, scope_tenant.as_deref(), &query)
+    })
+    .await;
+    match result {
+        Ok(Ok(audit)) => Json(audit).into_response(),
+        Ok(Err(
+            err @ (queries::audit::AuditQueryError::ScopeRequired
+            | queries::audit::AuditQueryError::ScopeMismatch),
+        )) => error_envelope(
+            StatusCode::BAD_REQUEST,
+            "invalid_tenant_scope",
+            err.to_string(),
+        ),
+        Ok(Err(
+            err @ (queries::audit::AuditQueryError::InvalidLimit
+            | queries::audit::AuditQueryError::InvalidRange),
+        )) => error_envelope(StatusCode::BAD_REQUEST, "invalid_query", err.to_string()),
+        Ok(Err(err)) => error_envelope(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "audit_unavailable",
+            err.to_string(),
+        ),
+        Err(_) => error_envelope(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "audit_unavailable",
+            "audit query worker failed",
+        ),
+    }
+}
+
+async fn get_tenant_budget(
+    State(state): State<Arc<AppState>>,
+    Path(tenant_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let scope_tenant = query_scope_header(&headers).map(str::to_string);
+    let Some(ledger) = state.budget_ledger.clone() else {
+        return error_envelope(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "budget_unavailable",
+            "tenant budget storage is not configured",
+        );
+    };
+    let result = tokio::task::spawn_blocking(move || {
+        queries::budget::query_budget(&ledger, &tenant_id, scope_tenant.as_deref())
+    })
+    .await;
+    match result {
+        Ok(Ok(view)) => Json(view).into_response(),
+        Ok(Err(
+            err @ (queries::budget::BudgetQueryError::ScopeRequired
+            | queries::budget::BudgetQueryError::ScopeMismatch),
+        )) => error_envelope(
+            StatusCode::BAD_REQUEST,
+            "invalid_tenant_scope",
+            err.to_string(),
+        ),
+        Ok(Err(queries::budget::BudgetQueryError::Budget(
+            idoris_tenancy::budget::BudgetError::TenantNotConfigured { tenant_id },
+        ))) => error_envelope(
+            StatusCode::NOT_FOUND,
+            "tenant_not_found",
+            format!("tenant {tenant_id:?} is not configured"),
+        ),
+        Ok(Err(err)) => error_envelope(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "budget_unavailable",
+            err.to_string(),
+        ),
+        Err(_) => error_envelope(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "budget_unavailable",
+            "budget query worker failed",
+        ),
+    }
+}
+
+fn query_scope_header(headers: &HeaderMap) -> Option<&str> {
+    let mut values = headers.get_all("x-idoris-tenant").iter();
+    let first = values.next()?;
+    if values.next().is_some() {
+        return None;
+    }
+    first
+        .to_str()
+        .ok()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+async fn get_capabilities(State(state): State<Arc<AppState>>) -> Response {
+    let Some(provider) = state.capabilities.as_ref() else {
+        return error_envelope(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "capabilities_unavailable",
+            "capacity provider is not configured",
+        );
+    };
+    match provider.snapshot().await {
+        Ok(entries) => Json(entries).into_response(),
+        Err(_) => error_envelope(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "capabilities_unavailable",
+            "capacity snapshot is unavailable",
+        ),
+    }
 }
 
 /// `GET /v1/models` (interface spec — `owned_by` is each card's
 /// `provider.id`, matching `server.ts`). Delegates to [`models::list_models`];
 /// authentication failures surface as structured upstream errors.
 async fn list_models(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    match models::list_models(&state.http_client, &state.cards).await {
+    match models::list_models(&state.http_client, &state.cards, &state.models_health).await {
         Ok(models) => Json(models).into_response(),
         Err(models::ModelsError::UpstreamAuthenticationFailed { locality, .. }) => {
             let mut response = error_envelope_with_reason(
@@ -373,14 +646,18 @@ fn rough_token_estimate(text: &str) -> u64 {
 /// `openAIChatCompletion` (`packages/adapters/subscription/relay.ts`).
 /// The returned model is the backend's resolved identity, never the caller's
 /// alias or requested value.
-fn openai_chat_completion(content: &str, served_model: &str, prompt: &str) -> serde_json::Value {
+fn openai_chat_completion(
+    content: &str,
+    served_model: &str,
+    prompt: &str,
+) -> (serde_json::Value, u64, u64) {
     let created = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
     let prompt_tokens = rough_token_estimate(prompt);
     let completion_tokens = rough_token_estimate(content);
-    json!({
+    let body = json!({
         "id": format!("chatcmpl-idoris-{}", Uuid::new_v4()),
         "object": "chat.completion",
         "created": created,
@@ -391,7 +668,8 @@ fn openai_chat_completion(content: &str, served_model: &str, prompt: &str) -> se
             "completion_tokens": completion_tokens,
             "total_tokens": prompt_tokens + completion_tokens,
         },
-    })
+    });
+    (body, prompt_tokens, completion_tokens)
 }
 
 /// Sets `X-iDoris-Served-Locality` (always, once a candidate is chosen —
@@ -528,6 +806,7 @@ async fn chat_completions(
     };
 
     let messages = extract_messages(object);
+    let parsed = intent::resolve_profile(parsed, &messages).await;
     let prompt = messages
         .iter()
         .map(|m| m.content.as_str())
@@ -585,18 +864,13 @@ async fn chat_completions(
         }
     }
 
-    // Concrete model IDs are informational in the iDoris × Agent24 contract;
-    // callers select a stable role and iDoris chooses its model. For this
-    // Supervisor-bound path we can verify that an explicit concrete ID names
-    // the selected card. Do so after selection so the response truthfully
-    // reports the selected locality. Resident HTTP proxies retain upstream
-    // model handling above (including arbitrary conformance fixture IDs).
+    // A present model field must be a non-empty string. Concrete model ids
+    // are forwarded to the selected lifecycle backend below; role aliases
+    // continue to use the selected provider id until B2 supplies role→model
+    // binding.
     if let Ok(selected) = dispatch::select(&cards, &parsed, &prompt)
         && object.contains_key("model")
-        && (model.is_none_or(str::is_empty)
-            || model.is_some_and(|requested_model| {
-                parsed.role.is_none() && requested_model != selected.card.provider.id
-            }))
+        && model.is_none_or(str::is_empty)
     {
         let requested_model = model.unwrap_or("");
         let mut response = error_envelope_with_reason(
@@ -604,8 +878,7 @@ async fn chat_completions(
             "unsupported_field",
             "unsupported_model",
             format!(
-                "model '{requested_model}' is not a supported role alias or the selected model '{}'; use a supported idoris/<role> alias or the selected provider.id",
-                selected.card.provider.id
+                "model '{requested_model}' must be a non-empty string or a supported idoris/<role> alias"
             ),
         );
         if let Ok(value) = HeaderValue::from_str(locality_str(selected.served_locality)) {
@@ -635,13 +908,20 @@ async fn chat_completions(
     // is dropped mid-request (e.g. a future connection-level timeout or
     // abort layered on top) -- genuinely different from, and strictly
     // better than, a listener that structurally can never fire.
+    let selected_for_dispatch = dispatch::select(&cards, &parsed, &prompt).ok();
+    let selected_estimated_cost = selected_for_dispatch
+        .as_ref()
+        .map(|selected| selected.estimated_cost_minor);
+    let supervisor = selected_for_dispatch
+        .as_ref()
+        .and_then(|selected| state.runtimes.get(&selected.card.provider.id));
     let budget_ledger = state.budget_ledger.as_deref();
     match dispatch_local(
         &cards,
-        state.supervisor.as_ref(),
+        supervisor,
         budget_ledger,
         &parsed,
-        &prompt,
+        dispatch::DispatchInput::with_model(model, &prompt),
         messages,
         tokio_util::sync::CancellationToken::new(),
     )
@@ -654,10 +934,22 @@ async fn chat_completions(
         Ok(outcome) => match &outcome.result {
             Err(failure) => dispatch_failure_response(failure, &outcome),
             Ok(chat_response) => {
-                let body =
+                let (body, prompt_tokens, completion_tokens) =
                     openai_chat_completion(&chat_response.content, &chat_response.model, &prompt);
                 let mut response = (StatusCode::OK, Json(body)).into_response();
                 apply_decision_headers(&mut response, &outcome);
+                let usage_cost_minor = match selected_estimated_cost {
+                    Some(0) => Some(0),
+                    Some(_) => outcome.actual_cost_minor,
+                    None => None,
+                };
+                response
+                    .extensions_mut()
+                    .insert(usage::UsageFact::inference_with_tokens(
+                        usage_cost_minor,
+                        prompt_tokens,
+                        completion_tokens,
+                    ));
                 // X-iDoris-Cost-Minor: only set for a genuinely paid,
                 // settled candidate -- omitted for free/local calls.
                 if let Some(cost_minor) = outcome.actual_cost_minor
@@ -778,6 +1070,11 @@ async fn chat_via_proxy_stream(
             if let Ok(v) = HeaderValue::from_str(locality_str(selected.served_locality)) {
                 response.headers_mut().insert(HEADER_SERVED_LOCALITY, v);
             }
+            if status.is_success() {
+                response
+                    .extensions_mut()
+                    .insert(usage::UsageFact::inference(Some(0)));
+            }
             response
         }
     }
@@ -835,6 +1132,7 @@ async fn chat_via_proxy_buffered(
         response.headers_mut().insert(HEADER_SERVED_LOCALITY, v);
     }
     if outcome.cached {
+        response.extensions_mut().insert(usage::UsageFact::cached());
         response
             .headers_mut()
             .insert(HEADER_CACHED, HeaderValue::from_static("true"));
@@ -843,6 +1141,10 @@ async fn chat_via_proxy_buffered(
         {
             response.headers_mut().insert(HEADER_ORIGIN_RECORD_ID, v);
         }
+    } else if status.is_success() {
+        response
+            .extensions_mut()
+            .insert(usage::UsageFact::inference(Some(0)));
     }
     response
 }
@@ -856,17 +1158,275 @@ async fn chat_via_proxy_buffered(
 #[derive(Clone)]
 struct RequestRecordId(String);
 
+struct BufferedAuditMeta {
+    tenant_id: Option<String>,
+    request_id: Option<String>,
+    privacy: Option<String>,
+    intent: Option<String>,
+    record_id: String,
+    status: StatusCode,
+    origin_record_id: Option<String>,
+    reason: String,
+    latency_ms: u64,
+}
+
+struct UsageMeta {
+    tenant_id: Option<String>,
+    request_id: Option<String>,
+    record_id: String,
+    fact: usage::UsageFact,
+}
+
 /// Server-generated on every response, success or error, streaming or not
 /// (interface spec §3.12) — never taken from a caller-supplied header.
-async fn record_id_middleware(mut req: Request<Body>, next: Next) -> Response {
+async fn record_id_middleware(
+    State(state): State<Arc<AppState>>,
+    mut req: Request<Body>,
+    next: Next,
+) -> Response {
+    let audit_started = Instant::now();
     let record_id = Uuid::new_v4().to_string();
+    let audit_chat = req.method() == Method::POST && req.uri().path() == "/v1/chat/completions";
+    let audit_tenant = audit_tenant_id(&state, req.headers());
+    let audit_request_id = audit_header(req.headers(), HEADER_REQUEST_ID, None);
+    let audit_privacy = audit_header(req.headers(), "x-idoris-privacy", Some("local_only"));
+    let audit_intent = audit_header(req.headers(), "x-idoris-intent", None);
     req.extensions_mut()
         .insert(RequestRecordId(record_id.clone()));
     let mut response = next.run(req).await;
     if let Ok(value) = HeaderValue::from_str(&record_id) {
         response.headers_mut().insert(HEADER_RECORD_ID, value);
     }
+    if audit_chat {
+        let usage_meta = response
+            .extensions()
+            .get::<usage::UsageFact>()
+            .copied()
+            .map(|fact| UsageMeta {
+                tenant_id: audit_tenant.clone(),
+                request_id: audit_request_id.clone(),
+                record_id: record_id.clone(),
+                fact,
+            });
+        let origin_record_id = response
+            .headers()
+            .get(HEADER_ORIGIN_RECORD_ID)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        let reason = audit_reason(
+            response.status(),
+            response.headers().contains_key(HEADER_SERVED_LOCALITY),
+            response
+                .headers()
+                .get(HEADER_DEGRADED)
+                .is_some_and(|value| value == "true"),
+        );
+        let mut meta = BufferedAuditMeta {
+            tenant_id: audit_tenant,
+            request_id: audit_request_id,
+            privacy: audit_privacy,
+            intent: audit_intent,
+            record_id,
+            status: response.status(),
+            origin_record_id,
+            reason,
+            latency_ms: 0,
+        };
+        if is_event_stream(&response) {
+            let (parts, body) = response.into_parts();
+            let stream_state = state.clone();
+            let stream_started = audit_started;
+            let stream = audit_body::finalize_stream(body.into_data_stream(), move |end| {
+                let mut meta = meta;
+                meta.latency_ms = elapsed_ms(stream_started);
+                meta.reason = match end {
+                    audit_body::StreamEnd::Completed => meta.reason,
+                    audit_body::StreamEnd::Error => "degraded: stream_error".into(),
+                    audit_body::StreamEnd::Dropped => "degraded: stream_cancelled".into(),
+                };
+                tokio::spawn(async move {
+                    finish_buffered_audit(stream_state.clone(), meta).await;
+                    if end == audit_body::StreamEnd::Completed {
+                        finish_usage(stream_state, usage_meta).await;
+                    }
+                });
+            });
+            response = Response::from_parts(parts, Body::from_stream(stream));
+        } else {
+            meta.latency_ms = elapsed_ms(audit_started);
+            finish_buffered_audit(state.clone(), meta).await;
+            finish_usage(state, usage_meta).await;
+        }
+    }
     response
+}
+
+fn elapsed_ms(started: Instant) -> u64 {
+    started.elapsed().as_millis().min(u64::MAX as u128) as u64
+}
+
+fn header_text<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn audit_header(headers: &HeaderMap, name: &str, default: Option<&str>) -> Option<String> {
+    match header_text(headers, name) {
+        Some(value) if value.encode_utf16().count() <= audit::MAX_FIELD_UTF16_UNITS => {
+            Some(value.to_string())
+        }
+        Some(_) => None,
+        None => default.map(str::to_string),
+    }
+}
+
+fn audit_tenant_id(state: &AppState, headers: &HeaderMap) -> Option<String> {
+    match state.deploy_mode {
+        idoris_contracts::DeployMode::Personal => Some(budget::PERSONAL_TENANT_ID.to_string()),
+        idoris_contracts::DeployMode::Tenant => {
+            header_text(headers, "x-idoris-tenant").map(str::to_string)
+        }
+    }
+}
+
+fn is_event_stream(response: &Response) -> bool {
+    response
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("text/event-stream"))
+}
+
+async fn finish_buffered_audit(state: Arc<AppState>, meta: BufferedAuditMeta) {
+    let (Some(store), Some(tenant_id)) = (state.record_store.clone(), meta.tenant_id) else {
+        return;
+    };
+    let mut payload = serde_json::Map::new();
+    payload.insert(
+        "request_id".into(),
+        json!(meta.request_id.unwrap_or_else(|| meta.record_id.clone())),
+    );
+    payload.insert("component".into(), json!("router"));
+    if let Some(privacy) = meta.privacy {
+        payload.insert("privacy".into(), json!(privacy));
+    }
+    if let Some(intent) = meta.intent {
+        payload.insert("intent".into(), json!(intent));
+    }
+    payload.insert("status".into(), json!(meta.status.as_u16()));
+    payload.insert("reason".into(), json!(meta.reason));
+    payload.insert("latency_ms".into(), json!(meta.latency_ms));
+
+    let failures = state.audit_failures.clone();
+    let result = tokio::task::spawn_blocking(move || -> Result<(), String> {
+        let guard = store
+            .lock()
+            .map_err(|_| "audit record store lock poisoned".to_string())?;
+        let writer = audit::AuditWriter::new(&guard);
+        let write = audit::AuditOnce::default().finish(
+            &writer,
+            &tenant_id,
+            &meta.record_id,
+            meta.origin_record_id.as_deref(),
+            &payload,
+        );
+        match write {
+            Ok(_) => Ok(()),
+            Err(audit::AuditError::Store(err)) => Err(err.to_string()),
+            Err(_) => {
+                let mut minimal = serde_json::Map::new();
+                minimal.insert("request_id".into(), json!(meta.record_id.clone()));
+                minimal.insert("component".into(), json!("router"));
+                minimal.insert("status".into(), json!(meta.status.as_u16()));
+                minimal.insert("reason".into(), json!(meta.reason));
+                writer
+                    .write_scoped(
+                        &tenant_id,
+                        Some(&meta.record_id),
+                        meta.origin_record_id.as_deref(),
+                        &minimal,
+                    )
+                    .map(|_| ())
+                    .map_err(|err| err.to_string())
+            }
+        }
+    })
+    .await;
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(message)) => {
+            failures.fetch_add(1, Ordering::Relaxed);
+            eprintln!("idoris: audit write failed: {message}");
+        }
+        Err(_) => {
+            failures.fetch_add(1, Ordering::Relaxed);
+            eprintln!("idoris: audit write worker failed");
+        }
+    }
+}
+
+async fn finish_usage(state: Arc<AppState>, meta: Option<UsageMeta>) {
+    let (Some(store), Some(meta)) = (state.record_store.clone(), meta) else {
+        return;
+    };
+    if !meta.fact.inference {
+        return;
+    }
+    let Some(cost_minor) = meta.fact.cost_minor else {
+        eprintln!("idoris: usage cost is unknown; refusing to persist a zero-cost guess");
+        return;
+    };
+    let Some(tenant_id) = meta.tenant_id else {
+        return;
+    };
+    let Some(ts_utc) = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_millis()).ok())
+    else {
+        eprintln!("idoris: usage timestamp is outside the supported UTC epoch range");
+        return;
+    };
+    let result = tokio::task::spawn_blocking(move || -> Result<(), String> {
+        let guard = store
+            .lock()
+            .map_err(|_| "usage record store lock poisoned".to_string())?;
+        let entry = idoris_tenancy::usage::UsageEntry {
+            ts_utc,
+            cost_minor: Some(cost_minor),
+            tokens_in: meta.fact.tokens_in,
+            tokens_out: meta.fact.tokens_out,
+            request_id: meta.request_id,
+        };
+        idoris_tenancy::usage::write_usage_record(&guard, Some(&tenant_id), &meta.record_id, &entry)
+            .map(|_| ())
+            .map_err(|err| err.to_string())
+    })
+    .await;
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(message)) => eprintln!("idoris: usage write failed: {message}"),
+        Err(_) => eprintln!("idoris: usage write worker failed"),
+    }
+}
+
+fn audit_reason(status: StatusCode, served_locality: bool, degraded: bool) -> String {
+    if status == StatusCode::PAYMENT_REQUIRED {
+        return "budget: budget_exceeded".into();
+    }
+    if degraded {
+        return "degraded: routing_fallback".into();
+    }
+    if status.is_success() {
+        return "intent_match: routed".into();
+    }
+    if status == StatusCode::SERVICE_UNAVAILABLE && !served_locality {
+        return "privacy_enforced: no_eligible_candidate".into();
+    }
+    format!("degraded: http_{}", status.as_u16())
 }
 
 #[cfg(test)]
@@ -886,6 +1446,10 @@ mod tests {
     use idoris_contracts::common::{FallbackPolicy, PrivacyClass};
     use idoris_contracts::component_card::{Egress, Form};
     use idoris_contracts::provider::{Cost, Family, Locality, ProviderDescriptor};
+    use idoris_tenancy::budget::{BudgetLedger, BudgetScope, Price, SpendGate};
+    use idoris_tenancy::store::{RecordKind, TenantRecord, TenantStore};
+    use rusqlite::Connection;
+    use serde_json::{Map, json};
     use tower::ServiceExt;
 
     use super::*;
@@ -1028,17 +1592,371 @@ mod tests {
         builder.body(Body::from(body.to_owned())).unwrap()
     }
 
+    fn memory_record_store() -> Arc<std::sync::Mutex<TenantStore>> {
+        Arc::new(std::sync::Mutex::new(
+            TenantStore::new(Connection::open_in_memory().unwrap()).unwrap(),
+        ))
+    }
+
+    fn audit_rows(
+        store: &Arc<std::sync::Mutex<TenantStore>>,
+    ) -> Vec<idoris_tenancy::store::TenantRecord> {
+        store
+            .lock()
+            .unwrap()
+            .list(Some(budget::PERSONAL_TENANT_ID), Some(RecordKind::Audit))
+            .unwrap()
+    }
+
+    fn usage_rows(
+        store: &Arc<std::sync::Mutex<TenantStore>>,
+    ) -> Vec<idoris_tenancy::store::TenantRecord> {
+        store
+            .lock()
+            .unwrap()
+            .list(Some(budget::PERSONAL_TENANT_ID), Some(RecordKind::Usage))
+            .unwrap()
+    }
+
+    async fn wait_audit_rows(
+        store: &Arc<std::sync::Mutex<TenantStore>>,
+        expected: usize,
+    ) -> Vec<idoris_tenancy::store::TenantRecord> {
+        for _ in 0..100 {
+            let rows = audit_rows(store);
+            if rows.len() == expected {
+                return rows;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let rows = audit_rows(store);
+        assert_eq!(rows.len(), expected, "audit finalizer did not settle");
+        rows
+    }
+
+    async fn wait_usage_rows(
+        store: &Arc<std::sync::Mutex<TenantStore>>,
+        expected: usize,
+    ) -> Vec<idoris_tenancy::store::TenantRecord> {
+        for _ in 0..100 {
+            let rows = usage_rows(store);
+            if rows.len() == expected {
+                return rows;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let rows = usage_rows(store);
+        assert_eq!(rows.len(), expected, "usage finalizer did not settle");
+        rows
+    }
+
+    fn usage_query_state() -> (tempfile::TempDir, AppState) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = dir.path().join("usage.sqlite3");
+        let store = TenantStore::open(&db).unwrap();
+        let ledger = BudgetLedger::open(&db).unwrap();
+        ledger
+            .configure_tenant("acme", 10_000, "Asia/Bangkok", SpendGate::PaidOnly)
+            .unwrap();
+        let mut payload = Map::new();
+        payload.insert("ts_utc".into(), json!(1_789_430_400_000_i64));
+        payload.insert("cost_minor".into(), json!(100));
+        payload.insert("tokens_in".into(), json!(1000));
+        payload.insert("tokens_out".into(), json!(500));
+        store
+            .put(
+                Some("acme"),
+                &TenantRecord {
+                    tenant_id: "acme".into(),
+                    kind: RecordKind::Usage,
+                    record_id: "usage-1".into(),
+                    request_id: "request-1".into(),
+                    origin_record_id: None,
+                    payload,
+                },
+            )
+            .unwrap();
+        let state = AppState {
+            record_store: Some(Arc::new(std::sync::Mutex::new(store))),
+            budget_ledger: Some(Arc::new(ledger)),
+            ..AppState::default()
+        };
+        (dir, state)
+    }
+
+    fn get_usage(uri: &str, tenant: Option<&str>) -> Request<Body> {
+        let mut builder = Request::builder().method("GET").uri(uri);
+        if let Some(tenant) = tenant {
+            builder = builder.header("x-idoris-tenant", tenant);
+        }
+        builder.body(Body::empty()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn usage_query_returns_trusted_timezone_range_and_totals() {
+        let (_dir, state) = usage_query_state();
+        let response = build_app(state)
+            .oneshot(get_usage(
+                "/idoris/tenants/acme/usage?period=2026-09",
+                Some("acme"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["tenant_id"], "acme");
+        assert_eq!(json["billing_timezone"], "Asia/Bangkok");
+        assert_eq!(json["range_utc"]["from"], "2026-08-31T17:00:00Z");
+        assert_eq!(json["range_utc"]["to"], "2026-09-30T17:00:00Z");
+        assert_eq!(json["totals"]["cost_minor"], json!(100.0));
+        assert_eq!(json["totals"]["tokens_in"], json!(1000.0));
+        assert_eq!(json["totals"]["tokens_out"], json!(500.0));
+        assert_eq!(json["totals"]["calls"], 1);
+    }
+
+    #[tokio::test]
+    async fn usage_query_rejects_missing_mismatched_duplicate_scope_and_timezone_override() {
+        let (_dir, state) = usage_query_state();
+        let app = build_app(state);
+        for request in [
+            get_usage("/idoris/tenants/acme/usage?period=2026-09", None),
+            get_usage("/idoris/tenants/acme/usage?period=2026-09", Some("other")),
+            get_usage(
+                "/idoris/tenants/acme/usage?period=2026-09&timezone=UTC",
+                Some("acme"),
+            ),
+        ] {
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+
+        let duplicate = Request::builder()
+            .method("GET")
+            .uri("/idoris/tenants/acme/usage?period=2026-09")
+            .header("x-idoris-tenant", "acme")
+            .header("x-idoris-tenant", "other")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(duplicate).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn usage_query_unknown_tenant_fails_closed() {
+        let (_dir, state) = usage_query_state();
+        let response = build_app(state)
+            .oneshot(get_usage(
+                "/idoris/tenants/missing/usage?period=2026-09",
+                Some("missing"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn budget_query_reports_remaining_available_and_is_read_only() {
+        let (_dir, state) = usage_query_state();
+        let ledger = state.budget_ledger.as_ref().unwrap().clone();
+        let scope = BudgetScope::new("acme", "key-1", "omlx", "model-1");
+        let reservation = ledger.reserve(&scope, Price::Known(600)).unwrap();
+        let before = ledger.tenant_readview("acme").unwrap();
+        assert_eq!(before.remaining_minor, 10_000);
+        assert_eq!(before.reserved_minor, 600);
+        assert_eq!(before.available_minor, 9_400);
+
+        let response = build_app(state)
+            .oneshot(get_usage("/idoris/tenants/acme/budget", Some("acme")))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["tenant_id"], "acme");
+        assert_eq!(json["billing_timezone"], "Asia/Bangkok");
+        assert_eq!(json["limit_minor"], 10_000);
+        assert_eq!(json["spent_minor"], 0);
+        assert_eq!(json["reserved_minor"], 600);
+        assert_eq!(json["remaining_minor"], 10_000);
+        assert_eq!(json["available_minor"], 9_400);
+        assert_eq!(json["scope"], "paid_only");
+
+        let after = ledger.tenant_readview("acme").unwrap();
+        assert_eq!(after, before);
+        ledger.release("acme", &reservation).unwrap();
+    }
+
+    #[tokio::test]
+    async fn budget_query_rejects_bad_scope_and_unknown_tenant() {
+        let (_dir, state) = usage_query_state();
+        let app = build_app(state);
+        for request in [
+            get_usage("/idoris/tenants/acme/budget", None),
+            get_usage("/idoris/tenants/acme/budget", Some("other")),
+        ] {
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+
+        let duplicate = Request::builder()
+            .method("GET")
+            .uri("/idoris/tenants/acme/budget")
+            .header("x-idoris-tenant", "acme")
+            .header("x-idoris-tenant", "other")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.clone().oneshot(duplicate).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let response = app
+            .oneshot(get_usage("/idoris/tenants/missing/budget", Some("missing")))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn audit_query_http_scopes_filters_and_rejects_unknown_params() {
+        let store = memory_record_store();
+        {
+            let guard = store.lock().unwrap();
+            for (tenant, id, ts) in [
+                (budget::PERSONAL_TENANT_ID, "own", 2_000_i64),
+                ("other", "private", 1_500_i64),
+            ] {
+                let mut payload = Map::new();
+                payload.insert("ts_utc".into(), json!(ts));
+                payload.insert("reason".into(), json!("intent_match"));
+                guard
+                    .put(
+                        Some(tenant),
+                        &TenantRecord {
+                            tenant_id: tenant.into(),
+                            kind: RecordKind::Audit,
+                            record_id: id.into(),
+                            request_id: format!("request-{id}"),
+                            origin_record_id: None,
+                            payload,
+                        },
+                    )
+                    .unwrap();
+            }
+        }
+        let app = build_app(AppState {
+            record_store: Some(store),
+            ..AppState::default()
+        });
+        let tenant = budget::PERSONAL_TENANT_ID;
+
+        let own = app
+            .clone()
+            .oneshot(get_usage(
+                &format!("/idoris/tenants/{tenant}/audit?record_id=own"),
+                Some(tenant),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(own.status(), StatusCode::OK);
+        let body = own.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["records"].as_array().unwrap().len(), 1);
+        assert_eq!(json["records"][0]["record_id"], "own");
+
+        let cross_tenant_id = app
+            .clone()
+            .oneshot(get_usage(
+                &format!("/idoris/tenants/{tenant}/audit?record_id=private"),
+                Some(tenant),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(cross_tenant_id.status(), StatusCode::OK);
+        let body = cross_tenant_id
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["records"].as_array().unwrap().is_empty());
+
+        let mismatch = app
+            .clone()
+            .oneshot(get_usage(
+                &format!("/idoris/tenants/{tenant}/audit"),
+                Some("other"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(mismatch.status(), StatusCode::BAD_REQUEST);
+
+        let unknown = app
+            .oneshot(get_usage(
+                &format!("/idoris/tenants/{tenant}/audit?timezone=UTC"),
+                Some(tenant),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(unknown.status(), StatusCode::BAD_REQUEST);
+    }
+
     #[tokio::test]
     async fn chat_completions_rejects_invalid_json() {
-        let app = build_app(AppState::default());
+        let store = memory_record_store();
+        let app = build_app(AppState {
+            record_store: Some(store.clone()),
+            ..AppState::default()
+        });
         let response = app
             .oneshot(post_chat("{not valid json", &[]))
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let response_record_id = response
+            .headers()
+            .get(HEADER_RECORD_ID)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(json["error"]["type"], "invalid_json");
+        let rows = audit_rows(&store);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].record_id, response_record_id);
+        assert_eq!(rows[0].payload["status"], json!(400));
+    }
+
+    #[tokio::test]
+    async fn oversized_intent_still_records_invalid_json_once() {
+        let store = memory_record_store();
+        let app = build_app(AppState {
+            record_store: Some(store.clone()),
+            ..AppState::default()
+        });
+        let long_intent = "x".repeat(audit::MAX_FIELD_UTF16_UNITS + 1);
+        let response = app
+            .oneshot(post_chat(
+                "{not valid json",
+                &[("x-idoris-intent", long_intent.as_str())],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let response_record_id = response
+            .headers()
+            .get(HEADER_RECORD_ID)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        let rows = audit_rows(&store);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].record_id, response_record_id);
+        assert_eq!(rows[0].payload["request_id"], json!(response_record_id));
+        assert!(rows[0].payload.get("intent").is_none());
     }
 
     #[tokio::test]
@@ -1113,7 +2031,11 @@ mod tests {
         // chosen, so there's no X-iDoris-Served-Locality to set, and per
         // R2-D task 3, zero remote egress is trivially true (no remote
         // path exists yet).
-        let app = build_app(AppState::default());
+        let store = memory_record_store();
+        let app = build_app(AppState {
+            record_store: Some(store.clone()),
+            ..AppState::default()
+        });
         let response = app
             .oneshot(post_chat(
                 r#"{"model":"idoris/daily","messages":[{"role":"user","content":"hi"}]}"#,
@@ -1123,9 +2045,23 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert!(!response.headers().contains_key(HEADER_SERVED_LOCALITY));
+        let response_record_id = response
+            .headers()
+            .get(HEADER_RECORD_ID)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(json["error"]["type"], "local_only_unavailable");
+        let rows = audit_rows(&store);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].record_id, response_record_id);
+        assert_eq!(
+            rows[0].payload["reason"],
+            json!("privacy_enforced: no_eligible_candidate")
+        );
     }
 
     /// A candidate was chosen (decide() succeeded) but no Supervisor is
@@ -1163,6 +2099,7 @@ mod tests {
     #[tokio::test]
     async fn chat_completions_succeeds_against_a_mock_supervisor() {
         let card = sample_component_card("local-1");
+        let store = memory_record_store();
         let adapter = std::sync::Arc::new(idoris_backend::MockAdapter::new(vec![
             idoris_backend::ModelInfo {
                 id: "local-1".to_string(),
@@ -1174,7 +2111,8 @@ mod tests {
                 .unwrap();
         let state = AppState {
             cards: vec![card.clone()],
-            supervisor: Some(dispatch::BoundSupervisor::new(&card, supervisor)),
+            runtimes: Some(dispatch::BoundSupervisor::new(&card, supervisor)).into(),
+            record_store: Some(store.clone()),
             ..AppState::default()
         };
         let app = build_app(state);
@@ -1201,6 +2139,17 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .contains("hello there")
+        );
+        let usage = usage_rows(&store);
+        assert_eq!(usage.len(), 1);
+        assert_eq!(usage[0].payload["cost_minor"], json!(0));
+        assert_eq!(
+            usage[0].payload["tokens_in"],
+            json["usage"]["prompt_tokens"]
+        );
+        assert_eq!(
+            usage[0].payload["tokens_out"],
+            json["usage"]["completion_tokens"]
         );
     }
 
@@ -1276,6 +2225,7 @@ mod tests {
     #[tokio::test]
     async fn chat_completions_paid_candidate_settles_and_sets_the_cost_header() {
         let (_dir, ledger) = configured_budget_ledger(1_000_000);
+        let store = memory_record_store();
         let adapter = std::sync::Arc::new(idoris_backend::MockAdapter::new(vec![
             idoris_backend::ModelInfo {
                 id: "paid-1".to_string(),
@@ -1287,11 +2237,13 @@ mod tests {
                 .unwrap();
         let state = AppState {
             cards: vec![paid_component_card("paid-1")],
-            supervisor: Some(dispatch::BoundSupervisor::new(
+            runtimes: Some(dispatch::BoundSupervisor::new(
                 &paid_component_card("paid-1"),
                 supervisor,
-            )),
+            ))
+            .into(),
             budget_ledger: Some(std::sync::Arc::new(ledger)),
+            record_store: Some(store.clone()),
             ..AppState::default()
         };
         let app = build_app(state);
@@ -1303,13 +2255,20 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        let cost_header = response
+        let cost_minor = response
             .headers()
             .get(HEADER_COST_MINOR)
             .unwrap()
             .to_str()
+            .unwrap()
+            .parse::<i64>()
             .unwrap();
-        assert!(cost_header.parse::<i64>().unwrap() > 0);
+        assert!(cost_minor > 0);
+        let usage = usage_rows(&store);
+        assert_eq!(usage.len(), 1);
+        assert_eq!(usage[0].payload["cost_minor"], json!(cost_minor));
+        assert!(usage[0].payload["tokens_in"].is_number());
+        assert!(usage[0].payload["tokens_out"].is_number());
     }
 
     #[tokio::test]
@@ -1465,6 +2424,7 @@ mod tests {
     #[tokio::test]
     async fn resident_http_service_candidate_forwards_via_proxy_byte_for_byte() {
         let server = wiremock::MockServer::start().await;
+        let store = memory_record_store();
         wiremock::Mock::given(wiremock::matchers::method("POST"))
             .and(wiremock::matchers::path("/v1/chat/completions"))
             .respond_with(
@@ -1475,6 +2435,7 @@ mod tests {
             .await;
         let state = AppState {
             cards: vec![resident_component_card("omlx", &server.uri())],
+            record_store: Some(store.clone()),
             ..AppState::default()
         };
         let app = build_app(state);
@@ -1486,6 +2447,13 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+        let response_record_id = response
+            .headers()
+            .get(HEADER_RECORD_ID)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
         assert_eq!(
             response.headers().get(HEADER_SERVED_LOCALITY).unwrap(),
             "loopback"
@@ -1497,6 +2465,58 @@ mod tests {
         // {object: "chat.completion", choices: [...]} shape.
         assert_eq!(json["marker"], "proxied");
         assert!(json.get("object").is_none());
+        let rows = audit_rows(&store);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].record_id, response_record_id);
+        assert_eq!(rows[0].payload["reason"], json!("intent_match: routed"));
+        let usage = usage_rows(&store);
+        assert_eq!(usage.len(), 1);
+        assert_eq!(usage[0].payload["cost_minor"], json!(0));
+        assert!(
+            !usage[0].payload.contains_key("tokens_in")
+                && !usage[0].payload.contains_key("tokens_out"),
+            "proxy usage without structured token facts must omit token fields"
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_request_id_still_records_success_once() {
+        let server = wiremock::MockServer::start().await;
+        let store = memory_record_store();
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/v1/chat/completions"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let app = build_app(AppState {
+            cards: vec![resident_component_card("omlx", &server.uri())],
+            record_store: Some(store.clone()),
+            ..AppState::default()
+        });
+        let long_request_id = "r".repeat(audit::MAX_FIELD_UTF16_UNITS + 1);
+        let body =
+            "{\"model\":\"idoris/daily\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}";
+        let response = app
+            .oneshot(post_chat(
+                body,
+                &[(HEADER_REQUEST_ID, long_request_id.as_str())],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let response_record_id = response
+            .headers()
+            .get(HEADER_RECORD_ID)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        let rows = audit_rows(&store);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].record_id, response_record_id);
+        assert_eq!(rows[0].payload["request_id"], json!(response_record_id));
+        server.verify().await;
     }
 
     #[tokio::test]
@@ -1543,6 +2563,7 @@ mod tests {
     #[tokio::test]
     async fn resident_http_service_second_call_with_same_request_id_is_cached() {
         let server = wiremock::MockServer::start().await;
+        let store = memory_record_store();
         wiremock::Mock::given(wiremock::matchers::method("POST"))
             .and(wiremock::matchers::path("/v1/chat/completions"))
             .respond_with(
@@ -1553,6 +2574,7 @@ mod tests {
             .await;
         let state = AppState {
             cards: vec![resident_component_card("omlx", &server.uri())],
+            record_store: Some(store.clone()),
             ..AppState::default()
         };
         let app = build_app(state);
@@ -1567,6 +2589,13 @@ mod tests {
             .unwrap()
             .to_string();
         let second = app.oneshot(post_chat(body, headers)).await.unwrap();
+        let second_record_id = second
+            .headers()
+            .get(HEADER_RECORD_ID)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
         assert_eq!(second.headers().get(HEADER_CACHED).unwrap(), "true");
         assert_eq!(
             second
@@ -1577,6 +2606,29 @@ mod tests {
                 .unwrap(),
             first_record_id
         );
+        assert_ne!(second_record_id, first_record_id);
+        let rows = audit_rows(&store);
+        assert_eq!(rows.len(), 2);
+        let first_row = rows
+            .iter()
+            .find(|row| row.record_id == first_record_id)
+            .unwrap();
+        let second_row = rows
+            .iter()
+            .find(|row| row.record_id == second_record_id)
+            .unwrap();
+        assert_eq!(first_row.origin_record_id, None);
+        assert_eq!(
+            second_row.origin_record_id.as_deref(),
+            Some(first_record_id.as_str())
+        );
+        let usage = usage_rows(&store);
+        assert_eq!(
+            usage.len(),
+            1,
+            "cache replay must not duplicate inference usage"
+        );
+        assert_eq!(usage[0].record_id, first_record_id);
         server.verify().await;
     }
 
@@ -1586,6 +2638,7 @@ mod tests {
     #[tokio::test]
     async fn resident_http_service_streaming_5xx_is_buffered_json_not_sse() {
         let server = wiremock::MockServer::start().await;
+        let store = memory_record_store();
         wiremock::Mock::given(wiremock::matchers::method("POST"))
             .and(wiremock::matchers::path("/v1/chat/completions"))
             .respond_with(
@@ -1597,6 +2650,7 @@ mod tests {
             .await;
         let state = AppState {
             cards: vec![resident_component_card("omlx", &server.uri())],
+            record_store: Some(store.clone()),
             ..AppState::default()
         };
         let app = build_app(state);
@@ -1608,6 +2662,13 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let response_record_id = response
+            .headers()
+            .get(HEADER_RECORD_ID)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
         assert_eq!(
             response
                 .headers()
@@ -1618,6 +2679,10 @@ mod tests {
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(json["error"], "upstream-down");
+        let rows = audit_rows(&store);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].record_id, response_record_id);
+        assert_eq!(rows[0].payload["status"], json!(502));
         server.verify().await;
     }
 
@@ -1632,6 +2697,7 @@ mod tests {
             "data: {\"content\":\"[DONE]\"}\n\n",
         ] {
             let server = wiremock::MockServer::start().await;
+            let store = memory_record_store();
             wiremock::Mock::given(wiremock::matchers::method("POST"))
                 .respond_with(
                     wiremock::ResponseTemplate::new(200).set_body_raw(body, "text/event-stream"),
@@ -1640,6 +2706,7 @@ mod tests {
                 .await;
             let app = build_app(AppState {
                 cards: vec![resident_component_card("omlx", &server.uri())],
+                record_store: Some(store.clone()),
                 ..AppState::default()
             });
             let response = app.oneshot(post_chat(
@@ -1647,29 +2714,38 @@ mod tests {
                 &[],
             )).await.unwrap();
             assert_eq!(response.status(), StatusCode::OK);
+            assert!(audit_rows(&store).is_empty());
             let err = response
                 .into_body()
                 .collect()
                 .await
                 .expect_err("bare EOF must fail");
             assert!(err.to_string().contains("unterminated upstream SSE"));
+            let rows = wait_audit_rows(&store, 1).await;
+            assert_eq!(rows[0].payload["reason"], json!("degraded: stream_error"));
+            assert!(usage_rows(&store).is_empty());
         }
     }
 
     #[tokio::test]
     async fn resident_http_service_streaming_2xx_passes_sse_bytes_through() {
         let server = wiremock::MockServer::start().await;
+        let store = memory_record_store();
         wiremock::Mock::given(wiremock::matchers::method("POST"))
             .and(wiremock::matchers::path("/v1/chat/completions"))
             .respond_with(
                 wiremock::ResponseTemplate::new(200)
                     .insert_header("content-type", "text/event-stream")
-                    .set_body_raw("data: hel\n\ndata: [DONE]\n\n", "text/event-stream"),
+                    .set_body_raw(
+                        "data: SENTINEL-STREAM-CONTENT\n\ndata: [DONE]\n\n",
+                        "text/event-stream",
+                    ),
             )
             .mount(&server)
             .await;
         let state = AppState {
             cards: vec![resident_component_card("omlx", &server.uri())],
+            record_store: Some(store.clone()),
             ..AppState::default()
         };
         let app = build_app(state);
@@ -1681,6 +2757,17 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+        let record_id = response
+            .headers()
+            .get(HEADER_RECORD_ID)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            audit_rows(&store).is_empty(),
+            "headers must not finalize SSE audit"
+        );
         assert!(
             response
                 .headers()
@@ -1692,7 +2779,66 @@ mod tests {
         );
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
         let text = String::from_utf8(bytes.to_vec()).unwrap();
-        assert!(text.contains("hel"));
+        assert!(text.contains("SENTINEL-STREAM-CONTENT"));
         assert!(text.contains("[DONE]"));
+        let rows = wait_audit_rows(&store, 1).await;
+        assert_eq!(rows[0].record_id, record_id);
+        assert_eq!(rows[0].payload["reason"], json!("intent_match: routed"));
+        assert!(rows[0].payload["latency_ms"].is_u64());
+        assert!(
+            !rows[0].payload.values().any(|value| {
+                value
+                    .as_str()
+                    .is_some_and(|text| text.contains("SENTINEL-STREAM-CONTENT"))
+            }),
+            "stream content must never enter audit metadata"
+        );
+        let usage = wait_usage_rows(&store, 1).await;
+        assert_eq!(usage[0].record_id, record_id);
+        assert_eq!(usage[0].payload["cost_minor"], json!(0));
+        assert!(!usage[0].payload.contains_key("tokens_in"));
+        assert!(!usage[0].payload.contains_key("tokens_out"));
+    }
+
+    #[tokio::test]
+    async fn dropping_stream_body_finalizes_cancelled_audit_once() {
+        let server = wiremock::MockServer::start().await;
+        let store = memory_record_store();
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_raw("data: later\n\ndata: [DONE]\n\n", "text/event-stream"),
+            )
+            .mount(&server)
+            .await;
+        let app = build_app(AppState {
+            cards: vec![resident_component_card("omlx", &server.uri())],
+            record_store: Some(store.clone()),
+            ..AppState::default()
+        });
+        let response = app
+            .oneshot(post_chat(
+                r#"{"model":"idoris/daily","stream":true,"messages":[{"role":"user","content":"hi"}]}"#,
+                &[],
+            ))
+            .await
+            .unwrap();
+        let record_id = response
+            .headers()
+            .get(HEADER_RECORD_ID)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(audit_rows(&store).is_empty());
+        drop(response);
+        let rows = wait_audit_rows(&store, 1).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].record_id, record_id);
+        assert_eq!(
+            rows[0].payload["reason"],
+            json!("degraded: stream_cancelled")
+        );
+        assert!(usage_rows(&store).is_empty());
     }
 }

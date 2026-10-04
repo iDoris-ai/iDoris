@@ -2,9 +2,13 @@
 //! `/v1/models` listing, mirroring `packages/router/src/server.ts`'s
 //! handler — best-effort per card, except authentication failures, which
 //! fail the request to prevent an incomplete list from appearing complete.
+//! Other failures are skipped, with three consecutive failures triggering a
+//! 30-second provider cooldown; a successful listing resets that state.
 
 use std::ffi::OsStr;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+use crate::health::HealthTracker;
 
 use idoris_contracts::ComponentCard;
 use idoris_contracts::component_card::Form;
@@ -81,10 +85,7 @@ async fn list_one(
     client: &reqwest::Client,
     card: &ComponentCard,
     api_key: Option<&OsStr>,
-) -> Result<Vec<ModelEntry>, ModelsError> {
-    if card.form != Form::HttpService {
-        return Ok(Vec::new());
-    }
+) -> Result<Option<Vec<ModelEntry>>, ModelsError> {
     let url = format!("{}/v1/models", card.endpoint.trim_end_matches('/'));
     let mut request = client.get(&url).timeout(MODELS_TIMEOUT);
     if is_loopback_omlx(card)
@@ -99,29 +100,31 @@ async fn list_one(
         request = request.header(AUTHORIZATION, authorization);
     }
     let Ok(resp) = request.send().await else {
-        return Ok(Vec::new());
+        return Ok(None);
     };
     if matches!(resp.status().as_u16(), 401 | 403) {
         return Err(auth_failure(card, "status", resp.status().as_u16().into()));
     }
     if !resp.status().is_success() {
-        return Ok(Vec::new());
+        return Ok(None);
     }
     let Ok(body) = resp.json::<serde_json::Value>().await else {
-        return Ok(Vec::new());
+        return Ok(None);
     };
     let Some(items) = body.get("data").and_then(|v| v.as_array()) else {
-        return Ok(Vec::new());
+        return Ok(None);
     };
-    Ok(items
-        .iter()
-        .filter_map(|m| m.get("id").and_then(|v| v.as_str()))
-        .map(|id| ModelEntry {
-            id: id.to_string(),
-            object: "model",
-            owned_by: card.provider.id.clone(),
-        })
-        .collect())
+    Ok(Some(
+        items
+            .iter()
+            .filter_map(|m| m.get("id").and_then(|v| v.as_str()))
+            .map(|id| ModelEntry {
+                id: id.to_string(),
+                object: "model",
+                owned_by: card.provider.id.clone(),
+            })
+            .collect(),
+    ))
 }
 
 /// Sequential, matching TS's own `for (const { card, backend } of
@@ -131,11 +134,29 @@ async fn list_one(
 pub async fn list_models(
     client: &reqwest::Client,
     cards: &[ComponentCard],
+    health: &HealthTracker,
 ) -> Result<ModelsResponse, ModelsError> {
     let api_key = std::env::var_os(idoris_upstream::omlx::OMLX_API_KEY_ENV);
     let mut data = Vec::new();
     for card in cards {
-        data.extend(list_one(client, card, api_key.as_deref()).await?);
+        let id = &card.provider.id;
+        if card.form != Form::HttpService {
+            continue;
+        }
+        // A trusted loopback oMLX card has credential semantics that must stay
+        // fail-closed. Skipping its probe during cooldown could turn a new
+        // 401/403 (or an invalid local credential) into a misleading partial
+        // 200. Other providers retain the task-30 discovery cooldown.
+        if !is_loopback_omlx(card) && health.is_cooling_down(id, Instant::now()) {
+            continue;
+        }
+        match list_one(client, card, api_key.as_deref()).await? {
+            Some(entries) => {
+                health.record(id, true, Instant::now());
+                data.extend(entries);
+            }
+            None => health.record(id, false, Instant::now()),
+        }
     }
     Ok(ModelsResponse {
         object: "list",
@@ -195,7 +216,9 @@ mod tests {
             .await;
         let client = reqwest::Client::new();
         let cards = vec![card("omlx", &server.uri(), Form::HttpService)];
-        let resp = list_models(&client, &cards).await.unwrap();
+        let resp = list_models(&client, &cards, &HealthTracker::default())
+            .await
+            .unwrap();
         assert_eq!(resp.object, "list");
         let ids: Vec<&str> = resp.data.iter().map(|m| m.id.as_str()).collect();
         assert_eq!(ids, vec!["model-a", "model-b"]);
@@ -207,23 +230,80 @@ mod tests {
 
     #[tokio::test]
     async fn a_failing_card_is_skipped_not_a_partial_failure() {
+        for response in [
+            ResponseTemplate::new(500),
+            ResponseTemplate::new(200).set_body_string("not-json"),
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({})),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/v1/models"))
+                .respond_with(response)
+                .mount(&server)
+                .await;
+            let client = reqwest::Client::new();
+            let cards = vec![card("omlx", &server.uri(), Form::HttpService)];
+            let health = HealthTracker::default();
+            for _ in 0..4 {
+                let resp = list_models(&client, &cards, &health).await.unwrap();
+                assert!(resp.data.is_empty());
+            }
+            assert_eq!(server.received_requests().await.unwrap().len(), 3);
+        }
+    }
+
+    #[tokio::test]
+    async fn successful_empty_listing_resets_failures() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/v1/models"))
-            .respond_with(ResponseTemplate::new(500))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"data": []})))
             .mount(&server)
             .await;
         let client = reqwest::Client::new();
         let cards = vec![card("omlx", &server.uri(), Form::HttpService)];
-        let resp = list_models(&client, &cards).await.unwrap();
-        assert!(resp.data.is_empty());
+        let health = HealthTracker::default();
+        for _ in 0..4 {
+            health.record("omlx", false, Instant::now());
+            let resp = list_models(&client, &cards, &health).await.unwrap();
+            assert!(resp.data.is_empty());
+        }
+        assert_eq!(server.received_requests().await.unwrap().len(), 4);
+    }
+
+    #[tokio::test]
+    async fn loopback_omlx_auth_failure_is_not_hidden_by_cooldown() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(401))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = reqwest::Client::new();
+        let mut omlx = card("omlx", &server.uri(), Form::HttpService);
+        omlx.version_pin = "omlx@0.6.4".into();
+        let health = HealthTracker::default();
+        let now = Instant::now();
+        for _ in 0..3 {
+            health.record("omlx", false, now);
+        }
+        assert!(health.is_cooling_down("omlx", now));
+
+        assert!(matches!(
+            list_models(&client, &[omlx], &health).await,
+            Err(ModelsError::UpstreamAuthenticationFailed { .. })
+        ));
+        server.verify().await;
     }
 
     #[tokio::test]
     async fn a_non_http_service_card_is_skipped_without_any_network_call() {
         let client = reqwest::Client::new();
         let cards = vec![card("subscription", "spawn://x", Form::SpawnCli)];
-        let resp = list_models(&client, &cards).await.unwrap();
+        let resp = list_models(&client, &cards, &HealthTracker::default())
+            .await
+            .unwrap();
         assert!(resp.data.is_empty());
     }
 }

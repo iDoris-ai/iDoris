@@ -2274,6 +2274,33 @@ mod tests {
             .expect("load a should eventually succeed");
     }
 
+    /// Task38: Busy is scoped to one runtime Supervisor, never process-global.
+    /// Two independent backends may load the same model id concurrently.
+    #[tokio::test(start_paused = true)]
+    async fn independent_supervisors_do_not_share_busy_state() {
+        let adapter_a = Arc::new(MockAdapter::new(catalog()));
+        adapter_a.set_load_delay("a", std::time::Duration::from_millis(200));
+        let adapter_b = Arc::new(MockAdapter::new(catalog()));
+        let supervisor_a = Supervisor::spawn(adapter_a.clone(), SupervisorConfig::default())
+            .expect("spawn A should succeed");
+        let supervisor_b = Supervisor::spawn(adapter_b.clone(), SupervisorConfig::default())
+            .expect("spawn B should succeed");
+
+        let load_a =
+            tokio::spawn(async move { supervisor_a.load("a", 4.0, on_demand_policy()).await });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        supervisor_b
+            .load("a", 4.0, on_demand_policy())
+            .await
+            .expect("an independent backend must not inherit A's Busy state");
+        assert_eq!(adapter_b.load_call_count("a"), 1);
+        load_a
+            .await
+            .unwrap()
+            .expect("A's original load should still succeed");
+        assert_eq!(adapter_a.load_call_count("a"), 1);
+    }
+
     /// Negative contrast: an already-`Ready` id with a matching policy must
     /// stay a no-op even while an *unrelated* id is mid-load — confirming
     /// the fix in this PR (an earlier version wrongly reported `Busy` here).
