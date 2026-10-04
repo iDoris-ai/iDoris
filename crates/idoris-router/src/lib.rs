@@ -38,6 +38,11 @@ pub mod health;
 /// card's own model listing.
 pub mod models;
 
+/// Metadata-only audit validation and tenant-scoped persistence (B1 task19).
+pub mod audit;
+/// Stable four-way routing/audit reason taxonomy.
+pub mod reason;
+
 /// Direct HTTP forwarding for a generic `http_service` component card's
 /// `POST /v1/chat/completions` (R2-G) — retries, idempotency cache; wired
 /// into `chat_completions`/`AppState` below (see the module's own doc for

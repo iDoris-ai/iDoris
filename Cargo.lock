@@ -1156,6 +1156,7 @@ dependencies = [
  "indexmap 2.14.2",
  "reqwest",
  "ring",
+ "rusqlite",
  "serde",
  "serde_json",
  "serde_yaml",
