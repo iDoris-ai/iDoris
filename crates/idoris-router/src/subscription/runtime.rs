@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::collections::btree_map::Entry;
 use std::time::Duration;
 
 use idoris_contracts::ComponentCard;
@@ -19,6 +20,7 @@ pub enum SubscriptionRuntimeError {
     Card(SubscriptionCardError),
     MissingSandbox,
     WrongProvider { expected: String, actual: String },
+    DuplicateProvider(String),
     MissingHandle(String),
 }
 
@@ -36,6 +38,12 @@ impl std::fmt::Display for SubscriptionRuntimeError {
                 write!(
                     f,
                     "subscription runtime provider mismatch: expected {expected}, got {actual}"
+                )
+            }
+            Self::DuplicateProvider(provider) => {
+                write!(
+                    f,
+                    "subscription runtime provider already registered: {provider}"
                 )
             }
             Self::MissingHandle(provider) => {
@@ -56,7 +64,7 @@ impl From<SubscriptionCardError> for SubscriptionRuntimeError {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct AuthorizedSubscription {
     provider_id: String,
     profile: UpstreamSandboxProfile,
@@ -151,13 +159,13 @@ impl SubscriptionRuntimeRegistry {
         handle: SubscriptionRuntimeHandle,
     ) -> Result<(), SubscriptionRuntimeError> {
         let provider = handle.provider_id.clone();
-        if self.handles.insert(provider.clone(), handle).is_some() {
-            return Err(SubscriptionRuntimeError::WrongProvider {
-                expected: "unique subscription provider".into(),
-                actual: provider,
-            });
+        match self.handles.entry(provider.clone()) {
+            Entry::Vacant(slot) => {
+                slot.insert(handle);
+                Ok(())
+            }
+            Entry::Occupied(_) => Err(SubscriptionRuntimeError::DuplicateProvider(provider)),
         }
-        Ok(())
     }
 
     pub fn get(
@@ -221,12 +229,42 @@ mod tests {
     #[test]
     fn factory_revalidates_card_and_rejects_provider_mismatch() {
         let card = subscription_card();
+        let authorized = AuthorizedSubscription {
+            provider_id: "other".into(),
+            profile: UpstreamSandboxProfile::fixed(UpstreamSubscriptionCli::Claude),
+        };
+        assert!(matches!(
+            SubscriptionRuntimeHandle::build(authorized, &card),
+            Err(SubscriptionRuntimeError::WrongProvider { expected, actual })
+                if expected == "other" && actual == "subscription"
+        ));
+    }
+
+    #[test]
+    fn factory_rejects_a_non_subscription_card_and_refused_registration_is_typed() {
+        let card = subscription_card();
         let authorized = authorize_subscription(&config(true, false, "claude"), &card)
             .unwrap()
             .unwrap();
-        let mut changed = card.clone();
-        changed.provider.id = "other".into();
-        assert!(SubscriptionRuntimeHandle::build(authorized, &changed).is_err());
+        let ordinary: ComponentCard =
+            serde_yaml::from_str(include_str!("../../../../config/components/omlx.yaml")).unwrap();
+        assert!(matches!(
+            SubscriptionRuntimeHandle::build(authorized, &ordinary),
+            Err(SubscriptionRuntimeError::Card(_))
+        ));
+        assert!(matches!(
+            authorize_subscription(
+                &SubscriptionConfig::snapshot(
+                    Some("tenant"),
+                    Some("1"),
+                    None,
+                    Some(SANDBOX_PROFILE_ID),
+                    Some("claude"),
+                ),
+                &card
+            ),
+            Err(SubscriptionRuntimeError::RegistrationRefused(_))
+        ));
     }
 
     #[test]
@@ -249,6 +287,42 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "subscription runtime handle unavailable for provider wrong"
+        );
+    }
+
+    #[tokio::test]
+    async fn duplicate_provider_is_rejected_without_replacing_the_original_handle() {
+        let card = subscription_card();
+        let claude = SubscriptionRuntimeHandle::build(
+            authorize_subscription(&config(true, false, "claude"), &card)
+                .unwrap()
+                .unwrap(),
+            &card,
+        )
+        .unwrap();
+        let original = claude.clone();
+        let codex = SubscriptionRuntimeHandle::build(
+            authorize_subscription(&config(true, false, "codex"), &card)
+                .unwrap()
+                .unwrap(),
+            &card,
+        )
+        .unwrap();
+        let mut registry = SubscriptionRuntimeRegistry::default();
+        registry.insert(claude).unwrap();
+        assert_eq!(
+            registry.insert(codex).unwrap_err(),
+            SubscriptionRuntimeError::DuplicateProvider("subscription".into())
+        );
+
+        original.service().shutdown().await.unwrap();
+        assert!(
+            !registry
+                .get("subscription")
+                .unwrap()
+                .service()
+                .is_accepting()
+                .await
         );
     }
 }
