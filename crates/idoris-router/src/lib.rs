@@ -299,6 +299,10 @@ pub fn build_app(state: AppState) -> Router {
             get(get_tenant_usage).fallback(not_found),
         )
         .route(
+            "/idoris/tenants/{tenant_id}/audit",
+            get(get_tenant_audit).fallback(not_found),
+        )
+        .route(
             "/idoris/tenants/{tenant_id}/budget",
             get(get_tenant_budget).fallback(not_found),
         )
@@ -375,6 +379,64 @@ async fn get_tenant_usage(
             StatusCode::INTERNAL_SERVER_ERROR,
             "usage_unavailable",
             "usage query worker failed",
+        ),
+    }
+}
+
+async fn get_tenant_audit(
+    State(state): State<Arc<AppState>>,
+    Path(tenant_id): Path<String>,
+    headers: HeaderMap,
+    query: Result<Query<queries::audit::AuditQuery>, axum::extract::rejection::QueryRejection>,
+) -> Response {
+    let Query(query) = match query {
+        Ok(query) => query,
+        Err(_) => {
+            return error_envelope(
+                StatusCode::BAD_REQUEST,
+                "invalid_query",
+                "audit query accepts only from, to, limit, and record_id",
+            );
+        }
+    };
+    let scope_tenant = query_scope_header(&headers).map(str::to_string);
+    let Some(store) = state.record_store.clone() else {
+        return error_envelope(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "audit_unavailable",
+            "tenant audit storage is not configured",
+        );
+    };
+    let result = tokio::task::spawn_blocking(move || {
+        let guard = store
+            .lock()
+            .map_err(|_| queries::audit::AuditQueryError::StorePoisoned)?;
+        queries::audit::query_audit(&guard, &tenant_id, scope_tenant.as_deref(), &query)
+    })
+    .await;
+    match result {
+        Ok(Ok(audit)) => Json(audit).into_response(),
+        Ok(Err(
+            err @ (queries::audit::AuditQueryError::ScopeRequired
+            | queries::audit::AuditQueryError::ScopeMismatch),
+        )) => error_envelope(
+            StatusCode::BAD_REQUEST,
+            "invalid_tenant_scope",
+            err.to_string(),
+        ),
+        Ok(Err(
+            err @ (queries::audit::AuditQueryError::InvalidLimit
+            | queries::audit::AuditQueryError::InvalidRange),
+        )) => error_envelope(StatusCode::BAD_REQUEST, "invalid_query", err.to_string()),
+        Ok(Err(err)) => error_envelope(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "audit_unavailable",
+            err.to_string(),
+        ),
+        Err(_) => error_envelope(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "audit_unavailable",
+            "audit query worker failed",
         ),
     }
 }
@@ -1751,6 +1813,91 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn audit_query_http_scopes_filters_and_rejects_unknown_params() {
+        let store = memory_record_store();
+        {
+            let guard = store.lock().unwrap();
+            for (tenant, id, ts) in [
+                (budget::PERSONAL_TENANT_ID, "own", 2_000_i64),
+                ("other", "private", 1_500_i64),
+            ] {
+                let mut payload = Map::new();
+                payload.insert("ts_utc".into(), json!(ts));
+                payload.insert("reason".into(), json!("intent_match"));
+                guard
+                    .put(
+                        Some(tenant),
+                        &TenantRecord {
+                            tenant_id: tenant.into(),
+                            kind: RecordKind::Audit,
+                            record_id: id.into(),
+                            request_id: format!("request-{id}"),
+                            origin_record_id: None,
+                            payload,
+                        },
+                    )
+                    .unwrap();
+            }
+        }
+        let app = build_app(AppState {
+            record_store: Some(store),
+            ..AppState::default()
+        });
+        let tenant = budget::PERSONAL_TENANT_ID;
+
+        let own = app
+            .clone()
+            .oneshot(get_usage(
+                &format!("/idoris/tenants/{tenant}/audit?record_id=own"),
+                Some(tenant),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(own.status(), StatusCode::OK);
+        let body = own.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["records"].as_array().unwrap().len(), 1);
+        assert_eq!(json["records"][0]["record_id"], "own");
+
+        let cross_tenant_id = app
+            .clone()
+            .oneshot(get_usage(
+                &format!("/idoris/tenants/{tenant}/audit?record_id=private"),
+                Some(tenant),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(cross_tenant_id.status(), StatusCode::OK);
+        let body = cross_tenant_id
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["records"].as_array().unwrap().is_empty());
+
+        let mismatch = app
+            .clone()
+            .oneshot(get_usage(
+                &format!("/idoris/tenants/{tenant}/audit"),
+                Some("other"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(mismatch.status(), StatusCode::BAD_REQUEST);
+
+        let unknown = app
+            .oneshot(get_usage(
+                &format!("/idoris/tenants/{tenant}/audit?timezone=UTC"),
+                Some(tenant),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(unknown.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
