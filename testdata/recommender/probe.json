@@ -1,0 +1,17 @@
+{
+  "_meta": {"source": "packages/recommender/tests/probe.test.ts", "generator": "reviewed manual extraction; pnpm test verifies"},
+  "nominal_ram": [
+    {"bytes": 25769803776, "expected_gb": 24},
+    {"bytes": 68719476736, "expected_gb": 64}
+  ],
+  "chips": [
+    {"input": "Apple M4", "expected": "M4"},
+    {"input": "Apple M1 Max", "expected": "M1 Max"},
+    {"input": "", "expected": "unknown"}
+  ],
+  "gpu_profiler": [
+    {"input": "Chipset Model: Apple M4\n  Total Number of Cores: 10\n", "expected": 10},
+    {"input": "no gpu info", "expected": null}
+  ],
+  "invalid_ram_labels": ["zero", "negative", "nan", "positive_infinity"]
+}

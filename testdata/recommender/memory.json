@@ -1,0 +1,32 @@
+{
+  "_meta": {"source": "packages/recommender/tests/memory.test.ts", "generator": "reviewed manual extraction; pnpm test verifies"},
+  "units": [
+    {"bytes": 1000000000, "gb": 1, "mib": 953.67431640625, "gib": 0.9313225746154785},
+    {"bytes": 1073741824, "gb": 1.073741824, "mib": 1024, "gib": 1}
+  ],
+  "weights": [
+    {"params_total_b": 8.19, "bpp": 0.55, "expected_gb": 4.5045},
+    {"params_total_b": 100, "bpp": 2, "weights_gb": 7.36, "expected_gb": 7.36}
+  ],
+  "kv": {
+    "arch": {"n_layers": 36, "n_kv_heads": 8, "head_dim": 128},
+    "ctx": 64,
+    "quant": "fp16",
+    "expected_bytes": 9437184,
+    "expected_mib": 9
+  },
+  "apple_budget_64": [
+    {"mode": "conservative", "expected_usable_gb": 42.24},
+    {"mode": "moderate", "expected_usable_gb": 44.8},
+    {"mode": "aggressive", "expected_usable_gb": 48}
+  ],
+  "moe_total_params": {
+    "params_total_b": 30,
+    "bpp": 0.55,
+    "arch": {"n_layers": 32, "n_kv_heads": 4, "head_dim": 128},
+    "ctx": 4096,
+    "kv_quant": "q8",
+    "overhead_gb": 1,
+    "expected_footprint_gb": 17.634217728
+  }
+}
