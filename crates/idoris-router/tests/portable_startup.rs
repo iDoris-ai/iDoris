@@ -46,15 +46,28 @@ fn spawn(exe: &Path, cwd: &Path, port: u16, env: &[(&str, &str)]) -> Running {
     {
         cmd.env_remove(key);
     }
-    Running(Some(
-        cmd.current_dir(cwd)
-            .env("IDORIS_PORT", port.to_string())
-            .envs(env.iter().copied())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap(),
-    ))
+    cmd.current_dir(cwd)
+        .env("IDORIS_PORT", port.to_string())
+        .env("IDORIS_DB_PATH", cwd.join("idoris-test.sqlite3"))
+        .envs(env.iter().copied())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        match cmd.spawn() {
+            Ok(child) => return Running(Some(child)),
+            Err(err)
+                if err.kind() == std::io::ErrorKind::ExecutableFileBusy
+                    && Instant::now() < deadline =>
+            {
+                // Linux may briefly reject exec immediately after fs::copy
+                // closes a newly written executable. Retry only ETXTBSY;
+                // every other spawn failure remains an immediate test error.
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(err) => panic!("failed to spawn copied idoris binary: {err}"),
+        }
+    }
 }
 
 fn failed(mut child: Running, expected: &str) {
@@ -255,4 +268,32 @@ fn explicit_missing_paths_do_not_fall_back_and_subscription_remains_rejected() {
     )
     .unwrap();
     failed(spawn(&exe, cwd.path(), port, &[]), "subscription");
+}
+
+#[test]
+fn explicit_storage_failures_do_not_fall_back() {
+    let (_root, cwd, exe, port) = fixture();
+    let blocker = cwd.path().join("not-a-directory");
+    fs::write(&blocker, "file").unwrap();
+    let bad_db = blocker.join("db.sqlite3");
+    let bad_db = bad_db.to_str().unwrap();
+    failed(
+        spawn(&exe, cwd.path(), port, &[("IDORIS_DB_PATH", bad_db)]),
+        "无法初始化持久化存储",
+    );
+
+    let missing = cwd.path().join("missing-tenants.yaml");
+    let missing = missing.to_str().unwrap();
+    failed(
+        spawn(
+            &exe,
+            cwd.path(),
+            port,
+            &[
+                ("IDORIS_DEPLOY_MODE", "tenant"),
+                ("IDORIS_TENANTS_CONFIG", missing),
+            ],
+        ),
+        "无法初始化持久化存储",
+    );
 }

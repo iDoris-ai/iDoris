@@ -50,6 +50,8 @@ pub mod audit;
 pub mod capabilities;
 /// Stable four-way routing/audit reason taxonomy.
 pub mod reason;
+/// Persistent record/budget storage bootstrap (B1 task18).
+pub mod storage;
 
 /// Direct HTTP forwarding for a generic `http_service` component card's
 /// `POST /v1/chat/completions` (R2-G) — retries, idempotency cache; wired
@@ -190,6 +192,9 @@ pub struct AppState {
     /// remain usable without a ledger. `Arc`
     /// because `BudgetLedger` (wraps a `Mutex<Connection>`) isn't `Clone`.
     pub budget_ledger: Option<Arc<idoris_tenancy::budget::BudgetLedger>>,
+    /// Tenant-scoped audit/usage record store. Startup installs it together
+    /// with `budget_ledger` from the same SQLite path.
+    pub record_store: Option<Arc<std::sync::Mutex<idoris_tenancy::store::TenantStore>>>,
     /// Outbound HTTP client for `GET /v1/models` (this PR) and the direct
     /// `http_service` chat-forwarding path (follow-up PR) — one client
     /// shared across requests so its connection pool is actually reused,
@@ -219,6 +224,10 @@ impl std::fmt::Debug for AppState {
             .field(
                 "budget_ledger",
                 &self.budget_ledger.as_ref().map(|_| "BudgetLedger { .. }"),
+            )
+            .field(
+                "record_store",
+                &self.record_store.as_ref().map(|_| "TenantStore { .. }"),
             )
             .field("http_client", &self.http_client)
             .field(
@@ -255,6 +264,7 @@ impl Default for AppState {
             },
             runtimes: runtime::RuntimeRegistry::default(),
             budget_ledger: None,
+            record_store: None,
             models_health: Arc::new(health::HealthTracker::default()),
             capabilities: None,
             proxy: Arc::new(proxy::ChatProxy::new(http_client.clone())),

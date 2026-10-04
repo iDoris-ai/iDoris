@@ -17,8 +17,9 @@
 //! forwards to it directly per-request instead.
 
 use idoris_router::{
-    AppState, BIND_HOST, build_app, cli, components, config, parse_port, routing_policy,
+    AppState, BIND_HOST, build_app, cli, components, config, parse_port, profile, routing_policy,
     runtime::RuntimeRegistry,
+    storage,
     write_timeout::{DEFAULT_WRITE_TIMEOUT, WriteTimeoutListener},
 };
 
@@ -41,6 +42,8 @@ fn env_flag(name: &str) -> bool {
 async fn run() -> Result<(), String> {
     let port =
         parse_port(std::env::var("IDORIS_PORT").ok().as_deref()).map_err(|err| err.to_string())?;
+    let deploy_mode =
+        profile::deploy_mode_from_env(std::env::var("IDORIS_DEPLOY_MODE").ok().as_deref());
 
     let components_dir =
         config::resolve_env("IDORIS_COMPONENTS_DIR", components::DEFAULT_COMPONENTS_DIR)?;
@@ -66,6 +69,11 @@ async fn run() -> Result<(), String> {
         })?;
 
     let runtimes = RuntimeRegistry::spawn(&cards)?;
+    // Preserve existing startup-gate precedence: component/policy/runtime
+    // validation (including the K04 subscription hard rejection) must fail
+    // before tenant storage/config bootstrap can surface a later error.
+    let persistent = storage::bootstrap_process(deploy_mode)
+        .map_err(|err| format!("无法初始化持久化存储：{err}"))?;
 
     let component_list = cards
         .iter()
@@ -73,9 +81,12 @@ async fn run() -> Result<(), String> {
         .collect::<Vec<_>>()
         .join(", ");
     let state = AppState {
+        deploy_mode,
         cards,
         routing_policy,
         runtimes,
+        budget_ledger: Some(persistent.budget),
+        record_store: Some(persistent.records),
         ..AppState::default()
     };
 
