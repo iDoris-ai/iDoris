@@ -41,62 +41,87 @@ Core product invariants:
 - Router/runtime/fallback/health/capacity designs should actively learn from mature open-source model routers/runtimes while preserving iDoris invariants.
 - Do not regress Rust safety improvements merely to mimic TS behavior; approved differences must be explicit and tested.
 
-## Verified snapshot — 2026-10-04 evening
+## Verified snapshot — 2026-10-05 afternoon
 
 ### Milestone position
 
 - Overall roadmap: M1-M8.
 - M1-M3: complete.
 - Current milestone: **M4**.
-- TS is now reference/PoC only; new product behavior is maintained in Rust.
+- TS is reference/PoC only; new product behavior is maintained in Rust.
 - M4 top-level workstreams are B1-B9 + A1-A6.
 - Rust convergence status:
-  - **B1 Rust parity: 38/39 merged; task33 implemented as PR #298.**
-  - **B2 recommender-rs: 21/21 complete; release PR #294 merged into main.**
-  - **B3 subscription relay: tasks 01-10 + 13 merged; task11/12/14 open; follow-up drain fix #299 open.**
-- Critical path: close B1 #298 -> stabilize/sync B3 onto current main -> finish B3 -> R6/v0.2.0 -> B4-B9/A lanes -> M4 close.
+  - **B1 Rust parity: 39/39 complete; release PR #303 merged to main.**
+  - **B2 recommender-rs: 21/21 complete; release PR #294 merged to main.**
+  - **B3 subscription relay: tasks 01-25 merged; task26-28 are the only remaining B3 closure work.**
+- Critical path: finish B3 tail -> B3 release to main -> R6/default Rust + v0.2.0 -> B4-B9/A lanes -> M4 close -> M5-M8.
 
 ### Live refs at checkpoint write
 
-- `origin/main = def5b3d3ffe01185d57afe2f6371c11b849846dd`
-  - includes B2 Rust recommender release #294.
-- `origin/feat/rust-parity = ad67fe618a6d3390f3c7754b55e1132421974cae`
-  - includes B2/main sync #297; B1 task33 is PR #298 on top.
-- `origin/feat/recommender-rs = 1f61d06073673d3a2d76e9b5aacfc3a010faf594`
-  - B2 task21 complete; feature is closed 21/21.
-- `origin/feat/subscription-relay = ebf0d2d608a245cc31297e817a642767ff95b0d6`
-  - includes tasks 01-10 +13 and fixture stabilization #296.
+- `origin/main = 0017c2ba14e37d7e904b7eb8784303477d77920a`
+  - includes B1 final Rust parity release #303 and B2 release #294.
+- `origin/feat/subscription-relay = eb22298a41c2a481cbb4cd307b096e3127219f4b`
+  - includes B3 tasks 01-25 and merged EPERM cleanup fix #315.
 
-### Open PRs at checkpoint write
+### B3 tail PRs / exact recovery order
 
-- **#292** task11 secure output file, latest head `c161a8b`; CI green; exact-head re-review requested after base stabilization.
-- **#293** task12 stateless relay API, latest head `4f36371`; CI green; exact-head re-review requested.
-- **#295** task14 graceful shutdown, latest head `edb240b`; CI green; exact-head re-review requested.
-- **#298** B1 task33 live capacities, exact head `4a0f376`; CI/TPR running. Production Rust source delta ~262 lines; full idoris-router test suite green locally.
-- **#299** subscription terminal/drain reason fix, exact head `4343430`; CI/TPR running.
+- **#317** `test(subscription): stabilize reaper cancellation fixture`
+  - head `c398cc18c02a464cd53c3eb797114c5daa04cad0`; base `feat/subscription-relay`.
+  - CI green; external reviewer `clestons` requested; TPR verdict pending at this snapshot.
+  - fixes the second macOS test race: install TERM trap before readiness marker, treat only ESRCH as group gone.
+  - local evidence: targeted cancellation 20/20 consecutive passes; full reaper/cancel suites, clippy/fmt/diff-check green.
+- **#314** `ci(subscription): require B3 Unix safety matrix`
+  - remote approved old head `178e42b...`; local repaired head is **`615ccabf29fdbe8136b36a849e3f4fb835e90903`** in `/Users/jason/Dev/auraai/iDoris-b3-26`.
+  - local head already contains #315 + #317 and the task26 Unix matrix. Rust portion of `scripts/check-subscription.sh` is green; local harness lacks Node runtime so pnpm cannot run locally.
+  - do not push this repaired head before #317 is approved/merged.
+- **#316** `test(subscription): add B3 real CLI smoke`
+  - approved old head `3f0fa7279b364dd62d1f23a1f6eb84bcb3c0553d`; base is #314 branch.
+  - real Mac smoke recorded PASS against Codex CLI 0.156.1 + Claude Code 2.1.289. Do not re-run real account smoke automatically.
+  - local combined/repaired head is **`dd801c0d20c3ab57c7b4c379f27742ca70242afe`** in `/Users/jason/Dev/auraai/iDoris-b3-27`; default no-op smoke/clippy/fmt/diff-check green.
+- **#318** `test(subscription): harden real CLI smoke assertions`
+  - head `9d1dd1c64dae509876fa4f9eb2703f9b1480a5cc`; stacked on #316.
+  - exact-token CLI flag matching, generic fixed-reply failure text, and acceptance wording narrowed to actual evidence; production delta 0.
+  - one macOS run failed on the old base in `subscription_disconnect`; another passed. Repaired task26 base runs the concurrent disconnect case 20/20 locally, so do not duplicate the reaper fix in #318.
+- **task28 release evidence**
+  - worktree `/Users/jason/Dev/auraai/iDoris-b3-28-current`; local final head **`fdeda7013de4869625ca9b52ebb16dad0770b6b3`**.
+  - docs are already synchronized with repaired task27 and honest tested-vs-not-tested wording. Do not open the task28 PR until #314/#316/#317/#318 close; then refresh final PR numbers/status and publish.
 
-Always refresh these PRs before acting.
+### Safe stacked merge sequence
 
-### Important integration state
+1. Merge #317 only after APPROVED + CI green.
+2. Push local task26 repaired head to #314 and require fresh Linux/macOS subscription jobs green; re-review exact head if approval is dismissed.
+3. Before merging #314, repoint #316 to `feat/subscription-relay` so source-branch deletion cannot auto-close it.
+4. Merge #314 after repaired exact-head gates pass.
+5. Validate/re-run #316 on the repaired base; merge when APPROVED + green. Before deleting its source branch, repoint #318 to `feat/subscription-relay`.
+6. Merge #318 when its final-base CI/TPR are green.
+7. Refresh task28 evidence, open/TPR/merge task28. B3 is then 28/28.
 
-- B3 is **224 main commits behind** at this snapshot. Do not continue Router-facing B3 task15+ on the stale long branch.
-- A dry-run integration branch/worktree exists:
-  - branch `integration/b3-main-sync`
-  - worktree `/Users/jason/Dev/auraai/iDoris-b3-main-sync`
-  - merge commit `aa5cb05` from #295 head + current main
-  - only textual merge conflict was `crates/idoris-router/src/lib.rs`; resolution keeps both B3 `subscription` module and main's sse/supervisor/write-timeout modules.
-- Router tests pass on the integration merge.
-- Upstream full-suite exposed a real terminal/drain reporting race: Cancelled could become CleanupFailed when bounded stdout/stderr drain scheduling exceeded the test grace. This is fixed independently in PR #299; after #299 lands, update the B3 stack/main-sync before declaring integration green.
+### Local final-preview evidence
+
+- B3 release preview combines #315 + #317 + repaired task26 + task27 hardening + task28 and is conflict-free.
+- Full Rust subscription matrix is green locally.
+- `idoris-upstream`: 110/110.
+- `idoris-router --lib`: 251/251.
+- clippy/fmt/diff-check green.
+- local `scripts/check-subscription.sh` reaches pnpm only after all Rust subscription tests pass; local harness has **no Node runtime**, so pnpm/conformance is not locally claimed as passed. GitHub CI is authoritative for Node/cross-platform gates.
+
+### R6/v0.2.0 preview evidence
+
+- Worktree `/Users/jason/Dev/auraai/iDoris-r6-preview-current`; current local head **`a941693c37de3f7588a90af1e9a6b326e71a9e0b`** (main + repaired B3 tail preview).
+- `cargo test --workspace --locked`: pass.
+- `cargo deny check advisories bans licenses sources`: pass (existing duplicate/yanked warnings remain warnings).
+- `cargo build --release --locked -p idoris-router`: pass.
+- Release archive contains exactly `idoris` + three runtime config files; `scripts/release-smoke.py` passes from unrelated cwd with clean IDORIS environment.
+- README already states Rust is production and TS is reference; CI rust job already runs Rust release conformance. R6 should not delete TS tooling because shared conformance/reference tests still use Node.
+- Crates remain `0.1.3`; after B3 release/R6 closure, create a dedicated version PR bumping the seven Rust crates + Cargo.lock to `0.2.0`, update progress, then tag `v0.2.0` only after release workflow gates pass. Contract version `1.0.1` is independent and should not be bumped just for crate release version.
 
 ### Immediate next execution order
 
-1. Merge #299 when APPROVED + CI green; sync the fix through #292 -> #293 -> #295 and the B3 main-sync integration branch.
-2. Merge #292, then safely repoint/merge #293, then safely repoint/merge #295; never delete a stacked base before repointing dependents.
-3. Merge #298 when APPROVED + CI green. That closes B1 39/39.
-4. Merge current main into `feat/subscription-relay` using the already-proven one-conflict integration recipe; run Router + Upstream full suites/clippy/fmt/diff-check.
-5. Only after that sync, implement B3 task15 runtime-handle, then task16 dispatch, 17-19 HTTP lifetime/result chain, 20-28 enable/conformance/release evidence.
-6. Close R6/v0.2.0, then execute M4 B4 -> B5/B6 -> B7/B8 -> B9 and A1-A6 acceptance.
-7. Continue M5 -> M6 -> M7 -> M8 under the same plan/implement/accept/challenge-review/TPR/merge loop.
+1. Close #317 -> repaired #314 -> #316 -> #318 -> task28 using the safe stacked order above.
+2. B3 release integration PR to current main; run full CI/shared conformance/FU-26 Tier-1 review.
+3. R6 default-Rust closure + v0.2.0 version/tag/release smoke.
+4. Begin M4 B4 direct-proxy budget reserve/settle, then B5/B6, B7/B8, B9 with A-lane acceptance interleaved.
+5. Continue M5 -> M6 -> M7 -> M8 with the same Prime loop.
 
 ## Known review lessons that must not be forgotten
 
