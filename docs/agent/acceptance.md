@@ -30,9 +30,22 @@ IDORIS_SUBSCRIPTION_REAL_CLI=both cargo test -p idoris-upstream --test subscript
 
 2026-10-05 本机实测（Mac，真实登录态）：
 
-- Codex CLI `0.156.1`：PASS —— 固定回复、工具/写入诱导不落盘、500ms timeout、显式 cancel、正常/timeout/cancel 后 PGID 消失。
-- Claude Code `2.1.289`：PASS —— 固定回复、工具/写入诱导不落盘、500ms timeout、显式 cancel、正常/timeout/cancel 后 PGID 消失。
+- Codex CLI `0.156.1`：PASS —— 固定回复、write-inducement 下未出现禁写文件、500ms timeout、PGID 建立后的显式 cancel、正常/timeout/cancel 后 PGID 消失。
+- Claude Code `2.1.289`：PASS —— 固定回复、write-inducement 下未出现禁写文件、500ms timeout、PGID 建立后的显式 cancel、正常/timeout/cancel 后 PGID 消失。
 - 测试输出仅记录版本与 PASS；未记录 prompt、stderr、凭据或自由文本。
+
+### B3 kill switch 运维验收
+
+订阅中转不是热开关。紧急停用时：
+
+1. 设置 `IDORIS_DISABLE_SUBSCRIPTION=1`。
+2. 优雅重启 iDoris；shutdown 必须先拒绝新 relay、取消 active CLI、等待 PGID 回收。
+3. 重启后确认 `/v1/models` 无 `claude-subscription` / `codex-subscription`。
+4. 再发一个普通本地/免费 HTTP 模型正控，确认能力②/③不受 kill switch 影响。
+5. 发一个 `local_only` 请求并确认 CLI spawn marker 为 0。
+
+若 CLI 版本升级后 task27 的 safety flags / fixed reply / write-inducement /
+timeout / cancel 任一项失败，该 CLI 必须保持禁用，禁止删安全 flag 后重试。
 
 ## 一、我只需要记住一个地址
 

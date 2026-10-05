@@ -6,6 +6,13 @@
 #  - allowed_egress 固定 [loopback]：订阅请求的来源必须是 loopback。
 #  - 真正注册还需 deploy_mode=personal 且显式 IDORIS_ENABLE_SUBSCRIPTION=1
 #    + IDORIS_SUBSCRIPTION_SANDBOX；否则 registry 跳过或拒绝启动。
+#  - kill switch：IDORIS_DISABLE_SUBSCRIPTION=1 优先于 enable；这是启动快照，
+#    需要优雅重启才生效，不是运行时热开关。
+#  - 当前安全边界是 best-effort：CLI 固定安全 argv + request-private workspace +
+#    环境凭据 scrub + loopback 来源门禁；不宣称隔离 HOME 登录态、CLI 网络目的地
+#    或主动 setsid/setpgid 脱组的恶意后代。
+#  - CLI 升级后必须重新跑显式 opt-in 的 subscription_real smoke；安全 flags
+#    不兼容时 fail-closed，禁止剥 flag 回退。
 provider:
   id: subscription
   family: other
