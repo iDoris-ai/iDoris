@@ -205,6 +205,26 @@ impl SubscriptionRuntimeRegistry {
     pub fn is_empty(&self) -> bool {
         self.handles.is_empty()
     }
+
+    pub fn len(&self) -> usize {
+        self.handles.len()
+    }
+
+    pub fn discovery(&self) -> Vec<SubscriptionDiscovery> {
+        self.handles
+            .values()
+            .map(|handle| SubscriptionDiscovery {
+                provider_id: handle.provider_id().to_string(),
+                model_id: handle.model_id().to_string(),
+            })
+            .collect()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubscriptionDiscovery {
+    pub provider_id: String,
+    pub model_id: String,
 }
 
 #[cfg(test)]

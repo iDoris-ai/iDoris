@@ -17,6 +17,8 @@ use reqwest::header::{AUTHORIZATION, HeaderValue};
 use serde::Serialize;
 use serde_json::Value;
 
+use crate::subscription::runtime::SubscriptionRuntimeRegistry;
+
 /// TS's reference loop (`server.ts`'s `/v1/models` handler) applies no
 /// timeout at all to each backend's `list()` call — an unresponsive
 /// upstream blocks the whole request indefinitely. Rust applies one so
@@ -162,6 +164,26 @@ pub async fn list_models(
         object: "list",
         data,
     })
+}
+
+pub async fn list_models_with_subscriptions(
+    client: &reqwest::Client,
+    cards: &[ComponentCard],
+    health: &HealthTracker,
+    subscriptions: &SubscriptionRuntimeRegistry,
+) -> Result<ModelsResponse, ModelsError> {
+    let mut response = list_models(client, cards, health).await?;
+    response.data.extend(
+        subscriptions
+            .discovery()
+            .into_iter()
+            .map(|entry| ModelEntry {
+                id: entry.model_id,
+                object: "model",
+                owned_by: entry.provider_id,
+            }),
+    );
+    Ok(response)
 }
 
 #[cfg(test)]
