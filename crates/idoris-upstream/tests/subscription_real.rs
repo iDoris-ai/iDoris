@@ -55,22 +55,48 @@ fn command_output(program: &Path, args: &[&str]) -> String {
     String::from_utf8(output.stdout).expect("CLI metadata output must be UTF-8")
 }
 
+fn help_has_token(help: &str, expected: &str) -> bool {
+    help.split_whitespace()
+        .map(|token| {
+            token.trim_matches(|ch: char| {
+                matches!(ch, ',' | '[' | ']' | '(' | ')' | '<' | '>' | '`')
+            })
+        })
+        .any(|token| token == expected)
+}
+
+#[test]
+fn help_flag_matching_is_token_exact() {
+    assert!(!help_has_token("--permission-prompts none", "-p"));
+    assert!(help_has_token("-p, --print", "-p"));
+    assert!(help_has_token("[--tools] (--restricted)", "--tools"));
+    assert!(help_has_token("[--tools] (--restricted)", "--restricted"));
+}
+
 fn verify_cli_capabilities(cli: SubscriptionCli, program: &Path) -> String {
     let version = command_output(program, &["--version"]).trim().to_string();
     assert!(!version.is_empty(), "CLI version must not be empty");
-    let mut help = command_output(program, &["--help"]);
-    if cli == SubscriptionCli::Codex {
-        help.push_str(&command_output(program, &["exec", "--help"]));
-    }
+    let root_help = command_output(program, &["--help"]);
+    let exec_help =
+        (cli == SubscriptionCli::Codex).then(|| command_output(program, &["exec", "--help"]));
     let supported_flags = required_flags(cli)
         .iter()
-        .filter(|flag| help.contains(**flag))
+        .filter(|flag| {
+            if **flag == "exec" {
+                help_has_token(&root_help, flag)
+            } else {
+                help_has_token(&root_help, flag)
+                    || exec_help
+                        .as_deref()
+                        .is_some_and(|help| help_has_token(help, flag))
+            }
+        })
         .map(|flag| (*flag).to_string())
         .collect::<BTreeSet<_>>();
     validate_cli_capabilities(
         SandboxProfile::fixed(cli),
         &CliCapabilities {
-            tools_off: cli == SubscriptionCli::Claude && help.contains("--tools"),
+            tools_off: cli == SubscriptionCli::Claude && help_has_token(&root_help, "--tools"),
             supported_flags,
         },
     )
@@ -198,7 +224,10 @@ async fn run_real_cli(cli: SubscriptionCli) {
         )
         .await
         .unwrap_or_else(|error| panic!("{version} fixed-reply smoke failed: {error}"));
-    assert_eq!(response.content.trim(), FIXED_REPLY);
+    assert!(
+        response.content.trim() == FIXED_REPLY,
+        "{version} fixed-reply smoke returned unexpected content"
+    );
     let group = normal.wait_group().await;
     wait_group_gone(group).await;
 
