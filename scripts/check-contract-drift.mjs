@@ -5,10 +5,27 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { generateInto } from "./gen-contracts.mjs";
+import {
+  assertContractVersionsEqual,
+  parseConformanceContractVersion,
+  parseRustContractVersion,
+  parseTsContractVersion,
+} from "./contract-version.mjs";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const committedDir = join(root, "packages/contracts/src/generated");
 const tmp = mkdtempSync(join(tmpdir(), "idoris-contracts-"));
+
+const tsVersion = parseTsContractVersion(
+  readFileSync(join(root, "packages/contracts/src/version.ts"), "utf8"),
+);
+const rustVersion = parseRustContractVersion(
+  readFileSync(join(root, "crates/idoris-contracts/src/version.rs"), "utf8"),
+);
+const conformanceVersion = parseConformanceContractVersion(
+  readFileSync(join(root, "conformance/tests/response-headers.test.ts"), "utf8"),
+);
+assertContractVersionsEqual({ ts: tsVersion, rust: rustVersion, conformance: conformanceVersion });
 
 try {
   generateInto(tmp);
@@ -33,7 +50,7 @@ try {
     console.error("契约漂移：请运行 pnpm gen:contracts 并提交产物。");
     process.exit(1);
   }
-  console.log("no contract drift");
+  console.log(`no contract drift (wire version ${tsVersion})`);
 } finally {
   rmSync(tmp, { recursive: true, force: true });
 }

@@ -16,15 +16,22 @@
 //! lifecycle) never touches this Supervisor at all — `AppState.proxy`
 //! forwards to it directly per-request instead.
 
-use idoris_backend::{Supervisor, SupervisorConfig, SupervisorHandle};
-use idoris_contracts::ComponentCard;
-use idoris_contracts::component_card::Form;
-use idoris_router::dispatch::is_resident_http_service;
-use idoris_router::{AppState, BIND_HOST, build_app, components, parse_port, routing_policy};
-use idoris_upstream::{OmlxAdapter, OmlxAdapterConfig};
+use idoris_router::{
+    AppState, BIND_HOST, build_app,
+    capabilities::{CapabilitiesProvider, LiveCapabilitiesProvider},
+    cli, components, config, host_facts, parse_port, profile, routing_policy,
+    runtime::RuntimeRegistry,
+    storage,
+    write_timeout::{DEFAULT_WRITE_TIMEOUT, WriteTimeoutListener},
+};
+use std::sync::Arc;
 
 #[tokio::main]
 async fn main() {
+    if let Err(message) = cli::parse_args(std::env::args_os().skip(1)) {
+        eprintln!("[idoris] {message}");
+        std::process::exit(1);
+    }
     if let Err(message) = run().await {
         eprintln!("[idoris] 启动失败：{message}");
         std::process::exit(1);
@@ -35,51 +42,14 @@ fn env_flag(name: &str) -> bool {
     std::env::var(name).is_ok_and(|v| v == "1")
 }
 
-/// Finds the first registered card that needs the Supervisor's explicit
-/// load/unload lifecycle (`form: http_service`, `load_policy.mode` anything
-/// but `Resident` — a card with no declared `load_policy` at all also
-/// counts, matching `dispatch::candidate`'s own `LoadMode::OnDemand`
-/// default) and spawns one `Supervisor` wrapping an `OmlxAdapter` pointed
-/// at its `endpoint`. Returns `Ok(None)` when no such card is registered —
-/// every local candidate then still fails closed as
-/// `local_only_unavailable`/`supervisor_unavailable`, same as before this
-/// wiring existed.
-///
-/// **Known simplification**: today's production config has exactly one
-/// such card (`config/components/omlx.yaml`); if more than one is ever
-/// registered, every card past the first (in sorted-filename load order)
-/// falls back to that same fail-closed behavior rather than getting its own
-/// Supervisor — a documented limitation, not a silent bug, until a
-/// per-card Supervisor registry exists.
-fn spawn_supervisor_for_omlx_card(
-    cards: &[ComponentCard],
-) -> Result<Option<SupervisorHandle>, String> {
-    let Some(card) = cards.iter().find(|c| {
-        c.form == Form::HttpService && !is_resident_http_service(c)
-        // is_resident_http_service already checks form == HttpService too;
-        // the explicit form check above is just so this predicate reads as
-        // "an http_service card that ISN'T the direct-forward kind" on its
-        // own, without requiring the reader to know that fact about the
-        // helper it calls.
-    }) else {
-        return Ok(None);
-    };
-    let adapter = OmlxAdapter::new(OmlxAdapterConfig {
-        base_url: card.endpoint.clone(),
-        ..OmlxAdapterConfig::default()
-    })
-    .map_err(|err| format!("无法构造 oMLX 适配器（{}）：{err}", card.provider.id))?;
-    let handle = Supervisor::spawn(std::sync::Arc::new(adapter), SupervisorConfig::default())
-        .map_err(|err| format!("无法启动 Supervisor（{}）：{err}", card.provider.id))?;
-    Ok(Some(handle))
-}
-
 async fn run() -> Result<(), String> {
     let port =
         parse_port(std::env::var("IDORIS_PORT").ok().as_deref()).map_err(|err| err.to_string())?;
+    let deploy_mode =
+        profile::deploy_mode_from_env(std::env::var("IDORIS_DEPLOY_MODE").ok().as_deref());
 
     let components_dir =
-        components::resolve_components_dir(std::env::var("IDORIS_COMPONENTS_DIR").ok().as_deref());
+        config::resolve_env("IDORIS_COMPONENTS_DIR", components::DEFAULT_COMPONENTS_DIR)?;
     let allow_mock = env_flag("IDORIS_ALLOW_MOCK");
     let cards = components::load_components(&components_dir, allow_mock).map_err(|err| {
         format!(
@@ -88,21 +58,47 @@ async fn run() -> Result<(), String> {
         )
     })?;
 
-    // Fail-fast only: idoris_policy::decide() doesn't consume routing
-    // policy rules yet (see routing_policy's module doc) -- this just
-    // guarantees a bad/missing IDORIS_ROUTING_POLICY is caught at startup,
-    // not silently ignored.
-    let routing_policy_path = routing_policy::resolve_routing_policy_path(
-        std::env::var("IDORIS_ROUTING_POLICY").ok().as_deref(),
-    );
-    routing_policy::load_routing_policy(&routing_policy_path).map_err(|err| {
-        format!(
-            "无法加载路由策略 \"{}\"（IDORIS_ROUTING_POLICY）：{err}",
-            routing_policy_path.display()
-        )
-    })?;
+    // Load once and retain the validated policy for both execution paths.
+    let routing_policy_path = config::resolve_env(
+        "IDORIS_ROUTING_POLICY",
+        routing_policy::DEFAULT_ROUTING_POLICY_PATH,
+    )?;
+    let routing_policy =
+        routing_policy::load_routing_policy(&routing_policy_path).map_err(|err| {
+            format!(
+                "无法加载路由策略 \"{}\"（IDORIS_ROUTING_POLICY）：{err}",
+                routing_policy_path.display()
+            )
+        })?;
 
-    let supervisor = spawn_supervisor_for_omlx_card(&cards)?;
+    let runtimes = RuntimeRegistry::spawn(&cards)?;
+    // Preserve existing startup-gate precedence: component/policy/runtime
+    // validation (including the K04 subscription hard rejection) must fail
+    // before tenant storage/config bootstrap can surface a later error.
+    let persistent = storage::bootstrap_process(deploy_mode)
+        .map_err(|err| format!("无法初始化持久化存储：{err}"))?;
+
+    let catalog_path = config::resolve_env("IDORIS_CATALOG", "config/catalog.yaml")?;
+    let capabilities = match host_facts::current_host_facts() {
+        Ok(facts) => {
+            let catalog =
+                idoris_recommender::catalog::load_catalog(&catalog_path).map_err(|error| {
+                    format!(
+                        "无法加载模型目录 \"{}\"（IDORIS_CATALOG）：{error}",
+                        catalog_path.display()
+                    )
+                })?;
+            Some(Arc::new(LiveCapabilitiesProvider::new(
+                catalog,
+                facts,
+                runtimes.clone(),
+            )) as Arc<dyn CapabilitiesProvider>)
+        }
+        Err(error) => {
+            eprintln!("[idoris] capabilities unavailable: {error}");
+            None
+        }
+    };
 
     let component_list = cards
         .iter()
@@ -110,8 +106,13 @@ async fn run() -> Result<(), String> {
         .collect::<Vec<_>>()
         .join(", ");
     let state = AppState {
+        deploy_mode,
         cards,
-        supervisor,
+        routing_policy,
+        runtimes,
+        capabilities,
+        budget_ledger: Some(persistent.budget),
+        record_store: Some(persistent.records),
         ..AppState::default()
     };
 
@@ -130,7 +131,10 @@ async fn run() -> Result<(), String> {
             &component_list
         }
     );
-    axum::serve(listener, app)
-        .await
-        .map_err(|err| format!("server error: {err}"))
+    axum::serve(
+        WriteTimeoutListener::new(listener, DEFAULT_WRITE_TIMEOUT),
+        app,
+    )
+    .await
+    .map_err(|err| format!("server error: {err}"))
 }

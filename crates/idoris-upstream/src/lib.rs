@@ -19,7 +19,9 @@
 //!   [`remote::CredentialSource`] only).
 
 pub mod chat;
+pub mod detect;
 pub mod error;
+pub mod factory;
 pub mod omlx;
 pub mod remote;
 pub mod subscription;
@@ -31,3 +33,12 @@ pub use chat::{
 pub use error::UpstreamError;
 pub use omlx::{OmlxAdapter, OmlxAdapterConfig};
 pub use remote::{CredentialSource, EnvCredentialSource};
+
+/// Builds an upstream transport that preserves the configured endpoint's locality.
+/// Explicitly disables proxies even when dependency feature unification enables them.
+pub fn http_client() -> Result<reqwest::Client, reqwest::Error> {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
+        .build()
+}

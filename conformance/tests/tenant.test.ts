@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { startFakeUpstream, type FakeUpstream } from "../src/fake-upstream.js";
 import { spawnConformanceServer, routingPolicyFixturePath, type RunningServer } from "../src/harness.js";
-import { localComponent, makeComponentsDir } from "../src/fixtures.js";
+import { localComponent, makeComponentsDir, makeTenantConfigFile } from "../src/fixtures.js";
 
 // tenant 模式要切 IDORIS_DEPLOY_MODE，和其它套件公用一个进程会互相污染，单独起一个。
 let upstream: FakeUpstream;
@@ -10,10 +10,11 @@ let server: RunningServer;
 beforeAll(async () => {
   upstream = await startFakeUpstream();
   const componentsDir = makeComponentsDir([localComponent(upstream.url)]);
+  const tenantConfig = makeTenantConfigFile([{ tenantId: "tenant-conformance" }]);
   server = await spawnConformanceServer({
     componentsDir,
     routingPolicyPath: routingPolicyFixturePath,
-    env: { IDORIS_DEPLOY_MODE: "tenant" },
+    env: { IDORIS_DEPLOY_MODE: "tenant", IDORIS_TENANTS_CONFIG: tenantConfig },
   });
 });
 

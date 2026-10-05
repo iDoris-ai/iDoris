@@ -1,0 +1,1006 @@
+{
+  "metadata": {
+    "source_commit": "49a66e86e65e9ddf26f3bf3c9d68041df49d8981"
+  },
+  "scenarios": [
+    {
+      "input": {
+        "name": "exact-tie-keeps-first",
+        "ram": 24,
+        "catalog": {
+          "version": 1,
+          "catalog": [
+            {
+              "id": "first",
+              "params_total_b": 1,
+              "arch": {
+                "n_layers": 1,
+                "n_kv_heads": 1,
+                "head_dim": 1
+              },
+              "roles": [
+                "daily"
+              ],
+              "quant_options": [
+                {
+                  "label": "q",
+                  "weights_gb": 1,
+                  "quality": 0.98
+                }
+              ],
+              "min_ram_gb": 1,
+              "capability": {
+                "reasoning": 1
+              }
+            },
+            {
+              "id": "second",
+              "params_total_b": 1,
+              "arch": {
+                "n_layers": 1,
+                "n_kv_heads": 1,
+                "head_dim": 1
+              },
+              "roles": [
+                "daily"
+              ],
+              "quant_options": [
+                {
+                  "label": "q",
+                  "weights_gb": 1,
+                  "quality": 0.98
+                }
+              ],
+              "min_ram_gb": 1,
+              "capability": {
+                "reasoning": 1
+              }
+            }
+          ]
+        },
+        "policy": {
+          "temp_slots": 0,
+          "needed_capabilities": []
+        }
+      },
+      "output": {
+        "hardware": {
+          "ram_gb": 24,
+          "chip": "fixture",
+          "gpu_cores": null,
+          "os": "darwin",
+          "source": "injected"
+        },
+        "policy": {
+          "wired_mode": "conservative",
+          "context_target": 32768,
+          "kv_quant": "q8",
+          "temp_slots": 0,
+          "quality_threshold": 0.98,
+          "needed_capabilities": []
+        },
+        "usable_gb": 15.84,
+        "reserve_gb": 7.199999999999999,
+        "temp_reserve_gb": 0,
+        "resident_budget_gb": 14.84,
+        "resident": {
+          "id": "first",
+          "ctx": 32768,
+          "score": 0.98,
+          "label": "q",
+          "quality": 0.98,
+          "weights_gb": 1,
+          "kv_gb": 0.000065536,
+          "footprint_gb": 2.000065536
+        },
+        "resident_label": "first@q",
+        "temp": [],
+        "blocked": [],
+        "warnings": [
+          "预算: 24GB conservative → usable 15.84GB（reserve 7.20GB）；常驻预算 14.84GB（预留临时 0.00GB + headroom 1.00GB）"
+        ],
+        "recommended_sysctl": {
+          "iogpu_wired_limit_mb": 16220
+        },
+        "tradeoff": "硬件 fixture / 24GB（conservative，ctx 32768，KV q8）\n常驻 first@q：权重 1.00GB + KV 0.00GB + 开销 = 2.00GB，预算 14.84GB；能力×质量=0.9800\nBLOCKED：无\n预算：usable 15.84GB（reserve 7.20GB，临时预留 0.00GB）",
+        "override": null
+      }
+    },
+    {
+      "input": {
+        "name": "empty-catalog",
+        "ram": 24,
+        "catalog": {
+          "version": 1,
+          "catalog": []
+        },
+        "policy": {
+          "temp_slots": 0,
+          "needed_capabilities": []
+        }
+      },
+      "output": {
+        "hardware": {
+          "ram_gb": 24,
+          "chip": "fixture",
+          "gpu_cores": null,
+          "os": "darwin",
+          "source": "injected"
+        },
+        "policy": {
+          "wired_mode": "conservative",
+          "context_target": 32768,
+          "kv_quant": "q8",
+          "temp_slots": 0,
+          "quality_threshold": 0.98,
+          "needed_capabilities": []
+        },
+        "usable_gb": 15.84,
+        "reserve_gb": 7.199999999999999,
+        "temp_reserve_gb": 0,
+        "resident_budget_gb": 14.84,
+        "resident": null,
+        "resident_label": null,
+        "temp": [],
+        "blocked": [],
+        "warnings": [
+          "预算: 24GB conservative → usable 15.84GB（reserve 7.20GB）；常驻预算 14.84GB（预留临时 0.00GB + headroom 1.00GB）",
+          "没有模型能放进常驻预算：请提高 wired_mode 或降低 context_target"
+        ],
+        "recommended_sysctl": {
+          "iogpu_wired_limit_mb": 16220
+        },
+        "tradeoff": "硬件 fixture / 24GB（conservative，ctx 32768，KV q8）\n常驻：无（预算 14.84GB 放不下任何 daily 模型）\nBLOCKED：无\n预算：usable 15.84GB（reserve 7.20GB，临时预留 0.00GB）",
+        "override": null
+      }
+    },
+    {
+      "input": {
+        "name": "ram-equality-admits",
+        "ram": 8,
+        "catalog": {
+          "version": 1,
+          "catalog": [
+            {
+              "id": "equal-ram",
+              "params_total_b": 1,
+              "arch": {
+                "n_layers": 1,
+                "n_kv_heads": 1,
+                "head_dim": 1
+              },
+              "roles": [
+                "daily"
+              ],
+              "quant_options": [
+                {
+                  "label": "q",
+                  "weights_gb": 0.1,
+                  "quality": 0.98
+                }
+              ],
+              "min_ram_gb": 8,
+              "capability": {
+                "reasoning": 1
+              }
+            }
+          ]
+        },
+        "policy": {
+          "temp_slots": 0,
+          "needed_capabilities": []
+        }
+      },
+      "output": {
+        "hardware": {
+          "ram_gb": 8,
+          "chip": "fixture",
+          "gpu_cores": null,
+          "os": "darwin",
+          "source": "injected"
+        },
+        "policy": {
+          "wired_mode": "conservative",
+          "context_target": 32768,
+          "kv_quant": "q8",
+          "temp_slots": 0,
+          "quality_threshold": 0.98,
+          "needed_capabilities": []
+        },
+        "usable_gb": 5,
+        "reserve_gb": 3,
+        "temp_reserve_gb": 0,
+        "resident_budget_gb": 4,
+        "resident": {
+          "id": "equal-ram",
+          "ctx": 32768,
+          "score": 0.98,
+          "label": "q",
+          "quality": 0.98,
+          "weights_gb": 0.1,
+          "kv_gb": 0.000065536,
+          "footprint_gb": 1.100065536
+        },
+        "resident_label": "equal-ram@q",
+        "temp": [],
+        "blocked": [],
+        "warnings": [
+          "预算: 8GB conservative → usable 5.00GB（reserve 3.00GB）；常驻预算 4.00GB（预留临时 0.00GB + headroom 1.00GB）"
+        ],
+        "recommended_sysctl": {
+          "iogpu_wired_limit_mb": 5120
+        },
+        "tradeoff": "硬件 fixture / 8GB（conservative，ctx 32768，KV q8）\n常驻 equal-ram@q：权重 0.10GB + KV 0.00GB + 开销 = 1.10GB，预算 4.00GB；能力×质量=0.9800\nBLOCKED：无\n预算：usable 5.00GB（reserve 3.00GB，临时预留 0.00GB）",
+        "override": null
+      }
+    },
+    {
+      "input": {
+        "name": "ram-below-blocks",
+        "ram": 7.999,
+        "catalog": {
+          "version": 1,
+          "catalog": [
+            {
+              "id": "equal-ram",
+              "params_total_b": 1,
+              "arch": {
+                "n_layers": 1,
+                "n_kv_heads": 1,
+                "head_dim": 1
+              },
+              "roles": [
+                "daily"
+              ],
+              "quant_options": [
+                {
+                  "label": "q",
+                  "weights_gb": 0.1,
+                  "quality": 0.98
+                }
+              ],
+              "min_ram_gb": 8,
+              "capability": {
+                "reasoning": 1
+              }
+            }
+          ]
+        },
+        "policy": {
+          "temp_slots": 0,
+          "needed_capabilities": []
+        }
+      },
+      "output": {
+        "hardware": {
+          "ram_gb": 7.999,
+          "chip": "fixture",
+          "gpu_cores": null,
+          "os": "darwin",
+          "source": "injected"
+        },
+        "policy": {
+          "wired_mode": "conservative",
+          "context_target": 32768,
+          "kv_quant": "q8",
+          "temp_slots": 0,
+          "quality_threshold": 0.98,
+          "needed_capabilities": []
+        },
+        "usable_gb": 4.999,
+        "reserve_gb": 3,
+        "temp_reserve_gb": 0,
+        "resident_budget_gb": 3.9989999999999997,
+        "resident": null,
+        "resident_label": null,
+        "temp": [],
+        "blocked": [
+          {
+            "id": "equal-ram",
+            "status": "BLOCKED",
+            "min_ram_gb": 8,
+            "estimated_memory_gb": 1.100065536,
+            "reason": "min_ram_gb=8 > ram_gb=7.999"
+          }
+        ],
+        "warnings": [
+          "预算: 7.999GB conservative → usable 5.00GB（reserve 3.00GB）；常驻预算 4.00GB（预留临时 0.00GB + headroom 1.00GB）",
+          "equal-ram: BLOCKED（min_ram_gb=8 > ram_gb=7.999）",
+          "没有模型能放进常驻预算：请提高 wired_mode 或降低 context_target"
+        ],
+        "recommended_sysctl": {
+          "iogpu_wired_limit_mb": 5119
+        },
+        "tradeoff": "硬件 fixture / 7.999GB（conservative，ctx 32768，KV q8）\n常驻：无（预算 4.00GB 放不下任何 daily 模型）\nBLOCKED：equal-ram(需8GB)\n预算：usable 5.00GB（reserve 3.00GB，临时预留 0.00GB）",
+        "override": null
+      }
+    },
+    {
+      "input": {
+        "name": "quality-threshold-equality-admits",
+        "ram": 24,
+        "catalog": {
+          "version": 1,
+          "catalog": [
+            {
+              "id": "quality-edge",
+              "params_total_b": 1,
+              "arch": {
+                "n_layers": 1,
+                "n_kv_heads": 1,
+                "head_dim": 1
+              },
+              "roles": [
+                "daily"
+              ],
+              "quant_options": [
+                {
+                  "label": "q",
+                  "weights_gb": 1,
+                  "quality": 0.98
+                }
+              ],
+              "min_ram_gb": 1,
+              "capability": {
+                "reasoning": 1
+              }
+            }
+          ]
+        },
+        "policy": {
+          "temp_slots": 0,
+          "needed_capabilities": [],
+          "quality_threshold": 0.98
+        }
+      },
+      "output": {
+        "hardware": {
+          "ram_gb": 24,
+          "chip": "fixture",
+          "gpu_cores": null,
+          "os": "darwin",
+          "source": "injected"
+        },
+        "policy": {
+          "wired_mode": "conservative",
+          "context_target": 32768,
+          "kv_quant": "q8",
+          "temp_slots": 0,
+          "quality_threshold": 0.98,
+          "needed_capabilities": []
+        },
+        "usable_gb": 15.84,
+        "reserve_gb": 7.199999999999999,
+        "temp_reserve_gb": 0,
+        "resident_budget_gb": 14.84,
+        "resident": {
+          "id": "quality-edge",
+          "ctx": 32768,
+          "score": 0.98,
+          "label": "q",
+          "quality": 0.98,
+          "weights_gb": 1,
+          "kv_gb": 0.000065536,
+          "footprint_gb": 2.000065536
+        },
+        "resident_label": "quality-edge@q",
+        "temp": [],
+        "blocked": [],
+        "warnings": [
+          "预算: 24GB conservative → usable 15.84GB（reserve 7.20GB）；常驻预算 14.84GB（预留临时 0.00GB + headroom 1.00GB）"
+        ],
+        "recommended_sysctl": {
+          "iogpu_wired_limit_mb": 16220
+        },
+        "tradeoff": "硬件 fixture / 24GB（conservative，ctx 32768，KV q8）\n常驻 quality-edge@q：权重 1.00GB + KV 0.00GB + 开销 = 2.00GB，预算 14.84GB；能力×质量=0.9800\nBLOCKED：无\n预算：usable 15.84GB（reserve 7.20GB，临时预留 0.00GB）",
+        "override": null
+      }
+    },
+    {
+      "input": {
+        "name": "quality-below-threshold-rejects",
+        "ram": 24,
+        "catalog": {
+          "version": 1,
+          "catalog": [
+            {
+              "id": "quality-edge",
+              "params_total_b": 1,
+              "arch": {
+                "n_layers": 1,
+                "n_kv_heads": 1,
+                "head_dim": 1
+              },
+              "roles": [
+                "daily"
+              ],
+              "quant_options": [
+                {
+                  "label": "q",
+                  "weights_gb": 1,
+                  "quality": 0.979999
+                }
+              ],
+              "min_ram_gb": 1,
+              "capability": {
+                "reasoning": 1
+              }
+            }
+          ]
+        },
+        "policy": {
+          "temp_slots": 0,
+          "needed_capabilities": [],
+          "quality_threshold": 0.98
+        }
+      },
+      "output": {
+        "hardware": {
+          "ram_gb": 24,
+          "chip": "fixture",
+          "gpu_cores": null,
+          "os": "darwin",
+          "source": "injected"
+        },
+        "policy": {
+          "wired_mode": "conservative",
+          "context_target": 32768,
+          "kv_quant": "q8",
+          "temp_slots": 0,
+          "quality_threshold": 0.98,
+          "needed_capabilities": []
+        },
+        "usable_gb": 15.84,
+        "reserve_gb": 7.199999999999999,
+        "temp_reserve_gb": 0,
+        "resident_budget_gb": 14.84,
+        "resident": null,
+        "resident_label": null,
+        "temp": [],
+        "blocked": [],
+        "warnings": [
+          "预算: 24GB conservative → usable 15.84GB（reserve 7.20GB）；常驻预算 14.84GB（预留临时 0.00GB + headroom 1.00GB）",
+          "没有模型能放进常驻预算：请提高 wired_mode 或降低 context_target"
+        ],
+        "recommended_sysctl": {
+          "iogpu_wired_limit_mb": 16220
+        },
+        "tradeoff": "硬件 fixture / 24GB（conservative，ctx 32768，KV q8）\n常驻：无（预算 14.84GB 放不下任何 daily 模型）\nBLOCKED：无\n预算：usable 15.84GB（reserve 7.20GB，临时预留 0.00GB）",
+        "override": null
+      }
+    },
+    {
+      "input": {
+        "name": "resident-budget-equality-admits",
+        "ram": 16,
+        "catalog": {
+          "version": 1,
+          "catalog": [
+            {
+              "id": "budget-edge",
+              "params_total_b": 1,
+              "arch": {
+                "n_layers": 1,
+                "n_kv_heads": 1,
+                "head_dim": 1
+              },
+              "roles": [
+                "daily"
+              ],
+              "quant_options": [
+                {
+                  "label": "q",
+                  "weights_gb": 8.56,
+                  "quality": 0.98
+                }
+              ],
+              "min_ram_gb": 1,
+              "capability": {
+                "reasoning": 1
+              }
+            }
+          ]
+        },
+        "policy": {
+          "temp_slots": 0,
+          "context_target": 0,
+          "needed_capabilities": []
+        }
+      },
+      "output": {
+        "hardware": {
+          "ram_gb": 16,
+          "chip": "fixture",
+          "gpu_cores": null,
+          "os": "darwin",
+          "source": "injected"
+        },
+        "policy": {
+          "wired_mode": "conservative",
+          "context_target": 0,
+          "kv_quant": "q8",
+          "temp_slots": 0,
+          "quality_threshold": 0.98,
+          "needed_capabilities": []
+        },
+        "usable_gb": 10.56,
+        "reserve_gb": 4.8,
+        "temp_reserve_gb": 0,
+        "resident_budget_gb": 9.56,
+        "resident": {
+          "id": "budget-edge",
+          "ctx": 0,
+          "score": 0.98,
+          "label": "q",
+          "quality": 0.98,
+          "weights_gb": 8.56,
+          "kv_gb": 0,
+          "footprint_gb": 9.56
+        },
+        "resident_label": "budget-edge@q",
+        "temp": [],
+        "blocked": [],
+        "warnings": [
+          "预算: 16GB conservative → usable 10.56GB（reserve 4.80GB）；常驻预算 9.56GB（预留临时 0.00GB + headroom 1.00GB）"
+        ],
+        "recommended_sysctl": {
+          "iogpu_wired_limit_mb": 10813
+        },
+        "tradeoff": "硬件 fixture / 16GB（conservative，ctx 0，KV q8）\n常驻 budget-edge@q：权重 8.56GB + KV 0.00GB + 开销 = 9.56GB，预算 9.56GB；能力×质量=0.9800\nBLOCKED：无\n预算：usable 10.56GB（reserve 4.80GB，临时预留 0.00GB）",
+        "override": null
+      }
+    },
+    {
+      "input": {
+        "name": "override-normal",
+        "ram": 24,
+        "catalog": {
+          "version": 1,
+          "catalog": [
+            {
+              "id": "auto",
+              "params_total_b": 1,
+              "arch": {
+                "n_layers": 1,
+                "n_kv_heads": 1,
+                "head_dim": 1
+              },
+              "roles": [
+                "daily"
+              ],
+              "quant_options": [
+                {
+                  "label": "q",
+                  "weights_gb": 1,
+                  "quality": 0.98
+                }
+              ],
+              "min_ram_gb": 1,
+              "capability": {
+                "reasoning": 1
+              }
+            },
+            {
+              "id": "forced",
+              "params_total_b": 1,
+              "arch": {
+                "n_layers": 1,
+                "n_kv_heads": 1,
+                "head_dim": 1
+              },
+              "roles": [],
+              "quant_options": [
+                {
+                  "label": "q",
+                  "weights_gb": 1,
+                  "quality": 0.98
+                }
+              ],
+              "min_ram_gb": 1,
+              "capability": {
+                "reasoning": 1
+              }
+            }
+          ]
+        },
+        "policy": {
+          "temp_slots": 0,
+          "needed_capabilities": []
+        },
+        "env": {
+          "IDORIS_CORE_MODEL": "forced"
+        }
+      },
+      "output": {
+        "hardware": {
+          "ram_gb": 24,
+          "chip": "fixture",
+          "gpu_cores": null,
+          "os": "darwin",
+          "source": "injected"
+        },
+        "policy": {
+          "wired_mode": "conservative",
+          "context_target": 32768,
+          "kv_quant": "q8",
+          "temp_slots": 0,
+          "quality_threshold": 0.98,
+          "needed_capabilities": []
+        },
+        "usable_gb": 15.84,
+        "reserve_gb": 7.199999999999999,
+        "temp_reserve_gb": 0,
+        "resident_budget_gb": 14.84,
+        "resident": {
+          "id": "forced",
+          "ctx": 32768,
+          "score": 0.98,
+          "label": "q",
+          "quality": 0.98,
+          "weights_gb": 1,
+          "kv_gb": 0.000065536,
+          "footprint_gb": 2.000065536
+        },
+        "resident_label": "forced@q",
+        "temp": [],
+        "blocked": [],
+        "warnings": [
+          "预算: 24GB conservative → usable 15.84GB（reserve 7.20GB）；常驻预算 14.84GB（预留临时 0.00GB + headroom 1.00GB）",
+          "IDORIS_CORE_MODEL=forced 生效：推荐模块让路（yields），不覆盖用户强制"
+        ],
+        "recommended_sysctl": {
+          "iogpu_wired_limit_mb": 16220
+        },
+        "tradeoff": "硬件 fixture / 24GB（conservative，ctx 32768，KV q8）\n常驻 forced@q：权重 1.00GB + KV 0.00GB + 开销 = 2.00GB，预算 14.84GB；能力×质量=0.9800\nBLOCKED：无\n预算：usable 15.84GB（reserve 7.20GB，临时预留 0.00GB）",
+        "override": {
+          "id": "forced",
+          "active": true
+        }
+      }
+    },
+    {
+      "input": {
+        "name": "override-unknown-falls-back",
+        "ram": 24,
+        "catalog": {
+          "version": 1,
+          "catalog": [
+            {
+              "id": "auto",
+              "params_total_b": 1,
+              "arch": {
+                "n_layers": 1,
+                "n_kv_heads": 1,
+                "head_dim": 1
+              },
+              "roles": [
+                "daily"
+              ],
+              "quant_options": [
+                {
+                  "label": "q",
+                  "weights_gb": 1,
+                  "quality": 0.98
+                }
+              ],
+              "min_ram_gb": 1,
+              "capability": {
+                "reasoning": 1
+              }
+            }
+          ]
+        },
+        "policy": {
+          "temp_slots": 0,
+          "needed_capabilities": []
+        },
+        "env": {
+          "IDORIS_CORE_MODEL": "missing"
+        }
+      },
+      "output": {
+        "hardware": {
+          "ram_gb": 24,
+          "chip": "fixture",
+          "gpu_cores": null,
+          "os": "darwin",
+          "source": "injected"
+        },
+        "policy": {
+          "wired_mode": "conservative",
+          "context_target": 32768,
+          "kv_quant": "q8",
+          "temp_slots": 0,
+          "quality_threshold": 0.98,
+          "needed_capabilities": []
+        },
+        "usable_gb": 15.84,
+        "reserve_gb": 7.199999999999999,
+        "temp_reserve_gb": 0,
+        "resident_budget_gb": 14.84,
+        "resident": {
+          "id": "auto",
+          "ctx": 32768,
+          "score": 0.98,
+          "label": "q",
+          "quality": 0.98,
+          "weights_gb": 1,
+          "kv_gb": 0.000065536,
+          "footprint_gb": 2.000065536
+        },
+        "resident_label": "auto@q",
+        "temp": [],
+        "blocked": [],
+        "warnings": [
+          "预算: 24GB conservative → usable 15.84GB（reserve 7.20GB）；常驻预算 14.84GB（预留临时 0.00GB + headroom 1.00GB）",
+          "IDORIS_CORE_MODEL=missing 不在目录中：忽略 override，回落自动选择"
+        ],
+        "recommended_sysctl": {
+          "iogpu_wired_limit_mb": 16220
+        },
+        "tradeoff": "硬件 fixture / 24GB（conservative，ctx 32768，KV q8）\n常驻 auto@q：权重 1.00GB + KV 0.00GB + 开销 = 2.00GB，预算 14.84GB；能力×质量=0.9800\nBLOCKED：无\n预算：usable 15.84GB（reserve 7.20GB，临时预留 0.00GB）",
+        "override": null
+      }
+    },
+    {
+      "input": {
+        "name": "override-oversized-still-yields",
+        "ram": 24,
+        "catalog": {
+          "version": 1,
+          "catalog": [
+            {
+              "id": "forced-big",
+              "params_total_b": 1,
+              "arch": {
+                "n_layers": 1,
+                "n_kv_heads": 1,
+                "head_dim": 1
+              },
+              "roles": [],
+              "quant_options": [
+                {
+                  "label": "q",
+                  "weights_gb": 50,
+                  "quality": 0.98
+                }
+              ],
+              "min_ram_gb": 64,
+              "capability": {
+                "reasoning": 1
+              }
+            }
+          ]
+        },
+        "policy": {
+          "temp_slots": 0,
+          "needed_capabilities": []
+        },
+        "env": {
+          "IDORIS_CORE_MODEL": "forced-big"
+        }
+      },
+      "output": {
+        "hardware": {
+          "ram_gb": 24,
+          "chip": "fixture",
+          "gpu_cores": null,
+          "os": "darwin",
+          "source": "injected"
+        },
+        "policy": {
+          "wired_mode": "conservative",
+          "context_target": 32768,
+          "kv_quant": "q8",
+          "temp_slots": 0,
+          "quality_threshold": 0.98,
+          "needed_capabilities": []
+        },
+        "usable_gb": 15.84,
+        "reserve_gb": 7.199999999999999,
+        "temp_reserve_gb": 0,
+        "resident_budget_gb": 14.84,
+        "resident": {
+          "id": "forced-big",
+          "ctx": 32768,
+          "score": 0.98,
+          "label": "q",
+          "quality": 0.98,
+          "weights_gb": 50,
+          "kv_gb": 0.000065536,
+          "footprint_gb": 51.000065536
+        },
+        "resident_label": "forced-big@q",
+        "temp": [],
+        "blocked": [
+          {
+            "id": "forced-big",
+            "status": "BLOCKED",
+            "min_ram_gb": 64,
+            "estimated_memory_gb": 51.000065536,
+            "reason": "min_ram_gb=64 > ram_gb=24"
+          }
+        ],
+        "warnings": [
+          "预算: 24GB conservative → usable 15.84GB（reserve 7.20GB）；常驻预算 14.84GB（预留临时 0.00GB + headroom 1.00GB）",
+          "forced-big: BLOCKED（min_ram_gb=64 > ram_gb=24）",
+          "IDORIS_CORE_MODEL=forced-big 放不下常驻预算（14.84GB）：已强制放行，请自行承担 OOM 风险",
+          "IDORIS_CORE_MODEL=forced-big 绕过 min_ram_gb 硬门槛（需 64GB，实际 24GB）",
+          "IDORIS_CORE_MODEL=forced-big 生效：推荐模块让路（yields），不覆盖用户强制"
+        ],
+        "recommended_sysctl": {
+          "iogpu_wired_limit_mb": 16220
+        },
+        "tradeoff": "硬件 fixture / 24GB（conservative，ctx 32768，KV q8）\n常驻 forced-big@q：权重 50.00GB + KV 0.00GB + 开销 = 51.00GB，预算 14.84GB；能力×质量=0.9800\nBLOCKED：forced-big(需64GB)\n预算：usable 15.84GB（reserve 7.20GB，临时预留 0.00GB）",
+        "override": {
+          "id": "forced-big",
+          "active": true
+        }
+      }
+    },
+    {
+      "input": {
+        "name": "temp-too-large-even-alone-requires-eviction",
+        "ram": 24,
+        "catalog": {
+          "version": 1,
+          "catalog": [
+            {
+              "id": "huge-temp",
+              "params_total_b": 1,
+              "arch": {
+                "n_layers": 1,
+                "n_kv_heads": 1,
+                "head_dim": 1
+              },
+              "roles": [],
+              "quant_options": [
+                {
+                  "label": "q",
+                  "weights_gb": 50,
+                  "quality": 0.98
+                }
+              ],
+              "min_ram_gb": 1,
+              "capability": {
+                "reasoning": 1,
+                "vision": 1
+              }
+            }
+          ]
+        },
+        "policy": {
+          "needed_capabilities": [
+            "vision"
+          ],
+          "temp_slots": 0
+        }
+      },
+      "output": {
+        "hardware": {
+          "ram_gb": 24,
+          "chip": "fixture",
+          "gpu_cores": null,
+          "os": "darwin",
+          "source": "injected"
+        },
+        "policy": {
+          "wired_mode": "conservative",
+          "context_target": 32768,
+          "kv_quant": "q8",
+          "temp_slots": 0,
+          "quality_threshold": 0.98,
+          "needed_capabilities": [
+            "vision"
+          ]
+        },
+        "usable_gb": 15.84,
+        "reserve_gb": 7.199999999999999,
+        "temp_reserve_gb": 0,
+        "resident_budget_gb": 14.84,
+        "resident": null,
+        "resident_label": null,
+        "temp": [
+          {
+            "id": "huge-temp",
+            "capability": "vision",
+            "status": "requires_eviction",
+            "min_ram_gb": 1,
+            "quant": {
+              "label": "q",
+              "quality": 0.98,
+              "weights_gb": 50,
+              "kv_gb": 0.000065536,
+              "footprint_gb": 51.000065536
+            },
+            "reason": "footprint 51.00GB > 剩余 15.84GB，需驱逐常驻后加载"
+          }
+        ],
+        "blocked": [],
+        "warnings": [
+          "预算: 24GB conservative → usable 15.84GB（reserve 7.20GB）；常驻预算 14.84GB（预留临时 0.00GB + headroom 1.00GB）",
+          "vision: huge-temp 需驱逐常驻（51.00GB > 剩余 15.84GB）",
+          "没有模型能放进常驻预算：请提高 wired_mode 或降低 context_target"
+        ],
+        "recommended_sysctl": {
+          "iogpu_wired_limit_mb": 16220
+        },
+        "tradeoff": "硬件 fixture / 24GB（conservative，ctx 32768，KV q8）\n常驻：无（预算 14.84GB 放不下任何 daily 模型）\n需驱逐：huge-temp@q\nBLOCKED：无\n预算：usable 15.84GB（reserve 7.20GB，临时预留 0.00GB）",
+        "override": null
+      }
+    },
+    {
+      "input": {
+        "name": "resident-budget-over-rejects",
+        "ram": 16,
+        "catalog": {
+          "version": 1,
+          "catalog": [
+            {
+              "id": "budget-edge",
+              "params_total_b": 1,
+              "arch": {
+                "n_layers": 1,
+                "n_kv_heads": 1,
+                "head_dim": 1
+              },
+              "roles": [
+                "daily"
+              ],
+              "quant_options": [
+                {
+                  "label": "q",
+                  "weights_gb": 8.560001,
+                  "quality": 0.98
+                }
+              ],
+              "min_ram_gb": 1,
+              "capability": {
+                "reasoning": 1
+              }
+            }
+          ]
+        },
+        "policy": {
+          "temp_slots": 0,
+          "context_target": 0,
+          "needed_capabilities": []
+        }
+      },
+      "output": {
+        "hardware": {
+          "ram_gb": 16,
+          "chip": "fixture",
+          "gpu_cores": null,
+          "os": "darwin",
+          "source": "injected"
+        },
+        "policy": {
+          "wired_mode": "conservative",
+          "context_target": 0,
+          "kv_quant": "q8",
+          "temp_slots": 0,
+          "quality_threshold": 0.98,
+          "needed_capabilities": []
+        },
+        "usable_gb": 10.56,
+        "reserve_gb": 4.8,
+        "temp_reserve_gb": 0,
+        "resident_budget_gb": 9.56,
+        "resident": null,
+        "resident_label": null,
+        "temp": [],
+        "blocked": [],
+        "warnings": [
+          "预算: 16GB conservative → usable 10.56GB（reserve 4.80GB）；常驻预算 9.56GB（预留临时 0.00GB + headroom 1.00GB）",
+          "没有模型能放进常驻预算：请提高 wired_mode 或降低 context_target"
+        ],
+        "recommended_sysctl": {
+          "iogpu_wired_limit_mb": 10813
+        },
+        "tradeoff": "硬件 fixture / 16GB（conservative，ctx 0，KV q8）\n常驻：无（预算 9.56GB 放不下任何 daily 模型）\nBLOCKED：无\n预算：usable 10.56GB（reserve 4.80GB，临时预留 0.00GB）",
+        "override": null
+      }
+    }
+  ]
+}

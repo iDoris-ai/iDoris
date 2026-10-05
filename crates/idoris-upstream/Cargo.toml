@@ -1,6 +1,6 @@
 [package]
 name = "idoris-upstream"
-version = "0.1.0"
+version = "0.1.3"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -46,7 +46,9 @@ tempfile = "3"
 # crate's own rustls-everywhere choice (see the `reqwest` entry above) and
 # keep the AWS SigV4/aws-config dependency chain out entirely — nothing
 # here uses the Bedrock adapter.
-genai = "0.6.5"
+# Exact while the workspace patches SSE framing: a routine cargo update
+# must not silently bypass the reviewed fix in vendor/genai.
+genai = "=0.6.5"
 
 [target.'cfg(unix)'.dependencies]
 nix = { workspace = true }
