@@ -172,6 +172,7 @@ pub struct HealthResponse {
     pub contract_version: &'static str,
     pub instance_id: String,
     pub components: usize,
+    pub dev_no_key_enabled: bool,
 }
 
 /// Shared server state. `instance_id` is generated once per process and
@@ -211,6 +212,9 @@ pub struct AppState {
     /// Production installs the persistent B5 verifier. Library tests may
     /// leave this unset to preserve pre-B5 request behavior.
     pub virtual_key_authenticator: Option<auth::VirtualKeyAuthenticator>,
+    /// Explicit loopback-only developer escape hatch. Production startup
+    /// leaves this false unless `IDORIS_DEV_NO_KEY=1` was set once.
+    pub dev_no_key_enabled: bool,
     /// Best-effort audit persistence failures. Audit must not alter the HTTP
     /// result already produced by routing/backend execution.
     pub audit_failures: Arc<AtomicU64>,
@@ -257,6 +261,7 @@ impl std::fmt::Debug for AppState {
                     .as_ref()
                     .map(|_| "configured"),
             )
+            .field("dev_no_key_enabled", &self.dev_no_key_enabled)
             .field(
                 "audit_failures",
                 &self.audit_failures.load(Ordering::Relaxed),
@@ -299,6 +304,7 @@ impl Default for AppState {
             budget_ledger: None,
             record_store: None,
             virtual_key_authenticator: None,
+            dev_no_key_enabled: false,
             audit_failures: Arc::new(AtomicU64::new(0)),
             models_health: Arc::new(health::HealthTracker::default()),
             capabilities: None,
@@ -583,6 +589,7 @@ async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         contract_version: idoris_contracts::CONTRACT_VERSION,
         instance_id: state.instance_id.clone(),
         components: state.cards.len(),
+        dev_no_key_enabled: state.dev_no_key_enabled,
     })
 }
 
@@ -819,6 +826,15 @@ fn virtual_key_scope_response(error: auth::VirtualKeyScopeError) -> Response {
     )
 }
 
+fn dev_no_key_scope_response() -> Response {
+    error_envelope_with_reason(
+        StatusCode::FORBIDDEN,
+        "policy_violation",
+        "DEV_NO_KEY_SCOPE_FORBIDDEN",
+        "developer no-key mode permits only free loopback local_only requests",
+    )
+}
+
 /// `POST /v1/chat/completions`. Order (locked by conformance): non-JSON
 /// body -> `invalid_json`; valid JSON that isn't an object -> `invalid_body`;
 /// only then are control-plane headers parsed (see [`profile::parse_profile`]).
@@ -857,7 +873,13 @@ async fn chat_completions(
         Err(err) => return err.into_response(),
     };
 
-    if let Some(authenticator) = &state.virtual_key_authenticator {
+    let authorization_present = headers.contains_key(axum::http::header::AUTHORIZATION);
+    let dev_no_key_request = state.dev_no_key_enabled && !authorization_present;
+    if dev_no_key_request {
+        if parsed.task.privacy.unwrap_or(PrivacyClass::LocalOnly) != PrivacyClass::LocalOnly {
+            return dev_no_key_scope_response();
+        }
+    } else if let Some(authenticator) = &state.virtual_key_authenticator {
         let identity = match authenticator.authenticate(&headers).await {
             Ok(identity) => identity,
             Err(_) => return virtual_key_unauthorized_response(),
@@ -865,6 +887,8 @@ async fn chat_completions(
         if let Err(error) = auth::enforce_scope(&identity, &parsed) {
             return virtual_key_scope_response(error);
         }
+    } else if state.dev_no_key_enabled && authorization_present {
+        return virtual_key_unauthorized_response();
     }
 
     let messages = extract_messages(object);
@@ -895,6 +919,13 @@ async fn chat_completions(
     // with an explicit load/unload lifecycle. See dispatch::select's doc
     // for the accepted double-decide() tradeoff this branch makes.
     if let Ok(selected) = dispatch::select(&cards, &parsed, &prompt) {
+        if dev_no_key_request
+            && (selected.served_locality != idoris_contracts::provider::Locality::Loopback
+                || selected.card.provider.cost.input_per_m != 0.0
+                || selected.card.provider.cost.output_per_m != 0.0)
+        {
+            return dev_no_key_scope_response();
+        }
         // A present model field must be a non-empty string before any
         // selected backend can execute. Keep selection first so the
         // established error still carries the selected locality/reasons.

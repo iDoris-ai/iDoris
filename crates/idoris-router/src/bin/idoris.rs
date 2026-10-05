@@ -55,6 +55,7 @@ async fn run() -> Result<(), String> {
         parse_port(std::env::var("IDORIS_PORT").ok().as_deref()).map_err(|err| err.to_string())?;
     let deploy_mode =
         profile::deploy_mode_from_env(std::env::var("IDORIS_DEPLOY_MODE").ok().as_deref());
+    let dev_no_key_enabled = env_flag("IDORIS_DEV_NO_KEY");
 
     let components_dir =
         config::resolve_env("IDORIS_COMPONENTS_DIR", components::DEFAULT_COMPONENTS_DIR)?;
@@ -150,6 +151,7 @@ async fn run() -> Result<(), String> {
         budget_ledger: Some(persistent.budget),
         record_store: Some(persistent.records),
         virtual_key_authenticator: Some(virtual_key_authenticator),
+        dev_no_key_enabled,
         ..AppState::default()
     };
 
@@ -160,6 +162,11 @@ async fn run() -> Result<(), String> {
         .map_err(|err| format!("无法绑定 {addr}：{err}"))?;
 
     println!("idoris listening on http://{addr}");
+    if dev_no_key_enabled {
+        eprintln!(
+            "[idoris] IDORIS_DEV_NO_KEY=1: unauthenticated chat is limited to free loopback local_only execution"
+        );
+    }
     println!(
         "idoris: 已注册组件 [{}]",
         if component_list.is_empty() {
