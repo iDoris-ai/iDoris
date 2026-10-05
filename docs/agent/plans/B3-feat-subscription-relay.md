@@ -149,11 +149,11 @@ pnpm lint && pnpm typecheck && pnpm check:contract-drift && pnpm build && pnpm t
 | 23 conformance fixture | #311 | merged | 临时 PATH fake CLI；不增加生产 command override |
 | 24 production gates | #312 | merged | 原子替换 K04 总拒绝；授权构造 + shutdown 接线 |
 | 25 shared conformance | #313 | merged | Rust release 二进制全量 conformance：134 passed / 8 todo |
-| 26 Unix CI matrix | #314 | **pending revalidation** | 首轮 macOS 暴露取消清理抖动；#315 正修 EPERM 后重跑 |
-| 27 real CLI smoke | #316 | **review / CI** | Codex 0.156.1 + Claude Code 2.1.289 本机真实 PASS |
+| 26 Unix CI matrix | #314 | **approved; pending repaired-base revalidation** | #315 已合并修 EPERM；#317 修 fixture readiness race 后须把最新 B3 合回 #314 并要求 macOS/Linux 全绿 |
+| 27 real CLI smoke | #316 | **approved; pending repaired-base sync** | Codex 0.156.1 + Claude Code 2.1.289 本机真实 PASS；#318 进一步收紧 flag token 与失败日志 |
 | 28 release evidence | 本 task | in progress | 本节 + acceptance + component 注释 |
 
-**B3 不能在 #314/#315/#316 闭环前声明 complete，也不能开 release PR 到 main。**
+**B3 不能在 #314/#316/#317/#318 闭环前声明 complete，也不能开 release PR 到 main。**
 
 ### 5.2 现行安全/行为结论
 
@@ -191,12 +191,16 @@ pnpm lint && pnpm typecheck && pnpm check:contract-drift && pnpm build && pnpm t
 
 - 升级 Codex/Claude 后先运行 task27 opt-in smoke；required flags/version profile 不满足即 fail-closed。
 - 禁止因新版本不支持安全 flag 就自动剥 flag 重试。
-- 只有通过 fixed reply、工具/写入诱导、timeout、cancel、PGID cleanup 后，才更新本节记录的支持版本。
-- 真实 smoke 不记录 prompt、stderr、凭据或自由文本。
+- 只有通过 fixed reply、write-inducement 下禁写文件未出现、timeout、显式 cancel、PGID cleanup 后，才更新本节记录的支持版本；这些证据不能扩写成“证明模型一定尝试了写入”或“证明 cancel 发生在确认生成中”。
+- 真实 smoke 的失败断言也不得记录 prompt、stderr、凭据或模型自由文本。
 
-### 5.6 已知未关闭项
+### 5.6 已知未关闭项 / release-preview 证据
 
-- #314 required macOS matrix 曾在 `subscription_cancel` 出现 `RELAY_CLEANUP_FAILED`；#315 将 `killpg EPERM` 解释为“组仍存在/继续有界确认”而不是立即失败，合并后须在 #314 新 head 重跑 macOS required job。
+- #315 已合并：`killpg EPERM` 不再立即覆盖请求终止原因，而是交给有界存在性检查继续确认。
+- #317 正在修第二个独立的测试竞态：`ignore-term` fixture 必须先安装 TERM trap 再发布 ready marker，且测试只认 `ESRCH` 为“组真的消失”；20 轮 targeted cancellation 测试本地连续通过。
+- #314 只有在同时包含 #315/#317 后，Linux+macOS required matrix 全绿，才可视为 task26 闭环。
+- #316 已 APPROVE；#318 把 CLI help 检查从子串匹配收紧为 token-exact，并阻止 fixed-reply 失败时回显真实模型自由文本。task27 最终 merge 前必须包含这层 hardening。
 - #314 同一次 run 的 B1 `load_fence::ownership_is_exclusive_even_after_marker_clear` 失败是独立既有 flake；不得与 B3 macOS blocker 混为一谈。
 - #305 review 记录：Linux 对 pipelined-bytes + close 的 POLLHUP/POLLIN 行为仍应由 Linux task26/task18 matrix 继续覆盖；不能只用 macOS 结论外推。
 - B3 无 A 机必测前置；若 release 同时宣称与真实 oMLX 大模型并发，则按 §4 另附 A 联合验证，当前不得冒充已完成。
+- 本地 release-preview（#315 + #317 + task26 + task27 hardening + task28）已验证：`idoris-upstream` 110/110、`idoris-router --lib` 251/251、subscription Rust matrix（含 disconnect/security/startup）全绿、clippy/fmt/diff-check 全绿。当前 harness 无 Node runtime，`pnpm` 阶段未本地执行；跨平台/Node conformance 以 GitHub CI 为权威，不能把本地缺 Node 写成已通过。
