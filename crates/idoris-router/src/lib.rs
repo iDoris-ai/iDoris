@@ -73,7 +73,7 @@ pub mod write_timeout;
 /// Real TCP connection lifetime and per-request cancellation tokens.
 pub mod connection;
 
-/// Pure subscription registration gates. Production stays K04-locked until B3 task24.
+/// Subscription registration/runtime/dispatch gates.
 pub mod subscription;
 
 use std::net::IpAddr;
@@ -220,6 +220,8 @@ pub struct AppState {
     /// Capacity surface provider. `None` is deliberately unavailable rather
     /// than a fake static snapshot; task33 installs the live implementation.
     pub capabilities: Option<Arc<dyn capabilities::CapabilitiesProvider>>,
+    /// Authorized subscription CLI runtimes. Empty means default-off/disabled.
+    pub subscriptions: subscription::runtime::SubscriptionRuntimeRegistry,
     /// R2-G: direct-forward path for a `LoadMode::Resident` `http_service`
     /// candidate (see `dispatch::select`/`is_resident_http_service`'s doc).
     /// `Arc` because `ChatProxy` holds a `Mutex`-guarded cache, same reason
@@ -252,6 +254,7 @@ impl std::fmt::Debug for AppState {
                 "capabilities",
                 &self.capabilities.as_ref().map(|_| "configured"),
             )
+            .field("subscriptions", &self.subscriptions.len())
             .field("proxy", &"ChatProxy { .. }")
             .finish()
     }
@@ -286,6 +289,7 @@ impl Default for AppState {
             audit_failures: Arc::new(AtomicU64::new(0)),
             models_health: Arc::new(health::HealthTracker::default()),
             capabilities: None,
+            subscriptions: subscription::runtime::SubscriptionRuntimeRegistry::default(),
             proxy: Arc::new(proxy::ChatProxy::new(http_client.clone())),
             http_client,
         }
@@ -533,7 +537,14 @@ async fn get_capabilities(State(state): State<Arc<AppState>>) -> Response {
 /// `provider.id`, matching `server.ts`). Delegates to [`models::list_models`];
 /// authentication failures surface as structured upstream errors.
 async fn list_models(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    match models::list_models(&state.http_client, &state.cards, &state.models_health).await {
+    match models::list_models_with_subscriptions(
+        &state.http_client,
+        &state.cards,
+        &state.models_health,
+        &state.subscriptions,
+    )
+    .await
+    {
         Ok(models) => Json(models).into_response(),
         Err(models::ModelsError::UpstreamAuthenticationFailed { locality, .. }) => {
             let mut response = error_envelope_with_reason(
@@ -843,6 +854,85 @@ async fn chat_completions(
     // with an explicit load/unload lifecycle. See dispatch::select's doc
     // for the accepted double-decide() tradeoff this branch makes.
     if let Ok(selected) = dispatch::select(&cards, &parsed, &prompt) {
+        // A present model field must be a non-empty string before any
+        // selected backend can execute. Keep selection first so the
+        // established error still carries the selected locality/reasons.
+        if object.contains_key("model") && model.is_none_or(str::is_empty) {
+            let requested_model = model.unwrap_or("");
+            let mut response = error_envelope_with_reason(
+                StatusCode::BAD_REQUEST,
+                "unsupported_field",
+                "unsupported_model",
+                format!(
+                    "model '{requested_model}' must be a non-empty string or a supported idoris/<role> alias"
+                ),
+            );
+            if let Ok(value) = HeaderValue::from_str(locality_str(selected.served_locality)) {
+                response.headers_mut().insert(HEADER_SERVED_LOCALITY, value);
+            }
+            let reason = reason_header_value(&selected.decision.reason_codes);
+            if !reason.is_empty()
+                && let Ok(value) = HeaderValue::from_str(&reason)
+            {
+                response.headers_mut().insert(HEADER_REASON, value);
+            }
+            if selected.decision.is_degraded() {
+                response
+                    .headers_mut()
+                    .insert(HEADER_DEGRADED, HeaderValue::from_static("true"));
+            }
+            return response;
+        }
+        if selected.card.provider.id == idoris_policy::SUBSCRIPTION_PROVIDER_ID {
+            let privacy = parsed
+                .task
+                .privacy
+                .unwrap_or(idoris_contracts::common::PrivacyClass::LocalOnly);
+            return match subscription::dispatch::dispatch_selected(
+                &selected,
+                privacy,
+                lifecycle.peer(),
+                &state.subscriptions,
+                messages.clone(),
+                lifecycle.cancellation_token(),
+            )
+            .await
+            {
+                Ok(chat) => subscription::response::success(
+                    &chat,
+                    &prompt,
+                    &record_id,
+                    object
+                        .get("stream")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false),
+                ),
+                Err(subscription::dispatch::SubscriptionDispatchError::Source(error)) => {
+                    subscription::response::source_rejection(error, &record_id)
+                }
+                Err(subscription::dispatch::SubscriptionDispatchError::Relay(error)) => {
+                    subscription::response::relay_failure(&error, &record_id)
+                }
+                Err(subscription::dispatch::SubscriptionDispatchError::PrivacyForbidden) => {
+                    rejection_response(idoris_policy::Rejection::LocalOnlyUnavailable)
+                }
+                Err(subscription::dispatch::SubscriptionDispatchError::Runtime(error)) => {
+                    error_envelope_with_reason(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "subscription_runtime_unavailable",
+                        "SUBSCRIPTION_RUNTIME_UNAVAILABLE",
+                        error.to_string(),
+                    )
+                }
+                Err(subscription::dispatch::SubscriptionDispatchError::NotSubscription) => {
+                    error_envelope(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "internal_error",
+                        "subscription dispatch boundary mismatch",
+                    )
+                }
+            };
+        }
         if dispatch::is_resident_http_service(&selected.card) {
             return chat_via_proxy(&state, &selected, &headers, &parsed, &value, &record_id).await;
         }
@@ -872,40 +962,6 @@ async fn chat_completions(
             );
             return response;
         }
-    }
-
-    // A present model field must be a non-empty string. Concrete model ids
-    // are forwarded to the selected lifecycle backend below; role aliases
-    // continue to use the selected provider id until B2 supplies role→model
-    // binding.
-    if let Ok(selected) = dispatch::select(&cards, &parsed, &prompt)
-        && object.contains_key("model")
-        && model.is_none_or(str::is_empty)
-    {
-        let requested_model = model.unwrap_or("");
-        let mut response = error_envelope_with_reason(
-            StatusCode::BAD_REQUEST,
-            "unsupported_field",
-            "unsupported_model",
-            format!(
-                "model '{requested_model}' must be a non-empty string or a supported idoris/<role> alias"
-            ),
-        );
-        if let Ok(value) = HeaderValue::from_str(locality_str(selected.served_locality)) {
-            response.headers_mut().insert(HEADER_SERVED_LOCALITY, value);
-        }
-        let reason = reason_header_value(&selected.decision.reason_codes);
-        if !reason.is_empty()
-            && let Ok(value) = HeaderValue::from_str(&reason)
-        {
-            response.headers_mut().insert(HEADER_REASON, value);
-        }
-        if selected.decision.is_degraded() {
-            response
-                .headers_mut()
-                .insert(HEADER_DEGRADED, HeaderValue::from_static("true"));
-        }
-        return response;
     }
 
     // The request token is a fresh child of this TCP connection's lifetime.

@@ -1,8 +1,9 @@
 //! Loads and validates `config/components/*.yaml` component cards
 //! (interface spec §3.1/§3.3), mirroring `packages/router/src/registry.ts`'s
 //! `loadComponents` — this module only covers the pure load+validate path.
-//! Until B3 implements subscription deployment/source/sandbox gates,
-//! subscription cards are rejected at startup regardless of form or env flags.
+//! Subscription cards are structurally admitted only through B3's fixed
+//! card boundary; deployment/sandbox/kill-switch authorization is applied
+//! separately at startup before any runtime is constructed.
 //!
 //! Unlike `registry.ts`, a `provider.id: mock` card here additionally
 //! requires this crate's own `dev-mock` cargo feature (which forwards to
@@ -19,11 +20,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use idoris_contracts::{ComponentCard, Contract};
-use idoris_policy::{
-    AdmissionStatus, Card, RegistrationError, is_subscription_provider_id, validate_registration,
-};
+use idoris_policy::{AdmissionStatus, Card, RegistrationError, validate_registration};
 
 use crate::dispatch::is_resident_http_service;
+use crate::subscription::card::classify_subscription_card;
 
 /// `serve.ts`'s `DEFAULT_COMPONENTS_DIR`.
 pub const DEFAULT_COMPONENTS_DIR: &str = "config/components";
@@ -70,9 +70,9 @@ pub enum LoadError {
     PaidResidentUnsupported {
         id: String,
     },
-    /// K04/H8: Rust does not yet enforce subscription's deployment boundary.
-    SubscriptionUnsupported {
+    SubscriptionCard {
         id: String,
+        message: String,
     },
 }
 
@@ -94,9 +94,9 @@ impl std::fmt::Display for LoadError {
                 f,
                 "付费 provider {id} 暂不支持直连转发（会绕过预算），请配置为 on_demand 或等待后续版本"
             ),
-            LoadError::SubscriptionUnsupported { id } => write!(
+            LoadError::SubscriptionCard { id, message } => write!(
                 f,
-                "Rust 版暂不支持订阅中转 provider {id}（需等待 B3 完成安全门禁），请从组件目录移除该卡后再启动；启用或禁用订阅的环境变量不能绕过此限制"
+                "subscription provider {id} failed its fixed card boundary: {message}"
             ),
         }
     }
@@ -149,9 +149,9 @@ fn placeholder_card(component: ComponentCard) -> Card {
 /// filename, matching `registry.ts`'s `.sort()`), parses + structurally
 /// validates each [`ComponentCard`], skips any `provider.id: mock` card
 /// unless allowed (compile-time `dev-mock` feature *and* `allow_mock_env`),
-/// rejects subscription cards until B3, then runs [`validate_registration`] on what's
-/// left (duplicate ids, loopback/endpoint consistency, contradictory relay
-/// claims — see that function's own docs).
+/// validates the fixed subscription card boundary, then runs
+/// [`validate_registration`] on the admitted set (duplicate ids,
+/// loopback/endpoint consistency, contradictory relay claims).
 pub fn load_components(dir: &Path, allow_mock_env: bool) -> Result<Vec<ComponentCard>, LoadError> {
     if !dir.is_dir() {
         return Err(LoadError::NotADirectory(dir.display().to_string()));
@@ -188,11 +188,10 @@ pub fn load_components(dir: &Path, allow_mock_env: bool) -> Result<Vec<Component
             file: file.clone(),
             message: e.to_string(),
         })?;
-        if is_subscription_provider_id(&card.provider.id) {
-            return Err(LoadError::SubscriptionUnsupported {
-                id: card.provider.id,
-            });
-        }
+        classify_subscription_card(&card).map_err(|error| LoadError::SubscriptionCard {
+            id: card.provider.id.clone(),
+            message: error.to_string(),
+        })?;
         if is_mock_card(&card) && !allow_mock {
             continue;
         }
@@ -402,22 +401,43 @@ load_policy: {{ mode: resident, keepalive: {{ pinned: true }}, admission: coexis
         assert_eq!(cards[0].provider.id, "proxy-free");
     }
 
-    /// K04/H8: identifying subscription by id must cover every load mode,
-    /// not only the Resident direct-forward path from the review.
     #[test]
-    fn subscription_http_cards_are_rejected_in_every_load_mode() {
-        for mode in ["resident", "on_demand", "evict_to_load"] {
-            let dir = TempDir::new().unwrap();
-            let card = resident_card("subscription", "{ input_per_m: 0, output_per_m: 0 }")
-                .replace("mode: resident", &format!("mode: {mode}"));
-            write_card(&dir, "subscription.yaml", &card);
-            let err = load_components(dir.path(), false).unwrap_err();
-            assert!(matches!(err, LoadError::SubscriptionUnsupported { .. }));
-            let message = err.to_string();
-            assert!(message.contains("subscription"), "{message}");
-            assert!(message.contains("订阅中转"), "{message}");
-            assert!(message.contains("B3"), "{message}");
-        }
+    fn shipped_subscription_card_is_structurally_admitted() {
+        let dir = TempDir::new().unwrap();
+        write_card(
+            &dir,
+            "subscription.yaml",
+            include_str!("../../../config/components/subscription.yaml"),
+        );
+        let cards = load_components(dir.path(), false).unwrap();
+        assert_eq!(cards.len(), 1);
+        assert_eq!(cards[0].provider.id, "subscription");
+        assert_eq!(
+            cards[0].form,
+            idoris_contracts::component_card::Form::SpawnCli
+        );
+    }
+
+    #[test]
+    fn spawn_cli_impersonation_and_wrong_subscription_form_are_rejected() {
+        let dir = TempDir::new().unwrap();
+        let impostor = include_str!("../../../config/components/subscription.yaml")
+            .replace("id: subscription", "id: impostor");
+        write_card(&dir, "impostor.yaml", &impostor);
+        assert!(matches!(
+            load_components(dir.path(), false).unwrap_err(),
+            LoadError::SubscriptionCard { .. }
+        ));
+
+        let dir = TempDir::new().unwrap();
+        let wrong_form = include_str!("../../../config/components/subscription.yaml")
+            .replace("form: spawn_cli", "form: http_service")
+            .replace("spawn://subscription", "http://127.0.0.1:9");
+        write_card(&dir, "subscription.yaml", &wrong_form);
+        assert!(matches!(
+            load_components(dir.path(), false).unwrap_err(),
+            LoadError::SubscriptionCard { .. }
+        ));
     }
 
     #[test]

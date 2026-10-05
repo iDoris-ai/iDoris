@@ -24,6 +24,10 @@ use idoris_router::{
     host_facts, parse_port, profile, routing_policy,
     runtime::RuntimeRegistry,
     storage,
+    subscription::{
+        config::SubscriptionConfig,
+        runtime::{SubscriptionRuntimeHandle, SubscriptionRuntimeRegistry, authorize_subscription},
+    },
     write_timeout::{DEFAULT_WRITE_TIMEOUT, WriteTimeoutListener},
 };
 use std::sync::Arc;
@@ -59,6 +63,32 @@ async fn run() -> Result<(), String> {
             components_dir.display()
         )
     })?;
+    let subscription_config = SubscriptionConfig::snapshot(
+        std::env::var("IDORIS_DEPLOY_MODE").ok().as_deref(),
+        std::env::var("IDORIS_ENABLE_SUBSCRIPTION").ok().as_deref(),
+        std::env::var("IDORIS_DISABLE_SUBSCRIPTION").ok().as_deref(),
+        std::env::var("IDORIS_SUBSCRIPTION_SANDBOX").ok().as_deref(),
+        std::env::var("IDORIS_SUBSCRIPTION_CLI").ok().as_deref(),
+    );
+    let mut subscriptions = SubscriptionRuntimeRegistry::default();
+    let mut active_cards = Vec::with_capacity(cards.len());
+    for card in cards {
+        if card.provider.id == idoris_policy::SUBSCRIPTION_PROVIDER_ID {
+            if let Some(authorized) = authorize_subscription(&subscription_config, &card)
+                .map_err(|error| format!("subscription registration failed: {error}"))?
+            {
+                let handle = SubscriptionRuntimeHandle::build(authorized, &card)
+                    .map_err(|error| format!("subscription runtime failed: {error}"))?;
+                subscriptions
+                    .insert(handle)
+                    .map_err(|error| format!("subscription runtime failed: {error}"))?;
+                active_cards.push(card);
+            }
+        } else {
+            active_cards.push(card);
+        }
+    }
+    let cards = active_cards;
 
     // Load once and retain the validated policy for both execution paths.
     let routing_policy_path = config::resolve_env(
@@ -74,8 +104,8 @@ async fn run() -> Result<(), String> {
         })?;
 
     let runtimes = RuntimeRegistry::spawn(&cards)?;
-    // Preserve existing startup-gate precedence: component/policy/runtime
-    // validation (including the K04 subscription hard rejection) must fail
+    // Preserve startup-gate precedence: component/policy/runtime validation
+    // (including subscription authorization and fixed card gates) must fail
     // before tenant storage/config bootstrap can surface a later error.
     let persistent = storage::bootstrap_process(deploy_mode)
         .map_err(|err| format!("无法初始化持久化存储：{err}"))?;
@@ -113,6 +143,7 @@ async fn run() -> Result<(), String> {
         routing_policy,
         runtimes,
         capabilities,
+        subscriptions: subscriptions.clone(),
         budget_ledger: Some(persistent.budget),
         record_store: Some(persistent.records),
         ..AppState::default()
@@ -140,6 +171,7 @@ async fn run() -> Result<(), String> {
         DEFAULT_WRITE_TIMEOUT,
     );
     let signal_shutdown = shutdown.clone();
+    let subscription_shutdown = subscriptions.clone();
     axum::serve(
         listener,
         app.into_make_service_with_connect_info::<ConnectionInfo>(),
@@ -147,6 +179,9 @@ async fn run() -> Result<(), String> {
     .with_graceful_shutdown(async move {
         let _ = tokio::signal::ctrl_c().await;
         signal_shutdown.cancel();
+        if let Err(error) = subscription_shutdown.shutdown_all().await {
+            eprintln!("[idoris] subscription shutdown failed: {error}");
+        }
     })
     .await
     .map_err(|err| format!("server error: {err}"))
