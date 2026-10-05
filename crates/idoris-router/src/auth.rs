@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::http::{HeaderMap, header::AUTHORIZATION};
-use idoris_contracts::common::PrivacyClass;
+use idoris_contracts::common::{FallbackPolicy, PrivacyClass};
 use idoris_tenancy::virtual_key::VirtualKeySecret;
 use idoris_tenancy::virtual_key::store::{AuthenticatedVirtualKey, VirtualKeyStore};
 
@@ -35,6 +35,7 @@ impl std::error::Error for VirtualKeyAuthError {}
 pub enum VirtualKeyScopeError {
     PrivacyForbidden,
     RoleForbidden,
+    FallbackForbidden,
 }
 
 impl VirtualKeyScopeError {
@@ -42,6 +43,7 @@ impl VirtualKeyScopeError {
         match self {
             Self::PrivacyForbidden => "VIRTUAL_KEY_PRIVACY_FORBIDDEN",
             Self::RoleForbidden => "VIRTUAL_KEY_ROLE_FORBIDDEN",
+            Self::FallbackForbidden => "VIRTUAL_KEY_FALLBACK_FORBIDDEN",
         }
     }
 }
@@ -63,6 +65,9 @@ pub fn enforce_scope(
     let privacy = profile.task.privacy.unwrap_or(PrivacyClass::LocalOnly);
     if !identity.scope.allowed_privacy.contains(&privacy) {
         return Err(VirtualKeyScopeError::PrivacyForbidden);
+    }
+    if matches!(profile.task.fallback, Some(FallbackPolicy::NextInChain)) {
+        return Err(VirtualKeyScopeError::FallbackForbidden);
     }
     let role = profile.role.ok_or(VirtualKeyScopeError::RoleForbidden)?;
     if !identity
@@ -86,34 +91,44 @@ impl VirtualKeyAuthenticator {
         Self { store }
     }
 
-    pub fn authenticate(
+    pub async fn authenticate(
         &self,
         headers: &HeaderMap,
     ) -> Result<AuthenticatedVirtualKey, VirtualKeyAuthError> {
+        let secret = bearer_secret(headers)?;
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|_| VirtualKeyAuthError::Unavailable)?
             .as_millis()
             .try_into()
             .map_err(|_| VirtualKeyAuthError::Unavailable)?;
-        self.authenticate_at(headers, now_ms)
+        let store = self.store.clone();
+        tokio::task::spawn_blocking(move || authenticate_secret(&store, secret, now_ms))
+            .await
+            .map_err(|_| VirtualKeyAuthError::Unavailable)?
     }
 
+    #[cfg(test)]
     fn authenticate_at(
         &self,
         headers: &HeaderMap,
         now_ms: i64,
     ) -> Result<AuthenticatedVirtualKey, VirtualKeyAuthError> {
         let secret = bearer_secret(headers)?;
-        let store = self
-            .store
-            .lock()
-            .map_err(|_| VirtualKeyAuthError::Unavailable)?;
-        store
-            .authenticate(&secret, now_ms)
-            .map_err(|_| VirtualKeyAuthError::Unavailable)?
-            .ok_or(VirtualKeyAuthError::Unauthorized)
+        authenticate_secret(&self.store, secret, now_ms)
     }
+}
+
+fn authenticate_secret(
+    store: &Arc<Mutex<VirtualKeyStore>>,
+    secret: VirtualKeySecret,
+    now_ms: i64,
+) -> Result<AuthenticatedVirtualKey, VirtualKeyAuthError> {
+    let store = store.lock().map_err(|_| VirtualKeyAuthError::Unavailable)?;
+    store
+        .authenticate(&secret, now_ms)
+        .map_err(|_| VirtualKeyAuthError::Unavailable)?
+        .ok_or(VirtualKeyAuthError::Unauthorized)
 }
 
 fn bearer_secret(headers: &HeaderMap) -> Result<VirtualKeySecret, VirtualKeyAuthError> {
