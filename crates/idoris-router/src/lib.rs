@@ -70,6 +70,9 @@ mod supervisor_stream;
 /// Per-connection deadlines for stalled HTTP response writes.
 pub mod write_timeout;
 
+/// Real TCP connection lifetime and per-request cancellation tokens.
+pub mod connection;
+
 /// Pure subscription registration gates. Production stays K04-locked until B3 task24.
 pub mod subscription;
 
@@ -315,6 +318,9 @@ pub fn build_app(state: AppState) -> Router {
             post(chat_completions).fallback(not_found),
         )
         .fallback(not_found)
+        .layer(middleware::from_fn(
+            connection::request_lifecycle_middleware,
+        ))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             record_id_middleware,
@@ -782,6 +788,7 @@ async fn chat_completions(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Extension(RequestRecordId(record_id)): Extension<RequestRecordId>,
+    Extension(lifecycle): Extension<connection::RequestLifecycle>,
     body: Bytes,
 ) -> Response {
     let value: serde_json::Value = match serde_json::from_slice(&body) {
@@ -901,16 +908,9 @@ async fn chat_completions(
         return response;
     }
 
-    // R0 finding: TS's cancellation propagation (server.ts's req.on("close"))
-    // never actually fires -- by the time it's attached, the request body
-    // (and with it, that stream's own "close") has already completed. This
-    // token has no client-disconnect signal wired to it from axum/hyper
-    // yet either, but dispatch_local's own drop-based guards (see its doc)
-    // still correctly release a budget reservation and propagate
-    // cancellation into the Supervisor call if *this handler's own future*
-    // is dropped mid-request (e.g. a future connection-level timeout or
-    // abort layered on top) -- genuinely different from, and strictly
-    // better than, a listener that structurally can never fire.
+    // The request token is a fresh child of this TCP connection's lifetime.
+    // Completing the request body does not cancel it; EOF/reset/shutdown of
+    // the actual connection does.
     let selected_for_dispatch = dispatch::select(&cards, &parsed, &prompt).ok();
     let selected_estimated_cost = selected_for_dispatch
         .as_ref()
@@ -926,7 +926,7 @@ async fn chat_completions(
         &parsed,
         dispatch::DispatchInput::with_model(model, &prompt),
         messages,
-        tokio_util::sync::CancellationToken::new(),
+        lifecycle.cancellation_token(),
     )
     .await
     {

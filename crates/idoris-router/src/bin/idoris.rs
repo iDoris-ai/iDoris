@@ -19,7 +19,9 @@
 use idoris_router::{
     AppState, BIND_HOST, build_app,
     capabilities::{CapabilitiesProvider, LiveCapabilitiesProvider},
-    cli, components, config, host_facts, parse_port, profile, routing_policy,
+    cli, components, config,
+    connection::{ConnectionInfo, ConnectionListener},
+    host_facts, parse_port, profile, routing_policy,
     runtime::RuntimeRegistry,
     storage,
     write_timeout::{DEFAULT_WRITE_TIMEOUT, WriteTimeoutListener},
@@ -131,10 +133,21 @@ async fn run() -> Result<(), String> {
             &component_list
         }
     );
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let listener = WriteTimeoutListener::new(
+        ConnectionListener::new(listener, shutdown.clone())
+            .map_err(|err| format!("无法启动连接监视器：{err}"))?,
+        DEFAULT_WRITE_TIMEOUT,
+    );
+    let signal_shutdown = shutdown.clone();
     axum::serve(
-        WriteTimeoutListener::new(listener, DEFAULT_WRITE_TIMEOUT),
-        app,
+        listener,
+        app.into_make_service_with_connect_info::<ConnectionInfo>(),
     )
+    .with_graceful_shutdown(async move {
+        let _ = tokio::signal::ctrl_c().await;
+        signal_shutdown.cancel();
+    })
     .await
     .map_err(|err| format!("server error: {err}"))
 }
