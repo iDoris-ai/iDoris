@@ -6,6 +6,47 @@
 > 判断依据只有一条：**这些事情能不能真的替我做掉，且我敢让它替我做。**
 > 记录日期：2026-09-07
 
+## B3 task27 · 真实订阅 CLI smoke（Rust-only）
+
+> 本节是 B3 Rust 迁移的显式 opt-in 实机验收记录；本文其余旧状态仍按顶部“已废弃”说明处理。
+
+运行：
+
+```bash
+IDORIS_SUBSCRIPTION_REAL_CLI=codex cargo test -p idoris-upstream --test subscription_real -- --nocapture
+IDORIS_SUBSCRIPTION_REAL_CLI=claude cargo test -p idoris-upstream --test subscription_real -- --nocapture
+# 或一次跑两套：
+IDORIS_SUBSCRIPTION_REAL_CLI=both cargo test -p idoris-upstream --test subscription_real -- --nocapture
+```
+
+规则：
+
+- 默认不访问真实订阅账号，也不使用 `#[ignore]`；只有显式设置 opt-in 才运行。
+- 一旦 opt-in，缺 CLI、未登录、版本/安全 flags 不兼容、真实调用失败都必须使测试失败；禁止 SKIP 冒充通过。
+- 测试只记录 CLI 版本与通过项；失败断言也不得回显模型自由文本。relay 错误仍只暴露固定 reason code/白名单 diagnostics。
+- 每套 CLI 必须验证：固定回复；工具/写入诱导下未出现禁写文件；真实 timeout；真实 CLI 进程组建立后的显式 cancellation；正常/timeout/cancel 后其独占 PID/PGID 都消失。该 smoke 不把“未出现禁写文件”夸大成“证明模型一定尝试了写入”，也不把 marker 后立即 cancel 夸大成“已取消一段确认在生成中的模型输出”。
+- wrapper 只先记录自己的 PID/PGID 然后 `exec` 真实 CLI，参数原样透传；它不是 fake CLI，也不会改变 iDoris 的固定安全 argv。
+- 真实 CLI 版本不兼容时应拒绝开放该 CLI，而不是剥掉安全 flag 重试。
+
+2026-10-05 本机实测（Mac，真实登录态）：
+
+- Codex CLI `0.156.1`：PASS —— 固定回复、write-inducement 下未出现禁写文件、500ms timeout、PGID 建立后的显式 cancel、正常/timeout/cancel 后 PGID 消失。
+- Claude Code `2.1.289`：PASS —— 固定回复、write-inducement 下未出现禁写文件、500ms timeout、PGID 建立后的显式 cancel、正常/timeout/cancel 后 PGID 消失。
+- 测试输出仅记录版本与 PASS；未记录 prompt、stderr、凭据或自由文本。
+
+### B3 kill switch 运维验收
+
+订阅中转不是热开关。紧急停用时：
+
+1. 设置 `IDORIS_DISABLE_SUBSCRIPTION=1`。
+2. 优雅重启 iDoris；shutdown 必须先拒绝新 relay、取消 active CLI、等待 PGID 回收。
+3. 重启后确认 `/v1/models` 无 `claude-subscription` / `codex-subscription`。
+4. 再发一个普通本地/免费 HTTP 模型正控，确认能力②/③不受 kill switch 影响。
+5. 发一个 `local_only` 请求并确认 CLI spawn marker 为 0。
+
+若 CLI 版本升级后 task27 的 safety flags / fixed reply / write-inducement /
+timeout / cancel 任一项失败，该 CLI 必须保持禁用，禁止删安全 flag 后重试。
+
 ## 一、我只需要记住一个地址
 
 我（或我的任何业务：Agent24 / 微信 bridge / blog 脚本 / banner 生成）只配置 `http://127.0.0.1:PORT/v1` 一个 OpenAI-compat 地址，就能用到本机所有 AI 能力，不用关心背后是本地模型、我的 Claude 订阅、还是某个云 API。

@@ -6,9 +6,12 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use axum::serve::Listener;
+use axum::extract::connect_info::Connected;
+use axum::serve::{IncomingStream, Listener};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::time::{Sleep, sleep};
+
+use crate::connection::{ConnectionInfo, ConnectionListener, ConnectionTagged};
 
 /// Production limit for a connection that cannot accept response bytes.
 pub const DEFAULT_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -47,6 +50,20 @@ pub struct WriteTimeoutIo<T> {
     deadline: Option<Pin<Box<Sleep>>>,
     flush_only_deadline: bool,
     timed_out: bool,
+}
+
+impl<T: ConnectionTagged> ConnectionTagged for WriteTimeoutIo<T> {
+    fn connection_token(&self) -> tokio_util::sync::CancellationToken {
+        self.inner.connection_token()
+    }
+}
+
+impl<'a> Connected<IncomingStream<'a, WriteTimeoutListener<ConnectionListener>>>
+    for ConnectionInfo
+{
+    fn connect_info(stream: IncomingStream<'a, WriteTimeoutListener<ConnectionListener>>) -> Self {
+        ConnectionInfo::from_parts(*stream.remote_addr(), stream.io().connection_token())
+    }
 }
 
 impl<T> WriteTimeoutIo<T> {
