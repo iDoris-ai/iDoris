@@ -149,11 +149,11 @@ pnpm lint && pnpm typecheck && pnpm check:contract-drift && pnpm build && pnpm t
 | 23 conformance fixture | #311 | merged | 临时 PATH fake CLI；不增加生产 command override |
 | 24 production gates | #312 | merged | 原子替换 K04 总拒绝；授权构造 + shutdown 接线 |
 | 25 shared conformance | #313 | merged | Rust release 二进制全量 conformance：134 passed / 8 todo |
-| 26 Unix CI matrix | #314 | **approved; repaired head `615ccab` in CI** | 已纳入 #315 EPERM 修复与 #317 fixture readiness race 修复；最终以该 exact head 的 Linux+macOS matrix 全绿并 merge 为闭环条件 |
+| 26 Unix CI matrix | #314 | **merged** | repaired head `615ccab` 已纳入 #315/#317；Linux+macOS matrix、Rust/gates 全绿后 merge |
 | 27 real CLI smoke | #316 | **approved; repaired/hardened head `dd801c0` pushed** | Codex 0.156.1 + Claude Code 2.1.289 本机真实 PASS；#318 已合入 task27 分支，收紧 flag token 与失败日志 |
 | 28 release evidence | 本 task | in progress | 本节 + acceptance + component 注释 |
 
-**B3 不能在 #314/#316 的最新 repaired heads 均 CI 全绿并实际 merge 前声明 complete，也不能开 release PR 到 main。**
+**B3 不能在 #316 repaired/hardened head `dd801c0` CI 全绿并实际 merge 前声明 complete，也不能开 release PR 到 main。**
 
 ### 5.2 现行安全/行为结论
 
@@ -198,7 +198,7 @@ pnpm lint && pnpm typecheck && pnpm check:contract-drift && pnpm build && pnpm t
 
 - #315 已合并：`killpg EPERM` 不再立即覆盖请求终止原因，而是交给有界存在性检查继续确认。
 - #317 已合并：`ignore-term` fixture 先安装 TERM trap 再发布 ready marker，测试只认 `ESRCH` 为“组真的消失”；该修复已同步到 task26 repaired head。
-- #314 repaired head `615ccab` 已包含 #315/#317；只有该 exact head 的 Linux+macOS matrix 全绿并 merge 后，task26 才闭环。
+- #314 repaired head `615ccab` 已包含 #315/#317；Linux+macOS subscription matrix、Rust/gates 全绿后已 merge，task26 正式闭环。
 - #318 已合入 task27 分支：CLI help 检查从子串匹配收紧为 token-exact，并阻止 fixed-reply 失败时回显真实模型自由文本。task27 repaired/hardened head 为 `dd801c0`，最终仍需 CI 全绿并 merge。
 - #314 同一次 run 的 B1 `load_fence::ownership_is_exclusive_even_after_marker_clear` 失败是独立既有 flake；不得与 B3 macOS blocker 混为一谈。
 - #305 review 记录：Linux 对 pipelined-bytes + close 的 POLLHUP/POLLIN 行为仍应由 Linux task26/task18 matrix 继续覆盖；不能只用 macOS 结论外推。
