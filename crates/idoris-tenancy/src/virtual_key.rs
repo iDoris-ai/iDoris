@@ -77,14 +77,6 @@ impl VirtualKeyHash {
         Self(bytes)
     }
 
-    pub fn from_bytes(bytes: [u8; 32]) -> Self {
-        Self(bytes)
-    }
-
-    pub fn as_bytes(&self) -> &[u8; 32] {
-        &self.0
-    }
-
     pub fn matches(&self, secret: &VirtualKeySecret) -> bool {
         let candidate = Self::from_secret(secret);
         bool::from(self.0.ct_eq(&candidate.0))
@@ -94,10 +86,6 @@ impl VirtualKeyHash {
     /// still the persistence/lookup key; this prefix is display-only.
     pub fn fingerprint(&self) -> String {
         hex(&self.0[..6])
-    }
-
-    pub fn to_hex(self) -> String {
-        hex(&self.0)
     }
 }
 
@@ -158,7 +146,6 @@ mod tests {
         assert_eq!(reparsed.hash(), first.hash);
         assert!(first.hash.matches(&reparsed));
         assert!(!first.hash.matches(&second.secret));
-        assert_eq!(first.hash.to_hex().len(), 64);
         assert_eq!(first.hash.fingerprint().len(), 12);
     }
 
