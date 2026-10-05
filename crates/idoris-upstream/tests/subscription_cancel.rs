@@ -19,6 +19,8 @@ use nix::unistd::Pid;
 use support::subscription_cli::FakeSubscriptionCli;
 use tokio_util::sync::CancellationToken;
 
+// CI macOS runners can take materially longer than local machines to reap
+// process groups; keep this comfortably above the observed scheduling jitter.
 const TEST_TERMINATION_GRACE: Duration = Duration::from_millis(500);
 
 fn spec(program: std::path::PathBuf) -> CommandSpec {

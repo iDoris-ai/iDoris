@@ -10,6 +10,7 @@ use std::ffi::OsString;
 use std::process::Stdio;
 use std::time::Duration;
 
+use nix::errno::Errno;
 use nix::sys::signal::killpg;
 use nix::unistd::Pid;
 use tokio::io::AsyncReadExt;
@@ -60,7 +61,7 @@ async fn wait_marker(path: &std::path::Path, minimum_lines: usize) {
 }
 
 fn group_is_gone(group: i32) -> bool {
-    killpg(Pid::from_raw(group), None).is_err()
+    matches!(killpg(Pid::from_raw(group), None), Err(Errno::ESRCH))
 }
 
 async fn wait_group_gone(group: i32) {
