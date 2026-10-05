@@ -200,6 +200,20 @@ pub fn settle(
         .map(|r| r.actual_cost_minor)
 }
 
+/// Idempotent settlement for a completed call whose actual cost is known.
+/// This treats an already-committed extreme overage as complete and accepts
+/// replay only when the stored settled amount matches exactly.
+pub fn settle_replayable(
+    ledger: &BudgetLedger,
+    tenant_id: Option<&str>,
+    reservation_id: &ReservationId,
+    actual_cost_minor: i64,
+) -> Result<i64, BudgetError> {
+    let tenant_id = tenant_id.unwrap_or(PERSONAL_TENANT_ID);
+    ledger.replay_settlement(tenant_id, reservation_id, actual_cost_minor)?;
+    Ok(actual_cost_minor)
+}
+
 /// Releases a reservation for a call that didn't happen (backend failure)
 /// — never call this for a call that actually completed (use [`settle`]).
 pub fn release(
@@ -360,6 +374,23 @@ mod tests {
         release(&ledger, Some("acme"), &id2).unwrap();
         let balance = ledger.tenant_balance("acme").unwrap();
         assert_eq!(balance, 10_000 - 400);
+    }
+
+    #[test]
+    fn replayable_settlement_accepts_committed_extreme_overage_without_double_charge() {
+        let (_dir, ledger) = ledger();
+        ledger
+            .configure_tenant("acme", 10_000, "UTC", SpendGate::PaidOnly)
+            .unwrap();
+
+        let id = reserve(&ledger, Some("acme"), "omlx", 1).unwrap();
+        assert_eq!(settle_replayable(&ledger, Some("acme"), &id, 5).unwrap(), 5);
+        let once = ledger.tenant_readview("acme").unwrap();
+        assert_eq!((once.spent_minor, once.reserved_minor), (5, 0));
+
+        assert_eq!(settle_replayable(&ledger, Some("acme"), &id, 5).unwrap(), 5);
+        let replayed = ledger.tenant_readview("acme").unwrap();
+        assert_eq!((replayed.spent_minor, replayed.reserved_minor), (5, 0));
     }
 
     #[test]

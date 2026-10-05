@@ -142,9 +142,24 @@ pub struct ForwardOpts<'a> {
     pub provider_id: &'a str,
     pub served_locality: Locality,
     pub privacy: PrivacyClass,
+    /// Paid direct-proxy calls require trustworthy OpenAI usage evidence
+    /// before a 2xx response may be retained or replayed.
+    pub require_openai_usage: bool,
 }
 
 /// [`ChatProxy::forward_buffered`]'s result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecutionDisposition {
+    /// No upstream execution happened for this caller.
+    NotExecuted,
+    /// The upstream returned a complete HTTP response.
+    Executed,
+    /// The POST may have executed, but a trustworthy terminal response is unavailable.
+    Uncertain,
+    /// This caller received a retained/cache/singleflight replay.
+    Replay,
+}
+
 #[derive(Clone)]
 pub struct ForwardOutcome {
     pub status: u16,
@@ -160,6 +175,7 @@ pub struct ForwardOutcome {
     /// key doc, C1).
     pub replayed_served_locality: Option<Locality>,
     pub retries: u32,
+    pub execution: ExecutionDisposition,
 }
 
 struct Flight {
@@ -394,6 +410,14 @@ impl ChatProxy {
     }
 
     fn failure(status: u16, retries: u32) -> ForwardOutcome {
+        Self::failure_with_execution(status, retries, ExecutionDisposition::NotExecuted)
+    }
+
+    fn failure_with_execution(
+        status: u16,
+        retries: u32,
+        execution: ExecutionDisposition,
+    ) -> ForwardOutcome {
         ForwardOutcome {
             status,
             body: Bytes::from_static(br#"{"error":{"type":"upstream_unavailable"}}"#),
@@ -402,6 +426,7 @@ impl ChatProxy {
             origin_record_id: None,
             replayed_served_locality: None,
             retries,
+            execution,
         }
     }
 
@@ -558,7 +583,9 @@ impl ChatProxy {
             {
                 return hit;
             }
-            return outcome.clone();
+            let mut replay = outcome.clone();
+            replay.execution = ExecutionDisposition::Replay;
+            return replay;
         }
         // If the leader is cancelled, waiting calls fail closed instead of resending.
         *result = Some(Self::flight_failure(502, "upstream_unavailable"));
@@ -572,6 +599,7 @@ impl ChatProxy {
             replay.cached = true;
             replay.origin_record_id = Some(opts.record_id.to_string());
             replay.replayed_served_locality = Some(opts.served_locality);
+            replay.execution = ExecutionDisposition::Replay;
         }
         let retained_bytes = flight
             .base_bytes
@@ -591,7 +619,11 @@ impl ChatProxy {
             // Keep a bounded uncertainty marker until expiry. Dropping a
             // completed but uncacheable result could permit a duplicate POST.
             uncertain = true;
-            replay = Self::flight_failure(502, "upstream_unavailable");
+            replay = Self::flight_failure_with_execution(
+                502,
+                "upstream_unavailable",
+                ExecutionDisposition::Uncertain,
+            );
         }
         if !uncertain && (200..300).contains(&outcome.status) {
             // Keep the request fingerprint through the idempotency window,
@@ -605,6 +637,14 @@ impl ChatProxy {
     }
 
     fn flight_failure(status: u16, kind: &str) -> ForwardOutcome {
+        Self::flight_failure_with_execution(status, kind, ExecutionDisposition::NotExecuted)
+    }
+
+    fn flight_failure_with_execution(
+        status: u16,
+        kind: &str,
+        execution: ExecutionDisposition,
+    ) -> ForwardOutcome {
         ForwardOutcome {
             status,
             body: Bytes::from(serde_json::json!({"error": {"type": kind}}).to_string()),
@@ -613,6 +653,7 @@ impl ChatProxy {
             origin_record_id: None,
             replayed_served_locality: None,
             retries: 0,
+            execution,
         }
     }
 
@@ -641,6 +682,7 @@ impl ChatProxy {
             origin_record_id: Some(entry.record_id),
             replayed_served_locality: Some(entry.served_locality),
             retries: 0,
+            execution: ExecutionDisposition::Replay,
         })
     }
 
@@ -691,9 +733,24 @@ impl ChatProxy {
                         Ok(bytes) => bytes,
                         Err(status) => {
                             *uncertain = true;
-                            return Self::failure(status, retries);
+                            return Self::failure_with_execution(
+                                status,
+                                retries,
+                                ExecutionDisposition::Uncertain,
+                            );
                         }
                     };
+                    if (200..300).contains(&status)
+                        && opts.require_openai_usage
+                        && crate::budget::parse_openai_usage(&body_bytes).is_err()
+                    {
+                        *uncertain = true;
+                        return Self::flight_failure_with_execution(
+                            502,
+                            "upstream_usage_invalid",
+                            ExecutionDisposition::Uncertain,
+                        );
+                    }
                     // Only a genuinely successful (2xx) call is cached —
                     // matches TS's own `res.ok` gate on the `remember()`
                     // call site exactly (a 4xx is never retried above
@@ -718,11 +775,17 @@ impl ChatProxy {
                     }
                     // Redirects, request timeouts, and 5xx responses do not
                     // prove the POST was not executed; retain their
-                    // fingerprint through the window.
-                    if (300..400).contains(&status) || status == 408 || (500..600).contains(&status)
+                    // fingerprint through the window and expose the same
+                    // uncertainty to budget settlement.
+                    let execution = if (300..400).contains(&status)
+                        || status == 408
+                        || (500..600).contains(&status)
                     {
                         *uncertain = true;
-                    }
+                        ExecutionDisposition::Uncertain
+                    } else {
+                        ExecutionDisposition::Executed
+                    };
                     return ForwardOutcome {
                         status,
                         body: body_bytes,
@@ -731,6 +794,7 @@ impl ChatProxy {
                         origin_record_id: None,
                         replayed_served_locality: None,
                         retries,
+                        execution,
                     };
                 }
                 Ok(Err(err)) => {
@@ -741,11 +805,23 @@ impl ChatProxy {
                         continue;
                     }
                     *uncertain = !err.is_connect();
-                    return Self::failure(if err.is_timeout() { 504 } else { 502 }, attempt as u32);
+                    return Self::failure_with_execution(
+                        if err.is_timeout() { 504 } else { 502 },
+                        attempt as u32,
+                        if err.is_connect() {
+                            ExecutionDisposition::NotExecuted
+                        } else {
+                            ExecutionDisposition::Uncertain
+                        },
+                    );
                 }
                 Err(_) => {
                     *uncertain = true;
-                    return Self::failure(504, attempt as u32);
+                    return Self::failure_with_execution(
+                        504,
+                        attempt as u32,
+                        ExecutionDisposition::Uncertain,
+                    );
                 }
             }
         }
@@ -1076,6 +1152,7 @@ mod tests {
             provider_id: "omlx",
             served_locality: Locality::Loopback,
             privacy: PrivacyClass::Any,
+            require_openai_usage: false,
         }
     }
 

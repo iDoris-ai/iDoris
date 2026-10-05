@@ -1163,6 +1163,7 @@ async fn chat_via_proxy_buffered(
         provider_id: selected.card.provider.id.as_str(),
         served_locality: selected.served_locality,
         privacy,
+        require_openai_usage: false,
     };
     let outcome = state
         .proxy
