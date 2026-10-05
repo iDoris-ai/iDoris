@@ -97,7 +97,7 @@ jobs:
           set -euo pipefail
           archive="idoris-${TAG}-aarch64-apple-darwin.tar.gz"
           checksum="${archive}.sha256"
-          COPYFILE_DISABLE=1 tar czf "$archive" -C target/release idoris -C "$GITHUB_WORKSPACE" config/components/omlx.yaml config/routing-policy.yaml config/catalog.yaml
+          COPYFILE_DISABLE=1 tar czf "$archive" -C target/release idoris -C "$GITHUB_WORKSPACE" config/components/omlx.yaml config/components/subscription.yaml config/routing-policy.yaml config/catalog.yaml
           shasum -a 256 "$archive" > "$checksum"
           echo "archive=${archive}" >> "$GITHUB_OUTPUT"
           echo "checksum=${checksum}" >> "$GITHUB_OUTPUT"

@@ -6,25 +6,22 @@ HTTP 契约测试：它只通过 HTTP 访问被测服务，不 `import` 任何 `
 接线方式见套件自己的 `conformance/README.md`「接入新实现」一节。本文档只覆盖
 Rust 这一侧：现在跑会看到什么、以后怎么跑 TS/Rust 两版对照。
 
-## 现状（2026-10-01，#48 合并前实跑）
+## 现状（R6 / v0.2.0 收敛）
 
-R2-D/E/G 已经把 `idoris-policy`（决策管道）、`idoris-tenancy`（预算账本）、
-组件卡加载（`IDORIS_COMPONENTS_DIR`）、路由策略（`IDORIS_ROUTING_POLICY`）、
-`/v1/models`、`/v1/chat/completions`（本地 Supervisor 路径 + 直连转发 + SSE）
-接进了 `idoris-router`。在合并了 #49、#153 的 #48 分支上跑
-`bash scripts/conformance-rust.sh`：
+Rust 已完成 B1（路由/审计/用量/capabilities）、B2（推荐器）和 B3
+（订阅中转）主链，`README.md` 明确 Rust 是生产实现；TS 仅保留为
+reference/PoC。CI 的 `rust` job 已安装 Node/pnpm，并把
+`bash scripts/conformance-rust.sh` 作为 required gate。
+
+B3 task25 的共享黑盒基线为：
 
 ```
-Test Files  7 passed | 1 skipped (8)
-     Tests  47 passed | 7 todo (54)
+Tests  134 passed / 8 todo
 ```
 
-47 条非 todo 用例全部通过；7 条 `it.todo` 是 `known-spec-conflicts.test.ts`
-里记录的已知规范落差，TS 与 Rust 两侧一致。此前唯一的失败（客户端断开时取消
-上游请求）是 TS 参考实现的 bug，#153 修复后两侧都通过。
-
-`scripts/conformance-rust.sh` 目前还**没有**接进 CI 的 `rust` job（该 job 不装
-Node/pnpm）。通过率已经追平，下一步可以把它接成必跑项。
+8 条 todo 是显式记录的已知规范/后续能力，不允许用新增 todo 掩盖回归。
+Rust 已批准的安全差异（例如确定性候选排序、Supervisor busy、严格取消）
+由 per-implementation 断言锁定，不要求 TS 为了表面相同而新增 M4+ 产品能力。
 
 ## 怎么跑 Rust 版
 
@@ -36,12 +33,9 @@ bash scripts/conformance-rust.sh
 
 1. `cargo build --release --locked -p idoris-router`，产出
    `target/release/idoris`；
-2. 设置 `IDORIS_CONFORMANCE_CMD=$(pwd)/target/release/idoris`（不带任何参数
-   ——`idoris-router` 目前不解析 argv，只读环境变量，见
-   `crates/idoris-router/src/bin/idoris.rs`；conformance harness
-   [`conformance/src/harness.ts`] 按空白切分 `IDORIS_CONFORMANCE_CMD` 得到
-   `bin` + `args` 来 spawn 子进程，所以这里给纯路径即可，不是漏写了
-   `serve`）；
+2. 设置 `IDORIS_CONFORMANCE_CMD=$(pwd)/target/release/idoris serve`，
+   明确走打包二进制的正式 `serve` 入口；同时设置结构化的
+   `IDORIS_CONFORMANCE_ARGV`，避免依赖空白切分解释 argv；
 3. `pnpm conformance`（等价于 `pnpm --filter @idoris/router... build &&
    pnpm --filter @idoris/conformance test:conformance`——前半句会顺带 build
    一遍 TS router，这一步对跑 Rust 版是多余的，但无害，就是慢几秒；套件本身
@@ -83,5 +77,6 @@ pnpm conformance | tee /tmp/conformance-ts.log
 bash scripts/conformance-rust.sh | tee /tmp/conformance-rust.log
 ```
 
-现阶段两份日志应该完全一致：47 条通过，7 条 todo（同一份「已知规范落差」清单）。
-以后任何一侧出现另一侧没有的失败用例，就是一处行为分叉，需要先判断哪一侧偏离了规范。
+R6 阶段 Rust 的 required 基线是 134 passed / 8 todo。TS 运行用于参考和
+回归对照，但不再要求它实现 Rust 后续新增的产品能力；共同用例出现分叉时，
+先判断是规范回归还是已批准的 Rust 安全差异，不能机械地把 Rust 降级去追平 TS。

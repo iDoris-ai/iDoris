@@ -30,7 +30,18 @@ curl http://127.0.0.1:8740/health
 
 看到 `{"status":"ok","version":"<tag 去掉 v>",...}` 即表示路由服务已启动；目标是下载解压后 60 秒内启动，无需设置环境变量或改配置。`/health` 不代表模型后端可用：即使没有安装或启动 oMLX，服务也能启动；推理请求遇到不可用候选仍按 fail-closed 返回错误，不回退到远程付费服务。
 
-发布包只带本地免费 oMLX 卡与默认路由策略，不带订阅卡或 mock 卡。默认从 **二进制所在目录**读取 `config/components/` 和 `config/routing-policy.yaml`，可从任意工作目录启动。可用 `IDORIS_COMPONENTS_DIR`、`IDORIS_ROUTING_POLICY` 指定其他路径（显式相对路径以 cwd 为准）；配置缺失或校验失败仍拒绝启动，订阅卡仍受 K04 限制，不会自动忽略或回退。源码构建不会自动复制配置，需要自行准备相同目录布局。
+发布包带本地免费 oMLX 卡、**默认关闭的订阅中转卡**、默认路由策略与模型 catalog；不带 mock 卡。默认从 **二进制所在目录**读取 `config/components/`、`config/routing-policy.yaml` 与 `config/catalog.yaml`，可从任意工作目录启动。可用 `IDORIS_COMPONENTS_DIR`、`IDORIS_ROUTING_POLICY`、`IDORIS_CATALOG` 指定其他路径（显式相对路径以 cwd 为准）；配置缺失或校验失败仍拒绝启动。订阅中转默认不会注册，也不会因为卡文件随包存在就自动调用远程 CLI。
+
+个人模式显式启用订阅中转时，必须同时满足固定沙箱档和 CLI 白名单；例如 Claude：
+
+```bash
+IDORIS_ENABLE_SUBSCRIPTION=1 \
+IDORIS_SUBSCRIPTION_SANDBOX=idoris-subscription-no-tools-readonly-v1 \
+IDORIS_SUBSCRIPTION_CLI=claude \
+./idoris serve
+```
+
+`IDORIS_SUBSCRIPTION_CLI` 目前只接受 `claude` 或 `codex`；未设置时默认 Claude。`IDORIS_DISABLE_SUBSCRIPTION=1` 优先于 enable，是需要重启生效的 kill switch。订阅能力只接受 loopback 来源，并始终按 remote locality 处理；`local_only` 请求不会 spawn CLI。源码构建不会自动复制配置，需要自行准备相同目录布局。
 
 默认卡连接 oMLX 的 `http://127.0.0.1:8000`（[oMLX 官方默认端口](https://github.com/jundot/omlx#installation)）。若 oMLX 开启认证，把在 oMLX 管理界面或启动配置中设置的推理 API key 通过 `IDORIS_OMLX_API_KEY` 传给 iDoris；iDoris 不自动读取 oMLX 配置或 `OMLX_API_KEY`。自定义端口（如旧工作站使用的 8088）需修改包内 `config/components/omlx.yaml` 的 endpoint。上游恢复或补充 key 后重启 iDoris，让 Supervisor 重新核对后端状态。
 
