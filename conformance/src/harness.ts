@@ -121,6 +121,8 @@ export interface SpawnOptions {
    * 时才够得到，走生产 CLI 已经不可达，见 `tests/default-routing-policy.test.ts`。
    */
   routingPolicyPath?: string;
+  /** 不传沿用仓库根目录；显式指定可验证被测 CLI 的配置定位行为。 */
+  cwd?: string;
   env?: NodeJS.ProcessEnv;
   healthTimeoutMs?: number;
 }
@@ -194,7 +196,7 @@ export async function spawnConformanceServer(opts: SpawnOptions): Promise<Runnin
   if (opts.routingPolicyPath !== undefined) env.IDORIS_ROUTING_POLICY = opts.routingPolicyPath;
   else delete env.IDORIS_ROUTING_POLICY;
 
-  const child: ChildProcess = spawn(bin, args, { cwd: repoRoot, env, detached: process.platform !== "win32" });
+  const child: ChildProcess = spawn(bin, args, { cwd: opts.cwd ?? repoRoot, env, detached: process.platform !== "win32" });
 
   let stdoutBuf = "";
   let stderrBuf = "";

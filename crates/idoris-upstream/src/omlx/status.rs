@@ -125,6 +125,17 @@ fn parse_memory_gb(value: Option<&serde_json::Value>, field: &str) -> Result<f64
     }
 }
 
+/// A successful activity response is authoritative: malformed/missing
+/// fields are `Unknown`, never replaced by a legacy `Ok` signal.
+pub(super) fn parse_activity_pressure(raw: &serde_json::Value) -> Pressure {
+    let pressure = &raw["active_models"]["memory_pressure"];
+    match pressure["enabled"].as_bool() {
+        Some(false) => Pressure::Ok,
+        Some(true) => parse_pressure(pressure.get("pressure_level")),
+        None => Pressure::Unknown,
+    }
+}
+
 /// Missing/`null` → explicit `Unknown` (never fail-open to `Ok`, per
 /// `Pressure`'s own doc comment). An unrecognized type/value doesn't fail
 /// the whole `status()` call — it degrades to `Unknown` for just this one

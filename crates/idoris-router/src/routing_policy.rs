@@ -4,27 +4,96 @@
 //! (conformance suite: "不传时落到仓库自带的 config/routing-policy.yaml，
 //! 不是未配置；指向不存在的文件时启动直接失败").
 //!
-//! **Deviation from `serve.ts`**: relative paths resolve against the
-//! current working directory, not a computed repo root. `serve.ts` derives
-//! the repo root from its own module's location on disk specifically to
-//! survive an unusual `cwd` (e.g. a LaunchAgent's default `cwd=/`) — a
-//! compiled Rust binary has no equivalent "next to the source tree"
-//! location to introspect (`std::env::current_exe()` gives the install
-//! path, not a repo path), so resolve-against-cwd is the only option that
-//! generalizes to a real deployment, at the cost of requiring the operator
-//! to run this binary from (or point `IDORIS_ROUTING_POLICY`/
-//! `IDORIS_COMPONENTS_DIR` as absolute paths at) the intended working
-//! directory.
+//! The `idoris` binary resolves an unset/blank policy path next to its
+//! executable so a release can ship with a sibling `config/` directory.
+//! Explicit relative paths still resolve against the current working
+//! directory. [`resolve_routing_policy_path`] remains a cwd-relative path
+//! helper for library callers.
 //!
-//! This crate's decision pipeline ([`idoris_policy::decide`]) doesn't
-//! consume [`RoutingPolicy`]'s rules yet — R2-D only wires up its
-//! load-and-validate-at-startup semantics (fail-fast on a bad file), same
-//! as `loadRoutingPolicy` is used for in the TS reference today.
+//! [`decide`] evaluates rules as a pure function. The request pipeline applies
+//! its tier restrictions before candidate selection on both execution paths.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use idoris_contracts::TaskProfile;
+use idoris_contracts::common::{Capability, PrivacyClass, Tier};
+use idoris_contracts::load_policy::LoadMode;
+use idoris_contracts::routing_policy::Condition;
 use idoris_contracts::{Contract, RoutingPolicy};
+
+/// Zero-based rule index, or the policy's default action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MatchedRule {
+    Rule(usize),
+    Default,
+}
+
+/// Pure policy result, mirroring `packages/router/src/policy.ts`.
+/// `capability`/`load` are metadata only; this evaluator performs no dispatch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RouteDecision {
+    pub tiers: Vec<Tier>,
+    pub fail_closed: bool,
+    pub capability: Option<Capability>,
+    pub load: Option<LoadMode>,
+    pub matched_rule: MatchedRule,
+}
+
+fn matches(condition: &Condition, profile: &TaskProfile) -> bool {
+    let Condition {
+        privacy,
+        intent,
+        complexity,
+        capabilities,
+    } = condition;
+    privacy.is_none_or(|v| profile.privacy == Some(v))
+        && intent
+            .as_ref()
+            .is_none_or(|v| profile.intent.as_ref() == Some(v))
+        && complexity.is_none_or(|v| profile.complexity == Some(v))
+        && capabilities.as_ref().is_none_or(|need| {
+            need.iter().all(|c| {
+                profile
+                    .capabilities
+                    .as_ref()
+                    .is_some_and(|have| have.contains(c))
+            })
+        })
+}
+
+/// First matching rule wins; otherwise use the default. Intersect requested
+/// tiers with privacy permissions without changing their order. Even an
+/// untrusted remote-only action cannot relax `local_only` or fail-closed.
+/// Callers normally pass a parsed profile; absent privacy also fails closed.
+pub fn decide(policy: &RoutingPolicy, profile: &TaskProfile) -> RouteDecision {
+    let matched = policy
+        .routing_policy
+        .rules
+        .iter()
+        .enumerate()
+        .find(|(_, rule)| matches(&rule.if_, profile));
+    let (matched_rule, action) = match matched {
+        Some((index, rule)) => (MatchedRule::Rule(index), &rule.then),
+        None => (MatchedRule::Default, &policy.routing_policy.default),
+    };
+    let local_only = profile.privacy.unwrap_or(PrivacyClass::LocalOnly) == PrivacyClass::LocalOnly;
+    let tiers = action
+        .tiers
+        .as_deref()
+        .unwrap_or(&[Tier::Local])
+        .iter()
+        .copied()
+        .filter(|tier| !local_only || *tier != Tier::Remote)
+        .collect();
+    RouteDecision {
+        tiers,
+        fail_closed: local_only || action.fail_closed.unwrap_or(false),
+        capability: action.capability,
+        load: action.load,
+        matched_rule,
+    }
+}
 
 /// `serve.ts`'s `DEFAULT_ROUTING_POLICY`.
 pub const DEFAULT_ROUTING_POLICY_PATH: &str = "config/routing-policy.yaml";

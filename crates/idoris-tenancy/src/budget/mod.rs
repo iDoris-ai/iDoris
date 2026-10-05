@@ -19,6 +19,7 @@ pub use estimator::{ConservativeTokenEstimator, TokenEstimator, estimate_tokens}
 pub use ledger::test_hooks;
 pub use ledger::{
     BudgetLedger, DEFAULT_RESERVATION_TTL_MS, Price, ReservationId, SettleReceipt, SpendGate,
+    TenantBudgetReadView,
 };
 pub use period::billing_period_key;
 pub use scope::BudgetScope;

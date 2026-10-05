@@ -54,6 +54,24 @@ bash scripts/conformance-rust.sh
 
 ## TS 与 Rust 双跑对照
 
+### 已批准的 Rust 安全差异（B1）
+
+B1 不以“字节级复刻 TS”为目标来削弱 Rust 已有的安全行为。下面这些差异已经
+被显式锁定；共同 HTTP conformance 不应为了制造表面一致而反向改掉它们：
+
+- **候选排序**：Rust 保留 `admission → cost → provider id` 的确定性排序；TS
+  参考实现仍取注册顺序第一张。B1 task08 用双候选负对照锁定这条差异。
+- **Supervisor 冲突**：同一 Supervisor 内，完全相同的并发 load 会
+  singleflight；不同 model、不同 policy 或不同 `memory_gb` 的冲突请求立即
+  `supervisor_busy`，不实现 TS `evict-lock` 工具类设想的等待队列。Busy 只在
+  单个 runtime Supervisor 内生效，不跨独立 backend。
+- **取消**：Rust 请求 future 被丢弃时会取消传给 adapter 的 token，并释放预算
+  reservation；这条由 `dropping_the_future_mid_chat_releases_the_reservation_and_cancels_the_token`
+  承重，不能为了追平 TS 旧的取消传播缺口而移除。
+
+task38 只锁定这些已经存在的行为，不新增等待队列或新的驱逐算法；若未来产品
+决定需要排队/超时等待，应另开独立实现 PR，并重新定义 Busy 契约。
+
 想知道 TS 参考实现和 Rust 版在同一套用例上的差异，分别跑一遍，diff 两次的
 输出（或者更直接地看各自失败在哪些用例上）：
 

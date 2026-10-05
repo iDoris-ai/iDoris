@@ -1,7 +1,7 @@
 //! Resident/pin admission logic. oMLX 0.6.4 moved setting `is_pinned`
 //! behind `PUT /admin/api/models/{id}/settings`, which requires a separate
-//! admin session this adapter doesn't have — the plain inference API key
-//! gets a bare 401. `GET /v1/models/status`, by contrast, is confirmed
+//! admin session established by `admin` using the main API key. Bearer
+//! authentication alone gets a bare 401. `GET /v1/models/status`, by contrast, is confirmed
 //! readable with just the inference key (read-only, no admin session
 //! needed) — [`parse_model_state`] is this adapter's only way to find out
 //! whether a model actually ended up pinned, and the only way to detect

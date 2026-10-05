@@ -30,6 +30,10 @@ export interface ComponentCardSpec {
   capabilities?: string[];
   fallbackPolicy?: "fail_closed" | "next_in_chain";
   failClosed?: boolean;
+  /** 不传保留 resident 默认值；null 省略字段；对象原样输出以构造策略正负例。 */
+  loadPolicy?: Record<string, unknown> | null;
+  extensions?: Record<string, unknown>;
+  providerExtensions?: Record<string, unknown>;
 }
 
 function renderCard(c: ComponentCardSpec): string {
@@ -44,6 +48,7 @@ function renderCard(c: ComponentCardSpec): string {
     "  privacy_class: " + c.privacyClass,
     "  cost: { input_per_m: 0, output_per_m: 0 }",
     "  locality: " + c.locality,
+    ...(c.providerExtensions === undefined ? [] : ["  extensions: " + JSON.stringify(c.providerExtensions)]),
     "form: http_service",
     "endpoint: " + JSON.stringify(c.endpoint),
     'version_pin: "' + c.id + '@conformance-1"',
@@ -51,7 +56,10 @@ function renderCard(c: ComponentCardSpec): string {
     "allowed_egress: [" + c.allowedEgress.join(", ") + "]",
     "fallback_policy: " + (c.fallbackPolicy ?? "fail_closed"),
     "fail_closed: " + String(c.failClosed ?? true),
-    "load_policy: { mode: resident, keepalive: { pinned: true }, admission: coexist }",
+    ...(c.loadPolicy === null ? [] : [c.loadPolicy === undefined
+      ? "load_policy: { mode: resident, keepalive: { pinned: true }, admission: coexist }"
+      : "load_policy: " + JSON.stringify(c.loadPolicy)]),
+    ...(c.extensions === undefined ? [] : ["extensions: " + JSON.stringify(c.extensions)]),
     "",
   ].join("\n");
 }
@@ -63,6 +71,33 @@ export function makeComponentsDir(cards: ComponentCardSpec[]): string {
     writeFileSync(join(dir, String(i) + "-" + c.id + ".yaml"), renderCard(c), "utf8");
   });
   return dir;
+}
+
+/** 原样写入 YAML（包括故意无效的策略），由被测实现负责校验。 */
+export function makeRoutingPolicyFile(content: string): string {
+  const dir = mkdtempSync(join(tmpdir(), "idoris-conformance-policy-"));
+  const path = join(dir, "routing-policy.yaml");
+  writeFileSync(path, content, "utf8");
+  return path;
+}
+
+/** Trusted local tenant configuration for Rust storage/bootstrap parity tests. */
+export function makeTenantConfigFile(
+  tenants: ReadonlyArray<{ tenantId: string; limitMinor?: number; billingTimezone?: string; scope?: "paid_only" | "all" }>,
+): string {
+  const dir = mkdtempSync(join(tmpdir(), "idoris-conformance-tenants-"));
+  const path = join(dir, "tenants.yaml");
+  const lines = ["tenants:"];
+  for (const tenant of tenants) {
+    lines.push(
+      "  - tenant_id: " + tenant.tenantId,
+      "    limit_minor: " + String(tenant.limitMinor ?? 1_000_000),
+      "    billing_timezone: " + (tenant.billingTimezone ?? "UTC"),
+      "    scope: " + (tenant.scope ?? "paid_only"),
+    );
+  }
+  writeFileSync(path, lines.join("\n") + "\n", "utf8");
+  return path;
 }
 
 /** 便利构造：单个 loopback + local_only 的可信本地组件，指向给定假上游 URL。 */

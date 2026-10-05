@@ -1,0 +1,249 @@
+{
+  "metadata": {
+    "recommender_commit": "49a66e86e65e9ddf26f3bf3c9d68041df49d8981",
+    "catalog_commit": "49a66e86e65e9ddf26f3bf3c9d68041df49d8981",
+    "catalog_sha256": "5a49fe4e27dab1bca020479c956de7fc874cf6c856502617ca84a05304b4988a"
+  },
+  "cases": {
+    "8": {
+      "projection": {
+        "resident_label": null,
+        "usable_gb": 5,
+        "reserve_gb": 3,
+        "temp_reserve_gb": 3.5,
+        "resident_budget_gb": 0.5,
+        "temp": [
+          {
+            "id": "nanbeige4.2-3b",
+            "capability": "coding",
+            "status": "ready",
+            "quant": "q4_k_m"
+          }
+        ],
+        "blocked_ids": [
+          "qwen3.5-9b",
+          "ornith-1.0-9b",
+          "ornith-1.5-9b",
+          "gemma-4-12b-it",
+          "qwen3-8b",
+          "agents-a1-35b",
+          "qwen3.6-35b-a3b",
+          "qwen3.8-27b",
+          "qwen2.5-vl-7b",
+          "qwen2.5-coder-14b"
+        ],
+        "iogpu_wired_limit_mb": 5120
+      }
+    },
+    "16": {
+      "projection": {
+        "resident_label": "nanbeige4.2-3b@q4_k_m",
+        "usable_gb": 10.56,
+        "reserve_gb": 4.8,
+        "temp_reserve_gb": 3.5,
+        "resident_budget_gb": 6.0600000000000005,
+        "temp": [
+          {
+            "id": "qwen2.5-vl-7b",
+            "capability": "vision",
+            "status": "requires_eviction",
+            "quant": "q8_0"
+          },
+          {
+            "id": "ornith-1.0-9b",
+            "capability": "coding",
+            "status": "requires_eviction",
+            "quant": "q6_k"
+          }
+        ],
+        "blocked_ids": [
+          "agents-a1-35b",
+          "qwen3.6-35b-a3b",
+          "qwen3.8-27b",
+          "qwen2.5-coder-14b"
+        ],
+        "iogpu_wired_limit_mb": 10813
+      }
+    },
+    "24": {
+      "full": {
+        "hardware": {
+          "ram_gb": 24,
+          "chip": "M4",
+          "gpu_cores": 10,
+          "os": "darwin",
+          "source": "injected"
+        },
+        "policy": {
+          "wired_mode": "conservative",
+          "context_target": 32768,
+          "kv_quant": "q8",
+          "temp_slots": 1,
+          "quality_threshold": 0.98,
+          "needed_capabilities": [
+            "vision",
+            "coding"
+          ]
+        },
+        "usable_gb": 15.84,
+        "reserve_gb": 7.199999999999999,
+        "temp_reserve_gb": 3.5,
+        "resident_budget_gb": 11.34,
+        "resident": {
+          "id": "ornith-1.0-9b",
+          "ctx": 32768,
+          "score": 0.84575,
+          "label": "q6_k",
+          "quality": 0.995,
+          "weights_gb": 7.36,
+          "kv_gb": 2.147483648,
+          "footprint_gb": 10.507483648000001
+        },
+        "resident_label": "ornith-1.0-9b@q6_k",
+        "temp": [
+          {
+            "id": "qwen2.5-vl-7b",
+            "capability": "vision",
+            "status": "requires_eviction",
+            "min_ram_gb": 16,
+            "quant": {
+              "label": "q8_0",
+              "quality": 0.998,
+              "weights_gb": 8.29,
+              "kv_gb": 0.939524096,
+              "footprint_gb": 10.229524095999999
+            },
+            "reason": "footprint 10.23GB > 剩余 5.33GB，需驱逐常驻后加载"
+          },
+          {
+            "id": "qwen2.5-coder-14b",
+            "capability": "coding",
+            "status": "requires_eviction",
+            "min_ram_gb": 24,
+            "quant": {
+              "label": "q4_k_m",
+              "quality": 0.98,
+              "weights_gb": 8,
+              "kv_gb": 3.221225472,
+              "footprint_gb": 12.221225472
+            },
+            "reason": "footprint 12.22GB > 剩余 5.33GB，需驱逐常驻后加载"
+          }
+        ],
+        "blocked": [
+          {
+            "id": "agents-a1-35b",
+            "status": "BLOCKED",
+            "min_ram_gb": 32,
+            "estimated_memory_gb": 17.34217728,
+            "reason": "min_ram_gb=32 > ram_gb=24"
+          },
+          {
+            "id": "qwen3.6-35b-a3b",
+            "status": "BLOCKED",
+            "min_ram_gb": 48,
+            "estimated_memory_gb": 24.47217728,
+            "reason": "min_ram_gb=48 > ram_gb=24"
+          },
+          {
+            "id": "qwen3.8-27b",
+            "status": "BLOCKED",
+            "min_ram_gb": 32,
+            "estimated_memory_gb": 19.544967296,
+            "reason": "min_ram_gb=32 > ram_gb=24"
+          }
+        ],
+        "warnings": [
+          "预算: 24GB conservative → usable 15.84GB（reserve 7.20GB）；常驻预算 11.34GB（预留临时 3.50GB + headroom 1.00GB）",
+          "agents-a1-35b: BLOCKED（min_ram_gb=32 > ram_gb=24）",
+          "qwen3.6-35b-a3b: BLOCKED（min_ram_gb=48 > ram_gb=24）",
+          "qwen3.8-27b: BLOCKED（min_ram_gb=32 > ram_gb=24）",
+          "vision: qwen2.5-vl-7b 需驱逐常驻（10.23GB > 剩余 5.33GB）",
+          "coding: qwen2.5-coder-14b 需驱逐常驻（12.22GB > 剩余 5.33GB）"
+        ],
+        "recommended_sysctl": {
+          "iogpu_wired_limit_mb": 16220
+        },
+        "tradeoff": "硬件 M4 / 24GB（conservative，ctx 32768，KV q8）\n常驻 ornith-1.0-9b@q6_k：权重 7.36GB + KV 2.15GB + 开销 = 10.51GB，预算 11.34GB；能力×质量=0.8458\n需驱逐：qwen2.5-vl-7b@q8_0、qwen2.5-coder-14b@q4_k_m\nBLOCKED：agents-a1-35b(需32GB)、qwen3.6-35b-a3b(需48GB)、qwen3.8-27b(需32GB)\n预算：usable 15.84GB（reserve 7.20GB，临时预留 3.50GB）",
+        "override": null
+      }
+    },
+    "32": {
+      "projection": {
+        "resident_label": "ornith-1.0-9b@q8_0",
+        "usable_gb": 21.12,
+        "reserve_gb": 9.6,
+        "temp_reserve_gb": 3.5,
+        "resident_budget_gb": 16.62,
+        "temp": [
+          {
+            "id": "qwen2.5-vl-7b",
+            "capability": "vision",
+            "status": "requires_eviction",
+            "quant": "q8_0"
+          },
+          {
+            "id": "agents-a1-35b",
+            "capability": "coding",
+            "status": "requires_eviction",
+            "quant": "q3_k"
+          }
+        ],
+        "blocked_ids": [
+          "qwen3.6-35b-a3b"
+        ],
+        "iogpu_wired_limit_mb": 21627
+      }
+    },
+    "64": {
+      "projection": {
+        "resident_label": "ornith-1.0-9b@q8_0",
+        "usable_gb": 42.24,
+        "reserve_gb": 16,
+        "temp_reserve_gb": 3.5,
+        "resident_budget_gb": 37.74,
+        "temp": [
+          {
+            "id": "qwen2.5-vl-7b",
+            "capability": "vision",
+            "status": "ready",
+            "quant": "q8_0"
+          },
+          {
+            "id": "agents-a1-35b",
+            "capability": "coding",
+            "status": "ready",
+            "quant": "q4_k_m"
+          }
+        ],
+        "blocked_ids": [],
+        "iogpu_wired_limit_mb": 43254
+      }
+    },
+    "128": {
+      "projection": {
+        "resident_label": "ornith-1.0-9b@q8_0",
+        "usable_gb": 84.48,
+        "reserve_gb": 16,
+        "temp_reserve_gb": 3.5,
+        "resident_budget_gb": 79.98,
+        "temp": [
+          {
+            "id": "qwen2.5-vl-7b",
+            "capability": "vision",
+            "status": "ready",
+            "quant": "q8_0"
+          },
+          {
+            "id": "agents-a1-35b",
+            "capability": "coding",
+            "status": "ready",
+            "quant": "q4_k_m"
+          }
+        ],
+        "blocked_ids": [],
+        "iogpu_wired_limit_mb": 86508
+      }
+    }
+  }
+}

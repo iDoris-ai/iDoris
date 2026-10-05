@@ -29,6 +29,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # Rust job 独立安装 conformance 所需的 TS 构建与测试工具。
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
       - run: rustup toolchain install 1.95 --profile minimal --component rustfmt,clippy
       - uses: actions/cache@v4
         with:
@@ -47,6 +54,32 @@ jobs:
       # (Opus Tier-2 re-review B-8) — also required here, not optional.
       - run: cargo clippy --all-targets --features idoris-tenancy/test-bins,idoris-tenancy/mutation-test-hooks -- -D warnings
       - run: cargo test --features idoris-tenancy/test-bins,idoris-tenancy/mutation-test-hooks
+      - name: Rust release conformance
+        # 正控：外部命令指向坏路径时，脚本仍必须选择本次 release 产物。
+        env:
+          IDORIS_CONFORMANCE_CMD: /idoris-conformance-missing
+          IDORIS_CONFORMANCE_ARGV: '["/idoris-conformance-missing"]'
+        run: bash scripts/conformance-rust.sh
+      - name: Rust startup egress assertion
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y strace
+          bash scripts/check-rust-egress.sh
+      - name: Conformance 错误命令负对照
+        shell: bash
+        run: |
+          log="$(mktemp)"
+          trap 'rm -f "$log"' EXIT
+          if IDORIS_CONFORMANCE_ARGV='["/idoris-conformance-missing"]' pnpm conformance >"$log" 2>&1; then
+            cat "$log"
+            echo "错误被测命令未使 conformance 失败" >&2
+            exit 1
+          fi
+          cat "$log"
+          grep -q '被测服务启动命令执行失败.*idoris-conformance-missing.*ENOENT' "$log"
+      # The vendored SSE framing and field parsing fixes are outside the workspace test set.
+      - run: cargo test -p genai --lib 'webc::'
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
-          command: check licenses bans
+          command: check advisories bans licenses sources
