@@ -23,8 +23,8 @@ IDORIS_SUBSCRIPTION_REAL_CLI=both cargo test -p idoris-upstream --test subscript
 
 - 默认不访问真实订阅账号，也不使用 `#[ignore]`；只有显式设置 opt-in 才运行。
 - 一旦 opt-in，缺 CLI、未登录、版本/安全 flags 不兼容、真实调用失败都必须使测试失败；禁止 SKIP 冒充通过。
-- 测试只记录 CLI 版本与通过项，不记录 prompt、stderr、凭据或自由文本。
-- 每套 CLI 必须验证：固定回复；工具/写入诱导不能突破 no-tools/read-only；真实 timeout；模拟 HTTP disconnect 的 cancellation；正常/timeout/cancel 后其独占 PID/PGID 都消失。
+- 测试只记录 CLI 版本与通过项；失败断言也不得回显模型自由文本。relay 错误仍只暴露固定 reason code/白名单 diagnostics。
+- 每套 CLI 必须验证：固定回复；工具/写入诱导下未出现禁写文件；真实 timeout；真实 CLI 进程组建立后的显式 cancellation；正常/timeout/cancel 后其独占 PID/PGID 都消失。该 smoke 不把“未出现禁写文件”夸大成“证明模型一定尝试了写入”，也不把 marker 后立即 cancel 夸大成“已取消一段确认在生成中的模型输出”。
 - wrapper 只先记录自己的 PID/PGID 然后 `exec` 真实 CLI，参数原样透传；它不是 fake CLI，也不会改变 iDoris 的固定安全 argv。
 - 真实 CLI 版本不兼容时应拒绝开放该 CLI，而不是剥掉安全 flag 重试。
 
