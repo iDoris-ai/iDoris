@@ -25,3 +25,8 @@ pub mod billing;
 
 /// Tenant-scoped usage records consumed by monthly billing aggregation.
 pub mod usage;
+
+/// Virtual-key secret/hash primitive. Plaintext keys are returned only at
+/// issuance; persistence layers store [`virtual_key::VirtualKeyHash`] plus
+/// non-secret scope metadata.
+pub mod virtual_key;
