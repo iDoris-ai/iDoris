@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 
 use idoris_backend::{Supervisor, SupervisorConfig, SupervisorHandle};
 use idoris_contracts::{ComponentCard, component_card::Form};
+use idoris_policy::is_subscription_provider_id;
 use idoris_upstream::factory::create_adapter;
 
 use crate::dispatch::BoundSupervisor;
@@ -91,6 +92,9 @@ impl From<Option<BoundSupervisor>> for RuntimeRegistry {
 /// # Panics
 /// Lifecycle construction requires a running Tokio runtime, like `Supervisor::spawn`.
 pub fn spawn_runtime(card: &ComponentCard) -> Result<Option<SupervisorHandle>, String> {
+    if is_subscription_provider_id(&card.provider.id) {
+        return Ok(None);
+    }
     if crate::dispatch::is_resident_http_service(card) {
         return Ok(None);
     }

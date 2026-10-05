@@ -22,6 +22,7 @@ pub enum SubscriptionRuntimeError {
     WrongProvider { expected: String, actual: String },
     DuplicateProvider(String),
     MissingHandle(String),
+    ShutdownFailed(String),
     ProfileMismatch,
 }
 
@@ -51,6 +52,12 @@ impl std::fmt::Display for SubscriptionRuntimeError {
                 write!(
                     f,
                     "subscription runtime handle unavailable for provider {provider}"
+                )
+            }
+            Self::ShutdownFailed(provider) => {
+                write!(
+                    f,
+                    "subscription runtime shutdown failed for provider {provider}"
                 )
             }
             Self::ProfileMismatch => {
@@ -218,6 +225,15 @@ impl SubscriptionRuntimeRegistry {
                 model_id: handle.model_id().to_string(),
             })
             .collect()
+    }
+
+    pub async fn shutdown_all(&self) -> Result<(), SubscriptionRuntimeError> {
+        for handle in self.handles.values() {
+            handle.service().shutdown().await.map_err(|_| {
+                SubscriptionRuntimeError::ShutdownFailed(handle.provider_id.clone())
+            })?;
+        }
+        Ok(())
     }
 }
 
