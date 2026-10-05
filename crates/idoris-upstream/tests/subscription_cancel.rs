@@ -19,6 +19,8 @@ use nix::unistd::Pid;
 use support::subscription_cli::FakeSubscriptionCli;
 use tokio_util::sync::CancellationToken;
 
+const TEST_TERMINATION_GRACE: Duration = Duration::from_millis(500);
+
 fn spec(program: std::path::PathBuf) -> CommandSpec {
     let leaked: &'static str = Box::leak(program.to_string_lossy().into_owned().into_boxed_str());
     CommandSpec {
@@ -84,7 +86,7 @@ async fn pre_cancelled_request_never_spawns() {
         &env(&fixture, "pid-marker", "pre-cancel"),
         DEFAULT_MAX_OUTPUT_BYTES,
         Duration::from_millis(100),
-        Duration::from_millis(50),
+        TEST_TERMINATION_GRACE,
         cancel,
     )
     .await
@@ -103,7 +105,7 @@ async fn timeout_reaps_even_a_term_ignoring_group() {
         &env(&fixture, "ignore-term", "timeout"),
         DEFAULT_MAX_OUTPUT_BYTES,
         Duration::from_secs(1),
-        Duration::from_millis(50),
+        TEST_TERMINATION_GRACE,
         CancellationToken::new(),
     )
     .await
@@ -123,7 +125,7 @@ async fn output_limit_reaps_a_process_that_would_otherwise_hang() {
         &env(&fixture, "limit-hang", "limit"),
         11,
         Duration::from_secs(5),
-        Duration::from_millis(50),
+        TEST_TERMINATION_GRACE,
         CancellationToken::new(),
     )
     .await
@@ -152,7 +154,7 @@ async fn cancellation_reaps_the_owned_group() {
         &run_env,
         DEFAULT_MAX_OUTPUT_BYTES,
         Duration::from_secs(5),
-        Duration::from_millis(50),
+        TEST_TERMINATION_GRACE,
         cancel,
     );
     let (result, group) = tokio::join!(run, coordinator);
@@ -190,7 +192,7 @@ async fn cancelling_one_request_does_not_kill_another_group() {
         &env_a,
         DEFAULT_MAX_OUTPUT_BYTES,
         Duration::from_secs(5),
-        Duration::from_millis(50),
+        TEST_TERMINATION_GRACE,
         cancel_a,
     );
     let run_b = run_process_controlled(
@@ -199,7 +201,7 @@ async fn cancelling_one_request_does_not_kill_another_group() {
         &env_b,
         DEFAULT_MAX_OUTPUT_BYTES,
         Duration::from_secs(5),
-        Duration::from_millis(50),
+        TEST_TERMINATION_GRACE,
         cancel_b,
     );
     let (result_a, result_b, group_b) = tokio::join!(run_a, run_b, coordinator);
