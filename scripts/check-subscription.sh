@@ -34,7 +34,9 @@ do
   run cargo test --locked -p idoris-upstream --test "$test"
 done
 
+run cargo test --locked -p idoris-upstream --lib 'subscription::'
 run cargo test --locked -p idoris-router --lib 'connection::tests'
+run cargo test --locked -p idoris-router --lib 'subscription::'
 for test in \
   subscription_card \
   subscription_source \

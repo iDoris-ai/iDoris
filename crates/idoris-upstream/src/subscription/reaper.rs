@@ -240,22 +240,53 @@ mod imp {
     }
 
     fn group_exists(group: Pid) -> Result<bool, SubscriptionRelayError> {
-        match killpg(group, None) {
+        classify_group_probe(killpg(group, None))
+    }
+
+    fn classify_group_probe(result: Result<(), Errno>) -> Result<bool, SubscriptionRelayError> {
+        match result {
             Ok(()) => Ok(true),
             Err(Errno::ESRCH) => Ok(false),
+            // Darwin can transiently report EPERM while the group still has
+            // exiting/zombie members. Treat that as "still alive" and let
+            // the bounded existence checks decide whether cleanup completed.
+            Err(Errno::EPERM) => Ok(true),
             Err(_) => Err(cleanup_error()),
         }
     }
 
     fn signal_group(group: Pid, signal: Signal) -> Result<(), SubscriptionRelayError> {
-        match killpg(group, Some(signal)) {
-            Ok(()) | Err(Errno::ESRCH) => Ok(()),
+        classify_signal_result(killpg(group, Some(signal)))
+    }
+
+    fn classify_signal_result(result: Result<(), Errno>) -> Result<(), SubscriptionRelayError> {
+        match result {
+            Ok(()) | Err(Errno::ESRCH) | Err(Errno::EPERM) => Ok(()),
             Err(_) => Err(cleanup_error()),
         }
     }
 
     fn cleanup_error() -> SubscriptionRelayError {
         SubscriptionRelayError::new(SubscriptionErrorCode::CleanupFailed)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn eperm_probe_is_conservatively_treated_as_existing() {
+            assert!(matches!(classify_group_probe(Err(Errno::EPERM)), Ok(true)));
+            assert!(matches!(classify_group_probe(Err(Errno::ESRCH)), Ok(false)));
+            assert!(classify_group_probe(Err(Errno::EINVAL)).is_err());
+        }
+
+        #[test]
+        fn eperm_signal_defers_failure_to_the_followup_existence_check() {
+            assert!(classify_signal_result(Err(Errno::EPERM)).is_ok());
+            assert!(classify_signal_result(Err(Errno::ESRCH)).is_ok());
+            assert!(classify_signal_result(Err(Errno::EINVAL)).is_err());
+        }
     }
 }
 
