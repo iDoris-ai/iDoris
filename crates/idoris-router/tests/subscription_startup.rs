@@ -6,7 +6,103 @@ use std::fs;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+use idoris_router::subscription::config::{
+    RegistrationAction, SANDBOX_PROFILE_ID, SubscriptionConfig, decide_registration,
+};
+use idoris_router::subscription::runtime::{SubscriptionRuntimeHandle, authorize_subscription};
 use tempfile::TempDir;
+
+fn shipped_subscription_card() -> idoris_contracts::ComponentCard {
+    serde_yaml::from_str(include_str!("../../../config/components/subscription.yaml")).unwrap()
+}
+
+fn config(
+    mode: Option<&str>,
+    enable: Option<&str>,
+    disable: Option<&str>,
+    sandbox: Option<&str>,
+    cli: Option<&str>,
+) -> SubscriptionConfig {
+    SubscriptionConfig::snapshot(mode, enable, disable, sandbox, cli)
+}
+
+#[test]
+fn future_registration_matrix_preserves_org_disable_and_sandbox_precedence() {
+    let ok = Some(SANDBOX_PROFILE_ID);
+    for (cfg, expected) in [
+        (
+            config(None, None, None, None, None),
+            RegistrationAction::Skip,
+        ),
+        (
+            config(Some("personal"), Some("1"), Some("1"), ok, Some("claude")),
+            RegistrationAction::Skip,
+        ),
+        (
+            config(Some("tenant"), Some("1"), Some("1"), ok, Some("claude")),
+            RegistrationAction::Refuse,
+        ),
+        (
+            config(Some("unknown"), Some("1"), None, ok, Some("claude")),
+            RegistrationAction::Refuse,
+        ),
+        (
+            config(Some("personal"), Some("1"), None, None, Some("claude")),
+            RegistrationAction::Refuse,
+        ),
+        (
+            config(Some("personal"), Some("1"), None, ok, Some("unknown-cli")),
+            RegistrationAction::Refuse,
+        ),
+        (
+            config(Some("personal"), Some("1"), None, ok, Some("codex")),
+            RegistrationAction::Register,
+        ),
+    ] {
+        assert_eq!(decide_registration(&cfg).action, expected, "{cfg:?}");
+    }
+}
+
+#[tokio::test]
+async fn test_build_can_construct_the_authorized_success_path_without_spawning() {
+    let card = shipped_subscription_card();
+    let authorized = authorize_subscription(
+        &config(
+            Some("personal"),
+            Some("1"),
+            None,
+            Some(SANDBOX_PROFILE_ID),
+            Some("claude"),
+        ),
+        &card,
+    )
+    .unwrap()
+    .unwrap();
+    let handle = SubscriptionRuntimeHandle::build(authorized, &card).unwrap();
+    assert_eq!(handle.model_id(), "claude-subscription");
+    assert_eq!(handle.service().active_requests().await, 0);
+}
+
+#[test]
+fn factory_revalidation_rejects_a_form_changed_after_authorization() {
+    let card = shipped_subscription_card();
+    let authorized = authorize_subscription(
+        &config(
+            Some("personal"),
+            Some("1"),
+            None,
+            Some(SANDBOX_PROFILE_ID),
+            Some("claude"),
+        ),
+        &card,
+    )
+    .unwrap()
+    .unwrap();
+    let mut impostor = card;
+    impostor.form = idoris_contracts::component_card::Form::HttpService;
+    impostor.endpoint = "http://127.0.0.1:9".into();
+    assert!(SubscriptionRuntimeHandle::build(authorized, &impostor).is_err());
+}
 
 fn assert_subscription_startup_rejected(form: &str, endpoint: &str, env: &[(&str, &str)]) {
     let dir = TempDir::new().unwrap();
@@ -128,4 +224,31 @@ fn subscription_spawn_card_is_rejected_with_kill_switch() {
         "spawn://subscription",
         &[("IDORIS_DISABLE_SUBSCRIPTION", "1")],
     );
+}
+
+#[test]
+fn production_k04_still_rejects_the_shipped_spawn_card_across_env_matrix() {
+    for env in [
+        vec![],
+        vec![("IDORIS_DEPLOY_MODE", "tenant")],
+        vec![("IDORIS_DEPLOY_MODE", "unknown")],
+        vec![
+            ("IDORIS_DEPLOY_MODE", "personal"),
+            ("IDORIS_ENABLE_SUBSCRIPTION", "1"),
+        ],
+        vec![
+            ("IDORIS_DEPLOY_MODE", "personal"),
+            ("IDORIS_ENABLE_SUBSCRIPTION", "1"),
+            ("IDORIS_DISABLE_SUBSCRIPTION", "1"),
+            ("IDORIS_SUBSCRIPTION_SANDBOX", SANDBOX_PROFILE_ID),
+        ],
+        vec![
+            ("IDORIS_DEPLOY_MODE", "personal"),
+            ("IDORIS_ENABLE_SUBSCRIPTION", "1"),
+            ("IDORIS_SUBSCRIPTION_SANDBOX", SANDBOX_PROFILE_ID),
+            ("IDORIS_SUBSCRIPTION_CLI", "claude"),
+        ],
+    ] {
+        assert_subscription_startup_rejected("spawn_cli", "spawn://subscription", &env);
+    }
 }
