@@ -4,6 +4,7 @@
 > 更新时间：2026-09-26
 
 ## 当前聚焦
+- **2026-10-05 / R6**：B1 Rust parity、B2 Rust recommender、B3 subscription relay 已全部完成并 release 到 `main`；Rust 为唯一继续维护的生产实现，TypeScript 仅保留 reference/PoC。R6 本地 release conformance：16 files passed / 1 skipped，134 passed / 8 todo；subscription 安全矩阵与 GitHub Ubuntu/macOS CI 全绿。当前准备 `v0.2.0` 版本切换。
 - **2026-09-27**：进入规划阶段（不开发）。现行规划统筹为 [`../iDoris-总体规划.md`](../iDoris-总体规划.md)（M4–M8 + 轨迹方案 + 管理界面），**待 jason 拍板 §10 后**再按 §7 拆 task。
 - **Milestone**：M1/M2/M3 的 task 全部 `DONE`（38 个），代码已在集成分支
 - **正在开发的 Task**：无

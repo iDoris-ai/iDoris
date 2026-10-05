@@ -24,11 +24,12 @@ def main(archive, expected):
             names = {
                 "idoris",
                 "config/components/omlx.yaml",
+                "config/components/subscription.yaml",
                 "config/routing-policy.yaml",
                 "config/catalog.yaml",
             }
             if {m.name for m in members} != names or any(not m.isfile() for m in members):
-                raise RuntimeError("archive must contain only idoris and the three runtime config files")
+                raise RuntimeError("archive must contain only idoris and the four runtime config files")
             package.extractall(bundle)
         # Refuse an occupied port so another process cannot supply a false green.
         with socket.socket() as probe:

@@ -8,11 +8,9 @@
 # 用法：
 #   bash scripts/conformance-rust.sh
 #
-# 现状（R2-D 把 idoris-policy/idoris-tenancy 接进 idoris-router 之前）：Rust
-# `idoris` 二进制只实现了 GET /health，其余路由一律 501，所以除了 /health 相关
-# 断言之外，conformance 套件里绝大多数用例都会失败——这是当前阶段的预期状态，
-# 不是这个脚本或套件本身的 bug。细节和"怎么解读一次失败的跑批"见
-# docs/rust/conformance.md。
+# R6：Rust `idoris` 是生产候选实现。B1/B2/B3 已补齐 Rust 请求核心、
+# 推荐器与订阅中转；CI 的 rust job 必跑本脚本，shared conformance 失败即阻止
+# 默认实现切换/发版。TS 只保留为参考/PoC，不再承载新的产品能力。
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
