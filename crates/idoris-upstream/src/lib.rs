@@ -24,6 +24,7 @@ pub mod error;
 pub mod factory;
 pub mod omlx;
 pub mod remote;
+pub mod subscription;
 
 pub use chat::{
     ChatChunk, ChatChunkStream, ChatMessage, ChatRequest, ChatResponse, RemoteChat,

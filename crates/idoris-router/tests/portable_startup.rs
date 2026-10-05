@@ -255,7 +255,7 @@ fn missing_or_invalid_bundled_policy_fails_startup() {
 }
 
 #[test]
-fn explicit_missing_paths_do_not_fall_back_and_subscription_remains_rejected() {
+fn explicit_missing_paths_do_not_fall_back() {
     let (_root, cwd, exe, port) = fixture();
     let components = [("IDORIS_COMPONENTS_DIR", "missing-components")];
     failed(
@@ -264,14 +264,6 @@ fn explicit_missing_paths_do_not_fall_back_and_subscription_remains_rejected() {
     );
     let policy = [("IDORIS_ROUTING_POLICY", "missing-policy.yaml")];
     failed(spawn(&exe, cwd.path(), port, &policy), "无法加载路由策略");
-    fs::write(
-        exe.parent()
-            .unwrap()
-            .join("config/components/subscription.yaml"),
-        include_str!("../../../config/components/subscription.yaml"),
-    )
-    .unwrap();
-    failed(spawn(&exe, cwd.path(), port, &[]), "subscription");
 }
 
 #[test]

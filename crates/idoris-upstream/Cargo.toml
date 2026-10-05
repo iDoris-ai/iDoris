@@ -36,6 +36,8 @@ tokio-util = { workspace = true }
 # them (like the TS reference's `encodeURIComponent`) keeps an id with a
 # `/` or space from being misread as a path separator or breaking the URL.
 percent-encoding = "2"
+# Per-request subscription workspaces persist until explicit post-reap cleanup.
+tempfile = "3"
 # Remote (OpenAI/Anthropic-compatible) provider client. License: MIT OR
 # Apache-2.0 (verified against its published Cargo.toml before adding).
 # Pinned to `0.6.5` (latest stable 0.6.x as of writing, not a `0.7.0-betaN`
@@ -47,6 +49,9 @@ percent-encoding = "2"
 # Exact while the workspace patches SSE framing: a routine cargo update
 # must not silently bypass the reviewed fix in vendor/genai.
 genai = "=0.6.5"
+
+[target.'cfg(unix)'.dependencies]
+nix = { workspace = true }
 
 [dev-dependencies]
 # `io-util` (for `AsyncWriteExt`) is test-only: the raw-TCP regression test
