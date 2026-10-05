@@ -178,6 +178,8 @@ pub struct ForwardOutcome {
     pub execution: ExecutionDisposition,
 }
 
+pub(crate) type SuccessFinalizeError = (u16, &'static str, &'static str);
+
 struct Flight {
     fingerprint: [u8; 32],
     outcome: tokio::sync::Mutex<Option<ForwardOutcome>>,
@@ -475,6 +477,20 @@ impl ChatProxy {
         body: &Value,
         opts: &ForwardOpts<'_>,
     ) -> ForwardOutcome {
+        self.forward_buffered_with_success_gate(endpoint, body, opts, |_| Ok(()))
+            .await
+    }
+
+    pub(crate) async fn forward_buffered_with_success_gate<F>(
+        &self,
+        endpoint: &str,
+        body: &Value,
+        opts: &ForwardOpts<'_>,
+        success_gate: F,
+    ) -> ForwardOutcome
+    where
+        F: FnOnce(&ForwardOutcome) -> Result<(), SuccessFinalizeError> + Send,
+    {
         // Every caller, including a cache hit or singleflight waiter, owns a
         // permit until its final outgoing bytes are dropped. Retained results
         // below stay unbound so the registries cannot hold permits indefinitely.
@@ -482,17 +498,23 @@ impl ChatProxy {
             Ok(permit) => permit,
             Err(_) => return Self::failure(503, 0),
         };
-        let mut outcome = self.forward_buffered_inner(endpoint, body, opts).await;
+        let mut outcome = self
+            .forward_buffered_inner(endpoint, body, opts, success_gate)
+            .await;
         outcome.body = with_permit(outcome.body, Arc::new(permit));
         outcome
     }
 
-    async fn forward_buffered_inner(
+    async fn forward_buffered_inner<F>(
         &self,
         endpoint: &str,
         body: &Value,
         opts: &ForwardOpts<'_>,
-    ) -> ForwardOutcome {
+        success_gate: F,
+    ) -> ForwardOutcome
+    where
+        F: FnOnce(&ForwardOutcome) -> Result<(), SuccessFinalizeError> + Send,
+    {
         let mut payload = body.clone();
         if let Some(obj) = payload.as_object_mut() {
             obj.insert("stream".to_string(), Value::Bool(false));
@@ -503,9 +525,10 @@ impl ChatProxy {
         };
         let Some(request_id) = opts.request_id else {
             let mut uncertain = false;
-            return self
+            let outcome = self
                 .forward_once(endpoint, &payload, opts, &fingerprint, &mut uncertain)
                 .await;
+            return Self::finalize_success(outcome, success_gate).0;
         };
         let url = format!("{}/v1/chat/completions", endpoint.trim_end_matches('/'));
         let key = cache_key(
@@ -594,6 +617,26 @@ impl ChatProxy {
         let outcome = self
             .forward_once(endpoint, &payload, opts, &fingerprint, &mut uncertain)
             .await;
+        let (outcome, finalize_failed) = Self::finalize_success(outcome, success_gate);
+        uncertain |= finalize_failed;
+        if !uncertain
+            && (200..300).contains(&outcome.status)
+            && !outcome.cached
+            && outcome.execution == ExecutionDisposition::Executed
+        {
+            self.remember(
+                key.clone(),
+                CacheEntry {
+                    at: Instant::now(),
+                    fingerprint,
+                    status: outcome.status,
+                    // Only outgoing bytes own the permit; cache retention must not.
+                    body: outcome.body.clone(),
+                    record_id: opts.record_id.to_string(),
+                    served_locality: opts.served_locality,
+                },
+            );
+        }
         let mut replay = outcome.clone();
         if (200..300).contains(&replay.status) && !replay.cached {
             replay.cached = true;
@@ -634,6 +677,44 @@ impl ChatProxy {
         }
         *result = Some(replay);
         outcome
+    }
+
+    fn finalize_success<F>(outcome: ForwardOutcome, success_gate: F) -> (ForwardOutcome, bool)
+    where
+        F: FnOnce(&ForwardOutcome) -> Result<(), SuccessFinalizeError>,
+    {
+        if outcome.execution == ExecutionDisposition::Executed
+            && (200..300).contains(&outcome.status)
+            && !outcome.cached
+            && let Err(error) = success_gate(&outcome)
+        {
+            return (Self::success_finalize_failure(error), true);
+        }
+        (outcome, false)
+    }
+
+    fn success_finalize_failure(error: SuccessFinalizeError) -> ForwardOutcome {
+        ForwardOutcome {
+            status: error.0,
+            body: Bytes::from(
+                serde_json::json!({
+                    "error": {
+                        "type": error.1,
+                        "rule_id": null,
+                        "reason_code": error.1,
+                        "evidence": null,
+                        "remediation": error.2,
+                    }
+                })
+                .to_string(),
+            ),
+            content_type: Some("application/json".to_string()),
+            cached: false,
+            origin_record_id: None,
+            replayed_served_locality: None,
+            retries: 0,
+            execution: ExecutionDisposition::Uncertain,
+        }
     }
 
     fn flight_failure(status: u16, kind: &str) -> ForwardOutcome {
@@ -749,28 +830,6 @@ impl ChatProxy {
                             502,
                             "upstream_usage_invalid",
                             ExecutionDisposition::Uncertain,
-                        );
-                    }
-                    // Only a genuinely successful (2xx) call is cached —
-                    // matches TS's own `res.ok` gate on the `remember()`
-                    // call site exactly (a 4xx is never retried above
-                    // either, so "not currently retrying" alone isn't the
-                    // right condition here; a 4xx must still reach this
-                    // point without being cached).
-                    if (200..300).contains(&status)
-                        && let Some(request_id) = opts.request_id
-                    {
-                        self.remember(
-                            cache_key(tenant_scope, &url, opts.provider_id, request_id),
-                            CacheEntry {
-                                at: Instant::now(),
-                                fingerprint: *fingerprint,
-                                status,
-                                // Only outgoing bytes own the permit; cache retention must not.
-                                body: body_bytes.clone(),
-                                record_id: opts.record_id.to_string(),
-                                served_locality: opts.served_locality,
-                            },
                         );
                     }
                     // Redirects, request timeouts, and 5xx responses do not
