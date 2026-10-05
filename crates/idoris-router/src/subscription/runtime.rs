@@ -22,6 +22,7 @@ pub enum SubscriptionRuntimeError {
     WrongProvider { expected: String, actual: String },
     DuplicateProvider(String),
     MissingHandle(String),
+    ProfileMismatch,
 }
 
 impl std::fmt::Display for SubscriptionRuntimeError {
@@ -51,6 +52,9 @@ impl std::fmt::Display for SubscriptionRuntimeError {
                     f,
                     "subscription runtime handle unavailable for provider {provider}"
                 )
+            }
+            Self::ProfileMismatch => {
+                f.write_str("subscription relay config does not match authorized sandbox")
             }
         }
     }
@@ -112,6 +116,7 @@ pub fn authorize_subscription(
 #[derive(Clone)]
 pub struct SubscriptionRuntimeHandle {
     provider_id: String,
+    model_id: &'static str,
     service: SubscriptionService,
 }
 
@@ -119,6 +124,15 @@ impl SubscriptionRuntimeHandle {
     pub fn build(
         authorized: AuthorizedSubscription,
         card: &ComponentCard,
+    ) -> Result<Self, SubscriptionRuntimeError> {
+        let relay_config = SubscriptionRelayConfig::from_process(authorized.profile);
+        Self::build_with_relay_config(authorized, card, relay_config)
+    }
+
+    pub(crate) fn build_with_relay_config(
+        authorized: AuthorizedSubscription,
+        card: &ComponentCard,
+        relay_config: SubscriptionRelayConfig,
     ) -> Result<Self, SubscriptionRuntimeError> {
         if classify_subscription_card(card)? != CardBoundary::Subscription {
             return Err(SubscriptionRuntimeError::Card(
@@ -131,10 +145,17 @@ impl SubscriptionRuntimeHandle {
                 actual: card.provider.id.clone(),
             });
         }
-        let relay =
-            SubscriptionRelay::new(SubscriptionRelayConfig::from_process(authorized.profile));
+        if relay_config.profile != authorized.profile {
+            return Err(SubscriptionRuntimeError::ProfileMismatch);
+        }
+        let model_id = match authorized.profile.cli {
+            UpstreamSubscriptionCli::Claude => "claude-subscription",
+            UpstreamSubscriptionCli::Codex => "codex-subscription",
+        };
+        let relay = SubscriptionRelay::new(relay_config);
         Ok(Self {
             provider_id: card.provider.id.clone(),
+            model_id,
             service: SubscriptionService::new(relay, DEFAULT_SHUTDOWN_WAIT),
         })
     }
@@ -145,6 +166,10 @@ impl SubscriptionRuntimeHandle {
 
     pub fn service(&self) -> &SubscriptionService {
         &self.service
+    }
+
+    pub fn model_id(&self) -> &'static str {
+        self.model_id
     }
 }
 
