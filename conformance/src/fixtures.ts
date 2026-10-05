@@ -11,9 +11,10 @@
  * http_service` 才能真正打一次 HTTP 请求，而不是像仓库里某些单测那样用
  * `mock://` 这种假 scheme（那种只在注入了自定义 fetch 的单测里能用）。
  */
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { copyFileSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { repoRoot } from "./harness.js";
 
 export type ComponentTier = "local" | "remote" | "lora";
 export type ComponentLocality = "loopback" | "lan" | "remote";
@@ -126,4 +127,14 @@ export function remoteComponent(endpoint: string, extra: Partial<ComponentCardSp
     endpoint,
     ...extra,
   };
+}
+
+/** Copy the shipped subscription card into an isolated one-card components directory. */
+export function makeSubscriptionComponentsDir(): string {
+  const dir = mkdtempSync(join(tmpdir(), "idoris-conformance-subscription-"));
+  copyFileSync(
+    join(repoRoot, "config", "components", "subscription.yaml"),
+    join(dir, "subscription.yaml"),
+  );
+  return dir;
 }
