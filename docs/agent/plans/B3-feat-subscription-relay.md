@@ -117,3 +117,86 @@ pnpm lint && pnpm typecheck && pnpm check:contract-drift && pnpm build && pnpm t
 不在B加载大模型；A现有opt-in oMLX测试使用 `IDORIS_OMLX_IT=1 cargo test -p idoris-upstream --test omlx_integration`，联合场景另附可复现配置与HTTP命令。A数据未取得时，只能声明B3独立验收通过，不能声明联合模型/内存验证完成。
 
 本次计划校验记录（2026-10-01）：Rust fmt、带指定features的clippy/test、cargo-deny四项以及全部TS门禁通过；TS conformance为47 passed / 7 todo。cargo-deny有依赖警告但退出0；未改锁文件。仅新增本计划，未改路由行为，因此未追加Rust HTTP conformance；未运行真实订阅或oMLX测试。负责人复核三位gpt-6-luna的证据/任务草稿，并修正任务顺序、符号链接竞态、异常回收和沙箱边界。
+
+## 5. 2026-10-05 release evidence（task28）
+
+### 5.1 task / PR 状态
+
+| task | PR | 状态 | 关键证据 |
+|---|---:|---|---|
+| 01 deps | #254 | merged | 安全 Unix process-group API / non-Unix fail-closed |
+| 02 gate policy | #259 | merged | personal-only、default-off、disable 胜 enable |
+| 03 card boundary | #260 | merged | 固定 subscription + SpawnCli + spawn://subscription |
+| 04 CLI profile | #264 | merged | 固定 Claude/Codex argv、stdin prompt、安全 flag |
+| 05 workspace | #271 | merged | request-private 0555 cwd + 0700 control + 0600 result |
+| 06 diagnostics | #274 | merged | API/AWS + IDORIS_* scrub；错误不带自由文本 |
+| 07 fake CLI | #272 | merged | PID/PGID、hang、TERM-ignore、孙进程、output-file fixture |
+| 08 spawn I/O | #281 | merged | stdout+stderr 共用 256KiB 上限；变异测试承重 |
+| 09 group reaper | #284 | merged | TERM→grace→KILL→wait；future drop 回收 |
+| 10 timeout/cancel | #290 | merged | 120s/5s defaults；pre-cancel/timeout/limit/并发隔离 |
+| 11 output file | #292 | merged | O_NOFOLLOW + same-handle metadata/read；竞态/超限拒绝 |
+| 12 relay API | #293 | merged | stateless relay；固定错误；清理后才删 workspace |
+| 13 source guard | #282 | merged | 真实 loopback peer；无 forwarded-header 提权 |
+| 14 shutdown | #295 | merged | stop-accepting + cancel-all + bounded drain |
+| 15 runtime handle | #301 | merged | typed authorization；重复 provider 不替换旧 handle |
+| 16 dispatch | #302 | merged | policy/privacy/source 后单次 relay；无隐式 fallback/retry |
+| 17 HTTP lifetime | #305 | merged | 真 TCP 断连→request token；keep-alive request token 隔离 |
+| 18 disconnect acceptance | #306 | merged | 真 HTTP 断连回收父孙 PGID + workspace；生产 wiring 变异必红 |
+| 19 HTTP result | #307 | merged | 200/502/403 shape；UTF-16 usage；错误无 stderr/prompt |
+| 20 discovery | #308 | merged | 静态 subscription model；不 spawn、不伪造 local capacity |
+| 21 startup matrix | #309 | merged | deploy/profile/enable/disable/unknown matrix |
+| 22 security acceptance | #310 | merged | env/cwd/argv/local_only/普通 HTTP 正控 |
+| 23 conformance fixture | #311 | merged | 临时 PATH fake CLI；不增加生产 command override |
+| 24 production gates | #312 | merged | 原子替换 K04 总拒绝；授权构造 + shutdown 接线 |
+| 25 shared conformance | #313 | merged | Rust release 二进制全量 conformance：134 passed / 8 todo |
+| 26 Unix CI matrix | #314 | **pending revalidation** | 首轮 macOS 暴露取消清理抖动；#315 正修 EPERM 后重跑 |
+| 27 real CLI smoke | #316 | **review / CI** | Codex 0.156.1 + Claude Code 2.1.289 本机真实 PASS |
+| 28 release evidence | 本 task | in progress | 本节 + acceptance + component 注释 |
+
+**B3 不能在 #314/#315/#316 闭环前声明 complete，也不能开 release PR 到 main。**
+
+### 5.2 现行安全/行为结论
+
+- **实现语言**：Rust 是唯一后续维护实现；TS 仅作 PoC / 参考契约与共同 conformance，不再新增产品能力。
+- **启用条件**：仅 personal 模式、显式 enable、固定 sandbox profile、固定 CLI；disable kill switch 优先。
+- **来源**：首版只接受真实 loopback peer；不信任 Forwarded/X-Forwarded-*；不开放 Tailscale/CGNAT。
+- **隐私**：subscription 永远是 remote；local_only 在 spawn 前拒绝，CLI 调用数必须为 0。
+- **进程**：每请求独立 PGID；取消/超时/输出超限均 TERM→grace→KILL；不承诺约束主动 setsid/setpgid 脱组的恶意后代。
+- **文件系统**：request cwd 仅是合作式 0555 边界；Codex output file 使用 no-follow + same-handle fstat/read；这**不是**完整同 UID OS 沙箱，也不是磁盘配额。
+- **凭据**：移除已知 API/AWS env 以及全部 IDORIS_*；保留 HOME/PATH 以使用 CLI 自己的登录态。不能声称 HOME 凭据隔离或网络目的地隔离。
+- **协议**：subscription 目前非流式；stream=true 仍按已记录兼容策略返回整块 JSON；每请求最多执行一次 CLI，无透明 retry/cache。
+- **usage**：仅估算 token，不能当真实供应商账单。
+- **平台**：本轮生产支持/验收目标是 macOS + Linux；Windows 不在 B3 放开范围。
+
+### 5.3 D-B3 结论（按已实现/已验收行为记录）
+
+| 决策 | release 结论 |
+|---|---|
+| D-B3-1 沙箱边界 | 接受当前显式 best-effort 边界：Claude no-tools + restricted；Codex read-only；不宣称网络/HOME/恶意同UID完全隔离。真实 CLI smoke 必须通过，否则该 CLI 不宣传可用。 |
+| D-B3-2 Tailscale | 首版拒绝；只允许 loopback。未来若开放必须另做可信入口/身份与精确 peer allowlist。 |
+| D-B3-3 kill switch | startup snapshot；`IDORIS_DISABLE_SUBSCRIPTION=1` 胜 enable。不是热切换：操作上必须设置 disable 后优雅重启。 |
+| D-B3-4 stream/error/retry | 非流式整块 JSON；source 403；relay 502 + 固定 RELAY_*；120s timeout / 5s grace；无透明 retry/cache。 |
+| D-B3-5 CLI/platform | 默认 Claude，Codex 显式可选；macOS/Linux。2026-10-05 实测 Codex 0.156.1、Claude Code 2.1.289 通过固定安全 profile。 |
+
+### 5.4 kill switch / 回滚流程
+
+1. 设置 `IDORIS_DISABLE_SUBSCRIPTION=1`（即使 enable 仍存在，disable 优先）。
+2. **优雅重启 iDoris**；运行中环境变量变化不会热更新当前快照。
+3. shutdown 阶段停止接受新的 subscription 请求，取消 active relay，并在有界等待内回收 owned PGID。
+4. 新进程启动后 subscription card 不注册；`/v1/models` 不再出现 subscription model。
+5. 用 local/free HTTP 正控确认能力②/③仍正常；local_only 请求确认 0 CLI spawn。
+6. 若清理未确认，保留受限 workspace / 固定 CleanupFailed 证据，不提前宣称清理成功；人工检查残留 PGID 后再重启。
+
+### 5.5 CLI 升级策略
+
+- 升级 Codex/Claude 后先运行 task27 opt-in smoke；required flags/version profile 不满足即 fail-closed。
+- 禁止因新版本不支持安全 flag 就自动剥 flag 重试。
+- 只有通过 fixed reply、工具/写入诱导、timeout、cancel、PGID cleanup 后，才更新本节记录的支持版本。
+- 真实 smoke 不记录 prompt、stderr、凭据或自由文本。
+
+### 5.6 已知未关闭项
+
+- #314 required macOS matrix 曾在 `subscription_cancel` 出现 `RELAY_CLEANUP_FAILED`；#315 将 `killpg EPERM` 解释为“组仍存在/继续有界确认”而不是立即失败，合并后须在 #314 新 head 重跑 macOS required job。
+- #314 同一次 run 的 B1 `load_fence::ownership_is_exclusive_even_after_marker_clear` 失败是独立既有 flake；不得与 B3 macOS blocker 混为一谈。
+- #305 review 记录：Linux 对 pipelined-bytes + close 的 POLLHUP/POLLIN 行为仍应由 Linux task26/task18 matrix 继续覆盖；不能只用 macOS 结论外推。
+- B3 无 A 机必测前置；若 release 同时宣称与真实 oMLX 大模型并发，则按 §4 另附 A 联合验证，当前不得冒充已完成。
