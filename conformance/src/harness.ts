@@ -9,7 +9,7 @@
  */
 import { spawn, type ChildProcess } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { join } from "node:path";
+import { delimiter, join } from "node:path";
 import { pickPort } from "./port.js";
 
 /** conformance/ 包本身在仓库根下，往上两级就是仓库根。 */
@@ -123,6 +123,8 @@ export interface SpawnOptions {
   routingPolicyPath?: string;
   /** 不传沿用仓库根目录；显式指定可验证被测 CLI 的配置定位行为。 */
   cwd?: string;
+  /** Test-only PATH prefixes (for controlled fake CLIs). Never reaches production code. */
+  pathPrepend?: string[];
   env?: NodeJS.ProcessEnv;
   healthTimeoutMs?: number;
 }
@@ -191,6 +193,9 @@ export async function spawnConformanceServer(opts: SpawnOptions): Promise<Runnin
     IDORIS_PORT: String(port),
     IDORIS_COMPONENTS_DIR: opts.componentsDir,
   };
+  if (opts.pathPrepend !== undefined && opts.pathPrepend.length > 0) {
+    env.PATH = [...opts.pathPrepend, env.PATH ?? ""].filter((part) => part !== "").join(delimiter);
+  }
   // 注意变量名是 IDORIS_ROUTING_POLICY，不是 IDORIS_ROUTING_POLICY_PATH
   // （packages/router/src/serve.ts 的 M1 实现就叫这个名字）。
   if (opts.routingPolicyPath !== undefined) env.IDORIS_ROUTING_POLICY = opts.routingPolicyPath;
