@@ -206,6 +206,9 @@ pub struct AppState {
     /// Tenant-scoped audit/usage record store. Startup installs it together
     /// with `budget_ledger` from the same SQLite path.
     pub record_store: Option<Arc<std::sync::Mutex<idoris_tenancy::store::TenantStore>>>,
+    /// Persistent B6 Event Log capability. This slice only bootstraps and
+    /// carries the handle; request event emission is wired separately.
+    pub event_log: Option<Arc<idoris_tenancy::event_log::EventLogStore>>,
     /// Best-effort audit persistence failures. Audit must not alter the HTTP
     /// result already produced by routing/backend execution.
     pub audit_failures: Arc<AtomicU64>,
@@ -245,6 +248,7 @@ impl std::fmt::Debug for AppState {
                 "record_store",
                 &self.record_store.as_ref().map(|_| "TenantStore { .. }"),
             )
+            .field("event_log", &self.event_log.as_ref().map(|_| "configured"))
             .field(
                 "audit_failures",
                 &self.audit_failures.load(Ordering::Relaxed),
@@ -286,6 +290,7 @@ impl Default for AppState {
             runtimes: runtime::RuntimeRegistry::default(),
             budget_ledger: None,
             record_store: None,
+            event_log: None,
             audit_failures: Arc::new(AtomicU64::new(0)),
             models_health: Arc::new(health::HealthTracker::default()),
             capabilities: None,
@@ -1555,6 +1560,11 @@ mod tests {
         assert_eq!(parse_port(None).unwrap(), DEFAULT_PORT);
         assert_eq!(parse_port(Some("")).unwrap(), DEFAULT_PORT);
         assert_eq!(parse_port(Some("   ")).unwrap(), DEFAULT_PORT);
+    }
+
+    #[test]
+    fn default_app_state_keeps_event_log_unconfigured() {
+        assert!(AppState::default().event_log.is_none());
     }
 
     #[test]

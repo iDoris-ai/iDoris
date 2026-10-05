@@ -146,6 +146,7 @@ async fn run() -> Result<(), String> {
         subscriptions: subscriptions.clone(),
         budget_ledger: Some(persistent.budget),
         record_store: Some(persistent.records),
+        event_log: Some(persistent.event_log),
         ..AppState::default()
     };
 
