@@ -247,11 +247,9 @@ mod imp {
         match result {
             Ok(()) => Ok(true),
             Err(Errno::ESRCH) => Ok(false),
-            // POSIX/macOS/Linux: EPERM means the process group exists but
-            // this process is not currently permitted to signal it. Treat
-            // that as "still alive" and keep waiting/escalating instead of
-            // rewriting a request cancellation into an immediate cleanup
-            // failure.
+            // Darwin can transiently report EPERM while the group still has
+            // exiting/zombie members. Treat that as "still alive" and let
+            // the bounded existence checks decide whether cleanup completed.
             Err(Errno::EPERM) => Ok(true),
             Err(_) => Err(cleanup_error()),
         }
