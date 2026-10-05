@@ -2894,6 +2894,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unknown_price_resident_proxy_is_rejected_at_pricing_before_egress() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        let mut card = resident_component_card("unknown-price", &endpoint);
+        card.provider.cost.input_per_m = f64::NAN;
+        card.provider.cost.output_per_m = 0.0;
+        let app = build_app(AppState {
+            cards: vec![card],
+            ..AppState::default()
+        });
+
+        let response = app
+            .oneshot(post_chat(r#"{"messages":[]}"#, &[]))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let error: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error["error"]["type"], "no_eligible_candidate");
+        assert!(
+            error["error"]["remediation"]
+                .as_str()
+                .is_some_and(|text| text.contains("Pricing"))
+        );
+    }
+
+    #[tokio::test]
     async fn free_proxy_obeys_spend_gate_for_buffered_streaming_and_cached_calls() {
         use idoris_tenancy::budget::SpendGate;
         for stream in [false, true] {
