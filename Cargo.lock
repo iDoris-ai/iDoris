@@ -1159,6 +1159,7 @@ dependencies = [
  "idoris-tenancy",
  "idoris-upstream",
  "indexmap 2.14.2",
+ "nix",
  "reqwest",
  "ring",
  "rusqlite",

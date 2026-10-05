@@ -57,6 +57,9 @@ reqwest = { version = "0.13", default-features = false, features = ["json", "rus
 indexmap = "2"
 ring = "0.17"
 
+[target.'cfg(unix)'.dependencies]
+nix = { workspace = true, features = ["poll"] }
+
 [dev-dependencies]
 async-trait = { workspace = true }
 rusqlite = { workspace = true }
