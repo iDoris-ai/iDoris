@@ -638,7 +638,7 @@ fn extract_messages(object: &serde_json::Map<String, serde_json::Value>) -> Vec<
         .collect()
 }
 
-/// Very rough token estimate (`ceil(chars / 4)`), matching the same
+/// Very rough token estimate (`ceil(UTF-16 code units / 4)`), matching the same
 /// order-of-magnitude heuristic `packages/adapters/subscription/relay.ts`
 /// uses for its own OpenAI-shaped response — a real per-model tokenizer
 /// isn't wired in at this layer. Purely informational (`usage` in the
@@ -647,7 +647,7 @@ fn rough_token_estimate(text: &str) -> u64 {
     if text.is_empty() {
         0
     } else {
-        (text.chars().count() as u64).div_ceil(4).max(1)
+        (text.encode_utf16().count() as u64).div_ceil(4).max(1)
     }
 }
 
