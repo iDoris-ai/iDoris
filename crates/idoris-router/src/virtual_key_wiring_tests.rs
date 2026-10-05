@@ -1,6 +1,7 @@
 #![allow(clippy::unwrap_used)]
 
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -110,6 +111,15 @@ fn state(endpoint: &str, authenticator: Option<auth::VirtualKeyAuthenticator>) -
 async fn json_body(response: Response) -> Value {
     let bytes = response.into_body().collect().await.unwrap().to_bytes();
     serde_json::from_slice(&bytes).unwrap()
+}
+
+fn wall_clock_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis()
+        .try_into()
+        .unwrap()
 }
 
 #[tokio::test]
@@ -227,6 +237,63 @@ async fn all_auth_failures_are_the_same_401_and_never_reach_upstream() {
         assert!(!rendered.contains("poison"));
     }
     blocker.execute_batch("ROLLBACK").unwrap();
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn key_expiring_while_waiting_for_store_lock_is_401_and_never_reaches_upstream() {
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(method("POST"))
+        .respond_with(wiremock::ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let key = MintedVirtualKey::mint();
+    let expires_at_ms = wall_clock_ms() + 500;
+    let (authenticator, store) = memory_auth(
+        &key,
+        &scope(
+            vec![PrivacyClass::LocalOnly],
+            &["fast"],
+            Some(expires_at_ms),
+        ),
+    );
+    let before_lock = Arc::new(tokio::sync::Notify::new());
+    let authenticator = authenticator.notify_before_store_lock(before_lock.clone());
+    let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let held_store = store.clone();
+    let holder = std::thread::spawn(move || {
+        let _guard = held_store.lock().unwrap();
+        locked_tx.send(()).unwrap();
+        release_rx.recv().unwrap();
+    });
+    locked_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    let app = build_app(state(&server.uri(), Some(authenticator)));
+    let request = chat_request(&[("authorization", bearer(&key))]);
+    let task = tokio::spawn(async move { app.oneshot(request).await.unwrap() });
+    tokio::time::timeout(Duration::from_secs(2), before_lock.notified())
+        .await
+        .unwrap();
+    assert!(wall_clock_ms() < expires_at_ms);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while wall_clock_ms() <= expires_at_ms {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .unwrap();
+    release_tx.send(()).unwrap();
+    holder.join().unwrap();
+
+    let response = task.await.unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let body = json_body(response).await;
+    assert_eq!(body["error"]["reason_code"], "VIRTUAL_KEY_UNAUTHORIZED");
+    assert_eq!(
+        body["error"]["remediation"],
+        "virtual key authentication failed"
+    );
     server.verify().await;
 }
 

@@ -84,11 +84,17 @@ pub fn enforce_scope(
 #[derive(Clone)]
 pub struct VirtualKeyAuthenticator {
     store: Arc<Mutex<VirtualKeyStore>>,
+    #[cfg(test)]
+    before_store_lock: Option<Arc<tokio::sync::Notify>>,
 }
 
 impl VirtualKeyAuthenticator {
     pub fn new(store: Arc<Mutex<VirtualKeyStore>>) -> Self {
-        Self { store }
+        Self {
+            store,
+            #[cfg(test)]
+            before_store_lock: None,
+        }
     }
 
     pub async fn authenticate(
@@ -96,16 +102,18 @@ impl VirtualKeyAuthenticator {
         headers: &HeaderMap,
     ) -> Result<AuthenticatedVirtualKey, VirtualKeyAuthError> {
         let secret = bearer_secret(headers)?;
-        let now_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|_| VirtualKeyAuthError::Unavailable)?
-            .as_millis()
-            .try_into()
-            .map_err(|_| VirtualKeyAuthError::Unavailable)?;
         let store = self.store.clone();
-        tokio::task::spawn_blocking(move || authenticate_secret(&store, secret, now_ms))
-            .await
-            .map_err(|_| VirtualKeyAuthError::Unavailable)?
+        #[cfg(test)]
+        let before_store_lock = self.before_store_lock.clone();
+        tokio::task::spawn_blocking(move || {
+            #[cfg(test)]
+            if let Some(notify) = before_store_lock {
+                notify.notify_one();
+            }
+            authenticate_secret(&store, secret)
+        })
+        .await
+        .map_err(|_| VirtualKeyAuthError::Unavailable)?
     }
 
     #[cfg(test)]
@@ -115,20 +123,55 @@ impl VirtualKeyAuthenticator {
         now_ms: i64,
     ) -> Result<AuthenticatedVirtualKey, VirtualKeyAuthError> {
         let secret = bearer_secret(headers)?;
-        authenticate_secret(&self.store, secret, now_ms)
+        authenticate_secret_with_clock(&self.store, secret, || Ok(now_ms))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn notify_before_store_lock(mut self, notify: Arc<tokio::sync::Notify>) -> Self {
+        self.before_store_lock = Some(notify);
+        self
     }
 }
 
 fn authenticate_secret(
     store: &Arc<Mutex<VirtualKeyStore>>,
     secret: VirtualKeySecret,
-    now_ms: i64,
+) -> Result<AuthenticatedVirtualKey, VirtualKeyAuthError> {
+    authenticate_secret_with_clock(store, secret, server_now_ms)
+}
+
+fn authenticate_secret_with_clock(
+    store: &Arc<Mutex<VirtualKeyStore>>,
+    secret: VirtualKeySecret,
+    mut now_ms: impl FnMut() -> Result<i64, VirtualKeyAuthError>,
 ) -> Result<AuthenticatedVirtualKey, VirtualKeyAuthError> {
     let store = store.lock().map_err(|_| VirtualKeyAuthError::Unavailable)?;
-    store
-        .authenticate(&secret, now_ms)
+    let lookup_now = now_ms()?;
+    let identity = store
+        .authenticate(&secret, lookup_now)
         .map_err(|_| VirtualKeyAuthError::Unavailable)?
-        .ok_or(VirtualKeyAuthError::Unauthorized)
+        .ok_or(VirtualKeyAuthError::Unauthorized)?;
+    let decision_now = now_ms()?;
+    if decision_now < lookup_now {
+        return Err(VirtualKeyAuthError::Unavailable);
+    }
+    if identity
+        .scope
+        .expires_at_ms
+        .is_some_and(|expires| expires <= decision_now)
+    {
+        return Err(VirtualKeyAuthError::Unauthorized);
+    }
+    Ok(identity)
+}
+
+fn server_now_ms() -> Result<i64, VirtualKeyAuthError> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| VirtualKeyAuthError::Unavailable)?
+        .as_millis()
+        .try_into()
+        .map_err(|_| VirtualKeyAuthError::Unavailable)
 }
 
 fn bearer_secret(headers: &HeaderMap) -> Result<VirtualKeySecret, VirtualKeyAuthError> {
