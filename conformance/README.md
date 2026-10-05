@@ -95,6 +95,9 @@ IDORIS_CONFORMANCE_ARGV='["/path/to/idoris-router-rs","serve","--flag","value wi
   回报 `loopback`）；在此之前就被拒绝的响应（400/503 等）不带这个头
 - `X-iDoris-Cached` + `X-iDoris-Origin-Record-Id`：同一个 Request-Id 在 60s 窗口内
   第二次命中缓存时才带；首次命中（真实推理）不带
+- 订阅中转（共同黑盒契约）：默认关闭、显式 disable、组织模式硬拒、enable 无 sandbox 硬拒；
+  loopback + 显式 enable 可成功且 `X-iDoris-Served-Locality: remote`；`local_only` 零 CLI spawn；
+  `stream:true` 仍返回整块 OpenAI JSON；完整请求体发送后客户端断开会取消正在运行的 CLI。
 
 ## 暂不覆盖（按上游指令）
 
