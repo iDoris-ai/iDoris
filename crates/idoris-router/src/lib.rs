@@ -1037,7 +1037,7 @@ async fn chat_via_proxy(
     body_value: &serde_json::Value,
     record_id: &str,
 ) -> Response {
-    let _reservation = match dispatch::ReservationGuard::reserve(
+    let mut reservation = match dispatch::ReservationGuard::reserve(
         state.budget_ledger.as_deref(),
         parsed.tenant_id.as_deref(),
         &selected.card.provider.id,
@@ -1056,23 +1056,32 @@ async fn chat_via_proxy(
             );
         }
     };
-    // Direct forwarding has no actual-usage settlement yet. Do not admit
-    // a paid call whose reservation would otherwise be released uncharged.
-    if budget::is_paid(Some(selected.estimated_cost_minor)) {
-        return error_envelope(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "paid_proxy_unavailable",
-            "付费直连尚不支持预算结算，请使用支持结算的后端",
-        );
-    }
+    let is_paid = budget::is_paid(Some(selected.estimated_cost_minor));
     let stream_requested = body_value
         .get("stream")
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
+    // Paid streaming still has no trustworthy terminal usage evidence.
+    if is_paid && stream_requested {
+        return error_envelope(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "paid_proxy_unavailable",
+            "付费流式直连尚不支持可信 usage 结算，请使用非流式请求或支持结算的后端",
+        );
+    }
     if stream_requested {
         return chat_via_proxy_stream(state, selected, body_value).await;
     }
-    chat_via_proxy_buffered(state, selected, headers, parsed, body_value, record_id).await
+    chat_via_proxy_buffered(
+        state,
+        selected,
+        headers,
+        parsed,
+        body_value,
+        record_id,
+        &mut reservation,
+    )
+    .await
 }
 
 /// The streaming half of [`chat_via_proxy`]. Never touches the idempotency
@@ -1153,7 +1162,9 @@ async fn chat_via_proxy_buffered(
     parsed: &ParsedProfile,
     body_value: &serde_json::Value,
     record_id: &str,
+    reservation: &mut dispatch::ReservationGuard<'_>,
 ) -> Response {
+    let is_paid = budget::is_paid(Some(selected.estimated_cost_minor));
     let request_id = headers.get(HEADER_REQUEST_ID).and_then(|v| v.to_str().ok());
     let privacy = parsed.task.privacy.unwrap_or(PrivacyClass::LocalOnly);
     let opts = proxy::ForwardOpts {
@@ -1163,12 +1174,100 @@ async fn chat_via_proxy_buffered(
         provider_id: selected.card.provider.id.as_str(),
         served_locality: selected.served_locality,
         privacy,
-        require_openai_usage: false,
+        require_openai_usage: is_paid,
     };
+    if is_paid {
+        // Once the paid POST is allowed to leave the process, dropping this
+        // future (client disconnect / cancellation) must not silently release
+        // the reservation: execution may already have happened upstream.
+        reservation.retain_on_drop();
+    }
     let outcome = state
         .proxy
         .forward_buffered(&selected.card.endpoint, body_value, &opts)
         .await;
+
+    if is_paid {
+        match outcome.execution {
+            proxy::ExecutionDisposition::NotExecuted | proxy::ExecutionDisposition::Replay => {
+                if reservation.release_now().is_err() {
+                    return error_envelope(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "internal_error",
+                        "付费上游预算预留释放失败",
+                    );
+                }
+            }
+            proxy::ExecutionDisposition::Uncertain => {
+                reservation.retain_until_expiry();
+            }
+            proxy::ExecutionDisposition::Executed => {
+                if !(200..300).contains(&outcome.status) && reservation.release_now().is_err() {
+                    return error_envelope(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "internal_error",
+                        "付费上游预算预留释放失败",
+                    );
+                }
+            }
+        }
+    }
+
+    let paid_usage = if is_paid
+        && outcome.execution == proxy::ExecutionDisposition::Executed
+        && (200..300).contains(&outcome.status)
+    {
+        let usage = match budget::parse_openai_usage(&outcome.body) {
+            Ok(usage) => usage,
+            Err(_) => {
+                reservation.retain_until_expiry();
+                let mut response = error_envelope(
+                    StatusCode::BAD_GATEWAY,
+                    "upstream_usage_invalid",
+                    "付费上游成功响应缺少可验证的 usage 证据",
+                );
+                if let Ok(value) = HeaderValue::from_str(locality_str(selected.served_locality)) {
+                    response.headers_mut().insert(HEADER_SERVED_LOCALITY, value);
+                }
+                return response;
+            }
+        };
+        Some(usage)
+    } else {
+        None
+    };
+    let paid_settlement = if let Some(usage) = paid_usage {
+        let actual = match budget::actual_cost_from_usage(&selected.card.provider.cost, usage) {
+            Ok(actual) => actual,
+            Err(_) => {
+                reservation.retain_until_expiry();
+                return error_envelope(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal_error",
+                    "付费上游 usage 无法转换为安全结算金额",
+                );
+            }
+        };
+        match reservation.settle_replayable(actual) {
+            Ok(Some(charged)) => Some((charged, usage)),
+            Ok(None) => {
+                return error_envelope(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal_error",
+                    "付费上游缺少可结算的预算预留",
+                );
+            }
+            Err(_) => {
+                return error_envelope(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal_error",
+                    "付费上游结算未能确认，请稍后查询预算账本",
+                );
+            }
+        }
+    } else {
+        None
+    };
 
     let status = StatusCode::from_u16(outcome.status).unwrap_or(StatusCode::BAD_GATEWAY);
     let mut response = (status, outcome.body).into_response();
@@ -1202,9 +1301,22 @@ async fn chat_via_proxy_buffered(
             response.headers_mut().insert(HEADER_ORIGIN_RECORD_ID, v);
         }
     } else if status.is_success() {
-        response
-            .extensions_mut()
-            .insert(usage::UsageFact::inference(Some(0)));
+        if let Some((cost_minor, usage)) = paid_settlement {
+            response
+                .extensions_mut()
+                .insert(usage::UsageFact::inference_with_tokens(
+                    Some(cost_minor),
+                    usage.input_tokens,
+                    usage.output_tokens,
+                ));
+            if let Ok(value) = HeaderValue::from_str(&cost_minor.to_string()) {
+                response.headers_mut().insert(HEADER_COST_MINOR, value);
+            }
+        } else {
+            response
+                .extensions_mut()
+                .insert(usage::UsageFact::inference(Some(0)));
+        }
     }
     response
 }
@@ -2407,7 +2519,226 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn paid_proxy_without_settlement_fails_closed_before_forwarding() {
+    async fn paid_buffered_proxy_settles_explicit_usage_and_cache_replay_does_not_charge_twice() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+                "id": "chatcmpl-paid",
+                "choices": [{"message": {"role": "assistant", "content": "ok"}}],
+                "usage": {"prompt_tokens": 7, "completion_tokens": 11, "total_tokens": 18}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let (_dir, ledger) = configured_budget_ledger(1_000_000);
+        let ledger = std::sync::Arc::new(ledger);
+        let mut card = resident_component_card("paid", &server.uri());
+        card.provider.cost = paid_component_card("paid").provider.cost;
+        let app = build_app(AppState {
+            cards: vec![card],
+            budget_ledger: Some(ledger.clone()),
+            ..AppState::default()
+        });
+        let body = r#"{"messages":[]}"#;
+        let first = app
+            .clone()
+            .oneshot(post_chat(body, &[("X-iDoris-Request-Id", "paid-once")]))
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        let charged = first
+            .headers()
+            .get(HEADER_COST_MINOR)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .parse::<i64>()
+            .unwrap();
+        assert!(charged > 0);
+        let settled = ledger.tenant_readview(budget::PERSONAL_TENANT_ID).unwrap();
+        assert_eq!((settled.spent_minor, settled.reserved_minor), (charged, 0));
+
+        let replay = app
+            .oneshot(post_chat(body, &[("X-iDoris-Request-Id", "paid-once")]))
+            .await
+            .unwrap();
+        assert_eq!(replay.status(), StatusCode::OK);
+        assert_eq!(
+            replay.headers().get(HEADER_CACHED).unwrap(),
+            HeaderValue::from_static("true")
+        );
+        assert!(!replay.headers().contains_key(HEADER_COST_MINOR));
+        let after_replay = ledger.tenant_readview(budget::PERSONAL_TENANT_ID).unwrap();
+        assert_eq!(
+            (after_replay.spent_minor, after_replay.reserved_minor),
+            (charged, 0)
+        );
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn paid_buffered_proxy_missing_usage_fails_closed_and_keeps_reservation_held() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(json!({"id": "chatcmpl-no-usage", "choices": []})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let (_dir, ledger) = configured_budget_ledger(1_000_000);
+        let ledger = std::sync::Arc::new(ledger);
+        let mut card = resident_component_card("paid", &server.uri());
+        card.provider.cost = paid_component_card("paid").provider.cost;
+        let app = build_app(AppState {
+            cards: vec![card],
+            budget_ledger: Some(ledger.clone()),
+            ..AppState::default()
+        });
+        let first = app
+            .clone()
+            .oneshot(post_chat(
+                r#"{"messages":[]}"#,
+                &[("X-iDoris-Request-Id", "missing-usage")],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::BAD_GATEWAY);
+        let first_view = ledger.tenant_readview(budget::PERSONAL_TENANT_ID).unwrap();
+        assert_eq!(first_view.spent_minor, 0);
+        assert!(first_view.reserved_minor > 0);
+
+        let replay = app
+            .oneshot(post_chat(
+                r#"{"messages":[]}"#,
+                &[("X-iDoris-Request-Id", "missing-usage")],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(replay.status(), StatusCode::BAD_GATEWAY);
+        let replay_view = ledger.tenant_readview(budget::PERSONAL_TENANT_ID).unwrap();
+        assert_eq!(replay_view.spent_minor, 0);
+        assert_eq!(replay_view.reserved_minor, first_view.reserved_minor);
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn paid_buffered_proxy_connect_failure_releases_the_reservation() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+
+        let (_dir, ledger) = configured_budget_ledger(1_000_000);
+        let ledger = std::sync::Arc::new(ledger);
+        let mut card = resident_component_card("paid", &endpoint);
+        card.provider.cost = paid_component_card("paid").provider.cost;
+        let app = build_app(AppState {
+            cards: vec![card],
+            budget_ledger: Some(ledger.clone()),
+            ..AppState::default()
+        });
+
+        let response = app
+            .oneshot(post_chat(r#"{"messages":[]}"#, &[]))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let view = ledger.tenant_readview(budget::PERSONAL_TENANT_ID).unwrap();
+        assert_eq!((view.spent_minor, view.reserved_minor), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn paid_buffered_proxy_uncertain_500_keeps_only_the_original_reservation() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(500)
+                    .set_body_json(json!({"error": "maybe-executed"})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let (_dir, ledger) = configured_budget_ledger(1_000_000);
+        let ledger = std::sync::Arc::new(ledger);
+        let mut card = resident_component_card("paid", &server.uri());
+        card.provider.cost = paid_component_card("paid").provider.cost;
+        let app = build_app(AppState {
+            cards: vec![card],
+            budget_ledger: Some(ledger.clone()),
+            ..AppState::default()
+        });
+        let request = || {
+            post_chat(
+                r#"{"messages":[]}"#,
+                &[("X-iDoris-Request-Id", "uncertain-500")],
+            )
+        };
+
+        let first = app.clone().oneshot(request()).await.unwrap();
+        assert_eq!(first.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let first_view = ledger.tenant_readview(budget::PERSONAL_TENANT_ID).unwrap();
+        assert_eq!(first_view.spent_minor, 0);
+        assert!(first_view.reserved_minor > 0);
+
+        let replay = app.oneshot(request()).await.unwrap();
+        assert_eq!(replay.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let replay_view = ledger.tenant_readview(budget::PERSONAL_TENANT_ID).unwrap();
+        assert_eq!(replay_view.spent_minor, 0);
+        assert_eq!(replay_view.reserved_minor, first_view.reserved_minor);
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn dropping_paid_buffered_proxy_future_keeps_the_inflight_reservation() {
+        use axum::{Router, extract::State, routing::post};
+        use tokio::sync::Notify;
+
+        async fn hold(State(received): State<std::sync::Arc<Notify>>, body: Bytes) -> &'static str {
+            assert!(!body.is_empty());
+            received.notify_one();
+            std::future::pending::<()>().await;
+            unreachable!()
+        }
+
+        let received = std::sync::Arc::new(Notify::new());
+        let upstream = Router::new()
+            .route("/v1/chat/completions", post(hold))
+            .with_state(received.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, upstream).await.unwrap();
+        });
+
+        let (_dir, ledger) = configured_budget_ledger(1_000_000);
+        let ledger = std::sync::Arc::new(ledger);
+        let mut card = resident_component_card("paid", &endpoint);
+        card.provider.cost = paid_component_card("paid").provider.cost;
+        let app = build_app(AppState {
+            cards: vec![card],
+            budget_ledger: Some(ledger.clone()),
+            ..AppState::default()
+        });
+        let request = post_chat(
+            r#"{"messages":[{"role":"user","content":"paid in flight"}]}"#,
+            &[("X-iDoris-Request-Id", "drop-paid")],
+        );
+        let task = tokio::spawn(async move { app.oneshot(request).await.unwrap() });
+        tokio::time::timeout(std::time::Duration::from_secs(2), received.notified())
+            .await
+            .expect("upstream must receive the complete paid POST");
+        task.abort();
+        let _ = task.await;
+
+        let view = ledger.tenant_readview(budget::PERSONAL_TENANT_ID).unwrap();
+        assert_eq!(view.spent_minor, 0);
+        assert!(view.reserved_minor > 0);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn paid_streaming_proxy_remains_fail_closed_before_forwarding() {
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("POST"))
             .respond_with(wiremock::ResponseTemplate::new(200))
@@ -2423,7 +2754,7 @@ mod tests {
             ..AppState::default()
         });
         let response = app
-            .oneshot(post_chat(r#"{"messages":[]}"#, &[]))
+            .oneshot(post_chat(r#"{"messages":[],"stream":true}"#, &[]))
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
