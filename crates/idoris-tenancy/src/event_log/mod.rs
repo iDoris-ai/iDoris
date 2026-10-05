@@ -5,7 +5,7 @@ use serde_json::Value;
 use thiserror::Error;
 use uuid::Uuid;
 
-const MAX_STRING_BYTES: usize = 500;
+const MAX_STRING_UTF16_UNITS: usize = 500;
 const MAX_ARRAY_ITEMS: usize = 32;
 const SCALAR_KEYS: &str = "component,intent,privacy,tier,provider_id,model_id,tokens_in,tokens_out,cost_minor,latency_ms,status,reason,rule_id,served_locality,degraded,cached,reserved_minor,settled_minor,price_version,rating,outcome,failure_mode,sensitivity,training_eligible";
 const ARRAY_KEYS: &str = "reason_codes,labels";
@@ -187,8 +187,10 @@ fn validate_metadata(metadata: &BTreeMap<String, Value>) -> Result<(), EventLogE
         if key_in(CONTENT_KEYS, key) || !key_in(SCALAR_KEYS, key) && !key_in(ARRAY_KEYS, key) {
             return Err(EventLogError::InvalidMetadata(key.clone()));
         }
-        let valid_string =
-            |text: &str| text.len() <= MAX_STRING_BYTES && !text.chars().any(char::is_control);
+        let valid_string = |text: &str| {
+            text.encode_utf16().count() <= MAX_STRING_UTF16_UNITS
+                && !text.chars().any(char::is_control)
+        };
         if key_in(ARRAY_KEYS, key) {
             let ok = value.as_array().is_some_and(|items| {
                 items.len() <= MAX_ARRAY_ITEMS
@@ -272,8 +274,8 @@ fn migrate(conn: &mut Connection) -> Result<(), EventLogError> {
     if tx.prepare("SELECT sequence,event_id,tenant_id,record_id,event_type,ts_utc_ms,request_id,session_id,trace_id,parent_id,origin_record_id,metadata FROM event_log_events LIMIT 0").is_err() {
         return Err(EventLogError::SchemaIncomplete);
     }
-    let objects: i64 = tx.query_row("SELECT count(*) FROM sqlite_master WHERE (type='table' AND name='event_log_events' AND upper(sql) LIKE '%SEQUENCE INTEGER PRIMARY KEY AUTOINCREMENT%' AND upper(sql) LIKE '%EVENT_ID TEXT NOT NULL UNIQUE%') OR (type='index' AND name='event_log_tenant_record_sequence' AND sql LIKE '%tenant_id, record_id, sequence%') OR (type='trigger' AND name='event_log_no_update' AND upper(sql) LIKE '%BEFORE UPDATE ON EVENT_LOG_EVENTS%' AND upper(sql) LIKE '%RAISE(ABORT%') OR (type='trigger' AND name='event_log_no_delete' AND upper(sql) LIKE '%BEFORE DELETE ON EVENT_LOG_EVENTS%' AND upper(sql) LIKE '%RAISE(ABORT%')", [], |r| r.get(0))?;
-    if objects != 4 {
+    let objects: i64 = tx.query_row("SELECT count(*) FROM sqlite_master WHERE (type='table' AND name='event_log_events' AND upper(sql) LIKE '%SEQUENCE INTEGER PRIMARY KEY AUTOINCREMENT%' AND upper(sql) LIKE '%EVENT_ID TEXT NOT NULL UNIQUE%') OR (type='index' AND name='event_log_tenant_record_sequence' AND sql LIKE '%tenant_id, record_id, sequence%') OR (type='trigger' AND name='event_log_guard_insert' AND upper(sql) LIKE '%BEFORE INSERT ON EVENT_LOG_EVENTS%' AND upper(sql) LIKE '%NEW.SEQUENCE != -1%' AND upper(sql) LIKE '%EVENT_ID = NEW.EVENT_ID%' AND upper(sql) LIKE '%RAISE(ABORT%') OR (type='trigger' AND name='event_log_sequence_positive' AND upper(sql) LIKE '%AFTER INSERT ON EVENT_LOG_EVENTS%' AND upper(sql) LIKE '%NEW.SEQUENCE <= 0%' AND upper(sql) LIKE '%RAISE(ABORT%') OR (type='trigger' AND name='event_log_no_update' AND upper(sql) LIKE '%BEFORE UPDATE ON EVENT_LOG_EVENTS%' AND upper(sql) LIKE '%RAISE(ABORT%') OR (type='trigger' AND name='event_log_no_delete' AND upper(sql) LIKE '%BEFORE DELETE ON EVENT_LOG_EVENTS%' AND upper(sql) LIKE '%RAISE(ABORT%')", [], |r| r.get(0))?;
+    if objects != 6 {
         return Err(EventLogError::SchemaIncomplete);
     }
     tx.commit()?;

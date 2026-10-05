@@ -184,6 +184,79 @@ fn sql_update_and_delete_are_blocked_by_triggers() {
 }
 
 #[test]
+fn raw_second_connection_cannot_replace_event_id_history() {
+    let db = temp_db("replace");
+    let store = EventLogStore::open(&db).unwrap();
+    let event = sample("a", "original");
+    let original_sequence = store.append(Some("a"), &event).unwrap();
+
+    let raw = Connection::open(&db).unwrap();
+    assert_eq!(
+        raw.query_row("PRAGMA recursive_triggers", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        0,
+        "regression must hold even for SQLite's default trigger mode"
+    );
+    let replace = raw.execute(
+        "INSERT OR REPLACE INTO event_log_events(event_id,tenant_id,record_id,event_type,ts_utc_ms,metadata) VALUES (?1,'a','REPLACED','decided',2,'{}')",
+        [&event.event_id],
+    );
+    assert!(
+        replace.is_err(),
+        "INSERT OR REPLACE must not rewrite history"
+    );
+
+    let stored: (i64, String, i64) = raw
+        .query_row(
+            "SELECT sequence,record_id,ts_utc_ms FROM event_log_events WHERE event_id=?1",
+            [&event.event_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        stored,
+        (original_sequence, "original".into(), event.ts_utc_ms)
+    );
+
+    assert_eq!(
+        store.append(Some("a"), &event).unwrap(),
+        original_sequence,
+        "EventLogStore exact retry must remain idempotent"
+    );
+}
+
+#[test]
+fn raw_connection_cannot_forge_sequence_order() {
+    let db = temp_db("sequence-forge");
+    let store = EventLogStore::open(&db).unwrap();
+    let first = sample("a", "first");
+    let first_sequence = store.append(Some("a"), &first).unwrap();
+    let raw = Connection::open(&db).unwrap();
+
+    for sequence in [99_i64, -1] {
+        let event_id = Uuid::new_v4().to_string();
+        let result = raw.execute(
+            "INSERT INTO event_log_events(sequence,event_id,tenant_id,record_id,event_type,ts_utc_ms,metadata) VALUES (?1,?2,'a','forged','decided',2,'{}')",
+            rusqlite::params![sequence, event_id],
+        );
+        assert!(
+            result.is_err(),
+            "explicit sequence {sequence} must be rejected"
+        );
+    }
+
+    let second_sequence = store.append(Some("a"), &sample("a", "second")).unwrap();
+    assert_eq!(first_sequence, 1);
+    assert_eq!(second_sequence, 2);
+    assert_eq!(
+        raw.query_row("SELECT count(*) FROM event_log_events", [], |row| row
+            .get::<_, i64>(0))
+            .unwrap(),
+        2
+    );
+}
+
+#[test]
 fn metadata_whitelist_and_bounds_fail_closed_before_insert() {
     let store = EventLogStore::new(Connection::open_in_memory().unwrap()).unwrap();
     let mut valid = sample("a", "r1");
@@ -198,7 +271,7 @@ fn metadata_whitelist_and_bounds_fail_closed_before_insert() {
         ("unknown_key", json!(true)),
         ("status", json!({"nested": true})),
         ("status", json!("has\ncontrol")),
-        ("status", json!("x".repeat(MAX_STRING_BYTES + 1))),
+        ("status", json!("x".repeat(MAX_STRING_UTF16_UNITS + 1))),
         ("labels", json!([1, 2])),
         (
             "labels",
@@ -224,6 +297,20 @@ fn metadata_whitelist_and_bounds_fail_closed_before_insert() {
             .unwrap()
             .is_empty()
     );
+
+    let mut utf16_ok = sample("a", "utf16-ok");
+    utf16_ok
+        .metadata
+        .insert("status".into(), json!("😀".repeat(250)));
+    store.append(Some("a"), &utf16_ok).unwrap();
+    let mut utf16_too_long = sample("a", "utf16-too-long");
+    utf16_too_long
+        .metadata
+        .insert("status".into(), json!("😀".repeat(251)));
+    assert!(matches!(
+        store.append(Some("a"), &utf16_too_long),
+        Err(EventLogError::InvalidMetadata(_))
+    ));
 }
 
 #[test]
@@ -339,7 +426,7 @@ fn recorded_migration_with_missing_schema_object_fails_at_open() {
     conn.execute_batch(
         "CREATE TABLE event_log_schema_migrations(version INTEGER PRIMARY KEY); \
          INSERT INTO event_log_schema_migrations VALUES(1); \
-         DROP TRIGGER event_log_no_delete;",
+         DROP TRIGGER event_log_guard_insert;",
     )
     .unwrap();
     assert!(matches!(
