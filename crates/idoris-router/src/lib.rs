@@ -100,8 +100,8 @@ use serde_json::json;
 use uuid::Uuid;
 
 use dispatch::{
-    DispatchError, DispatchFailure, Selected, dispatch_local, dispatch_local_preselected,
-    reason_header_value,
+    DispatchError, DispatchFailure, LocalExecutionContext, Selected, dispatch_local,
+    dispatch_local_preselected_observed, reason_header_value,
 };
 use profile::{ParsedProfile, ProfileError, parse_profile};
 
@@ -788,6 +788,7 @@ fn dispatch_failure_response(
     match failure {
         DispatchFailure::Backend(err) => backend_error_response(err, outcome),
         DispatchFailure::Budget(err) => budget_error_response(err, outcome),
+        DispatchFailure::EventLogUnavailable => event_log_unavailable_response(),
     }
 }
 
@@ -990,6 +991,53 @@ async fn append_decided(
     run_event_log_write(move || store.append(Some(&tenant_id), &event).map(|_| ())).await
 }
 
+#[derive(Clone)]
+pub(crate) struct BudgetReservedEventContext {
+    event_log: Arc<idoris_tenancy::event_log::EventLogStore>,
+    tenant_id: String,
+    record_id: String,
+    correlation: correlation::RequestCorrelation,
+}
+
+pub(crate) async fn append_budget_reserved(
+    context: &BudgetReservedEventContext,
+    selected: &Selected,
+) -> Result<(), ()> {
+    if !budget::is_paid(Some(selected.estimated_cost_minor)) {
+        return Ok(());
+    }
+    let mut metadata = std::collections::BTreeMap::new();
+    metadata.insert(
+        "reserved_minor".to_string(),
+        json!(selected.estimated_cost_minor),
+    );
+    metadata.insert(
+        "provider_id".to_string(),
+        json!(selected.card.provider.id.as_str()),
+    );
+    let ts_utc_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_millis()).ok())
+        .ok_or(())?;
+    let event = idoris_tenancy::event_log::NewEvent {
+        event_id: Uuid::new_v4().to_string(),
+        tenant_id: context.tenant_id.clone(),
+        record_id: context.record_id.clone(),
+        event_type: idoris_tenancy::event_log::EventType::BudgetReserved,
+        ts_utc_ms,
+        request_id: None,
+        session_id: context.correlation.session_id.clone(),
+        trace_id: context.correlation.trace_id.clone(),
+        parent_id: context.correlation.parent_id.clone(),
+        origin_record_id: None,
+        metadata,
+    };
+    let store = context.event_log.clone();
+    let tenant_id = context.tenant_id.clone();
+    run_event_log_write(move || store.append(Some(&tenant_id), &event).map(|_| ())).await
+}
+
 /// `POST /v1/chat/completions`. Order (locked by conformance): non-JSON
 /// body -> `invalid_json`; valid JSON that isn't an object -> `invalid_body`;
 /// only then are control-plane headers parsed (see [`profile::parse_profile`]).
@@ -1070,6 +1118,15 @@ async fn chat_completions(
     {
         return event_log_unavailable_response();
     }
+    let budget_event_context =
+        event_context
+            .as_ref()
+            .map(|(event_log, tenant_id)| BudgetReservedEventContext {
+                event_log: event_log.clone(),
+                tenant_id: tenant_id.clone(),
+                record_id: record_id.clone(),
+                correlation: correlation.clone(),
+            });
     let prompt = messages
         .iter()
         .map(|m| m.content.as_str())
@@ -1260,10 +1317,9 @@ async fn chat_completions(
         .and_then(|selected| state.runtimes.get(&selected.card.provider.id));
     let budget_ledger = state.budget_ledger.as_deref();
     let dispatch_result = if let Some(selected) = selected_for_dispatch.as_ref() {
-        dispatch_local_preselected(
+        dispatch_local_preselected_observed(
             selected,
-            supervisor,
-            budget_ledger,
+            LocalExecutionContext::new(supervisor, budget_ledger, budget_event_context.as_ref()),
             &parsed,
             dispatch::DispatchInput::with_model(model, &prompt),
             messages,
@@ -1800,6 +1856,9 @@ mod profiled_wiring_tests;
 
 #[cfg(test)]
 mod decided_wiring_tests;
+
+#[cfg(test)]
+mod budget_reserved_wiring_tests;
 
 #[cfg(test)]
 mod policy_wiring_tests;

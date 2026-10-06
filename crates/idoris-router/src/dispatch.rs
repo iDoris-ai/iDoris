@@ -140,6 +140,7 @@ fn candidate(component: &ComponentCard, prompt: &str) -> Card {
 pub enum DispatchFailure {
     Backend(BackendError),
     Budget(BudgetError),
+    EventLogUnavailable,
 }
 
 /// What [`dispatch_local`] returns on a successful `decide()`.
@@ -366,8 +367,7 @@ pub async fn dispatch_local(
 ) -> Result<ChatOutcome, DispatchError> {
     dispatch_local_inner(
         LocalSelection::Cards(cards),
-        supervisor,
-        budget_ledger,
+        LocalExecutionContext::new(supervisor, budget_ledger, None),
         profile,
         input,
         messages,
@@ -390,14 +390,52 @@ pub async fn dispatch_local_preselected(
 ) -> Result<ChatOutcome, DispatchError> {
     dispatch_local_inner(
         LocalSelection::Preselected(selected),
-        supervisor,
-        budget_ledger,
+        LocalExecutionContext::new(supervisor, budget_ledger, None),
         profile,
         input,
         messages,
         cancel,
     )
     .await
+}
+
+pub(crate) async fn dispatch_local_preselected_observed(
+    selected: &Selected,
+    execution: LocalExecutionContext<'_>,
+    profile: &ParsedProfile,
+    input: DispatchInput<'_>,
+    messages: Vec<ChatMessage>,
+    cancel: CancellationToken,
+) -> Result<ChatOutcome, DispatchError> {
+    dispatch_local_inner(
+        LocalSelection::Preselected(selected),
+        execution,
+        profile,
+        input,
+        messages,
+        cancel,
+    )
+    .await
+}
+
+pub(crate) struct LocalExecutionContext<'a> {
+    supervisor: Option<&'a BoundSupervisor>,
+    budget_ledger: Option<&'a BudgetLedger>,
+    budget_event: Option<&'a crate::BudgetReservedEventContext>,
+}
+
+impl<'a> LocalExecutionContext<'a> {
+    pub(crate) fn new(
+        supervisor: Option<&'a BoundSupervisor>,
+        budget_ledger: Option<&'a BudgetLedger>,
+        budget_event: Option<&'a crate::BudgetReservedEventContext>,
+    ) -> Self {
+        Self {
+            supervisor,
+            budget_ledger,
+            budget_event,
+        }
+    }
 }
 
 enum LocalSelection<'a> {
@@ -407,13 +445,17 @@ enum LocalSelection<'a> {
 
 async fn dispatch_local_inner(
     selection: LocalSelection<'_>,
-    supervisor: Option<&BoundSupervisor>,
-    budget_ledger: Option<&BudgetLedger>,
+    execution: LocalExecutionContext<'_>,
     profile: &ParsedProfile,
     input: DispatchInput<'_>,
     messages: Vec<ChatMessage>,
     cancel: CancellationToken,
 ) -> Result<ChatOutcome, DispatchError> {
+    let LocalExecutionContext {
+        supervisor,
+        budget_ledger,
+        budget_event,
+    } = execution;
     let tenant_id = profile.tenant_id.as_deref();
     let prompt = input.prompt;
     let requested_model = input.requested_model;
@@ -465,6 +507,19 @@ async fn dispatch_local_inner(
             });
         }
     };
+    if is_paid
+        && let Some(context) = budget_event
+        && crate::append_budget_reserved(context, selected)
+            .await
+            .is_err()
+    {
+        return Ok(ChatOutcome {
+            decision,
+            served_locality,
+            result: Err(DispatchFailure::EventLogUnavailable),
+            actual_cost_minor: None,
+        });
+    }
     // From here on, `reservation_guard`'s Drop releases the reservation on
     // any early return *and* on this future being dropped mid-`.await`
     // (client disconnect) — see its doc. Only the success path below
