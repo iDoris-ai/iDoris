@@ -19,14 +19,12 @@ export const repoRoot: string = fileURLToPath(new URL("../..", import.meta.url))
 
 export const routingPolicyFixturePath: string = join(repoRoot, "conformance", "fixtures", "routing-policy.yaml");
 
-const RUST_CONFORMANCE_KEY =
-  "idk_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const nativeFetch = globalThis.fetch.bind(globalThis);
+const rustAuthorizationByOrigin = new Map<string, string>();
 
-export function conformanceAuthorizationHeader(): string | undefined {
-  return process.env.IDORIS_CONFORMANCE_IMPLEMENTATION === "rust"
-    ? `Bearer ${RUST_CONFORMANCE_KEY}`
-    : undefined;
+export function conformanceAuthorizationHeader(baseUrl: string): string | undefined {
+  if (process.env.IDORIS_CONFORMANCE_IMPLEMENTATION !== "rust") return undefined;
+  return rustAuthorizationByOrigin.get(new URL(baseUrl).origin);
 }
 
 if (process.env.IDORIS_CONFORMANCE_IMPLEMENTATION === "rust") {
@@ -38,7 +36,7 @@ if (process.env.IDORIS_CONFORMANCE_IMPLEMENTATION === "rust") {
         new Headers(init.headers).forEach((value, key) => headers.set(key, value));
       }
       if (!headers.has("authorization")) {
-        const authorization = conformanceAuthorizationHeader();
+        const authorization = rustAuthorizationByOrigin.get(url.origin);
         if (authorization !== undefined) headers.set("authorization", authorization);
       }
       return nativeFetch(input, { ...init, headers });
@@ -210,6 +208,8 @@ export async function spawnConformanceServer(opts: SpawnOptions): Promise<Runnin
 
   let rustStateDir: string | undefined;
   let rustDbPath: string | undefined;
+  let rustAuthorization: string | undefined;
+  let rustOrigin: string | undefined;
   if (process.env.IDORIS_CONFORMANCE_IMPLEMENTATION === "rust") {
     const seeder = process.env.IDORIS_CONFORMANCE_KEY_SEEDER;
     if (seeder === undefined || seeder.trim() === "") {
@@ -225,6 +225,12 @@ export async function spawnConformanceServer(opts: SpawnOptions): Promise<Runnin
           (seeded.error?.message ?? (seeded.stderr.trim() || `exit ${String(seeded.status)}`)),
       );
     }
+    const secret = seeded.stdout.trim();
+    if (!/^idk_[0-9a-f]{64}$/.test(secret) || secret.includes("\n")) {
+      rmSync(rustStateDir, { recursive: true, force: true });
+      throw new Error("Rust conformance key seeder returned an invalid secret");
+    }
+    rustAuthorization = `Bearer ${secret}`;
   }
 
   const env: NodeJS.ProcessEnv = {
@@ -279,6 +285,7 @@ export async function spawnConformanceServer(opts: SpawnOptions): Promise<Runnin
   // 进程表占满。
   const killAndThrow = (kind: ConformanceStartupFailureKind, exitCode: number | null, message: string): never => {
     killTree(child, "SIGKILL");
+    if (rustOrigin !== undefined) rustAuthorizationByOrigin.delete(rustOrigin);
     if (rustStateDir !== undefined) rmSync(rustStateDir, { recursive: true, force: true });
     throw new ConformanceStartupError(
       kind,
@@ -288,6 +295,10 @@ export async function spawnConformanceServer(opts: SpawnOptions): Promise<Runnin
   };
 
   const baseUrl = "http://127.0.0.1:" + String(port);
+  if (rustAuthorization !== undefined) {
+    rustOrigin = new URL(baseUrl).origin;
+    rustAuthorizationByOrigin.set(rustOrigin, rustAuthorization);
+  }
   const deadline = Date.now() + (opts.healthTimeoutMs ?? 15_000);
   for (;;) {
     if (spawnError !== undefined) {
@@ -331,6 +342,7 @@ export async function spawnConformanceServer(opts: SpawnOptions): Promise<Runnin
           });
         }
       } finally {
+        if (rustOrigin !== undefined) rustAuthorizationByOrigin.delete(rustOrigin);
         if (rustStateDir !== undefined) {
           rmSync(rustStateDir, { recursive: true, force: true });
         }

@@ -42,7 +42,7 @@ function rawRequest(
   return new Promise((resolve, reject) => {
     const target = new URL(server.baseUrl);
     const requestHeaders: OutgoingHttpHeaders = { ...headers };
-    const authorization = conformanceAuthorizationHeader();
+    const authorization = conformanceAuthorizationHeader(server.baseUrl);
     if (path === "/v1/chat/completions" && authorization !== undefined && requestHeaders.authorization === undefined) {
       requestHeaders.authorization = authorization;
     }

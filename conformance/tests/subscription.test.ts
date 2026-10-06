@@ -170,16 +170,19 @@ it("closing the HTTP socket after full request body cancels the running subscrip
     socket.once("error", reject);
   });
   socket.write(
-    "POST /v1/chat/completions HTTP/1.1\r\n" +
-      "Host: localhost\r\n" +
-      "Content-Type: application/json\r\n" +
-      (conformanceAuthorizationHeader() === undefined
-        ? ""
-        : "Authorization: " + conformanceAuthorizationHeader() + "\r\n") +
-      "X-iDoris-Privacy: any\r\n" +
-      "X-iDoris-Complexity: complex\r\n" +
-      "Content-Length: " + String(Buffer.byteLength(body)) + "\r\n\r\n" +
-      body,
+    (() => {
+      const authorization = conformanceAuthorizationHeader(server.baseUrl);
+      return (
+        "POST /v1/chat/completions HTTP/1.1\r\n" +
+        "Host: localhost\r\n" +
+        "Content-Type: application/json\r\n" +
+        (authorization === undefined ? "" : "Authorization: " + authorization + "\r\n") +
+        "X-iDoris-Privacy: any\r\n" +
+        "X-iDoris-Complexity: complex\r\n" +
+        "Content-Length: " + String(Buffer.byteLength(body)) + "\r\n\r\n" +
+        body
+      );
+    })(),
   );
   await waitForMarker(fixture, /^spawn:/m);
   socket.destroy();

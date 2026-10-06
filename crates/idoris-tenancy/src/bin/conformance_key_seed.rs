@@ -7,10 +7,8 @@
 use std::path::PathBuf;
 
 use idoris_contracts::common::PrivacyClass;
-use idoris_tenancy::virtual_key::VirtualKeySecret;
+use idoris_tenancy::virtual_key::MintedVirtualKey;
 use idoris_tenancy::virtual_key::store::{VirtualKeyScope, VirtualKeyStore};
-
-const TEST_KEY: &str = "idk_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args_os().skip(1);
@@ -19,14 +17,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("expected exactly one database path".into());
     }
 
-    let secret = VirtualKeySecret::parse(TEST_KEY)?;
+    let minted = MintedVirtualKey::mint();
     let store = VirtualKeyStore::open(&db_path)?;
-    if store.authenticate(&secret, 0)?.is_some() {
-        return Ok(());
-    }
     store.insert_active(
-        "vk_conformance",
-        secret.hash(),
+        &minted.key_id,
+        minted.hash,
         &VirtualKeyScope {
             owner: "conformance".into(),
             allowed_privacy: vec![PrivacyClass::LocalOnly, PrivacyClass::Any],
@@ -41,5 +36,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             admin_scopes: Vec::new(),
         },
     )?;
+    println!("{}", minted.secret.expose_secret());
     Ok(())
 }
