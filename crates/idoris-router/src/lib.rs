@@ -978,9 +978,9 @@ async fn chat_completions(
         .collect::<Vec<_>>()
         .join("\n");
 
-    let (cards, fail_closed) = dispatch::policy_cards(&state.cards, &state.routing_policy, &parsed);
-    if cards.is_empty() {
-        return if fail_closed {
+    let policy_cards = dispatch::policy_cards(&state.cards, &state.routing_policy, &parsed);
+    if policy_cards.cards.is_empty() {
+        return if policy_cards.route.fail_closed {
             rejection_response(idoris_policy::Rejection::LocalOnlyUnavailable)
         } else {
             error_envelope(
@@ -997,7 +997,7 @@ async fn chat_completions(
     // Supervisor, which only makes sense for a real oMLX-shaped backend
     // with an explicit load/unload lifecycle. See dispatch::select's doc
     // for the accepted double-decide() tradeoff this branch makes.
-    if let Ok(selected) = dispatch::select(&cards, &parsed, &prompt) {
+    if let Ok(selected) = dispatch::select(&policy_cards.cards, &parsed, &prompt) {
         // A present model field must be a non-empty string before any
         // selected backend can execute. Keep selection first so the
         // established error still carries the selected locality/reasons.
@@ -1111,7 +1111,7 @@ async fn chat_completions(
     // The request token is a fresh child of this TCP connection's lifetime.
     // Completing the request body does not cancel it; EOF/reset/shutdown of
     // the actual connection does.
-    let selected_for_dispatch = dispatch::select(&cards, &parsed, &prompt).ok();
+    let selected_for_dispatch = dispatch::select(&policy_cards.cards, &parsed, &prompt).ok();
     let selected_estimated_cost = selected_for_dispatch
         .as_ref()
         .map(|selected| selected.estimated_cost_minor);
@@ -1120,7 +1120,7 @@ async fn chat_completions(
         .and_then(|selected| state.runtimes.get(&selected.card.provider.id));
     let budget_ledger = state.budget_ledger.as_deref();
     match dispatch_local(
-        &cards,
+        &policy_cards.cards,
         supervisor,
         budget_ledger,
         &parsed,
