@@ -828,7 +828,7 @@ async fn append_request_received(
     store: Arc<idoris_tenancy::event_log::EventLogStore>,
     tenant_id: String,
     record_id: String,
-    correlation: correlation::RequestCorrelation,
+    correlation: &correlation::RequestCorrelation,
 ) -> Result<(), ()> {
     let ts_utc_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -842,11 +842,52 @@ async fn append_request_received(
         event_type: idoris_tenancy::event_log::EventType::RequestReceived,
         ts_utc_ms,
         request_id: None,
-        session_id: correlation.session_id,
-        trace_id: correlation.trace_id,
-        parent_id: correlation.parent_id,
+        session_id: correlation.session_id.clone(),
+        trace_id: correlation.trace_id.clone(),
+        parent_id: correlation.parent_id.clone(),
         origin_record_id: None,
         metadata: Default::default(),
+    };
+    run_event_log_write(move || store.append(Some(&tenant_id), &event).map(|_| ())).await
+}
+
+async fn append_profiled(
+    store: Arc<idoris_tenancy::event_log::EventLogStore>,
+    tenant_id: String,
+    record_id: String,
+    correlation: &correlation::RequestCorrelation,
+    parsed: &ParsedProfile,
+) -> Result<(), ()> {
+    let privacy = match parsed
+        .task
+        .privacy
+        .unwrap_or(idoris_contracts::common::PrivacyClass::LocalOnly)
+    {
+        idoris_contracts::common::PrivacyClass::LocalOnly => "local_only",
+        idoris_contracts::common::PrivacyClass::Any => "any",
+    };
+    let mut metadata = std::collections::BTreeMap::new();
+    metadata.insert("privacy".to_string(), json!(privacy));
+    if let Some(intent) = parsed.task.intent.as_deref() {
+        metadata.insert("intent".to_string(), json!(intent));
+    }
+    let ts_utc_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_millis()).ok())
+        .ok_or(())?;
+    let event = idoris_tenancy::event_log::NewEvent {
+        event_id: Uuid::new_v4().to_string(),
+        tenant_id: tenant_id.clone(),
+        record_id,
+        event_type: idoris_tenancy::event_log::EventType::Profiled,
+        ts_utc_ms,
+        request_id: None,
+        session_id: correlation.session_id.clone(),
+        trace_id: correlation.trace_id.clone(),
+        parent_id: correlation.parent_id.clone(),
+        origin_record_id: None,
+        metadata,
     };
     run_event_log_write(move || store.append(Some(&tenant_id), &event).map(|_| ())).await
 }
@@ -892,7 +933,7 @@ async fn chat_completions(
         Ok(context) => context,
         Err(error) => return correlation_error_response(error),
     };
-    if let Some(event_log) = state.event_log.clone() {
+    let event_context = if let Some(event_log) = state.event_log.clone() {
         let tenant_id = match state.deploy_mode {
             idoris_contracts::DeployMode::Personal => budget::PERSONAL_TENANT_ID.to_string(),
             idoris_contracts::DeployMode::Tenant => match parsed.tenant_id.clone() {
@@ -900,16 +941,37 @@ async fn chat_completions(
                 None => return event_log_unavailable_response(),
             },
         };
-        if append_request_received(event_log, tenant_id, record_id.clone(), correlation)
-            .await
-            .is_err()
+        if append_request_received(
+            event_log.clone(),
+            tenant_id.clone(),
+            record_id.clone(),
+            &correlation,
+        )
+        .await
+        .is_err()
         {
             return event_log_unavailable_response();
         }
-    }
+        Some((event_log, tenant_id))
+    } else {
+        None
+    };
 
     let messages = extract_messages(object);
     let parsed = intent::resolve_profile(parsed, &messages).await;
+    if let Some((event_log, tenant_id)) = event_context
+        && append_profiled(
+            event_log,
+            tenant_id,
+            record_id.clone(),
+            &correlation,
+            &parsed,
+        )
+        .await
+        .is_err()
+    {
+        return event_log_unavailable_response();
+    }
     let prompt = messages
         .iter()
         .map(|m| m.content.as_str())
@@ -1579,6 +1641,9 @@ mod correlation_wiring_tests;
 
 #[cfg(test)]
 mod request_received_wiring_tests;
+
+#[cfg(test)]
+mod profiled_wiring_tests;
 
 #[cfg(test)]
 mod policy_wiring_tests;
