@@ -365,8 +365,7 @@ pub async fn dispatch_local(
     cancel: CancellationToken,
 ) -> Result<ChatOutcome, DispatchError> {
     dispatch_local_inner(
-        cards,
-        None,
+        LocalSelection::Cards(cards),
         supervisor,
         budget_ledger,
         profile,
@@ -390,8 +389,7 @@ pub async fn dispatch_local_preselected(
     cancel: CancellationToken,
 ) -> Result<ChatOutcome, DispatchError> {
     dispatch_local_inner(
-        &[],
-        Some(selected),
+        LocalSelection::Preselected(selected),
         supervisor,
         budget_ledger,
         profile,
@@ -402,9 +400,13 @@ pub async fn dispatch_local_preselected(
     .await
 }
 
+enum LocalSelection<'a> {
+    Cards(&'a [ComponentCard]),
+    Preselected(&'a Selected),
+}
+
 async fn dispatch_local_inner(
-    cards: &[ComponentCard],
-    preselected: Option<&Selected>,
+    selection: LocalSelection<'_>,
     supervisor: Option<&BoundSupervisor>,
     budget_ledger: Option<&BudgetLedger>,
     profile: &ParsedProfile,
@@ -417,11 +419,12 @@ async fn dispatch_local_inner(
     let requested_model = input.requested_model;
 
     let selected_owned;
-    let selected = if let Some(selected) = preselected {
-        selected
-    } else {
-        selected_owned = select(cards, profile, prompt)?;
-        &selected_owned
+    let selected = match selection {
+        LocalSelection::Preselected(selected) => selected,
+        LocalSelection::Cards(cards) => {
+            selected_owned = select(cards, profile, prompt)?;
+            &selected_owned
+        }
     };
     let decision = selected.decision.clone();
     let served_locality = selected.served_locality;
