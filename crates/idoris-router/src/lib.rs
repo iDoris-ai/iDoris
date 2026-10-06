@@ -1145,7 +1145,7 @@ async fn chat_completions(
                 .privacy
                 .unwrap_or(idoris_contracts::common::PrivacyClass::LocalOnly);
             return match subscription::dispatch::dispatch_selected(
-                &selected,
+                selected,
                 privacy,
                 lifecycle.peer(),
                 &state.subscriptions,
@@ -1190,7 +1190,7 @@ async fn chat_completions(
             };
         }
         if dispatch::is_resident_http_service(&selected.card) {
-            return chat_via_proxy(&state, &selected, &headers, &parsed, &value, &record_id).await;
+            return chat_via_proxy(&state, selected, &headers, &parsed, &value, &record_id).await;
         }
         if let Err(message) = supervisor_stream::validate(object) {
             let mut response = error_envelope_with_reason(
