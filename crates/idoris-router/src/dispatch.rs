@@ -786,6 +786,34 @@ routing_policy:
     }
 
     #[tokio::test]
+    async fn preselected_dispatch_does_not_decide_again() {
+        let card = local_card("a");
+        let profile = empty_profile();
+        let selected = select(std::slice::from_ref(&card), &profile, "").unwrap();
+        let outcome = dispatch_local_preselected(
+            &[],
+            &selected,
+            None,
+            None,
+            &profile,
+            DispatchInput::new(""),
+            Vec::new(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome.decision, selected.decision);
+        assert_eq!(outcome.served_locality, selected.served_locality);
+        match outcome.result.unwrap_err() {
+            DispatchFailure::Backend(err) => {
+                assert_eq!(err.reason_code(), "supervisor_unavailable")
+            }
+            other => panic!("expected Backend(supervisor_unavailable), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn no_cards_rejects_as_local_only_unavailable() {
         let err = dispatch_local(
             &[],
