@@ -99,7 +99,10 @@ use serde::Serialize;
 use serde_json::json;
 use uuid::Uuid;
 
-use dispatch::{DispatchError, DispatchFailure, Selected, dispatch_local, reason_header_value};
+use dispatch::{
+    DispatchError, DispatchFailure, Selected, dispatch_local, dispatch_local_preselected,
+    reason_header_value,
+};
 use profile::{ParsedProfile, ProfileError, parse_profile};
 
 const HEADER_SERVED_LOCALITY: &str = "X-iDoris-Served-Locality";
@@ -1258,17 +1261,31 @@ async fn chat_completions(
         .as_ref()
         .and_then(|selected| state.runtimes.get(&selected.card.provider.id));
     let budget_ledger = state.budget_ledger.as_deref();
-    match dispatch_local(
-        &policy_cards.cards,
-        supervisor,
-        budget_ledger,
-        &parsed,
-        dispatch::DispatchInput::with_model(model, &prompt),
-        messages,
-        lifecycle.cancellation_token(),
-    )
-    .await
-    {
+    let dispatch_result = if let Some(selected) = selected_for_dispatch.as_ref() {
+        dispatch_local_preselected(
+            &policy_cards.cards,
+            selected,
+            supervisor,
+            budget_ledger,
+            &parsed,
+            dispatch::DispatchInput::with_model(model, &prompt),
+            messages,
+            lifecycle.cancellation_token(),
+        )
+        .await
+    } else {
+        dispatch_local(
+            &policy_cards.cards,
+            supervisor,
+            budget_ledger,
+            &parsed,
+            dispatch::DispatchInput::with_model(model, &prompt),
+            messages,
+            lifecycle.cancellation_token(),
+        )
+        .await
+    };
+    match dispatch_result {
         Err(DispatchError::Rejection(rejection)) => rejection_response(rejection),
         Err(DispatchError::Internal(message)) => {
             error_envelope(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", message)
