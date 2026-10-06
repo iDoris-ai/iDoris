@@ -491,7 +491,7 @@ fn main_migration_trigger_is_rejected_before_marker_insert_can_forge_event() {
         .unwrap();
     conn.execute_batch(
         "CREATE TABLE event_log_schema_migrations(version INTEGER PRIMARY KEY); \
-         CREATE TRIGGER forge_on_migration AFTER INSERT ON event_log_schema_migrations BEGIN \
+         CREATE TRIGGER forge_on_migration AFTER INSERT ON EVENT_LOG_SCHEMA_MIGRATIONS BEGIN \
            INSERT INTO event_log_events(event_id,tenant_id,record_id,event_type,ts_utc_ms,metadata) \
            VALUES('00000000-0000-4000-8000-000000000001','attacker','forged','decided',0,'{}'); \
          END;",
@@ -522,7 +522,7 @@ fn temp_migration_trigger_is_rejected_before_marker_insert_can_forge_event() {
         .unwrap();
     conn.execute_batch(
         "CREATE TABLE event_log_schema_migrations(version INTEGER PRIMARY KEY); \
-         CREATE TEMP TRIGGER forge_on_migration AFTER INSERT ON main.event_log_schema_migrations BEGIN \
+         CREATE TEMP TRIGGER forge_on_migration AFTER INSERT ON main.Event_Log_Schema_Migrations BEGIN \
            INSERT INTO event_log_events(event_id,tenant_id,record_id,event_type,ts_utc_ms,metadata) \
            VALUES('00000000-0000-4000-8000-000000000002','attacker','forged','decided',0,'{}'); \
          END;",
@@ -542,6 +542,70 @@ fn temp_migration_trigger_is_rejected_before_marker_insert_can_forge_event() {
             .unwrap(),
         0,
         "TEMP migration trigger must be rejected before version insertion can fire it"
+    );
+}
+
+#[test]
+fn mixed_case_event_trigger_is_rejected_before_probe_can_forge_history() {
+    let db = temp_db("mixed-case-event-trigger");
+    let conn = Connection::open(&db).unwrap();
+    conn.execute_batch(include_str!("migrations/0001_events.sql"))
+        .unwrap();
+    conn.execute_batch(
+        "CREATE TABLE event_log_schema_migrations(version INTEGER PRIMARY KEY); \
+         INSERT INTO event_log_schema_migrations(version) VALUES(1); \
+         CREATE TRIGGER forge_on_event AFTER INSERT ON Event_Log_Events BEGIN \
+           INSERT INTO event_log_events(event_id,tenant_id,record_id,event_type,ts_utc_ms,metadata) \
+           VALUES('00000000-0000-4000-8000-000000000003','attacker','forged','decided',0,'{}'); \
+         END;",
+    )
+    .unwrap();
+
+    assert!(matches!(
+        EventLogStore::new(conn),
+        Err(EventLogError::SchemaIncomplete)
+    ));
+    let check = Connection::open(&db).unwrap();
+    assert_eq!(
+        check
+            .query_row("SELECT count(*) FROM event_log_events", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+        0,
+        "case-variant event trigger must be rejected before the schema probe can fire it"
+    );
+}
+
+#[test]
+fn temp_mixed_case_event_trigger_is_rejected_before_probe_can_forge_history() {
+    let db = temp_db("temp-mixed-case-event-trigger");
+    let conn = Connection::open(&db).unwrap();
+    conn.execute_batch(include_str!("migrations/0001_events.sql"))
+        .unwrap();
+    conn.execute_batch(
+        "CREATE TABLE event_log_schema_migrations(version INTEGER PRIMARY KEY); \
+         INSERT INTO event_log_schema_migrations(version) VALUES(1); \
+         CREATE TEMP TRIGGER forge_on_event AFTER INSERT ON main.Event_Log_Events BEGIN \
+           INSERT INTO event_log_events(event_id,tenant_id,record_id,event_type,ts_utc_ms,metadata) \
+           VALUES('00000000-0000-4000-8000-000000000004','attacker','forged','decided',0,'{}'); \
+         END;",
+    )
+    .unwrap();
+
+    assert!(matches!(
+        EventLogStore::new(conn),
+        Err(EventLogError::SchemaIncomplete)
+    ));
+    let check = Connection::open(&db).unwrap();
+    assert_eq!(
+        check
+            .query_row("SELECT count(*) FROM event_log_events", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+        0,
+        "TEMP case-variant event trigger must be rejected before the schema probe can fire it"
     );
 }
 

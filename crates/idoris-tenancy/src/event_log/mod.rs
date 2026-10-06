@@ -262,8 +262,8 @@ fn load_by_id(conn: &Connection, event_id: &str) -> Result<Option<EventLogEvent>
 fn schema_objects(conn: &Connection) -> Result<Vec<(String, String, String)>, EventLogError> {
     let mut stmt = conn.prepare(
         "SELECT type,name,sql FROM main.sqlite_master \
-         WHERE sql IS NOT NULL AND (name='event_log_schema_migrations' \
-         OR tbl_name IN ('event_log_events','event_log_schema_migrations')) \
+         WHERE sql IS NOT NULL AND (lower(name)='event_log_schema_migrations' \
+         OR lower(tbl_name) IN ('event_log_events','event_log_schema_migrations')) \
          AND type IN ('table','index','trigger') ORDER BY type,name",
     )?;
     let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
@@ -275,8 +275,8 @@ fn migration_schema_objects(
 ) -> Result<Vec<(String, String, String)>, EventLogError> {
     let mut stmt = conn.prepare(
         "SELECT type,name,sql FROM main.sqlite_master \
-         WHERE sql IS NOT NULL AND (name='event_log_schema_migrations' \
-         OR tbl_name='event_log_schema_migrations') \
+         WHERE sql IS NOT NULL AND (lower(name)='event_log_schema_migrations' \
+         OR lower(tbl_name)='event_log_schema_migrations') \
          AND type IN ('table','index','trigger') ORDER BY type,name",
     )?;
     let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
@@ -309,8 +309,8 @@ fn verify_canonical_schema(conn: &Connection) -> Result<(), EventLogError> {
 fn reject_temp_event_log_objects(conn: &Connection) -> Result<(), EventLogError> {
     let objects: i64 = conn.query_row(
         "SELECT count(*) FROM sqlite_temp_master \
-         WHERE name IN ('event_log_events','event_log_schema_migrations') \
-         OR tbl_name IN ('event_log_events','event_log_schema_migrations')",
+         WHERE lower(name) IN ('event_log_events','event_log_schema_migrations') \
+         OR lower(tbl_name) IN ('event_log_events','event_log_schema_migrations')",
         [],
         |row| row.get(0),
     )?;
