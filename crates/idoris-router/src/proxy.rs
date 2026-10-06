@@ -158,6 +158,11 @@ impl BufferedUpstreamPath {
         path: "/v1/chat/completions",
         force_non_stream: true,
     };
+
+    pub(crate) const EMBEDDINGS: Self = Self {
+        path: "/v1/embeddings",
+        force_non_stream: false,
+    };
 }
 
 /// [`ChatProxy::forward_buffered`]'s result.
