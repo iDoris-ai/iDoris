@@ -8,6 +8,7 @@ use idoris_backend::{
 use idoris_contracts::{ComponentCard, component_card::Form};
 use idoris_policy::is_subscription_provider_id;
 use idoris_upstream::factory::create_adapter;
+use idoris_upstream::{LocalHttpRuntimeAdapter, LocalHttpRuntimeConfig};
 
 use crate::dispatch::BoundSupervisor;
 
@@ -46,6 +47,42 @@ impl RuntimeRegistry {
             }
         }
         Ok(registry)
+    }
+
+    pub fn spawn_with_local_configs(
+        cards: &[ComponentCard],
+        local: &BTreeMap<String, LocalHttpRuntimeConfig>,
+    ) -> Result<Self, String> {
+        for (provider_id, config) in local {
+            let card = cards
+                .iter()
+                .find(|card| card.provider.id == *provider_id)
+                .ok_or_else(|| {
+                    format!("本地 runtime {provider_id:?} 没有对应的组件卡，拒绝启动")
+                })?;
+            if crate::dispatch::is_resident_http_service(card) {
+                return Err(format!(
+                    "本地 runtime {provider_id:?} 不能绑定 Resident 直连组件卡"
+                ));
+            }
+            if card.form != Form::HttpService
+                || card.provider.locality != idoris_contracts::provider::Locality::Loopback
+                || card.endpoint != config.launch.endpoint()
+            {
+                return Err(format!(
+                    "本地 runtime {provider_id:?} 与组件卡的 form/locality/endpoint 不一致"
+                ));
+            }
+        }
+
+        Self::spawn_with_factory(cards, |card| {
+            if let Some(config) = local.get(&card.provider.id) {
+                return LocalHttpRuntimeAdapter::new(config.clone()).map(|adapter| {
+                    std::sync::Arc::new(adapter) as std::sync::Arc<dyn RuntimeAdapter>
+                });
+            }
+            create_adapter(card)
+        })
     }
 
     pub fn get(&self, provider_id: &str) -> Option<&BoundSupervisor> {
@@ -285,6 +322,32 @@ mod tests {
 
         assert!(registry.is_empty());
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn local_config_requires_exact_card_binding() {
+        let mut custom = named_card("local-http");
+        custom.endpoint = "http://127.0.0.1:18111".into();
+        let launch = idoris_upstream::LocalRuntimeLaunch::new(
+            idoris_upstream::LocalRuntimeKind::MlxLmServer,
+            "/usr/bin/python3",
+            "/models/qwen-mlx",
+            18111,
+        )
+        .unwrap();
+        let config = LocalHttpRuntimeConfig::new(
+            launch,
+            "local-http",
+            2.0,
+            "/tmp/idoris/local-http.pending".into(),
+        )
+        .unwrap();
+        let configs = BTreeMap::from([("local-http".to_string(), config)]);
+        assert!(RuntimeRegistry::spawn_with_local_configs(&[custom.clone()], &configs).is_ok());
+
+        custom.endpoint = "http://127.0.0.1:19999".into();
+        assert!(RuntimeRegistry::spawn_with_local_configs(&[custom], &configs).is_err());
+        assert!(RuntimeRegistry::spawn_with_local_configs(&[], &configs).is_err());
     }
 
     #[tokio::test]
