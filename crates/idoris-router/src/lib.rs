@@ -892,6 +892,76 @@ async fn append_profiled(
     run_event_log_write(move || store.append(Some(&tenant_id), &event).map(|_| ())).await
 }
 
+enum DecisionObservation<'a> {
+    Selected(&'a Selected),
+    Rejected(&'a Rejection),
+    NoCandidate(&'static str),
+    Internal,
+}
+
+async fn append_decided(
+    store: Arc<idoris_tenancy::event_log::EventLogStore>,
+    tenant_id: String,
+    record_id: String,
+    correlation: &correlation::RequestCorrelation,
+    route: &routing_policy::RouteDecision,
+    observation: DecisionObservation<'_>,
+) -> Result<(), ()> {
+    let mut metadata = std::collections::BTreeMap::new();
+    let rule_id = match route.matched_rule {
+        routing_policy::MatchedRule::Rule(index) => format!("rule:{index}"),
+        routing_policy::MatchedRule::Default => "default".to_string(),
+    };
+    metadata.insert("rule_id".to_string(), json!(rule_id));
+    match observation {
+        DecisionObservation::Selected(selected) => {
+            let tier = match selected.card.provider.tier {
+                idoris_contracts::common::Tier::Local => "local",
+                idoris_contracts::common::Tier::Remote => "remote",
+                idoris_contracts::common::Tier::Lora => "lora",
+            };
+            metadata.insert("status".to_string(), json!("selected"));
+            metadata.insert("provider_id".to_string(), json!(selected.card.provider.id));
+            metadata.insert("tier".to_string(), json!(tier));
+            metadata.insert(
+                "served_locality".to_string(),
+                json!(locality_str(selected.served_locality)),
+            );
+        }
+        DecisionObservation::Rejected(rejection) => {
+            metadata.insert("status".to_string(), json!("rejected"));
+            metadata.insert("reason".to_string(), json!(rejection.error_type()));
+        }
+        DecisionObservation::NoCandidate(reason) => {
+            metadata.insert("status".to_string(), json!("rejected"));
+            metadata.insert("reason".to_string(), json!(reason));
+        }
+        DecisionObservation::Internal => {
+            metadata.insert("status".to_string(), json!("error"));
+            metadata.insert("reason".to_string(), json!("internal_error"));
+        }
+    }
+    let ts_utc_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_millis()).ok())
+        .ok_or(())?;
+    let event = idoris_tenancy::event_log::NewEvent {
+        event_id: Uuid::new_v4().to_string(),
+        tenant_id: tenant_id.clone(),
+        record_id,
+        event_type: idoris_tenancy::event_log::EventType::Decided,
+        ts_utc_ms,
+        request_id: None,
+        session_id: correlation.session_id.clone(),
+        trace_id: correlation.trace_id.clone(),
+        parent_id: correlation.parent_id.clone(),
+        origin_record_id: None,
+        metadata,
+    };
+    run_event_log_write(move || store.append(Some(&tenant_id), &event).map(|_| ())).await
+}
+
 /// `POST /v1/chat/completions`. Order (locked by conformance): non-JSON
 /// body -> `invalid_json`; valid JSON that isn't an object -> `invalid_body`;
 /// only then are control-plane headers parsed (see [`profile::parse_profile`]).
@@ -959,10 +1029,10 @@ async fn chat_completions(
 
     let messages = extract_messages(object);
     let parsed = intent::resolve_profile(parsed, &messages).await;
-    if let Some((event_log, tenant_id)) = event_context
+    if let Some((event_log, tenant_id)) = &event_context
         && append_profiled(
-            event_log,
-            tenant_id,
+            event_log.clone(),
+            tenant_id.clone(),
             record_id.clone(),
             &correlation,
             &parsed,
@@ -980,6 +1050,25 @@ async fn chat_completions(
 
     let policy_cards = dispatch::policy_cards(&state.cards, &state.routing_policy, &parsed);
     if policy_cards.cards.is_empty() {
+        let reason = if policy_cards.route.fail_closed {
+            "local_only_unavailable"
+        } else {
+            "no_candidate"
+        };
+        if let Some((event_log, tenant_id)) = &event_context
+            && append_decided(
+                event_log.clone(),
+                tenant_id.clone(),
+                record_id.clone(),
+                &correlation,
+                &policy_cards.route,
+                DecisionObservation::NoCandidate(reason),
+            )
+            .await
+            .is_err()
+        {
+            return event_log_unavailable_response();
+        }
         return if policy_cards.route.fail_closed {
             rejection_response(idoris_policy::Rejection::LocalOnlyUnavailable)
         } else {
@@ -991,13 +1080,34 @@ async fn chat_completions(
         };
     }
 
+    let selection = dispatch::select(&policy_cards.cards, &parsed, &prompt);
+    let observation = match &selection {
+        Ok(selected) => DecisionObservation::Selected(selected),
+        Err(DispatchError::Rejection(rejection)) => DecisionObservation::Rejected(rejection),
+        Err(DispatchError::Internal(_)) => DecisionObservation::Internal,
+    };
+    if let Some((event_log, tenant_id)) = &event_context
+        && append_decided(
+            event_log.clone(),
+            tenant_id.clone(),
+            record_id.clone(),
+            &correlation,
+            &policy_cards.route,
+            observation,
+        )
+        .await
+        .is_err()
+    {
+        return event_log_unavailable_response();
+    }
+
     // R2-G: a Resident-mode http_service candidate (a generic
     // OpenAI-compatible backend, including a conformance fixture pointing
     // at a fake upstream) is forwarded directly -- never through the
     // Supervisor, which only makes sense for a real oMLX-shaped backend
     // with an explicit load/unload lifecycle. See dispatch::select's doc
     // for the accepted double-decide() tradeoff this branch makes.
-    if let Ok(selected) = dispatch::select(&policy_cards.cards, &parsed, &prompt) {
+    if let Ok(selected) = &selection {
         // A present model field must be a non-empty string before any
         // selected backend can execute. Keep selection first so the
         // established error still carries the selected locality/reasons.
@@ -1033,7 +1143,7 @@ async fn chat_completions(
                 .privacy
                 .unwrap_or(idoris_contracts::common::PrivacyClass::LocalOnly);
             return match subscription::dispatch::dispatch_selected(
-                &selected,
+                selected,
                 privacy,
                 lifecycle.peer(),
                 &state.subscriptions,
@@ -1078,7 +1188,7 @@ async fn chat_completions(
             };
         }
         if dispatch::is_resident_http_service(&selected.card) {
-            return chat_via_proxy(&state, &selected, &headers, &parsed, &value, &record_id).await;
+            return chat_via_proxy(&state, selected, &headers, &parsed, &value, &record_id).await;
         }
         if let Err(message) = supervisor_stream::validate(object) {
             let mut response = error_envelope_with_reason(
@@ -1111,7 +1221,7 @@ async fn chat_completions(
     // The request token is a fresh child of this TCP connection's lifetime.
     // Completing the request body does not cancel it; EOF/reset/shutdown of
     // the actual connection does.
-    let selected_for_dispatch = dispatch::select(&policy_cards.cards, &parsed, &prompt).ok();
+    let selected_for_dispatch = selection.as_ref().ok();
     let selected_estimated_cost = selected_for_dispatch
         .as_ref()
         .map(|selected| selected.estimated_cost_minor);
@@ -1644,6 +1754,9 @@ mod request_received_wiring_tests;
 
 #[cfg(test)]
 mod profiled_wiring_tests;
+
+#[cfg(test)]
+mod decided_wiring_tests;
 
 #[cfg(test)]
 mod policy_wiring_tests;
