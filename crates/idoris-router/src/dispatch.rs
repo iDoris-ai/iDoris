@@ -639,15 +639,20 @@ async fn dispatch_local_inner(
         .await;
 
     if let Some(context) = completed_event {
-        let status = if chat_result.is_ok() {
-            "success"
-        } else {
-            "failure"
+        let append = match &chat_result {
+            Ok(response) => {
+                crate::append_completed_with_usage(
+                    context,
+                    selected,
+                    "success",
+                    idoris_tenancy::budget::estimate_tokens(prompt, "unknown"),
+                    idoris_tenancy::budget::estimate_tokens(&response.content, "unknown"),
+                )
+                .await
+            }
+            Err(_) => crate::append_completed(context, selected, "failure").await,
         };
-        if crate::append_completed(context, selected, status)
-            .await
-            .is_err()
-        {
+        if append.is_err() {
             return Err(ObservedDispatchError::EventLogUnavailable);
         }
     }
