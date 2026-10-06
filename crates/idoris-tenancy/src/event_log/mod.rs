@@ -251,14 +251,38 @@ fn load_by_id(conn: &Connection, event_id: &str) -> Result<Option<EventLogEvent>
     conn.query_row("SELECT sequence,event_id,tenant_id,record_id,event_type,ts_utc_ms,request_id,session_id,trace_id,parent_id,origin_record_id,metadata FROM event_log_events WHERE event_id=?1", [event_id], raw_event).optional()?.map(decode).transpose()
 }
 
+fn schema_objects(conn: &Connection) -> Result<Vec<(String, String, String)>, EventLogError> {
+    let mut stmt = conn.prepare(
+        "SELECT type,name,sql FROM sqlite_master \
+         WHERE sql IS NOT NULL AND (name='event_log_schema_migrations' OR tbl_name='event_log_events') \
+         AND type IN ('table','index','trigger') ORDER BY type,name",
+    )?;
+    let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+}
+
+fn verify_canonical_schema(conn: &Connection) -> Result<(), EventLogError> {
+    let canonical = Connection::open_in_memory()?;
+    canonical.execute_batch(
+        "CREATE TABLE IF NOT EXISTS event_log_schema_migrations (version INTEGER PRIMARY KEY)",
+    )?;
+    canonical.execute_batch(include_str!("migrations/0001_events.sql"))?;
+    if schema_objects(conn)? != schema_objects(&canonical)? {
+        return Err(EventLogError::SchemaIncomplete);
+    }
+    Ok(())
+}
+
 fn verify_append_only_guards(conn: &Connection) -> Result<(), EventLogError> {
     conn.execute_batch("SAVEPOINT event_log_schema_probe")?;
     let event_id = Uuid::new_v4().to_string();
     let forged_id = Uuid::new_v4().to_string();
+    let tenant_id = format!("schema-probe-{}", Uuid::new_v4().simple());
+    let record_id = format!("record-{}", Uuid::new_v4().simple());
     let probe = (|| -> Result<bool, EventLogError> {
         conn.execute(
-            "INSERT INTO event_log_events(event_id,tenant_id,record_id,event_type,ts_utc_ms,metadata) VALUES (?1,'__schema_probe__','probe','decided',0,'{}')",
-            [&event_id],
+            "INSERT INTO event_log_events(event_id,tenant_id,record_id,event_type,ts_utc_ms,metadata) VALUES (?1,?2,?3,'decided',0,'{}')",
+            rusqlite::params![event_id, tenant_id, record_id],
         )?;
         let update_blocked = conn
             .execute(
@@ -273,10 +297,10 @@ fn verify_append_only_guards(conn: &Connection) -> Result<(), EventLogError> {
             )
             .is_err();
         let sequence_blocked = conn
-            .execute("INSERT INTO event_log_events(sequence,event_id,tenant_id,record_id,event_type,ts_utc_ms,metadata) VALUES (-1,?1,'__schema_probe__','forged','decided',0,'{}')", [&forged_id])
+            .execute("INSERT INTO event_log_events(sequence,event_id,tenant_id,record_id,event_type,ts_utc_ms,metadata) VALUES (-1,?1,?2,'forged','decided',0,'{}')", rusqlite::params![forged_id, tenant_id])
             .is_err();
         let replace_blocked = conn
-            .execute("INSERT OR REPLACE INTO event_log_events(event_id,tenant_id,record_id,event_type,ts_utc_ms,metadata) VALUES (?1,'__schema_probe__','replaced','decided',0,'{}')", [&event_id])
+            .execute("INSERT OR REPLACE INTO event_log_events(event_id,tenant_id,record_id,event_type,ts_utc_ms,metadata) VALUES (?1,?2,'replaced','decided',0,'{}')", rusqlite::params![event_id, tenant_id])
             .is_err();
         Ok(update_blocked && delete_blocked && sequence_blocked && replace_blocked)
     })();
@@ -310,10 +334,7 @@ fn migrate(conn: &mut Connection) -> Result<(), EventLogError> {
     if tx.prepare("SELECT sequence,event_id,tenant_id,record_id,event_type,ts_utc_ms,request_id,session_id,trace_id,parent_id,origin_record_id,metadata FROM event_log_events LIMIT 0").is_err() {
         return Err(EventLogError::SchemaIncomplete);
     }
-    let objects: i64 = tx.query_row("SELECT count(*) FROM sqlite_master WHERE (type='table' AND name='event_log_events' AND upper(sql) LIKE '%SEQUENCE INTEGER PRIMARY KEY AUTOINCREMENT%' AND upper(sql) LIKE '%EVENT_ID TEXT NOT NULL UNIQUE%') OR (type='index' AND name='event_log_tenant_record_sequence' AND sql LIKE '%tenant_id, record_id, sequence%') OR (type='trigger' AND name='event_log_guard_insert' AND upper(sql) LIKE '%BEFORE INSERT ON EVENT_LOG_EVENTS%' AND upper(sql) LIKE '%NEW.SEQUENCE != -1%' AND upper(sql) LIKE '%EVENT_ID = NEW.EVENT_ID%' AND upper(sql) LIKE '%RAISE(ABORT%') OR (type='trigger' AND name='event_log_sequence_positive' AND upper(sql) LIKE '%AFTER INSERT ON EVENT_LOG_EVENTS%' AND upper(sql) LIKE '%NEW.SEQUENCE <= 0%' AND upper(sql) LIKE '%RAISE(ABORT%') OR (type='trigger' AND name='event_log_no_update' AND upper(sql) LIKE '%BEFORE UPDATE ON EVENT_LOG_EVENTS%' AND upper(sql) LIKE '%RAISE(ABORT%') OR (type='trigger' AND name='event_log_no_delete' AND upper(sql) LIKE '%BEFORE DELETE ON EVENT_LOG_EVENTS%' AND upper(sql) LIKE '%RAISE(ABORT%')", [], |r| r.get(0))?;
-    if objects != 6 {
-        return Err(EventLogError::SchemaIncomplete);
-    }
+    verify_canonical_schema(&tx)?;
     verify_append_only_guards(&tx)?;
     tx.commit()?;
     Ok(())

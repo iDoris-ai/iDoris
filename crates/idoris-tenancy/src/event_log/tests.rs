@@ -461,6 +461,29 @@ fn recorded_migration_with_noop_append_only_triggers_fails_at_open() {
 }
 
 #[test]
+fn recorded_migration_with_probe_aware_guards_fails_at_open() {
+    let db = temp_db("schema-probe-aware-guards");
+    let conn = Connection::open(&db).unwrap();
+    conn.execute_batch(include_str!("migrations/0001_events.sql"))
+        .unwrap();
+    conn.execute_batch(
+        "CREATE TABLE event_log_schema_migrations(version INTEGER PRIMARY KEY); \
+         INSERT INTO event_log_schema_migrations VALUES(1); \
+         DROP TRIGGER event_log_no_update; \
+         DROP TRIGGER event_log_no_delete; \
+         CREATE TRIGGER event_log_no_update BEFORE UPDATE ON event_log_events \
+           WHEN OLD.tenant_id LIKE 'schema-probe-%' BEGIN SELECT RAISE(ABORT, 'event log is append-only'); END; \
+         CREATE TRIGGER event_log_no_delete BEFORE DELETE ON event_log_events \
+           WHEN OLD.tenant_id LIKE 'schema-probe-%' BEGIN SELECT RAISE(ABORT, 'event log is append-only'); END;",
+    )
+    .unwrap();
+    assert!(matches!(
+        EventLogStore::new(conn),
+        Err(EventLogError::SchemaIncomplete)
+    ));
+}
+
+#[test]
 fn poisoned_connection_mutex_fails_closed() {
     let store = EventLogStore::new(Connection::open_in_memory().unwrap()).unwrap();
     let _ = std::panic::catch_unwind(|| {
