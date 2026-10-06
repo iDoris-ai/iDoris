@@ -97,6 +97,17 @@ impl ManagedRuntimeProcess {
         // No group signal may happen after wait() reaps the ownership
         // anchor: from this point the old PGID is allowed to be reused.
         self.armed = false;
+        // Group members receive the same terminal signal as the direct child,
+        // but their exit/reparent/reap can lag the child's wait() by a short
+        // scheduling window (especially under loaded Linux CI).  Observe that
+        // cleanup to completion before reporting shutdown success.  This is a
+        // read-only probe after the ownership anchor is reaped: never signal a
+        // numeric PGID again here, because it may now be reused by the OS.
+        if !wait_group_gone(self.process_group, grace).await? {
+            return Err(BackendError::internal(
+                "timed out waiting for local runtime process group cleanup",
+            ));
+        }
         Ok(())
     }
 
