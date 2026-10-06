@@ -153,6 +153,51 @@ B6 stack:
 5. Close B5/B6, then B7/B8, then B9 to finish M4.
 6. Continue M5 -> M6 -> M7 -> M8 under the same Prime loop.
 
+## Latest override snapshot — 2026-10-06 09:30 GMT+7
+
+This section is newer than the earlier morning snapshot above and overrides stale PR/base facts there. Live Git/GitHub still wins over both.
+
+### B5 landing stack
+
+- Old aggregate PRs **#328 and #334 are CLOSED as superseded**, not merged. Superseded #343 is also closed.
+- The size-safe main landing stack is now:
+  1. **#342** `5fff5c9330725fbd66f214dd732c7cfdb729d8d8` -> `main` — virtual-key SQLite store; original production slice ~220 lines.
+  2. **#346** `d67e339c222ff268e6f9fd7b4f14d2a5814eba3b` -> #342 — authenticator; 198 total additions, production <100.
+  3. **#347** `5a5d4d63fe10afcded5218d1607b302584abf47c` -> #346 — scope ceilings + store bootstrap; 166 file-level additions.
+  4. **#344** `d90ce7526b1acef298930e5612678bd5686ce1f4` -> #347 — chat wiring; production 142 changed lines.
+- All four reuse the original exact commit lineage; no rebase/force/rewrite. Retarget the immediate child to `main` before each parent branch can be deleted.
+- #344 retains both conformance challenge fixes: fresh one-time bearer per Rust server, origin-scoped injection, and a fresh harness-owned DB per server. Local JS conformance is still not claimed because this host has no Node.
+
+### B6 current heads
+
+- **#333 Event Log core** current head: `bcfaed2a4b89772dd3fa27544274c19b938ee394`, base `main`.
+  - Production delta remains 373 lines (301-500 security exception; double review required).
+  - Exact canonical `main` schema comparison + relevant TEMP rejection + `main.*` runtime/migration/probe qualification + randomized behavioral probe.
+  - ATTACH bearing regression proves a same-name attached schema cannot capture first migration or runtime writes.
+  - Full `idoris-tenancy` 124/124 plus integration groups, fmt/clippy/diff-check green locally.
+- #335 `b52dc82c11bc402af70378b72abf1342f29e661e` -> #333.
+- #336 `7d0ccc4a609f9e82004ea0c87ade993baf12d970` -> #335.
+- #337 `30be822234adc436008587ec3733b5647e1e3abd` -> #336 — `request.received`.
+- #339 `77ea47c08362c4a6ceeef63f3c4fe412a223f09d` -> #337 — `profiled`, production 80.
+- **#345** `fdb1bedd5b903fc97b031f0daef7d65cd4e18462` -> #339 — typed route-decision fact seam, production 22; no `decided` event yet.
+- **B6-07 `decided` is in active worker implementation** on exact #345 head. It must emit exactly one truthful pre-budget/pre-upstream decision fact on success and pre-execution rejection/no-eligible paths, never duplicate the historical Supervisor double-decide, and use only whitelisted non-content metadata.
+
+### Other gates
+
+- #326 paid Resident startup gate has green CI and Prime re-challenge found no new budget/settlement blocker; external current-head approval still required.
+- #340 load-fence lifetime fix is green and approval-pending. After it lands, merge current `main` normally into #338 (no rebase) for a fresh SHA/clean CI.
+- The #338 bad-command exit 143 was independently diagnosed as GitHub-hosted runner preemption; do not add code for it. Its real `flock` race is #340.
+- #341 is this docs-only rolling checkpoint PR; keep updating it instead of creating another checkpoint PR.
+
+### Immediate execution override
+
+1. Finish CI + current-head TPR on #326/#333/#340/#342/#346/#347/#344/#345 and the older B6 stack.
+2. Merge only `APPROVED + required CI green + mergeable`, with stacked child base retargeting before parent branch deletion.
+3. Finish B6-07 `decided`, then prioritize record-id decision-chain query/audit projection.
+4. Add budget/dispatched/completed/settled events in <=300 production slices as needed for the B6 decision chain.
+5. Implement `/v1/feedback` only with an explicit safe content-storage boundary for `corrected_output`; never bypass Event Log metadata content rules.
+6. Close B5/B6, then B7/B8 -> B9 -> M5 -> M6 -> M7 -> M8.
+
 ## Known review lessons that must not be forgotten
 
 - Task15: arbitrary concrete model IDs must be catalog-validated before Supervisor `load()`; otherwise unknown IDs can trigger eviction of a warm model before backend rejection.
