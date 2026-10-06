@@ -52,6 +52,7 @@ genai = "=0.6.5"
 
 [target.'cfg(unix)'.dependencies]
 nix = { workspace = true }
+rustix = { version = "1", features = ["process"] }
 
 [dev-dependencies]
 # `io-util` (for `AsyncWriteExt`) is test-only: the raw-TCP regression test

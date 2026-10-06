@@ -67,6 +67,12 @@ impl ManagedRuntimeProcess {
         self.child.id()
     }
 
+    #[cfg(unix)]
+    pub fn is_running(&mut self) -> Result<bool, BackendError> {
+        child_running_without_reap(self.process_group)
+    }
+
+    #[cfg(not(unix))]
     pub fn is_running(&mut self) -> Result<bool, BackendError> {
         self.child
             .try_wait()
@@ -74,17 +80,31 @@ impl ManagedRuntimeProcess {
             .map_err(|_| BackendError::internal("failed to inspect local runtime process"))
     }
 
+    #[cfg(unix)]
+    pub async fn shutdown(mut self, grace: Duration) -> Result<(), BackendError> {
+        // Keep the direct child unreaped while group signals are possible.
+        // Its PID is also this group's PGID, so the zombie/live child is
+        // the ownership anchor that prevents the numeric PGID from being
+        // recycled for an unrelated process group.
+        self.signal_terminate()?;
+        if !wait_group_gone(self.process_group, grace).await? {
+            self.signal_kill()?;
+        }
+        tokio::time::timeout(grace, self.child.wait())
+            .await
+            .map_err(|_| BackendError::internal("timed out reaping local runtime process"))?
+            .map_err(|_| BackendError::internal("failed to reap local runtime process"))?;
+        // No group signal may happen after wait() reaps the ownership
+        // anchor: from this point the old PGID is allowed to be reused.
+        self.armed = false;
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
     pub async fn shutdown(mut self, grace: Duration) -> Result<(), BackendError> {
         let running = self.is_running()?;
-
-        #[cfg(unix)]
-        self.signal_terminate()?;
-        #[cfg(not(unix))]
         if running {
             self.signal_terminate()?;
-        }
-
-        if running {
             match tokio::time::timeout(grace, self.child.wait()).await {
                 Ok(result) => {
                     result.map_err(|_| {
@@ -103,12 +123,6 @@ impl ManagedRuntimeProcess {
                         })?;
                 }
             }
-        }
-
-        #[cfg(unix)]
-        {
-            cleanup_group(self.process_group, grace).await?;
-            self.armed = false;
         }
         Ok(())
     }
@@ -139,27 +153,34 @@ impl ManagedRuntimeProcess {
 }
 
 #[cfg(unix)]
-fn signal_group(process_group: i32, signal: nix::sys::signal::Signal) -> Result<(), BackendError> {
-    match nix::sys::signal::killpg(nix::unistd::Pid::from_raw(process_group), signal) {
-        Ok(()) | Err(nix::errno::Errno::ESRCH) => Ok(()),
-        Err(_) => Err(BackendError::internal(
-            "failed to signal local runtime process group",
-        )),
-    }
+fn child_running_without_reap(pid: i32) -> Result<bool, BackendError> {
+    let pid = rustix::process::Pid::from_raw(pid)
+        .ok_or_else(|| BackendError::internal("local runtime process id is invalid"))?;
+    rustix::process::waitid(
+        rustix::process::WaitId::Pid(pid),
+        rustix::process::WaitIdOptions::EXITED
+            | rustix::process::WaitIdOptions::NOHANG
+            | rustix::process::WaitIdOptions::NOWAIT,
+    )
+    .map(|status| status.is_none())
+    .map_err(|_| BackendError::internal("failed to inspect local runtime process"))
 }
 
 #[cfg(unix)]
-async fn cleanup_group(process_group: i32, grace: Duration) -> Result<(), BackendError> {
-    if wait_group_gone(process_group, grace).await? {
-        return Ok(());
-    }
-    signal_group(process_group, nix::sys::signal::Signal::SIGKILL)?;
-    if wait_group_gone(process_group, grace).await? {
-        Ok(())
-    } else {
-        Err(BackendError::internal(
-            "timed out cleaning local runtime process group",
-        ))
+fn signal_group(process_group: i32, signal: nix::sys::signal::Signal) -> Result<(), BackendError> {
+    classify_signal_result(nix::sys::signal::killpg(
+        nix::unistd::Pid::from_raw(process_group),
+        signal,
+    ))
+}
+
+#[cfg(unix)]
+fn classify_signal_result(result: Result<(), nix::errno::Errno>) -> Result<(), BackendError> {
+    match result {
+        Ok(()) | Err(nix::errno::Errno::ESRCH) | Err(nix::errno::Errno::EPERM) => Ok(()),
+        Err(_) => Err(BackendError::internal(
+            "failed to signal local runtime process group",
+        )),
     }
 }
 
@@ -183,7 +204,15 @@ async fn wait_group_gone(process_group: i32, grace: Duration) -> Result<bool, Ba
 
 #[cfg(unix)]
 fn group_exists(process_group: i32) -> Result<bool, BackendError> {
-    match nix::sys::signal::killpg(nix::unistd::Pid::from_raw(process_group), None) {
+    classify_group_probe(nix::sys::signal::killpg(
+        nix::unistd::Pid::from_raw(process_group),
+        None,
+    ))
+}
+
+#[cfg(unix)]
+fn classify_group_probe(result: Result<(), nix::errno::Errno>) -> Result<bool, BackendError> {
+    match result {
         Ok(()) | Err(nix::errno::Errno::EPERM) => Ok(true),
         Err(nix::errno::Errno::ESRCH) => Ok(false),
         Err(_) => Err(BackendError::internal(
@@ -283,5 +312,79 @@ mod tests {
 
         process.shutdown(Duration::from_millis(50)).await.unwrap();
         assert!(!group_exists(pid.as_raw()).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn natural_exit_is_observed_without_reaping_before_drop() {
+        let mut process =
+            ManagedRuntimeProcess::spawn_command(std::path::Path::new("/usr/bin/true"), Vec::new())
+                .unwrap();
+        let pid = process.id().unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while process.is_running().unwrap() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(
+            process.id(),
+            Some(pid),
+            "non-reaping status observation must retain the PID/PGID ownership anchor"
+        );
+        drop(process);
+        let pgid = i32::try_from(pid).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while group_exists(pgid).unwrap() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn natural_parent_exit_still_cleans_owned_descendant_before_reap() {
+        let temp = tempfile::tempdir().unwrap();
+        let marker = temp.path().join("child");
+        let mut process = ManagedRuntimeProcess::spawn_command(
+            std::path::Path::new("/bin/sh"),
+            vec![
+                "-c".into(),
+                "sleep 30 & echo $! > \"$1\"".into(),
+                "runtime-test".into(),
+                marker.as_os_str().to_owned(),
+            ],
+        )
+        .unwrap();
+        let pgid = i32::try_from(process.id().unwrap()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !marker.exists() || process.is_running().unwrap() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            process.id().is_some(),
+            "natural exit must stay unreaped until owned-group cleanup finishes"
+        );
+
+        process.shutdown(Duration::from_millis(100)).await.unwrap();
+        assert!(!group_exists(pgid).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn darwin_eperm_defers_to_bounded_group_checks() {
+        assert!(classify_signal_result(Err(nix::errno::Errno::EPERM)).is_ok());
+        assert!(classify_group_probe(Err(nix::errno::Errno::EPERM)).unwrap());
+        assert!(classify_signal_result(Err(nix::errno::Errno::ESRCH)).is_ok());
+        assert!(!classify_group_probe(Err(nix::errno::Errno::ESRCH)).unwrap());
+        assert!(classify_signal_result(Err(nix::errno::Errno::EINVAL)).is_err());
+        assert!(classify_group_probe(Err(nix::errno::Errno::EINVAL)).is_err());
     }
 }
