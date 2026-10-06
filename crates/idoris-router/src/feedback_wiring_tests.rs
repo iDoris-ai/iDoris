@@ -41,6 +41,16 @@ fn feedback_request(body: serde_json::Value) -> Request<Body> {
         .unwrap()
 }
 
+fn feedback_request_with_tenant(body: serde_json::Value, tenant: &str) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri("/v1/feedback")
+        .header("content-type", "application/json")
+        .header("x-idoris-tenant", tenant)
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap()
+}
+
 #[tokio::test]
 async fn metadata_feedback_appends_to_existing_record() {
     let event_log = memory_event_log();
@@ -108,4 +118,39 @@ async fn feedback_rejects_unknown_record_and_content_fields() {
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
         assert!(!String::from_utf8_lossy(&bytes).contains("secret"));
     }
+}
+
+#[tokio::test]
+async fn feedback_control_char_metadata_is_400_before_event_log() {
+    let app = build_app(AppState::default());
+    for body in [
+        json!({"record_id":"record","outcome":"bad\nvalue"}),
+        json!({"record_id":"record","labels":["ok","bad\tvalue"]}),
+    ] {
+        let response = app.clone().oneshot(feedback_request(body)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["error"]["type"], "invalid_feedback");
+    }
+}
+
+#[tokio::test]
+async fn tenant_feedback_rejects_invalid_tenant_identifier_before_event_log() {
+    let app = build_app(AppState {
+        deploy_mode: idoris_contracts::DeployMode::Tenant,
+        ..AppState::default()
+    });
+    let tenant = "t".repeat(129);
+    let response = app
+        .oneshot(feedback_request_with_tenant(
+            json!({"record_id":"record","rating":"up"}),
+            &tenant,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(json["error"]["type"], "invalid_tenant_scope");
 }

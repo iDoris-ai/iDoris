@@ -367,12 +367,19 @@ async fn post_feedback(
     let tenant_id = match state.deploy_mode {
         idoris_contracts::DeployMode::Personal => budget::PERSONAL_TENANT_ID.to_string(),
         idoris_contracts::DeployMode::Tenant => match query_scope_header(&headers) {
-            Some(tenant_id) => tenant_id.to_string(),
+            Some(tenant_id) if feedback::valid_event_identifier(tenant_id) => tenant_id.to_string(),
             None => {
                 return error_envelope(
                     StatusCode::BAD_REQUEST,
                     "invalid_tenant_scope",
                     "feedback requires exactly one non-empty X-iDoris-Tenant",
+                );
+            }
+            Some(_) => {
+                return error_envelope(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_tenant_scope",
+                    "feedback tenant identifier is invalid",
                 );
             }
         },
