@@ -149,7 +149,9 @@ pub fn project_event_audit(path_tenant: &str, events: &[EventLogEvent]) -> Audit
                 record.payload.insert(key.to_string(), value.clone());
             }
         }
-        if let Some(value) = event.metadata.get("settled_minor") {
+        if event.event_type == idoris_tenancy::event_log::EventType::BudgetSettled
+            && let Some(value) = event.metadata.get("settled_minor")
+        {
             record.payload.insert("cost_minor".into(), value.clone());
         }
     }
@@ -343,6 +345,7 @@ mod tests {
                     ("tokens_out".into(), json!(888)),
                     ("latency_ms".into(), json!(777)),
                     ("cost_minor".into(), json!(666)),
+                    ("settled_minor".into(), json!(555)),
                 ]),
             ),
             event(
