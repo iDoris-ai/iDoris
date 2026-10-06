@@ -54,7 +54,11 @@ async fn metadata_feedback_appends_to_existing_record() {
             "record_id": record_id,
             "rating": "up",
             "labels": ["useful", "accepted"],
-            "outcome": "kept"
+            "outcome": "kept",
+            "rubric": [
+                {"id":"correct","pass":true},
+                {"id":"style","pass":false}
+            ]
         })))
         .await
         .unwrap();
@@ -75,6 +79,13 @@ async fn metadata_feedback_appends_to_existing_record() {
     assert_eq!(
         feedback[0].event.metadata.get("labels"),
         Some(&json!(["useful", "accepted"]))
+    );
+    assert_eq!(
+        feedback[0].event.metadata.get("rubric"),
+        Some(&json!([
+            {"id":"correct","pass":true},
+            {"id":"style","pass":false}
+        ]))
     );
     assert_eq!(
         feedback[0].event.trace_id.as_deref(),
@@ -99,10 +110,7 @@ async fn feedback_rejects_unknown_record_and_content_fields() {
         .unwrap();
     assert_eq!(missing.status(), StatusCode::NOT_FOUND);
     let record_id = create_record(&app).await;
-    for body in [
-        json!({"record_id": record_id, "corrected_output": "secret"}),
-        json!({"record_id": record_id, "rubric": [{"id":"r1","pass":true}]}),
-    ] {
+    for body in [json!({"record_id": record_id, "corrected_output": "secret"})] {
         let response = app.clone().oneshot(feedback_request(body)).await.unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let bytes = response.into_body().collect().await.unwrap().to_bytes();

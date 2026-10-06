@@ -9,6 +9,7 @@ const MAX_STRING_UTF16_UNITS: usize = 500;
 const MAX_ARRAY_ITEMS: usize = 32;
 const SCALAR_KEYS: &str = "component,intent,privacy,tier,provider_id,model_id,tokens_in,tokens_out,cost_minor,latency_ms,status,reason,rule_id,served_locality,degraded,cached,reserved_minor,settled_minor,price_version,rating,outcome,failure_mode,sensitivity,training_eligible";
 const ARRAY_KEYS: &str = "reason_codes,labels";
+const OBJECT_ARRAY_KEYS: &str = "rubric";
 const CONTENT_KEYS: &str = "prompt,prompts,input,inputs,content,contents,text,texts,body,messages,message,response,responses,output,outputs,completion,completions,corrected_output,query,answer,raw,data";
 
 macro_rules! event_types {
@@ -184,14 +185,36 @@ fn validate_id(field: &'static str, value: &str) -> Result<(), EventLogError> {
 
 fn validate_metadata(metadata: &BTreeMap<String, Value>) -> Result<(), EventLogError> {
     for (key, value) in metadata {
-        if key_in(CONTENT_KEYS, key) || !key_in(SCALAR_KEYS, key) && !key_in(ARRAY_KEYS, key) {
+        if key_in(CONTENT_KEYS, key)
+            || !key_in(SCALAR_KEYS, key)
+                && !key_in(ARRAY_KEYS, key)
+                && !key_in(OBJECT_ARRAY_KEYS, key)
+        {
             return Err(EventLogError::InvalidMetadata(key.clone()));
         }
         let valid_string = |text: &str| {
             text.encode_utf16().count() <= MAX_STRING_UTF16_UNITS
                 && !text.chars().any(char::is_control)
         };
-        if key_in(ARRAY_KEYS, key) {
+        if key_in(OBJECT_ARRAY_KEYS, key) {
+            let ok = value.as_array().is_some_and(|items| {
+                items.len() <= MAX_ARRAY_ITEMS
+                    && items.iter().all(|item| {
+                        let Some(object) = item.as_object() else {
+                            return false;
+                        };
+                        object.len() == 2
+                            && object
+                                .get("id")
+                                .and_then(Value::as_str)
+                                .is_some_and(|id| !id.trim().is_empty() && valid_string(id))
+                            && object.get("pass").is_some_and(Value::is_boolean)
+                    })
+            });
+            if !ok {
+                return Err(EventLogError::InvalidMetadata(key.clone()));
+            }
+        } else if key_in(ARRAY_KEYS, key) {
             let ok = value.as_array().is_some_and(|items| {
                 items.len() <= MAX_ARRAY_ITEMS
                     && items.iter().all(|v| v.as_str().is_some_and(valid_string))

@@ -27,13 +27,21 @@ impl Rating {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub(crate) struct RubricItem {
+    pub id: String,
+    pub pass: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct FeedbackRequest {
     pub record_id: String,
     pub rating: Option<Rating>,
     #[serde(default)]
     pub labels: Vec<String>,
     pub outcome: Option<String>,
-    pub rubric: Option<Value>,
+    #[serde(default)]
+    pub rubric: Vec<RubricItem>,
     pub corrected_output: Option<Value>,
 }
 
@@ -42,12 +50,16 @@ impl FeedbackRequest {
         if self.record_id.trim().is_empty() {
             return Err(FeedbackError::InvalidRecordId);
         }
-        if self.rubric.is_some() || self.corrected_output.is_some() {
+        if self.corrected_output.is_some() {
             return Err(FeedbackError::Invalid(
-                "rubric and corrected_output require structured/content feedback storage",
+                "corrected_output requires content storage",
             ));
         }
-        if self.rating.is_none() && self.outcome.is_none() && self.labels.is_empty() {
+        if self.rating.is_none()
+            && self.outcome.is_none()
+            && self.labels.is_empty()
+            && self.rubric.is_empty()
+        {
             return Err(FeedbackError::Invalid(
                 "feedback contains no metadata signal",
             ));
@@ -58,6 +70,8 @@ impl FeedbackRequest {
                 .outcome
                 .as_deref()
                 .is_some_and(|value| !valid_string(value))
+            || self.rubric.len() > MAX_LABELS
+            || self.rubric.iter().any(|item| !valid_string(&item.id))
         {
             return Err(FeedbackError::Invalid(
                 "feedback metadata exceeds safe bounds",
@@ -109,6 +123,18 @@ pub(crate) fn append_metadata_feedback(
     }
     if !request.labels.is_empty() {
         metadata.insert("labels".to_string(), json!(request.labels));
+    }
+    if !request.rubric.is_empty() {
+        metadata.insert(
+            "rubric".to_string(),
+            json!(
+                request
+                    .rubric
+                    .iter()
+                    .map(|item| json!({"id": item.id, "pass": item.pass}))
+                    .collect::<Vec<_>>()
+            ),
+        );
     }
     let ts_utc_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)

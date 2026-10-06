@@ -472,3 +472,27 @@ fn second_connection_write_lock_makes_append_fail_without_partial_row() {
         0
     );
 }
+
+#[test]
+fn rubric_metadata_accepts_only_bounded_id_pass_objects() {
+    let store = EventLogStore::new(Connection::open_in_memory().unwrap()).unwrap();
+    let mut valid = sample("tenant-a", "rubric-valid");
+    valid.event_type = EventType::FeedbackReceived;
+    valid.metadata = BTreeMap::from([("rubric".into(), json!([{"id":"correct","pass":true}]))]);
+    assert!(store.append(Some("tenant-a"), &valid).is_ok());
+
+    for invalid in [
+        json!([{"id":"correct","pass":true,"note":"text"}]),
+        json!([{"id":"","pass":true}]),
+        json!([{"id":"correct","pass":"yes"}]),
+        json!(["correct"]),
+    ] {
+        let mut event = sample("tenant-a", "rubric-invalid");
+        event.event_type = EventType::FeedbackReceived;
+        event.metadata = BTreeMap::from([("rubric".into(), invalid)]);
+        assert!(matches!(
+            store.append(Some("tenant-a"), &event),
+            Err(EventLogError::InvalidMetadata(key)) if key == "rubric"
+        ));
+    }
+}
