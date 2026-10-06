@@ -909,9 +909,7 @@ fn event_reason_code(reason: &idoris_policy::ReasonCode) -> String {
         }
         idoris_policy::ReasonCode::PriceUnknownExcluded => "price_unknown_excluded".to_string(),
         idoris_policy::ReasonCode::BudgetWithinLimit => "budget_within_limit".to_string(),
-        idoris_policy::ReasonCode::BudgetNoTenantContext => {
-            "budget_no_tenant_context".to_string()
-        }
+        idoris_policy::ReasonCode::BudgetNoTenantContext => "budget_no_tenant_context".to_string(),
         idoris_policy::ReasonCode::BudgetFallbackToFreeCandidate => {
             "budget_fallback_to_free_candidate".to_string()
         }
