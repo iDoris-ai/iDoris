@@ -15,10 +15,7 @@ fn memory_event_log() -> Arc<EventLogStore> {
     Arc::new(EventLogStore::new(Connection::open_in_memory().unwrap()).unwrap())
 }
 
-fn events_for_response(
-    event_log: &EventLogStore,
-    response: &Response,
-) -> Vec<EventLogEvent> {
+fn events_for_response(event_log: &EventLogStore, response: &Response) -> Vec<EventLogEvent> {
     let record_id = response
         .headers()
         .get(HEADER_RECORD_ID)
@@ -35,15 +32,17 @@ async fn selected_route_records_one_truthful_decided_event_before_proxy_executio
     let upstream = wiremock::MockServer::start().await;
     wiremock::Mock::given(method("POST"))
         .respond_with(
-            wiremock::ResponseTemplate::new(200)
-                .set_body_json(serde_json::json!({"choices": []})),
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({"choices": []})),
         )
         .expect(1)
         .mount(&upstream)
         .await;
     let event_log = memory_event_log();
     let app = build_app(AppState {
-        cards: vec![super::tests::resident_component_card("omlx", &upstream.uri())],
+        cards: vec![super::tests::resident_component_card(
+            "omlx",
+            &upstream.uri(),
+        )],
         event_log: Some(event_log.clone()),
         ..AppState::default()
     });
@@ -69,12 +68,18 @@ async fn selected_route_records_one_truthful_decided_event_before_proxy_executio
         ]
     );
     let decided = &events[2].event;
-    assert_eq!(decided.metadata.get("status"), Some(&serde_json::json!("selected")));
+    assert_eq!(
+        decided.metadata.get("status"),
+        Some(&serde_json::json!("selected"))
+    );
     assert_eq!(
         decided.metadata.get("provider_id"),
         Some(&serde_json::json!("omlx"))
     );
-    assert_eq!(decided.metadata.get("tier"), Some(&serde_json::json!("local")));
+    assert_eq!(
+        decided.metadata.get("tier"),
+        Some(&serde_json::json!("local"))
+    );
     assert_eq!(
         decided.metadata.get("served_locality"),
         Some(&serde_json::json!("loopback"))
@@ -126,9 +131,7 @@ async fn decided_append_failure_is_generic_503_before_budget_or_upstream() {
     let event_log = memory_event_log();
     let (_dir, ledger) = super::tests::configured_budget_ledger(1_000_000);
     let ledger = Arc::new(ledger);
-    let before = ledger
-        .tenant_readview(budget::PERSONAL_TENANT_ID)
-        .unwrap();
+    let before = ledger.tenant_readview(budget::PERSONAL_TENANT_ID).unwrap();
     let provider_id = "p".repeat(501);
     let app = build_app(AppState {
         cards: vec![super::tests::resident_component_card(
@@ -154,13 +157,8 @@ async fn decided_append_failure_is_generic_503_before_budget_or_upstream() {
     assert_eq!(events[1].event.event_type, EventType::Profiled);
     let body = response.into_body().collect().await.unwrap().to_bytes();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(
-        json["error"]["reason_code"],
-        "EVENT_LOG_APPEND_UNAVAILABLE"
-    );
-    let after = ledger
-        .tenant_readview(budget::PERSONAL_TENANT_ID)
-        .unwrap();
+    assert_eq!(json["error"]["reason_code"], "EVENT_LOG_APPEND_UNAVAILABLE");
+    let after = ledger.tenant_readview(budget::PERSONAL_TENANT_ID).unwrap();
     assert_eq!(after.spent_minor, before.spent_minor);
     assert_eq!(after.available_minor, before.available_minor);
     upstream.verify().await;
