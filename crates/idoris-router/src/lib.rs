@@ -392,6 +392,25 @@ async fn embeddings(
             "paid embeddings are unavailable until embeddings usage settlement is defined",
         );
     }
+    let _reservation = match dispatch::ReservationGuard::reserve(
+        state.budget_ledger.as_deref(),
+        parsed.tenant_id.as_deref(),
+        &selected.card.provider.id,
+        selected.estimated_cost_minor,
+    ) {
+        Ok(guard) => guard,
+        Err(err) => {
+            return budget_error_response(
+                &err,
+                &dispatch::ChatOutcome {
+                    decision: selected.decision.clone(),
+                    served_locality: selected.served_locality,
+                    result: Err(DispatchFailure::Budget(err.clone())),
+                    actual_cost_minor: None,
+                },
+            );
+        }
+    };
 
     let opts = proxy::ForwardOpts {
         request_id: headers
@@ -432,6 +451,7 @@ async fn embeddings(
         response.headers_mut().insert(HEADER_SERVED_LOCALITY, value);
     }
     if outcome.cached {
+        response.extensions_mut().insert(usage::UsageFact::cached());
         response
             .headers_mut()
             .insert(HEADER_CACHED, HeaderValue::from_static("true"));
@@ -442,6 +462,10 @@ async fn embeddings(
                 .headers_mut()
                 .insert(HEADER_ORIGIN_RECORD_ID, value);
         }
+    } else if status.is_success() {
+        response
+            .extensions_mut()
+            .insert(usage::UsageFact::inference(Some(0)));
     }
     response
 }
@@ -1744,7 +1768,8 @@ async fn record_id_middleware(
 ) -> Response {
     let audit_started = Instant::now();
     let record_id = Uuid::new_v4().to_string();
-    let audit_chat = req.method() == Method::POST && req.uri().path() == "/v1/chat/completions";
+    let audit_inference = req.method() == Method::POST
+        && matches!(req.uri().path(), "/v1/chat/completions" | "/v1/embeddings");
     let audit_tenant = audit_tenant_id(&state, req.headers());
     let audit_request_id = audit_header(req.headers(), HEADER_REQUEST_ID, None);
     let audit_privacy = audit_header(req.headers(), "x-idoris-privacy", Some("local_only"));
@@ -1755,7 +1780,7 @@ async fn record_id_middleware(
     if let Ok(value) = HeaderValue::from_str(&record_id) {
         response.headers_mut().insert(HEADER_RECORD_ID, value);
     }
-    if audit_chat {
+    if audit_inference {
         let usage_meta = response
             .extensions()
             .get::<usage::UsageFact>()
