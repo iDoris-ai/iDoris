@@ -57,8 +57,8 @@ pub fn detect_backend(facts: HostFacts) -> BackendChoice {
     }
     BackendChoice {
         kind: BackendKind::LlamaCpp,
-        implemented: false,
-        reason: "no dedicated GPU / non-Apple-Silicon: llama.cpp (GGUF) slot (adapter not implemented yet)",
+        implemented: true,
+        reason: "no dedicated GPU / non-Apple-Silicon: llama.cpp (GGUF) local runtime adapter",
     }
 }
 
@@ -110,21 +110,25 @@ mod tests {
                 };
                 let choice = detect_backend(facts);
                 assert_eq!(choice.kind, kind, "{facts:?}");
-                assert_eq!(choice.implemented, kind == Omlx, "{facts:?}");
+                assert_eq!(
+                    choice.implemented,
+                    matches!(kind, Omlx | LlamaCpp),
+                    "{facts:?}"
+                );
                 assert!(!choice.reason.is_empty());
             }
         }
     }
 
     #[test]
-    fn linux_without_gpu_does_not_claim_omlx_is_implemented() {
+    fn linux_without_gpu_selects_implemented_llama_cpp() {
         let choice = detect_backend(HostFacts {
             platform: Linux,
             arch: Arm64,
             has_nvidia_gpu: false,
         });
         assert_eq!(choice.kind, LlamaCpp);
-        assert!(!choice.implemented);
+        assert!(choice.implemented);
     }
 
     #[test]
