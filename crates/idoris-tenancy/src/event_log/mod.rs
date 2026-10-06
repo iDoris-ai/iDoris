@@ -79,6 +79,14 @@ pub enum EventLogError {
     Json(#[from] serde_json::Error),
 }
 
+/// SQLite-backed Event Log guarded against ordinary DML from every
+/// connection while the canonical schema remains intact.
+///
+/// A peer that can execute DDL against this database (or modify the file
+/// directly) is outside this append-only boundary: such a peer can remove
+/// the guards, rewrite history, and restore the same schema afterward.
+/// SQLite has no privilege layer that can make that history tamper-evident;
+/// callers must keep schema/file-write authority inside the trusted host.
 pub struct EventLogStore(Mutex<Connection>);
 
 impl EventLogStore {
@@ -254,11 +262,36 @@ fn load_by_id(conn: &Connection, event_id: &str) -> Result<Option<EventLogEvent>
 fn schema_objects(conn: &Connection) -> Result<Vec<(String, String, String)>, EventLogError> {
     let mut stmt = conn.prepare(
         "SELECT type,name,sql FROM main.sqlite_master \
-         WHERE sql IS NOT NULL AND (name='event_log_schema_migrations' OR tbl_name='event_log_events') \
+         WHERE sql IS NOT NULL AND (name='event_log_schema_migrations' \
+         OR tbl_name IN ('event_log_events','event_log_schema_migrations')) \
          AND type IN ('table','index','trigger') ORDER BY type,name",
     )?;
     let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
     rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+}
+
+fn migration_schema_objects(
+    conn: &Connection,
+) -> Result<Vec<(String, String, String)>, EventLogError> {
+    let mut stmt = conn.prepare(
+        "SELECT type,name,sql FROM main.sqlite_master \
+         WHERE sql IS NOT NULL AND (name='event_log_schema_migrations' \
+         OR tbl_name='event_log_schema_migrations') \
+         AND type IN ('table','index','trigger') ORDER BY type,name",
+    )?;
+    let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+}
+
+fn verify_canonical_migration_schema(conn: &Connection) -> Result<(), EventLogError> {
+    let canonical = Connection::open_in_memory()?;
+    canonical.execute_batch(
+        "CREATE TABLE IF NOT EXISTS event_log_schema_migrations (version INTEGER PRIMARY KEY)",
+    )?;
+    if migration_schema_objects(conn)? != migration_schema_objects(&canonical)? {
+        return Err(EventLogError::SchemaIncomplete);
+    }
+    Ok(())
 }
 
 fn verify_canonical_schema(conn: &Connection) -> Result<(), EventLogError> {
@@ -277,7 +310,7 @@ fn reject_temp_event_log_objects(conn: &Connection) -> Result<(), EventLogError>
     let objects: i64 = conn.query_row(
         "SELECT count(*) FROM sqlite_temp_master \
          WHERE name IN ('event_log_events','event_log_schema_migrations') \
-         OR tbl_name='event_log_events'",
+         OR tbl_name IN ('event_log_events','event_log_schema_migrations')",
         [],
         |row| row.get(0),
     )?;
@@ -331,6 +364,20 @@ fn migrate(conn: &mut Connection) -> Result<(), EventLogError> {
     tx.execute_batch(
         "CREATE TABLE IF NOT EXISTS main.event_log_schema_migrations (version INTEGER PRIMARY KEY)",
     )?;
+    // Validate this table and all objects attached to it before inserting a
+    // migration marker: an unexpected trigger could otherwise forge Event
+    // Log rows as a side effect of the version=1 INSERT.
+    verify_canonical_migration_schema(&tx)?;
+    let unsupported = tx
+        .query_row(
+            "SELECT version FROM main.event_log_schema_migrations WHERE version<>1 LIMIT 1",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .optional()?;
+    if unsupported.is_some() {
+        return Err(EventLogError::SchemaIncomplete);
+    }
     let applied = tx
         .query_row(
             "SELECT version FROM main.event_log_schema_migrations WHERE version=1",
