@@ -41,7 +41,7 @@ Core product invariants:
 - Router/runtime/fallback/health/capacity designs should actively learn from mature open-source model routers/runtimes while preserving iDoris invariants.
 - Do not regress Rust safety improvements merely to mimic TS behavior; approved differences must be explicit and tested.
 
-## Verified snapshot — 2026-10-05 afternoon
+## Verified snapshot — 2026-10-06 morning
 
 ### Milestone position
 
@@ -49,79 +49,109 @@ Core product invariants:
 - M1-M3: complete.
 - Current milestone: **M4**.
 - TS is reference/PoC only; new product behavior is maintained in Rust.
-- M4 top-level workstreams are B1-B9 + A1-A6.
-- Rust convergence status:
-  - **B1 Rust parity: 39/39 complete; release PR #303 merged to main.**
-  - **B2 recommender-rs: 21/21 complete; release PR #294 merged to main.**
-  - **B3 subscription relay: tasks 01-25 merged; task26-28 are the only remaining B3 closure work.**
-- Critical path: finish B3 tail -> B3 release to main -> R6/default Rust + v0.2.0 -> B4-B9/A lanes -> M4 close -> M5-M8.
+- **B1 Rust parity: complete.**
+- **B2 recommender-rs: complete.**
+- **B3 subscription relay: complete.**
+- **R6/default Rust: complete; v0.2.0 released.**
+- Current frontier: **B4/B5 closeout + B6 Event Log**, then B7/B8 -> B9 -> M5-M8.
 
 ### Live refs at checkpoint write
 
-- `origin/main = 0017c2ba14e37d7e904b7eb8784303477d77920a`
-  - includes B1 final Rust parity release #303 and B2 release #294.
-- `origin/feat/subscription-relay = eb22298a41c2a481cbb4cd307b096e3127219f4b`
-  - includes B3 tasks 01-25 and merged EPERM cleanup fix #315.
+- `origin/main = 6678649d0568961281afe3e6cdcf05893e8b36aa`.
+- Main worktree is intentionally not the development base; it is stale/diverged and contains the user's unrelated untracked `docs/research/RESEARCH-MIGRATION-NOTICE.md`. Do not reset/clean it.
+- Local Node runtime is absent. Do not claim local JS conformance; GitHub CI is the authoritative Node/cross-platform gate.
 
-### B3 tail PRs / exact recovery order
+### Open PR frontier
 
-- **#317** `test(subscription): stabilize reaper cancellation fixture`
-  - head `c398cc18c02a464cd53c3eb797114c5daa04cad0`; base `feat/subscription-relay`.
-  - CI green; external reviewer `clestons` requested; TPR verdict pending at this snapshot.
-  - fixes the second macOS test race: install TERM trap before readiness marker, treat only ESRCH as group gone.
-  - local evidence: targeted cancellation 20/20 consecutive passes; full reaper/cancel suites, clippy/fmt/diff-check green.
-- **#314** `ci(subscription): require B3 Unix safety matrix`
-  - remote approved old head `178e42b...`; local repaired head is **`615ccabf29fdbe8136b36a849e3f4fb835e90903`** in `/Users/jason/Dev/auraai/iDoris-b3-26`.
-  - local head already contains #315 + #317 and the task26 Unix matrix. Rust portion of `scripts/check-subscription.sh` is green; local harness lacks Node runtime so pnpm cannot run locally.
-  - do not push this repaired head before #317 is approved/merged.
-- **#316** `test(subscription): add B3 real CLI smoke`
-  - approved old head `3f0fa7279b364dd62d1f23a1f6eb84bcb3c0553d`; base is #314 branch.
-  - real Mac smoke recorded PASS against Codex CLI 0.156.1 + Claude Code 2.1.289. Do not re-run real account smoke automatically.
-  - local combined/repaired head is **`dd801c0d20c3ab57c7b4c379f27742ca70242afe`** in `/Users/jason/Dev/auraai/iDoris-b3-27`; default no-op smoke/clippy/fmt/diff-check green.
-- **#318** `test(subscription): harden real CLI smoke assertions`
-  - head `9d1dd1c64dae509876fa4f9eb2703f9b1480a5cc`; stacked on #316.
-  - exact-token CLI flag matching, generic fixed-reply failure text, and acceptance wording narrowed to actual evidence; production delta 0.
-  - one macOS run failed on the old base in `subscription_disconnect`; another passed. Repaired task26 base runs the concurrent disconnect case 20/20 locally, so do not duplicate the reaper fix in #318.
-- **task28 release evidence**
-  - worktree `/Users/jason/Dev/auraai/iDoris-b3-28-current`; local final head **`fdeda7013de4869625ca9b52ebb16dad0770b6b3`**.
-  - docs are already synchronized with repaired task27 and honest tested-vs-not-tested wording. Do not open the task28 PR until #314/#316/#317/#318 close; then refresh final PR numbers/status and publish.
+- **#326** B4 paid Resident startup gate
+  - head `15ce77c8c625445a401f155b48add0e45c8d9c65`, base `main`.
+  - CI green; current-head approval still required.
+- **#328** B5 virtual-key SQLite scopes
+  - head `43c3e436cf47b0cad01634818b88006d5aed6e7a`, base `main`.
+  - CI green; current-head approval still required.
+- **#334** B5 chat virtual-key enforcement
+  - head `d90ce7526b1acef298930e5612678bd5686ce1f4`, base #328 branch.
+  - Current-head CI green/CLEAN.
+  - Previous review blocker fixed twice: no shared hard-coded bearer; each Rust conformance server now owns a fresh DB + freshly minted one-time secret; Authorization is origin-scoped.
+  - Local JS conformance not run because Node is absent.
+- **#333** B6 Event Log core
+  - head `964f64db7979381decc2d4f74522ad753f6a473c`, base `main`.
+  - Production diff = **358 changed lines** (301-500 security-hardening exception; double review required).
+  - Static sqlite_master substring validation and predictable behavioral sentinels were both found spoofable during Prime/worker challenge review.
+  - Current design: generate canonical schema in an in-memory SQLite DB from the same migration + migration-table DDL, require exact schema object equality, then run a randomized savepoint behavior probe as defense-in-depth.
+  - Full idoris-tenancy 122/122 plus integration groups, fmt/clippy/diff-check green locally; remote current-head CI/review pending at checkpoint write.
+- **#335** B6 EventLogStore router bootstrap
+  - head `b52dc82c11bc402af70378b72abf1342f29e661e`, base #333 branch.
+- **#336** B6 correlation context
+  - head `7d0ccc4a609f9e82004ea0c87ade993baf12d970`, base #335 branch.
+- **#337** B6 request.received
+  - head `30be822234adc436008587ec3733b5647e1e3abd`, base #336 branch.
+  - CI green after evidence-backed Ubuntu rerun.
+- **#339** B6 profiled event
+  - head `77ea47c08362c4a6ceeef63f3c4fe412a223f09d`, base #337 branch.
+  - Production diff = 80 changed lines.
+  - Emits one `profiled` event after local intent/profile resolution and before routing/budget/upstream; metadata only `intent` + `privacy`; deliberately does not synthesize future M5 `inspected`.
+- **#338** subscription-startup readiness test hardening
+  - head `6a1a061f9e6d163be81e843ee0b39e3beb6735c8`, base `main`.
+  - The target startup-reset regression itself is green, but duplicate push CI exposed unrelated pre-existing flakes. Do not blindly rerun.
+- **#340** load-fence lifetime fix
+  - head `73fdeec27a77782b72aaae99026cf2d51443954f`, base `main`.
+  - Fixes a real Linux `flock` fork/dup lifetime race by explicitly unlocking when the owning `LoadFence` drops; production +11, test +24.
+  - Ownership-focused local repeat 100/100 + full idoris-backend/fmt/clippy/diff-check green; CI/review pending.
 
-### Safe stacked merge sequence
+### B6 sequencing and invariants
 
-1. Merge #317 only after APPROVED + CI green.
-2. Push local task26 repaired head to #314 and require fresh Linux/macOS subscription jobs green; re-review exact head if approval is dismissed.
-3. Before merging #314, repoint #316 to `feat/subscription-relay` so source-branch deletion cannot auto-close it.
-4. Merge #314 after repaired exact-head gates pass.
-5. Validate/re-run #316 on the repaired base; merge when APPROVED + green. Before deleting its source branch, repoint #318 to `feat/subscription-relay`.
-6. Merge #318 when its final-base CI/TPR are green.
-7. Refresh task28 evidence, open/TPR/merge task28. B3 is then 28/28.
+Implemented/published sequence:
 
-### Local final-preview evidence
+1. Event Log core (#333)
+2. router storage bootstrap (#335)
+3. validated correlation context (#336)
+4. `request.received` (#337)
+5. `profiled` (#339)
 
-- B3 release preview combines #315 + #317 + repaired task26 + task27 hardening + task28 and is conflict-free.
-- Full Rust subscription matrix is green locally.
-- `idoris-upstream`: 110/110.
-- `idoris-router --lib`: 251/251.
-- clippy/fmt/diff-check green.
-- local `scripts/check-subscription.sh` reaches pnpm only after all Rust subscription tests pass; local harness has **no Node runtime**, so pnpm/conformance is not locally claimed as passed. GitHub CI is authoritative for Node/cross-platform gates.
+Next B6 work must preserve these invariants:
 
-### R6/v0.2.0 preview evidence
+- Event Log is the truth source and append failures fail closed.
+- Synchronous SQLite on async request paths goes through `spawn_blocking`.
+- tenant scope comes from trusted parsed/internal authority; caller metadata cannot select another tenant.
+- `record_id` is server authority.
+- no prompt/messages/content/body/corrected_output in Event Log metadata.
+- M5 owns real `inspected` privacy scanning; M4 must not synthesize a fake `inspected` event.
+- Before persisting `decided`, preserve the complete routing decision fact. Current `policy_cards()` discards matched-rule metadata and the Supervisor path calls pure `decide()` twice; do not record a partial or duplicated decision.
+- `/v1/feedback` remains required for B6, but `corrected_output` cannot be smuggled through metadata; content storage needs an explicit boundary.
+- M4 acceptance still requires record-id lookup of the decision chain and audit projection from Event Log.
 
-- Worktree `/Users/jason/Dev/auraai/iDoris-r6-preview-current`; current local head **`a941693c37de3f7588a90af1e9a6b326e71a9e0b`** (main + repaired B3 tail preview).
-- `cargo test --workspace --locked`: pass.
-- `cargo deny check advisories bans licenses sources`: pass (existing duplicate/yanked warnings remain warnings).
-- `cargo build --release --locked -p idoris-router`: pass.
-- Release archive contains exactly `idoris` + three runtime config files; `scripts/release-smoke.py` passes from unrelated cwd with clean IDORIS environment.
-- README already states Rust is production and TS is reference; CI rust job already runs Rust release conformance. R6 should not delete TS tooling because shared conformance/reference tests still use Node.
-- Crates remain `0.1.3`; after B3 release/R6 closure, create a dedicated version PR bumping the seven Rust crates + Cargo.lock to `0.2.0`, update progress, then tag `v0.2.0` only after release workflow gates pass. Contract version `1.0.1` is independent and should not be bumped just for crate release version.
+### Safe stacked merge procedure
+
+B5 stack:
+
+1. #328 -> main.
+2. Before merging/deleting #328 source branch, repoint #334 base to main.
+3. Merge #334 only after its current head is APPROVED + green + mergeable.
+
+B6 stack:
+
+1. #333 -> main.
+2. Before merging/deleting #333 source branch, repoint #335 base to main.
+3. Before each subsequent parent branch is deleted, repoint the next child to main:
+   #335 -> #336 -> #337 -> #339 (and later B6 children).
+4. No rebase, no force-push. Temporary base retargeting may widen a child diff until its parent lands; that is expected.
+5. Never treat a dismissed/stale approval as current-head approval.
+
+### CI flake state
+
+- #337's earlier Ubuntu `subscription_startup` ECONNRESET was a readiness-probe panic. #338 makes connect/write/read reset a retryable readiness miss instead of an unwrap panic.
+- #338's later push-run rerun failed in `load_fence::ownership_is_exclusive_even_after_marker_clear`; #340 addresses the underlying fork/dup lock lifetime race.
+- The original #338 push run also ended one `Conformance bad-command negative control` step with exit 143. That is under separate investigation; do not conflate it with load-fence and do not rerun repeatedly without evidence.
 
 ### Immediate next execution order
 
-1. Close #317 -> repaired #314 -> #316 -> #318 -> task28 using the safe stacked order above.
-2. B3 release integration PR to current main; run full CI/shared conformance/FU-26 Tier-1 review.
-3. R6 default-Rust closure + v0.2.0 version/tag/release smoke.
-4. Begin M4 B4 direct-proxy budget reserve/settle, then B5/B6, B7/B8, B9 with A-lane acceptance interleaved.
-5. Continue M5 -> M6 -> M7 -> M8 with the same Prime loop.
+1. Finish current-head CI + TPR on #333/#334/#339/#340 and older #326/#328/#335-#338.
+2. Merge only when APPROVED + all required checks green + mergeable; retarget stacked child bases before deleting parent branches.
+3. After #340 lands, sync #338 to the new main with a normal merge (no rebase) so it gets a fresh SHA and clean CI.
+4. Continue B6 with a small decision-fact seam, then `decided`, record-id query/audit projection, completion/budget events as needed, and `/v1/feedback`.
+5. Close B5/B6, then B7/B8, then B9 to finish M4.
+6. Continue M5 -> M6 -> M7 -> M8 under the same Prime loop.
 
 ## Known review lessons that must not be forgotten
 
