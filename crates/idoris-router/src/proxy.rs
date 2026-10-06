@@ -175,6 +175,22 @@ impl BufferedUpstreamPath {
     };
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct StreamingUpstreamPath {
+    path: &'static str,
+}
+
+impl StreamingUpstreamPath {
+    const CHAT_COMPLETIONS: Self = Self {
+        path: "/v1/chat/completions",
+    };
+
+    #[cfg(test)]
+    pub(crate) const MESSAGES: Self = Self {
+        path: "/v1/messages",
+    };
+}
+
 /// [`ChatProxy::forward_buffered`]'s result.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExecutionDisposition {
@@ -961,12 +977,22 @@ impl ChatProxy {
     /// outright still gets a plain JSON/text error body, never an SSE
     /// stream carrying an error.
     pub async fn forward_stream(&self, endpoint: &str, body: &Value) -> StreamOutcome {
+        self.forward_stream_path(endpoint, StreamingUpstreamPath::CHAT_COMPLETIONS, body)
+            .await
+    }
+
+    pub(crate) async fn forward_stream_path(
+        &self,
+        endpoint: &str,
+        upstream_path: StreamingUpstreamPath,
+        body: &Value,
+    ) -> StreamOutcome {
         // Reject immediately rather than accumulate unbounded waiters.
         let Ok(permit) = self.permits.clone().try_acquire_owned() else {
             return Self::stream_failure(503);
         };
         let permit = Arc::new(permit);
-        let url = format!("{}/v1/chat/completions", endpoint.trim_end_matches('/'));
+        let url = format!("{}{}", endpoint.trim_end_matches('/'), upstream_path.path);
         let mut payload = body.clone();
         if let Some(obj) = payload.as_object_mut() {
             obj.insert("stream".to_string(), Value::Bool(true));
