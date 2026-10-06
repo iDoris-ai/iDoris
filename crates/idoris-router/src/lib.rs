@@ -325,6 +325,10 @@ pub fn build_app(state: AppState) -> Router {
             get(get_tenant_audit).fallback(not_found),
         )
         .route(
+            "/idoris/tenants/{tenant_id}/requests/{record_id}",
+            get(get_request_events).fallback(not_found),
+        )
+        .route(
             "/idoris/tenants/{tenant_id}/budget",
             get(get_tenant_budget).fallback(not_found),
         )
@@ -463,6 +467,57 @@ async fn get_tenant_audit(
             "audit_unavailable",
             "audit query worker failed",
         ),
+    }
+}
+
+async fn get_request_events(
+    State(state): State<Arc<AppState>>,
+    Path((tenant_id, record_id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Response {
+    let scope_tenant = query_scope_header(&headers).map(str::to_string);
+    if scope_tenant.as_deref() != Some(tenant_id.as_str()) {
+        return error_envelope(
+            StatusCode::BAD_REQUEST,
+            "invalid_tenant_scope",
+            "request event query requires matching X-iDoris-Tenant",
+        );
+    }
+    let Some(event_log) = state.event_log.clone() else {
+        return event_log_query_unavailable_response();
+    };
+    let result = tokio::task::spawn_blocking(move || {
+        queries::event_log::query_request_events(
+            &event_log,
+            &tenant_id,
+            scope_tenant.as_deref(),
+            &record_id,
+        )
+    })
+    .await;
+    match result {
+        Ok(Ok(events)) => Json(events).into_response(),
+        Ok(Err(
+            err @ (queries::event_log::RequestEventsQueryError::ScopeRequired
+            | queries::event_log::RequestEventsQueryError::ScopeMismatch),
+        )) => error_envelope(
+            StatusCode::BAD_REQUEST,
+            "invalid_tenant_scope",
+            err.to_string(),
+        ),
+        Ok(Err(queries::event_log::RequestEventsQueryError::InvalidRecordId)) => error_envelope(
+            StatusCode::BAD_REQUEST,
+            "invalid_record_id",
+            "record_id is invalid",
+        ),
+        Ok(Err(queries::event_log::RequestEventsQueryError::NotFound)) => error_envelope(
+            StatusCode::NOT_FOUND,
+            "request_not_found",
+            "request record was not found",
+        ),
+        Ok(Err(queries::event_log::RequestEventsQueryError::EventLog(_))) | Err(_) => {
+            event_log_query_unavailable_response()
+        }
     }
 }
 
@@ -813,6 +868,15 @@ fn event_log_unavailable_response() -> Response {
         StatusCode::SERVICE_UNAVAILABLE,
         "event_log_unavailable",
         "EVENT_LOG_APPEND_UNAVAILABLE",
+        "event log unavailable",
+    )
+}
+
+fn event_log_query_unavailable_response() -> Response {
+    error_envelope_with_reason(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "event_log_unavailable",
+        "EVENT_LOG_QUERY_UNAVAILABLE",
         "event log unavailable",
     )
 }
@@ -1865,6 +1929,9 @@ mod decided_wiring_tests;
 
 #[cfg(test)]
 mod budget_reserved_wiring_tests;
+
+#[cfg(test)]
+mod request_event_query_tests;
 
 #[cfg(test)]
 mod policy_wiring_tests;
