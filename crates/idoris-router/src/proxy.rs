@@ -168,6 +168,11 @@ impl BufferedUpstreamPath {
         path: "/v1/rerank",
         force_non_stream: false,
     };
+
+    pub(crate) const MESSAGES: Self = Self {
+        path: "/v1/messages",
+        force_non_stream: false,
+    };
 }
 
 /// [`ChatProxy::forward_buffered`]'s result.
