@@ -508,6 +508,49 @@ fn temp_shadow_is_rejected_even_with_canonical_main_schema() {
 }
 
 #[test]
+fn attached_shadow_cannot_capture_main_migration_or_event_writes() {
+    let db = temp_db("attached-main");
+    let shadow = temp_db("attached-shadow");
+    let shadow_conn = Connection::open(&shadow).unwrap();
+    shadow_conn
+        .execute_batch(
+            "CREATE TABLE event_log_events(sequence INTEGER PRIMARY KEY, marker TEXT); \
+             CREATE TABLE event_log_schema_migrations(version INTEGER PRIMARY KEY);",
+        )
+        .unwrap();
+    drop(shadow_conn);
+
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("ATTACH DATABASE ?1 AS shadow", [shadow.to_str().unwrap()])
+        .unwrap();
+    let store = EventLogStore::new(conn).unwrap();
+    let event = sample("tenant-a", "attached-record");
+    store.append(Some("tenant-a"), &event).unwrap();
+    drop(store);
+
+    let main = Connection::open(&db).unwrap();
+    assert_eq!(
+        main.query_row(
+            "SELECT count(*) FROM main.event_log_events WHERE event_id=?1",
+            [&event.event_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap(),
+        1
+    );
+    let shadow = Connection::open(&shadow).unwrap();
+    assert_eq!(
+        shadow
+            .query_row("SELECT count(*) FROM event_log_events", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+        0,
+        "attached schemas must not capture Event Log migration/runtime writes"
+    );
+}
+
+#[test]
 fn poisoned_connection_mutex_fails_closed() {
     let store = EventLogStore::new(Connection::open_in_memory().unwrap()).unwrap();
     let _ = std::panic::catch_unwind(|| {
