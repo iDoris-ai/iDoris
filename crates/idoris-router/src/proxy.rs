@@ -185,7 +185,6 @@ impl StreamingUpstreamPath {
         path: "/v1/chat/completions",
     };
 
-    #[cfg(test)]
     pub(crate) const MESSAGES: Self = Self {
         path: "/v1/messages",
     };
