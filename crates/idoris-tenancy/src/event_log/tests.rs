@@ -496,3 +496,65 @@ fn rubric_metadata_accepts_only_bounded_id_pass_objects() {
         ));
     }
 }
+
+#[test]
+fn tenant_query_is_scoped_filtered_limited_and_sequence_stable() {
+    let store = EventLogStore::new(Connection::open_in_memory().unwrap()).unwrap();
+    for (tenant, record, ts) in [
+        ("acme", "r1", 100),
+        ("beta", "private", 150),
+        ("acme", "r2", 200),
+        ("acme", "r1", 300),
+    ] {
+        let mut event = sample(tenant, record);
+        event.event_id = uuid::Uuid::new_v4().to_string();
+        event.ts_utc_ms = ts;
+        store.append(Some(tenant), &event).unwrap();
+    }
+
+    let rows = store
+        .events_for_tenant(
+            Some("acme"),
+            &EventLogQuery {
+                from_ts_utc_ms: Some(100),
+                to_ts_utc_ms: Some(300),
+                record_id: None,
+                limit: 10,
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        rows.iter()
+            .map(|row| row.event.record_id.as_str())
+            .collect::<Vec<_>>(),
+        ["r1", "r2"]
+    );
+    assert!(
+        rows.windows(2)
+            .all(|pair| pair[0].sequence < pair[1].sequence)
+    );
+
+    let exact = store
+        .events_for_tenant(
+            Some("acme"),
+            &EventLogQuery {
+                record_id: Some("r1"),
+                limit: 1,
+                ..EventLogQuery::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(exact.len(), 1);
+    assert_eq!(exact[0].event.record_id, "r1");
+    assert!(
+        store
+            .events_for_tenant(
+                None,
+                &EventLogQuery {
+                    limit: 1,
+                    ..Default::default()
+                }
+            )
+            .is_err()
+    );
+}

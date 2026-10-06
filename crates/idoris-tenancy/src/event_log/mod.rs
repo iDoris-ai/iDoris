@@ -50,6 +50,14 @@ pub struct EventLogEvent {
     pub event: NewEvent,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct EventLogQuery<'a> {
+    pub from_ts_utc_ms: Option<i64>,
+    pub to_ts_utc_ms: Option<i64>,
+    pub record_id: Option<&'a str>,
+    pub limit: usize,
+}
+
 #[derive(Debug, Error)]
 pub enum EventLogError {
     #[error("tenant scope is required")]
@@ -60,6 +68,8 @@ pub enum EventLogError {
     InvalidEventId,
     #[error("record_id is required")]
     InvalidRecordId,
+    #[error("event log query limit must be positive")]
+    InvalidLimit,
     #[error("invalid identifier field {0}")]
     InvalidIdentifier(&'static str),
     #[error("event timestamp must be non-negative")]
@@ -127,6 +137,46 @@ impl EventLogStore {
         let conn = self.0.lock().map_err(|_| EventLogError::LockPoisoned)?;
         let mut stmt = conn.prepare("SELECT sequence,event_id,tenant_id,record_id,event_type,ts_utc_ms,request_id,session_id,trace_id,parent_id,origin_record_id,metadata FROM event_log_events WHERE tenant_id=?1 AND record_id=?2 ORDER BY sequence")?;
         let rows = stmt.query_map(rusqlite::params![scope, record_id], raw_event)?;
+        rows.map(|row| decode(row?)).collect()
+    }
+
+    pub fn events_for_tenant(
+        &self,
+        scope: Option<&str>,
+        query: &EventLogQuery<'_>,
+    ) -> Result<Vec<EventLogEvent>, EventLogError> {
+        let scope = required_scope(scope)?;
+        if let Some(record_id) = query.record_id {
+            if record_id.trim().is_empty() {
+                return Err(EventLogError::InvalidRecordId);
+            }
+            validate_id("record_id", record_id)?;
+        }
+        let limit = i64::try_from(query.limit).map_err(|_| EventLogError::InvalidLimit)?;
+        if limit <= 0 {
+            return Err(EventLogError::InvalidLimit);
+        }
+        let conn = self.0.lock().map_err(|_| EventLogError::LockPoisoned)?;
+        let mut stmt = conn.prepare(
+            "SELECT sequence,event_id,tenant_id,record_id,event_type,ts_utc_ms,request_id,session_id,trace_id,parent_id,origin_record_id,metadata \
+             FROM event_log_events \
+             WHERE tenant_id=?1 \
+               AND (?2 IS NULL OR ts_utc_ms>=?2) \
+               AND (?3 IS NULL OR ts_utc_ms<?3) \
+               AND (?4 IS NULL OR record_id=?4) \
+             ORDER BY sequence \
+             LIMIT ?5",
+        )?;
+        let rows = stmt.query_map(
+            rusqlite::params![
+                scope,
+                query.from_ts_utc_ms,
+                query.to_ts_utc_ms,
+                query.record_id,
+                limit
+            ],
+            raw_event,
+        )?;
         rows.map(|row| decode(row?)).collect()
     }
 }
