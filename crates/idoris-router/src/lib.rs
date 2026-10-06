@@ -59,6 +59,7 @@ pub mod reason;
 pub mod storage;
 mod usage;
 
+mod feedback;
 /// Direct HTTP forwarding for a generic `http_service` component card's
 /// `POST /v1/chat/completions` (R2-G) — retries, idempotency cache; wired
 /// into `chat_completions`/`AppState` below (see the module's own doc for
@@ -336,6 +337,7 @@ pub fn build_app(state: AppState) -> Router {
             "/v1/chat/completions",
             post(chat_completions).fallback(not_found),
         )
+        .route("/v1/feedback", post(post_feedback).fallback(not_found))
         .fallback(not_found)
         .layer(middleware::from_fn(
             connection::request_lifecycle_middleware,
@@ -345,6 +347,65 @@ pub fn build_app(state: AppState) -> Router {
             record_id_middleware,
         ))
         .with_state(state)
+}
+
+async fn post_feedback(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Result<Json<feedback::FeedbackRequest>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let Json(request) = match body {
+        Ok(body) => body,
+        Err(_) => {
+            return error_envelope(
+                StatusCode::BAD_REQUEST,
+                "invalid_json",
+                "feedback body must be valid JSON matching the feedback schema",
+            );
+        }
+    };
+    let tenant_id = match state.deploy_mode {
+        idoris_contracts::DeployMode::Personal => budget::PERSONAL_TENANT_ID.to_string(),
+        idoris_contracts::DeployMode::Tenant => match query_scope_header(&headers) {
+            Some(tenant_id) => tenant_id.to_string(),
+            None => {
+                return error_envelope(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_tenant_scope",
+                    "feedback requires exactly one non-empty X-iDoris-Tenant",
+                );
+            }
+        },
+    };
+    if let Err(err) = request.validate() {
+        return error_envelope(StatusCode::BAD_REQUEST, "invalid_feedback", err.to_string());
+    }
+    let Some(event_log) = state.event_log.clone() else {
+        return event_log_unavailable_response();
+    };
+    let result = tokio::task::spawn_blocking(move || {
+        feedback::append_metadata_feedback(&event_log, &tenant_id, request)
+    })
+    .await;
+    match result {
+        Ok(Ok(())) => StatusCode::NO_CONTENT.into_response(),
+        Ok(Err(feedback::FeedbackError::InvalidRecordId)) => error_envelope(
+            StatusCode::BAD_REQUEST,
+            "invalid_record_id",
+            "record_id is invalid",
+        ),
+        Ok(Err(feedback::FeedbackError::NotFound)) => error_envelope(
+            StatusCode::NOT_FOUND,
+            "request_not_found",
+            "request record was not found",
+        ),
+        Ok(Err(feedback::FeedbackError::EventLog(_))) | Err(_) => event_log_unavailable_response(),
+        Ok(Err(feedback::FeedbackError::Invalid(_))) => error_envelope(
+            StatusCode::BAD_REQUEST,
+            "invalid_feedback",
+            "feedback payload is invalid",
+        ),
+    }
 }
 
 async fn get_tenant_usage(
@@ -2267,6 +2328,9 @@ mod stream_completed_wiring_tests;
 
 #[cfg(test)]
 mod stream_buffered_completed_wiring_tests;
+
+#[cfg(test)]
+mod feedback_wiring_tests;
 
 #[cfg(test)]
 mod request_event_query_tests;
