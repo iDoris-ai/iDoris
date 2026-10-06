@@ -678,7 +678,9 @@ async fn dispatch_local_inner(
                                     .await
                                     .is_err()
                             {
-                                return Err(ObservedDispatchError::EventLogUnavailable);
+                                eprintln!(
+                                    "idoris: budget.settled event write failed after committed settlement"
+                                );
                             }
                             Some(settled_minor)
                         }
