@@ -2003,6 +2003,9 @@ mod messages_wiring_tests;
 mod protocol_stream_path_tests;
 
 #[cfg(test)]
+mod protocol_error_matrix_tests;
+
+#[cfg(test)]
 mod policy_wiring_tests;
 
 #[cfg(test)]
