@@ -22,6 +22,7 @@ pub mod chat;
 pub mod detect;
 pub mod error;
 pub mod factory;
+pub mod local_runtime;
 pub mod omlx;
 pub mod remote;
 pub mod subscription;
@@ -31,6 +32,7 @@ pub use chat::{
     ensure_terminated,
 };
 pub use error::UpstreamError;
+pub use local_runtime::{LocalRuntimeKind, LocalRuntimeLaunch};
 pub use omlx::{OmlxAdapter, OmlxAdapterConfig};
 pub use remote::{CredentialSource, EnvCredentialSource};
 
