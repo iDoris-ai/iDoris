@@ -1,3 +1,4 @@
+use idoris_tenancy::event_log::EventLogEvent;
 use idoris_tenancy::store::{RecordKind, StoreError, TenantRecord, TenantStore};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -106,6 +107,66 @@ pub fn query_audit(
             })
             .collect(),
     })
+}
+
+pub fn project_event_audit(path_tenant: &str, events: &[EventLogEvent]) -> AuditResponse {
+    let mut records: Vec<AuditRecordView> = Vec::new();
+    for row in events {
+        let event = &row.event;
+        if event.tenant_id != path_tenant {
+            continue;
+        }
+        let index = records
+            .iter()
+            .position(|record| record.record_id == event.record_id)
+            .unwrap_or_else(|| {
+                let mut payload = Map::new();
+                payload.insert(
+                    "request_id".into(),
+                    serde_json::json!(event.request_id.as_deref().unwrap_or(&event.record_id)),
+                );
+                payload.insert("component".into(), serde_json::json!("router"));
+                records.push(AuditRecordView {
+                    record_id: event.record_id.clone(),
+                    request_id: event
+                        .request_id
+                        .clone()
+                        .unwrap_or_else(|| event.record_id.clone()),
+                    origin_record_id: event.origin_record_id.clone(),
+                    payload,
+                });
+                records.len() - 1
+            });
+        let record = &mut records[index];
+        record
+            .payload
+            .insert("ts_utc".into(), serde_json::json!(event.ts_utc_ms));
+        if record.origin_record_id.is_none() {
+            record.origin_record_id = event.origin_record_id.clone();
+        }
+        for key in [
+            "intent",
+            "privacy",
+            "tier",
+            "provider_id",
+            "model_id",
+            "tokens_in",
+            "tokens_out",
+            "cost_minor",
+            "latency_ms",
+        ] {
+            if let Some(value) = event.metadata.get(key) {
+                record.payload.insert(key.to_string(), value.clone());
+            }
+        }
+        if let Some(value) = event.metadata.get("settled_minor") {
+            record.payload.insert("cost_minor".into(), value.clone());
+        }
+    }
+    AuditResponse {
+        tenant_id: path_tenant.to_string(),
+        records,
+    }
 }
 
 fn audit_timestamp(record: &TenantRecord) -> Result<f64, AuditQueryError> {
@@ -257,5 +318,57 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(error, AuditQueryError::InvalidRecord { .. }));
+    }
+
+    #[test]
+    fn event_projection_groups_records_without_inventing_legacy_fields() {
+        use idoris_tenancy::event_log::{EventLogEvent, EventType, NewEvent};
+        use std::collections::BTreeMap;
+
+        let event = |sequence, record_id: &str, event_type, ts, metadata| EventLogEvent {
+            sequence,
+            event: NewEvent {
+                event_id: uuid::Uuid::new_v4().to_string(),
+                tenant_id: "acme".into(),
+                record_id: record_id.into(),
+                event_type,
+                ts_utc_ms: ts,
+                request_id: None,
+                session_id: None,
+                trace_id: None,
+                parent_id: None,
+                origin_record_id: None,
+                metadata,
+            },
+        };
+        let rows = vec![
+            event(
+                1,
+                "r1",
+                EventType::Profiled,
+                100,
+                BTreeMap::from([("privacy".into(), json!("local_only"))]),
+            ),
+            event(
+                2,
+                "r1",
+                EventType::BudgetSettled,
+                200,
+                BTreeMap::from([("settled_minor".into(), json!(7))]),
+            ),
+            event(3, "r2", EventType::RequestReceived, 300, BTreeMap::new()),
+        ];
+
+        let projected = project_event_audit("acme", &rows);
+        assert_eq!(projected.records.len(), 2);
+        assert_eq!(projected.records[0].record_id, "r1");
+        assert_eq!(projected.records[0].request_id, "r1");
+        assert_eq!(projected.records[0].payload["component"], json!("router"));
+        assert_eq!(projected.records[0].payload["privacy"], json!("local_only"));
+        assert_eq!(projected.records[0].payload["cost_minor"], json!(7));
+        assert_eq!(projected.records[0].payload["ts_utc"], json!(200));
+        assert!(!projected.records[0].payload.contains_key("status"));
+        assert!(!projected.records[0].payload.contains_key("reason"));
+        assert_eq!(projected.records[1].record_id, "r2");
     }
 }
