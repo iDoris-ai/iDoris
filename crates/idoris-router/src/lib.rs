@@ -322,6 +322,7 @@ pub fn build_app(state: AppState) -> Router {
             post(chat_completions).fallback(not_found),
         )
         .route("/v1/embeddings", post(embeddings).fallback(not_found))
+        .route("/v1/rerank", post(rerank).fallback(not_found))
         .fallback(not_found)
         .layer(middleware::from_fn(
             connection::request_lifecycle_middleware,
@@ -407,6 +408,111 @@ async fn embeddings(
         .forward_buffered_path(
             &selected.card.endpoint,
             proxy::BufferedUpstreamPath::EMBEDDINGS,
+            &value,
+            &opts,
+        )
+        .await;
+    let status = StatusCode::from_u16(outcome.status).unwrap_or(StatusCode::BAD_GATEWAY);
+    let mut response = (status, outcome.body).into_response();
+    let content_type = outcome
+        .content_type
+        .as_deref()
+        .unwrap_or("application/json");
+    if let Ok(value) = HeaderValue::from_str(content_type) {
+        response
+            .headers_mut()
+            .insert(axum::http::header::CONTENT_TYPE, value);
+    }
+    if let Ok(value) = HeaderValue::from_str(locality_str(
+        outcome
+            .replayed_served_locality
+            .unwrap_or(selected.served_locality),
+    )) {
+        response.headers_mut().insert(HEADER_SERVED_LOCALITY, value);
+    }
+    if outcome.cached {
+        response
+            .headers_mut()
+            .insert(HEADER_CACHED, HeaderValue::from_static("true"));
+        if let Some(origin) = outcome.origin_record_id
+            && let Ok(value) = HeaderValue::from_str(&origin)
+        {
+            response
+                .headers_mut()
+                .insert(HEADER_ORIGIN_RECORD_ID, value);
+        }
+    }
+    response
+}
+
+async fn rerank(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Extension(RequestRecordId(record_id)): Extension<RequestRecordId>,
+    body: Bytes,
+) -> Response {
+    let value: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(value) => value,
+        Err(_) => {
+            return error_envelope(
+                StatusCode::BAD_REQUEST,
+                "invalid_json",
+                "request body is not valid JSON",
+            );
+        }
+    };
+    let Some(object) = value.as_object() else {
+        return error_envelope(
+            StatusCode::BAD_REQUEST,
+            "invalid_body",
+            "request body must be a JSON object",
+        );
+    };
+    let model = object.get("model").and_then(serde_json::Value::as_str);
+    let mut parsed = match parse_profile(&headers, model, state.deploy_mode) {
+        Ok(parsed) => parsed,
+        Err(error) => return error.into_response(),
+    };
+    parsed.task.capabilities = Some(vec![Capability::Rerank]);
+
+    let (cards, _) = dispatch::policy_cards(&state.cards, &state.routing_policy, &parsed);
+    let cards = cards
+        .into_iter()
+        .filter(dispatch::is_resident_http_service)
+        .collect::<Vec<_>>();
+    let selected = match dispatch::select(&cards, &parsed, "") {
+        Ok(selected) => selected,
+        Err(DispatchError::Rejection(rejection)) => return rejection_response(rejection),
+        Err(DispatchError::Internal(message)) => {
+            return error_envelope(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", message);
+        }
+    };
+
+    let cost = &selected.card.provider.cost;
+    if cost.input_per_m != 0.0 || cost.output_per_m != 0.0 {
+        return error_envelope(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "paid_proxy_unavailable",
+            "paid rerank is unavailable until rerank usage settlement is defined",
+        );
+    }
+
+    let opts = proxy::ForwardOpts {
+        request_id: headers
+            .get(HEADER_REQUEST_ID)
+            .and_then(|value| value.to_str().ok()),
+        tenant_id: parsed.tenant_id.as_deref(),
+        record_id: &record_id,
+        provider_id: selected.card.provider.id.as_str(),
+        served_locality: selected.served_locality,
+        privacy: parsed.task.privacy.unwrap_or(PrivacyClass::LocalOnly),
+        require_openai_usage: false,
+    };
+    let outcome = state
+        .proxy
+        .forward_buffered_path(
+            &selected.card.endpoint,
+            proxy::BufferedUpstreamPath::RERANK,
             &value,
             &opts,
         )
@@ -1707,6 +1813,9 @@ mod local_privacy_tests;
 
 #[cfg(test)]
 mod embeddings_wiring_tests;
+
+#[cfg(test)]
+mod rerank_wiring_tests;
 
 #[cfg(test)]
 mod policy_wiring_tests;
