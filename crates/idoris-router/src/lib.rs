@@ -100,8 +100,8 @@ use serde_json::json;
 use uuid::Uuid;
 
 use dispatch::{
-    DispatchError, DispatchFailure, LocalExecutionContext, Selected, dispatch_local,
-    dispatch_local_preselected_observed, reason_header_value,
+    DispatchError, DispatchFailure, LocalExecutionContext, ObservedDispatchError, Selected,
+    dispatch_local, dispatch_local_preselected_observed, reason_header_value,
 };
 use profile::{ParsedProfile, ProfileError, parse_profile};
 
@@ -788,7 +788,6 @@ fn dispatch_failure_response(
     match failure {
         DispatchFailure::Backend(err) => backend_error_response(err, outcome),
         DispatchFailure::Budget(err) => budget_error_response(err, outcome),
-        DispatchFailure::EventLogUnavailable => event_log_unavailable_response(),
     }
 }
 
@@ -1317,7 +1316,7 @@ async fn chat_completions(
         .and_then(|selected| state.runtimes.get(&selected.card.provider.id));
     let budget_ledger = state.budget_ledger.as_deref();
     let dispatch_result = if let Some(selected) = selected_for_dispatch.as_ref() {
-        dispatch_local_preselected_observed(
+        match dispatch_local_preselected_observed(
             selected,
             LocalExecutionContext::new(supervisor, budget_ledger, budget_event_context.as_ref()),
             &parsed,
@@ -1326,6 +1325,13 @@ async fn chat_completions(
             lifecycle.cancellation_token(),
         )
         .await
+        {
+            Ok(outcome) => Ok(outcome),
+            Err(ObservedDispatchError::Dispatch(error)) => Err(error),
+            Err(ObservedDispatchError::EventLogUnavailable) => {
+                return event_log_unavailable_response();
+            }
+        }
     } else {
         dispatch_local(
             &policy_cards.cards,

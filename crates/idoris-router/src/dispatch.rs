@@ -140,7 +140,6 @@ fn candidate(component: &ComponentCard, prompt: &str) -> Card {
 pub enum DispatchFailure {
     Backend(BackendError),
     Budget(BudgetError),
-    EventLogUnavailable,
 }
 
 /// What [`dispatch_local`] returns on a successful `decide()`.
@@ -166,6 +165,18 @@ pub enum DispatchError {
     /// construction; kept as a typed error instead of `expect()` so a
     /// latent bug fails closed with a 500, never a panic.
     Internal(String),
+}
+
+#[derive(Debug)]
+pub(crate) enum ObservedDispatchError {
+    Dispatch(DispatchError),
+    EventLogUnavailable,
+}
+
+impl From<DispatchError> for ObservedDispatchError {
+    fn from(value: DispatchError) -> Self {
+        Self::Dispatch(value)
+    }
 }
 
 /// What [`select`] returns: everything a caller needs to route between the
@@ -365,15 +376,17 @@ pub async fn dispatch_local(
     messages: Vec<ChatMessage>,
     cancel: CancellationToken,
 ) -> Result<ChatOutcome, DispatchError> {
-    dispatch_local_inner(
-        LocalSelection::Cards(cards),
-        LocalExecutionContext::new(supervisor, budget_ledger, None),
-        profile,
-        input,
-        messages,
-        cancel,
+    public_dispatch_result(
+        dispatch_local_inner(
+            LocalSelection::Cards(cards),
+            LocalExecutionContext::new(supervisor, budget_ledger, None),
+            profile,
+            input,
+            messages,
+            cancel,
+        )
+        .await,
     )
-    .await
 }
 
 /// Executes a selection the caller already computed with select().
@@ -388,15 +401,17 @@ pub async fn dispatch_local_preselected(
     messages: Vec<ChatMessage>,
     cancel: CancellationToken,
 ) -> Result<ChatOutcome, DispatchError> {
-    dispatch_local_inner(
-        LocalSelection::Preselected(selected),
-        LocalExecutionContext::new(supervisor, budget_ledger, None),
-        profile,
-        input,
-        messages,
-        cancel,
+    public_dispatch_result(
+        dispatch_local_inner(
+            LocalSelection::Preselected(selected),
+            LocalExecutionContext::new(supervisor, budget_ledger, None),
+            profile,
+            input,
+            messages,
+            cancel,
+        )
+        .await,
     )
-    .await
 }
 
 pub(crate) async fn dispatch_local_preselected_observed(
@@ -406,7 +421,7 @@ pub(crate) async fn dispatch_local_preselected_observed(
     input: DispatchInput<'_>,
     messages: Vec<ChatMessage>,
     cancel: CancellationToken,
-) -> Result<ChatOutcome, DispatchError> {
+) -> Result<ChatOutcome, ObservedDispatchError> {
     dispatch_local_inner(
         LocalSelection::Preselected(selected),
         execution,
@@ -416,6 +431,18 @@ pub(crate) async fn dispatch_local_preselected_observed(
         cancel,
     )
     .await
+}
+
+fn public_dispatch_result(
+    result: Result<ChatOutcome, ObservedDispatchError>,
+) -> Result<ChatOutcome, DispatchError> {
+    match result {
+        Ok(outcome) => Ok(outcome),
+        Err(ObservedDispatchError::Dispatch(error)) => Err(error),
+        Err(ObservedDispatchError::EventLogUnavailable) => Err(DispatchError::Internal(
+            "event log observer is unavailable on an unobserved dispatch path".to_string(),
+        )),
+    }
 }
 
 pub(crate) struct LocalExecutionContext<'a> {
@@ -450,7 +477,7 @@ async fn dispatch_local_inner(
     input: DispatchInput<'_>,
     messages: Vec<ChatMessage>,
     cancel: CancellationToken,
-) -> Result<ChatOutcome, DispatchError> {
+) -> Result<ChatOutcome, ObservedDispatchError> {
     let LocalExecutionContext {
         supervisor,
         budget_ledger,
@@ -513,12 +540,7 @@ async fn dispatch_local_inner(
             .await
             .is_err()
     {
-        return Ok(ChatOutcome {
-            decision,
-            served_locality,
-            result: Err(DispatchFailure::EventLogUnavailable),
-            actual_cost_minor: None,
-        });
+        return Err(ObservedDispatchError::EventLogUnavailable);
     }
     // From here on, `reservation_guard`'s Drop releases the reservation on
     // any early return *and* on this future being dropped mid-`.await`
