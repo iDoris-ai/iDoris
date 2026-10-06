@@ -84,7 +84,7 @@ async fn selected_route_records_one_truthful_decided_event_before_proxy_executio
         decided.metadata.get("served_locality"),
         Some(&serde_json::json!("loopback"))
     );
-    assert!(decided.metadata.get("rule_id").is_some());
+    assert!(decided.metadata.contains_key("rule_id"));
     let rendered = serde_json::to_string(&decided.metadata).unwrap();
     assert!(!rendered.contains("private prompt"));
     upstream.verify().await;
@@ -117,7 +117,7 @@ async fn empty_candidate_rejection_records_decided_before_returning() {
         events[2].event.metadata.get("reason"),
         Some(&serde_json::json!("local_only_unavailable"))
     );
-    assert!(events[2].event.metadata.get("rule_id").is_some());
+    assert!(events[2].event.metadata.contains_key("rule_id"));
 }
 
 #[tokio::test]
