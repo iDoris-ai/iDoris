@@ -381,7 +381,6 @@ pub async fn dispatch_local(
 /// The ordinary dispatch_local path remains available for callers that do
 /// not already have a canonical Selected value.
 pub async fn dispatch_local_preselected(
-    cards: &[ComponentCard],
     selected: &Selected,
     supervisor: Option<&BoundSupervisor>,
     budget_ledger: Option<&BudgetLedger>,
@@ -391,7 +390,7 @@ pub async fn dispatch_local_preselected(
     cancel: CancellationToken,
 ) -> Result<ChatOutcome, DispatchError> {
     dispatch_local_inner(
-        cards,
+        &[],
         Some(selected),
         supervisor,
         budget_ledger,
@@ -791,7 +790,6 @@ routing_policy:
         let profile = empty_profile();
         let selected = select(std::slice::from_ref(&card), &profile, "").unwrap();
         let outcome = dispatch_local_preselected(
-            &[],
             &selected,
             None,
             None,
