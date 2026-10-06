@@ -216,7 +216,10 @@ export async function spawnConformanceServer(opts: SpawnOptions): Promise<Runnin
       throw new Error("Rust conformance requires IDORIS_CONFORMANCE_KEY_SEEDER");
     }
     rustStateDir = mkdtempSync(join(tmpdir(), "idoris-conformance-"));
-    rustDbPath = opts.env?.IDORIS_DB_PATH ?? join(rustStateDir, "state.sqlite3");
+    // Rust auth state is intentionally per spawned server. Caller env may
+    // carry an IDORIS_DB_PATH for the TS reference, but it must never defeat
+    // Rust conformance key isolation or keep a prior server's key active.
+    rustDbPath = join(rustStateDir, "state.sqlite3");
     const seeded = spawnSync(seeder, [rustDbPath], { encoding: "utf8" });
     if (seeded.error !== undefined || seeded.status !== 0) {
       rmSync(rustStateDir, { recursive: true, force: true });

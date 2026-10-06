@@ -37,7 +37,7 @@ async function start(env: NodeJS.ProcessEnv): Promise<RunningServer> {
     componentsDir: fixture.componentsDir,
     routingPolicyPath: routingPolicyFixturePath,
     pathPrepend: fixture.pathPrepend,
-    env: { ...env, IDORIS_DB_PATH: fixture.markerPath + ".sqlite3" },
+    env,
   });
 }
 
@@ -73,7 +73,7 @@ async function expectStartupFailure(env: NodeJS.ProcessEnv): Promise<void> {
     componentsDir: fixture.componentsDir,
     routingPolicyPath: routingPolicyFixturePath,
     pathPrepend: fixture.pathPrepend,
-    env: { ...env, IDORIS_DB_PATH: fixture.markerPath + ".sqlite3" },
+    env,
     healthTimeoutMs: 3_000,
   }).then(
     async (running) => {
