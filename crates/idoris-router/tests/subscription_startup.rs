@@ -172,15 +172,17 @@ fn run_production_startup(
         if child.try_wait().unwrap().is_some() {
             break;
         }
-        if let Ok(mut stream) = std::net::TcpStream::connect(("127.0.0.1", port)) {
-            stream
+        if let Ok(mut stream) = std::net::TcpStream::connect(("127.0.0.1", port))
+            && stream
                 .write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
-                .unwrap();
+                .is_ok()
+        {
             let mut response = String::new();
-            stream.read_to_string(&mut response).unwrap();
-            assert!(response.starts_with("HTTP/1.1 200"), "{response}");
-            started = true;
-            break;
+            if stream.read_to_string(&mut response).is_ok() {
+                assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+                started = true;
+                break;
+            }
         }
         if Instant::now() >= deadline {
             break;
