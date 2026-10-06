@@ -928,7 +928,7 @@ impl ChatProxy {
         // preflight and immediately before polling reqwest's send future.
         // Reject immediately rather than accumulate unbounded waiters.
         let Ok(permit) = self.permits.clone().try_acquire_owned() else {
-            return Ok(Self::stream_failure(503));
+            return Ok(Self::stream_failure(503, ExecutionDisposition::NotExecuted));
         };
         let permit = Arc::new(permit);
         let url = format!("{}/v1/chat/completions", endpoint.trim_end_matches('/'));
@@ -944,7 +944,9 @@ impl ChatProxy {
         .await
         {
             Ok(sent) => sent,
-            Err(_) => return Ok(Self::stream_failure(504)),
+            Err(_) => {
+                return Ok(Self::stream_failure(504, ExecutionDisposition::Uncertain));
+            }
         };
         Ok(match sent {
             Ok(resp) => {
@@ -1090,21 +1092,32 @@ impl ChatProxy {
                             status,
                             body: with_permit(body, Arc::clone(&permit)),
                             content_type,
+                            execution: ExecutionDisposition::Executed,
                         },
-                        Err(status) => Self::stream_failure(status),
+                        Err(status) => {
+                            Self::stream_failure(status, ExecutionDisposition::Uncertain)
+                        }
                     }
                 }
             }
-            Err(err) => Self::stream_failure(if err.is_timeout() { 504 } else { 502 }),
+            Err(err) => Self::stream_failure(
+                if err.is_timeout() { 504 } else { 502 },
+                if err.is_connect() {
+                    ExecutionDisposition::NotExecuted
+                } else {
+                    ExecutionDisposition::Uncertain
+                },
+            ),
         })
     }
 
-    fn stream_failure(status: u16) -> StreamOutcome {
+    fn stream_failure(status: u16, execution: ExecutionDisposition) -> StreamOutcome {
         let failure = Self::failure(status, 0);
         StreamOutcome::Buffered {
             status,
             body: failure.body,
             content_type: failure.content_type,
+            execution,
         }
     }
 }
@@ -1120,6 +1133,7 @@ pub enum StreamOutcome {
         status: u16,
         body: Bytes,
         content_type: Option<String>,
+        execution: ExecutionDisposition,
     },
     Stream {
         status: u16,
@@ -1685,6 +1699,7 @@ mod tests {
                 status,
                 body,
                 content_type,
+                ..
             } => {
                 assert_eq!(status, 502);
                 assert_eq!(content_type.as_deref(), Some("application/json"));

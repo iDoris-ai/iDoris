@@ -1729,8 +1729,17 @@ async fn chat_via_proxy_stream(
             status,
             body,
             content_type,
+            execution,
         } => {
             let status = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
+            if execution != proxy::ExecutionDisposition::NotExecuted
+                && let Some(context) = events.completed
+                && append_completed(context, selected, "failure")
+                    .await
+                    .is_err()
+            {
+                return event_log_unavailable_response();
+            }
             let mut response = (status, body).into_response();
             let content_type = content_type.as_deref().unwrap_or("application/json");
             if let Ok(v) = HeaderValue::from_str(content_type) {
@@ -2255,6 +2264,9 @@ mod proxy_completed_wiring_tests;
 
 #[cfg(test)]
 mod stream_completed_wiring_tests;
+
+#[cfg(test)]
+mod stream_buffered_completed_wiring_tests;
 
 #[cfg(test)]
 mod request_event_query_tests;
