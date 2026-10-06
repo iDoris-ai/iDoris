@@ -85,6 +85,14 @@ async fn selected_route_records_one_truthful_decided_event_before_proxy_executio
         Some(&serde_json::json!("loopback"))
     );
     assert!(decided.metadata.contains_key("rule_id"));
+    assert_eq!(
+        decided.metadata.get("reason_codes"),
+        Some(&serde_json::json!([
+            "privacy_loopback_only",
+            "budget_no_tenant_context",
+            "admission_ready"
+        ]))
+    );
     let rendered = serde_json::to_string(&decided.metadata).unwrap();
     assert!(!rendered.contains("private prompt"));
     upstream.verify().await;
