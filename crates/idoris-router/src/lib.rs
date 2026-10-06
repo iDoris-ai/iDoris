@@ -1166,16 +1166,25 @@ pub(crate) async fn append_completed(
     selected: &Selected,
     status: &'static str,
 ) -> Result<(), ()> {
+    append_completed_fields(
+        context,
+        selected.card.provider.id.as_str(),
+        selected.served_locality,
+        status,
+    )
+    .await
+}
+
+async fn append_completed_fields(
+    context: &CompletedEventContext,
+    provider_id: &str,
+    served_locality: idoris_contracts::provider::Locality,
+    status: &'static str,
+) -> Result<(), ()> {
     let mut metadata = std::collections::BTreeMap::new();
     metadata.insert("status".to_string(), json!(status));
-    metadata.insert(
-        "provider_id".to_string(),
-        json!(selected.card.provider.id.as_str()),
-    );
-    metadata.insert(
-        "served_locality".to_string(),
-        json!(selected.served_locality),
-    );
+    metadata.insert("provider_id".to_string(), json!(provider_id));
+    metadata.insert("served_locality".to_string(), json!(served_locality));
     let ts_utc_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .ok()
@@ -1686,7 +1695,7 @@ async fn chat_via_proxy(
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
     if stream_requested {
-        return chat_via_proxy_stream(state, selected, body_value, events.dispatched).await;
+        return chat_via_proxy_stream(state, selected, body_value, events).await;
     }
     chat_via_proxy_buffered(
         state, selected, headers, parsed, body_value, record_id, events,
@@ -1701,12 +1710,12 @@ async fn chat_via_proxy_stream(
     state: &AppState,
     selected: &Selected,
     body_value: &serde_json::Value,
-    dispatched_event: Option<&DispatchedEventContext>,
+    events: ProxyEventContexts<'_>,
 ) -> Response {
     let outcome = state
         .proxy
         .forward_stream_observed(&selected.card.endpoint, body_value, || async {
-            if let Some(context) = dispatched_event {
+            if let Some(context) = events.dispatched {
                 append_dispatched(context, selected).await?;
             }
             Ok::<(), ()>(())
@@ -1743,7 +1752,12 @@ async fn chat_via_proxy_stream(
             // Validate application termination around the permit-owning body.
             // Producer timeouts remain errors; only clean EOF without [DONE]
             // becomes an explicit truncation error.
-            let body = terminated_proxy_body(upstream);
+            let body = terminated_proxy_body_observed(
+                upstream,
+                events.completed.cloned(),
+                selected.card.provider.id.clone(),
+                selected.served_locality,
+            );
             let mut response = Response::builder()
                 .status(status)
                 .body(body)
@@ -1768,6 +1782,72 @@ async fn chat_via_proxy_stream(
 }
 
 /// Preserve proxy deadlines and ownership while rejecting incomplete SSE.
+fn terminated_proxy_body_observed(
+    upstream: Body,
+    completed_event: Option<CompletedEventContext>,
+    provider_id: String,
+    served_locality: idoris_contracts::provider::Locality,
+) -> Body {
+    use futures_util::StreamExt;
+
+    let guarded = sse::ensure_terminated(upstream.into_data_stream());
+    let observed = futures_util::stream::unfold(
+        (
+            Box::pin(guarded),
+            completed_event,
+            provider_id,
+            served_locality,
+            false,
+        ),
+        |(mut inner, mut event, provider_id, served_locality, finished)| async move {
+            if finished {
+                return None;
+            }
+            match inner.next().await {
+                Some(Ok(bytes)) => Some((
+                    Ok(bytes),
+                    (inner, event, provider_id, served_locality, false),
+                )),
+                Some(Err(err)) => {
+                    let append_failed = if let Some(context) = event.take() {
+                        append_completed_fields(&context, &provider_id, served_locality, "failure")
+                            .await
+                            .is_err()
+                    } else {
+                        false
+                    };
+                    let err = if append_failed {
+                        std::io::Error::other("event log unavailable")
+                    } else {
+                        err
+                    };
+                    Some((Err(err), (inner, event, provider_id, served_locality, true)))
+                }
+                None => {
+                    if let Some(context) = event.take()
+                        && append_completed_fields(
+                            &context,
+                            &provider_id,
+                            served_locality,
+                            "success",
+                        )
+                        .await
+                        .is_err()
+                    {
+                        return Some((
+                            Err(std::io::Error::other("event log unavailable")),
+                            (inner, event, provider_id, served_locality, true),
+                        ));
+                    }
+                    None
+                }
+            }
+        },
+    );
+    Body::from_stream(observed)
+}
+
+#[cfg(test)]
 fn terminated_proxy_body(upstream: Body) -> Body {
     Body::from_stream(sse::ensure_terminated(upstream.into_data_stream()))
 }
@@ -2172,6 +2252,9 @@ mod budget_settled_wiring_tests;
 
 #[cfg(test)]
 mod proxy_completed_wiring_tests;
+
+#[cfg(test)]
+mod stream_completed_wiring_tests;
 
 #[cfg(test)]
 mod request_event_query_tests;
