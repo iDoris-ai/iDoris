@@ -144,17 +144,7 @@ pub fn project_event_audit(path_tenant: &str, events: &[EventLogEvent]) -> Audit
         if record.origin_record_id.is_none() {
             record.origin_record_id = event.origin_record_id.clone();
         }
-        for key in [
-            "intent",
-            "privacy",
-            "tier",
-            "provider_id",
-            "model_id",
-            "tokens_in",
-            "tokens_out",
-            "cost_minor",
-            "latency_ms",
-        ] {
+        for key in ["intent", "privacy", "tier", "provider_id", "model_id"] {
             if let Some(value) = event.metadata.get(key) {
                 record.payload.insert(key.to_string(), value.clone());
             }
@@ -347,7 +337,13 @@ mod tests {
                 "r1",
                 EventType::Profiled,
                 100,
-                BTreeMap::from([("privacy".into(), json!("local_only"))]),
+                BTreeMap::from([
+                    ("privacy".into(), json!("local_only")),
+                    ("tokens_in".into(), json!(999)),
+                    ("tokens_out".into(), json!(888)),
+                    ("latency_ms".into(), json!(777)),
+                    ("cost_minor".into(), json!(666)),
+                ]),
             ),
             event(
                 2,
@@ -369,6 +365,9 @@ mod tests {
         assert_eq!(projected.records[0].payload["ts_utc"], json!(200));
         assert!(!projected.records[0].payload.contains_key("status"));
         assert!(!projected.records[0].payload.contains_key("reason"));
+        assert!(!projected.records[0].payload.contains_key("tokens_in"));
+        assert!(!projected.records[0].payload.contains_key("tokens_out"));
+        assert!(!projected.records[0].payload.contains_key("latency_ms"));
         assert_eq!(projected.records[1].record_id, "r2");
     }
 }
