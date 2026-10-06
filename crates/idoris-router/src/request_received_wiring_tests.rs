@@ -17,6 +17,21 @@ fn memory_event_log() -> Arc<EventLogStore> {
     Arc::new(EventLogStore::new(Connection::open_in_memory().unwrap()).unwrap())
 }
 
+fn events(
+    event_log: &EventLogStore,
+    response: &Response,
+) -> Vec<idoris_tenancy::event_log::EventLogEvent> {
+    let record_id = response
+        .headers()
+        .get(HEADER_RECORD_ID)
+        .unwrap()
+        .to_str()
+        .unwrap();
+    event_log
+        .events_for_record(Some(budget::PERSONAL_TENANT_ID), record_id)
+        .unwrap()
+}
+
 #[tokio::test]
 async fn request_received_persists_server_record_and_validated_correlation() {
     let upstream = wiremock::MockServer::start().await;
@@ -76,7 +91,7 @@ async fn request_received_persists_server_record_and_validated_correlation() {
     assert_eq!(event.session_id.as_deref(), Some(" session-1 "));
     assert_eq!(event.trace_id.as_deref(), Some("trace-1"));
     assert_eq!(event.parent_id.as_deref(), Some("parent-1"));
-    assert!(event.request_id.is_none());
+    assert_eq!(event.request_id.as_deref(), Some(event.record_id.as_str()));
     assert!(event.origin_record_id.is_none());
     assert!(event.metadata.is_empty());
     assert_eq!(
@@ -86,6 +101,42 @@ async fn request_received_persists_server_record_and_validated_correlation() {
         4
     );
     upstream.verify().await;
+}
+
+#[tokio::test]
+async fn request_received_preserves_valid_request_id_and_falls_back_on_oversize() {
+    let event_log = memory_event_log();
+    let app = build_app(AppState {
+        event_log: Some(event_log.clone()),
+        ..AppState::default()
+    });
+    let valid = app
+        .clone()
+        .oneshot(super::tests::post_chat(
+            r#"{"messages":[{"role":"user","content":"valid id"}]}"#,
+            &[(HEADER_REQUEST_ID, "caller-request")],
+        ))
+        .await
+        .unwrap();
+    let valid_events = events(&event_log, &valid);
+    assert_eq!(
+        valid_events[0].event.request_id.as_deref(),
+        Some("caller-request")
+    );
+
+    let long = "r".repeat(129);
+    let fallback = app
+        .oneshot(super::tests::post_chat(
+            r#"{"messages":[{"role":"user","content":"oversize id"}]}"#,
+            &[(HEADER_REQUEST_ID, long.as_str())],
+        ))
+        .await
+        .unwrap();
+    let fallback_events = events(&event_log, &fallback);
+    assert_eq!(
+        fallback_events[0].event.request_id.as_deref(),
+        Some(fallback_events[0].event.record_id.as_str())
+    );
 }
 
 #[tokio::test]
