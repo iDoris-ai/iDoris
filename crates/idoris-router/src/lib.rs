@@ -1102,7 +1102,7 @@ pub(crate) async fn append_budget_reserved(
 }
 
 #[derive(Clone)]
-struct DispatchedEventContext {
+pub(crate) struct DispatchedEventContext {
     event_log: Arc<idoris_tenancy::event_log::EventLogStore>,
     tenant_id: String,
     record_id: String,
@@ -1116,7 +1116,7 @@ struct DispatchedEventContext {
 /// prove TCP connected, request bytes reached the peer, or upstream execution
 /// occurred; an exhausted connect failure may therefore still finish as
 /// `ExecutionDisposition::NotExecuted` after this event exists.
-async fn append_dispatched(
+pub(crate) async fn append_dispatched(
     context: &DispatchedEventContext,
     selected: &Selected,
 ) -> Result<(), ()> {
@@ -1452,7 +1452,12 @@ async fn chat_completions(
     let dispatch_result = if let Some(selected) = selected_for_dispatch.as_ref() {
         match dispatch_local_preselected_observed(
             selected,
-            LocalExecutionContext::new(supervisor, budget_ledger, budget_event_context.as_ref()),
+            LocalExecutionContext::new(
+                supervisor,
+                budget_ledger,
+                budget_event_context.as_ref(),
+                dispatched_event_context.as_ref(),
+            ),
             &parsed,
             dispatch::DispatchInput::with_model(model, &prompt),
             messages,
