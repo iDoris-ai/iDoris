@@ -436,6 +436,31 @@ fn recorded_migration_with_missing_schema_object_fails_at_open() {
 }
 
 #[test]
+fn recorded_migration_with_noop_append_only_triggers_fails_at_open() {
+    let db = temp_db("schema-noop-guards");
+    let conn = Connection::open(&db).unwrap();
+    conn.execute_batch(include_str!("migrations/0001_events.sql"))
+        .unwrap();
+    conn.execute_batch(
+        "CREATE TABLE event_log_schema_migrations(version INTEGER PRIMARY KEY); \
+         INSERT INTO event_log_schema_migrations VALUES(1); \
+         DROP TRIGGER event_log_guard_insert; \
+         DROP TRIGGER event_log_sequence_positive; \
+         DROP TRIGGER event_log_no_update; \
+         DROP TRIGGER event_log_no_delete; \
+         CREATE TRIGGER event_log_guard_insert BEFORE INSERT ON event_log_events WHEN NEW.sequence != -1 OR EXISTS (SELECT 1 FROM event_log_events WHERE event_id = NEW.event_id) BEGIN SELECT 'RAISE(ABORT'; END; \
+         CREATE TRIGGER event_log_sequence_positive AFTER INSERT ON event_log_events WHEN NEW.sequence <= 0 BEGIN SELECT 'RAISE(ABORT'; END; \
+         CREATE TRIGGER event_log_no_update BEFORE UPDATE ON event_log_events BEGIN SELECT 'RAISE(ABORT'; END; \
+         CREATE TRIGGER event_log_no_delete BEFORE DELETE ON event_log_events BEGIN SELECT 'RAISE(ABORT'; END;",
+    )
+    .unwrap();
+    assert!(matches!(
+        EventLogStore::new(conn),
+        Err(EventLogError::SchemaIncomplete)
+    ));
+}
+
+#[test]
 fn poisoned_connection_mutex_fails_closed() {
     let store = EventLogStore::new(Connection::open_in_memory().unwrap()).unwrap();
     let _ = std::panic::catch_unwind(|| {

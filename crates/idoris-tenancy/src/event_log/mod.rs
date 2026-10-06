@@ -251,6 +251,42 @@ fn load_by_id(conn: &Connection, event_id: &str) -> Result<Option<EventLogEvent>
     conn.query_row("SELECT sequence,event_id,tenant_id,record_id,event_type,ts_utc_ms,request_id,session_id,trace_id,parent_id,origin_record_id,metadata FROM event_log_events WHERE event_id=?1", [event_id], raw_event).optional()?.map(decode).transpose()
 }
 
+fn verify_append_only_guards(conn: &Connection) -> Result<(), EventLogError> {
+    conn.execute_batch("SAVEPOINT event_log_schema_probe")?;
+    let event_id = Uuid::new_v4().to_string();
+    let forged_id = Uuid::new_v4().to_string();
+    let probe = (|| -> Result<bool, EventLogError> {
+        conn.execute(
+            "INSERT INTO event_log_events(event_id,tenant_id,record_id,event_type,ts_utc_ms,metadata) VALUES (?1,'__schema_probe__','probe','decided',0,'{}')",
+            [&event_id],
+        )?;
+        let update_blocked = conn
+            .execute(
+                "UPDATE event_log_events SET record_id='mutated' WHERE event_id=?1",
+                [&event_id],
+            )
+            .is_err();
+        let delete_blocked = conn
+            .execute(
+                "DELETE FROM event_log_events WHERE event_id=?1",
+                [&event_id],
+            )
+            .is_err();
+        let sequence_blocked = conn
+            .execute("INSERT INTO event_log_events(sequence,event_id,tenant_id,record_id,event_type,ts_utc_ms,metadata) VALUES (-1,?1,'__schema_probe__','forged','decided',0,'{}')", [&forged_id])
+            .is_err();
+        let replace_blocked = conn
+            .execute("INSERT OR REPLACE INTO event_log_events(event_id,tenant_id,record_id,event_type,ts_utc_ms,metadata) VALUES (?1,'__schema_probe__','replaced','decided',0,'{}')", [&event_id])
+            .is_err();
+        Ok(update_blocked && delete_blocked && sequence_blocked && replace_blocked)
+    })();
+    conn.execute_batch("ROLLBACK TO event_log_schema_probe; RELEASE event_log_schema_probe")?;
+    if !probe? {
+        return Err(EventLogError::SchemaIncomplete);
+    }
+    Ok(())
+}
+
 fn migrate(conn: &mut Connection) -> Result<(), EventLogError> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     tx.execute_batch(
@@ -278,6 +314,7 @@ fn migrate(conn: &mut Connection) -> Result<(), EventLogError> {
     if objects != 6 {
         return Err(EventLogError::SchemaIncomplete);
     }
+    verify_append_only_guards(&tx)?;
     tx.commit()?;
     Ok(())
 }
