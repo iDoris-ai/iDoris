@@ -1261,7 +1261,6 @@ async fn chat_completions(
     let budget_ledger = state.budget_ledger.as_deref();
     let dispatch_result = if let Some(selected) = selected_for_dispatch.as_ref() {
         dispatch_local_preselected(
-            &policy_cards.cards,
             selected,
             supervisor,
             budget_ledger,
