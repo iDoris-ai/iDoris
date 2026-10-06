@@ -160,7 +160,21 @@ async fn local_supervisor_records_one_content_free_completed_success() {
         event.metadata.get("served_locality"),
         Some(&json!("loopback"))
     );
-    assert_eq!(event.metadata.len(), 3);
+    assert_eq!(
+        event.metadata.get("tokens_in"),
+        Some(&json!(idoris_tenancy::budget::estimate_tokens(
+            "completion secret",
+            "unknown"
+        )))
+    );
+    assert_eq!(
+        event.metadata.get("tokens_out"),
+        Some(&json!(idoris_tenancy::budget::estimate_tokens(
+            "mock reply to: completion secret",
+            "unknown"
+        )))
+    );
+    assert_eq!(event.metadata.len(), 5);
     assert_eq!(event.session_id.as_deref(), Some("completed-session"));
     assert_eq!(event.trace_id.as_deref(), Some("completed-trace"));
     assert_eq!(event.parent_id.as_deref(), Some("completed-parent"));
