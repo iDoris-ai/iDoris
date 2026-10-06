@@ -65,7 +65,7 @@ impl LocalHttpRuntimeConfig {
 pub struct LocalHttpRuntimeAdapter {
     config: LocalHttpRuntimeConfig,
     client: reqwest::Client,
-    process: Mutex<Option<ManagedRuntimeProcess>>,
+    process: Mutex<Option<(ManagedRuntimeProcess, Option<LoadPolicy>)>>,
 }
 
 impl LocalHttpRuntimeAdapter {
@@ -95,7 +95,7 @@ impl LocalHttpRuntimeAdapter {
     async fn process_running(&self) -> Result<bool, BackendError> {
         let stale = {
             let mut guard = self.process.lock().await;
-            let Some(process) = guard.as_mut() else {
+            let Some((process, _)) = guard.as_mut() else {
                 return Ok(false);
             };
             if process.is_running()? {
@@ -103,7 +103,7 @@ impl LocalHttpRuntimeAdapter {
             }
             guard.take()
         };
-        if let Some(process) = stale {
+        if let Some((process, _)) = stale {
             process.shutdown(self.config.shutdown_grace).await?;
         }
         Ok(false)
@@ -112,7 +112,7 @@ impl LocalHttpRuntimeAdapter {
     async fn stop_process(&self) -> Result<(), BackendError> {
         let process = self.process.lock().await.take();
         match process {
-            Some(process) => process.shutdown(self.config.shutdown_grace).await,
+            Some((process, _)) => process.shutdown(self.config.shutdown_grace).await,
             None => Ok(()),
         }
     }
@@ -222,21 +222,25 @@ impl RuntimeAdapter for LocalHttpRuntimeAdapter {
         }])
     }
 
-    async fn load(&self, id: &str, _policy: Option<&LoadPolicy>) -> Result<(), BackendError> {
+    async fn load(&self, id: &str, policy: Option<&LoadPolicy>) -> Result<(), BackendError> {
         self.ensure_id(id)?;
         let stale = {
             let mut guard = self.process.lock().await;
-            if let Some(process) = guard.as_mut()
+            if let Some((process, active_policy)) = guard.as_mut()
                 && process.is_running()?
             {
+                *active_policy = policy.copied();
                 return Ok(());
             }
             guard.take()
         };
-        if let Some(process) = stale {
+        if let Some((process, _)) = stale {
             process.shutdown(self.config.shutdown_grace).await?;
         }
-        *self.process.lock().await = Some(ManagedRuntimeProcess::spawn(&self.config.launch)?);
+        *self.process.lock().await = Some((
+            ManagedRuntimeProcess::spawn(&self.config.launch)?,
+            policy.copied(),
+        ));
         Ok(())
     }
 
@@ -325,7 +329,7 @@ mod tests {
         let process =
             ManagedRuntimeProcess::spawn_test(Path::new("/bin/sleep"), vec![OsString::from("30")])
                 .unwrap();
-        *adapter.process.lock().await = Some(process);
+        *adapter.process.lock().await = Some((process, None));
         adapter
     }
 
