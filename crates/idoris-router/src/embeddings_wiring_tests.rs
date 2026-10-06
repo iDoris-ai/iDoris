@@ -4,6 +4,9 @@ use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
 use idoris_contracts::common::Capability;
 use idoris_contracts::component_card::Egress;
+use idoris_tenancy::budget::{BudgetLedger, SpendGate};
+use idoris_tenancy::store::{RecordKind, TenantStore};
+use rusqlite::Connection;
 use tower::ServiceExt;
 use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
 
@@ -140,4 +143,144 @@ async fn paid_embeddings_fail_closed_before_upstream() {
     let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(json["error"]["type"], "paid_proxy_unavailable");
     assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn free_embeddings_respect_exhausted_spend_gate_all_before_upstream() {
+    let server = MockServer::start().await;
+    let dir = tempfile::TempDir::new().unwrap();
+    let ledger = BudgetLedger::open(dir.path().join("budget.sqlite3")).unwrap();
+    ledger
+        .configure_tenant(budget::PERSONAL_TENANT_ID, 0, "UTC", SpendGate::All)
+        .unwrap();
+    let response = build_app(AppState {
+        cards: vec![embedding_card("embed-local", &server.uri())],
+        budget_ledger: Some(Arc::new(ledger)),
+        ..AppState::default()
+    })
+    .oneshot(request(
+        json!({"model":"embed-model","input":"free but gated"}),
+        &[],
+    ))
+    .await
+    .unwrap();
+
+    assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(json["error"]["type"], "budget_exceeded");
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn cached_embeddings_still_respect_exhausted_spend_gate_all() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(wiremock::matchers::path("/v1/embeddings"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": []})))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let dir = tempfile::TempDir::new().unwrap();
+    let ledger = Arc::new(BudgetLedger::open(dir.path().join("budget.sqlite3")).unwrap());
+    ledger
+        .configure_tenant(budget::PERSONAL_TENANT_ID, 1, "UTC", SpendGate::All)
+        .unwrap();
+    let app = build_app(AppState {
+        cards: vec![embedding_card("embed-local", &server.uri())],
+        budget_ledger: Some(ledger.clone()),
+        ..AppState::default()
+    });
+    let payload = json!({"model":"embed-model","input":"cache then gate"});
+    let headers = [(HEADER_REQUEST_ID, "embed-gated-cache")];
+
+    let first = app
+        .clone()
+        .oneshot(request(payload.clone(), &headers))
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+    ledger
+        .configure_tenant(budget::PERSONAL_TENANT_ID, 0, "UTC", SpendGate::All)
+        .unwrap();
+
+    let second = app.oneshot(request(payload, &headers)).await.unwrap();
+    assert_eq!(second.status(), StatusCode::PAYMENT_REQUIRED);
+    let bytes = second.into_body().collect().await.unwrap().to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(json["error"]["type"], "budget_exceeded");
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn embeddings_audit_usage_and_cache_origin_follow_record_id_contract() {
+    let server = MockServer::start().await;
+    let store = Arc::new(std::sync::Mutex::new(
+        TenantStore::new(Connection::open_in_memory().unwrap()).unwrap(),
+    ));
+    Mock::given(method("POST"))
+        .and(wiremock::matchers::path("/v1/embeddings"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "object": "list",
+            "data": [{"object":"embedding","index":0,"embedding":[0.1]}]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let app = build_app(AppState {
+        cards: vec![embedding_card("embed-local", &server.uri())],
+        record_store: Some(store.clone()),
+        ..AppState::default()
+    });
+    let payload = json!({"model":"embed-model","input":"cache me"});
+    let headers = [(HEADER_REQUEST_ID, "embed-cache-1")];
+
+    let first = app
+        .clone()
+        .oneshot(request(payload.clone(), &headers))
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+    let first_record_id = first.headers()[HEADER_RECORD_ID]
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(first.headers().get(HEADER_CACHED).is_none());
+
+    let second = app.oneshot(request(payload, &headers)).await.unwrap();
+    assert_eq!(second.status(), StatusCode::OK);
+    let second_record_id = second.headers()[HEADER_RECORD_ID]
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert_ne!(second_record_id, first_record_id);
+    assert_eq!(second.headers()[HEADER_CACHED], "true");
+    assert_eq!(
+        second.headers()[HEADER_ORIGIN_RECORD_ID].to_str().unwrap(),
+        first_record_id
+    );
+
+    {
+        let guard = store.lock().unwrap();
+        let audit = guard
+            .list(Some(budget::PERSONAL_TENANT_ID), Some(RecordKind::Audit))
+            .unwrap();
+        assert_eq!(audit.len(), 2);
+        assert_eq!(
+            audit
+                .iter()
+                .find(|row| row.record_id == second_record_id)
+                .unwrap()
+                .origin_record_id
+                .as_deref(),
+            Some(first_record_id.as_str())
+        );
+        let usage = guard
+            .list(Some(budget::PERSONAL_TENANT_ID), Some(RecordKind::Usage))
+            .unwrap();
+        assert_eq!(usage.len(), 1, "cache replay must not duplicate usage");
+        assert_eq!(usage[0].record_id, first_record_id);
+        assert_eq!(usage[0].payload["cost_minor"], json!(0));
+    }
+    server.verify().await;
 }
