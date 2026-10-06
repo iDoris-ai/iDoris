@@ -892,6 +892,33 @@ async fn append_profiled(
     run_event_log_write(move || store.append(Some(&tenant_id), &event).map(|_| ())).await
 }
 
+fn event_reason_code(reason: &idoris_policy::ReasonCode) -> String {
+    match reason {
+        idoris_policy::ReasonCode::PrivacyLoopbackOnly => "privacy_loopback_only".to_string(),
+        idoris_policy::ReasonCode::PrivacyTightenedByContent => {
+            "privacy_tightened_by_content".to_string()
+        }
+        idoris_policy::ReasonCode::RoleMatched(role) => {
+            format!("role_matched:{}", role.as_str())
+        }
+        idoris_policy::ReasonCode::RoleFallbackCapabilityOnly => {
+            "role_fallback_capability_only".to_string()
+        }
+        idoris_policy::ReasonCode::PriceUnknownExcluded => "price_unknown_excluded".to_string(),
+        idoris_policy::ReasonCode::BudgetWithinLimit => "budget_within_limit".to_string(),
+        idoris_policy::ReasonCode::BudgetNoTenantContext => {
+            "budget_no_tenant_context".to_string()
+        }
+        idoris_policy::ReasonCode::BudgetFallbackToFreeCandidate => {
+            "budget_fallback_to_free_candidate".to_string()
+        }
+        idoris_policy::ReasonCode::AdmissionReady => "admission_ready".to_string(),
+        idoris_policy::ReasonCode::AdmissionRequiresEviction => {
+            "admission_requires_eviction".to_string()
+        }
+    }
+}
+
 async fn append_decided(
     store: Arc<idoris_tenancy::event_log::EventLogStore>,
     tenant_id: String,
@@ -928,7 +955,7 @@ async fn append_decided(
                     .decision
                     .reason_codes
                     .iter()
-                    .map(|reason| format!("{reason:?}"))
+                    .map(event_reason_code)
                     .collect::<Vec<_>>();
                 metadata.insert("reason_codes".to_string(), json!(reason_codes));
             }
