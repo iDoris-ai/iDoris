@@ -2,7 +2,9 @@
 
 use std::collections::BTreeMap;
 
-use idoris_backend::{Supervisor, SupervisorConfig, SupervisorHandle};
+use idoris_backend::{
+    BackendError, RuntimeAdapter, Supervisor, SupervisorConfig, SupervisorHandle,
+};
 use idoris_contracts::{ComponentCard, component_card::Form};
 use idoris_policy::is_subscription_provider_id;
 use idoris_upstream::factory::create_adapter;
@@ -16,9 +18,20 @@ pub struct RuntimeRegistry {
 
 impl RuntimeRegistry {
     pub fn spawn(cards: &[ComponentCard]) -> Result<Self, String> {
+        Self::spawn_with_factory(cards, create_adapter)
+    }
+
+    /// Construct lifecycle runtimes using an explicitly supplied adapter
+    /// factory. The production default remains [`create_adapter`]; this seam
+    /// lets trusted startup configuration provide process-owned local runtimes
+    /// without smuggling executable/model paths into portable component cards.
+    pub fn spawn_with_factory<F>(cards: &[ComponentCard], factory: F) -> Result<Self, String>
+    where
+        F: Fn(&ComponentCard) -> Result<std::sync::Arc<dyn RuntimeAdapter>, BackendError>,
+    {
         let mut registry = Self::default();
         for card in cards {
-            let Some(handle) = spawn_runtime(card)? else {
+            let Some(handle) = spawn_runtime_with_factory(card, &factory)? else {
                 continue;
             };
             let provider_id = card.provider.id.clone();
@@ -92,6 +105,16 @@ impl From<Option<BoundSupervisor>> for RuntimeRegistry {
 /// # Panics
 /// Lifecycle construction requires a running Tokio runtime, like `Supervisor::spawn`.
 pub fn spawn_runtime(card: &ComponentCard) -> Result<Option<SupervisorHandle>, String> {
+    spawn_runtime_with_factory(card, &create_adapter)
+}
+
+fn spawn_runtime_with_factory<F>(
+    card: &ComponentCard,
+    factory: &F,
+) -> Result<Option<SupervisorHandle>, String>
+where
+    F: Fn(&ComponentCard) -> Result<std::sync::Arc<dyn RuntimeAdapter>, BackendError>,
+{
     if is_subscription_provider_id(&card.provider.id) {
         return Ok(None);
     }
@@ -105,7 +128,7 @@ pub fn spawn_runtime(card: &ComponentCard) -> Result<Option<SupervisorHandle>, S
         ));
     }
     let adapter =
-        create_adapter(card).map_err(|error| format!("provider {}: {error}", card.provider.id))?;
+        factory(card).map_err(|error| format!("provider {}: {error}", card.provider.id))?;
     Supervisor::spawn(adapter, SupervisorConfig::default())
         .map(Some)
         .map_err(|error| format!("provider {}: {error}", card.provider.id))
@@ -228,6 +251,40 @@ mod tests {
             let response = outcome.result.unwrap();
             assert_eq!(response.model, card.provider.id);
         }
+    }
+
+    #[tokio::test]
+    async fn injected_factory_constructs_non_omlx_lifecycle_runtime_without_card_extensions() {
+        let mut custom = named_card("local-http");
+        custom.extensions = None;
+        let registry = RuntimeRegistry::spawn_with_factory(std::slice::from_ref(&custom), |card| {
+            Ok(Arc::new(MockAdapter::new(vec![ModelInfo {
+                id: card.provider.id.clone(),
+                memory_gb: 2.0,
+            }])) as Arc<dyn RuntimeAdapter>)
+        })
+        .unwrap();
+
+        assert_eq!(registry.len(), 1);
+        assert!(registry.get("local-http").is_some());
+    }
+
+    #[tokio::test]
+    async fn injected_factory_is_not_called_for_subscription_or_resident_proxy_cards() {
+        let mut resident = named_card("resident");
+        resident.load_policy.as_mut().unwrap().mode = LoadMode::Resident;
+        let mut subscription = named_card(idoris_policy::SUBSCRIPTION_PROVIDER_ID);
+        subscription.load_policy = None;
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+
+        let registry = RuntimeRegistry::spawn_with_factory(&[resident, subscription], |_| {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(BackendError::internal("factory must not run"))
+        })
+        .unwrap();
+
+        assert!(registry.is_empty());
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
