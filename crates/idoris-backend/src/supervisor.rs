@@ -978,10 +978,11 @@ impl Env<'_> {
         models: &HashMap<String, ModelSlot>,
     ) -> Result<(), BackendError> {
         let accounted_gb = self.accounted_gb(models);
+        let has_unconfirmed_load = models.values().any(|slot| slot.load_unconfirmed);
         let Some(tracking) = self.runtime_capacity.as_mut() else {
             return Ok(());
         };
-        if accounted_gb == tracking.claimed_gb {
+        if (accounted_gb - tracking.claimed_gb).abs() <= CAPACITY_EPSILON_GB {
             return Ok(());
         }
         if accounted_gb > tracking.claimed_gb {
@@ -991,15 +992,20 @@ impl Env<'_> {
                 accounted_gb,
             )?;
             tracking.claimed_gb = accounted_gb;
+            if has_unconfirmed_load {
+                return Ok(());
+            }
             return Err(BackendError::invariant_violation(
                 "runtime capacity exceeded its admitted global claim",
             ));
-        } else {
+        } else if !has_unconfirmed_load {
             tracking.ledger.resize(
                 &tracking.allocation_key,
                 Some(tracking.claimed_gb),
                 Some(accounted_gb),
             )?;
+        } else {
+            return Ok(());
         }
         tracking.claimed_gb = accounted_gb;
         Ok(())
@@ -1955,7 +1961,6 @@ async fn run_actor(
                     violation = Some(format!("OpDone for {id:?} with no active op"));
                 }
                 if violation.is_none()
-                    && !models.get(&id).is_some_and(|slot| slot.load_unconfirmed)
                     && let Err(err) = env.settle_runtime_capacity(&models)
                 {
                     violation = Some(format!("global capacity reconciliation failed: {err}"));
@@ -4360,6 +4365,39 @@ mod tests {
             assert!(handle.load("b", 4.0, on_demand_policy()).await.is_err());
             assert_eq!(adapter.inner.load_call_count("b"), 0);
         }
+    }
+
+    #[test]
+    fn real_capacity_excess_beyond_epsilon_still_fails_closed() {
+        let adapter: Arc<dyn RuntimeAdapter> = Arc::new(MockAdapter::new(catalog()));
+        let config = SupervisorConfig::default();
+        let (tx, _rx) = mpsc::channel(1);
+        let weak = tx.downgrade();
+        let ledger = Arc::new(GlobalCapacityLedger::new(8.0).unwrap());
+        ledger.adopt_observed("runtime:test", None, 1.0).unwrap();
+        let mut env = Env {
+            adapter: &adapter,
+            config: &config,
+            self_tx: &weak,
+            load_fence: None,
+            reserved_gb: 1.0 + CAPACITY_EPSILON_GB * 2.0,
+            aggregate_covered: HashMap::new(),
+            runtime_capacity: Some(StartupCapacityTracking {
+                ledger: ledger.clone(),
+                allocation_key: "runtime:test".into(),
+                claimed_gb: 1.0,
+            }),
+            startup_error: None,
+        };
+
+        let error = env
+            .settle_runtime_capacity(&HashMap::new())
+            .expect_err("real excess beyond epsilon must remain an invariant failure");
+        assert_eq!(error.reason_code(), "state_invariant_violated");
+        assert_eq!(
+            ledger.snapshot().unwrap().allocations["runtime:test"],
+            1.0 + CAPACITY_EPSILON_GB * 2.0
+        );
     }
 
     /// M1: the actor task itself must exit once every `SupervisorHandle` is
