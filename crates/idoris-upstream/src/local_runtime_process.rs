@@ -2,7 +2,8 @@
 //!
 //! The launch argv comes from [`crate::LocalRuntimeLaunch`]; this layer adds
 //! lifecycle ownership only. Unix children get their own process group so
-//! shutdown and Drop cannot strand descendants.
+//! shutdown and Drop cannot strand descendants that remain in the runtime's
+//! process group.
 //! Engine/model readiness stays with [`idoris_backend::RuntimeAdapter::probe_ready`];
 //! there is no generic health endpoint shared by the B8 runtimes.
 
@@ -87,7 +88,12 @@ impl ManagedRuntimeProcess {
         // the ownership anchor that prevents the numeric PGID from being
         // recycled for an unrelated process group.
         self.signal_terminate()?;
-        if !wait_group_gone(self.process_group, grace).await? {
+        let leader_exited = wait_child_exit_without_reap(self.process_group, grace).await?;
+        if !leader_exited {
+            self.signal_kill()?;
+        } else if group_exists(self.process_group)? {
+            // The unreaped leader still anchors the PGID here. Sweep any
+            // descendants that survived SIGTERM before releasing that anchor.
             self.signal_kill()?;
         }
         tokio::time::timeout(grace, self.child.wait())
@@ -214,6 +220,24 @@ async fn wait_group_gone(process_group: i32, grace: Duration) -> Result<bool, Ba
 }
 
 #[cfg(unix)]
+async fn wait_child_exit_without_reap(pid: i32, grace: Duration) -> Result<bool, BackendError> {
+    let deadline = tokio::time::Instant::now() + grace;
+    loop {
+        if !child_running_without_reap(pid)? {
+            return Ok(true);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Ok(false);
+        }
+        tokio::time::sleep(
+            Duration::from_millis(10)
+                .min(deadline.saturating_duration_since(tokio::time::Instant::now())),
+        )
+        .await;
+    }
+}
+
+#[cfg(unix)]
 fn group_exists(process_group: i32) -> Result<bool, BackendError> {
     classify_group_probe(nix::sys::signal::killpg(
         nix::unistd::Pid::from_raw(process_group),
@@ -270,6 +294,22 @@ mod tests {
         assert!(process.is_running().unwrap());
         process.shutdown(Duration::from_millis(250)).await.unwrap();
         assert!(!group_exists(pid.as_raw()).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn graceful_shutdown_returns_before_full_grace() {
+        let process = ManagedRuntimeProcess::spawn_command(
+            std::path::Path::new("/bin/sleep"),
+            vec!["30".into()],
+        )
+        .unwrap();
+        let started = tokio::time::Instant::now();
+        process.shutdown(Duration::from_secs(2)).await.unwrap();
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "TERM-obedient child should not consume the full grace window"
+        );
     }
 
     #[cfg(unix)]
