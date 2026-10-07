@@ -96,6 +96,98 @@ impl GlobalCapacityLedger {
         Ok(allocations.remove(key).is_some())
     }
 
+    /// Atomic same-owner compare-and-set used by lifecycle reloads.
+    ///
+    /// `expected_gb=None` means the key must be absent; `next_gb=None`
+    /// removes it. Growth is admitted against exact fixed-point global units.
+    /// Confirmed non-increasing updates remain allowed even if observed truth
+    /// has already put the ledger over budget.
+    pub fn resize(
+        &self,
+        key: &str,
+        expected_gb: Option<f64>,
+        next_gb: Option<f64>,
+    ) -> Result<(), BackendError> {
+        self.compare_and_set(key, expected_gb, next_gb, true)
+    }
+
+    /// Record trusted already-existing residency without applying admission
+    /// policy. This may make the snapshot exceed the configured budget because
+    /// observation must describe reality rather than pretend it was rejected.
+    pub fn adopt_observed(
+        &self,
+        key: &str,
+        expected_gb: Option<f64>,
+        observed_gb: f64,
+    ) -> Result<(), BackendError> {
+        self.compare_and_set(key, expected_gb, Some(observed_gb), false)
+    }
+
+    fn compare_and_set(
+        &self,
+        key: &str,
+        expected_gb: Option<f64>,
+        next_gb: Option<f64>,
+        enforce_growth_admission: bool,
+    ) -> Result<(), BackendError> {
+        if key.trim().is_empty() {
+            return Err(BackendError::invalid_request(
+                "global capacity allocation key must not be empty",
+            ));
+        }
+        if let Some(value) = expected_gb {
+            let _ = to_capacity_units("expected_gb", value, Rounding::Up)?;
+        }
+        let next = match next_gb {
+            Some(value) => Some(CapacityAllocation {
+                requested_gb: value,
+                charged_units: to_capacity_units("next_gb", value, Rounding::Up)?,
+            }),
+            None => None,
+        };
+
+        let mut allocations = self
+            .allocations
+            .lock()
+            .map_err(|_| BackendError::lock_poisoned("global capacity ledger lock poisoned"))?;
+        let current = allocations.get(key).copied();
+        if current.map(|allocation| allocation.requested_gb) != expected_gb {
+            return Err(BackendError::invariant_violation(format!(
+                "global capacity allocation {key:?} expected {expected_gb:?} but is {:?}",
+                current.map(|allocation| allocation.requested_gb)
+            )));
+        }
+
+        let current_units = current.map_or(0, |allocation| allocation.charged_units);
+        let next_units = next.map_or(0, |allocation| allocation.charged_units);
+        let other_units = exact_total_units(&allocations)
+            .and_then(|total| total.checked_sub(current_units))
+            .ok_or_else(|| {
+                BackendError::invariant_violation("global capacity exact total overflowed")
+            })?;
+        let requested_total_units = other_units.checked_add(next_units).ok_or_else(|| {
+            BackendError::invariant_violation("global capacity exact total overflowed")
+        })?;
+        if enforce_growth_admission
+            && next_units > current_units
+            && requested_total_units > self.budget_units.saturating_add(CAPACITY_EPSILON_UNITS)
+        {
+            return Err(BackendError::Oom {
+                model_id: key.to_string(),
+            });
+        }
+
+        match next {
+            Some(allocation) => {
+                allocations.insert(key.to_string(), allocation);
+            }
+            None => {
+                allocations.remove(key);
+            }
+        }
+        Ok(())
+    }
+
     pub fn snapshot(&self) -> Result<GlobalCapacitySnapshot, BackendError> {
         let allocations = self
             .allocations
@@ -220,6 +312,70 @@ mod tests {
         assert!(ledger.release("omlx/a").unwrap());
         assert!(!ledger.release("omlx/a").unwrap());
         assert_eq!(ledger.snapshot().unwrap().reserved_gb, 12.0);
+    }
+
+    #[test]
+    fn resize_is_atomic_and_stale_expectations_do_not_mutate() {
+        let ledger = GlobalCapacityLedger::new(10.0).unwrap();
+        ledger.reserve("runtime/a", 4.0).unwrap();
+
+        let stale = ledger
+            .resize("runtime/a", Some(3.0), Some(5.0))
+            .unwrap_err();
+        assert_eq!(stale.reason_code(), "state_invariant_violated");
+        assert_eq!(ledger.snapshot().unwrap().allocations["runtime/a"], 4.0);
+
+        ledger.resize("runtime/a", Some(4.0), Some(6.0)).unwrap();
+        assert_eq!(ledger.snapshot().unwrap().allocations["runtime/a"], 6.0);
+    }
+
+    #[test]
+    fn resize_growth_checks_exact_global_capacity_without_partial_state() {
+        let ledger = GlobalCapacityLedger::new(10.0).unwrap();
+        ledger.reserve("runtime/a", 6.0).unwrap();
+        ledger.reserve("runtime/b", 4.0).unwrap();
+
+        let error = ledger
+            .resize("runtime/a", Some(6.0), Some(7.0))
+            .unwrap_err();
+        assert_eq!(error.reason_code(), "oom");
+        let snapshot = ledger.snapshot().unwrap();
+        assert_eq!(snapshot.reserved_gb, 10.0);
+        assert_eq!(snapshot.allocations["runtime/a"], 6.0);
+    }
+
+    #[test]
+    fn observed_overbudget_truth_can_shrink_and_release() {
+        let ledger = GlobalCapacityLedger::new(8.0).unwrap();
+        ledger.adopt_observed("runtime/a", None, 12.0).unwrap();
+        assert_eq!(ledger.snapshot().unwrap().reserved_gb, 12.0);
+
+        ledger.resize("runtime/a", Some(12.0), Some(9.0)).unwrap();
+        assert_eq!(ledger.snapshot().unwrap().reserved_gb, 9.0);
+        ledger.resize("runtime/a", Some(9.0), None).unwrap();
+        assert_eq!(ledger.snapshot().unwrap().reserved_gb, 0.0);
+    }
+
+    #[test]
+    fn cas_validates_inputs_before_mutation_and_distinguishes_zero_from_absent() {
+        let ledger = GlobalCapacityLedger::new(1.0).unwrap();
+        ledger.resize("runtime/a", None, Some(0.0)).unwrap();
+        assert_eq!(ledger.snapshot().unwrap().allocations["runtime/a"], 0.0);
+
+        assert!(
+            ledger
+                .resize("runtime/a", Some(0.0), Some(f64::MAX))
+                .is_err()
+        );
+        assert_eq!(ledger.snapshot().unwrap().allocations["runtime/a"], 0.0);
+        ledger.resize("runtime/a", Some(0.0), None).unwrap();
+        assert!(
+            !ledger
+                .snapshot()
+                .unwrap()
+                .allocations
+                .contains_key("runtime/a")
+        );
     }
 
     #[test]
