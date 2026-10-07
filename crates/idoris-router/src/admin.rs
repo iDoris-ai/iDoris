@@ -7,9 +7,12 @@ use std::sync::Arc;
 use axum::{
     Json, Router,
     extract::{Request, State},
-    http::{HeaderMap, StatusCode, header::AUTHORIZATION},
+    http::{
+        HeaderMap, StatusCode,
+        header::{self, AUTHORIZATION},
+    },
     middleware::{self, Next},
-    response::{IntoResponse, Response},
+    response::{Html, IntoResponse, Response},
     routing::get,
 };
 use serde::Serialize;
@@ -162,25 +165,101 @@ struct AdminStatusResponse {
     capacity: AdminCapacitySnapshot,
 }
 
-/// Build the authenticated read-only Admin router. The caller owns the
-/// separate loopback listener; this router is never mounted on [`crate::build_app`].
+/// Build the Admin listener router. Its static console shell carries no privileged
+/// data; every `/admin/api/v1/*` resource remains bearer-authenticated. The caller
+/// owns the separate loopback listener; this router is never mounted on [`crate::build_app`].
 pub fn build_admin_app(state: AppState, token: AdminSessionToken) -> Router {
     let state = AdminHttpState {
         app: Arc::new(state),
         token: Arc::new(token),
     };
-    Router::new()
-        .route("/admin/api/v1/status", get(admin_status))
-        .route("/admin/api/v1/backends", get(admin_backends))
-        .route("/admin/api/v1/models", get(admin_models))
-        .route("/admin/api/v1/roles", get(admin_roles))
-        .route("/admin/api/v1/runtimes", get(admin_runtimes))
+    let api = Router::new()
+        .route("/status", get(admin_status))
+        .route("/backends", get(admin_backends))
+        .route("/models", get(admin_models))
+        .route("/roles", get(admin_roles))
+        .route("/runtimes", get(admin_runtimes))
         .fallback(StatusCode::NOT_FOUND)
         .layer(middleware::from_fn_with_state(
             state.clone(),
             require_admin_auth,
         ))
-        .with_state(state)
+        .with_state(state);
+
+    Router::new()
+        .route("/admin/", get(admin_console))
+        .nest("/admin/api/v1", api)
+        .fallback(StatusCode::NOT_FOUND)
+}
+
+const ADMIN_CONSOLE_HTML: &str = r#"<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>iDoris Admin</title>
+<style>
+body{font-family:system-ui,sans-serif;max-width:960px;margin:2rem auto;padding:0 1rem;background:#111;color:#eee}
+label,button{font:inherit} input{font:inherit;width:32rem;max-width:100%} button{margin-left:.5rem}
+pre{white-space:pre-wrap;overflow-wrap:anywhere;border:1px solid #444;padding:1rem;border-radius:.4rem}
+.error{color:#ff9b9b}
+</style>
+<h1>iDoris Admin</h1>
+<p>Paste the launcher-provided Admin session token. It is used only in page memory for these read-only requests.</p>
+<label>Session token <input id="token" type="password" autocomplete="off" spellcheck="false"></label>
+<button id="refresh" type="button">Refresh</button>
+<p id="message" class="error" role="status"></p>
+<div id="results"></div>
+<script>
+(() => {
+  const resources = ['status','backends','models','roles','runtimes'];
+  const input = document.getElementById('token');
+  const results = document.getElementById('results');
+  const message = document.getElementById('message');
+  document.getElementById('refresh').addEventListener('click', async () => {
+    const token = input.value;
+    input.value = '';
+    results.replaceChildren();
+    message.textContent = '';
+    if (!token) { message.textContent = 'Session token is required.'; return; }
+    for (const resource of resources) {
+      const section = document.createElement('section');
+      const title = document.createElement('h2');
+      const output = document.createElement('pre');
+      title.textContent = resource;
+      output.textContent = 'Loading…';
+      section.append(title, output);
+      results.append(section);
+      try {
+        const response = await fetch(`/admin/api/v1/${resource}`, {
+          method: 'GET',
+          headers: {Authorization: `Bearer ${token}`},
+          cache: 'no-store',
+          credentials: 'omit'
+        });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        output.textContent = JSON.stringify(await response.json(), null, 2);
+      } catch (error) {
+        output.textContent = error instanceof Error ? error.message : 'Request failed';
+      }
+    }
+  });
+})();
+</script>
+</html>"#;
+
+async fn admin_console() -> impl IntoResponse {
+    (
+        [
+            (header::CACHE_CONTROL, "no-store"),
+            (header::REFERRER_POLICY, "no-referrer"),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+            (
+                header::CONTENT_SECURITY_POLICY,
+                "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'",
+            ),
+        ],
+        Html(ADMIN_CONSOLE_HTML),
+    )
 }
 
 async fn require_admin_auth(
@@ -684,6 +763,7 @@ mod tests {
             "/admin/api/v1/roles",
             "/admin/api/v1/runtimes",
             "/admin/api/v1/capacity",
+            "/admin/",
         ] {
             let response = crate::build_app(AppState::default())
                 .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
@@ -691,6 +771,65 @@ mod tests {
                 .unwrap();
             assert_eq!(response.status(), StatusCode::NOT_FOUND);
         }
+    }
+
+    #[tokio::test]
+    async fn admin_console_is_static_local_shell_with_hardened_headers() {
+        let token = AdminSessionToken::mint();
+        let secret = token.expose_secret().to_string();
+        let app = build_admin_app(AppState::default(), token);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let headers = response.headers();
+        assert_eq!(headers.get(header::CACHE_CONTROL).unwrap(), "no-store");
+        assert_eq!(headers.get(header::REFERRER_POLICY).unwrap(), "no-referrer");
+        assert_eq!(
+            headers.get(header::X_CONTENT_TYPE_OPTIONS).unwrap(),
+            "nosniff"
+        );
+        let csp = headers
+            .get(header::CONTENT_SECURITY_POLICY)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(csp.contains("connect-src 'self'"));
+        assert!(csp.contains("frame-ancestors 'none'"));
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        assert!(!html.contains(&secret));
+        for forbidden in [
+            "localStorage",
+            "sessionStorage",
+            "indexedDB",
+            "document.cookie",
+            "location.search",
+            "location.hash",
+            "<script src=",
+            "http://",
+            "https://",
+        ] {
+            assert!(
+                !html.contains(forbidden),
+                "forbidden console source: {forbidden}"
+            );
+        }
+        for resource in ["status", "backends", "models", "roles", "runtimes"] {
+            assert!(
+                html.contains(resource),
+                "missing console resource: {resource}"
+            );
+        }
+        assert!(html.contains("type=\"password\""));
+        assert!(html.contains("Authorization: `Bearer ${token}`"));
     }
 
     fn admin_request(path: &str, scheme: &str, secret: &str) -> Request<Body> {
