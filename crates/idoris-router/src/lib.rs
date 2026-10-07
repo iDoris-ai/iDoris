@@ -105,6 +105,7 @@ const HEADER_REASON: &str = "X-iDoris-Reason";
 const HEADER_DEGRADED: &str = "X-iDoris-Degraded";
 const HEADER_COST_MINOR: &str = "X-iDoris-Cost-Minor";
 const HEADER_REQUEST_ID: &str = "x-idoris-request-id";
+const HEADER_SESSION: &str = "x-idoris-session";
 const HEADER_CACHED: &str = "X-iDoris-Cached";
 const HEADER_ORIGIN_RECORD_ID: &str = "X-iDoris-Origin-Record-Id";
 
@@ -516,6 +517,14 @@ fn query_scope_header(headers: &HeaderMap) -> Option<&str> {
         .filter(|value| !value.is_empty())
 }
 
+fn session_affinity_key(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(HEADER_SESSION)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
 async fn get_capabilities(State(state): State<Arc<AppState>>) -> Response {
     let Some(provider) = state.capabilities.as_ref() else {
         return error_envelope(
@@ -826,6 +835,7 @@ async fn chat_completions(
         Ok(parsed) => parsed,
         Err(err) => return err.into_response(),
     };
+    let affinity_key = session_affinity_key(&headers);
 
     let messages = extract_messages(object);
     let parsed = intent::resolve_profile(parsed, &messages).await;
@@ -854,7 +864,7 @@ async fn chat_completions(
     // Supervisor, which only makes sense for a real oMLX-shaped backend
     // with an explicit load/unload lifecycle. See dispatch::select's doc
     // for the accepted double-decide() tradeoff this branch makes.
-    if let Ok(selected) = dispatch::select(&cards, &parsed, &prompt) {
+    if let Ok(selected) = dispatch::select_with_affinity(&cards, &parsed, &prompt, affinity_key) {
         // A present model field must be a non-empty string before any
         // selected backend can execute. Keep selection first so the
         // established error still carries the selected locality/reasons.
@@ -968,7 +978,8 @@ async fn chat_completions(
     // The request token is a fresh child of this TCP connection's lifetime.
     // Completing the request body does not cancel it; EOF/reset/shutdown of
     // the actual connection does.
-    let selected_for_dispatch = dispatch::select(&cards, &parsed, &prompt).ok();
+    let selected_for_dispatch =
+        dispatch::select_with_affinity(&cards, &parsed, &prompt, affinity_key).ok();
     let selected_estimated_cost = selected_for_dispatch
         .as_ref()
         .map(|selected| selected.estimated_cost_minor);
@@ -981,7 +992,7 @@ async fn chat_completions(
         supervisor,
         budget_ledger,
         &parsed,
-        dispatch::DispatchInput::with_model(model, &prompt),
+        dispatch::DispatchInput::with_model(model, &prompt).with_affinity(affinity_key),
         messages,
         lifecycle.cancellation_token(),
     )
@@ -1678,6 +1689,16 @@ mod tests {
         for bad in ["0", "-1", "70000"] {
             assert!(parse_port(Some(bad)).is_err(), "{bad} should be rejected");
         }
+    }
+
+    #[test]
+    fn session_affinity_header_is_trimmed_and_empty_is_disabled() {
+        let mut headers = HeaderMap::new();
+        assert_eq!(session_affinity_key(&headers), None);
+        headers.insert(HEADER_SESSION, HeaderValue::from_static("  run-42  "));
+        assert_eq!(session_affinity_key(&headers), Some("run-42"));
+        headers.insert(HEADER_SESSION, HeaderValue::from_static("   "));
+        assert_eq!(session_affinity_key(&headers), None);
     }
 
     #[tokio::test]
