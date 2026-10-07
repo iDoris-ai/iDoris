@@ -29,6 +29,10 @@ pub mod routing_policy;
 /// needed) `Supervisor` load → `Supervisor` chat.
 pub mod dispatch;
 
+/// Read-only Admin API v0 status facts. HTTP exposure is intentionally
+/// deferred until the dedicated loopback + session-token listener slice.
+pub mod admin;
+
 /// Per-card runtime construction for lifecycle-managed providers.
 pub mod runtime;
 
