@@ -20,6 +20,10 @@ use subtle::ConstantTimeEq;
 use uuid::Uuid;
 
 use crate::AppState;
+use idoris_contracts::admin_v0::{
+    AdminAdmissionStatus, AdminCapacityEntry, AdminCapacitySnapshot, AdminCapacityState,
+    AdminStatusResponse,
+};
 use idoris_policy::ROLES;
 
 pub const ADMIN_PORT_ENV: &str = "IDORIS_ADMIN_PORT";
@@ -158,13 +162,6 @@ struct AdminHttpState {
     token: Arc<AdminSessionToken>,
 }
 
-#[derive(Debug, Serialize)]
-struct AdminStatusResponse {
-    #[serde(flatten)]
-    status: AdminStatus,
-    capacity: AdminCapacitySnapshot,
-}
-
 /// Build the Admin listener router. Its static console shell carries no privileged
 /// data; every `/admin/api/v1/*` resource remains bearer-authenticated. The caller
 /// owns the separate loopback listener; this router is never mounted on [`crate::build_app`].
@@ -299,8 +296,18 @@ fn authorized(headers: &HeaderMap, token: &AdminSessionToken) -> bool {
 }
 
 async fn admin_status(State(state): State<AdminHttpState>) -> Json<AdminStatusResponse> {
+    let status = status(&state.app);
     Json(AdminStatusResponse {
-        status: status(&state.app),
+        status: status.status.to_string(),
+        service: status.service.to_string(),
+        version: status.version,
+        contract_version: status.contract_version.to_string(),
+        instance_id: status.instance_id,
+        components: status.components,
+        runtimes: status.runtimes,
+        subscriptions: status.subscriptions,
+        budget_configured: status.budget_configured,
+        audit_configured: status.audit_configured,
         capacity: capacity(&state.app).await,
     })
 }
@@ -404,21 +411,6 @@ pub struct AdminRuntime {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct AdminRuntimesSnapshot {
     pub runtimes: Vec<AdminRuntime>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AdminCapacityState {
-    Observed,
-    Unavailable,
-    Error,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize)]
-pub struct AdminCapacitySnapshot {
-    pub state: AdminCapacityState,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub entries: Option<Vec<crate::capabilities::CapabilityEntry>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -577,7 +569,30 @@ pub async fn capacity(state: &AppState) -> AdminCapacitySnapshot {
     match provider.snapshot().await {
         Ok(entries) => AdminCapacitySnapshot {
             state: AdminCapacityState::Observed,
-            entries: Some(entries),
+            entries: Some(
+                entries
+                    .into_iter()
+                    .map(|entry| AdminCapacityEntry {
+                        id: entry.id,
+                        capability: entry.capability,
+                        resident: entry.resident,
+                        estimated_memory_gb: entry.estimated_memory_gb,
+                        ctx_limit: entry.ctx_limit,
+                        queue_depth: entry.queue_depth,
+                        admission_status: match entry.admission_status {
+                            crate::capabilities::AdmissionStatus::Ready => {
+                                AdminAdmissionStatus::Ready
+                            }
+                            crate::capabilities::AdmissionStatus::RequiresEviction => {
+                                AdminAdmissionStatus::RequiresEviction
+                            }
+                            crate::capabilities::AdmissionStatus::Blocked => {
+                                AdminAdmissionStatus::Blocked
+                            }
+                        },
+                    })
+                    .collect(),
+            ),
         },
         Err(_) => AdminCapacitySnapshot {
             state: AdminCapacityState::Error,
@@ -714,6 +729,18 @@ mod tests {
             admission_status: crate::capabilities::AdmissionStatus::RequiresEviction,
         };
         for entries in [vec![entry.clone()], Vec::new()] {
+            let expected = entries
+                .iter()
+                .map(|entry| AdminCapacityEntry {
+                    id: entry.id.clone(),
+                    capability: entry.capability.clone(),
+                    resident: entry.resident,
+                    estimated_memory_gb: entry.estimated_memory_gb,
+                    ctx_limit: entry.ctx_limit,
+                    queue_depth: entry.queue_depth,
+                    admission_status: AdminAdmissionStatus::RequiresEviction,
+                })
+                .collect();
             let state = AppState {
                 capabilities: Some(Arc::new(FakeCapabilities {
                     entries: Some(entries.clone()),
@@ -724,7 +751,7 @@ mod tests {
                 capacity(&state).await,
                 AdminCapacitySnapshot {
                     state: AdminCapacityState::Observed,
-                    entries: Some(entries),
+                    entries: Some(expected),
                 }
             );
         }
@@ -1020,6 +1047,38 @@ mod tests {
             assert!(json.get("capacity").is_some());
             assert!(!String::from_utf8_lossy(&body).contains("secret backend detail"));
         }
+    }
+
+    #[tokio::test]
+    async fn admin_status_wire_shape_matches_the_shared_v0_contract() {
+        let state = AppState::default();
+        let instance_id = state.instance_id.clone();
+        let token = AdminSessionToken::mint();
+        let secret = token.expose_secret().to_string();
+        let response = build_admin_app(state, token)
+            .oneshot(admin_request("/admin/api/v1/status", "Bearer", &secret))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "status": "ok",
+                "service": "idoris",
+                "version": env!("CARGO_PKG_VERSION"),
+                "contract_version": idoris_contracts::CONTRACT_VERSION,
+                "instance_id": instance_id,
+                "components": 0,
+                "runtimes": 0,
+                "subscriptions": 0,
+                "budget_configured": false,
+                "audit_configured": false,
+                "capacity": {"state": "unavailable"},
+            })
+        );
+        assert!(idoris_contracts::parse::<AdminStatusResponse>(&value).is_ok());
     }
 
     #[tokio::test]
