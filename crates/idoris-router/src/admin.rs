@@ -5,8 +5,49 @@
 //! management session token before these facts become remotely reachable.
 
 use serde::Serialize;
+use subtle::ConstantTimeEq;
+use uuid::Uuid;
 
 use crate::AppState;
+
+const SESSION_TOKEN_LEN: usize = 64;
+
+pub struct AdminSessionToken(String);
+
+impl AdminSessionToken {
+    pub fn mint() -> Self {
+        Self(format!(
+            "{}{}",
+            Uuid::new_v4().simple(),
+            Uuid::new_v4().simple()
+        ))
+    }
+
+    /// Explicit one-time exposure for delivering the token to the local
+    /// management client. Never log or persist this value.
+    pub fn expose_secret(&self) -> &str {
+        &self.0
+    }
+
+    pub fn matches(&self, candidate: &str) -> bool {
+        if candidate.len() != SESSION_TOKEN_LEN {
+            return false;
+        }
+        bool::from(self.0.as_bytes().ct_eq(candidate.as_bytes()))
+    }
+}
+
+impl std::fmt::Debug for AdminSessionToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("AdminSessionToken([REDACTED])")
+    }
+}
+
+impl std::fmt::Display for AdminSessionToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("[REDACTED]")
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AdminStatus {
@@ -55,5 +96,19 @@ mod tests {
         assert_eq!(status.subscriptions, 0);
         assert!(!status.budget_configured);
         assert!(!status.audit_configured);
+    }
+
+    #[test]
+    fn session_tokens_are_fresh_redacted_and_constant_time_verifiable() {
+        let first = AdminSessionToken::mint();
+        let second = AdminSessionToken::mint();
+
+        assert_eq!(first.expose_secret().len(), SESSION_TOKEN_LEN);
+        assert_ne!(first.expose_secret(), second.expose_secret());
+        assert!(first.matches(first.expose_secret()));
+        assert!(!first.matches(second.expose_secret()));
+        assert!(!first.matches("short"));
+        assert_eq!(format!("{first}"), "[REDACTED]");
+        assert_eq!(format!("{first:?}"), "AdminSessionToken([REDACTED])");
     }
 }
