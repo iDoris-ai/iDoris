@@ -101,12 +101,11 @@ fn default_load_policy() -> LoadPolicy {
     }
 }
 
-/// A single, fixed placeholder memory size for every card's Supervisor
-/// "model" entry. This crate doesn't yet have a real per-model memory
-/// figure at the component-card layer (that's catalog/idoris-recommender
-/// data, not wired into R2-D) — every local candidate is treated as
-/// equally cheap to load for now.
-const PLACEHOLDER_MEMORY_GB: f64 = 1.0;
+// oMLX 0.6.4's /v1/models contract does not expose per-model memory and the
+// adapter therefore reports 0.0. Keep its legacy estimate until the dedicated
+// oMLX footprint source is wired; positive catalog values (including trusted
+// process-owned mlx_lm.server/llama.cpp configs) must never be collapsed to it.
+const UNKNOWN_CATALOG_MEMORY_GB: f64 = 1.0;
 
 /// R2-D simplification: every loaded component card is eligible for every
 /// catalog role and always `Ready` at `decide()` time — role→catalog
@@ -533,40 +532,44 @@ pub async fn dispatch_local(
     let _cancel_guard = CancelOnDrop(cancel.clone());
 
     let supervisor = &supervisor.handle;
-    // A concrete model id is caller-controlled. Validate it against the
-    // runtime catalog before load(): Supervisor eviction planning happens
-    // before an adapter can reject an unknown id, so skipping this preflight
-    // would let a bogus model name evict an unrelated warm model first.
-    if backend_model_id != provider_id {
-        let catalog = match supervisor.list().await {
-            Ok(models) => models,
-            Err(err) => {
-                return Ok(ChatOutcome {
-                    decision,
-                    served_locality,
-                    result: Err(DispatchFailure::Backend(err)),
-                    actual_cost_minor: None,
-                });
-            }
-        };
-        if !catalog.iter().any(|model| model.id == backend_model_id) {
+    // The runtime catalog is the lifecycle authority for both model identity
+    // and its admission footprint. Supervisor eviction/global-capacity
+    // planning happens before an adapter can reject an unknown id, so every
+    // load — including provider-id == model-id single-model runtimes — must
+    // resolve the exact catalog entry before mutating lifecycle state.
+    let catalog = match supervisor.list().await {
+        Ok(models) => models,
+        Err(err) => {
             return Ok(ChatOutcome {
                 decision,
                 served_locality,
-                result: Err(DispatchFailure::Backend(BackendError::model_not_found(
-                    backend_model_id,
-                ))),
+                result: Err(DispatchFailure::Backend(err)),
                 actual_cost_minor: None,
             });
         }
-    }
+    };
+    let Some(model) = catalog.iter().find(|model| model.id == backend_model_id) else {
+        return Ok(ChatOutcome {
+            decision,
+            served_locality,
+            result: Err(DispatchFailure::Backend(BackendError::model_not_found(
+                backend_model_id,
+            ))),
+            actual_cost_minor: None,
+        });
+    };
+    let admission_memory_gb = if model.memory_gb > 0.0 {
+        model.memory_gb
+    } else {
+        UNKNOWN_CATALOG_MEMORY_GB
+    };
     // `status.loaded` reports engine residency, which may have been
     // inherited after a Supervisor restart while the model is still in
     // Error (not yet adopted and policy-checked). Always pass through the
     // Supervisor's idempotent load path before chatting so it can establish
     // readiness and apply the requested policy.
     if let Err(err) = supervisor
-        .load(backend_model_id.clone(), PLACEHOLDER_MEMORY_GB, load_policy)
+        .load(backend_model_id.clone(), admission_memory_gb, load_policy)
         .await
     {
         return Ok(ChatOutcome {
@@ -637,7 +640,8 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use idoris_backend::{
-        BackendStatus, MockAdapter, ModelInfo, RuntimeAdapter, Supervisor, SupervisorConfig,
+        BackendStatus, GlobalCapacityLedger, MockAdapter, ModelInfo, RuntimeAdapter, Supervisor,
+        SupervisorConfig,
     };
     use idoris_contracts::TaskProfile;
     use idoris_contracts::common::PrivacyClass;
@@ -794,6 +798,46 @@ mod tests {
         let response = outcome.result.unwrap();
         assert_eq!(response.model, "a");
         assert!(response.content.contains("hello"));
+    }
+
+    #[tokio::test]
+    async fn catalog_memory_drives_global_admission_before_adapter_load() {
+        let card = local_card("a");
+        let adapter = Arc::new(MockAdapter::new(vec![ModelInfo {
+            id: "a".to_string(),
+            memory_gb: 6.0,
+        }]));
+        let ledger = Arc::new(GlobalCapacityLedger::new(4.0).unwrap());
+        let supervisor = Supervisor::spawn_with_startup_capacity_tracking(
+            adapter.clone(),
+            SupervisorConfig::default(),
+            ledger.clone(),
+            "a",
+        )
+        .unwrap();
+        let supervisor = BoundSupervisor::new(&card, supervisor);
+
+        let outcome = dispatch_local(
+            std::slice::from_ref(&card),
+            Some(&supervisor),
+            None,
+            &empty_profile(),
+            DispatchInput::new("hello"),
+            vec![ChatMessage {
+                role: "user".to_string(),
+                content: "hello".to_string(),
+            }],
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        match outcome.result.unwrap_err() {
+            DispatchFailure::Backend(err) => assert_eq!(err.reason_code(), "oom"),
+            other => panic!("expected Backend(oom), got {other:?}"),
+        }
+        assert_eq!(adapter.load_call_count("a"), 0);
+        assert_eq!(ledger.snapshot().unwrap().allocations["runtime:a"], 0.0);
     }
 
     #[tokio::test]
