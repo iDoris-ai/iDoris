@@ -7,15 +7,43 @@
  * `IDORIS_CONFORMANCE_CMD`/`IDORIS_CONFORMANCE_ARGV` 换成 Rust 二进制的启动命令，
  * 本文件不用改一行。
  */
-import { spawn, type ChildProcess } from "node:child_process";
+import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { delimiter, join } from "node:path";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { pickPort } from "./port.js";
 
 /** conformance/ 包本身在仓库根下，往上两级就是仓库根。 */
 export const repoRoot: string = fileURLToPath(new URL("../..", import.meta.url));
 
 export const routingPolicyFixturePath: string = join(repoRoot, "conformance", "fixtures", "routing-policy.yaml");
+
+const nativeFetch = globalThis.fetch.bind(globalThis);
+const rustAuthorizationByOrigin = new Map<string, string>();
+
+export function conformanceAuthorizationHeader(baseUrl: string): string | undefined {
+  if (process.env.IDORIS_CONFORMANCE_IMPLEMENTATION !== "rust") return undefined;
+  return rustAuthorizationByOrigin.get(new URL(baseUrl).origin);
+}
+
+if (process.env.IDORIS_CONFORMANCE_IMPLEMENTATION === "rust") {
+  globalThis.fetch = ((input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+    const url = typeof input === "string" || input instanceof URL ? new URL(input) : new URL(input.url);
+    if (url.pathname === "/v1/chat/completions") {
+      const headers = new Headers(input instanceof Request ? input.headers : undefined);
+      if (init?.headers !== undefined) {
+        new Headers(init.headers).forEach((value, key) => headers.set(key, value));
+      }
+      if (!headers.has("authorization")) {
+        const authorization = rustAuthorizationByOrigin.get(url.origin);
+        if (authorization !== undefined) headers.set("authorization", authorization);
+      }
+      return nativeFetch(input, { ...init, headers });
+    }
+    return nativeFetch(input, init);
+  }) as typeof fetch;
+}
 
 function defaultCommand(): string {
   return process.execPath + " " + join(repoRoot, "packages", "router", "dist", "cli.js") + " serve";
@@ -178,6 +206,36 @@ export async function spawnConformanceServer(opts: SpawnOptions): Promise<Runnin
   const port = await pickPort();
   const { bin, args } = resolveCommand();
 
+  let rustStateDir: string | undefined;
+  let rustDbPath: string | undefined;
+  let rustAuthorization: string | undefined;
+  let rustOrigin: string | undefined;
+  if (process.env.IDORIS_CONFORMANCE_IMPLEMENTATION === "rust") {
+    const seeder = process.env.IDORIS_CONFORMANCE_KEY_SEEDER;
+    if (seeder === undefined || seeder.trim() === "") {
+      throw new Error("Rust conformance requires IDORIS_CONFORMANCE_KEY_SEEDER");
+    }
+    rustStateDir = mkdtempSync(join(tmpdir(), "idoris-conformance-"));
+    // Rust auth state is intentionally per spawned server. Caller env may
+    // carry an IDORIS_DB_PATH for the TS reference, but it must never defeat
+    // Rust conformance key isolation or keep a prior server's key active.
+    rustDbPath = join(rustStateDir, "state.sqlite3");
+    const seeded = spawnSync(seeder, [rustDbPath], { encoding: "utf8" });
+    if (seeded.error !== undefined || seeded.status !== 0) {
+      rmSync(rustStateDir, { recursive: true, force: true });
+      throw new Error(
+        "failed to seed Rust conformance virtual key: " +
+          (seeded.error?.message ?? (seeded.stderr.trim() || `exit ${String(seeded.status)}`)),
+      );
+    }
+    const secret = seeded.stdout.trim();
+    if (!/^idk_[0-9a-f]{64}$/.test(secret) || secret.includes("\n")) {
+      rmSync(rustStateDir, { recursive: true, force: true });
+      throw new Error("Rust conformance key seeder returned an invalid secret");
+    }
+    rustAuthorization = `Bearer ${secret}`;
+  }
+
   const env: NodeJS.ProcessEnv = {
     ...withoutIdorisEnv(process.env),
     // 生产 CLI 默认拒绝注册 mock 组件（M1），conformance 的 fixtures 只用
@@ -190,6 +248,7 @@ export async function spawnConformanceServer(opts: SpawnOptions): Promise<Runnin
     // 进程的 stderr，污染我们在 spawnConformanceServer 失败时打印的 stderr 排查信息。
     NODE_NO_WARNINGS: "1",
     ...opts.env,
+    ...(rustDbPath === undefined ? {} : { IDORIS_DB_PATH: rustDbPath }),
     IDORIS_PORT: String(port),
     IDORIS_COMPONENTS_DIR: opts.componentsDir,
   };
@@ -229,6 +288,8 @@ export async function spawnConformanceServer(opts: SpawnOptions): Promise<Runnin
   // 进程表占满。
   const killAndThrow = (kind: ConformanceStartupFailureKind, exitCode: number | null, message: string): never => {
     killTree(child, "SIGKILL");
+    if (rustOrigin !== undefined) rustAuthorizationByOrigin.delete(rustOrigin);
+    if (rustStateDir !== undefined) rmSync(rustStateDir, { recursive: true, force: true });
     throw new ConformanceStartupError(
       kind,
       exitCode,
@@ -237,6 +298,10 @@ export async function spawnConformanceServer(opts: SpawnOptions): Promise<Runnin
   };
 
   const baseUrl = "http://127.0.0.1:" + String(port);
+  if (rustAuthorization !== undefined) {
+    rustOrigin = new URL(baseUrl).origin;
+    rustAuthorizationByOrigin.set(rustOrigin, rustAuthorization);
+  }
   const deadline = Date.now() + (opts.healthTimeoutMs ?? 15_000);
   for (;;) {
     if (spawnError !== undefined) {
@@ -266,17 +331,25 @@ export async function spawnConformanceServer(opts: SpawnOptions): Promise<Runnin
     port,
     stderrSoFar: () => stderrBuf,
     stop: async () => {
-      if (exitInfo !== undefined) return;
-      killTree(child, "SIGTERM");
-      await new Promise<void>((resolve) => {
-        const killTimer = setTimeout(() => {
-          killTree(child, "SIGKILL");
-        }, 3000);
-        child.once("exit", () => {
-          clearTimeout(killTimer);
-          resolve();
-        });
-      });
+      try {
+        if (exitInfo === undefined) {
+          killTree(child, "SIGTERM");
+          await new Promise<void>((resolve) => {
+            const killTimer = setTimeout(() => {
+              killTree(child, "SIGKILL");
+            }, 3000);
+            child.once("exit", () => {
+              clearTimeout(killTimer);
+              resolve();
+            });
+          });
+        }
+      } finally {
+        if (rustOrigin !== undefined) rustAuthorizationByOrigin.delete(rustOrigin);
+        if (rustStateDir !== undefined) {
+          rmSync(rustStateDir, { recursive: true, force: true });
+        }
+      }
     },
   };
 }

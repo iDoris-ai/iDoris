@@ -3,6 +3,7 @@ import { createConnection } from "node:net";
 import { afterEach, expect, it } from "vitest";
 import {
   ConformanceStartupError,
+  conformanceAuthorizationHeader,
   routingPolicyFixturePath,
   spawnConformanceServer,
   type RunningServer,
@@ -36,7 +37,7 @@ async function start(env: NodeJS.ProcessEnv): Promise<RunningServer> {
     componentsDir: fixture.componentsDir,
     routingPolicyPath: routingPolicyFixturePath,
     pathPrepend: fixture.pathPrepend,
-    env: { ...env, IDORIS_DB_PATH: fixture.markerPath + ".sqlite3" },
+    env,
   });
 }
 
@@ -72,7 +73,7 @@ async function expectStartupFailure(env: NodeJS.ProcessEnv): Promise<void> {
     componentsDir: fixture.componentsDir,
     routingPolicyPath: routingPolicyFixturePath,
     pathPrepend: fixture.pathPrepend,
-    env: { ...env, IDORIS_DB_PATH: fixture.markerPath + ".sqlite3" },
+    env,
     healthTimeoutMs: 3_000,
   }).then(
     async (running) => {
@@ -169,13 +170,19 @@ it("closing the HTTP socket after full request body cancels the running subscrip
     socket.once("error", reject);
   });
   socket.write(
-    "POST /v1/chat/completions HTTP/1.1\r\n" +
-      "Host: localhost\r\n" +
-      "Content-Type: application/json\r\n" +
-      "X-iDoris-Privacy: any\r\n" +
-      "X-iDoris-Complexity: complex\r\n" +
-      "Content-Length: " + String(Buffer.byteLength(body)) + "\r\n\r\n" +
-      body,
+    (() => {
+      const authorization = conformanceAuthorizationHeader(server.baseUrl);
+      return (
+        "POST /v1/chat/completions HTTP/1.1\r\n" +
+        "Host: localhost\r\n" +
+        "Content-Type: application/json\r\n" +
+        (authorization === undefined ? "" : "Authorization: " + authorization + "\r\n") +
+        "X-iDoris-Privacy: any\r\n" +
+        "X-iDoris-Complexity: complex\r\n" +
+        "Content-Length: " + String(Buffer.byteLength(body)) + "\r\n\r\n" +
+        body
+      );
+    })(),
   );
   await waitForMarker(fixture, /^spawn:/m);
   socket.destroy();

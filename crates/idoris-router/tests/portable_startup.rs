@@ -1,6 +1,9 @@
 //! Release binaries find bundled config beside the executable, independent of cwd.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+use idoris_contracts::common::PrivacyClass;
+use idoris_tenancy::virtual_key::VirtualKeySecret;
+use idoris_tenancy::virtual_key::store::{VirtualKeyScope, VirtualKeyStore};
 use std::{
     fs,
     path::Path,
@@ -8,6 +11,9 @@ use std::{
     time::{Duration, Instant},
 };
 use tempfile::TempDir;
+
+const PORTABLE_TEST_KEY: &str =
+    "idk_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
 struct Running(Option<Child>);
 impl Drop for Running {
@@ -72,6 +78,30 @@ fn spawn(exe: &Path, cwd: &Path, port: u16, env: &[(&str, &str)]) -> Running {
             Err(err) => panic!("failed to spawn copied idoris binary: {err}"),
         }
     }
+}
+
+fn seed_portable_key(cwd: &Path) {
+    let secret = VirtualKeySecret::parse(PORTABLE_TEST_KEY).unwrap();
+    let store = VirtualKeyStore::open(cwd.join("idoris-test.sqlite3")).unwrap();
+    store
+        .insert_active(
+            "vk_portable_startup",
+            secret.hash(),
+            &VirtualKeyScope {
+                owner: "portable-startup".into(),
+                allowed_privacy: vec![PrivacyClass::LocalOnly, PrivacyClass::Any],
+                allowed_roles: [
+                    "fast", "daily", "deep", "vision", "embed", "rerank", "decide", "auto",
+                ]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+                budget_ref: None,
+                expires_at_ms: None,
+                admin_scopes: Vec::new(),
+            },
+        )
+        .unwrap();
 }
 
 fn failed(mut child: Running, expected: &str) {
@@ -152,6 +182,7 @@ async fn explicit_relative_and_absolute_config_paths_start() {
 #[tokio::test]
 async fn bundled_config_starts_from_an_unrelated_working_directory() {
     let (_root, cwd, exe, port) = fixture();
+    seed_portable_key(cwd.path());
     let mut child = spawn(&exe, cwd.path(), port, &[]);
     let client = reqwest::Client::builder().no_proxy().build().unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -173,6 +204,7 @@ async fn bundled_config_starts_from_an_unrelated_working_directory() {
     assert_eq!(health["status"], "ok");
     let response = client
         .post(format!("http://127.0.0.1:{port}/v1/chat/completions"))
+        .bearer_auth(PORTABLE_TEST_KEY)
         .json(&serde_json::json!({"model":"idoris/daily","messages":[{"role":"user","content":"hi"}]}))
         .timeout(Duration::from_secs(5))
         .send()
@@ -200,6 +232,7 @@ async fn bundled_config_starts_from_an_unrelated_working_directory() {
         body[field] = value;
         let response = client
             .post(format!("http://127.0.0.1:{port}/v1/chat/completions"))
+            .bearer_auth(PORTABLE_TEST_KEY)
             .json(&body)
             .timeout(Duration::from_secs(5))
             .send()
@@ -227,6 +260,7 @@ async fn bundled_config_starts_from_an_unrelated_working_directory() {
     // error instead of being rejected as an unsupported field.
     let response = client
         .post(format!("http://127.0.0.1:{port}/v1/chat/completions"))
+        .bearer_auth(PORTABLE_TEST_KEY)
         .json(&serde_json::json!({
             "model": "another-model",
             "messages": [{"role":"user","content":"hi"}]
