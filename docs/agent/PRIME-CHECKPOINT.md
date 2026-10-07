@@ -47,7 +47,7 @@ Live Git/GitHub has moved well beyond the 2026-10-06 snapshot below. Treat this
 section as the first recovery anchor, then reconcile again with `git fetch origin`
 and `gh pr list --state open`.
 
-- `origin/main = 9de6021045f2cb4228c817bb73d5be45a7d3c7fb`.
+- `origin/main = 7680efa95acd7543332ec04a14fdead9004858f1`.
 - B8 process-owner **#376 merged** at exact head
   `6bf7ae9d336943fcfa3c9b072722aa8042a10447`; merge commit
   `2267a5fa78ceb2ced4187c960ddb83370687d906`.
@@ -63,16 +63,18 @@ and `gh pr list --state open`.
   challenge review for pre-egress SpendGate admission plus audit/UsageFact, but
   GitHub still requires a current-base approval.
 - B9 Admin v0 has advanced through **#383 status**, **#384 session token**,
-  **#385 loopback bind**, and **#386 backends snapshot** merged to main;
-  **#387 models snapshot** is now retargeted directly to main. #387 exact head is
-  `e90347c51c52d5f59fd6d0ee67e0cf4c841285bf`; its fail-closed Admin parsing
-  and data-plane compatibility received a fresh read-only FINAL PASS before
-  publication.
+  **#385 loopback bind**, **#386 backends snapshot**, and **#387 models
+  snapshot** merged to main. A transport-free **roles snapshot** is the next
+  safe slice; Admin HTTP token/header spelling is still intentionally
+  unresolved.
+- B8 exact global-capacity resize/adoption CAS is published as **#389**, head
+  `5585d149f4132f9520f46fcb04c123cd7542be47`, stacked on #382. Net production
+  delta is +92 lines with concurrent-CAS and large-magnitude regressions.
 - Do **not** invent an Admin session-token HTTP header/wire format. The docs
   specify a loopback management port and session-token concept, but not the
   transport spelling. Continue transport-free/read-only slices or other lanes
   until that public-contract boundary is explicit.
-- B5 #346, B6 #335, B7 #370, B8 #377, and B9 #387 are current root landing
+- B5 #346, B6 #335, B7 #370, and B8 #377 are current root landing
   gates waiting on current-base review. Keep advancing independent work rather
   than waiting.
 
