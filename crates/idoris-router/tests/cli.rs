@@ -50,9 +50,7 @@ fn invalid_commands_fail_before_startup_with_usage() {
         assert!(!output.status.success());
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
-            stderr.contains(
-                "用法: idoris [serve [--admin-token-stdin]] | idoris admin status --token-stdin"
-            ),
+            stderr.contains("idoris admin <status|backends|models|roles|runtimes> --token-stdin"),
             "{stderr}"
         );
     }
@@ -241,7 +239,7 @@ async fn launcher_token_stdin_authenticates_admin_without_leaking_to_logs() {
 }
 
 #[tokio::test]
-async fn admin_status_cli_uses_stdin_token_and_fixed_loopback_admin_port() {
+async fn admin_readonly_cli_uses_stdin_token_for_every_published_resource() {
     let data_port = free_port();
     let mut admin_port = free_port();
     while admin_port == data_port {
@@ -290,31 +288,39 @@ async fn admin_status_cli_uses_stdin_token_and_fixed_loopback_admin_port() {
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
 
-    let mut admin = clean_command();
-    admin
-        .args(["admin", "status", "--token-stdin"])
-        .env("IDORIS_ADMIN_PORT", admin_port.to_string())
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut admin = admin.spawn().unwrap();
-    admin
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(format!("{secret}\n").as_bytes())
-        .unwrap();
-    let output = admin.wait_with_output().unwrap();
-    assert!(output.status.success(), "{output:?}");
-    let status: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert!(status["instance_id"].is_string());
-    let combined = format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(!combined.contains(secret));
-    assert!(!combined.contains("Bearer "));
+    for resource in ["status", "backends", "models", "roles", "runtimes"] {
+        let mut admin = clean_command();
+        admin
+            .args(["admin", resource, "--token-stdin"])
+            .env("IDORIS_ADMIN_PORT", admin_port.to_string())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut admin = admin.spawn().unwrap();
+        admin
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(format!("{secret}\n").as_bytes())
+            .unwrap();
+        let output = admin.wait_with_output().unwrap();
+        assert!(output.status.success(), "{resource}: {output:?}");
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        match resource {
+            "status" => assert!(value["instance_id"].is_string()),
+            "backends" | "roles" => assert!(value.is_array()),
+            "models" => assert!(value["sources"].is_array()),
+            "runtimes" => assert!(value["runtimes"].is_array()),
+            _ => unreachable!(),
+        }
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!combined.contains(secret), "{resource}");
+        assert!(!combined.contains("Bearer "), "{resource}");
+    }
 
     daemon.kill().unwrap();
     let _ = daemon.wait();
