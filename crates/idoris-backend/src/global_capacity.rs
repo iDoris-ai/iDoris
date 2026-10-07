@@ -466,6 +466,48 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_same_key_resize_has_one_compare_and_set_winner() {
+        let ledger = Arc::new(GlobalCapacityLedger::new(16.0).unwrap());
+        ledger.reserve("runtime/a", 4.0).unwrap();
+        let start = Arc::new(Barrier::new(2));
+        let mut joins = Vec::new();
+        for next_gb in [5.0, 6.0] {
+            let ledger = Arc::clone(&ledger);
+            let start = Arc::clone(&start);
+            joins.push(thread::spawn(move || {
+                start.wait();
+                (
+                    next_gb,
+                    ledger.resize("runtime/a", Some(4.0), Some(next_gb)),
+                )
+            }));
+        }
+
+        let results = joins
+            .into_iter()
+            .map(|join| join.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            results.iter().filter(|(_, result)| result.is_ok()).count(),
+            1
+        );
+        assert_eq!(
+            results
+                .iter()
+                .filter(|(_, result)| result
+                    .as_ref()
+                    .is_err_and(|error| { error.reason_code() == "state_invariant_violated" }))
+                .count(),
+            1
+        );
+        let winner = results
+            .iter()
+            .find_map(|(next_gb, result)| result.is_ok().then_some(*next_gb))
+            .unwrap();
+        assert_eq!(ledger.snapshot().unwrap().allocations["runtime/a"], winner);
+    }
+
+    #[test]
     fn large_magnitude_one_gb_excess_is_never_rounded_away() {
         let ledger = GlobalCapacityLedger::new(1.0e16).unwrap();
         ledger.reserve("large", 1.0e16).unwrap();
@@ -473,6 +515,18 @@ mod tests {
         assert!(before.reserved_gb.is_finite());
 
         let error = ledger.reserve("one-more-gb", 1.0).unwrap_err();
+        assert_eq!(error.reason_code(), "oom");
+        assert_eq!(ledger.snapshot().unwrap(), before);
+    }
+
+    #[test]
+    fn large_magnitude_cas_growth_is_never_rounded_away() {
+        let ledger = GlobalCapacityLedger::new(1.0e16).unwrap();
+        ledger.reserve("large", 1.0e16).unwrap();
+        ledger.resize("growth", None, Some(0.0)).unwrap();
+        let before = ledger.snapshot().unwrap();
+
+        let error = ledger.resize("growth", Some(0.0), Some(1.0)).unwrap_err();
         assert_eq!(error.reason_code(), "oom");
         assert_eq!(ledger.snapshot().unwrap(), before);
     }
