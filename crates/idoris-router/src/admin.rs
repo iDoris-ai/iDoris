@@ -192,6 +192,21 @@ pub struct AdminRuntimesSnapshot {
     pub runtimes: Vec<AdminRuntime>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AdminCapacityState {
+    Observed,
+    Unavailable,
+    Error,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct AdminCapacitySnapshot {
+    pub state: AdminCapacityState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entries: Option<Vec<crate::capabilities::CapabilityEntry>>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AdminRole {
     pub role: &'static str,
@@ -335,6 +350,28 @@ fn map_runtime_status(
     }
 }
 
+/// Snapshot the already-installed capacity provider without inventing a
+/// fallback. Successful empty capacity is distinct from an unavailable
+/// provider, and provider errors never expose free-form backend detail.
+pub async fn capacity(state: &AppState) -> AdminCapacitySnapshot {
+    let Some(provider) = &state.capabilities else {
+        return AdminCapacitySnapshot {
+            state: AdminCapacityState::Unavailable,
+            entries: None,
+        };
+    };
+    match provider.snapshot().await {
+        Ok(entries) => AdminCapacitySnapshot {
+            state: AdminCapacityState::Observed,
+            entries: Some(entries),
+        },
+        Err(_) => AdminCapacitySnapshot {
+            state: AdminCapacityState::Error,
+            entries: None,
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
@@ -348,6 +385,35 @@ mod tests {
     };
 
     use super::*;
+
+    #[derive(Clone)]
+    struct FakeCapabilities {
+        entries: Option<Vec<crate::capabilities::CapabilityEntry>>,
+    }
+
+    impl crate::capabilities::CapabilitiesProvider for FakeCapabilities {
+        fn snapshot(
+            &self,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<
+                            Vec<crate::capabilities::CapabilityEntry>,
+                            crate::capabilities::CapabilitiesError,
+                        >,
+                    > + Send
+                    + '_,
+            >,
+        > {
+            Box::pin(async move {
+                self.entries.clone().ok_or_else(|| {
+                    crate::capabilities::CapabilitiesError::new(
+                        "secret backend detail must never escape Admin snapshot",
+                    )
+                })
+            })
+        }
+    }
 
     #[test]
     fn admin_port_requires_explicit_valid_tcp_port() {
@@ -381,6 +447,60 @@ mod tests {
             config.bind().await.is_err(),
             "an occupied Admin port must be rejected, never replaced"
         );
+    }
+
+    #[tokio::test]
+    async fn capacity_snapshot_preserves_observed_entries_and_successful_empty() {
+        use std::sync::Arc;
+
+        let entry = crate::capabilities::CapabilityEntry {
+            id: "model-a".into(),
+            capability: "reasoning".into(),
+            resident: true,
+            estimated_memory_gb: 12.5,
+            ctx_limit: 131_072,
+            queue_depth: 3,
+            admission_status: crate::capabilities::AdmissionStatus::RequiresEviction,
+        };
+        for entries in [vec![entry.clone()], Vec::new()] {
+            let state = AppState {
+                capabilities: Some(Arc::new(FakeCapabilities {
+                    entries: Some(entries.clone()),
+                })),
+                ..AppState::default()
+            };
+            assert_eq!(
+                capacity(&state).await,
+                AdminCapacitySnapshot {
+                    state: AdminCapacityState::Observed,
+                    entries: Some(entries),
+                }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn capacity_snapshot_distinguishes_unavailable_from_sanitized_error() {
+        use std::sync::Arc;
+
+        assert_eq!(
+            capacity(&AppState::default()).await,
+            AdminCapacitySnapshot {
+                state: AdminCapacityState::Unavailable,
+                entries: None,
+            }
+        );
+
+        let state = AppState {
+            capabilities: Some(Arc::new(FakeCapabilities { entries: None })),
+            ..AppState::default()
+        };
+        let snapshot = capacity(&state).await;
+        assert_eq!(snapshot.state, AdminCapacityState::Error);
+        assert_eq!(snapshot.entries, None);
+        let json = serde_json::to_string(&snapshot).unwrap();
+        assert_eq!(json, r#"{"state":"error"}"#);
+        assert!(!json.contains("secret backend detail"));
     }
 
     #[tokio::test]
