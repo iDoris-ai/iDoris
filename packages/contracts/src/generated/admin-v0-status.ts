@@ -34,3 +34,4 @@ export const adminV0StatusResponseSchema = z.object({ "status": z.literal("ok"),
       });
     }
   }) }).strict()
+
