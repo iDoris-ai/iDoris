@@ -108,11 +108,6 @@ fn default_load_policy() -> LoadPolicy {
     }
 }
 
-// oMLX 0.6.4's /v1/models contract does not expose per-model memory. Preserve
-// the established estimate for that path until its dedicated footprint source
-// is wired; trusted process-owned runtimes bind their configured memory below.
-const UNKNOWN_CATALOG_MEMORY_GB: f64 = 1.0;
-
 /// R2-D simplification: every loaded component card is eligible for every
 /// catalog role and always `Ready` at `decide()` time — role→catalog
 /// mapping isn't wired yet, and real admission state is only known after
@@ -539,11 +534,10 @@ pub async fn dispatch_local(
 
     let admission_memory_override = supervisor.admission_memory_gb;
     let supervisor = &supervisor.handle;
-    // A concrete model id is caller-controlled. Validate it against the
-    // runtime catalog before load(): Supervisor eviction planning happens
-    // before an adapter can reject an unknown id, so skipping this preflight
-    // would let a bogus model name evict an unrelated warm model first.
-    let admission_memory_gb = if backend_model_id != provider_id {
+    // Process-owned mlx_lm.server/llama.cpp bind a trusted config footprint.
+    // Every other lifecycle runtime (notably oMLX) must provide its exact
+    // selected model plus a positive pre-load footprint via its catalog.
+    let catalog = if admission_memory_override.is_none() || backend_model_id != provider_id {
         let catalog = match supervisor.list().await {
             Ok(models) => models,
             Err(err) => {
@@ -555,7 +549,9 @@ pub async fn dispatch_local(
                 });
             }
         };
-        let Some(model) = catalog.iter().find(|model| model.id == backend_model_id) else {
+        if backend_model_id != provider_id
+            && !catalog.iter().any(|model| model.id == backend_model_id)
+        {
             return Ok(ChatOutcome {
                 decision,
                 served_locality,
@@ -564,14 +560,40 @@ pub async fn dispatch_local(
                 ))),
                 actual_cost_minor: None,
             });
-        };
-        if model.memory_gb > 0.0 {
-            model.memory_gb
-        } else {
-            admission_memory_override.unwrap_or(UNKNOWN_CATALOG_MEMORY_GB)
         }
+        Some(catalog)
     } else {
-        admission_memory_override.unwrap_or(UNKNOWN_CATALOG_MEMORY_GB)
+        None
+    };
+    let admission_memory_gb = match admission_memory_override {
+        Some(memory_gb) => memory_gb,
+        None => {
+            let Some(model) = catalog
+                .as_ref()
+                .and_then(|models| models.iter().find(|model| model.id == backend_model_id))
+            else {
+                return Ok(ChatOutcome {
+                    decision,
+                    served_locality,
+                    result: Err(DispatchFailure::Backend(BackendError::model_not_found(
+                        backend_model_id,
+                    ))),
+                    actual_cost_minor: None,
+                });
+            };
+            model.memory_gb
+        }
+    };
+    if !admission_memory_gb.is_finite() || admission_memory_gb <= 0.0 {
+        return Ok(ChatOutcome {
+            decision,
+            served_locality,
+            result: Err(DispatchFailure::Backend(BackendError::Upstream {
+                message: "selected lifecycle model has no positive pre-load memory footprint"
+                    .into(),
+            })),
+            actual_cost_minor: None,
+        });
     };
     // `status.loaded` reports engine residency, which may have been
     // inherited after a Supervisor restart while the model is still in
@@ -877,6 +899,36 @@ mod tests {
         assert_eq!(response.model, "Qwen3-0.6B-4bit");
         assert_eq!(adapter.load_call_count("Qwen3-0.6B-4bit"), 1);
         assert_eq!(adapter.load_call_count("omlx"), 0);
+    }
+
+    #[tokio::test]
+    async fn zero_or_non_finite_catalog_memory_never_reaches_adapter_load() {
+        for memory_gb in [0.0, f64::NAN] {
+            let card = local_card("omlx");
+            let adapter = Arc::new(MockAdapter::new(vec![ModelInfo {
+                id: "actual-model".into(),
+                memory_gb,
+            }]));
+            let supervisor =
+                Supervisor::spawn(adapter.clone(), SupervisorConfig::default()).unwrap();
+            let supervisor = BoundSupervisor::new(&card, supervisor);
+            let outcome = dispatch_local(
+                std::slice::from_ref(&card),
+                Some(&supervisor),
+                None,
+                &empty_profile(),
+                DispatchInput::with_model(Some("actual-model"), "hello"),
+                Vec::new(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            match outcome.result.unwrap_err() {
+                DispatchFailure::Backend(err) => assert_eq!(err.reason_code(), "upstream_error"),
+                other => panic!("expected Backend(upstream_error), got {other:?}"),
+            }
+            assert_eq!(adapter.load_call_count("actual-model"), 0);
+        }
     }
 
     #[tokio::test]
