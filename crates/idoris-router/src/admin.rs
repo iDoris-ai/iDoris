@@ -120,6 +120,14 @@ pub struct AdminStatus {
     pub audit_configured: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AdminBackend {
+    pub provider_id: String,
+    pub locality: idoris_contracts::provider::Locality,
+    pub form: idoris_contracts::component_card::Form,
+    pub lifecycle_runtime_bound: bool,
+}
+
 pub fn status(state: &AppState) -> AdminStatus {
     AdminStatus {
         status: "ok",
@@ -133,6 +141,22 @@ pub fn status(state: &AppState) -> AdminStatus {
         budget_configured: state.budget_ledger.is_some(),
         audit_configured: state.record_store.is_some(),
     }
+}
+
+/// Snapshot startup-validated backend configuration and local lifecycle
+/// bindings only. This deliberately does not probe runtime health, models,
+/// memory pressure, or network reachability.
+pub fn backends(state: &AppState) -> Vec<AdminBackend> {
+    state
+        .cards
+        .iter()
+        .map(|card| AdminBackend {
+            provider_id: card.provider.id.clone(),
+            locality: card.provider.locality,
+            form: card.form,
+            lifecycle_runtime_bound: state.runtimes.get(&card.provider.id).is_some(),
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -191,6 +215,76 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn backends_report_only_configured_facts_and_runtime_binding() {
+        use std::sync::Arc;
+
+        use idoris_backend::{MockAdapter, ModelInfo, Supervisor, SupervisorConfig};
+        use idoris_contracts::Contract;
+        use idoris_contracts::load_policy::{Admission, Keepalive, LoadMode, LoadPolicy};
+
+        let mut lifecycle: idoris_contracts::ComponentCard =
+            serde_yaml::from_str(include_str!("../../../config/components/omlx.yaml")).unwrap();
+        lifecycle.provider.id = "lifecycle".into();
+        let mut direct = lifecycle.clone();
+        direct.provider.id = "direct".into();
+        direct.load_policy = Some(LoadPolicy {
+            mode: LoadMode::Resident,
+            keepalive: Keepalive::Pinned { pinned: true },
+            admission: Admission::Coexist,
+        });
+        assert!(lifecycle.validate().is_ok());
+        assert!(direct.validate().is_ok());
+        assert!(crate::dispatch::is_resident_http_service(&direct));
+
+        let adapter = Arc::new(MockAdapter::new(vec![ModelInfo {
+            id: "ignored-model".into(),
+            memory_gb: 42.0,
+        }]));
+        let handle = Supervisor::spawn(adapter, SupervisorConfig::default()).unwrap();
+        let runtimes = crate::runtime::RuntimeRegistry::from(
+            crate::dispatch::BoundSupervisor::new(&lifecycle, handle),
+        );
+        let state = AppState {
+            cards: vec![lifecycle, direct],
+            runtimes,
+            ..AppState::default()
+        };
+
+        let snapshot = backends(&state);
+        assert_eq!(snapshot.len(), 2);
+        assert_eq!(snapshot[0].provider_id, "lifecycle");
+        assert_eq!(
+            snapshot[0].locality,
+            idoris_contracts::provider::Locality::Loopback
+        );
+        assert_eq!(
+            snapshot[0].form,
+            idoris_contracts::component_card::Form::HttpService
+        );
+        assert!(snapshot[0].lifecycle_runtime_bound);
+        assert_eq!(snapshot[1].provider_id, "direct");
+        assert_eq!(
+            snapshot[1].locality,
+            idoris_contracts::provider::Locality::Loopback
+        );
+        assert_eq!(
+            snapshot[1].form,
+            idoris_contracts::component_card::Form::HttpService
+        );
+        assert!(!snapshot[1].lifecycle_runtime_bound);
+
+        let value = serde_json::to_value(&snapshot[0]).unwrap();
+        assert_eq!(
+            value.as_object().unwrap().keys().collect::<Vec<_>>(),
+            ["form", "lifecycle_runtime_bound", "locality", "provider_id"]
+        );
+        assert!(value.get("health").is_none());
+        assert!(value.get("models").is_none());
+        assert!(value.get("memory_pressure").is_none());
+        assert!(value.get("endpoint").is_none());
     }
 
     #[test]
