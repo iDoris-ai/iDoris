@@ -17,7 +17,9 @@
 //! forwards to it directly per-request instead.
 
 use idoris_router::{
-    AppState, BIND_HOST, build_app,
+    AppState, BIND_HOST,
+    admin::{ADMIN_PORT_ENV, AdminBindConfig, AdminSessionToken, build_admin_app},
+    build_app,
     capabilities::{CapabilitiesProvider, LiveCapabilitiesProvider},
     cli, components, config,
     connection::{ConnectionInfo, ConnectionListener},
@@ -30,7 +32,11 @@ use idoris_router::{
     },
     write_timeout::{DEFAULT_WRITE_TIMEOUT, WriteTimeoutListener},
 };
-use std::sync::Arc;
+use std::{
+    future::{Future, IntoFuture},
+    sync::Arc,
+};
+use tokio_util::sync::CancellationToken;
 
 #[tokio::main]
 async fn main() {
@@ -51,6 +57,15 @@ fn env_flag(name: &str) -> bool {
 async fn run() -> Result<(), String> {
     let port =
         parse_port(std::env::var("IDORIS_PORT").ok().as_deref()).map_err(|err| err.to_string())?;
+    let admin_port = match std::env::var(ADMIN_PORT_ENV) {
+        Ok(value) => Some(value),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err(format!("{ADMIN_PORT_ENV} 不是有效的 Unicode"));
+        }
+    };
+    let admin_bind =
+        AdminBindConfig::parse(admin_port.as_deref()).map_err(|err| err.to_string())?;
     let deploy_mode =
         profile::deploy_mode_from_env(std::env::var("IDORIS_DEPLOY_MODE").ok().as_deref());
 
@@ -149,13 +164,16 @@ async fn run() -> Result<(), String> {
         ..AppState::default()
     };
 
-    let app = build_app(state);
     let addr = std::net::SocketAddr::from((BIND_HOST, port));
-    let listener = tokio::net::TcpListener::bind(addr)
+    let data_listener = tokio::net::TcpListener::bind(addr)
         .await
         .map_err(|err| format!("无法绑定 {addr}：{err}"))?;
+    let admin_listener = admin_bind
+        .bind()
+        .await
+        .map_err(|err| format!("无法绑定 Admin {}：{err}", admin_bind.addr()))?;
+    let admin_token = AdminSessionToken::mint();
 
-    println!("idoris listening on http://{addr}");
     println!(
         "idoris: 已注册组件 [{}]",
         if component_list.is_empty() {
@@ -164,25 +182,153 @@ async fn run() -> Result<(), String> {
             &component_list
         }
     );
-    let shutdown = tokio_util::sync::CancellationToken::new();
-    let listener = WriteTimeoutListener::new(
-        ConnectionListener::new(listener, shutdown.clone())
+    serve_bound(data_listener, admin_listener, state, admin_token, async {
+        let _ = tokio::signal::ctrl_c().await;
+    })
+    .await
+}
+
+async fn serve_bound<S>(
+    data_listener: tokio::net::TcpListener,
+    admin_listener: tokio::net::TcpListener,
+    state: AppState,
+    admin_token: AdminSessionToken,
+    shutdown_signal: S,
+) -> Result<(), String>
+where
+    S: Future<Output = ()>,
+{
+    let data_addr = data_listener
+        .local_addr()
+        .map_err(|err| format!("无法读取 data listener 地址：{err}"))?;
+    let admin_addr = admin_listener
+        .local_addr()
+        .map_err(|err| format!("无法读取 Admin listener 地址：{err}"))?;
+    let subscriptions = state.subscriptions.clone();
+    let data_app = build_app(state.clone());
+    let admin_app = build_admin_app(state, admin_token);
+    let shutdown = CancellationToken::new();
+    let data_listener = WriteTimeoutListener::new(
+        ConnectionListener::new(data_listener, shutdown.clone())
             .map_err(|err| format!("无法启动连接监视器：{err}"))?,
         DEFAULT_WRITE_TIMEOUT,
     );
-    let signal_shutdown = shutdown.clone();
-    let subscription_shutdown = subscriptions.clone();
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<ConnectionInfo>(),
+    let admin_listener = WriteTimeoutListener::new(admin_listener, DEFAULT_WRITE_TIMEOUT);
+    println!("idoris listening on http://{data_addr}");
+    println!("idoris admin listening on http://{admin_addr}");
+    let data_shutdown = shutdown.clone();
+    let admin_shutdown = shutdown.clone();
+    let data_server = axum::serve(
+        data_listener,
+        data_app.into_make_service_with_connect_info::<ConnectionInfo>(),
     )
-    .with_graceful_shutdown(async move {
-        let _ = tokio::signal::ctrl_c().await;
-        signal_shutdown.cancel();
-        if let Err(error) = subscription_shutdown.shutdown_all().await {
-            eprintln!("[idoris] subscription shutdown failed: {error}");
+    .with_graceful_shutdown(async move { data_shutdown.cancelled().await })
+    .into_future();
+    let admin_server = axum::serve(admin_listener, admin_app)
+        .with_graceful_shutdown(async move { admin_shutdown.cancelled().await })
+        .into_future();
+    tokio::pin!(data_server, admin_server, shutdown_signal);
+
+    enum Exit {
+        Signal,
+        Data(std::io::Result<()>),
+        Admin(std::io::Result<()>),
+    }
+    let exit = tokio::select! {
+        result = &mut data_server => Exit::Data(result),
+        result = &mut admin_server => Exit::Admin(result),
+        _ = &mut shutdown_signal => Exit::Signal,
+    };
+    shutdown.cancel();
+
+    let server_result = match exit {
+        Exit::Signal => {
+            let (data, admin) = tokio::join!(&mut data_server, &mut admin_server);
+            match data {
+                Err(err) => Err(format!("data server error: {err}")),
+                Ok(()) => admin.map_err(|err| format!("admin server error: {err}")),
+            }
         }
-    })
-    .await
-    .map_err(|err| format!("server error: {err}"))
+        Exit::Data(result) => {
+            let _peer = admin_server.await;
+            match result {
+                Ok(()) => Err("data server exited unexpectedly".to_string()),
+                Err(err) => Err(format!("data server error: {err}")),
+            }
+        }
+        Exit::Admin(result) => {
+            let _peer = data_server.await;
+            match result {
+                Ok(()) => Err("admin server exited unexpectedly".to_string()),
+                Err(err) => Err(format!("admin server error: {err}")),
+            }
+        }
+    };
+    let subscription_result = subscriptions
+        .shutdown_all()
+        .await
+        .map_err(|error| format!("subscription shutdown failed: {error}"));
+    match (server_result, subscription_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(server), Ok(())) => Err(server),
+        (Ok(()), Err(subscription)) => Err(subscription),
+        (Err(server), Err(subscription)) => Err(format!("{server}; {subscription}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+
+    use super::*;
+
+    #[tokio::test]
+    async fn bound_servers_serve_both_surfaces_and_stop_on_injected_signal() {
+        let data_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let data_port = data_listener.local_addr().unwrap().port();
+        let admin_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let admin_port = admin_listener.local_addr().unwrap().port();
+        let token = AdminSessionToken::mint();
+        let secret = token.expose_secret().to_string();
+        let signal = CancellationToken::new();
+        let signal_wait = signal.clone();
+        let task = tokio::spawn(serve_bound(
+            data_listener,
+            admin_listener,
+            AppState::default(),
+            token,
+            async move { signal_wait.cancelled().await },
+        ));
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+
+        let health = client
+            .get(format!("http://127.0.0.1:{data_port}/health"))
+            .send()
+            .await
+            .unwrap();
+        assert!(health.status().is_success());
+        let health: serde_json::Value = health.json().await.unwrap();
+        let admin = client
+            .get(format!("http://127.0.0.1:{admin_port}/admin/api/v1/status"))
+            .header("authorization", format!("Bearer {secret}"))
+            .send()
+            .await
+            .unwrap();
+        assert!(admin.status().is_success());
+        let admin: serde_json::Value = admin.json().await.unwrap();
+        assert_eq!(health["instance_id"], admin["instance_id"]);
+        let data_admin = client
+            .get(format!("http://127.0.0.1:{data_port}/admin/api/v1/status"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(data_admin.status(), reqwest::StatusCode::NOT_FOUND);
+
+        signal.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
 }
