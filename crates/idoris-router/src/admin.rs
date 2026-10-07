@@ -418,7 +418,6 @@ mod tests {
         let mut auth_failed = observed.clone();
         auth_failed.provider.id = "auth-failed".into();
         auth_failed.endpoint = auth_server.uri();
-        auth_failed.version_pin = "omlx@0.6.4".into();
 
         let subscription: idoris_contracts::ComponentCard =
             serde_yaml::from_str(include_str!("../../../config/components/subscription.yaml"))
