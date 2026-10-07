@@ -2244,12 +2244,6 @@ async fn finish_buffered_audit(state: Arc<AppState>, meta: BufferedAuditMeta) {
         if let Some(event_log) = event_log {
             let mut metadata = std::collections::BTreeMap::new();
             metadata.insert("component".into(), json!("router"));
-            if let Some(privacy) = meta.privacy.as_ref() {
-                metadata.insert("privacy".into(), json!(privacy));
-            }
-            if let Some(intent) = meta.intent.as_ref() {
-                metadata.insert("intent".into(), json!(intent));
-            }
             metadata.insert("http_status".into(), json!(meta.status.as_u16()));
             metadata.insert("reason".into(), json!(meta.reason.clone()));
             metadata.insert("latency_ms".into(), json!(meta.latency_ms));
@@ -2642,6 +2636,8 @@ mod tests {
             legacy[0].payload["ts_utc"].as_i64().unwrap()
         );
         assert_eq!(event.metadata["component"], json!("router"));
+        assert!(!event.metadata.contains_key("privacy"));
+        assert!(!event.metadata.contains_key("intent"));
     }
 
     fn audit_rows(
