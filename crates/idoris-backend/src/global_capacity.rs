@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 use std::sync::Mutex;
 
 use crate::BackendError;
+use crate::eviction::CAPACITY_EPSILON_GB;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct GlobalCapacitySnapshot {
@@ -50,7 +51,10 @@ impl GlobalCapacityLedger {
             )));
         }
         let reserved_gb = allocations.values().sum::<f64>();
-        if reserved_gb + memory_gb > self.budget_gb {
+        let requested_total_gb = reserved_gb + memory_gb;
+        if !requested_total_gb.is_finite()
+            || requested_total_gb > self.budget_gb + CAPACITY_EPSILON_GB
+        {
             return Err(BackendError::Oom {
                 model_id: key.to_string(),
             });
@@ -93,6 +97,9 @@ fn validate(field: &'static str, value: f64) -> Result<(), BackendError> {
 mod tests {
     #![allow(clippy::unwrap_used)]
 
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+
     use super::*;
 
     #[test]
@@ -132,7 +139,67 @@ mod tests {
             "state_invariant_violated"
         );
         assert!(GlobalCapacityLedger::new(f64::NAN).is_err());
+        assert!(GlobalCapacityLedger::new(f64::INFINITY).is_err());
+        assert!(GlobalCapacityLedger::new(-1.0).is_err());
+        assert!(ledger.reserve("bad-nan", f64::NAN).is_err());
+        assert!(ledger.reserve("bad-inf", f64::INFINITY).is_err());
         assert!(ledger.reserve("bad", -1.0).is_err());
         assert!(ledger.reserve(" ", 1.0).is_err());
+    }
+
+    #[test]
+    fn decimal_boundary_uses_capacity_epsilon_but_real_excess_still_fails() {
+        let ledger = GlobalCapacityLedger::new(0.3).unwrap();
+        ledger.reserve("runtime/a", 0.1).unwrap();
+        ledger.reserve("runtime/b", 0.2).unwrap();
+        assert_eq!(ledger.snapshot().unwrap().allocations.len(), 2);
+
+        let excess = CAPACITY_EPSILON_GB * 10.0;
+        let ledger = GlobalCapacityLedger::new(0.3).unwrap();
+        ledger.reserve("runtime/a", 0.1).unwrap();
+        let error = ledger.reserve("runtime/b", 0.2 + excess).unwrap_err();
+        assert_eq!(error.reason_code(), "oom");
+        let snapshot = ledger.snapshot().unwrap();
+        assert_eq!(snapshot.allocations.len(), 1);
+        assert_eq!(snapshot.allocations["runtime/a"], 0.1);
+    }
+
+    #[test]
+    fn concurrent_last_capacity_race_admits_exactly_one_contender() {
+        let ledger = Arc::new(GlobalCapacityLedger::new(4.0).unwrap());
+        let start = Arc::new(Barrier::new(2));
+        let mut joins = Vec::new();
+        for key in ["omlx/a", "llama/b"] {
+            let ledger = Arc::clone(&ledger);
+            let start = Arc::clone(&start);
+            joins.push(thread::spawn(move || {
+                start.wait();
+                (key, ledger.reserve(key, 4.0))
+            }));
+        }
+
+        let results = joins
+            .into_iter()
+            .map(|join| join.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            results.iter().filter(|(_, result)| result.is_ok()).count(),
+            1
+        );
+        assert_eq!(
+            results
+                .iter()
+                .filter(|(_, result)| result.as_ref().is_err_and(|err| err.reason_code() == "oom"))
+                .count(),
+            1
+        );
+        let snapshot = ledger.snapshot().unwrap();
+        assert_eq!(snapshot.reserved_gb, 4.0);
+        assert_eq!(snapshot.allocations.len(), 1);
+        let winner = results
+            .iter()
+            .find_map(|(key, result)| result.is_ok().then_some(*key))
+            .unwrap();
+        assert_eq!(snapshot.allocations.get(winner), Some(&4.0));
     }
 }
