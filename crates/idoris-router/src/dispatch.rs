@@ -31,7 +31,7 @@ pub struct BoundSupervisor {
     provider_id: String,
     endpoint: String,
     locality: Locality,
-    admission_memory_gb: Option<f64>,
+    admission_model: Option<(String, f64)>,
 }
 
 impl BoundSupervisor {
@@ -41,12 +41,16 @@ impl BoundSupervisor {
             provider_id: card.provider.id.clone(),
             endpoint: card.endpoint.clone(),
             locality: card.provider.locality,
-            admission_memory_gb: None,
+            admission_model: None,
         }
     }
 
-    pub(crate) fn with_admission_memory_gb(mut self, memory_gb: f64) -> Self {
-        self.admission_memory_gb = Some(memory_gb);
+    pub(crate) fn with_admission_model(
+        mut self,
+        model_id: impl Into<String>,
+        memory_gb: f64,
+    ) -> Self {
+        self.admission_model = Some((model_id.into(), memory_gb));
         self
     }
 
@@ -537,13 +541,21 @@ pub async fn dispatch_local(
     // cancellation can stop early.
     let _cancel_guard = CancelOnDrop(cancel.clone());
 
-    let admission_memory_override = supervisor.admission_memory_gb;
+    let admission_memory_override = supervisor
+        .admission_model
+        .as_ref()
+        .filter(|(model_id, _)| model_id == &backend_model_id)
+        .map(|(_, memory_gb)| *memory_gb);
+    let bound_model_mismatch = supervisor
+        .admission_model
+        .as_ref()
+        .is_some_and(|(model_id, _)| model_id != &backend_model_id);
     let supervisor = &supervisor.handle;
     // A concrete model id is caller-controlled. Validate it against the
     // runtime catalog before load(): Supervisor eviction planning happens
     // before an adapter can reject an unknown id, so skipping this preflight
     // would let a bogus model name evict an unrelated warm model first.
-    let admission_memory_gb = if backend_model_id != provider_id {
+    let admission_memory_gb = if backend_model_id != provider_id || bound_model_mismatch {
         let catalog = match supervisor.list().await {
             Ok(models) => models,
             Err(err) => {
@@ -825,7 +837,7 @@ mod tests {
             "a",
         )
         .unwrap();
-        let supervisor = BoundSupervisor::new(&card, supervisor).with_admission_memory_gb(6.0);
+        let supervisor = BoundSupervisor::new(&card, supervisor).with_admission_model("a", 6.0);
 
         let outcome = dispatch_local(
             std::slice::from_ref(&card),
@@ -950,6 +962,60 @@ mod tests {
                 .unwrap()
                 .loaded
                 .contains(&"warm".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn implicit_provider_id_never_evicts_bound_single_model_runtime() {
+        let card = local_card("prov");
+        let adapter = Arc::new(MockAdapter::new(vec![ModelInfo {
+            id: "m".to_string(),
+            memory_gb: 8.0,
+        }]));
+        let warm_policy = LoadPolicy {
+            mode: LoadMode::OnDemand,
+            keepalive: Keepalive::IdleTtl { idle_ttl_s: 300 },
+            admission: Admission::RequiresEviction,
+        };
+        let supervisor = Supervisor::spawn(
+            adapter.clone(),
+            SupervisorConfig {
+                budget_gb: 10.0,
+                ..SupervisorConfig::default()
+            },
+        )
+        .unwrap();
+        supervisor
+            .load("m", 8.0, warm_policy)
+            .await
+            .expect("warm model must load");
+        let supervisor = BoundSupervisor::new(&card, supervisor).with_admission_model("m", 8.0);
+
+        let outcome = dispatch_local(
+            std::slice::from_ref(&card),
+            Some(&supervisor),
+            None,
+            &empty_profile(),
+            DispatchInput::new("hello"),
+            Vec::new(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        match outcome.result.unwrap_err() {
+            DispatchFailure::Backend(err) => assert_eq!(err.reason_code(), "model_not_found"),
+            other => panic!("expected Backend(model_not_found), got {other:?}"),
+        }
+        assert_eq!(adapter.load_call_count("prov"), 0);
+        assert_eq!(adapter.unload_call_count("m"), 0);
+        assert!(
+            adapter
+                .status()
+                .await
+                .unwrap()
+                .loaded
+                .contains(&"m".to_string())
         );
     }
 
