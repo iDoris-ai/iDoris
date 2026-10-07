@@ -47,7 +47,7 @@ Live Git/GitHub has moved well beyond the 2026-10-06 snapshot below. Treat this
 section as the first recovery anchor, then reconcile again with `git fetch origin`
 and `gh pr list --state open`.
 
-- `origin/main = 2267a5fa78ceb2ced4187c960ddb83370687d906`.
+- `origin/main = 5170395605c6ce6074a466be980f3e013dd17f07`.
 - B8 process-owner **#376 merged** at exact head
   `6bf7ae9d336943fcfa3c9b072722aa8042a10447`; merge commit
   `2267a5fa78ceb2ced4187c960ddb83370687d906`.
@@ -62,9 +62,9 @@ and `gh pr list --state open`.
   `28abf4d33d89b8908057667fe429fa59efd3c961` passed a fresh read-only
   challenge review for pre-egress SpendGate admission plus audit/UsageFact, but
   GitHub still requires a current-base approval.
-- B9 Admin v0 has advanced through published **#383 status**, **#384 session
-  token**, **#385 loopback bind**, **#386 backends snapshot**, and newly
-  published **#387 models snapshot**. #387 exact head is
+- B9 Admin v0 has advanced through **#383 status** and **#384 session token**
+  merged to main; published **#385 loopback bind**, **#386 backends snapshot**,
+  and newly published **#387 models snapshot** remain stacked. #387 exact head is
   `e90347c51c52d5f59fd6d0ee67e0cf4c841285bf`; its fail-closed Admin parsing
   and data-plane compatibility received a fresh read-only FINAL PASS before
   publication.
@@ -72,7 +72,7 @@ and `gh pr list --state open`.
   specify a loopback management port and session-token concept, but not the
   transport spelling. Continue transport-free/read-only slices or other lanes
   until that public-contract boundary is explicit.
-- B5 #346, B6 #335, B7 #370, B8 #377, and B9 #383 are current root landing
+- B5 #346, B6 #335, B7 #370, B8 #377, and B9 #385 are current root landing
   gates waiting on current-base review. Keep advancing independent work rather
   than waiting.
 
