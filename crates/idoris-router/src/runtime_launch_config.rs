@@ -157,4 +157,20 @@ runtimes:
             assert!(load(Some(file.path())).is_err());
         }
     }
+
+    #[test]
+    fn shipped_multibackend_example_matches_component_endpoints() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let example = root.join("config/examples/multibackend");
+        let configs = load(Some(&example.join("local-runtimes.yaml"))).unwrap();
+        let cards = crate::components::load_components(&example.join("components"), false).unwrap();
+
+        assert_eq!(configs.len(), 2);
+        assert_eq!(cards.len(), 2);
+        for card in cards {
+            let config = &configs[&card.provider.id];
+            assert_eq!(card.endpoint, config.launch.endpoint());
+            assert!(config.memory_gb > 0.0);
+        }
+    }
 }
