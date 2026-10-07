@@ -36,14 +36,28 @@ use std::sync::Arc;
 
 #[tokio::main]
 async fn main() {
-    if let Err(message) = cli::parse_args(std::env::args_os().skip(1)) {
+    let command = match cli::parse_args(std::env::args_os().skip(1)) {
+        Ok(command) => command,
+        Err(message) => {
+            eprintln!("[idoris] {message}");
+            std::process::exit(1);
+        }
+    };
+    let result = match command {
+        cli::Command::Serve => run().await,
+        cli::Command::Key(cli::KeyCommand::Issue) => issue_virtual_key(),
+    };
+    if let Err(message) = result {
         eprintln!("[idoris] {message}");
         std::process::exit(1);
     }
-    if let Err(message) = run().await {
-        eprintln!("[idoris] 启动失败：{message}");
-        std::process::exit(1);
-    }
+}
+
+fn issue_virtual_key() -> Result<(), String> {
+    let store = storage::open_virtual_key_store_process()?;
+    let mut stdin = std::io::stdin().lock();
+    let mut stdout = std::io::stdout().lock();
+    idoris_router::key_issue::issue_from_reader(&store, &mut stdin, &mut stdout)
 }
 
 fn env_flag(name: &str) -> bool {

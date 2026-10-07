@@ -60,16 +60,33 @@ pub fn bootstrap_process(deploy_mode: DeployMode) -> Result<StorageBootstrap, St
     let parent = executable
         .parent()
         .ok_or_else(|| "当前可执行文件没有父目录".to_string())?;
-    let db_path = match env_path("IDORIS_DB_PATH")? {
-        Some(path) => path,
-        None => default_db_path()?,
-    };
+    let db_path = process_db_path()?;
     let config_path = match env_path("IDORIS_TENANTS_CONFIG")? {
         Some(path) => Some(path),
         None if deploy_mode == DeployMode::Tenant => Some(parent.join(DEFAULT_TENANTS_RELATIVE)),
         None => None,
     };
     bootstrap(&db_path, config_path.as_deref(), deploy_mode)
+}
+
+/// Opens only the persistent virtual-key verifier store using the same
+/// process database resolution as daemon startup. This intentionally avoids
+/// tenant/budget bootstrap side effects for offline key-management commands.
+pub fn open_virtual_key_store_process() -> Result<VirtualKeyStore, String> {
+    let db_path = process_db_path()?;
+    if let Some(parent) = db_path.parent().filter(|path| !path.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)
+            .map_err(|err| format!("无法创建数据库目录 \"{}\"：{err}", parent.display()))?;
+    }
+    VirtualKeyStore::open(&db_path)
+        .map_err(|err| format!("无法打开虚拟 key 数据库 \"{}\"：{err}", db_path.display()))
+}
+
+fn process_db_path() -> Result<PathBuf, String> {
+    match env_path("IDORIS_DB_PATH")? {
+        Some(path) => Ok(path),
+        None => default_db_path(),
+    }
 }
 
 pub fn bootstrap(
