@@ -41,6 +41,41 @@ Core product invariants:
 - Router/runtime/fallback/health/capacity designs should actively learn from mature open-source model routers/runtimes while preserving iDoris invariants.
 - Do not regress Rust safety improvements merely to mimic TS behavior; approved differences must be explicit and tested.
 
+## Live delta — 2026-10-07 morning
+
+Live Git/GitHub has moved well beyond the 2026-10-06 snapshot below. Treat this
+section as the first recovery anchor, then reconcile again with `git fetch origin`
+and `gh pr list --state open`.
+
+- `origin/main = 2267a5fa78ceb2ced4187c960ddb83370687d906`.
+- B8 process-owner **#376 merged** at exact head
+  `6bf7ae9d336943fcfa3c9b072722aa8042a10447`; merge commit
+  `2267a5fa78ceb2ced4187c960ddb83370687d906`.
+- B8 HTTP runtime **#377** was retargeted to `main` after #376 landed; exact
+  head remains `002f0adbc6a1a9f67b7d5fc77f4ffc1d52102585`. Its repaired cancellation
+  and MLX model-identity behavior is locally green; current-base review is pending.
+- B8 global-capacity **#382** is at repaired exact head
+  `31741528a2d183d921a59b65464584e54f054beb`, APPROVED/CLEAN on its stacked
+  base. Internal accounting is deterministic fixed-point while the public GB API
+  remains `f64`; production delta is <=300.
+- B7 rerank **#370** exact head
+  `28abf4d33d89b8908057667fe429fa59efd3c961` passed a fresh read-only
+  challenge review for pre-egress SpendGate admission plus audit/UsageFact, but
+  GitHub still requires a current-base approval.
+- B9 Admin v0 has advanced through published **#383 status**, **#384 session
+  token**, **#385 loopback bind**, **#386 backends snapshot**, and newly
+  published **#387 models snapshot**. #387 exact head is
+  `e90347c51c52d5f59fd6d0ee67e0cf4c841285bf`; its fail-closed Admin parsing
+  and data-plane compatibility received a fresh read-only FINAL PASS before
+  publication.
+- Do **not** invent an Admin session-token HTTP header/wire format. The docs
+  specify a loopback management port and session-token concept, but not the
+  transport spelling. Continue transport-free/read-only slices or other lanes
+  until that public-contract boundary is explicit.
+- B5 #346, B6 #335, B7 #370, B8 #377, and B9 #383 are current root landing
+  gates waiting on current-base review. Keep advancing independent work rather
+  than waiting.
+
 ## Verified snapshot — 2026-10-06 morning
 
 ### Milestone position
