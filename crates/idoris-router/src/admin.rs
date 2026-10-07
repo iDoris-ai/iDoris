@@ -1,9 +1,17 @@
-//! Read-only Admin API v0 status facts.
-//!
-//! This module deliberately does not expose an HTTP route. The follow-up
-//! listener/auth slice must bind the admin surface to loopback and require a
-//! management session token before these facts become remotely reachable.
+//! Read-only Admin API v0 facts plus its authenticated router/listener contract.
+//! The Admin router is separate from the data plane and callers must bind it
+//! through [`AdminBindConfig`], which is fixed to IPv4 loopback.
 
+use std::sync::Arc;
+
+use axum::{
+    Json, Router,
+    extract::{Request, State},
+    http::{HeaderMap, StatusCode, header::AUTHORIZATION},
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
+    routing::get,
+};
 use serde::Serialize;
 use subtle::ConstantTimeEq;
 use uuid::Uuid;
@@ -12,6 +20,7 @@ use crate::AppState;
 use idoris_policy::ROLES;
 
 pub const ADMIN_PORT_ENV: &str = "IDORIS_ADMIN_PORT";
+pub const DEFAULT_ADMIN_PORT: u16 = 8741;
 pub const ADMIN_BIND_HOST: std::net::Ipv4Addr = std::net::Ipv4Addr::LOCALHOST;
 
 const SESSION_TOKEN_LEN: usize = 64;
@@ -33,13 +42,18 @@ pub struct AdminBindConfig {
 }
 
 impl AdminBindConfig {
-    /// Parse the dedicated Admin listener port. There is deliberately no
-    /// implicit default until the public Admin port contract assigns one.
+    /// Parse the dedicated Admin listener port. Unset/blank uses the public
+    /// Admin default; explicit values must be plain decimal TCP ports.
     pub fn parse(raw: Option<&str>) -> Result<Self, AdminPortError> {
-        let raw = raw
-            .ok_or_else(|| AdminPortError(format!("{ADMIN_PORT_ENV} 必须显式设置为 1-65535")))?
-            .trim();
-        if raw.is_empty() || !raw.bytes().all(|byte| byte.is_ascii_digit()) {
+        let raw = match raw.map(str::trim) {
+            None | Some("") => {
+                return Ok(Self {
+                    port: DEFAULT_ADMIN_PORT,
+                });
+            }
+            Some(raw) => raw,
+        };
+        if !raw.bytes().all(|byte| byte.is_ascii_digit()) {
             return Err(AdminPortError(format!(
                 "{ADMIN_PORT_ENV} 不是合法的端口号：'{raw}'。请设置为 1-65535 之间的整数"
             )));
@@ -105,6 +119,99 @@ impl std::fmt::Display for AdminSessionToken {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("[REDACTED]")
     }
+}
+
+#[derive(Clone)]
+struct AdminHttpState {
+    app: Arc<AppState>,
+    token: Arc<AdminSessionToken>,
+}
+
+#[derive(Debug, Serialize)]
+struct AdminStatusResponse {
+    #[serde(flatten)]
+    status: AdminStatus,
+    capacity: AdminCapacitySnapshot,
+}
+
+/// Build the authenticated read-only Admin router. The caller owns the
+/// separate loopback listener; this router is never mounted on [`crate::build_app`].
+pub fn build_admin_app(state: AppState, token: AdminSessionToken) -> Router {
+    let state = AdminHttpState {
+        app: Arc::new(state),
+        token: Arc::new(token),
+    };
+    Router::new()
+        .route("/admin/api/v1/status", get(admin_status))
+        .route("/admin/api/v1/backends", get(admin_backends))
+        .route("/admin/api/v1/models", get(admin_models))
+        .route("/admin/api/v1/roles", get(admin_roles))
+        .route("/admin/api/v1/runtimes", get(admin_runtimes))
+        .fallback(StatusCode::NOT_FOUND)
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_admin_auth,
+        ))
+        .with_state(state)
+}
+
+async fn require_admin_auth(
+    State(state): State<AdminHttpState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if !authorized(request.headers(), &state.token) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    next.run(request).await
+}
+
+fn authorized(headers: &HeaderMap, token: &AdminSessionToken) -> bool {
+    let mut values = headers.get_all(AUTHORIZATION).iter();
+    let Some(value) = values.next() else {
+        return false;
+    };
+    if values.next().is_some() {
+        return false;
+    }
+    let Ok(value) = value.to_str() else {
+        return false;
+    };
+    let Some((scheme, candidate)) = value.split_once(' ') else {
+        return false;
+    };
+    if scheme.is_empty()
+        || candidate.is_empty()
+        || scheme.bytes().any(|byte| byte.is_ascii_whitespace())
+        || candidate.chars().any(char::is_whitespace)
+        || candidate.contains(',')
+    {
+        return false;
+    }
+    scheme.eq_ignore_ascii_case("bearer") && token.matches(candidate)
+}
+
+async fn admin_status(State(state): State<AdminHttpState>) -> Json<AdminStatusResponse> {
+    Json(AdminStatusResponse {
+        status: status(&state.app),
+        capacity: capacity(&state.app).await,
+    })
+}
+
+async fn admin_backends(State(state): State<AdminHttpState>) -> Json<Vec<AdminBackend>> {
+    Json(backends(&state.app))
+}
+
+async fn admin_models(State(state): State<AdminHttpState>) -> Json<AdminModelsSnapshot> {
+    Json(models(&state.app).await)
+}
+
+async fn admin_roles() -> Json<Vec<AdminRole>> {
+    Json(roles())
+}
+
+async fn admin_runtimes(State(state): State<AdminHttpState>) -> Json<AdminRuntimesSnapshot> {
+    Json(runtimes(&state.app).await)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -377,7 +484,8 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use axum::body::Body;
-    use axum::http::{Request, StatusCode};
+    use axum::http::{HeaderValue, Request, StatusCode};
+    use http_body_util::BodyExt;
     use tower::ServiceExt;
     use wiremock::{
         Mock, MockServer, ResponseTemplate,
@@ -389,6 +497,11 @@ mod tests {
     #[derive(Clone)]
     struct FakeCapabilities {
         entries: Option<Vec<crate::capabilities::CapabilityEntry>>,
+    }
+
+    #[derive(Clone)]
+    struct CountingCapabilities {
+        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     }
 
     impl crate::capabilities::CapabilitiesProvider for FakeCapabilities {
@@ -415,21 +528,38 @@ mod tests {
         }
     }
 
+    impl crate::capabilities::CapabilitiesProvider for CountingCapabilities {
+        fn snapshot(
+            &self,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<
+                            Vec<crate::capabilities::CapabilityEntry>,
+                            crate::capabilities::CapabilitiesError,
+                        >,
+                    > + Send
+                    + '_,
+            >,
+        > {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async { Ok(Vec::new()) })
+        }
+    }
+
     #[test]
-    fn admin_port_requires_explicit_valid_tcp_port() {
-        for raw in [
-            None,
-            Some(""),
-            Some("   "),
-            Some("0"),
-            Some("65536"),
-            Some("-1"),
-            Some("+9"),
-            Some("8x"),
-        ] {
+    fn admin_port_defaults_and_validates_override() {
+        for raw in [None, Some(""), Some("   ")] {
+            assert_eq!(
+                AdminBindConfig::parse(raw).unwrap().port(),
+                DEFAULT_ADMIN_PORT
+            );
+        }
+        for raw in [Some("0"), Some("65536"), Some("-1"), Some("+9"), Some("8x")] {
             assert!(AdminBindConfig::parse(raw).is_err(), "{raw:?}");
         }
         assert_eq!(AdminBindConfig::parse(Some(" 1 ")).unwrap().port(), 1);
+        assert_eq!(AdminBindConfig::parse(Some("9000")).unwrap().port(), 9000);
         assert_eq!(AdminBindConfig::parse(Some("65535")).unwrap().port(), 65535);
     }
 
@@ -507,9 +637,11 @@ mod tests {
     async fn data_plane_router_does_not_expose_admin_paths() {
         for path in [
             "/admin/api/v1/status",
+            "/admin/api/v1/backends",
             "/admin/api/v1/models",
             "/admin/api/v1/roles",
             "/admin/api/v1/runtimes",
+            "/admin/api/v1/capacity",
         ] {
             let response = crate::build_app(AppState::default())
                 .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
@@ -517,6 +649,231 @@ mod tests {
                 .unwrap();
             assert_eq!(response.status(), StatusCode::NOT_FOUND);
         }
+    }
+
+    fn admin_request(path: &str, scheme: &str, secret: &str) -> Request<Body> {
+        Request::builder()
+            .uri(path)
+            .header(AUTHORIZATION, format!("{scheme} {secret}"))
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn admin_auth_failures_are_identical_and_bearer_scheme_is_case_insensitive() {
+        let token = AdminSessionToken::mint();
+        let secret = token.expose_secret().to_string();
+        let wrong = AdminSessionToken::mint().expose_secret().to_string();
+        let app = build_admin_app(AppState::default(), token);
+
+        for scheme in ["Bearer", "bearer", "BEARER"] {
+            let response = app
+                .clone()
+                .oneshot(admin_request("/admin/api/v1/status", scheme, &secret))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{scheme}");
+        }
+
+        let mut duplicate = admin_request("/admin/api/v1/status", "Bearer", &secret);
+        duplicate.headers_mut().append(
+            AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {secret}")).unwrap(),
+        );
+        let mut invalid_utf8 = Request::builder()
+            .uri("/admin/api/v1/status")
+            .body(Body::empty())
+            .unwrap();
+        invalid_utf8
+            .headers_mut()
+            .insert(AUTHORIZATION, HeaderValue::from_bytes(&[0xff]).unwrap());
+        let requests = [
+            Request::builder()
+                .uri("/admin/api/v1/status")
+                .body(Body::empty())
+                .unwrap(),
+            admin_request("/admin/api/v1/status", "Basic", &secret),
+            Request::builder()
+                .uri("/admin/api/v1/status")
+                .header(AUTHORIZATION, "Bearer")
+                .body(Body::empty())
+                .unwrap(),
+            Request::builder()
+                .uri("/admin/api/v1/status")
+                .header(AUTHORIZATION, format!("Bearer {secret} extra"))
+                .body(Body::empty())
+                .unwrap(),
+            Request::builder()
+                .uri("/admin/api/v1/status")
+                .header(AUTHORIZATION, format!("Bearer\t{secret}"))
+                .body(Body::empty())
+                .unwrap(),
+            Request::builder()
+                .uri("/admin/api/v1/status")
+                .header(AUTHORIZATION, format!("Bearer {secret},Bearer {secret}"))
+                .body(Body::empty())
+                .unwrap(),
+            admin_request("/admin/api/v1/status", "Bearer", &wrong),
+            duplicate,
+            invalid_utf8,
+            Request::builder()
+                .method("POST")
+                .uri("/admin/api/v1/status")
+                .body(Body::empty())
+                .unwrap(),
+            Request::builder()
+                .uri("/admin/api/v1/unknown")
+                .body(Body::empty())
+                .unwrap(),
+        ];
+        let mut bodies = Vec::new();
+        for request in requests {
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            bodies.push(response.into_body().collect().await.unwrap().to_bytes());
+        }
+        assert!(bodies.iter().all(|body| body == &bodies[0]));
+        assert!(!String::from_utf8_lossy(&bodies[0]).contains(&secret));
+    }
+
+    #[tokio::test]
+    async fn unauthorized_status_never_calls_capacity_provider() {
+        use std::sync::{Arc, atomic::AtomicUsize};
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let token = AdminSessionToken::mint();
+        let app = build_admin_app(
+            AppState {
+                capabilities: Some(Arc::new(CountingCapabilities {
+                    calls: calls.clone(),
+                })),
+                ..AppState::default()
+            },
+            token,
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/api/v1/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn authenticated_admin_router_exposes_only_the_five_read_routes() {
+        let token = AdminSessionToken::mint();
+        let secret = token.expose_secret().to_string();
+        let app = build_admin_app(AppState::default(), token);
+
+        for path in [
+            "/admin/api/v1/status",
+            "/admin/api/v1/backends",
+            "/admin/api/v1/models",
+            "/admin/api/v1/roles",
+            "/admin/api/v1/runtimes",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(admin_request(path, "Bearer", &secret))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{path}");
+        }
+        for path in ["/admin/api/v1/capacity", "/admin/api/v1/unknown"] {
+            let response = app
+                .clone()
+                .oneshot(admin_request(path, "Bearer", &secret))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+        }
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/api/v1/status")
+                    .header(AUTHORIZATION, format!("Bearer {secret}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    #[tokio::test]
+    async fn admin_status_embeds_capacity_and_sanitizes_provider_errors() {
+        use std::sync::Arc;
+
+        let entry = crate::capabilities::CapabilityEntry {
+            id: "model-a".into(),
+            capability: "reasoning".into(),
+            resident: true,
+            estimated_memory_gb: 12.5,
+            ctx_limit: 131_072,
+            queue_depth: 3,
+            admission_status: crate::capabilities::AdmissionStatus::Ready,
+        };
+        for entries in [Some(vec![entry]), None] {
+            let token = AdminSessionToken::mint();
+            let secret = token.expose_secret().to_string();
+            let app = build_admin_app(
+                AppState {
+                    capabilities: Some(Arc::new(FakeCapabilities { entries })),
+                    ..AppState::default()
+                },
+                token,
+            );
+            let response = app
+                .oneshot(admin_request("/admin/api/v1/status", "Bearer", &secret))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert!(json.get("capacity").is_some());
+            assert!(!String::from_utf8_lossy(&body).contains("secret backend detail"));
+        }
+    }
+
+    #[tokio::test]
+    async fn admin_models_route_sanitizes_provider_failure() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("provider-secret"))
+            .mount(&server)
+            .await;
+        let mut card: idoris_contracts::ComponentCard =
+            serde_yaml::from_str(include_str!("../../../config/components/omlx.yaml")).unwrap();
+        card.provider.id = "failed-provider".into();
+        card.endpoint = server.uri();
+        card.version_pin = "test@1".into();
+        let token = AdminSessionToken::mint();
+        let secret = token.expose_secret().to_string();
+        let app = build_admin_app(
+            AppState {
+                cards: vec![card],
+                ..AppState::default()
+            },
+            token,
+        );
+        let response = app
+            .oneshot(admin_request("/admin/api/v1/models", "Bearer", &secret))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert!(!String::from_utf8_lossy(&body).contains("provider-secret"));
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap()["sources"][0]["state"],
+            "error"
+        );
     }
 
     #[tokio::test]
