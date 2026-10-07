@@ -168,20 +168,22 @@ mod tests {
         }
     }
 
-    struct FailWriter;
-    impl Write for FailWriter {
-        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
-            Err(std::io::Error::other("blocked"))
+    #[derive(Default)]
+    struct FailFlushWriter(Vec<u8>);
+    impl Write for FailFlushWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.extend_from_slice(buf);
+            Ok(buf.len())
         }
         fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
+            Err(std::io::Error::other("blocked"))
         }
     }
 
     #[test]
     fn output_failure_revokes_inserted_key() {
         let store = VirtualKeyStore::new(Connection::open_in_memory().unwrap()).unwrap();
-        let mut error_writer = FailWriter;
+        let mut error_writer = FailFlushWriter::default();
         let error = issue_from_reader_at(
             &store,
             &mut br#"{"owner":"agent24","allowed_privacy":["local_only"],"allowed_roles":["fast"]}"#.as_slice(),
@@ -190,5 +192,8 @@ mod tests {
         )
         .unwrap_err();
         assert!(!error.contains("idk_"));
+        let json: serde_json::Value = serde_json::from_slice(&error_writer.0).unwrap();
+        let secret = VirtualKeySecret::parse(json["secret"].as_str().unwrap()).unwrap();
+        assert!(store.authenticate(&secret, 1001).unwrap().is_none());
     }
 }
