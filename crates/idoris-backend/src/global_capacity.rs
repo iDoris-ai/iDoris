@@ -4,7 +4,20 @@ use std::collections::BTreeMap;
 use std::sync::Mutex;
 
 use crate::BackendError;
-use crate::eviction::CAPACITY_EPSILON_GB;
+
+/// Internal accounting is finer than the public 1e-6 GB admission epsilon:
+/// 1 nano-GB = 1e-9 GB, so the existing epsilon is exactly 1000 units.
+/// Budgets round down and allocations round up into these units. That makes
+/// quantization itself conservative while leaving the already-documented
+/// epsilon as the only intentional admission tolerance.
+const CAPACITY_UNITS_PER_GB: u128 = 1_000_000_000;
+const CAPACITY_EPSILON_UNITS: u128 = 1_000;
+
+#[derive(Debug, Clone, Copy)]
+struct CapacityAllocation {
+    requested_gb: f64,
+    charged_units: u128,
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct GlobalCapacitySnapshot {
@@ -16,14 +29,16 @@ pub struct GlobalCapacitySnapshot {
 #[derive(Debug)]
 pub struct GlobalCapacityLedger {
     budget_gb: f64,
-    allocations: Mutex<BTreeMap<String, f64>>,
+    budget_units: u128,
+    allocations: Mutex<BTreeMap<String, CapacityAllocation>>,
 }
 
 impl GlobalCapacityLedger {
     pub fn new(budget_gb: f64) -> Result<Self, BackendError> {
-        validate("budget_gb", budget_gb)?;
+        let budget_units = to_capacity_units("budget_gb", budget_gb, Rounding::Down)?;
         Ok(Self {
             budget_gb,
+            budget_units,
             allocations: Mutex::new(BTreeMap::new()),
         })
     }
@@ -32,7 +47,7 @@ impl GlobalCapacityLedger {
     /// amount is idempotent; changing an existing amount is an invariant error
     /// so two owners cannot silently rewrite each other's accounting.
     pub fn reserve(&self, key: &str, memory_gb: f64) -> Result<(), BackendError> {
-        validate("memory_gb", memory_gb)?;
+        let charged_units = to_capacity_units("memory_gb", memory_gb, Rounding::Up)?;
         if key.trim().is_empty() {
             return Err(BackendError::invalid_request(
                 "global capacity allocation key must not be empty",
@@ -43,23 +58,33 @@ impl GlobalCapacityLedger {
             .lock()
             .map_err(|_| BackendError::lock_poisoned("global capacity ledger lock poisoned"))?;
         if let Some(existing) = allocations.get(key) {
-            if *existing == memory_gb {
+            if existing.requested_gb == memory_gb {
                 return Ok(());
             }
             return Err(BackendError::invariant_violation(format!(
-                "global capacity allocation {key:?} changed from {existing}GB to {memory_gb}GB"
+                "global capacity allocation {key:?} changed from {}GB to {memory_gb}GB",
+                existing.requested_gb
             )));
         }
-        let reserved_gb = allocations.values().sum::<f64>();
-        let requested_total_gb = reserved_gb + memory_gb;
-        if !requested_total_gb.is_finite()
-            || requested_total_gb > self.budget_gb + CAPACITY_EPSILON_GB
-        {
+        let Some(requested_total_units) = exact_total_units(&allocations)
+            .and_then(|reserved| reserved.checked_add(charged_units))
+        else {
+            return Err(BackendError::Oom {
+                model_id: key.to_string(),
+            });
+        };
+        if requested_total_units > self.budget_units.saturating_add(CAPACITY_EPSILON_UNITS) {
             return Err(BackendError::Oom {
                 model_id: key.to_string(),
             });
         }
-        allocations.insert(key.to_string(), memory_gb);
+        allocations.insert(
+            key.to_string(),
+            CapacityAllocation {
+                requested_gb: memory_gb,
+                charged_units,
+            },
+        );
         Ok(())
     }
 
@@ -76,21 +101,102 @@ impl GlobalCapacityLedger {
             .allocations
             .lock()
             .map_err(|_| BackendError::lock_poisoned("global capacity ledger lock poisoned"))?;
+        let reserved_units = exact_total_units(&allocations).ok_or_else(|| {
+            BackendError::invariant_violation("global capacity exact total overflowed")
+        })?;
         Ok(GlobalCapacitySnapshot {
             budget_gb: self.budget_gb,
-            reserved_gb: allocations.values().sum(),
-            allocations: allocations.clone(),
+            reserved_gb: units_to_gb(reserved_units),
+            allocations: allocations
+                .iter()
+                .map(|(key, allocation)| (key.clone(), allocation.requested_gb))
+                .collect(),
         })
     }
 }
 
-fn validate(field: &'static str, value: f64) -> Result<(), BackendError> {
+#[derive(Clone, Copy)]
+enum Rounding {
+    Down,
+    Up,
+}
+
+fn to_capacity_units(
+    field: &'static str,
+    value: f64,
+    rounding: Rounding,
+) -> Result<u128, BackendError> {
     if !value.is_finite() || value < 0.0 {
         return Err(BackendError::invalid_request(format!(
             "invalid global capacity {field}: {value}"
         )));
     }
-    Ok(())
+    if value == 0.0 {
+        return Ok(0);
+    }
+
+    // Decode the IEEE-754 value exactly, then scale by 1e9 with integer
+    // arithmetic. This avoids both magnitude-dependent loss (e.g. 1e16+1)
+    // and any dependence on map iteration/summation order.
+    let bits = value.to_bits();
+    let exponent_bits = ((bits >> 52) & 0x7ff) as i32;
+    let fraction = bits & ((1_u64 << 52) - 1);
+    let (significand, exponent) = if exponent_bits == 0 {
+        (u128::from(fraction), -1074)
+    } else {
+        (
+            u128::from((1_u64 << 52) | fraction),
+            exponent_bits - 1023 - 52,
+        )
+    };
+    let scaled = significand
+        .checked_mul(CAPACITY_UNITS_PER_GB)
+        .ok_or_else(|| capacity_range_error(field, value))?;
+
+    let units = if exponent >= 0 {
+        let factor = 1_u128
+            .checked_shl(exponent as u32)
+            .ok_or_else(|| capacity_range_error(field, value))?;
+        scaled
+            .checked_mul(factor)
+            .ok_or_else(|| capacity_range_error(field, value))?
+    } else {
+        let shift = (-exponent) as u32;
+        if shift >= u128::BITS {
+            match rounding {
+                Rounding::Down => 0,
+                Rounding::Up => 1,
+            }
+        } else {
+            let divisor = 1_u128 << shift;
+            let quotient = scaled / divisor;
+            let remainder = scaled % divisor;
+            match rounding {
+                Rounding::Down => quotient,
+                Rounding::Up if remainder != 0 => quotient
+                    .checked_add(1)
+                    .ok_or_else(|| capacity_range_error(field, value))?,
+                Rounding::Up => quotient,
+            }
+        }
+    };
+    Ok(units)
+}
+
+fn capacity_range_error(field: &'static str, value: f64) -> BackendError {
+    BackendError::invalid_request(format!(
+        "global capacity {field} is too large for exact fixed-point accounting: {value}"
+    ))
+}
+
+fn exact_total_units(allocations: &BTreeMap<String, CapacityAllocation>) -> Option<u128> {
+    allocations.values().try_fold(0_u128, |total, allocation| {
+        total.checked_add(allocation.charged_units)
+    })
+}
+
+fn units_to_gb(units: u128) -> f64 {
+    (units as f64) / (CAPACITY_UNITS_PER_GB as f64)
 }
 
 #[cfg(test)]
@@ -154,7 +260,7 @@ mod tests {
         ledger.reserve("runtime/b", 0.2).unwrap();
         assert_eq!(ledger.snapshot().unwrap().allocations.len(), 2);
 
-        let excess = CAPACITY_EPSILON_GB * 10.0;
+        let excess = crate::eviction::CAPACITY_EPSILON_GB * 10.0;
         let ledger = GlobalCapacityLedger::new(0.3).unwrap();
         ledger.reserve("runtime/a", 0.1).unwrap();
         let error = ledger.reserve("runtime/b", 0.2 + excess).unwrap_err();
@@ -201,5 +307,48 @@ mod tests {
             .find_map(|(key, result)| result.is_ok().then_some(*key))
             .unwrap();
         assert_eq!(snapshot.allocations.get(winner), Some(&4.0));
+    }
+
+    #[test]
+    fn large_magnitude_one_gb_excess_is_never_rounded_away() {
+        let ledger = GlobalCapacityLedger::new(1.0e16).unwrap();
+        ledger.reserve("large", 1.0e16).unwrap();
+        let before = ledger.snapshot().unwrap();
+        assert!(before.reserved_gb.is_finite());
+
+        let error = ledger.reserve("one-more-gb", 1.0).unwrap_err();
+        assert_eq!(error.reason_code(), "oom");
+        assert_eq!(ledger.snapshot().unwrap(), before);
+    }
+
+    #[test]
+    fn out_of_fixed_point_range_is_rejected_before_state_can_corrupt() {
+        assert!(GlobalCapacityLedger::new(f64::MAX).is_err());
+
+        let ledger = GlobalCapacityLedger::new(1.0e16).unwrap();
+        let before = ledger.snapshot().unwrap();
+        assert!(ledger.reserve("too-large", f64::MAX).is_err());
+        assert_eq!(ledger.snapshot().unwrap(), before);
+    }
+
+    #[test]
+    fn snapshot_total_is_finite_and_independent_of_key_sum_order() {
+        let large = 1.0e16;
+        let small = 1024.0;
+        let budget = large + small;
+
+        let large_first = GlobalCapacityLedger::new(budget).unwrap();
+        large_first.reserve("a-large", large).unwrap();
+        large_first.reserve("z-small", small).unwrap();
+
+        let small_first = GlobalCapacityLedger::new(budget).unwrap();
+        small_first.reserve("a-small", small).unwrap();
+        small_first.reserve("z-large", large).unwrap();
+
+        let first = large_first.snapshot().unwrap();
+        let second = small_first.snapshot().unwrap();
+        assert!(first.reserved_gb.is_finite());
+        assert!(second.reserved_gb.is_finite());
+        assert_eq!(first.reserved_gb, second.reserved_gb);
     }
 }
