@@ -521,6 +521,25 @@ async fn rerank(
             "paid rerank is unavailable until rerank usage settlement is defined",
         );
     }
+    let _reservation = match dispatch::ReservationGuard::reserve(
+        state.budget_ledger.as_deref(),
+        parsed.tenant_id.as_deref(),
+        &selected.card.provider.id,
+        selected.estimated_cost_minor,
+    ) {
+        Ok(guard) => guard,
+        Err(err) => {
+            return budget_error_response(
+                &err,
+                &dispatch::ChatOutcome {
+                    decision: selected.decision.clone(),
+                    served_locality: selected.served_locality,
+                    result: Err(DispatchFailure::Budget(err.clone())),
+                    actual_cost_minor: None,
+                },
+            );
+        }
+    };
 
     let opts = proxy::ForwardOpts {
         request_id: headers
@@ -561,6 +580,7 @@ async fn rerank(
         response.headers_mut().insert(HEADER_SERVED_LOCALITY, value);
     }
     if outcome.cached {
+        response.extensions_mut().insert(usage::UsageFact::cached());
         response
             .headers_mut()
             .insert(HEADER_CACHED, HeaderValue::from_static("true"));
@@ -571,6 +591,10 @@ async fn rerank(
                 .headers_mut()
                 .insert(HEADER_ORIGIN_RECORD_ID, value);
         }
+    } else if status.is_success() {
+        response
+            .extensions_mut()
+            .insert(usage::UsageFact::inference(Some(0)));
     }
     response
 }
@@ -598,10 +622,20 @@ async fn messages(
             "request body must be a JSON object",
         );
     };
-    let stream_requested = object
-        .get("stream")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
+    let stream_requested = match object.get("stream") {
+        None => false,
+        Some(stream) => match stream.as_bool() {
+            Some(value) => value,
+            None => {
+                return error_envelope_with_reason(
+                    StatusCode::BAD_REQUEST,
+                    "unsupported_field",
+                    "unsupported_stream",
+                    "stream must be a boolean",
+                );
+            }
+        },
+    };
     let model = object.get("model").and_then(serde_json::Value::as_str);
     let mut parsed = match parse_profile(&headers, model, state.deploy_mode) {
         Ok(parsed) => parsed,
@@ -630,6 +664,25 @@ async fn messages(
             "paid messages are unavailable until Anthropic usage settlement is defined",
         );
     }
+    let _reservation = match dispatch::ReservationGuard::reserve(
+        state.budget_ledger.as_deref(),
+        parsed.tenant_id.as_deref(),
+        &selected.card.provider.id,
+        selected.estimated_cost_minor,
+    ) {
+        Ok(guard) => guard,
+        Err(err) => {
+            return budget_error_response(
+                &err,
+                &dispatch::ChatOutcome {
+                    decision: selected.decision.clone(),
+                    served_locality: selected.served_locality,
+                    result: Err(DispatchFailure::Budget(err.clone())),
+                    actual_cost_minor: None,
+                },
+            );
+        }
+    };
 
     if stream_requested {
         return messages_stream(&state, &selected, &value).await;
@@ -674,6 +727,7 @@ async fn messages(
         response.headers_mut().insert(HEADER_SERVED_LOCALITY, value);
     }
     if outcome.cached {
+        response.extensions_mut().insert(usage::UsageFact::cached());
         response
             .headers_mut()
             .insert(HEADER_CACHED, HeaderValue::from_static("true"));
@@ -684,6 +738,10 @@ async fn messages(
                 .headers_mut()
                 .insert(HEADER_ORIGIN_RECORD_ID, value);
         }
+    } else if status.is_success() {
+        response
+            .extensions_mut()
+            .insert(usage::UsageFact::inference(Some(0)));
     }
     response
 }
@@ -1769,7 +1827,10 @@ async fn record_id_middleware(
     let audit_started = Instant::now();
     let record_id = Uuid::new_v4().to_string();
     let audit_inference = req.method() == Method::POST
-        && matches!(req.uri().path(), "/v1/chat/completions" | "/v1/embeddings");
+        && matches!(
+            req.uri().path(),
+            "/v1/chat/completions" | "/v1/embeddings" | "/v1/rerank" | "/v1/messages"
+        );
     let audit_tenant = audit_tenant_id(&state, req.headers());
     let audit_request_id = audit_header(req.headers(), HEADER_REQUEST_ID, None);
     let audit_privacy = audit_header(req.headers(), "x-idoris-privacy", Some("local_only"));
