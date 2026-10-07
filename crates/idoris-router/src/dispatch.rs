@@ -275,6 +275,21 @@ pub fn is_resident_http_service(card: &ComponentCard) -> bool {
             .is_some_and(|lp| lp.mode == LoadMode::Resident)
 }
 
+/// Resolve the exact model id that lifecycle dispatch will execute for a
+/// selected provider. Readiness affinity must use this same identity so it
+/// can never warm-match a different model than the one later loaded/chatted.
+pub(crate) fn backend_model_id(
+    profile: &ParsedProfile,
+    requested_model: Option<&str>,
+    provider_id: &str,
+) -> String {
+    if profile.role.is_none() {
+        requested_model.unwrap_or(provider_id).to_string()
+    } else {
+        provider_id.to_string()
+    }
+}
+
 /// RAII guard: on `Drop`, releases the reservation unless [`Self::take`]
 /// already removed it. This covers two cases a scattering of explicit
 /// `release()` calls at each early-`return` site cannot: an `Err` return
@@ -517,11 +532,7 @@ pub async fn dispatch_local(
         // defense in depth, not a path expected to actually trigger.
         let estimated_cost_minor = chosen.estimated_cost_minor.unwrap_or(0);
         let provider_id = chosen.id().to_string();
-        let backend_model_id = if profile.role.is_none() {
-            requested_model.unwrap_or(&provider_id).to_string()
-        } else {
-            provider_id.clone()
-        };
+        let backend_model_id = backend_model_id(profile, requested_model, &provider_id);
         (
             decision,
             served_locality,

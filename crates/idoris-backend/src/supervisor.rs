@@ -2152,6 +2152,40 @@ mod tests {
         assert_eq!(status.pressure, Pressure::Ok);
     }
 
+    #[tokio::test]
+    async fn exact_readiness_is_false_while_loading_stopping_or_error() {
+        let adapter = Arc::new(MockAdapter::new(catalog()));
+        adapter.set_load_delay("a", std::time::Duration::from_millis(100));
+        let handle = Supervisor::spawn(adapter.clone(), SupervisorConfig::default())
+            .expect("spawn should succeed");
+
+        let loading_handle = handle.clone();
+        let loading =
+            tokio::spawn(async move { loading_handle.load("a", 4.0, on_demand_policy()).await });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(!handle.is_ready("a").await.unwrap(), "Loading is not Ready");
+        loading.await.unwrap().unwrap();
+        assert!(handle.is_ready("a").await.unwrap());
+
+        adapter.set_unload_delay("a", std::time::Duration::from_millis(100));
+        let stopping_handle = handle.clone();
+        let stopping = tokio::spawn(async move { stopping_handle.unload("a").await });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(
+            !handle.is_ready("a").await.unwrap(),
+            "Stopping is not Ready"
+        );
+        stopping.await.unwrap().unwrap();
+
+        adapter.set_load_delay("a", std::time::Duration::ZERO);
+        adapter.set_load_script("a", vec![crate::mock::LoadOutcome::Fail]);
+        handle
+            .load("a", 4.0, on_demand_policy())
+            .await
+            .expect_err("scripted load failure should leave an Error slot");
+        assert!(!handle.is_ready("a").await.unwrap(), "Error is not Ready");
+    }
+
     /// Negative contrast: `chat` before any `load` fails `model_not_found`.
     #[tokio::test]
     async fn chat_before_any_load_lands_is_not_found() {

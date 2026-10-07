@@ -870,14 +870,7 @@ async fn chat_completions(
                     .iter()
                     .map(|card| {
                         let provider_id = card.provider.id.clone();
-                        let target_model = if parsed.role.is_none() {
-                            model
-                                .filter(|value| !value.is_empty())
-                                .map(str::to_string)
-                                .unwrap_or_else(|| provider_id.clone())
-                        } else {
-                            provider_id.clone()
-                        };
+                        let target_model = dispatch::backend_model_id(&parsed, model, &provider_id);
                         (provider_id, target_model)
                     })
                     .collect(),
@@ -2377,6 +2370,49 @@ mod tests {
             usage[0].payload["tokens_out"],
             json["usage"]["completion_tokens"]
         );
+    }
+
+    #[tokio::test]
+    async fn chat_request_freezes_one_readiness_snapshot_for_all_decide_passes() {
+        let card = sample_component_card("local-1");
+        let adapter = std::sync::Arc::new(idoris_backend::MockAdapter::new(vec![
+            idoris_backend::ModelInfo {
+                id: "local-1".to_string(),
+                memory_gb: 1.0,
+            },
+        ]));
+        let supervisor =
+            idoris_backend::Supervisor::spawn(adapter, idoris_backend::SupervisorConfig::default())
+                .unwrap();
+        supervisor
+            .load(
+                "local-1",
+                1.0,
+                idoris_contracts::load_policy::LoadPolicy {
+                    mode: idoris_contracts::load_policy::LoadMode::OnDemand,
+                    keepalive: idoris_contracts::load_policy::Keepalive::IdleTtl { idle_ttl_s: 60 },
+                    admission: idoris_contracts::load_policy::Admission::Coexist,
+                },
+            )
+            .await
+            .unwrap();
+        let runtimes: runtime::RuntimeRegistry =
+            dispatch::BoundSupervisor::new(&card, supervisor).into();
+        let state = AppState {
+            cards: vec![card],
+            runtimes: runtimes.clone(),
+            ..AppState::default()
+        };
+
+        let response = build_app(state)
+            .oneshot(post_chat(
+                r#"{"model":"idoris/daily","messages":[{"role":"user","content":"hi"}]}"#,
+                &[("X-iDoris-Session", "run-42")],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(runtimes.ready_snapshot_calls(), 1);
     }
 
     #[tokio::test]

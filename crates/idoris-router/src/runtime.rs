@@ -20,6 +20,8 @@ use crate::dispatch::BoundSupervisor;
 pub struct RuntimeRegistry {
     supervisors: BTreeMap<String, BoundSupervisor>,
     startup_capacity: Option<Arc<GlobalCapacityLedger>>,
+    #[cfg(test)]
+    ready_snapshot_calls: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl RuntimeRegistry {
@@ -43,6 +45,8 @@ impl RuntimeRegistry {
         let mut registry = Self {
             supervisors: BTreeMap::new(),
             startup_capacity: Some(startup_capacity.clone()),
+            #[cfg(test)]
+            ready_snapshot_calls: Arc::default(),
         };
         for card in cards {
             let Some(handle) = spawn_runtime_with_factory(card, &factory, Some(&startup_capacity))?
@@ -145,16 +149,29 @@ impl RuntimeRegistry {
     /// Return providers whose exact requested lifecycle target is currently
     /// chat-ready. Errors are conservatively treated as not ready.
     pub async fn exact_ready_providers(&self, targets: Vec<(String, String)>) -> BTreeSet<String> {
+        #[cfg(test)]
+        self.ready_snapshot_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let mut ready = BTreeSet::new();
         for (provider_id, model_id) in targets {
             if let Some(supervisor) = self.supervisors.get(&provider_id)
-                && supervisor.is_ready(&model_id).await.unwrap_or(false)
+                && ready_for_affinity(supervisor.is_ready(&model_id).await)
             {
                 ready.insert(provider_id);
             }
         }
         ready
     }
+
+    #[cfg(test)]
+    pub(crate) fn ready_snapshot_calls(&self) -> usize {
+        self.ready_snapshot_calls
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+fn ready_for_affinity(result: Result<bool, BackendError>) -> bool {
+    result.unwrap_or(false)
 }
 
 fn add_status_depth(
@@ -181,6 +198,8 @@ impl From<BoundSupervisor> for RuntimeRegistry {
         Self {
             supervisors,
             startup_capacity: None,
+            #[cfg(test)]
+            ready_snapshot_calls: Arc::default(),
         }
     }
 }
@@ -336,6 +355,7 @@ mod tests {
                 ("b".into(), mock_bound(&b)),
             ]),
             startup_capacity: None,
+            ready_snapshot_calls: Arc::default(),
         };
         for card in [&a, &b] {
             let outcome = dispatch_local(
@@ -397,6 +417,30 @@ mod tests {
         assert!(
             registry
                 .exact_ready_providers(vec![("runtime-b".into(), "target".into())])
+                .await
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn readiness_query_errors_are_neutral_for_affinity() {
+        assert!(!ready_for_affinity(Err(BackendError::internal(
+            "readiness unavailable"
+        ))));
+    }
+
+    #[tokio::test]
+    async fn resident_direct_path_never_receives_lifecycle_readiness_boost() {
+        let mut resident = named_card("resident");
+        resident.load_policy.as_mut().unwrap().mode = LoadMode::Resident;
+        let registry = RuntimeRegistry::spawn_with_factory(std::slice::from_ref(&resident), |_| {
+            panic!("Resident direct path must not construct a lifecycle runtime")
+        })
+        .unwrap();
+
+        assert!(
+            registry
+                .exact_ready_providers(vec![("resident".into(), "resident".into())])
                 .await
                 .is_empty()
         );
