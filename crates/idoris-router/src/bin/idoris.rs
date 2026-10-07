@@ -16,6 +16,7 @@
 //! lifecycle) never touches this Supervisor at all — `AppState.proxy`
 //! forwards to it directly per-request instead.
 
+use futures_util::StreamExt;
 use idoris_router::{
     AppState, BIND_HOST,
     admin::{ADMIN_PORT_ENV, AdminBindConfig, AdminSessionToken, build_admin_app},
@@ -48,10 +49,19 @@ async fn main() {
             std::process::exit(1);
         }
     };
-    let cli::Command::Serve(options) = command;
-    if let Err(message) = run(options).await {
-        eprintln!("[idoris] 启动失败：{message}");
-        std::process::exit(1);
+    match command {
+        cli::Command::Serve(options) => {
+            if let Err(message) = run(options).await {
+                eprintln!("[idoris] 启动失败：{message}");
+                std::process::exit(1);
+            }
+        }
+        cli::Command::Admin(cli::AdminCommand::Status(options)) => {
+            if let Err(message) = admin_status(options).await {
+                eprintln!("[idoris] Admin 操作失败：{message}");
+                std::process::exit(1);
+            }
+        }
     }
 }
 
@@ -212,6 +222,67 @@ fn read_admin_token(reader: &mut impl Read) -> Result<AdminSessionToken, String>
     AdminSessionToken::from_launcher_secret(&framed[..64]).map_err(|err| err.to_string())
 }
 
+const MAX_ADMIN_RESPONSE_BYTES: usize = 256 * 1024;
+
+async fn admin_status(options: cli::AdminOptions) -> Result<(), String> {
+    if !options.token_stdin {
+        return Err("Admin CLI 必须显式使用 --token-stdin".to_string());
+    }
+    let token = read_admin_token_from_stdin()?;
+    let admin_port = match std::env::var(ADMIN_PORT_ENV) {
+        Ok(value) => Some(value),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err(format!("{ADMIN_PORT_ENV} 不是有效的 Unicode"));
+        }
+    };
+    let bind = AdminBindConfig::parse(admin_port.as_deref()).map_err(|err| err.to_string())?;
+    let value = fetch_admin_status(bind, &token).await?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&value)
+            .map_err(|_| "无法格式化 Admin status 响应".to_string())?
+    );
+    Ok(())
+}
+
+async fn fetch_admin_status(
+    bind: AdminBindConfig,
+    token: &AdminSessionToken,
+) -> Result<serde_json::Value, String> {
+    let client =
+        idoris_upstream::http_client().map_err(|_| "无法初始化 Admin HTTP client".to_string())?;
+    let url = format!("http://{}/admin/api/v1/status", bind.addr());
+    let response = client
+        .get(url)
+        .bearer_auth(token.expose_secret())
+        .timeout(std::time::Duration::from_secs(5))
+        .send()
+        .await
+        .map_err(|_| "Admin status 请求失败".to_string())?;
+    if !response.status().is_success() {
+        return Err(format!("Admin status 返回 HTTP {}", response.status()));
+    }
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_ADMIN_RESPONSE_BYTES as u64)
+    {
+        return Err("Admin status 响应过大".to_string());
+    }
+    let mut body = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|_| "无法读取 Admin status 响应".to_string())?;
+        if body.len().saturating_add(chunk.len()) > MAX_ADMIN_RESPONSE_BYTES {
+            return Err("Admin status 响应过大".to_string());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    let value: serde_json::Value =
+        serde_json::from_slice(&body).map_err(|_| "Admin status 返回无效 JSON".to_string())?;
+    Ok(value)
+}
+
 async fn serve_bound<S>(
     data_listener: tokio::net::TcpListener,
     admin_listener: tokio::net::TcpListener,
@@ -305,6 +376,10 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
+    use wiremock::{
+        Mock, MockServer, ResponseTemplate,
+        matchers::{method, path},
+    };
 
     #[test]
     fn launcher_token_validation_never_echoes_secret() {
@@ -327,6 +402,68 @@ mod tests {
             let error = read_admin_token(&mut invalid.as_slice()).unwrap_err();
             assert!(!error.contains(std::str::from_utf8(secret).unwrap()));
         }
+    }
+
+    #[tokio::test]
+    async fn admin_status_transport_rejects_error_body_redirect_and_oversize() {
+        let token = AdminSessionToken::from_launcher_secret(
+            b"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        )
+        .unwrap();
+
+        let error_server = MockServer::start().await;
+        let sentinel = "UPSTREAM_SECRET_SENTINEL";
+        Mock::given(method("GET"))
+            .and(path("/admin/api/v1/status"))
+            .respond_with(ResponseTemplate::new(401).set_body_string(sentinel))
+            .mount(&error_server)
+            .await;
+        let error_bind =
+            AdminBindConfig::parse(Some(&error_server.address().port().to_string())).unwrap();
+        let error = fetch_admin_status(error_bind, &token).await.unwrap_err();
+        assert!(error.contains("HTTP 401"));
+        assert!(!error.contains(sentinel));
+        assert!(!error.contains(token.expose_secret()));
+
+        let redirect_target = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/admin/api/v1/status"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "unexpected": true
+            })))
+            .expect(0)
+            .mount(&redirect_target)
+            .await;
+        let redirect_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/admin/api/v1/status"))
+            .respond_with(
+                ResponseTemplate::new(302).insert_header("Location", redirect_target.uri()),
+            )
+            .mount(&redirect_server)
+            .await;
+        let redirect_bind =
+            AdminBindConfig::parse(Some(&redirect_server.address().port().to_string())).unwrap();
+        let error = fetch_admin_status(redirect_bind, &token).await.unwrap_err();
+        assert!(error.contains("HTTP 302"));
+        redirect_target.verify().await;
+
+        let large_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/admin/api/v1/status"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![
+                b'x';
+                MAX_ADMIN_RESPONSE_BYTES
+                    + 1
+            ]))
+            .mount(&large_server)
+            .await;
+        let large_bind =
+            AdminBindConfig::parse(Some(&large_server.address().port().to_string())).unwrap();
+        assert_eq!(
+            fetch_admin_status(large_bind, &token).await.unwrap_err(),
+            "Admin status 响应过大"
+        );
     }
 
     #[tokio::test]
