@@ -222,14 +222,22 @@ mod tests {
         use std::sync::Arc;
 
         use idoris_backend::{MockAdapter, ModelInfo, Supervisor, SupervisorConfig};
+        use idoris_contracts::Contract;
+        use idoris_contracts::load_policy::{Admission, Keepalive, LoadMode, LoadPolicy};
 
         let mut lifecycle: idoris_contracts::ComponentCard =
             serde_yaml::from_str(include_str!("../../../config/components/omlx.yaml")).unwrap();
         lifecycle.provider.id = "lifecycle".into();
         let mut direct = lifecycle.clone();
         direct.provider.id = "direct".into();
-        direct.form = idoris_contracts::component_card::Form::BundledBinary;
-        direct.provider.locality = idoris_contracts::provider::Locality::Remote;
+        direct.load_policy = Some(LoadPolicy {
+            mode: LoadMode::Resident,
+            keepalive: Keepalive::Pinned { pinned: true },
+            admission: Admission::Coexist,
+        });
+        assert!(lifecycle.validate().is_ok());
+        assert!(direct.validate().is_ok());
+        assert!(crate::dispatch::is_resident_http_service(&direct));
 
         let adapter = Arc::new(MockAdapter::new(vec![ModelInfo {
             id: "ignored-model".into(),
@@ -260,11 +268,11 @@ mod tests {
         assert_eq!(snapshot[1].provider_id, "direct");
         assert_eq!(
             snapshot[1].locality,
-            idoris_contracts::provider::Locality::Remote
+            idoris_contracts::provider::Locality::Loopback
         );
         assert_eq!(
             snapshot[1].form,
-            idoris_contracts::component_card::Form::BundledBinary
+            idoris_contracts::component_card::Form::HttpService
         );
         assert!(!snapshot[1].lifecycle_runtime_bound);
 
