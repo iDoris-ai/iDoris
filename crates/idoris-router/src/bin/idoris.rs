@@ -56,8 +56,8 @@ async fn main() {
                 std::process::exit(1);
             }
         }
-        cli::Command::Admin(cli::AdminCommand::Status(options)) => {
-            if let Err(message) = admin_status(options).await {
+        cli::Command::Admin(cli::AdminCommand::Read(resource, options)) => {
+            if let Err(message) = admin_read(resource, options).await {
                 eprintln!("[idoris] Admin 操作失败：{message}");
                 std::process::exit(1);
             }
@@ -253,7 +253,10 @@ fn read_admin_token(reader: &mut impl Read) -> Result<AdminSessionToken, String>
 
 const MAX_ADMIN_RESPONSE_BYTES: usize = 256 * 1024;
 
-async fn admin_status(options: cli::AdminOptions) -> Result<(), String> {
+async fn admin_read(
+    resource: cli::AdminResource,
+    options: cli::AdminOptions,
+) -> Result<(), String> {
     if !options.token_stdin {
         return Err("Admin CLI 必须显式使用 --token-stdin".to_string());
     }
@@ -266,49 +269,49 @@ async fn admin_status(options: cli::AdminOptions) -> Result<(), String> {
         }
     };
     let bind = AdminBindConfig::parse(admin_port.as_deref()).map_err(|err| err.to_string())?;
-    let value = fetch_admin_status(bind, &token).await?;
+    let value = fetch_admin_resource(bind, &token, resource).await?;
     println!(
         "{}",
-        serde_json::to_string_pretty(&value)
-            .map_err(|_| "无法格式化 Admin status 响应".to_string())?
+        serde_json::to_string_pretty(&value).map_err(|_| "无法格式化 Admin 响应".to_string())?
     );
     Ok(())
 }
 
-async fn fetch_admin_status(
+async fn fetch_admin_resource(
     bind: AdminBindConfig,
     token: &AdminSessionToken,
+    resource: cli::AdminResource,
 ) -> Result<serde_json::Value, String> {
     let client =
         idoris_upstream::http_client().map_err(|_| "无法初始化 Admin HTTP client".to_string())?;
-    let url = format!("http://{}/admin/api/v1/status", bind.addr());
+    let url = format!("http://{}/admin/api/v1/{}", bind.addr(), resource.path());
     let response = client
         .get(url)
         .bearer_auth(token.expose_secret())
         .timeout(std::time::Duration::from_secs(5))
         .send()
         .await
-        .map_err(|_| "Admin status 请求失败".to_string())?;
+        .map_err(|_| "Admin 请求失败".to_string())?;
     if !response.status().is_success() {
-        return Err(format!("Admin status 返回 HTTP {}", response.status()));
+        return Err(format!("Admin 返回 HTTP {}", response.status()));
     }
     if response
         .content_length()
         .is_some_and(|length| length > MAX_ADMIN_RESPONSE_BYTES as u64)
     {
-        return Err("Admin status 响应过大".to_string());
+        return Err("Admin 响应过大".to_string());
     }
     let mut body = Vec::new();
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|_| "无法读取 Admin status 响应".to_string())?;
+        let chunk = chunk.map_err(|_| "无法读取 Admin 响应".to_string())?;
         if body.len().saturating_add(chunk.len()) > MAX_ADMIN_RESPONSE_BYTES {
-            return Err("Admin status 响应过大".to_string());
+            return Err("Admin 响应过大".to_string());
         }
         body.extend_from_slice(&chunk);
     }
     let value: serde_json::Value =
-        serde_json::from_slice(&body).map_err(|_| "Admin status 返回无效 JSON".to_string())?;
+        serde_json::from_slice(&body).map_err(|_| "Admin 返回无效 JSON".to_string())?;
     Ok(value)
 }
 
@@ -465,7 +468,9 @@ mod tests {
             .await;
         let error_bind =
             AdminBindConfig::parse(Some(&error_server.address().port().to_string())).unwrap();
-        let error = fetch_admin_status(error_bind, &token).await.unwrap_err();
+        let error = fetch_admin_resource(error_bind, &token, cli::AdminResource::Status)
+            .await
+            .unwrap_err();
         assert!(error.contains("HTTP 401"));
         assert!(!error.contains(sentinel));
         assert!(!error.contains(token.expose_secret()));
@@ -489,7 +494,9 @@ mod tests {
             .await;
         let redirect_bind =
             AdminBindConfig::parse(Some(&redirect_server.address().port().to_string())).unwrap();
-        let error = fetch_admin_status(redirect_bind, &token).await.unwrap_err();
+        let error = fetch_admin_resource(redirect_bind, &token, cli::AdminResource::Status)
+            .await
+            .unwrap_err();
         assert!(error.contains("HTTP 302"));
         redirect_target.verify().await;
 
@@ -506,8 +513,10 @@ mod tests {
         let large_bind =
             AdminBindConfig::parse(Some(&large_server.address().port().to_string())).unwrap();
         assert_eq!(
-            fetch_admin_status(large_bind, &token).await.unwrap_err(),
-            "Admin status 响应过大"
+            fetch_admin_resource(large_bind, &token, cli::AdminResource::Status)
+                .await
+                .unwrap_err(),
+            "Admin 响应过大"
         );
     }
 
