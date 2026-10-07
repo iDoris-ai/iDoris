@@ -14,7 +14,10 @@ use std::path::{Path, PathBuf};
 
 use idoris_contracts::Contract;
 use idoris_contracts::adapter_manifest::AdapterManifest;
-use idoris_contracts::admin_v0::AdminStatusResponse;
+use idoris_contracts::admin_v0::{
+    AdminAdmissionStatus, AdminCapacityEntry, AdminCapacitySnapshot, AdminCapacityState,
+    AdminStatusResponse,
+};
 use idoris_contracts::component_card::ComponentCard;
 use idoris_contracts::load_policy::LoadPolicy;
 use idoris_contracts::provider::ProviderDescriptor;
@@ -102,6 +105,40 @@ fn admin_v0_status_corpus() {
     let mut bad_capacity = valid.clone();
     bad_capacity["capacity"] = json!({"state": "error", "entries": []});
     assert_parity::<AdminStatusResponse>("admin-v0-status.schema.json", &bad_capacity);
+}
+
+#[test]
+fn admin_v0_status_rejects_non_finite_capacity_memory() {
+    for estimated_memory_gb in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.0] {
+        let status = AdminStatusResponse {
+            status: "ok".into(),
+            service: "idoris".into(),
+            version: "0.2.0".into(),
+            contract_version: "1.0.1".into(),
+            instance_id: "instance-1".into(),
+            components: 0,
+            runtimes: 0,
+            subscriptions: 0,
+            budget_configured: false,
+            audit_configured: false,
+            capacity: AdminCapacitySnapshot {
+                state: AdminCapacityState::Observed,
+                entries: Some(vec![AdminCapacityEntry {
+                    id: "model-a".into(),
+                    capability: "reasoning".into(),
+                    resident: true,
+                    estimated_memory_gb,
+                    ctx_limit: 1,
+                    queue_depth: 0,
+                    admission_status: AdminAdmissionStatus::Ready,
+                }]),
+            },
+        };
+        assert!(
+            status.validate().is_err(),
+            "accepted {estimated_memory_gb:?}"
+        );
+    }
 }
 
 #[test]

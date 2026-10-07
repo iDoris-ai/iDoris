@@ -567,6 +567,16 @@ pub async fn capacity(state: &AppState) -> AdminCapacitySnapshot {
         };
     };
     match provider.snapshot().await {
+        Ok(entries)
+            if entries.iter().any(|entry| {
+                !entry.estimated_memory_gb.is_finite() || entry.estimated_memory_gb < 0.0
+            }) =>
+        {
+            AdminCapacitySnapshot {
+                state: AdminCapacityState::Error,
+                entries: None,
+            }
+        }
         Ok(entries) => AdminCapacitySnapshot {
             state: AdminCapacityState::Observed,
             entries: Some(
@@ -779,6 +789,35 @@ mod tests {
         let json = serde_json::to_string(&snapshot).unwrap();
         assert_eq!(json, r#"{"state":"error"}"#);
         assert!(!json.contains("secret backend detail"));
+    }
+
+    #[tokio::test]
+    async fn capacity_snapshot_rejects_invalid_memory_facts() {
+        use std::sync::Arc;
+
+        for estimated_memory_gb in [-1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let state = AppState {
+                capabilities: Some(Arc::new(FakeCapabilities {
+                    entries: Some(vec![crate::capabilities::CapabilityEntry {
+                        id: "model-a".into(),
+                        capability: "reasoning".into(),
+                        resident: true,
+                        estimated_memory_gb,
+                        ctx_limit: 131_072,
+                        queue_depth: 0,
+                        admission_status: crate::capabilities::AdmissionStatus::Ready,
+                    }]),
+                })),
+                ..AppState::default()
+            };
+            assert_eq!(
+                capacity(&state).await,
+                AdminCapacitySnapshot {
+                    state: AdminCapacityState::Error,
+                    entries: None,
+                }
+            );
+        }
     }
 
     #[tokio::test]

@@ -72,8 +72,12 @@ impl Contract for AdminStatusResponse {
         }
         match (&self.capacity.state, &self.capacity.entries) {
             (AdminCapacityState::Observed, Some(entries)) => {
-                if entries.iter().any(|entry| entry.estimated_memory_gb < 0.0) {
-                    return Err(ContractError::new("admin capacity memory must be >= 0"));
+                if entries.iter().any(|entry| {
+                    !entry.estimated_memory_gb.is_finite() || entry.estimated_memory_gb < 0.0
+                }) {
+                    return Err(ContractError::new(
+                        "admin capacity memory must be finite and >= 0",
+                    ));
                 }
             }
             (AdminCapacityState::Unavailable | AdminCapacityState::Error, None) => {}
