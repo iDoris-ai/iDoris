@@ -208,7 +208,36 @@ async fn run(options: cli::ServeOptions) -> Result<(), String> {
 }
 
 fn read_admin_token_from_stdin() -> Result<AdminSessionToken, String> {
-    read_admin_token(&mut std::io::stdin().lock())
+    read_admin_token_with_timeout(
+        || read_admin_token(&mut std::io::stdin().lock()),
+        std::time::Duration::from_secs(10),
+    )
+}
+
+fn read_admin_token_with_timeout<F>(
+    read: F,
+    timeout: std::time::Duration,
+) -> Result<AdminSessionToken, String>
+where
+    F: FnOnce() -> Result<AdminSessionToken, String> + Send + 'static,
+{
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    std::thread::Builder::new()
+        .name("idoris-admin-token".to_string())
+        .spawn(move || {
+            let _ = sender.send(read());
+        })
+        .map_err(|_| "无法启动 Admin session token 读取任务".to_string())?;
+    receiver
+        .recv_timeout(timeout)
+        .map_err(|error| match error {
+            std::sync::mpsc::RecvTimeoutError::Timeout => {
+                "等待 launcher Admin session token 超时".to_string()
+            }
+            std::sync::mpsc::RecvTimeoutError::Disconnected => {
+                "Admin session token 读取任务异常结束".to_string()
+            }
+        })?
 }
 
 fn read_admin_token(reader: &mut impl Read) -> Result<AdminSessionToken, String> {
@@ -398,10 +427,26 @@ mod tests {
         let token = read_admin_token(&mut valid.as_slice()).unwrap();
         assert!(token.matches(std::str::from_utf8(secret).unwrap()));
 
-        for invalid in [secret[..63].to_vec(), secret.to_vec()] {
+        let mut wrong_terminator = secret.to_vec();
+        wrong_terminator.push(b'X');
+        for invalid in [secret[..63].to_vec(), secret.to_vec(), wrong_terminator] {
             let error = read_admin_token(&mut invalid.as_slice()).unwrap_err();
             assert!(!error.contains(std::str::from_utf8(secret).unwrap()));
         }
+    }
+
+    #[test]
+    fn launcher_token_read_timeout_is_bounded_and_sanitized() {
+        let error = read_admin_token_with_timeout(
+            || {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                Err("SECRET_SENTINEL".to_string())
+            },
+            std::time::Duration::from_millis(10),
+        )
+        .unwrap_err();
+        assert_eq!(error, "等待 launcher Admin session token 超时");
+        assert!(!error.contains("SECRET_SENTINEL"));
     }
 
     #[tokio::test]
