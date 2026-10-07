@@ -34,17 +34,22 @@ use idoris_router::{
 };
 use std::{
     future::{Future, IntoFuture},
+    io::Read,
     sync::Arc,
 };
 use tokio_util::sync::CancellationToken;
 
 #[tokio::main]
 async fn main() {
-    if let Err(message) = cli::parse_args(std::env::args_os().skip(1)) {
-        eprintln!("[idoris] {message}");
-        std::process::exit(1);
-    }
-    if let Err(message) = run().await {
+    let command = match cli::parse_args(std::env::args_os().skip(1)) {
+        Ok(command) => command,
+        Err(message) => {
+            eprintln!("[idoris] {message}");
+            std::process::exit(1);
+        }
+    };
+    let cli::Command::Serve(options) = command;
+    if let Err(message) = run(options).await {
         eprintln!("[idoris] 启动失败：{message}");
         std::process::exit(1);
     }
@@ -54,7 +59,7 @@ fn env_flag(name: &str) -> bool {
     std::env::var(name).is_ok_and(|v| v == "1")
 }
 
-async fn run() -> Result<(), String> {
+async fn run(options: cli::ServeOptions) -> Result<(), String> {
     let port =
         parse_port(std::env::var("IDORIS_PORT").ok().as_deref()).map_err(|err| err.to_string())?;
     let admin_port = match std::env::var(ADMIN_PORT_ENV) {
@@ -172,7 +177,11 @@ async fn run() -> Result<(), String> {
         .bind()
         .await
         .map_err(|err| format!("无法绑定 Admin {}：{err}", admin_bind.addr()))?;
-    let admin_token = AdminSessionToken::mint();
+    let admin_token = if options.admin_token_stdin {
+        read_admin_token_from_stdin()?
+    } else {
+        AdminSessionToken::mint()
+    };
 
     println!(
         "idoris: 已注册组件 [{}]",
@@ -186,6 +195,21 @@ async fn run() -> Result<(), String> {
         let _ = tokio::signal::ctrl_c().await;
     })
     .await
+}
+
+fn read_admin_token_from_stdin() -> Result<AdminSessionToken, String> {
+    read_admin_token(&mut std::io::stdin().lock())
+}
+
+fn read_admin_token(reader: &mut impl Read) -> Result<AdminSessionToken, String> {
+    let mut framed = [0_u8; 65];
+    reader
+        .read_exact(&mut framed)
+        .map_err(|_| "无法从 stdin 读取完整 Admin session token".to_string())?;
+    if framed[64] != b'\n' {
+        return Err("stdin Admin session token 缺少换行终止符".to_string());
+    }
+    AdminSessionToken::from_launcher_secret(&framed[..64]).map_err(|err| err.to_string())
 }
 
 async fn serve_bound<S>(
@@ -281,6 +305,29 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
+
+    #[test]
+    fn launcher_token_validation_never_echoes_secret() {
+        let secret = "A".repeat(64);
+        let error = AdminSessionToken::from_launcher_secret(secret.as_bytes()).unwrap_err();
+        let rendered = error.to_string();
+        assert!(!rendered.contains(&secret));
+        assert!(!rendered.contains("Bearer"));
+    }
+
+    #[test]
+    fn launcher_token_frame_is_bounded_and_newline_terminated() {
+        let secret = b"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let mut valid = secret.to_vec();
+        valid.push(b'\n');
+        let token = read_admin_token(&mut valid.as_slice()).unwrap();
+        assert!(token.matches(std::str::from_utf8(secret).unwrap()));
+
+        for invalid in [secret[..63].to_vec(), secret.to_vec()] {
+            let error = read_admin_token(&mut invalid.as_slice()).unwrap_err();
+            assert!(!error.contains(std::str::from_utf8(secret).unwrap()));
+        }
+    }
 
     #[tokio::test]
     async fn bound_servers_serve_both_surfaces_and_stop_on_injected_signal() {
