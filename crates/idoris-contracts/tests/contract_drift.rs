@@ -9,6 +9,7 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use idoris_contracts::adapter_manifest::AdapterManifest;
+use idoris_contracts::admin_v0::AdminStatusResponse;
 use idoris_contracts::component_card::ComponentCard;
 use idoris_contracts::deploy_mode::DEPLOY_MODE_VALUES;
 use idoris_contracts::load_policy::LoadPolicy;
@@ -103,6 +104,35 @@ fn task_profile_shape_matches_schema() {
 #[test]
 fn routing_policy_shape_matches_schema() {
     assert_shape::<RoutingPolicy>();
+}
+
+#[test]
+fn admin_v0_status_shape_matches_schema() {
+    assert_shape::<AdminStatusResponse>();
+    let schema = load_schema("admin-v0-status.schema.json");
+    let capacity = &schema["properties"]["capacity"]["oneOf"][0];
+    assert_eq!(
+        keys_of(capacity, "required"),
+        ["entries".to_string(), "state".to_string()]
+            .into_iter()
+            .collect()
+    );
+    let entry = &capacity["properties"]["entries"]["items"];
+    assert_eq!(
+        keys_of(entry, "properties"),
+        [
+            "admission_status",
+            "capability",
+            "ctx_limit",
+            "estimated_memory_gb",
+            "id",
+            "queue_depth",
+            "resident",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+    );
 }
 
 #[test]
