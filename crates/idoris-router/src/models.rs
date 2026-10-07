@@ -46,6 +46,11 @@ pub enum ModelsError {
     UpstreamAuthenticationFailed { locality: Locality },
 }
 
+pub(crate) enum HttpModelObservation {
+    Observed(Vec<ModelEntry>),
+    Unavailable,
+}
+
 fn auth_failure(card: &ComponentCard, field: &str, value: Value) -> ModelsError {
     let mut event = serde_json::json!({
         "event": "upstream_model_listing_authentication_failed",
@@ -127,6 +132,17 @@ async fn list_one(
             })
             .collect(),
     ))
+}
+
+pub(crate) async fn observe_http_models(
+    client: &reqwest::Client,
+    card: &ComponentCard,
+) -> Result<HttpModelObservation, ModelsError> {
+    let api_key = std::env::var_os(idoris_upstream::omlx::OMLX_API_KEY_ENV);
+    match list_one(client, card, api_key.as_deref()).await? {
+        Some(entries) => Ok(HttpModelObservation::Observed(entries)),
+        None => Ok(HttpModelObservation::Unavailable),
+    }
 }
 
 /// Sequential, matching TS's own `for (const { card, backend } of

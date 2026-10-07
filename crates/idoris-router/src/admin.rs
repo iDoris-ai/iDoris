@@ -128,6 +128,43 @@ pub struct AdminBackend {
     pub lifecycle_runtime_bound: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AdminModelSourceKind {
+    HttpModelsEndpoint,
+    SubscriptionRegistration,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AdminModelSourceState {
+    Observed,
+    Configured,
+    Error,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AdminModelSourceError {
+    Unavailable,
+    AuthenticationFailed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AdminModelSource {
+    pub provider_id: String,
+    pub source: AdminModelSourceKind,
+    pub state: AdminModelSourceState,
+    pub models: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<AdminModelSourceError>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AdminModelsSnapshot {
+    pub sources: Vec<AdminModelSource>,
+}
+
 pub fn status(state: &AppState) -> AdminStatus {
     AdminStatus {
         status: "ok",
@@ -159,6 +196,57 @@ pub fn backends(state: &AppState) -> Vec<AdminBackend> {
         .collect()
 }
 
+/// Observe each active model source without collapsing failures into an
+/// apparently complete flat list. HTTP model ids are runtime observations;
+/// subscription ids are registration facts, not backend health claims.
+pub async fn models(state: &AppState) -> AdminModelsSnapshot {
+    let mut sources = Vec::new();
+    for card in &state.cards {
+        if card.form != idoris_contracts::component_card::Form::HttpService {
+            continue;
+        }
+        let (state_kind, models, error) =
+            match crate::models::observe_http_models(&state.http_client, card).await {
+                Ok(crate::models::HttpModelObservation::Observed(entries)) => (
+                    AdminModelSourceState::Observed,
+                    entries.into_iter().map(|entry| entry.id).collect(),
+                    None,
+                ),
+                Ok(crate::models::HttpModelObservation::Unavailable) => (
+                    AdminModelSourceState::Error,
+                    Vec::new(),
+                    Some(AdminModelSourceError::Unavailable),
+                ),
+                Err(crate::models::ModelsError::UpstreamAuthenticationFailed { .. }) => (
+                    AdminModelSourceState::Error,
+                    Vec::new(),
+                    Some(AdminModelSourceError::AuthenticationFailed),
+                ),
+            };
+        sources.push(AdminModelSource {
+            provider_id: card.provider.id.clone(),
+            source: AdminModelSourceKind::HttpModelsEndpoint,
+            state: state_kind,
+            models,
+            error,
+        });
+    }
+    sources.extend(
+        state
+            .subscriptions
+            .discovery()
+            .into_iter()
+            .map(|entry| AdminModelSource {
+                provider_id: entry.provider_id,
+                source: AdminModelSourceKind::SubscriptionRegistration,
+                state: AdminModelSourceState::Configured,
+                models: vec![entry.model_id],
+                error: None,
+            }),
+    );
+    AdminModelsSnapshot { sources }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
@@ -166,6 +254,10 @@ mod tests {
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt;
+    use wiremock::{
+        Mock, MockServer, ResponseTemplate,
+        matchers::{method, path},
+    };
 
     use super::*;
 
@@ -205,16 +297,13 @@ mod tests {
 
     #[tokio::test]
     async fn data_plane_router_does_not_expose_admin_paths() {
-        let response = crate::build_app(AppState::default())
-            .oneshot(
-                Request::builder()
-                    .uri("/admin/api/v1/status")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        for path in ["/admin/api/v1/status", "/admin/api/v1/models"] {
+            let response = crate::build_app(AppState::default())
+                .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        }
     }
 
     #[tokio::test]
@@ -285,6 +374,124 @@ mod tests {
         assert!(value.get("models").is_none());
         assert!(value.get("memory_pressure").is_none());
         assert!(value.get("endpoint").is_none());
+    }
+
+    #[tokio::test]
+    async fn models_snapshot_keeps_observed_configured_and_error_sources_distinct() {
+        use crate::subscription::config::{SANDBOX_PROFILE_ID, SubscriptionConfig};
+        use crate::subscription::runtime::{
+            SubscriptionRuntimeHandle, SubscriptionRuntimeRegistry, authorize_subscription,
+        };
+
+        let observed_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [{"id": "observed-a"}, {"id": "observed-b"}]
+            })))
+            .expect(1)
+            .mount(&observed_server)
+            .await;
+        let failed_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(1)
+            .mount(&failed_server)
+            .await;
+        let auth_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(401))
+            .expect(1)
+            .mount(&auth_server)
+            .await;
+
+        let mut observed: idoris_contracts::ComponentCard =
+            serde_yaml::from_str(include_str!("../../../config/components/omlx.yaml")).unwrap();
+        observed.provider.id = "observed".into();
+        observed.endpoint = observed_server.uri();
+        observed.version_pin = "test@1".into();
+        let mut failed = observed.clone();
+        failed.provider.id = "failed".into();
+        failed.endpoint = failed_server.uri();
+        let mut auth_failed = observed.clone();
+        auth_failed.provider.id = "auth-failed".into();
+        auth_failed.endpoint = auth_server.uri();
+        auth_failed.version_pin = "omlx@0.6.4".into();
+
+        let subscription: idoris_contracts::ComponentCard =
+            serde_yaml::from_str(include_str!("../../../config/components/subscription.yaml"))
+                .unwrap();
+        let config = SubscriptionConfig::snapshot(
+            Some("personal"),
+            Some("1"),
+            None,
+            Some(SANDBOX_PROFILE_ID),
+            Some("codex"),
+        );
+        let authorized = authorize_subscription(&config, &subscription)
+            .unwrap()
+            .unwrap();
+        let handle = SubscriptionRuntimeHandle::build(authorized, &subscription).unwrap();
+        let mut subscriptions = SubscriptionRuntimeRegistry::default();
+        subscriptions.insert(handle).unwrap();
+
+        let state = AppState {
+            cards: vec![observed, failed, auth_failed, subscription],
+            subscriptions,
+            ..AppState::default()
+        };
+        let snapshot = models(&state).await;
+        assert_eq!(snapshot.sources.len(), 4);
+        assert_eq!(
+            snapshot.sources[0],
+            AdminModelSource {
+                provider_id: "observed".into(),
+                source: AdminModelSourceKind::HttpModelsEndpoint,
+                state: AdminModelSourceState::Observed,
+                models: vec!["observed-a".into(), "observed-b".into()],
+                error: None,
+            }
+        );
+        assert_eq!(
+            snapshot.sources[1],
+            AdminModelSource {
+                provider_id: "failed".into(),
+                source: AdminModelSourceKind::HttpModelsEndpoint,
+                state: AdminModelSourceState::Error,
+                models: vec![],
+                error: Some(AdminModelSourceError::Unavailable),
+            }
+        );
+        assert_eq!(
+            snapshot.sources[2],
+            AdminModelSource {
+                provider_id: "auth-failed".into(),
+                source: AdminModelSourceKind::HttpModelsEndpoint,
+                state: AdminModelSourceState::Error,
+                models: vec![],
+                error: Some(AdminModelSourceError::AuthenticationFailed),
+            }
+        );
+        assert_eq!(
+            snapshot.sources[3],
+            AdminModelSource {
+                provider_id: "subscription".into(),
+                source: AdminModelSourceKind::SubscriptionRegistration,
+                state: AdminModelSourceState::Configured,
+                models: vec!["codex-subscription".into()],
+                error: None,
+            }
+        );
+        let value = serde_json::to_value(snapshot).unwrap();
+        assert!(
+            value.get("data").is_none(),
+            "must not publish a flat complete-looking list"
+        );
+        observed_server.verify().await;
+        failed_server.verify().await;
+        auth_server.verify().await;
     }
 
     #[test]
