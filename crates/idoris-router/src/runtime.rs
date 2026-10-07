@@ -96,7 +96,9 @@ impl RuntimeRegistry {
         })?;
         for (provider_id, config) in local {
             if let Some(bound) = registry.supervisors.get_mut(provider_id) {
-                *bound = bound.clone().with_admission_memory_gb(config.memory_gb);
+                *bound = bound
+                    .clone()
+                    .with_admission_model(config.model_id.clone(), config.memory_gb);
             }
         }
         Ok(registry)
