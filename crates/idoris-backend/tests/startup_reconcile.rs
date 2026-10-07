@@ -392,3 +392,39 @@ async fn invalid_or_failed_startup_status_fails_closed_before_adapter_load() {
     assert_eq!(adapter.mock.load_call_count("a"), 0);
     assert_eq!(adapter.calls.load(Ordering::SeqCst), 1);
 }
+
+#[tokio::test(start_paused = true)]
+async fn failed_startup_residency_blocks_other_runtime_global_growth() {
+    for first in [
+        FirstStatus::Error,
+        FirstStatus::Sample(sample(f64::NAN, &[])),
+        FirstStatus::Panic,
+    ] {
+        let ledger = Arc::new(GlobalCapacityLedger::new(8.0).unwrap());
+        let bad = Supervisor::spawn_with_startup_capacity_tracking(
+            adapter(first),
+            config(),
+            ledger.clone(),
+            "runtime-bad",
+        )
+        .unwrap();
+        assert!(bad.status().await.is_err());
+
+        let good_adapter = adapter(FirstStatus::Sample(sample(0.0, &[])));
+        let good = Supervisor::spawn_with_startup_capacity_tracking(
+            good_adapter.clone(),
+            config(),
+            ledger.clone(),
+            "runtime-good",
+        )
+        .unwrap();
+        assert_eq!(good.status().await.unwrap().used_gb, 0.0);
+        let error = good.load("a", 1.0, pinned()).await.unwrap_err();
+        assert_eq!(error.reason_code(), "oom");
+        assert_eq!(good_adapter.mock.load_call_count("a"), 0);
+
+        let snapshot = ledger.snapshot().unwrap();
+        assert_eq!(snapshot.allocations["runtime:runtime-bad"], 8.0);
+        assert_eq!(snapshot.allocations["runtime:runtime-good"], 0.0);
+    }
+}
