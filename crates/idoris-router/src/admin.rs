@@ -166,6 +166,32 @@ pub struct AdminModelsSnapshot {
     pub sources: Vec<AdminModelSource>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AdminRuntimeState {
+    Observed,
+    Error,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct AdminRuntime {
+    pub provider_id: String,
+    pub state: AdminRuntimeState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pressure: Option<idoris_backend::Pressure>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub used_gb: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_memory_max_gb: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub loaded: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct AdminRuntimesSnapshot {
+    pub runtimes: Vec<AdminRuntime>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AdminRole {
     pub role: &'static str,
@@ -270,6 +296,45 @@ pub async fn models(state: &AppState) -> AdminModelsSnapshot {
     AdminModelsSnapshot { sources }
 }
 
+/// Observe only lifecycle-managed runtimes. Resident direct HTTP cards are
+/// intentionally absent because they do not have a `RuntimeRegistry` entry.
+/// Backend failures are represented by `state=error`; free-form backend error
+/// strings never become part of this management snapshot.
+pub async fn runtimes(state: &AppState) -> AdminRuntimesSnapshot {
+    let runtimes = state
+        .runtimes
+        .status_observations()
+        .await
+        .into_iter()
+        .map(|(provider_id, status)| map_runtime_status(provider_id, status))
+        .collect();
+    AdminRuntimesSnapshot { runtimes }
+}
+
+fn map_runtime_status(
+    provider_id: String,
+    status: Result<idoris_backend::BackendStatus, idoris_backend::BackendError>,
+) -> AdminRuntime {
+    match status {
+        Ok(status) => AdminRuntime {
+            provider_id,
+            state: AdminRuntimeState::Observed,
+            pressure: Some(status.pressure),
+            used_gb: Some(status.used_gb),
+            model_memory_max_gb: Some(status.model_memory_max_gb),
+            loaded: Some(status.loaded),
+        },
+        Err(_) => AdminRuntime {
+            provider_id,
+            state: AdminRuntimeState::Error,
+            pressure: None,
+            used_gb: None,
+            model_memory_max_gb: None,
+            loaded: None,
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
@@ -324,6 +389,7 @@ mod tests {
             "/admin/api/v1/status",
             "/admin/api/v1/models",
             "/admin/api/v1/roles",
+            "/admin/api/v1/runtimes",
         ] {
             let response = crate::build_app(AppState::default())
                 .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
@@ -401,6 +467,135 @@ mod tests {
         assert!(value.get("models").is_none());
         assert!(value.get("memory_pressure").is_none());
         assert!(value.get("endpoint").is_none());
+    }
+
+    #[tokio::test]
+    async fn runtimes_snapshot_reports_observed_status_for_each_lifecycle_runtime() {
+        use std::sync::Arc;
+
+        use idoris_backend::{MockAdapter, ModelInfo, Pressure, Supervisor, SupervisorConfig};
+        use idoris_contracts::load_policy::{Admission, Keepalive, LoadMode, LoadPolicy};
+
+        fn card(id: &str) -> idoris_contracts::ComponentCard {
+            let mut card: idoris_contracts::ComponentCard =
+                serde_yaml::from_str(include_str!("../../../config/components/omlx.yaml")).unwrap();
+            card.provider.id = id.into();
+            card
+        }
+
+        fn policy() -> LoadPolicy {
+            LoadPolicy {
+                mode: LoadMode::OnDemand,
+                keepalive: Keepalive::IdleTtl { idle_ttl_s: 300 },
+                admission: Admission::Coexist,
+            }
+        }
+
+        let card_a = card("runtime-a");
+        let adapter_a = Arc::new(MockAdapter::new(vec![ModelInfo {
+            id: "alpha".into(),
+            memory_gb: 8.0,
+        }]));
+        let handle_a = Supervisor::spawn(
+            adapter_a,
+            SupervisorConfig {
+                budget_gb: 8.0,
+                ..SupervisorConfig::default()
+            },
+        )
+        .unwrap();
+        handle_a.load("alpha", 8.0, policy()).await.unwrap();
+
+        let card_b = card("runtime-b");
+        let adapter_b = Arc::new(MockAdapter::new(vec![ModelInfo {
+            id: "beta".into(),
+            memory_gb: 13.0,
+        }]));
+        let handle_b = Supervisor::spawn(
+            adapter_b,
+            SupervisorConfig {
+                budget_gb: 16.0,
+                ..SupervisorConfig::default()
+            },
+        )
+        .unwrap();
+        handle_b.load("beta", 13.0, policy()).await.unwrap();
+
+        let mut direct = card("direct-resident");
+        direct.load_policy = Some(LoadPolicy {
+            mode: LoadMode::Resident,
+            keepalive: Keepalive::Pinned { pinned: true },
+            admission: Admission::Coexist,
+        });
+        assert!(crate::dispatch::is_resident_http_service(&direct));
+
+        let registry = crate::runtime::RuntimeRegistry::from_supervisors([
+            crate::dispatch::BoundSupervisor::new(&card_a, handle_a),
+            crate::dispatch::BoundSupervisor::new(&card_b, handle_b),
+        ]);
+        let snapshot = runtimes(&AppState {
+            cards: vec![card_a, card_b, direct],
+            runtimes: registry,
+            ..AppState::default()
+        })
+        .await;
+
+        assert_eq!(snapshot.runtimes.len(), 2);
+        assert_eq!(
+            snapshot.runtimes[0],
+            AdminRuntime {
+                provider_id: "runtime-a".into(),
+                state: AdminRuntimeState::Observed,
+                pressure: Some(Pressure::Hard),
+                used_gb: Some(8.0),
+                model_memory_max_gb: Some(8.0),
+                loaded: Some(vec!["alpha".into()]),
+            }
+        );
+        assert_eq!(
+            snapshot.runtimes[1],
+            AdminRuntime {
+                provider_id: "runtime-b".into(),
+                state: AdminRuntimeState::Observed,
+                pressure: Some(Pressure::Soft),
+                used_gb: Some(13.0),
+                model_memory_max_gb: Some(16.0),
+                loaded: Some(vec!["beta".into()]),
+            }
+        );
+        assert!(
+            snapshot
+                .runtimes
+                .iter()
+                .all(|runtime| runtime.provider_id != "direct-resident")
+        );
+    }
+
+    #[test]
+    fn runtime_status_failure_is_explicit_without_raw_error_or_fake_values() {
+        let raw_secret = "backend token=secret should never escape";
+        let runtime = map_runtime_status(
+            "failed-runtime".into(),
+            Err(idoris_backend::BackendError::Upstream {
+                message: raw_secret.into(),
+            }),
+        );
+
+        assert_eq!(runtime.state, AdminRuntimeState::Error);
+        assert_eq!(runtime.pressure, None);
+        assert_eq!(runtime.used_gb, None);
+        assert_eq!(runtime.model_memory_max_gb, None);
+        assert_eq!(runtime.loaded, None);
+        let json = serde_json::to_value(&runtime).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({"provider_id":"failed-runtime","state":"error"})
+        );
+        assert!(
+            !serde_json::to_string(&runtime)
+                .unwrap()
+                .contains(raw_secret)
+        );
     }
 
     #[tokio::test]
