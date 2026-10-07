@@ -2,6 +2,7 @@
 
 use std::{
     fs,
+    io::Write,
     path::Path,
     process::{Command, Stdio},
     time::{Duration, Instant},
@@ -43,7 +44,10 @@ fn invalid_commands_fail_before_startup_with_usage() {
             .unwrap();
         assert!(!output.status.success());
         let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(stderr.contains("用法: idoris [serve]"), "{stderr}");
+        assert!(
+            stderr.contains("用法: idoris [serve [--admin-token-stdin]]"),
+            "{stderr}"
+        );
     }
 }
 
@@ -103,9 +107,11 @@ async fn occupied_admin_port_fails_before_data_health_is_served() {
     )
     .unwrap();
     let mut child = base_command(&repo, components.path())
+        .arg("--admin-token-stdin")
         .env("IDORIS_PORT", data_port.to_string())
         .env("IDORIS_ADMIN_PORT", admin_port.to_string())
         .env("IDORIS_DB_PATH", state.path().join("state.sqlite3"))
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -133,6 +139,149 @@ async fn occupied_admin_port_fails_before_data_health_is_served() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("无法绑定 Admin"), "{stderr}");
     assert!(stderr.contains(&admin_port.to_string()), "{stderr}");
+}
+
+#[tokio::test]
+async fn launcher_token_stdin_authenticates_admin_without_leaking_to_logs() {
+    let data_port = free_port();
+    let mut admin_port = free_port();
+    while admin_port == data_port {
+        admin_port = free_port();
+    }
+    let components = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    fs::copy(
+        repo.join("config/components/omlx.yaml"),
+        components.path().join("omlx.yaml"),
+    )
+    .unwrap();
+    let secret = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    let mut child = base_command(&repo, components.path())
+        .arg("--admin-token-stdin")
+        .env("IDORIS_PORT", data_port.to_string())
+        .env("IDORIS_ADMIN_PORT", admin_port.to_string())
+        .env("IDORIS_DB_PATH", state.path().join("state.sqlite3"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(format!("{secret}\n").as_bytes())
+        .unwrap();
+
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Ok(response) = client
+            .get(format!("http://127.0.0.1:{data_port}/health"))
+            .timeout(Duration::from_millis(200))
+            .send()
+            .await
+            && response.status().is_success()
+        {
+            break;
+        }
+        assert!(child.try_wait().unwrap().is_none());
+        assert!(Instant::now() < deadline, "health readiness timed out");
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    let admin_url = format!("http://127.0.0.1:{admin_port}/admin/api/v1/status");
+    assert_eq!(
+        client
+            .get(&admin_url)
+            .bearer_auth("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        client
+            .get(&admin_url)
+            .bearer_auth(secret)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::OK
+    );
+    assert_eq!(
+        client
+            .get(format!("http://127.0.0.1:{data_port}/admin/api/v1/status"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::NOT_FOUND
+    );
+
+    child.kill().unwrap();
+    let output = child.wait_with_output().unwrap();
+    let logs = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!logs.contains(secret));
+    assert!(!logs.contains("Bearer "));
+}
+
+#[tokio::test]
+async fn malformed_launcher_token_fails_before_either_surface_serves() {
+    let data_port = free_port();
+    let mut admin_port = free_port();
+    while admin_port == data_port {
+        admin_port = free_port();
+    }
+    let components = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    fs::copy(
+        repo.join("config/components/omlx.yaml"),
+        components.path().join("omlx.yaml"),
+    )
+    .unwrap();
+    let mut child = base_command(&repo, components.path())
+        .arg("--admin-token-stdin")
+        .env("IDORIS_PORT", data_port.to_string())
+        .env("IDORIS_ADMIN_PORT", admin_port.to_string())
+        .env("IDORIS_DB_PATH", state.path().join("state.sqlite3"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"too-short\n")
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("Admin session token") || stderr.contains("完整 Admin"));
+    assert!(!stderr.contains("too-short"));
+
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    for port in [data_port, admin_port] {
+        assert!(
+            client
+                .get(format!("http://127.0.0.1:{port}/health"))
+                .timeout(Duration::from_millis(100))
+                .send()
+                .await
+                .is_err(),
+            "listener {port} remained reachable after token rejection"
+        );
+    }
 }
 
 #[test]
