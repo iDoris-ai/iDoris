@@ -493,6 +493,68 @@ mod tests {
         auth_server.verify().await;
     }
 
+    #[tokio::test]
+    async fn models_snapshot_rejects_partial_http_observations_but_accepts_empty() {
+        let mixed_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [{"id": "valid"}, {"id": 7}]
+            })))
+            .expect(1)
+            .mount(&mixed_server)
+            .await;
+        let invalid_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [{"id": 7}, {"not_id": "x"}]
+            })))
+            .expect(1)
+            .mount(&invalid_server)
+            .await;
+        let empty_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": []
+            })))
+            .expect(1)
+            .mount(&empty_server)
+            .await;
+
+        let mut mixed: idoris_contracts::ComponentCard =
+            serde_yaml::from_str(include_str!("../../../config/components/omlx.yaml")).unwrap();
+        mixed.provider.id = "mixed".into();
+        mixed.endpoint = mixed_server.uri();
+        mixed.version_pin = "test@1".into();
+        let mut invalid = mixed.clone();
+        invalid.provider.id = "invalid".into();
+        invalid.endpoint = invalid_server.uri();
+        let mut empty = mixed.clone();
+        empty.provider.id = "empty".into();
+        empty.endpoint = empty_server.uri();
+
+        let snapshot = models(&AppState {
+            cards: vec![mixed, invalid, empty],
+            ..AppState::default()
+        })
+        .await;
+        assert_eq!(snapshot.sources.len(), 3);
+        for source in &snapshot.sources[..2] {
+            assert_eq!(source.state, AdminModelSourceState::Error);
+            assert_eq!(source.error, Some(AdminModelSourceError::Unavailable));
+            assert!(source.models.is_empty());
+        }
+        assert_eq!(snapshot.sources[2].state, AdminModelSourceState::Observed);
+        assert_eq!(snapshot.sources[2].error, None);
+        assert!(snapshot.sources[2].models.is_empty());
+
+        mixed_server.verify().await;
+        invalid_server.verify().await;
+        empty_server.verify().await;
+    }
+
     #[test]
     fn default_status_reports_only_real_configured_surfaces() {
         let state = AppState::default();

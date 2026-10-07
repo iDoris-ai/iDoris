@@ -88,11 +88,11 @@ fn is_loopback_omlx(card: &ComponentCard) -> bool {
         })
 }
 
-async fn list_one(
+async fn fetch_models_body(
     client: &reqwest::Client,
     card: &ComponentCard,
     api_key: Option<&OsStr>,
-) -> Result<Option<Vec<ModelEntry>>, ModelsError> {
+) -> Result<Option<Value>, ModelsError> {
     let url = format!("{}/v1/models", card.endpoint.trim_end_matches('/'));
     let mut request = client.get(&url).timeout(MODELS_TIMEOUT);
     if is_loopback_omlx(card)
@@ -118,6 +118,17 @@ async fn list_one(
     let Ok(body) = resp.json::<serde_json::Value>().await else {
         return Ok(None);
     };
+    Ok(Some(body))
+}
+
+async fn list_one(
+    client: &reqwest::Client,
+    card: &ComponentCard,
+    api_key: Option<&OsStr>,
+) -> Result<Option<Vec<ModelEntry>>, ModelsError> {
+    let Some(body) = fetch_models_body(client, card, api_key).await? else {
+        return Ok(None);
+    };
     let Some(items) = body.get("data").and_then(|v| v.as_array()) else {
         return Ok(None);
     };
@@ -139,10 +150,24 @@ pub(crate) async fn observe_http_models(
     card: &ComponentCard,
 ) -> Result<HttpModelObservation, ModelsError> {
     let api_key = std::env::var_os(idoris_upstream::omlx::OMLX_API_KEY_ENV);
-    match list_one(client, card, api_key.as_deref()).await? {
-        Some(entries) => Ok(HttpModelObservation::Observed(entries)),
-        None => Ok(HttpModelObservation::Unavailable),
+    let Some(body) = fetch_models_body(client, card, api_key.as_deref()).await? else {
+        return Ok(HttpModelObservation::Unavailable);
+    };
+    let Some(items) = body.get("data").and_then(|value| value.as_array()) else {
+        return Ok(HttpModelObservation::Unavailable);
+    };
+    let mut entries = Vec::with_capacity(items.len());
+    for item in items {
+        let Some(id) = item.get("id").and_then(|value| value.as_str()) else {
+            return Ok(HttpModelObservation::Unavailable);
+        };
+        entries.push(ModelEntry {
+            id: id.to_string(),
+            object: "model",
+            owned_by: card.provider.id.clone(),
+        });
     }
+    Ok(HttpModelObservation::Observed(entries))
 }
 
 /// Sequential, matching TS's own `for (const { card, backend } of
@@ -264,6 +289,30 @@ mod tests {
             assert_eq!(m.object, "model");
             assert_eq!(m.owned_by, "omlx");
         }
+    }
+
+    #[tokio::test]
+    async fn data_plane_keeps_best_effort_item_filtering() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [{"id": "kept"}, {"id": 7}, {"not_id": "ignored"}]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let response = list_models(
+            &reqwest::Client::new(),
+            &[card("plain", &server.uri(), Form::HttpService)],
+            &HealthTracker::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.data.len(), 1);
+        assert_eq!(response.data[0].id, "kept");
+        server.verify().await;
     }
 
     #[tokio::test]
