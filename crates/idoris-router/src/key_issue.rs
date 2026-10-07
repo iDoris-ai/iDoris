@@ -55,10 +55,6 @@ fn issue_from_reader_at(
         serde_json::from_slice(&raw).map_err(|_| "virtual-key spec JSON 无效".to_string())?;
     let scope = validated_scope(spec, now_ms)?;
     let minted = MintedVirtualKey::mint();
-    store
-        .insert_active(&minted.key_id, minted.hash, &scope)
-        .map_err(|_| "无法持久化 virtual key".to_string())?;
-
     let payload = serde_json::to_vec(&serde_json::json!({
         "key_id": minted.key_id,
         "secret": minted.secret.expose_secret(),
@@ -70,9 +66,15 @@ fn issue_from_reader_at(
         .and_then(|_| writer.flush())
         .is_err()
     {
-        let _ = store.revoke(&minted.key_id, now_ms.max(1));
-        return Err(format!("无法输出已撤销 virtual key {}", minted.key_id));
+        return Err("无法输出 virtual key；未激活凭证".to_string());
     }
+    // Persist only after the one-time plaintext handoff succeeds. If stdout
+    // fails, no verifier exists. If persistence fails, the caller may have
+    // seen a secret, but it was never activated and therefore cannot
+    // authenticate. This avoids relying on a fallible compensating revoke.
+    store
+        .insert_active(&minted.key_id, minted.hash, &scope)
+        .map_err(|_| "无法持久化 virtual key；已输出凭证未激活".to_string())?;
     Ok(())
 }
 
@@ -181,7 +183,7 @@ mod tests {
     }
 
     #[test]
-    fn output_failure_revokes_inserted_key() {
+    fn output_failure_never_activates_emitted_key() {
         let store = VirtualKeyStore::new(Connection::open_in_memory().unwrap()).unwrap();
         let mut error_writer = FailFlushWriter::default();
         let error = issue_from_reader_at(
