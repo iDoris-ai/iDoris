@@ -31,6 +31,7 @@ pub struct BoundSupervisor {
     provider_id: String,
     endpoint: String,
     locality: Locality,
+    admission_memory_gb: Option<f64>,
 }
 
 impl BoundSupervisor {
@@ -40,7 +41,13 @@ impl BoundSupervisor {
             provider_id: card.provider.id.clone(),
             endpoint: card.endpoint.clone(),
             locality: card.provider.locality,
+            admission_memory_gb: None,
         }
+    }
+
+    pub(crate) fn with_admission_memory_gb(mut self, memory_gb: f64) -> Self {
+        self.admission_memory_gb = Some(memory_gb);
+        self
     }
 
     pub(crate) fn provider_id(&self) -> &str {
@@ -101,10 +108,9 @@ fn default_load_policy() -> LoadPolicy {
     }
 }
 
-// oMLX 0.6.4's /v1/models contract does not expose per-model memory and the
-// adapter therefore reports 0.0. Keep its legacy estimate until the dedicated
-// oMLX footprint source is wired; positive catalog values (including trusted
-// process-owned mlx_lm.server/llama.cpp configs) must never be collapsed to it.
+// oMLX 0.6.4's /v1/models contract does not expose per-model memory. Preserve
+// the established estimate for that path until its dedicated footprint source
+// is wired; trusted process-owned runtimes bind their configured memory below.
 const UNKNOWN_CATALOG_MEMORY_GB: f64 = 1.0;
 
 /// R2-D simplification: every loaded component card is eligible for every
@@ -531,37 +537,41 @@ pub async fn dispatch_local(
     // cancellation can stop early.
     let _cancel_guard = CancelOnDrop(cancel.clone());
 
+    let admission_memory_override = supervisor.admission_memory_gb;
     let supervisor = &supervisor.handle;
-    // The runtime catalog is the lifecycle authority for both model identity
-    // and its admission footprint. Supervisor eviction/global-capacity
-    // planning happens before an adapter can reject an unknown id, so every
-    // load — including provider-id == model-id single-model runtimes — must
-    // resolve the exact catalog entry before mutating lifecycle state.
-    let catalog = match supervisor.list().await {
-        Ok(models) => models,
-        Err(err) => {
+    // A concrete model id is caller-controlled. Validate it against the
+    // runtime catalog before load(): Supervisor eviction planning happens
+    // before an adapter can reject an unknown id, so skipping this preflight
+    // would let a bogus model name evict an unrelated warm model first.
+    let admission_memory_gb = if backend_model_id != provider_id {
+        let catalog = match supervisor.list().await {
+            Ok(models) => models,
+            Err(err) => {
+                return Ok(ChatOutcome {
+                    decision,
+                    served_locality,
+                    result: Err(DispatchFailure::Backend(err)),
+                    actual_cost_minor: None,
+                });
+            }
+        };
+        let Some(model) = catalog.iter().find(|model| model.id == backend_model_id) else {
             return Ok(ChatOutcome {
                 decision,
                 served_locality,
-                result: Err(DispatchFailure::Backend(err)),
+                result: Err(DispatchFailure::Backend(BackendError::model_not_found(
+                    backend_model_id,
+                ))),
                 actual_cost_minor: None,
             });
+        };
+        if model.memory_gb > 0.0 {
+            model.memory_gb
+        } else {
+            admission_memory_override.unwrap_or(UNKNOWN_CATALOG_MEMORY_GB)
         }
-    };
-    let Some(model) = catalog.iter().find(|model| model.id == backend_model_id) else {
-        return Ok(ChatOutcome {
-            decision,
-            served_locality,
-            result: Err(DispatchFailure::Backend(BackendError::model_not_found(
-                backend_model_id,
-            ))),
-            actual_cost_minor: None,
-        });
-    };
-    let admission_memory_gb = if model.memory_gb > 0.0 {
-        model.memory_gb
     } else {
-        UNKNOWN_CATALOG_MEMORY_GB
+        admission_memory_override.unwrap_or(UNKNOWN_CATALOG_MEMORY_GB)
     };
     // `status.loaded` reports engine residency, which may have been
     // inherited after a Supervisor restart while the model is still in
@@ -815,7 +825,7 @@ mod tests {
             "a",
         )
         .unwrap();
-        let supervisor = BoundSupervisor::new(&card, supervisor);
+        let supervisor = BoundSupervisor::new(&card, supervisor).with_admission_memory_gb(6.0);
 
         let outcome = dispatch_local(
             std::slice::from_ref(&card),

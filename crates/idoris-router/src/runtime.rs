@@ -86,14 +86,20 @@ impl RuntimeRegistry {
             }
         }
 
-        Self::spawn_with_factory(cards, |card| {
+        let mut registry = Self::spawn_with_factory(cards, |card| {
             if let Some(config) = local.get(&card.provider.id) {
                 return LocalHttpRuntimeAdapter::new(config.clone()).map(|adapter| {
                     std::sync::Arc::new(adapter) as std::sync::Arc<dyn RuntimeAdapter>
                 });
             }
             create_adapter(card)
-        })
+        })?;
+        for (provider_id, config) in local {
+            if let Some(bound) = registry.supervisors.get_mut(provider_id) {
+                *bound = bound.clone().with_admission_memory_gb(config.memory_gb);
+            }
+        }
+        Ok(registry)
     }
 
     pub fn get(&self, provider_id: &str) -> Option<&BoundSupervisor> {
