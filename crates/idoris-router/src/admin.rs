@@ -9,6 +9,7 @@ use subtle::ConstantTimeEq;
 use uuid::Uuid;
 
 use crate::AppState;
+use idoris_policy::ROLES;
 
 pub const ADMIN_PORT_ENV: &str = "IDORIS_ADMIN_PORT";
 pub const ADMIN_BIND_HOST: std::net::Ipv4Addr = std::net::Ipv4Addr::LOCALHOST;
@@ -165,6 +166,13 @@ pub struct AdminModelsSnapshot {
     pub sources: Vec<AdminModelSource>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AdminRole {
+    pub role: &'static str,
+    pub aliases: Vec<String>,
+    pub catalog_role: bool,
+}
+
 pub fn status(state: &AppState) -> AdminStatus {
     AdminStatus {
         status: "ok",
@@ -192,6 +200,21 @@ pub fn backends(state: &AppState) -> Vec<AdminBackend> {
             locality: card.provider.locality,
             form: card.form,
             lifecycle_runtime_bound: state.runtimes.get(&card.provider.id).is_some(),
+        })
+        .collect()
+}
+
+/// Snapshot the stable public role contract only. The aliases are accepted
+/// model=idoris/<role> request names; they do not claim any configured or
+/// currently available model serves the role.
+pub fn roles() -> Vec<AdminRole> {
+    ROLES
+        .iter()
+        .copied()
+        .map(|role| AdminRole {
+            role: role.as_str(),
+            aliases: vec![format!("idoris/{}", role.as_str())],
+            catalog_role: role.is_catalog_role(),
         })
         .collect()
 }
@@ -297,7 +320,11 @@ mod tests {
 
     #[tokio::test]
     async fn data_plane_router_does_not_expose_admin_paths() {
-        for path in ["/admin/api/v1/status", "/admin/api/v1/models"] {
+        for path in [
+            "/admin/api/v1/status",
+            "/admin/api/v1/models",
+            "/admin/api/v1/roles",
+        ] {
             let response = crate::build_app(AppState::default())
                 .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
                 .await
@@ -553,6 +580,43 @@ mod tests {
         mixed_server.verify().await;
         invalid_server.verify().await;
         empty_server.verify().await;
+    }
+
+    #[test]
+    fn roles_snapshot_locks_contract_order_aliases_and_catalog_semantics() {
+        let expected = [
+            ("fast", "idoris/fast", true),
+            ("daily", "idoris/daily", true),
+            ("deep", "idoris/deep", true),
+            ("vision", "idoris/vision", true),
+            ("embed", "idoris/embed", true),
+            ("rerank", "idoris/rerank", true),
+            ("decide", "idoris/decide", true),
+            ("auto", "idoris/auto", false),
+        ];
+        let snapshot = roles();
+
+        assert_eq!(snapshot.len(), expected.len());
+        for (entry, (role, alias, catalog_role)) in snapshot.iter().zip(expected) {
+            assert_eq!(entry.role, role);
+            assert_eq!(entry.aliases, [alias]);
+            assert_eq!(entry.catalog_role, catalog_role);
+        }
+
+        let value = serde_json::to_value(snapshot).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!([
+                {"role":"fast","aliases":["idoris/fast"],"catalog_role":true},
+                {"role":"daily","aliases":["idoris/daily"],"catalog_role":true},
+                {"role":"deep","aliases":["idoris/deep"],"catalog_role":true},
+                {"role":"vision","aliases":["idoris/vision"],"catalog_role":true},
+                {"role":"embed","aliases":["idoris/embed"],"catalog_role":true},
+                {"role":"rerank","aliases":["idoris/rerank"],"catalog_role":true},
+                {"role":"decide","aliases":["idoris/decide"],"catalog_role":true},
+                {"role":"auto","aliases":["idoris/auto"],"catalog_role":false},
+            ])
+        );
     }
 
     #[test]
