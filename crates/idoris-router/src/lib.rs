@@ -858,13 +858,48 @@ async fn chat_completions(
         };
     }
 
+    // Freeze one exact lifecycle-readiness view for every decision this
+    // request performs. A session may prefer an already-Ready target only
+    // after policy admission/cost ties; without a session, preserve the
+    // pre-affinity selection order exactly.
+    let ready_provider_ids = if affinity_key.is_some() {
+        state
+            .runtimes
+            .exact_ready_providers(
+                cards
+                    .iter()
+                    .map(|card| {
+                        let provider_id = card.provider.id.clone();
+                        let target_model = if parsed.role.is_none() {
+                            model
+                                .filter(|value| !value.is_empty())
+                                .map(str::to_string)
+                                .unwrap_or_else(|| provider_id.clone())
+                        } else {
+                            provider_id.clone()
+                        };
+                        (provider_id, target_model)
+                    })
+                    .collect(),
+            )
+            .await
+    } else {
+        std::collections::BTreeSet::new()
+    };
+
     // R2-G: a Resident-mode http_service candidate (a generic
     // OpenAI-compatible backend, including a conformance fixture pointing
     // at a fake upstream) is forwarded directly -- never through the
     // Supervisor, which only makes sense for a real oMLX-shaped backend
     // with an explicit load/unload lifecycle. See dispatch::select's doc
     // for the accepted double-decide() tradeoff this branch makes.
-    if let Ok(selected) = dispatch::select_with_affinity(&cards, &parsed, &prompt, affinity_key) {
+    if let Ok(selected) = dispatch::select_with_affinity_and_ready(
+        &cards,
+        &parsed,
+        &prompt,
+        affinity_key,
+        &ready_provider_ids,
+    ) {
         // A present model field must be a non-empty string before any
         // selected backend can execute. Keep selection first so the
         // established error still carries the selected locality/reasons.
@@ -978,8 +1013,14 @@ async fn chat_completions(
     // The request token is a fresh child of this TCP connection's lifetime.
     // Completing the request body does not cancel it; EOF/reset/shutdown of
     // the actual connection does.
-    let selected_for_dispatch =
-        dispatch::select_with_affinity(&cards, &parsed, &prompt, affinity_key).ok();
+    let selected_for_dispatch = dispatch::select_with_affinity_and_ready(
+        &cards,
+        &parsed,
+        &prompt,
+        affinity_key,
+        &ready_provider_ids,
+    )
+    .ok();
     let selected_estimated_cost = selected_for_dispatch
         .as_ref()
         .map(|selected| selected.estimated_cost_minor);
@@ -992,7 +1033,9 @@ async fn chat_completions(
         supervisor,
         budget_ledger,
         &parsed,
-        dispatch::DispatchInput::with_model(model, &prompt).with_affinity(affinity_key),
+        dispatch::DispatchInput::with_model(model, &prompt)
+            .with_affinity(affinity_key)
+            .with_ready_providers(&ready_provider_ids),
         messages,
         lifecycle.cancellation_token(),
     )

@@ -1,6 +1,9 @@
 //! Construct and index lifecycle-managed runtimes by component provider.
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
 use idoris_backend::{
     BackendError, GlobalCapacityLedger, GlobalCapacitySnapshot, RuntimeAdapter, Supervisor,
@@ -137,6 +140,20 @@ impl RuntimeRegistry {
             depth = add_status_depth(depth, provider_id, supervisor.status().await);
         }
         depth
+    }
+
+    /// Return providers whose exact requested lifecycle target is currently
+    /// chat-ready. Errors are conservatively treated as not ready.
+    pub async fn exact_ready_providers(&self, targets: Vec<(String, String)>) -> BTreeSet<String> {
+        let mut ready = BTreeSet::new();
+        for (provider_id, model_id) in targets {
+            if let Some(supervisor) = self.supervisors.get(&provider_id)
+                && supervisor.is_ready(&model_id).await.unwrap_or(false)
+            {
+                ready.insert(provider_id);
+            }
+        }
+        ready
     }
 }
 
@@ -338,6 +355,51 @@ mod tests {
             let response = outcome.result.unwrap();
             assert_eq!(response.model, card.provider.id);
         }
+    }
+
+    #[tokio::test]
+    async fn exact_ready_snapshot_requires_the_requested_model_to_be_ready() {
+        let card = named_card("runtime-b");
+        let adapter = Arc::new(MockAdapter::new(vec![ModelInfo {
+            id: "target".into(),
+            memory_gb: 1.0,
+        }]));
+        let handle = Supervisor::spawn(adapter, SupervisorConfig::default()).unwrap();
+        handle
+            .load("target", 1.0, card.load_policy.unwrap())
+            .await
+            .unwrap();
+        let registry = RuntimeRegistry::from(BoundSupervisor::new(&card, handle));
+
+        let ready = registry
+            .exact_ready_providers(vec![
+                ("runtime-b".into(), "target".into()),
+                ("runtime-b".into(), "other".into()),
+            ])
+            .await;
+        assert_eq!(ready, ["runtime-b".to_string()].into());
+    }
+
+    #[tokio::test]
+    async fn startup_inherited_residency_is_not_claimed_as_chat_ready() {
+        let card = named_card("runtime-b");
+        let adapter = Arc::new(MockAdapter::new(vec![ModelInfo {
+            id: "target".into(),
+            memory_gb: 1.0,
+        }]));
+        adapter
+            .load("target", card.load_policy.as_ref())
+            .await
+            .unwrap();
+        let handle = Supervisor::spawn(adapter, SupervisorConfig::default()).unwrap();
+        let registry = RuntimeRegistry::from(BoundSupervisor::new(&card, handle));
+
+        assert!(
+            registry
+                .exact_ready_providers(vec![("runtime-b".into(), "target".into())])
+                .await
+                .is_empty()
+        );
     }
 
     #[tokio::test]

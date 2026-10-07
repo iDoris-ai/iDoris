@@ -108,6 +108,10 @@ enum Command {
     Status {
         reply: oneshot::Sender<Result<BackendStatus, BackendError>>,
     },
+    IsReady {
+        id: String,
+        reply: oneshot::Sender<Result<bool, BackendError>>,
+    },
     Chat {
         req: ChatRequest,
         cancel: CancellationToken,
@@ -272,6 +276,20 @@ impl SupervisorHandle {
     pub async fn status(&self) -> Result<BackendStatus, BackendError> {
         let (reply, rx) = oneshot::channel();
         self.send(ActorMsg::Cmd(Command::Status { reply })).await?;
+        rx.await
+            .map_err(|_| BackendError::supervisor_unavailable())?
+    }
+
+    /// Returns the actor's exact chat-ready state for one model id. This is
+    /// stricter than `status().loaded`, which also includes startup-inherited
+    /// residency that has not yet become `Ready`.
+    pub async fn is_ready(&self, id: impl Into<String>) -> Result<bool, BackendError> {
+        let (reply, rx) = oneshot::channel();
+        self.send(ActorMsg::Cmd(Command::IsReady {
+            id: id.into(),
+            reply,
+        }))
+        .await?;
         rx.await
             .map_err(|_| BackendError::supervisor_unavailable())?
     }
@@ -1649,6 +1667,9 @@ async fn run_actor(
                     Command::Status { reply } => {
                         let _ = reply.send(Err(BackendError::invariant_violation(msg)));
                     }
+                    Command::IsReady { reply, .. } => {
+                        let _ = reply.send(Err(BackendError::invariant_violation(msg)));
+                    }
                     Command::Chat { reply, .. } => {
                         let _ = reply.send(Err(BackendError::invariant_violation(msg)));
                     }
@@ -1716,6 +1737,13 @@ async fn run_actor(
                     model_memory_max_gb: config.budget_gb,
                     loaded,
                 }));
+            }
+
+            ActorMsg::Cmd(Command::IsReady { id, reply }) => {
+                let ready = models
+                    .get(&id)
+                    .is_some_and(|slot| slot.state == ModelState::Ready);
+                let _ = reply.send(Ok(ready));
             }
 
             ActorMsg::Cmd(Command::Chat { req, cancel, reply }) => {

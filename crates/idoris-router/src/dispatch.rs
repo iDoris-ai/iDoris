@@ -7,6 +7,8 @@
 //! that calls `dispatch_local`, not here (this module has no axum/HTTP
 //! dependency on purpose, so it's testable without spinning up the app).
 
+use std::collections::BTreeSet;
+
 use idoris_backend::{
     BackendError, BackendStatus, ChatMessage, ChatRequest, ChatResponse, SupervisorHandle,
 };
@@ -15,7 +17,7 @@ use idoris_contracts::load_policy::{Admission, Keepalive, LoadMode, LoadPolicy};
 use idoris_contracts::provider::Locality;
 use idoris_policy::{
     AdmissionStatus, Card, Decision, PolicyCtx, ROLES, ReasonCode, Rejection, RequestProfile,
-    decide_with_affinity, effective_served_locality,
+    decide_with_affinity_and_ready, effective_served_locality,
 };
 use idoris_tenancy::budget::{BudgetError, BudgetLedger, ReservationId};
 use tokio_util::sync::CancellationToken;
@@ -60,6 +62,10 @@ impl BoundSupervisor {
 
     pub(crate) async fn status(&self) -> Result<BackendStatus, BackendError> {
         self.handle.status().await
+    }
+
+    pub(crate) async fn is_ready(&self, model_id: &str) -> Result<bool, BackendError> {
+        self.handle.is_ready(model_id).await
     }
 
     /// Constructs the adapter from the same card used for the binding.
@@ -210,6 +216,16 @@ pub fn select_with_affinity(
     prompt: &str,
     affinity_key: Option<&str>,
 ) -> Result<Selected, DispatchError> {
+    select_with_affinity_and_ready(cards, profile, prompt, affinity_key, &BTreeSet::new())
+}
+
+pub fn select_with_affinity_and_ready(
+    cards: &[ComponentCard],
+    profile: &ParsedProfile,
+    prompt: &str,
+    affinity_key: Option<&str>,
+    ready_provider_ids: &BTreeSet<String>,
+) -> Result<Selected, DispatchError> {
     let candidates: Vec<Card> = cards.iter().map(|c| candidate(c, prompt)).collect();
     let request_profile = RequestProfile {
         task: profile.task.clone(),
@@ -221,8 +237,14 @@ pub fn select_with_affinity(
         min_ram_gb: None,
         budget: None,
     };
-    let decision = decide_with_affinity(&request_profile, &candidates, &ctx, affinity_key)
-        .map_err(DispatchError::Rejection)?;
+    let decision = decide_with_affinity_and_ready(
+        &request_profile,
+        &candidates,
+        &ctx,
+        affinity_key,
+        ready_provider_ids,
+    )
+    .map_err(DispatchError::Rejection)?;
     let Some(chosen) = candidates.iter().find(|c| c.id() == decision.chosen_id) else {
         return Err(DispatchError::Internal(format!(
             "decide() returned chosen_id {:?} absent from its own candidate list",
@@ -373,6 +395,7 @@ pub struct DispatchInput<'a> {
     pub requested_model: Option<&'a str>,
     pub prompt: &'a str,
     pub affinity_key: Option<&'a str>,
+    pub ready_provider_ids: Option<&'a BTreeSet<String>>,
 }
 
 impl<'a> DispatchInput<'a> {
@@ -381,6 +404,7 @@ impl<'a> DispatchInput<'a> {
             requested_model: None,
             prompt,
             affinity_key: None,
+            ready_provider_ids: None,
         }
     }
 
@@ -389,11 +413,17 @@ impl<'a> DispatchInput<'a> {
             requested_model,
             prompt,
             affinity_key: None,
+            ready_provider_ids: None,
         }
     }
 
     pub fn with_affinity(mut self, affinity_key: Option<&'a str>) -> Self {
         self.affinity_key = affinity_key;
+        self
+    }
+
+    pub fn with_ready_providers(mut self, ready_provider_ids: &'a BTreeSet<String>) -> Self {
+        self.ready_provider_ids = Some(ready_provider_ids);
         self
     }
 }
@@ -425,6 +455,7 @@ pub async fn dispatch_local(
     let prompt = input.prompt;
     let requested_model = input.requested_model;
     let affinity_key = input.affinity_key;
+    let ready_provider_ids = input.ready_provider_ids;
 
     // Scoped so `candidates`/`ctx` (which holds a `PolicyCtx<'_>` — not
     // `Send` because `dyn BudgetView` isn't `Sync` — see its own doc) are
@@ -450,8 +481,14 @@ pub async fn dispatch_local(
             min_ram_gb: None,
             budget: None,
         };
-        let decision = decide_with_affinity(&request_profile, &candidates, &ctx, affinity_key)
-            .map_err(DispatchError::Rejection)?;
+        let decision = decide_with_affinity_and_ready(
+            &request_profile,
+            &candidates,
+            &ctx,
+            affinity_key,
+            ready_provider_ids.unwrap_or(&BTreeSet::new()),
+        )
+        .map_err(DispatchError::Rejection)?;
 
         let Some(chosen) = candidates.iter().find(|c| c.id() == decision.chosen_id) else {
             return Err(DispatchError::Internal(format!(
