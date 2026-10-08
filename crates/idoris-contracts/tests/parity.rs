@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 
 use idoris_contracts::Contract;
 use idoris_contracts::adapter_manifest::AdapterManifest;
+use idoris_contracts::admin_v0::AdminBackendsResponse;
 use idoris_contracts::admin_v0::{
     AdminAdmissionStatus, AdminCapacityEntry, AdminCapacitySnapshot, AdminCapacityState,
     AdminStatusResponse,
@@ -84,6 +85,24 @@ fn assert_parity<T: Contract>(schema_file: &str, instance: &Value) {
 
 fn digest(c: char) -> String {
     format!("sha256:{}", c.to_string().repeat(64))
+}
+
+#[test]
+fn admin_v0_backends_corpus() {
+    let valid = json!([{
+        "provider_id": "omlx-local",
+        "locality": "loopback",
+        "form": "http_service",
+        "lifecycle_runtime_bound": true
+    }]);
+    assert_parity::<AdminBackendsResponse>("admin-v0-backends.schema.json", &valid);
+    assert_parity::<AdminBackendsResponse>("admin-v0-backends.schema.json", &json!([]));
+    let mut blank_id = valid.clone();
+    blank_id[0]["provider_id"] = json!("");
+    assert_parity::<AdminBackendsResponse>("admin-v0-backends.schema.json", &blank_id);
+    let mut extra = valid.clone();
+    extra[0]["endpoint"] = json!("http://127.0.0.1:8088/v1");
+    assert_parity::<AdminBackendsResponse>("admin-v0-backends.schema.json", &extra);
 }
 
 #[test]

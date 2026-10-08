@@ -9,6 +9,7 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use idoris_contracts::adapter_manifest::AdapterManifest;
+use idoris_contracts::admin_v0::AdminBackend;
 use idoris_contracts::admin_v0::AdminStatusResponse;
 use idoris_contracts::component_card::ComponentCard;
 use idoris_contracts::deploy_mode::DEPLOY_MODE_VALUES;
@@ -64,6 +65,22 @@ fn assert_shape<T: SchemaShape>() {
         "DRIFT: {} required set changed — update the struct and its SchemaShape::REQUIRED",
         T::SCHEMA_FILE
     );
+}
+
+#[test]
+fn admin_v0_backends_item_shape_matches_schema() {
+    let schema = load_schema("admin-v0-backends.schema.json");
+    assert_eq!(schema["type"], "array");
+    let items = &schema["items"];
+    let actual_properties = keys_of(items, "properties");
+    let expected_properties: BTreeSet<String> =
+        ["provider_id", "locality", "form", "lifecycle_runtime_bound"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+    assert_eq!(actual_properties, expected_properties);
+    assert_eq!(keys_of(items, "required"), expected_properties);
+    let _type_anchor: Option<AdminBackend> = None;
 }
 
 #[test]

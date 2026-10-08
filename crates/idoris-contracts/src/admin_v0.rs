@@ -4,6 +4,35 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Contract, ContractError, non_empty};
 use crate::shape::SchemaShape;
+use crate::{component_card::Form, provider::Locality};
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdminBackend {
+    pub provider_id: String,
+    pub locality: Locality,
+    pub form: Form,
+    pub lifecycle_runtime_bound: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct AdminBackendsResponse(pub Vec<AdminBackend>);
+
+impl Contract for AdminBackendsResponse {
+    fn validate(&self) -> Result<(), ContractError> {
+        if self
+            .0
+            .iter()
+            .any(|backend| !non_empty(&backend.provider_id))
+        {
+            return Err(ContractError::new(
+                "admin backend provider_id must not be empty",
+            ));
+        }
+        Ok(())
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
