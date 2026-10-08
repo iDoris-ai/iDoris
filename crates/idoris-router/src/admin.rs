@@ -21,8 +21,8 @@ use uuid::Uuid;
 
 use crate::AppState;
 use idoris_contracts::admin_v0::{
-    AdminAdmissionStatus, AdminCapacityEntry, AdminCapacitySnapshot, AdminCapacityState,
-    AdminStatusResponse,
+    AdminAdmissionStatus, AdminBackend, AdminBackendsResponse, AdminCapacityEntry,
+    AdminCapacitySnapshot, AdminCapacityState, AdminStatusResponse,
 };
 use idoris_policy::ROLES;
 
@@ -312,8 +312,8 @@ async fn admin_status(State(state): State<AdminHttpState>) -> Json<AdminStatusRe
     })
 }
 
-async fn admin_backends(State(state): State<AdminHttpState>) -> Json<Vec<AdminBackend>> {
-    Json(backends(&state.app))
+async fn admin_backends(State(state): State<AdminHttpState>) -> Json<AdminBackendsResponse> {
+    Json(AdminBackendsResponse(backends(&state.app)))
 }
 
 async fn admin_models(State(state): State<AdminHttpState>) -> Json<AdminModelsSnapshot> {
@@ -340,14 +340,6 @@ pub struct AdminStatus {
     pub subscriptions: usize,
     pub budget_configured: bool,
     pub audit_configured: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct AdminBackend {
-    pub provider_id: String,
-    pub locality: idoris_contracts::provider::Locality,
-    pub form: idoris_contracts::component_card::Form,
-    pub lifecycle_runtime_bound: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -1118,6 +1110,21 @@ mod tests {
             })
         );
         assert!(idoris_contracts::parse::<AdminStatusResponse>(&value).is_ok());
+    }
+
+    #[tokio::test]
+    async fn admin_backends_wire_shape_matches_the_shared_v0_contract() {
+        let token = AdminSessionToken::mint();
+        let secret = token.expose_secret().to_string();
+        let response = build_admin_app(AppState::default(), token)
+            .oneshot(admin_request("/admin/api/v1/backends", "Bearer", &secret))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value, serde_json::json!([]));
+        assert!(idoris_contracts::parse::<AdminBackendsResponse>(&value).is_ok());
     }
 
     #[tokio::test]
