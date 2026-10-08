@@ -36,6 +36,86 @@ impl Contract for AdminBackendsResponse {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum AdminModelSourceKind {
+    HttpModelsEndpoint,
+    SubscriptionRegistration,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AdminModelSourceState {
+    Observed,
+    Configured,
+    Error,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AdminModelSourceError {
+    Unavailable,
+    AuthenticationFailed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdminModelSource {
+    pub provider_id: String,
+    pub source: AdminModelSourceKind,
+    pub state: AdminModelSourceState,
+    pub models: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<AdminModelSourceError>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdminModelsResponse {
+    pub sources: Vec<AdminModelSource>,
+}
+
+impl Contract for AdminModelsResponse {
+    fn validate(&self) -> Result<(), ContractError> {
+        for source in &self.sources {
+            if !non_empty(&source.provider_id) || source.models.iter().any(|id| !non_empty(id)) {
+                return Err(ContractError::new(
+                    "admin model provider/model ids must not be empty",
+                ));
+            }
+            match (source.source, source.state, source.error) {
+                (
+                    AdminModelSourceKind::HttpModelsEndpoint,
+                    AdminModelSourceState::Observed,
+                    None,
+                ) => {}
+                (
+                    AdminModelSourceKind::SubscriptionRegistration,
+                    AdminModelSourceState::Configured,
+                    None,
+                ) if !source.models.is_empty() => {}
+                (
+                    AdminModelSourceKind::HttpModelsEndpoint,
+                    AdminModelSourceState::Error,
+                    Some(_),
+                ) if source.models.is_empty() => {}
+                _ => {
+                    return Err(ContractError::new(
+                        "admin model source/state/error shape mismatch",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl SchemaShape for AdminModelsResponse {
+    const SCHEMA_FILE: &'static str = "admin-v0-models.schema.json";
+    const PROPERTIES: &'static [&'static str] = &["sources"];
+    const REQUIRED: &'static [&'static str] = Self::PROPERTIES;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum AdminCapacityState {
     Observed,
     Unavailable,
