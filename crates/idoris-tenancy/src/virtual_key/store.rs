@@ -112,6 +112,24 @@ impl VirtualKeyStore {
         row.map(raw_to_identity).transpose()
     }
 
+    /// Startup authority check for exposing the data-plane listener beyond
+    /// loopback. Revoked/expired rows do not count as active authority.
+    pub fn has_active_key(&self, now_ms: i64) -> Result<bool, VirtualKeyStoreError> {
+        if now_ms < 0 {
+            return Err(VirtualKeyStoreError::InvalidMetadata);
+        }
+        let present: i64 = self.conn.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM virtual_keys
+                 WHERE status = 'active'
+                   AND (expires_at_ms IS NULL OR expires_at_ms > ?1)
+             )",
+            [now_ms],
+            |row| row.get(0),
+        )?;
+        Ok(present == 1)
+    }
+
     /// Revocation is durable and idempotent. Management code may observe the
     /// boolean; authentication still exposes only active-vs-not-active.
     pub fn revoke(&self, key_id: &str, revoked_at_ms: i64) -> Result<bool, VirtualKeyStoreError> {
@@ -280,6 +298,28 @@ mod tests {
         assert!(store.authenticate(&revoked.secret, 200).unwrap().is_none());
         assert!(store.authenticate(&expired.secret, 200).unwrap().is_none());
         assert!(store.authenticate(&active.secret, 200).unwrap().is_some());
+        assert!(store.has_active_key(200).unwrap());
+        assert!(store.revoke(&active.key_id, 201).unwrap());
+        assert!(!store.has_active_key(202).unwrap());
+    }
+
+    #[test]
+    fn active_key_presence_ignores_revoked_and_expired_rows() {
+        let store = VirtualKeyStore::new(Connection::open_in_memory().unwrap()).unwrap();
+        let revoked = MintedVirtualKey::mint();
+        let expired = MintedVirtualKey::mint();
+        store
+            .insert_active(&revoked.key_id, revoked.hash, &scope(None))
+            .unwrap();
+        store
+            .insert_active(&expired.key_id, expired.hash, &scope(Some(100)))
+            .unwrap();
+        assert!(store.revoke(&revoked.key_id, 50).unwrap());
+        assert!(!store.has_active_key(200).unwrap());
+        assert!(matches!(
+            store.has_active_key(-1),
+            Err(VirtualKeyStoreError::InvalidMetadata)
+        ));
     }
 
     #[test]
