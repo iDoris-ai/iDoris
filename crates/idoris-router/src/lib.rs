@@ -59,6 +59,7 @@ pub mod reason;
 pub mod storage;
 mod usage;
 
+mod event_identifier;
 mod feedback;
 /// Direct HTTP forwarding for a generic `http_service` component card's
 /// `POST /v1/chat/completions` (R2-G) — retries, idempotency cache; wired
@@ -2195,9 +2196,9 @@ fn event_request_id(request_id: Option<&str>, record_id: &str) -> String {
 fn audit_tenant_id(state: &AppState, headers: &HeaderMap) -> Option<String> {
     match state.deploy_mode {
         idoris_contracts::DeployMode::Personal => Some(budget::PERSONAL_TENANT_ID.to_string()),
-        idoris_contracts::DeployMode::Tenant => {
-            header_text(headers, "x-idoris-tenant").map(str::to_string)
-        }
+        idoris_contracts::DeployMode::Tenant => header_text(headers, "x-idoris-tenant")
+            .filter(|tenant_id| event_identifier::valid(tenant_id))
+            .map(str::to_string),
     }
 }
 
@@ -2712,6 +2713,27 @@ mod tests {
                 terminal.event.request_id.as_deref(),
                 Some(expected_request_id)
             );
+        }
+    }
+
+    #[test]
+    fn audit_tenant_scope_matches_event_log_identifier_boundary() {
+        let state = AppState {
+            deploy_mode: idoris_contracts::DeployMode::Tenant,
+            ..AppState::default()
+        };
+        let accepted = "t".repeat(128);
+        let mut headers = HeaderMap::new();
+        headers.insert("x-idoris-tenant", HeaderValue::from_str(&accepted).unwrap());
+        assert_eq!(
+            audit_tenant_id(&state, &headers).as_deref(),
+            Some(accepted.as_str())
+        );
+
+        for rejected in ["t".repeat(129), "left\tright".to_string()] {
+            let mut headers = HeaderMap::new();
+            headers.insert("x-idoris-tenant", HeaderValue::from_str(&rejected).unwrap());
+            assert_eq!(audit_tenant_id(&state, &headers), None);
         }
     }
 

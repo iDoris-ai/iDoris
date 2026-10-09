@@ -270,12 +270,19 @@ pub fn parse_profile(
         DeployMode::Personal => None,
         DeployMode::Tenant => {
             let tenant = match header_state(headers, "x-idoris-tenant") {
-                HeaderState::Present(s) => s.to_string(),
+                HeaderState::Present(s) if crate::event_identifier::valid(s) => s.to_string(),
                 HeaderState::Absent | HeaderState::Invalid => {
                     return Err(ProfileError::new(
                         StatusCode::BAD_REQUEST,
                         "tenant_missing",
                         "deploy_mode=tenant requires a single, non-blank X-iDoris-Tenant; no default tenant fallback",
+                    ));
+                }
+                HeaderState::Present(_) => {
+                    return Err(ProfileError::new(
+                        StatusCode::BAD_REQUEST,
+                        "tenant_missing",
+                        "deploy_mode=tenant requires a valid Event Log tenant identifier",
                     ));
                 }
             };
@@ -426,6 +433,29 @@ mod tests {
         )
         .unwrap();
         assert_eq!(parsed.tenant_id, Some("acme".to_string()));
+    }
+
+    #[test]
+    fn tenant_identifier_matches_event_log_boundary() {
+        let accepted = "t".repeat(128);
+        let parsed = parse_profile(
+            &headers(&[("x-idoris-tenant", accepted.as_str())]),
+            None,
+            DeployMode::Tenant,
+        )
+        .unwrap();
+        assert_eq!(parsed.tenant_id.as_deref(), Some(accepted.as_str()));
+
+        for rejected in ["t".repeat(129), "left\tright".to_string()] {
+            let err = parse_profile(
+                &headers(&[("x-idoris-tenant", rejected.as_str())]),
+                None,
+                DeployMode::Tenant,
+            )
+            .expect_err("tenant identifiers rejected by Event Log must fail before routing");
+            assert_eq!(err.status, StatusCode::BAD_REQUEST);
+            assert_eq!(err.error_type, "tenant_missing");
+        }
     }
 
     /// prdaemon review (PR #125): a header the caller *did* send, but with

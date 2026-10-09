@@ -8,7 +8,6 @@ use uuid::Uuid;
 
 const MAX_STRING_UTF16_UNITS: usize = 500;
 const MAX_LABELS: usize = 32;
-const MAX_IDENTIFIER_UTF16_UNITS: usize = 128;
 
 #[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -89,9 +88,7 @@ fn valid_string(value: &str) -> bool {
 }
 
 pub(crate) fn valid_event_identifier(value: &str) -> bool {
-    !value.trim().is_empty()
-        && value.encode_utf16().count() <= MAX_IDENTIFIER_UTF16_UNITS
-        && !value.chars().any(char::is_control)
+    crate::event_identifier::valid(value)
 }
 
 #[derive(Debug, thiserror::Error)]
