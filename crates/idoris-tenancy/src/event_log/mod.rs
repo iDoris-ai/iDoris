@@ -199,12 +199,18 @@ impl EventLogStore {
         }
         let conn = self.0.lock().map_err(|_| EventLogError::LockPoisoned)?;
         let mut stmt = conn.prepare(
-            "SELECT sequence,event_id,tenant_id,record_id,event_type,ts_utc_ms,request_id,session_id,trace_id,parent_id,origin_record_id,metadata \
-             FROM event_log_events \
-             WHERE tenant_id=?1 AND event_type=?2 \
+            "WITH ranked AS (\
+               SELECT sequence,event_id,tenant_id,record_id,event_type,ts_utc_ms,request_id,session_id,trace_id,parent_id,origin_record_id,metadata, \
+                      ROW_NUMBER() OVER (PARTITION BY record_id ORDER BY sequence DESC) AS rank \
+               FROM event_log_events \
+               WHERE tenant_id=?1 AND event_type=?2 \
+                 AND (?5 IS NULL OR record_id=?5)\
+             ) \
+             SELECT sequence,event_id,tenant_id,record_id,event_type,ts_utc_ms,request_id,session_id,trace_id,parent_id,origin_record_id,metadata \
+             FROM ranked \
+             WHERE rank=1 \
                AND (?3 IS NULL OR ts_utc_ms>=?3) \
                AND (?4 IS NULL OR ts_utc_ms<?4) \
-               AND (?5 IS NULL OR record_id=?5) \
              ORDER BY ts_utc_ms, record_id, sequence \
              LIMIT ?6",
         )?;

@@ -136,7 +136,7 @@ pub fn query_event_audit(
         return Err(AuditQueryError::InvalidRange);
     }
 
-    let finalized = store.events_for_tenant_type(
+    let finalized = match store.events_for_tenant_type(
         Some(path_tenant),
         EventType::AuditFinalized,
         &EventLogQuery {
@@ -145,7 +145,13 @@ pub fn query_event_audit(
             record_id: query.record_id.as_deref(),
             limit,
         },
-    )?;
+    ) {
+        Ok(events) => events,
+        Err(EventLogError::InvalidRecordId | EventLogError::InvalidIdentifier("record_id")) => {
+            Vec::new()
+        }
+        Err(error) => return Err(error.into()),
+    };
     let mut response = AuditResponse {
         tenant_id: path_tenant.to_string(),
         records: Vec::with_capacity(finalized.len()),
@@ -192,7 +198,7 @@ pub fn project_event_audit(path_tenant: &str, events: &[EventLogEvent]) -> Audit
         if record.origin_record_id.is_none() {
             record.origin_record_id = event.origin_record_id.clone();
         }
-        for key in ["intent", "privacy", "tier", "provider_id", "model_id"] {
+        for key in ["tier", "provider_id", "model_id"] {
             if let Some(value) = event.metadata.get(key) {
                 record.payload.insert(key.to_string(), value.clone());
             }
@@ -206,6 +212,13 @@ pub fn project_event_audit(path_tenant: &str, events: &[EventLogEvent]) -> Audit
             record
                 .payload
                 .insert("ts_utc".into(), serde_json::json!(event.ts_utc_ms));
+            for key in ["intent", "privacy"] {
+                if let Some(value) = event.metadata.get(key) {
+                    record.payload.insert(key.to_string(), value.clone());
+                } else {
+                    record.payload.remove(key);
+                }
+            }
             for (source, target) in [
                 ("http_status", "status"),
                 ("reason", "reason"),
@@ -515,10 +528,27 @@ mod tests {
             );
         }
         append(
+            "b",
+            EventType::AuditFinalized,
+            210,
+            BTreeMap::from([
+                ("component".into(), json!("router")),
+                ("http_status".into(), json!(204)),
+                ("reason".into(), json!("intent_match: routed")),
+                ("latency_ms".into(), json!(8)),
+                ("privacy".into(), json!("local_only")),
+                ("intent".into(), json!("chat")),
+            ]),
+        );
+        append(
             "a",
             EventType::FeedbackReceived,
             250,
-            BTreeMap::from([("rating".into(), json!(1))]),
+            BTreeMap::from([
+                ("rating".into(), json!(1)),
+                ("privacy".into(), json!("any")),
+                ("intent".into(), json!("feedback-overwrite")),
+            ]),
         );
 
         let response = query_event_audit(
@@ -549,6 +579,9 @@ mod tests {
         assert_eq!(response.records[0].payload["model_id"], json!("model-a"));
         assert_eq!(response.records[0].payload["cost_minor"], json!(9));
         assert_eq!(response.records[0].payload["ts_utc"], json!(200));
+        assert_eq!(response.records[1].record_id, "b");
+        assert_eq!(response.records[1].payload["status"], json!(204));
+        assert_eq!(response.records[1].payload["ts_utc"], json!(210));
     }
 
     #[test]
@@ -590,10 +623,23 @@ mod tests {
                 Some("acme"),
                 &AuditQuery {
                     limit: Some(MAX_LIMIT + 1),
-                    ..base
+                    ..base.clone()
                 }
             ),
             Err(AuditQueryError::InvalidLimit)
         ));
+        for record_id in ["", "bad\nrecord"] {
+            let response = query_event_audit(
+                &store,
+                "acme",
+                Some("acme"),
+                &AuditQuery {
+                    record_id: Some(record_id.into()),
+                    ..base.clone()
+                },
+            )
+            .unwrap();
+            assert!(response.records.is_empty());
+        }
     }
 }
