@@ -497,7 +497,7 @@ async fn get_tenant_audit(
         }
     };
     let scope_tenant = query_scope_header(&headers).map(str::to_string);
-    let Some(store) = state.record_store.clone() else {
+    let Some(store) = state.event_log.clone() else {
         return error_envelope(
             StatusCode::SERVICE_UNAVAILABLE,
             "audit_unavailable",
@@ -505,10 +505,7 @@ async fn get_tenant_audit(
         );
     };
     let result = tokio::task::spawn_blocking(move || {
-        let guard = store
-            .lock()
-            .map_err(|_| queries::audit::AuditQueryError::StorePoisoned)?;
-        queries::audit::query_audit(&guard, &tenant_id, scope_tenant.as_deref(), &query)
+        queries::audit::query_event_audit(&store, &tenant_id, scope_tenant.as_deref(), &query)
     })
     .await;
     match result {
@@ -2247,6 +2244,12 @@ async fn finish_buffered_audit(state: Arc<AppState>, meta: BufferedAuditMeta) {
             metadata.insert("http_status".into(), json!(meta.status.as_u16()));
             metadata.insert("reason".into(), json!(meta.reason.clone()));
             metadata.insert("latency_ms".into(), json!(meta.latency_ms));
+            if let Some(privacy) = meta.privacy.as_ref() {
+                metadata.insert("privacy".into(), json!(privacy));
+            }
+            if let Some(intent) = meta.intent.as_ref() {
+                metadata.insert("intent".into(), json!(intent));
+            }
             let event = idoris_tenancy::event_log::NewEvent {
                 event_id: Uuid::new_v4().to_string(),
                 tenant_id: tenant_id.clone(),
@@ -2433,7 +2436,7 @@ mod tests {
     use idoris_contracts::component_card::{Egress, Form};
     use idoris_contracts::provider::{Cost, Family, Locality, ProviderDescriptor};
     use idoris_tenancy::budget::{BudgetLedger, BudgetScope, Price, SpendGate};
-    use idoris_tenancy::event_log::{EventLogStore, EventType};
+    use idoris_tenancy::event_log::{EventLogStore, EventType, NewEvent};
     use idoris_tenancy::store::{RecordKind, TenantRecord, TenantStore};
     use rusqlite::Connection;
     use serde_json::{Map, json};
@@ -2636,7 +2639,7 @@ mod tests {
             legacy[0].payload["ts_utc"].as_i64().unwrap()
         );
         assert_eq!(event.metadata["component"], json!("router"));
-        assert!(!event.metadata.contains_key("privacy"));
+        assert_eq!(event.metadata["privacy"], legacy[0].payload["privacy"]);
         assert!(!event.metadata.contains_key("intent"));
     }
 
@@ -2860,33 +2863,34 @@ mod tests {
 
     #[tokio::test]
     async fn audit_query_http_scopes_filters_and_rejects_unknown_params() {
-        let store = memory_record_store();
-        {
-            let guard = store.lock().unwrap();
-            for (tenant, id, ts) in [
-                (budget::PERSONAL_TENANT_ID, "own", 2_000_i64),
-                ("other", "private", 1_500_i64),
-            ] {
-                let mut payload = Map::new();
-                payload.insert("ts_utc".into(), json!(ts));
-                payload.insert("reason".into(), json!("intent_match"));
-                guard
-                    .put(
-                        Some(tenant),
-                        &TenantRecord {
-                            tenant_id: tenant.into(),
-                            kind: RecordKind::Audit,
-                            record_id: id.into(),
-                            request_id: format!("request-{id}"),
-                            origin_record_id: None,
-                            payload,
-                        },
-                    )
-                    .unwrap();
-            }
+        let event_log =
+            Arc::new(EventLogStore::new(Connection::open_in_memory().unwrap()).unwrap());
+        for (tenant, id, ts) in [
+            (budget::PERSONAL_TENANT_ID, "own", 2_000_i64),
+            ("other", "private", 1_500_i64),
+        ] {
+            let event = NewEvent {
+                event_id: Uuid::new_v4().to_string(),
+                tenant_id: tenant.into(),
+                record_id: id.into(),
+                event_type: EventType::AuditFinalized,
+                ts_utc_ms: ts,
+                request_id: Some(format!("request-{id}")),
+                session_id: None,
+                trace_id: None,
+                parent_id: None,
+                origin_record_id: None,
+                metadata: std::collections::BTreeMap::from([
+                    ("component".into(), json!("router")),
+                    ("http_status".into(), json!(200)),
+                    ("reason".into(), json!("intent_match: routed")),
+                    ("latency_ms".into(), json!(1)),
+                ]),
+            };
+            event_log.append(Some(tenant), &event).unwrap();
         }
         let app = build_app(AppState {
-            record_store: Some(store),
+            event_log: Some(event_log),
             ..AppState::default()
         });
         let tenant = budget::PERSONAL_TENANT_ID;
