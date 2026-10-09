@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 
 use idoris_contracts::DeployMode;
 use idoris_tenancy::budget::{BudgetLedger, SpendGate};
+use idoris_tenancy::event_log::EventLogStore;
 use idoris_tenancy::store::TenantStore;
 use serde::Deserialize;
 
@@ -49,6 +50,7 @@ impl From<ConfigSpendGate> for SpendGate {
 pub struct StorageBootstrap {
     pub records: Arc<Mutex<TenantStore>>,
     pub budget: Arc<BudgetLedger>,
+    pub event_log: Arc<EventLogStore>,
 }
 
 pub fn bootstrap_process(deploy_mode: DeployMode) -> Result<StorageBootstrap, String> {
@@ -84,6 +86,8 @@ pub fn bootstrap(
         .map_err(|err| format!("无法打开租户记录数据库 \"{}\"：{err}", db_path.display()))?;
     let budget = BudgetLedger::open(db_path)
         .map_err(|err| format!("无法打开预算数据库 \"{}\"：{err}", db_path.display()))?;
+    let event_log = EventLogStore::open(db_path)
+        .map_err(|err| format!("无法打开事件日志数据库 \"{}\"：{err}", db_path.display()))?;
 
     let mut seen = BTreeSet::new();
     for config in configs {
@@ -118,6 +122,7 @@ pub fn bootstrap(
     Ok(StorageBootstrap {
         records: Arc::new(Mutex::new(records)),
         budget: Arc::new(budget),
+        event_log: Arc::new(event_log),
     })
 }
 
@@ -206,18 +211,43 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
+    use std::collections::BTreeMap;
+
     use idoris_tenancy::budget::{BudgetError, BudgetScope, Price};
+    use idoris_tenancy::event_log::{EventType, NewEvent};
     use idoris_tenancy::store::{RecordKind, TenantRecord};
+    use rusqlite::Connection;
     use serde_json::Map;
+    use uuid::Uuid;
 
     #[test]
     fn personal_defaults_are_persistent_and_unknown_tenant_is_not_fake_zero() {
         let dir = tempfile::TempDir::new().unwrap();
         let db = dir.path().join("state.sqlite3");
+        let event_id = Uuid::new_v4().to_string();
         {
             let storage = bootstrap(&db, None, DeployMode::Personal).unwrap();
             let view = storage.budget.tenant_readview(PERSONAL_TENANT_ID).unwrap();
             assert_eq!(view.limit_minor, 0);
+            storage
+                .event_log
+                .append(
+                    Some(PERSONAL_TENANT_ID),
+                    &NewEvent {
+                        event_id: event_id.clone(),
+                        tenant_id: PERSONAL_TENANT_ID.into(),
+                        record_id: "event-record".into(),
+                        event_type: EventType::RequestReceived,
+                        ts_utc_ms: 1,
+                        request_id: None,
+                        session_id: None,
+                        trace_id: None,
+                        parent_id: None,
+                        origin_record_id: None,
+                        metadata: BTreeMap::new(),
+                    },
+                )
+                .unwrap();
             storage
                 .records
                 .lock()
@@ -247,6 +277,34 @@ mod tests {
         );
         assert!(matches!(
             reopened.budget.tenant_readview("missing"),
+            Err(BudgetError::TenantNotConfigured { .. })
+        ));
+        let events = reopened
+            .event_log
+            .events_for_record(Some(PERSONAL_TENANT_ID), "event-record")
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event.event_id, event_id);
+    }
+
+    #[test]
+    fn broken_event_log_schema_fails_storage_bootstrap() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = dir.path().join("broken-event-log.sqlite3");
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE event_log_schema_migrations(version INTEGER PRIMARY KEY); \
+             INSERT INTO event_log_schema_migrations VALUES(1); \
+             CREATE TABLE event_log_events(sequence INTEGER PRIMARY KEY AUTOINCREMENT);",
+        )
+        .unwrap();
+        drop(conn);
+
+        let err = bootstrap(&db, None, DeployMode::Personal).err().unwrap();
+        assert!(err.contains("无法打开事件日志数据库"), "{err}");
+        let ledger = BudgetLedger::open(&db).unwrap();
+        assert!(matches!(
+            ledger.tenant_readview(PERSONAL_TENANT_ID),
             Err(BudgetError::TenantNotConfigured { .. })
         ));
     }
