@@ -14,6 +14,11 @@ use std::path::{Path, PathBuf};
 
 use idoris_contracts::Contract;
 use idoris_contracts::adapter_manifest::AdapterManifest;
+use idoris_contracts::admin_v0::AdminBackendsResponse;
+use idoris_contracts::admin_v0::{
+    AdminAdmissionStatus, AdminCapacityEntry, AdminCapacitySnapshot, AdminCapacityState,
+    AdminStatusResponse,
+};
 use idoris_contracts::component_card::ComponentCard;
 use idoris_contracts::load_policy::LoadPolicy;
 use idoris_contracts::provider::ProviderDescriptor;
@@ -80,6 +85,79 @@ fn assert_parity<T: Contract>(schema_file: &str, instance: &Value) {
 
 fn digest(c: char) -> String {
     format!("sha256:{}", c.to_string().repeat(64))
+}
+
+#[test]
+fn admin_v0_backends_corpus() {
+    let valid = json!([{
+        "provider_id": "omlx-local",
+        "locality": "loopback",
+        "form": "http_service",
+        "lifecycle_runtime_bound": true
+    }]);
+    assert_parity::<AdminBackendsResponse>("admin-v0-backends.schema.json", &valid);
+    assert_parity::<AdminBackendsResponse>("admin-v0-backends.schema.json", &json!([]));
+    let mut blank_id = valid.clone();
+    blank_id[0]["provider_id"] = json!("");
+    assert_parity::<AdminBackendsResponse>("admin-v0-backends.schema.json", &blank_id);
+    let mut extra = valid.clone();
+    extra[0]["endpoint"] = json!("http://127.0.0.1:8088/v1");
+    assert_parity::<AdminBackendsResponse>("admin-v0-backends.schema.json", &extra);
+}
+
+#[test]
+fn admin_v0_status_corpus() {
+    let valid = json!({
+        "status": "ok", "service": "idoris", "version": "0.2.0", "contract_version": "1.0.1",
+        "instance_id": "instance-1", "components": 2, "runtimes": 1, "subscriptions": 0,
+        "budget_configured": true, "audit_configured": true,
+        "capacity": {"state": "observed", "entries": [{
+            "id": "model-a", "capability": "reasoning", "resident": true,
+            "estimated_memory_gb": 12.5, "ctx_limit": 131072, "queue_depth": 1,
+            "admission_status": "ready"
+        }]}
+    });
+    assert_parity::<AdminStatusResponse>("admin-v0-status.schema.json", &valid);
+    let mut wrong_service = valid.clone();
+    wrong_service["service"] = json!("other");
+    assert_parity::<AdminStatusResponse>("admin-v0-status.schema.json", &wrong_service);
+    let mut bad_capacity = valid.clone();
+    bad_capacity["capacity"] = json!({"state": "error", "entries": []});
+    assert_parity::<AdminStatusResponse>("admin-v0-status.schema.json", &bad_capacity);
+}
+
+#[test]
+fn admin_v0_status_rejects_non_finite_capacity_memory() {
+    for estimated_memory_gb in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.0] {
+        let status = AdminStatusResponse {
+            status: "ok".into(),
+            service: "idoris".into(),
+            version: "0.2.0".into(),
+            contract_version: "1.0.1".into(),
+            instance_id: "instance-1".into(),
+            components: 0,
+            runtimes: 0,
+            subscriptions: 0,
+            budget_configured: false,
+            audit_configured: false,
+            capacity: AdminCapacitySnapshot {
+                state: AdminCapacityState::Observed,
+                entries: Some(vec![AdminCapacityEntry {
+                    id: "model-a".into(),
+                    capability: "reasoning".into(),
+                    resident: true,
+                    estimated_memory_gb,
+                    ctx_limit: 1,
+                    queue_depth: 0,
+                    admission_status: AdminAdmissionStatus::Ready,
+                }]),
+            },
+        };
+        assert!(
+            status.validate().is_err(),
+            "accepted {estimated_memory_gb:?}"
+        );
+    }
 }
 
 #[test]
