@@ -2250,13 +2250,21 @@ async fn finish_buffered_audit(state: Arc<AppState>, meta: BufferedAuditMeta) {
             if let Some(intent) = meta.intent.as_ref() {
                 metadata.insert("intent".into(), json!(intent));
             }
+            let event_request_id = if request_id.encode_utf16().count() <= 128
+                && !request_id.chars().any(char::is_control)
+            {
+                request_id.clone()
+            } else {
+                metadata.insert("audit_request_id".into(), json!(request_id.clone()));
+                meta.record_id.clone()
+            };
             let event = idoris_tenancy::event_log::NewEvent {
                 event_id: Uuid::new_v4().to_string(),
                 tenant_id: tenant_id.clone(),
                 record_id: meta.record_id.clone(),
                 event_type: idoris_tenancy::event_log::EventType::AuditFinalized,
                 ts_utc_ms: finalized_at,
-                request_id: Some(request_id),
+                request_id: Some(event_request_id),
                 session_id: None,
                 trace_id: None,
                 parent_id: None,
@@ -2641,6 +2649,87 @@ mod tests {
         assert_eq!(event.metadata["component"], json!("router"));
         assert_eq!(event.metadata["privacy"], legacy[0].payload["privacy"]);
         assert!(!event.metadata.contains_key("intent"));
+    }
+
+    #[tokio::test]
+    async fn audit_finalized_preserves_legacy_request_id_across_event_log_identifier_boundary() {
+        for units in [
+            128_usize,
+            129,
+            audit::MAX_FIELD_UTF16_UNITS,
+            audit::MAX_FIELD_UTF16_UNITS + 1,
+        ] {
+            let store = memory_record_store();
+            let event_log =
+                Arc::new(EventLogStore::new(Connection::open_in_memory().unwrap()).unwrap());
+            let request_id = "r".repeat(units);
+            let response = build_app(AppState {
+                record_store: Some(store.clone()),
+                event_log: Some(event_log.clone()),
+                ..AppState::default()
+            })
+            .oneshot(post_chat("{", &[(HEADER_REQUEST_ID, request_id.as_str())]))
+            .await
+            .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let record_id = response
+                .headers()
+                .get(HEADER_RECORD_ID)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string();
+            let expected_request_id = if units <= audit::MAX_FIELD_UTF16_UNITS {
+                request_id.as_str()
+            } else {
+                record_id.as_str()
+            };
+
+            let legacy = audit_rows(&store);
+            assert_eq!(legacy.len(), 1);
+            assert_eq!(legacy[0].payload["request_id"], json!(expected_request_id));
+
+            let event_records = queries::audit::query_event_audit(
+                &event_log,
+                budget::PERSONAL_TENANT_ID,
+                Some(budget::PERSONAL_TENANT_ID),
+                &queries::audit::AuditQuery {
+                    from: None,
+                    to: None,
+                    limit: None,
+                    record_id: Some(record_id.clone()),
+                },
+            )
+            .unwrap();
+            assert_eq!(event_records.records.len(), 1);
+            assert_eq!(event_records.records[0].request_id, expected_request_id);
+            assert_eq!(
+                event_records.records[0].payload["request_id"],
+                json!(expected_request_id)
+            );
+
+            let events = event_log
+                .events_for_record(Some(budget::PERSONAL_TENANT_ID), &record_id)
+                .unwrap();
+            let terminal = events.last().unwrap();
+            assert_eq!(terminal.event.event_type, EventType::AuditFinalized);
+            let expected_structured_id = if units <= 128 {
+                expected_request_id
+            } else {
+                record_id.as_str()
+            };
+            assert_eq!(
+                terminal.event.request_id.as_deref(),
+                Some(expected_structured_id)
+            );
+            assert_eq!(
+                terminal.event.metadata.get("audit_request_id"),
+                (129..=audit::MAX_FIELD_UTF16_UNITS)
+                    .contains(&units)
+                    .then(|| json!(request_id))
+                    .as_ref()
+            );
+        }
     }
 
     fn audit_rows(

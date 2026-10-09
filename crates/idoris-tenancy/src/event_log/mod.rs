@@ -7,7 +7,7 @@ use uuid::Uuid;
 
 const MAX_STRING_UTF16_UNITS: usize = 500;
 const MAX_ARRAY_ITEMS: usize = 32;
-const SCALAR_KEYS: &str = "component,intent,privacy,tier,provider_id,model_id,tokens_in,tokens_out,cost_minor,latency_ms,status,http_status,reason,rule_id,served_locality,degraded,cached,reserved_minor,settled_minor,price_version,rating,outcome,failure_mode,sensitivity,training_eligible";
+const SCALAR_KEYS: &str = "component,intent,privacy,tier,provider_id,model_id,tokens_in,tokens_out,cost_minor,latency_ms,status,http_status,reason,rule_id,served_locality,degraded,cached,reserved_minor,settled_minor,price_version,rating,outcome,failure_mode,sensitivity,training_eligible,audit_request_id";
 const ARRAY_KEYS: &str = "reason_codes,labels";
 const OBJECT_ARRAY_KEYS: &str = "rubric";
 const CONTENT_KEYS: &str = "prompt,prompts,input,inputs,content,contents,text,texts,body,messages,message,response,responses,output,outputs,completion,completions,corrected_output,query,answer,raw,data";
