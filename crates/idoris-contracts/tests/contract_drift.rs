@@ -9,6 +9,8 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use idoris_contracts::adapter_manifest::AdapterManifest;
+use idoris_contracts::admin_v0::AdminBackend;
+use idoris_contracts::admin_v0::AdminStatusResponse;
 use idoris_contracts::component_card::ComponentCard;
 use idoris_contracts::deploy_mode::DEPLOY_MODE_VALUES;
 use idoris_contracts::load_policy::LoadPolicy;
@@ -66,6 +68,22 @@ fn assert_shape<T: SchemaShape>() {
 }
 
 #[test]
+fn admin_v0_backends_item_shape_matches_schema() {
+    let schema = load_schema("admin-v0-backends.schema.json");
+    assert_eq!(schema["type"], "array");
+    let items = &schema["items"];
+    let actual_properties = keys_of(items, "properties");
+    let expected_properties: BTreeSet<String> =
+        ["provider_id", "locality", "form", "lifecycle_runtime_bound"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+    assert_eq!(actual_properties, expected_properties);
+    assert_eq!(keys_of(items, "required"), expected_properties);
+    let _type_anchor: Option<AdminBackend> = None;
+}
+
+#[test]
 fn provider_shape_matches_schema() {
     assert_shape::<ProviderDescriptor>();
 }
@@ -103,6 +121,35 @@ fn task_profile_shape_matches_schema() {
 #[test]
 fn routing_policy_shape_matches_schema() {
     assert_shape::<RoutingPolicy>();
+}
+
+#[test]
+fn admin_v0_status_shape_matches_schema() {
+    assert_shape::<AdminStatusResponse>();
+    let schema = load_schema("admin-v0-status.schema.json");
+    let capacity = &schema["properties"]["capacity"]["oneOf"][0];
+    assert_eq!(
+        keys_of(capacity, "required"),
+        ["entries".to_string(), "state".to_string()]
+            .into_iter()
+            .collect()
+    );
+    let entry = &capacity["properties"]["entries"]["items"];
+    assert_eq!(
+        keys_of(entry, "properties"),
+        [
+            "admission_status",
+            "capability",
+            "ctx_limit",
+            "estimated_memory_gb",
+            "id",
+            "queue_depth",
+            "resident",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+    );
 }
 
 #[test]

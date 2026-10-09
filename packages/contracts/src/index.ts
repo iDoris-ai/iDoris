@@ -15,5 +15,7 @@ export * from "./tenant.js";
 export * from "./adapter-manifest.js";
 export * from "./training-sample.js";
 export * from "./adapter-gate.js";
+export { adminV0BackendsResponseSchema } from "./generated/admin-v0-backends.js";
+export { adminV0StatusResponseSchema } from "./generated/admin-v0-status.js";
 export * from "./role.js";
 export * from "./version.js";

@@ -19,6 +19,7 @@ fn forward_opts() -> ForwardOpts<'static> {
         provider_id: "omlx",
         served_locality: Locality::Loopback,
         privacy: PrivacyClass::Any,
+        require_openai_usage: false,
     }
 }
 
