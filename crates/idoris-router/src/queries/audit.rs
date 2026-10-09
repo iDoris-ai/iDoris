@@ -439,6 +439,7 @@ mod tests {
                     ("http_status".into(), json!(200)),
                     ("reason".into(), json!("intent_match: routed")),
                     ("latency_ms".into(), json!(12)),
+                    ("privacy".into(), json!("local_only")),
                 ]),
             ),
             event(4, "r2", EventType::RequestReceived, 300, BTreeMap::new()),
