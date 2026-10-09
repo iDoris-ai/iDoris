@@ -1,4 +1,6 @@
-use idoris_tenancy::event_log::EventLogEvent;
+use idoris_tenancy::event_log::{
+    EventLogError, EventLogEvent, EventLogQuery, EventLogStore, EventType,
+};
 use idoris_tenancy::store::{RecordKind, StoreError, TenantRecord, TenantStore};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -43,6 +45,8 @@ pub enum AuditQueryError {
     InvalidRecord { record_id: String },
     #[error("tenant audit record store lock is poisoned")]
     StorePoisoned,
+    #[error(transparent)]
+    EventLog(#[from] EventLogError),
     #[error(transparent)]
     Store(#[from] StoreError),
 }
@@ -109,6 +113,59 @@ pub fn query_audit(
     })
 }
 
+pub fn query_event_audit(
+    store: &EventLogStore,
+    path_tenant: &str,
+    scope_tenant: Option<&str>,
+    query: &AuditQuery,
+) -> Result<AuditResponse, AuditQueryError> {
+    let scope_tenant = scope_tenant
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or(AuditQueryError::ScopeRequired)?;
+    if scope_tenant != path_tenant {
+        return Err(AuditQueryError::ScopeMismatch);
+    }
+    let limit = query.limit.unwrap_or(DEFAULT_LIMIT);
+    if limit == 0 || limit > MAX_LIMIT {
+        return Err(AuditQueryError::InvalidLimit);
+    }
+    if let (Some(from), Some(to)) = (query.from, query.to)
+        && from >= to
+    {
+        return Err(AuditQueryError::InvalidRange);
+    }
+
+    let finalized = match store.events_for_tenant_type(
+        Some(path_tenant),
+        EventType::AuditFinalized,
+        &EventLogQuery {
+            from_ts_utc_ms: query.from,
+            to_ts_utc_ms: query.to,
+            record_id: query.record_id.as_deref(),
+            limit,
+        },
+    ) {
+        Ok(events) => events,
+        Err(EventLogError::InvalidRecordId | EventLogError::InvalidIdentifier("record_id")) => {
+            Vec::new()
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let mut response = AuditResponse {
+        tenant_id: path_tenant.to_string(),
+        records: Vec::with_capacity(finalized.len()),
+    };
+    for terminal in finalized {
+        let events = store.events_for_record(Some(path_tenant), &terminal.event.record_id)?;
+        let mut projected = project_event_audit(path_tenant, &events);
+        if let Some(record) = projected.records.pop() {
+            response.records.push(record);
+        }
+    }
+    Ok(response)
+}
+
 pub fn project_event_audit(path_tenant: &str, events: &[EventLogEvent]) -> AuditResponse {
     let mut records: Vec<AuditRecordView> = Vec::new();
     for row in events {
@@ -138,13 +195,10 @@ pub fn project_event_audit(path_tenant: &str, events: &[EventLogEvent]) -> Audit
                 records.len() - 1
             });
         let record = &mut records[index];
-        record
-            .payload
-            .insert("ts_utc".into(), serde_json::json!(event.ts_utc_ms));
         if record.origin_record_id.is_none() {
             record.origin_record_id = event.origin_record_id.clone();
         }
-        for key in ["intent", "privacy", "tier", "provider_id", "model_id"] {
+        for key in ["tier", "provider_id", "model_id"] {
             if let Some(value) = event.metadata.get(key) {
                 record.payload.insert(key.to_string(), value.clone());
             }
@@ -153,6 +207,27 @@ pub fn project_event_audit(path_tenant: &str, events: &[EventLogEvent]) -> Audit
             && let Some(value) = event.metadata.get("settled_minor")
         {
             record.payload.insert("cost_minor".into(), value.clone());
+        }
+        if event.event_type == EventType::AuditFinalized {
+            record
+                .payload
+                .insert("ts_utc".into(), serde_json::json!(event.ts_utc_ms));
+            for key in ["intent", "privacy"] {
+                if let Some(value) = event.metadata.get(key) {
+                    record.payload.insert(key.to_string(), value.clone());
+                } else {
+                    record.payload.remove(key);
+                }
+            }
+            for (source, target) in [
+                ("http_status", "status"),
+                ("reason", "reason"),
+                ("latency_ms", "latency_ms"),
+            ] {
+                if let Some(value) = event.metadata.get(source) {
+                    record.payload.insert(target.to_string(), value.clone());
+                }
+            }
         }
     }
     AuditResponse {
@@ -355,7 +430,19 @@ mod tests {
                 200,
                 BTreeMap::from([("settled_minor".into(), json!(7))]),
             ),
-            event(3, "r2", EventType::RequestReceived, 300, BTreeMap::new()),
+            event(
+                3,
+                "r1",
+                EventType::AuditFinalized,
+                225,
+                BTreeMap::from([
+                    ("http_status".into(), json!(200)),
+                    ("reason".into(), json!("intent_match: routed")),
+                    ("latency_ms".into(), json!(12)),
+                    ("privacy".into(), json!("local_only")),
+                ]),
+            ),
+            event(4, "r2", EventType::RequestReceived, 300, BTreeMap::new()),
         ];
 
         let projected = project_event_audit("acme", &rows);
@@ -365,12 +452,195 @@ mod tests {
         assert_eq!(projected.records[0].payload["component"], json!("router"));
         assert_eq!(projected.records[0].payload["privacy"], json!("local_only"));
         assert_eq!(projected.records[0].payload["cost_minor"], json!(7));
-        assert_eq!(projected.records[0].payload["ts_utc"], json!(200));
-        assert!(!projected.records[0].payload.contains_key("status"));
-        assert!(!projected.records[0].payload.contains_key("reason"));
+        assert_eq!(projected.records[0].payload["ts_utc"], json!(225));
+        assert_eq!(projected.records[0].payload["status"], json!(200));
+        assert_eq!(
+            projected.records[0].payload["reason"],
+            json!("intent_match: routed")
+        );
         assert!(!projected.records[0].payload.contains_key("tokens_in"));
         assert!(!projected.records[0].payload.contains_key("tokens_out"));
-        assert!(!projected.records[0].payload.contains_key("latency_ms"));
+        assert_eq!(projected.records[0].payload["latency_ms"], json!(12));
         assert_eq!(projected.records[1].record_id, "r2");
+    }
+
+    #[test]
+    fn event_audit_query_limits_finalized_records_not_intermediate_events() {
+        use idoris_tenancy::event_log::{EventLogStore, EventType, NewEvent};
+        use std::collections::BTreeMap;
+
+        let store = EventLogStore::new(Connection::open_in_memory().unwrap()).unwrap();
+        let append = |record_id: &str,
+                      event_type: EventType,
+                      ts_utc_ms: i64,
+                      metadata: BTreeMap<String, Value>| {
+            let event = NewEvent {
+                event_id: uuid::Uuid::new_v4().to_string(),
+                tenant_id: "acme".into(),
+                record_id: record_id.into(),
+                event_type,
+                ts_utc_ms,
+                request_id: Some(format!("request-{record_id}")),
+                session_id: None,
+                trace_id: None,
+                parent_id: None,
+                origin_record_id: None,
+                metadata,
+            };
+            store.append(Some("acme"), &event).unwrap();
+        };
+
+        for ts in 1..=20 {
+            append(
+                "noise",
+                EventType::StreamChunk,
+                ts,
+                BTreeMap::from([("status".into(), json!("chunk"))]),
+            );
+        }
+        append(
+            "a",
+            EventType::Decided,
+            150,
+            BTreeMap::from([
+                ("provider_id".into(), json!("omlx")),
+                ("model_id".into(), json!("model-a")),
+            ]),
+        );
+        append(
+            "a",
+            EventType::BudgetSettled,
+            175,
+            BTreeMap::from([("settled_minor".into(), json!(9))]),
+        );
+        for (record_id, ts, status) in [("b", 200, 201), ("a", 200, 202), ("c", 300, 203)] {
+            append(
+                record_id,
+                EventType::AuditFinalized,
+                ts,
+                BTreeMap::from([
+                    ("component".into(), json!("router")),
+                    ("http_status".into(), json!(status)),
+                    ("reason".into(), json!("intent_match: routed")),
+                    ("latency_ms".into(), json!(7)),
+                    ("privacy".into(), json!("local_only")),
+                    ("intent".into(), json!("chat")),
+                ]),
+            );
+        }
+        append(
+            "b",
+            EventType::AuditFinalized,
+            210,
+            BTreeMap::from([
+                ("component".into(), json!("router")),
+                ("http_status".into(), json!(204)),
+                ("reason".into(), json!("intent_match: routed")),
+                ("latency_ms".into(), json!(8)),
+                ("privacy".into(), json!("local_only")),
+                ("intent".into(), json!("chat")),
+            ]),
+        );
+        append(
+            "a",
+            EventType::FeedbackReceived,
+            250,
+            BTreeMap::from([
+                ("rating".into(), json!(1)),
+                ("privacy".into(), json!("any")),
+                ("intent".into(), json!("feedback-overwrite")),
+            ]),
+        );
+
+        let response = query_event_audit(
+            &store,
+            "acme",
+            Some("acme"),
+            &AuditQuery {
+                from: Some(100),
+                to: Some(300),
+                limit: Some(2),
+                record_id: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            response
+                .records
+                .iter()
+                .map(|record| record.record_id.as_str())
+                .collect::<Vec<_>>(),
+            ["a", "b"]
+        );
+        assert_eq!(response.records[0].payload["status"], json!(202));
+        assert_eq!(response.records[0].payload["latency_ms"], json!(7));
+        assert_eq!(response.records[0].payload["privacy"], json!("local_only"));
+        assert_eq!(response.records[0].payload["intent"], json!("chat"));
+        assert_eq!(response.records[0].payload["provider_id"], json!("omlx"));
+        assert_eq!(response.records[0].payload["model_id"], json!("model-a"));
+        assert_eq!(response.records[0].payload["cost_minor"], json!(9));
+        assert_eq!(response.records[0].payload["ts_utc"], json!(200));
+        assert_eq!(response.records[1].record_id, "b");
+        assert_eq!(response.records[1].payload["status"], json!(204));
+        assert_eq!(response.records[1].payload["ts_utc"], json!(210));
+    }
+
+    #[test]
+    fn event_audit_query_preserves_scope_and_query_validation() {
+        let store =
+            idoris_tenancy::event_log::EventLogStore::new(Connection::open_in_memory().unwrap())
+                .unwrap();
+        let base = AuditQuery {
+            from: None,
+            to: None,
+            limit: None,
+            record_id: None,
+        };
+        assert!(matches!(
+            query_event_audit(&store, "acme", None, &base),
+            Err(AuditQueryError::ScopeRequired)
+        ));
+        assert!(matches!(
+            query_event_audit(&store, "acme", Some("other"), &base),
+            Err(AuditQueryError::ScopeMismatch)
+        ));
+        assert!(matches!(
+            query_event_audit(
+                &store,
+                "acme",
+                Some("acme"),
+                &AuditQuery {
+                    from: Some(10),
+                    to: Some(10),
+                    ..base.clone()
+                }
+            ),
+            Err(AuditQueryError::InvalidRange)
+        ));
+        assert!(matches!(
+            query_event_audit(
+                &store,
+                "acme",
+                Some("acme"),
+                &AuditQuery {
+                    limit: Some(MAX_LIMIT + 1),
+                    ..base.clone()
+                }
+            ),
+            Err(AuditQueryError::InvalidLimit)
+        ));
+        for record_id in ["", "bad\nrecord"] {
+            let response = query_event_audit(
+                &store,
+                "acme",
+                Some("acme"),
+                &AuditQuery {
+                    record_id: Some(record_id.into()),
+                    ..base.clone()
+                },
+            )
+            .unwrap();
+            assert!(response.records.is_empty());
+        }
     }
 }
