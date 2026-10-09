@@ -23,7 +23,7 @@ async-trait = { workspace = true }
 futures-core = "0.3"
 # `tokio::time::timeout` wraps every oMLX HTTP call — production code, so
 # a normal (not dev-only) dependency; `test-util` is added below instead.
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["process"] }
 serde_json = { workspace = true }
 # rustls, not the system TLS backend — no OpenSSL, and matches the `genai`
 # remote client's own default (later PR) so the crate has one TLS stack.
@@ -52,6 +52,7 @@ genai = "=0.6.5"
 
 [target.'cfg(unix)'.dependencies]
 nix = { workspace = true }
+rustix = { version = "1", features = ["process"] }
 
 [dev-dependencies]
 # `io-util` (for `AsyncWriteExt`) is test-only: the raw-TCP regression test
