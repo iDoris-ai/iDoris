@@ -171,7 +171,7 @@ impl BufferedUpstreamPath {
 
     pub(crate) const MESSAGES: Self = Self {
         path: "/v1/messages",
-        force_non_stream: false,
+        force_non_stream: true,
     };
 }
 
