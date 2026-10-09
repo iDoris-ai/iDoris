@@ -1380,10 +1380,7 @@ async fn chat_completions(
         Ok(context) => context,
         Err(error) => return correlation_error_response(error),
     };
-    let event_request_id = header_text(&headers, HEADER_REQUEST_ID)
-        .filter(|value| value.encode_utf16().count() <= 128 && !value.chars().any(char::is_control))
-        .unwrap_or(&record_id)
-        .to_string();
+    let event_request_id = event_request_id(header_text(&headers, HEADER_REQUEST_ID), &record_id);
     let event_context = if let Some(event_log) = state.event_log.clone() {
         let tenant_id = match state.deploy_mode {
             idoris_contracts::DeployMode::Personal => budget::PERSONAL_TENANT_ID.to_string(),
@@ -2187,6 +2184,14 @@ fn audit_header(headers: &HeaderMap, name: &str, default: Option<&str>) -> Optio
     }
 }
 
+fn event_request_id(request_id: Option<&str>, record_id: &str) -> String {
+    request_id
+        .filter(|value| value.encode_utf16().count() <= 128)
+        .filter(|value| !value.chars().any(char::is_control))
+        .unwrap_or(record_id)
+        .to_string()
+}
+
 fn audit_tenant_id(state: &AppState, headers: &HeaderMap) -> Option<String> {
     match state.deploy_mode {
         idoris_contracts::DeployMode::Personal => Some(budget::PERSONAL_TENANT_ID.to_string()),
@@ -2216,10 +2221,7 @@ async fn finish_buffered_audit(state: Arc<AppState>, meta: BufferedAuditMeta) {
             return;
         }
     };
-    let request_id = meta
-        .request_id
-        .clone()
-        .unwrap_or_else(|| meta.record_id.clone());
+    let request_id = event_request_id(meta.request_id.as_deref(), &meta.record_id);
     let mut payload = serde_json::Map::new();
     payload.insert("request_id".into(), json!(request_id.clone()));
     payload.insert("component".into(), json!("router"));
@@ -2250,21 +2252,13 @@ async fn finish_buffered_audit(state: Arc<AppState>, meta: BufferedAuditMeta) {
             if let Some(intent) = meta.intent.as_ref() {
                 metadata.insert("intent".into(), json!(intent));
             }
-            let event_request_id = if request_id.encode_utf16().count() <= 128
-                && !request_id.chars().any(char::is_control)
-            {
-                request_id.clone()
-            } else {
-                metadata.insert("audit_request_id".into(), json!(request_id.clone()));
-                meta.record_id.clone()
-            };
             let event = idoris_tenancy::event_log::NewEvent {
                 event_id: Uuid::new_v4().to_string(),
                 tenant_id: tenant_id.clone(),
                 record_id: meta.record_id.clone(),
                 event_type: idoris_tenancy::event_log::EventType::AuditFinalized,
                 ts_utc_ms: finalized_at,
-                request_id: Some(event_request_id),
+                request_id: Some(request_id),
                 session_id: None,
                 trace_id: None,
                 parent_id: None,
@@ -2652,17 +2646,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn audit_finalized_preserves_legacy_request_id_across_event_log_identifier_boundary() {
-        for units in [
-            128_usize,
-            129,
-            audit::MAX_FIELD_UTF16_UNITS,
-            audit::MAX_FIELD_UTF16_UNITS + 1,
-        ] {
+    async fn audit_finalized_uses_the_same_request_id_boundary_as_request_received() {
+        let cases = [
+            ("r".repeat(128), true),
+            ("r".repeat(129), false),
+            ("r".repeat(audit::MAX_FIELD_UTF16_UNITS), false),
+            ("r".repeat(audit::MAX_FIELD_UTF16_UNITS + 1), false),
+            ("left\tright".to_string(), false),
+        ];
+        for (request_id, preserves_caller_id) in cases {
             let store = memory_record_store();
             let event_log =
                 Arc::new(EventLogStore::new(Connection::open_in_memory().unwrap()).unwrap());
-            let request_id = "r".repeat(units);
             let response = build_app(AppState {
                 record_store: Some(store.clone()),
                 event_log: Some(event_log.clone()),
@@ -2679,7 +2674,7 @@ mod tests {
                 .to_str()
                 .unwrap()
                 .to_string();
-            let expected_request_id = if units <= audit::MAX_FIELD_UTF16_UNITS {
+            let expected_request_id = if preserves_caller_id {
                 request_id.as_str()
             } else {
                 record_id.as_str()
@@ -2713,21 +2708,9 @@ mod tests {
                 .unwrap();
             let terminal = events.last().unwrap();
             assert_eq!(terminal.event.event_type, EventType::AuditFinalized);
-            let expected_structured_id = if units <= 128 {
-                expected_request_id
-            } else {
-                record_id.as_str()
-            };
             assert_eq!(
                 terminal.event.request_id.as_deref(),
-                Some(expected_structured_id)
-            );
-            assert_eq!(
-                terminal.event.metadata.get("audit_request_id"),
-                (129..=audit::MAX_FIELD_UTF16_UNITS)
-                    .contains(&units)
-                    .then(|| json!(request_id))
-                    .as_ref()
+                Some(expected_request_id)
             );
         }
     }

@@ -209,12 +209,6 @@ pub fn project_event_audit(path_tenant: &str, events: &[EventLogEvent]) -> Audit
             record.payload.insert("cost_minor".into(), value.clone());
         }
         if event.event_type == EventType::AuditFinalized {
-            if let Some(Value::String(request_id)) = event.metadata.get("audit_request_id") {
-                record.request_id.clone_from(request_id);
-                record
-                    .payload
-                    .insert("request_id".into(), serde_json::json!(request_id));
-            }
             record
                 .payload
                 .insert("ts_utc".into(), serde_json::json!(event.ts_utc_ms));
