@@ -138,6 +138,16 @@ fn run_production_startup(
         .local_addr()
         .unwrap()
         .port();
+    let admin_port = loop {
+        let candidate = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        if candidate != port {
+            break candidate;
+        }
+    };
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let existing_path = std::env::var_os("PATH").unwrap_or_default();
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_idoris"));
@@ -156,6 +166,7 @@ fn run_production_startup(
         .env("IDORIS_CATALOG", root.join("config/catalog.yaml"))
         .env("IDORIS_DB_PATH", state.path().join("state.sqlite3"))
         .env("IDORIS_PORT", port.to_string())
+        .env("IDORIS_ADMIN_PORT", admin_port.to_string())
         .env(
             "PATH",
             format!("{}:{}", fake_bin.display(), existing_path.to_string_lossy()),
@@ -172,15 +183,17 @@ fn run_production_startup(
         if child.try_wait().unwrap().is_some() {
             break;
         }
-        if let Ok(mut stream) = std::net::TcpStream::connect(("127.0.0.1", port)) {
-            stream
+        if let Ok(mut stream) = std::net::TcpStream::connect(("127.0.0.1", port))
+            && stream
                 .write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
-                .unwrap();
+                .is_ok()
+        {
             let mut response = String::new();
-            stream.read_to_string(&mut response).unwrap();
-            assert!(response.starts_with("HTTP/1.1 200"), "{response}");
-            started = true;
-            break;
+            if stream.read_to_string(&mut response).is_ok() {
+                assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+                started = true;
+                break;
+            }
         }
         if Instant::now() >= deadline {
             break;
