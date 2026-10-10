@@ -8,8 +8,11 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::http::{HeaderMap, header::AUTHORIZATION};
+use idoris_contracts::common::PrivacyClass;
 use idoris_tenancy::virtual_key::VirtualKeySecret;
 use idoris_tenancy::virtual_key::store::{AuthenticatedVirtualKey, VirtualKeyStore};
+
+use crate::profile::ParsedProfile;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VirtualKeyAuthError {
@@ -27,6 +30,51 @@ impl std::fmt::Display for VirtualKeyAuthError {
 }
 
 impl std::error::Error for VirtualKeyAuthError {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VirtualKeyScopeError {
+    PrivacyForbidden,
+    RoleForbidden,
+}
+
+impl VirtualKeyScopeError {
+    pub const fn reason_code(self) -> &'static str {
+        match self {
+            Self::PrivacyForbidden => "VIRTUAL_KEY_PRIVACY_FORBIDDEN",
+            Self::RoleForbidden => "VIRTUAL_KEY_ROLE_FORBIDDEN",
+        }
+    }
+}
+
+impl std::fmt::Display for VirtualKeyScopeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.reason_code())
+    }
+}
+
+impl std::error::Error for VirtualKeyScopeError {}
+
+/// Applies the authenticated key as an authorization ceiling over the
+/// already-parsed request profile. Scope can only reject, never widen.
+pub fn enforce_scope(
+    identity: &AuthenticatedVirtualKey,
+    profile: &ParsedProfile,
+) -> Result<(), VirtualKeyScopeError> {
+    let privacy = profile.task.privacy.unwrap_or(PrivacyClass::LocalOnly);
+    if !identity.scope.allowed_privacy.contains(&privacy) {
+        return Err(VirtualKeyScopeError::PrivacyForbidden);
+    }
+    let role = profile.role.ok_or(VirtualKeyScopeError::RoleForbidden)?;
+    if !identity
+        .scope
+        .allowed_roles
+        .iter()
+        .any(|allowed| allowed == role.as_str())
+    {
+        return Err(VirtualKeyScopeError::RoleForbidden);
+    }
+    Ok(())
+}
 
 #[derive(Clone)]
 pub struct VirtualKeyAuthenticator {
@@ -90,12 +138,14 @@ fn bearer_secret(headers: &HeaderMap) -> Result<VirtualKeySecret, VirtualKeyAuth
 mod tests {
     #![allow(clippy::unwrap_used)]
 
+    use idoris_contracts::DeployMode;
     use idoris_contracts::common::PrivacyClass;
     use idoris_tenancy::virtual_key::MintedVirtualKey;
     use idoris_tenancy::virtual_key::store::VirtualKeyScope;
     use rusqlite::Connection;
 
     use super::*;
+    use crate::profile::parse_profile;
 
     fn scope(expires_at_ms: Option<i64>) -> VirtualKeyScope {
         VirtualKeyScope {
@@ -192,5 +242,68 @@ mod tests {
         assert_eq!(error, VirtualKeyAuthError::Unauthorized);
         let rendered = format!("{error} {error:?}");
         assert!(!rendered.contains(sentinel));
+    }
+
+    fn identity(privacy: Vec<PrivacyClass>, roles: &[&str]) -> AuthenticatedVirtualKey {
+        AuthenticatedVirtualKey {
+            key_id: "vk-test".into(),
+            scope: VirtualKeyScope {
+                owner: "agent24-instance".into(),
+                allowed_privacy: privacy,
+                allowed_roles: roles.iter().map(|role| (*role).to_string()).collect(),
+                budget_ref: None,
+                expires_at_ms: None,
+                admin_scopes: Vec::new(),
+            },
+        }
+    }
+
+    fn profile(model: &str, privacy: Option<&str>) -> crate::profile::ParsedProfile {
+        let mut headers = HeaderMap::new();
+        if let Some(privacy) = privacy {
+            headers.insert("x-idoris-privacy", privacy.parse().unwrap());
+        }
+        parse_profile(&headers, Some(model), DeployMode::Personal).unwrap()
+    }
+
+    #[test]
+    fn privacy_and_role_scopes_are_explicit_ceilings() {
+        let local_fast = identity(vec![PrivacyClass::LocalOnly], &["fast"]);
+        assert!(enforce_scope(&local_fast, &profile("idoris/fast", None)).is_ok());
+        assert_eq!(
+            enforce_scope(&local_fast, &profile("idoris/fast", Some("any"))).unwrap_err(),
+            VirtualKeyScopeError::PrivacyForbidden
+        );
+        assert_eq!(
+            enforce_scope(&local_fast, &profile("idoris/daily", None)).unwrap_err(),
+            VirtualKeyScopeError::RoleForbidden
+        );
+
+        let any_fast = identity(vec![PrivacyClass::LocalOnly, PrivacyClass::Any], &["fast"]);
+        assert!(enforce_scope(&any_fast, &profile("idoris/fast", Some("any"))).is_ok());
+        assert!(enforce_scope(&any_fast, &profile("idoris/fast", None)).is_ok());
+    }
+
+    #[test]
+    fn empty_roles_or_concrete_model_ids_never_bypass_role_scope() {
+        let no_roles = identity(vec![PrivacyClass::LocalOnly], &[]);
+        assert_eq!(
+            enforce_scope(&no_roles, &profile("idoris/fast", None)).unwrap_err(),
+            VirtualKeyScopeError::RoleForbidden
+        );
+
+        let fast = identity(vec![PrivacyClass::LocalOnly], &["fast"]);
+        assert_eq!(
+            enforce_scope(&fast, &profile("backend-concrete-model", None)).unwrap_err(),
+            VirtualKeyScopeError::RoleForbidden
+        );
+    }
+
+    #[test]
+    fn missing_internal_privacy_is_treated_as_local_only_not_any() {
+        let local_fast = identity(vec![PrivacyClass::LocalOnly], &["fast"]);
+        let mut parsed = profile("idoris/fast", None);
+        parsed.task.privacy = None;
+        assert!(enforce_scope(&local_fast, &parsed).is_ok());
     }
 }

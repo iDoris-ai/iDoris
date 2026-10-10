@@ -2,6 +2,7 @@ import Ajv2020 from "ajv/dist/2020.js";
 import { describe, expect, it } from "vitest";
 import adminV0BackendsJson from "../../schema/admin-v0-backends.schema.json";
 import adminV0ModelsJson from "../../schema/admin-v0-models.schema.json";
+import adminV0RolesJson from "../../schema/admin-v0-roles.schema.json";
 import adminV0StatusJson from "../../schema/admin-v0-status.schema.json";
 import adapterManifestJson from "../../schema/adapter-manifest.schema.json";
 import componentCardJson from "../../schema/component-card.schema.json";
@@ -13,6 +14,7 @@ import taskProfileJson from "../../schema/task-profile.schema.json";
 import trainingSampleJson from "../../schema/training-sample.schema.json";
 import { adminV0BackendsResponseSchema } from "../../src/generated/admin-v0-backends.js";
 import { adminV0ModelsResponseSchema } from "../../src/generated/admin-v0-models.js";
+import { adminV0RolesResponseSchema } from "../../src/generated/admin-v0-roles.js";
 import { adminV0StatusResponseSchema } from "../../src/generated/admin-v0-status.js";
 import { adapterManifestSchema } from "../../src/adapter-manifest.js";
 import { componentCardSchema } from "../../src/component-card.js";
@@ -27,6 +29,7 @@ const ajv = new Ajv2020({ allErrors: true, strict: false });
 const jsonByName = {
   "admin-v0-backends": adminV0BackendsJson,
   "admin-v0-models": adminV0ModelsJson,
+  "admin-v0-roles": adminV0RolesJson,
   "admin-v0-status": adminV0StatusJson,
   "adapter-manifest": adapterManifestJson,
   provider: providerJson, "load-policy": loadPolicyJson, "component-card": componentCardJson,
@@ -39,6 +42,7 @@ const ajvOk = (n: Name, data: unknown) => ajv.validate(`https://idoris.ai/schema
 const zodByName: Record<Name, { safeParse: (d: unknown) => { success: boolean } }> = {
   "admin-v0-backends": adminV0BackendsResponseSchema,
   "admin-v0-models": adminV0ModelsResponseSchema,
+  "admin-v0-roles": adminV0RolesResponseSchema,
   "admin-v0-status": adminV0StatusResponseSchema,
   "adapter-manifest": adapterManifestSchema,
   provider: providerDescriptorSchema, "load-policy": loadPolicySchema, "component-card": componentCardSchema,
@@ -83,6 +87,10 @@ const corpus: Array<[Name, unknown]> = [
   ["admin-v0-models", { sources: [{ provider_id: "claude-subscription", source: "subscription_registration", state: "configured", models: [] }] }],
   ["admin-v0-models", { sources: [{ provider_id: "omlx-local", source: "http_models_endpoint", state: "error", models: ["should-not-leak"], error: "authentication_failed" }] }],
   ["admin-v0-models", { sources: [{ provider_id: "omlx-local", source: "subscription_registration", state: "observed", models: ["Qwen3-8B"] }] }],
+  ["admin-v0-roles", [{ role: "daily", aliases: ["idoris/daily"], catalog_role: true }]],
+  ["admin-v0-roles", []],
+  ["admin-v0-roles", [{ role: "daily", aliases: [], catalog_role: true }]],
+  ["admin-v0-roles", [{ role: "daily", aliases: ["idoris/daily"], catalog_role: true, model: "Qwen3-8B" }]],
   ["admin-v0-status", {
     status: "ok", service: "idoris", version: "0.2.0", contract_version: "1.0.1",
     instance_id: "instance-1", components: 2, runtimes: 1, subscriptions: 0,
