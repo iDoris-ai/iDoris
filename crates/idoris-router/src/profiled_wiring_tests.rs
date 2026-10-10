@@ -43,10 +43,12 @@ async fn profiled_follows_request_received_with_resolved_safe_metadata() {
     let events = event_log
         .events_for_record(Some(budget::PERSONAL_TENANT_ID), &record_id)
         .unwrap();
-    assert_eq!(events.len(), 2);
+    assert_eq!(events.len(), 3);
     assert_eq!(events[0].event.event_type, EventType::RequestReceived);
     assert_eq!(events[1].event.event_type, EventType::Profiled);
+    assert_eq!(events[2].event.event_type, EventType::Decided);
     assert!(events[0].sequence < events[1].sequence);
+    assert!(events[1].sequence < events[2].sequence);
     assert_eq!(events[1].event.record_id, record_id);
     assert_eq!(events[1].event.tenant_id, budget::PERSONAL_TENANT_ID);
     assert_eq!(events[1].event.session_id.as_deref(), Some("session-1"));
