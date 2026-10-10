@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://idoris.ai/schema/admin-v0-runtimes.schema.json",
+  "title": "AdminV0RuntimesResponse",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["runtimes"],
+  "properties": {
+    "runtimes": {
+      "type": "array",
+      "items": {
+        "oneOf": [
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["provider_id", "state", "pressure", "used_gb", "model_memory_max_gb", "loaded"],
+            "properties": {
+              "provider_id": { "type": "string", "minLength": 1 },
+              "state": { "const": "observed" },
+              "pressure": { "enum": ["ok", "soft", "hard", "ceiling", "unknown"] },
+              "used_gb": { "type": "number", "minimum": 0 },
+              "model_memory_max_gb": { "type": "number", "minimum": 0 },
+              "loaded": { "type": "array", "items": { "type": "string", "minLength": 1 } }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["provider_id", "state"],
+            "properties": {
+              "provider_id": { "type": "string", "minLength": 1 },
+              "state": { "const": "error" }
+            }
+          }
+        ]
+      }
+    }
+  }
+}
