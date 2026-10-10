@@ -1546,7 +1546,16 @@ async fn chat_completions(
             };
         }
         if dispatch::is_resident_http_service(&selected.card) {
-            return chat_via_proxy(&state, selected, &headers, &parsed, &value, &record_id).await;
+            return chat_via_proxy(
+                &state,
+                selected,
+                &headers,
+                &parsed,
+                &value,
+                &record_id,
+                budget_event_context.as_ref(),
+            )
+            .await;
         }
         if let Err(message) = supervisor_stream::validate(object) {
             let mut response = error_envelope_with_reason(
@@ -1667,6 +1676,7 @@ async fn chat_via_proxy(
     parsed: &ParsedProfile,
     body_value: &serde_json::Value,
     record_id: &str,
+    budget_event_context: Option<&BudgetReservedEventContext>,
 ) -> Response {
     let mut reservation = match dispatch::ReservationGuard::reserve(
         state.budget_ledger.as_deref(),
@@ -1699,6 +1709,12 @@ async fn chat_via_proxy(
             "paid_proxy_unavailable",
             "付费流式直连尚不支持可信 usage 结算，请使用非流式请求或支持结算的后端",
         );
+    }
+    if is_paid
+        && let Some(context) = budget_event_context
+        && append_budget_reserved(context, selected).await.is_err()
+    {
+        return event_log_unavailable_response();
     }
     if stream_requested {
         return chat_via_proxy_stream(state, selected, body_value).await;
