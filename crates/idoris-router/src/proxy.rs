@@ -565,6 +565,30 @@ impl ChatProxy {
             .await
     }
 
+    pub(crate) async fn forward_buffered_with_success_gate_observed<F, O, Fut, E>(
+        &self,
+        endpoint: &str,
+        body: &Value,
+        opts: &ForwardOpts<'_>,
+        success_gate: F,
+        observer: O,
+    ) -> Result<ForwardOutcome, E>
+    where
+        F: FnOnce(&ForwardOutcome) -> Result<(), SuccessFinalizeError> + Send,
+        O: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<(), E>>,
+    {
+        self.forward_buffered_path_with_success_gate_observed(
+            endpoint,
+            BufferedUpstreamPath::CHAT_COMPLETIONS,
+            body,
+            opts,
+            success_gate,
+            observer,
+        )
+        .await
+    }
+
     pub(crate) async fn forward_buffered_with_success_gate<F>(
         &self,
         endpoint: &str,
@@ -575,14 +599,19 @@ impl ChatProxy {
     where
         F: FnOnce(&ForwardOutcome) -> Result<(), SuccessFinalizeError> + Send,
     {
-        self.forward_buffered_path_with_success_gate(
-            endpoint,
-            BufferedUpstreamPath::CHAT_COMPLETIONS,
-            body,
-            opts,
-            success_gate,
-        )
-        .await
+        let result = self
+            .forward_buffered_with_success_gate_observed(
+                endpoint,
+                body,
+                opts,
+                success_gate,
+                || async { Ok::<(), std::convert::Infallible>(()) },
+            )
+            .await;
+        match result {
+            Ok(outcome) => outcome,
+            Err(never) => match never {},
+        }
     }
 
     async fn forward_buffered_path_with_success_gate<F>(
@@ -1131,7 +1160,9 @@ impl ChatProxy {
         .await
         {
             Ok(sent) => sent,
-            Err(_) => return Ok(Self::stream_failure(504)),
+            Err(_) => {
+                return Ok(Self::stream_failure(504));
+            }
         };
         Ok(match sent {
             Ok(resp) => {
