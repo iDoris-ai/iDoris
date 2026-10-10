@@ -15,7 +15,7 @@ use idoris_contracts::LoadPolicy;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
-use crate::{LocalRuntimeLaunch, ManagedRuntimeProcess};
+use crate::{LocalRuntimeKind, LocalRuntimeLaunch, ManagedRuntimeProcess};
 
 const DEFAULT_CALL_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
@@ -164,7 +164,11 @@ impl LocalHttpRuntimeAdapter {
                 })
             })
             .collect::<Vec<_>>();
-        let body = serde_json::json!({"model": req.model, "messages": messages});
+        let engine_model = match self.config.launch.kind() {
+            LocalRuntimeKind::MlxLmServer => "default_model".to_string(),
+            LocalRuntimeKind::LlamaCpp => self.config.model_id.clone(),
+        };
+        let body = serde_json::json!({"model": engine_model, "messages": messages});
         let attempt = async {
             let response = self
                 .client
@@ -279,12 +283,10 @@ impl RuntimeAdapter for LocalHttpRuntimeAdapter {
     ) -> Result<ChatResponse, BackendError> {
         self.ensure_id(&req.model)?;
         if cancel.is_cancelled() {
-            let _ = self.stop_process().await;
             return Err(BackendError::cancelled());
         }
         tokio::select! {
             _ = cancel.cancelled() => {
-                let _ = self.stop_process().await;
                 Err(BackendError::cancelled())
             }
             result = self.chat_inner(req) => result,
@@ -365,7 +367,7 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/v1/chat/completions"))
             .and(body_json(serde_json::json!({
-                "model": "single-model",
+                "model": "default_model",
                 "messages": [{"role": "user", "content": "hello"}]
             })))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -455,7 +457,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn chat_cancellation_terminates_the_owned_runtime_process() {
+    async fn cancelling_one_chat_keeps_shared_runtime_available() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/v1/models"))
@@ -466,31 +468,77 @@ mod tests {
             .await;
         Mock::given(method("POST"))
             .and(path("/v1/chat/completions"))
+            .and(body_json(serde_json::json!({
+                "model": "default_model",
+                "messages": [{"role": "user", "content": "slow"}]
+            })))
             .respond_with(
                 ResponseTemplate::new(200)
                     .set_delay(Duration::from_secs(5))
-                    .set_body_json(serde_json::json!({"choices": []})),
+                    .set_body_json(serde_json::json!({
+                        "choices": [{"message": {"content": "slow-result"}}]
+                    })),
             )
+            .expect(1)
             .mount(&server)
             .await;
-        let adapter = with_running_process(&server).await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(body_json(serde_json::json!({
+                "model": "default_model",
+                "messages": [{"role": "user", "content": "fast"}]
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"content": "fast-result"}}]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let adapter = std::sync::Arc::new(with_running_process(&server).await);
         let cancel = CancellationToken::new();
-        let cancel_later = cancel.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            cancel_later.cancel();
+        let slow_adapter = adapter.clone();
+        let slow_cancel = cancel.clone();
+        let slow = tokio::spawn(async move {
+            slow_adapter
+                .chat(
+                    ChatRequest {
+                        model: "single-model".into(),
+                        messages: vec![ChatMessage {
+                            role: "user".into(),
+                            content: "slow".into(),
+                        }],
+                    },
+                    slow_cancel,
+                )
+                .await
         });
-        let error = adapter
+        tokio::spawn({
+            let cancel = cancel.clone();
+            async move {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                cancel.cancel();
+            }
+        });
+        let error = slow.await.unwrap().unwrap_err();
+        assert!(matches!(error, BackendError::Cancelled));
+        assert!(adapter.process_running().await.unwrap());
+
+        let response = adapter
             .chat(
                 ChatRequest {
                     model: "single-model".into(),
-                    messages: vec![],
+                    messages: vec![ChatMessage {
+                        role: "user".into(),
+                        content: "fast".into(),
+                    }],
                 },
-                cancel,
+                CancellationToken::new(),
             )
             .await
-            .unwrap_err();
-        assert!(matches!(error, BackendError::Cancelled));
-        assert!(!adapter.process_running().await.unwrap());
+            .unwrap();
+        assert_eq!(response.content, "fast-result");
+        assert_eq!(adapter.status().await.unwrap().loaded, vec!["single-model"]);
+        adapter.unload("single-model").await.unwrap();
+        server.verify().await;
     }
 }

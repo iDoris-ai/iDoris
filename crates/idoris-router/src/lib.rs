@@ -21,6 +21,9 @@ pub mod components;
 /// Executable-relative bundled config resolution with explicit-path overrides.
 pub mod config;
 
+/// Validated chat-request correlation identifiers for later Event Log use.
+pub mod correlation;
+
 /// Routing-policy loading from `IDORIS_ROUTING_POLICY` (R2-D task 2); wired
 /// into `AppState` in a follow-up PR.
 pub mod routing_policy;
@@ -28,6 +31,10 @@ pub mod routing_policy;
 /// The local decision + execution path (R2-D task 3): `decide()` → (if
 /// needed) `Supervisor` load → `Supervisor` chat.
 pub mod dispatch;
+
+/// Read-only Admin API v0 status facts. HTTP exposure is intentionally
+/// deferred until the dedicated loopback + session-token listener slice.
+pub mod admin;
 
 /// Per-card runtime construction for lifecycle-managed providers.
 pub mod runtime;
@@ -47,6 +54,8 @@ pub mod models;
 /// Metadata-only audit validation and tenant-scoped persistence (B1 task19).
 pub mod audit;
 mod audit_body;
+/// Trusted Authorization bearer -> virtual-key caller identity.
+pub mod auth;
 /// Injectable `/capabilities` provider boundary (B1 task32). Live capacity
 /// aggregation is wired by task33.
 pub mod capabilities;
@@ -90,7 +99,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use idoris_backend::{BackendError, ChatMessage};
-use idoris_contracts::common::PrivacyClass;
+use idoris_contracts::common::{Capability, PrivacyClass};
 use idoris_policy::Rejection;
 use idoris_tenancy::budget::{BUDGET_EXCEEDED_REASON_CODE, BudgetError};
 use serde::Serialize;
@@ -208,6 +217,12 @@ pub struct AppState {
     /// Tenant-scoped audit/usage record store. Startup installs it together
     /// with `budget_ledger` from the same SQLite path.
     pub record_store: Option<Arc<std::sync::Mutex<idoris_tenancy::store::TenantStore>>>,
+    /// Production installs the persistent B5 verifier. Library tests may
+    /// leave this unset to preserve pre-B5 request behavior.
+    pub virtual_key_authenticator: Option<auth::VirtualKeyAuthenticator>,
+    /// Persistent B6 Event Log capability. This slice only bootstraps and
+    /// carries the handle; request event emission is wired separately.
+    pub event_log: Option<Arc<idoris_tenancy::event_log::EventLogStore>>,
     /// Best-effort audit persistence failures. Audit must not alter the HTTP
     /// result already produced by routing/backend execution.
     pub audit_failures: Arc<AtomicU64>,
@@ -246,6 +261,14 @@ impl std::fmt::Debug for AppState {
             .field(
                 "record_store",
                 &self.record_store.as_ref().map(|_| "TenantStore { .. }"),
+            )
+            .field("event_log", &self.event_log.as_ref().map(|_| "configured"))
+            .field(
+                "virtual_key_authenticator",
+                &self
+                    .virtual_key_authenticator
+                    .as_ref()
+                    .map(|_| "configured"),
             )
             .field(
                 "audit_failures",
@@ -288,6 +311,8 @@ impl Default for AppState {
             runtimes: runtime::RuntimeRegistry::default(),
             budget_ledger: None,
             record_store: None,
+            virtual_key_authenticator: None,
+            event_log: None,
             audit_failures: Arc::new(AtomicU64::new(0)),
             models_health: Arc::new(health::HealthTracker::default()),
             capabilities: None,
@@ -323,6 +348,9 @@ pub fn build_app(state: AppState) -> Router {
             "/v1/chat/completions",
             post(chat_completions).fallback(not_found),
         )
+        .route("/v1/embeddings", post(embeddings).fallback(not_found))
+        .route("/v1/rerank", post(rerank).fallback(not_found))
+        .route("/v1/messages", post(messages).fallback(not_found))
         .fallback(not_found)
         .layer(middleware::from_fn(
             connection::request_lifecycle_middleware,
@@ -332,6 +360,412 @@ pub fn build_app(state: AppState) -> Router {
             record_id_middleware,
         ))
         .with_state(state)
+}
+
+async fn embeddings(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Extension(RequestRecordId(record_id)): Extension<RequestRecordId>,
+    body: Bytes,
+) -> Response {
+    let value: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(value) => value,
+        Err(_) => {
+            return error_envelope(
+                StatusCode::BAD_REQUEST,
+                "invalid_json",
+                "request body is not valid JSON",
+            );
+        }
+    };
+    let Some(object) = value.as_object() else {
+        return error_envelope(
+            StatusCode::BAD_REQUEST,
+            "invalid_body",
+            "request body must be a JSON object",
+        );
+    };
+    let model = object.get("model").and_then(serde_json::Value::as_str);
+    let mut parsed = match parse_profile(&headers, model, state.deploy_mode) {
+        Ok(parsed) => parsed,
+        Err(error) => return error.into_response(),
+    };
+    // The protocol endpoint is authoritative for the required capability.
+    // Caller headers may further constrain routing elsewhere, but they cannot
+    // turn an embeddings request into a chat/rerank dispatch.
+    parsed.task.capabilities = Some(vec![Capability::Embedding]);
+
+    let cards = dispatch::policy_cards(&state.cards, &state.routing_policy, &parsed)
+        .cards
+        .into_iter()
+        .filter(dispatch::is_resident_http_service)
+        .collect::<Vec<_>>();
+    let selected = match dispatch::select(&cards, &parsed, "") {
+        Ok(selected) => selected,
+        Err(DispatchError::Rejection(rejection)) => return rejection_response(rejection),
+        Err(DispatchError::Internal(message)) => {
+            return error_envelope(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", message);
+        }
+    };
+
+    // B7-02 reuses the direct buffered transport. Paid embeddings need a
+    // distinct usage-settlement contract (OpenAI embeddings do not report
+    // chat completion_tokens), so this slice must fail closed before egress.
+    let cost = &selected.card.provider.cost;
+    if cost.input_per_m != 0.0 || cost.output_per_m != 0.0 {
+        return error_envelope(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "paid_proxy_unavailable",
+            "paid embeddings are unavailable until embeddings usage settlement is defined",
+        );
+    }
+    let _reservation = match dispatch::ReservationGuard::reserve(
+        state.budget_ledger.as_deref(),
+        parsed.tenant_id.as_deref(),
+        &selected.card.provider.id,
+        selected.estimated_cost_minor,
+    ) {
+        Ok(guard) => guard,
+        Err(err) => {
+            return budget_error_response(
+                &err,
+                &dispatch::ChatOutcome {
+                    decision: selected.decision.clone(),
+                    served_locality: selected.served_locality,
+                    result: Err(DispatchFailure::Budget(err.clone())),
+                    actual_cost_minor: None,
+                },
+            );
+        }
+    };
+
+    let opts = proxy::ForwardOpts {
+        request_id: headers
+            .get(HEADER_REQUEST_ID)
+            .and_then(|value| value.to_str().ok()),
+        tenant_id: parsed.tenant_id.as_deref(),
+        record_id: &record_id,
+        provider_id: selected.card.provider.id.as_str(),
+        served_locality: selected.served_locality,
+        privacy: parsed.task.privacy.unwrap_or(PrivacyClass::LocalOnly),
+        require_openai_usage: false,
+    };
+    let outcome = state
+        .proxy
+        .forward_buffered_path(
+            &selected.card.endpoint,
+            proxy::BufferedUpstreamPath::EMBEDDINGS,
+            &value,
+            &opts,
+        )
+        .await;
+    let status = StatusCode::from_u16(outcome.status).unwrap_or(StatusCode::BAD_GATEWAY);
+    let mut response = (status, outcome.body).into_response();
+    let content_type = outcome
+        .content_type
+        .as_deref()
+        .unwrap_or("application/json");
+    if let Ok(value) = HeaderValue::from_str(content_type) {
+        response
+            .headers_mut()
+            .insert(axum::http::header::CONTENT_TYPE, value);
+    }
+    if let Ok(value) = HeaderValue::from_str(locality_str(
+        outcome
+            .replayed_served_locality
+            .unwrap_or(selected.served_locality),
+    )) {
+        response.headers_mut().insert(HEADER_SERVED_LOCALITY, value);
+    }
+    if outcome.cached {
+        response.extensions_mut().insert(usage::UsageFact::cached());
+        response
+            .headers_mut()
+            .insert(HEADER_CACHED, HeaderValue::from_static("true"));
+        if let Some(origin) = outcome.origin_record_id
+            && let Ok(value) = HeaderValue::from_str(&origin)
+        {
+            response
+                .headers_mut()
+                .insert(HEADER_ORIGIN_RECORD_ID, value);
+        }
+    } else if status.is_success() {
+        response
+            .extensions_mut()
+            .insert(usage::UsageFact::inference(Some(0)));
+    }
+    response
+}
+
+async fn rerank(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Extension(RequestRecordId(record_id)): Extension<RequestRecordId>,
+    body: Bytes,
+) -> Response {
+    let value: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(value) => value,
+        Err(_) => {
+            return error_envelope(
+                StatusCode::BAD_REQUEST,
+                "invalid_json",
+                "request body is not valid JSON",
+            );
+        }
+    };
+    let Some(object) = value.as_object() else {
+        return error_envelope(
+            StatusCode::BAD_REQUEST,
+            "invalid_body",
+            "request body must be a JSON object",
+        );
+    };
+    let model = object.get("model").and_then(serde_json::Value::as_str);
+    let mut parsed = match parse_profile(&headers, model, state.deploy_mode) {
+        Ok(parsed) => parsed,
+        Err(error) => return error.into_response(),
+    };
+    parsed.task.capabilities = Some(vec![Capability::Rerank]);
+
+    let cards = dispatch::policy_cards(&state.cards, &state.routing_policy, &parsed)
+        .cards
+        .into_iter()
+        .filter(dispatch::is_resident_http_service)
+        .collect::<Vec<_>>();
+    let selected = match dispatch::select(&cards, &parsed, "") {
+        Ok(selected) => selected,
+        Err(DispatchError::Rejection(rejection)) => return rejection_response(rejection),
+        Err(DispatchError::Internal(message)) => {
+            return error_envelope(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", message);
+        }
+    };
+
+    let cost = &selected.card.provider.cost;
+    if cost.input_per_m != 0.0 || cost.output_per_m != 0.0 {
+        return error_envelope(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "paid_proxy_unavailable",
+            "paid rerank is unavailable until rerank usage settlement is defined",
+        );
+    }
+    let _reservation = match dispatch::ReservationGuard::reserve(
+        state.budget_ledger.as_deref(),
+        parsed.tenant_id.as_deref(),
+        &selected.card.provider.id,
+        selected.estimated_cost_minor,
+    ) {
+        Ok(guard) => guard,
+        Err(err) => {
+            return budget_error_response(
+                &err,
+                &dispatch::ChatOutcome {
+                    decision: selected.decision.clone(),
+                    served_locality: selected.served_locality,
+                    result: Err(DispatchFailure::Budget(err.clone())),
+                    actual_cost_minor: None,
+                },
+            );
+        }
+    };
+
+    let opts = proxy::ForwardOpts {
+        request_id: headers
+            .get(HEADER_REQUEST_ID)
+            .and_then(|value| value.to_str().ok()),
+        tenant_id: parsed.tenant_id.as_deref(),
+        record_id: &record_id,
+        provider_id: selected.card.provider.id.as_str(),
+        served_locality: selected.served_locality,
+        privacy: parsed.task.privacy.unwrap_or(PrivacyClass::LocalOnly),
+        require_openai_usage: false,
+    };
+    let outcome = state
+        .proxy
+        .forward_buffered_path(
+            &selected.card.endpoint,
+            proxy::BufferedUpstreamPath::RERANK,
+            &value,
+            &opts,
+        )
+        .await;
+    let status = StatusCode::from_u16(outcome.status).unwrap_or(StatusCode::BAD_GATEWAY);
+    let mut response = (status, outcome.body).into_response();
+    let content_type = outcome
+        .content_type
+        .as_deref()
+        .unwrap_or("application/json");
+    if let Ok(value) = HeaderValue::from_str(content_type) {
+        response
+            .headers_mut()
+            .insert(axum::http::header::CONTENT_TYPE, value);
+    }
+    if let Ok(value) = HeaderValue::from_str(locality_str(
+        outcome
+            .replayed_served_locality
+            .unwrap_or(selected.served_locality),
+    )) {
+        response.headers_mut().insert(HEADER_SERVED_LOCALITY, value);
+    }
+    if outcome.cached {
+        response.extensions_mut().insert(usage::UsageFact::cached());
+        response
+            .headers_mut()
+            .insert(HEADER_CACHED, HeaderValue::from_static("true"));
+        if let Some(origin) = outcome.origin_record_id
+            && let Ok(value) = HeaderValue::from_str(&origin)
+        {
+            response
+                .headers_mut()
+                .insert(HEADER_ORIGIN_RECORD_ID, value);
+        }
+    } else if status.is_success() {
+        response
+            .extensions_mut()
+            .insert(usage::UsageFact::inference(Some(0)));
+    }
+    response
+}
+
+async fn messages(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Extension(RequestRecordId(record_id)): Extension<RequestRecordId>,
+    body: Bytes,
+) -> Response {
+    let value: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(value) => value,
+        Err(_) => {
+            return error_envelope(
+                StatusCode::BAD_REQUEST,
+                "invalid_json",
+                "request body is not valid JSON",
+            );
+        }
+    };
+    let Some(object) = value.as_object() else {
+        return error_envelope(
+            StatusCode::BAD_REQUEST,
+            "invalid_body",
+            "request body must be a JSON object",
+        );
+    };
+    if let Some(stream) = object.get("stream") {
+        match stream.as_bool() {
+            Some(false) => {}
+            Some(true) | None => {
+                return error_envelope_with_reason(
+                    StatusCode::BAD_REQUEST,
+                    "unsupported_field",
+                    "unsupported_stream",
+                    "streaming /v1/messages is not supported by this endpoint yet",
+                );
+            }
+        }
+    }
+    let model = object.get("model").and_then(serde_json::Value::as_str);
+    let mut parsed = match parse_profile(&headers, model, state.deploy_mode) {
+        Ok(parsed) => parsed,
+        Err(error) => return error.into_response(),
+    };
+    parsed.task.capabilities = Some(vec![Capability::Chat]);
+
+    let cards = dispatch::policy_cards(&state.cards, &state.routing_policy, &parsed)
+        .cards
+        .into_iter()
+        .filter(dispatch::is_resident_http_service)
+        .collect::<Vec<_>>();
+    let selected = match dispatch::select(&cards, &parsed, "") {
+        Ok(selected) => selected,
+        Err(DispatchError::Rejection(rejection)) => return rejection_response(rejection),
+        Err(DispatchError::Internal(message)) => {
+            return error_envelope(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", message);
+        }
+    };
+
+    let cost = &selected.card.provider.cost;
+    if cost.input_per_m != 0.0 || cost.output_per_m != 0.0 {
+        return error_envelope(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "paid_proxy_unavailable",
+            "paid messages are unavailable until Anthropic usage settlement is defined",
+        );
+    }
+    let _reservation = match dispatch::ReservationGuard::reserve(
+        state.budget_ledger.as_deref(),
+        parsed.tenant_id.as_deref(),
+        &selected.card.provider.id,
+        selected.estimated_cost_minor,
+    ) {
+        Ok(guard) => guard,
+        Err(err) => {
+            return budget_error_response(
+                &err,
+                &dispatch::ChatOutcome {
+                    decision: selected.decision.clone(),
+                    served_locality: selected.served_locality,
+                    result: Err(DispatchFailure::Budget(err.clone())),
+                    actual_cost_minor: None,
+                },
+            );
+        }
+    };
+
+    let opts = proxy::ForwardOpts {
+        request_id: headers
+            .get(HEADER_REQUEST_ID)
+            .and_then(|value| value.to_str().ok()),
+        tenant_id: parsed.tenant_id.as_deref(),
+        record_id: &record_id,
+        provider_id: selected.card.provider.id.as_str(),
+        served_locality: selected.served_locality,
+        privacy: parsed.task.privacy.unwrap_or(PrivacyClass::LocalOnly),
+        require_openai_usage: false,
+    };
+    let outcome = state
+        .proxy
+        .forward_buffered_path(
+            &selected.card.endpoint,
+            proxy::BufferedUpstreamPath::MESSAGES,
+            &value,
+            &opts,
+        )
+        .await;
+    let status = StatusCode::from_u16(outcome.status).unwrap_or(StatusCode::BAD_GATEWAY);
+    let mut response = (status, outcome.body).into_response();
+    let content_type = outcome
+        .content_type
+        .as_deref()
+        .unwrap_or("application/json");
+    if let Ok(value) = HeaderValue::from_str(content_type) {
+        response
+            .headers_mut()
+            .insert(axum::http::header::CONTENT_TYPE, value);
+    }
+    if let Ok(value) = HeaderValue::from_str(locality_str(
+        outcome
+            .replayed_served_locality
+            .unwrap_or(selected.served_locality),
+    )) {
+        response.headers_mut().insert(HEADER_SERVED_LOCALITY, value);
+    }
+    if outcome.cached {
+        response.extensions_mut().insert(usage::UsageFact::cached());
+        response
+            .headers_mut()
+            .insert(HEADER_CACHED, HeaderValue::from_static("true"));
+        if let Some(origin) = outcome.origin_record_id
+            && let Ok(value) = HeaderValue::from_str(&origin)
+        {
+            response
+                .headers_mut()
+                .insert(HEADER_ORIGIN_RECORD_ID, value);
+        }
+    } else if status.is_success() {
+        response
+            .extensions_mut()
+            .insert(usage::UsageFact::inference(Some(0)));
+    }
+    response
 }
 
 async fn get_tenant_usage(
@@ -798,6 +1232,120 @@ fn rejection_response(rejection: Rejection) -> Response {
     )
 }
 
+fn virtual_key_unauthorized_response() -> Response {
+    error_envelope_with_reason(
+        StatusCode::UNAUTHORIZED,
+        "unauthorized",
+        "VIRTUAL_KEY_UNAUTHORIZED",
+        "virtual key authentication failed",
+    )
+}
+
+fn virtual_key_scope_response(error: auth::VirtualKeyScopeError) -> Response {
+    error_envelope_with_reason(
+        StatusCode::FORBIDDEN,
+        "policy_violation",
+        error.reason_code(),
+        "virtual key scope forbids this request",
+    )
+}
+
+fn correlation_error_response(error: correlation::CorrelationError) -> Response {
+    error_envelope_with_reason(
+        StatusCode::BAD_REQUEST,
+        "invalid_correlation_header",
+        error.reason_code(),
+        "invalid correlation header",
+    )
+}
+
+fn event_log_unavailable_response() -> Response {
+    error_envelope_with_reason(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "event_log_unavailable",
+        "EVENT_LOG_APPEND_UNAVAILABLE",
+        "event log unavailable",
+    )
+}
+
+async fn run_event_log_write<F>(write: F) -> Result<(), ()>
+where
+    F: FnOnce() -> Result<(), idoris_tenancy::event_log::EventLogError> + Send + 'static,
+{
+    tokio::task::spawn_blocking(write)
+        .await
+        .map_err(|_| ())?
+        .map_err(|_| ())
+}
+
+async fn append_request_received(
+    store: Arc<idoris_tenancy::event_log::EventLogStore>,
+    tenant_id: String,
+    record_id: String,
+    correlation: &correlation::RequestCorrelation,
+) -> Result<(), ()> {
+    let ts_utc_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_millis()).ok())
+        .ok_or(())?;
+    let event = idoris_tenancy::event_log::NewEvent {
+        event_id: Uuid::new_v4().to_string(),
+        tenant_id: tenant_id.clone(),
+        record_id,
+        event_type: idoris_tenancy::event_log::EventType::RequestReceived,
+        ts_utc_ms,
+        request_id: None,
+        session_id: correlation.session_id.clone(),
+        trace_id: correlation.trace_id.clone(),
+        parent_id: correlation.parent_id.clone(),
+        origin_record_id: None,
+        metadata: Default::default(),
+    };
+    run_event_log_write(move || store.append(Some(&tenant_id), &event).map(|_| ())).await
+}
+
+async fn append_profiled(
+    store: Arc<idoris_tenancy::event_log::EventLogStore>,
+    tenant_id: String,
+    record_id: String,
+    correlation: &correlation::RequestCorrelation,
+    parsed: &ParsedProfile,
+) -> Result<(), ()> {
+    let privacy = match parsed
+        .task
+        .privacy
+        .unwrap_or(idoris_contracts::common::PrivacyClass::LocalOnly)
+    {
+        idoris_contracts::common::PrivacyClass::LocalOnly => "local_only",
+        idoris_contracts::common::PrivacyClass::Any => "any",
+    };
+    let mut metadata = std::collections::BTreeMap::new();
+    metadata.insert("privacy".to_string(), json!(privacy));
+    if let Some(intent) = parsed.task.intent.as_deref() {
+        metadata.insert("intent".to_string(), json!(intent));
+    }
+    let ts_utc_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_millis()).ok())
+        .ok_or(())?;
+    let event = idoris_tenancy::event_log::NewEvent {
+        event_id: Uuid::new_v4().to_string(),
+        tenant_id: tenant_id.clone(),
+        record_id,
+        event_type: idoris_tenancy::event_log::EventType::Profiled,
+        ts_utc_ms,
+        request_id: None,
+        session_id: correlation.session_id.clone(),
+        trace_id: correlation.trace_id.clone(),
+        parent_id: correlation.parent_id.clone(),
+        origin_record_id: None,
+        metadata,
+    };
+    run_event_log_write(move || store.append(Some(&tenant_id), &event).map(|_| ())).await
+}
+
 /// `POST /v1/chat/completions`. Order (locked by conformance): non-JSON
 /// body -> `invalid_json`; valid JSON that isn't an object -> `invalid_body`;
 /// only then are control-plane headers parsed (see [`profile::parse_profile`]).
@@ -835,19 +1383,69 @@ async fn chat_completions(
         Ok(parsed) => parsed,
         Err(err) => return err.into_response(),
     };
+    let correlation = match correlation::parse(&headers) {
+        Ok(context) => context,
+        Err(error) => return correlation_error_response(error),
+    };
+    let event_context = if let Some(event_log) = state.event_log.clone() {
+        let tenant_id = match state.deploy_mode {
+            idoris_contracts::DeployMode::Personal => budget::PERSONAL_TENANT_ID.to_string(),
+            idoris_contracts::DeployMode::Tenant => match parsed.tenant_id.clone() {
+                Some(tenant_id) => tenant_id,
+                None => return event_log_unavailable_response(),
+            },
+        };
+        if append_request_received(
+            event_log.clone(),
+            tenant_id.clone(),
+            record_id.clone(),
+            &correlation,
+        )
+        .await
+        .is_err()
+        {
+            return event_log_unavailable_response();
+        }
+        Some((event_log, tenant_id))
+    } else {
+        None
+    };
+
+    if let Some(authenticator) = &state.virtual_key_authenticator {
+        let identity = match authenticator.authenticate(&headers).await {
+            Ok(identity) => identity,
+            Err(_) => return virtual_key_unauthorized_response(),
+        };
+        if let Err(error) = auth::enforce_scope(&identity, &parsed) {
+            return virtual_key_scope_response(error);
+        }
+    }
     let affinity_key = session_affinity_key(&headers);
 
     let messages = extract_messages(object);
     let parsed = intent::resolve_profile(parsed, &messages).await;
+    if let Some((event_log, tenant_id)) = event_context
+        && append_profiled(
+            event_log,
+            tenant_id,
+            record_id.clone(),
+            &correlation,
+            &parsed,
+        )
+        .await
+        .is_err()
+    {
+        return event_log_unavailable_response();
+    }
     let prompt = messages
         .iter()
         .map(|m| m.content.as_str())
         .collect::<Vec<_>>()
         .join("\n");
 
-    let (cards, fail_closed) = dispatch::policy_cards(&state.cards, &state.routing_policy, &parsed);
-    if cards.is_empty() {
-        return if fail_closed {
+    let policy_cards = dispatch::policy_cards(&state.cards, &state.routing_policy, &parsed);
+    if policy_cards.cards.is_empty() {
+        return if policy_cards.route.fail_closed {
             rejection_response(idoris_policy::Rejection::LocalOnlyUnavailable)
         } else {
             error_envelope(
@@ -866,7 +1464,8 @@ async fn chat_completions(
         state
             .runtimes
             .exact_ready_providers(
-                cards
+                policy_cards
+                    .cards
                     .iter()
                     .map(|card| {
                         let provider_id = card.provider.id.clone();
@@ -887,7 +1486,7 @@ async fn chat_completions(
     // with an explicit load/unload lifecycle. See dispatch::select's doc
     // for the accepted double-decide() tradeoff this branch makes.
     if let Ok(selected) = dispatch::select_with_affinity_and_ready(
-        &cards,
+        &policy_cards.cards,
         &parsed,
         &prompt,
         affinity_key,
@@ -1007,7 +1606,7 @@ async fn chat_completions(
     // Completing the request body does not cancel it; EOF/reset/shutdown of
     // the actual connection does.
     let selected_for_dispatch = dispatch::select_with_affinity_and_ready(
-        &cards,
+        &policy_cards.cards,
         &parsed,
         &prompt,
         affinity_key,
@@ -1022,7 +1621,7 @@ async fn chat_completions(
         .and_then(|selected| state.runtimes.get(&selected.card.provider.id));
     let budget_ledger = state.budget_ledger.as_deref();
     match dispatch_local(
-        &cards,
+        &policy_cards.cards,
         supervisor,
         budget_ledger,
         &parsed,
@@ -1395,7 +1994,11 @@ async fn record_id_middleware(
 ) -> Response {
     let audit_started = Instant::now();
     let record_id = Uuid::new_v4().to_string();
-    let audit_chat = req.method() == Method::POST && req.uri().path() == "/v1/chat/completions";
+    let audit_inference = req.method() == Method::POST
+        && matches!(
+            req.uri().path(),
+            "/v1/chat/completions" | "/v1/embeddings" | "/v1/rerank" | "/v1/messages"
+        );
     let audit_tenant = audit_tenant_id(&state, req.headers());
     let audit_request_id = audit_header(req.headers(), HEADER_REQUEST_ID, None);
     let audit_privacy = audit_header(req.headers(), "x-idoris-privacy", Some("local_only"));
@@ -1406,7 +2009,7 @@ async fn record_id_middleware(
     if let Ok(value) = HeaderValue::from_str(&record_id) {
         response.headers_mut().insert(HEADER_RECORD_ID, value);
     }
-    if audit_chat {
+    if audit_inference {
         let usage_meta = response
             .extensions()
             .get::<usage::UsageFact>()
@@ -1642,6 +2245,27 @@ fn audit_reason(status: StatusCode, served_locality: bool, degraded: bool) -> St
 mod local_privacy_tests;
 
 #[cfg(test)]
+mod virtual_key_wiring_tests;
+
+#[cfg(test)]
+mod correlation_wiring_tests;
+
+#[cfg(test)]
+mod request_received_wiring_tests;
+
+#[cfg(test)]
+mod profiled_wiring_tests;
+
+#[cfg(test)]
+mod embeddings_wiring_tests;
+
+#[cfg(test)]
+mod rerank_wiring_tests;
+
+#[cfg(test)]
+mod messages_wiring_tests;
+
+#[cfg(test)]
 mod policy_wiring_tests;
 
 #[cfg(test)]
@@ -1704,6 +2328,11 @@ mod tests {
         assert_eq!(parse_port(None).unwrap(), DEFAULT_PORT);
         assert_eq!(parse_port(Some("")).unwrap(), DEFAULT_PORT);
         assert_eq!(parse_port(Some("   ")).unwrap(), DEFAULT_PORT);
+    }
+
+    #[test]
+    fn default_app_state_keeps_event_log_unconfigured() {
+        assert!(AppState::default().event_log.is_none());
     }
 
     #[test]

@@ -93,18 +93,24 @@ impl BoundSupervisor {
 /// Apply the YAML policy before either execution path selects a candidate.
 /// Privacy and deterministic selection remain enforced by the policy pipeline;
 /// `capability` and `load` are metadata until their dedicated tasks wire them.
+#[derive(Debug, Clone)]
+pub struct PolicyCards {
+    pub cards: Vec<ComponentCard>,
+    pub route: crate::routing_policy::RouteDecision,
+}
+
 pub fn policy_cards(
     cards: &[ComponentCard],
     policy: &idoris_contracts::RoutingPolicy,
     profile: &ParsedProfile,
-) -> (Vec<ComponentCard>, bool) {
+) -> PolicyCards {
     let route = crate::routing_policy::decide(policy, &profile.task);
     let cards = cards
         .iter()
         .filter(|card| route.tiers.contains(&card.provider.tier))
         .cloned()
         .collect();
-    (cards, route.fail_closed)
+    PolicyCards { cards, route }
 }
 
 /// Fallback for a card that doesn't declare its own `load_policy` — cards
@@ -817,6 +823,112 @@ mod tests {
             tenant_id: None,
             intent_source: crate::profile::IntentSource::Default,
         }
+    }
+
+    fn tier_card(id: &str, tier: Tier) -> ComponentCard {
+        let mut card = local_card(id);
+        card.provider.tier = tier;
+        card
+    }
+
+    fn routing_policy(yaml: &str) -> idoris_contracts::RoutingPolicy {
+        serde_yaml::from_str(yaml).expect("test routing policy should parse")
+    }
+
+    #[test]
+    fn policy_cards_retains_explicit_rule_decision_and_existing_filtering() {
+        let policy = routing_policy(
+            r#"
+routing_policy:
+  version: 1
+  rules:
+    - if: { intent: banner }
+      then:
+        tiers: [remote, local]
+        fail_closed: false
+        capability: vision
+        load: resident
+  default: { tiers: [lora], fail_closed: false }
+"#,
+        );
+        let mut profile = empty_profile();
+        profile.task.intent = Some("banner".to_string());
+        profile.task.privacy = Some(PrivacyClass::Any);
+        let cards = vec![
+            tier_card("lora", Tier::Lora),
+            tier_card("remote", Tier::Remote),
+            tier_card("local", Tier::Local),
+        ];
+
+        let filtered = policy_cards(&cards, &policy, &profile);
+
+        assert_eq!(
+            filtered
+                .cards
+                .iter()
+                .map(|card| card.provider.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["remote", "local"]
+        );
+        assert_eq!(
+            filtered.route.matched_rule,
+            crate::routing_policy::MatchedRule::Rule(0)
+        );
+        assert_eq!(filtered.route.tiers, vec![Tier::Remote, Tier::Local]);
+        assert!(!filtered.route.fail_closed);
+        assert_eq!(
+            filtered.route.capability,
+            Some(idoris_contracts::common::Capability::Vision)
+        );
+        assert_eq!(filtered.route.load, Some(LoadMode::Resident));
+    }
+
+    #[test]
+    fn policy_cards_retains_privacy_filtered_default_decision() {
+        let policy = routing_policy(
+            r#"
+routing_policy:
+  version: 1
+  rules:
+    - if: { intent: banner }
+      then: { tiers: [remote], fail_closed: false }
+  default:
+    tiers: [remote, lora, local]
+    fail_closed: false
+    capability: coding
+    load: evict_to_load
+"#,
+        );
+        let mut profile = empty_profile();
+        profile.task.intent = Some("chat".to_string());
+        profile.task.privacy = Some(PrivacyClass::LocalOnly);
+        let cards = vec![
+            tier_card("remote", Tier::Remote),
+            tier_card("local", Tier::Local),
+            tier_card("lora", Tier::Lora),
+        ];
+
+        let filtered = policy_cards(&cards, &policy, &profile);
+
+        assert_eq!(
+            filtered
+                .cards
+                .iter()
+                .map(|card| card.provider.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["local", "lora"]
+        );
+        assert_eq!(
+            filtered.route.matched_rule,
+            crate::routing_policy::MatchedRule::Default
+        );
+        assert_eq!(filtered.route.tiers, vec![Tier::Lora, Tier::Local]);
+        assert!(filtered.route.fail_closed);
+        assert_eq!(
+            filtered.route.capability,
+            Some(idoris_contracts::common::Capability::Coding)
+        );
+        assert_eq!(filtered.route.load, Some(LoadMode::EvictToLoad));
     }
 
     #[tokio::test]
