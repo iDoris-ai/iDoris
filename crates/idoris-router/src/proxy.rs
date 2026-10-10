@@ -175,6 +175,21 @@ impl BufferedUpstreamPath {
     };
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct StreamingUpstreamPath {
+    path: &'static str,
+}
+
+impl StreamingUpstreamPath {
+    const CHAT_COMPLETIONS: Self = Self {
+        path: "/v1/chat/completions",
+    };
+
+    pub(crate) const MESSAGES: Self = Self {
+        path: "/v1/messages",
+    };
+}
+
 /// [`ChatProxy::forward_buffered`]'s result.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExecutionDisposition {
@@ -505,8 +520,37 @@ impl ChatProxy {
         body: &Value,
         opts: &ForwardOpts<'_>,
     ) -> ForwardOutcome {
-        self.forward_buffered_path(endpoint, BufferedUpstreamPath::CHAT_COMPLETIONS, body, opts)
-            .await
+        let result = self
+            .forward_buffered_observed(endpoint, body, opts, || async {
+                Ok::<(), std::convert::Infallible>(())
+            })
+            .await;
+        match result {
+            Ok(outcome) => outcome,
+            Err(never) => match never {},
+        }
+    }
+
+    pub(crate) async fn forward_buffered_observed<F, Fut, E>(
+        &self,
+        endpoint: &str,
+        body: &Value,
+        opts: &ForwardOpts<'_>,
+        observer: F,
+    ) -> Result<ForwardOutcome, E>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<(), E>>,
+    {
+        self.forward_buffered_path_with_success_gate_observed(
+            endpoint,
+            BufferedUpstreamPath::CHAT_COMPLETIONS,
+            body,
+            opts,
+            |_| Ok(()),
+            observer,
+        )
+        .await
     }
 
     pub(crate) async fn forward_buffered_path(
@@ -520,22 +564,26 @@ impl ChatProxy {
             .await
     }
 
-    pub(crate) async fn forward_buffered_with_success_gate<F>(
+    pub(crate) async fn forward_buffered_with_success_gate_observed<F, O, Fut, E>(
         &self,
         endpoint: &str,
         body: &Value,
         opts: &ForwardOpts<'_>,
         success_gate: F,
-    ) -> ForwardOutcome
+        observer: O,
+    ) -> Result<ForwardOutcome, E>
     where
         F: FnOnce(&ForwardOutcome) -> Result<(), SuccessFinalizeError> + Send,
+        O: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<(), E>>,
     {
-        self.forward_buffered_path_with_success_gate(
+        self.forward_buffered_path_with_success_gate_observed(
             endpoint,
             BufferedUpstreamPath::CHAT_COMPLETIONS,
             body,
             opts,
             success_gate,
+            observer,
         )
         .await
     }
@@ -551,30 +599,66 @@ impl ChatProxy {
     where
         F: FnOnce(&ForwardOutcome) -> Result<(), SuccessFinalizeError> + Send,
     {
-        // Every caller, including a cache hit or singleflight waiter, owns a
-        // permit until its final outgoing bytes are dropped. Retained results
-        // below stay unbound so the registries cannot hold permits indefinitely.
-        let permit = match self.permits.clone().try_acquire_owned() {
-            Ok(permit) => permit,
-            Err(_) => return Self::failure(503, 0),
-        };
-        let mut outcome = self
-            .forward_buffered_inner(endpoint, path, body, opts, success_gate)
+        let result = self
+            .forward_buffered_path_with_success_gate_observed(
+                endpoint,
+                path,
+                body,
+                opts,
+                success_gate,
+                || async { Ok::<(), std::convert::Infallible>(()) },
+            )
             .await;
-        outcome.body = with_permit(outcome.body, Arc::new(permit));
-        outcome
+        match result {
+            Ok(outcome) => outcome,
+            Err(never) => match never {},
+        }
     }
 
-    async fn forward_buffered_inner<F>(
+    async fn forward_buffered_path_with_success_gate_observed<F, O, Fut, E>(
         &self,
         endpoint: &str,
         path: BufferedUpstreamPath,
         body: &Value,
         opts: &ForwardOpts<'_>,
         success_gate: F,
-    ) -> ForwardOutcome
+        observer: O,
+    ) -> Result<ForwardOutcome, E>
     where
         F: FnOnce(&ForwardOutcome) -> Result<(), SuccessFinalizeError> + Send,
+        O: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<(), E>>,
+    {
+        // The observer is intentionally later than every knowable preflight
+        // exit and earlier than the first reqwest send attempt. It therefore
+        // runs once across retries.
+        // Every caller, including a cache hit or singleflight waiter, owns a
+        // permit until its final outgoing bytes are dropped. Retained results
+        // below stay unbound so the registries cannot hold permits indefinitely.
+        let permit = match self.permits.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => return Ok(Self::failure(503, 0)),
+        };
+        let mut outcome = self
+            .forward_buffered_inner_observed(endpoint, path, body, opts, success_gate, observer)
+            .await?;
+        outcome.body = with_permit(outcome.body, Arc::new(permit));
+        Ok(outcome)
+    }
+
+    async fn forward_buffered_inner_observed<F, O, Fut, E>(
+        &self,
+        endpoint: &str,
+        path: BufferedUpstreamPath,
+        body: &Value,
+        opts: &ForwardOpts<'_>,
+        success_gate: F,
+        observer: O,
+    ) -> Result<ForwardOutcome, E>
+    where
+        F: FnOnce(&ForwardOutcome) -> Result<(), SuccessFinalizeError> + Send,
+        O: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<(), E>>,
     {
         let mut payload = body.clone();
         if path.force_non_stream
@@ -584,15 +668,15 @@ impl ChatProxy {
         }
         // Record ids differ on replay; payload and safety context must not.
         let Ok(fingerprint) = fingerprint(&payload, opts.privacy, opts.served_locality) else {
-            return Self::failure(502, 0);
+            return Ok(Self::failure(502, 0));
         };
         let url = format!("{}{}", endpoint.trim_end_matches('/'), path.path);
         let Some(request_id) = opts.request_id else {
             let mut uncertain = false;
             let outcome = self
-                .forward_once(&url, &payload, opts, &fingerprint, &mut uncertain)
-                .await;
-            return Self::finalize_success(outcome, success_gate).0;
+                .forward_once_observed(&url, &payload, opts, &fingerprint, &mut uncertain, observer)
+                .await?;
+            return Ok(Self::finalize_success(outcome, success_gate).0);
         };
         let key = cache_key(
             opts.tenant_id.unwrap_or("\u{0}personal"),
@@ -602,11 +686,11 @@ impl ChatProxy {
         );
         // A cache hit remains useful even when every flight slot is occupied.
         if let Some(hit) = self.lookup_cached(&key, &fingerprint, opts) {
-            return hit;
+            return Ok(hit);
         }
         let flight = {
             let Ok(mut flights) = self.flights.lock() else {
-                return Self::flight_failure(502, "upstream_unavailable");
+                return Ok(Self::flight_failure(502, "upstream_unavailable"));
             };
             // Successful and uncertain calls stay through the idempotency
             // window, independently of response cache eviction.
@@ -633,15 +717,15 @@ impl ChatProxy {
                     // A successful call may have populated the cache after
                     // the preflight lookup but before this capacity check.
                     if let Some(hit) = self.lookup_cached(&key, &fingerprint, opts) {
-                        return hit;
+                        return Ok(hit);
                     }
-                    return Self::flight_failure(503, "upstream_unavailable");
+                    return Ok(Self::flight_failure(503, "upstream_unavailable"));
                 }
                 let fallback = Self::flight_failure(502, "upstream_unavailable");
                 let base_bytes = Self::flight_base_bytes(key.capacity());
                 let initial_bytes = base_bytes.saturating_add(Self::outcome_bytes(&fallback));
                 if !self.reserve_flight_bytes(initial_bytes) {
-                    return Self::flight_failure(503, "upstream_unavailable");
+                    return Ok(Self::flight_failure(503, "upstream_unavailable"));
                 }
                 let flight = Arc::new(Flight {
                     fingerprint,
@@ -656,7 +740,7 @@ impl ChatProxy {
             }
         };
         if flight.fingerprint != fingerprint {
-            return Self::flight_failure(409, "request_id_conflict");
+            return Ok(Self::flight_failure(409, "request_id_conflict"));
         }
         let mut result = flight.outcome.lock().await;
         if let Some(outcome) = result.as_ref() {
@@ -667,19 +751,27 @@ impl ChatProxy {
                 && !outcome.cached
                 && let Some(hit) = self.lookup_cached(&key, &fingerprint, opts)
             {
-                return hit;
+                return Ok(hit);
             }
             let mut replay = outcome.clone();
             replay.execution = ExecutionDisposition::Replay;
-            return replay;
+            return Ok(replay);
         }
         // If the leader is cancelled, waiting calls fail closed instead of resending.
         *result = Some(Self::flight_failure(502, "upstream_unavailable"));
         let mut cancellation_guard = FlightCancellationGuard::new(Arc::clone(&flight));
         let mut uncertain = false;
-        let outcome = self
-            .forward_once(&url, &payload, opts, &fingerprint, &mut uncertain)
-            .await;
+        let outcome = match self
+            .forward_once_observed(&url, &payload, opts, &fingerprint, &mut uncertain, observer)
+            .await
+        {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                *result = None;
+                cancellation_guard.disarm();
+                return Err(error);
+            }
+        };
         let (outcome, finalize_failed) = Self::finalize_success(outcome, success_gate);
         uncertain |= finalize_failed;
         if !uncertain
@@ -739,7 +831,7 @@ impl ChatProxy {
             cancellation_guard.disarm();
         }
         *result = Some(replay);
-        outcome
+        Ok(outcome)
     }
 
     fn finalize_success<F>(outcome: ForwardOutcome, success_gate: F) -> (ForwardOutcome, bool)
@@ -830,22 +922,29 @@ impl ChatProxy {
         })
     }
 
-    async fn forward_once(
+    async fn forward_once_observed<F, Fut, E>(
         &self,
         url: &str,
         payload: &Value,
         opts: &ForwardOpts<'_>,
         fingerprint: &[u8; 32],
         uncertain: &mut bool,
-    ) -> ForwardOutcome {
+        observer: F,
+    ) -> Result<ForwardOutcome, E>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<(), E>>,
+    {
         let tenant_scope = opts.tenant_id.unwrap_or("\u{0}personal");
 
         if let Some(request_id) = opts.request_id {
             let key = cache_key(tenant_scope, url, opts.provider_id, request_id);
             if let Some(hit) = self.lookup_cached(&key, fingerprint, opts) {
-                return hit;
+                return Ok(hit);
             }
         }
+
+        observer().await?;
 
         let mut attempt = 0usize;
         loop {
@@ -876,11 +975,11 @@ impl ChatProxy {
                         Ok(bytes) => bytes,
                         Err(status) => {
                             *uncertain = true;
-                            return Self::failure_with_execution(
+                            return Ok(Self::failure_with_execution(
                                 status,
                                 retries,
                                 ExecutionDisposition::Uncertain,
-                            );
+                            ));
                         }
                     };
                     if (200..300).contains(&status)
@@ -888,11 +987,11 @@ impl ChatProxy {
                         && crate::budget::parse_openai_usage(&body_bytes).is_err()
                     {
                         *uncertain = true;
-                        return Self::flight_failure_with_execution(
+                        return Ok(Self::flight_failure_with_execution(
                             502,
                             "upstream_usage_invalid",
                             ExecutionDisposition::Uncertain,
-                        );
+                        ));
                     }
                     // Redirects, request timeouts, and 5xx responses do not
                     // prove the POST was not executed; retain their
@@ -907,7 +1006,7 @@ impl ChatProxy {
                     } else {
                         ExecutionDisposition::Executed
                     };
-                    return ForwardOutcome {
+                    return Ok(ForwardOutcome {
                         status,
                         body: body_bytes,
                         content_type,
@@ -916,7 +1015,7 @@ impl ChatProxy {
                         replayed_served_locality: None,
                         retries,
                         execution,
-                    };
+                    });
                 }
                 Ok(Err(err)) => {
                     // A send/read timeout or lost headers may follow an executed POST.
@@ -926,7 +1025,7 @@ impl ChatProxy {
                         continue;
                     }
                     *uncertain = !err.is_connect();
-                    return Self::failure_with_execution(
+                    return Ok(Self::failure_with_execution(
                         if err.is_timeout() { 504 } else { 502 },
                         attempt as u32,
                         if err.is_connect() {
@@ -934,15 +1033,15 @@ impl ChatProxy {
                         } else {
                             ExecutionDisposition::Uncertain
                         },
-                    );
+                    ));
                 }
                 Err(_) => {
                     *uncertain = true;
-                    return Self::failure_with_execution(
+                    return Ok(Self::failure_with_execution(
                         504,
                         attempt as u32,
                         ExecutionDisposition::Uncertain,
-                    );
+                    ));
                 }
             }
         }
@@ -961,16 +1060,73 @@ impl ChatProxy {
     /// outright still gets a plain JSON/text error body, never an SSE
     /// stream carrying an error.
     pub async fn forward_stream(&self, endpoint: &str, body: &Value) -> StreamOutcome {
+        self.forward_stream_path(endpoint, StreamingUpstreamPath::CHAT_COMPLETIONS, body)
+            .await
+    }
+
+    pub(crate) async fn forward_stream_path(
+        &self,
+        endpoint: &str,
+        upstream_path: StreamingUpstreamPath,
+        body: &Value,
+    ) -> StreamOutcome {
+        let result = self
+            .forward_stream_path_observed(endpoint, upstream_path, body, || async {
+                Ok::<(), std::convert::Infallible>(())
+            })
+            .await;
+        match result {
+            Ok(outcome) => outcome,
+            Err(never) => match never {},
+        }
+    }
+
+    // This pre-send seam is consumed by the next stacked Event Log slice.
+    // Keep it available in this independently mergeable preparatory PR.
+    #[allow(dead_code)]
+    pub(crate) async fn forward_stream_observed<F, Fut, E>(
+        &self,
+        endpoint: &str,
+        body: &Value,
+        observer: F,
+    ) -> Result<StreamOutcome, E>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<(), E>>,
+    {
+        self.forward_stream_path_observed(
+            endpoint,
+            StreamingUpstreamPath::CHAT_COMPLETIONS,
+            body,
+            observer,
+        )
+        .await
+    }
+
+    async fn forward_stream_path_observed<F, Fut, E>(
+        &self,
+        endpoint: &str,
+        upstream_path: StreamingUpstreamPath,
+        body: &Value,
+        observer: F,
+    ) -> Result<StreamOutcome, E>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<(), E>>,
+    {
+        // Streaming has one send attempt: observe after permit/payload
+        // preflight and immediately before polling reqwest's send future.
         // Reject immediately rather than accumulate unbounded waiters.
         let Ok(permit) = self.permits.clone().try_acquire_owned() else {
-            return Self::stream_failure(503);
+            return Ok(Self::stream_failure(503));
         };
         let permit = Arc::new(permit);
-        let url = format!("{}/v1/chat/completions", endpoint.trim_end_matches('/'));
+        let url = format!("{}{}", endpoint.trim_end_matches('/'), upstream_path.path);
         let mut payload = body.clone();
         if let Some(obj) = payload.as_object_mut() {
             obj.insert("stream".to_string(), Value::Bool(true));
         }
+        observer().await?;
         let sent = match tokio::time::timeout(
             self.header_timeout,
             self.client.post(&url).json(&payload).send(),
@@ -978,9 +1134,11 @@ impl ChatProxy {
         .await
         {
             Ok(sent) => sent,
-            Err(_) => return Self::stream_failure(504),
+            Err(_) => {
+                return Ok(Self::stream_failure(504));
+            }
         };
-        match sent {
+        Ok(match sent {
             Ok(resp) => {
                 let status = resp.status().as_u16();
                 let content_type = resp
@@ -1130,7 +1288,7 @@ impl ChatProxy {
                 }
             }
             Err(err) => Self::stream_failure(if err.is_timeout() { 504 } else { 502 }),
-        }
+        })
     }
 
     fn stream_failure(status: u16) -> StreamOutcome {
@@ -1193,6 +1351,10 @@ mod slow_reader_tests;
 #[cfg(test)]
 #[path = "proxy_path_tests.rs"]
 mod path_tests;
+
+#[cfg(test)]
+#[path = "proxy_observation_tests.rs"]
+mod observation_tests;
 
 #[cfg(test)]
 mod tests {

@@ -60,6 +60,9 @@ pub mod auth;
 /// aggregation is wired by task33.
 pub mod capabilities;
 pub mod host_facts;
+/// Offline, local-only virtual-key issuance. Plaintext is returned once to
+/// the caller and is never persisted.
+pub mod key_issue;
 /// Stable four-way routing/audit reason taxonomy.
 pub mod reason;
 /// Persistent record/budget storage bootstrap (B1 task18).
@@ -106,7 +109,10 @@ use serde::Serialize;
 use serde_json::json;
 use uuid::Uuid;
 
-use dispatch::{DispatchError, DispatchFailure, Selected, dispatch_local, reason_header_value};
+use dispatch::{
+    DispatchError, DispatchFailure, LocalExecutionContext, ObservedDispatchError, Selected,
+    dispatch_local, dispatch_local_preselected_observed, reason_header_value,
+};
 use profile::{ParsedProfile, ProfileError, parse_profile};
 
 const HEADER_SERVED_LOCALITY: &str = "X-iDoris-Served-Locality";
@@ -180,6 +186,7 @@ pub struct HealthResponse {
     pub contract_version: &'static str,
     pub instance_id: String,
     pub components: usize,
+    pub dev_no_key_enabled: bool,
 }
 
 /// Shared server state. `instance_id` is generated once per process and
@@ -219,6 +226,9 @@ pub struct AppState {
     /// Production installs the persistent B5 verifier. Library tests may
     /// leave this unset to preserve pre-B5 request behavior.
     pub virtual_key_authenticator: Option<auth::VirtualKeyAuthenticator>,
+    /// Explicit loopback-only developer escape hatch. Production startup
+    /// leaves this false unless `IDORIS_DEV_NO_KEY=1` was set once.
+    pub dev_no_key_enabled: bool,
     /// Persistent B6 Event Log capability. This slice only bootstraps and
     /// carries the handle; request event emission is wired separately.
     pub event_log: Option<Arc<idoris_tenancy::event_log::EventLogStore>>,
@@ -269,6 +279,7 @@ impl std::fmt::Debug for AppState {
                     .as_ref()
                     .map(|_| "configured"),
             )
+            .field("dev_no_key_enabled", &self.dev_no_key_enabled)
             .field(
                 "audit_failures",
                 &self.audit_failures.load(Ordering::Relaxed),
@@ -311,6 +322,7 @@ impl Default for AppState {
             budget_ledger: None,
             record_store: None,
             virtual_key_authenticator: None,
+            dev_no_key_enabled: false,
             event_log: None,
             audit_failures: Arc::new(AtomicU64::new(0)),
             models_health: Arc::new(health::HealthTracker::default()),
@@ -338,6 +350,10 @@ pub fn build_app(state: AppState) -> Router {
         .route(
             "/idoris/tenants/{tenant_id}/audit",
             get(get_tenant_audit).fallback(not_found),
+        )
+        .route(
+            "/idoris/tenants/{tenant_id}/requests/{record_id}",
+            get(get_request_events).fallback(not_found),
         )
         .route(
             "/idoris/tenants/{tenant_id}/budget",
@@ -648,19 +664,20 @@ async fn messages(
             "request body must be a JSON object",
         );
     };
-    if let Some(stream) = object.get("stream") {
-        match stream.as_bool() {
-            Some(false) => {}
-            Some(true) | None => {
+    let stream_requested = match object.get("stream") {
+        None => false,
+        Some(stream) => match stream.as_bool() {
+            Some(value) => value,
+            None => {
                 return error_envelope_with_reason(
                     StatusCode::BAD_REQUEST,
                     "unsupported_field",
                     "unsupported_stream",
-                    "streaming /v1/messages is not supported by this endpoint yet",
+                    "stream must be a boolean",
                 );
             }
-        }
-    }
+        },
+    };
     let model = object.get("model").and_then(serde_json::Value::as_str);
     let mut parsed = match parse_profile(&headers, model, state.deploy_mode) {
         Ok(parsed) => parsed,
@@ -708,6 +725,10 @@ async fn messages(
             );
         }
     };
+
+    if stream_requested {
+        return messages_stream(&state, &selected, &value).await;
+    }
 
     let opts = proxy::ForwardOpts {
         request_id: headers
@@ -765,6 +786,71 @@ async fn messages(
             .insert(usage::UsageFact::inference(Some(0)));
     }
     response
+}
+
+async fn messages_stream(
+    state: &AppState,
+    selected: &Selected,
+    body_value: &serde_json::Value,
+) -> Response {
+    match state
+        .proxy
+        .forward_stream_path(
+            &selected.card.endpoint,
+            proxy::StreamingUpstreamPath::MESSAGES,
+            body_value,
+        )
+        .await
+    {
+        proxy::StreamOutcome::Buffered {
+            status,
+            body,
+            content_type,
+        } => {
+            let status = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
+            let mut response = (status, body).into_response();
+            let content_type = content_type.as_deref().unwrap_or("application/json");
+            if let Ok(value) = HeaderValue::from_str(content_type) {
+                response
+                    .headers_mut()
+                    .insert(axum::http::header::CONTENT_TYPE, value);
+            }
+            if let Ok(value) = HeaderValue::from_str(locality_str(selected.served_locality)) {
+                response.headers_mut().insert(HEADER_SERVED_LOCALITY, value);
+            }
+            response
+        }
+        proxy::StreamOutcome::Stream {
+            status,
+            content_type,
+            response: upstream,
+        } => {
+            let status = StatusCode::from_u16(status).unwrap_or(StatusCode::OK);
+            let body = Body::from_stream(sse::ensure_event_terminated(
+                upstream.into_data_stream(),
+                b"message_stop",
+            ));
+            let mut response = Response::builder()
+                .status(status)
+                .body(body)
+                .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+            let content_type = content_type.as_deref().unwrap_or("text/event-stream");
+            if let Ok(value) = HeaderValue::from_str(content_type) {
+                response
+                    .headers_mut()
+                    .insert(axum::http::header::CONTENT_TYPE, value);
+            }
+            if let Ok(value) = HeaderValue::from_str(locality_str(selected.served_locality)) {
+                response.headers_mut().insert(HEADER_SERVED_LOCALITY, value);
+            }
+            if status.is_success() {
+                response
+                    .extensions_mut()
+                    .insert(usage::UsageFact::inference(Some(0)));
+            }
+            response
+        }
+    }
 }
 
 async fn get_tenant_usage(
@@ -890,6 +976,57 @@ async fn get_tenant_audit(
     }
 }
 
+async fn get_request_events(
+    State(state): State<Arc<AppState>>,
+    Path((tenant_id, record_id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Response {
+    let scope_tenant = query_scope_header(&headers).map(str::to_string);
+    if scope_tenant.as_deref() != Some(tenant_id.as_str()) {
+        return error_envelope(
+            StatusCode::BAD_REQUEST,
+            "invalid_tenant_scope",
+            "request event query requires matching X-iDoris-Tenant",
+        );
+    }
+    let Some(event_log) = state.event_log.clone() else {
+        return event_log_query_unavailable_response();
+    };
+    let result = tokio::task::spawn_blocking(move || {
+        queries::event_log::query_request_events(
+            &event_log,
+            &tenant_id,
+            scope_tenant.as_deref(),
+            &record_id,
+        )
+    })
+    .await;
+    match result {
+        Ok(Ok(events)) => Json(events).into_response(),
+        Ok(Err(
+            err @ (queries::event_log::RequestEventsQueryError::ScopeRequired
+            | queries::event_log::RequestEventsQueryError::ScopeMismatch),
+        )) => error_envelope(
+            StatusCode::BAD_REQUEST,
+            "invalid_tenant_scope",
+            err.to_string(),
+        ),
+        Ok(Err(queries::event_log::RequestEventsQueryError::InvalidRecordId)) => error_envelope(
+            StatusCode::BAD_REQUEST,
+            "invalid_record_id",
+            "record_id is invalid",
+        ),
+        Ok(Err(queries::event_log::RequestEventsQueryError::NotFound)) => error_envelope(
+            StatusCode::NOT_FOUND,
+            "request_not_found",
+            "request record was not found",
+        ),
+        Ok(Err(queries::event_log::RequestEventsQueryError::EventLog(_))) | Err(_) => {
+            event_log_query_unavailable_response()
+        }
+    }
+}
+
 async fn get_tenant_budget(
     State(state): State<Arc<AppState>>,
     Path(tenant_id): Path<String>,
@@ -1005,6 +1142,7 @@ async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         contract_version: idoris_contracts::CONTRACT_VERSION,
         instance_id: state.instance_id.clone(),
         components: state.cards.len(),
+        dev_no_key_enabled: state.dev_no_key_enabled,
     })
 }
 
@@ -1241,6 +1379,15 @@ fn virtual_key_scope_response(error: auth::VirtualKeyScopeError) -> Response {
     )
 }
 
+fn dev_no_key_scope_response() -> Response {
+    error_envelope_with_reason(
+        StatusCode::FORBIDDEN,
+        "policy_violation",
+        "DEV_NO_KEY_SCOPE_FORBIDDEN",
+        "developer no-key mode permits only free loopback local_only requests",
+    )
+}
+
 fn correlation_error_response(error: correlation::CorrelationError) -> Response {
     error_envelope_with_reason(
         StatusCode::BAD_REQUEST,
@@ -1255,6 +1402,15 @@ fn event_log_unavailable_response() -> Response {
         StatusCode::SERVICE_UNAVAILABLE,
         "event_log_unavailable",
         "EVENT_LOG_APPEND_UNAVAILABLE",
+        "event log unavailable",
+    )
+}
+
+fn event_log_query_unavailable_response() -> Response {
+    error_envelope_with_reason(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "event_log_unavailable",
+        "EVENT_LOG_QUERY_UNAVAILABLE",
         "event log unavailable",
     )
 }
@@ -1337,6 +1493,200 @@ async fn append_profiled(
     run_event_log_write(move || store.append(Some(&tenant_id), &event).map(|_| ())).await
 }
 
+fn event_reason_code(reason: &idoris_policy::ReasonCode) -> String {
+    match reason {
+        idoris_policy::ReasonCode::PrivacyLoopbackOnly => "privacy_loopback_only".to_string(),
+        idoris_policy::ReasonCode::PrivacyTightenedByContent => {
+            "privacy_tightened_by_content".to_string()
+        }
+        idoris_policy::ReasonCode::RoleMatched(role) => {
+            format!("role_matched:{}", role.as_str())
+        }
+        idoris_policy::ReasonCode::RoleFallbackCapabilityOnly => {
+            "role_fallback_capability_only".to_string()
+        }
+        idoris_policy::ReasonCode::PriceUnknownExcluded => "price_unknown_excluded".to_string(),
+        idoris_policy::ReasonCode::BudgetWithinLimit => "budget_within_limit".to_string(),
+        idoris_policy::ReasonCode::BudgetNoTenantContext => "budget_no_tenant_context".to_string(),
+        idoris_policy::ReasonCode::BudgetFallbackToFreeCandidate => {
+            "budget_fallback_to_free_candidate".to_string()
+        }
+        idoris_policy::ReasonCode::AdmissionReady => "admission_ready".to_string(),
+        idoris_policy::ReasonCode::AdmissionRequiresEviction => {
+            "admission_requires_eviction".to_string()
+        }
+    }
+}
+
+async fn append_decided(
+    store: Arc<idoris_tenancy::event_log::EventLogStore>,
+    tenant_id: String,
+    record_id: String,
+    correlation: &correlation::RequestCorrelation,
+    route: &routing_policy::RouteDecision,
+    selected: Option<&Selected>,
+    rejection_reason: Option<&str>,
+) -> Result<(), ()> {
+    let mut metadata = std::collections::BTreeMap::new();
+    let rule_id = match route.matched_rule {
+        routing_policy::MatchedRule::Rule(index) => format!("rule:{index}"),
+        routing_policy::MatchedRule::Default => "default".to_string(),
+    };
+    metadata.insert("rule_id".to_string(), json!(rule_id));
+    match selected {
+        Some(selected) => {
+            metadata.insert("status".to_string(), json!("selected"));
+            metadata.insert(
+                "provider_id".to_string(),
+                json!(selected.card.provider.id.as_str()),
+            );
+            metadata.insert("tier".to_string(), json!(selected.card.provider.tier));
+            metadata.insert(
+                "served_locality".to_string(),
+                json!(selected.served_locality),
+            );
+            metadata.insert(
+                "degraded".to_string(),
+                json!(selected.decision.is_degraded()),
+            );
+            if !selected.decision.reason_codes.is_empty() {
+                let reason_codes = selected
+                    .decision
+                    .reason_codes
+                    .iter()
+                    .map(event_reason_code)
+                    .collect::<Vec<_>>();
+                metadata.insert("reason_codes".to_string(), json!(reason_codes));
+            }
+        }
+        None => {
+            metadata.insert("status".to_string(), json!("rejected"));
+            metadata.insert(
+                "reason".to_string(),
+                json!(rejection_reason.unwrap_or("no_candidate")),
+            );
+        }
+    }
+    let ts_utc_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_millis()).ok())
+        .ok_or(())?;
+    let event = idoris_tenancy::event_log::NewEvent {
+        event_id: Uuid::new_v4().to_string(),
+        tenant_id: tenant_id.clone(),
+        record_id,
+        event_type: idoris_tenancy::event_log::EventType::Decided,
+        ts_utc_ms,
+        request_id: None,
+        session_id: correlation.session_id.clone(),
+        trace_id: correlation.trace_id.clone(),
+        parent_id: correlation.parent_id.clone(),
+        origin_record_id: None,
+        metadata,
+    };
+    run_event_log_write(move || store.append(Some(&tenant_id), &event).map(|_| ())).await
+}
+
+#[derive(Clone)]
+pub(crate) struct BudgetReservedEventContext {
+    event_log: Arc<idoris_tenancy::event_log::EventLogStore>,
+    tenant_id: String,
+    record_id: String,
+    correlation: correlation::RequestCorrelation,
+}
+
+pub(crate) async fn append_budget_reserved(
+    context: &BudgetReservedEventContext,
+    selected: &Selected,
+) -> Result<(), ()> {
+    if !budget::is_paid(Some(selected.estimated_cost_minor)) {
+        return Ok(());
+    }
+    let mut metadata = std::collections::BTreeMap::new();
+    metadata.insert(
+        "reserved_minor".to_string(),
+        json!(selected.estimated_cost_minor),
+    );
+    metadata.insert(
+        "provider_id".to_string(),
+        json!(selected.card.provider.id.as_str()),
+    );
+    let ts_utc_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_millis()).ok())
+        .ok_or(())?;
+    let event = idoris_tenancy::event_log::NewEvent {
+        event_id: Uuid::new_v4().to_string(),
+        tenant_id: context.tenant_id.clone(),
+        record_id: context.record_id.clone(),
+        event_type: idoris_tenancy::event_log::EventType::BudgetReserved,
+        ts_utc_ms,
+        request_id: None,
+        session_id: context.correlation.session_id.clone(),
+        trace_id: context.correlation.trace_id.clone(),
+        parent_id: context.correlation.parent_id.clone(),
+        origin_record_id: None,
+        metadata,
+    };
+    let store = context.event_log.clone();
+    let tenant_id = context.tenant_id.clone();
+    run_event_log_write(move || store.append(Some(&tenant_id), &event).map(|_| ())).await
+}
+
+#[derive(Clone)]
+struct DispatchedEventContext {
+    event_log: Arc<idoris_tenancy::event_log::EventLogStore>,
+    tenant_id: String,
+    record_id: String,
+    correlation: correlation::RequestCorrelation,
+}
+
+/// Persist the proxy-side dispatch-attempt fact.
+///
+/// `dispatched` means the router passed every knowable local/preflight gate
+/// and durably committed to the first real upstream send attempt. It does NOT
+/// prove TCP connected, request bytes reached the peer, or upstream execution
+/// occurred; an exhausted connect failure may therefore still finish as
+/// `ExecutionDisposition::NotExecuted` after this event exists.
+async fn append_dispatched(
+    context: &DispatchedEventContext,
+    selected: &Selected,
+) -> Result<(), ()> {
+    let mut metadata = std::collections::BTreeMap::new();
+    metadata.insert("status".to_string(), json!("attempted"));
+    metadata.insert(
+        "provider_id".to_string(),
+        json!(selected.card.provider.id.as_str()),
+    );
+    metadata.insert(
+        "served_locality".to_string(),
+        json!(selected.served_locality),
+    );
+    let ts_utc_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_millis()).ok())
+        .ok_or(())?;
+    let event = idoris_tenancy::event_log::NewEvent {
+        event_id: Uuid::new_v4().to_string(),
+        tenant_id: context.tenant_id.clone(),
+        record_id: context.record_id.clone(),
+        event_type: idoris_tenancy::event_log::EventType::Dispatched,
+        ts_utc_ms,
+        request_id: None,
+        session_id: context.correlation.session_id.clone(),
+        trace_id: context.correlation.trace_id.clone(),
+        parent_id: context.correlation.parent_id.clone(),
+        origin_record_id: None,
+        metadata,
+    };
+    let store = context.event_log.clone();
+    let tenant_id = context.tenant_id.clone();
+    run_event_log_write(move || store.append(Some(&tenant_id), &event).map(|_| ())).await
+}
+
 /// `POST /v1/chat/completions`. Order (locked by conformance): non-JSON
 /// body -> `invalid_json`; valid JSON that isn't an object -> `invalid_body`;
 /// only then are control-plane headers parsed (see [`profile::parse_profile`]).
@@ -1402,7 +1752,13 @@ async fn chat_completions(
         None
     };
 
-    if let Some(authenticator) = &state.virtual_key_authenticator {
+    let authorization_present = headers.contains_key(axum::http::header::AUTHORIZATION);
+    let dev_no_key_request = state.dev_no_key_enabled && !authorization_present;
+    if dev_no_key_request {
+        if parsed.task.privacy.unwrap_or(PrivacyClass::LocalOnly) != PrivacyClass::LocalOnly {
+            return dev_no_key_scope_response();
+        }
+    } else if let Some(authenticator) = &state.virtual_key_authenticator {
         let identity = match authenticator.authenticate(&headers).await {
             Ok(identity) => identity,
             Err(_) => return virtual_key_unauthorized_response(),
@@ -1410,14 +1766,16 @@ async fn chat_completions(
         if let Err(error) = auth::enforce_scope(&identity, &parsed) {
             return virtual_key_scope_response(error);
         }
+    } else if state.dev_no_key_enabled && authorization_present {
+        return virtual_key_unauthorized_response();
     }
 
     let messages = extract_messages(object);
     let parsed = intent::resolve_profile(parsed, &messages).await;
-    if let Some((event_log, tenant_id)) = event_context
+    if let Some((event_log, tenant_id)) = event_context.as_ref()
         && append_profiled(
-            event_log,
-            tenant_id,
+            event_log.clone(),
+            tenant_id.clone(),
             record_id.clone(),
             &correlation,
             &parsed,
@@ -1427,6 +1785,24 @@ async fn chat_completions(
     {
         return event_log_unavailable_response();
     }
+    let budget_event_context =
+        event_context
+            .as_ref()
+            .map(|(event_log, tenant_id)| BudgetReservedEventContext {
+                event_log: event_log.clone(),
+                tenant_id: tenant_id.clone(),
+                record_id: record_id.clone(),
+                correlation: correlation.clone(),
+            });
+    let dispatched_event_context =
+        event_context
+            .as_ref()
+            .map(|(event_log, tenant_id)| DispatchedEventContext {
+                event_log: event_log.clone(),
+                tenant_id: tenant_id.clone(),
+                record_id: record_id.clone(),
+                correlation: correlation.clone(),
+            });
     let prompt = messages
         .iter()
         .map(|m| m.content.as_str())
@@ -1435,6 +1811,26 @@ async fn chat_completions(
 
     let policy_cards = dispatch::policy_cards(&state.cards, &state.routing_policy, &parsed);
     if policy_cards.cards.is_empty() {
+        let reason = if policy_cards.route.fail_closed {
+            "local_only_unavailable"
+        } else {
+            "no_candidate"
+        };
+        if let Some((event_log, tenant_id)) = event_context.as_ref()
+            && append_decided(
+                event_log.clone(),
+                tenant_id.clone(),
+                record_id.clone(),
+                &correlation,
+                &policy_cards.route,
+                None,
+                Some(reason),
+            )
+            .await
+            .is_err()
+        {
+            return event_log_unavailable_response();
+        }
         return if policy_cards.route.fail_closed {
             rejection_response(idoris_policy::Rejection::LocalOnlyUnavailable)
         } else {
@@ -1446,13 +1842,42 @@ async fn chat_completions(
         };
     }
 
+    let selection = dispatch::select(&policy_cards.cards, &parsed, &prompt);
+    let rejection_reason = match &selection {
+        Ok(_) => None,
+        Err(DispatchError::Rejection(rejection)) => Some(rejection.error_type()),
+        Err(DispatchError::Internal(_)) => Some("internal_error"),
+    };
+    if let Some((event_log, tenant_id)) = event_context.as_ref()
+        && append_decided(
+            event_log.clone(),
+            tenant_id.clone(),
+            record_id.clone(),
+            &correlation,
+            &policy_cards.route,
+            selection.as_ref().ok(),
+            rejection_reason,
+        )
+        .await
+        .is_err()
+    {
+        return event_log_unavailable_response();
+    }
+
     // R2-G: a Resident-mode http_service candidate (a generic
     // OpenAI-compatible backend, including a conformance fixture pointing
     // at a fake upstream) is forwarded directly -- never through the
     // Supervisor, which only makes sense for a real oMLX-shaped backend
     // with an explicit load/unload lifecycle. See dispatch::select's doc
     // for the accepted double-decide() tradeoff this branch makes.
-    if let Ok(selected) = dispatch::select(&policy_cards.cards, &parsed, &prompt) {
+    if let Ok(selected) = &selection {
+        if dev_no_key_request
+            && (selected.served_locality != idoris_contracts::provider::Locality::Loopback
+                || selected.card.provider.cost.input_per_m != 0.0
+                || selected.card.provider.cost.output_per_m != 0.0)
+        {
+            return dev_no_key_scope_response();
+        }
         // A present model field must be a non-empty string before any
         // selected backend can execute. Keep selection first so the
         // established error still carries the selected locality/reasons.
@@ -1488,7 +1913,7 @@ async fn chat_completions(
                 .privacy
                 .unwrap_or(idoris_contracts::common::PrivacyClass::LocalOnly);
             return match subscription::dispatch::dispatch_selected(
-                &selected,
+                selected,
                 privacy,
                 lifecycle.peer(),
                 &state.subscriptions,
@@ -1533,7 +1958,17 @@ async fn chat_completions(
             };
         }
         if dispatch::is_resident_http_service(&selected.card) {
-            return chat_via_proxy(&state, &selected, &headers, &parsed, &value, &record_id).await;
+            return chat_via_proxy(
+                &state,
+                selected,
+                &headers,
+                &parsed,
+                &value,
+                &record_id,
+                dispatched_event_context.as_ref(),
+                budget_event_context.as_ref(),
+            )
+            .await;
         }
         if let Err(message) = supervisor_stream::validate(object) {
             let mut response = error_envelope_with_reason(
@@ -1566,7 +2001,7 @@ async fn chat_completions(
     // The request token is a fresh child of this TCP connection's lifetime.
     // Completing the request body does not cancel it; EOF/reset/shutdown of
     // the actual connection does.
-    let selected_for_dispatch = dispatch::select(&policy_cards.cards, &parsed, &prompt).ok();
+    let selected_for_dispatch = selection.ok();
     let selected_estimated_cost = selected_for_dispatch
         .as_ref()
         .map(|selected| selected.estimated_cost_minor);
@@ -1574,17 +2009,36 @@ async fn chat_completions(
         .as_ref()
         .and_then(|selected| state.runtimes.get(&selected.card.provider.id));
     let budget_ledger = state.budget_ledger.as_deref();
-    match dispatch_local(
-        &policy_cards.cards,
-        supervisor,
-        budget_ledger,
-        &parsed,
-        dispatch::DispatchInput::with_model(model, &prompt),
-        messages,
-        lifecycle.cancellation_token(),
-    )
-    .await
-    {
+    let dispatch_result = if let Some(selected) = selected_for_dispatch.as_ref() {
+        match dispatch_local_preselected_observed(
+            selected,
+            LocalExecutionContext::new(supervisor, budget_ledger, budget_event_context.as_ref()),
+            &parsed,
+            dispatch::DispatchInput::with_model(model, &prompt),
+            messages,
+            lifecycle.cancellation_token(),
+        )
+        .await
+        {
+            Ok(outcome) => Ok(outcome),
+            Err(ObservedDispatchError::Dispatch(error)) => Err(error),
+            Err(ObservedDispatchError::EventLogUnavailable) => {
+                return event_log_unavailable_response();
+            }
+        }
+    } else {
+        dispatch_local(
+            &policy_cards.cards,
+            supervisor,
+            budget_ledger,
+            &parsed,
+            dispatch::DispatchInput::with_model(model, &prompt),
+            messages,
+            lifecycle.cancellation_token(),
+        )
+        .await
+    };
+    match dispatch_result {
         Err(DispatchError::Rejection(rejection)) => rejection_response(rejection),
         Err(DispatchError::Internal(message)) => {
             error_envelope(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", message)
@@ -1628,6 +2082,7 @@ async fn chat_completions(
 /// body + its own `content-type`) — **never** re-wrapped into
 /// [`openai_chat_completion`]'s shape, matching `proxy.ts`'s own behavior:
 /// a transparent proxy, not a backend `RuntimeAdapter` call.
+#[allow(clippy::too_many_arguments)]
 async fn chat_via_proxy(
     state: &AppState,
     selected: &Selected,
@@ -1635,6 +2090,8 @@ async fn chat_via_proxy(
     parsed: &ParsedProfile,
     body_value: &serde_json::Value,
     record_id: &str,
+    dispatched_event: Option<&DispatchedEventContext>,
+    budget_event_context: Option<&BudgetReservedEventContext>,
 ) -> Response {
     let mut reservation = match dispatch::ReservationGuard::reserve(
         state.budget_ledger.as_deref(),
@@ -1668,8 +2125,14 @@ async fn chat_via_proxy(
             "付费流式直连尚不支持可信 usage 结算，请使用非流式请求或支持结算的后端",
         );
     }
+    if is_paid
+        && let Some(context) = budget_event_context
+        && append_budget_reserved(context, selected).await.is_err()
+    {
+        return event_log_unavailable_response();
+    }
     if stream_requested {
-        return chat_via_proxy_stream(state, selected, body_value).await;
+        return chat_via_proxy_stream(state, selected, body_value, dispatched_event).await;
     }
     chat_via_proxy_buffered(
         state,
@@ -1678,6 +2141,7 @@ async fn chat_via_proxy(
         parsed,
         body_value,
         record_id,
+        dispatched_event,
         &mut reservation,
     )
     .await
@@ -1690,12 +2154,21 @@ async fn chat_via_proxy_stream(
     state: &AppState,
     selected: &Selected,
     body_value: &serde_json::Value,
+    dispatched_event: Option<&DispatchedEventContext>,
 ) -> Response {
-    match state
+    let outcome = state
         .proxy
-        .forward_stream(&selected.card.endpoint, body_value)
-        .await
-    {
+        .forward_stream_observed(&selected.card.endpoint, body_value, || async {
+            if let Some(context) = dispatched_event {
+                append_dispatched(context, selected).await?;
+            }
+            Ok::<(), ()>(())
+        })
+        .await;
+    let Ok(outcome) = outcome else {
+        return event_log_unavailable_response();
+    };
+    match outcome {
         proxy::StreamOutcome::Buffered {
             status,
             body,
@@ -1754,6 +2227,7 @@ fn terminated_proxy_body(upstream: Body) -> Body {
 
 /// The non-streaming half of [`chat_via_proxy`] (this PR's predecessor —
 /// idempotency cache read/write, `X-iDoris-Cached`/`X-iDoris-Origin-Record-Id`).
+#[allow(clippy::too_many_arguments)]
 async fn chat_via_proxy_buffered(
     state: &AppState,
     selected: &Selected,
@@ -1761,6 +2235,7 @@ async fn chat_via_proxy_buffered(
     parsed: &ParsedProfile,
     body_value: &serde_json::Value,
     record_id: &str,
+    dispatched_event: Option<&DispatchedEventContext>,
     reservation: &mut dispatch::ReservationGuard<'_>,
 ) -> Response {
     let is_paid = budget::is_paid(Some(selected.estimated_cost_minor));
@@ -1785,7 +2260,7 @@ async fn chat_via_proxy_buffered(
     let outcome = if is_paid {
         state
             .proxy
-            .forward_buffered_with_success_gate(
+            .forward_buffered_with_success_gate_observed(
                 &selected.card.endpoint,
                 body_value,
                 &opts,
@@ -1822,13 +2297,27 @@ async fn chat_via_proxy_buffered(
                         )),
                     }
                 },
+                || async {
+                    if let Some(context) = dispatched_event {
+                        append_dispatched(context, selected).await?;
+                    }
+                    Ok::<(), ()>(())
+                },
             )
             .await
     } else {
         state
             .proxy
-            .forward_buffered(&selected.card.endpoint, body_value, &opts)
+            .forward_buffered_observed(&selected.card.endpoint, body_value, &opts, || async {
+                if let Some(context) = dispatched_event {
+                    append_dispatched(context, selected).await?;
+                }
+                Ok::<(), ()>(())
+            })
             .await
+    };
+    let Ok(outcome) = outcome else {
+        return event_log_unavailable_response();
     };
 
     if is_paid {
@@ -2209,6 +2698,18 @@ mod request_received_wiring_tests;
 mod profiled_wiring_tests;
 
 #[cfg(test)]
+mod decided_wiring_tests;
+
+#[cfg(test)]
+mod budget_reserved_wiring_tests;
+
+#[cfg(test)]
+mod dispatched_wiring_tests;
+
+#[cfg(test)]
+mod request_event_query_tests;
+
+#[cfg(test)]
 mod embeddings_wiring_tests;
 
 #[cfg(test)]
@@ -2216,6 +2717,9 @@ mod rerank_wiring_tests;
 
 #[cfg(test)]
 mod messages_wiring_tests;
+
+#[cfg(test)]
+mod protocol_stream_path_tests;
 
 #[cfg(test)]
 mod policy_wiring_tests;
