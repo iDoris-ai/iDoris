@@ -133,6 +133,7 @@ impl RuntimeRegistry {
                 .map(|bound| (bound.provider_id().to_string(), bound))
                 .collect(),
             startup_capacity: None,
+            ready_snapshot_calls: Arc::default(),
         }
     }
 
