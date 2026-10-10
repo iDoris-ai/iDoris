@@ -9,6 +9,7 @@ const MAX_STRING_UTF16_UNITS: usize = 500;
 const MAX_ARRAY_ITEMS: usize = 32;
 const SCALAR_KEYS: &str = "component,intent,privacy,tier,provider_id,model_id,tokens_in,tokens_out,cost_minor,latency_ms,status,reason,rule_id,served_locality,degraded,cached,reserved_minor,settled_minor,price_version,rating,outcome,failure_mode,sensitivity,training_eligible";
 const ARRAY_KEYS: &str = "reason_codes,labels";
+const OBJECT_ARRAY_KEYS: &str = "rubric";
 const CONTENT_KEYS: &str = "prompt,prompts,input,inputs,content,contents,text,texts,body,messages,message,response,responses,output,outputs,completion,completions,corrected_output,query,answer,raw,data";
 
 macro_rules! event_types {
@@ -49,6 +50,14 @@ pub struct EventLogEvent {
     pub event: NewEvent,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct EventLogQuery<'a> {
+    pub from_ts_utc_ms: Option<i64>,
+    pub to_ts_utc_ms: Option<i64>,
+    pub record_id: Option<&'a str>,
+    pub limit: usize,
+}
+
 #[derive(Debug, Error)]
 pub enum EventLogError {
     #[error("tenant scope is required")]
@@ -59,6 +68,8 @@ pub enum EventLogError {
     InvalidEventId,
     #[error("record_id is required")]
     InvalidRecordId,
+    #[error("event log query limit must be positive")]
+    InvalidLimit,
     #[error("invalid identifier field {0}")]
     InvalidIdentifier(&'static str),
     #[error("event timestamp must be non-negative")]
@@ -136,6 +147,46 @@ impl EventLogStore {
         let rows = stmt.query_map(rusqlite::params![scope, record_id], raw_event)?;
         rows.map(|row| decode(row?)).collect()
     }
+
+    pub fn events_for_tenant(
+        &self,
+        scope: Option<&str>,
+        query: &EventLogQuery<'_>,
+    ) -> Result<Vec<EventLogEvent>, EventLogError> {
+        let scope = required_scope(scope)?;
+        if let Some(record_id) = query.record_id {
+            if record_id.trim().is_empty() {
+                return Err(EventLogError::InvalidRecordId);
+            }
+            validate_id("record_id", record_id)?;
+        }
+        let limit = i64::try_from(query.limit).map_err(|_| EventLogError::InvalidLimit)?;
+        if limit <= 0 {
+            return Err(EventLogError::InvalidLimit);
+        }
+        let conn = self.0.lock().map_err(|_| EventLogError::LockPoisoned)?;
+        let mut stmt = conn.prepare(
+            "SELECT sequence,event_id,tenant_id,record_id,event_type,ts_utc_ms,request_id,session_id,trace_id,parent_id,origin_record_id,metadata \
+             FROM event_log_events \
+             WHERE tenant_id=?1 \
+               AND (?2 IS NULL OR ts_utc_ms>=?2) \
+               AND (?3 IS NULL OR ts_utc_ms<?3) \
+               AND (?4 IS NULL OR record_id=?4) \
+             ORDER BY sequence \
+             LIMIT ?5",
+        )?;
+        let rows = stmt.query_map(
+            rusqlite::params![
+                scope,
+                query.from_ts_utc_ms,
+                query.to_ts_utc_ms,
+                query.record_id,
+                limit
+            ],
+            raw_event,
+        )?;
+        rows.map(|row| decode(row?)).collect()
+    }
 }
 
 fn required_scope(scope: Option<&str>) -> Result<&str, EventLogError> {
@@ -192,14 +243,36 @@ fn validate_id(field: &'static str, value: &str) -> Result<(), EventLogError> {
 
 fn validate_metadata(metadata: &BTreeMap<String, Value>) -> Result<(), EventLogError> {
     for (key, value) in metadata {
-        if key_in(CONTENT_KEYS, key) || !key_in(SCALAR_KEYS, key) && !key_in(ARRAY_KEYS, key) {
+        if key_in(CONTENT_KEYS, key)
+            || !key_in(SCALAR_KEYS, key)
+                && !key_in(ARRAY_KEYS, key)
+                && !key_in(OBJECT_ARRAY_KEYS, key)
+        {
             return Err(EventLogError::InvalidMetadata(key.clone()));
         }
         let valid_string = |text: &str| {
             text.encode_utf16().count() <= MAX_STRING_UTF16_UNITS
                 && !text.chars().any(char::is_control)
         };
-        if key_in(ARRAY_KEYS, key) {
+        if key_in(OBJECT_ARRAY_KEYS, key) {
+            let ok = value.as_array().is_some_and(|items| {
+                items.len() <= MAX_ARRAY_ITEMS
+                    && items.iter().all(|item| {
+                        let Some(object) = item.as_object() else {
+                            return false;
+                        };
+                        object.len() == 2
+                            && object
+                                .get("id")
+                                .and_then(Value::as_str)
+                                .is_some_and(|id| !id.trim().is_empty() && valid_string(id))
+                            && object.get("pass").is_some_and(Value::is_boolean)
+                    })
+            });
+            if !ok {
+                return Err(EventLogError::InvalidMetadata(key.clone()));
+            }
+        } else if key_in(ARRAY_KEYS, key) {
             let ok = value.as_array().is_some_and(|items| {
                 items.len() <= MAX_ARRAY_ITEMS
                     && items.iter().all(|v| v.as_str().is_some_and(valid_string))

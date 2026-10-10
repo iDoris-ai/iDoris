@@ -69,6 +69,7 @@ pub mod reason;
 pub mod storage;
 mod usage;
 
+mod feedback;
 /// Direct HTTP forwarding for a generic `http_service` component card's
 /// `POST /v1/chat/completions` (R2-G) — retries, idempotency cache; wired
 /// into `chat_completions`/`AppState` below (see the module's own doc for
@@ -363,6 +364,7 @@ pub fn build_app(state: AppState) -> Router {
             "/v1/chat/completions",
             post(chat_completions).fallback(not_found),
         )
+        .route("/v1/feedback", post(post_feedback).fallback(not_found))
         .route("/v1/embeddings", post(embeddings).fallback(not_found))
         .route("/v1/rerank", post(rerank).fallback(not_found))
         .route("/v1/messages", post(messages).fallback(not_found))
@@ -375,6 +377,72 @@ pub fn build_app(state: AppState) -> Router {
             record_id_middleware,
         ))
         .with_state(state)
+}
+
+async fn post_feedback(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Result<Json<feedback::FeedbackRequest>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let Json(request) = match body {
+        Ok(body) => body,
+        Err(_) => {
+            return error_envelope(
+                StatusCode::BAD_REQUEST,
+                "invalid_json",
+                "feedback body must be valid JSON matching the feedback schema",
+            );
+        }
+    };
+    let tenant_id = match state.deploy_mode {
+        idoris_contracts::DeployMode::Personal => budget::PERSONAL_TENANT_ID.to_string(),
+        idoris_contracts::DeployMode::Tenant => match query_scope_header(&headers) {
+            Some(tenant_id) if feedback::valid_event_identifier(tenant_id) => tenant_id.to_string(),
+            None => {
+                return error_envelope(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_tenant_scope",
+                    "feedback requires exactly one non-empty X-iDoris-Tenant",
+                );
+            }
+            Some(_) => {
+                return error_envelope(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_tenant_scope",
+                    "feedback tenant identifier is invalid",
+                );
+            }
+        },
+    };
+    if let Err(err) = request.validate() {
+        return error_envelope(StatusCode::BAD_REQUEST, "invalid_feedback", err.to_string());
+    }
+    let Some(event_log) = state.event_log.clone() else {
+        return event_log_unavailable_response();
+    };
+    let result = tokio::task::spawn_blocking(move || {
+        feedback::append_metadata_feedback(&event_log, &tenant_id, request)
+    })
+    .await;
+    match result {
+        Ok(Ok(())) => StatusCode::NO_CONTENT.into_response(),
+        Ok(Err(feedback::FeedbackError::InvalidRecordId)) => error_envelope(
+            StatusCode::BAD_REQUEST,
+            "invalid_record_id",
+            "record_id is invalid",
+        ),
+        Ok(Err(feedback::FeedbackError::NotFound)) => error_envelope(
+            StatusCode::NOT_FOUND,
+            "request_not_found",
+            "request record was not found",
+        ),
+        Ok(Err(feedback::FeedbackError::EventLog(_))) | Err(_) => event_log_unavailable_response(),
+        Ok(Err(feedback::FeedbackError::Invalid(_))) => error_envelope(
+            StatusCode::BAD_REQUEST,
+            "invalid_feedback",
+            "feedback payload is invalid",
+        ),
+    }
 }
 
 async fn embeddings(
@@ -806,6 +874,7 @@ async fn messages_stream(
             status,
             body,
             content_type,
+            ..
         } => {
             let status = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
             let mut response = (status, body).into_response();
@@ -1687,6 +1756,103 @@ pub(crate) async fn append_dispatched(
     run_event_log_write(move || store.append(Some(&tenant_id), &event).map(|_| ())).await
 }
 
+#[derive(Clone)]
+pub(crate) struct CompletedEventContext {
+    event_log: Arc<idoris_tenancy::event_log::EventLogStore>,
+    tenant_id: String,
+    record_id: String,
+    correlation: correlation::RequestCorrelation,
+}
+
+pub(crate) async fn append_completed(
+    context: &CompletedEventContext,
+    selected: &Selected,
+    status: &'static str,
+) -> Result<(), ()> {
+    append_completed_fields(
+        context,
+        selected.card.provider.id.as_str(),
+        selected.served_locality,
+        status,
+    )
+    .await
+}
+
+async fn append_completed_fields(
+    context: &CompletedEventContext,
+    provider_id: &str,
+    served_locality: idoris_contracts::provider::Locality,
+    status: &'static str,
+) -> Result<(), ()> {
+    let mut metadata = std::collections::BTreeMap::new();
+    metadata.insert("status".to_string(), json!(status));
+    metadata.insert("provider_id".to_string(), json!(provider_id));
+    metadata.insert("served_locality".to_string(), json!(served_locality));
+    let ts_utc_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_millis()).ok())
+        .ok_or(())?;
+    let event = idoris_tenancy::event_log::NewEvent {
+        event_id: Uuid::new_v4().to_string(),
+        tenant_id: context.tenant_id.clone(),
+        record_id: context.record_id.clone(),
+        event_type: idoris_tenancy::event_log::EventType::Completed,
+        ts_utc_ms,
+        request_id: None,
+        session_id: context.correlation.session_id.clone(),
+        trace_id: context.correlation.trace_id.clone(),
+        parent_id: context.correlation.parent_id.clone(),
+        origin_record_id: None,
+        metadata,
+    };
+    let store = context.event_log.clone();
+    let tenant_id = context.tenant_id.clone();
+    run_event_log_write(move || store.append(Some(&tenant_id), &event).map(|_| ())).await
+}
+
+#[derive(Clone)]
+pub(crate) struct BudgetSettledEventContext {
+    event_log: Arc<idoris_tenancy::event_log::EventLogStore>,
+    tenant_id: String,
+    record_id: String,
+    correlation: correlation::RequestCorrelation,
+}
+
+pub(crate) async fn append_budget_settled(
+    context: &BudgetSettledEventContext,
+    selected: &Selected,
+    settled_minor: i64,
+) -> Result<(), ()> {
+    let mut metadata = std::collections::BTreeMap::new();
+    metadata.insert("settled_minor".to_string(), json!(settled_minor));
+    metadata.insert(
+        "provider_id".to_string(),
+        json!(selected.card.provider.id.as_str()),
+    );
+    let ts_utc_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_millis()).ok())
+        .ok_or(())?;
+    let event = idoris_tenancy::event_log::NewEvent {
+        event_id: Uuid::new_v4().to_string(),
+        tenant_id: context.tenant_id.clone(),
+        record_id: context.record_id.clone(),
+        event_type: idoris_tenancy::event_log::EventType::BudgetSettled,
+        ts_utc_ms,
+        request_id: None,
+        session_id: context.correlation.session_id.clone(),
+        trace_id: context.correlation.trace_id.clone(),
+        parent_id: context.correlation.parent_id.clone(),
+        origin_record_id: None,
+        metadata,
+    };
+    let store = context.event_log.clone();
+    let tenant_id = context.tenant_id.clone();
+    run_event_log_write(move || store.append(Some(&tenant_id), &event).map(|_| ())).await
+}
+
 /// `POST /v1/chat/completions`. Order (locked by conformance): non-JSON
 /// body -> `invalid_json`; valid JSON that isn't an object -> `invalid_body`;
 /// only then are control-plane headers parsed (see [`profile::parse_profile`]).
@@ -1798,6 +1964,24 @@ async fn chat_completions(
         event_context
             .as_ref()
             .map(|(event_log, tenant_id)| DispatchedEventContext {
+                event_log: event_log.clone(),
+                tenant_id: tenant_id.clone(),
+                record_id: record_id.clone(),
+                correlation: correlation.clone(),
+            });
+    let completed_event_context =
+        event_context
+            .as_ref()
+            .map(|(event_log, tenant_id)| CompletedEventContext {
+                event_log: event_log.clone(),
+                tenant_id: tenant_id.clone(),
+                record_id: record_id.clone(),
+                correlation: correlation.clone(),
+            });
+    let budget_settled_event_context =
+        event_context
+            .as_ref()
+            .map(|(event_log, tenant_id)| BudgetSettledEventContext {
                 event_log: event_log.clone(),
                 tenant_id: tenant_id.clone(),
                 record_id: record_id.clone(),
@@ -1965,7 +2149,10 @@ async fn chat_completions(
                 &parsed,
                 &value,
                 &record_id,
-                dispatched_event_context.as_ref(),
+                ProxyEventContexts {
+                    dispatched: dispatched_event_context.as_ref(),
+                    completed: completed_event_context.as_ref(),
+                },
                 budget_event_context.as_ref(),
             )
             .await;
@@ -2017,6 +2204,8 @@ async fn chat_completions(
                 budget_ledger,
                 budget_event_context.as_ref(),
                 dispatched_event_context.as_ref(),
+                completed_event_context.as_ref(),
+                budget_settled_event_context.as_ref(),
             ),
             &parsed,
             dispatch::DispatchInput::with_model(model, &prompt),
@@ -2087,6 +2276,12 @@ async fn chat_completions(
 /// body + its own `content-type`) — **never** re-wrapped into
 /// [`openai_chat_completion`]'s shape, matching `proxy.ts`'s own behavior:
 /// a transparent proxy, not a backend `RuntimeAdapter` call.
+#[derive(Clone, Copy)]
+struct ProxyEventContexts<'a> {
+    dispatched: Option<&'a DispatchedEventContext>,
+    completed: Option<&'a CompletedEventContext>,
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn chat_via_proxy(
     state: &AppState,
@@ -2095,7 +2290,7 @@ async fn chat_via_proxy(
     parsed: &ParsedProfile,
     body_value: &serde_json::Value,
     record_id: &str,
-    dispatched_event: Option<&DispatchedEventContext>,
+    events: ProxyEventContexts<'_>,
     budget_event_context: Option<&BudgetReservedEventContext>,
 ) -> Response {
     let mut reservation = match dispatch::ReservationGuard::reserve(
@@ -2137,7 +2332,7 @@ async fn chat_via_proxy(
         return event_log_unavailable_response();
     }
     if stream_requested {
-        return chat_via_proxy_stream(state, selected, body_value, dispatched_event).await;
+        return chat_via_proxy_stream(state, selected, body_value, events).await;
     }
     chat_via_proxy_buffered(
         state,
@@ -2146,7 +2341,7 @@ async fn chat_via_proxy(
         parsed,
         body_value,
         record_id,
-        dispatched_event,
+        events,
         &mut reservation,
     )
     .await
@@ -2159,12 +2354,12 @@ async fn chat_via_proxy_stream(
     state: &AppState,
     selected: &Selected,
     body_value: &serde_json::Value,
-    dispatched_event: Option<&DispatchedEventContext>,
+    events: ProxyEventContexts<'_>,
 ) -> Response {
     let outcome = state
         .proxy
         .forward_stream_observed(&selected.card.endpoint, body_value, || async {
-            if let Some(context) = dispatched_event {
+            if let Some(context) = events.dispatched {
                 append_dispatched(context, selected).await?;
             }
             Ok::<(), ()>(())
@@ -2178,8 +2373,17 @@ async fn chat_via_proxy_stream(
             status,
             body,
             content_type,
+            execution,
         } => {
             let status = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
+            if execution != proxy::ExecutionDisposition::NotExecuted
+                && let Some(context) = events.completed
+                && append_completed(context, selected, "failure")
+                    .await
+                    .is_err()
+            {
+                return event_log_unavailable_response();
+            }
             let mut response = (status, body).into_response();
             let content_type = content_type.as_deref().unwrap_or("application/json");
             if let Ok(v) = HeaderValue::from_str(content_type) {
@@ -2201,7 +2405,12 @@ async fn chat_via_proxy_stream(
             // Validate application termination around the permit-owning body.
             // Producer timeouts remain errors; only clean EOF without [DONE]
             // becomes an explicit truncation error.
-            let body = terminated_proxy_body(upstream);
+            let body = terminated_proxy_body_observed(
+                upstream,
+                events.completed.cloned(),
+                selected.card.provider.id.clone(),
+                selected.served_locality,
+            );
             let mut response = Response::builder()
                 .status(status)
                 .body(body)
@@ -2226,6 +2435,72 @@ async fn chat_via_proxy_stream(
 }
 
 /// Preserve proxy deadlines and ownership while rejecting incomplete SSE.
+fn terminated_proxy_body_observed(
+    upstream: Body,
+    completed_event: Option<CompletedEventContext>,
+    provider_id: String,
+    served_locality: idoris_contracts::provider::Locality,
+) -> Body {
+    use futures_util::StreamExt;
+
+    let guarded = sse::ensure_terminated(upstream.into_data_stream());
+    let observed = futures_util::stream::unfold(
+        (
+            Box::pin(guarded),
+            completed_event,
+            provider_id,
+            served_locality,
+            false,
+        ),
+        |(mut inner, mut event, provider_id, served_locality, finished)| async move {
+            if finished {
+                return None;
+            }
+            match inner.next().await {
+                Some(Ok(bytes)) => Some((
+                    Ok(bytes),
+                    (inner, event, provider_id, served_locality, false),
+                )),
+                Some(Err(err)) => {
+                    let append_failed = if let Some(context) = event.take() {
+                        append_completed_fields(&context, &provider_id, served_locality, "failure")
+                            .await
+                            .is_err()
+                    } else {
+                        false
+                    };
+                    let err = if append_failed {
+                        std::io::Error::other("event log unavailable")
+                    } else {
+                        err
+                    };
+                    Some((Err(err), (inner, event, provider_id, served_locality, true)))
+                }
+                None => {
+                    if let Some(context) = event.take()
+                        && append_completed_fields(
+                            &context,
+                            &provider_id,
+                            served_locality,
+                            "success",
+                        )
+                        .await
+                        .is_err()
+                    {
+                        return Some((
+                            Err(std::io::Error::other("event log unavailable")),
+                            (inner, event, provider_id, served_locality, true),
+                        ));
+                    }
+                    None
+                }
+            }
+        },
+    );
+    Body::from_stream(observed)
+}
+
+#[cfg(test)]
 fn terminated_proxy_body(upstream: Body) -> Body {
     Body::from_stream(sse::ensure_terminated(upstream.into_data_stream()))
 }
@@ -2240,7 +2515,7 @@ async fn chat_via_proxy_buffered(
     parsed: &ParsedProfile,
     body_value: &serde_json::Value,
     record_id: &str,
-    dispatched_event: Option<&DispatchedEventContext>,
+    events: ProxyEventContexts<'_>,
     reservation: &mut dispatch::ReservationGuard<'_>,
 ) -> Response {
     let is_paid = budget::is_paid(Some(selected.estimated_cost_minor));
@@ -2303,7 +2578,7 @@ async fn chat_via_proxy_buffered(
                     }
                 },
                 || async {
-                    if let Some(context) = dispatched_event {
+                    if let Some(context) = events.dispatched {
                         append_dispatched(context, selected).await?;
                     }
                     Ok::<(), ()>(())
@@ -2314,7 +2589,7 @@ async fn chat_via_proxy_buffered(
         state
             .proxy
             .forward_buffered_observed(&selected.card.endpoint, body_value, &opts, || async {
-                if let Some(context) = dispatched_event {
+                if let Some(context) = events.dispatched {
                     append_dispatched(context, selected).await?;
                 }
                 Ok::<(), ()>(())
@@ -2352,6 +2627,23 @@ async fn chat_via_proxy_buffered(
     }
 
     let status = StatusCode::from_u16(outcome.status).unwrap_or(StatusCode::BAD_GATEWAY);
+    if !outcome.cached
+        && outcome.execution != proxy::ExecutionDisposition::NotExecuted
+        && outcome.execution != proxy::ExecutionDisposition::Replay
+        && let Some(context) = events.completed
+    {
+        let event_status = if status.is_success() {
+            "success"
+        } else {
+            "failure"
+        };
+        if append_completed(context, selected, event_status)
+            .await
+            .is_err()
+        {
+            return event_log_unavailable_response();
+        }
+    }
     let mut response = (status, outcome.body).into_response();
     let content_type = outcome
         .content_type
@@ -2710,6 +3002,24 @@ mod budget_reserved_wiring_tests;
 
 #[cfg(test)]
 mod dispatched_wiring_tests;
+
+#[cfg(test)]
+mod completed_wiring_tests;
+
+#[cfg(test)]
+mod budget_settled_wiring_tests;
+
+#[cfg(test)]
+mod proxy_completed_wiring_tests;
+
+#[cfg(test)]
+mod stream_completed_wiring_tests;
+
+#[cfg(test)]
+mod stream_buffered_completed_wiring_tests;
+
+#[cfg(test)]
+mod feedback_wiring_tests;
 
 #[cfg(test)]
 mod request_event_query_tests;
