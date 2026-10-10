@@ -59,6 +59,9 @@ pub mod auth;
 /// aggregation is wired by task33.
 pub mod capabilities;
 pub mod host_facts;
+/// Offline, local-only virtual-key issuance. Plaintext is returned once to
+/// the caller and is never persisted.
+pub mod key_issue;
 /// Stable four-way routing/audit reason taxonomy.
 pub mod reason;
 /// Persistent record/budget storage bootstrap (B1 task18).
