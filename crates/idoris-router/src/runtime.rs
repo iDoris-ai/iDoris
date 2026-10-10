@@ -1,6 +1,9 @@
 //! Construct and index lifecycle-managed runtimes by component provider.
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
 use idoris_backend::{
     BackendError, BackendStatus, GlobalCapacityLedger, GlobalCapacitySnapshot, RuntimeAdapter,
@@ -17,6 +20,8 @@ use crate::dispatch::BoundSupervisor;
 pub struct RuntimeRegistry {
     supervisors: BTreeMap<String, BoundSupervisor>,
     startup_capacity: Option<Arc<GlobalCapacityLedger>>,
+    #[cfg(test)]
+    ready_snapshot_calls: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl RuntimeRegistry {
@@ -40,6 +45,8 @@ impl RuntimeRegistry {
         let mut registry = Self {
             supervisors: BTreeMap::new(),
             startup_capacity: Some(startup_capacity.clone()),
+            #[cfg(test)]
+            ready_snapshot_calls: Arc::default(),
         };
         for card in cards {
             let Some(handle) = spawn_runtime_with_factory(card, &factory, Some(&startup_capacity))?
@@ -86,14 +93,22 @@ impl RuntimeRegistry {
             }
         }
 
-        Self::spawn_with_factory(cards, |card| {
+        let mut registry = Self::spawn_with_factory(cards, |card| {
             if let Some(config) = local.get(&card.provider.id) {
                 return LocalHttpRuntimeAdapter::new(config.clone()).map(|adapter| {
                     std::sync::Arc::new(adapter) as std::sync::Arc<dyn RuntimeAdapter>
                 });
             }
             create_adapter(card)
-        })
+        })?;
+        for (provider_id, config) in local {
+            if let Some(bound) = registry.supervisors.get_mut(provider_id) {
+                *bound = bound
+                    .clone()
+                    .with_admission_model(config.model_id.clone(), config.memory_gb);
+            }
+        }
+        Ok(registry)
     }
 
     pub fn get(&self, provider_id: &str) -> Option<&BoundSupervisor> {
@@ -118,6 +133,7 @@ impl RuntimeRegistry {
                 .map(|bound| (bound.provider_id().to_string(), bound))
                 .collect(),
             startup_capacity: None,
+            ready_snapshot_calls: Arc::default(),
         }
     }
 
@@ -151,6 +167,33 @@ impl RuntimeRegistry {
         }
         depth
     }
+
+    /// Return providers whose exact requested lifecycle target is currently
+    /// chat-ready. Errors are conservatively treated as not ready.
+    pub async fn exact_ready_providers(&self, targets: Vec<(String, String)>) -> BTreeSet<String> {
+        #[cfg(test)]
+        self.ready_snapshot_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let mut ready = BTreeSet::new();
+        for (provider_id, model_id) in targets {
+            if let Some(supervisor) = self.supervisors.get(&provider_id)
+                && ready_for_affinity(supervisor.is_ready(&model_id).await)
+            {
+                ready.insert(provider_id);
+            }
+        }
+        ready
+    }
+
+    #[cfg(test)]
+    pub(crate) fn ready_snapshot_calls(&self) -> usize {
+        self.ready_snapshot_calls
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+fn ready_for_affinity(result: Result<bool, BackendError>) -> bool {
+    result.unwrap_or(false)
 }
 
 fn add_status_depth(
@@ -177,6 +220,8 @@ impl From<BoundSupervisor> for RuntimeRegistry {
         Self {
             supervisors,
             startup_capacity: None,
+            #[cfg(test)]
+            ready_snapshot_calls: Arc::default(),
         }
     }
 }
@@ -332,6 +377,7 @@ mod tests {
                 ("b".into(), mock_bound(&b)),
             ]),
             startup_capacity: None,
+            ready_snapshot_calls: Arc::default(),
         };
         for card in [&a, &b] {
             let outcome = dispatch_local(
@@ -351,6 +397,75 @@ mod tests {
             let response = outcome.result.unwrap();
             assert_eq!(response.model, card.provider.id);
         }
+    }
+
+    #[tokio::test]
+    async fn exact_ready_snapshot_requires_the_requested_model_to_be_ready() {
+        let card = named_card("runtime-b");
+        let adapter = Arc::new(MockAdapter::new(vec![ModelInfo {
+            id: "target".into(),
+            memory_gb: 1.0,
+        }]));
+        let handle = Supervisor::spawn(adapter, SupervisorConfig::default()).unwrap();
+        handle
+            .load("target", 1.0, card.load_policy.unwrap())
+            .await
+            .unwrap();
+        let registry = RuntimeRegistry::from(BoundSupervisor::new(&card, handle));
+
+        let ready = registry
+            .exact_ready_providers(vec![
+                ("runtime-b".into(), "target".into()),
+                ("runtime-b".into(), "other".into()),
+            ])
+            .await;
+        assert_eq!(ready, ["runtime-b".to_string()].into());
+    }
+
+    #[tokio::test]
+    async fn startup_inherited_residency_is_not_claimed_as_chat_ready() {
+        let card = named_card("runtime-b");
+        let adapter = Arc::new(MockAdapter::new(vec![ModelInfo {
+            id: "target".into(),
+            memory_gb: 1.0,
+        }]));
+        adapter
+            .load("target", card.load_policy.as_ref())
+            .await
+            .unwrap();
+        let handle = Supervisor::spawn(adapter, SupervisorConfig::default()).unwrap();
+        let registry = RuntimeRegistry::from(BoundSupervisor::new(&card, handle));
+
+        assert!(
+            registry
+                .exact_ready_providers(vec![("runtime-b".into(), "target".into())])
+                .await
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn readiness_query_errors_are_neutral_for_affinity() {
+        assert!(!ready_for_affinity(Err(BackendError::internal(
+            "readiness unavailable"
+        ))));
+    }
+
+    #[tokio::test]
+    async fn resident_direct_path_never_receives_lifecycle_readiness_boost() {
+        let mut resident = named_card("resident");
+        resident.load_policy.as_mut().unwrap().mode = LoadMode::Resident;
+        let registry = RuntimeRegistry::spawn_with_factory(std::slice::from_ref(&resident), |_| {
+            panic!("Resident direct path must not construct a lifecycle runtime")
+        })
+        .unwrap();
+
+        assert!(
+            registry
+                .exact_ready_providers(vec![("resident".into(), "resident".into())])
+                .await
+                .is_empty()
+        );
     }
 
     #[tokio::test]

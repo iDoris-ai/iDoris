@@ -108,6 +108,10 @@ enum Command {
     Status {
         reply: oneshot::Sender<Result<BackendStatus, BackendError>>,
     },
+    IsReady {
+        id: String,
+        reply: oneshot::Sender<Result<bool, BackendError>>,
+    },
     Chat {
         req: ChatRequest,
         cancel: CancellationToken,
@@ -272,6 +276,20 @@ impl SupervisorHandle {
     pub async fn status(&self) -> Result<BackendStatus, BackendError> {
         let (reply, rx) = oneshot::channel();
         self.send(ActorMsg::Cmd(Command::Status { reply })).await?;
+        rx.await
+            .map_err(|_| BackendError::supervisor_unavailable())?
+    }
+
+    /// Returns the actor's exact chat-ready state for one model id. This is
+    /// stricter than `status().loaded`, which also includes startup-inherited
+    /// residency that has not yet become `Ready`.
+    pub async fn is_ready(&self, id: impl Into<String>) -> Result<bool, BackendError> {
+        let (reply, rx) = oneshot::channel();
+        self.send(ActorMsg::Cmd(Command::IsReady {
+            id: id.into(),
+            reply,
+        }))
+        .await?;
         rx.await
             .map_err(|_| BackendError::supervisor_unavailable())?
     }
@@ -1595,6 +1613,18 @@ async fn run_actor(
                 Err(err) => Some(err),
             }
         }
+        (Some(tracking), Err(_)) => {
+            match tracking
+                .ledger
+                .block_growth_for_unknown_residency(&tracking.allocation_key, None)
+            {
+                Ok(claimed_gb) => {
+                    tracking.claimed_gb = claimed_gb;
+                    None
+                }
+                Err(err) => Some(err),
+            }
+        }
         _ => None,
     };
     if let Ok(status) = &startup {
@@ -1641,6 +1671,9 @@ async fn run_actor(
                         let _ = reply.send(Err(BackendError::invariant_violation(msg)));
                     }
                     Command::Status { reply } => {
+                        let _ = reply.send(Err(BackendError::invariant_violation(msg)));
+                    }
+                    Command::IsReady { reply, .. } => {
                         let _ = reply.send(Err(BackendError::invariant_violation(msg)));
                     }
                     Command::Chat { reply, .. } => {
@@ -1710,6 +1743,13 @@ async fn run_actor(
                     model_memory_max_gb: config.budget_gb,
                     loaded,
                 }));
+            }
+
+            ActorMsg::Cmd(Command::IsReady { id, reply }) => {
+                let ready = models
+                    .get(&id)
+                    .is_some_and(|slot| slot.state == ModelState::Ready);
+                let _ = reply.send(Ok(ready));
             }
 
             ActorMsg::Cmd(Command::Chat { req, cancel, reply }) => {
@@ -2115,6 +2155,40 @@ mod tests {
         let status = handle.status().await.expect("status should succeed");
         assert!(status.loaded.is_empty());
         assert_eq!(status.pressure, Pressure::Ok);
+    }
+
+    #[tokio::test]
+    async fn exact_readiness_is_false_while_loading_stopping_or_error() {
+        let adapter = Arc::new(MockAdapter::new(catalog()));
+        adapter.set_load_delay("a", std::time::Duration::from_millis(100));
+        let handle = Supervisor::spawn(adapter.clone(), SupervisorConfig::default())
+            .expect("spawn should succeed");
+
+        let loading_handle = handle.clone();
+        let loading =
+            tokio::spawn(async move { loading_handle.load("a", 4.0, on_demand_policy()).await });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(!handle.is_ready("a").await.unwrap(), "Loading is not Ready");
+        loading.await.unwrap().unwrap();
+        assert!(handle.is_ready("a").await.unwrap());
+
+        adapter.set_unload_delay("a", std::time::Duration::from_millis(100));
+        let stopping_handle = handle.clone();
+        let stopping = tokio::spawn(async move { stopping_handle.unload("a").await });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(
+            !handle.is_ready("a").await.unwrap(),
+            "Stopping is not Ready"
+        );
+        stopping.await.unwrap().unwrap();
+
+        adapter.set_load_delay("a", std::time::Duration::ZERO);
+        adapter.set_load_script("a", vec![crate::mock::LoadOutcome::Fail]);
+        handle
+            .load("a", 4.0, on_demand_policy())
+            .await
+            .expect_err("scripted load failure should leave an Error slot");
+        assert!(!handle.is_ready("a").await.unwrap(), "Error is not Ready");
     }
 
     /// Negative contrast: `chat` before any `load` fails `model_not_found`.

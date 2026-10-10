@@ -120,6 +120,7 @@ const HEADER_REASON: &str = "X-iDoris-Reason";
 const HEADER_DEGRADED: &str = "X-iDoris-Degraded";
 const HEADER_COST_MINOR: &str = "X-iDoris-Cost-Minor";
 const HEADER_REQUEST_ID: &str = "x-idoris-request-id";
+const HEADER_SESSION: &str = "x-idoris-session";
 const HEADER_CACHED: &str = "X-iDoris-Cached";
 const HEADER_ORIGIN_RECORD_ID: &str = "X-iDoris-Origin-Record-Id";
 
@@ -1087,6 +1088,14 @@ fn query_scope_header(headers: &HeaderMap) -> Option<&str> {
         .filter(|value| !value.is_empty())
 }
 
+fn session_affinity_key(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(HEADER_SESSION)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
 async fn get_capabilities(State(state): State<Arc<AppState>>) -> Response {
     let Some(provider) = state.capabilities.as_ref() else {
         return error_envelope(
@@ -1815,6 +1824,7 @@ async fn chat_completions(
     } else if state.dev_no_key_enabled && authorization_present {
         return virtual_key_unauthorized_response();
     }
+    let affinity_key = session_affinity_key(&headers);
 
     let messages = extract_messages(object);
     let parsed = intent::resolve_profile(parsed, &messages).await;
@@ -1897,7 +1907,36 @@ async fn chat_completions(
         };
     }
 
-    let selection = dispatch::select(&policy_cards.cards, &parsed, &prompt);
+    // Freeze one exact lifecycle-readiness view for every decision this
+    // request performs. A session may prefer an already-Ready target only
+    // after policy admission/cost ties; without a session, preserve the
+    // pre-affinity selection order exactly.
+    let ready_provider_ids = if affinity_key.is_some() {
+        state
+            .runtimes
+            .exact_ready_providers(
+                policy_cards
+                    .cards
+                    .iter()
+                    .map(|card| {
+                        let provider_id = card.provider.id.clone();
+                        let target_model = dispatch::backend_model_id(&parsed, model, &provider_id);
+                        (provider_id, target_model)
+                    })
+                    .collect(),
+            )
+            .await
+    } else {
+        std::collections::BTreeSet::new()
+    };
+
+    let selection = dispatch::select_with_affinity_and_ready(
+        &policy_cards.cards,
+        &parsed,
+        &prompt,
+        affinity_key,
+        &ready_provider_ids,
+    );
     let rejection_reason = match &selection {
         Ok(_) => None,
         Err(DispatchError::Rejection(rejection)) => Some(rejection.error_type()),
@@ -2075,7 +2114,7 @@ async fn chat_completions(
                 completed_event_context.as_ref(),
             ),
             &parsed,
-            dispatch::DispatchInput::with_model(model, &prompt),
+            dispatch::DispatchInput::with_model(model, &prompt).with_affinity(affinity_key),
             messages,
             lifecycle.cancellation_token(),
         )
@@ -2093,7 +2132,9 @@ async fn chat_completions(
             supervisor,
             budget_ledger,
             &parsed,
-            dispatch::DispatchInput::with_model(model, &prompt),
+            dispatch::DispatchInput::with_model(model, &prompt)
+                .with_affinity(affinity_key)
+                .with_ready_providers(&ready_provider_ids),
             messages,
             lifecycle.cancellation_token(),
         )
@@ -2876,6 +2917,16 @@ mod tests {
         }
     }
 
+    #[test]
+    fn session_affinity_header_is_trimmed_and_empty_is_disabled() {
+        let mut headers = HeaderMap::new();
+        assert_eq!(session_affinity_key(&headers), None);
+        headers.insert(HEADER_SESSION, HeaderValue::from_static("  run-42  "));
+        assert_eq!(session_affinity_key(&headers), Some("run-42"));
+        headers.insert(HEADER_SESSION, HeaderValue::from_static("   "));
+        assert_eq!(session_affinity_key(&headers), None);
+    }
+
     #[tokio::test]
     async fn health_has_the_pr46_shape_and_a_record_id_header() {
         let app = build_app(AppState::default());
@@ -3509,6 +3560,49 @@ mod tests {
             usage[0].payload["tokens_out"],
             json["usage"]["completion_tokens"]
         );
+    }
+
+    #[tokio::test]
+    async fn chat_request_freezes_one_readiness_snapshot_for_all_decide_passes() {
+        let card = sample_component_card("local-1");
+        let adapter = std::sync::Arc::new(idoris_backend::MockAdapter::new(vec![
+            idoris_backend::ModelInfo {
+                id: "local-1".to_string(),
+                memory_gb: 1.0,
+            },
+        ]));
+        let supervisor =
+            idoris_backend::Supervisor::spawn(adapter, idoris_backend::SupervisorConfig::default())
+                .unwrap();
+        supervisor
+            .load(
+                "local-1",
+                1.0,
+                idoris_contracts::load_policy::LoadPolicy {
+                    mode: idoris_contracts::load_policy::LoadMode::OnDemand,
+                    keepalive: idoris_contracts::load_policy::Keepalive::IdleTtl { idle_ttl_s: 60 },
+                    admission: idoris_contracts::load_policy::Admission::Coexist,
+                },
+            )
+            .await
+            .unwrap();
+        let runtimes: runtime::RuntimeRegistry =
+            dispatch::BoundSupervisor::new(&card, supervisor).into();
+        let state = AppState {
+            cards: vec![card],
+            runtimes: runtimes.clone(),
+            ..AppState::default()
+        };
+
+        let response = build_app(state)
+            .oneshot(post_chat(
+                r#"{"model":"idoris/daily","messages":[{"role":"user","content":"hi"}]}"#,
+                &[("X-iDoris-Session", "run-42")],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(runtimes.ready_snapshot_calls(), 1);
     }
 
     #[tokio::test]
