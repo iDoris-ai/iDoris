@@ -317,3 +317,122 @@ async fn exhausted_connect_failure_still_records_router_dispatch_attempt() {
         Some(&json!("attempted"))
     );
 }
+
+fn local_state(
+    event_log: Arc<EventLogStore>,
+    adapter: Arc<idoris_backend::MockAdapter>,
+) -> AppState {
+    let card = super::tests::sample_component_card("local-1");
+    let supervisor =
+        idoris_backend::Supervisor::spawn(adapter, idoris_backend::SupervisorConfig::default())
+            .unwrap();
+    AppState {
+        cards: vec![card.clone()],
+        runtimes: Some(dispatch::BoundSupervisor::new(&card, supervisor)).into(),
+        event_log: Some(event_log),
+        ..AppState::default()
+    }
+}
+
+fn local_adapter() -> Arc<idoris_backend::MockAdapter> {
+    Arc::new(idoris_backend::MockAdapter::new(vec![
+        idoris_backend::ModelInfo {
+            id: "local-1".to_string(),
+            memory_gb: 1.0,
+        },
+    ]))
+}
+
+#[tokio::test]
+async fn local_supervisor_records_dispatch_after_successful_load() {
+    let event_log = memory_event_log();
+    let adapter = local_adapter();
+    let response = build_app(local_state(event_log.clone(), adapter.clone()))
+        .oneshot(super::tests::post_chat(
+            r#"{"model":"idoris/daily","messages":[{"role":"user","content":"local secret"}]}"#,
+            &[
+                ("x-idoris-session", "local-session"),
+                ("x-idoris-trace-id", "local-trace"),
+                ("x-idoris-parent-id", "local-parent"),
+            ],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(adapter.load_call_count("local-1"), 1);
+    let chain = events(&event_log, &response);
+    assert_eq!(dispatched_count(&chain), 1);
+    let dispatched = chain
+        .iter()
+        .find(|event| event.event.event_type == EventType::Dispatched)
+        .unwrap();
+    assert_eq!(
+        dispatched.event.metadata.get("status"),
+        Some(&json!("attempted"))
+    );
+    assert_eq!(
+        dispatched.event.metadata.get("provider_id"),
+        Some(&json!("local-1"))
+    );
+    assert_eq!(
+        dispatched.event.metadata.get("served_locality"),
+        Some(&json!("loopback"))
+    );
+    assert_eq!(dispatched.event.metadata.len(), 3);
+    assert_eq!(
+        dispatched.event.session_id.as_deref(),
+        Some("local-session")
+    );
+    assert_eq!(dispatched.event.trace_id.as_deref(), Some("local-trace"));
+    assert_eq!(dispatched.event.parent_id.as_deref(), Some("local-parent"));
+    assert!(
+        !serde_json::to_string(&dispatched.event.metadata)
+            .unwrap()
+            .contains("local secret")
+    );
+}
+
+#[tokio::test]
+async fn local_load_failure_never_records_dispatch() {
+    let event_log = memory_event_log();
+    let adapter = local_adapter();
+    adapter.set_load_script("local-1", vec![idoris_backend::mock::LoadOutcome::Fail]);
+    let response = build_app(local_state(event_log.clone(), adapter))
+        .oneshot(super::tests::post_chat(
+            r#"{"model":"idoris/daily","messages":[{"role":"user","content":"load fail"}]}"#,
+            &[],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(dispatched_count(&events(&event_log, &response)), 0);
+}
+
+#[tokio::test]
+async fn local_dispatched_append_failure_is_generic_503_after_load() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = dir.path().join("events.sqlite3");
+    let event_log = Arc::new(EventLogStore::open(&db).unwrap());
+    Connection::open(&db)
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER fail_local_dispatched BEFORE INSERT ON event_log_events \
+             WHEN NEW.event_type='dispatched' BEGIN SELECT RAISE(ABORT,'fail dispatched'); END;",
+        )
+        .unwrap();
+    let adapter = local_adapter();
+    let response = build_app(local_state(event_log.clone(), adapter.clone()))
+        .oneshot(super::tests::post_chat(
+            r#"{"model":"idoris/daily","messages":[{"role":"user","content":"blocked local"}]}"#,
+            &[],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(adapter.load_call_count("local-1"), 1);
+    let chain = events(&event_log, &response);
+    assert_eq!(dispatched_count(&chain), 0);
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(json["error"]["reason_code"], "EVENT_LOG_APPEND_UNAVAILABLE");
+}
