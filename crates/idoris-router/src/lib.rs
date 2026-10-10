@@ -38,6 +38,7 @@ pub mod admin;
 
 /// Per-card runtime construction for lifecycle-managed providers.
 pub mod runtime;
+pub mod runtime_launch_config;
 
 /// Atomic reserve/settle/release around a paid candidate (R2-D task 4); not
 /// yet wired into `dispatch`/the request path — a follow-up PR does that.
@@ -59,6 +60,9 @@ pub mod auth;
 /// aggregation is wired by task33.
 pub mod capabilities;
 pub mod host_facts;
+/// Offline, local-only virtual-key issuance. Plaintext is returned once to
+/// the caller and is never persisted.
+pub mod key_issue;
 /// Stable four-way routing/audit reason taxonomy.
 pub mod reason;
 /// Persistent record/budget storage bootstrap (B1 task18).
@@ -215,6 +219,9 @@ pub struct AppState {
     /// Tenant-scoped audit/usage record store. Startup installs it together
     /// with `budget_ledger` from the same SQLite path.
     pub record_store: Option<Arc<std::sync::Mutex<idoris_tenancy::store::TenantStore>>>,
+    /// Production installs the persistent B5 verifier. Library tests may
+    /// leave this unset to preserve pre-B5 request behavior.
+    pub virtual_key_authenticator: Option<auth::VirtualKeyAuthenticator>,
     /// Persistent B6 Event Log capability. This slice only bootstraps and
     /// carries the handle; request event emission is wired separately.
     pub event_log: Option<Arc<idoris_tenancy::event_log::EventLogStore>>,
@@ -259,6 +266,13 @@ impl std::fmt::Debug for AppState {
             )
             .field("event_log", &self.event_log.as_ref().map(|_| "configured"))
             .field(
+                "virtual_key_authenticator",
+                &self
+                    .virtual_key_authenticator
+                    .as_ref()
+                    .map(|_| "configured"),
+            )
+            .field(
                 "audit_failures",
                 &self.audit_failures.load(Ordering::Relaxed),
             )
@@ -299,6 +313,7 @@ impl Default for AppState {
             runtimes: runtime::RuntimeRegistry::default(),
             budget_ledger: None,
             record_store: None,
+            virtual_key_authenticator: None,
             event_log: None,
             audit_failures: Arc::new(AtomicU64::new(0)),
             models_health: Arc::new(health::HealthTracker::default()),
@@ -1281,6 +1296,24 @@ fn rejection_response(rejection: Rejection) -> Response {
     )
 }
 
+fn virtual_key_unauthorized_response() -> Response {
+    error_envelope_with_reason(
+        StatusCode::UNAUTHORIZED,
+        "unauthorized",
+        "VIRTUAL_KEY_UNAUTHORIZED",
+        "virtual key authentication failed",
+    )
+}
+
+fn virtual_key_scope_response(error: auth::VirtualKeyScopeError) -> Response {
+    error_envelope_with_reason(
+        StatusCode::FORBIDDEN,
+        "policy_violation",
+        error.reason_code(),
+        "virtual key scope forbids this request",
+    )
+}
+
 fn correlation_error_response(error: correlation::CorrelationError) -> Response {
     error_envelope_with_reason(
         StatusCode::BAD_REQUEST,
@@ -1377,6 +1410,101 @@ async fn append_profiled(
     run_event_log_write(move || store.append(Some(&tenant_id), &event).map(|_| ())).await
 }
 
+fn event_reason_code(reason: &idoris_policy::ReasonCode) -> String {
+    match reason {
+        idoris_policy::ReasonCode::PrivacyLoopbackOnly => "privacy_loopback_only".to_string(),
+        idoris_policy::ReasonCode::PrivacyTightenedByContent => {
+            "privacy_tightened_by_content".to_string()
+        }
+        idoris_policy::ReasonCode::RoleMatched(role) => {
+            format!("role_matched:{}", role.as_str())
+        }
+        idoris_policy::ReasonCode::RoleFallbackCapabilityOnly => {
+            "role_fallback_capability_only".to_string()
+        }
+        idoris_policy::ReasonCode::PriceUnknownExcluded => "price_unknown_excluded".to_string(),
+        idoris_policy::ReasonCode::BudgetWithinLimit => "budget_within_limit".to_string(),
+        idoris_policy::ReasonCode::BudgetNoTenantContext => "budget_no_tenant_context".to_string(),
+        idoris_policy::ReasonCode::BudgetFallbackToFreeCandidate => {
+            "budget_fallback_to_free_candidate".to_string()
+        }
+        idoris_policy::ReasonCode::AdmissionReady => "admission_ready".to_string(),
+        idoris_policy::ReasonCode::AdmissionRequiresEviction => {
+            "admission_requires_eviction".to_string()
+        }
+    }
+}
+
+async fn append_decided(
+    store: Arc<idoris_tenancy::event_log::EventLogStore>,
+    tenant_id: String,
+    record_id: String,
+    correlation: &correlation::RequestCorrelation,
+    route: &routing_policy::RouteDecision,
+    selected: Option<&Selected>,
+    rejection_reason: Option<&str>,
+) -> Result<(), ()> {
+    let mut metadata = std::collections::BTreeMap::new();
+    let rule_id = match route.matched_rule {
+        routing_policy::MatchedRule::Rule(index) => format!("rule:{index}"),
+        routing_policy::MatchedRule::Default => "default".to_string(),
+    };
+    metadata.insert("rule_id".to_string(), json!(rule_id));
+    match selected {
+        Some(selected) => {
+            metadata.insert("status".to_string(), json!("selected"));
+            metadata.insert(
+                "provider_id".to_string(),
+                json!(selected.card.provider.id.as_str()),
+            );
+            metadata.insert("tier".to_string(), json!(selected.card.provider.tier));
+            metadata.insert(
+                "served_locality".to_string(),
+                json!(selected.served_locality),
+            );
+            metadata.insert(
+                "degraded".to_string(),
+                json!(selected.decision.is_degraded()),
+            );
+            if !selected.decision.reason_codes.is_empty() {
+                let reason_codes = selected
+                    .decision
+                    .reason_codes
+                    .iter()
+                    .map(event_reason_code)
+                    .collect::<Vec<_>>();
+                metadata.insert("reason_codes".to_string(), json!(reason_codes));
+            }
+        }
+        None => {
+            metadata.insert("status".to_string(), json!("rejected"));
+            metadata.insert(
+                "reason".to_string(),
+                json!(rejection_reason.unwrap_or("no_candidate")),
+            );
+        }
+    }
+    let ts_utc_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_millis()).ok())
+        .ok_or(())?;
+    let event = idoris_tenancy::event_log::NewEvent {
+        event_id: Uuid::new_v4().to_string(),
+        tenant_id: tenant_id.clone(),
+        record_id,
+        event_type: idoris_tenancy::event_log::EventType::Decided,
+        ts_utc_ms,
+        request_id: None,
+        session_id: correlation.session_id.clone(),
+        trace_id: correlation.trace_id.clone(),
+        parent_id: correlation.parent_id.clone(),
+        origin_record_id: None,
+        metadata,
+    };
+    run_event_log_write(move || store.append(Some(&tenant_id), &event).map(|_| ())).await
+}
+
 /// `POST /v1/chat/completions`. Order (locked by conformance): non-JSON
 /// body -> `invalid_json`; valid JSON that isn't an object -> `invalid_body`;
 /// only then are control-plane headers parsed (see [`profile::parse_profile`]).
@@ -1442,12 +1570,22 @@ async fn chat_completions(
         None
     };
 
+    if let Some(authenticator) = &state.virtual_key_authenticator {
+        let identity = match authenticator.authenticate(&headers).await {
+            Ok(identity) => identity,
+            Err(_) => return virtual_key_unauthorized_response(),
+        };
+        if let Err(error) = auth::enforce_scope(&identity, &parsed) {
+            return virtual_key_scope_response(error);
+        }
+    }
+
     let messages = extract_messages(object);
     let parsed = intent::resolve_profile(parsed, &messages).await;
-    if let Some((event_log, tenant_id)) = event_context
+    if let Some((event_log, tenant_id)) = event_context.as_ref()
         && append_profiled(
-            event_log,
-            tenant_id,
+            event_log.clone(),
+            tenant_id.clone(),
             record_id.clone(),
             &correlation,
             &parsed,
@@ -1465,6 +1603,26 @@ async fn chat_completions(
 
     let policy_cards = dispatch::policy_cards(&state.cards, &state.routing_policy, &parsed);
     if policy_cards.cards.is_empty() {
+        let reason = if policy_cards.route.fail_closed {
+            "local_only_unavailable"
+        } else {
+            "no_candidate"
+        };
+        if let Some((event_log, tenant_id)) = event_context.as_ref()
+            && append_decided(
+                event_log.clone(),
+                tenant_id.clone(),
+                record_id.clone(),
+                &correlation,
+                &policy_cards.route,
+                None,
+                Some(reason),
+            )
+            .await
+            .is_err()
+        {
+            return event_log_unavailable_response();
+        }
         return if policy_cards.route.fail_closed {
             rejection_response(idoris_policy::Rejection::LocalOnlyUnavailable)
         } else {
@@ -1476,13 +1634,35 @@ async fn chat_completions(
         };
     }
 
+    let selection = dispatch::select(&policy_cards.cards, &parsed, &prompt);
+    let rejection_reason = match &selection {
+        Ok(_) => None,
+        Err(DispatchError::Rejection(rejection)) => Some(rejection.error_type()),
+        Err(DispatchError::Internal(_)) => Some("internal_error"),
+    };
+    if let Some((event_log, tenant_id)) = event_context.as_ref()
+        && append_decided(
+            event_log.clone(),
+            tenant_id.clone(),
+            record_id.clone(),
+            &correlation,
+            &policy_cards.route,
+            selection.as_ref().ok(),
+            rejection_reason,
+        )
+        .await
+        .is_err()
+    {
+        return event_log_unavailable_response();
+    }
+
     // R2-G: a Resident-mode http_service candidate (a generic
     // OpenAI-compatible backend, including a conformance fixture pointing
     // at a fake upstream) is forwarded directly -- never through the
     // Supervisor, which only makes sense for a real oMLX-shaped backend
     // with an explicit load/unload lifecycle. See dispatch::select's doc
     // for the accepted double-decide() tradeoff this branch makes.
-    if let Ok(selected) = dispatch::select(&policy_cards.cards, &parsed, &prompt) {
+    if let Ok(selected) = &selection {
         // A present model field must be a non-empty string before any
         // selected backend can execute. Keep selection first so the
         // established error still carries the selected locality/reasons.
@@ -1518,7 +1698,7 @@ async fn chat_completions(
                 .privacy
                 .unwrap_or(idoris_contracts::common::PrivacyClass::LocalOnly);
             return match subscription::dispatch::dispatch_selected(
-                &selected,
+                selected,
                 privacy,
                 lifecycle.peer(),
                 &state.subscriptions,
@@ -1563,7 +1743,7 @@ async fn chat_completions(
             };
         }
         if dispatch::is_resident_http_service(&selected.card) {
-            return chat_via_proxy(&state, &selected, &headers, &parsed, &value, &record_id).await;
+            return chat_via_proxy(&state, selected, &headers, &parsed, &value, &record_id).await;
         }
         if let Err(message) = supervisor_stream::validate(object) {
             let mut response = error_envelope_with_reason(
@@ -1596,7 +1776,7 @@ async fn chat_completions(
     // The request token is a fresh child of this TCP connection's lifetime.
     // Completing the request body does not cancel it; EOF/reset/shutdown of
     // the actual connection does.
-    let selected_for_dispatch = dispatch::select(&policy_cards.cards, &parsed, &prompt).ok();
+    let selected_for_dispatch = selection.ok();
     let selected_estimated_cost = selected_for_dispatch
         .as_ref()
         .map(|selected| selected.estimated_cost_minor);
@@ -2227,6 +2407,9 @@ fn audit_reason(status: StatusCode, served_locality: bool, degraded: bool) -> St
 mod local_privacy_tests;
 
 #[cfg(test)]
+mod virtual_key_wiring_tests;
+
+#[cfg(test)]
 mod correlation_wiring_tests;
 
 #[cfg(test)]
@@ -2234,6 +2417,9 @@ mod request_received_wiring_tests;
 
 #[cfg(test)]
 mod profiled_wiring_tests;
+
+#[cfg(test)]
+mod decided_wiring_tests;
 
 #[cfg(test)]
 mod embeddings_wiring_tests;

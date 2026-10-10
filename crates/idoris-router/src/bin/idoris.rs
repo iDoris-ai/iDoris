@@ -20,6 +20,7 @@ use futures_util::StreamExt;
 use idoris_router::{
     AppState, BIND_HOST,
     admin::{ADMIN_PORT_ENV, AdminBindConfig, AdminSessionToken, build_admin_app},
+    auth::VirtualKeyAuthenticator,
     build_app,
     capabilities::{CapabilitiesProvider, LiveCapabilitiesProvider},
     cli, components, config,
@@ -62,7 +63,20 @@ async fn main() {
                 std::process::exit(1);
             }
         }
+        cli::Command::Key(cli::KeyCommand::Issue) => {
+            if let Err(message) = issue_virtual_key() {
+                eprintln!("[idoris] {message}");
+                std::process::exit(1);
+            }
+        }
     }
+}
+
+fn issue_virtual_key() -> Result<(), String> {
+    let store = storage::open_virtual_key_store_process()?;
+    let mut stdin = std::io::stdin().lock();
+    let mut stdout = std::io::stdout().lock();
+    idoris_router::key_issue::issue_from_reader(&store, &mut stdin, &mut stdout)
 }
 
 fn env_flag(name: &str) -> bool {
@@ -139,6 +153,7 @@ async fn run(options: cli::ServeOptions) -> Result<(), String> {
     // before tenant storage/config bootstrap can surface a later error.
     let persistent = storage::bootstrap_process(deploy_mode)
         .map_err(|err| format!("无法初始化持久化存储：{err}"))?;
+    let virtual_key_authenticator = VirtualKeyAuthenticator::new(persistent.virtual_keys.clone());
 
     let catalog_path = config::resolve_env("IDORIS_CATALOG", "config/catalog.yaml")?;
     let capabilities = match host_facts::current_host_facts() {
@@ -176,6 +191,7 @@ async fn run(options: cli::ServeOptions) -> Result<(), String> {
         subscriptions: subscriptions.clone(),
         budget_ledger: Some(persistent.budget),
         record_store: Some(persistent.records),
+        virtual_key_authenticator: Some(virtual_key_authenticator),
         event_log: Some(persistent.event_log),
         ..AppState::default()
     };
