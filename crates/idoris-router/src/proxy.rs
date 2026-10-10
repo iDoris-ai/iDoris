@@ -175,6 +175,22 @@ impl BufferedUpstreamPath {
     };
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct StreamingUpstreamPath {
+    path: &'static str,
+}
+
+impl StreamingUpstreamPath {
+    const CHAT_COMPLETIONS: Self = Self {
+        path: "/v1/chat/completions",
+    };
+
+    #[cfg(test)]
+    pub(crate) const MESSAGES: Self = Self {
+        path: "/v1/messages",
+    };
+}
+
 /// [`ChatProxy::forward_buffered`]'s result.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExecutionDisposition {
@@ -505,8 +521,15 @@ impl ChatProxy {
         body: &Value,
         opts: &ForwardOpts<'_>,
     ) -> ForwardOutcome {
-        self.forward_buffered_path(endpoint, BufferedUpstreamPath::CHAT_COMPLETIONS, body, opts)
-            .await
+        let result = self
+            .forward_buffered_observed(endpoint, body, opts, || async {
+                Ok::<(), std::convert::Infallible>(())
+            })
+            .await;
+        match result {
+            Ok(outcome) => outcome,
+            Err(never) => match never {},
+        }
     }
 
     pub(crate) async fn forward_buffered_observed<F, Fut, E>(
@@ -1034,8 +1057,18 @@ impl ChatProxy {
     /// outright still gets a plain JSON/text error body, never an SSE
     /// stream carrying an error.
     pub async fn forward_stream(&self, endpoint: &str, body: &Value) -> StreamOutcome {
+        self.forward_stream_path(endpoint, StreamingUpstreamPath::CHAT_COMPLETIONS, body)
+            .await
+    }
+
+    pub(crate) async fn forward_stream_path(
+        &self,
+        endpoint: &str,
+        upstream_path: StreamingUpstreamPath,
+        body: &Value,
+    ) -> StreamOutcome {
         let result = self
-            .forward_stream_observed(endpoint, body, || async {
+            .forward_stream_path_observed(endpoint, upstream_path, body, || async {
                 Ok::<(), std::convert::Infallible>(())
             })
             .await;
@@ -1045,9 +1078,32 @@ impl ChatProxy {
         }
     }
 
+    // This pre-send seam is consumed by the next stacked Event Log slice.
+    // Keep it available in this independently mergeable preparatory PR.
+    #[allow(dead_code)]
     pub(crate) async fn forward_stream_observed<F, Fut, E>(
         &self,
         endpoint: &str,
+        body: &Value,
+        observer: F,
+    ) -> Result<StreamOutcome, E>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<(), E>>,
+    {
+        self.forward_stream_path_observed(
+            endpoint,
+            StreamingUpstreamPath::CHAT_COMPLETIONS,
+            body,
+            observer,
+        )
+        .await
+    }
+
+    async fn forward_stream_path_observed<F, Fut, E>(
+        &self,
+        endpoint: &str,
+        upstream_path: StreamingUpstreamPath,
         body: &Value,
         observer: F,
     ) -> Result<StreamOutcome, E>
@@ -1062,7 +1118,7 @@ impl ChatProxy {
             return Ok(Self::stream_failure(503));
         };
         let permit = Arc::new(permit);
-        let url = format!("{}/v1/chat/completions", endpoint.trim_end_matches('/'));
+        let url = format!("{}{}", endpoint.trim_end_matches('/'), upstream_path.path);
         let mut payload = body.clone();
         if let Some(obj) = payload.as_object_mut() {
             obj.insert("stream".to_string(), Value::Bool(true));
