@@ -38,6 +38,7 @@ pub mod admin;
 
 /// Per-card runtime construction for lifecycle-managed providers.
 pub mod runtime;
+pub mod runtime_launch_config;
 
 /// Atomic reserve/settle/release around a paid candidate (R2-D task 4); not
 /// yet wired into `dispatch`/the request path — a follow-up PR does that.
@@ -59,6 +60,9 @@ pub mod auth;
 /// aggregation is wired by task33.
 pub mod capabilities;
 pub mod host_facts;
+/// Offline, local-only virtual-key issuance. Plaintext is returned once to
+/// the caller and is never persisted.
+pub mod key_issue;
 /// Stable four-way routing/audit reason taxonomy.
 pub mod reason;
 /// Persistent record/budget storage bootstrap (B1 task18).
@@ -2371,6 +2375,9 @@ mod rerank_wiring_tests;
 
 #[cfg(test)]
 mod messages_wiring_tests;
+
+#[cfg(test)]
+mod protocol_stream_path_tests;
 
 #[cfg(test)]
 mod policy_wiring_tests;
