@@ -32,8 +32,13 @@ pub mod routing_policy;
 /// needed) `Supervisor` load → `Supervisor` chat.
 pub mod dispatch;
 
+/// Read-only Admin API v0 status facts. HTTP exposure is intentionally
+/// deferred until the dedicated loopback + session-token listener slice.
+pub mod admin;
+
 /// Per-card runtime construction for lifecycle-managed providers.
 pub mod runtime;
+pub mod runtime_launch_config;
 
 /// Atomic reserve/settle/release around a paid candidate (R2-D task 4); not
 /// yet wired into `dispatch`/the request path — a follow-up PR does that.
@@ -49,10 +54,15 @@ pub mod models;
 /// Metadata-only audit validation and tenant-scoped persistence (B1 task19).
 pub mod audit;
 mod audit_body;
+/// Trusted Authorization bearer -> virtual-key caller identity.
+pub mod auth;
 /// Injectable `/capabilities` provider boundary (B1 task32). Live capacity
 /// aggregation is wired by task33.
 pub mod capabilities;
 pub mod host_facts;
+/// Offline, local-only virtual-key issuance. Plaintext is returned once to
+/// the caller and is never persisted.
+pub mod key_issue;
 /// Stable four-way routing/audit reason taxonomy.
 pub mod reason;
 /// Persistent record/budget storage bootstrap (B1 task18).
@@ -92,7 +102,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use idoris_backend::{BackendError, ChatMessage};
-use idoris_contracts::common::PrivacyClass;
+use idoris_contracts::common::{Capability, PrivacyClass};
 use idoris_policy::Rejection;
 use idoris_tenancy::budget::{BUDGET_EXCEEDED_REASON_CODE, BudgetError};
 use serde::Serialize;
@@ -212,6 +222,9 @@ pub struct AppState {
     /// Tenant-scoped audit/usage record store. Startup installs it together
     /// with `budget_ledger` from the same SQLite path.
     pub record_store: Option<Arc<std::sync::Mutex<idoris_tenancy::store::TenantStore>>>,
+    /// Production installs the persistent B5 verifier. Library tests may
+    /// leave this unset to preserve pre-B5 request behavior.
+    pub virtual_key_authenticator: Option<auth::VirtualKeyAuthenticator>,
     /// Persistent B6 Event Log capability. This slice only bootstraps and
     /// carries the handle; request event emission is wired separately.
     pub event_log: Option<Arc<idoris_tenancy::event_log::EventLogStore>>,
@@ -256,6 +269,13 @@ impl std::fmt::Debug for AppState {
             )
             .field("event_log", &self.event_log.as_ref().map(|_| "configured"))
             .field(
+                "virtual_key_authenticator",
+                &self
+                    .virtual_key_authenticator
+                    .as_ref()
+                    .map(|_| "configured"),
+            )
+            .field(
                 "audit_failures",
                 &self.audit_failures.load(Ordering::Relaxed),
             )
@@ -296,6 +316,7 @@ impl Default for AppState {
             runtimes: runtime::RuntimeRegistry::default(),
             budget_ledger: None,
             record_store: None,
+            virtual_key_authenticator: None,
             event_log: None,
             audit_failures: Arc::new(AtomicU64::new(0)),
             models_health: Arc::new(health::HealthTracker::default()),
@@ -336,6 +357,9 @@ pub fn build_app(state: AppState) -> Router {
             "/v1/chat/completions",
             post(chat_completions).fallback(not_found),
         )
+        .route("/v1/embeddings", post(embeddings).fallback(not_found))
+        .route("/v1/rerank", post(rerank).fallback(not_found))
+        .route("/v1/messages", post(messages).fallback(not_found))
         .fallback(not_found)
         .layer(middleware::from_fn(
             connection::request_lifecycle_middleware,
@@ -345,6 +369,483 @@ pub fn build_app(state: AppState) -> Router {
             record_id_middleware,
         ))
         .with_state(state)
+}
+
+async fn embeddings(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Extension(RequestRecordId(record_id)): Extension<RequestRecordId>,
+    body: Bytes,
+) -> Response {
+    let value: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(value) => value,
+        Err(_) => {
+            return error_envelope(
+                StatusCode::BAD_REQUEST,
+                "invalid_json",
+                "request body is not valid JSON",
+            );
+        }
+    };
+    let Some(object) = value.as_object() else {
+        return error_envelope(
+            StatusCode::BAD_REQUEST,
+            "invalid_body",
+            "request body must be a JSON object",
+        );
+    };
+    let model = object.get("model").and_then(serde_json::Value::as_str);
+    let mut parsed = match parse_profile(&headers, model, state.deploy_mode) {
+        Ok(parsed) => parsed,
+        Err(error) => return error.into_response(),
+    };
+    // The protocol endpoint is authoritative for the required capability.
+    // Caller headers may further constrain routing elsewhere, but they cannot
+    // turn an embeddings request into a chat/rerank dispatch.
+    parsed.task.capabilities = Some(vec![Capability::Embedding]);
+
+    let cards = dispatch::policy_cards(&state.cards, &state.routing_policy, &parsed)
+        .cards
+        .into_iter()
+        .filter(dispatch::is_resident_http_service)
+        .collect::<Vec<_>>();
+    let selected = match dispatch::select(&cards, &parsed, "") {
+        Ok(selected) => selected,
+        Err(DispatchError::Rejection(rejection)) => return rejection_response(rejection),
+        Err(DispatchError::Internal(message)) => {
+            return error_envelope(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", message);
+        }
+    };
+
+    // B7-02 reuses the direct buffered transport. Paid embeddings need a
+    // distinct usage-settlement contract (OpenAI embeddings do not report
+    // chat completion_tokens), so this slice must fail closed before egress.
+    let cost = &selected.card.provider.cost;
+    if cost.input_per_m != 0.0 || cost.output_per_m != 0.0 {
+        return error_envelope(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "paid_proxy_unavailable",
+            "paid embeddings are unavailable until embeddings usage settlement is defined",
+        );
+    }
+    let _reservation = match dispatch::ReservationGuard::reserve(
+        state.budget_ledger.as_deref(),
+        parsed.tenant_id.as_deref(),
+        &selected.card.provider.id,
+        selected.estimated_cost_minor,
+    ) {
+        Ok(guard) => guard,
+        Err(err) => {
+            return budget_error_response(
+                &err,
+                &dispatch::ChatOutcome {
+                    decision: selected.decision.clone(),
+                    served_locality: selected.served_locality,
+                    result: Err(DispatchFailure::Budget(err.clone())),
+                    actual_cost_minor: None,
+                },
+            );
+        }
+    };
+
+    let opts = proxy::ForwardOpts {
+        request_id: headers
+            .get(HEADER_REQUEST_ID)
+            .and_then(|value| value.to_str().ok()),
+        tenant_id: parsed.tenant_id.as_deref(),
+        record_id: &record_id,
+        provider_id: selected.card.provider.id.as_str(),
+        served_locality: selected.served_locality,
+        privacy: parsed.task.privacy.unwrap_or(PrivacyClass::LocalOnly),
+        require_openai_usage: false,
+    };
+    let outcome = state
+        .proxy
+        .forward_buffered_path(
+            &selected.card.endpoint,
+            proxy::BufferedUpstreamPath::EMBEDDINGS,
+            &value,
+            &opts,
+        )
+        .await;
+    let status = StatusCode::from_u16(outcome.status).unwrap_or(StatusCode::BAD_GATEWAY);
+    let mut response = (status, outcome.body).into_response();
+    let content_type = outcome
+        .content_type
+        .as_deref()
+        .unwrap_or("application/json");
+    if let Ok(value) = HeaderValue::from_str(content_type) {
+        response
+            .headers_mut()
+            .insert(axum::http::header::CONTENT_TYPE, value);
+    }
+    if let Ok(value) = HeaderValue::from_str(locality_str(
+        outcome
+            .replayed_served_locality
+            .unwrap_or(selected.served_locality),
+    )) {
+        response.headers_mut().insert(HEADER_SERVED_LOCALITY, value);
+    }
+    if outcome.cached {
+        response.extensions_mut().insert(usage::UsageFact::cached());
+        response
+            .headers_mut()
+            .insert(HEADER_CACHED, HeaderValue::from_static("true"));
+        if let Some(origin) = outcome.origin_record_id
+            && let Ok(value) = HeaderValue::from_str(&origin)
+        {
+            response
+                .headers_mut()
+                .insert(HEADER_ORIGIN_RECORD_ID, value);
+        }
+    } else if status.is_success() {
+        response
+            .extensions_mut()
+            .insert(usage::UsageFact::inference(Some(0)));
+    }
+    response
+}
+
+async fn rerank(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Extension(RequestRecordId(record_id)): Extension<RequestRecordId>,
+    body: Bytes,
+) -> Response {
+    let value: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(value) => value,
+        Err(_) => {
+            return error_envelope(
+                StatusCode::BAD_REQUEST,
+                "invalid_json",
+                "request body is not valid JSON",
+            );
+        }
+    };
+    let Some(object) = value.as_object() else {
+        return error_envelope(
+            StatusCode::BAD_REQUEST,
+            "invalid_body",
+            "request body must be a JSON object",
+        );
+    };
+    let model = object.get("model").and_then(serde_json::Value::as_str);
+    let mut parsed = match parse_profile(&headers, model, state.deploy_mode) {
+        Ok(parsed) => parsed,
+        Err(error) => return error.into_response(),
+    };
+    parsed.task.capabilities = Some(vec![Capability::Rerank]);
+
+    let cards = dispatch::policy_cards(&state.cards, &state.routing_policy, &parsed)
+        .cards
+        .into_iter()
+        .filter(dispatch::is_resident_http_service)
+        .collect::<Vec<_>>();
+    let selected = match dispatch::select(&cards, &parsed, "") {
+        Ok(selected) => selected,
+        Err(DispatchError::Rejection(rejection)) => return rejection_response(rejection),
+        Err(DispatchError::Internal(message)) => {
+            return error_envelope(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", message);
+        }
+    };
+
+    let cost = &selected.card.provider.cost;
+    if cost.input_per_m != 0.0 || cost.output_per_m != 0.0 {
+        return error_envelope(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "paid_proxy_unavailable",
+            "paid rerank is unavailable until rerank usage settlement is defined",
+        );
+    }
+    let _reservation = match dispatch::ReservationGuard::reserve(
+        state.budget_ledger.as_deref(),
+        parsed.tenant_id.as_deref(),
+        &selected.card.provider.id,
+        selected.estimated_cost_minor,
+    ) {
+        Ok(guard) => guard,
+        Err(err) => {
+            return budget_error_response(
+                &err,
+                &dispatch::ChatOutcome {
+                    decision: selected.decision.clone(),
+                    served_locality: selected.served_locality,
+                    result: Err(DispatchFailure::Budget(err.clone())),
+                    actual_cost_minor: None,
+                },
+            );
+        }
+    };
+
+    let opts = proxy::ForwardOpts {
+        request_id: headers
+            .get(HEADER_REQUEST_ID)
+            .and_then(|value| value.to_str().ok()),
+        tenant_id: parsed.tenant_id.as_deref(),
+        record_id: &record_id,
+        provider_id: selected.card.provider.id.as_str(),
+        served_locality: selected.served_locality,
+        privacy: parsed.task.privacy.unwrap_or(PrivacyClass::LocalOnly),
+        require_openai_usage: false,
+    };
+    let outcome = state
+        .proxy
+        .forward_buffered_path(
+            &selected.card.endpoint,
+            proxy::BufferedUpstreamPath::RERANK,
+            &value,
+            &opts,
+        )
+        .await;
+    let status = StatusCode::from_u16(outcome.status).unwrap_or(StatusCode::BAD_GATEWAY);
+    let mut response = (status, outcome.body).into_response();
+    let content_type = outcome
+        .content_type
+        .as_deref()
+        .unwrap_or("application/json");
+    if let Ok(value) = HeaderValue::from_str(content_type) {
+        response
+            .headers_mut()
+            .insert(axum::http::header::CONTENT_TYPE, value);
+    }
+    if let Ok(value) = HeaderValue::from_str(locality_str(
+        outcome
+            .replayed_served_locality
+            .unwrap_or(selected.served_locality),
+    )) {
+        response.headers_mut().insert(HEADER_SERVED_LOCALITY, value);
+    }
+    if outcome.cached {
+        response.extensions_mut().insert(usage::UsageFact::cached());
+        response
+            .headers_mut()
+            .insert(HEADER_CACHED, HeaderValue::from_static("true"));
+        if let Some(origin) = outcome.origin_record_id
+            && let Ok(value) = HeaderValue::from_str(&origin)
+        {
+            response
+                .headers_mut()
+                .insert(HEADER_ORIGIN_RECORD_ID, value);
+        }
+    } else if status.is_success() {
+        response
+            .extensions_mut()
+            .insert(usage::UsageFact::inference(Some(0)));
+    }
+    response
+}
+
+async fn messages(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Extension(RequestRecordId(record_id)): Extension<RequestRecordId>,
+    body: Bytes,
+) -> Response {
+    let value: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(value) => value,
+        Err(_) => {
+            return error_envelope(
+                StatusCode::BAD_REQUEST,
+                "invalid_json",
+                "request body is not valid JSON",
+            );
+        }
+    };
+    let Some(object) = value.as_object() else {
+        return error_envelope(
+            StatusCode::BAD_REQUEST,
+            "invalid_body",
+            "request body must be a JSON object",
+        );
+    };
+    let stream_requested = match object.get("stream") {
+        None => false,
+        Some(stream) => match stream.as_bool() {
+            Some(value) => value,
+            None => {
+                return error_envelope_with_reason(
+                    StatusCode::BAD_REQUEST,
+                    "unsupported_field",
+                    "unsupported_stream",
+                    "stream must be a boolean",
+                );
+            }
+        },
+    };
+    let model = object.get("model").and_then(serde_json::Value::as_str);
+    let mut parsed = match parse_profile(&headers, model, state.deploy_mode) {
+        Ok(parsed) => parsed,
+        Err(error) => return error.into_response(),
+    };
+    parsed.task.capabilities = Some(vec![Capability::Chat]);
+
+    let cards = dispatch::policy_cards(&state.cards, &state.routing_policy, &parsed)
+        .cards
+        .into_iter()
+        .filter(dispatch::is_resident_http_service)
+        .collect::<Vec<_>>();
+    let selected = match dispatch::select(&cards, &parsed, "") {
+        Ok(selected) => selected,
+        Err(DispatchError::Rejection(rejection)) => return rejection_response(rejection),
+        Err(DispatchError::Internal(message)) => {
+            return error_envelope(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", message);
+        }
+    };
+
+    let cost = &selected.card.provider.cost;
+    if cost.input_per_m != 0.0 || cost.output_per_m != 0.0 {
+        return error_envelope(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "paid_proxy_unavailable",
+            "paid messages are unavailable until Anthropic usage settlement is defined",
+        );
+    }
+    let _reservation = match dispatch::ReservationGuard::reserve(
+        state.budget_ledger.as_deref(),
+        parsed.tenant_id.as_deref(),
+        &selected.card.provider.id,
+        selected.estimated_cost_minor,
+    ) {
+        Ok(guard) => guard,
+        Err(err) => {
+            return budget_error_response(
+                &err,
+                &dispatch::ChatOutcome {
+                    decision: selected.decision.clone(),
+                    served_locality: selected.served_locality,
+                    result: Err(DispatchFailure::Budget(err.clone())),
+                    actual_cost_minor: None,
+                },
+            );
+        }
+    };
+
+    if stream_requested {
+        return messages_stream(&state, &selected, &value).await;
+    }
+
+    let opts = proxy::ForwardOpts {
+        request_id: headers
+            .get(HEADER_REQUEST_ID)
+            .and_then(|value| value.to_str().ok()),
+        tenant_id: parsed.tenant_id.as_deref(),
+        record_id: &record_id,
+        provider_id: selected.card.provider.id.as_str(),
+        served_locality: selected.served_locality,
+        privacy: parsed.task.privacy.unwrap_or(PrivacyClass::LocalOnly),
+        require_openai_usage: false,
+    };
+    let outcome = state
+        .proxy
+        .forward_buffered_path(
+            &selected.card.endpoint,
+            proxy::BufferedUpstreamPath::MESSAGES,
+            &value,
+            &opts,
+        )
+        .await;
+    let status = StatusCode::from_u16(outcome.status).unwrap_or(StatusCode::BAD_GATEWAY);
+    let mut response = (status, outcome.body).into_response();
+    let content_type = outcome
+        .content_type
+        .as_deref()
+        .unwrap_or("application/json");
+    if let Ok(value) = HeaderValue::from_str(content_type) {
+        response
+            .headers_mut()
+            .insert(axum::http::header::CONTENT_TYPE, value);
+    }
+    if let Ok(value) = HeaderValue::from_str(locality_str(
+        outcome
+            .replayed_served_locality
+            .unwrap_or(selected.served_locality),
+    )) {
+        response.headers_mut().insert(HEADER_SERVED_LOCALITY, value);
+    }
+    if outcome.cached {
+        response.extensions_mut().insert(usage::UsageFact::cached());
+        response
+            .headers_mut()
+            .insert(HEADER_CACHED, HeaderValue::from_static("true"));
+        if let Some(origin) = outcome.origin_record_id
+            && let Ok(value) = HeaderValue::from_str(&origin)
+        {
+            response
+                .headers_mut()
+                .insert(HEADER_ORIGIN_RECORD_ID, value);
+        }
+    } else if status.is_success() {
+        response
+            .extensions_mut()
+            .insert(usage::UsageFact::inference(Some(0)));
+    }
+    response
+}
+
+async fn messages_stream(
+    state: &AppState,
+    selected: &Selected,
+    body_value: &serde_json::Value,
+) -> Response {
+    match state
+        .proxy
+        .forward_stream_path(
+            &selected.card.endpoint,
+            proxy::StreamingUpstreamPath::MESSAGES,
+            body_value,
+        )
+        .await
+    {
+        proxy::StreamOutcome::Buffered {
+            status,
+            body,
+            content_type,
+            ..
+        } => {
+            let status = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
+            let mut response = (status, body).into_response();
+            let content_type = content_type.as_deref().unwrap_or("application/json");
+            if let Ok(value) = HeaderValue::from_str(content_type) {
+                response
+                    .headers_mut()
+                    .insert(axum::http::header::CONTENT_TYPE, value);
+            }
+            if let Ok(value) = HeaderValue::from_str(locality_str(selected.served_locality)) {
+                response.headers_mut().insert(HEADER_SERVED_LOCALITY, value);
+            }
+            response
+        }
+        proxy::StreamOutcome::Stream {
+            status,
+            content_type,
+            response: upstream,
+        } => {
+            let status = StatusCode::from_u16(status).unwrap_or(StatusCode::OK);
+            let body = Body::from_stream(sse::ensure_event_terminated(
+                upstream.into_data_stream(),
+                b"message_stop",
+            ));
+            let mut response = Response::builder()
+                .status(status)
+                .body(body)
+                .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+            let content_type = content_type.as_deref().unwrap_or("text/event-stream");
+            if let Ok(value) = HeaderValue::from_str(content_type) {
+                response
+                    .headers_mut()
+                    .insert(axum::http::header::CONTENT_TYPE, value);
+            }
+            if let Ok(value) = HeaderValue::from_str(locality_str(selected.served_locality)) {
+                response.headers_mut().insert(HEADER_SERVED_LOCALITY, value);
+            }
+            if status.is_success() {
+                response
+                    .extensions_mut()
+                    .insert(usage::UsageFact::inference(Some(0)));
+            }
+            response
+        }
+    }
 }
 
 async fn get_tenant_usage(
@@ -854,6 +1355,24 @@ fn rejection_response(rejection: Rejection) -> Response {
     )
 }
 
+fn virtual_key_unauthorized_response() -> Response {
+    error_envelope_with_reason(
+        StatusCode::UNAUTHORIZED,
+        "unauthorized",
+        "VIRTUAL_KEY_UNAUTHORIZED",
+        "virtual key authentication failed",
+    )
+}
+
+fn virtual_key_scope_response(error: auth::VirtualKeyScopeError) -> Response {
+    error_envelope_with_reason(
+        StatusCode::FORBIDDEN,
+        "policy_violation",
+        error.reason_code(),
+        "virtual key scope forbids this request",
+    )
+}
+
 fn correlation_error_response(error: correlation::CorrelationError) -> Response {
     error_envelope_with_reason(
         StatusCode::BAD_REQUEST,
@@ -1315,6 +1834,16 @@ async fn chat_completions(
         None
     };
 
+    if let Some(authenticator) = &state.virtual_key_authenticator {
+        let identity = match authenticator.authenticate(&headers).await {
+            Ok(identity) => identity,
+            Err(_) => return virtual_key_unauthorized_response(),
+        };
+        if let Err(error) = auth::enforce_scope(&identity, &parsed) {
+            return virtual_key_scope_response(error);
+        }
+    }
+
     let messages = extract_messages(object);
     let parsed = intent::resolve_profile(parsed, &messages).await;
     if let Some((event_log, tenant_id)) = event_context.as_ref()
@@ -1525,6 +2054,7 @@ async fn chat_completions(
                     dispatched: dispatched_event_context.as_ref(),
                     completed: completed_event_context.as_ref(),
                 },
+                budget_event_context.as_ref(),
             )
             .await;
         }
@@ -1653,6 +2183,7 @@ struct ProxyEventContexts<'a> {
     completed: Option<&'a CompletedEventContext>,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn chat_via_proxy(
     state: &AppState,
     selected: &Selected,
@@ -1661,8 +2192,9 @@ async fn chat_via_proxy(
     body_value: &serde_json::Value,
     record_id: &str,
     events: ProxyEventContexts<'_>,
+    budget_event_context: Option<&BudgetReservedEventContext>,
 ) -> Response {
-    let _reservation = match dispatch::ReservationGuard::reserve(
+    let mut reservation = match dispatch::ReservationGuard::reserve(
         state.budget_ledger.as_deref(),
         parsed.tenant_id.as_deref(),
         &selected.card.provider.id,
@@ -1681,24 +2213,37 @@ async fn chat_via_proxy(
             );
         }
     };
-    // Direct forwarding has no actual-usage settlement yet. Do not admit
-    // a paid call whose reservation would otherwise be released uncharged.
-    if budget::is_paid(Some(selected.estimated_cost_minor)) {
-        return error_envelope(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "paid_proxy_unavailable",
-            "付费直连尚不支持预算结算，请使用支持结算的后端",
-        );
-    }
+    let is_paid = budget::is_paid(Some(selected.estimated_cost_minor));
     let stream_requested = body_value
         .get("stream")
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
+    // Paid streaming still has no trustworthy terminal usage evidence.
+    if is_paid && stream_requested {
+        return error_envelope(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "paid_proxy_unavailable",
+            "付费流式直连尚不支持可信 usage 结算，请使用非流式请求或支持结算的后端",
+        );
+    }
+    if is_paid
+        && let Some(context) = budget_event_context
+        && append_budget_reserved(context, selected).await.is_err()
+    {
+        return event_log_unavailable_response();
+    }
     if stream_requested {
         return chat_via_proxy_stream(state, selected, body_value, events).await;
     }
     chat_via_proxy_buffered(
-        state, selected, headers, parsed, body_value, record_id, events,
+        state,
+        selected,
+        headers,
+        parsed,
+        body_value,
+        record_id,
+        events,
+        &mut reservation,
     )
     .await
 }
@@ -1863,6 +2408,7 @@ fn terminated_proxy_body(upstream: Body) -> Body {
 
 /// The non-streaming half of [`chat_via_proxy`] (this PR's predecessor —
 /// idempotency cache read/write, `X-iDoris-Cached`/`X-iDoris-Origin-Record-Id`).
+#[allow(clippy::too_many_arguments)]
 async fn chat_via_proxy_buffered(
     state: &AppState,
     selected: &Selected,
@@ -1871,7 +2417,9 @@ async fn chat_via_proxy_buffered(
     body_value: &serde_json::Value,
     record_id: &str,
     events: ProxyEventContexts<'_>,
+    reservation: &mut dispatch::ReservationGuard<'_>,
 ) -> Response {
+    let is_paid = budget::is_paid(Some(selected.estimated_cost_minor));
     let request_id = headers.get(HEADER_REQUEST_ID).and_then(|v| v.to_str().ok());
     let privacy = parsed.task.privacy.unwrap_or(PrivacyClass::LocalOnly);
     let opts = proxy::ForwardOpts {
@@ -1881,20 +2429,103 @@ async fn chat_via_proxy_buffered(
         provider_id: selected.card.provider.id.as_str(),
         served_locality: selected.served_locality,
         privacy,
-        require_openai_usage: false,
+        require_openai_usage: is_paid,
     };
-    let outcome = state
-        .proxy
-        .forward_buffered_observed(&selected.card.endpoint, body_value, &opts, || async {
-            if let Some(context) = events.dispatched {
-                append_dispatched(context, selected).await?;
-            }
-            Ok::<(), ()>(())
-        })
-        .await;
+    if is_paid {
+        // Once the paid POST is allowed to leave the process, dropping this
+        // future (client disconnect / cancellation) must not silently release
+        // the reservation: execution may already have happened upstream.
+        reservation.retain_on_drop();
+    }
+    let mut paid_settlement = None;
+    let outcome = if is_paid {
+        state
+            .proxy
+            .forward_buffered_with_success_gate_observed(
+                &selected.card.endpoint,
+                body_value,
+                &opts,
+                |outcome| {
+                    let usage = budget::parse_openai_usage(&outcome.body).map_err(|_| {
+                        (
+                            502,
+                            "upstream_usage_invalid",
+                            "付费上游成功响应缺少可验证的 usage 证据",
+                        )
+                    })?;
+                    let actual =
+                        match budget::actual_cost_from_usage(&selected.card.provider.cost, usage) {
+                            Ok(actual) => actual,
+                            Err(_) => {
+                                reservation.retain_until_expiry();
+                                return Err((
+                                    500,
+                                    "internal_error",
+                                    "付费上游 usage 无法转换为安全结算金额",
+                                ));
+                            }
+                        };
+                    match reservation.settle_replayable(actual) {
+                        Ok(Some(charged)) => {
+                            paid_settlement = Some((charged, usage));
+                            Ok(())
+                        }
+                        Ok(None) => Err((500, "internal_error", "付费上游缺少可结算的预算预留")),
+                        Err(_) => Err((
+                            500,
+                            "internal_error",
+                            "付费上游结算未能确认，请稍后查询预算账本",
+                        )),
+                    }
+                },
+                || async {
+                    if let Some(context) = events.dispatched {
+                        append_dispatched(context, selected).await?;
+                    }
+                    Ok::<(), ()>(())
+                },
+            )
+            .await
+    } else {
+        state
+            .proxy
+            .forward_buffered_observed(&selected.card.endpoint, body_value, &opts, || async {
+                if let Some(context) = events.dispatched {
+                    append_dispatched(context, selected).await?;
+                }
+                Ok::<(), ()>(())
+            })
+            .await
+    };
     let Ok(outcome) = outcome else {
         return event_log_unavailable_response();
     };
+
+    if is_paid {
+        match outcome.execution {
+            proxy::ExecutionDisposition::NotExecuted | proxy::ExecutionDisposition::Replay => {
+                if reservation.release_now().is_err() {
+                    return error_envelope(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "internal_error",
+                        "付费上游预算预留释放失败",
+                    );
+                }
+            }
+            proxy::ExecutionDisposition::Uncertain => {
+                reservation.retain_until_expiry();
+            }
+            proxy::ExecutionDisposition::Executed => {
+                if !(200..300).contains(&outcome.status) && reservation.release_now().is_err() {
+                    return error_envelope(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "internal_error",
+                        "付费上游预算预留释放失败",
+                    );
+                }
+            }
+        }
+    }
 
     let status = StatusCode::from_u16(outcome.status).unwrap_or(StatusCode::BAD_GATEWAY);
     if !outcome.cached
@@ -1945,9 +2576,22 @@ async fn chat_via_proxy_buffered(
             response.headers_mut().insert(HEADER_ORIGIN_RECORD_ID, v);
         }
     } else if status.is_success() {
-        response
-            .extensions_mut()
-            .insert(usage::UsageFact::inference(Some(0)));
+        if let Some((cost_minor, usage)) = paid_settlement {
+            response
+                .extensions_mut()
+                .insert(usage::UsageFact::inference_with_tokens(
+                    Some(cost_minor),
+                    usage.input_tokens,
+                    usage.output_tokens,
+                ));
+            if let Ok(value) = HeaderValue::from_str(&cost_minor.to_string()) {
+                response.headers_mut().insert(HEADER_COST_MINOR, value);
+            }
+        } else {
+            response
+                .extensions_mut()
+                .insert(usage::UsageFact::inference(Some(0)));
+        }
     }
     response
 }
@@ -1989,7 +2633,11 @@ async fn record_id_middleware(
 ) -> Response {
     let audit_started = Instant::now();
     let record_id = Uuid::new_v4().to_string();
-    let audit_chat = req.method() == Method::POST && req.uri().path() == "/v1/chat/completions";
+    let audit_inference = req.method() == Method::POST
+        && matches!(
+            req.uri().path(),
+            "/v1/chat/completions" | "/v1/embeddings" | "/v1/rerank" | "/v1/messages"
+        );
     let audit_tenant = audit_tenant_id(&state, req.headers());
     let audit_request_id = audit_header(req.headers(), HEADER_REQUEST_ID, None);
     let audit_privacy = audit_header(req.headers(), "x-idoris-privacy", Some("local_only"));
@@ -2000,7 +2648,7 @@ async fn record_id_middleware(
     if let Ok(value) = HeaderValue::from_str(&record_id) {
         response.headers_mut().insert(HEADER_RECORD_ID, value);
     }
-    if audit_chat {
+    if audit_inference {
         let usage_meta = response
             .extensions()
             .get::<usage::UsageFact>()
@@ -2236,6 +2884,9 @@ fn audit_reason(status: StatusCode, served_locality: bool, degraded: bool) -> St
 mod local_privacy_tests;
 
 #[cfg(test)]
+mod virtual_key_wiring_tests;
+
+#[cfg(test)]
 mod correlation_wiring_tests;
 
 #[cfg(test)]
@@ -2270,6 +2921,18 @@ mod stream_buffered_completed_wiring_tests;
 
 #[cfg(test)]
 mod request_event_query_tests;
+
+#[cfg(test)]
+mod embeddings_wiring_tests;
+
+#[cfg(test)]
+mod rerank_wiring_tests;
+
+#[cfg(test)]
+mod messages_wiring_tests;
+
+#[cfg(test)]
+mod protocol_stream_path_tests;
 
 #[cfg(test)]
 mod policy_wiring_tests;
@@ -3191,7 +3854,369 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn paid_proxy_without_settlement_fails_closed_before_forwarding() {
+    async fn paid_buffered_proxy_settles_explicit_usage_and_cache_replay_does_not_charge_twice() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+                "id": "chatcmpl-paid",
+                "choices": [{"message": {"role": "assistant", "content": "ok"}}],
+                "usage": {"prompt_tokens": 7, "completion_tokens": 11, "total_tokens": 18}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let (_dir, ledger) = configured_budget_ledger(1_000_000);
+        let ledger = std::sync::Arc::new(ledger);
+        let mut card = resident_component_card("paid", &server.uri());
+        card.provider.cost = paid_component_card("paid").provider.cost;
+        let app = build_app(AppState {
+            cards: vec![card],
+            budget_ledger: Some(ledger.clone()),
+            ..AppState::default()
+        });
+        let body = r#"{"messages":[]}"#;
+        let first = app
+            .clone()
+            .oneshot(post_chat(body, &[("X-iDoris-Request-Id", "paid-once")]))
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        let charged = first
+            .headers()
+            .get(HEADER_COST_MINOR)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .parse::<i64>()
+            .unwrap();
+        assert!(charged > 0);
+        let settled = ledger.tenant_readview(budget::PERSONAL_TENANT_ID).unwrap();
+        assert_eq!((settled.spent_minor, settled.reserved_minor), (charged, 0));
+
+        let replay = app
+            .oneshot(post_chat(body, &[("X-iDoris-Request-Id", "paid-once")]))
+            .await
+            .unwrap();
+        assert_eq!(replay.status(), StatusCode::OK);
+        assert_eq!(
+            replay.headers().get(HEADER_CACHED).unwrap(),
+            HeaderValue::from_static("true")
+        );
+        assert!(!replay.headers().contains_key(HEADER_COST_MINOR));
+        let after_replay = ledger.tenant_readview(budget::PERSONAL_TENANT_ID).unwrap();
+        assert_eq!(
+            (after_replay.spent_minor, after_replay.reserved_minor),
+            (charged, 0)
+        );
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn paid_buffered_proxy_unsettleable_usage_never_publishes_success_for_replay() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+                "id": "chatcmpl-overflow",
+                "choices": [{"message": {"role": "assistant", "content": "paid secret"}}],
+                "usage": {"prompt_tokens": u64::MAX, "completion_tokens": 1}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let (_dir, ledger) = configured_budget_ledger(1_000_000);
+        let ledger = std::sync::Arc::new(ledger);
+        let mut card = resident_component_card("paid", &server.uri());
+        card.provider.cost = paid_component_card("paid").provider.cost;
+        let app = build_app(AppState {
+            cards: vec![card],
+            budget_ledger: Some(ledger.clone()),
+            ..AppState::default()
+        });
+        let request = || {
+            post_chat(
+                r#"{"messages":[]}"#,
+                &[("X-iDoris-Request-Id", "paid-overflow")],
+            )
+        };
+
+        let first = app.clone().oneshot(request()).await.unwrap();
+        assert_eq!(first.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(!first.headers().contains_key(HEADER_CACHED));
+        let first_view = ledger.tenant_readview(budget::PERSONAL_TENANT_ID).unwrap();
+        assert_eq!(first_view.spent_minor, 0);
+        assert!(first_view.reserved_minor > 0);
+
+        let replay = app.oneshot(request()).await.unwrap();
+        assert_eq!(replay.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(!replay.headers().contains_key(HEADER_CACHED));
+        let replay_view = ledger.tenant_readview(budget::PERSONAL_TENANT_ID).unwrap();
+        assert_eq!(
+            (replay_view.spent_minor, replay_view.reserved_minor),
+            (0, first_view.reserved_minor)
+        );
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn paid_buffered_proxy_settlement_busy_never_publishes_success_for_replay() {
+        use axum::{Router, extract::State, routing::post};
+        use idoris_tenancy::budget::{DEFAULT_RESERVATION_TTL_MS, SystemClock};
+        use rusqlite::TransactionBehavior;
+        use tokio::sync::Notify;
+
+        type UpstreamState = (
+            std::sync::Arc<Notify>,
+            std::sync::Arc<Notify>,
+            std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        );
+        async fn paid_response(
+            State((received, release, calls)): State<UpstreamState>,
+        ) -> Json<serde_json::Value> {
+            if calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                received.notify_one();
+                release.notified().await;
+            }
+            Json(json!({
+                "id": "chatcmpl-busy",
+                "choices": [{"message": {"role": "assistant", "content": "paid secret"}}],
+                "usage": {"prompt_tokens": 7, "completion_tokens": 11}
+            }))
+        }
+
+        let received = std::sync::Arc::new(Notify::new());
+        let release = std::sync::Arc::new(Notify::new());
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let upstream = Router::new()
+            .route("/v1/chat/completions", post(paid_response))
+            .with_state((received.clone(), release.clone(), calls.clone()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, upstream).await.unwrap();
+        });
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let db_path = dir.path().join("busy.sqlite3");
+        let ledger = BudgetLedger::open_with_busy_timeout(
+            &db_path,
+            std::sync::Arc::new(SystemClock),
+            DEFAULT_RESERVATION_TTL_MS,
+            std::time::Duration::from_millis(10),
+        )
+        .unwrap();
+        ledger
+            .configure_tenant(
+                budget::PERSONAL_TENANT_ID,
+                1_000_000,
+                "UTC",
+                SpendGate::PaidOnly,
+            )
+            .unwrap();
+        let ledger = std::sync::Arc::new(ledger);
+        let mut card = resident_component_card("paid", &endpoint);
+        card.provider.cost = paid_component_card("paid").provider.cost;
+        let app = build_app(AppState {
+            cards: vec![card],
+            budget_ledger: Some(ledger.clone()),
+            ..AppState::default()
+        });
+        let request = || {
+            post_chat(
+                r#"{"messages":[]}"#,
+                &[("X-iDoris-Request-Id", "paid-busy")],
+            )
+        };
+        let first_app = app.clone();
+        let first = tokio::spawn(async move { first_app.oneshot(request()).await.unwrap() });
+        tokio::time::timeout(std::time::Duration::from_secs(2), received.notified())
+            .await
+            .expect("upstream must receive the paid POST");
+
+        let mut blocker = Connection::open(&db_path).unwrap();
+        let writer = blocker
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        release.notify_one();
+        let first = first.await.unwrap();
+        assert_eq!(first.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(!first.headers().contains_key(HEADER_CACHED));
+        drop(writer);
+
+        let first_view = ledger.tenant_readview(budget::PERSONAL_TENANT_ID).unwrap();
+        assert_eq!(first_view.spent_minor, 0);
+        assert!(first_view.reserved_minor > 0);
+        let replay = app.oneshot(request()).await.unwrap();
+        assert_eq!(replay.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(!replay.headers().contains_key(HEADER_CACHED));
+        let replay_view = ledger.tenant_readview(budget::PERSONAL_TENANT_ID).unwrap();
+        assert_eq!(replay_view.reserved_minor, first_view.reserved_minor);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn paid_buffered_proxy_missing_usage_fails_closed_and_keeps_reservation_held() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(json!({"id": "chatcmpl-no-usage", "choices": []})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let (_dir, ledger) = configured_budget_ledger(1_000_000);
+        let ledger = std::sync::Arc::new(ledger);
+        let mut card = resident_component_card("paid", &server.uri());
+        card.provider.cost = paid_component_card("paid").provider.cost;
+        let app = build_app(AppState {
+            cards: vec![card],
+            budget_ledger: Some(ledger.clone()),
+            ..AppState::default()
+        });
+        let first = app
+            .clone()
+            .oneshot(post_chat(
+                r#"{"messages":[]}"#,
+                &[("X-iDoris-Request-Id", "missing-usage")],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::BAD_GATEWAY);
+        let first_view = ledger.tenant_readview(budget::PERSONAL_TENANT_ID).unwrap();
+        assert_eq!(first_view.spent_minor, 0);
+        assert!(first_view.reserved_minor > 0);
+
+        let replay = app
+            .oneshot(post_chat(
+                r#"{"messages":[]}"#,
+                &[("X-iDoris-Request-Id", "missing-usage")],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(replay.status(), StatusCode::BAD_GATEWAY);
+        let replay_view = ledger.tenant_readview(budget::PERSONAL_TENANT_ID).unwrap();
+        assert_eq!(replay_view.spent_minor, 0);
+        assert_eq!(replay_view.reserved_minor, first_view.reserved_minor);
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn paid_buffered_proxy_connect_failure_releases_the_reservation() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+
+        let (_dir, ledger) = configured_budget_ledger(1_000_000);
+        let ledger = std::sync::Arc::new(ledger);
+        let mut card = resident_component_card("paid", &endpoint);
+        card.provider.cost = paid_component_card("paid").provider.cost;
+        let app = build_app(AppState {
+            cards: vec![card],
+            budget_ledger: Some(ledger.clone()),
+            ..AppState::default()
+        });
+
+        let response = app
+            .oneshot(post_chat(r#"{"messages":[]}"#, &[]))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let view = ledger.tenant_readview(budget::PERSONAL_TENANT_ID).unwrap();
+        assert_eq!((view.spent_minor, view.reserved_minor), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn paid_buffered_proxy_uncertain_500_keeps_only_the_original_reservation() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(500)
+                    .set_body_json(json!({"error": "maybe-executed"})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let (_dir, ledger) = configured_budget_ledger(1_000_000);
+        let ledger = std::sync::Arc::new(ledger);
+        let mut card = resident_component_card("paid", &server.uri());
+        card.provider.cost = paid_component_card("paid").provider.cost;
+        let app = build_app(AppState {
+            cards: vec![card],
+            budget_ledger: Some(ledger.clone()),
+            ..AppState::default()
+        });
+        let request = || {
+            post_chat(
+                r#"{"messages":[]}"#,
+                &[("X-iDoris-Request-Id", "uncertain-500")],
+            )
+        };
+
+        let first = app.clone().oneshot(request()).await.unwrap();
+        assert_eq!(first.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let first_view = ledger.tenant_readview(budget::PERSONAL_TENANT_ID).unwrap();
+        assert_eq!(first_view.spent_minor, 0);
+        assert!(first_view.reserved_minor > 0);
+
+        let replay = app.oneshot(request()).await.unwrap();
+        assert_eq!(replay.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let replay_view = ledger.tenant_readview(budget::PERSONAL_TENANT_ID).unwrap();
+        assert_eq!(replay_view.spent_minor, 0);
+        assert_eq!(replay_view.reserved_minor, first_view.reserved_minor);
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn dropping_paid_buffered_proxy_future_keeps_the_inflight_reservation() {
+        use axum::{Router, extract::State, routing::post};
+        use tokio::sync::Notify;
+
+        async fn hold(State(received): State<std::sync::Arc<Notify>>, body: Bytes) -> &'static str {
+            assert!(!body.is_empty());
+            received.notify_one();
+            std::future::pending::<()>().await;
+            unreachable!()
+        }
+
+        let received = std::sync::Arc::new(Notify::new());
+        let upstream = Router::new()
+            .route("/v1/chat/completions", post(hold))
+            .with_state(received.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, upstream).await.unwrap();
+        });
+
+        let (_dir, ledger) = configured_budget_ledger(1_000_000);
+        let ledger = std::sync::Arc::new(ledger);
+        let mut card = resident_component_card("paid", &endpoint);
+        card.provider.cost = paid_component_card("paid").provider.cost;
+        let app = build_app(AppState {
+            cards: vec![card],
+            budget_ledger: Some(ledger.clone()),
+            ..AppState::default()
+        });
+        let request = post_chat(
+            r#"{"messages":[{"role":"user","content":"paid in flight"}]}"#,
+            &[("X-iDoris-Request-Id", "drop-paid")],
+        );
+        let task = tokio::spawn(async move { app.oneshot(request).await.unwrap() });
+        tokio::time::timeout(std::time::Duration::from_secs(2), received.notified())
+            .await
+            .expect("upstream must receive the complete paid POST");
+        task.abort();
+        let _ = task.await;
+
+        let view = ledger.tenant_readview(budget::PERSONAL_TENANT_ID).unwrap();
+        assert_eq!(view.spent_minor, 0);
+        assert!(view.reserved_minor > 0);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn paid_streaming_proxy_remains_fail_closed_before_forwarding() {
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("POST"))
             .respond_with(wiremock::ResponseTemplate::new(200))
@@ -3207,11 +4232,39 @@ mod tests {
             ..AppState::default()
         });
         let response = app
-            .oneshot(post_chat(r#"{"messages":[]}"#, &[]))
+            .oneshot(post_chat(r#"{"messages":[],"stream":true}"#, &[]))
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn unknown_price_resident_proxy_is_rejected_at_pricing_before_egress() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        let mut card = resident_component_card("unknown-price", &endpoint);
+        card.provider.cost.input_per_m = f64::NAN;
+        card.provider.cost.output_per_m = 0.0;
+        let app = build_app(AppState {
+            cards: vec![card],
+            ..AppState::default()
+        });
+
+        let response = app
+            .oneshot(post_chat(r#"{"messages":[]}"#, &[]))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let error: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error["error"]["type"], "no_eligible_candidate");
+        assert!(
+            error["error"]["remediation"]
+                .as_str()
+                .is_some_and(|text| text.contains("Pricing"))
+        );
     }
 
     #[tokio::test]
