@@ -1960,7 +1960,7 @@ async fn chat_completions(
             selected,
             LocalExecutionContext::new(supervisor, budget_ledger, budget_event_context.as_ref()),
             &parsed,
-            dispatch::DispatchInput::with_model(model, &prompt),
+            dispatch::DispatchInput::with_model(model, &prompt).with_affinity(affinity_key),
             messages,
             lifecycle.cancellation_token(),
         )
