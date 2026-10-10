@@ -436,6 +436,284 @@ fn recorded_migration_with_missing_schema_object_fails_at_open() {
 }
 
 #[test]
+fn recorded_migration_with_noop_append_only_triggers_fails_at_open() {
+    let db = temp_db("schema-noop-guards");
+    let conn = Connection::open(&db).unwrap();
+    conn.execute_batch(include_str!("migrations/0001_events.sql"))
+        .unwrap();
+    conn.execute_batch(
+        "CREATE TABLE event_log_schema_migrations(version INTEGER PRIMARY KEY); \
+         INSERT INTO event_log_schema_migrations VALUES(1); \
+         DROP TRIGGER event_log_guard_insert; \
+         DROP TRIGGER event_log_sequence_positive; \
+         DROP TRIGGER event_log_no_update; \
+         DROP TRIGGER event_log_no_delete; \
+         CREATE TRIGGER event_log_guard_insert BEFORE INSERT ON event_log_events WHEN NEW.sequence != -1 OR EXISTS (SELECT 1 FROM event_log_events WHERE event_id = NEW.event_id) BEGIN SELECT 'RAISE(ABORT'; END; \
+         CREATE TRIGGER event_log_sequence_positive AFTER INSERT ON event_log_events WHEN NEW.sequence <= 0 BEGIN SELECT 'RAISE(ABORT'; END; \
+         CREATE TRIGGER event_log_no_update BEFORE UPDATE ON event_log_events BEGIN SELECT 'RAISE(ABORT'; END; \
+         CREATE TRIGGER event_log_no_delete BEFORE DELETE ON event_log_events BEGIN SELECT 'RAISE(ABORT'; END;",
+    )
+    .unwrap();
+    assert!(matches!(
+        EventLogStore::new(conn),
+        Err(EventLogError::SchemaIncomplete)
+    ));
+}
+
+#[test]
+fn recorded_migration_with_probe_aware_guards_fails_at_open() {
+    let db = temp_db("schema-probe-aware-guards");
+    let conn = Connection::open(&db).unwrap();
+    conn.execute_batch(include_str!("migrations/0001_events.sql"))
+        .unwrap();
+    conn.execute_batch(
+        "CREATE TABLE event_log_schema_migrations(version INTEGER PRIMARY KEY); \
+         INSERT INTO event_log_schema_migrations VALUES(1); \
+         DROP TRIGGER event_log_no_update; \
+         DROP TRIGGER event_log_no_delete; \
+         CREATE TRIGGER event_log_no_update BEFORE UPDATE ON event_log_events \
+           WHEN OLD.tenant_id LIKE 'schema-probe-%' BEGIN SELECT RAISE(ABORT, 'event log is append-only'); END; \
+         CREATE TRIGGER event_log_no_delete BEFORE DELETE ON event_log_events \
+           WHEN OLD.tenant_id LIKE 'schema-probe-%' BEGIN SELECT RAISE(ABORT, 'event log is append-only'); END;",
+    )
+    .unwrap();
+    assert!(matches!(
+        EventLogStore::new(conn),
+        Err(EventLogError::SchemaIncomplete)
+    ));
+}
+
+#[test]
+fn main_migration_trigger_is_rejected_before_marker_insert_can_forge_event() {
+    let db = temp_db("main-migration-trigger");
+    let conn = Connection::open(&db).unwrap();
+    conn.execute_batch(include_str!("migrations/0001_events.sql"))
+        .unwrap();
+    conn.execute_batch(
+        "CREATE TABLE event_log_schema_migrations(version INTEGER PRIMARY KEY); \
+         CREATE TRIGGER forge_on_migration AFTER INSERT ON EVENT_LOG_SCHEMA_MIGRATIONS BEGIN \
+           INSERT INTO event_log_events(event_id,tenant_id,record_id,event_type,ts_utc_ms,metadata) \
+           VALUES('00000000-0000-4000-8000-000000000001','attacker','forged','decided',0,'{}'); \
+         END;",
+    )
+    .unwrap();
+
+    assert!(matches!(
+        EventLogStore::new(conn),
+        Err(EventLogError::SchemaIncomplete)
+    ));
+    let check = Connection::open(&db).unwrap();
+    assert_eq!(
+        check
+            .query_row("SELECT count(*) FROM event_log_events", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+        0,
+        "migration trigger must be rejected before version insertion can fire it"
+    );
+}
+
+#[test]
+fn temp_migration_trigger_is_rejected_before_marker_insert_can_forge_event() {
+    let db = temp_db("temp-migration-trigger");
+    let conn = Connection::open(&db).unwrap();
+    conn.execute_batch(include_str!("migrations/0001_events.sql"))
+        .unwrap();
+    conn.execute_batch(
+        "CREATE TABLE event_log_schema_migrations(version INTEGER PRIMARY KEY); \
+         CREATE TEMP TRIGGER forge_on_migration AFTER INSERT ON main.Event_Log_Schema_Migrations BEGIN \
+           INSERT INTO event_log_events(event_id,tenant_id,record_id,event_type,ts_utc_ms,metadata) \
+           VALUES('00000000-0000-4000-8000-000000000002','attacker','forged','decided',0,'{}'); \
+         END;",
+    )
+    .unwrap();
+
+    assert!(matches!(
+        EventLogStore::new(conn),
+        Err(EventLogError::SchemaIncomplete)
+    ));
+    let check = Connection::open(&db).unwrap();
+    assert_eq!(
+        check
+            .query_row("SELECT count(*) FROM event_log_events", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+        0,
+        "TEMP migration trigger must be rejected before version insertion can fire it"
+    );
+}
+
+#[test]
+fn mixed_case_event_trigger_is_rejected_before_probe_can_forge_history() {
+    let db = temp_db("mixed-case-event-trigger");
+    let conn = Connection::open(&db).unwrap();
+    conn.execute_batch(include_str!("migrations/0001_events.sql"))
+        .unwrap();
+    conn.execute_batch(
+        "CREATE TABLE event_log_schema_migrations(version INTEGER PRIMARY KEY); \
+         INSERT INTO event_log_schema_migrations(version) VALUES(1); \
+         CREATE TRIGGER forge_on_event AFTER INSERT ON Event_Log_Events BEGIN \
+           INSERT INTO event_log_events(event_id,tenant_id,record_id,event_type,ts_utc_ms,metadata) \
+           VALUES('00000000-0000-4000-8000-000000000003','attacker','forged','decided',0,'{}'); \
+         END;",
+    )
+    .unwrap();
+
+    assert!(matches!(
+        EventLogStore::new(conn),
+        Err(EventLogError::SchemaIncomplete)
+    ));
+    let check = Connection::open(&db).unwrap();
+    assert_eq!(
+        check
+            .query_row("SELECT count(*) FROM event_log_events", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+        0,
+        "case-variant event trigger must be rejected before the schema probe can fire it"
+    );
+}
+
+#[test]
+fn temp_mixed_case_event_trigger_is_rejected_before_probe_can_forge_history() {
+    let db = temp_db("temp-mixed-case-event-trigger");
+    let conn = Connection::open(&db).unwrap();
+    conn.execute_batch(include_str!("migrations/0001_events.sql"))
+        .unwrap();
+    conn.execute_batch(
+        "CREATE TABLE event_log_schema_migrations(version INTEGER PRIMARY KEY); \
+         INSERT INTO event_log_schema_migrations(version) VALUES(1); \
+         CREATE TEMP TRIGGER forge_on_event AFTER INSERT ON main.Event_Log_Events BEGIN \
+           INSERT INTO event_log_events(event_id,tenant_id,record_id,event_type,ts_utc_ms,metadata) \
+           VALUES('00000000-0000-4000-8000-000000000004','attacker','forged','decided',0,'{}'); \
+         END;",
+    )
+    .unwrap();
+
+    assert!(matches!(
+        EventLogStore::new(conn),
+        Err(EventLogError::SchemaIncomplete)
+    ));
+    let check = Connection::open(&db).unwrap();
+    assert_eq!(
+        check
+            .query_row("SELECT count(*) FROM event_log_events", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+        0,
+        "TEMP case-variant event trigger must be rejected before the schema probe can fire it"
+    );
+}
+
+#[test]
+fn unsupported_migration_version_fails_closed_without_applying_older_schema() {
+    let db = temp_db("unsupported-migration-version");
+    let conn = Connection::open(&db).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE event_log_schema_migrations(version INTEGER PRIMARY KEY); \
+         INSERT INTO event_log_schema_migrations(version) VALUES(2);",
+    )
+    .unwrap();
+
+    assert!(matches!(
+        EventLogStore::new(conn),
+        Err(EventLogError::SchemaIncomplete)
+    ));
+    let check = Connection::open(&db).unwrap();
+    let versions: Vec<i64> = check
+        .prepare("SELECT version FROM event_log_schema_migrations ORDER BY version")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(versions, vec![2]);
+    let event_table: Option<String> = check
+        .query_row(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='event_log_events'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .unwrap();
+    assert!(
+        event_table.is_none(),
+        "unsupported future schema must not be backfilled with migration 1"
+    );
+}
+
+#[test]
+fn temp_shadow_is_rejected_even_with_canonical_main_schema() {
+    let db = temp_db("temp-shadow");
+    drop(EventLogStore::open(&db).unwrap());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute_batch(
+        "CREATE TEMP TABLE event_log_events (
+            sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_id TEXT NOT NULL UNIQUE, tenant_id TEXT NOT NULL, record_id TEXT NOT NULL,
+            event_type TEXT NOT NULL, ts_utc_ms INTEGER NOT NULL, request_id TEXT, session_id TEXT,
+            trace_id TEXT, parent_id TEXT, origin_record_id TEXT, metadata TEXT NOT NULL
+         );
+         CREATE TEMP TRIGGER event_log_guard_insert BEFORE INSERT ON event_log_events WHEN NEW.sequence != -1 OR EXISTS (SELECT 1 FROM event_log_events WHERE event_id = NEW.event_id) BEGIN SELECT RAISE(ABORT, 'event insert violates append-only invariants'); END;
+         CREATE TEMP TRIGGER event_log_sequence_positive AFTER INSERT ON event_log_events WHEN NEW.sequence <= 0 BEGIN SELECT RAISE(ABORT, 'event sequence must be database-assigned'); END;
+         CREATE TEMP TRIGGER event_log_no_update BEFORE UPDATE ON event_log_events BEGIN SELECT RAISE(ABORT, 'event log is append-only'); END;
+         CREATE TEMP TRIGGER event_log_no_delete BEFORE DELETE ON event_log_events BEGIN SELECT RAISE(ABORT, 'event log is append-only'); END;",
+    )
+    .unwrap();
+    assert!(matches!(
+        EventLogStore::new(conn),
+        Err(EventLogError::SchemaIncomplete)
+    ));
+}
+
+#[test]
+fn attached_shadow_cannot_capture_main_migration_or_event_writes() {
+    let db = temp_db("attached-main");
+    let shadow = temp_db("attached-shadow");
+    let shadow_conn = Connection::open(&shadow).unwrap();
+    shadow_conn
+        .execute_batch(
+            "CREATE TABLE event_log_events(sequence INTEGER PRIMARY KEY, marker TEXT); \
+             CREATE TABLE event_log_schema_migrations(version INTEGER PRIMARY KEY);",
+        )
+        .unwrap();
+    drop(shadow_conn);
+
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("ATTACH DATABASE ?1 AS shadow", [shadow.to_str().unwrap()])
+        .unwrap();
+    let store = EventLogStore::new(conn).unwrap();
+    let event = sample("tenant-a", "attached-record");
+    store.append(Some("tenant-a"), &event).unwrap();
+    drop(store);
+
+    let main = Connection::open(&db).unwrap();
+    assert_eq!(
+        main.query_row(
+            "SELECT count(*) FROM main.event_log_events WHERE event_id=?1",
+            [&event.event_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap(),
+        1
+    );
+    let shadow = Connection::open(&shadow).unwrap();
+    assert_eq!(
+        shadow
+            .query_row("SELECT count(*) FROM event_log_events", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+        0,
+        "attached schemas must not capture Event Log migration/runtime writes"
+    );
+}
+
+#[test]
 fn poisoned_connection_mutex_fails_closed() {
     let store = EventLogStore::new(Connection::open_in_memory().unwrap()).unwrap();
     let _ = std::panic::catch_unwind(|| {

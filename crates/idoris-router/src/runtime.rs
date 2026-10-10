@@ -2,10 +2,13 @@
 
 use std::collections::BTreeMap;
 
-use idoris_backend::{Supervisor, SupervisorConfig, SupervisorHandle};
+use idoris_backend::{
+    BackendError, BackendStatus, RuntimeAdapter, Supervisor, SupervisorConfig, SupervisorHandle,
+};
 use idoris_contracts::{ComponentCard, component_card::Form};
 use idoris_policy::is_subscription_provider_id;
 use idoris_upstream::factory::create_adapter;
+use idoris_upstream::{LocalHttpRuntimeAdapter, LocalHttpRuntimeConfig};
 
 use crate::dispatch::BoundSupervisor;
 
@@ -16,9 +19,20 @@ pub struct RuntimeRegistry {
 
 impl RuntimeRegistry {
     pub fn spawn(cards: &[ComponentCard]) -> Result<Self, String> {
+        Self::spawn_with_factory(cards, create_adapter)
+    }
+
+    /// Construct lifecycle runtimes using an explicitly supplied adapter
+    /// factory. The production default remains [`create_adapter`]; this seam
+    /// lets trusted startup configuration provide process-owned local runtimes
+    /// without smuggling executable/model paths into portable component cards.
+    pub fn spawn_with_factory<F>(cards: &[ComponentCard], factory: F) -> Result<Self, String>
+    where
+        F: Fn(&ComponentCard) -> Result<std::sync::Arc<dyn RuntimeAdapter>, BackendError>,
+    {
         let mut registry = Self::default();
         for card in cards {
-            let Some(handle) = spawn_runtime(card)? else {
+            let Some(handle) = spawn_runtime_with_factory(card, &factory)? else {
                 continue;
             };
             let provider_id = card.provider.id.clone();
@@ -35,8 +49,64 @@ impl RuntimeRegistry {
         Ok(registry)
     }
 
+    pub fn spawn_with_local_configs(
+        cards: &[ComponentCard],
+        local: &BTreeMap<String, LocalHttpRuntimeConfig>,
+    ) -> Result<Self, String> {
+        for (provider_id, config) in local {
+            let card = cards
+                .iter()
+                .find(|card| card.provider.id == *provider_id)
+                .ok_or_else(|| {
+                    format!("本地 runtime {provider_id:?} 没有对应的组件卡，拒绝启动")
+                })?;
+            if crate::dispatch::is_resident_http_service(card) {
+                return Err(format!(
+                    "本地 runtime {provider_id:?} 不能绑定 Resident 直连组件卡"
+                ));
+            }
+            if card.form != Form::HttpService
+                || card.provider.locality != idoris_contracts::provider::Locality::Loopback
+                || card.endpoint != config.launch.endpoint()
+            {
+                return Err(format!(
+                    "本地 runtime {provider_id:?} 与组件卡的 form/locality/endpoint 不一致"
+                ));
+            }
+        }
+
+        Self::spawn_with_factory(cards, |card| {
+            if let Some(config) = local.get(&card.provider.id) {
+                return LocalHttpRuntimeAdapter::new(config.clone()).map(|adapter| {
+                    std::sync::Arc::new(adapter) as std::sync::Arc<dyn RuntimeAdapter>
+                });
+            }
+            create_adapter(card)
+        })
+    }
+
     pub fn get(&self, provider_id: &str) -> Option<&BoundSupervisor> {
         self.supervisors.get(provider_id)
+    }
+
+    pub(crate) async fn status_observations(
+        &self,
+    ) -> Vec<(String, Result<BackendStatus, BackendError>)> {
+        let mut observations = Vec::with_capacity(self.supervisors.len());
+        for (provider_id, supervisor) in &self.supervisors {
+            observations.push((provider_id.clone(), supervisor.status().await));
+        }
+        observations
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_supervisors(supervisors: impl IntoIterator<Item = BoundSupervisor>) -> Self {
+        Self {
+            supervisors: supervisors
+                .into_iter()
+                .map(|bound| (bound.provider_id().to_string(), bound))
+                .collect(),
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -92,6 +162,16 @@ impl From<Option<BoundSupervisor>> for RuntimeRegistry {
 /// # Panics
 /// Lifecycle construction requires a running Tokio runtime, like `Supervisor::spawn`.
 pub fn spawn_runtime(card: &ComponentCard) -> Result<Option<SupervisorHandle>, String> {
+    spawn_runtime_with_factory(card, &create_adapter)
+}
+
+fn spawn_runtime_with_factory<F>(
+    card: &ComponentCard,
+    factory: &F,
+) -> Result<Option<SupervisorHandle>, String>
+where
+    F: Fn(&ComponentCard) -> Result<std::sync::Arc<dyn RuntimeAdapter>, BackendError>,
+{
     if is_subscription_provider_id(&card.provider.id) {
         return Ok(None);
     }
@@ -105,7 +185,7 @@ pub fn spawn_runtime(card: &ComponentCard) -> Result<Option<SupervisorHandle>, S
         ));
     }
     let adapter =
-        create_adapter(card).map_err(|error| format!("provider {}: {error}", card.provider.id))?;
+        factory(card).map_err(|error| format!("provider {}: {error}", card.provider.id))?;
     Supervisor::spawn(adapter, SupervisorConfig::default())
         .map(Some)
         .map_err(|error| format!("provider {}: {error}", card.provider.id))
@@ -228,6 +308,66 @@ mod tests {
             let response = outcome.result.unwrap();
             assert_eq!(response.model, card.provider.id);
         }
+    }
+
+    #[tokio::test]
+    async fn injected_factory_constructs_non_omlx_lifecycle_runtime_without_card_extensions() {
+        let mut custom = named_card("local-http");
+        custom.extensions = None;
+        let registry = RuntimeRegistry::spawn_with_factory(std::slice::from_ref(&custom), |card| {
+            Ok(Arc::new(MockAdapter::new(vec![ModelInfo {
+                id: card.provider.id.clone(),
+                memory_gb: 2.0,
+            }])) as Arc<dyn RuntimeAdapter>)
+        })
+        .unwrap();
+
+        assert_eq!(registry.len(), 1);
+        assert!(registry.get("local-http").is_some());
+    }
+
+    #[tokio::test]
+    async fn injected_factory_is_not_called_for_subscription_or_resident_proxy_cards() {
+        let mut resident = named_card("resident");
+        resident.load_policy.as_mut().unwrap().mode = LoadMode::Resident;
+        let mut subscription = named_card(idoris_policy::SUBSCRIPTION_PROVIDER_ID);
+        subscription.load_policy = None;
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+
+        let registry = RuntimeRegistry::spawn_with_factory(&[resident, subscription], |_| {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(BackendError::internal("factory must not run"))
+        })
+        .unwrap();
+
+        assert!(registry.is_empty());
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn local_config_requires_exact_card_binding() {
+        let mut custom = named_card("local-http");
+        custom.endpoint = "http://127.0.0.1:18111".into();
+        let launch = idoris_upstream::LocalRuntimeLaunch::new(
+            idoris_upstream::LocalRuntimeKind::MlxLmServer,
+            "/usr/bin/python3",
+            "/models/qwen-mlx",
+            18111,
+        )
+        .unwrap();
+        let config = LocalHttpRuntimeConfig::new(
+            launch,
+            "local-http",
+            2.0,
+            "/tmp/idoris/local-http.pending".into(),
+        )
+        .unwrap();
+        let configs = BTreeMap::from([("local-http".to_string(), config)]);
+        assert!(RuntimeRegistry::spawn_with_local_configs(&[custom.clone()], &configs).is_ok());
+
+        custom.endpoint = "http://127.0.0.1:19999".into();
+        assert!(RuntimeRegistry::spawn_with_local_configs(&[custom], &configs).is_err());
+        assert!(RuntimeRegistry::spawn_with_local_configs(&[], &configs).is_err());
     }
 
     #[tokio::test]
