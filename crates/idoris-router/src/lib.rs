@@ -21,6 +21,9 @@ pub mod components;
 /// Executable-relative bundled config resolution with explicit-path overrides.
 pub mod config;
 
+/// Validated chat-request correlation identifiers for later Event Log use.
+pub mod correlation;
+
 /// Routing-policy loading from `IDORIS_ROUTING_POLICY` (R2-D task 2); wired
 /// into `AppState` in a follow-up PR.
 pub mod routing_policy;
@@ -50,6 +53,8 @@ pub mod models;
 /// Metadata-only audit validation and tenant-scoped persistence (B1 task19).
 pub mod audit;
 mod audit_body;
+/// Trusted Authorization bearer -> virtual-key caller identity.
+pub mod auth;
 /// Injectable `/capabilities` provider boundary (B1 task32). Live capacity
 /// aggregation is wired by task33.
 pub mod capabilities;
@@ -210,6 +215,9 @@ pub struct AppState {
     /// Tenant-scoped audit/usage record store. Startup installs it together
     /// with `budget_ledger` from the same SQLite path.
     pub record_store: Option<Arc<std::sync::Mutex<idoris_tenancy::store::TenantStore>>>,
+    /// Persistent B6 Event Log capability. This slice only bootstraps and
+    /// carries the handle; request event emission is wired separately.
+    pub event_log: Option<Arc<idoris_tenancy::event_log::EventLogStore>>,
     /// Best-effort audit persistence failures. Audit must not alter the HTTP
     /// result already produced by routing/backend execution.
     pub audit_failures: Arc<AtomicU64>,
@@ -249,6 +257,7 @@ impl std::fmt::Debug for AppState {
                 "record_store",
                 &self.record_store.as_ref().map(|_| "TenantStore { .. }"),
             )
+            .field("event_log", &self.event_log.as_ref().map(|_| "configured"))
             .field(
                 "audit_failures",
                 &self.audit_failures.load(Ordering::Relaxed),
@@ -290,6 +299,7 @@ impl Default for AppState {
             runtimes: runtime::RuntimeRegistry::default(),
             budget_ledger: None,
             record_store: None,
+            event_log: None,
             audit_failures: Arc::new(AtomicU64::new(0)),
             models_health: Arc::new(health::HealthTracker::default()),
             capabilities: None,
@@ -372,8 +382,8 @@ async fn embeddings(
     // turn an embeddings request into a chat/rerank dispatch.
     parsed.task.capabilities = Some(vec![Capability::Embedding]);
 
-    let (cards, _) = dispatch::policy_cards(&state.cards, &state.routing_policy, &parsed);
-    let cards = cards
+    let cards = dispatch::policy_cards(&state.cards, &state.routing_policy, &parsed)
+        .cards
         .into_iter()
         .filter(dispatch::is_resident_http_service)
         .collect::<Vec<_>>();
@@ -504,8 +514,8 @@ async fn rerank(
     };
     parsed.task.capabilities = Some(vec![Capability::Rerank]);
 
-    let (cards, _) = dispatch::policy_cards(&state.cards, &state.routing_policy, &parsed);
-    let cards = cards
+    let cards = dispatch::policy_cards(&state.cards, &state.routing_policy, &parsed)
+        .cards
         .into_iter()
         .filter(dispatch::is_resident_http_service)
         .collect::<Vec<_>>();
@@ -646,8 +656,8 @@ async fn messages(
     };
     parsed.task.capabilities = Some(vec![Capability::Chat]);
 
-    let (cards, _) = dispatch::policy_cards(&state.cards, &state.routing_policy, &parsed);
-    let cards = cards
+    let cards = dispatch::policy_cards(&state.cards, &state.routing_policy, &parsed)
+        .cards
         .into_iter()
         .filter(dispatch::is_resident_http_service)
         .collect::<Vec<_>>();
@@ -1201,6 +1211,102 @@ fn rejection_response(rejection: Rejection) -> Response {
     )
 }
 
+fn correlation_error_response(error: correlation::CorrelationError) -> Response {
+    error_envelope_with_reason(
+        StatusCode::BAD_REQUEST,
+        "invalid_correlation_header",
+        error.reason_code(),
+        "invalid correlation header",
+    )
+}
+
+fn event_log_unavailable_response() -> Response {
+    error_envelope_with_reason(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "event_log_unavailable",
+        "EVENT_LOG_APPEND_UNAVAILABLE",
+        "event log unavailable",
+    )
+}
+
+async fn run_event_log_write<F>(write: F) -> Result<(), ()>
+where
+    F: FnOnce() -> Result<(), idoris_tenancy::event_log::EventLogError> + Send + 'static,
+{
+    tokio::task::spawn_blocking(write)
+        .await
+        .map_err(|_| ())?
+        .map_err(|_| ())
+}
+
+async fn append_request_received(
+    store: Arc<idoris_tenancy::event_log::EventLogStore>,
+    tenant_id: String,
+    record_id: String,
+    correlation: &correlation::RequestCorrelation,
+) -> Result<(), ()> {
+    let ts_utc_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_millis()).ok())
+        .ok_or(())?;
+    let event = idoris_tenancy::event_log::NewEvent {
+        event_id: Uuid::new_v4().to_string(),
+        tenant_id: tenant_id.clone(),
+        record_id,
+        event_type: idoris_tenancy::event_log::EventType::RequestReceived,
+        ts_utc_ms,
+        request_id: None,
+        session_id: correlation.session_id.clone(),
+        trace_id: correlation.trace_id.clone(),
+        parent_id: correlation.parent_id.clone(),
+        origin_record_id: None,
+        metadata: Default::default(),
+    };
+    run_event_log_write(move || store.append(Some(&tenant_id), &event).map(|_| ())).await
+}
+
+async fn append_profiled(
+    store: Arc<idoris_tenancy::event_log::EventLogStore>,
+    tenant_id: String,
+    record_id: String,
+    correlation: &correlation::RequestCorrelation,
+    parsed: &ParsedProfile,
+) -> Result<(), ()> {
+    let privacy = match parsed
+        .task
+        .privacy
+        .unwrap_or(idoris_contracts::common::PrivacyClass::LocalOnly)
+    {
+        idoris_contracts::common::PrivacyClass::LocalOnly => "local_only",
+        idoris_contracts::common::PrivacyClass::Any => "any",
+    };
+    let mut metadata = std::collections::BTreeMap::new();
+    metadata.insert("privacy".to_string(), json!(privacy));
+    if let Some(intent) = parsed.task.intent.as_deref() {
+        metadata.insert("intent".to_string(), json!(intent));
+    }
+    let ts_utc_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_millis()).ok())
+        .ok_or(())?;
+    let event = idoris_tenancy::event_log::NewEvent {
+        event_id: Uuid::new_v4().to_string(),
+        tenant_id: tenant_id.clone(),
+        record_id,
+        event_type: idoris_tenancy::event_log::EventType::Profiled,
+        ts_utc_ms,
+        request_id: None,
+        session_id: correlation.session_id.clone(),
+        trace_id: correlation.trace_id.clone(),
+        parent_id: correlation.parent_id.clone(),
+        origin_record_id: None,
+        metadata,
+    };
+    run_event_log_write(move || store.append(Some(&tenant_id), &event).map(|_| ())).await
+}
+
 /// `POST /v1/chat/completions`. Order (locked by conformance): non-JSON
 /// body -> `invalid_json`; valid JSON that isn't an object -> `invalid_body`;
 /// only then are control-plane headers parsed (see [`profile::parse_profile`]).
@@ -1238,18 +1344,58 @@ async fn chat_completions(
         Ok(parsed) => parsed,
         Err(err) => return err.into_response(),
     };
+    let correlation = match correlation::parse(&headers) {
+        Ok(context) => context,
+        Err(error) => return correlation_error_response(error),
+    };
+    let event_context = if let Some(event_log) = state.event_log.clone() {
+        let tenant_id = match state.deploy_mode {
+            idoris_contracts::DeployMode::Personal => budget::PERSONAL_TENANT_ID.to_string(),
+            idoris_contracts::DeployMode::Tenant => match parsed.tenant_id.clone() {
+                Some(tenant_id) => tenant_id,
+                None => return event_log_unavailable_response(),
+            },
+        };
+        if append_request_received(
+            event_log.clone(),
+            tenant_id.clone(),
+            record_id.clone(),
+            &correlation,
+        )
+        .await
+        .is_err()
+        {
+            return event_log_unavailable_response();
+        }
+        Some((event_log, tenant_id))
+    } else {
+        None
+    };
 
     let messages = extract_messages(object);
     let parsed = intent::resolve_profile(parsed, &messages).await;
+    if let Some((event_log, tenant_id)) = event_context
+        && append_profiled(
+            event_log,
+            tenant_id,
+            record_id.clone(),
+            &correlation,
+            &parsed,
+        )
+        .await
+        .is_err()
+    {
+        return event_log_unavailable_response();
+    }
     let prompt = messages
         .iter()
         .map(|m| m.content.as_str())
         .collect::<Vec<_>>()
         .join("\n");
 
-    let (cards, fail_closed) = dispatch::policy_cards(&state.cards, &state.routing_policy, &parsed);
-    if cards.is_empty() {
-        return if fail_closed {
+    let policy_cards = dispatch::policy_cards(&state.cards, &state.routing_policy, &parsed);
+    if policy_cards.cards.is_empty() {
+        return if policy_cards.route.fail_closed {
             rejection_response(idoris_policy::Rejection::LocalOnlyUnavailable)
         } else {
             error_envelope(
@@ -1266,7 +1412,7 @@ async fn chat_completions(
     // Supervisor, which only makes sense for a real oMLX-shaped backend
     // with an explicit load/unload lifecycle. See dispatch::select's doc
     // for the accepted double-decide() tradeoff this branch makes.
-    if let Ok(selected) = dispatch::select(&cards, &parsed, &prompt) {
+    if let Ok(selected) = dispatch::select(&policy_cards.cards, &parsed, &prompt) {
         // A present model field must be a non-empty string before any
         // selected backend can execute. Keep selection first so the
         // established error still carries the selected locality/reasons.
@@ -1380,7 +1526,7 @@ async fn chat_completions(
     // The request token is a fresh child of this TCP connection's lifetime.
     // Completing the request body does not cancel it; EOF/reset/shutdown of
     // the actual connection does.
-    let selected_for_dispatch = dispatch::select(&cards, &parsed, &prompt).ok();
+    let selected_for_dispatch = dispatch::select(&policy_cards.cards, &parsed, &prompt).ok();
     let selected_estimated_cost = selected_for_dispatch
         .as_ref()
         .map(|selected| selected.estimated_cost_minor);
@@ -1389,7 +1535,7 @@ async fn chat_completions(
         .and_then(|selected| state.runtimes.get(&selected.card.provider.id));
     let budget_ledger = state.budget_ledger.as_deref();
     match dispatch_local(
-        &cards,
+        &policy_cards.cards,
         supervisor,
         budget_ledger,
         &parsed,
@@ -2011,6 +2157,15 @@ fn audit_reason(status: StatusCode, served_locality: bool, degraded: bool) -> St
 mod local_privacy_tests;
 
 #[cfg(test)]
+mod correlation_wiring_tests;
+
+#[cfg(test)]
+mod request_received_wiring_tests;
+
+#[cfg(test)]
+mod profiled_wiring_tests;
+
+#[cfg(test)]
 mod embeddings_wiring_tests;
 
 #[cfg(test)]
@@ -2085,6 +2240,11 @@ mod tests {
         assert_eq!(parse_port(None).unwrap(), DEFAULT_PORT);
         assert_eq!(parse_port(Some("")).unwrap(), DEFAULT_PORT);
         assert_eq!(parse_port(Some("   ")).unwrap(), DEFAULT_PORT);
+    }
+
+    #[test]
+    fn default_app_state_keeps_event_log_unconfigured() {
+        assert!(AppState::default().event_log.is_none());
     }
 
     #[test]
