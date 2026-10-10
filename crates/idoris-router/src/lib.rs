@@ -381,8 +381,8 @@ async fn embeddings(
     // turn an embeddings request into a chat/rerank dispatch.
     parsed.task.capabilities = Some(vec![Capability::Embedding]);
 
-    let (cards, _) = dispatch::policy_cards(&state.cards, &state.routing_policy, &parsed);
-    let cards = cards
+    let cards = dispatch::policy_cards(&state.cards, &state.routing_policy, &parsed)
+        .cards
         .into_iter()
         .filter(dispatch::is_resident_http_service)
         .collect::<Vec<_>>();
@@ -513,8 +513,8 @@ async fn rerank(
     };
     parsed.task.capabilities = Some(vec![Capability::Rerank]);
 
-    let (cards, _) = dispatch::policy_cards(&state.cards, &state.routing_policy, &parsed);
-    let cards = cards
+    let cards = dispatch::policy_cards(&state.cards, &state.routing_policy, &parsed)
+        .cards
         .into_iter()
         .filter(dispatch::is_resident_http_service)
         .collect::<Vec<_>>();
