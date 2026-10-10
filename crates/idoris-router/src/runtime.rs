@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 
 use idoris_backend::{
-    BackendError, RuntimeAdapter, Supervisor, SupervisorConfig, SupervisorHandle,
+    BackendError, BackendStatus, RuntimeAdapter, Supervisor, SupervisorConfig, SupervisorHandle,
 };
 use idoris_contracts::{ComponentCard, component_card::Form};
 use idoris_policy::is_subscription_provider_id;
@@ -87,6 +87,26 @@ impl RuntimeRegistry {
 
     pub fn get(&self, provider_id: &str) -> Option<&BoundSupervisor> {
         self.supervisors.get(provider_id)
+    }
+
+    pub(crate) async fn status_observations(
+        &self,
+    ) -> Vec<(String, Result<BackendStatus, BackendError>)> {
+        let mut observations = Vec::with_capacity(self.supervisors.len());
+        for (provider_id, supervisor) in &self.supervisors {
+            observations.push((provider_id.clone(), supervisor.status().await));
+        }
+        observations
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_supervisors(supervisors: impl IntoIterator<Item = BoundSupervisor>) -> Self {
+        Self {
+            supervisors: supervisors
+                .into_iter()
+                .map(|bound| (bound.provider_id().to_string(), bound))
+                .collect(),
+        }
     }
 
     pub fn len(&self) -> usize {
