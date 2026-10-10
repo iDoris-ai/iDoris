@@ -78,8 +78,19 @@ async fn messages_preserves_native_path_payload_and_response() {
 }
 
 #[tokio::test]
-async fn messages_streaming_is_explicitly_rejected_before_upstream() {
+async fn messages_streaming_preserves_native_sse_and_requires_message_stop() {
     let server = MockServer::start().await;
+    let body = "event: message_start\ndata: {\"type\":\"message_start\"}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+    Mock::given(method("POST"))
+        .and(wiremock::matchers::path("/v1/messages"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_raw(body, "text/event-stream"),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
     let response = build_app(AppState {
         cards: vec![messages_card("messages-local", &server.uri())],
         ..AppState::default()
@@ -91,11 +102,45 @@ async fn messages_streaming_is_explicitly_rejected_before_upstream() {
     .await
     .unwrap();
 
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()[axum::http::header::CONTENT_TYPE],
+        HeaderValue::from_static("text/event-stream")
+    );
     let bytes = response.into_body().collect().await.unwrap().to_bytes();
-    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(json["error"]["reason_code"], "unsupported_stream");
-    assert!(server.received_requests().await.unwrap().is_empty());
+    assert_eq!(bytes.as_ref(), body.as_bytes());
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn messages_streaming_clean_eof_without_message_stop_is_body_error() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_raw(
+                    "event: message_delta\ndata: {\"type\":\"message_delta\"}\n\n",
+                    "text/event-stream",
+                ),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let response = build_app(AppState {
+        cards: vec![messages_card("messages-local", &server.uri())],
+        ..AppState::default()
+    })
+    .oneshot(request(
+        json!({"model":"claude-local","max_tokens":32,"stream":true,"messages":[]}),
+        &[],
+    ))
+    .await
+    .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(response.into_body().collect().await.is_err());
+    server.verify().await;
 }
 
 #[tokio::test]
@@ -136,6 +181,30 @@ async fn free_messages_respect_exhausted_spend_gate_all_before_upstream() {
     })
     .oneshot(request(
         json!({"model":"claude-local","max_tokens":32,"messages":[]}),
+        &[],
+    ))
+    .await
+    .unwrap();
+
+    assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn free_messages_stream_respects_exhausted_spend_gate_all_before_upstream() {
+    let server = MockServer::start().await;
+    let dir = tempfile::TempDir::new().unwrap();
+    let ledger = BudgetLedger::open(dir.path().join("budget.sqlite3")).unwrap();
+    ledger
+        .configure_tenant(budget::PERSONAL_TENANT_ID, 0, "UTC", SpendGate::All)
+        .unwrap();
+    let response = build_app(AppState {
+        cards: vec![messages_card("messages-local", &server.uri())],
+        budget_ledger: Some(Arc::new(ledger)),
+        ..AppState::default()
+    })
+    .oneshot(request(
+        json!({"model":"claude-local","max_tokens":32,"stream":true,"messages":[]}),
         &[],
     ))
     .await
