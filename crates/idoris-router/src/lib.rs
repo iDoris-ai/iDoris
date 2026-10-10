@@ -120,6 +120,7 @@ const HEADER_REASON: &str = "X-iDoris-Reason";
 const HEADER_DEGRADED: &str = "X-iDoris-Degraded";
 const HEADER_COST_MINOR: &str = "X-iDoris-Cost-Minor";
 const HEADER_REQUEST_ID: &str = "x-idoris-request-id";
+const HEADER_SESSION: &str = "x-idoris-session";
 const HEADER_CACHED: &str = "X-iDoris-Cached";
 const HEADER_ORIGIN_RECORD_ID: &str = "X-iDoris-Origin-Record-Id";
 
@@ -1087,6 +1088,14 @@ fn query_scope_header(headers: &HeaderMap) -> Option<&str> {
         .filter(|value| !value.is_empty())
 }
 
+fn session_affinity_key(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(HEADER_SESSION)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
 async fn get_capabilities(State(state): State<Arc<AppState>>) -> Response {
     let Some(provider) = state.capabilities.as_ref() else {
         return error_envelope(
@@ -1815,6 +1824,7 @@ async fn chat_completions(
     } else if state.dev_no_key_enabled && authorization_present {
         return virtual_key_unauthorized_response();
     }
+    let affinity_key = session_affinity_key(&headers);
 
     let messages = extract_messages(object);
     let parsed = intent::resolve_profile(parsed, &messages).await;
@@ -1897,7 +1907,8 @@ async fn chat_completions(
         };
     }
 
-    let selection = dispatch::select(&policy_cards.cards, &parsed, &prompt);
+    let selection =
+        dispatch::select_with_affinity(&policy_cards.cards, &parsed, &prompt, affinity_key);
     let rejection_reason = match &selection {
         Ok(_) => None,
         Err(DispatchError::Rejection(rejection)) => Some(rejection.error_type()),
@@ -2075,7 +2086,7 @@ async fn chat_completions(
                 completed_event_context.as_ref(),
             ),
             &parsed,
-            dispatch::DispatchInput::with_model(model, &prompt),
+            dispatch::DispatchInput::with_model(model, &prompt).with_affinity(affinity_key),
             messages,
             lifecycle.cancellation_token(),
         )
@@ -2093,7 +2104,7 @@ async fn chat_completions(
             supervisor,
             budget_ledger,
             &parsed,
-            dispatch::DispatchInput::with_model(model, &prompt),
+            dispatch::DispatchInput::with_model(model, &prompt).with_affinity(affinity_key),
             messages,
             lifecycle.cancellation_token(),
         )
@@ -2874,6 +2885,16 @@ mod tests {
         for bad in ["0", "-1", "70000"] {
             assert!(parse_port(Some(bad)).is_err(), "{bad} should be rejected");
         }
+    }
+
+    #[test]
+    fn session_affinity_header_is_trimmed_and_empty_is_disabled() {
+        let mut headers = HeaderMap::new();
+        assert_eq!(session_affinity_key(&headers), None);
+        headers.insert(HEADER_SESSION, HeaderValue::from_static("  run-42  "));
+        assert_eq!(session_affinity_key(&headers), Some("run-42"));
+        headers.insert(HEADER_SESSION, HeaderValue::from_static("   "));
+        assert_eq!(session_affinity_key(&headers), None);
     }
 
     #[tokio::test]

@@ -75,6 +75,7 @@ fn budget_stage<'a>(
     req: &RequestProfile,
     ctx: &PolicyCtx<'_>,
     candidates: Vec<&'a Card>,
+    affinity_key: Option<&str>,
 ) -> Result<BudgetStageOutcome<'a>, Rejection> {
     let mut reasons = Vec::new();
     let snapshot = ctx
@@ -87,7 +88,7 @@ fn budget_stage<'a>(
     };
 
     #[allow(clippy::expect_used)] // candidates 非空由调用方保证（admission 阶段已排除空集）
-    let natural_pick = pick(&candidates).expect("candidates is non-empty");
+    let natural_pick = pick(&candidates, affinity_key).expect("candidates is non-empty");
     let natural_cost = natural_pick.estimated_cost_minor.unwrap_or(0);
     let free: Vec<&Card> = candidates
         .iter()
@@ -144,9 +145,27 @@ fn budget_stage<'a>(
     })
 }
 
-/// 按 (admission 优先级, 估算成本, id 字典序) 排序取最小——最后一项永远打破
-/// 平局，保证同样输入两次运行结果一致（确定性要求）。
-fn pick<'a>(candidates: &[&'a Card]) -> Option<&'a Card> {
+/// Stable FNV-1a score for rendezvous-style session affinity. This is not a
+/// security hash; it only provides a process/version-independent deterministic
+/// tie-break without storing unbounded session state.
+fn affinity_score(session: &str, candidate_id: &str) -> u64 {
+    const OFFSET: u64 = 0xcbf29ce484222325;
+    const PRIME: u64 = 0x100000001b3;
+    session
+        .as_bytes()
+        .iter()
+        .copied()
+        .chain(std::iter::once(0))
+        .chain(candidate_id.as_bytes().iter().copied())
+        .fold(OFFSET, |hash, byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(PRIME)
+        })
+}
+
+/// 按 (admission 优先级, 估算成本, 会话亲和, id 字典序) 排序取最小。
+/// Affinity only breaks an exact admission/cost tie, so it can never bypass
+/// privacy, capability, admission, or budget policy to keep a session sticky.
+fn pick<'a>(candidates: &[&'a Card], affinity_key: Option<&str>) -> Option<&'a Card> {
     candidates.iter().copied().min_by(|a, b| {
         admission_rank(a.admission_status)
             .cmp(&admission_rank(b.admission_status))
@@ -154,6 +173,12 @@ fn pick<'a>(candidates: &[&'a Card]) -> Option<&'a Card> {
                 a.estimated_cost_minor
                     .unwrap_or(0)
                     .cmp(&b.estimated_cost_minor.unwrap_or(0))
+            })
+            .then_with(|| match affinity_key {
+                Some(session) => {
+                    affinity_score(session, b.id()).cmp(&affinity_score(session, a.id()))
+                }
+                None => std::cmp::Ordering::Equal,
             })
             .then_with(|| a.id().cmp(b.id()))
     })
@@ -165,6 +190,18 @@ pub fn decide(
     req: &RequestProfile,
     cards: &[Card],
     ctx: &PolicyCtx<'_>,
+) -> Result<Decision, Rejection> {
+    decide_with_affinity(req, cards, ctx, None)
+}
+
+/// Same safety pipeline as [`decide`], with a stable session key used only
+/// to break otherwise-identical candidate ties. The affinity key never enters
+/// any privacy/capability/admission/budget comparison and is not persisted.
+pub fn decide_with_affinity(
+    req: &RequestProfile,
+    cards: &[Card],
+    ctx: &PolicyCtx<'_>,
+    affinity_key: Option<&str>,
 ) -> Result<Decision, Rejection> {
     let mut reasons = Vec::new();
 
@@ -287,7 +324,7 @@ pub fn decide(
 
     // ---- ⑤ 预算（只作用于"本应选中的那条路径"；见 [`budget_stage`]） ---------
     let (after_budget, budget_reasons, budget_degradation) =
-        budget_stage(req, ctx, admission_eligible)?;
+        budget_stage(req, ctx, admission_eligible, affinity_key)?;
     reasons.extend(budget_reasons);
 
     let mut degradations = Vec::new();
@@ -310,7 +347,8 @@ pub fn decide(
     // ---- ⑥ 选择（Score → Pick，确定性排序） ---------------------------------
     #[allow(clippy::expect_used)]
     // after_budget 非空：budget_stage 只会原样返回非空输入或返回非空的 free 子集
-    let chosen = pick(&after_budget).expect("after_budget is non-empty, pick always returns Some");
+    let chosen = pick(&after_budget, affinity_key)
+        .expect("after_budget is non-empty, pick always returns Some");
 
     Ok(Decision {
         chosen_id: chosen.id().to_string(),
