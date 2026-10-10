@@ -117,6 +117,7 @@ impl RuntimeRegistry {
                 .into_iter()
                 .map(|bound| (bound.provider_id().to_string(), bound))
                 .collect(),
+            startup_capacity: None,
         }
     }
 
