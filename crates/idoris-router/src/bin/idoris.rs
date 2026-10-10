@@ -681,7 +681,7 @@ mod tests {
 }
 
 #[cfg(test)]
-mod tests {
+mod bind_tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
