@@ -8,7 +8,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::http::{HeaderMap, header::AUTHORIZATION};
-use idoris_contracts::common::PrivacyClass;
+use idoris_contracts::common::{FallbackPolicy, PrivacyClass};
+use idoris_policy::ROLES;
 use idoris_tenancy::virtual_key::VirtualKeySecret;
 use idoris_tenancy::virtual_key::store::{AuthenticatedVirtualKey, VirtualKeyStore};
 
@@ -35,6 +36,7 @@ impl std::error::Error for VirtualKeyAuthError {}
 pub enum VirtualKeyScopeError {
     PrivacyForbidden,
     RoleForbidden,
+    FallbackForbidden,
 }
 
 impl VirtualKeyScopeError {
@@ -42,6 +44,7 @@ impl VirtualKeyScopeError {
         match self {
             Self::PrivacyForbidden => "VIRTUAL_KEY_PRIVACY_FORBIDDEN",
             Self::RoleForbidden => "VIRTUAL_KEY_ROLE_FORBIDDEN",
+            Self::FallbackForbidden => "VIRTUAL_KEY_FALLBACK_FORBIDDEN",
         }
     }
 }
@@ -64,7 +67,23 @@ pub fn enforce_scope(
     if !identity.scope.allowed_privacy.contains(&privacy) {
         return Err(VirtualKeyScopeError::PrivacyForbidden);
     }
-    let role = profile.role.ok_or(VirtualKeyScopeError::RoleForbidden)?;
+    let full_role_authority = ROLES.iter().all(|role| {
+        identity
+            .scope
+            .allowed_roles
+            .iter()
+            .any(|allowed| allowed == role.as_str())
+    });
+    if matches!(profile.task.fallback, Some(FallbackPolicy::NextInChain)) && !full_role_authority {
+        return Err(VirtualKeyScopeError::FallbackForbidden);
+    }
+    let Some(role) = profile.role else {
+        return if full_role_authority {
+            Ok(())
+        } else {
+            Err(VirtualKeyScopeError::RoleForbidden)
+        };
+    };
     if !identity
         .scope
         .allowed_roles
@@ -79,41 +98,94 @@ pub fn enforce_scope(
 #[derive(Clone)]
 pub struct VirtualKeyAuthenticator {
     store: Arc<Mutex<VirtualKeyStore>>,
+    #[cfg(test)]
+    before_store_lock: Option<Arc<tokio::sync::Notify>>,
 }
 
 impl VirtualKeyAuthenticator {
     pub fn new(store: Arc<Mutex<VirtualKeyStore>>) -> Self {
-        Self { store }
+        Self {
+            store,
+            #[cfg(test)]
+            before_store_lock: None,
+        }
     }
 
-    pub fn authenticate(
+    pub async fn authenticate(
         &self,
         headers: &HeaderMap,
     ) -> Result<AuthenticatedVirtualKey, VirtualKeyAuthError> {
-        let now_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|_| VirtualKeyAuthError::Unavailable)?
-            .as_millis()
-            .try_into()
-            .map_err(|_| VirtualKeyAuthError::Unavailable)?;
-        self.authenticate_at(headers, now_ms)
+        let secret = bearer_secret(headers)?;
+        let store = self.store.clone();
+        #[cfg(test)]
+        let before_store_lock = self.before_store_lock.clone();
+        tokio::task::spawn_blocking(move || {
+            #[cfg(test)]
+            if let Some(notify) = before_store_lock {
+                notify.notify_one();
+            }
+            authenticate_secret(&store, secret)
+        })
+        .await
+        .map_err(|_| VirtualKeyAuthError::Unavailable)?
     }
 
+    #[cfg(test)]
     fn authenticate_at(
         &self,
         headers: &HeaderMap,
         now_ms: i64,
     ) -> Result<AuthenticatedVirtualKey, VirtualKeyAuthError> {
         let secret = bearer_secret(headers)?;
-        let store = self
-            .store
-            .lock()
-            .map_err(|_| VirtualKeyAuthError::Unavailable)?;
-        store
-            .authenticate(&secret, now_ms)
-            .map_err(|_| VirtualKeyAuthError::Unavailable)?
-            .ok_or(VirtualKeyAuthError::Unauthorized)
+        authenticate_secret_with_clock(&self.store, secret, || Ok(now_ms))
     }
+
+    #[cfg(test)]
+    pub(crate) fn notify_before_store_lock(mut self, notify: Arc<tokio::sync::Notify>) -> Self {
+        self.before_store_lock = Some(notify);
+        self
+    }
+}
+
+fn authenticate_secret(
+    store: &Arc<Mutex<VirtualKeyStore>>,
+    secret: VirtualKeySecret,
+) -> Result<AuthenticatedVirtualKey, VirtualKeyAuthError> {
+    authenticate_secret_with_clock(store, secret, server_now_ms)
+}
+
+fn authenticate_secret_with_clock(
+    store: &Arc<Mutex<VirtualKeyStore>>,
+    secret: VirtualKeySecret,
+    mut now_ms: impl FnMut() -> Result<i64, VirtualKeyAuthError>,
+) -> Result<AuthenticatedVirtualKey, VirtualKeyAuthError> {
+    let store = store.lock().map_err(|_| VirtualKeyAuthError::Unavailable)?;
+    let lookup_now = now_ms()?;
+    let identity = store
+        .authenticate(&secret, lookup_now)
+        .map_err(|_| VirtualKeyAuthError::Unavailable)?
+        .ok_or(VirtualKeyAuthError::Unauthorized)?;
+    let decision_now = now_ms()?;
+    if decision_now < lookup_now {
+        return Err(VirtualKeyAuthError::Unavailable);
+    }
+    if identity
+        .scope
+        .expires_at_ms
+        .is_some_and(|expires| expires <= decision_now)
+    {
+        return Err(VirtualKeyAuthError::Unauthorized);
+    }
+    Ok(identity)
+}
+
+fn server_now_ms() -> Result<i64, VirtualKeyAuthError> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| VirtualKeyAuthError::Unavailable)?
+        .as_millis()
+        .try_into()
+        .map_err(|_| VirtualKeyAuthError::Unavailable)
 }
 
 fn bearer_secret(headers: &HeaderMap) -> Result<VirtualKeySecret, VirtualKeyAuthError> {
@@ -297,6 +369,10 @@ mod tests {
             enforce_scope(&fast, &profile("backend-concrete-model", None)).unwrap_err(),
             VirtualKeyScopeError::RoleForbidden
         );
+
+        let roles = ROLES.iter().map(|role| role.as_str()).collect::<Vec<_>>();
+        let unrestricted = identity(vec![PrivacyClass::LocalOnly], &roles);
+        assert!(enforce_scope(&unrestricted, &profile("backend-concrete-model", None)).is_ok());
     }
 
     #[test]
@@ -305,5 +381,21 @@ mod tests {
         let mut parsed = profile("idoris/fast", None);
         parsed.task.privacy = None;
         assert!(enforce_scope(&local_fast, &parsed).is_ok());
+    }
+
+    #[test]
+    fn fallback_requires_full_role_authority() {
+        let mut parsed = profile("idoris/fast", None);
+        parsed.task.fallback = Some(FallbackPolicy::NextInChain);
+
+        let limited = identity(vec![PrivacyClass::LocalOnly], &["fast"]);
+        assert_eq!(
+            enforce_scope(&limited, &parsed).unwrap_err(),
+            VirtualKeyScopeError::FallbackForbidden
+        );
+
+        let roles = ROLES.iter().map(|role| role.as_str()).collect::<Vec<_>>();
+        let unrestricted = identity(vec![PrivacyClass::LocalOnly], &roles);
+        assert!(enforce_scope(&unrestricted, &parsed).is_ok());
     }
 }

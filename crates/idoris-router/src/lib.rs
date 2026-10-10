@@ -38,6 +38,7 @@ pub mod admin;
 
 /// Per-card runtime construction for lifecycle-managed providers.
 pub mod runtime;
+pub mod runtime_launch_config;
 
 /// Atomic reserve/settle/release around a paid candidate (R2-D task 4); not
 /// yet wired into `dispatch`/the request path — a follow-up PR does that.
@@ -59,6 +60,9 @@ pub mod auth;
 /// aggregation is wired by task33.
 pub mod capabilities;
 pub mod host_facts;
+/// Offline, local-only virtual-key issuance. Plaintext is returned once to
+/// the caller and is never persisted.
+pub mod key_issue;
 /// Stable four-way routing/audit reason taxonomy.
 pub mod reason;
 /// Persistent record/budget storage bootstrap (B1 task18).
@@ -218,6 +222,9 @@ pub struct AppState {
     /// Tenant-scoped audit/usage record store. Startup installs it together
     /// with `budget_ledger` from the same SQLite path.
     pub record_store: Option<Arc<std::sync::Mutex<idoris_tenancy::store::TenantStore>>>,
+    /// Production installs the persistent B5 verifier. Library tests may
+    /// leave this unset to preserve pre-B5 request behavior.
+    pub virtual_key_authenticator: Option<auth::VirtualKeyAuthenticator>,
     /// Persistent B6 Event Log capability. This slice only bootstraps and
     /// carries the handle; request event emission is wired separately.
     pub event_log: Option<Arc<idoris_tenancy::event_log::EventLogStore>>,
@@ -262,6 +269,13 @@ impl std::fmt::Debug for AppState {
             )
             .field("event_log", &self.event_log.as_ref().map(|_| "configured"))
             .field(
+                "virtual_key_authenticator",
+                &self
+                    .virtual_key_authenticator
+                    .as_ref()
+                    .map(|_| "configured"),
+            )
+            .field(
                 "audit_failures",
                 &self.audit_failures.load(Ordering::Relaxed),
             )
@@ -302,6 +316,7 @@ impl Default for AppState {
             runtimes: runtime::RuntimeRegistry::default(),
             budget_ledger: None,
             record_store: None,
+            virtual_key_authenticator: None,
             event_log: None,
             audit_failures: Arc::new(AtomicU64::new(0)),
             models_health: Arc::new(health::HealthTracker::default()),
@@ -1214,6 +1229,24 @@ fn rejection_response(rejection: Rejection) -> Response {
     )
 }
 
+fn virtual_key_unauthorized_response() -> Response {
+    error_envelope_with_reason(
+        StatusCode::UNAUTHORIZED,
+        "unauthorized",
+        "VIRTUAL_KEY_UNAUTHORIZED",
+        "virtual key authentication failed",
+    )
+}
+
+fn virtual_key_scope_response(error: auth::VirtualKeyScopeError) -> Response {
+    error_envelope_with_reason(
+        StatusCode::FORBIDDEN,
+        "policy_violation",
+        error.reason_code(),
+        "virtual key scope forbids this request",
+    )
+}
+
 fn correlation_error_response(error: correlation::CorrelationError) -> Response {
     error_envelope_with_reason(
         StatusCode::BAD_REQUEST,
@@ -1516,6 +1549,16 @@ async fn chat_completions(
     } else {
         None
     };
+
+    if let Some(authenticator) = &state.virtual_key_authenticator {
+        let identity = match authenticator.authenticate(&headers).await {
+            Ok(identity) => identity,
+            Err(_) => return virtual_key_unauthorized_response(),
+        };
+        if let Err(error) = auth::enforce_scope(&identity, &parsed) {
+            return virtual_key_scope_response(error);
+        }
+    }
 
     let messages = extract_messages(object);
     let parsed = intent::resolve_profile(parsed, &messages).await;
@@ -2388,6 +2431,9 @@ fn audit_reason(status: StatusCode, served_locality: bool, degraded: bool) -> St
 mod local_privacy_tests;
 
 #[cfg(test)]
+mod virtual_key_wiring_tests;
+
+#[cfg(test)]
 mod correlation_wiring_tests;
 
 #[cfg(test)]
@@ -2410,6 +2456,9 @@ mod rerank_wiring_tests;
 
 #[cfg(test)]
 mod messages_wiring_tests;
+
+#[cfg(test)]
+mod protocol_stream_path_tests;
 
 #[cfg(test)]
 mod policy_wiring_tests;
