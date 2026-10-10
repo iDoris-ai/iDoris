@@ -50,6 +50,8 @@ pub mod models;
 /// Metadata-only audit validation and tenant-scoped persistence (B1 task19).
 pub mod audit;
 mod audit_body;
+/// Trusted Authorization bearer -> virtual-key caller identity.
+pub mod auth;
 /// Injectable `/capabilities` provider boundary (B1 task32). Live capacity
 /// aggregation is wired by task33.
 pub mod capabilities;
