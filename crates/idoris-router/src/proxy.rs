@@ -521,8 +521,15 @@ impl ChatProxy {
         body: &Value,
         opts: &ForwardOpts<'_>,
     ) -> ForwardOutcome {
-        self.forward_buffered_path(endpoint, BufferedUpstreamPath::CHAT_COMPLETIONS, body, opts)
-            .await
+        let result = self
+            .forward_buffered_observed(endpoint, body, opts, || async {
+                Ok::<(), std::convert::Infallible>(())
+            })
+            .await;
+        match result {
+            Ok(outcome) => outcome,
+            Err(never) => match never {},
+        }
     }
 
     pub(crate) async fn forward_buffered_observed<F, Fut, E>(
@@ -1079,18 +1086,8 @@ impl ChatProxy {
     /// outright still gets a plain JSON/text error body, never an SSE
     /// stream carrying an error.
     pub async fn forward_stream(&self, endpoint: &str, body: &Value) -> StreamOutcome {
-        let result = self
-            .forward_stream_path_observed(
-                endpoint,
-                StreamingUpstreamPath::CHAT_COMPLETIONS,
-                body,
-                || async { Ok::<(), std::convert::Infallible>(()) },
-            )
-            .await;
-        match result {
-            Ok(outcome) => outcome,
-            Err(never) => match never {},
-        }
+        self.forward_stream_path(endpoint, StreamingUpstreamPath::CHAT_COMPLETIONS, body)
+            .await
     }
 
     pub(crate) async fn forward_stream_path(
@@ -1110,6 +1107,9 @@ impl ChatProxy {
         }
     }
 
+    // This pre-send seam is consumed by the next stacked Event Log slice.
+    // Keep it available in this independently mergeable preparatory PR.
+    #[allow(dead_code)]
     pub(crate) async fn forward_stream_observed<F, Fut, E>(
         &self,
         endpoint: &str,
