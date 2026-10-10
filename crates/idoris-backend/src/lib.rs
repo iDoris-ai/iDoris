@@ -20,6 +20,7 @@
 pub mod adapter;
 pub mod error;
 pub mod eviction;
+pub mod global_capacity;
 pub mod load_fence;
 pub mod mock;
 pub mod supervisor;
@@ -30,6 +31,7 @@ pub use error::BackendError;
 pub use eviction::{
     EvictionPlan, ModelEntry, ModelReq, ModelState, PlanEvictionError, Snapshot, plan_eviction,
 };
+pub use global_capacity::{GlobalCapacityLedger, GlobalCapacitySnapshot};
 pub use mock::MockAdapter;
 pub use supervisor::{Supervisor, SupervisorConfig, SupervisorHandle};
 pub use types::{BackendStatus, ChatMessage, ChatRequest, ChatResponse, ModelInfo, Pressure};

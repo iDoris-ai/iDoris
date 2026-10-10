@@ -20,6 +20,7 @@
 //! both sides.
 
 pub mod adapter_manifest;
+pub mod admin_v0;
 pub mod common;
 pub mod component_card;
 pub mod deploy_mode;
