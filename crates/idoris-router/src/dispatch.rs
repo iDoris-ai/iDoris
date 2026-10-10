@@ -15,7 +15,7 @@ use idoris_contracts::load_policy::{Admission, Keepalive, LoadMode, LoadPolicy};
 use idoris_contracts::provider::Locality;
 use idoris_policy::{
     AdmissionStatus, Card, Decision, PolicyCtx, ROLES, ReasonCode, Rejection, RequestProfile,
-    decide, effective_served_locality,
+    decide_with_affinity, effective_served_locality,
 };
 use idoris_tenancy::budget::{BudgetError, BudgetLedger, ReservationId};
 use tokio_util::sync::CancellationToken;
@@ -31,6 +31,7 @@ pub struct BoundSupervisor {
     provider_id: String,
     endpoint: String,
     locality: Locality,
+    admission_model: Option<(String, f64)>,
 }
 
 impl BoundSupervisor {
@@ -40,7 +41,17 @@ impl BoundSupervisor {
             provider_id: card.provider.id.clone(),
             endpoint: card.endpoint.clone(),
             locality: card.provider.locality,
+            admission_model: None,
         }
+    }
+
+    pub(crate) fn with_admission_model(
+        mut self,
+        model_id: impl Into<String>,
+        memory_gb: f64,
+    ) -> Self {
+        self.admission_model = Some((model_id.into(), memory_gb));
+        self
     }
 
     pub(crate) fn provider_id(&self) -> &str {
@@ -106,13 +117,6 @@ fn default_load_policy() -> LoadPolicy {
         admission: Admission::Coexist,
     }
 }
-
-/// A single, fixed placeholder memory size for every card's Supervisor
-/// "model" entry. This crate doesn't yet have a real per-model memory
-/// figure at the component-card layer (that's catalog/idoris-recommender
-/// data, not wired into R2-D) — every local candidate is treated as
-/// equally cheap to load for now.
-const PLACEHOLDER_MEMORY_GB: f64 = 1.0;
 
 /// R2-D simplification: every loaded component card is eligible for every
 /// catalog role and always `Ready` at `decide()` time — role→catalog
@@ -215,6 +219,15 @@ pub fn select(
     profile: &ParsedProfile,
     prompt: &str,
 ) -> Result<Selected, DispatchError> {
+    select_with_affinity(cards, profile, prompt, None)
+}
+
+pub fn select_with_affinity(
+    cards: &[ComponentCard],
+    profile: &ParsedProfile,
+    prompt: &str,
+    affinity_key: Option<&str>,
+) -> Result<Selected, DispatchError> {
     let candidates: Vec<Card> = cards.iter().map(|c| candidate(c, prompt)).collect();
     let request_profile = RequestProfile {
         task: profile.task.clone(),
@@ -226,7 +239,8 @@ pub fn select(
         min_ram_gb: None,
         budget: None,
     };
-    let decision = decide(&request_profile, &candidates, &ctx).map_err(DispatchError::Rejection)?;
+    let decision = decide_with_affinity(&request_profile, &candidates, &ctx, affinity_key)
+        .map_err(DispatchError::Rejection)?;
     let Some(chosen) = candidates.iter().find(|c| c.id() == decision.chosen_id) else {
         return Err(DispatchError::Internal(format!(
             "decide() returned chosen_id {:?} absent from its own candidate list",
@@ -376,6 +390,7 @@ impl Drop for CancelOnDrop {
 pub struct DispatchInput<'a> {
     pub requested_model: Option<&'a str>,
     pub prompt: &'a str,
+    pub affinity_key: Option<&'a str>,
 }
 
 impl<'a> DispatchInput<'a> {
@@ -383,6 +398,7 @@ impl<'a> DispatchInput<'a> {
         Self {
             requested_model: None,
             prompt,
+            affinity_key: None,
         }
     }
 
@@ -390,7 +406,13 @@ impl<'a> DispatchInput<'a> {
         Self {
             requested_model,
             prompt,
+            affinity_key: None,
         }
+    }
+
+    pub fn with_affinity(mut self, affinity_key: Option<&'a str>) -> Self {
+        self.affinity_key = affinity_key;
+        self
     }
 }
 
@@ -535,12 +557,11 @@ async fn dispatch_local_inner(
     let tenant_id = profile.tenant_id.as_deref();
     let prompt = input.prompt;
     let requested_model = input.requested_model;
-
     let selected_owned;
     let selected = match selection {
         LocalSelection::Preselected(selected) => selected,
         LocalSelection::Cards(cards) => {
-            selected_owned = select(cards, profile, prompt)?;
+            selected_owned = select_with_affinity(cards, profile, prompt, input.affinity_key)?;
             &selected_owned
         }
     };
@@ -614,12 +635,18 @@ async fn dispatch_local_inner(
     // cancellation can stop early.
     let _cancel_guard = CancelOnDrop(cancel.clone());
 
+    let admission_memory_override = supervisor
+        .admission_model
+        .as_ref()
+        .filter(|(model_id, _)| model_id == &backend_model_id)
+        .map(|(_, memory_gb)| *memory_gb);
     let supervisor = &supervisor.handle;
-    // A concrete model id is caller-controlled. Validate it against the
-    // runtime catalog before load(): Supervisor eviction planning happens
-    // before an adapter can reject an unknown id, so skipping this preflight
-    // would let a bogus model name evict an unrelated warm model first.
-    if backend_model_id != provider_id {
+    // Process-owned mlx_lm.server/llama.cpp bind a trusted config footprint.
+    // Every other lifecycle runtime (notably oMLX) must provide its exact
+    // selected model plus a positive pre-load footprint via its catalog.
+    // A mismatched bound model intentionally has no override, forcing this
+    // preflight before Supervisor eviction planning can mutate lifecycle state.
+    let catalog = if admission_memory_override.is_none() {
         let catalog = match supervisor.list().await {
             Ok(models) => models,
             Err(err) => {
@@ -631,7 +658,9 @@ async fn dispatch_local_inner(
                 });
             }
         };
-        if !catalog.iter().any(|model| model.id == backend_model_id) {
+        if backend_model_id != provider_id
+            && !catalog.iter().any(|model| model.id == backend_model_id)
+        {
             return Ok(ChatOutcome {
                 decision,
                 served_locality,
@@ -641,14 +670,47 @@ async fn dispatch_local_inner(
                 actual_cost_minor: None,
             });
         }
-    }
+        Some(catalog)
+    } else {
+        None
+    };
+    let admission_memory_gb = match admission_memory_override {
+        Some(memory_gb) => memory_gb,
+        None => {
+            let Some(model) = catalog
+                .as_ref()
+                .and_then(|models| models.iter().find(|model| model.id == backend_model_id))
+            else {
+                return Ok(ChatOutcome {
+                    decision,
+                    served_locality,
+                    result: Err(DispatchFailure::Backend(BackendError::model_not_found(
+                        backend_model_id,
+                    ))),
+                    actual_cost_minor: None,
+                });
+            };
+            model.memory_gb
+        }
+    };
+    if !admission_memory_gb.is_finite() || admission_memory_gb <= 0.0 {
+        return Ok(ChatOutcome {
+            decision,
+            served_locality,
+            result: Err(DispatchFailure::Backend(BackendError::Upstream {
+                message: "selected lifecycle model has no positive pre-load memory footprint"
+                    .into(),
+            })),
+            actual_cost_minor: None,
+        });
+    };
     // `status.loaded` reports engine residency, which may have been
     // inherited after a Supervisor restart while the model is still in
     // Error (not yet adopted and policy-checked). Always pass through the
     // Supervisor's idempotent load path before chatting so it can establish
     // readiness and apply the requested policy.
     if let Err(err) = supervisor
-        .load(backend_model_id.clone(), PLACEHOLDER_MEMORY_GB, load_policy)
+        .load(backend_model_id.clone(), admission_memory_gb, load_policy)
         .await
     {
         return Ok(ChatOutcome {
@@ -744,7 +806,8 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use idoris_backend::{
-        BackendStatus, MockAdapter, ModelInfo, RuntimeAdapter, Supervisor, SupervisorConfig,
+        BackendStatus, GlobalCapacityLedger, MockAdapter, ModelInfo, RuntimeAdapter, Supervisor,
+        SupervisorConfig,
     };
     use idoris_contracts::TaskProfile;
     use idoris_contracts::common::PrivacyClass;
@@ -1037,6 +1100,46 @@ routing_policy:
     }
 
     #[tokio::test]
+    async fn catalog_memory_drives_global_admission_before_adapter_load() {
+        let card = local_card("a");
+        let adapter = Arc::new(MockAdapter::new(vec![ModelInfo {
+            id: "a".to_string(),
+            memory_gb: 6.0,
+        }]));
+        let ledger = Arc::new(GlobalCapacityLedger::new(4.0).unwrap());
+        let supervisor = Supervisor::spawn_with_startup_capacity_tracking(
+            adapter.clone(),
+            SupervisorConfig::default(),
+            ledger.clone(),
+            "a",
+        )
+        .unwrap();
+        let supervisor = BoundSupervisor::new(&card, supervisor).with_admission_model("a", 6.0);
+
+        let outcome = dispatch_local(
+            std::slice::from_ref(&card),
+            Some(&supervisor),
+            None,
+            &empty_profile(),
+            DispatchInput::new("hello"),
+            vec![ChatMessage {
+                role: "user".to_string(),
+                content: "hello".to_string(),
+            }],
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        match outcome.result.unwrap_err() {
+            DispatchFailure::Backend(err) => assert_eq!(err.reason_code(), "oom"),
+            other => panic!("expected Backend(oom), got {other:?}"),
+        }
+        assert_eq!(adapter.load_call_count("a"), 0);
+        assert_eq!(ledger.snapshot().unwrap().allocations["runtime:a"], 0.0);
+    }
+
+    #[tokio::test]
     async fn concrete_model_is_dispatched_separately_from_provider_id() {
         let card = local_card("omlx");
         let adapter = Arc::new(MockAdapter::new(vec![ModelInfo {
@@ -1063,6 +1166,36 @@ routing_policy:
         assert_eq!(response.model, "Qwen3-0.6B-4bit");
         assert_eq!(adapter.load_call_count("Qwen3-0.6B-4bit"), 1);
         assert_eq!(adapter.load_call_count("omlx"), 0);
+    }
+
+    #[tokio::test]
+    async fn zero_or_non_finite_catalog_memory_never_reaches_adapter_load() {
+        for memory_gb in [0.0, f64::NAN] {
+            let card = local_card("omlx");
+            let adapter = Arc::new(MockAdapter::new(vec![ModelInfo {
+                id: "actual-model".into(),
+                memory_gb,
+            }]));
+            let supervisor =
+                Supervisor::spawn(adapter.clone(), SupervisorConfig::default()).unwrap();
+            let supervisor = BoundSupervisor::new(&card, supervisor);
+            let outcome = dispatch_local(
+                std::slice::from_ref(&card),
+                Some(&supervisor),
+                None,
+                &empty_profile(),
+                DispatchInput::with_model(Some("actual-model"), "hello"),
+                Vec::new(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            match outcome.result.unwrap_err() {
+                DispatchFailure::Backend(err) => assert_eq!(err.reason_code(), "upstream_error"),
+                other => panic!("expected Backend(upstream_error), got {other:?}"),
+            }
+            assert_eq!(adapter.load_call_count("actual-model"), 0);
+        }
     }
 
     #[tokio::test]
@@ -1136,6 +1269,60 @@ routing_policy:
                 .unwrap()
                 .loaded
                 .contains(&"warm".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn implicit_provider_id_never_evicts_bound_single_model_runtime() {
+        let card = local_card("prov");
+        let adapter = Arc::new(MockAdapter::new(vec![ModelInfo {
+            id: "m".to_string(),
+            memory_gb: 8.0,
+        }]));
+        let warm_policy = LoadPolicy {
+            mode: LoadMode::OnDemand,
+            keepalive: Keepalive::IdleTtl { idle_ttl_s: 300 },
+            admission: Admission::RequiresEviction,
+        };
+        let supervisor = Supervisor::spawn(
+            adapter.clone(),
+            SupervisorConfig {
+                budget_gb: 10.0,
+                ..SupervisorConfig::default()
+            },
+        )
+        .unwrap();
+        supervisor
+            .load("m", 8.0, warm_policy)
+            .await
+            .expect("warm model must load");
+        let supervisor = BoundSupervisor::new(&card, supervisor).with_admission_model("m", 8.0);
+
+        let outcome = dispatch_local(
+            std::slice::from_ref(&card),
+            Some(&supervisor),
+            None,
+            &empty_profile(),
+            DispatchInput::new("hello"),
+            Vec::new(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        match outcome.result.unwrap_err() {
+            DispatchFailure::Backend(err) => assert_eq!(err.reason_code(), "model_not_found"),
+            other => panic!("expected Backend(model_not_found), got {other:?}"),
+        }
+        assert_eq!(adapter.load_call_count("prov"), 0);
+        assert_eq!(adapter.unload_call_count("m"), 0);
+        assert!(
+            adapter
+                .status()
+                .await
+                .unwrap()
+                .loaded
+                .contains(&"m".to_string())
         );
     }
 

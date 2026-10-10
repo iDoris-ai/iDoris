@@ -53,6 +53,57 @@ fn remote_card(id: &str, roles: &[Role], cost_minor: Option<i64>) -> Card {
 }
 
 #[test]
+fn session_affinity_is_stable_for_exact_policy_ties_and_independent_of_input_order() {
+    let req = any_privacy_profile(None);
+    let a = remote_card("runtime-a", &[], Some(0));
+    let b = remote_card("runtime-b", &[], Some(0));
+    let ctx = PolicyCtx::default();
+    let first =
+        decide_with_affinity(&req, &[a.clone(), b.clone()], &ctx, Some("session-42")).unwrap();
+    let reversed = decide_with_affinity(&req, &[b, a], &ctx, Some("session-42")).unwrap();
+
+    assert_eq!(first.chosen_id, reversed.chosen_id);
+}
+
+#[test]
+fn session_affinity_distributes_equal_candidates_without_overriding_cost() {
+    let req = any_privacy_profile(None);
+    let a = remote_card("runtime-a", &[], Some(0));
+    let b = remote_card("runtime-b", &[], Some(0));
+    let ctx = PolicyCtx::default();
+    let chosen: std::collections::BTreeSet<String> = (0..64)
+        .map(|n| {
+            decide_with_affinity(
+                &req,
+                &[a.clone(), b.clone()],
+                &ctx,
+                Some(&format!("session-{n}")),
+            )
+            .unwrap()
+            .chosen_id
+        })
+        .collect();
+    assert_eq!(
+        chosen,
+        ["runtime-a".to_string(), "runtime-b".to_string()].into()
+    );
+
+    let cheap = remote_card("runtime-z-cheap", &[], Some(0));
+    let expensive = remote_card("runtime-a-expensive", &[], Some(1));
+    for n in 0..64 {
+        let session = format!("session-{n}");
+        let decision = decide_with_affinity(
+            &req,
+            &[cheap.clone(), expensive.clone()],
+            &ctx,
+            Some(&session),
+        )
+        .unwrap();
+        assert_eq!(decision.chosen_id, "runtime-z-cheap");
+    }
+}
+
+#[test]
 fn local_only_unavailable_without_a_loopback_candidate() {
     let req = local_only_profile(None);
     let cards = [remote_card("remote-1", &[], Some(0))];
