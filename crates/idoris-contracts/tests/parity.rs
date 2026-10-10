@@ -17,7 +17,7 @@ use idoris_contracts::adapter_manifest::AdapterManifest;
 use idoris_contracts::admin_v0::AdminBackendsResponse;
 use idoris_contracts::admin_v0::{
     AdminAdmissionStatus, AdminCapacityEntry, AdminCapacitySnapshot, AdminCapacityState,
-    AdminStatusResponse,
+    AdminModelsResponse, AdminStatusResponse,
 };
 use idoris_contracts::component_card::ComponentCard;
 use idoris_contracts::load_policy::LoadPolicy;
@@ -103,6 +103,56 @@ fn admin_v0_backends_corpus() {
     let mut extra = valid.clone();
     extra[0]["endpoint"] = json!("http://127.0.0.1:8088/v1");
     assert_parity::<AdminBackendsResponse>("admin-v0-backends.schema.json", &extra);
+}
+
+#[test]
+fn admin_v0_models_corpus() {
+    let observed = json!({
+        "sources": [{
+            "provider_id": "omlx-local",
+            "source": "http_models_endpoint",
+            "state": "observed",
+            "models": ["Qwen3-8B"]
+        }]
+    });
+    assert_parity::<AdminModelsResponse>("admin-v0-models.schema.json", &observed);
+
+    let configured = json!({
+        "sources": [{
+            "provider_id": "claude-subscription",
+            "source": "subscription_registration",
+            "state": "configured",
+            "models": ["claude-sonnet"]
+        }]
+    });
+    assert_parity::<AdminModelsResponse>("admin-v0-models.schema.json", &configured);
+
+    let error = json!({
+        "sources": [{
+            "provider_id": "omlx-local",
+            "source": "http_models_endpoint",
+            "state": "error",
+            "models": [],
+            "error": "unavailable"
+        }]
+    });
+    assert_parity::<AdminModelsResponse>("admin-v0-models.schema.json", &error);
+
+    let mut observed_with_error = observed.clone();
+    observed_with_error["sources"][0]["error"] = json!("unavailable");
+    assert_parity::<AdminModelsResponse>("admin-v0-models.schema.json", &observed_with_error);
+
+    let mut configured_empty = configured.clone();
+    configured_empty["sources"][0]["models"] = json!([]);
+    assert_parity::<AdminModelsResponse>("admin-v0-models.schema.json", &configured_empty);
+
+    let mut error_with_model = error.clone();
+    error_with_model["sources"][0]["models"] = json!(["should-not-leak"]);
+    assert_parity::<AdminModelsResponse>("admin-v0-models.schema.json", &error_with_model);
+
+    let mut wrong_source = observed.clone();
+    wrong_source["sources"][0]["source"] = json!("subscription_registration");
+    assert_parity::<AdminModelsResponse>("admin-v0-models.schema.json", &wrong_source);
 }
 
 #[test]
