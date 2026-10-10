@@ -420,7 +420,7 @@ pub async fn dispatch_local(
     public_dispatch_result(
         dispatch_local_inner(
             LocalSelection::Cards(cards),
-            LocalExecutionContext::new(supervisor, budget_ledger, None),
+            LocalExecutionContext::new(supervisor, budget_ledger, None, None),
             profile,
             input,
             messages,
@@ -445,7 +445,7 @@ pub async fn dispatch_local_preselected(
     public_dispatch_result(
         dispatch_local_inner(
             LocalSelection::Preselected(selected),
-            LocalExecutionContext::new(supervisor, budget_ledger, None),
+            LocalExecutionContext::new(supervisor, budget_ledger, None, None),
             profile,
             input,
             messages,
@@ -490,6 +490,7 @@ pub(crate) struct LocalExecutionContext<'a> {
     supervisor: Option<&'a BoundSupervisor>,
     budget_ledger: Option<&'a BudgetLedger>,
     budget_event: Option<&'a crate::BudgetReservedEventContext>,
+    dispatched_event: Option<&'a crate::DispatchedEventContext>,
 }
 
 impl<'a> LocalExecutionContext<'a> {
@@ -497,11 +498,13 @@ impl<'a> LocalExecutionContext<'a> {
         supervisor: Option<&'a BoundSupervisor>,
         budget_ledger: Option<&'a BudgetLedger>,
         budget_event: Option<&'a crate::BudgetReservedEventContext>,
+        dispatched_event: Option<&'a crate::DispatchedEventContext>,
     ) -> Self {
         Self {
             supervisor,
             budget_ledger,
             budget_event,
+            dispatched_event,
         }
     }
 }
@@ -523,6 +526,7 @@ async fn dispatch_local_inner(
         supervisor,
         budget_ledger,
         budget_event,
+        dispatched_event,
     } = execution;
     let tenant_id = profile.tenant_id.as_deref();
     let prompt = input.prompt;
@@ -649,6 +653,12 @@ async fn dispatch_local_inner(
             result: Err(DispatchFailure::Backend(err)),
             actual_cost_minor: None,
         });
+    }
+
+    if let Some(context) = dispatched_event
+        && crate::append_dispatched(context, selected).await.is_err()
+    {
+        return Err(ObservedDispatchError::EventLogUnavailable);
     }
 
     let chat_result = supervisor

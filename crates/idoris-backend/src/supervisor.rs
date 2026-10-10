@@ -24,6 +24,7 @@ use idoris_contracts::LoadPolicy;
 use tokio::sync::{Semaphore, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
+use crate::GlobalCapacityLedger;
 use crate::adapter::RuntimeAdapter;
 use crate::error::BackendError;
 use crate::eviction::{
@@ -344,6 +345,12 @@ impl SupervisorHandle {
 /// reply is dropped silently, which is safe but not resource-optimal.
 pub struct Supervisor;
 
+#[derive(Debug, Clone)]
+struct StartupCapacityTracking {
+    ledger: Arc<GlobalCapacityLedger>,
+    allocation_key: String,
+}
+
 impl Supervisor {
     /// # Panics
     ///
@@ -355,13 +362,47 @@ impl Supervisor {
         adapter: Arc<dyn RuntimeAdapter>,
         config: SupervisorConfig,
     ) -> Result<SupervisorHandle, BackendError> {
+        Self::spawn_inner(adapter, config, None)
+    }
+
+    /// Track this runtime's trusted startup residency in one shared process
+    /// capacity ledger. This API intentionally covers startup observation only;
+    /// load/unload global admission is wired separately once their confirmation
+    /// paths can update the same aggregate key atomically.
+    pub fn spawn_with_startup_capacity_tracking(
+        adapter: Arc<dyn RuntimeAdapter>,
+        config: SupervisorConfig,
+        ledger: Arc<GlobalCapacityLedger>,
+        runtime_id: impl Into<String>,
+    ) -> Result<SupervisorHandle, BackendError> {
+        let runtime_id = runtime_id.into();
+        if runtime_id.trim().is_empty() {
+            return Err(BackendError::invalid_request(
+                "startup capacity runtime id must not be empty",
+            ));
+        }
+        Self::spawn_inner(
+            adapter,
+            config,
+            Some(StartupCapacityTracking {
+                ledger,
+                allocation_key: format!("runtime:{runtime_id}"),
+            }),
+        )
+    }
+
+    fn spawn_inner(
+        adapter: Arc<dyn RuntimeAdapter>,
+        config: SupervisorConfig,
+        startup_capacity: Option<StartupCapacityTracking>,
+    ) -> Result<SupervisorHandle, BackendError> {
         if !config.budget_gb.is_finite() || config.budget_gb < 0.0 {
             return Err(BackendError::internal(format!(
                 "SupervisorConfig::budget_gb must be finite and >= 0, got {}",
                 config.budget_gb
             )));
         }
-        let (tx, _join) = spawn_actor(adapter, config);
+        let (tx, _join) = spawn_actor_inner(adapter, config, startup_capacity);
         Ok(SupervisorHandle { tx })
     }
 }
@@ -373,9 +414,18 @@ impl Supervisor {
 /// `SupervisorHandle`" contract) purely so a test can assert the task
 /// actually exits once every handle is dropped (M1, Opus Tier-2 review)
 /// without adding an internal implementation detail to the public API.
+#[cfg(test)]
 fn spawn_actor(
     adapter: Arc<dyn RuntimeAdapter>,
     config: SupervisorConfig,
+) -> (mpsc::Sender<ActorMsg>, tokio::task::JoinHandle<()>) {
+    spawn_actor_inner(adapter, config, None)
+}
+
+fn spawn_actor_inner(
+    adapter: Arc<dyn RuntimeAdapter>,
+    config: SupervisorConfig,
+    startup_capacity: Option<StartupCapacityTracking>,
 ) -> (mpsc::Sender<ActorMsg>, tokio::task::JoinHandle<()>) {
     let (tx, rx) = mpsc::channel(64);
     let call_slots = Arc::new(Semaphore::new(config.max_concurrent_adapter_calls.max(1)));
@@ -386,7 +436,14 @@ fn spawn_actor(
     // toward keeping the channel open, so `rx.recv()` correctly returns
     // `None`, and the loop exits, once the last external handle goes away.
     let self_tx = tx.downgrade();
-    let join = tokio::spawn(run_actor(adapter, config, rx, call_slots, self_tx));
+    let join = tokio::spawn(run_actor(
+        adapter,
+        config,
+        rx,
+        call_slots,
+        self_tx,
+        startup_capacity,
+    ));
     (tx, join)
 }
 
@@ -1385,6 +1442,7 @@ async fn run_actor(
     mut rx: mpsc::Receiver<ActorMsg>,
     call_slots: Arc<Semaphore>,
     self_tx: mpsc::WeakSender<ActorMsg>,
+    startup_capacity: Option<StartupCapacityTracking>,
 ) {
     let mut models: HashMap<String, ModelSlot> = HashMap::new();
     let mut active_op: Option<ActiveOp> = None;
@@ -1436,6 +1494,13 @@ async fn run_actor(
         .as_ref()
         .map(|status| status.used_gb)
         .unwrap_or_default();
+    let startup_capacity_error = match (&startup_capacity, &startup) {
+        (Some(tracking), Ok(status)) => tracking
+            .ledger
+            .adopt_observed(&tracking.allocation_key, None, status.used_gb)
+            .err(),
+        _ => None,
+    };
     if let Ok(status) = &startup {
         for id in &status.loaded {
             models.insert(
@@ -1465,7 +1530,9 @@ async fn run_actor(
         load_fence: load_fence.as_ref(),
         reserved_gb: initial_reserved_gb,
         aggregate_covered: HashMap::new(),
-        startup_error: load_fence_error.or_else(|| startup.err()),
+        startup_error: load_fence_error
+            .or(startup_capacity_error)
+            .or_else(|| startup.err()),
     };
 
     while let Some(msg) = rx.recv().await {
