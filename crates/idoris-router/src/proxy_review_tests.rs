@@ -53,6 +53,7 @@ fn opts<'a>(id: &'a str, record_id: &'a str) -> ForwardOpts<'a> {
         provider_id: "provider-a",
         served_locality: Locality::Loopback,
         privacy: PrivacyClass::Any,
+        require_openai_usage: false,
     }
 }
 

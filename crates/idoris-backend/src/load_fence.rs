@@ -88,6 +88,17 @@ impl LoadFence {
     }
 }
 
+impl Drop for LoadFence {
+    fn drop(&mut self) {
+        if let Some(owner_lock) = &self._owner_lock {
+            // A forked child can briefly inherit this open file description.
+            // Unlock explicitly so ownership ends with this LoadFence even if
+            // an inherited descriptor has not been closed yet.
+            let _ = owner_lock.unlock();
+        }
+    }
+}
+
 fn owner_lock_path(path: &Path) -> PathBuf {
     let mut owner_path = path.as_os_str().to_os_string();
     owner_path.push(".owner.lock");
@@ -237,6 +248,30 @@ mod tests {
         drop(owner);
         let next = LoadFence::claim(path.clone()).expect("claim should succeed after release");
         drop(next);
+        fs::remove_dir_all(
+            path.parent()
+                .and_then(Path::parent)
+                .expect("nested parent exists"),
+        )
+        .expect("test directory should be removable");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ownership_release_is_not_extended_by_an_inherited_descriptor() {
+        let path = test_path("inherited-descriptor");
+        let owner = LoadFence::claim(path.clone()).expect("first claim should succeed");
+        let inherited = owner
+            ._owner_lock
+            .as_ref()
+            .expect("claimed fence should retain its owner lock")
+            .try_clone()
+            .expect("duplicating the owner descriptor should succeed");
+
+        drop(owner);
+        let next = LoadFence::claim(path.clone())
+            .expect("claim should succeed when the owning LoadFence is released");
+        drop((next, inherited));
         fs::remove_dir_all(
             path.parent()
                 .and_then(Path::parent)

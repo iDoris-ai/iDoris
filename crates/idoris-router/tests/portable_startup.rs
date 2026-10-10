@@ -14,6 +14,7 @@ use tempfile::TempDir;
 
 const PORTABLE_TEST_KEY: &str =
     "idk_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+static PROCESS_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 struct Running(Option<Child>);
 impl Drop for Running {
@@ -21,6 +22,23 @@ impl Drop for Running {
         if let Some(child) = &mut self.0 {
             let _ = child.kill();
             let _ = child.wait();
+        }
+    }
+}
+
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+fn free_port_except(other: u16) -> u16 {
+    loop {
+        let port = free_port();
+        if port != other {
+            return port;
         }
     }
 }
@@ -42,15 +60,12 @@ fn fixture() -> (TempDir, TempDir, std::path::PathBuf, u16) {
     let cwd = TempDir::new().unwrap();
     fs::create_dir_all(cwd.path().join("config/components")).unwrap();
     fs::write(cwd.path().join("config/components/bad.yaml"), "not: [valid").unwrap();
-    let port = std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
+    let port = free_port();
     (root, cwd, bin.join("idoris"), port)
 }
 
 fn spawn(exe: &Path, cwd: &Path, port: u16, env: &[(&str, &str)]) -> Running {
+    let admin_port = free_port_except(port);
     let mut cmd = Command::new(exe);
     for (key, _) in std::env::vars_os().filter(|(k, _)| k.to_string_lossy().starts_with("IDORIS_"))
     {
@@ -58,6 +73,7 @@ fn spawn(exe: &Path, cwd: &Path, port: u16, env: &[(&str, &str)]) -> Running {
     }
     cmd.current_dir(cwd)
         .env("IDORIS_PORT", port.to_string())
+        .env("IDORIS_ADMIN_PORT", admin_port.to_string())
         .env("IDORIS_DB_PATH", cwd.join("idoris-test.sqlite3"))
         .envs(env.iter().copied())
         .stdout(Stdio::piped())
@@ -141,6 +157,7 @@ async fn wait_health(child: &mut Running, port: u16) {
 
 #[tokio::test]
 async fn explicit_relative_and_absolute_config_paths_start() {
+    let _guard = PROCESS_TEST_LOCK.lock().await;
     for absolute in [false, true] {
         let (_root, cwd, exe, port) = fixture();
         let bundled = exe.parent().unwrap().join("config");
@@ -181,9 +198,16 @@ async fn explicit_relative_and_absolute_config_paths_start() {
 
 #[tokio::test]
 async fn bundled_config_starts_from_an_unrelated_working_directory() {
+    let _guard = PROCESS_TEST_LOCK.lock().await;
     let (_root, cwd, exe, port) = fixture();
     seed_portable_key(cwd.path());
-    let mut child = spawn(&exe, cwd.path(), port, &[]);
+    let admin_port = free_port_except(port).to_string();
+    let mut child = spawn(
+        &exe,
+        cwd.path(),
+        port,
+        &[("IDORIS_ADMIN_PORT", admin_port.as_str())],
+    );
     let client = reqwest::Client::builder().no_proxy().build().unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
     let response = loop {
@@ -202,6 +226,13 @@ async fn bundled_config_starts_from_an_unrelated_working_directory() {
     assert!(response.status().is_success());
     let health: serde_json::Value = response.json().await.unwrap();
     assert_eq!(health["status"], "ok");
+    let admin = client
+        .get(format!("http://127.0.0.1:{admin_port}/admin/api/v1/status"))
+        .timeout(Duration::from_secs(1))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(admin.status(), reqwest::StatusCode::UNAUTHORIZED);
     let response = client
         .post(format!("http://127.0.0.1:{port}/v1/chat/completions"))
         .bearer_auth(PORTABLE_TEST_KEY)
@@ -272,10 +303,22 @@ async fn bundled_config_starts_from_an_unrelated_working_directory() {
     assert_eq!(response.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
     let error: serde_json::Value = response.json().await.unwrap();
     assert_eq!(error["error"]["type"], "local_only_unavailable");
+
+    let mut process = child.0.take().unwrap();
+    process.kill().unwrap();
+    let output = process.wait_with_output().unwrap();
+    let logs = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!logs.contains("Bearer "));
+    assert!(!logs.contains("AdminSessionToken"));
 }
 
 #[test]
 fn missing_or_invalid_bundled_policy_fails_startup() {
+    let _guard = PROCESS_TEST_LOCK.blocking_lock();
     for invalid in [false, true] {
         let (_root, cwd, exe, port) = fixture();
         let policy = exe.parent().unwrap().join("config/routing-policy.yaml");
@@ -290,6 +333,7 @@ fn missing_or_invalid_bundled_policy_fails_startup() {
 
 #[test]
 fn explicit_missing_paths_do_not_fall_back() {
+    let _guard = PROCESS_TEST_LOCK.blocking_lock();
     let (_root, cwd, exe, port) = fixture();
     let components = [("IDORIS_COMPONENTS_DIR", "missing-components")];
     failed(
@@ -302,6 +346,7 @@ fn explicit_missing_paths_do_not_fall_back() {
 
 #[test]
 fn explicit_storage_failures_do_not_fall_back() {
+    let _guard = PROCESS_TEST_LOCK.blocking_lock();
     let (_root, cwd, exe, port) = fixture();
     let blocker = cwd.path().join("not-a-directory");
     fs::write(&blocker, "file").unwrap();
