@@ -17,7 +17,7 @@ use idoris_contracts::adapter_manifest::AdapterManifest;
 use idoris_contracts::admin_v0::AdminBackendsResponse;
 use idoris_contracts::admin_v0::{
     AdminAdmissionStatus, AdminCapacityEntry, AdminCapacitySnapshot, AdminCapacityState,
-    AdminModelsResponse, AdminStatusResponse,
+    AdminModelsResponse, AdminRolesResponse, AdminStatusResponse,
 };
 use idoris_contracts::component_card::ComponentCard;
 use idoris_contracts::load_policy::LoadPolicy;
@@ -103,6 +103,23 @@ fn admin_v0_backends_corpus() {
     let mut extra = valid.clone();
     extra[0]["endpoint"] = json!("http://127.0.0.1:8088/v1");
     assert_parity::<AdminBackendsResponse>("admin-v0-backends.schema.json", &extra);
+}
+
+#[test]
+fn admin_v0_roles_corpus() {
+    let valid = json!([{
+        "role": "daily",
+        "aliases": ["idoris/daily"],
+        "catalog_role": true
+    }]);
+    assert_parity::<AdminRolesResponse>("admin-v0-roles.schema.json", &valid);
+    assert_parity::<AdminRolesResponse>("admin-v0-roles.schema.json", &json!([]));
+    let mut empty_aliases = valid.clone();
+    empty_aliases[0]["aliases"] = json!([]);
+    assert_parity::<AdminRolesResponse>("admin-v0-roles.schema.json", &empty_aliases);
+    let mut extra = valid.clone();
+    extra[0]["model"] = json!("Qwen3-8B");
+    assert_parity::<AdminRolesResponse>("admin-v0-roles.schema.json", &extra);
 }
 
 #[test]

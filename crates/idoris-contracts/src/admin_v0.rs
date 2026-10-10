@@ -34,6 +34,33 @@ impl Contract for AdminBackendsResponse {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdminRole {
+    pub role: String,
+    pub aliases: Vec<String>,
+    pub catalog_role: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct AdminRolesResponse(pub Vec<AdminRole>);
+
+impl Contract for AdminRolesResponse {
+    fn validate(&self) -> Result<(), ContractError> {
+        if self.0.iter().any(|role| {
+            !non_empty(&role.role)
+                || role.aliases.is_empty()
+                || role.aliases.iter().any(|alias| !non_empty(alias))
+        }) {
+            return Err(ContractError::new(
+                "admin role names and aliases must not be empty",
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AdminModelSourceKind {
