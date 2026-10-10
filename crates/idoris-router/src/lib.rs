@@ -1645,7 +1645,7 @@ pub(crate) async fn append_budget_reserved(
 }
 
 #[derive(Clone)]
-struct DispatchedEventContext {
+pub(crate) struct DispatchedEventContext {
     event_log: Arc<idoris_tenancy::event_log::EventLogStore>,
     tenant_id: String,
     record_id: String,
@@ -1659,7 +1659,7 @@ struct DispatchedEventContext {
 /// prove TCP connected, request bytes reached the peer, or upstream execution
 /// occurred; an exhausted connect failure may therefore still finish as
 /// `ExecutionDisposition::NotExecuted` after this event exists.
-async fn append_dispatched(
+pub(crate) async fn append_dispatched(
     context: &DispatchedEventContext,
     selected: &Selected,
 ) -> Result<(), ()> {
@@ -1683,6 +1683,52 @@ async fn append_dispatched(
         tenant_id: context.tenant_id.clone(),
         record_id: context.record_id.clone(),
         event_type: idoris_tenancy::event_log::EventType::Dispatched,
+        ts_utc_ms,
+        request_id: None,
+        session_id: context.correlation.session_id.clone(),
+        trace_id: context.correlation.trace_id.clone(),
+        parent_id: context.correlation.parent_id.clone(),
+        origin_record_id: None,
+        metadata,
+    };
+    let store = context.event_log.clone();
+    let tenant_id = context.tenant_id.clone();
+    run_event_log_write(move || store.append(Some(&tenant_id), &event).map(|_| ())).await
+}
+
+#[derive(Clone)]
+pub(crate) struct CompletedEventContext {
+    event_log: Arc<idoris_tenancy::event_log::EventLogStore>,
+    tenant_id: String,
+    record_id: String,
+    correlation: correlation::RequestCorrelation,
+}
+
+pub(crate) async fn append_completed(
+    context: &CompletedEventContext,
+    selected: &Selected,
+    status: &'static str,
+) -> Result<(), ()> {
+    let mut metadata = std::collections::BTreeMap::new();
+    metadata.insert("status".to_string(), json!(status));
+    metadata.insert(
+        "provider_id".to_string(),
+        json!(selected.card.provider.id.as_str()),
+    );
+    metadata.insert(
+        "served_locality".to_string(),
+        json!(selected.served_locality),
+    );
+    let ts_utc_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_millis()).ok())
+        .ok_or(())?;
+    let event = idoris_tenancy::event_log::NewEvent {
+        event_id: Uuid::new_v4().to_string(),
+        tenant_id: context.tenant_id.clone(),
+        record_id: context.record_id.clone(),
+        event_type: idoris_tenancy::event_log::EventType::Completed,
         ts_utc_ms,
         request_id: None,
         session_id: context.correlation.session_id.clone(),
@@ -1808,6 +1854,15 @@ async fn chat_completions(
         event_context
             .as_ref()
             .map(|(event_log, tenant_id)| DispatchedEventContext {
+                event_log: event_log.clone(),
+                tenant_id: tenant_id.clone(),
+                record_id: record_id.clone(),
+                correlation: correlation.clone(),
+            });
+    let completed_event_context =
+        event_context
+            .as_ref()
+            .map(|(event_log, tenant_id)| CompletedEventContext {
                 event_log: event_log.clone(),
                 tenant_id: tenant_id.clone(),
                 record_id: record_id.clone(),
@@ -2023,7 +2078,13 @@ async fn chat_completions(
     let dispatch_result = if let Some(selected) = selected_for_dispatch.as_ref() {
         match dispatch_local_preselected_observed(
             selected,
-            LocalExecutionContext::new(supervisor, budget_ledger, budget_event_context.as_ref()),
+            LocalExecutionContext::new(
+                supervisor,
+                budget_ledger,
+                budget_event_context.as_ref(),
+                dispatched_event_context.as_ref(),
+                completed_event_context.as_ref(),
+            ),
             &parsed,
             dispatch::DispatchInput::with_model(model, &prompt).with_affinity(affinity_key),
             messages,
@@ -2716,6 +2777,9 @@ mod budget_reserved_wiring_tests;
 
 #[cfg(test)]
 mod dispatched_wiring_tests;
+
+#[cfg(test)]
+mod completed_wiring_tests;
 
 #[cfg(test)]
 mod request_event_query_tests;
