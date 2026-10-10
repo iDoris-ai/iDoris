@@ -115,10 +115,14 @@ fn sample(used_gb: f64, loaded: &[&str]) -> BackendStatus {
 }
 
 fn adapter(first: FirstStatus) -> Arc<StartupAdapter> {
+    adapter_with_catalog(first, catalog())
+}
+
+fn adapter_with_catalog(first: FirstStatus, catalog: Vec<ModelInfo>) -> Arc<StartupAdapter> {
     let unknown =
         matches!(&first, FirstStatus::Sample(s) if s.loaded.iter().any(|id| id == "inherited"));
     Arc::new(StartupAdapter {
-        mock: MockAdapter::new(catalog()),
+        mock: MockAdapter::new(catalog),
         first,
         unknown,
         calls: AtomicUsize::new(0),
@@ -326,6 +330,84 @@ async fn timed_out_load_keeps_its_global_preclaim() {
     let error = handle.load("a", 6.0, pinned()).await.unwrap_err();
     assert_eq!(error.reason_code(), "adapter_timed_out");
     assert_eq!(ledger.snapshot().unwrap().reserved_gb, 6.0);
+}
+
+#[tokio::test]
+async fn decimal_capacity_settlement_tolerates_equivalent_summation_order() {
+    let fractional_catalog = || {
+        [("a", 0.2), ("b", 0.3), ("c", 0.1)]
+            .into_iter()
+            .map(|(id, memory_gb)| ModelInfo {
+                id: id.into(),
+                memory_gb,
+            })
+            .collect()
+    };
+
+    for attempt in 0..40 {
+        let ledger = Arc::new(GlobalCapacityLedger::new(8.0).unwrap());
+        let adapter =
+            adapter_with_catalog(FirstStatus::Sample(sample(0.0, &[])), fractional_catalog());
+        let handle = Supervisor::spawn_with_startup_capacity_tracking(
+            adapter,
+            config(),
+            ledger.clone(),
+            format!("fractional-{attempt}"),
+        )
+        .unwrap();
+
+        handle.load("a", 0.2, pinned()).await.unwrap();
+        handle.load("b", 0.3, pinned()).await.unwrap();
+        handle.load("c", 0.1, pinned()).await.unwrap();
+        handle
+            .status()
+            .await
+            .expect("equivalent float summation must not poison the runtime");
+        assert!((ledger.snapshot().unwrap().reserved_gb - 0.6).abs() < 1e-6);
+    }
+}
+
+#[tokio::test]
+async fn unconfirmed_engine_residency_is_adopted_without_poisoning_unrelated_unload() {
+    let ledger = Arc::new(GlobalCapacityLedger::new(16.0).unwrap());
+    let adapter = adapter_with_catalog(
+        FirstStatus::Sample(sample(0.0, &[])),
+        [("a", 2.0), ("b", 1.0)]
+            .into_iter()
+            .map(|(id, memory_gb)| ModelInfo {
+                id: id.into(),
+                memory_gb,
+            })
+            .collect(),
+    );
+    let mut timeout_config = config();
+    timeout_config.budget_gb = 16.0;
+    timeout_config.adapter_call_timeout = Duration::from_millis(10);
+    let handle = Supervisor::spawn_with_startup_capacity_tracking(
+        adapter.clone(),
+        timeout_config,
+        ledger.clone(),
+        "runtime-a",
+    )
+    .unwrap();
+
+    handle.load("b", 1.0, pinned()).await.unwrap();
+    adapter.mock.set_load_delay("a", Duration::from_secs(1));
+    let error = handle.load("a", 6.0, pinned()).await.unwrap_err();
+    assert_eq!(error.reason_code(), "adapter_timed_out");
+    assert_eq!(ledger.snapshot().unwrap().reserved_gb, 7.0);
+
+    adapter.mock.set_load_delay("a", Duration::ZERO);
+    adapter.mock.load("a", Some(&pinned())).await.unwrap();
+    handle
+        .unload("b")
+        .await
+        .expect("unrelated confirmed unload must not poison while a load is unconfirmed");
+    handle
+        .status()
+        .await
+        .expect("runtime must remain usable after conservative reconciliation");
+    assert_eq!(ledger.snapshot().unwrap().reserved_gb, 8.0);
 }
 
 #[tokio::test]
