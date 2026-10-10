@@ -1077,6 +1077,52 @@ fn correlation_error_response(error: correlation::CorrelationError) -> Response 
     )
 }
 
+fn event_log_unavailable_response() -> Response {
+    error_envelope_with_reason(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "event_log_unavailable",
+        "EVENT_LOG_APPEND_UNAVAILABLE",
+        "event log unavailable",
+    )
+}
+
+async fn run_event_log_write<F>(write: F) -> Result<(), ()>
+where
+    F: FnOnce() -> Result<(), idoris_tenancy::event_log::EventLogError> + Send + 'static,
+{
+    tokio::task::spawn_blocking(write)
+        .await
+        .map_err(|_| ())?
+        .map_err(|_| ())
+}
+
+async fn append_request_received(
+    store: Arc<idoris_tenancy::event_log::EventLogStore>,
+    tenant_id: String,
+    record_id: String,
+    correlation: correlation::RequestCorrelation,
+) -> Result<(), ()> {
+    let ts_utc_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_millis()).ok())
+        .ok_or(())?;
+    let event = idoris_tenancy::event_log::NewEvent {
+        event_id: Uuid::new_v4().to_string(),
+        tenant_id: tenant_id.clone(),
+        record_id,
+        event_type: idoris_tenancy::event_log::EventType::RequestReceived,
+        ts_utc_ms,
+        request_id: None,
+        session_id: correlation.session_id,
+        trace_id: correlation.trace_id,
+        parent_id: correlation.parent_id,
+        origin_record_id: None,
+        metadata: Default::default(),
+    };
+    run_event_log_write(move || store.append(Some(&tenant_id), &event).map(|_| ())).await
+}
+
 /// `POST /v1/chat/completions`. Order (locked by conformance): non-JSON
 /// body -> `invalid_json`; valid JSON that isn't an object -> `invalid_body`;
 /// only then are control-plane headers parsed (see [`profile::parse_profile`]).
@@ -1114,10 +1160,25 @@ async fn chat_completions(
         Ok(parsed) => parsed,
         Err(err) => return err.into_response(),
     };
-    let _correlation = match correlation::parse(&headers) {
+    let correlation = match correlation::parse(&headers) {
         Ok(context) => context,
         Err(error) => return correlation_error_response(error),
     };
+    if let Some(event_log) = state.event_log.clone() {
+        let tenant_id = match state.deploy_mode {
+            idoris_contracts::DeployMode::Personal => budget::PERSONAL_TENANT_ID.to_string(),
+            idoris_contracts::DeployMode::Tenant => match parsed.tenant_id.clone() {
+                Some(tenant_id) => tenant_id,
+                None => return event_log_unavailable_response(),
+            },
+        };
+        if append_request_received(event_log, tenant_id, record_id.clone(), correlation)
+            .await
+            .is_err()
+        {
+            return event_log_unavailable_response();
+        }
+    }
 
     let messages = extract_messages(object);
     let parsed = intent::resolve_profile(parsed, &messages).await;
@@ -1892,6 +1953,9 @@ mod local_privacy_tests;
 
 #[cfg(test)]
 mod correlation_wiring_tests;
+
+#[cfg(test)]
+mod request_received_wiring_tests;
 
 #[cfg(test)]
 mod embeddings_wiring_tests;
