@@ -279,6 +279,7 @@ async fn run(options: cli::ServeOptions) -> Result<(), String> {
         budget_ledger: Some(persistent.budget),
         record_store: Some(persistent.records),
         virtual_key_authenticator: Some(virtual_key_authenticator),
+        remote_bind_requires_auth: !bind_host.is_loopback(),
         dev_no_key_enabled,
         event_log: Some(persistent.event_log),
         ..AppState::default()

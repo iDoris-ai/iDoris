@@ -226,6 +226,9 @@ pub struct AppState {
     /// Production installs the persistent B5 verifier. Library tests may
     /// leave this unset to preserve pre-B5 request behavior.
     pub virtual_key_authenticator: Option<auth::VirtualKeyAuthenticator>,
+    /// Non-loopback data listeners require a valid virtual key on every
+    /// registered data-plane route except `/health`.
+    pub remote_bind_requires_auth: bool,
     /// Explicit loopback-only developer escape hatch. Production startup
     /// leaves this false unless `IDORIS_DEV_NO_KEY=1` was set once.
     pub dev_no_key_enabled: bool,
@@ -322,6 +325,7 @@ impl Default for AppState {
             budget_ledger: None,
             record_store: None,
             virtual_key_authenticator: None,
+            remote_bind_requires_auth: false,
             dev_no_key_enabled: false,
             event_log: None,
             audit_failures: Arc::new(AtomicU64::new(0)),
@@ -372,9 +376,30 @@ pub fn build_app(state: AppState) -> Router {
         ))
         .layer(middleware::from_fn_with_state(
             state.clone(),
+            remote_bind_auth_middleware,
+        ))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
             record_id_middleware,
         ))
         .with_state(state)
+}
+
+async fn remote_bind_auth_middleware(
+    State(state): State<Arc<AppState>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if !state.remote_bind_requires_auth || request.uri().path() == "/health" {
+        return next.run(request).await;
+    }
+    let Some(authenticator) = &state.virtual_key_authenticator else {
+        return virtual_key_unauthorized_response();
+    };
+    if authenticator.authenticate(request.headers()).await.is_err() {
+        return virtual_key_unauthorized_response();
+    }
+    next.run(request).await
 }
 
 async fn embeddings(
@@ -2671,6 +2696,49 @@ mod tests {
         assert!(json["version"].is_string());
         assert!(json["instance_id"].is_string());
         assert_eq!(json["components"], 0);
+    }
+
+    #[tokio::test]
+    async fn remote_bind_requires_bearer_on_every_registered_route_except_health() {
+        let app = build_app(AppState {
+            remote_bind_requires_auth: true,
+            ..AppState::default()
+        });
+        let routes = [
+            ("GET", "/v1/models"),
+            ("GET", "/capabilities"),
+            ("GET", "/idoris/tenants/acme/usage"),
+            ("GET", "/idoris/tenants/acme/audit"),
+            ("GET", "/idoris/tenants/acme/requests/record-1"),
+            ("GET", "/idoris/tenants/acme/budget"),
+            ("POST", "/v1/chat/completions"),
+            ("POST", "/v1/embeddings"),
+            ("POST", "/v1/rerank"),
+            ("POST", "/v1/messages"),
+        ];
+        for (method, uri) in routes {
+            let request = Request::builder()
+                .method(method)
+                .uri(uri)
+                .body(Body::empty())
+                .unwrap();
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "{method} {uri}"
+            );
+        }
+        let health = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(health.status(), StatusCode::OK);
     }
 
     #[tokio::test]
