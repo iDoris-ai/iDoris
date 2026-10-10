@@ -75,6 +75,7 @@ async fn buffered_proxy_records_one_content_free_dispatch_attempt() {
             EventType::Profiled,
             EventType::Decided,
             EventType::Dispatched,
+            EventType::Completed,
         ]
     );
     let dispatched = &chain[3].event;
