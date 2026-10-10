@@ -136,11 +136,17 @@ fn server_now_ms() -> Result<i64, String> {
 
 fn validate_bind_authority(
     bind_host: IpAddr,
+    deploy_mode: idoris_contracts::DeployMode,
     dev_no_key_enabled: bool,
     has_active_key: bool,
 ) -> Result<(), String> {
     if bind_host.is_loopback() {
         return Ok(());
+    }
+    if deploy_mode == idoris_contracts::DeployMode::Tenant {
+        return Err(format!(
+            "{BIND_HOST_ENV}={bind_host} 是非 loopback；tenant 模式在 M4 仍依赖可信消费方传入已验明的 X-iDoris-Tenant，因此只允许 loopback"
+        ));
     }
     if dev_no_key_enabled {
         return Err(format!(
@@ -239,7 +245,7 @@ async fn run(options: cli::ServeOptions) -> Result<(), String> {
             .has_active_key(now_ms)
             .map_err(|err| format!("无法检查 virtual key 启动权限：{err}"))?
     };
-    validate_bind_authority(bind_host, dev_no_key_enabled, has_active_key)?;
+    validate_bind_authority(bind_host, deploy_mode, dev_no_key_enabled, has_active_key)?;
     let virtual_key_authenticator = VirtualKeyAuthenticator::new(persistent.virtual_keys.clone());
 
     let catalog_path = config::resolve_env("IDORIS_CATALOG", "config/catalog.yaml")?;
@@ -707,9 +713,25 @@ mod bind_tests {
     #[test]
     fn non_loopback_requires_active_key_and_never_allows_dev_no_key() {
         let remote: IpAddr = "100.64.0.5".parse().unwrap();
-        assert!(validate_bind_authority(BIND_HOST, true, false).is_ok());
-        assert!(validate_bind_authority(remote, false, true).is_ok());
-        assert!(validate_bind_authority(remote, false, false).is_err());
-        assert!(validate_bind_authority(remote, true, true).is_err());
+        assert!(
+            validate_bind_authority(BIND_HOST, idoris_contracts::DeployMode::Tenant, true, false)
+                .is_ok()
+        );
+        assert!(
+            validate_bind_authority(remote, idoris_contracts::DeployMode::Personal, false, true)
+                .is_ok()
+        );
+        assert!(
+            validate_bind_authority(remote, idoris_contracts::DeployMode::Personal, false, false)
+                .is_err()
+        );
+        assert!(
+            validate_bind_authority(remote, idoris_contracts::DeployMode::Personal, true, true)
+                .is_err()
+        );
+        assert!(
+            validate_bind_authority(remote, idoris_contracts::DeployMode::Tenant, false, true)
+                .is_err()
+        );
     }
 }
