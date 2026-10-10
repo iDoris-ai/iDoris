@@ -658,19 +658,20 @@ async fn messages(
             "request body must be a JSON object",
         );
     };
-    if let Some(stream) = object.get("stream") {
-        match stream.as_bool() {
-            Some(false) => {}
-            Some(true) | None => {
+    let stream_requested = match object.get("stream") {
+        None => false,
+        Some(stream) => match stream.as_bool() {
+            Some(value) => value,
+            None => {
                 return error_envelope_with_reason(
                     StatusCode::BAD_REQUEST,
                     "unsupported_field",
                     "unsupported_stream",
-                    "streaming /v1/messages is not supported by this endpoint yet",
+                    "stream must be a boolean",
                 );
             }
-        }
-    }
+        },
+    };
     let model = object.get("model").and_then(serde_json::Value::as_str);
     let mut parsed = match parse_profile(&headers, model, state.deploy_mode) {
         Ok(parsed) => parsed,
@@ -718,6 +719,10 @@ async fn messages(
             );
         }
     };
+
+    if stream_requested {
+        return messages_stream(&state, &selected, &value).await;
+    }
 
     let opts = proxy::ForwardOpts {
         request_id: headers
@@ -775,6 +780,71 @@ async fn messages(
             .insert(usage::UsageFact::inference(Some(0)));
     }
     response
+}
+
+async fn messages_stream(
+    state: &AppState,
+    selected: &Selected,
+    body_value: &serde_json::Value,
+) -> Response {
+    match state
+        .proxy
+        .forward_stream_path(
+            &selected.card.endpoint,
+            proxy::StreamingUpstreamPath::MESSAGES,
+            body_value,
+        )
+        .await
+    {
+        proxy::StreamOutcome::Buffered {
+            status,
+            body,
+            content_type,
+        } => {
+            let status = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
+            let mut response = (status, body).into_response();
+            let content_type = content_type.as_deref().unwrap_or("application/json");
+            if let Ok(value) = HeaderValue::from_str(content_type) {
+                response
+                    .headers_mut()
+                    .insert(axum::http::header::CONTENT_TYPE, value);
+            }
+            if let Ok(value) = HeaderValue::from_str(locality_str(selected.served_locality)) {
+                response.headers_mut().insert(HEADER_SERVED_LOCALITY, value);
+            }
+            response
+        }
+        proxy::StreamOutcome::Stream {
+            status,
+            content_type,
+            response: upstream,
+        } => {
+            let status = StatusCode::from_u16(status).unwrap_or(StatusCode::OK);
+            let body = Body::from_stream(sse::ensure_event_terminated(
+                upstream.into_data_stream(),
+                b"message_stop",
+            ));
+            let mut response = Response::builder()
+                .status(status)
+                .body(body)
+                .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+            let content_type = content_type.as_deref().unwrap_or("text/event-stream");
+            if let Ok(value) = HeaderValue::from_str(content_type) {
+                response
+                    .headers_mut()
+                    .insert(axum::http::header::CONTENT_TYPE, value);
+            }
+            if let Ok(value) = HeaderValue::from_str(locality_str(selected.served_locality)) {
+                response.headers_mut().insert(HEADER_SERVED_LOCALITY, value);
+            }
+            if status.is_success() {
+                response
+                    .extensions_mut()
+                    .insert(usage::UsageFact::inference(Some(0)));
+            }
+            response
+        }
+    }
 }
 
 async fn get_tenant_usage(
