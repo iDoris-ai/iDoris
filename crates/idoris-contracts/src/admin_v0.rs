@@ -34,6 +34,125 @@ impl Contract for AdminBackendsResponse {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdminRole {
+    pub role: String,
+    pub aliases: Vec<String>,
+    pub catalog_role: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct AdminRolesResponse(pub Vec<AdminRole>);
+
+impl Contract for AdminRolesResponse {
+    fn validate(&self) -> Result<(), ContractError> {
+        if self.0.iter().any(|role| {
+            !non_empty(&role.role)
+                || role.aliases.is_empty()
+                || role.aliases.iter().any(|alias| !non_empty(alias))
+        }) {
+            return Err(ContractError::new(
+                "admin role names and aliases must not be empty",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AdminRuntimeState {
+    Observed,
+    Error,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AdminRuntimePressure {
+    Ok,
+    Soft,
+    Hard,
+    Ceiling,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdminRuntime {
+    pub provider_id: String,
+    pub state: AdminRuntimeState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pressure: Option<AdminRuntimePressure>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub used_gb: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_memory_max_gb: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loaded: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdminRuntimesResponse {
+    pub runtimes: Vec<AdminRuntime>,
+}
+
+impl Contract for AdminRuntimesResponse {
+    fn validate(&self) -> Result<(), ContractError> {
+        for runtime in &self.runtimes {
+            if !non_empty(&runtime.provider_id) {
+                return Err(ContractError::new(
+                    "admin runtime provider_id must not be empty",
+                ));
+            }
+            match runtime.state {
+                AdminRuntimeState::Observed => {
+                    let (Some(_), Some(used_gb), Some(max_gb), Some(loaded)) = (
+                        runtime.pressure,
+                        runtime.used_gb,
+                        runtime.model_memory_max_gb,
+                        runtime.loaded.as_ref(),
+                    ) else {
+                        return Err(ContractError::new(
+                            "observed admin runtime must include all observed facts",
+                        ));
+                    };
+                    if !used_gb.is_finite()
+                        || used_gb < 0.0
+                        || !max_gb.is_finite()
+                        || max_gb < 0.0
+                        || loaded.iter().any(|model| !non_empty(model))
+                    {
+                        return Err(ContractError::new(
+                            "admin runtime facts must be finite/non-negative with non-empty model ids",
+                        ));
+                    }
+                }
+                AdminRuntimeState::Error => {
+                    if runtime.pressure.is_some()
+                        || runtime.used_gb.is_some()
+                        || runtime.model_memory_max_gb.is_some()
+                        || runtime.loaded.is_some()
+                    {
+                        return Err(ContractError::new(
+                            "error admin runtime must not expose partial backend facts",
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl SchemaShape for AdminRuntimesResponse {
+    const SCHEMA_FILE: &'static str = "admin-v0-runtimes.schema.json";
+    const PROPERTIES: &'static [&'static str] = &["runtimes"];
+    const REQUIRED: &'static [&'static str] = Self::PROPERTIES;
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AdminModelSourceKind {

@@ -23,7 +23,9 @@ use crate::AppState;
 use idoris_contracts::admin_v0::{
     AdminAdmissionStatus, AdminBackend, AdminBackendsResponse, AdminCapacityEntry,
     AdminCapacitySnapshot, AdminCapacityState, AdminModelSource, AdminModelSourceError,
-    AdminModelSourceKind, AdminModelSourceState, AdminModelsResponse, AdminStatusResponse,
+    AdminModelSourceKind, AdminModelSourceState, AdminModelsResponse, AdminRole,
+    AdminRolesResponse, AdminRuntime, AdminRuntimePressure, AdminRuntimeState,
+    AdminRuntimesResponse, AdminStatusResponse,
 };
 use idoris_policy::ROLES;
 
@@ -321,11 +323,11 @@ async fn admin_models(State(state): State<AdminHttpState>) -> Json<AdminModelsRe
     Json(models(&state.app).await)
 }
 
-async fn admin_roles() -> Json<Vec<AdminRole>> {
-    Json(roles())
+async fn admin_roles() -> Json<AdminRolesResponse> {
+    Json(AdminRolesResponse(roles()))
 }
 
-async fn admin_runtimes(State(state): State<AdminHttpState>) -> Json<AdminRuntimesSnapshot> {
+async fn admin_runtimes(State(state): State<AdminHttpState>) -> Json<AdminRuntimesResponse> {
     Json(runtimes(&state.app).await)
 }
 
@@ -341,39 +343,6 @@ pub struct AdminStatus {
     pub subscriptions: usize,
     pub budget_configured: bool,
     pub audit_configured: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AdminRuntimeState {
-    Observed,
-    Error,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize)]
-pub struct AdminRuntime {
-    pub provider_id: String,
-    pub state: AdminRuntimeState,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub pressure: Option<idoris_backend::Pressure>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub used_gb: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub model_memory_max_gb: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub loaded: Option<Vec<String>>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize)]
-pub struct AdminRuntimesSnapshot {
-    pub runtimes: Vec<AdminRuntime>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct AdminRole {
-    pub role: &'static str,
-    pub aliases: Vec<String>,
-    pub catalog_role: bool,
 }
 
 pub fn status(state: &AppState) -> AdminStatus {
@@ -415,7 +384,7 @@ pub fn roles() -> Vec<AdminRole> {
         .iter()
         .copied()
         .map(|role| AdminRole {
-            role: role.as_str(),
+            role: role.as_str().to_string(),
             aliases: vec![format!("idoris/{}", role.as_str())],
             catalog_role: role.is_catalog_role(),
         })
@@ -477,7 +446,7 @@ pub async fn models(state: &AppState) -> AdminModelsResponse {
 /// intentionally absent because they do not have a `RuntimeRegistry` entry.
 /// Backend failures are represented by `state=error`; free-form backend error
 /// strings never become part of this management snapshot.
-pub async fn runtimes(state: &AppState) -> AdminRuntimesSnapshot {
+pub async fn runtimes(state: &AppState) -> AdminRuntimesResponse {
     let runtimes = state
         .runtimes
         .status_observations()
@@ -485,7 +454,7 @@ pub async fn runtimes(state: &AppState) -> AdminRuntimesSnapshot {
         .into_iter()
         .map(|(provider_id, status)| map_runtime_status(provider_id, status))
         .collect();
-    AdminRuntimesSnapshot { runtimes }
+    AdminRuntimesResponse { runtimes }
 }
 
 fn map_runtime_status(
@@ -496,7 +465,13 @@ fn map_runtime_status(
         Ok(status) => AdminRuntime {
             provider_id,
             state: AdminRuntimeState::Observed,
-            pressure: Some(status.pressure),
+            pressure: Some(match status.pressure {
+                idoris_backend::Pressure::Ok => AdminRuntimePressure::Ok,
+                idoris_backend::Pressure::Soft => AdminRuntimePressure::Soft,
+                idoris_backend::Pressure::Hard => AdminRuntimePressure::Hard,
+                idoris_backend::Pressure::Ceiling => AdminRuntimePressure::Ceiling,
+                idoris_backend::Pressure::Unknown => AdminRuntimePressure::Unknown,
+            }),
             used_gb: Some(status.used_gb),
             model_memory_max_gb: Some(status.model_memory_max_gb),
             loaded: Some(status.loaded),
@@ -1215,7 +1190,7 @@ mod tests {
     async fn runtimes_snapshot_reports_observed_status_for_each_lifecycle_runtime() {
         use std::sync::Arc;
 
-        use idoris_backend::{MockAdapter, ModelInfo, Pressure, Supervisor, SupervisorConfig};
+        use idoris_backend::{MockAdapter, ModelInfo, Supervisor, SupervisorConfig};
         use idoris_contracts::load_policy::{Admission, Keepalive, LoadMode, LoadPolicy};
 
         fn card(id: &str) -> idoris_contracts::ComponentCard {
@@ -1288,7 +1263,7 @@ mod tests {
             AdminRuntime {
                 provider_id: "runtime-a".into(),
                 state: AdminRuntimeState::Observed,
-                pressure: Some(Pressure::Hard),
+                pressure: Some(AdminRuntimePressure::Hard),
                 used_gb: Some(8.0),
                 model_memory_max_gb: Some(8.0),
                 loaded: Some(vec!["alpha".into()]),
@@ -1299,7 +1274,7 @@ mod tests {
             AdminRuntime {
                 provider_id: "runtime-b".into(),
                 state: AdminRuntimeState::Observed,
-                pressure: Some(Pressure::Soft),
+                pressure: Some(AdminRuntimePressure::Soft),
                 used_gb: Some(13.0),
                 model_memory_max_gb: Some(16.0),
                 loaded: Some(vec!["beta".into()]),
@@ -1311,6 +1286,21 @@ mod tests {
                 .iter()
                 .all(|runtime| runtime.provider_id != "direct-resident")
         );
+    }
+
+    #[tokio::test]
+    async fn admin_runtimes_wire_shape_matches_the_shared_v0_contract() {
+        let token = AdminSessionToken::mint();
+        let secret = token.expose_secret().to_string();
+        let response = build_admin_app(AppState::default(), token)
+            .oneshot(admin_request("/admin/api/v1/runtimes", "Bearer", &secret))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value, serde_json::json!({"runtimes": []}));
+        assert!(idoris_contracts::parse::<AdminRuntimesResponse>(&value).is_ok());
     }
 
     #[test]
@@ -1517,6 +1507,20 @@ mod tests {
         mixed_server.verify().await;
         invalid_server.verify().await;
         empty_server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn admin_roles_wire_shape_matches_the_shared_v0_contract() {
+        let token = AdminSessionToken::mint();
+        let secret = token.expose_secret().to_string();
+        let response = build_admin_app(AppState::default(), token)
+            .oneshot(admin_request("/admin/api/v1/roles", "Bearer", &secret))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(idoris_contracts::parse::<AdminRolesResponse>(&value).is_ok());
     }
 
     #[test]
