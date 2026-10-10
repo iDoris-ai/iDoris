@@ -219,7 +219,6 @@ mod tests {
 
     use super::*;
     use idoris_contracts::common::PrivacyClass;
-    use std::collections::BTreeMap;
     use idoris_tenancy::budget::{BudgetError, BudgetScope, Price};
     use idoris_tenancy::event_log::{EventType, NewEvent};
     use idoris_tenancy::store::{RecordKind, TenantRecord};
@@ -227,6 +226,7 @@ mod tests {
     use idoris_tenancy::virtual_key::store::VirtualKeyScope;
     use rusqlite::Connection;
     use serde_json::Map;
+    use std::collections::BTreeMap;
     use uuid::Uuid;
 
     fn virtual_key_scope() -> VirtualKeyScope {
