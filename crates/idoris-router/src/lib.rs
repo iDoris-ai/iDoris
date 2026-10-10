@@ -50,6 +50,8 @@ pub mod models;
 /// Metadata-only audit validation and tenant-scoped persistence (B1 task19).
 pub mod audit;
 mod audit_body;
+/// Trusted Authorization bearer -> virtual-key caller identity.
+pub mod auth;
 /// Injectable `/capabilities` provider boundary (B1 task32). Live capacity
 /// aggregation is wired by task33.
 pub mod capabilities;
@@ -210,6 +212,9 @@ pub struct AppState {
     /// Tenant-scoped audit/usage record store. Startup installs it together
     /// with `budget_ledger` from the same SQLite path.
     pub record_store: Option<Arc<std::sync::Mutex<idoris_tenancy::store::TenantStore>>>,
+    /// Persistent B6 Event Log capability. This slice only bootstraps and
+    /// carries the handle; request event emission is wired separately.
+    pub event_log: Option<Arc<idoris_tenancy::event_log::EventLogStore>>,
     /// Best-effort audit persistence failures. Audit must not alter the HTTP
     /// result already produced by routing/backend execution.
     pub audit_failures: Arc<AtomicU64>,
@@ -249,6 +254,7 @@ impl std::fmt::Debug for AppState {
                 "record_store",
                 &self.record_store.as_ref().map(|_| "TenantStore { .. }"),
             )
+            .field("event_log", &self.event_log.as_ref().map(|_| "configured"))
             .field(
                 "audit_failures",
                 &self.audit_failures.load(Ordering::Relaxed),
@@ -290,6 +296,7 @@ impl Default for AppState {
             runtimes: runtime::RuntimeRegistry::default(),
             budget_ledger: None,
             record_store: None,
+            event_log: None,
             audit_failures: Arc::new(AtomicU64::new(0)),
             models_health: Arc::new(health::HealthTracker::default()),
             capabilities: None,
@@ -326,6 +333,7 @@ pub fn build_app(state: AppState) -> Router {
             post(chat_completions).fallback(not_found),
         )
         .route("/v1/embeddings", post(embeddings).fallback(not_found))
+        .route("/v1/rerank", post(rerank).fallback(not_found))
         .fallback(not_found)
         .layer(middleware::from_fn(
             connection::request_lifecycle_middleware,
@@ -430,6 +438,135 @@ async fn embeddings(
         .forward_buffered_path(
             &selected.card.endpoint,
             proxy::BufferedUpstreamPath::EMBEDDINGS,
+            &value,
+            &opts,
+        )
+        .await;
+    let status = StatusCode::from_u16(outcome.status).unwrap_or(StatusCode::BAD_GATEWAY);
+    let mut response = (status, outcome.body).into_response();
+    let content_type = outcome
+        .content_type
+        .as_deref()
+        .unwrap_or("application/json");
+    if let Ok(value) = HeaderValue::from_str(content_type) {
+        response
+            .headers_mut()
+            .insert(axum::http::header::CONTENT_TYPE, value);
+    }
+    if let Ok(value) = HeaderValue::from_str(locality_str(
+        outcome
+            .replayed_served_locality
+            .unwrap_or(selected.served_locality),
+    )) {
+        response.headers_mut().insert(HEADER_SERVED_LOCALITY, value);
+    }
+    if outcome.cached {
+        response.extensions_mut().insert(usage::UsageFact::cached());
+        response
+            .headers_mut()
+            .insert(HEADER_CACHED, HeaderValue::from_static("true"));
+        if let Some(origin) = outcome.origin_record_id
+            && let Ok(value) = HeaderValue::from_str(&origin)
+        {
+            response
+                .headers_mut()
+                .insert(HEADER_ORIGIN_RECORD_ID, value);
+        }
+    } else if status.is_success() {
+        response
+            .extensions_mut()
+            .insert(usage::UsageFact::inference(Some(0)));
+    }
+    response
+}
+
+async fn rerank(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Extension(RequestRecordId(record_id)): Extension<RequestRecordId>,
+    body: Bytes,
+) -> Response {
+    let value: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(value) => value,
+        Err(_) => {
+            return error_envelope(
+                StatusCode::BAD_REQUEST,
+                "invalid_json",
+                "request body is not valid JSON",
+            );
+        }
+    };
+    let Some(object) = value.as_object() else {
+        return error_envelope(
+            StatusCode::BAD_REQUEST,
+            "invalid_body",
+            "request body must be a JSON object",
+        );
+    };
+    let model = object.get("model").and_then(serde_json::Value::as_str);
+    let mut parsed = match parse_profile(&headers, model, state.deploy_mode) {
+        Ok(parsed) => parsed,
+        Err(error) => return error.into_response(),
+    };
+    parsed.task.capabilities = Some(vec![Capability::Rerank]);
+
+    let (cards, _) = dispatch::policy_cards(&state.cards, &state.routing_policy, &parsed);
+    let cards = cards
+        .into_iter()
+        .filter(dispatch::is_resident_http_service)
+        .collect::<Vec<_>>();
+    let selected = match dispatch::select(&cards, &parsed, "") {
+        Ok(selected) => selected,
+        Err(DispatchError::Rejection(rejection)) => return rejection_response(rejection),
+        Err(DispatchError::Internal(message)) => {
+            return error_envelope(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", message);
+        }
+    };
+
+    let cost = &selected.card.provider.cost;
+    if cost.input_per_m != 0.0 || cost.output_per_m != 0.0 {
+        return error_envelope(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "paid_proxy_unavailable",
+            "paid rerank is unavailable until rerank usage settlement is defined",
+        );
+    }
+    let _reservation = match dispatch::ReservationGuard::reserve(
+        state.budget_ledger.as_deref(),
+        parsed.tenant_id.as_deref(),
+        &selected.card.provider.id,
+        selected.estimated_cost_minor,
+    ) {
+        Ok(guard) => guard,
+        Err(err) => {
+            return budget_error_response(
+                &err,
+                &dispatch::ChatOutcome {
+                    decision: selected.decision.clone(),
+                    served_locality: selected.served_locality,
+                    result: Err(DispatchFailure::Budget(err.clone())),
+                    actual_cost_minor: None,
+                },
+            );
+        }
+    };
+
+    let opts = proxy::ForwardOpts {
+        request_id: headers
+            .get(HEADER_REQUEST_ID)
+            .and_then(|value| value.to_str().ok()),
+        tenant_id: parsed.tenant_id.as_deref(),
+        record_id: &record_id,
+        provider_id: selected.card.provider.id.as_str(),
+        served_locality: selected.served_locality,
+        privacy: parsed.task.privacy.unwrap_or(PrivacyClass::LocalOnly),
+        require_openai_usage: false,
+    };
+    let outcome = state
+        .proxy
+        .forward_buffered_path(
+            &selected.card.endpoint,
+            proxy::BufferedUpstreamPath::RERANK,
             &value,
             &opts,
         )
@@ -1488,7 +1625,10 @@ async fn record_id_middleware(
     let audit_started = Instant::now();
     let record_id = Uuid::new_v4().to_string();
     let audit_inference = req.method() == Method::POST
-        && matches!(req.uri().path(), "/v1/chat/completions" | "/v1/embeddings");
+        && matches!(
+            req.uri().path(),
+            "/v1/chat/completions" | "/v1/embeddings" | "/v1/rerank"
+        );
     let audit_tenant = audit_tenant_id(&state, req.headers());
     let audit_request_id = audit_header(req.headers(), HEADER_REQUEST_ID, None);
     let audit_privacy = audit_header(req.headers(), "x-idoris-privacy", Some("local_only"));
@@ -1738,6 +1878,9 @@ mod local_privacy_tests;
 mod embeddings_wiring_tests;
 
 #[cfg(test)]
+mod rerank_wiring_tests;
+
+#[cfg(test)]
 mod policy_wiring_tests;
 
 #[cfg(test)]
@@ -1800,6 +1943,11 @@ mod tests {
         assert_eq!(parse_port(None).unwrap(), DEFAULT_PORT);
         assert_eq!(parse_port(Some("")).unwrap(), DEFAULT_PORT);
         assert_eq!(parse_port(Some("   ")).unwrap(), DEFAULT_PORT);
+    }
+
+    #[test]
+    fn default_app_state_keeps_event_log_unconfigured() {
+        assert!(AppState::default().event_log.is_none());
     }
 
     #[test]
