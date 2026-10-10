@@ -2360,6 +2360,9 @@ mod rerank_wiring_tests;
 mod messages_wiring_tests;
 
 #[cfg(test)]
+mod protocol_stream_path_tests;
+
+#[cfg(test)]
 mod policy_wiring_tests;
 
 #[cfg(test)]
