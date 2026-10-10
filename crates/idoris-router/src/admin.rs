@@ -23,7 +23,8 @@ use crate::AppState;
 use idoris_contracts::admin_v0::{
     AdminAdmissionStatus, AdminBackend, AdminBackendsResponse, AdminCapacityEntry,
     AdminCapacitySnapshot, AdminCapacityState, AdminModelSource, AdminModelSourceError,
-    AdminModelSourceKind, AdminModelSourceState, AdminModelsResponse, AdminStatusResponse,
+    AdminModelSourceKind, AdminModelSourceState, AdminModelsResponse, AdminRole,
+    AdminRolesResponse, AdminStatusResponse,
 };
 use idoris_policy::ROLES;
 
@@ -321,8 +322,8 @@ async fn admin_models(State(state): State<AdminHttpState>) -> Json<AdminModelsRe
     Json(models(&state.app).await)
 }
 
-async fn admin_roles() -> Json<Vec<AdminRole>> {
-    Json(roles())
+async fn admin_roles() -> Json<AdminRolesResponse> {
+    Json(AdminRolesResponse(roles()))
 }
 
 async fn admin_runtimes(State(state): State<AdminHttpState>) -> Json<AdminRuntimesSnapshot> {
@@ -369,13 +370,6 @@ pub struct AdminRuntimesSnapshot {
     pub runtimes: Vec<AdminRuntime>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct AdminRole {
-    pub role: &'static str,
-    pub aliases: Vec<String>,
-    pub catalog_role: bool,
-}
-
 pub fn status(state: &AppState) -> AdminStatus {
     AdminStatus {
         status: "ok",
@@ -415,7 +409,7 @@ pub fn roles() -> Vec<AdminRole> {
         .iter()
         .copied()
         .map(|role| AdminRole {
-            role: role.as_str(),
+            role: role.as_str().to_string(),
             aliases: vec![format!("idoris/{}", role.as_str())],
             catalog_role: role.is_catalog_role(),
         })
@@ -1517,6 +1511,20 @@ mod tests {
         mixed_server.verify().await;
         invalid_server.verify().await;
         empty_server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn admin_roles_wire_shape_matches_the_shared_v0_contract() {
+        let token = AdminSessionToken::mint();
+        let secret = token.expose_secret().to_string();
+        let response = build_admin_app(AppState::default(), token)
+            .oneshot(admin_request("/admin/api/v1/roles", "Bearer", &secret))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(idoris_contracts::parse::<AdminRolesResponse>(&value).is_ok());
     }
 
     #[test]
