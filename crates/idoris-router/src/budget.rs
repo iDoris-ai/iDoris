@@ -11,6 +11,7 @@ use idoris_contracts::provider::Cost;
 use idoris_tenancy::budget::{
     BudgetError, BudgetLedger, BudgetScope, Price, ReservationId, estimate_tokens,
 };
+use serde_json::Value;
 
 /// Conservative placeholder for the completion side of a cost estimate.
 /// This crate doesn't parse a caller-supplied `max_tokens` out of the
@@ -58,6 +59,71 @@ fn priced_minor(cost: &Cost, input_tokens: u64, output_tokens: u64) -> Option<i6
     } else {
         None
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UsageEvidence {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UsageEvidenceError {
+    InvalidJson,
+    MissingUsage,
+    InvalidPromptTokens,
+    InvalidCompletionTokens,
+    InvalidPriceOrAmount,
+}
+
+impl std::fmt::Display for UsageEvidenceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::InvalidJson => "upstream usage response is not valid JSON",
+            Self::MissingUsage => "upstream response is missing usage evidence",
+            Self::InvalidPromptTokens => "upstream prompt_tokens must be a non-negative integer",
+            Self::InvalidCompletionTokens => {
+                "upstream completion_tokens must be a non-negative integer"
+            }
+            Self::InvalidPriceOrAmount => "upstream usage cannot be converted to a valid charge",
+        })
+    }
+}
+
+impl std::error::Error for UsageEvidenceError {}
+
+/// Parses the OpenAI chat-completion usage object used as billing evidence
+/// for a paid direct proxy call. Missing or malformed usage is never
+/// interpreted as zero.
+pub fn parse_openai_usage(body: &[u8]) -> Result<UsageEvidence, UsageEvidenceError> {
+    let value: Value = serde_json::from_slice(body).map_err(|_| UsageEvidenceError::InvalidJson)?;
+    let usage = value
+        .as_object()
+        .and_then(|object| object.get("usage"))
+        .and_then(Value::as_object)
+        .ok_or(UsageEvidenceError::MissingUsage)?;
+    let input_tokens = usage
+        .get("prompt_tokens")
+        .and_then(Value::as_u64)
+        .ok_or(UsageEvidenceError::InvalidPromptTokens)?;
+    let output_tokens = usage
+        .get("completion_tokens")
+        .and_then(Value::as_u64)
+        .ok_or(UsageEvidenceError::InvalidCompletionTokens)?;
+    Ok(UsageEvidence {
+        input_tokens,
+        output_tokens,
+    })
+}
+
+/// Computes a charge from explicit upstream usage evidence. This has no
+/// fallback to the reserved estimate: an estimate is not actual usage.
+pub fn actual_cost_from_usage(
+    cost: &Cost,
+    usage: UsageEvidence,
+) -> Result<i64, UsageEvidenceError> {
+    priced_minor(cost, usage.input_tokens, usage.output_tokens)
+        .ok_or(UsageEvidenceError::InvalidPriceOrAmount)
 }
 
 /// A per-request, per-candidate cost estimate in minor currency units, used
@@ -132,6 +198,20 @@ pub fn settle(
     ledger
         .settle(tenant_id, reservation_id, actual_cost_minor)
         .map(|r| r.actual_cost_minor)
+}
+
+/// Idempotent settlement for a completed call whose actual cost is known.
+/// This treats an already-committed extreme overage as complete and accepts
+/// replay only when the stored settled amount matches exactly.
+pub fn settle_replayable(
+    ledger: &BudgetLedger,
+    tenant_id: Option<&str>,
+    reservation_id: &ReservationId,
+    actual_cost_minor: i64,
+) -> Result<i64, BudgetError> {
+    let tenant_id = tenant_id.unwrap_or(PERSONAL_TENANT_ID);
+    ledger.replay_settlement(tenant_id, reservation_id, actual_cost_minor)?;
+    Ok(actual_cost_minor)
 }
 
 /// Releases a reservation for a call that didn't happen (backend failure)
@@ -217,6 +297,53 @@ mod tests {
     }
 
     #[test]
+    fn explicit_openai_usage_is_the_only_buffered_proxy_billing_evidence() {
+        let usage = parse_openai_usage(
+            br#"{"usage":{"prompt_tokens":7,"completion_tokens":11,"total_tokens":18}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            usage,
+            UsageEvidence {
+                input_tokens: 7,
+                output_tokens: 11
+            }
+        );
+        assert_eq!(actual_cost_from_usage(&paid_cost(), usage).unwrap(), 29);
+    }
+
+    #[test]
+    fn missing_or_malformed_usage_never_becomes_zero_cost() {
+        for body in [
+            br#"{}"#.as_slice(),
+            br#"{"usage":null}"#.as_slice(),
+            br#"{"usage":{"completion_tokens":1}}"#.as_slice(),
+            br#"{"usage":{"prompt_tokens":1}}"#.as_slice(),
+            br#"{"usage":{"prompt_tokens":-1,"completion_tokens":1}}"#.as_slice(),
+            br#"{"usage":{"prompt_tokens":1.5,"completion_tokens":1}}"#.as_slice(),
+            br#"{"usage":{"prompt_tokens":"1","completion_tokens":1}}"#.as_slice(),
+        ] {
+            assert!(parse_openai_usage(body).is_err(), "{body:?}");
+        }
+    }
+
+    #[test]
+    fn malformed_json_and_unrepresentable_charge_fail_closed_without_body_leakage() {
+        let error = parse_openai_usage(br#"{"usage":"SECRET_SENTINEL""#).unwrap_err();
+        assert_eq!(error, UsageEvidenceError::InvalidJson);
+        assert!(!error.to_string().contains("SECRET_SENTINEL"));
+
+        let usage = UsageEvidence {
+            input_tokens: u64::MAX,
+            output_tokens: u64::MAX,
+        };
+        assert_eq!(
+            actual_cost_from_usage(&paid_cost(), usage),
+            Err(UsageEvidenceError::InvalidPriceOrAmount)
+        );
+    }
+
+    #[test]
     fn ledger_unavailable_error_matches_a_real_not_configured_rejection() {
         let (_dir, ledger) = ledger();
         let via_helper = ledger_unavailable_error(Some("acme"), "omlx");
@@ -247,6 +374,23 @@ mod tests {
         release(&ledger, Some("acme"), &id2).unwrap();
         let balance = ledger.tenant_balance("acme").unwrap();
         assert_eq!(balance, 10_000 - 400);
+    }
+
+    #[test]
+    fn replayable_settlement_accepts_committed_extreme_overage_without_double_charge() {
+        let (_dir, ledger) = ledger();
+        ledger
+            .configure_tenant("acme", 10_000, "UTC", SpendGate::PaidOnly)
+            .unwrap();
+
+        let id = reserve(&ledger, Some("acme"), "omlx", 1).unwrap();
+        assert_eq!(settle_replayable(&ledger, Some("acme"), &id, 5).unwrap(), 5);
+        let once = ledger.tenant_readview("acme").unwrap();
+        assert_eq!((once.spent_minor, once.reserved_minor), (5, 0));
+
+        assert_eq!(settle_replayable(&ledger, Some("acme"), &id, 5).unwrap(), 5);
+        let replayed = ledger.tenant_readview("acme").unwrap();
+        assert_eq!((replayed.spent_minor, replayed.reserved_minor), (5, 0));
     }
 
     #[test]
