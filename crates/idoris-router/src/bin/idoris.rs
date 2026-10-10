@@ -63,7 +63,20 @@ async fn main() {
                 std::process::exit(1);
             }
         }
+        cli::Command::Key(cli::KeyCommand::Issue) => {
+            if let Err(message) = issue_virtual_key() {
+                eprintln!("[idoris] {message}");
+                std::process::exit(1);
+            }
+        }
     }
+}
+
+fn issue_virtual_key() -> Result<(), String> {
+    let store = storage::open_virtual_key_store_process()?;
+    let mut stdin = std::io::stdin().lock();
+    let mut stdout = std::io::stdout().lock();
+    idoris_router::key_issue::issue_from_reader(&store, &mut stdin, &mut stdout)
 }
 
 fn env_flag(name: &str) -> bool {
