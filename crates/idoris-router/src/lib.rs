@@ -187,6 +187,7 @@ pub struct HealthResponse {
     pub contract_version: &'static str,
     pub instance_id: String,
     pub components: usize,
+    pub dev_no_key_enabled: bool,
 }
 
 /// Shared server state. `instance_id` is generated once per process and
@@ -226,6 +227,9 @@ pub struct AppState {
     /// Production installs the persistent B5 verifier. Library tests may
     /// leave this unset to preserve pre-B5 request behavior.
     pub virtual_key_authenticator: Option<auth::VirtualKeyAuthenticator>,
+    /// Explicit loopback-only developer escape hatch. Production startup
+    /// leaves this false unless `IDORIS_DEV_NO_KEY=1` was set once.
+    pub dev_no_key_enabled: bool,
     /// Persistent B6 Event Log capability. This slice only bootstraps and
     /// carries the handle; request event emission is wired separately.
     pub event_log: Option<Arc<idoris_tenancy::event_log::EventLogStore>>,
@@ -276,6 +280,7 @@ impl std::fmt::Debug for AppState {
                     .as_ref()
                     .map(|_| "configured"),
             )
+            .field("dev_no_key_enabled", &self.dev_no_key_enabled)
             .field(
                 "audit_failures",
                 &self.audit_failures.load(Ordering::Relaxed),
@@ -318,6 +323,7 @@ impl Default for AppState {
             budget_ledger: None,
             record_store: None,
             virtual_key_authenticator: None,
+            dev_no_key_enabled: false,
             event_log: None,
             audit_failures: Arc::new(AtomicU64::new(0)),
             models_health: Arc::new(health::HealthTracker::default()),
@@ -1145,6 +1151,7 @@ async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         contract_version: idoris_contracts::CONTRACT_VERSION,
         instance_id: state.instance_id.clone(),
         components: state.cards.len(),
+        dev_no_key_enabled: state.dev_no_key_enabled,
     })
 }
 
@@ -1378,6 +1385,15 @@ fn virtual_key_scope_response(error: auth::VirtualKeyScopeError) -> Response {
         "policy_violation",
         error.reason_code(),
         "virtual key scope forbids this request",
+    )
+}
+
+fn dev_no_key_scope_response() -> Response {
+    error_envelope_with_reason(
+        StatusCode::FORBIDDEN,
+        "policy_violation",
+        "DEV_NO_KEY_SCOPE_FORBIDDEN",
+        "developer no-key mode permits only free loopback local_only requests",
     )
 }
 
@@ -1628,6 +1644,58 @@ pub(crate) async fn append_budget_reserved(
     run_event_log_write(move || store.append(Some(&tenant_id), &event).map(|_| ())).await
 }
 
+#[derive(Clone)]
+struct DispatchedEventContext {
+    event_log: Arc<idoris_tenancy::event_log::EventLogStore>,
+    tenant_id: String,
+    record_id: String,
+    correlation: correlation::RequestCorrelation,
+}
+
+/// Persist the proxy-side dispatch-attempt fact.
+///
+/// `dispatched` means the router passed every knowable local/preflight gate
+/// and durably committed to the first real upstream send attempt. It does NOT
+/// prove TCP connected, request bytes reached the peer, or upstream execution
+/// occurred; an exhausted connect failure may therefore still finish as
+/// `ExecutionDisposition::NotExecuted` after this event exists.
+async fn append_dispatched(
+    context: &DispatchedEventContext,
+    selected: &Selected,
+) -> Result<(), ()> {
+    let mut metadata = std::collections::BTreeMap::new();
+    metadata.insert("status".to_string(), json!("attempted"));
+    metadata.insert(
+        "provider_id".to_string(),
+        json!(selected.card.provider.id.as_str()),
+    );
+    metadata.insert(
+        "served_locality".to_string(),
+        json!(selected.served_locality),
+    );
+    let ts_utc_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_millis()).ok())
+        .ok_or(())?;
+    let event = idoris_tenancy::event_log::NewEvent {
+        event_id: Uuid::new_v4().to_string(),
+        tenant_id: context.tenant_id.clone(),
+        record_id: context.record_id.clone(),
+        event_type: idoris_tenancy::event_log::EventType::Dispatched,
+        ts_utc_ms,
+        request_id: None,
+        session_id: context.correlation.session_id.clone(),
+        trace_id: context.correlation.trace_id.clone(),
+        parent_id: context.correlation.parent_id.clone(),
+        origin_record_id: None,
+        metadata,
+    };
+    let store = context.event_log.clone();
+    let tenant_id = context.tenant_id.clone();
+    run_event_log_write(move || store.append(Some(&tenant_id), &event).map(|_| ())).await
+}
+
 /// `POST /v1/chat/completions`. Order (locked by conformance): non-JSON
 /// body -> `invalid_json`; valid JSON that isn't an object -> `invalid_body`;
 /// only then are control-plane headers parsed (see [`profile::parse_profile`]).
@@ -1693,7 +1761,13 @@ async fn chat_completions(
         None
     };
 
-    if let Some(authenticator) = &state.virtual_key_authenticator {
+    let authorization_present = headers.contains_key(axum::http::header::AUTHORIZATION);
+    let dev_no_key_request = state.dev_no_key_enabled && !authorization_present;
+    if dev_no_key_request {
+        if parsed.task.privacy.unwrap_or(PrivacyClass::LocalOnly) != PrivacyClass::LocalOnly {
+            return dev_no_key_scope_response();
+        }
+    } else if let Some(authenticator) = &state.virtual_key_authenticator {
         let identity = match authenticator.authenticate(&headers).await {
             Ok(identity) => identity,
             Err(_) => return virtual_key_unauthorized_response(),
@@ -1701,6 +1775,8 @@ async fn chat_completions(
         if let Err(error) = auth::enforce_scope(&identity, &parsed) {
             return virtual_key_scope_response(error);
         }
+    } else if state.dev_no_key_enabled && authorization_present {
+        return virtual_key_unauthorized_response();
     }
     let affinity_key = session_affinity_key(&headers);
 
@@ -1723,6 +1799,15 @@ async fn chat_completions(
         event_context
             .as_ref()
             .map(|(event_log, tenant_id)| BudgetReservedEventContext {
+                event_log: event_log.clone(),
+                tenant_id: tenant_id.clone(),
+                record_id: record_id.clone(),
+                correlation: correlation.clone(),
+            });
+    let dispatched_event_context =
+        event_context
+            .as_ref()
+            .map(|(event_log, tenant_id)| DispatchedEventContext {
                 event_log: event_log.clone(),
                 tenant_id: tenant_id.clone(),
                 record_id: record_id.clone(),
@@ -1797,6 +1882,13 @@ async fn chat_completions(
     // with an explicit load/unload lifecycle. See dispatch::select's doc
     // for the accepted double-decide() tradeoff this branch makes.
     if let Ok(selected) = &selection {
+        if dev_no_key_request
+            && (selected.served_locality != idoris_contracts::provider::Locality::Loopback
+                || selected.card.provider.cost.input_per_m != 0.0
+                || selected.card.provider.cost.output_per_m != 0.0)
+        {
+            return dev_no_key_scope_response();
+        }
         // A present model field must be a non-empty string before any
         // selected backend can execute. Keep selection first so the
         // established error still carries the selected locality/reasons.
@@ -1884,6 +1976,7 @@ async fn chat_completions(
                 &parsed,
                 &value,
                 &record_id,
+                dispatched_event_context.as_ref(),
                 budget_event_context.as_ref(),
             )
             .await;
@@ -2000,6 +2093,7 @@ async fn chat_completions(
 /// body + its own `content-type`) — **never** re-wrapped into
 /// [`openai_chat_completion`]'s shape, matching `proxy.ts`'s own behavior:
 /// a transparent proxy, not a backend `RuntimeAdapter` call.
+#[allow(clippy::too_many_arguments)]
 async fn chat_via_proxy(
     state: &AppState,
     selected: &Selected,
@@ -2007,6 +2101,7 @@ async fn chat_via_proxy(
     parsed: &ParsedProfile,
     body_value: &serde_json::Value,
     record_id: &str,
+    dispatched_event: Option<&DispatchedEventContext>,
     budget_event_context: Option<&BudgetReservedEventContext>,
 ) -> Response {
     let mut reservation = match dispatch::ReservationGuard::reserve(
@@ -2048,7 +2143,7 @@ async fn chat_via_proxy(
         return event_log_unavailable_response();
     }
     if stream_requested {
-        return chat_via_proxy_stream(state, selected, body_value).await;
+        return chat_via_proxy_stream(state, selected, body_value, dispatched_event).await;
     }
     chat_via_proxy_buffered(
         state,
@@ -2057,6 +2152,7 @@ async fn chat_via_proxy(
         parsed,
         body_value,
         record_id,
+        dispatched_event,
         &mut reservation,
     )
     .await
@@ -2069,12 +2165,21 @@ async fn chat_via_proxy_stream(
     state: &AppState,
     selected: &Selected,
     body_value: &serde_json::Value,
+    dispatched_event: Option<&DispatchedEventContext>,
 ) -> Response {
-    match state
+    let outcome = state
         .proxy
-        .forward_stream(&selected.card.endpoint, body_value)
-        .await
-    {
+        .forward_stream_observed(&selected.card.endpoint, body_value, || async {
+            if let Some(context) = dispatched_event {
+                append_dispatched(context, selected).await?;
+            }
+            Ok::<(), ()>(())
+        })
+        .await;
+    let Ok(outcome) = outcome else {
+        return event_log_unavailable_response();
+    };
+    match outcome {
         proxy::StreamOutcome::Buffered {
             status,
             body,
@@ -2133,6 +2238,7 @@ fn terminated_proxy_body(upstream: Body) -> Body {
 
 /// The non-streaming half of [`chat_via_proxy`] (this PR's predecessor —
 /// idempotency cache read/write, `X-iDoris-Cached`/`X-iDoris-Origin-Record-Id`).
+#[allow(clippy::too_many_arguments)]
 async fn chat_via_proxy_buffered(
     state: &AppState,
     selected: &Selected,
@@ -2140,6 +2246,7 @@ async fn chat_via_proxy_buffered(
     parsed: &ParsedProfile,
     body_value: &serde_json::Value,
     record_id: &str,
+    dispatched_event: Option<&DispatchedEventContext>,
     reservation: &mut dispatch::ReservationGuard<'_>,
 ) -> Response {
     let is_paid = budget::is_paid(Some(selected.estimated_cost_minor));
@@ -2164,7 +2271,7 @@ async fn chat_via_proxy_buffered(
     let outcome = if is_paid {
         state
             .proxy
-            .forward_buffered_with_success_gate(
+            .forward_buffered_with_success_gate_observed(
                 &selected.card.endpoint,
                 body_value,
                 &opts,
@@ -2201,13 +2308,27 @@ async fn chat_via_proxy_buffered(
                         )),
                     }
                 },
+                || async {
+                    if let Some(context) = dispatched_event {
+                        append_dispatched(context, selected).await?;
+                    }
+                    Ok::<(), ()>(())
+                },
             )
             .await
     } else {
         state
             .proxy
-            .forward_buffered(&selected.card.endpoint, body_value, &opts)
+            .forward_buffered_observed(&selected.card.endpoint, body_value, &opts, || async {
+                if let Some(context) = dispatched_event {
+                    append_dispatched(context, selected).await?;
+                }
+                Ok::<(), ()>(())
+            })
             .await
+    };
+    let Ok(outcome) = outcome else {
+        return event_log_unavailable_response();
     };
 
     if is_paid {
@@ -2592,6 +2713,9 @@ mod decided_wiring_tests;
 
 #[cfg(test)]
 mod budget_reserved_wiring_tests;
+
+#[cfg(test)]
+mod dispatched_wiring_tests;
 
 #[cfg(test)]
 mod request_event_query_tests;

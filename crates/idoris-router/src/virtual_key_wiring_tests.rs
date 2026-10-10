@@ -108,6 +108,12 @@ fn state(endpoint: &str, authenticator: Option<auth::VirtualKeyAuthenticator>) -
     }
 }
 
+fn dev_state(endpoint: &str, authenticator: auth::VirtualKeyAuthenticator) -> AppState {
+    let mut state = state(endpoint, Some(authenticator));
+    state.dev_no_key_enabled = true;
+    state
+}
+
 async fn json_body(response: Response) -> Value {
     let bytes = response.into_body().collect().await.unwrap().to_bytes();
     serde_json::from_slice(&bytes).unwrap()
@@ -348,4 +354,101 @@ async fn scope_and_fallback_fail_403_before_any_upstream_call() {
         assert_eq!(body["error"]["reason_code"], reason);
     }
     server.verify().await;
+}
+
+#[tokio::test]
+async fn dev_no_key_allows_only_missing_auth_to_free_loopback_local_only() {
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok":true})),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let key = MintedVirtualKey::mint();
+    let (authenticator, _store) =
+        memory_auth(&key, &scope(vec![PrivacyClass::LocalOnly], &["fast"], None));
+    let app = build_app(dev_state(&server.uri(), authenticator));
+
+    let response = app.oneshot(chat_request(&[])).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn dev_no_key_rejects_any_paid_remote_and_invalid_bearer_before_egress() {
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(method("POST"))
+        .respond_with(wiremock::ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let key = MintedVirtualKey::mint();
+    let (authenticator, _store) =
+        memory_auth(&key, &scope(vec![PrivacyClass::LocalOnly], &["fast"], None));
+
+    let any = build_app(dev_state(&server.uri(), authenticator.clone()))
+        .oneshot(chat_request(&[("x-idoris-privacy", "any".into())]))
+        .await
+        .unwrap();
+    assert_eq!(any.status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        json_body(any).await["error"]["reason_code"],
+        "DEV_NO_KEY_SCOPE_FORBIDDEN"
+    );
+
+    let mut paid_state = dev_state(&server.uri(), authenticator.clone());
+    paid_state.cards[0].provider.cost.input_per_m = 1.0;
+    let paid = build_app(paid_state)
+        .oneshot(chat_request(&[]))
+        .await
+        .unwrap();
+    assert_eq!(paid.status(), StatusCode::FORBIDDEN);
+
+    let mut remote_state = dev_state(&server.uri(), authenticator.clone());
+    remote_state.cards[0].provider.locality = Locality::Remote;
+    remote_state.cards[0].provider.privacy_class = PrivacyClass::Any;
+    remote_state.cards[0].privacy_class = PrivacyClass::Any;
+    remote_state.cards[0].allowed_egress = vec![Egress::Internet];
+    let remote = build_app(remote_state)
+        .oneshot(chat_request(&[]))
+        .await
+        .unwrap();
+    assert!(!remote.status().is_success());
+
+    let invalid = build_app(dev_state(&server.uri(), authenticator))
+        .oneshot(chat_request(&[(
+            "authorization",
+            "Bearer malformed".into(),
+        )]))
+        .await
+        .unwrap();
+    assert_eq!(invalid.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        json_body(invalid).await["error"]["reason_code"],
+        "VIRTUAL_KEY_UNAUTHORIZED"
+    );
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn health_reports_dev_no_key_enabled_without_auth_material() {
+    let key = MintedVirtualKey::mint();
+    let (authenticator, _store) =
+        memory_auth(&key, &scope(vec![PrivacyClass::LocalOnly], &["fast"], None));
+    let response = build_app(dev_state("http://127.0.0.1:1", authenticator))
+        .oneshot(
+            Request::builder()
+                .uri("/health")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_body(response).await;
+    assert_eq!(body["dev_no_key_enabled"], true);
+    assert!(!body.to_string().contains("idk_"));
 }
