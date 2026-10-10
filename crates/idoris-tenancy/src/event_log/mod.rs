@@ -90,6 +90,14 @@ pub enum EventLogError {
     Json(#[from] serde_json::Error),
 }
 
+/// SQLite-backed Event Log guarded against ordinary DML from every
+/// connection while the canonical schema remains intact.
+///
+/// A peer that can execute DDL against this database (or modify the file
+/// directly) is outside this append-only boundary: such a peer can remove
+/// the guards, rewrite history, and restore the same schema afterward.
+/// SQLite has no privilege layer that can make that history tamper-evident;
+/// callers must keep schema/file-write authority inside the trusted host.
 pub struct EventLogStore(Mutex<Connection>);
 
 impl EventLogStore {
@@ -116,7 +124,7 @@ impl EventLogStore {
             return Ok(existing.sequence);
         }
         tx.execute(
-            "INSERT INTO event_log_events (event_id,tenant_id,record_id,event_type,ts_utc_ms,request_id,session_id,trace_id,parent_id,origin_record_id,metadata) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+            "INSERT INTO main.event_log_events (event_id,tenant_id,record_id,event_type,ts_utc_ms,request_id,session_id,trace_id,parent_id,origin_record_id,metadata) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
             rusqlite::params![event.event_id, scope, event.record_id, event.event_type.as_str(), event.ts_utc_ms, event.request_id, event.session_id, event.trace_id, event.parent_id, event.origin_record_id, metadata],
         )?;
         let sequence = tx.last_insert_rowid();
@@ -135,7 +143,7 @@ impl EventLogStore {
         }
         validate_id("record_id", record_id)?;
         let conn = self.0.lock().map_err(|_| EventLogError::LockPoisoned)?;
-        let mut stmt = conn.prepare("SELECT sequence,event_id,tenant_id,record_id,event_type,ts_utc_ms,request_id,session_id,trace_id,parent_id,origin_record_id,metadata FROM event_log_events WHERE tenant_id=?1 AND record_id=?2 ORDER BY sequence")?;
+        let mut stmt = conn.prepare("SELECT sequence,event_id,tenant_id,record_id,event_type,ts_utc_ms,request_id,session_id,trace_id,parent_id,origin_record_id,metadata FROM main.event_log_events WHERE tenant_id=?1 AND record_id=?2 ORDER BY sequence")?;
         let rows = stmt.query_map(rusqlite::params![scope, record_id], raw_event)?;
         rows.map(|row| decode(row?)).collect()
     }
@@ -321,17 +329,131 @@ fn decode(raw: RawEvent) -> Result<EventLogEvent, EventLogError> {
 }
 
 fn load_by_id(conn: &Connection, event_id: &str) -> Result<Option<EventLogEvent>, EventLogError> {
-    conn.query_row("SELECT sequence,event_id,tenant_id,record_id,event_type,ts_utc_ms,request_id,session_id,trace_id,parent_id,origin_record_id,metadata FROM event_log_events WHERE event_id=?1", [event_id], raw_event).optional()?.map(decode).transpose()
+    conn.query_row("SELECT sequence,event_id,tenant_id,record_id,event_type,ts_utc_ms,request_id,session_id,trace_id,parent_id,origin_record_id,metadata FROM main.event_log_events WHERE event_id=?1", [event_id], raw_event).optional()?.map(decode).transpose()
+}
+
+fn schema_objects(conn: &Connection) -> Result<Vec<(String, String, String)>, EventLogError> {
+    let mut stmt = conn.prepare(
+        "SELECT type,name,sql FROM main.sqlite_master \
+         WHERE sql IS NOT NULL AND (lower(name)='event_log_schema_migrations' \
+         OR lower(tbl_name) IN ('event_log_events','event_log_schema_migrations')) \
+         AND type IN ('table','index','trigger') ORDER BY type,name",
+    )?;
+    let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+}
+
+fn migration_schema_objects(
+    conn: &Connection,
+) -> Result<Vec<(String, String, String)>, EventLogError> {
+    let mut stmt = conn.prepare(
+        "SELECT type,name,sql FROM main.sqlite_master \
+         WHERE sql IS NOT NULL AND (lower(name)='event_log_schema_migrations' \
+         OR lower(tbl_name)='event_log_schema_migrations') \
+         AND type IN ('table','index','trigger') ORDER BY type,name",
+    )?;
+    let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+}
+
+fn verify_canonical_migration_schema(conn: &Connection) -> Result<(), EventLogError> {
+    let canonical = Connection::open_in_memory()?;
+    canonical.execute_batch(
+        "CREATE TABLE IF NOT EXISTS event_log_schema_migrations (version INTEGER PRIMARY KEY)",
+    )?;
+    if migration_schema_objects(conn)? != migration_schema_objects(&canonical)? {
+        return Err(EventLogError::SchemaIncomplete);
+    }
+    Ok(())
+}
+
+fn verify_canonical_schema(conn: &Connection) -> Result<(), EventLogError> {
+    let canonical = Connection::open_in_memory()?;
+    canonical.execute_batch(
+        "CREATE TABLE IF NOT EXISTS event_log_schema_migrations (version INTEGER PRIMARY KEY)",
+    )?;
+    canonical.execute_batch(include_str!("migrations/0001_events.sql"))?;
+    if schema_objects(conn)? != schema_objects(&canonical)? {
+        return Err(EventLogError::SchemaIncomplete);
+    }
+    Ok(())
+}
+
+fn reject_temp_event_log_objects(conn: &Connection) -> Result<(), EventLogError> {
+    let objects: i64 = conn.query_row(
+        "SELECT count(*) FROM sqlite_temp_master \
+         WHERE lower(name) IN ('event_log_events','event_log_schema_migrations') \
+         OR lower(tbl_name) IN ('event_log_events','event_log_schema_migrations')",
+        [],
+        |row| row.get(0),
+    )?;
+    if objects != 0 {
+        return Err(EventLogError::SchemaIncomplete);
+    }
+    Ok(())
+}
+
+fn verify_append_only_guards(conn: &Connection) -> Result<(), EventLogError> {
+    conn.execute_batch("SAVEPOINT event_log_schema_probe")?;
+    let event_id = Uuid::new_v4().to_string();
+    let forged_id = Uuid::new_v4().to_string();
+    let tenant_id = format!("schema-probe-{}", Uuid::new_v4().simple());
+    let record_id = format!("record-{}", Uuid::new_v4().simple());
+    let probe = (|| -> Result<bool, EventLogError> {
+        conn.execute(
+            "INSERT INTO main.event_log_events(event_id,tenant_id,record_id,event_type,ts_utc_ms,metadata) VALUES (?1,?2,?3,'decided',0,'{}')",
+            rusqlite::params![event_id, tenant_id, record_id],
+        )?;
+        let update_blocked = conn
+            .execute(
+                "UPDATE main.event_log_events SET record_id='mutated' WHERE event_id=?1",
+                [&event_id],
+            )
+            .is_err();
+        let delete_blocked = conn
+            .execute(
+                "DELETE FROM main.event_log_events WHERE event_id=?1",
+                [&event_id],
+            )
+            .is_err();
+        let sequence_blocked = conn
+            .execute("INSERT INTO main.event_log_events(sequence,event_id,tenant_id,record_id,event_type,ts_utc_ms,metadata) VALUES (-1,?1,?2,'forged','decided',0,'{}')", rusqlite::params![forged_id, tenant_id])
+            .is_err();
+        let replace_blocked = conn
+            .execute("INSERT OR REPLACE INTO main.event_log_events(event_id,tenant_id,record_id,event_type,ts_utc_ms,metadata) VALUES (?1,?2,'replaced','decided',0,'{}')", rusqlite::params![event_id, tenant_id])
+            .is_err();
+        Ok(update_blocked && delete_blocked && sequence_blocked && replace_blocked)
+    })();
+    conn.execute_batch("ROLLBACK TO event_log_schema_probe; RELEASE event_log_schema_probe")?;
+    if !probe? {
+        return Err(EventLogError::SchemaIncomplete);
+    }
+    Ok(())
 }
 
 fn migrate(conn: &mut Connection) -> Result<(), EventLogError> {
+    reject_temp_event_log_objects(conn)?;
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     tx.execute_batch(
-        "CREATE TABLE IF NOT EXISTS event_log_schema_migrations (version INTEGER PRIMARY KEY)",
+        "CREATE TABLE IF NOT EXISTS main.event_log_schema_migrations (version INTEGER PRIMARY KEY)",
     )?;
+    // Validate this table and all objects attached to it before inserting a
+    // migration marker: an unexpected trigger could otherwise forge Event
+    // Log rows as a side effect of the version=1 INSERT.
+    verify_canonical_migration_schema(&tx)?;
+    let unsupported = tx
+        .query_row(
+            "SELECT version FROM main.event_log_schema_migrations WHERE version<>1 LIMIT 1",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .optional()?;
+    if unsupported.is_some() {
+        return Err(EventLogError::SchemaIncomplete);
+    }
     let applied = tx
         .query_row(
-            "SELECT version FROM event_log_schema_migrations WHERE version=1",
+            "SELECT version FROM main.event_log_schema_migrations WHERE version=1",
             [],
             |r| r.get::<_, i64>(0),
         )
@@ -340,17 +462,15 @@ fn migrate(conn: &mut Connection) -> Result<(), EventLogError> {
     if !applied {
         tx.execute_batch(include_str!("migrations/0001_events.sql"))?;
         tx.execute(
-            "INSERT INTO event_log_schema_migrations(version) VALUES (1)",
+            "INSERT INTO main.event_log_schema_migrations(version) VALUES (1)",
             [],
         )?;
     }
-    if tx.prepare("SELECT sequence,event_id,tenant_id,record_id,event_type,ts_utc_ms,request_id,session_id,trace_id,parent_id,origin_record_id,metadata FROM event_log_events LIMIT 0").is_err() {
+    if tx.prepare("SELECT sequence,event_id,tenant_id,record_id,event_type,ts_utc_ms,request_id,session_id,trace_id,parent_id,origin_record_id,metadata FROM main.event_log_events LIMIT 0").is_err() {
         return Err(EventLogError::SchemaIncomplete);
     }
-    let objects: i64 = tx.query_row("SELECT count(*) FROM sqlite_master WHERE (type='table' AND name='event_log_events' AND upper(sql) LIKE '%SEQUENCE INTEGER PRIMARY KEY AUTOINCREMENT%' AND upper(sql) LIKE '%EVENT_ID TEXT NOT NULL UNIQUE%') OR (type='index' AND name='event_log_tenant_record_sequence' AND sql LIKE '%tenant_id, record_id, sequence%') OR (type='trigger' AND name='event_log_guard_insert' AND upper(sql) LIKE '%BEFORE INSERT ON EVENT_LOG_EVENTS%' AND upper(sql) LIKE '%NEW.SEQUENCE != -1%' AND upper(sql) LIKE '%EVENT_ID = NEW.EVENT_ID%' AND upper(sql) LIKE '%RAISE(ABORT%') OR (type='trigger' AND name='event_log_sequence_positive' AND upper(sql) LIKE '%AFTER INSERT ON EVENT_LOG_EVENTS%' AND upper(sql) LIKE '%NEW.SEQUENCE <= 0%' AND upper(sql) LIKE '%RAISE(ABORT%') OR (type='trigger' AND name='event_log_no_update' AND upper(sql) LIKE '%BEFORE UPDATE ON EVENT_LOG_EVENTS%' AND upper(sql) LIKE '%RAISE(ABORT%') OR (type='trigger' AND name='event_log_no_delete' AND upper(sql) LIKE '%BEFORE DELETE ON EVENT_LOG_EVENTS%' AND upper(sql) LIKE '%RAISE(ABORT%')", [], |r| r.get(0))?;
-    if objects != 6 {
-        return Err(EventLogError::SchemaIncomplete);
-    }
+    verify_canonical_schema(&tx)?;
+    verify_append_only_guards(&tx)?;
     tx.commit()?;
     Ok(())
 }

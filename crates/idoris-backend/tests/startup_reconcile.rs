@@ -10,8 +10,8 @@ use std::{
 
 use async_trait::async_trait;
 use idoris_backend::{
-    BackendError, BackendStatus, ChatRequest, ChatResponse, MockAdapter, ModelInfo, RuntimeAdapter,
-    Supervisor, SupervisorConfig,
+    BackendError, BackendStatus, ChatRequest, ChatResponse, GlobalCapacityLedger, MockAdapter,
+    ModelInfo, RuntimeAdapter, Supervisor, SupervisorConfig,
 };
 use idoris_contracts::{
     LoadPolicy,
@@ -123,6 +123,74 @@ fn config() -> SupervisorConfig {
         adapter_call_timeout: Duration::from_secs(1),
         ..SupervisorConfig::default()
     }
+}
+
+#[tokio::test]
+async fn startup_capacity_tracking_adopts_observed_truth_even_over_budget() {
+    let adapter = adapter(FirstStatus::Sample(sample(20.0, &["inherited"])));
+    let ledger = Arc::new(GlobalCapacityLedger::new(8.0).unwrap());
+    let handle = Supervisor::spawn_with_startup_capacity_tracking(
+        adapter,
+        config(),
+        ledger.clone(),
+        "runtime-a",
+    )
+    .unwrap();
+
+    assert_eq!(handle.status().await.unwrap().used_gb, 20.0);
+    let snapshot = ledger.snapshot().unwrap();
+    assert_eq!(snapshot.budget_gb, 8.0);
+    assert_eq!(snapshot.reserved_gb, 20.0);
+    assert_eq!(snapshot.allocations["runtime:runtime-a"], 20.0);
+}
+
+#[tokio::test]
+async fn startup_capacity_tracking_aggregates_distinct_runtimes_without_double_counting() {
+    let ledger = Arc::new(GlobalCapacityLedger::new(8.0).unwrap());
+    let a = Supervisor::spawn_with_startup_capacity_tracking(
+        adapter(FirstStatus::Sample(sample(7.0, &["inherited-a"]))),
+        config(),
+        ledger.clone(),
+        "runtime-a",
+    )
+    .unwrap();
+    let b = Supervisor::spawn_with_startup_capacity_tracking(
+        adapter(FirstStatus::Sample(sample(9.0, &["inherited-b"]))),
+        config(),
+        ledger.clone(),
+        "runtime-b",
+    )
+    .unwrap();
+
+    assert_eq!(a.status().await.unwrap().used_gb, 7.0);
+    assert_eq!(b.status().await.unwrap().used_gb, 9.0);
+    let snapshot = ledger.snapshot().unwrap();
+    assert_eq!(snapshot.reserved_gb, 16.0);
+    assert_eq!(snapshot.allocations["runtime:runtime-a"], 7.0);
+    assert_eq!(snapshot.allocations["runtime:runtime-b"], 9.0);
+}
+
+#[tokio::test]
+async fn startup_capacity_inconsistency_fails_closed() {
+    let adapter = adapter(FirstStatus::Sample(sample(2.0, &["inherited"])));
+    let ledger = Arc::new(GlobalCapacityLedger::new(24.0).unwrap());
+    ledger
+        .adopt_observed("runtime:runtime-a", None, 1.0)
+        .unwrap();
+    let handle = Supervisor::spawn_with_startup_capacity_tracking(
+        adapter,
+        config(),
+        ledger.clone(),
+        "runtime-a",
+    )
+    .unwrap();
+
+    let error = handle.status().await.unwrap_err();
+    assert_eq!(error.reason_code(), "state_invariant_violated");
+    assert_eq!(
+        ledger.snapshot().unwrap().allocations["runtime:runtime-a"],
+        1.0
+    );
 }
 
 #[tokio::test]
