@@ -21,6 +21,9 @@ pub mod components;
 /// Executable-relative bundled config resolution with explicit-path overrides.
 pub mod config;
 
+/// Validated chat-request correlation identifiers for later Event Log use.
+pub mod correlation;
+
 /// Routing-policy loading from `IDORIS_ROUTING_POLICY` (R2-D task 2); wired
 /// into `AppState` in a follow-up PR.
 pub mod routing_policy;
@@ -50,6 +53,8 @@ pub mod models;
 /// Metadata-only audit validation and tenant-scoped persistence (B1 task19).
 pub mod audit;
 mod audit_body;
+/// Trusted Authorization bearer -> virtual-key caller identity.
+pub mod auth;
 /// Injectable `/capabilities` provider boundary (B1 task32). Live capacity
 /// aggregation is wired by task33.
 pub mod capabilities;
@@ -210,6 +215,9 @@ pub struct AppState {
     /// Tenant-scoped audit/usage record store. Startup installs it together
     /// with `budget_ledger` from the same SQLite path.
     pub record_store: Option<Arc<std::sync::Mutex<idoris_tenancy::store::TenantStore>>>,
+    /// Persistent B6 Event Log capability. This slice only bootstraps and
+    /// carries the handle; request event emission is wired separately.
+    pub event_log: Option<Arc<idoris_tenancy::event_log::EventLogStore>>,
     /// Best-effort audit persistence failures. Audit must not alter the HTTP
     /// result already produced by routing/backend execution.
     pub audit_failures: Arc<AtomicU64>,
@@ -249,6 +257,7 @@ impl std::fmt::Debug for AppState {
                 "record_store",
                 &self.record_store.as_ref().map(|_| "TenantStore { .. }"),
             )
+            .field("event_log", &self.event_log.as_ref().map(|_| "configured"))
             .field(
                 "audit_failures",
                 &self.audit_failures.load(Ordering::Relaxed),
@@ -290,6 +299,7 @@ impl Default for AppState {
             runtimes: runtime::RuntimeRegistry::default(),
             budget_ledger: None,
             record_store: None,
+            event_log: None,
             audit_failures: Arc::new(AtomicU64::new(0)),
             models_health: Arc::new(health::HealthTracker::default()),
             capabilities: None,
@@ -1201,6 +1211,15 @@ fn rejection_response(rejection: Rejection) -> Response {
     )
 }
 
+fn correlation_error_response(error: correlation::CorrelationError) -> Response {
+    error_envelope_with_reason(
+        StatusCode::BAD_REQUEST,
+        "invalid_correlation_header",
+        error.reason_code(),
+        "invalid correlation header",
+    )
+}
+
 /// `POST /v1/chat/completions`. Order (locked by conformance): non-JSON
 /// body -> `invalid_json`; valid JSON that isn't an object -> `invalid_body`;
 /// only then are control-plane headers parsed (see [`profile::parse_profile`]).
@@ -1237,6 +1256,10 @@ async fn chat_completions(
     let parsed = match parse_profile(&headers, model, state.deploy_mode) {
         Ok(parsed) => parsed,
         Err(err) => return err.into_response(),
+    };
+    let _correlation = match correlation::parse(&headers) {
+        Ok(context) => context,
+        Err(error) => return correlation_error_response(error),
     };
 
     let messages = extract_messages(object);
@@ -2011,6 +2034,9 @@ fn audit_reason(status: StatusCode, served_locality: bool, degraded: bool) -> St
 mod local_privacy_tests;
 
 #[cfg(test)]
+mod correlation_wiring_tests;
+
+#[cfg(test)]
 mod embeddings_wiring_tests;
 
 #[cfg(test)]
@@ -2082,6 +2108,11 @@ mod tests {
         assert_eq!(parse_port(None).unwrap(), DEFAULT_PORT);
         assert_eq!(parse_port(Some("")).unwrap(), DEFAULT_PORT);
         assert_eq!(parse_port(Some("   ")).unwrap(), DEFAULT_PORT);
+    }
+
+    #[test]
+    fn default_app_state_keeps_event_log_unconfigured() {
+        assert!(AppState::default().event_log.is_none());
     }
 
     #[test]

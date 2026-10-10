@@ -22,6 +22,7 @@ pub mod chat;
 pub mod detect;
 pub mod error;
 pub mod factory;
+pub mod local_http_runtime;
 pub mod local_runtime;
 pub mod local_runtime_process;
 pub mod omlx;
@@ -33,6 +34,7 @@ pub use chat::{
     ensure_terminated,
 };
 pub use error::UpstreamError;
+pub use local_http_runtime::{LocalHttpRuntimeAdapter, LocalHttpRuntimeConfig};
 pub use local_runtime::{LocalRuntimeKind, LocalRuntimeLaunch};
 pub use local_runtime_process::ManagedRuntimeProcess;
 pub use omlx::{OmlxAdapter, OmlxAdapterConfig};

@@ -22,7 +22,8 @@ use uuid::Uuid;
 use crate::AppState;
 use idoris_contracts::admin_v0::{
     AdminAdmissionStatus, AdminBackend, AdminBackendsResponse, AdminCapacityEntry,
-    AdminCapacitySnapshot, AdminCapacityState, AdminStatusResponse,
+    AdminCapacitySnapshot, AdminCapacityState, AdminModelSource, AdminModelSourceError,
+    AdminModelSourceKind, AdminModelSourceState, AdminModelsResponse, AdminStatusResponse,
 };
 use idoris_policy::ROLES;
 
@@ -316,7 +317,7 @@ async fn admin_backends(State(state): State<AdminHttpState>) -> Json<AdminBacken
     Json(AdminBackendsResponse(backends(&state.app)))
 }
 
-async fn admin_models(State(state): State<AdminHttpState>) -> Json<AdminModelsSnapshot> {
+async fn admin_models(State(state): State<AdminHttpState>) -> Json<AdminModelsResponse> {
     Json(models(&state.app).await)
 }
 
@@ -340,43 +341,6 @@ pub struct AdminStatus {
     pub subscriptions: usize,
     pub budget_configured: bool,
     pub audit_configured: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AdminModelSourceKind {
-    HttpModelsEndpoint,
-    SubscriptionRegistration,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AdminModelSourceState {
-    Observed,
-    Configured,
-    Error,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AdminModelSourceError {
-    Unavailable,
-    AuthenticationFailed,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct AdminModelSource {
-    pub provider_id: String,
-    pub source: AdminModelSourceKind,
-    pub state: AdminModelSourceState,
-    pub models: Vec<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<AdminModelSourceError>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct AdminModelsSnapshot {
-    pub sources: Vec<AdminModelSource>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -461,7 +425,7 @@ pub fn roles() -> Vec<AdminRole> {
 /// Observe each active model source without collapsing failures into an
 /// apparently complete flat list. HTTP model ids are runtime observations;
 /// subscription ids are registration facts, not backend health claims.
-pub async fn models(state: &AppState) -> AdminModelsSnapshot {
+pub async fn models(state: &AppState) -> AdminModelsResponse {
     let mut sources = Vec::new();
     for card in &state.cards {
         if card.form != idoris_contracts::component_card::Form::HttpService {
@@ -506,7 +470,7 @@ pub async fn models(state: &AppState) -> AdminModelsSnapshot {
                 error: None,
             }),
     );
-    AdminModelsSnapshot { sources }
+    AdminModelsResponse { sources }
 }
 
 /// Observe only lifecycle-managed runtimes. Resident direct HTTP cards are
@@ -1125,6 +1089,21 @@ mod tests {
         let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(value, serde_json::json!([]));
         assert!(idoris_contracts::parse::<AdminBackendsResponse>(&value).is_ok());
+    }
+
+    #[tokio::test]
+    async fn admin_models_wire_shape_matches_the_shared_v0_contract() {
+        let token = AdminSessionToken::mint();
+        let secret = token.expose_secret().to_string();
+        let response = build_admin_app(AppState::default(), token)
+            .oneshot(admin_request("/admin/api/v1/models", "Bearer", &secret))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value, serde_json::json!({"sources": []}));
+        assert!(idoris_contracts::parse::<AdminModelsResponse>(&value).is_ok());
     }
 
     #[tokio::test]
