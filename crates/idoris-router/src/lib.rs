@@ -21,6 +21,9 @@ pub mod components;
 /// Executable-relative bundled config resolution with explicit-path overrides.
 pub mod config;
 
+/// Validated chat-request correlation identifiers for later Event Log use.
+pub mod correlation;
+
 /// Routing-policy loading from `IDORIS_ROUTING_POLICY` (R2-D task 2); wired
 /// into `AppState` in a follow-up PR.
 pub mod routing_policy;
@@ -1065,6 +1068,15 @@ fn rejection_response(rejection: Rejection) -> Response {
     )
 }
 
+fn correlation_error_response(error: correlation::CorrelationError) -> Response {
+    error_envelope_with_reason(
+        StatusCode::BAD_REQUEST,
+        "invalid_correlation_header",
+        error.reason_code(),
+        "invalid correlation header",
+    )
+}
+
 /// `POST /v1/chat/completions`. Order (locked by conformance): non-JSON
 /// body -> `invalid_json`; valid JSON that isn't an object -> `invalid_body`;
 /// only then are control-plane headers parsed (see [`profile::parse_profile`]).
@@ -1101,6 +1113,10 @@ async fn chat_completions(
     let parsed = match parse_profile(&headers, model, state.deploy_mode) {
         Ok(parsed) => parsed,
         Err(err) => return err.into_response(),
+    };
+    let _correlation = match correlation::parse(&headers) {
+        Ok(context) => context,
+        Err(error) => return correlation_error_response(error),
     };
 
     let messages = extract_messages(object);
@@ -1873,6 +1889,9 @@ fn audit_reason(status: StatusCode, served_locality: bool, degraded: bool) -> St
 
 #[cfg(test)]
 mod local_privacy_tests;
+
+#[cfg(test)]
+mod correlation_wiring_tests;
 
 #[cfg(test)]
 mod embeddings_wiring_tests;
