@@ -1164,11 +1164,29 @@ async fn append_profiled(
     run_event_log_write(move || store.append(Some(&tenant_id), &event).map(|_| ())).await
 }
 
-enum DecisionObservation<'a> {
-    Selected(&'a Selected),
-    Rejected(&'a Rejection),
-    NoCandidate(&'static str),
-    Internal,
+fn event_reason_code(reason: &idoris_policy::ReasonCode) -> String {
+    match reason {
+        idoris_policy::ReasonCode::PrivacyLoopbackOnly => "privacy_loopback_only".to_string(),
+        idoris_policy::ReasonCode::PrivacyTightenedByContent => {
+            "privacy_tightened_by_content".to_string()
+        }
+        idoris_policy::ReasonCode::RoleMatched(role) => {
+            format!("role_matched:{}", role.as_str())
+        }
+        idoris_policy::ReasonCode::RoleFallbackCapabilityOnly => {
+            "role_fallback_capability_only".to_string()
+        }
+        idoris_policy::ReasonCode::PriceUnknownExcluded => "price_unknown_excluded".to_string(),
+        idoris_policy::ReasonCode::BudgetWithinLimit => "budget_within_limit".to_string(),
+        idoris_policy::ReasonCode::BudgetNoTenantContext => "budget_no_tenant_context".to_string(),
+        idoris_policy::ReasonCode::BudgetFallbackToFreeCandidate => {
+            "budget_fallback_to_free_candidate".to_string()
+        }
+        idoris_policy::ReasonCode::AdmissionReady => "admission_ready".to_string(),
+        idoris_policy::ReasonCode::AdmissionRequiresEviction => {
+            "admission_requires_eviction".to_string()
+        }
+    }
 }
 
 async fn append_decided(
@@ -1177,7 +1195,8 @@ async fn append_decided(
     record_id: String,
     correlation: &correlation::RequestCorrelation,
     route: &routing_policy::RouteDecision,
-    observation: DecisionObservation<'_>,
+    selected: Option<&Selected>,
+    rejection_reason: Option<&str>,
 ) -> Result<(), ()> {
     let mut metadata = std::collections::BTreeMap::new();
     let rule_id = match route.matched_rule {
@@ -1185,32 +1204,38 @@ async fn append_decided(
         routing_policy::MatchedRule::Default => "default".to_string(),
     };
     metadata.insert("rule_id".to_string(), json!(rule_id));
-    match observation {
-        DecisionObservation::Selected(selected) => {
-            let tier = match selected.card.provider.tier {
-                idoris_contracts::common::Tier::Local => "local",
-                idoris_contracts::common::Tier::Remote => "remote",
-                idoris_contracts::common::Tier::Lora => "lora",
-            };
+    match selected {
+        Some(selected) => {
             metadata.insert("status".to_string(), json!("selected"));
-            metadata.insert("provider_id".to_string(), json!(selected.card.provider.id));
-            metadata.insert("tier".to_string(), json!(tier));
+            metadata.insert(
+                "provider_id".to_string(),
+                json!(selected.card.provider.id.as_str()),
+            );
+            metadata.insert("tier".to_string(), json!(selected.card.provider.tier));
             metadata.insert(
                 "served_locality".to_string(),
-                json!(locality_str(selected.served_locality)),
+                json!(selected.served_locality),
             );
+            metadata.insert(
+                "degraded".to_string(),
+                json!(selected.decision.is_degraded()),
+            );
+            if !selected.decision.reason_codes.is_empty() {
+                let reason_codes = selected
+                    .decision
+                    .reason_codes
+                    .iter()
+                    .map(event_reason_code)
+                    .collect::<Vec<_>>();
+                metadata.insert("reason_codes".to_string(), json!(reason_codes));
+            }
         }
-        DecisionObservation::Rejected(rejection) => {
+        None => {
             metadata.insert("status".to_string(), json!("rejected"));
-            metadata.insert("reason".to_string(), json!(rejection.error_type()));
-        }
-        DecisionObservation::NoCandidate(reason) => {
-            metadata.insert("status".to_string(), json!("rejected"));
-            metadata.insert("reason".to_string(), json!(reason));
-        }
-        DecisionObservation::Internal => {
-            metadata.insert("status".to_string(), json!("error"));
-            metadata.insert("reason".to_string(), json!("internal_error"));
+            metadata.insert(
+                "reason".to_string(),
+                json!(rejection_reason.unwrap_or("no_candidate")),
+            );
         }
     }
     let ts_utc_ms = SystemTime::now()
@@ -1301,7 +1326,7 @@ async fn chat_completions(
 
     let messages = extract_messages(object);
     let parsed = intent::resolve_profile(parsed, &messages).await;
-    if let Some((event_log, tenant_id)) = &event_context
+    if let Some((event_log, tenant_id)) = event_context.as_ref()
         && append_profiled(
             event_log.clone(),
             tenant_id.clone(),
@@ -1327,14 +1352,15 @@ async fn chat_completions(
         } else {
             "no_candidate"
         };
-        if let Some((event_log, tenant_id)) = &event_context
+        if let Some((event_log, tenant_id)) = event_context.as_ref()
             && append_decided(
                 event_log.clone(),
                 tenant_id.clone(),
                 record_id.clone(),
                 &correlation,
                 &policy_cards.route,
-                DecisionObservation::NoCandidate(reason),
+                None,
+                Some(reason),
             )
             .await
             .is_err()
@@ -1353,19 +1379,20 @@ async fn chat_completions(
     }
 
     let selection = dispatch::select(&policy_cards.cards, &parsed, &prompt);
-    let observation = match &selection {
-        Ok(selected) => DecisionObservation::Selected(selected),
-        Err(DispatchError::Rejection(rejection)) => DecisionObservation::Rejected(rejection),
-        Err(DispatchError::Internal(_)) => DecisionObservation::Internal,
+    let rejection_reason = match &selection {
+        Ok(_) => None,
+        Err(DispatchError::Rejection(rejection)) => Some(rejection.error_type()),
+        Err(DispatchError::Internal(_)) => Some("internal_error"),
     };
-    if let Some((event_log, tenant_id)) = &event_context
+    if let Some((event_log, tenant_id)) = event_context.as_ref()
         && append_decided(
             event_log.clone(),
             tenant_id.clone(),
             record_id.clone(),
             &correlation,
             &policy_cards.route,
-            observation,
+            selection.as_ref().ok(),
+            rejection_reason,
         )
         .await
         .is_err()
@@ -1493,7 +1520,7 @@ async fn chat_completions(
     // The request token is a fresh child of this TCP connection's lifetime.
     // Completing the request body does not cancel it; EOF/reset/shutdown of
     // the actual connection does.
-    let selected_for_dispatch = selection.as_ref().ok();
+    let selected_for_dispatch = selection.ok();
     let selected_estimated_cost = selected_for_dispatch
         .as_ref()
         .map(|selected| selected.estimated_cost_minor);
