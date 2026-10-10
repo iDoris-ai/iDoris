@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://idoris.ai/schema/admin-v0-backends.schema.json",
+  "title": "AdminV0BackendsResponse",
+  "type": "array",
+  "items": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": ["provider_id", "locality", "form", "lifecycle_runtime_bound"],
+    "properties": {
+      "provider_id": { "type": "string", "minLength": 1 },
+      "locality": { "enum": ["loopback", "lan", "remote"] },
+      "form": { "enum": ["http_service", "spawn_cli", "bundled_binary", "nostr_node", "mitm_proxy", "batch_job"] },
+      "lifecycle_runtime_bound": { "type": "boolean" }
+    }
+  }
+}

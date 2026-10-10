@@ -8,6 +8,7 @@ use idoris_contracts::DeployMode;
 use idoris_tenancy::budget::{BudgetLedger, SpendGate};
 use idoris_tenancy::event_log::EventLogStore;
 use idoris_tenancy::store::TenantStore;
+use idoris_tenancy::virtual_key::store::VirtualKeyStore;
 use serde::Deserialize;
 
 use crate::budget::PERSONAL_TENANT_ID;
@@ -50,6 +51,8 @@ impl From<ConfigSpendGate> for SpendGate {
 pub struct StorageBootstrap {
     pub records: Arc<Mutex<TenantStore>>,
     pub budget: Arc<BudgetLedger>,
+    /// Persistent verifier storage only; request authentication is wired separately.
+    pub virtual_keys: Arc<Mutex<VirtualKeyStore>>,
     pub event_log: Arc<EventLogStore>,
 }
 
@@ -59,16 +62,33 @@ pub fn bootstrap_process(deploy_mode: DeployMode) -> Result<StorageBootstrap, St
     let parent = executable
         .parent()
         .ok_or_else(|| "当前可执行文件没有父目录".to_string())?;
-    let db_path = match env_path("IDORIS_DB_PATH")? {
-        Some(path) => path,
-        None => default_db_path()?,
-    };
+    let db_path = process_db_path()?;
     let config_path = match env_path("IDORIS_TENANTS_CONFIG")? {
         Some(path) => Some(path),
         None if deploy_mode == DeployMode::Tenant => Some(parent.join(DEFAULT_TENANTS_RELATIVE)),
         None => None,
     };
     bootstrap(&db_path, config_path.as_deref(), deploy_mode)
+}
+
+/// Opens only the persistent virtual-key verifier store using the same
+/// process database resolution as daemon startup. This intentionally avoids
+/// tenant/budget bootstrap side effects for offline key-management commands.
+pub fn open_virtual_key_store_process() -> Result<VirtualKeyStore, String> {
+    let db_path = process_db_path()?;
+    if let Some(parent) = db_path.parent().filter(|path| !path.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)
+            .map_err(|err| format!("无法创建数据库目录 \"{}\"：{err}", parent.display()))?;
+    }
+    VirtualKeyStore::open(&db_path)
+        .map_err(|err| format!("无法打开虚拟 key 数据库 \"{}\"：{err}", db_path.display()))
+}
+
+fn process_db_path() -> Result<PathBuf, String> {
+    match env_path("IDORIS_DB_PATH")? {
+        Some(path) => Ok(path),
+        None => default_db_path(),
+    }
 }
 
 pub fn bootstrap(
@@ -86,6 +106,9 @@ pub fn bootstrap(
         .map_err(|err| format!("无法打开租户记录数据库 \"{}\"：{err}", db_path.display()))?;
     let budget = BudgetLedger::open(db_path)
         .map_err(|err| format!("无法打开预算数据库 \"{}\"：{err}", db_path.display()))?;
+    // Open the verifier schema during startup so a broken key store fails closed.
+    let virtual_keys = VirtualKeyStore::open(db_path)
+        .map_err(|err| format!("无法打开虚拟 key 数据库 \"{}\"：{err}", db_path.display()))?;
     let event_log = EventLogStore::open(db_path)
         .map_err(|err| format!("无法打开事件日志数据库 \"{}\"：{err}", db_path.display()))?;
 
@@ -122,6 +145,7 @@ pub fn bootstrap(
     Ok(StorageBootstrap {
         records: Arc::new(Mutex::new(records)),
         budget: Arc::new(budget),
+        virtual_keys: Arc::new(Mutex::new(virtual_keys)),
         event_log: Arc::new(event_log),
     })
 }
@@ -211,24 +235,44 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
-    use std::collections::BTreeMap;
-
+    use idoris_contracts::common::PrivacyClass;
     use idoris_tenancy::budget::{BudgetError, BudgetScope, Price};
     use idoris_tenancy::event_log::{EventType, NewEvent};
     use idoris_tenancy::store::{RecordKind, TenantRecord};
+    use idoris_tenancy::virtual_key::MintedVirtualKey;
+    use idoris_tenancy::virtual_key::store::VirtualKeyScope;
     use rusqlite::Connection;
     use serde_json::Map;
+    use std::collections::BTreeMap;
     use uuid::Uuid;
+
+    fn virtual_key_scope() -> VirtualKeyScope {
+        VirtualKeyScope {
+            owner: "agent24-instance".into(),
+            allowed_privacy: vec![PrivacyClass::LocalOnly],
+            allowed_roles: vec!["fast".into()],
+            budget_ref: None,
+            expires_at_ms: None,
+            admin_scopes: Vec::new(),
+        }
+    }
 
     #[test]
     fn personal_defaults_are_persistent_and_unknown_tenant_is_not_fake_zero() {
         let dir = tempfile::TempDir::new().unwrap();
         let db = dir.path().join("state.sqlite3");
+        let key = MintedVirtualKey::mint();
         let event_id = Uuid::new_v4().to_string();
         {
             let storage = bootstrap(&db, None, DeployMode::Personal).unwrap();
             let view = storage.budget.tenant_readview(PERSONAL_TENANT_ID).unwrap();
             assert_eq!(view.limit_minor, 0);
+            storage
+                .virtual_keys
+                .lock()
+                .unwrap()
+                .insert_active(&key.key_id, key.hash, &virtual_key_scope())
+                .unwrap();
             storage
                 .event_log
                 .append(
@@ -279,12 +323,36 @@ mod tests {
             reopened.budget.tenant_readview("missing"),
             Err(BudgetError::TenantNotConfigured { .. })
         ));
+        assert_eq!(
+            reopened
+                .virtual_keys
+                .lock()
+                .unwrap()
+                .authenticate(&key.secret, 1)
+                .unwrap()
+                .unwrap()
+                .key_id,
+            key.key_id
+        );
         let events = reopened
             .event_log
             .events_for_record(Some(PERSONAL_TENANT_ID), "event-record")
             .unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event.event_id, event_id);
+    }
+
+    #[test]
+    fn virtual_key_store_open_failure_fails_bootstrap_closed() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = dir.path().join("state.sqlite3");
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch("CREATE TABLE virtual_key_schema_migrations (broken INTEGER);")
+            .unwrap();
+        drop(conn);
+
+        let err = bootstrap(&db, None, DeployMode::Personal).err().unwrap();
+        assert!(err.contains("无法打开虚拟 key 数据库"), "{err}");
     }
 
     #[test]
