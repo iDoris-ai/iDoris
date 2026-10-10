@@ -520,3 +520,39 @@ async fn remote_bind_requires_bearer_on_every_data_route_except_health() {
         .unwrap();
     assert_eq!(health.status(), StatusCode::OK);
 }
+
+#[tokio::test]
+async fn protocol_routes_reject_privacy_outside_authenticated_key_scope() {
+    let key = MintedVirtualKey::mint();
+    let roles = idoris_policy::ROLES
+        .iter()
+        .map(|role| role.as_str())
+        .collect::<Vec<_>>();
+    let (authenticator, _store) =
+        memory_auth(&key, &scope(vec![PrivacyClass::LocalOnly], &roles, None));
+    let mut remote = state("http://127.0.0.1:1", Some(authenticator));
+    remote.remote_bind_requires_auth = true;
+    let app = build_app(remote);
+    for endpoint in ["/v1/embeddings", "/v1/rerank", "/v1/messages"] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(endpoint)
+                    .header("authorization", bearer(&key))
+                    .header("x-idoris-privacy", "any")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"model":"idoris/fast","messages":[]}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN, "{endpoint}");
+        assert_eq!(
+            json_body(response).await["error"]["reason_code"],
+            "VIRTUAL_KEY_PRIVACY_FORBIDDEN",
+            "{endpoint}"
+        );
+    }
+}

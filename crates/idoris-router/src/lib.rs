@@ -387,7 +387,7 @@ pub fn build_app(state: AppState) -> Router {
 
 async fn remote_bind_auth_middleware(
     State(state): State<Arc<AppState>>,
-    request: Request,
+    mut request: Request,
     next: Next,
 ) -> Response {
     if !state.remote_bind_requires_auth || request.uri().path() == "/health" {
@@ -396,15 +396,49 @@ async fn remote_bind_auth_middleware(
     let Some(authenticator) = &state.virtual_key_authenticator else {
         return virtual_key_unauthorized_response();
     };
-    if authenticator.authenticate(request.headers()).await.is_err() {
-        return virtual_key_unauthorized_response();
-    }
+    let identity = match authenticator.authenticate(request.headers()).await {
+        Ok(identity) => identity,
+        Err(_) => return virtual_key_unauthorized_response(),
+    };
+    request.extensions_mut().insert(identity);
     next.run(request).await
+}
+
+async fn enforce_protocol_key_scope(
+    state: &AppState,
+    headers: &HeaderMap,
+    remote_identity: Option<&idoris_tenancy::virtual_key::store::AuthenticatedVirtualKey>,
+    parsed: &profile::ParsedProfile,
+) -> Result<(), Response> {
+    if let Some(identity) = remote_identity {
+        return auth::enforce_scope(identity, parsed).map_err(virtual_key_scope_response);
+    }
+    let has_bearer = headers.contains_key(axum::http::header::AUTHORIZATION);
+    if state.dev_no_key_enabled && !has_bearer {
+        return if parsed.task.privacy.unwrap_or(PrivacyClass::LocalOnly) == PrivacyClass::LocalOnly
+        {
+            Ok(())
+        } else {
+            Err(dev_no_key_scope_response())
+        };
+    }
+    if let Some(authenticator) = &state.virtual_key_authenticator {
+        let identity = authenticator
+            .authenticate(headers)
+            .await
+            .map_err(|_| virtual_key_unauthorized_response())?;
+        return auth::enforce_scope(&identity, parsed).map_err(virtual_key_scope_response);
+    }
+    if state.dev_no_key_enabled && has_bearer {
+        return Err(virtual_key_unauthorized_response());
+    }
+    Ok(())
 }
 
 async fn embeddings(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    remote_identity: Option<Extension<idoris_tenancy::virtual_key::store::AuthenticatedVirtualKey>>,
     Extension(RequestRecordId(record_id)): Extension<RequestRecordId>,
     body: Bytes,
 ) -> Response {
@@ -434,6 +468,16 @@ async fn embeddings(
     // Caller headers may further constrain routing elsewhere, but they cannot
     // turn an embeddings request into a chat/rerank dispatch.
     parsed.task.capabilities = Some(vec![Capability::Embedding]);
+    if let Err(response) = enforce_protocol_key_scope(
+        &state,
+        &headers,
+        remote_identity.as_ref().map(|identity| &identity.0),
+        &parsed,
+    )
+    .await
+    {
+        return response;
+    }
 
     let cards = dispatch::policy_cards(&state.cards, &state.routing_policy, &parsed)
         .cards
@@ -540,6 +584,7 @@ async fn embeddings(
 async fn rerank(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    remote_identity: Option<Extension<idoris_tenancy::virtual_key::store::AuthenticatedVirtualKey>>,
     Extension(RequestRecordId(record_id)): Extension<RequestRecordId>,
     body: Bytes,
 ) -> Response {
@@ -566,6 +611,16 @@ async fn rerank(
         Err(error) => return error.into_response(),
     };
     parsed.task.capabilities = Some(vec![Capability::Rerank]);
+    if let Err(response) = enforce_protocol_key_scope(
+        &state,
+        &headers,
+        remote_identity.as_ref().map(|identity| &identity.0),
+        &parsed,
+    )
+    .await
+    {
+        return response;
+    }
 
     let cards = dispatch::policy_cards(&state.cards, &state.routing_policy, &parsed)
         .cards
@@ -669,6 +724,7 @@ async fn rerank(
 async fn messages(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    remote_identity: Option<Extension<idoris_tenancy::virtual_key::store::AuthenticatedVirtualKey>>,
     Extension(RequestRecordId(record_id)): Extension<RequestRecordId>,
     body: Bytes,
 ) -> Response {
@@ -708,6 +764,16 @@ async fn messages(
         Err(error) => return error.into_response(),
     };
     parsed.task.capabilities = Some(vec![Capability::Chat]);
+    if let Err(response) = enforce_protocol_key_scope(
+        &state,
+        &headers,
+        remote_identity.as_ref().map(|identity| &identity.0),
+        &parsed,
+    )
+    .await
+    {
+        return response;
+    }
 
     let cards = dispatch::policy_cards(&state.cards, &state.routing_policy, &parsed)
         .cards
