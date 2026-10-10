@@ -38,6 +38,7 @@ pub mod admin;
 
 /// Per-card runtime construction for lifecycle-managed providers.
 pub mod runtime;
+pub mod runtime_launch_config;
 
 /// Atomic reserve/settle/release around a paid candidate (R2-D task 4); not
 /// yet wired into `dispatch`/the request path — a follow-up PR does that.
