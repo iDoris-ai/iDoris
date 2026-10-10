@@ -656,8 +656,8 @@ async fn messages(
     };
     parsed.task.capabilities = Some(vec![Capability::Chat]);
 
-    let (cards, _) = dispatch::policy_cards(&state.cards, &state.routing_policy, &parsed);
-    let cards = cards
+    let cards = dispatch::policy_cards(&state.cards, &state.routing_policy, &parsed)
+        .cards
         .into_iter()
         .filter(dispatch::is_resident_http_service)
         .collect::<Vec<_>>();
