@@ -161,5 +161,6 @@ fn buffered_opts<'a>() -> ForwardOpts<'a> {
         provider_id: "provider",
         served_locality: Locality::Loopback,
         privacy: PrivacyClass::Any,
+        require_openai_usage: false,
     }
 }

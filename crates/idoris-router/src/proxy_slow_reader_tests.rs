@@ -14,6 +14,7 @@ fn opts() -> ForwardOpts<'static> {
         provider_id: "provider",
         served_locality: Locality::Loopback,
         privacy: PrivacyClass::Any,
+        require_openai_usage: false,
     }
 }
 
