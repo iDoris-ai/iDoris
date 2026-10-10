@@ -63,7 +63,20 @@ async fn main() {
                 std::process::exit(1);
             }
         }
+        cli::Command::Key(cli::KeyCommand::Issue) => {
+            if let Err(message) = issue_virtual_key() {
+                eprintln!("[idoris] {message}");
+                std::process::exit(1);
+            }
+        }
     }
+}
+
+fn issue_virtual_key() -> Result<(), String> {
+    let store = storage::open_virtual_key_store_process()?;
+    let mut stdin = std::io::stdin().lock();
+    let mut stdout = std::io::stdout().lock();
+    idoris_router::key_issue::issue_from_reader(&store, &mut stdin, &mut stdout)
 }
 
 fn env_flag(name: &str) -> bool {
@@ -84,6 +97,7 @@ async fn run(options: cli::ServeOptions) -> Result<(), String> {
         AdminBindConfig::parse(admin_port.as_deref()).map_err(|err| err.to_string())?;
     let deploy_mode =
         profile::deploy_mode_from_env(std::env::var("IDORIS_DEPLOY_MODE").ok().as_deref());
+    let dev_no_key_enabled = env_flag("IDORIS_DEV_NO_KEY");
 
     let components_dir =
         config::resolve_env("IDORIS_COMPONENTS_DIR", components::DEFAULT_COMPONENTS_DIR)?;
@@ -181,6 +195,7 @@ async fn run(options: cli::ServeOptions) -> Result<(), String> {
         budget_ledger: Some(persistent.budget),
         record_store: Some(persistent.records),
         virtual_key_authenticator: Some(virtual_key_authenticator),
+        dev_no_key_enabled,
         event_log: Some(persistent.event_log),
         ..AppState::default()
     };
@@ -199,6 +214,12 @@ async fn run(options: cli::ServeOptions) -> Result<(), String> {
         AdminSessionToken::mint()
     };
 
+    println!("idoris listening on http://{addr}");
+    if dev_no_key_enabled {
+        eprintln!(
+            "[idoris] IDORIS_DEV_NO_KEY=1: unauthenticated chat is limited to free loopback local_only execution"
+        );
+    }
     println!(
         "idoris: 已注册组件 [{}]",
         if component_list.is_empty() {

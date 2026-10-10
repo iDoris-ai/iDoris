@@ -6,6 +6,7 @@ use std::ffi::OsString;
 pub enum Command {
     Serve(ServeOptions),
     Admin(AdminCommand),
+    Key(KeyCommand),
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -44,7 +45,12 @@ pub struct AdminOptions {
     pub token_stdin: bool,
 }
 
-const USAGE: &str = "用法: idoris [serve [--admin-token-stdin]] | idoris admin <status|backends|models|roles|runtimes> --token-stdin";
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyCommand {
+    Issue,
+}
+
+const USAGE: &str = "用法: idoris [serve [--admin-token-stdin]] | idoris admin <status|backends|models|roles|runtimes> --token-stdin | idoris key issue --spec-stdin";
 
 pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Command, String> {
     let args = args.into_iter().collect::<Vec<_>>();
@@ -70,6 +76,9 @@ pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Command, S
                 AdminOptions { token_stdin: true },
             )))
         }
+        [key, issue, option] if key == "key" && issue == "issue" && option == "--spec-stdin" => {
+            Ok(Command::Key(KeyCommand::Issue))
+        }
         _ => Err(USAGE.to_string()),
     }
 }
@@ -81,7 +90,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn serve_accepts_only_the_explicit_admin_token_source_option() {
+    fn parses_serve_admin_and_exact_key_issue_forms() {
         assert_eq!(
             parse_args([]).unwrap(),
             Command::Serve(ServeOptions::default())
@@ -131,6 +140,15 @@ mod tests {
                 ))
             );
         }
+        assert_eq!(
+            parse_args([
+                OsString::from("key"),
+                OsString::from("issue"),
+                OsString::from("--spec-stdin")
+            ])
+            .unwrap(),
+            Command::Key(KeyCommand::Issue)
+        );
         assert_eq!(AdminResource::Status.path(), "status");
         assert_eq!(AdminResource::Backends.path(), "backends");
         assert_eq!(AdminResource::Models.path(), "models");
@@ -142,6 +160,12 @@ mod tests {
             vec![OsString::from("--admin-token-stdin")],
             vec![OsString::from("admin")],
             vec![OsString::from("admin"), OsString::from("status")],
+            vec![OsString::from("key"), OsString::from("issue")],
+            vec![
+                OsString::from("key"),
+                OsString::from("issue"),
+                OsString::from("--secret"),
+            ],
             vec![
                 OsString::from("admin"),
                 OsString::from("models"),
