@@ -64,6 +64,14 @@ impl ManagedRuntimeProcess {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn spawn_test(
+        executable: &std::path::Path,
+        args: Vec<std::ffi::OsString>,
+    ) -> Result<Self, BackendError> {
+        Self::spawn_command(executable, args)
+    }
+
     pub fn id(&self) -> Option<u32> {
         self.child.id()
     }

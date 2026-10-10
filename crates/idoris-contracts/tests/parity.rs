@@ -17,7 +17,7 @@ use idoris_contracts::adapter_manifest::AdapterManifest;
 use idoris_contracts::admin_v0::AdminBackendsResponse;
 use idoris_contracts::admin_v0::{
     AdminAdmissionStatus, AdminCapacityEntry, AdminCapacitySnapshot, AdminCapacityState,
-    AdminStatusResponse,
+    AdminModelsResponse, AdminRolesResponse, AdminRuntimesResponse, AdminStatusResponse,
 };
 use idoris_contracts::component_card::ComponentCard;
 use idoris_contracts::load_policy::LoadPolicy;
@@ -103,6 +103,108 @@ fn admin_v0_backends_corpus() {
     let mut extra = valid.clone();
     extra[0]["endpoint"] = json!("http://127.0.0.1:8088/v1");
     assert_parity::<AdminBackendsResponse>("admin-v0-backends.schema.json", &extra);
+}
+
+#[test]
+fn admin_v0_roles_corpus() {
+    let valid = json!([{
+        "role": "daily",
+        "aliases": ["idoris/daily"],
+        "catalog_role": true
+    }]);
+    assert_parity::<AdminRolesResponse>("admin-v0-roles.schema.json", &valid);
+    assert_parity::<AdminRolesResponse>("admin-v0-roles.schema.json", &json!([]));
+    let mut empty_aliases = valid.clone();
+    empty_aliases[0]["aliases"] = json!([]);
+    assert_parity::<AdminRolesResponse>("admin-v0-roles.schema.json", &empty_aliases);
+    let mut extra = valid.clone();
+    extra[0]["model"] = json!("Qwen3-8B");
+    assert_parity::<AdminRolesResponse>("admin-v0-roles.schema.json", &extra);
+}
+
+#[test]
+fn admin_v0_runtimes_corpus() {
+    let observed = json!({"runtimes": [{
+        "provider_id": "omlx-local",
+        "state": "observed",
+        "pressure": "soft",
+        "used_gb": 8.5,
+        "model_memory_max_gb": 32.0,
+        "loaded": ["Qwen3-8B"]
+    }]});
+    assert_parity::<AdminRuntimesResponse>("admin-v0-runtimes.schema.json", &observed);
+    assert_parity::<AdminRuntimesResponse>(
+        "admin-v0-runtimes.schema.json",
+        &json!({"runtimes": []}),
+    );
+    let error = json!({"runtimes": [{"provider_id": "omlx-local", "state": "error"}]});
+    assert_parity::<AdminRuntimesResponse>("admin-v0-runtimes.schema.json", &error);
+
+    let mut missing_pressure = observed.clone();
+    missing_pressure["runtimes"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("pressure");
+    assert_parity::<AdminRuntimesResponse>("admin-v0-runtimes.schema.json", &missing_pressure);
+    let mut negative = observed.clone();
+    negative["runtimes"][0]["used_gb"] = json!(-1);
+    assert_parity::<AdminRuntimesResponse>("admin-v0-runtimes.schema.json", &negative);
+    let mut partial_error = error.clone();
+    partial_error["runtimes"][0]["pressure"] = json!("ok");
+    assert_parity::<AdminRuntimesResponse>("admin-v0-runtimes.schema.json", &partial_error);
+    let mut extra = observed.clone();
+    extra["runtimes"][0]["endpoint"] = json!("http://127.0.0.1:8088");
+    assert_parity::<AdminRuntimesResponse>("admin-v0-runtimes.schema.json", &extra);
+}
+
+#[test]
+fn admin_v0_models_corpus() {
+    let observed = json!({
+        "sources": [{
+            "provider_id": "omlx-local",
+            "source": "http_models_endpoint",
+            "state": "observed",
+            "models": ["Qwen3-8B"]
+        }]
+    });
+    assert_parity::<AdminModelsResponse>("admin-v0-models.schema.json", &observed);
+
+    let configured = json!({
+        "sources": [{
+            "provider_id": "claude-subscription",
+            "source": "subscription_registration",
+            "state": "configured",
+            "models": ["claude-sonnet"]
+        }]
+    });
+    assert_parity::<AdminModelsResponse>("admin-v0-models.schema.json", &configured);
+
+    let error = json!({
+        "sources": [{
+            "provider_id": "omlx-local",
+            "source": "http_models_endpoint",
+            "state": "error",
+            "models": [],
+            "error": "unavailable"
+        }]
+    });
+    assert_parity::<AdminModelsResponse>("admin-v0-models.schema.json", &error);
+
+    let mut observed_with_error = observed.clone();
+    observed_with_error["sources"][0]["error"] = json!("unavailable");
+    assert_parity::<AdminModelsResponse>("admin-v0-models.schema.json", &observed_with_error);
+
+    let mut configured_empty = configured.clone();
+    configured_empty["sources"][0]["models"] = json!([]);
+    assert_parity::<AdminModelsResponse>("admin-v0-models.schema.json", &configured_empty);
+
+    let mut error_with_model = error.clone();
+    error_with_model["sources"][0]["models"] = json!(["should-not-leak"]);
+    assert_parity::<AdminModelsResponse>("admin-v0-models.schema.json", &error_with_model);
+
+    let mut wrong_source = observed.clone();
+    wrong_source["sources"][0]["source"] = json!("subscription_registration");
+    assert_parity::<AdminModelsResponse>("admin-v0-models.schema.json", &wrong_source);
 }
 
 #[test]
