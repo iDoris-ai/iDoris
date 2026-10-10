@@ -177,6 +177,18 @@ pub enum DispatchError {
     Internal(String),
 }
 
+#[derive(Debug)]
+pub(crate) enum ObservedDispatchError {
+    Dispatch(DispatchError),
+    EventLogUnavailable,
+}
+
+impl From<DispatchError> for ObservedDispatchError {
+    fn from(value: DispatchError) -> Self {
+        Self::Dispatch(value)
+    }
+}
+
 /// What [`select`] returns: everything a caller needs to route between the
 /// two request-execution paths (R2-G) *before* committing to either one.
 #[derive(Debug)]
@@ -472,84 +484,151 @@ pub async fn dispatch_local(
     messages: Vec<ChatMessage>,
     cancel: CancellationToken,
 ) -> Result<ChatOutcome, DispatchError> {
+    public_dispatch_result(
+        dispatch_local_inner(
+            LocalSelection::Cards(cards),
+            LocalExecutionContext::new(supervisor, budget_ledger, None),
+            profile,
+            input,
+            messages,
+            cancel,
+        )
+        .await,
+    )
+}
+
+/// Executes a selection the caller already computed with select().
+/// The ordinary dispatch_local path remains available for callers that do
+/// not already have a canonical Selected value.
+pub async fn dispatch_local_preselected(
+    selected: &Selected,
+    supervisor: Option<&BoundSupervisor>,
+    budget_ledger: Option<&BudgetLedger>,
+    profile: &ParsedProfile,
+    input: DispatchInput<'_>,
+    messages: Vec<ChatMessage>,
+    cancel: CancellationToken,
+) -> Result<ChatOutcome, DispatchError> {
+    public_dispatch_result(
+        dispatch_local_inner(
+            LocalSelection::Preselected(selected),
+            LocalExecutionContext::new(supervisor, budget_ledger, None),
+            profile,
+            input,
+            messages,
+            cancel,
+        )
+        .await,
+    )
+}
+
+pub(crate) async fn dispatch_local_preselected_observed(
+    selected: &Selected,
+    execution: LocalExecutionContext<'_>,
+    profile: &ParsedProfile,
+    input: DispatchInput<'_>,
+    messages: Vec<ChatMessage>,
+    cancel: CancellationToken,
+) -> Result<ChatOutcome, ObservedDispatchError> {
+    dispatch_local_inner(
+        LocalSelection::Preselected(selected),
+        execution,
+        profile,
+        input,
+        messages,
+        cancel,
+    )
+    .await
+}
+
+fn public_dispatch_result(
+    result: Result<ChatOutcome, ObservedDispatchError>,
+) -> Result<ChatOutcome, DispatchError> {
+    match result {
+        Ok(outcome) => Ok(outcome),
+        Err(ObservedDispatchError::Dispatch(error)) => Err(error),
+        Err(ObservedDispatchError::EventLogUnavailable) => Err(DispatchError::Internal(
+            "event log observer is unavailable on an unobserved dispatch path".to_string(),
+        )),
+    }
+}
+
+pub(crate) struct LocalExecutionContext<'a> {
+    supervisor: Option<&'a BoundSupervisor>,
+    budget_ledger: Option<&'a BudgetLedger>,
+    budget_event: Option<&'a crate::BudgetReservedEventContext>,
+}
+
+impl<'a> LocalExecutionContext<'a> {
+    pub(crate) fn new(
+        supervisor: Option<&'a BoundSupervisor>,
+        budget_ledger: Option<&'a BudgetLedger>,
+        budget_event: Option<&'a crate::BudgetReservedEventContext>,
+    ) -> Self {
+        Self {
+            supervisor,
+            budget_ledger,
+            budget_event,
+        }
+    }
+}
+
+enum LocalSelection<'a> {
+    Cards(&'a [ComponentCard]),
+    Preselected(&'a Selected),
+}
+
+async fn dispatch_local_inner(
+    selection: LocalSelection<'_>,
+    execution: LocalExecutionContext<'_>,
+    profile: &ParsedProfile,
+    input: DispatchInput<'_>,
+    messages: Vec<ChatMessage>,
+    cancel: CancellationToken,
+) -> Result<ChatOutcome, ObservedDispatchError> {
+    let LocalExecutionContext {
+        supervisor,
+        budget_ledger,
+        budget_event,
+    } = execution;
     let tenant_id = profile.tenant_id.as_deref();
     let prompt = input.prompt;
     let requested_model = input.requested_model;
     let affinity_key = input.affinity_key;
     let ready_provider_ids = input.ready_provider_ids;
 
-    // Scoped so `candidates`/`ctx` (which holds a `PolicyCtx<'_>` — not
-    // `Send` because `dyn BudgetView` isn't `Sync` — see its own doc) are
-    // dropped before any `.await` below; otherwise the whole function's
-    // future would stop being `Send`, which axum's `Handler` trait requires.
-    let (
-        decision,
-        served_locality,
-        provider_id,
-        backend_model_id,
-        load_policy,
-        cost,
-        estimated_cost_minor,
-    ) = {
-        let candidates: Vec<Card> = cards.iter().map(|c| candidate(c, prompt)).collect();
-        let request_profile = RequestProfile {
-            task: profile.task.clone(),
-            role: profile.role,
-            tenant_id: profile.tenant_id.clone(),
-            content_tightening: None,
-        };
-        let ctx = PolicyCtx {
-            min_ram_gb: None,
-            budget: None,
-        };
-        let decision = decide_with_affinity_and_ready(
-            &request_profile,
-            &candidates,
-            &ctx,
-            affinity_key,
-            ready_provider_ids.unwrap_or(&BTreeSet::new()),
-        )
-        .map_err(DispatchError::Rejection)?;
-
-        let Some(chosen) = candidates.iter().find(|c| c.id() == decision.chosen_id) else {
-            return Err(DispatchError::Internal(format!(
-                "decide() returned chosen_id {:?} absent from its own candidate list",
-                decision.chosen_id
-            )));
-        };
-        let served_locality = effective_served_locality(chosen);
-        // Fail closed before budget reservation or any Supervisor operation.
-        if supervisor.is_some_and(|bound| !bound.matches(&chosen.component)) {
-            return Ok(ChatOutcome {
-                decision,
-                served_locality,
-                result: Err(DispatchFailure::Backend(
-                    BackendError::supervisor_unavailable(),
-                )),
-                actual_cost_minor: None,
-            });
+    let selected_owned;
+    let selected = match selection {
+        LocalSelection::Preselected(selected) => selected,
+        LocalSelection::Cards(cards) => {
+            selected_owned = select_with_affinity_and_ready(
+                cards,
+                profile,
+                prompt,
+                affinity_key,
+                ready_provider_ids.unwrap_or(&BTreeSet::new()),
+            )?;
+            &selected_owned
         }
-        let load_policy = chosen
-            .component
-            .load_policy
-            .unwrap_or_else(default_load_policy);
-        // decide()'s pricing stage already excluded any None/negative
-        // estimate, so this is always Some(v >= 0); unwrap_or(0) is
-        // defense in depth, not a path expected to actually trigger.
-        let estimated_cost_minor = chosen.estimated_cost_minor.unwrap_or(0);
-        let provider_id = chosen.id().to_string();
-        let backend_model_id = backend_model_id(profile, requested_model, &provider_id);
-        (
+    };
+    let decision = selected.decision.clone();
+    let served_locality = selected.served_locality;
+    // Fail closed before budget reservation or any Supervisor operation.
+    if supervisor.is_some_and(|bound| !bound.matches(&selected.card)) {
+        return Ok(ChatOutcome {
             decision,
             served_locality,
-            provider_id,
-            backend_model_id,
-            load_policy,
-            chosen.component.provider.cost,
-            estimated_cost_minor,
-        )
-    };
-
+            result: Err(DispatchFailure::Backend(
+                BackendError::supervisor_unavailable(),
+            )),
+            actual_cost_minor: None,
+        });
+    }
+    let load_policy = selected.load_policy;
+    let estimated_cost_minor = selected.estimated_cost_minor;
+    let provider_id = selected.card.provider.id.clone();
+    let backend_model_id = backend_model_id(profile, requested_model, &provider_id);
+    let cost = selected.card.provider.cost;
     let is_paid = budget::is_paid(Some(estimated_cost_minor));
     let mut reservation_guard = match ReservationGuard::reserve(
         budget_ledger,
@@ -567,6 +646,14 @@ pub async fn dispatch_local(
             });
         }
     };
+    if is_paid
+        && let Some(context) = budget_event
+        && crate::append_budget_reserved(context, selected)
+            .await
+            .is_err()
+    {
+        return Err(ObservedDispatchError::EventLogUnavailable);
+    }
     // From here on, `reservation_guard`'s Drop releases the reservation on
     // any early return *and* on this future being dropped mid-`.await`
     // (client disconnect) — see its doc. Only the success path below
@@ -929,6 +1016,33 @@ routing_policy:
             Some(idoris_contracts::common::Capability::Coding)
         );
         assert_eq!(filtered.route.load, Some(LoadMode::EvictToLoad));
+    }
+
+    #[tokio::test]
+    async fn preselected_dispatch_does_not_decide_again() {
+        let card = local_card("a");
+        let profile = empty_profile();
+        let selected = select(std::slice::from_ref(&card), &profile, "").unwrap();
+        let outcome = dispatch_local_preselected(
+            &selected,
+            None,
+            None,
+            &profile,
+            DispatchInput::new(""),
+            Vec::new(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome.decision, selected.decision);
+        assert_eq!(outcome.served_locality, selected.served_locality);
+        match outcome.result.unwrap_err() {
+            DispatchFailure::Backend(err) => {
+                assert_eq!(err.reason_code(), "supervisor_unavailable")
+            }
+            other => panic!("expected Backend(supervisor_unavailable), got {other:?}"),
+        }
     }
 
     #[tokio::test]
