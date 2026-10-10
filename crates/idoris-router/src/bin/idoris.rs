@@ -27,7 +27,7 @@ use idoris_router::{
     connection::{ConnectionInfo, ConnectionListener},
     host_facts, parse_port, profile, routing_policy,
     runtime::RuntimeRegistry,
-    storage,
+    runtime_launch_config, storage,
     subscription::{
         config::SubscriptionConfig,
         runtime::{SubscriptionRuntimeHandle, SubscriptionRuntimeRegistry, authorize_subscription},
@@ -221,7 +221,9 @@ async fn run(options: cli::ServeOptions) -> Result<(), String> {
             )
         })?;
 
-    let runtimes = RuntimeRegistry::spawn(&cards)?;
+    let local_runtime_path = config::optional_env_path("IDORIS_LOCAL_RUNTIME_CONFIG")?;
+    let local_runtime_configs = runtime_launch_config::load(local_runtime_path.as_deref())?;
+    let runtimes = RuntimeRegistry::spawn_with_local_configs(&cards, &local_runtime_configs)?;
     // Preserve startup-gate precedence: component/policy/runtime validation
     // (including subscription authorization and fixed card gates) must fail
     // before tenant storage/config bootstrap can surface a later error.
