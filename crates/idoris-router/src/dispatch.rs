@@ -274,6 +274,7 @@ pub(crate) struct ReservationGuard<'a> {
     ledger: Option<&'a BudgetLedger>,
     tenant_id: Option<&'a str>,
     id: Option<ReservationId>,
+    release_on_drop: bool,
 }
 
 impl<'a> ReservationGuard<'a> {
@@ -299,6 +300,7 @@ impl<'a> ReservationGuard<'a> {
             ledger,
             tenant_id,
             id,
+            release_on_drop: true,
         })
     }
 
@@ -306,11 +308,50 @@ impl<'a> ReservationGuard<'a> {
     fn take(&mut self) -> Option<ReservationId> {
         self.id.take()
     }
+
+    /// Settles a completed request using the ledger's replay-safe path.
+    /// `None` means this guard never held a real reservation.
+    pub(crate) fn settle_replayable(
+        &mut self,
+        actual_cost_minor: i64,
+    ) -> Result<Option<i64>, BudgetError> {
+        match (self.ledger, self.take()) {
+            (Some(ledger), Some(id)) => {
+                budget::settle_replayable(ledger, self.tenant_id, &id, actual_cost_minor).map(Some)
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Disarms Drop without releasing the reservation. Use only when an
+    /// upstream call completed but its actual cost cannot be established;
+    /// retaining the reservation until its TTL expires is safer than
+    /// silently declaring the paid call free.
+    pub(crate) fn retain_until_expiry(&mut self) {
+        let _ = self.take();
+    }
+
+    /// Once a paid POST may have crossed the process boundary, dropping the
+    /// caller future must not turn an uncertain execution into a free call.
+    pub(crate) fn retain_on_drop(&mut self) {
+        self.release_on_drop = false;
+    }
+
+    /// Releases only when upstream execution is proven not to have happened
+    /// (or this caller only observed a replay).
+    pub(crate) fn release_now(&mut self) -> Result<(), BudgetError> {
+        match (self.ledger, self.take()) {
+            (Some(ledger), Some(id)) => budget::release(ledger, self.tenant_id, &id),
+            _ => Ok(()),
+        }
+    }
 }
 
 impl Drop for ReservationGuard<'_> {
     fn drop(&mut self) {
-        if let (Some(ledger), Some(id)) = (self.ledger, self.id.take()) {
+        if self.release_on_drop
+            && let (Some(ledger), Some(id)) = (self.ledger, self.id.take())
+        {
             let _ = budget::release(ledger, self.tenant_id, &id);
         }
     }

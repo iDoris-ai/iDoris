@@ -211,11 +211,15 @@ async fn budget_event_append_failure_releases_reservation_before_backend_executi
 }
 
 #[tokio::test]
-async fn paid_proxy_transient_reservation_is_released_without_budget_event() {
+async fn paid_proxy_records_budget_reservation_before_dispatch() {
     let upstream = MockServer::start().await;
     Mock::given(method("POST"))
-        .respond_with(ResponseTemplate::new(200))
-        .expect(0)
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "chatcmpl-budget-event",
+            "choices": [{"message": {"role": "assistant", "content": "ok"}}],
+            "usage": {"prompt_tokens": 7, "completion_tokens": 11, "total_tokens": 18}
+        })))
+        .expect(1)
         .mount(&upstream)
         .await;
     let event_log = memory_event_log();
@@ -239,14 +243,25 @@ async fn paid_proxy_transient_reservation_is_released_without_budget_event() {
     .await
     .unwrap();
 
-    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(response.status(), StatusCode::OK);
+    let events = events_for_response(&event_log, &response);
     assert_eq!(
-        budget_event_count(&events_for_response(&event_log, &response)),
-        0
+        events
+            .iter()
+            .map(|event| event.event.event_type)
+            .collect::<Vec<_>>(),
+        vec![
+            EventType::RequestReceived,
+            EventType::Profiled,
+            EventType::Decided,
+            EventType::BudgetReserved,
+            EventType::Dispatched,
+        ]
     );
+    assert_eq!(budget_event_count(&events), 1);
     let after = ledger.tenant_readview(budget::PERSONAL_TENANT_ID).unwrap();
-    assert_eq!(after.spent_minor, before.spent_minor);
+    assert!(after.spent_minor > before.spent_minor);
     assert_eq!(after.reserved_minor, before.reserved_minor);
-    assert_eq!(after.available_minor, before.available_minor);
+    assert!(after.available_minor < before.available_minor);
     upstream.verify().await;
 }

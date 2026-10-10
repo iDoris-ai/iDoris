@@ -39,6 +39,22 @@ pub fn resolve_env(name: &str, default_relative: &str) -> Result<PathBuf, String
     resolve_path(None, default_relative, &executable)
 }
 
+/// Read an optional Unicode path without inventing a bundled default.
+pub fn optional_env_path(name: &str) -> Result<Option<PathBuf>, String> {
+    std::env::var_os(name)
+        .map(|value| {
+            value
+                .into_string()
+                .map_err(|_| format!("环境变量 {name} 不是有效的 Unicode 路径"))
+                .map(|value| {
+                    let value = value.trim();
+                    (!value.is_empty()).then(|| PathBuf::from(value))
+                })
+        })
+        .transpose()
+        .map(Option::flatten)
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]

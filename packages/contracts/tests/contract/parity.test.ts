@@ -1,5 +1,10 @@
 import Ajv2020 from "ajv/dist/2020.js";
 import { describe, expect, it } from "vitest";
+import adminV0BackendsJson from "../../schema/admin-v0-backends.schema.json";
+import adminV0ModelsJson from "../../schema/admin-v0-models.schema.json";
+import adminV0RolesJson from "../../schema/admin-v0-roles.schema.json";
+import adminV0RuntimesJson from "../../schema/admin-v0-runtimes.schema.json";
+import adminV0StatusJson from "../../schema/admin-v0-status.schema.json";
 import adapterManifestJson from "../../schema/adapter-manifest.schema.json";
 import componentCardJson from "../../schema/component-card.schema.json";
 import loadPolicyJson from "../../schema/load-policy.schema.json";
@@ -8,6 +13,11 @@ import roleJson from "../../schema/role.schema.json";
 import routingPolicyJson from "../../schema/routing-policy.schema.json";
 import taskProfileJson from "../../schema/task-profile.schema.json";
 import trainingSampleJson from "../../schema/training-sample.schema.json";
+import { adminV0BackendsResponseSchema } from "../../src/generated/admin-v0-backends.js";
+import { adminV0ModelsResponseSchema } from "../../src/generated/admin-v0-models.js";
+import { adminV0RolesResponseSchema } from "../../src/generated/admin-v0-roles.js";
+import { adminV0RuntimesResponseSchema } from "../../src/generated/admin-v0-runtimes.js";
+import { adminV0StatusResponseSchema } from "../../src/generated/admin-v0-status.js";
 import { adapterManifestSchema } from "../../src/adapter-manifest.js";
 import { componentCardSchema } from "../../src/component-card.js";
 import { loadPolicySchema } from "../../src/load-policy.js";
@@ -19,6 +29,11 @@ import { trainingSampleSchema } from "../../src/training-sample.js";
 
 const ajv = new Ajv2020({ allErrors: true, strict: false });
 const jsonByName = {
+  "admin-v0-backends": adminV0BackendsJson,
+  "admin-v0-models": adminV0ModelsJson,
+  "admin-v0-roles": adminV0RolesJson,
+  "admin-v0-runtimes": adminV0RuntimesJson,
+  "admin-v0-status": adminV0StatusJson,
   "adapter-manifest": adapterManifestJson,
   provider: providerJson, "load-policy": loadPolicyJson, "component-card": componentCardJson,
   "routing-policy": routingPolicyJson, "task-profile": taskProfileJson, "training-sample": trainingSampleJson,
@@ -28,6 +43,11 @@ type Name = keyof typeof jsonByName;
 for (const schema of Object.values(jsonByName)) ajv.addSchema(schema as object);
 const ajvOk = (n: Name, data: unknown) => ajv.validate(`https://idoris.ai/schema/${n}.schema.json`, data);
 const zodByName: Record<Name, { safeParse: (d: unknown) => { success: boolean } }> = {
+  "admin-v0-backends": adminV0BackendsResponseSchema,
+  "admin-v0-models": adminV0ModelsResponseSchema,
+  "admin-v0-roles": adminV0RolesResponseSchema,
+  "admin-v0-runtimes": adminV0RuntimesResponseSchema,
+  "admin-v0-status": adminV0StatusResponseSchema,
   "adapter-manifest": adapterManifestSchema,
   provider: providerDescriptorSchema, "load-policy": loadPolicySchema, "component-card": componentCardSchema,
   "routing-policy": routingPolicySchema, "task-profile": taskProfileSchema,
@@ -60,6 +80,39 @@ const validSample = {
 };
 
 const corpus: Array<[Name, unknown]> = [
+  ["admin-v0-backends", [{ provider_id: "omlx-local", locality: "loopback", form: "http_service", lifecycle_runtime_bound: true }]],
+  ["admin-v0-backends", []],
+  ["admin-v0-backends", [{ provider_id: "", locality: "loopback", form: "http_service", lifecycle_runtime_bound: false }]],
+  ["admin-v0-backends", [{ provider_id: "omlx-local", locality: "loopback", form: "http_service", lifecycle_runtime_bound: true, endpoint: "http://127.0.0.1:8088/v1" }]],
+  ["admin-v0-models", { sources: [{ provider_id: "omlx-local", source: "http_models_endpoint", state: "observed", models: ["Qwen3-8B"] }] }],
+  ["admin-v0-models", { sources: [{ provider_id: "claude-subscription", source: "subscription_registration", state: "configured", models: ["claude-sonnet"] }] }],
+  ["admin-v0-models", { sources: [{ provider_id: "omlx-local", source: "http_models_endpoint", state: "error", models: [], error: "unavailable" }] }],
+  ["admin-v0-models", { sources: [{ provider_id: "omlx-local", source: "http_models_endpoint", state: "observed", models: ["Qwen3-8B"], error: "unavailable" }] }],
+  ["admin-v0-models", { sources: [{ provider_id: "claude-subscription", source: "subscription_registration", state: "configured", models: [] }] }],
+  ["admin-v0-models", { sources: [{ provider_id: "omlx-local", source: "http_models_endpoint", state: "error", models: ["should-not-leak"], error: "authentication_failed" }] }],
+  ["admin-v0-models", { sources: [{ provider_id: "omlx-local", source: "subscription_registration", state: "observed", models: ["Qwen3-8B"] }] }],
+  ["admin-v0-roles", [{ role: "daily", aliases: ["idoris/daily"], catalog_role: true }]],
+  ["admin-v0-roles", []],
+  ["admin-v0-roles", [{ role: "daily", aliases: [], catalog_role: true }]],
+  ["admin-v0-roles", [{ role: "daily", aliases: ["idoris/daily"], catalog_role: true, model: "Qwen3-8B" }]],
+  ["admin-v0-runtimes", { runtimes: [{ provider_id: "omlx-local", state: "observed", pressure: "soft", used_gb: 8.5, model_memory_max_gb: 32, loaded: ["Qwen3-8B"] }] }],
+  ["admin-v0-runtimes", { runtimes: [] }],
+  ["admin-v0-runtimes", { runtimes: [{ provider_id: "omlx-local", state: "error" }] }],
+  ["admin-v0-runtimes", { runtimes: [{ provider_id: "omlx-local", state: "observed", used_gb: 8.5, model_memory_max_gb: 32, loaded: ["Qwen3-8B"] }] }],
+  ["admin-v0-runtimes", { runtimes: [{ provider_id: "omlx-local", state: "observed", pressure: "soft", used_gb: -1, model_memory_max_gb: 32, loaded: ["Qwen3-8B"] }] }],
+  ["admin-v0-runtimes", { runtimes: [{ provider_id: "omlx-local", state: "error", pressure: "ok" }] }],
+  ["admin-v0-runtimes", { runtimes: [{ provider_id: "omlx-local", state: "observed", pressure: "soft", used_gb: 8.5, model_memory_max_gb: 32, loaded: ["Qwen3-8B"], endpoint: "http://127.0.0.1:8088" }] }],
+  ["admin-v0-status", {
+    status: "ok", service: "idoris", version: "0.2.0", contract_version: "1.0.1",
+    instance_id: "instance-1", components: 2, runtimes: 1, subscriptions: 0,
+    budget_configured: true, audit_configured: true,
+    capacity: { state: "observed", entries: [{ id: "model-a", capability: "reasoning", resident: true, estimated_memory_gb: 12.5, ctx_limit: 131072, queue_depth: 1, admission_status: "ready" }] },
+  }],
+  ["admin-v0-status", {
+    status: "ok", service: "idoris", version: "0.2.0", contract_version: "1.0.1",
+    instance_id: "instance-1", components: 0, runtimes: 0, subscriptions: 0,
+    budget_configured: false, audit_configured: false, capacity: { state: "error" },
+  }],
   ["training-sample", validSample],
   ["training-sample", { ...validSample, data_class: "nope" }],
   ["training-sample", { ...validSample, messages: [{ role: "user", content: "hi" }] }],
