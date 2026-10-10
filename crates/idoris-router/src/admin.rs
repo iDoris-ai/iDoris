@@ -13,9 +13,9 @@ use axum::{
     },
     middleware::{self, Next},
     response::{Html, IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 use uuid::Uuid;
 
@@ -177,6 +177,8 @@ pub fn build_admin_app(state: AppState, token: AdminSessionToken) -> Router {
         .route("/status", get(admin_status))
         .route("/backends", get(admin_backends))
         .route("/models", get(admin_models))
+        .route("/models/load", post(admin_model_load))
+        .route("/models/unload", post(admin_model_unload))
         .route("/roles", get(admin_roles))
         .route("/runtimes", get(admin_runtimes))
         .fallback(StatusCode::NOT_FOUND)
@@ -321,6 +323,75 @@ async fn admin_backends(State(state): State<AdminHttpState>) -> Json<AdminBacken
 
 async fn admin_models(State(state): State<AdminHttpState>) -> Json<AdminModelsResponse> {
     Json(models(&state.app).await)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ModelOperationInput {
+    provider_id: String,
+    model_id: String,
+}
+
+#[derive(Serialize)]
+struct ModelOperationResult<'a> {
+    provider_id: &'a str,
+    model_id: &'a str,
+    operation: &'static str,
+    status: &'static str,
+}
+
+async fn admin_model_load(
+    State(state): State<AdminHttpState>,
+    Json(input): Json<ModelOperationInput>,
+) -> Response {
+    model_operation(&state.app, input, true).await
+}
+
+async fn admin_model_unload(
+    State(state): State<AdminHttpState>,
+    Json(input): Json<ModelOperationInput>,
+) -> Response {
+    model_operation(&state.app, input, false).await
+}
+
+async fn model_operation(state: &AppState, input: ModelOperationInput, load: bool) -> Response {
+    let Some(card) = state
+        .cards
+        .iter()
+        .find(|card| card.provider.id == input.provider_id)
+    else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error":{"type":"unknown_model_identity"}})),
+        )
+            .into_response();
+    };
+    let Some(runtime) = state.runtimes.get(&input.provider_id) else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error":{"type":"runtime_unavailable"}})),
+        )
+            .into_response();
+    };
+    if let Err(error) = runtime
+        .admin_model_operation(card, &input.model_id, load)
+        .await
+    {
+        let (status, kind) = match error {
+            idoris_backend::BackendError::ModelNotFound { .. } => {
+                (StatusCode::NOT_FOUND, "unknown_model_identity")
+            }
+            _ => (StatusCode::SERVICE_UNAVAILABLE, "model_operation_failed"),
+        };
+        return (status, Json(serde_json::json!({"error":{"type":kind}}))).into_response();
+    }
+    Json(ModelOperationResult {
+        provider_id: &input.provider_id,
+        model_id: &input.model_id,
+        operation: if load { "load" } else { "unload" },
+        status: "ok",
+    })
+    .into_response()
 }
 
 async fn admin_roles() -> Json<AdminRolesResponse> {
@@ -757,6 +828,8 @@ mod tests {
             "/admin/api/v1/status",
             "/admin/api/v1/backends",
             "/admin/api/v1/models",
+            "/admin/api/v1/models/load",
+            "/admin/api/v1/models/unload",
             "/admin/api/v1/roles",
             "/admin/api/v1/runtimes",
             "/admin/api/v1/capacity",
@@ -1184,6 +1257,94 @@ mod tests {
         assert!(value.get("models").is_none());
         assert!(value.get("memory_pressure").is_none());
         assert!(value.get("endpoint").is_none());
+    }
+
+    #[tokio::test]
+    async fn model_operations_require_admin_token_and_exact_provider_model() {
+        use idoris_backend::{MockAdapter, ModelInfo, Supervisor, SupervisorConfig};
+        let mut card: idoris_contracts::ComponentCard =
+            serde_yaml::from_str(include_str!("../../../config/components/omlx.yaml")).unwrap();
+        card.provider.id = "managed".into();
+        let adapter = Arc::new(MockAdapter::new(vec![ModelInfo {
+            id: "known".into(),
+            memory_gb: 2.0,
+        }]));
+        let handle = Supervisor::spawn(adapter, SupervisorConfig::default()).unwrap();
+        let token = AdminSessionToken::mint();
+        let secret = token.expose_secret().to_owned();
+        let app = build_admin_app(
+            AppState {
+                runtimes: crate::runtime::RuntimeRegistry::from(
+                    crate::dispatch::BoundSupervisor::new(&card, handle),
+                ),
+                cards: vec![card],
+                ..AppState::default()
+            },
+            token,
+        );
+        let request = |path: &str, provider: &str, model: &str, authenticated: bool| {
+            let mut builder = Request::builder()
+                .method("POST")
+                .uri(path)
+                .header("content-type", "application/json");
+            if authenticated {
+                builder = builder.header(AUTHORIZATION, format!("Bearer {secret}"));
+            }
+            builder
+                .body(Body::from(
+                    serde_json::json!({"provider_id":provider,"model_id":model}).to_string(),
+                ))
+                .unwrap()
+        };
+        let load = "/admin/api/v1/models/load";
+        let unload = "/admin/api/v1/models/unload";
+        assert_eq!(
+            app.clone()
+                .oneshot(request(load, "managed", "known", false))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(request(load, "wrong", "known", true))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(request(load, "managed", "missing", true))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(request(load, "managed", "known", true))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(request(unload, "managed", "known", true))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        for path in [load, unload] {
+            let response = crate::build_app(AppState::default())
+                .oneshot(request(path, "managed", "known", true))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        }
     }
 
     #[tokio::test]
