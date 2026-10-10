@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 
 use idoris_contracts::DeployMode;
 use idoris_tenancy::budget::{BudgetLedger, SpendGate};
+use idoris_tenancy::event_log::EventLogStore;
 use idoris_tenancy::store::TenantStore;
 use idoris_tenancy::virtual_key::store::VirtualKeyStore;
 use serde::Deserialize;
@@ -52,6 +53,7 @@ pub struct StorageBootstrap {
     pub budget: Arc<BudgetLedger>,
     /// Persistent verifier storage only; request authentication is wired separately.
     pub virtual_keys: Arc<Mutex<VirtualKeyStore>>,
+    pub event_log: Arc<EventLogStore>,
 }
 
 pub fn bootstrap_process(deploy_mode: DeployMode) -> Result<StorageBootstrap, String> {
@@ -90,6 +92,8 @@ pub fn bootstrap(
     // Open the verifier schema during startup so a broken key store fails closed.
     let virtual_keys = VirtualKeyStore::open(db_path)
         .map_err(|err| format!("无法打开虚拟 key 数据库 \"{}\"：{err}", db_path.display()))?;
+    let event_log = EventLogStore::open(db_path)
+        .map_err(|err| format!("无法打开事件日志数据库 \"{}\"：{err}", db_path.display()))?;
 
     let mut seen = BTreeSet::new();
     for config in configs {
@@ -125,6 +129,7 @@ pub fn bootstrap(
         records: Arc::new(Mutex::new(records)),
         budget: Arc::new(budget),
         virtual_keys: Arc::new(Mutex::new(virtual_keys)),
+        event_log: Arc::new(event_log),
     })
 }
 
@@ -214,12 +219,15 @@ mod tests {
 
     use super::*;
     use idoris_contracts::common::PrivacyClass;
+    use std::collections::BTreeMap;
     use idoris_tenancy::budget::{BudgetError, BudgetScope, Price};
+    use idoris_tenancy::event_log::{EventType, NewEvent};
     use idoris_tenancy::store::{RecordKind, TenantRecord};
     use idoris_tenancy::virtual_key::MintedVirtualKey;
     use idoris_tenancy::virtual_key::store::VirtualKeyScope;
     use rusqlite::Connection;
     use serde_json::Map;
+    use uuid::Uuid;
 
     fn virtual_key_scope() -> VirtualKeyScope {
         VirtualKeyScope {
@@ -237,6 +245,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let db = dir.path().join("state.sqlite3");
         let key = MintedVirtualKey::mint();
+        let event_id = Uuid::new_v4().to_string();
         {
             let storage = bootstrap(&db, None, DeployMode::Personal).unwrap();
             let view = storage.budget.tenant_readview(PERSONAL_TENANT_ID).unwrap();
@@ -246,6 +255,25 @@ mod tests {
                 .lock()
                 .unwrap()
                 .insert_active(&key.key_id, key.hash, &virtual_key_scope())
+                .unwrap();
+            storage
+                .event_log
+                .append(
+                    Some(PERSONAL_TENANT_ID),
+                    &NewEvent {
+                        event_id: event_id.clone(),
+                        tenant_id: PERSONAL_TENANT_ID.into(),
+                        record_id: "event-record".into(),
+                        event_type: EventType::RequestReceived,
+                        ts_utc_ms: 1,
+                        request_id: None,
+                        session_id: None,
+                        trace_id: None,
+                        parent_id: None,
+                        origin_record_id: None,
+                        metadata: BTreeMap::new(),
+                    },
+                )
                 .unwrap();
             storage
                 .records
@@ -289,6 +317,12 @@ mod tests {
                 .key_id,
             key.key_id
         );
+        let events = reopened
+            .event_log
+            .events_for_record(Some(PERSONAL_TENANT_ID), "event-record")
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event.event_id, event_id);
     }
 
     #[test]
@@ -302,6 +336,28 @@ mod tests {
 
         let err = bootstrap(&db, None, DeployMode::Personal).err().unwrap();
         assert!(err.contains("无法打开虚拟 key 数据库"), "{err}");
+    }
+
+    #[test]
+    fn broken_event_log_schema_fails_storage_bootstrap() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = dir.path().join("broken-event-log.sqlite3");
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE event_log_schema_migrations(version INTEGER PRIMARY KEY); \
+             INSERT INTO event_log_schema_migrations VALUES(1); \
+             CREATE TABLE event_log_events(sequence INTEGER PRIMARY KEY AUTOINCREMENT);",
+        )
+        .unwrap();
+        drop(conn);
+
+        let err = bootstrap(&db, None, DeployMode::Personal).err().unwrap();
+        assert!(err.contains("无法打开事件日志数据库"), "{err}");
+        let ledger = BudgetLedger::open(&db).unwrap();
+        assert!(matches!(
+            ledger.tenant_readview(PERSONAL_TENANT_ID),
+            Err(BudgetError::TenantNotConfigured { .. })
+        ));
     }
 
     #[test]
