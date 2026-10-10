@@ -15,7 +15,7 @@ use idoris_contracts::load_policy::{Admission, Keepalive, LoadMode, LoadPolicy};
 use idoris_contracts::provider::Locality;
 use idoris_policy::{
     AdmissionStatus, Card, Decision, PolicyCtx, ROLES, ReasonCode, Rejection, RequestProfile,
-    decide, effective_served_locality,
+    decide_with_affinity, effective_served_locality,
 };
 use idoris_tenancy::budget::{BudgetError, BudgetLedger, ReservationId};
 use tokio_util::sync::CancellationToken;
@@ -215,6 +215,15 @@ pub fn select(
     profile: &ParsedProfile,
     prompt: &str,
 ) -> Result<Selected, DispatchError> {
+    select_with_affinity(cards, profile, prompt, None)
+}
+
+pub fn select_with_affinity(
+    cards: &[ComponentCard],
+    profile: &ParsedProfile,
+    prompt: &str,
+    affinity_key: Option<&str>,
+) -> Result<Selected, DispatchError> {
     let candidates: Vec<Card> = cards.iter().map(|c| candidate(c, prompt)).collect();
     let request_profile = RequestProfile {
         task: profile.task.clone(),
@@ -226,7 +235,8 @@ pub fn select(
         min_ram_gb: None,
         budget: None,
     };
-    let decision = decide(&request_profile, &candidates, &ctx).map_err(DispatchError::Rejection)?;
+    let decision = decide_with_affinity(&request_profile, &candidates, &ctx, affinity_key)
+        .map_err(DispatchError::Rejection)?;
     let Some(chosen) = candidates.iter().find(|c| c.id() == decision.chosen_id) else {
         return Err(DispatchError::Internal(format!(
             "decide() returned chosen_id {:?} absent from its own candidate list",
@@ -376,6 +386,7 @@ impl Drop for CancelOnDrop {
 pub struct DispatchInput<'a> {
     pub requested_model: Option<&'a str>,
     pub prompt: &'a str,
+    pub affinity_key: Option<&'a str>,
 }
 
 impl<'a> DispatchInput<'a> {
@@ -383,6 +394,7 @@ impl<'a> DispatchInput<'a> {
         Self {
             requested_model: None,
             prompt,
+            affinity_key: None,
         }
     }
 
@@ -390,7 +402,13 @@ impl<'a> DispatchInput<'a> {
         Self {
             requested_model,
             prompt,
+            affinity_key: None,
         }
+    }
+
+    pub fn with_affinity(mut self, affinity_key: Option<&'a str>) -> Self {
+        self.affinity_key = affinity_key;
+        self
     }
 }
 
@@ -535,12 +553,11 @@ async fn dispatch_local_inner(
     let tenant_id = profile.tenant_id.as_deref();
     let prompt = input.prompt;
     let requested_model = input.requested_model;
-
     let selected_owned;
     let selected = match selection {
         LocalSelection::Preselected(selected) => selected,
         LocalSelection::Cards(cards) => {
-            selected_owned = select(cards, profile, prompt)?;
+            selected_owned = select_with_affinity(cards, profile, prompt, input.affinity_key)?;
             &selected_owned
         }
     };
