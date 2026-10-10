@@ -21,6 +21,7 @@ pub use budget::{BudgetSnapshot, BudgetView};
 pub use card::{AdmissionStatus, Card};
 pub use pipeline::{
     Decision, Degradation, PolicyCtx, ReasonCode, Rejection, RequestProfile, Stage, decide,
+    decide_with_affinity,
 };
 pub use privacy::{
     SUBSCRIPTION_PROVIDER_ID, effective_privacy, effective_served_locality,

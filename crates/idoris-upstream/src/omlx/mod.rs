@@ -185,10 +185,10 @@ impl OmlxAdapter {
         format!("{prefix}{}{suffix}", utf8_percent_encode(id, PATH_SEGMENT))
     }
 
-    /// `GET /v1/models` — every model this instance could route to,
-    /// whether or not currently loaded (see `status::parse_list`'s doc).
+    /// `GET /v1/models/status` — every model this instance could route to,
+    /// with oMLX's own pre-load memory estimate (see `status::parse_list`).
     pub async fn list(&self) -> Result<Vec<ModelInfo>, BackendError> {
-        Ok(status::parse_list(&self.get("/v1/models").await?))
+        status::parse_list(&self.get("/v1/models/status").await?)
     }
 
     /// Memory/loaded models from `/api/status`; pressure prefers admin
@@ -537,12 +537,15 @@ mod tests {
     // end to end, including the API key.
 
     #[tokio::test]
-    async fn list_returns_models_with_string_ids() {
+    async fn list_returns_truthful_preload_footprints() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
-            .and(path("/v1/models"))
+            .and(path("/v1/models/status"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "data": [{"id": "qwen3-8b"}, {"id": "qwen3-4b"}]
+                "models": [
+                    {"id": "qwen3-8b", "estimated_size": 6_u64 * 1024 * 1024 * 1024},
+                    {"id": "MarkItDown", "estimated_size": 0}
+                ]
             })))
             .mount(&server)
             .await;
@@ -550,6 +553,8 @@ mod tests {
         let models = adapter.list().await.expect("list must succeed");
         assert_eq!(models.len(), 2);
         assert_eq!(models[0].id, "qwen3-8b");
+        assert_eq!(models[0].memory_gb, 6.0);
+        assert_eq!(models[1].memory_gb, 0.0);
     }
 
     #[tokio::test]
@@ -1244,9 +1249,9 @@ mod tests {
             &server,
             vec![(
                 "GET",
-                "/v1/models",
+                "/v1/models/status",
                 ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                    "data": [{"id": "qwen3-8b"}]
+                    "models": [{"id": "qwen3-8b", "estimated_size": 1024_u64 * 1024 * 1024}]
                 })),
             )],
         )
