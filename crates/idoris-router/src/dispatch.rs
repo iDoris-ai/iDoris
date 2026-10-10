@@ -68,6 +68,41 @@ impl BoundSupervisor {
         self.handle.is_ready(model_id).await
     }
 
+    /// Admin operations use the same pinned memory facts and Supervisor admission as dispatch.
+    pub(crate) async fn admin_model_operation(
+        &self,
+        card: &ComponentCard,
+        model_id: &str,
+        load: bool,
+    ) -> Result<(), BackendError> {
+        if !self.matches(card) || model_id.is_empty() {
+            return Err(BackendError::model_not_found(model_id));
+        }
+        let override_memory = self
+            .admission_model
+            .as_ref()
+            .filter(|(id, _)| id == model_id)
+            .map(|(_, gb)| *gb);
+        let catalog = self.handle.list().await?;
+        let model = catalog.iter().find(|model| model.id == model_id);
+        if model.is_none() && override_memory.is_none() {
+            return Err(BackendError::model_not_found(model_id));
+        }
+        if !load {
+            return self.handle.unload(model_id.to_owned()).await;
+        }
+        let memory_gb = override_memory.or_else(|| model.map(|entry| entry.memory_gb));
+        let Some(memory_gb) = memory_gb.filter(|gb| gb.is_finite() && *gb > 0.0) else {
+            return Err(BackendError::Upstream {
+                message: "invalid catalog memory".into(),
+            });
+        };
+        let policy = card.load_policy.unwrap_or_else(default_load_policy);
+        self.handle
+            .load(model_id.to_owned(), memory_gb, policy)
+            .await
+    }
+
     /// Constructs the adapter from the same card used for the binding.
     pub fn spawn_omlx(card: &ComponentCard) -> Result<Self, String> {
         let adapter = idoris_upstream::OmlxAdapter::new(idoris_upstream::OmlxAdapterConfig {
