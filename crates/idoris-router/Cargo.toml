@@ -56,6 +56,7 @@ reqwest = { version = "0.13", default-features = false, features = ["json", "rus
 # direct `idoris-router` edge onto an already-vendored crate.
 indexmap = "2"
 ring = "0.17"
+subtle = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 nix = { workspace = true, features = ["poll"] }
