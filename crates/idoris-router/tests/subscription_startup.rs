@@ -138,6 +138,16 @@ fn run_production_startup(
         .local_addr()
         .unwrap()
         .port();
+    let admin_port = loop {
+        let candidate = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        if candidate != port {
+            break candidate;
+        }
+    };
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let existing_path = std::env::var_os("PATH").unwrap_or_default();
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_idoris"));
@@ -156,6 +166,7 @@ fn run_production_startup(
         .env("IDORIS_CATALOG", root.join("config/catalog.yaml"))
         .env("IDORIS_DB_PATH", state.path().join("state.sqlite3"))
         .env("IDORIS_PORT", port.to_string())
+        .env("IDORIS_ADMIN_PORT", admin_port.to_string())
         .env(
             "PATH",
             format!("{}:{}", fake_bin.display(), existing_path.to_string_lossy()),

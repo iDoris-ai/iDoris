@@ -2,7 +2,12 @@ import { request, type OutgoingHttpHeaders } from "node:http";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { startFakeUpstream, type FakeUpstream } from "../src/fake-upstream.js";
 import { localComponent, makeComponentsDir } from "../src/fixtures.js";
-import { routingPolicyFixturePath, spawnConformanceServer, type RunningServer } from "../src/harness.js";
+import {
+  conformanceAuthorizationHeader,
+  routingPolicyFixturePath,
+  spawnConformanceServer,
+  type RunningServer,
+} from "../src/harness.js";
 
 const isRust = process.env.IDORIS_CONFORMANCE_IMPLEMENTATION === "rust";
 
@@ -36,13 +41,18 @@ function rawRequest(
 ): Promise<RawResponse> {
   return new Promise((resolve, reject) => {
     const target = new URL(server.baseUrl);
+    const requestHeaders: OutgoingHttpHeaders = { ...headers };
+    const authorization = conformanceAuthorizationHeader(server.baseUrl);
+    if (path === "/v1/chat/completions" && authorization !== undefined && requestHeaders.authorization === undefined) {
+      requestHeaders.authorization = authorization;
+    }
     const req = request(
       {
         hostname: target.hostname,
         port: Number(target.port),
         method,
         path,
-        headers,
+        headers: requestHeaders,
       },
       (res) => {
         let data = "";
