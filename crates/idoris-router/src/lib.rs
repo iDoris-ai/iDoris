@@ -1635,6 +1635,58 @@ pub(crate) async fn append_budget_reserved(
     run_event_log_write(move || store.append(Some(&tenant_id), &event).map(|_| ())).await
 }
 
+#[derive(Clone)]
+struct DispatchedEventContext {
+    event_log: Arc<idoris_tenancy::event_log::EventLogStore>,
+    tenant_id: String,
+    record_id: String,
+    correlation: correlation::RequestCorrelation,
+}
+
+/// Persist the proxy-side dispatch-attempt fact.
+///
+/// `dispatched` means the router passed every knowable local/preflight gate
+/// and durably committed to the first real upstream send attempt. It does NOT
+/// prove TCP connected, request bytes reached the peer, or upstream execution
+/// occurred; an exhausted connect failure may therefore still finish as
+/// `ExecutionDisposition::NotExecuted` after this event exists.
+async fn append_dispatched(
+    context: &DispatchedEventContext,
+    selected: &Selected,
+) -> Result<(), ()> {
+    let mut metadata = std::collections::BTreeMap::new();
+    metadata.insert("status".to_string(), json!("attempted"));
+    metadata.insert(
+        "provider_id".to_string(),
+        json!(selected.card.provider.id.as_str()),
+    );
+    metadata.insert(
+        "served_locality".to_string(),
+        json!(selected.served_locality),
+    );
+    let ts_utc_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_millis()).ok())
+        .ok_or(())?;
+    let event = idoris_tenancy::event_log::NewEvent {
+        event_id: Uuid::new_v4().to_string(),
+        tenant_id: context.tenant_id.clone(),
+        record_id: context.record_id.clone(),
+        event_type: idoris_tenancy::event_log::EventType::Dispatched,
+        ts_utc_ms,
+        request_id: None,
+        session_id: context.correlation.session_id.clone(),
+        trace_id: context.correlation.trace_id.clone(),
+        parent_id: context.correlation.parent_id.clone(),
+        origin_record_id: None,
+        metadata,
+    };
+    let store = context.event_log.clone();
+    let tenant_id = context.tenant_id.clone();
+    run_event_log_write(move || store.append(Some(&tenant_id), &event).map(|_| ())).await
+}
+
 /// `POST /v1/chat/completions`. Order (locked by conformance): non-JSON
 /// body -> `invalid_json`; valid JSON that isn't an object -> `invalid_body`;
 /// only then are control-plane headers parsed (see [`profile::parse_profile`]).
@@ -1737,6 +1789,15 @@ async fn chat_completions(
         event_context
             .as_ref()
             .map(|(event_log, tenant_id)| BudgetReservedEventContext {
+                event_log: event_log.clone(),
+                tenant_id: tenant_id.clone(),
+                record_id: record_id.clone(),
+                correlation: correlation.clone(),
+            });
+    let dispatched_event_context =
+        event_context
+            .as_ref()
+            .map(|(event_log, tenant_id)| DispatchedEventContext {
                 event_log: event_log.clone(),
                 tenant_id: tenant_id.clone(),
                 record_id: record_id.clone(),
@@ -1904,6 +1965,7 @@ async fn chat_completions(
                 &parsed,
                 &value,
                 &record_id,
+                dispatched_event_context.as_ref(),
                 budget_event_context.as_ref(),
             )
             .await;
@@ -2020,6 +2082,7 @@ async fn chat_completions(
 /// body + its own `content-type`) — **never** re-wrapped into
 /// [`openai_chat_completion`]'s shape, matching `proxy.ts`'s own behavior:
 /// a transparent proxy, not a backend `RuntimeAdapter` call.
+#[allow(clippy::too_many_arguments)]
 async fn chat_via_proxy(
     state: &AppState,
     selected: &Selected,
@@ -2027,6 +2090,7 @@ async fn chat_via_proxy(
     parsed: &ParsedProfile,
     body_value: &serde_json::Value,
     record_id: &str,
+    dispatched_event: Option<&DispatchedEventContext>,
     budget_event_context: Option<&BudgetReservedEventContext>,
 ) -> Response {
     let mut reservation = match dispatch::ReservationGuard::reserve(
@@ -2068,7 +2132,7 @@ async fn chat_via_proxy(
         return event_log_unavailable_response();
     }
     if stream_requested {
-        return chat_via_proxy_stream(state, selected, body_value).await;
+        return chat_via_proxy_stream(state, selected, body_value, dispatched_event).await;
     }
     chat_via_proxy_buffered(
         state,
@@ -2077,6 +2141,7 @@ async fn chat_via_proxy(
         parsed,
         body_value,
         record_id,
+        dispatched_event,
         &mut reservation,
     )
     .await
@@ -2089,12 +2154,21 @@ async fn chat_via_proxy_stream(
     state: &AppState,
     selected: &Selected,
     body_value: &serde_json::Value,
+    dispatched_event: Option<&DispatchedEventContext>,
 ) -> Response {
-    match state
+    let outcome = state
         .proxy
-        .forward_stream(&selected.card.endpoint, body_value)
-        .await
-    {
+        .forward_stream_observed(&selected.card.endpoint, body_value, || async {
+            if let Some(context) = dispatched_event {
+                append_dispatched(context, selected).await?;
+            }
+            Ok::<(), ()>(())
+        })
+        .await;
+    let Ok(outcome) = outcome else {
+        return event_log_unavailable_response();
+    };
+    match outcome {
         proxy::StreamOutcome::Buffered {
             status,
             body,
@@ -2153,6 +2227,7 @@ fn terminated_proxy_body(upstream: Body) -> Body {
 
 /// The non-streaming half of [`chat_via_proxy`] (this PR's predecessor —
 /// idempotency cache read/write, `X-iDoris-Cached`/`X-iDoris-Origin-Record-Id`).
+#[allow(clippy::too_many_arguments)]
 async fn chat_via_proxy_buffered(
     state: &AppState,
     selected: &Selected,
@@ -2160,6 +2235,7 @@ async fn chat_via_proxy_buffered(
     parsed: &ParsedProfile,
     body_value: &serde_json::Value,
     record_id: &str,
+    dispatched_event: Option<&DispatchedEventContext>,
     reservation: &mut dispatch::ReservationGuard<'_>,
 ) -> Response {
     let is_paid = budget::is_paid(Some(selected.estimated_cost_minor));
@@ -2184,7 +2260,7 @@ async fn chat_via_proxy_buffered(
     let outcome = if is_paid {
         state
             .proxy
-            .forward_buffered_with_success_gate(
+            .forward_buffered_with_success_gate_observed(
                 &selected.card.endpoint,
                 body_value,
                 &opts,
@@ -2221,13 +2297,27 @@ async fn chat_via_proxy_buffered(
                         )),
                     }
                 },
+                || async {
+                    if let Some(context) = dispatched_event {
+                        append_dispatched(context, selected).await?;
+                    }
+                    Ok::<(), ()>(())
+                },
             )
             .await
     } else {
         state
             .proxy
-            .forward_buffered(&selected.card.endpoint, body_value, &opts)
+            .forward_buffered_observed(&selected.card.endpoint, body_value, &opts, || async {
+                if let Some(context) = dispatched_event {
+                    append_dispatched(context, selected).await?;
+                }
+                Ok::<(), ()>(())
+            })
             .await
+    };
+    let Ok(outcome) = outcome else {
+        return event_log_unavailable_response();
     };
 
     if is_paid {
@@ -2612,6 +2702,9 @@ mod decided_wiring_tests;
 
 #[cfg(test)]
 mod budget_reserved_wiring_tests;
+
+#[cfg(test)]
+mod dispatched_wiring_tests;
 
 #[cfg(test)]
 mod request_event_query_tests;
