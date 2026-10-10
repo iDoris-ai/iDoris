@@ -2483,7 +2483,13 @@ async fn chat_via_proxy_buffered(
             .await
             .is_err()
         {
-            return event_log_unavailable_response();
+            if is_paid && paid_settlement.is_some() {
+                eprintln!(
+                    "idoris: completed event write failed after committed paid proxy settlement"
+                );
+            } else {
+                return event_log_unavailable_response();
+            }
         }
     }
     let mut response = (status, outcome.body).into_response();

@@ -155,3 +155,61 @@ async fn buffered_proxy_cache_replay_does_not_record_completed() {
     assert_eq!(cached.status(), StatusCode::OK);
     assert_eq!(completed(&events(&event_log, &cached)).len(), 0);
 }
+
+#[tokio::test]
+async fn paid_completed_append_failure_preserves_settled_response_with_and_without_request_id() {
+    for request_id in [None, Some("paid-completed-failure")] {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "choices": [{"message": {"role": "assistant", "content": "charged reply"}}],
+                "usage": {"prompt_tokens": 7, "completion_tokens": 11, "total_tokens": 18}
+            })))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = dir.path().join("events.sqlite3");
+        let event_log = Arc::new(EventLogStore::open(&db).unwrap());
+        Connection::open(&db)
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER reject_completed BEFORE INSERT ON event_log_events \
+             WHEN NEW.event_type='completed' BEGIN SELECT RAISE(ABORT,'failure'); END;",
+            )
+            .unwrap();
+        let (_budget_dir, ledger) = super::tests::configured_budget_ledger(1_000_000);
+        let ledger = Arc::new(ledger);
+        let before = ledger.tenant_readview(budget::PERSONAL_TENANT_ID).unwrap();
+        let mut card = super::tests::resident_component_card("paid", &upstream.uri());
+        card.provider.cost = super::tests::paid_component_card("paid").provider.cost;
+        let app = build_app(AppState {
+            cards: vec![card],
+            event_log: Some(event_log.clone()),
+            budget_ledger: Some(ledger.clone()),
+            ..AppState::default()
+        });
+        let headers = request_id
+            .map(|id| vec![("X-iDoris-Request-Id", id)])
+            .unwrap_or_default();
+        let response = app
+            .oneshot(super::tests::post_chat(
+                r#"{"messages":[{"role":"user","content":"bill this"}]}"#,
+                &headers,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response.headers().contains_key(HEADER_COST_MINOR));
+        let chain = events(&event_log, &response);
+        assert_eq!(completed(&chain).len(), 0);
+        assert_eq!(
+            chain.last().unwrap().event.event_type,
+            EventType::Dispatched
+        );
+        let after = ledger.tenant_readview(budget::PERSONAL_TENANT_ID).unwrap();
+        assert!(after.spent_minor > before.spent_minor);
+        assert_eq!(after.reserved_minor, before.reserved_minor);
+        upstream.verify().await;
+    }
+}
