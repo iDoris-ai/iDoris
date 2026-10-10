@@ -109,7 +109,10 @@ use serde::Serialize;
 use serde_json::json;
 use uuid::Uuid;
 
-use dispatch::{DispatchError, DispatchFailure, Selected, dispatch_local, reason_header_value};
+use dispatch::{
+    DispatchError, DispatchFailure, LocalExecutionContext, ObservedDispatchError, Selected,
+    dispatch_local, dispatch_local_preselected_observed, reason_header_value,
+};
 use profile::{ParsedProfile, ProfileError, parse_profile};
 
 const HEADER_SERVED_LOCALITY: &str = "X-iDoris-Served-Locality";
@@ -347,6 +350,10 @@ pub fn build_app(state: AppState) -> Router {
         .route(
             "/idoris/tenants/{tenant_id}/audit",
             get(get_tenant_audit).fallback(not_found),
+        )
+        .route(
+            "/idoris/tenants/{tenant_id}/requests/{record_id}",
+            get(get_request_events).fallback(not_found),
         )
         .route(
             "/idoris/tenants/{tenant_id}/budget",
@@ -899,6 +906,57 @@ async fn get_tenant_audit(
     }
 }
 
+async fn get_request_events(
+    State(state): State<Arc<AppState>>,
+    Path((tenant_id, record_id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Response {
+    let scope_tenant = query_scope_header(&headers).map(str::to_string);
+    if scope_tenant.as_deref() != Some(tenant_id.as_str()) {
+        return error_envelope(
+            StatusCode::BAD_REQUEST,
+            "invalid_tenant_scope",
+            "request event query requires matching X-iDoris-Tenant",
+        );
+    }
+    let Some(event_log) = state.event_log.clone() else {
+        return event_log_query_unavailable_response();
+    };
+    let result = tokio::task::spawn_blocking(move || {
+        queries::event_log::query_request_events(
+            &event_log,
+            &tenant_id,
+            scope_tenant.as_deref(),
+            &record_id,
+        )
+    })
+    .await;
+    match result {
+        Ok(Ok(events)) => Json(events).into_response(),
+        Ok(Err(
+            err @ (queries::event_log::RequestEventsQueryError::ScopeRequired
+            | queries::event_log::RequestEventsQueryError::ScopeMismatch),
+        )) => error_envelope(
+            StatusCode::BAD_REQUEST,
+            "invalid_tenant_scope",
+            err.to_string(),
+        ),
+        Ok(Err(queries::event_log::RequestEventsQueryError::InvalidRecordId)) => error_envelope(
+            StatusCode::BAD_REQUEST,
+            "invalid_record_id",
+            "record_id is invalid",
+        ),
+        Ok(Err(queries::event_log::RequestEventsQueryError::NotFound)) => error_envelope(
+            StatusCode::NOT_FOUND,
+            "request_not_found",
+            "request record was not found",
+        ),
+        Ok(Err(queries::event_log::RequestEventsQueryError::EventLog(_))) | Err(_) => {
+            event_log_query_unavailable_response()
+        }
+    }
+}
+
 async fn get_tenant_budget(
     State(state): State<Arc<AppState>>,
     Path(tenant_id): Path<String>,
@@ -1278,6 +1336,15 @@ fn event_log_unavailable_response() -> Response {
     )
 }
 
+fn event_log_query_unavailable_response() -> Response {
+    error_envelope_with_reason(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "event_log_unavailable",
+        "EVENT_LOG_QUERY_UNAVAILABLE",
+        "event log unavailable",
+    )
+}
+
 async fn run_event_log_write<F>(write: F) -> Result<(), ()>
 where
     F: FnOnce() -> Result<(), idoris_tenancy::event_log::EventLogError> + Send + 'static,
@@ -1450,6 +1517,54 @@ async fn append_decided(
     };
     run_event_log_write(move || store.append(Some(&tenant_id), &event).map(|_| ())).await
 }
+
+#[derive(Clone)]
+pub(crate) struct BudgetReservedEventContext {
+    event_log: Arc<idoris_tenancy::event_log::EventLogStore>,
+    tenant_id: String,
+    record_id: String,
+    correlation: correlation::RequestCorrelation,
+}
+
+pub(crate) async fn append_budget_reserved(
+    context: &BudgetReservedEventContext,
+    selected: &Selected,
+) -> Result<(), ()> {
+    if !budget::is_paid(Some(selected.estimated_cost_minor)) {
+        return Ok(());
+    }
+    let mut metadata = std::collections::BTreeMap::new();
+    metadata.insert(
+        "reserved_minor".to_string(),
+        json!(selected.estimated_cost_minor),
+    );
+    metadata.insert(
+        "provider_id".to_string(),
+        json!(selected.card.provider.id.as_str()),
+    );
+    let ts_utc_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_millis()).ok())
+        .ok_or(())?;
+    let event = idoris_tenancy::event_log::NewEvent {
+        event_id: Uuid::new_v4().to_string(),
+        tenant_id: context.tenant_id.clone(),
+        record_id: context.record_id.clone(),
+        event_type: idoris_tenancy::event_log::EventType::BudgetReserved,
+        ts_utc_ms,
+        request_id: None,
+        session_id: context.correlation.session_id.clone(),
+        trace_id: context.correlation.trace_id.clone(),
+        parent_id: context.correlation.parent_id.clone(),
+        origin_record_id: None,
+        metadata,
+    };
+    let store = context.event_log.clone();
+    let tenant_id = context.tenant_id.clone();
+    run_event_log_write(move || store.append(Some(&tenant_id), &event).map(|_| ())).await
+}
+
 /// `POST /v1/chat/completions`. Order (locked by conformance): non-JSON
 /// body -> `invalid_json`; valid JSON that isn't an object -> `invalid_body`;
 /// only then are control-plane headers parsed (see [`profile::parse_profile`]).
@@ -1548,6 +1663,15 @@ async fn chat_completions(
     {
         return event_log_unavailable_response();
     }
+    let budget_event_context =
+        event_context
+            .as_ref()
+            .map(|(event_log, tenant_id)| BudgetReservedEventContext {
+                event_log: event_log.clone(),
+                tenant_id: tenant_id.clone(),
+                record_id: record_id.clone(),
+                correlation: correlation.clone(),
+            });
     let prompt = messages
         .iter()
         .map(|m| m.content.as_str())
@@ -1703,7 +1827,16 @@ async fn chat_completions(
             };
         }
         if dispatch::is_resident_http_service(&selected.card) {
-            return chat_via_proxy(&state, selected, &headers, &parsed, &value, &record_id).await;
+            return chat_via_proxy(
+                &state,
+                selected,
+                &headers,
+                &parsed,
+                &value,
+                &record_id,
+                budget_event_context.as_ref(),
+            )
+            .await;
         }
         if let Err(message) = supervisor_stream::validate(object) {
             let mut response = error_envelope_with_reason(
@@ -1744,17 +1877,36 @@ async fn chat_completions(
         .as_ref()
         .and_then(|selected| state.runtimes.get(&selected.card.provider.id));
     let budget_ledger = state.budget_ledger.as_deref();
-    match dispatch_local(
-        &policy_cards.cards,
-        supervisor,
-        budget_ledger,
-        &parsed,
-        dispatch::DispatchInput::with_model(model, &prompt),
-        messages,
-        lifecycle.cancellation_token(),
-    )
-    .await
-    {
+    let dispatch_result = if let Some(selected) = selected_for_dispatch.as_ref() {
+        match dispatch_local_preselected_observed(
+            selected,
+            LocalExecutionContext::new(supervisor, budget_ledger, budget_event_context.as_ref()),
+            &parsed,
+            dispatch::DispatchInput::with_model(model, &prompt),
+            messages,
+            lifecycle.cancellation_token(),
+        )
+        .await
+        {
+            Ok(outcome) => Ok(outcome),
+            Err(ObservedDispatchError::Dispatch(error)) => Err(error),
+            Err(ObservedDispatchError::EventLogUnavailable) => {
+                return event_log_unavailable_response();
+            }
+        }
+    } else {
+        dispatch_local(
+            &policy_cards.cards,
+            supervisor,
+            budget_ledger,
+            &parsed,
+            dispatch::DispatchInput::with_model(model, &prompt),
+            messages,
+            lifecycle.cancellation_token(),
+        )
+        .await
+    };
+    match dispatch_result {
         Err(DispatchError::Rejection(rejection)) => rejection_response(rejection),
         Err(DispatchError::Internal(message)) => {
             error_envelope(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", message)
@@ -1805,6 +1957,7 @@ async fn chat_via_proxy(
     parsed: &ParsedProfile,
     body_value: &serde_json::Value,
     record_id: &str,
+    budget_event_context: Option<&BudgetReservedEventContext>,
 ) -> Response {
     let mut reservation = match dispatch::ReservationGuard::reserve(
         state.budget_ledger.as_deref(),
@@ -1837,6 +1990,12 @@ async fn chat_via_proxy(
             "paid_proxy_unavailable",
             "付费流式直连尚不支持可信 usage 结算，请使用非流式请求或支持结算的后端",
         );
+    }
+    if is_paid
+        && let Some(context) = budget_event_context
+        && append_budget_reserved(context, selected).await.is_err()
+    {
+        return event_log_unavailable_response();
     }
     if stream_requested {
         return chat_via_proxy_stream(state, selected, body_value).await;
@@ -2380,6 +2539,12 @@ mod profiled_wiring_tests;
 
 #[cfg(test)]
 mod decided_wiring_tests;
+
+#[cfg(test)]
+mod budget_reserved_wiring_tests;
+
+#[cfg(test)]
+mod request_event_query_tests;
 
 #[cfg(test)]
 mod embeddings_wiring_tests;
