@@ -1,9 +1,10 @@
 //! Construct and index lifecycle-managed runtimes by component provider.
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, sync::Arc};
 
 use idoris_backend::{
-    BackendError, BackendStatus, RuntimeAdapter, Supervisor, SupervisorConfig, SupervisorHandle,
+    BackendError, BackendStatus, GlobalCapacityLedger, GlobalCapacitySnapshot, RuntimeAdapter,
+    Supervisor, SupervisorConfig, SupervisorHandle,
 };
 use idoris_contracts::{ComponentCard, component_card::Form};
 use idoris_policy::is_subscription_provider_id;
@@ -15,6 +16,7 @@ use crate::dispatch::BoundSupervisor;
 #[derive(Debug, Clone, Default)]
 pub struct RuntimeRegistry {
     supervisors: BTreeMap<String, BoundSupervisor>,
+    startup_capacity: Option<Arc<GlobalCapacityLedger>>,
 }
 
 impl RuntimeRegistry {
@@ -30,9 +32,18 @@ impl RuntimeRegistry {
     where
         F: Fn(&ComponentCard) -> Result<std::sync::Arc<dyn RuntimeAdapter>, BackendError>,
     {
-        let mut registry = Self::default();
+        let budget_gb = SupervisorConfig::default().budget_gb;
+        let startup_capacity = Arc::new(
+            GlobalCapacityLedger::new(budget_gb)
+                .map_err(|error| format!("startup capacity ledger: {error}"))?,
+        );
+        let mut registry = Self {
+            supervisors: BTreeMap::new(),
+            startup_capacity: Some(startup_capacity.clone()),
+        };
         for card in cards {
-            let Some(handle) = spawn_runtime_with_factory(card, &factory)? else {
+            let Some(handle) = spawn_runtime_with_factory(card, &factory, Some(&startup_capacity))?
+            else {
                 continue;
             };
             let provider_id = card.provider.id.clone();
@@ -106,6 +117,7 @@ impl RuntimeRegistry {
                 .into_iter()
                 .map(|bound| (bound.provider_id().to_string(), bound))
                 .collect(),
+            startup_capacity: None,
         }
     }
 
@@ -115,6 +127,21 @@ impl RuntimeRegistry {
 
     pub fn is_empty(&self) -> bool {
         self.supervisors.is_empty()
+    }
+
+    /// Wait for every lifecycle runtime's startup reconciliation, then return
+    /// the shared residency snapshot. This deliberately does not claim
+    /// load/unload admission authority yet.
+    pub async fn startup_capacity_snapshot(
+        &self,
+    ) -> Result<Option<GlobalCapacitySnapshot>, BackendError> {
+        let Some(ledger) = &self.startup_capacity else {
+            return Ok(None);
+        };
+        for supervisor in self.supervisors.values() {
+            supervisor.status().await?;
+        }
+        ledger.snapshot().map(Some)
     }
 
     pub async fn queue_depth(&self) -> u64 {
@@ -147,7 +174,10 @@ impl From<BoundSupervisor> for RuntimeRegistry {
     fn from(bound: BoundSupervisor) -> Self {
         let mut supervisors = BTreeMap::new();
         supervisors.insert(bound.provider_id().to_string(), bound);
-        Self { supervisors }
+        Self {
+            supervisors,
+            startup_capacity: None,
+        }
     }
 }
 
@@ -162,12 +192,13 @@ impl From<Option<BoundSupervisor>> for RuntimeRegistry {
 /// # Panics
 /// Lifecycle construction requires a running Tokio runtime, like `Supervisor::spawn`.
 pub fn spawn_runtime(card: &ComponentCard) -> Result<Option<SupervisorHandle>, String> {
-    spawn_runtime_with_factory(card, &create_adapter)
+    spawn_runtime_with_factory(card, &create_adapter, None)
 }
 
 fn spawn_runtime_with_factory<F>(
     card: &ComponentCard,
     factory: &F,
+    startup_capacity: Option<&Arc<GlobalCapacityLedger>>,
 ) -> Result<Option<SupervisorHandle>, String>
 where
     F: Fn(&ComponentCard) -> Result<std::sync::Arc<dyn RuntimeAdapter>, BackendError>,
@@ -186,7 +217,18 @@ where
     }
     let adapter =
         factory(card).map_err(|error| format!("provider {}: {error}", card.provider.id))?;
-    Supervisor::spawn(adapter, SupervisorConfig::default())
+    let config = SupervisorConfig::default();
+    let supervisor = if let Some(ledger) = startup_capacity {
+        Supervisor::spawn_with_startup_capacity_tracking(
+            adapter,
+            config,
+            ledger.clone(),
+            card.provider.id.clone(),
+        )
+    } else {
+        Supervisor::spawn(adapter, config)
+    };
+    supervisor
         .map(Some)
         .map_err(|error| format!("provider {}: {error}", card.provider.id))
 }
@@ -289,6 +331,7 @@ mod tests {
                 ("a".into(), mock_bound(&a)),
                 ("b".into(), mock_bound(&b)),
             ]),
+            startup_capacity: None,
         };
         for card in [&a, &b] {
             let outcome = dispatch_local(
@@ -324,6 +367,25 @@ mod tests {
 
         assert_eq!(registry.len(), 1);
         assert!(registry.get("local-http").is_some());
+    }
+
+    #[tokio::test]
+    async fn registry_tracks_each_runtime_startup_in_one_shared_capacity_snapshot() {
+        let a = named_card("runtime-a");
+        let b = named_card("runtime-b");
+        let registry = RuntimeRegistry::spawn_with_factory(&[a, b], |card| {
+            Ok(Arc::new(MockAdapter::new(vec![ModelInfo {
+                id: card.provider.id.clone(),
+                memory_gb: 2.0,
+            }])) as Arc<dyn RuntimeAdapter>)
+        })
+        .unwrap();
+
+        let snapshot = registry.startup_capacity_snapshot().await.unwrap().unwrap();
+        assert_eq!(snapshot.budget_gb, SupervisorConfig::default().budget_gb);
+        assert_eq!(snapshot.reserved_gb, 0.0);
+        assert_eq!(snapshot.allocations["runtime:runtime-a"], 0.0);
+        assert_eq!(snapshot.allocations["runtime:runtime-b"], 0.0);
     }
 
     #[tokio::test]
