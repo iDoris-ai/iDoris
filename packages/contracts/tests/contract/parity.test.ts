@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import adminV0BackendsJson from "../../schema/admin-v0-backends.schema.json";
 import adminV0ModelsJson from "../../schema/admin-v0-models.schema.json";
 import adminV0RolesJson from "../../schema/admin-v0-roles.schema.json";
+import adminV0RuntimesJson from "../../schema/admin-v0-runtimes.schema.json";
 import adminV0StatusJson from "../../schema/admin-v0-status.schema.json";
 import adapterManifestJson from "../../schema/adapter-manifest.schema.json";
 import componentCardJson from "../../schema/component-card.schema.json";
@@ -15,6 +16,7 @@ import trainingSampleJson from "../../schema/training-sample.schema.json";
 import { adminV0BackendsResponseSchema } from "../../src/generated/admin-v0-backends.js";
 import { adminV0ModelsResponseSchema } from "../../src/generated/admin-v0-models.js";
 import { adminV0RolesResponseSchema } from "../../src/generated/admin-v0-roles.js";
+import { adminV0RuntimesResponseSchema } from "../../src/generated/admin-v0-runtimes.js";
 import { adminV0StatusResponseSchema } from "../../src/generated/admin-v0-status.js";
 import { adapterManifestSchema } from "../../src/adapter-manifest.js";
 import { componentCardSchema } from "../../src/component-card.js";
@@ -30,6 +32,7 @@ const jsonByName = {
   "admin-v0-backends": adminV0BackendsJson,
   "admin-v0-models": adminV0ModelsJson,
   "admin-v0-roles": adminV0RolesJson,
+  "admin-v0-runtimes": adminV0RuntimesJson,
   "admin-v0-status": adminV0StatusJson,
   "adapter-manifest": adapterManifestJson,
   provider: providerJson, "load-policy": loadPolicyJson, "component-card": componentCardJson,
@@ -43,6 +46,7 @@ const zodByName: Record<Name, { safeParse: (d: unknown) => { success: boolean } 
   "admin-v0-backends": adminV0BackendsResponseSchema,
   "admin-v0-models": adminV0ModelsResponseSchema,
   "admin-v0-roles": adminV0RolesResponseSchema,
+  "admin-v0-runtimes": adminV0RuntimesResponseSchema,
   "admin-v0-status": adminV0StatusResponseSchema,
   "adapter-manifest": adapterManifestSchema,
   provider: providerDescriptorSchema, "load-policy": loadPolicySchema, "component-card": componentCardSchema,
@@ -91,6 +95,13 @@ const corpus: Array<[Name, unknown]> = [
   ["admin-v0-roles", []],
   ["admin-v0-roles", [{ role: "daily", aliases: [], catalog_role: true }]],
   ["admin-v0-roles", [{ role: "daily", aliases: ["idoris/daily"], catalog_role: true, model: "Qwen3-8B" }]],
+  ["admin-v0-runtimes", { runtimes: [{ provider_id: "omlx-local", state: "observed", pressure: "soft", used_gb: 8.5, model_memory_max_gb: 32, loaded: ["Qwen3-8B"] }] }],
+  ["admin-v0-runtimes", { runtimes: [] }],
+  ["admin-v0-runtimes", { runtimes: [{ provider_id: "omlx-local", state: "error" }] }],
+  ["admin-v0-runtimes", { runtimes: [{ provider_id: "omlx-local", state: "observed", used_gb: 8.5, model_memory_max_gb: 32, loaded: ["Qwen3-8B"] }] }],
+  ["admin-v0-runtimes", { runtimes: [{ provider_id: "omlx-local", state: "observed", pressure: "soft", used_gb: -1, model_memory_max_gb: 32, loaded: ["Qwen3-8B"] }] }],
+  ["admin-v0-runtimes", { runtimes: [{ provider_id: "omlx-local", state: "error", pressure: "ok" }] }],
+  ["admin-v0-runtimes", { runtimes: [{ provider_id: "omlx-local", state: "observed", pressure: "soft", used_gb: 8.5, model_memory_max_gb: 32, loaded: ["Qwen3-8B"], endpoint: "http://127.0.0.1:8088" }] }],
   ["admin-v0-status", {
     status: "ok", service: "idoris", version: "0.2.0", contract_version: "1.0.1",
     instance_id: "instance-1", components: 2, runtimes: 1, subscriptions: 0,
