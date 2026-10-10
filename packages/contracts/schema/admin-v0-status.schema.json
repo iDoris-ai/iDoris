@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://idoris.ai/schema/admin-v0-status.schema.json",
+  "title": "AdminV0StatusResponse",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["status", "service", "version", "contract_version", "instance_id", "components", "runtimes", "subscriptions", "budget_configured", "audit_configured", "capacity"],
+  "properties": {
+    "status": { "const": "ok" },
+    "service": { "const": "idoris" },
+    "version": { "type": "string", "minLength": 1 },
+    "contract_version": { "type": "string", "minLength": 1 },
+    "instance_id": { "type": "string", "minLength": 1 },
+    "components": { "type": "integer", "minimum": 0 },
+    "runtimes": { "type": "integer", "minimum": 0 },
+    "subscriptions": { "type": "integer", "minimum": 0 },
+    "budget_configured": { "type": "boolean" },
+    "audit_configured": { "type": "boolean" },
+    "capacity": {
+      "oneOf": [
+        {
+          "type": "object", "additionalProperties": false, "required": ["state", "entries"],
+          "properties": {
+            "state": { "const": "observed" },
+            "entries": {
+              "type": "array",
+              "items": {
+                "type": "object", "additionalProperties": false,
+                "required": ["id", "capability", "resident", "estimated_memory_gb", "ctx_limit", "queue_depth", "admission_status"],
+                "properties": {
+                  "id": { "type": "string" }, "capability": { "type": "string" }, "resident": { "type": "boolean" },
+                  "estimated_memory_gb": { "type": "number", "minimum": 0 }, "ctx_limit": { "type": "integer", "minimum": 0 },
+                  "queue_depth": { "type": "integer", "minimum": 0 },
+                  "admission_status": { "enum": ["ready", "requires_eviction", "blocked"] }
+                }
+              }
+            }
+          }
+        },
+        { "type": "object", "additionalProperties": false, "required": ["state"], "properties": { "state": { "const": "unavailable" } } },
+        { "type": "object", "additionalProperties": false, "required": ["state"], "properties": { "state": { "const": "error" } } }
+      ]
+    }
+  }
+}

@@ -154,7 +154,7 @@ it("closing the HTTP socket after full request body cancels the running subscrip
   const claude = fixture.binDir + "/claude";
   writeFileSync(
     claude,
-    `#!/bin/sh\nset -eu\nmarker="\${SUBSCRIPTION_FIXTURE_MARKER:?}"\npgid="$(ps -o pgid= -p $$ | tr -d ' ')"\nprintf 'spawn:%s:%s\\n' "$$" "$pgid" >> "$marker"\ntrap 'printf "term:%s\\n" "$$" >> "$marker"; exit 0' TERM\nwhile :; do sleep 1; done\n`,
+    `#!/bin/sh\nset -eu\nmarker="\${SUBSCRIPTION_FIXTURE_MARKER:?}"\npgid="$(ps -o pgid= -p $$ | tr -d ' ')"\ntrap 'printf "term:%s\\n" "$$" >> "$marker"; exit 0' TERM\nprintf 'spawn:%s:%s\\n' "$$" "$pgid" >> "$marker"\nwhile :; do sleep 1; done\n`,
     "utf8",
   );
   chmodSync(claude, 0o755);

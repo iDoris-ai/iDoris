@@ -142,9 +142,52 @@ pub struct ForwardOpts<'a> {
     pub provider_id: &'a str,
     pub served_locality: Locality,
     pub privacy: PrivacyClass,
+    /// Paid direct-proxy calls require trustworthy OpenAI usage evidence
+    /// before a 2xx response may be retained or replayed.
+    pub require_openai_usage: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BufferedUpstreamPath {
+    path: &'static str,
+    force_non_stream: bool,
+}
+
+impl BufferedUpstreamPath {
+    const CHAT_COMPLETIONS: Self = Self {
+        path: "/v1/chat/completions",
+        force_non_stream: true,
+    };
+
+    pub(crate) const EMBEDDINGS: Self = Self {
+        path: "/v1/embeddings",
+        force_non_stream: false,
+    };
+
+    pub(crate) const RERANK: Self = Self {
+        path: "/v1/rerank",
+        force_non_stream: false,
+    };
+
+    pub(crate) const MESSAGES: Self = Self {
+        path: "/v1/messages",
+        force_non_stream: true,
+    };
 }
 
 /// [`ChatProxy::forward_buffered`]'s result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecutionDisposition {
+    /// No upstream execution happened for this caller.
+    NotExecuted,
+    /// The upstream returned a complete HTTP response.
+    Executed,
+    /// The POST may have executed, but a trustworthy terminal response is unavailable.
+    Uncertain,
+    /// This caller received a retained/cache/singleflight replay.
+    Replay,
+}
+
 #[derive(Clone)]
 pub struct ForwardOutcome {
     pub status: u16,
@@ -160,7 +203,10 @@ pub struct ForwardOutcome {
     /// key doc, C1).
     pub replayed_served_locality: Option<Locality>,
     pub retries: u32,
+    pub execution: ExecutionDisposition,
 }
+
+pub(crate) type SuccessFinalizeError = (u16, &'static str, &'static str);
 
 struct Flight {
     fingerprint: [u8; 32],
@@ -394,6 +440,14 @@ impl ChatProxy {
     }
 
     fn failure(status: u16, retries: u32) -> ForwardOutcome {
+        Self::failure_with_execution(status, retries, ExecutionDisposition::NotExecuted)
+    }
+
+    fn failure_with_execution(
+        status: u16,
+        retries: u32,
+        execution: ExecutionDisposition,
+    ) -> ForwardOutcome {
         ForwardOutcome {
             status,
             body: Bytes::from_static(br#"{"error":{"type":"upstream_unavailable"}}"#),
@@ -402,6 +456,7 @@ impl ChatProxy {
             origin_record_id: None,
             replayed_served_locality: None,
             retries,
+            execution,
         }
     }
 
@@ -450,6 +505,52 @@ impl ChatProxy {
         body: &Value,
         opts: &ForwardOpts<'_>,
     ) -> ForwardOutcome {
+        self.forward_buffered_path(endpoint, BufferedUpstreamPath::CHAT_COMPLETIONS, body, opts)
+            .await
+    }
+
+    pub(crate) async fn forward_buffered_path(
+        &self,
+        endpoint: &str,
+        path: BufferedUpstreamPath,
+        body: &Value,
+        opts: &ForwardOpts<'_>,
+    ) -> ForwardOutcome {
+        self.forward_buffered_path_with_success_gate(endpoint, path, body, opts, |_| Ok(()))
+            .await
+    }
+
+    pub(crate) async fn forward_buffered_with_success_gate<F>(
+        &self,
+        endpoint: &str,
+        body: &Value,
+        opts: &ForwardOpts<'_>,
+        success_gate: F,
+    ) -> ForwardOutcome
+    where
+        F: FnOnce(&ForwardOutcome) -> Result<(), SuccessFinalizeError> + Send,
+    {
+        self.forward_buffered_path_with_success_gate(
+            endpoint,
+            BufferedUpstreamPath::CHAT_COMPLETIONS,
+            body,
+            opts,
+            success_gate,
+        )
+        .await
+    }
+
+    async fn forward_buffered_path_with_success_gate<F>(
+        &self,
+        endpoint: &str,
+        path: BufferedUpstreamPath,
+        body: &Value,
+        opts: &ForwardOpts<'_>,
+        success_gate: F,
+    ) -> ForwardOutcome
+    where
+        F: FnOnce(&ForwardOutcome) -> Result<(), SuccessFinalizeError> + Send,
+    {
         // Every caller, including a cache hit or singleflight waiter, owns a
         // permit until its final outgoing bytes are dropped. Retained results
         // below stay unbound so the registries cannot hold permits indefinitely.
@@ -457,32 +558,42 @@ impl ChatProxy {
             Ok(permit) => permit,
             Err(_) => return Self::failure(503, 0),
         };
-        let mut outcome = self.forward_buffered_inner(endpoint, body, opts).await;
+        let mut outcome = self
+            .forward_buffered_inner(endpoint, path, body, opts, success_gate)
+            .await;
         outcome.body = with_permit(outcome.body, Arc::new(permit));
         outcome
     }
 
-    async fn forward_buffered_inner(
+    async fn forward_buffered_inner<F>(
         &self,
         endpoint: &str,
+        path: BufferedUpstreamPath,
         body: &Value,
         opts: &ForwardOpts<'_>,
-    ) -> ForwardOutcome {
+        success_gate: F,
+    ) -> ForwardOutcome
+    where
+        F: FnOnce(&ForwardOutcome) -> Result<(), SuccessFinalizeError> + Send,
+    {
         let mut payload = body.clone();
-        if let Some(obj) = payload.as_object_mut() {
+        if path.force_non_stream
+            && let Some(obj) = payload.as_object_mut()
+        {
             obj.insert("stream".to_string(), Value::Bool(false));
         }
         // Record ids differ on replay; payload and safety context must not.
         let Ok(fingerprint) = fingerprint(&payload, opts.privacy, opts.served_locality) else {
             return Self::failure(502, 0);
         };
+        let url = format!("{}{}", endpoint.trim_end_matches('/'), path.path);
         let Some(request_id) = opts.request_id else {
             let mut uncertain = false;
-            return self
-                .forward_once(endpoint, &payload, opts, &fingerprint, &mut uncertain)
+            let outcome = self
+                .forward_once(&url, &payload, opts, &fingerprint, &mut uncertain)
                 .await;
+            return Self::finalize_success(outcome, success_gate).0;
         };
-        let url = format!("{}/v1/chat/completions", endpoint.trim_end_matches('/'));
         let key = cache_key(
             opts.tenant_id.unwrap_or("\u{0}personal"),
             &url,
@@ -558,20 +669,43 @@ impl ChatProxy {
             {
                 return hit;
             }
-            return outcome.clone();
+            let mut replay = outcome.clone();
+            replay.execution = ExecutionDisposition::Replay;
+            return replay;
         }
         // If the leader is cancelled, waiting calls fail closed instead of resending.
         *result = Some(Self::flight_failure(502, "upstream_unavailable"));
         let mut cancellation_guard = FlightCancellationGuard::new(Arc::clone(&flight));
         let mut uncertain = false;
         let outcome = self
-            .forward_once(endpoint, &payload, opts, &fingerprint, &mut uncertain)
+            .forward_once(&url, &payload, opts, &fingerprint, &mut uncertain)
             .await;
+        let (outcome, finalize_failed) = Self::finalize_success(outcome, success_gate);
+        uncertain |= finalize_failed;
+        if !uncertain
+            && (200..300).contains(&outcome.status)
+            && !outcome.cached
+            && outcome.execution == ExecutionDisposition::Executed
+        {
+            self.remember(
+                key.clone(),
+                CacheEntry {
+                    at: Instant::now(),
+                    fingerprint,
+                    status: outcome.status,
+                    // Only outgoing bytes own the permit; cache retention must not.
+                    body: outcome.body.clone(),
+                    record_id: opts.record_id.to_string(),
+                    served_locality: opts.served_locality,
+                },
+            );
+        }
         let mut replay = outcome.clone();
         if (200..300).contains(&replay.status) && !replay.cached {
             replay.cached = true;
             replay.origin_record_id = Some(opts.record_id.to_string());
             replay.replayed_served_locality = Some(opts.served_locality);
+            replay.execution = ExecutionDisposition::Replay;
         }
         let retained_bytes = flight
             .base_bytes
@@ -591,7 +725,11 @@ impl ChatProxy {
             // Keep a bounded uncertainty marker until expiry. Dropping a
             // completed but uncacheable result could permit a duplicate POST.
             uncertain = true;
-            replay = Self::flight_failure(502, "upstream_unavailable");
+            replay = Self::flight_failure_with_execution(
+                502,
+                "upstream_unavailable",
+                ExecutionDisposition::Uncertain,
+            );
         }
         if !uncertain && (200..300).contains(&outcome.status) {
             // Keep the request fingerprint through the idempotency window,
@@ -604,7 +742,53 @@ impl ChatProxy {
         outcome
     }
 
+    fn finalize_success<F>(outcome: ForwardOutcome, success_gate: F) -> (ForwardOutcome, bool)
+    where
+        F: FnOnce(&ForwardOutcome) -> Result<(), SuccessFinalizeError>,
+    {
+        if outcome.execution == ExecutionDisposition::Executed
+            && (200..300).contains(&outcome.status)
+            && !outcome.cached
+            && let Err(error) = success_gate(&outcome)
+        {
+            return (Self::success_finalize_failure(error), true);
+        }
+        (outcome, false)
+    }
+
+    fn success_finalize_failure(error: SuccessFinalizeError) -> ForwardOutcome {
+        ForwardOutcome {
+            status: error.0,
+            body: Bytes::from(
+                serde_json::json!({
+                    "error": {
+                        "type": error.1,
+                        "rule_id": null,
+                        "reason_code": error.1,
+                        "evidence": null,
+                        "remediation": error.2,
+                    }
+                })
+                .to_string(),
+            ),
+            content_type: Some("application/json".to_string()),
+            cached: false,
+            origin_record_id: None,
+            replayed_served_locality: None,
+            retries: 0,
+            execution: ExecutionDisposition::Uncertain,
+        }
+    }
+
     fn flight_failure(status: u16, kind: &str) -> ForwardOutcome {
+        Self::flight_failure_with_execution(status, kind, ExecutionDisposition::NotExecuted)
+    }
+
+    fn flight_failure_with_execution(
+        status: u16,
+        kind: &str,
+        execution: ExecutionDisposition,
+    ) -> ForwardOutcome {
         ForwardOutcome {
             status,
             body: Bytes::from(serde_json::json!({"error": {"type": kind}}).to_string()),
@@ -613,6 +797,7 @@ impl ChatProxy {
             origin_record_id: None,
             replayed_served_locality: None,
             retries: 0,
+            execution,
         }
     }
 
@@ -641,22 +826,22 @@ impl ChatProxy {
             origin_record_id: Some(entry.record_id),
             replayed_served_locality: Some(entry.served_locality),
             retries: 0,
+            execution: ExecutionDisposition::Replay,
         })
     }
 
     async fn forward_once(
         &self,
-        endpoint: &str,
+        url: &str,
         payload: &Value,
         opts: &ForwardOpts<'_>,
         fingerprint: &[u8; 32],
         uncertain: &mut bool,
     ) -> ForwardOutcome {
-        let url = format!("{}/v1/chat/completions", endpoint.trim_end_matches('/'));
         let tenant_scope = opts.tenant_id.unwrap_or("\u{0}personal");
 
         if let Some(request_id) = opts.request_id {
-            let key = cache_key(tenant_scope, &url, opts.provider_id, request_id);
+            let key = cache_key(tenant_scope, url, opts.provider_id, request_id);
             if let Some(hit) = self.lookup_cached(&key, fingerprint, opts) {
                 return hit;
             }
@@ -668,7 +853,7 @@ impl ChatProxy {
             // connection failure proves that this POST was not executed.
             let sent = tokio::time::timeout(
                 self.header_timeout,
-                self.client.post(&url).json(payload).send(),
+                self.client.post(url).json(payload).send(),
             )
             .await;
             match sent {
@@ -691,38 +876,37 @@ impl ChatProxy {
                         Ok(bytes) => bytes,
                         Err(status) => {
                             *uncertain = true;
-                            return Self::failure(status, retries);
+                            return Self::failure_with_execution(
+                                status,
+                                retries,
+                                ExecutionDisposition::Uncertain,
+                            );
                         }
                     };
-                    // Only a genuinely successful (2xx) call is cached —
-                    // matches TS's own `res.ok` gate on the `remember()`
-                    // call site exactly (a 4xx is never retried above
-                    // either, so "not currently retrying" alone isn't the
-                    // right condition here; a 4xx must still reach this
-                    // point without being cached).
                     if (200..300).contains(&status)
-                        && let Some(request_id) = opts.request_id
+                        && opts.require_openai_usage
+                        && crate::budget::parse_openai_usage(&body_bytes).is_err()
                     {
-                        self.remember(
-                            cache_key(tenant_scope, &url, opts.provider_id, request_id),
-                            CacheEntry {
-                                at: Instant::now(),
-                                fingerprint: *fingerprint,
-                                status,
-                                // Only outgoing bytes own the permit; cache retention must not.
-                                body: body_bytes.clone(),
-                                record_id: opts.record_id.to_string(),
-                                served_locality: opts.served_locality,
-                            },
+                        *uncertain = true;
+                        return Self::flight_failure_with_execution(
+                            502,
+                            "upstream_usage_invalid",
+                            ExecutionDisposition::Uncertain,
                         );
                     }
                     // Redirects, request timeouts, and 5xx responses do not
                     // prove the POST was not executed; retain their
-                    // fingerprint through the window.
-                    if (300..400).contains(&status) || status == 408 || (500..600).contains(&status)
+                    // fingerprint through the window and expose the same
+                    // uncertainty to budget settlement.
+                    let execution = if (300..400).contains(&status)
+                        || status == 408
+                        || (500..600).contains(&status)
                     {
                         *uncertain = true;
-                    }
+                        ExecutionDisposition::Uncertain
+                    } else {
+                        ExecutionDisposition::Executed
+                    };
                     return ForwardOutcome {
                         status,
                         body: body_bytes,
@@ -731,6 +915,7 @@ impl ChatProxy {
                         origin_record_id: None,
                         replayed_served_locality: None,
                         retries,
+                        execution,
                     };
                 }
                 Ok(Err(err)) => {
@@ -741,11 +926,23 @@ impl ChatProxy {
                         continue;
                     }
                     *uncertain = !err.is_connect();
-                    return Self::failure(if err.is_timeout() { 504 } else { 502 }, attempt as u32);
+                    return Self::failure_with_execution(
+                        if err.is_timeout() { 504 } else { 502 },
+                        attempt as u32,
+                        if err.is_connect() {
+                            ExecutionDisposition::NotExecuted
+                        } else {
+                            ExecutionDisposition::Uncertain
+                        },
+                    );
                 }
                 Err(_) => {
                     *uncertain = true;
-                    return Self::failure(504, attempt as u32);
+                    return Self::failure_with_execution(
+                        504,
+                        attempt as u32,
+                        ExecutionDisposition::Uncertain,
+                    );
                 }
             }
         }
@@ -994,6 +1191,10 @@ mod concurrency_tests;
 mod slow_reader_tests;
 
 #[cfg(test)]
+#[path = "proxy_path_tests.rs"]
+mod path_tests;
+
+#[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -1076,6 +1277,7 @@ mod tests {
             provider_id: "omlx",
             served_locality: Locality::Loopback,
             privacy: PrivacyClass::Any,
+            require_openai_usage: false,
         }
     }
 

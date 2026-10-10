@@ -204,6 +204,8 @@ function killTree(child: ChildProcess, signal: NodeJS.Signals): void {
 /** 轮询 /health 直到 200 或超时；子进程提前退出/启动失败则立即抛错并带上 stdio 供排查。 */
 export async function spawnConformanceServer(opts: SpawnOptions): Promise<RunningServer> {
   const port = await pickPort();
+  let adminPort = await pickPort();
+  while (adminPort === port) adminPort = await pickPort();
   const { bin, args } = resolveCommand();
 
   let rustStateDir: string | undefined;
@@ -250,6 +252,10 @@ export async function spawnConformanceServer(opts: SpawnOptions): Promise<Runnin
     ...opts.env,
     ...(rustDbPath === undefined ? {} : { IDORIS_DB_PATH: rustDbPath }),
     IDORIS_PORT: String(port),
+    // Rust M4/B9 serves Admin on a second listener. Give every harness child
+    // its own port so parallel conformance workers never contend on 8741.
+    // TS ignores this variable, so the shared harness stays implementation-neutral.
+    IDORIS_ADMIN_PORT: String(adminPort),
     IDORIS_COMPONENTS_DIR: opts.componentsDir,
   };
   if (opts.pathPrepend !== undefined && opts.pathPrepend.length > 0) {
