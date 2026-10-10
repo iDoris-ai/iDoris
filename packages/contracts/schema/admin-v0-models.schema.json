@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://idoris.ai/schema/admin-v0-models.schema.json",
+  "title": "AdminV0ModelsResponse",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["sources"],
+  "properties": {
+    "sources": {
+      "type": "array",
+      "items": {
+        "oneOf": [
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["provider_id", "source", "state", "models"],
+            "properties": {
+              "provider_id": { "type": "string", "minLength": 1 },
+              "source": { "const": "http_models_endpoint" },
+              "state": { "const": "observed" },
+              "models": { "type": "array", "items": { "type": "string", "minLength": 1 } }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["provider_id", "source", "state", "models"],
+            "properties": {
+              "provider_id": { "type": "string", "minLength": 1 },
+              "source": { "const": "subscription_registration" },
+              "state": { "const": "configured" },
+              "models": { "type": "array", "minItems": 1, "items": { "type": "string", "minLength": 1 } }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["provider_id", "source", "state", "models", "error"],
+            "properties": {
+              "provider_id": { "type": "string", "minLength": 1 },
+              "source": { "const": "http_models_endpoint" },
+              "state": { "const": "error" },
+              "models": { "type": "array", "maxItems": 0, "items": { "type": "string", "minLength": 1 } },
+              "error": { "enum": ["unavailable", "authentication_failed"] }
+            }
+          }
+        ]
+      }
+    }
+  }
+}
