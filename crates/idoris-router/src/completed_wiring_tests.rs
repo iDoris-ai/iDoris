@@ -225,7 +225,23 @@ async fn completed_append_failure_is_generic_503_after_chat() {
         )
         .unwrap();
     let adapter = Arc::new(ObservedAdapter::new(false));
-    let response = build_app(local_state(event_log.clone(), adapter.clone()))
+    let (_budget_dir, ledger) = super::tests::configured_budget_ledger(1_000_000);
+    let ledger = Arc::new(ledger);
+    let before = ledger.tenant_readview(budget::PERSONAL_TENANT_ID).unwrap();
+    let paid_card = super::tests::paid_component_card("local-1");
+    let supervisor = idoris_backend::Supervisor::spawn(
+        adapter.clone(),
+        idoris_backend::SupervisorConfig::default(),
+    )
+    .unwrap();
+    let state = AppState {
+        cards: vec![paid_card.clone()],
+        runtimes: dispatch::BoundSupervisor::new(&paid_card, supervisor).into(),
+        event_log: Some(event_log.clone()),
+        budget_ledger: Some(ledger.clone()),
+        ..AppState::default()
+    };
+    let response = build_app(state)
         .oneshot(super::tests::post_chat(
             r#"{"model":"idoris/daily","messages":[{"role":"user","content":"already executed"}]}"#,
             &[],
@@ -235,6 +251,8 @@ async fn completed_append_failure_is_generic_503_after_chat() {
 
     assert_eq!(adapter.chat_calls.load(Ordering::SeqCst), 1);
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let after = ledger.tenant_readview(budget::PERSONAL_TENANT_ID).unwrap();
+    assert!(after.spent_minor > before.spent_minor);
     let chain = events(&event_log, &response);
     assert_eq!(completed(&chain).len(), 0);
     assert_eq!(

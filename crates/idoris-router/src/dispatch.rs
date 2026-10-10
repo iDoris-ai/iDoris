@@ -679,6 +679,30 @@ async fn dispatch_local_inner(
         )
         .await;
 
+    // A successful upstream execution must be charged before any fallible
+    // completion event append can return early and drop the reservation.
+    let actual_cost_minor = if let Ok(response) = &chat_result {
+        // Settling is best-effort (see `ChatOutcome::actual_cost_minor`'s
+        // doc): a successful chat response is never withheld just
+        // because the ledger write afterward had a problem.
+        match (budget_ledger, reservation_guard.take()) {
+            (Some(ledger), Some(id)) => {
+                let actual = budget::estimate_actual_cost_minor(
+                    &cost,
+                    prompt,
+                    &response.content,
+                    estimated_cost_minor,
+                );
+                budget::settle(ledger, tenant_id, &id, actual)
+                    .ok()
+                    .filter(|_| is_paid)
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
+
     if let Some(context) = completed_event {
         let status = if chat_result.is_ok() {
             "success"
@@ -693,6 +717,17 @@ async fn dispatch_local_inner(
         }
     }
 
+    // Keep the settled event after Completed while charging before the
+    // fallible Completed append. A failed settled-event append cannot refund.
+    if let Some(settled_minor) = actual_cost_minor
+        && let Some(context) = budget_settled_event
+        && crate::append_budget_settled(context, selected, settled_minor)
+            .await
+            .is_err()
+    {
+        eprintln!("idoris: budget.settled event write failed after committed settlement");
+    }
+
     match chat_result {
         Err(err) => Ok(ChatOutcome {
             decision,
@@ -700,43 +735,12 @@ async fn dispatch_local_inner(
             result: Err(DispatchFailure::Backend(err)),
             actual_cost_minor: None,
         }),
-        Ok(response) => {
-            // Settling is best-effort (see `ChatOutcome::actual_cost_minor`'s
-            // doc): a successful chat response is never withheld just
-            // because the ledger write afterward had a problem.
-            let actual_cost_minor = match (budget_ledger, reservation_guard.take()) {
-                (Some(ledger), Some(id)) => {
-                    let actual = budget::estimate_actual_cost_minor(
-                        &cost,
-                        prompt,
-                        &response.content,
-                        estimated_cost_minor,
-                    );
-                    match budget::settle(ledger, tenant_id, &id, actual) {
-                        Ok(settled_minor) if is_paid => {
-                            if let Some(context) = budget_settled_event
-                                && crate::append_budget_settled(context, selected, settled_minor)
-                                    .await
-                                    .is_err()
-                            {
-                                eprintln!(
-                                    "idoris: budget.settled event write failed after committed settlement"
-                                );
-                            }
-                            Some(settled_minor)
-                        }
-                        Ok(_) | Err(_) => None,
-                    }
-                }
-                _ => None,
-            };
-            Ok(ChatOutcome {
-                decision,
-                served_locality,
-                result: Ok(response),
-                actual_cost_minor,
-            })
-        }
+        Ok(response) => Ok(ChatOutcome {
+            decision,
+            served_locality,
+            result: Ok(response),
+            actual_cost_minor,
+        }),
     }
 }
 
