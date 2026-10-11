@@ -349,6 +349,7 @@ pub struct Supervisor;
 struct StartupCapacityTracking {
     ledger: Arc<GlobalCapacityLedger>,
     allocation_key: String,
+    claimed_gb: f64,
 }
 
 impl Supervisor {
@@ -387,6 +388,7 @@ impl Supervisor {
             Some(StartupCapacityTracking {
                 ledger,
                 allocation_key: format!("runtime:{runtime_id}"),
+                claimed_gb: 0.0,
             }),
         )
     }
@@ -940,10 +942,75 @@ struct Env<'a> {
     // that the same snapshot proves are represented by independent slots.
     reserved_gb: f64,
     aggregate_covered: HashMap<String, f64>,
+    runtime_capacity: Option<StartupCapacityTracking>,
     startup_error: Option<BackendError>,
 }
 
 impl Env<'_> {
+    fn accounted_gb(&self, models: &HashMap<String, ModelSlot>) -> f64 {
+        models
+            .values()
+            .filter(|slot| occupies_budget(slot.state))
+            .map(|slot| slot.memory_gb)
+            .sum::<f64>()
+            + self.effective_reserved_gb(models)
+    }
+
+    fn claim_runtime_capacity(&mut self, planned_gb: f64) -> Result<(), BackendError> {
+        let Some(tracking) = self.runtime_capacity.as_mut() else {
+            return Ok(());
+        };
+        let next_gb = tracking.claimed_gb.max(planned_gb);
+        if next_gb == tracking.claimed_gb {
+            return Ok(());
+        }
+        tracking.ledger.resize(
+            &tracking.allocation_key,
+            Some(tracking.claimed_gb),
+            Some(next_gb),
+        )?;
+        tracking.claimed_gb = next_gb;
+        Ok(())
+    }
+
+    fn settle_runtime_capacity(
+        &mut self,
+        models: &HashMap<String, ModelSlot>,
+    ) -> Result<(), BackendError> {
+        let accounted_gb = self.accounted_gb(models);
+        let has_unconfirmed_load = models.values().any(|slot| slot.load_unconfirmed);
+        let Some(tracking) = self.runtime_capacity.as_mut() else {
+            return Ok(());
+        };
+        if (accounted_gb - tracking.claimed_gb).abs() <= CAPACITY_EPSILON_GB {
+            return Ok(());
+        }
+        if accounted_gb > tracking.claimed_gb {
+            tracking.ledger.adopt_observed(
+                &tracking.allocation_key,
+                Some(tracking.claimed_gb),
+                accounted_gb,
+            )?;
+            tracking.claimed_gb = accounted_gb;
+            if has_unconfirmed_load {
+                return Ok(());
+            }
+            return Err(BackendError::invariant_violation(
+                "runtime capacity exceeded its admitted global claim",
+            ));
+        } else if !has_unconfirmed_load {
+            tracking.ledger.resize(
+                &tracking.allocation_key,
+                Some(tracking.claimed_gb),
+                Some(accounted_gb),
+            )?;
+        } else {
+            return Ok(());
+        }
+        tracking.claimed_gb = accounted_gb;
+        Ok(())
+    }
+
     // Keep the raw total so unknown residency can be recovered after a
     // covered slot is later removed. Credits are frozen at snapshot time;
     // they must never grow with a later request estimate.
@@ -1174,7 +1241,7 @@ fn handle_load(
     reply: LoadReply,
     models: &mut HashMap<String, ModelSlot>,
     active_op: &mut Option<ActiveOp>,
-    env: &Env<'_>,
+    env: &mut Env<'_>,
 ) {
     // Decided before the mutex, same as the already-Ready/already-Stopped
     // checks elsewhere: a malformed request is the caller's mistake
@@ -1267,6 +1334,18 @@ fn handle_load(
             return;
         }
     };
+    let evicted: std::collections::HashSet<&str> = evict.iter().map(String::as_str).collect();
+    let planned_gb = reservation
+        + request_charge
+        + models
+            .iter()
+            .filter(|(model_id, slot)| {
+                model_id.as_str() != id
+                    && !evicted.contains(model_id.as_str())
+                    && occupies_budget(slot.state)
+            })
+            .map(|(_, slot)| slot.memory_gb)
+            .sum::<f64>();
     // Claim the durable fence before changing any ledger or operation state.
     // A rejected claim is a pure admission failure: chosen victims remain
     // untouched and no active operation is installed.
@@ -1283,6 +1362,14 @@ fn handle_load(
             return;
         }
     };
+    if let Err(err) = env.claim_runtime_capacity(planned_gb) {
+        let err = match load_fence.clear() {
+            Ok(()) => err,
+            Err(clear_err) => clear_err,
+        };
+        let _ = reply.send(Err(err));
+        return;
+    }
     for victim in &evict {
         set_state_or_panic(models, victim, ModelState::Stopping);
     }
@@ -1494,11 +1581,20 @@ async fn run_actor(
         .as_ref()
         .map(|status| status.used_gb)
         .unwrap_or_default();
-    let startup_capacity_error = match (&startup_capacity, &startup) {
-        (Some(tracking), Ok(status)) => tracking
-            .ledger
-            .adopt_observed(&tracking.allocation_key, None, status.used_gb)
-            .err(),
+    let mut startup_capacity = startup_capacity;
+    let startup_capacity_error = match (&mut startup_capacity, &startup) {
+        (Some(tracking), Ok(status)) => {
+            match tracking
+                .ledger
+                .adopt_observed(&tracking.allocation_key, None, status.used_gb)
+            {
+                Ok(()) => {
+                    tracking.claimed_gb = status.used_gb;
+                    None
+                }
+                Err(err) => Some(err),
+            }
+        }
         _ => None,
     };
     if let Ok(status) = &startup {
@@ -1530,6 +1626,7 @@ async fn run_actor(
         load_fence: load_fence.as_ref(),
         reserved_gb: initial_reserved_gb,
         aggregate_covered: HashMap::new(),
+        runtime_capacity: startup_capacity,
         startup_error: load_fence_error
             .or(startup_capacity_error)
             .or_else(|| startup.err()),
@@ -1698,7 +1795,7 @@ async fn run_actor(
                     reply,
                     &mut models,
                     &mut active_op,
-                    &env,
+                    &mut env,
                 );
             }
 
@@ -1862,6 +1959,11 @@ async fn run_actor(
                 let waiters = take_waiters(&mut active_op);
                 if waiters.is_none() && violation.is_none() {
                     violation = Some(format!("OpDone for {id:?} with no active op"));
+                }
+                if violation.is_none()
+                    && let Err(err) = env.settle_runtime_capacity(&models)
+                {
+                    violation = Some(format!("global capacity reconciliation failed: {err}"));
                 }
                 match (violation, waiters) {
                     (Some(msg), Some(waiters)) => {
@@ -4263,6 +4365,39 @@ mod tests {
             assert!(handle.load("b", 4.0, on_demand_policy()).await.is_err());
             assert_eq!(adapter.inner.load_call_count("b"), 0);
         }
+    }
+
+    #[test]
+    fn real_capacity_excess_beyond_epsilon_still_fails_closed() {
+        let adapter: Arc<dyn RuntimeAdapter> = Arc::new(MockAdapter::new(catalog()));
+        let config = SupervisorConfig::default();
+        let (tx, _rx) = mpsc::channel(1);
+        let weak = tx.downgrade();
+        let ledger = Arc::new(GlobalCapacityLedger::new(8.0).unwrap());
+        ledger.adopt_observed("runtime:test", None, 1.0).unwrap();
+        let mut env = Env {
+            adapter: &adapter,
+            config: &config,
+            self_tx: &weak,
+            load_fence: None,
+            reserved_gb: 1.0 + CAPACITY_EPSILON_GB * 2.0,
+            aggregate_covered: HashMap::new(),
+            runtime_capacity: Some(StartupCapacityTracking {
+                ledger: ledger.clone(),
+                allocation_key: "runtime:test".into(),
+                claimed_gb: 1.0,
+            }),
+            startup_error: None,
+        };
+
+        let error = env
+            .settle_runtime_capacity(&HashMap::new())
+            .expect_err("real excess beyond epsilon must remain an invariant failure");
+        assert_eq!(error.reason_code(), "state_invariant_violated");
+        assert_eq!(
+            ledger.snapshot().unwrap().allocations["runtime:test"],
+            1.0 + CAPACITY_EPSILON_GB * 2.0
+        );
     }
 
     /// M1: the actor task itself must exit once every `SupervisorHandle` is
