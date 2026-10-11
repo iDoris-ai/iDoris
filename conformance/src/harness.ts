@@ -142,6 +142,8 @@ function withoutIdorisEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
 
 export interface SpawnOptions {
   componentsDir: string;
+  /** Explicit server-side key binding for a Rust tenant fixture. */
+  rustTenantId?: string;
   /**
    * 不传 = 走被测 CLI 自己的缺省值。TS 参考实现（`packages/router/src/serve.ts`，
    * M1）缺省会解析成仓库自带的 `config/routing-policy.yaml`，**不再是**"未配置
@@ -222,7 +224,8 @@ export async function spawnConformanceServer(opts: SpawnOptions): Promise<Runnin
     // carry an IDORIS_DB_PATH for the TS reference, but it must never defeat
     // Rust conformance key isolation or keep a prior server's key active.
     rustDbPath = join(rustStateDir, "state.sqlite3");
-    const seeded = spawnSync(seeder, [rustDbPath], { encoding: "utf8" });
+    const seedArgs = opts.rustTenantId === undefined ? [rustDbPath] : [rustDbPath, opts.rustTenantId];
+    const seeded = spawnSync(seeder, seedArgs, { encoding: "utf8" });
     if (seeded.error !== undefined || seeded.status !== 0) {
       rmSync(rustStateDir, { recursive: true, force: true });
       throw new Error(
