@@ -125,6 +125,11 @@ Every rule/decoder/stage was mutation-checked by hand (removing it turns its tes
 
 7. **Gate two beyond the pure core (M5-30):** where the broker runs (separate-UID LaunchAgent per docs/15 §2.2), the keychain/Secure Enclave store, the grant configuration format, the `POST /v1/broker/http` wire contract, and the HMAC audit fingerprint key.
 
+8. **Pre-existing B6 Event Log gaps (chat too, found by the fifth review; not changed tonight because they are B6 semantics under review):**
+   - a connection failure after `dispatched` (execution `NotExecuted`) leaves the chain ending at `dispatched` with no `completed`;
+   - if `completed` fails to append after a successful upstream answer, the client gets 503 but the response is already in the idempotency cache, so a retry with the same `X-iDoris-Request-Id` replays 200 and that chain never gets `completed`;
+   - `request.received` is written before authentication, and in tenant mode the tenant comes from the request header; virtual keys are not bound to a tenant, so an unauthenticated or wrong-tenant caller can add `request.received` rows under another tenant id.
+
 ## Known CI note
 
 `test/m5-budget-concurrency` CI run 38137840647 failed in `subscription (macos-latest)` → "Subscription Unix safety + shared conformance" (exit 101). The branch only adds one router test file; the same commit's 20 subscription test groups pass locally on this Mac, and every branch stacked on it is green. The same step failed the same way once more on `feat/inspect-15-decided-tightening-reason` (run 38140879392, job 114474328065, exit 101), while its child `feat/inspect-16-homoglyph-folding` — which contains the identical change — passed on macOS. `bash scripts/check-subscription.sh` on that exact commit passes in full on this Mac (20 Rust groups + shared conformance 134 passed / 8 todo). Two occurrences of one intermittent macOS-runner-only panic in the subscription safety tests: worth a look at the job log once `gh` works (logs need auth), then re-run; do not add code for it blindly.
