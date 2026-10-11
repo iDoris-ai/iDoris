@@ -122,21 +122,33 @@ Core product invariants:
   require a ledger. Pre-send cancellation releases; armed cancellation retains.
   All gates pass, and #478 release conformance is 134/8. One POST charges 2201
   once and returns 200 to waiter/cache with no leftover reservation.
-- Active lane: worktree `wt-budget-safety-01`, branch
-  `feat/budget-safety-03-completion-reservation` (the old directory name is
-  retained). The 4096-cap regression fails before the fix, now passes as 402
-  with zero POST/debit/reservation; an 8-cap passes unchanged. An ignored-cap
-  mutation fails by assertion. Full gates are currently running before PR.
-  It quotes max(1024, explicit max_tokens) for resident HTTP candidates;
-  other backends, missing/invalid caps and prompt estimates keep legacy rules.
-  This does not establish an arbitrary-provider physical billing guarantee.
+- #479 `f8e7728` (188 changed lines) completes the explicit max_tokens
+  resident-HTTP quote fix, with #477/#478 underneath. Final feature-enabled
+  serial Rust suite passes (router **504/504**), strict clippy/fmt, cargo deny,
+  every pnpm gate, and release Rust conformance **134 passed / 8 todo**.
+  The 4096-cap/3000-budget case is 402 with zero POST/debit/reservation;
+  ignoring the cap fails an assertion. Small caps preserve their payload.
+- This closes the explicit cap case; other backends, missing/invalid caps and
+  prompt estimates retain legacy assumptions. No claim of arbitrary-provider
+  physical billing protection. REDACT consent and public Admin writes stay
+  pending, as do the other owner decisions described in the original handoff.
+- Remote CI: draft #476's complete push/PR checks, including both macOS jobs,
+  are now SUCCESS. #478's Rust/macOS jobs were still running at the last poll.
+  APPROVED search is empty; sampled M4 #361/#374/#416 are authored by the
+  current jhfnetboy account, so do not self-approve or switch identities.
+- All new code is committed and pushed. Latest validated stack head is #479;
+  #476 remains the historical combined integration snapshot, not a branch to
+  merge its descendants into (that would collapse the dependent PR diffs).
+- Resume: inspect #479/other fresh CI and incoming independent reviews; follow
+  the repository merge gates. Continue decision-free safety review/validation
+  from the first genuinely unresolved item, without reopening fixed cases.
 
 - Active worktrees live beside the main checkout under `/Users/jason/Dev/iDoris/`.
   Cargo targets must be isolated when building differing worktree revisions;
   a shared target reused stale workspace libraries during the first tenant
   build. `target-identity-night` was cleaned after validation. Current buffered
-  work uses `target-identity32-night` for budget-safety-02; budget-safety-03
-  currently uses the separate `target-version-night`; release conformance uses
+  validated budget-safety-02 uses `target-identity32-night`; budget-safety-03
+  uses the separate `target-version-night`; release conformance uses
   `target-inspect22-release`. Clean workspace packages before switching source
   revisions while retaining dependency cache. Durable validation logs now live
   in `night-evidence-2026-10-12/` beside the checkout; `/tmp` was cleared.
