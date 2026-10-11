@@ -67,7 +67,7 @@ async fn streaming_non_2xx_records_completed_failure() {
 }
 
 #[tokio::test]
-async fn streaming_connect_failure_does_not_record_completed() {
+async fn streaming_connect_failure_completes_the_recorded_attempt() {
     let event_log = memory_event_log();
     let app = build_app(AppState {
         cards: vec![super::tests::resident_component_card(
@@ -85,5 +85,9 @@ async fn streaming_connect_failure_does_not_record_completed() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
-    assert_eq!(completed_count(&events(&event_log, &response)), 0);
+    let chain = events(&event_log, &response);
+    assert_eq!(completed_count(&chain), 1);
+    assert!(chain.iter().any(|e| e.event.event_type == EventType::Dispatched));
+    assert_eq!(chain.last().unwrap().event.event_type, EventType::Completed);
+    assert_eq!(chain.last().unwrap().event.metadata["status"], "failure");
 }
