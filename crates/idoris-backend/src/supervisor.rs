@@ -1595,6 +1595,18 @@ async fn run_actor(
                 Err(err) => Some(err),
             }
         }
+        (Some(tracking), Err(_)) => {
+            match tracking
+                .ledger
+                .block_growth_for_unknown_residency(&tracking.allocation_key, None)
+            {
+                Ok(claimed_gb) => {
+                    tracking.claimed_gb = claimed_gb;
+                    None
+                }
+                Err(err) => Some(err),
+            }
+        }
         _ => None,
     };
     if let Ok(status) = &startup {
