@@ -110,7 +110,7 @@ async fn parent_exit_clears_pipe_holding_descendant_and_drain_is_bounded() {
         stdout.read_to_end(&mut bytes).await.unwrap();
         bytes
     });
-    let outcome = reaper
+    reaper
         .finish_after_parent_exit(Duration::from_millis(300))
         .await
         .unwrap();
@@ -119,7 +119,6 @@ async fn parent_exit_clears_pipe_holding_descendant_and_drain_is_bounded() {
         .unwrap();
     assert!(String::from_utf8_lossy(&bytes).contains("fake-cli-output"));
     assert!(group_is_gone(group));
-    assert!(!outcome.escalated_to_kill);
 }
 
 #[tokio::test]

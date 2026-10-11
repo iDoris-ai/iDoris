@@ -62,6 +62,7 @@ run pnpm --filter @idoris/router... build
 # resolves its default policy/catalog beside the executable, matching release
 # layout rather than repository cwd.
 run cargo build --release --locked -p idoris-router
+run cargo build --release --locked -p idoris-tenancy --bin conformance_key_seed --features test-bins
 bin="${CARGO_TARGET_DIR:-$root/target}/release/idoris"
 test -x "$bin"
 mkdir -p "$(dirname "$bin")/config"
@@ -71,6 +72,7 @@ export IDORIS_CONFORMANCE_ARGV
 IDORIS_CONFORMANCE_ARGV="$(node -e 'process.stdout.write(JSON.stringify([process.argv[1], "serve"]))' "$bin")"
 unset IDORIS_CONFORMANCE_CMD
 export IDORIS_CONFORMANCE_IMPLEMENTATION=rust
+export IDORIS_CONFORMANCE_KEY_SEEDER="${CARGO_TARGET_DIR:-$root/target}/release/conformance_key_seed"
 export IDORIS_CONFORMANCE_POST_RETRY=0
 run pnpm --filter @idoris/conformance test:conformance -- \
   tests/subscription-fixture.test.ts tests/subscription.test.ts

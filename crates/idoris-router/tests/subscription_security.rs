@@ -65,6 +65,16 @@ fn assert_production_gate_never_spawns(env: &[(&str, &str)]) {
         .local_addr()
         .unwrap()
         .port();
+    let admin_port = loop {
+        let candidate = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        if candidate != port {
+            break candidate;
+        }
+    };
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let mut command = Command::new(env!("CARGO_BIN_EXE_idoris"));
     for (key, _) in std::env::vars_os() {
@@ -81,6 +91,7 @@ fn assert_production_gate_never_spawns(env: &[(&str, &str)]) {
             root.join("config/routing-policy.yaml"),
         )
         .env("IDORIS_PORT", port.to_string())
+        .env("IDORIS_ADMIN_PORT", admin_port.to_string())
         .env(
             "PATH",
             format!("{}:{}", bin.display(), existing_path.to_string_lossy()),

@@ -9,6 +9,9 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use idoris_contracts::adapter_manifest::AdapterManifest;
+use idoris_contracts::admin_v0::{
+    AdminBackend, AdminModelsResponse, AdminRole, AdminRuntimesResponse, AdminStatusResponse,
+};
 use idoris_contracts::component_card::ComponentCard;
 use idoris_contracts::deploy_mode::DEPLOY_MODE_VALUES;
 use idoris_contracts::load_policy::LoadPolicy;
@@ -66,6 +69,89 @@ fn assert_shape<T: SchemaShape>() {
 }
 
 #[test]
+fn admin_v0_backends_item_shape_matches_schema() {
+    let schema = load_schema("admin-v0-backends.schema.json");
+    assert_eq!(schema["type"], "array");
+    let items = &schema["items"];
+    let actual_properties = keys_of(items, "properties");
+    let expected_properties: BTreeSet<String> =
+        ["provider_id", "locality", "form", "lifecycle_runtime_bound"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+    assert_eq!(actual_properties, expected_properties);
+    assert_eq!(keys_of(items, "required"), expected_properties);
+    let _type_anchor: Option<AdminBackend> = None;
+}
+
+#[test]
+fn admin_v0_roles_item_shape_matches_schema() {
+    let schema = load_schema("admin-v0-roles.schema.json");
+    assert_eq!(schema["type"], "array");
+    let items = &schema["items"];
+    let expected: BTreeSet<String> = ["role", "aliases", "catalog_role"]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(keys_of(items, "properties"), expected);
+    assert_eq!(keys_of(items, "required"), expected);
+    let _type_anchor: Option<AdminRole> = None;
+}
+
+#[test]
+fn admin_v0_runtimes_shape_matches_schema() {
+    assert_shape::<AdminRuntimesResponse>();
+    let schema = load_schema("admin-v0-runtimes.schema.json");
+    let variants = schema["properties"]["runtimes"]["items"]["oneOf"]
+        .as_array()
+        .expect("admin runtime entries must be a oneOf");
+    assert_eq!(variants.len(), 2);
+    let observed: BTreeSet<String> = [
+        "provider_id",
+        "state",
+        "pressure",
+        "used_gb",
+        "model_memory_max_gb",
+        "loaded",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect();
+    assert_eq!(keys_of(&variants[0], "properties"), observed);
+    assert_eq!(keys_of(&variants[0], "required"), observed);
+    let error: BTreeSet<String> = ["provider_id", "state"]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(keys_of(&variants[1], "properties"), error);
+    assert_eq!(keys_of(&variants[1], "required"), error);
+}
+
+#[test]
+fn admin_v0_models_shape_matches_schema() {
+    assert_shape::<AdminModelsResponse>();
+    let schema = load_schema("admin-v0-models.schema.json");
+    let variants = schema["properties"]["sources"]["items"]["oneOf"]
+        .as_array()
+        .expect("admin model sources must be a oneOf");
+    assert_eq!(variants.len(), 3);
+
+    let base: BTreeSet<String> = ["models", "provider_id", "source", "state"]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(keys_of(&variants[0], "properties"), base);
+    assert_eq!(keys_of(&variants[0], "required"), base);
+    assert_eq!(keys_of(&variants[1], "properties"), base);
+    assert_eq!(keys_of(&variants[1], "required"), base);
+
+    let mut error = base;
+    error.insert("error".into());
+    assert_eq!(keys_of(&variants[2], "properties"), error);
+    assert_eq!(keys_of(&variants[2], "required"), error);
+}
+
+#[test]
 fn provider_shape_matches_schema() {
     assert_shape::<ProviderDescriptor>();
 }
@@ -103,6 +189,35 @@ fn task_profile_shape_matches_schema() {
 #[test]
 fn routing_policy_shape_matches_schema() {
     assert_shape::<RoutingPolicy>();
+}
+
+#[test]
+fn admin_v0_status_shape_matches_schema() {
+    assert_shape::<AdminStatusResponse>();
+    let schema = load_schema("admin-v0-status.schema.json");
+    let capacity = &schema["properties"]["capacity"]["oneOf"][0];
+    assert_eq!(
+        keys_of(capacity, "required"),
+        ["entries".to_string(), "state".to_string()]
+            .into_iter()
+            .collect()
+    );
+    let entry = &capacity["properties"]["entries"]["items"];
+    assert_eq!(
+        keys_of(entry, "properties"),
+        [
+            "admission_status",
+            "capability",
+            "ctx_limit",
+            "estimated_memory_gb",
+            "id",
+            "queue_depth",
+            "resident",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+    );
 }
 
 #[test]

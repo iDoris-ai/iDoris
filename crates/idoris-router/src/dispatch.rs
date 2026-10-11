@@ -15,7 +15,7 @@ use idoris_contracts::load_policy::{Admission, Keepalive, LoadMode, LoadPolicy};
 use idoris_contracts::provider::Locality;
 use idoris_policy::{
     AdmissionStatus, Card, Decision, PolicyCtx, ROLES, ReasonCode, Rejection, RequestProfile,
-    decide, effective_served_locality,
+    decide_with_affinity, effective_served_locality,
 };
 use idoris_tenancy::budget::{BudgetError, BudgetLedger, ReservationId};
 use tokio_util::sync::CancellationToken;
@@ -215,6 +215,15 @@ pub fn select(
     profile: &ParsedProfile,
     prompt: &str,
 ) -> Result<Selected, DispatchError> {
+    select_with_affinity(cards, profile, prompt, None)
+}
+
+pub fn select_with_affinity(
+    cards: &[ComponentCard],
+    profile: &ParsedProfile,
+    prompt: &str,
+    affinity_key: Option<&str>,
+) -> Result<Selected, DispatchError> {
     let candidates: Vec<Card> = cards.iter().map(|c| candidate(c, prompt)).collect();
     let request_profile = RequestProfile {
         task: profile.task.clone(),
@@ -226,7 +235,8 @@ pub fn select(
         min_ram_gb: None,
         budget: None,
     };
-    let decision = decide(&request_profile, &candidates, &ctx).map_err(DispatchError::Rejection)?;
+    let decision = decide_with_affinity(&request_profile, &candidates, &ctx, affinity_key)
+        .map_err(DispatchError::Rejection)?;
     let Some(chosen) = candidates.iter().find(|c| c.id() == decision.chosen_id) else {
         return Err(DispatchError::Internal(format!(
             "decide() returned chosen_id {:?} absent from its own candidate list",
@@ -274,6 +284,7 @@ pub(crate) struct ReservationGuard<'a> {
     ledger: Option<&'a BudgetLedger>,
     tenant_id: Option<&'a str>,
     id: Option<ReservationId>,
+    release_on_drop: bool,
 }
 
 impl<'a> ReservationGuard<'a> {
@@ -299,6 +310,7 @@ impl<'a> ReservationGuard<'a> {
             ledger,
             tenant_id,
             id,
+            release_on_drop: true,
         })
     }
 
@@ -306,11 +318,50 @@ impl<'a> ReservationGuard<'a> {
     fn take(&mut self) -> Option<ReservationId> {
         self.id.take()
     }
+
+    /// Settles a completed request using the ledger's replay-safe path.
+    /// `None` means this guard never held a real reservation.
+    pub(crate) fn settle_replayable(
+        &mut self,
+        actual_cost_minor: i64,
+    ) -> Result<Option<i64>, BudgetError> {
+        match (self.ledger, self.take()) {
+            (Some(ledger), Some(id)) => {
+                budget::settle_replayable(ledger, self.tenant_id, &id, actual_cost_minor).map(Some)
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Disarms Drop without releasing the reservation. Use only when an
+    /// upstream call completed but its actual cost cannot be established;
+    /// retaining the reservation until its TTL expires is safer than
+    /// silently declaring the paid call free.
+    pub(crate) fn retain_until_expiry(&mut self) {
+        let _ = self.take();
+    }
+
+    /// Once a paid POST may have crossed the process boundary, dropping the
+    /// caller future must not turn an uncertain execution into a free call.
+    pub(crate) fn retain_on_drop(&mut self) {
+        self.release_on_drop = false;
+    }
+
+    /// Releases only when upstream execution is proven not to have happened
+    /// (or this caller only observed a replay).
+    pub(crate) fn release_now(&mut self) -> Result<(), BudgetError> {
+        match (self.ledger, self.take()) {
+            (Some(ledger), Some(id)) => budget::release(ledger, self.tenant_id, &id),
+            _ => Ok(()),
+        }
+    }
 }
 
 impl Drop for ReservationGuard<'_> {
     fn drop(&mut self) {
-        if let (Some(ledger), Some(id)) = (self.ledger, self.id.take()) {
+        if self.release_on_drop
+            && let (Some(ledger), Some(id)) = (self.ledger, self.id.take())
+        {
             let _ = budget::release(ledger, self.tenant_id, &id);
         }
     }
@@ -335,6 +386,7 @@ impl Drop for CancelOnDrop {
 pub struct DispatchInput<'a> {
     pub requested_model: Option<&'a str>,
     pub prompt: &'a str,
+    pub affinity_key: Option<&'a str>,
 }
 
 impl<'a> DispatchInput<'a> {
@@ -342,6 +394,7 @@ impl<'a> DispatchInput<'a> {
         Self {
             requested_model: None,
             prompt,
+            affinity_key: None,
         }
     }
 
@@ -349,7 +402,13 @@ impl<'a> DispatchInput<'a> {
         Self {
             requested_model,
             prompt,
+            affinity_key: None,
         }
+    }
+
+    pub fn with_affinity(mut self, affinity_key: Option<&'a str>) -> Self {
+        self.affinity_key = affinity_key;
+        self
     }
 }
 
@@ -498,12 +557,11 @@ async fn dispatch_local_inner(
     let tenant_id = profile.tenant_id.as_deref();
     let prompt = input.prompt;
     let requested_model = input.requested_model;
-
     let selected_owned;
     let selected = match selection {
         LocalSelection::Preselected(selected) => selected,
         LocalSelection::Cards(cards) => {
-            selected_owned = select(cards, profile, prompt)?;
+            selected_owned = select_with_affinity(cards, profile, prompt, input.affinity_key)?;
             &selected_owned
         }
     };
@@ -638,6 +696,30 @@ async fn dispatch_local_inner(
         )
         .await;
 
+    // A successful upstream execution must be charged before any fallible
+    // completion event append can return early and drop the reservation.
+    let actual_cost_minor = if let Ok(response) = &chat_result {
+        // Settling is best-effort (see `ChatOutcome::actual_cost_minor`'s
+        // doc): a successful chat response is never withheld just
+        // because the ledger write afterward had a problem.
+        match (budget_ledger, reservation_guard.take()) {
+            (Some(ledger), Some(id)) => {
+                let actual = budget::estimate_actual_cost_minor(
+                    &cost,
+                    prompt,
+                    &response.content,
+                    estimated_cost_minor,
+                );
+                budget::settle(ledger, tenant_id, &id, actual)
+                    .ok()
+                    .filter(|_| is_paid)
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
+
     if let Some(context) = completed_event {
         let append = match &chat_result {
             Ok(response) => {
@@ -657,6 +739,17 @@ async fn dispatch_local_inner(
         }
     }
 
+    // Keep the settled event after Completed while charging before the
+    // fallible Completed append. A failed settled-event append cannot refund.
+    if let Some(settled_minor) = actual_cost_minor
+        && let Some(context) = budget_settled_event
+        && crate::append_budget_settled(context, selected, settled_minor)
+            .await
+            .is_err()
+    {
+        eprintln!("idoris: budget.settled event write failed after committed settlement");
+    }
+
     match chat_result {
         Err(err) => Ok(ChatOutcome {
             decision,
@@ -664,41 +757,12 @@ async fn dispatch_local_inner(
             result: Err(DispatchFailure::Backend(err)),
             actual_cost_minor: None,
         }),
-        Ok(response) => {
-            // Settling is best-effort (see `ChatOutcome::actual_cost_minor`'s
-            // doc): a successful chat response is never withheld just
-            // because the ledger write afterward had a problem.
-            let actual_cost_minor = match (budget_ledger, reservation_guard.take()) {
-                (Some(ledger), Some(id)) => {
-                    let actual = budget::estimate_actual_cost_minor(
-                        &cost,
-                        prompt,
-                        &response.content,
-                        estimated_cost_minor,
-                    );
-                    match budget::settle(ledger, tenant_id, &id, actual) {
-                        Ok(settled_minor) if is_paid => {
-                            if let Some(context) = budget_settled_event
-                                && crate::append_budget_settled(context, selected, settled_minor)
-                                    .await
-                                    .is_err()
-                            {
-                                return Err(ObservedDispatchError::EventLogUnavailable);
-                            }
-                            Some(settled_minor)
-                        }
-                        Ok(_) | Err(_) => None,
-                    }
-                }
-                _ => None,
-            };
-            Ok(ChatOutcome {
-                decision,
-                served_locality,
-                result: Ok(response),
-                actual_cost_minor,
-            })
-        }
+        Ok(response) => Ok(ChatOutcome {
+            decision,
+            served_locality,
+            result: Ok(response),
+            actual_cost_minor,
+        }),
     }
 }
 

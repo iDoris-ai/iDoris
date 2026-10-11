@@ -59,7 +59,7 @@ mod tests {
             has_nvidia_gpu: false,
         });
         assert_eq!(recommendation.kind, BackendKind::LlamaCpp);
-        assert!(!recommendation.implemented);
+        assert!(recommendation.implemented);
         let adapter = create_adapter(&card("omlx", &server.uri())).expect("adapter constructs");
         assert_eq!(server.received_requests().await.unwrap().len(), 0);
         let models = adapter.list().await.expect("upstream list succeeds");
