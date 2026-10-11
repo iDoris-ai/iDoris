@@ -517,6 +517,55 @@ fn credential_file_paths() {
     }
 }
 
+#[test]
+fn full_width_and_dash_variants_are_folded_before_scanning() {
+    let cases = [
+        ("１３８１２３４５６７８", FindingKind::CnMobile),
+        ("138－1234－5678", FindingKind::CnMobile),
+        ("138–1234—5678", FindingKind::CnMobile),
+        (
+            "6222\u{3000}0212\u{3000}3456\u{3000}7894",
+            FindingKind::BankCard,
+        ),
+        (
+            "１１０１０５１９４９１２３１００２Ｘ",
+            FindingKind::CnResidentId,
+        ),
+        (
+            "ａｌｉｃｅ＠ｅｘａｍｐｌｅ．ｃｏｍ",
+            FindingKind::EmailAddress,
+        ),
+    ];
+    for (evasive, kind) in cases {
+        let input = format!("看这里：{evasive}。");
+        let response = inspect(&input, &open_ctx());
+        let hit = response.findings.iter().find(|f| f.kind == kind);
+        // The span points at the caller's original text, not the folded copy.
+        assert_eq!(
+            hit.map(|f| covered(&input, f)),
+            Some(evasive.to_string()),
+            "{input}: {response:?}"
+        );
+    }
+}
+
+#[test]
+fn zero_width_characters_inside_an_entity_do_not_hide_it() {
+    let input = "身份证 1101051949\u{200B}1231\u{2060}002X 和 sk\u{200D}-proj-FwFvrdcwEcSaT3WQwn8QMH2iE6bao4pjmx5ZTDNsbiqASwXU";
+    let response = inspect(input, &open_ctx());
+    let id = response
+        .findings
+        .iter()
+        .find(|f| f.kind == FindingKind::CnResidentId)
+        .unwrap();
+    assert_eq!(covered(input, id), "1101051949\u{200B}1231\u{2060}002X");
+    assert!(
+        kinds(&response).contains(&FindingKind::ApiKey),
+        "{response:?}"
+    );
+    assert_eq!(response.sensitivity, Sensitivity::S3);
+}
+
 fn valid_id() -> impl Strategy<Value = String> {
     (0usize..34, 1950u32..2030, 1u32..13, 1u32..29, 0u32..1000).prop_map(
         |(province, year, month, day, seq)| {
@@ -536,6 +585,24 @@ fn valid_id() -> impl Strategy<Value = String> {
 }
 
 proptest! {
+    #[test]
+    fn zero_width_noise_never_hides_a_valid_id(
+        id in valid_id(),
+        noise in proptest::collection::vec((0usize..18, prop_oneof![Just('\u{200B}'), Just('\u{200D}'), Just('\u{FEFF}')]), 0..6),
+    ) {
+        let mut chars: Vec<char> = id.chars().collect();
+        for (at, zw) in noise.iter().rev() {
+            chars.insert((*at).min(chars.len()), *zw);
+        }
+        let noisy: String = chars.into_iter().collect();
+        let response = inspect(&noisy, &open_ctx());
+        let found = response.findings.iter().any(|f| {
+            f.kind == FindingKind::CnResidentId
+                && covered(&noisy, f).chars().filter(|c| c.is_ascii_alphanumeric()).collect::<String>() == id
+        });
+        prop_assert!(found, "{:?} {:?}", noisy, response);
+    }
+
     #[test]
     fn any_input_yields_a_valid_in_bounds_response(input in any::<String>()) {
         let response = inspect(&input, &open_ctx());

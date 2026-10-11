@@ -10,10 +10,12 @@
 //! - L0 只会让结果更严：本模块不读调用方的 header，只接收已解析的
 //!   [`InspectCtx`]，由接线层负责把它传进来（接线不在本切片内）。
 //!
-//! 扫描直接跑在 UTF-16 code unit 上，所以命中位置天然就是契约要求的 span
-//! 单位（`idoris_contracts::inspect` 模块文档），不需要二次换算。
+//! 扫描跑在 UTF-16 code unit 上，命中位置就是契约要求的 span 单位
+//! （`idoris_contracts::inspect` 模块文档）；扫描前的逃逸归一化只删字符、
+//! 不增字符，命中再按 `normalize` 的映射表回到原文坐标。
 
 mod l0;
+mod normalize;
 mod secrets;
 #[cfg(test)]
 mod tests;
@@ -74,7 +76,11 @@ pub fn inspect(input: &str, ctx: &InspectCtx) -> InspectResponse {
         };
     }
     let units: Vec<u16> = input.encode_utf16().collect();
-    let hits = l0::scan(&units);
+    let normalized = normalize::normalize(&units);
+    let mut hits = l0::scan(&normalized.units);
+    for hit in &mut hits {
+        (hit.start, hit.length) = normalized.original_span(hit.start, hit.length);
+    }
     let sensitivity = hits
         .iter()
         .map(|hit| hit.sensitivity)
