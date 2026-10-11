@@ -51,6 +51,7 @@ So nothing was merged and nothing was approved. Every branch below is pushed and
 | 28 | `docs/m5-gate-one-runtime` | `fix/inspect-17-window-segment-floor` @ `22b5096b` | fix(policy): stop joining short digit runs into one entity |
 | 29 | `fix/inspect-17-window-segment-floor` | `fix/inspect-18-second-review` @ `50caf46a` | fix(inspect): address second review of the M5 hardening |
 | 30 | `fix/inspect-18-second-review` | `fix/inspect-19-third-review` @ `aced94db` | fix(inspect): judge digit groups whole or fully decomposed |
+| 31 | `fix/inspect-19-third-review` | `fix/inspect-20-grouping-recall` @ `7c6cee42` | fix(inspect): recover grouped entities next to short numbers |
 
 Rules for landing (same as PRIME-CHECKPOINT "Safe stacked merge procedure"): merge parent first; before a parent branch is deleted, retarget its child to `main`; no rebase, no force-push; never treat a stale approval as current.
 
@@ -82,7 +83,7 @@ The #421 M5 plan (contract freeze → pure L0 → rule packs → endpoint → IN
 | M5-13..19 | three-grain breaker state machine (B-8 params); provider breaker on buffered and streaming proxy sends; chat and protocol selection steer away from open providers; Supervisor single-model lockout; subscription relay → OAuth breaker |
 | review fixes | first review: six fail-open paths closed (unreadable content → `local_only`, grouped numbers, invisible separators, encodings); breaker made opt-in after CI caught a conformance break |
 | M5-21..23 | large bodies scanned off the async worker (`inspect_failed` fail-closed); decided reasons carry `privacy_tightened_by_content`; all BMP digit scripts + Latin homoglyphs folded |
-| review fixes 2/3 | false-positive explosion from tab/newline joining removed; digit groups judged as runs, whole group, or full decomposition into entities; `\uXXXX` and math digits folded in place; report-only breakers re-lock after the window |
+| review fixes 2–4 | false-positive explosion from tab/newline joining removed; digit groups judged as runs, whole group, or full decomposition into entities; `\uXXXX` and math digits folded in place; report-only breakers re-lock after the window |
 
 M5 acceptance shape is tested: an id/phone/card injected anywhere in a declared-`any` body (plain content, array parts, tool arguments, JSON numbers, Anthropic `system`, embeddings input, rerank documents) yields zero upstream requests on a non-local card; kill switch stops the next request; 100-way budget race never overspends.
 
@@ -117,7 +118,11 @@ A second review of everything after the first one found that the first-review ha
 
 ## Third independent review
 
-A narrow third review of the second fix measured a recall regression (one canonical grouping per entity missed `138-12345678`, `110101 1949 1231 0023`, …) and still-high false positives (22% of random 8-number rows). `fix/inspect-19-third-review` settles the digit-group rule: each run alone, the whole group in any grouping (original M5-02 behaviour), and several entities only when the whole group decomposes into neighbouring entity windows. Measured on 5000 random rows each: 8×4-digit rows 0.36% flagged, 20-number rows 0%. **Owner trade-off:** an entity glued to an unrelated number in one group (`Room 1203 138 1234 5678`) is not found; ids split across lines/parts are not found. Rust conformance passes on the stack top (134 passed / 8 todo).
+A narrow third review of the second fix measured a recall regression (one canonical grouping per entity missed `138-12345678`, `110101 1949 1231 0023`, …) and still-high false positives (22% of random 8-number rows). `fix/inspect-19-third-review` changed the digit-group rule to: each run alone, the whole group in any grouping (original M5-02 behaviour), and several entities only when the whole group decomposes into neighbouring entity windows. Measured on 5000 random rows each: 8×4-digit rows 0.36% flagged, 20-number rows 0%. (superseded by the fourth-review fix below).
+
+## Fourth independent review — final digit-group rule
+
+A fourth review found the third fix's DP correct and linear but measured a recall regression (card + expiry/CVV in one group, a phone after a time, two phones + a digit — all missed) and 1.8% false positives on rows of small integers. `fix/inspect-20-grouping-recall` (stack top) settles it: multi-run windows must be a real written form (mobile 3-4-4 / 3-8 / 7-4 / 4-3-4 + 86 variants; id 6-8-4 / 6-12 / 6-4-4-4; card 4-4-4-4[-1..3] / 6-13), and a group is one decomposition into such entities with at most two ≤ 3-digit numbers at each end. Measured on 5000 random rows each: small-integer rows 0%, 5–6 four-digit numbers 0%, 8 four-digit numbers 0.26%; remaining false positives are groups written exactly like a phone (3-4-4) or card (4-4-4-4 + issuer prefix + Luhn), as since M5-02. **Owner trade-offs:** 4-digit neighbours (`Room 1203 138 1234 5678`, an id followed by a year) and ids split across lines/parts are not found; allowing 4-digit neighbours flagged ~10% of 5-number rows.
 
 ## CI caught a real regression tonight
 
