@@ -2603,9 +2603,10 @@ fn subscription_fault<T>(
 /// Whether a Supervisor outcome counts for or against the chosen model's
 /// breaker: model faults count, success resets, and anything that says
 /// nothing about the model (missing model config, a model still loading,
-/// capacity, a concurrent unload (`ModelUnavailable` while stopping),
-/// another model's failed eviction, cancellation, contention, budget, our
-/// own invariants) is ignored.
+/// capacity, another model's failed eviction, cancellation, contention,
+/// budget, our own invariants) is ignored. `ModelUnavailable` counts: it
+/// also follows an unconfirmed load and a failed ready check, which are
+/// model faults; a concurrent unload costs one short lockout at most.
 fn local_model_fault(
     result: &Result<idoris_backend::ChatResponse, dispatch::DispatchFailure>,
 ) -> Option<bool> {
@@ -2613,7 +2614,8 @@ fn local_model_fault(
     match result {
         Ok(_) => Some(false),
         Err(dispatch::DispatchFailure::Backend(
-            E::Oom { .. }
+            E::ModelUnavailable { .. }
+            | E::Oom { .. }
             | E::ProbeTimedOut { .. }
             | E::AdapterTimedOut { .. }
             | E::AdapterPanicked { .. }

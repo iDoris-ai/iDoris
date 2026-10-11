@@ -636,13 +636,12 @@ fn review_regressions_grouped_split_and_invisible_variants() {
     // F4 (ids split across lines or parts) is deliberately not covered:
     // joining on line breaks flagged most numeric tables (second review)
     // and cannot reach across JSON parts anyway.
-    let cases: [(&str, &[FindingKind]); 9] = [
+    let cases: [(&str, &[FindingKind]); 8] = [
         // F3: neighbouring grouped numbers
         (
             "张三 110101 19900307 7379 138 1234 5678",
             &[FindingKind::CnResidentId, FindingKind::CnMobile],
         ),
-        ("Room 1203 138 1234 5678", &[FindingKind::CnMobile]),
         // F5: invisible separators and other digit scripts
         ("138\u{00A0}1234\u{00A0}5678", &[FindingKind::CnMobile]),
         ("138\u{200E}1234\u{200E}5678", &[FindingKind::CnMobile]),
@@ -755,6 +754,36 @@ fn escapes_and_math_digits_are_folded_in_place() {
     let bold = "𝟏𝟑𝟖𝟏𝟐𝟑𝟒𝟓𝟔𝟕𝟖";
     let response = inspect(bold, &open_ctx());
     assert_eq!(covered(bold, &response.findings[0]), bold);
+}
+
+#[test]
+fn third_review_groupings_and_numeric_rows() {
+    // Any written grouping of one number is still that number.
+    for (input, kind) in [
+        ("138-12345678", FindingKind::CnMobile),
+        ("138 12345678", FindingKind::CnMobile),
+        ("1381234 5678", FindingKind::CnMobile),
+        ("1381 234 5678", FindingKind::CnMobile),
+        ("110101 1949 1231 0023", FindingKind::CnResidentId),
+        ("110101 194912310023", FindingKind::CnResidentId),
+        (
+            "\\uD835\\uDFCF\\uD835\\uDFD1\\uD835\\uDFD6\\uD835\\uDFCF\\uD835\\uDFD0\\uD835\\uDFD1\\uD835\\uDFD2\\uD835\\uDFD3\\uD835\\uDFD4\\uD835\\uDFD5\\uD835\\uDFD6",
+            FindingKind::CnMobile,
+        ),
+    ] {
+        assert!(
+            kinds(&inspect(input, &open_ctx())).contains(&kind),
+            "{input}"
+        );
+    }
+    // Rows of numbers do not decompose into entities.
+    for input in [
+        "[4439 2537 8993 1464 7386 8090 1034 8297]",
+        "[3412 5590 6012 4471 9032 1188 2765 4410 3307 6621 5129 8840 1203 4456 7781 3302 1509 6654 4421 3398]",
+    ] {
+        let response = inspect(input, &open_ctx());
+        assert!(response.findings.is_empty(), "{input}: {response:?}");
+    }
 }
 
 fn valid_id() -> impl Strategy<Value = String> {

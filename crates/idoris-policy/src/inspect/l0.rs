@@ -25,9 +25,6 @@ const ID_CHECK: &[u8; 11] = b"10X98765432";
 /// 紧跟的 `X`/`x`（只对 17 位数字有意义：身份证校验位）。
 struct Candidate<'a> {
     digits: &'a [u8],
-    /// Lengths of the digit runs this candidate spans; one run means an
-    /// unbroken number, several mean a written grouping.
-    runs: &'a [usize],
     start: usize,
     end: usize,
     x_suffix: bool,
@@ -66,33 +63,72 @@ pub(super) fn scan_plain(units: &[u16]) -> Vec<Hit> {
                 k += 1;
             }
         }
-        // Every run of neighbouring segments that can still be one entity:
-        // the whole group, each segment alone, and everything in between, so
-        // `110101 19900307 7379 138 1234 5678` yields both the id and the
-        // phone. A multi-run window only counts in a real written grouping
-        // (see `classify`). Bounded by the longest entity, so linear.
-        let lengths: Vec<usize> = segments.iter().map(|&(s, e)| e - s).collect();
-        for a in 0..segments.len() {
-            let mut digits = Vec::new();
-            for (b, &(seg_start, seg_end)) in segments.iter().enumerate().skip(a) {
-                digits.extend(
-                    units[seg_start..seg_end]
-                        .iter()
-                        .map(|&u| (u - u16::from(b'0')) as u8),
-                );
-                if digits.len() > MAX_ENTITY_DIGITS {
-                    break;
+        // Each run alone and the whole group, however it is grouped (3-8,
+        // 6-4-4-4, … are all real ways to write these numbers). Beyond that,
+        // a group counts as several entities only when it splits completely
+        // into neighbouring windows that each are one: `110101 19900307 7379
+        // 138 1234 5678` yields the id and the phone, while a row of random
+        // numbers almost never decomposes (judging every window flagged most
+        // numeric tables as cards — second and third review).
+        let n = segments.len();
+        let mut prefix = vec![0usize; n + 1];
+        for (k, &(seg_start, seg_end)) in segments.iter().enumerate() {
+            prefix[k + 1] = prefix[k] + (seg_end - seg_start);
+        }
+        let window = |a: usize, b: usize| -> Vec<Hit> {
+            let mut found = Vec::new();
+            if prefix[b + 1] - prefix[a] > MAX_ENTITY_DIGITS {
+                return found;
+            }
+            let digits: Vec<u8> = segments[a..=b]
+                .iter()
+                .flat_map(|&(seg_start, seg_end)| units[seg_start..seg_end].iter())
+                .map(|&u| (u - u16::from(b'0')) as u8)
+                .collect();
+            classify(
+                &Candidate {
+                    digits: &digits,
+                    start: segments[a].0,
+                    end: segments[b].1,
+                    x_suffix: x_suffix && b + 1 == n,
+                },
+                &mut found,
+            );
+            found
+        };
+        for a in 0..n {
+            hits.extend(window(a, a));
+        }
+        if n > 1 {
+            hits.extend(window(0, n - 1));
+            // decomposes[a]: the runs from `a` on split into entity windows;
+            // first_window[a]: the shortest such window starting at `a`.
+            let mut decomposes = vec![false; n + 1];
+            decomposes[n] = true;
+            let mut first_window: Vec<Option<(usize, Vec<Hit>)>> = (0..n).map(|_| None).collect();
+            for a in (0..n).rev() {
+                for b in a..n {
+                    if prefix[b + 1] - prefix[a] > MAX_ENTITY_DIGITS {
+                        break;
+                    }
+                    if !decomposes[b + 1] {
+                        continue;
+                    }
+                    let found = window(a, b);
+                    if !found.is_empty() {
+                        decomposes[a] = true;
+                        first_window[a] = Some((b, found));
+                        break;
+                    }
                 }
-                classify(
-                    &Candidate {
-                        digits: &digits,
-                        runs: &lengths[a..=b],
-                        start: segments[a].0,
-                        end: seg_end,
-                        x_suffix: x_suffix && b + 1 == segments.len(),
-                    },
-                    &mut hits,
-                );
+            }
+            let mut a = 0;
+            while decomposes[0] && a < n {
+                let Some((b, found)) = first_window[a].take() else {
+                    break;
+                };
+                hits.extend(found);
+                a = b + 1;
             }
         }
         i = group_end;
@@ -153,38 +189,32 @@ fn classify(c: &Candidate<'_>, hits: &mut Vec<Hit>) {
         });
     };
     let d = c.digits;
-    let grouped = c.runs.len() > 1;
-    let grouped_as = |pattern: &[usize]| !grouped || c.runs == pattern;
-    if d.len() == 17 && c.x_suffix && grouped_as(&[6, 8, 3]) && id_structure(d) {
+    if d.len() == 17 && c.x_suffix && id_structure(d) {
         push(
             FindingKind::CnResidentId,
             c.end + 1,
             id_sensitivity(d, b'X'),
         );
     }
-    if d.len() == 18 && grouped_as(&[6, 8, 4]) && id_structure(&d[..17]) {
+    if d.len() == 18 && id_structure(&d[..17]) {
         push(
             FindingKind::CnResidentId,
             c.end,
             id_sensitivity(&d[..17], b'0' + d[17]),
         );
     }
-    if d.len() == 15 && grouped_as(&[6, 6, 3]) && legacy_id_structure(d) {
+    if d.len() == 15 && legacy_id_structure(d) {
         push(FindingKind::CnResidentId, c.end, Sensitivity::S2);
     }
     let mobile = match d.len() {
-        11 => grouped_as(&[3, 4, 4]) && is_mobile(d),
-        13 => grouped_as(&[2, 3, 4, 4]) && d[..2] == [8, 6] && is_mobile(&d[2..]),
+        11 => is_mobile(d),
+        13 => d[..2] == [8, 6] && is_mobile(&d[2..]),
         _ => false,
     };
     if mobile {
         push(FindingKind::CnMobile, c.end, Sensitivity::S2);
     }
-    if (16..=19).contains(&d.len())
-        && (!grouped || card_grouping(c.runs))
-        && card_iin(d)
-        && luhn_valid(d)
-    {
+    if (16..=19).contains(&d.len()) && card_iin(d) && luhn_valid(d) {
         push(FindingKind::BankCard, c.end, Sensitivity::S3);
     }
 }
@@ -221,13 +251,6 @@ fn id_sensitivity(first17: &[u8], check: u8) -> Sensitivity {
 /// MIIT 11 位手机号 `1[3-9]\d{9}`。
 fn is_mobile(d: &[u8]) -> bool {
     d.len() == 11 && d[0] == 1 && (3..=9).contains(&d[1])
-}
-
-/// Cards are written in fours, with a short final run for 17-19 digits.
-fn card_grouping(runs: &[usize]) -> bool {
-    runs.split_last().is_some_and(|(last, rest)| {
-        rest.len() >= 3 && rest.iter().all(|&r| r == 4) && (1..=4).contains(last)
-    })
 }
 
 /// Issuer ranges that exist (ISO/IEC 7812 major industry 3–6, Mastercard
