@@ -258,6 +258,7 @@ async fn paid_proxy_records_budget_reservation_before_dispatch() {
             EventType::Decided,
             EventType::BudgetReserved,
             EventType::Dispatched,
+            EventType::Completed,
         ]
     );
     assert_eq!(budget_event_count(&events), 1);

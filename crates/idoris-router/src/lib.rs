@@ -2201,7 +2201,10 @@ async fn chat_completions(
                 &parsed,
                 &value,
                 &record_id,
-                dispatched_event_context.as_ref(),
+                ProxyEventContexts {
+                    dispatched: dispatched_event_context.as_ref(),
+                    completed: completed_event_context.as_ref(),
+                },
                 budget_event_context.as_ref(),
             )
             .await;
@@ -2327,6 +2330,12 @@ async fn chat_completions(
 /// body + its own `content-type`) — **never** re-wrapped into
 /// [`openai_chat_completion`]'s shape, matching `proxy.ts`'s own behavior:
 /// a transparent proxy, not a backend `RuntimeAdapter` call.
+#[derive(Clone, Copy)]
+struct ProxyEventContexts<'a> {
+    dispatched: Option<&'a DispatchedEventContext>,
+    completed: Option<&'a CompletedEventContext>,
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn chat_via_proxy(
     state: &AppState,
@@ -2335,7 +2344,7 @@ async fn chat_via_proxy(
     parsed: &ParsedProfile,
     body_value: &serde_json::Value,
     record_id: &str,
-    dispatched_event: Option<&DispatchedEventContext>,
+    events: ProxyEventContexts<'_>,
     budget_event_context: Option<&BudgetReservedEventContext>,
 ) -> Response {
     let mut reservation = match dispatch::ReservationGuard::reserve(
@@ -2377,7 +2386,7 @@ async fn chat_via_proxy(
         return event_log_unavailable_response();
     }
     if stream_requested {
-        return chat_via_proxy_stream(state, selected, body_value, dispatched_event).await;
+        return chat_via_proxy_stream(state, selected, body_value, events.dispatched).await;
     }
     chat_via_proxy_buffered(
         state,
@@ -2386,7 +2395,7 @@ async fn chat_via_proxy(
         parsed,
         body_value,
         record_id,
-        dispatched_event,
+        events,
         &mut reservation,
     )
     .await
@@ -2480,7 +2489,7 @@ async fn chat_via_proxy_buffered(
     parsed: &ParsedProfile,
     body_value: &serde_json::Value,
     record_id: &str,
-    dispatched_event: Option<&DispatchedEventContext>,
+    events: ProxyEventContexts<'_>,
     reservation: &mut dispatch::ReservationGuard<'_>,
 ) -> Response {
     let is_paid = budget::is_paid(Some(selected.estimated_cost_minor));
@@ -2543,7 +2552,7 @@ async fn chat_via_proxy_buffered(
                     }
                 },
                 || async {
-                    if let Some(context) = dispatched_event {
+                    if let Some(context) = events.dispatched {
                         append_dispatched(context, selected).await?;
                     }
                     Ok::<(), ()>(())
@@ -2554,7 +2563,7 @@ async fn chat_via_proxy_buffered(
         state
             .proxy
             .forward_buffered_observed(&selected.card.endpoint, body_value, &opts, || async {
-                if let Some(context) = dispatched_event {
+                if let Some(context) = events.dispatched {
                     append_dispatched(context, selected).await?;
                 }
                 Ok::<(), ()>(())
@@ -2592,6 +2601,29 @@ async fn chat_via_proxy_buffered(
     }
 
     let status = StatusCode::from_u16(outcome.status).unwrap_or(StatusCode::BAD_GATEWAY);
+    if !outcome.cached
+        && outcome.execution != proxy::ExecutionDisposition::NotExecuted
+        && outcome.execution != proxy::ExecutionDisposition::Replay
+        && let Some(context) = events.completed
+    {
+        let event_status = if status.is_success() {
+            "success"
+        } else {
+            "failure"
+        };
+        if append_completed(context, selected, event_status)
+            .await
+            .is_err()
+        {
+            if is_paid && paid_settlement.is_some() {
+                eprintln!(
+                    "idoris: completed event write failed after committed paid proxy settlement"
+                );
+            } else {
+                return event_log_unavailable_response();
+            }
+        }
+    }
     let mut response = (status, outcome.body).into_response();
     let content_type = outcome
         .content_type
@@ -2956,6 +2988,9 @@ mod completed_wiring_tests;
 
 #[cfg(test)]
 mod budget_settled_wiring_tests;
+
+#[cfg(test)]
+mod proxy_completed_wiring_tests;
 
 #[cfg(test)]
 mod request_event_query_tests;
