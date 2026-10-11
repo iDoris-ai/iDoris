@@ -486,10 +486,12 @@ async fn remote_bind_auth_middleware(
         return next.run(request).await;
     }
     let Some(authenticator) = &state.virtual_key_authenticator else {
-        return if state.remote_bind_requires_auth {
+        return if state.remote_bind_requires_auth
+            || state.deploy_mode == idoris_contracts::DeployMode::Tenant
+        {
             virtual_key_unauthorized_response()
         } else {
-            // Library callers may intentionally omit the production
+            // Personal library callers may intentionally omit the production
             // authenticator; production startup always installs one.
             next.run(request).await
         };
@@ -3316,9 +3318,7 @@ async fn record_id_middleware(
     req.extensions_mut()
         .insert(RequestRecordId(record_id.clone()));
     let mut response = next.run(req).await;
-    if state.deploy_mode == idoris_contracts::DeployMode::Tenant
-        && state.virtual_key_authenticator.is_some()
-    {
+    if state.deploy_mode == idoris_contracts::DeployMode::Tenant {
         audit_tenant = response
             .extensions()
             .get::<TrustedTenant>()
@@ -3612,6 +3612,12 @@ fn audit_reason(status: StatusCode, served_locality: bool, degraded: bool) -> St
 
 #[cfg(test)]
 mod inspect_wiring_tests;
+
+#[cfg(test)]
+mod tenant_test_support;
+
+#[cfg(test)]
+use tenant_test_support::tenant_test_app;
 
 #[cfg(test)]
 mod inspected_wiring_tests;
@@ -4477,7 +4483,7 @@ mod tests {
             deploy_mode: idoris_contracts::DeployMode::Tenant,
             ..AppState::default()
         };
-        let app = build_app(state);
+        let app = tenant_test_app(state, "acme");
         let response = app.oneshot(post_chat("{}", &[])).await.unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
