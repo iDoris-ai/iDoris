@@ -5808,3 +5808,6 @@ mod tests {
 
 #[cfg(test)]
 mod subscription_breaker_flow_tests;
+
+#[cfg(test)]
+mod budget_completion_reservation_tests;
