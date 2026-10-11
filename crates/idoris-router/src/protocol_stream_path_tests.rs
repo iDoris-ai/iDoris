@@ -32,6 +32,7 @@ async fn generalized_stream_transport_preserves_messages_path_and_payload() {
             &server.uri(),
             proxy::StreamingUpstreamPath::MESSAGES,
             &payload,
+            "messages-provider",
         )
         .await;
     let proxy::StreamOutcome::Stream {
