@@ -105,18 +105,38 @@ Core product invariants:
 - #474 additionally reproduces and fixes a paid pre-send error retaining 2051
   budget units despite zero POSTs. With/without request ID and retries, restored
   balances remain unchanged; cancellation/uncertain execution still retain.
-- Active lane: `wt-resilience-08`, branch `feat/resilience-08-subscription-flow`,
-  adds an HTTP → authorized runtime → actual repository CLI fixture process
-  regression. Three fixture failures open OAuth breaker; fourth spawn stops.
-  Targeted test passes; mutation and full gates are in progress. This does
-  not validate the real vendor CLI or resolve owner decision #6.
+- #475 `9a715db` (127 lines) adds the HTTP → authorized runtime → repository
+  CLI fixture flow. Three real fixture failures open OAuth breaker; fourth
+  spawn stops. Removing handler feedback fails an assertion. Full local gates
+  pass (router 499/499). Real vendor CLI validation remains owner decision #6.
+- Draft #476 `7fea357` combines that stack with ordinary merges of #464 and
+  #466. The exact combined head passes every B gate and release Rust conformance
+  (134/8), at synchronized wire version **1.1.0**. Main and v0.3.0 tag refs
+  were checked again: main remains 792ed904; the tag does not exist.
+- Additional budget regressions are real: max_tokens=4096 under a 3000-unit
+  limit still reached the paid upstream because completion quote was fixed at
+  1024; a same-ID paid waiter returned 402 from a duplicate full reservation.
+- #477 `8a76839` (257 lines, cfg(test) coordinator) → #478 `f48f92f`
+  (243-line production wiring) moves priced reservation to the singleflight
+  leader. Cache/replay/waiters use zero-cost SpendGate; paid candidates still
+  require a ledger. Pre-send cancellation releases; armed cancellation retains.
+  All gates pass, and #478 release conformance is 134/8. One POST charges 2201
+  once and returns 200 to waiter/cache with no leftover reservation.
+- Active lane: worktree `wt-budget-safety-01`, branch
+  `feat/budget-safety-03-completion-reservation` (the old directory name is
+  retained). The 4096-cap regression fails before the fix, now passes as 402
+  with zero POST/debit/reservation; an 8-cap passes unchanged. An ignored-cap
+  mutation fails by assertion. Full gates are currently running before PR.
+  It quotes max(1024, explicit max_tokens) for resident HTTP candidates;
+  other backends, missing/invalid caps and prompt estimates keep legacy rules.
+  This does not establish an arbitrary-provider physical billing guarantee.
 
 - Active worktrees live beside the main checkout under `/Users/jason/Dev/iDoris/`.
   Cargo targets must be isolated when building differing worktree revisions;
   a shared target reused stale workspace libraries during the first tenant
   build. `target-identity-night` was cleaned after validation. Current buffered
-  work uses `target-identity32-night`; paid-release checks use the separate
-  `target-version-night`; release conformance uses
+  work uses `target-identity32-night` for budget-safety-02; budget-safety-03
+  currently uses the separate `target-version-night`; release conformance uses
   `target-inspect22-release`. Clean workspace packages before switching source
   revisions while retaining dependency cache. Durable validation logs now live
   in `night-evidence-2026-10-12/` beside the checkout; `/tmp` was cleared.

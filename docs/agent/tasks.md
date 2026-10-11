@@ -475,4 +475,8 @@
 
 | FU-211 | 2026-10-12 paid pre-send error | dispatched 写入失败、上游 0 POST 时预留仍残留 2051；#474 修正确定未发送错误的释放，与无 ID/同 ID 重试的账本零增量回归，本地全门禁及 release conformance 通过 | PR_OPEN |
 
-| FU-212 | M5 OAuth breaker fixture | HTTP → 已授权 sandbox runtime → 仓库 CLI fixture 的真实子进程故障反馈；3 次失败后第 4 次不再 spawn。真实厂商 CLI 验证仍属原决策 #6，未宣称完成 | IN_PROGRESS |
+| FU-212 | M5 OAuth breaker fixture | #475；HTTP → 已授权 runtime → fixture 进程：3 次失败后第 4 次不再 spawn；撤反馈负控失败，完整门禁通过。真实厂商 CLI 仍属原决策 #6 | PR_OPEN |
+
+| FU-213 | 2026-10-12 paid replay headroom | 已复现同 ID waiter 因重复完整预留收到 402；#477–#478 零成本 SpendGate + leader-only 预留，1 POST/1 扣费、waiter/cache 200，发送前取消释放/允许发送后保留，最终门禁与 release conformance 通过 | PR_OPEN |
+
+| FU-214 | 2026-10-12 declared max_tokens | 3000 预算 + max_tokens=4096 仍下发付费 POST；budget-safety-03 按较大显式上限提高 resident HTTP quote，保持 1024 下限及 payload；定向与撤修负控通过，完整门禁进行中 | IN_PROGRESS |

@@ -2,6 +2,11 @@
 
 ## 2026-10-12 凌晨
 
+- #475 补 HTTP → 授权 runtime → fixture 子进程的 OAuth 故障反馈回归，完整门禁通过。
+- Draft #476 整合安全修复、wire 1.1.0 和 macOS fixtures，同一 HEAD 完整门禁及 release conformance 134/8 通过。
+- #477–#478 修复 paid waiter/cache 的重复预留拒绝；leader 才预留付费金额，取消与结算规则有账本负控。
+- 新复现显式 max_tokens 未进入预留估算，独立小切片正在最终验证；默认/无上限和 prompt 估算仍是原有假设。
+
 - #469–#473 完成缓存发布前提交、protocol/free chat 接线和所有代理路径的连接失败终态；直接入口负控覆盖被早期路由拒绝掩盖的保护，最终完整门禁与 release conformance 134/8 通过。
 - #474 修复确定未发送的付费请求残留预算预留；已复现 2051 残留，修复后无 ID/同 ID 重试均为零扣费、零残留、零 POST。
 - 付费 chat 已结算后的成功响应规则保留；真实 CLI 验证和公开写接口继续待审。
