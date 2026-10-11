@@ -3303,6 +3303,9 @@ mod kill_switch_wiring_tests;
 mod budget_concurrency_wiring_tests;
 
 #[cfg(test)]
+mod breaker_wiring_tests;
+
+#[cfg(test)]
 mod local_privacy_tests;
 
 #[cfg(test)]
