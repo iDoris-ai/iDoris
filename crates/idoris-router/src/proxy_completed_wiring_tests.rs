@@ -359,13 +359,14 @@ async fn chat_preflight_terminal_paths_require_a_committed_dispatch() {
             correlation: correlation::RequestCorrelation::default(),
         };
         let contexts = ProxyEventContexts {
+            budget_reserved: None,
             dispatched: Some(&dispatch_context),
             completed: Some(&completed_context),
         };
         let response = if streaming {
             chat_via_proxy_stream(&state, &selected, &body, contexts).await
         } else {
-            let mut reservation = dispatch::ReservationGuard::reserve(
+            let reservation = proxy_budget::ProxyBudget::new(
                 state.budget_ledger.as_deref(),
                 None,
                 &selected.card.provider.id,
@@ -380,7 +381,7 @@ async fn chat_preflight_terminal_paths_require_a_committed_dispatch() {
                 &body,
                 "preflight",
                 contexts,
-                &mut reservation,
+                &reservation,
             )
             .await
         };
