@@ -178,6 +178,11 @@ impl<K: Eq + Hash + Clone> BreakerBook<K> {
         self.entry(key, class).admit(now_ms)
     }
 
+    /// Whether this key has ever been recorded.
+    pub fn contains(&self, key: &K) -> bool {
+        self.breakers.contains_key(key)
+    }
+
     /// Read-only; a key never seen is admitted.
     pub fn would_admit(&self, key: &K, now_ms: u64) -> bool {
         self.breakers

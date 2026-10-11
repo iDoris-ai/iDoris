@@ -175,7 +175,10 @@ pub(crate) fn inspect_body(
     let tightened = declared == PrivacyClass::Any && effective == PrivacyClass::LocalOnly;
     Inspection {
         killed: tightened && kill_switch,
-        uninspectable: tightened && opaque && !kill_switch && response.findings.is_empty(),
+        // With no finding and no kill switch, only unreadable content can
+        // have tightened `any` — detected here (parts, data URLs, token ids)
+        // or by the inspector itself (an embedded base64 payload).
+        uninspectable: tightened && !kill_switch && response.findings.is_empty(),
         failed: false,
         tightened,
         response,
