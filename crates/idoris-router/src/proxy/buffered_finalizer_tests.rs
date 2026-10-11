@@ -174,7 +174,7 @@ async fn cancellation_during_finalization_retains_the_executed_request_marker() 
     let replay = proxy
         .forward_buffered(&server.uri(), &body(), &options("retry"))
         .await;
-    assert_eq!(replay.status, 503);
+    assert_eq!(replay.status, 502);
     assert_eq!(replay.execution, ExecutionDisposition::Replay);
     assert_eq!(proxy.cache_size_for_test(), 0);
     server.verify().await;
