@@ -136,6 +136,64 @@ fn failed(mut child: Running, expected: &str) {
     }
 }
 
+#[test]
+fn non_loopback_without_an_active_key_refuses_before_bind() {
+    let (_root, cwd, exe, port) = fixture();
+    failed(
+        spawn(
+            &exe,
+            cwd.path(),
+            port,
+            &[("IDORIS_BIND_HOST", "100.64.0.5")],
+        ),
+        "非 loopback，但当前没有有效 virtual key；拒绝启动",
+    );
+}
+
+#[test]
+fn non_loopback_never_accepts_dev_no_key_even_when_a_key_exists() {
+    let (_root, cwd, exe, port) = fixture();
+    seed_portable_key(cwd.path());
+    failed(
+        spawn(
+            &exe,
+            cwd.path(),
+            port,
+            &[
+                ("IDORIS_BIND_HOST", "100.64.0.5"),
+                ("IDORIS_DEV_NO_KEY", "1"),
+            ],
+        ),
+        "IDORIS_DEV_NO_KEY=1 只允许 loopback",
+    );
+}
+
+#[test]
+fn tenant_mode_non_loopback_refuses_until_tenant_authority_is_cryptographic() {
+    let (_root, cwd, exe, port) = fixture();
+    seed_portable_key(cwd.path());
+    let tenants = cwd.path().join("tenants.yaml");
+    fs::write(
+        &tenants,
+        "tenants:\n  - tenant_id: acme\n    limit_minor: 100\n    billing_timezone: UTC\n    scope: all\n",
+    )
+    .unwrap();
+    let tenants = tenants.to_str().unwrap();
+    failed(
+        spawn(
+            &exe,
+            cwd.path(),
+            port,
+            &[
+                ("IDORIS_BIND_HOST", "100.64.0.5"),
+                ("IDORIS_DEPLOY_MODE", "tenant"),
+                ("IDORIS_TENANTS_CONFIG", tenants),
+            ],
+        ),
+        "tenant 模式在 M4 仍依赖可信消费方传入已验明的 X-iDoris-Tenant，因此只允许 loopback",
+    );
+}
+
 async fn wait_health(child: &mut Running, port: u16) {
     let client = reqwest::Client::builder().no_proxy().build().unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
