@@ -469,6 +469,10 @@
 
 | FU-208 | 2026-10-11 夜间接手 / tenant authority | virtual key 显式绑定 tenant；拒绝跨租户、unbound、匿名和缺 authenticator，request.received 在 scope 后，audit 仅取可信 tenant。#463 → #465 → #467 → #468；本地全门禁、3 项撤修负控通过；待独立批准和 landing | PR_OPEN |
 
-| FU-209 | 2026-10-11 第五次审查 / Event Log | completed 必须先于成功缓存与 flight replay 发布；失败不得重放 200 或重复 POST；dispatched 后的连接失败也要有终态。transport #469 已发布；protocol 接线和连接失败终态在验证。付费 chat 已结算响应规则保留待明确语义评审 | IN_PROGRESS |
+| FU-209 | 2026-10-11 第五次审查 / Event Log | completed 必须先于成功缓存与 flight replay 发布；失败不得重放 200 或重复 POST；dispatched 后的连接失败也要有终态。完整修复栈 #469–#473 已发布、全门禁通过；缓存失败/取消和未执行连接终态有撤修负控。付费 chat 已结算成功响应规则保留；待独立批准和 landing | PR_OPEN |
 
 | FU-210 | macOS CI 38137840647 / 38140879392 | fixture 后代回收与临时端口抢占分开修复；#466，相关套件各 30/30 重复通过，完整本地门禁通过，待 review/CI 和功能 release PR | PR_OPEN |
+
+| FU-211 | 2026-10-12 paid pre-send error | dispatched 写入失败、上游 0 POST 时预留仍残留 2051；#474 修正确定未发送错误的释放，与无 ID/同 ID 重试的账本零增量回归，本地全门禁及 release conformance 通过 | PR_OPEN |
+
+| FU-212 | M5 OAuth breaker fixture | HTTP → 已授权 sandbox runtime → 仓库 CLI fixture 的真实子进程故障反馈；3 次失败后第 4 次不再 spawn。真实厂商 CLI 验证仍属原决策 #6，未宣称完成 | IN_PROGRESS |

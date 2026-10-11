@@ -85,23 +85,38 @@ Core product invariants:
 - Remote checks are advancing: #374/#463/#467 have green Linux Rust/TS/
   subscription checks; macOS subscription remains queued on these runs.
   No current-head approval exists. Do not conflate queued with failed.
-- 2026-10-12 after midnight: #469 `7d328e7` (261 changed lines) adds the
-  asynchronous buffered finalizer before cache/singleflight publication.
-  Four regressions cover hook failure, waiters, no request ID and cancellation;
-  removing the check fails an assertion. Final feature-enabled serial Rust
-  tests/clippy/fmt, cargo deny and all pnpm gates passed (conformance 134/8).
-- Active Event Log worktrees: `wt-event-log-32` protocol finalization and
-  `wt-event-log-33` protocol attempt terminals. The protocol cache regression
-  reproduces a 200 when its completion hook is removed; restored test passes.
-  Full protocol gates and release conformance are in progress; neither slice
-  is yet published. Preserve the existing paid-chat committed-settlement
-  response rule until its Event Log failure semantics receive explicit review.
+- 2026-10-12 after midnight: buffered/Event Log repair is published as
+  #469 `7d328e7` transport finalizer → #470 `493ba53` protocol cache ordering →
+  #471 `21c545d` protocol attempt terminals → #472 `f330a05` free-chat ordering →
+  #473 `3f13aab` chat attempt terminals → #474 `5be697f` paid pre-send release.
+  Each PR is <=300 total changed lines. All final heads pass feature-enabled
+  serial Rust tests, strict clippy/fmt, cargo deny and all pnpm gates;
+  protocol/chat behavior slices also pass release Rust conformance (134/8).
+- Failed completion never publishes a free/protocol 200 cache/replay or a
+  duplicate same-key POST in the retention window. Pending-hook cancellation
+  retains the existing generic failure marker. Recorded connect attempts
+  terminate with completed/failure without changing execution classification.
+  Direct preflight tests cover guards that an HTTP selection refusal masked;
+  hand mutations fail by assertions. Older tests expecting unfinished stream
+  chains were revised explicitly, not deleted.
+- Preserve the existing paid-chat rule: committed settlement keeps its success
+  response when completion logging fails. Do not move that append ahead of
+  paid cache publication without reviewing charged-response cancellation.
+- #474 additionally reproduces and fixes a paid pre-send error retaining 2051
+  budget units despite zero POSTs. With/without request ID and retries, restored
+  balances remain unchanged; cancellation/uncertain execution still retain.
+- Active lane: `wt-resilience-08`, branch `feat/resilience-08-subscription-flow`,
+  adds an HTTP → authorized runtime → actual repository CLI fixture process
+  regression. Three fixture failures open OAuth breaker; fourth spawn stops.
+  Targeted test passes; mutation and full gates are in progress. This does
+  not validate the real vendor CLI or resolve owner decision #6.
 
 - Active worktrees live beside the main checkout under `/Users/jason/Dev/iDoris/`.
   Cargo targets must be isolated when building differing worktree revisions;
   a shared target reused stale workspace libraries during the first tenant
   build. `target-identity-night` was cleaned after validation. Current buffered
-  work uses `target-identity32-night`; release conformance uses
+  work uses `target-identity32-night`; paid-release checks use the separate
+  `target-version-night`; release conformance uses
   `target-inspect22-release`. Clean workspace packages before switching source
   revisions while retaining dependency cache. Durable validation logs now live
   in `night-evidence-2026-10-12/` beside the checkout; `/tmp` was cleared.
