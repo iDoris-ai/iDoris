@@ -41,6 +41,81 @@ Core product invariants:
 - Router/runtime/fallback/health/capacity designs should actively learn from mature open-source model routers/runtimes while preserving iDoris invariants.
 - Do not regress Rust safety improvements merely to mimic TS behavior; approved differences must be explicit and tested.
 
+## CI audit override — 2026-10-12 04:17 GMT+7 (read first)
+
+- Full live audit found **39 original queued PRs with failed CLA checks**:
+  #422 and #424–#461. CLA signatures in the configured
+  `AAStarCommunity/Brood` `cla-signatures` store do not include `clestons`.
+  The contributor must sign personally; do not sign on their behalf, change
+  contributor attribution or bypass this gate. A green newer descendant
+  does not make these older PR heads green.
+- Three older jobs also failed independently of CLA:
+  - #439 / run 38152050067: descendant process-group cleanup; #466 contains
+    the fixture repair, but the older head still has a failed check.
+  - #448 / run 38152082197: Unicode decimal neighbour generated as
+    "non-digit" context. The original regression seed reproduces locally.
+  - #452 / run 38152099270: inline temporary script test returns sanitized
+    SpawnFailed. The underlying errno is unavailable; ETXTBSY is a plausible
+    filesystem failure pattern, not a proven diagnosis of this run.
+- New #490 (`5f443d06f4f87801774b3820b1e24aefcd8f3799`, base #489)
+  repairs the property domain,
+  retains the original seed and deterministic Unicode boundaries, and moves
+  both inline spawn scripts into the stable fake CLI fixture (74 changed
+  lines). Inspect 38 tests / 4096 property cases, spawn 5 tests, full
+  feature-enabled serial Rust tests, strict fmt/clippy/deny and all six TS
+  gates pass; TS conformance 134/8. All nine remote checks are now green
+  (both push/PR Linux Rust/TS and Linux/macOS subscription; original failed
+  spawn tests pass on Linux). Independent review remains pending. Production
+  behavior is unchanged; older failed heads remain red.
+- Original failed-head repair candidates are now available without rewriting
+  any queued branch: #493 (`a461327`, base #439; 141 lines), #494 (`a9ee06b`,
+  base #448; 142 lines), #495 (`8cd157f`, base #452; 141 lines). Each normally
+  merges #466 and backports the #490 spawn/property repairs. Production code
+  remains identical to its respective parent. Regressions follow each stage's
+  implemented folds: fullwidth on #439, BMP scripts on #448, BMP/math on #452.
+  Full serial feature-enabled Rust/strict fmt-clippy-deny and all six TS gates
+  pass on each candidate; conformance 134/8. #493 has all nine remote checks
+  green; #494/#495 are running. Original heads remain blocked until reviewed
+  backports merge and those parent heads rerun CI; CLA signing still applies.
+- #491 head `3334732` and #492 head `57a5573` passed all nine remote checks.
+  Live M4 readiness audit found no merge-ready node: all lack independent
+  approval, #374 retains CHANGES_REQUESTED, and #424 has failed CLA. Main is
+  still 792ed904. #420 is already merged in main; #422 is the handoff docs PR,
+  not an outstanding authentication prerequisite. No PR bases were changed.
+- M5 pure C-3 follow-up #492 (`57a55735f982024c3c9984d74ec7f8f388b4a139`,
+  base #490; 165 lines) blocks this exchange's credential in one-layer
+  base64/base64url, hex and percent echoes, including short values and
+  non-UTF-8 binary wrappers. Two baseline bypasses reproduced. Policy 139,
+  full local Rust/TS gates and release conformance 134/8 pass; removing
+  encoded lookup, raw-byte matching or short-token support makes the
+  corresponding safety assertion fail; restored tests pass. L0 thresholds
+  retain their original semantics. Remote CI/review are pending; delivery,
+  streaming, arbitrary/nested encoding and storage/API wiring remain open.
+- Checkpoint #491 at `a4890ae` passed all nine remote checks after importing
+  #466. Further updates only change documentation; its code remains c8a3ced.
+- Latest M4 #488 (`ef957893cbc172250e77a71a271961b524f0e69b`) and M5 #489
+  (`c7cfe8cc9ef77b71da4ce7e4757b1cee17404244`) have all remote checks green.
+  Neither has independent current-head approval. Main remains `792ed904`;
+  no `v0.3.0` tag or release has been created.
+- M4 dry run 38174477955 succeeded with Release skipped. Its downloaded
+  archive SHA-256 is
+  `f05cf6c047fe085c34139b11fce2432198a46c08f692817d648134cdcb5c3fe2`;
+  checksum and isolated local smoke pass at version 0.3.0. Always run the
+  fixed smoke script from #487/#488; older M5/docs worktrees still contain
+  the unsafe script that inherits the caller's default data directory.
+- Next: obtain the contributor's CLA signature and independent approvals;
+  land the diagnosed repairs through normal reviewed merges, then rerun
+  affected current-head checks. Preserve child bases before deleting parent
+  branches. Real M4 acceptance on main remains required before tagging.
+- Checkpoint #491 macOS run 38175922043 reproduced the same pre-#466
+  process-group race. The candidate now includes #466 through an ordinary
+  merge; all non-document files match exact commit `c8a3ced`. This imports
+  69 test/fixture lines without changing production behavior. The merged
+  candidate passed full local Rust/TS gates (conformance 134/8). #466 remains
+  an explicit review dependency; await checks on the new #491 head.
+- The existing default-DB recovery question and the authorization request
+  for one review-request comment remain unanswered; do not infer answers.
+
 ## Live delta — 2026-10-11 Codex takeover (newest; read first)
 
 - Goal mode is active; work continues on workstation B. Live main remains
