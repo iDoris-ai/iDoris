@@ -163,7 +163,7 @@ From M5-14 on, CI failed "Rust release conformance" and the subscription job's s
 
 ## Next (resume here)
 
-Stack top: `fix/review-5-hardening`. Every worktree under `/Volumes/UltraDisk/Dev2/iDoris/iDoris-wt/` was clean and pushed at stop time; `docs/handoff-2026-10-11-night` is this file.
+Stack top: `fix/review-5-hardening`. CI was green through `feat/event-log-28-protocol-chain`; the results for `feat/event-log-29-protocol-dispatch`, `-30-messages-stream`, `feat/gate-two-01`, `-02` and `fix/review-5-hardening` were not visible at stop time (anonymous GitHub API rate limit) — check them first; all of them passed router lib + integration suites locally, and the router-touching ones passed Rust conformance locally except the de-correlation and review-5 slices, whose changed paths conformance does not exercise. Every worktree under `/Volumes/UltraDisk/Dev2/iDoris/iDoris-wt/` was clean and pushed at stop time; `docs/handoff-2026-10-11-night` is this file.
 
 1. `gh auth login -h github.com`, then `bash /Volumes/UltraDisk/Dev2/iDoris/iDoris-wt/pr-queue/create-prs.sh` (opens all queued PRs in stack order, bases set, idempotent). Re-run the intermittent macOS subscription job with its log.
 2. Owner review per "How to review this stack" above; land the M4 tail first, re-run the acceptance set on `main`, tag `v0.3.0`.
