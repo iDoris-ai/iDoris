@@ -459,11 +459,23 @@ async fn remote_bind_auth_middleware(
     mut request: Request,
     next: Next,
 ) -> Response {
-    if !state.remote_bind_requires_auth || request.uri().path() == "/health" {
+    if request.uri().path() == "/health" {
+        return next.run(request).await;
+    }
+    let has_bearer = request
+        .headers()
+        .contains_key(axum::http::header::AUTHORIZATION);
+    if state.dev_no_key_enabled && !state.remote_bind_requires_auth && !has_bearer {
         return next.run(request).await;
     }
     let Some(authenticator) = &state.virtual_key_authenticator else {
-        return virtual_key_unauthorized_response();
+        return if state.remote_bind_requires_auth {
+            virtual_key_unauthorized_response()
+        } else {
+            // Library callers may intentionally omit the production
+            // authenticator; production startup always installs one.
+            next.run(request).await
+        };
     };
     let identity = match authenticator.authenticate(request.headers()).await {
         Ok(identity) => identity,

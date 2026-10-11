@@ -454,7 +454,7 @@ async fn health_reports_dev_no_key_enabled_without_auth_material() {
 }
 
 #[tokio::test]
-async fn remote_bind_requires_bearer_on_every_data_route_except_health() {
+async fn data_plane_requires_bearer_by_default_on_loopback_and_remote() {
     let key = MintedVirtualKey::mint();
     let roles = idoris_policy::ROLES
         .iter()
@@ -468,9 +468,6 @@ async fn remote_bind_requires_bearer_on_every_data_route_except_health() {
             None,
         ),
     );
-    let mut remote = state("http://127.0.0.1:1", Some(authenticator));
-    remote.remote_bind_requires_auth = true;
-    let app = build_app(remote);
 
     let routes = [
         ("GET", "/v1/models"),
@@ -480,45 +477,83 @@ async fn remote_bind_requires_bearer_on_every_data_route_except_health() {
         ("GET", "/idoris/tenants/acme/requests/record-1"),
         ("GET", "/idoris/tenants/acme/budget"),
         ("POST", "/v1/chat/completions"),
+        ("POST", "/v1/feedback"),
         ("POST", "/v1/embeddings"),
         ("POST", "/v1/rerank"),
         ("POST", "/v1/messages"),
     ];
-    for (method, uri) in routes {
-        let response = app
-            .clone()
+    for remote_bind_requires_auth in [false, true] {
+        let mut protected = state("http://127.0.0.1:1", Some(authenticator.clone()));
+        protected.remote_bind_requires_auth = remote_bind_requires_auth;
+        let app = build_app(protected);
+        for (method, uri) in routes {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(uri)
+                        .header("content-type", "application/json")
+                        .body(Body::from("{}"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "remote={remote_bind_requires_auth} {method} {uri}"
+            );
+            assert_eq!(
+                json_body(response).await["error"]["reason_code"],
+                "VIRTUAL_KEY_UNAUTHORIZED",
+                "remote={remote_bind_requires_auth} {method} {uri}"
+            );
+        }
+
+        let health = app
             .oneshot(
                 Request::builder()
-                    .method(method)
-                    .uri(uri)
-                    .header("content-type", "application/json")
-                    .body(Body::from("{}"))
+                    .uri("/health")
+                    .body(Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
-        assert_eq!(
-            response.status(),
-            StatusCode::UNAUTHORIZED,
-            "{method} {uri}"
-        );
-        assert_eq!(
-            json_body(response).await["error"]["reason_code"],
-            "VIRTUAL_KEY_UNAUTHORIZED",
-            "{method} {uri}"
-        );
+        assert_eq!(health.status(), StatusCode::OK);
     }
+}
 
-    let health = app
+#[tokio::test]
+async fn explicit_loopback_dev_no_key_allows_missing_bearer_but_rejects_invalid_bearer() {
+    let key = MintedVirtualKey::mint();
+    let (authenticator, _store) =
+        memory_auth(&key, &scope(vec![PrivacyClass::LocalOnly], &["fast"], None));
+    let app = build_app(dev_state("http://127.0.0.1:1", authenticator));
+
+    let anonymous = app
+        .clone()
         .oneshot(
             Request::builder()
-                .uri("/health")
+                .uri("/v1/models")
                 .body(Body::empty())
                 .unwrap(),
         )
         .await
         .unwrap();
-    assert_eq!(health.status(), StatusCode::OK);
+    assert_ne!(anonymous.status(), StatusCode::UNAUTHORIZED);
+
+    let invalid = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/models")
+                .header("authorization", "Bearer malformed")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(invalid.status(), StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]
