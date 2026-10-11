@@ -540,6 +540,20 @@ async fn enforce_key_scope_with(
     Ok(())
 }
 
+/// Effective privacy for a protocol endpoint body after gate one
+/// ([`inspect::inspect_body`]). These endpoints keep no Event Log chain
+/// yet, so the verdict only tightens routing.
+fn protocol_inspected_privacy(
+    value: &serde_json::Value,
+    parsed: &profile::ParsedProfile,
+) -> PrivacyClass {
+    inspect::inspect_body(
+        value,
+        parsed.task.privacy.unwrap_or(PrivacyClass::LocalOnly),
+    )
+    .effective
+}
+
 async fn embeddings(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -583,6 +597,9 @@ async fn embeddings(
     {
         return response;
     }
+    // INSPECTED (M5-07): same gate as chat, after the key scope admitted
+    // the declared privacy and before the routing policy reads it.
+    parsed.task.privacy = Some(protocol_inspected_privacy(&value, &parsed));
 
     let cards = dispatch::policy_cards(&state.cards, &state.routing_policy, &parsed)
         .cards
@@ -726,6 +743,9 @@ async fn rerank(
     {
         return response;
     }
+    // INSPECTED (M5-07): same gate as chat, after the key scope admitted
+    // the declared privacy and before the routing policy reads it.
+    parsed.task.privacy = Some(protocol_inspected_privacy(&value, &parsed));
 
     let cards = dispatch::policy_cards(&state.cards, &state.routing_policy, &parsed)
         .cards
@@ -880,6 +900,9 @@ async fn messages(
     {
         return response;
     }
+    // INSPECTED (M5-07): same gate as chat, after the key scope admitted
+    // the declared privacy and before the routing policy reads it.
+    parsed.task.privacy = Some(protocol_inspected_privacy(&value, &parsed));
 
     let cards = dispatch::policy_cards(&state.cards, &state.routing_policy, &parsed)
         .cards
@@ -3260,6 +3283,9 @@ mod inspect_wiring_tests;
 
 #[cfg(test)]
 mod inspected_wiring_tests;
+
+#[cfg(test)]
+mod protocol_inspected_wiring_tests;
 
 #[cfg(test)]
 mod local_privacy_tests;
