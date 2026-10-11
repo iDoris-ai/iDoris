@@ -10,6 +10,7 @@
 //! 以及完整的决策管道 [`decide`]（这个 crate 按依赖顺序叠加的多个 PR
 //! landing，场景测试在下一个 PR 里加入）。
 
+pub mod breaker;
 pub mod budget;
 pub mod card;
 pub mod inspect;
