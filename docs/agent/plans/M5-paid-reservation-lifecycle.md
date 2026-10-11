@@ -9,6 +9,7 @@
 4. Settle a successful response once before successful cache publication;
    preserve the existing paid completion-log failure rule and charge receipt.
 
-The first slice builds and tests the coordinator under cfg(test). The next
-slice wires it into the router. Explicit completion-cap estimates follow after
-that, so a larger quote does not make an already-paid cache reply unaffordable.
+The coordinator is now wired into buffered proxy requests. The zero-cost
+admission preserves SpendGate policy; budget-reserved events describe only
+leader reservations. Explicit completion-cap estimates follow in their own
+slice, so a larger quote does not make an already-paid reply unaffordable.
