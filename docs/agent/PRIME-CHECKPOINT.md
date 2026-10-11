@@ -67,6 +67,21 @@ Core product invariants:
   (both push/PR Linux Rust/TS and Linux/macOS subscription; original failed
   spawn tests pass on Linux). Independent review remains pending. Production
   behavior is unchanged; older failed heads remain red.
+- Original failed-head repair candidates are now available without rewriting
+  any queued branch: #493 (`a461327`, base #439; 141 lines), #494 (`a9ee06b`,
+  base #448; 142 lines), #495 (`8cd157f`, base #452; 141 lines). Each normally
+  merges #466 and backports the #490 spawn/property repairs. Production code
+  remains identical to its respective parent. Regressions follow each stage's
+  implemented folds: fullwidth on #439, BMP scripts on #448, BMP/math on #452.
+  Full serial feature-enabled Rust/strict fmt-clippy-deny and all six TS gates
+  pass on each candidate; conformance 134/8. #493 has all nine remote checks
+  green; #494/#495 are running. Original heads remain blocked until reviewed
+  backports merge and those parent heads rerun CI; CLA signing still applies.
+- #491 head `3334732` and #492 head `57a5573` passed all nine remote checks.
+  Live M4 readiness audit found no merge-ready node: all lack independent
+  approval, #374 retains CHANGES_REQUESTED, and #424 has failed CLA. Main is
+  still 792ed904. #420 is already merged in main; #422 is the handoff docs PR,
+  not an outstanding authentication prerequisite. No PR bases were changed.
 - M5 pure C-3 follow-up #492 (`57a55735f982024c3c9984d74ec7f8f388b4a139`,
   base #490; 165 lines) blocks this exchange's credential in one-layer
   base64/base64url, hex and percent echoes, including short values and

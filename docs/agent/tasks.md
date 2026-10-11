@@ -504,3 +504,5 @@
 | FU-225 | Original queue CI audit / Unicode and spawn fixtures | #490，原 CI 随机种子确定复现属性前提错误；Unicode 数字边界回归、稳定 CLI 夹具，38 inspect（4096 轮）/5 spawn/全 Rust 与 TS 门禁通过；39 个原 PR 的 CLA 签署及独立批准仍阻塞 landing | PR_OPEN |
 
 | FU-226 | Gate-two known credential encoding | #492，一层 Base64/URL-safe/hex/percent 本次凭据回显检查（含短值/二进制包装）；两个 baseline 绕过与三项撤修负控、139 policy/完整 Rust 与 TS/release conformance 134/8，通过；纯核心，runtime/storage/API 仍待审 | PR_OPEN |
+
+| FU-227 | Original-head CI repair backports | #493/#494/#495，分别回移到 #439/#448/#452，141/142/141 行；三个 full Rust/TS 门禁通过（134/8）；按历史阶段覆盖数字折叠，生产代码保持父节点原样；待回移独立批准、父节点新 CI 和 CLA | PR_OPEN |
