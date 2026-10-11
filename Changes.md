@@ -2,6 +2,9 @@
 
 ## 2026-10-12 凌晨
 
+- #488/#489 修复 deployment mode 变化导致已绑定 tenant key 权限提升：已复现 personal mode 读取其他 tenant 事件 200；新 ceiling 阻断，正例/撤修负控/全部门禁通过，M4 router 443、M5 router 507，各 release conformance 134/8。
+- 发布干跑 38173125316 与最新 M4 exact-head 38174477955 均成功；前者下载 archive 校验与本机隔离 smoke 通过，Release job 均 skipped，未打 tag。
+
 - #487 准备 0.3.0 crate/lock 元数据和 tenant key 迁移说明；router 441/441、完整门禁、release Rust conformance 134/8、真实 archive smoke 0.3.0 全过，wire 仍为 1.0.1。
 - release smoke 修复测试用户目录隔离：损坏调用方 DB 的负控证明旧路径会触及持久库；初次本地 baseline 已用默认库，原预算配置无快照，已询问用户并停止后续写入，历史记录仍在。
 - 已启动 release workflow 干跑 38173125316（仅 build/test/package）；未打 tag 或创建 Release。

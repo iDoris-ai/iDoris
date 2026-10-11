@@ -495,6 +495,8 @@
 
 | FU-221 | M4 combined tenant acceptance | #486，正确租户链/四缓存撤销/角色拒绝无 request.received；晚 scope 负控失败，router 441/441 全门禁和 release Rust conformance 134/8 通过，main 验收未发生 | PR_OPEN |
 
-| FU-222 | M4 v0.3.0 release metadata | #487，7 crate/lock 升 0.3.0 + 绑定迁移说明，完整门禁/release conformance/真实 archive smoke 全过；干跑 38173125316 仍运行，main/tag 待批准 | PR_OPEN |
+| FU-222 | M4 v0.3.0 release metadata | #487，7 crate/lock 升 0.3.0 + 绑定迁移说明，完整门禁/release conformance/真实 archive smoke 全过；干跑 38173125316 已成功且下载产物通过校验/smoke，main/tag 待批准 | PR_OPEN |
 
 | FU-223 | Release smoke default-data isolation | #487 隔离 child home/data/state，损坏 caller DB sentinel 正控通过/撤修负控失败；初次旧脚本本地 baseline 已触及默认库，历史仍在、原预算配置未知，用户恢复问题待答 | PR_OPEN |
+
+| FU-224 | Bound key deployment-mode ceiling | #488 M4 / #489 M5，已复现 personal mode 下 tenant-a key 读取 tenant-b 事件；修复、合法 personal 正例与撤修负控，全门禁及各 release conformance 134/8 通过，待独立批准 | PR_OPEN |

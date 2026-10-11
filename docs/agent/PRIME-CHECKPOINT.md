@@ -185,29 +185,44 @@ Core product invariants:
   captured and cannot be assumed unchanged. Owner question is pending; no
   further writes or guessed restoration. Private impact counts are in
   `night-evidence-2026-10-12/m4-release01-default-db-impact.json`.
-- Release dry run **38173125316** is verified IN_PROGRESS on `f64f7a0`:
-  workflow_dispatch build/test/package only, release job disabled for this
-  event. Poll that run; do not retrigger merely because observation times out.
-  Local candidate archive SHA-256 starts `294d4987b4b39b6c`; full checksum/logs
-  live beside the archive in `night-evidence-2026-10-12/`.
-- All new code is committed and pushed. Latest M5 validated stack head is #481;
-  latest M4 version/migration candidate is #487;
+- Release dry run **38173125316** on #487 SUCCESS; release job SKIPPED.
+  Downloaded `release-assets` to `night-evidence-2026-10-12/release-dryrun-f64f7a0/`,
+  verified SHA-256 and independently ran the downloaded archive's isolated
+  local smoke at 0.3.0. No release/tag was created.
+- Another reproduced authority leak: personal mode ignored tenant-a binding
+  and returned tenant-b's stored event data (HTTP 200). #488 `ef95789` (101 lines)
+  enforces the binding's effective deployment scope; foreign bindings cannot
+  become personal authority. Explicit personal keys accept absent/matching
+  headers and reject foreign/empty/duplicate values; unbound legacy behavior
+  stays covered. Removal restores 200. Full gates (router 443), release 134/8,
+  fresh 0.3.0 archive smoke and all remote checks pass. New exact-head release
+  dry run **38174477955** SUCCESS (Release job skipped).
+- #489 `c7cfe8c` (103 lines), base #481, applies the same fix to M5. Full
+  feature-enabled serial Rust (router 507), all other gates and rebuilt release
+  Rust conformance 134/8 (wire 1.1.0) pass. Its independent removed-guard check
+  fails by assertion; restored source is clean/committed/pushed. Remote CI fresh.
+- Owner authorization question pending for one #488 review-request comment
+  per COLLAB §5. No notification has been sent; do not infer approval from time.
+  Concrete local draft: `night-evidence-2026-10-12/review-request-488.md`.
+- All new code is committed and pushed. Latest M5 validated stack head is #489;
+  latest M4 mode-ceiling candidate is #488;
   #476 remains the historical combined integration snapshot, not a branch to
   merge its descendants into (that would collapse the dependent PR diffs).
-- Resume: inspect run 38173125316 and #487 CI/reviews; diagnose any actual
-  failure, then follow the M4 release procedure. Keep the default-DB owner
+- Resume: inspect #489 CI and incoming reviews; send the prepared single #488
+  review notification only if the owner explicitly authorizes it. Follow the
+  M4 release procedure after independent approvals. Keep the default-DB owner
   question pending until answered; do not assume permission to restore data.
   Follow independent approval/merge gates and re-run M4 acceptance on actual
   main before tag. REDACT consent and Admin v1 public writes remain pending.
   Do not recreate completed tests or collapse open parent/child review diffs.
 
 - Active worktrees live beside the main checkout under `/Users/jason/Dev/iDoris/`.
-  Current debug caches: `target-identity32-night` built M4 authority #485;
-  `target-version-night` and `target-inspect22-release` now hold #487's
-  crate 0.3.0 / wire 1.0.1 debug and release builds (older M5 wire 1.1.0 artifacts
+  Current caches: `target-version-night` built M4 #488 (crate 0.3.0/wire 1.0.1);
+  `target-identity32-night` and `target-inspect22-release` built M5 #489
+  (crate 0.2.0/wire 1.1.0). All seven release crates were freshly recompiled (older M5 wire 1.1.0 artifacts
   were cleaned). Clean workspace packages before reuse, keep dependency caches,
   and run full suites serially. Logs/bodies in `night-evidence-2026-10-12/`
-  use `m4-security02..04` and `m4-release01` prefixes; `run-night-gates.py` records the full gate loop.
+  use `m4-security02..04`, `m4-release01`, `identity37/38` prefixes; `run-night-gates.py` records the full gate loop.
 
 
 ## Live delta — 2026-10-11 Claude handoff (historical snapshot)
