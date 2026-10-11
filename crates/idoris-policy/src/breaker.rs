@@ -40,9 +40,18 @@ impl CredentialClass {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum State {
-    Closed { failures: u32 },
-    Open { until_ms: u64 },
-    HalfOpen { probing: bool },
+    Closed {
+        failures: u32,
+    },
+    Open {
+        until_ms: u64,
+    },
+    /// 探测在途；它从 `since_ms` 开始。超过一个恢复窗口仍未回报的探测
+    /// 视为丢失（请求被取消、本地 503 之类），允许再放一个探测，否则这个
+    /// provider 会被永远卡在拒绝状态。
+    HalfOpen {
+        since_ms: u64,
+    },
 }
 
 /// 一次准入判定。
@@ -83,11 +92,15 @@ impl Breaker {
             State::Open { until_ms } if now_ms < until_ms => Admission::Rejected {
                 retry_after_ms: until_ms - now_ms,
             },
-            State::Open { .. } | State::HalfOpen { probing: false } => {
-                self.state = State::HalfOpen { probing: true };
+            State::HalfOpen { since_ms }
+                if now_ms < since_ms.saturating_add(self.class.recovery_ms()) =>
+            {
+                Admission::Rejected { retry_after_ms: 0 }
+            }
+            State::Open { .. } | State::HalfOpen { .. } => {
+                self.state = State::HalfOpen { since_ms: now_ms };
                 Admission::Probe
             }
-            State::HalfOpen { probing: true } => Admission::Rejected { retry_after_ms: 0 },
         }
     }
 
@@ -227,6 +240,17 @@ mod tests {
         );
         breaker.on_success();
         assert_eq!(breaker.admit(15_002), Admission::Allowed);
+    }
+
+    #[test]
+    fn a_probe_that_never_reports_is_replaced_after_a_window() {
+        let mut breaker = tripped(CredentialClass::Local, 0);
+        assert_eq!(breaker.admit(15_000), Admission::Probe);
+        assert_eq!(
+            breaker.admit(29_999),
+            Admission::Rejected { retry_after_ms: 0 }
+        );
+        assert_eq!(breaker.admit(30_000), Admission::Probe);
     }
 
     #[test]
