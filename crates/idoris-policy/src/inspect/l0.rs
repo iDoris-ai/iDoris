@@ -25,6 +25,9 @@ const ID_CHECK: &[u8; 11] = b"10X98765432";
 /// 紧跟的 `X`/`x`（只对 17 位数字有意义：身份证校验位）。
 struct Candidate<'a> {
     digits: &'a [u8],
+    /// Lengths of the digit runs spanned: one run is an unbroken number,
+    /// several are a written grouping.
+    runs: &'a [usize],
     start: usize,
     end: usize,
     x_suffix: bool,
@@ -63,17 +66,19 @@ pub(super) fn scan_plain(units: &[u16]) -> Vec<Hit> {
                 k += 1;
             }
         }
-        // Each run alone and the whole group, however it is grouped (3-8,
-        // 6-4-4-4, … are all real ways to write these numbers). Beyond that,
-        // a group counts as several entities only when it splits completely
-        // into neighbouring windows that each are one: `110101 19900307 7379
-        // 138 1234 5678` yields the id and the phone, while a row of random
-        // numbers almost never decomposes (judging every window flagged most
-        // numeric tables as cards — second and third review).
+        // Each run alone; otherwise windows of several runs must be a real
+        // written form of the entity (see `classify`). The group is judged
+        // as one decomposition into neighbouring entity windows, which may
+        // start and end with up to two short numbers (≤ 3 digits: an
+        // expiry, a CVV, an hour): `4111 1111 1111 1111 12 28`,
+        // `19 138 1234 5678`, `110101 19900307 7379 138 1234 5678`. A row
+        // of random numbers almost never decomposes (four reviews tonight
+        // traded recall against false positives on exactly this rule).
         let n = segments.len();
+        let lengths: Vec<usize> = segments.iter().map(|&(s, e)| e - s).collect();
         let mut prefix = vec![0usize; n + 1];
-        for (k, &(seg_start, seg_end)) in segments.iter().enumerate() {
-            prefix[k + 1] = prefix[k] + (seg_end - seg_start);
+        for (k, &len) in lengths.iter().enumerate() {
+            prefix[k + 1] = prefix[k] + len;
         }
         let window = |a: usize, b: usize| -> Vec<Hit> {
             let mut found = Vec::new();
@@ -88,6 +93,7 @@ pub(super) fn scan_plain(units: &[u16]) -> Vec<Hit> {
             classify(
                 &Candidate {
                     digits: &digits,
+                    runs: &lengths[a..=b],
                     start: segments[a].0,
                     end: segments[b].1,
                     x_suffix: x_suffix && b + 1 == n,
@@ -100,18 +106,21 @@ pub(super) fn scan_plain(units: &[u16]) -> Vec<Hit> {
             hits.extend(window(a, a));
         }
         if n > 1 {
-            hits.extend(window(0, n - 1));
-            // decomposes[a]: the runs from `a` on split into entity windows;
-            // first_window[a]: the shortest such window starting at `a`.
+            let short = |k: usize| lengths[k] <= MAX_SHORT_EDGE_DIGITS;
+            // tail_ok[k]: runs k.. are at most two short numbers (or none).
+            let tail_ok: Vec<bool> = (0..=n)
+                .map(|k| n - k <= MAX_SHORT_EDGE_RUNS && (k..n).all(short))
+                .collect();
+            // decomposes[a]: runs a.. are one or more entity windows, then a
+            // short tail; first_window[a]: the shortest such window at `a`.
             let mut decomposes = vec![false; n + 1];
-            decomposes[n] = true;
             let mut first_window: Vec<Option<(usize, Vec<Hit>)>> = (0..n).map(|_| None).collect();
             for a in (0..n).rev() {
                 for b in a..n {
                     if prefix[b + 1] - prefix[a] > MAX_ENTITY_DIGITS {
                         break;
                     }
-                    if !decomposes[b + 1] {
+                    if !(decomposes[b + 1] || tail_ok[b + 1]) {
                         continue;
                     }
                     let found = window(a, b);
@@ -122,13 +131,14 @@ pub(super) fn scan_plain(units: &[u16]) -> Vec<Hit> {
                     }
                 }
             }
-            let mut a = 0;
-            while decomposes[0] && a < n {
-                let Some((b, found)) = first_window[a].take() else {
-                    break;
-                };
-                hits.extend(found);
-                a = b + 1;
+            let head = (0..=MAX_SHORT_EDGE_RUNS.min(n))
+                .take_while(|&h| (0..h).all(short))
+                .find(|&h| decomposes[h]);
+            if let Some(mut a) = head {
+                while let Some((b, found)) = first_window.get_mut(a).and_then(Option::take) {
+                    hits.extend(found);
+                    a = b + 1;
+                }
             }
         }
         i = group_end;
@@ -150,6 +160,9 @@ fn is_digit(u: u16) -> bool {
 
 /// Longest digit entity (a 19-digit card).
 const MAX_ENTITY_DIGITS: usize = 19;
+/// Short numbers allowed around the entities of one group, and how many.
+const MAX_SHORT_EDGE_DIGITS: usize = 3;
+const MAX_SHORT_EDGE_RUNS: usize = 2;
 /// Separators tolerated between two digit runs of one group.
 const MAX_SEPARATOR_RUN: usize = 3;
 
@@ -189,32 +202,52 @@ fn classify(c: &Candidate<'_>, hits: &mut Vec<Hit>) {
         });
     };
     let d = c.digits;
-    if d.len() == 17 && c.x_suffix && id_structure(d) {
+    let written_as = |forms: &[&[usize]]| c.runs.len() == 1 || forms.contains(&c.runs);
+    if d.len() == 17
+        && c.x_suffix
+        && written_as(&[&[6, 8, 3], &[6, 11], &[6, 4, 4, 3]])
+        && id_structure(d)
+    {
         push(
             FindingKind::CnResidentId,
             c.end + 1,
             id_sensitivity(d, b'X'),
         );
     }
-    if d.len() == 18 && id_structure(&d[..17]) {
+    if d.len() == 18 && written_as(&[&[6, 8, 4], &[6, 12], &[6, 4, 4, 4]]) && id_structure(&d[..17])
+    {
         push(
             FindingKind::CnResidentId,
             c.end,
             id_sensitivity(&d[..17], b'0' + d[17]),
         );
     }
-    if d.len() == 15 && legacy_id_structure(d) {
+    if d.len() == 15 && written_as(&[&[6, 6, 3], &[6, 9]]) && legacy_id_structure(d) {
         push(FindingKind::CnResidentId, c.end, Sensitivity::S2);
     }
     let mobile = match d.len() {
-        11 => is_mobile(d),
-        13 => d[..2] == [8, 6] && is_mobile(&d[2..]),
+        11 => written_as(&[&[3, 4, 4], &[3, 8], &[7, 4], &[4, 3, 4]]) && is_mobile(d),
+        13 => {
+            written_as(&[&[2, 3, 4, 4], &[2, 11], &[2, 3, 8], &[5, 4, 4]])
+                && d[..2] == [8, 6]
+                && is_mobile(&d[2..])
+        }
+        15 => {
+            written_as(&[&[4, 3, 4, 4], &[4, 11], &[4, 3, 8]])
+                && d[..4] == [0, 0, 8, 6]
+                && is_mobile(&d[4..])
+        }
         _ => false,
     };
     if mobile {
         push(FindingKind::CnMobile, c.end, Sensitivity::S2);
     }
-    if (16..=19).contains(&d.len()) && card_iin(d) && luhn_valid(d) {
+    let card_form = c.runs.len() == 1
+        || c.runs == [6, 13]
+        || (c.runs.len() >= 4
+            && c.runs[..4] == [4, 4, 4, 4]
+            && (c.runs.len() == 4 || (c.runs.len() == 5 && (1..=3).contains(&c.runs[4]))));
+    if (16..=19).contains(&d.len()) && card_form && card_iin(d) && luhn_valid(d) {
         push(FindingKind::BankCard, c.end, Sensitivity::S3);
     }
 }
