@@ -1,7 +1,7 @@
 //! The Event Log chain for `/v1/embeddings`, `/v1/rerank` and
 //! `/v1/messages`. M4 acceptance says any request's record id must find
 //! its decision chain; until now only chat wrote one. These endpoints now
-//! append the same facts as chat's proxy path — `request.received` (before
+//! append the same facts as chat's proxy path — `request.received` (after
 //! auth), `inspected`, `profiled`, `decided`, then `dispatched` right before
 //! the upstream send and `completed` once it actually executed — with the
 //! same correlation checks and the same fail-closed 503 when an append
