@@ -30,7 +30,7 @@ export function conformanceAuthorizationHeader(baseUrl: string): string | undefi
 if (process.env.IDORIS_CONFORMANCE_IMPLEMENTATION === "rust") {
   globalThis.fetch = ((input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
     const url = typeof input === "string" || input instanceof URL ? new URL(input) : new URL(input.url);
-    if (url.pathname === "/v1/chat/completions") {
+    if (url.pathname !== "/health") {
       const headers = new Headers(input instanceof Request ? input.headers : undefined);
       if (init?.headers !== undefined) {
         new Headers(init.headers).forEach((value, key) => headers.set(key, value));
