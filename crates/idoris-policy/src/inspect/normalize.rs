@@ -26,7 +26,13 @@ pub(super) fn normalize(units: &[u16]) -> Normalized {
         // place, so it joins the surrounding text; a lone surrogate is
         // kept as-is rather than failing the decode.
         let (unit, width) = if let Some(escaped) = unicode_escape(&units[i..]) {
-            (escaped, 6)
+            // An escaped surrogate pair for a mathematical digit.
+            match (escaped, units.get(i + 6..).and_then(unicode_escape)) {
+                (0xD835, Some(low @ 0xDFCE..=0xDFFF)) => {
+                    ((low - 0xDFCE) % 10 + u16::from(b'0'), 12)
+                }
+                _ => (escaped, 6),
+            }
         } else if let Some(digit) = math_digit(&units[i..]) {
             (digit, 2)
         } else {
