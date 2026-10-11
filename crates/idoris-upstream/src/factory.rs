@@ -46,9 +46,9 @@ mod tests {
     async fn explicit_omlx_constructs_without_io_and_lists_upstream_models() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
-            .and(path("/v1/models"))
+            .and(path("/v1/models/status"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "data": [{"id": "qwen3-8b"}]
+                "models": [{"id": "qwen3-8b", "estimated_size": 6_u64 * 1024 * 1024 * 1024}]
             })))
             .expect(1)
             .mount(&server)

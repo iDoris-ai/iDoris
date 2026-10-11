@@ -111,7 +111,12 @@ async fn stream_false_uses_buffered_omlx_completion() {
     Mock::given(method("GET"))
         .and(path("/v1/models/status"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "models": [{"id": "omlx", "loaded": true, "pinned": false}]
+            "models": [{
+                "id": "omlx",
+                "loaded": true,
+                "pinned": false,
+                "estimated_size": 1024_u64 * 1024 * 1024
+            }]
         })))
         .mount(&upstream)
         .await;
