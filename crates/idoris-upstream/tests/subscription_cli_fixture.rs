@@ -105,10 +105,19 @@ async fn fixture_creates_parent_and_grandchild_in_one_group_and_can_be_reaped() 
         .await
         .expect("parent exits after group TERM")
         .expect("wait parent");
-    assert!(
-        killpg(Pid::from_raw(group), None).is_err(),
-        "group must be gone"
-    );
+    // Reaping the leader does not synchronously reap every group member.
+    // Require ESRCH, rather than treating any signal error as proof of exit.
+    timeout(Duration::from_secs(2), async {
+        loop {
+            match killpg(Pid::from_raw(group), None) {
+                Err(nix::errno::Errno::ESRCH) => break,
+                Ok(()) => sleep(Duration::from_millis(20)).await,
+                Err(error) => panic!("cannot inspect fixture group: {error}"),
+            }
+        }
+    })
+    .await
+    .expect("group must be gone after descendant reaping");
 }
 
 #[tokio::test]
