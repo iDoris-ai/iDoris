@@ -47,3 +47,42 @@ async fn a_declared_completion_cap_that_exceeds_budget_is_denied_before_post() {
     assert_eq!(after.reserved_minor, before.reserved_minor);
     upstream.verify().await;
 }
+
+#[tokio::test]
+async fn small_completion_cap_preserves_payload_and_legacy_admission() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "choices":[{"message":{"role":"assistant","content":"answer"}}],
+            "usage":{"prompt_tokens":1,"completion_tokens":4,"total_tokens":5}
+        })))
+        .expect(1)
+        .mount(&upstream)
+        .await;
+    let (_dir, ledger) = super::tests::configured_budget_ledger(3000);
+    let ledger = Arc::new(ledger);
+    let mut card = super::tests::resident_component_card("paid", &upstream.uri());
+    card.provider.cost = super::tests::paid_component_card("paid").provider.cost;
+    let app = build_app(AppState {
+        cards: vec![card],
+        budget_ledger: Some(ledger.clone()),
+        ..AppState::default()
+    });
+    let response = app
+        .oneshot(super::tests::post_chat(
+            r#"{"max_tokens":8,"messages":[{"role":"user","content":"small cap"}]}"#,
+            &[],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let requests = upstream.received_requests().await.unwrap();
+    assert_eq!(
+        requests[0].body_json::<serde_json::Value>().unwrap()["max_tokens"],
+        8
+    );
+    let view = ledger.tenant_readview(budget::PERSONAL_TENANT_ID).unwrap();
+    assert_eq!(view.spent_minor, 9);
+    assert_eq!(view.reserved_minor, 0);
+    upstream.verify().await;
+}

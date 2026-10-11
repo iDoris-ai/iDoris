@@ -2501,13 +2501,14 @@ async fn chat_completions(
 
     // Resident proxies and Supervisor-run models share one breaker book.
     let open_provider_ids = state.proxy.open_providers(policy_cards.cards.iter());
-    let mut selection = dispatch::select_avoiding_open_breakers(
+    let mut selection = dispatch::select_with_completion_reservation(
         &policy_cards.cards,
         &parsed,
         &prompt,
         affinity_key,
         &ready_provider_ids,
         &open_provider_ids,
+        budget::completion_reservation_tokens(&value),
     );
     // M5-22: INSPECTED already lowered the privacy floor, so the pipeline
     // cannot tell that content did it; record the fact it would have
