@@ -63,8 +63,10 @@ Core product invariants:
   both inline spawn scripts into the stable fake CLI fixture (74 changed
   lines). Inspect 38 tests / 4096 property cases, spawn 5 tests, full
   feature-enabled serial Rust tests, strict fmt/clippy/deny and all six TS
-  gates pass; TS conformance 134/8. Remote CI and independent review remain
-  pending. Production behavior is unchanged; older failed heads remain red.
+  gates pass; TS conformance 134/8. All nine remote checks are now green
+  (both push/PR Linux Rust/TS and Linux/macOS subscription; original failed
+  spawn tests pass on Linux). Independent review remains pending. Production
+  behavior is unchanged; older failed heads remain red.
 - Latest M4 #488 (`ef957893cbc172250e77a71a271961b524f0e69b`) and M5 #489
   (`c7cfe8cc9ef77b71da4ce7e4757b1cee17404244`) have all remote checks green.
   Neither has independent current-head approval. Main remains `792ed904`;
@@ -79,6 +81,12 @@ Core product invariants:
   land the diagnosed repairs through normal reviewed merges, then rerun
   affected current-head checks. Preserve child bases before deleting parent
   branches. Real M4 acceptance on main remains required before tagging.
+- Checkpoint #491 macOS run 38175922043 reproduced the same pre-#466
+  process-group race. The candidate now includes #466 through an ordinary
+  merge; all non-document files match exact commit `c8a3ced`. This imports
+  69 test/fixture lines without changing production behavior. The merged
+  candidate passed full local Rust/TS gates (conformance 134/8). #466 remains
+  an explicit review dependency; await checks on the new #491 head.
 - The existing default-DB recovery question and the authorization request
   for one review-request comment remain unanswered; do not infer answers.
 
