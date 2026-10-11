@@ -130,6 +130,95 @@ fn wall_clock_ms() -> i64 {
 }
 
 #[tokio::test]
+async fn explicitly_personal_key_accepts_its_scope_and_rejects_foreign_or_duplicate_headers() {
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(method("POST"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({"ok":true})))
+        .expect(2)
+        .mount(&server)
+        .await;
+    let key = MintedVirtualKey::mint();
+    let mut key_scope = scope(vec![PrivacyClass::LocalOnly], &["fast"], None);
+    key_scope.tenant_id = Some(budget::PERSONAL_TENANT_ID.into());
+    let (authenticator, _) = memory_auth(&key, &key_scope);
+    let app = build_app(state(&server.uri(), Some(authenticator)));
+    for tenant in [None, Some(budget::PERSONAL_TENANT_ID)] {
+        let mut headers = vec![("authorization", bearer(&key))];
+        if let Some(tenant) = tenant {
+            headers.push(("x-idoris-tenant", tenant.into()));
+        }
+        let response = app.clone().oneshot(chat_request(&headers)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+    for tenants in [vec!["tenant-b"], vec![""], vec!["personal", "personal"]] {
+        let mut headers = vec![("authorization", bearer(&key))];
+        headers.extend(
+            tenants
+                .into_iter()
+                .map(|tenant| ("x-idoris-tenant", tenant.into())),
+        );
+        let response = app.clone().oneshot(chat_request(&headers)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            json_body(response).await["error"]["reason_code"],
+            "VIRTUAL_KEY_TENANT_FORBIDDEN"
+        );
+    }
+    server.verify().await;
+    assert_eq!(server.received_requests().await.unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn personal_deployment_does_not_promote_a_tenant_bound_key() {
+    let key = MintedVirtualKey::mint();
+    let mut key_scope = scope(vec![PrivacyClass::LocalOnly], &["fast"], None);
+    key_scope.tenant_id = Some("tenant-a".into());
+    let (authenticator, _) = memory_auth(&key, &key_scope);
+    let log = Arc::new(
+        idoris_tenancy::event_log::EventLogStore::new(Connection::open_in_memory().unwrap())
+            .unwrap(),
+    );
+    log.append(
+        Some("tenant-b"),
+        &idoris_tenancy::event_log::NewEvent {
+            event_id: uuid::Uuid::new_v4().to_string(),
+            tenant_id: "tenant-b".into(),
+            record_id: "private-record".into(),
+            event_type: idoris_tenancy::event_log::EventType::RequestReceived,
+            ts_utc_ms: 10,
+            request_id: None,
+            session_id: None,
+            trace_id: None,
+            parent_id: None,
+            origin_record_id: None,
+            metadata: Default::default(),
+        },
+    )
+    .unwrap();
+    let app = build_app(AppState {
+        deploy_mode: idoris_contracts::DeployMode::Personal,
+        virtual_key_authenticator: Some(authenticator),
+        event_log: Some(log),
+        ..AppState::default()
+    });
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/idoris/tenants/tenant-b/requests/private-record")
+                .header("authorization", bearer(&key))
+                .header("x-idoris-tenant", "tenant-b")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let body = json_body(response).await;
+    assert_eq!(body["error"]["reason_code"], "VIRTUAL_KEY_TENANT_FORBIDDEN");
+    assert!(!body.to_string().contains("private-record"));
+}
+
+#[tokio::test]
 async fn revoked_tenant_key_cannot_replay_warmed_inference_caches() {
     for (endpoint, capability, body) in [
         (
