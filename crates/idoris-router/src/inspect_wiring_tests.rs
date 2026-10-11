@@ -227,3 +227,21 @@ async fn only_post_is_routed() {
     let (status, _) = send(&app, request).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
+
+#[tokio::test]
+async fn embedded_base64_payloads_answer_block() {
+    let app = build_app(AppState::default());
+    let body =
+        json!({ "input": "看图 ![x](data:image/png;base64,iVBORw0KGgoAAAANSUhEUg==)" }).to_string();
+    let (status, text) = send(&app, inspect_request(&body, &[("x-idoris-privacy", "any")])).await;
+    assert_eq!(status, StatusCode::OK);
+    let response = contract(&text);
+    assert_eq!(
+        response.action,
+        idoris_contracts::inspect::InspectAction::Block
+    );
+    assert_eq!(
+        response.sensitivity,
+        idoris_contracts::inspect::Sensitivity::S3
+    );
+}

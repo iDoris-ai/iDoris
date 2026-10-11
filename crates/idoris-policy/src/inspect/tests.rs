@@ -825,6 +825,27 @@ fn fourth_review_entities_with_short_neighbours() {
     }
 }
 
+#[test]
+fn embedded_base64_payloads_are_not_provably_clean() {
+    for input in [
+        "data:image/png;base64,iVBORw0KGgoAAAANSUhEUg==",
+        "看图 ![x](DATA:image/jpeg;base64,/9j/4AAQSkZJRg==) 谢谢",
+        "<img src=\"data:application/pdf;base64,JVBERi0xLjQ=\">",
+    ] {
+        let response = inspect(input, &open_ctx());
+        assert_eq!(response.action, InspectAction::Block, "{input}");
+        assert_eq!(response.sensitivity, Sensitivity::S3, "{input}");
+    }
+    for input in ["metadata: {\"a\": 1}", "data: 42", "data:text/plain,hello"] {
+        let response = inspect(input, &open_ctx());
+        assert_eq!(
+            response.action,
+            InspectAction::Allow,
+            "{input}: {response:?}"
+        );
+    }
+}
+
 fn valid_id() -> impl Strategy<Value = String> {
     (0usize..34, 1950u32..2030, 1u32..13, 1u32..29, 0u32..1000).prop_map(
         |(province, year, month, day, seq)| {
