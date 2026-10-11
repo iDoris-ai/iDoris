@@ -154,7 +154,7 @@ pub(crate) struct BufferedUpstreamPath {
 }
 
 impl BufferedUpstreamPath {
-    const CHAT_COMPLETIONS: Self = Self {
+    pub(crate) const CHAT_COMPLETIONS: Self = Self {
         path: "/v1/chat/completions",
         force_non_stream: true,
     };
