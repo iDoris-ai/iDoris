@@ -86,8 +86,8 @@ impl Respond for OmlxModelStatus {
         let loaded = self.0.snapshot();
         ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "models": [
-                {"id": "qwen3-8b", "loaded": loaded.iter().any(|id| id == "qwen3-8b"), "pinned": false},
-                {"id": "other-model", "loaded": loaded.iter().any(|id| id == "other-model"), "pinned": false}
+                {"id": "qwen3-8b", "loaded": loaded.iter().any(|id| id == "qwen3-8b"), "pinned": false, "estimated_size": 20 * GIB},
+                {"id": "other-model", "loaded": loaded.iter().any(|id| id == "other-model"), "pinned": false, "estimated_size": 2 * GIB}
             ]
         }))
     }
