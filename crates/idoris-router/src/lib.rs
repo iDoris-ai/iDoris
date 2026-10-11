@@ -1261,10 +1261,9 @@ async fn messages_stream(
             status,
             body,
             content_type,
-            execution,
+            ..
         } => {
-            if execution != proxy::ExecutionDisposition::NotExecuted
-                && let Some(events) = events
+            if let Some(events) = events
                 && let Err(response) = events.completed_failure(selected).await
             {
                 return response;
