@@ -313,6 +313,14 @@ impl EgressCounter {
     }
 }
 
+/// The connection grain of the breaker book: one key per scheme/host/port,
+/// distinct from every provider id.
+fn connection_key(url: &str) -> Option<String> {
+    reqwest::Url::parse(url)
+        .ok()
+        .map(|parsed| format!("connection:{}", parsed.origin().ascii_serialization()))
+}
+
 /// The proxy only fronts `http_service` cards: loopback ones are local
 /// runtimes, anything else is treated as a keyed API.
 fn credential_class(url: &str) -> idoris_policy::breaker::CredentialClass {
@@ -383,19 +391,26 @@ impl ChatProxy {
     /// (read-only, so selection can steer away without claiming a probe).
     pub(crate) fn open_providers<'a>(
         &self,
-        provider_ids: impl IntoIterator<Item = &'a str>,
+        cards: impl IntoIterator<Item = &'a idoris_contracts::ComponentCard>,
     ) -> std::collections::BTreeSet<String> {
         if !self.breakers_enabled() {
             return std::collections::BTreeSet::new();
         }
         let now_ms = wall_clock_ms();
         let Ok(book) = self.breakers.lock() else {
-            return provider_ids.into_iter().map(str::to_string).collect();
+            return cards
+                .into_iter()
+                .map(|card| card.provider.id.clone())
+                .collect();
         };
-        provider_ids
+        cards
             .into_iter()
-            .filter(|id| !book.would_admit(&id.to_string(), now_ms))
-            .map(str::to_string)
+            .filter(|card| {
+                !book.would_admit(&card.provider.id, now_ms)
+                    || connection_key(&card.endpoint)
+                        .is_some_and(|conn| !book.would_admit(&conn, now_ms))
+            })
+            .map(|card| card.provider.id.clone())
             .collect()
     }
 
@@ -442,12 +457,14 @@ impl ChatProxy {
         let Ok(mut book) = self.breakers.lock() else {
             return false;
         };
-        book.admit(
-            &provider_id.to_string(),
-            credential_class(url),
-            wall_clock_ms(),
-        )
-        .admitted()
+        let now_ms = wall_clock_ms();
+        // Connection cooldown first, read-only, so a cooling host never
+        // claims a provider's half-open probe.
+        if connection_key(url).is_some_and(|conn| !book.would_admit(&conn, now_ms)) {
+            return false;
+        }
+        book.admit(&provider_id.to_string(), credential_class(url), now_ms)
+            .admitted()
     }
 
     /// 408, 429 and 5xx (including the proxy's own transport-failure 502/504)
@@ -473,8 +490,13 @@ impl ChatProxy {
         );
         if status == 408 || status == 429 || (500..600).contains(&status) {
             book.on_failure(&key, class, now_ms);
-            if let Some(ms) = retry_after_ms.filter(|_| status == 429 || status == 503) {
-                book.on_retry_after(&key, class, now_ms, ms);
+            // Retry-After describes the server, not one provider card: cool
+            // the whole connection (every card on this scheme/host/port).
+            if let (Some(ms), Some(conn)) = (
+                retry_after_ms.filter(|_| status == 429 || status == 503),
+                connection_key(url),
+            ) {
+                book.on_retry_after(&conn, class, now_ms, ms);
             }
         } else {
             book.on_success(&key, class);
@@ -1798,6 +1820,35 @@ mod tests {
         }
         assert_eq!(seen, [503, 500, 503]);
         assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn retry_after_cools_the_whole_connection_not_just_one_provider() {
+        let busy = upstream_sequence(&[(429, Some("120")), (200, None)]).await;
+        let other_host = upstream_sequence(&[(200, None)]).await;
+        let proxy = ChatProxy::new(reqwest::Client::new());
+        let send = |uri: String, provider: &'static str| {
+            let proxy = &proxy;
+            async move {
+                proxy
+                    .forward_buffered(
+                        &uri,
+                        &chat_body(),
+                        &ForwardOpts {
+                            provider_id: provider,
+                            ..opts(None, "rec-conn")
+                        },
+                    )
+                    .await
+                    .status
+            }
+        };
+        assert_eq!(send(busy.uri(), "card-a").await, 429);
+        // A different card on the same scheme/host/port is cooled too.
+        assert_eq!(send(busy.uri(), "card-b").await, 503);
+        assert_eq!(busy.received_requests().await.unwrap().len(), 1);
+        // Another host is unaffected.
+        assert_eq!(send(other_host.uri(), "card-c").await, 200);
     }
 
     #[tokio::test]
