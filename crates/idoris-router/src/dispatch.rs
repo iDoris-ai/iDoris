@@ -31,6 +31,7 @@ pub struct BoundSupervisor {
     provider_id: String,
     endpoint: String,
     locality: Locality,
+    admission_model: Option<(String, f64)>,
 }
 
 impl BoundSupervisor {
@@ -40,7 +41,17 @@ impl BoundSupervisor {
             provider_id: card.provider.id.clone(),
             endpoint: card.endpoint.clone(),
             locality: card.provider.locality,
+            admission_model: None,
         }
+    }
+
+    pub(crate) fn with_admission_model(
+        mut self,
+        model_id: impl Into<String>,
+        memory_gb: f64,
+    ) -> Self {
+        self.admission_model = Some((model_id.into(), memory_gb));
+        self
     }
 
     pub(crate) fn provider_id(&self) -> &str {
@@ -107,12 +118,10 @@ fn default_load_policy() -> LoadPolicy {
     }
 }
 
-/// A single, fixed placeholder memory size for every card's Supervisor
-/// "model" entry. This crate doesn't yet have a real per-model memory
-/// figure at the component-card layer (that's catalog/idoris-recommender
-/// data, not wired into R2-D) — every local candidate is treated as
-/// equally cheap to load for now.
-const PLACEHOLDER_MEMORY_GB: f64 = 1.0;
+// oMLX 0.6.4's /v1/models contract does not expose per-model memory. Preserve
+// the established estimate for that path until its dedicated footprint source
+// is wired; trusted process-owned runtimes bind their configured memory below.
+const UNKNOWN_CATALOG_MEMORY_GB: f64 = 1.0;
 
 /// R2-D simplification: every loaded component card is eligible for every
 /// catalog role and always `Ready` at `decide()` time — role→catalog
@@ -635,12 +644,21 @@ async fn dispatch_local_inner(
     // cancellation can stop early.
     let _cancel_guard = CancelOnDrop(cancel.clone());
 
+    let admission_memory_override = supervisor
+        .admission_model
+        .as_ref()
+        .filter(|(model_id, _)| model_id == &backend_model_id)
+        .map(|(_, memory_gb)| *memory_gb);
+    let bound_model_mismatch = supervisor
+        .admission_model
+        .as_ref()
+        .is_some_and(|(model_id, _)| model_id != &backend_model_id);
     let supervisor = &supervisor.handle;
     // A concrete model id is caller-controlled. Validate it against the
     // runtime catalog before load(): Supervisor eviction planning happens
     // before an adapter can reject an unknown id, so skipping this preflight
     // would let a bogus model name evict an unrelated warm model first.
-    if backend_model_id != provider_id {
+    let admission_memory_gb = if backend_model_id != provider_id || bound_model_mismatch {
         let catalog = match supervisor.list().await {
             Ok(models) => models,
             Err(err) => {
@@ -652,7 +670,7 @@ async fn dispatch_local_inner(
                 });
             }
         };
-        if !catalog.iter().any(|model| model.id == backend_model_id) {
+        let Some(model) = catalog.iter().find(|model| model.id == backend_model_id) else {
             return Ok(ChatOutcome {
                 decision,
                 served_locality,
@@ -661,15 +679,22 @@ async fn dispatch_local_inner(
                 ))),
                 actual_cost_minor: None,
             });
+        };
+        if model.memory_gb > 0.0 {
+            model.memory_gb
+        } else {
+            admission_memory_override.unwrap_or(UNKNOWN_CATALOG_MEMORY_GB)
         }
-    }
+    } else {
+        admission_memory_override.unwrap_or(UNKNOWN_CATALOG_MEMORY_GB)
+    };
     // `status.loaded` reports engine residency, which may have been
     // inherited after a Supervisor restart while the model is still in
     // Error (not yet adopted and policy-checked). Always pass through the
     // Supervisor's idempotent load path before chatting so it can establish
     // readiness and apply the requested policy.
     if let Err(err) = supervisor
-        .load(backend_model_id.clone(), PLACEHOLDER_MEMORY_GB, load_policy)
+        .load(backend_model_id.clone(), admission_memory_gb, load_policy)
         .await
     {
         return Ok(ChatOutcome {
@@ -776,7 +801,8 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use idoris_backend::{
-        BackendStatus, MockAdapter, ModelInfo, RuntimeAdapter, Supervisor, SupervisorConfig,
+        BackendStatus, GlobalCapacityLedger, MockAdapter, ModelInfo, RuntimeAdapter, Supervisor,
+        SupervisorConfig,
     };
     use idoris_contracts::TaskProfile;
     use idoris_contracts::common::PrivacyClass;
@@ -1069,6 +1095,46 @@ routing_policy:
     }
 
     #[tokio::test]
+    async fn catalog_memory_drives_global_admission_before_adapter_load() {
+        let card = local_card("a");
+        let adapter = Arc::new(MockAdapter::new(vec![ModelInfo {
+            id: "a".to_string(),
+            memory_gb: 6.0,
+        }]));
+        let ledger = Arc::new(GlobalCapacityLedger::new(4.0).unwrap());
+        let supervisor = Supervisor::spawn_with_startup_capacity_tracking(
+            adapter.clone(),
+            SupervisorConfig::default(),
+            ledger.clone(),
+            "a",
+        )
+        .unwrap();
+        let supervisor = BoundSupervisor::new(&card, supervisor).with_admission_model("a", 6.0);
+
+        let outcome = dispatch_local(
+            std::slice::from_ref(&card),
+            Some(&supervisor),
+            None,
+            &empty_profile(),
+            DispatchInput::new("hello"),
+            vec![ChatMessage {
+                role: "user".to_string(),
+                content: "hello".to_string(),
+            }],
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        match outcome.result.unwrap_err() {
+            DispatchFailure::Backend(err) => assert_eq!(err.reason_code(), "oom"),
+            other => panic!("expected Backend(oom), got {other:?}"),
+        }
+        assert_eq!(adapter.load_call_count("a"), 0);
+        assert_eq!(ledger.snapshot().unwrap().allocations["runtime:a"], 0.0);
+    }
+
+    #[tokio::test]
     async fn concrete_model_is_dispatched_separately_from_provider_id() {
         let card = local_card("omlx");
         let adapter = Arc::new(MockAdapter::new(vec![ModelInfo {
@@ -1168,6 +1234,60 @@ routing_policy:
                 .unwrap()
                 .loaded
                 .contains(&"warm".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn implicit_provider_id_never_evicts_bound_single_model_runtime() {
+        let card = local_card("prov");
+        let adapter = Arc::new(MockAdapter::new(vec![ModelInfo {
+            id: "m".to_string(),
+            memory_gb: 8.0,
+        }]));
+        let warm_policy = LoadPolicy {
+            mode: LoadMode::OnDemand,
+            keepalive: Keepalive::IdleTtl { idle_ttl_s: 300 },
+            admission: Admission::RequiresEviction,
+        };
+        let supervisor = Supervisor::spawn(
+            adapter.clone(),
+            SupervisorConfig {
+                budget_gb: 10.0,
+                ..SupervisorConfig::default()
+            },
+        )
+        .unwrap();
+        supervisor
+            .load("m", 8.0, warm_policy)
+            .await
+            .expect("warm model must load");
+        let supervisor = BoundSupervisor::new(&card, supervisor).with_admission_model("m", 8.0);
+
+        let outcome = dispatch_local(
+            std::slice::from_ref(&card),
+            Some(&supervisor),
+            None,
+            &empty_profile(),
+            DispatchInput::new("hello"),
+            Vec::new(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        match outcome.result.unwrap_err() {
+            DispatchFailure::Backend(err) => assert_eq!(err.reason_code(), "model_not_found"),
+            other => panic!("expected Backend(model_not_found), got {other:?}"),
+        }
+        assert_eq!(adapter.load_call_count("prov"), 0);
+        assert_eq!(adapter.unload_call_count("m"), 0);
+        assert!(
+            adapter
+                .status()
+                .await
+                .unwrap()
+                .loaded
+                .contains(&"m".to_string())
         );
     }
 
