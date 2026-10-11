@@ -63,7 +63,7 @@ Core product invariants:
   #463 `164444c` storage/issuance (172 lines) →
   #465 `4c62d18` explicit conformance key binding (22 lines) →
   #467 `29aff5d` HTTP tenant authority / events / audit (296 lines) →
-  `feat/identity-keys-35-tenant-default-deny` `1a5008c` (239-line PR delta,
+  #468 `1a5008c` (239-line PR delta,
   including ordinary merge of #374's repaired test). The last slice also
   denies missing authenticators in tenant library mode; real bound-key
   cfg(test) fixtures preserve authorized routing tests. Three hand mutations
@@ -85,15 +85,26 @@ Core product invariants:
 - Remote checks are advancing: #374/#463/#467 have green Linux Rust/TS/
   subscription checks; macOS subscription remains queued on these runs.
   No current-head approval exists. Do not conflate queued with failed.
-- Next active lane: buffered proxy completion must commit before publishing
-  an idempotent success/cache/flight result. Retain failed or uncertain
-  execution markers, so append failure cannot trigger a duplicate POST.
-  Separate transport seam, protocol wiring and chat wiring into small PRs.
+- 2026-10-12 after midnight: #469 `7d328e7` (261 changed lines) adds the
+  asynchronous buffered finalizer before cache/singleflight publication.
+  Four regressions cover hook failure, waiters, no request ID and cancellation;
+  removing the check fails an assertion. Final feature-enabled serial Rust
+  tests/clippy/fmt, cargo deny and all pnpm gates passed (conformance 134/8).
+- Active Event Log worktrees: `wt-event-log-32` protocol finalization and
+  `wt-event-log-33` protocol attempt terminals. The protocol cache regression
+  reproduces a 200 when its completion hook is removed; restored test passes.
+  Full protocol gates and release conformance are in progress; neither slice
+  is yet published. Preserve the existing paid-chat committed-settlement
+  response rule until its Event Log failure semantics receive explicit review.
 
 - Active worktrees live beside the main checkout under `/Users/jason/Dev/iDoris/`.
   Cargo targets must be isolated when building differing worktree revisions;
   a shared target reused stale workspace libraries during the first tenant
-  build. The tenant checks use `target-identity-night` and compile cleanly.
+  build. `target-identity-night` was cleaned after validation. Current buffered
+  work uses `target-identity32-night`; release conformance uses
+  `target-inspect22-release`. Clean workspace packages before switching source
+  revisions while retaining dependency cache. Durable validation logs now live
+  in `night-evidence-2026-10-12/` beside the checkout; `/tmp` was cleared.
 
 ## Live delta — 2026-10-11 Claude handoff (historical snapshot)
 

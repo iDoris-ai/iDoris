@@ -467,8 +467,8 @@
 | FU-206 | A 机 v0.1.1 冒烟 | Supervisor 参数：文本消息之外未支持参数（含 max_tokens）显式 400；参数清单、HTTP 回归与放行 max_tokens 变异验证 | PR_OPEN（feat/openai-compat-03） |
 | FU-207 | A 机 v0.1.1 冒烟 | 模型目录鉴权：loopback oMLX 复用 IDORIS_OMLX_API_KEY，401/403 显式 502 并记录安全日志；凭证隔离回归与变异验证 | PR_OPEN（feat/openai-compat-04） |
 
-| FU-208 | 2026-10-11 夜间接手 / tenant authority | virtual key 显式绑定 tenant；拒绝跨租户、unbound、匿名和缺 authenticator，request.received 在 scope 后，audit 仅取可信 tenant。#463 → #465 → #467 → identity-keys-35；本地全门禁、3 项撤修负控通过；待独立批准和 landing | PR_OPEN |
+| FU-208 | 2026-10-11 夜间接手 / tenant authority | virtual key 显式绑定 tenant；拒绝跨租户、unbound、匿名和缺 authenticator，request.received 在 scope 后，audit 仅取可信 tenant。#463 → #465 → #467 → #468；本地全门禁、3 项撤修负控通过；待独立批准和 landing | PR_OPEN |
 
-| FU-209 | 2026-10-11 第五次审查 / Event Log | completed 必须先于成功缓存与 flight replay 发布；失败不得重放 200 或重复 POST；dispatched 后的连接失败也要有终态。拆 transport / protocol / chat slices，保留 fail-closed 和预算语义 | IN_PROGRESS |
+| FU-209 | 2026-10-11 第五次审查 / Event Log | completed 必须先于成功缓存与 flight replay 发布；失败不得重放 200 或重复 POST；dispatched 后的连接失败也要有终态。transport #469 已发布；protocol 接线和连接失败终态在验证。付费 chat 已结算响应规则保留待明确语义评审 | IN_PROGRESS |
 
 | FU-210 | macOS CI 38137840647 / 38140879392 | fixture 后代回收与临时端口抢占分开修复；#466，相关套件各 30/30 重复通过，完整本地门禁通过，待 review/CI 和功能 release PR | PR_OPEN |
