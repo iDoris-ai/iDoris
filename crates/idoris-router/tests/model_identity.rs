@@ -93,7 +93,12 @@ async fn mount_omlx_success(server: &MockServer) {
     Mock::given(method("GET"))
         .and(path("/v1/models/status"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "models": [{"id":"Qwen3-0.6B-4bit", "loaded":true, "pinned":false}]
+            "models": [{
+                "id":"Qwen3-0.6B-4bit",
+                "loaded":true,
+                "pinned":false,
+                "estimated_size": 6_u64 * 1024 * 1024 * 1024
+            }]
         })))
         .mount(server)
         .await;
@@ -182,5 +187,38 @@ async fn concrete_model_is_forwarded_when_provider_id_differs() {
     assert_eq!(
         chat.body_json::<serde_json::Value>().unwrap()["model"],
         "Qwen3-0.6B-4bit"
+    );
+}
+
+#[tokio::test]
+async fn malformed_omlx_footprint_fails_before_load() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/status"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "loaded_models": [], "model_memory_used": 0, "model_memory_max": 0
+        })))
+        .mount(&upstream)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models/status"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "models": [{"id":"Qwen3-0.6B-4bit", "loaded":false, "pinned":false}]
+        })))
+        .mount(&upstream)
+        .await;
+
+    let response = app_with_provider(&upstream, "omlx")
+        .await
+        .oneshot(request("Qwen3-0.6B-4bit"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let requests = upstream.received_requests().await.unwrap();
+    assert!(
+        !requests
+            .iter()
+            .any(|request| request.url.path().ends_with("/load")),
+        "malformed pre-load footprint must fail before any model load"
     );
 }
