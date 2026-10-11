@@ -707,6 +707,26 @@ fn other_digit_scripts_and_latin_homoglyphs_are_folded() {
     }
 }
 
+#[test]
+fn lists_of_short_numbers_are_not_grouped_into_entities() {
+    for input in [
+        "sort: 3 1 4 1 5 9 2 6 5 3 5 8 9 7 9 3 2 3 8 4 6",
+        "scores 12 34 56 78 90 12 34 56 78 90",
+        "1\n2\n3\n4\n5\n6\n7\n8\n9\n0\n1\n2\n3\n4\n5\n6\n7\n8\n9",
+    ] {
+        let response = inspect(input, &open_ctx());
+        assert!(response.findings.is_empty(), "{input:?}: {response:?}");
+    }
+    // Real groupings still join.
+    for input in [
+        "6222 0212 3456 7894",
+        "138 1234 5678",
+        "110101 19900307 7379",
+    ] {
+        assert!(!inspect(input, &open_ctx()).findings.is_empty(), "{input}");
+    }
+}
+
 fn valid_id() -> impl Strategy<Value = String> {
     (0usize..34, 1950u32..2030, 1u32..13, 1u32..29, 0u32..1000).prop_map(
         |(province, year, month, day, seq)| {

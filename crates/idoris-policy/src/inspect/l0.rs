@@ -78,6 +78,16 @@ pub(super) fn scan_plain(units: &[u16]) -> Vec<Hit> {
                 if digits.len() > MAX_ENTITY_DIGITS {
                     break;
                 }
+                // Real groupings (3-4-4, 4-4-4-4, 6-8-4, …) never split an
+                // entity into runs shorter than three digits; without this a
+                // list of single digits would yield Luhn-valid "cards".
+                if b > a
+                    && segments[a..=b]
+                        .iter()
+                        .any(|&(s, e)| e - s < MIN_GROUPED_RUN)
+                {
+                    break;
+                }
                 classify(
                     &Candidate {
                         digits: &digits,
@@ -108,6 +118,8 @@ fn is_digit(u: u16) -> bool {
 
 /// Longest digit entity (a 19-digit card).
 const MAX_ENTITY_DIGITS: usize = 19;
+/// Shortest digit run allowed inside a multi-run entity.
+const MIN_GROUPED_RUN: usize = 3;
 /// Separators tolerated between two digit runs of one group.
 const MAX_SEPARATOR_RUN: usize = 3;
 
