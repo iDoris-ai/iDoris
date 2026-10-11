@@ -313,6 +313,24 @@ impl EgressCounter {
     }
 }
 
+/// Top-level body fields through which an OpenAI- or Anthropic-shaped
+/// request names its end user or groups requests by caller: `user`,
+/// `safety_identifier`, `prompt_cache_key` (OpenAI) and `metadata`
+/// (OpenAI stored-completion tags, Anthropic `metadata.user_id`). The proxy
+/// already sends no caller headers and no upstream request id, so with
+/// these removed every remote request stands alone.
+const IDENTITY_FIELDS: &[&str] = &["user", "safety_identifier", "prompt_cache_key", "metadata"];
+
+fn decorrelate(payload: &Value) -> Value {
+    let mut stripped = payload.clone();
+    if let Some(object) = stripped.as_object_mut() {
+        for field in IDENTITY_FIELDS {
+            object.remove(*field);
+        }
+    }
+    stripped
+}
+
 /// The connection grain of the breaker book: one key per scheme/host/port,
 /// distinct from every provider id.
 fn connection_key(url: &str) -> Option<String> {
@@ -512,6 +530,15 @@ impl ChatProxy {
     /// counter first when the host is not loopback.
     fn outbound(&self, url: &str, payload: &Value) -> reqwest::RequestBuilder {
         let request = self.client.post(url);
+        // Egress de-correlation (plan §4.5): an off-host upstream never
+        // learns who is asking. Loopback runtimes keep the body byte for byte.
+        let decorrelated;
+        let payload = if is_loopback_url(url) {
+            payload
+        } else {
+            decorrelated = decorrelate(payload);
+            &decorrelated
+        };
         match serde_json::to_vec(payload) {
             Ok(body) => {
                 self.egress.record(url, body.len());
@@ -1916,6 +1943,54 @@ mod tests {
         ] {
             assert!(!is_loopback_url(url), "{url}");
         }
+    }
+
+    #[tokio::test]
+    async fn off_host_bodies_are_decorrelated_and_loopback_bodies_are_not() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .mount(&server)
+            .await;
+        let client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_millis(50))
+            .build()
+            .unwrap();
+        let mut proxy = ChatProxy::new(client);
+        proxy.retry_delays = Vec::new();
+        proxy.set_breakers_enabled(false);
+        let body = serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "user": "alice@corp",
+            "safety_identifier": "hash-of-alice",
+            "prompt_cache_key": "tenant-acme",
+            "metadata": {"user_id": "alice"}
+        });
+
+        // Loopback: forwarded byte for byte, identity fields included.
+        let _ = proxy
+            .forward_buffered(&server.uri(), &body, &opts(None, "rec-local"))
+            .await;
+        let received: Value =
+            serde_json::from_slice(&server.received_requests().await.unwrap()[0].body).unwrap();
+        let mut sent = body.clone();
+        sent["stream"] = Value::Bool(false);
+        assert_eq!(received, sent);
+
+        // Off host: what is counted as sent is the de-correlated body.
+        let _ = proxy
+            .forward_buffered("http://192.0.2.1:9", &body, &opts(None, "rec-remote"))
+            .await;
+        let expected = decorrelate(&sent);
+        for field in IDENTITY_FIELDS {
+            assert!(expected.get(*field).is_none(), "{field}");
+        }
+        assert_eq!(expected["messages"], body["messages"]);
+        assert_eq!(
+            proxy.egress().bytes,
+            serde_json::to_vec(&expected).unwrap().len() as u64
+        );
     }
 
     #[tokio::test]
