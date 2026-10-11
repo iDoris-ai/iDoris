@@ -11,7 +11,8 @@ Cache hits and singleflight waiters do not repeat either hook.
 A completion-hook failure returns its error and retains a generic 503 marker.
 The same cache key cannot execute another POST within the idempotency window;
 a changed payload conflicts. Cancellation while the hook is pending retains
-that marker too. Calls without request IDs fail before returning success but
+the existing generic 502 cancellation marker. Calls without request IDs fail
+before returning success but
 have no cross-request deduplication guarantee.
 
 ## Follow-up
