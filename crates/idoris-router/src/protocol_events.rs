@@ -3,11 +3,14 @@
 //! its decision chain; until now only chat wrote one. These endpoints now
 //! append the same facts as chat's proxy path — `request.received` (after
 //! auth), `inspected`, `profiled`, `decided`, then `dispatched` right before
-//! the upstream send and `completed` once it actually executed — with the
+//! the upstream send and `completed` when that attempt terminates — with the
 //! same correlation checks and the same fail-closed 503 when an append
 //! fails. A streamed `/v1/messages` completes when its stream ends.
 
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
 use axum::http::HeaderMap;
 use axum::response::Response;
@@ -30,6 +33,7 @@ pub(crate) struct ProtocolEvents {
     tenant_id: String,
     record_id: String,
     correlation: RequestCorrelation,
+    dispatched: AtomicBool,
 }
 
 impl ProtocolEvents {
@@ -67,6 +71,7 @@ impl ProtocolEvents {
             tenant_id,
             record_id: record_id.to_string(),
             correlation,
+            dispatched: AtomicBool::new(false),
         }))
     }
 
@@ -102,21 +107,21 @@ impl ProtocolEvents {
             record_id: self.record_id.clone(),
             correlation: self.correlation.clone(),
         };
-        append_dispatched(&context, selected).await
+        append_dispatched(&context, selected).await?;
+        self.dispatched.store(true, Ordering::Release);
+        Ok(())
     }
 
-    /// Only an upstream call that actually executed completes: cache hits,
-    /// replays and refused or unsent requests record nothing here.
+    /// Every recorded send attempt gets a terminal result, including a
+    /// failed connection. Cache hits, replays and preflight refusals do not.
     pub(crate) async fn completed(
         &self,
         selected: &Selected,
         outcome: &ForwardOutcome,
     ) -> Result<(), Response> {
-        if outcome.cached
-            || matches!(
-                outcome.execution,
-                ExecutionDisposition::NotExecuted | ExecutionDisposition::Replay
-            )
+        if !self.dispatched.load(Ordering::Acquire)
+            || outcome.cached
+            || outcome.execution == ExecutionDisposition::Replay
         {
             return Ok(());
         }
@@ -139,8 +144,11 @@ impl ProtocolEvents {
         }
     }
 
-    /// A streaming request whose upstream answered with a buffered error.
+    /// A stream whose send attempt failed or received a buffered upstream error.
     pub(crate) async fn completed_failure(&self, selected: &Selected) -> Result<(), Response> {
+        if !self.dispatched.load(Ordering::Acquire) {
+            return Ok(());
+        }
         append_completed(&self.completed_context(), selected, "failure")
             .await
             .map_err(|()| event_log_unavailable_response())

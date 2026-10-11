@@ -20,3 +20,12 @@ have no cross-request deduplication guarantee.
 This transport slice preserves existing endpoint behavior through no-op hooks.
 Wire protocol endpoints next. Preserve the existing paid-chat settlement rule
 until its Event Log failure semantics receive an explicit review.
+
+## Protocol attempt terminals
+
+A protocol request whose `dispatched` append committed records `completed`
+with failure even when connection establishment fails. This completes the
+router attempt; it does not claim that upstream inference ran, and it does
+not change `ExecutionDisposition` or charge budget. Breaker/preflight refusals
+have no committed dispatch and therefore no completion. The same distinction
+applies to a messages stream that returns a buffered transport error.

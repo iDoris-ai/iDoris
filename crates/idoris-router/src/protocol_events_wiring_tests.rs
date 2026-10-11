@@ -3,6 +3,7 @@
 #![allow(clippy::unwrap_used)]
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::http::{HeaderValue, Request, StatusCode};
 use http_body_util::BodyExt;
@@ -350,5 +351,134 @@ async fn failed_protocol_completion_never_becomes_a_cached_success() {
             server.verify().await;
             assert_eq!(server.received_requests().await.unwrap().len(), 1, "{path}");
         }
+    }
+}
+
+fn attempted_protocol_cases() -> Vec<(&'static str, Capability, serde_json::Value)> {
+    let mut cases = endpoints().to_vec();
+    let (_, capability, mut body) = endpoints()[2].clone();
+    body["stream"] = json!(true);
+    cases.push(("/v1/messages", capability, body));
+    cases
+}
+
+fn terminal_types(log: &EventLogStore, response: &Response) -> Vec<EventType> {
+    log.events_for_record(Some(budget::PERSONAL_TENANT_ID), &record_id(response))
+        .unwrap()
+        .into_iter()
+        .map(|e| e.event.event_type)
+        .filter(|t| matches!(t, EventType::Dispatched | EventType::Completed))
+        .collect()
+}
+
+#[tokio::test]
+async fn protocol_connect_failure_terminates_its_recorded_attempt() {
+    for (path, capability, body) in attempted_protocol_cases() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let mut card = super::tests::resident_component_card("proto-card", &endpoint);
+        card.provider.capabilities = vec![capability];
+        let log = Arc::new(EventLogStore::new(Connection::open_in_memory().unwrap()).unwrap());
+        let app = build_app(AppState {
+            cards: vec![card],
+            event_log: Some(log.clone()),
+            proxy: Arc::new(proxy::ChatProxy::with_config(
+                idoris_upstream::http_client().unwrap(),
+                Duration::from_secs(60),
+                vec![],
+            )),
+            ..AppState::default()
+        });
+        drop(listener);
+        let response = app.oneshot(post(path, &body, &[])).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY, "{path}");
+        assert_eq!(
+            terminal_types(&log, &response),
+            [EventType::Dispatched, EventType::Completed]
+        );
+        let chain = log
+            .events_for_record(Some(budget::PERSONAL_TENANT_ID), &record_id(&response))
+            .unwrap();
+        assert_eq!(chain.last().unwrap().event.metadata["status"], "failure");
+    }
+}
+
+#[tokio::test]
+async fn protocol_breaker_refusal_creates_no_fictitious_attempt_or_completion() {
+    for (path, capability, body) in attempted_protocol_cases() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(503).insert_header("Retry-After", "60"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut card = super::tests::resident_component_card("proto-card", &server.uri());
+        card.provider.capabilities = vec![capability];
+        let log = Arc::new(EventLogStore::new(Connection::open_in_memory().unwrap()).unwrap());
+        let proxy = proxy::ChatProxy::new(idoris_upstream::http_client().unwrap());
+        proxy.set_breakers_enabled(true);
+        let app = build_app(AppState {
+            cards: vec![card],
+            event_log: Some(log.clone()),
+            proxy: Arc::new(proxy),
+            ..AppState::default()
+        });
+        let attempted = app.clone().oneshot(post(path, &body, &[])).await.unwrap();
+        assert_eq!(attempted.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            terminal_types(&log, &attempted),
+            [EventType::Dispatched, EventType::Completed]
+        );
+        let refused = app.oneshot(post(path, &body, &[])).await.unwrap();
+        assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(terminal_types(&log, &refused).is_empty(), "{path}");
+        server.verify().await;
+    }
+}
+
+#[tokio::test]
+async fn protocol_terminal_entry_points_require_a_committed_dispatch() {
+    for streaming in [false, true] {
+        let log = Arc::new(EventLogStore::new(Connection::open_in_memory().unwrap()).unwrap());
+        let state = AppState {
+            event_log: Some(log.clone()),
+            ..AppState::default()
+        };
+        let headers = HeaderMap::new();
+        let parsed =
+            profile::parse_profile(&headers, None, idoris_contracts::DeployMode::Personal).unwrap();
+        let selected = dispatch::select(
+            &[super::tests::resident_component_card(
+                "proto-card",
+                "http://127.0.0.1:1",
+            )],
+            &parsed,
+            "hello",
+        )
+        .unwrap();
+        let events = protocol_events::ProtocolEvents::begin(&state, &headers, &parsed, "preflight")
+            .await
+            .unwrap()
+            .unwrap();
+        let outcome = proxy::ForwardOutcome {
+            status: 503,
+            body: "refused".into(),
+            content_type: None,
+            cached: false,
+            origin_record_id: None,
+            replayed_served_locality: None,
+            retries: 0,
+            execution: proxy::ExecutionDisposition::NotExecuted,
+        };
+        if streaming {
+            events.completed_failure(&selected).await.unwrap();
+        } else {
+            events.completed(&selected, &outcome).await.unwrap();
+        }
+        let chain = log
+            .events_for_record(Some(budget::PERSONAL_TENANT_ID), "preflight")
+            .unwrap();
+        assert_eq!(chain.len(), 1);
+        assert_eq!(chain[0].event.event_type, EventType::RequestReceived);
     }
 }
