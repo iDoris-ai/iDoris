@@ -52,6 +52,7 @@ So nothing was merged and nothing was approved. Every branch below is pushed and
 | 29 | `fix/inspect-17-window-segment-floor` | `fix/inspect-18-second-review` @ `50caf46a` | fix(inspect): address second review of the M5 hardening |
 | 30 | `fix/inspect-18-second-review` | `fix/inspect-19-third-review` @ `aced94db` | fix(inspect): judge digit groups whole or fully decomposed |
 | 31 | `fix/inspect-19-third-review` | `fix/inspect-20-grouping-recall` @ `b498db6a` | fix(inspect): recover grouped entities next to short numbers |
+| 32 | `fix/inspect-20-grouping-recall` | `feat/inspect-21-opaque-in-inspector` @ `228bb1f0` | feat(policy): treat embedded base64 payloads as uninspectable |
 
 Rules for landing (same as PRIME-CHECKPOINT "Safe stacked merge procedure"): merge parent first; before a parent branch is deleted, retarget its child to `main`; no rebase, no force-push; never treat a stale approval as current.
 
@@ -84,6 +85,7 @@ The #421 M5 plan (contract freeze → pure L0 → rule packs → endpoint → IN
 | review fixes | first review: six fail-open paths closed (unreadable content → `local_only`, grouped numbers, invisible separators, encodings); breaker made opt-in after CI caught a conformance break |
 | M5-21..23 | large bodies scanned off the async worker (`inspect_failed` fail-closed); decided reasons carry `privacy_tightened_by_content`; all BMP digit scripts + Latin homoglyphs folded |
 | review fixes 2–4 | false-positive explosion from tab/newline joining removed; digit groups judged as runs, whole group, or full decomposition into entities; `\uXXXX` and math digits folded in place; report-only breakers re-lock after the window |
+| M5-24 | public `/v1/inspect` answers BLOCK/S3 for embedded `data:…;base64,` payloads (the route stage already pinned them local) |
 
 M5 acceptance shape is tested: an id/phone/card injected anywhere in a declared-`any` body (plain content, array parts, tool arguments, JSON numbers, Anthropic `system`, embeddings input, rerank documents) yields zero upstream requests on a non-local card; kill switch stops the next request; 100-way budget race never overspends.
 
