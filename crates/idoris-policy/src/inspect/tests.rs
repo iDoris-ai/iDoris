@@ -633,20 +633,19 @@ fn harmless_encoded_text_and_plain_words_stay_clean() {
 /// used to come back clean.
 #[test]
 fn review_regressions_grouped_split_and_invisible_variants() {
-    let cases: [(&str, &[FindingKind]); 12] = [
+    // F4 (ids split across lines or parts) is deliberately not covered:
+    // joining on line breaks flagged most numeric tables (second review)
+    // and cannot reach across JSON parts anyway.
+    let cases: [(&str, &[FindingKind]); 9] = [
         // F3: neighbouring grouped numbers
         (
             "张三 110101 19900307 7379 138 1234 5678",
             &[FindingKind::CnResidentId, FindingKind::CnMobile],
         ),
         ("Room 1203 138 1234 5678", &[FindingKind::CnMobile]),
-        // F4: split across lines / text parts
-        ("1101011990\n0307737X", &[FindingKind::CnResidentId]),
-        ("110101199003\n07737X\n", &[FindingKind::CnResidentId]),
         // F5: invisible separators and other digit scripts
         ("138\u{00A0}1234\u{00A0}5678", &[FindingKind::CnMobile]),
         ("138\u{200E}1234\u{200E}5678", &[FindingKind::CnMobile]),
-        ("138\t1234\t5678", &[FindingKind::CnMobile]),
         ("138  1234  5678", &[FindingKind::CnMobile]),
         (
             "\u{0661}\u{0663}\u{0668}\u{0661}\u{0662}\u{0663}\u{0664}\u{0665}\u{0666}\u{0667}\u{0668}",
@@ -713,6 +712,12 @@ fn lists_of_short_numbers_are_not_grouped_into_entities() {
         "sort: 3 1 4 1 5 9 2 6 5 3 5 8 9 7 9 3 2 3 8 4 6",
         "scores 12 34 56 78 90 12 34 56 78 90",
         "1\n2\n3\n4\n5\n6\n7\n8\n9\n0\n1\n2\n3\n4\n5\n6\n7\n8\n9",
+        // Second review: flattened logit_bias, a TSV table, ports, years.
+        "logit_bias\n198\n-100\n50256\n-100\n15339\n5\n1734\n10",
+        "1\t1520\t45600\t31200\n2\t1830\t52100\t29900\n3\t2210\t61200\t33400",
+        "ports 8080 8443 9090 3000",
+        "years 2019 2020 2021 2022 2023",
+        "ids 1203 4567 8901 2345 6789",
     ] {
         let response = inspect(input, &open_ctx());
         assert!(response.findings.is_empty(), "{input:?}: {response:?}");
@@ -725,6 +730,31 @@ fn lists_of_short_numbers_are_not_grouped_into_entities() {
     ] {
         assert!(!inspect(input, &open_ctx()).findings.is_empty(), "{input}");
     }
+}
+
+#[test]
+fn escapes_and_math_digits_are_folded_in_place() {
+    let escaped = "\\u0031\\u0033\\u0038\\u0031\\u0032\\u0033\\u0034\\u0035\\u0036\\u0037\\u0038";
+    for input in [
+        format!("电话 {escaped}\\uD800"),
+        "\\u0031\\u0033\\u0038-\\u0031\\u0032\\u0033\\u0034-\\u0035\\u0036\\u0037\\u0038"
+            .to_string(),
+        "\\u0031\\u0033\\u0038 1234 5678".to_string(),
+        "电话 𝟏𝟑𝟖𝟏𝟐𝟑𝟒𝟓𝟔𝟕𝟖".to_string(),
+    ] {
+        let response = inspect(&input, &open_ctx());
+        assert!(
+            kinds(&response).contains(&FindingKind::CnMobile),
+            "{input}: {response:?}"
+        );
+    }
+    // The span covers whole escapes and whole surrogate pairs.
+    let input = format!("tel {escaped}!");
+    let response = inspect(&input, &open_ctx());
+    assert_eq!(covered(&input, &response.findings[0]), escaped);
+    let bold = "𝟏𝟑𝟖𝟏𝟐𝟑𝟒𝟓𝟔𝟕𝟖";
+    let response = inspect(bold, &open_ctx());
+    assert_eq!(covered(bold, &response.findings[0]), bold);
 }
 
 fn valid_id() -> impl Strategy<Value = String> {

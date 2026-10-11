@@ -102,19 +102,23 @@ pub(crate) struct Inspection {
 
 /// Inspects every object key, string and number in `body` — content parts,
 /// tool definitions and arguments included — one value per line. Lines are
-/// digit-group separators, so an identifier split across two parts or two
-/// lines is still found. `declared` must already have passed the caller's
-/// key scope, so remote is allowed unless `kill_switch` is engaged.
+/// separators between values, never part of a digit group. `declared` must
+/// already have passed the caller's key scope, so remote is allowed unless
+/// `kill_switch` is engaged.
 ///
 /// Content L0 cannot read (images, audio, files, `data:…;base64,` payloads,
-/// token-id arrays) is not provably clean (docs/15 §1.1b), so its presence
+/// token ids under `input`) is not provably clean (docs/15 §1.1b), so its presence
 /// alone pins the request to `local_only`.
 pub(crate) fn inspect_body(
     body: &serde_json::Value,
     declared: PrivacyClass,
     kill_switch: bool,
 ) -> Inspection {
-    fn collect(value: &serde_json::Value, out: &mut String, opaque: &mut bool) {
+    // `in_input`: inside an `input` value, where the embeddings API accepts
+    // token ids — any integer array there is unreadable to L0, however
+    // short (a phone number is ~4 tokens). Elsewhere integer arrays are
+    // ordinary data (tool-schema enums, seeds) and stay readable.
+    fn collect(value: &serde_json::Value, out: &mut String, opaque: &mut bool, in_input: bool) {
         match value {
             serde_json::Value::String(text) => {
                 *opaque |= is_data_url(text);
@@ -122,18 +126,25 @@ pub(crate) fn inspect_body(
             }
             serde_json::Value::Number(number) => push_line(out, &number.to_string()),
             serde_json::Value::Array(items) => {
-                *opaque |= items.len() >= MIN_TOKEN_ARRAY
+                *opaque |= in_input
+                    && !items.is_empty()
                     && items.iter().all(|item| item.is_i64() || item.is_u64());
-                items.iter().for_each(|item| collect(item, out, opaque));
+                items
+                    .iter()
+                    .for_each(|item| collect(item, out, opaque, in_input));
             }
             serde_json::Value::Object(map) => {
                 *opaque |= map
                     .get("type")
                     .and_then(serde_json::Value::as_str)
-                    .is_some_and(|kind| OPAQUE_PART_TYPES.contains(&kind));
+                    .is_some_and(|kind| {
+                        OPAQUE_PART_TYPES
+                            .iter()
+                            .any(|opaque| opaque.eq_ignore_ascii_case(kind))
+                    });
                 map.iter().for_each(|(key, item)| {
                     push_line(out, key);
-                    collect(item, out, opaque);
+                    collect(item, out, opaque, key == "input");
                 });
             }
             serde_json::Value::Bool(_) | serde_json::Value::Null => {}
@@ -150,7 +161,7 @@ pub(crate) fn inspect_body(
     }
     let mut text = String::new();
     let mut opaque = false;
-    collect(body, &mut text, &mut opaque);
+    collect(body, &mut text, &mut opaque, false);
     let ctx = InspectCtx {
         declared,
         remote_allowed: !kill_switch,
@@ -222,9 +233,6 @@ const OPAQUE_PART_TYPES: &[&str] = &[
     "input_file",
     "document",
 ];
-/// An all-integer array this long is treated as token ids (the embeddings
-/// API accepts them), which L0 cannot read.
-const MIN_TOKEN_ARRAY: usize = 8;
 
 /// Appends the `inspected` fact: sensitivity, effective privacy, the
 /// distinct finding kinds, and a reason only when content tightened the

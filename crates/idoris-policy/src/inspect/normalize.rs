@@ -7,46 +7,86 @@
 
 pub(super) struct Normalized {
     pub units: Vec<u16>,
-    /// `origin[i]` 是归一化后第 `i` 个 code unit 在原文里的下标。
+    /// `origin[i]..origin_end[i]` is the original range the `i`-th
+    /// normalized unit came from (one unit, or a whole `\uXXXX` escape or
+    /// surrogate pair that collapsed into it).
     origin: Vec<usize>,
+    origin_end: Vec<usize>,
 }
 
 pub(super) fn normalize(units: &[u16]) -> Normalized {
     let mut out = Normalized {
         units: Vec::with_capacity(units.len()),
         origin: Vec::with_capacity(units.len()),
+        origin_end: Vec::with_capacity(units.len()),
     };
-    for (i, &u) in units.iter().enumerate() {
-        let folded = match u {
-            // ZWSP/ZWNJ/ZWJ、WORD JOINER、BOM/ZWNBSP、软连字符，以及双向文字
-            // 控制字符（LRM/RLM/ALM、嵌入/覆盖、隔离）：不可见，直接丢掉。
-            0x200B..=0x200F
-            | 0x2060
-            | 0xFEFF
-            | 0x00AD
-            | 0x061C
-            | 0x202A..=0x202E
-            | 0x2066..=0x2069 => continue,
-            // 不换行空格、各种宽度的空格：按普通空格处理。
-            0x00A0 | 0x2000..=0x200A | 0x202F | 0x205F => u16::from(b' '),
-            // 其他文字的十进制数字（阿拉伯-印度、天城文、泰文……）。
-            _ if decimal_digit_zero(u).is_some() => {
-                decimal_digit_zero(u).map_or(u, |zero| u - zero + u16::from(b'0'))
-            }
-            // 西里尔/希腊字母里和拉丁字母同形的那些（`ѕk-`、`АКIА`）。
-            _ if latin_confusable(u).is_some() => latin_confusable(u).map_or(u, u16::from),
-            // 全角 ASCII（！到～）折回半角。
-            0xFF01..=0xFF5E => u - 0xFEE0,
-            // 全角空格。
-            0x3000 => u16::from(b' '),
-            // 连字符、破折号、减号：数字分组里都按 `-` 处理。
-            0x2010..=0x2015 | 0x2212 => u16::from(b'-'),
-            _ => u,
+    let mut i = 0;
+    while i < units.len() {
+        // A literal `\uXXXX` escape (JSON/JS source) stands for its unit, in
+        // place, so it joins the surrounding text; a lone surrogate is
+        // kept as-is rather than failing the decode.
+        let (unit, width) = if let Some(escaped) = unicode_escape(&units[i..]) {
+            (escaped, 6)
+        } else if let Some(digit) = math_digit(&units[i..]) {
+            (digit, 2)
+        } else {
+            (units[i], 1)
         };
-        out.units.push(folded);
-        out.origin.push(i);
+        if let Some(folded) = fold(unit) {
+            out.units.push(folded);
+            out.origin.push(i);
+            out.origin_end.push(i + width);
+        }
+        i += width;
     }
     out
+}
+
+/// `\uXXXX` at the start of `units`.
+fn unicode_escape(units: &[u16]) -> Option<u16> {
+    let window = units.get(..6)?;
+    if window[0] != u16::from(b'\\') || window[1] != u16::from(b'u') {
+        return None;
+    }
+    window[2..].iter().try_fold(0u16, |acc, &u| {
+        let digit = char::from_u32(u32::from(u))?.to_digit(16)?;
+        Some(acc << 4 | u16::try_from(digit).ok()?)
+    })
+}
+
+/// Mathematical alphanumeric digits U+1D7CE..=U+1D7FF (bold, double-struck,
+/// sans-serif, monospace …), encoded as the surrogate pair D835 DFCE..DFFF.
+fn math_digit(units: &[u16]) -> Option<u16> {
+    match units {
+        [0xD835, low @ 0xDFCE..=0xDFFF, ..] => Some((low - 0xDFCE) % 10 + u16::from(b'0')),
+        _ => None,
+    }
+}
+
+/// One unit's fold, or `None` to drop it.
+fn fold(u: u16) -> Option<u16> {
+    Some(match u {
+        // ZWSP/ZWNJ/ZWJ、WORD JOINER、BOM/ZWNBSP、软连字符，以及双向文字
+        // 控制字符（LRM/RLM/ALM、嵌入/覆盖、隔离）：不可见，直接丢掉。
+        0x200B..=0x200F | 0x2060 | 0xFEFF | 0x00AD | 0x061C | 0x202A..=0x202E | 0x2066..=0x2069 => {
+            return None;
+        }
+        // 不换行空格、各种宽度的空格：按普通空格处理。
+        0x00A0 | 0x2000..=0x200A | 0x202F | 0x205F => u16::from(b' '),
+        // 其他文字的十进制数字（阿拉伯-印度、天城文、泰文……）。
+        _ if decimal_digit_zero(u).is_some() => {
+            decimal_digit_zero(u).map_or(u, |zero| u - zero + u16::from(b'0'))
+        }
+        // 西里尔/希腊字母里和拉丁字母同形的那些（`ѕk-`、`АКIА`）。
+        _ if latin_confusable(u).is_some() => latin_confusable(u).map_or(u, u16::from),
+        // 全角 ASCII（！到～）折回半角。
+        0xFF01..=0xFF5E => u - 0xFEE0,
+        // 全角空格。
+        0x3000 => u16::from(b' '),
+        // 连字符、破折号、减号：数字分组里都按 `-` 处理。
+        0x2010..=0x2015 | 0x2212 => u16::from(b'-'),
+        _ => u,
+    })
 }
 
 /// BMP blocks whose ten decimal digits are contiguous, by the code point of
@@ -103,7 +143,7 @@ impl Normalized {
     /// `length` 必须 ≥ 1（命中永远非空）。
     pub fn original_span(&self, start: usize, length: usize) -> (usize, usize) {
         let first = self.origin[start];
-        let last = self.origin[start + length - 1];
-        (first, last + 1 - first)
+        let end = self.origin_end[start + length - 1];
+        (first, end - first)
     }
 }

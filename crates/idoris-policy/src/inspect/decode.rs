@@ -37,7 +37,6 @@ pub(super) fn scan(units: &[u16], hits: &mut Vec<Hit>) {
             report(&bytes, start, end - start, hits);
         }
     }
-    scan_unicode_escapes(units, hits);
     for (start, end) in runs(units, |b| {
         b.is_ascii_alphanumeric() || b"%._~+-".contains(&b)
     }) {
@@ -84,37 +83,6 @@ fn report(decoded: &[u8], start: usize, length: usize, hits: &mut Vec<Hit>) {
             length,
             sensitivity: inner.sensitivity,
         });
-    }
-}
-
-/// Runs of at least three literal `\uXXXX` escapes (JSON/JS source style).
-fn scan_unicode_escapes(units: &[u16], hits: &mut Vec<Hit>) {
-    let escape_at = |i: usize| -> Option<u16> {
-        let window = units.get(i..i + 6)?;
-        if window[0] != u16::from(b'\\') || window[1] != u16::from(b'u') {
-            return None;
-        }
-        window[2..].iter().try_fold(0u16, |acc, &u| {
-            let digit = hex_value(u8::try_from(u).ok()?)?;
-            Some(acc << 4 | u16::from(digit))
-        })
-    };
-    let mut i = 0;
-    while i < units.len() {
-        let start = i;
-        let mut decoded = Vec::new();
-        while let Some(unit) = escape_at(i) {
-            decoded.push(unit);
-            i += 6;
-        }
-        if decoded.len() >= MIN_PERCENT_ESCAPES
-            && let Ok(text) = String::from_utf16(&decoded)
-        {
-            report(text.as_bytes(), start, i - start, hits);
-        }
-        if i == start {
-            i += 1;
-        }
     }
 }
 
