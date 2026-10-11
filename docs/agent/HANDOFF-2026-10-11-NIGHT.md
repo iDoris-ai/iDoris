@@ -1,17 +1,20 @@
 # iDoris Handoff — 2026-10-11 night — M4 integration + M5 gate one + resilience
 
+**Where this file lives:** branch `docs/handoff-2026-10-11-night` (not on `main` yet — nothing tonight is merged). To read it on a fresh clone: `git fetch origin && git switch docs/handoff-2026-10-11-night`. This branch also contains #421's handoff and the PR bodies in `docs/agent/pr-queue-2026-10-11/`.
+
 Read after `HANDOFF-2026-10-11-M4-LANDING-TAIL.md` (#421). This file only adds what happened between 18:10 and the stop time on 2026-10-11 (+07).
 
 ## Owner instruction for this session
 
 > "GO straight tonight, no reviewer, just submit pr based on old pr without review, stack it, i review tmr"
 > "stop your jobs before 9:40 PM, before that time, commit all, push"
+> then at 21:10: "继续推进，还有点token" (keep going) — the stop time was lifted; work stopped at 22:08 with everything pushed.
 
 So nothing was merged and nothing was approved. Every branch below is pushed and stacked on the previous one; the owner reviews tomorrow. No approval was fabricated and the "approval from someone other than the last pusher" rule was not touched.
 
 ## Environment facts found tonight
 
-- `gh` token for `jhfnetboy` in `~/.config/gh/hosts.yml` is **invalid** (HTTP 401). **No PR could be opened.** All PR titles/bodies plus an idempotent opener are in `/Volumes/UltraDisk/Dev2/iDoris/iDoris-wt/pr-queue/` — after `gh auth login -h github.com`, run `bash /Volumes/UltraDisk/Dev2/iDoris/iDoris-wt/pr-queue/create-prs.sh` (opens them in stack order with the right bases; skips heads that already have an open PR).
+- `gh` token for `jhfnetboy` in `~/.config/gh/hosts.yml` is **invalid** (HTTP 401). **No PR could be opened.** All PR titles/bodies plus an idempotent opener are committed in `docs/agent/pr-queue-2026-10-11/` on this branch (one `NN-*.md` body per PR, `create-prs.sh` opens them in stack order) — after `gh auth login -h github.com`, run `bash docs/agent/pr-queue-2026-10-11/create-prs.sh` (opens them in stack order with the right bases; skips heads that already have an open PR).
 - HTTPS git has no credential. Pushes went over SSH with `~/.ssh/cleston-ed25519`, which authenticates as **clestons** (the repo's configured git user). `~/.ssh/id_ed25519` authenticates as jhfnetboy.
 - Consequence for the approval rule: **clestons is the last pusher on every branch below, so jhfnetboy (or anyone but clestons) can approve them.**
 - This Mac had no stale iDoris worktrees or local branches; #421's cleanup checklist had nothing to delete here. Tonight's worktrees live in `/Volumes/UltraDisk/Dev2/iDoris/iDoris-wt/` (one per branch, all clean and pushed at stop time); once a branch's PR is merged its worktree can be removed. Cargo target dirs `iDoris-wt/target`, `target-gaps`, `target-review` are scratch (safe to delete).
@@ -69,9 +72,9 @@ Rules for landing (same as PRIME-CHECKPOINT "Safe stacked merge procedure"): mer
 
 1. **Land M4 first, independently of everything below.** Approve and merge the original tail PRs (#361 → … → #418, #398 → #408, #374) in parent-first order, retargeting children before deleting parents. `integration/m4-landing-tail` only exists to prove they compose and to carry the acceptance run; after the tail is in `main` its diff collapses to merge commits. Then merge `test/m4-acceptance-gaps` (tests only), re-run the acceptance set on `main`, tag `v0.3.0`.
 2. **Contract first:** `feat/inspect-01-contract-freeze` is the only public-wire decision point (request shape, kind list, UTF-16 spans). Settle decision 3 here before reviewing the rest.
-3. **Pure code next, low risk:** inspect-02/03/04/10/11/12/16 and resilience-01 are IO-free (`idoris-policy`); each commit message lists the hand-run mutations that turn its tests red.
-4. **Wiring, highest attention:** inspect-05 (endpoint + auth split), inspect-06/07 (INSPECTED placement — the privacy-critical change), inspect-08 (kill switch), inspect-09 (egress counter), resilience-02..08 (breakers; off by default in the binary).
-5. **Read the review-fix PRs as a sequence** (`fix/inspect-13` → `-17` → `-18` → `-19` → `-20`): they record four rounds of trade-offs on the digit-group rule. The final rule is in `-20`; the earlier ones explain why simpler rules were rejected. If you prefer, squash-review `-13..-20` as one diff against `feat/inspect-16-homoglyph-folding`.
+3. **Pure code next, low risk:** inspect-02/03/04/10/11/12/16, inspect-21, resilience-01 and gate-two-02 (broker core) are IO-free (`idoris-policy`); each commit message lists the hand-run mutations that turn its tests red.
+4. **Wiring, highest attention:** inspect-05 (endpoint + auth split), inspect-06/07 (INSPECTED placement — the privacy-critical change), inspect-08 (kill switch), inspect-09 (egress counter), resilience-02..08 (breakers; off by default in the binary), event-log-28..30 (Event Log chain on embeddings/rerank/messages), gate-two-01 (changes the bytes sent to off-host upstreams).
+5. **Read the review-fix PRs as a sequence** (`fix/inspect-13` → `-17` → `-18` → `-19` → `-20`; `fix/review-5-hardening` is separate and fixes M5-24..30): they record four rounds of trade-offs on the digit-group rule. The final rule is in `-20`; the earlier ones explain why simpler rules were rejected. If you prefer, squash-review `-13..-20` as one diff against `feat/inspect-16-homoglyph-folding`.
 6. Everything is stacked, so a change requested low in the stack means merging that branch forward into its children (no rebase, no force-push), the way the breaker opt-in fix was propagated tonight.
 
 ## M4 status
@@ -154,7 +157,7 @@ A narrow third review of the second fix measured a recall regression (one canoni
 
 ## Fourth independent review — final digit-group rule
 
-A fourth review found the third fix's DP correct and linear but measured a recall regression (card + expiry/CVV in one group, a phone after a time, two phones + a digit — all missed) and 1.8% false positives on rows of small integers. `fix/inspect-20-grouping-recall` (stack top) settles it: multi-run windows must be a real written form (mobile 3-4-4 / 3-8 / 7-4 / 4-3-4 + 86 variants; id 6-8-4 / 6-12 / 6-4-4-4; card 4-4-4-4[-1..3] / 6-13), and a group is one decomposition into such entities with at most two ≤ 3-digit numbers at each end. Measured on 5000 random rows each: small-integer rows 0%, 5–6 four-digit numbers 0%, 8 four-digit numbers 0.26%; remaining false positives are groups written exactly like a phone (3-4-4) or card (4-4-4-4 + issuer prefix + Luhn), as since M5-02. A final timeboxed check (400k fuzzed groups) found no crash and no entity-free decomposition; its one realistic miss, the `0086` prefix, is fixed on the same branch. **Owner trade-offs:** 4-digit neighbours (`Room 1203 138 1234 5678`, an id followed by a year) and ids split across lines/parts are not found; allowing 4-digit neighbours flagged ~10% of 5-number rows.
+A fourth review found the third fix's DP correct and linear but measured a recall regression (card + expiry/CVV in one group, a phone after a time, two phones + a digit — all missed) and 1.8% false positives on rows of small integers. `fix/inspect-20-grouping-recall` (stack top at that time) settles it: multi-run windows must be a real written form (mobile 3-4-4 / 3-8 / 7-4 / 4-3-4 + 86 variants; id 6-8-4 / 6-12 / 6-4-4-4; card 4-4-4-4[-1..3] / 6-13), and a group is one decomposition into such entities with at most two ≤ 3-digit numbers at each end. Measured on 5000 random rows each: small-integer rows 0%, 5–6 four-digit numbers 0%, 8 four-digit numbers 0.26%; remaining false positives are groups written exactly like a phone (3-4-4) or card (4-4-4-4 + issuer prefix + Luhn), as since M5-02. A final timeboxed check (400k fuzzed groups) found no crash and no entity-free decomposition; its one realistic miss, the `0086` prefix, is fixed on the same branch. **Owner trade-offs:** 4-digit neighbours (`Room 1203 138 1234 5678`, an id followed by a year) and ids split across lines/parts are not found; allowing 4-digit neighbours flagged ~10% of 5-number rows.
 
 ## CI caught a real regression tonight
 
@@ -163,9 +166,9 @@ From M5-14 on, CI failed "Rust release conformance" and the subscription job's s
 
 ## Next (resume here)
 
-Stack top: `fix/review-5-hardening`. CI was green through `feat/event-log-28-protocol-chain`; the results for `feat/event-log-29-protocol-dispatch`, `-30-messages-stream`, `feat/gate-two-01`, `-02` and `fix/review-5-hardening` were not visible at stop time (anonymous GitHub API rate limit) — check them first; all of them passed router lib + integration suites locally, and the router-touching ones passed Rust conformance locally except the de-correlation and review-5 slices, whose changed paths conformance does not exercise. Every worktree under `/Volumes/UltraDisk/Dev2/iDoris/iDoris-wt/` was clean and pushed at stop time; `docs/handoff-2026-10-11-night` is this file.
+Stack top: `fix/review-5-hardening`. CI was green through `feat/event-log-28-protocol-chain`; the results for `feat/event-log-29-protocol-dispatch`, `-30-messages-stream`, `feat/gate-two-01`, `-02` and `fix/review-5-hardening` were not visible at stop time (anonymous GitHub API rate limit) — check them first; all of them passed router lib + integration suites locally, and the router-touching ones passed Rust conformance locally except the de-correlation and review-5 slices, whose changed paths conformance does not exercise. **Nothing depends on the original Mac:** every branch below is on `origin`, and the PR bodies/opener are committed in `docs/agent/pr-queue-2026-10-11/`. (On that Mac, every worktree under `/Volumes/UltraDisk/Dev2/iDoris/iDoris-wt/` was clean and pushed at stop time.) `docs/handoff-2026-10-11-night` is this file.
 
-1. `gh auth login -h github.com`, then `bash /Volumes/UltraDisk/Dev2/iDoris/iDoris-wt/pr-queue/create-prs.sh` (opens all queued PRs in stack order, bases set, idempotent). Re-run the intermittent macOS subscription job with its log.
+1. `gh auth login -h github.com`, then `bash docs/agent/pr-queue-2026-10-11/create-prs.sh` (opens all queued PRs in stack order, bases set, idempotent). Re-run the intermittent macOS subscription job with its log.
 2. Owner review per "How to review this stack" above; land the M4 tail first, re-run the acceptance set on `main`, tag `v0.3.0`.
 3. Owner decisions listed above (1–8). Each unblocks a ready next slice:
    - redact consent → wire the M5-12 engine into `/v1/inspect` and the route stage (stream restore already exists);
