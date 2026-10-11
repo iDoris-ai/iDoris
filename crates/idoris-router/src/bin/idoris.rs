@@ -37,9 +37,13 @@ use idoris_router::{
 use std::{
     future::{Future, IntoFuture},
     io::Read,
+    net::IpAddr,
     sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
 };
 use tokio_util::sync::CancellationToken;
+
+const BIND_HOST_ENV: &str = "IDORIS_BIND_HOST";
 
 #[tokio::main]
 async fn main() {
@@ -83,6 +87,80 @@ fn env_flag(name: &str) -> bool {
     std::env::var(name).is_ok_and(|v| v == "1")
 }
 
+fn parse_bind_host(raw: Option<&str>) -> Result<IpAddr, String> {
+    let Some(raw) = raw.map(str::trim).filter(|raw| !raw.is_empty()) else {
+        return Ok(BIND_HOST);
+    };
+    let host = raw
+        .parse::<IpAddr>()
+        .map_err(|_| format!("{BIND_HOST_ENV} 必须是明确的 IP 地址，不能使用主机名：'{raw}'"))?;
+    if host.is_unspecified()
+        || host.is_multicast()
+        || matches!(host, IpAddr::V4(ip) if ip == std::net::Ipv4Addr::BROADCAST)
+    {
+        return Err(format!(
+            "{BIND_HOST_ENV} 禁止通配/组播/广播地址：'{host}'；请绑定明确接口地址"
+        ));
+    }
+    if !host.is_loopback() && !is_tailscale_address(host) {
+        return Err(format!(
+            "{BIND_HOST_ENV}={host} 不是 loopback 或 Tailscale tailnet 地址；M4 远程入口只允许精确 tailnet 接口"
+        ));
+    }
+    Ok(host)
+}
+
+fn is_tailscale_address(host: IpAddr) -> bool {
+    match host {
+        IpAddr::V4(ip) => {
+            let [a, b, _, _] = ip.octets();
+            a == 100 && (64..=127).contains(&b)
+        }
+        IpAddr::V6(ip) => {
+            if let Some(mapped) = ip.to_ipv4_mapped() {
+                return is_tailscale_address(IpAddr::V4(mapped));
+            }
+            let segments = ip.segments();
+            segments[0] == 0xfd7a && segments[1] == 0x115c && segments[2] == 0xa1e0
+        }
+    }
+}
+
+fn server_now_ms() -> Result<i64, String> {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| "系统时间早于 Unix epoch，无法验证 virtual key".to_string())?
+        .as_millis();
+    i64::try_from(millis).map_err(|_| "系统时间超出 virtual key 可验证范围".to_string())
+}
+
+fn validate_bind_authority(
+    bind_host: IpAddr,
+    deploy_mode: idoris_contracts::DeployMode,
+    dev_no_key_enabled: bool,
+    has_active_key: bool,
+) -> Result<(), String> {
+    if bind_host.is_loopback() {
+        return Ok(());
+    }
+    if deploy_mode == idoris_contracts::DeployMode::Tenant {
+        return Err(format!(
+            "{BIND_HOST_ENV}={bind_host} 是非 loopback；tenant 模式在 M4 仍依赖可信消费方传入已验明的 X-iDoris-Tenant，因此只允许 loopback"
+        ));
+    }
+    if dev_no_key_enabled {
+        return Err(format!(
+            "{BIND_HOST_ENV}={bind_host} 是非 loopback；IDORIS_DEV_NO_KEY=1 只允许 loopback"
+        ));
+    }
+    if !has_active_key {
+        return Err(format!(
+            "{BIND_HOST_ENV}={bind_host} 是非 loopback，但当前没有有效 virtual key；拒绝启动"
+        ));
+    }
+    Ok(())
+}
+
 async fn run(options: cli::ServeOptions) -> Result<(), String> {
     let port =
         parse_port(std::env::var("IDORIS_PORT").ok().as_deref()).map_err(|err| err.to_string())?;
@@ -98,6 +176,7 @@ async fn run(options: cli::ServeOptions) -> Result<(), String> {
     let deploy_mode =
         profile::deploy_mode_from_env(std::env::var("IDORIS_DEPLOY_MODE").ok().as_deref());
     let dev_no_key_enabled = env_flag("IDORIS_DEV_NO_KEY");
+    let bind_host = parse_bind_host(std::env::var(BIND_HOST_ENV).ok().as_deref())?;
 
     let components_dir =
         config::resolve_env("IDORIS_COMPONENTS_DIR", components::DEFAULT_COMPONENTS_DIR)?;
@@ -156,6 +235,17 @@ async fn run(options: cli::ServeOptions) -> Result<(), String> {
     // before tenant storage/config bootstrap can surface a later error.
     let persistent = storage::bootstrap_process(deploy_mode)
         .map_err(|err| format!("无法初始化持久化存储：{err}"))?;
+    let has_active_key = {
+        let now_ms = server_now_ms()?;
+        let store = persistent
+            .virtual_keys
+            .lock()
+            .map_err(|_| "virtual key store lock poisoned".to_string())?;
+        store
+            .has_active_key(now_ms)
+            .map_err(|err| format!("无法检查 virtual key 启动权限：{err}"))?
+    };
+    validate_bind_authority(bind_host, deploy_mode, dev_no_key_enabled, has_active_key)?;
     let virtual_key_authenticator = VirtualKeyAuthenticator::new(persistent.virtual_keys.clone());
 
     let catalog_path = config::resolve_env("IDORIS_CATALOG", "config/catalog.yaml")?;
@@ -195,12 +285,13 @@ async fn run(options: cli::ServeOptions) -> Result<(), String> {
         budget_ledger: Some(persistent.budget),
         record_store: Some(persistent.records),
         virtual_key_authenticator: Some(virtual_key_authenticator),
+        remote_bind_requires_auth: !bind_host.is_loopback(),
         dev_no_key_enabled,
         event_log: Some(persistent.event_log),
         ..AppState::default()
     };
 
-    let addr = std::net::SocketAddr::from((BIND_HOST, port));
+    let addr = std::net::SocketAddr::from((bind_host, port));
     let data_listener = tokio::net::TcpListener::bind(addr)
         .await
         .map_err(|err| format!("无法绑定 {addr}：{err}"))?;
@@ -595,5 +686,52 @@ mod tests {
             .unwrap()
             .unwrap()
             .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod bind_tests {
+    #![allow(clippy::unwrap_used)]
+
+    use super::*;
+
+    #[test]
+    fn bind_host_is_ip_literal_only_and_rejects_wildcards() {
+        assert_eq!(parse_bind_host(None).unwrap(), BIND_HOST);
+        assert_eq!(
+            parse_bind_host(Some("100.64.0.5")).unwrap(),
+            "100.64.0.5".parse::<IpAddr>().unwrap()
+        );
+        assert!(parse_bind_host(Some("localhost")).is_err());
+        assert!(parse_bind_host(Some("0.0.0.0")).is_err());
+        assert!(parse_bind_host(Some("::")).is_err());
+        assert!(parse_bind_host(Some("192.168.1.20")).is_err());
+        assert!(parse_bind_host(Some("8.8.8.8")).is_err());
+        assert!(parse_bind_host(Some("fd7a:115c:a1e0::1")).is_ok());
+    }
+
+    #[test]
+    fn non_loopback_requires_active_key_and_never_allows_dev_no_key() {
+        let remote: IpAddr = "100.64.0.5".parse().unwrap();
+        assert!(
+            validate_bind_authority(BIND_HOST, idoris_contracts::DeployMode::Tenant, true, false)
+                .is_ok()
+        );
+        assert!(
+            validate_bind_authority(remote, idoris_contracts::DeployMode::Personal, false, true)
+                .is_ok()
+        );
+        assert!(
+            validate_bind_authority(remote, idoris_contracts::DeployMode::Personal, false, false)
+                .is_err()
+        );
+        assert!(
+            validate_bind_authority(remote, idoris_contracts::DeployMode::Personal, true, true)
+                .is_err()
+        );
+        assert!(
+            validate_bind_authority(remote, idoris_contracts::DeployMode::Tenant, false, true)
+                .is_err()
+        );
     }
 }

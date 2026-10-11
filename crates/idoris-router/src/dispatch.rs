@@ -438,7 +438,7 @@ pub async fn dispatch_local(
     public_dispatch_result(
         dispatch_local_inner(
             LocalSelection::Cards(cards),
-            LocalExecutionContext::new(supervisor, budget_ledger, None, None, None),
+            LocalExecutionContext::new(supervisor, budget_ledger, None, None, None, None),
             profile,
             input,
             messages,
@@ -463,7 +463,7 @@ pub async fn dispatch_local_preselected(
     public_dispatch_result(
         dispatch_local_inner(
             LocalSelection::Preselected(selected),
-            LocalExecutionContext::new(supervisor, budget_ledger, None, None, None),
+            LocalExecutionContext::new(supervisor, budget_ledger, None, None, None, None),
             profile,
             input,
             messages,
@@ -510,6 +510,7 @@ pub(crate) struct LocalExecutionContext<'a> {
     budget_event: Option<&'a crate::BudgetReservedEventContext>,
     dispatched_event: Option<&'a crate::DispatchedEventContext>,
     completed_event: Option<&'a crate::CompletedEventContext>,
+    budget_settled_event: Option<&'a crate::BudgetSettledEventContext>,
 }
 
 impl<'a> LocalExecutionContext<'a> {
@@ -519,6 +520,7 @@ impl<'a> LocalExecutionContext<'a> {
         budget_event: Option<&'a crate::BudgetReservedEventContext>,
         dispatched_event: Option<&'a crate::DispatchedEventContext>,
         completed_event: Option<&'a crate::CompletedEventContext>,
+        budget_settled_event: Option<&'a crate::BudgetSettledEventContext>,
     ) -> Self {
         Self {
             supervisor,
@@ -526,6 +528,7 @@ impl<'a> LocalExecutionContext<'a> {
             budget_event,
             dispatched_event,
             completed_event,
+            budget_settled_event,
         }
     }
 }
@@ -549,6 +552,7 @@ async fn dispatch_local_inner(
         budget_event,
         dispatched_event,
         completed_event,
+        budget_settled_event,
     } = execution;
     let tenant_id = profile.tenant_id.as_deref();
     let prompt = input.prompt;
@@ -728,6 +732,17 @@ async fn dispatch_local_inner(
         {
             return Err(ObservedDispatchError::EventLogUnavailable);
         }
+    }
+
+    // Keep the settled event after Completed while charging before the
+    // fallible Completed append. A failed settled-event append cannot refund.
+    if let Some(settled_minor) = actual_cost_minor
+        && let Some(context) = budget_settled_event
+        && crate::append_budget_settled(context, selected, settled_minor)
+            .await
+            .is_err()
+    {
+        eprintln!("idoris: budget.settled event write failed after committed settlement");
     }
 
     match chat_result {
