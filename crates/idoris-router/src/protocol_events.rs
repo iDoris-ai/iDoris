@@ -1,9 +1,11 @@
 //! The Event Log chain for `/v1/embeddings`, `/v1/rerank` and
 //! `/v1/messages`. M4 acceptance says any request's record id must find
 //! its decision chain; until now only chat wrote one. These endpoints now
-//! append the same leading facts as chat — `request.received` (before auth),
-//! `inspected`, `profiled`, `decided` — with the same correlation checks and
-//! the same fail-closed 503 when an append fails.
+//! append the same facts as chat's proxy path — `request.received` (before
+//! auth), `inspected`, `profiled`, `decided`, then `dispatched` right before
+//! the upstream send and `completed` once it actually executed — with the
+//! same correlation checks and the same fail-closed 503 when an append
+//! fails. The `/v1/messages` streaming branch stops at `decided` for now.
 
 use std::sync::Arc;
 
@@ -15,9 +17,11 @@ use crate::correlation::{self, RequestCorrelation};
 use crate::dispatch::{DispatchError, Selected};
 use crate::inspect::Inspection;
 use crate::profile::ParsedProfile;
+use crate::proxy::{ExecutionDisposition, ForwardOutcome};
 use crate::routing_policy::RouteDecision;
 use crate::{
-    AppState, HEADER_REQUEST_ID, append_decided, append_profiled, append_request_received, budget,
+    AppState, CompletedEventContext, DispatchedEventContext, HEADER_REQUEST_ID, append_completed,
+    append_decided, append_dispatched, append_profiled, append_request_received, budget,
     correlation_error_response, event_log_unavailable_response, event_request_id, header_text,
 };
 
@@ -88,6 +92,48 @@ impl ProtocolEvents {
         )
         .await
         .map_err(|()| event_log_unavailable_response())
+    }
+
+    /// Called by the proxy right before the send; an error stops the send.
+    pub(crate) async fn dispatched(&self, selected: &Selected) -> Result<(), ()> {
+        let context = DispatchedEventContext {
+            event_log: self.log.clone(),
+            tenant_id: self.tenant_id.clone(),
+            record_id: self.record_id.clone(),
+            correlation: self.correlation.clone(),
+        };
+        append_dispatched(&context, selected).await
+    }
+
+    /// Only an upstream call that actually executed completes: cache hits,
+    /// replays and refused or unsent requests record nothing here.
+    pub(crate) async fn completed(
+        &self,
+        selected: &Selected,
+        outcome: &ForwardOutcome,
+    ) -> Result<(), Response> {
+        if outcome.cached
+            || matches!(
+                outcome.execution,
+                ExecutionDisposition::NotExecuted | ExecutionDisposition::Replay
+            )
+        {
+            return Ok(());
+        }
+        let status = if (200..300).contains(&outcome.status) {
+            "success"
+        } else {
+            "failure"
+        };
+        let context = CompletedEventContext {
+            event_log: self.log.clone(),
+            tenant_id: self.tenant_id.clone(),
+            record_id: self.record_id.clone(),
+            correlation: self.correlation.clone(),
+        };
+        append_completed(&context, selected, status)
+            .await
+            .map_err(|()| event_log_unavailable_response())
     }
 
     pub(crate) async fn decided(

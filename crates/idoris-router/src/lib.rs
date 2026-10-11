@@ -718,15 +718,30 @@ async fn embeddings(
         privacy: parsed.task.privacy.unwrap_or(PrivacyClass::LocalOnly),
         require_openai_usage: false,
     };
-    let outcome = state
+    let outcome = match state
         .proxy
-        .forward_buffered_path(
+        .forward_buffered_path_observed(
             &selected.card.endpoint,
             proxy::BufferedUpstreamPath::EMBEDDINGS,
             &value,
             &opts,
+            || async {
+                if let Some(events) = &events {
+                    events.dispatched(&selected).await?;
+                }
+                Ok::<(), ()>(())
+            },
         )
-        .await;
+        .await
+    {
+        Ok(outcome) => outcome,
+        Err(()) => return event_log_unavailable_response(),
+    };
+    if let Some(events) = &events
+        && let Err(response) = events.completed(&selected, &outcome).await
+    {
+        return response;
+    }
     let status = StatusCode::from_u16(outcome.status).unwrap_or(StatusCode::BAD_GATEWAY);
     let mut response = (status, outcome.body).into_response();
     let content_type = outcome
@@ -895,15 +910,30 @@ async fn rerank(
         privacy: parsed.task.privacy.unwrap_or(PrivacyClass::LocalOnly),
         require_openai_usage: false,
     };
-    let outcome = state
+    let outcome = match state
         .proxy
-        .forward_buffered_path(
+        .forward_buffered_path_observed(
             &selected.card.endpoint,
             proxy::BufferedUpstreamPath::RERANK,
             &value,
             &opts,
+            || async {
+                if let Some(events) = &events {
+                    events.dispatched(&selected).await?;
+                }
+                Ok::<(), ()>(())
+            },
         )
-        .await;
+        .await
+    {
+        Ok(outcome) => outcome,
+        Err(()) => return event_log_unavailable_response(),
+    };
+    if let Some(events) = &events
+        && let Err(response) = events.completed(&selected, &outcome).await
+    {
+        return response;
+    }
     let status = StatusCode::from_u16(outcome.status).unwrap_or(StatusCode::BAD_GATEWAY);
     let mut response = (status, outcome.body).into_response();
     let content_type = outcome
@@ -1090,15 +1120,30 @@ async fn messages(
         privacy: parsed.task.privacy.unwrap_or(PrivacyClass::LocalOnly),
         require_openai_usage: false,
     };
-    let outcome = state
+    let outcome = match state
         .proxy
-        .forward_buffered_path(
+        .forward_buffered_path_observed(
             &selected.card.endpoint,
             proxy::BufferedUpstreamPath::MESSAGES,
             &value,
             &opts,
+            || async {
+                if let Some(events) = &events {
+                    events.dispatched(&selected).await?;
+                }
+                Ok::<(), ()>(())
+            },
         )
-        .await;
+        .await
+    {
+        Ok(outcome) => outcome,
+        Err(()) => return event_log_unavailable_response(),
+    };
+    if let Some(events) = &events
+        && let Err(response) = events.completed(&selected, &outcome).await
+    {
+        return response;
+    }
     let status = StatusCode::from_u16(outcome.status).unwrap_or(StatusCode::BAD_GATEWAY);
     let mut response = (status, outcome.body).into_response();
     let content_type = outcome

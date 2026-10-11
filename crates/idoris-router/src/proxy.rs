@@ -776,6 +776,32 @@ impl ChatProxy {
         .await
     }
 
+    /// [`Self::forward_buffered_path`] with a pre-send observer (records
+    /// `dispatched` for the protocol endpoints).
+    pub(crate) async fn forward_buffered_path_observed<F, Fut, E>(
+        &self,
+        endpoint: &str,
+        path: BufferedUpstreamPath,
+        body: &Value,
+        opts: &ForwardOpts<'_>,
+        observer: F,
+    ) -> Result<ForwardOutcome, E>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<(), E>>,
+    {
+        self.forward_buffered_path_with_success_gate_observed(
+            endpoint,
+            path,
+            body,
+            opts,
+            |_| Ok(()),
+            observer,
+        )
+        .await
+    }
+
+    #[cfg(test)]
     pub(crate) async fn forward_buffered_path(
         &self,
         endpoint: &str,
@@ -811,6 +837,7 @@ impl ChatProxy {
         .await
     }
 
+    #[cfg(test)]
     async fn forward_buffered_path_with_success_gate<F>(
         &self,
         endpoint: &str,
