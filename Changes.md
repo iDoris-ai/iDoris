@@ -3,7 +3,7 @@
 ## 2026-10-12 凌晨
 
 - #484–#486 完成 M4 tenant-key 夹具、入口/审计鉴权和验收回移；9 端点有效请求拒绝矩阵、3 项撤修负控、角色拒绝先于 request.received、四接口缓存撤销均有证据。
-- M4 安全候选 687c6ce：router 441/441，完整 Rust/TS 门禁、release Rust conformance 134/8，通过 wire 1.0.1；#483–#485 远端 CI 全绿，仍无批准/main 合并/tag。
+- M4 安全候选 687c6ce：router 441/441，完整 Rust/TS 门禁、release Rust conformance 134/8，通过 wire 1.0.1；#483–#486 远端 CI 全绿，仍无批准/main 合并/tag。
 - 发布准备仍缺 router 包版本对齐：health 使用 Cargo 0.2.0，而 v0.3.0 archive smoke 要求 0.3.0；下一片处理元数据和绑定密钥迁移说明。
 
 - #481 验证四个推理接口在成功缓存后撤销 tenant key：401、无重放、无新增租户事件/审计、仍为 1 POST；撤 active 条件负控失败，最终 router 505/505，全门禁通过。

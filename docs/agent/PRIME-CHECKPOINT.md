@@ -169,7 +169,7 @@ Core product invariants:
   15 key HTTP tests pass. Full serial feature-enabled Rust (router 441), strict
   clippy/fmt/deny and all pnpm gates pass. Rebuilt release Rust/seeder and shared
   conformance pass **134/8**, wire **1.0.1**, on source head `687c6ce`.
-- #483–#485 remote checks are SUCCESS; #486 is newly pushed. Independent
+- #483–#486 complete remote push/PR checks are SUCCESS. Independent
   approval/main landing/v0.3.0 remain absent. Do not treat candidate verification
   as real-main acceptance or publish early.
 - Release preparation gap found: release.yml expects tag-derived 0.3.0 during
