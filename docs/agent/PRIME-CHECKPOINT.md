@@ -143,23 +143,43 @@ Core product invariants:
   pass; full serial feature-enabled Rust (policy 135/router 504), fmt/clippy/
   deny and all pnpm gates pass (134/8). No runtime wiring, streaming, arbitrary
   encoded payload handling or public/storage contract was added. C-3 is not
-  production-enforced yet. Remote CI is newly started; FU-215 remains PR_OPEN.
-- All new code is committed and pushed. Latest validated stack head is #480;
+  production-enforced yet. All remote push/PR CI is SUCCESS; FU-215 remains PR_OPEN.
+- #481 `81c2e75` adds warmed-cache revocation acceptance for all four buffered
+  inference endpoints: real cache hit before revoke, then 401/no cached payload,
+  one upstream POST and no added tenant events/audit rows. Removing SQL's active
+  predicate fails with 200 versus 401. Restored full gates pass (router 505,
+  shared conformance 134/8). This is test-only evidence, not a new behavior fix.
+- M4 #423 did not contain #374's latest repaired head. New #482 `2abf0c2`
+  branches from #424 and ordinarily merges `2d15076`; 34 changed test lines.
+  Full feature-enabled serial Rust (router 435), clippy/fmt/deny, every pnpm
+  gate and whitespace checks pass. Real paid-chat chain lookup, Event Log-only
+  audit and frozen exact-ready snapshot tests execute. Wire remains 1.0.1.
+- #483 `98e7203` (155 changed lines) backports applicable #463 storage/issuance
+  changes onto #482: nullable explicit tenant binding, legacy migration,
+  validated local CLI binding. Full gates pass (router 436, shared 134/8).
+  This alone does not enforce HTTP tenant authority. Next prepare real bound-key
+  conformance/fixtures and middleware/audit enforcement per its repository plan
+  `docs/agent/plans/M4-tenant-key-backport.md`, then final combined release gates.
+  The urgent security repair must not depend on publishing the entire M5 stack.
+- #481/#482 remote Rust/macOS checks were still progressing at the last poll;
+  #483 is newly pushed. No independent approval, main merge or tag exists.
+- All new code is committed and pushed. Latest M5 validated stack head is #481;
+  latest M4 storage-only backport head is #483;
   #476 remains the historical combined integration snapshot, not a branch to
   merge its descendants into (that would collapse the dependent PR diffs).
-- Resume: inspect #480/other fresh CI and incoming independent reviews; follow
-  the repository merge gates. Continue decision-free safety review/validation
-  from the first genuinely unresolved item, without reopening fixed cases.
+- Resume: inspect #481–#483 CI/reviews, then continue the M4 tenant-key backport
+  from its first unfinished plan step. Follow the independent approval/merge
+  gates; keep REDACT consent and Admin v1 public writes pending. Do not recreate
+  completed tests or merge a descendant into its open review parent.
 
 - Active worktrees live beside the main checkout under `/Users/jason/Dev/iDoris/`.
-  Cargo targets must be isolated when building differing worktree revisions;
-  a shared target reused stale workspace libraries during the first tenant
-  build. `target-identity-night` was cleaned after validation. Current buffered
-  validated budget-safety-02 uses `target-identity32-night`; budget-safety-03
-  used `target-version-night`, now reused after policy clean for gate-two-03; release conformance uses
-  `target-inspect22-release`. Clean workspace packages before switching source
-  revisions while retaining dependency cache. Durable validation logs now live
-  in `night-evidence-2026-10-12/` beside the checkout; `/tmp` was cleared.
+  Current debug caches: `target-identity32-night` built M4 validation #482;
+  `target-version-night` built M4 storage #483 (both wire 1.0.1). Workspace
+  packages were cleaned before reuse; retain third-party caches. Run full
+  suites serially. `target-inspect22-release` still holds #479's wire 1.1.0
+  release validation. Durable logs/bodies live in `night-evidence-2026-10-12/`;
+  prefixes `identity36`, `m4-validation01`, `m4-security01` cover these slices.
+
 
 ## Live delta — 2026-10-11 Claude handoff (historical snapshot)
 

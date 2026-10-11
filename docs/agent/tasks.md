@@ -482,3 +482,9 @@
 | FU-214 | 2026-10-12 declared max_tokens | #479；3000 预算 + 4096 cap 改为 402/零 POST/零余额变化，保持 1024 下限及 payload，撤上限接线负控失败；最终 router 504/504，全 Rust/TS 门禁、release conformance 134/8 通过，待独立批准 | PR_OPEN |
 
 | FU-215 | gate-two C-3 响应边界 | #480；缓冲响应中的本次凭据及闸一命中、非法 UTF-8/总长度超限默认拒绝，10 项回归与两项撤修负控、全门禁通过；仅纯核心，运行时接线/流式/编码处理仍未闭环，待独立批准 | PR_OPEN |
+
+| FU-216 | tenant cache revocation acceptance | #481，四推理接口先证明真实缓存再撤 key，401/零新增上游请求与租户记录；撤 active 负控失败、最终 router 505/505，全门禁通过 | PR_OPEN |
+
+| FU-217 | M4 latest protocol review evidence | #423 未包含 #374 修复；#482 从 #424 普通合并 2d15076，完整门禁通过（router 435/435、wire 1.0.1），仍待独立批准及 main 验收 | PR_OPEN |
+
+| FU-218 | M4 tenant-key security backport | #483 先回移存储与 CLI，完整门禁通过（router 436/436）；绑定夹具、运行时 authority/audit 接线及最终 release gates 仍未完成，按 M4-tenant-key-backport.md 继续 | PR_OPEN |

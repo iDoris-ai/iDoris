@@ -2,6 +2,11 @@
 
 ## 2026-10-12 凌晨
 
+- #481 验证四个推理接口在成功缓存后撤销 tenant key：401、无重放、无新增租户事件/审计、仍为 1 POST；撤 active 条件负控失败，最终 router 505/505，全门禁通过。
+- #482 更新 M4 验收候选以包含 #374 最新修复；router 435/435，完整 Rust/TS 门禁通过，wire 1.0.1。原 #423 的绿 CI 未包含该修复。
+- #483 将 tenant-key 存储/CLI 绑定回移到 M4（155 行），router 436/436，全门禁通过；绑定夹具及运行时鉴权仍需后续切片，不能宣称安全修复或 M4 发布完成。
+- #480 远端 CI 已全绿，所有新代码/检查点已提交推送；main 和 tag 未变。
+
 - #475 补 HTTP → 授权 runtime → fixture 子进程的 OAuth 故障反馈回归，完整门禁通过。
 - Draft #476 整合安全修复、wire 1.1.0 和 macOS fixtures，同一 HEAD 完整门禁及 release conformance 134/8 通过。
 - #477–#478 修复 paid waiter/cache 的重复预留拒绝；leader 才预留付费金额，取消与结算规则有账本负控。
