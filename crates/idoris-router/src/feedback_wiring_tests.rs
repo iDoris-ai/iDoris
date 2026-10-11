@@ -160,8 +160,8 @@ async fn tenant_feedback_rejects_invalid_tenant_identifier_before_event_log() {
         ))
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
     let bytes = response.into_body().collect().await.unwrap().to_bytes();
     let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(json["error"]["type"], "invalid_tenant_scope");
+    assert_eq!(json["error"]["type"], "policy_violation");
 }

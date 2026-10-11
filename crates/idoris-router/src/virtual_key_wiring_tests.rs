@@ -592,3 +592,212 @@ async fn protocol_routes_reject_privacy_outside_authenticated_key_scope() {
         );
     }
 }
+
+#[tokio::test]
+async fn tenant_keys_reject_cross_tenant_unbound_and_anonymous_requests_without_side_effects() {
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(method("POST"))
+        .respond_with(wiremock::ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let roles = idoris_policy::ROLES
+        .iter()
+        .map(|role| role.as_str())
+        .collect::<Vec<_>>();
+    let bound = MintedVirtualKey::mint();
+    let mut bound_scope = scope(vec![PrivacyClass::LocalOnly], &roles, None);
+    bound_scope.tenant_id = Some("tenant-a".into());
+    let (authenticator, store) = memory_auth(&bound, &bound_scope);
+    let unbound = MintedVirtualKey::mint();
+    store
+        .lock()
+        .unwrap()
+        .insert_active(
+            &unbound.key_id,
+            unbound.hash,
+            &scope(vec![PrivacyClass::LocalOnly], &roles, None),
+        )
+        .unwrap();
+    let event_log = Arc::new(
+        idoris_tenancy::event_log::EventLogStore::new(Connection::open_in_memory().unwrap())
+            .unwrap(),
+    );
+    let records = Arc::new(Mutex::new(
+        idoris_tenancy::store::TenantStore::new(Connection::open_in_memory().unwrap()).unwrap(),
+    ));
+    let mut protected = state(&server.uri(), Some(authenticator));
+    protected.cards[0].provider.capabilities =
+        vec![Capability::Chat, Capability::Embedding, Capability::Rerank];
+    protected.deploy_mode = idoris_contracts::DeployMode::Tenant;
+    protected.event_log = Some(event_log.clone());
+    protected.record_store = Some(records.clone());
+    protected.dev_no_key_enabled = true;
+    let app = build_app(protected);
+    for (method, uri) in [
+        ("POST", "/v1/chat/completions"),
+        ("POST", "/v1/embeddings"),
+        ("POST", "/v1/rerank"),
+        ("POST", "/v1/messages"),
+        ("POST", "/v1/feedback"),
+        ("GET", "/idoris/tenants/tenant-b/requests/record-1"),
+        ("GET", "/idoris/tenants/tenant-b/audit"),
+        ("GET", "/idoris/tenants/tenant-b/usage"),
+        ("GET", "/idoris/tenants/tenant-b/budget"),
+    ] {
+        let body = match uri {
+            "/v1/embeddings" => json!({"model":"m","input":"hello"}),
+            "/v1/rerank" => json!({"model":"m","query":"q","documents":["a"]}),
+            "/v1/messages" => {
+                json!({"model":"m","max_tokens":8,"messages":[{"role":"user","content":"hi"}]})
+            }
+            "/v1/feedback" => json!({"record_id":"record-1","rating":"up"}),
+            _ => json!({"model":"idoris/fast","messages":[{"role":"user","content":"hello"}]}),
+        };
+        for (token, tenant, status) in [
+            (
+                Some(bearer(&bound)),
+                Some("tenant-b"),
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                Some(bearer(&unbound)),
+                Some("tenant-a"),
+                StatusCode::FORBIDDEN,
+            ),
+            (None, Some("tenant-b"), StatusCode::UNAUTHORIZED),
+            (
+                Some("Bearer malformed".into()),
+                Some("tenant-b"),
+                StatusCode::UNAUTHORIZED,
+            ),
+        ] {
+            let mut request = Request::builder()
+                .method(method)
+                .uri(uri)
+                .header("content-type", "application/json");
+            if let Some(token) = token {
+                request = request.header("authorization", token);
+            }
+            if let Some(tenant) = tenant {
+                request = request.header("x-idoris-tenant", tenant);
+            }
+            let response = app
+                .clone()
+                .oneshot(request.body(Body::from(body.to_string())).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), status, "{method} {uri}");
+            let record_id = response.headers()[HEADER_RECORD_ID]
+                .to_str()
+                .unwrap()
+                .to_owned();
+            for tenant in ["tenant-a", "tenant-b"] {
+                assert!(
+                    event_log
+                        .events_for_record(Some(tenant), &record_id)
+                        .unwrap()
+                        .is_empty()
+                );
+            }
+            let body = json_body(response).await;
+            assert_eq!(
+                body["error"]["reason_code"],
+                if status == StatusCode::FORBIDDEN {
+                    "VIRTUAL_KEY_TENANT_FORBIDDEN"
+                } else {
+                    "VIRTUAL_KEY_UNAUTHORIZED"
+                }
+            );
+            assert!(!body.to_string().contains("tenant-a"));
+        }
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .header("authorization", bearer(&bound))
+                    .header("x-idoris-tenant", "tenant-a")
+                    .header("x-idoris-tenant", "tenant-b")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+    for tenant in ["tenant-a", "tenant-b"] {
+        assert!(
+            records
+                .lock()
+                .unwrap()
+                .list(Some(tenant), None)
+                .unwrap()
+                .is_empty()
+        );
+    }
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn tenant_library_without_authenticator_fails_closed_without_egress_or_audit() {
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(method("POST"))
+        .respond_with(wiremock::ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&server)
+        .await;
+    for dev_no_key_enabled in [false, true] {
+        let log = Arc::new(
+            idoris_tenancy::event_log::EventLogStore::new(Connection::open_in_memory().unwrap())
+                .unwrap(),
+        );
+        let records = Arc::new(Mutex::new(
+            idoris_tenancy::store::TenantStore::new(Connection::open_in_memory().unwrap()).unwrap(),
+        ));
+        let mut unconfigured = state(&server.uri(), None);
+        unconfigured.deploy_mode = idoris_contracts::DeployMode::Tenant;
+        unconfigured.dev_no_key_enabled = dev_no_key_enabled;
+        unconfigured.event_log = Some(log.clone());
+        unconfigured.record_store = Some(records.clone());
+        let app = build_app(unconfigured);
+        for token in [None, Some(bearer(&MintedVirtualKey::mint()))] {
+            let mut headers = vec![("x-idoris-tenant", "tenant-a".into())];
+            if let Some(token) = token {
+                headers.push(("authorization", token));
+            }
+            let response = app.clone().oneshot(chat_request(&headers)).await.unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            let record_id = response.headers()[HEADER_RECORD_ID].to_str().unwrap();
+            assert!(
+                log.events_for_record(Some("tenant-a"), record_id)
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(
+                records
+                    .lock()
+                    .unwrap()
+                    .list(Some("tenant-a"), None)
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(
+                json_body(response).await["error"]["reason_code"],
+                "VIRTUAL_KEY_UNAUTHORIZED"
+            );
+        }
+        let health = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(health.status(), StatusCode::OK);
+    }
+    server.verify().await;
+}
