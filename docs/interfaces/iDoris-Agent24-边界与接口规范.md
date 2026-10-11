@@ -155,6 +155,7 @@
 
 - 响应头 `X-iDoris-Served-Locality: loopback | lan | remote`（契约已定，M4 实现）。**它证明的是路由没选错，不证明字节没出本机**，后者靠 `allowed_egress` 和出网探针保证（ADR-032 §9 原文）。
 - `POST /v1/inspect`（M5）：只做判定，返回 `{sensitivity: S0..S3, findings: [{kind, span?}], action: BLOCK|REDACT|ALLOW}`，不改写内容。
+  - wire contract `1.1.0`（2026-10-11 负责人确认）：`{input: string}`，span 使用 UTF-16 单位；随 M5 端点发布升级。此版本独立于 Markdown 文档修订号。
   - 契约已冻结（M5-01）：`packages/contracts/schema/inspect-request.schema.json`（`{input: string}`）与 `inspect-response.schema.json`，Rust 侧 `idoris_contracts::inspect`，两侧全部对象 `additionalProperties:false` / `deny_unknown_fields`。
   - `kind` 是封闭枚举（证件/手机/银行卡/统一社会信用代码/车牌/护照/港澳证件/邮箱/密钥类/凭据路径/`input_limit_exceeded`），新增类别属于契约变更。
   - `span = {start, length}`，按 **UTF-16 code unit** 计、半开区间 `[start, start+length)`，`length ≥ 1`；`input_limit_exceeded`（超限未扫描，按 X-1 直接 BLOCK）不带 span。

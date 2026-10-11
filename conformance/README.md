@@ -69,7 +69,7 @@ IDORIS_CONFORMANCE_ARGV='["/path/to/idoris-router-rs","serve","--flag","value wi
 ## 覆盖清单
 
 - `GET /health`：200；服务身份字段 `service`/`version`/`contract_version`（锁定为规范标注的
-  `1.0.1`）/`instance_id`（同进程两次请求不变，不同进程互不相同）
+  `1.1.0`）/`instance_id`（同进程两次请求不变，不同进程互不相同）
 - `GET /v1/models` 形状（`id`/`object`/`owned_by`）
 - 请求体：非法 JSON → 400 `invalid_json`；合法 JSON 但不是对象（`null`/数组/数字）→ 400
   `invalid_body`；合法最小请求走通全链路；并锁定 `invalid_json` > `invalid_body` >
