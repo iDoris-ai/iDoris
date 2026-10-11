@@ -786,6 +786,42 @@ fn third_review_groupings_and_numeric_rows() {
     }
 }
 
+#[test]
+fn fourth_review_entities_with_short_neighbours() {
+    // Neighbours of up to three digits only: allowing four (a year, a room)
+    // flagged ~10% of rows of five 4-digit numbers as cards.
+    for (input, expected) in [
+        ("4111 1111 1111 1111 12/28", &[FindingKind::BankCard][..]),
+        ("4111 1111 1111 1111 123", &[FindingKind::BankCard]),
+        ("4111 1111 1111 1111 12 28", &[FindingKind::BankCard]),
+        ("2026-10-11 20:19 138 1234 5678", &[FindingKind::CnMobile]),
+        ("28 138 1234 5678", &[FindingKind::CnMobile]),
+        ("138 1234 5678 139 8765 4321 7", &[FindingKind::CnMobile]),
+    ] {
+        let found = kinds(&inspect(input, &open_ctx()));
+        for kind in expected {
+            assert!(found.contains(kind), "{input}: {found:?}");
+        }
+    }
+    let both = inspect("138 1234 5678 139 8765 4321 7", &open_ctx());
+    assert_eq!(
+        both.findings
+            .iter()
+            .filter(|f| f.kind == FindingKind::CnMobile)
+            .count(),
+        2
+    );
+    for input in [
+        "59 15 33 28 80 70 89 61",
+        "1 3 5 7 9 11 13 15",
+        "合计 15 20 30 45 60 7",
+        "16 17 18 19 20 1",
+    ] {
+        let response = inspect(input, &open_ctx());
+        assert!(response.findings.is_empty(), "{input}: {response:?}");
+    }
+}
+
 fn valid_id() -> impl Strategy<Value = String> {
     (0usize..34, 1950u32..2030, 1u32..13, 1u32..29, 0u32..1000).prop_map(
         |(province, year, month, day, seq)| {
