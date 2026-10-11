@@ -80,6 +80,7 @@ async fn paid_local_records_one_budget_reservation_after_decision_before_executi
             EventType::BudgetReserved,
             EventType::Dispatched,
             EventType::Completed,
+            EventType::BudgetSettled,
         ]
     );
     assert_eq!(budget_event_count(&events), 1);
