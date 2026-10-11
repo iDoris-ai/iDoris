@@ -400,6 +400,123 @@ fn new_rule_spans_count_utf16_code_units() {
     );
 }
 
+// 前缀拆开写，源码里不出现完整的 key 形态（避免误触发仓库的密钥扫描）；
+// 随机部分是固定的假值，不对应任何真实凭据。
+const FAKE_OPENAI: &str = concat!(
+    "sk",
+    "-proj-FwFvrdcwEcSaT3WQwn8QMH2iE6bao4pjmx5ZTDNsbiqASwXU"
+);
+const FAKE_GITHUB: &str = concat!("gh", "p_X74NuHG7OVWUJrSlMDg6V1MANv6NXmI3P3ay");
+const FAKE_AWS_ID: &str = concat!("AK", "IA5HVJV2XAZM2TT6A8");
+const FAKE_RAW_SECRET: &str = "zMCTnu5i8RRUKO7CCgpDdFZwTMKHPBZU1HmjS9jA";
+
+#[test]
+fn prefixed_keys_are_found_by_rule_set_a() {
+    for key in [FAKE_OPENAI, FAKE_GITHUB, FAKE_AWS_ID] {
+        assert_single(
+            &format!("token={key};"),
+            FindingKind::ApiKey,
+            key,
+            Sensitivity::S3,
+        );
+        assert_eq!(inspect(key, &open_ctx()).action, InspectAction::Block);
+    }
+    // 短的、看起来像前缀的普通词不算。
+    for input in ["sk-learn", "pip install sk-video", "AKIA123", "ghp_short"] {
+        assert_none(input, FindingKind::ApiKey);
+    }
+}
+
+#[test]
+fn rule_sets_a_and_b_are_independent() {
+    // 真实格式的长 key：两组各自命中同一个位置。
+    let response = inspect(FAKE_OPENAI, &open_ctx());
+    assert_eq!(
+        kinds(&response),
+        [FindingKind::ApiKey, FindingKind::HighEntropySecret]
+    );
+    // 没有前缀的随机串只有 B 组兜得住；太短的 AWS id 只有 A 组认得。
+    assert_single(
+        &format!("secret: {FAKE_RAW_SECRET}"),
+        FindingKind::HighEntropySecret,
+        FAKE_RAW_SECRET,
+        Sensitivity::S3,
+    );
+    assert_none(FAKE_RAW_SECRET, FindingKind::ApiKey);
+    assert_none(FAKE_AWS_ID, FindingKind::HighEntropySecret);
+}
+
+#[test]
+fn identifiers_paths_and_urls_are_not_high_entropy() {
+    for input in [
+        "AbstractSingletonProxyFactoryBean2024Impl",
+        "getUserAccountBalanceForPeriodV2Handler",
+        "XMLHttpRequestEventTargetPrototypeHandler",
+        "com_example_service_UserAccountServiceImpl_v2",
+        "my-very-long-kubernetes-deployment-name-v2",
+        "/api/v1/organizations/12345/projects/67890/members",
+        "x86_64-apple-darwin/release/deps/idoris_policy-9f8e7d6c5b4a3210",
+        "550e8400-e29b-41d4-a716-446655440000",
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        // 类别切换很密，但只有 4 个不同字符：熵门挡住。
+        "a1B2a1B2a1B2a1B2a1B2a1B2a1B2a1B2a1B2",
+        // 32 个字符以下 B 组不出手，已知的短格式交给 A 组。
+        "req_8Zk3Lm9Xa2Wp7Rt5Yb1Nc4",
+    ] {
+        assert_none(input, FindingKind::HighEntropySecret);
+    }
+}
+
+#[test]
+fn private_key_blocks_including_truncated_ones() {
+    let block = "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjE\n-----END OPENSSH PRIVATE KEY-----";
+    assert_single(
+        &format!("key:\n{block}\nthanks"),
+        FindingKind::PrivateKey,
+        block,
+        Sensitivity::S3,
+    );
+    let truncated = "-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEA";
+    assert_single(
+        &format!("看这个 {truncated}"),
+        FindingKind::PrivateKey,
+        truncated,
+        Sensitivity::S3,
+    );
+    assert_none(
+        "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----",
+        FindingKind::PrivateKey,
+    );
+}
+
+#[test]
+fn credential_file_paths() {
+    for path in [
+        "~/.ssh/id_ed25519",
+        ".env",
+        "./config/.env.local",
+        "certs/server.pem",
+        "~/.ssh/authorized_keys",
+        "~/.aws/credentials",
+        "login.keychain-db",
+    ] {
+        assert_single(
+            &format!("cat {path} please"),
+            FindingKind::CredentialPath,
+            path,
+            Sensitivity::S2,
+        );
+    }
+    for input in [
+        "process.env.API_KEY",
+        "a .envrc file",
+        "the environment",
+        "item.key",
+    ] {
+        assert_none(input, FindingKind::CredentialPath);
+    }
+}
+
 fn valid_id() -> impl Strategy<Value = String> {
     (0usize..34, 1950u32..2030, 1u32..13, 1u32..29, 0u32..1000).prop_map(
         |(province, year, month, day, seq)| {

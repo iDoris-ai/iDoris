@@ -14,6 +14,7 @@
 //! 单位（`idoris_contracts::inspect` 模块文档），不需要二次换算。
 
 mod l0;
+mod secrets;
 #[cfg(test)]
 mod tests;
 mod tokens;
