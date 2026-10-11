@@ -234,6 +234,172 @@ fn response_never_carries_the_matched_text() {
     }
 }
 
+/// 每个输入都必须恰好命中一次 `kind`，且 span 覆盖 `expected` 片段。
+fn assert_single(input: &str, kind: FindingKind, expected: &str, sensitivity: Sensitivity) {
+    let response = inspect(input, &open_ctx());
+    let matching: Vec<_> = response
+        .findings
+        .iter()
+        .filter(|f| f.kind == kind)
+        .collect();
+    assert_eq!(matching.len(), 1, "{input}: {response:?}");
+    assert_eq!(covered(input, matching[0]), expected, "{input}");
+    assert_eq!(response.sensitivity, sensitivity, "{input}");
+}
+
+fn assert_none(input: &str, kind: FindingKind) {
+    let response = inspect(input, &open_ctx());
+    assert!(!kinds(&response).contains(&kind), "{input}: {response:?}");
+}
+
+#[test]
+fn unified_social_credit_code_requires_mod31_check() {
+    let ok = "91350100M000100Y43";
+    assert_single(
+        &format!("信用代码：{ok}"),
+        FindingKind::CnUnifiedSocialCreditCode,
+        ok,
+        Sensitivity::S1,
+    );
+    assert_single(
+        "9144030071526726XG",
+        FindingKind::CnUnifiedSocialCreditCode,
+        "9144030071526726XG",
+        Sensitivity::S1,
+    );
+    assert_eq!(inspect(ok, &open_ctx()).action, InspectAction::Redact);
+    assert_none("91350100M000100Y44", FindingKind::CnUnifiedSocialCreditCode);
+    // 校验位对，但第 3–8 位行政区划不是数字。
+    assert_none("91AB0100M000100Y4T", FindingKind::CnUnifiedSocialCreditCode);
+}
+
+#[test]
+fn passports_and_travel_permits_by_structure() {
+    for id in ["E12345678", "EA1234567", "G12345678", "e12345678"] {
+        assert_single(
+            &format!("护照 {id}。"),
+            FindingKind::CnPassport,
+            id,
+            Sensitivity::S3,
+        );
+    }
+    for id in ["H12345678", "M87654321"] {
+        assert_single(
+            &format!("回乡证{id}"),
+            FindingKind::HkMacauTravelPermit,
+            id,
+            Sensitivity::S3,
+        );
+    }
+    for input in [
+        "EI1234567",
+        "E1234567",
+        "E123456789",
+        "X12345678",
+        "H1234567A",
+    ] {
+        assert_none(input, FindingKind::CnPassport);
+        assert_none(input, FindingKind::HkMacauTravelPermit);
+    }
+}
+
+#[test]
+fn hong_kong_identity_card_requires_check_digit() {
+    for id in [
+        "A123456(3)",
+        "C668668(9)",
+        "Z683365(A)",
+        "AB987654(3)",
+        "A1234563",
+        "g123456a",
+    ] {
+        assert_single(
+            &format!("HKID {id} end"),
+            FindingKind::HkIdentityCard,
+            id,
+            Sensitivity::S3,
+        );
+    }
+    for input in [
+        "A123456(4)",
+        "A1234564",
+        "AB987654(2)",
+        "1A23456(3)",
+        "G123456(5)",
+    ] {
+        assert_none(input, FindingKind::HkIdentityCard);
+    }
+}
+
+#[test]
+fn license_plates_regular_and_new_energy() {
+    for plate in [
+        "粤B12345",
+        "京A·12345",
+        "沪AD12345",
+        "粤B 1234D",
+        "川A12345",
+    ] {
+        assert_single(
+            &format!("车牌{plate}停在门口"),
+            FindingKind::CnLicensePlate,
+            plate,
+            Sensitivity::S2,
+        );
+    }
+    for input in [
+        "京ABCDEF",
+        "京A1234",
+        "京A1234567",
+        "北京12345",
+        "京a12345",
+        "京I12345",
+        "粤B12345x",
+        "京112345",
+    ] {
+        assert_none(input, FindingKind::CnLicensePlate);
+    }
+}
+
+#[test]
+fn email_addresses_with_real_domains() {
+    let email = "alice.zhang+tag@example.com.cn";
+    for input in [format!("<{email}>."), format!("写信给 {email}.")] {
+        assert_single(&input, FindingKind::EmailAddress, email, Sensitivity::S2);
+    }
+    assert_single(
+        "写信到 a_b-c@mail-01.example.org。",
+        FindingKind::EmailAddress,
+        "a_b-c@mail-01.example.org",
+        Sensitivity::S2,
+    );
+    for input in [
+        "a@b",
+        "user@localhost",
+        "@example.com",
+        "x@example.c",
+        "x@example.c0m",
+    ] {
+        assert_none(input, FindingKind::EmailAddress);
+    }
+}
+
+#[test]
+fn new_rule_spans_count_utf16_code_units() {
+    let input = "🚗😀粤B12345";
+    let response = inspect(input, &open_ctx());
+    assert_eq!(
+        response.findings,
+        [InspectFinding {
+            kind: FindingKind::CnLicensePlate,
+            span: Some(InspectSpan {
+                start: 4,
+                length: 7
+            }),
+        }]
+    );
+}
+
 fn valid_id() -> impl Strategy<Value = String> {
     (0usize..34, 1950u32..2030, 1u32..13, 1u32..29, 0u32..1000).prop_map(
         |(province, year, month, day, seq)| {

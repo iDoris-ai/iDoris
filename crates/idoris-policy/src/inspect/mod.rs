@@ -16,6 +16,7 @@
 mod l0;
 #[cfg(test)]
 mod tests;
+mod tokens;
 
 use idoris_contracts::common::PrivacyClass;
 use idoris_contracts::inspect::{
