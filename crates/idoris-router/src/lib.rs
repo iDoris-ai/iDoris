@@ -478,7 +478,11 @@ async fn remote_bind_auth_middleware(
     let has_bearer = request
         .headers()
         .contains_key(axum::http::header::AUTHORIZATION);
-    if state.dev_no_key_enabled && !state.remote_bind_requires_auth && !has_bearer {
+    if state.dev_no_key_enabled
+        && state.deploy_mode == idoris_contracts::DeployMode::Personal
+        && !state.remote_bind_requires_auth
+        && !has_bearer
+    {
         return next.run(request).await;
     }
     let Some(authenticator) = &state.virtual_key_authenticator else {
@@ -494,8 +498,28 @@ async fn remote_bind_auth_middleware(
         Ok(identity) => identity,
         Err(_) => return virtual_key_unauthorized_response(),
     };
+    let trusted_tenant = if state.deploy_mode == idoris_contracts::DeployMode::Tenant {
+        let Some(bound) = identity.scope.tenant_id.as_deref() else {
+            return virtual_key_scope_response(auth::VirtualKeyScopeError::TenantForbidden);
+        };
+        match query_scope_header(request.headers()) {
+            Some(tenant) if tenant == bound && event_identifier::valid(tenant) => {
+                Some(TrustedTenant(bound.to_string()))
+            }
+            // Preserve body/profile precedence; scoped handlers reject an
+            // absent header, and no marker means no tenant audit.
+            None if !request.headers().contains_key("x-idoris-tenant") => None,
+            _ => return virtual_key_scope_response(auth::VirtualKeyScopeError::TenantForbidden),
+        }
+    } else {
+        None
+    };
     request.extensions_mut().insert(identity);
-    next.run(request).await
+    let mut response = next.run(request).await;
+    if let Some(tenant) = trusted_tenant {
+        response.extensions_mut().insert(tenant);
+    }
+    response
 }
 
 async fn enforce_protocol_key_scope(
@@ -615,11 +639,6 @@ async fn embeddings(
     // Caller headers may further constrain routing elsewhere, but they cannot
     // turn an embeddings request into a chat/rerank dispatch.
     parsed.task.capabilities = Some(vec![Capability::Embedding]);
-    let events =
-        match protocol_events::ProtocolEvents::begin(&state, &headers, &parsed, &record_id).await {
-            Ok(events) => events,
-            Err(response) => return response,
-        };
     if let Err(response) = enforce_protocol_key_scope(
         &state,
         &headers,
@@ -630,6 +649,11 @@ async fn embeddings(
     {
         return response;
     }
+    let events =
+        match protocol_events::ProtocolEvents::begin(&state, &headers, &parsed, &record_id).await {
+            Ok(events) => events,
+            Err(response) => return response,
+        };
     // INSPECTED (M5-07): same gate as chat, after the key scope admitted
     // the declared privacy and before the routing policy reads it.
     let inspection = protocol_inspection(&state, &value, body.len(), &parsed).await;
@@ -810,11 +834,6 @@ async fn rerank(
         Err(error) => return error.into_response(),
     };
     parsed.task.capabilities = Some(vec![Capability::Rerank]);
-    let events =
-        match protocol_events::ProtocolEvents::begin(&state, &headers, &parsed, &record_id).await {
-            Ok(events) => events,
-            Err(response) => return response,
-        };
     if let Err(response) = enforce_protocol_key_scope(
         &state,
         &headers,
@@ -825,6 +844,11 @@ async fn rerank(
     {
         return response;
     }
+    let events =
+        match protocol_events::ProtocolEvents::begin(&state, &headers, &parsed, &record_id).await {
+            Ok(events) => events,
+            Err(response) => return response,
+        };
     // INSPECTED (M5-07): same gate as chat, after the key scope admitted
     // the declared privacy and before the routing policy reads it.
     let inspection = protocol_inspection(&state, &value, body.len(), &parsed).await;
@@ -1016,11 +1040,6 @@ async fn messages(
         Err(error) => return error.into_response(),
     };
     parsed.task.capabilities = Some(vec![Capability::Chat]);
-    let events =
-        match protocol_events::ProtocolEvents::begin(&state, &headers, &parsed, &record_id).await {
-            Ok(events) => events,
-            Err(response) => return response,
-        };
     if let Err(response) = enforce_protocol_key_scope(
         &state,
         &headers,
@@ -1031,6 +1050,11 @@ async fn messages(
     {
         return response;
     }
+    let events =
+        match protocol_events::ProtocolEvents::begin(&state, &headers, &parsed, &record_id).await {
+            Ok(events) => events,
+            Err(response) => return response,
+        };
     // INSPECTED (M5-07): same gate as chat, after the key scope admitted
     // the declared privacy and before the routing policy reads it.
     let inspection = protocol_inspection(&state, &value, body.len(), &parsed).await;
@@ -2264,6 +2288,23 @@ async fn chat_completions(
         Ok(parsed) => parsed,
         Err(err) => return err.into_response(),
     };
+    let authorization_present = headers.contains_key(axum::http::header::AUTHORIZATION);
+    let dev_no_key_request = state.dev_no_key_enabled && !authorization_present;
+    if dev_no_key_request {
+        if parsed.task.privacy.unwrap_or(PrivacyClass::LocalOnly) != PrivacyClass::LocalOnly {
+            return dev_no_key_scope_response();
+        }
+    } else if let Some(authenticator) = &state.virtual_key_authenticator {
+        let identity = match authenticator.authenticate(&headers).await {
+            Ok(identity) => identity,
+            Err(_) => return virtual_key_unauthorized_response(),
+        };
+        if let Err(error) = auth::enforce_scope(&identity, &parsed) {
+            return virtual_key_scope_response(error);
+        }
+    } else if state.dev_no_key_enabled && authorization_present {
+        return virtual_key_unauthorized_response();
+    }
     let correlation = match correlation::parse(&headers) {
         Ok(context) => context,
         Err(error) => return correlation_error_response(error),
@@ -2294,23 +2335,6 @@ async fn chat_completions(
         None
     };
 
-    let authorization_present = headers.contains_key(axum::http::header::AUTHORIZATION);
-    let dev_no_key_request = state.dev_no_key_enabled && !authorization_present;
-    if dev_no_key_request {
-        if parsed.task.privacy.unwrap_or(PrivacyClass::LocalOnly) != PrivacyClass::LocalOnly {
-            return dev_no_key_scope_response();
-        }
-    } else if let Some(authenticator) = &state.virtual_key_authenticator {
-        let identity = match authenticator.authenticate(&headers).await {
-            Ok(identity) => identity,
-            Err(_) => return virtual_key_unauthorized_response(),
-        };
-        if let Err(error) = auth::enforce_scope(&identity, &parsed) {
-            return virtual_key_scope_response(error);
-        }
-    } else if state.dev_no_key_enabled && authorization_present {
-        return virtual_key_unauthorized_response();
-    }
     // INSPECTED: after the key scope admitted the declared privacy, before
     // profiling, routing policy, or a remote intent detector can see `any`.
     let mut parsed = parsed;
@@ -3249,6 +3273,9 @@ async fn chat_via_proxy_buffered(
 #[derive(Clone)]
 struct RequestRecordId(String);
 
+#[derive(Clone)]
+struct TrustedTenant(String);
+
 struct BufferedAuditMeta {
     tenant_id: Option<String>,
     request_id: Option<String>,
@@ -3282,13 +3309,21 @@ async fn record_id_middleware(
             req.uri().path(),
             "/v1/chat/completions" | "/v1/embeddings" | "/v1/rerank" | "/v1/messages"
         );
-    let audit_tenant = audit_tenant_id(&state, req.headers());
+    let mut audit_tenant = audit_tenant_id(&state, req.headers());
     let audit_request_id = audit_header(req.headers(), HEADER_REQUEST_ID, None);
     let audit_privacy = audit_header(req.headers(), "x-idoris-privacy", Some("local_only"));
     let audit_intent = audit_header(req.headers(), "x-idoris-intent", None);
     req.extensions_mut()
         .insert(RequestRecordId(record_id.clone()));
     let mut response = next.run(req).await;
+    if state.deploy_mode == idoris_contracts::DeployMode::Tenant
+        && state.virtual_key_authenticator.is_some()
+    {
+        audit_tenant = response
+            .extensions()
+            .get::<TrustedTenant>()
+            .map(|tenant| tenant.0.clone());
+    }
     if let Ok(value) = HeaderValue::from_str(&record_id) {
         response.headers_mut().insert(HEADER_RECORD_ID, value);
     }
