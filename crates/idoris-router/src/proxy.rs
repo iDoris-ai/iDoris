@@ -1233,9 +1233,15 @@ impl ChatProxy {
     /// `!opts.stream`), so a streaming request whose upstream call fails
     /// outright still gets a plain JSON/text error body, never an SSE
     /// stream carrying an error.
+    /// Without a card at hand the endpoint is the breaker key.
     pub async fn forward_stream(&self, endpoint: &str, body: &Value) -> StreamOutcome {
-        self.forward_stream_path(endpoint, StreamingUpstreamPath::CHAT_COMPLETIONS, body)
-            .await
+        self.forward_stream_path(
+            endpoint,
+            StreamingUpstreamPath::CHAT_COMPLETIONS,
+            body,
+            endpoint,
+        )
+        .await
     }
 
     pub(crate) async fn forward_stream_path(
@@ -1243,9 +1249,10 @@ impl ChatProxy {
         endpoint: &str,
         upstream_path: StreamingUpstreamPath,
         body: &Value,
+        provider_id: &str,
     ) -> StreamOutcome {
         let result = self
-            .forward_stream_path_observed(endpoint, upstream_path, body, || async {
+            .forward_stream_path_observed(endpoint, upstream_path, body, provider_id, || async {
                 Ok::<(), std::convert::Infallible>(())
             })
             .await;
@@ -1262,6 +1269,7 @@ impl ChatProxy {
         &self,
         endpoint: &str,
         body: &Value,
+        provider_id: &str,
         observer: F,
     ) -> Result<StreamOutcome, E>
     where
@@ -1272,16 +1280,21 @@ impl ChatProxy {
             endpoint,
             StreamingUpstreamPath::CHAT_COMPLETIONS,
             body,
+            provider_id,
             observer,
         )
         .await
     }
 
+    /// The provider breaker sees the initial response only: once a 2xx
+    /// stream has started its later fate is a stream outcome, not a reason
+    /// to stop sending to the provider.
     async fn forward_stream_path_observed<F, Fut, E>(
         &self,
         endpoint: &str,
         upstream_path: StreamingUpstreamPath,
         body: &Value,
+        provider_id: &str,
         observer: F,
     ) -> Result<StreamOutcome, E>
     where
@@ -1300,6 +1313,9 @@ impl ChatProxy {
         if let Some(obj) = payload.as_object_mut() {
             obj.insert("stream".to_string(), Value::Bool(true));
         }
+        if !self.admit_provider(provider_id, &url) {
+            return Ok(Self::stream_failure(503, ExecutionDisposition::NotExecuted));
+        }
         observer().await?;
         let sent =
             match tokio::time::timeout(self.header_timeout, self.outbound(&url, &payload).send())
@@ -1307,6 +1323,7 @@ impl ChatProxy {
             {
                 Ok(sent) => sent,
                 Err(_) => {
+                    self.report_provider(provider_id, &url, 504, None);
                     return Ok(Self::stream_failure(504, ExecutionDisposition::Uncertain));
                 }
             };
@@ -1318,6 +1335,12 @@ impl ChatProxy {
                     .get(reqwest::header::CONTENT_TYPE)
                     .and_then(|v| v.to_str().ok())
                     .map(str::to_string);
+                let retry_after_ms = resp
+                    .headers()
+                    .get(reqwest::header::RETRY_AFTER)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(idoris_policy::breaker::parse_retry_after_ms);
+                self.report_provider(provider_id, &url, status, retry_after_ms);
                 if (200..300).contains(&status) {
                     let idle = self.stream_idle_timeout;
                     #[cfg(test)]
@@ -1462,14 +1485,18 @@ impl ChatProxy {
                     }
                 }
             }
-            Err(err) => Self::stream_failure(
-                if err.is_timeout() { 504 } else { 502 },
-                if err.is_connect() {
-                    ExecutionDisposition::NotExecuted
-                } else {
-                    ExecutionDisposition::Uncertain
-                },
-            ),
+            Err(err) => {
+                let status = if err.is_timeout() { 504 } else { 502 };
+                self.report_provider(provider_id, &url, status, None);
+                Self::stream_failure(
+                    status,
+                    if err.is_connect() {
+                        ExecutionDisposition::NotExecuted
+                    } else {
+                        ExecutionDisposition::Uncertain
+                    },
+                )
+            }
         })
     }
 
@@ -1699,6 +1726,21 @@ mod tests {
         let proxy = ChatProxy::new(reqwest::Client::new());
         assert_eq!(statuses(&proxy, &server, 2).await, [429, 503]);
         assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn streaming_sends_share_the_provider_breaker() {
+        let server = upstream_sequence(&[(503, None), (500, None), (200, None)]).await;
+        let proxy = ChatProxy::new(reqwest::Client::new());
+        let mut seen = Vec::new();
+        for _ in 0..3 {
+            match proxy.forward_stream(&server.uri(), &chat_body()).await {
+                StreamOutcome::Buffered { status, .. } => seen.push(status),
+                StreamOutcome::Stream { status, .. } => seen.push(status),
+            }
+        }
+        assert_eq!(seen, [503, 500, 503]);
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
     }
 
     #[tokio::test]

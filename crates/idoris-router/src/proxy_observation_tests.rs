@@ -270,7 +270,7 @@ async fn stream_observer_runs_once_and_failure_sends_nothing() {
     let proxy = ChatProxy::new(reqwest::Client::new());
     let observed = AtomicUsize::new(0);
     let success = proxy
-        .forward_stream_observed(&url, &body("stream"), || async {
+        .forward_stream_observed(&url, &body("stream"), "observed-provider", || async {
             observed.fetch_add(1, Ordering::SeqCst);
             Ok::<(), ()>(())
         })
@@ -291,7 +291,7 @@ async fn stream_observer_runs_once_and_failure_sends_nothing() {
     assert_eq!(calls.load(Ordering::SeqCst), 1);
 
     let failed = proxy
-        .forward_stream_observed(&url, &body("blocked"), || async {
+        .forward_stream_observed(&url, &body("blocked"), "observed-provider", || async {
             Err::<(), &'static str>("observer failed")
         })
         .await;
@@ -302,7 +302,7 @@ async fn stream_observer_runs_once_and_failure_sends_nothing() {
     no_permit.permits = Arc::new(Semaphore::new(0));
     let skipped = AtomicUsize::new(0);
     let preflight = no_permit
-        .forward_stream_observed(&url, &body("no-permit"), || async {
+        .forward_stream_observed(&url, &body("no-permit"), "observed-provider", || async {
             skipped.fetch_add(1, Ordering::SeqCst);
             Ok::<(), ()>(())
         })
