@@ -35,3 +35,9 @@ applies to a messages stream that returns a buffered transport error.
 Free buffered chat uses the same pre-publication completion hook. Append failure
 cannot become a cached success. Paid chat retains its existing post-settlement
 response rule and is covered by the existing committed-settlement regression.
+
+## Chat attempt terminals
+
+Buffered free/paid chat and free streams also complete recorded connection-failure
+attempts. A preflight refusal never creates a terminal without its dispatch.
+NotExecuted paid calls release their reservation and do not charge the ledger.

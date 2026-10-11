@@ -323,7 +323,12 @@ async fn exhausted_connect_failure_still_records_router_dispatch_attempt() {
     assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
     let chain = events(&event_log, &response);
     assert_eq!(dispatched_count(&chain), 1);
-    let event = chain.last().unwrap();
+    assert_eq!(chain.last().unwrap().event.event_type, EventType::Completed);
+    assert_eq!(chain.last().unwrap().event.metadata["status"], "failure");
+    let event = chain
+        .iter()
+        .find(|e| e.event.event_type == EventType::Dispatched)
+        .unwrap();
     assert_eq!(event.event.event_type, EventType::Dispatched);
     assert_eq!(
         event.event.metadata.get("status"),
