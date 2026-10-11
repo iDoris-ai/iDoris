@@ -41,3 +41,10 @@ response rule and is covered by the existing committed-settlement regression.
 Buffered free/paid chat and free streams also complete recorded connection-failure
 attempts. A preflight refusal never creates a terminal without its dispatch.
 NotExecuted paid calls release their reservation and do not charge the ledger.
+
+## Rejected paid dispatch
+
+A returned pre-send observer error proves the POST was stopped. Release its
+paid reservation immediately, including on same-ID retries. Client cancellation
+and uncertain upstream execution continue to retain reservations; committed
+settlements remain charged. A failed release stays a generic internal error.
