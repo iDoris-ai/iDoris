@@ -12,8 +12,28 @@ pub(crate) fn ensure_terminated<E>(
 where
     E: std::error::Error + Send + Sync + 'static,
 {
+    ensure_terminal(inner, TerminalField::DataDone)
+}
+
+pub(crate) fn ensure_event_terminated<E>(
+    inner: impl Stream<Item = Result<Bytes, E>> + Send + 'static,
+    event: &'static [u8],
+) -> impl Stream<Item = Result<Bytes, io::Error>> + Send
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
+    ensure_terminal(inner, TerminalField::Event(event))
+}
+
+fn ensure_terminal<E>(
+    inner: impl Stream<Item = Result<Bytes, E>> + Send + 'static,
+    terminal: TerminalField,
+) -> impl Stream<Item = Result<Bytes, io::Error>> + Send
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
     stream::unfold(
-        (Box::pin(inner), TerminalEvent::default(), false),
+        (Box::pin(inner), TerminalEvent::new(terminal), false),
         |(mut inner, mut marker, finished)| async move {
             if finished {
                 return None;
@@ -38,6 +58,12 @@ where
     )
 }
 
+#[derive(Clone, Copy)]
+enum TerminalField {
+    DataDone,
+    Event(&'static [u8]),
+}
+
 struct TerminalEvent {
     // Only a short marker can match; cap retained line bytes even when an
     // upstream sends arbitrarily large data lines. No response buffering.
@@ -46,21 +72,21 @@ struct TerminalEvent {
     after_cr: bool,
     done: bool,
     first_line: bool,
+    terminal: TerminalField,
 }
 
-impl Default for TerminalEvent {
-    fn default() -> Self {
+impl TerminalEvent {
+    fn new(terminal: TerminalField) -> Self {
         Self {
             line: Vec::new(),
             data_is_done: None,
             after_cr: false,
             done: false,
             first_line: true,
+            terminal,
         }
     }
-}
 
-impl TerminalEvent {
     fn feed(&mut self, bytes: &[u8]) {
         for &byte in bytes {
             if self.done {
@@ -80,16 +106,31 @@ impl TerminalEvent {
                 }
                 if self.line.is_empty() {
                     self.done = self.data_is_done.take() == Some(true);
-                } else if let Some(data) = self.line.strip_prefix(b"data:") {
-                    let data = data.strip_prefix(b" ").unwrap_or(data);
-                    // SSE joins multiple data fields with a newline, so
-                    // even a second empty field makes this a different value.
-                    self.data_is_done = Some(self.data_is_done.is_none() && data == b"[DONE]");
-                } else if self.line == b"data" {
-                    self.data_is_done = Some(false);
+                } else {
+                    match self.terminal {
+                        TerminalField::DataDone => {
+                            if let Some(data) = self.line.strip_prefix(b"data:") {
+                                let data = data.strip_prefix(b" ").unwrap_or(data);
+                                // SSE joins multiple data fields with a newline, so
+                                // even a second empty field makes this a different value.
+                                self.data_is_done =
+                                    Some(self.data_is_done.is_none() && data == b"[DONE]");
+                            } else if self.line == b"data" {
+                                self.data_is_done = Some(false);
+                            }
+                        }
+                        TerminalField::Event(target) => {
+                            if let Some(event) = self.line.strip_prefix(b"event:") {
+                                let event = event.strip_prefix(b" ").unwrap_or(event);
+                                self.data_is_done = Some(event == target);
+                            } else if self.line == b"event" {
+                                self.data_is_done = Some(false);
+                            }
+                        }
+                    }
                 }
                 self.line.clear();
-            } else if self.line.len() < 16 {
+            } else if self.line.len() < 64 {
                 self.line.push(byte);
             }
         }
@@ -191,5 +232,35 @@ mod tests {
                 matches!(result.last(), Some(Err(err)) if err.kind() == io::ErrorKind::UnexpectedEof)
             );
         }
+    }
+
+    #[tokio::test]
+    async fn event_terminal_survives_chunk_splits_and_rejects_clean_truncation() {
+        let body = b"event: message_delta\ndata: {}\n\nevent: message_stop\ndata: {}\n\n";
+        for split in 0..=body.len() {
+            let chunks = [
+                Ok::<_, reqwest::Error>(Bytes::copy_from_slice(&body[..split])),
+                Ok(Bytes::copy_from_slice(&body[split..])),
+            ];
+            let result: Result<Vec<_>, _> =
+                ensure_event_terminated(stream::iter(chunks), b"message_stop")
+                    .collect::<Vec<_>>()
+                    .await
+                    .into_iter()
+                    .collect();
+            assert_eq!(result.unwrap().concat(), body);
+        }
+
+        let truncated = b"event: message_delta\ndata: {}\n\n";
+        let result: Vec<_> = ensure_event_terminated(
+            stream::iter([Ok::<_, reqwest::Error>(Bytes::copy_from_slice(truncated))]),
+            b"message_stop",
+        )
+        .collect()
+        .await;
+        assert!(matches!(
+            result.last(),
+            Some(Err(err)) if err.kind() == io::ErrorKind::UnexpectedEof
+        ));
     }
 }

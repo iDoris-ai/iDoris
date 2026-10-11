@@ -7,6 +7,8 @@ use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use uuid::Uuid;
 
+pub mod store;
+
 pub const VIRTUAL_KEY_PREFIX: &str = "idk_";
 const SECRET_HEX_LEN: usize = 64;
 pub const VIRTUAL_KEY_LEN: usize = VIRTUAL_KEY_PREFIX.len() + SECRET_HEX_LEN;

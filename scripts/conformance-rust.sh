@@ -24,6 +24,8 @@ fi
 
 echo "[conformance-rust] cargo build --release -p idoris-router" >&2
 cargo build --release --locked -p idoris-router
+echo "[conformance-rust] cargo build --release -p idoris-tenancy --bin conformance_key_seed --features test-bins" >&2
+cargo build --release --locked -p idoris-tenancy --bin conformance_key_seed --features test-bins
 
 bin="${CARGO_TARGET_DIR:-$root/target}/release/idoris"
 if [ ! -x "$bin" ]; then
@@ -46,6 +48,7 @@ export IDORIS_CONFORMANCE_POST_RETRY=0
 # approved D-B1-1 edge differences are locked per implementation instead of
 # forcing one side to mimic the other.
 export IDORIS_CONFORMANCE_IMPLEMENTATION=rust
+export IDORIS_CONFORMANCE_KEY_SEEDER="${CARGO_TARGET_DIR:-$root/target}/release/conformance_key_seed"
 
 echo "[conformance-rust] IDORIS_CONFORMANCE_CMD=$IDORIS_CONFORMANCE_CMD" >&2
 echo "[conformance-rust] pnpm conformance" >&2

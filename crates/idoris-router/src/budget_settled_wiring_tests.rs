@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 use axum::http::StatusCode;
+use http_body_util::BodyExt;
 use idoris_backend::{MockAdapter, ModelInfo};
 use idoris_tenancy::event_log::{EventLogEvent, EventLogStore, EventType};
 use rusqlite::Connection;
@@ -110,4 +111,55 @@ async fn free_local_never_records_budget_settled() {
             .iter()
             .all(|event| event.event.event_type != EventType::BudgetSettled)
     );
+}
+
+#[tokio::test]
+async fn budget_settled_append_failure_keeps_already_settled_success_response() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = dir.path().join("events.sqlite3");
+    let event_log = Arc::new(EventLogStore::open(&db).unwrap());
+    Connection::open(&db)
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER fail_budget_settled BEFORE INSERT ON event_log_events \
+             WHEN NEW.event_type='budget.settled' BEGIN SELECT RAISE(ABORT,'fail settled'); END;",
+        )
+        .unwrap();
+    let (_budget_dir, ledger) = super::tests::configured_budget_ledger(1_000_000);
+    let ledger = Arc::new(ledger);
+    let before = ledger.tenant_readview(budget::PERSONAL_TENANT_ID).unwrap();
+    let card = super::tests::paid_component_card("paid-local");
+    let adapter = Arc::new(MockAdapter::new(vec![ModelInfo {
+        id: "paid-local".to_string(),
+        memory_gb: 1.0,
+    }]));
+    let supervisor = idoris_backend::Supervisor::spawn(adapter, Default::default()).unwrap();
+    let response = build_app(AppState {
+        cards: vec![card.clone()],
+        runtimes: dispatch::BoundSupervisor::new(&card, supervisor).into(),
+        budget_ledger: Some(ledger.clone()),
+        event_log: Some(event_log.clone()),
+        ..AppState::default()
+    })
+    .oneshot(super::tests::post_chat(
+        r#"{"model":"idoris/daily","messages":[{"role":"user","content":"still return me"}]}"#,
+        &[],
+    ))
+    .await
+    .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(response.headers().get(HEADER_COST_MINOR).is_some());
+    let chain = events(&event_log, &response);
+    assert!(
+        chain
+            .iter()
+            .all(|event| event.event.event_type != EventType::BudgetSettled)
+    );
+    let after = ledger.tenant_readview(budget::PERSONAL_TENANT_ID).unwrap();
+    assert!(after.spent_minor > before.spent_minor);
+    assert_eq!(after.reserved_minor, before.reserved_minor);
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert!(body["choices"][0]["message"]["content"].is_string());
 }
