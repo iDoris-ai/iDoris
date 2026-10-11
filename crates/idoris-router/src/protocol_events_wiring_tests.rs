@@ -435,3 +435,50 @@ async fn protocol_breaker_refusal_creates_no_fictitious_attempt_or_completion() 
         server.verify().await;
     }
 }
+
+#[tokio::test]
+async fn protocol_terminal_entry_points_require_a_committed_dispatch() {
+    for streaming in [false, true] {
+        let log = Arc::new(EventLogStore::new(Connection::open_in_memory().unwrap()).unwrap());
+        let state = AppState {
+            event_log: Some(log.clone()),
+            ..AppState::default()
+        };
+        let headers = HeaderMap::new();
+        let parsed =
+            profile::parse_profile(&headers, None, idoris_contracts::DeployMode::Personal).unwrap();
+        let selected = dispatch::select(
+            &[super::tests::resident_component_card(
+                "proto-card",
+                "http://127.0.0.1:1",
+            )],
+            &parsed,
+            "hello",
+        )
+        .unwrap();
+        let events = protocol_events::ProtocolEvents::begin(&state, &headers, &parsed, "preflight")
+            .await
+            .unwrap()
+            .unwrap();
+        let outcome = proxy::ForwardOutcome {
+            status: 503,
+            body: "refused".into(),
+            content_type: None,
+            cached: false,
+            origin_record_id: None,
+            replayed_served_locality: None,
+            retries: 0,
+            execution: proxy::ExecutionDisposition::NotExecuted,
+        };
+        if streaming {
+            events.completed_failure(&selected).await.unwrap();
+        } else {
+            events.completed(&selected, &outcome).await.unwrap();
+        }
+        let chain = log
+            .events_for_record(Some(budget::PERSONAL_TENANT_ID), "preflight")
+            .unwrap();
+        assert_eq!(chain.len(), 1);
+        assert_eq!(chain[0].event.event_type, EventType::RequestReceived);
+    }
+}
