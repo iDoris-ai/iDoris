@@ -41,6 +41,47 @@ Core product invariants:
 - Router/runtime/fallback/health/capacity designs should actively learn from mature open-source model routers/runtimes while preserving iDoris invariants.
 - Do not regress Rust safety improvements merely to mimic TS behavior; approved differences must be explicit and tested.
 
+## CI audit override — 2026-10-12 04:17 GMT+7 (read first)
+
+- Full live audit found **39 original queued PRs with failed CLA checks**:
+  #422 and #424–#461. CLA signatures in the configured
+  `AAStarCommunity/Brood` `cla-signatures` store do not include `clestons`.
+  The contributor must sign personally; do not sign on their behalf, change
+  contributor attribution or bypass this gate. A green newer descendant
+  does not make these older PR heads green.
+- Three older jobs also failed independently of CLA:
+  - #439 / run 38152050067: descendant process-group cleanup; #466 contains
+    the fixture repair, but the older head still has a failed check.
+  - #448 / run 38152082197: Unicode decimal neighbour generated as
+    "non-digit" context. The original regression seed reproduces locally.
+  - #452 / run 38152099270: inline temporary script test returns sanitized
+    SpawnFailed. The underlying errno is unavailable; ETXTBSY is a plausible
+    filesystem failure pattern, not a proven diagnosis of this run.
+- New #490 (`5f443d06f4f87801774b3820b1e24aefcd8f3799`, base #489)
+  repairs the property domain,
+  retains the original seed and deterministic Unicode boundaries, and moves
+  both inline spawn scripts into the stable fake CLI fixture (74 changed
+  lines). Inspect 38 tests / 4096 property cases, spawn 5 tests, full
+  feature-enabled serial Rust tests, strict fmt/clippy/deny and all six TS
+  gates pass; TS conformance 134/8. Remote CI and independent review remain
+  pending. Production behavior is unchanged; older failed heads remain red.
+- Latest M4 #488 (`ef957893cbc172250e77a71a271961b524f0e69b`) and M5 #489
+  (`c7cfe8cc9ef77b71da4ce7e4757b1cee17404244`) have all remote checks green.
+  Neither has independent current-head approval. Main remains `792ed904`;
+  no `v0.3.0` tag or release has been created.
+- M4 dry run 38174477955 succeeded with Release skipped. Its downloaded
+  archive SHA-256 is
+  `f05cf6c047fe085c34139b11fce2432198a46c08f692817d648134cdcb5c3fe2`;
+  checksum and isolated local smoke pass at version 0.3.0. Always run the
+  fixed smoke script from #487/#488; older M5/docs worktrees still contain
+  the unsafe script that inherits the caller's default data directory.
+- Next: obtain the contributor's CLA signature and independent approvals;
+  land the diagnosed repairs through normal reviewed merges, then rerun
+  affected current-head checks. Preserve child bases before deleting parent
+  branches. Real M4 acceptance on main remains required before tagging.
+- The existing default-DB recovery question and the authorization request
+  for one review-request comment remain unanswered; do not infer answers.
+
 ## Live delta — 2026-10-11 Codex takeover (newest; read first)
 
 - Goal mode is active; work continues on workstation B. Live main remains

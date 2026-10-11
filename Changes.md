@@ -2,6 +2,10 @@
 
 ## 2026-10-12 凌晨
 
+- #490 修正 Unicode 非数字上下文的属性生成器、保留失败种子并补边界用例；两个即时写脚本测试改用稳定 CLI 夹具，完整本地门禁通过（74 行），生产行为未变。
+
+- 全量 CI 核验发现原队列 39 个 CLA 签署阻塞，另有 #439/#448/#452 测试失败；最新 #488/#489 检查全绿不代表旧 PR 门禁通过。M4 exact-head 干跑下载产物校验及隔离 smoke 均通过。
+
 - #488/#489 修复 deployment mode 变化导致已绑定 tenant key 权限提升：已复现 personal mode 读取其他 tenant 事件 200；新 ceiling 阻断，正例/撤修负控/全部门禁通过，M4 router 443、M5 router 507，各 release conformance 134/8。
 - 发布干跑 38173125316 与最新 M4 exact-head 38174477955 均成功；前者下载 archive 校验与本机隔离 smoke 通过，Release job 均 skipped，未打 tag。
 
