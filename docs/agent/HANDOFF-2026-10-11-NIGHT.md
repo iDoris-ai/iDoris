@@ -59,6 +59,15 @@ Rules for landing (same as PRIME-CHECKPOINT "Safe stacked merge procedure"): mer
 
 `integration/m4-landing-tail` is a draft vehicle only: it merges #418 (contains #361→#417), #408 (contains #398) and #374 onto main without conflicts. Prefer landing those PRs individually; once they are in `main`, this branch's own diff collapses to merge commits.
 
+## How to review this stack (suggested)
+
+1. **Land M4 first, independently of everything below.** Approve and merge the original tail PRs (#361 → … → #418, #398 → #408, #374) in parent-first order, retargeting children before deleting parents. `integration/m4-landing-tail` only exists to prove they compose and to carry the acceptance run; after the tail is in `main` its diff collapses to merge commits. Then merge `test/m4-acceptance-gaps` (tests only), re-run the acceptance set on `main`, tag `v0.3.0`.
+2. **Contract first:** `feat/inspect-01-contract-freeze` is the only public-wire decision point (request shape, kind list, UTF-16 spans). Settle decision 3 here before reviewing the rest.
+3. **Pure code next, low risk:** inspect-02/03/04/10/11/12/16 and resilience-01 are IO-free (`idoris-policy`); each commit message lists the hand-run mutations that turn its tests red.
+4. **Wiring, highest attention:** inspect-05 (endpoint + auth split), inspect-06/07 (INSPECTED placement — the privacy-critical change), inspect-08 (kill switch), inspect-09 (egress counter), resilience-02..08 (breakers; off by default in the binary).
+5. **Read the review-fix PRs as a sequence** (`fix/inspect-13` → `-17` → `-18` → `-19` → `-20`): they record four rounds of trade-offs on the digit-group rule. The final rule is in `-20`; the earlier ones explain why simpler rules were rejected. If you prefer, squash-review `-13..-20` as one diff against `feat/inspect-16-homoglyph-folding`.
+6. Everything is stacked, so a change requested low in the stack means merging that branch forward into its children (no rebase, no force-push), the way the breaker opt-in fix was propagated tonight.
+
 ## M4 status
 
 - Landing tail unchanged: #361 #362 #364–#367 #416–#418 (B6), #398 #408 (B8), #374 (B7) still need a current-head approval from someone other than the last pusher.
