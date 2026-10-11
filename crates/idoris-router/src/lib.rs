@@ -71,6 +71,7 @@ mod usage;
 
 mod event_identifier;
 mod feedback;
+mod inspect;
 /// Direct HTTP forwarding for a generic `http_service` component card's
 /// `POST /v1/chat/completions` (R2-G) — retries, idempotency cache; wired
 /// into `chat_completions`/`AppState` below (see the module's own doc for
@@ -371,6 +372,10 @@ pub fn build_app(state: AppState) -> Router {
             post(chat_completions).fallback(not_found),
         )
         .route("/v1/feedback", post(post_feedback).fallback(not_found))
+        .route(
+            "/v1/inspect",
+            post(inspect::post_inspect).fallback(not_found),
+        )
         .route("/v1/embeddings", post(embeddings).fallback(not_found))
         .route("/v1/rerank", post(rerank).fallback(not_found))
         .route("/v1/messages", post(messages).fallback(not_found))
@@ -492,13 +497,31 @@ async fn enforce_protocol_key_scope(
     remote_identity: Option<&idoris_tenancy::virtual_key::store::AuthenticatedVirtualKey>,
     parsed: &profile::ParsedProfile,
 ) -> Result<(), Response> {
+    let privacy = parsed.task.privacy.unwrap_or(PrivacyClass::LocalOnly);
+    enforce_key_scope_with(state, headers, remote_identity, privacy, |identity| {
+        auth::enforce_scope(identity, parsed)
+    })
+    .await
+}
+
+/// The authentication half of [`enforce_protocol_key_scope`] with the scope
+/// check injected, for endpoints whose authority is not role-shaped
+/// (`/v1/inspect` only needs the privacy ceiling).
+async fn enforce_key_scope_with(
+    state: &AppState,
+    headers: &HeaderMap,
+    remote_identity: Option<&idoris_tenancy::virtual_key::store::AuthenticatedVirtualKey>,
+    privacy: PrivacyClass,
+    check: impl Fn(
+        &idoris_tenancy::virtual_key::store::AuthenticatedVirtualKey,
+    ) -> Result<(), auth::VirtualKeyScopeError>,
+) -> Result<(), Response> {
     if let Some(identity) = remote_identity {
-        return auth::enforce_scope(identity, parsed).map_err(virtual_key_scope_response);
+        return check(identity).map_err(virtual_key_scope_response);
     }
     let has_bearer = headers.contains_key(axum::http::header::AUTHORIZATION);
     if state.dev_no_key_enabled && !has_bearer {
-        return if parsed.task.privacy.unwrap_or(PrivacyClass::LocalOnly) == PrivacyClass::LocalOnly
-        {
+        return if privacy == PrivacyClass::LocalOnly {
             Ok(())
         } else {
             Err(dev_no_key_scope_response())
@@ -509,7 +532,7 @@ async fn enforce_protocol_key_scope(
             .authenticate(headers)
             .await
             .map_err(|_| virtual_key_unauthorized_response())?;
-        return auth::enforce_scope(&identity, parsed).map_err(virtual_key_scope_response);
+        return check(&identity).map_err(virtual_key_scope_response);
     }
     if state.dev_no_key_enabled && has_bearer {
         return Err(virtual_key_unauthorized_response());
@@ -3210,6 +3233,9 @@ fn audit_reason(status: StatusCode, served_locality: bool, degraded: bool) -> St
     }
     format!("degraded: http_{}", status.as_u16())
 }
+
+#[cfg(test)]
+mod inspect_wiring_tests;
 
 #[cfg(test)]
 mod local_privacy_tests;
