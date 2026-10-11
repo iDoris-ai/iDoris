@@ -87,7 +87,11 @@ async fn streaming_connect_failure_completes_the_recorded_attempt() {
     assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
     let chain = events(&event_log, &response);
     assert_eq!(completed_count(&chain), 1);
-    assert!(chain.iter().any(|e| e.event.event_type == EventType::Dispatched));
+    assert!(
+        chain
+            .iter()
+            .any(|e| e.event.event_type == EventType::Dispatched)
+    );
     assert_eq!(chain.last().unwrap().event.event_type, EventType::Completed);
     assert_eq!(chain.last().unwrap().event.metadata["status"], "failure");
 }
