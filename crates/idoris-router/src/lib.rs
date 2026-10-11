@@ -72,6 +72,7 @@ mod usage;
 mod event_identifier;
 mod feedback;
 mod inspect;
+mod protocol_events;
 /// Direct HTTP forwarding for a generic `http_service` component card's
 /// `POST /v1/chat/completions` (R2-G) — retries, idempotency cache; wired
 /// into `chat_completions`/`AppState` below (see the module's own doc for
@@ -546,15 +547,14 @@ async fn enforce_key_scope_with(
     Ok(())
 }
 
-/// Effective privacy for a protocol endpoint body after gate one
-/// ([`inspect::inspect_body`]). These endpoints keep no Event Log chain
-/// yet, so the verdict only tightens routing.
-async fn protocol_inspected_privacy(
+/// Gate one for a protocol endpoint body ([`inspect::inspect_body`]); the
+/// verdict tightens routing and is recorded as the `inspected` event.
+async fn protocol_inspection(
     state: &AppState,
     value: &serde_json::Value,
     raw_len: usize,
     parsed: &profile::ParsedProfile,
-) -> PrivacyClass {
+) -> inspect::Inspection {
     inspect::inspect_body_on_request_path(
         value,
         raw_len,
@@ -562,7 +562,6 @@ async fn protocol_inspected_privacy(
         state.remote_kill_switch.load(Ordering::SeqCst),
     )
     .await
-    .effective
 }
 
 /// Protocol endpoints only ever pick resident http_service cards; steer
@@ -616,6 +615,11 @@ async fn embeddings(
     // Caller headers may further constrain routing elsewhere, but they cannot
     // turn an embeddings request into a chat/rerank dispatch.
     parsed.task.capabilities = Some(vec![Capability::Embedding]);
+    let events =
+        match protocol_events::ProtocolEvents::begin(&state, &headers, &parsed, &record_id).await {
+            Ok(events) => events,
+            Err(response) => return response,
+        };
     if let Err(response) = enforce_protocol_key_scope(
         &state,
         &headers,
@@ -628,15 +632,43 @@ async fn embeddings(
     }
     // INSPECTED (M5-07): same gate as chat, after the key scope admitted
     // the declared privacy and before the routing policy reads it.
-    parsed.task.privacy =
-        Some(protocol_inspected_privacy(&state, &value, body.len(), &parsed).await);
+    let inspection = protocol_inspection(&state, &value, body.len(), &parsed).await;
+    if let Some(events) = &events
+        && let Err(response) = events.inspected(&inspection).await
+    {
+        return response;
+    }
+    parsed.task.privacy = Some(inspection.effective);
+    if let Some(events) = &events
+        && let Err(response) = events.profiled(&parsed).await
+    {
+        return response;
+    }
 
-    let cards = dispatch::policy_cards(&state.cards, &state.routing_policy, &parsed)
+    let policy = dispatch::policy_cards(&state.cards, &state.routing_policy, &parsed);
+    let cards = policy
         .cards
         .into_iter()
         .filter(dispatch::is_resident_http_service)
         .collect::<Vec<_>>();
-    let selected = match select_protocol_card(&state, &cards, &parsed) {
+    let mut selection = select_protocol_card(&state, &cards, &parsed);
+    if inspection.tightened
+        && !inspection.killed
+        && !inspection.failed
+        && !inspection.uninspectable
+        && let Ok(selected) = selection.as_mut()
+    {
+        selected
+            .decision
+            .reason_codes
+            .insert(0, idoris_policy::ReasonCode::PrivacyTightenedByContent);
+    }
+    if let Some(events) = &events
+        && let Err(response) = events.decided(&policy.route, &selection).await
+    {
+        return response;
+    }
+    let selected = match selection {
         Ok(selected) => selected,
         Err(DispatchError::Rejection(rejection)) => return rejection_response(rejection),
         Err(DispatchError::Internal(message)) => {
@@ -763,6 +795,11 @@ async fn rerank(
         Err(error) => return error.into_response(),
     };
     parsed.task.capabilities = Some(vec![Capability::Rerank]);
+    let events =
+        match protocol_events::ProtocolEvents::begin(&state, &headers, &parsed, &record_id).await {
+            Ok(events) => events,
+            Err(response) => return response,
+        };
     if let Err(response) = enforce_protocol_key_scope(
         &state,
         &headers,
@@ -775,15 +812,43 @@ async fn rerank(
     }
     // INSPECTED (M5-07): same gate as chat, after the key scope admitted
     // the declared privacy and before the routing policy reads it.
-    parsed.task.privacy =
-        Some(protocol_inspected_privacy(&state, &value, body.len(), &parsed).await);
+    let inspection = protocol_inspection(&state, &value, body.len(), &parsed).await;
+    if let Some(events) = &events
+        && let Err(response) = events.inspected(&inspection).await
+    {
+        return response;
+    }
+    parsed.task.privacy = Some(inspection.effective);
+    if let Some(events) = &events
+        && let Err(response) = events.profiled(&parsed).await
+    {
+        return response;
+    }
 
-    let cards = dispatch::policy_cards(&state.cards, &state.routing_policy, &parsed)
+    let policy = dispatch::policy_cards(&state.cards, &state.routing_policy, &parsed);
+    let cards = policy
         .cards
         .into_iter()
         .filter(dispatch::is_resident_http_service)
         .collect::<Vec<_>>();
-    let selected = match select_protocol_card(&state, &cards, &parsed) {
+    let mut selection = select_protocol_card(&state, &cards, &parsed);
+    if inspection.tightened
+        && !inspection.killed
+        && !inspection.failed
+        && !inspection.uninspectable
+        && let Ok(selected) = selection.as_mut()
+    {
+        selected
+            .decision
+            .reason_codes
+            .insert(0, idoris_policy::ReasonCode::PrivacyTightenedByContent);
+    }
+    if let Some(events) = &events
+        && let Err(response) = events.decided(&policy.route, &selection).await
+    {
+        return response;
+    }
+    let selected = match selection {
         Ok(selected) => selected,
         Err(DispatchError::Rejection(rejection)) => return rejection_response(rejection),
         Err(DispatchError::Internal(message)) => {
@@ -921,6 +986,11 @@ async fn messages(
         Err(error) => return error.into_response(),
     };
     parsed.task.capabilities = Some(vec![Capability::Chat]);
+    let events =
+        match protocol_events::ProtocolEvents::begin(&state, &headers, &parsed, &record_id).await {
+            Ok(events) => events,
+            Err(response) => return response,
+        };
     if let Err(response) = enforce_protocol_key_scope(
         &state,
         &headers,
@@ -933,15 +1003,43 @@ async fn messages(
     }
     // INSPECTED (M5-07): same gate as chat, after the key scope admitted
     // the declared privacy and before the routing policy reads it.
-    parsed.task.privacy =
-        Some(protocol_inspected_privacy(&state, &value, body.len(), &parsed).await);
+    let inspection = protocol_inspection(&state, &value, body.len(), &parsed).await;
+    if let Some(events) = &events
+        && let Err(response) = events.inspected(&inspection).await
+    {
+        return response;
+    }
+    parsed.task.privacy = Some(inspection.effective);
+    if let Some(events) = &events
+        && let Err(response) = events.profiled(&parsed).await
+    {
+        return response;
+    }
 
-    let cards = dispatch::policy_cards(&state.cards, &state.routing_policy, &parsed)
+    let policy = dispatch::policy_cards(&state.cards, &state.routing_policy, &parsed);
+    let cards = policy
         .cards
         .into_iter()
         .filter(dispatch::is_resident_http_service)
         .collect::<Vec<_>>();
-    let selected = match select_protocol_card(&state, &cards, &parsed) {
+    let mut selection = select_protocol_card(&state, &cards, &parsed);
+    if inspection.tightened
+        && !inspection.killed
+        && !inspection.failed
+        && !inspection.uninspectable
+        && let Ok(selected) = selection.as_mut()
+    {
+        selected
+            .decision
+            .reason_codes
+            .insert(0, idoris_policy::ReasonCode::PrivacyTightenedByContent);
+    }
+    if let Some(events) = &events
+        && let Err(response) = events.decided(&policy.route, &selection).await
+    {
+        return response;
+    }
+    let selected = match selection {
         Ok(selected) => selected,
         Err(DispatchError::Rejection(rejection)) => return rejection_response(rejection),
         Err(DispatchError::Internal(message)) => {
@@ -3416,6 +3514,9 @@ mod budget_concurrency_wiring_tests;
 
 #[cfg(test)]
 mod breaker_wiring_tests;
+
+#[cfg(test)]
+mod protocol_events_wiring_tests;
 
 #[cfg(test)]
 mod local_privacy_tests;
