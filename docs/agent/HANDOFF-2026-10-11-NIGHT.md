@@ -161,8 +161,16 @@ A fourth review found the third fix's DP correct and linear but measured a recal
 From M5-14 on, CI failed "Rust release conformance" and the subscription job's shared conformance on Linux and macOS: the shared suite expects persistent 5xx to pass through and later cases to reach the same upstream, but the new provider breaker opened after two failures. Fixed on `feat/resilience-02-proxy-breaker` by making breakers opt-in in the binary (decision 5 above), then merged forward (no rebase) through 03→07; Rust conformance re-run locally on the fixed branch and on the stack top: 134 passed / 8 todo.
 
 
-## Next
+## Next (resume here)
 
-1. `gh auth login`, run `pr-queue/create-prs.sh`, re-run the flaky macOS job.
-2. Owner review of the stack; land M4 tail → re-run acceptance on main → `v0.3.0`.
-3. Owner decisions above; then wire REDACT, Admin v1 kill switch, `inspected` events on protocol endpoints, gate two (Keychain).
+Stack top: `fix/review-5-hardening`. Every worktree under `/Volumes/UltraDisk/Dev2/iDoris/iDoris-wt/` was clean and pushed at stop time; `docs/handoff-2026-10-11-night` is this file.
+
+1. `gh auth login -h github.com`, then `bash /Volumes/UltraDisk/Dev2/iDoris/iDoris-wt/pr-queue/create-prs.sh` (opens all queued PRs in stack order, bases set, idempotent). Re-run the intermittent macOS subscription job with its log.
+2. Owner review per "How to review this stack" above; land the M4 tail first, re-run the acceptance set on `main`, tag `v0.3.0`.
+3. Owner decisions listed above (1–8). Each unblocks a ready next slice:
+   - redact consent → wire the M5-12 engine into `/v1/inspect` and the route stage (stream restore already exists);
+   - Admin v1 write surface → kill-switch toggle, egress counter and breaker state views;
+   - breakers on by default → flip `IDORIS_PROVIDER_BREAKER` default and update `conformance/tests/upstream-behavior.test.ts`;
+   - gate two store/config/wire → keychain-backed `SecretSource`, grant config, `POST /v1/broker/http`, C-3 response scan;
+   - B6 gaps in item 8 → `completed` after a not-executed dispatch, cache/`completed` ordering, tenant binding of virtual keys.
+4. Decision-free follow-ups still open: subscription OAuth breaker end-to-end with the CLI fixture harness; `inspected` reason codes in `/audit` projections if the owner wants them visible there.
