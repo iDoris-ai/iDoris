@@ -13,6 +13,7 @@
 pub mod breaker;
 pub mod budget;
 pub mod card;
+pub mod credentials;
 pub mod inspect;
 pub mod pipeline;
 pub mod privacy;
