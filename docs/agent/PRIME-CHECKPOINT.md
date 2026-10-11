@@ -172,27 +172,42 @@ Core product invariants:
 - #483–#486 complete remote push/PR checks are SUCCESS. Independent
   approval/main landing/v0.3.0 remain absent. Do not treat candidate verification
   as real-main acceptance or publish early.
-- Release preparation gap found: release.yml expects tag-derived 0.3.0 during
-  archive smoke, but /health uses CARGO_PKG_VERSION and router still declares
-  0.2.0. Prepare the required version metadata/migration guidance before tag;
-  inspect existing release conventions first. Do not change wire 1.0.1 for M4.
+- #487 `f64f7a0` (81 changed lines) fixes the reproduced release health
+  0.2.0-versus-tag-0.3.0 mismatch: all seven Rust crates/lock entries follow
+  the prior release convention at 0.3.0; wire remains 1.0.1. Operator migration
+  guide is `docs/releases/v0.3.0.md`. Full gates (router 441), release Rust
+  conformance 134/8 and actual five-file archive smoke at 0.3.0 pass locally.
+- Release smoke now isolates the child test user's default home/data/state
+  paths and still supplies no IDORIS_* settings. An invalid caller DB sentinel
+  stays untouched; removing isolation makes the real smoke fail. The initial
+  old-script baseline used workstation default DB. Existing history remains
+  (390 records/150 reservations), but previous budget configuration was not
+  captured and cannot be assumed unchanged. Owner question is pending; no
+  further writes or guessed restoration. Private impact counts are in
+  `night-evidence-2026-10-12/m4-release01-default-db-impact.json`.
+- Release dry run **38173125316** is verified IN_PROGRESS on `f64f7a0`:
+  workflow_dispatch build/test/package only, release job disabled for this
+  event. Poll that run; do not retrigger merely because observation times out.
+  Local candidate archive SHA-256 starts `294d4987b4b39b6c`; full checksum/logs
+  live beside the archive in `night-evidence-2026-10-12/`.
 - All new code is committed and pushed. Latest M5 validated stack head is #481;
-  latest M4 tenant-key validated candidate is #486;
+  latest M4 version/migration candidate is #487;
   #476 remains the historical combined integration snapshot, not a branch to
   merge its descendants into (that would collapse the dependent PR diffs).
-- Resume: inspect fresh CI/reviews, then complete concrete M4 release
-  preparation (version metadata and operator binding migration guidance).
+- Resume: inspect run 38173125316 and #487 CI/reviews; diagnose any actual
+  failure, then follow the M4 release procedure. Keep the default-DB owner
+  question pending until answered; do not assume permission to restore data.
   Follow independent approval/merge gates and re-run M4 acceptance on actual
   main before tag. REDACT consent and Admin v1 public writes remain pending.
   Do not recreate completed tests or collapse open parent/child review diffs.
 
 - Active worktrees live beside the main checkout under `/Users/jason/Dev/iDoris/`.
   Current debug caches: `target-identity32-night` built M4 authority #485;
-  `target-version-night` built M4 acceptance #486. `target-inspect22-release`
-  now holds #486's wire 1.0.1 release build (older M5 wire 1.1.0 artifacts
+  `target-version-night` and `target-inspect22-release` now hold #487's
+  crate 0.3.0 / wire 1.0.1 debug and release builds (older M5 wire 1.1.0 artifacts
   were cleaned). Clean workspace packages before reuse, keep dependency caches,
   and run full suites serially. Logs/bodies in `night-evidence-2026-10-12/`
-  use `m4-security02..04` prefixes; `run-night-gates.py` records the full gate loop.
+  use `m4-security02..04` and `m4-release01` prefixes; `run-night-gates.py` records the full gate loop.
 
 
 ## Live delta — 2026-10-11 Claude handoff (historical snapshot)

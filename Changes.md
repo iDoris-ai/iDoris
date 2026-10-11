@@ -2,9 +2,13 @@
 
 ## 2026-10-12 凌晨
 
+- #487 准备 0.3.0 crate/lock 元数据和 tenant key 迁移说明；router 441/441、完整门禁、release Rust conformance 134/8、真实 archive smoke 0.3.0 全过，wire 仍为 1.0.1。
+- release smoke 修复测试用户目录隔离：损坏调用方 DB 的负控证明旧路径会触及持久库；初次本地 baseline 已用默认库，原预算配置无快照，已询问用户并停止后续写入，历史记录仍在。
+- 已启动 release workflow 干跑 38173125316（仅 build/test/package）；未打 tag 或创建 Release。
+
 - #484–#486 完成 M4 tenant-key 夹具、入口/审计鉴权和验收回移；9 端点有效请求拒绝矩阵、3 项撤修负控、角色拒绝先于 request.received、四接口缓存撤销均有证据。
 - M4 安全候选 687c6ce：router 441/441，完整 Rust/TS 门禁、release Rust conformance 134/8，通过 wire 1.0.1；#483–#486 远端 CI 全绿，仍无批准/main 合并/tag。
-- 发布准备仍缺 router 包版本对齐：health 使用 Cargo 0.2.0，而 v0.3.0 archive smoke 要求 0.3.0；下一片处理元数据和绑定密钥迁移说明。
+- 发布版本不匹配已由 #487 修复；真实 main 验收与独立批准仍未完成。
 
 - #481 验证四个推理接口在成功缓存后撤销 tenant key：401、无重放、无新增租户事件/审计、仍为 1 POST；撤 active 条件负控失败，最终 router 505/505，全门禁通过。
 - #482 更新 M4 验收候选以包含 #374 最新修复；router 435/435，完整 Rust/TS 门禁通过，wire 1.0.1。原 #423 的绿 CI 未包含该修复。
