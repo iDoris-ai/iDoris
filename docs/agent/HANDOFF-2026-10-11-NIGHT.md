@@ -56,6 +56,7 @@ So nothing was merged and nothing was approved. Every branch below is pushed and
 | 33 | `feat/inspect-21-opaque-in-inspector` | `feat/resilience-08-connection-cooldown` @ `eae2ac6e` | feat(router): cool whole connections on Retry-After |
 | 34 | `feat/resilience-08-connection-cooldown` | `feat/event-log-28-protocol-chain` @ `d1cc81f9` | feat(router): record the decision chain on protocol endpoints |
 | 35 | `feat/event-log-28-protocol-chain` | `feat/event-log-29-protocol-dispatch` @ `6df741cd` | feat(router): record dispatch and completion on protocol endpoints |
+| 36 | `feat/event-log-29-protocol-dispatch` | `feat/event-log-30-messages-stream` @ `c6906b05` | feat(router): complete streamed /v1/messages in the Event Log |
 
 Rules for landing (same as PRIME-CHECKPOINT "Safe stacked merge procedure"): merge parent first; before a parent branch is deleted, retarget its child to `main`; no rebase, no force-push; never treat a stale approval as current.
 
@@ -100,7 +101,8 @@ The #421 M5 plan (contract freeze → pure L0 → rule packs → endpoint → IN
 | M5-24 | public `/v1/inspect` answers BLOCK/S3 for embedded `data:…;base64,` payloads (the route stage already pinned them local) |
 | M5-25 | connection-grain cooldown: `Retry-After` cools every card on the same scheme/host/port; selection steers away (opt-in breakers) |
 | M5-26 | decision chain (received → inspected → profiled → decided) on embeddings/rerank/messages; dispatched/completed added in M5-27 |
-| M5-27 | `dispatched`/`completed` on buffered protocol requests (replays record nothing); `/v1/messages` streaming still ends at `decided` |
+| M5-27 | `dispatched`/`completed` on buffered protocol requests (replays record nothing); `/v1/messages` streaming completed in M5-28 |
+| M5-28 | streamed `/v1/messages` records `dispatched` and completes when the stream ends (`message_stop`); every inference endpoint now has a full decision chain |
 
 M5 acceptance shape is tested: an id/phone/card injected anywhere in a declared-`any` body (plain content, array parts, tool arguments, JSON numbers, Anthropic `system`, embeddings input, rerank documents) yields zero upstream requests on a non-local card; kill switch stops the next request; 100-way budget race never overspends.
 
