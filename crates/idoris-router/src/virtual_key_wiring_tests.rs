@@ -130,6 +130,70 @@ fn wall_clock_ms() -> i64 {
 }
 
 #[tokio::test]
+async fn rejected_key_role_never_writes_request_received() {
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(method("POST"))
+        .respond_with(wiremock::ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let key = MintedVirtualKey::mint();
+    let mut key_scope = scope(vec![PrivacyClass::LocalOnly], &["fast"], None);
+    key_scope.tenant_id = Some("tenant-a".into());
+    let (authenticator, _) = memory_auth(&key, &key_scope);
+    let log = Arc::new(
+        idoris_tenancy::event_log::EventLogStore::new(Connection::open_in_memory().unwrap())
+            .unwrap(),
+    );
+    let mut protected = state(&server.uri(), Some(authenticator));
+    protected.deploy_mode = idoris_contracts::DeployMode::Tenant;
+    protected.event_log = Some(log.clone());
+    protected.record_store = Some(Arc::new(Mutex::new(
+        idoris_tenancy::store::TenantStore::new(Connection::open_in_memory().unwrap()).unwrap(),
+    )));
+    let response = build_app(protected)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .header("authorization", bearer(&key))
+                .header("x-idoris-tenant", "tenant-a")
+                .body(Body::from(
+                    r#"{"model":"idoris/daily","messages":[{"role":"user","content":"hello"}]}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let record_id = response.headers()[HEADER_RECORD_ID]
+        .to_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(
+        json_body(response).await["error"]["reason_code"],
+        "VIRTUAL_KEY_ROLE_FORBIDDEN"
+    );
+    let events = log.events_for_record(Some("tenant-a"), &record_id).unwrap();
+    // An authenticated, bound caller may have its denial audited, but must
+    // not create an admitted request's decision chain outside its key scope.
+    assert!(events.iter().any(|row| row.event.event_type == idoris_tenancy::event_log::EventType::AuditFinalized));
+    assert!(
+        !events.iter().any(
+            |row| row.event.event_type == idoris_tenancy::event_log::EventType::RequestReceived
+        )
+    );
+    assert!(
+        log.events_for_record(Some("tenant-b"), &record_id)
+            .unwrap()
+            .is_empty()
+    );
+    server.verify().await;
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn valid_key_reaches_execution_boundary_and_none_authenticator_preserves_legacy_behavior() {
     let server = wiremock::MockServer::start().await;
     wiremock::Mock::given(method("POST"))
@@ -800,4 +864,185 @@ async fn tenant_library_without_authenticator_fails_closed_without_egress_or_aud
         assert_eq!(health.status(), StatusCode::OK);
     }
     server.verify().await;
+}
+
+#[tokio::test]
+async fn bound_tenant_key_serves_only_its_tenant_and_records_the_authenticated_chain() {
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(method("POST"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({"ok":true})))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let key = MintedVirtualKey::mint();
+    let mut key_scope = scope(vec![PrivacyClass::LocalOnly], &["fast"], None);
+    key_scope.tenant_id = Some("tenant-a".into());
+    let (authenticator, _) = memory_auth(&key, &key_scope);
+    let event_log = Arc::new(
+        idoris_tenancy::event_log::EventLogStore::new(Connection::open_in_memory().unwrap())
+            .unwrap(),
+    );
+    let mut protected = state(&server.uri(), Some(authenticator));
+    protected.deploy_mode = idoris_contracts::DeployMode::Tenant;
+    protected.event_log = Some(event_log.clone());
+    protected.record_store = Some(Arc::new(Mutex::new(
+        idoris_tenancy::store::TenantStore::new(Connection::open_in_memory().unwrap()).unwrap(),
+    )));
+    let response = build_app(protected)
+        .oneshot(chat_request(&[
+            ("authorization", bearer(&key)),
+            ("x-idoris-tenant", "tenant-a".into()),
+        ]))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let record_id = response.headers()[HEADER_RECORD_ID].to_str().unwrap();
+    let events = event_log
+        .events_for_record(Some("tenant-a"), record_id)
+        .unwrap();
+    assert_eq!(
+        events[0].event.event_type,
+        idoris_tenancy::event_log::EventType::RequestReceived
+    );
+    assert!(events.iter().all(|row| row.event.tenant_id == "tenant-a"));
+    assert!(events.iter().any(|row| row.event.event_type
+        == idoris_tenancy::event_log::EventType::AuditFinalized));
+    assert!(
+        event_log
+            .events_for_record(Some("tenant-b"), record_id)
+            .unwrap()
+            .is_empty()
+    );
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn revoked_tenant_key_cannot_replay_warmed_inference_caches() {
+    for (endpoint, capability, body) in [
+        (
+            "/v1/chat/completions",
+            Capability::Chat,
+            json!({"model":"idoris/fast","messages":[{"role":"user","content":"hello"}]}),
+        ),
+        (
+            "/v1/embeddings",
+            Capability::Embedding,
+            json!({"model":"m","input":["hello"]}),
+        ),
+        (
+            "/v1/rerank",
+            Capability::Rerank,
+            json!({"model":"m","query":"q","documents":["a"]}),
+        ),
+        (
+            "/v1/messages",
+            Capability::Chat,
+            json!({"model":"m","max_tokens":8,"messages":[{"role":"user","content":"hi"}]}),
+        ),
+    ] {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(method("POST"))
+            .and(path(endpoint))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({"ok":true})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let key = MintedVirtualKey::mint();
+        let roles = idoris_policy::ROLES
+            .iter()
+            .map(|role| role.as_str())
+            .collect::<Vec<_>>();
+        let mut key_scope = scope(vec![PrivacyClass::LocalOnly], &roles, None);
+        key_scope.tenant_id = Some("tenant-a".into());
+        let (authenticator, keys) = memory_auth(&key, &key_scope);
+        let log = Arc::new(
+            idoris_tenancy::event_log::EventLogStore::new(Connection::open_in_memory().unwrap())
+                .unwrap(),
+        );
+        let records = Arc::new(Mutex::new(
+            idoris_tenancy::store::TenantStore::new(Connection::open_in_memory().unwrap()).unwrap(),
+        ));
+        let mut protected = state(&server.uri(), Some(authenticator));
+        protected.cards[0].provider.capabilities = vec![capability];
+        protected.deploy_mode = idoris_contracts::DeployMode::Tenant;
+        protected.event_log = Some(log.clone());
+        protected.record_store = Some(records.clone());
+        let app = build_app(protected);
+        let request = || {
+            Request::builder()
+                .method("POST")
+                .uri(endpoint)
+                .header("content-type", "application/json")
+                .header("authorization", bearer(&key))
+                .header("x-idoris-tenant", "tenant-a")
+                .header(HEADER_REQUEST_ID, "revoked-cache")
+                .body(Body::from(body.to_string()))
+                .unwrap()
+        };
+        let first = app.clone().oneshot(request()).await.unwrap();
+        assert_eq!(first.status(), StatusCode::OK, "{endpoint}");
+        assert!(!first.headers().contains_key(HEADER_CACHED));
+        assert_eq!(json_body(first).await, json!({"ok":true}));
+        let warmed = app.clone().oneshot(request()).await.unwrap();
+        assert_eq!(warmed.status(), StatusCode::OK, "{endpoint}");
+        assert!(warmed.headers().contains_key(HEADER_CACHED), "{endpoint}");
+        assert_eq!(json_body(warmed).await, json!({"ok":true}));
+        let query = idoris_tenancy::event_log::EventLogQuery {
+            limit: 1000,
+            ..Default::default()
+        };
+        let events_before = log
+            .events_for_tenant(Some("tenant-a"), &query)
+            .unwrap()
+            .len();
+        assert!(events_before > 0 && events_before < query.limit);
+        let records_before = records
+            .lock()
+            .unwrap()
+            .list(Some("tenant-a"), None)
+            .unwrap()
+            .len();
+        assert!(records_before > 0);
+        assert!(
+            keys.lock()
+                .unwrap()
+                .revoke(&key.key_id, wall_clock_ms())
+                .unwrap()
+        );
+        let denied = app.oneshot(request()).await.unwrap();
+        assert_eq!(denied.status(), StatusCode::UNAUTHORIZED, "{endpoint}");
+        assert!(!denied.headers().contains_key(HEADER_CACHED));
+        assert_eq!(
+            json_body(denied).await["error"]["reason_code"],
+            "VIRTUAL_KEY_UNAUTHORIZED"
+        );
+        assert_eq!(
+            log.events_for_tenant(Some("tenant-a"), &query)
+                .unwrap()
+                .len(),
+            events_before,
+            "{endpoint}: no forged events"
+        );
+        assert_eq!(
+            records
+                .lock()
+                .unwrap()
+                .list(Some("tenant-a"), None)
+                .unwrap()
+                .len(),
+            records_before,
+            "{endpoint}: no new tenant records"
+        );
+        assert!(
+            log.events_for_tenant(Some("tenant-b"), &query)
+                .unwrap()
+                .is_empty()
+        );
+        server.verify().await;
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            1,
+            "{endpoint}"
+        );
+    }
 }
