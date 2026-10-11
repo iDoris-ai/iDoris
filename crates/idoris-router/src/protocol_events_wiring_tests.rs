@@ -97,10 +97,13 @@ async fn served_protocol_requests_leave_a_queryable_decision_chain() {
                 EventType::RequestReceived,
                 EventType::Inspected,
                 EventType::Profiled,
-                EventType::Decided
+                EventType::Decided,
+                EventType::Dispatched,
+                EventType::Completed,
             ],
             "{path}"
         );
+        assert_eq!(events[5].event.metadata["status"], "success", "{path}");
         assert!(
             events
                 .iter()
@@ -124,7 +127,7 @@ async fn served_protocol_requests_leave_a_queryable_decision_chain() {
         assert_eq!(queried.status(), StatusCode::OK);
         let bytes = queried.into_body().collect().await.unwrap().to_bytes();
         let chain: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(chain["events"].as_array().unwrap().len(), 4, "{path}");
+        assert_eq!(chain["events"].as_array().unwrap().len(), 6, "{path}");
     }
 }
 
@@ -176,5 +179,42 @@ async fn malformed_correlation_is_rejected_before_anything_is_recorded() {
             .events_for_record(Some(budget::PERSONAL_TENANT_ID), &record_id(&response))
             .unwrap();
         assert!(events.is_empty(), "{path}");
+    }
+}
+
+#[tokio::test]
+async fn an_idempotent_replay_records_no_second_dispatch() {
+    for (path, capability, body) in endpoints() {
+        let (server, app, log) = app_with(capability, PrivacyClass::LocalOnly).await;
+        let headers = [("x-idoris-request-id", "proto-replay-1")];
+        let first = app
+            .clone()
+            .oneshot(post(path, &body, &headers))
+            .await
+            .unwrap();
+        let second = app.oneshot(post(path, &body, &headers)).await.unwrap();
+        assert_eq!(server.received_requests().await.unwrap().len(), 1, "{path}");
+        let replayed = log
+            .events_for_record(Some(budget::PERSONAL_TENANT_ID), &record_id(&second))
+            .unwrap();
+        assert!(
+            replayed.iter().all(|e| !matches!(
+                e.event.event_type,
+                EventType::Dispatched | EventType::Completed
+            )),
+            "{path}: {:?}",
+            replayed
+                .iter()
+                .map(|e| e.event.event_type)
+                .collect::<Vec<_>>()
+        );
+        let original = log
+            .events_for_record(Some(budget::PERSONAL_TENANT_ID), &record_id(&first))
+            .unwrap();
+        assert_eq!(
+            original.last().unwrap().event.event_type,
+            EventType::Completed,
+            "{path}"
+        );
     }
 }
