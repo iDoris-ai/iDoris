@@ -127,8 +127,11 @@ impl Breaker {
                     failures: failures + 1,
                 }
             }
-            State::Open { until_ms } => State::Open { until_ms },
-            State::Closed { .. } | State::HalfOpen { .. } => State::Open {
+            // Paths that report without admitting (Supervisor, subscription)
+            // never move an expired window to HALF_OPEN; a failure after the
+            // window is the failed probe, so reopen for a full window.
+            State::Open { until_ms } if now_ms < until_ms => State::Open { until_ms },
+            State::Closed { .. } | State::HalfOpen { .. } | State::Open { .. } => State::Open {
                 until_ms: now_ms.saturating_add(self.class.recovery_ms()),
             },
         };
@@ -290,6 +293,14 @@ mod tests {
         let mut breaker = tripped(CredentialClass::Local, 0);
         breaker.on_failure(10_000);
         assert_eq!(breaker.admit(15_000), Admission::Probe);
+    }
+
+    #[test]
+    fn a_failure_after_an_unprobed_window_reopens() {
+        let mut breaker = tripped(CredentialClass::Local, 0);
+        breaker.on_failure(16_000);
+        assert!(!breaker.would_admit(20_000));
+        assert!(breaker.would_admit(31_000));
     }
 
     #[test]

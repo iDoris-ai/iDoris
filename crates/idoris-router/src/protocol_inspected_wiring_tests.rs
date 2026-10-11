@@ -117,6 +117,11 @@ async fn unreadable_content_is_pinned_local_with_zero_egress() {
             json!({"model": "embed-model", "input": [[16, 7529, 4278, 1234, 5678, 9012, 3456, 7890]]}),
         ),
         (
+            "/v1/embeddings",
+            Capability::Embedding,
+            json!({"model": "embed-model", "input": [16, 7529, 4278, 1234]}),
+        ),
+        (
             "/v1/messages",
             Capability::Chat,
             json!({"model": "claude-local", "max_tokens": 16, "messages": [{"role": "user", "content": [

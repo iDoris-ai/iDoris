@@ -297,3 +297,53 @@ async fn a_tightened_request_served_locally_says_why_in_decided() {
         "privacy_tightened_by_content"
     );
 }
+
+#[tokio::test]
+async fn integer_enums_in_tool_schemas_stay_readable() {
+    let (upstream, state, _) = any_only_upstream().await;
+    let (status, _, _) = chat(
+        state,
+        json!({"model": "idoris/daily", "messages": [{"role": "user", "content": "pick a level"}],
+        "tools": [{"type": "function", "function": {"name": "set_level", "parameters": {
+            "type": "object",
+            "properties": {"level": {"type": "integer", "enum": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]}}
+        }}}]}),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+    assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn unreadable_content_is_not_reported_as_content_tightening_in_decided() {
+    let (_any_upstream, mut state, event_log) = any_only_upstream().await;
+    let local = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"marker": "local"})))
+        .mount(&local)
+        .await;
+    state
+        .cards
+        .push(resident_component_card("trusted-local", &local.uri()));
+    let (status, record_id, _) = chat(
+        state,
+        json!({"model": "idoris/daily", "messages": [{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0KGgo="}}
+        ]}]}),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+    let events = event_log
+        .events_for_record(Some(budget::PERSONAL_TENANT_ID), &record_id)
+        .unwrap();
+    assert_eq!(events[1].event.metadata["reason"], "uninspectable_content");
+    let decided = events
+        .iter()
+        .find(|e| e.event.event_type == EventType::Decided)
+        .unwrap();
+    let codes = decided.event.metadata["reason_codes"].as_array().unwrap();
+    assert!(
+        !codes.contains(&json!("privacy_tightened_by_content")),
+        "{codes:?}"
+    );
+}

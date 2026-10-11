@@ -25,6 +25,9 @@ const ID_CHECK: &[u8; 11] = b"10X98765432";
 /// 紧跟的 `X`/`x`（只对 17 位数字有意义：身份证校验位）。
 struct Candidate<'a> {
     digits: &'a [u8],
+    /// Lengths of the digit runs this candidate spans; one run means an
+    /// unbroken number, several mean a written grouping.
+    runs: &'a [usize],
     start: usize,
     end: usize,
     x_suffix: bool,
@@ -66,7 +69,9 @@ pub(super) fn scan_plain(units: &[u16]) -> Vec<Hit> {
         // Every run of neighbouring segments that can still be one entity:
         // the whole group, each segment alone, and everything in between, so
         // `110101 19900307 7379 138 1234 5678` yields both the id and the
-        // phone. Bounded by the longest entity, so linear in the group.
+        // phone. A multi-run window only counts in a real written grouping
+        // (see `classify`). Bounded by the longest entity, so linear.
+        let lengths: Vec<usize> = segments.iter().map(|&(s, e)| e - s).collect();
         for a in 0..segments.len() {
             let mut digits = Vec::new();
             for (b, &(seg_start, seg_end)) in segments.iter().enumerate().skip(a) {
@@ -78,19 +83,10 @@ pub(super) fn scan_plain(units: &[u16]) -> Vec<Hit> {
                 if digits.len() > MAX_ENTITY_DIGITS {
                     break;
                 }
-                // Real groupings (3-4-4, 4-4-4-4, 6-8-4, …) never split an
-                // entity into runs shorter than three digits; without this a
-                // list of single digits would yield Luhn-valid "cards".
-                if b > a
-                    && segments[a..=b]
-                        .iter()
-                        .any(|&(s, e)| e - s < MIN_GROUPED_RUN)
-                {
-                    break;
-                }
                 classify(
                     &Candidate {
                         digits: &digits,
+                        runs: &lengths[a..=b],
                         start: segments[a].0,
                         end: seg_end,
                         x_suffix: x_suffix && b + 1 == segments.len(),
@@ -118,17 +114,14 @@ fn is_digit(u: u16) -> bool {
 
 /// Longest digit entity (a 19-digit card).
 const MAX_ENTITY_DIGITS: usize = 19;
-/// Shortest digit run allowed inside a multi-run entity.
-const MIN_GROUPED_RUN: usize = 3;
 /// Separators tolerated between two digit runs of one group.
 const MAX_SEPARATOR_RUN: usize = 3;
 
-/// Space, hyphen, tab and line breaks: a number split across lines or text
-/// parts (the router joins body values with newlines) still forms a group.
+/// Space and hyphen only. Tabs and line breaks would join table cells and
+/// unrelated JSON values into "entities" (second review: most numeric
+/// tables were flagged), and could not join text parts anyway.
 fn is_separator(u: u16) -> bool {
-    [b' ', b'-', b'\t', b'\n', b'\r']
-        .iter()
-        .any(|&c| u == u16::from(c))
+    u == u16::from(b' ') || u == u16::from(b'-')
 }
 
 /// 从 `start`（必须是数字）开始的数字组终点：最多 3 个分隔符，且两侧都是
@@ -160,32 +153,38 @@ fn classify(c: &Candidate<'_>, hits: &mut Vec<Hit>) {
         });
     };
     let d = c.digits;
-    if d.len() == 17 && c.x_suffix && id_structure(d) {
+    let grouped = c.runs.len() > 1;
+    let grouped_as = |pattern: &[usize]| !grouped || c.runs == pattern;
+    if d.len() == 17 && c.x_suffix && grouped_as(&[6, 8, 3]) && id_structure(d) {
         push(
             FindingKind::CnResidentId,
             c.end + 1,
             id_sensitivity(d, b'X'),
         );
     }
-    if d.len() == 18 && id_structure(&d[..17]) {
+    if d.len() == 18 && grouped_as(&[6, 8, 4]) && id_structure(&d[..17]) {
         push(
             FindingKind::CnResidentId,
             c.end,
             id_sensitivity(&d[..17], b'0' + d[17]),
         );
     }
-    if d.len() == 15 && legacy_id_structure(d) {
+    if d.len() == 15 && grouped_as(&[6, 6, 3]) && legacy_id_structure(d) {
         push(FindingKind::CnResidentId, c.end, Sensitivity::S2);
     }
     let mobile = match d.len() {
-        11 => is_mobile(d),
-        13 => d[..2] == [8, 6] && is_mobile(&d[2..]),
+        11 => grouped_as(&[3, 4, 4]) && is_mobile(d),
+        13 => grouped_as(&[2, 3, 4, 4]) && d[..2] == [8, 6] && is_mobile(&d[2..]),
         _ => false,
     };
     if mobile {
         push(FindingKind::CnMobile, c.end, Sensitivity::S2);
     }
-    if (16..=19).contains(&d.len()) && d[0] != 0 && luhn_valid(d) {
+    if (16..=19).contains(&d.len())
+        && (!grouped || card_grouping(c.runs))
+        && card_iin(d)
+        && luhn_valid(d)
+    {
         push(FindingKind::BankCard, c.end, Sensitivity::S3);
     }
 }
@@ -222,6 +221,24 @@ fn id_sensitivity(first17: &[u8], check: u8) -> Sensitivity {
 /// MIIT 11 位手机号 `1[3-9]\d{9}`。
 fn is_mobile(d: &[u8]) -> bool {
     d.len() == 11 && d[0] == 1 && (3..=9).contains(&d[1])
+}
+
+/// Cards are written in fours, with a short final run for 17-19 digits.
+fn card_grouping(runs: &[usize]) -> bool {
+    runs.split_last().is_some_and(|(last, rest)| {
+        rest.len() >= 3 && rest.iter().all(|&r| r == 4) && (1..=4).contains(last)
+    })
+}
+
+/// Issuer ranges that exist (ISO/IEC 7812 major industry 3–6, Mastercard
+/// 2221–2720, UnionPay 81). Rules out years, ports and most counters.
+fn card_iin(d: &[u8]) -> bool {
+    match d[0] {
+        3..=6 => true,
+        2 => (2221..=2720).contains(&number(&d[..4])),
+        8 => d[1] == 1,
+        _ => false,
+    }
 }
 
 fn luhn_valid(d: &[u8]) -> bool {

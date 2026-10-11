@@ -2311,6 +2311,8 @@ async fn chat_completions(
     // recorded through `content_tightening`, ahead of privacy_loopback_only.
     if inspection.tightened
         && !inspection.killed
+        && !inspection.failed
+        && !inspection.uninspectable
         && let Ok(selected) = selection.as_mut()
     {
         selected
@@ -2601,8 +2603,9 @@ fn subscription_fault<T>(
 /// Whether a Supervisor outcome counts for or against the chosen model's
 /// breaker: model faults count, success resets, and anything that says
 /// nothing about the model (missing model config, a model still loading,
-/// capacity, cancellation, contention, budget, our own invariants) is
-/// ignored.
+/// capacity, a concurrent unload (`ModelUnavailable` while stopping),
+/// another model's failed eviction, cancellation, contention, budget, our
+/// own invariants) is ignored.
 fn local_model_fault(
     result: &Result<idoris_backend::ChatResponse, dispatch::DispatchFailure>,
 ) -> Option<bool> {
@@ -2610,15 +2613,13 @@ fn local_model_fault(
     match result {
         Ok(_) => Some(false),
         Err(dispatch::DispatchFailure::Backend(
-            E::ModelUnavailable { .. }
-            | E::Oom { .. }
+            E::Oom { .. }
             | E::ProbeTimedOut { .. }
             | E::AdapterTimedOut { .. }
             | E::AdapterPanicked { .. }
             | E::LoadUnconfirmed { .. }
             | E::LoadPostconditionFailed { .. }
-            | E::Upstream { .. }
-            | E::EvictionFailed { .. },
+            | E::Upstream { .. },
         )) => Some(true),
         Err(_) => None,
     }
