@@ -759,14 +759,15 @@ async fn embeddings(
                     }
                     Ok::<(), ()>(())
                 },
-                |outcome| async {
-                    if let Some(events) = &events {
-                        events
-                            .completed(&selected, &outcome)
-                            .await
-                            .map_err(|_| ())?;
+                |outcome| {
+                    let events = &events;
+                    let selected = &selected;
+                    async move {
+                        if let Some(events) = events {
+                            events.completed(selected, &outcome).await.map_err(|_| ())?;
+                        }
+                        Ok::<(), ()>(())
                     }
-                    Ok::<(), ()>(())
                 },
             ),
         )
@@ -958,14 +959,15 @@ async fn rerank(
                     }
                     Ok::<(), ()>(())
                 },
-                |outcome| async {
-                    if let Some(events) = &events {
-                        events
-                            .completed(&selected, &outcome)
-                            .await
-                            .map_err(|_| ())?;
+                |outcome| {
+                    let events = &events;
+                    let selected = &selected;
+                    async move {
+                        if let Some(events) = events {
+                            events.completed(selected, &outcome).await.map_err(|_| ())?;
+                        }
+                        Ok::<(), ()>(())
                     }
-                    Ok::<(), ()>(())
                 },
             ),
         )
@@ -1175,14 +1177,15 @@ async fn messages(
                     }
                     Ok::<(), ()>(())
                 },
-                |outcome| async {
-                    if let Some(events) = &events {
-                        events
-                            .completed(&selected, &outcome)
-                            .await
-                            .map_err(|_| ())?;
+                |outcome| {
+                    let events = &events;
+                    let selected = &selected;
+                    async move {
+                        if let Some(events) = events {
+                            events.completed(selected, &outcome).await.map_err(|_| ())?;
+                        }
+                        Ok::<(), ()>(())
                     }
-                    Ok::<(), ()>(())
                 },
             ),
         )
