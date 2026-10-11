@@ -75,6 +75,7 @@ async fn paid_local_records_one_budget_reservation_after_decision_before_executi
             .collect::<Vec<_>>(),
         vec![
             EventType::RequestReceived,
+            EventType::Inspected,
             EventType::Profiled,
             EventType::Decided,
             EventType::BudgetReserved,
@@ -84,7 +85,7 @@ async fn paid_local_records_one_budget_reservation_after_decision_before_executi
         ]
     );
     assert_eq!(budget_event_count(&events), 1);
-    let reserved = &events[3].event;
+    let reserved = &events[4].event;
     assert_eq!(
         reserved.metadata.get("reserved_minor"),
         Some(&json!(budget::estimate_cost_minor(
@@ -201,7 +202,18 @@ async fn budget_event_append_failure_releases_reservation_before_backend_executi
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     let events = events_for_response(&event_log, &response);
     assert_eq!(budget_event_count(&events), 0);
-    assert_eq!(events.len(), 3);
+    assert_eq!(
+        events
+            .iter()
+            .map(|event| event.event.event_type)
+            .collect::<Vec<_>>(),
+        vec![
+            EventType::RequestReceived,
+            EventType::Inspected,
+            EventType::Profiled,
+            EventType::Decided,
+        ]
+    );
     let body = response.into_body().collect().await.unwrap().to_bytes();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(json["error"]["reason_code"], "EVENT_LOG_APPEND_UNAVAILABLE");
@@ -254,6 +266,7 @@ async fn paid_proxy_records_budget_reservation_before_dispatch() {
             .collect::<Vec<_>>(),
         vec![
             EventType::RequestReceived,
+            EventType::Inspected,
             EventType::Profiled,
             EventType::Decided,
             EventType::BudgetReserved,

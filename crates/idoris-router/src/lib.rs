@@ -2094,6 +2094,27 @@ async fn chat_completions(
     } else if state.dev_no_key_enabled && authorization_present {
         return virtual_key_unauthorized_response();
     }
+    // INSPECTED: after the key scope admitted the declared privacy, before
+    // profiling, routing policy, or a remote intent detector can see `any`.
+    let mut parsed = parsed;
+    let inspection = inspect::inspect_body(
+        &value,
+        parsed.task.privacy.unwrap_or(PrivacyClass::LocalOnly),
+    );
+    if let Some((event_log, tenant_id)) = event_context.as_ref()
+        && inspect::append_inspected(
+            event_log.clone(),
+            tenant_id.clone(),
+            record_id.clone(),
+            &correlation,
+            &inspection,
+        )
+        .await
+        .is_err()
+    {
+        return event_log_unavailable_response();
+    }
+    parsed.task.privacy = Some(inspection.effective);
     let affinity_key = session_affinity_key(&headers);
 
     let messages = extract_messages(object);
@@ -3236,6 +3257,9 @@ fn audit_reason(status: StatusCode, served_locality: bool, degraded: bool) -> St
 
 #[cfg(test)]
 mod inspect_wiring_tests;
+
+#[cfg(test)]
+mod inspected_wiring_tests;
 
 #[cfg(test)]
 mod local_privacy_tests;

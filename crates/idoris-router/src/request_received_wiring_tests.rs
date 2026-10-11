@@ -78,12 +78,37 @@ async fn request_received_persists_server_record_and_validated_correlation() {
     let events = event_log
         .events_for_record(Some(budget::PERSONAL_TENANT_ID), &record_id)
         .unwrap();
-    assert_eq!(events.len(), 5);
+    assert_eq!(events.len(), 6);
     assert_eq!(events[0].event.event_type, EventType::RequestReceived);
-    assert_eq!(events[1].event.event_type, EventType::Profiled);
-    assert_eq!(events[2].event.event_type, EventType::Decided);
-    assert_eq!(events[3].event.event_type, EventType::Dispatched);
-    assert_eq!(events[4].event.event_type, EventType::Completed);
+    assert_eq!(events[1].event.event_type, EventType::Inspected);
+    assert_eq!(events[2].event.event_type, EventType::Profiled);
+    assert_eq!(events[3].event.event_type, EventType::Decided);
+    assert_eq!(events[4].event.event_type, EventType::Dispatched);
+    assert_eq!(events[5].event.event_type, EventType::Completed);
+    assert!(events[0].sequence < events[1].sequence);
+    assert!(events[1].sequence < events[2].sequence);
+    let inspected = &events[1].event;
+    assert_eq!(inspected.tenant_id, budget::PERSONAL_TENANT_ID);
+    assert_eq!(inspected.record_id, record_id);
+    assert_eq!(inspected.session_id.as_deref(), Some(" session-1 "));
+    assert_eq!(inspected.trace_id.as_deref(), Some("trace-1"));
+    assert_eq!(inspected.parent_id.as_deref(), Some("parent-1"));
+    assert!(inspected.request_id.is_none());
+    assert!(inspected.origin_record_id.is_none());
+    assert_eq!(inspected.metadata.get("sensitivity"), Some(&json!("S0")));
+    assert_eq!(
+        inspected.metadata.get("privacy"),
+        Some(&json!("local_only"))
+    );
+    assert!(inspected.metadata.get("labels").unwrap().is_array());
+    assert_eq!(inspected.metadata.get("labels"), Some(&json!([])));
+    assert!(!inspected.metadata.contains_key("reason"));
+    assert_eq!(inspected.metadata.len(), 3);
+    assert!(
+        !serde_json::to_string(&inspected.metadata)
+            .unwrap()
+            .contains("secret prompt")
+    );
     let event = &events[0].event;
     assert_eq!(event.tenant_id, budget::PERSONAL_TENANT_ID);
     assert_eq!(event.record_id, record_id);
@@ -166,10 +191,12 @@ async fn tenant_mode_uses_parsed_tenant_not_untrusted_metadata() {
     let events = event_log
         .events_for_record(Some("acme"), record_id)
         .unwrap();
-    assert_eq!(events.len(), 3);
+    assert_eq!(events.len(), 4);
     assert_eq!(events[0].event.event_type, EventType::RequestReceived);
-    assert_eq!(events[1].event.event_type, EventType::Profiled);
-    assert_eq!(events[2].event.event_type, EventType::Decided);
+    assert_eq!(events[1].event.event_type, EventType::Inspected);
+    assert_eq!(events[2].event.event_type, EventType::Profiled);
+    assert_eq!(events[3].event.event_type, EventType::Decided);
+    assert!(events.iter().all(|event| event.event.tenant_id == "acme"));
     assert!(
         event_log
             .events_for_record(Some("evil"), record_id)

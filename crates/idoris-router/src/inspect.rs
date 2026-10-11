@@ -81,3 +81,106 @@ pub(crate) async fn post_inspect(
     };
     (StatusCode::OK, Json(inspect(&request.input, &ctx))).into_response()
 }
+
+/// The chat path's `INSPECTED` stage (docs/15 §1.5): the whole request body
+/// is classified before any routing decision or remote intent detection, and
+/// anything short of an ALLOW verdict pins the request to `local_only`.
+pub(crate) struct Inspection {
+    pub response: idoris_contracts::InspectResponse,
+    pub effective: PrivacyClass,
+    pub tightened: bool,
+}
+
+/// Inspects every object key, string and number in `body` — content parts,
+/// tool definitions and arguments included — joined by newlines so values
+/// never merge into one digit group. `declared` must already have passed the
+/// caller's key scope, which is what makes `remote_allowed` true here.
+pub(crate) fn inspect_body(body: &serde_json::Value, declared: PrivacyClass) -> Inspection {
+    fn collect(value: &serde_json::Value, out: &mut String) {
+        match value {
+            serde_json::Value::String(text) => push_line(out, text),
+            serde_json::Value::Number(number) => push_line(out, &number.to_string()),
+            serde_json::Value::Array(items) => items.iter().for_each(|item| collect(item, out)),
+            serde_json::Value::Object(map) => map.iter().for_each(|(key, item)| {
+                push_line(out, key);
+                collect(item, out);
+            }),
+            serde_json::Value::Bool(_) | serde_json::Value::Null => {}
+        }
+    }
+    fn push_line(out: &mut String, text: &str) {
+        out.push_str(text);
+        out.push('\n');
+    }
+    let mut text = String::new();
+    collect(body, &mut text);
+    let ctx = InspectCtx {
+        declared,
+        remote_allowed: true,
+        redact_consent: false,
+        max_input_utf16: DEFAULT_MAX_INPUT_UTF16,
+    };
+    let response = inspect(&text, &ctx);
+    let tightening = (response.action != idoris_contracts::inspect::InspectAction::Allow)
+        .then_some(PrivacyClass::LocalOnly);
+    let effective = idoris_policy::effective_privacy(declared, tightening);
+    Inspection {
+        tightened: declared == PrivacyClass::Any && effective == PrivacyClass::LocalOnly,
+        response,
+        effective,
+    }
+}
+
+/// Appends the `inspected` fact: sensitivity, effective privacy, the
+/// distinct finding kinds, and a reason only when content tightened the
+/// caller's `any`. Never spans, never content.
+pub(crate) async fn append_inspected(
+    store: Arc<idoris_tenancy::event_log::EventLogStore>,
+    tenant_id: String,
+    record_id: String,
+    correlation: &crate::correlation::RequestCorrelation,
+    inspection: &Inspection,
+) -> Result<(), ()> {
+    let mut labels: Vec<serde_json::Value> = Vec::new();
+    for finding in &inspection.response.findings {
+        let label = serde_json::to_value(finding.kind).map_err(|_| ())?;
+        if !labels.contains(&label) {
+            labels.push(label);
+        }
+    }
+    let mut metadata = std::collections::BTreeMap::new();
+    metadata.insert(
+        "sensitivity".to_string(),
+        serde_json::to_value(inspection.response.sensitivity).map_err(|_| ())?,
+    );
+    metadata.insert(
+        "privacy".to_string(),
+        serde_json::to_value(inspection.effective).map_err(|_| ())?,
+    );
+    metadata.insert("labels".to_string(), serde_json::Value::Array(labels));
+    if inspection.tightened {
+        metadata.insert(
+            "reason".to_string(),
+            serde_json::Value::from("privacy_tightened_by_content"),
+        );
+    }
+    let ts_utc_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_millis()).ok())
+        .ok_or(())?;
+    let event = idoris_tenancy::event_log::NewEvent {
+        event_id: uuid::Uuid::new_v4().to_string(),
+        tenant_id: tenant_id.clone(),
+        record_id,
+        event_type: idoris_tenancy::event_log::EventType::Inspected,
+        ts_utc_ms,
+        request_id: None,
+        session_id: correlation.session_id.clone(),
+        trace_id: correlation.trace_id.clone(),
+        parent_id: correlation.parent_id.clone(),
+        origin_record_id: None,
+        metadata,
+    };
+    crate::run_event_log_write(move || store.append(Some(&tenant_id), &event).map(|_| ())).await
+}

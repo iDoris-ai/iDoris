@@ -63,13 +63,14 @@ async fn selected_route_records_one_truthful_decided_event_before_proxy_executio
             .collect::<Vec<_>>(),
         vec![
             EventType::RequestReceived,
+            EventType::Inspected,
             EventType::Profiled,
             EventType::Decided,
             EventType::Dispatched,
             EventType::Completed,
         ]
     );
-    let decided = &events[2].event;
+    let decided = &events[3].event;
     assert_eq!(
         decided.metadata.get("status"),
         Some(&serde_json::json!("selected"))
@@ -117,17 +118,18 @@ async fn empty_candidate_rejection_records_decided_before_returning() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     let events = events_for_response(&event_log, &response);
-    assert_eq!(events.len(), 3);
-    assert_eq!(events[2].event.event_type, EventType::Decided);
+    assert_eq!(events.len(), 4);
+    assert_eq!(events[1].event.event_type, EventType::Inspected);
+    assert_eq!(events[3].event.event_type, EventType::Decided);
     assert_eq!(
-        events[2].event.metadata.get("status"),
+        events[3].event.metadata.get("status"),
         Some(&serde_json::json!("rejected"))
     );
     assert_eq!(
-        events[2].event.metadata.get("reason"),
+        events[3].event.metadata.get("reason"),
         Some(&serde_json::json!("local_only_unavailable"))
     );
-    assert!(events[2].event.metadata.contains_key("rule_id"));
+    assert!(events[3].event.metadata.contains_key("rule_id"));
 }
 
 #[tokio::test]
@@ -162,9 +164,10 @@ async fn decided_append_failure_is_generic_503_before_budget_or_upstream() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     let events = events_for_response(&event_log, &response);
-    assert_eq!(events.len(), 2);
+    assert_eq!(events.len(), 3);
     assert_eq!(events[0].event.event_type, EventType::RequestReceived);
-    assert_eq!(events[1].event.event_type, EventType::Profiled);
+    assert_eq!(events[1].event.event_type, EventType::Inspected);
+    assert_eq!(events[2].event.event_type, EventType::Profiled);
     let body = response.into_body().collect().await.unwrap().to_bytes();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(json["error"]["reason_code"], "EVENT_LOG_APPEND_UNAVAILABLE");
@@ -205,6 +208,7 @@ async fn supervisor_double_decide_path_emits_decided_only_once() {
             .collect::<Vec<_>>(),
         vec![
             EventType::RequestReceived,
+            EventType::Inspected,
             EventType::Profiled,
             EventType::Decided,
         ]

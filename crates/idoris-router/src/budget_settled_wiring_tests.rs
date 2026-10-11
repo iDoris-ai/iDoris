@@ -60,6 +60,7 @@ async fn paid_local_records_budget_settled_after_completed() {
             .collect::<Vec<_>>(),
         vec![
             EventType::RequestReceived,
+            EventType::Inspected,
             EventType::Profiled,
             EventType::Decided,
             EventType::BudgetReserved,

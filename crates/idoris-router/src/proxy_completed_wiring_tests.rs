@@ -67,6 +67,7 @@ async fn buffered_proxy_records_completed_success_after_dispatch() {
             .collect::<Vec<_>>(),
         vec![
             EventType::RequestReceived,
+            EventType::Inspected,
             EventType::Profiled,
             EventType::Decided,
             EventType::Dispatched,

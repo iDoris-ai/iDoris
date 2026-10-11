@@ -72,13 +72,14 @@ async fn buffered_proxy_records_one_content_free_dispatch_attempt() {
             .collect::<Vec<_>>(),
         vec![
             EventType::RequestReceived,
+            EventType::Inspected,
             EventType::Profiled,
             EventType::Decided,
             EventType::Dispatched,
             EventType::Completed,
         ]
     );
-    let dispatched = &chain[3].event;
+    let dispatched = &chain[4].event;
     assert_eq!(dispatched.metadata.get("status"), Some(&json!("attempted")));
     assert_eq!(
         dispatched.metadata.get("provider_id"),
@@ -178,7 +179,18 @@ async fn dispatched_append_failure_is_503_with_zero_post_for_buffered_and_stream
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         let chain = events(&event_log, &response);
         assert_eq!(dispatched_count(&chain), 0);
-        assert_eq!(chain.len(), 3);
+        assert_eq!(
+            chain
+                .iter()
+                .map(|event| event.event.event_type)
+                .collect::<Vec<_>>(),
+            vec![
+                EventType::RequestReceived,
+                EventType::Inspected,
+                EventType::Profiled,
+                EventType::Decided,
+            ]
+        );
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(json["error"]["reason_code"], "EVENT_LOG_APPEND_UNAVAILABLE");
