@@ -67,6 +67,17 @@ Core product invariants:
   (both push/PR Linux Rust/TS and Linux/macOS subscription; original failed
   spawn tests pass on Linux). Independent review remains pending. Production
   behavior is unchanged; older failed heads remain red.
+- M5 pure C-3 follow-up #492 (`57a55735f982024c3c9984d74ec7f8f388b4a139`,
+  base #490; 165 lines) blocks this exchange's credential in one-layer
+  base64/base64url, hex and percent echoes, including short values and
+  non-UTF-8 binary wrappers. Two baseline bypasses reproduced. Policy 139,
+  full local Rust/TS gates and release conformance 134/8 pass; removing
+  encoded lookup, raw-byte matching or short-token support makes the
+  corresponding safety assertion fail; restored tests pass. L0 thresholds
+  retain their original semantics. Remote CI/review are pending; delivery,
+  streaming, arbitrary/nested encoding and storage/API wiring remain open.
+- Checkpoint #491 at `a4890ae` passed all nine remote checks after importing
+  #466. Further updates only change documentation; its code remains c8a3ced.
 - Latest M4 #488 (`ef957893cbc172250e77a71a271961b524f0e69b`) and M5 #489
   (`c7cfe8cc9ef77b71da4ce7e4757b1cee17404244`) have all remote checks green.
   Neither has independent current-head approval. Main remains `792ed904`;
