@@ -170,7 +170,7 @@ async fn cancellation_during_finalization_retains_the_executed_request_marker() 
         .await
         .unwrap();
     leader.abort();
-    assert!(leader.await.unwrap_err().is_cancelled());
+    assert!(matches!(leader.await, Err(error) if error.is_cancelled()));
     let replay = proxy
         .forward_buffered(&server.uri(), &body(), &options("retry"))
         .await;
