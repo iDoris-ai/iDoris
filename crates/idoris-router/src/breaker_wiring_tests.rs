@@ -327,18 +327,52 @@ fn reported_subscription_faults_open_the_oauth_breaker_after_three() {
     let proxy = proxy::ChatProxy::new(reqwest::Client::new());
     let oauth = idoris_policy::breaker::CredentialClass::OAuth;
     let id = idoris_policy::SUBSCRIPTION_PROVIDER_ID;
+    let card = super::tests::sample_component_card(id);
     for _ in 0..2 {
         proxy.report_outcome(id, oauth, Some(true));
     }
     assert!(
-        proxy.open_providers([id]).is_empty(),
+        proxy.open_providers([&card]).is_empty(),
         "two faults must not open it"
     );
     proxy.report_outcome(id, oauth, None);
     assert!(
-        proxy.open_providers([id]).is_empty(),
+        proxy.open_providers([&card]).is_empty(),
         "ignored outcomes do not count"
     );
     proxy.report_outcome(id, oauth, Some(true));
-    assert!(proxy.open_providers([id]).contains(id));
+    assert!(proxy.open_providers([&card]).contains(id));
+}
+
+#[tokio::test]
+async fn selection_avoids_every_card_on_a_cooling_connection() {
+    let busy = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(429)
+                .insert_header("retry-after", "120")
+                .set_body_json(json!({"error": "slow down"})),
+        )
+        .mount(&busy)
+        .await;
+    let healthy = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"marker": "healthy"})))
+        .mount(&healthy)
+        .await;
+    let app = build_app(AppState {
+        cards: vec![
+            resident_component_card("a1-busy-host", &busy.uri()),
+            resident_component_card("a2-busy-host", &busy.uri()),
+            resident_component_card("b-healthy", &healthy.uri()),
+        ],
+        ..AppState::default()
+    });
+    let body = r#"{"model":"idoris/daily","messages":[{"role":"user","content":"hi"}]}"#;
+    let first = app.clone().oneshot(post_chat(body, &[])).await.unwrap();
+    assert_eq!(first.status(), StatusCode::TOO_MANY_REQUESTS);
+    let second = app.oneshot(post_chat(body, &[])).await.unwrap();
+    assert_eq!(second.status(), StatusCode::OK);
+    assert_eq!(busy.received_requests().await.unwrap().len(), 1);
+    assert_eq!(healthy.received_requests().await.unwrap().len(), 1);
 }

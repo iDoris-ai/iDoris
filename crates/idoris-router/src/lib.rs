@@ -572,9 +572,7 @@ fn select_protocol_card(
     cards: &[idoris_contracts::ComponentCard],
     parsed: &profile::ParsedProfile,
 ) -> Result<dispatch::Selected, DispatchError> {
-    let open = state
-        .proxy
-        .open_providers(cards.iter().map(|card| card.provider.id.as_str()));
+    let open = state.proxy.open_providers(cards.iter());
     dispatch::select_avoiding_open_breakers(
         cards,
         parsed,
@@ -2292,12 +2290,7 @@ async fn chat_completions(
     };
 
     // Resident proxies and Supervisor-run models share one breaker book.
-    let open_provider_ids = state.proxy.open_providers(
-        policy_cards
-            .cards
-            .iter()
-            .map(|card| card.provider.id.as_str()),
-    );
+    let open_provider_ids = state.proxy.open_providers(policy_cards.cards.iter());
     let mut selection = dispatch::select_avoiding_open_breakers(
         &policy_cards.cards,
         &parsed,
