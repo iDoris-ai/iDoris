@@ -671,6 +671,42 @@ fn review_regressions_grouped_split_and_invisible_variants() {
     }
 }
 
+#[test]
+fn other_digit_scripts_and_latin_homoglyphs_are_folded() {
+    let thai_phone = "เบอร์ ๑๓๘๑๒๓๔๕๖๗๘";
+    assert!(kinds(&inspect(thai_phone, &open_ctx())).contains(&FindingKind::CnMobile));
+    let devanagari_id: String = "11010519491231002"
+        .chars()
+        .map(|d| char::from_u32(0x0966 + d.to_digit(10).unwrap()).unwrap())
+        .chain(['X'])
+        .collect();
+    let response = inspect(&devanagari_id, &open_ctx());
+    assert!(
+        kinds(&response).contains(&FindingKind::CnResidentId),
+        "{response:?}"
+    );
+    assert_eq!(
+        covered(&devanagari_id, &response.findings[0]),
+        devanagari_id
+    );
+    // Cyrillic DZE for `s` in the prefix, Cyrillic A and K in AKIA.
+    let spoofed_openai = FAKE_OPENAI.replacen('s', "\u{0455}", 1);
+    let spoofed_aws = FAKE_AWS_ID.replacen("AK", "\u{0410}\u{041A}", 1);
+    for key in [spoofed_openai, spoofed_aws] {
+        assert!(
+            kinds(&inspect(&key, &open_ctx())).contains(&FindingKind::ApiKey),
+            "{key}"
+        );
+    }
+    // Ordinary Russian and Greek text stays clean.
+    for text in [
+        "Привет, как дела? Сегодня хорошая погода.",
+        "Καλημέρα, τι κάνεις;",
+    ] {
+        assert!(inspect(text, &open_ctx()).findings.is_empty(), "{text}");
+    }
+}
+
 fn valid_id() -> impl Strategy<Value = String> {
     (0usize..34, 1950u32..2030, 1u32..13, 1u32..29, 0u32..1000).prop_map(
         |(province, year, month, day, seq)| {
