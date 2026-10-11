@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://idoris.ai/schema/inspect-response.schema.json",
+  "title": "InspectResponse",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["sensitivity", "findings", "action"],
+  "properties": {
+    "sensitivity": { "enum": ["S0", "S1", "S2", "S3"] },
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["kind"],
+        "properties": {
+          "kind": {
+            "enum": [
+              "cn_resident_id", "cn_mobile", "bank_card", "cn_unified_social_credit_code",
+              "cn_license_plate", "cn_passport", "hk_identity_card", "hk_macau_travel_permit",
+              "email_address", "api_key", "private_key", "high_entropy_secret", "credential_path",
+              "input_limit_exceeded"
+            ]
+          },
+          "span": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["start", "length"],
+            "properties": {
+              "start": { "type": "integer", "minimum": 0 },
+              "length": { "type": "integer", "minimum": 1 }
+            }
+          }
+        }
+      }
+    },
+    "action": { "enum": ["BLOCK", "REDACT", "ALLOW"] }
+  }
+}

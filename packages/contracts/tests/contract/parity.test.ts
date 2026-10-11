@@ -7,6 +7,8 @@ import adminV0RuntimesJson from "../../schema/admin-v0-runtimes.schema.json";
 import adminV0StatusJson from "../../schema/admin-v0-status.schema.json";
 import adapterManifestJson from "../../schema/adapter-manifest.schema.json";
 import componentCardJson from "../../schema/component-card.schema.json";
+import inspectRequestJson from "../../schema/inspect-request.schema.json";
+import inspectResponseJson from "../../schema/inspect-response.schema.json";
 import loadPolicyJson from "../../schema/load-policy.schema.json";
 import providerJson from "../../schema/provider.schema.json";
 import roleJson from "../../schema/role.schema.json";
@@ -20,6 +22,8 @@ import { adminV0RuntimesResponseSchema } from "../../src/generated/admin-v0-runt
 import { adminV0StatusResponseSchema } from "../../src/generated/admin-v0-status.js";
 import { adapterManifestSchema } from "../../src/adapter-manifest.js";
 import { componentCardSchema } from "../../src/component-card.js";
+import { inspectRequestSchema } from "../../src/generated/inspect-request.js";
+import { inspectResponseSchema } from "../../src/generated/inspect-response.js";
 import { loadPolicySchema } from "../../src/load-policy.js";
 import { providerDescriptorSchema } from "../../src/provider.js";
 import { roleSchema } from "../../src/role.js";
@@ -35,6 +39,8 @@ const jsonByName = {
   "admin-v0-runtimes": adminV0RuntimesJson,
   "admin-v0-status": adminV0StatusJson,
   "adapter-manifest": adapterManifestJson,
+  "inspect-request": inspectRequestJson,
+  "inspect-response": inspectResponseJson,
   provider: providerJson, "load-policy": loadPolicyJson, "component-card": componentCardJson,
   "routing-policy": routingPolicyJson, "task-profile": taskProfileJson, "training-sample": trainingSampleJson,
   role: roleJson,
@@ -49,6 +55,8 @@ const zodByName: Record<Name, { safeParse: (d: unknown) => { success: boolean } 
   "admin-v0-runtimes": adminV0RuntimesResponseSchema,
   "admin-v0-status": adminV0StatusResponseSchema,
   "adapter-manifest": adapterManifestSchema,
+  "inspect-request": inspectRequestSchema,
+  "inspect-response": inspectResponseSchema,
   provider: providerDescriptorSchema, "load-policy": loadPolicySchema, "component-card": componentCardSchema,
   "routing-policy": routingPolicySchema, "task-profile": taskProfileSchema,
   "training-sample": trainingSampleSchema,
@@ -79,7 +87,30 @@ const validSample = {
   messages: [{ role: "user", content: "hi" }, { role: "assistant", content: "hello" }],
 };
 
+const validInspect = {
+  sensitivity: "S3",
+  findings: [{ kind: "cn_resident_id", span: { start: 4, length: 18 } }, { kind: "input_limit_exceeded" }],
+  action: "BLOCK",
+};
+
 const corpus: Array<[Name, unknown]> = [
+  ["inspect-request", { input: "身份证 110105194912310021" }],
+  ["inspect-request", { input: "" }],
+  ["inspect-request", {}],
+  ["inspect-request", { input: null }],
+  ["inspect-request", { input: "x", privacy: "any" }],
+  ["inspect-response", validInspect],
+  ["inspect-response", { sensitivity: "S0", findings: [], action: "ALLOW" }],
+  ["inspect-response", { ...validInspect, sensitivity: "S4" }],
+  ["inspect-response", { ...validInspect, action: "block" }],
+  ["inspect-response", { ...validInspect, findings: [{ kind: "phone" }] }],
+  ["inspect-response", { ...validInspect, findings: [{ kind: "cn_mobile", span: { start: 0, length: 0 } }] }],
+  ["inspect-response", { ...validInspect, findings: [{ kind: "cn_mobile", span: { start: -1, length: 11 } }] }],
+  ["inspect-response", { ...validInspect, findings: [{ kind: "cn_mobile", span: { start: 1.5, length: 11 } }] }],
+  ["inspect-response", { ...validInspect, findings: [{ kind: "cn_mobile", span: null }] }],
+  ["inspect-response", { ...validInspect, findings: [{ kind: "cn_mobile", span: { start: 0, end: 11 } }] }],
+  ["inspect-response", { ...validInspect, findings: [{ kind: "api_key", match: "sk-live-1" }] }],
+  ["inspect-response", { ...validInspect, reason: "matched 110105194912310021" }],
   ["admin-v0-backends", [{ provider_id: "omlx-local", locality: "loopback", form: "http_service", lifecycle_runtime_bound: true }]],
   ["admin-v0-backends", []],
   ["admin-v0-backends", [{ provider_id: "", locality: "loopback", form: "http_service", lifecycle_runtime_bound: false }]],
