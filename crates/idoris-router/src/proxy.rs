@@ -398,20 +398,23 @@ impl ChatProxy {
             .collect()
     }
 
-    /// M5-18 single-model lockout for Supervisor-run cards: the same book,
-    /// local class. Only model faults count; `None` means the outcome says
-    /// nothing about the model (config, cancellation, contention, our bugs).
-    pub(crate) fn report_local_outcome(&self, provider_id: &str, failed: Option<bool>) {
+    /// M5-18/19: outcomes of paths that do not go through this proxy
+    /// (Supervisor-run models, the subscription relay) feed the same book
+    /// so selection steers away from them too. `None` means the outcome
+    /// says nothing about the provider and is ignored.
+    pub(crate) fn report_outcome(
+        &self,
+        provider_id: &str,
+        class: idoris_policy::breaker::CredentialClass,
+        failed: Option<bool>,
+    ) {
         let Some(failed) = failed else {
             return;
         };
         let Ok(mut book) = self.breakers.lock() else {
             return;
         };
-        let (key, class) = (
-            provider_id.to_string(),
-            idoris_policy::breaker::CredentialClass::Local,
-        );
+        let key = provider_id.to_string();
         if failed {
             book.on_failure(&key, class, wall_clock_ms());
         } else {
