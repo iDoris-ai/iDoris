@@ -283,3 +283,72 @@ async fn a_stream_without_message_stop_completes_as_failure() {
         .unwrap();
     assert_eq!(completed.1, Some(json!("failure")));
 }
+
+#[tokio::test]
+async fn failed_protocol_completion_never_becomes_a_cached_success() {
+    for (path, capability, body) in endpoints() {
+        for request_id in [None, Some("failed-protocol-completion")] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let dir = tempfile::TempDir::new().unwrap();
+            let db = dir.path().join("events.sqlite3");
+            let log = Arc::new(EventLogStore::open(&db).unwrap());
+            Connection::open(&db)
+                .unwrap()
+                .execute_batch(
+                    "CREATE TRIGGER reject_completed BEFORE INSERT ON event_log_events \
+                 WHEN NEW.event_type='completed' BEGIN SELECT RAISE(ABORT,'failure'); END;",
+                )
+                .unwrap();
+            let mut card = super::tests::resident_component_card("proto-card", &server.uri());
+            card.provider.capabilities = vec![capability];
+            let app = build_app(AppState {
+                cards: vec![card],
+                event_log: Some(log.clone()),
+                ..AppState::default()
+            });
+            let headers = request_id
+                .map(|id| vec![("x-idoris-request-id", id)])
+                .unwrap_or_default();
+            let first = app
+                .clone()
+                .oneshot(post(path, &body, &headers))
+                .await
+                .unwrap();
+            assert_eq!(first.status(), StatusCode::SERVICE_UNAVAILABLE, "{path}");
+            let chain = log
+                .events_for_record(Some(budget::PERSONAL_TENANT_ID), &record_id(&first))
+                .unwrap();
+            assert_eq!(
+                chain.last().unwrap().event.event_type,
+                EventType::Dispatched
+            );
+            assert_eq!(
+                chain
+                    .iter()
+                    .filter(|e| e.event.event_type == EventType::Dispatched)
+                    .count(),
+                1
+            );
+            assert!(!first.headers().contains_key(HEADER_CACHED));
+            if request_id.is_some() {
+                let second = app.oneshot(post(path, &body, &headers)).await.unwrap();
+                assert_eq!(second.status(), StatusCode::SERVICE_UNAVAILABLE, "{path}");
+                assert!(!second.headers().contains_key(HEADER_CACHED));
+                let replay = log
+                    .events_for_record(Some(budget::PERSONAL_TENANT_ID), &record_id(&second))
+                    .unwrap();
+                assert!(replay.iter().all(|e| !matches!(
+                    e.event.event_type,
+                    EventType::Dispatched | EventType::Completed
+                )));
+            }
+            server.verify().await;
+            assert_eq!(server.received_requests().await.unwrap().len(), 1, "{path}");
+        }
+    }
+}

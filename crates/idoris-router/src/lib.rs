@@ -746,28 +746,35 @@ async fn embeddings(
     };
     let outcome = match state
         .proxy
-        .forward_buffered_path_observed(
+        .forward_buffered_path_finalized(
             &selected.card.endpoint,
             proxy::BufferedUpstreamPath::EMBEDDINGS,
             &value,
             &opts,
-            || async {
-                if let Some(events) = &events {
-                    events.dispatched(&selected).await?;
-                }
-                Ok::<(), ()>(())
-            },
+            |_| Ok(()),
+            (
+                || async {
+                    if let Some(events) = &events {
+                        events.dispatched(&selected).await?;
+                    }
+                    Ok::<(), ()>(())
+                },
+                |outcome| async {
+                    if let Some(events) = &events {
+                        events
+                            .completed(&selected, &outcome)
+                            .await
+                            .map_err(|_| ())?;
+                    }
+                    Ok::<(), ()>(())
+                },
+            ),
         )
         .await
     {
         Ok(outcome) => outcome,
         Err(()) => return event_log_unavailable_response(),
     };
-    if let Some(events) = &events
-        && let Err(response) = events.completed(&selected, &outcome).await
-    {
-        return response;
-    }
     let status = StatusCode::from_u16(outcome.status).unwrap_or(StatusCode::BAD_GATEWAY);
     let mut response = (status, outcome.body).into_response();
     let content_type = outcome
@@ -938,28 +945,35 @@ async fn rerank(
     };
     let outcome = match state
         .proxy
-        .forward_buffered_path_observed(
+        .forward_buffered_path_finalized(
             &selected.card.endpoint,
             proxy::BufferedUpstreamPath::RERANK,
             &value,
             &opts,
-            || async {
-                if let Some(events) = &events {
-                    events.dispatched(&selected).await?;
-                }
-                Ok::<(), ()>(())
-            },
+            |_| Ok(()),
+            (
+                || async {
+                    if let Some(events) = &events {
+                        events.dispatched(&selected).await?;
+                    }
+                    Ok::<(), ()>(())
+                },
+                |outcome| async {
+                    if let Some(events) = &events {
+                        events
+                            .completed(&selected, &outcome)
+                            .await
+                            .map_err(|_| ())?;
+                    }
+                    Ok::<(), ()>(())
+                },
+            ),
         )
         .await
     {
         Ok(outcome) => outcome,
         Err(()) => return event_log_unavailable_response(),
     };
-    if let Some(events) = &events
-        && let Err(response) = events.completed(&selected, &outcome).await
-    {
-        return response;
-    }
     let status = StatusCode::from_u16(outcome.status).unwrap_or(StatusCode::BAD_GATEWAY);
     let mut response = (status, outcome.body).into_response();
     let content_type = outcome
@@ -1148,28 +1162,35 @@ async fn messages(
     };
     let outcome = match state
         .proxy
-        .forward_buffered_path_observed(
+        .forward_buffered_path_finalized(
             &selected.card.endpoint,
             proxy::BufferedUpstreamPath::MESSAGES,
             &value,
             &opts,
-            || async {
-                if let Some(events) = &events {
-                    events.dispatched(&selected).await?;
-                }
-                Ok::<(), ()>(())
-            },
+            |_| Ok(()),
+            (
+                || async {
+                    if let Some(events) = &events {
+                        events.dispatched(&selected).await?;
+                    }
+                    Ok::<(), ()>(())
+                },
+                |outcome| async {
+                    if let Some(events) = &events {
+                        events
+                            .completed(&selected, &outcome)
+                            .await
+                            .map_err(|_| ())?;
+                    }
+                    Ok::<(), ()>(())
+                },
+            ),
         )
         .await
     {
         Ok(outcome) => outcome,
         Err(()) => return event_log_unavailable_response(),
     };
-    if let Some(events) = &events
-        && let Err(response) = events.completed(&selected, &outcome).await
-    {
-        return response;
-    }
     let status = StatusCode::from_u16(outcome.status).unwrap_or(StatusCode::BAD_GATEWAY);
     let mut response = (status, outcome.body).into_response();
     let content_type = outcome
