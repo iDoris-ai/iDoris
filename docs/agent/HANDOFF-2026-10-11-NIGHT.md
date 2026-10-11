@@ -54,6 +54,7 @@ So nothing was merged and nothing was approved. Every branch below is pushed and
 | 31 | `fix/inspect-19-third-review` | `fix/inspect-20-grouping-recall` @ `b498db6a` | fix(inspect): recover grouped entities next to short numbers |
 | 32 | `fix/inspect-20-grouping-recall` | `feat/inspect-21-opaque-in-inspector` @ `228bb1f0` | feat(policy): treat embedded base64 payloads as uninspectable |
 | 33 | `feat/inspect-21-opaque-in-inspector` | `feat/resilience-08-connection-cooldown` @ `eae2ac6e` | feat(router): cool whole connections on Retry-After |
+| 34 | `feat/resilience-08-connection-cooldown` | `feat/event-log-28-protocol-chain` @ `d1cc81f9` | feat(router): record the decision chain on protocol endpoints |
 
 Rules for landing (same as PRIME-CHECKPOINT "Safe stacked merge procedure"): merge parent first; before a parent branch is deleted, retarget its child to `main`; no rebase, no force-push; never treat a stale approval as current.
 
@@ -97,6 +98,7 @@ The #421 M5 plan (contract freeze → pure L0 → rule packs → endpoint → IN
 | review fixes 2–4 | false-positive explosion from tab/newline joining removed; digit groups judged as runs, whole group, or full decomposition into entities; `\uXXXX` and math digits folded in place; report-only breakers re-lock after the window |
 | M5-24 | public `/v1/inspect` answers BLOCK/S3 for embedded `data:…;base64,` payloads (the route stage already pinned them local) |
 | M5-25 | connection-grain cooldown: `Retry-After` cools every card on the same scheme/host/port; selection steers away (opt-in breakers) |
+| M5-26 | decision chain (received → inspected → profiled → decided) on embeddings/rerank/messages; dispatched/completed there still open — **next step** |
 
 M5 acceptance shape is tested: an id/phone/card injected anywhere in a declared-`any` body (plain content, array parts, tool arguments, JSON numbers, Anthropic `system`, embeddings input, rerank documents) yields zero upstream requests on a non-local card; kill switch stops the next request; 100-way budget race never overspends.
 
