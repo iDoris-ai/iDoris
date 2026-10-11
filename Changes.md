@@ -6,7 +6,8 @@
 - Draft #476 整合安全修复、wire 1.1.0 和 macOS fixtures，同一 HEAD 完整门禁及 release conformance 134/8 通过。
 - #477–#478 修复 paid waiter/cache 的重复预留拒绝；leader 才预留付费金额，取消与结算规则有账本负控。
 - #479 完成显式 max_tokens 较大上限的预留估算：超预算 402/零 POST；最终 router 504/504，全门禁及 release conformance 134/8 通过。默认/无上限和 prompt 估算仍是原有假设。
-- Draft #476 远端 CI 已全绿（包括两轮 macOS）；独立批准仍为空，main/tag 状态未变。
+- #476 和 #479 远端 CI 已全绿（包括两轮 macOS）；独立批准仍为空，main/tag 状态未变。
+- #480 增加 gate-two 缓冲响应检查核心，10 项凭证回归、两项撤修负控、完整门禁通过；运行时接线、流式及任意编码处理尚未实现，公开写接口仍待审。
 
 - #469–#473 完成缓存发布前提交、protocol/free chat 接线和所有代理路径的连接失败终态；直接入口负控覆盖被早期路由拒绝掩盖的保护，最终完整门禁与 release conformance 134/8 通过。
 - #474 修复确定未发送的付费请求残留预算预留；已复现 2051 残留，修复后无 ID/同 ID 重试均为零扣费、零残留、零 POST。

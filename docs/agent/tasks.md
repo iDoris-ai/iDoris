@@ -480,3 +480,5 @@
 | FU-213 | 2026-10-12 paid replay headroom | 已复现同 ID waiter 因重复完整预留收到 402；#477–#478 零成本 SpendGate + leader-only 预留，1 POST/1 扣费、waiter/cache 200，发送前取消释放/允许发送后保留，最终门禁与 release conformance 通过 | PR_OPEN |
 
 | FU-214 | 2026-10-12 declared max_tokens | #479；3000 预算 + 4096 cap 改为 402/零 POST/零余额变化，保持 1024 下限及 payload，撤上限接线负控失败；最终 router 504/504，全 Rust/TS 门禁、release conformance 134/8 通过，待独立批准 | PR_OPEN |
+
+| FU-215 | gate-two C-3 响应边界 | #480；缓冲响应中的本次凭据及闸一命中、非法 UTF-8/总长度超限默认拒绝，10 项回归与两项撤修负控、全门禁通过；仅纯核心，运行时接线/流式/编码处理仍未闭环，待独立批准 | PR_OPEN |

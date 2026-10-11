@@ -132,14 +132,22 @@ Core product invariants:
   prompt estimates retain legacy assumptions. No claim of arbitrary-provider
   physical billing protection. REDACT consent and public Admin writes stay
   pending, as do the other owner decisions described in the original handoff.
-- Remote CI: draft #476's complete push/PR checks, including both macOS jobs,
-  are now SUCCESS. #478's Rust/macOS jobs were still running at the last poll.
-  APPROVED search is empty; sampled M4 #361/#374/#416 are authored by the
-  current jhfnetboy account, so do not self-approve or switch identities.
-- All new code is committed and pushed. Latest validated stack head is #479;
+- Remote CI: #476 and #479 complete push/PR checks, including both macOS
+  jobs, are SUCCESS. APPROVED search is empty. All M4 tail PR authors were
+  checked (#361/#362/#364–#367/#374/#398/#408/#416–#418/#423): jhfnetboy,
+  the current account. Do not self-approve or switch identities.
+- #480 `ea5c70e` (218 changed lines) adds gate-two buffered response inspection
+  core: this call's credential (including normalized Unicode escapes), L0
+  inspection of body/header names/header values, aggregate size and UTF-8
+  fail closed. Ten credential tests and both removed-check negative controls
+  pass; full serial feature-enabled Rust (policy 135/router 504), fmt/clippy/
+  deny and all pnpm gates pass (134/8). No runtime wiring, streaming, arbitrary
+  encoded payload handling or public/storage contract was added. C-3 is not
+  production-enforced yet. Remote CI is newly started; FU-215 remains PR_OPEN.
+- All new code is committed and pushed. Latest validated stack head is #480;
   #476 remains the historical combined integration snapshot, not a branch to
   merge its descendants into (that would collapse the dependent PR diffs).
-- Resume: inspect #479/other fresh CI and incoming independent reviews; follow
+- Resume: inspect #480/other fresh CI and incoming independent reviews; follow
   the repository merge gates. Continue decision-free safety review/validation
   from the first genuinely unresolved item, without reopening fixed cases.
 
@@ -148,7 +156,7 @@ Core product invariants:
   a shared target reused stale workspace libraries during the first tenant
   build. `target-identity-night` was cleaned after validation. Current buffered
   validated budget-safety-02 uses `target-identity32-night`; budget-safety-03
-  uses the separate `target-version-night`; release conformance uses
+  used `target-version-night`, now reused after policy clean for gate-two-03; release conformance uses
   `target-inspect22-release`. Clean workspace packages before switching source
   revisions while retaining dependency cache. Durable validation logs now live
   in `night-evidence-2026-10-12/` beside the checkout; `/tmp` was cleared.
