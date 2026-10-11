@@ -934,6 +934,37 @@ impl ChatProxy {
         O: FnOnce() -> Fut,
         Fut: std::future::Future<Output = Result<(), E>>,
     {
+        self.forward_buffered_path_finalized(
+            endpoint,
+            path,
+            body,
+            opts,
+            success_gate,
+            (observer, |_| std::future::ready(Ok(()))),
+        )
+        .await
+    }
+
+    /// Finalize a new forwarding result before publishing its response,
+    /// cache entry or singleflight replay. Cache hits and waiters do not
+    /// repeat either observer. Failure retains an uncertainty marker so
+    /// retrying the same cache key within its window cannot repeat the POST.
+    pub(crate) async fn forward_buffered_path_finalized<F, O, C, Fut, Completed, E>(
+        &self,
+        endpoint: &str,
+        path: BufferedUpstreamPath,
+        body: &Value,
+        opts: &ForwardOpts<'_>,
+        success_gate: F,
+        observers: (O, C),
+    ) -> Result<ForwardOutcome, E>
+    where
+        F: FnOnce(&ForwardOutcome) -> Result<(), SuccessFinalizeError> + Send,
+        O: FnOnce() -> Fut,
+        C: FnOnce(ForwardOutcome) -> Completed,
+        Fut: std::future::Future<Output = Result<(), E>>,
+        Completed: std::future::Future<Output = Result<(), E>>,
+    {
         // The observer is intentionally later than every knowable preflight
         // exit and earlier than the first reqwest send attempt. It therefore
         // runs once across retries.
@@ -945,26 +976,29 @@ impl ChatProxy {
             Err(_) => return Ok(Self::failure(503, 0)),
         };
         let mut outcome = self
-            .forward_buffered_inner_observed(endpoint, path, body, opts, success_gate, observer)
+            .forward_buffered_inner_observed(endpoint, path, body, opts, success_gate, observers)
             .await?;
         outcome.body = with_permit(outcome.body, Arc::new(permit));
         Ok(outcome)
     }
 
-    async fn forward_buffered_inner_observed<F, O, Fut, E>(
+    async fn forward_buffered_inner_observed<F, O, C, Fut, Completed, E>(
         &self,
         endpoint: &str,
         path: BufferedUpstreamPath,
         body: &Value,
         opts: &ForwardOpts<'_>,
         success_gate: F,
-        observer: O,
+        observers: (O, C),
     ) -> Result<ForwardOutcome, E>
     where
         F: FnOnce(&ForwardOutcome) -> Result<(), SuccessFinalizeError> + Send,
         O: FnOnce() -> Fut,
+        C: FnOnce(ForwardOutcome) -> Completed,
         Fut: std::future::Future<Output = Result<(), E>>,
+        Completed: std::future::Future<Output = Result<(), E>>,
     {
+        let (observer, completed) = observers;
         let mut payload = body.clone();
         if path.force_non_stream
             && let Some(obj) = payload.as_object_mut()
@@ -981,7 +1015,9 @@ impl ChatProxy {
             let outcome = self
                 .forward_once_observed(&url, &payload, opts, &fingerprint, &mut uncertain, observer)
                 .await?;
-            return Ok(Self::finalize_success(outcome, success_gate).0);
+            let outcome = Self::finalize_success(outcome, success_gate).0;
+            completed(outcome.clone()).await?;
+            return Ok(outcome);
         };
         let key = cache_key(
             opts.tenant_id.unwrap_or("\u{0}personal"),
@@ -1079,6 +1115,16 @@ impl ChatProxy {
         };
         let (outcome, finalize_failed) = Self::finalize_success(outcome, success_gate);
         uncertain |= finalize_failed;
+        if let Err(error) = completed(outcome.clone()).await {
+            *result = Some(Self::flight_failure_with_execution(
+                503,
+                "upstream_unavailable",
+                ExecutionDisposition::Uncertain,
+            ));
+            // Keep cancellation_guard armed until the uncertain result expires.
+            // No successful body has reached the cache or waiting callers.
+            return Err(error);
+        }
         if !uncertain
             && (200..300).contains(&outcome.status)
             && !outcome.cached
@@ -2580,6 +2626,10 @@ mod tests {
 #[cfg(test)]
 #[path = "proxy/stream_limits_tests.rs"]
 mod stream_limits_tests;
+
+#[cfg(test)]
+#[path = "proxy/buffered_finalizer_tests.rs"]
+mod buffered_finalizer_tests;
 
 #[cfg(test)]
 #[path = "proxy/slow_reader_tests.rs"]
