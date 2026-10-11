@@ -53,6 +53,7 @@ So nothing was merged and nothing was approved. Every branch below is pushed and
 | 30 | `fix/inspect-18-second-review` | `fix/inspect-19-third-review` @ `aced94db` | fix(inspect): judge digit groups whole or fully decomposed |
 | 31 | `fix/inspect-19-third-review` | `fix/inspect-20-grouping-recall` @ `b498db6a` | fix(inspect): recover grouped entities next to short numbers |
 | 32 | `fix/inspect-20-grouping-recall` | `feat/inspect-21-opaque-in-inspector` @ `228bb1f0` | feat(policy): treat embedded base64 payloads as uninspectable |
+| 33 | `feat/inspect-21-opaque-in-inspector` | `feat/resilience-08-connection-cooldown` @ `eae2ac6e` | feat(router): cool whole connections on Retry-After |
 
 Rules for landing (same as PRIME-CHECKPOINT "Safe stacked merge procedure"): merge parent first; before a parent branch is deleted, retarget its child to `main`; no rebase, no force-push; never treat a stale approval as current.
 
@@ -86,6 +87,7 @@ The #421 M5 plan (contract freeze → pure L0 → rule packs → endpoint → IN
 | M5-21..23 | large bodies scanned off the async worker (`inspect_failed` fail-closed); decided reasons carry `privacy_tightened_by_content`; all BMP digit scripts + Latin homoglyphs folded |
 | review fixes 2–4 | false-positive explosion from tab/newline joining removed; digit groups judged as runs, whole group, or full decomposition into entities; `\uXXXX` and math digits folded in place; report-only breakers re-lock after the window |
 | M5-24 | public `/v1/inspect` answers BLOCK/S3 for embedded `data:…;base64,` payloads (the route stage already pinned them local) |
+| M5-25 | connection-grain cooldown: `Retry-After` cools every card on the same scheme/host/port; selection steers away (opt-in breakers) |
 
 M5 acceptance shape is tested: an id/phone/card injected anywhere in a declared-`any` body (plain content, array parts, tool arguments, JSON numbers, Anthropic `system`, embeddings input, rerank documents) yields zero upstream requests on a non-local card; kill switch stops the next request; 100-way budget race never overspends.
 
@@ -98,7 +100,7 @@ Every rule/decoder/stage was mutation-checked by hand (removing it turns its tes
 3. `/v1/inspect` request shape (`{input: string}` vs messages), the finding-kind list, and whether to bump wire `contract_version` (still `1.0.1`) when the endpoint ships.
 4. `credential_path` sensitivity S2 (vs S3).
 5. **Provider breakers are off by default in the binary** (`IDORIS_PROVIDER_BREAKER=1` turns them on). CI showed that on-by-default breaks the shared conformance contract ("persistent 5xx is passed through verbatim"; `conformance/tests/upstream-behavior.test.ts` sends 500 then 503 to one local upstream and expects later cases to reach it). Turning them on by default needs an owner decision plus a conformance update (e.g. an env-gated expectation like `IDORIS_CONFORMANCE_POST_RETRY`). Also new public error type when on: 503 `provider_circuit_open`.
-6. Breaker scope still open: per-connection Retry-After is folded into the provider key today; the subscription wiring is unit-tested only (no CLI fixture run).
+6. Breaker scope still open: the subscription wiring is unit-tested only (no CLI fixture run). (Per-connection Retry-After is done in M5-25.)
 
 ## Known CI note
 
