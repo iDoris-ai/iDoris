@@ -488,6 +488,16 @@ async fn remote_bind_auth_middleware(
         Ok(identity) => identity,
         Err(_) => return virtual_key_unauthorized_response(),
     };
+    // A deployment-mode change must not promote a tenant-scoped key into
+    // personal authority; personal's effective inference tenant is fixed.
+    if state.deploy_mode == idoris_contracts::DeployMode::Personal
+        && let Some(bound) = identity.scope.tenant_id.as_deref()
+        && (bound != budget::PERSONAL_TENANT_ID
+            || (request.headers().contains_key("x-idoris-tenant")
+                && query_scope_header(request.headers()) != Some(bound)))
+    {
+        return virtual_key_scope_response(auth::VirtualKeyScopeError::TenantForbidden);
+    }
     let trusted_tenant = if state.deploy_mode == idoris_contracts::DeployMode::Tenant {
         let Some(bound) = identity.scope.tenant_id.as_deref() else {
             return virtual_key_scope_response(auth::VirtualKeyScopeError::TenantForbidden);
