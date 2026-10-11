@@ -2298,7 +2298,7 @@ async fn chat_completions(
             .iter()
             .map(|card| card.provider.id.as_str()),
     );
-    let selection = dispatch::select_avoiding_open_breakers(
+    let mut selection = dispatch::select_avoiding_open_breakers(
         &policy_cards.cards,
         &parsed,
         &prompt,
@@ -2306,6 +2306,18 @@ async fn chat_completions(
         &ready_provider_ids,
         &open_provider_ids,
     );
+    // M5-22: INSPECTED already lowered the privacy floor, so the pipeline
+    // cannot tell that content did it; record the fact it would have
+    // recorded through `content_tightening`, ahead of privacy_loopback_only.
+    if inspection.tightened
+        && !inspection.killed
+        && let Ok(selected) = selection.as_mut()
+    {
+        selected
+            .decision
+            .reason_codes
+            .insert(0, idoris_policy::ReasonCode::PrivacyTightenedByContent);
+    }
     let rejection_reason = match &selection {
         Ok(_) => None,
         Err(DispatchError::Rejection(rejection)) => Some(rejection.error_type()),
