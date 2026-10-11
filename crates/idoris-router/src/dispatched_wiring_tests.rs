@@ -454,3 +454,65 @@ async fn local_dispatched_append_failure_is_generic_503_after_load() {
     let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(json["error"]["reason_code"], "EVENT_LOG_APPEND_UNAVAILABLE");
 }
+
+#[tokio::test]
+async fn rejected_paid_dispatch_releases_its_reservation_before_same_id_retry() {
+    for request_id in [None, Some("paid-dispatch-rejected")] {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&upstream)
+            .await;
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = dir.path().join("events.sqlite3");
+        let log = Arc::new(EventLogStore::open(&db).unwrap());
+        Connection::open(&db)
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER reject_dispatch BEFORE INSERT ON event_log_events \
+             WHEN NEW.event_type='dispatched' BEGIN SELECT RAISE(ABORT,'failure'); END;",
+            )
+            .unwrap();
+        let (_budget_dir, ledger) = super::tests::configured_budget_ledger(1_000_000);
+        let ledger = Arc::new(ledger);
+        let before = ledger.tenant_readview(budget::PERSONAL_TENANT_ID).unwrap();
+        let mut card = super::tests::resident_component_card("paid", &upstream.uri());
+        card.provider.cost = super::tests::paid_component_card("paid").provider.cost;
+        let app = build_app(AppState {
+            cards: vec![card],
+            event_log: Some(log.clone()),
+            budget_ledger: Some(ledger.clone()),
+            ..AppState::default()
+        });
+        let headers = request_id
+            .map(|id| vec![(HEADER_REQUEST_ID, id)])
+            .unwrap_or_default();
+        for _ in 0..2 {
+            let response = app
+                .clone()
+                .oneshot(super::tests::post_chat(
+                    r#"{"messages":[{"role":"user","content":"no send"}]}"#,
+                    &headers,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            let chain = events(&log, &response);
+            assert!(
+                chain
+                    .iter()
+                    .any(|e| e.event.event_type == EventType::BudgetReserved)
+            );
+            assert!(chain.iter().all(|e| !matches!(
+                e.event.event_type,
+                EventType::Dispatched | EventType::Completed | EventType::BudgetSettled
+            )));
+            let after = ledger.tenant_readview(budget::PERSONAL_TENANT_ID).unwrap();
+            assert_eq!(after.spent_minor, before.spent_minor);
+            assert_eq!(after.reserved_minor, before.reserved_minor);
+        }
+        upstream.verify().await;
+        assert!(upstream.received_requests().await.unwrap().is_empty());
+    }
+}
