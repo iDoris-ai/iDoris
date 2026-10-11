@@ -15,7 +15,7 @@ use idoris_contracts::load_policy::{Admission, Keepalive, LoadMode, LoadPolicy};
 use idoris_contracts::provider::Locality;
 use idoris_policy::{
     AdmissionStatus, Card, Decision, PolicyCtx, ROLES, ReasonCode, Rejection, RequestProfile,
-    decide, effective_served_locality,
+    decide_with_affinity, effective_served_locality,
 };
 use idoris_tenancy::budget::{BudgetError, BudgetLedger, ReservationId};
 use tokio_util::sync::CancellationToken;
@@ -31,6 +31,7 @@ pub struct BoundSupervisor {
     provider_id: String,
     endpoint: String,
     locality: Locality,
+    admission_model: Option<(String, f64)>,
 }
 
 impl BoundSupervisor {
@@ -40,7 +41,17 @@ impl BoundSupervisor {
             provider_id: card.provider.id.clone(),
             endpoint: card.endpoint.clone(),
             locality: card.provider.locality,
+            admission_model: None,
         }
+    }
+
+    pub(crate) fn with_admission_model(
+        mut self,
+        model_id: impl Into<String>,
+        memory_gb: f64,
+    ) -> Self {
+        self.admission_model = Some((model_id.into(), memory_gb));
+        self
     }
 
     pub(crate) fn provider_id(&self) -> &str {
@@ -107,12 +118,10 @@ fn default_load_policy() -> LoadPolicy {
     }
 }
 
-/// A single, fixed placeholder memory size for every card's Supervisor
-/// "model" entry. This crate doesn't yet have a real per-model memory
-/// figure at the component-card layer (that's catalog/idoris-recommender
-/// data, not wired into R2-D) — every local candidate is treated as
-/// equally cheap to load for now.
-const PLACEHOLDER_MEMORY_GB: f64 = 1.0;
+// oMLX 0.6.4's /v1/models contract does not expose per-model memory. Preserve
+// the established estimate for that path until its dedicated footprint source
+// is wired; trusted process-owned runtimes bind their configured memory below.
+const UNKNOWN_CATALOG_MEMORY_GB: f64 = 1.0;
 
 /// R2-D simplification: every loaded component card is eligible for every
 /// catalog role and always `Ready` at `decide()` time — role→catalog
@@ -167,6 +176,18 @@ pub enum DispatchError {
     Internal(String),
 }
 
+#[derive(Debug)]
+pub(crate) enum ObservedDispatchError {
+    Dispatch(DispatchError),
+    EventLogUnavailable,
+}
+
+impl From<DispatchError> for ObservedDispatchError {
+    fn from(value: DispatchError) -> Self {
+        Self::Dispatch(value)
+    }
+}
+
 /// What [`select`] returns: everything a caller needs to route between the
 /// two request-execution paths (R2-G) *before* committing to either one.
 #[derive(Debug)]
@@ -203,6 +224,15 @@ pub fn select(
     profile: &ParsedProfile,
     prompt: &str,
 ) -> Result<Selected, DispatchError> {
+    select_with_affinity(cards, profile, prompt, None)
+}
+
+pub fn select_with_affinity(
+    cards: &[ComponentCard],
+    profile: &ParsedProfile,
+    prompt: &str,
+    affinity_key: Option<&str>,
+) -> Result<Selected, DispatchError> {
     let candidates: Vec<Card> = cards.iter().map(|c| candidate(c, prompt)).collect();
     let request_profile = RequestProfile {
         task: profile.task.clone(),
@@ -214,7 +244,8 @@ pub fn select(
         min_ram_gb: None,
         budget: None,
     };
-    let decision = decide(&request_profile, &candidates, &ctx).map_err(DispatchError::Rejection)?;
+    let decision = decide_with_affinity(&request_profile, &candidates, &ctx, affinity_key)
+        .map_err(DispatchError::Rejection)?;
     let Some(chosen) = candidates.iter().find(|c| c.id() == decision.chosen_id) else {
         return Err(DispatchError::Internal(format!(
             "decide() returned chosen_id {:?} absent from its own candidate list",
@@ -364,6 +395,7 @@ impl Drop for CancelOnDrop {
 pub struct DispatchInput<'a> {
     pub requested_model: Option<&'a str>,
     pub prompt: &'a str,
+    pub affinity_key: Option<&'a str>,
 }
 
 impl<'a> DispatchInput<'a> {
@@ -371,6 +403,7 @@ impl<'a> DispatchInput<'a> {
         Self {
             requested_model: None,
             prompt,
+            affinity_key: None,
         }
     }
 
@@ -378,7 +411,13 @@ impl<'a> DispatchInput<'a> {
         Self {
             requested_model,
             prompt,
+            affinity_key: None,
         }
+    }
+
+    pub fn with_affinity(mut self, affinity_key: Option<&'a str>) -> Self {
+        self.affinity_key = affinity_key;
+        self
     }
 }
 
@@ -405,80 +444,158 @@ pub async fn dispatch_local(
     messages: Vec<ChatMessage>,
     cancel: CancellationToken,
 ) -> Result<ChatOutcome, DispatchError> {
+    public_dispatch_result(
+        dispatch_local_inner(
+            LocalSelection::Cards(cards),
+            LocalExecutionContext::new(supervisor, budget_ledger, None, None, None, None),
+            profile,
+            input,
+            messages,
+            cancel,
+        )
+        .await,
+    )
+}
+
+/// Executes a selection the caller already computed with select().
+/// The ordinary dispatch_local path remains available for callers that do
+/// not already have a canonical Selected value.
+pub async fn dispatch_local_preselected(
+    selected: &Selected,
+    supervisor: Option<&BoundSupervisor>,
+    budget_ledger: Option<&BudgetLedger>,
+    profile: &ParsedProfile,
+    input: DispatchInput<'_>,
+    messages: Vec<ChatMessage>,
+    cancel: CancellationToken,
+) -> Result<ChatOutcome, DispatchError> {
+    public_dispatch_result(
+        dispatch_local_inner(
+            LocalSelection::Preselected(selected),
+            LocalExecutionContext::new(supervisor, budget_ledger, None, None, None, None),
+            profile,
+            input,
+            messages,
+            cancel,
+        )
+        .await,
+    )
+}
+
+pub(crate) async fn dispatch_local_preselected_observed(
+    selected: &Selected,
+    execution: LocalExecutionContext<'_>,
+    profile: &ParsedProfile,
+    input: DispatchInput<'_>,
+    messages: Vec<ChatMessage>,
+    cancel: CancellationToken,
+) -> Result<ChatOutcome, ObservedDispatchError> {
+    dispatch_local_inner(
+        LocalSelection::Preselected(selected),
+        execution,
+        profile,
+        input,
+        messages,
+        cancel,
+    )
+    .await
+}
+
+fn public_dispatch_result(
+    result: Result<ChatOutcome, ObservedDispatchError>,
+) -> Result<ChatOutcome, DispatchError> {
+    match result {
+        Ok(outcome) => Ok(outcome),
+        Err(ObservedDispatchError::Dispatch(error)) => Err(error),
+        Err(ObservedDispatchError::EventLogUnavailable) => Err(DispatchError::Internal(
+            "event log observer is unavailable on an unobserved dispatch path".to_string(),
+        )),
+    }
+}
+
+pub(crate) struct LocalExecutionContext<'a> {
+    supervisor: Option<&'a BoundSupervisor>,
+    budget_ledger: Option<&'a BudgetLedger>,
+    budget_event: Option<&'a crate::BudgetReservedEventContext>,
+    dispatched_event: Option<&'a crate::DispatchedEventContext>,
+    completed_event: Option<&'a crate::CompletedEventContext>,
+    budget_settled_event: Option<&'a crate::BudgetSettledEventContext>,
+}
+
+impl<'a> LocalExecutionContext<'a> {
+    pub(crate) fn new(
+        supervisor: Option<&'a BoundSupervisor>,
+        budget_ledger: Option<&'a BudgetLedger>,
+        budget_event: Option<&'a crate::BudgetReservedEventContext>,
+        dispatched_event: Option<&'a crate::DispatchedEventContext>,
+        completed_event: Option<&'a crate::CompletedEventContext>,
+        budget_settled_event: Option<&'a crate::BudgetSettledEventContext>,
+    ) -> Self {
+        Self {
+            supervisor,
+            budget_ledger,
+            budget_event,
+            dispatched_event,
+            completed_event,
+            budget_settled_event,
+        }
+    }
+}
+
+enum LocalSelection<'a> {
+    Cards(&'a [ComponentCard]),
+    Preselected(&'a Selected),
+}
+
+async fn dispatch_local_inner(
+    selection: LocalSelection<'_>,
+    execution: LocalExecutionContext<'_>,
+    profile: &ParsedProfile,
+    input: DispatchInput<'_>,
+    messages: Vec<ChatMessage>,
+    cancel: CancellationToken,
+) -> Result<ChatOutcome, ObservedDispatchError> {
+    let LocalExecutionContext {
+        supervisor,
+        budget_ledger,
+        budget_event,
+        dispatched_event,
+        completed_event,
+        budget_settled_event,
+    } = execution;
     let tenant_id = profile.tenant_id.as_deref();
     let prompt = input.prompt;
     let requested_model = input.requested_model;
-
-    // Scoped so `candidates`/`ctx` (which holds a `PolicyCtx<'_>` — not
-    // `Send` because `dyn BudgetView` isn't `Sync` — see its own doc) are
-    // dropped before any `.await` below; otherwise the whole function's
-    // future would stop being `Send`, which axum's `Handler` trait requires.
-    let (
-        decision,
-        served_locality,
-        provider_id,
-        backend_model_id,
-        load_policy,
-        cost,
-        estimated_cost_minor,
-    ) = {
-        let candidates: Vec<Card> = cards.iter().map(|c| candidate(c, prompt)).collect();
-        let request_profile = RequestProfile {
-            task: profile.task.clone(),
-            role: profile.role,
-            tenant_id: profile.tenant_id.clone(),
-            content_tightening: None,
-        };
-        let ctx = PolicyCtx {
-            min_ram_gb: None,
-            budget: None,
-        };
-        let decision =
-            decide(&request_profile, &candidates, &ctx).map_err(DispatchError::Rejection)?;
-
-        let Some(chosen) = candidates.iter().find(|c| c.id() == decision.chosen_id) else {
-            return Err(DispatchError::Internal(format!(
-                "decide() returned chosen_id {:?} absent from its own candidate list",
-                decision.chosen_id
-            )));
-        };
-        let served_locality = effective_served_locality(chosen);
-        // Fail closed before budget reservation or any Supervisor operation.
-        if supervisor.is_some_and(|bound| !bound.matches(&chosen.component)) {
-            return Ok(ChatOutcome {
-                decision,
-                served_locality,
-                result: Err(DispatchFailure::Backend(
-                    BackendError::supervisor_unavailable(),
-                )),
-                actual_cost_minor: None,
-            });
+    let selected_owned;
+    let selected = match selection {
+        LocalSelection::Preselected(selected) => selected,
+        LocalSelection::Cards(cards) => {
+            selected_owned = select_with_affinity(cards, profile, prompt, input.affinity_key)?;
+            &selected_owned
         }
-        let load_policy = chosen
-            .component
-            .load_policy
-            .unwrap_or_else(default_load_policy);
-        // decide()'s pricing stage already excluded any None/negative
-        // estimate, so this is always Some(v >= 0); unwrap_or(0) is
-        // defense in depth, not a path expected to actually trigger.
-        let estimated_cost_minor = chosen.estimated_cost_minor.unwrap_or(0);
-        let provider_id = chosen.id().to_string();
-        let backend_model_id = if profile.role.is_none() {
-            requested_model.unwrap_or(&provider_id).to_string()
-        } else {
-            provider_id.clone()
-        };
-        (
+    };
+    let decision = selected.decision.clone();
+    let served_locality = selected.served_locality;
+    // Fail closed before budget reservation or any Supervisor operation.
+    if supervisor.is_some_and(|bound| !bound.matches(&selected.card)) {
+        return Ok(ChatOutcome {
             decision,
             served_locality,
-            provider_id,
-            backend_model_id,
-            load_policy,
-            chosen.component.provider.cost,
-            estimated_cost_minor,
-        )
+            result: Err(DispatchFailure::Backend(
+                BackendError::supervisor_unavailable(),
+            )),
+            actual_cost_minor: None,
+        });
+    }
+    let load_policy = selected.load_policy;
+    let estimated_cost_minor = selected.estimated_cost_minor;
+    let provider_id = selected.card.provider.id.clone();
+    let backend_model_id = if profile.role.is_none() {
+        requested_model.unwrap_or(&provider_id).to_string()
+    } else {
+        provider_id.clone()
     };
-
+    let cost = selected.card.provider.cost;
     let is_paid = budget::is_paid(Some(estimated_cost_minor));
     let mut reservation_guard = match ReservationGuard::reserve(
         budget_ledger,
@@ -496,6 +613,14 @@ pub async fn dispatch_local(
             });
         }
     };
+    if is_paid
+        && let Some(context) = budget_event
+        && crate::append_budget_reserved(context, selected)
+            .await
+            .is_err()
+    {
+        return Err(ObservedDispatchError::EventLogUnavailable);
+    }
     // From here on, `reservation_guard`'s Drop releases the reservation on
     // any early return *and* on this future being dropped mid-`.await`
     // (client disconnect) — see its doc. Only the success path below
@@ -519,12 +644,21 @@ pub async fn dispatch_local(
     // cancellation can stop early.
     let _cancel_guard = CancelOnDrop(cancel.clone());
 
+    let admission_memory_override = supervisor
+        .admission_model
+        .as_ref()
+        .filter(|(model_id, _)| model_id == &backend_model_id)
+        .map(|(_, memory_gb)| *memory_gb);
+    let bound_model_mismatch = supervisor
+        .admission_model
+        .as_ref()
+        .is_some_and(|(model_id, _)| model_id != &backend_model_id);
     let supervisor = &supervisor.handle;
     // A concrete model id is caller-controlled. Validate it against the
     // runtime catalog before load(): Supervisor eviction planning happens
     // before an adapter can reject an unknown id, so skipping this preflight
     // would let a bogus model name evict an unrelated warm model first.
-    if backend_model_id != provider_id {
+    let admission_memory_gb = if backend_model_id != provider_id || bound_model_mismatch {
         let catalog = match supervisor.list().await {
             Ok(models) => models,
             Err(err) => {
@@ -536,7 +670,7 @@ pub async fn dispatch_local(
                 });
             }
         };
-        if !catalog.iter().any(|model| model.id == backend_model_id) {
+        let Some(model) = catalog.iter().find(|model| model.id == backend_model_id) else {
             return Ok(ChatOutcome {
                 decision,
                 served_locality,
@@ -545,15 +679,22 @@ pub async fn dispatch_local(
                 ))),
                 actual_cost_minor: None,
             });
+        };
+        if model.memory_gb > 0.0 {
+            model.memory_gb
+        } else {
+            admission_memory_override.unwrap_or(UNKNOWN_CATALOG_MEMORY_GB)
         }
-    }
+    } else {
+        admission_memory_override.unwrap_or(UNKNOWN_CATALOG_MEMORY_GB)
+    };
     // `status.loaded` reports engine residency, which may have been
     // inherited after a Supervisor restart while the model is still in
     // Error (not yet adopted and policy-checked). Always pass through the
     // Supervisor's idempotent load path before chatting so it can establish
     // readiness and apply the requested policy.
     if let Err(err) = supervisor
-        .load(backend_model_id.clone(), PLACEHOLDER_MEMORY_GB, load_policy)
+        .load(backend_model_id.clone(), admission_memory_gb, load_policy)
         .await
     {
         return Ok(ChatOutcome {
@@ -562,6 +703,12 @@ pub async fn dispatch_local(
             result: Err(DispatchFailure::Backend(err)),
             actual_cost_minor: None,
         });
+    }
+
+    if let Some(context) = dispatched_event
+        && crate::append_dispatched(context, selected).await.is_err()
+    {
+        return Err(ObservedDispatchError::EventLogUnavailable);
     }
 
     let chat_result = supervisor
@@ -574,6 +721,55 @@ pub async fn dispatch_local(
         )
         .await;
 
+    // A successful upstream execution must be charged before any fallible
+    // completion event append can return early and drop the reservation.
+    let actual_cost_minor = if let Ok(response) = &chat_result {
+        // Settling is best-effort (see `ChatOutcome::actual_cost_minor`'s
+        // doc): a successful chat response is never withheld just
+        // because the ledger write afterward had a problem.
+        match (budget_ledger, reservation_guard.take()) {
+            (Some(ledger), Some(id)) => {
+                let actual = budget::estimate_actual_cost_minor(
+                    &cost,
+                    prompt,
+                    &response.content,
+                    estimated_cost_minor,
+                );
+                budget::settle(ledger, tenant_id, &id, actual)
+                    .ok()
+                    .filter(|_| is_paid)
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
+
+    if let Some(context) = completed_event {
+        let status = if chat_result.is_ok() {
+            "success"
+        } else {
+            "failure"
+        };
+        if crate::append_completed(context, selected, status)
+            .await
+            .is_err()
+        {
+            return Err(ObservedDispatchError::EventLogUnavailable);
+        }
+    }
+
+    // Keep the settled event after Completed while charging before the
+    // fallible Completed append. A failed settled-event append cannot refund.
+    if let Some(settled_minor) = actual_cost_minor
+        && let Some(context) = budget_settled_event
+        && crate::append_budget_settled(context, selected, settled_minor)
+            .await
+            .is_err()
+    {
+        eprintln!("idoris: budget.settled event write failed after committed settlement");
+    }
+
     match chat_result {
         Err(err) => Ok(ChatOutcome {
             decision,
@@ -581,31 +777,12 @@ pub async fn dispatch_local(
             result: Err(DispatchFailure::Backend(err)),
             actual_cost_minor: None,
         }),
-        Ok(response) => {
-            // Settling is best-effort (see `ChatOutcome::actual_cost_minor`'s
-            // doc): a successful chat response is never withheld just
-            // because the ledger write afterward had a problem.
-            let actual_cost_minor = match (budget_ledger, reservation_guard.take()) {
-                (Some(ledger), Some(id)) => {
-                    let actual = budget::estimate_actual_cost_minor(
-                        &cost,
-                        prompt,
-                        &response.content,
-                        estimated_cost_minor,
-                    );
-                    budget::settle(ledger, tenant_id, &id, actual)
-                        .ok()
-                        .filter(|_| is_paid)
-                }
-                _ => None,
-            };
-            Ok(ChatOutcome {
-                decision,
-                served_locality,
-                result: Ok(response),
-                actual_cost_minor,
-            })
-        }
+        Ok(response) => Ok(ChatOutcome {
+            decision,
+            served_locality,
+            result: Ok(response),
+            actual_cost_minor,
+        }),
     }
 }
 
@@ -624,7 +801,8 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use idoris_backend::{
-        BackendStatus, MockAdapter, ModelInfo, RuntimeAdapter, Supervisor, SupervisorConfig,
+        BackendStatus, GlobalCapacityLedger, MockAdapter, ModelInfo, RuntimeAdapter, Supervisor,
+        SupervisorConfig,
     };
     use idoris_contracts::TaskProfile;
     use idoris_contracts::common::PrivacyClass;
@@ -819,6 +997,33 @@ routing_policy:
     }
 
     #[tokio::test]
+    async fn preselected_dispatch_does_not_decide_again() {
+        let card = local_card("a");
+        let profile = empty_profile();
+        let selected = select(std::slice::from_ref(&card), &profile, "").unwrap();
+        let outcome = dispatch_local_preselected(
+            &selected,
+            None,
+            None,
+            &profile,
+            DispatchInput::new(""),
+            Vec::new(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome.decision, selected.decision);
+        assert_eq!(outcome.served_locality, selected.served_locality);
+        match outcome.result.unwrap_err() {
+            DispatchFailure::Backend(err) => {
+                assert_eq!(err.reason_code(), "supervisor_unavailable")
+            }
+            other => panic!("expected Backend(supervisor_unavailable), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn no_cards_rejects_as_local_only_unavailable() {
         let err = dispatch_local(
             &[],
@@ -887,6 +1092,46 @@ routing_policy:
         let response = outcome.result.unwrap();
         assert_eq!(response.model, "a");
         assert!(response.content.contains("hello"));
+    }
+
+    #[tokio::test]
+    async fn catalog_memory_drives_global_admission_before_adapter_load() {
+        let card = local_card("a");
+        let adapter = Arc::new(MockAdapter::new(vec![ModelInfo {
+            id: "a".to_string(),
+            memory_gb: 6.0,
+        }]));
+        let ledger = Arc::new(GlobalCapacityLedger::new(4.0).unwrap());
+        let supervisor = Supervisor::spawn_with_startup_capacity_tracking(
+            adapter.clone(),
+            SupervisorConfig::default(),
+            ledger.clone(),
+            "a",
+        )
+        .unwrap();
+        let supervisor = BoundSupervisor::new(&card, supervisor).with_admission_model("a", 6.0);
+
+        let outcome = dispatch_local(
+            std::slice::from_ref(&card),
+            Some(&supervisor),
+            None,
+            &empty_profile(),
+            DispatchInput::new("hello"),
+            vec![ChatMessage {
+                role: "user".to_string(),
+                content: "hello".to_string(),
+            }],
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        match outcome.result.unwrap_err() {
+            DispatchFailure::Backend(err) => assert_eq!(err.reason_code(), "oom"),
+            other => panic!("expected Backend(oom), got {other:?}"),
+        }
+        assert_eq!(adapter.load_call_count("a"), 0);
+        assert_eq!(ledger.snapshot().unwrap().allocations["runtime:a"], 0.0);
     }
 
     #[tokio::test]
@@ -989,6 +1234,60 @@ routing_policy:
                 .unwrap()
                 .loaded
                 .contains(&"warm".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn implicit_provider_id_never_evicts_bound_single_model_runtime() {
+        let card = local_card("prov");
+        let adapter = Arc::new(MockAdapter::new(vec![ModelInfo {
+            id: "m".to_string(),
+            memory_gb: 8.0,
+        }]));
+        let warm_policy = LoadPolicy {
+            mode: LoadMode::OnDemand,
+            keepalive: Keepalive::IdleTtl { idle_ttl_s: 300 },
+            admission: Admission::RequiresEviction,
+        };
+        let supervisor = Supervisor::spawn(
+            adapter.clone(),
+            SupervisorConfig {
+                budget_gb: 10.0,
+                ..SupervisorConfig::default()
+            },
+        )
+        .unwrap();
+        supervisor
+            .load("m", 8.0, warm_policy)
+            .await
+            .expect("warm model must load");
+        let supervisor = BoundSupervisor::new(&card, supervisor).with_admission_model("m", 8.0);
+
+        let outcome = dispatch_local(
+            std::slice::from_ref(&card),
+            Some(&supervisor),
+            None,
+            &empty_profile(),
+            DispatchInput::new("hello"),
+            Vec::new(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        match outcome.result.unwrap_err() {
+            DispatchFailure::Backend(err) => assert_eq!(err.reason_code(), "model_not_found"),
+            other => panic!("expected Backend(model_not_found), got {other:?}"),
+        }
+        assert_eq!(adapter.load_call_count("prov"), 0);
+        assert_eq!(adapter.unload_call_count("m"), 0);
+        assert!(
+            adapter
+                .status()
+                .await
+                .unwrap()
+                .loaded
+                .contains(&"m".to_string())
         );
     }
 
