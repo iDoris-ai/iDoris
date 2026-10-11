@@ -104,6 +104,7 @@ fn seed_portable_key(cwd: &Path) {
             "vk_portable_startup",
             secret.hash(),
             &VirtualKeyScope {
+                tenant_id: None,
                 owner: "portable-startup".into(),
                 allowed_privacy: vec![PrivacyClass::LocalOnly, PrivacyClass::Any],
                 allowed_roles: [

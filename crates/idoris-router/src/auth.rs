@@ -221,6 +221,7 @@ mod tests {
 
     fn scope(expires_at_ms: Option<i64>) -> VirtualKeyScope {
         VirtualKeyScope {
+            tenant_id: None,
             owner: "agent24-instance".into(),
             allowed_privacy: vec![PrivacyClass::LocalOnly],
             allowed_roles: vec!["fast".into()],
@@ -320,6 +321,7 @@ mod tests {
         AuthenticatedVirtualKey {
             key_id: "vk-test".into(),
             scope: VirtualKeyScope {
+                tenant_id: None,
                 owner: "agent24-instance".into(),
                 allowed_privacy: privacy,
                 allowed_roles: roles.iter().map(|role| (*role).to_string()).collect(),

@@ -23,6 +23,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &minted.key_id,
         minted.hash,
         &VirtualKeyScope {
+            tenant_id: None,
             owner: "conformance".into(),
             allowed_privacy: vec![PrivacyClass::LocalOnly, PrivacyClass::Any],
             allowed_roles: [

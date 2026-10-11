@@ -15,6 +15,7 @@ const MAX_OWNER_BYTES: usize = 128;
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct IssueSpec {
+    tenant_id: Option<String>,
     owner: String,
     allowed_privacy: Vec<PrivacyClass>,
     allowed_roles: Vec<String>,
@@ -116,7 +117,15 @@ fn validated_scope(spec: IssueSpec, now_ms: i64) -> Result<VirtualKeyScope, Stri
     if spec.expires_at_ms.is_some_and(|expires| expires <= now_ms) {
         return Err("expires_at_ms 必须晚于当前服务器时间".to_string());
     }
+    if spec
+        .tenant_id
+        .as_deref()
+        .is_some_and(|tenant| tenant.trim() != tenant || !crate::event_identifier::valid(tenant))
+    {
+        return Err("virtual-key tenant_id 无效".to_string());
+    }
     Ok(VirtualKeyScope {
+        tenant_id: spec.tenant_id,
         owner: spec.owner,
         allowed_privacy: spec.allowed_privacy,
         allowed_roles: spec.allowed_roles,
@@ -166,6 +175,35 @@ mod tests {
         ] {
             let mut output = Vec::new();
             assert!(issue_from_reader_at(&store, &mut &*spec, &mut output, 1000).is_err());
+            assert!(output.is_empty());
+        }
+    }
+
+    #[test]
+    fn local_issue_spec_persists_explicit_tenant_binding() {
+        let store = VirtualKeyStore::new(Connection::open_in_memory().unwrap()).unwrap();
+        let mut output = Vec::new();
+        issue_from_reader_at(
+            &store,
+            &mut br#"{"owner":"agent24","tenant_id":"tenant-a","allowed_privacy":["local_only"],"allowed_roles":["fast"]}"#.as_slice(),
+            &mut output,
+            1000,
+        )
+        .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&output).unwrap();
+        let secret = VirtualKeySecret::parse(json["secret"].as_str().unwrap()).unwrap();
+        let identity = store.authenticate(&secret, 1001).unwrap().unwrap();
+        assert_eq!(identity.scope.tenant_id.as_deref(), Some("tenant-a"));
+        for tenant in ["", " tenant-a", "tenant-a\n"] {
+            let spec = serde_json::json!({
+                "owner":"agent24", "tenant_id":tenant,
+                "allowed_privacy":["local_only"], "allowed_roles":["fast"]
+            });
+            let mut output = Vec::new();
+            assert!(
+                issue_from_reader_at(&store, &mut spec.to_string().as_bytes(), &mut output, 1000)
+                    .is_err()
+            );
             assert!(output.is_empty());
         }
     }
