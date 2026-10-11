@@ -227,6 +227,9 @@ pub struct AppState {
     /// Production installs the persistent B5 verifier. Library tests may
     /// leave this unset to preserve pre-B5 request behavior.
     pub virtual_key_authenticator: Option<auth::VirtualKeyAuthenticator>,
+    /// Non-loopback data listeners require a valid virtual key on every
+    /// registered data-plane route except `/health`.
+    pub remote_bind_requires_auth: bool,
     /// Explicit loopback-only developer escape hatch. Production startup
     /// leaves this false unless `IDORIS_DEV_NO_KEY=1` was set once.
     pub dev_no_key_enabled: bool,
@@ -323,6 +326,7 @@ impl Default for AppState {
             budget_ledger: None,
             record_store: None,
             virtual_key_authenticator: None,
+            remote_bind_requires_auth: false,
             dev_no_key_enabled: false,
             event_log: None,
             audit_failures: Arc::new(AtomicU64::new(0)),
@@ -373,14 +377,69 @@ pub fn build_app(state: AppState) -> Router {
         ))
         .layer(middleware::from_fn_with_state(
             state.clone(),
+            remote_bind_auth_middleware,
+        ))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
             record_id_middleware,
         ))
         .with_state(state)
 }
 
+async fn remote_bind_auth_middleware(
+    State(state): State<Arc<AppState>>,
+    mut request: Request,
+    next: Next,
+) -> Response {
+    if !state.remote_bind_requires_auth || request.uri().path() == "/health" {
+        return next.run(request).await;
+    }
+    let Some(authenticator) = &state.virtual_key_authenticator else {
+        return virtual_key_unauthorized_response();
+    };
+    let identity = match authenticator.authenticate(request.headers()).await {
+        Ok(identity) => identity,
+        Err(_) => return virtual_key_unauthorized_response(),
+    };
+    request.extensions_mut().insert(identity);
+    next.run(request).await
+}
+
+async fn enforce_protocol_key_scope(
+    state: &AppState,
+    headers: &HeaderMap,
+    remote_identity: Option<&idoris_tenancy::virtual_key::store::AuthenticatedVirtualKey>,
+    parsed: &profile::ParsedProfile,
+) -> Result<(), Response> {
+    if let Some(identity) = remote_identity {
+        return auth::enforce_scope(identity, parsed).map_err(virtual_key_scope_response);
+    }
+    let has_bearer = headers.contains_key(axum::http::header::AUTHORIZATION);
+    if state.dev_no_key_enabled && !has_bearer {
+        return if parsed.task.privacy.unwrap_or(PrivacyClass::LocalOnly) == PrivacyClass::LocalOnly
+        {
+            Ok(())
+        } else {
+            Err(dev_no_key_scope_response())
+        };
+    }
+    if let Some(authenticator) = &state.virtual_key_authenticator {
+        let identity = authenticator
+            .authenticate(headers)
+            .await
+            .map_err(|_| virtual_key_unauthorized_response())?;
+        return auth::enforce_scope(&identity, parsed).map_err(virtual_key_scope_response);
+    }
+    if state.dev_no_key_enabled && has_bearer {
+        return Err(virtual_key_unauthorized_response());
+    }
+    Ok(())
+}
+
 async fn embeddings(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    remote_identity: Option<Extension<idoris_tenancy::virtual_key::store::AuthenticatedVirtualKey>>,
     Extension(RequestRecordId(record_id)): Extension<RequestRecordId>,
     body: Bytes,
 ) -> Response {
@@ -410,6 +469,16 @@ async fn embeddings(
     // Caller headers may further constrain routing elsewhere, but they cannot
     // turn an embeddings request into a chat/rerank dispatch.
     parsed.task.capabilities = Some(vec![Capability::Embedding]);
+    if let Err(response) = enforce_protocol_key_scope(
+        &state,
+        &headers,
+        remote_identity.as_ref().map(|identity| &identity.0),
+        &parsed,
+    )
+    .await
+    {
+        return response;
+    }
 
     let cards = dispatch::policy_cards(&state.cards, &state.routing_policy, &parsed)
         .cards
@@ -516,6 +585,7 @@ async fn embeddings(
 async fn rerank(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    remote_identity: Option<Extension<idoris_tenancy::virtual_key::store::AuthenticatedVirtualKey>>,
     Extension(RequestRecordId(record_id)): Extension<RequestRecordId>,
     body: Bytes,
 ) -> Response {
@@ -542,6 +612,16 @@ async fn rerank(
         Err(error) => return error.into_response(),
     };
     parsed.task.capabilities = Some(vec![Capability::Rerank]);
+    if let Err(response) = enforce_protocol_key_scope(
+        &state,
+        &headers,
+        remote_identity.as_ref().map(|identity| &identity.0),
+        &parsed,
+    )
+    .await
+    {
+        return response;
+    }
 
     let cards = dispatch::policy_cards(&state.cards, &state.routing_policy, &parsed)
         .cards
@@ -645,6 +725,7 @@ async fn rerank(
 async fn messages(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    remote_identity: Option<Extension<idoris_tenancy::virtual_key::store::AuthenticatedVirtualKey>>,
     Extension(RequestRecordId(record_id)): Extension<RequestRecordId>,
     body: Bytes,
 ) -> Response {
@@ -685,6 +766,16 @@ async fn messages(
         Err(error) => return error.into_response(),
     };
     parsed.task.capabilities = Some(vec![Capability::Chat]);
+    if let Err(response) = enforce_protocol_key_scope(
+        &state,
+        &headers,
+        remote_identity.as_ref().map(|identity| &identity.0),
+        &parsed,
+    )
+    .await
+    {
+        return response;
+    }
 
     let cards = dispatch::policy_cards(&state.cards, &state.routing_policy, &parsed)
         .cards
@@ -1742,6 +1833,48 @@ pub(crate) async fn append_completed(
     run_event_log_write(move || store.append(Some(&tenant_id), &event).map(|_| ())).await
 }
 
+#[derive(Clone)]
+pub(crate) struct BudgetSettledEventContext {
+    event_log: Arc<idoris_tenancy::event_log::EventLogStore>,
+    tenant_id: String,
+    record_id: String,
+    correlation: correlation::RequestCorrelation,
+}
+
+pub(crate) async fn append_budget_settled(
+    context: &BudgetSettledEventContext,
+    selected: &Selected,
+    settled_minor: i64,
+) -> Result<(), ()> {
+    let mut metadata = std::collections::BTreeMap::new();
+    metadata.insert("settled_minor".to_string(), json!(settled_minor));
+    metadata.insert(
+        "provider_id".to_string(),
+        json!(selected.card.provider.id.as_str()),
+    );
+    let ts_utc_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_millis()).ok())
+        .ok_or(())?;
+    let event = idoris_tenancy::event_log::NewEvent {
+        event_id: Uuid::new_v4().to_string(),
+        tenant_id: context.tenant_id.clone(),
+        record_id: context.record_id.clone(),
+        event_type: idoris_tenancy::event_log::EventType::BudgetSettled,
+        ts_utc_ms,
+        request_id: None,
+        session_id: context.correlation.session_id.clone(),
+        trace_id: context.correlation.trace_id.clone(),
+        parent_id: context.correlation.parent_id.clone(),
+        origin_record_id: None,
+        metadata,
+    };
+    let store = context.event_log.clone();
+    let tenant_id = context.tenant_id.clone();
+    run_event_log_write(move || store.append(Some(&tenant_id), &event).map(|_| ())).await
+}
+
 /// `POST /v1/chat/completions`. Order (locked by conformance): non-JSON
 /// body -> `invalid_json`; valid JSON that isn't an object -> `invalid_body`;
 /// only then are control-plane headers parsed (see [`profile::parse_profile`]).
@@ -1863,6 +1996,15 @@ async fn chat_completions(
         event_context
             .as_ref()
             .map(|(event_log, tenant_id)| CompletedEventContext {
+                event_log: event_log.clone(),
+                tenant_id: tenant_id.clone(),
+                record_id: record_id.clone(),
+                correlation: correlation.clone(),
+            });
+    let budget_settled_event_context =
+        event_context
+            .as_ref()
+            .map(|(event_log, tenant_id)| BudgetSettledEventContext {
                 event_log: event_log.clone(),
                 tenant_id: tenant_id.clone(),
                 record_id: record_id.clone(),
@@ -2084,6 +2226,7 @@ async fn chat_completions(
                 budget_event_context.as_ref(),
                 dispatched_event_context.as_ref(),
                 completed_event_context.as_ref(),
+                budget_settled_event_context.as_ref(),
             ),
             &parsed,
             dispatch::DispatchInput::with_model(model, &prompt).with_affinity(affinity_key),
@@ -2782,6 +2925,9 @@ mod dispatched_wiring_tests;
 mod completed_wiring_tests;
 
 #[cfg(test)]
+mod budget_settled_wiring_tests;
+
+#[cfg(test)]
 mod request_event_query_tests;
 
 #[cfg(test)]
@@ -2919,6 +3065,49 @@ mod tests {
         assert!(json["version"].is_string());
         assert!(json["instance_id"].is_string());
         assert_eq!(json["components"], 0);
+    }
+
+    #[tokio::test]
+    async fn remote_bind_requires_bearer_on_every_registered_route_except_health() {
+        let app = build_app(AppState {
+            remote_bind_requires_auth: true,
+            ..AppState::default()
+        });
+        let routes = [
+            ("GET", "/v1/models"),
+            ("GET", "/capabilities"),
+            ("GET", "/idoris/tenants/acme/usage"),
+            ("GET", "/idoris/tenants/acme/audit"),
+            ("GET", "/idoris/tenants/acme/requests/record-1"),
+            ("GET", "/idoris/tenants/acme/budget"),
+            ("POST", "/v1/chat/completions"),
+            ("POST", "/v1/embeddings"),
+            ("POST", "/v1/rerank"),
+            ("POST", "/v1/messages"),
+        ];
+        for (method, uri) in routes {
+            let request = Request::builder()
+                .method(method)
+                .uri(uri)
+                .body(Body::empty())
+                .unwrap();
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "{method} {uri}"
+            );
+        }
+        let health = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(health.status(), StatusCode::OK);
     }
 
     #[tokio::test]
