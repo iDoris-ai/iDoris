@@ -154,31 +154,45 @@ Core product invariants:
   Full feature-enabled serial Rust (router 435), clippy/fmt/deny, every pnpm
   gate and whitespace checks pass. Real paid-chat chain lookup, Event Log-only
   audit and frozen exact-ready snapshot tests execute. Wire remains 1.0.1.
-- #483 `98e7203` (155 changed lines) backports applicable #463 storage/issuance
-  changes onto #482: nullable explicit tenant binding, legacy migration,
-  validated local CLI binding. Full gates pass (router 436, shared 134/8).
-  This alone does not enforce HTTP tenant authority. Next prepare real bound-key
-  conformance/fixtures and middleware/audit enforcement per its repository plan
-  `docs/agent/plans/M4-tenant-key-backport.md`, then final combined release gates.
-  The urgent security repair must not depend on publishing the entire M5 stack.
-- #481/#482 remote Rust/macOS checks were still progressing at the last poll;
-  #483 is newly pushed. No independent approval, main merge or tag exists.
+- M4 tenant-key backport candidate is now complete in review slices:
+  #483 `98e7203` (155 lines) storage/issuance → #484 `afe3a6e` (138 lines)
+  real bound-key routing/conformance fixtures → #485 `27237cf` (294 lines)
+  admission/default-deny/trusted audit → #486 `687c6ce` (245 test lines)
+  final acceptance. Legacy keys stay unbound; reissue explicitly for tenant mode.
+- M4 baseline reproduced tenant-a key + valid tenant-b chat returning 200.
+  Final nine-endpoint rejection matrix uses valid bodies and eligible cards,
+  covers cross-tenant/unbound/anonymous/malformed/duplicate headers and missing
+  authenticators under both dev settings, with zero unauthorized egress/writes.
+  Binding, trusted audit and default-deny removals independently fail assertions.
+- #486 proves authorized tenant chain, four warmed-cache revocation paths and
+  no request.received before role scope. Late scope mutation fails; restored
+  15 key HTTP tests pass. Full serial feature-enabled Rust (router 441), strict
+  clippy/fmt/deny and all pnpm gates pass. Rebuilt release Rust/seeder and shared
+  conformance pass **134/8**, wire **1.0.1**, on source head `687c6ce`.
+- #483–#485 remote checks are SUCCESS; #486 is newly pushed. Independent
+  approval/main landing/v0.3.0 remain absent. Do not treat candidate verification
+  as real-main acceptance or publish early.
+- Release preparation gap found: release.yml expects tag-derived 0.3.0 during
+  archive smoke, but /health uses CARGO_PKG_VERSION and router still declares
+  0.2.0. Prepare the required version metadata/migration guidance before tag;
+  inspect existing release conventions first. Do not change wire 1.0.1 for M4.
 - All new code is committed and pushed. Latest M5 validated stack head is #481;
-  latest M4 storage-only backport head is #483;
+  latest M4 tenant-key validated candidate is #486;
   #476 remains the historical combined integration snapshot, not a branch to
   merge its descendants into (that would collapse the dependent PR diffs).
-- Resume: inspect #481–#483 CI/reviews, then continue the M4 tenant-key backport
-  from its first unfinished plan step. Follow the independent approval/merge
-  gates; keep REDACT consent and Admin v1 public writes pending. Do not recreate
-  completed tests or merge a descendant into its open review parent.
+- Resume: inspect fresh CI/reviews, then complete concrete M4 release
+  preparation (version metadata and operator binding migration guidance).
+  Follow independent approval/merge gates and re-run M4 acceptance on actual
+  main before tag. REDACT consent and Admin v1 public writes remain pending.
+  Do not recreate completed tests or collapse open parent/child review diffs.
 
 - Active worktrees live beside the main checkout under `/Users/jason/Dev/iDoris/`.
-  Current debug caches: `target-identity32-night` built M4 validation #482;
-  `target-version-night` built M4 storage #483 (both wire 1.0.1). Workspace
-  packages were cleaned before reuse; retain third-party caches. Run full
-  suites serially. `target-inspect22-release` still holds #479's wire 1.1.0
-  release validation. Durable logs/bodies live in `night-evidence-2026-10-12/`;
-  prefixes `identity36`, `m4-validation01`, `m4-security01` cover these slices.
+  Current debug caches: `target-identity32-night` built M4 authority #485;
+  `target-version-night` built M4 acceptance #486. `target-inspect22-release`
+  now holds #486's wire 1.0.1 release build (older M5 wire 1.1.0 artifacts
+  were cleaned). Clean workspace packages before reuse, keep dependency caches,
+  and run full suites serially. Logs/bodies in `night-evidence-2026-10-12/`
+  use `m4-security02..04` prefixes; `run-night-gates.py` records the full gate loop.
 
 
 ## Live delta — 2026-10-11 Claude handoff (historical snapshot)

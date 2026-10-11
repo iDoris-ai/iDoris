@@ -487,4 +487,10 @@
 
 | FU-217 | M4 latest protocol review evidence | #423 未包含 #374 修复；#482 从 #424 普通合并 2d15076，完整门禁通过（router 435/435、wire 1.0.1），仍待独立批准及 main 验收 | PR_OPEN |
 
-| FU-218 | M4 tenant-key security backport | #483 先回移存储与 CLI，完整门禁通过（router 436/436）；绑定夹具、运行时 authority/audit 接线及最终 release gates 仍未完成，按 M4-tenant-key-backport.md 继续 | PR_OPEN |
+| FU-218 | M4 tenant-key security backport | #483–#486 回移存储/CLI、真实绑定夹具、入口/可信审计与验收；最终 router 441/441，全门禁、release Rust conformance 134/8（wire 1.0.1），仍待独立批准与 main landing | PR_OPEN |
+
+| FU-219 | M4 tenant fixture authority | #484，实际绑定 key 的 cfg(test) 路由夹具与 conformance seed；23 定向、router 436/436、全门禁通过，负例仍直接 build_app | PR_OPEN |
+
+| FU-220 | M4 tenant admission/audit | #485，已复现合法跨租户请求 200；9 端点有效请求矩阵、缺 authenticator 默认拒绝及可信审计 marker，3 撤修负控失败，最终 router 438/438 全门禁通过 | PR_OPEN |
+
+| FU-221 | M4 combined tenant acceptance | #486，正确租户链/四缓存撤销/角色拒绝无 request.received；晚 scope 负控失败，router 441/441 全门禁和 release Rust conformance 134/8 通过，main 验收未发生 | PR_OPEN |
