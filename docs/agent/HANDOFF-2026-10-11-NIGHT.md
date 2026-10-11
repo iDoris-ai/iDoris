@@ -58,6 +58,7 @@ So nothing was merged and nothing was approved. Every branch below is pushed and
 | 35 | `feat/event-log-28-protocol-chain` | `feat/event-log-29-protocol-dispatch` @ `6df741cd` | feat(router): record dispatch and completion on protocol endpoints |
 | 36 | `feat/event-log-29-protocol-dispatch` | `feat/event-log-30-messages-stream` @ `c6906b05` | feat(router): complete streamed /v1/messages in the Event Log |
 | 37 | `feat/event-log-30-messages-stream` | `feat/gate-two-01-egress-decorrelation` @ `8a1422e5` | feat(router): de-correlate request bodies sent off host |
+| 38 | `feat/gate-two-01-egress-decorrelation` | `feat/gate-two-02-broker-core` @ `3f1a36b9` | feat(policy): add the gate-two credential broker core |
 
 Rules for landing (same as PRIME-CHECKPOINT "Safe stacked merge procedure"): merge parent first; before a parent branch is deleted, retarget its child to `main`; no rebase, no force-push; never treat a stale approval as current.
 
@@ -105,6 +106,7 @@ The #421 M5 plan (contract freeze → pure L0 → rule packs → endpoint → IN
 | M5-27 | `dispatched`/`completed` on buffered protocol requests (replays record nothing); `/v1/messages` streaming completed in M5-28 |
 | M5-28 | streamed `/v1/messages` records `dispatched` and completes when the stream ends (`message_stop`); every inference endpoint now has a full decision chain |
 | M5-29 | egress de-correlation: off-host bodies drop `user` / `safety_identifier` / `prompt_cache_key` / `metadata`; loopback unchanged |
+| M5-30 | gate-two broker core (pure): `secret://` refs, grants, authorize-before-reveal (C-2), overwriting injection (C-1), value-free audit; store/config/wire pending |
 
 M5 acceptance shape is tested: an id/phone/card injected anywhere in a declared-`any` body (plain content, array parts, tool arguments, JSON numbers, Anthropic `system`, embeddings input, rerank documents) yields zero upstream requests on a non-local card; kill switch stops the next request; 100-way budget race never overspends.
 
@@ -118,6 +120,8 @@ Every rule/decoder/stage was mutation-checked by hand (removing it turns its tes
 4. `credential_path` sensitivity S2 (vs S3).
 5. **Provider breakers are off by default in the binary** (`IDORIS_PROVIDER_BREAKER=1` turns them on). CI showed that on-by-default breaks the shared conformance contract ("persistent 5xx is passed through verbatim"; `conformance/tests/upstream-behavior.test.ts` sends 500 then 503 to one local upstream and expects later cases to reach it). Turning them on by default needs an owner decision plus a conformance update (e.g. an env-gated expectation like `IDORIS_CONFORMANCE_POST_RETRY`). Also new public error type when on: 503 `provider_circuit_open`.
 6. Breaker scope still open: the subscription wiring is unit-tested only (no CLI fixture run). (Per-connection Retry-After is done in M5-25.)
+
+7. **Gate two beyond the pure core (M5-30):** where the broker runs (separate-UID LaunchAgent per docs/15 §2.2), the keychain/Secure Enclave store, the grant configuration format, the `POST /v1/broker/http` wire contract, and the HMAC audit fingerprint key.
 
 ## Known CI note
 
