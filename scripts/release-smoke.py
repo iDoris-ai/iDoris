@@ -35,6 +35,14 @@ def main(archive, expected):
         with socket.socket() as probe:
             probe.bind(("127.0.0.1", 8740))
         env = {k: v for k, v in os.environ.items() if not k.startswith("IDORIS_")}
+        # Exercise default-path resolution in an isolated test user context:
+        # a developer's actual home may contain live keys and tenant budgets.
+        test_user_dir = root / "test-user"
+        test_user_dir.mkdir()
+        env.update(HOME=str(test_user_dir),
+                   XDG_DATA_HOME=str(test_user_dir / "data"),
+                   XDG_STATE_HOME=str(test_user_dir / "state"),
+                   LOCALAPPDATA=str(test_user_dir / "appdata"))
         with (root / "server.log").open("w+") as log:
             process = subprocess.Popen([str(bundle / "idoris")], cwd=cwd, env=env,
                                        stdout=log, stderr=subprocess.STDOUT)

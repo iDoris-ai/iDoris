@@ -7,6 +7,8 @@ Rust（`Cargo.toml` workspace 下的 `crates/`）是生产实现。`packages/` �
 
 ## 安装与运行
 
+`v0.3.0` 待发布候选的版本与 tenant key 升级步骤见[发布与迁移说明](docs/releases/v0.3.0.md)。
+
 从 [GitHub Releases](https://github.com/iDoris-ai/iDoris/releases) 下载对应版本，校验后解压运行——包内自带可用的 `config/`，不需要编辑配置文件。目前只发布 macOS Apple Silicon（`aarch64-apple-darwin`）。
 
 ```bash
