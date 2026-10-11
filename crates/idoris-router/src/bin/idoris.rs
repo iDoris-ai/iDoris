@@ -287,6 +287,9 @@ async fn run(options: cli::ServeOptions) -> Result<(), String> {
         virtual_key_authenticator: Some(virtual_key_authenticator),
         remote_bind_requires_auth: !bind_host.is_loopback(),
         dev_no_key_enabled,
+        remote_kill_switch: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(env_flag(
+            "IDORIS_REMOTE_KILL_SWITCH",
+        ))),
         event_log: Some(persistent.event_log),
         ..AppState::default()
     };
@@ -310,6 +313,12 @@ async fn run(options: cli::ServeOptions) -> Result<(), String> {
         eprintln!(
             "[idoris] IDORIS_DEV_NO_KEY=1: unauthenticated chat is limited to free loopback local_only execution"
         );
+    }
+    if state
+        .remote_kill_switch
+        .load(std::sync::atomic::Ordering::SeqCst)
+    {
+        eprintln!("[idoris] IDORIS_REMOTE_KILL_SWITCH=1: every request is pinned to local_only");
     }
     println!(
         "idoris: 已注册组件 [{}]",

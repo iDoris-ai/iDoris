@@ -94,7 +94,7 @@ pub mod subscription;
 
 use std::net::IpAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use axum::body::{Body, Bytes};
@@ -236,6 +236,11 @@ pub struct AppState {
     /// Explicit loopback-only developer escape hatch. Production startup
     /// leaves this false unless `IDORIS_DEV_NO_KEY=1` was set once.
     pub dev_no_key_enabled: bool,
+    /// M5 remote kill switch: while engaged, gate one treats remote egress as
+    /// not allowed, so every request is pinned to `local_only`. Shared so an
+    /// operator surface can flip it at runtime; startup engages it from
+    /// `IDORIS_REMOTE_KILL_SWITCH=1`.
+    pub remote_kill_switch: Arc<AtomicBool>,
     /// Persistent B6 Event Log capability. This slice only bootstraps and
     /// carries the handle; request event emission is wired separately.
     pub event_log: Option<Arc<idoris_tenancy::event_log::EventLogStore>>,
@@ -331,6 +336,7 @@ impl Default for AppState {
             virtual_key_authenticator: None,
             remote_bind_requires_auth: false,
             dev_no_key_enabled: false,
+            remote_kill_switch: Arc::new(AtomicBool::new(false)),
             event_log: None,
             audit_failures: Arc::new(AtomicU64::new(0)),
             models_health: Arc::new(health::HealthTracker::default()),
@@ -544,12 +550,14 @@ async fn enforce_key_scope_with(
 /// ([`inspect::inspect_body`]). These endpoints keep no Event Log chain
 /// yet, so the verdict only tightens routing.
 fn protocol_inspected_privacy(
+    state: &AppState,
     value: &serde_json::Value,
     parsed: &profile::ParsedProfile,
 ) -> PrivacyClass {
     inspect::inspect_body(
         value,
         parsed.task.privacy.unwrap_or(PrivacyClass::LocalOnly),
+        state.remote_kill_switch.load(Ordering::SeqCst),
     )
     .effective
 }
@@ -599,7 +607,7 @@ async fn embeddings(
     }
     // INSPECTED (M5-07): same gate as chat, after the key scope admitted
     // the declared privacy and before the routing policy reads it.
-    parsed.task.privacy = Some(protocol_inspected_privacy(&value, &parsed));
+    parsed.task.privacy = Some(protocol_inspected_privacy(&state, &value, &parsed));
 
     let cards = dispatch::policy_cards(&state.cards, &state.routing_policy, &parsed)
         .cards
@@ -745,7 +753,7 @@ async fn rerank(
     }
     // INSPECTED (M5-07): same gate as chat, after the key scope admitted
     // the declared privacy and before the routing policy reads it.
-    parsed.task.privacy = Some(protocol_inspected_privacy(&value, &parsed));
+    parsed.task.privacy = Some(protocol_inspected_privacy(&state, &value, &parsed));
 
     let cards = dispatch::policy_cards(&state.cards, &state.routing_policy, &parsed)
         .cards
@@ -902,7 +910,7 @@ async fn messages(
     }
     // INSPECTED (M5-07): same gate as chat, after the key scope admitted
     // the declared privacy and before the routing policy reads it.
-    parsed.task.privacy = Some(protocol_inspected_privacy(&value, &parsed));
+    parsed.task.privacy = Some(protocol_inspected_privacy(&state, &value, &parsed));
 
     let cards = dispatch::policy_cards(&state.cards, &state.routing_policy, &parsed)
         .cards
@@ -2123,6 +2131,7 @@ async fn chat_completions(
     let inspection = inspect::inspect_body(
         &value,
         parsed.task.privacy.unwrap_or(PrivacyClass::LocalOnly),
+        state.remote_kill_switch.load(Ordering::SeqCst),
     );
     if let Some((event_log, tenant_id)) = event_context.as_ref()
         && inspect::append_inspected(
@@ -3286,6 +3295,9 @@ mod inspected_wiring_tests;
 
 #[cfg(test)]
 mod protocol_inspected_wiring_tests;
+
+#[cfg(test)]
+mod kill_switch_wiring_tests;
 
 #[cfg(test)]
 mod local_privacy_tests;

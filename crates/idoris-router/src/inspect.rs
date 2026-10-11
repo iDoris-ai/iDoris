@@ -72,10 +72,13 @@ pub(crate) async fn post_inspect(
         return response;
     }
     // Reaching here means the caller's key scope already admits the
-    // declared privacy, so tenant policy allows remote for `any`.
+    // declared privacy, so tenant policy allows remote for `any` — unless the
+    // remote kill switch is engaged.
     let ctx = InspectCtx {
         declared,
-        remote_allowed: true,
+        remote_allowed: !state
+            .remote_kill_switch
+            .load(std::sync::atomic::Ordering::SeqCst),
         redact_consent: false,
         max_input_utf16: DEFAULT_MAX_INPUT_UTF16,
     };
@@ -89,13 +92,19 @@ pub(crate) struct Inspection {
     pub response: idoris_contracts::InspectResponse,
     pub effective: PrivacyClass,
     pub tightened: bool,
+    /// The remote kill switch, not the content, is what pinned `any`.
+    pub killed: bool,
 }
 
 /// Inspects every object key, string and number in `body` — content parts,
 /// tool definitions and arguments included — joined by newlines so values
 /// never merge into one digit group. `declared` must already have passed the
-/// caller's key scope, which is what makes `remote_allowed` true here.
-pub(crate) fn inspect_body(body: &serde_json::Value, declared: PrivacyClass) -> Inspection {
+/// caller's key scope, so remote is allowed unless `kill_switch` is engaged.
+pub(crate) fn inspect_body(
+    body: &serde_json::Value,
+    declared: PrivacyClass,
+    kill_switch: bool,
+) -> Inspection {
     fn collect(value: &serde_json::Value, out: &mut String) {
         match value {
             serde_json::Value::String(text) => push_line(out, text),
@@ -116,7 +125,7 @@ pub(crate) fn inspect_body(body: &serde_json::Value, declared: PrivacyClass) -> 
     collect(body, &mut text);
     let ctx = InspectCtx {
         declared,
-        remote_allowed: true,
+        remote_allowed: !kill_switch,
         redact_consent: false,
         max_input_utf16: DEFAULT_MAX_INPUT_UTF16,
     };
@@ -124,8 +133,10 @@ pub(crate) fn inspect_body(body: &serde_json::Value, declared: PrivacyClass) -> 
     let tightening = (response.action != idoris_contracts::inspect::InspectAction::Allow)
         .then_some(PrivacyClass::LocalOnly);
     let effective = idoris_policy::effective_privacy(declared, tightening);
+    let tightened = declared == PrivacyClass::Any && effective == PrivacyClass::LocalOnly;
     Inspection {
-        tightened: declared == PrivacyClass::Any && effective == PrivacyClass::LocalOnly,
+        killed: tightened && kill_switch,
+        tightened,
         response,
         effective,
     }
@@ -159,10 +170,12 @@ pub(crate) async fn append_inspected(
     );
     metadata.insert("labels".to_string(), serde_json::Value::Array(labels));
     if inspection.tightened {
-        metadata.insert(
-            "reason".to_string(),
-            serde_json::Value::from("privacy_tightened_by_content"),
-        );
+        let reason = if inspection.killed {
+            "remote_kill_switch"
+        } else {
+            "privacy_tightened_by_content"
+        };
+        metadata.insert("reason".to_string(), serde_json::Value::from(reason));
     }
     let ts_utc_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
