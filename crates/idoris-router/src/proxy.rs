@@ -1395,7 +1395,7 @@ impl ChatProxy {
     /// The provider breaker sees the initial response only: once a 2xx
     /// stream has started its later fate is a stream outcome, not a reason
     /// to stop sending to the provider.
-    async fn forward_stream_path_observed<F, Fut, E>(
+    pub(crate) async fn forward_stream_path_observed<F, Fut, E>(
         &self,
         endpoint: &str,
         upstream_path: StreamingUpstreamPath,

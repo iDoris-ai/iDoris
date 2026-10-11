@@ -5,7 +5,7 @@
 //! auth), `inspected`, `profiled`, `decided`, then `dispatched` right before
 //! the upstream send and `completed` once it actually executed — with the
 //! same correlation checks and the same fail-closed 503 when an append
-//! fails. The `/v1/messages` streaming branch stops at `decided` for now.
+//! fails. A streamed `/v1/messages` completes when its stream ends.
 
 use std::sync::Arc;
 
@@ -125,13 +125,23 @@ impl ProtocolEvents {
         } else {
             "failure"
         };
-        let context = CompletedEventContext {
+        append_completed(&self.completed_context(), selected, status)
+            .await
+            .map_err(|()| event_log_unavailable_response())
+    }
+
+    pub(crate) fn completed_context(&self) -> CompletedEventContext {
+        CompletedEventContext {
             event_log: self.log.clone(),
             tenant_id: self.tenant_id.clone(),
             record_id: self.record_id.clone(),
             correlation: self.correlation.clone(),
-        };
-        append_completed(&context, selected, status)
+        }
+    }
+
+    /// A streaming request whose upstream answered with a buffered error.
+    pub(crate) async fn completed_failure(&self, selected: &Selected) -> Result<(), Response> {
+        append_completed(&self.completed_context(), selected, "failure")
             .await
             .map_err(|()| event_log_unavailable_response())
     }
