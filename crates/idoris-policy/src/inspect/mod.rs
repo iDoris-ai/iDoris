@@ -85,12 +85,23 @@ pub fn inspect(input: &str, ctx: &InspectCtx) -> InspectResponse {
     for hit in &mut hits {
         (hit.start, hit.length) = normalized.original_span(hit.start, hit.length);
     }
-    let sensitivity = hits
-        .iter()
-        .map(|hit| hit.sensitivity)
-        .max()
-        .unwrap_or(Sensitivity::S0);
-    let action = decide_action(&hits, sensitivity, ctx);
+    // An embedded `data:…;base64,` payload (an image or file in markdown
+    // or HTML) is content L0 cannot read: not provably clean, so BLOCK at
+    // S3 like an unscanned oversize input, whatever else was found.
+    let opaque = contains_base64_data_url(input);
+    let sensitivity = if opaque {
+        Sensitivity::S3
+    } else {
+        hits.iter()
+            .map(|hit| hit.sensitivity)
+            .max()
+            .unwrap_or(Sensitivity::S0)
+    };
+    let action = if opaque {
+        InspectAction::Block
+    } else {
+        decide_action(&hits, sensitivity, ctx)
+    };
     let findings = hits
         .iter()
         .map(|hit| InspectFinding {
@@ -106,6 +117,18 @@ pub fn inspect(input: &str, ctx: &InspectCtx) -> InspectResponse {
         findings,
         action,
     }
+}
+
+/// `data:<mediatype>;base64,` anywhere, case-insensitive (RFC 2397).
+fn contains_base64_data_url(input: &str) -> bool {
+    let lower = input.to_ascii_lowercase();
+    lower.match_indices("data:").any(|(at, _)| {
+        let rest = &lower[at + 5..];
+        let header_end = rest
+            .find(|c: char| c == ',' || c.is_whitespace())
+            .unwrap_or(rest.len());
+        rest[..header_end].ends_with(";base64") && rest[header_end..].starts_with(',')
+    })
 }
 
 /// UTF-16 长度不会超过 UTF-8 字节数，所以字节数没超就一定没超，省掉一次计数。
