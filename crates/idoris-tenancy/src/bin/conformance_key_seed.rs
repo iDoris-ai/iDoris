@@ -1,6 +1,6 @@
 //! Test-only helper for black-box Rust conformance runs.
 //!
-//! Seeds one deterministic, broad-scope virtual key into an isolated test
+//! Seeds one fresh, broad-scope virtual key into an isolated test
 //! database. This binary is feature-gated behind `test-bins` and is never
 //! part of a normal production build or release archive.
 
@@ -13,8 +13,12 @@ use idoris_tenancy::virtual_key::store::{VirtualKeyScope, VirtualKeyStore};
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args_os().skip(1);
     let db_path = PathBuf::from(args.next().ok_or("missing database path")?);
+    let tenant_id = args
+        .next()
+        .map(|value| value.into_string().map_err(|_| "invalid tenant identifier"))
+        .transpose()?;
     if args.next().is_some() {
-        return Err("expected exactly one database path".into());
+        return Err("expected database path and optional tenant identifier".into());
     }
 
     let minted = MintedVirtualKey::mint();
@@ -23,7 +27,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &minted.key_id,
         minted.hash,
         &VirtualKeyScope {
-            tenant_id: None,
+            tenant_id,
             owner: "conformance".into(),
             allowed_privacy: vec![PrivacyClass::LocalOnly, PrivacyClass::Any],
             allowed_roles: [

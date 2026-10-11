@@ -142,11 +142,14 @@ async fn request_received_preserves_valid_request_id_and_falls_back_on_oversize(
 #[tokio::test]
 async fn tenant_mode_uses_parsed_tenant_not_untrusted_metadata() {
     let event_log = memory_event_log();
-    let app = build_app(AppState {
-        deploy_mode: DeployMode::Tenant,
-        event_log: Some(event_log.clone()),
-        ..AppState::default()
-    });
+    let app = tenant_test_app(
+        AppState {
+            deploy_mode: DeployMode::Tenant,
+            event_log: Some(event_log.clone()),
+            ..AppState::default()
+        },
+        "acme",
+    );
     let response = app
         .oneshot(super::tests::post_chat(
             "{}",

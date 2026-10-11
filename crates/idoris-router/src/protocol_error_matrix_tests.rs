@@ -65,11 +65,14 @@ async fn protocol_endpoints_share_tenant_missing_envelope_before_egress() {
             .await;
         let mut card = super::tests::resident_component_card("protocol-local", &server.uri());
         card.provider.capabilities = vec![capability];
-        let app = build_app(AppState {
-            deploy_mode: idoris_contracts::DeployMode::Tenant,
-            cards: vec![card],
-            ..AppState::default()
-        });
+        let app = tenant_test_app(
+            AppState {
+                deploy_mode: idoris_contracts::DeployMode::Tenant,
+                cards: vec![card],
+                ..AppState::default()
+            },
+            "acme",
+        );
         let payload = match path {
             "/v1/embeddings" => json!({"model":"x","input":"hello"}),
             "/v1/rerank" => json!({"model":"x","query":"q","documents":["d"]}),
