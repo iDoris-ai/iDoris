@@ -14,6 +14,7 @@
 //! （`idoris_contracts::inspect` 模块文档）；扫描前的逃逸归一化只删字符、
 //! 不增字符，命中再按 `normalize` 的映射表回到原文坐标。
 
+mod decode;
 mod l0;
 mod normalize;
 mod secrets;

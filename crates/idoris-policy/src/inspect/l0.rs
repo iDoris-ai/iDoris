@@ -30,7 +30,15 @@ struct Candidate<'a> {
     x_suffix: bool,
 }
 
+/// 明文规则，加上解码一层之后的同一套明文规则（[`super::decode`]）。
 pub(super) fn scan(units: &[u16]) -> Vec<Hit> {
+    let mut hits = scan_plain(units);
+    super::decode::scan(units, &mut hits);
+    sort_dedup(hits)
+}
+
+/// 只看明文：数字类、字母数字类、凭据类规则。
+pub(super) fn scan_plain(units: &[u16]) -> Vec<Hit> {
     let mut hits = Vec::new();
     let mut i = 0;
     while i < units.len() {
@@ -81,6 +89,10 @@ pub(super) fn scan(units: &[u16]) -> Vec<Hit> {
     }
     super::tokens::scan(units, &mut hits);
     super::secrets::scan(units, &mut hits);
+    sort_dedup(hits)
+}
+
+fn sort_dedup(mut hits: Vec<Hit>) -> Vec<Hit> {
     hits.sort_by_key(|hit| (hit.start, hit.length, hit.kind as u8));
     hits.dedup_by_key(|hit| (hit.kind, hit.start, hit.length));
     hits
