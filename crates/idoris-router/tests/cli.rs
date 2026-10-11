@@ -167,6 +167,7 @@ async fn launcher_token_stdin_authenticates_admin_without_leaking_to_logs() {
         .env("IDORIS_PORT", data_port.to_string())
         .env("IDORIS_ADMIN_PORT", admin_port.to_string())
         .env("IDORIS_DB_PATH", state.path().join("state.sqlite3"))
+        .env("IDORIS_DEV_NO_KEY", "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
