@@ -13,6 +13,7 @@ beforeAll(async () => {
   const tenantConfig = makeTenantConfigFile([{ tenantId: "tenant-conformance" }]);
   server = await spawnConformanceServer({
     componentsDir,
+    rustTenantId: "tenant-conformance",
     routingPolicyPath: routingPolicyFixturePath,
     env: { IDORIS_DEPLOY_MODE: "tenant", IDORIS_TENANTS_CONFIG: tenantConfig },
   });

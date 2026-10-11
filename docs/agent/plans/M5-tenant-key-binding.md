@@ -23,8 +23,10 @@ identifiers must be nonempty, unpadded, control-free and at most 128 UTF-16 unit
 ## HTTP enforcement (next slice)
 
 The shipped binary installs the authenticator on all data-plane endpoints.
-Except `/health`, tenant requests need a valid bearer and exactly one tenant
-header equal to the stored binding. Unbound/mismatched keys receive generic
+Except `/health`, tenant requests need a valid bound bearer. Tenant-scoped
+handlers require exactly one header equal to the stored binding. Absent headers
+retain existing body/profile error precedence and confer no tenant audit scope.
+Unbound/mismatched keys receive generic
 403 `VIRTUAL_KEY_TENANT_FORBIDDEN`; invalid/missing bearers receive generic 401.
 DEV_NO_KEY does not bypass tenant authentication. Existing tenant URL/header
 checks still prevent a bound tenant from querying a different tenant's path.
