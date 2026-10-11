@@ -57,6 +57,7 @@ So nothing was merged and nothing was approved. Every branch below is pushed and
 | 34 | `feat/resilience-08-connection-cooldown` | `feat/event-log-28-protocol-chain` @ `d1cc81f9` | feat(router): record the decision chain on protocol endpoints |
 | 35 | `feat/event-log-28-protocol-chain` | `feat/event-log-29-protocol-dispatch` @ `6df741cd` | feat(router): record dispatch and completion on protocol endpoints |
 | 36 | `feat/event-log-29-protocol-dispatch` | `feat/event-log-30-messages-stream` @ `c6906b05` | feat(router): complete streamed /v1/messages in the Event Log |
+| 37 | `feat/event-log-30-messages-stream` | `feat/gate-two-01-egress-decorrelation` @ `8a1422e5` | feat(router): de-correlate request bodies sent off host |
 
 Rules for landing (same as PRIME-CHECKPOINT "Safe stacked merge procedure"): merge parent first; before a parent branch is deleted, retarget its child to `main`; no rebase, no force-push; never treat a stale approval as current.
 
@@ -103,6 +104,7 @@ The #421 M5 plan (contract freeze → pure L0 → rule packs → endpoint → IN
 | M5-26 | decision chain (received → inspected → profiled → decided) on embeddings/rerank/messages; dispatched/completed added in M5-27 |
 | M5-27 | `dispatched`/`completed` on buffered protocol requests (replays record nothing); `/v1/messages` streaming completed in M5-28 |
 | M5-28 | streamed `/v1/messages` records `dispatched` and completes when the stream ends (`message_stop`); every inference endpoint now has a full decision chain |
+| M5-29 | egress de-correlation: off-host bodies drop `user` / `safety_identifier` / `prompt_cache_key` / `metadata`; loopback unchanged |
 
 M5 acceptance shape is tested: an id/phone/card injected anywhere in a declared-`any` body (plain content, array parts, tool arguments, JSON numbers, Anthropic `system`, embeddings input, rerank documents) yields zero upstream requests on a non-local card; kill switch stops the next request; 100-way budget race never overspends.
 
