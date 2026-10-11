@@ -159,6 +159,13 @@
   - `kind` 是封闭枚举（证件/手机/银行卡/统一社会信用代码/车牌/护照/港澳证件/邮箱/密钥类/凭据路径/`input_limit_exceeded`），新增类别属于契约变更。
   - `span = {start, length}`，按 **UTF-16 code unit** 计、半开区间 `[start, start+length)`，`length ≥ 1`；`input_limit_exceeded`（超限未扫描，按 X-1 直接 BLOCK）不带 span。
   - 响应里除枚举外没有任何字符串字段：命中原文、密钥子串不会出现在响应体，也不会经由响应进入日志。
+  - 鉴权：与协议端点同一套 virtual key，但**只看 key 的隐私上限**，不看 role（按 role 限定的 key 也能调用）。`X-iDoris-Privacy` 缺省为 `local_only`。调用方同意脱敏的线上表示尚未定义，所以目前只会返回 `BLOCK` / `ALLOW`，不会返回 `REDACT`。
+- **闸一在推理路径上的行为（M5，已实现，待评审）**：
+  - `/v1/chat/completions`、`/v1/embeddings`、`/v1/rerank`、`/v1/messages` 在鉴权之后、路由策略和意图识别之前检查**整个请求体**（含 content parts、工具参数、数字字段）。判定不是 `ALLOW` 就把这次请求钉成 `local_only`（只收紧、不放宽）；没有可信本地卡时返回 `local_only_unavailable`，上游收到 0 个请求。
+  - 无法检查的内容（图片/音频/文件 part、`data:…;base64,`、token id 数组）不算"干净"，同样钉成 `local_only`。
+  - chat 的 Event Log 多一个 `inspected` 事件（`request.received` 之后、`profiled` 之前），metadata 只有 `sensitivity`、`privacy`、`labels`（命中类别）和收紧时的 `reason`（`privacy_tightened_by_content` / `uninspectable_content` / `remote_kill_switch` / `inspect_failed`），不含原文和位置。
+  - **远程熔断开关**：启动时 `IDORIS_REMOTE_KILL_SWITCH=1` 让所有请求按 `local_only` 处理；运行时切换需要 Admin v1 写接口（未定）。
+  - **provider 断路器**：二进制里默认关闭，`IDORIS_PROVIDER_BREAKER=1` 才启用（共享 conformance 仍约定"持续 5xx 原样透传"）。启用后：被断开的 provider 不再收到请求，选路会改选其他候选，全部断开时返回 503（发送前被拒为 `provider_circuit_open`）。
 
 ### 3.6 预算与计费
 
