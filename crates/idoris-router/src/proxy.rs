@@ -352,9 +352,11 @@ pub struct ChatProxy {
     egress: Arc<EgressCounter>,
     /// M5-14 provider-grain circuit breakers, keyed by provider id.
     breakers: Mutex<idoris_policy::breaker::BreakerBook<String>>,
-    /// Lets tests about other proxy behaviour send repeated failures.
-    #[cfg(test)]
-    pub(crate) breaker_disabled: bool,
+    /// On for a library-constructed proxy. The `idoris` binary turns it off
+    /// unless `IDORIS_PROVIDER_BREAKER=1`: the shared conformance contract
+    /// still says persistent 5xx is passed through verbatim, so enabling
+    /// breakers by default is an owner decision, not a silent change.
+    breaker_enabled: std::sync::atomic::AtomicBool,
     pub(crate) window: Duration,
     max_entries: usize,
     header_timeout: Duration,
@@ -383,8 +385,7 @@ impl ChatProxy {
         &self,
         provider_ids: impl IntoIterator<Item = &'a str>,
     ) -> std::collections::BTreeSet<String> {
-        #[cfg(test)]
-        if self.breaker_disabled {
+        if !self.breakers_enabled() {
             return std::collections::BTreeSet::new();
         }
         let now_ms = wall_clock_ms();
@@ -400,9 +401,17 @@ impl ChatProxy {
 
     /// Claims an upstream send for `provider_id`. A poisoned lock fails
     /// closed: no send.
+    /// Turns provider breakers on or off for every later request.
+    pub fn set_breakers_enabled(&self, enabled: bool) {
+        self.breaker_enabled.store(enabled, Ordering::SeqCst);
+    }
+
+    fn breakers_enabled(&self) -> bool {
+        self.breaker_enabled.load(Ordering::SeqCst)
+    }
+
     fn admit_provider(&self, provider_id: &str, url: &str) -> bool {
-        #[cfg(test)]
-        if self.breaker_disabled {
+        if !self.breakers_enabled() {
             return true;
         }
         let Ok(mut book) = self.breakers.lock() else {
@@ -426,6 +435,9 @@ impl ChatProxy {
         status: u16,
         retry_after_ms: Option<u64>,
     ) {
+        if !self.breakers_enabled() {
+            return;
+        }
         let Ok(mut book) = self.breakers.lock() else {
             return;
         };
@@ -473,8 +485,7 @@ impl ChatProxy {
             client,
             egress: Arc::new(EgressCounter::default()),
             breakers: Mutex::new(idoris_policy::breaker::BreakerBook::new()),
-            #[cfg(test)]
-            breaker_disabled: false,
+            breaker_enabled: std::sync::atomic::AtomicBool::new(true),
             window: DEFAULT_WINDOW,
             max_entries: DEFAULT_MAX_ENTRIES,
             header_timeout: Duration::from_secs(10),
