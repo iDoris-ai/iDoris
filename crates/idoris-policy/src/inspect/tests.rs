@@ -796,6 +796,9 @@ fn fourth_review_entities_with_short_neighbours() {
         ("4111 1111 1111 1111 12 28", &[FindingKind::BankCard]),
         ("2026-10-11 20:19 138 1234 5678", &[FindingKind::CnMobile]),
         ("28 138 1234 5678", &[FindingKind::CnMobile]),
+        ("0086 138 1234 5678", &[FindingKind::CnMobile]),
+        ("0086-13812345678", &[FindingKind::CnMobile]),
+        ("008613812345678", &[FindingKind::CnMobile]),
         ("138 1234 5678 139 8765 4321 7", &[FindingKind::CnMobile]),
     ] {
         let found = kinds(&inspect(input, &open_ctx()));

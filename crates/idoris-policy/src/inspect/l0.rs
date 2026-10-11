@@ -232,6 +232,11 @@ fn classify(c: &Candidate<'_>, hits: &mut Vec<Hit>) {
                 && d[..2] == [8, 6]
                 && is_mobile(&d[2..])
         }
+        15 => {
+            written_as(&[&[4, 3, 4, 4], &[4, 11], &[4, 3, 8]])
+                && d[..4] == [0, 0, 8, 6]
+                && is_mobile(&d[4..])
+        }
         _ => false,
     };
     if mobile {
