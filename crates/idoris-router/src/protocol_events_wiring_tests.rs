@@ -3,6 +3,7 @@
 #![allow(clippy::unwrap_used)]
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::http::{HeaderValue, Request, StatusCode};
 use http_body_util::BodyExt;

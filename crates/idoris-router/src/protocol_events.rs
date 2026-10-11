@@ -144,7 +144,7 @@ impl ProtocolEvents {
         }
     }
 
-    /// A streaming request whose upstream answered with a buffered error.
+    /// A stream whose send attempt failed or received a buffered upstream error.
     pub(crate) async fn completed_failure(&self, selected: &Selected) -> Result<(), Response> {
         if !self.dispatched.load(Ordering::Acquire) {
             return Ok(());
