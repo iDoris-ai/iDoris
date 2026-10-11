@@ -59,3 +59,59 @@ async fn failing_local_upstream_is_not_contacted_once_its_breaker_opens() {
         "a breaker refusal must not be recorded as a dispatch"
     );
 }
+
+#[tokio::test]
+async fn selection_moves_to_a_healthy_candidate_once_a_breaker_opens() {
+    let failing = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(500).set_body_json(json!({"error": "boom"})))
+        .mount(&failing)
+        .await;
+    let healthy = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"marker": "healthy"})))
+        .mount(&healthy)
+        .await;
+    let event_log = Arc::new(EventLogStore::new(Connection::open_in_memory().unwrap()).unwrap());
+    let app = build_app(AppState {
+        cards: vec![
+            resident_component_card("a-failing", &failing.uri()),
+            resident_component_card("b-healthy", &healthy.uri()),
+        ],
+        event_log: Some(event_log.clone()),
+        ..AppState::default()
+    });
+    let body = r#"{"model":"idoris/daily","messages":[{"role":"user","content":"hi"}]}"#;
+
+    let mut statuses = Vec::new();
+    let mut last_record = String::new();
+    for _ in 0..3 {
+        let response = app.clone().oneshot(post_chat(body, &[])).await.unwrap();
+        statuses.push(response.status());
+        last_record = response
+            .headers()
+            .get(HEADER_RECORD_ID)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+    }
+    assert_eq!(
+        statuses,
+        [
+            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::OK
+        ]
+    );
+    assert_eq!(failing.received_requests().await.unwrap().len(), 2);
+    assert_eq!(healthy.received_requests().await.unwrap().len(), 1);
+    let events = event_log
+        .events_for_record(Some(budget::PERSONAL_TENANT_ID), &last_record)
+        .unwrap();
+    let decided = events
+        .iter()
+        .find(|e| e.event.event_type == EventType::Decided)
+        .unwrap();
+    assert_eq!(decided.event.metadata["provider_id"], "b-healthy");
+}

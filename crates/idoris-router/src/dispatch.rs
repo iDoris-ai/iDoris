@@ -129,7 +129,7 @@ fn default_load_policy() -> LoadPolicy {
 /// mapping isn't wired yet, and real admission state is only known after
 /// asking the Supervisor (post-selection, see [`dispatch_local`]).
 /// `estimated_cost_minor` comes from [`budget::estimate_cost_minor`].
-fn candidate(component: &ComponentCard, prompt: &str) -> Card {
+fn candidate(component: &ComponentCard, prompt: &str, blocked: bool) -> Card {
     Card {
         component: component.clone(),
         roles: ROLES
@@ -140,7 +140,13 @@ fn candidate(component: &ComponentCard, prompt: &str) -> Card {
         experiment: false,
         min_ram_gb: 0.0,
         estimated_cost_minor: budget::estimate_cost_minor(&component.provider.cost, prompt),
-        admission_status: AdmissionStatus::Ready,
+        // M5-16: an open provider breaker is an admission fact; decide()
+        // drops Blocked candidates at its admission stage.
+        admission_status: if blocked {
+            AdmissionStatus::Blocked
+        } else {
+            AdmissionStatus::Ready
+        },
     }
 }
 
@@ -244,7 +250,30 @@ pub fn select_with_affinity_and_ready(
     affinity_key: Option<&str>,
     ready_provider_ids: &BTreeSet<String>,
 ) -> Result<Selected, DispatchError> {
-    let candidates: Vec<Card> = cards.iter().map(|c| candidate(c, prompt)).collect();
+    select_avoiding_open_breakers(
+        cards,
+        profile,
+        prompt,
+        affinity_key,
+        ready_provider_ids,
+        &BTreeSet::new(),
+    )
+}
+
+/// [`select_with_affinity_and_ready`] with providers whose breaker is open
+/// marked `Blocked`, so another candidate is chosen when one exists.
+pub fn select_avoiding_open_breakers(
+    cards: &[ComponentCard],
+    profile: &ParsedProfile,
+    prompt: &str,
+    affinity_key: Option<&str>,
+    ready_provider_ids: &BTreeSet<String>,
+    open_provider_ids: &BTreeSet<String>,
+) -> Result<Selected, DispatchError> {
+    let candidates: Vec<Card> = cards
+        .iter()
+        .map(|c| candidate(c, prompt, open_provider_ids.contains(&c.provider.id)))
+        .collect();
     let request_profile = RequestProfile {
         task: profile.task.clone(),
         role: profile.role,

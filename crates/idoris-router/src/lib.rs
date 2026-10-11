@@ -2263,12 +2263,20 @@ async fn chat_completions(
         std::collections::BTreeSet::new()
     };
 
-    let selection = dispatch::select_with_affinity_and_ready(
+    let open_provider_ids = state.proxy.open_providers(
+        policy_cards
+            .cards
+            .iter()
+            .filter(|card| dispatch::is_resident_http_service(card))
+            .map(|card| card.provider.id.as_str()),
+    );
+    let selection = dispatch::select_avoiding_open_breakers(
         &policy_cards.cards,
         &parsed,
         &prompt,
         affinity_key,
         &ready_provider_ids,
+        &open_provider_ids,
     );
     let rejection_reason = match &selection {
         Ok(_) => None,
