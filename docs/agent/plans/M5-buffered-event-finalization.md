@@ -17,9 +17,9 @@ have no cross-request deduplication guarantee.
 
 ## Follow-up
 
-This transport slice preserves existing endpoint behavior through no-op hooks.
-Wire protocol endpoints next. Preserve the existing paid-chat settlement rule
-until its Event Log failure semantics receive an explicit review.
+Protocol endpoints and free chat use the pre-publication completion hook.
+Paid chat preserves its existing committed-settlement response rule until
+its Event Log failure semantics receive an explicit review.
 
 ## Protocol attempt terminals
 
@@ -29,3 +29,9 @@ router attempt; it does not claim that upstream inference ran, and it does
 not change `ExecutionDisposition` or charge budget. Breaker/preflight refusals
 have no committed dispatch and therefore no completion. The same distinction
 applies to a messages stream that returns a buffered transport error.
+
+## Free chat
+
+Free buffered chat uses the same pre-publication completion hook. Append failure
+cannot become a cached success. Paid chat retains its existing post-settlement
+response rule and is covered by the existing committed-settlement regression.

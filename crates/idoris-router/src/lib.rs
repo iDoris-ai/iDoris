@@ -3125,6 +3125,7 @@ async fn chat_via_proxy_buffered(
         reservation.retain_on_drop();
     }
     let mut paid_settlement = None;
+    let completed_context = events.completed;
     let outcome = if is_paid {
         state
             .proxy
@@ -3176,12 +3177,39 @@ async fn chat_via_proxy_buffered(
     } else {
         state
             .proxy
-            .forward_buffered_observed(&selected.card.endpoint, body_value, &opts, || async {
-                if let Some(context) = events.dispatched {
-                    append_dispatched(context, selected).await?;
-                }
-                Ok::<(), ()>(())
-            })
+            .forward_buffered_path_finalized(
+                &selected.card.endpoint,
+                proxy::BufferedUpstreamPath::CHAT_COMPLETIONS,
+                body_value,
+                &opts,
+                |_| Ok(()),
+                (
+                    || async {
+                        if let Some(context) = events.dispatched {
+                            append_dispatched(context, selected).await?;
+                        }
+                        Ok::<(), ()>(())
+                    },
+                    |outcome| async move {
+                        if !outcome.cached
+                            && !matches!(
+                                outcome.execution,
+                                proxy::ExecutionDisposition::NotExecuted
+                                    | proxy::ExecutionDisposition::Replay
+                            )
+                            && let Some(context) = completed_context
+                        {
+                            let status = if (200..300).contains(&outcome.status) {
+                                "success"
+                            } else {
+                                "failure"
+                            };
+                            append_completed(context, selected, status).await?;
+                        }
+                        Ok::<(), ()>(())
+                    },
+                ),
+            )
             .await
     };
     let Ok(outcome) = outcome else {
@@ -3215,7 +3243,8 @@ async fn chat_via_proxy_buffered(
     }
 
     let status = StatusCode::from_u16(outcome.status).unwrap_or(StatusCode::BAD_GATEWAY);
-    if !outcome.cached
+    if is_paid
+        && !outcome.cached
         && outcome.execution != proxy::ExecutionDisposition::NotExecuted
         && outcome.execution != proxy::ExecutionDisposition::Replay
         && let Some(context) = events.completed
