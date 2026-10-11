@@ -59,16 +59,37 @@ Core product invariants:
   and UTF-16 spans; bump wire contract on endpoint publication. The new
   version slice chooses additive minor **1.1.0**. REDACT consent and Admin v1
   public write endpoints remain pending owner review; continue safety work.
-- Tenant virtual-key remediation is being split into <=300-line slices:
-  `feat/identity-keys-31-tenant-binding` (migration, issuance, legacy behavior),
-  then `feat/identity-keys-32-tenant-enforcement` (HTTP binding, trusted audit
-  scope, authentication before request.received). Cross-tenant/unbound/
-  anonymous/repeated-header negative cases and a legitimate tenant positive
-  control pass locally; full final-head checks are in progress.
-- The two historical macOS CI failures have distinct causes: run 38137840647
-  observed group reaping before descendants exited; run 38140879392 hit
-  EADDRINUSE during startup. Test-only fixture repairs are being validated on
-  `test/subscription-31-fixture-races`; no production workaround added.
+- Tenant key repair is published in independent <=300-line slices:
+  #463 `164444c` storage/issuance (172 lines) →
+  #465 `4c62d18` explicit conformance key binding (22 lines) →
+  #467 `29aff5d` HTTP tenant authority / events / audit (296 lines) →
+  `feat/identity-keys-35-tenant-default-deny` `1a5008c` (239-line PR delta,
+  including ordinary merge of #374's repaired test). The last slice also
+  denies missing authenticators in tenant library mode; real bound-key
+  cfg(test) fixtures preserve authorized routing tests. Three hand mutations
+  (binding bypass, untrusted audit scope, missing authenticator bypass) fail
+  by assertions; restored final heads pass full Rust/TS gates and release
+  conformance (134 passed / 8 todo). None is approved or merged yet.
+- #464 `aba5ecf` publishes additive wire contract **1.1.0** with Rust/TS/health
+  expectations synchronized. Full Rust/TS gates and release Rust conformance
+  (134 passed / 8 todo) pass locally. It ships with M5, not early with M4.
+- #466 `c8a3ced`, base `feat/subscription-test-hardening`, repairs the two
+  historical macOS fixture races: readiness marker after TERM trap, bounded
+  ESRCH-only descendant reaping, distinct port reservations and bounded
+  EADDRINUSE-only startup retries. Both affected suites passed 30 repetitions
+  each; all local gates pass (full Rust run serially). The old failed runs
+  were rerun once after logs were diagnosed; keep observing remote results.
+- Parallel full-suite execution hit portable_startup's existing 5s copied-
+  binary launch deadline on two different negative tests. Serial 8/8 and
+  final full serial gates pass. No production change or relaxed assertion.
+- Remote checks are advancing: #374/#463/#467 have green Linux Rust/TS/
+  subscription checks; macOS subscription remains queued on these runs.
+  No current-head approval exists. Do not conflate queued with failed.
+- Next active lane: buffered proxy completion must commit before publishing
+  an idempotent success/cache/flight result. Retain failed or uncertain
+  execution markers, so append failure cannot trigger a duplicate POST.
+  Separate transport seam, protocol wiring and chat wiring into small PRs.
+
 - Active worktrees live beside the main checkout under `/Users/jason/Dev/iDoris/`.
   Cargo targets must be isolated when building differing worktree revisions;
   a shared target reused stale workspace libraries during the first tenant

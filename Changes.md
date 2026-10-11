@@ -2,6 +2,10 @@
 
 ## 2026-10-11 Codex 接手
 
+- 新增 #463/#465/#467 的 tenant key 绑定、显式 conformance key 和 HTTP 鉴权修复；library default deny 提交 `1a5008c`。跨租户、匿名、缺 authenticator 的零出网/零受害租户记录均有回归与撤修负控。
+- #464 将 inspect 的 wire contract 升为 1.1.0；完整 Rust/TS 门禁与 release conformance 134/8 均通过。
+- #466 修两类 macOS fixture 竞态，相关套件各重复 30 轮通过；完整门禁已串行复验。
+
 - 已核验 GitHub 登录；40 个队列 PR 已创建为 #422–#461，保留依赖 base。
 - #374 补齐可选上游与零出网证据，提交 `2d15076`；本地 Rust/TS 门禁通过，待独立批准。
 - 负责人确认 inspect 的 `{input: string}` / UTF-16 span；端点发布时升契约版本，REDACT 同意格式与 Admin v1 写端点继续待审。
