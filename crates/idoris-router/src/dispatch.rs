@@ -522,7 +522,7 @@ pub async fn dispatch_local(
     public_dispatch_result(
         dispatch_local_inner(
             LocalSelection::Cards(cards),
-            LocalExecutionContext::new(supervisor, budget_ledger, None),
+            LocalExecutionContext::new(supervisor, budget_ledger, None, None, None, None),
             profile,
             input,
             messages,
@@ -547,7 +547,7 @@ pub async fn dispatch_local_preselected(
     public_dispatch_result(
         dispatch_local_inner(
             LocalSelection::Preselected(selected),
-            LocalExecutionContext::new(supervisor, budget_ledger, None),
+            LocalExecutionContext::new(supervisor, budget_ledger, None, None, None, None),
             profile,
             input,
             messages,
@@ -592,6 +592,9 @@ pub(crate) struct LocalExecutionContext<'a> {
     supervisor: Option<&'a BoundSupervisor>,
     budget_ledger: Option<&'a BudgetLedger>,
     budget_event: Option<&'a crate::BudgetReservedEventContext>,
+    dispatched_event: Option<&'a crate::DispatchedEventContext>,
+    completed_event: Option<&'a crate::CompletedEventContext>,
+    budget_settled_event: Option<&'a crate::BudgetSettledEventContext>,
 }
 
 impl<'a> LocalExecutionContext<'a> {
@@ -599,11 +602,17 @@ impl<'a> LocalExecutionContext<'a> {
         supervisor: Option<&'a BoundSupervisor>,
         budget_ledger: Option<&'a BudgetLedger>,
         budget_event: Option<&'a crate::BudgetReservedEventContext>,
+        dispatched_event: Option<&'a crate::DispatchedEventContext>,
+        completed_event: Option<&'a crate::CompletedEventContext>,
+        budget_settled_event: Option<&'a crate::BudgetSettledEventContext>,
     ) -> Self {
         Self {
             supervisor,
             budget_ledger,
             budget_event,
+            dispatched_event,
+            completed_event,
+            budget_settled_event,
         }
     }
 }
@@ -625,6 +634,9 @@ async fn dispatch_local_inner(
         supervisor,
         budget_ledger,
         budget_event,
+        dispatched_event,
+        completed_event,
+        budget_settled_event,
     } = execution;
     let tenant_id = profile.tenant_id.as_deref();
     let prompt = input.prompt;
@@ -798,6 +810,12 @@ async fn dispatch_local_inner(
         });
     }
 
+    if let Some(context) = dispatched_event
+        && crate::append_dispatched(context, selected).await.is_err()
+    {
+        return Err(ObservedDispatchError::EventLogUnavailable);
+    }
+
     let chat_result = supervisor
         .chat(
             ChatRequest {
@@ -808,6 +826,55 @@ async fn dispatch_local_inner(
         )
         .await;
 
+    // A successful upstream execution must be charged before any fallible
+    // completion event append can return early and drop the reservation.
+    let actual_cost_minor = if let Ok(response) = &chat_result {
+        // Settling is best-effort (see `ChatOutcome::actual_cost_minor`'s
+        // doc): a successful chat response is never withheld just
+        // because the ledger write afterward had a problem.
+        match (budget_ledger, reservation_guard.take()) {
+            (Some(ledger), Some(id)) => {
+                let actual = budget::estimate_actual_cost_minor(
+                    &cost,
+                    prompt,
+                    &response.content,
+                    estimated_cost_minor,
+                );
+                budget::settle(ledger, tenant_id, &id, actual)
+                    .ok()
+                    .filter(|_| is_paid)
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
+
+    if let Some(context) = completed_event {
+        let status = if chat_result.is_ok() {
+            "success"
+        } else {
+            "failure"
+        };
+        if crate::append_completed(context, selected, status)
+            .await
+            .is_err()
+        {
+            return Err(ObservedDispatchError::EventLogUnavailable);
+        }
+    }
+
+    // Keep the settled event after Completed while charging before the
+    // fallible Completed append. A failed settled-event append cannot refund.
+    if let Some(settled_minor) = actual_cost_minor
+        && let Some(context) = budget_settled_event
+        && crate::append_budget_settled(context, selected, settled_minor)
+            .await
+            .is_err()
+    {
+        eprintln!("idoris: budget.settled event write failed after committed settlement");
+    }
+
     match chat_result {
         Err(err) => Ok(ChatOutcome {
             decision,
@@ -815,31 +882,12 @@ async fn dispatch_local_inner(
             result: Err(DispatchFailure::Backend(err)),
             actual_cost_minor: None,
         }),
-        Ok(response) => {
-            // Settling is best-effort (see `ChatOutcome::actual_cost_minor`'s
-            // doc): a successful chat response is never withheld just
-            // because the ledger write afterward had a problem.
-            let actual_cost_minor = match (budget_ledger, reservation_guard.take()) {
-                (Some(ledger), Some(id)) => {
-                    let actual = budget::estimate_actual_cost_minor(
-                        &cost,
-                        prompt,
-                        &response.content,
-                        estimated_cost_minor,
-                    );
-                    budget::settle(ledger, tenant_id, &id, actual)
-                        .ok()
-                        .filter(|_| is_paid)
-                }
-                _ => None,
-            };
-            Ok(ChatOutcome {
-                decision,
-                served_locality,
-                result: Ok(response),
-                actual_cost_minor,
-            })
-        }
+        Ok(response) => Ok(ChatOutcome {
+            decision,
+            served_locality,
+            result: Ok(response),
+            actual_cost_minor,
+        }),
     }
 }
 

@@ -588,31 +588,6 @@ impl ChatProxy {
         .await
     }
 
-    pub(crate) async fn forward_buffered_with_success_gate<F>(
-        &self,
-        endpoint: &str,
-        body: &Value,
-        opts: &ForwardOpts<'_>,
-        success_gate: F,
-    ) -> ForwardOutcome
-    where
-        F: FnOnce(&ForwardOutcome) -> Result<(), SuccessFinalizeError> + Send,
-    {
-        let result = self
-            .forward_buffered_with_success_gate_observed(
-                endpoint,
-                body,
-                opts,
-                success_gate,
-                || async { Ok::<(), std::convert::Infallible>(()) },
-            )
-            .await;
-        match result {
-            Ok(outcome) => outcome,
-            Err(never) => match never {},
-        }
-    }
-
     async fn forward_buffered_path_with_success_gate<F>(
         &self,
         endpoint: &str,

@@ -260,6 +260,7 @@ async fn buffered_observer_runs_once_across_connect_retries() {
     };
     assert_eq!(result.status, 502);
     assert_eq!(result.retries, 2);
+    assert_eq!(result.execution, ExecutionDisposition::NotExecuted);
     assert_eq!(observed.load(Ordering::SeqCst), 1);
 }
 

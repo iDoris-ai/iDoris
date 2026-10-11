@@ -65,6 +65,7 @@ async fn selected_route_records_one_truthful_decided_event_before_proxy_executio
             EventType::RequestReceived,
             EventType::Profiled,
             EventType::Decided,
+            EventType::Dispatched,
         ]
     );
     let decided = &events[2].event;
