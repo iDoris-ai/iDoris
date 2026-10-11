@@ -1,16 +1,12 @@
-//! Parsing for oMLX's `GET /v1/models` (list) and `GET /api/status`
+//! Parsing for oMLX's `GET /v1/models/status` (list) and `GET /api/status`
 //! (status) responses — ported 1:1 from `packages/adapters/omlx/
 //! omlx-backend.ts`'s `list()`/`status()`/`parseLoaded`/`parseMemoryGb`/
 //! `parsePressure` (FU-16, 0.6.4 retest, 5 review rounds on `main`).
 //!
-//! `status()` is **strict/fail-closed**: a response that doesn't look
+//! Both catalog/status parsers are **strict/fail-closed**: a response that doesn't look
 //! exactly like what oMLX 0.6.4 is known to send is an error, never a
 //! silently-degraded default (a `[]` loaded list masking "we couldn't
 //! parse this" is exactly the class of bug FU-16 fixed on the TS side).
-//! `list()` is the one exception, matching the TS reference's own
-//! leniency there: a missing `data` field is treated as an empty catalog,
-//! not an error — that field genuinely comes back absent on some oMLX
-//! configurations and isn't itself a parse failure.
 
 use idoris_backend::{BackendError, BackendStatus, ModelInfo, Pressure};
 
@@ -33,22 +29,49 @@ fn describe_shape(value: &serde_json::Value) -> &'static str {
     }
 }
 
-/// `GET /v1/models` → every model this oMLX instance could route to,
-/// whether or not currently loaded. `/v1/models` reports no memory size,
-/// so `memory_gb` is always `0.0` (same placeholder the TS reference
-/// uses); a missing `data` field is an empty catalog, not an error
-/// (matches the TS reference's `body.data ?? []`).
-pub(super) fn parse_list(raw: &serde_json::Value) -> Vec<ModelInfo> {
-    raw.get("data")
-        .and_then(|v| v.as_array())
-        .into_iter()
-        .flatten()
-        .filter_map(|m| m.get("id").and_then(|id| id.as_str()))
-        .map(|id| ModelInfo {
+/// `GET /v1/models/status` → every discovered model plus oMLX's own
+/// pre-load `estimated_size` in bytes. Zero is preserved for virtual models;
+/// callers that intend to lifecycle-load an entry must reject zero before
+/// admission rather than inventing a footprint.
+pub(super) fn parse_list(raw: &serde_json::Value) -> Result<Vec<ModelInfo>, BackendError> {
+    let models = raw
+        .as_object()
+        .and_then(|body| body.get("models"))
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| {
+            upstream_error("oMLX GET /v1/models/status response is missing a models array")
+        })?;
+    let mut seen = std::collections::HashSet::with_capacity(models.len());
+    let mut parsed = Vec::with_capacity(models.len());
+    for (index, model) in models.iter().enumerate() {
+        let id = model
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| {
+                upstream_error(format!(
+                    "oMLX GET /v1/models/status models[{index}].id must be a non-empty string"
+                ))
+            })?;
+        if !seen.insert(id.to_string()) {
+            return Err(upstream_error(format!(
+                "oMLX GET /v1/models/status has duplicate model id {id:?}"
+            )));
+        }
+        let estimated_size = model
+            .get("estimated_size")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| {
+                upstream_error(format!(
+                    "oMLX GET /v1/models/status models[{index}].estimated_size must be a non-negative integer"
+                ))
+            })?;
+        parsed.push(ModelInfo {
             id: id.to_string(),
-            memory_gb: 0.0,
-        })
-        .collect()
+            memory_gb: estimated_size as f64 / BYTES_PER_GIB,
+        });
+    }
+    Ok(parsed)
 }
 
 /// `GET /api/status` → [`BackendStatus`]. Fail-closed at every step; see
@@ -167,27 +190,46 @@ mod tests {
     use super::*;
 
     #[test]
-    fn list_missing_data_is_an_empty_catalog_not_an_error() {
-        assert_eq!(parse_list(&json!({})), vec![]);
-    }
-
-    #[test]
-    fn list_filters_out_entries_without_a_string_id() {
-        let raw = json!({"data": [{"id": "a"}, {"id": 5}, {}, {"id": "b"}]});
-        let models = parse_list(&raw);
+    fn list_status_converts_exact_bytes_and_preserves_zero_virtual_models() {
+        let six_gib = 6_u64 * 1024 * 1024 * 1024;
+        let raw = json!({"models": [
+            {"id": "qwen", "estimated_size": six_gib},
+            {"id": "MarkItDown", "estimated_size": 0}
+        ]});
+        let models = parse_list(&raw).unwrap();
         assert_eq!(
             models,
             vec![
                 ModelInfo {
-                    id: "a".into(),
-                    memory_gb: 0.0
+                    id: "qwen".into(),
+                    memory_gb: 6.0
                 },
                 ModelInfo {
-                    id: "b".into(),
+                    id: "MarkItDown".into(),
                     memory_gb: 0.0
                 },
             ]
         );
+    }
+
+    #[test]
+    fn list_status_rejects_missing_malformed_duplicate_or_negative_sizes() {
+        for raw in [
+            json!({}),
+            json!({"models": {}}),
+            json!({"models": [{"id": 7, "estimated_size": 1}]}),
+            json!({"models": [{"id": "a"}]}),
+            json!({"models": [{"id": "a", "estimated_size": -1}]}),
+            json!({"models": [
+                {"id": "a", "estimated_size": 1},
+                {"id": "a", "estimated_size": 2}
+            ]}),
+        ] {
+            assert_eq!(
+                parse_list(&raw).unwrap_err().reason_code(),
+                "upstream_error"
+            );
+        }
     }
 
     #[test]
