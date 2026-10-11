@@ -218,3 +218,68 @@ async fn an_idempotent_replay_records_no_second_dispatch() {
         );
     }
 }
+
+async fn streamed_messages_chain(sse: &'static str) -> Vec<(EventType, Option<serde_json::Value>)> {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_raw(sse, "text/event-stream"),
+        )
+        .mount(&server)
+        .await;
+    let mut card = super::tests::resident_component_card("proto-card", &server.uri());
+    card.provider.capabilities = vec![Capability::Chat];
+    let log = Arc::new(EventLogStore::new(Connection::open_in_memory().unwrap()).unwrap());
+    let app = build_app(AppState {
+        cards: vec![card],
+        event_log: Some(log.clone()),
+        ..AppState::default()
+    });
+    let body = json!({"model": "m", "max_tokens": 8, "stream": true,
+                      "messages": [{"role": "user", "content": "hi"}]});
+    let response = app.oneshot(post("/v1/messages", &body, &[])).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let record = record_id(&response);
+    // Drain the stream; completion is recorded when it ends.
+    let _ = response.into_body().collect().await;
+    log.events_for_record(Some(budget::PERSONAL_TENANT_ID), &record)
+        .unwrap()
+        .into_iter()
+        .map(|e| (e.event.event_type, e.event.metadata.get("status").cloned()))
+        .collect()
+}
+
+#[tokio::test]
+async fn streamed_messages_complete_when_the_stream_ends() {
+    let chain = streamed_messages_chain(
+        "event: message_start\ndata: {\"type\":\"message_start\"}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+    )
+    .await;
+    let types: Vec<_> = chain.iter().map(|(t, _)| *t).collect();
+    assert_eq!(
+        types,
+        [
+            EventType::RequestReceived,
+            EventType::Inspected,
+            EventType::Profiled,
+            EventType::Decided,
+            EventType::Dispatched,
+            EventType::Completed,
+        ]
+    );
+    assert_eq!(chain[5].1, Some(json!("success")));
+}
+
+#[tokio::test]
+async fn a_stream_without_message_stop_completes_as_failure() {
+    let chain =
+        streamed_messages_chain("event: message_start\ndata: {\"type\":\"message_start\"}\n\n")
+            .await;
+    let completed = chain
+        .iter()
+        .find(|(t, _)| *t == EventType::Completed)
+        .unwrap();
+    assert_eq!(completed.1, Some(json!("failure")));
+}
