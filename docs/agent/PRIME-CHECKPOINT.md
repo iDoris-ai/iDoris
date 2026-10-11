@@ -41,6 +41,17 @@ Core product invariants:
 - Router/runtime/fallback/health/capacity designs should actively learn from mature open-source model routers/runtimes while preserving iDoris invariants.
 - Do not regress Rust safety improvements merely to mimic TS behavior; approved differences must be explicit and tested.
 
+## Live delta — 2026-10-11 night (newest; read first)
+
+- `origin/main = 792ed904dfbfda984fff81ea5dd930e12bfe6a30` (unchanged tonight; nothing merged).
+- M4 landing tail (#361 #362 #364–#367 #416–#418, #398 #408, #374) still waits for a current-head approval from someone other than the last pusher.
+- `integration/m4-landing-tail` merges all of them onto main without conflicts; the full final-main acceptance set is green on it (see `HANDOFF-2026-10-11-NIGHT.md`). Acceptance evidence gaps for claims 1/3/4 are closed in `test/m4-acceptance-gaps`.
+- M5 gate one is implemented as a stacked chain `feat/inspect-01-contract-freeze` → … → `feat/resilience-07-subscription-breaker` → review fixes → `fix/inspect-19-third-review` (stack top; see the handoff for every branch) (contract, pure L0 + rule packs, `/v1/inspect`, INSPECTED on chat and protocol endpoints, kill switch core, egress counter, evasion folding, one-layer decoding, REDACT engine, budget race acceptance test, three-grain breaker + proxy wiring + selection steering + Supervisor model lockout + subscription OAuth breaker). **No PRs opened yet**: `gh` auth is invalid on this Mac; bodies + opener in `/Volumes/UltraDisk/Dev2/iDoris/iDoris-wt/pr-queue/`.
+- Pushed as **clestons** over SSH (`~/.ssh/cleston-ed25519`), so another account can approve.
+- Owner decisions pending: redact-consent wire format; Admin v1 write surface (kill switch toggle, egress/breaker view); `/v1/inspect` request shape, kind list and wire-version bump; `credential_path` S2 vs S3; `provider_circuit_open` error type.
+- Three independent agent reviews ran tonight; their fail-open and false-positive findings are fixed with regression tests. Provider breakers are opt-in in the binary (`IDORIS_PROVIDER_BREAKER=1`) because on-by-default broke shared conformance.
+- Owner working rule (2026-10-11): when blocked on review, keep going by stacking new PRs on the open ones; the owner reviews later.
+
 ## Live delta — 2026-10-07 morning
 
 Live Git/GitHub has moved well beyond the 2026-10-06 snapshot below. Treat this
