@@ -94,26 +94,46 @@ pub(crate) struct Inspection {
     pub tightened: bool,
     /// The remote kill switch, not the content, is what pinned `any`.
     pub killed: bool,
+    /// Unreadable content, with no L0 finding, is what pinned `any`.
+    pub uninspectable: bool,
 }
 
 /// Inspects every object key, string and number in `body` — content parts,
-/// tool definitions and arguments included — joined by newlines so values
-/// never merge into one digit group. `declared` must already have passed the
-/// caller's key scope, so remote is allowed unless `kill_switch` is engaged.
+/// tool definitions and arguments included — one value per line. Lines are
+/// digit-group separators, so an identifier split across two parts or two
+/// lines is still found. `declared` must already have passed the caller's
+/// key scope, so remote is allowed unless `kill_switch` is engaged.
+///
+/// Content L0 cannot read (images, audio, files, `data:…;base64,` payloads,
+/// token-id arrays) is not provably clean (docs/15 §1.1b), so its presence
+/// alone pins the request to `local_only`.
 pub(crate) fn inspect_body(
     body: &serde_json::Value,
     declared: PrivacyClass,
     kill_switch: bool,
 ) -> Inspection {
-    fn collect(value: &serde_json::Value, out: &mut String) {
+    fn collect(value: &serde_json::Value, out: &mut String, opaque: &mut bool) {
         match value {
-            serde_json::Value::String(text) => push_line(out, text),
+            serde_json::Value::String(text) => {
+                *opaque |= is_data_url(text);
+                push_line(out, text);
+            }
             serde_json::Value::Number(number) => push_line(out, &number.to_string()),
-            serde_json::Value::Array(items) => items.iter().for_each(|item| collect(item, out)),
-            serde_json::Value::Object(map) => map.iter().for_each(|(key, item)| {
-                push_line(out, key);
-                collect(item, out);
-            }),
+            serde_json::Value::Array(items) => {
+                *opaque |= items.len() >= MIN_TOKEN_ARRAY
+                    && items.iter().all(|item| item.is_i64() || item.is_u64());
+                items.iter().for_each(|item| collect(item, out, opaque));
+            }
+            serde_json::Value::Object(map) => {
+                *opaque |= map
+                    .get("type")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|kind| OPAQUE_PART_TYPES.contains(&kind));
+                map.iter().for_each(|(key, item)| {
+                    push_line(out, key);
+                    collect(item, out, opaque);
+                });
+            }
             serde_json::Value::Bool(_) | serde_json::Value::Null => {}
         }
     }
@@ -121,8 +141,14 @@ pub(crate) fn inspect_body(
         out.push_str(text);
         out.push('\n');
     }
+    fn is_data_url(text: &str) -> bool {
+        text.get(..5)
+            .is_some_and(|scheme| scheme.eq_ignore_ascii_case("data:"))
+            && text.contains(";base64,")
+    }
     let mut text = String::new();
-    collect(body, &mut text);
+    let mut opaque = false;
+    collect(body, &mut text, &mut opaque);
     let ctx = InspectCtx {
         declared,
         remote_allowed: !kill_switch,
@@ -130,17 +156,34 @@ pub(crate) fn inspect_body(
         max_input_utf16: DEFAULT_MAX_INPUT_UTF16,
     };
     let response = inspect(&text, &ctx);
-    let tightening = (response.action != idoris_contracts::inspect::InspectAction::Allow)
+    let tightening = (opaque || response.action != idoris_contracts::inspect::InspectAction::Allow)
         .then_some(PrivacyClass::LocalOnly);
     let effective = idoris_policy::effective_privacy(declared, tightening);
     let tightened = declared == PrivacyClass::Any && effective == PrivacyClass::LocalOnly;
     Inspection {
         killed: tightened && kill_switch,
+        uninspectable: tightened && opaque && !kill_switch && response.findings.is_empty(),
         tightened,
         response,
         effective,
     }
 }
+
+/// Content-part types whose payload L0 cannot read (OpenAI chat/responses,
+/// Anthropic messages).
+const OPAQUE_PART_TYPES: &[&str] = &[
+    "image_url",
+    "input_image",
+    "image",
+    "input_audio",
+    "audio",
+    "file",
+    "input_file",
+    "document",
+];
+/// An all-integer array this long is treated as token ids (the embeddings
+/// API accepts them), which L0 cannot read.
+const MIN_TOKEN_ARRAY: usize = 8;
 
 /// Appends the `inspected` fact: sensitivity, effective privacy, the
 /// distinct finding kinds, and a reason only when content tightened the
@@ -172,6 +215,8 @@ pub(crate) async fn append_inspected(
     if inspection.tightened {
         let reason = if inspection.killed {
             "remote_kill_switch"
+        } else if inspection.uninspectable {
+            "uninspectable_content"
         } else {
             "privacy_tightened_by_content"
         };

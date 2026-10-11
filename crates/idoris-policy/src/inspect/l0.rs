@@ -50,39 +50,43 @@ pub(super) fn scan_plain(units: &[u16]) -> Vec<Hit> {
         let x_suffix = units
             .get(group_end)
             .is_some_and(|&u| u == u16::from(b'X') || u == u16::from(b'x'));
-        let joined: Vec<u8> = units[i..group_end]
-            .iter()
-            .filter(|&&u| is_digit(u))
-            .map(|&u| (u - u16::from(b'0')) as u8)
-            .collect();
-        classify(
-            &Candidate {
-                digits: &joined,
-                start: i,
-                end: group_end,
-                x_suffix,
-            },
-            &mut hits,
-        );
-        if joined.len() != group_end - i {
-            let mut offset = 0;
-            let mut seg_start = i;
-            while seg_start < group_end {
-                let mut seg_end = seg_start;
-                while seg_end < group_end && is_digit(units[seg_end]) {
-                    seg_end += 1;
+        let mut segments: Vec<(usize, usize)> = Vec::new();
+        let mut k = i;
+        while k < group_end {
+            if is_digit(units[k]) {
+                let seg_start = k;
+                while k < group_end && is_digit(units[k]) {
+                    k += 1;
                 }
-                let len = seg_end - seg_start;
-                let last = seg_end == group_end;
-                let candidate = Candidate {
-                    digits: &joined[offset..offset + len],
-                    start: seg_start,
-                    end: seg_end,
-                    x_suffix: last && x_suffix,
-                };
-                classify(&candidate, &mut hits);
-                offset += len;
-                seg_start = seg_end + 1;
+                segments.push((seg_start, k));
+            } else {
+                k += 1;
+            }
+        }
+        // Every run of neighbouring segments that can still be one entity:
+        // the whole group, each segment alone, and everything in between, so
+        // `110101 19900307 7379 138 1234 5678` yields both the id and the
+        // phone. Bounded by the longest entity, so linear in the group.
+        for a in 0..segments.len() {
+            let mut digits = Vec::new();
+            for (b, &(seg_start, seg_end)) in segments.iter().enumerate().skip(a) {
+                digits.extend(
+                    units[seg_start..seg_end]
+                        .iter()
+                        .map(|&u| (u - u16::from(b'0')) as u8),
+                );
+                if digits.len() > MAX_ENTITY_DIGITS {
+                    break;
+                }
+                classify(
+                    &Candidate {
+                        digits: &digits,
+                        start: segments[a].0,
+                        end: seg_end,
+                        x_suffix: x_suffix && b + 1 == segments.len(),
+                    },
+                    &mut hits,
+                );
             }
         }
         i = group_end;
@@ -102,22 +106,35 @@ fn is_digit(u: u16) -> bool {
     (u16::from(b'0')..=u16::from(b'9')).contains(&u)
 }
 
+/// Longest digit entity (a 19-digit card).
+const MAX_ENTITY_DIGITS: usize = 19;
+/// Separators tolerated between two digit runs of one group.
+const MAX_SEPARATOR_RUN: usize = 3;
+
+/// Space, hyphen, tab and line breaks: a number split across lines or text
+/// parts (the router joins body values with newlines) still forms a group.
 fn is_separator(u: u16) -> bool {
-    u == u16::from(b' ') || u == u16::from(b'-')
+    [b' ', b'-', b'\t', b'\n', b'\r']
+        .iter()
+        .any(|&c| u == u16::from(c))
 }
 
-/// 从 `start`（必须是数字）开始的数字组终点：分隔符只有在两侧都是数字时才算组内。
+/// 从 `start`（必须是数字）开始的数字组终点：最多 3 个分隔符，且两侧都是
+/// 数字时才算组内。
 fn group_end(units: &[u16], start: usize) -> usize {
     let mut j = start;
     loop {
         while j < units.len() && is_digit(units[j]) {
             j += 1;
         }
-        let joins = j + 1 < units.len() && is_separator(units[j]) && is_digit(units[j + 1]);
-        if !joins {
+        let mut k = j;
+        while k < units.len() && k - j < MAX_SEPARATOR_RUN && is_separator(units[k]) {
+            k += 1;
+        }
+        if k == j || k >= units.len() || !is_digit(units[k]) {
             return j;
         }
-        j += 1;
+        j = k;
     }
 }
 
