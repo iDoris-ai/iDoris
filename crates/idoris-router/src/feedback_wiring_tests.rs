@@ -145,10 +145,13 @@ async fn feedback_control_char_metadata_is_400_before_event_log() {
 
 #[tokio::test]
 async fn tenant_feedback_rejects_invalid_tenant_identifier_before_event_log() {
-    let app = build_app(AppState {
-        deploy_mode: idoris_contracts::DeployMode::Tenant,
-        ..AppState::default()
-    });
+    let app = tenant_test_app(
+        AppState {
+            deploy_mode: idoris_contracts::DeployMode::Tenant,
+            ..AppState::default()
+        },
+        "acme",
+    );
     let tenant = "t".repeat(129);
     let response = app
         .oneshot(feedback_request_with_tenant(
@@ -157,8 +160,8 @@ async fn tenant_feedback_rejects_invalid_tenant_identifier_before_event_log() {
         ))
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
     let bytes = response.into_body().collect().await.unwrap().to_bytes();
     let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(json["error"]["type"], "invalid_tenant_scope");
+    assert_eq!(json["error"]["type"], "policy_violation");
 }

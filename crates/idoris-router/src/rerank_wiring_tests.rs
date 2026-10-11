@@ -101,11 +101,14 @@ async fn rerank_fails_closed_before_upstream_for_wrong_capability_and_untrusted_
 #[tokio::test]
 async fn tenant_rerank_requires_tenant_before_upstream() {
     let server = MockServer::start().await;
-    let response = build_app(AppState {
-        deploy_mode: idoris_contracts::DeployMode::Tenant,
-        cards: vec![rerank_card("rerank-local", &server.uri())],
-        ..AppState::default()
-    })
+    let response = tenant_test_app(
+        AppState {
+            deploy_mode: idoris_contracts::DeployMode::Tenant,
+            cards: vec![rerank_card("rerank-local", &server.uri())],
+            ..AppState::default()
+        },
+        "acme",
+    )
     .oneshot(request(
         json!({"model":"rerank-model","query":"q","documents":["tenant data"]}),
         &[],

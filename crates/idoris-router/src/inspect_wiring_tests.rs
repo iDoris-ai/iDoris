@@ -124,10 +124,13 @@ async fn invalid_privacy_and_missing_tenant_are_profile_errors() {
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
 
-    let tenant_app = build_app(AppState {
-        deploy_mode: idoris_contracts::DeployMode::Tenant,
-        ..AppState::default()
-    });
+    let tenant_app = tenant_test_app(
+        AppState {
+            deploy_mode: idoris_contracts::DeployMode::Tenant,
+            ..AppState::default()
+        },
+        "acme",
+    );
     let (status, text) = send(&tenant_app, inspect_request(&body, &[])).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert!(text.contains("tenant_missing"), "{text}");

@@ -779,3 +779,65 @@ async fn bound_tenant_key_serves_only_its_tenant_and_records_the_authenticated_c
     );
     server.verify().await;
 }
+
+#[tokio::test]
+async fn tenant_library_without_authenticator_fails_closed_without_egress_or_audit() {
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(method("POST"))
+        .respond_with(wiremock::ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&server)
+        .await;
+    for dev_no_key_enabled in [false, true] {
+        let log = Arc::new(
+            idoris_tenancy::event_log::EventLogStore::new(Connection::open_in_memory().unwrap())
+                .unwrap(),
+        );
+        let records = Arc::new(Mutex::new(
+            idoris_tenancy::store::TenantStore::new(Connection::open_in_memory().unwrap()).unwrap(),
+        ));
+        let mut unconfigured = state(&server.uri(), None);
+        unconfigured.deploy_mode = idoris_contracts::DeployMode::Tenant;
+        unconfigured.dev_no_key_enabled = dev_no_key_enabled;
+        unconfigured.event_log = Some(log.clone());
+        unconfigured.record_store = Some(records.clone());
+        let app = build_app(unconfigured);
+        for token in [None, Some(bearer(&MintedVirtualKey::mint()))] {
+            let mut headers = vec![("x-idoris-tenant", "tenant-a".into())];
+            if let Some(token) = token {
+                headers.push(("authorization", token));
+            }
+            let response = app.clone().oneshot(chat_request(&headers)).await.unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            let record_id = response.headers()[HEADER_RECORD_ID].to_str().unwrap();
+            assert!(
+                log.events_for_record(Some("tenant-a"), record_id)
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(
+                records
+                    .lock()
+                    .unwrap()
+                    .list(Some("tenant-a"), None)
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(
+                json_body(response).await["error"]["reason_code"],
+                "VIRTUAL_KEY_UNAUTHORIZED"
+            );
+        }
+        let health = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(health.status(), StatusCode::OK);
+    }
+    server.verify().await;
+}

@@ -33,8 +33,10 @@ checks still prevent a bound tenant from querying a different tenant's path.
 
 Authenticate and enforce scope before `request.received`. Audit middleware
 uses the authenticated tenant marker, so denied tenant requests create no
-victim-tenant rows. Transport-free library tests may still inject an AppState
-without an authenticator; production startup always installs one.
+victim-tenant rows. Tenant library mode also refuses an absent authenticator. Authorized routing
+fixtures use fresh bound keys through a cfg(test)-only helper; authentication
+negative tests call build_app directly. Personal library fixtures retain legacy
+behavior. Production startup always installs an authenticator.
 
 Acceptance: legacy DB migration/reopen, bound-key issuance, correct-tenant
 execution, cross-tenant/unbound/anonymous/duplicate-header rejection, zero
