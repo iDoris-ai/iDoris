@@ -115,3 +115,51 @@ async fn selection_moves_to_a_healthy_candidate_once_a_breaker_opens() {
         .unwrap();
     assert_eq!(decided.event.metadata["provider_id"], "b-healthy");
 }
+
+#[tokio::test]
+async fn protocol_selection_also_moves_to_a_healthy_candidate() {
+    let failing = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(503).set_body_json(json!({"error": "busy"})))
+        .mount(&failing)
+        .await;
+    let healthy = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"object": "list", "data": []})),
+        )
+        .mount(&healthy)
+        .await;
+    let embedding = |id: &str, uri: &str| {
+        let mut card = resident_component_card(id, uri);
+        card.provider.capabilities = vec![idoris_contracts::common::Capability::Embedding];
+        card
+    };
+    let app = build_app(AppState {
+        cards: vec![
+            embedding("a-failing", &failing.uri()),
+            embedding("b-healthy", &healthy.uri()),
+        ],
+        ..AppState::default()
+    });
+    let mut statuses = Vec::new();
+    for _ in 0..3 {
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/embeddings")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"model":"embed","input":["hello"]}"#))
+            .unwrap();
+        statuses.push(app.clone().oneshot(request).await.unwrap().status());
+    }
+    assert_eq!(
+        statuses,
+        [
+            StatusCode::SERVICE_UNAVAILABLE,
+            StatusCode::SERVICE_UNAVAILABLE,
+            StatusCode::OK
+        ]
+    );
+    assert_eq!(failing.received_requests().await.unwrap().len(), 2);
+    assert_eq!(healthy.received_requests().await.unwrap().len(), 1);
+}
