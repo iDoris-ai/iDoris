@@ -123,6 +123,21 @@ impl GlobalCapacityLedger {
         self.compare_and_set(key, expected_gb, Some(observed_gb), false)
     }
 
+    /// Conservatively block further global growth when a runtime's startup
+    /// residency cannot be measured. Charging one full global budget is a
+    /// sentinel upper bound for admission, not a claim that this amount was
+    /// observed. It may put the ledger over budget when other runtimes already
+    /// have allocations; that is intentional because unknown residency must
+    /// never be interpreted as free capacity.
+    pub(crate) fn block_growth_for_unknown_residency(
+        &self,
+        key: &str,
+        expected_gb: Option<f64>,
+    ) -> Result<f64, BackendError> {
+        self.compare_and_set(key, expected_gb, Some(self.budget_gb), false)?;
+        Ok(self.budget_gb)
+    }
+
     fn compare_and_set(
         &self,
         key: &str,
