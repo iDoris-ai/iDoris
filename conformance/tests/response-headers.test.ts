@@ -38,8 +38,8 @@ describe("GET /health 服务身份", () => {
     expect(body.status).toBe("ok");
     expect(body.service).toBe("idoris");
     expect(typeof body.version).toBe("string");
-    // contract_version 是规范文档标注的值（当前 v1.0.1），不是随便一个字符串。
-    expect(body.contract_version).toBe("1.0.1");
+    // contract_version 是规范文档标注的值（当前 v1.1.0），不是随便一个字符串。
+    expect(body.contract_version).toBe("1.1.0");
     expect(typeof body.instance_id).toBe("string");
     expect((body.instance_id as string).length).toBeGreaterThan(0);
     expect(body.components).toBeGreaterThanOrEqual(1);
