@@ -63,11 +63,12 @@ async fn request_received_persists_server_record_and_validated_correlation() {
     let events = event_log
         .events_for_record(Some(budget::PERSONAL_TENANT_ID), &record_id)
         .unwrap();
-    assert_eq!(events.len(), 4);
+    assert_eq!(events.len(), 5);
     assert_eq!(events[0].event.event_type, EventType::RequestReceived);
     assert_eq!(events[1].event.event_type, EventType::Profiled);
     assert_eq!(events[2].event.event_type, EventType::Decided);
     assert_eq!(events[3].event.event_type, EventType::Dispatched);
+    assert_eq!(events[4].event.event_type, EventType::Completed);
     let event = &events[0].event;
     assert_eq!(event.tenant_id, budget::PERSONAL_TENANT_ID);
     assert_eq!(event.record_id, record_id);
