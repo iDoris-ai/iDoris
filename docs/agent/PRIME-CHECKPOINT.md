@@ -41,7 +41,40 @@ Core product invariants:
 - Router/runtime/fallback/health/capacity designs should actively learn from mature open-source model routers/runtimes while preserving iDoris invariants.
 - Do not regress Rust safety improvements merely to mimic TS behavior; approved differences must be explicit and tested.
 
-## Live delta — 2026-10-11 night (newest; read first)
+## Live delta — 2026-10-11 Codex takeover (newest; read first)
+
+- Goal mode is active; work continues on workstation B. Live main remains
+  `792ed904dfbfda984fff81ea5dd930e12bfe6a30`.
+- GitHub authentication is valid on this machine. All 40 queued PRs have been
+  created as **#422–#461**, preserving the queue's base/head pairs; #423 is
+  the draft M4 integration vehicle. No queued PR has been approved or merged.
+- #374's current review blocker is repaired at `2d1507616cfa67b15d3d705e5b6347a71d8391de`:
+  endpoint-valid bodies, eligible WireMock components, explicit zero-request
+  expectations and verification. Full feature-enabled Rust tests, strict
+  clippy, cargo deny and all TS gates passed locally (conformance 134/8).
+  Current-head independent approval and fresh CI are still required.
+- All open PRs currently lack APPROVED review status; do not bypass the
+  repository's last-push approval rule or mark M4 complete prematurely.
+- Owner decisions received in chat: accept `/v1/inspect` `{input: string}`
+  and UTF-16 spans; bump wire contract on endpoint publication. The new
+  version slice chooses additive minor **1.1.0**. REDACT consent and Admin v1
+  public write endpoints remain pending owner review; continue safety work.
+- Tenant virtual-key remediation is being split into <=300-line slices:
+  `feat/identity-keys-31-tenant-binding` (migration, issuance, legacy behavior),
+  then `feat/identity-keys-32-tenant-enforcement` (HTTP binding, trusted audit
+  scope, authentication before request.received). Cross-tenant/unbound/
+  anonymous/repeated-header negative cases and a legitimate tenant positive
+  control pass locally; full final-head checks are in progress.
+- The two historical macOS CI failures have distinct causes: run 38137840647
+  observed group reaping before descendants exited; run 38140879392 hit
+  EADDRINUSE during startup. Test-only fixture repairs are being validated on
+  `test/subscription-31-fixture-races`; no production workaround added.
+- Active worktrees live beside the main checkout under `/Users/jason/Dev/iDoris/`.
+  Cargo targets must be isolated when building differing worktree revisions;
+  a shared target reused stale workspace libraries during the first tenant
+  build. The tenant checks use `target-identity-night` and compile cleanly.
+
+## Live delta — 2026-10-11 Claude handoff (historical snapshot)
 
 Full handoff: `docs/agent/HANDOFF-2026-10-11-NIGHT.md` on branch `docs/handoff-2026-10-11-night` (`git fetch origin && git switch docs/handoff-2026-10-11-night`).
 

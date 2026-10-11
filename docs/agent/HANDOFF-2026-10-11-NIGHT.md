@@ -164,7 +164,17 @@ A fourth review found the third fix's DP correct and linear but measured a recal
 From M5-14 on, CI failed "Rust release conformance" and the subscription job's shared conformance on Linux and macOS: the shared suite expects persistent 5xx to pass through and later cases to reach the same upstream, but the new provider breaker opened after two failures. Fixed on `feat/resilience-02-proxy-breaker` by making breakers opt-in in the binary (decision 5 above), then merged forward (no rebase) through 03→07; Rust conformance re-run locally on the fixed branch and on the stack top: 134 passed / 8 todo.
 
 
-## Next (resume here)
+## Codex takeover — live update (2026-10-11 night)
+
+The historical snapshot below remains useful, but GitHub auth now works on
+workstation B and all 40 PRs are open as #422–#461. The latest resume anchor is
+`PRIME-CHECKPOINT.md` → "Codex takeover" on branch
+`docs/handoff-2026-10-11-codex`. #374's test-evidence blocker is repaired at
+`2d15076`; it still needs current-head independent approval. No M4 release
+has occurred. Owner accepted the inspect input/span design and a publication
+wire-version bump; REDACT consent and Admin v1 writes remain pending.
+
+## Next (historical resume instructions)
 
 Stack top: `fix/review-5-hardening`. CI was green through `feat/event-log-28-protocol-chain`; the results for `feat/event-log-29-protocol-dispatch`, `-30-messages-stream`, `feat/gate-two-01`, `-02` and `fix/review-5-hardening` were not visible at stop time (anonymous GitHub API rate limit) — check them first; all of them passed router lib + integration suites locally, and the router-touching ones passed Rust conformance locally except the de-correlation and review-5 slices, whose changed paths conformance does not exercise. **Nothing depends on the original Mac:** every branch below is on `origin`, and the PR bodies/opener are committed in `docs/agent/pr-queue-2026-10-11/`. (On that Mac, every worktree under `/Volumes/UltraDisk/Dev2/iDoris/iDoris-wt/` was clean and pushed at stop time.) `docs/handoff-2026-10-11-night` is this file.
 

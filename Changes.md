@@ -1,5 +1,14 @@
 # Changes
 
+## 2026-10-11 Codex 接手
+
+- 已核验 GitHub 登录；40 个队列 PR 已创建为 #422–#461，保留依赖 base。
+- #374 补齐可选上游与零出网证据，提交 `2d15076`；本地 Rust/TS 门禁通过，待独立批准。
+- 负责人确认 inspect 的 `{input: string}` / UTF-16 span；端点发布时升契约版本，REDACT 同意格式与 Admin v1 写端点继续待审。
+- 优先修 tenant virtual key 绑定，并将存储迁移与 HTTP enforcement 分开评审。
+- 补查历史 CI：两次 macOS 失败分别是进程组回收时序与临时端口冲突。
+- M4 仍待尾栈批准、合并及真实 main 验收；未打 `v0.3.0`。
+
 ## 2026-10-11 夜间（M4 集成 + M5 闸一）
 
 - M4 尾巴集成并跑验收
