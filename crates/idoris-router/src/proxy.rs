@@ -327,16 +327,34 @@ fn decorrelate(payload: &Value) -> Value {
         for field in IDENTITY_FIELDS {
             object.remove(*field);
         }
+        // OpenAI chat `messages[].name` names a participant, usually a person.
+        if let Some(Value::Array(messages)) = object.get_mut("messages") {
+            for message in messages.iter_mut().filter_map(Value::as_object_mut) {
+                message.remove("name");
+            }
+        }
     }
     stripped
 }
 
 /// The connection grain of the breaker book: one key per scheme/host/port,
 /// distinct from every provider id.
-fn connection_key(url: &str) -> Option<String> {
+fn connection_key(url: &str) -> Option<BreakerKey> {
     reqwest::Url::parse(url)
         .ok()
-        .map(|parsed| format!("connection:{}", parsed.origin().ascii_serialization()))
+        .map(|parsed| BreakerKey::Connection(parsed.origin().ascii_serialization()))
+}
+
+/// Provider ids are arbitrary strings, so the two grains live in separate
+/// variants rather than a shared string namespace.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum BreakerKey {
+    Provider(String),
+    Connection(String),
+}
+
+fn provider_key(provider_id: &str) -> BreakerKey {
+    BreakerKey::Provider(provider_id.to_string())
 }
 
 /// The proxy only fronts `http_service` cards: loopback ones are local
@@ -377,7 +395,7 @@ pub struct ChatProxy {
     pub(crate) client: reqwest::Client,
     egress: Arc<EgressCounter>,
     /// M5-14 provider-grain circuit breakers, keyed by provider id.
-    breakers: Mutex<idoris_policy::breaker::BreakerBook<String>>,
+    breakers: Mutex<idoris_policy::breaker::BreakerBook<BreakerKey>>,
     /// On for a library-constructed proxy. The `idoris` binary turns it off
     /// unless `IDORIS_PROVIDER_BREAKER=1`: the shared conformance contract
     /// still says persistent 5xx is passed through verbatim, so enabling
@@ -424,7 +442,7 @@ impl ChatProxy {
         cards
             .into_iter()
             .filter(|card| {
-                !book.would_admit(&card.provider.id, now_ms)
+                !book.would_admit(&provider_key(&card.provider.id), now_ms)
                     || connection_key(&card.endpoint)
                         .is_some_and(|conn| !book.would_admit(&conn, now_ms))
             })
@@ -449,7 +467,7 @@ impl ChatProxy {
         let Ok(mut book) = self.breakers.lock() else {
             return;
         };
-        let key = provider_id.to_string();
+        let key = provider_key(provider_id);
         if failed {
             book.on_failure(&key, class, wall_clock_ms());
         } else {
@@ -475,13 +493,18 @@ impl ChatProxy {
         let Ok(mut book) = self.breakers.lock() else {
             return false;
         };
-        let now_ms = wall_clock_ms();
-        // Connection cooldown first, read-only, so a cooling host never
-        // claims a provider's half-open probe.
-        if connection_key(url).is_some_and(|conn| !book.would_admit(&conn, now_ms)) {
+        let (now_ms, class) = (wall_clock_ms(), credential_class(url));
+        // A connection that was ever told to Retry-After gates first: while
+        // cooling it refuses, and once its window ends exactly one send
+        // probes it (the rest wait for that probe's answer), so a backlog
+        // does not hit the host all at once.
+        if let Some(conn) = connection_key(url)
+            && book.contains(&conn)
+            && !book.admit(&conn, class, now_ms).admitted()
+        {
             return false;
         }
-        book.admit(&provider_id.to_string(), credential_class(url), now_ms)
+        book.admit(&provider_key(provider_id), class, now_ms)
             .admitted()
     }
 
@@ -502,22 +525,27 @@ impl ChatProxy {
             return;
         };
         let (key, class, now_ms) = (
-            provider_id.to_string(),
+            provider_key(provider_id),
             credential_class(url),
             wall_clock_ms(),
         );
+        let conn = connection_key(url);
         if status == 408 || status == 429 || (500..600).contains(&status) {
             book.on_failure(&key, class, now_ms);
             // Retry-After describes the server, not one provider card: cool
             // the whole connection (every card on this scheme/host/port).
             if let (Some(ms), Some(conn)) = (
                 retry_after_ms.filter(|_| status == 429 || status == 503),
-                connection_key(url),
+                conn.as_ref(),
             ) {
-                book.on_retry_after(&conn, class, now_ms, ms);
+                book.on_retry_after(conn, class, now_ms, ms);
             }
         } else {
             book.on_success(&key, class);
+            // A good answer closes a connection that had been cooling.
+            if let Some(conn) = conn.filter(|conn| book.contains(conn)) {
+                book.on_success(&conn, class);
+            }
         }
     }
 
@@ -1905,6 +1933,79 @@ mod tests {
         assert_eq!(send(other_host.uri(), "card-c").await, 200);
     }
 
+    #[test]
+    fn provider_ids_cannot_collide_with_connection_keys() {
+        let proxy = ChatProxy::new(reqwest::Client::new());
+        let mut colliding =
+            idoris_contracts::ComponentCard::clone(&crate::tests::sample_component_card("x"));
+        colliding.provider.id = "connection:http://127.0.0.1:8740".into();
+        colliding.endpoint = "http://127.0.0.1:8740".into();
+        let mut innocent = crate::tests::sample_component_card("innocent");
+        innocent.endpoint = "http://127.0.0.1:8740".into();
+        for _ in 0..3 {
+            proxy.report_outcome(
+                &colliding.provider.id,
+                idoris_policy::breaker::CredentialClass::Local,
+                Some(true),
+            );
+        }
+        let open = proxy.open_providers([&colliding, &innocent]);
+        assert!(open.contains(&colliding.provider.id));
+        assert!(!open.contains("innocent"), "{open:?}");
+        assert!(proxy.admit_provider("innocent", "http://127.0.0.1:8740/v1/chat/completions"));
+    }
+
+    #[tokio::test]
+    async fn an_expired_connection_cooldown_admits_one_probe_at_a_time() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(429)
+                    .insert_header("retry-after", "1")
+                    .set_body_json(serde_json::json!({})),
+            )
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_delay(Duration::from_millis(300))
+                    .set_body_json(serde_json::json!({})),
+            )
+            .with_priority(2)
+            .mount(&server)
+            .await;
+        let proxy = ChatProxy::new(reqwest::Client::new());
+        let send = |provider: &'static str| {
+            let proxy = &proxy;
+            let uri = server.uri();
+            async move {
+                proxy
+                    .forward_buffered(
+                        &uri,
+                        &chat_body(),
+                        &ForwardOpts {
+                            provider_id: provider,
+                            ..opts(None, "rec-probe")
+                        },
+                    )
+                    .await
+                    .status
+            }
+        };
+        assert_eq!(send("card-a").await, 429);
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        let (first, second) = tokio::join!(send("card-a"), send("card-b"));
+        let mut statuses = [first, second];
+        statuses.sort_unstable();
+        assert_eq!(statuses, [200, 503], "one probe, the other waits");
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+        // The probe's success closed the connection for everyone.
+        assert_eq!(send("card-b").await, 200);
+    }
+
     #[tokio::test]
     async fn answers_that_are_not_provider_failures_keep_it_closed() {
         let server = upstream_sequence(&[
@@ -1967,6 +2068,10 @@ mod tests {
             "prompt_cache_key": "tenant-acme",
             "metadata": {"user_id": "alice"}
         });
+        let mut named = body.clone();
+        named["messages"][0]["name"] = serde_json::json!("alice");
+        assert!(decorrelate(&named)["messages"][0].get("name").is_none());
+        assert_eq!(decorrelate(&named)["messages"][0]["content"], "hi");
 
         // Loopback: forwarded byte for byte, identity fields included.
         let _ = proxy

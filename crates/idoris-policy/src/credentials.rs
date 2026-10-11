@@ -76,6 +76,20 @@ pub enum HeaderScheme {
 
 /// One allowed use of one secret: exact HTTPS host, methods, path prefix,
 /// and the header the value goes into.
+/// Caller headers that carry a credential or pick whose account is billed;
+/// all of them are dropped before injection, whichever header the grant
+/// writes, so a caller cannot ride along a second credential or org.
+const CREDENTIAL_HEADERS: &[&str] = &[
+    "authorization",
+    "proxy-authorization",
+    "x-api-key",
+    "api-key",
+    "x-goog-api-key",
+    "openai-organization",
+    "openai-project",
+    "cookie",
+];
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Grant {
     pub secret: SecretRef,
@@ -84,6 +98,23 @@ pub struct Grant {
     pub path_prefix: String,
     pub header: String,
     pub scheme: HeaderScheme,
+}
+
+impl Grant {
+    /// A grant that could never be applied safely is ignored (fail closed):
+    /// an empty or relative path prefix would allow every path, and a header
+    /// name outside RFC 9110 token characters could not match what the
+    /// caller sent.
+    fn is_valid(&self) -> bool {
+        !self.host.is_empty()
+            && self.path_prefix.starts_with('/')
+            && !self.methods.is_empty()
+            && !self.header.is_empty()
+            && self
+                .header
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
+    }
 }
 
 /// What a caller asks the broker to do; carries no value.
@@ -129,7 +160,8 @@ pub fn authorize<'g>(
     grants
         .iter()
         .find(|grant| {
-            grant.secret == *request.secret
+            grant.is_valid()
+                && grant.secret == *request.secret
                 && grant.host == host
                 && grant
                     .methods
@@ -149,6 +181,10 @@ pub fn broker(
 ) -> Result<AuditRecord, CredentialError> {
     let grant = authorize(grants, request)?;
     let secret = source.reveal(&grant.secret)?;
+    // A value with control characters would split or forge headers.
+    if secret.0.is_empty() || secret.0.bytes().any(|b| b.is_ascii_control()) {
+        return Err(CredentialError::Unavailable);
+    }
     let value = match grant.scheme {
         HeaderScheme::Bearer => format!("Bearer {}", secret.0),
         HeaderScheme::Raw => secret.0,
@@ -163,10 +199,17 @@ pub fn broker(
     })
 }
 
-/// C-1: every caller-supplied header with this name (any case, any count)
-/// is removed before the injected one is added.
+/// C-1: every caller-supplied header with this name, and every other
+/// credential or billing header, is removed (any case, any count) before
+/// the injected one is added.
 pub fn inject(headers: &mut Vec<(String, String)>, name: &str, value: String) {
-    headers.retain(|(existing, _)| !existing.eq_ignore_ascii_case(name));
+    headers.retain(|(existing, _)| {
+        let existing = existing.trim();
+        !existing.eq_ignore_ascii_case(name)
+            && !CREDENTIAL_HEADERS
+                .iter()
+                .any(|credential| existing.eq_ignore_ascii_case(credential))
+    });
     headers.push((name.to_string(), value));
 }
 
@@ -182,11 +225,12 @@ fn destination(raw: &str) -> Result<(String, String), CredentialError> {
         None => host.to_string(),
     };
     // The URL parser already resolved `.`/`..` segments; encoded dots,
-    // slashes or backslashes inside a segment survive it but some upstreams
-    // decode them into a traversal, so refuse them outright.
+    // slashes or backslashes, double encoding (`%25…`) and `;` path
+    // parameters (`..;/` on Tomcat/Spring) survive it but some upstreams turn
+    // them into a traversal, so refuse them outright.
     let path = url.path().to_string();
     let lower = path.to_ascii_lowercase();
-    if ["%2e", "%2f", "%5c"]
+    if ["%2e", "%2f", "%5c", "%25", ";"]
         .iter()
         .any(|encoded| lower.contains(encoded))
     {
@@ -363,6 +407,108 @@ mod tests {
             }
         );
         assert!(!format!("{audit:?}").contains("sk-real-value"));
+    }
+
+    #[test]
+    fn review_five_bypasses_are_closed() {
+        let source = CountingSource {
+            reveals: Cell::new(0),
+        };
+        let secret = openai();
+        for url in [
+            "https://api.openai.com/v1/chat/..;/files",
+            "https://api.openai.com/v1/chat/%252e%252e/files",
+        ] {
+            let mut headers = Vec::new();
+            assert!(
+                broker(
+                    &grants(),
+                    &source,
+                    &request(&secret, url, "POST"),
+                    &mut headers
+                )
+                .is_err(),
+                "{url}"
+            );
+        }
+        // Grants that could not be applied safely are ignored.
+        let mut empty_prefix = grants();
+        empty_prefix[0].path_prefix = String::new();
+        let mut spaced_header = grants();
+        spaced_header[0].header = "Authorization ".into();
+        for bad in [empty_prefix, spaced_header] {
+            assert_eq!(
+                authorize(
+                    &bad,
+                    &request(
+                        &secret,
+                        "https://api.openai.com/v1/chat/completions",
+                        "POST"
+                    )
+                ),
+                Err(CredentialError::NotGranted)
+            );
+        }
+        assert_eq!(source.reveals.get(), 0);
+
+        // Every caller credential or billing header goes, not only the grant's.
+        let raw_key = vec![Grant {
+            header: "x-api-key".into(),
+            scheme: HeaderScheme::Raw,
+            ..grants().remove(0)
+        }];
+        let mut headers = vec![
+            ("Authorization".to_string(), "Bearer attacker".to_string()),
+            (
+                "OpenAI-Organization".to_string(),
+                "org-attacker".to_string(),
+            ),
+            ("accept".to_string(), "application/json".to_string()),
+        ];
+        broker(
+            &raw_key,
+            &source,
+            &request(
+                &secret,
+                "https://api.openai.com/v1/chat/completions",
+                "POST",
+            ),
+            &mut headers,
+        )
+        .unwrap();
+        assert_eq!(
+            headers,
+            vec![
+                ("accept".to_string(), "application/json".to_string()),
+                ("x-api-key".to_string(), "sk-real-value".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn values_with_control_characters_are_refused() {
+        struct Forged;
+        impl SecretSource for Forged {
+            fn reveal(&self, _secret: &SecretRef) -> Result<Secret, CredentialError> {
+                Ok(Secret::new("sk\r\nX-Evil: 1".to_string()))
+            }
+        }
+        let secret = openai();
+        let mut headers = Vec::new();
+        assert_eq!(
+            broker(
+                &grants(),
+                &Forged,
+                &request(
+                    &secret,
+                    "https://api.openai.com/v1/chat/completions",
+                    "POST"
+                ),
+                &mut headers
+            ),
+            Err(CredentialError::Unavailable)
+        );
+        assert!(headers.is_empty());
     }
 
     #[test]

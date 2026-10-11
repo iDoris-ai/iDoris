@@ -347,3 +347,20 @@ async fn unreadable_content_is_not_reported_as_content_tightening_in_decided() {
         "{codes:?}"
     );
 }
+
+#[tokio::test]
+async fn an_embedded_data_url_in_text_is_recorded_as_uninspectable() {
+    let (upstream, state, event_log) = any_only_upstream().await;
+    let (status, record_id, _) = chat(
+        state,
+        json!({"model": "idoris/daily", "messages": [{"role": "user",
+            "content": "look ![x](data:image/png;base64,iVBORw0KGgo=)"}]}),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::SERVICE_UNAVAILABLE);
+    assert!(upstream.received_requests().await.unwrap().is_empty());
+    let events = event_log
+        .events_for_record(Some(budget::PERSONAL_TENANT_ID), &record_id)
+        .unwrap();
+    assert_eq!(events[1].event.metadata["reason"], "uninspectable_content");
+}
