@@ -9,6 +9,8 @@ use super::{VirtualKeyHash, VirtualKeySecret};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VirtualKeyScope {
+    #[serde(default)]
+    pub tenant_id: Option<String>,
     pub owner: String,
     pub allowed_privacy: Vec<PrivacyClass>,
     pub allowed_roles: Vec<String>,
@@ -59,8 +61,8 @@ impl VirtualKeyStore {
         self.conn.execute(
             "INSERT INTO virtual_keys (
                 key_id, key_hash, owner, allowed_privacy, allowed_roles,
-                budget_ref, expires_at_ms, admin_scopes, status, revoked_at_ms
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'active', NULL)",
+                budget_ref, expires_at_ms, admin_scopes, tenant_id, status, revoked_at_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'active', NULL)",
             rusqlite::params![
                 key_id,
                 &hash.0[..],
@@ -70,6 +72,7 @@ impl VirtualKeyStore {
                 scope.budget_ref.as_deref(),
                 scope.expires_at_ms,
                 serde_json::to_string(&scope.admin_scopes)?,
+                scope.tenant_id.as_deref(),
             ],
         )?;
         Ok(())
@@ -90,7 +93,7 @@ impl VirtualKeyStore {
             .conn
             .query_row(
                 "SELECT key_id, owner, allowed_privacy, allowed_roles, budget_ref,
-                            expires_at_ms, admin_scopes
+                            expires_at_ms, admin_scopes, tenant_id
                      FROM virtual_keys
                      WHERE key_hash = ?1
                        AND status = 'active'
@@ -105,6 +108,7 @@ impl VirtualKeyStore {
                         row.get(4)?,
                         row.get(5)?,
                         row.get(6)?,
+                        row.get(7)?,
                     ))
                 },
             )
@@ -154,12 +158,14 @@ type RawVirtualKey = (
     Option<String>,
     Option<i64>,
     String,
+    Option<String>,
 );
 
 fn raw_to_identity(row: RawVirtualKey) -> Result<AuthenticatedVirtualKey, VirtualKeyStoreError> {
     Ok(AuthenticatedVirtualKey {
         key_id: row.0,
         scope: VirtualKeyScope {
+            tenant_id: row.7,
             owner: row.1,
             allowed_privacy: serde_json::from_str(&row.2)?,
             allowed_roles: serde_json::from_str(&row.3)?,
@@ -173,6 +179,12 @@ fn raw_to_identity(row: RawVirtualKey) -> Result<AuthenticatedVirtualKey, Virtua
 fn validate_metadata(key_id: &str, scope: &VirtualKeyScope) -> Result<(), VirtualKeyStoreError> {
     if key_id.trim().is_empty()
         || scope.owner.trim().is_empty()
+        || scope.tenant_id.as_deref().is_some_and(|value| {
+            value.is_empty()
+                || value.trim() != value
+                || value.encode_utf16().count() > 128
+                || value.chars().any(char::is_control)
+        })
         || scope.allowed_privacy.is_empty()
         || scope
             .allowed_roles
@@ -211,6 +223,20 @@ pub fn initialize_virtual_key_schema(conn: &mut Connection) -> rusqlite::Result<
             [],
         )?;
     }
+    let bound: Option<i64> = tx
+        .query_row(
+            "SELECT version FROM virtual_key_schema_migrations WHERE version = 2",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if bound.is_none() {
+        tx.execute_batch(include_str!("store/0002_tenant_binding.sql"))?;
+        tx.execute(
+            "INSERT INTO virtual_key_schema_migrations (version) VALUES (2)",
+            [],
+        )?;
+    }
     tx.commit()
 }
 
@@ -223,6 +249,7 @@ mod tests {
 
     fn scope(expires_at_ms: Option<i64>) -> VirtualKeyScope {
         VirtualKeyScope {
+            tenant_id: None,
             owner: "agent24-instance".into(),
             allowed_privacy: vec![PrivacyClass::LocalOnly],
             allowed_roles: vec!["fast".into(), "daily".into()],
@@ -333,5 +360,58 @@ mod tests {
             Err(VirtualKeyStoreError::InvalidMetadata)
         ));
         assert!(store.authenticate(&minted.secret, 1).unwrap().is_none());
+    }
+
+    #[test]
+    fn tenant_binding_survives_reopen_and_legacy_rows_remain_unbound() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(include_str!("store/0001_virtual_keys.sql"))
+            .unwrap();
+        conn.execute_batch(
+            "CREATE TABLE virtual_key_schema_migrations (version INTEGER PRIMARY KEY);
+             INSERT INTO virtual_key_schema_migrations VALUES (1);",
+        )
+        .unwrap();
+        let legacy = MintedVirtualKey::mint();
+        conn.execute(
+            "INSERT INTO virtual_keys
+             (key_id, key_hash, owner, allowed_privacy, allowed_roles, admin_scopes, status)
+             VALUES (?1, ?2, 'legacy', '[\"local_only\"]', '[\"fast\"]', '[]', 'active')",
+            rusqlite::params![legacy.key_id, &legacy.hash.0[..]],
+        )
+        .unwrap();
+        initialize_virtual_key_schema(&mut conn).unwrap();
+        initialize_virtual_key_schema(&mut conn).unwrap();
+        let store = VirtualKeyStore::new(conn).unwrap();
+        let old = store.authenticate(&legacy.secret, 1).unwrap().unwrap();
+        assert_eq!(old.scope.tenant_id, None);
+        let key = MintedVirtualKey::mint();
+        let mut bound = scope(None);
+        bound.tenant_id = Some("tenant-a".into());
+        store.insert_active(&key.key_id, key.hash, &bound).unwrap();
+        let reopened = VirtualKeyStore::new(store.conn).unwrap();
+        let identity = reopened.authenticate(&key.secret, 1).unwrap().unwrap();
+        assert_eq!(identity.scope.tenant_id.as_deref(), Some("tenant-a"));
+        assert_eq!(reopened.authenticate(&legacy.secret, 1).unwrap(), Some(old));
+    }
+
+    #[test]
+    fn tenant_binding_rejects_unusable_identifiers_without_activating_key() {
+        let store = VirtualKeyStore::new(Connection::open_in_memory().unwrap()).unwrap();
+        for tenant in [
+            "".into(),
+            " tenant".into(),
+            "tenant\n".into(),
+            "x".repeat(129),
+        ] {
+            let key = MintedVirtualKey::mint();
+            let mut bound = scope(None);
+            bound.tenant_id = Some(tenant);
+            assert!(matches!(
+                store.insert_active(&key.key_id, key.hash, &bound),
+                Err(VirtualKeyStoreError::InvalidMetadata)
+            ));
+            assert!(store.authenticate(&key.secret, 1).unwrap().is_none());
+        }
     }
 }

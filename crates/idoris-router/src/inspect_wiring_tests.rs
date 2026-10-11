@@ -145,6 +145,7 @@ fn authenticated_app(allowed_privacy: Vec<PrivacyClass>, roles: &[&str]) -> (Rou
         VirtualKeyStore::new(Connection::open_in_memory().unwrap()).unwrap(),
     ));
     let scope = VirtualKeyScope {
+        tenant_id: None,
         owner: "agent24-instance".into(),
         allowed_privacy,
         allowed_roles: roles.iter().map(|role| (*role).to_string()).collect(),

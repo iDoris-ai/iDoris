@@ -1,0 +1,39 @@
+# M5 tenant virtual-key boundary
+
+Tenant authority comes from a server-stored virtual-key binding. `owner`,
+`budget_ref`, request metadata and an unauthenticated tenant header confer no
+tenant authority. This is a safety repair, independent of Admin v1 writes.
+
+## Storage and issuance
+
+Migration 0002 adds nullable `virtual_keys.tenant_id` transactionally. Existing
+keys stay unbound; never infer a binding from an owner or request. Missing
+`tenant_id` in older serialized scopes deserializes as `None`. Personal mode
+continues accepting unbound keys. Tenant mode requires an explicitly bound key.
+
+Use local issuance with the tenant administrator's chosen identifier:
+
+```sh
+printf '%s\n' '{"owner":"agent24","tenant_id":"acme","allowed_privacy":["local_only"],"allowed_roles":["fast"]}' | idoris key issue --spec-stdin
+```
+
+The plaintext key is returned once; SQLite persists only its verifier. Tenant
+identifiers must be nonempty, unpadded, control-free and at most 128 UTF-16 units.
+
+## HTTP enforcement (next slice)
+
+The shipped binary installs the authenticator on all data-plane endpoints.
+Except `/health`, tenant requests need a valid bearer and exactly one tenant
+header equal to the stored binding. Unbound/mismatched keys receive generic
+403 `VIRTUAL_KEY_TENANT_FORBIDDEN`; invalid/missing bearers receive generic 401.
+DEV_NO_KEY does not bypass tenant authentication. Existing tenant URL/header
+checks still prevent a bound tenant from querying a different tenant's path.
+
+Authenticate and enforce scope before `request.received`. Audit middleware
+uses the authenticated tenant marker, so denied tenant requests create no
+victim-tenant rows. Transport-free library tests may still inject an AppState
+without an authenticator; production startup always installs one.
+
+Acceptance: legacy DB migration/reopen, bound-key issuance, correct-tenant
+execution, cross-tenant/unbound/anonymous/duplicate-header rejection, zero
+upstream calls and zero victim-tenant Event Log/legacy audit rows.
