@@ -147,6 +147,7 @@ start_traced_router() {
   IDORIS_ROUTING_POLICY="$policy" \
   IDORIS_DB_PATH="$db" \
   IDORIS_PORT="$port" \
+  IDORIS_DEV_NO_KEY=1 \
   setsid strace -f -s 256 -e trace=connect -o "$trace" "$bin" serve >"$log" 2>&1 &
   groups+=("$!")
   wait_health "$port" "$log"
