@@ -71,6 +71,45 @@ impl InspectCtx {
     }
 }
 
+/// Compare a known credential after the same escape normalization used by L0.
+pub(crate) fn contains_credential(input: &str, credential: &str) -> bool {
+    let input = decode_json_unicode_escapes(&input.encode_utf16().collect::<Vec<_>>());
+    let input = normalize::normalize(&input);
+    let credential = normalize::normalize(&credential.encode_utf16().collect::<Vec<_>>());
+    credential.units.is_empty()
+        || input
+            .units
+            .windows(credential.units.len())
+            .any(|part| part == credential.units)
+}
+
+/// A literal `\uXXXX` in JSON/JS source stands for that unit, so it can join a credential.
+fn decode_json_unicode_escapes(units: &[u16]) -> Vec<u16> {
+    let mut out = Vec::with_capacity(units.len());
+    let mut index = 0;
+    while index < units.len() {
+        if let Some(escaped) = json_unicode_escape(&units[index..]) {
+            out.push(escaped);
+            index += 6;
+        } else {
+            out.push(units[index]);
+            index += 1;
+        }
+    }
+    out
+}
+
+fn json_unicode_escape(units: &[u16]) -> Option<u16> {
+    let window = units.get(..6)?;
+    if window[0] != u16::from(b'\\') || window[1] != u16::from(b'u') {
+        return None;
+    }
+    window[2..].iter().try_fold(0u16, |acc, &unit| {
+        let digit = char::from_u32(u32::from(unit))?.to_digit(16)?;
+        Some(acc << 4 | u16::try_from(digit).ok()?)
+    })
+}
+
 /// L0 的一条命中：类别、UTF-16 位置、这条命中自身的敏感度。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Hit {
