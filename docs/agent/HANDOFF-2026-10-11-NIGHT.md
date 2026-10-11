@@ -51,7 +51,7 @@ So nothing was merged and nothing was approved. Every branch below is pushed and
 | 28 | `docs/m5-gate-one-runtime` | `fix/inspect-17-window-segment-floor` @ `22b5096b` | fix(policy): stop joining short digit runs into one entity |
 | 29 | `fix/inspect-17-window-segment-floor` | `fix/inspect-18-second-review` @ `50caf46a` | fix(inspect): address second review of the M5 hardening |
 | 30 | `fix/inspect-18-second-review` | `fix/inspect-19-third-review` @ `aced94db` | fix(inspect): judge digit groups whole or fully decomposed |
-| 31 | `fix/inspect-19-third-review` | `fix/inspect-20-grouping-recall` @ `7c6cee42` | fix(inspect): recover grouped entities next to short numbers |
+| 31 | `fix/inspect-19-third-review` | `fix/inspect-20-grouping-recall` @ `b498db6a` | fix(inspect): recover grouped entities next to short numbers |
 
 Rules for landing (same as PRIME-CHECKPOINT "Safe stacked merge procedure"): merge parent first; before a parent branch is deleted, retarget its child to `main`; no rebase, no force-push; never treat a stale approval as current.
 
@@ -122,7 +122,7 @@ A narrow third review of the second fix measured a recall regression (one canoni
 
 ## Fourth independent review — final digit-group rule
 
-A fourth review found the third fix's DP correct and linear but measured a recall regression (card + expiry/CVV in one group, a phone after a time, two phones + a digit — all missed) and 1.8% false positives on rows of small integers. `fix/inspect-20-grouping-recall` (stack top) settles it: multi-run windows must be a real written form (mobile 3-4-4 / 3-8 / 7-4 / 4-3-4 + 86 variants; id 6-8-4 / 6-12 / 6-4-4-4; card 4-4-4-4[-1..3] / 6-13), and a group is one decomposition into such entities with at most two ≤ 3-digit numbers at each end. Measured on 5000 random rows each: small-integer rows 0%, 5–6 four-digit numbers 0%, 8 four-digit numbers 0.26%; remaining false positives are groups written exactly like a phone (3-4-4) or card (4-4-4-4 + issuer prefix + Luhn), as since M5-02. **Owner trade-offs:** 4-digit neighbours (`Room 1203 138 1234 5678`, an id followed by a year) and ids split across lines/parts are not found; allowing 4-digit neighbours flagged ~10% of 5-number rows.
+A fourth review found the third fix's DP correct and linear but measured a recall regression (card + expiry/CVV in one group, a phone after a time, two phones + a digit — all missed) and 1.8% false positives on rows of small integers. `fix/inspect-20-grouping-recall` (stack top) settles it: multi-run windows must be a real written form (mobile 3-4-4 / 3-8 / 7-4 / 4-3-4 + 86 variants; id 6-8-4 / 6-12 / 6-4-4-4; card 4-4-4-4[-1..3] / 6-13), and a group is one decomposition into such entities with at most two ≤ 3-digit numbers at each end. Measured on 5000 random rows each: small-integer rows 0%, 5–6 four-digit numbers 0%, 8 four-digit numbers 0.26%; remaining false positives are groups written exactly like a phone (3-4-4) or card (4-4-4-4 + issuer prefix + Luhn), as since M5-02. A final timeboxed check (400k fuzzed groups) found no crash and no entity-free decomposition; its one realistic miss, the `0086` prefix, is fixed on the same branch. **Owner trade-offs:** 4-digit neighbours (`Room 1203 138 1234 5678`, an id followed by a year) and ids split across lines/parts are not found; allowing 4-digit neighbours flagged ~10% of 5-number rows.
 
 ## CI caught a real regression tonight
 
