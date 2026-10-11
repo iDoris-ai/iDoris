@@ -108,6 +108,25 @@ fn run_production_startup(
     card_yaml: &str,
     env: &[(&str, &str)],
 ) -> (bool, std::process::Output, bool) {
+    for attempt in 0..3 {
+        let result = run_production_startup_once(card_yaml, env);
+        let stderr = String::from_utf8_lossy(&result.1.stderr);
+        if result.0
+            || attempt == 2
+            || !stderr.contains("无法绑定")
+            || !stderr.contains("Address already in use")
+        {
+            return result;
+        }
+        assert!(!result.2, "a bind collision must not invoke the CLI");
+    }
+    unreachable!()
+}
+
+fn run_production_startup_once(
+    card_yaml: &str,
+    env: &[(&str, &str)],
+) -> (bool, std::process::Output, bool) {
     use std::io::{Read, Write};
     use std::os::unix::fs::PermissionsExt;
 
@@ -133,21 +152,10 @@ fn run_production_startup(
         fs::set_permissions(path, permissions).unwrap();
     }
 
-    let port = std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
-    let admin_port = loop {
-        let candidate = std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
-        if candidate != port {
-            break candidate;
-        }
-    };
+    let port_reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let admin_reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = port_reservation.local_addr().unwrap().port();
+    let admin_port = admin_reservation.local_addr().unwrap().port();
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let existing_path = std::env::var_os("PATH").unwrap_or_default();
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_idoris"));
@@ -156,8 +164,7 @@ fn run_production_startup(
             cmd.env_remove(key);
         }
     }
-    let mut child = cmd
-        .current_dir(&root)
+    cmd.current_dir(&root)
         .env("IDORIS_COMPONENTS_DIR", components.path())
         .env(
             "IDORIS_ROUTING_POLICY",
@@ -173,9 +180,12 @@ fn run_production_startup(
         )
         .envs(env.iter().copied())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+        .stderr(Stdio::piped());
+    // Hold both distinct ports through setup; only release for the child bind.
+    // A competing process can still claim one then, so retry only that error.
+    drop(port_reservation);
+    drop(admin_reservation);
+    let mut child = cmd.spawn().unwrap();
 
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut started = false;
