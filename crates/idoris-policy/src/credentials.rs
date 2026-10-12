@@ -243,12 +243,12 @@ fn destination(raw: &str) -> Result<(String, String), CredentialError> {
         None => host.to_string(),
     };
     // The URL parser already resolved `.`/`..` segments; encoded dots,
-    // slashes or backslashes, double encoding (`%25…`) and `;` path
-    // parameters (`..;/` on Tomcat/Spring) survive it but some upstreams turn
-    // them into a traversal, so refuse them outright.
+    // slashes, backslashes or semicolons, double encoding (`%25…`),
+    // and `;` path parameters (`..;/` on Tomcat/Spring) survive it but some
+    // upstreams turn them into a traversal, so refuse them outright.
     let path = url.path().to_string();
     let lower = path.to_ascii_lowercase();
-    if ["%2e", "%2f", "%5c", "%25", ";"]
+    if ["%2e", "%2f", "%5c", "%3b", "%25", ";"]
         .iter()
         .any(|encoded| lower.contains(encoded))
     {
@@ -435,6 +435,8 @@ mod tests {
         let secret = openai();
         for url in [
             "https://api.openai.com/v1/chat/..;/files",
+            "https://api.openai.com/v1/chat/..%3b/files",
+            "https://api.openai.com/v1/chat/..%3B/files",
             "https://api.openai.com/v1/chat/%252e%252e/files",
         ] {
             let mut headers = Vec::new();
