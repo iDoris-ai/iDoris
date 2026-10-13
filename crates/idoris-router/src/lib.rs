@@ -3012,9 +3012,13 @@ fn is_event_stream(response: &Response) -> bool {
 }
 
 async fn finish_buffered_audit(state: Arc<AppState>, meta: BufferedAuditMeta) {
-    let (Some(store), Some(tenant_id)) = (state.record_store.clone(), meta.tenant_id) else {
+    let Some(tenant_id) = meta.tenant_id else {
         return;
     };
+    let store = state.record_store.clone();
+    if store.is_none() && state.event_log.is_none() {
+        return;
+    }
     let finalized_at = match SystemTime::now().duration_since(UNIX_EPOCH) {
         Ok(duration) => duration.as_millis().min(i64::MAX as u128) as i64,
         Err(_) => {
@@ -3063,6 +3067,13 @@ async fn finish_buffered_audit(state: Arc<AppState>, meta: BufferedAuditMeta) {
             };
             event_failed = event_log.append(Some(&tenant_id), &event).is_err();
         }
+        let Some(store) = store else {
+            return if event_failed {
+                Err("audit finalization write failed".to_string())
+            } else {
+                Ok(())
+            };
+        };
         let guard = store
             .lock()
             .map_err(|_| "audit record store lock poisoned".to_string())?;
@@ -3236,6 +3247,16 @@ mod protocol_stream_path_tests;
 
 #[cfg(test)]
 mod policy_wiring_tests;
+
+#[cfg(test)]
+fn stage_events(
+    events: Vec<idoris_tenancy::event_log::EventLogEvent>,
+) -> Vec<idoris_tenancy::event_log::EventLogEvent> {
+    events
+        .into_iter()
+        .filter(|row| row.event.event_type != idoris_tenancy::event_log::EventType::AuditFinalized)
+        .collect()
+}
 
 #[cfg(test)]
 mod tests {
@@ -3507,6 +3528,33 @@ mod tests {
         assert_eq!(event.metadata["component"], json!("router"));
         assert!(!event.metadata.contains_key("privacy"));
         assert!(!event.metadata.contains_key("intent"));
+    }
+
+    #[tokio::test]
+    async fn audit_finalized_event_log_only_covers_early_parse_errors() {
+        let event_log =
+            Arc::new(EventLogStore::new(Connection::open_in_memory().unwrap()).unwrap());
+        let response = build_app(AppState {
+            event_log: Some(event_log.clone()),
+            record_store: None,
+            ..AppState::default()
+        })
+        .oneshot(post_chat("{", &[]))
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let record_id = response
+            .headers()
+            .get(HEADER_RECORD_ID)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        let events = event_log
+            .events_for_record(Some(budget::PERSONAL_TENANT_ID), record_id)
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event.event_type, EventType::AuditFinalized);
+        assert_eq!(events[0].event.metadata["http_status"], json!(400));
     }
 
     #[tokio::test]

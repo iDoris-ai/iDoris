@@ -27,9 +27,11 @@ fn events(
         .unwrap()
         .to_str()
         .unwrap();
-    event_log
-        .events_for_record(Some(budget::PERSONAL_TENANT_ID), record_id)
-        .unwrap()
+    stage_events(
+        event_log
+            .events_for_record(Some(budget::PERSONAL_TENANT_ID), record_id)
+            .unwrap(),
+    )
 }
 
 #[tokio::test]
@@ -75,9 +77,11 @@ async fn request_received_persists_server_record_and_validated_correlation() {
         .to_string();
     assert_ne!(record_id, "caller-record");
 
-    let events = event_log
-        .events_for_record(Some(budget::PERSONAL_TENANT_ID), &record_id)
-        .unwrap();
+    let events = stage_events(
+        event_log
+            .events_for_record(Some(budget::PERSONAL_TENANT_ID), &record_id)
+            .unwrap(),
+    );
     assert_eq!(events.len(), 5);
     assert_eq!(events[0].event.event_type, EventType::RequestReceived);
     assert_eq!(events[1].event.event_type, EventType::Profiled);
@@ -163,9 +167,11 @@ async fn tenant_mode_uses_parsed_tenant_not_untrusted_metadata() {
         .unwrap()
         .to_str()
         .unwrap();
-    let events = event_log
-        .events_for_record(Some("acme"), record_id)
-        .unwrap();
+    let events = stage_events(
+        event_log
+            .events_for_record(Some("acme"), record_id)
+            .unwrap(),
+    );
     assert_eq!(events.len(), 3);
     assert_eq!(events[0].event.event_type, EventType::RequestReceived);
     assert_eq!(events[1].event.event_type, EventType::Profiled);
