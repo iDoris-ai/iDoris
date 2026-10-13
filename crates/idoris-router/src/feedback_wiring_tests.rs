@@ -442,3 +442,66 @@ async fn rejected_tenant_requests_do_not_write_victim_audit_rows() {
     assert_eq!(victim_rows.len(), 1);
     assert_eq!(victim_rows[0].record_id, record_id);
 }
+
+#[tokio::test]
+async fn authenticated_tenant_request_writes_its_own_terminal_audit() {
+    let event_log = memory_event_log();
+    let store = Arc::new(Mutex::new(
+        TenantStore::new(Connection::open_in_memory().unwrap()).unwrap(),
+    ));
+    let victim = MintedVirtualKey::mint();
+    let app = build_app(AppState {
+        deploy_mode: DeployMode::Tenant,
+        event_log: Some(event_log.clone()),
+        record_store: Some(store.clone()),
+        virtual_key_authenticator: Some(tenant_auth(&[(&victim, Some("victim"))])),
+        ..AppState::default()
+    });
+    let response = app
+        .oneshot(with_key(
+            super::tests::post_chat(
+                "{",
+                &[
+                    ("x-idoris-tenant", "victim"),
+                    ("x-idoris-event-tenant", "evil"),
+                ],
+            ),
+            &victim,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let record_id = response
+        .headers()
+        .get(HEADER_RECORD_ID)
+        .unwrap()
+        .to_str()
+        .unwrap();
+    let events = event_log
+        .events_for_record(Some("victim"), record_id)
+        .unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].event.event_type, EventType::AuditFinalized);
+    assert!(
+        event_log
+            .events_for_record(Some("evil"), record_id)
+            .unwrap()
+            .is_empty()
+    );
+
+    let records = store
+        .lock()
+        .unwrap()
+        .list(Some("victim"), Some(RecordKind::Audit))
+        .unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].record_id, record_id);
+    assert!(
+        store
+            .lock()
+            .unwrap()
+            .list(Some("evil"), Some(RecordKind::Audit))
+            .unwrap()
+            .is_empty()
+    );
+}
