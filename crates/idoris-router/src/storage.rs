@@ -249,6 +249,7 @@ mod tests {
     fn virtual_key_scope() -> VirtualKeyScope {
         VirtualKeyScope {
             owner: "agent24-instance".into(),
+            tenant_id: None,
             allowed_privacy: vec![PrivacyClass::LocalOnly],
             allowed_roles: vec!["fast".into()],
             budget_ref: None,
