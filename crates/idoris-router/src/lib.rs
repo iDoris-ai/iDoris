@@ -465,11 +465,26 @@ async fn remote_bind_auth_middleware(
     let has_bearer = request
         .headers()
         .contains_key(axum::http::header::AUTHORIZATION);
-    if state.dev_no_key_enabled && !state.remote_bind_requires_auth && !has_bearer {
+    let tenant_mode = state.deploy_mode == idoris_contracts::DeployMode::Tenant;
+    if tenant_mode
+        && matches!(
+            request.uri().path(),
+            "/v1/chat/completions" | "/v1/embeddings" | "/v1/rerank" | "/v1/messages"
+        )
+        && query_scope_header(request.headers()).is_none()
+    {
+        return error_envelope_with_reason(
+            StatusCode::BAD_REQUEST,
+            "tenant_missing",
+            "tenant_missing",
+            "deploy_mode=tenant requires a single, non-blank X-iDoris-Tenant; no default tenant fallback",
+        );
+    }
+    if state.dev_no_key_enabled && !state.remote_bind_requires_auth && !has_bearer && !tenant_mode {
         return next.run(request).await;
     }
     let Some(authenticator) = &state.virtual_key_authenticator else {
-        return if state.remote_bind_requires_auth {
+        return if state.remote_bind_requires_auth || tenant_mode {
             virtual_key_unauthorized_response()
         } else {
             // Library callers may intentionally omit the production
@@ -481,8 +496,39 @@ async fn remote_bind_auth_middleware(
         Ok(identity) => identity,
         Err(_) => return virtual_key_unauthorized_response(),
     };
+    if tenant_mode {
+        let tenant_header = request.headers().get_all("x-idoris-tenant");
+        if tenant_header.iter().next().is_some() {
+            let Some(requested_tenant) = query_scope_header(request.headers()) else {
+                return error_envelope(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_tenant_scope",
+                    "request requires exactly one non-empty X-iDoris-Tenant",
+                );
+            };
+            if !feedback::valid_event_identifier(requested_tenant) {
+                return error_envelope(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_tenant_scope",
+                    "tenant identifier is invalid",
+                );
+            }
+            if identity.scope.tenant_id.as_deref() != Some(requested_tenant) {
+                return error_envelope(
+                    StatusCode::FORBIDDEN,
+                    "tenant_scope_forbidden",
+                    "virtual key does not authorize this tenant",
+                );
+            }
+        }
+    }
+    let verified_tenant_identity = tenant_mode.then(|| identity.clone());
     request.extensions_mut().insert(identity);
-    next.run(request).await
+    let mut response = next.run(request).await;
+    if let Some(identity) = verified_tenant_identity {
+        response.extensions_mut().insert(identity);
+    }
+    response
 }
 
 async fn enforce_protocol_key_scope(
@@ -2168,8 +2214,36 @@ async fn chat_completions(
         };
     }
 
-    let selection =
-        dispatch::select_with_affinity(&policy_cards.cards, &parsed, &prompt, affinity_key);
+    // Freeze one exact lifecycle-readiness view for every decision this
+    // request performs. A session may prefer an already-Ready target only
+    // after policy admission/cost ties; without a session, preserve the
+    // pre-affinity selection order exactly.
+    let ready_provider_ids = if affinity_key.is_some() {
+        state
+            .runtimes
+            .exact_ready_providers(
+                policy_cards
+                    .cards
+                    .iter()
+                    .map(|card| {
+                        let provider_id = card.provider.id.clone();
+                        let target_model = dispatch::backend_model_id(&parsed, model, &provider_id);
+                        (provider_id, target_model)
+                    })
+                    .collect(),
+            )
+            .await
+    } else {
+        std::collections::BTreeSet::new()
+    };
+
+    let selection = dispatch::select_with_affinity_and_ready(
+        &policy_cards.cards,
+        &parsed,
+        &prompt,
+        affinity_key,
+        &ready_provider_ids,
+    );
     let rejection_reason = match &selection {
         Ok(_) => None,
         Err(DispatchError::Rejection(rejection)) => Some(rejection.error_type()),
@@ -2364,6 +2438,9 @@ async fn chat_completions(
             }
         }
     } else {
+        // Readiness only breaks ties between eligible targets. A failed
+        // selection has none, so this path can preserve the public dispatch
+        // input shape while reproducing the same rejection.
         dispatch_local(
             &policy_cards.cards,
             supervisor,
@@ -3193,6 +3270,9 @@ mod messages_wiring_tests;
 mod protocol_stream_path_tests;
 
 #[cfg(test)]
+mod protocol_error_matrix_tests;
+
+#[cfg(test)]
 mod policy_wiring_tests;
 
 #[cfg(test)]
@@ -3969,6 +4049,49 @@ mod tests {
             usage[0].payload["tokens_out"],
             json["usage"]["completion_tokens"]
         );
+    }
+
+    #[tokio::test]
+    async fn chat_request_freezes_one_readiness_snapshot_for_all_decide_passes() {
+        let card = sample_component_card("local-1");
+        let adapter = std::sync::Arc::new(idoris_backend::MockAdapter::new(vec![
+            idoris_backend::ModelInfo {
+                id: "local-1".to_string(),
+                memory_gb: 1.0,
+            },
+        ]));
+        let supervisor =
+            idoris_backend::Supervisor::spawn(adapter, idoris_backend::SupervisorConfig::default())
+                .unwrap();
+        supervisor
+            .load(
+                "local-1",
+                1.0,
+                idoris_contracts::load_policy::LoadPolicy {
+                    mode: idoris_contracts::load_policy::LoadMode::OnDemand,
+                    keepalive: idoris_contracts::load_policy::Keepalive::IdleTtl { idle_ttl_s: 60 },
+                    admission: idoris_contracts::load_policy::Admission::Coexist,
+                },
+            )
+            .await
+            .unwrap();
+        let runtimes: runtime::RuntimeRegistry =
+            dispatch::BoundSupervisor::new(&card, supervisor).into();
+        let state = AppState {
+            cards: vec![card],
+            runtimes: runtimes.clone(),
+            ..AppState::default()
+        };
+
+        let response = build_app(state)
+            .oneshot(post_chat(
+                r#"{"model":"idoris/daily","messages":[{"role":"user","content":"hi"}]}"#,
+                &[("X-iDoris-Session", "run-42")],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(runtimes.ready_snapshot_calls(), 1);
     }
 
     #[tokio::test]

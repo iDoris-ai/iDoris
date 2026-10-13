@@ -123,7 +123,7 @@
 - **Agent24 侧前置（J-6）**：在 M4 接入 iDoris 之前，Agent24 修补 `shell_exec` 与 MCP 子进程继承环境变量的缺口（`env_clear` + 白名单，mcp.json 支持按 server 配置 env），防止 `IDORIS_API_KEY` 外泄。
 
 - 请求头：`Authorization: Bearer idk_<key>`（M4 起，**缺省必须带 key**。loopback ≠ 授权：同一台机器上的任何进程都能连 loopback。「loopback 免 key」只作为**显式开启的开发者选项**（`IDORIS_DEV_NO_KEY=1`）。开启后，无 key 请求一律视为 `allowed_privacy=[local_only]`，不能使用付费或远程路径，启动日志和 `/health` 会明示。非 loopback 在任何情况下都必须带 key。v1.1，采纳 Agent24 的审阅意见）；`X-iDoris-Tenant`（tenant 模式必填，沿用 contract-tenancy v1.3）。
-- key 的 scope（草案）：`{key_id, owner, allowed_privacy[], allowed_roles[], budget_ref, expires_at, admin_scopes[]}`。Agent24 管理页使用的 key 需要 `admin_scopes`。
+- key 的 scope（草案）：`{key_id, owner, tenant_id?, allowed_privacy[], allowed_roles[], budget_ref, expires_at, admin_scopes[]}`。tenant 模式要求 key 绑定 `tenant_id`；Agent24 管理页使用的 key 需要 `admin_scopes`。
 
 ### 3.3 模型、角色目录与容量
 
