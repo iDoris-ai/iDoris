@@ -16,6 +16,7 @@ const MAX_OWNER_BYTES: usize = 128;
 #[serde(deny_unknown_fields)]
 struct IssueSpec {
     owner: String,
+    tenant_id: Option<String>,
     allowed_privacy: Vec<PrivacyClass>,
     allowed_roles: Vec<String>,
     expires_at_ms: Option<i64>,
@@ -89,6 +90,14 @@ fn validated_scope(spec: IssueSpec, now_ms: i64) -> Result<VirtualKeyScope, Stri
     {
         return Err("virtual-key owner 无效".to_string());
     }
+    if spec.tenant_id.as_deref().is_some_and(|tenant| {
+        tenant.is_empty()
+            || tenant.len() > 128
+            || tenant.trim() != tenant
+            || tenant.chars().any(char::is_control)
+    }) {
+        return Err("virtual-key tenant_id 无效".to_string());
+    }
     if spec.allowed_privacy.is_empty()
         || spec
             .allowed_privacy
@@ -118,6 +127,7 @@ fn validated_scope(spec: IssueSpec, now_ms: i64) -> Result<VirtualKeyScope, Stri
     }
     Ok(VirtualKeyScope {
         owner: spec.owner,
+        tenant_id: spec.tenant_id,
         allowed_privacy: spec.allowed_privacy,
         allowed_roles: spec.allowed_roles,
         budget_ref: None,
@@ -140,7 +150,7 @@ mod tests {
         let mut output = Vec::new();
         issue_from_reader_at(
             &store,
-            &mut br#"{"owner":"agent24","allowed_privacy":["local_only"],"allowed_roles":["fast"],"expires_at_ms":2000}"#.as_slice(),
+            &mut br#"{"owner":"agent24","tenant_id":"acme","allowed_privacy":["local_only"],"allowed_roles":["fast"],"expires_at_ms":2000}"#.as_slice(),
             &mut output,
             1000,
         )
@@ -150,6 +160,7 @@ mod tests {
         let identity = store.authenticate(&secret, 1500).unwrap().unwrap();
         assert_eq!(identity.key_id, json["key_id"]);
         assert_eq!(identity.scope.owner, "agent24");
+        assert_eq!(identity.scope.tenant_id.as_deref(), Some("acme"));
         assert!(output.ends_with(b"\n"));
     }
 
@@ -163,6 +174,8 @@ mod tests {
             br#"{"owner":"agent24","allowed_privacy":["local_only"],"allowed_roles":["fast","fast"]}"#.as_slice(),
             br#"{"owner":"agent24","allowed_privacy":["local_only"],"allowed_roles":["fast"],"expires_at_ms":1000}"#.as_slice(),
             br#"{"owner":"agent24","allowed_privacy":["local_only"],"allowed_roles":["fast"],"admin_scopes":["future"]}"#.as_slice(),
+            br#"{"owner":"agent24","tenant_id":" ","allowed_privacy":["local_only"],"allowed_roles":["fast"]}"#.as_slice(),
+            br#"{"owner":"agent24","tenant_id":" acme ","allowed_privacy":["local_only"],"allowed_roles":["fast"]}"#.as_slice(),
         ] {
             let mut output = Vec::new();
             assert!(issue_from_reader_at(&store, &mut &*spec, &mut output, 1000).is_err());
