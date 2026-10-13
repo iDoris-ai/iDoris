@@ -144,7 +144,7 @@ async fn request_received_preserves_valid_request_id_and_falls_back_on_oversize(
 }
 
 #[tokio::test]
-async fn tenant_mode_uses_parsed_tenant_not_untrusted_metadata() {
+async fn tenant_mode_rejects_unauthenticated_request_before_event_write() {
     let event_log = memory_event_log();
     let app = build_app(AppState {
         deploy_mode: DeployMode::Tenant,
@@ -161,21 +161,17 @@ async fn tenant_mode_uses_parsed_tenant_not_untrusted_metadata() {
         ))
         .await
         .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     let record_id = response
         .headers()
         .get(HEADER_RECORD_ID)
         .unwrap()
         .to_str()
         .unwrap();
-    let events = stage_events(
-        event_log
-            .events_for_record(Some("acme"), record_id)
-            .unwrap(),
-    );
-    assert_eq!(events.len(), 3);
-    assert_eq!(events[0].event.event_type, EventType::RequestReceived);
-    assert_eq!(events[1].event.event_type, EventType::Profiled);
-    assert_eq!(events[2].event.event_type, EventType::Decided);
+    let events = event_log
+        .events_for_record(Some("acme"), record_id)
+        .unwrap();
+    assert!(events.is_empty());
     assert!(
         event_log
             .events_for_record(Some("evil"), record_id)
