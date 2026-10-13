@@ -42,7 +42,10 @@ async fn profiled_follows_request_received_with_resolved_safe_metadata() {
         .to_string();
     let events = event_log
         .events_for_record(Some(budget::PERSONAL_TENANT_ID), &record_id)
-        .unwrap();
+        .unwrap()
+        .into_iter()
+        .filter(|row| row.event.event_type != EventType::AuditFinalized)
+        .collect::<Vec<_>>();
     assert_eq!(events.len(), 3);
     assert_eq!(events[0].event.event_type, EventType::RequestReceived);
     assert_eq!(events[1].event.event_type, EventType::Profiled);
@@ -88,7 +91,10 @@ async fn explicit_intent_is_profiled_without_inspecting_message_content() {
         .to_string();
     let events = event_log
         .events_for_record(Some(budget::PERSONAL_TENANT_ID), &record_id)
-        .unwrap();
+        .unwrap()
+        .into_iter()
+        .filter(|row| row.event.event_type != EventType::AuditFinalized)
+        .collect::<Vec<_>>();
     let profiled = &events[1].event;
     assert_eq!(profiled.metadata.get("intent"), Some(&json!("email")));
     assert_eq!(profiled.metadata.get("privacy"), Some(&json!("any")));
@@ -137,7 +143,10 @@ async fn profiled_append_failure_is_generic_503_before_budget_or_upstream() {
     assert_eq!(json["error"]["reason_code"], "EVENT_LOG_APPEND_UNAVAILABLE");
     let events = event_log
         .events_for_record(Some(budget::PERSONAL_TENANT_ID), &record_id)
-        .unwrap();
+        .unwrap()
+        .into_iter()
+        .filter(|row| row.event.event_type != EventType::AuditFinalized)
+        .collect::<Vec<_>>();
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].event.event_type, EventType::RequestReceived);
     let after = ledger.tenant_readview(budget::PERSONAL_TENANT_ID).unwrap();
