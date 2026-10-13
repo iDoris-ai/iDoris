@@ -465,11 +465,26 @@ async fn remote_bind_auth_middleware(
     let has_bearer = request
         .headers()
         .contains_key(axum::http::header::AUTHORIZATION);
-    if state.dev_no_key_enabled && !state.remote_bind_requires_auth && !has_bearer {
+    let tenant_mode = state.deploy_mode == idoris_contracts::DeployMode::Tenant;
+    if tenant_mode
+        && matches!(
+            request.uri().path(),
+            "/v1/chat/completions" | "/v1/embeddings" | "/v1/rerank" | "/v1/messages"
+        )
+        && query_scope_header(request.headers()).is_none()
+    {
+        return error_envelope_with_reason(
+            StatusCode::BAD_REQUEST,
+            "tenant_missing",
+            "tenant_missing",
+            "deploy_mode=tenant requires a single, non-blank X-iDoris-Tenant; no default tenant fallback",
+        );
+    }
+    if state.dev_no_key_enabled && !state.remote_bind_requires_auth && !has_bearer && !tenant_mode {
         return next.run(request).await;
     }
     let Some(authenticator) = &state.virtual_key_authenticator else {
-        return if state.remote_bind_requires_auth {
+        return if state.remote_bind_requires_auth || tenant_mode {
             virtual_key_unauthorized_response()
         } else {
             // Library callers may intentionally omit the production
@@ -481,8 +496,39 @@ async fn remote_bind_auth_middleware(
         Ok(identity) => identity,
         Err(_) => return virtual_key_unauthorized_response(),
     };
+    if tenant_mode {
+        let tenant_header = request.headers().get_all("x-idoris-tenant");
+        if tenant_header.iter().next().is_some() {
+            let Some(requested_tenant) = query_scope_header(request.headers()) else {
+                return error_envelope(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_tenant_scope",
+                    "request requires exactly one non-empty X-iDoris-Tenant",
+                );
+            };
+            if !feedback::valid_event_identifier(requested_tenant) {
+                return error_envelope(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_tenant_scope",
+                    "tenant identifier is invalid",
+                );
+            }
+            if identity.scope.tenant_id.as_deref() != Some(requested_tenant) {
+                return error_envelope(
+                    StatusCode::FORBIDDEN,
+                    "tenant_scope_forbidden",
+                    "virtual key does not authorize this tenant",
+                );
+            }
+        }
+    }
+    let verified_tenant_identity = tenant_mode.then(|| identity.clone());
     request.extensions_mut().insert(identity);
-    next.run(request).await
+    let mut response = next.run(request).await;
+    if let Some(identity) = verified_tenant_identity {
+        response.extensions_mut().insert(identity);
+    }
+    response
 }
 
 async fn enforce_protocol_key_scope(
@@ -2888,13 +2934,22 @@ async fn record_id_middleware(
             req.uri().path(),
             "/v1/chat/completions" | "/v1/embeddings" | "/v1/rerank" | "/v1/messages"
         );
-    let audit_tenant = audit_tenant_id(&state, req.headers());
+    let requested_audit_tenant = audit_tenant_id(&state, req.headers());
     let audit_request_id = audit_header(req.headers(), HEADER_REQUEST_ID, None);
     let audit_privacy = audit_header(req.headers(), "x-idoris-privacy", Some("local_only"));
     let audit_intent = audit_header(req.headers(), "x-idoris-intent", None);
     req.extensions_mut()
         .insert(RequestRecordId(record_id.clone()));
     let mut response = next.run(req).await;
+    let audit_tenant = match state.deploy_mode {
+        idoris_contracts::DeployMode::Personal => requested_audit_tenant,
+        idoris_contracts::DeployMode::Tenant => response
+            .extensions()
+            .get::<idoris_tenancy::virtual_key::store::AuthenticatedVirtualKey>()
+            .and_then(|identity| identity.scope.tenant_id.as_ref())
+            .filter(|tenant| Some(tenant.as_str()) == requested_audit_tenant.as_deref())
+            .cloned(),
+    };
     if let Ok(value) = HeaderValue::from_str(&record_id) {
         response.headers_mut().insert(HEADER_RECORD_ID, value);
     }
