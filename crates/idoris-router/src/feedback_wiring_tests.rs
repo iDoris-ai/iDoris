@@ -7,6 +7,7 @@ use http_body_util::BodyExt;
 use idoris_contracts::DeployMode;
 use idoris_contracts::common::PrivacyClass;
 use idoris_tenancy::event_log::{EventLogStore, EventType, NewEvent};
+use idoris_tenancy::store::{RecordKind, TenantStore};
 use idoris_tenancy::virtual_key::MintedVirtualKey;
 use idoris_tenancy::virtual_key::store::{VirtualKeyScope, VirtualKeyStore};
 use rusqlite::Connection;
@@ -364,4 +365,80 @@ async fn tenant_key_cannot_write_feedback_or_request_event_to_another_tenant() {
             .unwrap()
             .is_empty()
     );
+}
+
+#[tokio::test]
+async fn rejected_tenant_requests_do_not_write_victim_audit_rows() {
+    let store = Arc::new(Mutex::new(
+        TenantStore::new(Connection::open_in_memory().unwrap()).unwrap(),
+    ));
+    let attacker = MintedVirtualKey::mint();
+    let victim = MintedVirtualKey::mint();
+    let app = build_app(AppState {
+        deploy_mode: DeployMode::Tenant,
+        record_store: Some(store.clone()),
+        virtual_key_authenticator: Some(tenant_auth(&[
+            (&attacker, Some("attacker")),
+            (&victim, Some("victim")),
+        ])),
+        ..AppState::default()
+    });
+    let rejected = [
+        (
+            super::tests::post_chat("{", &[("x-idoris-tenant", "victim")]),
+            StatusCode::UNAUTHORIZED,
+        ),
+        (
+            with_key(
+                super::tests::post_chat("{", &[("x-idoris-tenant", "victim")]),
+                &attacker,
+            ),
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            with_key(
+                super::tests::post_chat(
+                    "{",
+                    &[
+                        ("x-idoris-tenant", "victim"),
+                        ("x-idoris-tenant", "attacker"),
+                    ],
+                ),
+                &attacker,
+            ),
+            StatusCode::BAD_REQUEST,
+        ),
+    ];
+    for (request, status) in rejected {
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), status);
+        let victim_rows = store
+            .lock()
+            .unwrap()
+            .list(Some("victim"), Some(RecordKind::Audit))
+            .unwrap();
+        assert!(victim_rows.is_empty());
+    }
+
+    let response = app
+        .oneshot(with_key(
+            super::tests::post_chat("{", &[("x-idoris-tenant", "victim")]),
+            &victim,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let record_id = response
+        .headers()
+        .get(HEADER_RECORD_ID)
+        .unwrap()
+        .to_str()
+        .unwrap();
+    let victim_rows = store
+        .lock()
+        .unwrap()
+        .list(Some("victim"), Some(RecordKind::Audit))
+        .unwrap();
+    assert_eq!(victim_rows.len(), 1);
+    assert_eq!(victim_rows[0].record_id, record_id);
 }
