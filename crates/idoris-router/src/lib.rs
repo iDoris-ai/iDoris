@@ -2139,8 +2139,36 @@ async fn chat_completions(
         };
     }
 
-    let selection =
-        dispatch::select_with_affinity(&policy_cards.cards, &parsed, &prompt, affinity_key);
+    // Freeze one exact lifecycle-readiness view for every decision this
+    // request performs. A session may prefer an already-Ready target only
+    // after policy admission/cost ties; without a session, preserve the
+    // pre-affinity selection order exactly.
+    let ready_provider_ids = if affinity_key.is_some() {
+        state
+            .runtimes
+            .exact_ready_providers(
+                policy_cards
+                    .cards
+                    .iter()
+                    .map(|card| {
+                        let provider_id = card.provider.id.clone();
+                        let target_model = dispatch::backend_model_id(&parsed, model, &provider_id);
+                        (provider_id, target_model)
+                    })
+                    .collect(),
+            )
+            .await
+    } else {
+        std::collections::BTreeSet::new()
+    };
+
+    let selection = dispatch::select_with_affinity_and_ready(
+        &policy_cards.cards,
+        &parsed,
+        &prompt,
+        affinity_key,
+        &ready_provider_ids,
+    );
     let rejection_reason = match &selection {
         Ok(_) => None,
         Err(DispatchError::Rejection(rejection)) => Some(rejection.error_type()),
@@ -2335,6 +2363,9 @@ async fn chat_completions(
             }
         }
     } else {
+        // Readiness only breaks ties between eligible targets. A failed
+        // selection has none, so this path can preserve the public dispatch
+        // input shape while reproducing the same rejection.
         dispatch_local(
             &policy_cards.cards,
             supervisor,
@@ -3936,6 +3967,49 @@ mod tests {
             usage[0].payload["tokens_out"],
             json["usage"]["completion_tokens"]
         );
+    }
+
+    #[tokio::test]
+    async fn chat_request_freezes_one_readiness_snapshot_for_all_decide_passes() {
+        let card = sample_component_card("local-1");
+        let adapter = std::sync::Arc::new(idoris_backend::MockAdapter::new(vec![
+            idoris_backend::ModelInfo {
+                id: "local-1".to_string(),
+                memory_gb: 1.0,
+            },
+        ]));
+        let supervisor =
+            idoris_backend::Supervisor::spawn(adapter, idoris_backend::SupervisorConfig::default())
+                .unwrap();
+        supervisor
+            .load(
+                "local-1",
+                1.0,
+                idoris_contracts::load_policy::LoadPolicy {
+                    mode: idoris_contracts::load_policy::LoadMode::OnDemand,
+                    keepalive: idoris_contracts::load_policy::Keepalive::IdleTtl { idle_ttl_s: 60 },
+                    admission: idoris_contracts::load_policy::Admission::Coexist,
+                },
+            )
+            .await
+            .unwrap();
+        let runtimes: runtime::RuntimeRegistry =
+            dispatch::BoundSupervisor::new(&card, supervisor).into();
+        let state = AppState {
+            cards: vec![card],
+            runtimes: runtimes.clone(),
+            ..AppState::default()
+        };
+
+        let response = build_app(state)
+            .oneshot(post_chat(
+                r#"{"model":"idoris/daily","messages":[{"role":"user","content":"hi"}]}"#,
+                &[("X-iDoris-Session", "run-42")],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(runtimes.ready_snapshot_calls(), 1);
     }
 
     #[tokio::test]

@@ -14,6 +14,8 @@
 
 mod types;
 
+use std::collections::BTreeSet;
+
 pub use types::{Decision, Degradation, PolicyCtx, ReasonCode, Rejection, RequestProfile, Stage};
 
 use idoris_contracts::common::{Capability, PrivacyClass};
@@ -76,6 +78,7 @@ fn budget_stage<'a>(
     ctx: &PolicyCtx<'_>,
     candidates: Vec<&'a Card>,
     affinity_key: Option<&str>,
+    ready_candidate_ids: &BTreeSet<String>,
 ) -> Result<BudgetStageOutcome<'a>, Rejection> {
     let mut reasons = Vec::new();
     let snapshot = ctx
@@ -88,7 +91,8 @@ fn budget_stage<'a>(
     };
 
     #[allow(clippy::expect_used)] // candidates 非空由调用方保证（admission 阶段已排除空集）
-    let natural_pick = pick(&candidates, affinity_key).expect("candidates is non-empty");
+    let natural_pick =
+        pick(&candidates, affinity_key, ready_candidate_ids).expect("candidates is non-empty");
     let natural_cost = natural_pick.estimated_cost_minor.unwrap_or(0);
     let free: Vec<&Card> = candidates
         .iter()
@@ -165,7 +169,11 @@ fn affinity_score(session: &str, candidate_id: &str) -> u64 {
 /// 按 (admission 优先级, 估算成本, 会话亲和, id 字典序) 排序取最小。
 /// Affinity only breaks an exact admission/cost tie, so it can never bypass
 /// privacy, capability, admission, or budget policy to keep a session sticky.
-fn pick<'a>(candidates: &[&'a Card], affinity_key: Option<&str>) -> Option<&'a Card> {
+fn pick<'a>(
+    candidates: &[&'a Card],
+    affinity_key: Option<&str>,
+    ready_candidate_ids: &BTreeSet<String>,
+) -> Option<&'a Card> {
     candidates.iter().copied().min_by(|a, b| {
         admission_rank(a.admission_status)
             .cmp(&admission_rank(b.admission_status))
@@ -173,6 +181,11 @@ fn pick<'a>(candidates: &[&'a Card], affinity_key: Option<&str>) -> Option<&'a C
                 a.estimated_cost_minor
                     .unwrap_or(0)
                     .cmp(&b.estimated_cost_minor.unwrap_or(0))
+            })
+            .then_with(|| match affinity_key {
+                Some(_) => (!ready_candidate_ids.contains(a.id()))
+                    .cmp(&(!ready_candidate_ids.contains(b.id()))),
+                None => std::cmp::Ordering::Equal,
             })
             .then_with(|| match affinity_key {
                 Some(session) => {
@@ -202,6 +215,20 @@ pub fn decide_with_affinity(
     cards: &[Card],
     ctx: &PolicyCtx<'_>,
     affinity_key: Option<&str>,
+) -> Result<Decision, Rejection> {
+    decide_with_affinity_and_ready(req, cards, ctx, affinity_key, &BTreeSet::new())
+}
+
+/// Same safety pipeline as [`decide_with_affinity`], with a trusted,
+/// request-scoped snapshot of candidate ids whose exact lifecycle target is
+/// already `Ready`. Readiness only breaks equal admission/cost ties before
+/// session rendezvous hashing; it cannot relax policy gates.
+pub fn decide_with_affinity_and_ready(
+    req: &RequestProfile,
+    cards: &[Card],
+    ctx: &PolicyCtx<'_>,
+    affinity_key: Option<&str>,
+    ready_candidate_ids: &BTreeSet<String>,
 ) -> Result<Decision, Rejection> {
     let mut reasons = Vec::new();
 
@@ -323,8 +350,13 @@ pub fn decide_with_affinity(
     }
 
     // ---- ⑤ 预算（只作用于"本应选中的那条路径"；见 [`budget_stage`]） ---------
-    let (after_budget, budget_reasons, budget_degradation) =
-        budget_stage(req, ctx, admission_eligible, affinity_key)?;
+    let (after_budget, budget_reasons, budget_degradation) = budget_stage(
+        req,
+        ctx,
+        admission_eligible,
+        affinity_key,
+        ready_candidate_ids,
+    )?;
     reasons.extend(budget_reasons);
 
     let mut degradations = Vec::new();
@@ -347,7 +379,7 @@ pub fn decide_with_affinity(
     // ---- ⑥ 选择（Score → Pick，确定性排序） ---------------------------------
     #[allow(clippy::expect_used)]
     // after_budget 非空：budget_stage 只会原样返回非空输入或返回非空的 free 子集
-    let chosen = pick(&after_budget, affinity_key)
+    let chosen = pick(&after_budget, affinity_key, ready_candidate_ids)
         .expect("after_budget is non-empty, pick always returns Some");
 
     Ok(Decision {
