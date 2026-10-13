@@ -522,8 +522,13 @@ async fn remote_bind_auth_middleware(
             }
         }
     }
+    let verified_tenant_identity = tenant_mode.then(|| identity.clone());
     request.extensions_mut().insert(identity);
-    next.run(request).await
+    let mut response = next.run(request).await;
+    if let Some(identity) = verified_tenant_identity {
+        response.extensions_mut().insert(identity);
+    }
+    response
 }
 
 async fn enforce_protocol_key_scope(

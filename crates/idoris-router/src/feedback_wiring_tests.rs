@@ -279,6 +279,12 @@ async fn tenant_key_cannot_write_feedback_or_request_event_to_another_tenant() {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(
+            response
+                .extensions()
+                .get::<idoris_tenancy::virtual_key::store::AuthenticatedVirtualKey>()
+                .is_none()
+        );
     }
     let no_auth = app
         .clone()
@@ -295,6 +301,18 @@ async fn tenant_key_cannot_write_feedback_or_request_event_to_another_tenant() {
         .await
         .unwrap();
     assert_eq!(cross_tenant_chat.status(), StatusCode::FORBIDDEN);
+    let rejected_record_id = cross_tenant_chat
+        .headers()
+        .get(HEADER_RECORD_ID)
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(
+        event_log
+            .events_for_record(Some("victim"), rejected_record_id)
+            .unwrap()
+            .is_empty()
+    );
     assert_eq!(
         event_log
             .events_for_record(Some("victim"), record_id)
@@ -311,6 +329,16 @@ async fn tenant_key_cannot_write_feedback_or_request_event_to_another_tenant() {
         .await
         .unwrap();
     assert_eq!(authorized.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        authorized
+            .extensions()
+            .get::<idoris_tenancy::virtual_key::store::AuthenticatedVirtualKey>()
+            .unwrap()
+            .scope
+            .tenant_id
+            .as_deref(),
+        Some("victim")
+    );
     let events = event_log
         .events_for_record(Some("victim"), record_id)
         .unwrap();
