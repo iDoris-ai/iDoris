@@ -2283,14 +2283,15 @@ async fn chat_completions(
             }
         }
     } else {
+        // Readiness only breaks ties between eligible targets. A failed
+        // selection has none, so this path can preserve the public dispatch
+        // input shape while reproducing the same rejection.
         dispatch_local(
             &policy_cards.cards,
             supervisor,
             budget_ledger,
             &parsed,
-            dispatch::DispatchInput::with_model(model, &prompt)
-                .with_affinity(affinity_key)
-                .with_ready_providers(&ready_provider_ids),
+            dispatch::DispatchInput::with_model(model, &prompt).with_affinity(affinity_key),
             messages,
             lifecycle.cancellation_token(),
         )
