@@ -7,6 +7,8 @@
 //! that calls `dispatch_local`, not here (this module has no axum/HTTP
 //! dependency on purpose, so it's testable without spinning up the app).
 
+use std::collections::BTreeSet;
+
 use idoris_backend::{
     BackendError, BackendStatus, ChatMessage, ChatRequest, ChatResponse, SupervisorHandle,
 };
@@ -15,7 +17,7 @@ use idoris_contracts::load_policy::{Admission, Keepalive, LoadMode, LoadPolicy};
 use idoris_contracts::provider::Locality;
 use idoris_policy::{
     AdmissionStatus, Card, Decision, PolicyCtx, ROLES, ReasonCode, Rejection, RequestProfile,
-    decide_with_affinity, effective_served_locality,
+    decide_with_affinity_and_ready, effective_served_locality,
 };
 use idoris_tenancy::budget::{BudgetError, BudgetLedger, ReservationId};
 use tokio_util::sync::CancellationToken;
@@ -60,6 +62,10 @@ impl BoundSupervisor {
 
     pub(crate) async fn status(&self) -> Result<BackendStatus, BackendError> {
         self.handle.status().await
+    }
+
+    pub(crate) async fn is_ready(&self, model_id: &str) -> Result<bool, BackendError> {
+        self.handle.is_ready(model_id).await
     }
 
     /// Constructs the adapter from the same card used for the binding.
@@ -228,6 +234,16 @@ pub fn select_with_affinity(
     prompt: &str,
     affinity_key: Option<&str>,
 ) -> Result<Selected, DispatchError> {
+    select_with_affinity_and_ready(cards, profile, prompt, affinity_key, &BTreeSet::new())
+}
+
+pub fn select_with_affinity_and_ready(
+    cards: &[ComponentCard],
+    profile: &ParsedProfile,
+    prompt: &str,
+    affinity_key: Option<&str>,
+    ready_provider_ids: &BTreeSet<String>,
+) -> Result<Selected, DispatchError> {
     let candidates: Vec<Card> = cards.iter().map(|c| candidate(c, prompt)).collect();
     let request_profile = RequestProfile {
         task: profile.task.clone(),
@@ -239,8 +255,14 @@ pub fn select_with_affinity(
         min_ram_gb: None,
         budget: None,
     };
-    let decision = decide_with_affinity(&request_profile, &candidates, &ctx, affinity_key)
-        .map_err(DispatchError::Rejection)?;
+    let decision = decide_with_affinity_and_ready(
+        &request_profile,
+        &candidates,
+        &ctx,
+        affinity_key,
+        ready_provider_ids,
+    )
+    .map_err(DispatchError::Rejection)?;
     let Some(chosen) = candidates.iter().find(|c| c.id() == decision.chosen_id) else {
         return Err(DispatchError::Internal(format!(
             "decide() returned chosen_id {:?} absent from its own candidate list",
@@ -269,6 +291,21 @@ pub fn is_resident_http_service(card: &ComponentCard) -> bool {
         && card
             .load_policy
             .is_some_and(|lp| lp.mode == LoadMode::Resident)
+}
+
+/// Resolve the exact model id that lifecycle dispatch will execute for a
+/// selected provider. Readiness affinity must use this same identity so it
+/// can never warm-match a different model than the one later loaded/chatted.
+pub(crate) fn backend_model_id(
+    profile: &ParsedProfile,
+    requested_model: Option<&str>,
+    provider_id: &str,
+) -> String {
+    if profile.role.is_none() {
+        requested_model.unwrap_or(provider_id).to_string()
+    } else {
+        provider_id.to_string()
+    }
 }
 
 /// RAII guard: on `Drop`, releases the reservation unless [`Self::take`]
@@ -561,11 +598,13 @@ async fn dispatch_local_inner(
     let tenant_id = profile.tenant_id.as_deref();
     let prompt = input.prompt;
     let requested_model = input.requested_model;
+    let affinity_key = input.affinity_key;
+
     let selected_owned;
     let selected = match selection {
         LocalSelection::Preselected(selected) => selected,
         LocalSelection::Cards(cards) => {
-            selected_owned = select_with_affinity(cards, profile, prompt, input.affinity_key)?;
+            selected_owned = select_with_affinity(cards, profile, prompt, affinity_key)?;
             &selected_owned
         }
     };
@@ -585,11 +624,7 @@ async fn dispatch_local_inner(
     let load_policy = selected.load_policy;
     let estimated_cost_minor = selected.estimated_cost_minor;
     let provider_id = selected.card.provider.id.clone();
-    let backend_model_id = if profile.role.is_none() {
-        requested_model.unwrap_or(&provider_id).to_string()
-    } else {
-        provider_id.clone()
-    };
+    let backend_model_id = backend_model_id(profile, requested_model, &provider_id);
     let cost = selected.card.provider.cost;
     let is_paid = budget::is_paid(Some(estimated_cost_minor));
     let mut reservation_guard = match ReservationGuard::reserve(
