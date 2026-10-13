@@ -465,11 +465,26 @@ async fn remote_bind_auth_middleware(
     let has_bearer = request
         .headers()
         .contains_key(axum::http::header::AUTHORIZATION);
-    if state.dev_no_key_enabled && !state.remote_bind_requires_auth && !has_bearer {
+    let tenant_mode = state.deploy_mode == idoris_contracts::DeployMode::Tenant;
+    if tenant_mode
+        && matches!(
+            request.uri().path(),
+            "/v1/chat/completions" | "/v1/embeddings" | "/v1/rerank" | "/v1/messages"
+        )
+        && query_scope_header(request.headers()).is_none()
+    {
+        return error_envelope_with_reason(
+            StatusCode::BAD_REQUEST,
+            "tenant_missing",
+            "tenant_missing",
+            "deploy_mode=tenant requires a single, non-blank X-iDoris-Tenant; no default tenant fallback",
+        );
+    }
+    if state.dev_no_key_enabled && !state.remote_bind_requires_auth && !has_bearer && !tenant_mode {
         return next.run(request).await;
     }
     let Some(authenticator) = &state.virtual_key_authenticator else {
-        return if state.remote_bind_requires_auth {
+        return if state.remote_bind_requires_auth || tenant_mode {
             virtual_key_unauthorized_response()
         } else {
             // Library callers may intentionally omit the production
@@ -481,6 +496,32 @@ async fn remote_bind_auth_middleware(
         Ok(identity) => identity,
         Err(_) => return virtual_key_unauthorized_response(),
     };
+    if tenant_mode {
+        let tenant_header = request.headers().get_all("x-idoris-tenant");
+        if tenant_header.iter().next().is_some() {
+            let Some(requested_tenant) = query_scope_header(request.headers()) else {
+                return error_envelope(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_tenant_scope",
+                    "request requires exactly one non-empty X-iDoris-Tenant",
+                );
+            };
+            if !feedback::valid_event_identifier(requested_tenant) {
+                return error_envelope(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_tenant_scope",
+                    "tenant identifier is invalid",
+                );
+            }
+            if identity.scope.tenant_id.as_deref() != Some(requested_tenant) {
+                return error_envelope(
+                    StatusCode::FORBIDDEN,
+                    "tenant_scope_forbidden",
+                    "virtual key does not authorize this tenant",
+                );
+            }
+        }
+    }
     request.extensions_mut().insert(identity);
     next.run(request).await
 }
