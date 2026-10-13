@@ -14,6 +14,7 @@ beforeAll(async () => {
   server = await spawnConformanceServer({
     componentsDir,
     routingPolicyPath: routingPolicyFixturePath,
+    keyTenantId: "tenant-conformance",
     env: { IDORIS_DEPLOY_MODE: "tenant", IDORIS_TENANTS_CONFIG: tenantConfig },
   });
 });
