@@ -3006,7 +3006,10 @@ fn header_text<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
 
 fn audit_header(headers: &HeaderMap, name: &str, default: Option<&str>) -> Option<String> {
     match header_text(headers, name) {
-        Some(value) if value.encode_utf16().count() <= audit::MAX_FIELD_UTF16_UNITS => {
+        Some(value)
+            if value.encode_utf16().count() <= audit::MAX_FIELD_UTF16_UNITS
+                && !value.chars().any(char::is_control) =>
+        {
             Some(value.to_string())
         }
         Some(_) => None,
@@ -3040,9 +3043,13 @@ fn is_event_stream(response: &Response) -> bool {
 }
 
 async fn finish_buffered_audit(state: Arc<AppState>, meta: BufferedAuditMeta) {
-    let (Some(store), Some(tenant_id)) = (state.record_store.clone(), meta.tenant_id) else {
+    let Some(tenant_id) = meta.tenant_id else {
         return;
     };
+    let store = state.record_store.clone();
+    if store.is_none() && state.event_log.is_none() {
+        return;
+    }
     let finalized_at = match SystemTime::now().duration_since(UNIX_EPOCH) {
         Ok(duration) => duration.as_millis().min(i64::MAX as u128) as i64,
         Err(_) => {
@@ -3097,35 +3104,39 @@ async fn finish_buffered_audit(state: Arc<AppState>, meta: BufferedAuditMeta) {
             };
             event_failed = event_log.append(Some(&tenant_id), &event).is_err();
         }
-        let guard = store
-            .lock()
-            .map_err(|_| "audit record store lock poisoned".to_string())?;
-        let writer = audit::AuditWriter::new(&guard);
-        let write = audit::AuditOnce::default().finish(
-            &writer,
-            &tenant_id,
-            &meta.record_id,
-            meta.origin_record_id.as_deref(),
-            &payload,
-        );
-        let legacy_failed = if let Err(error) = write {
-            if !matches!(error, audit::AuditError::Store(_)) {
-                let mut minimal = serde_json::Map::new();
-                minimal.insert("request_id".into(), json!(meta.record_id.clone()));
-                minimal.insert("component".into(), json!("router"));
-                minimal.insert("status".into(), json!(meta.status.as_u16()));
-                minimal.insert("reason".into(), json!(meta.reason));
-                minimal.insert("ts_utc".into(), json!(finalized_at));
-                writer
-                    .write_scoped(
-                        &tenant_id,
-                        Some(&meta.record_id),
-                        meta.origin_record_id.as_deref(),
-                        &minimal,
-                    )
-                    .is_err()
+        let legacy_failed = if let Some(store) = store {
+            let guard = store
+                .lock()
+                .map_err(|_| "audit record store lock poisoned".to_string())?;
+            let writer = audit::AuditWriter::new(&guard);
+            let write = audit::AuditOnce::default().finish(
+                &writer,
+                &tenant_id,
+                &meta.record_id,
+                meta.origin_record_id.as_deref(),
+                &payload,
+            );
+            if let Err(error) = write {
+                if !matches!(error, audit::AuditError::Store(_)) {
+                    let mut minimal = serde_json::Map::new();
+                    minimal.insert("request_id".into(), json!(meta.record_id.clone()));
+                    minimal.insert("component".into(), json!("router"));
+                    minimal.insert("status".into(), json!(meta.status.as_u16()));
+                    minimal.insert("reason".into(), json!(meta.reason));
+                    minimal.insert("ts_utc".into(), json!(finalized_at));
+                    writer
+                        .write_scoped(
+                            &tenant_id,
+                            Some(&meta.record_id),
+                            meta.origin_record_id.as_deref(),
+                            &minimal,
+                        )
+                        .is_err()
+                } else {
+                    true
+                }
             } else {
-                true
+                false
             }
         } else {
             false
@@ -3544,6 +3555,78 @@ mod tests {
         assert_eq!(event.metadata["component"], json!("router"));
         assert_eq!(event.metadata["privacy"], legacy[0].payload["privacy"]);
         assert!(!event.metadata.contains_key("intent"));
+    }
+
+    #[tokio::test]
+    async fn audit_finalized_is_written_without_legacy_record_store() {
+        let event_log =
+            Arc::new(EventLogStore::new(Connection::open_in_memory().unwrap()).unwrap());
+        let response = build_app(AppState {
+            event_log: Some(event_log.clone()),
+            ..AppState::default()
+        })
+        .oneshot(post_chat("{", &[]))
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let record_id = response
+            .headers()
+            .get(HEADER_RECORD_ID)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        let audit = queries::audit::query_event_audit(
+            &event_log,
+            budget::PERSONAL_TENANT_ID,
+            Some(budget::PERSONAL_TENANT_ID),
+            &queries::audit::AuditQuery {
+                from: None,
+                to: None,
+                limit: None,
+                record_id: Some(record_id.to_string()),
+            },
+        )
+        .unwrap();
+        assert_eq!(audit.records.len(), 1);
+        assert_eq!(audit.records[0].payload["status"], json!(400));
+    }
+
+    #[tokio::test]
+    async fn control_in_optional_audit_headers_does_not_drop_terminal_event() {
+        for header in ["x-idoris-intent", "x-idoris-privacy"] {
+            let store = memory_record_store();
+            let event_log =
+                Arc::new(EventLogStore::new(Connection::open_in_memory().unwrap()).unwrap());
+            let response = build_app(AppState {
+                record_store: Some(store.clone()),
+                event_log: Some(event_log.clone()),
+                ..AppState::default()
+            })
+            .oneshot(post_chat("{", &[(header, "left\tright")]))
+            .await
+            .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let record_id = response
+                .headers()
+                .get(HEADER_RECORD_ID)
+                .unwrap()
+                .to_str()
+                .unwrap();
+            let rows = audit_rows(&store);
+            assert_eq!(rows.len(), 1);
+            let events = event_log
+                .events_for_record(Some(budget::PERSONAL_TENANT_ID), record_id)
+                .unwrap();
+            assert_eq!(events.len(), 1, "{header}");
+            assert_eq!(events[0].event.event_type, EventType::AuditFinalized);
+            let field = if header == "x-idoris-intent" {
+                "intent"
+            } else {
+                "privacy"
+            };
+            assert!(!events[0].event.metadata.contains_key(field));
+            assert!(!rows[0].payload.contains_key(field));
+        }
     }
 
     #[tokio::test]

@@ -212,10 +212,20 @@ pub fn project_event_audit(path_tenant: &str, events: &[EventLogEvent]) -> Audit
             record
                 .payload
                 .insert("ts_utc".into(), serde_json::json!(event.ts_utc_ms));
-            for key in ["intent", "privacy"] {
+            for key in [
+                "component",
+                "intent",
+                "privacy",
+                "tier",
+                "provider_id",
+                "model_id",
+                "tokens_in",
+                "tokens_out",
+                "cost_minor",
+            ] {
                 if let Some(value) = event.metadata.get(key) {
                     record.payload.insert(key.to_string(), value.clone());
-                } else {
+                } else if key == "intent" || key == "privacy" {
                     record.payload.remove(key);
                 }
             }
