@@ -2030,10 +2030,7 @@ async fn chat_completions(
         Ok(context) => context,
         Err(error) => return correlation_error_response(error),
     };
-    let event_request_id = header_text(&headers, HEADER_REQUEST_ID)
-        .filter(|value| value.encode_utf16().count() <= 128 && !value.chars().any(char::is_control))
-        .unwrap_or(&record_id)
-        .to_string();
+    let event_request_id = event_request_id(header_text(&headers, HEADER_REQUEST_ID), &record_id);
     let event_context = if let Some(event_log) = state.event_log.clone() {
         let tenant_id = match state.deploy_mode {
             idoris_contracts::DeployMode::Personal => budget::PERSONAL_TENANT_ID.to_string(),
@@ -2989,6 +2986,14 @@ fn audit_header(headers: &HeaderMap, name: &str, default: Option<&str>) -> Optio
     }
 }
 
+fn event_request_id(request_id: Option<&str>, record_id: &str) -> String {
+    request_id
+        .filter(|value| value.encode_utf16().count() <= 128)
+        .filter(|value| !value.chars().any(char::is_control))
+        .unwrap_or(record_id)
+        .to_string()
+}
+
 fn audit_tenant_id(state: &AppState, headers: &HeaderMap) -> Option<String> {
     match state.deploy_mode {
         idoris_contracts::DeployMode::Personal => Some(budget::PERSONAL_TENANT_ID.to_string()),
@@ -3018,10 +3023,7 @@ async fn finish_buffered_audit(state: Arc<AppState>, meta: BufferedAuditMeta) {
             return;
         }
     };
-    let request_id = meta
-        .request_id
-        .clone()
-        .unwrap_or_else(|| meta.record_id.clone());
+    let request_id = event_request_id(meta.request_id.as_deref(), &meta.record_id);
     let mut payload = serde_json::Map::new();
     payload.insert("request_id".into(), json!(request_id.clone()));
     payload.insert("component".into(), json!("router"));
@@ -3505,6 +3507,38 @@ mod tests {
         assert_eq!(event.metadata["component"], json!("router"));
         assert!(!event.metadata.contains_key("privacy"));
         assert!(!event.metadata.contains_key("intent"));
+    }
+
+    #[tokio::test]
+    async fn audit_finalized_rejects_request_ids_outside_event_log_boundary() {
+        for request_id in ["r".repeat(129), "left\tright".to_string()] {
+            let store = memory_record_store();
+            let event_log =
+                Arc::new(EventLogStore::new(Connection::open_in_memory().unwrap()).unwrap());
+            let response = build_app(AppState {
+                record_store: Some(store.clone()),
+                event_log: Some(event_log.clone()),
+                ..AppState::default()
+            })
+            .oneshot(post_chat("{", &[(HEADER_REQUEST_ID, request_id.as_str())]))
+            .await
+            .unwrap();
+            let record_id = response
+                .headers()
+                .get(HEADER_RECORD_ID)
+                .unwrap()
+                .to_str()
+                .unwrap();
+            let rows = audit_rows(&store);
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].request_id, record_id);
+            let events = event_log
+                .events_for_record(Some(budget::PERSONAL_TENANT_ID), record_id)
+                .unwrap();
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].event.event_type, EventType::AuditFinalized);
+            assert_eq!(events[0].event.request_id.as_deref(), Some(record_id));
+        }
     }
 
     fn audit_rows(
