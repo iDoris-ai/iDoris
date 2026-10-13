@@ -56,22 +56,42 @@ async fn protocol_endpoints_share_invalid_json_envelope() {
 
 #[tokio::test]
 async fn protocol_endpoints_share_tenant_missing_envelope_before_egress() {
-    let app = build_app(AppState {
-        deploy_mode: idoris_contracts::DeployMode::Tenant,
-        ..AppState::default()
-    });
-    for (path, _) in ENDPOINTS {
+    for (path, capability) in ENDPOINTS {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let mut card = super::tests::resident_component_card("protocol-local", &server.uri());
+        card.provider.capabilities = vec![capability];
+        let app = build_app(AppState {
+            deploy_mode: idoris_contracts::DeployMode::Tenant,
+            cards: vec![card],
+            ..AppState::default()
+        });
+        let payload = match path {
+            "/v1/embeddings" => json!({"model":"x","input":"hello"}),
+            "/v1/rerank" => json!({"model":"x","query":"q","documents":["d"]}),
+            "/v1/messages" => json!({"model":"x","max_tokens":8,"messages":[]}),
+            _ => unreachable!(),
+        };
         let response = app
-            .clone()
             .oneshot(request(
                 path,
-                Body::from(r#"{"model":"x","messages":[],"input":"x","documents":[]}"#),
+                Body::from(serde_json::to_vec(&payload).unwrap()),
             ))
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{path}");
         let json = json_body(response).await;
         assert_unified_error(&json, "tenant_missing");
+        assert_eq!(json["error"]["reason_code"], "tenant_missing");
+        server.verify().await;
+        assert!(
+            server.received_requests().await.unwrap().is_empty(),
+            "{path}"
+        );
     }
 }
 
