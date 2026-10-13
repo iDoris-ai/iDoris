@@ -428,7 +428,6 @@ pub struct DispatchInput<'a> {
     pub requested_model: Option<&'a str>,
     pub prompt: &'a str,
     pub affinity_key: Option<&'a str>,
-    pub ready_provider_ids: Option<&'a BTreeSet<String>>,
 }
 
 impl<'a> DispatchInput<'a> {
@@ -437,7 +436,6 @@ impl<'a> DispatchInput<'a> {
             requested_model: None,
             prompt,
             affinity_key: None,
-            ready_provider_ids: None,
         }
     }
 
@@ -446,17 +444,11 @@ impl<'a> DispatchInput<'a> {
             requested_model,
             prompt,
             affinity_key: None,
-            ready_provider_ids: None,
         }
     }
 
     pub fn with_affinity(mut self, affinity_key: Option<&'a str>) -> Self {
         self.affinity_key = affinity_key;
-        self
-    }
-
-    pub fn with_ready_providers(mut self, ready_provider_ids: &'a BTreeSet<String>) -> Self {
-        self.ready_provider_ids = Some(ready_provider_ids);
         self
     }
 }
@@ -607,19 +599,12 @@ async fn dispatch_local_inner(
     let prompt = input.prompt;
     let requested_model = input.requested_model;
     let affinity_key = input.affinity_key;
-    let ready_provider_ids = input.ready_provider_ids;
 
     let selected_owned;
     let selected = match selection {
         LocalSelection::Preselected(selected) => selected,
         LocalSelection::Cards(cards) => {
-            selected_owned = select_with_affinity_and_ready(
-                cards,
-                profile,
-                prompt,
-                affinity_key,
-                ready_provider_ids.unwrap_or(&BTreeSet::new()),
-            )?;
+            selected_owned = select_with_affinity(cards, profile, prompt, affinity_key)?;
             &selected_owned
         }
     };
