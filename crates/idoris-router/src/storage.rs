@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 
 use idoris_contracts::DeployMode;
 use idoris_tenancy::budget::{BudgetLedger, SpendGate};
-use idoris_tenancy::event_log::{EventLogStore, EventType, NewEvent};
+use idoris_tenancy::event_log::{EventLogError, EventLogStore, EventType, NewEvent};
 use idoris_tenancy::store::{TenantRecord, TenantStore};
 use idoris_tenancy::virtual_key::store::VirtualKeyStore;
 use serde::Deserialize;
@@ -144,7 +144,13 @@ pub fn bootstrap(
         eprintln!("idoris: 已撤销 {revoked} 个不再存在于可信配置中的租户");
     }
 
-    backfill_legacy_audits(&records, &event_log)?;
+    let migration = backfill_legacy_audits(&records, &event_log)?;
+    if migration.retained_incompatible > 0 {
+        eprintln!(
+            "idoris: 已保留 {} 条无法迁移的旧审计记录；这些记录不会出现在 Event Log 审计查询中",
+            migration.retained_incompatible
+        );
+    }
 
     Ok(StorageBootstrap {
         records: Arc::new(Mutex::new(records)),
@@ -154,11 +160,22 @@ pub fn bootstrap(
     })
 }
 
-fn backfill_legacy_audits(records: &TenantStore, event_log: &EventLogStore) -> Result<(), String> {
+#[derive(Default, Debug, PartialEq, Eq)]
+struct AuditMigrationReport {
+    migrated: usize,
+    retained_incompatible: usize,
+}
+
+fn backfill_legacy_audits(
+    records: &TenantStore,
+    event_log: &EventLogStore,
+) -> Result<AuditMigrationReport, String> {
+    let mut report = AuditMigrationReport::default();
     let tenants = records
         .audit_tenants_for_migration()
         .map_err(|error| format!("无法枚举旧审计租户：{error}"))?;
     for tenant in tenants {
+        let compatible_tenant = crate::event_identifier::valid(&tenant);
         let mut after: Option<String> = None;
         loop {
             let batch = records
@@ -168,6 +185,25 @@ fn backfill_legacy_audits(records: &TenantStore, event_log: &EventLogStore) -> R
                 break;
             }
             for record in &batch {
+                // Older audit writes accepted identifiers that Event Log rejects.
+                // Keep those rows in the legacy store without blocking startup.
+                if !compatible_tenant
+                    || !crate::event_identifier::valid(&record.record_id)
+                    || record
+                        .origin_record_id
+                        .as_deref()
+                        .is_some_and(|id| !crate::event_identifier::valid(id))
+                {
+                    report.retained_incompatible += 1;
+                    continue;
+                }
+                let event = match migrated_audit_event(record) {
+                    Ok(event) => event,
+                    Err(_) => {
+                        report.retained_incompatible += 1;
+                        continue;
+                    }
+                };
                 let existing = event_log
                     .events_for_record(Some(&tenant), &record.record_id)
                     .map_err(|error| {
@@ -182,18 +218,26 @@ fn backfill_legacy_audits(records: &TenantStore, event_log: &EventLogStore) -> R
                 {
                     continue;
                 }
-                let event = migrated_audit_event(record)?;
-                event_log.append(Some(&tenant), &event).map_err(|error| {
-                    format!(
-                        "无法迁移旧审计记录 {tenant:?}/{:?}：{error}",
-                        record.record_id
-                    )
-                })?;
+                match event_log.append(Some(&tenant), &event) {
+                    Ok(_) => report.migrated += 1,
+                    Err(
+                        EventLogError::InvalidIdentifier(_)
+                        | EventLogError::InvalidRecordId
+                        | EventLogError::InvalidTimestamp
+                        | EventLogError::InvalidMetadata(_),
+                    ) => report.retained_incompatible += 1,
+                    Err(error) => {
+                        return Err(format!(
+                            "无法迁移旧审计记录 {tenant:?}/{:?}：{error}",
+                            record.record_id
+                        ));
+                    }
+                }
             }
             after = batch.last().map(|record| record.record_id.clone());
         }
     }
-    Ok(())
+    Ok(report)
 }
 
 fn migrated_audit_event(record: &TenantRecord) -> Result<NewEvent, String> {
@@ -506,6 +550,77 @@ mod tests {
                 assert!(!audit.records[0].payload.contains_key("intent"));
             }
         }
+    }
+
+    #[test]
+    fn startup_retains_incompatible_legacy_audits_and_migrates_valid_rows() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = dir.path().join("state.sqlite3");
+        let config = dir.path().join("tenants.yaml");
+        std::fs::write(
+            &config,
+            "tenants:\n  - tenant_id: acme\n    limit_minor: 0\n    billing_timezone: UTC\n",
+        )
+        .unwrap();
+        let long_id = "x".repeat(129);
+        let records = TenantStore::open(&db).unwrap();
+        let add = |tenant: &str, record_id: &str, origin: Option<&str>, ts: i64| {
+            records
+                .put(
+                    Some(tenant),
+                    &TenantRecord {
+                        tenant_id: tenant.into(),
+                        kind: RecordKind::Audit,
+                        record_id: record_id.into(),
+                        request_id: "legacy-request".into(),
+                        origin_record_id: origin.map(str::to_owned),
+                        payload: Map::from_iter([
+                            ("ts_utc".into(), json!(ts)),
+                            ("status".into(), json!(400)),
+                        ]),
+                    },
+                )
+                .unwrap();
+        };
+        // The old audit store accepted all of these identifiers and values.
+        add(&long_id, "bad-tenant", None, 1);
+        add("acme", &long_id, None, 2);
+        add("acme", "bad-origin", Some(&long_id), 3);
+        add("acme", "bad-timestamp", None, -1);
+        add("acme", "good", None, 4);
+        drop(records);
+
+        let storage = bootstrap(&db, Some(&config), DeployMode::Tenant).unwrap();
+        let legacy = storage.records.lock().unwrap();
+        for (tenant, record_id) in [
+            (long_id.as_str(), "bad-tenant"),
+            ("acme", long_id.as_str()),
+            ("acme", "bad-origin"),
+            ("acme", "bad-timestamp"),
+        ] {
+            assert!(
+                legacy
+                    .get(Some(tenant), RecordKind::Audit, record_id)
+                    .unwrap()
+                    .is_some(),
+                "incompatible legacy audit must be retained"
+            );
+        }
+        assert_eq!(
+            storage
+                .event_log
+                .events_for_record(Some("acme"), "good")
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            backfill_legacy_audits(&legacy, &storage.event_log).unwrap(),
+            AuditMigrationReport {
+                migrated: 0,
+                retained_incompatible: 4,
+            }
+        );
     }
 
     #[test]
