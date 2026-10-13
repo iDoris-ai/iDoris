@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use idoris_tenancy::event_log::{EventLogError, EventLogStore, EventType, NewEvent};
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
@@ -40,9 +40,16 @@ pub(crate) struct FeedbackRequest {
     #[serde(default)]
     pub labels: Vec<String>,
     pub outcome: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_nullable_rubric")]
     pub rubric: Vec<RubricItem>,
     pub corrected_output: Option<Value>,
+}
+
+fn deserialize_nullable_rubric<'de, D>(deserializer: D) -> Result<Vec<RubricItem>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(Option::<Vec<RubricItem>>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 impl FeedbackRequest {

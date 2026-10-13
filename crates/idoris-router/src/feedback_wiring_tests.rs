@@ -104,6 +104,36 @@ async fn metadata_feedback_appends_to_existing_record() {
 }
 
 #[tokio::test]
+async fn explicit_null_rubric_keeps_existing_rating_feedback_valid() {
+    let event_log = memory_event_log();
+    let app = build_app(AppState {
+        event_log: Some(event_log.clone()),
+        ..AppState::default()
+    });
+    let record_id = create_record(&app).await;
+    let response = app
+        .oneshot(feedback_request(json!({
+            "record_id": record_id,
+            "rating": "up",
+            "rubric": null
+        })))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    let events = event_log
+        .events_for_record(Some(budget::PERSONAL_TENANT_ID), &record_id)
+        .unwrap();
+    let feedback = events
+        .iter()
+        .filter(|event| event.event.event_type == EventType::FeedbackReceived)
+        .collect::<Vec<_>>();
+    assert_eq!(feedback.len(), 1);
+    assert_eq!(feedback[0].event.metadata.get("rating"), Some(&json!("up")));
+    assert!(!feedback[0].event.metadata.contains_key("rubric"));
+}
+
+#[tokio::test]
 async fn feedback_rejects_unknown_record_and_content_fields() {
     let event_log = memory_event_log();
     let app = build_app(AppState {
