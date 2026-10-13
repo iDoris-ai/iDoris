@@ -117,9 +117,9 @@ M5 acceptance shape is tested: an id/phone/card injected anywhere in a declared-
 
 Every rule/decoder/stage was mutation-checked by hand (removing it turns its tests red); notes are in each commit message.
 
-## Decisions waiting for the owner
+## Owner decisions and remaining questions
 
-1. **Redact consent wire format.** Without it `/v1/inspect` and the route stage never answer REDACT (personal data → BLOCK). The engine (M5-12) is ready to wire once decided.
+1. **Redact consent: decided 2026-10-13.** The iDoris local console must obtain the user's explicit confirmation for each individual REDACT request and issue an authorization valid only for that request. The caller's own consent claim does not authorize REDACT. Until this wire is implemented and verified, `/v1/inspect` and the route stage continue to answer BLOCK for personal data. A caller-declared or time-limited approval may be reconsidered only after extensive scenario testing; it is not part of the initial M5 wire. M4 audit repair, merging, full acceptance on `main`, and the `v0.3.0` release take priority before this M5 implementation.
 2. **Admin v1 write surface** for the kill switch toggle (docs/15: management port/UI only; Admin v0 is read-only by decision) and for showing the egress counter / breaker state.
 3. `/v1/inspect` request shape (`{input: string}` vs messages), the finding-kind list, and whether to bump wire `contract_version` (still `1.0.1`) when the endpoint ships.
 4. `credential_path` sensitivity S2 (vs S3).
@@ -170,8 +170,8 @@ Stack top: `fix/review-5-hardening`. CI was green through `feat/event-log-28-pro
 
 1. `gh auth login -h github.com`, then `bash docs/agent/pr-queue-2026-10-11/create-prs.sh` (opens all queued PRs in stack order, bases set, idempotent). Re-run the intermittent macOS subscription job with its log.
 2. Owner review per "How to review this stack" above; land the M4 tail first, re-run the acceptance set on `main`, tag `v0.3.0`.
-3. Owner decisions listed above (1–8). Each unblocks a ready next slice:
-   - redact consent → wire the M5-12 engine into `/v1/inspect` and the route stage (stream restore already exists);
+3. Implement the decided REDACT consent wire after M4 release, then resolve remaining owner questions (2–8). Each unblocks a ready next slice:
+   - per-request local-console consent → wire the M5-12 engine into `/v1/inspect` and the route stage (stream restore already exists);
    - Admin v1 write surface → kill-switch toggle, egress counter and breaker state views;
    - breakers on by default → flip `IDORIS_PROVIDER_BREAKER` default and update `conformance/tests/upstream-behavior.test.ts`;
    - gate two store/config/wire → keychain-backed `SecretSource`, grant config, `POST /v1/broker/http`, C-3 response scan;
