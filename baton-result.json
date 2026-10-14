@@ -1,0 +1,14 @@
+{
+  "schema": "baton-result/v1",
+  "task_id": "m4-remote-audit-20261014",
+  "attempt_id": "f1b7203a-18d8-482f-9014-dfad0ec831f2",
+  "sequence": 1,
+  "status": "started",
+  "base_sha": "357bfd92cc2fe58169016154560fc8639ff4b530",
+  "result_sha": "357bfd92cc2fe58169016154560fc8639ff4b530",
+  "summary": "Started independent Linux M4 RC verification on Grok Bot lane; macOS unavailable on this box.",
+  "tests": [],
+  "blocker": null,
+  "next": "Run cargo/pnpm/conformance/tenant-audit gates; write Chinese acceptance report; push.",
+  "updated_at": "2026-10-14T12:47:00Z"
+}

@@ -1,0 +1,2 @@
+timestamp	actor	decision	evidence
+2026-10-14T12:47:00Z	grokbot	started M4 independent verification on baton/grokbot-20261014 at 357bfd92cc2fe58169016154560fc8639ff4b530	baton-result.json seq=1 status=started
