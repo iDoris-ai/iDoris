@@ -2,13 +2,88 @@
   "schema": "baton-result/v1",
   "task_id": "m4-remote-audit-20261014",
   "attempt_id": "f1b7203a-18d8-482f-9014-dfad0ec831f2",
-  "sequence": 1,
-  "status": "started",
+  "sequence": 2,
+  "status": "completed",
   "base_sha": "357bfd92cc2fe58169016154560fc8639ff4b530",
-  "result_sha": "357bfd92cc2fe58169016154560fc8639ff4b530",
-  "summary": "Started independent Linux M4 RC verification on Grok Bot lane; macOS unavailable on this box.",
-  "tests": [],
+  "result_sha": "c8800fbe9ce3f7d6d4fd693a525e13f3204f261e",
+  "summary": "Linux M4 RC verification delivered: TS/clippy/fmt/conformance/egress pass; full cargo test exit 101 on 2 hung subscription fixtures (skip-rerun pass); macOS and real subscription CLI not run. Cloud delivery != acceptance pass.",
+  "tests": [
+    {
+      "command": "pnpm install --frozen-lockfile",
+      "exit_code": 0
+    },
+    {
+      "command": "cargo fmt --check",
+      "exit_code": 0
+    },
+    {
+      "command": "pnpm lint",
+      "exit_code": 0
+    },
+    {
+      "command": "pnpm typecheck",
+      "exit_code": 0
+    },
+    {
+      "command": "pnpm check:contract-drift",
+      "exit_code": 0
+    },
+    {
+      "command": "pnpm build",
+      "exit_code": 0
+    },
+    {
+      "command": "pnpm test",
+      "exit_code": 0
+    },
+    {
+      "command": "pnpm conformance",
+      "exit_code": 0
+    },
+    {
+      "command": "pnpm test:tenancy",
+      "exit_code": 0
+    },
+    {
+      "command": "pnpm test:audit",
+      "exit_code": 0
+    },
+    {
+      "command": "cargo clippy --all-targets --features idoris-tenancy/test-bins,idoris-tenancy/mutation-test-hooks -- -D warnings",
+      "exit_code": 0
+    },
+    {
+      "command": "cargo test --features idoris-tenancy/test-bins,idoris-tenancy/mutation-test-hooks",
+      "exit_code": 101
+    },
+    {
+      "command": "cargo test --features idoris-tenancy/test-bins,idoris-tenancy/mutation-test-hooks -- --skip fixture_basic_modes_are_real --skip fixture_exposes_hang_ignore_term_hold_pipe_and_pid_marker_modes",
+      "exit_code": 0
+    },
+    {
+      "command": "cargo test --test query_acceptance --features idoris-tenancy/test-bins,idoris-tenancy/mutation-test-hooks",
+      "exit_code": 0
+    },
+    {
+      "command": "cargo test -p idoris-tenancy --features idoris-tenancy/test-bins,idoris-tenancy/mutation-test-hooks",
+      "exit_code": 0
+    },
+    {
+      "command": "cargo test -p genai --lib webc::",
+      "exit_code": 0
+    },
+    {
+      "command": "env IDORIS_CONFORMANCE_CMD=/idoris-conformance-missing IDORIS_CONFORMANCE_ARGV=[\"/idoris-conformance-missing\"] bash scripts/conformance-rust.sh",
+      "exit_code": 0
+    },
+    {
+      "command": "bash scripts/check-rust-egress.sh",
+      "exit_code": 0
+    }
+  ],
   "blocker": null,
-  "next": "Run cargo/pnpm/conformance/tenant-audit gates; write Chinese acceptance report; push.",
-  "updated_at": "2026-10-14T12:47:00Z"
+  "next": "Coordinator: re-check subscription_cli_fixture on macOS/TTY; do not treat cloud delivery as full acceptance.",
+  "updated_at": "2026-10-14T13:26:44Z",
+  "report_path": "docs/m4-acceptance-grokbot-20261014.md",
+  "platform": "linux-x86_64-only"
 }

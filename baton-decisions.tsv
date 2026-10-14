@@ -3,3 +3,4 @@ timestamp	actor	decision	evidence
 2026-10-14T13:26:31Z	grokbot	Linux M4 gates mostly green; full cargo_test=101 on subscription_cli_fixture hang; skip-2 rerun=0	docs/m4-acceptance-grokbot-20261014.md + m4-gate-logs summary
 2026-10-14T13:26:31Z	grokbot	tenant-isolation + audit record-id evidence collected on Linux only; macOS and real subscription CLI not run	pnpm test:tenancy/audit; cargo query_acceptance; idoris-tenancy tests
 2026-10-14T13:26:31Z	grokbot	wrote Chinese acceptance report for coordinator; cloud delivery != acceptance pass	docs/m4-acceptance-grokbot-20261014.md
+2026-10-14T13:26:44Z	grokbot	completed Linux acceptance delivery on baton/grokbot-20261014 (result_sha=c8800fbe9ce3f7d6d4fd693a525e13f3204f261e)	baton-result.json seq=2 status=completed; push pending
