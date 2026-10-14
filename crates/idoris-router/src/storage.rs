@@ -392,6 +392,7 @@ mod tests {
     fn virtual_key_scope() -> VirtualKeyScope {
         VirtualKeyScope {
             owner: "agent24-instance".into(),
+            tenant_id: None,
             allowed_privacy: vec![PrivacyClass::LocalOnly],
             allowed_roles: vec!["fast".into()],
             budget_ref: None,
@@ -521,6 +522,26 @@ mod tests {
                 .unwrap();
         }
         drop(records);
+        let old_event_log = EventLogStore::open(&db).unwrap();
+        old_event_log
+            .append(
+                Some("acme"),
+                &NewEvent {
+                    event_id: Uuid::new_v4().to_string(),
+                    tenant_id: "acme".into(),
+                    record_id: "old-a".into(),
+                    event_type: EventType::RequestReceived,
+                    ts_utc_ms: 900,
+                    request_id: None,
+                    session_id: None,
+                    trace_id: None,
+                    parent_id: None,
+                    origin_record_id: None,
+                    metadata: BTreeMap::new(),
+                },
+            )
+            .unwrap();
+        drop(old_event_log);
 
         for _ in 0..2 {
             let storage = bootstrap(&db, Some(&config), DeployMode::Tenant).unwrap();
@@ -529,8 +550,12 @@ mod tests {
                     .event_log
                     .events_for_record(Some(tenant), record_id)
                     .unwrap();
-                assert_eq!(events.len(), 1, "migration must be idempotent");
-                assert_eq!(events[0].event.event_type, EventType::AuditFinalized);
+                let expected_len = if record_id == "old-a" { 2 } else { 1 };
+                assert_eq!(events.len(), expected_len, "migration must be idempotent");
+                assert_eq!(
+                    events.last().unwrap().event.event_type,
+                    EventType::AuditFinalized
+                );
                 let audit = crate::queries::audit::query_event_audit(
                     &storage.event_log,
                     tenant,
@@ -545,6 +570,10 @@ mod tests {
                 .unwrap();
                 assert_eq!(audit.records.len(), 1);
                 assert_eq!(audit.records[0].request_id, format!("request-{record_id}"));
+                assert_eq!(
+                    audit.records[0].payload["request_id"],
+                    json!(format!("request-{record_id}"))
+                );
                 assert_eq!(audit.records[0].payload["status"], json!(200));
                 assert_eq!(audit.records[0].payload["cost_minor"], json!(3));
                 assert!(!audit.records[0].payload.contains_key("intent"));

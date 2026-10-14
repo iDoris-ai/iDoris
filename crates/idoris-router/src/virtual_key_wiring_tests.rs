@@ -27,6 +27,7 @@ fn scope(
 ) -> VirtualKeyScope {
     VirtualKeyScope {
         owner: "agent24-instance".into(),
+        tenant_id: None,
         allowed_privacy: privacy,
         allowed_roles: roles.iter().map(|role| (*role).to_string()).collect(),
         budget_ref: None,
