@@ -1,2 +1,5 @@
 timestamp	actor	decision	evidence
 2026-10-14T12:47:00Z	grokbot	started M4 independent verification on baton/grokbot-20261014 at 357bfd92cc2fe58169016154560fc8639ff4b530	baton-result.json seq=1 status=started
+2026-10-14T13:26:31Z	grokbot	Linux M4 gates mostly green; full cargo_test=101 on subscription_cli_fixture hang; skip-2 rerun=0	docs/m4-acceptance-grokbot-20261014.md + m4-gate-logs summary
+2026-10-14T13:26:31Z	grokbot	tenant-isolation + audit record-id evidence collected on Linux only; macOS and real subscription CLI not run	pnpm test:tenancy/audit; cargo query_acceptance; idoris-tenancy tests
+2026-10-14T13:26:31Z	grokbot	wrote Chinese acceptance report for coordinator; cloud delivery != acceptance pass	docs/m4-acceptance-grokbot-20261014.md
