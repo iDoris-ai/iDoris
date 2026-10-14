@@ -284,8 +284,9 @@ fn proc_entry_vanished(error: &std::io::Error) -> bool {
 
 #[cfg(target_os = "linux")]
 fn read_proc_stat(path: &std::path::Path) -> Result<Option<String>, BackendError> {
-    match std::fs::read_to_string(path) {
-        Ok(stat) => Ok(Some(stat)),
+    match std::fs::read(path) {
+        // Linux comm is arbitrary bytes; only the fields after it are parsed.
+        Ok(stat) => Ok(Some(String::from_utf8_lossy(&stat).into_owned())),
         Err(error) if proc_entry_vanished(&error) => Ok(None),
         Err(_) => Err(BackendError::internal(
             "failed to inspect local runtime process group",
@@ -567,6 +568,32 @@ mod tests {
         assert!(proc_entry_vanished(&std::io::Error::from_raw_os_error(
             nix::errno::Errno::ESRCH as i32
         )));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn non_utf8_proc_comm_preserves_state_and_group() {
+        let temp = tempfile::tempdir().unwrap();
+        let task = temp.path().join("task/42");
+        std::fs::create_dir_all(&task).unwrap();
+        let stat_path = task.join("stat");
+        for state in [b'S', b'Z'] {
+            let mut bytes = b"42 (runtime\xff) name) ".to_vec();
+            bytes.push(state);
+            bytes.extend_from_slice(b" 1 123 0\n");
+            std::fs::write(&stat_path, bytes).unwrap();
+            let stat = read_proc_stat(&stat_path).unwrap().unwrap();
+            assert_eq!(
+                proc_stat_state_and_group(&stat).unwrap(),
+                (if state == b'S' { "S" } else { "Z" }, 123)
+            );
+            assert_eq!(
+                zombie_leader_has_live_threads(temp.path(), 123).unwrap(),
+                state == b'S'
+            );
+        }
+        std::fs::write(&stat_path, b"42 (runtime\xff) malformed\n").unwrap();
+        assert!(zombie_leader_has_live_threads(temp.path(), 123).is_err());
     }
 
     #[cfg(target_os = "linux")]
