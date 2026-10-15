@@ -431,19 +431,19 @@
 
 > 决策：[`../18-推理后端与决策模型-vLLM与Decision3.0评估.md`](../18-推理后端与决策模型-vLLM与Decision3.0评估.md)。完整任务卡（范围 / 不做 / 依赖 / 验收）见 [`plans/runtime-portability-and-decision-model.md`](plans/runtime-portability-and-decision-model.md)，本节只做台账索引。
 
-> 本表为计划，未授权开发：prdaemon Codex astra 审核通过后，仍须 owner 明确允许才启动；READY 仅为依赖就绪。A6/B8 是后续占位。
+> 2026-10-15：PR #524 已合并。实现集中在 `feat/runtime-portability-and-decision-model`，任务分支先回到这条 feature 分支，不直接合 `main`。A6/B8 仍是占位。
 
 | Task | 内容 | 依赖 | 状态 |
 |:---|:---|:---|:---|
-| A1 | HTTP/runtime readiness/chat 共用 Bearer（缺失即拒绝启动） | — | READY |
+| A1 | HTTP/runtime readiness/chat 共用 Bearer（缺失即拒绝启动） | — | DOING |
 | A2 | `LocalRuntimeKind::Vllm`（认证、真实模型身份、GPU 额度） | A1 | BACKLOG |
 | A3 | 🖥 vllm-metal vs oMLX 实机对比，领先超 30% 即重开结论一 | A2 | BACKLOG |
-| A4 | `OllamaAdapter`（Windows 默认后端） | — | READY |
+| A4 | `OllamaAdapter`（Windows 默认后端） | — | DOING |
 | A5 | NVIDIA 探测 + `detect_backend` 接默认卡 | A2, A4 | BACKLOG |
 | A6 | 跨平台发布 / 非 Apple 内存模型 / Windows 进程 owner（里程碑占位） | A5 | BACKLOG |
-| A7 | oMLX 依赖清单 + 退出路径样例配置 | — | READY |
-| BM | 模式分离：意图识别只在 `idoris/auto` 下运行（聊天 / 自动路由 / 调用方声明三种模式，D-5） | — | READY |
-| B0 | 🖥 d3-lite 在 oMLX `/v1/systemone` 上的线格式 + 中文 spike | — | READY |
+| A7 | oMLX 依赖清单 + 退出路径样例配置 | — | DOING |
+| BM | 模式分离：意图识别只在 `idoris/auto` 下运行（聊天 / 自动路由 / 调用方声明三种模式，D-5） | — | DOING |
+| B0 | 🖥 d3-lite 在 oMLX `/v1/systemone` 上的线格式 + 中文 spike | — | BLOCKED：本机 oMLX 0.6.4 无该端点 |
 | B1 | 隐私过滤后的确定性 auto 角色选择与来源隔离 | B2 达标、B4、#510；与 B5 同版本 | BACKLOG |
 | B2 | ≥200 条中英评测集 + 评测脚本（准确率 / ECE / 置换一致 / 延迟） | B0 | BACKLOG |
 | B3 | 固定 System One 线格式 + 认证客户端 + 引擎来源校验 | B0, A1 | BACKLOG |

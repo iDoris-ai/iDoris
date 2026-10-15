@@ -226,7 +226,9 @@ B1 不是补几条 YAML：当前 tier 只有 local/remote/lora，deep 是角色�
 
 ## 附录 A · Spike 记录
 
-（待 B0 填写：oMLX 版本、d3-lite revision、请求 / 响应样例、中英各 10 条的 p50 / p95、常驻内存。）
+2026-10-15 的 B0 没有跑成延迟和准确率。本机正在使用的 oMLX 是 0.6.4（`/Applications/oMLX.app`，`~/.omlx/bin/omlx --version`），其 `server.py` 没有 `POST /v1/systemone`，包内也没有 `systemone` 字符串。`127.0.0.1:8088` 在听，未带凭证的 `/v1/models` 返回 401。`~/.omlx/models` 里没有 d3 权重。上游 commit `33e0b0c` 的 DecisionEngine 不在这份安装里。
+
+因此没有请求样例、p50/p95 或常驻内存数字。依赖 d3 的 B2/B3/B4/B5 先暂停。BM 和 WP-A 继续。升级本机 oMLX 或下载 d3 会改动正在使用的推理服务，本次没有做。细节见 [`agent/evidence/b0-d3-omlx-spike.md`](agent/evidence/b0-d3-omlx-spike.md)。
 
 ## 附录 B · 后端比较记录
 

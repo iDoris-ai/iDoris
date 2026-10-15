@@ -4,11 +4,11 @@
 > 基线：`origin/main@01133d4`。路线图位置：WP-A 属于 F1.2 的后续，WP-B 属于 F2.4 的后续和 M6「入口判定层」。
 > 协作规则见 [`../COLLAB.md`](../COLLAB.md)。编码由本机子 agent 完成，主会话负责规划、测试和验收。
 
-> **实施门禁（2026-10-15 更新）**：本 PR 仅提交设计供批准，不授权开工。必须先完成 prdaemon 的 Codex astra 审核，再获得 owner 明确的开发许可，才能启动实现、实机 spike 或实现子 agent。下列 `READY` 只表示任务依赖就绪，不代表已获开工许可。使用 default/standard 服务，禁止 Fast/priority。
+> **实施门禁（2026-10-15）**：PR #524 已合并进 `main`。owner 已许可开工，但实现只进入 feature 分支 `feat/runtime-portability-and-decision-model`。owner 明确允许之前，不向 `main` 提 PR，也不把任务分支直接合进 `main`。使用 default/standard 服务，禁止 Fast/priority。
 
 ## 执行约定
 
-- 每个任务开一个分支 `feat/<wp>-<id>-<短名>`（例如 `feat/runtime-a2-vllm-kind`），PR 直接提到 `main`，单个 PR 不超过 300 行（不含测试 fixture）。
+- 集成分支是 `feat/runtime-portability-and-decision-model`（从 `origin/main@997db59` 拉出）。每个任务再开 `feat/<wp>-<id>-<短名>`（例如 `feat/runtime-a2-vllm-kind`），先合并回这条 feature 分支。单个任务不超过 300 行（不含测试 fixture）。
 - 每个修复或新行为必须带回归测试，并说明「去掉实现后测试会失败」。
 - 改到契约（`packages/contracts/schema/*.json`）时，同步运行 `node scripts/gen-contracts.mjs` 和 `node scripts/check-contract-drift.mjs`；对 Agent24 可见的变更要升契约版本（`scripts/contract-version.mjs`）。
 - 依赖真实引擎的任务（标 🖥）在本机 M1 Max 上做实机验证，结果贴进 PR。CI 只跑 wiremock 和 mock。
@@ -147,7 +147,8 @@ WP-B  B0 + A1 -> B3
   - 覆盖 `daily + coding`、`auto + Intent`、`auto + Complexity`、缺少/非法 header 的组合；非法 header 仍为 400。其他显式角色（vision/embed/decide 等）不因“聊天模式”这个名称被改成 daily/chat 能力。
 - **风险/回滚**：对外可见的行为变化仅限「不带意图头的非 auto 请求不再自动识别意图」；仓库默认路由不引用这四类识别意图，因此默认选择不变；自定义 intent 策略可能变化，必须写明迁移影响。回滚恢复此前检测调用条件；字段来源仅为内部元数据，不应改写调用方声明。
 
-### B0 🖥 d3 在 oMLX 上的实机 spike  `READY`
+### B0 🖥 d3 在 oMLX 上的实机 spike  `BLOCKED`
+- **2026-10-15**：本机 oMLX 0.6.4 没有 `/v1/systemone`，模型目录也没有 d3。证据在 [`../evidence/b0-d3-omlx-spike.md`](../evidence/b0-d3-omlx-spike.md)。未升级服务、未下载权重。B2/B3 及之后的 d3 链路暂停，直到 owner 批准更换本机 oMLX。
 - **优先级**：high（B2、B4 的前置）
 - **目标**：确认 `/v1/systemone` 的线格式，以及 d3-lite / d3-nano 对中文输入的实际表现。
 - **开发范围**：
