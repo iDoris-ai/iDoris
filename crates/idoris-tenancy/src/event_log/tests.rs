@@ -982,6 +982,120 @@ fn tenant_type_query_plan_seeks_each_optional_time_range() {
 }
 
 #[test]
+fn tenant_type_record_query_seeks_record_for_each_optional_time_range() {
+    let store = EventLogStore::new(Connection::open_in_memory().unwrap()).unwrap();
+    let conn = store.0.lock().unwrap();
+    for (from, to) in [
+        (None, None),
+        (Some(10), None),
+        (None, Some(20)),
+        (Some(10), Some(20)),
+    ] {
+        let query = EventLogQuery {
+            from_ts_utc_ms: from,
+            to_ts_utc_ms: to,
+            record_id: Some("late"),
+            limit: 1,
+        };
+        let plan: Vec<String> = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {}", tenant_type_query(&query)))
+            .unwrap()
+            .query_map(
+                rusqlite::params!["a", "audit.finalized", from, to, "late", 1],
+                |row| row.get(3),
+            )
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(
+            plan.iter().any(|detail| {
+                detail.contains("SEARCH e USING INDEX event_log_tenant_record_sequence")
+                    && detail.contains("tenant_id=? AND record_id=?")
+            }),
+            "record-filter candidate must seek tenant and record: {plan:?}"
+        );
+        println!("record bounds=({from:?},{to:?}) plan={plan:?}");
+    }
+}
+
+#[test]
+fn tenant_type_record_query_work_ignores_unrelated_tenant_history() {
+    use rusqlite::StatementStatus;
+
+    let store = EventLogStore::new(Connection::open_in_memory().unwrap()).unwrap();
+    let mut terminal = sample("a", "late");
+    terminal.event_type = EventType::AuditFinalized;
+    terminal.ts_utc_ms = 10;
+    store.append(Some("a"), &terminal).unwrap();
+    terminal.event_id = Uuid::new_v4().to_string();
+    terminal.ts_utc_ms = i64::MAX;
+    let sequence = store.append(Some("a"), &terminal).unwrap();
+    let expected = EventLogEvent {
+        sequence,
+        event: terminal.clone(),
+    };
+    for (tenant, kind) in [
+        ("a", EventType::FeedbackReceived),
+        ("b", EventType::AuditFinalized),
+    ] {
+        let mut event = sample(tenant, "late");
+        event.event_type = kind;
+        store.append(Some(tenant), &event).unwrap();
+    }
+
+    let mut previous_size = 0;
+    let mut baseline = BTreeMap::new();
+    for size in [0, 100, 1_000] {
+        for i in previous_size..size {
+            let mut event = sample("a", &format!("unrelated-{i}"));
+            event.event_type = EventType::AuditFinalized;
+            event.ts_utc_ms = i;
+            store.append(Some("a"), &event).unwrap();
+        }
+        previous_size = size;
+        for record in ["absent", "late"] {
+            let query = EventLogQuery {
+                record_id: Some(record),
+                limit: 1,
+                ..Default::default()
+            };
+            let expected = if record == "late" {
+                vec![expected.clone()]
+            } else {
+                Vec::new()
+            };
+            assert_eq!(
+                store
+                    .events_for_tenant_type(Some("a"), EventType::AuditFinalized, &query)
+                    .unwrap(),
+                expected
+            );
+            let conn = store.0.lock().unwrap();
+            let mut stmt = conn.prepare(&tenant_type_query(&query)).unwrap();
+            let actual: Vec<i64> = stmt
+                .query_map(
+                    rusqlite::params!["a", "audit.finalized", None::<i64>, None::<i64>, record, 1],
+                    |row| row.get(0),
+                )
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            assert_eq!(
+                actual,
+                expected.iter().map(|row| row.sequence).collect::<Vec<_>>()
+            );
+            let steps = stmt.get_status(StatementStatus::VmStep);
+            let initial = *baseline.entry(record).or_insert(steps);
+            println!("unrelated={size} record={record} vm_steps={steps} baseline={initial}");
+            assert!(
+                steps <= initial + 32,
+                "single-record work grew with unrelated history: record={record}, size={size}, steps={steps}, baseline={initial}"
+            );
+        }
+    }
+}
+
+#[test]
 fn canonical_v1_upgrades_and_v2_reopens_without_changing_history() {
     let db = temp_db("upgrade-v2");
     let conn = Connection::open(&db).unwrap();
