@@ -2,14 +2,73 @@
   "schema": "baton-result/v1",
   "task_id": "idoris-cloud-grok-pr428-dependency-security-20261015",
   "attempt_id": "18ad79ec-e20e-44b7-8f21-f00e21726554",
-  "sequence": 1,
-  "status": "started",
+  "sequence": 2,
+  "status": "completed",
   "base_sha": "26c6d464bf513871c9ff30c3699b684dd0016b35",
   "branch": "baton/grokbot-20261015-pr428-dependency-security",
-  "result_sha": null,
-  "summary": "开始处理 PR428 继承的 cargo-deny 失败（rustls 0.23.45 漏洞 + unsafe-libyaml 不再维护）",
-  "tests": [],
+  "result_sha": "54299bef5785a57de681fb6278e1df6a0059f2a1",
+  "summary": "Cargo.lock 仅将 rustls 0.23.45 升至 0.23.46（版本+校验和，经 cargo update 真实解析），deny.toml 原样复制主线已有的 RUSTSEC-2024-0449 不再维护豁免；未新增或忽略任何漏洞 ID，未改其他依赖。cargo deny 四项全过，cargo check --locked 通过。仅为云端交付，待协调者独立验收。",
+  "tests": [
+    {
+      "command": "cargo deny check advisories (pre-fix base 26c6d46, RED)",
+      "exit_code": 1
+    },
+    {
+      "command": "cargo update -p rustls@0.23.45 --precise 0.23.46",
+      "exit_code": 0
+    },
+    {
+      "command": "cargo metadata --locked --format-version 1",
+      "exit_code": 0
+    },
+    {
+      "command": "cargo deny check advisories",
+      "exit_code": 0
+    },
+    {
+      "command": "cargo deny check advisories bans licenses sources",
+      "exit_code": 0
+    },
+    {
+      "command": "cargo check --locked -p idoris-policy -p idoris-router -p idoris-upstream",
+      "exit_code": 0
+    },
+    {
+      "command": "cargo check --locked --workspace",
+      "exit_code": 0
+    }
+  ],
   "blocker": null,
-  "next": null,
-  "updated_at": "2026-10-15T13:03:17+00:00"
+  "next": "交协调者独立验收，与 Codex policy 修复一次更新原 PR428；不声称 M5 已合并",
+  "updated_at": "2026-10-15T13:05:21+00:00",
+  "source_head": "54299bef5785a57de681fb6278e1df6a0059f2a1",
+  "files": [
+    "Cargo.lock",
+    "deny.toml"
+  ],
+  "pass_fail": {
+    "red_pre_fix_cargo_deny_advisories": "FAIL as expected (RUSTSEC-2026-0346/0347/0348/0349 rustls 0.23.45 + RUSTSEC-2024-0449 unsafe-libyaml unmaintained)",
+    "post_fix_cargo_deny_advisories": "PASS",
+    "post_fix_bans_licenses_sources": "PASS",
+    "cargo_check_locked": "PASS"
+  },
+  "evidence": {
+    "tool_versions": {
+      "cargo": "1.95.0",
+      "cargo-deny": "0.20.2 (official GitHub release x86_64-unknown-linux-musl, tarball sha256 9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f matches published .sha256)"
+    },
+    "advisory_db_commit": "edb58f5974b83eb8302332821cb6d389777aa351",
+    "rustls_0.23.46_crates_io_checksum": "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf",
+    "file_sha256": {
+      "Cargo.lock": "c89e4f57d075076f2f27ef5f81e0765fbb9af00d41dd226254610db9ccb07a26",
+      "deny.toml": "194c06b4411b77d1f745958b91cb30354e2c6c8a638c9ac8777120b5fa75b233"
+    },
+    "lock_matches_main_reference_22edaf15": "Cargo.lock post-image blob identical to reference commit; deny.toml hunk identical to main's existing RUSTSEC-2024-0449 entry"
+  },
+  "coverage_gaps": [
+    "未运行全量 cargo test（判据允许用聚焦检查）；仅 cargo check --locked（policy/router/upstream 及 --workspace）",
+    "未在 GitHub Actions 上复跑；本地 cargo-deny 0.20.2 与 CI 的 cargo-deny-action@v2 版本可能不同",
+    "cargo update -p rustls 顺带把 tempfile 的 getrandom 依赖从 0.4.3 改解析为 0.3.4（两者都满足约束），已手工还原以保持只改 rustls；还原后 cargo metadata/check --locked 均通过",
+    "主线沿用的 deny.toml 注释写 RUSTSEC-2024-0449 于 2026-10-12 发布，advisory-db 原文 date=2024-03-25（informational=unmaintained、patched 为空、无 CVE 别名）；按要求原样复制主线条目未改注释，供协调者判断"
+  ]
 }

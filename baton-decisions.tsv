@@ -1,2 +1,5 @@
 time	decision	reason
 2026-10-15T13:03:17Z	started	从 base 26c6d46 拉出分支；仅允许改 Cargo.lock、deny.toml 与回执文件
+2026-10-15T13:05:21Z	rustls_only	cargo update 精确升级 rustls 至 0.23.46；还原顺带的 tempfile getrandom 重解析，lock 与主线参考 22edaf15 一致
+2026-10-15T13:05:21Z	deny_exception	主线 origin/main 确含 RUSTSEC-2024-0449 条目，advisory 为 informational=unmaintained、无补丁、无 CVE；原样复制，未加其他忽略
+2026-10-15T13:05:21Z	completed	cargo deny advisories/bans/licenses/sources 全过，cargo check --locked 通过；推送分支，不开 PR 不合并
