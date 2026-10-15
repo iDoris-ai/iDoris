@@ -1,7 +1,7 @@
 # 73 个历史 PR 的逐项核对与承接
 
 核对日期：2026-10-15；比较主线 `03c079c70611331a8c85a1666e32a75df6359d09`。
-行动记录更新至 main `08405ea968bcb919d48cabab535ab0337ecb3ace`；全量表保留原核对基线。
+行动记录更新至 main `b84566128c15c7424bd7a6a1f162b4be6aeed2a7`；预算开发栈另记录下列合并，全量表保留原核对基线。
 
 范围是核对开始时的 73 个开放 PR；#423/#482 已在前一轮关闭；新建 #507/#508 等另计。原始分类为 62 个 M5、8 个 M4 收尾候选、3 个历史/CI 记录。逐项读取 slice、源码/测试、后续承接、精确 head、review 与 base 消费关系；73/73 编号覆盖且无重复。此清单不是逐 PR 重跑全部测试或新的 GitHub APPROVE。
 
@@ -10,7 +10,9 @@
 - 沿栈继承不等于替代：功能尚未进入 main 的 M5 切片继续开发。
 - 完整活跃替代 PR 可以承接旧 PR 的审查；关闭旧 PR 不代表替代已合并或已发布。
 - 仍有开放 PR 依赖的 base 分支保留。四个已无消费者和 checkout 的远端分支在完整祖先与备份验证后删除；无强推或批量 rebase。
-- #425 已修复契约不变量，并以 a5b3272 同步已审核的依赖安全修复；#479 的 nullable cap 修复已获 e3426f6 精确 head 批准，预算父层同步安全补丁后仍需新 head CI/复审。
+- #425 已修复契约不变量，并以 a5b3272 同步已审核的依赖安全修复，保留其开发栈审查入口。
+- #479 的 nullable cap 和单 completion 报价边界已在精确 head `13962dd` 获批准、CI 绿、CLEAN 且包含最新 base 后，普通合并到 #477 的 `feat/budget-safety-01-paid-state`；合并提交 `0b7f68e` 尚未进入 main。#477 新 head 需要重新 CI/精确批准，旧 `f13d837` 批准不沿用，消费者分支保留。[#479](https://github.com/iDoris-ai/iDoris/pull/479)
+- `n` 缺省、null、整数 1 保留兼容，其余值由 #517 在实际预检阶段拒绝，零上游 POST、零账本变化；#517 已合入 #479 开发分支，随本次 #479 进入 #477，并非 main 或 031 发行内容。旧计划中“n 未计入报价仍待修复”不能再描述这棵开发栈。[#517](https://github.com/iDoris-ai/iDoris/pull/517)
 - M5 的 REDACT 仍需 iDoris 本地控制台中用户逐次、单次确认；长期/调用方授权暂不启用。
 
 ## 重复与历史 PR 的承接清单
@@ -30,12 +32,18 @@
 | [#484](https://github.com/iDoris-ai/iDoris/pull/484) | 字节边界和真实绑定 fixture 由 [#513](https://github.com/iDoris-ai/iDoris/pull/513) 迁移；没有以 UTF-16 限制替换字节限制。 | 已关闭；仍有消费者的 base 保留 |
 | [#496](https://github.com/iDoris-ai/iDoris/pull/496) | 预算事件失败 503、零 POST、账本恢复矩阵由 [#514](https://github.com/iDoris-ai/iDoris/pull/514) 迁移，已合入 main 92cd184。 | 已关闭；仍有消费者的 base 保留 |
 
-关闭后，原73项已关闭11项，剩余62个审查入口：60个M5功能/测试切片、#491的M5 CI配套，以及#485一个M4测试尾项。新建PR另计。M5已归入 [GitHub里程碑](https://github.com/iDoris-ai/iDoris/milestone/1)，M4接线收尾归入 [v0.3.1](https://github.com/iDoris-ai/iDoris/milestone/2)。
+原73项现有11项已关闭、1项（#479）已合入开发栈，剩余61个开放审查入口：59个M5功能/测试切片、#491的M5 CI配套，以及#485一个M4测试尾项。栈内合并与 main 已交付分别记账。新建PR另计。M5已归入 [GitHub里程碑](https://github.com/iDoris-ai/iDoris/milestone/1)，M4接线收尾归入 [v0.3.1](https://github.com/iDoris-ai/iDoris/milestone/2)。
 
 ## 仍需继续的收尾
 
 - #485：九端点拒绝/缺 authenticator 独立矩阵已迁移到 [#515](https://github.com/iDoris-ai/iDoris/pull/515)，本地独立验收通过；515 尚未合入，原485保持开放，不提前删除依赖 base。
 - #491 含实际 fixture/CI 代码，不能因标题是 docs 就关闭；作为 M5 CI 配套继续承接。
+
+## 合并优先级
+
+- P0：先完成当前 main 的真实 M4 与 031 新行为验收；#507/#510/#515/#518/#522/#525/#526 按当前精确 head 的 CI、远程批准和 base 关系收口。#485 在 #515 真正合入前保持开放。
+- P0：Agent24 受保护 `ab/idoris` 的 provider、已分配硬件预算和真实两进程验收；计划/消费方指针存在或局部测试通过不代表已交付。最终集成到 main 保留仓库规定的人工 gate。
+- P1：#477 的新 `0b7f68e` 按新 head 复审；#480 自动改为以 #477 为 base 后，已 Update branch 到 `ec879e1`，核对包含最新 base 并请求新 head 复审。M5 隐私链逐层维护 base；其他旧切片即使批准，也须保留各自行记录载明的继承缺口，不把旧栈整体称作安全或已发布。
 
 ## 全量逐 PR 结果（核对基线）
 
