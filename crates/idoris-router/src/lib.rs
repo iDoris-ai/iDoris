@@ -3343,6 +3343,12 @@ mod protocol_error_matrix_tests;
 mod policy_wiring_tests;
 
 #[cfg(test)]
+mod tenant_test_support;
+
+#[cfg(test)]
+use tenant_test_support::{tenant_test_app, tenant_test_request};
+
+#[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -4345,8 +4351,11 @@ mod tests {
             deploy_mode: idoris_contracts::DeployMode::Tenant,
             ..AppState::default()
         };
-        let app = build_app(state);
-        let response = app.oneshot(post_chat("{}", &[])).await.unwrap();
+        let (app, key) = tenant_test_app(state, "acme");
+        let response = app
+            .oneshot(tenant_test_request(post_chat("{}", &[]), &key))
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
