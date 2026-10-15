@@ -1,0 +1,7 @@
+seq	decision	rationale
+1	branch claude/idoris-pr521-identity-5287-j89ti8	platform-assigned name; requested unsuffixed name not pushed
+2	echo guard in adapter not wire module	native_completion_wire is shared with oMLX and read-only for this task
+3	guard applies to llama too	llama engine_model is config.model_id; requiring exact echo is consistent and fails closed on gguf-path echoes
+4	body model rewrite is the only body mutation	documented exception to raw pass-through; other fields asserted unchanged
+5	legacy path unchanged	legacy already reports config.model_id and has no engine identity evidence to check
+6	wiremock fixture plus sleeping shell script via public load()	real loopback HTTP and real owned child without private test hooks

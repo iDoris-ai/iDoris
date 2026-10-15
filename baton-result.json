@@ -1,10 +1,52 @@
 {
-  "sequence": 1,
+  "sequence": 2,
   "task_id": "idoris-cloud-claude-pr521-identity-20261015-5287",
   "attempt_id": "a18a1a48-194d-468b-bee4-f54192f0c3c1",
   "base_sha": "c3000c6bfff6080619f5e1d693555559b57f709f",
   "base_branch": "ops/cloud-pr521-model-identity-20261015-5287",
   "branch": "claude/idoris-pr521-identity-5287-j89ti8",
   "requested_branch": "claude/idoris-pr521-identity-5287",
-  "status": "started"
+  "branch_note": "platform-assigned branch name carries suffix -j89ti8; no push to the unsuffixed name, original521, base or main",
+  "status": "completed",
+  "source_head": "dbdbd84e321ce184d42a0a5b0127669938319f7d",
+  "result_sha": "dbdbd84e321ce184d42a0a5b0127669938319f7d",
+  "result_sha_note": "code result commit; this baton file lands in the next commit on the same branch (its own sha cannot be self-referenced)",
+  "files": [
+    "crates/idoris-upstream/src/local_http_runtime.rs",
+    "crates/idoris-upstream/tests/local_runtime_native_identity.rs",
+    "baton-result.json",
+    "baton-decisions.tsv"
+  ],
+  "toolchain": "rustc 1.95.0 (59807616e 2026-04-14); cargo 1.95.0 (f2d3ce0bd 2026-03-21); x86_64-unknown-linux-gnu; Cloud Linux container running as uid 0",
+  "commands": [
+    {"cmd": "cargo test -p idoris-upstream --test local_runtime_native_identity (base source + new test, RED)", "exit": 101, "passed": 2, "failed": 3, "evidence": "mlx response.model left=\"default_model\" right=\"qwen3-local-configured\"; wrong echo accepted for mlx and llama; missing echo already failed via shared wire check"},
+    {"cmd": "cargo test -p idoris-upstream --test local_runtime_native_identity (fix, GREEN)", "exit": 0, "passed": 5, "failed": 0},
+    {"cmd": "mutation M1: echo guard disabled (&& false)", "exit": 101, "passed": 3, "failed": 2, "red_tests": ["mlx_native_wrong_engine_echo_fails_closed", "llama_native_engine_model_is_configured_id_and_echo_is_required"]},
+    {"cmd": "mutation M2: response.model mapping removed and body model left as engine_model", "exit": 101, "passed": 4, "failed": 1, "red_tests": ["mlx_native_response_exposes_configured_model_not_placeholder"]},
+    {"cmd": "mutation M3: only native body model mapping reverted to engine_model", "exit": 101, "passed": 4, "failed": 1, "red_tests": ["mlx_native_response_exposes_configured_model_not_placeholder"]},
+    {"cmd": "source restored after mutations (cmp identical to fix)", "exit": 0},
+    {"cmd": "cargo fmt --all -- --check", "exit": 0},
+    {"cmd": "cargo clippy -p idoris-upstream --all-targets -- -D warnings", "exit": 0},
+    {"cmd": "cargo test -p idoris-upstream --no-fail-fast (head)", "exit": 101, "binaries": 25, "passed": 195, "failed": 11},
+    {"cmd": "cargo test -p idoris-upstream --no-fail-fast (base c3000c6 via temporary worktree, same target dir)", "exit": 101, "passed": 190, "failed": 11, "note": "identical failing test-name set to head; head adds exactly the 5 new tests"},
+    {"cmd": "timeout 580 cargo test --workspace --no-fail-fast", "exit": 124, "binaries_completed": 80, "passed": 1262, "failed": 5, "note": "timed out while running idoris-upstream tests/subscription_cli_fixture.rs; all 5 failures are in the base-known failing set"}
+  ],
+  "preexisting_environmental_failures": [
+    "subscription::output::tests::symlink_directory_and_oversized_result_are_rejected (uid 0 bypasses read-only permission check)",
+    "subscription_cancel: cancellation_reaps_the_owned_group, output_limit_reaps_a_process_that_would_otherwise_hang, cancelling_one_request_does_not_kill_another_group, timeout_reaps_even_a_term_ignoring_group",
+    "ignored_term_escalates_to_kill_and_reaps_direct_child, parent_exit_clears_pipe_holding_descendant_and_drain_is_bounded",
+    "nonzero_empty_timeout_cancel_and_output_limit_are_fixed_errors",
+    "real_child_sees_safe_argv_scrubbed_secrets_and_read_only_cwd",
+    "repeated_shutdowns_and_request_finish_race_are_idempotent",
+    "workspace_has_private_control_and_restricted_request_cwd"
+  ],
+  "residue_check": "no test child processes after runs; only listeners are platform-owned (process_api 2024/2025, environment-manager, claude)",
+  "coverage_gaps": [
+    "full workspace test did not finish within the 580s budget: stopped in idoris-upstream subscription_cli_fixture; remaining binaries after it (idoris-upstream subscription_* tail, supervisor_*, and any crate ordered later) not run in the workspace pass, though all idoris-upstream binaries ran in the separate package run",
+    "workspace-wide clippy not run (only idoris-upstream all-targets)",
+    "11 pre-existing subscription/process-group test failures in this uid-0 container reproduce identically on base; not investigated (out of scope, read-only files)",
+    "Linux only; no real mlx_lm.server or llama-server process, no real model, no macOS, no v0.3.1 / signing acceptance claimed",
+    "real engine echo behaviour (mlx_lm.server echoing default_model, llama-server echoing request model) is asserted by fixture only, not proven against real binaries"
+  ],
+  "result_summary": "LocalHttpRuntimeAdapter native path now requires response.model to equal the outbound engine_model (mlx: default_model; llama.cpp: config.model_id), failing closed on missing or wrong echo, then maps ChatResponse.model and the native JSON model field to config.model_id. This name mapping is the single deliberate exception to raw native body pass-through; id/object/created/system_fingerprint/choices (tool_calls, finish_reason)/usage are preserved byte-for-byte (asserted by full-body equality). Legacy (non-native) path unchanged and needs no echo; shared native_completion_wire and remote oMLX identity validation untouched."
 }
