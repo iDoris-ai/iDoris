@@ -14,6 +14,8 @@ pub enum FactsSource {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HostFacts {
+    /// Real host RAM for eligibility; probes use round(total bytes / 2^30).
+    /// Injected fixture facts may be fractional. This is not allocated memory.
     pub ram_gb: f64,
     pub chip: String,
     pub gpu_cores: Option<u32>,

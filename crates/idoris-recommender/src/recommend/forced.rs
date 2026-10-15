@@ -2,8 +2,9 @@ use crate::catalog::Catalog;
 use crate::probe::HostFacts;
 
 use super::quant::{lowest_footprint_pick, pick_quant, quant_by_label};
-use super::resident::budget_breakdown;
-use super::types::{CoreOverride, ForcedResult, RecommenderPolicy, ResidentChoice};
+use super::types::{
+    BudgetBreakdown, CoreOverride, ForcedResult, RecommenderPolicy, ResidentChoice,
+};
 
 pub fn apply_core_override(
     catalog: &Catalog,
@@ -11,6 +12,7 @@ pub fn apply_core_override(
     policy: &RecommenderPolicy,
     forced: Option<&str>,
     current_resident: Option<ResidentChoice>,
+    budget: &BudgetBreakdown,
 ) -> ForcedResult {
     let Some(forced) = forced.map(str::trim).filter(|value| !value.is_empty()) else {
         return ForcedResult {
@@ -33,7 +35,7 @@ pub fn apply_core_override(
         };
     };
 
-    let resident_budget = budget_breakdown(host, policy).resident_budget_gb;
+    let resident_budget = budget.resident_budget_gb;
     let mut warnings = Vec::new();
     let mut pick = forced_quant.and_then(|label| quant_by_label(model, label, policy));
     let mut used_lowest_fallback = false;
@@ -59,7 +61,26 @@ pub fn apply_core_override(
         };
     };
 
-    if used_lowest_fallback {
+    // A user override can spend the soft resident reserve, but never another
+    // application's allocation or bypass real host eligibility in allocated mode.
+    if budget.allocated_budget_bytes.is_some()
+        && (pick.footprint_gb > budget.usable_gb || host.ram_gb < model.min_ram_gb)
+    {
+        warnings.push(format!(
+            "IDORIS_CORE_MODEL={forced} BLOCKED: footprint {:.9}GB / allocated total {:.9}GB; min_ram_gb={} / ram_gb={}; override inactive",
+            pick.footprint_gb, budget.usable_gb, model.min_ram_gb, host.ram_gb
+        ));
+        return ForcedResult {
+            resident: current_resident,
+            override_choice: Some(CoreOverride {
+                id: model.id.clone(),
+                active: false,
+            }),
+            warnings,
+        };
+    }
+
+    if used_lowest_fallback && budget.allocated_budget_bytes.is_none() {
         warnings.push(format!(
             "IDORIS_CORE_MODEL={} 放不下常驻预算（{resident_budget:.2}GB）：已强制放行，请自行承担 OOM 风险",
             model.id
