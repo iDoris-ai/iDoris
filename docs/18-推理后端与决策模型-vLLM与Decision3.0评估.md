@@ -110,6 +110,38 @@
 - **只用模型，不引入 vLLM-SR 的 Go 路由器本体。** `docs/10` 和 `docs/research/rust-base/02` 已经因为它绑定 vLLM、语言栈不符而否决过，这个结论不变。
 - **d3-edge 不用于开放域**（新域只有 12.9 分）；中文能力必须先评测。
 
+### 三种调用模式（2026-10-15 owner 确认，决策点 D-5）
+
+意图识别不再对每条请求都跑，只在调用方明确要求「交给 iDoris 选」时才运行。
+
+**这不是新契约，而是对齐已有契约。** 接口规范 `docs/interfaces/iDoris-Agent24-边界与接口规范.md` §2.3 第 115 行已写明「声明角色的调用不从内容重猜 task/role；显式 auto 才委托角色选择」，第 130 行写明「auto 不作为默认猜测」。现在的代码对 `idoris/daily` 这类已声明角色的请求也做意图识别（`crates/idoris-router/src/intent/mod.rs` 的 `resolve_profile_with_detector` 不看角色），与规范不一致。
+
+| 模式 | 怎么进入 | 意图从哪来 | 是否调用判定模型 |
+|---|---|---|---|
+| **聊天模式**（默认） | `model` 为具体角色（如 `idoris/daily`），或为不透明模型 ID，或不填 | 不识别，按默认 `chat` 处理 | 否 |
+| **自动路由模式** | `model: "idoris/auto"`，且没有 `X-iDoris-Intent` 头 | 识别：先用哈希 detector，d3 生效后用 d3 | 是 |
+| **调用方声明模式** | 带 `X-iDoris-Intent` 头（任意 `model`） | 用调用方声明的值 | 否 |
+
+规则：
+
+- **隐私检查与模式无关。** INSPECTED（闸一）和 `local_only` 过滤对三种模式都照常执行，不变量 #1 的顺序不变；跳过的只是「意图」这一步的识别。
+- **聊天模式的选模型方式和现在一样。** 具体角色在该角色内选；不透明模型 ID 或不填时，不受角色约束，走默认规则。写错的 `idoris/<角色>` 仍然返回 400 `unknown_role`。
+- **路由规则对两种模式生效。** B1 补的 intent/complexity 规则，对「自动路由模式识别出的意图」和「调用方声明的意图」都生效，规则引擎不用改。
+- **d3 只影响自动路由模式。** 判定模型不可用时，只有 `idoris/auto` 请求返回 503 `judge_unavailable`（不变量 #8 原文，不用修改），调用方可以改用具体角色重试。聊天模式和调用方声明模式完全不受影响。
+
+为什么这样分：
+
+1. 普通聊天不依赖判定模型，d3 挂了聊天照常可用，D-1 的风险基本消失。
+2. 每条聊天消息省一次判定调用（50–150ms）；不用 auto 的用户不必常驻 d3。
+3. 和 Agent24 的边界一致：「这是什么任务、用哪个角色」由 Agent24 判断（接口规范 §2.3 第 96 行「Agent24 决定 task→role」），iDoris 只在角色内选模型；auto 是给不想自己判断的调用方的可选服务。
+4. 现在识别出的意图本来就不影响路由（routing-policy 里没有引用它的规则），改成只在 auto 下识别，路由行为不变，只是 Event Log `profiled` 事件里聊天模式的 intent 不再是识别值。
+
+代价：普通聊天里问编程问题不会被自动升级到 deep。要升级，可以选 `idoris/deep` 或 `idoris/auto`，或者由客户端带意图头。
+
+**测试与契约影响**：现有 `conformance/tests/intent-detection.test.ts:30` 和 `crates/idoris-router/tests/intent_wiring.rs:45` 用 `idoris/daily` 并期望触发识别，这本身与规范第 115 行矛盾，需要改成 `idoris/auto`。因为是向规范对齐，不需要升契约版本，但对外可见的行为有变化，要写进 release note。
+
+**一处有意收窄**：规范第 115 行还允许「未声明角色的其他调用方可由静态规则/判定器选角色」（「可」，不是「必须」）。本决定选择不做：不透明模型 ID 或不填 `model` 一律按聊天模式处理，不做识别，保持简单。以后如果出现确实需要的调用方，再单独提出。
+
 ### 融合方式：三个单向阀插槽（代码均已预留）
 
 1. **意图 / 复杂度提议者**
@@ -118,7 +150,8 @@
    - 问题设计：`intent: choice[chat, web_search, coding, email, agent_task]`，`complexity: score[simple, medium, complex]`。
    - **先 shadow，后生效**（总体规划 M6「入口判定层」要求）：先与现行哈希 detector 并跑，只把 d3 的结论和一致率写进 Event Log，不改路由；一致率与评测达标后再切为生效。
    - 生效后置信度低于阈值：视为「未命中」，保留默认 `chat`（与现有 miss 语义一致）。模型给的阈值/置信度只能收紧，按不变量 #8 做 clamp。
-   - 生效后 judge 不可用或超时：按**不变量 #8 默认拒绝**，`reason_code: judge_unavailable`。只有配置显式写 `on_judge_unavailable: fallback_hashing` 时才回落到哈希 detector，并且必须在 `X-iDoris-Degraded` 与 `profiled` 事件里标明，不允许静默回落。见决策点 D-1。
+   - 只在自动路由模式（`idoris/auto`）下运行，见上面的「三种调用模式」。
+   - 生效后 judge 不可用或超时：`idoris/auto` 请求按**不变量 #8 拒绝**，返回 503 `reason_code: judge_unavailable`，不回落、不静默。聊天模式和调用方声明模式不调用 judge，不受影响。见决策点 D-1。
    - 配套改动：
      - 扩展 detector 的输出，让它能写 `complexity`；
      - `resolve_profile` 改为按配置选择 detector（现在硬编码 `default_detector()`）；
@@ -154,15 +187,16 @@
 拆分后的工作包与任务卡见 [`agent/plans/runtime-portability-and-decision-model.md`](agent/plans/runtime-portability-and-decision-model.md)，台账索引见 [`agent/tasks.md`](agent/tasks.md) 的「F1.2+ / F2.4+」一节。
 
 - **WP-A 跨平台推理后端**：A1 ChatProxy Bearer → A2 vLLM runtime kind → A3 vllm-metal 对比 spike → A4 OllamaAdapter → A5 后端探测接线 → A6 跨平台发布（里程碑占位）→ A7 oMLX 依赖风险与退出路径。
-- **WP-B 决策模型提议者**：B0 d3 spike → B2 评测集与评测脚本 / B3 `/v1/systemone` 契约类型 → B4 shadow detector → B5 切为生效（B1 路由规则补 intent/complexity 与它同一版本上线）→ B6 对外 `/v1/systemone` → B7 L1 隐私收紧器（M5 后）→ B8 自有决策模型（M7 占位）。
+- **WP-B 决策模型提议者**：BM 模式分离（意图识别只在 `idoris/auto` 下运行）→ B0 d3 spike → B2 评测集与评测脚本 / B3 `/v1/systemone` 契约类型 → B4 shadow detector → B5 切为生效（B1 路由规则补 intent/complexity 与它同一版本上线）→ B6 对外 `/v1/systemone` → B7 L1 隐私收紧器（M5 后）→ B8 自有决策模型（M7 占位）。
 
 待 owner 确认的决策点：
 
 | 编号 | 问题 | 建议 |
 |---|---|---|
-| D-1 | d3 生效后 judge 不可用时，意图判定是拒绝还是回落哈希？ | 默认拒绝（不变量 #8 原文），配置可显式选 `fallback_hashing`，并在响应头和事件里标明 |
+| D-1 | d3 生效后 judge 不可用时怎么办？ | **已确认（2026-10-15，依赖 D-5）**：只有 `idoris/auto` 请求返回 503 `judge_unavailable`，不变量 #8 不修改；聊天模式和调用方声明模式不调用 judge，不受影响。不再提供 `fallback_hashing` 配置 |
 | D-2 | M6 原设想「复用常驻小模型做 logit 型 System-1」，d3 是专用模型，要多占内存 | 先用 d3-lite（下载约 3.7GB）；B2 评测同时测「常驻聊天模型 + `/v1/systemone` 模拟判定」作对照，用数据决定 |
 | D-3 | Windows 默认后端选 Ollama（不用 vLLM：无官方原生 Windows、WSL2 过不了「妈妈测试」、基本要求 NVIDIA） | **已确认（2026-10-15）**。代价：Ollama 用 GGUF，与 MLX 权重不通用，catalog 按后端分列模型 ID；Ollama 能否跑 d3 未核实，Windows 上的决策模型暂时空缺 |
+| D-5 | 聊天模式与意图路由分开？ | **已确认（2026-10-15）**：分成聊天 / 自动路由 / 调用方声明三种模式，意图识别只在 `idoris/auto` 下运行，见 §3「三种调用模式」 |
 
 ## 附录 A · Spike 记录
 

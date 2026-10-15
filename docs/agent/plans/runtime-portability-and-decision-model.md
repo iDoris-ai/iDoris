@@ -21,13 +21,14 @@ WP-A  A1 ─┐
           A4 ──> A5 ──> A6(里程碑占位)
           A7（文档/护栏，独立）
 
-WP-B  B0🖥 ─┬─> B2 ──────────────────┐
+WP-B  BM（模式分离）──────────────┐
+      B0🖥 ─┬─> B2 ──────────────────┤
             └─> B3 ──> B4(shadow) ────┴─> B5 + B1（同一版本上线）──> B6
                                             └──> B7（依赖 M5 闸一合并）
                                             B8（M7 占位）
 ```
 
-建议顺序：先做 A1、A4、B0、B3（互不依赖，可并行），再做 B2、B4，之后 A2 → B1 与 B5（同一版本）→ A5 → B6，A3/A7 穿插进行，B7 等 M5 合并后再开。
+建议顺序：先做 BM、A1、A4、B0、B3（互不依赖，可并行），再做 B2、B4，之后 A2 → B1 与 B5（同一版本）→ A5 → B6，A3/A7 穿插进行，B7 等 M5 合并后再开。
 
 ---
 
@@ -119,6 +120,23 @@ WP-B  B0🖥 ─┬─> B2 ─────────────────�
 
 ## WP-B Decision 3.0 决策模型提议者
 
+### BM 模式分离：意图识别只在 `idoris/auto` 下运行  `READY`
+- **优先级**：high（B4/B5 的前置；先做它，d3 的影响范围从一开始就只限于 auto 模式）
+- **目标**：落实 docs/18 §3「三种调用模式」（D-5）：聊天模式不识别意图，自动路由模式识别，调用方声明模式用 header。同时修复现有代码与接口规范 §2.3 第 115 行（「声明角色的调用不从内容重猜」）的不一致。
+- **开发范围**：
+  - `crates/idoris-router/src/intent/mod.rs` 的 `resolve_profile_with_detector`：在现有的跳过条件里加上「`parsed.role` 不是 `Some(Role::Auto)` 就跳过」。
+  - TS 参考实现 `packages/router/src/intent.ts` 同步修改。
+  - 把 `conformance/tests/intent-detection.test.ts`、`crates/idoris-router/tests/intent_wiring.rs` 里期望触发识别的用例改成 `idoris/auto`，并为聊天模式补反例。
+  - 向规范对齐，不升契约版本；对外可见的行为变化写进 release note。
+- **明确不做**：不改隐私检查和 `local_only` 过滤；不改聊天模式的选模型逻辑；不改规则引擎。
+- **依赖**：无
+- **验收**：
+  - `idoris/daily`、不透明模型 ID、不填 `model` 三种情况下 detector 调用 0 次（mock 计数）；
+  - `idoris/auto` 且无意图头时 detector 被调用；带意图头时任意 `model` 都调用 0 次；
+  - 三种模式下 `local_only` 都只剩本地候选（隐私检查不随模式跳过）；
+  - 聊天模式的 `decided` 结果与改动前一致（对照测试）。
+- **风险/回滚**：对外可见的行为变化仅限「不带意图头的非 auto 请求不再自动识别意图」；由于现有路由规则不引用识别出的意图，路由结果不变。回滚即删掉这一个跳过条件。
+
 ### B0 🖥 d3 在 oMLX 上的实机 spike  `READY`
 - **优先级**：high（B2、B4 的前置）
 - **目标**：确认 `/v1/systemone` 的线格式，以及 d3-lite / d3-nano 对中文输入的实际表现。
@@ -176,12 +194,13 @@ WP-B  B0🖥 ─┬─> B2 ─────────────────�
   - `resolve_profile` 改成按配置选择 detector（现在硬编码 `default_detector()`），配置项为 `intent_judge: { mode: off|shadow|active, model, timeout_ms, min_confidence }`。
   - shadow 模式下 d3 异步运行，不阻塞请求。`profiled` 事件新增 `shadow_intent`、`shadow_agree` 两个标量字段（需要扩充 `crates/idoris-tenancy/src/event_log/mod.rs` 的 SCALAR_KEYS 白名单），只记录标签，不记录内容（不变量 #5、#15）。
 - **明确不做**：shadow 模式不改变 `task.intent`；不做 complexity（在 B5 做）。
-- **依赖**：B3
+- **依赖**：B3、BM
 - **验收**：
   - shadow 模式下，路由结果和请求头与 `off` 模式逐字节相同（对照测试）；
   - judge 超时不影响响应延迟（mock 延迟 5s，响应仍在基线范围内）；
   - 事件里不出现消息内容（沿用现有的内容键黑名单测试）；
-  - header 显式给出 intent 时不调用 judge（mock 断言调用 0 次）。
+  - header 显式给出 intent 时不调用 judge（mock 断言调用 0 次）；
+  - 聊天模式（非 `idoris/auto`）下不调用 judge（mock 断言调用 0 次）。shadow 的一致率数据只来自 auto 流量，样本不足时以 B2 的离线评测为准。
 
 ### B5 切为生效：intent + complexity  `BACKLOG`
 - **优先级**：medium
@@ -189,13 +208,14 @@ WP-B  B0🖥 ─┬─> B2 ─────────────────�
 - **开发范围**：
   - 扩展 detector 输出，使其也能给出 complexity（`IntentHit` 增加可选的 `complexity`）。
   - 置信度低于 `min_confidence` 时视为未命中，intent 保持默认 `chat`；配置里的阈值只能调高，不能低于代码下限（clamp）。
-  - judge 不可用时的行为由 D-1 决定：默认 503 `judge_unavailable`；如果配置了 `on_judge_unavailable: fallback_hashing`，就回落到哈希 detector，并在 `X-iDoris-Degraded: intent_judge_fallback` 和 `decided` 的 reason_codes 里标明。
+  - judge 不可用时（D-1）：`idoris/auto` 请求返回 503 `judge_unavailable`，不回落；聊天模式和调用方声明模式不调用 judge。
+  - 启用 auto 时，在 oMLX 里把 d3 设为常驻（pin），启动时检查它是否就绪，降低被内存压力挤掉的概率。
 - **明确不做**：不让 d3 影响 privacy、预算或准入（不变量 #1、#10）。
 - **依赖**：B4，以及 B2 达到通过线；与 B1 同一版本上线
 - **验收**：
   - `local_only` 加 `active` 时，d3 仍可运行（Loopback），远程候选仍为 0；
   - 低置信度时结果与 miss 相同；
-  - judge 不可用时：默认配置返回 503 和 `judge_unavailable`，配置回落时返回 200 并带 degraded 头；
+  - judge 不可用时：`idoris/auto` 返回 503 和 `judge_unavailable`；同一时刻 `idoris/daily` 请求正常返回 200；
   - property test：任何 d3 输出都不会让候选集合多出非 local 的卡。
 
 ### B6 对外 `/v1/systemone`（M6）  `BACKLOG`
@@ -230,7 +250,8 @@ WP-B  B0🖥 ─┬─> B2 ─────────────────�
 
 | 编号 | 问题 | 建议 |
 |---|---|---|
-| D-1 | d3 生效后 judge 不可用：拒绝还是回落？ | 默认拒绝（不变量 #8）；可在配置里显式选择回落，回落时必须在响应头和事件里标明 |
+| D-1 | d3 生效后 judge 不可用：拒绝还是回落？ | **已确认（2026-10-15，依赖 D-5）**：只有 `idoris/auto` 返回 503 `judge_unavailable`；不变量 #8 不修改；不提供 `fallback_hashing` |
 | D-2 | d3 专用模型和「复用常驻小模型」之间的取舍 | B2 同时评测两者，用数据决定 |
 | D-3 | Windows 默认用 Ollama | **已确认（2026-10-15）**；catalog 按后端分列模型 ID；Ollama 能否跑 d3 未核实，Windows 上的决策模型暂时空缺 |
 | D-4 | B1 改变了默认路由行为 | **已确认（2026-10-15）**：写进 release note，并与 B5 同一版本上线 |
+| D-5 | 聊天模式与意图路由分开 | **已确认（2026-10-15）**：三种调用模式，意图识别只在 `idoris/auto` 下运行，由 BM 落实 |

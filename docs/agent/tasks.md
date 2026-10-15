@@ -440,12 +440,13 @@
 | A5 | NVIDIA 探测 + `detect_backend` 接默认卡 | A2, A4 | BACKLOG |
 | A6 | 跨平台发布 / 非 Apple 内存模型 / Windows 进程 owner（里程碑占位） | A5 | BACKLOG |
 | A7 | oMLX 依赖清单 + 退出路径样例配置 | — | READY |
+| BM | 模式分离：意图识别只在 `idoris/auto` 下运行（聊天 / 自动路由 / 调用方声明三种模式，D-5） | — | READY |
 | B0 | 🖥 d3-lite 在 oMLX `/v1/systemone` 上的线格式 + 中文 spike | — | READY |
 | B1 | `routing-policy.yaml` 补 intent / complexity 规则（与 B5 同一版本上线） | B5 | BACKLOG |
 | B2 | ≥200 条中英评测集 + 评测脚本（准确率 / ECE / 置换一致 / 延迟） | B0 | BACKLOG |
 | B3 | `/v1/systemone` 契约 schema + `SystemOneClient` | B0（可先行） | READY |
-| B4 | `SystemOneDetector` shadow 模式（只记一致率，不改路由） | B3 | BACKLOG |
-| B5 | 切为生效：intent + complexity；judge 不可用时的行为见 D-1 | B4, B2 过线；与 B1 同版本 | BACKLOG |
+| B4 | `SystemOneDetector` shadow 模式（只记一致率，不改路由） | B3, BM | BACKLOG |
+| B5 | 切为生效：intent + complexity；judge 不可用时仅 `idoris/auto` 返回 `judge_unavailable`（D-1） | B4, B2 过线；与 B1 同版本 | BACKLOG |
 | B6 | 对外 `POST /v1/systemone`（M6，scope + `judge_unavailable`） | B3, B5 | BACKLOG |
 | B7 | L1 隐私收紧器（只收紧） | M5 闸一合并 | BLOCKED |
 | B8 | 自有决策模型（M7 占位，d3 作 base/教师） | M6 | BACKLOG |
