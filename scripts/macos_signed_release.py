@@ -82,11 +82,16 @@ class Runner:
     def __call__(self, stage, argv):
         # Never print argv, local paths, aliases, environment, or raw tool output.
         # File-backed capture bounds memory even if a tool is unexpectedly noisy.
+        # Preserve local keychain, temporary-directory and selected Xcode context.
+        # Signing tools do not need ambient API tokens or unrelated credentials.
+        env = {key: os.environ[key] for key in
+               ("HOME", "PATH", "TMPDIR", "LANG", "DEVELOPER_DIR") if key in os.environ}
+        env["LC_ALL"] = "C"
         with tempfile.TemporaryFile() as output:
             try:
                 result = subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=output,
                                         stderr=subprocess.STDOUT, timeout=self.timeout,
-                                        check=False, env={**os.environ, "LC_ALL": "C"})
+                                        check=False, env=env)
             except subprocess.TimeoutExpired:
                 raise ReleaseError(f"{stage}: timed out; no deliverable produced") from None
             except OSError:

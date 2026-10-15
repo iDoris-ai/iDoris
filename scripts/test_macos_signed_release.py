@@ -3,6 +3,7 @@
 import io
 import hashlib
 import json
+import os
 from pathlib import Path
 import shutil
 import struct
@@ -235,6 +236,28 @@ class NotaryBehavior(unittest.TestCase):
         with self.assertRaisesRegex(release.ReleaseError, "deadline"):
             release.notarize(lambda *_: json.dumps({"id": SUBMISSION, "status": "In Progress"}),
                              Path("safe.dmg"), "alias", 1, clock=lambda: next(clock), sleep=lambda _: None)
+
+    def test_runner_does_not_forward_ambient_api_credentials(self):
+        keys = ("IDORIS_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GH_TOKEN", "UNRELATED_TEST_SECRET")
+        with patch.dict(os.environ, {key: "fixture-only" for key in keys}):
+            presence = release.Runner(5)("environment presence control", [
+                sys.executable, "-c",
+                "import json, os, sys; print(json.dumps({key: key in os.environ for key in sys.argv[1:]}))",
+                *keys])
+        self.assertEqual(json.loads(presence), {key: False for key in keys})
+
+    def test_runner_preserves_required_nonsecret_context(self):
+        context = {"HOME": "/fixture/operator-home", "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+                   "TMPDIR": tempfile.gettempdir(), "LANG": "en_US.UTF-8", "LC_ALL": "C",
+                   "DEVELOPER_DIR": "/fixture/selected-xcode"}
+        with patch.dict(os.environ, context, clear=True):
+            observed = release.Runner(5)("environment context control", [
+                sys.executable, "-c", "import json, os; print(json.dumps(dict(os.environ)))"])
+        observed = json.loads(observed)
+        self.assertEqual({key: observed.get(key) for key in context}, context)
+        # macOS may add its own encoding field after the process starts.
+        os_added = {"__CF_USER_TEXT_ENCODING"} if sys.platform == "darwin" else set()
+        self.assertLessEqual(set(observed) - set(context), os_added)
 
     def test_runner_failure_and_timeout_hide_private_output(self):
         runner = release.Runner(1)
