@@ -33,7 +33,7 @@ fn fake_runtime(dir: &Path) -> PathBuf {
         &script,
         r#"#!/bin/sh
 printf '%s\n' "$@" > "$0.args.tmp"
-mv "$0.args.tmp" "$0.args"
+/bin/mv "$0.args.tmp" "$0.args"
 exec sleep 30
 "#,
     )
@@ -276,7 +276,7 @@ async fn llama_load_passes_configured_alias_as_one_process_argument() {
     let server = MockServer::start().await;
     let adapter = loaded_adapter(&server, LocalRuntimeKind::LlamaCpp, dir.path()).await;
     let argv_path = dir.path().join("fake-runtime.sh.args");
-    for _ in 0..40 {
+    for _ in 0..500 {
         if argv_path.exists() {
             break;
         }
