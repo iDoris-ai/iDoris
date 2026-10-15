@@ -17,16 +17,26 @@ import macos_signed_release as release
 TEAM = "ABCDEFGHIJ"
 IDENTITY = "A" * 40
 SUBMISSION = "12345678-1234-1234-1234-123456789abc"
+EXPECTED_STAGES = [
+    "identity lookup", "CLI signing", "signature verification", "signature metadata",
+    "DMG creation", "DMG signing", "signature verification", "signature metadata",
+    "notary submit", "notary info", "ticket stapling", "ticket validation",
+    "signature verification", "signature metadata", "DMG integrity",
+    "DMG Gatekeeper assessment", "DMG mount", "signature verification",
+    "signature metadata", "CLI notarization verification", "DMG detach",
+]
 
 
 class AppleDouble:
     def __init__(self, fail=None, status="Accepted", corrupt=False):
         self.stages = []
+        self.calls = []
         self.fail, self.status, self.corrupt = fail, status, corrupt
         self.payload = None
 
     def __call__(self, stage, argv):
         self.stages.append(stage)
+        self.calls.append((stage, argv))
         if stage == self.fail:
             raise release.ReleaseError("injected tool failure")
         if stage == "identity lookup":
@@ -95,12 +105,25 @@ class ReleaseBehavior(unittest.TestCase):
         self.assertNotIn("test-alias", json.dumps(manifest))
         self.assertLess(fake.stages.index("ticket stapling"), fake.stages.index("DMG mount"))
         self.assertEqual(fake.stages[-1], "DMG detach")
+        self.assertEqual(fake.stages, EXPECTED_STAGES)
+        commands = dict(fake.calls)
+        self.assertEqual(commands["CLI signing"][:-1], [
+            "/usr/bin/codesign", "--force", "--sign", IDENTITY, "--timestamp",
+            "--options", "runtime", "--identifier", "ai.idoris.cli"])
+        self.assertEqual(commands["DMG signing"][:-1],
+                         ["/usr/bin/codesign", "--sign", IDENTITY, "--timestamp"])
+        self.assertEqual(commands["ticket validation"][:-1],
+                         ["/usr/bin/xcrun", "stapler", "validate"])
+        self.assertEqual(commands["DMG integrity"][:-1], ["/usr/bin/hdiutil", "verify"])
+        self.assertEqual(commands["DMG Gatekeeper assessment"][:-1], [
+            "/usr/sbin/spctl", "--assess", "--type", "open", "--context",
+            "context:primary-signature", "--verbose=2"])
+        self.assertEqual(commands["CLI notarization verification"][:-1], [
+            "/usr/bin/codesign", "--verify", "--strict", "-R=notarized",
+            "--check-notarization", "--verbose=4"])
 
     def test_every_failed_stage_stops_without_publishing(self):
-        baseline = AppleDouble()
-        release.release(self.args, baseline)
-        shutil.rmtree(self.args.output)
-        for stage in dict.fromkeys(baseline.stages):
+        for stage in dict.fromkeys(EXPECTED_STAGES):
             with self.subTest(stage=stage):
                 fake = AppleDouble(fail=stage)
                 with self.assertRaises(release.ReleaseError):
@@ -167,12 +190,50 @@ class ReleaseBehavior(unittest.TestCase):
             release.validate(self.args)
 
     def test_wrong_team_or_missing_runtime_or_timestamp_fails(self):
-        for metadata in (f"TeamIdentifier={TEAM}\n", "TeamIdentifier=WRONG\n",
-                         f"TeamIdentifier={TEAM}\nAuthority=Developer ID Application: Test ({TEAM})\nTimestamp=x\n"):
+        valid = (f"TeamIdentifier={TEAM}\nAuthority=Developer ID Application: Test ({TEAM})\n"
+                 "Timestamp=x\nCodeDirectory flags=0x10000(runtime)\n")
+        for metadata in (valid.replace(f"TeamIdentifier={TEAM}", "TeamIdentifier=WRONG"),
+                         valid.replace("Timestamp=x\n", ""),
+                         valid.replace("CodeDirectory flags=0x10000(runtime)\n", "")):
             def run(stage, argv):
                 return metadata if stage == "signature metadata" else ""
             with self.assertRaises(release.ReleaseError):
                 release.signature(run, self.binary, TEAM, runtime=True)
+
+    def test_extra_file_and_symlink_in_mounted_payload_fail(self):
+        for kind in ("extra", "symlink"):
+            fake = AppleDouble()
+            def run(stage, argv):
+                result = fake(stage, argv)
+                if stage == "DMG mount":
+                    mount = Path(argv[argv.index("-mountpoint") + 1])
+                    if kind == "extra":
+                        (mount / "unplanned.txt").write_text("extra")
+                    else:
+                        path = mount / "config/catalog.yaml"
+                        path.unlink()
+                        path.symlink_to(mount / "config/routing-policy.yaml")
+                return result
+            with self.subTest(kind=kind), self.assertRaisesRegex(
+                    release.ReleaseError, "file set" if kind == "extra" else "symbolic links"):
+                release.release(self.args, run)
+            self.assertFalse(self.args.output.exists())
+            self.assertEqual(fake.stages[-1], "DMG detach")
+
+    def test_staging_binary_checksum_is_independent_of_source_validation(self):
+        original_copy = shutil.copyfile
+        def corrupt_copy(source, target, **kwargs):
+            result = original_copy(source, target, **kwargs)
+            if Path(target).name == "idoris":
+                with Path(target).open("ab") as stream:
+                    stream.write(b"changed during staging")
+            return result
+        fake = AppleDouble()
+        with patch("macos_signed_release.shutil.copyfile", side_effect=corrupt_copy):
+            with self.assertRaisesRegex(release.ReleaseError, "binary changed during staging"):
+                release.release(self.args, fake)
+        self.assertEqual(fake.stages, ["identity lookup"])
+        self.assertFalse(self.args.output.exists())
 
     def test_identity_mismatch_stops_before_signing(self):
         for listing in ("0 valid identities found", f'{IDENTITY} "Developer ID Application: Test (XXXXXXXXXX)"',
@@ -236,6 +297,13 @@ class NotaryBehavior(unittest.TestCase):
         with self.assertRaisesRegex(release.ReleaseError, "deadline"):
             release.notarize(lambda *_: json.dumps({"id": SUBMISSION, "status": "In Progress"}),
                              Path("safe.dmg"), "alias", 1, clock=lambda: next(clock), sleep=lambda _: None)
+
+    def test_later_poll_cannot_switch_submission_id(self):
+        responses = iter([{"id": SUBMISSION}, {"id": SUBMISSION, "status": "In Progress"},
+                          {"id": "aaaaaaaa-1234-1234-1234-123456789abc", "status": "Accepted"}])
+        with self.assertRaisesRegex(release.ReleaseError, "different submission"):
+            release.notarize(lambda *_: json.dumps(next(responses)), Path("safe.dmg"),
+                             "alias", 60, sleep=lambda _: None)
 
     def test_runner_does_not_forward_ambient_api_credentials(self):
         keys = ("IDORIS_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GH_TOKEN", "UNRELATED_TEST_SECRET")
