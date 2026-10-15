@@ -301,7 +301,11 @@ mod tests {
 
     #[test]
     fn migrates_legacy_keys_without_granting_tenant_authority() {
-        let conn = Connection::open_in_memory().unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "idoris-tenant-migration-{}.sqlite3",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let mut conn = Connection::open(&path).unwrap();
         conn.execute_batch(
             "CREATE TABLE virtual_key_schema_migrations (version INTEGER PRIMARY KEY);",
         )
@@ -323,6 +327,8 @@ mod tests {
             rusqlite::params![legacy.key_id, &legacy.hash.0[..]],
         )
         .unwrap();
+        initialize_virtual_key_schema(&mut conn).unwrap();
+        initialize_virtual_key_schema(&mut conn).unwrap();
         let store = VirtualKeyStore::new(conn).unwrap();
         let legacy_identity = store.authenticate(&legacy.secret, 1).unwrap().unwrap();
         assert_eq!(legacy_identity.scope.tenant_id, None);
@@ -335,6 +341,49 @@ mod tests {
             .unwrap();
         let bound_identity = store.authenticate(&bound.secret, 1).unwrap().unwrap();
         assert_eq!(bound_identity.scope.tenant_id.as_deref(), Some("victim"));
+        drop(store);
+        let reopened = VirtualKeyStore::open(&path).unwrap();
+        assert_eq!(
+            reopened.authenticate(&bound.secret, 1).unwrap(),
+            Some(bound_identity)
+        );
+        assert_eq!(
+            reopened.authenticate(&legacy.secret, 1).unwrap(),
+            Some(legacy_identity)
+        );
+        drop(reopened);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn tenant_binding_rejects_unusable_identifiers_without_activating_key() {
+        let store = VirtualKeyStore::new(Connection::open_in_memory().unwrap()).unwrap();
+        for tenant in [
+            "".into(),
+            " tenant".into(),
+            "tenant\n".into(),
+            "tenant\0suffix".into(),
+            "x".repeat(129),
+            "é".repeat(65),
+        ] {
+            let key = MintedVirtualKey::mint();
+            let mut bound = scope(None);
+            bound.tenant_id = Some(tenant);
+            assert!(matches!(
+                store.insert_active(&key.key_id, key.hash, &bound),
+                Err(VirtualKeyStoreError::InvalidMetadata)
+            ));
+            assert!(store.authenticate(&key.secret, 1).unwrap().is_none());
+            assert!(!store.has_active_key(1).unwrap());
+        }
+        let key = MintedVirtualKey::mint();
+        let mut bound = scope(None);
+        bound.tenant_id = Some("é".repeat(64));
+        store.insert_active(&key.key_id, key.hash, &bound).unwrap();
+        assert_eq!(
+            store.authenticate(&key.secret, 1).unwrap().unwrap().scope,
+            bound
+        );
     }
 
     #[test]

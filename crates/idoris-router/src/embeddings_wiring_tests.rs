@@ -103,17 +103,21 @@ async fn embeddings_fails_closed_before_upstream_for_wrong_capability_and_untrus
 #[tokio::test]
 async fn tenant_embeddings_requires_tenant_before_upstream() {
     let server = MockServer::start().await;
-    let response = build_app(AppState {
-        deploy_mode: idoris_contracts::DeployMode::Tenant,
-        cards: vec![embedding_card("embed-local", &server.uri())],
-        ..AppState::default()
-    })
-    .oneshot(request(
-        json!({"model":"embed-model","input":"tenant data"}),
-        &[],
-    ))
-    .await
-    .unwrap();
+    let (app, key) = tenant_test_app(
+        AppState {
+            deploy_mode: idoris_contracts::DeployMode::Tenant,
+            cards: vec![embedding_card("embed-local", &server.uri())],
+            ..AppState::default()
+        },
+        "acme",
+    );
+    let response = app
+        .oneshot(tenant_test_request(
+            request(json!({"model":"embed-model","input":"tenant data"}), &[]),
+            &key,
+        ))
+        .await
+        .unwrap();
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     let bytes = response.into_body().collect().await.unwrap().to_bytes();
