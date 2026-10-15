@@ -411,6 +411,90 @@ const FAKE_AWS_ID: &str = concat!("AK", "IA5HVJV2XAZM2TT6A8");
 const FAKE_RAW_SECRET: &str = "zMCTnu5i8RRUKO7CCgpDdFZwTMKHPBZU1HmjS9jA";
 
 #[test]
+fn credential_assignments_score_only_the_value() {
+    for prefix in [
+        "DJANGO_SECRET_KEY_FOR_PRODUCTION_SETTINGS=",
+        "STRIPE_SECRET=",
+        "export DATABASE_PASSWORD=",
+        "--password=",
+        "API_KEY=",
+        "TOKEN=",
+        "K=",
+        "password: ",
+        "",
+    ] {
+        let input = format!("😀 {prefix}{FAKE_RAW_SECRET}");
+        assert_single(
+            &input,
+            FindingKind::HighEntropySecret,
+            FAKE_RAW_SECRET,
+            Sensitivity::S3,
+        );
+        let response = inspect(&input, &open_ctx());
+        assert_eq!(response.action, InspectAction::Block, "{prefix}");
+        assert!(!kinds(&response).contains(&FindingKind::ApiKey));
+    }
+    for value in ["development", "a1B2a1B2a1B2a1B2a1B2a1B2a1B2a1B2a1B2"] {
+        let input = format!("DJANGO_SECRET_KEY_FOR_PRODUCTION_SETTINGS={value}");
+        let response = inspect(&input, &open_ctx());
+        assert!(response.findings.is_empty(), "{response:?}");
+        assert_eq!(response.action, InspectAction::Allow);
+    }
+}
+
+#[test]
+fn credential_assignment_keeps_base64_padding() {
+    // Thirty body characters plus padding: dropping padding would fall below
+    // the existing 32-unit threshold and regress a previously detected value.
+    let value = "aA1bB2cC3dD4eE5fF6gG7hH8iI9jJ0==";
+    for prefix in ["", "DJANGO_SECRET_KEY_FOR_PRODUCTION_SETTINGS="] {
+        let input = format!("😀 {prefix}{value}");
+        assert_single(
+            &input,
+            FindingKind::HighEntropySecret,
+            value,
+            Sensitivity::S3,
+        );
+        assert_eq!(inspect(&input, &open_ctx()).action, InspectAction::Block);
+    }
+}
+
+#[test]
+fn credential_windows_paths_preserve_original_spans() {
+    for path in [
+        r"C:\Users\alice\.aws\credentials",
+        r"C:\Users\a\.ssh\config",
+        r"C:\Users\a\.ssh\known_hosts",
+        r"C:\Users\a\.kube\config",
+        r"C:\Users\a\.docker\config.json",
+        r"%USERPROFILE%\.aws\credentials",
+        r"C:\Users\a\config\.env.local",
+    ] {
+        for written in [path.to_owned(), path.replace('\\', "/")] {
+            let input = format!("😀 cat {written} please");
+            // ':' and '%' delimit the existing ASCII path runs.
+            let expected = written.rsplit([':', '%']).next().unwrap();
+            assert_single(
+                &input,
+                FindingKind::CredentialPath,
+                expected,
+                Sensitivity::S2,
+            );
+            assert_eq!(inspect(&input, &open_ctx()).action, InspectAction::Redact);
+        }
+    }
+    for path in [
+        r"C:\Users\alice\notes.txt",
+        r"C:\code\process.env.API_KEY",
+        r"C:\config\.envrc",
+    ] {
+        let response = inspect(path, &open_ctx());
+        assert!(response.findings.is_empty(), "{response:?}");
+        assert_eq!(response.action, InspectAction::Allow);
+    }
+}
+
+#[test]
 fn prefixed_keys_are_found_by_rule_set_a() {
     for key in [FAKE_OPENAI, FAKE_GITHUB, FAKE_AWS_ID] {
         assert_single(

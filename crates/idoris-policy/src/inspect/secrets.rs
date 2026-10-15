@@ -9,7 +9,8 @@
 //!   切换率是区分随机串和驼峰/蛇形标识符、路径、URL 的主要信号
 //!   （标识符按单词切换，随机串几乎每个字符都切换）。
 //!
-//! 一个真实格式的 key 通常两组都会命中；任一组被删掉，另一组仍然兜得住。
+//! 两组各自判定：符合前缀格式的短 key 可能只命中 A，未列出的随机串可能
+//! 只命中 B；满足两组条件的 key 才有双重覆盖。
 
 use idoris_contracts::inspect::{FindingKind, Sensitivity};
 
@@ -59,9 +60,13 @@ pub(super) fn scan(units: &[u16], hits: &mut Vec<Hit>) {
             hits.push(hit(FindingKind::ApiKey, start, end, Sensitivity::S3));
         }
     }
-    for (start, end) in runs(units, |c| {
-        c.is_ascii_alphanumeric() || b"+/=_-".contains(&c)
-    }) {
+    // '=' separates an assignment name from its value; only trailing base64
+    // padding belongs to the value being scored.
+    for (start, run_end) in runs(units, |c| c.is_ascii_alphanumeric() || b"+/_-".contains(&c)) {
+        let mut end = run_end;
+        while end < units.len() && end - run_end < 2 && units[end] == u16::from(b'=') {
+            end += 1;
+        }
         if looks_random(&units[start..end]) {
             hits.push(hit(
                 FindingKind::HighEntropySecret,
@@ -72,10 +77,24 @@ pub(super) fn scan(units: &[u16], hits: &mut Vec<Hit>) {
         }
     }
     for (start, end) in runs(units, |c| {
-        c.is_ascii_alphanumeric() || b"._~/-".contains(&c)
+        c.is_ascii_alphanumeric() || b"._~/-\\".contains(&c)
     }) {
-        let token = &units[start..end];
-        if CREDENTIAL_PATHS.iter().any(|p| find(token, 0, p).is_some()) || is_env_file(token) {
+        // Fold separators only for matching; hit coordinates stay in the input.
+        let token: Vec<u16> = units[start..end]
+            .iter()
+            .map(|&u| {
+                if u == u16::from(b'\\') {
+                    u16::from(b'/')
+                } else {
+                    u
+                }
+            })
+            .collect();
+        if CREDENTIAL_PATHS
+            .iter()
+            .any(|p| find(&token, 0, p).is_some())
+            || is_env_file(&token)
+        {
             hits.push(hit(
                 FindingKind::CredentialPath,
                 start,
