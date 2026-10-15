@@ -215,6 +215,40 @@ async fn wait_health(child: &mut Running, port: u16) {
 }
 
 #[tokio::test]
+async fn omlx_exit_example_cards_pass_startup_validation() {
+    let _guard = PROCESS_TEST_LOCK.lock().await;
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    for (backend, provider_id) in [("ollama", "ollama-exit"), ("mlx-lm", "mlx-lm-exit")] {
+        let components = repo.join(format!("config/examples/omlx-exit/{backend}/components"));
+        let cards = idoris_router::components::load_components(&components, false).unwrap();
+        assert_eq!(cards.len(), 1, "{backend}");
+        assert_eq!(cards[0].provider.id, provider_id);
+
+        let (_root, cwd, exe, port) = fixture();
+        let mut child = spawn(
+            &exe,
+            cwd.path(),
+            port,
+            &[("IDORIS_COMPONENTS_DIR", components.to_str().unwrap())],
+        );
+        wait_health(&mut child, port).await;
+        let health: serde_json::Value = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .get(format!("http://127.0.0.1:{port}/health"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(health["status"], "ok", "{backend}: {health}");
+        assert_eq!(health["components"], 1, "{backend}: {health}");
+    }
+}
+
+#[tokio::test]
 async fn explicit_relative_and_absolute_config_paths_start() {
     let _guard = PROCESS_TEST_LOCK.lock().await;
     for absolute in [false, true] {
