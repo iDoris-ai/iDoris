@@ -2330,6 +2330,23 @@ async fn chat_completions(
     } else if state.dev_no_key_enabled && authorization_present {
         return virtual_key_unauthorized_response();
     }
+    let completion_reservation = match budget::completion_reservation_tokens(&value) {
+        Ok(completion) => completion,
+        Err("n") => {
+            return error_envelope(
+                StatusCode::BAD_REQUEST,
+                "unsupported_completion_count",
+                "n must be the integer 1 or null; multiple completions are not supported",
+            );
+        }
+        Err(field) => {
+            return error_envelope(
+                StatusCode::BAD_REQUEST,
+                "invalid_completion_cap",
+                format!("{field} must be an integer between 0 and 9007199254740992"),
+            );
+        }
+    };
     let correlation = match correlation::parse(&headers) {
         Ok(context) => context,
         Err(error) => return correlation_error_response(error),
@@ -2501,13 +2518,14 @@ async fn chat_completions(
 
     // Resident proxies and Supervisor-run models share one breaker book.
     let open_provider_ids = state.proxy.open_providers(policy_cards.cards.iter());
-    let mut selection = dispatch::select_avoiding_open_breakers(
+    let mut selection = dispatch::select_with_completion_reservation(
         &policy_cards.cards,
         &parsed,
         &prompt,
         affinity_key,
         &ready_provider_ids,
         &open_provider_ids,
+        completion_reservation,
     );
     // M5-22: INSPECTED already lowered the privacy floor, so the pipeline
     // cannot tell that content did it; record the fact it would have
@@ -5754,6 +5772,8 @@ mod tests {
 #[cfg(test)]
 mod subscription_breaker_flow_tests;
 
+#[cfg(test)]
+mod budget_completion_reservation_tests;
 mod proxy_budget;
 
 #[cfg(test)]
