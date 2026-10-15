@@ -65,12 +65,25 @@ pub struct ChatMessage {
 /// the TS comment on `signal`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ChatRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native: Option<NativeCompletionRequest>,
     pub model: String,
     pub messages: Vec<ChatMessage>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ChatResponse {
+    /// Full validated completion, including tool calls and backend usage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native: Option<serde_json::Value>,
     pub model: String,
     pub content: String,
+}
+
+/// Lossless payload for native lifecycle adapters. The router validates supported
+/// parameters before admission; adapters must forward these values unchanged.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NativeCompletionRequest {
+    pub messages: Vec<serde_json::Value>,
+    pub parameters: serde_json::Map<String, serde_json::Value>,
 }

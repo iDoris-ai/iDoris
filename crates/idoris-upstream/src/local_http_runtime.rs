@@ -154,21 +154,11 @@ impl LocalHttpRuntimeAdapter {
             return Err(BackendError::model_unavailable(&req.model));
         }
         let url = format!("{}/v1/chat/completions", self.config.launch.endpoint());
-        let messages = req
-            .messages
-            .iter()
-            .map(|message| {
-                serde_json::json!({
-                    "role": message.role,
-                    "content": message.content,
-                })
-            })
-            .collect::<Vec<_>>();
         let engine_model = match self.config.launch.kind() {
             LocalRuntimeKind::MlxLmServer => "default_model".to_string(),
             LocalRuntimeKind::LlamaCpp => self.config.model_id.clone(),
         };
-        let body = serde_json::json!({"model": engine_model, "messages": messages});
+        let body = crate::native_completion_wire::request_body(&req, &engine_model);
         let attempt = async {
             let response = self
                 .client
@@ -199,6 +189,9 @@ impl LocalHttpRuntimeAdapter {
             .map_err(|_| BackendError::Upstream {
                 message: "local runtime chat timed out".into(),
             })??;
+        if req.native.is_some() {
+            return crate::native_completion_wire::response(raw);
+        }
         let content = raw
             .pointer("/choices/0/message/content")
             .and_then(serde_json::Value::as_str)
@@ -207,6 +200,7 @@ impl LocalHttpRuntimeAdapter {
             })?
             .to_string();
         Ok(ChatResponse {
+            native: None,
             model: self.config.model_id.clone(),
             content,
         })
@@ -381,6 +375,7 @@ mod tests {
         let response = adapter
             .chat(
                 ChatRequest {
+                    native: None,
                     model: "single-model".into(),
                     messages: vec![ChatMessage {
                         role: "user".into(),
@@ -443,6 +438,7 @@ mod tests {
         let error = adapter
             .chat(
                 ChatRequest {
+                    native: None,
                     model: "single-model".into(),
                     messages: vec![],
                 },
@@ -502,6 +498,7 @@ mod tests {
             slow_adapter
                 .chat(
                     ChatRequest {
+                        native: None,
                         model: "single-model".into(),
                         messages: vec![ChatMessage {
                             role: "user".into(),
@@ -526,6 +523,7 @@ mod tests {
         let response = adapter
             .chat(
                 ChatRequest {
+                    native: None,
                     model: "single-model".into(),
                     messages: vec![ChatMessage {
                         role: "user".into(),

@@ -16,6 +16,7 @@ async fn json(response: axum::response::Response) -> serde_json::Value {
 #[tokio::test]
 async fn success_is_buffered_openai_json_with_remote_and_record_id() {
     let chat = ChatResponse {
+        native: None,
         model: "claude-subscription".into(),
         content: "答😀😀".into(),
     };
