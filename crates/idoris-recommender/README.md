@@ -111,8 +111,11 @@ estimate is `weights + KV(context_target) + 1GB` per-model runtime overhead.
 Loading peaks, temporary loading buffers, and measured backend peaks are **not
 modeled**. This is an estimated admission limit, not a claim that observed peak
 RSS stays below the allocation. Estimates and GB comparisons use `f64`. Integer
-byte values are exactly representable up to 2^53 bytes; estimates do not promise byte precision beyond
-that range. Loading peaks require separate margin and backend calibration.
+byte inputs are exactly representable up to 2^53 bytes, but conversion to GB and
+footprint arithmetic can still introduce rounding at ordinary model sizes
+(including approximately one byte at an admission boundary). This is not a
+byte-exact memory allocator; precision degrades further above 2^53 bytes.
+Loading peaks require separate margin and backend calibration.
 `recommended_sysctl` remains advice for the physical host, derived from its
 legacy usable memory and wired mode, independently of the allocation.
 
