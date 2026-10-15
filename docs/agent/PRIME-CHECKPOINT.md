@@ -263,3 +263,7 @@ Update this file whenever any of the following happens:
 - before intentionally ending a long Prime work session.
 
 When updating, preserve useful historical review lessons but replace stale SHA/PR/task-status facts with current live truth.
+
+## 2026-10-15 历史队列收口
+
+当前73项逐项证据、8个重复/历史PR关闭及M5继续工作见[PR承接账本](PR-DISPOSITION-2026-10-15.md)。v0.3.0已发布；v0.3.1接线仍在进行；不要按旧handoff重新创建已关闭的历史PR。
