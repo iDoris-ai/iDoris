@@ -1,6 +1,5 @@
-//! Skeleton crate — see `README.md` in this directory for scope and the TS
-//! package it corresponds to. R1 only stakes out the module layout; no
-//! business logic is ported here yet.
+//! Maintained catalog recommender. See `README.md` for allocated budget and
+//! legacy TypeScript parity contracts.
 
 /// Hardware probing (`packages/recommender/src/probe.ts`): `HostFacts` and
 /// its adapters (`os::totalmem`, CPU model string, GPU core count via
@@ -11,7 +10,7 @@ pub mod probe;
 
 /// Memory footprint formulas (`packages/recommender/src/memory.ts`, T2.1.1):
 /// `footprint(GB) = params_total_b * bpp(quant) + KV(ctx) + overhead`. Unit
-/// conventions (decimal GB for weights, MiB for KV, Apple RAM budget table)
+/// conventions (decimal GB for weights and KV, Apple RAM budget table)
 /// must be preserved exactly — see the TS source's header comment before
 /// touching any of this.
 pub mod memory;

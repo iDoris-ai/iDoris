@@ -110,7 +110,7 @@ fn consumer_rows(rec: &Recommendation, catalog: &Catalog) -> Vec<CapacityRow> {
 #[test]
 fn public_recommendation_maps_to_b1_capacity_fields_at_24_and_32gb() {
     let catalog = load_catalog(repo_root().join("config/catalog.yaml")).unwrap();
-    let at_24 = recommend(&hardware(24.0), &catalog, None, None).unwrap();
+    let at_24 = recommend(&hardware(24.0), &catalog, None, None, None).unwrap();
     let rows_24 = consumer_rows(&at_24, &catalog);
     assert!(
         rows_24
@@ -133,7 +133,7 @@ fn public_recommendation_maps_to_b1_capacity_fields_at_24_and_32gb() {
     assert_eq!(resident_row.estimated_memory_gb, resident.footprint_gb);
     assert_ne!(resident_row.estimated_memory_gb, resident.weights_gb);
 
-    let at_32 = recommend(&hardware(32.0), &catalog, None, None).unwrap();
+    let at_32 = recommend(&hardware(32.0), &catalog, None, None, None).unwrap();
     let rows_32 = consumer_rows(&at_32, &catalog);
     assert_eq!(at_32.resident_label.as_deref(), Some("ornith-1.0-9b@q8_0"));
     assert!(
@@ -185,7 +185,14 @@ fn forced_resident_can_remain_blocked_without_consumer_deduplication() {
         needed_capabilities: Some(Vec::new()),
         ..Default::default()
     };
-    let rec = recommend(&hardware(24.0), &catalog, Some(&policy), Some("forced-big")).unwrap();
+    let rec = recommend(
+        &hardware(24.0),
+        &catalog,
+        Some(&policy),
+        Some("forced-big"),
+        None,
+    )
+    .unwrap();
     let rows = consumer_rows(&rec, &catalog);
     assert_eq!(rows.iter().filter(|row| row.id == "forced-big").count(), 2);
     assert!(
