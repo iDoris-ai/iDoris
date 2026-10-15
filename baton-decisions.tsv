@@ -2,3 +2,4 @@ timestamp	decision	rationale
 2026-10-15T11:27:29Z	started	从 base_sha 1c4cebd 创建分支并写入 started 回执，开始 v0.3.1 release wire 审计
 2026-10-15T11:32:02Z	audit_doc_written	写入 docs/agent/V031-RELEASE-WIRE-AUDIT-20261015.md：用户旅程/031 blockers/候选模型未验证/文本vs图视频；证据来自 README、release.yml、CLI、PR516/507/510、Agent24 PR980-982、milestone#2
 2026-10-15T11:32:02Z	no_false_pass	明确不宣称产品 PASS；macOS 正式包与真实模型调用列为 coverage_gaps；用户五模型标未验证
+2026-10-15T11:32:02Z	completed_receipt	sequence=2 status=completed；result_sha=8c621fe264a3b281cbe881718e59ad4d49a4a3ae；仅云交付审计文档，非acceptance PASS
