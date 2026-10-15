@@ -1,0 +1,14 @@
+    Checking rustls v0.23.45
+    Checking idoris-contracts v0.2.0 (<checkout>/crates/idoris-contracts)
+    Checking idoris-policy v0.2.0 (<checkout>/crates/idoris-policy)
+    Checking idoris-backend v0.2.0 (<checkout>/crates/idoris-backend)
+    Checking idoris-tenancy v0.2.0 (<checkout>/crates/idoris-tenancy)
+    Checking idoris-recommender v0.2.0 (<checkout>/crates/idoris-recommender)
+    Checking tokio-rustls v0.26.5
+    Checking rustls-platform-verifier v0.7.1
+    Checking hyper-rustls v0.27.10
+    Checking reqwest v0.13.5
+    Checking genai v0.6.5 (<checkout>/vendor/genai)
+    Checking idoris-upstream v0.2.0 (<checkout>/crates/idoris-upstream)
+    Checking idoris-router v0.2.0 (<checkout>/crates/idoris-router)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 9.46s

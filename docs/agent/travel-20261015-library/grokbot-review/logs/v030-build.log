@@ -1,0 +1,9 @@
+   Compiling idoris-contracts v0.3.0 (<checkout>/crates/idoris-contracts)
+   Compiling idoris-policy v0.3.0 (<checkout>/crates/idoris-policy)
+   Compiling idoris-backend v0.3.0 (<checkout>/crates/idoris-backend)
+   Compiling idoris-tenancy v0.3.0 (<checkout>/crates/idoris-tenancy)
+   Compiling idoris-recommender v0.3.0 (<checkout>/crates/idoris-recommender)
+   Compiling idoris-upstream v0.3.0 (<checkout>/crates/idoris-upstream)
+   Compiling idoris-router v0.3.0 (<checkout>/crates/idoris-router)
+    Finished `release` profile [optimized] target(s) in 19.56s
+exit=0

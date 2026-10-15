@@ -1,0 +1,2 @@
+PASS release startup outside repository; version; no-key 401; unavailable model list; Admin auth/page
+PASS late backend: unavailable startup; models 200 + latched chat 503; owned service restart + chat 200

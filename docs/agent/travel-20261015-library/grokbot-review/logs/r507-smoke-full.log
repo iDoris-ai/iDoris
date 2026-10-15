@@ -1,0 +1,5 @@
+PASS release startup outside repository; version; no-key 401; unavailable model list; Admin auth/page
+PASS late backend: unavailable startup; models 200 + latched chat 503; owned service restart + chat 200
+PASS persisted key bootstrap/restart; model discovery; concrete+daily calls; locality/record headers; role denial; Admin CLI
+Fixture received model fields: ['fixture-model', 'idoris/daily']
+PASS oMLX-shaped list/status/load/chat; concrete model works; default daily alias fails closed (known product gap)

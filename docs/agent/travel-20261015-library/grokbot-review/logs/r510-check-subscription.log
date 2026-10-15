@@ -1,0 +1,438 @@
++ cargo test --locked -p idoris-upstream --test subscription_cli_fixture
+   Compiling serde_core v1.0.229
+   Compiling futures-util v0.3.34
+   Compiling serde_json v1.0.151
+   Compiling tracing v0.1.44
+   Compiling subtle v2.6.1
+   Compiling h2 v0.4.19
+   Compiling rustls v0.23.46
+   Compiling serde v1.0.229
+   Compiling hyper v1.11.1
+   Compiling form_urlencoded v1.2.2
+   Compiling url v2.5.8
+   Compiling tower v0.5.3
+   Compiling tokio-rustls v0.26.5
+   Compiling hyper-util v0.1.21
+   Compiling futures-executor v0.3.34
+   Compiling nix v0.31.3
+   Compiling futures v0.3.34
+   Compiling tower-http v0.6.11
+   Compiling rustls-platform-verifier v0.7.1
+   Compiling value-ext v0.1.5
+   Compiling serde_with v3.24.0
+   Compiling idoris-contracts v0.3.0 (<checkout>/crates/idoris-contracts)
+   Compiling hyper-rustls v0.27.10
+   Compiling reqwest v0.13.5
+   Compiling idoris-backend v0.3.0 (<checkout>/crates/idoris-backend)
+   Compiling assert-json-diff v2.0.2
+   Compiling wiremock v0.6.5
+   Compiling genai v0.6.5 (<checkout>/vendor/genai)
+   Compiling idoris-upstream v0.3.0 (<checkout>/crates/idoris-upstream)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 13.77s
+     Running tests/subscription_cli_fixture.rs (<target>/debug/deps/subscription_cli_fixture-eec5fa58ca689fef)
+
+running 4 tests
+test fixture_basic_modes_are_real ... ok
+test fixture_creates_parent_and_grandchild_in_one_group_and_can_be_reaped ... ok
+test group_wait_observes_descendant_after_parent_exit ... ok
+test fixture_exposes_hang_ignore_term_hold_pipe_and_pid_marker_modes ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+
++ cargo test --locked -p idoris-upstream --test subscription_command
+   Compiling idoris-upstream v0.3.0 (<checkout>/crates/idoris-upstream)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.80s
+     Running tests/subscription_command.rs (<target>/debug/deps/subscription_command-b046fdbfddcc05a7)
+
+running 3 tests
+test multi_message_prompt_preserves_roles_and_order ... ok
+test unsupported_safety_capability_fails_closed_without_flag_stripping ... ok
+test claude_and_codex_use_exact_fixed_safety_arguments ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
++ cargo test --locked -p idoris-upstream --test subscription_process_group_probe
+   Compiling idoris-upstream v0.3.0 (<checkout>/crates/idoris-upstream)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.44s
+     Running tests/subscription_process_group_probe.rs (<target>/debug/deps/subscription_process_group_probe-952befcbc8ca5c91)
+
+running 1 test
+test unix::safe_process_group_api_signals_parent_and_descendant ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s
+
++ cargo test --locked -p idoris-upstream --test subscription_workspace
+   Compiling idoris-upstream v0.3.0 (<checkout>/crates/idoris-upstream)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.58s
+     Running tests/subscription_workspace.rs (<target>/debug/deps/subscription_workspace-48e200922f150cc6)
+
+running 2 tests
+test workspace_has_private_control_and_restricted_request_cwd ... ok
+test drop_without_reap_confirmation_leaves_the_restricted_workspace ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
++ cargo test --locked -p idoris-upstream --test subscription_spawn
+   Compiling idoris-upstream v0.3.0 (<checkout>/crates/idoris-upstream)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.83s
+     Running tests/subscription_spawn.rs (<target>/debug/deps/subscription_spawn-8b1fce41530df7c7)
+
+running 5 tests
+test combined_stdout_stderr_limit_counts_bytes_not_characters ... ok
+test combined_limit_is_shared_across_stdout_and_stderr ... ok
+test echo_preserves_utf8_even_when_input_and_output_cross_chunk_boundaries ... ok
+test large_stderr_and_large_stdin_are_drained_concurrently_without_deadlock ... ok
+test spawn_failure_and_closed_stdin_use_fixed_non_leaking_errors ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
++ cargo test --locked -p idoris-upstream --test subscription_reaper
+   Compiling idoris-upstream v0.3.0 (<checkout>/crates/idoris-upstream)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.94s
+     Running tests/subscription_reaper.rs (<target>/debug/deps/subscription_reaper-a19be5adc7be1585)
+
+running 6 tests
+test term_reaps_parent_and_grandchild_as_one_group ... ok
+test bounded_drain_aborts_a_task_that_never_finishes ... ok
+test parent_exit_clears_pipe_holding_descendant_and_drain_is_bounded ... ok
+test cancelling_finish_after_parent_exit_still_kills_the_owned_process_group ... ok
+test cancelling_terminate_still_kills_the_owned_process_group ... ok
+test ignored_term_escalates_to_kill_and_reaps_direct_child ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.51s
+
++ cargo test --locked -p idoris-upstream --test subscription_cancel
+   Compiling idoris-upstream v0.3.0 (<checkout>/crates/idoris-upstream)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.89s
+     Running tests/subscription_cancel.rs (<target>/debug/deps/subscription_cancel-8c4c1285562e4267)
+
+running 6 tests
+test defaults_are_the_documented_120s_and_5s ... ok
+test pre_cancelled_request_never_spawns ... ok
+test cancellation_reaps_the_owned_group ... ok
+test output_limit_reaps_a_process_that_would_otherwise_hang ... ok
+test cancelling_one_request_does_not_kill_another_group ... ok
+test timeout_reaps_even_a_term_ignoring_group ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.50s
+
++ cargo test --locked -p idoris-upstream --test subscription_relay
+   Compiling idoris-upstream v0.3.0 (<checkout>/crates/idoris-upstream)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.88s
+     Running tests/subscription_relay.rs (<target>/debug/deps/subscription_relay-f3a35a3ab4fe8754)
+
+running 4 tests
+test codex_prefers_private_result_file_over_stdout ... ok
+test list_and_claude_chat_return_subscription_model_and_content ... ok
+test normal_exit_leaves_no_process_group ... ok
+test nonzero_empty_timeout_cancel_and_output_limit_are_fixed_errors ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.11s
+
++ cargo test --locked -p idoris-upstream --test subscription_shutdown
+   Compiling idoris-upstream v0.3.0 (<checkout>/crates/idoris-upstream)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.27s
+     Running tests/subscription_shutdown.rs (<target>/debug/deps/subscription_shutdown-dc19baaa1bd170e7)
+
+running 2 tests
+test repeated_shutdowns_and_request_finish_race_are_idempotent ... ok
+test shutdown_rejects_new_requests_and_waits_for_all_groups_to_disappear ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
++ cargo test --locked -p idoris-upstream --test subscription_sandbox
+   Compiling idoris-upstream v0.3.0 (<checkout>/crates/idoris-upstream)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.76s
+     Running tests/subscription_sandbox.rs (<target>/debug/deps/subscription_sandbox-b6d9544fab5b2739)
+
+running 1 test
+test real_child_sees_safe_argv_scrubbed_secrets_and_read_only_cwd ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
++ cargo test --locked -p idoris-upstream --lib subscription::
+   Compiling idoris-upstream v0.3.0 (<checkout>/crates/idoris-upstream)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 6.99s
+     Running unittests src/lib.rs (<target>/debug/deps/idoris_upstream-d51d583630011dac)
+
+running 14 tests
+test subscription::environment::tests::every_declared_credential_key_is_actually_filtered ... ok
+test subscription::error::tests::reason_codes_are_fixed_and_complete ... ok
+test subscription::environment::tests::strips_known_credentials_and_all_idoris_switches_but_preserves_other_values ... ok
+test subscription::error::tests::stderr_and_prompt_sentinels_never_enter_display_debug_or_public_message ... ok
+test subscription::reaper::imp::tests::eperm_probe_is_conservatively_treated_as_existing ... ok
+test subscription::output::tests::open_handle_is_stable_across_path_replacement ... ok
+test subscription::output::tests::nonzero_exit_cannot_be_overridden_by_result_file ... ok
+test subscription::reaper::imp::tests::eperm_signal_defers_failure_to_the_followup_existence_check ... ok
+test subscription::output::tests::nonempty_result_wins_and_missing_or_empty_falls_back_to_stdout ... ok
+test subscription::workspace::tests::tempdir_failure_cannot_reach_the_spawn_step ... ok
+test subscription::output::tests::symlink_directory_and_oversized_result_are_rejected ... ok
+test subscription::output::tests::fifo_swap_is_rejected_without_blocking_open ... ok
+test subscription::process::tests::successful_path_still_reports_drain_cleanup_failure ... ok
+test subscription::process::tests::terminal_reason_survives_bounded_drain_abort ... ok
+
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 117 filtered out; finished in 0.00s
+
++ cargo test --locked -p idoris-router --lib connection::tests
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.18s
+     Running unittests src/lib.rs (<target>/debug/deps/idoris_router-e717e75e4ed3dad7)
+
+running 5 tests
+test connection::tests::middleware_derives_a_fresh_child_token_per_request ... ok
+test connection::tests::server_shutdown_cancels_existing_connection_tokens ... ok
+test connection::tests::completed_request_body_then_tcp_close_cancels_connection_token ... ok
+test connection::tests::real_keep_alive_requests_receive_fresh_child_tokens ... ok
+test connection::tests::raw_connection_monitor_cancels_when_peer_closes ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 455 filtered out; finished in 0.11s
+
++ cargo test --locked -p idoris-router --lib subscription::
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.14s
+     Running unittests src/lib.rs (<target>/debug/deps/idoris_router-e717e75e4ed3dad7)
+
+running 11 tests
+test subscription::config::tests::valid_registration_carries_a_typed_snapshot ... ok
+test subscription::config::tests::registration_truth_table_is_fail_closed ... ok
+test subscription::dispatch::tests::privacy_and_source_fail_before_handle_lookup ... ok
+test subscription::runtime::tests::disabled_or_default_off_never_constructs_a_runtime ... ok
+test subscription::runtime::tests::factory_rejects_a_non_subscription_card_and_refused_registration_is_typed ... ok
+test subscription::runtime::tests::factory_revalidates_card_and_rejects_provider_mismatch ... ok
+test subscription::dispatch::tests::missing_handle_is_terminal_and_never_falls_back ... ok
+test subscription::runtime::tests::only_authorized_subscription_card_can_build_a_bound_handle ... ok
+test subscription::runtime::tests::registry_is_provider_bound_and_missing_handle_is_fixed_error ... ok
+test subscription::runtime::tests::duplicate_provider_is_rejected_without_replacing_the_original_handle ... ok
+test subscription::dispatch::tests::loopback_selected_subscription_calls_exactly_its_bound_relay ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 449 filtered out; finished in 0.01s
+
++ cargo test --locked -p idoris-router --test subscription_card
+   Compiling idoris-router v0.3.0 (<checkout>/crates/idoris-router)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 9.86s
+     Running tests/subscription_card.rs (<target>/debug/deps/subscription_card-cff332f43d47f180)
+
+running 3 tests
+test shipped_subscription_card_is_the_only_valid_subscription_identity_shape ... ok
+test subscription_cannot_claim_local_or_local_only ... ok
+test subscription_cost_must_be_known_zero_and_ordinary_http_stays_ordinary ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
++ cargo test --locked -p idoris-router --test subscription_source
+   Compiling idoris-router v0.3.0 (<checkout>/crates/idoris-router)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.74s
+     Running tests/subscription_source.rs (<target>/debug/deps/subscription_source-35601f953e37a45b)
+
+running 4 tests
+test loopback_ipv4_ipv6_and_mapped_ipv4_are_allowed ... ok
+test missing_lan_public_mapped_remote_and_tailscale_are_forbidden ... ok
+test parser_rejects_invalid_octets_instead_of_loose_string_matching ... ok
+test source_errors_map_to_fixed_forbidden_http_contract ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
++ cargo test --locked -p idoris-router --test subscription_disconnect
+   Compiling idoris-router v0.3.0 (<checkout>/crates/idoris-router)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.03s
+     Running tests/subscription_disconnect.rs (<target>/debug/deps/subscription_disconnect-a011d076bd049697)
+
+running 4 tests
+test full_body_then_disconnect_reaps_group_and_removes_workspace ... ok
+test disconnecting_a_does_not_cancel_concurrent_b ... ok
+test repeated_disconnects_leave_no_groups_or_workspaces ... ok
+test open_keep_alive_connection_allows_slow_requests_to_finish ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.31s
+
++ cargo test --locked -p idoris-router --test subscription_response
+   Compiling idoris-router v0.3.0 (<checkout>/crates/idoris-router)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.87s
+     Running tests/subscription_response.rs (<target>/debug/deps/subscription_response-abd5a412ac4b9eb1)
+
+running 3 tests
+test source_rejection_is_403_with_record_id_but_not_served_locality ... ok
+test relay_failure_is_502_remote_and_never_leaks_stderr_content ... ok
+test success_is_buffered_openai_json_with_remote_and_record_id ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
++ cargo test --locked -p idoris-router --test subscription_discovery
+   Compiling idoris-router v0.3.0 (<checkout>/crates/idoris-router)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.95s
+     Running tests/subscription_discovery.rs (<target>/debug/deps/subscription_discovery-441af163403284a0)
+
+running 3 tests
+test subscription_discovery_does_not_fabricate_local_capability_rows ... ok
+test enabled_runtime_is_listed_statically_without_spawning ... ok
+test disabled_or_default_off_runtime_has_no_discovery_entry ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+
++ cargo test --locked -p idoris-router --test subscription_startup
+   Compiling idoris-router v0.3.0 (<checkout>/crates/idoris-router)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.95s
+     Running tests/subscription_startup.rs (<target>/debug/deps/subscription_startup-4215a427413ab615)
+
+running 7 tests
+test future_registration_matrix_preserves_org_disable_and_sandbox_precedence ... ok
+test factory_revalidation_rejects_a_form_changed_after_authorization ... ok
+test test_build_can_construct_the_authorized_success_path_without_spawning ... ok
+test production_wrong_subscription_form_and_spawn_cli_impersonation_fail_structurally ... ok
+test production_org_unknown_sandbox_and_cli_fail_closed_before_listen ... ok
+test production_enabled_valid_profile_starts_without_eager_cli_spawn ... ok
+test production_default_off_and_kill_switch_start_without_registering_or_spawning ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.26s
+
++ cargo test --locked -p idoris-router --test subscription_security
+   Compiling idoris-router v0.3.0 (<checkout>/crates/idoris-router)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.90s
+     Running tests/subscription_security.rs (<target>/debug/deps/subscription_security-08eee72f01ce7e16)
+
+running 3 tests
+test local_only_rejects_before_subscription_service_starts_a_request ... ok
+test ordinary_free_loopback_http_model_still_returns_200 ... ok
+test default_disabled_and_non_personal_modes_have_zero_subscription_spawns ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
++ pnpm --filter @idoris/router... build
+.                                        |  WARN  Unsupported engine: wanted: {"node":">=22"} (current: {"node":"v20.19.2","pnpm":"10.34.5"})
+Scope: 5 of 9 workspace projects
+packages/contracts build$ tsc -p tsconfig.build.json
+packages/contracts build: Done
+packages/adapters build$ tsc -p tsconfig.build.json
+packages/recommender build$ tsc -p tsconfig.build.json
+packages/tenancy build$ tsc -p tsconfig.build.json
+packages/recommender build: Done
+packages/tenancy build: Done
+packages/adapters build: Done
+packages/router build$ tsc -p tsconfig.build.json
+packages/router build: Done
+packages/router postbuild$ node -e "require('node:fs').chmodSync('dist/cli.js', 0o755)"
+packages/router postbuild: Done
++ pnpm --filter @idoris/conformance test:conformance -- tests/subscription-fixture.test.ts tests/subscription.test.ts
+.                                        |  WARN  Unsupported engine: wanted: {"node":">=22"} (current: {"node":"v20.19.2","pnpm":"10.34.5"})
+
+> @idoris/conformance@0.0.0 test:conformance <checkout>/conformance
+> vitest run -- tests/subscription-fixture.test.ts tests/subscription.test.ts
+
+
+ RUN  v2.1.9 <checkout>/conformance
+
+ ✓ tests/core.test.ts (17 tests | 1 skipped) 436ms
+ ✓ tests/subscription.test.ts (8 tests) 2870ms
+   ✓ subscription is default-off and explicit disable remains zero-spawn 716ms
+   ✓ explicit enable without the declared sandbox fails closed 317ms
+   ✓ subscription role idoris/daily retains authorized relay execution 343ms
+   ✓ subscription role idoris/auto retains authorized relay execution 339ms
+   ✓ closing the HTTP socket after full request body cancels the running subscription CLI 313ms
+ ✓ tests/upstream-behavior.test.ts (7 tests) 4282ms
+   ✓ 上游 5xx 重试与错误映射 > 5xx 按被测实现的 POST 重试策略处理（Rust 不重试不确定执行） 1321ms
+   ✓ 上游 5xx 重试与错误映射 > 持续 5xx 原样透传，调用数符合 POST 重试策略 1265ms
+   ✓ 慢响应不会被提前掐断 > 上游延迟 800ms 才回 200 => 客户端仍拿到 200，耗时 >= 750ms 808ms
+   ✓ 客户端断开 => 向上游传播取消 > 负对照：hang 请求不主动断开时，wasAborted() 保持 false 523ms
+ ✓ tests/response-headers.test.ts (13 tests) 1693ms
+   ✓ X-iDoris-Served-Locality > 上游返回 5xx（依然是“某后端服务了这次请求”）也带 Served-Locality 1266ms
+ ✓ tests/fixture-harness.test.ts (10 tests) 756ms
+   ✓ 被测 CLI 接受定制 policy；坏 policy 仍真实非零提前退出 595ms
+ ✓ tests/input-edges.test.ts (5 tests) 410ms
+ ✓ tests/card-policy.test.ts (21 tests) 10155ms
+   ✓ 'local_only 必须 fail_closed'：合法卡正控；只改一个字段即非零提前退出 603ms
+   ✓ 'provider 隐私下限'：合法卡正控；只改一个字段即非零提前退出 532ms
+   ✓ 'local tier 不能 remote locality'：合法卡正控；只改一个字段即非零提前退出 532ms
+   ✓ 'local tier 必须 load_policy'：合法卡正控；只改一个字段即非零提前退出 532ms
+   ✓ 'resident 不能 pinned=false'：合法卡正控；只改一个字段即非零提前退出 583ms
+   ✓ 'resident 不能 idle TTL'：合法卡正控；只改一个字段即非零提前退出 638ms
+   ✓ 'on_demand 不能 pinned=true'：合法卡正控；只改一个字段即非零提前退出 530ms
+   ✓ 'evict_to_load 不能 pinned=true'：合法卡正控；只改一个字段即非零提前退出 632ms
+   ✓ 'local none 必须独占'：合法卡正控；只改一个字段即非零提前退出 639ms
+   ✓ 'any none 必须独占'：合法卡正控；只改一个字段即非零提前退出 635ms
+   ✓ '重复 none 也拒绝'：合法卡正控；只改一个字段即非零提前退出 583ms
+   ✓ 'local_only 禁 internet'：合法卡正控；只改一个字段即非零提前退出 636ms
+   ✓ 'local_only 禁 lan'：合法卡正控；只改一个字段即非零提前退出 638ms
+   ✓ 额外合法卡：{"id":"omlx","tier":"lora","locality":"remote","privacyClass":"any","allowedEgress":["internet"],"fallbackPolicy":"next_in_chain","failClosed":false,"endpoint":"http://127.0.0.1:12345","extensions":{"_degradation":"Without this binding the fixture cannot serve role aliases.","idoris_role_models":{"daily":"fake-model-1"}},"loadPolicy":null} 328ms
+   ✓ 额外合法卡：{"id":"omlx","tier":"local","locality":"lan","privacyClass":"local_only","allowedEgress":["loopback"],"endpoint":"http://127.0.0.1:12345","extensions":{"_degradation":"Without this binding the fixture cannot serve role aliases.","idoris_role_models":{"daily":"fake-model-1"}}} 326ms
+   ✓ 额外合法卡：{"id":"omlx","tier":"local","locality":"loopback","privacyClass":"local_only","allowedEgress":["loopback"],"endpoint":"http://127.0.0.1:12345","extensions":{"_degradation":"Without this binding the fixture cannot serve role aliases.","idoris_role_models":{"daily":"fake-model-1"}},"fallbackPolicy":"next_in_chain"} 326ms
+   ✓ 额外合法卡：{"id":"omlx","tier":"remote","locality":"remote","privacyClass":"any","allowedEgress":["lan","internet"],"fallbackPolicy":"next_in_chain","failClosed":false,"endpoint":"http://127.0.0.1:12345","extensions":{"_degradation":"Without this binding the fixture cannot serve role aliases.","idoris_role_models":{"daily":"fake-model-1"}}} 323ms
+   ✓ provider=any 允许卡收紧到 local_only 325ms
+ ✓ tests/local-only-privacy.test.ts (5 tests) 1125ms
+   ✓ loopback 卡的 provider/card privacy=any 不满足 local_only > 保持 local tier 可选时拒绝不可信卡且零出站；可信 local_only 正控成功 719ms
+ ✓ tests/routing-policy.test.ts (8 tests) 2611ms
+   ✓ YAML policy 真正决定请求候选 > rule='local' default='remote' intent='coding' privacy='any' failClosed=true => 200 393ms
+   ✓ YAML policy 真正决定请求候选 > rule='remote' default='local' intent='chat' privacy='any' failClosed=true => 200 387ms
+   ✓ YAML policy 真正决定请求候选 > rule='remote' default='local' intent='coding' privacy='local_only' failClosed=false => 503 326ms
+   ✓ YAML policy 真正决定请求候选 > uses the first matching rule and the default only when no rule matches 401ms
+ ↓ tests/known-spec-conflicts.test.ts (7 tests | 7 skipped)
+ ✓ tests/default-routing-policy.test.ts (3 tests) 676ms
+ ✓ tests/extension-policy.test.ts (28 tests) 8510ms
+   ✓ extensions 降级声明 > '空对象' 330ms
+   ✓ extensions 降级声明 > 'NEL 不属于 JS trim 空白' 324ms
+   ✓ extensions 降级声明 > '缺声明' 311ms
+   ✓ extensions 降级声明 > '空声明' 313ms
+   ✓ extensions 降级声明 > '纯空白声明' 313ms
+   ✓ extensions 降级声明 > 'BOM 声明' 362ms
+   ✓ extensions 降级声明 > '非字符串 7' 312ms
+   ✓ extensions 降级声明 > '非字符串 []' 310ms
+   ✓ providerExtensions 降级声明 > '省略' 375ms
+   ✓ providerExtensions 降级声明 > '空对象' 322ms
+   ✓ providerExtensions 降级声明 > '仅声明' 325ms
+   ✓ providerExtensions 降级声明 > '特性带声明' 322ms
+   ✓ providerExtensions 降级声明 > '缺声明' 310ms
+   ✓ providerExtensions 降级声明 > '空声明' 313ms
+   ✓ providerExtensions 降级声明 > '纯空白声明' 311ms
+   ✓ providerExtensions 降级声明 > '非字符串 false' 312ms
+   ✓ providerExtensions 降级声明 > '非字符串 7' 311ms
+   ✓ providerExtensions 降级声明 > '非字符串 []' 310ms
+   ✓ providerExtensions 降级声明 > '非字符串 {}' 312ms
+ ✓ tests/streaming.test.ts (2 tests) 458ms
+ ✓ tests/subscription-fixture.test.ts (4 tests) 353ms
+ ✓ tests/tenant.test.ts (2 tests) 413ms
+ ✓ tests/intent-detection.test.ts (3 tests) 950ms
+   ✓ intent fallback wiring > intent=undefined prompt='fix this bug' => 200 334ms
+   ✓ intent fallback wiring > intent=undefined prompt='tell me a joke' => 503 336ms
+ ✓ tests/models-health.test.ts (1 test) 409ms
+
+ Test Files  16 passed | 1 skipped (17)
+      Tests  136 passed | 8 todo (144)
+   Start at  16:06:54
+   Duration  40.63s (transform 251ms, setup 0ms, collect 581ms, tests 36.11s, environment 3ms, prepare 931ms)
+
++ cargo build --release --locked -p idoris-router
+    Finished `release` profile [optimized] target(s) in 0.19s
++ cargo build --release --locked -p idoris-tenancy --bin conformance_key_seed --features test-bins
+    Finished `release` profile [optimized] target(s) in 0.08s
++ pnpm --filter @idoris/conformance test:conformance -- tests/subscription-fixture.test.ts tests/subscription.test.ts
+.                                        |  WARN  Unsupported engine: wanted: {"node":">=22"} (current: {"node":"v20.19.2","pnpm":"10.34.5"})
+
+> @idoris/conformance@0.0.0 test:conformance <checkout>/conformance
+> vitest run -- tests/subscription-fixture.test.ts tests/subscription.test.ts
+
+
+ RUN  v2.1.9 <checkout>/conformance
+
+ ✓ tests/core.test.ts (17 tests | 1 skipped) 341ms
+ ✓ tests/subscription.test.ts (8 tests) 709ms
+ ✓ tests/upstream-behavior.test.ts (7 tests) 1508ms
+   ✓ 慢响应不会被提前掐断 > 上游延迟 800ms 才回 200 => 客户端仍拿到 200，耗时 >= 750ms 827ms
+   ✓ 客户端断开 => 向上游传播取消 > 负对照：hang 请求不主动断开时，wasAborted() 保持 false 524ms
+ ✓ tests/response-headers.test.ts (13 tests) 157ms
+ ✓ tests/fixture-harness.test.ts (10 tests) 334ms
+ ✓ tests/input-edges.test.ts (5 tests) 96ms
+ ✓ tests/card-policy.test.ts (21 tests) 2187ms
+ ✓ tests/local-only-privacy.test.ts (5 tests) 245ms
+ ✓ tests/routing-policy.test.ts (8 tests) 601ms
+ ↓ tests/known-spec-conflicts.test.ts (7 tests | 7 skipped)
+ ✓ tests/default-routing-policy.test.ts (3 tests) 164ms
+ ✓ tests/extension-policy.test.ts (28 tests) 2010ms
+ ✓ tests/streaming.test.ts (2 tests) 156ms
+ ✓ tests/subscription-fixture.test.ts (4 tests) 308ms
+ ✓ tests/tenant.test.ts (2 tests) 90ms
+ ✓ tests/intent-detection.test.ts (3 tests) 225ms
+ ✓ tests/models-health.test.ts (1 test) 92ms
+
+ Test Files  16 passed | 1 skipped (17)
+      Tests  136 passed | 8 todo (144)
+   Start at  16:07:36
+   Duration  13.84s (transform 228ms, setup 0ms, collect 565ms, tests 9.22s, environment 3ms, prepare 979ms)
+
+exit=0

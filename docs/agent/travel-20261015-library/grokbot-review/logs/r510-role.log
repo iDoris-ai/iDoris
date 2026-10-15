@@ -1,0 +1,30 @@
+ Downloading crates ...
+  Downloaded rustls v0.23.46
+   Compiling rustls v0.23.46
+   Compiling idoris-contracts v0.3.0 (<checkout>/crates/idoris-contracts)
+   Compiling idoris-policy v0.3.0 (<checkout>/crates/idoris-policy)
+   Compiling idoris-backend v0.3.0 (<checkout>/crates/idoris-backend)
+   Compiling idoris-tenancy v0.3.0 (<checkout>/crates/idoris-tenancy)
+   Compiling idoris-recommender v0.3.0 (<checkout>/crates/idoris-recommender)
+   Compiling tokio-rustls v0.26.5
+   Compiling rustls-platform-verifier v0.7.1
+   Compiling hyper-rustls v0.27.10
+   Compiling reqwest v0.13.5
+   Compiling genai v0.6.5 (<checkout>/vendor/genai)
+   Compiling idoris-upstream v0.3.0 (<checkout>/crates/idoris-upstream)
+   Compiling idoris-router v0.3.0 (<checkout>/crates/idoris-router)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 33.41s
+     Running unittests src/lib.rs (<target>/debug/deps/idoris_router-e717e75e4ed3dad7)
+
+running 8 tests
+test role_binding_tests::role_binding_only_configured_providers_enter_role_selection_even_with_fallback ... ok
+test role_binding_tests::role_binding_loader_rejects_malformed_configuration ... ok
+test role_binding_tests::role_binding_subscription_configuration_is_rejected_and_http_controls_remain_valid ... ok
+test role_binding_tests::role_binding_resident_posts_concrete_model_for_buffered_stream_and_override ... ok
+test role_binding_tests::role_binding_lifecycle_uses_exact_configured_model_and_preserves_override ... ok
+test role_binding_tests::role_binding_missing_model_and_capacity_fail_before_load ... ok
+test role_binding_tests::role_binding_negative_controls_never_post_or_load ... ok
+test role_binding_tests::role_binding_protocols_send_exact_target_and_preserve_concrete_payload ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 452 filtered out; finished in 0.37s
+

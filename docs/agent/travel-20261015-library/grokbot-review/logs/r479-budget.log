@@ -1,0 +1,48 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.15s
+     Running unittests src/lib.rs (<target>/debug/deps/idoris_router-8f26db58ad93ae3c)
+
+running 41 tests
+test budget::tests::actual_cost_reflects_the_real_completion_length_not_the_reservation_placeholder ... ok
+test budget::tests::explicit_openai_usage_is_the_only_buffered_proxy_billing_evidence ... ok
+test budget::tests::ledger_unavailable_error_matches_a_real_not_configured_rejection ... ok
+test budget::tests::malformed_cost_is_price_unknown_not_free ... ok
+test budget::tests::malformed_json_and_unrepresentable_charge_fail_closed_without_body_leakage ... ok
+test budget::tests::missing_or_malformed_usage_never_becomes_zero_cost ... ok
+test budget::tests::personal_deployment_uses_the_fixed_tenant_id ... ok
+test budget::tests::positive_cost_is_paid_and_scales_with_the_rates ... ok
+test budget::tests::replayable_settlement_accepts_committed_extreme_overage_without_double_charge ... ok
+test budget::tests::reserve_settle_release_round_trip ... ok
+test budget::tests::reserve_without_configuration_fails_closed ... ok
+test budget::tests::zero_cost_is_always_free ... ok
+test budget_completion_reservation_tests::a_declared_completion_cap_that_exceeds_budget_is_denied_before_post ... ok
+test budget_completion_reservation_tests::both_completion_fields_use_the_larger_quote ... ok
+test budget_completion_reservation_tests::completion_precision_boundary_is_quoted_without_truncation ... ok
+test budget_completion_reservation_tests::invalid_completion_caps_are_400_without_post_or_charge ... ok
+test budget_completion_reservation_tests::small_completion_cap_preserves_payload_and_legacy_admission ... ok
+test budget_completion_reservation_tests::valid_caps_and_defaults_preserve_payload_and_floor ... ok
+test budget_concurrency_wiring_tests::one_hundred_concurrent_paid_requests_never_overrun_the_budget ... ok
+test budget_reserved_wiring_tests::budget_event_append_failure_releases_reservation_before_backend_execution ... ok
+test budget_reserved_wiring_tests::free_and_no_ledger_paths_do_not_emit_budget_reserved ... ok
+test budget_reserved_wiring_tests::paid_local_records_one_budget_reservation_after_decision_before_execution ... ok
+test budget_reserved_wiring_tests::paid_proxy_records_budget_reservation_before_dispatch ... ok
+test budget_settled_wiring_tests::budget_settled_append_failure_keeps_already_settled_success_response ... ok
+test budget_settled_wiring_tests::free_local_never_records_budget_settled ... ok
+test budget_settled_wiring_tests::paid_local_records_budget_settled_after_completed ... ok
+test components::tests::a_paid_resident_http_service_card_is_admitted_after_budget_wiring ... ok
+test decided_wiring_tests::decided_append_failure_is_generic_503_before_budget_or_upstream ... ok
+test dispatch::tests::paid_candidate_over_budget_is_rejected_and_nothing_is_charged ... ok
+test policy_wiring_tests::yaml_policy_precedes_budget_on_both_execution_paths ... ok
+test policy_wiring_tests::yaml_selected_paid_candidate_reaches_supervisor_admission_after_budget ... ok
+test profiled_wiring_tests::profiled_append_failure_is_generic_503_before_budget_or_upstream ... ok
+test proxy::retention_tests::long_id_budget_covers_cancelled_marker_and_rejects_new_id ... ok
+test proxy::retention_tests::oversized_failure_keeps_bounded_marker_and_expiry_releases_budget ... ok
+test proxy_budget::tests::cached_admission_does_not_require_a_second_paid_reservation ... ok
+test proxy_budget::tests::cancelled_before_send_releases_but_armed_execution_retains ... ok
+test request_received_wiring_tests::event_log_busy_fails_closed_before_upstream_or_budget ... ok
+test storage::tests::trusted_file_controls_tenant_budget_and_bad_db_path_fails ... ok
+test tests::budget_query_rejects_bad_scope_and_unknown_tenant ... ok
+test tests::budget_query_reports_remaining_available_and_is_read_only ... ok
+test tests::chat_completions_paid_candidate_over_budget_is_402_with_a_structured_body ... ok
+
+test result: ok. 41 passed; 0 failed; 0 ignored; 0 measured; 467 filtered out; finished in 4.28s
+

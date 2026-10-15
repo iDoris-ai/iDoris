@@ -1,2 +1,3 @@
 time	lane	decision	reason
 2026-10-15T08:57:18Z	grokbot	start	从 ops/travel-20261015-library@9054a5d 拉出 baton/grokbot-20261015；只复核 507/479/510；task_id/attempt_id 未提供记 null
+2026-10-15T09:10:20Z	grokbot	review-done	507/479/510 三项逐项复核完成，无阻断；n 未乘风险实测确认仍在（非本增量）；507 用 v0.3.0 同源 Linux 构建实测 late-backend

@@ -1,0 +1,9 @@
+   Compiling idoris-router v0.2.0 (<checkout>/crates/idoris-router)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 8.50s
+     Running unittests src/lib.rs (<target>/debug/deps/idoris_router-8f26db58ad93ae3c)
+
+running 1 test
+test budget_completion_reservation_tests::grokbot_probe_n_multiplier_not_quoted ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 508 filtered out; finished in 0.11s
+
