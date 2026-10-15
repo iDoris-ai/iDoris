@@ -21,9 +21,11 @@ fn events(event_log: &EventLogStore, response: &Response) -> Vec<EventLogEvent> 
         .unwrap()
         .to_str()
         .unwrap();
-    event_log
-        .events_for_record(Some(budget::PERSONAL_TENANT_ID), record_id)
-        .unwrap()
+    stage_events(
+        event_log
+            .events_for_record(Some(budget::PERSONAL_TENANT_ID), record_id)
+            .unwrap(),
+    )
 }
 
 fn completed_count(events: &[EventLogEvent]) -> usize {
