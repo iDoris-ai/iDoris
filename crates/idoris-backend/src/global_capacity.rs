@@ -8,10 +8,40 @@ use crate::BackendError;
 /// Internal accounting is finer than the public 1e-6 GB admission epsilon:
 /// 1 nano-GB = 1e-9 GB, so the existing epsilon is exactly 1000 units.
 /// Budgets round down and allocations round up into these units. That makes
-/// quantization itself conservative while leaving the already-documented
-/// epsilon as the only intentional admission tolerance.
+/// quantization itself conservative. Legacy GB budgets retain their admission
+/// epsilon; explicit byte budgets admit no tolerance.
 const CAPACITY_UNITS_PER_GB: u128 = 1_000_000_000;
 const CAPACITY_EPSILON_UNITS: u128 = 1_000;
+
+/// A conservative byte charge, converted before distinct model estimates sum.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct CapacityCharge(u128);
+
+impl CapacityCharge {
+    pub(crate) fn from_gb(value: f64) -> Result<Self, BackendError> {
+        to_capacity_units("model charge", value, Rounding::Up).map(Self)
+    }
+
+    pub(crate) fn checked_add(self, other: Self) -> Result<Self, BackendError> {
+        self.0
+            .checked_add(other.0)
+            .map(Self)
+            .ok_or_else(|| BackendError::invariant_violation("runtime capacity charge overflowed"))
+    }
+
+    pub(crate) fn saturating_sub(self, other: Self) -> Self {
+        Self(self.0.saturating_sub(other.0))
+    }
+
+    fn gb(self) -> f64 {
+        units_to_gb(self.0)
+    }
+}
+
+enum ExpectedAllocation {
+    Estimate(Option<f64>),
+    Charge(Option<CapacityCharge>),
+}
 
 #[derive(Debug, Clone, Copy)]
 struct CapacityAllocation {
@@ -30,17 +60,76 @@ pub struct GlobalCapacitySnapshot {
 pub struct GlobalCapacityLedger {
     budget_gb: f64,
     budget_units: u128,
+    admission_epsilon_units: u128,
     allocations: Mutex<BTreeMap<String, CapacityAllocation>>,
 }
 
 impl GlobalCapacityLedger {
+    pub(crate) fn uses_exact_bytes(&self) -> bool {
+        self.admission_epsilon_units == 0
+    }
+
+    /// Single-owner CAS in exact units; observation may exceed the ceiling.
+    pub(crate) fn update_charge(
+        &self,
+        key: &str,
+        expected: Option<CapacityCharge>,
+        next: CapacityCharge,
+        admit_growth: bool,
+    ) -> Result<(), BackendError> {
+        self.replace_allocation(
+            key,
+            ExpectedAllocation::Charge(expected),
+            Some(CapacityAllocation {
+                requested_gb: next.gb(),
+                charged_units: next.0,
+            }),
+            admit_growth,
+            None,
+        )
+    }
+
+    /// Check the post-eviction plan while retaining the old claim until release
+    /// is confirmed. Even a shrinking plan must fit beside other actors' truth.
+    pub(crate) fn claim_charge(
+        &self,
+        key: &str,
+        current: CapacityCharge,
+        planned: CapacityCharge,
+    ) -> Result<(), BackendError> {
+        let held = current.max(planned);
+        self.replace_allocation(
+            key,
+            ExpectedAllocation::Charge(Some(current)),
+            Some(CapacityAllocation {
+                requested_gb: held.gb(),
+                charged_units: held.0,
+            }),
+            true,
+            Some(planned),
+        )
+    }
+
     pub fn new(budget_gb: f64) -> Result<Self, BackendError> {
         let budget_units = to_capacity_units("budget_gb", budget_gb, Rounding::Down)?;
         Ok(Self {
             budget_gb,
             budget_units,
+            admission_epsilon_units: CAPACITY_EPSILON_UNITS,
             allocations: Mutex::new(BTreeMap::new()),
         })
+    }
+
+    /// Construct an exact decimal-byte ceiling for new charged growth.
+    /// Model estimates still round upward to whole bytes; the floating-point
+    /// snapshot is informational and never determines this admission limit.
+    pub fn new_bytes(budget_bytes: u64) -> Self {
+        Self {
+            budget_gb: units_to_gb(u128::from(budget_bytes)),
+            budget_units: u128::from(budget_bytes),
+            admission_epsilon_units: 0,
+            allocations: Mutex::new(BTreeMap::new()),
+        }
     }
 
     /// Reserve one runtime/model allocation. Repeating the exact same key and
@@ -73,7 +162,12 @@ impl GlobalCapacityLedger {
                 model_id: key.to_string(),
             });
         };
-        if requested_total_units > self.budget_units.saturating_add(CAPACITY_EPSILON_UNITS) {
+        if (self.budget_gb == 0.0 && charged_units > 0)
+            || requested_total_units
+                > self
+                    .budget_units
+                    .saturating_add(self.admission_epsilon_units)
+        {
             return Err(BackendError::Oom {
                 model_id: key.to_string(),
             });
@@ -145,11 +239,6 @@ impl GlobalCapacityLedger {
         next_gb: Option<f64>,
         enforce_growth_admission: bool,
     ) -> Result<(), BackendError> {
-        if key.trim().is_empty() {
-            return Err(BackendError::invalid_request(
-                "global capacity allocation key must not be empty",
-            ));
-        }
         if let Some(value) = expected_gb {
             let _ = to_capacity_units("expected_gb", value, Rounding::Up)?;
         }
@@ -161,15 +250,43 @@ impl GlobalCapacityLedger {
             None => None,
         };
 
+        self.replace_allocation(
+            key,
+            ExpectedAllocation::Estimate(expected_gb),
+            next,
+            enforce_growth_admission,
+            None,
+        )
+    }
+
+    fn replace_allocation(
+        &self,
+        key: &str,
+        expected: ExpectedAllocation,
+        next: Option<CapacityAllocation>,
+        enforce_growth_admission: bool,
+        planned_charge: Option<CapacityCharge>,
+    ) -> Result<(), BackendError> {
+        if key.trim().is_empty() {
+            return Err(BackendError::invalid_request(
+                "global capacity allocation key must not be empty",
+            ));
+        }
+
         let mut allocations = self
             .allocations
             .lock()
             .map_err(|_| BackendError::lock_poisoned("global capacity ledger lock poisoned"))?;
         let current = allocations.get(key).copied();
-        if current.map(|allocation| allocation.requested_gb) != expected_gb {
+        let matches = match expected {
+            ExpectedAllocation::Estimate(value) => current.map(|a| a.requested_gb) == value,
+            ExpectedAllocation::Charge(value) => {
+                current.map(|a| CapacityCharge(a.charged_units)) == value
+            }
+        };
+        if !matches {
             return Err(BackendError::invariant_violation(format!(
-                "global capacity allocation {key:?} expected {expected_gb:?} but is {:?}",
-                current.map(|allocation| allocation.requested_gb)
+                "global capacity allocation {key:?} changed before compare-and-set"
             )));
         }
 
@@ -183,9 +300,22 @@ impl GlobalCapacityLedger {
         let requested_total_units = other_units.checked_add(next_units).ok_or_else(|| {
             BackendError::invariant_violation("global capacity exact total overflowed")
         })?;
+        if let Some(planned) = planned_charge
+            && other_units
+                .checked_add(planned.0)
+                .is_none_or(|total| total > self.budget_units)
+        {
+            return Err(BackendError::Oom {
+                model_id: key.to_string(),
+            });
+        }
         if enforce_growth_admission
             && next_units > current_units
-            && requested_total_units > self.budget_units.saturating_add(CAPACITY_EPSILON_UNITS)
+            && (self.budget_gb == 0.0
+                || requested_total_units
+                    > self
+                        .budget_units
+                        .saturating_add(self.admission_epsilon_units))
         {
             return Err(BackendError::Oom {
                 model_id: key.to_string(),
@@ -314,6 +444,131 @@ mod tests {
     use std::thread;
 
     use super::*;
+
+    #[test]
+    fn exact_charge_cas_detects_growth_hidden_by_identical_float_snapshots() {
+        let full = CapacityCharge(16_777_216_000_000_000);
+        let next = full.checked_add(CapacityCharge(1)).unwrap();
+        assert_eq!(full.gb(), next.gb());
+        let ledger = GlobalCapacityLedger::new_bytes(16_777_216_000_000_001);
+        ledger.update_charge("runtime", None, full, true).unwrap();
+        ledger
+            .update_charge("runtime", Some(full), next, true)
+            .unwrap();
+        assert!(
+            ledger
+                .update_charge("runtime", Some(full), full, true)
+                .is_err()
+        );
+        ledger
+            .update_charge("runtime", Some(next), full, true)
+            .unwrap();
+    }
+
+    #[test]
+    fn charge_overflow_fails_closed_without_rewriting_the_ledger() {
+        assert!(
+            CapacityCharge(u128::MAX)
+                .checked_add(CapacityCharge(1))
+                .is_err()
+        );
+        let ledger = GlobalCapacityLedger::new_bytes(u64::MAX);
+        ledger
+            .update_charge("observed", None, CapacityCharge(u128::MAX), false)
+            .unwrap();
+        assert!(
+            ledger
+                .update_charge("new", None, CapacityCharge(1), true)
+                .is_err()
+        );
+        assert!(!ledger.snapshot().unwrap().allocations.contains_key("new"));
+        ledger
+            .update_charge(
+                "observed",
+                Some(CapacityCharge(u128::MAX)),
+                CapacityCharge::default(),
+                true,
+            )
+            .unwrap();
+        assert_eq!(ledger.snapshot().unwrap().reserved_gb, 0.0);
+    }
+
+    #[test]
+    fn byte_budget_enforces_exact_growth_boundary_and_preserves_observed_truth() {
+        let ledger = GlobalCapacityLedger::new_bytes(125_000_000);
+        ledger.reserve("a", 0.0625).unwrap();
+        ledger.reserve("a", 0.0625).unwrap();
+        ledger.resize("b", None, Some(0.0625)).unwrap();
+        assert_eq!(ledger.snapshot().unwrap().reserved_gb, 0.125);
+        assert!(ledger.reserve("extra", f64::from_bits(1)).is_err());
+        assert!(
+            ledger
+                .resize("b", Some(0.0625), Some(0.0625 + 1e-9))
+                .is_err()
+        );
+        ledger.release("a").unwrap();
+        ledger.resize("b", Some(0.0625), Some(0.125)).unwrap();
+        assert!(ledger.resize("b", Some(0.0625), None).is_err());
+        ledger.adopt_observed("b", Some(0.125), 0.25).unwrap();
+        ledger.resize("b", Some(0.25), Some(0.25)).unwrap();
+        ledger.resize("b", Some(0.25), Some(0.2)).unwrap();
+        assert!(ledger.reserve("extra", f64::from_bits(1)).is_err());
+        ledger.resize("b", Some(0.2), None).unwrap();
+        assert_eq!(ledger.snapshot().unwrap().reserved_gb, 0.0);
+    }
+
+    #[test]
+    fn byte_budget_handles_zero_small_and_large_integer_limits_without_epsilon() {
+        for bytes in [0, 1, 500, (1_u64 << 53) + 1, u64::MAX] {
+            let ledger = GlobalCapacityLedger::new_bytes(bytes);
+            assert_eq!(ledger.budget_units, u128::from(bytes));
+            ledger.reserve("empty", 0.0).unwrap();
+            if bytes == 0 {
+                assert!(ledger.reserve("positive", f64::from_bits(1)).is_err());
+                assert!(
+                    ledger
+                        .resize("empty", Some(0.0), Some(f64::from_bits(1)))
+                        .is_err()
+                );
+            } else {
+                ledger.reserve("one-byte-charge", 0.5e-9).unwrap();
+            }
+        }
+        let ledger = GlobalCapacityLedger::new_bytes(1);
+        ledger.resize("a", None, Some(0.5e-9)).unwrap();
+        assert!(ledger.reserve("b", 0.5e-9).is_err());
+        assert!(ledger.resize("a", Some(0.5e-9), Some(500e-9)).is_err());
+        let legacy = GlobalCapacityLedger::new(1e-9).unwrap();
+        legacy.reserve("legacy-tolerance", 500e-9).unwrap();
+        // These distinct integer caps have the same floating GB display.
+        let exact_bytes = 16_777_216_000_000_000_u64;
+        let below = GlobalCapacityLedger::new_bytes(exact_bytes - 1);
+        let exact = GlobalCapacityLedger::new_bytes(exact_bytes);
+        assert_eq!(
+            below.snapshot().unwrap().budget_gb,
+            exact.snapshot().unwrap().budget_gb
+        );
+        assert!(below.reserve("large", 16_777_216.0).is_err());
+        exact.reserve("large", 16_777_216.0).unwrap();
+    }
+
+    #[test]
+    fn zero_budget_denies_even_sub_epsilon_positive_growth() {
+        let ledger = GlobalCapacityLedger::new(0.0).unwrap();
+        ledger.reserve("empty", 0.0).unwrap();
+        ledger.reserve("empty", 0.0).unwrap();
+        for positive in [f64::from_bits(1), 1e-9, 1e-7, 1.0] {
+            assert!(ledger.reserve("new", positive).is_err());
+            assert!(ledger.resize("empty", Some(0.0), Some(positive)).is_err());
+            assert!(ledger.resize("new", None, Some(positive)).is_err());
+        }
+        // Existing engine truth can still reconcile and release above-budget residency.
+        ledger.adopt_observed("inherited", None, 1.0).unwrap();
+        ledger.resize("inherited", Some(1.0), Some(1.0)).unwrap();
+        ledger.resize("inherited", Some(1.0), Some(0.5)).unwrap();
+        ledger.resize("inherited", Some(0.5), None).unwrap();
+        assert_eq!(ledger.snapshot().unwrap().reserved_gb, 0.0);
+    }
 
     #[test]
     fn reservations_are_global_idempotent_and_releasable() {
