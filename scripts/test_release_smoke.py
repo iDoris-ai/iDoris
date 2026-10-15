@@ -6,6 +6,8 @@ import importlib.util
 import io
 import json
 import os
+import signal
+import time
 from pathlib import Path
 import socket
 import subprocess
@@ -189,9 +191,67 @@ class SmokeBehavior(unittest.TestCase):
                 package.addfile(entry, io.BytesIO(b""))
         return archive
 
+    def run_cli(self, args, timeout=10):
+        # A timed-out subprocess.run kills only the CLI, leaving its payload.
+        # Own a fresh group and signal it before reaping the CLI's reserved PID.
+        child = subprocess.Popen([sys.executable, str(SCRIPT), *args],
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                 start_new_session=True)
+        birth = subprocess.run(["/bin/ps", "-p", str(child.pid), "-o", "lstart="],
+                               capture_output=True).stdout
+        try:
+            stdout, stderr = child.communicate(timeout=timeout)
+        except BaseException:
+            # Do not signal a group if the CLI has already been reaped.
+            if child.returncode is None:
+                current = subprocess.run(["/bin/ps", "-p", str(child.pid), "-o", "lstart="],
+                                         capture_output=True).stdout
+                if birth and current == birth:
+                    try:
+                        if os.getpgid(child.pid) == child.pid:
+                            os.killpg(child.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+            child.communicate(timeout=5)
+            raise
+        return subprocess.CompletedProcess(child.args, child.returncode, stdout, stderr)
+
+    def test_cli_timeout_reaps_the_owned_payload_process(self):
+        pid_file = self.root / "payload-pid"
+        payload = (f"#!{sys.executable}\nimport os, time\nfrom pathlib import Path\n"
+                   f"Path({str(pid_file)!r}).write_text(str(os.getpid()))\ntime.sleep(60)\n")
+        (self.bundle / "idoris").write_text(payload)
+        child_pid = None
+        birth = None
+        try:
+            with self.assertRaises(subprocess.TimeoutExpired):
+                self.run_cli(["--payload-dir", str(self.bundle), "--expected-version", "0.3.0"],
+                             timeout=2)
+            self.assertTrue(pid_file.exists(), "control must actually start the owned payload")
+            child_pid = int(pid_file.read_text())
+            birth = subprocess.run(["/bin/ps", "-p", str(child_pid), "-o", "lstart="],
+                                   capture_output=True).stdout
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline:
+                try:
+                    os.kill(child_pid, 0)
+                except ProcessLookupError:
+                    break
+                time.sleep(0.02)
+            else:
+                self.fail("CLI timeout left its owned payload alive")
+        finally:
+            if child_pid is not None and birth:
+                current = subprocess.run(["/bin/ps", "-p", str(child_pid), "-o", "lstart="],
+                                         capture_output=True).stdout
+                if current == birth:
+                    try:
+                        os.kill(child_pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+
     def test_legacy_archive_cli_invocation_still_runs(self):
-        result = subprocess.run([sys.executable, str(SCRIPT), str(self.archive()), "0.3.0"],
-                                capture_output=True, text=True, timeout=10)
+        result = self.run_cli([str(self.archive()), "0.3.0"])
         self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_bad_archive_members_refuse_without_extracting_or_running(self):
@@ -207,12 +267,11 @@ class SmokeBehavior(unittest.TestCase):
             smoke.main(invalid, "0.3.0")
 
     def test_payload_cli_invocation_and_mixed_arguments(self):
-        result = subprocess.run([sys.executable, str(SCRIPT), "--payload-dir", str(self.bundle),
-                                 "--expected-version", "0.3.0"], capture_output=True, timeout=10)
+        result = self.run_cli(["--payload-dir", str(self.bundle),
+                               "--expected-version", "0.3.0"])
         self.assertEqual(result.returncode, 0, result.stderr)
-        result = subprocess.run([sys.executable, str(SCRIPT), "old.tar.gz", "0.3.0",
-                                 "--payload-dir", str(self.bundle), "--expected-version", "0.3.0"],
-                                capture_output=True, timeout=5)
+        result = self.run_cli(["old.tar.gz", "0.3.0", "--payload-dir", str(self.bundle),
+                               "--expected-version", "0.3.0"], timeout=5)
         self.assertNotEqual(result.returncode, 0)
 
 
@@ -232,7 +291,7 @@ class WorkflowBehavior(unittest.TestCase):
             result = subprocess.run(["bash", "-c", command], env=env, timeout=5)
             self.assertEqual(result.returncode, 0)
             self.assertEqual((root / "argv").read_text().splitlines(),
-                             ["-B", "-m", "unittest", "discover", "-s", "scripts", "-p", "test_*release*.py"])
+                             ["-B", "-m", "unittest", "discover", "-v", "-s", "scripts", "-p", "test_*release*.py"])
 
     def test_tag_gate_refuses_old_release_wrong_checkout_or_nonmain_source(self):
         block = WORKFLOW.read_text().split("name: Require tag to point at a commit on main", 1)[1]
