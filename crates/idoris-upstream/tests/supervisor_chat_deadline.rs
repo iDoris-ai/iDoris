@@ -87,6 +87,22 @@ fn request() -> ChatRequest {
     }
 }
 
+async fn assert_unload_succeeds(server: &MockServer, handle: &idoris_backend::SupervisorHandle) {
+    // The real adapter must reach its unload endpoint after the chat releases
+    // inflight; an error or a skipped adapter call must fail this check.
+    Mock::given(method("POST"))
+        .and(path("/v1/models/qwen3-8b/unload"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(server)
+        .await;
+    tokio::time::timeout(Duration::from_secs(5), handle.unload("qwen3-8b"))
+        .await
+        .expect("inflight must be released promptly")
+        .expect("the real adapter unload must succeed after chat ends");
+    server.verify().await;
+}
+
 /// Default configs, 11s generation: the old 10s adapter deadline failed it.
 #[tokio::test]
 async fn default_supervisor_path_survives_an_eleven_second_chat() {
@@ -138,10 +154,7 @@ async fn supervisor_chat_deadline_rejects_and_frees_the_slot() {
         "{:?}",
         start.elapsed()
     );
-    tokio::time::timeout(Duration::from_secs(5), handle.unload("qwen3-8b"))
-        .await
-        .expect("inflight must be released")
-        .ok();
+    assert_unload_succeeds(&server, &handle).await;
 }
 
 /// Caller cancellation after the POST reached the fixture converges promptly,
@@ -180,8 +193,5 @@ async fn cancel_after_post_sent_converges_through_the_supervisor() {
     assert_eq!(err.reason_code(), "cancelled");
     assert!(start.elapsed() < Duration::from_secs(2));
     // The in-flight slot is released: an unload is not wedged behind the chat.
-    tokio::time::timeout(Duration::from_secs(5), handle.unload("qwen3-8b"))
-        .await
-        .expect("inflight must be released after cancel")
-        .ok();
+    assert_unload_succeeds(&server, &handle).await;
 }
