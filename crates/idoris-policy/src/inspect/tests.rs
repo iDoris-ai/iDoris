@@ -495,6 +495,122 @@ fn credential_windows_paths_preserve_original_spans() {
 }
 
 #[test]
+fn credential_internal_equals_preserves_value_spans() {
+    for (prefix, value) in [
+        ("", "zMCTnu5i8RRUKO7CCgpDd=FZwTMKHPBZU1HmjS9jA"),
+        ("", "aA1bB2cC3dD4eE5fF6gG7=hH8iI9jJ0kK1lL2mM3nN4"),
+        ("PASSWORD=", "aA1bB2cC3dD4eE5fF6gG7=hH8iI9jJ0kK1lL2mM3nN4"),
+        ("", "aA1bB2cC3dD4eE5fF6gG7=Q62rR7sS8tT9uU0vV1wW2="),
+    ] {
+        let input = format!("😀 {prefix}{value}");
+        assert_single(
+            &input,
+            FindingKind::HighEntropySecret,
+            value,
+            Sensitivity::S3,
+        );
+        let response = inspect(&input, &open_ctx());
+        assert_eq!(response.action, InspectAction::Block, "{input}");
+        assert_eq!(
+            response.findings[0].span.unwrap().start,
+            (3 + prefix.len()) as u64
+        );
+    }
+}
+
+#[test]
+fn credential_union_does_not_widen_or_duplicate_existing_values() {
+    let input = format!("😀 {FAKE_RAW_SECRET}={FAKE_RAW_SECRET}");
+    let response = inspect(&input, &open_ctx());
+    assert_eq!(response.action, InspectAction::Block);
+    assert_eq!(response.sensitivity, Sensitivity::S3);
+    assert_eq!(response.findings.len(), 2, "{response:?}");
+    for (finding, start) in response.findings.iter().zip([3, 44]) {
+        assert_eq!(finding.kind, FindingKind::HighEntropySecret);
+        assert_eq!(finding.span.unwrap().start, start);
+        assert_eq!(covered(&input, finding), FAKE_RAW_SECRET);
+    }
+}
+
+#[test]
+fn credential_serialized_env_escapes_keep_original_spans() {
+    for (argument, expected) in [
+        (r#"{"command":"cat .env\nnext_command"}"#, ".env"),
+        (r#"{"command":"cat .env\n"}"#, ".env"),
+        (r#"{"command":"cat ~/.env\tx"}"#, "~/.env"),
+        (r#"{"command":"cat .env\r\nnext"}"#, ".env"),
+        (r#"\"/app/.env\""#, "/app/.env"),
+        (r"C:\app\.env\\", r"\app\.env"),
+        (r#"{"command":"cat .env.local\"}"#, ".env.local"),
+        (r#"{"command":"cat ~/.ssh/id_rsa\"}"#, "~/.ssh/id_rsa"),
+        (
+            r#"{"arguments":"{\"command\":\"cat /app/.env\"}"}"#,
+            "/app/.env",
+        ),
+        (
+            r#"{"arguments":"{\"command\":\"cat C:\\app\\.env\"}"}"#,
+            r"\\app\\.env",
+        ),
+    ] {
+        let input = format!("😀 {argument}");
+        assert_single(
+            &input,
+            FindingKind::CredentialPath,
+            expected,
+            Sensitivity::S2,
+        );
+        let response = inspect(&input, &open_ctx());
+        assert_eq!(response.action, InspectAction::Redact, "{input}");
+        let start = input.find(expected).unwrap();
+        assert_eq!(
+            response.findings[0].span.unwrap().start,
+            input[..start].encode_utf16().count() as u64
+        );
+    }
+}
+
+#[test]
+fn credential_serialized_windows_separators() {
+    for path in [
+        r"C:\\Users\\a\\.aws\\credentials",
+        r"C:\\Users\\a\\.kube\\config",
+        r"C:\\Users\\a\\.docker\\config.json",
+        r"C:\\Users\\a\\.ssh\\config",
+    ] {
+        let input = format!("😀 {{\"path\":\"{path}\"}}");
+        assert_single(
+            &input,
+            FindingKind::CredentialPath,
+            &path[2..],
+            Sensitivity::S2,
+        );
+        assert_eq!(inspect(&input, &open_ctx()).action, InspectAction::Redact);
+    }
+}
+
+#[test]
+fn credential_assignment_name_does_not_gain_padding() {
+    for input in [
+        "aA1bB2cC3dD4eE5fF6gG7hH8iI9jJ0k=developmentconfiguration",
+        "K=8vLr5VrExzWYr2qeBJNvhYsN63lysYi",
+        "K=aVTZ23bG7tHZlX0SqxlZ3dzETRxOmw",
+        r"C:\Windows\System32\drivers\etc\hosts",
+        r"\\?\C:\temp\file.txt",
+        r"split on \ and / please",
+        r"C:\code\process.env.API_KEY",
+        r"escape \n.envelope",
+    ] {
+        let response = inspect(input, &open_ctx());
+        assert_eq!(
+            response.action,
+            InspectAction::Allow,
+            "{input}: {response:?}"
+        );
+        assert!(response.findings.is_empty(), "{input}: {response:?}");
+    }
+}
+
+#[test]
 fn prefixed_keys_are_found_by_rule_set_a() {
     for key in [FAKE_OPENAI, FAKE_GITHUB, FAKE_AWS_ID] {
         assert_single(

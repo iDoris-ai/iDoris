@@ -60,49 +60,128 @@ pub(super) fn scan(units: &[u16], hits: &mut Vec<Hit>) {
             hits.push(hit(FindingKind::ApiKey, start, end, Sensitivity::S3));
         }
     }
-    // '=' separates an assignment name from its value; only trailing base64
-    // padding belongs to the value being scored.
-    for (start, run_end) in runs(units, |c| c.is_ascii_alphanumeric() || b"+/_-".contains(&c)) {
-        let mut end = run_end;
-        while end < units.len() && end - run_end < 2 && units[end] == u16::from(b'=') {
-            end += 1;
-        }
-        if looks_random(&units[start..end]) {
-            hits.push(hit(
-                FindingKind::HighEntropySecret,
-                start,
-                end,
-                Sensitivity::S3,
+    // Prefer value-only spans. The inclusive segmentation is a fallback for
+    // internal '=': it must neither duplicate nor widen an existing value hit.
+    for (start, end) in runs(units, |c| entropy_member(c) || c == b'=') {
+        let token = &units[start..end];
+        let mut candidates = Vec::new();
+        for (part_start, part_end) in runs(token, entropy_member) {
+            let mut padded_end = part_end;
+            while padded_end < token.len()
+                && padded_end - part_end < 2
+                && token[padded_end] == u16::from(b'=')
+            {
+                padded_end += 1;
+            }
+            // An '=' followed by another value character is an assignment or
+            // internal separator, not trailing base64 padding.
+            let padding_ends_value = token
+                .get(padded_end)
+                .is_none_or(|&u| !ascii(u).is_some_and(entropy_member));
+            candidates.push((
+                part_start,
+                if padding_ends_value {
+                    padded_end
+                } else {
+                    part_end
+                },
             ));
         }
+        if let Some(eq) = token.iter().position(|&u| u == u16::from(b'='))
+            && random_parts(&token[eq + 1..])
+        {
+            candidates.push((eq + 1, token.len()));
+        }
+        if random_parts(token) {
+            candidates.push((0, token.len()));
+        }
+        let mut accepted = Vec::new();
+        for (a, b) in candidates {
+            if looks_random(&token[a..b]) && !accepted.iter().any(|&(x, y)| a < y && x < b) {
+                accepted.push((a, b));
+                hits.push(hit(
+                    FindingKind::HighEntropySecret,
+                    start + a,
+                    start + b,
+                    Sensitivity::S3,
+                ));
+            }
+        }
     }
-    for (start, end) in runs(units, |c| {
+    for (start, run_end) in runs(units, |c| {
         c.is_ascii_alphanumeric() || b"._~/-\\".contains(&c)
     }) {
-        // Fold separators only for matching; hit coordinates stay in the input.
-        let token: Vec<u16> = units[start..end]
-            .iter()
-            .map(|&u| {
-                if u == u16::from(b'\\') {
-                    u16::from(b'/')
-                } else {
-                    u
-                }
-            })
-            .collect();
-        if CREDENTIAL_PATHS
-            .iter()
-            .any(|p| find(&token, 0, p).is_some())
-            || is_env_file(&token)
-        {
+        let mut end = run_end;
+        // Preserve the Windows prefix, but stop at an escape after an env
+        // filename. The old backslash-split segmentation ended here too.
+        let old_runs = runs(&units[start..run_end], |c| {
+            c.is_ascii_alphanumeric() || b"._~/-".contains(&c)
+        });
+        for &(a, b) in &old_runs {
+            if is_env_file(&units[start + a..start + b]) {
+                end = start + b;
+                break;
+            }
+        }
+        while end > start && units[end - 1] == u16::from(b'\\') {
+            end -= 1;
+        }
+        if credential_path(&fold_path(&units[start..end])) {
             hits.push(hit(
                 FindingKind::CredentialPath,
                 start,
                 end,
                 Sensitivity::S2,
             ));
+        } else {
+            // Union with the old segmentation when folding did not match.
+            // A matching folded run takes precedence to keep K2's full span.
+            for (a, b) in runs(&units[start..end], |c| {
+                c.is_ascii_alphanumeric() || b"._~/-".contains(&c)
+            }) {
+                if credential_path(&units[start + a..start + b]) {
+                    hits.push(hit(
+                        FindingKind::CredentialPath,
+                        start + a,
+                        start + b,
+                        Sensitivity::S2,
+                    ));
+                }
+            }
         }
     }
+}
+
+fn entropy_member(c: u8) -> bool {
+    c.is_ascii_alphanumeric() || b"+/_-".contains(&c)
+}
+
+// Inclusive candidates must contain secret-like pieces on both sides of an
+// internal '='. Otherwise an ordinary assignment name can manufacture a hit.
+fn random_parts(token: &[u16]) -> bool {
+    token
+        .split(|&u| u == u16::from(b'='))
+        .filter(|part| !part.is_empty())
+        .all(|part| part.len() > 1 && switches(part) * 2 >= part.len() - 1)
+}
+
+fn fold_path(token: &[u16]) -> Vec<u16> {
+    let mut folded = Vec::with_capacity(token.len());
+    for &u in token {
+        let u = if u == u16::from(b'\\') {
+            u16::from(b'/')
+        } else {
+            u
+        };
+        if u != u16::from(b'/') || folded.last() != Some(&u) {
+            folded.push(u);
+        }
+    }
+    folded
+}
+
+fn credential_path(token: &[u16]) -> bool {
+    CREDENTIAL_PATHS.iter().any(|p| find(token, 0, p).is_some()) || is_env_file(token)
 }
 
 fn hit(kind: FindingKind, start: usize, end: usize, sensitivity: Sensitivity) -> Hit {
@@ -180,20 +259,10 @@ fn looks_random(token: &[u16]) -> bool {
     if token.len() < 32 {
         return false;
     }
-    let class = |u: u16| match ascii(u) {
-        Some(c) if c.is_ascii_lowercase() => 0usize,
-        Some(c) if c.is_ascii_uppercase() => 1,
-        Some(c) if c.is_ascii_digit() => 2,
-        _ => 3,
-    };
     let mut counts = [0u32; 128];
     for &u in token {
         counts[usize::from(u) % 128] += 1;
     }
-    let switches = token
-        .windows(2)
-        .filter(|w| class(w[0]) != class(w[1]))
-        .count();
     let n = token.len() as f64;
     let entropy: f64 = counts
         .iter()
@@ -203,7 +272,20 @@ fn looks_random(token: &[u16]) -> bool {
             -p * p.log2()
         })
         .sum();
-    entropy >= 4.0 && switches * 2 >= token.len() - 1
+    entropy >= 4.0 && switches(token) * 2 >= token.len() - 1
+}
+
+fn switches(token: &[u16]) -> usize {
+    let class = |u: u16| match ascii(u) {
+        Some(c) if c.is_ascii_lowercase() => 0usize,
+        Some(c) if c.is_ascii_uppercase() => 1,
+        Some(c) if c.is_ascii_digit() => 2,
+        _ => 3,
+    };
+    token
+        .windows(2)
+        .filter(|w| class(w[0]) != class(w[1]))
+        .count()
 }
 
 /// `.env`、`.env.local` 这类文件名：前面不能紧贴标识符字符
