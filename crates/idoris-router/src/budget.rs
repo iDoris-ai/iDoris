@@ -24,6 +24,13 @@ pub(crate) const RESERVED_COMPLETION_TOKENS: u64 = 1024;
 /// When both fields are present, quote their maximum regardless of upstream
 /// precedence; retain the original fields and the legacy 1024-token floor.
 pub(crate) fn completion_reservation_tokens(body: &Value) -> Result<u64, &'static str> {
+    // Quotation accounts for one completion; reject multiplicity before forwarding.
+    if body
+        .get("n")
+        .is_some_and(|count| !count.is_null() && count.as_u64() != Some(1))
+    {
+        return Err("n");
+    }
     const MAX_EXACT_COMPLETION_TOKENS: u64 = 1_u64 << 53;
     let mut completion = RESERVED_COMPLETION_TOKENS;
     for field in ["max_tokens", "max_completion_tokens"] {

@@ -2332,6 +2332,13 @@ async fn chat_completions(
     }
     let completion_reservation = match budget::completion_reservation_tokens(&value) {
         Ok(completion) => completion,
+        Err("n") => {
+            return error_envelope(
+                StatusCode::BAD_REQUEST,
+                "unsupported_completion_count",
+                "n must be the integer 1 or null; multiple completions are not supported",
+            );
+        }
         Err(field) => {
             return error_envelope(
                 StatusCode::BAD_REQUEST,
