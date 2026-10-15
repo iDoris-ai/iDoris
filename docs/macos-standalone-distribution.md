@@ -11,7 +11,7 @@
 
 ## 操作者输入与边界
 
-要求 macOS、Python 3.11+、Xcode command-line tools（`xcrun notarytool`/`stapler`）、已有且有效的 Developer ID Application keychain identity、已有 notarytool profile alias，以及网络连接。identity 输入是证书 SHA1 指纹，team ID 必须与实际证书、签名元数据一致。profile alias 由操作者确认；未知时停止，不猜测、不创建 profile。不要传密码、私钥、个人账号或在日志中 dump 环境。
+要求 macOS、Python 3.9+、Xcode command-line tools（`xcrun notarytool`/`stapler`）、已有且有效的 Developer ID Application keychain identity、已有 notarytool profile alias，以及网络连接。identity 输入是证书 SHA1 指纹，team ID 必须与实际证书、签名元数据一致。profile alias 由操作者确认；未知时停止，不猜测、不创建 profile。不要传密码、私钥、个人账号或在日志中 dump 环境。
 
 输入 binary 只接受指定架构的 thin 64-bit Mach-O executable（aarch64 或 x86_64）；不接受 tar/ZIP、脚本、dylib、fat/universal。`--binary-sha256` 固定构建产物字节，签名只修改 staging 副本。`--source-sha` 和 `--version` 是构建负责人提供的来源声明，脚本不能从任意 Mach-O 证明源码 SHA/语义版本；构建 provenance 和精确版本 `/health` smoke 是发布前置门禁。
 
@@ -39,7 +39,7 @@ python3 scripts/macos_signed_release.py \
 1. 校验参数、输入 SHA256、Mach-O 架构/type、配置路径和输出位置；查询有效 identity 并核对 Developer ID Application/team。
 2. 复制 CLI 和配置；用 `codesign --timestamp --options runtime` 签 CLI，验证严格签名、team、authority、timestamp、runtime。
 3. `hdiutil create -format UDZO` 生成 UDIF DMG，再用同一 identity 和 timestamp 签 DMG 并核对签名。
-4. `notarytool submit --keychain-profile … --output-format json`，记录 submission UUID，以 `info` 查询直到 `Accepted`；拒绝、未知状态、坏 JSON、ID 不一致或超时均停止。默认每 15 秒查询、接受期限一小时，这是一次发布的公证事务轮询，不是 LoopX 定时状态检查。
+4. `notarytool submit --keychain-profile … --output-format json`，只将上传响应中的有效 submission UUID 视为收据，立即调用 `info` 再查询直到 `Accepted`；拒绝、未知状态、坏 JSON、ID 不一致或超时均停止。默认每 15 秒查询、接受期限一小时，这是一次发布的公证事务轮询，不是 LoopX 定时状态检查。
 5. staple、validate、再次严格核对 DMG 签名、`hdiutil verify` 和 `spctl` open assessment；只读挂载，核对 CLI/四配置内容哈希、CLI 签名和公证状态，再 detach。
 6. **最后**计算附票后 DMG 的 SHA256，写 checksum 与公开 manifest，然后将产物目录移到最终输出位置。manifest 同时记录输入与签名后 CLI SHA256、配置 SHA256、source/version 声明、submission UUID 和实际通过的工具检查。
 
@@ -62,9 +62,22 @@ python3 scripts/macos_signed_release.py \
 ## 本切片验证
 
 ```sh
-python3 -m unittest discover -s scripts -p test_macos_signed_release.py -v
-python3 scripts/macos_signed_release.py --help
+/usr/bin/python3 --version
+python3 --version
+/usr/bin/python3 -B -m unittest discover -s scripts -p test_macos_signed_release.py -v
+python3 -B -m unittest discover -s scripts -p test_macos_signed_release.py -v
+/usr/bin/python3 -B scripts/macos_signed_release.py --help
+python3 -B scripts/macos_signed_release.py --help
 git diff --check
 ```
 
 行为测试使用 Apple tool doubles 覆盖各阶段错误后停止、拒绝和公证 deadline、坏响应、非法输入/路径/归档、挂载内容损坏、最终附票字节 checksum 顺序、plan 不调用工具、真实子进程失败/超时不泄漏输出。它们不是真实 codesign、公证服务、stapler 或 Gatekeeper 验收。本切片未执行任何签名、上传公证、credential 修改、Cargo build、tag、Release 或发布动作；实际发行仍等待 v0.3.1 产品门禁与受控签名运行。
+
+
+### Python 兼容性与异步提交回归（2026-10-15）
+
+在基线 `cf013947` 上实际使用 `/usr/bin/python3` 3.9.6 运行原 14 项测试，复现 10 个 `hashlib.file_digest` 不存在的错误；该 API 不适用于系统 Python。现改为每次最多读取 1 MiB、逐块更新 SHA256，覆盖空文件、短文件和跨块文件。fixture 临时根已使用 `Path.resolve()`；生产 symlink/path guards 保持原样。
+
+新增 ID-only、id/message/path 上传收据、后续坏 `info`、缺失/非法状态回归后，在修复前的 Python 3.11.9 上实际得到 18 项中 5 failures 和 1 error；修复后上述两个解释器均通过全部 18 项行为测试和 CLI help。完整流水线的 Apple double 也改为返回不带 status 的上传收据，避免只有独立单元测试覆盖真实异步流程。
+
+本机只读核对了 `xcrun notarytool --version`（1.1.2 build 41）、`submit --help`、`info --help` 和 `man notarytool`：默认 `--no-wait` 只等上传，submit 返回 UUID，info 才负责获取处理状态，JSON 是支持的输出格式。前述 Apple workflow 文档也分别展示只有 id/path 的上传收据及带 status 的处理结果；这些文档没有承诺所有版本完整 JSON 键集合，因此解析只依赖有效 UUID，忽略 message/path，始终从同 ID 的 info 响应确认 Accepted。submit 若显式携带未知/拒绝状态同样停止；info 缺失状态绝不视为接受。此核对未请求凭据、未执行真实提交，真实 Apple 服务与用户下载路径验收仍待协调者完成。

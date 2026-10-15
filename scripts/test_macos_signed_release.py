@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Behavior tests only: fake Apple tools NEVER establish signing acceptance."""
 import io
+import hashlib
 import json
 from pathlib import Path
 import shutil
@@ -41,7 +42,10 @@ class AppleDouble:
         if stage == "DMG signing":
             with Path(argv[-1]).open("ab") as stream:
                 stream.write(b"image signature")
-        if stage in ("notary submit", "notary info"):
+        if stage == "notary submit":
+            return json.dumps({"id": SUBMISSION, "message": "Successfully uploaded file.",
+                               "path": "test-image.dmg"})
+        if stage == "notary info":
             return json.dumps({"id": SUBMISSION, "status": self.status})
         if stage == "ticket stapling":
             with Path(argv[-1]).open("ab") as stream:
@@ -183,6 +187,32 @@ class ReleaseBehavior(unittest.TestCase):
 
 
 class NotaryBehavior(unittest.TestCase):
+    def test_id_only_submit_queries_info_before_acceptance(self):
+        for receipt in ({"id": SUBMISSION},
+                        {"id": SUBMISSION, "message": "Successfully uploaded file.", "path": "safe.dmg"}):
+            calls = []
+            responses = iter([receipt, {"id": SUBMISSION, "status": "In Progress"},
+                              {"id": SUBMISSION, "status": "Accepted"}])
+            def run(stage, argv):
+                calls.append(argv[2])
+                return json.dumps(next(responses))
+            self.assertEqual(release.notarize(run, Path("safe.dmg"), "alias", 60,
+                                             sleep=lambda _: None), SUBMISSION)
+            self.assertEqual(calls, ["submit", "info", "info"])
+
+    def test_upload_receipt_alone_cannot_establish_acceptance(self):
+        for status in ("Invalid", "Rejected", "unexpected", None):
+            responses = iter([{"id": SUBMISSION, "status": "Accepted"},
+                              {"id": SUBMISSION, "status": status}])
+            with self.subTest(status=status), self.assertRaises(release.ReleaseError):
+                release.notarize(lambda *_: json.dumps(next(responses)),
+                                 Path("safe.dmg"), "alias", 60, sleep=lambda _: None)
+
+    def test_malformed_info_after_valid_upload_fails(self):
+        responses = iter([json.dumps({"id": SUBMISSION}), "{}"])
+        with self.assertRaisesRegex(release.ReleaseError, "malformed"):
+            release.notarize(lambda *_: next(responses), Path("safe.dmg"), "alias", 60)
+
     def test_poll_until_accepted(self):
         calls = []
         def run(stage, argv):
@@ -213,6 +243,15 @@ class NotaryBehavior(unittest.TestCase):
         self.assertNotIn("private-value", str(result.exception))
         with self.assertRaisesRegex(release.ReleaseError, "timed out"):
             runner("test timeout", [sys.executable, "-c", "import time; time.sleep(10)"])
+
+
+class DigestBehavior(unittest.TestCase):
+    def test_empty_and_multi_chunk_files_match_sha256(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp).resolve() / "payload"
+            for data in (b"", b"abc", bytes(range(256)) * 8193):
+                path.write_bytes(data)
+                self.assertEqual(release.digest(path), hashlib.sha256(data).hexdigest())
 
 
 if __name__ == "__main__":

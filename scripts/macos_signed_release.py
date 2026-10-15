@@ -32,8 +32,11 @@ def require(condition, message):
 
 
 def digest(path):
+    checksum = hashlib.sha256()
     with path.open("rb") as stream:
-        return hashlib.file_digest(stream, "sha256").hexdigest()
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            checksum.update(chunk)
+    return checksum.hexdigest()
 
 
 def regular(path):
@@ -109,7 +112,14 @@ def notarize(run, image, profile, timeout, clock=time.monotonic, sleep=time.slee
         return data, submission
     data, submission = request("submit", image)
     print(f"Notary submission: {submission}", file=sys.stderr)
+    # An asynchronous upload receipt guarantees an ID, not a processing status.
+    # If a status is present, still reject unexpected values and confirm via info.
+    if "status" in data:
+        require(data["status"] in ("In Progress", "Accepted"),
+                f"notary {submission}: rejected or unknown status; retrieve log locally")
     end = clock() + timeout
+    data, returned = request("info", submission)
+    require(returned == submission, "notary service returned a different submission ID")
     while True:
         status = data.get("status")
         if status == "Accepted":
