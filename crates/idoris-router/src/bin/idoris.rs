@@ -243,7 +243,11 @@ async fn run(options: cli::ServeOptions) -> Result<(), String> {
 
     let local_runtime_path = config::optional_env_path("IDORIS_LOCAL_RUNTIME_CONFIG")?;
     let local_runtime_configs = runtime_launch_config::load(local_runtime_path.as_deref())?;
-    let runtimes = RuntimeRegistry::spawn_with_local_configs(&cards, &local_runtime_configs)?;
+    let runtimes = RuntimeRegistry::spawn_with_local_configs_and_budget(
+        &cards,
+        &local_runtime_configs,
+        allocated_budget_bytes,
+    )?;
     // Preserve startup-gate precedence: component/policy/runtime validation
     // (including subscription authorization and fixed card gates) must fail
     // before tenant storage/config bootstrap can surface a later error.
