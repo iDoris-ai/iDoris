@@ -19,6 +19,10 @@ fn card(endpoint: &str) -> ComponentCard {
         serde_yaml::from_str(include_str!("../../../config/components/omlx.yaml")).unwrap();
     card.endpoint = endpoint.into();
     card.provider.id = "Qwen3-0.6B-4bit".into();
+    card.extensions = Some(serde_json::from_value(serde_json::json!({
+        "_degradation": "Removing these bindings disables aliases.",
+        "idoris_role_models": {"daily": "Qwen3-0.6B-4bit", "fast": "Qwen3-0.6B-4bit"}
+    })).unwrap());
     card
 }
 

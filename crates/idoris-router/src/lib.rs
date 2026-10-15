@@ -31,6 +31,8 @@ pub mod routing_policy;
 /// The local decision + execution path (R2-D task 3): `decide()` → (if
 /// needed) `Supervisor` load → `Supervisor` chat.
 pub mod dispatch;
+#[cfg(test)]
+mod role_binding_tests;
 
 /// Read-only Admin API v0 status facts. HTTP exposure is intentionally
 /// deferred until the dedicated loopback + session-token listener slice.
@@ -2221,10 +2223,10 @@ async fn chat_completions(
                 policy_cards
                     .cards
                     .iter()
-                    .map(|card| {
-                        let provider_id = card.provider.id.clone();
-                        let target_model = dispatch::backend_model_id(&parsed, model, &provider_id);
-                        (provider_id, target_model)
+                    .filter_map(|card| {
+                        dispatch::backend_model_id(&parsed, model, card)
+                            .ok()
+                            .map(|target| (card.provider.id.clone(), target))
                     })
                     .collect(),
             )
@@ -2355,12 +2357,23 @@ async fn chat_completions(
             };
         }
         if dispatch::is_resident_http_service(&selected.card) {
+            let mut upstream_body = value.clone();
+            if parsed.role.is_some() {
+                let target = match dispatch::backend_model_id(&parsed, model, &selected.card) {
+                    Ok(target) => target,
+                    Err(DispatchError::Rejection(rejection)) => return rejection_response(rejection),
+                    Err(DispatchError::Internal(message)) => return error_envelope(
+                        StatusCode::INTERNAL_SERVER_ERROR, "internal_error", message,
+                    ),
+                };
+                upstream_body["model"] = serde_json::Value::String(target);
+            }
             return chat_via_proxy(
                 &state,
                 selected,
                 &headers,
                 &parsed,
-                &value,
+                &upstream_body,
                 &record_id,
                 ProxyEventContexts {
                     dispatched: dispatched_event_context.as_ref(),
@@ -3385,7 +3398,10 @@ mod tests {
             fallback_policy: FallbackPolicy::FailClosed,
             fail_closed: true,
             load_policy: None,
-            extensions: None,
+            extensions: Some(serde_json::from_value(json!({
+                "_degradation": "Removing these bindings disables aliases.",
+                "idoris_role_models": {"daily": id}
+            })).unwrap()),
         }
     }
 
@@ -5390,7 +5406,7 @@ mod tests {
         wiremock::Mock::given(wiremock::matchers::method("POST"))
             .and(wiremock::matchers::path("/v1/chat/completions"))
             .and(wiremock::matchers::body_json(serde_json::json!({
-                "model": "idoris/daily",
+                "model": "omlx",
                 "stream": false,
                 "messages": [{"role": "user", "content": "redirect guard payload"}]
             })))
