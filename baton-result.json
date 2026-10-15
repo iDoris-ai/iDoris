@@ -1,0 +1,14 @@
+{
+  "schema": "baton-result/v1",
+  "task_id": "idoris-cloud-grok-release-wire-audit-20261015",
+  "attempt_id": "5d06768c-1784-4069-b71a-08fc50fe6ac5",
+  "sequence": 1,
+  "status": "started",
+  "base_sha": "1c4cebdae582cda68db9f8e5aca9ff2caa1db8bd",
+  "result_sha": null,
+  "summary": "开始 v0.3.1 release wire 审计",
+  "tests": [],
+  "blocker": null,
+  "next": null,
+  "updated_at": "2026-10-15T11:27:29Z"
+}
