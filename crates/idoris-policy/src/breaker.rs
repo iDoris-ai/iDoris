@@ -70,7 +70,7 @@ impl Admission {
 /// 一次放行的不透明票据。故意没有 `Copy`/`Clone`：同一次请求只能把票据
 /// 移交给一个回报方法，从类型上避免成功和失败各报一次。
 ///
-/// 字段不公开。调用方不能自己造票据，也不能看世代；过期与否只由断路器判断。
+/// 字段不公开，调用方不能自己造票据；过期与否只由断路器判断。
 #[derive(Debug)]
 #[must_use = "move this ticket into exactly one outcome report"]
 pub struct AdmissionTicket {
