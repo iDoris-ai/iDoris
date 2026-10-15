@@ -2330,6 +2330,16 @@ async fn chat_completions(
     } else if state.dev_no_key_enabled && authorization_present {
         return virtual_key_unauthorized_response();
     }
+    let completion_reservation = match budget::completion_reservation_tokens(&value) {
+        Ok(completion) => completion,
+        Err(field) => {
+            return error_envelope(
+                StatusCode::BAD_REQUEST,
+                "invalid_completion_cap",
+                format!("{field} must be an integer between 0 and 9007199254740992"),
+            );
+        }
+    };
     let correlation = match correlation::parse(&headers) {
         Ok(context) => context,
         Err(error) => return correlation_error_response(error),
@@ -2508,7 +2518,7 @@ async fn chat_completions(
         affinity_key,
         &ready_provider_ids,
         &open_provider_ids,
-        budget::completion_reservation_tokens(&value),
+        completion_reservation,
     );
     // M5-22: INSPECTED already lowered the privacy floor, so the pipeline
     // cannot tell that content did it; record the fact it would have
