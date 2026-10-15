@@ -13,6 +13,13 @@ fn open_ctx() -> InspectCtx {
     }
 }
 
+fn finding(kind: FindingKind, start: u64, length: u64) -> InspectFinding {
+    InspectFinding {
+        kind,
+        span: Some(InspectSpan { start, length }),
+    }
+}
+
 fn assert_entity(text: &str, canonical: &str, kind: FindingKind) {
     let expected = inspect(canonical, &open_ctx());
     let input = format!("😀号码：{text}。结束");
@@ -113,10 +120,15 @@ fn dates_ipv4_decimals_and_unrelated_short_groups_stay_public() {
         "13\t81\t23\t45\t678",
         "6\t22\t20\t21\t23\t45\t67\t89\t4",
         "1.2.3.4.5.6.7.8.9.0.1.2.3.4.5.6.7.8.9.0",
-        // A valid card subwindow must not turn a numeric table into an entity.
-        "1111.6222.0212.3456.7894.2222",
-        "1111/6222/0212/3456/7894/2222",
-        "1111\t6222\t0212\t3456\t7894\t2222",
+        // Underscore and comma are out of scope for this separator pass.
+        "138_1234_5678",
+        "138,1234,5678",
+        "6222_0212_3456_7894",
+        "6222,0212,3456,7894",
+        // Formatted ids with a bad province or an impossible date stay public.
+        "990105.19491231.0003",
+        "110105.19491331.0003",
+        "110105.19000229.0003",
     ] {
         let response = inspect(input, &open_ctx());
         assert_eq!(
@@ -235,14 +247,208 @@ fn canonical_neighbor_and_country_code_keep_all_expected_spans() {
 
 #[test]
 fn unrelated_four_digit_neighbor_prevents_new_window_matching() {
-    // Same conservative boundary as 7c6cee4: a room number is not a short edge.
-    assert_eq!(
-        inspect("1203 138.1234.5678", &open_ctx()).action,
-        InspectAction::Allow
-    );
+    // Deliberate false positive: an entity-shaped numeric row is reported even
+    // when the neighbor is an unrelated four-digit room number. This used to
+    // expect Allow (7c6cee4 / aced94d full-chain veto).
+    let response = inspect("1203 138.1234.5678", &open_ctx());
+    assert_eq!(response.action, InspectAction::Redact);
+    assert_eq!(response.sensitivity, Sensitivity::S2);
+    assert_eq!(response.findings, [finding(FindingKind::CnMobile, 5, 13)]);
     // A matching 3/4/4 row is intrinsically ambiguous and is treated as a phone.
     assert_eq!(
         inspect("138.1234.5678", &open_ctx()).action,
         InspectAction::Redact
     );
+}
+
+#[test]
+fn g1_edge_digit_keeps_formatted_phone_and_card_span() {
+    for (input, start) in [("138-1234-5678 1", 0u64), ("1 138-1234-5678", 2)] {
+        let granted = inspect(input, &open_ctx());
+        assert_eq!(granted.action, InspectAction::Redact, "{input}");
+        assert_eq!(granted.sensitivity, Sensitivity::S2, "{input}");
+        assert_eq!(
+            granted.findings,
+            [finding(FindingKind::CnMobile, start, 13)],
+            "{input}"
+        );
+        let missing = inspect(
+            input,
+            &InspectCtx {
+                redact_consent: false,
+                ..open_ctx()
+            },
+        );
+        assert_eq!(missing.action, InspectAction::Block, "{input}");
+        assert_eq!(missing.sensitivity, Sensitivity::S2, "{input}");
+        assert_eq!(missing.findings, granted.findings, "{input}");
+    }
+    for (input, start) in [
+        ("6222 0212 3456 7894 1", 0u64),
+        ("12 6222 0212 3456 7894", 3),
+    ] {
+        for consent in [true, false] {
+            let response = inspect(
+                input,
+                &InspectCtx {
+                    redact_consent: consent,
+                    ..open_ctx()
+                },
+            );
+            assert_eq!(response.action, InspectAction::Block, "{input}");
+            assert_eq!(response.sensitivity, Sensitivity::S3, "{input}");
+            assert_eq!(
+                response.findings,
+                [finding(FindingKind::BankCard, start, 19)],
+                "{input}"
+            );
+        }
+    }
+}
+
+#[test]
+fn g2_period_tab_slash_resident_ids_are_s3_exact_span() {
+    let specs: &[(&[&str], &str)] = &[
+        (&["110105", "19491231", "0003"], "110105194912310003"),
+        (&["110105", "19491231", "002X"], "11010519491231002X"),
+        (&["440308", "19900101", "1239"], "440308199001011239"),
+        (&["440308", "1990", "0101", "1239"], "440308199001011239"),
+        (&["110105", "1949", "1231", "002X"], "11010519491231002X"),
+    ];
+    for (parts, canonical) in specs {
+        for separator in ["\t", ".", "/"] {
+            assert_entity(&parts.join(separator), canonical, FindingKind::CnResidentId);
+        }
+    }
+    assert_entity(
+        "110105.19491231.002x",
+        "11010519491231002x",
+        FindingKind::CnResidentId,
+    );
+    let downgraded = inspect("110105.19491231.0001", &open_ctx());
+    assert_eq!(downgraded.action, InspectAction::Redact);
+    assert_eq!(downgraded.sensitivity, Sensitivity::S2);
+    assert_eq!(
+        downgraded.findings,
+        [finding(FindingKind::CnResidentId, 0, 20)]
+    );
+}
+
+#[test]
+fn taiwan_resident_830000_follows_id_checksum_rules() {
+    assert_entity(
+        "830000199001011234",
+        "830000199001011234",
+        FindingKind::CnResidentId,
+    );
+    assert_entity(
+        "830000.19900101.1234",
+        "830000199001011234",
+        FindingKind::CnResidentId,
+    );
+    assert_entity(
+        "830000/1990/0101/1234",
+        "830000199001011234",
+        FindingKind::CnResidentId,
+    );
+    assert_entity(
+        "830000\t19900101\t1234",
+        "830000199001011234",
+        FindingKind::CnResidentId,
+    );
+    let downgraded = inspect("830000199001011230", &open_ctx());
+    assert_eq!(downgraded.action, InspectAction::Redact);
+    assert_eq!(downgraded.sensitivity, Sensitivity::S2);
+    assert_eq!(
+        downgraded.findings,
+        [finding(FindingKind::CnResidentId, 0, 18)]
+    );
+    let formatted = inspect("830000.19900101.1230", &open_ctx());
+    assert_eq!(formatted.action, InspectAction::Redact);
+    assert_eq!(formatted.sensitivity, Sensitivity::S2);
+    assert_eq!(
+        formatted.findings,
+        [finding(FindingKind::CnResidentId, 0, 20)]
+    );
+    let missing = inspect(
+        "830000199001011230",
+        &InspectCtx {
+            redact_consent: false,
+            ..open_ctx()
+        },
+    );
+    assert_eq!(missing.action, InspectAction::Block);
+    assert_eq!(missing.findings, downgraded.findings);
+    // 8-digit Taiwan permits are a different document and are not detected.
+    for input in ["83000019", "01234567"] {
+        let response = inspect(input, &open_ctx());
+        assert_eq!(response.action, InspectAction::Allow, "{input}");
+        assert!(response.findings.is_empty(), "{input}: {response:?}");
+    }
+}
+
+#[test]
+fn g3_entity_subwindows_ignore_unrelated_neighbors() {
+    let phones = [
+        ("1203 138.1234.5678", 5u64),
+        ("1 2 3 138.1234.5678", 6),
+        ("1203 138 1234 5678", 5),
+        ("1203 138-1234-5678", 5),
+    ];
+    for (input, start) in phones {
+        let response = inspect(input, &open_ctx());
+        assert_ne!(response.action, InspectAction::Allow, "{input}");
+        assert_eq!(response.action, InspectAction::Redact, "{input}");
+        assert_eq!(response.sensitivity, Sensitivity::S2, "{input}");
+        assert_eq!(
+            response.findings,
+            [finding(FindingKind::CnMobile, start, 13)],
+            "{input}: {response:?}"
+        );
+    }
+    let cards = [
+        ("6222.0212.3456.7894 2028", 0u64, 19u64),
+        ("2026.10.15 6222.0212.3456.7894", 11, 19),
+        ("6222\t0212\t3456\t7894\t1000", 0, 19),
+    ];
+    for (input, start, length) in cards {
+        let response = inspect(input, &open_ctx());
+        assert_ne!(response.action, InspectAction::Allow, "{input}");
+        assert_eq!(response.action, InspectAction::Block, "{input}");
+        assert_eq!(response.sensitivity, Sensitivity::S3, "{input}");
+        assert_eq!(
+            response.findings,
+            [finding(FindingKind::BankCard, start, length)],
+            "{input}: {response:?}"
+        );
+    }
+    let both = inspect("138.1234.5678 7 139.1234.5678", &open_ctx());
+    assert_eq!(both.action, InspectAction::Redact);
+    assert_eq!(both.sensitivity, Sensitivity::S2);
+    assert_eq!(
+        both.findings,
+        [
+            finding(FindingKind::CnMobile, 0, 13),
+            finding(FindingKind::CnMobile, 16, 13),
+        ]
+    );
+    // Both 16-digit windows are Luhn-valid. Flagging the 1111-prefixed row is
+    // the deliberate false positive of accepting entity-shaped subwindows.
+    for input in [
+        "1111.6222.0212.3456.7894.2222",
+        "1111/6222/0212/3456/7894/2222",
+        "1111\t6222\t0212\t3456\t7894\t2222",
+    ] {
+        let response = inspect(input, &open_ctx());
+        assert_eq!(response.action, InspectAction::Block, "{input}");
+        assert_eq!(response.sensitivity, Sensitivity::S3, "{input}");
+        assert_eq!(
+            response.findings,
+            [
+                finding(FindingKind::BankCard, 0, 19),
+                finding(FindingKind::BankCard, 5, 19),
+            ],
+            "{input}: {response:?}"
+        );
+    }
 }
