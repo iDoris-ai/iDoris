@@ -1,0 +1,2 @@
+time	lane	decision	reason
+2026-10-15T08:57:18Z	grokbot	start	从 ops/travel-20261015-library@9054a5d 拉出 baton/grokbot-20261015；只复核 507/479/510；task_id/attempt_id 未提供记 null

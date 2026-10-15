@@ -1,0 +1,14 @@
+{
+  "schema": "baton-result/v1",
+  "task_id": null,
+  "attempt_id": null,
+  "sequence": 1,
+  "status": "started",
+  "base_sha": "9054a5d0f74e6468adc6207336077801d838c36d",
+  "result_sha": null,
+  "summary": "Grok Bot 车道已开始：独立复核 HANDOFF 中保存的 507/479/510 三个精确 head（只读复核，无生产修改）。task_id/attempt_id 未在 handoff body 中提供，记为 null。",
+  "tests": [],
+  "blocker": null,
+  "next": "读取 HANDOFF.md 与 evidence，逐个复核三个 head",
+  "updated_at": "2026-10-15T08:57:18+00:00"
+}
