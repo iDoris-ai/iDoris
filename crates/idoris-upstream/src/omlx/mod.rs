@@ -370,18 +370,17 @@ impl OmlxAdapter {
         if cancel.is_cancelled() {
             return Err(BackendError::cancelled());
         }
-        let messages: Vec<serde_json::Value> = req
-            .messages
-            .iter()
-            .map(|m| serde_json::json!({"role": m.role, "content": m.content}))
-            .collect();
-        let body = serde_json::json!({"model": req.model.clone(), "messages": messages});
+        let body = crate::native_completion_wire::request_body(&req, &req.model);
         let call = self.post_parse("/v1/chat/completions", &body);
         tokio::select! {
             _ = cancel.cancelled() => Err(BackendError::cancelled()),
             result = call => {
                 let raw = result?;
-                Ok(ChatResponse { native: None, model: req.model, content: extract_content(&raw) })
+                if req.native.is_some() {
+                    crate::native_completion_wire::response(raw, &req.model)
+                } else {
+                    Ok(ChatResponse { native: None, model: req.model, content: extract_content(&raw) })
+                }
             }
         }
     }
