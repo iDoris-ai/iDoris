@@ -436,10 +436,10 @@
 | Task | 内容 | 依赖 | 状态 |
 |:---|:---|:---|:---|
 | A1 | HTTP/runtime readiness/chat 共用 Bearer（缺失即拒绝启动） | — | DONE（`fe11d57`，已合入 feature 分支；线版本仍是 1.0.1） |
-| A2 | `LocalRuntimeKind::Vllm`（认证、真实模型身份、GPU 额度） | A1 | BACKLOG |
+| A2 | `LocalRuntimeKind::Vllm`（认证、真实模型身份、GPU 额度）。没有 Linux GPU 验收 | A1 | DONE（`4426cd3`，已合入 feature 分支） |
 | A3 | 🖥 vllm-metal vs oMLX 实机对比，领先超 30% 即重开结论一 | A2 | BACKLOG |
 | A4 | `OllamaAdapter`（Windows 默认后端）。硬 pin 拒绝，不发送 `keep_alive: -1` | — | DONE（`9146255`，已合入 feature 分支） |
-| A5 | NVIDIA 探测 + `detect_backend` 接默认卡 | A2, A4 | BACKLOG |
+| A5 | NVIDIA 探测 + `detect_backend` 接默认卡。不识别 AMD | A2, A4 | DOING |
 | A6 | 跨平台发布 / 非 Apple 内存模型 / Windows 进程 owner（里程碑占位） | A5 | BACKLOG |
 | A7 | oMLX 依赖清单 + 退出路径样例配置 | — | DONE（`c6c3385`，已合入 feature 分支；未做实机推理） |
 | BM | 模式分离：意图识别只在 `idoris/auto` 下运行（聊天 / 自动路由 / 调用方声明三种模式，D-5） | — | DONE（`2bf1de5`，已合入 feature 分支） |
