@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use crate::catalog::{Catalog, load_catalog};
-use crate::memory::{KvQuant, WiredMode, recommended_wired_limit_mb};
+use crate::memory::{KvQuant, WiredMode, apple_usable_gb, recommended_wired_limit_mb};
 use crate::probe::HostFacts;
 
 use super::forced::apply_core_override;
@@ -12,24 +12,33 @@ use super::types::{
     SysctlRecommendation, TempStatus,
 };
 
+/// Recommend within an externally allocated TOTAL when `Some(bytes)` is supplied.
+/// The allocation replaces host usable memory; host facts still gate `min_ram_gb`.
+/// Bytes convert to decimal GB once here via `budget_breakdown`. Footprints are
+/// weights + KV at policy context + 1GB overhead; loading peaks are not modeled.
+/// `None` preserves TS parity, including oversized temp/forced legacy exceptions.
 pub fn recommend(
     hardware: &HostFacts,
     catalog: &Catalog,
     partial_policy: Option<&PartialPolicy>,
     forced: Option<&str>,
+    allocated_budget_bytes: Option<u64>,
 ) -> Result<Recommendation, RecommendError> {
     let policy = RecommenderPolicy::merged(partial_policy);
-    let budget = budget_breakdown(hardware, &policy);
-    let blocked = blocked_choices(catalog, hardware, &policy)?;
-    let automatic = choose_resident(catalog, hardware, &policy);
-    let forced_result = apply_core_override(catalog, hardware, &policy, forced, automatic);
+    let budget = budget_breakdown(hardware, &policy, allocated_budget_bytes);
+    let blocked = blocked_choices(catalog, hardware, &policy, &budget)?;
+    let automatic = choose_resident(catalog, hardware, &policy, &budget);
+    let forced_result = apply_core_override(catalog, hardware, &policy, forced, automatic, &budget);
     let resident = forced_result.resident;
-    let temp_result = temp_admission(catalog, hardware, &policy, resident.as_ref());
+    let temp_result = temp_admission(catalog, hardware, &policy, resident.as_ref(), &budget);
 
+    let budget_source = allocated_budget_bytes.map_or_else(
+        || format!("{}GB {}", compact(hardware.ram_gb), wired_mode(&policy)),
+        |bytes| format!("外部分配 {bytes} bytes"),
+    );
     let mut warnings = vec![format!(
-        "预算: {}GB {} → usable {}GB（reserve {}GB）；常驻预算 {}GB（预留临时 {}GB + headroom {}GB）",
-        compact(hardware.ram_gb),
-        wired_mode(&policy),
+        "预算: {} → usable {}GB（reserve {}GB）；常驻预算 {}GB（预留临时 {}GB + headroom {}GB）",
+        budget_source,
         fixed2(budget.usable_gb),
         fixed2(budget.reserve_gb),
         fixed2(budget.resident_budget_gb),
@@ -60,6 +69,7 @@ pub fn recommend(
         &blocked,
     );
 
+    let host_usable_gb = apple_usable_gb(hardware.ram_gb, policy.wired_mode);
     Ok(Recommendation {
         hardware: hardware.clone(),
         policy,
@@ -73,21 +83,29 @@ pub fn recommend(
         blocked,
         warnings,
         recommended_sysctl: SysctlRecommendation {
-            iogpu_wired_limit_mb: recommended_wired_limit_mb(budget.usable_gb),
+            iogpu_wired_limit_mb: recommended_wired_limit_mb(host_usable_gb),
         },
         tradeoff,
         override_choice: forced_result.override_choice,
     })
 }
 
+/// Load a catalog and apply the same budget contract as [`recommend`].
 pub fn recommend_from_file(
     path: impl AsRef<Path>,
     hardware: &HostFacts,
     partial_policy: Option<&PartialPolicy>,
     forced: Option<&str>,
+    allocated_budget_bytes: Option<u64>,
 ) -> Result<Recommendation, RecommendError> {
     let catalog = load_catalog(path)?;
-    recommend(hardware, &catalog, partial_policy, forced)
+    recommend(
+        hardware,
+        &catalog,
+        partial_policy,
+        forced,
+        allocated_budget_bytes,
+    )
 }
 
 fn build_tradeoff(
@@ -146,7 +164,13 @@ fn build_tradeoff(
             "BLOCKED：{}",
             blocked
                 .iter()
-                .map(|choice| format!("{}(需{}GB)", choice.id, compact(choice.min_ram_gb)))
+                .map(|choice| {
+                    if budget.allocated_budget_bytes.is_some() {
+                        format!("{}({})", choice.id, choice.reason)
+                    } else {
+                        format!("{}(需{}GB)", choice.id, compact(choice.min_ram_gb))
+                    }
+                })
                 .collect::<Vec<_>>()
                 .join("、")
         )
