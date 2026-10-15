@@ -1,0 +1,15 @@
+{
+  "schema": "baton-result/v1",
+  "task_id": "idoris-cloud-grok-pr428-dependency-security-20261015",
+  "attempt_id": "18ad79ec-e20e-44b7-8f21-f00e21726554",
+  "sequence": 1,
+  "status": "started",
+  "base_sha": "26c6d464bf513871c9ff30c3699b684dd0016b35",
+  "branch": "baton/grokbot-20261015-pr428-dependency-security",
+  "result_sha": null,
+  "summary": "开始处理 PR428 继承的 cargo-deny 失败（rustls 0.23.45 漏洞 + unsafe-libyaml 不再维护）",
+  "tests": [],
+  "blocker": null,
+  "next": null,
+  "updated_at": "2026-10-15T13:03:17+00:00"
+}

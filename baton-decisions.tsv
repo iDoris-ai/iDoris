@@ -1,0 +1,2 @@
+time	decision	reason
+2026-10-15T13:03:17Z	started	从 base 26c6d46 拉出分支；仅允许改 Cargo.lock、deny.toml 与回执文件
