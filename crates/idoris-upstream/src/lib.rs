@@ -25,6 +25,7 @@ pub mod factory;
 pub mod local_http_runtime;
 pub mod local_runtime;
 pub mod local_runtime_process;
+pub mod native_completion_wire;
 pub mod omlx;
 pub mod remote;
 pub mod subscription;
