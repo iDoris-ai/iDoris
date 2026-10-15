@@ -1,0 +1,6 @@
+id	decision	reason
+1	Agent24 launched via caller-supplied argv, not guessed	Agent24 source unreadable in scope; forbidden to invent CLI flags
+2	Tap proxy between Agent24 and iDoris	Wire evidence for key/privacy/model/Record-Id/locality without modifying either product
+3	Loopback canaries on :8000 and :11434 for bypass	Only observable direct-backend paths; cloud bypass listed as gap
+4	Exit 10 = RED, never PASS	Missing IDORIS_URL provider is a product finding
+5	Status blocked	Real Agent24 run not possible in this session

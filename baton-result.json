@@ -2,7 +2,27 @@
   "task_id": "idoris-cloud-claude-wire-harness-20261015",
   "attempt_id": "61328801-5c39-4ac0-bfec-492eae2d2d6d",
   "base_sha": "1f6d8c5b3dd81d9eb1f4fc5f72f5d2576fce727a",
-  "sequence": 1,
-  "status": "started",
-  "branch": "jhfnetboy/cloud-v031-agent24-wire-acceptance-20261015"
+  "sequence": 2,
+  "status": "blocked",
+  "branch": "jhfnetboy/cloud-v031-agent24-wire-acceptance-20261015",
+  "source_head": "963a717e1950b78ec503e969799ddc12c1b806e0",
+  "files": ["scripts/test_agent24_idoris_v031.py", "baton-result.json", "baton-decisions.tsv"],
+  "commands": [
+    {"cmd": "python3 -m py_compile scripts/test_agent24_idoris_v031.py", "exit_code": 0},
+    {"cmd": "cargo build --release -p idoris-router (binary 'idoris', reports version 0.3.0)", "exit_code": 0},
+    {"cmd": "python3 -I scripts/test_agent24_idoris_v031.py --self-test --idoris-bin target/release/idoris", "exit_code": 0, "counts": "9 tests, 0 failures, 0 errors, 0 skipped; repeated 4x stable (one earlier run overlapped another run and hit port contention)"},
+    {"cmd": "tool run with stub consumer 'conformant' (NOT Agent24)", "exit_code": 0, "counts": "verdict PASS, 9/9 scenarios: role->bound model, concrete model, no_key, wrong_key, role_not_permitted, locality remote/lan/missing, gateway_down"},
+    {"cmd": "tool run with stub consumer 'noop' (NOT Agent24, no provider)", "exit_code": 10, "counts": "verdict RED not-implemented: 0 tap requests"},
+    {"cmd": "tool run with stub consumer 'bypass' (self-test)", "exit_code": 10, "counts": "RED, loopback canary :11434 hit=1 flagged BYPASS"},
+    {"cmd": "tool run with nothing supplied", "exit_code": 3, "counts": "BLOCKED"}
+  ],
+  "coverage_gaps": [
+    "REAL Agent24 NOT run: this cloud session's GitHub scope is limited to iDoris-ai/iDoris, so Agent24 source/binary (ModelRouter, CLI, HTTP handlers) were not readable. No Agent24 SHA, no real RED/GREEN evidence against Agent24 exists yet.",
+    "Agent24 CLI call interface is deliberately NOT guessed: Codex must supply --agent24-bin and the exact --agent24-call-cmd argv ({model},{role},{prompt} placeholders). IDORIS_URL/IDORIS_API_KEY env names come from iDoris spec (R1), unverified against Agent24 source; overridable via --url-env/--key-env.",
+    "PR516 authoritative spec taken from docs/interfaces/iDoris-Agent24-边界与接口规范.md and docs/安装与首次调用-v0.3.0.md in the base tree; PR516 itself not fetched/compared.",
+    "Pass/fail of Agent24 is judged from exit code, captured output, wire traffic (tap) and loopback canaries (:8000, :11434); cloud-direct bypass, SSE streaming, macOS/Windows, Agent24 internals unobserved.",
+    "Record-Id visibility in Agent24 output is asserted by default (spec 3.7); disable with --no-record-id-in-output if Agent24 only logs it elsewhere.",
+    "Tool self-test uses stub consumers; they prove the tool, not Agent24. iDoris binary reports version 0.3.0 in /health on this candidate (Cargo version), not 0.3.1."
+  ],
+  "result_summary": "Delivered scripts/test_agent24_idoris_v031.py: starts real iDoris (isolated DB/state, resident loopback fixture card with idoris_role_models bindings, two virtual keys), records Agent24->iDoris traffic via a loopback tap, and runs a user-supplied real Agent24 command through 9 scenarios (role, concrete model, no key, wrong key, role denied, served-locality remote/lan/missing, gateway killed) with canary listeners for direct oMLX/Ollama bypass. Verdicts: PASS 0 / RED 10 (not-implemented or non-conformant) / BLOCKED 3 / tool error 2. Self-proof passes. Verified on iDoris side: idoris/daily resolves to bound fixture model, virtual key not forwarded upstream, Served-Locality loopback + Record-Id on 200. Status blocked solely because real Agent24 was out of reach; Codex should run it locally against Agent24 main (expect RED not-implemented if no IDORIS_URL provider) and again after wiring. Minimal future interface is emitted in the report under required_interface_for_green. Linux-only; no models downloaded, no paid calls."
 }
