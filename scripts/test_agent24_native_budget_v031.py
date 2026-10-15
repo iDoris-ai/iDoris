@@ -11,6 +11,12 @@ Agent24 chat cannot set tools/max_tokens/response_format/disable_thinking;
 nondefault parameter evidence is explicitly DIRECT iDoris evidence only.
 SHA inputs bind bytes; source SHAs are operator build-provenance declarations,
 not cryptographic proof that those bytes were compiled from those sources.
+
+Exit codes: 0 listed real criteria passed; 1 failed criterion; 3 BLOCKED;
+4 PARTIAL (diagnostic artifacts or skipped native deadline). Diagnostic WIP
+builds MUST use --diagnostic-artifacts and --agent24-source-diff-sha256.
+Real model quality, final 0.3.1 release provenance, signing and manual product
+approval remain outside this harness even when its listed criteria pass.
 """
 import argparse
 import contextlib
@@ -293,6 +299,9 @@ class Tap(Server):
                     status, response_headers, result = request_http(upstream, self.path, self.command, body, headers, timeout=20)
                     entry.update(status=status, locality=response_headers.get('x-idoris-served-locality'),
                                  record_id=response_headers.get('x-idoris-record-id'), actual_model=result.get('model'))
+                    error = result.get('error')
+                    if isinstance(error, dict):
+                        entry['error_reason'] = error.get('reason_code')
                     if self.path == '/health':
                         entry['identity'] = result
                     self.reply(status, result, response_headers)
@@ -444,7 +453,8 @@ def scenario(args, binaries, root, config, name, allocation, footprint, reservat
                                        and health.get('version') == args.expected_version and bool(health.get('instance_id'))
                                        and health.get('dev_no_key_enabled') is False)
         require(checks['formal_health_1_0_1'], 'actual iDoris formal identity mismatch')
-        status, _, capabilities = request_http(gateway_port, '/capabilities')
+        status, _, capabilities = request_http(gateway_port, '/capabilities', headers={'Authorization': 'Bearer ' + key})
+        result['recommendation_http_status'] = status
         require(status == 200 and isinstance(capabilities, list) and capabilities, 'live recommendation response unavailable')
         result['recommendations'] = [{'id': row['id'], 'admission_status': row['admission_status'],
                                       'estimated_memory_gb': row['estimated_memory_gb']} for row in capabilities]
@@ -478,8 +488,10 @@ def scenario(args, binaries, root, config, name, allocation, footprint, reservat
         require(checks['real_key_and_localonly_wire'] and checks['real_consumer_health_probe'], 'consumer did not use authenticated formal gateway')
         if name != 'positive':
             checks['consumer_rejected'] = code != 0 and MARKER not in cli_output
+            checks['consumer_capacity_denial'] = all(item.get('status') == 503 and item.get('error_reason') == 'eviction_impossible' for item in wire)
             checks['zero_lifecycle_load_posts'] = not fixture.posts('/load')
             checks['zero_completion_posts'] = not fixture.posts('/chat/completions')
+            result['consumer_gateway_statuses'] = [item.get('status') for item in wire]
             require(all(checks.values()), 'insufficient allocation reached lifecycle or returned success')
             return result
         completions = fixture.posts('/chat/completions')
@@ -497,10 +509,12 @@ def scenario(args, binaries, root, config, name, allocation, footprint, reservat
                                                       == {k: wire[-1]['body'][k] for k in fields if k in wire[-1]['body']})
         require(all(checks.values()), 'actual consumer lifecycle/record/payload acceptance failed')
         auth = {'Authorization': 'Bearer ' + key, 'X-iDoris-Privacy': 'local_only'}
-        rich = payload()
+        rich = payload('idoris/daily')
         status, _, _ = request_http(gateway_port, '/v1/chat/completions', 'POST', rich, auth)
         got = fixture.posts('/chat/completions')[-1][2]
-        checks['DIRECT_native_nondefault_parameters_preserved'] = status == 200 and all(got.get(k) == v for k, v in rich.items())
+        result['DIRECT_parameters_http_status'] = status
+        checks['DIRECT_native_nondefault_parameters_preserved'] = (status == 200 and got.get('model') == MODEL_A
+                                                                  and all(got.get(k) == v for k, v in rich.items() if k != 'model'))
         require(checks['DIRECT_native_nondefault_parameters_preserved'], 'direct native parameter preservation failed')
         # Real POST observed before closing the owned TCP client. This is a
         # client cancellation test, not proof of a 120-second server timeout.
@@ -508,7 +522,7 @@ def scenario(args, binaries, root, config, name, allocation, footprint, reservat
         fixture.post_seen.clear()
         conn = http.client.HTTPConnection('127.0.0.1', gateway_port, timeout=5)
         try:
-            conn.request('POST', '/v1/chat/completions', json.dumps(payload()), {**auth, 'Content-Type': 'application/json'})
+            conn.request('POST', '/v1/chat/completions', json.dumps(payload('idoris/daily')), {**auth, 'Content-Type': 'application/json'})
             require(fixture.post_seen.wait(5), 'cancellation did not reach actual fixture POST')
         finally:
             if conn.sock:
@@ -523,7 +537,7 @@ def scenario(args, binaries, root, config, name, allocation, footprint, reservat
             started = time.monotonic()
             # Actual production OmlxAdapter/Supervisor chat deadline is 120s.
             # Client timeout is deliberately longer; no fake timeout config.
-            status, _, value = request_http(gateway_port, '/v1/chat/completions', 'POST', payload(), auth, timeout=135)
+            status, _, value = request_http(gateway_port, '/v1/chat/completions', 'POST', payload('idoris/daily'), auth, timeout=135)
             elapsed = time.monotonic() - started
             result['DIRECT_server_timeout_seconds'] = round(elapsed, 2)
             checks['DIRECT_real_server_timeout_after_post'] = (fixture.post_seen.is_set() and status >= 400
@@ -534,11 +548,13 @@ def scenario(args, binaries, root, config, name, allocation, footprint, reservat
         fixture.hold = False
         # Admission of B forces eviction of A: each is 70% of the allocated
         # total, so both cannot coexist. Never invoke fixture unload directly.
-        status, _, _ = request_http(gateway_port, '/v1/chat/completions', 'POST', payload(MODEL_B), auth)
+        status, _, _ = request_http(gateway_port, '/v1/chat/completions', 'POST', payload('idoris/deep'), auth)
         checks['DIRECT_next_model_completed_after_unload'] = status == 200 and bool(fixture.posts('/%s/unload' % MODEL_A)) and bool(fixture.posts('/%s/load' % MODEL_B))
         require(checks['DIRECT_next_model_completed_after_unload'], 'Supervisor did not unload cancelled model and serve next model')
         code, text = consumer(binaries['agent24'], agent_env, work)
         checks['consumer_next_request_after_eviction'] = code == 0 and MARKER in text and bool(fixture.posts('/%s/unload' % MODEL_B))
+        checks['consumer_next_request_after_eviction'] &= (len(fixture.posts('/%s/load' % MODEL_A)) >= 2
+                                                          and fixture.posts('/chat/completions')[-1][2].get('model') == MODEL_A)
         require(checks['consumer_next_request_after_eviction'], 'actual consumer next request after unload failed')
         return result
     finally:
@@ -617,6 +633,8 @@ def parser():
         result.add_argument('--' + name + '-sha256')
     result.add_argument('--idoris-source-sha')
     result.add_argument('--agent24-source-sha')
+    result.add_argument('--agent24-source-diff-sha256', help='declared diff provenance for a diagnostic WIP build')
+    result.add_argument('--diagnostic-artifacts', action='store_true', help='force PARTIAL: supplied artifacts have not passed final product gates')
     result.add_argument('--config-dir', type=Path)
     result.add_argument('--core-reserved-bytes', type=int)
     result.add_argument('--expected-version')
@@ -644,11 +662,18 @@ def main(argv=None):
         'Supplied SHA256 verifies executable bytes; source SHAs remain operator build provenance declarations.']}
     code = 3
     try:
+        if args.diagnostic_artifacts:
+            require(args.agent24_source_diff_sha256 and re.fullmatch('[0-9a-f]{64}', args.agent24_source_diff_sha256),
+                    'diagnostic WIP artifacts require source diff SHA256 declaration')
+            report['diagnostic_source_provenance'] = {'agent24_declared_diff_sha256': args.agent24_source_diff_sha256,
+                                                     'clean_source_claimed': False, 'final_product_gates_passed': False}
         acceptance(args, report)
-        report['verdict'] = 'PARTIAL' if args.skip_server_timeout else 'PASS'
-        report['reason'] = ('actual native deadline check omitted' if args.skip_server_timeout
+        partial = args.skip_server_timeout or args.diagnostic_artifacts
+        report['verdict'] = 'PARTIAL' if partial else 'PASS'
+        report['reason'] = ('diagnostic artifacts have not passed final source/product gates' if args.diagnostic_artifacts
+                            else 'actual native deadline check omitted' if args.skip_server_timeout
                             else 'listed real consumer, native, lifecycle and allocated-budget criteria completed')
-        code = 4 if args.skip_server_timeout else 0
+        code = 4 if partial else 0
     except Blocked as error:
         report['reason'] = str(error)
     except Failed as error:
