@@ -22,9 +22,11 @@ fn events_for_response(event_log: &EventLogStore, response: &Response) -> Vec<Ev
         .unwrap()
         .to_str()
         .unwrap();
-    event_log
-        .events_for_record(Some(budget::PERSONAL_TENANT_ID), record_id)
-        .unwrap()
+    stage_events(
+        event_log
+            .events_for_record(Some(budget::PERSONAL_TENANT_ID), record_id)
+            .unwrap(),
+    )
 }
 
 fn budget_event_count(events: &[EventLogEvent]) -> usize {

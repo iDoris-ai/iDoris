@@ -2077,10 +2077,7 @@ async fn chat_completions(
         Ok(context) => context,
         Err(error) => return correlation_error_response(error),
     };
-    let event_request_id = header_text(&headers, HEADER_REQUEST_ID)
-        .filter(|value| value.encode_utf16().count() <= 128 && !value.chars().any(char::is_control))
-        .unwrap_or(&record_id)
-        .to_string();
+    let event_request_id = event_request_id(header_text(&headers, HEADER_REQUEST_ID), &record_id);
     let event_context = if let Some(event_log) = state.event_log.clone() {
         let tenant_id = match state.deploy_mode {
             idoris_contracts::DeployMode::Personal => budget::PERSONAL_TENANT_ID.to_string(),
@@ -3076,6 +3073,14 @@ fn audit_header(headers: &HeaderMap, name: &str, default: Option<&str>) -> Optio
     }
 }
 
+fn event_request_id(request_id: Option<&str>, record_id: &str) -> String {
+    request_id
+        .filter(|value| value.encode_utf16().count() <= 128)
+        .filter(|value| !value.chars().any(char::is_control))
+        .unwrap_or(record_id)
+        .to_string()
+}
+
 fn audit_tenant_id(state: &AppState, headers: &HeaderMap) -> Option<String> {
     match state.deploy_mode {
         idoris_contracts::DeployMode::Personal => Some(budget::PERSONAL_TENANT_ID.to_string()),
@@ -3094,27 +3099,68 @@ fn is_event_stream(response: &Response) -> bool {
 }
 
 async fn finish_buffered_audit(state: Arc<AppState>, meta: BufferedAuditMeta) {
-    let (Some(store), Some(tenant_id)) = (state.record_store.clone(), meta.tenant_id) else {
+    let Some(tenant_id) = meta.tenant_id else {
         return;
     };
+    let store = state.record_store.clone();
+    if store.is_none() && state.event_log.is_none() {
+        return;
+    }
+    let finalized_at = match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(duration) => duration.as_millis().min(i64::MAX as u128) as i64,
+        Err(_) => {
+            state.audit_failures.fetch_add(1, Ordering::Relaxed);
+            eprintln!("idoris: audit finalization clock is before unix epoch");
+            return;
+        }
+    };
+    let request_id = event_request_id(meta.request_id.as_deref(), &meta.record_id);
     let mut payload = serde_json::Map::new();
-    payload.insert(
-        "request_id".into(),
-        json!(meta.request_id.unwrap_or_else(|| meta.record_id.clone())),
-    );
+    payload.insert("request_id".into(), json!(request_id.clone()));
     payload.insert("component".into(), json!("router"));
-    if let Some(privacy) = meta.privacy {
+    if let Some(privacy) = meta.privacy.as_ref() {
         payload.insert("privacy".into(), json!(privacy));
     }
-    if let Some(intent) = meta.intent {
+    if let Some(intent) = meta.intent.as_ref() {
         payload.insert("intent".into(), json!(intent));
     }
     payload.insert("status".into(), json!(meta.status.as_u16()));
-    payload.insert("reason".into(), json!(meta.reason));
+    payload.insert("reason".into(), json!(meta.reason.clone()));
     payload.insert("latency_ms".into(), json!(meta.latency_ms));
+    payload.insert("ts_utc".into(), json!(finalized_at));
 
     let failures = state.audit_failures.clone();
+    let event_log = state.event_log.clone();
     let result = tokio::task::spawn_blocking(move || -> Result<(), String> {
+        let mut event_failed = false;
+        if let Some(event_log) = event_log {
+            let mut metadata = std::collections::BTreeMap::new();
+            metadata.insert("component".into(), json!("router"));
+            metadata.insert("http_status".into(), json!(meta.status.as_u16()));
+            metadata.insert("reason".into(), json!(meta.reason.clone()));
+            metadata.insert("latency_ms".into(), json!(meta.latency_ms));
+            let event = idoris_tenancy::event_log::NewEvent {
+                event_id: Uuid::new_v4().to_string(),
+                tenant_id: tenant_id.clone(),
+                record_id: meta.record_id.clone(),
+                event_type: idoris_tenancy::event_log::EventType::AuditFinalized,
+                ts_utc_ms: finalized_at,
+                request_id: Some(request_id),
+                session_id: None,
+                trace_id: None,
+                parent_id: None,
+                origin_record_id: meta.origin_record_id.clone(),
+                metadata,
+            };
+            event_failed = event_log.append(Some(&tenant_id), &event).is_err();
+        }
+        let Some(store) = store else {
+            return if event_failed {
+                Err("audit finalization write failed".to_string())
+            } else {
+                Ok(())
+            };
+        };
         let guard = store
             .lock()
             .map_err(|_| "audit record store lock poisoned".to_string())?;
@@ -3126,15 +3172,14 @@ async fn finish_buffered_audit(state: Arc<AppState>, meta: BufferedAuditMeta) {
             meta.origin_record_id.as_deref(),
             &payload,
         );
-        match write {
-            Ok(_) => Ok(()),
-            Err(audit::AuditError::Store(err)) => Err(err.to_string()),
-            Err(_) => {
+        let legacy_failed = if let Err(error) = write {
+            if !matches!(error, audit::AuditError::Store(_)) {
                 let mut minimal = serde_json::Map::new();
                 minimal.insert("request_id".into(), json!(meta.record_id.clone()));
                 minimal.insert("component".into(), json!("router"));
                 minimal.insert("status".into(), json!(meta.status.as_u16()));
                 minimal.insert("reason".into(), json!(meta.reason));
+                minimal.insert("ts_utc".into(), json!(finalized_at));
                 writer
                     .write_scoped(
                         &tenant_id,
@@ -3142,9 +3187,17 @@ async fn finish_buffered_audit(state: Arc<AppState>, meta: BufferedAuditMeta) {
                         meta.origin_record_id.as_deref(),
                         &minimal,
                     )
-                    .map(|_| ())
-                    .map_err(|err| err.to_string())
+                    .is_err()
+            } else {
+                true
             }
+        } else {
+            false
+        };
+        if event_failed || legacy_failed {
+            Err("audit finalization write failed".to_string())
+        } else {
+            Ok(())
         }
     })
     .await;
@@ -3286,6 +3339,16 @@ mod protocol_error_matrix_tests;
 mod policy_wiring_tests;
 
 #[cfg(test)]
+fn stage_events(
+    events: Vec<idoris_tenancy::event_log::EventLogEvent>,
+) -> Vec<idoris_tenancy::event_log::EventLogEvent> {
+    events
+        .into_iter()
+        .filter(|row| row.event.event_type != idoris_tenancy::event_log::EventType::AuditFinalized)
+        .collect()
+}
+
+#[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -3297,6 +3360,7 @@ mod tests {
     use idoris_contracts::component_card::{Egress, Form};
     use idoris_contracts::provider::{Cost, Family, Locality, ProviderDescriptor};
     use idoris_tenancy::budget::{BudgetLedger, BudgetScope, Price, SpendGate};
+    use idoris_tenancy::event_log::{EventLogStore, EventType};
     use idoris_tenancy::store::{RecordKind, TenantRecord, TenantStore};
     use rusqlite::Connection;
     use serde_json::{Map, json};
@@ -3504,6 +3568,115 @@ mod tests {
         Arc::new(std::sync::Mutex::new(
             TenantStore::new(Connection::open_in_memory().unwrap()).unwrap(),
         ))
+    }
+
+    #[tokio::test]
+    async fn audit_finalized_dual_write_covers_early_errors_with_exact_terminal_facts() {
+        let store = memory_record_store();
+        let event_log =
+            Arc::new(EventLogStore::new(Connection::open_in_memory().unwrap()).unwrap());
+        let response = build_app(AppState {
+            record_store: Some(store.clone()),
+            event_log: Some(event_log.clone()),
+            ..AppState::default()
+        })
+        .oneshot(post_chat("{", &[]))
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let record_id = response
+            .headers()
+            .get(HEADER_RECORD_ID)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        let legacy = audit_rows(&store);
+        assert_eq!(legacy.len(), 1);
+        let events = event_log
+            .events_for_record(Some(budget::PERSONAL_TENANT_ID), &record_id)
+            .unwrap();
+        assert_eq!(
+            events.len(),
+            1,
+            "early parse failure has only terminal audit fact"
+        );
+        let event = &events[0].event;
+        assert_eq!(event.event_type, EventType::AuditFinalized);
+        assert_eq!(event.request_id.as_deref(), Some(record_id.as_str()));
+        assert_eq!(event.metadata["http_status"], json!(400));
+        assert_eq!(event.metadata["reason"], legacy[0].payload["reason"]);
+        assert_eq!(
+            event.metadata["latency_ms"],
+            legacy[0].payload["latency_ms"]
+        );
+        assert_eq!(
+            event.ts_utc_ms,
+            legacy[0].payload["ts_utc"].as_i64().unwrap()
+        );
+        assert_eq!(event.metadata["component"], json!("router"));
+        assert!(!event.metadata.contains_key("privacy"));
+        assert!(!event.metadata.contains_key("intent"));
+    }
+
+    #[tokio::test]
+    async fn audit_finalized_event_log_only_covers_early_parse_errors() {
+        let event_log =
+            Arc::new(EventLogStore::new(Connection::open_in_memory().unwrap()).unwrap());
+        let response = build_app(AppState {
+            event_log: Some(event_log.clone()),
+            record_store: None,
+            ..AppState::default()
+        })
+        .oneshot(post_chat("{", &[]))
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let record_id = response
+            .headers()
+            .get(HEADER_RECORD_ID)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        let events = event_log
+            .events_for_record(Some(budget::PERSONAL_TENANT_ID), record_id)
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event.event_type, EventType::AuditFinalized);
+        assert_eq!(events[0].event.metadata["http_status"], json!(400));
+    }
+
+    #[tokio::test]
+    async fn audit_finalized_rejects_request_ids_outside_event_log_boundary() {
+        for request_id in ["r".repeat(129), "left\tright".to_string()] {
+            let store = memory_record_store();
+            let event_log =
+                Arc::new(EventLogStore::new(Connection::open_in_memory().unwrap()).unwrap());
+            let response = build_app(AppState {
+                record_store: Some(store.clone()),
+                event_log: Some(event_log.clone()),
+                ..AppState::default()
+            })
+            .oneshot(post_chat("{", &[(HEADER_REQUEST_ID, request_id.as_str())]))
+            .await
+            .unwrap();
+            let record_id = response
+                .headers()
+                .get(HEADER_RECORD_ID)
+                .unwrap()
+                .to_str()
+                .unwrap();
+            let rows = audit_rows(&store);
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].request_id, record_id);
+            let events = event_log
+                .events_for_record(Some(budget::PERSONAL_TENANT_ID), record_id)
+                .unwrap();
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].event.event_type, EventType::AuditFinalized);
+            assert_eq!(events[0].event.request_id.as_deref(), Some(record_id));
+        }
     }
 
     fn audit_rows(
