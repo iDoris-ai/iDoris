@@ -1933,6 +1933,24 @@ pub(crate) async fn append_completed(
         selected.card.provider.id.as_str(),
         selected.served_locality,
         status,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn append_completed_with_usage(
+    context: &CompletedEventContext,
+    selected: &Selected,
+    status: &'static str,
+    tokens_in: u64,
+    tokens_out: u64,
+) -> Result<(), ()> {
+    append_completed_fields(
+        context,
+        selected.card.provider.id.as_str(),
+        selected.served_locality,
+        status,
+        Some((tokens_in, tokens_out)),
     )
     .await
 }
@@ -1942,11 +1960,17 @@ async fn append_completed_fields(
     provider_id: &str,
     served_locality: idoris_contracts::provider::Locality,
     status: &'static str,
+    usage: Option<(u64, u64)>,
 ) -> Result<(), ()> {
     let mut metadata = std::collections::BTreeMap::new();
     metadata.insert("status".to_string(), json!(status));
     metadata.insert("provider_id".to_string(), json!(provider_id));
     metadata.insert("served_locality".to_string(), json!(served_locality));
+    if let Some((tokens_in, tokens_out)) = usage {
+        metadata.insert("tokens_in".to_string(), json!(tokens_in));
+        metadata.insert("tokens_out".to_string(), json!(tokens_out));
+        metadata.insert("token_estimator".to_string(), json!("conservative"));
+    }
     let ts_utc_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .ok()
@@ -2660,9 +2684,15 @@ fn terminated_proxy_body_observed(
                 )),
                 Some(Err(err)) => {
                     let append_failed = if let Some(context) = event.take() {
-                        append_completed_fields(&context, &provider_id, served_locality, "failure")
-                            .await
-                            .is_err()
+                        append_completed_fields(
+                            &context,
+                            &provider_id,
+                            served_locality,
+                            "failure",
+                            None,
+                        )
+                        .await
+                        .is_err()
                     } else {
                         false
                     };
@@ -2680,6 +2710,7 @@ fn terminated_proxy_body_observed(
                             &provider_id,
                             served_locality,
                             "success",
+                            None,
                         )
                         .await
                         .is_err()

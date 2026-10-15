@@ -263,12 +263,27 @@ fn metadata_whitelist_and_bounds_fail_closed_before_insert() {
     valid.metadata.insert("cost_minor".into(), json!(42));
     valid
         .metadata
+        .insert("token_estimator".into(), json!("conservative"));
+    valid
+        .metadata
         .insert("labels".into(), json!(["good", "safe"]));
     store.append(Some("a"), &valid).unwrap();
+    assert_eq!(
+        store.events_for_record(Some("a"), "r1").unwrap()[0]
+            .event
+            .metadata,
+        valid.metadata
+    );
 
     let bad_values = [
         ("prompt", json!("secret")),
         ("unknown_key", json!(true)),
+        ("token_estimator", json!({"source": "conservative"})),
+        ("token_estimator", json!("bad\nsource")),
+        (
+            "token_estimator",
+            json!("x".repeat(MAX_STRING_UTF16_UNITS + 1)),
+        ),
         ("status", json!({"nested": true})),
         ("status", json!("has\ncontrol")),
         ("status", json!("x".repeat(MAX_STRING_UTF16_UNITS + 1))),
