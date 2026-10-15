@@ -47,7 +47,7 @@ python3 scripts/macos_signed_release.py \
 
 每条子命令默认 300 秒上限（可用 `--command-timeout` 调整），stdin 关闭，输出在临时文件中捕获，读取最多 1 MiB。错误只报告阶段、退出码或已验证的 submission UUID，不输出原始工具诊断、路径、alias、证书姓名或环境；更详细的 Apple 日志应在操作者本机私下查看。公证期限检查在请求之间进行，最后一条命令最多另占一个 command timeout。超时退出不取消 Apple 后台任务，UUID 已提交后可用现有 profile 查询 `notarytool info/log`，不要盲目重复提交。上传响应丢失时 UUID 可能未知，应先本地查 notarytool history。
 
-失败不发布最终输出目录，无 unsigned fallback。挂载后的失败会尝试 detach；如果 attach 超时或 detach 失败，操作者应本地检查残留挂载，解决后使用新输出目录重试。不要删除 quarantine、禁用 Gatekeeper 或绕过失败。
+失败不报告发布成功，无 unsigned fallback；只清理本次拥有的输出文件，外来文件/目录保留。挂载副作用后的失败（包括 attach 超时）会尝试 detach 本次挂载；如清理仍失败，主错误与清理错误一起报告，操作者应本地检查残留挂载，解决后使用新输出目录重试。不要删除 quarantine、禁用 Gatekeeper 或绕过失败。
 
 ## 最小 workflow 接入（由协调者实施）
 
