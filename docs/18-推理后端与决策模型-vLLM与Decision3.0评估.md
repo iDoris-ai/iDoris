@@ -41,7 +41,7 @@
 | vLLM 跨平台 | Linux（CUDA / ROCm / XPU / CPU）有官方支持。**Windows 没有官方原生支持**，官方路径是 WSL2（或 Docker Model Runner + WSL2），原生 Windows 只有社区构建。边缘 / 端侧（手机、Core ML）不是 vLLM 的领域。 |
 | vllm-metal | vllm-project 下的「社区维护硬件插件」，要求 macOS 15+ 和 Apple Silicon。底层仍是 MLX，由 `mlx_lm` 提供层实现。paged attention 标为 experimental。`vllm serve` 范式是**一进程一模型**。 |
 | oMLX | 仅支持 macOS Apple Silicon。能力：原生多模型、LRU 驱逐、pin、手动 load / unload、内存上限、SSD 二级 KV cache；同时提供 OpenAI 端点和 Anthropic `/v1/messages`，以及 embeddings、rerank。**已支持 `POST /v1/systemone`，并点名支持 Decision 3.0 全系**（d3 / flash / mini / nano / lite / edge）。 |
-| Ollama | Win / Mac / Linux 原生。`/api/ps` 加 `keep_alive` 可以实现加载、卸载和 pin。0.35 起也提供 `/v1/systemone`。 |
+| Ollama | Win / Mac / Linux 原生。`/api/ps` 加 `keep_alive` 可以实现加载、卸载和 pin。0.35 起也提供 `/v1/systemone`，但调研只看到它支持 Nimble、Tev1 等决策模型，**能否跑 d3 未核实**。 |
 | Decision 3.0 | 来自 vLLM-SR 团队，Apache-2.0，基于 Qwen3.5 系。输入是 state（文本 / JSON / 图片 / 视频）加 typed questions（`choice` / `bool` / `score`），输出选项概率而不是生成文本。HTTP 形态为 `/v1/systemone`（TypeSafe System One 线格式）。 |
 | d3 规模 | edge 0.59B、lite 0.85B、nano 2.21B、mini 4.54B、flash 8.39B、d3 26.09B。edge 在新域任务上只有 12.9 分（d3 为 60.5），只适合窄而经过验证的类目。 |
 | d3 在 Mac 上 | 在 M5 Pro 上，Core ML 版 d3-lite 约 53ms、d3-nano 约 69ms（JevBench 中位数）。下载体积：lite 3.7GB、nano 10.5GB。 |
@@ -134,7 +134,9 @@
 
 ### 前置缺口
 
-先给 `config/routing-policy.yaml` 补上引用 intent / complexity 的规则（例如 `coding` → deep、`complex` → deep）。不补的话，分类器再准也没有可观测的路由效果。
+`config/routing-policy.yaml` 需要补上引用 intent / complexity 的规则（例如 `coding` → deep、`complex` → deep）。不补的话，分类器再准也没有可观测的路由效果。
+
+**上线时机：与 d3 生效（B5）同一版本。** 如果提前上线，驱动这些规则的仍是不准的哈希识别器，误判会直接把请求送错模型。shadow 运行只记录一致率，不需要这些规则。
 
 ### 评测门槛（默认开启前必须通过）
 
@@ -152,7 +154,7 @@
 拆分后的工作包与任务卡见 [`agent/plans/runtime-portability-and-decision-model.md`](agent/plans/runtime-portability-and-decision-model.md)，台账索引见 [`agent/tasks.md`](agent/tasks.md) 的「F1.2+ / F2.4+」一节。
 
 - **WP-A 跨平台推理后端**：A1 ChatProxy Bearer → A2 vLLM runtime kind → A3 vllm-metal 对比 spike → A4 OllamaAdapter → A5 后端探测接线 → A6 跨平台发布（里程碑占位）→ A7 oMLX 依赖风险与退出路径。
-- **WP-B 决策模型提议者**：B0 d3 spike → B1 路由规则补 intent/complexity → B2 评测集与评测脚本 → B3 `/v1/systemone` 契约类型 → B4 shadow detector → B5 切为生效 → B6 对外 `/v1/systemone` → B7 L1 隐私收紧器（M5 后）→ B8 自有决策模型（M7 占位）。
+- **WP-B 决策模型提议者**：B0 d3 spike → B2 评测集与评测脚本 / B3 `/v1/systemone` 契约类型 → B4 shadow detector → B5 切为生效（B1 路由规则补 intent/complexity 与它同一版本上线）→ B6 对外 `/v1/systemone` → B7 L1 隐私收紧器（M5 后）→ B8 自有决策模型（M7 占位）。
 
 待 owner 确认的决策点：
 
@@ -160,7 +162,7 @@
 |---|---|---|
 | D-1 | d3 生效后 judge 不可用时，意图判定是拒绝还是回落哈希？ | 默认拒绝（不变量 #8 原文），配置可显式选 `fallback_hashing`，并在响应头和事件里标明 |
 | D-2 | M6 原设想「复用常驻小模型做 logit 型 System-1」，d3 是专用模型，要多占内存 | 先用 d3-lite（下载约 3.7GB）；B2 评测同时测「常驻聊天模型 + `/v1/systemone` 模拟判定」作对照，用数据决定 |
-| D-3 | Windows 默认后端选 Ollama | 接受；Ollama 的 GGUF 生态与 oMLX/MLX 权重不通用，catalog 需按后端分列模型 ID |
+| D-3 | Windows 默认后端选 Ollama（不用 vLLM：无官方原生 Windows、WSL2 过不了「妈妈测试」、基本要求 NVIDIA） | **已确认（2026-10-15）**。代价：Ollama 用 GGUF，与 MLX 权重不通用，catalog 按后端分列模型 ID；Ollama 能否跑 d3 未核实，Windows 上的决策模型暂时空缺 |
 
 ## 附录 A · Spike 记录
 

@@ -21,13 +21,13 @@ WP-A  A1 ─┐
           A4 ──> A5 ──> A6(里程碑占位)
           A7（文档/护栏，独立）
 
-WP-B  B0🖥 ──> B2 ──┐
-      B1 ───────────┼─> B4 ──> B5 ──> B6
-      B3 ───────────┘           └──> B7（依赖 M5 闸一合并）
-                                       B8（M7 占位）
+WP-B  B0🖥 ─┬─> B2 ──────────────────┐
+            └─> B3 ──> B4(shadow) ────┴─> B5 + B1（同一版本上线）──> B6
+                                            └──> B7（依赖 M5 闸一合并）
+                                            B8（M7 占位）
 ```
 
-建议顺序：先做 A1、B1、B3（互不依赖，可并行），再做 B0 → B2，之后 A2 → B4 → A4 → B5 → A5 → B6，A3/A7 穿插进行，B7 等 M5 合并后再开。
+建议顺序：先做 A1、A4、B0、B3（互不依赖，可并行），再做 B2、B4，之后 A2 → B1 与 B5（同一版本）→ A5 → B6，A3/A7 穿插进行，B7 等 M5 合并后再开。
 
 ---
 
@@ -130,14 +130,15 @@ WP-B  B0🖥 ──> B2 ──┐
 - **交付物**：填写 docs/18 附录 A（oMLX 版本、d3 revision、样例、数字）。
 - **否决条件**：中文 `choice` 的准确率接近随机，或者 p95 > 300ms，则 WP-B 暂停，在附录里写明原因。
 
-### B1 路由规则补上 intent 和 complexity  `READY`
+### B1 路由规则补上 intent 和 complexity  `BACKLOG`（与 B5 同一版本上线）
 - **优先级**：high（不做这一步，任何分类器都不会产生可观测的效果）
+- **上线时机**：PR 可以提前写好，但必须和 B5 在同一版本合并。提前上线的话，驱动规则的仍是哈希识别器，误判会直接把请求送错模型；B4 的 shadow 运行只记录一致率，不需要这些规则。
 - **目标**：`config/routing-policy.yaml` 的规则引用检测到的 intent（`coding`、`agent_task` 等）和 `complexity: complex`，并映射到对应的层级。
 - **开发范围**：
   - 增加规则，例如 `coding` → deep，`agent_task` → deep，`web_search` → 需要工具能力；`local_only` 规则仍然排在第一（不变量 #1、#2）。
   - 更新 `conformance/tests/default-routing-policy.test.ts`。
 - **明确不做**：不改规则引擎（`routing_policy.rs`）；不改 detector。
-- **依赖**：无
+- **依赖**：B5（同一版本上线）
 - **验收**：conformance 断言：`coding` 意图选中 deep 层；`local_only` 加 `coding` 时仍然只剩本地候选；`X-iDoris-Reason` 带上匹配到的 `rule_id`。
 - **风险**：改的是默认路由行为，属于用户可见的变化，要写进 release note。
 
@@ -175,7 +176,7 @@ WP-B  B0🖥 ──> B2 ──┐
   - `resolve_profile` 改成按配置选择 detector（现在硬编码 `default_detector()`），配置项为 `intent_judge: { mode: off|shadow|active, model, timeout_ms, min_confidence }`。
   - shadow 模式下 d3 异步运行，不阻塞请求。`profiled` 事件新增 `shadow_intent`、`shadow_agree` 两个标量字段（需要扩充 `crates/idoris-tenancy/src/event_log/mod.rs` 的 SCALAR_KEYS 白名单），只记录标签，不记录内容（不变量 #5、#15）。
 - **明确不做**：shadow 模式不改变 `task.intent`；不做 complexity（在 B5 做）。
-- **依赖**：B1、B3
+- **依赖**：B3
 - **验收**：
   - shadow 模式下，路由结果和请求头与 `off` 模式逐字节相同（对照测试）；
   - judge 超时不影响响应延迟（mock 延迟 5s，响应仍在基线范围内）；
@@ -190,7 +191,7 @@ WP-B  B0🖥 ──> B2 ──┐
   - 置信度低于 `min_confidence` 时视为未命中，intent 保持默认 `chat`；配置里的阈值只能调高，不能低于代码下限（clamp）。
   - judge 不可用时的行为由 D-1 决定：默认 503 `judge_unavailable`；如果配置了 `on_judge_unavailable: fallback_hashing`，就回落到哈希 detector，并在 `X-iDoris-Degraded: intent_judge_fallback` 和 `decided` 的 reason_codes 里标明。
 - **明确不做**：不让 d3 影响 privacy、预算或准入（不变量 #1、#10）。
-- **依赖**：B4，以及 B2 达到通过线
+- **依赖**：B4，以及 B2 达到通过线；与 B1 同一版本上线
 - **验收**：
   - `local_only` 加 `active` 时，d3 仍可运行（Loopback），远程候选仍为 0；
   - 低置信度时结果与 miss 相同；
@@ -231,5 +232,5 @@ WP-B  B0🖥 ──> B2 ──┐
 |---|---|---|
 | D-1 | d3 生效后 judge 不可用：拒绝还是回落？ | 默认拒绝（不变量 #8）；可在配置里显式选择回落，回落时必须在响应头和事件里标明 |
 | D-2 | d3 专用模型和「复用常驻小模型」之间的取舍 | B2 同时评测两者，用数据决定 |
-| D-3 | Windows 默认用 Ollama | 接受；catalog 按后端分列模型 ID |
-| D-4 | B1 改变了默认路由行为 | 接受，并写进 release note |
+| D-3 | Windows 默认用 Ollama | **已确认（2026-10-15）**；catalog 按后端分列模型 ID；Ollama 能否跑 d3 未核实，Windows 上的决策模型暂时空缺 |
+| D-4 | B1 改变了默认路由行为 | **已确认（2026-10-15）**：写进 release note，并与 B5 同一版本上线 |
