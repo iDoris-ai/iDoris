@@ -69,6 +69,7 @@ pub mod reason;
 pub mod storage;
 mod usage;
 
+mod event_identifier;
 mod feedback;
 /// Direct HTTP forwarding for a generic `http_service` component card's
 /// `POST /v1/chat/completions` (R2-G) — retries, idempotency cache; wired
@@ -1154,7 +1155,7 @@ async fn get_tenant_audit(
         }
     };
     let scope_tenant = query_scope_header(&headers).map(str::to_string);
-    let Some(store) = state.record_store.clone() else {
+    let Some(store) = state.event_log.clone() else {
         return error_envelope(
             StatusCode::SERVICE_UNAVAILABLE,
             "audit_unavailable",
@@ -1162,10 +1163,7 @@ async fn get_tenant_audit(
         );
     };
     let result = tokio::task::spawn_blocking(move || {
-        let guard = store
-            .lock()
-            .map_err(|_| queries::audit::AuditQueryError::StorePoisoned)?;
-        queries::audit::query_audit(&guard, &tenant_id, scope_tenant.as_deref(), &query)
+        queries::audit::query_event_audit(&store, &tenant_id, scope_tenant.as_deref(), &query)
     })
     .await;
     match result {
@@ -3065,7 +3063,10 @@ fn header_text<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
 
 fn audit_header(headers: &HeaderMap, name: &str, default: Option<&str>) -> Option<String> {
     match header_text(headers, name) {
-        Some(value) if value.encode_utf16().count() <= audit::MAX_FIELD_UTF16_UNITS => {
+        Some(value)
+            if value.encode_utf16().count() <= audit::MAX_FIELD_UTF16_UNITS
+                && !value.chars().any(char::is_control) =>
+        {
             Some(value.to_string())
         }
         Some(_) => None,
@@ -3084,9 +3085,9 @@ fn event_request_id(request_id: Option<&str>, record_id: &str) -> String {
 fn audit_tenant_id(state: &AppState, headers: &HeaderMap) -> Option<String> {
     match state.deploy_mode {
         idoris_contracts::DeployMode::Personal => Some(budget::PERSONAL_TENANT_ID.to_string()),
-        idoris_contracts::DeployMode::Tenant => {
-            header_text(headers, "x-idoris-tenant").map(str::to_string)
-        }
+        idoris_contracts::DeployMode::Tenant => header_text(headers, "x-idoris-tenant")
+            .filter(|tenant_id| event_identifier::valid(tenant_id))
+            .map(str::to_string),
     }
 }
 
@@ -3139,6 +3140,12 @@ async fn finish_buffered_audit(state: Arc<AppState>, meta: BufferedAuditMeta) {
             metadata.insert("http_status".into(), json!(meta.status.as_u16()));
             metadata.insert("reason".into(), json!(meta.reason.clone()));
             metadata.insert("latency_ms".into(), json!(meta.latency_ms));
+            if let Some(privacy) = meta.privacy.as_ref() {
+                metadata.insert("privacy".into(), json!(privacy));
+            }
+            if let Some(intent) = meta.intent.as_ref() {
+                metadata.insert("intent".into(), json!(intent));
+            }
             let event = idoris_tenancy::event_log::NewEvent {
                 event_id: Uuid::new_v4().to_string(),
                 tenant_id: tenant_id.clone(),
@@ -3154,42 +3161,39 @@ async fn finish_buffered_audit(state: Arc<AppState>, meta: BufferedAuditMeta) {
             };
             event_failed = event_log.append(Some(&tenant_id), &event).is_err();
         }
-        let Some(store) = store else {
-            return if event_failed {
-                Err("audit finalization write failed".to_string())
+        let legacy_failed = if let Some(store) = store {
+            let guard = store
+                .lock()
+                .map_err(|_| "audit record store lock poisoned".to_string())?;
+            let writer = audit::AuditWriter::new(&guard);
+            let write = audit::AuditOnce::default().finish(
+                &writer,
+                &tenant_id,
+                &meta.record_id,
+                meta.origin_record_id.as_deref(),
+                &payload,
+            );
+            if let Err(error) = write {
+                if !matches!(error, audit::AuditError::Store(_)) {
+                    let mut minimal = serde_json::Map::new();
+                    minimal.insert("request_id".into(), json!(meta.record_id.clone()));
+                    minimal.insert("component".into(), json!("router"));
+                    minimal.insert("status".into(), json!(meta.status.as_u16()));
+                    minimal.insert("reason".into(), json!(meta.reason));
+                    minimal.insert("ts_utc".into(), json!(finalized_at));
+                    writer
+                        .write_scoped(
+                            &tenant_id,
+                            Some(&meta.record_id),
+                            meta.origin_record_id.as_deref(),
+                            &minimal,
+                        )
+                        .is_err()
+                } else {
+                    true
+                }
             } else {
-                Ok(())
-            };
-        };
-        let guard = store
-            .lock()
-            .map_err(|_| "audit record store lock poisoned".to_string())?;
-        let writer = audit::AuditWriter::new(&guard);
-        let write = audit::AuditOnce::default().finish(
-            &writer,
-            &tenant_id,
-            &meta.record_id,
-            meta.origin_record_id.as_deref(),
-            &payload,
-        );
-        let legacy_failed = if let Err(error) = write {
-            if !matches!(error, audit::AuditError::Store(_)) {
-                let mut minimal = serde_json::Map::new();
-                minimal.insert("request_id".into(), json!(meta.record_id.clone()));
-                minimal.insert("component".into(), json!("router"));
-                minimal.insert("status".into(), json!(meta.status.as_u16()));
-                minimal.insert("reason".into(), json!(meta.reason));
-                minimal.insert("ts_utc".into(), json!(finalized_at));
-                writer
-                    .write_scoped(
-                        &tenant_id,
-                        Some(&meta.record_id),
-                        meta.origin_record_id.as_deref(),
-                        &minimal,
-                    )
-                    .is_err()
-            } else {
-                true
+                false
             }
         } else {
             false
@@ -3339,16 +3343,6 @@ mod protocol_error_matrix_tests;
 mod policy_wiring_tests;
 
 #[cfg(test)]
-fn stage_events(
-    events: Vec<idoris_tenancy::event_log::EventLogEvent>,
-) -> Vec<idoris_tenancy::event_log::EventLogEvent> {
-    events
-        .into_iter()
-        .filter(|row| row.event.event_type != idoris_tenancy::event_log::EventType::AuditFinalized)
-        .collect()
-}
-
-#[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -3360,7 +3354,7 @@ mod tests {
     use idoris_contracts::component_card::{Egress, Form};
     use idoris_contracts::provider::{Cost, Family, Locality, ProviderDescriptor};
     use idoris_tenancy::budget::{BudgetLedger, BudgetScope, Price, SpendGate};
-    use idoris_tenancy::event_log::{EventLogStore, EventType};
+    use idoris_tenancy::event_log::{EventLogStore, EventType, NewEvent};
     use idoris_tenancy::store::{RecordKind, TenantRecord, TenantStore};
     use rusqlite::Connection;
     use serde_json::{Map, json};
@@ -3616,17 +3610,16 @@ mod tests {
             legacy[0].payload["ts_utc"].as_i64().unwrap()
         );
         assert_eq!(event.metadata["component"], json!("router"));
-        assert!(!event.metadata.contains_key("privacy"));
+        assert_eq!(event.metadata["privacy"], legacy[0].payload["privacy"]);
         assert!(!event.metadata.contains_key("intent"));
     }
 
     #[tokio::test]
-    async fn audit_finalized_event_log_only_covers_early_parse_errors() {
+    async fn audit_finalized_is_written_without_legacy_record_store() {
         let event_log =
             Arc::new(EventLogStore::new(Connection::open_in_memory().unwrap()).unwrap());
         let response = build_app(AppState {
             event_log: Some(event_log.clone()),
-            record_store: None,
             ..AppState::default()
         })
         .oneshot(post_chat("{", &[]))
@@ -3639,17 +3632,70 @@ mod tests {
             .unwrap()
             .to_str()
             .unwrap();
-        let events = event_log
-            .events_for_record(Some(budget::PERSONAL_TENANT_ID), record_id)
-            .unwrap();
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].event.event_type, EventType::AuditFinalized);
-        assert_eq!(events[0].event.metadata["http_status"], json!(400));
+        let audit = queries::audit::query_event_audit(
+            &event_log,
+            budget::PERSONAL_TENANT_ID,
+            Some(budget::PERSONAL_TENANT_ID),
+            &queries::audit::AuditQuery {
+                from: None,
+                to: None,
+                limit: None,
+                record_id: Some(record_id.to_string()),
+            },
+        )
+        .unwrap();
+        assert_eq!(audit.records.len(), 1);
+        assert_eq!(audit.records[0].payload["status"], json!(400));
     }
 
     #[tokio::test]
-    async fn audit_finalized_rejects_request_ids_outside_event_log_boundary() {
-        for request_id in ["r".repeat(129), "left\tright".to_string()] {
+    async fn control_in_optional_audit_headers_does_not_drop_terminal_event() {
+        for header in ["x-idoris-intent", "x-idoris-privacy"] {
+            let store = memory_record_store();
+            let event_log =
+                Arc::new(EventLogStore::new(Connection::open_in_memory().unwrap()).unwrap());
+            let response = build_app(AppState {
+                record_store: Some(store.clone()),
+                event_log: Some(event_log.clone()),
+                ..AppState::default()
+            })
+            .oneshot(post_chat("{", &[(header, "left\tright")]))
+            .await
+            .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let record_id = response
+                .headers()
+                .get(HEADER_RECORD_ID)
+                .unwrap()
+                .to_str()
+                .unwrap();
+            let rows = audit_rows(&store);
+            assert_eq!(rows.len(), 1);
+            let events = event_log
+                .events_for_record(Some(budget::PERSONAL_TENANT_ID), record_id)
+                .unwrap();
+            assert_eq!(events.len(), 1, "{header}");
+            assert_eq!(events[0].event.event_type, EventType::AuditFinalized);
+            let field = if header == "x-idoris-intent" {
+                "intent"
+            } else {
+                "privacy"
+            };
+            assert!(!events[0].event.metadata.contains_key(field));
+            assert!(!rows[0].payload.contains_key(field));
+        }
+    }
+
+    #[tokio::test]
+    async fn audit_finalized_uses_the_same_request_id_boundary_as_request_received() {
+        let cases = [
+            ("r".repeat(128), true),
+            ("r".repeat(129), false),
+            ("r".repeat(audit::MAX_FIELD_UTF16_UNITS), false),
+            ("r".repeat(audit::MAX_FIELD_UTF16_UNITS + 1), false),
+            ("left\tright".to_string(), false),
+        ];
+        for (request_id, preserves_caller_id) in cases {
             let store = memory_record_store();
             let event_log =
                 Arc::new(EventLogStore::new(Connection::open_in_memory().unwrap()).unwrap());
@@ -3661,21 +3707,73 @@ mod tests {
             .oneshot(post_chat("{", &[(HEADER_REQUEST_ID, request_id.as_str())]))
             .await
             .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
             let record_id = response
                 .headers()
                 .get(HEADER_RECORD_ID)
                 .unwrap()
                 .to_str()
-                .unwrap();
-            let rows = audit_rows(&store);
-            assert_eq!(rows.len(), 1);
-            assert_eq!(rows[0].request_id, record_id);
+                .unwrap()
+                .to_string();
+            let expected_request_id = if preserves_caller_id {
+                request_id.as_str()
+            } else {
+                record_id.as_str()
+            };
+
+            let legacy = audit_rows(&store);
+            assert_eq!(legacy.len(), 1);
+            assert_eq!(legacy[0].payload["request_id"], json!(expected_request_id));
+
+            let event_records = queries::audit::query_event_audit(
+                &event_log,
+                budget::PERSONAL_TENANT_ID,
+                Some(budget::PERSONAL_TENANT_ID),
+                &queries::audit::AuditQuery {
+                    from: None,
+                    to: None,
+                    limit: None,
+                    record_id: Some(record_id.clone()),
+                },
+            )
+            .unwrap();
+            assert_eq!(event_records.records.len(), 1);
+            assert_eq!(event_records.records[0].request_id, expected_request_id);
+            assert_eq!(
+                event_records.records[0].payload["request_id"],
+                json!(expected_request_id)
+            );
+
             let events = event_log
-                .events_for_record(Some(budget::PERSONAL_TENANT_ID), record_id)
+                .events_for_record(Some(budget::PERSONAL_TENANT_ID), &record_id)
                 .unwrap();
-            assert_eq!(events.len(), 1);
-            assert_eq!(events[0].event.event_type, EventType::AuditFinalized);
-            assert_eq!(events[0].event.request_id.as_deref(), Some(record_id));
+            let terminal = events.last().unwrap();
+            assert_eq!(terminal.event.event_type, EventType::AuditFinalized);
+            assert_eq!(
+                terminal.event.request_id.as_deref(),
+                Some(expected_request_id)
+            );
+        }
+    }
+
+    #[test]
+    fn audit_tenant_scope_matches_event_log_identifier_boundary() {
+        let state = AppState {
+            deploy_mode: idoris_contracts::DeployMode::Tenant,
+            ..AppState::default()
+        };
+        let accepted = "t".repeat(128);
+        let mut headers = HeaderMap::new();
+        headers.insert("x-idoris-tenant", HeaderValue::from_str(&accepted).unwrap());
+        assert_eq!(
+            audit_tenant_id(&state, &headers).as_deref(),
+            Some(accepted.as_str())
+        );
+
+        for rejected in ["t".repeat(129), "left\tright".to_string()] {
+            let mut headers = HeaderMap::new();
+            headers.insert("x-idoris-tenant", HeaderValue::from_str(&rejected).unwrap());
+            assert_eq!(audit_tenant_id(&state, &headers), None);
         }
     }
 
@@ -3899,33 +3997,34 @@ mod tests {
 
     #[tokio::test]
     async fn audit_query_http_scopes_filters_and_rejects_unknown_params() {
-        let store = memory_record_store();
-        {
-            let guard = store.lock().unwrap();
-            for (tenant, id, ts) in [
-                (budget::PERSONAL_TENANT_ID, "own", 2_000_i64),
-                ("other", "private", 1_500_i64),
-            ] {
-                let mut payload = Map::new();
-                payload.insert("ts_utc".into(), json!(ts));
-                payload.insert("reason".into(), json!("intent_match"));
-                guard
-                    .put(
-                        Some(tenant),
-                        &TenantRecord {
-                            tenant_id: tenant.into(),
-                            kind: RecordKind::Audit,
-                            record_id: id.into(),
-                            request_id: format!("request-{id}"),
-                            origin_record_id: None,
-                            payload,
-                        },
-                    )
-                    .unwrap();
-            }
+        let event_log =
+            Arc::new(EventLogStore::new(Connection::open_in_memory().unwrap()).unwrap());
+        for (tenant, id, ts) in [
+            (budget::PERSONAL_TENANT_ID, "own", 2_000_i64),
+            ("other", "private", 1_500_i64),
+        ] {
+            let event = NewEvent {
+                event_id: Uuid::new_v4().to_string(),
+                tenant_id: tenant.into(),
+                record_id: id.into(),
+                event_type: EventType::AuditFinalized,
+                ts_utc_ms: ts,
+                request_id: Some(format!("request-{id}")),
+                session_id: None,
+                trace_id: None,
+                parent_id: None,
+                origin_record_id: None,
+                metadata: std::collections::BTreeMap::from([
+                    ("component".into(), json!("router")),
+                    ("http_status".into(), json!(200)),
+                    ("reason".into(), json!("intent_match: routed")),
+                    ("latency_ms".into(), json!(1)),
+                ]),
+            };
+            event_log.append(Some(tenant), &event).unwrap();
         }
         let app = build_app(AppState {
-            record_store: Some(store),
+            event_log: Some(event_log),
             ..AppState::default()
         });
         let tenant = budget::PERSONAL_TENANT_ID;

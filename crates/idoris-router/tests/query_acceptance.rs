@@ -29,6 +29,7 @@ fn state_from(db: &std::path::Path) -> AppState {
         deploy_mode: DeployMode::Personal,
         budget_ledger: Some(persistent.budget),
         record_store: Some(persistent.records),
+        event_log: Some(persistent.event_log),
         ..AppState::default()
     }
 }
