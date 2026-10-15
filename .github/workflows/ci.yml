@@ -109,3 +109,10 @@ jobs:
       - name: Subscription Unix safety + shared conformance
         shell: bash
         run: bash scripts/check-subscription.sh
+
+  release-helpers:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Release helper behavior
+        run: python3 -B -m unittest discover -s scripts -p 'test_*release*.py'

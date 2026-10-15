@@ -53,7 +53,7 @@ python3 scripts/macos_signed_release.py \
 
 `.github/workflows/release.yml` 的 tag 路径仍要求精确提交位于 `origin/main` 历史内，并运行 workspace tests、locked release build 和精确版本的 archive smoke。`v0.3.0` 被明确拒绝，已有 tag/assets 保持不变。`workflow_dispatch` 仅构建，不创建 Release。
 
-未签名 tar.gz 和 checksum 只保存在 `unsigned-build-only` Actions artifact 中，保留七天，不附加到 GitHub Release。tag 路径只调用 `gh release create --verify-tag --draft` 创建无资产草稿。已有 Release 会使创建失败，workflow 不修改或覆盖它。GitHub runner 不执行 Apple 签名，也不接收 Apple 证书、私钥或 profile 凭据。
+未签名 tar.gz 和 checksum 只保存在 `unsigned-build-only` Actions artifact 中，保留七天，不附加到 GitHub Release。tag 路径只调用 `gh release create --verify-tag --draft` 创建无资产草稿。创建前分页列举可见 Release（包括 draft）的 tag，发现同 tag 即拒绝；列表读取失败也停止，不创建或覆盖 Release。此预检不构成并发创建的原子锁。GitHub runner 不执行 Apple 签名，也不接收 Apple 证书、私钥或 profile 凭据。
 
 `release-smoke.py` 保留旧调用 `python3 scripts/release-smoke.py ARCHIVE EXPECTED_VERSION`。归档必须恰有 CLI 和四个 regular-file 成员，拒绝重复成员、链接和其他路径。新入口直接执行挂载目录中的同一个 CLI，不复制或写入 payload：
 
@@ -63,7 +63,7 @@ python3 scripts/release-smoke.py \
   --expected-version 0.3.1
 ```
 
-调用前先验证 DMG 与 CLI 的签名、公证、附票和 payload 哈希。这个入口不验证 Apple 签名，也不接收 DMG 文件。它要求 `idoris` 与 `config/` 下四份公开配置均为 regular files，路径不经过符号链接。检查从空 cwd 启动，清除继承的 `IDORIS_*`，用临时 HOME 和数据目录，并要求 `/health` 精确返回 `status=ok`、预期版本和 `components=1`。默认数据端口 8740、Admin 端口 8741 必须空闲；检查结束会回收自己启动的进程，不输出可能包含临时 Admin token 的服务器日志。
+调用前先验证 DMG 与 CLI 的签名、公证、附票和 payload 哈希。这个入口不验证 Apple 签名，也不接收 DMG 文件。它要求 `idoris` 与 `config/` 下四份公开配置均为 regular files，路径不经过符号链接。检查从空 cwd 启动，清除继承的 `IDORIS_*`，用临时 HOME 和数据目录，并要求 `/health` 精确返回 `status=ok`、预期版本和 `components=1`。默认数据端口 8740、Admin 端口 8741 必须空闲：启动前检查 IPv4/IPv6 loopback 的可连接监听，拒绝包括通配/双栈在内的已有监听，再用允许 TIME_WAIT 重用的 bind 探针核查端口；这不是对检查后新出现进程的身份认证。检查结束会回收自己启动的进程，不输出可能包含临时 Admin token 的服务器日志。
 
 ## 完成本地签名与发布
 
@@ -108,6 +108,8 @@ gh release edit "$TAG" --repo "$REPO" --draft=false
 在最终 v0.3.1 source cut 上，另需运行新 native 参数透传和 deadline/cancellation 的产品门禁、Agent24 实际 provider wiring/请求路由验收，再检查签名后挂载或手动复制的同一 CLI 的启动及精确 `/health` 版本。当前 `scripts/smoke-agent24.mjs` 仍引用旧 `packages/router/dist/index.js` 和模拟 upstream，只是 iDoris 侧契约验证，不能替代 Agent24 仓库对真实 Rust v0.3.1 的接入证明。已有 v0.3.0 smoke 不可计作这些新门禁通过。
 
 下载验收还需在从未见过该产品的干净 macOS/VM 上用 Safari 获取 DMG，保留 quarantine，断网测试附票后的挂载、按现有手动流程复制 CLI+config、从 Terminal 启动。随后联网执行需要网络的产品 smoke。CLI 安装位置、配置和进程管理继续由现有手动流程负责。工具检查与单测均不能代替这份用户路径验收。
+
+普通 push/PR 的 macOS `release-helpers` job 执行同一组 `test_*release*.py` 单测；不只在 tag workflow 上运行。测试通过仍不是实际签名或发布证明。
 
 ## 本切片验证
 

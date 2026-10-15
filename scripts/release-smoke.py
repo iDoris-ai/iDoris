@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Validate package startup/version; payload signatures must be verified separately."""
 import argparse
+import errno
 import json
 import os
 from pathlib import Path
@@ -40,8 +41,23 @@ def smoke_payload(directory, expected):
         cwd, home = root / "empty-cwd", root / "home"
         cwd.mkdir()
         home.mkdir()
-        # Check both default ports before starting the child.
+        # REUSEADDR permits quick repeats after TIME_WAIT on macOS, but can
+        # bind over an existing wildcard listener. Refuse accepting listeners
+        # on both loopbacks before spawning; unexpected probe errors fail closed.
         for port in (8740, 8741):
+            for family, host in ((socket.AF_INET, "127.0.0.1"), (socket.AF_INET6, "::1")):
+                try:
+                    with socket.socket(family) as listener_probe:
+                        listener_probe.settimeout(0.25)
+                        result = listener_probe.connect_ex((host, port))
+                except OSError as error:
+                    if error.errno not in (errno.EAFNOSUPPORT, errno.EPROTONOSUPPORT):
+                        raise
+                    continue
+                if result == 0:
+                    raise OSError(errno.EADDRINUSE, "release smoke port already has a listener")
+                if result not in (errno.ECONNREFUSED, errno.EADDRNOTAVAIL):
+                    raise OSError(result, "cannot establish release smoke port availability")
             with socket.socket() as probe:
                 probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                 probe.bind(("127.0.0.1", port))
