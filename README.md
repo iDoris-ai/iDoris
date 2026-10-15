@@ -7,6 +7,8 @@ Rust（`Cargo.toml` workspace 下的 `crates/`）是生产实现。`packages/` �
 
 ## 安装与运行
 
+新用户先读 [v0.3.0 安装、密钥初始化、模型调用与 Agent24 接入检查](docs/安装与首次调用-v0.3.0.md)。正式包是 Apple Silicon macOS 命令行程序，控制台位于 `http://127.0.0.1:8741/admin/`，当前只读；不含模型或桌面安装器。推理和模型发现需要 virtual key，`/health` 就绪不代表完成模型配置。
+
 从 [GitHub Releases](https://github.com/iDoris-ai/iDoris/releases) 下载对应版本，校验后解压运行——包内自带可用的 `config/`，不需要编辑配置文件。目前只发布 macOS Apple Silicon（`aarch64-apple-darwin`）。
 
 ```bash
