@@ -12,12 +12,12 @@
 | 文档修订 `1.2` | 本次文字整合；不是服务 wire version，不触发代码或 schema 升级 |
 | iDoris release `v0.3.0` | 实现提交 `03c079c70611331a8c85a1666e32a75df6359d09`（下称 I0） |
 | runtime `contract_version=1.0.1` | I0 的 `crates/idoris-contracts/src/version.rs::CONTRACT_VERSION`；TS `packages/contracts/src/version.ts` 同值 |
-| Agent24 main | `6072fd373142eb3dbf1a6a4a3222e6eec82c74f6`（下称 A0）；main 源码状态不等于 stable 已发给用户 |
+| Agent24 审计基线 | `6072fd373142eb3dbf1a6a4a3222e6eec82c74f6`（下称 A0，固定历史快照，非当前 main）；main 源码状态不等于 stable 已发给用户 |
 | v0.3.1 | 拟议集成目标，尚未发布/验收；本规范不选择未来 wire version 或猜最低 Agent24 release |
 
 除明确标为“提案/目标”的部分外，正文表达 R0–R8 的既有边界；§4 标明其实现差距。已有 JSON Schema 对它覆盖的 wire 结构是机器真源；未覆盖条款为文字规范，不能声称 schema 已齐全。发生实现差距时须如实失败或显示不可用，不能把目标字段当作当前 API。
 
-**反向权威**：在同机组合中，主机事实与整机预算分配归 Agent24；公式和硬件能力计划只引用 [HW-TIERS §3.3/3.4（固定 961a6408）](https://github.com/iDoris-ai/Agent24/blob/961a64085576eec365d0442ed27d2a7422168200/docs/design/HW-TIERS-capability-hardware-matrix.md) 与 [ADR-036 提案（同一固定提交）](https://github.com/iDoris-ai/Agent24/blob/961a64085576eec365d0442ed27d2a7422168200/docs/decision.md)。审计快照中 [#964](https://github.com/iDoris-ai/Agent24/pull/964)、[#966](https://github.com/iDoris-ai/Agent24/pull/966) 均 **OPEN、未合并**，不是 A0 API。HW-1 候选固定为 `f857ecfa4493b181d17a1d8e9323efde36ffe425`；其 `HardwareReport` 仅有 `profile/level/usable_bytes/reasons`，没有 `llm_allocated_bytes`。不直接依赖 agent24-hw，不照抄提案中已过时的“推荐器尚无分配额入参”。
+**反向权威**：在同机组合中，主机事实与整机预算分配归 Agent24；公式和硬件能力计划只引用 [HW-TIERS §3.3/3.4（固定 961a6408）](https://github.com/iDoris-ai/Agent24/blob/961a64085576eec365d0442ed27d2a7422168200/docs/design/HW-TIERS-capability-hardware-matrix.md) 与 [ADR-036 提案（同一固定提交）](https://github.com/iDoris-ai/Agent24/blob/961a64085576eec365d0442ed27d2a7422168200/docs/decision.md)。A0 审计后，[#964](https://github.com/iDoris-ai/Agent24/pull/964) 已合并为 `622be5d7df0387b91028820624a778cb99cd6d43`，[#966](https://github.com/iDoris-ai/Agent24/pull/966) 已合并为 `cb11d7bc345ce8dfb5c438e4d6cf0d3663e76724`（2026-10-15 状态回读）；这不改变固定 A0，也不证明已发布给用户。HW-1 来源固定为 `f857ecfa4493b181d17a1d8e9323efde36ffe425`；其 `HardwareReport` 仅有 `profile/level/usable_bytes/reasons`，没有 `llm_allocated_bytes`。不直接依赖 agent24-hw，不照抄提案中已过时的“推荐器尚无分配额入参”。
 
 动作授权与 Desktop 安全实现由 Agent24 的 [ADR-032/035（固定 A0）](https://github.com/iDoris-ai/Agent24/blob/6072fd373142eb3dbf1a6a4a3222e6eec82c74f6/docs/decision.md) 负责；跨仓边界以本文整合条款为准。
 
@@ -149,14 +149,14 @@ Agent24 事件日志是 Evolver 主数据源，运行期记忆不是训练副本
 | max_tokens/timeout 不匹配 | I0 `crates/idoris-router/src/lib.rs` unsupported_parameter 分支、`crates/idoris-upstream/src/omlx/mod.rs::OmlxAdapterConfig`（共用 call_timeout）；A0 `rust/apps/agent24d/src/model_callback.rs`、`rust/apps/agent24-documents/src/extract/run.rs`；iDoris FU-206/FU-25（`docs/agent/tasks.md`） | 参数保留到上游、非法值拒绝、长生成不被 load timeout 截断；仍是目标 |
 | readiness 尚非结构化协议 | I0 `crates/idoris-router/src/bin/idoris.rs::run` 只打印 listening 文本；`tests/cli.rs::occupied_admin_port_fails_before_data_health_is_served` | 不发明 IDORIS_READY 为当前输出 |
 
-### 4.1 未合并候选（不是 I0 或发布能力）
+### 4.1 I0 之后的源码与候选（不是 v0.3.0 发布能力）
 
 | 候选 | 固定提交 | 证据范围/限制 |
 |---|---|---|
-| [#507](https://github.com/iDoris-ai/iDoris/pull/507) onboarding | `a232f83` | `docs/安装与首次调用-v0.3.0.md`、`scripts/test_onboarding_smoke.py`：iDoris 归档 fixture，非 Agent24 真实进程联调 |
-| [#508](https://github.com/iDoris-ai/iDoris/pull/508) key ceiling | `1c9c592` | `crates/idoris-router/src/lib.rs`、`src/virtual_key_wiring_tests.rs`：防 personal key 提升与鉴权前事件泄露；不是已发布安全结论 |
-| [#510](https://github.com/iDoris-ai/iDoris/pull/510) role binding | `bbf99ec` | `crates/idoris-router/src/dispatch.rs::role_models` 与 `src/role_binding_tests.rs`：显式运维 map/auto、缺失 fail-closed；首片仅承诺 HTTP，不据函数接受扩展宣称其他后端已验收 |
-| budget 精度后续 | `a078b033bb503216fbc0f2e2bcc419d3a4118a15` | `crates/idoris-backend/tests/runtime_exact_charge.rs`、`crates/idoris-router/tests/runtime_exact_growth.rs`；尚未合并，亦不能替代 runtime allocation 基础接线验收 |
+| [#507](https://github.com/iDoris-ai/iDoris/pull/507) onboarding | `5d6d9b5f6bbbd8242ac50cc59c66fc8024e5464e`（OPEN） | `docs/安装与首次调用-v0.3.0.md`、`scripts/test_onboarding_smoke.py`：iDoris 归档 fixture，非 Agent24 真实进程联调 |
+| [#508](https://github.com/iDoris-ai/iDoris/pull/508) key ceiling | `1c9c592ffb8f8226e873cfbbc242abf2fe24e747`（已合并至 `959337d`） | `crates/idoris-router/src/lib.rs`、`src/virtual_key_wiring_tests.rs`：防 personal key 提升与鉴权前事件泄露；已经进入 main，但不属于 I0 发布二进制，补丁版仍需完整验收 |
+| [#510](https://github.com/iDoris-ai/iDoris/pull/510) role binding | `c3cfff4a7864fc83951507615214bbc1c22d90ec`（OPEN） | `crates/idoris-router/src/dispatch.rs::role_models` 与 `src/role_binding_tests.rs`：显式运维 map/auto、缺失 fail-closed；HTTP 多协议与 lifecycle 共享具体目标；无映射 fixed subscription 保留既有角色资格，执行身份仍固定；不是 Agent24 已联调的证据 |
+| budget 精度后续 [#511](https://github.com/iDoris-ai/iDoris/pull/511) / [#512](https://github.com/iDoris-ai/iDoris/pull/512) | `20bb2a3c593c49972c8c5697f20c62ec9788091c` / `6e9f15828302f6735318eaceaafe91629bcd1601`（OPEN） | `crates/idoris-backend/tests/runtime_exact_charge.rs`、`crates/idoris-router/tests/runtime_exact_growth.rs`；尚未合并，亦不能替代 runtime allocation 基础接线验收 |
 
 ### 4.2 Schema 清单（I0 实际只有 15 份）
 
