@@ -76,6 +76,9 @@ async fn buffered_proxy_records_completed_success_after_dispatch() {
         ]
     );
     let event = &completed(&chain)[0].event;
+    for key in ["tokens_in", "tokens_out", "token_estimator"] {
+        assert!(!event.metadata.contains_key(key), "unexpected {key}");
+    }
     assert_eq!(event.metadata.get("status"), Some(&json!("success")));
     assert_eq!(event.metadata.get("provider_id"), Some(&json!("proxy")));
     assert_eq!(event.trace_id.as_deref(), Some("proxy-completed-trace"));
@@ -114,6 +117,12 @@ async fn buffered_proxy_failure_records_completed_failure() {
     let chain = events(&event_log, &response);
     let completed = completed(&chain);
     assert_eq!(completed.len(), 1);
+    for key in ["tokens_in", "tokens_out", "token_estimator"] {
+        assert!(
+            !completed[0].event.metadata.contains_key(key),
+            "unexpected {key}"
+        );
+    }
     assert_eq!(
         completed[0].event.metadata.get("status"),
         Some(&json!("failure"))
