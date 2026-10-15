@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
-"""Exercise a release binary in disposable storage, with a loopback HTTP fixture.
+"""Pin v0.3.0 behavior (adapt expectations before use with v0.3.1).
+
+Exercise a release binary in disposable storage, with a loopback HTTP fixture.
 
 No model downloads, subscription commands, paid calls, or real backend requests.
 Usage: python3 scripts/test_onboarding_smoke.py /absolute/path/to/extracted/idoris
 """
+import argparse
 import contextlib
 import http.server
 import json
@@ -12,7 +15,6 @@ from pathlib import Path
 import secrets
 import socket
 import subprocess
-import sys
 import tempfile
 import threading
 import time
@@ -101,7 +103,8 @@ def server(binary, cwd, env, token):
                     if request('http://127.0.0.1:' + env['IDORIS_PORT'] + '/health')[0] == 200:
                         break
                 except (OSError, urllib.error.URLError):
-                    time.sleep(.1)
+                    pass
+                time.sleep(.1)
             else:
                 raise RuntimeError('readiness timeout')
             yield
@@ -116,7 +119,49 @@ def server(binary, cwd, env, token):
             assert token not in log.read(), 'Admin token leaked to logs'
 
 
-def main(binary):
+def late_backend_case(binary, root, env, token, key, card, components, base):
+    """Released 0.3.0 latches startup_error until our own service restarts."""
+    LOADED.clear()
+    with socket.socket() as unavailable:
+        unavailable.bind(('127.0.0.1', 0))
+        address = unavailable.getsockname()
+        endpoint = 'http://127.0.0.1:' + str(address[1])
+        (components / 'local.yaml').write_text(card.replace('http://127.0.0.1:8000', endpoint))
+        body = {'model': 'fixture-model', 'messages': [{'role': 'user', 'content': 'hello'}],
+                'stream': False}
+        with contextlib.ExitStack() as cleanup:
+            with server(binary, root, env, token):
+                status, _, raw = request(base + '/v1/chat/completions', key, body)
+                assert status == 503, (status, raw)
+                startup_error = json.loads(raw)['error']['remediation']
+                assert 'oMLX GET /api/status' in startup_error, raw
+                assert ('could not connect' in startup_error or
+                        'timed out (transport error)' in startup_error), raw
+                unavailable.close()
+                upstream = http.server.ThreadingHTTPServer(address, Fixture)
+                thread = threading.Thread(target=upstream.serve_forever, daemon=True)
+                thread.start()
+                cleanup.callback(thread.join)
+                cleanup.callback(upstream.server_close)
+                cleanup.callback(upstream.shutdown)
+                status, _, raw = request(base + '/v1/models', key)
+                assert status == 200, (status, raw)
+                assert json.loads(raw)['data'][0]['id'] == 'fixture-model', raw
+                count = len(SEEN)
+                status, _, raw = request(base + '/v1/chat/completions', key, body)
+                assert status == 503, (status, raw)
+                assert json.loads(raw)['error']['remediation'] == startup_error, raw
+                assert len(SEEN) == count, 'latched startup error unexpectedly called backend'
+            # The server context stops and waits for only the subprocess it owns.
+            with server(binary, root, env, token):
+                status, _, raw = request(base + '/v1/chat/completions', key, body)
+                assert status == 200, (status, raw)
+                assert json.loads(raw)['choices'][0]['message']['content'] == 'fixture-ok', raw
+                assert SEEN[-1]['model'] == 'fixture-model'
+    print('PASS late backend: unavailable startup; models 200 + latched chat 503; owned service restart + chat 200')
+
+
+def main(binary, late_backend_only=False):
     binary = Path(binary).resolve(strict=True)
     SEEN.clear()
     LOADED.clear()
@@ -158,6 +203,11 @@ def main(binary):
                 assert request(admin + '/admin/api/v1/status', token)[0] == 200
                 assert b'Session token' in request(admin + '/admin/')[2]
         print('PASS release startup outside repository; version; no-key 401; unavailable model list; Admin auth/page')
+        late_backend_case(binary, root, env, token, key, card, components, base)
+        if late_backend_only:
+            return
+        SEEN.clear()
+        LOADED.clear()
         upstream = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Fixture)
         thread = threading.Thread(target=upstream.serve_forever, daemon=True)
         thread.start()
@@ -184,6 +234,7 @@ def main(binary):
                                         env=env, input=token + '\n', text=True, capture_output=True, check=True)
                 assert json.loads(result.stdout)
                 assert len(SEEN) == 2, SEEN
+                assert SEEN[1]['model'] == 'idoris/daily', SEEN
                 print('PASS persisted key bootstrap/restart; model discovery; concrete+daily calls; locality/record headers; role denial; Admin CLI')
                 print('Fixture received model fields:', [item['model'] for item in SEEN])
             # Restore the packaged lifecycle card shape against our oMLX-shaped fixture.
@@ -205,6 +256,7 @@ def main(binary):
                 status, _, raw = request(base + '/v1/chat/completions', limited_key, body)
                 assert status == 503, (status, raw)
                 assert json.loads(raw)['error']['type'] == 'local_only_unavailable'
+                assert json.loads(raw)['error']['remediation'] == 'model not found: omlx', raw
                 assert len(SEEN) == count, 'unresolved role unexpectedly invoked a model'
                 print('PASS oMLX-shaped list/status/load/chat; concrete model works; default daily alias fails closed (known product gap)')
         finally:
@@ -214,4 +266,8 @@ def main(binary):
 
 
 if __name__ == '__main__':
-    main(*sys.argv[1:])
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('binary')
+    parser.add_argument('--late-backend-only', action='store_true')
+    args = parser.parse_args()
+    main(args.binary, args.late_backend_only)
