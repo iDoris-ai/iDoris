@@ -58,6 +58,17 @@ impl InspectCtx {
     }
 }
 
+/// Compare a known credential after the same escape normalization used by L0.
+pub(crate) fn contains_credential(input: &str, credential: &str) -> bool {
+    let input = normalize::normalize(&input.encode_utf16().collect::<Vec<_>>());
+    let credential = normalize::normalize(&credential.encode_utf16().collect::<Vec<_>>());
+    credential.units.is_empty()
+        || input
+            .units
+            .windows(credential.units.len())
+            .any(|part| part == credential.units)
+}
+
 /// L0 的一条命中：类别、UTF-16 位置、这条命中自身的敏感度。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Hit {
