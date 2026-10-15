@@ -113,7 +113,7 @@ messages 或 d3 可替换，也不声明完成 A4 的 Ollama 生命周期 adapte
 1. 记录旧版本、候选版本、模型 revision/量化和脱敏的端点结果，保留旧卡与可回退的引擎工件。
 2. 用独立测试服务复跑 U0 的 models、load/unload、流式和非流式 chat，并核对身份及认证失败行为。
 3. 核对 `/api/status` 的 `loaded_models`、内存字段和单位；复测 `is_pinned` 对应的 loaded/pinned 后置条件、admin 登录及压力语义。缺失或非法字段仍须 fail-closed。结合 FU-17/FU-18 区分实机证据与 mock 覆盖，未验证项不能写成已通过。
-4. 跑共享 conformance 与 oMLX adapter 测试，再更新 `version_pin` 和端点证据。任何必要后置条件不成立就保留旧 pin，或采用下述直连退路。日志不记录 key 或 admin token。
+4. 跑共享 conformance 与 oMLX adapter 测试，再更新 `version_pin` 和端点证据。任何必要后置条件不成立就保留旧 pin，或采用 [Mac 直连退路 runbook](../config/examples/omlx-exit/README.md)。日志不记录 key 或 admin token。
 
 ## 3. 结论二：用 Decision 3.0，只当提议者
 
