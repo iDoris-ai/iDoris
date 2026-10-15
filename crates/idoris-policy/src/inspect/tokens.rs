@@ -222,7 +222,7 @@ fn scan_plates(units: &[u16], hits: &mut Vec<Hit>) {
     }
 }
 
-/// ASCII-only `local@domain.tld`：本地部分 `[A-Za-z0-9._%+-]+`，域名至少一个点、
+/// ASCII `local@domain.tld`：本地部分 `[A-Za-z0-9._%+-]+`，域名至少一个点、
 /// 顶级域至少两个字母。全角和非 ASCII 邮箱不在这里匹配。
 fn scan_emails(units: &[u16], hits: &mut Vec<Hit>) {
     let local_char = |u: u16| is_alnum(u) || b"._%+-".iter().any(|&c| u16::from(c) == u);
