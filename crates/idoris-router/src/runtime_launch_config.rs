@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 
 use idoris_contracts::ComponentAuth;
-use idoris_upstream::{LocalHttpRuntimeConfig, LocalRuntimeKind, LocalRuntimeLaunch};
+use idoris_upstream::{LocalHttpRuntimeConfig, LocalRuntimeKind, LocalRuntimeLaunch, VllmLaunch};
 
 use crate::upstream_auth::{self, EnvLookup};
 
@@ -35,6 +35,12 @@ struct RuntimeLaunchEntry {
     load_fence_path: PathBuf,
     #[serde(default)]
     auth: Option<ComponentAuth>,
+    #[serde(default)]
+    engine_version: Option<String>,
+    #[serde(default)]
+    model_revision: Option<String>,
+    #[serde(default)]
+    gpu_total_gib: Option<f64>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -42,6 +48,7 @@ struct RuntimeLaunchEntry {
 enum RuntimeKind {
     MlxLmServer,
     LlamaCpp,
+    Vllm,
 }
 
 impl From<RuntimeKind> for LocalRuntimeKind {
@@ -49,6 +56,57 @@ impl From<RuntimeKind> for LocalRuntimeKind {
         match value {
             RuntimeKind::MlxLmServer => Self::MlxLmServer,
             RuntimeKind::LlamaCpp => Self::LlamaCpp,
+            RuntimeKind::Vllm => Self::Vllm,
+        }
+    }
+}
+
+fn launch_from_entry(
+    provider_id: &str,
+    entry: &RuntimeLaunchEntry,
+) -> Result<LocalRuntimeLaunch, String> {
+    let vllm_only = entry.engine_version.is_some()
+        || entry.model_revision.is_some()
+        || entry.gpu_total_gib.is_some();
+    match entry.kind {
+        RuntimeKind::MlxLmServer | RuntimeKind::LlamaCpp => {
+            if vllm_only {
+                return Err(format!(
+                    "本地 runtime {provider_id} 的 engine_version、model_revision、gpu_total_gib 只适用于 kind: vllm"
+                ));
+            }
+            LocalRuntimeLaunch::new(
+                entry.kind.into(),
+                entry.executable.clone(),
+                entry.model_path.clone(),
+                entry.port,
+            )
+            .map_err(|error| error.to_string())
+        }
+        RuntimeKind::Vllm => {
+            let engine_version = entry.engine_version.clone().ok_or_else(|| {
+                format!("本地 runtime {provider_id} 必须固定 engine_version（x.y.z）")
+            })?;
+            let gpu_total_gib = entry.gpu_total_gib.ok_or_else(|| {
+                format!(
+                    "本地 runtime {provider_id} 必须给出 gpu_total_gib。memory_gb 是实际 GPU 预留，会作为 --gpu-memory-utilization 传给 vLLM，不能只做账"
+                )
+            })?;
+            let model = entry
+                .model_path
+                .to_str()
+                .ok_or_else(|| format!("本地 runtime {provider_id} 的 model_path 必须是 UTF-8"))?;
+            LocalRuntimeLaunch::vllm(VllmLaunch {
+                executable: entry.executable.clone(),
+                model: model.to_string(),
+                port: entry.port,
+                served_model_name: entry.model_id.clone(),
+                engine_version,
+                gpu_total_gib,
+                reserve_gib: entry.memory_gb,
+                model_revision: entry.model_revision.clone(),
+            })
+            .map_err(|error| error.to_string())
         }
     }
 }
@@ -81,13 +139,8 @@ pub(crate) fn load_with(
         if provider_id.is_empty() {
             return Err("本地 runtime provider_id 不能为空".to_string());
         }
-        let launch = LocalRuntimeLaunch::new(
-            entry.kind.into(),
-            entry.executable,
-            entry.model_path,
-            entry.port,
-        )
-        .map_err(|error| format!("本地 runtime {provider_id:?} 启动配置无效：{error}"))?;
+        let launch = launch_from_entry(provider_id, &entry)
+            .map_err(|error| format!("本地 runtime {provider_id:?} 启动配置无效：{error}"))?;
         let mut config = LocalHttpRuntimeConfig::new(
             launch,
             entry.model_id,
@@ -173,6 +226,130 @@ runtimes:
             let file = write(raw);
             assert!(load(Some(file.path())).is_err());
         }
+    }
+
+    #[test]
+    fn vllm_kind_accepts_a_local_artifact_and_rejects_an_unpinned_repo() {
+        let local = write(
+            r#"version: 1
+runtimes:
+  - provider_id: vllm-local
+    kind: vllm
+    executable: /opt/vllm/vllm
+    model_path: /models/qwen
+    engine_version: 0.11.0
+    gpu_total_gib: 24
+    port: 18103
+    model_id: served-id
+    memory_gb: 18
+    load_fence_path: /tmp/idoris/vllm-local.pending
+"#,
+        );
+        let configs = load(Some(local.path())).unwrap();
+        let launch = &configs["vllm-local"].launch;
+        assert_eq!(launch.kind(), LocalRuntimeKind::Vllm);
+        assert_eq!(launch.engine_version(), Some("0.11.0"));
+        assert_eq!(
+            launch
+                .args()
+                .into_iter()
+                .map(|arg| arg.into_string().unwrap())
+                .collect::<Vec<_>>(),
+            [
+                "serve",
+                "/models/qwen",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                "18103",
+                "--served-model-name",
+                "served-id",
+                "--gpu-memory-utilization",
+                "0.75",
+            ]
+        );
+
+        let repo = write(
+            r#"version: 1
+runtimes:
+  - provider_id: vllm-hf
+    kind: vllm
+    executable: /opt/vllm/vllm
+    model_path: Qwen/Qwen2.5-7B
+    engine_version: 0.11.0
+    gpu_total_gib: 24
+    port: 18103
+    model_id: served-id
+    memory_gb: 18
+    load_fence_path: /tmp/idoris/vllm-hf.pending
+"#,
+        );
+        let missing_revision = load(Some(repo.path())).unwrap_err();
+        assert!(missing_revision.contains("not an offline launch"));
+        assert!(missing_revision.contains("revision"));
+
+        let pinned = write(
+            r#"version: 1
+runtimes:
+  - provider_id: vllm-hf
+    kind: vllm
+    executable: /opt/vllm/vllm
+    model_path: Qwen/Qwen2.5-7B
+    model_revision: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    engine_version: 0.11.0
+    gpu_total_gib: 24
+    port: 18103
+    model_id: served-id
+    memory_gb: 18
+    load_fence_path: /tmp/idoris/vllm-hf.pending
+"#,
+        );
+        let pinned_args = load(Some(pinned.path())).unwrap()["vllm-hf"]
+            .launch
+            .args()
+            .into_iter()
+            .map(|arg| arg.into_string().unwrap())
+            .collect::<Vec<_>>();
+        assert!(
+            pinned_args
+                .windows(2)
+                .any(|pair| { pair == ["--revision", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"] })
+        );
+
+        for raw in [
+            r#"version: 1
+runtimes:
+  - {provider_id: vllm-local, kind: vllm, executable: /opt/vllm/vllm, model_path: /models/qwen, port: 18103, model_id: served-id, memory_gb: 18, load_fence_path: /tmp/idoris/vllm-local.pending, gpu_total_gib: 24}
+"#,
+            r#"version: 1
+runtimes:
+  - {provider_id: mlx-fallback, kind: mlx_lm_server, executable: /usr/bin/python3, model_path: /models/qwen-mlx, port: 18101, model_id: qwen-mlx, memory_gb: 18.5, load_fence_path: /tmp/idoris/mlx-fallback.pending, engine_version: 0.11.0}
+"#,
+            r#"version: 1
+runtimes:
+  - {provider_id: vllm-local, kind: vllm, executable: /opt/vllm/vllm, model_path: /models/qwen, engine_version: 0.11.0, gpu_total_gib: 16, port: 18103, model_id: served-id, memory_gb: 18, load_fence_path: /tmp/idoris/vllm-local.pending}
+"#,
+        ] {
+            let file = write(raw);
+            assert!(load(Some(file.path())).is_err(), "{raw}");
+        }
+    }
+
+    #[test]
+    fn shipped_vllm_example_is_a_local_artifact_pin() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let example = root.join("config/examples/multibackend/vllm-local-runtime.yaml");
+        let configs = load(Some(&example)).unwrap();
+        let launch = &configs["vllm-local"].launch;
+        assert_eq!(launch.kind(), LocalRuntimeKind::Vllm);
+        let args = launch
+            .args()
+            .into_iter()
+            .map(|arg| arg.into_string().unwrap())
+            .collect::<Vec<_>>();
+        assert!(!args.iter().any(|arg| arg == "--revision"));
+        assert!(args.iter().any(|arg| arg == "--gpu-memory-utilization"));
+        assert_eq!(configs["vllm-local"].bearer, None);
     }
 
     #[test]

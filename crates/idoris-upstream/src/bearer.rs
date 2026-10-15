@@ -40,6 +40,12 @@ impl UpstreamBearer {
     pub fn authorization(&self) -> &str {
         &self.authorization
     }
+
+    /// The secret without the `Bearer ` prefix. This is the value vLLM's
+    /// `--api-key` must use so the client header and the engine agree.
+    pub fn secret(&self) -> &str {
+        self.authorization.strip_prefix("Bearer ").unwrap_or("")
+    }
 }
 
 #[cfg(test)]
@@ -52,6 +58,7 @@ mod tests {
     fn secret_is_prefixed_once_and_absent_from_debug() {
         let bearer = UpstreamBearer::from_secret("sk-test-token").unwrap();
         assert_eq!(bearer.authorization(), "Bearer sk-test-token");
+        assert_eq!(bearer.secret(), "sk-test-token");
         let rendered = format!("{bearer:?}");
         assert!(!rendered.contains("sk-test-token"));
         assert!(rendered.contains("redacted"));
