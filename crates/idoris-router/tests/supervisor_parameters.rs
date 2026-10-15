@@ -41,7 +41,6 @@ async fn unsupported_options_are_400_before_any_upstream_call() {
         ..AppState::default()
     });
     for (key, value) in [
-        ("max_tokens", json!(40)),
         ("max_completion_tokens", json!(40)),
         ("temperature", json!(0.2)),
         ("top_p", json!(0.9)),
@@ -53,10 +52,8 @@ async fn unsupported_options_are_400_before_any_upstream_call() {
         ("n", json!(1)),
         ("logprobs", json!(false)),
         ("top_logprobs", json!(2)),
-        ("response_format", json!({"type":"json_object"})),
-        ("tools", json!([])),
-        ("tool_choice", json!("none")),
-        ("parallel_tool_calls", json!(false)),
+        ("tool_choice", json!("unsupported")),
+        ("parallel_tool_calls", json!("false")),
         ("functions", json!([])),
         ("function_call", json!("auto")),
         ("stream_options", json!({})),
@@ -106,7 +103,7 @@ async fn stream_validation_precedes_parameter_validation() {
             .oneshot(request(json!({
                 "model": "idoris/daily",
                 "stream": stream,
-                "max_tokens": 40,
+                "temperature": 0.2,
                 "messages": [{"role":"user","content":"hi"}]
             })))
             .await
@@ -131,7 +128,7 @@ async fn message_fields_and_multimodal_content_are_not_dropped() {
         json!(null),
         json!([{"role":"user","content":[{"type":"text","text":"hi"}]}]),
         json!([{"role":"assistant","content":"", "tool_calls":[]}]),
-        json!([{"role":"user","content":"hi","name":"jason"}]),
+        json!([{"role":"user","content":"hi","unknown_field":"jason"}]),
         json!([{"role":"user"}]),
     ] {
         let response = app
