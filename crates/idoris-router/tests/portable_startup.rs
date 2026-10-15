@@ -313,7 +313,7 @@ async fn bundled_config_starts_from_an_unrelated_working_directory() {
             serde_json::json!(0.2),
             "unsupported_parameter",
         ),
-        ("max_tokens", serde_json::json!(64), "unsupported_parameter"),
+        ("max_tokens", serde_json::Value::Null, "unsupported_parameter"),
     ] {
         let mut body = serde_json::json!({
             "model": "idoris/daily",
