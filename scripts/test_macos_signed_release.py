@@ -336,6 +336,218 @@ class NotaryBehavior(unittest.TestCase):
             runner("test timeout", [sys.executable, "-c", "import time; time.sleep(10)"])
 
 
+class MountAndPublishBehavior(unittest.TestCase):
+    def setUp(self):
+        ReleaseBehavior.setUp(self)
+
+    def test_attach_side_effect_then_timeout_detaches_without_publishing(self):
+        fake = AppleDouble()
+
+        def run(stage, argv):
+            if stage == "DMG mount":
+                fake(stage, argv)
+                raise release.ReleaseError("DMG mount: timed out; no deliverable produced")
+            return fake(stage, argv)
+
+        with self.assertRaisesRegex(release.ReleaseError, r"^DMG mount: timed out"):
+            release.release(self.args, run)
+        self.assertEqual(fake.stages[-1], "DMG detach")
+        self.assertEqual(fake.calls[-1][1][:2], ["/usr/bin/hdiutil", "detach"])
+        self.assertFalse(self.args.output.exists())
+        self.assertNotIn("Verified signed", sys.stdout.getvalue())
+
+    def test_attach_failure_without_mount_side_effect_does_not_detach(self):
+        fake = AppleDouble(fail="DMG mount")
+        with self.assertRaisesRegex(release.ReleaseError, "injected tool failure"):
+            release.release(self.args, fake)
+        self.assertNotIn("DMG detach", fake.stages)
+        self.assertFalse(self.args.output.exists())
+
+    def test_preexisting_mount_path_is_not_detached(self):
+        work = self.root / "work"
+        work.mkdir()
+        mount = work / "mounted"
+        mount.mkdir()
+        sentinel = mount / "SENTINEL"
+        sentinel.write_text("unowned")
+        calls = []
+
+        def run(stage, argv):
+            calls.append((stage, argv))
+            return ""
+
+        with self.assertRaisesRegex(release.ReleaseError, "preexisting mount"):
+            release.verify_payload(run, work / "image.dmg", work, "a" * 64, {}, TEAM)
+        self.assertEqual(calls, [])
+        self.assertEqual(sentinel.read_text(), "unowned")
+        self.assertEqual(sorted(p.name for p in mount.iterdir()), ["SENTINEL"])
+
+    def test_detach_failure_preserves_verification_error(self):
+        fake = AppleDouble(corrupt=True)
+
+        def run(stage, argv):
+            result = fake(stage, argv)
+            if stage == "DMG detach":
+                raise release.ReleaseError("DMG detach: tool failed (exit 9); inspect locally with Apple tools")
+            return result
+
+        with self.assertRaises(release.ReleaseError) as caught:
+            release.release(self.args, run)
+        message = str(caught.exception)
+        self.assertIn("DMG payload checksum mismatch", message)
+        self.assertIn("DMG detach: tool failed (exit 9)", message)
+        self.assertLess(message.index("checksum"), message.index("DMG detach"))
+        self.assertFalse(self.args.output.exists())
+        self.assertNotIn("Verified signed", sys.stdout.getvalue())
+
+    def test_detach_failure_preserves_attach_timeout(self):
+        fake = AppleDouble()
+
+        def run(stage, argv):
+            if stage == "DMG mount":
+                fake(stage, argv)
+                raise release.ReleaseError("DMG mount: timed out; no deliverable produced")
+            if stage == "DMG detach":
+                fake(stage, argv)
+                raise release.ReleaseError("DMG detach: tool failed (exit 9); inspect locally with Apple tools")
+            return fake(stage, argv)
+
+        with self.assertRaises(release.ReleaseError) as caught:
+            release.release(self.args, run)
+        message = str(caught.exception)
+        self.assertTrue(message.startswith("DMG mount: timed out; no deliverable produced"))
+        self.assertIn("DMG detach: tool failed (exit 9)", message)
+        self.assertEqual(fake.stages[-1], "DMG detach")
+        self.assertFalse(self.args.output.exists())
+
+    def test_detach_only_failure_is_fatal(self):
+        fake = AppleDouble()
+
+        def run(stage, argv):
+            result = fake(stage, argv)
+            if stage == "DMG detach":
+                raise release.ReleaseError("DMG detach: tool failed (exit 9); inspect locally with Apple tools")
+            return result
+
+        with self.assertRaisesRegex(release.ReleaseError, r"^DMG detach: tool failed \(exit 9\)"):
+            release.release(self.args, run)
+        self.assertFalse(self.args.output.exists())
+        self.assertNotIn("Verified signed", sys.stdout.getvalue())
+
+    def test_directory_cleanup_failure_preserves_mount_timeout(self):
+        fake = AppleDouble()
+
+        def run(stage, argv):
+            if stage == "DMG mount":
+                fake(stage, argv)
+                raise release.ReleaseError("DMG mount: timed out; no deliverable produced")
+            return fake(stage, argv)
+
+        original = tempfile.TemporaryDirectory.cleanup
+
+        def cleanup(directory):
+            if os.path.basename(directory.name).startswith("idoris-sign-"):
+                # Real cleanup detaches its finalizer before rmtree; a failed rmtree
+                # must not leave that finalizer to warn with the local path.
+                directory._finalizer.detach()
+                raise OSError(30, "Read-only file system")
+            return original(directory)
+
+        with patch.object(tempfile.TemporaryDirectory, "cleanup", cleanup):
+            with self.assertRaises(release.ReleaseError) as caught:
+                release.release(self.args, run)
+        message = str(caught.exception)
+        self.assertTrue(message.startswith("DMG mount: timed out; no deliverable produced"))
+        self.assertIn("filesystem cleanup failed", message)
+        self.assertNotIn("Read-only file system", message)
+        self.assertFalse(self.args.output.exists())
+        self.assertNotIn("Verified signed", sys.stdout.getvalue())
+
+    def test_directory_cleanup_failure_without_primary_is_fatal(self):
+        original = tempfile.TemporaryDirectory.cleanup
+
+        def cleanup(directory):
+            if os.path.basename(directory.name).startswith("idoris-sign-"):
+                directory._finalizer.detach()
+                raise OSError(30, "Read-only file system", directory.name)
+            return original(directory)
+
+        with patch.object(tempfile.TemporaryDirectory, "cleanup", cleanup):
+            with self.assertRaisesRegex(release.ReleaseError, "filesystem cleanup failed"):
+                release.release(self.args, AppleDouble())
+        self.assertNotIn(str(self.root), sys.stderr.getvalue())
+        self.assertNotIn("Verified signed", sys.stdout.getvalue())
+
+    def test_existing_output_sentinel_is_untouched(self):
+        self.args.output.mkdir()
+        sentinel = self.args.output / "SENTINEL"
+        sentinel.write_text("other-writer")
+        marker = sentinel.stat().st_ino
+        with self.assertRaises(release.ReleaseError):
+            release.release(self.args, lambda *_: self.fail("unexpected tool invocation"))
+        self.assertEqual(sentinel.read_text(), "other-writer")
+        self.assertEqual(sentinel.stat().st_ino, marker)
+        self.assertEqual([path.name for path in self.args.output.iterdir()], ["SENTINEL"])
+
+    def test_empty_output_collision_is_not_overwritten(self):
+        fake = AppleDouble()
+        armed = {"on": False}
+        collided = {}
+        out = self.args.output
+        real_exists, real_mkdir, real_rename = Path.exists, Path.mkdir, Path.rename
+
+        def exists(path):
+            if armed["on"] and path == out and not real_exists(path):
+                os.mkdir(path)
+                collided["ino"] = path.stat().st_ino
+                return False
+            return real_exists(path)
+
+        def mkdir(path, mode=0o777, parents=False, exist_ok=False):
+            if armed["on"] and path == out and not real_exists(path):
+                os.mkdir(path, mode)
+                collided["ino"] = path.stat().st_ino
+            return real_mkdir(path, mode=mode, parents=parents, exist_ok=exist_ok)
+
+        def rename(path, target):
+            if armed["on"] and target == out and not real_exists(target):
+                os.mkdir(target)
+                collided["ino"] = target.stat().st_ino
+            return real_rename(path, target)
+
+        def run(stage, argv):
+            result = fake(stage, argv)
+            if stage == "DMG detach":
+                armed["on"] = True
+            return result
+
+        with patch.object(Path, "exists", exists), patch.object(Path, "mkdir", mkdir), \
+                patch.object(Path, "rename", rename):
+            with self.assertRaises(release.ReleaseError):
+                release.release(self.args, run)
+        self.assertEqual(out.stat().st_ino, collided["ino"])
+        self.assertEqual(list(out.iterdir()), [])
+        self.assertNotIn("Verified signed", sys.stdout.getvalue())
+
+    def test_partial_publication_keeps_foreign_sentinel_only(self):
+        out = self.args.output
+        real_mkdir = Path.mkdir
+
+        def mkdir(path, mode=0o777, parents=False, exist_ok=False):
+            created = not path.exists()
+            result = real_mkdir(path, mode=mode, parents=parents, exist_ok=exist_ok)
+            if created and path == out:
+                (path / "OTHER_WRITER").write_text("keep")
+            return result
+
+        with patch.object(Path, "mkdir", mkdir):
+            with self.assertRaisesRegex(release.ReleaseError, "output changed during publication"):
+                release.release(self.args, AppleDouble())
+        self.assertEqual([path.name for path in out.iterdir()], ["OTHER_WRITER"])
+        self.assertEqual((out / "OTHER_WRITER").read_text(), "keep")
+        self.assertNotIn("Verified signed", sys.stdout.getvalue())
+
+
 class DigestBehavior(unittest.TestCase):
     def test_empty_and_multi_chunk_files_match_sha256(self):
         with tempfile.TemporaryDirectory() as temp:
