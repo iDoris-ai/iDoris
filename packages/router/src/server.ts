@@ -284,6 +284,7 @@ async function handleChat(
       { messages: toMessages(body.messages) },
       intentDetector,
       deployMode,
+      body.model,
     );
     profile = resolved.profile;
     tenantId = resolved.tenantId;
