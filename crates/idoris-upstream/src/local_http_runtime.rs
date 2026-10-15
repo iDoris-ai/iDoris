@@ -207,6 +207,7 @@ impl LocalHttpRuntimeAdapter {
             })?
             .to_string();
         Ok(ChatResponse {
+            native: None,
             model: self.config.model_id.clone(),
             content,
         })
@@ -381,6 +382,7 @@ mod tests {
         let response = adapter
             .chat(
                 ChatRequest {
+                    native: None,
                     model: "single-model".into(),
                     messages: vec![ChatMessage {
                         role: "user".into(),
@@ -443,6 +445,7 @@ mod tests {
         let error = adapter
             .chat(
                 ChatRequest {
+                    native: None,
                     model: "single-model".into(),
                     messages: vec![],
                 },
@@ -502,6 +505,7 @@ mod tests {
             slow_adapter
                 .chat(
                     ChatRequest {
+                        native: None,
                         model: "single-model".into(),
                         messages: vec![ChatMessage {
                             role: "user".into(),
@@ -526,6 +530,7 @@ mod tests {
         let response = adapter
             .chat(
                 ChatRequest {
+                    native: None,
                     model: "single-model".into(),
                     messages: vec![ChatMessage {
                         role: "user".into(),

@@ -381,7 +381,7 @@ impl OmlxAdapter {
             _ = cancel.cancelled() => Err(BackendError::cancelled()),
             result = call => {
                 let raw = result?;
-                Ok(ChatResponse { model: req.model, content: extract_content(&raw) })
+                Ok(ChatResponse { native: None, model: req.model, content: extract_content(&raw) })
             }
         }
     }
@@ -1129,6 +1129,7 @@ mod tests {
 
     fn chat_request() -> ChatRequest {
         ChatRequest {
+            native: None,
             model: "qwen3-8b".to_string(),
             messages: vec![idoris_backend::ChatMessage {
                 role: "user".to_string(),

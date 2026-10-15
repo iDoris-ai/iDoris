@@ -2315,6 +2315,7 @@ mod tests {
         let err = handle
             .chat(
                 ChatRequest {
+                    native: None,
                     model: "a".to_string(),
                     messages: vec![],
                 },
@@ -2390,6 +2391,7 @@ mod tests {
         let resp = handle
             .chat(
                 ChatRequest {
+                    native: None,
                     model: "a".to_string(),
                     messages: vec![],
                 },
@@ -2700,6 +2702,7 @@ mod tests {
         let err = handle
             .chat(
                 ChatRequest {
+                    native: None,
                     model: "a".to_string(),
                     messages: vec![],
                 },
@@ -2953,6 +2956,7 @@ mod tests {
             _cancel: CancellationToken,
         ) -> Result<ChatResponse, BackendError> {
             Ok(ChatResponse {
+                native: None,
                 model: req.model,
                 content: String::new(),
             })
@@ -3083,6 +3087,7 @@ mod tests {
             _cancel: CancellationToken,
         ) -> Result<ChatResponse, BackendError> {
             Ok(ChatResponse {
+                native: None,
                 model: req.model,
                 content: String::new(),
             })
@@ -3182,6 +3187,7 @@ mod tests {
             _cancel: CancellationToken,
         ) -> Result<ChatResponse, BackendError> {
             Ok(ChatResponse {
+                native: None,
                 model: req.model,
                 content: String::new(),
             })
@@ -3301,6 +3307,7 @@ mod tests {
             .expect("load a should succeed");
         let err = no_hang(handle.chat(
             ChatRequest {
+                native: None,
                 model: "a".to_string(),
                 messages: vec![],
             },
@@ -3338,6 +3345,7 @@ mod tests {
         let chat_a = tokio::spawn(async move {
             h2.chat(
                 ChatRequest {
+                    native: None,
                     model: "a".to_string(),
                     messages: vec![],
                 },
@@ -3375,6 +3383,7 @@ mod tests {
         let chat_a = tokio::spawn(async move {
             h2.chat(
                 ChatRequest {
+                    native: None,
                     model: "a".to_string(),
                     messages: vec![],
                 },
@@ -3393,6 +3402,7 @@ mod tests {
         );
         let err = no_hang(handle.chat(
             ChatRequest {
+                native: None,
                 model: "a".to_string(),
                 messages: vec![],
             },
@@ -3462,6 +3472,7 @@ mod tests {
             assert_eq!(handle.status().await.unwrap().used_gb, 8.0);
             let err = no_hang(handle.chat(
                 ChatRequest {
+                    native: None,
                     model: "a".to_string(),
                     messages: vec![],
                 },
@@ -3548,6 +3559,7 @@ mod tests {
         // a must still genuinely be servable, not just accounted-for.
         no_hang(handle.chat(
             ChatRequest {
+                native: None,
                 model: "a".to_string(),
                 messages: vec![],
             },
@@ -3680,6 +3692,7 @@ mod tests {
             _cancel: CancellationToken,
         ) -> Result<ChatResponse, BackendError> {
             Ok(ChatResponse {
+                native: None,
                 model: req.model,
                 content: String::new(),
             })
@@ -3826,6 +3839,7 @@ mod tests {
             self.chat_entered.notify_one();
             self.release_chat.notified().await;
             Ok(ChatResponse {
+                native: None,
                 model: req.model,
                 content: String::new(),
             })
@@ -3845,6 +3859,7 @@ mod tests {
         let chat = tokio::spawn(async move {
             h.chat(
                 ChatRequest {
+                    native: None,
                     model: "a".into(),
                     messages: vec![],
                 },
@@ -4081,6 +4096,7 @@ mod tests {
             _cancel: CancellationToken,
         ) -> Result<ChatResponse, BackendError> {
             Ok(ChatResponse {
+                native: None,
                 model: req.model,
                 content: String::new(),
             })
@@ -4281,6 +4297,7 @@ mod tests {
             _cancel: CancellationToken,
         ) -> Result<ChatResponse, BackendError> {
             Ok(ChatResponse {
+                native: None,
                 model: req.model,
                 content: String::new(),
             })
@@ -4740,6 +4757,7 @@ mod tests {
             _cancel: CancellationToken,
         ) -> Result<ChatResponse, BackendError> {
             Ok(ChatResponse {
+                native: None,
                 model: req.model,
                 content: String::new(),
             })
