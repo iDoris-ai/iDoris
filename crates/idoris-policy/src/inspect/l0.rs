@@ -16,11 +16,11 @@ use idoris_contracts::inspect::{FindingKind, Sensitivity};
 
 use super::Hit;
 
-/// 身份证前两位：GB/T 2260 省级码，加上 83（台湾居民居住证，地址码 `830000`）。
-/// 8 位台胞证不是这套 18 位号码，这里不识别。
+/// GB/T 2260 省级行政区划码（身份证前两位）。
+/// 83 不在这里：台湾居民居住证只在 18 位路径认地址码 `830000`。
 pub(super) const PROVINCES: &[u8] = &[
     11, 12, 13, 14, 15, 21, 22, 23, 31, 32, 33, 34, 35, 36, 37, 41, 42, 43, 44, 45, 46, 50, 51, 52,
-    53, 54, 61, 62, 63, 64, 65, 71, 81, 82, 83,
+    53, 54, 61, 62, 63, 64, 65, 71, 81, 82,
 ];
 /// GB 11643-1999 / ISO 7064 MOD 11-2 权重与校验码表。
 const ID_WEIGHTS: [u32; 17] = [7, 9, 10, 5, 8, 4, 2, 1, 6, 3, 7, 9, 10, 5, 8, 4, 2];
@@ -265,9 +265,12 @@ fn classify(c: &Candidate<'_>, hits: &mut Vec<Hit>) {
 }
 
 /// 18 位身份证前 17 位：省级区划码 + 合法的 YYYYMMDD 出生日期。
+/// 83 只认台湾居民居住证 `830000`，不接受其它 `83xxxx`，也不进入 15 位旧证。
 fn id_structure(d: &[u8]) -> bool {
     let year = number(&d[6..10]);
-    PROVINCES.contains(&(d[0] * 10 + d[1]))
+    let province = d[0] * 10 + d[1];
+    let province_ok = PROVINCES.contains(&province) || (province == 83 && d[2..6] == [0, 0, 0, 0]);
+    province_ok
         && (1900..=2100).contains(&year)
         && valid_date(year, number(&d[10..12]), number(&d[12..14]))
 }

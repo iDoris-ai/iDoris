@@ -379,8 +379,17 @@ fn taiwan_resident_830000_follows_id_checksum_rules() {
     );
     assert_eq!(missing.action, InspectAction::Block);
     assert_eq!(missing.findings, downgraded.findings);
-    // 8-digit Taiwan permits are a different document and are not detected.
-    for input in ["83000019", "01234567"] {
+    // 83 only means the 18-digit 830000 resident ID. Other 83xxxx addresses,
+    // 15-digit legacy numbers, and 8-digit permits stay public.
+    for input in [
+        "830105199001011231",
+        "830105.19900101.1231",
+        "831100199001011230",
+        "830000900101123",
+        "830105900101123",
+        "83000019",
+        "01234567",
+    ] {
         let response = inspect(input, &open_ctx());
         assert_eq!(response.action, InspectAction::Allow, "{input}");
         assert!(response.findings.is_empty(), "{input}: {response:?}");
