@@ -4,16 +4,18 @@ use crate::catalog::{Catalog, CatalogModel};
 use crate::probe::HostFacts;
 
 use super::quant::{lowest_footprint_pick, pick_quant};
-use super::resident::budget_breakdown;
-use super::types::{RecommenderPolicy, ResidentChoice, TempChoice, TempResult, TempStatus};
+use super::types::{
+    BudgetBreakdown, RecommenderPolicy, ResidentChoice, TempChoice, TempResult, TempStatus,
+};
 
 pub fn temp_admission(
     catalog: &Catalog,
     host: &HostFacts,
     policy: &RecommenderPolicy,
     resident: Option<&ResidentChoice>,
+    budget: &BudgetBreakdown,
 ) -> TempResult {
-    let usable = budget_breakdown(host, policy).usable_gb;
+    let usable = budget.usable_gb;
     let resident_footprint = resident.map_or(0.0, |choice| choice.footprint_gb);
     let remaining = usable - resident_footprint;
     let mut choices = Vec::new();
@@ -24,7 +26,21 @@ pub fn temp_admission(
             continue;
         };
         let key = capability_key(*capability);
-        if let Some(quant) = pick_quant(model, remaining, policy, policy.quality_threshold) {
+        let fitting = pick_quant(model, remaining, policy, policy.quality_threshold);
+        let fits_quality_and_remaining = fitting.is_some();
+        let Some(quant) = fitting.or_else(|| {
+            pick_quant(model, usable, policy, policy.quality_threshold)
+                .or_else(|| lowest_footprint_pick(model, policy))
+        }) else {
+            continue;
+        };
+        // `blocked_choices` exposes these models as unavailable. Eviction cannot
+        // increase the allocation. Preserve the unbudgeted TS fixture exception.
+        let allocated = budget.allocated_budget_bytes.is_some();
+        if allocated && quant.footprint_gb > usable {
+            continue;
+        }
+        if fits_quality_and_remaining || (allocated && quant.footprint_gb <= remaining) {
             choices.push(TempChoice {
                 id: model.id.clone(),
                 capability: *capability,
@@ -39,11 +55,6 @@ pub fn temp_admission(
             continue;
         }
 
-        let Some(quant) = pick_quant(model, usable, policy, policy.quality_threshold)
-            .or_else(|| lowest_footprint_pick(model, policy))
-        else {
-            continue;
-        };
         warnings.push(format!(
             "{key}: {} 需驱逐常驻（{:.2}GB > 剩余 {:.2}GB）",
             model.id, quant.footprint_gb, remaining

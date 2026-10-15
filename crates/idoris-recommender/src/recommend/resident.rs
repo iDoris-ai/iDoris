@@ -11,11 +11,22 @@ use super::types::{
     TEMP_SLOT_RESERVE_GB,
 };
 
-pub fn budget_breakdown(host: &HostFacts, policy: &RecommenderPolicy) -> BudgetBreakdown {
-    let reserve_gb = apple_reserve_gb(host.ram_gb);
-    let usable_gb = apple_usable_gb(host.ram_gb, policy.wired_mode);
+/// Convert external integer bytes to decimal GB once, without a second OS reserve.
+pub fn budget_breakdown(
+    host: &HostFacts,
+    policy: &RecommenderPolicy,
+    allocated_budget_bytes: Option<u64>,
+) -> BudgetBreakdown {
+    let (reserve_gb, usable_gb) = match allocated_budget_bytes {
+        Some(bytes) => (0.0, bytes as f64 / 1_000_000_000.0),
+        None => (
+            apple_reserve_gb(host.ram_gb),
+            apple_usable_gb(host.ram_gb, policy.wired_mode),
+        ),
+    };
     let temp_reserve_gb = f64::from(policy.temp_slots) * TEMP_SLOT_RESERVE_GB;
     BudgetBreakdown {
+        allocated_budget_bytes,
         reserve_gb,
         usable_gb,
         temp_reserve_gb,
@@ -27,10 +38,12 @@ pub fn blocked_choices(
     catalog: &Catalog,
     host: &HostFacts,
     policy: &RecommenderPolicy,
+    budget: &BudgetBreakdown,
 ) -> Result<Vec<BlockedChoice>, ResidentError> {
     let mut blocked = Vec::new();
     for model in &catalog.catalog {
-        if host.ram_gb >= model.min_ram_gb {
+        let below_min_ram = host.ram_gb < model.min_ram_gb;
+        if !below_min_ram && budget.allocated_budget_bytes.is_none() {
             continue;
         }
         let pick = lowest_footprint_pick(model, policy).ok_or_else(|| {
@@ -38,11 +51,21 @@ pub fn blocked_choices(
                 id: model.id.clone(),
             }
         })?;
+        let reason = if below_min_ram {
+            format!("min_ram_gb={} > ram_gb={}", model.min_ram_gb, host.ram_gb)
+        } else if pick.footprint_gb > budget.usable_gb {
+            format!(
+                "minimum footprint {:.9}GB > allocated total {:.9}GB",
+                pick.footprint_gb, budget.usable_gb
+            )
+        } else {
+            continue;
+        };
         blocked.push(BlockedChoice {
             id: model.id.clone(),
             min_ram_gb: model.min_ram_gb,
             estimated_memory_gb: pick.footprint_gb,
-            reason: format!("min_ram_gb={} > ram_gb={}", model.min_ram_gb, host.ram_gb),
+            reason,
         });
     }
     Ok(blocked)
@@ -52,10 +75,11 @@ pub fn choose_resident(
     catalog: &Catalog,
     host: &HostFacts,
     policy: &RecommenderPolicy,
+    budget: &BudgetBreakdown,
 ) -> Option<ResidentChoice> {
     let daily = CatalogRole::new(Role::Daily).ok()?;
     let candidates = role_candidates(catalog, daily, None, Some(host.ram_gb));
-    let budget = budget_breakdown(host, policy).resident_budget_gb;
+    let budget = budget.resident_budget_gb;
     let mut best: Option<ResidentChoice> = None;
 
     for id in candidates {
