@@ -1,6 +1,7 @@
 # 73 个历史 PR 的逐项核对与承接
 
 核对日期：2026-10-15；比较主线 `03c079c70611331a8c85a1666e32a75df6359d09`。
+行动记录更新至 main `08405ea968bcb919d48cabab535ab0337ecb3ace`；全量表保留原核对基线。
 
 范围是核对开始时的 73 个开放 PR；#423/#482 已在前一轮关闭；新建 #507/#508 等另计。原始分类为 62 个 M5、8 个 M4 收尾候选、3 个历史/CI 记录。逐项读取 slice、源码/测试、后续承接、精确 head、review 与 base 消费关系；73/73 编号覆盖且无重复。此清单不是逐 PR 重跑全部测试或新的 GitHub APPROVE。
 
@@ -9,7 +10,7 @@
 - 沿栈继承不等于替代：功能尚未进入 main 的 M5 切片继续开发。
 - 完整活跃替代 PR 可以承接旧 PR 的审查；关闭旧 PR 不代表替代已合并或已发布。
 - 仍有开放 PR 依赖的 base 分支保留。四个已无消费者和 checkout 的远端分支在完整祖先与备份验证后删除；无强推或批量 rebase。
-- #425 已以58a7edb修复契约不变量；#479 已以b8f3214修复completion cap，两者均重新等待远程review/CI。
+- #425 已修复契约不变量，并以 a5b3272 同步已审核的依赖安全修复；#479 的 nullable cap 修复已获 e3426f6 精确 head 批准，预算父层同步安全补丁后仍需新 head CI/复审。
 - M5 的 REDACT 仍需 iDoris 本地控制台中用户逐次、单次确认；长期/调用方授权暂不启用。
 
 ## 重复与历史 PR 的承接清单
@@ -25,13 +26,15 @@
 | [#487](https://github.com/iDoris-ai/iDoris/pull/487) | 由 main 的0.3.0版本与 #507 的迁移文档/隔离smoke完整承接。 | 已关闭；无消费者远端分支已归档后删除 |
 | [#488](https://github.com/iDoris-ai/iDoris/pull/488) | 由 #508 的显式上限及正反用例、#507 的新Personal数据库/模式切换说明承接。 | 已关闭；保留分支 |
 
-关闭后，原73项剩余65个审查入口：60个M5功能/测试切片、#491的M5 CI配套，以及4个M4测试收尾。新建PR另计。M5已归入 [GitHub里程碑](https://github.com/iDoris-ai/iDoris/milestone/1)，M4接线收尾归入 [v0.3.1](https://github.com/iDoris-ai/iDoris/milestone/2)。
+| [#483](https://github.com/iDoris-ai/iDoris/pull/483) | 独有 CLI/reopen/非法 tenant 绑定及持久化矩阵由 [#513](https://github.com/iDoris-ai/iDoris/pull/513) 迁移，已合入 main 027a92c。 | 已关闭；仍有消费者的 base 保留 |
+| [#484](https://github.com/iDoris-ai/iDoris/pull/484) | 字节边界和真实绑定 fixture 由 [#513](https://github.com/iDoris-ai/iDoris/pull/513) 迁移；没有以 UTF-16 限制替换字节限制。 | 已关闭；仍有消费者的 base 保留 |
+| [#496](https://github.com/iDoris-ai/iDoris/pull/496) | 预算事件失败 503、零 POST、账本恢复矩阵由 [#514](https://github.com/iDoris-ai/iDoris/pull/514) 迁移，已合入 main 92cd184。 | 已关闭；仍有消费者的 base 保留 |
+
+关闭后，原73项已关闭11项，剩余62个审查入口：60个M5功能/测试切片、#491的M5 CI配套，以及#485一个M4测试尾项。新建PR另计。M5已归入 [GitHub里程碑](https://github.com/iDoris-ai/iDoris/milestone/1)，M4接线收尾归入 [v0.3.1](https://github.com/iDoris-ai/iDoris/milestone/2)。
 
 ## 仍需继续的收尾
 
-- #483/#484：保留 CLI/reopen/非法 tenant 绑定及 fixture 的独有测试；不能把 UTF-16 限制直接替换当前字节限制。
-- #485：生产保护由 main+#508 覆盖；旧九端点拒绝/缺 authenticator 矩阵仍需逐项移植验证。
-- #496：预算事件追加失败时 503、零 POST、余额恢复的独有测试仍需移植。
+- #485：九端点拒绝/缺 authenticator 独立矩阵已迁移到 [#515](https://github.com/iDoris-ai/iDoris/pull/515)，本地独立验收通过；515 尚未合入，原485保持开放，不提前删除依赖 base。
 - #491 含实际 fixture/CI 代码，不能因标题是 docs 就关闭；作为 M5 CI 配套继续承接。
 
 ## 全量逐 PR 结果（核对基线）
@@ -122,7 +125,9 @@
 - #464/#466/#486/#487 的远端临时分支已删除：逐个确认没有开放 base 消费者、没有 checkout，旧 head 是对应 #476/#493/#496 的祖先，并先验证完整 bundle 备份。四个本地分支不存在或与远端不同，未强删本地分支。
 - 字节预算修复已按后端和 Router 两层提交 #511/#512；逐模型整数 charge/CAS 的完整组合通过独立公开 dispatch 及生命周期复核，仍待当前 head 的远程 review/CI 和主线验收，尚未发布。
 - #508 已获精确 head 批准且9/9 CI通过，合并至 main 959337d；v0.3.0 标签仍指向03c079c，不把主线修复误写进已发布归档。
-- #479 的 b8f3214 又发现显式 null 的兼容性回归，正在修复；#425 的两项 Rust CI 失败来自旧分支上的依赖安全检查，等待同步修复。两项都不能因本地针对性测试通过就视为最终完成。
+- #479 显式 null 回归已由 e3426f6 修复并获精确 head PRD 批准。旧预算栈的依赖安全失败由父层 #478 的22edaf1承接：与 #425 a5b3272 的两文件补丁 stable patch-id 相同；离线 advisories 与 locked cargo check 通过。#479/#517 按父子顺序同步后重新等待 CI/复审，未把 whole main 合入 M5 栈。
+- [#517](https://github.com/iDoris-ai/iDoris/pull/517) 以严格拒绝非单 completion 修复 n 报价缺口；n省略/null/整数1保留，其他值400且零POST。原实现负控200，修复后43预算及4参数测试通过；尚未合并。其旧head另有CLI malformed launcher token CI失败，根因未由现有日志证明，不能宣称已修复。
+- 实际 main 08405ea 的 macOS M4 Rust 基线验收通过：1242项 workspace 测试、严格 workspace clippy、fmt与diff检查。此证据不包含尚未合入的031接线，也不证明Agent24端到端/真机验收或031发布。
 - #464/#466/#486/#487 的删除时间为2026-10-15 07:44Z。原提交可分别用 `git fetch origin refs/pull/464/head`（替换为对应PR编号）取回，再以 `git show FETCH_HEAD` 检查；本地完整备份也已验证。
 - 本轮传播时，#481 的 head 分支（#489 的 base）快进到 ff45e24，原81c2e75仍是祖先；后续合法快进以远端即时状态为准。#422/#462/#488在本次检查时仍位于原 head，不承诺分支名永久存在。
 
@@ -145,9 +150,9 @@ FU-208–224 继续使用原编号；下表只更新承接，历史“已发布�
 | FU-215 | #480/#492/#497；broker响应检查纯核心，运行时接线未闭环 |
 | FU-216 | #481→#508；四端点缓存撤销测试 |
 | FU-217 | #482已关闭；当前M4验收已在实际main完成 |
-| FU-218 | #483–#486；保护/测试逐项承接，483/484/485独有矩阵仍待移植 |
-| FU-219 | #484；真实绑定fixture仍待对账 |
-| FU-220 | #485→main+#508保护；额外拒绝矩阵待移植 |
+| FU-218 | #483–#486；保护/测试逐项承接，483/484经513落main；485由515承接待合并 |
+| FU-219 | #484→#513；真实绑定fixture已迁移落main |
+| FU-220 | #485→main+#508保护；额外拒绝矩阵已在515待审 |
 | FU-221 | #486→#508；三个组合验收测试承接 |
 | FU-222 | #487→main版本+#507迁移文档 |
 | FU-223 | #487→#507隔离smoke；历史默认DB原预算未知，见下方 |
@@ -157,8 +162,8 @@ FU-208–224 继续使用原编号；下表只更新承接，历史“已发布�
 
 ## 继续推进的顺序
 
-1. #507/#508 与实际字节预算准入先完成独立 review/CI；两仓真实接线及 v0.3.1 发布仍需组合验收。
-2. M5 并行修 #425 契约验证；#479已推送修复，等待新head复审；将后续已验证的修复移入被阻断原切片，逐步收敛父子 review。
+1. #508/#513/#514已合入main；#507/#510与预算#511→#512按精确新head批准、CI绿、CLEAN三门合入。base推进先Update branch，reviewing时不push。两仓真实接线及v0.3.1仍需组合验收。
+2. M5保留本地用户单次REDACT确认边界；#478依赖安全修复→#479 nullable cap→#517 n限制沿原依赖同步并复审，不扩大advisory忽略项；其余已验证修复逐层移回原切片。
 3. 保留 #476 作为历史集成快照，不把所有后代倒灌回它；在源分支已验证后再规划新的组合验收，不能凭 CI 绿批量合并。
 4. 便宜状态检查默认5分钟；不启动本机 PR Review Watcher，不使用 Fast/priority。
 
