@@ -58,6 +58,24 @@ ALL_ROLES = ['fast', 'daily', 'deep', 'vision', 'embed', 'rerank', 'decide', 'au
 CANARY_PORTS = {'omlx-default-8000': 8000, 'ollama-default-11434': 11434}
 EXIT_PASS, EXIT_FAIL, EXIT_TOOL, EXIT_BLOCKED, EXIT_RED = 0, 1, 2, 3, 10
 
+def parse_canary_ports(raw):
+    """None => defaults. Explicit JSON object {name: port} replaces the whole map."""
+    if raw is None or raw == '':
+        return None
+    try:
+        data = json.loads(raw)
+    except ValueError as e:
+        raise ToolError('--canary-ports must be JSON object of name->port: %s' % e)
+    if not isinstance(data, dict) or not data:
+        raise ToolError('--canary-ports must be a non-empty JSON object of name->port')
+    out = {}
+    for k, v in data.items():
+        if not isinstance(k, str) or not isinstance(v, int) or isinstance(v, bool) or not (1 <= v <= 65535):
+            raise ToolError('--canary-ports values must be port integers 1..65535')
+        out[k] = v
+    return out
+
+
 REQUIRED_INTERFACE = [
     'ModelRouter/provider registry accepts an optional IDORIS_URL (+ IDORIS_API_KEY) slot; unset => behaviour unchanged.',
     'Two logical providers: idoris-local (fixed X-iDoris-Privacy: local_only) and idoris-any (fixed any).',
@@ -156,14 +174,24 @@ class Fixture:
 
 # --------------------------------------------------------------------------- canaries
 class Canaries:
-    """Listeners on well-known direct-backend loopback ports; any connection is a bypass."""
+    """Listeners on well-known direct-backend loopback ports; any connection is a bypass.
 
-    def __init__(self):
-        self.hits = {k: [] for k in CANARY_PORTS}
+    Default ports are the product facts (oMLX :8000, Ollama :11434). A caller may
+    pass an explicit ports map to bind dedicated free ports instead; that limits
+    proof to those ports and must be reported accurately — it does not invent
+    coverage of the default ports.
+    """
+
+    def __init__(self, ports=None):
+        self.ports = dict(ports) if ports is not None else dict(CANARY_PORTS)
+        self.default_ports = dict(CANARY_PORTS)
+        self.using_defaults = self.ports == self.default_ports
+        self.hits = {k: [] for k in self.ports}
         self.unavailable = {}
-        self.socks, self.threads = {}, []
+        self.bound = {}
+        self.socks, self.threads = [], []
         self.stop = False
-        for name, port in CANARY_PORTS.items():
+        for name, port in self.ports.items():
             s = socket.socket()
             s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             try:
@@ -174,7 +202,8 @@ class Canaries:
                 s.close()
                 self.unavailable[name] = str(e)
                 continue
-            self.socks[name] = s
+            self.bound[name] = port
+            self.socks.append(s)
             t = threading.Thread(target=self._serve, args=(name, s), daemon=True)
             t.start()
             self.threads.append(t)
@@ -200,7 +229,7 @@ class Canaries:
         self.stop = True
         for t in self.threads:
             t.join(3)
-        for s in self.socks.values():
+        for s in self.socks:
             s.close()
 
 
@@ -358,6 +387,31 @@ class ToolError(Exception):
 
 
 # --------------------------------------------------------------------------- run the consumer
+def _pid_state(pid):
+    """Return (alive: bool, state: str|None). alive False means ESRCH / fully gone.
+
+    Zombies (state Z) still count as alive until reaped — callers must wait them out
+    or treat lingering Z as incomplete cleanup. No global pkill; only this pid.
+    """
+    if pid <= 0:
+        return False, None
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False, None
+    except PermissionError:
+        return True, 'EPERM'
+    # Linux: /proc/<pid>/stat state char; other platforms: best-effort alive only.
+    try:
+        with open(f'/proc/{pid}/stat', encoding='utf-8') as f:
+            # comm may contain spaces/parens; state is after the last ')'
+            body = f.read().rsplit(')', 1)[-1].strip()
+            state = body.split()[0] if body else '?'
+            return True, state
+    except OSError:
+        return True, 'alive'
+
+
 def run_consumer(argv, env, cwd, timeout):
     t0 = time.monotonic()
     p = subprocess.Popen(argv, env=env, cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
@@ -369,11 +423,17 @@ def run_consumer(argv, env, cwd, timeout):
         timed_out = True
         with contextlib.suppress(ProcessLookupError):
             os.killpg(p.pid, signal.SIGKILL)
-        out, err = p.communicate()
+        try:
+            out, err = p.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(p.pid, signal.SIGKILL)
+            out, err = p.communicate()
     with contextlib.suppress(ProcessLookupError):  # reap stragglers in the group
         os.killpg(p.pid, signal.SIGKILL)
     return {'exit_code': None if timed_out else p.returncode, 'timed_out': timed_out,
-            'seconds': round(time.monotonic() - t0, 2), 'stdout': out, 'stderr': err}
+            'seconds': round(time.monotonic() - t0, 2), 'stdout': out, 'stderr': err,
+            'session_pid': p.pid}
 
 
 def child_env(home, tap_url, key, args):
@@ -404,9 +464,12 @@ def acceptance(args, scrub):
               'scenarios': [], 'coverage_gaps': [], 'required_interface_for_green': REQUIRED_INTERFACE}
     if args.agent24_source:
         report['static'] = static_scan(Path(args.agent24_source))
+    plat = sys.platform
     report['coverage_gaps'] += [
-        'Linux-only run; macOS/Windows not exercised.',
-        'Cloud-direct bypass is not observable: only loopback canaries (:8000 oMLX, :11434 Ollama) are counted.',
+        (f'Fixture/tool plumbing exercised on sys.platform={plat} only. '
+         'This is not real-engine proof for other platforms; macOS/Windows engine '
+         'evidence, if any, is external-reported and not claimed by this cloud/Linux run.'),
+        'Cloud-direct bypass is not observable: only loopback canaries (:8000 oMLX, :11434 Ollama by default) are counted.',
         'Fixture stands in for oMLX/Ollama; real model quality/lifecycle not tested.',
         'Tap buffers responses: SSE streaming path is not covered.',
         'Agent24 behaviour is judged from process exit, captured output and wire traffic only; its internal tripwire code is not inspected by this tool.']
@@ -423,9 +486,22 @@ def acceptance(args, scrub):
     if not os.access(agent_bin, os.X_OK):
         raise ToolError('--agent24-bin is not executable')
 
-    fixture, canaries, gw, tap = Fixture(), Canaries(), None, None
+    canary_ports = parse_canary_ports(getattr(args, 'canary_ports', None))
+    fixture, canaries, gw, tap = Fixture(), Canaries(canary_ports), None, None
+    report['canaries'] = {
+        'requested_ports': dict(canaries.ports),
+        'bound_ports': dict(canaries.bound),
+        'unavailable': dict(canaries.unavailable),
+        'using_default_ports': canaries.using_defaults,
+    }
+    if not canaries.using_defaults:
+        report['coverage_gaps'].append(
+            'Caller overrode canary ports; bypass proof is limited to the requested ports only '
+            f'({canaries.ports!r}), not the default oMLX:8000 / Ollama:11434 product facts.')
     for name, why in canaries.unavailable.items():
-        report['coverage_gaps'].append(f'canary {name} not bound ({why}); bypass to that port unobservable.')
+        report['coverage_gaps'].append(
+            f'canary {name} not bound on port {canaries.ports.get(name)} ({why}); '
+            'bypass to that port is unobservable on this run.')
     with tempfile.TemporaryDirectory(prefix='a24-idoris-') as tmp:
         root = Path(tmp)
         scrub.add_path(root, '<tmp>')
@@ -488,6 +564,17 @@ def acceptance(args, scrub):
     if report['static'] and not report['static']['idoris_url_provider_found'] and report['verdict'] == 'PASS':
         report['coverage_gaps'].append('Static scan found no IDORIS_URL literal although dynamic run passed '
                                        '(provider may use another config name; review).')
+    # L2: never PASS when any requested canary failed to bind — bypass would be invisible.
+    unavailable = (report.get('canaries') or {}).get('unavailable') or {}
+    if unavailable and report.get('verdict') == 'PASS':
+        requested = (report.get('canaries') or {}).get('requested_ports') or {}
+        missing = ', '.join(f'{n}@{requested.get(n)}' for n in sorted(unavailable))
+        report['verdict'] = 'BLOCKED'
+        report['reason'] = (
+            f'direct-backend canary bind incomplete ({missing}); '
+            'bypass detection coverage is limited — refusing PASS. '
+            'Do not terminate existing Ollama/oMLX; free those ports, or pass '
+            '--canary-ports with dedicated loopback ports (proof then limited to those ports).')
     return report
 
 
@@ -631,7 +718,7 @@ def mk_args(**kw):
                             agent24_source=None, agent24_call_cmd=None, agent24_cwd=None, agent24_env=[],
                             url_env='IDORIS_URL', key_env='IDORIS_API_KEY', call_timeout=20,
                             expect_privacy='local_only', record_id_in_output=True, report_json=None, self_test=False,
-                            stub_consumer=None)
+                            stub_consumer=None, canary_ports=None)
     ns.__dict__.update(kw)
     return ns
 
@@ -667,13 +754,50 @@ class SelfTest(unittest.TestCase):
             self.assertTrue(static_scan(Path(d))['idoris_url_provider_found'])
 
     def test_timeout_kills_process_group(self):
-        marker = tempfile.mktemp()
-        script = f'import subprocess,time;subprocess.Popen(["sleep","30"]);open({marker!r},"w").write("x");time.sleep(30)'
+        """Prove run_consumer killpg reaps the grandchild, not only the parent session leader.
+
+        Writes the grandchild PID before sleeping. After timeout cleanup, waits for that
+        exact PID to leave the process table (or become a short-lived zombie that then
+        disappears). PID-reuse is avoided by capturing the PID before kill and requiring
+        ESRCH / gone — never assuming stop just because the parent exited.
+        """
+        pid_file = tempfile.mktemp(prefix='a24-gpid-')
+        script = (
+            'import subprocess, time\n'
+            f'p = subprocess.Popen(["sleep", "30"])\n'
+            f'open({pid_file!r}, "w").write(str(p.pid))\n'
+            'time.sleep(30)\n'
+        )
         t0 = time.monotonic()
         res = run_consumer([sys.executable, '-I', '-c', script], {'PATH': os.environ['PATH']}, '/', 1.5)
-        self.assertTrue(res['timed_out'])
-        self.assertLess(time.monotonic() - t0, 6)
-        os.unlink(marker)
+        self.assertTrue(res['timed_out'], res)
+        self.assertLess(time.monotonic() - t0, 8)
+        # Parent session may exit before grandchild; require the recorded PID to go away.
+        deadline = time.monotonic() + 8
+        gpid = None
+        while time.monotonic() < deadline and gpid is None:
+            try:
+                gpid = int(Path(pid_file).read_text().strip())
+            except (OSError, ValueError):
+                time.sleep(0.05)
+        self.assertIsNotNone(gpid, 'grandchild PID was never recorded')
+        gone = False
+        states_seen = []
+        while time.monotonic() < deadline:
+            alive, state = _pid_state(gpid)
+            if state:
+                states_seen.append(state)
+            if not alive:
+                gone = True
+                break
+            time.sleep(0.05)
+        with contextlib.suppress(OSError):
+            os.unlink(pid_file)
+        self.assertTrue(
+            gone,
+            f'grandchild pid={gpid} still present after killpg; states={states_seen[-5:]}. '
+            'Container/root hosts may reap zombies slowly; this failure means the process '
+            'group was not cleaned up (parent exit alone is not enough).')
 
     def test_scrubber(self):
         s = Scrubber()
@@ -704,6 +828,25 @@ class SelfTest(unittest.TestCase):
         self.assertEqual(r['verdict'], 'RED')
         self.assertIn('BYPASS', r['reason'])
 
+    def test_occupied_default_canary_refuses_pass(self):
+        """L2: if a default canary port cannot bind, verdict must not be PASS."""
+        self.need_bin()
+        holders = []
+        try:
+            for port in CANARY_PORTS.values():
+                s = socket.socket()
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                s.bind(('127.0.0.1', port))
+                s.listen(1)
+                holders.append(s)
+            r = self.run_mode('conformant')
+            self.assertEqual(r['verdict'], 'BLOCKED', r.get('reason'))
+            self.assertTrue(r.get('canaries', {}).get('unavailable'), r.get('canaries'))
+            self.assertNotEqual(r['verdict'], 'PASS')
+        finally:
+            for s in holders:
+                s.close()
+
     def test_noop_stub_is_red_not_implemented(self):
         self.need_bin()
         r = self.run_mode('noop')
@@ -729,6 +872,10 @@ def main(argv=None):
                    help='skip the check that Agent24 output shows the Record-Id')
     p.add_argument('--call-timeout', type=float, default=60, help='seconds per Agent24 call before kill')
     p.add_argument('--report-json', help='write the sanitized report here (default: stdout)')
+    p.add_argument('--canary-ports', default=None,
+                   help='JSON object overriding canary name->port (limits bypass proof to those ports; '
+                        'default remains oMLX:8000 and Ollama:11434). Use when defaults are occupied; '
+                        'do not kill existing services.')
     p.add_argument('--self-test', action='store_true', help='prove this tool with stub consumers (not Agent24)')
     p.add_argument('--stub-consumer', choices=['conformant', 'ignore_locality', 'bypass', 'noop'], help=argparse.SUPPRESS)
     args, rest = p.parse_known_args(argv)
@@ -740,8 +887,13 @@ def main(argv=None):
         SelfTest.idoris_bin = args.idoris_bin
         suite = unittest.defaultTestLoader.loadTestsFromTestCase(SelfTest)
         res = unittest.TextTestRunner(verbosity=2).run(suite)
-        print(f'SELF-TEST ran={res.testsRun} failures={len(res.failures)} errors={len(res.errors)} skipped={len(res.skipped)}')
-        return EXIT_PASS if res.wasSuccessful() else EXIT_FAIL
+        n_fail, n_err, n_skip = len(res.failures), len(res.errors), len(res.skipped)
+        print(f'SELF-TEST ran={res.testsRun} failures={n_fail} errors={n_err} skipped={n_skip} '
+              f'successful={res.wasSuccessful()} idoris_bin={"yes" if args.idoris_bin else "no"}')
+        # L3: incomplete/skipped self-test must not exit 0 (wasSuccessful ignores skips).
+        if n_skip or n_fail or n_err or not res.wasSuccessful():
+            return EXIT_FAIL
+        return EXIT_PASS
     scrub = Scrubber()
     needs_bin = bool(args.agent24_bin and args.agent24_call_cmd)
     if needs_bin and not args.idoris_bin:
