@@ -198,6 +198,7 @@ mod tests {
                 return Err(UpstreamError::timeout());
             }
             Ok(ChatResponse {
+                native: None,
                 model: "test-model".to_string(),
                 content: "ok".to_string(),
             })
@@ -219,6 +220,7 @@ mod tests {
 
     fn request() -> ChatRequest {
         ChatRequest {
+            native: None,
             model: "test-model".to_string(),
             messages: vec![ChatMessage {
                 role: "user".to_string(),

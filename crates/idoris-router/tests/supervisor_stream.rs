@@ -123,6 +123,7 @@ async fn stream_false_uses_buffered_omlx_completion() {
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "model": "omlx",
             "choices": [{"message": {"content": "buffered answer"}}]
         })))
         .mount(&upstream)
