@@ -40,8 +40,8 @@ python3 scripts/macos_signed_release.py \
 2. 复制 CLI 和配置；用 `codesign --timestamp --options runtime` 签 CLI，验证严格签名、team、authority、timestamp、runtime。
 3. `hdiutil create -format UDZO` 生成 UDIF DMG，再用同一 identity 和 timestamp 签 DMG 并核对签名。
 4. `notarytool submit --keychain-profile … --output-format json`，只将上传响应中的有效 submission UUID 视为收据，立即调用 `info` 再查询直到 `Accepted`；拒绝、未知状态、坏 JSON、ID 不一致或超时均停止。默认每 15 秒查询、接受期限一小时，这是一次发布的公证事务轮询，不是 LoopX 定时状态检查。
-5. staple、validate、再次严格核对 DMG 签名、`hdiutil verify` 和 `spctl` open assessment；只读挂载，核对 CLI/四配置内容哈希、CLI 签名和公证状态，再 detach。
-6. **最后**计算附票后 DMG 的 SHA256，写 checksum 与公开 manifest，然后将产物目录移到最终输出位置。manifest 同时记录输入与签名后 CLI SHA256、配置 SHA256、source/version 声明、submission UUID 和实际通过的工具检查。
+5. staple、validate、再次严格核对 DMG 签名、`hdiutil verify` 和 `spctl` open assessment；只读挂载，核对 CLI/四配置内容哈希、CLI 签名和公证状态，再 detach。attach 发生挂载副作用后即使超时也尽力 detach 本次挂载；主错误保留，清理错误追加。已有挂载路径直接拒绝，不卸载别人的挂载。
+6. **最后**计算附票后 DMG 的 SHA256，写 checksum 与公开 manifest，随后以独占 mkdir 预留最终输出目录，再用 O_EXCL 复制三个产物并复核摘要与 manifest；遇到目录竞争时失败，不覆盖现有内容。失败只清理本次创建的未完成文件，保留其他写者的 sentinel。manifest 同时记录输入与签名后 CLI SHA256、配置 SHA256、source/version 声明、submission UUID 和实际通过的工具检查。
 
 输出名称固定为 `idoris-v0.3.1-aarch64-apple-darwin.dmg`、同名 `.sha256`、`.manifest.json`（架构/版本随显式参数变化）。签名时间、公证票据和文件系统使字节不保证可复现；固定的是名称和输入来源约束。manifest 本身不是签名证明，下载者应检查 DMG 签名/附票以及可信来源的 checksum。
 
