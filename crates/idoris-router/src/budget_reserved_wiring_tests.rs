@@ -271,3 +271,81 @@ async fn paid_proxy_records_budget_reservation_before_dispatch() {
     assert!(after.available_minor < before.available_minor);
     upstream.verify().await;
 }
+
+#[tokio::test]
+async fn paid_proxy_budget_event_failure_releases_before_upstream() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&upstream)
+        .await;
+    let (budget_dir, ledger) = super::tests::configured_budget_ledger(1_000_000);
+    let ledger = Arc::new(ledger);
+    // Sharing the fixture DB lets the failing trigger observe the real reservation.
+    let db = budget_dir.path().join("b.sqlite3");
+    let event_log = Arc::new(EventLogStore::open(&db).unwrap());
+    Connection::open(&db)
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER fail_proxy_budget_reserved BEFORE INSERT ON event_log_events \
+             WHEN NEW.event_type='budget.reserved' AND EXISTS (\
+             SELECT 1 FROM reservations WHERE tenant_id=NEW.tenant_id \
+             AND provider_id=json_extract(NEW.metadata,'$.provider_id') \
+             AND reserved_minor=json_extract(NEW.metadata,'$.reserved_minor') \
+             AND reserved_minor>0 AND status='active') \
+             BEGIN SELECT RAISE(ABORT,'fail budget'); END;",
+        )
+        .unwrap();
+    let before = ledger.tenant_readview(budget::PERSONAL_TENANT_ID).unwrap();
+    let mut card = super::tests::resident_component_card("paid-proxy", &upstream.uri());
+    card.provider.cost = super::tests::paid_component_card("paid-proxy")
+        .provider
+        .cost;
+    let response = build_app(AppState {
+        cards: vec![card],
+        budget_ledger: Some(ledger.clone()),
+        event_log: Some(event_log.clone()),
+        ..AppState::default()
+    })
+    .oneshot(super::tests::post_chat(
+        r#"{"model":"idoris/daily","messages":[{"role":"user","content":"proxy"}]}"#,
+        &[],
+    ))
+    .await
+    .unwrap();
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        budget_event_count(&events_for_response(&event_log, &response)),
+        0
+    );
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["error"]["reason_code"], "EVENT_LOG_APPEND_UNAVAILABLE");
+    let reservation: (String, String, i64, String) = Connection::open(&db)
+        .unwrap()
+        .query_row(
+            "SELECT tenant_id,provider_id,reserved_minor,status FROM reservations",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(reservation.0, budget::PERSONAL_TENANT_ID);
+    assert_eq!(reservation.1, "paid-proxy");
+    assert!(reservation.2 > 0);
+    assert_eq!(reservation.3, "released");
+    assert_eq!(
+        Connection::open(&db)
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM reservations", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+    let after = ledger.tenant_readview(budget::PERSONAL_TENANT_ID).unwrap();
+    assert_eq!(after.spent_minor, before.spent_minor);
+    assert_eq!(after.reserved_minor, before.reserved_minor);
+    assert_eq!(after.available_minor, before.available_minor);
+    upstream.verify().await;
+}
