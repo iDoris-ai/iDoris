@@ -110,6 +110,13 @@ impl Harness {
         let mut card: ComponentCard =
             serde_yaml::from_str(include_str!("../../../config/components/omlx.yaml")).unwrap();
         card.endpoint = upstream.uri();
+        card.extensions = Some(
+            serde_json::from_value(serde_json::json!({
+                "_degradation": "Removing this explicit fixture binding disables daily aliases.",
+                "idoris_role_models": {"daily": "omlx"}
+            }))
+            .unwrap(),
+        );
         let app = build_app(AppState {
             runtimes: Some(BoundSupervisor::spawn_omlx(&card).unwrap()).into(),
             cards: vec![card],
