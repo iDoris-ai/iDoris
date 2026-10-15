@@ -41,3 +41,7 @@ behavior. Production startup always installs an authenticator.
 Acceptance: legacy DB migration/reopen, bound-key issuance, correct-tenant
 execution, cross-tenant/unbound/anonymous/duplicate-header rejection, zero
 upstream calls and zero victim-tenant Event Log/legacy audit rows.
+
+Explicit binding also limits a key after a deployment-mode change: personal
+mode accepts unbound keys or an explicit personal binding, never a foreign
+tenant binding. An explicit personal key rejects foreign/duplicate headers.
