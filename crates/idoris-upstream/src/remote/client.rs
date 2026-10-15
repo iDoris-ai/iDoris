@@ -188,6 +188,7 @@ impl RemoteChat for RemoteClient {
             Err(_elapsed) => Err(UpstreamError::timeout()),
             Ok(Err(err)) => Err(map_genai_error(err)),
             Ok(Ok(resp)) => Ok(ChatResponse {
+                native: None,
                 model: req.model,
                 content: resp.first_text().unwrap_or("").to_string(),
             }),
@@ -539,6 +540,7 @@ mod tests {
 
     fn request() -> ChatRequest {
         ChatRequest {
+            native: None,
             model: "test-model".to_string(),
             messages: vec![ChatMessage {
                 role: "user".to_string(),

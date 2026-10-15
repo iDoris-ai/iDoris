@@ -62,6 +62,12 @@ pub const DEFAULT_BASE_URL: &str = "http://127.0.0.1:8088";
 /// single-flighted load/evict mutex) forever.
 pub const DEFAULT_CALL_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Default deadline for `POST /v1/chat/completions` only. Generation can
+/// legitimately take far longer than a management call, so chat is bounded
+/// separately (finite, never unlimited); load/status/pin keep
+/// [`DEFAULT_CALL_TIMEOUT`].
+pub const DEFAULT_CHAT_TIMEOUT: Duration = Duration::from_secs(120);
+
 /// Env var oMLX's inference API key is read from. Never logged, never put
 /// in an error message.
 pub const OMLX_API_KEY_ENV: &str = "IDORIS_OMLX_API_KEY";
@@ -109,6 +115,7 @@ pub struct OmlxAdapter {
     base_url: String,
     api_key: Option<String>,
     call_timeout: Duration,
+    chat_timeout: Duration,
     client: reqwest::Client,
     admin_session: tokio::sync::Mutex<Option<reqwest::header::HeaderValue>>,
     load_fence_path: Option<std::path::PathBuf>,
@@ -122,10 +129,17 @@ impl OmlxAdapter {
             base_url: config.base_url.trim_end_matches('/').to_string(),
             api_key: config.api_key,
             call_timeout: config.call_timeout,
+            chat_timeout: DEFAULT_CHAT_TIMEOUT,
             client,
             admin_session: tokio::sync::Mutex::new(None),
             load_fence_path: None,
         })
+    }
+
+    /// Override the chat-only deadline (default [`DEFAULT_CHAT_TIMEOUT`]).
+    pub fn with_chat_timeout(mut self, chat_timeout: Duration) -> Self {
+        self.chat_timeout = chat_timeout;
+        self
     }
 
     /// Override the durable Supervisor load marker location. Every adapter
@@ -169,13 +183,14 @@ impl OmlxAdapter {
         &self,
         path: &str,
         body: &serde_json::Value,
+        timeout: Duration,
     ) -> Result<serde_json::Value, BackendError> {
         http::post_and_parse(
             &self.client,
             &self.base_url,
             path,
             self.api_key(),
-            self.call_timeout,
+            timeout,
             body,
         )
         .await
@@ -370,18 +385,17 @@ impl OmlxAdapter {
         if cancel.is_cancelled() {
             return Err(BackendError::cancelled());
         }
-        let messages: Vec<serde_json::Value> = req
-            .messages
-            .iter()
-            .map(|m| serde_json::json!({"role": m.role, "content": m.content}))
-            .collect();
-        let body = serde_json::json!({"model": req.model.clone(), "messages": messages});
-        let call = self.post_parse("/v1/chat/completions", &body);
+        let body = crate::native_completion_wire::request_body(&req, &req.model);
+        let call = self.post_parse("/v1/chat/completions", &body, self.chat_timeout);
         tokio::select! {
             _ = cancel.cancelled() => Err(BackendError::cancelled()),
             result = call => {
                 let raw = result?;
-                Ok(ChatResponse { model: req.model, content: extract_content(&raw) })
+                if req.native.is_some() {
+                    crate::native_completion_wire::response(raw)
+                } else {
+                    Ok(ChatResponse { native: None, model: req.model, content: extract_content(&raw) })
+                }
             }
         }
     }
@@ -1129,6 +1143,7 @@ mod tests {
 
     fn chat_request() -> ChatRequest {
         ChatRequest {
+            native: None,
             model: "qwen3-8b".to_string(),
             messages: vec![idoris_backend::ChatMessage {
                 role: "user".to_string(),
@@ -1213,6 +1228,82 @@ mod tests {
             .expect("select! must not itself hang waiting on the slow response")
             .expect_err("must report cancellation, not wait out the 5s delay");
         assert_eq!(err.reason_code(), "cancelled");
+    }
+
+    #[tokio::test]
+    async fn chat_deadline_is_independent_of_the_management_call_timeout() {
+        let server = MockServer::start().await;
+        let slow = ResponseTemplate::new(200)
+            .set_delay(Duration::from_millis(800))
+            .set_body_json(serde_json::json!({"choices": [{"message": {"content": "late"}}]}));
+        mount_all(
+            &server,
+            vec![
+                ("POST", "/v1/chat/completions", slow.clone()),
+                ("GET", "/v1/models/status", slow),
+            ],
+        )
+        .await;
+        // call_timeout is 500ms: a management GET with the same 800ms delay
+        // must still time out, while chat (default 120s) must succeed.
+        let adapter = adapter_for(&server).await;
+        let list_err = adapter.list().await.expect_err("management stays at 500ms");
+        assert!(list_err.to_string().contains("timed out"), "{list_err}");
+        let reply = adapter
+            .chat(chat_request(), CancellationToken::new())
+            .await
+            .expect("chat must outlive call_timeout");
+        assert_eq!(reply.content, "late");
+    }
+
+    #[tokio::test]
+    async fn default_management_deadline_remains_ten_seconds() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models/status"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(11)))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let config = OmlxAdapterConfig {
+            base_url: server.uri(),
+            ..OmlxAdapterConfig::default()
+        };
+        assert_eq!(config.call_timeout, Duration::from_secs(10));
+        let adapter = OmlxAdapter::new(config).expect("adapter");
+        let started = std::time::Instant::now();
+        let error = tokio::time::timeout(Duration::from_secs(15), adapter.list())
+            .await
+            .expect("default management deadline must be bounded")
+            .expect_err("eleven-second management response must exceed the ten-second bound");
+        assert!(error.to_string().contains("timed out"), "{error}");
+        assert!(started.elapsed() >= Duration::from_secs(9));
+        assert_eq!(server.received_requests().await.expect("requests").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn short_chat_timeout_rejects_a_slow_completion() {
+        let server = MockServer::start().await;
+        mount_all(
+            &server,
+            vec![(
+                "POST",
+                "/v1/chat/completions",
+                ResponseTemplate::new(200).set_delay(Duration::from_secs(5)),
+            )],
+        )
+        .await;
+        let adapter = adapter_for(&server)
+            .await
+            .with_chat_timeout(Duration::from_millis(100));
+        let err = tokio::time::timeout(
+            Duration::from_secs(2),
+            adapter.chat(chat_request(), CancellationToken::new()),
+        )
+        .await
+        .expect("chat_timeout must fire well before the 5s response")
+        .expect_err("must time out");
+        assert!(err.to_string().contains("timed out"), "{err}");
     }
 
     #[tokio::test]
