@@ -2364,11 +2364,11 @@ async fn chat_completions(
                     Err(DispatchError::Rejection(rejection)) => {
                         return rejection_response(rejection);
                     }
-                    Err(DispatchError::Internal(message)) => {
+                    Err(DispatchError::Internal(_)) => {
                         return error_envelope(
                             StatusCode::INTERNAL_SERVER_ERROR,
                             "internal_error",
-                            message,
+                            "backend model resolution failed",
                         );
                     }
                 };
