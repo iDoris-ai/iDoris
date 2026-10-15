@@ -7,6 +7,7 @@ use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
 use idoris_contracts::InspectResponse;
 use idoris_contracts::common::PrivacyClass;
+use idoris_contracts::inspect::InspectAction;
 use idoris_tenancy::virtual_key::MintedVirtualKey;
 use idoris_tenancy::virtual_key::store::{VirtualKeyScope, VirtualKeyStore};
 use rusqlite::Connection;
@@ -39,6 +40,73 @@ async fn send(app: &Router, request: Request<Body>) -> (StatusCode, String) {
 fn contract(body: &str) -> InspectResponse {
     let value: Value = serde_json::from_str(body).unwrap();
     idoris_contracts::parse::<InspectResponse>(&value).unwrap()
+}
+
+#[tokio::test]
+async fn known_l0_misses_are_never_allowed_by_authenticated_http() {
+    let (app, bearer) =
+        authenticated_app(vec![PrivacyClass::LocalOnly, PrivacyClass::Any], &["fast"]);
+    let inputs = [
+        "6222\t0212\t3456\t7894",
+        "6222.0212.3456.7894",
+        "6222/0212/3456/7894",
+        "138.1234.5678",
+        r"C:\Users\alice\.aws\credentials",
+        concat!(
+            "DJANGO_SECRET_KEY_FOR_PRODUCTION_SETTINGS=",
+            "zMCTnu5i8RRUKO7CCgpDdFZwTMKHPBZU1HmjS9jA"
+        ),
+    ];
+    let mut outcomes = Vec::new();
+    for input in inputs {
+        let body = json!({ "input": input }).to_string();
+        let (status, text) = send(
+            &app,
+            inspect_request(
+                &body,
+                &[("authorization", &bearer), ("x-idoris-privacy", "any")],
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{input}: {text}");
+        outcomes.push((input, contract(&text).action));
+    }
+    for (input, action) in &outcomes {
+        assert_ne!(*action, InspectAction::Allow, "{input}: {outcomes:?}");
+    }
+    for (input, privacy, expected) in [
+        ("6222 0212 3456 7894", "any", InspectAction::Block),
+        ("hello", "any", InspectAction::Allow),
+        ("hello", "local_only", InspectAction::Block),
+    ] {
+        let body = json!({ "input": input }).to_string();
+        let (status, text) = send(
+            &app,
+            inspect_request(
+                &body,
+                &[("authorization", &bearer), ("x-idoris-privacy", privacy)],
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{text}");
+        assert_eq!(contract(&text).action, expected);
+    }
+    for input in inputs {
+        let body = json!({ "input": input }).to_string();
+        let (status, text) = send(
+            &app,
+            inspect_request(
+                &body,
+                &[
+                    ("authorization", &bearer),
+                    ("x-idoris-privacy", "local_only"),
+                ],
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{text}");
+        assert_eq!(contract(&text).action, InspectAction::Block);
+    }
 }
 
 #[tokio::test]

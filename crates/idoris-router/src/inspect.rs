@@ -71,8 +71,6 @@ pub(crate) async fn post_inspect(
     {
         return response;
     }
-    // Reaching here means the caller's key scope already admits the
-    // declared privacy, so tenant policy allows remote for `any`.
     let ctx = InspectCtx {
         declared,
         remote_allowed: true,
