@@ -1,5 +1,6 @@
 """Package/startup controls; no test establishes Apple signing acceptance."""
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler
+from socketserver import TCPServer
 import threading
 
 import importlib.util
@@ -27,7 +28,8 @@ WORKFLOW = SCRIPT.parent.parent / ".github/workflows/release.yml"
 SERVER = r'''#!/usr/bin/env python3
 import json, os
 from pathlib import Path
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler
+from socketserver import TCPServer
 assert not any(k.startswith("IDORIS_") for k in os.environ)
 assert Path.cwd() != Path(__file__).parent
 assert Path(os.environ["HOME"]) != Path(__file__).parent
@@ -39,8 +41,8 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(json.dumps({"status":"ok", "version":"0.3.0", "components":1}).encode())
     def log_message(self, *args): pass
-HTTPServer.allow_reuse_address = True
-HTTPServer(("127.0.0.1", 8740), Handler).serve_forever()
+TCPServer.allow_reuse_address = True
+TCPServer(("127.0.0.1", 8740), Handler).serve_forever()
 '''
 
 
@@ -71,6 +73,14 @@ class SmokeBehavior(unittest.TestCase):
         self.assertEqual(len(children), 1)
         self.assertIsNotNone(children[0].poll(), "owned server must be reaped")
 
+    def test_payload_fixture_does_not_require_reverse_dns(self):
+        controlled = SERVER.replace("import json, os\n", "import json, os, socket\n"
+            "def reject_lookup(*args):\n"
+            "    raise RuntimeError('fixture reverse DNS unavailable')\n"
+            "socket.getfqdn = reject_lookup\n", 1)
+        (self.bundle / "idoris").write_text(controlled)
+        smoke.smoke_payload(self.bundle, "0.3.0")
+
     def test_back_to_back_payload_runs_accept_time_wait_without_a_listener(self):
         smoke.smoke_payload(self.bundle, "0.3.0")
         smoke.smoke_payload(self.bundle, "0.3.0")
@@ -96,7 +106,8 @@ class SmokeBehavior(unittest.TestCase):
                     smoke.smoke_payload(self.bundle, "0.3.0")
                 spawn.assert_not_called()
 
-    def test_wildcard_listeners_cannot_supply_a_false_green(self):
+    @patch.object(socket, "getfqdn", side_effect=AssertionError("fixture must not resolve hostnames"))
+    def test_wildcard_listeners_cannot_supply_a_false_green(self, _lookup):
         health_requests = []
         class Health(BaseHTTPRequestHandler):
             def do_GET(self):
@@ -106,7 +117,7 @@ class SmokeBehavior(unittest.TestCase):
                 self.wfile.write(b'{"status":"ok","version":"0.3.1","components":1}')
             def log_message(self, *args):
                 pass
-        class Wildcard(HTTPServer):
+        class Wildcard(TCPServer):
             allow_reuse_address = True
         class DualStack(Wildcard):
             address_family = socket.AF_INET6
