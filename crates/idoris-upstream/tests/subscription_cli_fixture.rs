@@ -31,7 +31,9 @@ async fn wait_group_gone(group: i32) {
         loop {
             match killpg(Pid::from_raw(group), None) {
                 Err(Errno::ESRCH) => break,
-                result => result.expect("process group probe must succeed while group exists"),
+                // Darwin may return EPERM while only unreaped zombies remain.
+                Ok(()) | Err(Errno::EPERM) => {}
+                Err(error) => panic!("process group probe failed: {error}"),
             }
             sleep(Duration::from_millis(20)).await;
         }
