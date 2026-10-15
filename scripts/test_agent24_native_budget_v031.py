@@ -11,7 +11,7 @@ SHA inputs bind bytes; source SHAs are operator build-provenance declarations,
 not cryptographic proof that those bytes were compiled from those sources.
 
 Exit codes: 0 listed real criteria passed; 1 failed criterion; 3 BLOCKED;
-4 PARTIAL (diagnostic artifacts or skipped native deadline). Diagnostic WIP
+4 PARTIAL (diagnostic artifacts or skipped native deadline). Diagnostic
 builds MUST use --diagnostic-artifacts and --agent24-source-diff-sha256.
 Real model quality, final 0.3.1 release provenance, signing and manual product
 approval remain outside this harness even when its listed criteria pass.
@@ -481,13 +481,13 @@ def scenario(args, binaries, root, config, name, handoff, footprint, reservation
         if name == 'zero':
             checks['zero_recommendation_budget_blocks_all'] = all(row['admission_status'] == 'blocked' for row in capabilities)
             require(checks['zero_recommendation_budget_blocks_all'], 'zero budget recommendation admitted a model')
-        tap = Tap(gateway_port, key)
+        tap = None if args.daemon_cancellation_only else Tap(gateway_port, key)
         agent_home = work / 'agent-home'
         agent_env = environment(agent_home)
         state = agent_home / '.agent24'
         state.mkdir()
         (state / 'os.json').write_text('{"default":"disabled","domainOs":{}}\n')
-        agent_env.update(IDORIS_URL='http://127.0.0.1:%d' % tap.port, IDORIS_API_KEY=key,
+        agent_env.update(IDORIS_URL='http://127.0.0.1:%d' % (gateway_port if args.daemon_cancellation_only else tap.port), IDORIS_API_KEY=key,
                          AGENT24D_BIN=str(work / 'never-spawn-another-daemon'))
         daemon = Process([binaries['agent24d'], 'serve', '--port', '0'], agent_env, work)
         def daemon_ready():
@@ -498,6 +498,49 @@ def scenario(args, binaries, root, config, name, handoff, footprint, reservation
             except (OSError, ValueError):
                 return False
         wait_for(daemon_ready, 20, 'real Agent24 daemon discovery deadline')
+        if args.daemon_cancellation_only:
+            result['control'] = 'daemon_origin_shutdown_cancellation'
+            checks['consumer_connected_directly_without_tap'] = tap is None
+            fixture.hold = True
+            fixture.post_seen.clear()
+            cli = Process([binaries['agent24'], 'chat', 'owned-cancel-' + uuid.uuid4().hex,
+                           '--model', 'idoris/daily'], agent_env, work)
+            try:
+                require(fixture.post_seen.wait(8), 'real CLI cancellation request did not reach completion POST')
+                checks['actual_cli_and_daemon_alive_after_post'] = cli.proc.poll() is None and daemon.proc.poll() is None
+                started = time.monotonic()
+                os.killpg(daemon.proc.pid, signal.SIGTERM)
+                disconnected = fixture.disconnected.wait(5)
+                elapsed = time.monotonic() - started
+                result['daemon_term_to_upstream_disconnect_seconds'] = round(elapsed, 3)
+                checks['daemon_origin_upstream_disconnect_within_5s'] = disconnected and elapsed <= 5
+                try:
+                    exit_code = cli.proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    raise Failed('actual CLI did not settle after owned daemon TERM') from None
+                checks['cancelled_cli_failed_without_answer'] = exit_code != 0 and MARKER not in cli.text()
+            finally:
+                cli.close()
+            daemon.close()
+            fixture.hold = False
+            require(all(checks.values()), 'daemon-origin cancellation criteria failed')
+            auth = {'Authorization': 'Bearer ' + key, 'X-iDoris-Privacy': 'local_only'}
+            status, _, response = request_http(gateway_port, '/v1/chat/completions', 'POST', payload('idoris/deep'), auth)
+            checks['supervisor_unloaded_cancelled_A_and_loaded_B'] = (status == 200 and response.get('model') == MODEL_B
+                                                                     and bool(fixture.posts('/%s/unload' % MODEL_A))
+                                                                     and bool(fixture.posts('/%s/load' % MODEL_B)))
+            require(checks['supervisor_unloaded_cancelled_A_and_loaded_B'], 'Supervisor failed eviction after daemon cancellation')
+            daemon = Process([binaries['agent24d'], 'serve', '--port', '0'], agent_env, work)
+            wait_for(daemon_ready, 20, 'new owned Agent24 daemon discovery deadline')
+            code, output = command([binaries['agent24'], 'chat', 'owned-next-' + uuid.uuid4().hex,
+                                    '--model', 'idoris/daily'], agent_env, work, timeout=25)
+            checks['new_daemon_next_cli_succeeded_after_eviction'] = (code == 0 and MARKER in output
+                                                                      and 'iDoris record ' in output
+                                                                      and len(fixture.posts('/%s/load' % MODEL_A)) >= 2
+                                                                      and bool(fixture.posts('/%s/unload' % MODEL_B))
+                                                                      and fixture.posts('/chat/completions')[-1][2].get('model') == MODEL_A)
+            require(checks['new_daemon_next_cli_succeeded_after_eviction'], 'new daemon CLI did not recover after cancellation/eviction')
+            return result
         code, cli_output = consumer(binaries['agent24'], agent_env, work)
         require(daemon.proc.poll() is None, 'owned daemon exited during consumer request')
         wire = [item for item in tap.events if item['path'] == '/v1/chat/completions']
@@ -625,8 +668,10 @@ def acceptance(args, report):
         canaries = Canaries()
         try:
             failures = []
-            for name, handoff, reservation in (('positive', positive_handoff, args.core_reserved_bytes),
-                                               ('zero', zero_handoff, 2 ** 64 - 1), ('insufficient', small_handoff, small_reservation)):
+            cases = [('positive', positive_handoff, args.core_reserved_bytes)]
+            if not args.daemon_cancellation_only:
+                cases.extend([('zero', zero_handoff, 2 ** 64 - 1), ('insufficient', small_handoff, small_reservation)])
+            for name, handoff, reservation in cases:
                 item = {}
                 # Keep partial evidence if a product assertion fails.
                 report['scenarios'].append(item)
@@ -638,11 +683,12 @@ def acceptance(args, report):
             report['canary_connections'] = canaries.hits
             require(canaries.hits == 0, 'direct default backend canary was contacted')
             require(not failures, 'scenario criteria failed: ' + ', '.join(failures))
-            positive_rows = report['scenarios'][0]['recommendations']
-            zero_rows = report['scenarios'][1]['recommendations']
-            require(any(row['admission_status'] != 'blocked' for row in positive_rows)
-                    and positive_rows != zero_rows, 'positive-to-zero recommendation allocation change not observable')
-            report['recommendation_allocation_change_observed'] = True
+            if not args.daemon_cancellation_only:
+                positive_rows = report['scenarios'][0]['recommendations']
+                zero_rows = report['scenarios'][1]['recommendations']
+                require(any(row['admission_status'] != 'blocked' for row in positive_rows)
+                        and positive_rows != zero_rows, 'positive-to-zero recommendation allocation change not observable')
+                report['recommendation_allocation_change_observed'] = True
         finally:
             report['canary_connections'] = canaries.hits
             canaries.close()
@@ -655,13 +701,15 @@ def parser():
         result.add_argument('--' + name + '-sha256')
     result.add_argument('--idoris-source-sha')
     result.add_argument('--agent24-source-sha')
-    result.add_argument('--agent24-source-diff-sha256', help='declared diff provenance for a diagnostic WIP build')
+    result.add_argument('--agent24-source-diff-sha256', help='declared diff provenance for a diagnostic build')
     result.add_argument('--diagnostic-artifacts', action='store_true', help='force PARTIAL: supplied artifacts have not passed final product gates')
     result.add_argument('--config-dir', type=Path)
     result.add_argument('--core-reserved-bytes', type=int)
     result.add_argument('--expected-version')
     result.add_argument('--report-json', type=Path)
     result.add_argument('--self-test', action='store_true')
+    result.add_argument('--daemon-cancellation-only', action='store_true',
+                        help='run only actual CLI/daemon TERM cancellation and recovery; PARTIAL, no unchanged deadline rerun')
     result.add_argument('--skip-server-timeout', action='store_true',
                         help='omit actual 120s server deadline test; forces PARTIAL/nonzero verdict')
     return result
@@ -678,7 +726,8 @@ def main(argv=None):
               'scenarios': [], 'coverage_gaps': [
         'No nondefault Agent24 CLI tools/max_tokens/response_format/disable_thinking interface; rich native checks are DIRECT iDoris only.',
         'Inspected CLI prints content/tokens/Record-Id only; actual model and locality evidence are gateway wire facts, not separate CLI display fields.',
-        'Cancellation/deadline checks are DIRECT iDoris controls, not daemon-shutdown/Agent24 cancellation proof.',
+        ('This narrowed run omits unchanged Tap, full allocation matrix and native server deadline controls.' if args.daemon_cancellation_only
+         else 'Standard cancellation/deadline checks are DIRECT; daemon-origin proof requires the separate daemon-cancellation-only control.'),
         'Owned loopback lifecycle/OAI fixture is not a real model engine or model-quality proof.',
         'No OS network sandbox: isolated environment/config and default-backend canaries cover configured paths, not all possible outbound traffic.',
         'Supplied SHA256 verifies executable bytes; source SHAs remain operator build provenance declarations.']}
@@ -686,13 +735,14 @@ def main(argv=None):
     try:
         if args.diagnostic_artifacts:
             require(args.agent24_source_diff_sha256 and re.fullmatch('[0-9a-f]{64}', args.agent24_source_diff_sha256),
-                    'diagnostic WIP artifacts require source diff SHA256 declaration')
+                    'diagnostic artifacts require source diff SHA256 declaration')
             report['diagnostic_source_provenance'] = {'agent24_declared_diff_sha256': args.agent24_source_diff_sha256,
                                                      'clean_source_claimed': False, 'final_product_gates_passed': False}
         acceptance(args, report)
-        partial = args.skip_server_timeout or args.diagnostic_artifacts
+        partial = args.skip_server_timeout or args.diagnostic_artifacts or args.daemon_cancellation_only
         report['verdict'] = 'PARTIAL' if partial else 'PASS'
-        report['reason'] = ('diagnostic artifacts have not passed final source/product gates' if args.diagnostic_artifacts
+        report['reason'] = ('only daemon-origin cancellation control executed' if args.daemon_cancellation_only
+                            else 'diagnostic artifacts have not passed final source/product gates' if args.diagnostic_artifacts
                             else 'actual native deadline check omitted' if args.skip_server_timeout
                             else 'listed real consumer, native, lifecycle and allocated-budget criteria completed')
         code = 4 if partial else 0
@@ -757,13 +807,14 @@ class HarnessTests(unittest.TestCase):
             acceptance(parser().parse_args([]), report)
 
     def test_no_artifacts_cli_is_nonzero_blocked(self):
-        output = io.StringIO()
-        with contextlib.redirect_stdout(output):
-            code = main([])
-        report = json.loads(output.getvalue())
-        self.assertEqual(code, 3)
-        self.assertEqual(report['verdict'], 'BLOCKED')
-        self.assertEqual(report['scenarios'], [])
+        for argv in ([], ['--daemon-cancellation-only']):
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                code = main(argv)
+            report = json.loads(output.getvalue())
+            self.assertEqual(code, 3)
+            self.assertEqual(report['verdict'], 'BLOCKED')
+            self.assertEqual(report['scenarios'], [])
 
     def test_hash_compatible_with_system_python(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -794,6 +845,23 @@ class HarnessTests(unittest.TestCase):
             self.assertEqual(request_http(fixture.port, '/v1/models/%s/unload' % MODEL_A, 'POST', {})[0], 200)
             self.assertFalse(request_http(fixture.port, '/v1/models/status')[2]['models'][0]['loaded'])
         finally:
+            fixture.close()
+
+    def test_held_post_fixture_observes_actual_peer_disconnect(self):
+        fixture = Fixture(12345)
+        conn = http.client.HTTPConnection('127.0.0.1', fixture.port, timeout=2)
+        try:
+            request_http(fixture.port, '/v1/models/%s/load' % MODEL_A, 'POST', {})
+            fixture.hold = True
+            self.assertFalse(fixture.disconnected.is_set())
+            conn.request('POST', '/v1/chat/completions', json.dumps(payload()), {'Content-Type': 'application/json'})
+            self.assertTrue(fixture.post_seen.wait(2))
+            self.assertFalse(fixture.disconnected.is_set())
+            conn.sock.shutdown(socket.SHUT_RDWR)
+            conn.close()
+            self.assertTrue(fixture.disconnected.wait(2))
+        finally:
+            conn.close()
             fixture.close()
 
     def test_owned_group_timeout_cleanup_including_child(self):
