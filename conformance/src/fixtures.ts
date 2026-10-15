@@ -110,6 +110,11 @@ export function localComponent(endpoint: string, extra: Partial<ComponentCardSpe
     privacyClass: "local_only",
     allowedEgress: ["loopback"],
     endpoint,
+    // startFakeUpstream advertises this exact model; only daily is claimed.
+    extensions: {
+      _degradation: "Without this binding the fixture cannot serve role aliases.",
+      idoris_role_models: { daily: "fake-model-1" },
+    },
     ...extra,
   };
 }
@@ -125,6 +130,11 @@ export function remoteComponent(endpoint: string, extra: Partial<ComponentCardSp
     fallbackPolicy: "next_in_chain",
     failClosed: false,
     endpoint,
+    // startFakeUpstream advertises this exact model; only daily is claimed.
+    extensions: {
+      _degradation: "Without this binding the fixture cannot serve role aliases.",
+      idoris_role_models: { daily: "fake-model-1" },
+    },
     ...extra,
   };
 }

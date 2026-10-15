@@ -39,23 +39,27 @@ no bindings still accepts explicit concrete overrides.
 
 `idoris_role_models` is explicitly unsupported on the `subscription` provider,
 including an empty mapping. Startup rejects it, and programmatic cards carrying
-it fail closed. Subscription execution retains the authorized relay's fixed
-identity; arbitrary mapping targets are never forwarded into its sandbox.
+it fail closed. Without this extension, valid subscription cards retain their
+existing role eligibility, including `auto`. Capability, privacy, policy, source,
+and authorization gates still apply. The relay executes its authorized runtime's
+fixed model. Request and mapping targets never change that model.
 
-Only cards explicitly bound for the requested role enter selection. There is no
-capability-only fallback to another role and no first-model selection. Existing
-policy ordering chooses among eligible configured backends. `auto` also requires
-an explicit target; it is a routing default, never a static catalog model role.
-An explicit concrete request model remains unchanged. Readiness affinity and
-lifecycle load/chat resolve the same exact ID; lifecycle catalog membership and
-positive footprint checks run before load or eviction. A process-owned runtime
-can supply its existing trusted footprint for its exact configured model.
+Only HTTP cards explicitly bound for the requested role enter selection. There is
+no capability-only fallback to another role and no first-model selection. Existing
+policy ordering chooses among eligible configured backends. HTTP `auto` also
+requires an explicit target. It is a routing default, never a static catalog
+model role. For HTTP backends, an explicit concrete request model remains
+unchanged. Readiness affinity and lifecycle load/chat resolve the same exact ID.
+Lifecycle catalog membership and positive footprint checks run before load or
+eviction. A process-owned runtime can supply its existing trusted footprint for
+its exact configured model.
 
-Resident HTTP services receive the resolved concrete model in buffered and SSE
-requests. Their residency/availability remains owned by the external service;
-upstream failure is returned without retrying another role or backend. Binding
-configuration does not prove the resident backend has weights installed, nor does
-it add a new download, catalog refresh, or hardware admission authority.
+Resident HTTP services receive the resolved concrete model for chat completions,
+embeddings, rerank, and native messages, including supported streaming requests.
+The external service owns residency and availability. Upstream failure returns
+without retrying another role or backend. Binding configuration does not prove
+that the resident backend has weights installed. It adds no download, catalog
+refresh, or hardware admission authority.
 
 Release integration must persist a verified user selection into these bindings
 and independently establish model availability. Consuming the current read-only

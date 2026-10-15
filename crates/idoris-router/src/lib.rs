@@ -574,6 +574,34 @@ async fn enforce_protocol_key_scope(
     Ok(())
 }
 
+fn bound_http_body(
+    parsed: &ParsedProfile,
+    value: &serde_json::Value,
+    card: &idoris_contracts::ComponentCard,
+) -> Result<serde_json::Value, DispatchError> {
+    let mut body = value.clone();
+    if parsed.role.is_some() {
+        let target = dispatch::backend_model_id(
+            parsed,
+            value.get("model").and_then(serde_json::Value::as_str),
+            card,
+        )?;
+        body["model"] = serde_json::Value::String(target);
+    }
+    Ok(body)
+}
+
+fn model_resolution_error(error: DispatchError) -> Response {
+    match error {
+        DispatchError::Rejection(rejection) => rejection_response(rejection),
+        DispatchError::Internal(_) => error_envelope(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal_error",
+            "backend model resolution failed",
+        ),
+    }
+}
+
 async fn embeddings(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -634,6 +662,11 @@ async fn embeddings(
     // B7-02 reuses the direct buffered transport. Paid embeddings need a
     // distinct usage-settlement contract (OpenAI embeddings do not report
     // chat completion_tokens), so this slice must fail closed before egress.
+    let value = match bound_http_body(&parsed, &value, &selected.card) {
+        Ok(body) => body,
+        Err(error) => return model_resolution_error(error),
+    };
+
     let cost = &selected.card.provider.cost;
     if cost.input_per_m != 0.0 || cost.output_per_m != 0.0 {
         return error_envelope(
@@ -772,6 +805,11 @@ async fn rerank(
         Err(DispatchError::Internal(message)) => {
             return error_envelope(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", message);
         }
+    };
+
+    let value = match bound_http_body(&parsed, &value, &selected.card) {
+        Ok(body) => body,
+        Err(error) => return model_resolution_error(error),
     };
 
     let cost = &selected.card.provider.cost;
@@ -926,6 +964,11 @@ async fn messages(
         Err(DispatchError::Internal(message)) => {
             return error_envelope(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", message);
         }
+    };
+
+    let value = match bound_http_body(&parsed, &value, &selected.card) {
+        Ok(body) => body,
+        Err(error) => return model_resolution_error(error),
     };
 
     let cost = &selected.card.provider.cost;
@@ -2367,23 +2410,10 @@ async fn chat_completions(
             };
         }
         if dispatch::is_resident_http_service(&selected.card) {
-            let mut upstream_body = value.clone();
-            if parsed.role.is_some() {
-                let target = match dispatch::backend_model_id(&parsed, model, &selected.card) {
-                    Ok(target) => target,
-                    Err(DispatchError::Rejection(rejection)) => {
-                        return rejection_response(rejection);
-                    }
-                    Err(DispatchError::Internal(_)) => {
-                        return error_envelope(
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            "internal_error",
-                            "backend model resolution failed",
-                        );
-                    }
-                };
-                upstream_body["model"] = serde_json::Value::String(target);
-            }
+            let upstream_body = match bound_http_body(&parsed, &value, &selected.card) {
+                Ok(body) => body,
+                Err(error) => return model_resolution_error(error),
+            };
             return chat_via_proxy(
                 &state,
                 selected,

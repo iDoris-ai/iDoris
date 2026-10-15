@@ -287,6 +287,22 @@ fn role_binding_subscription_configuration_is_rejected_and_http_controls_remain_
         components::load_components(dir.path(), false).unwrap(),
         [subscription.clone()]
     );
+    for model in ["idoris/daily", "idoris/auto", "idoris/fast"] {
+        let profile = profile::parse_profile(
+            &headers,
+            Some(model),
+            idoris_contracts::DeployMode::Personal,
+        )
+        .unwrap();
+        assert!(dispatch::select(std::slice::from_ref(&subscription), &profile, "").is_ok());
+        let private = profile::parse_profile(
+            &HeaderMap::new(),
+            Some(model),
+            idoris_contracts::DeployMode::Personal,
+        )
+        .unwrap();
+        assert!(dispatch::select(std::slice::from_ref(&subscription), &private, "").is_err());
+    }
     let concrete = profile::parse_profile(
         &headers,
         Some("explicit-model"),
@@ -323,5 +339,101 @@ fn role_binding_subscription_configuration_is_rejected_and_http_controls_remain_
                 http
             );
         }
+    }
+}
+
+#[tokio::test]
+async fn role_binding_protocols_send_exact_target_and_preserve_concrete_payload() {
+    for (path, role, payload) in [
+        (
+            "/v1/chat/completions",
+            "daily",
+            json!({"messages":[],"stream":false}),
+        ),
+        ("/v1/embeddings", "embed", json!({"input":["hello"]})),
+        (
+            "/v1/rerank",
+            "rerank",
+            json!({"query":"hello","documents":["doc"]}),
+        ),
+        (
+            "/v1/messages",
+            "daily",
+            json!({"messages":[],"max_tokens":8,"stream":false}),
+        ),
+        (
+            "/v1/messages",
+            "daily",
+            json!({"messages":[],"max_tokens":8,"stream":true}),
+        ),
+    ] {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(|request: &wiremock::Request| {
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                if body["stream"] == true {
+                    ResponseTemplate::new(200).set_body_raw(
+                        "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+                        "text/event-stream",
+                    )
+                } else {
+                    ResponseTemplate::new(200).set_body_json(json!({"ok":true}))
+                }
+            })
+            .mount(&upstream)
+            .await;
+        let mut card = resident_component_card("protocol-provider", &upstream.uri());
+        card.provider.capabilities =
+            vec![Capability::Chat, Capability::Embedding, Capability::Rerank];
+        bind(&mut card, json!({role:"verified-protocol-model"}));
+        let app = build_app(AppState {
+            cards: vec![card.clone()],
+            ..AppState::default()
+        });
+        for model in [format!("idoris/{role}"), "concrete-override".into()] {
+            let mut body = payload.clone();
+            body["model"] = json!(model);
+            let request = Request::builder()
+                .method("POST")
+                .uri(path)
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap();
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{path}: {model}");
+            response.into_body().collect().await.unwrap();
+            body["model"] = json!(if model.starts_with("idoris/") {
+                "verified-protocol-model"
+            } else {
+                "concrete-override"
+            });
+            let requests = upstream.received_requests().await.unwrap();
+            let observed = requests.last().unwrap();
+            assert_eq!(observed.url.path(), path);
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&observed.body).unwrap(),
+                body
+            );
+        }
+        card.extensions = None;
+        let app = build_app(AppState {
+            cards: vec![card],
+            ..AppState::default()
+        });
+        let mut body = payload;
+        body["model"] = json!(format!("idoris/{role}"));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(path)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(upstream.received_requests().await.unwrap().len(), 2);
     }
 }

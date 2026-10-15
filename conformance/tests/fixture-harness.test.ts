@@ -17,10 +17,10 @@ function cardText(extra: Parameters<typeof localComponent>[1] = {}): string {
   return readFileSync(join(dir, readdirSync(dir)[0] as string), "utf8");
 }
 
-it("未指定 loadPolicy 时保留 resident 默认值，extensions 默认不生成", () => {
+it("默认 HTTP fixture 声明真实上游 daily 模型并保留 resident 策略", () => {
   const text = cardText();
   expect(text).toContain("load_policy: { mode: resident, keepalive: { pinned: true }, admission: coexist }");
-  expect(text).not.toContain("extensions:");
+  expect(text).toContain('"idoris_role_models":{"daily":"fake-model-1"}');
 });
 
 it("loadPolicy=null 真正省略字段，而不是输出 null", () => {

@@ -155,6 +155,18 @@ pub(crate) fn role_models(
     Ok(models)
 }
 
+// Subscription executes the authorized runtime's fixed model, not an HTTP
+// model target. Preserve its legacy role eligibility only without a mapping.
+fn fixed_subscription_roles(component: &ComponentCard) -> bool {
+    matches!(
+        crate::subscription::card::classify_subscription_card(component),
+        Ok(crate::subscription::card::CardBoundary::Subscription)
+    ) && !component
+        .extensions
+        .as_ref()
+        .is_some_and(|extensions| extensions.contains_key("idoris_role_models"))
+}
+
 fn candidate(component: &ComponentCard, prompt: &str) -> Card {
     let models = role_models(component).unwrap_or_default();
     Card {
@@ -162,7 +174,10 @@ fn candidate(component: &ComponentCard, prompt: &str) -> Card {
         roles: ROLES
             .iter()
             .copied()
-            .filter(|r| r.is_catalog_role() && models.contains_key(r.as_str()))
+            .filter(|r| {
+                r.is_catalog_role()
+                    && (fixed_subscription_roles(component) || models.contains_key(r.as_str()))
+            })
             .collect(),
         experiment: false,
         min_ram_gb: 0.0,
@@ -275,9 +290,9 @@ pub fn select_with_affinity_and_ready(
         .iter()
         .filter(|card| {
             role_models(card).is_ok_and(|models| {
-                profile
-                    .role
-                    .is_none_or(|role| models.contains_key(role.as_str()))
+                profile.role.is_none_or(|role| {
+                    fixed_subscription_roles(card) || models.contains_key(role.as_str())
+                })
             })
         })
         .map(|c| candidate(c, prompt))

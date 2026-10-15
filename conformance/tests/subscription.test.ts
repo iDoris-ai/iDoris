@@ -50,7 +50,7 @@ async function healthComponents(s: RunningServer): Promise<number> {
 
 async function postSubscription(
   s: RunningServer,
-  options: { privacy?: "any" | "local_only"; stream?: boolean } = {},
+  options: { privacy?: "any" | "local_only"; stream?: boolean; model?: string } = {},
 ): Promise<Response> {
   return await fetch(s.baseUrl + "/v1/chat/completions", {
     method: "POST",
@@ -60,7 +60,7 @@ async function postSubscription(
       "x-idoris-complexity": "complex",
     },
     body: JSON.stringify({
-      model: "claude-subscription",
+      model: options.model ?? "claude-subscription",
       stream: options.stream ?? false,
       messages: [{ role: "user", content: "hello-subscription" }],
     }),
@@ -128,6 +128,22 @@ it("loopback enabled subscription returns buffered OpenAI JSON and remote served
   expect(body.object).toBe("chat.completion");
   expect(body.model).toBe("claude-subscription");
   expect(body.choices[0]?.message.content).toMatch(/^fixture:/);
+  expect(fixture.readMarker().trim().split("\n")).toHaveLength(1);
+});
+
+it.each(["idoris/daily", "idoris/auto"])("subscription role %s retains authorized relay execution", async (model) => {
+  fixture = makeSubscriptionFixture("claude");
+  server = await start(fixture.env);
+  const response = await postSubscription(server, { model });
+  expect(response.status).toBe(200);
+  expect(response.headers.get("x-idoris-served-locality")).toBe("remote");
+  const body: unknown = await response.json();
+  // The TS reference echoes request metadata; Rust reports the fixed runtime ID.
+  // Neither relay passes that metadata as a CLI model-selection argument.
+  expect(body).toMatchObject({
+    object: "chat.completion",
+    model: process.env.IDORIS_CONFORMANCE_IMPLEMENTATION === "rust" ? "claude-subscription" : model,
+  });
   expect(fixture.readMarker().trim().split("\n")).toHaveLength(1);
 });
 
