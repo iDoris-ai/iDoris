@@ -497,6 +497,15 @@ async fn remote_bind_auth_middleware(
         Ok(identity) => identity,
         Err(_) => return virtual_key_unauthorized_response(),
     };
+    // An explicit tenant grant remains a ceiling in personal deployments.
+    if state.deploy_mode == idoris_contracts::DeployMode::Personal
+        && let Some(bound_tenant) = identity.scope.tenant_id.as_deref()
+        && (bound_tenant != budget::PERSONAL_TENANT_ID
+            || (request.headers().contains_key("x-idoris-tenant")
+                && query_scope_header(request.headers()) != Some(bound_tenant)))
+    {
+        return virtual_key_scope_response(auth::VirtualKeyScopeError::TenantForbidden);
+    }
     if tenant_mode {
         let tenant_header = request.headers().get_all("x-idoris-tenant");
         if tenant_header.iter().next().is_some() {
@@ -2075,6 +2084,24 @@ async fn chat_completions(
         Ok(context) => context,
         Err(error) => return correlation_error_response(error),
     };
+    let authorization_present = headers.contains_key(axum::http::header::AUTHORIZATION);
+    let dev_no_key_request = state.dev_no_key_enabled && !authorization_present;
+    if dev_no_key_request {
+        if parsed.task.privacy.unwrap_or(PrivacyClass::LocalOnly) != PrivacyClass::LocalOnly {
+            return dev_no_key_scope_response();
+        }
+    } else if let Some(authenticator) = &state.virtual_key_authenticator {
+        let identity = match authenticator.authenticate(&headers).await {
+            Ok(identity) => identity,
+            Err(_) => return virtual_key_unauthorized_response(),
+        };
+        if let Err(error) = auth::enforce_scope(&identity, &parsed) {
+            return virtual_key_scope_response(error);
+        }
+    } else if state.dev_no_key_enabled && authorization_present {
+        return virtual_key_unauthorized_response();
+    }
+
     let event_request_id = event_request_id(header_text(&headers, HEADER_REQUEST_ID), &record_id);
     let event_context = if let Some(event_log) = state.event_log.clone() {
         let tenant_id = match state.deploy_mode {
@@ -2101,23 +2128,6 @@ async fn chat_completions(
         None
     };
 
-    let authorization_present = headers.contains_key(axum::http::header::AUTHORIZATION);
-    let dev_no_key_request = state.dev_no_key_enabled && !authorization_present;
-    if dev_no_key_request {
-        if parsed.task.privacy.unwrap_or(PrivacyClass::LocalOnly) != PrivacyClass::LocalOnly {
-            return dev_no_key_scope_response();
-        }
-    } else if let Some(authenticator) = &state.virtual_key_authenticator {
-        let identity = match authenticator.authenticate(&headers).await {
-            Ok(identity) => identity,
-            Err(_) => return virtual_key_unauthorized_response(),
-        };
-        if let Err(error) = auth::enforce_scope(&identity, &parsed) {
-            return virtual_key_scope_response(error);
-        }
-    } else if state.dev_no_key_enabled && authorization_present {
-        return virtual_key_unauthorized_response();
-    }
     let affinity_key = session_affinity_key(&headers);
 
     let messages = extract_messages(object);
@@ -3343,6 +3353,12 @@ mod protocol_error_matrix_tests;
 mod policy_wiring_tests;
 
 #[cfg(test)]
+mod tenant_test_support;
+
+#[cfg(test)]
+use tenant_test_support::{tenant_test_app, tenant_test_request};
+
+#[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -4345,8 +4361,11 @@ mod tests {
             deploy_mode: idoris_contracts::DeployMode::Tenant,
             ..AppState::default()
         };
-        let app = build_app(state);
-        let response = app.oneshot(post_chat("{}", &[])).await.unwrap();
+        let (app, key) = tenant_test_app(state, "acme");
+        let response = app
+            .oneshot(tenant_test_request(post_chat("{}", &[]), &key))
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
