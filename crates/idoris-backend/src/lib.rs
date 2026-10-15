@@ -34,7 +34,10 @@ pub use eviction::{
 pub use global_capacity::{GlobalCapacityLedger, GlobalCapacitySnapshot};
 pub use mock::MockAdapter;
 pub use supervisor::{Supervisor, SupervisorConfig, SupervisorHandle};
-pub use types::{BackendStatus, ChatMessage, ChatRequest, ChatResponse, ModelInfo, Pressure};
+pub use types::{
+    BackendStatus, ChatMessage, ChatRequest, ChatResponse, ModelInfo, NativeCompletionRequest,
+    Pressure,
+};
 
 #[cfg(test)]
 mod tests {
@@ -191,6 +194,7 @@ mod tests {
         let err = adapter
             .chat(
                 ChatRequest {
+                    native: None,
                     model: "qwen3-8b".to_string(),
                     messages: vec![ChatMessage {
                         role: "user".to_string(),
@@ -214,6 +218,7 @@ mod tests {
         let response = adapter
             .chat(
                 ChatRequest {
+                    native: None,
                     model: "qwen3-8b".to_string(),
                     messages: vec![ChatMessage {
                         role: "user".to_string(),
@@ -238,6 +243,7 @@ mod tests {
         let err = adapter
             .chat(
                 ChatRequest {
+                    native: None,
                     model: "qwen3-8b".to_string(),
                     messages: vec![ChatMessage {
                         role: "user".to_string(),
@@ -259,6 +265,7 @@ mod tests {
         let err = adapter
             .chat(
                 ChatRequest {
+                    native: None,
                     model: "does-not-exist".to_string(),
                     messages: vec![],
                 },

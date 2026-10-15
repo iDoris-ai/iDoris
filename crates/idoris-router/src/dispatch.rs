@@ -546,6 +546,7 @@ fn public_dispatch_result(
 }
 
 pub(crate) struct LocalExecutionContext<'a> {
+    native: Option<&'a idoris_backend::NativeCompletionRequest>,
     supervisor: Option<&'a BoundSupervisor>,
     budget_ledger: Option<&'a BudgetLedger>,
     budget_event: Option<&'a crate::BudgetReservedEventContext>,
@@ -564,6 +565,7 @@ impl<'a> LocalExecutionContext<'a> {
         budget_settled_event: Option<&'a crate::BudgetSettledEventContext>,
     ) -> Self {
         Self {
+            native: None,
             supervisor,
             budget_ledger,
             budget_event,
@@ -571,6 +573,16 @@ impl<'a> LocalExecutionContext<'a> {
             completed_event,
             budget_settled_event,
         }
+    }
+}
+
+impl<'a> LocalExecutionContext<'a> {
+    pub(crate) fn with_native(
+        mut self,
+        native: &'a idoris_backend::NativeCompletionRequest,
+    ) -> Self {
+        self.native = Some(native);
+        self
     }
 }
 
@@ -588,6 +600,7 @@ async fn dispatch_local_inner(
     cancel: CancellationToken,
 ) -> Result<ChatOutcome, ObservedDispatchError> {
     let LocalExecutionContext {
+        native,
         supervisor,
         budget_ledger,
         budget_event,
@@ -769,6 +782,7 @@ async fn dispatch_local_inner(
     let chat_result = supervisor
         .chat(
             ChatRequest {
+                native: native.cloned(),
                 model: backend_model_id,
                 messages,
             },
