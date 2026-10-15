@@ -4,6 +4,7 @@
 //! `-` 分隔（`138-1234-5678`、`6222 0212 …`）。每个数字组既按整组（去掉分隔
 //! 符）判定，也按组内每一段连续数字单独判定，所以「手机号 空格 银行卡号」
 //! 被并成一个大组时，两段仍各自命中。宁可多报，也不能因为分组方式漏报。
+//! 另以最多 19 位、5 段的窗口识别 tab、点、斜线等常见分隔格式，不跨连续分隔符或换行。
 //!
 //! 结构校验压倒校验和：身份证先看省级行政区划码和出生日期，校验位只决定
 //! 敏感度（X-2）；银行卡没有可用的结构信号，所以 Luhn 是必要条件。
@@ -79,6 +80,7 @@ pub(super) fn scan(units: &[u16]) -> Vec<Hit> {
         }
         i = group_end;
     }
+    scan_formatted(units, &mut hits);
     hits.sort_by_key(|hit| (hit.start, hit.length));
     hits.dedup_by_key(|hit| (hit.kind, hit.start, hit.length));
     hits
@@ -90,6 +92,89 @@ fn is_digit(u: u16) -> bool {
 
 fn is_separator(u: u16) -> bool {
     u == u16::from(b' ') || u == u16::from(b'-')
+}
+
+/// Require complete decomposition, with at most two short edge numbers (time, CVV).
+/// Arbitrary subwindows flag numeric tables: see 7c6cee4 / aced94d.
+fn scan_formatted(units: &[u16], hits: &mut Vec<Hit>) {
+    let mut i = 0;
+    while i < units.len() {
+        if !is_digit(units[i]) {
+            i += 1;
+            continue;
+        }
+        let mut segments = Vec::new();
+        loop {
+            let start = i;
+            while i < units.len() && is_digit(units[i]) {
+                i += 1;
+            }
+            segments.push((start, i));
+            let joins = units.get(i).is_some_and(|&u| {
+                is_separator(u) || [b'\t', b'.', b'/'].map(u16::from).contains(&u)
+            }) && units.get(i + 1).is_some_and(|&u| is_digit(u));
+            if !joins {
+                break;
+            }
+            i += 1;
+        }
+        let n = segments.len();
+        let short = |k: usize| segments[k].1 - segments[k].0 <= 3;
+        let mut decomposes: Vec<bool> = (0..=n).map(|k| n - k <= 2 && (k..n).all(short)).collect();
+        let mut choices = vec![None; n];
+        for a in (0..n).rev() {
+            for b in a..n.min(a + 5) {
+                if !decomposes[b + 1] {
+                    continue;
+                }
+                let found = formatted_window(units, &segments[a..=b]);
+                if !found.is_empty() {
+                    decomposes[a] = true;
+                    choices[a] = Some((b + 1, found));
+                    break;
+                }
+            }
+        }
+        let head = (0..=2.min(n))
+            .take_while(|&h| (0..h).all(short))
+            .find(|&h| choices.get(h).is_some_and(Option::is_some));
+        if let Some(mut a) = head {
+            while let Some((end, found)) = choices.get_mut(a).and_then(Option::take) {
+                hits.extend(found);
+                a = end;
+            }
+        }
+    }
+}
+
+/// Fixed 19-digit / five-segment bound; only phone and four-digit card groupings.
+/// Ordinary numbers written exactly like an entity remain unavoidably ambiguous.
+fn formatted_window(units: &[u16], segments: &[(usize, usize)]) -> Vec<Hit> {
+    let lengths: Vec<usize> = segments.iter().map(|&(s, e)| e - s).collect();
+    let count: usize = lengths.iter().sum();
+    let mobile_shape = matches!(lengths.as_slice(), [3, 4, 4] | [2, 3, 4, 4] | [2, 11]);
+    let card_shape = (16..=19).contains(&count)
+        && lengths.len() >= 4
+        && lengths[..lengths.len() - 1].iter().all(|&len| len == 4)
+        && lengths.last().is_some_and(|len| (1..=4).contains(len));
+    let mut hits = Vec::new();
+    if (segments.len() == 1 || mobile_shape || card_shape) && count <= 19 {
+        let digits: Vec<u8> = segments
+            .iter()
+            .flat_map(|&(s, e)| units[s..e].iter())
+            .map(|&u| (u - u16::from(b'0')) as u8)
+            .collect();
+        classify(
+            &Candidate {
+                digits: &digits,
+                start: segments[0].0,
+                end: segments[segments.len() - 1].1,
+                x_suffix: false,
+            },
+            &mut hits,
+        );
+    }
+    hits
 }
 
 /// 从 `start`（必须是数字）开始的数字组终点：分隔符只有在两侧都是数字时才算组内。
