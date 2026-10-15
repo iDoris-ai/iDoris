@@ -40,36 +40,38 @@ pub(super) fn scan(units: &[u16], hits: &mut Vec<Hit>) {
 }
 
 fn classify_token(t: &[u8], start: usize, rest: &[u16], hits: &mut Vec<Hit>) {
-    let mut push = |kind, length, sensitivity| {
-        hits.push(Hit {
-            kind,
-            start,
-            length,
-            sensitivity,
-        });
-    };
-    if t.len() == 18 && uscc_valid(t) {
-        push(FindingKind::CnUnifiedSocialCreditCode, 18, Sensitivity::S1);
-    }
-    if t.len() == 9 && is_passport(t) {
-        push(FindingKind::CnPassport, 9, Sensitivity::S3);
-    }
-    if t.len() == 9 && matches!(t[0], b'H' | b'M') && all_digits(&t[1..]) {
-        push(FindingKind::HkMacauTravelPermit, 9, Sensitivity::S3);
-    }
-    // `A123456(3)`：校验位写在紧跟的括号里，span 包含括号。
-    if let &[open, check, close, ..] = rest
-        && open == u16::from(b'(')
-        && close == u16::from(b')')
-        && check < 0x80
-        && hkid_valid(t, (check as u8).to_ascii_uppercase())
     {
-        push(FindingKind::HkIdentityCard, t.len() + 3, Sensitivity::S3);
+        let mut push = |kind, length, sensitivity| {
+            hits.push(Hit {
+                kind,
+                start,
+                length,
+                sensitivity,
+            });
+        };
+        if t.len() == 18 && uscc_valid(t) {
+            push(FindingKind::CnUnifiedSocialCreditCode, 18, Sensitivity::S1);
+        }
+        if t.len() == 9 && is_passport(t) {
+            push(FindingKind::CnPassport, 9, Sensitivity::S3);
+        }
+        if t.len() == 9 && matches!(t[0], b'H' | b'M') && all_digits(&t[1..]) {
+            push(FindingKind::HkMacauTravelPermit, 9, Sensitivity::S3);
+        }
     }
+    // `A123456(3)`、`A123456 (3)`、`A123456（3）`：校验位写在紧跟的成对括号里。
+    // 单字母与双字母共用 [`hkid_paren_window`]，span 含那个 ASCII 空格和括号。
+    push_parenthesized_hkid(t, 1, start, rest, hits);
+    push_parenthesized_hkid(t, 2, start, rest, hits);
     if let Some((&check, body)) = t.split_last()
         && hkid_valid(body, check)
     {
-        push(FindingKind::HkIdentityCard, t.len(), Sensitivity::S3);
+        hits.push(Hit {
+            kind: FindingKind::HkIdentityCard,
+            start,
+            length: t.len(),
+            sensitivity: Sensitivity::S3,
+        });
     }
 }
 
@@ -106,6 +108,51 @@ fn uscc_valid(t: &[u8]) -> bool {
     };
     let sum: u32 = values.iter().zip(USCC_WEIGHTS).map(|(v, w)| v * w).sum();
     all_digits(&t[2..8]) && values[17] == (31 - sum % 31) % 31
+}
+
+/// U+FF08 `（` / U+FF09 `）`。只认这两个码位，不做通用 Unicode 规范化。
+const HKID_FULLWIDTH_OPEN: u16 = 0xFF08;
+const HKID_FULLWIDTH_CLOSE: u16 = 0xFF09;
+
+/// 主体后面的有界括号窗口：可选恰好一个 ASCII 空格，然后开括号、一位
+/// ASCII 校验、闭括号。`()` 与 `（）` 必须各自成对。缺闭括号或闭括号
+/// 不在窗口内就返回 `None`，不往后再扫。返回的长度含空格和括号。
+fn hkid_paren_window(rest: &[u16]) -> Option<(u8, usize)> {
+    let spaced = rest.first().is_some_and(|&unit| unit == u16::from(b' '));
+    let base = usize::from(spaced);
+    let open = *rest.get(base)?;
+    let check = *rest.get(base + 1)?;
+    let close = *rest.get(base + 2)?;
+    let ascii_pair = open == u16::from(b'(') && close == u16::from(b')');
+    let fullwidth_pair = open == HKID_FULLWIDTH_OPEN && close == HKID_FULLWIDTH_CLOSE;
+    if !(ascii_pair || fullwidth_pair) || check > 0x7F {
+        return None;
+    }
+    Some(((check as u8).to_ascii_uppercase(), base + 3))
+}
+
+/// `letters` 为 1 或 2。两个调用点共用 [`hkid_paren_window`]。
+fn push_parenthesized_hkid(
+    t: &[u8],
+    letters: usize,
+    start: usize,
+    rest: &[u16],
+    hits: &mut Vec<Hit>,
+) {
+    if t.len() != letters + 6 {
+        return;
+    }
+    let Some((check, extra)) = hkid_paren_window(rest) else {
+        return;
+    };
+    if hkid_valid(t, check) {
+        hits.push(Hit {
+            kind: FindingKind::HkIdentityCard,
+            start,
+            length: t.len() + extra,
+            sensitivity: Sensitivity::S3,
+        });
+    }
 }
 
 /// 1–2 个字母 + 6 位数字，加权 9..2（单字母时首位按空格 = 36），
@@ -175,8 +222,8 @@ fn scan_plates(units: &[u16], hits: &mut Vec<Hit>) {
     }
 }
 
-/// `local@domain.tld`：本地部分 `[A-Za-z0-9._%+-]+`，域名至少一个点、
-/// 顶级域至少两个字母。
+/// ASCII-only `local@domain.tld`：本地部分 `[A-Za-z0-9._%+-]+`，域名至少一个点、
+/// 顶级域至少两个字母。全角和非 ASCII 邮箱不在这里匹配。
 fn scan_emails(units: &[u16], hits: &mut Vec<Hit>) {
     let local_char = |u: u16| is_alnum(u) || b"._%+-".iter().any(|&c| u16::from(c) == u);
     let domain_char = |u: u16| is_alnum(u) || u == u16::from(b'.') || u == u16::from(b'-');
