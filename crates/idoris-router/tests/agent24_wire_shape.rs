@@ -75,7 +75,9 @@ impl Drop for Harness {
 
 impl Harness {
     async fn start(chat_response: Value) -> Self {
-        let upstream = MockServer::start().await;
+        // Each harness represents a distinct engine. A pooled server can reuse
+        // an endpoint while the prior Supervisor still owns its load fence.
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("GET"))
             .and(path("/api/status"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({

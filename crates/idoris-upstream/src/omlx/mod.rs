@@ -1257,6 +1257,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn default_management_deadline_remains_ten_seconds() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models/status"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(11)))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let config = OmlxAdapterConfig {
+            base_url: server.uri(),
+            ..OmlxAdapterConfig::default()
+        };
+        assert_eq!(config.call_timeout, Duration::from_secs(10));
+        let adapter = OmlxAdapter::new(config).expect("adapter");
+        let started = std::time::Instant::now();
+        let error = tokio::time::timeout(Duration::from_secs(15), adapter.list())
+            .await
+            .expect("default management deadline must be bounded")
+            .expect_err("eleven-second management response must exceed the ten-second bound");
+        assert!(error.to_string().contains("timed out"), "{error}");
+        assert!(started.elapsed() >= Duration::from_secs(9));
+        assert_eq!(server.received_requests().await.expect("requests").len(), 1);
+    }
+
+    #[tokio::test]
     async fn short_chat_timeout_rejects_a_slow_completion() {
         let server = MockServer::start().await;
         mount_all(

@@ -16,7 +16,18 @@ pub(crate) fn validate(object: &Map<String, Value>) -> Result<(), String> {
                 ) || (format.get("type").and_then(Value::as_str) == Some("json_schema")
                     && format.get("json_schema").is_some_and(Value::is_object))
             }),
-            "chat_template_kwargs" => value.is_object(),
+            "tool_choice" => {
+                matches!(value.as_str(), Some("auto" | "none" | "required"))
+                    || (value.get("type").and_then(Value::as_str) == Some("function")
+                        && value
+                            .pointer("/function/name")
+                            .and_then(Value::as_str)
+                            .is_some_and(|name| !name.is_empty()))
+            }
+            "parallel_tool_calls" => value.is_boolean(),
+            "chat_template_kwargs" => value
+                .as_object()
+                .is_some_and(|kwargs| kwargs.get("enable_thinking").is_none_or(Value::is_boolean)),
             "disable_thinking" => value.is_boolean(),
             _ => {
                 return Err(format!(
@@ -67,8 +78,8 @@ fn valid_message(message: &Value) -> bool {
     }
     let role = message.get("role").and_then(Value::as_str);
     let calls = message.get("tool_calls");
-    if let Some(calls) = calls {
-        if role != Some("assistant")
+    if let Some(calls) = calls
+        && (role != Some("assistant")
             || !calls.as_array().is_some_and(|calls| {
                 !calls.is_empty()
                     && calls.iter().all(|call| {
@@ -79,10 +90,9 @@ fn valid_message(message: &Value) -> bool {
                                 .pointer("/function/arguments")
                                 .is_some_and(Value::is_string)
                     })
-            })
-        {
-            return false;
-        }
+            }))
+    {
+        return false;
     }
     if role == Some("tool") {
         if !message.get("tool_call_id").is_some_and(Value::is_string) {
