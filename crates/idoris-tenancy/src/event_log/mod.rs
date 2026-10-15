@@ -225,10 +225,15 @@ impl EventLogStore {
 
 // Keep optional bounds as direct comparisons so SQLite can seek the time index.
 fn tenant_type_query(query: &EventLogQuery<'_>) -> String {
-    let mut sql = String::from(
-        "SELECT e.* FROM main.event_log_events AS e \
-         WHERE e.tenant_id=?1 AND e.event_type=?2",
-    );
+    let mut sql = String::from("SELECT e.* FROM main.event_log_events AS e");
+    if query.record_id.is_some() {
+        // Otherwise SQLite can prefer time ordering and scan unrelated records.
+        sql.push_str(" INDEXED BY event_log_tenant_record_sequence");
+    }
+    sql.push_str(" WHERE e.tenant_id=?1 AND e.event_type=?2");
+    if query.record_id.is_some() {
+        sql.push_str(" AND e.record_id=?5");
+    }
     if query.from_ts_utc_ms.is_some() {
         sql.push_str(" AND e.ts_utc_ms>=?3");
     }
@@ -237,8 +242,7 @@ fn tenant_type_query(query: &EventLogQuery<'_>) -> String {
     }
     // Supersession is by sequence across all timestamps, for this type only.
     sql.push_str(
-        " AND (?5 IS NULL OR e.record_id=?5) \
-         AND NOT EXISTS (SELECT 1 FROM main.event_log_events AS later \
+        " AND NOT EXISTS (SELECT 1 FROM main.event_log_events AS later \
            WHERE later.tenant_id=e.tenant_id AND later.record_id=e.record_id \
              AND later.event_type=e.event_type AND later.sequence>e.sequence) \
          ORDER BY e.ts_utc_ms, e.record_id, e.sequence LIMIT ?6",
