@@ -13,6 +13,51 @@ const MIN_HEX: usize = 16;
 const MIN_PERCENT_ESCAPES: usize = 3;
 
 pub(super) fn scan(units: &[u16], hits: &mut Vec<Hit>) {
+    any_decoded(units, false, |bytes, start, length| {
+        report(bytes, start, length, hits);
+        false
+    });
+}
+
+/// Exact matching can inspect short encodings without making L0's heuristic
+/// rules flag ordinary short words. Decode one layer, never recursively.
+pub(super) fn contains_credential(
+    units: &[u16],
+    credential: &[u16],
+    raw_credential: &[u8],
+) -> bool {
+    credential.is_empty()
+        || raw_credential.is_empty()
+        || any_decoded(units, true, |bytes, _, _| {
+            // A binary wrapper must not hide the credential just because the
+            // whole decoded payload cannot be interpreted as UTF-8.
+            if bytes
+                .windows(raw_credential.len())
+                .any(|part| part == raw_credential)
+            {
+                return true;
+            }
+            let Ok(text) = std::str::from_utf8(bytes) else {
+                return false;
+            };
+            let normalized = super::normalize::normalize(&text.encode_utf16().collect::<Vec<_>>());
+            normalized
+                .units
+                .windows(credential.len())
+                .any(|part| part == credential)
+        })
+}
+
+fn any_decoded(
+    units: &[u16],
+    exact_match: bool,
+    mut matches: impl FnMut(&[u8], usize, usize) -> bool,
+) -> bool {
+    let (min_base64, min_hex, min_percent) = if exact_match {
+        (2, 2, 1)
+    } else {
+        (MIN_BASE64, MIN_HEX, MIN_PERCENT_ESCAPES)
+    };
     // base64/hex: the base64url-or-standard alphabet plus up to two `=` of
     // padding. `=` elsewhere separates (`payload=<token>`).
     for (start, run_end) in runs(units, |b| b.is_ascii_alphanumeric() || b"+/_-".contains(&b)) {
@@ -25,25 +70,38 @@ pub(super) fn scan(units: &[u16], hits: &mut Vec<Hit>) {
             .strip_prefix(b"0x")
             .or_else(|| token.strip_prefix(b"0X"))
             .unwrap_or(&token);
-        let mut decoded = vec![decode_hex(hex)];
+        let mut decoded = vec![decode_hex(hex, min_hex)];
         // A base64 blob glued to a prefix from its own alphabet (`id/…`,
         // `x…`) decodes misaligned as a whole; also try each `/`-separated
         // piece and the first three shifted starts.
         for shift in 0..4 {
-            decoded.push(token.get(shift..).and_then(decode_base64));
+            decoded.push(
+                token
+                    .get(shift..)
+                    .and_then(|part| decode_base64(part, min_base64)),
+            );
         }
-        decoded.extend(token.split(|&b| b == b'/').map(decode_base64));
+        decoded.extend(
+            token
+                .split(|&b| b == b'/')
+                .map(|part| decode_base64(part, min_base64)),
+        );
         for bytes in decoded.into_iter().flatten() {
-            report(&bytes, start, end - start, hits);
+            if matches(&bytes, start, end - start) {
+                return true;
+            }
         }
     }
     for (start, end) in runs(units, |b| {
         b.is_ascii_alphanumeric() || b"%._~+-".contains(&b)
     }) {
-        if let Some(decoded) = decode_percent(&ascii_bytes(&units[start..end])) {
-            report(&decoded, start, end - start, hits);
+        if let Some(decoded) = decode_percent(&ascii_bytes(&units[start..end]), min_percent)
+            && matches(&decoded, start, end - start)
+        {
+            return true;
         }
     }
+    false
 }
 
 /// Maximal runs of ASCII bytes accepted by `member`, as `[start, end)`.
@@ -86,7 +144,7 @@ fn report(decoded: &[u8], start: usize, length: usize, hits: &mut Vec<Hit>) {
     }
 }
 
-fn decode_percent(token: &[u8]) -> Option<Vec<u8>> {
+fn decode_percent(token: &[u8], min_escapes: usize) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(token.len());
     let mut escapes = 0;
     let mut i = 0;
@@ -109,11 +167,11 @@ fn decode_percent(token: &[u8]) -> Option<Vec<u8>> {
             }
         }
     }
-    (escapes >= MIN_PERCENT_ESCAPES).then_some(out)
+    (escapes >= min_escapes).then_some(out)
 }
 
-fn decode_hex(token: &[u8]) -> Option<Vec<u8>> {
-    if token.len() < MIN_HEX || !token.len().is_multiple_of(2) {
+fn decode_hex(token: &[u8], min_length: usize) -> Option<Vec<u8>> {
+    if token.len() < min_length || !token.len().is_multiple_of(2) {
         return None;
     }
     token
@@ -123,12 +181,12 @@ fn decode_hex(token: &[u8]) -> Option<Vec<u8>> {
 }
 
 /// 标准与 URL-safe 字母表都认，补位可有可无。
-fn decode_base64(token: &[u8]) -> Option<Vec<u8>> {
+fn decode_base64(token: &[u8], min_length: usize) -> Option<Vec<u8>> {
     let body = token
         .strip_suffix(b"==")
         .or_else(|| token.strip_suffix(b"="))
         .unwrap_or(token);
-    if body.len() < MIN_BASE64 || body.len() % 4 == 1 {
+    if body.len() < min_length || body.len() % 4 == 1 {
         return None;
     }
     let mut out = Vec::with_capacity(body.len() * 3 / 4);

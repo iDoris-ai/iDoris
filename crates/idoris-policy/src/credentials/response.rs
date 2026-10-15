@@ -28,6 +28,7 @@ impl ResponseGuard {
     /// Check a complete, decoded UTF-8 body and every response header name/value.
     /// Invalid UTF-8 and aggregate oversize responses fail closed. The returned
     /// body borrows the inspected input; do not replace it before delivery.
+    /// Known credentials are checked in one base64/hex/percent layer too.
     /// This is not a streaming guard or an arbitrary encoding decoder.
     pub fn check<'a>(
         &self,
@@ -163,6 +164,65 @@ mod tests {
         let full = "a".repeat(DEFAULT_MAX_INPUT_UTF16);
         assert_eq!(
             guard.check(&[("x".into(), "b".into())], full.as_bytes()),
+            Err(ResponseBlocked)
+        );
+    }
+
+    #[test]
+    fn encoded_known_credential_is_blocked_in_body_and_headers() {
+        let guard = ResponseGuard::new("ordinary-secret".into());
+        for encoded in [
+            "b3JkaW5hcnktc2VjcmV0",
+            "encoded/b3JkaW5hcnktc2VjcmV0",
+            "6f7264696e6172792d736563726574",
+            "0x6F7264696E6172792D736563726574",
+            "%6f%72%64%69%6e%61%72%79%2d%73%65%63%72%65%74",
+            "ordinary%2Dsecret",
+        ] {
+            let body = format!(r#"{{"echo":"{encoded}"}}"#);
+            assert_eq!(guard.check(&[], body.as_bytes()), Err(ResponseBlocked));
+            assert_eq!(
+                guard.check(&[("X-Echo".into(), encoded.into())], b"ok"),
+                Err(ResponseBlocked)
+            );
+        }
+        let clean = "b3JkaW5hcnkgcmVzdWx0"; // "ordinary result", not this credential.
+        assert_eq!(guard.check(&[], clean.as_bytes()), Ok(clean));
+    }
+
+    #[test]
+    fn exact_match_covers_short_and_url_safe_encodings_without_changing_l0() {
+        for (secret, encodings) in [
+            ("a", vec!["YQ==", "YQ", "61", "%61"]),
+            ("??>>", vec!["Pz8+Pg==", "Pz8-Pg==", "Pz8-Pg"]),
+        ] {
+            let guard = ResponseGuard::new(secret.into());
+            for encoded in encodings {
+                // L0 deliberately ignores these short, non-sensitive tokens.
+                let ctx = InspectCtx {
+                    declared: PrivacyClass::Any,
+                    remote_allowed: true,
+                    redact_consent: false,
+                    max_input_utf16: encoded.len(),
+                };
+                assert_eq!(inspect::inspect(encoded, &ctx).action, InspectAction::Allow);
+                assert_eq!(guard.check(&[], encoded.as_bytes()), Err(ResponseBlocked));
+                assert_eq!(
+                    guard.check(&[("X-Echo".into(), encoded.into())], b"ok"),
+                    Err(ResponseBlocked)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn known_credential_in_encoded_binary_is_blocked() {
+        let guard = ResponseGuard::new("ordinary-secret".into());
+        // Base64 of a non-UTF-8 byte followed by the credential.
+        let encoded = "/29yZGluYXJ5LXNlY3JldA==";
+        assert_eq!(guard.check(&[], encoded.as_bytes()), Err(ResponseBlocked));
+        assert_eq!(
+            guard.check(&[("X-Echo".into(), encoded.into())], b"ok"),
             Err(ResponseBlocked)
         );
     }
