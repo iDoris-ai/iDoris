@@ -1,0 +1,5 @@
+decision	reason
+独立 chat_timeout 而非提高 call_timeout	管理/status/load 保留10s/30s，不全部改120或无限
+Supervisor 新增 chat_call_timeout 而非复用 adapter_call_timeout(30s)	30s外层会截断120s chat；chat 与管理调用分离
+用 with_chat_timeout builder 而非给 OmlxAdapterConfig 加字段	避免破坏全部 pub struct 字面量构造调用方
+不改 router 绑定	spawn_omlx 使用默认配置即得120s，无需触碰 router 生产代码

@@ -2,7 +2,60 @@
   "task_id": "idoris-cloud-claude-native-deadline-20261015",
   "attempt_id": "c100cbca-bd8d-4848-a507-ffc343d6662e",
   "base_sha": "1c4cebdae582cda68db9f8e5aca9ff2caa1db8bd",
-  "sequence": 1,
-  "status": "started",
-  "branch": "jhfnetboy/cloud-v031-native-deadline-20261015"
+  "sequence": 2,
+  "status": "completed",
+  "branch": "jhfnetboy/cloud-v031-native-deadline-20261015",
+  "source_head": "0446e6917feda647e1204dca38be0e6267846925",
+  "result_sha": "0446e6917feda647e1204dca38be0e6267846925",
+  "files": [
+    "crates/idoris-upstream/src/omlx/mod.rs",
+    "crates/idoris-backend/src/supervisor.rs",
+    "crates/idoris-upstream/tests/supervisor_chat_deadline.rs",
+    "crates/idoris-router/tests/native_chat_deadline.rs"
+  ],
+  "commands": [
+    {
+      "cmd": "cargo test -p idoris-router --test native_chat_deadline (base 1c4cebd, RED)",
+      "exit": 101,
+      "result": "fail: elapsed=10.016s, 'oMLX POST /v1/chat/completions timed out after 10s', POSTs=1"
+    },
+    {
+      "cmd": "cargo test -p idoris-upstream --test supervisor_chat_deadline default_supervisor (base, RED)",
+      "exit": 101,
+      "result": "fail: elapsed=10.0026s timed out after 10s"
+    },
+    {
+      "cmd": "cargo test -p idoris-router --test native_chat_deadline (fixed, GREEN)",
+      "exit": 0,
+      "result": "1 passed (11.15s)"
+    },
+    {
+      "cmd": "cargo test -p idoris-upstream --test supervisor_chat_deadline (fixed, GREEN)",
+      "exit": 0,
+      "result": "3 passed"
+    },
+    {
+      "cmd": "cargo fmt --all --check",
+      "exit": 0,
+      "result": "pass"
+    },
+    {
+      "cmd": "cargo clippy -p idoris-backend -p idoris-upstream -p idoris-router --all-targets -- -D warnings",
+      "exit": 0,
+      "result": "pass"
+    },
+    {
+      "cmd": "cargo test --no-fail-fast -p idoris-backend -p idoris-upstream -p idoris-router",
+      "exit": 101,
+      "result": "917 passed, 10 failed; all 10 are subscription process-group/sandbox tests in idoris-upstream; base run of upstream+router also fails 11 of the same family (2 differ run-to-run, timing flaky; running as root in container); none touch chat"
+    }
+  ],
+  "coverage_gaps": [
+    "生产默认值 chat 120s 未做真实 120s 等待测试（仅用短配置测试超时拒绝）；120s 消费者预算含排队/加载，chat 上限不等于端到端总时长",
+    "Supervisor 外层与适配器内层 chat deadline 默认同为 120s，竞态时任一方返回超时错误（adapter_timed_out 或 upstream timed out）",
+    "BoundSupervisor::spawn_omlx 走 SupervisorConfig::default；未改 router runtime.rs 的显式 SupervisorConfig 构造（用 ..default 继承）",
+    "subscription/process-group 既有测试在 root 容器内失败，未作为本分支通过声明；未复跑 Agent24 另外四个参数红测试",
+    "未在 macOS/真实 oMLX 上验证，仅 loopback wiremock"
+  ],
+  "result_summary": "原生 chat 单独 deadline：OmlxAdapter 新增 chat_timeout(默认120s,with_chat_timeout)，SupervisorConfig 新增 chat_call_timeout(默认120s)；load/status/pin/unload 仍 10s/30s。router→Supervisor→Omlx 真实 HTTP 路径 11s chat 修复前约10.0s失败、修复后通过并收到非空内容；短外层超时拒绝与POST发出后取消2s内收敛、inflight释放均有测试。生产改动约30行。"
 }
