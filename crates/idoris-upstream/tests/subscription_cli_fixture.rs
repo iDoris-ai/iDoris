@@ -8,6 +8,7 @@ mod support {
 use std::process::Stdio;
 use std::time::Duration;
 
+use nix::errno::Errno;
 use nix::sys::signal::{Signal, killpg};
 use nix::unistd::Pid;
 use support::subscription_cli::FakeSubscriptionCli;
@@ -23,6 +24,47 @@ fn marker_pids(contents: &str) -> Vec<(i32, i32)> {
             Some((parts.next()?.parse().ok()?, parts.next()?.parse().ok()?))
         })
         .collect()
+}
+
+async fn wait_group_gone(group: i32) {
+    timeout(Duration::from_secs(2), async {
+        loop {
+            match killpg(Pid::from_raw(group), None) {
+                Err(Errno::ESRCH) => break,
+                result => result.expect("process group probe must succeed while group exists"),
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("group must be gone after parent wait");
+}
+
+#[tokio::test]
+async fn group_wait_observes_descendant_after_parent_exit() {
+    let mut child = Command::new("/bin/sh")
+        .args(["-c", "exec 3<&0; cat <&3 >/dev/null &"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0)
+        .spawn()
+        .expect("parent with pipe-blocked descendant spawns");
+    let group = child.id().expect("parent pid") as i32;
+    let input = child.stdin.take().expect("descendant input pipe");
+    timeout(Duration::from_secs(2), child.wait())
+        .await
+        .expect("parent exits before descendant")
+        .expect("wait parent");
+    assert_eq!(killpg(Pid::from_raw(group), None), Ok(()));
+
+    let release = tokio::spawn(async move {
+        sleep(Duration::from_millis(50)).await;
+        drop(input);
+    });
+    wait_group_gone(group).await;
+    assert_eq!(killpg(Pid::from_raw(group), None), Err(Errno::ESRCH));
+    release.await.expect("descendant input released");
 }
 
 #[tokio::test]
@@ -105,10 +147,8 @@ async fn fixture_creates_parent_and_grandchild_in_one_group_and_can_be_reaped() 
         .await
         .expect("parent exits after group TERM")
         .expect("wait parent");
-    assert!(
-        killpg(Pid::from_raw(group), None).is_err(),
-        "group must be gone"
-    );
+    // Waiting for the direct child does not wait for every group member's exit/reap.
+    wait_group_gone(group).await;
 }
 
 #[tokio::test]
