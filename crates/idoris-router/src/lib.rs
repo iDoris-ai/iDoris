@@ -2940,13 +2940,22 @@ async fn record_id_middleware(
             req.uri().path(),
             "/v1/chat/completions" | "/v1/embeddings" | "/v1/rerank" | "/v1/messages"
         );
-    let audit_tenant = audit_tenant_id(&state, req.headers());
+    let requested_audit_tenant = audit_tenant_id(&state, req.headers());
     let audit_request_id = audit_header(req.headers(), HEADER_REQUEST_ID, None);
     let audit_privacy = audit_header(req.headers(), "x-idoris-privacy", Some("local_only"));
     let audit_intent = audit_header(req.headers(), "x-idoris-intent", None);
     req.extensions_mut()
         .insert(RequestRecordId(record_id.clone()));
     let mut response = next.run(req).await;
+    let audit_tenant = match state.deploy_mode {
+        idoris_contracts::DeployMode::Personal => requested_audit_tenant,
+        idoris_contracts::DeployMode::Tenant => response
+            .extensions()
+            .get::<idoris_tenancy::virtual_key::store::AuthenticatedVirtualKey>()
+            .and_then(|identity| identity.scope.tenant_id.as_ref())
+            .filter(|tenant| Some(tenant.as_str()) == requested_audit_tenant.as_deref())
+            .cloned(),
+    };
     if let Ok(value) = HeaderValue::from_str(&record_id) {
         response.headers_mut().insert(HEADER_RECORD_ID, value);
     }
