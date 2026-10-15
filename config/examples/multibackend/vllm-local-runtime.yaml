@@ -1,0 +1,12 @@
+version: 1
+runtimes:
+  - provider_id: vllm-local
+    kind: vllm
+    executable: /ABSOLUTE/PATH/TO/vllm
+    model_path: /ABSOLUTE/PATH/TO/MODEL
+    engine_version: 0.11.0
+    gpu_total_gib: 24
+    port: 18103
+    model_id: vllm-local
+    memory_gb: 18
+    load_fence_path: /ABSOLUTE/PATH/TO/PRIVATE-IDORIS-STATE/fences/vllm-local.pending

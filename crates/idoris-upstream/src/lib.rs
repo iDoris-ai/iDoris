@@ -41,7 +41,7 @@ pub use chat::{
 };
 pub use error::UpstreamError;
 pub use local_http_runtime::{LocalHttpRuntimeAdapter, LocalHttpRuntimeConfig};
-pub use local_runtime::{LocalRuntimeKind, LocalRuntimeLaunch};
+pub use local_runtime::{LocalRuntimeKind, LocalRuntimeLaunch, VllmLaunch};
 pub use local_runtime_process::ManagedRuntimeProcess;
 pub use ollama::{CAPABILITIES as OLLAMA_CAPABILITIES, OllamaAdapter, OllamaAdapterConfig};
 pub use omlx::{OmlxAdapter, OmlxAdapterConfig};

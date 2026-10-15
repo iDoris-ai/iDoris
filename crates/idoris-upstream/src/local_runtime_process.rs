@@ -24,8 +24,8 @@ pub struct ManagedRuntimeProcess {
 }
 
 impl ManagedRuntimeProcess {
-    pub fn spawn(launch: &LocalRuntimeLaunch) -> Result<Self, BackendError> {
-        Self::spawn_command(launch.executable(), launch.args())
+    pub fn spawn(launch: &LocalRuntimeLaunch, api_key: Option<&str>) -> Result<Self, BackendError> {
+        Self::spawn_command(launch.executable(), launch.args_with_api_key(api_key)?)
     }
 
     fn spawn_command(

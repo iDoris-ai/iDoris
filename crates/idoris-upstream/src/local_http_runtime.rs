@@ -1,8 +1,9 @@
 //! Single-model process-owned OpenAI-compatible local HTTP runtime.
 //!
-//! mlx_lm.server and llama.cpp differ in launch argv (owned by
+//! mlx_lm.server, llama.cpp, and vLLM differ in launch argv (owned by
 //! LocalRuntimeLaunch) but share the small HTTP surface this adapter needs:
 //! GET /v1/models for readiness and POST /v1/chat/completions for inference.
+//! vLLM readiness requires the served model id. HTTP 200 alone is not ready.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -15,7 +16,7 @@ use idoris_contracts::LoadPolicy;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
-use crate::{LocalRuntimeKind, LocalRuntimeLaunch, ManagedRuntimeProcess, UpstreamBearer};
+use crate::{LocalRuntimeLaunch, ManagedRuntimeProcess, UpstreamBearer};
 
 const DEFAULT_CALL_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
@@ -50,6 +51,20 @@ impl LocalHttpRuntimeConfig {
         if !load_fence_path.is_absolute() {
             return Err(BackendError::internal(
                 "local runtime load fence path must be absolute",
+            ));
+        }
+        if let Some(reserve) = launch.gpu_reserve_gib()
+            && reserve != memory_gb
+        {
+            return Err(BackendError::invalid_request(
+                "vllm memory_gb must equal the GPU reserve passed to the engine",
+            ));
+        }
+        if let Some(served) = launch.served_model_name()
+            && served != model_id
+        {
+            return Err(BackendError::invalid_request(
+                "vllm served model name must match model_id",
             ));
         }
         Ok(Self {
@@ -128,6 +143,7 @@ impl LocalHttpRuntimeAdapter {
 
     async fn probe_models_endpoint(&self) -> Result<bool, BackendError> {
         let url = format!("{}/v1/models", self.config.launch.endpoint());
+        let expected = self.config.launch.readiness_model_id().map(str::to_string);
         let attempt = async {
             let response = match self.authed(self.client.get(url)).send().await {
                 Ok(response) => response,
@@ -148,10 +164,18 @@ impl LocalHttpRuntimeAdapter {
                 Ok(body) => body,
                 Err(_) => return Ok(false),
             };
-            Ok(body
-                .get("data")
-                .and_then(serde_json::Value::as_array)
-                .is_some_and(|models| !models.is_empty()))
+            let Some(models) = body.get("data").and_then(serde_json::Value::as_array) else {
+                return Ok(false);
+            };
+            if models.is_empty() {
+                return Ok(false);
+            }
+            let Some(expected) = expected.as_deref() else {
+                return Ok(true);
+            };
+            Ok(models
+                .iter()
+                .any(|model| model.get("id").and_then(serde_json::Value::as_str) == Some(expected)))
         };
         tokio::time::timeout(self.config.call_timeout, attempt)
             .await
@@ -173,10 +197,11 @@ impl LocalHttpRuntimeAdapter {
                 })
             })
             .collect::<Vec<_>>();
-        let engine_model = match self.config.launch.kind() {
-            LocalRuntimeKind::MlxLmServer => "default_model".to_string(),
-            LocalRuntimeKind::LlamaCpp => self.config.model_id.clone(),
-        };
+        let engine_model = self
+            .config
+            .launch
+            .chat_model(&self.config.model_id)
+            .to_string();
         let body = serde_json::json!({"model": engine_model, "messages": messages});
         let attempt = async {
             let response = self
@@ -248,8 +273,9 @@ impl RuntimeAdapter for LocalHttpRuntimeAdapter {
         if let Some((process, _)) = stale {
             process.shutdown(self.config.shutdown_grace).await?;
         }
+        let api_key = self.config.bearer.as_ref().map(UpstreamBearer::secret);
         *self.process.lock().await = Some((
-            ManagedRuntimeProcess::spawn(&self.config.launch)?,
+            ManagedRuntimeProcess::spawn(&self.config.launch, api_key)?,
             policy.copied(),
         ));
         Ok(())
@@ -708,6 +734,119 @@ mod tests {
                 Some("Bearer wrong-token".to_string())
             ]
         );
+        adapter.unload("single-model").await.unwrap();
+        server.verify().await;
+    }
+
+    fn vllm_config(server: &MockServer, served: &str, reserve: f64) -> LocalHttpRuntimeConfig {
+        let launch = crate::LocalRuntimeLaunch::vllm(crate::VllmLaunch {
+            executable: std::path::PathBuf::from("/usr/bin/false"),
+            model: "/models/qwen".to_string(),
+            port: server.address().port(),
+            served_model_name: served.to_string(),
+            engine_version: "0.11.0".to_string(),
+            gpu_total_gib: 24.0,
+            reserve_gib: reserve,
+            model_revision: None,
+        })
+        .unwrap();
+        LocalHttpRuntimeConfig::new(
+            launch,
+            served,
+            reserve,
+            std::env::temp_dir().join("idoris-vllm-load.pending"),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn vllm_memory_gb_must_match_the_engine_reserve() {
+        let launch = crate::LocalRuntimeLaunch::vllm(crate::VllmLaunch {
+            executable: std::path::PathBuf::from("/usr/bin/false"),
+            model: "/models/qwen".to_string(),
+            port: 9,
+            served_model_name: "single-model".to_string(),
+            engine_version: "0.11.0".to_string(),
+            gpu_total_gib: 24.0,
+            reserve_gib: 18.0,
+            model_revision: None,
+        })
+        .unwrap();
+        let error = LocalHttpRuntimeConfig::new(
+            launch,
+            "single-model",
+            2.5,
+            std::env::temp_dir().join("idoris-vllm-load.pending"),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("GPU reserve"));
+    }
+
+    #[cfg(unix)]
+    async fn with_vllm_process(server: &MockServer) -> LocalHttpRuntimeAdapter {
+        let adapter =
+            LocalHttpRuntimeAdapter::new(vllm_config(server, "single-model", 18.0)).unwrap();
+        let process =
+            ManagedRuntimeProcess::spawn_test(Path::new("/bin/sleep"), vec![OsString::from("30")])
+                .unwrap();
+        *adapter.process.lock().await = Some((process, None));
+        adapter
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn vllm_readiness_requires_the_served_model_and_chat_uses_that_name() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [{"id": "other-model"}]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let adapter = with_vllm_process(&server).await;
+        assert!(!adapter.probe_ready("single-model").await.unwrap());
+        adapter.unload("single-model").await.unwrap();
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [{"id": "single-model"}]
+            })))
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(body_json(serde_json::json!({
+                "model": "single-model",
+                "messages": [{"role": "user", "content": "hello"}]
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"content": "world"}}]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let adapter = with_vllm_process(&server).await;
+        assert!(adapter.probe_ready("single-model").await.unwrap());
+        let response = adapter
+            .chat(
+                ChatRequest {
+                    model: "single-model".into(),
+                    messages: vec![ChatMessage {
+                        role: "user".into(),
+                        content: "hello".into(),
+                    }],
+                },
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.model, "single-model");
+        assert_eq!(response.content, "world");
         adapter.unload("single-model").await.unwrap();
         server.verify().await;
     }
