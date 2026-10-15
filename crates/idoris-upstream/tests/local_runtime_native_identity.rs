@@ -29,7 +29,14 @@ const MODEL_ID: &str = "qwen3-local-configured";
 
 fn fake_runtime(dir: &Path) -> PathBuf {
     let script = dir.join("fake-runtime.sh");
-    std::fs::write(&script, "#!/bin/sh\nexec sleep 30\n").unwrap();
+    std::fs::write(
+        &script,
+        r#"#!/bin/sh
+printf '%s\n' "$@" > "$0.args"
+exec sleep 30
+"#,
+    )
+    .unwrap();
     std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
     script
 }
@@ -202,7 +209,7 @@ async fn mlx_native_missing_engine_echo_fails_closed() {
 }
 
 #[tokio::test]
-async fn llama_native_engine_model_is_configured_id_and_echo_is_required() {
+async fn llama_native_with_launch_alias_requires_that_identity() {
     let original = tool_completion(Some(MODEL_ID));
     let response = native_chat(LocalRuntimeKind::LlamaCpp, MODEL_ID, original.clone())
         .await
@@ -250,4 +257,34 @@ async fn legacy_response_keeps_configured_model_without_echo_requirement() {
     assert_eq!(response.model, MODEL_ID);
     assert_eq!(response.content, "world");
     assert!(response.native.is_none());
+}
+
+#[tokio::test]
+async fn llama_load_passes_configured_alias_as_one_process_argument() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = MockServer::start().await;
+    let adapter = loaded_adapter(&server, LocalRuntimeKind::LlamaCpp, dir.path()).await;
+    let argv_path = dir.path().join("fake-runtime.sh.args");
+    for _ in 0..40 {
+        if argv_path.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let argv = std::fs::read_to_string(&argv_path).unwrap();
+    adapter.unload(MODEL_ID).await.unwrap();
+    let argv: Vec<_> = argv.lines().collect();
+    assert_eq!(
+        argv,
+        vec![
+            "--model",
+            "/models/qwen.gguf",
+            "--alias",
+            MODEL_ID,
+            "--host",
+            "127.0.0.1",
+            "--port",
+            &server.address().port().to_string()
+        ]
+    );
 }

@@ -69,12 +69,13 @@ pub struct LocalHttpRuntimeAdapter {
 }
 
 impl LocalHttpRuntimeAdapter {
-    pub fn new(config: LocalHttpRuntimeConfig) -> Result<Self, BackendError> {
+    pub fn new(mut config: LocalHttpRuntimeConfig) -> Result<Self, BackendError> {
         if config.call_timeout.is_zero() || config.shutdown_grace.is_zero() {
             return Err(BackendError::internal(
                 "local runtime timeouts must be non-zero",
             ));
         }
+        config.launch = config.launch.with_model_alias(&config.model_id);
         let client = crate::http_client()
             .map_err(|_| BackendError::internal("failed to build local runtime HTTP client"))?;
         Ok(Self {
@@ -207,7 +208,8 @@ impl LocalHttpRuntimeAdapter {
     }
 
     /// The engine is addressed by `engine_model` (mlx_lm.server's
-    /// `default_model` placeholder, or the configured id for llama.cpp) and
+    /// `default_model` placeholder, or the configured id installed through
+    /// llama.cpp's actual `--alias` launch argument) and
     /// must echo exactly that; anything else is not evidence this owned
     /// single-model process served the call. A verified echo is then mapped
     /// to the configured iDoris model id in both the response identity and
