@@ -190,7 +190,7 @@ impl LocalHttpRuntimeAdapter {
                 message: "local runtime chat timed out".into(),
             })??;
         if req.native.is_some() {
-            return crate::native_completion_wire::response(raw, &self.config.model_id);
+            return crate::native_completion_wire::response(raw);
         }
         let content = raw
             .pointer("/choices/0/message/content")

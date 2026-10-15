@@ -25,7 +25,17 @@ pub fn request_body(request: &ChatRequest, engine_model: &str) -> Value {
     Value::Object(body)
 }
 
-pub fn response(mut raw: Value, fallback_model: &str) -> Result<ChatResponse, BackendError> {
+/// Formal native completions must identify their actual backend model.
+/// Selected/requested model identities are not evidence of what served a call.
+pub fn response(raw: Value) -> Result<ChatResponse, BackendError> {
+    let model = raw
+        .get("model")
+        .and_then(Value::as_str)
+        .filter(|model| !model.trim().is_empty())
+        .ok_or_else(|| BackendError::Upstream {
+            message: "native runtime response missing a nonempty actual model".into(),
+        })?
+        .to_string();
     let invalid = || BackendError::Upstream {
         message: "native runtime response missing text or tool completion".into(),
     };
@@ -45,12 +55,6 @@ pub fn response(mut raw: Value, fallback_model: &str) -> Result<ChatResponse, Ba
         }
         _ => return Err(invalid()),
     };
-    let model = raw
-        .get("model")
-        .and_then(Value::as_str)
-        .unwrap_or(fallback_model)
-        .to_string();
-    raw["model"] = json!(model);
     Ok(ChatResponse {
         model,
         content,

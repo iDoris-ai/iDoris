@@ -377,7 +377,7 @@ impl OmlxAdapter {
             result = call => {
                 let raw = result?;
                 if req.native.is_some() {
-                    crate::native_completion_wire::response(raw, &req.model)
+                    crate::native_completion_wire::response(raw)
                 } else {
                     Ok(ChatResponse { native: None, model: req.model, content: extract_content(&raw) })
                 }

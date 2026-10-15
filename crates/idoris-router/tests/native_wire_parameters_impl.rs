@@ -44,6 +44,7 @@ async fn check(field: &str, value: Value) {
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "model": "omlx",
             "choices": [{"message": {"content": "buffered answer"}}]
         })))
         .mount(&upstream)
@@ -329,4 +330,71 @@ async fn parameters_cannot_bypass_spend_admission() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
     assert!(upstream.received_requests().await.unwrap().is_empty());
+}
+
+async fn assert_invalid_backend_model(model: Option<Value>) {
+    let upstream = MockServer::start().await;
+    let app = native_app(&upstream).await;
+    let mut completion = json!({"choices":[{"message":{"role":"assistant","content":"answer"}}],
+        "usage":{"prompt_tokens":4,"completion_tokens":2,"total_tokens":6}});
+    if let Some(model) = model {
+        completion["model"] = model;
+    }
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&completion))
+        .mount(&upstream)
+        .await;
+    let response = app
+        .oneshot(request(json!({"model":"idoris/daily", "max_tokens":512,
+        "messages":[{"role":"user","content":"hi"}]})))
+        .await
+        .unwrap();
+    let status = response.status();
+    let body: Value =
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let requests = upstream.received_requests().await.unwrap();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.url.path() == "/v1/chat/completions")
+            .count(),
+        1,
+        "response validation happens after the inference POST"
+    );
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "backend={completion}; response={body}"
+    );
+    assert!(
+        body.get("model").is_none(),
+        "no inferred actual-model identity: {body}"
+    );
+    assert!(body.get("choices").is_none());
+}
+
+#[tokio::test]
+async fn missing_backend_model_is_refused_after_inference() {
+    assert_invalid_backend_model(None).await;
+}
+
+#[tokio::test]
+async fn empty_backend_model_is_refused_after_inference() {
+    assert_invalid_backend_model(Some(json!(""))).await;
+}
+
+#[tokio::test]
+async fn nonstring_backend_model_is_refused_after_inference() {
+    assert_invalid_backend_model(Some(json!(42))).await;
+}
+
+#[tokio::test]
+async fn whitespace_backend_model_is_refused_after_inference() {
+    assert_invalid_backend_model(Some(json!(" \t\n"))).await;
+}
+
+#[tokio::test]
+async fn null_backend_model_is_refused_after_inference() {
+    assert_invalid_backend_model(Some(Value::Null)).await;
 }
