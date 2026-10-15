@@ -149,30 +149,133 @@ def signature(run, path, team, runtime=False):
         require(re.search(r"flags=.*\bruntime\b", info), "CLI lacks hardened runtime")
 
 
+def _entries(path):
+    try:
+        return tuple(sorted(os.listdir(path)))
+    except OSError:
+        return None
+
+
+def _cleanup_text(error):
+    return str(error) if isinstance(error, ReleaseError) else "filesystem cleanup failed"
+
+
+def _raise_preserved(primary, secondary):
+    # Keep the original failure object when cleanup also fails. A cleanup-only
+    # failure stays fatal. OSError text can contain local paths, so it is not copied.
+    if isinstance(primary, (KeyboardInterrupt, SystemExit)):
+        raise primary
+    if secondary is None:
+        if primary is not None:
+            raise primary
+        return
+    note = _cleanup_text(secondary)
+    if primary is None:
+        if isinstance(secondary, ReleaseError):
+            raise secondary
+        raise ReleaseError(note) from None
+    if isinstance(primary, ReleaseError):
+        message = str(primary)
+        if note not in message:
+            primary.args = (f"{message}; cleanup also failed: {note}",)
+        raise primary
+    raise ReleaseError(f"filesystem operation failed; cleanup also failed: {note}") from None
+
+
+def _copy_exclusive(source, dest, owned):
+    try:
+        descriptor = os.open(str(dest), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+    except FileExistsError:
+        raise ReleaseError("output must be a new directory") from None
+    owned.append(dest)
+    try:
+        with os.fdopen(descriptor, "wb") as stream, source.open("rb") as src:
+            shutil.copyfileobj(src, stream)
+            stream.flush()
+            os.fsync(stream.fileno())
+    except BaseException:
+        try:
+            os.unlink(dest)
+        except OSError:
+            pass
+        raise
+
+
+class _SignWork(tempfile.TemporaryDirectory):
+    def __exit__(self, exc_type, exc, tb):
+        cleanup_error = None
+        try:
+            self.cleanup()
+        except OSError as error:
+            cleanup_error = error
+        if cleanup_error is not None and not isinstance(exc, (KeyboardInterrupt, SystemExit)):
+            _raise_preserved(exc, cleanup_error)
+        return False
+
+
+def _discard_owned(directory, owned, reserved):
+    error = None
+    for path in owned:
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError as failure:
+            error = failure
+    if reserved:
+        try:
+            if directory.is_dir() and not any(directory.iterdir()):
+                directory.rmdir()
+        except OSError as failure:
+            error = error or failure
+    return error
+
+
 def verify_payload(run, image, work, cli_hash, config_hashes, team):
     mount = work / "mounted"
+    # Only the mountpoint created below is ours. Never detach a preexisting path.
+    if mount.is_symlink() or mount.exists() or os.path.ismount(mount):
+        raise ReleaseError("refusing preexisting mount path")
     mount.mkdir()
-    attached = False
+    before = _entries(mount)
+    primary = None
+    detach = False
     try:
-        run("DMG mount", ["/usr/bin/hdiutil", "attach", "-readonly", "-nobrowse",
-                          "-noautoopen", "-mountpoint", str(mount), str(image)])
-        attached = True
-        files = {str(p.relative_to(mount)) for p in mount.rglob("*") if p.is_file()}
-        require(not any(p.is_symlink() for p in mount.rglob("*")), "DMG contains symbolic links")
-        # hdiutil may add filesystem bookkeeping, but no extra payload files.
-        files = {p for p in files if not p.startswith(".fseventsd/") and p != ".DS_Store"}
-        expected = {"idoris": cli_hash, **config_hashes}
-        require(files == set(expected), "DMG payload file set mismatch")
-        for rel, checksum in expected.items():
-            require(digest(mount / rel) == checksum, "DMG payload checksum mismatch")
-        signature(run, mount / "idoris", team, runtime=True)
-        # Apple's "other code" check; spctl execute assesses app bundles, not CLIs.
-        run("CLI notarization verification", ["/usr/bin/codesign", "--verify", "--strict",
-                                             "-R=notarized", "--check-notarization",
-                                             "--verbose=4", str(mount / "idoris")])
+        try:
+            run("DMG mount", ["/usr/bin/hdiutil", "attach", "-readonly", "-nobrowse",
+                              "-noautoopen", "-mountpoint", str(mount), str(image)])
+        except BaseException as error:
+            primary = error
+        else:
+            detach = True
+        # attach can mount and then time out before it returns.
+        if not detach and (os.path.ismount(mount) or _entries(mount) != before):
+            detach = True
+        if primary is None:
+            try:
+                files = {str(p.relative_to(mount)) for p in mount.rglob("*") if p.is_file()}
+                require(not any(p.is_symlink() for p in mount.rglob("*")), "DMG contains symbolic links")
+                # hdiutil may add filesystem bookkeeping, but no extra payload files.
+                files = {p for p in files if not p.startswith(".fseventsd/") and p != ".DS_Store"}
+                expected = {"idoris": cli_hash, **config_hashes}
+                require(files == set(expected), "DMG payload file set mismatch")
+                for rel, checksum in expected.items():
+                    require(digest(mount / rel) == checksum, "DMG payload checksum mismatch")
+                signature(run, mount / "idoris", team, runtime=True)
+                # Apple's "other code" check; spctl execute assesses app bundles, not CLIs.
+                run("CLI notarization verification", ["/usr/bin/codesign", "--verify", "--strict",
+                                                     "-R=notarized", "--check-notarization",
+                                                     "--verbose=4", str(mount / "idoris")])
+            except BaseException as error:
+                primary = error
     finally:
-        if attached:
-            run("DMG detach", ["/usr/bin/hdiutil", "detach", str(mount)])
+        cleanup = None
+        if detach:
+            try:
+                run("DMG detach", ["/usr/bin/hdiutil", "detach", str(mount)])
+            except BaseException as error:
+                cleanup = error
+    _raise_preserved(primary, cleanup)
 
 
 def release(args, run=None):
@@ -188,8 +291,9 @@ def release(args, run=None):
     require(re.search(r'\b' + args.identity.upper() + r'\s+"Developer ID Application: [^"\n]+ \('
                       + args.team_id + r'\)"', identities, re.IGNORECASE),
             "exact valid Developer ID Application identity/team not found")
-    # New directory published atomically only after all verification succeeds.
-    with tempfile.TemporaryDirectory(prefix="idoris-sign-", dir=out.parent) as temp:
+    # Publish only after verification. mkdir(exist_ok=False) reserves the final
+    # directory without replacing an empty directory the way rename() can.
+    with _SignWork(prefix="idoris-sign-", dir=out.parent) as temp:
         work = Path(temp)
         payload, artifacts = work / "payload", work / "artifacts"
         payload.mkdir()
@@ -230,8 +334,28 @@ def release(args, run=None):
                     "checks": ["codesign-strict", "stapler-validate", "hdiutil-verify", "spctl-open", "codesign-check-notarization", "mounted-payload-sha256"]}
         (artifacts / f"{name}.sha256").write_text(f"{final_hash}  {name}\n")
         (artifacts / f"{name}.manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
-        require(not out.exists(), "output appeared during operation; refusing replacement")
-        artifacts.rename(out)
+        published = (name, f"{name}.sha256", f"{name}.manifest.json")
+        owned = []
+        reserved = False
+        try:
+            try:
+                out.mkdir(exist_ok=False)
+            except FileExistsError:
+                raise ReleaseError("output must be a new directory") from None
+            reserved = True
+            for artifact_name in published:
+                _copy_exclusive(artifacts / artifact_name, out / artifact_name, owned)
+            require({item.name for item in out.iterdir()} == set(published),
+                    "output changed during publication")
+            require(digest(out / name) == final_hash, "published artifact checksum mismatch")
+            try:
+                published_manifest = json.loads((out / f"{name}.manifest.json").read_text())
+            except ValueError:
+                raise ReleaseError("published manifest does not match artifact") from None
+            require(isinstance(published_manifest, dict) and published_manifest.get("sha256") == final_hash,
+                    "published manifest does not match artifact")
+        except BaseException as error:
+            _raise_preserved(error, _discard_owned(out, owned, reserved))
     print(f"Verified signed artifacts: {name}")
 
 
