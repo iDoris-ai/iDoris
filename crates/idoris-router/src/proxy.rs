@@ -30,10 +30,13 @@
 //! value, so there is no `tenant="a:b"+id="c"` vs `tenant="a"+id="b:c"`
 //! collision ambiguity.
 
+use std::collections::BTreeMap;
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+use idoris_upstream::UpstreamBearer;
 
 use axum::body::{Body, Bytes};
 use futures_util::stream;
@@ -145,6 +148,12 @@ pub struct ForwardOpts<'a> {
     /// Paid direct-proxy calls require trustworthy OpenAI usage evidence
     /// before a 2xx response may be retained or replayed.
     pub require_openai_usage: bool,
+}
+
+struct UpstreamAttempt<'a> {
+    endpoint: &'a str,
+    url: &'a str,
+    payload: &'a Value,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -301,6 +310,7 @@ pub struct ChatProxy {
     pub(crate) retry_delays: Vec<Duration>,
     pub(crate) cache: Mutex<IndexMap<String, CacheEntry>>,
     flights: Mutex<IndexMap<String, Arc<Flight>>>,
+    upstream_bearers: BTreeMap<String, UpstreamBearer>,
 }
 
 impl ChatProxy {
@@ -329,6 +339,20 @@ impl ChatProxy {
             retry_delays: vec![Duration::from_millis(250), Duration::from_secs(1)],
             cache: Mutex::new(IndexMap::new()),
             flights: Mutex::new(IndexMap::new()),
+            upstream_bearers: BTreeMap::new(),
+        }
+    }
+
+    pub fn with_upstream_bearers(mut self, bearers: BTreeMap<String, UpstreamBearer>) -> Self {
+        self.upstream_bearers = bearers;
+        self
+    }
+
+    fn upstream_post(&self, endpoint: &str, url: &str, payload: &Value) -> reqwest::RequestBuilder {
+        let request = self.client.post(url).json(payload);
+        match self.upstream_bearers.get(endpoint) {
+            Some(bearer) => bearer.on(request),
+            None => request,
         }
     }
 
@@ -674,7 +698,17 @@ impl ChatProxy {
         let Some(request_id) = opts.request_id else {
             let mut uncertain = false;
             let outcome = self
-                .forward_once_observed(&url, &payload, opts, &fingerprint, &mut uncertain, observer)
+                .forward_once_observed(
+                    UpstreamAttempt {
+                        endpoint,
+                        url: &url,
+                        payload: &payload,
+                    },
+                    opts,
+                    &fingerprint,
+                    &mut uncertain,
+                    observer,
+                )
                 .await?;
             return Ok(Self::finalize_success(outcome, success_gate).0);
         };
@@ -762,7 +796,17 @@ impl ChatProxy {
         let mut cancellation_guard = FlightCancellationGuard::new(Arc::clone(&flight));
         let mut uncertain = false;
         let outcome = match self
-            .forward_once_observed(&url, &payload, opts, &fingerprint, &mut uncertain, observer)
+            .forward_once_observed(
+                UpstreamAttempt {
+                    endpoint,
+                    url: &url,
+                    payload: &payload,
+                },
+                opts,
+                &fingerprint,
+                &mut uncertain,
+                observer,
+            )
             .await
         {
             Ok(outcome) => outcome,
@@ -924,8 +968,7 @@ impl ChatProxy {
 
     async fn forward_once_observed<F, Fut, E>(
         &self,
-        url: &str,
-        payload: &Value,
+        call: UpstreamAttempt<'_>,
         opts: &ForwardOpts<'_>,
         fingerprint: &[u8; 32],
         uncertain: &mut bool,
@@ -938,7 +981,7 @@ impl ChatProxy {
         let tenant_scope = opts.tenant_id.unwrap_or("\u{0}personal");
 
         if let Some(request_id) = opts.request_id {
-            let key = cache_key(tenant_scope, url, opts.provider_id, request_id);
+            let key = cache_key(tenant_scope, call.url, opts.provider_id, request_id);
             if let Some(hit) = self.lookup_cached(&key, fingerprint, opts) {
                 return Ok(hit);
             }
@@ -952,7 +995,8 @@ impl ChatProxy {
             // connection failure proves that this POST was not executed.
             let sent = tokio::time::timeout(
                 self.header_timeout,
-                self.client.post(url).json(payload).send(),
+                self.upstream_post(call.endpoint, call.url, call.payload)
+                    .send(),
             )
             .await;
             match sent {
@@ -1129,7 +1173,7 @@ impl ChatProxy {
         observer().await?;
         let sent = match tokio::time::timeout(
             self.header_timeout,
-            self.client.post(&url).json(&payload).send(),
+            self.upstream_post(endpoint, &url, &payload).send(),
         )
         .await
         {
@@ -1457,6 +1501,67 @@ mod tests {
 
     fn chat_body() -> Value {
         serde_json::json!({"model": "idoris/daily", "messages": [{"role": "user", "content": "hi"}]})
+    }
+
+    fn authorization_header(request: &wiremock::Request) -> Option<String> {
+        request
+            .headers
+            .get("authorization")
+            .map(|value| value.to_str().unwrap().to_string())
+    }
+
+    #[tokio::test]
+    async fn configured_bearer_is_sent_on_buffered_and_stream_posts() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "choices": [{"message": {"content": "ok"}}]
+                })),
+            )
+            .expect(2)
+            .mount(&server)
+            .await;
+        let bearer = UpstreamBearer::from_secret("proxy-token").unwrap();
+        let mut bearers = BTreeMap::new();
+        bearers.insert(server.uri(), bearer);
+        let proxy = ChatProxy::new(reqwest::Client::new()).with_upstream_bearers(bearers);
+        let buffered = proxy
+            .forward_buffered(&server.uri(), &chat_body(), &opts(None, "rec-bearer"))
+            .await;
+        assert_eq!(buffered.status, 200);
+        match proxy.forward_stream(&server.uri(), &chat_body()).await {
+            StreamOutcome::Buffered { status, .. } | StreamOutcome::Stream { status, .. } => {
+                assert_eq!(status, 200);
+            }
+        }
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests.iter().all(|request| {
+            authorization_header(request).as_deref() == Some("Bearer proxy-token")
+        }));
+    }
+
+    #[tokio::test]
+    async fn undeclared_bearer_sends_no_authorization() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "choices": [{"message": {"content": "ok"}}]
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let proxy = ChatProxy::new(reqwest::Client::new());
+        let outcome = proxy
+            .forward_buffered(&server.uri(), &chat_body(), &opts(None, "rec-none"))
+            .await;
+        assert_eq!(outcome.status, 200);
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(authorization_header(&requests[0]), None);
     }
 
     #[tokio::test]

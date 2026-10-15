@@ -32,6 +32,7 @@ use idoris_router::{
         config::SubscriptionConfig,
         runtime::{SubscriptionRuntimeHandle, SubscriptionRuntimeRegistry, authorize_subscription},
     },
+    upstream_auth,
     write_timeout::{DEFAULT_WRITE_TIMEOUT, WriteTimeoutListener},
 };
 use std::{
@@ -242,7 +243,12 @@ async fn run(options: cli::ServeOptions) -> Result<(), String> {
         })?;
 
     let local_runtime_path = config::optional_env_path("IDORIS_LOCAL_RUNTIME_CONFIG")?;
-    let local_runtime_configs = runtime_launch_config::load(local_runtime_path.as_deref())?;
+    let mut local_runtime_configs = runtime_launch_config::load(local_runtime_path.as_deref())?;
+    let endpoint_bearers = upstream_auth::prepare_upstream_auth(
+        &cards,
+        &mut local_runtime_configs,
+        &upstream_auth::read_process_env,
+    )?;
     let runtimes = RuntimeRegistry::spawn_with_local_configs_and_budget(
         &cards,
         &local_runtime_configs,
@@ -292,7 +298,7 @@ async fn run(options: cli::ServeOptions) -> Result<(), String> {
         .map(|c| format!("{}({:?})", c.provider.id, c.form))
         .collect::<Vec<_>>()
         .join(", ");
-    let state = AppState {
+    let mut state = AppState {
         deploy_mode,
         cards,
         routing_policy,
@@ -307,6 +313,7 @@ async fn run(options: cli::ServeOptions) -> Result<(), String> {
         event_log: Some(persistent.event_log),
         ..AppState::default()
     };
+    upstream_auth::install_upstream_bearers(&mut state, endpoint_bearers);
 
     let addr = std::net::SocketAddr::from((bind_host, port));
     let data_listener = tokio::net::TcpListener::bind(addr)

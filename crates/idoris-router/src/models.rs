@@ -263,6 +263,8 @@ mod tests {
             fail_closed: true,
             load_policy: None,
             extensions: None,
+
+            auth: None,
         }
     }
 

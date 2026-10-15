@@ -63,6 +63,20 @@
     "fail_closed": {
       "type": "boolean"
     },
+    "auth": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "env"],
+      "properties": {
+        "kind": { "const": "bearer" },
+        "env": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+        }
+      }
+    },
     "load_policy": {
       "$ref": "load-policy.schema.json"
     },

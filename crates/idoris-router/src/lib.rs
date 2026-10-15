@@ -39,6 +39,7 @@ pub mod admin;
 /// Per-card runtime construction for lifecycle-managed providers.
 pub mod runtime;
 pub mod runtime_launch_config;
+pub mod upstream_auth;
 
 /// Atomic reserve/settle/release around a paid candidate (R2-D task 4); not
 /// yet wired into `dispatch`/the request path — a follow-up PR does that.
@@ -3290,6 +3291,9 @@ fn audit_reason(status: StatusCode, served_locality: bool, degraded: bool) -> St
 }
 
 #[cfg(test)]
+mod bearer_auth_tests;
+
+#[cfg(test)]
 mod local_privacy_tests;
 
 #[cfg(test)]
@@ -3402,6 +3406,8 @@ mod tests {
             fail_closed: true,
             load_policy: None,
             extensions: None,
+
+            auth: None,
         }
     }
 

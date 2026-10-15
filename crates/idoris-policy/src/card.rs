@@ -133,6 +133,8 @@ pub(crate) mod test_support {
                     admission: Admission::Coexist,
                 }),
                 extensions: None,
+
+                auth: None,
             },
             roles: roles.to_vec(),
             experiment: false,
