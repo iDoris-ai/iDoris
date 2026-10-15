@@ -190,7 +190,7 @@ impl LocalHttpRuntimeAdapter {
                 message: "local runtime chat timed out".into(),
             })??;
         if req.native.is_some() {
-            return crate::native_completion_wire::response(raw);
+            return self.native_response(raw, &engine_model);
         }
         let content = raw
             .pointer("/choices/0/message/content")
@@ -204,6 +204,36 @@ impl LocalHttpRuntimeAdapter {
             model: self.config.model_id.clone(),
             content,
         })
+    }
+
+    /// The engine is addressed by `engine_model` (mlx_lm.server's
+    /// `default_model` placeholder, or the configured id for llama.cpp) and
+    /// must echo exactly that; anything else is not evidence this owned
+    /// single-model process served the call. A verified echo is then mapped
+    /// to the configured iDoris model id in both the response identity and
+    /// the native body's `model` field — the one deliberate exception to raw
+    /// native body pass-through. All other engine fields stay untouched.
+    fn native_response(
+        &self,
+        raw: serde_json::Value,
+        engine_model: &str,
+    ) -> Result<ChatResponse, BackendError> {
+        if raw.get("model").and_then(serde_json::Value::as_str) != Some(engine_model) {
+            return Err(BackendError::Upstream {
+                message:
+                    "local runtime native response model did not echo the requested engine model"
+                        .into(),
+            });
+        }
+        let mut response = crate::native_completion_wire::response(raw)?;
+        response.model = self.config.model_id.clone();
+        if let Some(serde_json::Value::Object(body)) = response.native.as_mut() {
+            body.insert(
+                "model".into(),
+                serde_json::Value::String(self.config.model_id.clone()),
+            );
+        }
+        Ok(response)
     }
 }
 
