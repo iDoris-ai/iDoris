@@ -429,8 +429,11 @@ def run_consumer(argv, env, cwd, timeout):
             with contextlib.suppress(ProcessLookupError):
                 os.kill(p.pid, signal.SIGKILL)
             out, err = p.communicate()
-    with contextlib.suppress(ProcessLookupError):  # reap stragglers in the group
-        os.killpg(p.pid, signal.SIGKILL)
+    # Timeout already sent SIGKILL to the whole group before reaping the parent.
+    # Do not signal that retired group ID again after communicate reaps it.
+    if not timed_out:
+        with contextlib.suppress(ProcessLookupError):  # stop descendants of a normally exited parent
+            os.killpg(p.pid, signal.SIGKILL)
     return {'exit_code': None if timed_out else p.returncode, 'timed_out': timed_out,
             'seconds': round(time.monotonic() - t0, 2), 'stdout': out, 'stderr': err,
             'session_pid': p.pid}
@@ -467,8 +470,7 @@ def acceptance(args, scrub):
     plat = sys.platform
     report['coverage_gaps'] += [
         (f'Fixture/tool plumbing exercised on sys.platform={plat} only. '
-         'This is not real-engine proof for other platforms; macOS/Windows engine '
-         'evidence, if any, is external-reported and not claimed by this cloud/Linux run.'),
+         'This does not establish real-engine behaviour or results on other platforms.'),
         'Cloud-direct bypass is not observable: only loopback canaries (:8000 oMLX, :11434 Ollama by default) are counted.',
         'Fixture stands in for oMLX/Ollama; real model quality/lifecycle not tested.',
         'Tap buffers responses: SSE streaming path is not covered.',
@@ -487,7 +489,7 @@ def acceptance(args, scrub):
         raise ToolError('--agent24-bin is not executable')
 
     canary_ports = parse_canary_ports(getattr(args, 'canary_ports', None))
-    fixture, canaries, gw, tap = Fixture(), Canaries(canary_ports), None, None
+    canaries, gw, tap = Canaries(canary_ports), None, None
     report['canaries'] = {
         'requested_ports': dict(canaries.ports),
         'bound_ports': dict(canaries.bound),
@@ -502,6 +504,15 @@ def acceptance(args, scrub):
         report['coverage_gaps'].append(
             f'canary {name} not bound on port {canaries.ports.get(name)} ({why}); '
             'bypass to that port is unobservable on this run.')
+    if canaries.unavailable:
+        missing = ', '.join(f'{name}@{canaries.ports[name]}' for name in sorted(canaries.unavailable))
+        report['verdict'] = 'BLOCKED'
+        report['reason'] = (
+            f'direct-backend canary bind incomplete ({missing}); consumer was not launched. '
+            'Use available dedicated --canary-ports only when that limited coverage is intended.')
+        canaries.close()
+        return report
+    fixture = Fixture()
     with tempfile.TemporaryDirectory(prefix='a24-idoris-') as tmp:
         root = Path(tmp)
         scrub.add_path(root, '<tmp>')
@@ -564,17 +575,6 @@ def acceptance(args, scrub):
     if report['static'] and not report['static']['idoris_url_provider_found'] and report['verdict'] == 'PASS':
         report['coverage_gaps'].append('Static scan found no IDORIS_URL literal although dynamic run passed '
                                        '(provider may use another config name; review).')
-    # L2: never PASS when any requested canary failed to bind — bypass would be invisible.
-    unavailable = (report.get('canaries') or {}).get('unavailable') or {}
-    if unavailable and report.get('verdict') == 'PASS':
-        requested = (report.get('canaries') or {}).get('requested_ports') or {}
-        missing = ', '.join(f'{n}@{requested.get(n)}' for n in sorted(unavailable))
-        report['verdict'] = 'BLOCKED'
-        report['reason'] = (
-            f'direct-backend canary bind incomplete ({missing}); '
-            'bypass detection coverage is limited — refusing PASS. '
-            'Do not terminate existing Ollama/oMLX; free those ports, or pass '
-            '--canary-ports with dedicated loopback ports (proof then limited to those ports).')
     return report
 
 
@@ -846,6 +846,20 @@ class SelfTest(unittest.TestCase):
         finally:
             for s in holders:
                 s.close()
+
+    def test_occupied_canary_blocks_before_consumer_launch(self):
+        with tempfile.TemporaryDirectory() as tmp, socket.socket() as holder:
+            holder.bind(('127.0.0.1', 0))
+            holder.listen(1)
+            marker = Path(tmp) / 'consumer-started'
+            command = [sys.executable, '-c',
+                       f'from pathlib import Path; Path({str(marker)!r}).write_text("started")']
+            args = mk_args(agent24_bin=sys.executable, agent24_call_cmd=json.dumps(command),
+                           canary_ports=json.dumps({'occupied-fixture': holder.getsockname()[1]}))
+            report = acceptance(args, Scrubber())
+            self.assertEqual(report['verdict'], 'BLOCKED')
+            self.assertEqual(report['scenarios'], [])
+            self.assertFalse(marker.exists(), 'a blocked run must not launch the consumer')
 
     def test_noop_stub_is_red_not_implemented(self):
         self.need_bin()
