@@ -1,0 +1,10 @@
+{
+  "sequence": 1,
+  "task_id": "idoris-cloud-claude-pr521-identity-20261015-5287",
+  "attempt_id": "a18a1a48-194d-468b-bee4-f54192f0c3c1",
+  "base_sha": "c3000c6bfff6080619f5e1d693555559b57f709f",
+  "base_branch": "ops/cloud-pr521-model-identity-20261015-5287",
+  "branch": "claude/idoris-pr521-identity-5287-j89ti8",
+  "requested_branch": "claude/idoris-pr521-identity-5287",
+  "status": "started"
+}
