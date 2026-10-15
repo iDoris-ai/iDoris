@@ -112,6 +112,7 @@ async fn mount_omlx_success(server: &MockServer) {
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "model": "Qwen3-0.6B-4bit",
             "choices": [{"message":{"content":"actual response"}}]
         })))
         .mount(server)

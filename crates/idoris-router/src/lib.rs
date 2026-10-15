@@ -2468,6 +2468,7 @@ async fn chat_completions(
         .as_ref()
         .and_then(|selected| state.runtimes.get(&selected.card.provider.id));
     let budget_ledger = state.budget_ledger.as_deref();
+    let native = supervisor_parameters::payload(object);
     let dispatch_result = if let Some(selected) = selected_for_dispatch.as_ref() {
         match dispatch_local_preselected_observed(
             selected,
@@ -2478,7 +2479,8 @@ async fn chat_completions(
                 dispatched_event_context.as_ref(),
                 completed_event_context.as_ref(),
                 budget_settled_event_context.as_ref(),
-            ),
+            )
+            .with_native(&native),
             &parsed,
             dispatch::DispatchInput::with_model(model, &prompt).with_affinity(affinity_key),
             messages,
@@ -2516,7 +2518,22 @@ async fn chat_completions(
             Err(failure) => dispatch_failure_response(failure, &outcome),
             Ok(chat_response) => {
                 let (body, prompt_tokens, completion_tokens) =
-                    openai_chat_completion(&chat_response.content, &chat_response.model, &prompt);
+                    if let Some(body) = &chat_response.native {
+                        (
+                            body.clone(),
+                            body.pointer("/usage/prompt_tokens")
+                                .and_then(serde_json::Value::as_u64),
+                            body.pointer("/usage/completion_tokens")
+                                .and_then(serde_json::Value::as_u64),
+                        )
+                    } else {
+                        let (body, input, output) = openai_chat_completion(
+                            &chat_response.content,
+                            &chat_response.model,
+                            &prompt,
+                        );
+                        (body, Some(input), Some(output))
+                    };
                 let mut response = (StatusCode::OK, Json(body)).into_response();
                 apply_decision_headers(&mut response, &outcome);
                 let usage_cost_minor = match selected_estimated_cost {
@@ -2524,13 +2541,12 @@ async fn chat_completions(
                     Some(_) => outcome.actual_cost_minor,
                     None => None,
                 };
-                response
-                    .extensions_mut()
-                    .insert(usage::UsageFact::inference_with_tokens(
-                        usage_cost_minor,
-                        prompt_tokens,
-                        completion_tokens,
-                    ));
+                response.extensions_mut().insert(usage::UsageFact {
+                    cost_minor: usage_cost_minor,
+                    tokens_in: prompt_tokens,
+                    tokens_out: completion_tokens,
+                    inference: true,
+                });
                 // X-iDoris-Cost-Minor: only set for a genuinely paid,
                 // settled candidate -- omitted for free/local calls.
                 if let Some(cost_minor) = outcome.actual_cost_minor

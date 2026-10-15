@@ -378,6 +378,7 @@ impl RuntimeAdapter for MockAdapter {
             .map(|m| m.content.as_str())
             .unwrap_or("");
         Ok(ChatResponse {
+            native: None,
             model: req.model,
             content: format!("mock reply to: {last_user_message}"),
         })
