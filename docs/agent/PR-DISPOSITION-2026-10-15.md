@@ -8,8 +8,8 @@
 
 - 沿栈继承不等于替代：功能尚未进入 main 的 M5 切片继续开发。
 - 完整活跃替代 PR 可以承接旧 PR 的审查；关闭旧 PR 不代表替代已合并或已发布。
-- 关闭清单中的旧 base 分支全部保留，禁止破坏未合并子 PR 的差异；没有强推、批量 rebase 或删除远端分支。
-- #425 的契约修复正在开发；#479 已以 b8f3214 快进更新原 PR，经独立本地复核后重新等待远程 review/CI。
+- 仍有开放 PR 依赖的 base 分支保留。四个已无消费者和 checkout 的远端分支在完整祖先与备份验证后删除；无强推或批量 rebase。
+- #425 已以58a7edb修复契约不变量；#479 已以b8f3214修复completion cap，两者均重新等待远程review/CI。
 - M5 的 REDACT 仍需 iDoris 本地控制台中用户逐次、单次确认；长期/调用方授权暂不启用。
 
 ## 重复与历史 PR 的承接清单
@@ -18,11 +18,11 @@
 | --- | --- | --- |
 | [#422](https://github.com/iDoris-ai/iDoris/pull/422) | 历史快照归档；本账本承接现状，保留原 commit 与分支。 | 已关闭；保留分支 |
 | [#462](https://github.com/iDoris-ai/iDoris/pull/462) | 历史快照归档；保留 FU-208–224 映射及默认数据库事项。 | 已关闭；保留分支 |
-| [#464](https://github.com/iDoris-ai/iDoris/pull/464) | 由 #476 承接；六个契约文件 blob 相同，尚未发布。 | 已关闭；保留分支 |
-| [#466](https://github.com/iDoris-ai/iDoris/pull/466) | 由 #493 承接；启动/后代回收测试 blob 相同，fixture 为严格包含，尚未发布。 | 已关闭；保留分支 |
+| [#464](https://github.com/iDoris-ai/iDoris/pull/464) | 由 #476 承接；六个契约文件 blob 相同，尚未发布。 | 已关闭；无消费者远端分支已归档后删除 |
+| [#466](https://github.com/iDoris-ai/iDoris/pull/466) | 由 #493 承接；启动/后代回收测试 blob 相同，fixture 为严格包含，尚未发布。 | 已关闭；无消费者远端分支已归档后删除 |
 | [#481](https://github.com/iDoris-ai/iDoris/pull/481) | 由 #508 承接；四端点 warmed-cache 撤销测试归一化后完全相同。 | 已关闭；保留分支 |
-| [#486](https://github.com/iDoris-ai/iDoris/pull/486) | 由 #508 承接；三个验收测试归一化后完全相同。 | 已关闭；保留分支 |
-| [#487](https://github.com/iDoris-ai/iDoris/pull/487) | 由 main 的0.3.0版本与 #507 的迁移文档/隔离smoke完整承接。 | 已关闭；保留分支 |
+| [#486](https://github.com/iDoris-ai/iDoris/pull/486) | 由 #508 承接；三个验收测试归一化后完全相同。 | 已关闭；无消费者远端分支已归档后删除 |
+| [#487](https://github.com/iDoris-ai/iDoris/pull/487) | 由 main 的0.3.0版本与 #507 的迁移文档/隔离smoke完整承接。 | 已关闭；无消费者远端分支已归档后删除 |
 | [#488](https://github.com/iDoris-ai/iDoris/pull/488) | 由 #508 的显式上限及正反用例、#507 的新Personal数据库/模式切换说明承接。 | 已关闭；保留分支 |
 
 关闭后，原73项剩余65个审查入口：60个M5功能/测试切片、#491的M5 CI配套，以及4个M4测试收尾。新建PR另计。M5已归入 [GitHub里程碑](https://github.com/iDoris-ai/iDoris/milestone/1)，M4接线收尾归入 [v0.3.1](https://github.com/iDoris-ai/iDoris/milestone/2)。
@@ -113,6 +113,18 @@
 | [#495](https://github.com/iDoris-ai/iDoris/pull/495) / [8cd157f](https://github.com/iDoris-ai/iDoris/commit/8cd157f0a6bc7951cbbb08ace52578c1503e1535) / #452 | M5：Backport stable spawn and Unicode fixture repair to #452。生产：None. 测试：512KiB stdin/64KiB stderr/3s pressure and closed-stdin fixed-error tests, seed/non-digit generator and stage-current decimal boundary cases, plus #466 races. 文档：None. | main：Main has old fixture modes and no inspector; only disappearance wait partly covered by #504. 后续：#490 has same mature repair concept but is not on original #452 base; #493/#494 target other parent heads. | No exact-head blocker retained in fetched reviews; this is not a new approval. Integration/base/dependency reconciliation remains; CI SUCCESS alone is not delivery evidence. 下一步：Integrate repair into #452 or deliberately retire original slice only after accepted replacement carries all production and unique tests; preserve nonleaking error and pressure limits. |
 | [#496](https://github.com/iDoris-ai/iDoris/pull/496) / [ae3db80](https://github.com/iDoris-ai/iDoris/commit/ae3db80292e3c5368cfbe08b15792736e2e71367) / #488 | unfinished M4：Paid proxy budget-event append failure acceptance。生产：None. 测试：paid_proxy_budget_event_failure_releases_before_upstream: trigger abort budget.reserved -> generic 503, zero POST, no reservation event, spent/reserved/available unchanged. 文档：None. | main：Main budget_reserved_wiring_tests.rs lacks this direct-proxy regression; local Supervisor append-failure coverage does not prove proxy behavior. 后续：Latest leaf on #488 M4 chain; root auth port does not itself claim this test and no merged later replacement is proven. | No exact-head blocker retained in fetched reviews; this is not a new approval. Integration/base/dependency reconciliation remains; CI SUCCESS alone is not delivery evidence. 下一步：Port this single focused regression to main using current role-bound fixture and auth setup; only close after independently verified equivalent assertions land. |
 | [#497](https://github.com/iDoris-ai/iDoris/pull/497) / [f3b80ca](https://github.com/iDoris-ai/iDoris/commit/f3b80ca5cbed69045628c27fa218532b26fed719) / #492 | M5：Reject encoded semicolon path traversal before reveal。生产：Add %3b to lowercased credential destination denylist, covering %3B too. 测试：Both spellings in C-2 denied-destination test, including no secret reveal. 文档：None. | main：Main lacks credentials broker; this remains unique policy core. 后续：Fixes one conditional #461 bypass only; %u/overlong/fullwidth path escape class and all #461 breaker defects remain. No later replacement exists in snapshot. | Own exact-head APPROVED; inherited #461 blockers remain, and its current approval explicitly says it does not close encoded-path class. 下一步：Port small accepted fix into #461 original head if that remains review unit, then replace denylist with reviewed path policy and keep zero-reveal regression. Preserve test even if implementation changes. |
+
+## 本轮追加验证与分支处理
+
+- #425 新 head 58a7edb：Rust/schema/Zod 一致验证未扫描输入不带 span 且只可 BLOCK；39项 Rust 契约、621项 TS 和六个逐规则负控通过。协调者复核生产 diff，没有冒称重复独立执行全套。
+- #479 新 head b8f3214：两个 completion cap 字段严格校验，41项预算及 singleflight 重放验收通过，另有独立边界 probe。
+- #479 修复传播到 #480、已关闭但仍作 base 的 #481、#489、#490、#492、#497。六层原 slice 的 stable patch-id 逐项相同；组合 tip 在新 target 上的41项预算测试通过，六个远端 ref 原子快进成功。#481 原 commit 仍可达。
+- #464/#466/#486/#487 的远端临时分支已删除：逐个确认没有开放 base 消费者、没有 checkout，旧 head 是对应 #476/#493/#496 的祖先，并先验证完整 bundle 备份。四个本地分支不存在或与远端不同，未强删本地分支。
+- 字节预算修复已按后端和 Router 两层提交 #511/#512；逐模型整数 charge/CAS 的完整组合通过独立公开 dispatch 及生命周期复核，仍待当前 head 的远程 review/CI 和主线验收，尚未发布。
+- #508 已获精确 head 批准且9/9 CI通过，合并至 main 959337d；v0.3.0 标签仍指向03c079c，不把主线修复误写进已发布归档。
+- #479 的 b8f3214 又发现显式 null 的兼容性回归，正在修复；#425 的两项 Rust CI 失败来自旧分支上的依赖安全检查，等待同步修复。两项都不能因本地针对性测试通过就视为最终完成。
+- #464/#466/#486/#487 的删除时间为2026-10-15 07:44Z。原提交可分别用 `git fetch origin refs/pull/464/head`（替换为对应PR编号）取回，再以 `git show FETCH_HEAD` 检查；本地完整备份也已验证。
+- 本轮传播时，#481 的 head 分支（#489 的 base）快进到 ff45e24，原81c2e75仍是祖先；后续合法快进以远端即时状态为准。#422/#462/#488在本次检查时仍位于原 head，不承诺分支名永久存在。
 
 ## 历史快照及未完成事项保留
 
