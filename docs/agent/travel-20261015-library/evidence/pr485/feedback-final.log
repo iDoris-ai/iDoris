@@ -1,0 +1,15 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.17s
+     Running unittests src/lib.rs (target/debug/deps/idoris_router-38320eab92319385)
+
+running 8 tests
+test feedback_wiring_tests::authenticated_tenant_request_writes_its_own_terminal_audit ... ok
+test feedback_wiring_tests::explicit_null_rubric_keeps_existing_rating_feedback_valid ... ok
+test feedback_wiring_tests::feedback_control_char_metadata_is_400_before_event_log ... ok
+test feedback_wiring_tests::feedback_rejects_unknown_record_and_content_fields ... ok
+test feedback_wiring_tests::metadata_feedback_appends_to_existing_record ... ok
+test feedback_wiring_tests::rejected_tenant_requests_do_not_write_victim_audit_rows ... ok
+test feedback_wiring_tests::tenant_feedback_rejects_invalid_tenant_identifier_before_event_log ... ok
+test feedback_wiring_tests::tenant_key_cannot_write_feedback_or_request_event_to_another_tenant ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 446 filtered out; finished in 0.01s
+

@@ -1,0 +1,17 @@
+   Compiling idoris-router v0.3.0 (/Users/jason/Dev/auraai/iDoris/crates/idoris-router)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 5.29s
+     Running unittests src/lib.rs (target/debug/deps/idoris_router-c3e58bdfacda1323)
+
+running 9 tests
+test virtual_key_wiring_tests::tenant_authority_regressions::bound_tenant_key_serves_only_its_tenant_and_records_the_authenticated_chain ... ok
+test virtual_key_wiring_tests::tenant_authority_regressions::explicitly_personal_key_accepts_its_scope_and_rejects_foreign_or_duplicate_headers ... ok
+test virtual_key_wiring_tests::tenant_authority_regressions::personal_deployment_does_not_promote_a_tenant_bound_key ... ok
+test virtual_key_wiring_tests::tenant_authority_regressions::personal_inference_rejects_foreign_bound_keys_before_upstream ... ok
+test virtual_key_wiring_tests::tenant_authority_regressions::rejected_key_role_never_writes_request_received ... ok
+test virtual_key_wiring_tests::tenant_authority_regressions::revoked_tenant_key_cannot_replay_warmed_inference_caches ... ok
+test virtual_key_wiring_tests::tenant_authority_regressions::unbound_personal_key_preserves_legacy_tenant_header_behavior ... ok
+test virtual_key_wiring_tests::tenant_keys_reject_cross_tenant_unbound_and_anonymous_requests_without_side_effects ... ok
+test virtual_key_wiring_tests::tenant_library_without_authenticator_fails_closed_without_egress_or_audit ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 445 filtered out; finished in 0.06s
+

@@ -1,0 +1,43 @@
+{
+  "cwd": "/Users/jason/Dev/auraai/iDoris",
+  "tested_commit": "e630eabdefc097760eaeadc3422dce286836d816",
+  "tested_file_blob": "489fbc49027805fa5bfd008a762f635a7be08791",
+  "commands": [
+    {
+      "log": "baseline-auth.log",
+      "command": "CARGO_BUILD_JOBS=2 cargo test --locked --offline -p idoris-router --lib virtual_key_wiring_tests -- --test-threads=1",
+      "exit_code": 0,
+      "source_commit": "9054a5d0f74e6468adc6207336077801d838c36d"
+    },
+    {
+      "log": "migration.log",
+      "command": "CARGO_BUILD_JOBS=2 cargo test --locked --offline -p idoris-router --lib virtual_key_wiring_tests::tenant_ -- --test-threads=1",
+      "exit_code": 0,
+      "source_commit": "e630eabdefc097760eaeadc3422dce286836d816"
+    },
+    {
+      "log": "auth-final.log",
+      "command": "CARGO_BUILD_JOBS=2 cargo test --locked --offline -p idoris-router --features idoris-tenancy/test-bins,idoris-tenancy/mutation-test-hooks --lib virtual_key_wiring_tests -- --test-threads=1",
+      "exit_code": 0,
+      "source_commit": "e630eabdefc097760eaeadc3422dce286836d816"
+    },
+    {
+      "log": "feedback-final.log",
+      "command": "CARGO_BUILD_JOBS=2 cargo test --locked --offline -p idoris-router --features idoris-tenancy/test-bins,idoris-tenancy/mutation-test-hooks --lib feedback_wiring_tests -- --test-threads=1",
+      "exit_code": 0,
+      "source_commit": "e630eabdefc097760eaeadc3422dce286836d816"
+    },
+    {
+      "log": "clippy.log",
+      "command": "CARGO_BUILD_JOBS=2 cargo clippy --locked --offline -p idoris-router --all-targets --features idoris-tenancy/test-bins,idoris-tenancy/mutation-test-hooks -- -D warnings",
+      "exit_code": 0,
+      "source_commit": "e630eabdefc097760eaeadc3422dce286836d816"
+    },
+    {
+      "log": "fmt.log",
+      "command": "cargo fmt --all -- --check",
+      "exit_code": 0,
+      "source_commit": "e630eabdefc097760eaeadc3422dce286836d816"
+    }
+  ]
+}

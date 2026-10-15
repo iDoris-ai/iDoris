@@ -1,0 +1,28 @@
+   Compiling idoris-tenancy v0.3.0 (/Users/jason/Dev/auraai/iDoris/crates/idoris-tenancy)
+   Compiling idoris-router v0.3.0 (/Users/jason/Dev/auraai/iDoris/crates/idoris-router)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 15.27s
+     Running unittests src/lib.rs (target/debug/deps/idoris_router-38320eab92319385)
+
+running 19 tests
+test virtual_key_wiring_tests::all_auth_failures_are_the_same_401_and_never_reach_upstream ... ok
+test virtual_key_wiring_tests::data_plane_requires_bearer_by_default_on_loopback_and_remote ... ok
+test virtual_key_wiring_tests::dev_no_key_allows_only_missing_auth_to_free_loopback_local_only ... ok
+test virtual_key_wiring_tests::dev_no_key_rejects_any_paid_remote_and_invalid_bearer_before_egress ... ok
+test virtual_key_wiring_tests::explicit_loopback_dev_no_key_allows_missing_bearer_but_rejects_invalid_bearer ... ok
+test virtual_key_wiring_tests::health_reports_dev_no_key_enabled_without_auth_material ... ok
+test virtual_key_wiring_tests::key_expiring_while_waiting_for_store_lock_is_401_and_never_reaches_upstream ... ok
+test virtual_key_wiring_tests::protocol_routes_reject_privacy_outside_authenticated_key_scope ... ok
+test virtual_key_wiring_tests::scope_and_fallback_fail_403_before_any_upstream_call ... ok
+test virtual_key_wiring_tests::tenant_authority_regressions::bound_tenant_key_serves_only_its_tenant_and_records_the_authenticated_chain ... ok
+test virtual_key_wiring_tests::tenant_authority_regressions::explicitly_personal_key_accepts_its_scope_and_rejects_foreign_or_duplicate_headers ... ok
+test virtual_key_wiring_tests::tenant_authority_regressions::personal_deployment_does_not_promote_a_tenant_bound_key ... ok
+test virtual_key_wiring_tests::tenant_authority_regressions::personal_inference_rejects_foreign_bound_keys_before_upstream ... ok
+test virtual_key_wiring_tests::tenant_authority_regressions::rejected_key_role_never_writes_request_received ... ok
+test virtual_key_wiring_tests::tenant_authority_regressions::revoked_tenant_key_cannot_replay_warmed_inference_caches ... ok
+test virtual_key_wiring_tests::tenant_authority_regressions::unbound_personal_key_preserves_legacy_tenant_header_behavior ... ok
+test virtual_key_wiring_tests::tenant_keys_reject_cross_tenant_unbound_and_anonymous_requests_without_side_effects ... ok
+test virtual_key_wiring_tests::tenant_library_without_authenticator_fails_closed_without_egress_or_audit ... ok
+test virtual_key_wiring_tests::valid_key_reaches_execution_boundary_and_none_authenticator_preserves_legacy_behavior ... ok
+
+test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 435 filtered out; finished in 5.98s
+

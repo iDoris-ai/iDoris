@@ -1,0 +1,389 @@
+diff --git a/crates/idoris-router/src/auth.rs b/crates/idoris-router/src/auth.rs
+index af348530..da630f61 100644
+--- a/crates/idoris-router/src/auth.rs
++++ b/crates/idoris-router/src/auth.rs
+@@ -34,6 +34,7 @@ impl std::error::Error for VirtualKeyAuthError {}
+ 
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+ pub enum VirtualKeyScopeError {
++    TenantForbidden,
+     PrivacyForbidden,
+     RoleForbidden,
+     FallbackForbidden,
+@@ -42,6 +43,7 @@ pub enum VirtualKeyScopeError {
+ impl VirtualKeyScopeError {
+     pub const fn reason_code(self) -> &'static str {
+         match self {
++            Self::TenantForbidden => "VIRTUAL_KEY_TENANT_FORBIDDEN",
+             Self::PrivacyForbidden => "VIRTUAL_KEY_PRIVACY_FORBIDDEN",
+             Self::RoleForbidden => "VIRTUAL_KEY_ROLE_FORBIDDEN",
+             Self::FallbackForbidden => "VIRTUAL_KEY_FALLBACK_FORBIDDEN",
+diff --git a/crates/idoris-router/src/feedback_wiring_tests.rs b/crates/idoris-router/src/feedback_wiring_tests.rs
+index f892acff..71f778c1 100644
+--- a/crates/idoris-router/src/feedback_wiring_tests.rs
++++ b/crates/idoris-router/src/feedback_wiring_tests.rs
+@@ -160,8 +160,8 @@ async fn tenant_feedback_rejects_invalid_tenant_identifier_before_event_log() {
+         ))
+         .await
+         .unwrap();
+-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
++    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+     let bytes = response.into_body().collect().await.unwrap().to_bytes();
+     let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+-    assert_eq!(json["error"]["type"], "invalid_tenant_scope");
++    assert_eq!(json["error"]["type"], "policy_violation");
+ }
+diff --git a/crates/idoris-router/src/lib.rs b/crates/idoris-router/src/lib.rs
+index 2d7072a7..16d68ddc 100644
+--- a/crates/idoris-router/src/lib.rs
++++ b/crates/idoris-router/src/lib.rs
+@@ -466,14 +466,20 @@ async fn remote_bind_auth_middleware(
+     let has_bearer = request
+         .headers()
+         .contains_key(axum::http::header::AUTHORIZATION);
+-    if state.dev_no_key_enabled && !state.remote_bind_requires_auth && !has_bearer {
++    if state.dev_no_key_enabled
++        && state.deploy_mode == idoris_contracts::DeployMode::Personal
++        && !state.remote_bind_requires_auth
++        && !has_bearer
++    {
+         return next.run(request).await;
+     }
+     let Some(authenticator) = &state.virtual_key_authenticator else {
+-        return if state.remote_bind_requires_auth {
++        return if state.remote_bind_requires_auth
++            || state.deploy_mode == idoris_contracts::DeployMode::Tenant
++        {
+             virtual_key_unauthorized_response()
+         } else {
+-            // Library callers may intentionally omit the production
++            // Personal library callers may intentionally omit the production
+             // authenticator; production startup always installs one.
+             next.run(request).await
+         };
+@@ -482,8 +488,28 @@ async fn remote_bind_auth_middleware(
+         Ok(identity) => identity,
+         Err(_) => return virtual_key_unauthorized_response(),
+     };
++    let trusted_tenant = if state.deploy_mode == idoris_contracts::DeployMode::Tenant {
++        let Some(bound) = identity.scope.tenant_id.as_deref() else {
++            return virtual_key_scope_response(auth::VirtualKeyScopeError::TenantForbidden);
++        };
++        match query_scope_header(request.headers()) {
++            Some(tenant) if tenant == bound && event_identifier::valid(tenant) => {
++                Some(TrustedTenant(bound.to_string()))
++            }
++            // Preserve body/profile precedence; scoped handlers reject an
++            // absent header, and no marker means no tenant audit.
++            None if !request.headers().contains_key("x-idoris-tenant") => None,
++            _ => return virtual_key_scope_response(auth::VirtualKeyScopeError::TenantForbidden),
++        }
++    } else {
++        None
++    };
+     request.extensions_mut().insert(identity);
+-    next.run(request).await
++    let mut response = next.run(request).await;
++    if let Some(tenant) = trusted_tenant {
++        response.extensions_mut().insert(tenant);
++    }
++    response
+ }
+ 
+ async fn enforce_protocol_key_scope(
+@@ -2024,6 +2050,23 @@ async fn chat_completions(
+         Ok(parsed) => parsed,
+         Err(err) => return err.into_response(),
+     };
++    let authorization_present = headers.contains_key(axum::http::header::AUTHORIZATION);
++    let dev_no_key_request = state.dev_no_key_enabled && !authorization_present;
++    if dev_no_key_request {
++        if parsed.task.privacy.unwrap_or(PrivacyClass::LocalOnly) != PrivacyClass::LocalOnly {
++            return dev_no_key_scope_response();
++        }
++    } else if let Some(authenticator) = &state.virtual_key_authenticator {
++        let identity = match authenticator.authenticate(&headers).await {
++            Ok(identity) => identity,
++            Err(_) => return virtual_key_unauthorized_response(),
++        };
++        if let Err(error) = auth::enforce_scope(&identity, &parsed) {
++            return virtual_key_scope_response(error);
++        }
++    } else if state.dev_no_key_enabled && authorization_present {
++        return virtual_key_unauthorized_response();
++    }
+     let correlation = match correlation::parse(&headers) {
+         Ok(context) => context,
+         Err(error) => return correlation_error_response(error),
+@@ -2054,23 +2097,6 @@ async fn chat_completions(
+         None
+     };
+ 
+-    let authorization_present = headers.contains_key(axum::http::header::AUTHORIZATION);
+-    let dev_no_key_request = state.dev_no_key_enabled && !authorization_present;
+-    if dev_no_key_request {
+-        if parsed.task.privacy.unwrap_or(PrivacyClass::LocalOnly) != PrivacyClass::LocalOnly {
+-            return dev_no_key_scope_response();
+-        }
+-    } else if let Some(authenticator) = &state.virtual_key_authenticator {
+-        let identity = match authenticator.authenticate(&headers).await {
+-            Ok(identity) => identity,
+-            Err(_) => return virtual_key_unauthorized_response(),
+-        };
+-        if let Err(error) = auth::enforce_scope(&identity, &parsed) {
+-            return virtual_key_scope_response(error);
+-        }
+-    } else if state.dev_no_key_enabled && authorization_present {
+-        return virtual_key_unauthorized_response();
+-    }
+     let affinity_key = session_affinity_key(&headers);
+ 
+     let messages = extract_messages(object);
+@@ -2885,6 +2911,9 @@ async fn chat_via_proxy_buffered(
+ #[derive(Clone)]
+ struct RequestRecordId(String);
+ 
++#[derive(Clone)]
++struct TrustedTenant(String);
++
+ struct BufferedAuditMeta {
+     tenant_id: Option<String>,
+     request_id: Option<String>,
+@@ -2918,13 +2947,19 @@ async fn record_id_middleware(
+             req.uri().path(),
+             "/v1/chat/completions" | "/v1/embeddings" | "/v1/rerank" | "/v1/messages"
+         );
+-    let audit_tenant = audit_tenant_id(&state, req.headers());
++    let mut audit_tenant = audit_tenant_id(&state, req.headers());
+     let audit_request_id = audit_header(req.headers(), HEADER_REQUEST_ID, None);
+     let audit_privacy = audit_header(req.headers(), "x-idoris-privacy", Some("local_only"));
+     let audit_intent = audit_header(req.headers(), "x-idoris-intent", None);
+     req.extensions_mut()
+         .insert(RequestRecordId(record_id.clone()));
+     let mut response = next.run(req).await;
++    if state.deploy_mode == idoris_contracts::DeployMode::Tenant {
++        audit_tenant = response
++            .extensions()
++            .get::<TrustedTenant>()
++            .map(|tenant| tenant.0.clone());
++    }
+     if let Ok(value) = HeaderValue::from_str(&record_id) {
+         response.headers_mut().insert(HEADER_RECORD_ID, value);
+     }
+diff --git a/crates/idoris-router/src/virtual_key_wiring_tests.rs b/crates/idoris-router/src/virtual_key_wiring_tests.rs
+index cda1029c..5c6a704d 100644
+--- a/crates/idoris-router/src/virtual_key_wiring_tests.rs
++++ b/crates/idoris-router/src/virtual_key_wiring_tests.rs
+@@ -592,3 +592,212 @@ async fn protocol_routes_reject_privacy_outside_authenticated_key_scope() {
+         );
+     }
+ }
++
++#[tokio::test]
++async fn tenant_keys_reject_cross_tenant_unbound_and_anonymous_requests_without_side_effects() {
++    let server = wiremock::MockServer::start().await;
++    wiremock::Mock::given(method("POST"))
++        .respond_with(wiremock::ResponseTemplate::new(200))
++        .expect(0)
++        .mount(&server)
++        .await;
++    let roles = idoris_policy::ROLES
++        .iter()
++        .map(|role| role.as_str())
++        .collect::<Vec<_>>();
++    let bound = MintedVirtualKey::mint();
++    let mut bound_scope = scope(vec![PrivacyClass::LocalOnly], &roles, None);
++    bound_scope.tenant_id = Some("tenant-a".into());
++    let (authenticator, store) = memory_auth(&bound, &bound_scope);
++    let unbound = MintedVirtualKey::mint();
++    store
++        .lock()
++        .unwrap()
++        .insert_active(
++            &unbound.key_id,
++            unbound.hash,
++            &scope(vec![PrivacyClass::LocalOnly], &roles, None),
++        )
++        .unwrap();
++    let event_log = Arc::new(
++        idoris_tenancy::event_log::EventLogStore::new(Connection::open_in_memory().unwrap())
++            .unwrap(),
++    );
++    let records = Arc::new(Mutex::new(
++        idoris_tenancy::store::TenantStore::new(Connection::open_in_memory().unwrap()).unwrap(),
++    ));
++    let mut protected = state(&server.uri(), Some(authenticator));
++    protected.cards[0].provider.capabilities =
++        vec![Capability::Chat, Capability::Embedding, Capability::Rerank];
++    protected.deploy_mode = idoris_contracts::DeployMode::Tenant;
++    protected.event_log = Some(event_log.clone());
++    protected.record_store = Some(records.clone());
++    protected.dev_no_key_enabled = true;
++    let app = build_app(protected);
++    for (method, uri) in [
++        ("POST", "/v1/chat/completions"),
++        ("POST", "/v1/embeddings"),
++        ("POST", "/v1/rerank"),
++        ("POST", "/v1/messages"),
++        ("POST", "/v1/feedback"),
++        ("GET", "/idoris/tenants/tenant-b/requests/record-1"),
++        ("GET", "/idoris/tenants/tenant-b/audit"),
++        ("GET", "/idoris/tenants/tenant-b/usage"),
++        ("GET", "/idoris/tenants/tenant-b/budget"),
++    ] {
++        let body = match uri {
++            "/v1/embeddings" => json!({"model":"m","input":"hello"}),
++            "/v1/rerank" => json!({"model":"m","query":"q","documents":["a"]}),
++            "/v1/messages" => {
++                json!({"model":"m","max_tokens":8,"messages":[{"role":"user","content":"hi"}]})
++            }
++            "/v1/feedback" => json!({"record_id":"record-1","rating":"up"}),
++            _ => json!({"model":"idoris/fast","messages":[{"role":"user","content":"hello"}]}),
++        };
++        for (token, tenant, status) in [
++            (
++                Some(bearer(&bound)),
++                Some("tenant-b"),
++                StatusCode::FORBIDDEN,
++            ),
++            (
++                Some(bearer(&unbound)),
++                Some("tenant-a"),
++                StatusCode::FORBIDDEN,
++            ),
++            (None, Some("tenant-b"), StatusCode::UNAUTHORIZED),
++            (
++                Some("Bearer malformed".into()),
++                Some("tenant-b"),
++                StatusCode::UNAUTHORIZED,
++            ),
++        ] {
++            let mut request = Request::builder()
++                .method(method)
++                .uri(uri)
++                .header("content-type", "application/json");
++            if let Some(token) = token {
++                request = request.header("authorization", token);
++            }
++            if let Some(tenant) = tenant {
++                request = request.header("x-idoris-tenant", tenant);
++            }
++            let response = app
++                .clone()
++                .oneshot(request.body(Body::from(body.to_string())).unwrap())
++                .await
++                .unwrap();
++            assert_eq!(response.status(), status, "{method} {uri}");
++            let record_id = response.headers()[HEADER_RECORD_ID]
++                .to_str()
++                .unwrap()
++                .to_owned();
++            for tenant in ["tenant-a", "tenant-b"] {
++                assert!(
++                    event_log
++                        .events_for_record(Some(tenant), &record_id)
++                        .unwrap()
++                        .is_empty()
++                );
++            }
++            let body = json_body(response).await;
++            assert_eq!(
++                body["error"]["reason_code"],
++                if status == StatusCode::FORBIDDEN {
++                    "VIRTUAL_KEY_TENANT_FORBIDDEN"
++                } else {
++                    "VIRTUAL_KEY_UNAUTHORIZED"
++                }
++            );
++            assert!(!body.to_string().contains("tenant-a"));
++        }
++        let response = app
++            .clone()
++            .oneshot(
++                Request::builder()
++                    .method(method)
++                    .uri(uri)
++                    .header("authorization", bearer(&bound))
++                    .header("x-idoris-tenant", "tenant-a")
++                    .header("x-idoris-tenant", "tenant-b")
++                    .body(Body::from(body.to_string()))
++                    .unwrap(),
++            )
++            .await
++            .unwrap();
++        assert_eq!(response.status(), StatusCode::FORBIDDEN);
++    }
++    for tenant in ["tenant-a", "tenant-b"] {
++        assert!(
++            records
++                .lock()
++                .unwrap()
++                .list(Some(tenant), None)
++                .unwrap()
++                .is_empty()
++        );
++    }
++    server.verify().await;
++}
++
++#[tokio::test]
++async fn tenant_library_without_authenticator_fails_closed_without_egress_or_audit() {
++    let server = wiremock::MockServer::start().await;
++    wiremock::Mock::given(method("POST"))
++        .respond_with(wiremock::ResponseTemplate::new(200))
++        .expect(0)
++        .mount(&server)
++        .await;
++    for dev_no_key_enabled in [false, true] {
++        let log = Arc::new(
++            idoris_tenancy::event_log::EventLogStore::new(Connection::open_in_memory().unwrap())
++                .unwrap(),
++        );
++        let records = Arc::new(Mutex::new(
++            idoris_tenancy::store::TenantStore::new(Connection::open_in_memory().unwrap()).unwrap(),
++        ));
++        let mut unconfigured = state(&server.uri(), None);
++        unconfigured.deploy_mode = idoris_contracts::DeployMode::Tenant;
++        unconfigured.dev_no_key_enabled = dev_no_key_enabled;
++        unconfigured.event_log = Some(log.clone());
++        unconfigured.record_store = Some(records.clone());
++        let app = build_app(unconfigured);
++        for token in [None, Some(bearer(&MintedVirtualKey::mint()))] {
++            let mut headers = vec![("x-idoris-tenant", "tenant-a".into())];
++            if let Some(token) = token {
++                headers.push(("authorization", token));
++            }
++            let response = app.clone().oneshot(chat_request(&headers)).await.unwrap();
++            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
++            let record_id = response.headers()[HEADER_RECORD_ID].to_str().unwrap();
++            assert!(
++                log.events_for_record(Some("tenant-a"), record_id)
++                    .unwrap()
++                    .is_empty()
++            );
++            assert!(
++                records
++                    .lock()
++                    .unwrap()
++                    .list(Some("tenant-a"), None)
++                    .unwrap()
++                    .is_empty()
++            );
++            assert_eq!(
++                json_body(response).await["error"]["reason_code"],
++                "VIRTUAL_KEY_UNAUTHORIZED"
++            );
++        }
++        let health = app
++            .oneshot(
++                Request::builder()
++                    .uri("/health")
++                    .body(Body::empty())
++                    .unwrap(),
++            )
++            .await
++            .unwrap();
++        assert_eq!(health.status(), StatusCode::OK);
++    }
++    server.verify().await;
++}
