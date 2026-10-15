@@ -51,6 +51,8 @@ fn mock_yaml_shaped_card() -> Card {
                 admission: Admission::Coexist,
             }),
             extensions: None,
+
+            auth: None,
         },
         roles: Vec::new(),
         experiment: false,

@@ -79,6 +79,8 @@ fn resident_card(endpoint: &str) -> ComponentCard {
             admission: Admission::Coexist,
         }),
         extensions: None,
+
+        auth: None,
     }
 }
 

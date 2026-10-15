@@ -35,7 +35,7 @@ pub mod training_sample;
 pub mod version;
 
 pub use adapter_manifest::AdapterManifest;
-pub use component_card::ComponentCard;
+pub use component_card::{ComponentAuth, ComponentCard};
 pub use deploy_mode::DeployMode;
 pub use error::{Contract, ContractError, parse};
 pub use load_policy::LoadPolicy;

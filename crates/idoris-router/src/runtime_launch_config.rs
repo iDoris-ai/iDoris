@@ -9,7 +9,10 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
+use idoris_contracts::ComponentAuth;
 use idoris_upstream::{LocalHttpRuntimeConfig, LocalRuntimeKind, LocalRuntimeLaunch};
+
+use crate::upstream_auth::{self, EnvLookup};
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -30,6 +33,8 @@ struct RuntimeLaunchEntry {
     model_id: String,
     memory_gb: f64,
     load_fence_path: PathBuf,
+    #[serde(default)]
+    auth: Option<ComponentAuth>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -49,6 +54,13 @@ impl From<RuntimeKind> for LocalRuntimeKind {
 }
 
 pub fn load(path: Option<&Path>) -> Result<BTreeMap<String, LocalHttpRuntimeConfig>, String> {
+    load_with(path, &upstream_auth::read_process_env)
+}
+
+pub(crate) fn load_with(
+    path: Option<&Path>,
+    lookup: &impl Fn(&str) -> EnvLookup,
+) -> Result<BTreeMap<String, LocalHttpRuntimeConfig>, String> {
     let Some(path) = path else {
         return Ok(BTreeMap::new());
     };
@@ -76,13 +88,18 @@ pub fn load(path: Option<&Path>) -> Result<BTreeMap<String, LocalHttpRuntimeConf
             entry.port,
         )
         .map_err(|error| format!("本地 runtime {provider_id:?} 启动配置无效：{error}"))?;
-        let config = LocalHttpRuntimeConfig::new(
+        let mut config = LocalHttpRuntimeConfig::new(
             launch,
             entry.model_id,
             entry.memory_gb,
             entry.load_fence_path,
         )
         .map_err(|error| format!("本地 runtime {provider_id:?} 配置无效：{error}"))?;
+        if let Some(auth) = entry.auth {
+            config.bearer = Some(upstream_auth::resolve_bearer(&auth, lookup).map_err(
+                |error| format!("本地 runtime {provider_id} 的 auth 无法生效：{error}"),
+            )?);
+        }
         if configs.insert(provider_id.to_string(), config).is_some() {
             return Err(format!("本地 runtime provider_id 重复：{provider_id}"));
         }
@@ -172,5 +189,46 @@ runtimes:
             assert_eq!(card.endpoint, config.launch.endpoint());
             assert!(config.memory_gb > 0.0);
         }
+    }
+
+    #[test]
+    fn declared_auth_reads_the_named_env_and_a_missing_env_refuses_startup() {
+        let present = write(
+            r#"version: 1
+runtimes:
+  - provider_id: mlx-fallback
+    kind: mlx_lm_server
+    executable: /usr/bin/python3
+    model_path: /models/qwen-mlx
+    port: 18101
+    model_id: qwen-mlx
+    memory_gb: 18.5
+    load_fence_path: /tmp/idoris/mlx-fallback.pending
+    auth: { kind: bearer, env: IDORIS_LAUNCH_BEARER_FOR_TEST }
+"#,
+        );
+        let missing = load_with(Some(present.path()), &|name| {
+            assert_eq!(name, "IDORIS_LAUNCH_BEARER_FOR_TEST");
+            crate::upstream_auth::EnvLookup::Missing
+        })
+        .unwrap_err();
+        assert!(missing.contains("IDORIS_LAUNCH_BEARER_FOR_TEST"));
+        assert!(missing.contains("未设置"));
+        assert!(!missing.contains("launch-secret-value"));
+
+        let file = write(&std::fs::read_to_string(present.path()).unwrap());
+        let configs = load_with(Some(file.path()), &|name| {
+            assert_eq!(name, "IDORIS_LAUNCH_BEARER_FOR_TEST");
+            crate::upstream_auth::EnvLookup::Value("launch-secret-value".to_string())
+        })
+        .unwrap();
+        assert_eq!(
+            configs["mlx-fallback"]
+                .bearer
+                .as_ref()
+                .unwrap()
+                .authorization(),
+            "Bearer launch-secret-value"
+        );
     }
 }

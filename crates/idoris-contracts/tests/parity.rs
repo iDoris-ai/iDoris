@@ -308,6 +308,22 @@ fn component_card_corpus() {
     let mut with_extensions = valid.clone();
     with_extensions["extensions"] = json!({"provider.anthropic.prompt_cache": {"ttl": 5}});
     assert_parity::<ComponentCard>("component-card.schema.json", &with_extensions);
+
+    let mut with_auth = valid.clone();
+    with_auth["auth"] = json!({"kind": "bearer", "env": "UPSTREAM_API_TOKEN"});
+    assert_parity::<ComponentCard>("component-card.schema.json", &with_auth);
+
+    let mut literal_env = valid.clone();
+    literal_env["auth"] = json!({"kind": "bearer", "env": "sk-live-token"});
+    assert_parity::<ComponentCard>("component-card.schema.json", &literal_env);
+
+    let mut token_field = valid.clone();
+    token_field["auth"] = json!({"kind": "bearer", "env": "UPSTREAM_API_TOKEN", "token": "secret"});
+    assert_parity::<ComponentCard>("component-card.schema.json", &token_field);
+
+    let mut basic = valid.clone();
+    basic["auth"] = json!({"kind": "basic", "env": "UPSTREAM_API_TOKEN"});
+    assert_parity::<ComponentCard>("component-card.schema.json", &basic);
 }
 
 #[test]

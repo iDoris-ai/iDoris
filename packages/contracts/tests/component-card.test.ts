@@ -25,6 +25,16 @@ describe("ComponentCard", () => {
   it("accepts a valid card", () => {
     expect(componentCardSchema.safeParse(valid).success).toBe(true);
   });
+  it("accepts a bearer env reference and rejects a literal or unknown kind", () => {
+    const authed = { ...valid, auth: { kind: "bearer", env: "UPSTREAM_API_TOKEN" } };
+    expect(componentCardSchema.safeParse(authed).success).toBe(true);
+    const literal = { ...valid, auth: { kind: "bearer", env: "sk-live-token" } };
+    expect(componentCardSchema.safeParse(literal).success).toBe(false);
+    const tokenField = { ...valid, auth: { kind: "bearer", env: "UPSTREAM_API_TOKEN", token: "secret" } };
+    expect(componentCardSchema.safeParse(tokenField).success).toBe(false);
+    const basic = { ...valid, auth: { kind: "basic", env: "UPSTREAM_API_TOKEN" } };
+    expect(componentCardSchema.safeParse(basic).success).toBe(false);
+  });
   it("rejects a card missing version_pin", () => {
     const { version_pin: _omitted, ...missing } = valid;
     const res = componentCardSchema.safeParse(missing);

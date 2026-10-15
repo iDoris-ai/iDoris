@@ -21,6 +21,7 @@
 //!   further PRs on this stack; this PR has
 //!   [`remote::CredentialSource`] only).
 
+pub mod bearer;
 pub mod chat;
 pub mod detect;
 pub mod error;
@@ -33,6 +34,7 @@ pub mod omlx;
 pub mod remote;
 pub mod subscription;
 
+pub use bearer::UpstreamBearer;
 pub use chat::{
     ChatChunk, ChatChunkStream, ChatMessage, ChatRequest, ChatResponse, RemoteChat,
     ensure_terminated,

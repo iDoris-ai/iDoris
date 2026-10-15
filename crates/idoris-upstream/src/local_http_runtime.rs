@@ -15,7 +15,7 @@ use idoris_contracts::LoadPolicy;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
-use crate::{LocalRuntimeKind, LocalRuntimeLaunch, ManagedRuntimeProcess};
+use crate::{LocalRuntimeKind, LocalRuntimeLaunch, ManagedRuntimeProcess, UpstreamBearer};
 
 const DEFAULT_CALL_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
@@ -28,6 +28,7 @@ pub struct LocalHttpRuntimeConfig {
     pub load_fence_path: PathBuf,
     pub call_timeout: Duration,
     pub shutdown_grace: Duration,
+    pub bearer: Option<UpstreamBearer>,
 }
 
 impl LocalHttpRuntimeConfig {
@@ -58,6 +59,7 @@ impl LocalHttpRuntimeConfig {
             load_fence_path,
             call_timeout: DEFAULT_CALL_TIMEOUT,
             shutdown_grace: DEFAULT_SHUTDOWN_GRACE,
+            bearer: None,
         })
     }
 }
@@ -82,6 +84,13 @@ impl LocalHttpRuntimeAdapter {
             client,
             process: Mutex::new(None),
         })
+    }
+
+    fn authed(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match &self.config.bearer {
+            Some(bearer) => bearer.on(request),
+            None => request,
+        }
     }
 
     fn ensure_id(&self, id: &str) -> Result<(), BackendError> {
@@ -120,7 +129,7 @@ impl LocalHttpRuntimeAdapter {
     async fn probe_models_endpoint(&self) -> Result<bool, BackendError> {
         let url = format!("{}/v1/models", self.config.launch.endpoint());
         let attempt = async {
-            let response = match self.client.get(url).send().await {
+            let response = match self.authed(self.client.get(url)).send().await {
                 Ok(response) => response,
                 Err(_) => return Ok(false),
             };
@@ -171,9 +180,7 @@ impl LocalHttpRuntimeAdapter {
         let body = serde_json::json!({"model": engine_model, "messages": messages});
         let attempt = async {
             let response = self
-                .client
-                .post(url)
-                .json(&body)
+                .authed(self.client.post(url).json(&body))
                 .send()
                 .await
                 .map_err(|_| BackendError::Upstream {
@@ -538,6 +545,169 @@ mod tests {
             .unwrap();
         assert_eq!(response.content, "fast-result");
         assert_eq!(adapter.status().await.unwrap().loaded, vec!["single-model"]);
+        adapter.unload("single-model").await.unwrap();
+        server.verify().await;
+    }
+
+    fn authorizations(requests: &[wiremock::Request]) -> Vec<Option<String>> {
+        requests
+            .iter()
+            .map(|request| {
+                request
+                    .headers
+                    .get("authorization")
+                    .map(|value| value.to_str().unwrap().to_string())
+            })
+            .collect()
+    }
+
+    #[cfg(unix)]
+    async fn bearer_adapter(server: &MockServer, secret: &str) -> LocalHttpRuntimeAdapter {
+        let mut runtime_config = config(server);
+        runtime_config.bearer = Some(crate::UpstreamBearer::from_secret(secret).unwrap());
+        let adapter = LocalHttpRuntimeAdapter::new(runtime_config).unwrap();
+        let process =
+            ManagedRuntimeProcess::spawn_test(Path::new("/bin/sleep"), vec![OsString::from("30")])
+                .unwrap();
+        *adapter.process.lock().await = Some((process, None));
+        adapter
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn undeclared_auth_sends_no_authorization_on_readiness_or_chat() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [{"id": "single-model"}]
+            })))
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"content": "plain"}}]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let adapter = with_running_process(&server).await;
+        assert!(adapter.probe_ready("single-model").await.unwrap());
+        let response = adapter
+            .chat(
+                ChatRequest {
+                    model: "single-model".into(),
+                    messages: vec![ChatMessage {
+                        role: "user".into(),
+                        content: "hi".into(),
+                    }],
+                },
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.content, "plain");
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(authorizations(&requests), vec![None, None, None]);
+        adapter.unload("single-model").await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn readiness_and_chat_send_the_same_bearer() {
+        let server = MockServer::start().await;
+        let secret = "runtime-shared-token";
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [{"id": "single-model"}]
+            })))
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"content": "authed"}}]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let adapter = bearer_adapter(&server, secret).await;
+        assert!(adapter.probe_ready("single-model").await.unwrap());
+        let response = adapter
+            .chat(
+                ChatRequest {
+                    model: "single-model".into(),
+                    messages: vec![ChatMessage {
+                        role: "user".into(),
+                        content: "hi".into(),
+                    }],
+                },
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.content, "authed");
+        let expected = format!("Bearer {secret}");
+        assert_eq!(
+            authorizations(&server.received_requests().await.unwrap()),
+            vec![
+                Some(expected.clone()),
+                Some(expected.clone()),
+                Some(expected)
+            ]
+        );
+        adapter.unload("single-model").await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn wrong_bearer_readiness_does_not_pass_and_chat_does_not_post() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(401))
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"content": "should-not-run"}}]
+            })))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let adapter = bearer_adapter(&server, "wrong-token").await;
+        assert!(adapter.probe_ready("single-model").await.is_err());
+        assert!(
+            adapter
+                .chat(
+                    ChatRequest {
+                        model: "single-model".into(),
+                        messages: vec![],
+                    },
+                    CancellationToken::new(),
+                )
+                .await
+                .is_err()
+        );
+        let requests = server.received_requests().await.unwrap();
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.method == wiremock::http::Method::GET)
+        );
+        assert_eq!(
+            authorizations(&requests),
+            vec![
+                Some("Bearer wrong-token".to_string()),
+                Some("Bearer wrong-token".to_string())
+            ]
+        );
         adapter.unload("single-model").await.unwrap();
         server.verify().await;
     }

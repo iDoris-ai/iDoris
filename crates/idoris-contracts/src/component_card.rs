@@ -30,6 +30,46 @@ pub enum Egress {
     Internet,
 }
 
+/// Optional upstream credential reference. The card stores an environment
+/// variable name, never the secret.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ComponentAuth {
+    Bearer { env: String },
+}
+
+impl ComponentAuth {
+    pub fn env_var(&self) -> &str {
+        match self {
+            Self::Bearer { env } => env,
+        }
+    }
+
+    pub fn validate_name(&self) -> Result<(), ContractError> {
+        if is_env_var_name(self.env_var()) {
+            Ok(())
+        } else {
+            Err(ContractError::new(
+                "component_card.auth.env must be an environment variable name",
+            ))
+        }
+    }
+}
+
+pub fn is_env_var_name(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    if bytes.is_empty() || bytes.len() > 128 {
+        return false;
+    }
+    let first = bytes[0];
+    if !first.is_ascii_alphabetic() && first != b'_' {
+        return false;
+    }
+    bytes[1..]
+        .iter()
+        .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ComponentCard {
@@ -44,6 +84,8 @@ pub struct ComponentCard {
     pub fail_closed: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub load_policy: Option<LoadPolicy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth: Option<ComponentAuth>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub extensions: Option<serde_json::Map<String, serde_json::Value>>,
 }
@@ -69,6 +111,9 @@ impl Contract for ComponentCard {
                 "component_card.allowed_egress must have at least one entry",
             ));
         }
+        if let Some(auth) = &self.auth {
+            auth.validate_name()?;
+        }
         Ok(())
     }
 }
@@ -85,6 +130,7 @@ impl SchemaShape for ComponentCard {
         "fallback_policy",
         "fail_closed",
         "load_policy",
+        "auth",
         "extensions",
     ];
     const REQUIRED: &'static [&'static str] = &[
