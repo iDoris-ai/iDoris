@@ -99,6 +99,28 @@ IDORIS_CONFORMANCE_ARGV='["/path/to/idoris-router-rs","serve","--flag","value wi
   loopback + 显式 enable 可成功且 `X-iDoris-Served-Locality: remote`；`local_only` 零 CLI spawn；
   `stream:true` 仍返回整块 OpenAI JSON；完整请求体发送后客户端断开会取消正在运行的 CLI。
 
+## 上游依赖分类（A7）
+
+分类按测试实际访问的上游协议划分。fixture 的 `provider.id: omlx` 只是注册身份，
+不代表测试调用了 oMLX 专有 API。`/health`、控制头、路由与订阅开关属于 iDoris 契约，
+也不属于 OpenAI 上游协议。
+
+| 用例所在文件 | 上游依赖 | 边界 |
+|---|---|---|
+| `core.test.ts`、`models-health.test.ts` | OpenAI-compat 子集 | `GET /v1/models`、`POST /v1/chat/completions` |
+| `upstream-behavior.test.ts`、`streaming.test.ts` | OpenAI-compat 子集 | chat JSON、SSE、错误、取消；重试策略是 iDoris 的断言 |
+| `default-routing-policy.test.ts`、`routing-policy.test.ts`、`intent-detection.test.ts`、`local-only-privacy.test.ts`、`tenant.test.ts`、`response-headers.test.ts`、`input-edges.test.ts` | 需要上游时只用 OpenAI-compat 子集 | models/chat；其余断言针对 iDoris 的入口、隐私与路由行为 |
+| `card-policy.test.ts`、`extension-policy.test.ts` | 无专有上游依赖 | 卡注册和启动校验；不验证引擎的 load/pin 语义 |
+| `fixture-harness.test.ts`，除下一行外 | 需要上游时只用 OpenAI-compat 子集 | fixture 序列化、进程/harness、启动与模型列表 |
+| `fixture-harness.test.ts` 的「fake upstream 的 status 快照可动态变化并可构造失败」 | **oMLX 专有** | 直接请求假上游 `GET /api/status`，断言 `loaded_models` 和 `pressure`；只验证假上游，不是实机验收 |
+| `subscription.test.ts`、`subscription-fixture.test.ts` | 订阅 CLI / harness，无 oMLX HTTP 依赖 | 对调用方返回 OpenAI 形状，不证明本地引擎兼容性 |
+| `known-spec-conflicts.test.ts` | `todo`，无已执行的上游覆盖 | 其中 `/v1/systemone` 不属于 OpenAI-compat 子集 |
+
+当前共享 conformance 没有覆盖 oMLX 的 load/unload、pin、admin 会话和真实内存压力。
+这些专有端点的 Rust mock 覆盖在 `crates/idoris-upstream/src/omlx/`，完整依赖清单与
+`version_pin` 升级复测要求见 [docs/18 §2.1](../docs/18-推理后端与决策模型-vLLM与Decision3.0评估.md#21-omlx-依赖清单与退出边界a7)。
+共享套件通过不能作为这些端点兼容或实机退路可用的证据。
+
 ## 暂不覆盖（按上游指令）
 
 预算与意图解析顺序相关的用例暂不写：jason 正在把顺序修订为"隐私 → 意图 → 预算"，

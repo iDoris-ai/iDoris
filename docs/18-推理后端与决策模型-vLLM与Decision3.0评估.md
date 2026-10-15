@@ -88,6 +88,33 @@
 
 ---
 
+### 2.1 oMLX 依赖清单与退出边界（A7）
+
+以下按当前 Rust 调用点列出依赖。OpenAI-compat 只描述 HTTP 子集，不保证引擎的
+生命周期、模型身份或资源语义相同。[conformance 分类](../conformance/README.md#上游依赖分类a7)
+区分了共享 HTTP 用例与 oMLX 专有假上游用例。
+
+| 依赖 | 当前消费者 / 代码证据 | 退出时的边界 |
+|---|---|---|
+| OpenAI-compat `GET /v1/models`、`POST /v1/chat/completions` | `crates/idoris-router/src/models.rs`、`proxy.rs`；`crates/idoris-upstream/src/local_http_runtime.rs` | 可改接提供同一子集的 loopback 服务；仍须核对具体模型 ID、请求字段、响应与 SSE |
+| oMLX `GET /v1/models/status` | `crates/idoris-upstream/src/omlx/mod.rs`、`status.rs`、`pin.rs`；发现模型及 `estimated_size`，确认 `loaded`、`pinned` | OpenAI models 列表不能替代加载/pin 后置条件；退路直连不提供这些保证 |
+| oMLX `POST /v1/models/{id}/load`、`/unload` | `crates/idoris-upstream/src/omlx/mod.rs`；Supervisor 生命周期 | 退路由外部服务管理模型，不复用这两个端点 |
+| oMLX `GET /api/status` | `crates/idoris-upstream/src/omlx/status.rs`；`loaded_models`、内存上限/用量、压力回退 | `model_memory_max` / `model_memory_used` 按字节转 GiB；不能把缺压力当作正常 |
+| oMLX `POST /admin/api/login`、`PUT /admin/api/models/{id}/settings`、`GET /admin/api/activity` | `crates/idoris-upstream/src/omlx/admin.rs`、`pin.rs`、`mod.rs`；admin 会话、pin 写入、`active_models.memory_pressure` | Bearer 不能替代 admin 会话；直连退路不提供 Supervisor pin、驱逐或压力准入 |
+| oMLX `/v1/models` 的可选 Bearer | `crates/idoris-router/src/models.rs`；仅 local + loopback + `version_pin: omlx@…` 的受限路径 | 非 oMLX 卡不能借用 `IDORIS_OMLX_API_KEY`；通用 HTTP/runtime Bearer 是 A1，A7 不实现 |
+| 非 OpenAI 的 `POST /v1/systemone` | B0/B3 计划中的 d3 接入，当前没有已交付的客户端 | 不把 Ollama 或 mlx_lm 的 chat 当作替代 judge；本机缺端点的证据与 B0 状态保持原样 |
+
+退路只承诺文本 chat 的 resident HTTP 直连配置。它不声明 embedding、rerank、Anthropic
+messages 或 d3 可替换，也不声明完成 A4 的 Ollama 生命周期 adapter。`resident` 在此选择
+`ChatProxy` 路径，不会让 iDoris 启动引擎或验证引擎 pin；内存和服务存活由操作者管理。
+
+升级 `version_pin` 时，按 [FU-16](agent/tasks.md#跟进项账本followups) 的清单复测，不能只改卡上的版本字符串。
+
+1. 记录旧版本、候选版本、模型 revision/量化和脱敏的端点结果，保留旧卡与可回退的引擎工件。
+2. 用独立测试服务复跑 U0 的 models、load/unload、流式和非流式 chat，并核对身份及认证失败行为。
+3. 核对 `/api/status` 的 `loaded_models`、内存字段和单位；复测 `is_pinned` 对应的 loaded/pinned 后置条件、admin 登录及压力语义。缺失或非法字段仍须 fail-closed。结合 FU-17/FU-18 区分实机证据与 mock 覆盖，未验证项不能写成已通过。
+4. 跑共享 conformance 与 oMLX adapter 测试，再更新 `version_pin` 和端点证据。任何必要后置条件不成立就保留旧 pin，或采用 [Mac 直连退路 runbook](../config/examples/omlx-exit/README.md)。日志不记录 key 或 admin token。
+
 ## 3. 结论二：用 Decision 3.0，只当提议者
 
 ### 为什么能用，而且合适
