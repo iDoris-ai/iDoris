@@ -183,6 +183,31 @@ mod tests {
         }
     }
 
+    #[test]
+    fn local_issue_rejects_invalid_tenant_binding_without_output_or_active_key() {
+        let store = VirtualKeyStore::new(Connection::open_in_memory().unwrap()).unwrap();
+        for tenant in [
+            "".into(),
+            " tenant-a".into(),
+            "tenant-a\n".into(),
+            "tenant\0suffix".into(),
+            "x".repeat(129),
+            "é".repeat(65),
+        ] {
+            let spec = serde_json::json!({
+                "owner":"agent24", "tenant_id":tenant,
+                "allowed_privacy":["local_only"], "allowed_roles":["fast"]
+            });
+            let mut output = Vec::new();
+            assert!(
+                issue_from_reader_at(&store, &mut spec.to_string().as_bytes(), &mut output, 1000)
+                    .is_err()
+            );
+            assert!(output.is_empty());
+            assert!(!store.has_active_key(1001).unwrap());
+        }
+    }
+
     #[derive(Default)]
     struct FailFlushWriter(Vec<u8>);
     impl Write for FailFlushWriter {
