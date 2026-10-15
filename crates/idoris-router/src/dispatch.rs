@@ -137,6 +137,9 @@ pub(crate) fn role_models(
     else {
         return Ok(Default::default());
     };
+    if component.provider.id == idoris_policy::SUBSCRIPTION_PROVIDER_ID {
+        return Err("idoris_role_models is unsupported on subscription providers".into());
+    }
     let models: std::collections::BTreeMap<String, String> =
         serde_json::from_value(value.clone()).map_err(|e| format!("idoris_role_models: {e}"))?;
     for (role, model) in &models {
@@ -270,9 +273,13 @@ pub fn select_with_affinity_and_ready(
 ) -> Result<Selected, DispatchError> {
     let candidates: Vec<Card> = cards
         .iter()
-        .filter(|card| profile.role.is_none_or(|role| {
-            role_models(card).is_ok_and(|models| models.contains_key(role.as_str()))
-        }))
+        .filter(|card| {
+            role_models(card).is_ok_and(|models| {
+                profile
+                    .role
+                    .is_none_or(|role| models.contains_key(role.as_str()))
+            })
+        })
         .map(|c| candidate(c, prompt))
         .collect();
     let request_profile = RequestProfile {

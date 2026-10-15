@@ -2361,10 +2361,16 @@ async fn chat_completions(
             if parsed.role.is_some() {
                 let target = match dispatch::backend_model_id(&parsed, model, &selected.card) {
                     Ok(target) => target,
-                    Err(DispatchError::Rejection(rejection)) => return rejection_response(rejection),
-                    Err(DispatchError::Internal(message)) => return error_envelope(
-                        StatusCode::INTERNAL_SERVER_ERROR, "internal_error", message,
-                    ),
+                    Err(DispatchError::Rejection(rejection)) => {
+                        return rejection_response(rejection);
+                    }
+                    Err(DispatchError::Internal(message)) => {
+                        return error_envelope(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "internal_error",
+                            message,
+                        );
+                    }
                 };
                 upstream_body["model"] = serde_json::Value::String(target);
             }
@@ -3398,10 +3404,13 @@ mod tests {
             fallback_policy: FallbackPolicy::FailClosed,
             fail_closed: true,
             load_policy: None,
-            extensions: Some(serde_json::from_value(json!({
-                "_degradation": "Removing these bindings disables aliases.",
-                "idoris_role_models": {"daily": id}
-            })).unwrap()),
+            extensions: Some(
+                serde_json::from_value(json!({
+                    "_degradation": "Removing these bindings disables aliases.",
+                    "idoris_role_models": {"daily": id}
+                }))
+                .unwrap(),
+            ),
         }
     }
 

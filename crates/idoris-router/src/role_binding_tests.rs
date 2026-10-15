@@ -243,3 +243,85 @@ fn role_binding_only_configured_providers_enter_role_selection_even_with_fallbac
     .unwrap();
     assert!(dispatch::select(&[unrelated, configured], &profile, "").is_err());
 }
+
+#[test]
+fn role_binding_subscription_configuration_is_rejected_and_http_controls_remain_valid() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("card.yaml");
+    let mut subscription: ComponentCard =
+        serde_yaml::from_str(include_str!("../../../config/components/subscription.yaml")).unwrap();
+    let mut headers = HeaderMap::new();
+    headers.insert("x-idoris-privacy", HeaderValue::from_static("any"));
+    // Even an empty mapping is unsupported; concrete requests must not silently
+    // ignore a configured target in favor of the relay's fixed identity.
+    for mapping in [json!({}), json!({"daily":"arbitrary", "auto":"arbitrary"})] {
+        subscription
+            .extensions
+            .as_mut()
+            .unwrap()
+            .insert("idoris_role_models".into(), mapping);
+        std::fs::write(&path, serde_yaml::to_string(&subscription).unwrap()).unwrap();
+        match components::load_components(dir.path(), false) {
+            Err(components::LoadError::Invalid { message, .. }) => {
+                assert!(message.contains("unsupported on subscription"), "{message}");
+            }
+            other => panic!("expected unsupported binding rejection, got {other:?}"),
+        }
+        for model in ["idoris/daily", "idoris/auto", "explicit-model"] {
+            let profile = profile::parse_profile(
+                &headers,
+                Some(model),
+                idoris_contracts::DeployMode::Personal,
+            )
+            .unwrap();
+            assert!(dispatch::select(std::slice::from_ref(&subscription), &profile, "").is_err());
+        }
+    }
+    subscription
+        .extensions
+        .as_mut()
+        .unwrap()
+        .remove("idoris_role_models");
+    std::fs::write(&path, serde_yaml::to_string(&subscription).unwrap()).unwrap();
+    assert_eq!(
+        components::load_components(dir.path(), false).unwrap(),
+        [subscription.clone()]
+    );
+    let concrete = profile::parse_profile(
+        &headers,
+        Some("explicit-model"),
+        idoris_contracts::DeployMode::Personal,
+    )
+    .unwrap();
+    assert!(dispatch::select(&[subscription], &concrete, "").is_ok());
+    let lifecycle: ComponentCard =
+        serde_yaml::from_str(include_str!("../../../config/components/omlx.yaml")).unwrap();
+    for mut http in [
+        lifecycle,
+        resident_component_card("resident", "http://127.0.0.1:1234"),
+    ] {
+        bind(
+            &mut http,
+            json!({"daily":"installed-chat", "auto":"installed-chat"}),
+        );
+        std::fs::write(&path, serde_yaml::to_string(&http).unwrap()).unwrap();
+        assert_eq!(
+            components::load_components(dir.path(), false).unwrap(),
+            [http.clone()]
+        );
+        for model in ["idoris/daily", "idoris/auto", "explicit-model"] {
+            let profile = profile::parse_profile(
+                &headers,
+                Some(model),
+                idoris_contracts::DeployMode::Personal,
+            )
+            .unwrap();
+            assert_eq!(
+                dispatch::select(std::slice::from_ref(&http), &profile, "")
+                    .unwrap()
+                    .card,
+                http
+            );
+        }
+    }
+}

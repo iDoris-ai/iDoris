@@ -1,11 +1,13 @@
 # Backend model bindings for role requests
 
-Proposed contract implemented on this local branch; canonical iDoris/Agent24
-design review must accept this configuration boundary before release.
+This is an iDoris-internal trusted configuration boundary for lifecycle-managed
+and resident HTTP backends. It is not a cross-repository model-selection API.
+Only the operator or trusted provisioner may write these bindings; request bodies
+and caller headers cannot configure them.
 
-The Rust router accepts optional `extensions.idoris_role_models` on each component
-card. It is a trusted operator configuration boundary, mapping role names to exact
-model IDs understood by that card's backend. For example, with synthetic IDs:
+The Rust router accepts optional `extensions.idoris_role_models` on HTTP component
+cards, mapping role names to verified installed model IDs understood by that
+card's backend. For example, with synthetic IDs:
 
 ```yaml
 extensions:
@@ -16,7 +18,7 @@ extensions:
     auto: installed-chat-model-id
 ```
 
-Replace the example IDs with independently verified backend IDs. No binding is
+Replace the example IDs with independently verified installed backend IDs. No binding is
 shipped for oMLX: iDoris cannot infer which weights the user installed. Do not copy
 recommender catalog IDs into these values without verifying the backend identity.
 The static recommendation catalog describes families, roles, quantization, and
@@ -31,7 +33,14 @@ be concrete IDs rather than another `idoris/` alias. Malformed bindings fail
 startup. Removing the extension leaves concrete requests available but makes role
 requests unavailable on that card. Cards supplied programmatically also fail
 closed for malformed or missing role bindings. `_degradation` is required by the
-existing extension registration rule.
+existing extension registration rule. Programmatic cards with invalid bindings
+are excluded from selection, including concrete requests; a valid HTTP card with
+no bindings still accepts explicit concrete overrides.
+
+`idoris_role_models` is explicitly unsupported on the `subscription` provider,
+including an empty mapping. Startup rejects it, and programmatic cards carrying
+it fail closed. Subscription execution retains the authorized relay's fixed
+identity; arbitrary mapping targets are never forwarded into its sandbox.
 
 Only cards explicitly bound for the requested role enter selection. There is no
 capability-only fallback to another role and no first-model selection. Existing
@@ -49,6 +58,8 @@ configuration does not prove the resident backend has weights installed, nor doe
 it add a new download, catalog refresh, or hardware admission authority.
 
 Release integration must persist a verified user selection into these bindings
-and independently establish model availability. This change supplies dispatch
-identity, not the Agent24 launcher, authentication bridge, or allocation budget
-execution contract.
+and independently establish model availability. Consuming the current read-only
+models/capabilities observations and completing Agent24 integration remain a next
+slice. This change supplies dispatch identity; it does not complete installation,
+availability discovery, the Agent24 launcher/authentication bridge, or allocation
+budget integration.

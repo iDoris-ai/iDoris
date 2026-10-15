@@ -13,10 +13,13 @@ fn card(id: &str, endpoint: &str) -> ComponentCard {
         serde_yaml::from_str(include_str!("../../../config/components/omlx.yaml")).unwrap();
     card.provider.id = id.to_string();
     card.endpoint = endpoint.to_string();
-    card.extensions = Some(serde_json::from_value(serde_json::json!({
-        "_degradation": "Removing these bindings disables aliases.",
-        "idoris_role_models": {"daily": id, "fast": id}
-    })).unwrap());
+    card.extensions = Some(
+        serde_json::from_value(serde_json::json!({
+            "_degradation": "Removing these bindings disables aliases.",
+            "idoris_role_models": {"daily": id, "fast": id}
+        }))
+        .unwrap(),
+    );
     card
 }
 
