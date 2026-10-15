@@ -49,7 +49,7 @@
 
 **三个职责示例（含后续里程碑设计，不代表 v0.3.0 已全部实现）**
 1. **总结今天的微信群聊**（敏感、只能在本机处理）。Agent24 先用本地工具取消息，再以 `idoris/daily` + `local_only` 发起调用。iDoris 过隐私闸后选本地 daily 模型，必要时驱逐空闲模型再加载；本地免费调用不涉及付费预算（仍受容量准入约束），响应回传 `loopback`。如果本地模型加载不起来，返回 **503 fail-closed**，**不会改走云端**。
-2. **查资料写竞品分析报告**（公开数据，复杂任务）。Agent24 执行搜索和抓取工具，凭证由 vault (b) 注入。之后以 `idoris/deep` + `any` 发起调用。iDoris 选远程 deep 模型，对预算做原子 reserve（额度不足返回 402 终态；不得借 Fallback 绕过预算拒绝），注入 provider 凭证（vault (a)），结算后回传 `X-iDoris-Cost-Minor`，Agent24 记入按模块的用量账本。
+2. **查资料写竞品分析报告**（公开数据，复杂任务）。Agent24 执行搜索和抓取工具，凭证由 vault (b) 注入。之后以 `idoris/deep` + `any` 发起调用。iDoris 选远程 deep 模型，对预算做原子 reserve（额度不足时仅在调用方显式声明 `X-iDoris-Fallback: next_in_chain` 后允许回落到免费候选，并如实回传降级；未声明或无可行候选则返回 402。I0 router 尚未接入此声明的预算回落，实际仍返回 402，见 §4），注入 provider 凭证（vault (a)），结算后回传 `X-iDoris-Cost-Minor`，Agent24 记入按模块的用量账本。
 3. **转账或删除文件**（高风险动作）。Agent24 的 Guardian 调用 `/v1/systemone`（`local_only`），iDoris 用本地判定器返回概率，并如实回报 `judge.engine`。判定器不可用时**拒绝**（`judge_unavailable`），Agent24 转人工确认。资产类签名只能走 AirAccount + passkey（J-7）。双方以 `record_id` 与 `approval_id` 关联记录。
 
 ---
@@ -61,7 +61,8 @@
 - Agent24 不拥有、启动或托管 iDoris daemon；iDoris daemon 不启动 Agent24。用户或可信外部 launcher 负责启动。launcher 宿主尚未决定（R9），不自动变成 Desktop 的 sidecar。
 - `IDORIS_URL` 必须显式配置，无隐含端口。D-1(a)：配置后独占 iDoris，不留直连 oMLX/Ollama 回退；缺 key、服务不可用或身份不符都明确失败。
 - 已接受完整模型是两个逻辑 provider：`idoris-local`=Local，固定 `local_only`；`idoris-any`=Remote，固定 `any`。按 URL 去重 models/容量，不能相加。D-6 两把 key 分别限定 `[local_only]` 与 `[local_only,any]`。§3 提议仅交付 local 子集，第二 provider/key 延后，不撤销 D-6。
-- 数据面默认必须有 virtual bearer，即使 loopback。`IDORIS_DEV_NO_KEY=1` 仅为显式 loopback 开发选项，无 key 只能走免费 loopback/local_only；错误 bearer 不能借此绕过。非 loopback 必须有有效 key。tenant 模式沿用 `X-iDoris-Tenant`；个人模式不伪造 tenant。
+- 模块 manifest 未声明或声明 `local_only` 时使用 `idoris-local`；只有 `remote_allowed` 才有资格进入 `idoris-any`，仍不能扩大调用方已授予的权限。
+- 数据面默认必须有 virtual bearer，即使 loopback。`IDORIS_DEV_NO_KEY=1` 仅为显式 loopback 开发选项，无 key 只能走免费 loopback/local_only；错误 bearer 不能借此绕过。非 loopback 必须有有效 key。tenant 模式沿用 `X-iDoris-Tenant`；个人模式不伪造 tenant；tenant 模式的数据 key 必须绑定该 tenant_id。
 
 | 凭证 | 权威/使用者 | 边界 |
 |---|---|---|
@@ -111,9 +112,9 @@ Agent24 拥有同机 host facts、core 占用与整机账，为 iDoris 划一个
 ### 2.5 请求、隐私、响应与错误
 
 - 原型请求为 `model=idoris/<role>` 加 `X-iDoris-Privacy`、`X-iDoris-Complexity: simple|complex`、`X-iDoris-Request-Id`。Intent/Capabilities/Fallback 等只按真实需求加法接入；关联 Session/Trace-Id/Request-Id 由内核生成，不信任模块。`X-iDoris-Caller` 可选且只作元数据，永不作为策略依据。近期 Agent24 接入不做流式。
-- 隐私只能维持或收紧。声明角色的调用不从内容重猜 task/role；显式 auto 才委托角色选择，仍不放宽 privacy。未声明角色的其他调用方可由静态规则/判定器选角色。处理顺序：隐私 → 角色/能力 → 付费预算 → 容量 → 选择/声明的降级；预算拒绝不被静默本地回落掩盖。
-- `X-iDoris-Served-Locality: loopback|lan|remote` 表示**推理实际位置**。仅选定后端后有此头，后端错误也带；选择前拒绝可缺失。idoris-local 只接受 loopback，缺失/lan/remote 都按错误，结果不返调用者。完整 any provider 缺头保守计 remote。网关地址在 loopback 不证明推理在本机，亦不证明字节没有出网。
-- 所有响应带 `X-iDoris-Record-Id`；缓存还带 `X-iDoris-Cached: true`、`X-iDoris-Origin-Record-Id` 供去重。`/health` 返回 service/version/contract_version/instance_id；活着不代表 backend/model ready。身份自报不是对抗恶意本机端点的认证。
+- 隐私只能维持或收紧。声明角色的调用不从内容重猜 task/role；显式 auto 才委托角色选择，仍不放宽 privacy。未声明角色的其他调用方可由静态规则/判定器选角色。处理顺序：隐私 → 角色/能力 → 付费预算 → 容量 → 选择/声明的降级；预算不足不被静默回落掩盖；仅显式声明 `X-iDoris-Fallback: next_in_chain` 才允许 iDoris 回落到免费候选，并在响应中说明降级。此授权不允许 Agent24 改走另一 provider；I0 router 的实现差距见 §4。
+- `X-iDoris-Served-Locality: loopback|lan|remote` 表示**推理实际位置**。仅选定后端后有此头，后端错误也带；选择前拒绝可缺失。idoris-local 只接受 loopback，缺失/lan/remote 都按错误，结果不返调用者。完整 any provider 的 lan 及缺头均保守计 remote。网关地址在 loopback 不证明推理在本机，亦不证明字节没有出网。
+- 所有响应带 `X-iDoris-Record-Id`；缓存还带 `X-iDoris-Cached: true`、`X-iDoris-Origin-Record-Id` 供去重。`/health` 返回 service/version/contract_version/instance_id；开启开发免 key 时启动日志及 health 的 `dev_no_key_enabled` 会明示；活着不代表 backend/model ready。身份自报不是对抗恶意本机端点的认证。
 - 错误体采用 `{error:{type,rule_id,reason_code,evidence,remediation}}` 的结构化方向，实际各端点字段以源码/fixture 为准；不得假定所有字段处处存在。402/403/413/400 unsupported field 为终止错误，不重试、不换 provider；503 local_only_unavailable 在独占路径明确失败。rule_id/evidence/remediation 仅在管理页展示，不透给模块。
 - iDoris 已有 JSON/SSE 路径与取消处理；不得把未来 Agent24 非流式首片当作禁止 iDoris SSE。已开始 token 后不重试；字段支持必须逐项证明。I0 Supervisor 路径会拒绝 max_tokens，不能宣称完整 OpenAI 兼容。
 
@@ -135,6 +136,8 @@ Agent24 事件日志是 Evolver 主数据源，运行期记忆不是训练副本
 
 ## 4. 实际/候选/目标与工件映射
 
+**预算回落实现差距（B1）**：R6/R7 已接受“显式声明 Fallback 可回落到免费候选并回传降级”。I0 `idoris-policy::pipeline::budget_stage` 有 `allow_fallback()` 与 `Degradation::BudgetFallback` 分支及测试，但 `idoris-router/src/dispatch.rs` 传入 `PolicyCtx { budget: None }`，实际报价后原子 reserve 失败直接返回402。因此 I0 router 在有无声明时都仍为402，不能把 policy 核心的已测能力写成运行时已接线；031验收要如实验证该差距，不能反转既有规范。
+
 以下源码及测试名称按 I0/A0 固定对象静态核对；**本次未运行软件测试**，已有测试只证明对应层，不代表跨仓组合验收。
 
 | 事实/差距 | 精确源码、工件与已有测试 | v0.3.1 所需证据 |
@@ -153,10 +156,13 @@ Agent24 事件日志是 Evolver 主数据源，运行期记忆不是训练副本
 
 | 候选 | 固定提交 | 证据范围/限制 |
 |---|---|---|
-| [#507](https://github.com/iDoris-ai/iDoris/pull/507) onboarding | `5d6d9b5f6bbbd8242ac50cc59c66fc8024e5464e`（OPEN） | `docs/安装与首次调用-v0.3.0.md`、`scripts/test_onboarding_smoke.py`：iDoris 归档 fixture，非 Agent24 真实进程联调 |
+| [#507](https://github.com/iDoris-ai/iDoris/pull/507) onboarding | `543b008121760f9b3eb1264c25803b5ca38cf6fc`（OPEN；该head已获PRD批准，后续base/head移动须复审） | `docs/安装与首次调用-v0.3.0.md`、`scripts/test_onboarding_smoke.py`：iDoris 归档 fixture，非 Agent24 真实进程联调 |
 | [#508](https://github.com/iDoris-ai/iDoris/pull/508) key ceiling | `1c9c592ffb8f8226e873cfbbc242abf2fe24e747`（已合并至 `959337d`） | `crates/idoris-router/src/lib.rs`、`src/virtual_key_wiring_tests.rs`：防 personal key 提升与鉴权前事件泄露；已经进入 main，但不属于 I0 发布二进制，补丁版仍需完整验收 |
-| [#510](https://github.com/iDoris-ai/iDoris/pull/510) role binding | `c3cfff4a7864fc83951507615214bbc1c22d90ec`（OPEN） | `crates/idoris-router/src/dispatch.rs::role_models` 与 `src/role_binding_tests.rs`：显式运维 map/auto、缺失 fail-closed；HTTP 多协议与 lifecycle 共享具体目标；无映射 fixed subscription 保留既有角色资格，执行身份仍固定；不是 Agent24 已联调的证据 |
-| budget 精度后续 [#511](https://github.com/iDoris-ai/iDoris/pull/511) / [#512](https://github.com/iDoris-ai/iDoris/pull/512) | `20bb2a3c593c49972c8c5697f20c62ec9788091c` / `6e9f15828302f6735318eaceaafe91629bcd1601`（OPEN） | `crates/idoris-backend/tests/runtime_exact_charge.rs`、`crates/idoris-router/tests/runtime_exact_growth.rs`；尚未合并，亦不能替代 runtime allocation 基础接线验收 |
+| [#510](https://github.com/iDoris-ai/iDoris/pull/510) role binding | `6a9b37737d807983f78d55d719326f9771f183b8`（OPEN；该head已获PRD批准，后续base/head移动须复审） | `crates/idoris-router/src/dispatch.rs::role_models` 与 `src/role_binding_tests.rs`：显式运维 map/auto、缺失 fail-closed；HTTP 多协议与 lifecycle 共享具体目标；无映射 fixed subscription 保留既有角色资格，执行身份仍固定；不是 Agent24 已联调的证据 |
+| [#511](https://github.com/iDoris-ai/iDoris/pull/511) 精确容量基础 | `0c0d34347436f73f6816e161af8a687248666761`（已合并至 `9395a96760f450f7f88f916137659c05290f2008`） | `crates/idoris-backend/tests/runtime_exact_charge.rs`；已进入main，非I0产物，仍不等于启动预算已接线。 |
+| [#512](https://github.com/iDoris-ai/iDoris/pull/512) 启动预算接线 | `f1da0c7aca7fa0c0f4204f09790a1c141fd48682`（OPEN；新head待复审） | `crates/idoris-router/tests/runtime_exact_growth.rs`；候选真实runtime额度接线，尚未合并。 |
+
+**2026-10-15 后续状态**：#511 已以精确head批准、9绿CI、CLEAN普通合并为 main `9395a96760f450f7f88f916137659c05290f2008`；#512已转base main并同步到 `f1da0c7aca7fa0c0f4204f09790a1c141fd48682`，需新head复审。#479 nullable cap修复e3426f6已批准，父层安全修复同步后当前73051b1仍须以新head门禁为准。当前状态以GitHub为准，这些不是I0产物内容。
 
 ### 4.2 Schema 清单（I0 实际只有 15 份）
 
@@ -167,7 +173,7 @@ Agent24 事件日志是 Evolver 主数据源，运行期记忆不是训练副本
 
 ## 5. 历史承接与被取代条款
 
-历史保留用于追溯，不能构成第二份当前契约：
+历史保留用于追溯，不能构成第二份当前契约。以下既有细则继续保留而非退役：未声明角色时回传所选角色；requires_models可声明角色名；外部Jev仅用于允许离机的请求；修订遵循“提议→双方同意→升版本”。这里只恢复规范承接，不宣称相应目标工件已全部实现。
 
 | 历史材料 | 继承/更正 |
 |---|---|
@@ -195,5 +201,4 @@ Agent24 事件日志是 Evolver 主数据源，运行期记忆不是训练副本
 | R6 | 2026-09-27 | iDoris | jason 提出，iDoris 提议：请求阶段职责划分 S0–S7；统一凭证模块 vault | Agent24 方向同意，提出措辞修订与五个条件 |
 | R7 | 2026-09-27 | 双方 | iDoris 采纳全部措辞修订与条件，并对 J-4、J-2 各加一处限定；Agent24 确认；jason 拍板 J-1…J-8 全部选 (a) | **v1.1** |
 | R8 | 2026-09-27 | Agent24 | 审阅 v1.1：无异议；建议 loopback 免 key 仅作为显式开发者选项，免 key 时视为 local_only | 已采纳，写入 §3.2 |
-
 | R9 | 2026-10-15 | iDoris | [文档修订 1.2 整合与三个 owner 决策](negotiation/R9-v1.2-协商提案.md)；local_only v0.3.1 最小数据面与 launcher 解耦 | **OWNER REVIEW PENDING**；不是新实现或双方最终同意 |
