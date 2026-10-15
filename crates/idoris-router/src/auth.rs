@@ -34,6 +34,7 @@ impl std::error::Error for VirtualKeyAuthError {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VirtualKeyScopeError {
+    TenantForbidden,
     PrivacyForbidden,
     RoleForbidden,
     FallbackForbidden,
@@ -42,6 +43,7 @@ pub enum VirtualKeyScopeError {
 impl VirtualKeyScopeError {
     pub const fn reason_code(self) -> &'static str {
         match self {
+            Self::TenantForbidden => "VIRTUAL_KEY_TENANT_FORBIDDEN",
             Self::PrivacyForbidden => "VIRTUAL_KEY_PRIVACY_FORBIDDEN",
             Self::RoleForbidden => "VIRTUAL_KEY_ROLE_FORBIDDEN",
             Self::FallbackForbidden => "VIRTUAL_KEY_FALLBACK_FORBIDDEN",
