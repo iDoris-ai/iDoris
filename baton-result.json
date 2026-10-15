@@ -2,13 +2,98 @@
   "schema": "baton-result/v1",
   "task_id": "idoris-cloud-grok-release-wire-audit-20261015",
   "attempt_id": "5d06768c-1784-4069-b71a-08fc50fe6ac5",
-  "sequence": 1,
-  "status": "started",
+  "sequence": 2,
+  "status": "completed",
   "base_sha": "1c4cebdae582cda68db9f8e5aca9ff2caa1db8bd",
-  "result_sha": null,
-  "summary": "开始 v0.3.1 release wire 审计",
-  "tests": [],
+  "result_sha": "8c621fe264a3b281cbe881718e59ad4d49a4a3ae",
+  "summary": "云交付完成：审计文档已提交。覆盖用户旅程证据、v0.3.0资产vs无v0.3.1发布、031 blockers（#510/#507/#515/#485/#516、Agent24 #974/PR981/PR982等）、五候选模型未验证、文本网关vs无图视频路由。非产品验收PASS。coverage_gaps：未跑darwin正式包与真实模型调用。",
+  "tests": [
+    {
+      "name": "workflow_release_exists",
+      "command": "test -f .github/workflows/release.yml",
+      "exit_code": 0,
+      "pass": true
+    },
+    {
+      "name": "no_v031_release_notes",
+      "command": "test ! -f docs/releases/v0.3.1.md",
+      "exit_code": 0,
+      "pass": true
+    },
+    {
+      "name": "cli_usage_string_present",
+      "command": "rg -q 'idoris key issue --spec-stdin' crates/idoris-router/src/cli.rs",
+      "exit_code": 0,
+      "pass": true
+    },
+    {
+      "name": "release_only_apple_darwin",
+      "command": "rg -q 'aarch64-apple-darwin' .github/workflows/release.yml",
+      "exit_code": 0,
+      "pass": true
+    },
+    {
+      "name": "catalog_has_qwen36",
+      "command": "rg -q 'qwen3.6-35b-a3b' config/catalog.yaml",
+      "exit_code": 0,
+      "pass": true
+    },
+    {
+      "name": "catalog_no_flux_wan_image_gen",
+      "command": "! rg -qi 'flux|wan2|qwen-image' config/catalog.yaml",
+      "exit_code": 0,
+      "pass": true
+    },
+    {
+      "name": "wire_version_101",
+      "command": "rg -q '1.0.1' crates/idoris-contracts/src/version.rs",
+      "exit_code": 0,
+      "pass": true
+    },
+    {
+      "name": "cli_unit_parse",
+      "command": "cargo test -p idoris-router --locked --lib parses_serve_admin",
+      "exit_code": 0,
+      "pass": true
+    },
+    {
+      "name": "health_shape_unit",
+      "command": "cargo test -p idoris-router --locked --lib health_has_the_pr46",
+      "exit_code": 0,
+      "pass": true
+    },
+    {
+      "name": "cli_bad_args_usage",
+      "command": "./target/debug/idoris nope",
+      "exit_code": 1,
+      "pass": true
+    },
+    {
+      "name": "release_assets_darwin_only",
+      "command": "gh release view v0.3.0 --json assets",
+      "exit_code": 0,
+      "pass": true
+    },
+    {
+      "name": "no_v031_tag",
+      "command": "gh release view v0.3.1",
+      "exit_code": 1,
+      "pass": true,
+      "note": "release not found confirms gap"
+    }
+  ],
   "blocker": null,
-  "next": null,
-  "updated_at": "2026-10-15T11:27:29Z"
+  "next": "合入#510后更新onboarding期望；推进Agent24 provider/PR982预算；owner关闭R9；干净macOS组合验收后再考虑v0.3.1 tag。勿将本云交付当作产品PASS。",
+  "coverage_gaps": [
+    "未在macOS解压/启动正式v0.3.0归档",
+    "未启动真实oMLX或真实模型chat",
+    "未执行Agent24 Desktop/PR981/PR982运行时路径",
+    "单元测试PASS不等于组合验收PASS"
+  ],
+  "files": [
+    "docs/agent/V031-RELEASE-WIRE-AUDIT-20261015.md",
+    "baton-decisions.tsv",
+    "baton-result.json"
+  ],
+  "updated_at": "2026-10-15T11:32:22Z"
 }
