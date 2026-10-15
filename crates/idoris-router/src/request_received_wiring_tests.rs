@@ -183,6 +183,62 @@ async fn tenant_mode_rejects_unauthenticated_request_before_event_write() {
 }
 
 #[tokio::test]
+async fn tenant_mode_uses_bound_fixture_tenant_not_untrusted_metadata() {
+    let upstream = wiremock::MockServer::start().await;
+    wiremock::Mock::given(method("POST"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+            serde_json::json!({"id":"tenant-positive", "object":"chat.completion", "choices":[]}),
+        ))
+        .expect(1)
+        .mount(&upstream)
+        .await;
+    let event_log = memory_event_log();
+    let (app, key) = tenant_test_app(
+        AppState {
+            deploy_mode: DeployMode::Tenant,
+            cards: vec![super::tests::resident_component_card(
+                "tenant-event-test",
+                &upstream.uri(),
+            )],
+            event_log: Some(event_log.clone()),
+            ..AppState::default()
+        },
+        "acme",
+    );
+    let response = app.oneshot(tenant_test_request(
+        super::tests::post_chat(
+            r#"{"model":"idoris/daily","messages":[{"role":"user","content":"tenant fixture"}]}"#,
+            &[("x-idoris-tenant", "acme"), ("x-idoris-event-tenant", "evil")],
+        ),
+        &key,
+    )).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    upstream.verify().await;
+    let record_id = response
+        .headers()
+        .get(HEADER_RECORD_ID)
+        .unwrap()
+        .to_str()
+        .unwrap();
+    let rows = event_log
+        .events_for_record(Some("acme"), record_id)
+        .unwrap();
+    assert_eq!(rows[0].event.event_type, EventType::RequestReceived);
+    assert_eq!(rows[1].event.event_type, EventType::Profiled);
+    assert_eq!(rows[2].event.event_type, EventType::Decided);
+    assert!(rows.iter().all(|row| row.event.tenant_id == "acme"));
+    assert!(
+        event_log
+            .events_for_record(Some("evil"), record_id)
+            .unwrap()
+            .is_empty()
+    );
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(body["id"], "tenant-positive");
+}
+
+#[tokio::test]
 async fn each_accepted_http_request_gets_fresh_record_and_event_ids() {
     let event_log = memory_event_log();
     let app = build_app(AppState {
