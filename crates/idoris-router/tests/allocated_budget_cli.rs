@@ -145,6 +145,7 @@ async fn mount_omlx_fixture(upstream: &MockServer, estimated_size: u64) {
         .and(path("/v1/chat/completions"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "id": "chatcmpl-budget-fixture",
+            "model": MODEL_ID,
             "choices": [{"message": {"role": "assistant", "content": "budget-ok"}}]
         })))
         .mount(upstream)
