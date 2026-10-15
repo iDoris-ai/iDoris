@@ -126,7 +126,7 @@ async fn cap_admission_case(caps: &str, budget_minor: i64, expected: StatusCode)
     if expected == StatusCode::OK {
         assert_eq!(requests.len(), 1, "caps={caps}");
         let forwarded = requests[0].body_json::<serde_json::Value>().unwrap();
-        for field in ["max_tokens", "max_completion_tokens"] {
+        for field in ["max_tokens", "max_completion_tokens", "n"] {
             assert_eq!(forwarded.get(field), payload.get(field), "caps={caps}");
         }
         assert_eq!(after.spent_minor - before.spent_minor, 4);
@@ -135,7 +135,9 @@ async fn cap_admission_case(caps: &str, budget_minor: i64, expected: StatusCode)
         assert_eq!(after.spent_minor, before.spent_minor, "caps={caps}");
         assert_eq!(
             body["error"]["type"],
-            if expected == StatusCode::BAD_REQUEST {
+            if expected == StatusCode::BAD_REQUEST && payload.get("n").is_some() {
+                "unsupported_completion_count"
+            } else if expected == StatusCode::BAD_REQUEST {
                 "invalid_completion_cap"
             } else {
                 "budget_exceeded"
@@ -227,6 +229,43 @@ async fn valid_caps_and_defaults_preserve_payload_and_floor() {
         r#"{"max_completion_tokens":8}"#,
         r#"{"max_tokens":8,"max_completion_tokens":16}"#,
         r#"{"max_tokens":2048,"max_completion_tokens":16}"#,
+    ] {
+        cap_admission_case(caps, 3000, StatusCode::OK).await;
+        cap_admission_case(caps, 1023, StatusCode::PAYMENT_REQUIRED).await;
+    }
+}
+
+#[tokio::test]
+async fn unsupported_completion_counts_never_post_or_charge() {
+    for count in [
+        "2",
+        "3",
+        "0",
+        "-1",
+        "1.0",
+        "2.0",
+        "\"2\"",
+        "true",
+        "[]",
+        "{}",
+        "18446744073709551616",
+    ] {
+        for stream in [false, true] {
+            cap_admission_case(
+                &format!("{{\"n\":{count},\"stream\":{stream},\"max_tokens\":2048}}"),
+                3000,
+                StatusCode::BAD_REQUEST,
+            )
+            .await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn single_completion_defaults_keep_nullable_caps_and_budget_floor() {
+    for caps in [
+        r#"{"n":1,"max_tokens":null}"#,
+        r#"{"n":null,"max_completion_tokens":null}"#,
     ] {
         cap_admission_case(caps, 3000, StatusCode::OK).await;
         cap_admission_case(caps, 1023, StatusCode::PAYMENT_REQUIRED).await;
