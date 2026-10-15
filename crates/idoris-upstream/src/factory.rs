@@ -13,6 +13,11 @@ pub fn create_adapter(card: &ComponentCard) -> Result<Arc<dyn RuntimeAdapter>, B
             config.base_url.clone_from(&card.endpoint);
             Ok(Arc::new(super::OmlxAdapter::new(config)?))
         }
+        "ollama" => {
+            let mut config = super::OllamaAdapterConfig::default();
+            config.base_url.clone_from(&card.endpoint);
+            Ok(Arc::new(super::OllamaAdapter::new(config)?))
+        }
         provider => Err(BackendError::invalid_request(format!(
             "no adapter for provider {provider}"
         ))),
@@ -70,6 +75,40 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["qwen3-8b"]
         );
+    }
+
+    #[tokio::test]
+    async fn explicit_ollama_lists_tags_and_does_not_pull() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/tags"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "models": [{"name": "qwen3:8b", "size": 6_u64 * 1024 * 1024 * 1024}]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let adapter = create_adapter(&card("ollama", &server.uri())).expect("adapter constructs");
+        assert!(
+            !crate::OLLAMA_CAPABILITIES.contains(&idoris_contracts::common::Capability::Rerank),
+            "Ollama has no rerank endpoint"
+        );
+        let models = adapter.list().await.expect("tag list succeeds");
+        assert_eq!(
+            models
+                .iter()
+                .map(|model| (model.id.as_str(), model.memory_gb))
+                .collect::<Vec<_>>(),
+            [("qwen3:8b", 6.0)]
+        );
+        let paths = server
+            .received_requests()
+            .await
+            .expect("recorded")
+            .iter()
+            .map(|request| request.url.path().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(paths, ["/api/tags"]);
     }
 
     #[test]

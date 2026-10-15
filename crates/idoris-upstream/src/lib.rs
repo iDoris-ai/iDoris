@@ -12,6 +12,9 @@
 //!   this stack), with a stable `reason_code()` that keeps authentication
 //!   failure and dependency failure from ever collapsing into the same
 //!   code.
+//! - [`ollama`] — [`ollama::OllamaAdapter`], a `RuntimeAdapter` for a
+//!   running Ollama daemon. It does not pull models and it does not claim
+//!   a hard pin.
 //! - [`omlx`] — [`omlx::OmlxAdapter`], a complete `RuntimeAdapter`
 //!   implementation (built up across the PRs on this branch stack).
 //! - [`remote`] — the concrete `RemoteChat` client(s) (landing across
@@ -25,6 +28,7 @@ pub mod factory;
 pub mod local_http_runtime;
 pub mod local_runtime;
 pub mod local_runtime_process;
+pub mod ollama;
 pub mod omlx;
 pub mod remote;
 pub mod subscription;
@@ -37,6 +41,7 @@ pub use error::UpstreamError;
 pub use local_http_runtime::{LocalHttpRuntimeAdapter, LocalHttpRuntimeConfig};
 pub use local_runtime::{LocalRuntimeKind, LocalRuntimeLaunch};
 pub use local_runtime_process::ManagedRuntimeProcess;
+pub use ollama::{CAPABILITIES as OLLAMA_CAPABILITIES, OllamaAdapter, OllamaAdapterConfig};
 pub use omlx::{OmlxAdapter, OmlxAdapterConfig};
 pub use remote::{CredentialSource, EnvCredentialSource};
 
