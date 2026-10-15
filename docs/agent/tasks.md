@@ -427,6 +427,31 @@
 
 ---
 
+## F1.2+ / F2.4+ — 跨平台推理后端与 Decision 3.0 决策模型（2026-10-15）
+
+> 决策：[`../18-推理后端与决策模型-vLLM与Decision3.0评估.md`](../18-推理后端与决策模型-vLLM与Decision3.0评估.md)。完整任务卡（范围 / 不做 / 依赖 / 验收）见 [`plans/runtime-portability-and-decision-model.md`](plans/runtime-portability-and-decision-model.md)，本节只做台账索引。
+
+| Task | 内容 | 依赖 | 状态 |
+|:---|:---|:---|:---|
+| A1 | ChatProxy 可选 Bearer（卡片 `auth.env`，缺失即拒绝启动） | — | READY |
+| A2 | `LocalRuntimeKind::Vllm`（`vllm serve`，覆盖 vllm-metal） | A1 | READY |
+| A3 | 🖥 vllm-metal vs oMLX 实机对比，领先超 30% 即重开结论一 | A2 | BACKLOG |
+| A4 | `OllamaAdapter`（Windows 默认后端） | — | READY |
+| A5 | NVIDIA 探测 + `detect_backend` 接默认卡 | A2, A4 | BACKLOG |
+| A6 | 跨平台发布 / 非 Apple 内存模型 / Windows 进程 owner（里程碑占位） | A5 | BACKLOG |
+| A7 | oMLX 依赖清单 + 退出路径样例配置 | — | READY |
+| B0 | 🖥 d3-lite 在 oMLX `/v1/systemone` 上的线格式 + 中文 spike | — | READY |
+| B1 | `routing-policy.yaml` 补 intent / complexity 规则 | — | READY |
+| B2 | ≥200 条中英评测集 + 评测脚本（准确率 / ECE / 置换一致 / 延迟） | B0 | BACKLOG |
+| B3 | `/v1/systemone` 契约 schema + `SystemOneClient` | B0（可先行） | READY |
+| B4 | `SystemOneDetector` shadow 模式（只记一致率，不改路由） | B1, B3 | BACKLOG |
+| B5 | 切为生效：intent + complexity；judge 不可用默认拒绝（D-1） | B4, B2 过线 | BACKLOG |
+| B6 | 对外 `POST /v1/systemone`（M6，scope + `judge_unavailable`） | B3, B5 | BACKLOG |
+| B7 | L1 隐私收紧器（只收紧） | M5 闸一合并 | BLOCKED |
+| B8 | 自有决策模型（M7 占位，d3 作 base/教师） | M6 | BACKLOG |
+
+---
+
 ## 跟进项账本（followups）
 
 | # | 来源 | 内容 | 状态 |
