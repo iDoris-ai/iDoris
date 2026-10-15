@@ -431,10 +431,12 @@
 
 > 决策：[`../18-推理后端与决策模型-vLLM与Decision3.0评估.md`](../18-推理后端与决策模型-vLLM与Decision3.0评估.md)。完整任务卡（范围 / 不做 / 依赖 / 验收）见 [`plans/runtime-portability-and-decision-model.md`](plans/runtime-portability-and-decision-model.md)，本节只做台账索引。
 
+> 本表为计划，未授权开发：prdaemon Codex astra 审核通过后，仍须 owner 明确允许才启动；READY 仅为依赖就绪。A6/B8 是后续占位。
+
 | Task | 内容 | 依赖 | 状态 |
 |:---|:---|:---|:---|
-| A1 | ChatProxy 可选 Bearer（卡片 `auth.env`，缺失即拒绝启动） | — | READY |
-| A2 | `LocalRuntimeKind::Vllm`（`vllm serve`，覆盖 vllm-metal） | A1 | READY |
+| A1 | HTTP/runtime readiness/chat 共用 Bearer（缺失即拒绝启动） | — | READY |
+| A2 | `LocalRuntimeKind::Vllm`（认证、真实模型身份、GPU 额度） | A1 | BACKLOG |
 | A3 | 🖥 vllm-metal vs oMLX 实机对比，领先超 30% 即重开结论一 | A2 | BACKLOG |
 | A4 | `OllamaAdapter`（Windows 默认后端） | — | READY |
 | A5 | NVIDIA 探测 + `detect_backend` 接默认卡 | A2, A4 | BACKLOG |
@@ -442,13 +444,13 @@
 | A7 | oMLX 依赖清单 + 退出路径样例配置 | — | READY |
 | BM | 模式分离：意图识别只在 `idoris/auto` 下运行（聊天 / 自动路由 / 调用方声明三种模式，D-5） | — | READY |
 | B0 | 🖥 d3-lite 在 oMLX `/v1/systemone` 上的线格式 + 中文 spike | — | READY |
-| B1 | `routing-policy.yaml` 补 intent / complexity 规则（与 B5 同一版本上线） | B5 | BACKLOG |
+| B1 | 隐私过滤后的确定性 auto 角色选择与来源隔离 | B2 达标、B4、#510；与 B5 同版本 | BACKLOG |
 | B2 | ≥200 条中英评测集 + 评测脚本（准确率 / ECE / 置换一致 / 延迟） | B0 | BACKLOG |
-| B3 | `/v1/systemone` 契约 schema + `SystemOneClient` | B0（可先行） | READY |
+| B3 | 固定 System One 线格式 + 认证客户端 + 引擎来源校验 | B0, A1 | BACKLOG |
 | B4 | `SystemOneDetector` shadow 模式（只记一致率，不改路由） | B3, BM | BACKLOG |
 | B5 | 切为生效：intent + complexity；judge 不可用时仅 `idoris/auto` 返回 `judge_unavailable`（D-1） | B4, B2 过线；与 B1 同版本 | BACKLOG |
 | B6 | 对外 `POST /v1/systemone`（M6，scope + `judge_unavailable`） | B3, B5 | BACKLOG |
-| B7 | L1 隐私收紧器（只收紧） | M5 闸一合并 | BLOCKED |
+| B7 | L1 隐私收紧器（active 必要判定故障显式拒绝） | B3/B5、M5 合并与语义复审 | BLOCKED |
 | B8 | 自有决策模型（M7 占位，d3 作 base/教师） | M6 | BACKLOG |
 
 ---
