@@ -653,6 +653,74 @@ fn credential_serialized_windows_separators() {
 }
 
 #[test]
+fn credential_paths_after_serialized_env_remain_covered() {
+    for (text, paths) in [
+        (
+            r#""./.env\n./.aws/credentials\n./id_rsa""#,
+            vec!["./.env", "./.aws/credentials", "./id_rsa"],
+        ),
+        (
+            r#""./.aws/credentials\n./.env\n./id_rsa""#,
+            vec!["./.aws/credentials", "./.env", "./id_rsa"],
+        ),
+        (
+            r".env\n~/.aws/credentials",
+            vec![".env", "~/.aws/credentials"],
+        ),
+    ] {
+        assert_credential_paths_masked(text, &paths);
+    }
+}
+
+#[test]
+fn credential_paths_after_absolute_env_remain_covered() {
+    for (text, paths) in [
+        (
+            r#""/app/.env\n/root/.ssh/id_rsa""#,
+            vec!["/app/.env", "/root/.ssh/id_rsa"],
+        ),
+        (
+            r"/app/.env\t/home/alice/.ssh/id_rsa",
+            vec!["/app/.env", "/home/alice/.ssh/id_rsa"],
+        ),
+        (
+            r"C:\app\.env\..\..\Users\a\.ssh\id_rsa",
+            vec![r"\app\.env", r".ssh\id_rsa"],
+        ),
+    ] {
+        assert_credential_paths_masked(text, &paths);
+    }
+}
+
+fn assert_credential_paths_masked(text: &str, paths: &[&str]) {
+    let input = format!("🚗😀 {text}");
+    let response = inspect(&input, &open_ctx());
+    assert_eq!(response.action, InspectAction::Redact);
+    let mut masked: Vec<u16> = input.encode_utf16().collect();
+    let mut covered_units = vec![false; masked.len()];
+    for finding in &response.findings {
+        assert_eq!(finding.kind, FindingKind::CredentialPath);
+        let span = finding.span.unwrap();
+        let start = span.start as usize;
+        let end = start + span.length as usize;
+        covered_units[start..end].fill(true);
+        masked[start..end].fill(u16::from(b'*'));
+    }
+    let redacted = String::from_utf16(&masked).unwrap();
+    for path in paths {
+        let byte_start = input.find(path).unwrap();
+        let start = input[..byte_start].encode_utf16().count();
+        let end = start + path.encode_utf16().count();
+        assert!(
+            covered_units[start..end].iter().all(|covered| *covered),
+            "path {path:?} left exposed: {redacted:?}; {response:?}"
+        );
+        assert!(!redacted.contains(path), "{redacted:?}");
+    }
+    assert!(redacted.starts_with("🚗😀 "));
+}
+
+#[test]
 fn credential_ambiguous_assignments_fail_closed_on_aggregate_entropy() {
     // These can be assignments with individually sub-threshold values or opaque
     // credentials containing '='. The inclusive detector cannot distinguish the

@@ -111,17 +111,6 @@ pub(super) fn scan(units: &[u16], hits: &mut Vec<Hit>) {
         c.is_ascii_alphanumeric() || b"._~/-\\".contains(&c)
     }) {
         let mut end = run_end;
-        // Preserve the Windows prefix, but stop at an escape after an env
-        // filename. The old backslash-split segmentation ended here too.
-        let old_runs = runs(&units[start..run_end], |c| {
-            c.is_ascii_alphanumeric() || b"._~/-".contains(&c)
-        });
-        for &(a, b) in &old_runs {
-            if is_env_file(&units[start + a..start + b]) {
-                end = start + b;
-                break;
-            }
-        }
         while end > start && units[end - 1] == u16::from(b'\\') {
             end -= 1;
         }
