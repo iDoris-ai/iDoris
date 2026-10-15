@@ -434,12 +434,10 @@ fn credential_assignments_score_only_the_value() {
         assert_eq!(response.action, InspectAction::Block, "{prefix}");
         assert!(!kinds(&response).contains(&FindingKind::ApiKey));
     }
-    for value in ["development", "a1B2a1B2a1B2a1B2a1B2a1B2a1B2a1B2a1B2"] {
-        let input = format!("DJANGO_SECRET_KEY_FOR_PRODUCTION_SETTINGS={value}");
-        let response = inspect(&input, &open_ctx());
-        assert!(response.findings.is_empty(), "{response:?}");
-        assert_eq!(response.action, InspectAction::Allow);
-    }
+    let input = "DJANGO_SECRET_KEY_FOR_PRODUCTION_SETTINGS=development";
+    let response = inspect(input, &open_ctx());
+    assert!(response.findings.is_empty(), "{response:?}");
+    assert_eq!(response.action, InspectAction::Allow);
 }
 
 #[test]
@@ -519,6 +517,72 @@ fn credential_internal_equals_preserves_value_spans() {
 }
 
 #[test]
+fn credential_internal_equals_with_low_switch_piece() {
+    for value in [
+        "abcdefgh=Q1w2E3r4T5y6U7i8O9p0A1s2D3f4",
+        "Q1w2E3r4T5y6U7i8O9p0A1s2D3f4=abcdefgh",
+        "abcd=Q1w2E3r4T5y6U7i8O9p0A1s2=efgh",
+        "abcdefgh=Q1w2E3r4T5y6U7i8O9p0A1s2D3f4==",
+        "abc=Q1w2E3r4T5y6U7i8O9p0A1s2D3f4", // Exactly 32 units.
+        "Q1w2E3r4T5y6U7i8O9p0A1s2D3f4=abc",
+    ] {
+        for prefix in ["", "PASSWORD="] {
+            let input = format!("🚗😀 {prefix}{value};");
+            assert_single(
+                &input,
+                FindingKind::HighEntropySecret,
+                value,
+                Sensitivity::S3,
+            );
+            let response = inspect(&input, &open_ctx());
+            assert_eq!(response.action, InspectAction::Block);
+            assert_eq!(response.sensitivity, Sensitivity::S3);
+            assert_eq!(
+                response.findings[0].span.unwrap().start,
+                (5 + prefix.len()) as u64
+            );
+        }
+    }
+    // Inclusive segmentation still obeys length and entropy thresholds.
+    for input in [
+        "ab=Q1w2E3r4T5y6U7i8O9p0A1s2D3f4",   // 31 units.
+        "a1B2a1B2a1B2a1B2=a1B2a1B2a1B2a1B2", // Low entropy.
+    ] {
+        let response = inspect(input, &open_ctx());
+        assert_eq!(
+            response.action,
+            InspectAction::Allow,
+            "{input}: {response:?}"
+        );
+        assert!(response.findings.is_empty(), "{input}: {response:?}");
+    }
+}
+
+#[test]
+fn credential_internal_equals_at_every_split_keeps_inclusive_coverage() {
+    // Every insertion retains the original scanner's high-entropy token.
+    // Near the ends a long piece is itself detected; prefer that exact span.
+    for split in 1..FAKE_RAW_SECRET.len() {
+        let (left, right) = FAKE_RAW_SECRET.split_at(split);
+        let value = format!("{left}={right}");
+        let input = format!("🚗😀 {value};");
+        let response = inspect(&input, &open_ctx());
+        assert_eq!(
+            response.action,
+            InspectAction::Block,
+            "{split}: {response:?}"
+        );
+        assert_eq!(response.sensitivity, Sensitivity::S3);
+        assert_eq!(kinds(&response), [FindingKind::HighEntropySecret]);
+        let finding = &response.findings[0];
+        let span = finding.span.unwrap();
+        assert!(span.start >= 5);
+        assert!(span.start + span.length <= 5 + value.len() as u64);
+        assert!([left, right, value.as_str()].contains(&covered(&input, finding).as_str()));
+    }
+}
+
+#[test]
 fn credential_union_does_not_widen_or_duplicate_existing_values() {
     let input = format!("😀 {FAKE_RAW_SECRET}={FAKE_RAW_SECRET}");
     let response = inspect(&input, &open_ctx());
@@ -589,11 +653,40 @@ fn credential_serialized_windows_separators() {
 }
 
 #[test]
-fn credential_assignment_name_does_not_gain_padding() {
-    for input in [
+fn credential_ambiguous_assignments_fail_closed_on_aggregate_entropy() {
+    // These can be assignments with individually sub-threshold values or opaque
+    // credentials containing '='. The inclusive detector cannot distinguish the
+    // intent: retain its conservative Block, but never invent a padded-name span.
+    for token in [
         "aA1bB2cC3dD4eE5fF6gG7hH8iI9jJ0k=developmentconfiguration",
         "K=8vLr5VrExzWYr2qeBJNvhYsN63lysYi",
         "K=aVTZ23bG7tHZlX0SqxlZ3dzETRxOmw",
+        "DJANGO_SECRET_KEY_FOR_PRODUCTION_SETTINGS=a1B2a1B2a1B2a1B2a1B2a1B2a1B2a1B2a1B2",
+    ] {
+        let input = format!("😀 {token};");
+        assert_single(
+            &input,
+            FindingKind::HighEntropySecret,
+            token,
+            Sensitivity::S3,
+        );
+        let response = inspect(&input, &open_ctx());
+        assert_eq!(response.action, InspectAction::Block);
+        assert_eq!(response.findings[0].span.unwrap().start, 3);
+    }
+    // A delimiter before a benign value is not trailing base64 padding. Here
+    // the aggregate also falls below the switch threshold, so it remains Allow.
+    let response = inspect(
+        "aA1bB2cC3dD4eE5fF6gG7hH8iI9jJ0k=developmentconfigurationdevelopmentconfiguration",
+        &open_ctx(),
+    );
+    assert_eq!(response.action, InspectAction::Allow);
+    assert!(response.findings.is_empty(), "{response:?}");
+}
+
+#[test]
+fn credential_benign_windows_paths_and_escapes_are_allowed() {
+    for input in [
         r"C:\Windows\System32\drivers\etc\hosts",
         r"\\?\C:\temp\file.txt",
         r"split on \ and / please",

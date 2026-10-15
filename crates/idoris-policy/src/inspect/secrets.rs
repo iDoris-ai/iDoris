@@ -60,8 +60,11 @@ pub(super) fn scan(units: &[u16], hits: &mut Vec<Hit>) {
             hits.push(hit(FindingKind::ApiKey, start, end, Sensitivity::S3));
         }
     }
-    // Prefer value-only spans. The inclusive segmentation is a fallback for
-    // internal '=': it must neither duplicate nor widen an existing value hit.
+    // Union value-only and inclusive segmentation, preferring value-only spans.
+    // '=' is ambiguous: it can separate an assignment or belong to a credential.
+    // Never let an assignment heuristic veto an inclusive high-entropy hit;
+    // that fails open when individually short pieces form one random token.
+    // This deliberately retains conservative hits on ambiguous assignments.
     for (start, end) in runs(units, |c| entropy_member(c) || c == b'=') {
         let token = &units[start..end];
         let mut candidates = Vec::new();
@@ -87,14 +90,10 @@ pub(super) fn scan(units: &[u16], hits: &mut Vec<Hit>) {
                 },
             ));
         }
-        if let Some(eq) = token.iter().position(|&u| u == u16::from(b'='))
-            && random_parts(&token[eq + 1..])
-        {
+        if let Some(eq) = token.iter().position(|&u| u == u16::from(b'=')) {
             candidates.push((eq + 1, token.len()));
         }
-        if random_parts(token) {
-            candidates.push((0, token.len()));
-        }
+        candidates.push((0, token.len()));
         let mut accepted = Vec::new();
         for (a, b) in candidates {
             if looks_random(&token[a..b]) && !accepted.iter().any(|&(x, y)| a < y && x < b) {
@@ -154,15 +153,6 @@ pub(super) fn scan(units: &[u16], hits: &mut Vec<Hit>) {
 
 fn entropy_member(c: u8) -> bool {
     c.is_ascii_alphanumeric() || b"+/_-".contains(&c)
-}
-
-// Inclusive candidates must contain secret-like pieces on both sides of an
-// internal '='. Otherwise an ordinary assignment name can manufacture a hit.
-fn random_parts(token: &[u16]) -> bool {
-    token
-        .split(|&u| u == u16::from(b'='))
-        .filter(|part| !part.is_empty())
-        .all(|part| part.len() > 1 && switches(part) * 2 >= part.len() - 1)
 }
 
 fn fold_path(token: &[u16]) -> Vec<u16> {
