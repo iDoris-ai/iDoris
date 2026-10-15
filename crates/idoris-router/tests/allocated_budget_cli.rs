@@ -248,9 +248,9 @@ async fn post_chat(port: u16) -> reqwest::Response {
         .header("content-type", "application/json")
         .header("X-iDoris-Privacy", "local_only")
         .timeout(Duration::from_secs(10))
-        .body(format!(
-            r#"{{"model":"idoris/daily","stream":false,"messages":[{{"role":"user","content":"hi"}}]}}"#
-        ))
+        .body(
+            r#"{"model":"idoris/daily","stream":false,"messages":[{"role":"user","content":"hi"}]}"#,
+        )
         .send()
         .await
         .unwrap()
