@@ -152,6 +152,20 @@ GET /idoris/tenants/{tenant_id}/audit?from=&to=&limit=   # 审计记录（仅元
 
 **硬保证**：同一批数据在任何时区的机器上聚合，`totals` 与 `range_utc` 必须完全一致——不是尽力而为。
 
+### Completed 事件中的 token 估算来源
+
+请求事件查询 `GET /idoris/tenants/{tenant_id}/requests/{record_id}` 返回原始事件 metadata。
+本地成功完成的 `completed` 事件携带 `tokens_in` / `tokens_out`，以及无内容的标量
+`token_estimator: "conservative"`。这两个数量是预算估算器
+`idoris_tenancy::budget::estimate_tokens` 对拼接 prompt 和提取出的回复文本的估算事实，
+与预算结算使用相同口径，不是模型报告的实际 token 数。
+
+响应体 `usage` 和用量记录仍使用 `rough_token_estimate`（UTF-16 长度 / 4 向上取整）；
+它们与 Completed 的保守预算估算不同，同一 `record_id` 下也不保证相等，尤其是 CJK 文本。
+预算金额和两个现有估算器均保持原有行为。失败的本地完成、proxy 和 stream 完成不写入
+`tokens_in` / `tokens_out` / `token_estimator`，缺失不能解释为零。
+历史 append-only 事件可能没有来源标签；不能据此推断它们是 rough 或真实 token 数。
+
 ## 7. 消费方迁移清单
 
 1. 把本地路由/成本/审计层改成薄客户端：调 `/v1/*` 并带 `X-iDoris-Tenant`。

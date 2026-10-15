@@ -1967,6 +1967,7 @@ async fn append_completed_fields(
     if let Some((tokens_in, tokens_out)) = usage {
         metadata.insert("tokens_in".to_string(), json!(tokens_in));
         metadata.insert("tokens_out".to_string(), json!(tokens_out));
+        metadata.insert("token_estimator".to_string(), json!("conservative"));
     }
     let ts_utc_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -4080,6 +4081,154 @@ mod tests {
         assert_eq!(unknown.status(), StatusCode::BAD_REQUEST);
     }
 
+    fn legacy_only_audit_row(store: &Arc<std::sync::Mutex<TenantStore>>, record_id: &str) {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let mut payload = Map::new();
+        payload.insert("request_id".into(), json!(format!("request-{record_id}")));
+        payload.insert("component".into(), json!("router"));
+        payload.insert("status".into(), json!(200));
+        payload.insert("reason".into(), json!("intent_match: routed"));
+        payload.insert("latency_ms".into(), json!(1));
+        payload.insert("ts_utc".into(), json!(now));
+        store
+            .lock()
+            .unwrap()
+            .put(
+                Some(budget::PERSONAL_TENANT_ID),
+                &TenantRecord {
+                    tenant_id: budget::PERSONAL_TENANT_ID.into(),
+                    kind: RecordKind::Audit,
+                    record_id: record_id.into(),
+                    request_id: format!("request-{record_id}"),
+                    origin_record_id: None,
+                    payload,
+                },
+            )
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn audit_query_http_is_unavailable_with_only_the_legacy_record_store() {
+        // A real request lands a legacy audit row, but `/audit` never falls
+        // back to that store: without an Event Log it is unavailable.
+        let store = memory_record_store();
+        let app = build_app(AppState {
+            record_store: Some(store.clone()),
+            ..AppState::default()
+        });
+        let request = app
+            .clone()
+            .oneshot(post_chat("{not valid json", &[]))
+            .await
+            .unwrap();
+        assert_eq!(request.status(), StatusCode::BAD_REQUEST);
+        let record_id = request
+            .headers()
+            .get(HEADER_RECORD_ID)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(audit_rows(&store)[0].record_id, record_id);
+
+        let tenant = budget::PERSONAL_TENANT_ID;
+        for uri in [
+            format!("/idoris/tenants/{tenant}/audit"),
+            format!("/idoris/tenants/{tenant}/audit?record_id={record_id}"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(get_usage(&uri, Some(tenant)))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE, "{uri}");
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(json["error"]["type"], "audit_unavailable");
+            assert!(
+                !String::from_utf8(body.to_vec())
+                    .unwrap()
+                    .contains(&record_id)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn audit_query_http_never_returns_rows_present_only_in_the_legacy_record_store() {
+        // With both stores configured, a real request dual-writes its audit
+        // fact; a row planted only in the legacy store must stay invisible.
+        let store = memory_record_store();
+        let event_log =
+            Arc::new(EventLogStore::new(Connection::open_in_memory().unwrap()).unwrap());
+        legacy_only_audit_row(&store, "legacy-only");
+        let app = build_app(AppState {
+            record_store: Some(store.clone()),
+            event_log: Some(event_log),
+            ..AppState::default()
+        });
+        let request = app
+            .clone()
+            .oneshot(post_chat("{not valid json", &[]))
+            .await
+            .unwrap();
+        assert_eq!(request.status(), StatusCode::BAD_REQUEST);
+        let dual_written = request
+            .headers()
+            .get(HEADER_RECORD_ID)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        let mut legacy_ids = audit_rows(&store)
+            .into_iter()
+            .map(|row| row.record_id)
+            .collect::<Vec<_>>();
+        legacy_ids.sort();
+        let mut expected_legacy_ids = vec!["legacy-only".to_string(), dual_written.clone()];
+        expected_legacy_ids.sort();
+        assert_eq!(legacy_ids, expected_legacy_ids);
+
+        let tenant = budget::PERSONAL_TENANT_ID;
+        let all = app
+            .clone()
+            .oneshot(get_usage(
+                &format!("/idoris/tenants/{tenant}/audit"),
+                Some(tenant),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(all.status(), StatusCode::OK);
+        let body = all.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let ids = json["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["record_id"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, [dual_written.as_str()]);
+        assert!(
+            !String::from_utf8(body.to_vec())
+                .unwrap()
+                .contains("legacy-only")
+        );
+
+        let filtered = app
+            .oneshot(get_usage(
+                &format!("/idoris/tenants/{tenant}/audit?record_id=legacy-only"),
+                Some(tenant),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(filtered.status(), StatusCode::OK);
+        let body = filtered.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["records"].as_array().unwrap().is_empty());
+    }
+
     #[tokio::test]
     async fn chat_completions_rejects_invalid_json() {
         let store = memory_record_store();
@@ -4373,6 +4522,106 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(runtimes.ready_snapshot_calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn chat_request_serves_the_exact_ready_session_target_from_one_snapshot() {
+        // Two equal-cost eligible targets, only one exact-ready. Running both
+        // orientations under one session key means rendezvous hashing alone
+        // cannot explain the pick; the single frozen readiness view must.
+        for ready in ["local-a", "local-b"] {
+            let cards = vec![
+                sample_component_card("local-a"),
+                sample_component_card("local-b"),
+            ];
+            let mut adapters = Vec::new();
+            let mut bound = Vec::new();
+            for card in &cards {
+                let id = card.provider.id.clone();
+                let adapter = std::sync::Arc::new(idoris_backend::MockAdapter::new(vec![
+                    idoris_backend::ModelInfo {
+                        id: id.clone(),
+                        memory_gb: 1.0,
+                    },
+                ]));
+                let supervisor = idoris_backend::Supervisor::spawn(
+                    adapter.clone(),
+                    idoris_backend::SupervisorConfig::default(),
+                )
+                .unwrap();
+                // Warm with dispatch's default policy so serving the ready
+                // target is an idempotent no-op rather than a policy re-apply.
+                if id == ready {
+                    supervisor
+                        .load(
+                            id.as_str(),
+                            1.0,
+                            idoris_contracts::load_policy::LoadPolicy {
+                                mode: idoris_contracts::load_policy::LoadMode::OnDemand,
+                                keepalive: idoris_contracts::load_policy::Keepalive::IdleTtl {
+                                    idle_ttl_s: 300,
+                                },
+                                admission: idoris_contracts::load_policy::Admission::Coexist,
+                            },
+                        )
+                        .await
+                        .unwrap();
+                }
+                bound.push(dispatch::BoundSupervisor::new(card, supervisor));
+                adapters.push((id, adapter));
+            }
+            let runtimes = runtime::RuntimeRegistry::from_supervisors(bound);
+            let event_log =
+                Arc::new(EventLogStore::new(Connection::open_in_memory().unwrap()).unwrap());
+            let state = AppState {
+                cards,
+                runtimes: runtimes.clone(),
+                event_log: Some(event_log.clone()),
+                ..AppState::default()
+            };
+
+            let response = build_app(state)
+                .oneshot(post_chat(
+                    r#"{"model":"idoris/daily","messages":[{"role":"user","content":"hi"}]}"#,
+                    &[("X-iDoris-Session", "run-42")],
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{ready}");
+            assert_eq!(runtimes.ready_snapshot_calls(), 1, "{ready}");
+            assert_eq!(
+                response.headers().get(HEADER_SERVED_LOCALITY).unwrap(),
+                "loopback"
+            );
+            let record_id = response
+                .headers()
+                .get(HEADER_RECORD_ID)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string();
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(json["model"], ready);
+
+            // Only the ready upstream executed: the other was never loaded,
+            // and MockAdapter refuses chat for a model it has not loaded.
+            for (id, adapter) in &adapters {
+                let expected_loads = u32::from(id == ready);
+                assert_eq!(adapter.load_call_count(id), expected_loads, "{ready}: {id}");
+            }
+            // No provider header exists; the Event Log names the provider.
+            let chain = event_log
+                .events_for_record(Some(budget::PERSONAL_TENANT_ID), &record_id)
+                .unwrap();
+            for event_type in [EventType::Decided, EventType::Dispatched] {
+                let event = chain
+                    .iter()
+                    .find(|event| event.event.event_type == event_type)
+                    .unwrap();
+                assert_eq!(event.event.metadata["provider_id"], json!(ready));
+            }
+        }
     }
 
     #[tokio::test]
