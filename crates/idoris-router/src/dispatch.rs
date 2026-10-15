@@ -129,7 +129,7 @@ fn default_load_policy() -> LoadPolicy {
 /// mapping isn't wired yet, and real admission state is only known after
 /// asking the Supervisor (post-selection, see [`dispatch_local`]).
 /// `estimated_cost_minor` comes from [`budget::estimate_cost_minor`].
-fn candidate(component: &ComponentCard, prompt: &str, blocked: bool) -> Card {
+fn candidate(component: &ComponentCard, prompt: &str, blocked: bool, completion: u64) -> Card {
     Card {
         component: component.clone(),
         roles: ROLES
@@ -139,7 +139,15 @@ fn candidate(component: &ComponentCard, prompt: &str, blocked: bool) -> Card {
             .collect(),
         experiment: false,
         min_ram_gb: 0.0,
-        estimated_cost_minor: budget::estimate_cost_minor(&component.provider.cost, prompt),
+        estimated_cost_minor: if is_resident_http_service(component) {
+            budget::estimate_cost_minor_with_completion(
+                &component.provider.cost,
+                prompt,
+                completion,
+            )
+        } else {
+            budget::estimate_cost_minor(&component.provider.cost, prompt)
+        },
         // M5-16: an open provider breaker is an admission fact; decide()
         // drops Blocked candidates at its admission stage.
         admission_status: if blocked {
@@ -270,9 +278,36 @@ pub fn select_avoiding_open_breakers(
     ready_provider_ids: &BTreeSet<String>,
     open_provider_ids: &BTreeSet<String>,
 ) -> Result<Selected, DispatchError> {
+    select_with_completion_reservation(
+        cards,
+        profile,
+        prompt,
+        affinity_key,
+        ready_provider_ids,
+        open_provider_ids,
+        budget::RESERVED_COMPLETION_TOKENS,
+    )
+}
+
+pub(crate) fn select_with_completion_reservation(
+    cards: &[ComponentCard],
+    profile: &ParsedProfile,
+    prompt: &str,
+    affinity_key: Option<&str>,
+    ready_provider_ids: &BTreeSet<String>,
+    open_provider_ids: &BTreeSet<String>,
+    completion: u64,
+) -> Result<Selected, DispatchError> {
     let candidates: Vec<Card> = cards
         .iter()
-        .map(|c| candidate(c, prompt, open_provider_ids.contains(&c.provider.id)))
+        .map(|c| {
+            candidate(
+                c,
+                prompt,
+                open_provider_ids.contains(&c.provider.id),
+                completion,
+            )
+        })
         .collect();
     let request_profile = RequestProfile {
         task: profile.task.clone(),

@@ -2330,6 +2330,23 @@ async fn chat_completions(
     } else if state.dev_no_key_enabled && authorization_present {
         return virtual_key_unauthorized_response();
     }
+    let completion_reservation = match budget::completion_reservation_tokens(&value) {
+        Ok(completion) => completion,
+        Err("n") => {
+            return error_envelope(
+                StatusCode::BAD_REQUEST,
+                "unsupported_completion_count",
+                "n must be the integer 1 or null; multiple completions are not supported",
+            );
+        }
+        Err(field) => {
+            return error_envelope(
+                StatusCode::BAD_REQUEST,
+                "invalid_completion_cap",
+                format!("{field} must be an integer between 0 and 9007199254740992"),
+            );
+        }
+    };
     let correlation = match correlation::parse(&headers) {
         Ok(context) => context,
         Err(error) => return correlation_error_response(error),
@@ -2501,13 +2518,14 @@ async fn chat_completions(
 
     // Resident proxies and Supervisor-run models share one breaker book.
     let open_provider_ids = state.proxy.open_providers(policy_cards.cards.iter());
-    let mut selection = dispatch::select_avoiding_open_breakers(
+    let mut selection = dispatch::select_with_completion_reservation(
         &policy_cards.cards,
         &parsed,
         &prompt,
         affinity_key,
         &ready_provider_ids,
         &open_provider_ids,
+        completion_reservation,
     );
     // M5-22: INSPECTED already lowered the privacy floor, so the pipeline
     // cannot tell that content did it; record the fact it would have
@@ -2653,8 +2671,8 @@ async fn chat_completions(
                 ProxyEventContexts {
                     dispatched: dispatched_event_context.as_ref(),
                     completed: completed_event_context.as_ref(),
+                    budget_reserved: budget_event_context.as_ref(),
                 },
-                budget_event_context.as_ref(),
             )
             .await;
         }
@@ -2839,6 +2857,7 @@ fn local_model_fault(
 /// a transparent proxy, not a backend `RuntimeAdapter` call.
 #[derive(Clone, Copy)]
 struct ProxyEventContexts<'a> {
+    budget_reserved: Option<&'a BudgetReservedEventContext>,
     dispatched: Option<&'a DispatchedEventContext>,
     completed: Option<&'a CompletedEventContext>,
 }
@@ -2852,9 +2871,8 @@ async fn chat_via_proxy(
     body_value: &serde_json::Value,
     record_id: &str,
     events: ProxyEventContexts<'_>,
-    budget_event_context: Option<&BudgetReservedEventContext>,
 ) -> Response {
-    let mut reservation = match dispatch::ReservationGuard::reserve(
+    let proxy_budget = match proxy_budget::ProxyBudget::new(
         state.budget_ledger.as_deref(),
         parsed.tenant_id.as_deref(),
         &selected.card.provider.id,
@@ -2886,12 +2904,6 @@ async fn chat_via_proxy(
             "付费流式直连尚不支持可信 usage 结算，请使用非流式请求或支持结算的后端",
         );
     }
-    if is_paid
-        && let Some(context) = budget_event_context
-        && append_budget_reserved(context, selected).await.is_err()
-    {
-        return event_log_unavailable_response();
-    }
     if stream_requested {
         return chat_via_proxy_stream(state, selected, body_value, events).await;
     }
@@ -2903,7 +2915,7 @@ async fn chat_via_proxy(
         body_value,
         record_id,
         events,
-        &mut reservation,
+        &proxy_budget,
     )
     .await
 }
@@ -3106,7 +3118,7 @@ async fn chat_via_proxy_buffered(
     body_value: &serde_json::Value,
     record_id: &str,
     events: ProxyEventContexts<'_>,
-    reservation: &mut dispatch::ReservationGuard<'_>,
+    proxy_budget: &proxy_budget::ProxyBudget<'_>,
 ) -> Response {
     let is_paid = budget::is_paid(Some(selected.estimated_cost_minor));
     let request_id = headers.get(HEADER_REQUEST_ID).and_then(|v| v.to_str().ok());
@@ -3120,13 +3132,6 @@ async fn chat_via_proxy_buffered(
         privacy,
         require_openai_usage: is_paid,
     };
-    if is_paid {
-        // Once the paid POST is allowed to leave the process, dropping this
-        // future (client disconnect / cancellation) must not silently release
-        // the reservation: execution may already have happened upstream.
-        reservation.retain_on_drop();
-    }
-    let mut paid_settlement = None;
     let completed_context = events.completed;
     let dispatched = AtomicBool::new(false);
     let dispatched_ref = &dispatched;
@@ -3137,45 +3142,18 @@ async fn chat_via_proxy_buffered(
                 &selected.card.endpoint,
                 body_value,
                 &opts,
-                |outcome| {
-                    let usage = budget::parse_openai_usage(&outcome.body).map_err(|_| {
-                        (
-                            502,
-                            "upstream_usage_invalid",
-                            "付费上游成功响应缺少可验证的 usage 证据",
-                        )
-                    })?;
-                    let actual =
-                        match budget::actual_cost_from_usage(&selected.card.provider.cost, usage) {
-                            Ok(actual) => actual,
-                            Err(_) => {
-                                reservation.retain_until_expiry();
-                                return Err((
-                                    500,
-                                    "internal_error",
-                                    "付费上游 usage 无法转换为安全结算金额",
-                                ));
-                            }
-                        };
-                    match reservation.settle_replayable(actual) {
-                        Ok(Some(charged)) => {
-                            paid_settlement = Some((charged, usage));
-                            Ok(())
-                        }
-                        Ok(None) => Err((500, "internal_error", "付费上游缺少可结算的预算预留")),
-                        Err(_) => Err((
-                            500,
-                            "internal_error",
-                            "付费上游结算未能确认，请稍后查询预算账本",
-                        )),
-                    }
-                },
+                |outcome| proxy_budget.settle_response(outcome, &selected.card.provider.cost),
                 || async {
+                    proxy_budget.prepare_for_post()?;
+                    if let Some(context) = events.budget_reserved {
+                        append_budget_reserved(context, selected).await?;
+                    }
                     if let Some(context) = events.dispatched {
                         append_dispatched(context, selected).await?;
                         dispatched.store(true, Ordering::Release);
                     }
-                    Ok::<(), ()>(())
+                    proxy_budget.arm()?;
+                    Ok::<(), ProxyObserverError>(())
                 },
             )
             .await
@@ -3194,7 +3172,7 @@ async fn chat_via_proxy_buffered(
                             append_dispatched(context, selected).await?;
                             dispatched.store(true, Ordering::Release);
                         }
-                        Ok::<(), ()>(())
+                        Ok::<(), ProxyObserverError>(())
                     },
                     |outcome| async move {
                         if dispatched_ref.load(Ordering::Acquire)
@@ -3209,50 +3187,35 @@ async fn chat_via_proxy_buffered(
                             };
                             append_completed(context, selected, status).await?;
                         }
-                        Ok::<(), ()>(())
+                        Ok::<(), ProxyObserverError>(())
                     },
                 ),
             )
             .await
     };
-    let Ok(outcome) = outcome else {
-        // A returned pre-send observer error stopped the POST. Release its
-        // paid reservation; cancellation continues to retain uncertain work.
-        if is_paid && !dispatched.load(Ordering::Acquire) && reservation.release_now().is_err() {
-            return error_envelope(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "internal_error",
-                "付费上游预算预留释放失败",
-            );
+    let outcome = match outcome {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            if is_paid && proxy_budget.release_unsent().is_err() {
+                return error_envelope(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal_error",
+                    "付费上游预算预留释放失败",
+                );
+            }
+            return match error {
+                ProxyObserverError::EventLog => event_log_unavailable_response(),
+                ProxyObserverError::Budget(error) => proxy_budget_error_response(error, selected),
+            };
         }
-        return event_log_unavailable_response();
     };
-
-    if is_paid {
-        match outcome.execution {
-            proxy::ExecutionDisposition::NotExecuted | proxy::ExecutionDisposition::Replay => {
-                if reservation.release_now().is_err() {
-                    return error_envelope(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "internal_error",
-                        "付费上游预算预留释放失败",
-                    );
-                }
-            }
-            proxy::ExecutionDisposition::Uncertain => {
-                reservation.retain_until_expiry();
-            }
-            proxy::ExecutionDisposition::Executed => {
-                if !(200..300).contains(&outcome.status) && reservation.release_now().is_err() {
-                    return error_envelope(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "internal_error",
-                        "付费上游预算预留释放失败",
-                    );
-                }
-            }
-        }
+    if is_paid && let Err(error) = proxy_budget.finish(&outcome) {
+        return proxy_budget_error_response(error, selected);
     }
+    let paid_settlement = match proxy_budget.settlement() {
+        Ok(settlement) => settlement,
+        Err(error) => return proxy_budget_error_response(error, selected),
+    };
 
     let status = StatusCode::from_u16(outcome.status).unwrap_or(StatusCode::BAD_GATEWAY);
     if is_paid
@@ -5808,3 +5771,46 @@ mod tests {
 
 #[cfg(test)]
 mod subscription_breaker_flow_tests;
+
+#[cfg(test)]
+mod budget_completion_reservation_tests;
+mod proxy_budget;
+
+#[cfg(test)]
+mod paid_replay_admission_tests;
+
+enum ProxyObserverError {
+    EventLog,
+    Budget(proxy_budget::ProxyBudgetError),
+}
+impl From<()> for ProxyObserverError {
+    fn from(_: ()) -> Self {
+        Self::EventLog
+    }
+}
+impl From<proxy_budget::ProxyBudgetError> for ProxyObserverError {
+    fn from(error: proxy_budget::ProxyBudgetError) -> Self {
+        Self::Budget(error)
+    }
+}
+fn proxy_budget_error_response(
+    error: proxy_budget::ProxyBudgetError,
+    selected: &Selected,
+) -> Response {
+    match error {
+        proxy_budget::ProxyBudgetError::Ledger(error) => budget_error_response(
+            &error,
+            &dispatch::ChatOutcome {
+                decision: selected.decision.clone(),
+                served_locality: selected.served_locality,
+                result: Err(DispatchFailure::Budget(error.clone())),
+                actual_cost_minor: None,
+            },
+        ),
+        proxy_budget::ProxyBudgetError::StateUnavailable => error_envelope(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal_error",
+            "付费上游预算状态不可用",
+        ),
+    }
+}
