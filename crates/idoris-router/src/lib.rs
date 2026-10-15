@@ -1969,6 +1969,7 @@ async fn append_completed_fields(
     if let Some((tokens_in, tokens_out)) = usage {
         metadata.insert("tokens_in".to_string(), json!(tokens_in));
         metadata.insert("tokens_out".to_string(), json!(tokens_out));
+        metadata.insert("token_estimator".to_string(), json!("conservative"));
     }
     let ts_utc_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
