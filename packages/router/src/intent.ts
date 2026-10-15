@@ -1,5 +1,6 @@
 import { type DeployMode, taskProfileSchema, type TaskProfile } from "@idoris/contracts";
-import { currentDeployMode, parseProfile, type HeaderBag } from "./profile.js";
+import { currentDeployMode, parseProfile, type ComplexitySource, type HeaderBag } from "./profile.js";
+import { parseModelRole, RoleParseError } from "./roles.js";
 
 /** 意图来源：显式 header / 自动识别 / 静态默认值（D3=B：缺省不猜，回落 chat）。 */
 export type IntentSource = "header" | "detected" | "default";
@@ -206,30 +207,45 @@ export interface ResolvedProfile {
   profile: TaskProfile;
   tenantId?: string;
   intentSource: IntentSource;
+  complexitySource: ComplexitySource;
+}
+
+function isAutoModel(model: unknown): boolean {
+  if (typeof model !== "string") return false;
+  try {
+    return parseModelRole(model) === "auto";
+  } catch (err) {
+    if (err instanceof RoleParseError) return false;
+    throw err;
+  }
 }
 
 /**
  * 控制面 header → TaskProfile，并在未显式声明 intent 时跑一次兜底识别（T2.4.1）。
  *
- * 三条不可协商的次序：
+ * 四条不可协商的次序：
  * 1. **显式 header 永远优先** —— 此时识别器根本不会被调用；
  * 2. **隐私绝不推断** —— 识别结果只被允许替换 intent，privacy/tenant/capabilities
  *    全部来自已校验的 header 结果；识别器返回非法值即回落默认，不 500；
  * 3. **local_only + 远端嵌入端点不识别** —— 不给「自动识别」留一条外泄后门。
+ * 4. **只有 `idoris/auto` 调用识别器** —— 具体角色、不透明模型 ID、缺 model 都不调用。
+ *    单独的 complexity header 不关闭 auto 的识别，识别结果也不改 complexity。
  */
 export async function resolveProfile(
   headers: HeaderBag,
   context: IntentContext,
   detector?: IntentDetector,
   deployMode: DeployMode = currentDeployMode(),
+  model?: unknown,
 ): Promise<ResolvedProfile> {
   const parsed = parseProfile(headers, deployMode);
   const base: ResolvedProfile = {
     profile: parsed.profile,
     intentSource: parsed.intentSource,
+    complexitySource: parsed.complexitySource,
     ...(parsed.tenantId === undefined ? {} : { tenantId: parsed.tenantId }),
   };
-  if (parsed.intentSource === "header" || detector === undefined) return base;
+  if (!isAutoModel(model) || parsed.intentSource === "header" || detector === undefined) return base;
   if (parsed.profile.privacy === "local_only" && detector.locality === "remote") return base;
   // 没有任何文本可识别：连识别器都不必调用（省掉一次无意义的嵌入请求/出网机会）。
   if (queryText(context) === "") return base;

@@ -352,6 +352,7 @@ mod tests {
             role: None,
             tenant_id: None,
             intent_source: IntentSource::Default,
+            complexity_source: crate::profile::ComplexitySource::Default,
         }
     }
 

@@ -28,6 +28,7 @@ async fn dispatch(
         role: None,
         tenant_id: None,
         intent_source: IntentSource::Default,
+        complexity_source: idoris_router::profile::ComplexitySource::Default,
     };
     dispatch_local(
         std::slice::from_ref(card),

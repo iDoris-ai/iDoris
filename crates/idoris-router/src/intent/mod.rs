@@ -9,6 +9,7 @@ use std::sync::OnceLock;
 use idoris_backend::ChatMessage;
 use idoris_contracts::Contract;
 use idoris_contracts::common::PrivacyClass;
+use idoris_policy::Role;
 
 use crate::profile::{IntentSource, ParsedProfile};
 use detector::{Embedder, IntentHit, IntentMessage, UtteranceIntentDetector, UtteranceRoute};
@@ -138,8 +139,10 @@ fn has_detectable_text(messages: &[ChatMessage]) -> bool {
 }
 
 /// Applies fallback intent detection without allowing it to rewrite any other
-/// control-plane field. Explicit headers always win. Detector failures,
-/// misses, and invalid intents preserve the parsed `chat` default.
+/// control-plane field. Only `idoris/auto` without `X-iDoris-Intent` calls the
+/// detector. Explicit headers always win. Detector failures, misses, and
+/// invalid intents preserve the parsed `chat` default. A detected intent never
+/// replaces complexity.
 pub async fn resolve_profile(mut parsed: ParsedProfile, messages: &[ChatMessage]) -> ParsedProfile {
     resolve_profile_with_detector(&mut parsed, messages, default_detector()).await;
     parsed
@@ -150,7 +153,8 @@ async fn resolve_profile_with_detector(
     messages: &[ChatMessage],
     detector: &impl ProfileIntentDetector,
 ) {
-    if parsed.intent_source == IntentSource::Header
+    if parsed.role != Some(Role::Auto)
+        || parsed.intent_source == IntentSource::Header
         || (parsed.task.privacy.unwrap_or(PrivacyClass::LocalOnly) == PrivacyClass::LocalOnly
             && detector.locality() == DetectorLocality::Remote)
         || !has_detectable_text(messages)
@@ -174,8 +178,10 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use idoris_contracts::TaskProfile;
+    use idoris_contracts::common::{Capability, Complexity};
 
     use super::*;
+    use crate::profile::ComplexitySource;
 
     struct FakeDetector {
         locality: DetectorLocality,
@@ -219,9 +225,10 @@ mod tests {
                 ),
                 ..TaskProfile::default()
             },
-            role: None,
+            role: Some(Role::Auto),
             tenant_id: None,
             intent_source: source,
+            complexity_source: ComplexitySource::Default,
         }
     }
 
@@ -323,5 +330,58 @@ mod tests {
         .await;
         assert_eq!(profile.task.intent.as_deref(), Some("coding"));
         assert_eq!(profile.intent_source, IntentSource::Detected);
+    }
+
+    #[tokio::test]
+    async fn non_auto_roles_keep_role_capability_and_skip_the_detector() {
+        let detector = fake(
+            DetectorLocality::Loopback,
+            Ok(Some(IntentHit {
+                intent: "coding".into(),
+                score: 1.0,
+            })),
+        );
+        let cases = [
+            (Some(Role::Daily), Some(vec![Capability::Chat])),
+            (Some(Role::Fast), Some(vec![Capability::Chat])),
+            (Some(Role::Deep), Some(vec![Capability::Reasoning])),
+            (Some(Role::Vision), Some(vec![Capability::Vision])),
+            (Some(Role::Embed), Some(vec![Capability::Embedding])),
+            (Some(Role::Rerank), Some(vec![Capability::Rerank])),
+            (Some(Role::Decide), Some(vec![Capability::Chat])),
+            (None, Some(vec![Capability::Chat])),
+        ];
+        for (role, capabilities) in cases {
+            let mut profile = parsed(PrivacyClass::Any, IntentSource::Default);
+            profile.role = role;
+            profile.task.capabilities = capabilities.clone();
+            resolve_profile_with_detector(&mut profile, &messages("fix this bug"), &detector).await;
+            assert_eq!(profile.role, role);
+            assert_eq!(profile.task.capabilities, capabilities);
+            assert_eq!(profile.task.intent.as_deref(), Some("chat"));
+            assert_eq!(profile.intent_source, IntentSource::Default);
+            assert_eq!(detector.calls.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn declared_complexity_survives_auto_intent_detection() {
+        let detector = fake(
+            DetectorLocality::Loopback,
+            Ok(Some(IntentHit {
+                intent: "coding".into(),
+                score: 1.0,
+            })),
+        );
+        let mut profile = parsed(PrivacyClass::Any, IntentSource::Default);
+        profile.task.complexity = Some(Complexity::Complex);
+        profile.complexity_source = ComplexitySource::Header;
+        resolve_profile_with_detector(&mut profile, &messages("fix this bug"), &detector).await;
+        assert_eq!(detector.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(profile.task.intent.as_deref(), Some("coding"));
+        assert_eq!(profile.intent_source, IntentSource::Detected);
+        assert_eq!(profile.task.complexity, Some(Complexity::Complex));
+        assert_eq!(profile.complexity_source, ComplexitySource::Header);
+        assert_eq!(profile.role, Some(Role::Auto));
     }
 }

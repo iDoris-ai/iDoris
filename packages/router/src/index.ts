@@ -1,6 +1,6 @@
 export { HealthTracker, FAILURE_THRESHOLD, COOLDOWN_MS } from "./health.js";
 export { parseProfile, currentDeployMode, ProfileError } from "./profile.js";
-export type { HeaderBag, ProfileParseResult } from "./profile.js";
+export type { ComplexitySource, HeaderBag, ProfileParseResult } from "./profile.js";
 export {
   UtteranceIntentDetector,
   cosine,

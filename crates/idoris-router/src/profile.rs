@@ -60,6 +60,15 @@ pub enum IntentSource {
     Default,
 }
 
+/// Whether `X-iDoris-Complexity` was sent. Detection must not replace a
+/// header value. A detected complexity source is intentionally absent until
+/// B5.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ComplexitySource {
+    Header,
+    Default,
+}
+
 /// Parsed control-plane profile: task metadata + optional resolved role +
 /// optional tenant id.
 #[derive(Debug, Clone)]
@@ -68,6 +77,7 @@ pub struct ParsedProfile {
     pub role: Option<Role>,
     pub tenant_id: Option<String>,
     pub intent_source: IntentSource,
+    pub complexity_source: ComplexitySource,
 }
 
 /// One header's state: outright absent, present but unusable, or present
@@ -154,14 +164,14 @@ fn parse_intent(headers: &HeaderMap) -> Result<(String, IntentSource), ProfileEr
     }
 }
 
-fn parse_complexity(headers: &HeaderMap) -> Result<Complexity, ProfileError> {
+fn parse_complexity(headers: &HeaderMap) -> Result<(Complexity, ComplexitySource), ProfileError> {
     match header_state(headers, "x-idoris-complexity") {
-        HeaderState::Absent => Ok(Complexity::Simple),
+        HeaderState::Absent => Ok((Complexity::Simple, ComplexitySource::Default)),
         HeaderState::Invalid => Err(invalid_header(
             "X-iDoris-Complexity must be a single, non-blank, UTF-8 value: simple|complex",
         )),
-        HeaderState::Present("simple") => Ok(Complexity::Simple),
-        HeaderState::Present("complex") => Ok(Complexity::Complex),
+        HeaderState::Present("simple") => Ok((Complexity::Simple, ComplexitySource::Header)),
+        HeaderState::Present("complex") => Ok((Complexity::Complex, ComplexitySource::Header)),
         HeaderState::Present(_) => {
             Err(invalid_header("X-iDoris-Complexity must be simple|complex"))
         }
@@ -251,7 +261,7 @@ pub fn parse_profile(
 ) -> Result<ParsedProfile, ProfileError> {
     let privacy = parse_privacy(headers)?;
     let (intent, intent_source) = parse_intent(headers)?;
-    let complexity = parse_complexity(headers)?;
+    let (complexity, complexity_source) = parse_complexity(headers)?;
     let capabilities = parse_capabilities(headers)?;
     let fallback = parse_fallback(headers)?;
     let role = parse_role(model)?;
@@ -295,6 +305,7 @@ pub fn parse_profile(
         role,
         tenant_id,
         intent_source,
+        complexity_source,
     })
 }
 
@@ -340,6 +351,7 @@ mod tests {
         assert_eq!(parsed.task.intent, Some("chat".to_string()));
         assert_eq!(parsed.intent_source, IntentSource::Default);
         assert_eq!(parsed.task.complexity, Some(Complexity::Simple));
+        assert_eq!(parsed.complexity_source, ComplexitySource::Default);
         assert_eq!(parsed.task.capabilities, Some(vec![Capability::Chat]));
         assert_eq!(parsed.task.fallback, None);
         assert_eq!(parsed.tenant_id, None);
@@ -395,6 +407,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(parsed.task.complexity, Some(Complexity::Complex));
+        assert_eq!(parsed.complexity_source, ComplexitySource::Header);
         assert_eq!(
             parsed.task.capabilities,
             Some(vec![Capability::Chat, Capability::Coding])

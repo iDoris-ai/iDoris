@@ -3,11 +3,15 @@ import { taskProfileSchema, type DeployMode, type TaskProfile } from "@idoris/co
 
 export type HeaderBag = Record<string, string | string[] | undefined>;
 
+export type ComplexitySource = "header" | "default";
+
 export interface ProfileParseResult {
   profile: TaskProfile;
   tenantId?: string;
   /** intent 是否来自显式 header（T2.4.1：显式声明永远优先于识别结果）。 */
   intentSource: "header" | "default";
+  /** complexity 是否来自显式 header。本任务不记录 detected。 */
+  complexitySource: ComplexitySource;
 }
 
 /** 控制面/租户相关的可预期错误（映射为 HTTP 状态 + 错误码）。 */
@@ -50,7 +54,9 @@ export function parseProfile(headers: HeaderBag, deployMode: DeployMode = curren
   }
   const intentHeader = header(headers, "x-idoris-intent");
   const intent = intentHeader ?? "chat";
-  const complexity = header(headers, "x-idoris-complexity") ?? "simple";
+  const complexityHeader = header(headers, "x-idoris-complexity");
+  const complexity = complexityHeader ?? "simple";
+  const complexitySource: ComplexitySource = complexityHeader === undefined ? "default" : "header";
   const capsRaw = header(headers, "x-idoris-capabilities");
   const capabilities = capsRaw ? capsRaw.split(",").map((s) => s.trim()).filter(Boolean) : ["chat"];
   const fallback = header(headers, "x-idoris-fallback");
@@ -72,7 +78,7 @@ export function parseProfile(headers: HeaderBag, deployMode: DeployMode = curren
     if (tenantId === undefined) {
       throw new ProfileError(400, "tenant_missing", "deploy_mode=tenant requires X-iDoris-Tenant; no default tenant fallback");
     }
-    return { profile: parsed.data, tenantId, intentSource };
+    return { profile: parsed.data, tenantId, intentSource, complexitySource };
   }
-  return { profile: parsed.data, intentSource };
+  return { profile: parsed.data, intentSource, complexitySource };
 }

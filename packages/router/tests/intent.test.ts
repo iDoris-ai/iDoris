@@ -17,19 +17,20 @@ const here = dirname(fileURLToPath(import.meta.url));
 const root = join(here, "..", "..", "..");
 const fixtures = join(here, "fixtures", "good");
 const user = (content: string) => ({ messages: [{ role: "user", content }] });
+const AUTO = "idoris/auto";
 const l2 = (v: readonly number[]): number => Math.sqrt(v.reduce((s, x) => s + x * x, 0));
 
 describe("resolveProfile：显式声明优先于识别", () => {
   it("显式 X-iDoris-Intent 存在时识别器根本不被调用", async () => {
     const detect = vi.fn(async () => ({ intent: "web_search", score: 1 }));
     const detector: IntentDetector = { locality: "loopback", detect };
-    const r = await resolveProfile({ "x-idoris-intent": "banner" }, user("帮我上网查一下"), detector, "personal");
+    const r = await resolveProfile({ "x-idoris-intent": "banner" }, user("帮我上网查一下"), detector, "personal", AUTO);
     expect(r.profile.intent).toBe("banner");
     expect(r.intentSource).toBe("header");
     expect(detect).not.toHaveBeenCalled();
   });
   it("没有 detector 时回落静态默认 chat（D3=B）", async () => {
-    const r = await resolveProfile({}, user("帮我上网查一下"), undefined, "personal");
+    const r = await resolveProfile({}, user("帮我上网查一下"), undefined, "personal", AUTO);
     expect(r.profile.intent).toBe("chat");
     expect(r.intentSource).toBe("default");
   });
@@ -38,13 +39,13 @@ describe("resolveProfile：显式声明优先于识别", () => {
 describe("privacy 永不被自动推断", () => {
   it("识别成功也不改 privacy：缺省仍是保守的 local_only", async () => {
     const detector: IntentDetector = { locality: "loopback", detect: async () => ({ intent: "web_search", score: 1 }) };
-    const r = await resolveProfile({}, user("帮我上网查一下"), detector, "personal");
+    const r = await resolveProfile({}, user("帮我上网查一下"), detector, "personal", AUTO);
     expect(r.intentSource).toBe("detected");
     expect(r.profile.privacy).toBe("local_only");
   });
   it("显式 privacy=any 不被识别结果改写，且除 intent 外逐字段与 parseProfile 一致", async () => {
     const detector: IntentDetector = { locality: "loopback", detect: async () => ({ intent: "coding", score: 1 }) };
-    const r = await resolveProfile({ "x-idoris-privacy": "any" }, user("写一个函数"), detector, "personal");
+    const r = await resolveProfile({ "x-idoris-privacy": "any" }, user("写一个函数"), detector, "personal", AUTO);
     const raw = parseProfile({ "x-idoris-privacy": "any" }, "personal").profile;
     expect(r.profile.privacy).toBe("any");
     expect(r.intentSource).toBe("detected");
@@ -55,17 +56,17 @@ describe("privacy 永不被自动推断", () => {
       locality: "loopback",
       detect: async () => ({ intent: "coding", score: 1, privacy: "any", tenantId: "evil" }),
     } as unknown as IntentDetector;
-    const r = await resolveProfile({}, user("写一个函数"), hostile, "personal");
+    const r = await resolveProfile({}, user("写一个函数"), hostile, "personal", AUTO);
     expect(r.profile.privacy).toBe("local_only");
     expect(r.tenantId).toBeUndefined();
   });
   it("local_only + 远端嵌入端点：不识别（不给自动识别留外泄后门）", async () => {
     const detect = vi.fn(async () => ({ intent: "web_search", score: 1 }));
     const remote: IntentDetector = { locality: "remote", detect };
-    const blocked = await resolveProfile({}, user("帮我上网查一下"), remote, "personal");
+    const blocked = await resolveProfile({}, user("帮我上网查一下"), remote, "personal", AUTO);
     expect(detect).not.toHaveBeenCalled();
     expect(blocked.intentSource).toBe("default");
-    const allowed = await resolveProfile({ "x-idoris-privacy": "any" }, user("帮我上网查一下"), remote, "personal");
+    const allowed = await resolveProfile({ "x-idoris-privacy": "any" }, user("帮我上网查一下"), remote, "personal", AUTO);
     expect(detect).toHaveBeenCalledTimes(1);
     expect(allowed.intentSource).toBe("detected");
   });
@@ -74,7 +75,7 @@ describe("privacy 永不被自动推断", () => {
 describe("兜底而非猜：识别不出/出故障/非法值都回落默认", () => {
   it("识别器自行认输（返回 undefined）时回落默认，不做二次阈值猜测", async () => {
     const detector: IntentDetector = { locality: "loopback", detect: async () => undefined };
-    const r = await resolveProfile({}, user("随便说点什么"), detector, "personal");
+    const r = await resolveProfile({}, user("随便说点什么"), detector, "personal", AUTO);
     expect(r.intentSource).toBe("default");
     expect(r.profile.intent).toBe("chat");
   });
@@ -85,19 +86,19 @@ describe("兜底而非猜：识别不出/出故障/非法值都回落默认", ()
         throw new Error("embedding endpoint down");
       },
     };
-    const r = await resolveProfile({}, user("写一个函数"), detector, "personal");
+    const r = await resolveProfile({}, user("写一个函数"), detector, "personal", AUTO);
     expect(r.intentSource).toBe("default");
   });
   it("识别器给出非法 intent（空串）被拒绝，不把脏数据带进路由", async () => {
     const detector: IntentDetector = { locality: "loopback", detect: async () => ({ intent: "", score: 1 }) };
-    const r = await resolveProfile({}, user("写一个函数"), detector, "personal");
+    const r = await resolveProfile({}, user("写一个函数"), detector, "personal", AUTO);
     expect(r.intentSource).toBe("default");
     expect(r.profile.intent).toBe("chat");
   });
   it("空 prompt 不触发识别", async () => {
     const detect = vi.fn(async () => ({ intent: "coding", score: 1 }));
     const detector: IntentDetector = { locality: "loopback", detect };
-    const r = await resolveProfile({}, { messages: [] }, detector, "personal");
+    const r = await resolveProfile({}, { messages: [] }, detector, "personal", AUTO);
     expect(detect).not.toHaveBeenCalled();
     expect(r.intentSource).toBe("default");
   });
@@ -160,7 +161,7 @@ describe("startRouter 接线", () => {
       running = undefined;
     }
   });
-  it("仅在缺 intent header 时调用注入的识别器", async () => {
+  it("仅在 idoris/auto 且缺 intent header 时调用注入的识别器", async () => {
     const seen: string[] = [];
     const detector: IntentDetector = {
       locality: "loopback",
@@ -175,16 +176,49 @@ describe("startRouter 接线", () => {
       intentDetector: detector,
     });
     const active = running;
-    const post = (headers: Record<string, string>) =>
+    const post = (model: string, headers: Record<string, string>) =>
       fetch("http://127.0.0.1:" + active.port + "/v1/chat/completions", {
         method: "POST",
         headers: { "content-type": "application/json", ...headers },
-        body: JSON.stringify({ model: "mock-1", messages: [{ role: "user", content: "hi there" }] }),
+        body: JSON.stringify({ model, messages: [{ role: "user", content: "hi there" }] }),
       });
-    await post({});
+    await post(AUTO, {});
     expect(seen).toEqual(["hi there"]);
-    await post({ "x-idoris-intent": "banner" });
+    await post(AUTO, { "x-idoris-intent": "banner" });
     expect(seen).toEqual(["hi there"]);
+    await post("mock-1", {});
+    await post("idoris/daily", {});
+    expect(seen).toEqual(["hi there"]);
+  }, 20_000);
+});
+
+describe("只有 idoris/auto 调用识别器", () => {
+  it("具体角色、不透明模型 ID 和缺 model 都不调用，且不改写 intent", async () => {
+    const detect = vi.fn(async () => ({ intent: "coding", score: 1 }));
+    const detector: IntentDetector = { locality: "loopback", detect };
+    for (const model of ["idoris/daily", "idoris/fast", "idoris/deep", "idoris/vision", "idoris/embed", "idoris/rerank", "idoris/decide", "org/opaque-model", undefined]) {
+      const r = await resolveProfile({}, user("fix this bug"), detector, "personal", model);
+      expect(r.profile.intent).toBe("chat");
+      expect(r.intentSource).toBe("default");
+    }
+    expect(detect).not.toHaveBeenCalled();
+  });
+
+  it("auto 没有意图头时调用，单独的 complexity 头不关掉识别也不被覆盖", async () => {
+    const detect = vi.fn(async () => ({ intent: "coding", score: 1 }));
+    const detector: IntentDetector = { locality: "loopback", detect };
+    const r = await resolveProfile(
+      { "x-idoris-complexity": "complex" },
+      user("fix this bug"),
+      detector,
+      "personal",
+      AUTO,
+    );
+    expect(detect).toHaveBeenCalledTimes(1);
+    expect(r.profile.intent).toBe("coding");
+    expect(r.intentSource).toBe("detected");
+    expect(r.profile.complexity).toBe("complex");
+    expect(r.complexitySource).toBe("header");
   });
 });
 
