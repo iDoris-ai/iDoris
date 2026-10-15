@@ -2,7 +2,7 @@
 """Exercise a release binary in disposable storage, with a loopback HTTP fixture.
 
 No model downloads, subscription commands, paid calls, or real backend requests.
-Usage: python3 scripts/onboarding-smoke.py /absolute/path/to/extracted/idoris
+Usage: python3 scripts/test_onboarding_smoke.py /absolute/path/to/extracted/idoris
 """
 import contextlib
 import http.server
