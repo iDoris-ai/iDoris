@@ -2,13 +2,54 @@
   "schema": "baton-result/v1",
   "task_id": null,
   "attempt_id": null,
-  "sequence": 1,
-  "status": "started",
+  "sequence": 2,
+  "status": "completed",
   "base_sha": "9054a5d0f74e6468adc6207336077801d838c36d",
-  "result_sha": null,
-  "summary": "Grok Bot 车道已开始：独立复核 HANDOFF 中保存的 507/479/510 三个精确 head（只读复核，无生产修改）。task_id/attempt_id 未在 handoff body 中提供，记为 null。",
-  "tests": [],
+  "result_sha": "db1cc244a2a72df372f40226971c56be74d93a18",
+  "summary": "已推送中文独立复核报告 docs/agent/travel-20261015-library/grokbot-review/REVIEW.md 及日志：#507/#479/#510 三个保存 head 逐项复核，无阻断项。#479 n 未乘风险实测确认仍在（非本增量）；#507 late-backend 用 v0.3.0 同源 Linux 构建实测复现；#510 conformance 136 pass/8 todo，check-subscription 通过。未改生产代码与 PR。",
+  "tests": [
+    {
+      "command": "cargo test -p idoris-router --test supervisor_parameters --locked (479)",
+      "exit_code": 0
+    },
+    {
+      "command": "cargo test -p idoris-router --lib budget --locked -- --test-threads=1 (479)",
+      "exit_code": 0
+    },
+    {
+      "command": "cargo clippy -p idoris-router --lib --test supervisor_parameters --locked -- -D warnings (479)",
+      "exit_code": 0
+    },
+    {
+      "command": "cargo test -p idoris-router --lib --locked role_binding_ (510)",
+      "exit_code": 0
+    },
+    {
+      "command": "bash scripts/conformance-rust.sh (510)",
+      "exit_code": 0
+    },
+    {
+      "command": "bash scripts/check-subscription.sh (510)",
+      "exit_code": 0
+    },
+    {
+      "command": "cargo clippy -p idoris-router --all-targets --locked -- -D warnings (510)",
+      "exit_code": 0
+    },
+    {
+      "command": "cargo fmt --all -- --check (479, 510)",
+      "exit_code": 0
+    },
+    {
+      "command": "python3 scripts/test_onboarding_smoke.py <v0.3.0 Linux build> (507)",
+      "exit_code": 0
+    },
+    {
+      "command": "python3 scripts/test_onboarding_smoke.py <v0.3.0 Linux build> --late-backend-only (507)",
+      "exit_code": 0
+    }
+  ],
   "blocker": null,
-  "next": "读取 HANDOFF.md 与 evidence，逐个复核三个 head",
-  "updated_at": "2026-10-15T08:57:18+00:00"
+  "next": "协调者回收：按 HANDOFF 流程推进三个保存分支；0.3.1 前更新 507 smoke 别名断言；后续处理 n 乘数报价",
+  "updated_at": "2026-10-15T09:10:34+00:00"
 }
