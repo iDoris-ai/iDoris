@@ -54,6 +54,11 @@ pub struct SupervisorConfig {
     /// this, a hanging call would hold `active_op` (the global load/evict
     /// mutex) forever — llama-swap Issue #946's root cause.
     pub adapter_call_timeout: std::time::Duration,
+    /// Outer deadline for one `chat` adapter call only (excludes queueing
+    /// and loading, which stay under `adapter_call_timeout`). Generation
+    /// legitimately outlasts management calls. Equal adapter and Supervisor
+    /// chat deadlines may race; neither is guaranteed to report first.
+    pub chat_call_timeout: std::time::Duration,
     /// Poll interval/attempt bound for [`confirm_memory_released`] — used
     /// after an eviction's `unload`s (before the new model's `load`) and
     /// before an OOM retry, never blocking either forever.
@@ -71,6 +76,7 @@ impl Default for SupervisorConfig {
             probe_interval: std::time::Duration::from_millis(20),
             probe_max_attempts: 50,
             adapter_call_timeout: std::time::Duration::from_secs(30),
+            chat_call_timeout: std::time::Duration::from_secs(120),
             release_confirm_interval: std::time::Duration::from_millis(20),
             release_confirm_max_attempts: 10,
             oom_retry_backoff: std::time::Duration::from_millis(100),
@@ -354,11 +360,11 @@ impl SupervisorHandle {
 /// distinction matters, since a task blocked *inside* `acquire().await`
 /// would still count as one more accumulating detached task, defeating the
 /// point of bounding concurrency in the first place. A hanging adapter call
-/// is additionally bounded in *time* by `config.adapter_call_timeout` (see
-/// [`with_adapter_timeout`]), applied to every `list`/`chat`/`load`/
-/// `unload`/`probe_ready` call — so a permanently-hanging adapter stalls at
-/// most `max_concurrent_adapter_calls` real calls, each for at most that
-/// timeout, never an unbounded number of tasks held forever. Full
+/// is additionally bounded in *time* by `config.chat_call_timeout` for
+/// `chat` and `config.adapter_call_timeout` for management calls (see
+/// [`with_adapter_timeout`]) — so a permanently-hanging adapter stalls at
+/// most `max_concurrent_adapter_calls` real calls, each for at most its
+/// configured timeout, never an unbounded number of tasks held forever. Full
 /// graceful-shutdown task
 /// tracking/cancellation (stopping still-running spawned calls when the
 /// last handle drops) is a deliberately deferred concern for a future PR —
@@ -1891,7 +1897,7 @@ async fn run_actor(
                             slot.inflight += 1;
                         }
                         let adapter = adapter.clone();
-                        let timeout = config.adapter_call_timeout;
+                        let timeout = config.chat_call_timeout;
                         let self_tx = self_tx.clone();
                         let ownership = load_fence.clone();
                         tokio::spawn(async move {
@@ -2315,6 +2321,7 @@ mod tests {
         let err = handle
             .chat(
                 ChatRequest {
+                    native: None,
                     model: "a".to_string(),
                     messages: vec![],
                 },
@@ -2390,6 +2397,7 @@ mod tests {
         let resp = handle
             .chat(
                 ChatRequest {
+                    native: None,
                     model: "a".to_string(),
                     messages: vec![],
                 },
@@ -2700,6 +2708,7 @@ mod tests {
         let err = handle
             .chat(
                 ChatRequest {
+                    native: None,
                     model: "a".to_string(),
                     messages: vec![],
                 },
@@ -2953,6 +2962,7 @@ mod tests {
             _cancel: CancellationToken,
         ) -> Result<ChatResponse, BackendError> {
             Ok(ChatResponse {
+                native: None,
                 model: req.model,
                 content: String::new(),
             })
@@ -3083,6 +3093,7 @@ mod tests {
             _cancel: CancellationToken,
         ) -> Result<ChatResponse, BackendError> {
             Ok(ChatResponse {
+                native: None,
                 model: req.model,
                 content: String::new(),
             })
@@ -3182,6 +3193,7 @@ mod tests {
             _cancel: CancellationToken,
         ) -> Result<ChatResponse, BackendError> {
             Ok(ChatResponse {
+                native: None,
                 model: req.model,
                 content: String::new(),
             })
@@ -3301,6 +3313,7 @@ mod tests {
             .expect("load a should succeed");
         let err = no_hang(handle.chat(
             ChatRequest {
+                native: None,
                 model: "a".to_string(),
                 messages: vec![],
             },
@@ -3321,6 +3334,75 @@ mod tests {
             .expect("a different id must not be busy after the panicking chat");
     }
 
+    /// Chat has its own outer deadline: a generation slower than
+    /// `adapter_call_timeout` (the load/unload/status bound) must still
+    /// complete when it is within `chat_call_timeout`.
+    #[tokio::test(start_paused = true)]
+    async fn chat_outlives_the_management_adapter_timeout() {
+        let adapter = Arc::new(MockAdapter::new(evictable_catalog()));
+        let handle = Supervisor::spawn(
+            adapter.clone(),
+            SupervisorConfig {
+                adapter_call_timeout: std::time::Duration::from_millis(50),
+                chat_call_timeout: std::time::Duration::from_secs(5),
+                ..SupervisorConfig::default()
+            },
+        )
+        .expect("spawn");
+        handle
+            .load("a", 4.0, on_demand_policy())
+            .await
+            .expect("load a");
+        adapter.set_chat_delay("a", std::time::Duration::from_millis(300));
+        let reply = handle
+            .chat(
+                ChatRequest {
+                    native: None,
+                    model: "a".to_string(),
+                    messages: vec![],
+                },
+                CancellationToken::new(),
+            )
+            .await
+            .expect("a 300ms chat must survive the 50ms management timeout");
+        assert_eq!(reply.model, "a");
+    }
+
+    /// The chat outer deadline is finite and releases the in-flight slot, so
+    /// a later unload is not wedged behind the timed-out chat.
+    #[tokio::test(start_paused = true)]
+    async fn chat_call_timeout_rejects_and_releases_inflight() {
+        let adapter = Arc::new(MockAdapter::new(evictable_catalog()));
+        let handle = Supervisor::spawn(
+            adapter.clone(),
+            SupervisorConfig {
+                chat_call_timeout: std::time::Duration::from_millis(50),
+                ..SupervisorConfig::default()
+            },
+        )
+        .expect("spawn");
+        handle
+            .load("a", 4.0, on_demand_policy())
+            .await
+            .expect("load a");
+        adapter.set_chat_delay("a", std::time::Duration::from_secs(3600));
+        let err = handle
+            .chat(
+                ChatRequest {
+                    native: None,
+                    model: "a".to_string(),
+                    messages: vec![],
+                },
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("chat must hit its own deadline");
+        assert_eq!(err.reason_code(), "adapter_timed_out");
+        no_hang(handle.unload("a"))
+            .await
+            .expect("inflight must be released after the chat timeout");
+    }
+
     /// C2: a model with an in-flight `chat` is never chosen as an
     /// eviction victim, even when it would otherwise be the LRU pick —
     /// unloading it mid-`chat` would abort real, in-progress work.
@@ -3338,6 +3420,7 @@ mod tests {
         let chat_a = tokio::spawn(async move {
             h2.chat(
                 ChatRequest {
+                    native: None,
                     model: "a".to_string(),
                     messages: vec![],
                 },
@@ -3375,6 +3458,7 @@ mod tests {
         let chat_a = tokio::spawn(async move {
             h2.chat(
                 ChatRequest {
+                    native: None,
                     model: "a".to_string(),
                     messages: vec![],
                 },
@@ -3393,6 +3477,7 @@ mod tests {
         );
         let err = no_hang(handle.chat(
             ChatRequest {
+                native: None,
                 model: "a".to_string(),
                 messages: vec![],
             },
@@ -3462,6 +3547,7 @@ mod tests {
             assert_eq!(handle.status().await.unwrap().used_gb, 8.0);
             let err = no_hang(handle.chat(
                 ChatRequest {
+                    native: None,
                     model: "a".to_string(),
                     messages: vec![],
                 },
@@ -3548,6 +3634,7 @@ mod tests {
         // a must still genuinely be servable, not just accounted-for.
         no_hang(handle.chat(
             ChatRequest {
+                native: None,
                 model: "a".to_string(),
                 messages: vec![],
             },
@@ -3680,6 +3767,7 @@ mod tests {
             _cancel: CancellationToken,
         ) -> Result<ChatResponse, BackendError> {
             Ok(ChatResponse {
+                native: None,
                 model: req.model,
                 content: String::new(),
             })
@@ -3826,6 +3914,7 @@ mod tests {
             self.chat_entered.notify_one();
             self.release_chat.notified().await;
             Ok(ChatResponse {
+                native: None,
                 model: req.model,
                 content: String::new(),
             })
@@ -3845,6 +3934,7 @@ mod tests {
         let chat = tokio::spawn(async move {
             h.chat(
                 ChatRequest {
+                    native: None,
                     model: "a".into(),
                     messages: vec![],
                 },
@@ -4081,6 +4171,7 @@ mod tests {
             _cancel: CancellationToken,
         ) -> Result<ChatResponse, BackendError> {
             Ok(ChatResponse {
+                native: None,
                 model: req.model,
                 content: String::new(),
             })
@@ -4281,6 +4372,7 @@ mod tests {
             _cancel: CancellationToken,
         ) -> Result<ChatResponse, BackendError> {
             Ok(ChatResponse {
+                native: None,
                 model: req.model,
                 content: String::new(),
             })
@@ -4740,6 +4832,7 @@ mod tests {
             _cancel: CancellationToken,
         ) -> Result<ChatResponse, BackendError> {
             Ok(ChatResponse {
+                native: None,
                 model: req.model,
                 content: String::new(),
             })
