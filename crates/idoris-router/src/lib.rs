@@ -1656,6 +1656,7 @@ async fn append_request_received(
     store: Arc<idoris_tenancy::event_log::EventLogStore>,
     tenant_id: String,
     record_id: String,
+    request_id: String,
     correlation: &correlation::RequestCorrelation,
 ) -> Result<(), ()> {
     let ts_utc_ms = SystemTime::now()
@@ -1669,7 +1670,7 @@ async fn append_request_received(
         record_id,
         event_type: idoris_tenancy::event_log::EventType::RequestReceived,
         ts_utc_ms,
-        request_id: None,
+        request_id: Some(request_id),
         session_id: correlation.session_id.clone(),
         trace_id: correlation.trace_id.clone(),
         parent_id: correlation.parent_id.clone(),
@@ -2052,6 +2053,10 @@ async fn chat_completions(
         Ok(context) => context,
         Err(error) => return correlation_error_response(error),
     };
+    let event_request_id = header_text(&headers, HEADER_REQUEST_ID)
+        .filter(|value| value.encode_utf16().count() <= 128 && !value.chars().any(char::is_control))
+        .unwrap_or(&record_id)
+        .to_string();
     let event_context = if let Some(event_log) = state.event_log.clone() {
         let tenant_id = match state.deploy_mode {
             idoris_contracts::DeployMode::Personal => budget::PERSONAL_TENANT_ID.to_string(),
@@ -2064,6 +2069,7 @@ async fn chat_completions(
             event_log.clone(),
             tenant_id.clone(),
             record_id.clone(),
+            event_request_id,
             &correlation,
         )
         .await
