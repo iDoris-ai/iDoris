@@ -18,6 +18,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{LocalRuntimeKind, LocalRuntimeLaunch, ManagedRuntimeProcess};
 
 const DEFAULT_CALL_TIMEOUT: Duration = Duration::from_secs(10);
+const DEFAULT_CHAT_TIMEOUT: Duration = Duration::from_secs(120);
 const DEFAULT_SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone)]
@@ -26,7 +27,10 @@ pub struct LocalHttpRuntimeConfig {
     pub model_id: String,
     pub memory_gb: f64,
     pub load_fence_path: PathBuf,
+    /// Readiness/management round trips; independent of generation.
     pub call_timeout: Duration,
+    /// Entire completion round trip, including response body.
+    pub chat_timeout: Duration,
     pub shutdown_grace: Duration,
 }
 
@@ -57,6 +61,7 @@ impl LocalHttpRuntimeConfig {
             memory_gb,
             load_fence_path,
             call_timeout: DEFAULT_CALL_TIMEOUT,
+            chat_timeout: DEFAULT_CHAT_TIMEOUT,
             shutdown_grace: DEFAULT_SHUTDOWN_GRACE,
         })
     }
@@ -70,7 +75,10 @@ pub struct LocalHttpRuntimeAdapter {
 
 impl LocalHttpRuntimeAdapter {
     pub fn new(mut config: LocalHttpRuntimeConfig) -> Result<Self, BackendError> {
-        if config.call_timeout.is_zero() || config.shutdown_grace.is_zero() {
+        if config.call_timeout.is_zero()
+            || config.chat_timeout.is_zero()
+            || config.shutdown_grace.is_zero()
+        {
             return Err(BackendError::internal(
                 "local runtime timeouts must be non-zero",
             ));
@@ -185,7 +193,7 @@ impl LocalHttpRuntimeAdapter {
                     message: "local runtime chat response was not valid JSON".into(),
                 })
         };
-        let raw = tokio::time::timeout(self.config.call_timeout, attempt)
+        let raw = tokio::time::timeout(self.config.chat_timeout, attempt)
             .await
             .map_err(|_| BackendError::Upstream {
                 message: "local runtime chat timed out".into(),
