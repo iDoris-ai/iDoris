@@ -864,6 +864,31 @@ fn valid_id() -> impl Strategy<Value = String> {
     )
 }
 
+#[test]
+fn normalized_decimal_neighbours_remain_part_of_the_number() {
+    let id = "110105195001010004";
+    for digit in ['௦', '０', '٠', '𝟎'] {
+        for input in [format!("{digit}{id}"), format!("{id}{digit}")] {
+            let response = inspect(&input, &open_ctx());
+            assert!(
+                !kinds(&response).contains(&FindingKind::CnResidentId),
+                "{input}: {response:?}"
+            );
+        }
+        // A real text boundary separates the neighbouring digit from the ID.
+        let input = format!("{digit}:身份证{id}!{digit}");
+        let response = inspect(&input, &open_ctx());
+        assert!(
+            response
+                .findings
+                .iter()
+                .any(|f| { f.kind == FindingKind::CnResidentId && covered(&input, f) == id })
+        );
+        assert_eq!(response.sensitivity, Sensitivity::S3);
+        assert_eq!(response.action, InspectAction::Block);
+    }
+}
+
 proptest! {
     #[test]
     fn zero_width_noise_never_hides_a_valid_id(
@@ -900,8 +925,10 @@ proptest! {
     #[test]
     fn every_valid_id_in_non_digit_text_is_found_as_s3(
         id in valid_id(),
-        before in "[^0-9 \\-]{0,8}",
-        after in "[^0-9xX \\-]{0,8}",
+        // Numeric, space and dash folds can extend the number; literal escapes
+        // can introduce them too. The suffix also excludes X confusables.
+        before in r"[^\p{N}\p{Z}\p{Pd}−\\]{0,8}",
+        after in r"[^\p{N}\p{Z}\p{Pd}−\\xXｘＸхХΧ]{0,8}",
     ) {
         let input = format!("{before}{id}{after}");
         let response = inspect(&input, &open_ctx());

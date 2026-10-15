@@ -7,8 +7,6 @@ mod support {
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
-use std::fs;
-use std::os::unix::fs::PermissionsExt;
 
 use idoris_upstream::subscription::command::CommandSpec;
 use idoris_upstream::subscription::process::{DEFAULT_MAX_OUTPUT_BYTES, run_process};
@@ -82,22 +80,13 @@ async fn combined_limit_is_shared_across_stdout_and_stderr() {
 
 #[tokio::test]
 async fn large_stderr_and_large_stdin_are_drained_concurrently_without_deadlock() {
-    let dir = tempfile::TempDir::new().unwrap();
-    let script = dir.path().join("pressure.sh");
-    fs::write(
-        &script,
-        "#!/bin/sh\ni=0; while [ $i -lt 4096 ]; do printf '0123456789abcdef' >&2; i=$((i+1)); done; cat >/dev/null; printf ok\n",
-    )
-    .unwrap();
-    let mut perms = fs::metadata(&script).unwrap().permissions();
-    perms.set_mode(0o755);
-    fs::set_permissions(&script, perms).unwrap();
+    let fixture = FakeSubscriptionCli::install();
     let output = tokio::time::timeout(
         std::time::Duration::from_secs(3),
         run_process(
-            &spec(script, Some("x".repeat(512 * 1024))),
-            dir.path(),
-            &BTreeMap::from([(OsString::from("PATH"), OsString::from("/usr/bin:/bin"))]),
+            &spec(fixture.program("codex"), Some("x".repeat(512 * 1024))),
+            fixture.bin_dir(),
+            &env("pipe-pressure"),
             1024 * 1024,
         ),
     )
@@ -120,16 +109,11 @@ async fn spawn_failure_and_closed_stdin_use_fixed_non_leaking_errors() {
         .unwrap_err();
     assert_eq!(err.reason_code(), "RELAY_SPAWN_FAILED");
 
-    let dir = tempfile::TempDir::new().unwrap();
-    let script = dir.path().join("close.sh");
-    fs::write(&script, "#!/bin/sh\nexec 0<&-\nsleep 0.05\nexit 0\n").unwrap();
-    let mut perms = fs::metadata(&script).unwrap().permissions();
-    perms.set_mode(0o755);
-    fs::set_permissions(&script, perms).unwrap();
+    let fixture = FakeSubscriptionCli::install();
     let err = run_process(
-        &spec(script, Some("x".repeat(8 * 1024 * 1024))),
-        dir.path(),
-        &BTreeMap::from([(OsString::from("PATH"), OsString::from("/usr/bin:/bin"))]),
+        &spec(fixture.program("codex"), Some("x".repeat(8 * 1024 * 1024))),
+        fixture.bin_dir(),
+        &env("close-stdin"),
         DEFAULT_MAX_OUTPUT_BYTES,
     )
     .await
