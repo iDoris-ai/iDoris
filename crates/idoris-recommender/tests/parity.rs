@@ -34,7 +34,7 @@ fn ram_reference_fixture_matches_typescript_at_all_six_tiers() {
             os: Some("darwin".into()),
         })
         .unwrap();
-        let actual = recommend(&hardware, &catalog, None, None).unwrap();
+        let actual = recommend(&hardware, &catalog, None, None, None).unwrap();
         let expected = &fixture["cases"][ram.to_string()];
         if ram == 24 {
             assert_recommendation(&actual, &expected["full"]);
@@ -65,7 +65,7 @@ fn every_edge_scenario_replays_the_typescript_full_recommendation() {
             .get("env")
             .and_then(|env| env.get("IDORIS_CORE_MODEL"))
             .and_then(Value::as_str);
-        let actual = recommend(&hardware, &catalog, Some(&policy), forced).unwrap();
+        let actual = recommend(&hardware, &catalog, Some(&policy), forced, None).unwrap();
         assert_recommendation(&actual, &scenario["output"]);
     }
 }

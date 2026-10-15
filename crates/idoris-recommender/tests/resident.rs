@@ -58,12 +58,18 @@ fn real_catalog() -> Catalog {
 #[test]
 fn budget_components_and_24gb_real_catalog_match_ts_acceptance() {
     let policy = RecommenderPolicy::default();
-    let budget = budget_breakdown(&host(24.0), &policy);
+    let budget = budget_breakdown(&host(24.0), &policy, None);
     assert_eq!(budget.usable_gb, 15.84);
     assert_eq!(budget.temp_reserve_gb, 3.5);
     assert!((budget.resident_budget_gb - 11.34).abs() < 1e-12);
 
-    let resident = choose_resident(&real_catalog(), &host(24.0), &policy).unwrap();
+    let resident = choose_resident(
+        &real_catalog(),
+        &host(24.0),
+        &policy,
+        &idoris_recommender::recommend::budget_breakdown(&host(24.0), &policy, None),
+    )
+    .unwrap();
     assert_eq!(resident.id, "ornith-1.0-9b");
     assert_eq!(resident.label, "q6_k");
     assert!((resident.quality - 0.995).abs() < 1e-12);
@@ -81,11 +87,24 @@ fn blocked_scans_all_models_but_experiment_never_becomes_resident() {
     };
     let policy = RecommenderPolicy::default();
 
-    let blocked = blocked_choices(&catalog, &host(8.0), &policy).unwrap();
+    let blocked = blocked_choices(
+        &catalog,
+        &host(8.0),
+        &policy,
+        &idoris_recommender::recommend::budget_breakdown(&host(8.0), &policy, None),
+    )
+    .unwrap();
     assert_eq!(blocked.len(), 1);
     assert_eq!(blocked[0].id, "experiment");
     assert_eq!(
-        choose_resident(&catalog, &host(64.0), &policy).unwrap().id,
+        choose_resident(
+            &catalog,
+            &host(64.0),
+            &policy,
+            &idoris_recommender::recommend::budget_breakdown(&host(64.0), &policy, None)
+        )
+        .unwrap()
+        .id,
         "normal"
     );
 }
@@ -105,7 +124,13 @@ fn ram_equality_is_admitted_and_score_then_footprint_then_order_decides() {
         temp_slots: Some(0),
         ..Default::default()
     }));
-    let resident = choose_resident(&catalog, &host(16.0), &policy).unwrap();
+    let resident = choose_resident(
+        &catalog,
+        &host(16.0),
+        &policy,
+        &idoris_recommender::recommend::budget_breakdown(&host(16.0), &policy, None),
+    )
+    .unwrap();
     assert_eq!(resident.id, "better");
 
     let tied = Catalog {
@@ -117,7 +142,14 @@ fn ram_equality_is_admitted_and_score_then_footprint_then_order_decides() {
         excluded: None,
     };
     assert_eq!(
-        choose_resident(&tied, &host(16.0), &policy).unwrap().id,
+        choose_resident(
+            &tied,
+            &host(16.0),
+            &policy,
+            &idoris_recommender::recommend::budget_breakdown(&host(16.0), &policy, None)
+        )
+        .unwrap()
+        .id,
         "first-small"
     );
 }
@@ -129,7 +161,19 @@ fn empty_catalog_and_negative_resident_budget_return_none() {
         catalog: Vec::new(),
         excluded: None,
     };
-    assert!(choose_resident(&empty, &host(24.0), &RecommenderPolicy::default()).is_none());
+    assert!(
+        choose_resident(
+            &empty,
+            &host(24.0),
+            &RecommenderPolicy::default(),
+            &idoris_recommender::recommend::budget_breakdown(
+                &host(24.0),
+                &RecommenderPolicy::default(),
+                None
+            )
+        )
+        .is_none()
+    );
 
     let catalog = Catalog {
         version: 1.0,
@@ -140,6 +184,14 @@ fn empty_catalog_and_negative_resident_budget_return_none() {
         temp_slots: Some(100),
         ..Default::default()
     }));
-    assert!(budget_breakdown(&host(24.0), &policy).resident_budget_gb < 0.0);
-    assert!(choose_resident(&catalog, &host(24.0), &policy).is_none());
+    assert!(budget_breakdown(&host(24.0), &policy, None).resident_budget_gb < 0.0);
+    assert!(
+        choose_resident(
+            &catalog,
+            &host(24.0),
+            &policy,
+            &idoris_recommender::recommend::budget_breakdown(&host(24.0), &policy, None)
+        )
+        .is_none()
+    );
 }
