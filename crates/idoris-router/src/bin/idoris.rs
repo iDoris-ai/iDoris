@@ -25,7 +25,7 @@ use idoris_router::{
     capabilities::{CapabilitiesProvider, LiveCapabilitiesProvider},
     cli, components, config,
     connection::{ConnectionInfo, ConnectionListener},
-    host_facts, parse_port, profile, routing_policy,
+    default_backend, host_facts, parse_port, profile, routing_policy,
     runtime::RuntimeRegistry,
     runtime_launch_config, storage,
     subscription::{
@@ -98,6 +98,10 @@ fn parse_allocated_budget(raw: Option<&std::ffi::OsStr>) -> Result<Option<u64>, 
 
 fn env_flag(name: &str) -> bool {
     std::env::var(name).is_ok_and(|v| v == "1")
+}
+
+fn current_executable() -> Result<std::path::PathBuf, String> {
+    std::env::current_exe().map_err(|err| format!("无法定位当前可执行文件：{err}"))
 }
 
 fn parse_bind_host(raw: Option<&str>) -> Result<IpAddr, String> {
@@ -193,15 +197,49 @@ async fn run(options: cli::ServeOptions) -> Result<(), String> {
     let dev_no_key_enabled = env_flag("IDORIS_DEV_NO_KEY");
     let bind_host = parse_bind_host(std::env::var(BIND_HOST_ENV).ok().as_deref())?;
 
-    let components_dir =
-        config::resolve_env("IDORIS_COMPONENTS_DIR", components::DEFAULT_COMPONENTS_DIR)?;
+    let components_env = match std::env::var("IDORIS_COMPONENTS_DIR") {
+        Ok(value) => Some(value),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err("环境变量 IDORIS_COMPONENTS_DIR 不是有效的 Unicode 路径".to_string());
+        }
+    };
+    let bundled_components = config::resolve_path(
+        None,
+        components::DEFAULT_COMPONENTS_DIR,
+        &current_executable()?,
+    )?;
+    let component_source =
+        default_backend::classify(components_env.as_deref(), &bundled_components);
     let allow_mock = env_flag("IDORIS_ALLOW_MOCK");
-    let cards = components::load_components(&components_dir, allow_mock).map_err(|err| {
-        format!(
-            "无法加载组件目录 \"{}\"（IDORIS_COMPONENTS_DIR）：{err}",
-            components_dir.display()
-        )
-    })?;
+    let local_runtime_path = config::optional_env_path("IDORIS_LOCAL_RUNTIME_CONFIG")?;
+    let (cards, mut local_runtime_configs) = match component_source {
+        default_backend::ComponentSource::Configured(path) => {
+            let cards = default_backend::load_configured(&path, allow_mock)?;
+            let configs = runtime_launch_config::load(local_runtime_path.as_deref())?;
+            (cards, configs)
+        }
+        default_backend::ComponentSource::Detected => {
+            let configs = runtime_launch_config::load(local_runtime_path.as_deref())?;
+            let cards = default_backend::startup_cards(
+                default_backend::ComponentSource::Detected,
+                allow_mock,
+                &configs,
+                std::env::var_os("PATH").as_deref(),
+                idoris_upstream::detect::current_host_facts,
+                |kind, endpoint| async move {
+                    idoris_upstream::detect::query_installed_models(
+                        kind,
+                        &endpoint,
+                        idoris_upstream::detect::INSTALL_QUERY_TIMEOUT,
+                    )
+                    .await
+                },
+            )
+            .await?;
+            (cards, configs)
+        }
+    };
     let subscription_config = SubscriptionConfig::snapshot(
         std::env::var("IDORIS_DEPLOY_MODE").ok().as_deref(),
         std::env::var("IDORIS_ENABLE_SUBSCRIPTION").ok().as_deref(),
@@ -242,8 +280,6 @@ async fn run(options: cli::ServeOptions) -> Result<(), String> {
             )
         })?;
 
-    let local_runtime_path = config::optional_env_path("IDORIS_LOCAL_RUNTIME_CONFIG")?;
-    let mut local_runtime_configs = runtime_launch_config::load(local_runtime_path.as_deref())?;
     let endpoint_bearers = upstream_auth::prepare_upstream_auth(
         &cards,
         &mut local_runtime_configs,

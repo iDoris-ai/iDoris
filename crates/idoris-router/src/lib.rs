@@ -20,6 +20,8 @@ pub mod intent;
 pub mod components;
 /// Executable-relative bundled config resolution with explicit-path overrides.
 pub mod config;
+/// Default backend card when no component directory is configured.
+pub mod default_backend;
 
 /// Validated chat-request correlation identifiers for later Event Log use.
 pub mod correlation;

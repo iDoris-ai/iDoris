@@ -425,6 +425,49 @@ fn missing_or_invalid_bundled_policy_fails_startup() {
 }
 
 #[test]
+fn missing_bundled_components_recommend_without_claiming_cuda_or_windows() {
+    let _guard = PROCESS_TEST_LOCK.blocking_lock();
+    let (_root, cwd, exe, port) = fixture();
+    fs::remove_dir_all(exe.parent().unwrap().join("config/components")).unwrap();
+    let empty_path = cwd.path().join("empty-path");
+    fs::create_dir(&empty_path).unwrap();
+    // PATH is empty, so nvidia-smi is absent. This Mac or Linux run is not a
+    // CUDA acceptance test, and it is not a Windows acceptance test.
+    let expected = match std::env::consts::OS {
+        "macos" => "推荐的默认后端是 oMLX",
+        "linux" => "没有检测到 NVIDIA GPU，默认后端是 llama.cpp",
+        "windows" => "Windows 的默认后端是 Ollama",
+        _ => "不会改用其他后端",
+    };
+    let mut child = spawn(
+        &exe,
+        cwd.path(),
+        port,
+        &[("PATH", empty_path.to_str().unwrap())],
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if child.0.as_mut().unwrap().try_wait().unwrap().is_some() {
+            let output = child.0.take().unwrap().wait_with_output().unwrap();
+            assert_eq!(output.status.code(), Some(1));
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(stderr.contains(expected), "{stderr}");
+            assert!(
+                stderr.contains("不会改用其他后端") || stderr.contains("不会改用 vLLM"),
+                "{stderr}"
+            );
+            assert!(!stderr.contains("无法加载组件目录"), "{stderr}");
+            assert!(!stderr.contains("不是合法 YAML"), "{stderr}");
+            assert!(!stderr.contains("CUDA"), "{stderr}");
+            assert!(!stderr.contains("已验收"), "{stderr}");
+            return;
+        }
+        assert!(Instant::now() < deadline, "startup did not fail");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
 fn explicit_missing_paths_do_not_fall_back() {
     let _guard = PROCESS_TEST_LOCK.blocking_lock();
     let (_root, cwd, exe, port) = fixture();
