@@ -435,7 +435,7 @@
 
 | Task | 内容 | 依赖 | 状态 |
 |:---|:---|:---|:---|
-| A1 | HTTP/runtime readiness/chat 共用 Bearer（缺失即拒绝启动） | — | DOING |
+| A1 | HTTP/runtime readiness/chat 共用 Bearer（缺失即拒绝启动） | — | DONE（`fe11d57`，已合入 feature 分支；线版本仍是 1.0.1） |
 | A2 | `LocalRuntimeKind::Vllm`（认证、真实模型身份、GPU 额度） | A1 | BACKLOG |
 | A3 | 🖥 vllm-metal vs oMLX 实机对比，领先超 30% 即重开结论一 | A2 | BACKLOG |
 | A4 | `OllamaAdapter`（Windows 默认后端）。硬 pin 拒绝，不发送 `keep_alive: -1` | — | DONE（`9146255`，已合入 feature 分支） |
