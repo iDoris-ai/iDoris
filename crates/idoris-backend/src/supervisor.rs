@@ -360,11 +360,11 @@ impl SupervisorHandle {
 /// distinction matters, since a task blocked *inside* `acquire().await`
 /// would still count as one more accumulating detached task, defeating the
 /// point of bounding concurrency in the first place. A hanging adapter call
-/// is additionally bounded in *time* by `config.adapter_call_timeout` (see
-/// [`with_adapter_timeout`]), applied to every `list`/`chat`/`load`/
-/// `unload`/`probe_ready` call — so a permanently-hanging adapter stalls at
-/// most `max_concurrent_adapter_calls` real calls, each for at most that
-/// timeout, never an unbounded number of tasks held forever. Full
+/// is additionally bounded in *time* by `config.chat_call_timeout` for
+/// `chat` and `config.adapter_call_timeout` for management calls (see
+/// [`with_adapter_timeout`]) — so a permanently-hanging adapter stalls at
+/// most `max_concurrent_adapter_calls` real calls, each for at most its
+/// configured timeout, never an unbounded number of tasks held forever. Full
 /// graceful-shutdown task
 /// tracking/cancellation (stopping still-running spawned calls when the
 /// last handle drops) is a deliberately deferred concern for a future PR —

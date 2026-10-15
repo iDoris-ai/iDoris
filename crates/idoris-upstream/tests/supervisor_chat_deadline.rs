@@ -79,6 +79,7 @@ fn adapter(server: &MockServer) -> OmlxAdapter {
 
 fn request() -> ChatRequest {
     ChatRequest {
+        native: None,
         model: "qwen3-8b".to_string(),
         messages: vec![ChatMessage {
             role: "user".to_string(),
@@ -110,6 +111,7 @@ async fn default_supervisor_path_survives_an_eleven_second_chat() {
         ResponseTemplate::new(200)
             .set_delay(Duration::from_secs(11))
             .set_body_json(serde_json::json!({
+                "model": "qwen3-8b",
                 "choices": [{"message": {"content": "late answer"}}]
             })),
     )

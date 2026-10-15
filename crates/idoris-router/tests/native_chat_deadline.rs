@@ -42,7 +42,9 @@ async fn native_router_survives_an_eleven_second_chat() {
         .respond_with(
             ResponseTemplate::new(200)
                 .set_delay(Duration::from_secs(11))
-                .set_body_json(json!({"choices": [{"message": {"content": "late answer"}}]})),
+                .set_body_json(
+                    json!({"model":"omlx","choices": [{"message": {"content": "late answer"}}]}),
+                ),
         )
         .mount(&upstream)
         .await;
@@ -54,8 +56,7 @@ async fn native_router_survives_an_eleven_second_chat() {
         cards: vec![card],
         ..AppState::default()
     });
-    let body =
-        json!({"model":"idoris/daily","messages":[{"role":"user","content":"hi"}],"stream":false});
+    let body = json!({"model":"omlx","messages":[{"role":"user","content":"hi"}],"stream":false});
     let start = Instant::now();
     let response = app
         .oneshot(
