@@ -86,3 +86,139 @@ async fn small_completion_cap_preserves_payload_and_legacy_admission() {
     assert_eq!(view.reserved_minor, 0);
     upstream.verify().await;
 }
+
+async fn cap_admission_case(caps: &str, budget_minor: i64, expected: StatusCode) {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "choices":[{"message":{"role":"assistant","content":"answer"}}],
+            "usage":{"prompt_tokens":1,"completion_tokens":4,"total_tokens":5}
+        })))
+        .mount(&upstream)
+        .await;
+    let (_dir, ledger) = super::tests::configured_budget_ledger(budget_minor);
+    let ledger = Arc::new(ledger);
+    let before = ledger.tenant_readview(budget::PERSONAL_TENANT_ID).unwrap();
+    let mut card = super::tests::resident_component_card("paid", &upstream.uri());
+    // One minor unit per completion token makes precision boundaries observable.
+    card.provider.cost = idoris_contracts::provider::Cost {
+        input_per_m: 0.0,
+        output_per_m: 1_000_000.0,
+    };
+    let app = build_app(AppState {
+        cards: vec![card],
+        budget_ledger: Some(ledger.clone()),
+        ..AppState::default()
+    });
+    let mut payload: serde_json::Value = serde_json::from_str(caps).unwrap();
+    payload["messages"] = json!([{"role":"user","content":"cap test"}]);
+    let response = app
+        .oneshot(super::tests::post_chat(&payload.to_string(), &[]))
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let requests = upstream.received_requests().await.unwrap();
+    let after = ledger.tenant_readview(budget::PERSONAL_TENANT_ID).unwrap();
+    assert_eq!(status, expected, "caps={caps}; response={body}");
+    assert_eq!(after.reserved_minor, before.reserved_minor, "caps={caps}");
+    if expected == StatusCode::OK {
+        assert_eq!(requests.len(), 1, "caps={caps}");
+        let forwarded = requests[0].body_json::<serde_json::Value>().unwrap();
+        for field in ["max_tokens", "max_completion_tokens"] {
+            assert_eq!(forwarded.get(field), payload.get(field), "caps={caps}");
+        }
+        assert_eq!(after.spent_minor - before.spent_minor, 4);
+    } else {
+        assert!(requests.is_empty(), "caps={caps}");
+        assert_eq!(after.spent_minor, before.spent_minor, "caps={caps}");
+        assert_eq!(
+            body["error"]["type"],
+            if expected == StatusCode::BAD_REQUEST {
+                "invalid_completion_cap"
+            } else {
+                "budget_exceeded"
+            }
+        );
+    }
+}
+
+#[tokio::test]
+async fn invalid_completion_caps_are_400_without_post_or_charge() {
+    for field in ["max_tokens", "max_completion_tokens"] {
+        for invalid in [
+            "4096.0",
+            "4096.5",
+            "4.096e3",
+            "\"4096\"",
+            "null",
+            "-1",
+            "true",
+            "[]",
+            "{}",
+            "9007199254740993",
+            "4611686018427388415",
+            "18446744073709551615",
+            "18446744073709551616",
+        ] {
+            cap_admission_case(
+                &format!("{{\"{field}\":{invalid}}}"),
+                3000,
+                StatusCode::BAD_REQUEST,
+            )
+            .await;
+        }
+        // A valid sibling must never mask an invalid field.
+        let other = if field == "max_tokens" {
+            "max_completion_tokens"
+        } else {
+            "max_tokens"
+        };
+        cap_admission_case(
+            &format!("{{\"{field}\":null,\"{other}\":8}}"),
+            3000,
+            StatusCode::BAD_REQUEST,
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn both_completion_fields_use_the_larger_quote() {
+    for caps in [
+        r#"{"max_completion_tokens":4096}"#,
+        r#"{"max_tokens":8,"max_completion_tokens":4096}"#,
+        r#"{"max_tokens":4096,"max_completion_tokens":8}"#,
+    ] {
+        cap_admission_case(caps, 3000, StatusCode::PAYMENT_REQUIRED).await;
+    }
+}
+
+#[tokio::test]
+async fn completion_precision_boundary_is_quoted_without_truncation() {
+    for field in ["max_tokens", "max_completion_tokens"] {
+        for cap in [9_007_199_254_740_991_u64, 9_007_199_254_740_992] {
+            let caps = format!("{{\"{field}\":{cap}}}");
+            let exact = i64::try_from(cap).unwrap();
+            cap_admission_case(&caps, exact - 1, StatusCode::PAYMENT_REQUIRED).await;
+            // Existing floating-point pricing may round upward by one minor unit.
+            cap_admission_case(&caps, exact + 1, StatusCode::OK).await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn valid_caps_and_defaults_preserve_payload_and_floor() {
+    for caps in [
+        "{}",
+        r#"{"max_tokens":0}"#,
+        r#"{"max_tokens":8}"#,
+        r#"{"max_completion_tokens":8}"#,
+        r#"{"max_tokens":8,"max_completion_tokens":16}"#,
+        r#"{"max_tokens":2048,"max_completion_tokens":16}"#,
+    ] {
+        cap_admission_case(caps, 3000, StatusCode::OK).await;
+        cap_admission_case(caps, 1023, StatusCode::PAYMENT_REQUIRED).await;
+    }
+}

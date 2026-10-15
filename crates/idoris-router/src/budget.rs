@@ -17,11 +17,24 @@ use serde_json::Value;
 /// A smaller caller cap never reduces the existing conservative reservation.
 pub(crate) const RESERVED_COMPLETION_TOKENS: u64 = 1024;
 
-pub(crate) fn completion_reservation_tokens(body: &Value) -> u64 {
-    body.get("max_tokens")
-        .and_then(Value::as_u64)
-        .unwrap_or(RESERVED_COMPLETION_TOKENS)
-        .max(RESERVED_COMPLETION_TOKENS)
+/// Validate both forwarded output caps before any quotation. Reject explicit
+/// non-integers rather than letting an upstream coerce a larger cap than quoted.
+/// The inclusive 2^53 ceiling keeps counts exactly representable in f64 pricing.
+/// When both fields are present, quote their maximum regardless of upstream
+/// precedence; retain the original fields and the legacy 1024-token floor.
+pub(crate) fn completion_reservation_tokens(body: &Value) -> Result<u64, &'static str> {
+    const MAX_EXACT_COMPLETION_TOKENS: u64 = 1_u64 << 53;
+    let mut completion = RESERVED_COMPLETION_TOKENS;
+    for field in ["max_tokens", "max_completion_tokens"] {
+        if let Some(value) = body.get(field) {
+            let cap = value
+                .as_u64()
+                .filter(|cap| *cap <= MAX_EXACT_COMPLETION_TOKENS)
+                .ok_or(field)?;
+            completion = completion.max(cap);
+        }
+    }
+    Ok(completion)
 }
 
 /// No virtual-key system exists yet (interface spec §3.2's key vault isn't
