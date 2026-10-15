@@ -7,8 +7,9 @@
 
 use std::{
     fs,
+    io::{Read, Seek, SeekFrom},
     path::{Path, PathBuf},
-    process::{Child, Command, Stdio},
+    process::{Child, Command, ExitStatus, Output, Stdio},
     sync::atomic::{AtomicU64, Ordering},
     time::{Duration, Instant},
 };
@@ -256,7 +257,33 @@ async fn post_chat(port: u16) -> reqwest::Response {
         .unwrap()
 }
 
-fn startup_with_budget(raw: &str) -> std::process::Output {
+const STARTUP_EXIT_TIMEOUT: Duration = Duration::from_secs(3);
+
+#[derive(Debug)]
+struct StartupTimeout {
+    pid: u32,
+    status: ExitStatus,
+    ports_bound: bool,
+}
+
+struct StartupChild(Child);
+
+impl Drop for StartupChild {
+    fn drop(&mut self) {
+        // Fallback cleanup on assertion/IO failure; normal paths explicitly reap.
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+fn captured_output(mut file: fs::File) -> Vec<u8> {
+    file.seek(SeekFrom::Start(0)).unwrap();
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).unwrap();
+    bytes
+}
+
+fn startup_with_budget(raw: &str) -> Result<Output, StartupTimeout> {
     let home = IsolatedHome::new();
     let components = tempfile::tempdir().unwrap();
     let state = tempfile::tempdir().unwrap();
@@ -266,21 +293,72 @@ fn startup_with_budget(raw: &str) -> std::process::Output {
         components.path().join("omlx.yaml"),
     )
     .unwrap();
-    clean_command()
-        .arg("serve")
-        .current_dir(&repo)
-        .env("HOME", &home.path)
-        .env("IDORIS_COMPONENTS_DIR", components.path())
-        .env(
-            "IDORIS_ROUTING_POLICY",
-            repo.join("config/routing-policy.yaml"),
-        )
-        .env("IDORIS_CATALOG", repo.join("config/catalog.yaml"))
-        .env("IDORIS_PORT", free_port().to_string())
-        .env("IDORIS_DB_PATH", state.path().join("state.sqlite3"))
-        .env("IDORIS_ALLOCATED_BUDGET_BYTES", raw)
-        .output()
-        .unwrap()
+    let data_port = free_port();
+    let admin_port = loop {
+        let port = free_port();
+        if port != data_port {
+            break port;
+        }
+    };
+    // Regular files cannot fill a pipe and deadlock the child before exit.
+    let stdout = tempfile::tempfile().unwrap();
+    let stderr = tempfile::tempfile().unwrap();
+    let mut child = StartupChild(
+        clean_command()
+            .arg("serve")
+            .current_dir(&repo)
+            .env("HOME", &home.path)
+            .env("IDORIS_COMPONENTS_DIR", components.path())
+            .env(
+                "IDORIS_ROUTING_POLICY",
+                repo.join("config/routing-policy.yaml"),
+            )
+            .env("IDORIS_CATALOG", repo.join("config/catalog.yaml"))
+            .env("IDORIS_PORT", data_port.to_string())
+            .env("IDORIS_ADMIN_PORT", admin_port.to_string())
+            .env("IDORIS_DB_PATH", state.path().join("state.sqlite3"))
+            .env("IDORIS_ALLOCATED_BUDGET_BYTES", raw)
+            .stdin(Stdio::null())
+            .stdout(stdout.try_clone().unwrap())
+            .stderr(stderr.try_clone().unwrap())
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = Instant::now() + STARTUP_EXIT_TIMEOUT;
+    let mut ports_bound = false;
+    loop {
+        if child.0.try_wait().unwrap().is_some() {
+            let status = child.0.wait().expect("reap exited startup child");
+            return Ok(Output {
+                status,
+                stdout: captured_output(stdout),
+                stderr: captured_output(stderr),
+            });
+        }
+        if Instant::now() >= deadline {
+            let pid = child.0.id();
+            if let Err(error) = child.0.kill() {
+                assert!(
+                    child.0.try_wait().unwrap().is_some(),
+                    "kill startup child: {error}"
+                );
+            }
+            let status = child.0.wait().expect("reap timed-out startup child");
+            // A killed process is never returned as Output: on some platforms
+            // its exit code could otherwise resemble an expected startup error.
+            return Err(StartupTimeout {
+                pid,
+                status,
+                ports_bound,
+            });
+        }
+        let listening = |port| {
+            let address = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+            std::net::TcpStream::connect_timeout(&address, Duration::from_millis(20)).is_ok()
+        };
+        ports_bound |= listening(data_port) && listening(admin_port);
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 #[test]
@@ -294,7 +372,9 @@ fn illegal_and_negative_budget_configs_fail_startup() {
         " -1 ",
         "0x10",
     ] {
-        let output = startup_with_budget(raw);
+        let output = startup_with_budget(raw).unwrap_or_else(|timeout| {
+            panic!("startup must exit normally for raw={raw:?}: {timeout:?}")
+        });
         assert_eq!(
             output.status.code(),
             Some(1),
@@ -306,6 +386,32 @@ fn illegal_and_negative_budget_configs_fail_startup() {
             "raw={raw:?} stderr={stderr}"
         );
     }
+}
+
+#[test]
+fn valid_budget_times_out_and_reaps_the_owned_startup_child() {
+    let started = Instant::now();
+    let timeout = startup_with_budget(&SUFFICIENT_BUDGET_BYTES.to_string())
+        .expect_err("a valid budget starts the server, so the exit-only helper must time out");
+    assert!(started.elapsed() >= STARTUP_EXIT_TIMEOUT);
+    assert!(started.elapsed() < STARTUP_EXIT_TIMEOUT + Duration::from_secs(2));
+    assert!(
+        timeout.ports_bound,
+        "valid startup must bind both isolated listener ports"
+    );
+    assert!(
+        !timeout.status.success(),
+        "owned server was killed after the deadline"
+    );
+    #[cfg(unix)]
+    assert_eq!(
+        nix::sys::wait::waitpid(
+            nix::unistd::Pid::from_raw(i32::try_from(timeout.pid).unwrap()),
+            Some(nix::sys::wait::WaitPidFlag::WNOHANG),
+        ),
+        Err(nix::errno::Errno::ECHILD),
+        "timeout child must have been reaped, not left running or as a zombie",
+    );
 }
 
 #[tokio::test]
