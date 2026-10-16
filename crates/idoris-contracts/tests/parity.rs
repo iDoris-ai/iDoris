@@ -20,6 +20,7 @@ use idoris_contracts::admin_v0::{
     AdminModelsResponse, AdminRolesResponse, AdminRuntimesResponse, AdminStatusResponse,
 };
 use idoris_contracts::component_card::ComponentCard;
+use idoris_contracts::inspect::{InspectRequest, InspectResponse};
 use idoris_contracts::load_policy::LoadPolicy;
 use idoris_contracts::provider::ProviderDescriptor;
 use idoris_contracts::routing_policy::RoutingPolicy;
@@ -85,6 +86,148 @@ fn assert_parity<T: Contract>(schema_file: &str, instance: &Value) {
 
 fn digest(c: char) -> String {
     format!("sha256:{}", c.to_string().repeat(64))
+}
+
+#[test]
+fn inspect_request_corpus() {
+    let file = "inspect-request.schema.json";
+    for instance in [
+        json!({"input": "身份证 110105194912310021"}),
+        json!({"input": ""}),
+        json!({}),
+        json!({"input": 1}),
+        json!({"input": null}),
+        json!({"input": "x", "privacy": "any"}),
+        json!({"messages": [{"role": "user", "content": "x"}]}),
+    ] {
+        assert_parity::<InspectRequest>(file, &instance);
+    }
+}
+
+#[test]
+fn inspect_response_corpus() {
+    let file = "inspect-response.schema.json";
+    let valid = json!({
+        "sensitivity": "S3",
+        "findings": [
+            {"kind": "cn_resident_id", "span": {"start": 4, "length": 18}},
+            {"kind": "input_limit_exceeded"}
+        ],
+        "action": "BLOCK"
+    });
+    assert!(idoris_contracts::parse::<InspectResponse>(&valid).is_ok());
+    assert_parity::<InspectResponse>(file, &valid);
+    assert_parity::<InspectResponse>(
+        file,
+        &json!({"sensitivity": "S0", "findings": [], "action": "ALLOW"}),
+    );
+    let mutations: [(&str, Value); 13] = [
+        ("/sensitivity", json!("S4")),
+        ("/sensitivity", json!("s3")),
+        ("/action", json!("block")),
+        ("/action", json!("ESCALATE")),
+        ("/findings/0/kind", json!("phone")),
+        ("/findings/0/span/length", json!(0)),
+        ("/findings/0/span/start", json!(-1)),
+        ("/findings/0/span/start", json!(1.5)),
+        ("/findings/0/span", Value::Null),
+        ("/findings/0/span", json!({"start": 4, "end": 22})),
+        (
+            "/findings/0/span",
+            json!({"start": 4, "length": 18, "end": 22}),
+        ),
+        (
+            "/findings/0",
+            json!({"kind": "api_key", "match": "sk-live-1"}),
+        ),
+        ("/findings", json!(null)),
+    ];
+    for (pointer, replacement) in mutations {
+        let mut instance = valid.clone();
+        *instance.pointer_mut(pointer).unwrap() = replacement;
+        assert!(idoris_contracts::parse::<InspectResponse>(&instance).is_err());
+        assert_parity::<InspectResponse>(file, &instance);
+    }
+    let mut extra = valid.clone();
+    extra["reason"] = json!("matched 110105194912310021");
+    assert_parity::<InspectResponse>(file, &extra);
+    let mut missing = valid.clone();
+    missing.as_object_mut().unwrap().remove("findings");
+    assert_parity::<InspectResponse>(file, &missing);
+}
+
+// Independent verdicts: agreement alone also passes when both validators are wrong.
+fn inspect_response_expected_cases() -> Vec<(Value, bool)> {
+    let special = json!({"kind": "input_limit_exceeded"});
+    let spanned = json!({"kind": "input_limit_exceeded", "span": {"start": 0, "length": 1}});
+    let mobile = json!({"kind": "cn_mobile", "span": {"start": 0, "length": 11}});
+    vec![
+        (
+            json!({"sensitivity": "S0", "findings": [spanned], "action": "BLOCK"}),
+            false,
+        ),
+        (
+            json!({"sensitivity": "S0", "findings": [special], "action": "ALLOW"}),
+            false,
+        ),
+        (
+            json!({"sensitivity": "S0", "findings": [special], "action": "REDACT"}),
+            false,
+        ),
+        (
+            json!({"sensitivity": "S0", "findings": [spanned], "action": "ALLOW"}),
+            false,
+        ),
+        (
+            json!({"sensitivity": "S0", "findings": [mobile, special], "action": "ALLOW"}),
+            false,
+        ),
+        (
+            json!({"sensitivity": "S0", "findings": [mobile, spanned], "action": "BLOCK"}),
+            false,
+        ),
+        (
+            json!({"sensitivity": "S0", "findings": [special], "action": "BLOCK"}),
+            true,
+        ),
+        (
+            json!({"sensitivity": "S0", "findings": [mobile, special], "action": "BLOCK"}),
+            true,
+        ),
+        (
+            json!({"sensitivity": "S0", "findings": [mobile], "action": "ALLOW"}),
+            true,
+        ),
+        (
+            json!({"sensitivity": "S0", "findings": [], "action": "ALLOW"}),
+            true,
+        ),
+    ]
+}
+
+#[test]
+fn inspect_response_expected_rust_verdicts() {
+    let mismatches: Vec<_> = inspect_response_expected_cases()
+        .into_iter()
+        .filter(|(instance, expected)| {
+            idoris_contracts::parse::<InspectResponse>(instance).is_ok() != *expected
+        })
+        .collect();
+    assert!(mismatches.is_empty(), "wrong Rust verdicts: {mismatches:?}");
+}
+
+#[test]
+fn inspect_response_expected_schema_verdicts() {
+    let mismatches: Vec<_> = inspect_response_expected_cases()
+        .into_iter()
+        .filter(|(instance, expected)| {
+            schema_says_valid("inspect-response.schema.json", instance) != *expected
+        })
+        .collect();
+    assert!(
+        mismatches.is_empty(),
+        "wrong schema verdicts: {mismatches:?}"
+    );
 }
 
 #[test]

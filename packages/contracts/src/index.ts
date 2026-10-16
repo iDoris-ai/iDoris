@@ -20,5 +20,7 @@ export { adminV0ModelsResponseSchema } from "./generated/admin-v0-models.js";
 export { adminV0RolesResponseSchema } from "./generated/admin-v0-roles.js";
 export { adminV0RuntimesResponseSchema } from "./generated/admin-v0-runtimes.js";
 export { adminV0StatusResponseSchema } from "./generated/admin-v0-status.js";
+export { inspectRequestSchema } from "./generated/inspect-request.js";
+export { inspectResponseSchema } from "./generated/inspect-response.js";
 export * from "./role.js";
 export * from "./version.js";
