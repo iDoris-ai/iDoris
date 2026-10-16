@@ -33,8 +33,8 @@ ignore = [
   # CVE is ever filed against `paste` itself (this entry only silences the
   # maintenance-status notice, not an actual vulnerability class).
   "RUSTSEC-2024-0436",
-  # RUSTSEC-2024-0449 reports unsafe-libyaml's unmaintained status,
-  # not a reported vulnerability. It enters through
+  # RUSTSEC-2024-0449 was issued on 2026-10-12 for unsafe-libyaml's
+  # unmaintained status, not a reported vulnerability. It enters through
   # serde_yaml, which parses local component/policy/catalog YAML. No patched
   # unsafe-libyaml release exists; replacing serde_yaml with a safe parser
   # needs compatibility testing across those formats. Keep the exception

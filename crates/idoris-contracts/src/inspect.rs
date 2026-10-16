@@ -125,6 +125,16 @@ pub struct InspectResponse {
 
 impl Contract for InspectResponse {
     fn validate(&self) -> Result<(), ContractError> {
+        for finding in &self.findings {
+            if finding.kind == FindingKind::InputLimitExceeded {
+                if finding.span.is_some() {
+                    return Err(ContractError::new("unscanned input must not carry a span"));
+                }
+                if self.action != InspectAction::Block {
+                    return Err(ContractError::new("unscanned input requires BLOCK"));
+                }
+            }
+        }
         let empty_span = self
             .findings
             .iter()
