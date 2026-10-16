@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Validate package startup/version; payload signatures must be verified separately."""
+"""Validate package startup/version in isolated fresh user state.
+
+Payload signatures must be verified separately. The child inherits no IDORIS_*
+variables and must create idoris.sqlite3 under the disposable home.
+"""
 import argparse
 import errno
 import json
@@ -62,8 +66,15 @@ def smoke_payload(directory, expected):
                 probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                 probe.bind(("127.0.0.1", port))
         env = {k: v for k, v in os.environ.items() if not k.startswith("IDORIS_")}
-        env.update(HOME=str(home), XDG_DATA_HOME=str(home / "data"), LOCALAPPDATA=str(home / "data"))
+        # Override only the child's user-directory environment. Never read/write
+        # the operator's existing key store, tenant budgets, or load fences.
+        env.update(HOME=str(home),
+                   XDG_DATA_HOME=str(home / "data"),
+                   XDG_STATE_HOME=str(home / "state"),
+                   LOCALAPPDATA=str(home / "appdata"))
         with (root / "server.log").open("w+") as log:
+            # Stay in the CLI process group so a group kill on CLI timeout
+            # reaps this payload. Do not setsid or start_new_session.
             process = subprocess.Popen([str(bundle / "idoris")], cwd=cwd, env=env,
                                        stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT)
             try:
@@ -82,6 +93,9 @@ def smoke_payload(directory, expected):
                         raise RuntimeError("server exited during health check")
                     if (health.get("status"), health.get("version"), health.get("components")) != ("ok", expected, 1):
                         raise RuntimeError(f"unexpected health: {health!r}; expected version {expected!r}")
+                    if not list(home.rglob("idoris.sqlite3")):
+                        raise RuntimeError("default database was not created in isolated user state")
+                    print("release smoke: fresh user state + default database verified")
                     return
                 raise RuntimeError("/health readiness timed out")
             finally:

@@ -35,6 +35,7 @@ assert Path.cwd() != Path(__file__).parent
 assert Path(os.environ["HOME"]) != Path(__file__).parent
 for name in ("components/omlx.yaml", "components/subscription.yaml", "routing-policy.yaml", "catalog.yaml"):
     assert (Path(__file__).parent / "config" / name).is_file()
+Path(os.environ["HOME"], "idoris.sqlite3").write_bytes(b"")
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
