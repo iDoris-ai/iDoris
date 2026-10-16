@@ -37,22 +37,46 @@ impl RuntimeRegistry {
     where
         F: Fn(&ComponentCard) -> Result<std::sync::Arc<dyn RuntimeAdapter>, BackendError>,
     {
-        Self::spawn_with_factory_inner(cards, factory, false)
+        Self::spawn_with_factory_inner(cards, None, false, factory)
     }
 
-    fn spawn_with_factory_inner<F>(
+    /// Apply an already allocated model budget to both process-wide admission
+    /// and each runtime, while the remote kill switch (engaged at boot) keeps
+    /// non-trusted-local cards from being status-probed. Bytes use decimal GB,
+    /// matching model memory estimates. `None` preserves the historical default;
+    /// no OS reserve is deducted here.
+    pub fn spawn_with_factory_and_budget<F>(
         cards: &[ComponentCard],
+        allocated_budget_bytes: Option<u64>,
         factory: F,
-        remote_kill_switch: bool,
     ) -> Result<Self, String>
     where
         F: Fn(&ComponentCard) -> Result<std::sync::Arc<dyn RuntimeAdapter>, BackendError>,
     {
-        let budget_gb = SupervisorConfig::default().budget_gb;
-        let startup_capacity = Arc::new(
-            GlobalCapacityLedger::new(budget_gb)
+        Self::spawn_with_factory_inner(cards, allocated_budget_bytes, false, factory)
+    }
+
+    fn spawn_with_factory_inner<F>(
+        cards: &[ComponentCard],
+        allocated_budget_bytes: Option<u64>,
+        remote_kill_switch: bool,
+        factory: F,
+    ) -> Result<Self, String>
+    where
+        F: Fn(&ComponentCard) -> Result<std::sync::Arc<dyn RuntimeAdapter>, BackendError>,
+    {
+        let config = SupervisorConfig {
+            budget_gb: allocated_budget_bytes
+                .map(|bytes| bytes as f64 / 1_000_000_000.0)
+                .unwrap_or_else(|| SupervisorConfig::default().budget_gb),
+            ..SupervisorConfig::default()
+        };
+        let budget_gb = config.budget_gb;
+        let startup_capacity = Arc::new(match allocated_budget_bytes {
+            Some(bytes) => GlobalCapacityLedger::new_bytes(bytes),
+            None => GlobalCapacityLedger::new(budget_gb)
                 .map_err(|error| format!("startup capacity ledger: {error}"))?,
-        );
+        });
         let mut registry = Self {
             supervisors: BTreeMap::new(),
             startup_capacity: Some(startup_capacity.clone()),
@@ -64,6 +88,7 @@ impl RuntimeRegistry {
                 card,
                 &factory,
                 Some(&startup_capacity),
+                config.clone(),
                 remote_kill_switch,
             )?
             else {
@@ -86,6 +111,14 @@ impl RuntimeRegistry {
     pub fn spawn_with_local_configs(
         cards: &[ComponentCard],
         local: &BTreeMap<String, LocalHttpRuntimeConfig>,
+    ) -> Result<Self, String> {
+        Self::spawn_with_local_configs_and_budget(cards, local, None, false)
+    }
+
+    pub fn spawn_with_local_configs_and_budget(
+        cards: &[ComponentCard],
+        local: &BTreeMap<String, LocalHttpRuntimeConfig>,
+        allocated_budget_bytes: Option<u64>,
         remote_kill_switch: bool,
     ) -> Result<Self, String> {
         for (provider_id, config) in local {
@@ -112,6 +145,8 @@ impl RuntimeRegistry {
 
         let mut registry = Self::spawn_with_factory_inner(
             cards,
+            allocated_budget_bytes,
+            remote_kill_switch,
             |card| {
                 if let Some(config) = local.get(&card.provider.id) {
                     return LocalHttpRuntimeAdapter::new(config.clone()).map(|adapter| {
@@ -120,7 +155,6 @@ impl RuntimeRegistry {
                 }
                 create_adapter(card)
             },
-            remote_kill_switch,
         )?;
         for (provider_id, config) in local {
             if let Some(bound) = registry.supervisors.get_mut(provider_id) {
@@ -258,7 +292,13 @@ impl From<Option<BoundSupervisor>> for RuntimeRegistry {
 /// # Panics
 /// Lifecycle construction requires a running Tokio runtime, like `Supervisor::spawn`.
 pub fn spawn_runtime(card: &ComponentCard) -> Result<Option<SupervisorHandle>, String> {
-    spawn_runtime_with_factory(card, &create_adapter, None, false)
+    spawn_runtime_with_factory(
+        card,
+        &create_adapter,
+        None,
+        SupervisorConfig::default(),
+        false,
+    )
 }
 
 fn is_trusted_local_card(card: &ComponentCard) -> bool {
@@ -276,6 +316,7 @@ fn spawn_runtime_with_factory<F>(
     card: &ComponentCard,
     factory: &F,
     startup_capacity: Option<&Arc<GlobalCapacityLedger>>,
+    config: SupervisorConfig,
     remote_kill_switch: bool,
 ) -> Result<Option<SupervisorHandle>, String>
 where
@@ -295,7 +336,6 @@ where
     }
     let adapter =
         factory(card).map_err(|error| format!("provider {}: {error}", card.provider.id))?;
-    let config = SupervisorConfig::default();
     // Engaged at boot: do not status-probe a card that fails `is_local_capable`.
     // Trusted loopback local_only cards are still probed.
     let skip_startup_probe = remote_kill_switch && !is_trusted_local_card(card);
@@ -583,13 +623,11 @@ mod tests {
         )
         .unwrap();
         let configs = BTreeMap::from([("local-http".to_string(), config)]);
-        assert!(
-            RuntimeRegistry::spawn_with_local_configs(&[custom.clone()], &configs, false).is_ok()
-        );
+        assert!(RuntimeRegistry::spawn_with_local_configs(&[custom.clone()], &configs).is_ok());
 
         custom.endpoint = "http://127.0.0.1:19999".into();
-        assert!(RuntimeRegistry::spawn_with_local_configs(&[custom], &configs, false).is_err());
-        assert!(RuntimeRegistry::spawn_with_local_configs(&[], &configs, false).is_err());
+        assert!(RuntimeRegistry::spawn_with_local_configs(&[custom], &configs).is_err());
+        assert!(RuntimeRegistry::spawn_with_local_configs(&[], &configs).is_err());
     }
 
     #[tokio::test]
@@ -671,9 +709,10 @@ mod tests {
                 .mount(&server)
                 .await;
             card.endpoint = server.uri();
-            let registry = RuntimeRegistry::spawn_with_local_configs(
+            let registry = RuntimeRegistry::spawn_with_local_configs_and_budget(
                 std::slice::from_ref(&card),
                 &BTreeMap::new(),
+                None,
                 remote_kill_switch,
             )
             .unwrap();

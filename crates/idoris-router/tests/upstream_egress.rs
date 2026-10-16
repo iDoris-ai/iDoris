@@ -56,6 +56,7 @@ async fn stream_failed(client: &RemoteClient) -> bool {
 }
 fn request() -> ChatRequest {
     ChatRequest {
+        native: None,
         model: "test".into(),
         messages: vec![],
     }

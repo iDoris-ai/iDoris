@@ -7,7 +7,7 @@ use uuid::Uuid;
 
 const MAX_STRING_UTF16_UNITS: usize = 500;
 const MAX_ARRAY_ITEMS: usize = 32;
-const SCALAR_KEYS: &str = "component,intent,privacy,tier,provider_id,model_id,tokens_in,tokens_out,cost_minor,latency_ms,status,http_status,reason,rule_id,served_locality,degraded,cached,reserved_minor,settled_minor,price_version,rating,outcome,failure_mode,sensitivity,training_eligible";
+const SCALAR_KEYS: &str = "component,intent,privacy,tier,provider_id,model_id,tokens_in,tokens_out,token_estimator,cost_minor,latency_ms,status,http_status,reason,rule_id,served_locality,degraded,cached,reserved_minor,settled_minor,price_version,rating,outcome,failure_mode,sensitivity,training_eligible";
 const ARRAY_KEYS: &str = "reason_codes,labels";
 const OBJECT_ARRAY_KEYS: &str = "rubric";
 const CONTENT_KEYS: &str = "prompt,prompts,input,inputs,content,contents,text,texts,body,messages,message,response,responses,output,outputs,completion,completions,corrected_output,query,answer,raw,data";
@@ -167,7 +167,7 @@ impl EventLogStore {
         let conn = self.0.lock().map_err(|_| EventLogError::LockPoisoned)?;
         let mut stmt = conn.prepare(
             "SELECT sequence,event_id,tenant_id,record_id,event_type,ts_utc_ms,request_id,session_id,trace_id,parent_id,origin_record_id,metadata \
-             FROM event_log_events \
+             FROM main.event_log_events \
              WHERE tenant_id=?1 \
                AND (?2 IS NULL OR ts_utc_ms>=?2) \
                AND (?3 IS NULL OR ts_utc_ms<?3) \
@@ -206,22 +206,8 @@ impl EventLogStore {
             return Err(EventLogError::InvalidLimit);
         }
         let conn = self.0.lock().map_err(|_| EventLogError::LockPoisoned)?;
-        let mut stmt = conn.prepare(
-            "WITH ranked AS (\
-               SELECT sequence,event_id,tenant_id,record_id,event_type,ts_utc_ms,request_id,session_id,trace_id,parent_id,origin_record_id,metadata, \
-                      ROW_NUMBER() OVER (PARTITION BY record_id ORDER BY sequence DESC) AS rank \
-               FROM event_log_events \
-               WHERE tenant_id=?1 AND event_type=?2 \
-                 AND (?5 IS NULL OR record_id=?5)\
-             ) \
-             SELECT sequence,event_id,tenant_id,record_id,event_type,ts_utc_ms,request_id,session_id,trace_id,parent_id,origin_record_id,metadata \
-             FROM ranked \
-             WHERE rank=1 \
-               AND (?3 IS NULL OR ts_utc_ms>=?3) \
-               AND (?4 IS NULL OR ts_utc_ms<?4) \
-             ORDER BY ts_utc_ms, record_id, sequence \
-             LIMIT ?6",
-        )?;
+        let sql = tenant_type_query(query);
+        let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map(
             rusqlite::params![
                 scope,
@@ -235,6 +221,33 @@ impl EventLogStore {
         )?;
         rows.map(|row| decode(row?)).collect()
     }
+}
+
+// Keep optional bounds as direct comparisons so SQLite can seek the time index.
+fn tenant_type_query(query: &EventLogQuery<'_>) -> String {
+    let mut sql = String::from("SELECT e.* FROM main.event_log_events AS e");
+    if query.record_id.is_some() {
+        // Otherwise SQLite can prefer time ordering and scan unrelated records.
+        sql.push_str(" INDEXED BY event_log_tenant_record_sequence");
+    }
+    sql.push_str(" WHERE e.tenant_id=?1 AND e.event_type=?2");
+    if query.record_id.is_some() {
+        sql.push_str(" AND e.record_id=?5");
+    }
+    if query.from_ts_utc_ms.is_some() {
+        sql.push_str(" AND e.ts_utc_ms>=?3");
+    }
+    if query.to_ts_utc_ms.is_some() {
+        sql.push_str(" AND e.ts_utc_ms<?4");
+    }
+    // Supersession is by sequence across all timestamps, for this type only.
+    sql.push_str(
+        " AND NOT EXISTS (SELECT 1 FROM main.event_log_events AS later \
+           WHERE later.tenant_id=e.tenant_id AND later.record_id=e.record_id \
+             AND later.event_type=e.event_type AND later.sequence>e.sequence) \
+         ORDER BY e.ts_utc_ms, e.record_id, e.sequence LIMIT ?6",
+    );
+    sql
 }
 
 fn required_scope(scope: Option<&str>) -> Result<&str, EventLogError> {
@@ -415,12 +428,15 @@ fn verify_canonical_migration_schema(conn: &Connection) -> Result<(), EventLogEr
     Ok(())
 }
 
-fn verify_canonical_schema(conn: &Connection) -> Result<(), EventLogError> {
+fn verify_canonical_schema(conn: &Connection, version: i64) -> Result<(), EventLogError> {
     let canonical = Connection::open_in_memory()?;
     canonical.execute_batch(
         "CREATE TABLE IF NOT EXISTS event_log_schema_migrations (version INTEGER PRIMARY KEY)",
     )?;
     canonical.execute_batch(include_str!("migrations/0001_events.sql"))?;
+    if version >= 2 {
+        canonical.execute_batch(include_str!("migrations/0002_tenant_type_time.sql"))?;
+    }
     if schema_objects(conn)? != schema_objects(&canonical)? {
         return Err(EventLogError::SchemaIncomplete);
     }
@@ -489,35 +505,39 @@ fn migrate(conn: &mut Connection) -> Result<(), EventLogError> {
     // migration marker: an unexpected trigger could otherwise forge Event
     // Log rows as a side effect of the version=1 INSERT.
     verify_canonical_migration_schema(&tx)?;
-    let unsupported = tx
-        .query_row(
-            "SELECT version FROM main.event_log_schema_migrations WHERE version<>1 LIMIT 1",
-            [],
-            |r| r.get::<_, i64>(0),
-        )
-        .optional()?;
-    if unsupported.is_some() {
-        return Err(EventLogError::SchemaIncomplete);
+    let versions = {
+        let mut stmt =
+            tx.prepare("SELECT version FROM main.event_log_schema_migrations ORDER BY version")?;
+        stmt.query_map([], |row| row.get::<_, i64>(0))?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    let version = match versions.as_slice() {
+        [] => 0,
+        [1] => 1,
+        [1, 2] => 2,
+        _ => return Err(EventLogError::SchemaIncomplete),
+    };
+    if version > 0 {
+        verify_canonical_schema(&tx, version)?;
     }
-    let applied = tx
-        .query_row(
-            "SELECT version FROM main.event_log_schema_migrations WHERE version=1",
-            [],
-            |r| r.get::<_, i64>(0),
-        )
-        .optional()?
-        .is_some();
-    if !applied {
+    if version == 0 {
         tx.execute_batch(include_str!("migrations/0001_events.sql"))?;
         tx.execute(
             "INSERT INTO main.event_log_schema_migrations(version) VALUES (1)",
             [],
         )?;
     }
+    if version < 2 {
+        tx.execute_batch(include_str!("migrations/0002_tenant_type_time.sql"))?;
+        tx.execute(
+            "INSERT INTO main.event_log_schema_migrations(version) VALUES (2)",
+            [],
+        )?;
+    }
     if tx.prepare("SELECT sequence,event_id,tenant_id,record_id,event_type,ts_utc_ms,request_id,session_id,trace_id,parent_id,origin_record_id,metadata FROM main.event_log_events LIMIT 0").is_err() {
         return Err(EventLogError::SchemaIncomplete);
     }
-    verify_canonical_schema(&tx)?;
+    verify_canonical_schema(&tx, 2)?;
     verify_append_only_guards(&tx)?;
     tx.commit()?;
     Ok(())

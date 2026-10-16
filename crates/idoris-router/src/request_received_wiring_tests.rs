@@ -30,6 +30,9 @@ fn events(
     event_log
         .events_for_record(Some(budget::PERSONAL_TENANT_ID), record_id)
         .unwrap()
+        .into_iter()
+        .filter(|row| row.event.event_type != EventType::AuditFinalized)
+        .collect()
 }
 
 #[tokio::test]
@@ -77,7 +80,10 @@ async fn request_received_persists_server_record_and_validated_correlation() {
 
     let events = event_log
         .events_for_record(Some(budget::PERSONAL_TENANT_ID), &record_id)
-        .unwrap();
+        .unwrap()
+        .into_iter()
+        .filter(|row| row.event.event_type != EventType::AuditFinalized)
+        .collect::<Vec<_>>();
     assert_eq!(events.len(), 6);
     assert_eq!(events[0].event.event_type, EventType::RequestReceived);
     assert_eq!(events[1].event.event_type, EventType::Inspected);
@@ -165,7 +171,7 @@ async fn request_received_preserves_valid_request_id_and_falls_back_on_oversize(
 }
 
 #[tokio::test]
-async fn tenant_mode_uses_parsed_tenant_not_untrusted_metadata() {
+async fn tenant_mode_rejects_unauthenticated_request_before_event_write() {
     let event_log = memory_event_log();
     let app = build_app(AppState {
         deploy_mode: DeployMode::Tenant,
@@ -182,6 +188,7 @@ async fn tenant_mode_uses_parsed_tenant_not_untrusted_metadata() {
         ))
         .await
         .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     let record_id = response
         .headers()
         .get(HEADER_RECORD_ID)
@@ -191,18 +198,72 @@ async fn tenant_mode_uses_parsed_tenant_not_untrusted_metadata() {
     let events = event_log
         .events_for_record(Some("acme"), record_id)
         .unwrap();
-    assert_eq!(events.len(), 4);
-    assert_eq!(events[0].event.event_type, EventType::RequestReceived);
-    assert_eq!(events[1].event.event_type, EventType::Inspected);
-    assert_eq!(events[2].event.event_type, EventType::Profiled);
-    assert_eq!(events[3].event.event_type, EventType::Decided);
-    assert!(events.iter().all(|event| event.event.tenant_id == "acme"));
+    // main authenticates before REQUEST_RECEIVED, so an unauthenticated tenant
+    // request fails closed and writes no event at all.
+    assert!(events.is_empty());
     assert!(
         event_log
             .events_for_record(Some("evil"), record_id)
             .unwrap()
             .is_empty()
     );
+}
+
+#[tokio::test]
+async fn tenant_mode_uses_bound_fixture_tenant_not_untrusted_metadata() {
+    let upstream = wiremock::MockServer::start().await;
+    wiremock::Mock::given(method("POST"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+            serde_json::json!({"id":"tenant-positive", "object":"chat.completion", "choices":[]}),
+        ))
+        .expect(1)
+        .mount(&upstream)
+        .await;
+    let event_log = memory_event_log();
+    let (app, key) = tenant_test_app(
+        AppState {
+            deploy_mode: DeployMode::Tenant,
+            cards: vec![super::tests::resident_component_card(
+                "tenant-event-test",
+                &upstream.uri(),
+            )],
+            event_log: Some(event_log.clone()),
+            ..AppState::default()
+        },
+        "acme",
+    );
+    let response = app.oneshot(tenant_test_request(
+        super::tests::post_chat(
+            r#"{"model":"idoris/daily","messages":[{"role":"user","content":"tenant fixture"}]}"#,
+            &[("x-idoris-tenant", "acme"), ("x-idoris-event-tenant", "evil")],
+        ),
+        &key,
+    )).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    upstream.verify().await;
+    let record_id = response
+        .headers()
+        .get(HEADER_RECORD_ID)
+        .unwrap()
+        .to_str()
+        .unwrap();
+    let rows = event_log
+        .events_for_record(Some("acme"), record_id)
+        .unwrap();
+    assert_eq!(rows[0].event.event_type, EventType::RequestReceived);
+    assert_eq!(rows[1].event.event_type, EventType::Inspected);
+    assert_eq!(rows[2].event.event_type, EventType::Profiled);
+    assert_eq!(rows[3].event.event_type, EventType::Decided);
+    assert!(rows.iter().all(|row| row.event.tenant_id == "acme"));
+    assert!(
+        event_log
+            .events_for_record(Some("evil"), record_id)
+            .unwrap()
+            .is_empty()
+    );
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(body["id"], "tenant-positive");
 }
 
 #[tokio::test]

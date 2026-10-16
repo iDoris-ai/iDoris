@@ -101,6 +101,41 @@ impl TenantStore {
         rows.map(|row| raw_to_record(row?)).collect()
     }
 
+    /// Trusted startup migration only: discover historical audit tenant scopes.
+    /// Record contents still require a tenant-scoped query.
+    pub fn audit_tenants_for_migration(&self) -> Result<Vec<String>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT tenant_id FROM tenant_records WHERE kind = 'audit' ORDER BY tenant_id",
+        )?;
+        let rows = stmt.query_map([], |row| row.get(0))?;
+        rows.collect::<Result<_, _>>().map_err(StoreError::from)
+    }
+
+    /// Trusted startup migration only: bounded, tenant-scoped historical scan.
+    pub fn audit_migration_batch(
+        &self,
+        scope: Option<&str>,
+        after_record: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<TenantRecord>, StoreError> {
+        let scope = required_scope(scope)?;
+        let mut stmt = self.conn.prepare(
+            "SELECT tenant_id, kind, record_id, request_id, origin_record_id, payload \
+             FROM tenant_records \
+             WHERE tenant_id = ?1 AND kind = 'audit' AND (?2 IS NULL OR record_id > ?2) \
+             ORDER BY record_id LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(
+            rusqlite::params![
+                scope,
+                after_record,
+                i64::try_from(limit).unwrap_or(i64::MAX)
+            ],
+            row_to_raw,
+        )?;
+        rows.map(|row| raw_to_record(row?)).collect()
+    }
+
     pub fn get(
         &self,
         scope: Option<&str>,
