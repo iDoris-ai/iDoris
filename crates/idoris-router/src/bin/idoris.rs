@@ -229,7 +229,12 @@ async fn run(options: cli::ServeOptions) -> Result<(), String> {
 
     let local_runtime_path = config::optional_env_path("IDORIS_LOCAL_RUNTIME_CONFIG")?;
     let local_runtime_configs = runtime_launch_config::load(local_runtime_path.as_deref())?;
-    let runtimes = RuntimeRegistry::spawn_with_local_configs(&cards, &local_runtime_configs)?;
+    let remote_kill_switch = env_flag("IDORIS_REMOTE_KILL_SWITCH");
+    let runtimes = RuntimeRegistry::spawn_with_local_configs(
+        &cards,
+        &local_runtime_configs,
+        remote_kill_switch,
+    )?;
     // Preserve startup-gate precedence: component/policy/runtime validation
     // (including subscription authorization and fixed card gates) must fail
     // before tenant storage/config bootstrap can surface a later error.
@@ -287,9 +292,9 @@ async fn run(options: cli::ServeOptions) -> Result<(), String> {
         virtual_key_authenticator: Some(virtual_key_authenticator),
         remote_bind_requires_auth: !bind_host.is_loopback(),
         dev_no_key_enabled,
-        remote_kill_switch: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(env_flag(
-            "IDORIS_REMOTE_KILL_SWITCH",
-        ))),
+        remote_kill_switch: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+            remote_kill_switch,
+        )),
         event_log: Some(persistent.event_log),
         ..AppState::default()
     };

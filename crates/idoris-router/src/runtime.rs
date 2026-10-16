@@ -37,6 +37,17 @@ impl RuntimeRegistry {
     where
         F: Fn(&ComponentCard) -> Result<std::sync::Arc<dyn RuntimeAdapter>, BackendError>,
     {
+        Self::spawn_with_factory_inner(cards, factory, false)
+    }
+
+    fn spawn_with_factory_inner<F>(
+        cards: &[ComponentCard],
+        factory: F,
+        remote_kill_switch: bool,
+    ) -> Result<Self, String>
+    where
+        F: Fn(&ComponentCard) -> Result<std::sync::Arc<dyn RuntimeAdapter>, BackendError>,
+    {
         let budget_gb = SupervisorConfig::default().budget_gb;
         let startup_capacity = Arc::new(
             GlobalCapacityLedger::new(budget_gb)
@@ -49,7 +60,12 @@ impl RuntimeRegistry {
             ready_snapshot_calls: Arc::default(),
         };
         for card in cards {
-            let Some(handle) = spawn_runtime_with_factory(card, &factory, Some(&startup_capacity))?
+            let Some(handle) = spawn_runtime_with_factory(
+                card,
+                &factory,
+                Some(&startup_capacity),
+                remote_kill_switch,
+            )?
             else {
                 continue;
             };
@@ -70,6 +86,7 @@ impl RuntimeRegistry {
     pub fn spawn_with_local_configs(
         cards: &[ComponentCard],
         local: &BTreeMap<String, LocalHttpRuntimeConfig>,
+        remote_kill_switch: bool,
     ) -> Result<Self, String> {
         for (provider_id, config) in local {
             let card = cards
@@ -93,14 +110,18 @@ impl RuntimeRegistry {
             }
         }
 
-        let mut registry = Self::spawn_with_factory(cards, |card| {
-            if let Some(config) = local.get(&card.provider.id) {
-                return LocalHttpRuntimeAdapter::new(config.clone()).map(|adapter| {
-                    std::sync::Arc::new(adapter) as std::sync::Arc<dyn RuntimeAdapter>
-                });
-            }
-            create_adapter(card)
-        })?;
+        let mut registry = Self::spawn_with_factory_inner(
+            cards,
+            |card| {
+                if let Some(config) = local.get(&card.provider.id) {
+                    return LocalHttpRuntimeAdapter::new(config.clone()).map(|adapter| {
+                        std::sync::Arc::new(adapter) as std::sync::Arc<dyn RuntimeAdapter>
+                    });
+                }
+                create_adapter(card)
+            },
+            remote_kill_switch,
+        )?;
         for (provider_id, config) in local {
             if let Some(bound) = registry.supervisors.get_mut(provider_id) {
                 *bound = bound
@@ -237,13 +258,25 @@ impl From<Option<BoundSupervisor>> for RuntimeRegistry {
 /// # Panics
 /// Lifecycle construction requires a running Tokio runtime, like `Supervisor::spawn`.
 pub fn spawn_runtime(card: &ComponentCard) -> Result<Option<SupervisorHandle>, String> {
-    spawn_runtime_with_factory(card, &create_adapter, None)
+    spawn_runtime_with_factory(card, &create_adapter, None, false)
+}
+
+fn is_trusted_local_card(card: &ComponentCard) -> bool {
+    idoris_policy::privacy::is_local_capable(&idoris_policy::Card {
+        component: card.clone(),
+        roles: Vec::new(),
+        experiment: false,
+        min_ram_gb: 0.0,
+        estimated_cost_minor: None,
+        admission_status: idoris_policy::AdmissionStatus::Ready,
+    })
 }
 
 fn spawn_runtime_with_factory<F>(
     card: &ComponentCard,
     factory: &F,
     startup_capacity: Option<&Arc<GlobalCapacityLedger>>,
+    remote_kill_switch: bool,
 ) -> Result<Option<SupervisorHandle>, String>
 where
     F: Fn(&ComponentCard) -> Result<std::sync::Arc<dyn RuntimeAdapter>, BackendError>,
@@ -263,15 +296,25 @@ where
     let adapter =
         factory(card).map_err(|error| format!("provider {}: {error}", card.provider.id))?;
     let config = SupervisorConfig::default();
-    let supervisor = if let Some(ledger) = startup_capacity {
-        Supervisor::spawn_with_startup_capacity_tracking(
+    // Engaged at boot: do not status-probe a card that fails `is_local_capable`.
+    // Trusted loopback local_only cards are still probed.
+    let skip_startup_probe = remote_kill_switch && !is_trusted_local_card(card);
+    let supervisor = match (startup_capacity, skip_startup_probe) {
+        (Some(ledger), true) => Supervisor::spawn_with_startup_capacity_tracking_without_probe(
             adapter,
             config,
             ledger.clone(),
             card.provider.id.clone(),
-        )
-    } else {
-        Supervisor::spawn(adapter, config)
+        ),
+        (Some(ledger), false) => Supervisor::spawn_with_startup_capacity_tracking(
+            adapter,
+            config,
+            ledger.clone(),
+            card.provider.id.clone(),
+        ),
+        // Registry startup always passes a ledger. `spawn_runtime` passes
+        // the switch as false, so a missing ledger never takes the skip arm.
+        (None, _) => Supervisor::spawn(adapter, config),
     };
     supervisor
         .map(Some)
@@ -540,11 +583,13 @@ mod tests {
         )
         .unwrap();
         let configs = BTreeMap::from([("local-http".to_string(), config)]);
-        assert!(RuntimeRegistry::spawn_with_local_configs(&[custom.clone()], &configs).is_ok());
+        assert!(
+            RuntimeRegistry::spawn_with_local_configs(&[custom.clone()], &configs, false).is_ok()
+        );
 
         custom.endpoint = "http://127.0.0.1:19999".into();
-        assert!(RuntimeRegistry::spawn_with_local_configs(&[custom], &configs).is_err());
-        assert!(RuntimeRegistry::spawn_with_local_configs(&[], &configs).is_err());
+        assert!(RuntimeRegistry::spawn_with_local_configs(&[custom], &configs, false).is_err());
+        assert!(RuntimeRegistry::spawn_with_local_configs(&[], &configs, false).is_err());
     }
 
     #[tokio::test]
@@ -601,5 +646,74 @@ mod tests {
             Err(idoris_backend::BackendError::supervisor_unavailable()),
         );
         assert_eq!(depth, 2);
+    }
+
+    /// Boot-time `IDORIS_REMOTE_KILL_SWITCH`: startup must not call
+    /// `adapter.status()` (oMLX `GET /api/status`) for an http card that is
+    /// not `is_local_capable`. Deleting `skip_startup_probe` makes the
+    /// zero-request assertions fail.
+    #[tokio::test]
+    async fn remote_kill_switch_startup_sends_no_request_for_untrusted_omlx_http_cards() {
+        use idoris_contracts::common::PrivacyClass;
+        use idoris_contracts::provider::Locality;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        async fn startup_paths(mut card: ComponentCard, remote_kill_switch: bool) -> Vec<String> {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/api/status"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "loaded_models": [],
+                    "model_memory_used": 0,
+                    "model_memory_max": 0
+                })))
+                .mount(&server)
+                .await;
+            card.endpoint = server.uri();
+            let registry = RuntimeRegistry::spawn_with_local_configs(
+                std::slice::from_ref(&card),
+                &BTreeMap::new(),
+                remote_kill_switch,
+            )
+            .unwrap();
+            let _ = registry
+                .get(&card.provider.id)
+                .expect("omlx http card spawns a lifecycle runtime")
+                .status()
+                .await;
+            server
+                .received_requests()
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|request| request.url.path().to_string())
+                .collect()
+        }
+
+        let mut privacy_any_loopback = card();
+        privacy_any_loopback.privacy_class = PrivacyClass::Any;
+        privacy_any_loopback.provider.privacy_class = PrivacyClass::Any;
+        let mut lan = card();
+        lan.provider.locality = Locality::Lan;
+
+        for untrusted in [privacy_any_loopback, lan] {
+            let suppressed = startup_paths(untrusted.clone(), true).await;
+            assert!(
+                suppressed.is_empty(),
+                "kill switch on must send 0 requests, including /api/status, got {suppressed:?}"
+            );
+            let open = startup_paths(untrusted, false).await;
+            assert!(
+                open.iter().any(|path| path == "/api/status"),
+                "kill switch off must probe /api/status, got {open:?}"
+            );
+        }
+
+        let trusted = startup_paths(card(), true).await;
+        assert!(
+            trusted.iter().any(|path| path == "/api/status"),
+            "trusted loopback omlx card must still be probed, got {trusted:?}"
+        );
     }
 }
