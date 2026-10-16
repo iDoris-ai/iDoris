@@ -11,8 +11,10 @@
 //!   [`InspectCtx`]，由接线层负责把它传进来（接线不在本切片内）。
 //!
 //! 扫描跑在 UTF-16 code unit 上，命中位置就是契约要求的 span 单位
-//! （`idoris_contracts::inspect` 模块文档）；扫描前的逃逸归一化只删字符、
-//! 不增字符，命中再按 `normalize` 的映射表回到原文坐标。
+//! （`idoris_contracts::inspect` 模块文档）。逃逸归一化只删或折叠字符、
+//! 不增字符。删除 Default_Ignorable 的视图和保留它们当边界的视图都扫，
+//! 命中按各自的映射表回到原文坐标后取并集，所以粘合不会比「不删」更松，
+//! 实体内部的隐形插入也不会比「删除」更松。
 
 mod l0;
 mod normalize;
@@ -76,11 +78,18 @@ pub fn inspect(input: &str, ctx: &InspectCtx) -> InspectResponse {
         };
     }
     let units: Vec<u16> = input.encode_utf16().collect();
-    let normalized = normalize::normalize(&units);
-    let mut hits = l0::scan(&normalized.units);
-    for hit in &mut hits {
-        (hit.start, hit.length) = normalized.original_span(hit.start, hit.length);
-    }
+    let mut hits = scan_view(&normalize::fold_keeping_ignorables(&units));
+    hits.extend(scan_view(&normalize::normalize(&units)));
+    // 同一原文区间只留一条。敏感度取更严的那条，避免并集把 S3 降成 S2。
+    hits.sort_by_key(|hit| {
+        (
+            hit.start,
+            hit.length,
+            hit.kind as u8,
+            std::cmp::Reverse(hit.sensitivity as u8),
+        )
+    });
+    hits.dedup_by_key(|hit| (hit.kind, hit.start, hit.length));
     let sensitivity = hits
         .iter()
         .map(|hit| hit.sensitivity)
@@ -102,6 +111,14 @@ pub fn inspect(input: &str, ctx: &InspectCtx) -> InspectResponse {
         findings,
         action,
     }
+}
+
+fn scan_view(normalized: &normalize::Normalized) -> Vec<Hit> {
+    let mut hits = l0::scan(&normalized.units);
+    for hit in &mut hits {
+        (hit.start, hit.length) = normalized.original_span(hit.start, hit.length);
+    }
+    hits
 }
 
 /// UTF-16 长度不会超过 UTF-8 字节数，所以字节数没超就一定没超，省掉一次计数。

@@ -634,6 +634,78 @@ fn default_ignorable_insertions_do_not_hide_id_or_mobile() {
     }
 }
 
+/// 可忽略字符夹在两个 ASCII 记号之间时，不能把它们粘成一个更长的 run。
+/// 纯删除会让这些行变成 Allow；实体内部的插入仍然要能命中，span 盖住插入。
+#[test]
+fn ignorable_between_ascii_tokens_does_not_join_away_the_entity() {
+    let key = format!("sk-{}", "a".repeat(40));
+    let rows = [
+        (
+            format!("Key\u{2068}{key}\u{2069}"),
+            InspectAction::Block,
+            FindingKind::ApiKey,
+            key.clone(),
+        ),
+        (
+            "\u{2068}1\u{2069}\u{2068}13812345678\u{2069}".to_string(),
+            InspectAction::Redact,
+            FindingKind::CnMobile,
+            "13812345678".to_string(),
+        ),
+        (
+            "1\u{200E}13812345678".to_string(),
+            InspectAction::Redact,
+            FindingKind::CnMobile,
+            "13812345678".to_string(),
+        ),
+        (
+            "2\u{200F}13812345678".to_string(),
+            InspectAction::Redact,
+            FindingKind::CnMobile,
+            "13812345678".to_string(),
+        ),
+        (
+            "13812345678\u{200E}9".to_string(),
+            InspectAction::Redact,
+            FindingKind::CnMobile,
+            "13812345678".to_string(),
+        ),
+        (
+            format!("a\u{200E}{key}"),
+            InspectAction::Block,
+            FindingKind::ApiKey,
+            key.clone(),
+        ),
+    ];
+    for (input, action, kind, entity) in rows {
+        let response = inspect(&input, &open_ctx());
+        assert_ne!(
+            response.action,
+            InspectAction::Allow,
+            "{input:?} {response:?}"
+        );
+        assert_eq!(response.action, action, "{input:?} {response:?}");
+        let hit = response
+            .findings
+            .iter()
+            .find(|f| f.kind == kind && covered(&input, f) == entity)
+            .unwrap_or_else(|| {
+                panic!("{input:?} missing {kind:?} covering {entity}: {response:?}")
+            });
+        assert_eq!(covered(&input, hit), entity);
+    }
+
+    let split = "138\u{200B}1234\u{200B}5678";
+    let response = inspect(split, &open_ctx());
+    assert_eq!(response.action, InspectAction::Redact, "{response:?}");
+    let hit = response
+        .findings
+        .iter()
+        .find(|f| f.kind == FindingKind::CnMobile)
+        .unwrap();
+    assert_eq!(covered(split, hit), split);
+}
+
 #[test]
 fn soft_hyphen_and_zwnj_arms_each_have_a_dedicated_case() {
     // Removing either arm alone must turn these red (mutation targets).
@@ -700,7 +772,65 @@ fn valid_id() -> impl Strategy<Value = String> {
     )
 }
 
+fn action_rank(action: InspectAction) -> u8 {
+    match action {
+        InspectAction::Allow => 0,
+        InspectAction::Redact => 1,
+        InspectAction::Block => 2,
+    }
+}
+
+/// 单视图的动作。坐标只用于把命中送进和 `inspect` 相同的 L2 判定。
+fn action_of_view(normalized: &super::normalize::Normalized, ctx: &InspectCtx) -> InspectAction {
+    let mut hits = super::l0::scan(&normalized.units);
+    for hit in &mut hits {
+        (hit.start, hit.length) = normalized.original_span(hit.start, hit.length);
+    }
+    let sensitivity = hits
+        .iter()
+        .map(|hit| hit.sensitivity)
+        .max()
+        .unwrap_or(Sensitivity::S0);
+    super::decide_action(&hits, sensitivity, ctx)
+}
+
 proptest! {
+    #[test]
+    fn union_is_never_looser_than_either_ignorable_view(
+        chars in proptest::collection::vec(
+            prop_oneof![
+                (b'0'..=b'9').prop_map(char::from),
+                (b'a'..=b'z').prop_map(char::from),
+                (b'A'..=b'Z').prop_map(char::from),
+                Just('-'),
+                Just(' '),
+                Just('\u{200B}'),
+                Just('\u{200E}'),
+                Just('\u{200F}'),
+                Just('\u{2068}'),
+                Just('\u{2069}'),
+                Just('\u{00AD}'),
+                Just('\u{FEFF}'),
+            ],
+            0..48,
+        ),
+    ) {
+        let input: String = chars.into_iter().collect();
+        let units: Vec<u16> = input.encode_utf16().collect();
+        let ctx = open_ctx();
+        let kept = action_of_view(&super::normalize::fold_keeping_ignorables(&units), &ctx);
+        let stripped = action_of_view(&super::normalize::normalize(&units), &ctx);
+        let merged = inspect(&input, &ctx).action;
+        prop_assert!(
+            action_rank(merged) >= action_rank(kept),
+            "kept {kept:?} merged {merged:?} input {input:?}"
+        );
+        prop_assert!(
+            action_rank(merged) >= action_rank(stripped),
+            "stripped {stripped:?} merged {merged:?} input {input:?}"
+        );
+    }
+
     #[test]
     fn zero_width_noise_never_hides_a_valid_id(
         id in valid_id(),
