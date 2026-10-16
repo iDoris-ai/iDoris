@@ -147,6 +147,7 @@ async fn request_query_returns_the_full_chain_of_a_real_paid_local_chat() {
             .collect::<Vec<_>>(),
         [
             EventType::RequestReceived,
+            EventType::Inspected,
             EventType::Profiled,
             EventType::Decided,
             EventType::BudgetReserved,
@@ -170,7 +171,7 @@ async fn request_query_returns_the_full_chain_of_a_real_paid_local_chat() {
             .iter()
             .all(|event| event["trace_id"] == "query-chain-trace")
     );
-    assert_eq!(events[2]["metadata"]["provider_id"], "paid-local");
+    assert_eq!(events[3]["metadata"]["provider_id"], "paid-local");
     let rendered = String::from_utf8(body.to_vec()).unwrap();
     assert!(!rendered.contains(SENTINEL));
 

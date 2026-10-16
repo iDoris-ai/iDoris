@@ -46,26 +46,47 @@ async fn profiled_follows_request_received_with_resolved_safe_metadata() {
         .into_iter()
         .filter(|row| row.event.event_type != EventType::AuditFinalized)
         .collect::<Vec<_>>();
-    assert_eq!(events.len(), 3);
+    assert_eq!(events.len(), 4);
     assert_eq!(events[0].event.event_type, EventType::RequestReceived);
-    assert_eq!(events[1].event.event_type, EventType::Profiled);
-    assert_eq!(events[2].event.event_type, EventType::Decided);
+    assert_eq!(events[1].event.event_type, EventType::Inspected);
+    assert_eq!(events[2].event.event_type, EventType::Profiled);
+    assert_eq!(events[3].event.event_type, EventType::Decided);
     assert!(events[0].sequence < events[1].sequence);
     assert!(events[1].sequence < events[2].sequence);
-    assert_eq!(events[1].event.record_id, record_id);
-    assert_eq!(events[1].event.tenant_id, budget::PERSONAL_TENANT_ID);
-    assert_eq!(events[1].event.session_id.as_deref(), Some("session-1"));
-    assert_eq!(events[1].event.trace_id.as_deref(), Some("trace-1"));
-    assert_eq!(events[1].event.parent_id.as_deref(), Some("parent-1"));
+    assert!(events[2].sequence < events[3].sequence);
+    let inspected = &events[1].event;
+    assert_eq!(inspected.record_id, record_id);
+    assert_eq!(inspected.tenant_id, budget::PERSONAL_TENANT_ID);
+    assert_eq!(inspected.session_id.as_deref(), Some("session-1"));
+    assert_eq!(inspected.trace_id.as_deref(), Some("trace-1"));
+    assert_eq!(inspected.parent_id.as_deref(), Some("parent-1"));
+    assert!(inspected.request_id.is_none());
+    assert_eq!(inspected.metadata.get("sensitivity"), Some(&json!("S0")));
     assert_eq!(
-        events[1].event.metadata.get("intent"),
+        inspected.metadata.get("privacy"),
+        Some(&json!("local_only"))
+    );
+    assert!(inspected.metadata.get("labels").unwrap().is_array());
+    assert!(!inspected.metadata.contains_key("reason"));
+    assert!(
+        !serde_json::to_string(&inspected.metadata)
+            .unwrap()
+            .contains("fix this bug")
+    );
+    assert_eq!(events[2].event.record_id, record_id);
+    assert_eq!(events[2].event.tenant_id, budget::PERSONAL_TENANT_ID);
+    assert_eq!(events[2].event.session_id.as_deref(), Some("session-1"));
+    assert_eq!(events[2].event.trace_id.as_deref(), Some("trace-1"));
+    assert_eq!(events[2].event.parent_id.as_deref(), Some("parent-1"));
+    assert_eq!(
+        events[2].event.metadata.get("intent"),
         Some(&json!("coding"))
     );
     assert_eq!(
-        events[1].event.metadata.get("privacy"),
+        events[2].event.metadata.get("privacy"),
         Some(&json!("local_only"))
     );
-    assert_eq!(events[1].event.metadata.len(), 2);
+    assert_eq!(events[2].event.metadata.len(), 2);
 }
 
 #[tokio::test]
@@ -95,7 +116,16 @@ async fn explicit_intent_is_profiled_without_inspecting_message_content() {
         .into_iter()
         .filter(|row| row.event.event_type != EventType::AuditFinalized)
         .collect::<Vec<_>>();
-    let profiled = &events[1].event;
+    assert_eq!(events[1].event.event_type, EventType::Inspected);
+    assert_eq!(events[1].event.metadata.get("privacy"), Some(&json!("any")));
+    assert!(!events[1].event.metadata.contains_key("reason"));
+    assert!(
+        !serde_json::to_string(&events[1].event.metadata)
+            .unwrap()
+            .contains("secret customer text")
+    );
+    let profiled = &events[2].event;
+    assert_eq!(profiled.event_type, EventType::Profiled);
     assert_eq!(profiled.metadata.get("intent"), Some(&json!("email")));
     assert_eq!(profiled.metadata.get("privacy"), Some(&json!("any")));
     let rendered = serde_json::to_string(&profiled.metadata).unwrap();
@@ -147,8 +177,9 @@ async fn profiled_append_failure_is_generic_503_before_budget_or_upstream() {
         .into_iter()
         .filter(|row| row.event.event_type != EventType::AuditFinalized)
         .collect::<Vec<_>>();
-    assert_eq!(events.len(), 1);
+    assert_eq!(events.len(), 2);
     assert_eq!(events[0].event.event_type, EventType::RequestReceived);
+    assert_eq!(events[1].event.event_type, EventType::Inspected);
     let after = ledger.tenant_readview(budget::PERSONAL_TENANT_ID).unwrap();
     assert_eq!(after.spent_minor, before.spent_minor);
     assert_eq!(after.available_minor, before.available_minor);
