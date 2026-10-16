@@ -85,7 +85,9 @@ pub(super) fn scan(units: &[u16]) -> Vec<Hit> {
         i = group_end;
     }
     scan_formatted(units, &mut hits);
-    hits.sort_by_key(|hit| (hit.start, hit.length));
+    super::tokens::scan(units, &mut hits);
+    super::secrets::scan(units, &mut hits);
+    hits.sort_by_key(|hit| (hit.start, hit.length, hit.kind as u8));
     hits.dedup_by_key(|hit| (hit.kind, hit.start, hit.length));
     hits
 }
