@@ -1,12 +1,7 @@
 name: release
 
-# 触发方式：
-#   1) push 一个 `v*` tag —— 真正发版：build → test → package → 建 GitHub Release。
-#   2) workflow_dispatch —— 手动干跑：build → test → package，但不建 Release，
-#      用来在合并/改动这个 workflow 后验证流程本身是否能跑通。
-#      `dry_run` 输入目前恒为“干跑”（release job 只在 tag push 时才跑），
-#      保留这个输入是为了在 Actions 界面上明确告诉触发者这次不会发版，
-#      并为未来需要区分干跑细节时留一个开关位。
+# Tag builds create an empty draft. Only an operator uploads signed DMG assets
+# and publishes after product/download acceptance. Dispatch never creates a release.
 on:
   push:
     tags:
@@ -24,11 +19,8 @@ permissions:
 
 jobs:
   build:
-    name: build + test + package (aarch64-apple-darwin)
+    name: build + test + unsigned package (aarch64-apple-darwin)
     runs-on: macos-14
-    outputs:
-      archive: ${{ steps.package.outputs.archive }}
-      checksum: ${{ steps.package.outputs.checksum }}
     steps:
       # fetch-depth: 0 —— 下面的「tag 必须指向 main 上的提交」检查要用
       # `git merge-base --is-ancestor`，需要完整历史，浅克隆不够。
@@ -46,6 +38,11 @@ jobs:
         run: |
           set -euo pipefail
           git fetch origin main
+          test "$(git rev-parse HEAD)" = "$(git rev-parse "$GITHUB_SHA^{commit}")"
+          if [ "$GITHUB_REF_NAME" = "v0.3.0" ]; then
+            echo "::error::v0.3.0 tag and published assets are immutable" >&2
+            exit 1
+          fi
           if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
             echo "::error::tag $GITHUB_REF_NAME（commit $GITHUB_SHA）不在 origin/main 的历史里，拒绝发版" >&2
             exit 1
@@ -58,6 +55,9 @@ jobs:
 
       # 发版前置门禁：测试不过，后面的 build/package 步骤不会执行，
       # release job（needs: build）也就不会跑，不会发出一个没过测试的版本。
+      - name: Release helper behavior tests
+        run: python3 -B -m unittest discover -s scripts -p 'test_*release*.py' -v
+
       - name: cargo test --workspace
         run: cargo test --workspace --locked
 
@@ -89,7 +89,7 @@ jobs:
       # `env:` 传入（而不是直接插进 `run:` 脚本文本）才不会有脚本注入风险；
       # 此时它已经在上一步过了 vX.Y.Z 格式校验（干跑分支是固定的
       # `dryrun-<7 位 sha>`），双重保险。
-      - name: Package binary + sha256
+      - name: Package unsigned binary + sha256
         id: package
         env:
           TAG: ${{ steps.version.outputs.tag }}
@@ -110,7 +110,7 @@ jobs:
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: release-assets
+          name: unsigned-build-only
           path: |
             ${{ steps.package.outputs.archive }}
             ${{ steps.package.outputs.checksum }}
@@ -118,32 +118,28 @@ jobs:
           retention-days: 7
 
   release:
-    name: create GitHub Release
+    name: create empty draft for operator signing
     needs: build
-    # 只有真正的 `v*` tag push 才发版；workflow_dispatch（干跑）永远停在 build。
     if: ${{ github.event_name == 'push' }}
-    # 这个 job 只下载 build 产物、调用 gh CLI 建 Release，不需要 macOS 机器
-    # ——用 ubuntu-latest 省 macOS 分钟数。
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
-        with:
-          name: release-assets
-
-      # needs.build.outputs.* 不是 runner 内置环境变量，显式经 `env:` 传入；
-      # $GITHUB_REF_NAME/$GITHUB_REPOSITORY 是内置环境变量，直接引用即可。
-      - name: gh release create
+      # No artifact download, asset upload, Apple credentials or signing here.
+      # Refuse an existing published release or draft for this tag before create.
+      - name: Create empty draft release
         env:
           GH_TOKEN: ${{ github.token }}
-          ARCHIVE: ${{ needs.build.outputs.archive }}
-          CHECKSUM: ${{ needs.build.outputs.checksum }}
         run: |
           set -euo pipefail
+          existing_tags="$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases" --jq '.[].tag_name')"
+          if printf '%s\n' "$existing_tags" | grep -Fx -- "$GITHUB_REF_NAME" >/dev/null; then
+            echo "A release or draft already exists for this tag" >&2
+            exit 1
+          fi
           gh release create "$GITHUB_REF_NAME" \
-            "$ARCHIVE" \
-            "$CHECKSUM" \
             --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --draft \
             --title "$GITHUB_REF_NAME" \
             --generate-notes
