@@ -78,7 +78,9 @@ pub fn inspect(input: &str, ctx: &InspectCtx) -> InspectResponse {
         };
     }
     let units: Vec<u16> = input.encode_utf16().collect();
-    let mut hits = scan_view(&normalize::fold_keeping_ignorables(&units));
+    // 原文视图保证 base 覆盖不丢；两个折叠视图负责补隐形插入与全角/横线变体。
+    let mut hits = scan_view(&normalize::identity(&units));
+    hits.extend(scan_view(&normalize::fold_keeping_ignorables(&units)));
     hits.extend(scan_view(&normalize::normalize(&units)));
     // 同一原文区间只留一条。敏感度取更严的那条，避免并集把 S3 降成 S2。
     hits.sort_by_key(|hit| {
