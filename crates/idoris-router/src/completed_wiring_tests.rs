@@ -148,6 +148,7 @@ async fn local_supervisor_records_one_content_free_completed_success() {
             .collect::<Vec<_>>(),
         vec![
             EventType::RequestReceived,
+            EventType::Inspected,
             EventType::Profiled,
             EventType::Decided,
             EventType::Dispatched,
