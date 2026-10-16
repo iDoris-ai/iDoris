@@ -12,6 +12,7 @@
 
 pub mod budget;
 pub mod card;
+pub mod inspect;
 pub mod pipeline;
 pub mod privacy;
 pub mod registry;
