@@ -168,6 +168,9 @@ allowed_egress: [loopback]
 fallback_policy: fail_closed
 fail_closed: true
 load_policy: {{ mode: resident, keepalive: {{ pinned: true }}, admission: coexist }}
+extensions:
+  _degradation: Removing bindings disables aliases.
+  idoris_role_models: {{ daily: fixture-chat }}
 "#,
         upstream.uri()
     ))
