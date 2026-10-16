@@ -1347,6 +1347,7 @@ async fn list_models(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         &state.cards,
         &state.models_health,
         &state.subscriptions,
+        state.remote_kill_switch.load(Ordering::SeqCst),
     )
     .await
     {

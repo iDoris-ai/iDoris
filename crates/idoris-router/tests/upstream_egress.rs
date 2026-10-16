@@ -104,6 +104,7 @@ async fn upstream_redirects_never_reach_the_other_origin() {
             &state.http_client,
             &[card(&origin.uri())],
             &state.models_health,
+            false,
         )
         .await
         .unwrap();
