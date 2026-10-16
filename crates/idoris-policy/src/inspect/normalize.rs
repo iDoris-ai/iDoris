@@ -1,9 +1,11 @@
 //! L0 逃逸归一化（docs/15 §1.6 隐形类）：扫描前把全角 ASCII 折回半角、各种
-//! 横线统一成 `-`、全角空格变成空格，并去掉零宽/格式字符；命中位置再映射回
-//! 原文的 UTF-16 坐标，所以契约里的 span 永远指向调用方给的那段原文。
+//! 横线统一成 `-`、全角空格变成空格，并去掉 Unicode `Default_Ignorable_Code_Point`
+//! （含非 BMP 的 TAG / 变体选择符等）；命中位置再映射回原文的 UTF-16 坐标，
+//! 所以契约里的 span 永远指向调用方给的那段原文。
 //!
-//! 被删掉的零宽字符如果夹在一个命中中间，会被包含在映射回去的 span 里——
+//! 被删掉的可忽略字符如果夹在一个命中中间，会被包含在映射回去的 span 里——
 //! span 覆盖的是「从命中的第一个字符到最后一个字符」的原文区间。
+//! 代理对整对丢弃；孤立的高/低代理保留，绝不半对丢弃。
 
 pub(super) struct Normalized {
     pub units: Vec<u16>,
@@ -11,15 +13,83 @@ pub(super) struct Normalized {
     origin: Vec<usize>,
 }
 
+/// Unicode DerivedCoreProperties.txt `Default_Ignorable_Code_Point`
+/// （覆盖 BMP 与补充平面；含保留码位按属性表一并忽略）。
+fn is_default_ignorable(cp: u32) -> bool {
+    matches!(
+        cp,
+        0x00AD
+            | 0x034F
+            | 0x061C
+            | 0x115F..=0x1160
+            | 0x17B4..=0x17B5
+            | 0x180B..=0x180F
+            | 0x200B..=0x200F
+            | 0x202A..=0x202E
+            | 0x2060..=0x206F
+            | 0x3164
+            | 0xFE00..=0xFE0F
+            | 0xFEFF
+            | 0xFFA0
+            | 0xFFF0..=0xFFF8
+            | 0x1BCA0..=0x1BCA3
+            | 0x1D173..=0x1D17A
+            | 0xE0000..=0xE0FFF
+    )
+}
+
+fn is_high_surrogate(u: u16) -> bool {
+    (0xD800..=0xDBFF).contains(&u)
+}
+
+fn is_low_surrogate(u: u16) -> bool {
+    (0xDC00..=0xDFFF).contains(&u)
+}
+
+fn decode_surrogate_pair(high: u16, low: u16) -> u32 {
+    0x10000 + ((u32::from(high) - 0xD800) << 10) + (u32::from(low) - 0xDC00)
+}
+
 pub(super) fn normalize(units: &[u16]) -> Normalized {
     let mut out = Normalized {
         units: Vec::with_capacity(units.len()),
         origin: Vec::with_capacity(units.len()),
     };
-    for (i, &u) in units.iter().enumerate() {
+    let mut i = 0;
+    while i < units.len() {
+        let u = units[i];
+
+        // 完整代理对：按标量值判断是否 Default_Ignorable；是则整对丢掉。
+        if is_high_surrogate(u) {
+            if let Some(&low) = units.get(i + 1) {
+                if is_low_surrogate(low) {
+                    let cp = decode_surrogate_pair(u, low);
+                    if is_default_ignorable(cp) {
+                        i += 2;
+                        continue;
+                    }
+                    out.units.push(u);
+                    out.origin.push(i);
+                    out.units.push(low);
+                    out.origin.push(i + 1);
+                    i += 2;
+                    continue;
+                }
+            }
+            // 孤立高代理：保留，绝不半对丢弃。
+            out.units.push(u);
+            out.origin.push(i);
+            i += 1;
+            continue;
+        }
+
+        // BMP（含孤立低代理）：按单 unit 判断。
+        if is_default_ignorable(u32::from(u)) {
+            i += 1;
+            continue;
+        }
+
         let folded = match u {
-            // ZWSP/ZWNJ/ZWJ、WORD JOINER、BOM/ZWNBSP、软连字符：不可见，直接丢掉。
-            0x200B..=0x200D | 0x2060 | 0xFEFF | 0x00AD => continue,
             // 全角 ASCII（！到～）折回半角。
             0xFF01..=0xFF5E => u - 0xFEE0,
             // 全角空格。
@@ -30,6 +100,7 @@ pub(super) fn normalize(units: &[u16]) -> Normalized {
         };
         out.units.push(folded);
         out.origin.push(i);
+        i += 1;
     }
     out
 }
