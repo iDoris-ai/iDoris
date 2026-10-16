@@ -3300,6 +3300,9 @@ mod protocol_inspected_wiring_tests;
 mod kill_switch_wiring_tests;
 
 #[cfg(test)]
+mod budget_concurrency_wiring_tests;
+
+#[cfg(test)]
 mod local_privacy_tests;
 
 #[cfg(test)]
