@@ -2,15 +2,21 @@
 //!
 //! 对每个长得像编码串的 token 解码**一层**，解出合法 UTF-8 就用同一套 L0
 //! （先归一化再扫描）检查解码后的文本；有命中就按命中的类别和敏感度报告
-//! 整个编码串的原位置。只解一层：嵌套编码的成本无界，而且解不开的长随机串
-//! 已经由 B 组高熵规则兜住。
+//! 整个编码串的原位置。只解一层：嵌套编码的成本无界。
+//!
+//! 百分号编码：只要有 ≥ 1 个合法 `%XX` 就解码；非法 `%`（如 `%ZZ`）原样保留并
+//! 继续扫描，避免一个坏转义把整段合法内容抹掉。短百分号密钥（例如一个转义
+//! 藏起 `sk-`）不依赖高熵规则。
+//!
+//! 已知缺口（不在本层覆盖）：UTF-16LE base64（如 PowerShell `-EncodedCommand`）
+//! 解出的数字被 NUL 隔开；按 76 列折行的 MIME/PEM base64 跨行密钥。
 
 use super::Hit;
 
 /// 至少编码 9 个字节才值得解（短于 12 个字符的 base64 太容易撞上普通词）。
 const MIN_BASE64: usize = 12;
 const MIN_HEX: usize = 16;
-const MIN_PERCENT_ESCAPES: usize = 3;
+const MIN_PERCENT_ESCAPES: usize = 1;
 
 pub(super) fn scan(units: &[u16], hits: &mut Vec<Hit>) {
     // base64/hex: the base64url-or-standard alphabet plus up to two `=` of
@@ -84,11 +90,17 @@ fn decode_percent(token: &[u8]) -> Option<Vec<u8>> {
     while i < token.len() {
         match token[i] {
             b'%' => {
-                let hi = hex_value(*token.get(i + 1)?)?;
-                let lo = hex_value(*token.get(i + 2)?)?;
-                out.push(hi << 4 | lo);
-                escapes += 1;
-                i += 3;
+                let hi = token.get(i + 1).copied().and_then(hex_value);
+                let lo = token.get(i + 2).copied().and_then(hex_value);
+                if let (Some(hi), Some(lo)) = (hi, lo) {
+                    out.push(hi << 4 | lo);
+                    escapes += 1;
+                    i += 3;
+                } else {
+                    // Keep scanning: one bad `%` must not discard a valid prefix.
+                    out.push(b'%');
+                    i += 1;
+                }
             }
             b'+' => {
                 out.push(b' ');

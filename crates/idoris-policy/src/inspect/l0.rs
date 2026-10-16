@@ -93,8 +93,18 @@ pub(super) fn scan_plain(units: &[u16]) -> Vec<Hit> {
 }
 
 fn sort_dedup(mut hits: Vec<Hit>) -> Vec<Hit> {
+    // Same (kind, start, length) may arrive at different sensitivities (e.g. a
+    // hex-encoded bad-checksum ID + valid ID both map to the whole encoded
+    // token). Keep the higher sensitivity so S3/Block is never downgraded.
     hits.sort_by_key(|hit| (hit.start, hit.length, hit.kind as u8));
-    hits.dedup_by_key(|hit| (hit.kind, hit.start, hit.length));
+    hits.dedup_by(|later, kept| {
+        if later.kind == kept.kind && later.start == kept.start && later.length == kept.length {
+            kept.sensitivity = kept.sensitivity.max(later.sensitivity);
+            true
+        } else {
+            false
+        }
+    });
     hits
 }
 

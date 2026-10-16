@@ -1,0 +1,2 @@
+timestamp	task_id	attempt_id	decision	reason
+2026-10-16T08:46:16Z	idoris-grokbot-pr435-decode-20261016	8e4d2b71-0c55-4a18-93d2-1f7a6b9033aa	fix_e1_e2_e3	E1 keep max sensitivity in sort_dedup; E2 MIN_PERCENT_ESCAPES=1; E3 keep decoding after malformed percent escape; added inspect regression tests

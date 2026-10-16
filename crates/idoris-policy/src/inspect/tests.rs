@@ -623,10 +623,61 @@ fn harmless_encoded_text_and_plain_words_stay_clean() {
         "configuration-management_v2",
         "deadbeefcafebabe0011223344556677",
         "q=%E4%BD%A0%E5%A5%BD",
+        // single escape that does not hide a secret stays clean
+        "100%25 of users",
     ] {
         let response = inspect(input, &open_ctx());
         assert!(response.findings.is_empty(), "{input}: {response:?}");
     }
+}
+
+/// E1: hex of (bad-checksum ID + valid ID) must keep S3/Block, not collapse to S2/Redact.
+#[test]
+fn encoded_mixed_id_checksums_keep_max_sensitivity() {
+    let plain = "11010519491231003X 11010519491231002X";
+    let plain_response = inspect(plain, &open_ctx());
+    assert_eq!(plain_response.sensitivity, Sensitivity::S3);
+    assert_eq!(plain_response.action, InspectAction::Block);
+
+    let hex = "31313031303531393439313233313030335820313130313035313934393132333130303258";
+    let response = inspect(hex, &open_ctx());
+    assert!(
+        kinds(&response).contains(&FindingKind::CnResidentId),
+        "{response:?}"
+    );
+    assert_eq!(response.sensitivity, Sensitivity::S3, "{response:?}");
+    assert_eq!(response.action, InspectAction::Block, "{response:?}");
+}
+
+/// E2: a single percent-escape must not hide an `sk-` API key as Allow.
+#[test]
+fn single_percent_escape_does_not_hide_api_key() {
+    let encoded = "%73k-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let response = inspect(encoded, &open_ctx());
+    assert!(
+        kinds(&response).contains(&FindingKind::ApiKey),
+        "{response:?}"
+    );
+    assert_eq!(response.sensitivity, Sensitivity::S3, "{response:?}");
+    assert_eq!(response.action, InspectAction::Block, "{response:?}");
+}
+
+/// E3: a malformed escape after a valid percent-encoded phone must not wipe the hit.
+#[test]
+fn malformed_percent_escape_does_not_discard_valid_prefix() {
+    let phone = "%31%33%38%31%32%33%34%35%36%37%38";
+    let good = inspect(phone, &open_ctx());
+    assert_eq!(good.action, InspectAction::Redact, "{good:?}");
+    assert_eq!(good.sensitivity, Sensitivity::S2, "{good:?}");
+
+    let with_junk = format!("{phone}%ZZ");
+    let response = inspect(&with_junk, &open_ctx());
+    assert!(
+        kinds(&response).contains(&FindingKind::CnMobile),
+        "{response:?}"
+    );
+    assert_eq!(response.sensitivity, Sensitivity::S2, "{response:?}");
+    assert_eq!(response.action, InspectAction::Redact, "{response:?}");
 }
 
 fn valid_id() -> impl Strategy<Value = String> {
