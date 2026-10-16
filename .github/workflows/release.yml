@@ -133,7 +133,7 @@ jobs:
         run: |
           set -euo pipefail
           existing_tags="$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases" --jq '.[].tag_name')"
-          if printf '%s\n' "$existing_tags" | grep -Fx -- "$GITHUB_REF_NAME" >/dev/null; then
+          if grep -Fxq -- "$GITHUB_REF_NAME" <<<"$existing_tags"; then
             echo "A release or draft already exists for this tag" >&2
             exit 1
           fi
