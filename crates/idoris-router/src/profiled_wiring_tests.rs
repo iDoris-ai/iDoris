@@ -46,7 +46,7 @@ async fn profiled_follows_request_received_with_resolved_safe_metadata() {
         .into_iter()
         .filter(|row| row.event.event_type != EventType::AuditFinalized)
         .collect::<Vec<_>>();
-    assert_eq!(events.len(), 3);
+    assert_eq!(events.len(), 4);
     assert_eq!(events[0].event.event_type, EventType::RequestReceived);
     assert_eq!(events[1].event.event_type, EventType::Inspected);
     assert_eq!(events[2].event.event_type, EventType::Profiled);
@@ -177,7 +177,7 @@ async fn profiled_append_failure_is_generic_503_before_budget_or_upstream() {
         .into_iter()
         .filter(|row| row.event.event_type != EventType::AuditFinalized)
         .collect::<Vec<_>>();
-    assert_eq!(events.len(), 1);
+    assert_eq!(events.len(), 2);
     assert_eq!(events[0].event.event_type, EventType::RequestReceived);
     assert_eq!(events[1].event.event_type, EventType::Inspected);
     let after = ledger.tenant_readview(budget::PERSONAL_TENANT_ID).unwrap();

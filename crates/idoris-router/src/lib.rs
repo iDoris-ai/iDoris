@@ -623,6 +623,8 @@ fn model_resolution_error(error: DispatchError) -> Response {
             "backend model resolution failed",
         ),
     }
+}
+
 /// Effective privacy for a protocol endpoint body after gate one
 /// ([`inspect::inspect_body`]). These endpoints keep no Event Log chain
 /// yet, so the verdict only tightens routing.

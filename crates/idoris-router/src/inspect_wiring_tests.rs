@@ -406,15 +406,17 @@ async fn invalid_privacy_and_missing_tenant_are_profile_errors() {
         deploy_mode: idoris_contracts::DeployMode::Tenant,
         ..AppState::default()
     });
-    let (status, text) = send(&tenant_app, inspect_request(&body, &[])).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert!(text.contains("tenant_missing"), "{text}");
+    // Tenant mode without any authenticator is default-deny on main: both the
+    // missing-tenant and the forged-tenant-header cases are rejected before any
+    // profile or inspection work.
+    let (status, _) = send(&tenant_app, inspect_request(&body, &[])).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
     let (status, _) = send(
         &tenant_app,
         inspect_request(&body, &[("x-idoris-tenant", "acme")]),
     )
     .await;
-    assert_eq!(status, StatusCode::OK);
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
 
 fn authenticated_app(allowed_privacy: Vec<PrivacyClass>, roles: &[&str]) -> (Router, String) {
@@ -424,6 +426,8 @@ fn authenticated_app(allowed_privacy: Vec<PrivacyClass>, roles: &[&str]) -> (Rou
     ));
     let scope = VirtualKeyScope {
         owner: "agent24-instance".into(),
+        // Legacy personal key: main's tenant authority field stays unbound here.
+        tenant_id: None,
         allowed_privacy,
         allowed_roles: roles.iter().map(|role| (*role).to_string()).collect(),
         budget_ref: None,
