@@ -71,6 +71,13 @@ fn resident_card(endpoint: &str) -> ComponentCard {
         keepalive: idoris_contracts::load_policy::Keepalive::Pinned { pinned: true },
         admission: idoris_contracts::load_policy::Admission::Coexist,
     });
+    card.extensions = Some(
+        serde_json::from_value(serde_json::json!({
+            "_degradation": "Removing these bindings disables aliases.",
+            "idoris_role_models": {"daily": "sse-test", "fast": "sse-test"}
+        }))
+        .unwrap(),
+    );
     card
 }
 
