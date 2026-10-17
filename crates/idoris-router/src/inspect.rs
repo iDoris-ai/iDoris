@@ -96,6 +96,8 @@ pub(crate) struct Inspection {
     pub killed: bool,
     /// Unreadable content, with no L0 finding, is what pinned `any`.
     pub uninspectable: bool,
+    /// The scan itself did not complete (docs/15 §1.5 `inspect_failed`).
+    pub failed: bool,
 }
 
 /// Inspects every object key, string and number in `body` — content parts,
@@ -173,9 +175,48 @@ pub(crate) fn inspect_body(
     Inspection {
         killed: tightened && kill_switch,
         uninspectable: tightened && opaque && !kill_switch && response.findings.is_empty(),
+        failed: false,
         tightened,
         response,
         effective,
+    }
+}
+
+/// Bodies at least this large are scanned on the blocking pool: a 256K
+/// adversarial body takes ~150 ms, too long to hold an async worker.
+const OFF_WORKER_BYTES: usize = 32 * 1024;
+
+/// [`inspect_body`] for a request path: small bodies inline, large ones on
+/// the blocking pool. If the blocking task fails the request is pinned to
+/// `local_only` with `reason=inspect_failed` (docs/15 §1.5) — a scanner
+/// failure never lets content out.
+pub(crate) async fn inspect_body_on_request_path(
+    body: &serde_json::Value,
+    raw_len: usize,
+    declared: PrivacyClass,
+    kill_switch: bool,
+) -> Inspection {
+    if raw_len < OFF_WORKER_BYTES {
+        return inspect_body(body, declared, kill_switch);
+    }
+    let owned = body.clone();
+    tokio::task::spawn_blocking(move || inspect_body(&owned, declared, kill_switch))
+        .await
+        .unwrap_or_else(|_| failed_inspection(declared))
+}
+
+fn failed_inspection(declared: PrivacyClass) -> Inspection {
+    Inspection {
+        response: idoris_contracts::InspectResponse {
+            sensitivity: idoris_contracts::inspect::Sensitivity::S3,
+            findings: Vec::new(),
+            action: idoris_contracts::inspect::InspectAction::Block,
+        },
+        effective: PrivacyClass::LocalOnly,
+        tightened: declared == PrivacyClass::Any,
+        killed: false,
+        uninspectable: false,
+        failed: true,
     }
 }
 
@@ -223,7 +264,9 @@ pub(crate) async fn append_inspected(
     );
     metadata.insert("labels".to_string(), serde_json::Value::Array(labels));
     if inspection.tightened {
-        let reason = if inspection.killed {
+        let reason = if inspection.failed {
+            "inspect_failed"
+        } else if inspection.killed {
             "remote_kill_switch"
         } else if inspection.uninspectable {
             "uninspectable_content"
@@ -251,4 +294,37 @@ pub(crate) async fn append_inspected(
         metadata,
     };
     crate::run_event_log_write(move || store.append(Some(&tenant_id), &event).map(|_| ())).await
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+
+    use super::*;
+
+    #[tokio::test]
+    async fn large_bodies_are_scanned_off_the_worker_with_the_same_verdict() {
+        let filler = "x".repeat(OFF_WORKER_BYTES);
+        let body =
+            serde_json::json!({"messages": [{"content": filler}, {"content": "电话 13812345678"}]});
+        let raw_len = serde_json::to_vec(&body).unwrap().len();
+        assert!(raw_len >= OFF_WORKER_BYTES);
+        let off = inspect_body_on_request_path(&body, raw_len, PrivacyClass::Any, false).await;
+        let inline = inspect_body(&body, PrivacyClass::Any, false);
+        assert_eq!(off.response, inline.response);
+        assert_eq!(off.effective, PrivacyClass::LocalOnly);
+        assert!(off.tightened && !off.failed);
+    }
+
+    #[test]
+    fn a_failed_scan_pins_local_only() {
+        let failed = failed_inspection(PrivacyClass::Any);
+        assert_eq!(failed.effective, PrivacyClass::LocalOnly);
+        assert!(failed.tightened && failed.failed);
+        assert_eq!(
+            failed.response.action,
+            idoris_contracts::inspect::InspectAction::Block
+        );
+        assert!(!failed_inspection(PrivacyClass::LocalOnly).tightened);
+    }
 }
