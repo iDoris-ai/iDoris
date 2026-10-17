@@ -4,6 +4,7 @@
 #![allow(clippy::unwrap_used)]
 
 use axum::http::StatusCode;
+use http_body_util::BodyExt;
 use idoris_tenancy::event_log::{EventLogStore, EventType};
 use rusqlite::Connection;
 use tower::ServiceExt;
@@ -29,6 +30,7 @@ async fn failing_local_upstream_is_not_contacted_once_its_breaker_opens() {
 
     let mut last_record = String::new();
     let mut statuses = Vec::new();
+    let mut refusals = Vec::new();
     for _ in 0..3 {
         let response = app.clone().oneshot(post_chat(body, &[])).await.unwrap();
         statuses.push(response.status());
@@ -39,6 +41,8 @@ async fn failing_local_upstream_is_not_contacted_once_its_breaker_opens() {
             .to_str()
             .unwrap()
             .to_string();
+        let body_bytes = response.into_body().collect().await.unwrap().to_bytes();
+        refusals.push(serde_json::from_slice::<serde_json::Value>(&body_bytes).ok());
     }
     assert_eq!(
         statuses,
@@ -49,6 +53,17 @@ async fn failing_local_upstream_is_not_contacted_once_its_breaker_opens() {
         ]
     );
     assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    // The all-open case must stay the retryable `provider_circuit_open` from the
+    // proxy send gate. Marking every open provider `Blocked` during selection
+    // turned it into `no_eligible_candidate`, which clients read as "no such
+    // model" rather than "cooling down, retry" - a contract change.
+    let Some(refusal) = refusals[2].as_ref() else {
+        panic!("refusal body is not JSON");
+    };
+    assert_eq!(
+        refusal["error"]["type"], "provider_circuit_open",
+        "all-open chat must answer the retryable breaker reason, got {refusal}"
+    );
     let refused = event_log
         .events_for_record(Some(budget::PERSONAL_TENANT_ID), &last_record)
         .unwrap();
