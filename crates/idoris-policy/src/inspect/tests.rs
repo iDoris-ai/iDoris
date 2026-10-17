@@ -837,11 +837,32 @@ proptest! {
         ],
         lead in prop_oneof![Just(""), Just("1"), Just("１"), Just("a"), Just("ａ"), Just("-"), Just("\u{2010}")],
         trail in prop_oneof![Just(""), Just("9"), Just("１"), Just("x"), Just("ｘ"), Just("-")],
+        // One representative per `Default_Ignorable_Code_Point` range, so every
+        // range in `normalize::is_default_ignorable` is load-bearing: dropping a
+        // range from that table makes this property fail.
         inner in proptest::collection::vec(
             prop_oneof![
-                Just('\u{200B}'), Just('\u{200E}'), Just('\u{200F}'),
-                Just('\u{2068}'), Just('\u{2069}'), Just('\u{00AD}'),
-                Just('\u{FEFF}'), Just('\u{E0020}'),
+                Just('\u{00AD}'),   // 0x00AD
+                Just('\u{034F}'),   // 0x034F
+                Just('\u{061C}'),   // 0x061C
+                Just('\u{115F}'),   // 0x115F..=0x1160
+                Just('\u{17B4}'),   // 0x17B4..=0x17B5
+                Just('\u{180B}'),   // 0x180B..=0x180F
+                Just('\u{200B}'),   // 0x200B..=0x200F
+                Just('\u{200E}'),
+                Just('\u{200F}'),
+                Just('\u{202A}'),   // 0x202A..=0x202E
+                Just('\u{2060}'),   // 0x2060..=0x206F
+                Just('\u{2068}'),
+                Just('\u{2069}'),
+                Just('\u{3164}'),   // 0x3164
+                Just('\u{FE00}'),   // 0xFE00..=0xFE0F
+                Just('\u{FEFF}'),   // 0xFEFF
+                Just('\u{FFA0}'),   // 0xFFA0
+                Just('\u{FFF0}'),   // 0xFFF0..=0xFFF8
+                Just('\u{1BCA0}'),  // 0x1BCA0..=0x1BCA3 (non-BMP)
+                Just('\u{1D173}'),  // 0x1D173..=0x1D17A (non-BMP)
+                Just('\u{E0020}'),  // 0xE0000..=0xE0FFF (TAG, non-BMP)
             ],
             0..3,
         ),
@@ -983,5 +1004,65 @@ proptest! {
         prop_assert!(found, "{} {:?}", input, response);
         prop_assert_eq!(response.sensitivity, Sensitivity::S3);
         prop_assert_eq!(response.action, InspectAction::Block);
+    }
+}
+
+/// Absolute guard for the `Default_Ignorable_Code_Point` drop list.
+///
+/// The union property above compares the union against each view, so it cannot
+/// notice a range disappearing from `is_default_ignorable`: when a code point is
+/// no longer dropped, the *strip* view stops dropping it too and the property
+/// still holds — even though the "ignorable inserted inside an entity" capability
+/// is gone. This test pins the capability itself, with one hard-coded
+/// representative per range so the table and the guard cannot drift together.
+#[test]
+fn every_default_ignorable_range_still_breaks_an_entity_insertion() {
+    // Independent copy of the ranges; deliberately not derived from the table.
+    const RANGES: &[char] = &[
+        '\u{00AD}',
+        '\u{034F}',
+        '\u{061C}',
+        '\u{115F}',
+        '\u{17B4}',
+        '\u{180B}',
+        '\u{200B}',
+        '\u{200E}',
+        '\u{200F}',
+        '\u{202A}',
+        '\u{2060}',
+        '\u{2068}',
+        '\u{2069}',
+        '\u{3164}',
+        '\u{FE00}',
+        '\u{FEFF}',
+        '\u{FFA0}',
+        '\u{FFF0}',
+        '\u{1BCA0}',
+        '\u{1D173}',
+        '\u{E0020}',
+    ];
+    let ctx = open_ctx();
+    for ch in RANGES {
+        let mobile = format!("138{ch}1234{ch}5678");
+        let response = inspect(&mobile, &ctx);
+        assert_ne!(
+            response.action,
+            InspectAction::Allow,
+            "U+{:04X} inserted inside a mobile was not detected: {response:?}",
+            *ch as u32
+        );
+        assert!(
+            kinds(&response).contains(&FindingKind::CnMobile),
+            "U+{:04X} must still yield CnMobile: {response:?}",
+            *ch as u32
+        );
+
+        let id = format!("110105{ch}19491231002X");
+        let response = inspect(&id, &ctx);
+        assert!(
+            kinds(&response).contains(&FindingKind::CnResidentId),
+            "U+{:04X} inserted inside a resident id was not detected: {response:?}",
+            *ch as u32
+        );
     }
 }
