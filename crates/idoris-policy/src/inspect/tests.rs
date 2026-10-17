@@ -878,6 +878,243 @@ fn credential_file_paths() {
     }
 }
 
+#[test]
+fn full_width_and_dash_variants_are_folded_before_scanning() {
+    let cases = [
+        ("１３８１２３４５６７８", FindingKind::CnMobile),
+        ("138－1234－5678", FindingKind::CnMobile),
+        ("138–1234—5678", FindingKind::CnMobile),
+        (
+            "6222\u{3000}0212\u{3000}3456\u{3000}7894",
+            FindingKind::BankCard,
+        ),
+        (
+            "１１０１０５１９４９１２３１００２Ｘ",
+            FindingKind::CnResidentId,
+        ),
+        (
+            "ａｌｉｃｅ＠ｅｘａｍｐｌｅ．ｃｏｍ",
+            FindingKind::EmailAddress,
+        ),
+    ];
+    for (evasive, kind) in cases {
+        let input = format!("看这里：{evasive}。");
+        let response = inspect(&input, &open_ctx());
+        let hit = response.findings.iter().find(|f| f.kind == kind);
+        // The span points at the caller's original text, not the folded copy.
+        assert_eq!(
+            hit.map(|f| covered(&input, f)),
+            Some(evasive.to_string()),
+            "{input}: {response:?}"
+        );
+    }
+}
+
+#[test]
+fn zero_width_characters_inside_an_entity_do_not_hide_it() {
+    let input = "身份证 1101051949\u{200B}1231\u{2060}002X 和 sk\u{200D}-proj-FwFvrdcwEcSaT3WQwn8QMH2iE6bao4pjmx5ZTDNsbiqASwXU";
+    let response = inspect(input, &open_ctx());
+    let id = response
+        .findings
+        .iter()
+        .find(|f| f.kind == FindingKind::CnResidentId)
+        .unwrap();
+    assert_eq!(covered(input, id), "1101051949\u{200B}1231\u{2060}002X");
+    assert!(
+        kinds(&response).contains(&FindingKind::ApiKey),
+        "{response:?}"
+    );
+    assert_eq!(response.sensitivity, Sensitivity::S3);
+}
+
+/// Default_Ignorable insertions that the closed 6-codepoint list missed.
+/// Each must match the clean string's verdict and keep the insert inside the span.
+#[test]
+fn default_ignorable_insertions_do_not_hide_id_or_mobile() {
+    // TAG SPACE, LANGUAGE TAG, VS17, VS16, INVISIBLE SEPARATOR, LRM,
+    // COMBINING GRAPHEME JOINER, MONGOLIAN VOWEL SEPARATOR, soft hyphen, ZWNJ.
+    let inserts = [
+        '\u{E0020}',
+        '\u{E0001}',
+        '\u{E0100}',
+        '\u{FE0F}',
+        '\u{2063}',
+        '\u{200E}',
+        '\u{034F}',
+        '\u{180E}',
+        '\u{00AD}',
+        '\u{200C}',
+    ];
+    let clean_id = "11010519491231002X";
+    let clean_mobile = "13812345678";
+    let clean_id_resp = inspect(clean_id, &open_ctx());
+    let clean_mobile_resp = inspect(clean_mobile, &open_ctx());
+    assert_ne!(clean_id_resp.action, InspectAction::Allow);
+    assert_ne!(clean_mobile_resp.action, InspectAction::Allow);
+
+    for insert in inserts {
+        let noisy_id = format!("1101{insert}0519491231002X");
+        let id_resp = inspect(&noisy_id, &open_ctx());
+        assert_eq!(
+            id_resp.action, clean_id_resp.action,
+            "id insert {insert:?}: {id_resp:?}"
+        );
+        assert_ne!(id_resp.action, InspectAction::Allow, "id insert {insert:?}");
+        let id_hit = id_resp
+            .findings
+            .iter()
+            .find(|f| f.kind == FindingKind::CnResidentId)
+            .unwrap_or_else(|| panic!("id insert {insert:?}: {id_resp:?}"));
+        assert_eq!(
+            covered(&noisy_id, id_hit),
+            noisy_id,
+            "id span must cover insert {insert:?}"
+        );
+
+        let noisy_mobile = format!("138{insert}12345678");
+        let mobile_resp = inspect(&noisy_mobile, &open_ctx());
+        assert_eq!(
+            mobile_resp.action, clean_mobile_resp.action,
+            "mobile insert {insert:?}: {mobile_resp:?}"
+        );
+        assert_ne!(
+            mobile_resp.action,
+            InspectAction::Allow,
+            "mobile insert {insert:?}"
+        );
+        let mobile_hit = mobile_resp
+            .findings
+            .iter()
+            .find(|f| f.kind == FindingKind::CnMobile)
+            .unwrap_or_else(|| panic!("mobile insert {insert:?}: {mobile_resp:?}"));
+        let covered_mobile = covered(&noisy_mobile, mobile_hit);
+        assert!(
+            covered_mobile.contains(insert) || covered_mobile == noisy_mobile,
+            "mobile span must cover insert {insert:?}: got {covered_mobile:?}"
+        );
+    }
+}
+
+/// 可忽略字符夹在两个 ASCII 记号之间时，不能把它们粘成一个更长的 run。
+/// 纯删除会让这些行变成 Allow；实体内部的插入仍然要能命中，span 盖住插入。
+#[test]
+fn ignorable_between_ascii_tokens_does_not_join_away_the_entity() {
+    let key = format!("sk-{}", "a".repeat(40));
+    let rows = [
+        (
+            format!("Key\u{2068}{key}\u{2069}"),
+            InspectAction::Block,
+            FindingKind::ApiKey,
+            key.clone(),
+        ),
+        (
+            "\u{2068}1\u{2069}\u{2068}13812345678\u{2069}".to_string(),
+            InspectAction::Redact,
+            FindingKind::CnMobile,
+            "13812345678".to_string(),
+        ),
+        (
+            "1\u{200E}13812345678".to_string(),
+            InspectAction::Redact,
+            FindingKind::CnMobile,
+            "13812345678".to_string(),
+        ),
+        (
+            "2\u{200F}13812345678".to_string(),
+            InspectAction::Redact,
+            FindingKind::CnMobile,
+            "13812345678".to_string(),
+        ),
+        (
+            "13812345678\u{200E}9".to_string(),
+            InspectAction::Redact,
+            FindingKind::CnMobile,
+            "13812345678".to_string(),
+        ),
+        (
+            format!("a\u{200E}{key}"),
+            InspectAction::Block,
+            FindingKind::ApiKey,
+            key.clone(),
+        ),
+    ];
+    for (input, action, kind, entity) in rows {
+        let response = inspect(&input, &open_ctx());
+        assert_ne!(
+            response.action,
+            InspectAction::Allow,
+            "{input:?} {response:?}"
+        );
+        assert_eq!(response.action, action, "{input:?} {response:?}");
+        let hit = response
+            .findings
+            .iter()
+            .find(|f| f.kind == kind && covered(&input, f) == entity)
+            .unwrap_or_else(|| {
+                panic!("{input:?} missing {kind:?} covering {entity}: {response:?}")
+            });
+        assert_eq!(covered(&input, hit), entity);
+    }
+
+    let split = "138\u{200B}1234\u{200B}5678";
+    let response = inspect(split, &open_ctx());
+    assert_eq!(response.action, InspectAction::Redact, "{response:?}");
+    let hit = response
+        .findings
+        .iter()
+        .find(|f| f.kind == FindingKind::CnMobile)
+        .unwrap();
+    assert_eq!(covered(split, hit), split);
+}
+
+#[test]
+fn soft_hyphen_and_zwnj_arms_each_have_a_dedicated_case() {
+    // Removing either arm alone must turn these red (mutation targets).
+    let soft = "138\u{00AD}12345678";
+    let zwnj = "138\u{200C}12345678";
+    for input in [soft, zwnj] {
+        let response = inspect(input, &open_ctx());
+        assert!(
+            kinds(&response).contains(&FindingKind::CnMobile),
+            "{input}: {response:?}"
+        );
+        assert_ne!(response.action, InspectAction::Allow, "{input}");
+        let hit = response
+            .findings
+            .iter()
+            .find(|f| f.kind == FindingKind::CnMobile)
+            .unwrap();
+        assert_eq!(covered(input, hit), input);
+    }
+}
+
+#[test]
+fn lone_high_surrogate_is_not_treated_as_default_ignorable() {
+    // U+DB40 is a high surrogate used by TAG / VS supplementary planes.
+    // A lone unit must be kept so we never drop half a pair.
+    let units = [
+        u16::from(b'1'),
+        u16::from(b'3'),
+        u16::from(b'8'),
+        0xDB40,
+        u16::from(b'1'),
+        u16::from(b'2'),
+        u16::from(b'3'),
+        u16::from(b'4'),
+        u16::from(b'5'),
+        u16::from(b'6'),
+        u16::from(b'7'),
+        u16::from(b'8'),
+    ];
+    let normalized = super::normalize::normalize(&units);
+    assert!(
+        normalized.units.contains(&0xDB40),
+        "lone high surrogate must survive: {:?}",
+        normalized.units
+    );
+    assert_eq!(normalized.units.len(), units.len());
+}
+
 fn valid_id() -> impl Strategy<Value = String> {
     (0usize..34, 1950u32..2030, 1u32..13, 1u32..29, 0u32..1000).prop_map(
         |(province, year, month, day, seq)| {
@@ -896,7 +1133,211 @@ fn valid_id() -> impl Strategy<Value = String> {
     )
 }
 
+fn sensitivity_rank(sensitivity: Sensitivity) -> u8 {
+    match sensitivity {
+        Sensitivity::S0 => 0,
+        Sensitivity::S1 => 1,
+        Sensitivity::S2 => 2,
+        Sensitivity::S3 => 3,
+    }
+}
+
+fn action_rank(action: InspectAction) -> u8 {
+    match action {
+        InspectAction::Allow => 0,
+        InspectAction::Redact => 1,
+        InspectAction::Block => 2,
+    }
+}
+
+/// 单视图的动作。坐标只用于把命中送进和 `inspect` 相同的 L2 判定。
+fn action_of_view(normalized: &super::normalize::Normalized, ctx: &InspectCtx) -> InspectAction {
+    let mut hits = super::l0::scan(&normalized.units);
+    for hit in &mut hits {
+        (hit.start, hit.length) = normalized.original_span(hit.start, hit.length);
+    }
+    let sensitivity = hits
+        .iter()
+        .map(|hit| hit.sensitivity)
+        .max()
+        .unwrap_or(Sensitivity::S0);
+    super::decide_action(&hits, sensitivity, ctx)
+}
+
+/// Findings of one view, mapped back to original coordinates.
+fn findings_of_view(normalized: &super::normalize::Normalized) -> Vec<(FindingKind, u64, u64)> {
+    let mut hits = super::l0::scan(&normalized.units);
+    for hit in &mut hits {
+        (hit.start, hit.length) = normalized.original_span(hit.start, hit.length);
+    }
+    hits.iter()
+        .map(|hit| (hit.kind, hit.start as u64, hit.length as u64))
+        .collect()
+}
+
 proptest! {
+    /// The union must never be looser than *any* of the three views, and it must
+    /// keep every entity each view found. Generated inputs deliberately mix the
+    /// three reasons the views exist:
+    ///
+    /// * a gluing char next to the entity (fullwidth digit, hyphen variant) -
+    ///   only the **raw** view sees through it, because folding joins the two;
+    /// * an ignorable before a fullwidth entity - only the **keep** view sees it,
+    ///   because the raw view has no folding and the strip view joins;
+    /// * an ignorable inside the entity - only the **strip** view sees it.
+    ///
+    /// So deleting any single view makes this property fail, not just the two it
+    /// used to compare.
+    #[test]
+    fn union_is_never_looser_than_any_single_view(
+        entity in prop_oneof![
+            Just("13812345678".to_string()),
+            Just("11010519491231002X".to_string()),
+            Just(format!("sk-{}", "a".repeat(40))),
+            Just("a@b.com".to_string()),
+        ],
+        lead in prop_oneof![Just(""), Just("1"), Just("１"), Just("a"), Just("ａ"), Just("-"), Just("\u{2010}")],
+        trail in prop_oneof![Just(""), Just("9"), Just("１"), Just("x"), Just("ｘ"), Just("-")],
+        // One representative per `Default_Ignorable_Code_Point` range. This is
+        // coverage, not a guard on the table: dropping a range from
+        // `normalize::is_default_ignorable` does NOT fail this property (the strip
+        // view stops dropping it too, so the union stays a superset). The table
+        // is guarded by `every_default_ignorable_range_still_breaks_an_entity_insertion`.
+        inner in proptest::collection::vec(
+            prop_oneof![
+                Just('\u{00AD}'),   // 0x00AD
+                Just('\u{034F}'),   // 0x034F
+                Just('\u{061C}'),   // 0x061C
+                Just('\u{115F}'),   // 0x115F..=0x1160
+                Just('\u{17B4}'),   // 0x17B4..=0x17B5
+                Just('\u{180B}'),   // 0x180B..=0x180F
+                Just('\u{200B}'),   // 0x200B..=0x200F
+                Just('\u{200E}'),
+                Just('\u{200F}'),
+                Just('\u{202A}'),   // 0x202A..=0x202E
+                Just('\u{2060}'),   // 0x2060..=0x206F
+                Just('\u{2068}'),
+                Just('\u{2069}'),
+                Just('\u{3164}'),   // 0x3164
+                Just('\u{FE00}'),   // 0xFE00..=0xFE0F
+                Just('\u{FEFF}'),   // 0xFEFF
+                Just('\u{FFA0}'),   // 0xFFA0
+                Just('\u{FFF0}'),   // 0xFFF0..=0xFFF8
+                Just('\u{1BCA0}'),  // 0x1BCA0..=0x1BCA3 (non-BMP)
+                Just('\u{1D173}'),  // 0x1D173..=0x1D17A (non-BMP)
+                Just('\u{E0020}'),  // 0xE0000..=0xE0FFF (TAG, non-BMP)
+            ],
+            0..3,
+        ),
+        fold_entity in any::<bool>(),
+        // A boundary-only ignorable *between* the lead and the entity. This is
+        // the shape that only the keep view catches: the raw view has no
+        // folding, and the strip view joins the lead to the entity.
+        pre in prop_oneof![
+            Just(""),
+            Just("\u{200B}"),
+            Just("\u{200E}"),
+            Just("\u{2068}"),
+        ],
+    ) {
+        // Sometimes widen the entity to fullwidth so folding is required at all.
+        let entity = if fold_entity {
+            entity.chars().map(|c| match c {
+                '0'..='9' => char::from_u32(c as u32 - b'0' as u32 + 0xFF10).unwrap_or(c),
+                'a'..='z' => char::from_u32(c as u32 - b'a' as u32 + 0xFF41).unwrap_or(c),
+                'A'..='Z' => char::from_u32(c as u32 - b'A' as u32 + 0xFF21).unwrap_or(c),
+                other => other,
+            }).collect::<String>()
+        } else {
+            entity
+        };
+        let mut text = String::from(lead);
+        text.push_str(pre);
+        // Insert the ignorables inside the entity when it is long enough.
+        let mut inserted = 0usize;
+        for (index, ch) in entity.chars().enumerate() {
+            if inserted < inner.len() && index == (inserted + 1) * 4 {
+                text.push(inner[inserted]);
+                inserted += 1;
+            }
+            text.push(ch);
+        }
+        while inserted < inner.len() {
+            text.push(inner[inserted]);
+            inserted += 1;
+        }
+        text.push_str(trail);
+
+        let units: Vec<u16> = text.encode_utf16().collect();
+        let ctx = open_ctx();
+        let merged = inspect(&text, &ctx);
+        let merged_findings: Vec<(FindingKind, u64, u64)> = merged
+            .findings
+            .iter()
+            .map(|finding| {
+                let span = finding.span.unwrap_or(idoris_contracts::inspect::InspectSpan {
+                    start: 0,
+                    length: 0,
+                });
+                (finding.kind, span.start, span.length)
+            })
+            .collect();
+
+        let views = [
+            ("raw", super::normalize::identity(&units)),
+            ("keep", super::normalize::fold_keeping_ignorables(&units)),
+            ("strip", super::normalize::normalize(&units)),
+        ];
+        for (name, view) in views {
+            let view_findings = findings_of_view(&view);
+            let view_sensitivity = {
+                let mut hits = super::l0::scan(&view.units);
+                for hit in &mut hits {
+                    (hit.start, hit.length) = view.original_span(hit.start, hit.length);
+                }
+                hits.iter().map(|hit| hit.sensitivity).max().unwrap_or(Sensitivity::S0)
+            };
+            prop_assert!(
+                action_rank(merged.action) >= action_rank(action_of_view(&view, &ctx)),
+                "{name} is stricter than the union: view {:?} merged {:?} input {text:?}",
+                action_of_view(&view, &ctx),
+                merged.action
+            );
+            prop_assert!(
+                sensitivity_rank(merged.sensitivity) >= sensitivity_rank(view_sensitivity),
+                "{name} sensitivity is stricter than the union: input {text:?}"
+            );
+            for finding in view_findings {
+                prop_assert!(
+                    merged_findings.contains(&finding),
+                    "{name} finding {finding:?} missing from the union {merged_findings:?} input {text:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn zero_width_noise_never_hides_a_valid_id(
+        id in valid_id(),
+        noise in proptest::collection::vec((0usize..18, prop_oneof![
+            Just('\u{200B}'), Just('\u{200C}'), Just('\u{200D}'), Just('\u{200E}'),
+            Just('\u{2063}'), Just('\u{FEFF}'), Just('\u{00AD}'), Just('\u{034F}'),
+            Just('\u{FE0F}'), Just('\u{E0020}'),
+        ]), 0..6),
+    ) {
+        let mut chars: Vec<char> = id.chars().collect();
+        for (at, zw) in noise.iter().rev() {
+            chars.insert((*at).min(chars.len()), *zw);
+        }
+        let noisy: String = chars.into_iter().collect();
+        let response = inspect(&noisy, &open_ctx());
+        let found = response.findings.iter().any(|f| {
+            f.kind == FindingKind::CnResidentId
+                && covered(&noisy, f).chars().filter(|c| c.is_ascii_alphanumeric()).collect::<String>() == id
+        });
+        prop_assert!(found, "{:?} {:?}", noisy, response);
+    }
+
     #[test]
     fn any_input_yields_a_valid_in_bounds_response(input in any::<String>()) {
         let response = inspect(&input, &open_ctx());
@@ -926,5 +1367,65 @@ proptest! {
         prop_assert!(found, "{} {:?}", input, response);
         prop_assert_eq!(response.sensitivity, Sensitivity::S3);
         prop_assert_eq!(response.action, InspectAction::Block);
+    }
+}
+
+/// Absolute guard for the `Default_Ignorable_Code_Point` drop list.
+///
+/// The union property above compares the union against each view, so it cannot
+/// notice a range disappearing from `is_default_ignorable`: when a code point is
+/// no longer dropped, the *strip* view stops dropping it too and the property
+/// still holds — even though the "ignorable inserted inside an entity" capability
+/// is gone. This test pins the capability itself, with one hard-coded
+/// representative per range so the table and the guard cannot drift together.
+#[test]
+fn every_default_ignorable_range_still_breaks_an_entity_insertion() {
+    // Independent copy of the ranges; deliberately not derived from the table.
+    const RANGES: &[char] = &[
+        '\u{00AD}',
+        '\u{034F}',
+        '\u{061C}',
+        '\u{115F}',
+        '\u{17B4}',
+        '\u{180B}',
+        '\u{200B}',
+        '\u{200E}',
+        '\u{200F}',
+        '\u{202A}',
+        '\u{2060}',
+        '\u{2068}',
+        '\u{2069}',
+        '\u{3164}',
+        '\u{FE00}',
+        '\u{FEFF}',
+        '\u{FFA0}',
+        '\u{FFF0}',
+        '\u{1BCA0}',
+        '\u{1D173}',
+        '\u{E0020}',
+    ];
+    let ctx = open_ctx();
+    for ch in RANGES {
+        let mobile = format!("138{ch}1234{ch}5678");
+        let response = inspect(&mobile, &ctx);
+        assert_ne!(
+            response.action,
+            InspectAction::Allow,
+            "U+{:04X} inserted inside a mobile was not detected: {response:?}",
+            *ch as u32
+        );
+        assert!(
+            kinds(&response).contains(&FindingKind::CnMobile),
+            "U+{:04X} must still yield CnMobile: {response:?}",
+            *ch as u32
+        );
+
+        let id = format!("110105{ch}19491231002X");
+        let response = inspect(&id, &ctx);
+        assert!(
+            kinds(&response).contains(&FindingKind::CnResidentId),
+            "U+{:04X} inserted inside a resident id was not detected: {response:?}",
+            *ch as u32
+        );
     }
 }
