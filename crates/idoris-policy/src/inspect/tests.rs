@@ -566,6 +566,120 @@ fn zero_width_characters_inside_an_entity_do_not_hide_it() {
     assert_eq!(response.sensitivity, Sensitivity::S3);
 }
 
+#[test]
+fn one_layer_of_encoding_does_not_hide_an_entity() {
+    let cases = [
+        // base64 of "身份证 11010519491231002X"
+        (
+            "6Lqr5Lu96K+BIDExMDEwNTE5NDkxMjMxMDAyWA==",
+            FindingKind::CnResidentId,
+            Sensitivity::S3,
+        ),
+        // base64 and unpadded base64url of "13812345678"
+        ("MTM4MTIzNDU2Nzg=", FindingKind::CnMobile, Sensitivity::S2),
+        ("MTM4MTIzNDU2Nzg", FindingKind::CnMobile, Sensitivity::S2),
+        // base64url (with `-`) of "电话13812345678"
+        (
+            "55S16K-dMTM4MTIzNDU2Nzg",
+            FindingKind::CnMobile,
+            Sensitivity::S2,
+        ),
+        // percent-encoded and hex-encoded "13812345678"
+        (
+            "%31%33%38%31%32%33%34%35%36%37%38",
+            FindingKind::CnMobile,
+            Sensitivity::S2,
+        ),
+        (
+            "3133383132333435363738",
+            FindingKind::CnMobile,
+            Sensitivity::S2,
+        ),
+        // hex of "card 6222021234567894"
+        (
+            "636172642036323232303231323334353637383934",
+            FindingKind::BankCard,
+            Sensitivity::S3,
+        ),
+    ];
+    for (encoded, kind, sensitivity) in cases {
+        let input = format!("payload={encoded}&x=1");
+        let response = inspect(&input, &open_ctx());
+        let hit = response
+            .findings
+            .iter()
+            .find(|f| f.kind == kind)
+            .unwrap_or_else(|| panic!("{encoded}: {response:?}"));
+        assert_eq!(covered(&input, hit), encoded);
+        assert_eq!(response.sensitivity, sensitivity, "{encoded}");
+    }
+}
+
+#[test]
+fn harmless_encoded_text_and_plain_words_stay_clean() {
+    for input in [
+        // base64 of "hello world"
+        "aGVsbG8gd29ybGQ=",
+        "configuration-management_v2",
+        "deadbeefcafebabe0011223344556677",
+        "q=%E4%BD%A0%E5%A5%BD",
+        // single escape that does not hide a secret stays clean
+        "100%25 of users",
+    ] {
+        let response = inspect(input, &open_ctx());
+        assert!(response.findings.is_empty(), "{input}: {response:?}");
+    }
+}
+
+/// E1: hex of (bad-checksum ID + valid ID) must keep S3/Block, not collapse to S2/Redact.
+#[test]
+fn encoded_mixed_id_checksums_keep_max_sensitivity() {
+    let plain = "11010519491231003X 11010519491231002X";
+    let plain_response = inspect(plain, &open_ctx());
+    assert_eq!(plain_response.sensitivity, Sensitivity::S3);
+    assert_eq!(plain_response.action, InspectAction::Block);
+
+    let hex = "31313031303531393439313233313030335820313130313035313934393132333130303258";
+    let response = inspect(hex, &open_ctx());
+    assert!(
+        kinds(&response).contains(&FindingKind::CnResidentId),
+        "{response:?}"
+    );
+    assert_eq!(response.sensitivity, Sensitivity::S3, "{response:?}");
+    assert_eq!(response.action, InspectAction::Block, "{response:?}");
+}
+
+/// E2: a single percent-escape must not hide an `sk-` API key as Allow.
+#[test]
+fn single_percent_escape_does_not_hide_api_key() {
+    let encoded = "%73k-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let response = inspect(encoded, &open_ctx());
+    assert!(
+        kinds(&response).contains(&FindingKind::ApiKey),
+        "{response:?}"
+    );
+    assert_eq!(response.sensitivity, Sensitivity::S3, "{response:?}");
+    assert_eq!(response.action, InspectAction::Block, "{response:?}");
+}
+
+/// E3: a malformed escape after a valid percent-encoded phone must not wipe the hit.
+#[test]
+fn malformed_percent_escape_does_not_discard_valid_prefix() {
+    let phone = "%31%33%38%31%32%33%34%35%36%37%38";
+    let good = inspect(phone, &open_ctx());
+    assert_eq!(good.action, InspectAction::Redact, "{good:?}");
+    assert_eq!(good.sensitivity, Sensitivity::S2, "{good:?}");
+
+    let with_junk = format!("{phone}%ZZ");
+    let response = inspect(&with_junk, &open_ctx());
+    assert!(
+        kinds(&response).contains(&FindingKind::CnMobile),
+        "{response:?}"
+    );
+    assert_eq!(response.sensitivity, Sensitivity::S2, "{response:?}");
+    assert_eq!(response.action, InspectAction::Redact, "{response:?}");
+}
+
 /// Default_Ignorable insertions that the closed 6-codepoint list missed.
 /// Each must match the clean string's verdict and keep the insert inside the span.
 #[test]

@@ -27,6 +27,7 @@
 //! 三路缺一不可：`tests::union_is_never_looser_than_any_single_view` 会在
 //! 任意一路被删掉时变红。
 
+mod decode;
 mod l0;
 mod normalize;
 mod secrets;
