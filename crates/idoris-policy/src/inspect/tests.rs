@@ -772,6 +772,15 @@ fn valid_id() -> impl Strategy<Value = String> {
     )
 }
 
+fn sensitivity_rank(sensitivity: Sensitivity) -> u8 {
+    match sensitivity {
+        Sensitivity::S0 => 0,
+        Sensitivity::S1 => 1,
+        Sensitivity::S2 => 2,
+        Sensitivity::S3 => 3,
+    }
+}
+
 fn action_rank(action: InspectAction) -> u8 {
     match action {
         InspectAction::Allow => 0,
@@ -794,41 +803,133 @@ fn action_of_view(normalized: &super::normalize::Normalized, ctx: &InspectCtx) -
     super::decide_action(&hits, sensitivity, ctx)
 }
 
+/// Findings of one view, mapped back to original coordinates.
+fn findings_of_view(normalized: &super::normalize::Normalized) -> Vec<(FindingKind, u64, u64)> {
+    let mut hits = super::l0::scan(&normalized.units);
+    for hit in &mut hits {
+        (hit.start, hit.length) = normalized.original_span(hit.start, hit.length);
+    }
+    hits.iter()
+        .map(|hit| (hit.kind, hit.start as u64, hit.length as u64))
+        .collect()
+}
+
 proptest! {
+    /// The union must never be looser than *any* of the three views, and it must
+    /// keep every entity each view found. Generated inputs deliberately mix the
+    /// three reasons the views exist:
+    ///
+    /// * a gluing char next to the entity (fullwidth digit, hyphen variant) -
+    ///   only the **raw** view sees through it, because folding joins the two;
+    /// * an ignorable before a fullwidth entity - only the **keep** view sees it,
+    ///   because the raw view has no folding and the strip view joins;
+    /// * an ignorable inside the entity - only the **strip** view sees it.
+    ///
+    /// So deleting any single view makes this property fail, not just the two it
+    /// used to compare.
     #[test]
-    fn union_is_never_looser_than_either_ignorable_view(
-        chars in proptest::collection::vec(
+    fn union_is_never_looser_than_any_single_view(
+        entity in prop_oneof![
+            Just("13812345678".to_string()),
+            Just("11010519491231002X".to_string()),
+            Just(format!("sk-{}", "a".repeat(40))),
+            Just("a@b.com".to_string()),
+        ],
+        lead in prop_oneof![Just(""), Just("1"), Just("１"), Just("a"), Just("ａ"), Just("-"), Just("\u{2010}")],
+        trail in prop_oneof![Just(""), Just("9"), Just("１"), Just("x"), Just("ｘ"), Just("-")],
+        inner in proptest::collection::vec(
             prop_oneof![
-                (b'0'..=b'9').prop_map(char::from),
-                (b'a'..=b'z').prop_map(char::from),
-                (b'A'..=b'Z').prop_map(char::from),
-                Just('-'),
-                Just(' '),
-                Just('\u{200B}'),
-                Just('\u{200E}'),
-                Just('\u{200F}'),
-                Just('\u{2068}'),
-                Just('\u{2069}'),
-                Just('\u{00AD}'),
-                Just('\u{FEFF}'),
+                Just('\u{200B}'), Just('\u{200E}'), Just('\u{200F}'),
+                Just('\u{2068}'), Just('\u{2069}'), Just('\u{00AD}'),
+                Just('\u{FEFF}'), Just('\u{E0020}'),
             ],
-            0..48,
+            0..3,
         ),
+        fold_entity in any::<bool>(),
+        // A boundary-only ignorable *between* the lead and the entity. This is
+        // the shape that only the keep view catches: the raw view has no
+        // folding, and the strip view joins the lead to the entity.
+        pre in prop_oneof![
+            Just(""),
+            Just("\u{200B}"),
+            Just("\u{200E}"),
+            Just("\u{2068}"),
+        ],
     ) {
-        let input: String = chars.into_iter().collect();
-        let units: Vec<u16> = input.encode_utf16().collect();
+        // Sometimes widen the entity to fullwidth so folding is required at all.
+        let entity = if fold_entity {
+            entity.chars().map(|c| match c {
+                '0'..='9' => char::from_u32(c as u32 - b'0' as u32 + 0xFF10).unwrap_or(c),
+                'a'..='z' => char::from_u32(c as u32 - b'a' as u32 + 0xFF41).unwrap_or(c),
+                'A'..='Z' => char::from_u32(c as u32 - b'A' as u32 + 0xFF21).unwrap_or(c),
+                other => other,
+            }).collect::<String>()
+        } else {
+            entity
+        };
+        let mut text = String::from(lead);
+        text.push_str(pre);
+        // Insert the ignorables inside the entity when it is long enough.
+        let mut inserted = 0usize;
+        for (index, ch) in entity.chars().enumerate() {
+            if inserted < inner.len() && index == (inserted + 1) * 4 {
+                text.push(inner[inserted]);
+                inserted += 1;
+            }
+            text.push(ch);
+        }
+        while inserted < inner.len() {
+            text.push(inner[inserted]);
+            inserted += 1;
+        }
+        text.push_str(trail);
+
+        let units: Vec<u16> = text.encode_utf16().collect();
         let ctx = open_ctx();
-        let kept = action_of_view(&super::normalize::fold_keeping_ignorables(&units), &ctx);
-        let stripped = action_of_view(&super::normalize::normalize(&units), &ctx);
-        let merged = inspect(&input, &ctx).action;
-        prop_assert!(
-            action_rank(merged) >= action_rank(kept),
-            "kept {kept:?} merged {merged:?} input {input:?}"
-        );
-        prop_assert!(
-            action_rank(merged) >= action_rank(stripped),
-            "stripped {stripped:?} merged {merged:?} input {input:?}"
-        );
+        let merged = inspect(&text, &ctx);
+        let merged_findings: Vec<(FindingKind, u64, u64)> = merged
+            .findings
+            .iter()
+            .map(|finding| {
+                let span = finding.span.unwrap_or(idoris_contracts::inspect::InspectSpan {
+                    start: 0,
+                    length: 0,
+                });
+                (finding.kind, span.start, span.length)
+            })
+            .collect();
+
+        let views = [
+            ("raw", super::normalize::identity(&units)),
+            ("keep", super::normalize::fold_keeping_ignorables(&units)),
+            ("strip", super::normalize::normalize(&units)),
+        ];
+        for (name, view) in views {
+            let view_findings = findings_of_view(&view);
+            let view_sensitivity = {
+                let mut hits = super::l0::scan(&view.units);
+                for hit in &mut hits {
+                    (hit.start, hit.length) = view.original_span(hit.start, hit.length);
+                }
+                hits.iter().map(|hit| hit.sensitivity).max().unwrap_or(Sensitivity::S0)
+            };
+            prop_assert!(
+                action_rank(merged.action) >= action_rank(action_of_view(&view, &ctx)),
+                "{name} is stricter than the union: view {:?} merged {:?} input {text:?}",
+                action_of_view(&view, &ctx),
+                merged.action
+            );
+            prop_assert!(
+                sensitivity_rank(merged.sensitivity) >= sensitivity_rank(view_sensitivity),
+                "{name} sensitivity is stricter than the union: input {text:?}"
+            );
+            for finding in view_findings {
+                prop_assert!(
+                    merged_findings.contains(&finding),
+                    "{name} finding {finding:?} missing from the union {merged_findings:?} input {text:?}"
+                );
+            }
+        }
     }
 
     #[test]
