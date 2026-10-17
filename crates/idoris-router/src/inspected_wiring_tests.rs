@@ -233,3 +233,25 @@ async fn inspected_append_failure_is_503_before_profiling_or_egress() {
     );
     assert!(upstream.received_requests().await.unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn image_parts_pin_chat_local_with_an_uninspectable_reason() {
+    let (upstream, state, event_log) = any_only_upstream().await;
+    let (status, record_id, _) = chat(
+        state,
+        json!({"model": "idoris/daily", "messages": [{"role": "user", "content": [
+            {"type": "text", "text": "这张图里写了什么"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUg=="}}
+        ]}]}),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::SERVICE_UNAVAILABLE);
+    assert!(upstream.received_requests().await.unwrap().is_empty());
+    let events = event_log
+        .events_for_record(Some(budget::PERSONAL_TENANT_ID), &record_id)
+        .unwrap();
+    let inspected = &events[1].event;
+    assert_eq!(inspected.event_type, EventType::Inspected);
+    assert_eq!(inspected.metadata["reason"], "uninspectable_content");
+    assert_eq!(inspected.metadata["privacy"], "local_only");
+}

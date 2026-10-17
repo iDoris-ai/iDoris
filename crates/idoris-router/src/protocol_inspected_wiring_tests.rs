@@ -105,3 +105,28 @@ async fn identifiers_pin_protocol_bodies_local_with_zero_egress() {
         assert_eq!(received, 0, "remote egress must be zero for {path}");
     }
 }
+
+/// Review F1/F2: content L0 cannot read is not provably clean, so it never
+/// leaves for a non-local card even when no rule fires.
+#[tokio::test]
+async fn unreadable_content_is_pinned_local_with_zero_egress() {
+    let cases = [
+        (
+            "/v1/embeddings",
+            Capability::Embedding,
+            json!({"model": "embed-model", "input": [[16, 7529, 4278, 1234, 5678, 9012, 3456, 7890]]}),
+        ),
+        (
+            "/v1/messages",
+            Capability::Chat,
+            json!({"model": "claude-local", "max_tokens": 16, "messages": [{"role": "user", "content": [
+                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo="}}
+            ]}]}),
+        ),
+    ];
+    for (path, capability, body) in cases {
+        let (status, error, received) = send(path, capability, &body).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{path}: {error}");
+        assert_eq!(received, 0, "{path}");
+    }
+}

@@ -18,8 +18,20 @@ pub(super) fn normalize(units: &[u16]) -> Normalized {
     };
     for (i, &u) in units.iter().enumerate() {
         let folded = match u {
-            // ZWSP/ZWNJ/ZWJ、WORD JOINER、BOM/ZWNBSP、软连字符：不可见，直接丢掉。
-            0x200B..=0x200D | 0x2060 | 0xFEFF | 0x00AD => continue,
+            // ZWSP/ZWNJ/ZWJ、WORD JOINER、BOM/ZWNBSP、软连字符，以及双向文字
+            // 控制字符（LRM/RLM/ALM、嵌入/覆盖、隔离）：不可见，直接丢掉。
+            0x200B..=0x200F
+            | 0x2060
+            | 0xFEFF
+            | 0x00AD
+            | 0x061C
+            | 0x202A..=0x202E
+            | 0x2066..=0x2069 => continue,
+            // 不换行空格、各种宽度的空格：按普通空格处理。
+            0x00A0 | 0x2000..=0x200A | 0x202F | 0x205F => u16::from(b' '),
+            // 阿拉伯-印度数字与扩展阿拉伯-印度数字。
+            0x0660..=0x0669 => u - 0x0660 + u16::from(b'0'),
+            0x06F0..=0x06F9 => u - 0x06F0 + u16::from(b'0'),
             // 全角 ASCII（！到～）折回半角。
             0xFF01..=0xFF5E => u - 0xFEE0,
             // 全角空格。

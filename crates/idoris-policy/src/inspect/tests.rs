@@ -629,6 +629,48 @@ fn harmless_encoded_text_and_plain_words_stay_clean() {
     }
 }
 
+/// Regressions from the 2026-10-11 adversarial review: every input below
+/// used to come back clean.
+#[test]
+fn review_regressions_grouped_split_and_invisible_variants() {
+    let cases: [(&str, &[FindingKind]); 12] = [
+        // F3: neighbouring grouped numbers
+        (
+            "张三 110101 19900307 7379 138 1234 5678",
+            &[FindingKind::CnResidentId, FindingKind::CnMobile],
+        ),
+        ("Room 1203 138 1234 5678", &[FindingKind::CnMobile]),
+        // F4: split across lines / text parts
+        ("1101011990\n0307737X", &[FindingKind::CnResidentId]),
+        ("110101199003\n07737X\n", &[FindingKind::CnResidentId]),
+        // F5: invisible separators and other digit scripts
+        ("138\u{00A0}1234\u{00A0}5678", &[FindingKind::CnMobile]),
+        ("138\u{200E}1234\u{200E}5678", &[FindingKind::CnMobile]),
+        ("138\t1234\t5678", &[FindingKind::CnMobile]),
+        ("138  1234  5678", &[FindingKind::CnMobile]),
+        (
+            "\u{0661}\u{0663}\u{0668}\u{0661}\u{0662}\u{0663}\u{0664}\u{0665}\u{0666}\u{0667}\u{0668}",
+            &[FindingKind::CnMobile],
+        ),
+        // F6: encodings
+        (
+            "see id/MTEwMTAxMTk5MDAzMDc3MzdY",
+            &[FindingKind::CnResidentId],
+        ),
+        ("0x3133383132333435363738", &[FindingKind::CnMobile]),
+        (
+            "\\u0031\\u0033\\u0038\\u0031\\u0032\\u0033\\u0034\\u0035\\u0036\\u0037\\u0038",
+            &[FindingKind::CnMobile],
+        ),
+    ];
+    for (input, expected) in cases {
+        let found = kinds(&inspect(input, &open_ctx()));
+        for kind in expected {
+            assert!(found.contains(kind), "{input:?}: {found:?}");
+        }
+    }
+}
+
 fn valid_id() -> impl Strategy<Value = String> {
     (0usize..34, 1950u32..2030, 1u32..13, 1u32..29, 0u32..1000).prop_map(
         |(province, year, month, day, seq)| {
@@ -696,4 +738,36 @@ proptest! {
         prop_assert_eq!(response.sensitivity, Sensitivity::S3);
         prop_assert_eq!(response.action, InspectAction::Block);
     }
+}
+
+/// Reviewer A2: a pasted numeric table must stay public. Rows joined by a line
+/// break may not be licensed by the weak "16–19 digits + Luhn" card rule, while
+/// structural entities (resident id, mobile) may still cross a line break.
+#[test]
+fn numeric_tables_do_not_become_bank_cards_across_line_breaks() {
+    let table = "year qty\n2023 1203\n2024 1305\n2025 1411\n2026 1520";
+    let response = inspect(table, &open_ctx());
+    assert_eq!(
+        response.action,
+        InspectAction::Allow,
+        "an ordinary year/quantity table must stay public: {response:?}"
+    );
+    assert!(response.findings.is_empty(), "{response:?}");
+
+    // The structural wins from this PR survive: an id split across a line, and
+    // a mobile split across a line, are still found.
+    let id = inspect("1101011990\n0307737X", &open_ctx());
+    assert!(
+        kinds(&id).contains(&FindingKind::CnResidentId),
+        "an id split across a line break must still be found: {id:?}"
+    );
+    let mobile = inspect("138\n1234 5678", &open_ctx());
+    assert!(
+        kinds(&mobile).contains(&FindingKind::CnMobile),
+        "a mobile split across a line break must still be found: {mobile:?}"
+    );
+
+    // And a card whose groups are all on one line is unaffected.
+    let card = inspect("6222 0212 3456 7894", &open_ctx());
+    assert_eq!(card.action, InspectAction::Block, "{card:?}");
 }
