@@ -104,6 +104,11 @@ impl ManagedRuntimeProcess {
             // descendants that survived SIGTERM before releasing that anchor.
             self.signal_kill()?;
         }
+        // Linux can retain killed orphan descendants as zombies until PID 1
+        // reaps them. Check for live group members while the unreaped leader
+        // still prevents this PGID from being reused.
+        #[cfg(target_os = "linux")]
+        let group_clean = wait_group_cleanup(self.process_group, grace).await;
         tokio::time::timeout(grace, self.child.wait())
             .await
             .map_err(|_| BackendError::internal("timed out reaping local runtime process"))?
@@ -111,13 +116,11 @@ impl ManagedRuntimeProcess {
         // No group signal may happen after wait() reaps the ownership
         // anchor: from this point the old PGID is allowed to be reused.
         self.armed = false;
-        // Group members receive the same terminal signal as the direct child,
-        // but their exit/reparent/reap can lag the child's wait() by a short
-        // scheduling window (especially under loaded Linux CI).  Observe that
-        // cleanup to completion before reporting shutdown success.  This is a
-        // read-only probe after the ownership anchor is reaped: never signal a
-        // numeric PGID again here, because it may now be reused by the OS.
-        if !wait_group_gone(self.process_group, grace).await? {
+        // On other Unix systems, observe group removal after the leader has
+        // been reaped. This is read-only: never signal a numeric PGID here.
+        #[cfg(not(target_os = "linux"))]
+        let group_clean = wait_group_cleanup(self.process_group, grace).await;
+        if !group_clean? {
             return Err(BackendError::internal(
                 "timed out waiting for local runtime process group cleanup",
             ));
@@ -210,10 +213,10 @@ fn classify_signal_result(result: Result<(), nix::errno::Errno>) -> Result<(), B
 }
 
 #[cfg(unix)]
-async fn wait_group_gone(process_group: i32, grace: Duration) -> Result<bool, BackendError> {
+async fn wait_group_cleanup(process_group: i32, grace: Duration) -> Result<bool, BackendError> {
     let deadline = tokio::time::Instant::now() + grace;
     loop {
-        if !group_exists(process_group)? {
+        if !group_has_live_members(process_group)? {
             return Ok(true);
         }
         if tokio::time::Instant::now() >= deadline {
@@ -225,6 +228,128 @@ async fn wait_group_gone(process_group: i32, grace: Duration) -> Result<bool, Ba
         )
         .await;
     }
+}
+
+#[cfg(target_os = "linux")]
+fn group_has_live_members(process_group: i32) -> Result<bool, BackendError> {
+    if !group_exists(process_group)? {
+        return Ok(false);
+    }
+
+    // Linux keeps an orphaned descendant in its process group until PID 1
+    // reaps it. killpg(pgid, 0) therefore sees a group made only of zombies.
+    // Those descendants have exited, even when their reaper is slow.
+    let processes = std::fs::read_dir("/proc")
+        .map_err(|_| BackendError::internal("failed to inspect local runtime process group"))?;
+    for process in processes {
+        let process = process
+            .map_err(|_| BackendError::internal("failed to inspect local runtime process group"))?;
+        let Some(pid) = process.file_name().to_string_lossy().parse::<i32>().ok() else {
+            continue;
+        };
+        match nix::unistd::getpgid(Some(nix::unistd::Pid::from_raw(pid))) {
+            Ok(group) if group.as_raw() == process_group => {}
+            Ok(_) | Err(nix::errno::Errno::ESRCH) => continue,
+            Err(_) => {
+                return Err(BackendError::internal(
+                    "failed to inspect local runtime process group",
+                ));
+            }
+        }
+        let process_path = process.path();
+        let Some(stat) = read_proc_stat(&process_path.join("stat"))? else {
+            continue;
+        };
+        let (state, group) = proc_stat_state_and_group(&stat)?;
+        if group != process_group {
+            continue;
+        }
+        if !matches!(state, "Z" | "X" | "x") {
+            return Ok(true);
+        }
+        // A thread-group leader can be a zombie while sibling threads still
+        // hold resources. Inspect each task before treating its group as dead.
+        if state == "Z" && zombie_leader_has_live_threads(&process_path, process_group)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+#[cfg(target_os = "linux")]
+fn proc_entry_vanished(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::NotFound
+        || error.raw_os_error() == Some(nix::errno::Errno::ESRCH as i32)
+}
+
+#[cfg(target_os = "linux")]
+fn read_proc_stat(path: &std::path::Path) -> Result<Option<String>, BackendError> {
+    match std::fs::read(path) {
+        // Linux comm is arbitrary bytes; only the fields after it are parsed.
+        Ok(stat) => Ok(Some(String::from_utf8_lossy(&stat).into_owned())),
+        Err(error) if proc_entry_vanished(&error) => Ok(None),
+        Err(_) => Err(BackendError::internal(
+            "failed to inspect local runtime process group",
+        )),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn proc_stat_state_and_group(stat: &str) -> Result<(&str, i32), BackendError> {
+    let fields = stat
+        .rsplit_once(") ")
+        .map(|(_, fields)| fields)
+        .ok_or_else(|| BackendError::internal("failed to inspect local runtime process group"))?;
+    let mut fields = fields.split_whitespace();
+    let state = fields
+        .next()
+        .ok_or_else(|| BackendError::internal("failed to inspect local runtime process group"))?;
+    let _parent = fields.next();
+    let group = fields
+        .next()
+        .and_then(|group| group.parse::<i32>().ok())
+        .ok_or_else(|| BackendError::internal("failed to inspect local runtime process group"))?;
+    Ok((state, group))
+}
+
+#[cfg(target_os = "linux")]
+fn zombie_leader_has_live_threads(
+    process_path: &std::path::Path,
+    process_group: i32,
+) -> Result<bool, BackendError> {
+    let tasks = match std::fs::read_dir(process_path.join("task")) {
+        Ok(tasks) => tasks,
+        Err(error) if proc_entry_vanished(&error) => return Ok(false),
+        Err(_) => {
+            return Err(BackendError::internal(
+                "failed to inspect local runtime process group",
+            ));
+        }
+    };
+    for task in tasks {
+        let task = match task {
+            Ok(task) => task,
+            Err(error) if proc_entry_vanished(&error) => continue,
+            Err(_) => {
+                return Err(BackendError::internal(
+                    "failed to inspect local runtime process group",
+                ));
+            }
+        };
+        let Some(stat) = read_proc_stat(&task.path().join("stat"))? else {
+            continue;
+        };
+        let (state, group) = proc_stat_state_and_group(&stat)?;
+        if group == process_group && !matches!(state, "Z" | "X" | "x") {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn group_has_live_members(process_group: i32) -> Result<bool, BackendError> {
+    group_exists(process_group)
 }
 
 #[cfg(unix)]
@@ -370,7 +495,7 @@ mod tests {
         assert!(armed.is_ok(), "TERM-ignore child must become ready");
 
         process.shutdown(Duration::from_millis(50)).await.unwrap();
-        assert!(!group_exists(pid.as_raw()).unwrap());
+        assert!(!group_has_live_members(pid.as_raw()).unwrap());
     }
 
     #[cfg(unix)]
@@ -431,9 +556,120 @@ mod tests {
             process.id().is_some(),
             "natural exit must stay unreaped until owned-group cleanup finishes"
         );
+        assert!(group_has_live_members(pgid).unwrap());
 
         process.shutdown(Duration::from_millis(100)).await.unwrap();
-        assert!(!group_exists(pgid).unwrap());
+        assert!(!group_has_live_members(pgid).unwrap());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn disappearing_proc_entry_includes_esrch() {
+        assert!(proc_entry_vanished(&std::io::Error::from_raw_os_error(
+            nix::errno::Errno::ESRCH as i32
+        )));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn non_utf8_proc_comm_preserves_state_and_group() {
+        let temp = tempfile::tempdir().unwrap();
+        let task = temp.path().join("task/42");
+        std::fs::create_dir_all(&task).unwrap();
+        let stat_path = task.join("stat");
+        for state in [b'S', b'Z'] {
+            let mut bytes = b"42 (runtime\xff) name) ".to_vec();
+            bytes.push(state);
+            bytes.extend_from_slice(b" 1 123 0\n");
+            std::fs::write(&stat_path, bytes).unwrap();
+            let stat = read_proc_stat(&stat_path).unwrap().unwrap();
+            assert_eq!(
+                proc_stat_state_and_group(&stat).unwrap(),
+                (if state == b'S' { "S" } else { "Z" }, 123)
+            );
+            assert_eq!(
+                zombie_leader_has_live_threads(temp.path(), 123).unwrap(),
+                state == b'S'
+            );
+        }
+        std::fs::write(&stat_path, b"42 (runtime\xff) malformed\n").unwrap();
+        assert!(zombie_leader_has_live_threads(temp.path(), 123).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn zombie_leader_checks_sibling_thread_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let task = temp.path().join("task/42");
+        std::fs::create_dir_all(&task).unwrap();
+        std::fs::write(task.join("stat"), "42 (sibling) S 1 123 0\n").unwrap();
+        assert!(zombie_leader_has_live_threads(temp.path(), 123).unwrap());
+        std::fs::write(task.join("stat"), "42 (sibling) Z 1 123 0\n").unwrap();
+        assert!(!zombie_leader_has_live_threads(temp.path(), 123).unwrap());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn zombie_only_group_is_clean_before_orphan_reap() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "local_runtime_process::tests::zombie_only_group_subprocess",
+                "--nocapture",
+            ])
+            .env("IDORIS_ZOMBIE_ONLY_GROUP_HELPER", "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "isolated subreaper test failed: {} {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("running 1 test"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn zombie_only_group_subprocess() {
+        if std::env::var_os("IDORIS_ZOMBIE_ONLY_GROUP_HELPER").is_none() {
+            return;
+        }
+        // prctl changes the calling process; the outer test launches this
+        // helper in its own process so concurrent tests keep their reaper.
+        nix::sys::prctl::set_child_subreaper(true).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let marker = temp.path().join("child");
+        let mut process = ManagedRuntimeProcess::spawn_command(
+            std::path::Path::new("/bin/sh"),
+            vec![
+                "-c".into(),
+                "sleep 30 & echo $! > \"$1\"".into(),
+                "runtime-test".into(),
+                marker.as_os_str().to_owned(),
+            ],
+        )
+        .unwrap();
+        let pgid = i32::try_from(process.id().unwrap()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !marker.exists() || process.is_running().unwrap() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let orphan_pid = std::fs::read_to_string(&marker)
+            .unwrap()
+            .trim()
+            .parse::<i32>()
+            .unwrap();
+        process.shutdown(Duration::from_millis(250)).await.unwrap();
+        assert!(
+            group_exists(pgid).unwrap(),
+            "unreaped orphan anchors the group"
+        );
+        assert!(!group_has_live_members(pgid).unwrap());
+        nix::sys::wait::waitpid(nix::unistd::Pid::from_raw(orphan_pid), None).unwrap();
     }
 
     #[cfg(unix)]

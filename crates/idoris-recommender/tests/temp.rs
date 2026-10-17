@@ -65,7 +65,17 @@ fn highest_capability_model_is_kept_even_when_weaker_model_would_fit() {
         ],
         excluded: None,
     };
-    let result = temp_admission(&catalog, &host(), &policy(vec![Capability::Vision]), None);
+    let result = temp_admission(
+        &catalog,
+        &host(),
+        &policy(vec![Capability::Vision]),
+        None,
+        &idoris_recommender::recommend::budget_breakdown(
+            &host(),
+            &policy(vec![Capability::Vision]),
+            None,
+        ),
+    );
     assert_eq!(result.choices.len(), 1);
     assert_eq!(result.choices[0].id, "strong-big");
     assert_eq!(result.choices[0].status, TempStatus::RequiresEviction);
@@ -88,6 +98,11 @@ fn each_capability_reuses_same_remaining_budget_without_cumulative_deduction() {
         &host(),
         &policy(vec![Capability::Vision, Capability::Coding]),
         None,
+        &idoris_recommender::recommend::budget_breakdown(
+            &host(),
+            &policy(vec![Capability::Vision, Capability::Coding]),
+            None,
+        ),
     );
     assert_eq!(result.choices.len(), 2);
     assert!(
@@ -107,7 +122,13 @@ fn temp_slots_does_not_truncate_and_duplicate_capabilities_remain_visible() {
     };
     let mut policy = policy(vec![Capability::Vision, Capability::Vision]);
     policy.temp_slots = 0;
-    let result = temp_admission(&catalog, &host(), &policy, None);
+    let result = temp_admission(
+        &catalog,
+        &host(),
+        &policy,
+        None,
+        &idoris_recommender::recommend::budget_breakdown(&host(), &policy, None),
+    );
     assert_eq!(result.choices.len(), 2);
     assert_eq!(result.choices[0].id, "multi");
     assert_eq!(result.choices[1].id, "multi");
@@ -141,6 +162,11 @@ fn resident_experiment_low_ram_and_missing_capability_are_excluded() {
         &host(),
         &policy(vec![Capability::Vision, Capability::Coding]),
         Some(&resident),
+        &idoris_recommender::recommend::budget_breakdown(
+            &host(),
+            &policy(vec![Capability::Vision, Capability::Coding]),
+            None,
+        ),
     );
     assert_eq!(result.choices.len(), 1);
     assert_eq!(result.choices[0].id, "ordinary");

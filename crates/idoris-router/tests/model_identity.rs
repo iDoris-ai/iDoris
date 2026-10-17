@@ -15,6 +15,13 @@ fn card_with_provider(provider_id: &str, endpoint: &str) -> ComponentCard {
         serde_yaml::from_str(include_str!("../../../config/components/omlx.yaml")).unwrap();
     card.provider.id = provider_id.into();
     card.endpoint = endpoint.into();
+    card.extensions = Some(
+        serde_json::from_value(serde_json::json!({
+            "_degradation": "Removing these bindings disables aliases.",
+            "idoris_role_models": {"daily": "Qwen3-0.6B-4bit", "fast": "Qwen3-0.6B-4bit"}
+        }))
+        .unwrap(),
+    );
     card
 }
 
@@ -29,7 +36,7 @@ async fn app_with_provider(server: &MockServer, provider_id: &str) -> axum::Rout
 }
 
 async fn app(server: &MockServer) -> axum::Router {
-    app_with_provider(server, "Qwen3-0.6B-4bit").await
+    app_with_provider(server, "omlx").await
 }
 
 fn request(model: &str) -> Request<Body> {
@@ -105,6 +112,7 @@ async fn mount_omlx_success(server: &MockServer) {
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "model": "Qwen3-0.6B-4bit",
             "choices": [{"message":{"content":"actual response"}}]
         })))
         .mount(server)

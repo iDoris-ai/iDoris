@@ -200,7 +200,11 @@ fn parse_capabilities(headers: &HeaderMap) -> Result<Vec<Capability>, ProfileErr
         }
         match parse_capability(part) {
             Some(cap) => out.push(cap),
-            None => return Err(invalid_header(format!("unknown capability {part:?}"))),
+            None => {
+                return Err(invalid_header(
+                    "X-iDoris-Capabilities contains an unsupported capability",
+                ));
+            }
         }
     }
     if out.is_empty() {

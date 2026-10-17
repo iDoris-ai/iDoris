@@ -263,12 +263,27 @@ fn metadata_whitelist_and_bounds_fail_closed_before_insert() {
     valid.metadata.insert("cost_minor".into(), json!(42));
     valid
         .metadata
+        .insert("token_estimator".into(), json!("conservative"));
+    valid
+        .metadata
         .insert("labels".into(), json!(["good", "safe"]));
     store.append(Some("a"), &valid).unwrap();
+    assert_eq!(
+        store.events_for_record(Some("a"), "r1").unwrap()[0]
+            .event
+            .metadata,
+        valid.metadata
+    );
 
     let bad_values = [
         ("prompt", json!("secret")),
         ("unknown_key", json!(true)),
+        ("token_estimator", json!({"source": "conservative"})),
+        ("token_estimator", json!("bad\nsource")),
+        (
+            "token_estimator",
+            json!("x".repeat(MAX_STRING_UTF16_UNITS + 1)),
+        ),
         ("status", json!({"nested": true})),
         ("status", json!("has\ncontrol")),
         ("status", json!("x".repeat(MAX_STRING_UTF16_UNITS + 1))),
@@ -614,8 +629,8 @@ fn unsupported_migration_version_fails_closed_without_applying_older_schema() {
     let db = temp_db("unsupported-migration-version");
     let conn = Connection::open(&db).unwrap();
     conn.execute_batch(
-        "CREATE TABLE event_log_schema_migrations(version INTEGER PRIMARY KEY); \
-         INSERT INTO event_log_schema_migrations(version) VALUES(2);",
+        "CREATE TABLE event_log_schema_migrations (version INTEGER PRIMARY KEY); \
+         INSERT INTO event_log_schema_migrations(version) VALUES(3);",
     )
     .unwrap();
 
@@ -631,7 +646,7 @@ fn unsupported_migration_version_fails_closed_without_applying_older_schema() {
         .unwrap()
         .collect::<Result<_, _>>()
         .unwrap();
-    assert_eq!(versions, vec![2]);
+    assert_eq!(versions, vec![3]);
     let event_table: Option<String> = check
         .query_row(
             "SELECT name FROM sqlite_master WHERE type='table' AND name='event_log_events'",
@@ -834,5 +849,332 @@ fn tenant_query_is_scoped_filtered_limited_and_sequence_stable() {
                 }
             )
             .is_err()
+    );
+}
+
+#[test]
+fn tenant_type_query_matches_latest_sequence_model_for_all_bounds() {
+    let store = EventLogStore::new(Connection::open_in_memory().unwrap()).unwrap();
+    let mut history = Vec::new();
+    // Later same-type events outside either boundary must still supersede the
+    // candidate. Later other-type/tenant events must never supersede it.
+    for (tenant, record, kind, ts) in [
+        ("a", "moves-forward", EventType::AuditFinalized, 20),
+        ("a", "moves-forward", EventType::AuditFinalized, 40),
+        ("a", "moves-backward", EventType::AuditFinalized, 20),
+        ("a", "moves-backward", EventType::AuditFinalized, 0),
+        ("a", "tie-z", EventType::AuditFinalized, 20),
+        ("a", "tie-a", EventType::AuditFinalized, 20),
+        ("a", "tie-a", EventType::AuditFinalized, 20),
+        ("a", "tie-a", EventType::FeedbackReceived, 50),
+        ("b", "tie-z", EventType::AuditFinalized, 50),
+        ("a", "maximum", EventType::AuditFinalized, i64::MAX),
+        ("a", "maximum", EventType::Decided, 0),
+    ] {
+        let mut event = sample(tenant, record);
+        event.event_type = kind;
+        event.ts_utc_ms = ts;
+        let sequence = store.append(Some(tenant), &event).unwrap();
+        history.push(EventLogEvent { sequence, event });
+    }
+    for tenant in ["a", "b", "empty"] {
+        for kind in [
+            EventType::AuditFinalized,
+            EventType::FeedbackReceived,
+            EventType::Decided,
+        ] {
+            for from in [None, Some(0), Some(20), Some(21), Some(40), Some(i64::MAX)] {
+                for to in [None, Some(0), Some(20), Some(21), Some(40), Some(i64::MAX)] {
+                    for record in [None, Some("tie-a"), Some("moves-forward"), Some("maximum")] {
+                        for limit in [1, 2, 100] {
+                            let query = EventLogQuery {
+                                from_ts_utc_ms: from,
+                                to_ts_utc_ms: to,
+                                record_id: record,
+                                limit,
+                            };
+                            let mut latest = BTreeMap::new();
+                            for row in &history {
+                                if row.event.tenant_id == tenant && row.event.event_type == kind {
+                                    latest.insert(&row.event.record_id, row.clone());
+                                }
+                            }
+                            let mut expected: Vec<_> = latest
+                                .into_values()
+                                .filter(|row| {
+                                    from.is_none_or(|v| row.event.ts_utc_ms >= v)
+                                        && to.is_none_or(|v| row.event.ts_utc_ms < v)
+                                        && record.is_none_or(|v| row.event.record_id == v)
+                                })
+                                .collect();
+                            expected.sort_by(|a, b| {
+                                (a.event.ts_utc_ms, &a.event.record_id, a.sequence).cmp(&(
+                                    b.event.ts_utc_ms,
+                                    &b.event.record_id,
+                                    b.sequence,
+                                ))
+                            });
+                            expected.truncate(limit);
+                            assert_eq!(
+                                store
+                                    .events_for_tenant_type(Some(tenant), kind, &query)
+                                    .unwrap(),
+                                expected,
+                                "tenant={tenant}, kind={kind:?}, query={query:?}",
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn tenant_type_query_plan_seeks_each_optional_time_range() {
+    let store = EventLogStore::new(Connection::open_in_memory().unwrap()).unwrap();
+    let conn = store.0.lock().unwrap();
+    for (from, to) in [
+        (None, None),
+        (Some(10), None),
+        (None, Some(20)),
+        (Some(10), Some(20)),
+    ] {
+        let query = EventLogQuery {
+            from_ts_utc_ms: from,
+            to_ts_utc_ms: to,
+            limit: 1,
+            ..Default::default()
+        };
+        let sql = format!("EXPLAIN QUERY PLAN {}", tenant_type_query(&query));
+        let plan: Vec<String> = conn
+            .prepare(&sql)
+            .unwrap()
+            .query_map(
+                rusqlite::params!["a", "audit.finalized", from, to, Option::<&str>::None, 1],
+                |row| row.get(3),
+            )
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let candidate = plan
+            .iter()
+            .find(|detail| detail.contains("SEARCH e USING INDEX event_log_tenant_type_time"))
+            .unwrap_or_else(|| panic!("missing candidate index search: {plan:?}"));
+        assert!(
+            candidate.contains("tenant_id=? AND event_type=?"),
+            "{plan:?}"
+        );
+        assert_eq!(
+            candidate.contains("ts_utc_ms>?"),
+            from.is_some(),
+            "{plan:?}"
+        );
+        assert_eq!(candidate.contains("ts_utc_ms<?"), to.is_some(), "{plan:?}");
+        assert!(
+            plan.iter().any(|detail| {
+                detail.contains("SEARCH later USING INDEX event_log_tenant_record_sequence")
+                    && detail.contains("tenant_id=? AND record_id=? AND sequence>?")
+            }),
+            "later sequence lookup must also seek: {plan:?}"
+        );
+    }
+}
+
+#[test]
+fn tenant_type_record_query_seeks_record_for_each_optional_time_range() {
+    let store = EventLogStore::new(Connection::open_in_memory().unwrap()).unwrap();
+    let conn = store.0.lock().unwrap();
+    for (from, to) in [
+        (None, None),
+        (Some(10), None),
+        (None, Some(20)),
+        (Some(10), Some(20)),
+    ] {
+        let query = EventLogQuery {
+            from_ts_utc_ms: from,
+            to_ts_utc_ms: to,
+            record_id: Some("late"),
+            limit: 1,
+        };
+        let plan: Vec<String> = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {}", tenant_type_query(&query)))
+            .unwrap()
+            .query_map(
+                rusqlite::params!["a", "audit.finalized", from, to, "late", 1],
+                |row| row.get(3),
+            )
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(
+            plan.iter().any(|detail| {
+                detail.contains("SEARCH e USING INDEX event_log_tenant_record_sequence")
+                    && detail.contains("tenant_id=? AND record_id=?")
+            }),
+            "record-filter candidate must seek tenant and record: {plan:?}"
+        );
+        println!("record bounds=({from:?},{to:?}) plan={plan:?}");
+    }
+}
+
+#[test]
+fn tenant_type_record_query_work_ignores_unrelated_tenant_history() {
+    use rusqlite::StatementStatus;
+
+    let store = EventLogStore::new(Connection::open_in_memory().unwrap()).unwrap();
+    let mut terminal = sample("a", "late");
+    terminal.event_type = EventType::AuditFinalized;
+    terminal.ts_utc_ms = 10;
+    store.append(Some("a"), &terminal).unwrap();
+    terminal.event_id = Uuid::new_v4().to_string();
+    terminal.ts_utc_ms = i64::MAX;
+    let sequence = store.append(Some("a"), &terminal).unwrap();
+    let expected = EventLogEvent {
+        sequence,
+        event: terminal.clone(),
+    };
+    for (tenant, kind) in [
+        ("a", EventType::FeedbackReceived),
+        ("b", EventType::AuditFinalized),
+    ] {
+        let mut event = sample(tenant, "late");
+        event.event_type = kind;
+        store.append(Some(tenant), &event).unwrap();
+    }
+
+    let mut previous_size = 0;
+    let mut baseline = BTreeMap::new();
+    for size in [0, 100, 1_000] {
+        for i in previous_size..size {
+            let mut event = sample("a", &format!("unrelated-{i}"));
+            event.event_type = EventType::AuditFinalized;
+            event.ts_utc_ms = i;
+            store.append(Some("a"), &event).unwrap();
+        }
+        previous_size = size;
+        for record in ["absent", "late"] {
+            let query = EventLogQuery {
+                record_id: Some(record),
+                limit: 1,
+                ..Default::default()
+            };
+            let expected = if record == "late" {
+                vec![expected.clone()]
+            } else {
+                Vec::new()
+            };
+            assert_eq!(
+                store
+                    .events_for_tenant_type(Some("a"), EventType::AuditFinalized, &query)
+                    .unwrap(),
+                expected
+            );
+            let conn = store.0.lock().unwrap();
+            let mut stmt = conn.prepare(&tenant_type_query(&query)).unwrap();
+            let actual: Vec<i64> = stmt
+                .query_map(
+                    rusqlite::params!["a", "audit.finalized", None::<i64>, None::<i64>, record, 1],
+                    |row| row.get(0),
+                )
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            assert_eq!(
+                actual,
+                expected.iter().map(|row| row.sequence).collect::<Vec<_>>()
+            );
+            let steps = stmt.get_status(StatementStatus::VmStep);
+            let initial = *baseline.entry(record).or_insert(steps);
+            println!("unrelated={size} record={record} vm_steps={steps} baseline={initial}");
+            assert!(
+                steps <= initial + 32,
+                "single-record work grew with unrelated history: record={record}, size={size}, steps={steps}, baseline={initial}"
+            );
+        }
+    }
+}
+
+#[test]
+fn canonical_v1_upgrades_and_v2_reopens_without_changing_history() {
+    let db = temp_db("upgrade-v2");
+    let conn = Connection::open(&db).unwrap();
+    conn.execute_batch(include_str!("migrations/0001_events.sql"))
+        .unwrap();
+    conn.execute_batch("CREATE TABLE event_log_schema_migrations (version INTEGER PRIMARY KEY); INSERT INTO event_log_schema_migrations VALUES(1);").unwrap();
+    let event = sample("a", "before-upgrade");
+    conn.execute("INSERT INTO main.event_log_events(event_id,tenant_id,record_id,event_type,ts_utc_ms,request_id,session_id,trace_id,metadata) VALUES(?1,'a','before-upgrade','decided',?2,'req-1','session-1','trace-1',?3)",
+        rusqlite::params![event.event_id, event.ts_utc_ms, serde_json::to_string(&event.metadata).unwrap()]).unwrap();
+    drop(conn);
+    for _ in 0..2 {
+        let store = EventLogStore::open(&db).unwrap();
+        assert_eq!(
+            store
+                .events_for_record(Some("a"), "before-upgrade")
+                .unwrap(),
+            vec![EventLogEvent {
+                sequence: 1,
+                event: event.clone()
+            }]
+        );
+        let conn = store.0.lock().unwrap();
+        let versions: Vec<i64> = conn
+            .prepare("SELECT version FROM main.event_log_schema_migrations ORDER BY version")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(versions, [1, 2]);
+        verify_canonical_schema(&conn, 2).unwrap();
+    }
+    let fresh = EventLogStore::new(Connection::open_in_memory().unwrap()).unwrap();
+    verify_canonical_schema(&fresh.0.lock().unwrap(), 2).unwrap();
+}
+
+#[test]
+fn migration_rejects_gaps_and_missing_or_noncanonical_v2_indexes() {
+    for mutation in [
+        "DELETE FROM event_log_schema_migrations WHERE version=1",
+        "INSERT INTO event_log_schema_migrations VALUES(0)",
+        "INSERT INTO event_log_schema_migrations VALUES(3)",
+        "DROP INDEX event_log_tenant_type_time",
+        "DROP INDEX event_log_tenant_type_time; CREATE INDEX event_log_tenant_type_time ON event_log_events(tenant_id,ts_utc_ms,event_type)",
+        "DROP INDEX event_log_tenant_type_time; CREATE INDEX event_log_tenant_type_time ON event_log_events(tenant_id,event_type,ts_utc_ms) WHERE ts_utc_ms>0",
+    ] {
+        let mut conn = Connection::open_in_memory().unwrap();
+        migrate(&mut conn).unwrap();
+        conn.execute_batch(mutation).unwrap();
+        assert!(
+            matches!(migrate(&mut conn), Err(EventLogError::SchemaIncomplete)),
+            "{mutation}"
+        );
+    }
+    // Invalid v1 must fail before creating either the v2 index or marker.
+    let mut conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch(include_str!("migrations/0001_events.sql"))
+        .unwrap();
+    conn.execute_batch("CREATE TABLE event_log_schema_migrations (version INTEGER PRIMARY KEY); INSERT INTO event_log_schema_migrations VALUES(1); DROP TRIGGER event_log_no_delete;").unwrap();
+    assert!(matches!(
+        migrate(&mut conn),
+        Err(EventLogError::SchemaIncomplete)
+    ));
+    assert_eq!(
+        conn.query_row(
+            "SELECT count(*) FROM main.event_log_schema_migrations WHERE version=2",
+            [],
+            |row| row.get::<_, i64>(0)
+        )
+        .unwrap(),
+        0
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT count(*) FROM main.sqlite_master WHERE name='event_log_tenant_type_time'",
+            [],
+            |row| row.get::<_, i64>(0)
+        )
+        .unwrap(),
+        0
     );
 }

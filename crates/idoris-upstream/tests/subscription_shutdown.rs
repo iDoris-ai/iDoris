@@ -92,6 +92,7 @@ fn service(fake: &FakeBin) -> SubscriptionService {
 
 fn request(id: &str) -> ChatRequest {
     ChatRequest {
+        native: None,
         model: "claude-subscription".into(),
         messages: vec![ChatMessage {
             role: "user".into(),

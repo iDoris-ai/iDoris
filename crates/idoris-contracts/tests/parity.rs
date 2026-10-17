@@ -156,6 +156,80 @@ fn inspect_response_corpus() {
     assert_parity::<InspectResponse>(file, &missing);
 }
 
+// Independent verdicts: agreement alone also passes when both validators are wrong.
+fn inspect_response_expected_cases() -> Vec<(Value, bool)> {
+    let special = json!({"kind": "input_limit_exceeded"});
+    let spanned = json!({"kind": "input_limit_exceeded", "span": {"start": 0, "length": 1}});
+    let mobile = json!({"kind": "cn_mobile", "span": {"start": 0, "length": 11}});
+    vec![
+        (
+            json!({"sensitivity": "S0", "findings": [spanned], "action": "BLOCK"}),
+            false,
+        ),
+        (
+            json!({"sensitivity": "S0", "findings": [special], "action": "ALLOW"}),
+            false,
+        ),
+        (
+            json!({"sensitivity": "S0", "findings": [special], "action": "REDACT"}),
+            false,
+        ),
+        (
+            json!({"sensitivity": "S0", "findings": [spanned], "action": "ALLOW"}),
+            false,
+        ),
+        (
+            json!({"sensitivity": "S0", "findings": [mobile, special], "action": "ALLOW"}),
+            false,
+        ),
+        (
+            json!({"sensitivity": "S0", "findings": [mobile, spanned], "action": "BLOCK"}),
+            false,
+        ),
+        (
+            json!({"sensitivity": "S0", "findings": [special], "action": "BLOCK"}),
+            true,
+        ),
+        (
+            json!({"sensitivity": "S0", "findings": [mobile, special], "action": "BLOCK"}),
+            true,
+        ),
+        (
+            json!({"sensitivity": "S0", "findings": [mobile], "action": "ALLOW"}),
+            true,
+        ),
+        (
+            json!({"sensitivity": "S0", "findings": [], "action": "ALLOW"}),
+            true,
+        ),
+    ]
+}
+
+#[test]
+fn inspect_response_expected_rust_verdicts() {
+    let mismatches: Vec<_> = inspect_response_expected_cases()
+        .into_iter()
+        .filter(|(instance, expected)| {
+            idoris_contracts::parse::<InspectResponse>(instance).is_ok() != *expected
+        })
+        .collect();
+    assert!(mismatches.is_empty(), "wrong Rust verdicts: {mismatches:?}");
+}
+
+#[test]
+fn inspect_response_expected_schema_verdicts() {
+    let mismatches: Vec<_> = inspect_response_expected_cases()
+        .into_iter()
+        .filter(|(instance, expected)| {
+            schema_says_valid("inspect-response.schema.json", instance) != *expected
+        })
+        .collect();
+    assert!(
+        mismatches.is_empty(),
+        "wrong schema verdicts: {mismatches:?}"
+    );
+}
+
 #[test]
 fn admin_v0_backends_corpus() {
     let valid = json!([{

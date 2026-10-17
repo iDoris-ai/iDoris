@@ -69,6 +69,7 @@ pub struct LiveCapabilitiesProvider {
     catalog: Arc<Catalog>,
     facts: HostFacts,
     policy: Option<PartialPolicy>,
+    allocated_budget_bytes: Option<u64>,
     runtimes: RuntimeRegistry,
 }
 
@@ -78,6 +79,7 @@ impl LiveCapabilitiesProvider {
             catalog: Arc::new(catalog),
             facts,
             policy: None,
+            allocated_budget_bytes: None,
             runtimes,
         }
     }
@@ -87,9 +89,22 @@ impl LiveCapabilitiesProvider {
         self
     }
 
+    /// Set the total externally allocated memory in integer bytes. `None` keeps
+    /// legacy host-derived recommendations; this never changes physical facts.
+    pub fn with_allocated_budget_bytes(mut self, allocated_budget_bytes: Option<u64>) -> Self {
+        self.allocated_budget_bytes = allocated_budget_bytes;
+        self
+    }
+
     async fn live_snapshot(&self) -> Result<Vec<CapabilityEntry>, CapabilitiesError> {
-        let recommendation = recommend(&self.facts, &self.catalog, self.policy.as_ref(), None)
-            .map_err(|_| CapabilitiesError::new("recommender snapshot failed"))?;
+        let recommendation = recommend(
+            &self.facts,
+            &self.catalog,
+            self.policy.as_ref(),
+            None,
+            self.allocated_budget_bytes,
+        )
+        .map_err(|_| CapabilitiesError::new("recommender snapshot failed"))?;
         let queue_depth = self.runtimes.queue_depth().await;
         Ok(map_recommendation(
             &recommendation,
@@ -351,6 +366,50 @@ mod tests {
         assert_eq!(default[0].ctx_limit, 32_768);
         assert_eq!(short[0].ctx_limit, 4096);
         assert!(short[0].estimated_memory_gb < default[0].estimated_memory_gb);
+    }
+
+    #[tokio::test]
+    async fn allocated_provider_maps_ready_eviction_and_total_blocked_using_real_facts() {
+        let catalog = load_catalog(repo_root().join("config/catalog.yaml")).unwrap();
+        let policy = PartialPolicy {
+            temp_slots: Some(0),
+            ..Default::default()
+        };
+        let baseline = recommend(&facts(64.0), &catalog, Some(&policy), None, None).unwrap();
+        let vision_bytes = (baseline
+            .temp
+            .iter()
+            .find(|t| t.capability == idoris_contracts::common::Capability::Vision)
+            .unwrap()
+            .quant
+            .footprint_gb
+            * 1e9)
+            .round() as u64;
+        for (budget, expected) in [
+            (None, AdmissionStatus::Ready),
+            (Some(0), AdmissionStatus::Blocked),
+            (Some(vision_bytes - 1), AdmissionStatus::Blocked),
+            (Some(vision_bytes), AdmissionStatus::RequiresEviction),
+            (Some(40_000_000_000), AdmissionStatus::Ready),
+        ] {
+            let provider = LiveCapabilitiesProvider::new(
+                catalog.clone(),
+                facts(64.0),
+                RuntimeRegistry::default(),
+            )
+            .with_policy(policy.clone())
+            .with_allocated_budget_bytes(budget);
+            let entries = provider.snapshot().await.unwrap();
+            let vision = entries
+                .iter()
+                .find(|entry| entry.id == "qwen2.5-vl-7b")
+                .unwrap();
+            assert_eq!(vision.admission_status, expected, "{budget:?}");
+            assert_eq!(vision.capability, "vision");
+            assert!(!vision.resident);
+            assert_eq!(vision.queue_depth, 0);
+            assert_eq!(entries.iter().filter(|e| e.id == vision.id).count(), 1);
+        }
     }
 
     #[test]

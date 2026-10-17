@@ -52,7 +52,7 @@ X-iDoris-Cost-Minor: <int>          # 本次调用成本，最小货币单位
 ## 3. TenantContext
 
 ```yaml
-tenant_id: acme-co                  # 消费方负责验明身份后传入；Router 不做签发/鉴权
+tenant_id: acme-co                  # 消费方验明用户身份；Router 再校验 virtual key 的 tenant 绑定
 budget:
   limit_minor: 5000000              # 账期上限，最小货币单位（整数，避免浮点）
   spent_minor: 1234567              # 本账期已花费（Router 维护）
@@ -63,7 +63,7 @@ quota:                              # 可选
   tpm: 200000
 ```
 
-**`tenant_id` 的来源**：Router **不做租户鉴权与签发**——那是组织侧的事。Router 只消费「已验明的 tenant_id」，并对它做隔离与计账。消费方必须保证不把 A 租户的请求打上 B 的 tenant_id。
+**`tenant_id` 的来源**：组织侧负责验明用户身份，并为每个租户申请绑定 `tenant_id` 的 iDoris virtual key。Router 对 tenant 模式的请求，先验证 key 中持久化的 `tenant_id` 与 `X-iDoris-Tenant` 相同，再读写租户数据。未绑定租户的旧 key 不能用于 tenant 模式。消费方仍负责正确识别其用户和租户。
 
 ## 4. 预算：耗尽是**拒绝**，不是降级
 
@@ -152,6 +152,20 @@ GET /idoris/tenants/{tenant_id}/audit?from=&to=&limit=   # 审计记录（仅元
 
 **硬保证**：同一批数据在任何时区的机器上聚合，`totals` 与 `range_utc` 必须完全一致——不是尽力而为。
 
+### Completed 事件中的 token 估算来源
+
+请求事件查询 `GET /idoris/tenants/{tenant_id}/requests/{record_id}` 返回原始事件 metadata。
+本地成功完成的 `completed` 事件携带 `tokens_in` / `tokens_out`，以及无内容的标量
+`token_estimator: "conservative"`。这两个数量是预算估算器
+`idoris_tenancy::budget::estimate_tokens` 对拼接 prompt 和提取出的回复文本的估算事实，
+与预算结算使用相同口径，不是模型报告的实际 token 数。
+
+响应体 `usage` 和用量记录仍使用 `rough_token_estimate`（UTF-16 长度 / 4 向上取整）；
+它们与 Completed 的保守预算估算不同，同一 `record_id` 下也不保证相等，尤其是 CJK 文本。
+预算金额和两个现有估算器均保持原有行为。失败的本地完成、proxy 和 stream 完成不写入
+`tokens_in` / `tokens_out` / `token_estimator`，缺失不能解释为零。
+历史 append-only 事件可能没有来源标签；不能据此推断它们是 rough 或真实 token 数。
+
 ## 7. 消费方迁移清单
 
 1. 把本地路由/成本/审计层改成薄客户端：调 `/v1/*` 并带 `X-iDoris-Tenant`。
@@ -163,7 +177,7 @@ GET /idoris/tenants/{tenant_id}/audit?from=&to=&limit=   # 审计记录（仅元
 
 ## 8. 未定 / 后续
 
-- **租户鉴权与签发**：不在本契约内，组织侧负责。
+- **用户身份与租户归属**：组织侧负责。Router 负责验证 virtual key 的租户绑定；`idoris key issue --spec-stdin` 的 spec 在 tenant 用途下需包含 `tenant_id`。
 - **跨租户聚合报表**（组织管理员视角）：未定，需要时另起契约。
 - **`quota.rpm/tpm` 限流**：字段已留位，语义与实现待 F1.5 之后。
 
@@ -173,4 +187,4 @@ GET /idoris/tenants/{tenant_id}/audit?from=&to=&limit=   # 审计记录（仅元
 | 402 / 决策 `reason` **传达到人** | **消费方** | Router 只到结构化错误体 + `X-iDoris-Reason`。再往前要知道「谁是负责人、他用什么看通知」，那是业务语义，本契约不承载。**一个只写进日志的 402 等于没传到人。** |
 | 消费方自身进程的出网启动断言 | **消费方** | 与 Router 的 `T1.3.6` 是**同一机制的两个实例，不是一份代码的两个副本**——各留各的，都需要 |
 | 账期时区解析与对账凭据 | **iDoris** | 由 `usage` 响应的 `billing_timezone` + `range_utc` 提供，供消费方出账单前断言 |
-| 租户身份鉴权与签发 | **组织侧 / 消费方** | Router 只消费已验明的 `tenant_id` |
+| 用户身份与租户归属 | **组织侧 / 消费方** | 组织侧验明用户；Router 对照 virtual key 的持久化租户绑定校验请求头 |
