@@ -104,6 +104,18 @@ impl Breaker {
         }
     }
 
+    /// What [`Self::admit`] would answer, without claiming a probe — for
+    /// steering selection away from a provider before choosing one.
+    pub fn would_admit(&self, now_ms: u64) -> bool {
+        match self.state {
+            State::Closed { .. } => true,
+            State::Open { until_ms } => now_ms >= until_ms,
+            State::HalfOpen { since_ms } => {
+                now_ms >= since_ms.saturating_add(self.class.recovery_ms())
+            }
+        }
+    }
+
     pub fn on_success(&mut self) {
         self.state = State::Closed { failures: 0 };
     }
@@ -161,6 +173,13 @@ impl<K: Eq + Hash + Clone> BreakerBook<K> {
 
     pub fn admit(&mut self, key: &K, class: CredentialClass, now_ms: u64) -> Admission {
         self.entry(key, class).admit(now_ms)
+    }
+
+    /// Read-only; a key never seen is admitted.
+    pub fn would_admit(&self, key: &K, now_ms: u64) -> bool {
+        self.breakers
+            .get(key)
+            .is_none_or(|breaker| breaker.would_admit(now_ms))
     }
 
     pub fn on_success(&mut self, key: &K, class: CredentialClass) {
@@ -294,6 +313,18 @@ mod tests {
         for raw in ["", "-1", "1.5", "Wed, 21 Oct 2015 07:28:00 GMT"] {
             assert_eq!(parse_retry_after_ms(raw), None, "{raw}");
         }
+    }
+
+    #[test]
+    fn would_admit_matches_admit_without_claiming_the_probe() {
+        let mut breaker = tripped(CredentialClass::Local, 0);
+        assert!(!breaker.would_admit(14_999));
+        assert!(breaker.would_admit(15_000));
+        assert!(breaker.would_admit(15_000), "peeking twice claims nothing");
+        assert_eq!(breaker.admit(15_000), Admission::Probe);
+        assert!(!breaker.would_admit(15_001));
+        let book: BreakerBook<&str> = BreakerBook::new();
+        assert!(book.would_admit(&"never-seen", 0));
     }
 
     #[test]

@@ -129,7 +129,7 @@ fn default_load_policy() -> LoadPolicy {
 /// mapping isn't wired yet, and real admission state is only known after
 /// asking the Supervisor (post-selection, see [`dispatch_local`]).
 /// `estimated_cost_minor` comes from [`budget::estimate_cost_minor`].
-fn candidate(component: &ComponentCard, prompt: &str) -> Card {
+fn candidate(component: &ComponentCard, prompt: &str, blocked: bool) -> Card {
     Card {
         component: component.clone(),
         roles: ROLES
@@ -140,7 +140,13 @@ fn candidate(component: &ComponentCard, prompt: &str) -> Card {
         experiment: false,
         min_ram_gb: 0.0,
         estimated_cost_minor: budget::estimate_cost_minor(&component.provider.cost, prompt),
-        admission_status: AdmissionStatus::Ready,
+        // M5-16: an open provider breaker is an admission fact; decide()
+        // drops Blocked candidates at its admission stage.
+        admission_status: if blocked {
+            AdmissionStatus::Blocked
+        } else {
+            AdmissionStatus::Ready
+        },
     }
 }
 
@@ -244,7 +250,30 @@ pub fn select_with_affinity_and_ready(
     affinity_key: Option<&str>,
     ready_provider_ids: &BTreeSet<String>,
 ) -> Result<Selected, DispatchError> {
-    let candidates: Vec<Card> = cards.iter().map(|c| candidate(c, prompt)).collect();
+    select_avoiding_open_breakers(
+        cards,
+        profile,
+        prompt,
+        affinity_key,
+        ready_provider_ids,
+        &BTreeSet::new(),
+    )
+}
+
+/// [`select_with_affinity_and_ready`] with providers whose breaker is open
+/// marked `Blocked`, so another candidate is chosen when one exists.
+pub fn select_avoiding_open_breakers(
+    cards: &[ComponentCard],
+    profile: &ParsedProfile,
+    prompt: &str,
+    affinity_key: Option<&str>,
+    ready_provider_ids: &BTreeSet<String>,
+    open_provider_ids: &BTreeSet<String>,
+) -> Result<Selected, DispatchError> {
+    let blocked: Vec<Card> = cards
+        .iter()
+        .map(|c| candidate(c, prompt, open_provider_ids.contains(&c.provider.id)))
+        .collect();
     let request_profile = RequestProfile {
         task: profile.task.clone(),
         role: profile.role,
@@ -255,15 +284,35 @@ pub fn select_with_affinity_and_ready(
         min_ram_gb: None,
         budget: None,
     };
-    let decision = decide_with_affinity_and_ready(
+    let mut pool = blocked;
+    let decision = match decide_with_affinity_and_ready(
         &request_profile,
-        &candidates,
+        &pool,
         &ctx,
         affinity_key,
         ready_provider_ids,
-    )
-    .map_err(DispatchError::Rejection)?;
-    let Some(chosen) = candidates.iter().find(|c| c.id() == decision.chosen_id) else {
+    ) {
+        Ok(decision) => decision,
+        // When the open set covers every eligible card, marking them all
+        // `Blocked` turns "everything is cooling down" into
+        // `no_eligible_candidate`, which is a different contract: clients key on
+        // the error type to decide whether to retry. Fall back to plain
+        // selection so the proxy send gate can answer the retryable
+        // `provider_circuit_open` instead.
+        Err(_) if !open_provider_ids.is_empty() => {
+            pool = cards.iter().map(|c| candidate(c, prompt, false)).collect();
+            decide_with_affinity_and_ready(
+                &request_profile,
+                &pool,
+                &ctx,
+                affinity_key,
+                ready_provider_ids,
+            )
+            .map_err(DispatchError::Rejection)?
+        }
+        Err(rejection) => return Err(DispatchError::Rejection(rejection)),
+    };
+    let Some(chosen) = pool.iter().find(|c| c.id() == decision.chosen_id) else {
         return Err(DispatchError::Internal(format!(
             "decide() returned chosen_id {:?} absent from its own candidate list",
             decision.chosen_id

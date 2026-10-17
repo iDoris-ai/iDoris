@@ -379,6 +379,26 @@ pub struct ChatProxy {
 }
 
 impl ChatProxy {
+    /// Providers among `provider_ids` whose breaker would refuse a send now
+    /// (read-only, so selection can steer away without claiming a probe).
+    pub(crate) fn open_providers<'a>(
+        &self,
+        provider_ids: impl IntoIterator<Item = &'a str>,
+    ) -> std::collections::BTreeSet<String> {
+        if !self.breakers_enabled() {
+            return std::collections::BTreeSet::new();
+        }
+        let now_ms = wall_clock_ms();
+        let Ok(book) = self.breakers.lock() else {
+            return provider_ids.into_iter().map(str::to_string).collect();
+        };
+        provider_ids
+            .into_iter()
+            .filter(|id| !book.would_admit(&id.to_string(), now_ms))
+            .map(str::to_string)
+            .collect()
+    }
+
     /// Claims an upstream send for `provider_id`. A poisoned lock fails
     /// closed: no send.
     /// Turns provider breakers on or off for every later request.
