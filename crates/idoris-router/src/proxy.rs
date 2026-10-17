@@ -31,7 +31,7 @@
 //! collision ambiguity.
 
 use std::io::{self, Write};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -280,8 +280,58 @@ impl Drop for FlightCancellationGuard {
     }
 }
 
+/// Requests and body bytes the proxy attempted to send to a non-loopback
+/// host: the M5 remote egress counter. Counted per attempt, before the send,
+/// from the exact serialized body, so a failed connection still counts — the
+/// number can over-state but never under-state what left the machine.
+/// Classified by the target URL's host, not by what the card claims.
+#[derive(Debug, Default)]
+pub struct EgressCounter {
+    requests: AtomicU64,
+    bytes: AtomicU64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct EgressSnapshot {
+    pub requests: u64,
+    pub bytes: u64,
+}
+
+impl EgressCounter {
+    fn record(&self, url: &str, bytes: usize) {
+        if !is_loopback_url(url) {
+            self.requests.fetch_add(1, Ordering::Relaxed);
+            self.bytes.fetch_add(bytes as u64, Ordering::Relaxed);
+        }
+    }
+
+    pub fn snapshot(&self) -> EgressSnapshot {
+        EgressSnapshot {
+            requests: self.requests.load(Ordering::Relaxed),
+            bytes: self.bytes.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// `localhost` or a loopback IP literal. Anything else — other names
+/// included, since they may resolve off-host — counts as egress.
+fn is_loopback_url(url: &str) -> bool {
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        return false;
+    };
+    parsed.host_str().is_some_and(|host| {
+        host.eq_ignore_ascii_case("localhost")
+            || host
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|ip| ip.is_loopback())
+    })
+}
+
 pub struct ChatProxy {
     pub(crate) client: reqwest::Client,
+    egress: Arc<EgressCounter>,
     pub(crate) window: Duration,
     max_entries: usize,
     header_timeout: Duration,
@@ -304,12 +354,34 @@ pub struct ChatProxy {
 }
 
 impl ChatProxy {
+    /// Off-host egress observed so far by this proxy.
+    pub fn egress(&self) -> EgressSnapshot {
+        self.egress.snapshot()
+    }
+
+    /// The POST exactly as it goes on the wire, recorded in the egress
+    /// counter first when the host is not loopback.
+    fn outbound(&self, url: &str, payload: &Value) -> reqwest::RequestBuilder {
+        let request = self.client.post(url);
+        match serde_json::to_vec(payload) {
+            Ok(body) => {
+                self.egress.record(url, body.len());
+                request
+                    .header(reqwest::header::CONTENT_TYPE, "application/json")
+                    .body(body)
+            }
+            // Unreachable for a `Value`; let reqwest report its own error.
+            Err(_) => request.json(payload),
+        }
+    }
+
     /// Creates a proxy. The injected `client` must have redirects disabled
     /// for connection-failure retries to be safe, since a redirect can obscure
     /// whether the upstream accepted the POST.
     pub fn new(client: reqwest::Client) -> Self {
         Self {
             client,
+            egress: Arc::new(EgressCounter::default()),
             window: DEFAULT_WINDOW,
             max_entries: DEFAULT_MAX_ENTRIES,
             header_timeout: Duration::from_secs(10),
@@ -950,11 +1022,8 @@ impl ChatProxy {
         loop {
             // Keep the transport error until retry classification: only a
             // connection failure proves that this POST was not executed.
-            let sent = tokio::time::timeout(
-                self.header_timeout,
-                self.client.post(url).json(payload).send(),
-            )
-            .await;
+            let sent =
+                tokio::time::timeout(self.header_timeout, self.outbound(url, payload).send()).await;
             match sent {
                 Ok(Ok(resp)) => {
                     let status = resp.status().as_u16();
@@ -1127,17 +1196,15 @@ impl ChatProxy {
             obj.insert("stream".to_string(), Value::Bool(true));
         }
         observer().await?;
-        let sent = match tokio::time::timeout(
-            self.header_timeout,
-            self.client.post(&url).json(&payload).send(),
-        )
-        .await
-        {
-            Ok(sent) => sent,
-            Err(_) => {
-                return Ok(Self::stream_failure(504, ExecutionDisposition::Uncertain));
-            }
-        };
+        let sent =
+            match tokio::time::timeout(self.header_timeout, self.outbound(&url, &payload).send())
+                .await
+            {
+                Ok(sent) => sent,
+                Err(_) => {
+                    return Ok(Self::stream_failure(504, ExecutionDisposition::Uncertain));
+                }
+            };
         Ok(match sent {
             Ok(resp) => {
                 let status = resp.status().as_u16();
@@ -1479,6 +1546,66 @@ mod tests {
         assert_eq!(out.retries, 0);
         let body: Value = serde_json::from_slice(&out.body).unwrap();
         assert_eq!(body["marker"], "raw-passthrough");
+    }
+
+    #[test]
+    fn only_localhost_and_loopback_literals_are_not_egress() {
+        for url in [
+            "http://127.0.0.1:8080/v1",
+            "http://127.9.9.9",
+            "http://LOCALHOST:1",
+            "http://[::1]:2/x",
+        ] {
+            assert!(is_loopback_url(url), "{url}");
+        }
+        for url in [
+            "http://10.0.0.5:8080",
+            "https://api.openai.com/v1",
+            "http://127.0.0.1.nip.io",
+            "http://[::ffff:8.8.8.8]",
+            "not a url",
+        ] {
+            assert!(!is_loopback_url(url), "{url}");
+        }
+    }
+
+    #[tokio::test]
+    async fn off_host_attempts_count_exact_wire_bytes_and_loopback_does_not() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .mount(&server)
+            .await;
+        let client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_millis(50))
+            .build()
+            .unwrap();
+        let mut proxy = ChatProxy::new(client);
+        proxy.retry_delays = Vec::new();
+
+        let local = proxy
+            .forward_buffered(&server.uri(), &chat_body(), &opts(None, "rec-local"))
+            .await;
+        assert_eq!(local.status, 200);
+        assert_eq!(proxy.egress(), EgressSnapshot::default());
+        let wire_bytes = server.received_requests().await.unwrap()[0].body.len() as u64;
+
+        // TEST-NET-1: never reachable, so this only proves the attempt is
+        // counted before the send, with the same bytes the loopback got.
+        let _ = proxy
+            .forward_buffered(
+                "http://192.0.2.1:9",
+                &chat_body(),
+                &opts(None, "rec-remote"),
+            )
+            .await;
+        assert_eq!(
+            proxy.egress(),
+            EgressSnapshot {
+                requests: 1,
+                bytes: wire_bytes
+            }
+        );
     }
 
     #[tokio::test]
