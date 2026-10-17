@@ -393,6 +393,40 @@ mod lockout_window_tests {
         );
     }
 
+    /// The subscription relay path (`ChatProxy::report_outcome`) also never
+    /// claims `admit`, so it depends on the same reopen rule. OAuth: 3 faults,
+    /// 60 s window. Measured through the bare breaker because `open_providers`
+    /// reads the wall clock and this path is not time-injectable.
+    #[test]
+    fn oauth_relay_faults_past_the_window_reopen_the_lockout() {
+        let class = CredentialClass::OAuth;
+        let window = class.recovery_ms();
+        let mut breaker = Breaker::new(class);
+
+        for _ in 0..class.failure_threshold() {
+            breaker.on_failure(0);
+        }
+        assert!(!breaker.would_admit(0), "threshold faults must open it");
+
+        // 61 s later the window has expired: selection peeks and admits.
+        assert!(breaker.would_admit(window + 1_000), "expired window admits");
+
+        // A relay fault now must re-lock instead of inheriting the stale deadline.
+        breaker.on_failure(window + 1_000);
+        assert!(
+            !breaker.would_admit(window + 1_000),
+            "a fault on the relay path must reopen the OAuth lockout"
+        );
+        assert!(
+            !breaker.would_admit(window + 1_000 + window - 1),
+            "the reopened window still rejects"
+        );
+        assert!(
+            breaker.would_admit(window + 1_000 + window),
+            "after the reopened window it is admitted again"
+        );
+    }
+
     /// Control: a failure inside a still-valid window keeps that deadline
     /// instead of extending it, so a single window is not stretched by noise.
     #[test]

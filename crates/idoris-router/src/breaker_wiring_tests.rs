@@ -287,3 +287,58 @@ async fn the_fallback_re_decide_agrees_with_the_decided_rejection() {
     assert_eq!(error["error"]["type"], decided.event.metadata["reason"]);
     assert_eq!(adapter.load_call_count("only-flaky"), 2);
 }
+
+#[test]
+fn subscription_relay_faults_are_classified_for_the_oauth_breaker() {
+    use idoris_upstream::subscription::error::{
+        SubscriptionErrorCode as Code, SubscriptionRelayError,
+    };
+    use subscription::dispatch::SubscriptionDispatchError as E;
+    let relay = |code| Err::<(), _>(E::Relay(SubscriptionRelayError::new(code)));
+    for code in [
+        Code::CliFailed,
+        Code::EmptyOutput,
+        Code::SpawnFailed,
+        Code::Timeout,
+        Code::CleanupFailed,
+    ] {
+        assert_eq!(
+            super::subscription_fault(&relay(code)),
+            Some(true),
+            "{code:?}"
+        );
+    }
+    for code in [Code::Cancelled, Code::OutputLimit] {
+        assert_eq!(super::subscription_fault(&relay(code)), None, "{code:?}");
+    }
+    assert_eq!(super::subscription_fault(&Ok::<(), E>(())), Some(false));
+    assert_eq!(
+        super::subscription_fault(&Err::<(), _>(E::PrivacyForbidden)),
+        None
+    );
+    assert_eq!(
+        super::subscription_fault(&Err::<(), _>(E::NotSubscription)),
+        None
+    );
+}
+
+#[test]
+fn reported_subscription_faults_open_the_oauth_breaker_after_three() {
+    let proxy = proxy::ChatProxy::new(reqwest::Client::new());
+    let oauth = idoris_policy::breaker::CredentialClass::OAuth;
+    let id = idoris_policy::SUBSCRIPTION_PROVIDER_ID;
+    for _ in 0..2 {
+        proxy.report_outcome(id, oauth, Some(true));
+    }
+    assert!(
+        proxy.open_providers([id]).is_empty(),
+        "two faults must not open it"
+    );
+    proxy.report_outcome(id, oauth, None);
+    assert!(
+        proxy.open_providers([id]).is_empty(),
+        "ignored outcomes do not count"
+    );
+    proxy.report_outcome(id, oauth, Some(true));
+    assert!(proxy.open_providers([id]).contains(id));
+}

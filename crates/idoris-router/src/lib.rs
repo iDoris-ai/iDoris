@@ -2367,7 +2367,7 @@ async fn chat_completions(
                 .task
                 .privacy
                 .unwrap_or(idoris_contracts::common::PrivacyClass::LocalOnly);
-            return match subscription::dispatch::dispatch_selected(
+            let result = subscription::dispatch::dispatch_selected(
                 selected,
                 privacy,
                 lifecycle.peer(),
@@ -2375,8 +2375,13 @@ async fn chat_completions(
                 messages.clone(),
                 lifecycle.cancellation_token(),
             )
-            .await
-            {
+            .await;
+            state.proxy.report_outcome(
+                idoris_policy::SUBSCRIPTION_PROVIDER_ID,
+                idoris_policy::breaker::CredentialClass::OAuth,
+                subscription_fault(&result),
+            );
+            return match result {
                 Ok(chat) => subscription::response::success(
                     &chat,
                     &prompt,
@@ -2507,8 +2512,9 @@ async fn chat_completions(
         .await
     };
     if let Ok(outcome) = &dispatch_result {
-        state.proxy.report_local_outcome(
+        state.proxy.report_outcome(
             &outcome.decision.chosen_id,
+            idoris_policy::breaker::CredentialClass::Local,
             local_model_fault(&outcome.result),
         );
     }
@@ -2546,6 +2552,29 @@ async fn chat_completions(
                 response
             }
         },
+    }
+}
+
+/// M5-19: the subscription relay's own failures count against the
+/// subscription provider (OAuth class: 3 faults, 60s); a cancelled relay,
+/// an over-long answer, and every local rejection say nothing about it.
+fn subscription_fault<T>(
+    result: &Result<T, subscription::dispatch::SubscriptionDispatchError>,
+) -> Option<bool> {
+    use idoris_upstream::subscription::error::SubscriptionErrorCode as Code;
+    match result {
+        Ok(_) => Some(false),
+        Err(subscription::dispatch::SubscriptionDispatchError::Relay(error)) => {
+            match error.code() {
+                Code::CliFailed
+                | Code::EmptyOutput
+                | Code::SpawnFailed
+                | Code::Timeout
+                | Code::CleanupFailed => Some(true),
+                Code::Cancelled | Code::OutputLimit => None,
+            }
+        }
+        Err(_) => None,
     }
 }
 
