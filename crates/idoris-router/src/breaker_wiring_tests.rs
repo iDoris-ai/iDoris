@@ -130,3 +130,120 @@ async fn selection_moves_to_a_healthy_candidate_once_a_breaker_opens() {
         .unwrap();
     assert_eq!(decided.event.metadata["provider_id"], "b-healthy");
 }
+
+#[tokio::test]
+async fn protocol_selection_also_moves_to_a_healthy_candidate() {
+    let failing = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(503).set_body_json(json!({"error": "busy"})))
+        .mount(&failing)
+        .await;
+    let healthy = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"object": "list", "data": []})),
+        )
+        .mount(&healthy)
+        .await;
+    let embedding = |id: &str, uri: &str| {
+        let mut card = resident_component_card(id, uri);
+        card.provider.capabilities = vec![idoris_contracts::common::Capability::Embedding];
+        card
+    };
+    let app = build_app(AppState {
+        cards: vec![
+            embedding("a-failing", &failing.uri()),
+            embedding("b-healthy", &healthy.uri()),
+        ],
+        ..AppState::default()
+    });
+    let mut statuses = Vec::new();
+    for _ in 0..3 {
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/embeddings")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"model":"embed","input":["hello"]}"#))
+            .unwrap();
+        statuses.push(app.clone().oneshot(request).await.unwrap().status());
+    }
+    assert_eq!(
+        statuses,
+        [
+            StatusCode::SERVICE_UNAVAILABLE,
+            StatusCode::SERVICE_UNAVAILABLE,
+            StatusCode::OK
+        ]
+    );
+    assert_eq!(failing.received_requests().await.unwrap().len(), 2);
+    assert_eq!(healthy.received_requests().await.unwrap().len(), 1);
+}
+
+/// Same acceptance as the chat case, on the three protocol endpoints: when the
+/// single eligible card's breaker is open, the third request must stay the
+/// retryable `provider_circuit_open` and must not be sent.
+#[tokio::test]
+async fn single_card_all_open_keeps_the_retryable_reason_on_protocol_endpoints() {
+    for (uri, capability, payload) in [
+        (
+            "/v1/embeddings",
+            idoris_contracts::common::Capability::Embedding,
+            r#"{"model":"embed","input":["hello"]}"#,
+        ),
+        (
+            "/v1/rerank",
+            idoris_contracts::common::Capability::Rerank,
+            r#"{"model":"rerank","query":"q","documents":["a","b"]}"#,
+        ),
+        (
+            "/v1/messages",
+            idoris_contracts::common::Capability::Chat,
+            r#"{"model":"idoris/daily","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}"#,
+        ),
+    ] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(503).set_body_json(json!({"error": "busy"})))
+            .mount(&server)
+            .await;
+        let mut card = resident_component_card("only-card", &server.uri());
+        card.provider.capabilities = vec![capability];
+        let app = build_app(AppState {
+            cards: vec![card],
+            ..AppState::default()
+        });
+
+        let mut statuses = Vec::new();
+        let mut bodies = Vec::new();
+        for _ in 0..3 {
+            let request = axum::http::Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("content-type", "application/json")
+                .body(Body::from(payload))
+                .unwrap();
+            let response = app.clone().oneshot(request).await.unwrap();
+            statuses.push(response.status());
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            bodies.push(serde_json::from_slice::<serde_json::Value>(&bytes).ok());
+        }
+
+        assert_eq!(
+            statuses[2],
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{uri} third request must be 503"
+        );
+        let Some(refusal) = bodies[2].as_ref() else {
+            panic!("{uri} refusal body is not JSON");
+        };
+        assert_eq!(
+            refusal["error"]["type"], "provider_circuit_open",
+            "{uri} all-open must answer the retryable breaker reason, got {refusal}"
+        );
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            2,
+            "{uri} the refused request must not be sent"
+        );
+    }
+}

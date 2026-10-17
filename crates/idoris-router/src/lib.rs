@@ -562,6 +562,26 @@ fn protocol_inspected_privacy(
     .effective
 }
 
+/// Protocol endpoints only ever pick resident http_service cards; steer
+/// away from those whose provider breaker is open (M5-17).
+fn select_protocol_card(
+    state: &AppState,
+    cards: &[idoris_contracts::ComponentCard],
+    parsed: &profile::ParsedProfile,
+) -> Result<dispatch::Selected, DispatchError> {
+    let open = state
+        .proxy
+        .open_providers(cards.iter().map(|card| card.provider.id.as_str()));
+    dispatch::select_avoiding_open_breakers(
+        cards,
+        parsed,
+        "",
+        None,
+        &std::collections::BTreeSet::new(),
+        &open,
+    )
+}
+
 async fn embeddings(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -614,7 +634,7 @@ async fn embeddings(
         .into_iter()
         .filter(dispatch::is_resident_http_service)
         .collect::<Vec<_>>();
-    let selected = match dispatch::select(&cards, &parsed, "") {
+    let selected = match select_protocol_card(&state, &cards, &parsed) {
         Ok(selected) => selected,
         Err(DispatchError::Rejection(rejection)) => return rejection_response(rejection),
         Err(DispatchError::Internal(message)) => {
@@ -760,7 +780,7 @@ async fn rerank(
         .into_iter()
         .filter(dispatch::is_resident_http_service)
         .collect::<Vec<_>>();
-    let selected = match dispatch::select(&cards, &parsed, "") {
+    let selected = match select_protocol_card(&state, &cards, &parsed) {
         Ok(selected) => selected,
         Err(DispatchError::Rejection(rejection)) => return rejection_response(rejection),
         Err(DispatchError::Internal(message)) => {
@@ -917,7 +937,7 @@ async fn messages(
         .into_iter()
         .filter(dispatch::is_resident_http_service)
         .collect::<Vec<_>>();
-    let selected = match dispatch::select(&cards, &parsed, "") {
+    let selected = match select_protocol_card(&state, &cards, &parsed) {
         Ok(selected) => selected,
         Err(DispatchError::Rejection(rejection)) => return rejection_response(rejection),
         Err(DispatchError::Internal(message)) => {
