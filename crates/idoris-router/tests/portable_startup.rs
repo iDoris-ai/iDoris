@@ -54,7 +54,10 @@ fn fixture() -> (TempDir, TempDir, std::path::PathBuf, u16) {
         "routing-policy.yaml",
         "catalog.yaml",
     ] {
-        let raw = fs::read_to_string(repo.join(file)).unwrap();
+        let mut raw = fs::read_to_string(repo.join(file)).unwrap();
+        if file == "components/omlx.yaml" {
+            raw.push_str("\nextensions:\n  _degradation: Removing bindings disables aliases.\n  idoris_role_models: { daily: unavailable-chat }\n");
+        }
         fs::write(bin.join("config").join(file), raw.replace(":8000", ":0")).unwrap();
     }
     let cwd = TempDir::new().unwrap();
@@ -105,6 +108,7 @@ fn seed_portable_key(cwd: &Path) {
             secret.hash(),
             &VirtualKeyScope {
                 owner: "portable-startup".into(),
+                tenant_id: None,
                 allowed_privacy: vec![PrivacyClass::LocalOnly, PrivacyClass::Any],
                 allowed_roles: [
                     "fast", "daily", "deep", "vision", "embed", "rerank", "decide", "auto",
@@ -312,7 +316,11 @@ async fn bundled_config_starts_from_an_unrelated_working_directory() {
             serde_json::json!(0.2),
             "unsupported_parameter",
         ),
-        ("max_tokens", serde_json::json!(64), "unsupported_parameter"),
+        (
+            "max_tokens",
+            serde_json::Value::Null,
+            "unsupported_parameter",
+        ),
     ] {
         let mut body = serde_json::json!({
             "model": "idoris/daily",

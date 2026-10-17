@@ -25,6 +25,9 @@ fn events_for_response(event_log: &EventLogStore, response: &Response) -> Vec<Ev
     event_log
         .events_for_record(Some(budget::PERSONAL_TENANT_ID), record_id)
         .unwrap()
+        .into_iter()
+        .filter(|row| row.event.event_type != EventType::AuditFinalized)
+        .collect()
 }
 
 #[tokio::test]

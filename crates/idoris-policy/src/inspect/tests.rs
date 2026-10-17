@@ -411,6 +411,367 @@ const FAKE_AWS_ID: &str = concat!("AK", "IA5HVJV2XAZM2TT6A8");
 const FAKE_RAW_SECRET: &str = "zMCTnu5i8RRUKO7CCgpDdFZwTMKHPBZU1HmjS9jA";
 
 #[test]
+fn credential_assignments_score_only_the_value() {
+    for prefix in [
+        "DJANGO_SECRET_KEY_FOR_PRODUCTION_SETTINGS=",
+        "STRIPE_SECRET=",
+        "export DATABASE_PASSWORD=",
+        "--password=",
+        "API_KEY=",
+        "TOKEN=",
+        "K=",
+        "password: ",
+        "",
+    ] {
+        let input = format!("😀 {prefix}{FAKE_RAW_SECRET}");
+        assert_single(
+            &input,
+            FindingKind::HighEntropySecret,
+            FAKE_RAW_SECRET,
+            Sensitivity::S3,
+        );
+        let response = inspect(&input, &open_ctx());
+        assert_eq!(response.action, InspectAction::Block, "{prefix}");
+        assert!(!kinds(&response).contains(&FindingKind::ApiKey));
+    }
+    let input = "DJANGO_SECRET_KEY_FOR_PRODUCTION_SETTINGS=development";
+    let response = inspect(input, &open_ctx());
+    assert!(response.findings.is_empty(), "{response:?}");
+    assert_eq!(response.action, InspectAction::Allow);
+}
+
+#[test]
+fn credential_assignment_keeps_base64_padding() {
+    // Thirty body characters plus padding: dropping padding would fall below
+    // the existing 32-unit threshold and regress a previously detected value.
+    let value = "aA1bB2cC3dD4eE5fF6gG7hH8iI9jJ0==";
+    for prefix in ["", "DJANGO_SECRET_KEY_FOR_PRODUCTION_SETTINGS="] {
+        let input = format!("😀 {prefix}{value}");
+        assert_single(
+            &input,
+            FindingKind::HighEntropySecret,
+            value,
+            Sensitivity::S3,
+        );
+        assert_eq!(inspect(&input, &open_ctx()).action, InspectAction::Block);
+    }
+}
+
+#[test]
+fn credential_windows_paths_preserve_original_spans() {
+    for path in [
+        r"C:\Users\alice\.aws\credentials",
+        r"C:\Users\a\.ssh\config",
+        r"C:\Users\a\.ssh\known_hosts",
+        r"C:\Users\a\.kube\config",
+        r"C:\Users\a\.docker\config.json",
+        r"%USERPROFILE%\.aws\credentials",
+        r"C:\Users\a\config\.env.local",
+    ] {
+        for written in [path.to_owned(), path.replace('\\', "/")] {
+            let input = format!("😀 cat {written} please");
+            // ':' and '%' delimit the existing ASCII path runs.
+            let expected = written.rsplit([':', '%']).next().unwrap();
+            assert_single(
+                &input,
+                FindingKind::CredentialPath,
+                expected,
+                Sensitivity::S2,
+            );
+            assert_eq!(inspect(&input, &open_ctx()).action, InspectAction::Redact);
+        }
+    }
+    for path in [
+        r"C:\Users\alice\notes.txt",
+        r"C:\code\process.env.API_KEY",
+        r"C:\config\.envrc",
+    ] {
+        let response = inspect(path, &open_ctx());
+        assert!(response.findings.is_empty(), "{response:?}");
+        assert_eq!(response.action, InspectAction::Allow);
+    }
+}
+
+#[test]
+fn credential_internal_equals_preserves_value_spans() {
+    for (prefix, value) in [
+        ("", "zMCTnu5i8RRUKO7CCgpDd=FZwTMKHPBZU1HmjS9jA"),
+        ("", "aA1bB2cC3dD4eE5fF6gG7=hH8iI9jJ0kK1lL2mM3nN4"),
+        ("PASSWORD=", "aA1bB2cC3dD4eE5fF6gG7=hH8iI9jJ0kK1lL2mM3nN4"),
+        ("", "aA1bB2cC3dD4eE5fF6gG7=Q62rR7sS8tT9uU0vV1wW2="),
+    ] {
+        let input = format!("😀 {prefix}{value}");
+        assert_single(
+            &input,
+            FindingKind::HighEntropySecret,
+            value,
+            Sensitivity::S3,
+        );
+        let response = inspect(&input, &open_ctx());
+        assert_eq!(response.action, InspectAction::Block, "{input}");
+        assert_eq!(
+            response.findings[0].span.unwrap().start,
+            (3 + prefix.len()) as u64
+        );
+    }
+}
+
+#[test]
+fn credential_internal_equals_with_low_switch_piece() {
+    for value in [
+        "abcdefgh=Q1w2E3r4T5y6U7i8O9p0A1s2D3f4",
+        "Q1w2E3r4T5y6U7i8O9p0A1s2D3f4=abcdefgh",
+        "abcd=Q1w2E3r4T5y6U7i8O9p0A1s2=efgh",
+        "abcdefgh=Q1w2E3r4T5y6U7i8O9p0A1s2D3f4==",
+        "abc=Q1w2E3r4T5y6U7i8O9p0A1s2D3f4", // Exactly 32 units.
+        "Q1w2E3r4T5y6U7i8O9p0A1s2D3f4=abc",
+    ] {
+        for prefix in ["", "PASSWORD="] {
+            let input = format!("🚗😀 {prefix}{value};");
+            assert_single(
+                &input,
+                FindingKind::HighEntropySecret,
+                value,
+                Sensitivity::S3,
+            );
+            let response = inspect(&input, &open_ctx());
+            assert_eq!(response.action, InspectAction::Block);
+            assert_eq!(response.sensitivity, Sensitivity::S3);
+            assert_eq!(
+                response.findings[0].span.unwrap().start,
+                (5 + prefix.len()) as u64
+            );
+        }
+    }
+    // Inclusive segmentation still obeys length and entropy thresholds.
+    for input in [
+        "ab=Q1w2E3r4T5y6U7i8O9p0A1s2D3f4",   // 31 units.
+        "a1B2a1B2a1B2a1B2=a1B2a1B2a1B2a1B2", // Low entropy.
+    ] {
+        let response = inspect(input, &open_ctx());
+        assert_eq!(
+            response.action,
+            InspectAction::Allow,
+            "{input}: {response:?}"
+        );
+        assert!(response.findings.is_empty(), "{input}: {response:?}");
+    }
+}
+
+#[test]
+fn credential_internal_equals_at_every_split_keeps_inclusive_coverage() {
+    // Every insertion retains the original scanner's high-entropy token.
+    // Near the ends a long piece is itself detected; prefer that exact span.
+    for split in 1..FAKE_RAW_SECRET.len() {
+        let (left, right) = FAKE_RAW_SECRET.split_at(split);
+        let value = format!("{left}={right}");
+        let input = format!("🚗😀 {value};");
+        let response = inspect(&input, &open_ctx());
+        assert_eq!(
+            response.action,
+            InspectAction::Block,
+            "{split}: {response:?}"
+        );
+        assert_eq!(response.sensitivity, Sensitivity::S3);
+        assert_eq!(kinds(&response), [FindingKind::HighEntropySecret]);
+        let finding = &response.findings[0];
+        let span = finding.span.unwrap();
+        assert!(span.start >= 5);
+        assert!(span.start + span.length <= 5 + value.len() as u64);
+        assert!([left, right, value.as_str()].contains(&covered(&input, finding).as_str()));
+    }
+}
+
+#[test]
+fn credential_union_does_not_widen_or_duplicate_existing_values() {
+    let input = format!("😀 {FAKE_RAW_SECRET}={FAKE_RAW_SECRET}");
+    let response = inspect(&input, &open_ctx());
+    assert_eq!(response.action, InspectAction::Block);
+    assert_eq!(response.sensitivity, Sensitivity::S3);
+    assert_eq!(response.findings.len(), 2, "{response:?}");
+    for (finding, start) in response.findings.iter().zip([3, 44]) {
+        assert_eq!(finding.kind, FindingKind::HighEntropySecret);
+        assert_eq!(finding.span.unwrap().start, start);
+        assert_eq!(covered(&input, finding), FAKE_RAW_SECRET);
+    }
+}
+
+#[test]
+fn credential_serialized_env_escapes_keep_original_spans() {
+    for (argument, expected) in [
+        (r#"{"command":"cat .env\nnext_command"}"#, ".env"),
+        (r#"{"command":"cat .env\n"}"#, ".env"),
+        (r#"{"command":"cat ~/.env\tx"}"#, "~/.env"),
+        (r#"{"command":"cat .env\r\nnext"}"#, ".env"),
+        (r#"\"/app/.env\""#, "/app/.env"),
+        (r"C:\app\.env\\", r"\app\.env"),
+        (r#"{"command":"cat .env.local\"}"#, ".env.local"),
+        (r#"{"command":"cat ~/.ssh/id_rsa\"}"#, "~/.ssh/id_rsa"),
+        (
+            r#"{"arguments":"{\"command\":\"cat /app/.env\"}"}"#,
+            "/app/.env",
+        ),
+        (
+            r#"{"arguments":"{\"command\":\"cat C:\\app\\.env\"}"}"#,
+            r"\\app\\.env",
+        ),
+    ] {
+        let input = format!("😀 {argument}");
+        assert_single(
+            &input,
+            FindingKind::CredentialPath,
+            expected,
+            Sensitivity::S2,
+        );
+        let response = inspect(&input, &open_ctx());
+        assert_eq!(response.action, InspectAction::Redact, "{input}");
+        let start = input.find(expected).unwrap();
+        assert_eq!(
+            response.findings[0].span.unwrap().start,
+            input[..start].encode_utf16().count() as u64
+        );
+    }
+}
+
+#[test]
+fn credential_serialized_windows_separators() {
+    for path in [
+        r"C:\\Users\\a\\.aws\\credentials",
+        r"C:\\Users\\a\\.kube\\config",
+        r"C:\\Users\\a\\.docker\\config.json",
+        r"C:\\Users\\a\\.ssh\\config",
+    ] {
+        let input = format!("😀 {{\"path\":\"{path}\"}}");
+        assert_single(
+            &input,
+            FindingKind::CredentialPath,
+            &path[2..],
+            Sensitivity::S2,
+        );
+        assert_eq!(inspect(&input, &open_ctx()).action, InspectAction::Redact);
+    }
+}
+
+#[test]
+fn credential_paths_after_serialized_env_remain_covered() {
+    for (text, paths) in [
+        (
+            r#""./.env\n./.aws/credentials\n./id_rsa""#,
+            vec!["./.env", "./.aws/credentials", "./id_rsa"],
+        ),
+        (
+            r#""./.aws/credentials\n./.env\n./id_rsa""#,
+            vec!["./.aws/credentials", "./.env", "./id_rsa"],
+        ),
+        (
+            r".env\n~/.aws/credentials",
+            vec![".env", "~/.aws/credentials"],
+        ),
+    ] {
+        assert_credential_paths_masked(text, &paths);
+    }
+}
+
+#[test]
+fn credential_paths_after_absolute_env_remain_covered() {
+    for (text, paths) in [
+        (
+            r#""/app/.env\n/root/.ssh/id_rsa""#,
+            vec!["/app/.env", "/root/.ssh/id_rsa"],
+        ),
+        (
+            r"/app/.env\t/home/alice/.ssh/id_rsa",
+            vec!["/app/.env", "/home/alice/.ssh/id_rsa"],
+        ),
+        (
+            r"C:\app\.env\..\..\Users\a\.ssh\id_rsa",
+            vec![r"\app\.env", r".ssh\id_rsa"],
+        ),
+    ] {
+        assert_credential_paths_masked(text, &paths);
+    }
+}
+
+fn assert_credential_paths_masked(text: &str, paths: &[&str]) {
+    let input = format!("🚗😀 {text}");
+    let response = inspect(&input, &open_ctx());
+    assert_eq!(response.action, InspectAction::Redact);
+    let mut masked: Vec<u16> = input.encode_utf16().collect();
+    let mut covered_units = vec![false; masked.len()];
+    for finding in &response.findings {
+        assert_eq!(finding.kind, FindingKind::CredentialPath);
+        let span = finding.span.unwrap();
+        let start = span.start as usize;
+        let end = start + span.length as usize;
+        covered_units[start..end].fill(true);
+        masked[start..end].fill(u16::from(b'*'));
+    }
+    let redacted = String::from_utf16(&masked).unwrap();
+    for path in paths {
+        let byte_start = input.find(path).unwrap();
+        let start = input[..byte_start].encode_utf16().count();
+        let end = start + path.encode_utf16().count();
+        assert!(
+            covered_units[start..end].iter().all(|covered| *covered),
+            "path {path:?} left exposed: {redacted:?}; {response:?}"
+        );
+        assert!(!redacted.contains(path), "{redacted:?}");
+    }
+    assert!(redacted.starts_with("🚗😀 "));
+}
+
+#[test]
+fn credential_ambiguous_assignments_fail_closed_on_aggregate_entropy() {
+    // These can be assignments with individually sub-threshold values or opaque
+    // credentials containing '='. The inclusive detector cannot distinguish the
+    // intent: retain its conservative Block, but never invent a padded-name span.
+    for token in [
+        "aA1bB2cC3dD4eE5fF6gG7hH8iI9jJ0k=developmentconfiguration",
+        "K=8vLr5VrExzWYr2qeBJNvhYsN63lysYi",
+        "K=aVTZ23bG7tHZlX0SqxlZ3dzETRxOmw",
+        "DJANGO_SECRET_KEY_FOR_PRODUCTION_SETTINGS=a1B2a1B2a1B2a1B2a1B2a1B2a1B2a1B2a1B2",
+    ] {
+        let input = format!("😀 {token};");
+        assert_single(
+            &input,
+            FindingKind::HighEntropySecret,
+            token,
+            Sensitivity::S3,
+        );
+        let response = inspect(&input, &open_ctx());
+        assert_eq!(response.action, InspectAction::Block);
+        assert_eq!(response.findings[0].span.unwrap().start, 3);
+    }
+    // A delimiter before a benign value is not trailing base64 padding. Here
+    // the aggregate also falls below the switch threshold, so it remains Allow.
+    let response = inspect(
+        "aA1bB2cC3dD4eE5fF6gG7hH8iI9jJ0k=developmentconfigurationdevelopmentconfiguration",
+        &open_ctx(),
+    );
+    assert_eq!(response.action, InspectAction::Allow);
+    assert!(response.findings.is_empty(), "{response:?}");
+}
+
+#[test]
+fn credential_benign_windows_paths_and_escapes_are_allowed() {
+    for input in [
+        r"C:\Windows\System32\drivers\etc\hosts",
+        r"\\?\C:\temp\file.txt",
+        r"split on \ and / please",
+        r"C:\code\process.env.API_KEY",
+        r"escape \n.envelope",
+    ] {
+        let response = inspect(input, &open_ctx());
+        assert_eq!(
+            response.action,
+            InspectAction::Allow,
+            "{input}: {response:?}"
+        );
+        assert!(response.findings.is_empty(), "{input}: {response:?}");
+    }
+}
+
+#[test]
 fn prefixed_keys_are_found_by_rule_set_a() {
     for key in [FAKE_OPENAI, FAKE_GITHUB, FAKE_AWS_ID] {
         assert_single(

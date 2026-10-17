@@ -124,6 +124,71 @@ async fn engaged_switch_stops_protocol_endpoints() {
     }
 }
 
+fn get(path: &str) -> Request<Body> {
+    Request::builder()
+        .method("GET")
+        .uri(path)
+        .body(Body::empty())
+        .unwrap()
+}
+
+/// Kill switch on: `GET /v1/models` and admin `GET /models` must not touch a
+/// remote any-only card. Switch off is the control and still lists it.
+#[tokio::test]
+async fn engaged_switch_skips_remote_model_listing() {
+    let (server, state) = any_only(Capability::Chat).await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "object": "list",
+            "data": [{"id": "remote-model"}],
+        })))
+        .mount(&server)
+        .await;
+    let switch = state.remote_kill_switch.clone();
+    let app = build_app(state.clone());
+    let token = admin::AdminSessionToken::mint();
+    let secret = token.expose_secret().to_string();
+    let admin_app = admin::build_admin_app(state, token);
+
+    let open = app.clone().oneshot(get("/v1/models")).await.unwrap();
+    assert_eq!(open.status(), StatusCode::OK);
+    let open_body = open.into_body().collect().await.unwrap().to_bytes();
+    let open_json: serde_json::Value = serde_json::from_slice(&open_body).unwrap();
+    assert_eq!(open_json["data"][0]["id"], "remote-model");
+
+    let admin_open = admin_app
+        .clone()
+        .oneshot(get_admin("/admin/api/v1/models", &secret))
+        .await
+        .unwrap();
+    assert_eq!(admin_open.status(), StatusCode::OK);
+    let open_hits = server.received_requests().await.unwrap().len();
+    assert!(open_hits >= 1, "switch off must still list the remote card");
+
+    switch.store(true, Ordering::SeqCst);
+    let closed = app.oneshot(get("/v1/models")).await.unwrap();
+    assert_eq!(closed.status(), StatusCode::OK);
+    let admin_closed = admin_app
+        .oneshot(get_admin("/admin/api/v1/models", &secret))
+        .await
+        .unwrap();
+    assert_eq!(admin_closed.status(), StatusCode::OK);
+    assert_eq!(
+        server.received_requests().await.unwrap().len(),
+        open_hits,
+        "engaged kill switch must not GET a remote any-only card"
+    );
+}
+
+fn get_admin(path: &str, secret: &str) -> Request<Body> {
+    Request::builder()
+        .method("GET")
+        .uri(path)
+        .header("authorization", format!("Bearer {secret}"))
+        .body(Body::empty())
+        .unwrap()
+}
+
 #[tokio::test]
 async fn engaged_switch_turns_inspect_allow_into_block() {
     let state = AppState {
