@@ -244,7 +244,7 @@ async fn run(options: cli::ServeOptions) -> Result<(), String> {
     let local_runtime_path = config::optional_env_path("IDORIS_LOCAL_RUNTIME_CONFIG")?;
     let local_runtime_configs = runtime_launch_config::load(local_runtime_path.as_deref())?;
     let remote_kill_switch = env_flag("IDORIS_REMOTE_KILL_SWITCH");
-    let runtimes = RuntimeRegistry::spawn_with_local_configs_and_budget(
+    let runtimes = RuntimeRegistry::spawn_with_local_configs_budget_and_kill_switch(
         &cards,
         &local_runtime_configs,
         allocated_budget_bytes,
