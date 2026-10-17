@@ -227,3 +227,29 @@ async fn only_post_is_routed() {
     let (status, _) = send(&app, request).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
+
+/// Reviewer's A2: an ordinary year/quantity table must stay public. Before the
+/// value-boundary fix, the router joined distinct JSON values with newlines and
+/// the scanner's newline separator merged the rows into one Luhn-valid 16-digit
+/// run, pinning a declared-`any` request to local_only (and 503 when only remote
+/// cards serve it).
+#[tokio::test]
+async fn ordinary_numeric_table_is_not_pinned_to_local() {
+    for body in [
+        json!({"messages":[{"role":"user","content":"year qty\n2023 1203\n2024 1305\n2025 1411\n2026 1520"}]}),
+        json!({"messages":[{"role":"user","content":"2023 1204 2024 1306"}]}),
+        json!({"model":"embed","input":["y1 1203","y2 1305"]}),
+    ] {
+        let inspection = inspect::inspect_body(&body, PrivacyClass::Any, false);
+        assert_eq!(
+            inspection.effective,
+            PrivacyClass::Any,
+            "false positive on {body}"
+        );
+        assert!(
+            inspection.response.findings.is_empty(),
+            "unexpected findings on {body}: {:?}",
+            inspection.response.findings
+        );
+    }
+}

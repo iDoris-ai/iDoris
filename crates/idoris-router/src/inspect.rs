@@ -137,9 +137,19 @@ pub(crate) fn inspect_body(
             serde_json::Value::Bool(_) | serde_json::Value::Null => {}
         }
     }
+    /// Hard boundary between two JSON values.
+    ///
+    /// A newline would not do: the L0 scanner treats line breaks as intra-entity
+    /// separators (so an entity split across lines inside one string is still
+    /// found), which meant two unrelated rows of a pasted numeric table merged
+    /// into one 16-digit Luhn-valid run and were reported as a bank card. U+001F
+    /// is neither a digit nor one of the scanner's separators, so values can
+    /// never be joined, while real newlines inside a value keep working.
+    const VALUE_BOUNDARY: char = '\u{1f}';
+
     fn push_line(out: &mut String, text: &str) {
         out.push_str(text);
-        out.push('\n');
+        out.push(VALUE_BOUNDARY);
     }
     fn is_data_url(text: &str) -> bool {
         text.get(..5)

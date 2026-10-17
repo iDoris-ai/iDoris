@@ -739,3 +739,35 @@ proptest! {
         prop_assert_eq!(response.action, InspectAction::Block);
     }
 }
+
+/// Reviewer A2: a pasted numeric table must stay public. Rows joined by a line
+/// break may not be licensed by the weak "16–19 digits + Luhn" card rule, while
+/// structural entities (resident id, mobile) may still cross a line break.
+#[test]
+fn numeric_tables_do_not_become_bank_cards_across_line_breaks() {
+    let table = "year qty\n2023 1203\n2024 1305\n2025 1411\n2026 1520";
+    let response = inspect(table, &open_ctx());
+    assert_eq!(
+        response.action,
+        InspectAction::Allow,
+        "an ordinary year/quantity table must stay public: {response:?}"
+    );
+    assert!(response.findings.is_empty(), "{response:?}");
+
+    // The structural wins from this PR survive: an id split across a line, and
+    // a mobile split across a line, are still found.
+    let id = inspect("1101011990\n0307737X", &open_ctx());
+    assert!(
+        kinds(&id).contains(&FindingKind::CnResidentId),
+        "an id split across a line break must still be found: {id:?}"
+    );
+    let mobile = inspect("138\n1234 5678", &open_ctx());
+    assert!(
+        kinds(&mobile).contains(&FindingKind::CnMobile),
+        "a mobile split across a line break must still be found: {mobile:?}"
+    );
+
+    // And a card whose groups are all on one line is unaffected.
+    let card = inspect("6222 0212 3456 7894", &open_ctx());
+    assert_eq!(card.action, InspectAction::Block, "{card:?}");
+}
