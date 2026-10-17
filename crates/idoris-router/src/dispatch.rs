@@ -270,7 +270,7 @@ pub fn select_avoiding_open_breakers(
     ready_provider_ids: &BTreeSet<String>,
     open_provider_ids: &BTreeSet<String>,
 ) -> Result<Selected, DispatchError> {
-    let candidates: Vec<Card> = cards
+    let blocked: Vec<Card> = cards
         .iter()
         .map(|c| candidate(c, prompt, open_provider_ids.contains(&c.provider.id)))
         .collect();
@@ -284,15 +284,35 @@ pub fn select_avoiding_open_breakers(
         min_ram_gb: None,
         budget: None,
     };
-    let decision = decide_with_affinity_and_ready(
+    let mut pool = blocked;
+    let decision = match decide_with_affinity_and_ready(
         &request_profile,
-        &candidates,
+        &pool,
         &ctx,
         affinity_key,
         ready_provider_ids,
-    )
-    .map_err(DispatchError::Rejection)?;
-    let Some(chosen) = candidates.iter().find(|c| c.id() == decision.chosen_id) else {
+    ) {
+        Ok(decision) => decision,
+        // When the open set covers every eligible card, marking them all
+        // `Blocked` turns "everything is cooling down" into
+        // `no_eligible_candidate`, which is a different contract: clients key on
+        // the error type to decide whether to retry. Fall back to plain
+        // selection so the proxy send gate can answer the retryable
+        // `provider_circuit_open` instead.
+        Err(_) if !open_provider_ids.is_empty() => {
+            pool = cards.iter().map(|c| candidate(c, prompt, false)).collect();
+            decide_with_affinity_and_ready(
+                &request_profile,
+                &pool,
+                &ctx,
+                affinity_key,
+                ready_provider_ids,
+            )
+            .map_err(DispatchError::Rejection)?
+        }
+        Err(rejection) => return Err(DispatchError::Rejection(rejection)),
+    };
+    let Some(chosen) = pool.iter().find(|c| c.id() == decision.chosen_id) else {
         return Err(DispatchError::Internal(format!(
             "decide() returned chosen_id {:?} absent from its own candidate list",
             decision.chosen_id
