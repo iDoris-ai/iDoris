@@ -402,7 +402,7 @@ impl Supervisor {
         adapter: Arc<dyn RuntimeAdapter>,
         config: SupervisorConfig,
     ) -> Result<SupervisorHandle, BackendError> {
-        Self::spawn_inner(adapter, config, None)
+        Self::spawn_inner(adapter, config, None, true)
     }
 
     /// Track this runtime's trusted startup residency in one shared process
@@ -413,6 +413,33 @@ impl Supervisor {
         config: SupervisorConfig,
         ledger: Arc<GlobalCapacityLedger>,
         runtime_id: impl Into<String>,
+    ) -> Result<SupervisorHandle, BackendError> {
+        Self::spawn_with_startup_capacity(adapter, config, ledger, runtime_id, true)
+    }
+
+    /// Same as [`Self::spawn_with_startup_capacity_tracking`], except the actor
+    /// does not call `adapter.status()` before accepting commands.
+    ///
+    /// The boot-time remote kill switch uses this for cards that are not
+    /// trusted-local, so startup sends no request. The runtime is left out of
+    /// the shared ledger: recording a fabricated zero would hide real
+    /// residency, and charging the whole budget would deny the trusted local
+    /// runtime the switch still allows.
+    pub fn spawn_with_startup_capacity_tracking_without_probe(
+        adapter: Arc<dyn RuntimeAdapter>,
+        config: SupervisorConfig,
+        ledger: Arc<GlobalCapacityLedger>,
+        runtime_id: impl Into<String>,
+    ) -> Result<SupervisorHandle, BackendError> {
+        Self::spawn_with_startup_capacity(adapter, config, ledger, runtime_id, false)
+    }
+
+    fn spawn_with_startup_capacity(
+        adapter: Arc<dyn RuntimeAdapter>,
+        config: SupervisorConfig,
+        ledger: Arc<GlobalCapacityLedger>,
+        runtime_id: impl Into<String>,
+        startup_probe: bool,
     ) -> Result<SupervisorHandle, BackendError> {
         let runtime_id = runtime_id.into();
         if runtime_id.trim().is_empty() {
@@ -429,6 +456,7 @@ impl Supervisor {
                 allocation_key: format!("runtime:{runtime_id}"),
                 claimed_gb: 0.0,
             }),
+            startup_probe,
         )
     }
 
@@ -436,6 +464,7 @@ impl Supervisor {
         adapter: Arc<dyn RuntimeAdapter>,
         config: SupervisorConfig,
         startup_capacity: Option<StartupCapacityTracking>,
+        startup_probe: bool,
     ) -> Result<SupervisorHandle, BackendError> {
         if !config.budget_gb.is_finite() || config.budget_gb < 0.0 {
             return Err(BackendError::internal(format!(
@@ -443,7 +472,7 @@ impl Supervisor {
                 config.budget_gb
             )));
         }
-        let (tx, _join) = spawn_actor_inner(adapter, config, startup_capacity);
+        let (tx, _join) = spawn_actor_inner(adapter, config, startup_capacity, startup_probe);
         Ok(SupervisorHandle { tx })
     }
 }
@@ -460,13 +489,14 @@ fn spawn_actor(
     adapter: Arc<dyn RuntimeAdapter>,
     config: SupervisorConfig,
 ) -> (mpsc::Sender<ActorMsg>, tokio::task::JoinHandle<()>) {
-    spawn_actor_inner(adapter, config, None)
+    spawn_actor_inner(adapter, config, None, true)
 }
 
 fn spawn_actor_inner(
     adapter: Arc<dyn RuntimeAdapter>,
     config: SupervisorConfig,
     startup_capacity: Option<StartupCapacityTracking>,
+    startup_probe: bool,
 ) -> (mpsc::Sender<ActorMsg>, tokio::task::JoinHandle<()>) {
     let (tx, rx) = mpsc::channel(64);
     let call_slots = Arc::new(Semaphore::new(config.max_concurrent_adapter_calls.max(1)));
@@ -484,6 +514,7 @@ fn spawn_actor_inner(
         call_slots,
         self_tx,
         startup_capacity,
+        startup_probe,
     ));
     (tx, join)
 }
@@ -1671,6 +1702,7 @@ async fn run_actor(
     call_slots: Arc<Semaphore>,
     self_tx: mpsc::WeakSender<ActorMsg>,
     startup_capacity: Option<StartupCapacityTracking>,
+    startup_probe: bool,
 ) {
     let mut models: HashMap<String, ModelSlot> = HashMap::new();
     let mut active_op: Option<ActiveOp> = None;
@@ -1695,17 +1727,27 @@ async fn run_actor(
     let load_fence = load_fence_result.ok();
     // Sample engine residency once, before accepting commands. Spawning the
     // adapter call isolates panic; the timeout bounds startup even when the
-    // adapter never returns.
-    let startup_adapter = adapter.clone();
-    let startup_ownership = load_fence.clone();
-    let timeout = config.adapter_call_timeout;
-    let startup = tokio::spawn(async move {
-        let _ownership = startup_ownership;
-        with_adapter_timeout(startup_adapter.status(), timeout, "startup/status").await
-    })
-    .await
-    .map_err(|err| BackendError::adapter_panicked("startup/status", err.to_string()))
-    .and_then(|result| result);
+    // adapter never returns. `startup_probe == false` skips that call entirely
+    // (remote kill switch at boot) and does not join the shared ledger.
+    let startup = if startup_probe {
+        let startup_adapter = adapter.clone();
+        let startup_ownership = load_fence.clone();
+        let timeout = config.adapter_call_timeout;
+        tokio::spawn(async move {
+            let _ownership = startup_ownership;
+            with_adapter_timeout(startup_adapter.status(), timeout, "startup/status").await
+        })
+        .await
+        .map_err(|err| BackendError::adapter_panicked("startup/status", err.to_string()))
+        .and_then(|result| result)
+    } else {
+        Ok(BackendStatus {
+            pressure: Pressure::Unknown,
+            used_gb: 0.0,
+            model_memory_max_gb: config.budget_gb,
+            loaded: Vec::new(),
+        })
+    };
     let startup = startup.and_then(|status| {
         if !status.used_gb.is_finite()
             || status.used_gb < 0.0
@@ -1722,7 +1764,11 @@ async fn run_actor(
         .as_ref()
         .map(|status| status.used_gb)
         .unwrap_or_default();
-    let mut startup_capacity = startup_capacity;
+    let mut startup_capacity = if startup_probe {
+        startup_capacity
+    } else {
+        None
+    };
     let startup_capacity_error = match (&mut startup_capacity, &startup) {
         (Some(tracking), Ok(status)) => {
             match tracking

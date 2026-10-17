@@ -40,12 +40,43 @@ impl RuntimeRegistry {
         Self::spawn_with_factory_and_budget(cards, None, factory)
     }
 
+    /// Same as [`Self::spawn_with_factory`] but with the remote kill switch
+    /// engaged at boot: cards that fail `is_local_capable` are not status-probed.
+    pub fn spawn_with_factory_budget_and_kill_switch<F>(
+        cards: &[ComponentCard],
+        allocated_budget_bytes: Option<u64>,
+        remote_kill_switch: bool,
+        factory: F,
+    ) -> Result<Self, String>
+    where
+        F: Fn(&ComponentCard) -> Result<std::sync::Arc<dyn RuntimeAdapter>, BackendError>,
+    {
+        Self::spawn_with_factory_budgeted(
+            cards,
+            allocated_budget_bytes,
+            remote_kill_switch,
+            factory,
+        )
+    }
+
     /// Apply an already allocated model budget to both process-wide admission
     /// and each runtime. Bytes use decimal GB, matching model memory estimates.
     /// `None` preserves the historical default; no OS reserve is deducted here.
     pub fn spawn_with_factory_and_budget<F>(
         cards: &[ComponentCard],
         allocated_budget_bytes: Option<u64>,
+        factory: F,
+    ) -> Result<Self, String>
+    where
+        F: Fn(&ComponentCard) -> Result<std::sync::Arc<dyn RuntimeAdapter>, BackendError>,
+    {
+        Self::spawn_with_factory_budgeted(cards, allocated_budget_bytes, false, factory)
+    }
+
+    fn spawn_with_factory_budgeted<F>(
+        cards: &[ComponentCard],
+        allocated_budget_bytes: Option<u64>,
+        remote_kill_switch: bool,
         factory: F,
     ) -> Result<Self, String>
     where
@@ -75,6 +106,7 @@ impl RuntimeRegistry {
                 &factory,
                 Some(&startup_capacity),
                 config.clone(),
+                remote_kill_switch,
             )?
             else {
                 continue;
@@ -105,6 +137,22 @@ impl RuntimeRegistry {
         local: &BTreeMap<String, LocalHttpRuntimeConfig>,
         allocated_budget_bytes: Option<u64>,
     ) -> Result<Self, String> {
+        Self::spawn_with_local_configs_budget_and_kill_switch(
+            cards,
+            local,
+            allocated_budget_bytes,
+            false,
+        )
+    }
+
+    /// Startup entry point: both the allocated model budget and the remote kill
+    /// switch engaged at boot are threaded into the per-runtime construction.
+    pub fn spawn_with_local_configs_budget_and_kill_switch(
+        cards: &[ComponentCard],
+        local: &BTreeMap<String, LocalHttpRuntimeConfig>,
+        allocated_budget_bytes: Option<u64>,
+        remote_kill_switch: bool,
+    ) -> Result<Self, String> {
         for (provider_id, config) in local {
             let card = cards
                 .iter()
@@ -127,15 +175,19 @@ impl RuntimeRegistry {
             }
         }
 
-        let mut registry =
-            Self::spawn_with_factory_and_budget(cards, allocated_budget_bytes, |card| {
+        let mut registry = Self::spawn_with_factory_budgeted(
+            cards,
+            allocated_budget_bytes,
+            remote_kill_switch,
+            |card| {
                 if let Some(config) = local.get(&card.provider.id) {
                     return LocalHttpRuntimeAdapter::new(config.clone()).map(|adapter| {
                         std::sync::Arc::new(adapter) as std::sync::Arc<dyn RuntimeAdapter>
                     });
                 }
                 create_adapter(card)
-            })?;
+            },
+        )?;
         for (provider_id, config) in local {
             if let Some(bound) = registry.supervisors.get_mut(provider_id) {
                 *bound = bound
@@ -272,7 +324,24 @@ impl From<Option<BoundSupervisor>> for RuntimeRegistry {
 /// # Panics
 /// Lifecycle construction requires a running Tokio runtime, like `Supervisor::spawn`.
 pub fn spawn_runtime(card: &ComponentCard) -> Result<Option<SupervisorHandle>, String> {
-    spawn_runtime_with_factory(card, &create_adapter, None, SupervisorConfig::default())
+    spawn_runtime_with_factory(
+        card,
+        &create_adapter,
+        None,
+        SupervisorConfig::default(),
+        false,
+    )
+}
+
+fn is_trusted_local_card(card: &ComponentCard) -> bool {
+    idoris_policy::privacy::is_local_capable(&idoris_policy::Card {
+        component: card.clone(),
+        roles: Vec::new(),
+        experiment: false,
+        min_ram_gb: 0.0,
+        estimated_cost_minor: None,
+        admission_status: idoris_policy::AdmissionStatus::Ready,
+    })
 }
 
 fn spawn_runtime_with_factory<F>(
@@ -280,6 +349,7 @@ fn spawn_runtime_with_factory<F>(
     factory: &F,
     startup_capacity: Option<&Arc<GlobalCapacityLedger>>,
     config: SupervisorConfig,
+    remote_kill_switch: bool,
 ) -> Result<Option<SupervisorHandle>, String>
 where
     F: Fn(&ComponentCard) -> Result<std::sync::Arc<dyn RuntimeAdapter>, BackendError>,
@@ -298,15 +368,25 @@ where
     }
     let adapter =
         factory(card).map_err(|error| format!("provider {}: {error}", card.provider.id))?;
-    let supervisor = if let Some(ledger) = startup_capacity {
-        Supervisor::spawn_with_startup_capacity_tracking(
+    // Engaged at boot: do not status-probe a card that fails `is_local_capable`.
+    // Trusted loopback local_only cards are still probed.
+    let skip_startup_probe = remote_kill_switch && !is_trusted_local_card(card);
+    let supervisor = match (startup_capacity, skip_startup_probe) {
+        (Some(ledger), true) => Supervisor::spawn_with_startup_capacity_tracking_without_probe(
             adapter,
             config,
             ledger.clone(),
             card.provider.id.clone(),
-        )
-    } else {
-        Supervisor::spawn(adapter, config)
+        ),
+        (Some(ledger), false) => Supervisor::spawn_with_startup_capacity_tracking(
+            adapter,
+            config,
+            ledger.clone(),
+            card.provider.id.clone(),
+        ),
+        // Registry startup always passes a ledger; `spawn_runtime` passes the
+        // switch as false, so a missing ledger never takes the skip arm.
+        (None, _) => Supervisor::spawn(adapter, config),
     };
     supervisor
         .map(Some)
@@ -614,6 +694,71 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn remote_kill_switch_startup_sends_no_request_for_untrusted_omlx_http_cards() {
+        use idoris_contracts::common::PrivacyClass;
+        use idoris_contracts::provider::Locality;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        async fn startup_paths(mut card: ComponentCard, remote_kill_switch: bool) -> Vec<String> {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/api/status"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "loaded_models": [],
+                    "model_memory_used": 0,
+                    "model_memory_max": 0
+                })))
+                .mount(&server)
+                .await;
+            card.endpoint = server.uri();
+            let registry = RuntimeRegistry::spawn_with_local_configs_budget_and_kill_switch(
+                std::slice::from_ref(&card),
+                &BTreeMap::new(),
+                None,
+                remote_kill_switch,
+            )
+            .unwrap();
+            let _ = registry
+                .get(&card.provider.id)
+                .expect("omlx http card spawns a lifecycle runtime")
+                .status()
+                .await;
+            server
+                .received_requests()
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|request| request.url.path().to_string())
+                .collect()
+        }
+
+        let mut privacy_any_loopback = card();
+        privacy_any_loopback.privacy_class = PrivacyClass::Any;
+        privacy_any_loopback.provider.privacy_class = PrivacyClass::Any;
+        let mut lan = card();
+        lan.provider.locality = Locality::Lan;
+
+        for untrusted in [privacy_any_loopback, lan] {
+            let suppressed = startup_paths(untrusted.clone(), true).await;
+            assert!(
+                suppressed.is_empty(),
+                "kill switch on must send 0 requests, including /api/status, got {suppressed:?}"
+            );
+            let open = startup_paths(untrusted, false).await;
+            assert!(
+                open.iter().any(|path| path == "/api/status"),
+                "kill switch off must probe /api/status, got {open:?}"
+            );
+        }
+
+        let trusted = startup_paths(card(), true).await;
+        assert!(
+            trusted.iter().any(|path| path == "/api/status"),
+            "trusted loopback omlx card must still be probed, got {trusted:?}"
+        );
+    }
     #[tokio::test]
     async fn allocated_budget_none_preserves_default_load_behavior() {
         let card = named_card("budget-default");

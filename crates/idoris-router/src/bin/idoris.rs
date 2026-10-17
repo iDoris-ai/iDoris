@@ -243,10 +243,12 @@ async fn run(options: cli::ServeOptions) -> Result<(), String> {
 
     let local_runtime_path = config::optional_env_path("IDORIS_LOCAL_RUNTIME_CONFIG")?;
     let local_runtime_configs = runtime_launch_config::load(local_runtime_path.as_deref())?;
-    let runtimes = RuntimeRegistry::spawn_with_local_configs_and_budget(
+    let remote_kill_switch = env_flag("IDORIS_REMOTE_KILL_SWITCH");
+    let runtimes = RuntimeRegistry::spawn_with_local_configs_budget_and_kill_switch(
         &cards,
         &local_runtime_configs,
         allocated_budget_bytes,
+        remote_kill_switch,
     )?;
     // Preserve startup-gate precedence: component/policy/runtime validation
     // (including subscription authorization and fixed card gates) must fail
@@ -304,6 +306,9 @@ async fn run(options: cli::ServeOptions) -> Result<(), String> {
         virtual_key_authenticator: Some(virtual_key_authenticator),
         remote_bind_requires_auth: !bind_host.is_loopback(),
         dev_no_key_enabled,
+        remote_kill_switch: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+            remote_kill_switch,
+        )),
         event_log: Some(persistent.event_log),
         ..AppState::default()
     };
@@ -327,6 +332,12 @@ async fn run(options: cli::ServeOptions) -> Result<(), String> {
         eprintln!(
             "[idoris] IDORIS_DEV_NO_KEY=1: unauthenticated chat is limited to free loopback local_only execution"
         );
+    }
+    if state
+        .remote_kill_switch
+        .load(std::sync::atomic::Ordering::SeqCst)
+    {
+        eprintln!("[idoris] IDORIS_REMOTE_KILL_SWITCH=1: every request is pinned to local_only");
     }
     println!(
         "idoris: 已注册组件 [{}]",
