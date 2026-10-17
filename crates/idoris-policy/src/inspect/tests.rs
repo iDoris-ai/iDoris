@@ -1198,9 +1198,11 @@ proptest! {
         ],
         lead in prop_oneof![Just(""), Just("1"), Just("１"), Just("a"), Just("ａ"), Just("-"), Just("\u{2010}")],
         trail in prop_oneof![Just(""), Just("9"), Just("１"), Just("x"), Just("ｘ"), Just("-")],
-        // One representative per `Default_Ignorable_Code_Point` range, so every
-        // range in `normalize::is_default_ignorable` is load-bearing: dropping a
-        // range from that table makes this property fail.
+        // One representative per `Default_Ignorable_Code_Point` range. This is
+        // coverage, not a guard on the table: dropping a range from
+        // `normalize::is_default_ignorable` does NOT fail this property (the strip
+        // view stops dropping it too, so the union stays a superset). The table
+        // is guarded by `every_default_ignorable_range_still_breaks_an_entity_insertion`.
         inner in proptest::collection::vec(
             prop_oneof![
                 Just('\u{00AD}'),   // 0x00AD

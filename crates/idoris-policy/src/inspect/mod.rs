@@ -91,8 +91,16 @@ pub fn inspect(input: &str, ctx: &InspectCtx) -> InspectResponse {
     let units: Vec<u16> = input.encode_utf16().collect();
     // 原文视图保证 base 覆盖不丢；两个折叠视图负责补隐形插入与全角/横线变体。
     let mut hits = scan_view(&normalize::identity(&units));
-    hits.extend(scan_view(&normalize::fold_keeping_ignorables(&units)));
-    hits.extend(scan_view(&normalize::normalize(&units)));
+    // The folded views may only add coverage, never invent an entity the original
+    // spelling does not have, so their HKID hits are filtered against the original.
+    hits.extend(drop_folded_malformed_hkid(
+        scan_view(&normalize::fold_keeping_ignorables(&units)),
+        &units,
+    ));
+    hits.extend(drop_folded_malformed_hkid(
+        scan_view(&normalize::normalize(&units)),
+        &units,
+    ));
     // 同一原文区间只留一条。敏感度取更严的那条，避免并集把 S3 降成 S2。
     hits.sort_by_key(|hit| {
         (
@@ -132,6 +140,35 @@ fn scan_view(normalized: &normalize::Normalized) -> Vec<Hit> {
         (hit.start, hit.length) = normalized.original_span(hit.start, hit.length);
     }
     hits
+}
+
+/// Folded views make some malformed HKID spellings look well formed: fullwidth
+/// parentheses and U+3000 fold to `()` and a space, which is exactly the shape the
+/// HKID rule accepts. Those spellings are not valid HKIDs, so a folded view must
+/// not report them.
+///
+/// The drop is judged on the **original** text the hit covers, and only for
+/// `HkIdentityCard` hits from a folded view: the raw view is exactly `base`, and
+/// U+3000 folding is load-bearing for bank cards (`6222\u{3000}0212...`), so
+/// neither the raw view nor the folding table may change.
+fn drop_folded_malformed_hkid(hits: Vec<Hit>, original: &[u16]) -> Vec<Hit> {
+    hits.into_iter()
+        .filter(|hit| {
+            hit.kind != FindingKind::HkIdentityCard
+                || !malformed_hkid_spelling(&original[hit.start..hit.start + hit.length])
+        })
+        .collect()
+}
+
+/// True when the original spelling is not a valid HKID: it contains an ideographic
+/// space, or its parenthesis types do not pair (a fullwidth opener must be closed
+/// by a fullwidth closer).
+fn malformed_hkid_spelling(span: &[u16]) -> bool {
+    let opens_full = span.iter().filter(|&&u| u == 0xFF08).count();
+    let opens_ascii = span.iter().filter(|&&u| u == u16::from(b'(')).count();
+    let closes_full = span.iter().filter(|&&u| u == 0xFF09).count();
+    let closes_ascii = span.iter().filter(|&&u| u == u16::from(b')')).count();
+    span.contains(&0x3000) || opens_full != closes_full || opens_ascii != closes_ascii
 }
 
 /// UTF-16 长度不会超过 UTF-8 字节数，所以字节数没超就一定没超，省掉一次计数。
