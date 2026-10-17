@@ -163,3 +163,127 @@ async fn protocol_selection_also_moves_to_a_healthy_candidate() {
     assert_eq!(failing.received_requests().await.unwrap().len(), 2);
     assert_eq!(healthy.received_requests().await.unwrap().len(), 1);
 }
+
+#[tokio::test]
+async fn supervisor_model_that_keeps_failing_is_locked_out_for_another() {
+    let cards = vec![
+        super::tests::sample_component_card("a-flaky"),
+        super::tests::sample_component_card("b-steady"),
+    ];
+    let mut adapters = Vec::new();
+    let mut bound = Vec::new();
+    for card in &cards {
+        let id = card.provider.id.clone();
+        let adapter = Arc::new(idoris_backend::MockAdapter::new(vec![
+            idoris_backend::ModelInfo {
+                id: id.clone(),
+                memory_gb: 1.0,
+            },
+        ]));
+        if id == "a-flaky" {
+            adapter.set_load_script(&id, vec![idoris_backend::mock::LoadOutcome::Fail; 3]);
+        }
+        let supervisor = idoris_backend::Supervisor::spawn(
+            adapter.clone(),
+            idoris_backend::SupervisorConfig::default(),
+        )
+        .unwrap();
+        bound.push(dispatch::BoundSupervisor::new(card, supervisor));
+        adapters.push(adapter);
+    }
+    let event_log = Arc::new(EventLogStore::new(Connection::open_in_memory().unwrap()).unwrap());
+    let app = build_app(AppState {
+        cards,
+        runtimes: runtime::RuntimeRegistry::from_supervisors(bound),
+        event_log: Some(event_log.clone()),
+        ..AppState::default()
+    });
+    let body = r#"{"model":"idoris/daily","messages":[{"role":"user","content":"hi"}]}"#;
+    let mut ok = Vec::new();
+    let mut last_record = String::new();
+    for _ in 0..3 {
+        let response = app.clone().oneshot(post_chat(body, &[])).await.unwrap();
+        ok.push(response.status() == StatusCode::OK);
+        last_record = response
+            .headers()
+            .get(HEADER_RECORD_ID)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+    }
+    assert_eq!(ok, [false, false, true]);
+    assert_eq!(
+        adapters[0].load_call_count("a-flaky"),
+        2,
+        "locked after two model faults"
+    );
+    assert_eq!(adapters[1].load_call_count("b-steady"), 1);
+    let events = event_log
+        .events_for_record(Some(budget::PERSONAL_TENANT_ID), &last_record)
+        .unwrap();
+    let decided = events
+        .iter()
+        .find(|e| e.event.event_type == EventType::Decided)
+        .unwrap();
+    assert_eq!(decided.event.metadata["provider_id"], "b-steady");
+}
+
+#[tokio::test]
+async fn the_fallback_re_decide_agrees_with_the_decided_rejection() {
+    // With the only model locked, selection is rejected and the legacy
+    // fallback re-decides; it must reach the same verdict the decided event
+    // recorded instead of re-picking the locked model.
+    let card = super::tests::sample_component_card("only-flaky");
+    let adapter = Arc::new(idoris_backend::MockAdapter::new(vec![
+        idoris_backend::ModelInfo {
+            id: "only-flaky".to_string(),
+            memory_gb: 1.0,
+        },
+    ]));
+    adapter.set_load_script(
+        "only-flaky",
+        vec![idoris_backend::mock::LoadOutcome::Fail; 3],
+    );
+    let supervisor = idoris_backend::Supervisor::spawn(
+        adapter.clone(),
+        idoris_backend::SupervisorConfig::default(),
+    )
+    .unwrap();
+    let event_log = Arc::new(EventLogStore::new(Connection::open_in_memory().unwrap()).unwrap());
+    let app = build_app(AppState {
+        cards: vec![card.clone()],
+        runtimes: Some(dispatch::BoundSupervisor::new(&card, supervisor)).into(),
+        event_log: Some(event_log.clone()),
+        ..AppState::default()
+    });
+    let body = r#"{"model":"idoris/daily","messages":[{"role":"user","content":"hi"}]}"#;
+    let mut last = None;
+    for _ in 0..3 {
+        last = Some(app.clone().oneshot(post_chat(body, &[])).await.unwrap());
+    }
+    let response = last.unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let record_id = response
+        .headers()
+        .get(HEADER_RECORD_ID)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let bytes = http_body_util::BodyExt::collect(response.into_body())
+        .await
+        .unwrap()
+        .to_bytes();
+    let error: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let events = event_log
+        .events_for_record(Some(budget::PERSONAL_TENANT_ID), &record_id)
+        .unwrap();
+    let decided = events
+        .iter()
+        .find(|e| e.event.event_type == EventType::Decided)
+        .unwrap();
+    assert_eq!(decided.event.metadata["status"], "rejected");
+    assert_eq!(error["error"]["type"], decided.event.metadata["reason"]);
+    assert_eq!(adapter.load_call_count("only-flaky"), 2);
+}

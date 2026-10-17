@@ -2283,11 +2283,11 @@ async fn chat_completions(
         std::collections::BTreeSet::new()
     };
 
+    // Resident proxies and Supervisor-run models share one breaker book.
     let open_provider_ids = state.proxy.open_providers(
         policy_cards
             .cards
             .iter()
-            .filter(|card| dispatch::is_resident_http_service(card))
             .map(|card| card.provider.id.as_str()),
     );
     let selection = dispatch::select_avoiding_open_breakers(
@@ -2499,12 +2499,19 @@ async fn chat_completions(
             &parsed,
             dispatch::DispatchInput::with_model(model, &prompt)
                 .with_affinity(affinity_key)
-                .with_ready_providers(&ready_provider_ids),
+                .with_ready_providers(&ready_provider_ids)
+                .with_blocked_providers(&open_provider_ids),
             messages,
             lifecycle.cancellation_token(),
         )
         .await
     };
+    if let Ok(outcome) = &dispatch_result {
+        state.proxy.report_local_outcome(
+            &outcome.decision.chosen_id,
+            local_model_fault(&outcome.result),
+        );
+    }
     match dispatch_result {
         Err(DispatchError::Rejection(rejection)) => rejection_response(rejection),
         Err(DispatchError::Internal(message)) => {
@@ -2539,6 +2546,32 @@ async fn chat_completions(
                 response
             }
         },
+    }
+}
+
+/// Whether a Supervisor outcome counts for or against the chosen model's
+/// breaker: model faults count, success resets, and anything that says
+/// nothing about the model (missing model config, a model still loading,
+/// capacity, cancellation, contention, budget, our own invariants) is
+/// ignored.
+fn local_model_fault(
+    result: &Result<idoris_backend::ChatResponse, dispatch::DispatchFailure>,
+) -> Option<bool> {
+    use idoris_backend::BackendError as E;
+    match result {
+        Ok(_) => Some(false),
+        Err(dispatch::DispatchFailure::Backend(
+            E::ModelUnavailable { .. }
+            | E::Oom { .. }
+            | E::ProbeTimedOut { .. }
+            | E::AdapterTimedOut { .. }
+            | E::AdapterPanicked { .. }
+            | E::LoadUnconfirmed { .. }
+            | E::LoadPostconditionFailed { .. }
+            | E::Upstream { .. }
+            | E::EvictionFailed { .. },
+        )) => Some(true),
+        Err(_) => None,
     }
 }
 

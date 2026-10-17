@@ -458,6 +458,9 @@ pub struct DispatchInput<'a> {
     pub prompt: &'a str,
     pub affinity_key: Option<&'a str>,
     pub ready_provider_ids: Option<&'a BTreeSet<String>>,
+    /// Providers whose breaker is open (M5-16/18), so a re-decide here can
+    /// never pick what the caller's own decision steered away from.
+    pub blocked_provider_ids: Option<&'a BTreeSet<String>>,
 }
 
 impl<'a> DispatchInput<'a> {
@@ -467,6 +470,7 @@ impl<'a> DispatchInput<'a> {
             prompt,
             affinity_key: None,
             ready_provider_ids: None,
+            blocked_provider_ids: None,
         }
     }
 
@@ -476,6 +480,7 @@ impl<'a> DispatchInput<'a> {
             prompt,
             affinity_key: None,
             ready_provider_ids: None,
+            blocked_provider_ids: None,
         }
     }
 
@@ -486,6 +491,11 @@ impl<'a> DispatchInput<'a> {
 
     pub fn with_ready_providers(mut self, ready_provider_ids: &'a BTreeSet<String>) -> Self {
         self.ready_provider_ids = Some(ready_provider_ids);
+        self
+    }
+
+    pub fn with_blocked_providers(mut self, blocked_provider_ids: &'a BTreeSet<String>) -> Self {
+        self.blocked_provider_ids = Some(blocked_provider_ids);
         self
     }
 }
@@ -637,17 +647,19 @@ async fn dispatch_local_inner(
     let requested_model = input.requested_model;
     let affinity_key = input.affinity_key;
     let ready_provider_ids = input.ready_provider_ids;
+    let blocked_provider_ids = input.blocked_provider_ids;
 
     let selected_owned;
     let selected = match selection {
         LocalSelection::Preselected(selected) => selected,
         LocalSelection::Cards(cards) => {
-            selected_owned = select_with_affinity_and_ready(
+            selected_owned = select_avoiding_open_breakers(
                 cards,
                 profile,
                 prompt,
                 affinity_key,
                 ready_provider_ids.unwrap_or(&BTreeSet::new()),
+                blocked_provider_ids.unwrap_or(&BTreeSet::new()),
             )?;
             &selected_owned
         }

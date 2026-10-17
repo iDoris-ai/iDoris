@@ -399,6 +399,27 @@ impl ChatProxy {
             .collect()
     }
 
+    /// M5-18 single-model lockout for Supervisor-run cards: the same book,
+    /// local class. Only model faults count; `None` means the outcome says
+    /// nothing about the model (config, cancellation, contention, our bugs).
+    pub(crate) fn report_local_outcome(&self, provider_id: &str, failed: Option<bool>) {
+        let Some(failed) = failed.filter(|_| self.breakers_enabled()) else {
+            return;
+        };
+        let Ok(mut book) = self.breakers.lock() else {
+            return;
+        };
+        let (key, class) = (
+            provider_id.to_string(),
+            idoris_policy::breaker::CredentialClass::Local,
+        );
+        if failed {
+            book.on_failure(&key, class, wall_clock_ms());
+        } else {
+            book.on_success(&key, class);
+        }
+    }
+
     /// Claims an upstream send for `provider_id`. A poisoned lock fails
     /// closed: no send.
     /// Turns provider breakers on or off for every later request.
