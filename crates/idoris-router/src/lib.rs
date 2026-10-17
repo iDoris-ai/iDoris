@@ -2560,17 +2560,28 @@ fn local_model_fault(
     use idoris_backend::BackendError as E;
     match result {
         Ok(_) => Some(false),
+        // Neither of these says anything about the health of the model we just
+        // selected, so blaming it would lock out a healthy model:
+        // * `EvictionFailed` means *another* model failed to unload
+        //   (`supervisor.rs` eviction path) and the backend documents it as
+        //   transient - it is the candidate we did not choose that is stuck.
+        // * `ModelUnavailable` on the chat path comes from losing a
+        //   Stopping/Stopped race with an unload, i.e. a scheduling collision.
+        // With the reopen rule in place a misclassified fault would re-lock the
+        // model for a full window every time, so a healthy model hit by eviction
+        // traffic every window would never serve.
         Err(dispatch::DispatchFailure::Backend(
-            E::ModelUnavailable { .. }
-            | E::Oom { .. }
+            E::Oom { .. }
             | E::ProbeTimedOut { .. }
             | E::AdapterTimedOut { .. }
             | E::AdapterPanicked { .. }
             | E::LoadUnconfirmed { .. }
             | E::LoadPostconditionFailed { .. }
-            | E::Upstream { .. }
-            | E::EvictionFailed { .. },
+            | E::Upstream { .. },
         )) => Some(true),
+        Err(dispatch::DispatchFailure::Backend(
+            E::ModelUnavailable { .. } | E::EvictionFailed { .. },
+        )) => Some(false),
         Err(_) => None,
     }
 }
@@ -5474,5 +5485,92 @@ mod tests {
             json!("degraded: stream_cancelled")
         );
         assert!(usage_rows(&store).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod local_model_fault_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::local_model_fault;
+    use idoris_backend::BackendError as E;
+
+    fn blames(error: E) -> Option<bool> {
+        local_model_fault(&Err(super::dispatch::DispatchFailure::Backend(error)))
+    }
+
+    /// Table-driven: which backend failures blame the selected model.
+    ///
+    /// `EvictionFailed` and `ModelUnavailable` must **not** blame it — the first
+    /// is another model failing to unload, the second is an unload race — so
+    /// flipping either back to "fault" has to turn this table red.
+    #[test]
+    fn only_this_models_own_failures_are_faults() {
+        let model = || "m".to_string();
+        let cases: Vec<(E, Option<bool>, &str)> = vec![
+            (E::Oom { model_id: model() }, Some(true), "oom"),
+            (
+                E::ProbeTimedOut { model_id: model() },
+                Some(true),
+                "probe timeout",
+            ),
+            (
+                E::AdapterTimedOut { model_id: model() },
+                Some(true),
+                "adapter timeout",
+            ),
+            (
+                E::AdapterPanicked {
+                    model_id: model(),
+                    message: "x".into(),
+                },
+                Some(true),
+                "adapter panic",
+            ),
+            (
+                E::LoadUnconfirmed {
+                    model_id: model(),
+                    message: "x".into(),
+                },
+                Some(true),
+                "load unconfirmed",
+            ),
+            (
+                E::LoadPostconditionFailed {
+                    model_id: model(),
+                    message: "x".into(),
+                },
+                Some(true),
+                "load postcondition",
+            ),
+            (
+                E::Upstream {
+                    message: "x".into(),
+                },
+                Some(true),
+                "upstream",
+            ),
+            // Not this model's fault: another model failed to unload.
+            (
+                E::EvictionFailed { model_id: model() },
+                Some(false),
+                "eviction failed",
+            ),
+            // Not this model's fault: lost a Stopping/Stopped race.
+            (
+                E::ModelUnavailable { model_id: model() },
+                Some(false),
+                "model unavailable",
+            ),
+            // A non-backend failure is not a model-health signal at all.
+            (
+                E::ModelNotFound { model_id: model() },
+                None,
+                "model not found is not a health signal",
+            ),
+        ];
+        for (error, expected, label) in cases {
+            assert_eq!(blames(error), expected, "{label}");
+        }
     }
 }
