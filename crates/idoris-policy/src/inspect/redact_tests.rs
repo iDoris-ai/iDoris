@@ -247,3 +247,183 @@ fn streaming_refuses_the_same_mangled_placeholders_as_batch() {
         );
     }
 }
+
+fn stream_chunks(r: &super::redact::Redaction, chunks: &[&str]) -> Result<String, RestoreError> {
+    let mut stream = r.stream();
+    let mut out = String::new();
+    for chunk in chunks {
+        out.push_str(&stream.push(chunk)?);
+    }
+    out.push_str(&stream.finish()?);
+    Ok(out)
+}
+
+#[test]
+fn parser_contract_at_every_two_and_three_chunk_utf8_boundary() {
+    let r = redacted("电话 13812345678");
+    let mut rows = vec![
+        ("电话 已省略".to_owned(), false),
+        ("电话 [cn_mobile_1]".into(), false),
+        ("电话 CN_MOBILE1".into(), false),
+        ("[CN_MOBILE_1] [cn_mobile_1]".into(), false),
+        ("[CN_MOBILE_1] [[cn_mobile_1]]".into(), false),
+        ("[CN_MOBILE_1] [ [cn_mobile_1]".into(), false),
+        ("[CN_MOBILE_1] [CN_MOBILE1]".into(), false),
+        ("[CN_MOBILE_1] CN_MOBILE1".into(), false),
+        ("[CN_MOBILE_1] [cn_mobile_1".into(), false),
+        ("[CN_MOBILE_1] c.n---mobile 1".into(), false),
+        ("[CN_MOBILE_1] x[row_1] [step_2]".into(), true),
+        ("[CN_MOBILE_1] [IMPORTANT_NOTE]".into(), true),
+        ("[CN_MOBILE_1] [IMPORTANT_NOTE_1]".into(), false),
+        ("[CN_MOBILE_1] [CN_MOBILE_01]".into(), false),
+        ("[CN_MOBILE_1] [CN_MOBILE_1]".into(), true),
+        ("[[CN_MOBILE_1] 🌊 [note] 文 [".into(), true),
+    ];
+    for kind in ["person", "PERSON", "CN_MOBILE", "step", "IMPORTANT"] {
+        rows.push((
+            format!("[CN_MOBILE_1] [{kind}_{}]", "1".repeat(65)),
+            kind == "step",
+        ));
+    }
+    rows.push((format!("[CN_MOBILE_1] [{}]", "x".repeat(100)), true));
+    rows.push((format!("[CN_MOBILE_1] [{}]", "A".repeat(100)), true));
+    rows.push((format!("[CN_MOBILE_1] [{}_1]", "A".repeat(100)), false));
+    for (text, accepted) in rows {
+        let expected = r.restore(&text);
+        assert_eq!(expected.is_ok(), accepted, "contract: {text}");
+        for a in 0..=text.len() {
+            if !text.is_char_boundary(a) {
+                continue;
+            }
+            for b in a..=text.len() {
+                if !text.is_char_boundary(b) {
+                    continue;
+                }
+                let actual = stream_chunks(&r, &[&text[..a], &text[a..b], &text[b..]]);
+                assert_eq!(actual.is_ok(), accepted, "split {a}/{b}: {text}");
+                if accepted {
+                    assert_eq!(actual, expected, "split {a}/{b}: {text}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn literal_collisions_nested_literals_and_long_literals_round_trip_at_every_split() {
+    for literal in [
+        "[CN_MOBILE_1]",
+        "[[CN_MOBILE_1]",
+        "[cn_mobile_1]",
+        "x[row_1]",
+        "[step_2]",
+        "[IMPORTANT_NOTE_1]",
+        &format!("[PERSON_{}]", "1".repeat(100)),
+    ] {
+        let input = format!("🌊 引用 {literal} 电话 13812345678");
+        let r = redacted(&input);
+        assert_eq!(r.restore(&r.text).unwrap(), input);
+        for at in 0..=r.text.len() {
+            if r.text.is_char_boundary(at) {
+                assert_eq!(
+                    stream_chunks(&r, &[&r.text[..at], &r.text[at..]]).unwrap(),
+                    input
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn completeness_is_set_based_and_errors_poison_streams() {
+    let r = redacted("13812345678 和 13987654321");
+    assert!(r.restore("[CN_MOBILE_1] [CN_MOBILE_1]").is_err());
+    assert!(
+        r.restore("[CN_MOBILE_1] [CN_MOBILE_2] [CN_MOBILE_1]")
+            .is_ok()
+    );
+    let mut stream = r.stream();
+    assert!(stream.push("[CN_MOBILE_1] [cn_mobile_1]").is_err());
+    assert!(stream.push("[CN_MOBILE_2]").is_err());
+    assert!(stream.finish().is_err());
+}
+
+#[test]
+fn empty_table_has_no_stream_only_rejections() {
+    let r = super::redact::Redaction::empty_for_test();
+    for text in ["见 [", "[step_2]", "[IMPORTANT_NOTE]", "[PERSON_1]"] {
+        let expected = r.restore(text);
+        for at in 0..=text.len() {
+            if text.is_char_boundary(at) {
+                assert_eq!(stream_chunks(&r, &[&text[..at], &text[at..]]), expected);
+            }
+        }
+    }
+}
+
+proptest::proptest! {
+    #![proptest_config(proptest::test_runner::Config::with_cases(256))]
+    #[test]
+    fn arbitrary_partitions_preserve_batch_verdict_and_output(
+        pieces in proptest::collection::vec(proptest::sample::select(vec![
+            "[", "]", "_", "CN", "mobile", "1", " ", "-", "🌊", "step_2", "PERSON", "[CN_MOBILE_1]"
+        ]), 0..80),
+        cuts in proptest::collection::vec(proptest::bool::ANY, 0..200),
+    ) {
+        let r = redacted("13812345678");
+        let text = format!("[CN_MOBILE_1] {}", pieces.concat());
+        let expected = r.restore(&text);
+        let mut chunks = Vec::new();
+        let mut start = 0;
+        for (n, (at, _)) in text.char_indices().enumerate() {
+            if cuts.get(n).copied().unwrap_or(false) { chunks.push(&text[start..at]); start = at; }
+        }
+        chunks.push(&text[start..]);
+        let actual = stream_chunks(&r, &chunks);
+        proptest::prop_assert_eq!(actual.is_ok(), expected.is_ok());
+        if expected.is_ok() { proptest::prop_assert_eq!(actual, expected); }
+    }
+}
+
+/// `push` accepts `&str`; transport splits inside a code point must first be
+/// decoded without loss. Exercise every raw byte split through that adapter.
+#[test]
+fn transport_byte_splits_decode_without_changing_parser_verdicts() {
+    let r = redacted("电话 13812345678");
+    for text in [
+        "🌊 电话 [CN_MOBILE_1]，见 [step_2]",
+        "🌊 [CN_MOBILE_1] [[cn_mobile_1]]",
+        "🌊 [CN_MOBILE_1] [IMPORTANT_NOTE]",
+        "🌊 [CN_MOBILE_1] [person_11111111111111111111111111111111111111111111111111111111111111111]",
+    ] {
+        for a in 0..=text.len() {
+            for b in a..=text.len() {
+                let mut pending = Vec::new();
+                let mut decoded = Vec::new();
+                for chunk in [
+                    &text.as_bytes()[..a],
+                    &text.as_bytes()[a..b],
+                    &text.as_bytes()[b..],
+                ] {
+                    pending.extend_from_slice(chunk);
+                    let valid = match std::str::from_utf8(&pending) {
+                        Ok(s) => s.len(),
+                        Err(e) => {
+                            assert!(e.error_len().is_none());
+                            e.valid_up_to()
+                        }
+                    };
+                    decoded.push(std::str::from_utf8(&pending[..valid]).unwrap().to_owned());
+                    pending.drain(..valid);
+                }
+                assert!(pending.is_empty());
+                let refs: Vec<_> = decoded.iter().map(String::as_str).collect();
+                assert_eq!(
+                    stream_chunks(&r, &refs),
+                    r.restore(text),
+                    "raw bytes {a}/{b}"
+                );
+            }
+        }
+    }
+}

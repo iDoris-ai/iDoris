@@ -101,7 +101,7 @@ pub fn redact(
                     }
                 };
                 // U1: a literal placeholder-shaped token in the input must not be
-                // mints to the same name, or `restore` would write personal data
+                // minted with the same name, or `restore` would write personal data
                 // over the user's own text. Skip any index the input already uses.
                 let placeholder = loop {
                     let candidate = format!("[{kind}_{n}]");
@@ -126,275 +126,272 @@ pub fn redact(
 }
 
 impl Redaction {
-    /// 把模型输出里的占位符换回原值（R-1/R-2 见模块文档）。
+    #[cfg(test)]
+    pub(super) fn empty_for_test() -> Self {
+        Self {
+            text: String::new(),
+            table: Vec::new(),
+            literals: Vec::new(),
+        }
+    }
+
+    /// Restore with the same scanner and completeness rule as streaming.
     pub fn restore(&self, output: &str) -> Result<String, RestoreError> {
-        // U3 / R-1: §1.4 asks for a set comparison - refuse when the count or type
-        // of placeholders does not match. Every minted placeholder must appear in
-        // the model output, and nothing placeholder-shaped outside the table may
-        // survive (a swallowed, lowercased or de-bracketed placeholder is a
-        // mangled one, not a clean pass-through).
-        // `replace` first so an unknown placeholder is reported as Unknown, not as
-        // a missing one; only a text whose tokens are all accounted for is then
-        // judged on completeness.
-        let restored = self.replace(output)?;
-        self.reject_mangled(&restored)?;
-        for (placeholder, _) in &self.table {
-            if !output.contains(placeholder.as_str()) {
-                return Err(RestoreError::MangledPlaceholder);
-            }
-        }
-        self.reject_extra_placeholder_shapes(output)?;
-        Ok(restored)
+        let mut stream = self.stream();
+        let mut result = stream.push(output)?;
+        result.push_str(&stream.finish()?);
+        Ok(result)
     }
 
-    /// Any placeholder-shaped token in the output that is not exactly a table
-    /// entry - wrong case, wrong digits, missing underscore - is a mangled
-    /// placeholder and must be refused rather than passed through.
-    fn reject_extra_placeholder_shapes(&self, output: &str) -> Result<(), RestoreError> {
-        let mut rest = output;
-        while let Some(open) = rest.find('[') {
-            let tail = &rest[open..];
-            let Some(close) = tail.find(']') else {
-                break;
-            };
-            let candidate = &tail[..=close];
-            if looks_like_placeholder_any_case(candidate)
-                && !self
-                    .table
-                    .iter()
-                    .any(|(placeholder, _)| placeholder == candidate)
-                && !self.literals.iter().any(|literal| literal == candidate)
-            {
-                return Err(RestoreError::MangledPlaceholder);
-            }
-            rest = &tail[candidate.len()..];
-        }
-        Ok(())
-    }
-
-    /// Streaming variant of [`Self::replace`]: records which table placeholders
-    /// were restored, and refuses a placeholder-shaped token that is neither a
-    /// table entry nor one of the input's own literals — the same verdict batch
-    /// `restore` reaches, so the two paths cannot disagree.
-    fn replace_streaming(
-        &self,
-        output: &str,
-        restored_counts: &mut Vec<(String, usize)>,
-    ) -> Result<String, RestoreError> {
-        let restored = self.replace(output)?;
-        for (placeholder, _) in &self.table {
-            let seen = output.matches(placeholder.as_str()).count();
-            if seen > 0 {
-                match restored_counts.iter_mut().find(|(p, _)| p == placeholder) {
-                    Some((_, n)) => *n += seen,
-                    None => restored_counts.push((placeholder.clone(), seen)),
-                }
-            }
-        }
-        self.reject_extra_placeholder_shapes(output)?;
-        Ok(restored)
-    }
-
-    /// R-2：只认映射表里的占位符。
-    fn replace(&self, output: &str) -> Result<String, RestoreError> {
-        let mut rest = output;
-        let mut restored = String::with_capacity(output.len());
-        while let Some(open) = rest.find('[') {
-            restored.push_str(&rest[..open]);
-            let tail = &rest[open..];
-            match tail.find(']').map(|close| &tail[..=close]) {
-                Some(candidate) if self.literals.iter().any(|literal| literal == candidate) => {
-                    // The user's own literal, not a minted placeholder.
-                    restored.push_str(candidate);
-                    rest = &tail[candidate.len()..];
-                }
-                Some(candidate) if looks_like_placeholder(candidate) => {
-                    let (_, original) = self
-                        .table
-                        .iter()
-                        .find(|(placeholder, _)| placeholder == candidate)
-                        .ok_or(RestoreError::UnknownPlaceholder)?;
-                    restored.push_str(original);
-                    rest = &tail[candidate.len()..];
-                }
-                _ => {
-                    restored.push('[');
-                    rest = &tail[1..];
-                }
-            }
-        }
-        restored.push_str(rest);
-        Ok(restored)
-    }
-
-    /// R-1：回填后的文本里不能再出现任何已知占位符的变形（去括号、`_`
-    /// 变空格或连字符）。
-    fn reject_mangled(&self, restored: &str) -> Result<(), RestoreError> {
-        for (placeholder, _) in &self.table {
-            let bare = &placeholder[1..placeholder.len() - 1];
-            let variants = [
-                bare.to_string(),
-                bare.replace('_', " "),
-                bare.replace('_', "-"),
-            ];
-            if variants
-                .iter()
-                .any(|variant| restored.contains(variant.as_str()))
-            {
-                return Err(RestoreError::MangledPlaceholder);
-            }
-        }
-        Ok(())
-    }
-
-    /// 流式回填：占位符可能被切在两个 chunk 之间。
     pub fn stream(&self) -> StreamRestorer<'_> {
+        let limit = self
+            .table
+            .iter()
+            .map(|(p, _)| p.len())
+            .chain(self.literals.iter().map(String::len))
+            .max()
+            .unwrap_or(0)
+            .max(64);
         StreamRestorer {
             redaction: self,
-            pending: String::new(),
-            emitted_tail: String::new(),
-            restored: Vec::new(),
+            token: None,
+            normalized: String::new(),
+            names: self.table.iter().map(|(p, _)| normalize(p)).collect(),
+            seen: vec![false; self.table.len()],
+            limit,
+            failed: None,
         }
     }
 }
 
-/// 占位符（含括号）最长不会超过这个长度；更长的未闭合 `[` 不再压住。
-const MAX_PLACEHOLDER: usize = 64;
+/// Bounded bracket classifier. After the spelling buffer fills, structural
+/// state still follows the entire token: overflow never becomes an exemption.
+struct Token {
+    spelling: String,
+    overflow: bool,
+    uppercase: bool,
+    reserved: bool,
+    digits: bool,
+    indexed: bool,
+}
 
-/// 逐 chunk 回填；未闭合的 `[` 之后的内容先压住，等下一块或 [`finish`]。
-/// 变形检查跨 chunk 进行：上一块已输出文本的尾巴和这一块拼起来再查。
+impl Token {
+    fn new() -> Self {
+        Self {
+            spelling: "[".into(),
+            overflow: false,
+            uppercase: true,
+            reserved: false,
+            digits: false,
+            indexed: false,
+        }
+    }
+
+    fn advance(&mut self, c: char) {
+        self.uppercase &= !c.is_ascii_lowercase();
+        if c == '_' {
+            self.reserved = !self.overflow && reserved_kind(&self.spelling[1..]);
+            self.indexed = self.overflow || self.spelling.len() > 1;
+            self.digits = false;
+        } else if c.is_ascii_digit() {
+            self.digits = self.indexed;
+        } else {
+            self.indexed = false;
+            self.digits = false;
+        }
+    }
+
+    fn placeholder(&self) -> bool {
+        self.digits && (self.uppercase || self.reserved)
+    }
+}
+
+/// Incremental restoration over UTF-8 strings. Call `finish` to validate
+/// completeness, even after the last `push` emitted text. All output is
+/// provisional until `finish` succeeds; discard it on any error. A failed
+/// `push` permanently poisons the restorer.
 ///
-/// [`finish`]: StreamRestorer::finish
+/// Held spelling is bounded by max(64, longest table entry or input literal).
+/// Shape state and the normalized suffix remain bounded independently of output
+/// length, including unclosed brackets and arbitrarily long separator runs.
 pub struct StreamRestorer<'a> {
     redaction: &'a Redaction,
-    pending: String,
-    emitted_tail: String,
-    /// How many times each table placeholder was restored so far, so `finish`
-    /// can apply batch `restore`'s completeness rule to the whole stream.
-    restored: Vec<(String, usize)>,
+    token: Option<Token>,
+    normalized: String,
+    names: Vec<String>,
+    seen: Vec<bool>,
+    limit: usize,
+    failed: Option<RestoreError>,
 }
 
 impl StreamRestorer<'_> {
-    /// The longest placeholder this redaction actually minted, so the stream
-    /// bounds its held prefix by the table instead of a fixed constant.
-    fn max_placeholder_len(&self) -> usize {
-        self.redaction
-            .table
-            .iter()
-            .map(|(placeholder, _)| placeholder.len())
-            .max()
-            .unwrap_or(0)
+    pub fn push(&mut self, chunk: &str) -> Result<String, RestoreError> {
+        if let Some(error) = self.failed {
+            return Err(error);
+        }
+        let result = self.scan(chunk);
+        if let Err(error) = result {
+            self.failed = Some(error);
+        }
+        result
     }
 
-    pub fn push(&mut self, chunk: &str) -> Result<String, RestoreError> {
-        self.pending.push_str(chunk);
-        let hold_from = match self.pending.rfind('[') {
-            Some(open) if !self.pending[open..].contains(']') => {
-                let held = &self.pending[open..];
-                // A held segment that is still a plausible placeholder prefix but
-                // has already outgrown any real placeholder can never become a
-                // known one; batch `restore` refuses it, so streaming must too
-                // rather than releasing the `[` as plain text.
-                if held.len() > self.max_placeholder_len() && is_placeholder_prefix(held) {
-                    return Err(RestoreError::UnknownPlaceholder);
+    fn scan(&mut self, chunk: &str) -> Result<String, RestoreError> {
+        let mut out = String::new();
+        for c in chunk.chars() {
+            if c == ']' && self.token.is_some() {
+                let mut token = self.token.take().ok_or(RestoreError::MangledPlaceholder)?;
+                if !token.overflow {
+                    token.spelling.push(c);
+                    if self.redaction.literals.contains(&token.spelling) {
+                        self.normalized.clear();
+                        out.push_str(&token.spelling);
+                        continue;
+                    }
+                    if let Some(index) = self
+                        .redaction
+                        .table
+                        .iter()
+                        .position(|(p, _)| *p == token.spelling)
+                    {
+                        self.seen[index] = true;
+                        self.normalized.clear();
+                        out.push_str(&self.redaction.table[index].1);
+                        continue;
+                    }
                 }
-                if held.len() <= MAX_PLACEHOLDER {
-                    open
+                if token.placeholder() {
+                    return Err(if token.uppercase {
+                        RestoreError::UnknownPlaceholder
+                    } else {
+                        RestoreError::MangledPlaceholder
+                    });
+                }
+                if token.overflow {
+                    self.plain("]", &mut out)?;
                 } else {
-                    self.pending.len()
+                    self.plain(&token.spelling, &mut out)?;
                 }
+                continue;
             }
-            _ => self.pending.len(),
-        };
-        let ready: String = self.pending.drain(..hold_from).collect();
-        self.emit(&ready)
+            if (c.is_ascii_alphanumeric() || c == '_')
+                && let Some(mut token) = self.token.take()
+            {
+                token.advance(c);
+                if !token.overflow && token.spelling.len() < self.limit {
+                    token.spelling.push(c);
+                } else {
+                    if !token.overflow {
+                        self.plain(&token.spelling, &mut out)?;
+                        token.spelling.clear();
+                        token.overflow = true;
+                    }
+                    self.plain(&c.to_string(), &mut out)?;
+                }
+                self.token = Some(token);
+                continue;
+            }
+            // Advance only one opening bracket: malformed outer brackets never
+            // hide a valid or malformed inner token.
+            if let Some(token) = self.token.take() {
+                self.plain(&token.spelling, &mut out)?;
+            }
+            if c == '[' {
+                self.token = Some(Token::new());
+            } else {
+                self.plain(&c.to_string(), &mut out)?;
+            }
+        }
+        Ok(out)
+    }
+
+    fn plain(&mut self, text: &str, out: &mut String) -> Result<(), RestoreError> {
+        for c in text.chars().filter(char::is_ascii_alphanumeric) {
+            self.normalized.push(c.to_ascii_uppercase());
+            if self
+                .names
+                .iter()
+                .any(|name| self.normalized.ends_with(name))
+            {
+                return Err(RestoreError::MangledPlaceholder);
+            }
+            let max = self.names.iter().map(String::len).max().unwrap_or(0);
+            if self.normalized.len() > max {
+                self.normalized.drain(..self.normalized.len() - max);
+            }
+        }
+        out.push_str(text);
+        Ok(())
     }
 
     pub fn finish(mut self) -> Result<String, RestoreError> {
-        let rest = std::mem::take(&mut self.pending);
-        let tail = self.emit(&rest)?;
-        // N1: the batch path refuses a text that lost a placeholder; streaming
-        // must reach the same verdict, and `finish` is where the whole stream is
-        // finally known.
-        for (placeholder, _) in &self.redaction.table {
-            if !self.restored.iter().any(|(seen, _)| seen == placeholder) {
-                return Err(RestoreError::MangledPlaceholder);
-            }
+        if let Some(error) = self.failed {
+            return Err(error);
+        }
+        let mut tail = String::new();
+        if let Some(token) = self.token.take() {
+            self.plain(&token.spelling, &mut tail)?;
+        }
+        if self.seen.iter().any(|seen| !seen) {
+            return Err(RestoreError::MangledPlaceholder);
         }
         Ok(tail)
     }
-
-    fn emit(&mut self, ready: &str) -> Result<String, RestoreError> {
-        let restored = self
-            .redaction
-            .replace_streaming(ready, &mut self.restored)?;
-        let window = format!("{}{restored}", self.emitted_tail);
-        self.redaction.reject_mangled(&window)?;
-        let keep = window
-            .char_indices()
-            .rev()
-            .nth(MAX_PLACEHOLDER - 1)
-            .map_or(0, |(at, _)| at);
-        self.emitted_tail = window[keep..].to_string();
-        Ok(restored)
-    }
 }
 
-/// Placeholder shape ignoring case, so a lowercased or mis-cased placeholder is
-/// still recognised as a mangled placeholder rather than plain text.
-fn looks_like_placeholder_any_case(candidate: &str) -> bool {
-    if !candidate.starts_with('[') || !candidate.ends_with(']') {
-        return false;
-    }
-    let inner = &candidate[1..candidate.len() - 1];
-    inner.rsplit_once('_').is_some_and(|(kind, n)| {
-        !kind.is_empty()
-            && kind.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
-            && !n.is_empty()
-            && n.bytes().all(|b| b.is_ascii_digit())
-    })
+fn normalize(text: &str) -> String {
+    text.chars()
+        .filter(char::is_ascii_alphanumeric)
+        .map(|c| c.to_ascii_uppercase())
+        .collect()
 }
 
-/// Every placeholder-shaped token already present in `text`, so the engine never
-/// mints a colliding name and `restore` can pass the user's own text through.
+// Uppercase indexed identifiers reserve the generic placeholder namespace.
+// Lowercase prose identifiers remain ordinary, except actual entity kinds.
+fn reserved_kind(kind: &str) -> bool {
+    use idoris_contracts::inspect::FindingKind::*;
+    kind.eq_ignore_ascii_case("person")
+        || [
+            CnResidentId,
+            CnMobile,
+            BankCard,
+            CnUnifiedSocialCreditCode,
+            CnLicensePlate,
+            CnPassport,
+            HkIdentityCard,
+            HkMacauTravelPermit,
+            EmailAddress,
+            ApiKey,
+            PrivateKey,
+            HighEntropySecret,
+            CredentialPath,
+            InputLimitExceeded,
+        ]
+        .iter()
+        .any(|k| kind.eq_ignore_ascii_case(k.as_str()))
+}
+
+/// The same bracket grammar used by restoration, advancing one `[` at a time.
+/// Record all input literals (including ordinary lowercase indexed identifiers)
+/// before minting names, so exact literals bypass both shape and mangling checks.
 fn placeholder_tokens(text: &str) -> Vec<String> {
     let mut found = Vec::new();
-    let mut rest = text;
-    while let Some(open) = rest.find('[') {
-        let tail = &rest[open..];
-        let Some(close) = tail.find(']') else {
-            break;
-        };
-        let candidate = &tail[..=close];
-        if looks_like_placeholder(candidate) {
-            found.push(candidate.to_string());
+    let mut token: Option<Token> = None;
+    for c in text.chars() {
+        if c == '[' {
+            token = Some(Token::new());
+        } else if let Some(mut current) = token.take() {
+            if c == ']' {
+                current.spelling.push(c);
+                found.push(current.spelling);
+            } else if c.is_ascii_alphanumeric() || c == '_' {
+                current.advance(c);
+                current.spelling.push(c);
+                token = Some(current);
+            }
         }
-        rest = &tail[candidate.len()..];
     }
     found
-}
-
-/// True while the text after an unmatched `[` can still become a placeholder:
-/// uppercase letters, digits and `_` only.
-fn is_placeholder_prefix(held: &str) -> bool {
-    held.strip_prefix('[').is_some_and(|inner| {
-        inner
-            .bytes()
-            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
-    })
-}
-
-/// `[` + 大写字母/数字/下划线 + `_` + 数字 + `]`。
-fn looks_like_placeholder(candidate: &str) -> bool {
-    let inner = &candidate[1..candidate.len() - 1];
-    inner.rsplit_once('_').is_some_and(|(kind, n)| {
-        !kind.is_empty()
-            && kind
-                .bytes()
-                .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
-            && !n.is_empty()
-            && n.bytes().all(|b| b.is_ascii_digit())
-    })
 }
 
 fn label(kind: idoris_contracts::inspect::FindingKind) -> String {
@@ -403,4 +400,33 @@ fn label(kind: idoris_contracts::inspect::FindingKind) -> String {
 
 fn utf16(units: &[u16]) -> Result<String, RedactError> {
     String::from_utf16(units).map_err(|_| RedactError::InvalidSpan)
+}
+
+#[cfg(test)]
+mod scanner_bounds {
+    use super::*;
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn overflow_keeps_bounded_state_without_losing_the_final_shape() {
+        let r = Redaction {
+            text: String::new(),
+            table: vec![("[CN_MOBILE_1]".into(), "value".into())],
+            literals: Vec::new(),
+        };
+        for prefix in ["[PERSON_", "[person_", "[A"] {
+            let mut stream = r.stream();
+            stream.push("[CN_MOBILE_1]").unwrap();
+            stream.push(prefix).unwrap();
+            for _ in 0..1_000 {
+                stream.push("1111111111").unwrap();
+                assert!(stream.token.as_ref().unwrap().spelling.len() <= stream.limit);
+                assert!(stream.normalized.len() <= normalize("[CN_MOBILE_1]").len());
+            }
+            if prefix == "[A" {
+                stream.push("_").unwrap();
+            }
+            assert!(stream.push("1]").is_err());
+        }
+    }
 }
