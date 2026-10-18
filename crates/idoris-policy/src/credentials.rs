@@ -201,7 +201,9 @@ fn destination(raw: &str) -> Result<(String, String), CredentialError> {
 fn path_is_safe(path: &str) -> bool {
     path.bytes()
         .all(|b| b.is_ascii_alphanumeric() || b"-._~/".contains(&b))
-        && path.split('/').all(|segment| segment != "." && segment != "..")
+        && path
+            .split('/')
+            .all(|segment| segment != "." && segment != "..")
 }
 
 /// `path` equals `prefix` or continues it at a segment boundary.
