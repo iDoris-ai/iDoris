@@ -2579,9 +2579,13 @@ fn local_model_fault(
             | E::LoadPostconditionFailed { .. }
             | E::Upstream { .. },
         )) => Some(true),
+        // `Some(false)` means *success* and clears the breaker, which would turn
+        // the old over-locking into silent un-locking: an in-flight request that
+        // ends with an unload race would close a breaker another request just
+        // opened. `None` is the honest answer - not a health signal either way.
         Err(dispatch::DispatchFailure::Backend(
             E::ModelUnavailable { .. } | E::EvictionFailed { .. },
-        )) => Some(false),
+        )) => None,
         Err(_) => None,
     }
 }
@@ -5550,16 +5554,17 @@ mod local_model_fault_tests {
                 Some(true),
                 "upstream",
             ),
-            // Not this model's fault: another model failed to unload.
+            // Not this model's fault, and not a success either: `Some(false)`
+            // clears the breaker (on_success -> Closed{0}), so these must be
+            // `None` - no health signal at all.
             (
                 E::EvictionFailed { model_id: model() },
-                Some(false),
+                None,
                 "eviction failed",
             ),
-            // Not this model's fault: lost a Stopping/Stopped race.
             (
                 E::ModelUnavailable { model_id: model() },
-                Some(false),
+                None,
                 "model unavailable",
             ),
             // A non-backend failure is not a model-health signal at all.
@@ -5572,5 +5577,65 @@ mod local_model_fault_tests {
         for (error, expected, label) in cases {
             assert_eq!(blames(error), expected, "{label}");
         }
+    }
+
+    /// The tri-state contract must be honoured the same way `report_local_outcome`
+    /// wires it: `Some(true)` -> `on_failure`, `Some(false)` -> `on_success`
+    /// (which *clears* the breaker), `None` -> nothing applied. B1' was that the
+    /// two race outcomes reported `Some(false)`, so a request that lost an unload
+    /// race closed a breaker another request had just opened.
+    #[test]
+    fn a_race_outcome_neither_locks_nor_unlocks_a_breaker() {
+        use idoris_backend::BackendError as E;
+        use idoris_policy::breaker::{Breaker, CredentialClass};
+
+        let class = CredentialClass::Local;
+        let mut breaker = Breaker::new(class);
+        // Two faults lock it (Local threshold).
+        breaker.on_failure(0);
+        breaker.on_failure(0);
+        assert!(!breaker.would_admit(0), "two faults must lock");
+
+        // An in-flight request that ends in an unload race must leave it locked.
+        let race = super::local_model_fault(&Err(super::dispatch::DispatchFailure::Backend(
+            E::ModelUnavailable {
+                model_id: "m".into(),
+            },
+        )));
+        assert_eq!(race, None);
+        if let Some(failed) = race {
+            if failed {
+                breaker.on_failure(0);
+            } else {
+                breaker.on_success();
+            }
+        }
+        assert!(
+            !breaker.would_admit(0),
+            "a race outcome must not clear a locked breaker"
+        );
+
+        // Same for the eviction variant, and it must not reset the failure count
+        // of a breaker that is not yet open.
+        let mut counting = Breaker::new(class);
+        counting.on_failure(0);
+        let eviction = super::local_model_fault(&Err(super::dispatch::DispatchFailure::Backend(
+            E::EvictionFailed {
+                model_id: "m".into(),
+            },
+        )));
+        assert_eq!(eviction, None);
+        if let Some(failed) = eviction {
+            if failed {
+                counting.on_failure(0);
+            } else {
+                counting.on_success();
+            }
+        }
+        counting.on_failure(0);
+        assert!(
+            !counting.would_admit(0),
+            "one fault, a race, then one more fault must still lock"
+        );
     }
 }
