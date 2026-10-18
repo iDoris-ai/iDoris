@@ -30,6 +30,9 @@
 mod decode;
 mod l0;
 mod normalize;
+pub mod redact;
+#[cfg(test)]
+mod redact_tests;
 mod secrets;
 #[cfg(test)]
 mod tests;

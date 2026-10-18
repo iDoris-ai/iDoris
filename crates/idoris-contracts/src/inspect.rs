@@ -90,6 +90,28 @@ pub enum FindingKind {
     InputLimitExceeded,
 }
 
+impl FindingKind {
+    /// The wire value, without going through serde.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::CnResidentId => "cn_resident_id",
+            Self::CnMobile => "cn_mobile",
+            Self::BankCard => "bank_card",
+            Self::CnUnifiedSocialCreditCode => "cn_unified_social_credit_code",
+            Self::CnLicensePlate => "cn_license_plate",
+            Self::CnPassport => "cn_passport",
+            Self::HkIdentityCard => "hk_identity_card",
+            Self::HkMacauTravelPermit => "hk_macau_travel_permit",
+            Self::EmailAddress => "email_address",
+            Self::ApiKey => "api_key",
+            Self::PrivateKey => "private_key",
+            Self::HighEntropySecret => "high_entropy_secret",
+            Self::CredentialPath => "credential_path",
+            Self::InputLimitExceeded => "input_limit_exceeded",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct InspectSpan {
@@ -196,6 +218,7 @@ mod tests {
                 serde_json::to_value(kind).unwrap(),
                 serde_json::json!(value)
             );
+            assert_eq!(kind.as_str(), *value);
         }
     }
 
