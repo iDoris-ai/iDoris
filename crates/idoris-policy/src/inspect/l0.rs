@@ -177,12 +177,11 @@ fn classify(c: &Candidate<'_>, hits: &mut Vec<Hit>) {
     if d.len() == 15 && grouped_as(&[6, 6, 3]) && legacy_id_structure(d) {
         push(FindingKind::CnResidentId, c.end, Sensitivity::S2);
     }
-    // The common written forms for an 11-digit mobile. A 3-8 / 4-7 / 4-4-3 split
-    // is what people actually type; requiring only 3-4-4 lost them (base caught
-    // them). `138 123 45678` is deliberately NOT accepted: it is a table cell, and
-    // a mobile has no checksum to tell it from a real grouping.
+    // Restore the requested 3-8 / 4-7 layouts alongside 3-4-4. Do not add
+    // 4-4-3: ordinary rows such as `1998 2005 100` collide with mobile numbers.
+    // These enumerated layouts are heuristics, not proof that a row is a phone.
     let mobile = match d.len() {
-        11 => matches!(c.runs, [] | [11] | [3, 4, 4] | [3, 8] | [4, 7] | [4, 4, 3]) && is_mobile(d),
+        11 => matches!(c.runs, [] | [11] | [3, 4, 4] | [3, 8] | [4, 7]) && is_mobile(d),
         13 => grouped_as(&[2, 3, 4, 4]) && d[..2] == [8, 6] && is_mobile(&d[2..]),
         _ => false,
     };
@@ -252,7 +251,6 @@ fn card_iin(d: &[u8]) -> bool {
             (2221..=2720).contains(&first_four) || (2200..=2204).contains(&first_four)
         }
         9 => first_four == 9792, // Troy
-        1 => first_four == 2131, // legacy JCB (historically 15 digits)
         8 => d[1] == 1,
         _ => false,
     }

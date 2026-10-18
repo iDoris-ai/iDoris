@@ -835,11 +835,13 @@ fn common_written_layouts_and_issuer_ranges_are_found_again() {
     for (input, kind) in [
         ("138-12345678", FindingKind::CnMobile),
         ("1381 2345678", FindingKind::CnMobile),
-        ("1381 2345 678", FindingKind::CnMobile),
         // 6-12 split with the X check digit.
         ("110105 19491231002X", FindingKind::CnResidentId),
+        ("110105 194912310021", FindingKind::CnResidentId),
         // UnionPay-length 6-13 / 6-12 written splits.
         ("622202 1234567890128", FindingKind::BankCard),
+        ("622202 123456789012", FindingKind::BankCard),
+        ("6222 0212 3456 7890 128", FindingKind::BankCard),
         // MIR 2200–2204, previously rejected by the issuer allowlist.
         ("2200123456789019", FindingKind::BankCard),
         ("2200 1234 5678 9019", FindingKind::BankCard),
@@ -855,9 +857,17 @@ fn common_written_layouts_and_issuer_ranges_are_found_again() {
         );
     }
 
-    // A space-separated table cell is not a mobile: a phone has no checksum, so
-    // accepting run-length alone would make every numeric table a phone.
-    for input in ["138 123 45678", "2023 1203 2024", "1 2 3 4 5 6 7 8"] {
+    // Keep the rejected table layouts public; accepted layouts are still
+    // heuristic and can collide with other numeric text.
+    for input in [
+        "138 123 45678",
+        "2023 1203 2024",
+        "1 2 3 4 5 6 7 8",
+        "1998 2005 100",
+        "1949 1978 200",
+        "共 1500 2000 300 元",
+        "年份 1998 2005 100 1999 2006 200",
+    ] {
         let response = inspect(input, &open_ctx());
         assert_eq!(
             response.action,
