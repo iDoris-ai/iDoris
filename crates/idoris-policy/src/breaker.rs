@@ -15,6 +15,13 @@
 
 use std::collections::HashMap;
 use std::hash::Hash;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+fn next_issuer() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    NEXT.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+        .unwrap_or_else(|_| panic!("breaker issuer IDs exhausted"))
+}
 
 /// 决定断路器参数的凭据类别。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -74,6 +81,7 @@ impl Admission {
 #[derive(Debug)]
 #[must_use = "move this ticket into exactly one outcome report"]
 pub struct AdmissionTicket {
+    issuer: u64,
     generation: u64,
     probe: bool,
 }
@@ -92,8 +100,13 @@ impl Admit {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Tickets belong to this instance. Cloning retains state but creates a new issuer.
+///
+/// Pre-release API refinement: `Breaker` is no longer `Copy`, and `new` is no
+/// longer `const`, because every new or cloned instance needs a unique identity.
+#[derive(Debug, PartialEq, Eq)]
 pub struct Breaker {
+    issuer: u64,
     class: CredentialClass,
     state: State,
     /// 当前世代。进入 OPEN、以及探测成功回到 CLOSED 时加一。
@@ -103,9 +116,22 @@ pub struct Breaker {
     open_cohort: Option<u64>,
 }
 
-impl Breaker {
-    pub const fn new(class: CredentialClass) -> Self {
+impl Clone for Breaker {
+    fn clone(&self) -> Self {
         Self {
+            issuer: next_issuer(),
+            class: self.class,
+            state: self.state,
+            generation: self.generation,
+            open_cohort: self.open_cohort,
+        }
+    }
+}
+
+impl Breaker {
+    pub fn new(class: CredentialClass) -> Self {
+        Self {
+            issuer: next_issuer(),
             class,
             state: State::Closed { failures: 0 },
             generation: 0,
@@ -129,6 +155,7 @@ impl Breaker {
             State::HalfOpen { probing: true } => (Admission::Rejected { retry_after_ms: 0 }, None),
         };
         let ticket = probe.map(|probe| AdmissionTicket {
+            issuer: self.issuer,
             generation: self.generation,
             probe,
         });
@@ -136,7 +163,14 @@ impl Breaker {
     }
 
     pub fn on_success(&mut self, ticket: AdmissionTicket) {
-        let AdmissionTicket { generation, probe } = ticket;
+        let AdmissionTicket {
+            issuer,
+            generation,
+            probe,
+        } = ticket;
+        if issuer != self.issuer {
+            return;
+        }
         if generation != self.generation {
             return;
         }
@@ -154,7 +188,14 @@ impl Breaker {
     }
 
     pub fn on_failure(&mut self, ticket: AdmissionTicket, now_ms: u64) {
-        let AdmissionTicket { generation, probe } = ticket;
+        let AdmissionTicket {
+            issuer,
+            generation,
+            probe,
+        } = ticket;
+        if issuer != self.issuer {
+            return;
+        }
         if generation != self.generation {
             return;
         }
@@ -185,7 +226,14 @@ impl Breaker {
     /// 类别的完整恢复时间，header 更长时再延长。同一打开世代里、另一枚
     /// 尚未回报的票据仍可以延长窗口，但不能缩短。
     pub fn on_retry_after(&mut self, ticket: AdmissionTicket, now_ms: u64, retry_after_ms: u64) {
-        let AdmissionTicket { generation, probe } = ticket;
+        let AdmissionTicket {
+            issuer,
+            generation,
+            probe,
+        } = ticket;
+        if issuer != self.issuer {
+            return;
+        }
         if matches!(self.state, State::HalfOpen { .. }) && !probe {
             return;
         }
