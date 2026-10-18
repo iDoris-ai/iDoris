@@ -485,6 +485,16 @@ mod scanner_bounds {
             table: vec![("[CN_MOBILE_1]".into(), "value".into())],
             literals: Vec::new(),
         };
+        // Leave 1 or 2 bytes before the limit, then append a 3-byte character.
+        // All-fullwidth prefixes alone can land exactly on 64 and miss overshoot.
+        for ascii_count in [61, 62] {
+            let mut stream = r.stream();
+            stream
+                .push(&format!("[{}", "A".repeat(ascii_count)))
+                .unwrap();
+            stream.push("Ａ").unwrap();
+            assert!(stream.token.as_ref().unwrap().spelling.len() <= stream.limit);
+        }
         for prefix in ["[Ａ", "[ＰＥＲＳＯＮ＿"] {
             let mut stream = r.stream();
             stream.push("[CN_MOBILE_1]").unwrap();
