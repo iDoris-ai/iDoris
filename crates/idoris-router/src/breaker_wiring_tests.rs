@@ -377,6 +377,56 @@ async fn single_card_all_open_keeps_the_retryable_reason_on_protocol_endpoints()
 /// next to an embedding-only lifecycle card, must still answer the retryable
 /// `provider_circuit_open` — the lifecycle card is not selectable for chat.
 #[tokio::test]
+async fn all_open_mixed_cards_keep_retryable_reason_in_both_id_orders() {
+    for (life_id, proxy_id) in [("a-life", "z-proxy"), ("z-life", "a-proxy")] {
+        let server = MockServer::start().await;
+        let life = super::tests::sample_component_card(life_id);
+        let adapter = Arc::new(idoris_backend::MockAdapter::new(vec![
+            idoris_backend::ModelInfo {
+                id: life_id.to_string(),
+                memory_gb: 1.0,
+            },
+        ]));
+        let supervisor = idoris_backend::Supervisor::spawn(
+            adapter.clone(),
+            idoris_backend::SupervisorConfig::default(),
+        )
+        .unwrap();
+        let state = AppState {
+            cards: vec![
+                life.clone(),
+                resident_component_card(proxy_id, &server.uri()),
+            ],
+            runtimes: Some(dispatch::BoundSupervisor::new(&life, supervisor)).into(),
+            ..AppState::default()
+        };
+        state.proxy.set_breakers_enabled(true);
+        for provider in [life_id, proxy_id] {
+            state.proxy.report_local_outcome(provider, Some(true));
+            state.proxy.report_local_outcome(provider, Some(true));
+        }
+        assert_eq!(state.proxy.open_providers([life_id, proxy_id]).len(), 2);
+        let app = build_app(state);
+        let response = app
+            .oneshot(post_chat(
+                r#"{"model":"idoris/daily","messages":[{"role":"user","content":"hi"}]}"#,
+                &[],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            body["error"]["type"], "provider_circuit_open",
+            "{life_id}/{proxy_id}: {body}"
+        );
+        assert_eq!(adapter.load_call_count(life_id), 0);
+        assert_eq!(server.received_requests().await.unwrap().len(), 0);
+    }
+}
+
+#[tokio::test]
 async fn a_mixed_tier_keeps_the_retryable_reason_for_chat() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))

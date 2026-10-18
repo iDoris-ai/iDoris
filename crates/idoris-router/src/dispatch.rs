@@ -293,30 +293,24 @@ pub fn select_avoiding_open_breakers(
         ready_provider_ids,
     ) {
         Ok(decision) => decision,
-        // When the open set covers every eligible card, marking them all
-        // `Blocked` turns "everything is cooling down" into
-        // `no_eligible_candidate`, which is a different contract: clients key on
-        // the error type to decide whether to retry. Fall back to plain
-        // selection so the proxy send gate can answer the retryable
-        // `provider_circuit_open` instead.
-        // Only the proxy-gated path may fall back: there the send gate answers the
-        // retryable `provider_circuit_open` before anything leaves the process.
-        // A lifecycle card would instead be dispatched through the Supervisor,
-        // which loads the model - i.e. the fallback would defeat the lockout it
-        // exists to report. So require every eligible card to be a resident http
-        // service before relaxing the open set.
-        // Relax the open set only when the card this fallback would actually
-        // choose is proxy-gated, because that is where the retryable
-        // `provider_circuit_open` is answered before anything is sent. Judging
-        // the whole candidate list instead would switch the fallback off in a
-        // mixed deployment - a resident chat card plus an embedding-only
-        // lifecycle card in the same tier - and chat would answer the terminal
-        // `no_eligible_candidate` again.
+        // Relax only proxy-gated resident cards: their send gate reports the
+        // retryable `provider_circuit_open`. Open lifecycle cards stay blocked
+        // regardless of cost, affinity or id ordering, so they cannot suppress
+        // that reason or get loaded by the Supervisor through this fallback.
         Err(rejection) => {
             if open_provider_ids.is_empty() {
                 return Err(DispatchError::Rejection(rejection));
             }
-            let plain: Vec<Card> = cards.iter().map(|c| candidate(c, prompt, false)).collect();
+            let plain: Vec<Card> = cards
+                .iter()
+                .map(|c| {
+                    candidate(
+                        c,
+                        prompt,
+                        open_provider_ids.contains(&c.provider.id) && !is_resident_http_service(c),
+                    )
+                })
+                .collect();
             let relaxed = decide_with_affinity_and_ready(
                 &request_profile,
                 &plain,

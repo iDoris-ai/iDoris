@@ -5507,9 +5507,9 @@ mod local_model_fault_tests {
 
     /// Table-driven: which backend failures blame the selected model.
     ///
-    /// `EvictionFailed` and `ModelUnavailable` must **not** blame it — the first
-    /// is another model failing to unload, the second is an unload race — so
-    /// flipping either back to "fault" has to turn this table red.
+    /// `EvictionFailed` is another model's unload failure, not this model's
+    /// success or fault. `ModelUnavailable` counts to lock out wedged models;
+    /// this deliberately also counts Stopping/Stopped unload races.
     #[test]
     fn only_this_models_own_failures_are_faults() {
         let model = || "m".to_string();
