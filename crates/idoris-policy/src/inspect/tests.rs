@@ -825,3 +825,44 @@ proptest! {
         prop_assert_eq!(response.action, InspectAction::Block);
     }
 }
+
+/// Written layouts and issuers the exact-shape rule dropped, all of which base
+/// caught. Additive: every row here must be found again, and the deliberate
+/// negatives must stay public.
+#[test]
+fn common_written_layouts_and_issuer_ranges_are_found_again() {
+    // (input, expected kind) — base caught every one of these.
+    for (input, kind) in [
+        ("138-12345678", FindingKind::CnMobile),
+        ("1381 2345678", FindingKind::CnMobile),
+        ("1381 2345 678", FindingKind::CnMobile),
+        // 6-12 split with the X check digit.
+        ("110105 19491231002X", FindingKind::CnResidentId),
+        // UnionPay-length 6-13 / 6-12 written splits.
+        ("622202 1234567890128", FindingKind::BankCard),
+        // MIR 2200–2204, previously rejected by the issuer allowlist.
+        ("2200123456789019", FindingKind::BankCard),
+        ("2200 1234 5678 9019", FindingKind::BankCard),
+        // Troy.
+        ("9792123456789018", FindingKind::BankCard),
+        // Mainstream 4-4-4-4 still works.
+        ("6222 0212 3456 7894", FindingKind::BankCard),
+    ] {
+        let response = inspect(input, &open_ctx());
+        assert!(
+            kinds(&response).contains(&kind),
+            "{input:?} must be {kind:?}: {response:?}"
+        );
+    }
+
+    // A space-separated table cell is not a mobile: a phone has no checksum, so
+    // accepting run-length alone would make every numeric table a phone.
+    for input in ["138 123 45678", "2023 1203 2024", "1 2 3 4 5 6 7 8"] {
+        let response = inspect(input, &open_ctx());
+        assert_eq!(
+            response.action,
+            InspectAction::Allow,
+            "{input:?} must stay public: {response:?}"
+        );
+    }
+}

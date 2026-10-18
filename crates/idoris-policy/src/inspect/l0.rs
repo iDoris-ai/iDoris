@@ -155,14 +155,19 @@ fn classify(c: &Candidate<'_>, hits: &mut Vec<Hit>) {
     let d = c.digits;
     let grouped = c.runs.len() > 1;
     let grouped_as = |pattern: &[usize]| !grouped || c.runs == pattern;
-    if d.len() == 17 && c.x_suffix && grouped_as(&[6, 8, 3]) && id_structure(d) {
+    if d.len() == 17
+        && c.x_suffix
+        && matches!(c.runs, [] | [17] | [6, 8, 3] | [6, 11])
+        && id_structure(d)
+    {
         push(
             FindingKind::CnResidentId,
             c.end + 1,
             id_sensitivity(d, b'X'),
         );
     }
-    if d.len() == 18 && grouped_as(&[6, 8, 4]) && id_structure(&d[..17]) {
+    if d.len() == 18 && matches!(c.runs, [] | [18] | [6, 8, 4] | [6, 12]) && id_structure(&d[..17])
+    {
         push(
             FindingKind::CnResidentId,
             c.end,
@@ -172,8 +177,12 @@ fn classify(c: &Candidate<'_>, hits: &mut Vec<Hit>) {
     if d.len() == 15 && grouped_as(&[6, 6, 3]) && legacy_id_structure(d) {
         push(FindingKind::CnResidentId, c.end, Sensitivity::S2);
     }
+    // The common written forms for an 11-digit mobile. A 3-8 / 4-7 / 4-4-3 split
+    // is what people actually type; requiring only 3-4-4 lost them (base caught
+    // them). `138 123 45678` is deliberately NOT accepted: it is a table cell, and
+    // a mobile has no checksum to tell it from a real grouping.
     let mobile = match d.len() {
-        11 => grouped_as(&[3, 4, 4]) && is_mobile(d),
+        11 => matches!(c.runs, [] | [11] | [3, 4, 4] | [3, 8] | [4, 7] | [4, 4, 3]) && is_mobile(d),
         13 => grouped_as(&[2, 3, 4, 4]) && d[..2] == [8, 6] && is_mobile(&d[2..]),
         _ => false,
     };
@@ -223,19 +232,27 @@ fn is_mobile(d: &[u8]) -> bool {
     d.len() == 11 && d[0] == 1 && (3..=9).contains(&d[1])
 }
 
-/// Cards are written in fours, with a short final run for 17-19 digits.
+/// Written card layouts: fours with a short final run for 17-19 digits, plus the
+/// 6-13 / 6-12 splits used for UnionPay-length numbers.
 fn card_grouping(runs: &[usize]) -> bool {
-    runs.split_last().is_some_and(|(last, rest)| {
+    let fours = runs.split_last().is_some_and(|(last, rest)| {
         rest.len() >= 3 && rest.iter().all(|&r| r == 4) && (1..=4).contains(last)
-    })
+    });
+    fours || matches!(runs, [6, 13] | [6, 12])
 }
 
 /// Issuer ranges that exist (ISO/IEC 7812 major industry 3–6, Mastercard
 /// 2221–2720, UnionPay 81). Rules out years, ports and most counters.
 fn card_iin(d: &[u8]) -> bool {
+    let first_four = number(&d[..4]);
     match d[0] {
         3..=6 => true,
-        2 => (2221..=2720).contains(&number(&d[..4])),
+        2 => {
+            // Mastercard 2221–2720, plus MIR 2200–2204 (base caught it).
+            (2221..=2720).contains(&first_four) || (2200..=2204).contains(&first_four)
+        }
+        9 => first_four == 9792, // Troy
+        1 => first_four == 2131, // legacy JCB (historically 15 digits)
         8 => d[1] == 1,
         _ => false,
     }
