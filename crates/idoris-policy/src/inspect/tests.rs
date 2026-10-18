@@ -803,3 +803,38 @@ fn a_card_on_one_line_is_still_blocked_when_the_next_line_starts_with_digits() {
     let table = "year qty\n2023 1203\n2024 1305\n2025 1411\n2026 1520";
     assert_eq!(inspect(table, &open_ctx()).action, InspectAction::Allow);
 }
+
+/// Documented trade-off (reviewer G): a tab-separated 16-digit run is treated as
+/// a bank card. A real card written with tabs and a spreadsheet row are the same
+/// shape and both can be Luhn-valid, so no checksum can separate them; this layer
+/// chooses to catch the card. The cost is that a small share of random four-column
+/// numeric tables is reported as `BankCard S3`, which pins `any` requests to
+/// `local_only`. Recorded in `docs/agent/M5-L0-COVERAGE.md`.
+#[test]
+fn tab_separated_digit_rows_are_deliberately_treated_as_cards() {
+    // The card we must not lose.
+    let card = inspect("6222\t0212\t3456\t7894", &open_ctx());
+    assert_eq!(
+        card.action,
+        InspectAction::Block,
+        "a tab-separated card must stay caught: {card:?}"
+    );
+    assert!(kinds(&card).contains(&FindingKind::BankCard), "{card:?}");
+
+    // The cost: a four-column numeric row that happens to pass Luhn is also a card.
+    // Pinned so the trade-off cannot be changed without noticing this line.
+    let row = inspect("2023\t1203\t2024\t1305", &open_ctx());
+    assert_eq!(
+        row.action,
+        InspectAction::Block,
+        "documented trade-off: Luhn-valid tab rows read as cards: {row:?}"
+    );
+
+    // And a row that does not pass Luhn stays public - the rule is not "any row".
+    let clean = inspect("2023\t1203\t2024\t1306", &open_ctx());
+    assert_eq!(
+        clean.action,
+        InspectAction::Allow,
+        "a non-Luhn four-column row must stay public: {clean:?}"
+    );
+}
