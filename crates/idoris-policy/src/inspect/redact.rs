@@ -7,7 +7,8 @@
 //!   绝不把「替换了一部分」的文本放出去。
 //! - R-1/R-2：回填时，输出里出现映射表之外的占位符形状，或者已知占位符被
 //!   改写（宽字符折叠、ASCII 字母数字大写归一化后匹配），拒绝回填，不猜。
-//!   仅完整落在同一个原始字面量或合法回填条目内的匹配豁免；分隔文本也参与归一化。
+//!   仅完整落在同一个原始字面量内的匹配豁免；分隔文本也参与归一化。
+//!   合法回填条目被原值替换后重置匹配缓冲，不把消失的名字和后续数字拼接。
 //! - R-4：映射表只活在这个值里；`Debug` 不打印原值。
 
 use std::fmt;
@@ -269,7 +270,9 @@ impl StreamRestorer<'_> {
                         .position(|(p, _)| *p == token.spelling)
                     {
                         self.seen[index] = true;
-                        self.track(&token.spelling, true)?;
+                        // The spelling disappears from visible output; unlike an input literal,
+                        // it must not combine with following digits into a different name.
+                        self.normalized.clear();
                         out.push_str(&self.redaction.table[index].1);
                         continue;
                     }
@@ -475,20 +478,22 @@ mod scanner_bounds {
     }
 
     #[test]
-    fn restoration_events_keep_cross_boundary_detection() {
+    #[allow(clippy::unwrap_used)]
+    fn multibyte_continuations_respect_the_byte_limit_before_appending() {
         let r = Redaction {
             text: String::new(),
-            table: vec![
-                ("[CN_MOBILE_1]".into(), "phone".into()),
-                ("[1]".into(), "digit".into()),
-            ],
+            table: vec![("[CN_MOBILE_1]".into(), "value".into())],
             literals: Vec::new(),
         };
-        for (text, accepted) in [
-            ("[CN_MOBILE_1] [1]", true),
-            ("[CN_MOBILE_1] CN_MOBILE[1]", false),
-        ] {
-            super::super::redact_tests::assert_all_partitions(&r, text, accepted);
+        for prefix in ["[Ａ", "[ＰＥＲＳＯＮ＿"] {
+            let mut stream = r.stream();
+            stream.push("[CN_MOBILE_1]").unwrap();
+            stream.push(prefix).unwrap();
+            for _ in 0..80 {
+                stream.push("Ａ").unwrap();
+                assert!(stream.token.as_ref().unwrap().spelling.len() <= stream.limit);
+            }
+            assert!(stream.push("＿１]").is_err());
         }
     }
 

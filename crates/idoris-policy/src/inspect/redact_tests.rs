@@ -461,6 +461,74 @@ fn empty_table_has_no_stream_only_rejections() {
     }
 }
 
+#[test]
+fn honest_multi_entity_round_trips_do_not_join_restored_names_with_digits() {
+    let mut inputs = Vec::new();
+    for count in [10, 11, 12, 20] {
+        for suffix in [
+            " 1楼，",
+            " 是 2 号楼的；",
+            " 第 2 页，共 15 人，合计 10 元；",
+        ] {
+            let input: String = (1..=count)
+                .map(|i| format!("电话 138{i:08}{suffix}"))
+                .collect();
+            inputs.push(input);
+        }
+    }
+    let address_book: String = (1..=12).map(|i| format!("电话 138{i:08}；")).collect();
+    inputs.push(format!("{address_book}第一个号码 13800000001 是 2 号楼的"));
+    for input in inputs {
+        let r = redacted(&input);
+        let expected = Ok(input.clone());
+        assert_eq!(r.restore(&r.text), expected);
+        for at in 0..=r.text.len() {
+            if r.text.is_char_boundary(at) {
+                assert_eq!(stream_chunks(&r, &[&r.text[..at], &r.text[at..]]), expected);
+            }
+        }
+        let boundaries: Vec<_> = r
+            .text
+            .char_indices()
+            .map(|(at, _)| at)
+            .chain([r.text.len()])
+            .collect();
+        let chunks: Vec<_> = boundaries.windows(2).map(|w| &r.text[w[0]..w[1]]).collect();
+        assert_eq!(stream_chunks(&r, &chunks), expected);
+    }
+}
+
+proptest::proptest! {
+    #![proptest_config(proptest::test_runner::Config::with_cases(1_500))]
+    #[test]
+    fn real_redactions_round_trip_original_mixed_numeric_text(
+        count in 1usize..=20,
+        fragments in proptest::collection::vec(proptest::sample::select(vec![
+            " 1楼，", " 是 2 号楼的；", " 第 2 页；", " 共 15 人；", " 合计 10 元；",
+            " 价格 ￥１２０；", " 请参考 [1] 和 [2]；", " 引用 [ＣＮ＿ＭＯＢＩＬＥ＿１]；",
+            " literal cn_mobile_1；", " invoice 2024-0918；", " 🌊[] 中文；"
+        ]), 1..30),
+        cuts in proptest::collection::vec(proptest::bool::ANY, 0..300),
+    ) {
+        let input: String = (1..=count)
+            .map(|i| format!("电话 138{i:08}{}", fragments[(i - 1) % fragments.len()]))
+            .collect();
+        let r = redacted(&input);
+        let expected = Ok(input);
+        proptest::prop_assert_eq!(r.restore(&r.text), expected.clone());
+        let mut chunks = Vec::new();
+        let mut start = 0;
+        for (n, (at, _)) in r.text.char_indices().enumerate() {
+            if cuts.get(n).copied().unwrap_or(false) {
+                chunks.push(&r.text[start..at]);
+                start = at;
+            }
+        }
+        chunks.push(&r.text[start..]);
+        proptest::prop_assert_eq!(stream_chunks(&r, &chunks), expected);
+    }
+}
+
 proptest::proptest! {
     #![proptest_config(proptest::test_runner::Config::with_cases(10_000))]
     #[test]
