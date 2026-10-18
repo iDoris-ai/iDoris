@@ -56,6 +56,7 @@ async fn stream_failed(client: &RemoteClient) -> bool {
 }
 fn request() -> ChatRequest {
     ChatRequest {
+        native: None,
         model: "test".into(),
         messages: vec![],
     }
@@ -104,6 +105,7 @@ async fn upstream_redirects_never_reach_the_other_origin() {
             &state.http_client,
             &[card(&origin.uri())],
             &state.models_health,
+            false,
         )
         .await
         .unwrap();

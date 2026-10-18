@@ -76,6 +76,12 @@ async fn streaming_proxy_records_completed_only_after_done_is_consumed() {
         .filter(|event| event.event.event_type == EventType::Completed)
         .collect::<Vec<_>>();
     assert_eq!(completed.len(), 1);
+    for key in ["tokens_in", "tokens_out", "token_estimator"] {
+        assert!(
+            !completed[0].event.metadata.contains_key(key),
+            "unexpected {key}"
+        );
+    }
     assert_eq!(
         completed[0].event.metadata.get("status"),
         Some(&json!("success"))
@@ -131,6 +137,12 @@ async fn unterminated_stream_records_completed_failure() {
         .filter(|event| event.event.event_type == EventType::Completed)
         .collect::<Vec<_>>();
     assert_eq!(completed.len(), 1);
+    for key in ["tokens_in", "tokens_out", "token_estimator"] {
+        assert!(
+            !completed[0].event.metadata.contains_key(key),
+            "unexpected {key}"
+        );
+    }
     assert_eq!(
         completed[0].event.metadata.get("status"),
         Some(&json!("failure"))

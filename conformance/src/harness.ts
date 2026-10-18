@@ -153,6 +153,8 @@ export interface SpawnOptions {
   cwd?: string;
   /** Test-only PATH prefixes (for controlled fake CLIs). Never reaches production code. */
   pathPrepend?: string[];
+  /** Tenant bound to the Rust conformance key when testing tenant deployment. */
+  keyTenantId?: string;
   env?: NodeJS.ProcessEnv;
   healthTimeoutMs?: number;
 }
@@ -222,7 +224,9 @@ export async function spawnConformanceServer(opts: SpawnOptions): Promise<Runnin
     // carry an IDORIS_DB_PATH for the TS reference, but it must never defeat
     // Rust conformance key isolation or keep a prior server's key active.
     rustDbPath = join(rustStateDir, "state.sqlite3");
-    const seeded = spawnSync(seeder, [rustDbPath], { encoding: "utf8" });
+    const seeded = spawnSync(seeder, [rustDbPath, ...(opts.keyTenantId === undefined ? [] : [opts.keyTenantId])], {
+      encoding: "utf8",
+    });
     if (seeded.error !== undefined || seeded.status !== 0) {
       rmSync(rustStateDir, { recursive: true, force: true });
       throw new Error(

@@ -24,6 +24,7 @@ import { adapterManifestSchema } from "../../src/adapter-manifest.js";
 import { componentCardSchema } from "../../src/component-card.js";
 import { inspectRequestSchema } from "../../src/generated/inspect-request.js";
 import { inspectResponseSchema } from "../../src/generated/inspect-response.js";
+import { inspectResponseSchema as publicInspectResponseSchema } from "../../src/index.js";
 import { loadPolicySchema } from "../../src/load-policy.js";
 import { providerDescriptorSchema } from "../../src/provider.js";
 import { roleSchema } from "../../src/role.js";
@@ -197,4 +198,35 @@ describe("JSON Schema <-> 生成的 zod 一致性（零漂移语义门）", () =
       expect(typeof ajv.getSchema(`https://idoris.ai/schema/${n}.schema.json`)).toBe("function");
     }
   });
+});
+
+const special = { kind: "input_limit_exceeded" };
+const spannedSpecial = { ...special, span: { start: 0, length: 1 } };
+const mobile = { kind: "cn_mobile", span: { start: 0, length: 11 } };
+const inspectResponseCases = [
+  ["special span with BLOCK", [spannedSpecial], "BLOCK", false],
+  ["spanless special with ALLOW", [special], "ALLOW", false],
+  ["spanless special with REDACT", [special], "REDACT", false],
+  ["special span with ALLOW", [spannedSpecial], "ALLOW", false],
+  ["special after ordinary finding with ALLOW", [mobile, special], "ALLOW", false],
+  ["spanned special after ordinary finding with BLOCK", [mobile, spannedSpecial], "BLOCK", false],
+  ["spanless special with BLOCK", [special], "BLOCK", true],
+  ["mixed findings with BLOCK", [mobile, special], "BLOCK", true],
+  ["ordinary finding with ALLOW", [mobile], "ALLOW", true],
+  ["clean ALLOW", [], "ALLOW", true],
+] as const;
+
+describe("inspect response independent expected verdicts", () => {
+  for (const [name, findings, action, expected] of inspectResponseCases) {
+    const data = { sensitivity: "S0", findings, action };
+    it(`${name}: raw schema`, () => {
+      expect(ajvOk("inspect-response", data)).toBe(expected);
+    });
+    it(`${name}: generated Zod`, () => {
+      expect(inspectResponseSchema.safeParse(data).success).toBe(expected);
+    });
+    it(`${name}: public Zod`, () => {
+      expect(publicInspectResponseSchema.safeParse(data).success).toBe(expected);
+    });
+  }
 });

@@ -115,6 +115,7 @@ async fn unresolved_load_fence_blocks_eviction_of_ready_model() {
     let chat = handle
         .chat(
             ChatRequest {
+                native: None,
                 model: "a".into(),
                 messages: vec![ChatMessage {
                     role: "user".into(),

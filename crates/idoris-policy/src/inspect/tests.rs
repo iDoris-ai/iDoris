@@ -411,6 +411,367 @@ const FAKE_AWS_ID: &str = concat!("AK", "IA5HVJV2XAZM2TT6A8");
 const FAKE_RAW_SECRET: &str = "zMCTnu5i8RRUKO7CCgpDdFZwTMKHPBZU1HmjS9jA";
 
 #[test]
+fn credential_assignments_score_only_the_value() {
+    for prefix in [
+        "DJANGO_SECRET_KEY_FOR_PRODUCTION_SETTINGS=",
+        "STRIPE_SECRET=",
+        "export DATABASE_PASSWORD=",
+        "--password=",
+        "API_KEY=",
+        "TOKEN=",
+        "K=",
+        "password: ",
+        "",
+    ] {
+        let input = format!("😀 {prefix}{FAKE_RAW_SECRET}");
+        assert_single(
+            &input,
+            FindingKind::HighEntropySecret,
+            FAKE_RAW_SECRET,
+            Sensitivity::S3,
+        );
+        let response = inspect(&input, &open_ctx());
+        assert_eq!(response.action, InspectAction::Block, "{prefix}");
+        assert!(!kinds(&response).contains(&FindingKind::ApiKey));
+    }
+    let input = "DJANGO_SECRET_KEY_FOR_PRODUCTION_SETTINGS=development";
+    let response = inspect(input, &open_ctx());
+    assert!(response.findings.is_empty(), "{response:?}");
+    assert_eq!(response.action, InspectAction::Allow);
+}
+
+#[test]
+fn credential_assignment_keeps_base64_padding() {
+    // Thirty body characters plus padding: dropping padding would fall below
+    // the existing 32-unit threshold and regress a previously detected value.
+    let value = "aA1bB2cC3dD4eE5fF6gG7hH8iI9jJ0==";
+    for prefix in ["", "DJANGO_SECRET_KEY_FOR_PRODUCTION_SETTINGS="] {
+        let input = format!("😀 {prefix}{value}");
+        assert_single(
+            &input,
+            FindingKind::HighEntropySecret,
+            value,
+            Sensitivity::S3,
+        );
+        assert_eq!(inspect(&input, &open_ctx()).action, InspectAction::Block);
+    }
+}
+
+#[test]
+fn credential_windows_paths_preserve_original_spans() {
+    for path in [
+        r"C:\Users\alice\.aws\credentials",
+        r"C:\Users\a\.ssh\config",
+        r"C:\Users\a\.ssh\known_hosts",
+        r"C:\Users\a\.kube\config",
+        r"C:\Users\a\.docker\config.json",
+        r"%USERPROFILE%\.aws\credentials",
+        r"C:\Users\a\config\.env.local",
+    ] {
+        for written in [path.to_owned(), path.replace('\\', "/")] {
+            let input = format!("😀 cat {written} please");
+            // ':' and '%' delimit the existing ASCII path runs.
+            let expected = written.rsplit([':', '%']).next().unwrap();
+            assert_single(
+                &input,
+                FindingKind::CredentialPath,
+                expected,
+                Sensitivity::S2,
+            );
+            assert_eq!(inspect(&input, &open_ctx()).action, InspectAction::Redact);
+        }
+    }
+    for path in [
+        r"C:\Users\alice\notes.txt",
+        r"C:\code\process.env.API_KEY",
+        r"C:\config\.envrc",
+    ] {
+        let response = inspect(path, &open_ctx());
+        assert!(response.findings.is_empty(), "{response:?}");
+        assert_eq!(response.action, InspectAction::Allow);
+    }
+}
+
+#[test]
+fn credential_internal_equals_preserves_value_spans() {
+    for (prefix, value) in [
+        ("", "zMCTnu5i8RRUKO7CCgpDd=FZwTMKHPBZU1HmjS9jA"),
+        ("", "aA1bB2cC3dD4eE5fF6gG7=hH8iI9jJ0kK1lL2mM3nN4"),
+        ("PASSWORD=", "aA1bB2cC3dD4eE5fF6gG7=hH8iI9jJ0kK1lL2mM3nN4"),
+        ("", "aA1bB2cC3dD4eE5fF6gG7=Q62rR7sS8tT9uU0vV1wW2="),
+    ] {
+        let input = format!("😀 {prefix}{value}");
+        assert_single(
+            &input,
+            FindingKind::HighEntropySecret,
+            value,
+            Sensitivity::S3,
+        );
+        let response = inspect(&input, &open_ctx());
+        assert_eq!(response.action, InspectAction::Block, "{input}");
+        assert_eq!(
+            response.findings[0].span.unwrap().start,
+            (3 + prefix.len()) as u64
+        );
+    }
+}
+
+#[test]
+fn credential_internal_equals_with_low_switch_piece() {
+    for value in [
+        "abcdefgh=Q1w2E3r4T5y6U7i8O9p0A1s2D3f4",
+        "Q1w2E3r4T5y6U7i8O9p0A1s2D3f4=abcdefgh",
+        "abcd=Q1w2E3r4T5y6U7i8O9p0A1s2=efgh",
+        "abcdefgh=Q1w2E3r4T5y6U7i8O9p0A1s2D3f4==",
+        "abc=Q1w2E3r4T5y6U7i8O9p0A1s2D3f4", // Exactly 32 units.
+        "Q1w2E3r4T5y6U7i8O9p0A1s2D3f4=abc",
+    ] {
+        for prefix in ["", "PASSWORD="] {
+            let input = format!("🚗😀 {prefix}{value};");
+            assert_single(
+                &input,
+                FindingKind::HighEntropySecret,
+                value,
+                Sensitivity::S3,
+            );
+            let response = inspect(&input, &open_ctx());
+            assert_eq!(response.action, InspectAction::Block);
+            assert_eq!(response.sensitivity, Sensitivity::S3);
+            assert_eq!(
+                response.findings[0].span.unwrap().start,
+                (5 + prefix.len()) as u64
+            );
+        }
+    }
+    // Inclusive segmentation still obeys length and entropy thresholds.
+    for input in [
+        "ab=Q1w2E3r4T5y6U7i8O9p0A1s2D3f4",   // 31 units.
+        "a1B2a1B2a1B2a1B2=a1B2a1B2a1B2a1B2", // Low entropy.
+    ] {
+        let response = inspect(input, &open_ctx());
+        assert_eq!(
+            response.action,
+            InspectAction::Allow,
+            "{input}: {response:?}"
+        );
+        assert!(response.findings.is_empty(), "{input}: {response:?}");
+    }
+}
+
+#[test]
+fn credential_internal_equals_at_every_split_keeps_inclusive_coverage() {
+    // Every insertion retains the original scanner's high-entropy token.
+    // Near the ends a long piece is itself detected; prefer that exact span.
+    for split in 1..FAKE_RAW_SECRET.len() {
+        let (left, right) = FAKE_RAW_SECRET.split_at(split);
+        let value = format!("{left}={right}");
+        let input = format!("🚗😀 {value};");
+        let response = inspect(&input, &open_ctx());
+        assert_eq!(
+            response.action,
+            InspectAction::Block,
+            "{split}: {response:?}"
+        );
+        assert_eq!(response.sensitivity, Sensitivity::S3);
+        assert_eq!(kinds(&response), [FindingKind::HighEntropySecret]);
+        let finding = &response.findings[0];
+        let span = finding.span.unwrap();
+        assert!(span.start >= 5);
+        assert!(span.start + span.length <= 5 + value.len() as u64);
+        assert!([left, right, value.as_str()].contains(&covered(&input, finding).as_str()));
+    }
+}
+
+#[test]
+fn credential_union_does_not_widen_or_duplicate_existing_values() {
+    let input = format!("😀 {FAKE_RAW_SECRET}={FAKE_RAW_SECRET}");
+    let response = inspect(&input, &open_ctx());
+    assert_eq!(response.action, InspectAction::Block);
+    assert_eq!(response.sensitivity, Sensitivity::S3);
+    assert_eq!(response.findings.len(), 2, "{response:?}");
+    for (finding, start) in response.findings.iter().zip([3, 44]) {
+        assert_eq!(finding.kind, FindingKind::HighEntropySecret);
+        assert_eq!(finding.span.unwrap().start, start);
+        assert_eq!(covered(&input, finding), FAKE_RAW_SECRET);
+    }
+}
+
+#[test]
+fn credential_serialized_env_escapes_keep_original_spans() {
+    for (argument, expected) in [
+        (r#"{"command":"cat .env\nnext_command"}"#, ".env"),
+        (r#"{"command":"cat .env\n"}"#, ".env"),
+        (r#"{"command":"cat ~/.env\tx"}"#, "~/.env"),
+        (r#"{"command":"cat .env\r\nnext"}"#, ".env"),
+        (r#"\"/app/.env\""#, "/app/.env"),
+        (r"C:\app\.env\\", r"\app\.env"),
+        (r#"{"command":"cat .env.local\"}"#, ".env.local"),
+        (r#"{"command":"cat ~/.ssh/id_rsa\"}"#, "~/.ssh/id_rsa"),
+        (
+            r#"{"arguments":"{\"command\":\"cat /app/.env\"}"}"#,
+            "/app/.env",
+        ),
+        (
+            r#"{"arguments":"{\"command\":\"cat C:\\app\\.env\"}"}"#,
+            r"\\app\\.env",
+        ),
+    ] {
+        let input = format!("😀 {argument}");
+        assert_single(
+            &input,
+            FindingKind::CredentialPath,
+            expected,
+            Sensitivity::S2,
+        );
+        let response = inspect(&input, &open_ctx());
+        assert_eq!(response.action, InspectAction::Redact, "{input}");
+        let start = input.find(expected).unwrap();
+        assert_eq!(
+            response.findings[0].span.unwrap().start,
+            input[..start].encode_utf16().count() as u64
+        );
+    }
+}
+
+#[test]
+fn credential_serialized_windows_separators() {
+    for path in [
+        r"C:\\Users\\a\\.aws\\credentials",
+        r"C:\\Users\\a\\.kube\\config",
+        r"C:\\Users\\a\\.docker\\config.json",
+        r"C:\\Users\\a\\.ssh\\config",
+    ] {
+        let input = format!("😀 {{\"path\":\"{path}\"}}");
+        assert_single(
+            &input,
+            FindingKind::CredentialPath,
+            &path[2..],
+            Sensitivity::S2,
+        );
+        assert_eq!(inspect(&input, &open_ctx()).action, InspectAction::Redact);
+    }
+}
+
+#[test]
+fn credential_paths_after_serialized_env_remain_covered() {
+    for (text, paths) in [
+        (
+            r#""./.env\n./.aws/credentials\n./id_rsa""#,
+            vec!["./.env", "./.aws/credentials", "./id_rsa"],
+        ),
+        (
+            r#""./.aws/credentials\n./.env\n./id_rsa""#,
+            vec!["./.aws/credentials", "./.env", "./id_rsa"],
+        ),
+        (
+            r".env\n~/.aws/credentials",
+            vec![".env", "~/.aws/credentials"],
+        ),
+    ] {
+        assert_credential_paths_masked(text, &paths);
+    }
+}
+
+#[test]
+fn credential_paths_after_absolute_env_remain_covered() {
+    for (text, paths) in [
+        (
+            r#""/app/.env\n/root/.ssh/id_rsa""#,
+            vec!["/app/.env", "/root/.ssh/id_rsa"],
+        ),
+        (
+            r"/app/.env\t/home/alice/.ssh/id_rsa",
+            vec!["/app/.env", "/home/alice/.ssh/id_rsa"],
+        ),
+        (
+            r"C:\app\.env\..\..\Users\a\.ssh\id_rsa",
+            vec![r"\app\.env", r".ssh\id_rsa"],
+        ),
+    ] {
+        assert_credential_paths_masked(text, &paths);
+    }
+}
+
+fn assert_credential_paths_masked(text: &str, paths: &[&str]) {
+    let input = format!("🚗😀 {text}");
+    let response = inspect(&input, &open_ctx());
+    assert_eq!(response.action, InspectAction::Redact);
+    let mut masked: Vec<u16> = input.encode_utf16().collect();
+    let mut covered_units = vec![false; masked.len()];
+    for finding in &response.findings {
+        assert_eq!(finding.kind, FindingKind::CredentialPath);
+        let span = finding.span.unwrap();
+        let start = span.start as usize;
+        let end = start + span.length as usize;
+        covered_units[start..end].fill(true);
+        masked[start..end].fill(u16::from(b'*'));
+    }
+    let redacted = String::from_utf16(&masked).unwrap();
+    for path in paths {
+        let byte_start = input.find(path).unwrap();
+        let start = input[..byte_start].encode_utf16().count();
+        let end = start + path.encode_utf16().count();
+        assert!(
+            covered_units[start..end].iter().all(|covered| *covered),
+            "path {path:?} left exposed: {redacted:?}; {response:?}"
+        );
+        assert!(!redacted.contains(path), "{redacted:?}");
+    }
+    assert!(redacted.starts_with("🚗😀 "));
+}
+
+#[test]
+fn credential_ambiguous_assignments_fail_closed_on_aggregate_entropy() {
+    // These can be assignments with individually sub-threshold values or opaque
+    // credentials containing '='. The inclusive detector cannot distinguish the
+    // intent: retain its conservative Block, but never invent a padded-name span.
+    for token in [
+        "aA1bB2cC3dD4eE5fF6gG7hH8iI9jJ0k=developmentconfiguration",
+        "K=8vLr5VrExzWYr2qeBJNvhYsN63lysYi",
+        "K=aVTZ23bG7tHZlX0SqxlZ3dzETRxOmw",
+        "DJANGO_SECRET_KEY_FOR_PRODUCTION_SETTINGS=a1B2a1B2a1B2a1B2a1B2a1B2a1B2a1B2a1B2",
+    ] {
+        let input = format!("😀 {token};");
+        assert_single(
+            &input,
+            FindingKind::HighEntropySecret,
+            token,
+            Sensitivity::S3,
+        );
+        let response = inspect(&input, &open_ctx());
+        assert_eq!(response.action, InspectAction::Block);
+        assert_eq!(response.findings[0].span.unwrap().start, 3);
+    }
+    // A delimiter before a benign value is not trailing base64 padding. Here
+    // the aggregate also falls below the switch threshold, so it remains Allow.
+    let response = inspect(
+        "aA1bB2cC3dD4eE5fF6gG7hH8iI9jJ0k=developmentconfigurationdevelopmentconfiguration",
+        &open_ctx(),
+    );
+    assert_eq!(response.action, InspectAction::Allow);
+    assert!(response.findings.is_empty(), "{response:?}");
+}
+
+#[test]
+fn credential_benign_windows_paths_and_escapes_are_allowed() {
+    for input in [
+        r"C:\Windows\System32\drivers\etc\hosts",
+        r"\\?\C:\temp\file.txt",
+        r"split on \ and / please",
+        r"C:\code\process.env.API_KEY",
+        r"escape \n.envelope",
+    ] {
+        let response = inspect(input, &open_ctx());
+        assert_eq!(
+            response.action,
+            InspectAction::Allow,
+            "{input}: {response:?}"
+        );
+        assert!(response.findings.is_empty(), "{input}: {response:?}");
+    }
+}
+
+#[test]
 fn prefixed_keys_are_found_by_rule_set_a() {
     for key in [FAKE_OPENAI, FAKE_GITHUB, FAKE_AWS_ID] {
         assert_single(
@@ -886,6 +1247,15 @@ fn valid_id() -> impl Strategy<Value = String> {
     )
 }
 
+fn sensitivity_rank(sensitivity: Sensitivity) -> u8 {
+    match sensitivity {
+        Sensitivity::S0 => 0,
+        Sensitivity::S1 => 1,
+        Sensitivity::S2 => 2,
+        Sensitivity::S3 => 3,
+    }
+}
+
 fn action_rank(action: InspectAction) -> u8 {
     match action {
         InspectAction::Allow => 0,
@@ -908,41 +1278,156 @@ fn action_of_view(normalized: &super::normalize::Normalized, ctx: &InspectCtx) -
     super::decide_action(&hits, sensitivity, ctx)
 }
 
+/// Findings of one view, mapped back to original coordinates.
+fn findings_of_view(normalized: &super::normalize::Normalized) -> Vec<(FindingKind, u64, u64)> {
+    let mut hits = super::l0::scan(&normalized.units);
+    for hit in &mut hits {
+        (hit.start, hit.length) = normalized.original_span(hit.start, hit.length);
+    }
+    hits.iter()
+        .map(|hit| (hit.kind, hit.start as u64, hit.length as u64))
+        .collect()
+}
+
 proptest! {
+    /// The union must never be looser than *any* of the three views, and it must
+    /// keep every entity each view found. Generated inputs deliberately mix the
+    /// three reasons the views exist:
+    ///
+    /// * a gluing char next to the entity (fullwidth digit, hyphen variant) -
+    ///   only the **raw** view sees through it, because folding joins the two;
+    /// * an ignorable before a fullwidth entity - only the **keep** view sees it,
+    ///   because the raw view has no folding and the strip view joins;
+    /// * an ignorable inside the entity - only the **strip** view sees it.
+    ///
+    /// So deleting any single view makes this property fail, not just the two it
+    /// used to compare.
     #[test]
-    fn union_is_never_looser_than_either_ignorable_view(
-        chars in proptest::collection::vec(
+    fn union_is_never_looser_than_any_single_view(
+        entity in prop_oneof![
+            Just("13812345678".to_string()),
+            Just("11010519491231002X".to_string()),
+            Just(format!("sk-{}", "a".repeat(40))),
+            Just("a@b.com".to_string()),
+        ],
+        lead in prop_oneof![Just(""), Just("1"), Just("１"), Just("a"), Just("ａ"), Just("-"), Just("\u{2010}")],
+        trail in prop_oneof![Just(""), Just("9"), Just("１"), Just("x"), Just("ｘ"), Just("-")],
+        // One representative per `Default_Ignorable_Code_Point` range. This is
+        // coverage, not a guard on the table: dropping a range from
+        // `normalize::is_default_ignorable` does NOT fail this property (the strip
+        // view stops dropping it too, so the union stays a superset). The table
+        // is guarded by `every_default_ignorable_range_still_breaks_an_entity_insertion`.
+        inner in proptest::collection::vec(
             prop_oneof![
-                (b'0'..=b'9').prop_map(char::from),
-                (b'a'..=b'z').prop_map(char::from),
-                (b'A'..=b'Z').prop_map(char::from),
-                Just('-'),
-                Just(' '),
-                Just('\u{200B}'),
+                Just('\u{00AD}'),   // 0x00AD
+                Just('\u{034F}'),   // 0x034F
+                Just('\u{061C}'),   // 0x061C
+                Just('\u{115F}'),   // 0x115F..=0x1160
+                Just('\u{17B4}'),   // 0x17B4..=0x17B5
+                Just('\u{180B}'),   // 0x180B..=0x180F
+                Just('\u{200B}'),   // 0x200B..=0x200F
                 Just('\u{200E}'),
                 Just('\u{200F}'),
+                Just('\u{202A}'),   // 0x202A..=0x202E
+                Just('\u{2060}'),   // 0x2060..=0x206F
                 Just('\u{2068}'),
                 Just('\u{2069}'),
-                Just('\u{00AD}'),
-                Just('\u{FEFF}'),
+                Just('\u{3164}'),   // 0x3164
+                Just('\u{FE00}'),   // 0xFE00..=0xFE0F
+                Just('\u{FEFF}'),   // 0xFEFF
+                Just('\u{FFA0}'),   // 0xFFA0
+                Just('\u{FFF0}'),   // 0xFFF0..=0xFFF8
+                Just('\u{1BCA0}'),  // 0x1BCA0..=0x1BCA3 (non-BMP)
+                Just('\u{1D173}'),  // 0x1D173..=0x1D17A (non-BMP)
+                Just('\u{E0020}'),  // 0xE0000..=0xE0FFF (TAG, non-BMP)
             ],
-            0..48,
+            0..3,
         ),
+        fold_entity in any::<bool>(),
+        // A boundary-only ignorable *between* the lead and the entity. This is
+        // the shape that only the keep view catches: the raw view has no
+        // folding, and the strip view joins the lead to the entity.
+        pre in prop_oneof![
+            Just(""),
+            Just("\u{200B}"),
+            Just("\u{200E}"),
+            Just("\u{2068}"),
+        ],
     ) {
-        let input: String = chars.into_iter().collect();
-        let units: Vec<u16> = input.encode_utf16().collect();
+        // Sometimes widen the entity to fullwidth so folding is required at all.
+        let entity = if fold_entity {
+            entity.chars().map(|c| match c {
+                '0'..='9' => char::from_u32(c as u32 - b'0' as u32 + 0xFF10).unwrap_or(c),
+                'a'..='z' => char::from_u32(c as u32 - b'a' as u32 + 0xFF41).unwrap_or(c),
+                'A'..='Z' => char::from_u32(c as u32 - b'A' as u32 + 0xFF21).unwrap_or(c),
+                other => other,
+            }).collect::<String>()
+        } else {
+            entity
+        };
+        let mut text = String::from(lead);
+        text.push_str(pre);
+        // Insert the ignorables inside the entity when it is long enough.
+        let mut inserted = 0usize;
+        for (index, ch) in entity.chars().enumerate() {
+            if inserted < inner.len() && index == (inserted + 1) * 4 {
+                text.push(inner[inserted]);
+                inserted += 1;
+            }
+            text.push(ch);
+        }
+        while inserted < inner.len() {
+            text.push(inner[inserted]);
+            inserted += 1;
+        }
+        text.push_str(trail);
+
+        let units: Vec<u16> = text.encode_utf16().collect();
         let ctx = open_ctx();
-        let kept = action_of_view(&super::normalize::fold_keeping_ignorables(&units), &ctx);
-        let stripped = action_of_view(&super::normalize::normalize(&units), &ctx);
-        let merged = inspect(&input, &ctx).action;
-        prop_assert!(
-            action_rank(merged) >= action_rank(kept),
-            "kept {kept:?} merged {merged:?} input {input:?}"
-        );
-        prop_assert!(
-            action_rank(merged) >= action_rank(stripped),
-            "stripped {stripped:?} merged {merged:?} input {input:?}"
-        );
+        let merged = inspect(&text, &ctx);
+        let merged_findings: Vec<(FindingKind, u64, u64)> = merged
+            .findings
+            .iter()
+            .map(|finding| {
+                let span = finding.span.unwrap_or(idoris_contracts::inspect::InspectSpan {
+                    start: 0,
+                    length: 0,
+                });
+                (finding.kind, span.start, span.length)
+            })
+            .collect();
+
+        let views = [
+            ("raw", super::normalize::identity(&units)),
+            ("keep", super::normalize::fold_keeping_ignorables(&units)),
+            ("strip", super::normalize::normalize(&units)),
+        ];
+        for (name, view) in views {
+            let view_findings = findings_of_view(&view);
+            let view_sensitivity = {
+                let mut hits = super::l0::scan(&view.units);
+                for hit in &mut hits {
+                    (hit.start, hit.length) = view.original_span(hit.start, hit.length);
+                }
+                hits.iter().map(|hit| hit.sensitivity).max().unwrap_or(Sensitivity::S0)
+            };
+            prop_assert!(
+                action_rank(merged.action) >= action_rank(action_of_view(&view, &ctx)),
+                "{name} is stricter than the union: view {:?} merged {:?} input {text:?}",
+                action_of_view(&view, &ctx),
+                merged.action
+            );
+            prop_assert!(
+                sensitivity_rank(merged.sensitivity) >= sensitivity_rank(view_sensitivity),
+                "{name} sensitivity is stricter than the union: input {text:?}"
+            );
+            for finding in view_findings {
+                prop_assert!(
+                    merged_findings.contains(&finding),
+                    "{name} finding {finding:?} missing from the union {merged_findings:?} input {text:?}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -996,5 +1481,65 @@ proptest! {
         prop_assert!(found, "{} {:?}", input, response);
         prop_assert_eq!(response.sensitivity, Sensitivity::S3);
         prop_assert_eq!(response.action, InspectAction::Block);
+    }
+}
+
+/// Absolute guard for the `Default_Ignorable_Code_Point` drop list.
+///
+/// The union property above compares the union against each view, so it cannot
+/// notice a range disappearing from `is_default_ignorable`: when a code point is
+/// no longer dropped, the *strip* view stops dropping it too and the property
+/// still holds — even though the "ignorable inserted inside an entity" capability
+/// is gone. This test pins the capability itself, with one hard-coded
+/// representative per range so the table and the guard cannot drift together.
+#[test]
+fn every_default_ignorable_range_still_breaks_an_entity_insertion() {
+    // Independent copy of the ranges; deliberately not derived from the table.
+    const RANGES: &[char] = &[
+        '\u{00AD}',
+        '\u{034F}',
+        '\u{061C}',
+        '\u{115F}',
+        '\u{17B4}',
+        '\u{180B}',
+        '\u{200B}',
+        '\u{200E}',
+        '\u{200F}',
+        '\u{202A}',
+        '\u{2060}',
+        '\u{2068}',
+        '\u{2069}',
+        '\u{3164}',
+        '\u{FE00}',
+        '\u{FEFF}',
+        '\u{FFA0}',
+        '\u{FFF0}',
+        '\u{1BCA0}',
+        '\u{1D173}',
+        '\u{E0020}',
+    ];
+    let ctx = open_ctx();
+    for ch in RANGES {
+        let mobile = format!("138{ch}1234{ch}5678");
+        let response = inspect(&mobile, &ctx);
+        assert_ne!(
+            response.action,
+            InspectAction::Allow,
+            "U+{:04X} inserted inside a mobile was not detected: {response:?}",
+            *ch as u32
+        );
+        assert!(
+            kinds(&response).contains(&FindingKind::CnMobile),
+            "U+{:04X} must still yield CnMobile: {response:?}",
+            *ch as u32
+        );
+
+        let id = format!("110105{ch}19491231002X");
+        let response = inspect(&id, &ctx);
+        assert!(
+            kinds(&response).contains(&FindingKind::CnResidentId),
+            "U+{:04X} inserted inside a resident id was not detected: {response:?}",
+            *ch as u32
+        );
     }
 }

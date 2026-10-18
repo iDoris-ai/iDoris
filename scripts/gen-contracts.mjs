@@ -1,5 +1,6 @@
 // 契约生成：JSON Schema（真源）→ zod（TS 侧产物）。
 // 用法：node scripts/gen-contracts.mjs [outDir]   （默认 packages/contracts/src/generated）
+import { deepStrictEqual } from "node:assert";
 import { mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -29,12 +30,40 @@ function inlineRefs(node, seen = new Set()) {
   return node;
 }
 
+// The pinned converter drops object if/then and array contains. Keep this
+// fallback scoped to the two inspect rules, and fail if their schema changes.
+function inspectResponseCode(schema, name) {
+  const finding = schema.properties.findings.items;
+  const kind = finding.if.properties.kind.const;
+  const action = schema.then.properties.action.const;
+  deepStrictEqual(finding.if, { properties: { kind: { const: kind } } });
+  deepStrictEqual(finding.then, { properties: { span: false } });
+  deepStrictEqual(schema.if, {
+    properties: { findings: { contains: { properties: { kind: { const: kind } } } } },
+  });
+  deepStrictEqual(schema.then, { properties: { action: { const: action } } });
+  const base = jsonSchemaToZod(schema);
+  return `import { z } from "zod";
+
+export const ${name} = ${base}
+  .refine((value) => value.findings.every((finding) =>
+    finding.kind !== ${JSON.stringify(kind)} || finding.span === undefined),
+    "unscanned input must not carry a span")
+  .refine((value) => value.action === ${JSON.stringify(action)} ||
+    value.findings.every((finding) => finding.kind !== ${JSON.stringify(kind)}),
+    "unscanned input requires BLOCK");
+`;
+}
+
 export function generateInto(outDir) {
   mkdirSync(outDir, { recursive: true });
   for (const file of readdirSync(schemaDir).filter((f) => f.endsWith(".schema.json")).sort()) {
     const raw = loadSchema(file);
     const name = raw.title.charAt(0).toLowerCase() + raw.title.slice(1) + "Schema";
-    const code = jsonSchemaToZod(inlineRefs(raw), { module: "esm", name });
+    const schema = inlineRefs(raw);
+    const code = file === "inspect-response.schema.json"
+      ? inspectResponseCode(schema, name)
+      : jsonSchemaToZod(schema, { module: "esm", name });
     writeFileSync(
       join(outDir, file.replace(/\.schema\.json$/, ".ts")),
       `// GENERATED FROM packages/contracts/schema/${file} — do not edit by hand.\n${code}\n`,

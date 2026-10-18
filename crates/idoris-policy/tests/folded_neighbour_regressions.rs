@@ -137,9 +137,11 @@ fn folded_views_still_catch_ignorables_inside_an_entity() {
         0,
         13,
     );
-    // 保留视图的收益：可忽略字符当边界，实体从它之后开始。
+    // 保留视图的收益：既需要折叠（全角数字），又需要把可忽略字符当边界。
+    // 原文视图没有折叠、看不到全角数字；删除视图把前面的 `1` 和手机号粘成
+    // 12 位、不再是手机号。只有保留视图同时做对两件事，所以删掉它这条会红。
     assert_one(
-        "1\u{200E}13812345678",
+        "1\u{200B}１３８１２３４５６７８",
         FindingKind::CnMobile,
         InspectAction::Redact,
         Sensitivity::S2,

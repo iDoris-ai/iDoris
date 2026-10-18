@@ -47,6 +47,7 @@ async fn enabled_runtime_is_listed_statically_without_spawning() {
         &[],
         &HealthTracker::default(),
         &subscriptions,
+        false,
     )
     .await
     .unwrap();
@@ -68,6 +69,7 @@ async fn disabled_or_default_off_runtime_has_no_discovery_entry() {
             &[],
             &HealthTracker::default(),
             &subscriptions,
+            false,
         )
         .await
         .unwrap();

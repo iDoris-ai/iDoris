@@ -4,11 +4,24 @@ This directory is intentionally **not** part of the default `config/components`
 set. It is a copy-and-edit example for running iDoris with process-owned
 `mlx_lm.server` and `llama.cpp` backends without changing callers or Rust code.
 
-1. Replace every `/ABSOLUTE/PATH/TO/...` value in `local-runtimes.yaml` with a
-   trusted local executable/model path. `memory_gb` is the admission footprint
-   for that concrete runtime and must be set from the selected model/runtime
+1. Replace the executable and model placeholders in `local-runtimes.yaml` with
+   trusted absolute local paths. `memory_gb` is the admission footprint for that
+   concrete runtime and must be set from the selected model/runtime
    configuration rather than guessed from free system memory.
-2. Start iDoris with both files selected:
+2. Create a private, persistent state directory owned by the user running
+   iDoris:
+
+   ```sh
+   state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/idoris"
+   umask 077
+   mkdir -p "$state_dir/fences"
+   chmod 700 "$state_dir" "$state_dir/fences"
+   ```
+
+   Replace `/ABSOLUTE/PATH/TO/PRIVATE-IDORIS-STATE` in both `load_fence_path`
+   values with the expanded absolute `state_dir` path. Keep the two fence
+   filenames stable across restarts so pending-load protection remains durable.
+3. Start iDoris with both files selected:
 
    ```sh
    IDORIS_COMPONENTS_DIR=config/examples/multibackend/components \

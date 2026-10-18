@@ -120,6 +120,7 @@ async fn inherited_residency_uses_observed_memory_until_unload() {
         handle
             .chat(
                 ChatRequest {
+                    native: None,
                     model: "a".into(),
                     messages: vec![],
                 },

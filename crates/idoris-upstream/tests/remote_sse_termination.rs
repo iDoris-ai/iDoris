@@ -23,6 +23,7 @@ impl CredentialSource for Key {
 
 fn request() -> ChatRequest {
     ChatRequest {
+        native: None,
         model: "test-model".into(),
         messages: vec![ChatMessage {
             role: "user".into(),
