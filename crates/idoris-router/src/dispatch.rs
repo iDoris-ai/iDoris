@@ -305,10 +305,7 @@ pub fn select_avoiding_open_breakers(
         // which loads the model - i.e. the fallback would defeat the lockout it
         // exists to report. So require every eligible card to be a resident http
         // service before relaxing the open set.
-        Err(_)
-            if !open_provider_ids.is_empty()
-                && cards.iter().all(|card| is_resident_http_service(card)) =>
-        {
+        Err(_) if !open_provider_ids.is_empty() && cards.iter().all(is_resident_http_service) => {
             pool = cards.iter().map(|c| candidate(c, prompt, false)).collect();
             decide_with_affinity_and_ready(
                 &request_profile,
