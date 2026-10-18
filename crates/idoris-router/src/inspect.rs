@@ -112,7 +112,12 @@ pub(crate) fn inspect_body(
     declared: PrivacyClass,
     kill_switch: bool,
 ) -> Inspection {
-    fn collect(value: &serde_json::Value, out: &mut String, opaque: &mut bool) {
+    fn collect(
+        value: &serde_json::Value,
+        out: &mut String,
+        opaque: &mut bool,
+        embedding_input: Option<&serde_json::Value>,
+    ) {
         match value {
             serde_json::Value::String(text) => {
                 *opaque |= is_data_url(text);
@@ -120,9 +125,18 @@ pub(crate) fn inspect_body(
             }
             serde_json::Value::Number(number) => push_line(out, &number.to_string()),
             serde_json::Value::Array(items) => {
-                *opaque |= items.len() >= MIN_TOKEN_ARRAY
-                    && items.iter().all(|item| item.is_i64() || item.is_u64());
-                items.iter().for_each(|item| collect(item, out, opaque));
+                // Only `/v1/embeddings` carries `input`, and that is the sole
+                // place an integer token array is opaque payload rather than
+                // ordinary JSON. Judging every array anywhere pinned clean chats
+                // to local_only: a tool schema's `enum: [0..7]` or a
+                // `metadata.scores` list of eight ints did exactly that, and
+                // remote-only callers then got 503.
+                if embedding_input.is_some_and(|input| std::ptr::eq(value, input)) {
+                    *opaque |= is_integer_token_array(value);
+                }
+                items
+                    .iter()
+                    .for_each(|item| collect(item, out, opaque, embedding_input));
             }
             serde_json::Value::Object(map) => {
                 *opaque |= map
@@ -131,7 +145,7 @@ pub(crate) fn inspect_body(
                     .is_some_and(|kind| OPAQUE_PART_TYPES.contains(&kind));
                 map.iter().for_each(|(key, item)| {
                     push_line(out, key);
-                    collect(item, out, opaque);
+                    collect(item, out, opaque, embedding_input);
                 });
             }
             serde_json::Value::Bool(_) | serde_json::Value::Null => {}
@@ -158,7 +172,8 @@ pub(crate) fn inspect_body(
     }
     let mut text = String::new();
     let mut opaque = false;
-    collect(body, &mut text, &mut opaque);
+    let embedding_input = body.get("input");
+    collect(body, &mut text, &mut opaque, embedding_input);
     let ctx = InspectCtx {
         declared,
         remote_allowed: !kill_switch,
@@ -193,7 +208,19 @@ const OPAQUE_PART_TYPES: &[&str] = &[
 ];
 /// An all-integer array this long is treated as token ids (the embeddings
 /// API accepts them), which L0 cannot read.
-const MIN_TOKEN_ARRAY: usize = 8;
+/// An integer token array: any non-empty all-integer array under `input`.
+/// There is deliberately no length floor - a phone number is only a handful of
+/// tokens, and a floor let a 4-int embeddings input through.
+fn is_integer_token_array(value: &serde_json::Value) -> bool {
+    fn all_integers(value: &serde_json::Value) -> bool {
+        match value {
+            serde_json::Value::Array(items) => !items.is_empty() && items.iter().all(all_integers),
+            serde_json::Value::Number(number) => number.is_i64() || number.is_u64(),
+            _ => false,
+        }
+    }
+    all_integers(value)
+}
 
 /// Appends the `inspected` fact: sensitivity, effective privacy, the
 /// distinct finding kinds, and a reason only when content tightened the
