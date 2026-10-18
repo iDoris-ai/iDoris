@@ -29,7 +29,7 @@ struct Candidate<'a> {
     end: usize,
     x_suffix: bool,
     /// True when this candidate was formed by joining digit runs across a line
-    /// break, which only structural entities (id, mobile) may do.
+    /// break; only checksum-valid modern resident IDs may be reported from it.
     crossed_line_break: bool,
 }
 
@@ -101,8 +101,8 @@ pub(super) fn scan_plain(units: &[u16]) -> Vec<Hit> {
                 if digits.len() > MAX_ENTITY_DIGITS {
                     break;
                 }
-                // Crossing a line is permitted only for complete line spans,
-                // not a suffix/prefix window through unrelated table cells.
+                // A crossing window must cover complete line segments within
+                // this numeric group, not partial suffix/prefix table windows.
                 let aligned = (a == 0 || gaps[a - 1]) && (b + 1 == segments.len() || gaps[b]);
                 if crossed_line_break && !aligned {
                     continue;
@@ -144,13 +144,9 @@ const MAX_SEPARATOR_RUN: usize = 3;
 /// Space, hyphen, tab and line breaks: an entity split across lines inside one
 /// value still forms a group.
 ///
-/// A line break is the one weak separator here, so `classify` scopes it: joining
-/// **across a line break** is only allowed for entities with a strict structural
-/// layout (resident id, mobile). The bare "16–19 digits + Luhn" card rule may not
-/// cross a line, because `2023 1203\n2024 1305\n2025 1411\n2026 1520` joins into a
-/// 16-digit Luhn-valid run and would pin every pasted numeric table to
-/// local_only — a false positive that 503s remote-only callers. A weak checksum
-/// must not be licensed by a layout the scanner itself invented.
+/// `classify` permits cross-line matches only for modern resident IDs with
+/// valid structure and checksum. Phones, legacy IDs and bank cards do not
+/// acquire cross-line recall, to avoid fabricating entities from numeric lists.
 fn is_separator(u: u16) -> bool {
     [b' ', b'-', b'\t', b'\n', b'\r']
         .iter()
