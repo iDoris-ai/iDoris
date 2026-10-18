@@ -12,6 +12,16 @@ pub(super) struct Normalized {
 }
 
 pub(super) fn normalize(units: &[u16]) -> Normalized {
+    normalize_with_letters(units, true)
+}
+
+/// Keep digit/fullwidth normalization but preserve non-Latin token boundaries.
+/// This view is scanned too, so letter folding cannot erase existing findings.
+pub(super) fn normalize_without_letter_folding(units: &[u16]) -> Normalized {
+    normalize_with_letters(units, false)
+}
+
+fn normalize_with_letters(units: &[u16], fold_letters: bool) -> Normalized {
     let mut out = Normalized {
         units: Vec::with_capacity(units.len()),
         origin: Vec::with_capacity(units.len()),
@@ -34,7 +44,9 @@ pub(super) fn normalize(units: &[u16]) -> Normalized {
                 decimal_digit_zero(u).map_or(u, |zero| u - zero + u16::from(b'0'))
             }
             // 西里尔/希腊字母里和拉丁字母同形的那些（`ѕk-`、`АКIА`）。
-            _ if latin_confusable(u).is_some() => latin_confusable(u).map_or(u, u16::from),
+            _ if fold_letters && latin_confusable(u).is_some() => {
+                latin_confusable(u).map_or(u, u16::from)
+            }
             // 全角 ASCII（！到～）折回半角。
             0xFF01..=0xFF5E => u - 0xFEE0,
             // 全角空格。
