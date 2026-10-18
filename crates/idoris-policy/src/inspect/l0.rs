@@ -2,9 +2,9 @@
 //!
 //! 只用线性扫描，不用正则：先找「数字组」——ASCII 数字，组内允许单个空格或
 //! `-` 分隔（`138-1234-5678`、`6222 0212 …`）。每个数字组既按整组（去掉分隔
-//! 符）判定，也按组内每一段连续数字单独判定，所以「手机号 空格 银行卡号」
-//! 被并成一个大组时，两段仍各自命中。多段候选仅接受显式支持的书写布局，
-//! 不跨 tab/换行拼接；未枚举的布局可能漏检，以避免任意数字表格被误判。
+//! 符）判定，也按组内每一段连续数字单独判定。多实体组需完整分解；
+//! 只有标准手机号/身份证布局的窗口可忽略相邻杂项数字独立命中，银行卡
+//! 不走此例外。不跨 tab/换行拼接；不能保证任意布局或任意数字表格零误报。
 //!
 //! 结构校验压倒校验和：身份证先看省级行政区划码和出生日期，校验位只决定
 //! 敏感度（X-2）；银行卡没有可用的结构信号，所以 Luhn 是必要条件。
@@ -101,6 +101,27 @@ pub(super) fn scan_plain(units: &[u16]) -> Vec<Hit> {
             hits.extend(window(a, a));
         }
         if n > 1 {
+            // A standard written phone/ID must not disappear because an
+            // unrelated quantity/room number prevents full decomposition.
+            // Do not relax card windows: that recreates random-table matches.
+            for a in 0..n {
+                for b in a + 1..n {
+                    if prefix[b + 1] - prefix[a] > MAX_ENTITY_DIGITS {
+                        break;
+                    }
+                    let lengths: Vec<usize> = segments[a..=b].iter().map(|(s, e)| e - s).collect();
+                    let mobile_shape =
+                        matches!(lengths.as_slice(), [3, 4, 4] | [2, 3, 4, 4] | [5, 4, 4]);
+                    let id_shape = matches!(lengths.as_slice(), [6, 8, 4])
+                        || (x_suffix && b + 1 == n && matches!(lengths.as_slice(), [6, 8, 3]));
+                    if mobile_shape || id_shape {
+                        hits.extend(window(a, b).into_iter().filter(|hit| {
+                            (mobile_shape && hit.kind == FindingKind::CnMobile)
+                                || (id_shape && hit.kind == FindingKind::CnResidentId)
+                        }));
+                    }
+                }
+            }
             hits.extend(window(0, n - 1));
             // decomposes[a]: the runs from `a` on split into entity windows;
             // first_window[a]: the shortest such window starting at `a`.

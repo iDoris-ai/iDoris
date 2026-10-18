@@ -636,7 +636,8 @@ fn review_regressions_grouped_split_and_invisible_variants() {
     // F4 (ids split across lines or parts) is deliberately not covered:
     // joining on line breaks flagged most numeric tables (second review)
     // and cannot reach across JSON parts anyway.
-    let cases: [(&str, &[FindingKind]); 8] = [
+    let cases: [(&str, &[FindingKind]); 9] = [
+        ("Room 1203 138 1234 5678", &[FindingKind::CnMobile]),
         // F3: neighbouring grouped numbers
         (
             "张三 110101 19900307 7379 138 1234 5678",
@@ -754,6 +755,38 @@ fn escapes_and_math_digits_are_folded_in_place() {
     let bold = "𝟏𝟑𝟖𝟏𝟐𝟑𝟒𝟓𝟔𝟕𝟖";
     let response = inspect(bold, &open_ctx());
     assert_eq!(covered(bold, &response.findings[0]), bold);
+}
+
+#[test]
+fn standard_written_entities_survive_unrelated_numeric_neighbours() {
+    for (input, expected) in [
+        ("Room 1203 138 1234 5678", 1),
+        ("138-1234-5678 1", 1),
+        ("qty 3 138 1234 5678", 1),
+        ("138 1234 5678 1 139 8765 4321", 2),
+        ("qty 3 86 138 1234 5678 2", 2),
+    ] {
+        let response = inspect(input, &open_ctx());
+        assert_eq!(
+            response
+                .findings
+                .iter()
+                .filter(|f| f.kind == FindingKind::CnMobile)
+                .count(),
+            expected,
+            "{input}: {response:?}"
+        );
+        assert_ne!(response.action, InspectAction::Allow);
+    }
+    for input in ["qty 3 110105 19491231 002X", "110105 19491231 0021 3"] {
+        assert!(
+            kinds(&inspect(input, &open_ctx())).contains(&FindingKind::CnResidentId),
+            "{input}"
+        );
+    }
+    // Card subwindows do not get the recall exception.
+    let card_row = "1 6222 0212 3456 7894 2";
+    assert_eq!(inspect(card_row, &open_ctx()).action, InspectAction::Allow);
 }
 
 #[test]
