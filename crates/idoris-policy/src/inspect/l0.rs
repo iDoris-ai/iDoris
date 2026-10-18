@@ -54,7 +54,11 @@ pub(super) fn scan_plain(units: &[u16]) -> Vec<Hit> {
             .get(group_end)
             .is_some_and(|&u| u == u16::from(b'X') || u == u16::from(b'x'));
         let mut segments: Vec<(usize, usize)> = Vec::new();
-        // `gaps[n]` is the separator run between segment n-1 and segment n.
+        // `gaps[n]` is the separator run **after** segment n (pushed only when
+        // segment n+1 is appended), so the gap *inside* a window ending at
+        // segment b is `gaps[b - 1]`, never `gaps[b]` - reading `gaps[b]` looks
+        // at the gap outside the window and would mark a card at end of line as
+        // crossed the moment a following line starts with a digit.
         let mut gaps: Vec<bool> = Vec::new();
         let mut k = i;
         while k < group_end {
@@ -83,8 +87,10 @@ pub(super) fn scan_plain(units: &[u16]) -> Vec<Hit> {
             let mut digits = Vec::new();
             let mut crossed_line_break = false;
             for (b, &(seg_start, seg_end)) in segments.iter().enumerate().skip(a) {
-                // `gaps[b]` is the gap before segment b (absent for b == 0).
-                if let Some(&broke) = gaps.get(b) {
+                // Only gaps *inside* the window (between segments a..=b) count.
+                if b > a
+                    && let Some(&broke) = gaps.get(b - 1)
+                {
                     crossed_line_break |= broke;
                 }
                 digits.extend(

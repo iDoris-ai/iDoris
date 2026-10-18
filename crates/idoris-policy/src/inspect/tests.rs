@@ -771,3 +771,35 @@ fn numeric_tables_do_not_become_bank_cards_across_line_breaks() {
     let card = inspect("6222 0212 3456 7894", &open_ctx());
     assert_eq!(card.action, InspectAction::Block, "{card:?}");
 }
+
+/// F1: the line-break scoping must look only at gaps *inside* the candidate
+/// window. Reading one gap further marked a card that sits entirely on one line
+/// as "crossed a line break" as soon as the next line began with a digit, and the
+/// card was then released to remote.
+#[test]
+fn a_card_on_one_line_is_still_blocked_when_the_next_line_starts_with_digits() {
+    for text in [
+        "card 6222 0212 3456 7894\n2. thanks",
+        "6222021234567894\n2024",
+        "card 6222 0212 3456 7894\r\n1",
+        "card 6222 0212 3456 7894 \n1",
+    ] {
+        let response = inspect(text, &open_ctx());
+        assert_eq!(
+            response.action,
+            InspectAction::Block,
+            "a card on one line must stay Blocked: {text:?} -> {response:?}"
+        );
+        assert!(
+            kinds(&response).contains(&FindingKind::BankCard),
+            "{text:?} -> {response:?}"
+        );
+    }
+    // The accepted gap is unchanged: a card whose own groups are split by the
+    // line break is not joined (A2 rule).
+    let split = "6222 0212\n3456 7894";
+    assert_eq!(inspect(split, &open_ctx()).action, InspectAction::Allow);
+    // And the ordinary table from A2 stays public.
+    let table = "year qty\n2023 1203\n2024 1305\n2025 1411\n2026 1520";
+    assert_eq!(inspect(table, &open_ctx()).action, InspectAction::Allow);
+}
