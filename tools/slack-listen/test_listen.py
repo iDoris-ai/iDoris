@@ -5,9 +5,11 @@ from __future__ import annotations
 
 import json
 import os
+import queue
 import socket
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -41,6 +43,18 @@ class FilterTest(unittest.TestCase):
         self.assertEqual(record["channel_name"], "pr")
         self.assertEqual(record["text"], "在吗")
         self.assertNotIn("token", record)
+
+    def test_long_text_is_stored_whole(self) -> None:
+        text = "长" * 9000
+        record = listen.accept_event(
+            {"type": "message", "channel": "C1", "user": "UOTHER", "text": text, "ts": "9.9"},
+            "EvLong",
+            policy(),
+            listen.Seen(),
+        )
+        self.assertIsNotNone(record)
+        assert record is not None
+        self.assertEqual(record["text"], text)
 
     def test_drops_self_bot_other_channel_and_subtype(self) -> None:
         seen = listen.Seen()
@@ -178,6 +192,64 @@ class SpoolTest(unittest.TestCase):
             saved = json.loads(path.read_text(encoding="utf-8"))
             self.assertEqual(saved["text"], "你好")
             self.assertNotIn("token", saved)
+
+    def test_short_write_rolls_back_before_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp) / "state"
+            listen.append_spool(directory, {"text": "first"})
+            path = directory / "events.jsonl"
+            before = path.read_bytes()
+            real_write = os.write
+            calls = {"n": 0}
+
+            def short_then_fail(fd: int, data: bytes) -> int:
+                calls["n"] += 1
+                if calls["n"] == 1:
+                    return real_write(fd, bytes(data[:1]))
+                raise OSError(28, "No space left on device")
+
+            with mock.patch.object(listen.os, "write", side_effect=short_then_fail):
+                with self.assertRaises(OSError):
+                    listen.append_spool(directory, {"text": "second-record"})
+            self.assertEqual(path.read_bytes(), before)
+            listen.append_spool(directory, {"text": "second-record"})
+            lines = path.read_text(encoding="utf-8").splitlines()
+            self.assertEqual([json.loads(line)["text"] for line in lines], ["first", "second-record"])
+
+
+class ShutdownTest(unittest.TestCase):
+    def tearDown(self) -> None:
+        listen.stop.clear()
+        proc = listen.current_trigger["proc"]
+        listen.current_trigger["proc"] = None
+        if proc is not None and proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=3)
+
+    def test_shutdown_reaps_current_trigger_and_skips_the_queue(self) -> None:
+        listen.stop.clear()
+        with tempfile.TemporaryDirectory() as tmp:
+            script = Path(tmp) / "sleep.sh"
+            script.write_text("#!/bin/sh\nread line\nsleep 30\n", encoding="utf-8")
+            script.chmod(0o700)
+            events: queue.Queue = queue.Queue()
+            events.put({"text": "run"})
+            events.put({"text": "skip"})
+            config = listen.Config(["pr"], [], False, str(script), 30, Path(tmp))
+            worker = threading.Thread(target=listen.trigger_worker, args=(events, config))
+            worker.start()
+            deadline = time.time() + 3
+            while listen.current_trigger["proc"] is None and time.time() < deadline:
+                time.sleep(0.02)
+            proc = listen.current_trigger["proc"]
+            self.assertIsNotNone(proc)
+            assert proc is not None
+            listen.stop.set()
+            listen.stop_trigger_worker(worker, 1)
+            self.assertFalse(worker.is_alive())
+            self.assertIsNone(listen.current_trigger["proc"])
+            self.assertIsNotNone(proc.poll())
+            self.assertEqual(events.qsize(), 1)
 
 
 class FrameTest(unittest.TestCase):

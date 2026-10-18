@@ -35,6 +35,7 @@ SLACK_API = "https://slack.com/api/"
 
 stop = threading.Event()
 current_sock: dict[str, socket.socket | None] = {"sock": None}
+current_trigger: dict[str, subprocess.Popen | None] = {"proc": None}
 
 
 class Disconnect(RuntimeError):
@@ -303,7 +304,7 @@ def accept_event(
         "channel": channel,
         "channel_name": policy.channel_names.get(channel, ""),
         "user": user,
-        "text": text[:8000],
+        "text": text,
         "ts": ts,
         "thread_ts": str(event.get("thread_ts") or ""),
         "event_id": event_id,
@@ -326,6 +327,7 @@ def append_spool(directory: Path, record: dict) -> None:
         path.replace(rotated)
     line = (json.dumps(record, ensure_ascii=False) + "\n").encode("utf-8")
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    start = os.lseek(fd, 0, os.SEEK_END)
     try:
         view = memoryview(line)
         while view:
@@ -334,6 +336,10 @@ def append_spool(directory: Path, record: dict) -> None:
                 raise OSError("事件记录写入失败")
             view = view[written:]
         os.fsync(fd)
+    except OSError:
+        os.ftruncate(fd, start)
+        os.fsync(fd)
+        raise
     finally:
         os.close(fd)
 
@@ -375,29 +381,84 @@ def run_trigger(path: str, record: dict, timeout: float) -> None:
         stderr=subprocess.PIPE,
         start_new_session=True,
     )
+    current_trigger["proc"] = proc
     payload = json.dumps(record, ensure_ascii=False).encode("utf-8")
     try:
         _out, err = proc.communicate(payload, timeout=timeout)
     except subprocess.TimeoutExpired:
-        os.killpg(proc.pid, signal.SIGTERM)
-        try:
-            proc.communicate(timeout=2)
-        except subprocess.TimeoutExpired:
-            os.killpg(proc.pid, signal.SIGKILL)
-            proc.communicate()
+        reap_trigger(proc)
         log(f"触发超时，已终止：{path}")
         return
-    if proc.returncode != 0:
+    finally:
+        if current_trigger["proc"] is proc:
+            current_trigger["proc"] = None
+    if proc.returncode != 0 and not stop.is_set():
         detail = redact(err.decode("utf-8", errors="replace").strip().replace("\n", " "))
         log(f"触发退出 {proc.returncode}：{detail}")
 
 
+def signal_group(proc: subprocess.Popen, sig: int) -> None:
+    if proc.poll() is not None:
+        return
+    try:
+        os.killpg(proc.pid, sig)
+    except ProcessLookupError:
+        return
+
+
+def reap_trigger(proc: subprocess.Popen) -> None:
+    if proc.poll() is not None:
+        return
+    signal_group(proc, signal.SIGTERM)
+    try:
+        proc.communicate(timeout=2)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    if proc.poll() is None:
+        signal_group(proc, signal.SIGKILL)
+        proc.communicate()
+
+
+def stop_trigger_worker(worker: threading.Thread | None, timeout: float) -> None:
+    """Stop starting triggers, then terminate and reap the current child.
+
+    The worker thread owns communicate(). This function only signals the child,
+    then joins that thread so the pipes are reaped once.
+    """
+    proc = current_trigger["proc"]
+    if proc is not None:
+        try:
+            signal_group(proc, signal.SIGTERM)
+        except OSError as exc:
+            log(f"退出时终止触发进程失败：{safe_error(exc)}")
+    if worker is not None:
+        worker.join(timeout=max(timeout, 0) + 3)
+    proc = current_trigger["proc"]
+    if proc is not None and proc.poll() is None:
+        try:
+            signal_group(proc, signal.SIGKILL)
+        except OSError as exc:
+            log(f"退出时强制结束触发进程失败：{safe_error(exc)}")
+        if worker is not None and worker.is_alive():
+            worker.join(timeout=3)
+    proc = current_trigger["proc"]
+    if proc is not None and proc.poll() is None and (worker is None or not worker.is_alive()):
+        try:
+            reap_trigger(proc)
+        except OSError as exc:
+            log(f"退出时回收触发进程失败：{safe_error(exc)}")
+
+
 def trigger_worker(events: queue.Queue, config: Config) -> None:
-    while not stop.is_set() or not events.empty():
+    while not stop.is_set():
         try:
             record = events.get(timeout=0.5)
         except queue.Empty:
             continue
+        if stop.is_set():
+            events.task_done()
+            break
         try:
             run_trigger(config.trigger, record, config.trigger_timeout)
         except OSError as exc:
@@ -688,8 +749,7 @@ def main(argv: list[str]) -> int:
             delay = 1 if health["hello"] else min(delay * 2, 60)
         if stop.is_set() or stop.wait(delay):
             break
-    if worker is not None:
-        worker.join(timeout=config.trigger_timeout)
+    stop_trigger_worker(worker, config.trigger_timeout)
     log("监听进程退出。")
     return 0
 
