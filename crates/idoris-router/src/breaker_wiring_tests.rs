@@ -4,6 +4,7 @@
 #![allow(clippy::unwrap_used)]
 
 use axum::http::StatusCode;
+use http_body_util::BodyExt;
 use idoris_tenancy::event_log::{EventLogStore, EventType};
 use rusqlite::Connection;
 use tower::ServiceExt;
@@ -29,6 +30,7 @@ async fn failing_local_upstream_is_not_contacted_once_its_breaker_opens() {
 
     let mut last_record = String::new();
     let mut statuses = Vec::new();
+    let mut refusals = Vec::new();
     for _ in 0..3 {
         let response = app.clone().oneshot(post_chat(body, &[])).await.unwrap();
         statuses.push(response.status());
@@ -39,6 +41,8 @@ async fn failing_local_upstream_is_not_contacted_once_its_breaker_opens() {
             .to_str()
             .unwrap()
             .to_string();
+        let body_bytes = response.into_body().collect().await.unwrap().to_bytes();
+        refusals.push(serde_json::from_slice::<serde_json::Value>(&body_bytes).ok());
     }
     assert_eq!(
         statuses,
@@ -49,6 +53,17 @@ async fn failing_local_upstream_is_not_contacted_once_its_breaker_opens() {
         ]
     );
     assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    // The all-open case must stay the retryable `provider_circuit_open` from the
+    // proxy send gate. Marking every open provider `Blocked` during selection
+    // turned it into `no_eligible_candidate`, which clients read as "no such
+    // model" rather than "cooling down, retry" - a contract change.
+    let Some(refusal) = refusals[2].as_ref() else {
+        panic!("refusal body is not JSON");
+    };
+    assert_eq!(
+        refusal["error"]["type"], "provider_circuit_open",
+        "all-open chat must answer the retryable breaker reason, got {refusal}"
+    );
     let refused = event_log
         .events_for_record(Some(budget::PERSONAL_TENANT_ID), &last_record)
         .unwrap();
@@ -286,4 +301,73 @@ async fn the_fallback_re_decide_agrees_with_the_decided_rejection() {
     assert_eq!(decided.event.metadata["status"], "rejected");
     assert_eq!(error["error"]["type"], decided.event.metadata["reason"]);
     assert_eq!(adapter.load_call_count("only-flaky"), 2);
+}
+
+/// Same acceptance as the chat case, on the three protocol endpoints: when the
+/// single eligible card's breaker is open, the third request must stay the
+/// retryable `provider_circuit_open` and must not be sent.
+#[tokio::test]
+async fn single_card_all_open_keeps_the_retryable_reason_on_protocol_endpoints() {
+    for (uri, capability, payload) in [
+        (
+            "/v1/embeddings",
+            idoris_contracts::common::Capability::Embedding,
+            r#"{"model":"embed","input":["hello"]}"#,
+        ),
+        (
+            "/v1/rerank",
+            idoris_contracts::common::Capability::Rerank,
+            r#"{"model":"rerank","query":"q","documents":["a","b"]}"#,
+        ),
+        (
+            "/v1/messages",
+            idoris_contracts::common::Capability::Chat,
+            r#"{"model":"idoris/daily","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}"#,
+        ),
+    ] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(503).set_body_json(json!({"error": "busy"})))
+            .mount(&server)
+            .await;
+        let mut card = resident_component_card("only-card", &server.uri());
+        card.provider.capabilities = vec![capability];
+        let app = build_app(AppState {
+            cards: vec![card],
+            ..AppState::default()
+        });
+
+        let mut statuses = Vec::new();
+        let mut bodies = Vec::new();
+        for _ in 0..3 {
+            let request = axum::http::Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("content-type", "application/json")
+                .body(Body::from(payload))
+                .unwrap();
+            let response = app.clone().oneshot(request).await.unwrap();
+            statuses.push(response.status());
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            bodies.push(serde_json::from_slice::<serde_json::Value>(&bytes).ok());
+        }
+
+        assert_eq!(
+            statuses[2],
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{uri} third request must be 503"
+        );
+        let Some(refusal) = bodies[2].as_ref() else {
+            panic!("{uri} refusal body is not JSON");
+        };
+        assert_eq!(
+            refusal["error"]["type"], "provider_circuit_open",
+            "{uri} all-open must answer the retryable breaker reason, got {refusal}"
+        );
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            2,
+            "{uri} the refused request must not be sent"
+        );
+    }
 }
