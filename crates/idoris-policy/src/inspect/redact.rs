@@ -172,6 +172,29 @@ impl Redaction {
         Ok(())
     }
 
+    /// Streaming variant of [`Self::replace`]: records which table placeholders
+    /// were restored, and refuses a placeholder-shaped token that is neither a
+    /// table entry nor one of the input's own literals — the same verdict batch
+    /// `restore` reaches, so the two paths cannot disagree.
+    fn replace_streaming(
+        &self,
+        output: &str,
+        restored_counts: &mut Vec<(String, usize)>,
+    ) -> Result<String, RestoreError> {
+        let restored = self.replace(output)?;
+        for (placeholder, _) in &self.table {
+            let seen = output.matches(placeholder.as_str()).count();
+            if seen > 0 {
+                match restored_counts.iter_mut().find(|(p, _)| p == placeholder) {
+                    Some((_, n)) => *n += seen,
+                    None => restored_counts.push((placeholder.clone(), seen)),
+                }
+            }
+        }
+        self.reject_extra_placeholder_shapes(output)?;
+        Ok(restored)
+    }
+
     /// R-2：只认映射表里的占位符。
     fn replace(&self, output: &str) -> Result<String, RestoreError> {
         let mut rest = output;
@@ -230,6 +253,7 @@ impl Redaction {
             redaction: self,
             pending: String::new(),
             emitted_tail: String::new(),
+            restored: Vec::new(),
         }
     }
 }
@@ -245,6 +269,9 @@ pub struct StreamRestorer<'a> {
     redaction: &'a Redaction,
     pending: String,
     emitted_tail: String,
+    /// How many times each table placeholder was restored so far, so `finish`
+    /// can apply batch `restore`'s completeness rule to the whole stream.
+    restored: Vec<(String, usize)>,
 }
 
 impl StreamRestorer<'_> {
@@ -285,11 +312,22 @@ impl StreamRestorer<'_> {
 
     pub fn finish(mut self) -> Result<String, RestoreError> {
         let rest = std::mem::take(&mut self.pending);
-        self.emit(&rest)
+        let tail = self.emit(&rest)?;
+        // N1: the batch path refuses a text that lost a placeholder; streaming
+        // must reach the same verdict, and `finish` is where the whole stream is
+        // finally known.
+        for (placeholder, _) in &self.redaction.table {
+            if !self.restored.iter().any(|(seen, _)| seen == placeholder) {
+                return Err(RestoreError::MangledPlaceholder);
+            }
+        }
+        Ok(tail)
     }
 
     fn emit(&mut self, ready: &str) -> Result<String, RestoreError> {
-        let restored = self.redaction.replace(ready)?;
+        let restored = self
+            .redaction
+            .replace_streaming(ready, &mut self.restored)?;
         let window = format!("{}{restored}", self.emitted_tail);
         self.redaction.reject_mangled(&window)?;
         let keep = window

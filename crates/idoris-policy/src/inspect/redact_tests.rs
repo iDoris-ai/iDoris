@@ -217,3 +217,33 @@ fn restore_refuses_missing_lowercased_and_debracketed_placeholders() {
         assert_eq!(r.restore(text).unwrap_err(), expected, "{text}");
     }
 }
+
+/// N1: the streaming path must reach the same verdict as batch `restore` for the
+/// three U3 rows. Before this, only the batch path refused them.
+#[test]
+fn streaming_refuses_the_same_mangled_placeholders_as_batch() {
+    let r = redacted("请联系 13812345678");
+    for mangled in [
+        "电话 已省略",        // placeholder swallowed entirely
+        "电话 [cn_mobile_1]", // wrong case
+        "电话 CN_MOBILE1",    // de-bracketed and de-underscored
+        // The real placeholder is present *and* a wrong-case twin is too: only
+        // the placeholder-shape check can refuse this one.
+        "电话 [CN_MOBILE_1] 与 [cn_mobile_1]",
+    ] {
+        assert_eq!(
+            r.restore(mangled).unwrap_err(),
+            RestoreError::MangledPlaceholder,
+            "batch: {mangled}"
+        );
+        let mut stream = r.stream();
+        let streamed = stream
+            .push(mangled)
+            .and_then(|first| stream.finish().map(|tail| format!("{first}{tail}")));
+        assert_eq!(
+            streamed.unwrap_err(),
+            RestoreError::MangledPlaceholder,
+            "stream: {mangled}"
+        );
+    }
+}
