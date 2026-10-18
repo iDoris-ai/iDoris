@@ -153,7 +153,7 @@
 | 设计 | 说明 | 来源 |
 |:---|:---|:---|
 | **虚拟 key = 调用方身份**（解 FU-14） | iDoris 给每个上游（Agent24 的某个模块、AgentEar、手机）签发一把本地 key。policy 可以按 key 区分；key 由 iDoris 签发，不是调用方自称，因此不走 caller header | archestra、onecli |
-| 绑定规则 | loopback 默认可不带 key；**非 loopback 绑定且没有 key 时拒绝启动**；Tailscale 只绑 tailnet 接口，不绑 0.0.0.0；拒绝伪造 Host 和代理头（防 DNS rebinding） | krill、openminis 反例、exxperts |
+| 绑定规则 | 数据面默认必须带 virtual key（loopback 同样如此）；免 key 仅限显式 `IDORIS_DEV_NO_KEY=1` 的免费 loopback/local_only 开发模式；**非 loopback 绑定且没有有效 key 时拒绝启动**；Tailscale 只绑 tailnet 接口，不绑 0.0.0.0；拒绝伪造 Host 和代理头（防 DNS rebinding） | krill、openminis 反例、exxperts |
 | 层级 | Org(tenant) → Workspace/Project → Key(member/agent)；**下层只能收紧上层策略** | platypus、OpenAI 治理白皮书 |
 | Blueprint | 组织级策略模板（路由 + 隐私规则 + 预算），应用到 workspace 时「增量、幂等、快照」 | platypus |
 | 临时授权 | policy 绑定可以带到期时间（例如「本周允许某项目用 Opus」），到期自动失效 | authentik |
@@ -420,11 +420,11 @@ docs/15 的设计**保留并作为落地依据**。调研补充如下：
 **分工：**
 - **iDoris 自带控制台**只做四件事：健康/内存/后端状态；**安全姿态与 kill switch**；模型加载、常驻、驱逐；最近请求的决策轨迹。
 - **Agent24 管理页**做全部其余能力：路由规则编辑与回放、隐私规则、预算与审批、轨迹与授权、学习与晋升、租户与密钥。
-- **敏感操作的最终确认留在 iDoris**：开启内容记录、开启训练、离机训练、放宽隐私、关闭 kill switch。Agent24 可以发起，但 iDoris 要求一次性确认令牌并记入审计。确认既可以在 iDoris 控制台完成，也可以用 Agent24 转交的用户确认凭据完成，具体凭据形式在边界规范里定。
+- **敏感操作的最终确认留在 iDoris**：开启内容记录、开启训练、离机训练、放宽隐私、关闭 kill switch。Agent24 可以发起，但 iDoris 要求一次性确认令牌并记入审计。确认只在 iDoris 本地控制台由用户逐次、单次完成；Agent24 不能代理确认，也不转交可替代确认的调用方凭据（D-4）。
 
 | 阶段 | iDoris 侧 | Agent24 侧 |
 |:---|:---|:---|
-| M4 | `idoris` CLI + Admin API v0（只读 + 模型操作）+ 极简控制台；模型下载仍沿用 oMLX 自带界面 | 状态卡片（读 Admin API） |
+| M4 | `idoris` CLI + Admin API v0（只读：status/backends/models/runtimes/roles；无模型写操作）+ 只读极简控制台；模型下载仍沿用 oMLX 自带界面 | 状态卡片（读 Admin API） |
 | M5 | Admin API v1（隐私、预算、审批、kill switch） | 管理页：隐私、预算、审批 |
 | M6–M7 | Admin API v2（轨迹、授权、学习、晋升） | 管理页：轨迹、学习、路由回放 |
 | M8 | 组织版 Admin API（OIDC/RBAC） | 组织管理页 |

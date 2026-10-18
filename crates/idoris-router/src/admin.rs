@@ -3,6 +3,7 @@
 //! through [`AdminBindConfig`], which is fixed to IPv4 loopback.
 
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use axum::{
     Json, Router,
@@ -400,24 +401,30 @@ pub async fn models(state: &AppState) -> AdminModelsResponse {
         if card.form != idoris_contracts::component_card::Form::HttpService {
             continue;
         }
-        let (state_kind, models, error) =
-            match crate::models::observe_http_models(&state.http_client, card).await {
-                Ok(crate::models::HttpModelObservation::Observed(entries)) => (
-                    AdminModelSourceState::Observed,
-                    entries.into_iter().map(|entry| entry.id).collect(),
-                    None,
-                ),
-                Ok(crate::models::HttpModelObservation::Unavailable) => (
-                    AdminModelSourceState::Error,
-                    Vec::new(),
-                    Some(AdminModelSourceError::Unavailable),
-                ),
-                Err(crate::models::ModelsError::UpstreamAuthenticationFailed { .. }) => (
-                    AdminModelSourceState::Error,
-                    Vec::new(),
-                    Some(AdminModelSourceError::AuthenticationFailed),
-                ),
-            };
+        let (state_kind, models, error) = match crate::models::observe_http_models(
+            &state.http_client,
+            card,
+            state.remote_kill_switch.load(Ordering::SeqCst),
+        )
+        .await
+        {
+            Ok(crate::models::HttpModelObservation::Suppressed) => continue,
+            Ok(crate::models::HttpModelObservation::Observed(entries)) => (
+                AdminModelSourceState::Observed,
+                entries.into_iter().map(|entry| entry.id).collect(),
+                None,
+            ),
+            Ok(crate::models::HttpModelObservation::Unavailable) => (
+                AdminModelSourceState::Error,
+                Vec::new(),
+                Some(AdminModelSourceError::Unavailable),
+            ),
+            Err(crate::models::ModelsError::UpstreamAuthenticationFailed { .. }) => (
+                AdminModelSourceState::Error,
+                Vec::new(),
+                Some(AdminModelSourceError::AuthenticationFailed),
+            ),
+        };
         sources.push(AdminModelSource {
             provider_id: card.provider.id.clone(),
             source: AdminModelSourceKind::HttpModelsEndpoint,

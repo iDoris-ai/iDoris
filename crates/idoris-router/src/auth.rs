@@ -34,6 +34,7 @@ impl std::error::Error for VirtualKeyAuthError {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VirtualKeyScopeError {
+    TenantForbidden,
     PrivacyForbidden,
     RoleForbidden,
     FallbackForbidden,
@@ -42,6 +43,7 @@ pub enum VirtualKeyScopeError {
 impl VirtualKeyScopeError {
     pub const fn reason_code(self) -> &'static str {
         match self {
+            Self::TenantForbidden => "VIRTUAL_KEY_TENANT_FORBIDDEN",
             Self::PrivacyForbidden => "VIRTUAL_KEY_PRIVACY_FORBIDDEN",
             Self::RoleForbidden => "VIRTUAL_KEY_ROLE_FORBIDDEN",
             Self::FallbackForbidden => "VIRTUAL_KEY_FALLBACK_FORBIDDEN",
@@ -222,6 +224,7 @@ mod tests {
     fn scope(expires_at_ms: Option<i64>) -> VirtualKeyScope {
         VirtualKeyScope {
             owner: "agent24-instance".into(),
+            tenant_id: None,
             allowed_privacy: vec![PrivacyClass::LocalOnly],
             allowed_roles: vec!["fast".into()],
             budget_ref: None,
@@ -321,6 +324,7 @@ mod tests {
             key_id: "vk-test".into(),
             scope: VirtualKeyScope {
                 owner: "agent24-instance".into(),
+                tenant_id: None,
                 allowed_privacy: privacy,
                 allowed_roles: roles.iter().map(|role| (*role).to_string()).collect(),
                 budget_ref: None,

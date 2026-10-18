@@ -41,6 +41,14 @@ Core product invariants:
 - Router/runtime/fallback/health/capacity designs should actively learn from mature open-source model routers/runtimes while preserving iDoris invariants.
 - Do not regress Rust safety improvements merely to mimic TS behavior; approved differences must be explicit and tested.
 
+## Release checkpoint — 2026-10-15
+
+- M4 v0.3.0 已正式发布；tag 解引用到 `03c079c70611331a8c85a1666e32a75df6359d09`，本次核对的 main 也为该提交。下方 October 7 及更早段落是历史快照。
+- 正式资产只有 Apple Silicon macOS tar.gz 与 sha256；无 iDoris DMG/EXE，也不包含后端或模型。Admin v0 已有独立 loopback HTTP 端口、Bearer 会话 token 与只读浏览器页面；早期“Admin wire 未定”的限制已过期。
+- 用户路径见 [安装与首次调用](../安装与首次调用-v0.3.0.md)。归档测试直接验证 Rust 二进制、key bootstrap、Admin 和本地夹具加载/调用；TS smoke 不代表 Rust 发布包验收。
+- 发布完成不等于 onboarding/Agent24 已完成：角色→真实模型绑定仍有缺口，默认 `idoris/daily` 会落到 `omlx` ID；需先修复并验收真实 Agent24 接入，再推进 M5。M5–M8 是后续计划，不是本版交付。
+- 保留既有暂停作业与 worker 所有权；远程评审为权威，不启动本地 PR Review Watcher。轮询遵循全局 5 分钟策略；禁止自动选择 Fast/priority 服务。
+
 ## Live delta — 2026-10-07 morning
 
 Live Git/GitHub has moved well beyond the 2026-10-06 snapshot below. Treat this
@@ -263,3 +271,7 @@ Update this file whenever any of the following happens:
 - before intentionally ending a long Prime work session.
 
 When updating, preserve useful historical review lessons but replace stale SHA/PR/task-status facts with current live truth.
+
+## 2026-10-15 历史队列收口
+
+当前73项逐项证据、8个重复/历史PR关闭及M5继续工作见[PR承接账本](PR-DISPOSITION-2026-10-15.md)。v0.3.0已发布；v0.3.1接线仍在进行；不要按旧handoff重新创建已关闭的历史PR。
