@@ -1111,3 +1111,40 @@ proptest! {
         prop_assert_eq!(response.action, InspectAction::Block);
     }
 }
+
+#[test]
+fn fifth_review_card_group_keeps_full_length_not_prefix() {
+    // Each full card and its 16-digit prefix pass Luhn independently.
+    // The parent's single-run scan and DP must not add a contained prefix
+    // beside the longer whole-group finding.
+    for input in [
+        "6222 0212 3456 7894 5",
+        "6222-0212-3456-7894-5",
+        "6222 0212 3456 7894 18",
+        "6222-0212-3456-7894-18",
+        "6222 0212 3456 7894 120",
+        "6222-0212-3456-7894-120",
+    ] {
+        let response = inspect(input, &open_ctx());
+        assert_eq!(kinds(&response), [FindingKind::BankCard], "{input}");
+        assert_eq!(
+            covered(input, &response.findings[0]),
+            input,
+            "{input}: truncated to the shorter Luhn-valid prefix"
+        );
+    }
+    // Mixed shape: when the longer extension is NOT itself Luhn-valid, the
+    // shorter prefix is still the (only) entity — the longest-window
+    // preference must still fall back correctly, not just stop matching.
+    for (input, card) in [
+        ("4111 1111 1111 1111 12/28", "4111 1111 1111 1111"),
+        ("4111 1111 1111 1111 123", "4111 1111 1111 1111"),
+    ] {
+        let response = inspect(input, &open_ctx());
+        assert!(
+            kinds(&response).contains(&FindingKind::BankCard),
+            "{input}: {response:?}"
+        );
+        assert_eq!(covered(input, &response.findings[0]), card, "{input}");
+    }
+}

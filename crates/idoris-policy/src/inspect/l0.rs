@@ -131,6 +131,18 @@ pub(super) fn scan_plain(units: &[u16]) -> Vec<Hit> {
                 }
             }
             hits.extend(window(0, n - 1));
+            // A single card group can end with an invalid 1–3 digit suffix.
+            // Keep its valid prefix as fallback, without admitting interior
+            // cards in arbitrary numeric rows or skipping numeric prefixes.
+            if prefix[n] <= MAX_ENTITY_DIGITS {
+                for b in 0..n - 1 {
+                    hits.extend(
+                        window(0, b)
+                            .into_iter()
+                            .filter(|hit| hit.kind == FindingKind::BankCard),
+                    );
+                }
+            }
             // decomposes[a]: the runs from `a` on split into entity windows;
             // first_window[a]: the shortest such window starting at `a`.
             let mut decomposes = vec![false; n + 1];
@@ -158,6 +170,21 @@ pub(super) fn scan_plain(units: &[u16]) -> Vec<Hit> {
                     break;
                 };
                 hits.extend(found);
+                // Keep the parent's shortest decomposition and its other
+                // entity kinds, but also collect longer card alternatives
+                // whose remaining runs still decompose completely.
+                for end in b + 1..n {
+                    if prefix[end + 1] - prefix[a] > MAX_ENTITY_DIGITS {
+                        break;
+                    }
+                    if decomposes[end + 1] {
+                        hits.extend(
+                            window(a, end)
+                                .into_iter()
+                                .filter(|hit| hit.kind == FindingKind::BankCard),
+                        );
+                    }
+                }
                 a = b + 1;
             }
         }
@@ -166,6 +193,11 @@ pub(super) fn scan_plain(units: &[u16]) -> Vec<Hit> {
     super::tokens::scan(units, &mut hits);
     super::secrets::scan(units, &mut hits);
     sort_dedup(hits)
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static SUPPRESSION_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 fn sort_dedup(mut hits: Vec<Hit>) -> Vec<Hit> {
@@ -178,6 +210,36 @@ fn sort_dedup(mut hits: Vec<Hit>) -> Vec<Hit> {
         )
     });
     hits.dedup_by_key(|hit| (hit.kind, hit.start, hit.length));
+    // Preserve the public ordering and all other entity kinds. The reverse
+    // pass removes shorter cards at the same start; the forward pass removes
+    // cards contained by an earlier start. Both passes are linear, including
+    // when the input contains many adjacent cards. Cards are always S3.
+    let mut same_start = None;
+    for hit in hits.iter_mut().rev() {
+        #[cfg(test)]
+        SUPPRESSION_VISITS.with(|visits| visits.set(visits.get() + 1));
+        if hit.kind != FindingKind::BankCard {
+            continue;
+        }
+        if same_start != Some(hit.start) {
+            same_start = Some(hit.start);
+        } else {
+            hit.length = 0;
+        }
+    }
+    let mut card_end = 0;
+    hits.retain(|hit| {
+        #[cfg(test)]
+        SUPPRESSION_VISITS.with(|visits| visits.set(visits.get() + 1));
+        if hit.kind != FindingKind::BankCard {
+            return true;
+        }
+        if hit.length == 0 || hit.start + hit.length <= card_end {
+            return false;
+        }
+        card_end = hit.start + hit.length;
+        true
+    });
     hits
 }
 
@@ -332,4 +394,42 @@ fn valid_date(year: u32, month: u32, day: u32) -> bool {
         _ => return false,
     };
     (1..=days).contains(&day)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn containment_filter_visits_each_finding_twice_and_preserves_order() {
+        for count in [1, 128, 8192] {
+            let mut hits = Vec::new();
+            for i in 0..count {
+                for (offset, length, kind) in [
+                    (0, 16, FindingKind::BankCard),
+                    (0, 19, FindingKind::BankCard),
+                    (1, 16, FindingKind::BankCard),
+                    (2, 11, FindingKind::CnMobile),
+                    (30, 16, FindingKind::BankCard),
+                ] {
+                    hits.push(Hit {
+                        start: i * 64 + offset,
+                        length,
+                        kind,
+                        sensitivity: Sensitivity::S3,
+                    });
+                }
+            }
+            SUPPRESSION_VISITS.with(|visits| visits.set(0));
+            let kept = sort_dedup(hits);
+            SUPPRESSION_VISITS.with(|visits| assert_eq!(visits.get(), count * 10));
+            assert_eq!(kept.len(), count * 3);
+            for (i, chunk) in kept.chunks_exact(3).enumerate() {
+                assert_eq!((chunk[0].start, chunk[0].length), (i * 64, 19));
+                assert_eq!(chunk[1].kind, FindingKind::CnMobile);
+                assert_eq!((chunk[2].start, chunk[2].length), (i * 64 + 30, 16));
+                assert!(chunk.iter().all(|hit| hit.sensitivity == Sensitivity::S3));
+            }
+        }
+    }
 }
