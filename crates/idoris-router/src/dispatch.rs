@@ -305,18 +305,41 @@ pub fn select_avoiding_open_breakers(
         // which loads the model - i.e. the fallback would defeat the lockout it
         // exists to report. So require every eligible card to be a resident http
         // service before relaxing the open set.
-        Err(_) if !open_provider_ids.is_empty() && cards.iter().all(is_resident_http_service) => {
-            pool = cards.iter().map(|c| candidate(c, prompt, false)).collect();
-            decide_with_affinity_and_ready(
+        // Relax the open set only when the card this fallback would actually
+        // choose is proxy-gated, because that is where the retryable
+        // `provider_circuit_open` is answered before anything is sent. Judging
+        // the whole candidate list instead would switch the fallback off in a
+        // mixed deployment - a resident chat card plus an embedding-only
+        // lifecycle card in the same tier - and chat would answer the terminal
+        // `no_eligible_candidate` again.
+        Err(rejection) => {
+            if open_provider_ids.is_empty() {
+                return Err(DispatchError::Rejection(rejection));
+            }
+            let plain: Vec<Card> = cards.iter().map(|c| candidate(c, prompt, false)).collect();
+            let relaxed = decide_with_affinity_and_ready(
                 &request_profile,
-                &pool,
+                &plain,
                 &ctx,
                 affinity_key,
                 ready_provider_ids,
             )
-            .map_err(DispatchError::Rejection)?
+            .map_err(DispatchError::Rejection)?;
+            let Some(relaxed_chosen) = plain.iter().find(|c| c.id() == relaxed.chosen_id) else {
+                return Err(DispatchError::Internal(format!(
+                    "decide() returned chosen_id {:?} absent from its own candidate list",
+                    relaxed.chosen_id
+                )));
+            };
+            if !is_resident_http_service(&relaxed_chosen.component) {
+                // A lifecycle card would be dispatched through the Supervisor,
+                // which loads the model: relaxing here would load a locked-out
+                // model. Keep the original rejection.
+                return Err(DispatchError::Rejection(rejection));
+            }
+            pool = plain;
+            relaxed
         }
-        Err(rejection) => return Err(DispatchError::Rejection(rejection)),
     };
     let Some(chosen) = pool.iter().find(|c| c.id() == decision.chosen_id) else {
         return Err(DispatchError::Internal(format!(

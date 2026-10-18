@@ -371,3 +371,52 @@ async fn single_card_all_open_keeps_the_retryable_reason_on_protocol_endpoints()
         );
     }
 }
+
+/// B4: in a mixed tier the fallback must look at the card it would actually
+/// choose, not at every policy card. A resident chat card whose breaker is open,
+/// next to an embedding-only lifecycle card, must still answer the retryable
+/// `provider_circuit_open` — the lifecycle card is not selectable for chat.
+#[tokio::test]
+async fn a_mixed_tier_keeps_the_retryable_reason_for_chat() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(503).set_body_json(json!({"error": "busy"})))
+        .mount(&server)
+        .await;
+    let mut chat_card = resident_component_card("chat-proxy", &server.uri());
+    chat_card.provider.capabilities = vec![idoris_contracts::common::Capability::Chat];
+    // Same tier, but only an embedding lifecycle card: never selectable for chat.
+    let mut embedding_card = super::tests::sample_component_card("embed-lifecycle");
+    embedding_card.provider.capabilities = vec![idoris_contracts::common::Capability::Embedding];
+    embedding_card.load_policy = None;
+
+    let app = build_app(AppState {
+        cards: vec![chat_card, embedding_card],
+        ..AppState::default()
+    });
+
+    let mut statuses = Vec::new();
+    let mut bodies = Vec::new();
+    for _ in 0..3 {
+        let response = app
+            .clone()
+            .oneshot(post_chat(
+                r#"{"model":"idoris/daily","messages":[{"role":"user","content":"hi"}]}"#,
+                &[],
+            ))
+            .await
+            .unwrap();
+        statuses.push(response.status());
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        bodies.push(serde_json::from_slice::<serde_json::Value>(&bytes).ok());
+    }
+    assert_eq!(statuses[2], StatusCode::SERVICE_UNAVAILABLE);
+    let Some(refusal) = bodies[2].as_ref() else {
+        panic!("refusal body is not JSON");
+    };
+    assert_eq!(
+        refusal["error"]["type"], "provider_circuit_open",
+        "a mixed tier must keep the retryable reason, got {refusal}"
+    );
+    assert_eq!(server.received_requests().await.unwrap().len(), 2);
+}
