@@ -27,6 +27,7 @@
 //! 三路缺一不可：`tests::union_is_never_looser_than_any_single_view` 会在
 //! 任意一路被删掉时变红。
 
+mod decode;
 mod l0;
 mod normalize;
 mod secrets;
@@ -89,28 +90,7 @@ pub fn inspect(input: &str, ctx: &InspectCtx) -> InspectResponse {
         };
     }
     let units: Vec<u16> = input.encode_utf16().collect();
-    // 原文视图保证 base 覆盖不丢；两个折叠视图负责补隐形插入与全角/横线变体。
-    let mut hits = scan_view(&normalize::identity(&units));
-    // The folded views may only add coverage, never invent an entity the original
-    // spelling does not have, so their HKID hits are filtered against the original.
-    hits.extend(drop_folded_malformed_hkid(
-        scan_view(&normalize::fold_keeping_ignorables(&units)),
-        &units,
-    ));
-    hits.extend(drop_folded_malformed_hkid(
-        scan_view(&normalize::normalize(&units)),
-        &units,
-    ));
-    // 同一原文区间只留一条。敏感度取更严的那条，避免并集把 S3 降成 S2。
-    hits.sort_by_key(|hit| {
-        (
-            hit.start,
-            hit.length,
-            hit.kind as u8,
-            std::cmp::Reverse(hit.sensitivity as u8),
-        )
-    });
-    hits.dedup_by_key(|hit| (hit.kind, hit.start, hit.length));
+    let hits = scan_all_views(&units, l0::scan);
     let sensitivity = hits
         .iter()
         .map(|hit| hit.sensitivity)
@@ -134,8 +114,30 @@ pub fn inspect(input: &str, ctx: &InspectCtx) -> InspectResponse {
     }
 }
 
-fn scan_view(normalized: &normalize::Normalized) -> Vec<Hit> {
-    let mut hits = l0::scan(&normalized.units);
+/// Share the exact normalization/HKID policy between plaintext and decoded
+/// content. The decoder passes scan_plain to retain its one-layer bound.
+fn scan_all_views(units: &[u16], scan: fn(&[u16]) -> Vec<Hit>) -> Vec<Hit> {
+    let mut hits = scan_view(&normalize::identity(units), scan);
+    for view in [
+        normalize::fold_keeping_ignorables(units),
+        normalize::normalize(units),
+    ] {
+        hits.extend(drop_folded_malformed_hkid(scan_view(&view, scan), units));
+    }
+    hits.sort_by_key(|hit| {
+        (
+            hit.start,
+            hit.length,
+            hit.kind as u8,
+            std::cmp::Reverse(hit.sensitivity as u8),
+        )
+    });
+    hits.dedup_by_key(|hit| (hit.kind, hit.start, hit.length));
+    hits
+}
+
+fn scan_view(normalized: &normalize::Normalized, scan: fn(&[u16]) -> Vec<Hit>) -> Vec<Hit> {
+    let mut hits = scan(&normalized.units);
     for hit in &mut hits {
         (hit.start, hit.length) = normalized.original_span(hit.start, hit.length);
     }

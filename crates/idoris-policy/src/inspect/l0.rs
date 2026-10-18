@@ -35,7 +35,15 @@ struct Candidate<'a> {
     x_suffix: bool,
 }
 
+/// 明文规则，加上解码一层之后的同一套明文规则（[`super::decode`]）。
 pub(super) fn scan(units: &[u16]) -> Vec<Hit> {
+    let mut hits = scan_plain(units);
+    super::decode::scan(units, &mut hits);
+    sort_dedup(hits)
+}
+
+/// 只看明文：数字类、字母数字类、凭据类规则。
+pub(super) fn scan_plain(units: &[u16]) -> Vec<Hit> {
     let mut hits = Vec::new();
     let mut i = 0;
     while i < units.len() {
@@ -87,8 +95,22 @@ pub(super) fn scan(units: &[u16]) -> Vec<Hit> {
     scan_formatted(units, &mut hits);
     super::tokens::scan(units, &mut hits);
     super::secrets::scan(units, &mut hits);
+    sort_dedup(hits)
+}
+
+fn sort_dedup(mut hits: Vec<Hit>) -> Vec<Hit> {
+    // Same (kind, start, length) may arrive at different sensitivities (e.g. a
+    // hex-encoded bad-checksum ID + valid ID both map to the whole encoded
+    // token). Keep the higher sensitivity so S3/Block is never downgraded.
     hits.sort_by_key(|hit| (hit.start, hit.length, hit.kind as u8));
-    hits.dedup_by_key(|hit| (hit.kind, hit.start, hit.length));
+    hits.dedup_by(|later, kept| {
+        if later.kind == kept.kind && later.start == kept.start && later.length == kept.length {
+            kept.sensitivity = kept.sensitivity.max(later.sensitivity);
+            true
+        } else {
+            false
+        }
+    });
     hits
 }
 
