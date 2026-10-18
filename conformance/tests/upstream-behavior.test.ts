@@ -86,6 +86,12 @@ describe("慢响应不会被提前掐断", () => {
     const elapsed = Date.now() - start;
     expect(res.status).toBe(200);
     expect(elapsed).toBeGreaterThanOrEqual(750);
+    const request = upstream.requests().filter((entry) => entry.path === "/v1/chat/completions").at(-1);
+    expect(request).toBeDefined();
+    const body: unknown = JSON.parse(request?.bodyText ?? "null");
+    expect(body).toMatchObject({
+      model: process.env.IDORIS_CONFORMANCE_IMPLEMENTATION === "rust" ? "fake-model-1" : "idoris/daily",
+    });
   });
 });
 

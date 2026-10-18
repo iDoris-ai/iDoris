@@ -24,6 +24,9 @@ fn events(event_log: &EventLogStore, response: &Response) -> Vec<EventLogEvent> 
     event_log
         .events_for_record(Some(budget::PERSONAL_TENANT_ID), record_id)
         .unwrap()
+        .into_iter()
+        .filter(|row| row.event.event_type != EventType::AuditFinalized)
+        .collect()
 }
 
 fn completed_count(events: &[EventLogEvent]) -> usize {
@@ -60,6 +63,12 @@ async fn streaming_non_2xx_records_completed_failure() {
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     let chain = events(&event_log, &response);
     assert_eq!(completed_count(&chain), 1);
+    for key in ["tokens_in", "tokens_out", "token_estimator"] {
+        assert!(
+            !chain.last().unwrap().event.metadata.contains_key(key),
+            "unexpected {key}"
+        );
+    }
     assert_eq!(
         chain.last().unwrap().event.metadata.get("status"),
         Some(&json!("failure"))

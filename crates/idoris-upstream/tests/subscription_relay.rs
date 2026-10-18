@@ -41,6 +41,7 @@ impl FakeBin {
 
 fn request(model: &str) -> ChatRequest {
     ChatRequest {
+        native: None,
         model: model.into(),
         messages: vec![ChatMessage {
             role: "user".into(),

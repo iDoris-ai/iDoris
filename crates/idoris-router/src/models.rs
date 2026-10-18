@@ -49,6 +49,31 @@ pub enum ModelsError {
 pub(crate) enum HttpModelObservation {
     Observed(Vec<ModelEntry>),
     Unavailable,
+    /// Kill switch engaged and the card is not trusted-local. No probe was sent.
+    Suppressed,
+}
+
+enum OneList {
+    Entries(Vec<ModelEntry>),
+    Unavailable,
+    Suppressed,
+}
+
+/// Trusted-local is the same three-part gate the router uses for `local_only`:
+/// effective loopback, `local_only` privacy, and egress limited to none/loopback.
+fn is_trusted_local(card: &ComponentCard) -> bool {
+    idoris_policy::privacy::is_local_capable(&idoris_policy::Card {
+        component: card.clone(),
+        roles: Vec::new(),
+        experiment: false,
+        min_ram_gb: 0.0,
+        estimated_cost_minor: None,
+        admission_status: idoris_policy::AdmissionStatus::Ready,
+    })
+}
+
+fn suppress_untrusted_remote(card: &ComponentCard, remote_kill_switch: bool) -> bool {
+    remote_kill_switch && !is_trusted_local(card)
 }
 
 fn auth_failure(card: &ComponentCard, field: &str, value: Value) -> ModelsError {
@@ -125,14 +150,18 @@ async fn list_one(
     client: &reqwest::Client,
     card: &ComponentCard,
     api_key: Option<&OsStr>,
-) -> Result<Option<Vec<ModelEntry>>, ModelsError> {
+    remote_kill_switch: bool,
+) -> Result<OneList, ModelsError> {
+    if suppress_untrusted_remote(card, remote_kill_switch) {
+        return Ok(OneList::Suppressed);
+    }
     let Some(body) = fetch_models_body(client, card, api_key).await? else {
-        return Ok(None);
+        return Ok(OneList::Unavailable);
     };
     let Some(items) = body.get("data").and_then(|v| v.as_array()) else {
-        return Ok(None);
+        return Ok(OneList::Unavailable);
     };
-    Ok(Some(
+    Ok(OneList::Entries(
         items
             .iter()
             .filter_map(|m| m.get("id").and_then(|v| v.as_str()))
@@ -148,7 +177,11 @@ async fn list_one(
 pub(crate) async fn observe_http_models(
     client: &reqwest::Client,
     card: &ComponentCard,
+    remote_kill_switch: bool,
 ) -> Result<HttpModelObservation, ModelsError> {
+    if suppress_untrusted_remote(card, remote_kill_switch) {
+        return Ok(HttpModelObservation::Suppressed);
+    }
     let api_key = std::env::var_os(idoris_upstream::omlx::OMLX_API_KEY_ENV);
     let Some(body) = fetch_models_body(client, card, api_key.as_deref()).await? else {
         return Ok(HttpModelObservation::Unavailable);
@@ -178,6 +211,7 @@ pub async fn list_models(
     client: &reqwest::Client,
     cards: &[ComponentCard],
     health: &HealthTracker,
+    remote_kill_switch: bool,
 ) -> Result<ModelsResponse, ModelsError> {
     let api_key = std::env::var_os(idoris_upstream::omlx::OMLX_API_KEY_ENV);
     let mut data = Vec::new();
@@ -193,12 +227,13 @@ pub async fn list_models(
         if !is_loopback_omlx(card) && health.is_cooling_down(id, Instant::now()) {
             continue;
         }
-        match list_one(client, card, api_key.as_deref()).await? {
-            Some(entries) => {
+        match list_one(client, card, api_key.as_deref(), remote_kill_switch).await? {
+            OneList::Entries(entries) => {
                 health.record(id, true, Instant::now());
                 data.extend(entries);
             }
-            None => health.record(id, false, Instant::now()),
+            OneList::Unavailable => health.record(id, false, Instant::now()),
+            OneList::Suppressed => {}
         }
     }
     Ok(ModelsResponse {
@@ -212,8 +247,9 @@ pub async fn list_models_with_subscriptions(
     cards: &[ComponentCard],
     health: &HealthTracker,
     subscriptions: &SubscriptionRuntimeRegistry,
+    remote_kill_switch: bool,
 ) -> Result<ModelsResponse, ModelsError> {
-    let mut response = list_models(client, cards, health).await?;
+    let mut response = list_models(client, cards, health, remote_kill_switch).await?;
     response.data.extend(
         subscriptions
             .discovery()
@@ -279,7 +315,7 @@ mod tests {
             .await;
         let client = reqwest::Client::new();
         let cards = vec![card("omlx", &server.uri(), Form::HttpService)];
-        let resp = list_models(&client, &cards, &HealthTracker::default())
+        let resp = list_models(&client, &cards, &HealthTracker::default(), false)
             .await
             .unwrap();
         assert_eq!(resp.object, "list");
@@ -306,6 +342,7 @@ mod tests {
             &reqwest::Client::new(),
             &[card("plain", &server.uri(), Form::HttpService)],
             &HealthTracker::default(),
+            false,
         )
         .await
         .unwrap();
@@ -332,7 +369,7 @@ mod tests {
             let cards = vec![card("omlx", &server.uri(), Form::HttpService)];
             let health = HealthTracker::default();
             for _ in 0..4 {
-                let resp = list_models(&client, &cards, &health).await.unwrap();
+                let resp = list_models(&client, &cards, &health, false).await.unwrap();
                 assert!(resp.data.is_empty());
             }
             assert_eq!(server.received_requests().await.unwrap().len(), 3);
@@ -352,7 +389,7 @@ mod tests {
         let health = HealthTracker::default();
         for _ in 0..4 {
             health.record("omlx", false, Instant::now());
-            let resp = list_models(&client, &cards, &health).await.unwrap();
+            let resp = list_models(&client, &cards, &health, false).await.unwrap();
             assert!(resp.data.is_empty());
         }
         assert_eq!(server.received_requests().await.unwrap().len(), 4);
@@ -378,7 +415,7 @@ mod tests {
         assert!(health.is_cooling_down("omlx", now));
 
         assert!(matches!(
-            list_models(&client, &[omlx], &health).await,
+            list_models(&client, &[omlx], &health, false).await,
             Err(ModelsError::UpstreamAuthenticationFailed { .. })
         ));
         server.verify().await;
@@ -388,7 +425,7 @@ mod tests {
     async fn a_non_http_service_card_is_skipped_without_any_network_call() {
         let client = reqwest::Client::new();
         let cards = vec![card("subscription", "spawn://x", Form::SpawnCli)];
-        let resp = list_models(&client, &cards, &HealthTracker::default())
+        let resp = list_models(&client, &cards, &HealthTracker::default(), false)
             .await
             .unwrap();
         assert!(resp.data.is_empty());

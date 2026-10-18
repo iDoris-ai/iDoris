@@ -59,7 +59,7 @@ fn recommendation_contains_budget_resident_temp_blocked_warnings_and_tradeoff_in
         catalog: vec![model("resident", 2.0, 1.0), model("blocked", 9.0, 64.0)],
         excluded: None,
     };
-    let result = recommend(&hardware(), &catalog, None, None).unwrap();
+    let result = recommend(&hardware(), &catalog, None, None, None).unwrap();
     assert_eq!(result.resident.as_ref().unwrap().id, "resident");
     assert_eq!(result.resident_label.as_deref(), Some("resident@q"));
     assert_eq!(result.blocked.len(), 1);
@@ -84,6 +84,7 @@ fn explicit_override_is_reflected_without_mutating_process_environment() {
         &catalog,
         Some(&PartialPolicy::default()),
         Some("forced"),
+        None,
     )
     .unwrap();
     assert_eq!(result.resident.as_ref().unwrap().id, "forced");
@@ -121,7 +122,7 @@ catalog:
 "#,
     )
     .unwrap();
-    let result = recommend_from_file(&path, &hardware(), None, None).unwrap();
+    let result = recommend_from_file(&path, &hardware(), None, None, None).unwrap();
     fs::remove_file(&path).unwrap();
     assert_eq!(result.resident.as_ref().unwrap().id, "demo");
 }
@@ -133,7 +134,7 @@ fn fixed_output_precision_is_visible_at_two_and_four_decimals() {
         catalog: vec![model("resident", 0.123456, 1.0)],
         excluded: None,
     };
-    let result = recommend(&hardware(), &catalog, None, None).unwrap();
+    let result = recommend(&hardware(), &catalog, None, None, None).unwrap();
     assert!(result.tradeoff.contains("能力×质量=0.1235"));
     assert!(result.tradeoff.contains("usable 15.84GB"));
 }

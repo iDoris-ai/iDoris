@@ -65,6 +65,7 @@ cat
     let response = relay
         .chat(
             ChatRequest {
+                native: None,
                 model: "claude-subscription".into(),
                 messages: vec![ChatMessage {
                     role: "user".into(),
