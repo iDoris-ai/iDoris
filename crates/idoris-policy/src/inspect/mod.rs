@@ -11,8 +11,21 @@
 //!   [`InspectCtx`]，由接线层负责把它传进来（接线不在本切片内）。
 //!
 //! 扫描跑在 UTF-16 code unit 上，命中位置就是契约要求的 span 单位
-//! （`idoris_contracts::inspect` 模块文档）；扫描前的逃逸归一化只删字符、
-//! 不增字符，命中再按 `normalize` 的映射表回到原文坐标。
+//! （`idoris_contracts::inspect` 模块文档）。逃逸归一化只删或折叠字符、
+//! 不增字符。
+//!
+//! 一共扫**三个视图**，各自把命中映射回原文坐标后取并集：
+//!
+//! 1. **原文**（`normalize::identity`）：不折叠、不删除。这是 base 的覆盖，
+//!    保证「原文能抓到的，归一化后绝不放行」。折叠本身也会粘合（全角字母
+//!    数字、横线变体贴在实体边上），只有这一路不受影响。
+//! 2. **折叠并保留**（`normalize::fold_keeping_ignorables`）：可忽略字符留在
+//!    原地当边界，所以「可忽略字符 + 全角实体」这种形状只有它能命中。
+//! 3. **折叠并删除**（`normalize::normalize`）：实体内部的隐形插入被去掉，
+//!    所以「零宽字符夹在实体中间」只有它能命中。
+//!
+//! 三路缺一不可：`tests::union_is_never_looser_than_any_single_view` 会在
+//! 任意一路被删掉时变红。
 
 mod decode;
 mod l0;
@@ -77,11 +90,7 @@ pub fn inspect(input: &str, ctx: &InspectCtx) -> InspectResponse {
         };
     }
     let units: Vec<u16> = input.encode_utf16().collect();
-    let normalized = normalize::normalize(&units);
-    let mut hits = l0::scan(&normalized.units);
-    for hit in &mut hits {
-        (hit.start, hit.length) = normalized.original_span(hit.start, hit.length);
-    }
+    let hits = scan_all_views(&units, l0::scan);
     let sensitivity = hits
         .iter()
         .map(|hit| hit.sensitivity)
@@ -103,6 +112,65 @@ pub fn inspect(input: &str, ctx: &InspectCtx) -> InspectResponse {
         findings,
         action,
     }
+}
+
+/// Share the exact normalization/HKID policy between plaintext and decoded
+/// content. The decoder passes scan_plain to retain its one-layer bound.
+fn scan_all_views(units: &[u16], scan: fn(&[u16]) -> Vec<Hit>) -> Vec<Hit> {
+    let mut hits = scan_view(&normalize::identity(units), scan);
+    for view in [
+        normalize::fold_keeping_ignorables(units),
+        normalize::normalize(units),
+    ] {
+        hits.extend(drop_folded_malformed_hkid(scan_view(&view, scan), units));
+    }
+    hits.sort_by_key(|hit| {
+        (
+            hit.start,
+            hit.length,
+            hit.kind as u8,
+            std::cmp::Reverse(hit.sensitivity as u8),
+        )
+    });
+    hits.dedup_by_key(|hit| (hit.kind, hit.start, hit.length));
+    hits
+}
+
+fn scan_view(normalized: &normalize::Normalized, scan: fn(&[u16]) -> Vec<Hit>) -> Vec<Hit> {
+    let mut hits = scan(&normalized.units);
+    for hit in &mut hits {
+        (hit.start, hit.length) = normalized.original_span(hit.start, hit.length);
+    }
+    hits
+}
+
+/// Folded views make some malformed HKID spellings look well formed: fullwidth
+/// parentheses and U+3000 fold to `()` and a space, which is exactly the shape the
+/// HKID rule accepts. Those spellings are not valid HKIDs, so a folded view must
+/// not report them.
+///
+/// The drop is judged on the **original** text the hit covers, and only for
+/// `HkIdentityCard` hits from a folded view: the raw view is exactly `base`, and
+/// U+3000 folding is load-bearing for bank cards (`6222\u{3000}0212...`), so
+/// neither the raw view nor the folding table may change.
+fn drop_folded_malformed_hkid(hits: Vec<Hit>, original: &[u16]) -> Vec<Hit> {
+    hits.into_iter()
+        .filter(|hit| {
+            hit.kind != FindingKind::HkIdentityCard
+                || !malformed_hkid_spelling(&original[hit.start..hit.start + hit.length])
+        })
+        .collect()
+}
+
+/// True when the original spelling is not a valid HKID: it contains an ideographic
+/// space, or its parenthesis types do not pair (a fullwidth opener must be closed
+/// by a fullwidth closer).
+fn malformed_hkid_spelling(span: &[u16]) -> bool {
+    let opens_full = span.iter().filter(|&&u| u == 0xFF08).count();
+    let opens_ascii = span.iter().filter(|&&u| u == u16::from(b'(')).count();
+    let closes_full = span.iter().filter(|&&u| u == 0xFF09).count();
+    let closes_ascii = span.iter().filter(|&&u| u == u16::from(b')')).count();
+    span.contains(&0x3000) || opens_full != closes_full || opens_ascii != closes_ascii
 }
 
 /// UTF-16 长度不会超过 UTF-8 字节数，所以字节数没超就一定没超，省掉一次计数。

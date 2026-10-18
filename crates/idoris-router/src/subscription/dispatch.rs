@@ -61,6 +61,7 @@ pub async fn dispatch_selected(
         .service()
         .chat(
             ChatRequest {
+                native: None,
                 model: handle.model_id().to_string(),
                 messages,
             },

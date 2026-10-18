@@ -148,7 +148,7 @@ fn three_timezone_child_processes_return_fixed_monthly_answers() {
     ];
     for (timezone, expected_from, expected_to) in cases {
         let output = Command::new(&executable)
-            .args(["--exact", "timezone_child_probe", "--nocapture"])
+            .args(["--exact", "timezone_child_probe", "--nocapture", "--quiet"])
             .env("IDORIS_QUERY_ACCEPTANCE_CHILD_TZ", timezone)
             .output()
             .unwrap();

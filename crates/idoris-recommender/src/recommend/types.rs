@@ -72,6 +72,8 @@ pub const HEADROOM_GB: f64 = 1.0;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct BudgetBreakdown {
+    /// Original external allocation; `None` selects legacy TS admission semantics.
+    pub allocated_budget_bytes: Option<u64>,
     pub reserve_gb: f64,
     pub usable_gb: f64,
     pub temp_reserve_gb: f64,

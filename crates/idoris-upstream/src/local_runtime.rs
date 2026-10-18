@@ -21,6 +21,7 @@ pub struct LocalRuntimeLaunch {
     executable: PathBuf,
     model_path: PathBuf,
     port: u16,
+    model_alias: Option<String>,
 }
 
 impl LocalRuntimeLaunch {
@@ -56,6 +57,7 @@ impl LocalRuntimeLaunch {
             executable,
             model_path,
             port,
+            model_alias: None,
         })
     }
 
@@ -75,6 +77,13 @@ impl LocalRuntimeLaunch {
         self.port
     }
 
+    pub(crate) fn with_model_alias(mut self, model_id: &str) -> Self {
+        if self.kind == LocalRuntimeKind::LlamaCpp {
+            self.model_alias = Some(model_id.to_owned());
+        }
+        self
+    }
+
     /// Exact argv passed directly to `Command`; no shell is involved.
     pub fn args(&self) -> Vec<OsString> {
         let port = OsString::from(self.port.to_string());
@@ -89,14 +98,14 @@ impl LocalRuntimeLaunch {
                 "--port".into(),
                 port,
             ],
-            LocalRuntimeKind::LlamaCpp => vec![
-                "--model".into(),
-                self.model_path.as_os_str().to_owned(),
-                "--host".into(),
-                "127.0.0.1".into(),
-                "--port".into(),
-                port,
-            ],
+            LocalRuntimeKind::LlamaCpp => {
+                let mut args = vec!["--model".into(), self.model_path.as_os_str().to_owned()];
+                if let Some(alias) = &self.model_alias {
+                    args.extend(["--alias".into(), alias.into()]);
+                }
+                args.extend(["--host".into(), "127.0.0.1".into(), "--port".into(), port]);
+                args
+            }
         }
     }
 

@@ -7,6 +7,9 @@ use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
 use idoris_contracts::InspectResponse;
 use idoris_contracts::common::PrivacyClass;
+use idoris_contracts::inspect::{
+    FindingKind, InspectAction, InspectFinding, InspectSpan, Sensitivity,
+};
 use idoris_tenancy::virtual_key::MintedVirtualKey;
 use idoris_tenancy::virtual_key::store::{VirtualKeyScope, VirtualKeyStore};
 use rusqlite::Connection;
@@ -39,6 +42,281 @@ async fn send(app: &Router, request: Request<Body>) -> (StatusCode, String) {
 fn contract(body: &str) -> InspectResponse {
     let value: Value = serde_json::from_str(body).unwrap();
     idoris_contracts::parse::<InspectResponse>(&value).unwrap()
+}
+
+#[tokio::test]
+async fn known_l0_misses_are_never_allowed_by_authenticated_http() {
+    let (app, bearer) =
+        authenticated_app(vec![PrivacyClass::LocalOnly, PrivacyClass::Any], &["fast"]);
+    let inputs = [
+        "6222\t0212\t3456\t7894",
+        "6222.0212.3456.7894",
+        "6222/0212/3456/7894",
+        "138.1234.5678",
+        r"C:\Users\alice\.aws\credentials",
+        concat!(
+            "DJANGO_SECRET_KEY_FOR_PRODUCTION_SETTINGS=",
+            "zMCTnu5i8RRUKO7CCgpDdFZwTMKHPBZU1HmjS9jA"
+        ),
+    ];
+    let mut outcomes = Vec::new();
+    for input in inputs {
+        let body = json!({ "input": input }).to_string();
+        let (status, text) = send(
+            &app,
+            inspect_request(
+                &body,
+                &[("authorization", &bearer), ("x-idoris-privacy", "any")],
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{input}: {text}");
+        outcomes.push((input, contract(&text).action));
+    }
+    for (input, action) in &outcomes {
+        assert_ne!(*action, InspectAction::Allow, "{input}: {outcomes:?}");
+    }
+    for (input, privacy, expected) in [
+        ("6222 0212 3456 7894", "any", InspectAction::Block),
+        ("hello", "any", InspectAction::Allow),
+        ("hello", "local_only", InspectAction::Block),
+    ] {
+        let body = json!({ "input": input }).to_string();
+        let (status, text) = send(
+            &app,
+            inspect_request(
+                &body,
+                &[("authorization", &bearer), ("x-idoris-privacy", privacy)],
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{text}");
+        assert_eq!(contract(&text).action, expected);
+    }
+    for input in inputs {
+        let body = json!({ "input": input }).to_string();
+        let (status, text) = send(
+            &app,
+            inspect_request(
+                &body,
+                &[
+                    ("authorization", &bearer),
+                    ("x-idoris-privacy", "local_only"),
+                ],
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{text}");
+        assert_eq!(contract(&text).action, InspectAction::Block);
+    }
+}
+
+#[tokio::test]
+async fn grouped_resident_ids_are_blocked_with_original_spans_over_http() {
+    let (app, bearer) =
+        authenticated_app(vec![PrivacyClass::LocalOnly, PrivacyClass::Any], &["fast"]);
+    for entity in [
+        "110105.19491231.0003",
+        "110105\t19491231\t0003",
+        "110105/19491231/0003",
+        "110105.19491231.002X",
+        "110105\t19491231\t002X",
+        "110105/19491231/002X",
+        "440308.19900101.1239",
+        "440308.1990.0101.1239",
+        "830000199001011234",
+    ] {
+        let input = format!("😀 证件：{entity}。");
+        let response = authenticated_inspection(&app, &bearer, &input).await;
+        assert_http_entity(
+            &input,
+            entity,
+            &response,
+            FindingKind::CnResidentId,
+            Sensitivity::S3,
+        );
+    }
+}
+
+#[tokio::test]
+async fn neighboring_numbers_cannot_hide_entities_over_http() {
+    let (app, bearer) =
+        authenticated_app(vec![PrivacyClass::LocalOnly, PrivacyClass::Any], &["fast"]);
+    for (input, entity, kind, sensitivity) in [
+        (
+            "1203 138.1234.5678",
+            "138.1234.5678",
+            FindingKind::CnMobile,
+            Sensitivity::S2,
+        ),
+        (
+            "6222.0212.3456.7894 2028",
+            "6222.0212.3456.7894",
+            FindingKind::BankCard,
+            Sensitivity::S3,
+        ),
+        (
+            "2026.10.15 6222.0212.3456.7894",
+            "6222.0212.3456.7894",
+            FindingKind::BankCard,
+            Sensitivity::S3,
+        ),
+        (
+            "6222\t0212\t3456\t7894\t1000",
+            "6222\t0212\t3456\t7894",
+            FindingKind::BankCard,
+            Sensitivity::S3,
+        ),
+        (
+            "138.1234.5678 7 139.1234.5678",
+            "138.1234.5678",
+            FindingKind::CnMobile,
+            Sensitivity::S2,
+        ),
+        (
+            "138.1234.5678 7 139.1234.5678",
+            "139.1234.5678",
+            FindingKind::CnMobile,
+            Sensitivity::S2,
+        ),
+        (
+            "1 2 3 138.1234.5678",
+            "138.1234.5678",
+            FindingKind::CnMobile,
+            Sensitivity::S2,
+        ),
+        (
+            "1111.6222.0212.3456.7894.2222",
+            "6222.0212.3456.7894",
+            FindingKind::BankCard,
+            Sensitivity::S3,
+        ),
+        (
+            "1203 138 1234 5678",
+            "138 1234 5678",
+            FindingKind::CnMobile,
+            Sensitivity::S2,
+        ),
+        (
+            "1203 138-1234-5678",
+            "138-1234-5678",
+            FindingKind::CnMobile,
+            Sensitivity::S2,
+        ),
+    ] {
+        let input = format!("🚗😀 {input}。");
+        let response = authenticated_inspection(&app, &bearer, &input).await;
+        assert_http_entity(&input, entity, &response, kind, sensitivity);
+    }
+}
+
+#[tokio::test]
+async fn gate_one_short_neighbors_preserve_action_sensitivity_and_span() {
+    let (app, bearer) =
+        authenticated_app(vec![PrivacyClass::LocalOnly, PrivacyClass::Any], &["fast"]);
+    for (input, kind, sensitivity, start, length) in [
+        (
+            "138-1234-5678 1",
+            FindingKind::CnMobile,
+            Sensitivity::S2,
+            0,
+            13,
+        ),
+        (
+            "1 138-1234-5678",
+            FindingKind::CnMobile,
+            Sensitivity::S2,
+            2,
+            13,
+        ),
+        (
+            "6222 0212 3456 7894 1",
+            FindingKind::BankCard,
+            Sensitivity::S3,
+            0,
+            19,
+        ),
+        (
+            "12 6222 0212 3456 7894",
+            FindingKind::BankCard,
+            Sensitivity::S3,
+            3,
+            19,
+        ),
+    ] {
+        let response = authenticated_inspection(&app, &bearer, input).await;
+        assert_eq!(response.action, InspectAction::Block, "{input}");
+        assert_eq!(response.sensitivity, sensitivity, "{input}");
+        assert_eq!(
+            response.findings,
+            [InspectFinding {
+                kind,
+                span: Some(InspectSpan { start, length }),
+            }],
+            "{input}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn unknown_capability_is_rejected_without_echoing_header_content() {
+    let (app, bearer) =
+        authenticated_app(vec![PrivacyClass::LocalOnly, PrivacyClass::Any], &["fast"]);
+    let (status, text) = send(
+        &app,
+        inspect_request(
+            r#"{"input":"hello"}"#,
+            &[
+                ("authorization", &bearer),
+                ("x-idoris-privacy", "any"),
+                ("x-idoris-capabilities", "SENTINEL_SECRET_42"),
+            ],
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(!text.contains("SENTINEL_SECRET_42"), "{text}");
+}
+
+async fn authenticated_inspection(app: &Router, bearer: &str, input: &str) -> InspectResponse {
+    let body = json!({ "input": input }).to_string();
+    let (status, text) = send(
+        app,
+        inspect_request(
+            &body,
+            &[("authorization", bearer), ("x-idoris-privacy", "any")],
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{input}: {text}");
+    contract(&text)
+}
+
+fn assert_http_entity(
+    input: &str,
+    entity: &str,
+    response: &InspectResponse,
+    kind: FindingKind,
+    sensitivity: Sensitivity,
+) {
+    assert_eq!(
+        response.action,
+        InspectAction::Block,
+        "{input}: {response:?}"
+    );
+    assert_eq!(response.sensitivity, sensitivity, "{input}: {response:?}");
+    let start = input[..input.find(entity).unwrap()].encode_utf16().count() as u64;
+    let expected = InspectFinding {
+        kind,
+        span: Some(InspectSpan {
+            start,
+            length: entity.encode_utf16().count() as u64,
+        }),
+    };
+    assert!(
+        response.findings.contains(&expected),
+        "{input}: {response:?}"
+    );
 }
 
 #[tokio::test]
@@ -128,15 +406,17 @@ async fn invalid_privacy_and_missing_tenant_are_profile_errors() {
         deploy_mode: idoris_contracts::DeployMode::Tenant,
         ..AppState::default()
     });
-    let (status, text) = send(&tenant_app, inspect_request(&body, &[])).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert!(text.contains("tenant_missing"), "{text}");
+    // Tenant mode without any authenticator is default-deny on main: both the
+    // missing-tenant and the forged-tenant-header cases are rejected before any
+    // profile or inspection work.
+    let (status, _) = send(&tenant_app, inspect_request(&body, &[])).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
     let (status, _) = send(
         &tenant_app,
         inspect_request(&body, &[("x-idoris-tenant", "acme")]),
     )
     .await;
-    assert_eq!(status, StatusCode::OK);
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
 
 fn authenticated_app(allowed_privacy: Vec<PrivacyClass>, roles: &[&str]) -> (Router, String) {
@@ -146,6 +426,8 @@ fn authenticated_app(allowed_privacy: Vec<PrivacyClass>, roles: &[&str]) -> (Rou
     ));
     let scope = VirtualKeyScope {
         owner: "agent24-instance".into(),
+        // Legacy personal key: main's tenant authority field stays unbound here.
+        tenant_id: None,
         allowed_privacy,
         allowed_roles: roles.iter().map(|role| (*role).to_string()).collect(),
         budget_ref: None,
