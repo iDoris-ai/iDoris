@@ -36,6 +36,7 @@ SLACK_API = "https://slack.com/api/"
 stop = threading.Event()
 current_sock: dict[str, socket.socket | None] = {"sock": None}
 current_trigger: dict[str, subprocess.Popen | None] = {"proc": None}
+trigger_lock = threading.Lock()
 
 
 class Disconnect(RuntimeError):
@@ -374,14 +375,17 @@ def acquire_lock(directory: Path):
 
 
 def run_trigger(path: str, record: dict, timeout: float) -> None:
-    proc = subprocess.Popen(
-        [path],
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        start_new_session=True,
-    )
-    current_trigger["proc"] = proc
+    with trigger_lock:
+        if stop.is_set():
+            return
+        proc = subprocess.Popen(
+            [path],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+        current_trigger["proc"] = proc
     payload = json.dumps(record, ensure_ascii=False).encode("utf-8")
     try:
         _out, err = proc.communicate(payload, timeout=timeout)
@@ -390,16 +394,17 @@ def run_trigger(path: str, record: dict, timeout: float) -> None:
         log(f"触发超时，已终止：{path}")
         return
     finally:
-        if current_trigger["proc"] is proc:
-            current_trigger["proc"] = None
+        with trigger_lock:
+            if current_trigger["proc"] is proc:
+                current_trigger["proc"] = None
     if proc.returncode != 0 and not stop.is_set():
         detail = redact(err.decode("utf-8", errors="replace").strip().replace("\n", " "))
         log(f"触发退出 {proc.returncode}：{detail}")
 
 
 def signal_group(proc: subprocess.Popen, sig: int) -> None:
-    if proc.poll() is not None:
-        return
+    # The leader can exit while a descendant still holds the pipes.
+    # Signal the process group anyway; do not treat poll() as "the group is gone".
     try:
         os.killpg(proc.pid, sig)
     except ProcessLookupError:
@@ -407,43 +412,45 @@ def signal_group(proc: subprocess.Popen, sig: int) -> None:
 
 
 def reap_trigger(proc: subprocess.Popen) -> None:
-    if proc.poll() is not None:
-        return
     signal_group(proc, signal.SIGTERM)
     try:
         proc.communicate(timeout=2)
         return
     except subprocess.TimeoutExpired:
         pass
-    if proc.poll() is None:
-        signal_group(proc, signal.SIGKILL)
-        proc.communicate()
+    signal_group(proc, signal.SIGKILL)
+    proc.communicate()
 
 
 def stop_trigger_worker(worker: threading.Thread | None, timeout: float) -> None:
-    """Stop starting triggers, then terminate and reap the current child.
+    """Stop new triggers, then signal and reap the current process group.
 
-    The worker thread owns communicate(). This function only signals the child,
-    then joins that thread so the pipes are reaped once.
+    run_trigger holds trigger_lock from the stop check through Popen, so this
+    cannot observe "not started" after a start has already been allowed.
+    The worker thread owns communicate(). This function only signals, then joins.
     """
-    proc = current_trigger["proc"]
+    stop.set()
+    with trigger_lock:
+        proc = current_trigger["proc"]
     if proc is not None:
         try:
             signal_group(proc, signal.SIGTERM)
         except OSError as exc:
             log(f"退出时终止触发进程失败：{safe_error(exc)}")
+    grace = min(max(timeout, 0.2), 2)
     if worker is not None:
-        worker.join(timeout=max(timeout, 0) + 3)
-    proc = current_trigger["proc"]
-    if proc is not None and proc.poll() is None:
+        worker.join(timeout=grace)
+    with trigger_lock:
+        proc = current_trigger["proc"]
+    if worker is not None and worker.is_alive() and proc is not None:
         try:
             signal_group(proc, signal.SIGKILL)
         except OSError as exc:
             log(f"退出时强制结束触发进程失败：{safe_error(exc)}")
-        if worker is not None and worker.is_alive():
-            worker.join(timeout=3)
-    proc = current_trigger["proc"]
-    if proc is not None and proc.poll() is None and (worker is None or not worker.is_alive()):
+        worker.join(timeout=3)
+    with trigger_lock:
+        proc = current_trigger["proc"]
+    if proc is not None and (worker is None or not worker.is_alive()):
         try:
             reap_trigger(proc)
         except OSError as exc:
@@ -472,8 +479,8 @@ def expected_accept(key: str) -> str:
     return base64.b64encode(digest).decode("ascii")
 
 
-def encode_frame(opcode: int, payload: bytes, *, mask: bool) -> bytes:
-    first = 0x80 | (opcode & 0x0F)
+def encode_frame(opcode: int, payload: bytes, *, mask: bool, fin: bool = True) -> bytes:
+    first = (0x80 if fin else 0) | (opcode & 0x0F)
     length = len(payload)
     mask_bit = 0x80 if mask else 0
     if length < 126:
@@ -548,6 +555,8 @@ class WebSocket:
                 parts = [payload]
             else:
                 raise RuntimeError(f"不支持的帧 {opcode}")
+            if sum(len(part) for part in parts) > MAX_FRAME:
+                raise RuntimeError("消息太大")
             if fin:
                 return b"".join(parts).decode("utf-8")
 
@@ -723,34 +732,37 @@ def main(argv: list[str]) -> int:
     signal.signal(signal.SIGINT, handle_signal)
     events: queue.Queue | None = None
     worker = None
-    if config.trigger:
-        events = queue.Queue(maxsize=20)
-        worker = threading.Thread(target=trigger_worker, args=(events, config), daemon=True)
-        worker.start()
-    seen = Seen()
-    health = {"hello": False}
-    delay = 1
-    log(f"监听进程启动。记录目录 {config.spool_dir}。不调用模型，不发 Slack。")
-    while not stop.is_set():
-        health["hello"] = False
-        try:
-            policy = resolve_policy(env, config)
-            url = open_connection(env["SLACK_APP_TOKEN"])
-            write_status(config.spool_dir, last_connect_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), last_error="")
-            run_socket(url, policy, seen, config, events, health)
-            delay = 1
-        except Disconnect as exc:
-            log(f"Slack 要求重连：{safe_error(exc)}")
-            write_status(config.spool_dir, last_error=safe_error(exc))
-            delay = 1 if health["hello"] else min(delay * 2, 60)
-        except Exception as exc:
-            log(f"连接中断：{safe_error(exc)}")
-            write_status(config.spool_dir, last_error=safe_error(exc))
-            delay = 1 if health["hello"] else min(delay * 2, 60)
-        if stop.is_set() or stop.wait(delay):
-            break
-    stop_trigger_worker(worker, config.trigger_timeout)
-    log("监听进程退出。")
+    try:
+        if config.trigger:
+            events = queue.Queue(maxsize=20)
+            worker = threading.Thread(target=trigger_worker, args=(events, config), daemon=True)
+            worker.start()
+        seen = Seen()
+        health = {"hello": False}
+        delay = 1
+        log(f"监听进程启动。记录目录 {config.spool_dir}。不调用模型，不发 Slack。")
+        while not stop.is_set():
+            health["hello"] = False
+            try:
+                policy = resolve_policy(env, config)
+                url = open_connection(env["SLACK_APP_TOKEN"])
+                write_status(config.spool_dir, last_connect_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), last_error="")
+                run_socket(url, policy, seen, config, events, health)
+                delay = 1
+            except Disconnect as exc:
+                log(f"Slack 要求重连：{safe_error(exc)}")
+                write_status(config.spool_dir, last_error=safe_error(exc))
+                delay = 1 if health["hello"] else min(delay * 2, 60)
+            except Exception as exc:
+                log(f"连接中断：{safe_error(exc)}")
+                write_status(config.spool_dir, last_error=safe_error(exc))
+                delay = 1 if health["hello"] else min(delay * 2, 60)
+            if stop.is_set() or stop.wait(delay):
+                break
+    finally:
+        stop.set()
+        stop_trigger_worker(worker, config.trigger_timeout)
+        log("监听进程退出。")
     return 0
 
 

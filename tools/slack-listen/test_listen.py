@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import os
 import queue
+import signal
 import socket
 import tempfile
 import threading
@@ -15,6 +16,16 @@ from pathlib import Path
 from unittest import mock
 
 import listen
+
+
+def descendant_code(pidfile: Path) -> str:
+    path = str(pidfile)
+    return (
+        "import os, signal, time\n"
+        "signal.signal(signal.SIGHUP, signal.SIG_IGN)\n"
+        f"open({path!r}, 'w').write(str(os.getpid()))\n"
+        "time.sleep(30)\n"
+    )
 
 
 def policy(**overrides) -> listen.Policy:
@@ -188,6 +199,7 @@ class SpoolTest(unittest.TestCase):
                 {"channel": "C1", "user": "UOTHER", "text": "你好", "ts": "1"},
             )
             path = directory / "events.jsonl"
+            self.assertEqual(os.stat(directory).st_mode & 0o777, 0o700)
             self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
             saved = json.loads(path.read_text(encoding="utf-8"))
             self.assertEqual(saved["text"], "你好")
@@ -251,6 +263,114 @@ class ShutdownTest(unittest.TestCase):
             self.assertIsNotNone(proc.poll())
             self.assertEqual(events.qsize(), 1)
 
+    def test_timeout_kills_descendant_that_keeps_the_pipes(self) -> None:
+        listen.stop.clear()
+        listen.current_trigger["proc"] = None
+        with tempfile.TemporaryDirectory() as tmp:
+            pidfile = Path(tmp) / "grand.pid"
+            script = Path(tmp) / "spawn.py"
+            script.write_text(
+                "\n".join(
+                    [
+                        "#!/usr/bin/env python3",
+                        "import subprocess, sys",
+                        f"code = {descendant_code(pidfile)!r}",
+                        "subprocess.Popen([sys.executable, '-c', code])",
+                        "sys.exit(0)",
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            script.chmod(0o700)
+            listen.run_trigger(str(script), {"text": "hi"}, 0.8)
+            self.assertIsNone(listen.current_trigger["proc"])
+            self.assertTrue(pidfile.exists(), "grandchild did not start")
+            pid = int(pidfile.read_text(encoding="utf-8"))
+            deadline = time.time() + 2
+            while time.time() < deadline:
+                try:
+                    os.kill(pid, 0)
+                except ProcessLookupError:
+                    return
+                time.sleep(0.05)
+            os.kill(pid, signal.SIGKILL)
+            self.fail(f"grandchild {pid} was still running")
+
+    def test_stop_during_start_still_signals_the_process_group(self) -> None:
+        listen.stop.clear()
+        listen.current_trigger["proc"] = None
+        entered = threading.Event()
+        killed: list[tuple[int, int]] = []
+
+        def fake_popen(_cmd, **_kwargs):
+            entered.set()
+            time.sleep(0.2)
+            proc = mock.Mock()
+            proc.pid = 4242
+            proc.poll.return_value = None
+            proc.returncode = None
+
+            def communicate(*_args, **_kwargs):
+                deadline = time.time() + 2
+                while not killed and time.time() < deadline:
+                    time.sleep(0.01)
+                proc.returncode = -15
+                proc.poll.return_value = -15
+                return (b"", b"")
+
+            proc.communicate.side_effect = communicate
+            return proc
+
+        def fake_killpg(pid, sig):
+            killed.append((pid, sig))
+
+        worker = threading.Thread(target=listen.run_trigger, args=("/bin/echo", {"text": "x"}, 5))
+        with mock.patch.object(listen.subprocess, "Popen", side_effect=fake_popen), mock.patch.object(
+            listen.os, "killpg", side_effect=fake_killpg
+        ):
+            worker.start()
+            self.assertTrue(entered.wait(2))
+            listen.stop_trigger_worker(worker, 1)
+        worker.join(2)
+        self.assertFalse(worker.is_alive())
+        self.assertTrue(any(pid == 4242 and sig == signal.SIGTERM for pid, sig in killed))
+        self.assertIsNone(listen.current_trigger["proc"])
+
+    def test_status_write_failure_still_reaps_before_the_error_escapes(self) -> None:
+        listen.stop.clear()
+        calls = {"n": 0}
+        real_stop = listen.stop_trigger_worker
+
+        def spy(worker, timeout):
+            calls["n"] += 1
+            real_stop(worker, timeout)
+
+        env = {
+            "SLACK_APP_TOKEN": "xapp-test",
+            "SLACK_USER_TOKEN": "xoxp-test",
+            "SLACK_BOT_TOKEN": "xoxb-test",
+        }
+        prev_term = signal.getsignal(signal.SIGTERM)
+        prev_int = signal.getsignal(signal.SIGINT)
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                config = listen.Config(["pr"], [], False, "/bin/sleep", 30, Path(tmp))
+                with mock.patch.object(listen, "load_env", return_value=env), mock.patch.object(
+                    listen, "load_config", return_value=config
+                ), mock.patch.object(listen, "acquire_lock", return_value=17), mock.patch.object(
+                    listen, "resolve_policy", side_effect=OSError(28, "No space left on device")
+                ), mock.patch.object(
+                    listen, "write_status", side_effect=OSError(28, "No space left on device")
+                ), mock.patch.object(listen, "stop_trigger_worker", side_effect=spy):
+                    with self.assertRaises(OSError):
+                        listen.main([])
+        finally:
+            signal.signal(signal.SIGTERM, prev_term)
+            signal.signal(signal.SIGINT, prev_int)
+            listen.stop.clear()
+        self.assertEqual(calls["n"], 1)
+
 
 class FrameTest(unittest.TestCase):
     def test_masked_and_plain_roundtrip(self) -> None:
@@ -266,6 +386,38 @@ class FrameTest(unittest.TestCase):
         _fin, opcode, payload = listen.WebSocket(_FakeSock(sock.sent)).read_frame()
         self.assertEqual(opcode, 10)
         self.assertEqual(payload, b"xyz")
+
+    def test_fragmented_message_over_the_total_limit_is_rejected(self) -> None:
+        chunk = b"a" * 400_000
+        raw = (
+            listen.encode_frame(1, chunk, mask=False, fin=False)
+            + listen.encode_frame(0, chunk, mask=False, fin=False)
+            + listen.encode_frame(0, chunk, mask=False, fin=True)
+        )
+        ws = listen.WebSocket(_FakeSock(raw))
+        with self.assertRaises(RuntimeError):
+            ws.next_text()
+
+    def test_spool_failure_does_not_ack_or_remember(self) -> None:
+        message = {
+            "type": "events_api",
+            "envelope_id": "env",
+            "payload": {
+                "event_id": "ev",
+                "event": {"type": "message", "channel": "C1", "user": "UOTHER", "text": "hello", "ts": "1"},
+            },
+        }
+        ws = mock.Mock()
+        ws.next_text.return_value = json.dumps(message)
+        seen = listen.Seen()
+        config = listen.Config(["pr"], [], False, "", 1, Path("/unused"))
+        with mock.patch.object(listen, "open_websocket", return_value=ws), mock.patch.object(
+            listen, "append_spool", side_effect=OSError(28, "disk full")
+        ):
+            with self.assertRaises(OSError):
+                listen.run_socket("unused", policy(), seen, config, None)
+        self.assertEqual(ws.send_text.call_count, 0)
+        self.assertFalse(seen.has("C1:1"))
 
 
 class HandshakeTest(unittest.TestCase):
