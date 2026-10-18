@@ -38,6 +38,10 @@ pub struct Redaction {
     pub text: String,
     /// `(占位符, 原值)`，按占位符首次出现的顺序。
     table: Vec<(String, String)>,
+    /// Placeholder-shaped tokens the input already contained. They are the
+    /// user's own text: `restore` must pass them through untouched instead of
+    /// demanding they be in the table.
+    literals: Vec<String>,
 }
 
 impl fmt::Debug for Redaction {
@@ -76,6 +80,7 @@ pub fn redact(
     let mut out = Redaction {
         text: String::with_capacity(input.len()),
         table: Vec::new(),
+        literals: placeholder_tokens(input),
     };
     let mut counters: Vec<(String, usize)> = Vec::new();
     let mut cursor = 0;
@@ -85,7 +90,7 @@ pub fn redact(
         let placeholder = match out.table.iter().find(|(_, value)| *value == original) {
             Some((placeholder, _)) => placeholder.clone(),
             None => {
-                let n = match counters.iter_mut().find(|(k, _)| *k == kind) {
+                let mut n = match counters.iter_mut().find(|(k, _)| *k == kind) {
                     Some((_, n)) => {
                         *n += 1;
                         *n
@@ -95,7 +100,17 @@ pub fn redact(
                         1
                     }
                 };
-                let placeholder = format!("[{kind}_{n}]");
+                // U1: a literal placeholder-shaped token in the input must not be
+                // mints to the same name, or `restore` would write personal data
+                // over the user's own text. Skip any index the input already uses.
+                let placeholder = loop {
+                    let candidate = format!("[{kind}_{n}]");
+                    if input.contains(&candidate) || out.text.contains(&candidate) {
+                        n += 1;
+                        continue;
+                    }
+                    break candidate;
+                };
                 out.table.push((placeholder.clone(), original));
                 placeholder
             }
@@ -113,9 +128,48 @@ pub fn redact(
 impl Redaction {
     /// 把模型输出里的占位符换回原值（R-1/R-2 见模块文档）。
     pub fn restore(&self, output: &str) -> Result<String, RestoreError> {
+        // U3 / R-1: §1.4 asks for a set comparison - refuse when the count or type
+        // of placeholders does not match. Every minted placeholder must appear in
+        // the model output, and nothing placeholder-shaped outside the table may
+        // survive (a swallowed, lowercased or de-bracketed placeholder is a
+        // mangled one, not a clean pass-through).
+        // `replace` first so an unknown placeholder is reported as Unknown, not as
+        // a missing one; only a text whose tokens are all accounted for is then
+        // judged on completeness.
         let restored = self.replace(output)?;
         self.reject_mangled(&restored)?;
+        for (placeholder, _) in &self.table {
+            if !output.contains(placeholder.as_str()) {
+                return Err(RestoreError::MangledPlaceholder);
+            }
+        }
+        self.reject_extra_placeholder_shapes(output)?;
         Ok(restored)
+    }
+
+    /// Any placeholder-shaped token in the output that is not exactly a table
+    /// entry - wrong case, wrong digits, missing underscore - is a mangled
+    /// placeholder and must be refused rather than passed through.
+    fn reject_extra_placeholder_shapes(&self, output: &str) -> Result<(), RestoreError> {
+        let mut rest = output;
+        while let Some(open) = rest.find('[') {
+            let tail = &rest[open..];
+            let Some(close) = tail.find(']') else {
+                break;
+            };
+            let candidate = &tail[..=close];
+            if looks_like_placeholder_any_case(candidate)
+                && !self
+                    .table
+                    .iter()
+                    .any(|(placeholder, _)| placeholder == candidate)
+                && !self.literals.iter().any(|literal| literal == candidate)
+            {
+                return Err(RestoreError::MangledPlaceholder);
+            }
+            rest = &tail[candidate.len()..];
+        }
+        Ok(())
     }
 
     /// R-2：只认映射表里的占位符。
@@ -126,6 +180,11 @@ impl Redaction {
             restored.push_str(&rest[..open]);
             let tail = &rest[open..];
             match tail.find(']').map(|close| &tail[..=close]) {
+                Some(candidate) if self.literals.iter().any(|literal| literal == candidate) => {
+                    // The user's own literal, not a minted placeholder.
+                    restored.push_str(candidate);
+                    rest = &tail[candidate.len()..];
+                }
                 Some(candidate) if looks_like_placeholder(candidate) => {
                     let (_, original) = self
                         .table
@@ -189,15 +248,37 @@ pub struct StreamRestorer<'a> {
 }
 
 impl StreamRestorer<'_> {
+    /// The longest placeholder this redaction actually minted, so the stream
+    /// bounds its held prefix by the table instead of a fixed constant.
+    fn max_placeholder_len(&self) -> usize {
+        self.redaction
+            .table
+            .iter()
+            .map(|(placeholder, _)| placeholder.len())
+            .max()
+            .unwrap_or(0)
+    }
+
     pub fn push(&mut self, chunk: &str) -> Result<String, RestoreError> {
         self.pending.push_str(chunk);
-        let hold_from = self
-            .pending
-            .rfind('[')
-            .filter(|&open| {
-                !self.pending[open..].contains(']') && self.pending.len() - open <= MAX_PLACEHOLDER
-            })
-            .unwrap_or(self.pending.len());
+        let hold_from = match self.pending.rfind('[') {
+            Some(open) if !self.pending[open..].contains(']') => {
+                let held = &self.pending[open..];
+                // A held segment that is still a plausible placeholder prefix but
+                // has already outgrown any real placeholder can never become a
+                // known one; batch `restore` refuses it, so streaming must too
+                // rather than releasing the `[` as plain text.
+                if held.len() > self.max_placeholder_len() && is_placeholder_prefix(held) {
+                    return Err(RestoreError::UnknownPlaceholder);
+                }
+                if held.len() <= MAX_PLACEHOLDER {
+                    open
+                } else {
+                    self.pending.len()
+                }
+            }
+            _ => self.pending.len(),
+        };
         let ready: String = self.pending.drain(..hold_from).collect();
         self.emit(&ready)
     }
@@ -219,6 +300,50 @@ impl StreamRestorer<'_> {
         self.emitted_tail = window[keep..].to_string();
         Ok(restored)
     }
+}
+
+/// Placeholder shape ignoring case, so a lowercased or mis-cased placeholder is
+/// still recognised as a mangled placeholder rather than plain text.
+fn looks_like_placeholder_any_case(candidate: &str) -> bool {
+    if !candidate.starts_with('[') || !candidate.ends_with(']') {
+        return false;
+    }
+    let inner = &candidate[1..candidate.len() - 1];
+    inner.rsplit_once('_').is_some_and(|(kind, n)| {
+        !kind.is_empty()
+            && kind.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+            && !n.is_empty()
+            && n.bytes().all(|b| b.is_ascii_digit())
+    })
+}
+
+/// Every placeholder-shaped token already present in `text`, so the engine never
+/// mints a colliding name and `restore` can pass the user's own text through.
+fn placeholder_tokens(text: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut rest = text;
+    while let Some(open) = rest.find('[') {
+        let tail = &rest[open..];
+        let Some(close) = tail.find(']') else {
+            break;
+        };
+        let candidate = &tail[..=close];
+        if looks_like_placeholder(candidate) {
+            found.push(candidate.to_string());
+        }
+        rest = &tail[candidate.len()..];
+    }
+    found
+}
+
+/// True while the text after an unmatched `[` can still become a placeholder:
+/// uppercase letters, digits and `_` only.
+fn is_placeholder_prefix(held: &str) -> bool {
+    held.strip_prefix('[').is_some_and(|inner| {
+        inner
+            .bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+    })
 }
 
 /// `[` + 大写字母/数字/下划线 + `_` + 数字 + `]`。

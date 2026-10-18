@@ -155,3 +155,65 @@ fn streaming_restore_handles_placeholders_split_across_chunks() {
     let long = format!("[{}", "x".repeat(100));
     assert_eq!(stream.push(&long).unwrap(), long);
 }
+
+/// U1: a literal placeholder-shaped token in the input must survive the round
+/// trip untouched. Before the fix, `redact` minted the same name and `restore`
+/// wrote personal data over the user's own text.
+#[test]
+fn a_literal_placeholder_in_the_input_round_trips_byte_identically() {
+    let input = "引用 [CN_MOBILE_1]，电话 13812345678";
+    let verdict = inspect(input, &consenting());
+    let redaction = redact(input, &verdict, &consenting()).unwrap();
+    assert!(
+        !redaction.text.contains("[CN_MOBILE_1]，电话 [CN_MOBILE_1]"),
+        "the minted name collided with the literal: {}",
+        redaction.text
+    );
+    assert_eq!(redaction.restore(&redaction.text).unwrap(), input);
+}
+
+/// U2: streaming must refuse exactly what batch `restore` refuses. An unmatched
+/// `[` that has outgrown any real placeholder can never become a known one.
+#[test]
+fn streaming_refuses_an_overflowed_placeholder_prefix_like_batch() {
+    let r = redacted("请联系 13812345678");
+    let overflow = format!("[PERSON_{}]", "1".repeat(65));
+    assert_eq!(
+        r.restore(&overflow).unwrap_err(),
+        RestoreError::UnknownPlaceholder
+    );
+    let mut stream = r.stream();
+    let first = &overflow[..overflow.len() - 1];
+    let second = "]";
+    match stream.push(first) {
+        Err(error) => assert_eq!(error, RestoreError::UnknownPlaceholder),
+        Ok(_) => {
+            assert_eq!(
+                stream.push(second).unwrap_err(),
+                RestoreError::UnknownPlaceholder,
+                "stream must refuse what batch restore refuses"
+            );
+        }
+    }
+}
+
+/// U3: §1.4 asks for a set comparison. A swallowed, lowercased or de-bracketed
+/// placeholder is a mangled one and must be refused.
+#[test]
+fn restore_refuses_missing_lowercased_and_debracketed_placeholders() {
+    let r = redacted("请联系 13812345678");
+    for mangled in ["电话 已省略", "电话 [cn_mobile_1]", "电话 CN_MOBILE1"] {
+        assert_eq!(
+            r.restore(mangled).unwrap_err(),
+            RestoreError::MangledPlaceholder,
+            "{mangled}"
+        );
+    }
+    // The rows that already erred must keep their verdicts.
+    for (text, expected) in [
+        ("CN_MOBILE_1", RestoreError::MangledPlaceholder),
+        ("[CN_MOBILE_01]", RestoreError::UnknownPlaceholder),
+    ] {
+        assert_eq!(r.restore(text).unwrap_err(), expected, "{text}");
+    }
+}
