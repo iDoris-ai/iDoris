@@ -5,6 +5,7 @@
 //! 被删掉的零宽字符如果夹在一个命中中间，会被包含在映射回去的 span 里——
 //! span 覆盖的是「从命中的第一个字符到最后一个字符」的原文区间。
 
+#[derive(PartialEq, Eq)]
 pub(super) struct Normalized {
     pub units: Vec<u16>,
     /// `origin[i]..origin_end[i]` is the original range the `i`-th
@@ -25,13 +26,28 @@ pub(super) fn normalize_without_letter_folding(units: &[u16]) -> Normalized {
 }
 
 /// Independent letter and escape views prevent either fold from erasing hits.
-pub(super) fn views(units: &[u16]) -> [Normalized; 4] {
-    [
-        normalize(units),
-        normalize_without_letter_folding(units),
-        normalize_with_options(units, true, false),
-        normalize_with_options(units, false, false),
-    ]
+pub(super) fn views(units: &[u16]) -> Vec<Normalized> {
+    let escaped = units
+        .windows(2)
+        .any(|pair| pair == [u16::from(b'\\'), u16::from(b'u')]);
+    let letters = escaped || units.iter().any(|&u| latin_confusable(u).is_some());
+    let mut views = vec![normalize(units)];
+    let mut add = |view: Normalized| {
+        // Equal units alone are insufficient: spans must share the same source map.
+        if !views.contains(&view) {
+            views.push(view);
+        }
+    };
+    if letters {
+        add(normalize_without_letter_folding(units));
+    }
+    if escaped {
+        add(normalize_with_options(units, true, false));
+        if letters {
+            add(normalize_with_options(units, false, false));
+        }
+    }
+    views
 }
 
 fn normalize_with_options(units: &[u16], fold_letters: bool, fold_escapes: bool) -> Normalized {

@@ -169,7 +169,14 @@ pub(super) fn scan_plain(units: &[u16]) -> Vec<Hit> {
 }
 
 fn sort_dedup(mut hits: Vec<Hit>) -> Vec<Hit> {
-    hits.sort_by_key(|hit| (hit.start, hit.length, hit.kind as u8));
+    hits.sort_by_key(|hit| {
+        (
+            hit.start,
+            hit.length,
+            hit.kind as u8,
+            std::cmp::Reverse(hit.sensitivity as u8),
+        )
+    });
     hits.dedup_by_key(|hit| (hit.kind, hit.start, hit.length));
     hits
 }

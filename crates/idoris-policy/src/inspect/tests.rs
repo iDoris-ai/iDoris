@@ -981,6 +981,62 @@ fn country_code_attached_to_first_mobile_group_is_supported() {
     assert!(kinds(&inspect(input, &open_ctx())).contains(&FindingKind::CnMobile));
 }
 
+#[test]
+fn equivalent_normalization_views_do_not_multiply_scan_work() {
+    for text in [
+        "ordinary ASCII prose",
+        "2023 1203 2024 1306",
+        "YWJjZGVmZ2hpamts",
+        "中文文本",
+        r"C:\users\name",
+    ] {
+        let units: Vec<u16> = text.encode_utf16().collect();
+        assert_eq!(super::normalize::views(&units).len(), 1, "{text}");
+    }
+    for text in [
+        r"\u13812345678",
+        r"\u11010519491231002Х",
+        r"\u11010519491231002Χ",
+        "доступаAKIA5HVJV2XAZM2TT6A8",
+    ] {
+        let units: Vec<u16> = text.encode_utf16().collect();
+        let views = super::normalize::views(&units);
+        assert!(views.len() > 1, "{text}");
+        for (i, view) in views.iter().enumerate() {
+            assert!(!views[..i].contains(view), "duplicate scan view: {text}");
+        }
+    }
+}
+
+#[test]
+fn literal_escape_prefix_and_confusable_id_suffix_are_both_preserved() {
+    for suffix in ['Х', 'Χ'] {
+        let input = format!(r"\u11010519491231002{suffix}");
+        let response = inspect(&input, &open_ctx());
+        assert_eq!(response.action, InspectAction::Block, "{response:?}");
+        assert!(kinds(&response).contains(&FindingKind::CnResidentId));
+    }
+}
+
+#[test]
+fn one_encoded_blob_retains_the_highest_id_sensitivity() {
+    for text in [
+        "110105195001010001 110105195001010004",
+        "110105195001010004 110105195001010001",
+        r"\u110105195001010001 110105195001010004",
+        r"\u110105195001010004 110105195001010001",
+    ] {
+        let encoded: String = text.bytes().map(|b| format!("%{b:02X}")).collect();
+        let response = inspect(&encoded, &open_ctx());
+        assert_eq!(
+            response.sensitivity,
+            Sensitivity::S3,
+            "{text}: {response:?}"
+        );
+        assert_eq!(response.action, InspectAction::Block, "{response:?}");
+    }
+}
+
 fn valid_id() -> impl Strategy<Value = String> {
     (0usize..34, 1950u32..2030, 1u32..13, 1u32..29, 0u32..1000).prop_map(
         |(province, year, month, day, seq)| {
