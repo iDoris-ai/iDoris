@@ -101,6 +101,12 @@ pub(super) fn scan_plain(units: &[u16]) -> Vec<Hit> {
                 if digits.len() > MAX_ENTITY_DIGITS {
                     break;
                 }
+                // Crossing a line is permitted only for complete line spans,
+                // not a suffix/prefix window through unrelated table cells.
+                let aligned = (a == 0 || gaps[a - 1]) && (b + 1 == segments.len() || gaps[b]);
+                if crossed_line_break && !aligned {
+                    continue;
+                }
                 classify(
                     &Candidate {
                         digits: &digits,

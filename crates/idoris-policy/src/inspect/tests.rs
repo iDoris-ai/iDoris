@@ -804,6 +804,28 @@ fn a_card_on_one_line_is_still_blocked_when_the_next_line_starts_with_digits() {
     assert_eq!(inspect(table, &open_ctx()).action, InspectAction::Allow);
 }
 
+#[test]
+fn cross_line_entity_windows_must_cover_complete_numeric_lines() {
+    for table in [
+        "1\t197\t4567\n6\t770\t56489",
+        "1 197 4567\n6 770 56489",
+        // Mirror boundary: a complete first line but only a prefix of the last.
+        "138\n1234 5678 2",
+        // Only a suffix of the first line, complete final line.
+        "2 138\n1234 5678",
+    ] {
+        let response = inspect(table, &open_ctx());
+        assert_eq!(
+            response.action,
+            InspectAction::Allow,
+            "{table:?}: {response:?}"
+        );
+    }
+    for input in ["138\n1234 5678", "1101011990\n0307737X"] {
+        assert!(!inspect(input, &open_ctx()).findings.is_empty(), "{input}");
+    }
+}
+
 /// Documented trade-off (reviewer G): a tab-separated 16-digit run is treated as
 /// a bank card. A real card written with tabs and a spreadsheet row are the same
 /// shape and both can be Luhn-valid, so no checksum can separate them; this layer
@@ -829,6 +851,8 @@ fn tab_separated_digit_rows_are_deliberately_treated_as_cards() {
         InspectAction::Block,
         "documented trade-off: Luhn-valid tab rows read as cards: {row:?}"
     );
+
+    assert!(kinds(&row).contains(&FindingKind::BankCard), "{row:?}");
 
     // And a row that does not pass Luhn stays public - the rule is not "any row".
     let clean = inspect("2023\t1203\t2024\t1306", &open_ctx());

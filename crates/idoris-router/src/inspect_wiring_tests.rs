@@ -254,7 +254,7 @@ async fn ordinary_numeric_table_is_not_pinned_to_local() {
     }
 }
 
-/// E (reviewer): the token-array rule must follow the embeddings `input` path,
+/// E (reviewer): the token-array rule must follow the top-level `input` subtree,
 /// not "any array of >= 8 integers anywhere". A tool schema's `enum` or a
 /// `metadata.scores` list used to pin a clean chat to local_only, which 503s
 /// remote-only callers.
@@ -278,13 +278,22 @@ async fn integer_arrays_outside_the_embeddings_input_do_not_pin_a_clean_chat() {
     }
 
     // The real token-array payload is still opaque, with no length floor:
-    for input in [json!([1, 2, 3, 4]), json!([12345, 67890, 11111])] {
+    for input in [
+        json!([1, 2, 3, 4]),
+        json!([12345, 67890, 11111]),
+        json!(["hello", [0, 1, 2, 3, 4, 5, 6, 7]]),
+        json!([[0, 1, 2, 3, 4, 5, 6, 7], []]),
+        json!([[0, 1, 2, 3, 4, 5, 6, 7], null]),
+        json!({"ids": [0,1,2,3,4,5,6,7]}),
+        json!({"wrapper": ["hello", {"ids": [7]}]}),
+    ] {
         let body = json!({"model":"embed","input":input});
         let inspection = inspect::inspect_body(&body, PrivacyClass::Any, false);
         assert_eq!(
             inspection.effective,
             PrivacyClass::LocalOnly,
-            "an embeddings token array must stay opaque: {body}"
+            "an input token array must stay opaque: {body}"
         );
+        assert!(inspection.uninspectable, "{body}");
     }
 }
