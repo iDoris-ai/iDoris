@@ -80,11 +80,25 @@ pub fn inspect(input: &str, ctx: &InspectCtx) -> InspectResponse {
         };
     }
     let units: Vec<u16> = input.encode_utf16().collect();
-    let normalized = normalize::normalize(&units);
-    let mut hits = l0::scan(&normalized.units);
-    for hit in &mut hits {
-        (hit.start, hit.length) = normalized.original_span(hit.start, hit.length);
+    let mut hits = Vec::new();
+    for view in normalize::views(&units) {
+        for mut hit in l0::scan(&view.units) {
+            (hit.start, hit.length) = view.original_span(hit.start, hit.length);
+            hits.push(hit);
+        }
     }
+    // Union in original coordinates, retaining the strongest sensitivity when
+    // both views find the same entity. Sort before dedup: no quadratic merging.
+    hits.sort_by_key(|hit| (hit.start, hit.length, hit.kind.as_str()));
+    hits.dedup_by(|next, previous| {
+        if (next.start, next.length, next.kind) == (previous.start, previous.length, previous.kind)
+        {
+            previous.sensitivity = previous.sensitivity.max(next.sensitivity);
+            true
+        } else {
+            false
+        }
+    });
     let sensitivity = hits
         .iter()
         .map(|hit| hit.sensitivity)

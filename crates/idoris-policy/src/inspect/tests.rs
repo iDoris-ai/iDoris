@@ -786,6 +786,122 @@ fn third_review_groupings_and_numeric_rows() {
     }
 }
 
+#[test]
+fn letter_folding_cannot_erase_existing_secret_findings() {
+    for (input, kind, secret) in [
+        (
+            format!("доступа{FAKE_AWS_ID}"),
+            FindingKind::ApiKey,
+            FAKE_AWS_ID.to_owned(),
+        ),
+        (
+            format!("{FAKE_RAW_SECRET}{}", "о".repeat(64)),
+            FindingKind::HighEntropySecret,
+            FAKE_RAW_SECRET.to_owned(),
+        ),
+        (
+            format!("аAa0Bb1Cc2Dd3Ee4Ff5Gg6Hh7Ii8Jj9Kk2{}", "а".repeat(64)),
+            FindingKind::HighEntropySecret,
+            "Aa0Bb1Cc2Dd3Ee4Ff5Gg6Hh7Ii8Jj9Kk2".to_owned(),
+        ),
+        // Raw-only scanning is not sufficient: the baseline must still fold fullwidth.
+        (
+            format!(
+                "доступа{}",
+                FAKE_AWS_ID
+                    .chars()
+                    .map(|c| char::from_u32(c as u32 + 0xFEE0).unwrap())
+                    .collect::<String>()
+            ),
+            FindingKind::ApiKey,
+            FAKE_AWS_ID
+                .chars()
+                .map(|c| char::from_u32(c as u32 + 0xFEE0).unwrap())
+                .collect::<String>(),
+        ),
+    ] {
+        let response = inspect(&input, &open_ctx());
+        assert_eq!(
+            response.action,
+            InspectAction::Block,
+            "{input:?}: {response:?}"
+        );
+        assert!(
+            response
+                .findings
+                .iter()
+                .any(|f| f.kind == kind && covered(&input, f) == secret),
+            "{input:?}: {response:?}"
+        );
+    }
+}
+
+#[test]
+fn normalization_views_do_not_duplicate_findings() {
+    for input in [FAKE_AWS_ID, FAKE_RAW_SECRET, "11010519491231002X"] {
+        let response = inspect(input, &open_ctx());
+        for (i, finding) in response.findings.iter().enumerate() {
+            assert!(
+                !response.findings[..i]
+                    .iter()
+                    .any(|prior| prior.kind == finding.kind && prior.span == finding.span),
+                "{response:?}"
+            );
+        }
+        let expected = super::l0::scan(
+            &super::normalize::normalize(&input.encode_utf16().collect::<Vec<_>>()).units,
+        );
+        assert_eq!(response.findings.len(), expected.len(), "{response:?}");
+    }
+}
+
+#[test]
+fn tamil_zero_obeys_the_same_numeric_boundary_as_ascii_zero() {
+    let ascii = inspect("011010519491231002X", &open_ctx());
+    let tamil = inspect("௦11010519491231002X", &open_ctx());
+    assert_eq!(ascii.action, InspectAction::Allow);
+    assert_eq!(tamil.action, ascii.action);
+    assert_eq!(tamil.findings, ascii.findings);
+}
+
+#[test]
+fn literal_unicode_prefix_does_not_swallow_following_entities() {
+    for (entity, kind) in [
+        ("110105195001010004", FindingKind::CnResidentId),
+        ("11010519491231002X", FindingKind::CnResidentId),
+        ("13812345678", FindingKind::CnMobile),
+        ("6222021234567894", FindingKind::BankCard),
+        ("6222 0212 3456 7894", FindingKind::BankCard),
+    ] {
+        let input = format!(r"\u{entity}");
+        let response = inspect(&input, &open_ctx());
+        assert!(
+            response
+                .findings
+                .iter()
+                .any(|f| f.kind == kind && covered(&input, f) == entity),
+            "{input:?}: {response:?}"
+        );
+        // report() also needs the non-escape view, without recursive decoding.
+        let encoded = input
+            .as_bytes()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
+        let decoded_response = inspect(&encoded, &open_ctx());
+        assert!(
+            kinds(&decoded_response).contains(&kind),
+            "{encoded}: {decoded_response:?}"
+        );
+    }
+}
+
+#[test]
+fn country_code_attached_to_first_mobile_group_is_supported() {
+    let input = "+86138 1234 5678";
+    assert!(kinds(&inspect(input, &open_ctx())).contains(&FindingKind::CnMobile));
+}
+
 fn valid_id() -> impl Strategy<Value = String> {
     (0usize..34, 1950u32..2030, 1u32..13, 1u32..29, 0u32..1000).prop_map(
         |(province, year, month, day, seq)| {
@@ -843,6 +959,12 @@ proptest! {
         before in "[^0-9 \\-]{0,8}",
         after in "[^0-9xX \\-]{0,8}",
     ) {
+        // The premise is non-digit *after normalization*, not merely non-ASCII
+        // digit. Tamil/fullwidth/etc. digits are real numeric neighbours.
+        for neighbour in [&before, &after] {
+            let units: Vec<u16> = neighbour.encode_utf16().collect();
+            prop_assume!(!super::normalize::normalize(&units).units.iter().any(|u| (u16::from(b'0')..=u16::from(b'9')).contains(u)));
+        }
         let input = format!("{before}{id}{after}");
         let response = inspect(&input, &open_ctx());
         let found = response
