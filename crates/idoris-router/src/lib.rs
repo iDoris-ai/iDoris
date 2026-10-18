@@ -2560,13 +2560,15 @@ fn local_model_fault(
     use idoris_backend::BackendError as E;
     match result {
         Ok(_) => Some(false),
-        // Neither of these says anything about the health of the model we just
-        // selected, so blaming it would lock out a healthy model:
-        // * `EvictionFailed` means *another* model failed to unload
-        //   (`supervisor.rs` eviction path) and the backend documents it as
-        //   transient - it is the candidate we did not choose that is stuck.
-        // * `ModelUnavailable` on the chat path comes from losing a
-        //   Stopping/Stopped race with an unload, i.e. a scheduling collision.
+        // `EvictionFailed` says nothing about the health of the model we just
+        // selected: it means *another* model failed to unload (`supervisor.rs`
+        // eviction path) and the backend documents it as transient - it is the
+        // candidate we did not choose that is stuck.
+        // `ModelUnavailable` is deliberately NOT in the ignore list: it also
+        // covers a model that is wedged in Error and will never start, so
+        // ignoring it means a permanently broken model never reaches the
+        // threshold and callers never fail over. Measured from the router: five
+        // failing requests never switched to the healthy candidate.
         // With the reopen rule in place a misclassified fault would re-lock the
         // model for a full window every time, so a healthy model hit by eviction
         // traffic every window would never serve.
@@ -2577,15 +2579,15 @@ fn local_model_fault(
             | E::AdapterPanicked { .. }
             | E::LoadUnconfirmed { .. }
             | E::LoadPostconditionFailed { .. }
-            | E::Upstream { .. },
+            | E::Upstream { .. }
+            | E::ModelUnavailable { .. },
         )) => Some(true),
-        // `Some(false)` means *success* and clears the breaker, which would turn
-        // the old over-locking into silent un-locking: an in-flight request that
-        // ends with an unload race would close a breaker another request just
-        // opened. `None` is the honest answer - not a health signal either way.
-        Err(dispatch::DispatchFailure::Backend(
-            E::ModelUnavailable { .. } | E::EvictionFailed { .. },
-        )) => None,
+        // `Some(false)` means *success* and clears the breaker (`on_success` ->
+        // `Closed{0}`), which would turn over-locking into silent un-locking: an
+        // in-flight request ending in an unload race could close a breaker
+        // another request just opened. `None` is the honest answer - not a health
+        // signal either way.
+        Err(dispatch::DispatchFailure::Backend(E::EvictionFailed { .. })) => None,
         Err(_) => None,
     }
 }
@@ -5560,12 +5562,12 @@ mod local_model_fault_tests {
             (
                 E::EvictionFailed { model_id: model() },
                 None,
-                "eviction failed",
+                "eviction failed (another model's unload)",
             ),
             (
                 E::ModelUnavailable { model_id: model() },
-                None,
-                "model unavailable",
+                Some(true),
+                "model unavailable (a wedged model must reach the threshold)",
             ),
             // A non-backend failure is not a model-health signal at all.
             (
@@ -5579,63 +5581,68 @@ mod local_model_fault_tests {
         }
     }
 
-    /// The tri-state contract must be honoured the same way `report_local_outcome`
-    /// wires it: `Some(true)` -> `on_failure`, `Some(false)` -> `on_success`
-    /// (which *clears* the breaker), `None` -> nothing applied. B1' was that the
-    /// two race outcomes reported `Some(false)`, so a request that lost an unload
-    /// race closed a breaker another request had just opened.
+    /// The tri-state contract as `report_local_outcome` wires it: `Some(true)` ->
+    /// `on_failure`, `Some(false)` -> `on_success` (which *clears* the breaker),
+    /// `None` -> nothing applied.
+    ///
+    /// Two obligations that pull in opposite directions:
+    /// * an eviction failure belongs to another model, so it must not be reported
+    ///   as success (that would clear a breaker another request just opened);
+    /// * a wedged `ModelUnavailable` model must still reach the threshold, or
+    ///   callers never fail over.
     #[test]
-    fn a_race_outcome_neither_locks_nor_unlocks_a_breaker() {
+    fn eviction_failures_neither_lock_nor_unlock_and_wedged_models_do() {
         use idoris_backend::BackendError as E;
         use idoris_policy::breaker::{Breaker, CredentialClass};
 
         let class = CredentialClass::Local;
-        let mut breaker = Breaker::new(class);
-        // Two faults lock it (Local threshold).
-        breaker.on_failure(0);
-        breaker.on_failure(0);
-        assert!(!breaker.would_admit(0), "two faults must lock");
 
-        // An in-flight request that ends in an unload race must leave it locked.
-        let race = super::local_model_fault(&Err(super::dispatch::DispatchFailure::Backend(
-            E::ModelUnavailable {
-                model_id: "m".into(),
-            },
-        )));
-        assert_eq!(race, None);
-        if let Some(failed) = race {
-            if failed {
-                breaker.on_failure(0);
-            } else {
-                breaker.on_success();
-            }
-        }
-        assert!(
-            !breaker.would_admit(0),
-            "a race outcome must not clear a locked breaker"
-        );
-
-        // Same for the eviction variant, and it must not reset the failure count
-        // of a breaker that is not yet open.
-        let mut counting = Breaker::new(class);
-        counting.on_failure(0);
+        // (1) A locked breaker must stay locked when an in-flight request ends in
+        // an eviction failure: `None` applies nothing.
+        let mut locked = Breaker::new(class);
+        locked.on_failure(0);
+        locked.on_failure(0);
+        assert!(!locked.would_admit(0), "two faults must lock");
         let eviction = super::local_model_fault(&Err(super::dispatch::DispatchFailure::Backend(
             E::EvictionFailed {
                 model_id: "m".into(),
             },
         )));
-        assert_eq!(eviction, None);
+        assert_eq!(eviction, None, "an eviction failure is not a health signal");
         if let Some(failed) = eviction {
             if failed {
-                counting.on_failure(0);
+                locked.on_failure(0);
             } else {
-                counting.on_success();
+                locked.on_success();
             }
         }
-        counting.on_failure(0);
         assert!(
-            !counting.would_admit(0),
-            "one fault, a race, then one more fault must still lock"
+            !locked.would_admit(0),
+            "an eviction failure must not clear a locked breaker"
+        );
+
+        // (2) A wedged model must reach the threshold and lock out.
+        let mut wedged = Breaker::new(class);
+        let mut applied = 0;
+        for _ in 0..8 {
+            let outcome = super::local_model_fault(&Err(
+                super::dispatch::DispatchFailure::Backend(E::ModelUnavailable {
+                    model_id: "m".into(),
+                }),
+            ));
+            if let Some(failed) = outcome {
+                applied += 1;
+                if failed {
+                    wedged.on_failure(0);
+                } else {
+                    wedged.on_success();
+                }
+            }
+        }
+        assert_eq!(applied, 8, "a wedged model must be reported as a fault");
+        assert!(
+            !wedged.would_admit(0),
+            "a model that is always unavailable must be locked out"
         );
     }
 }
