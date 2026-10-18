@@ -258,6 +258,98 @@ fn stream_chunks(r: &super::redact::Redaction, chunks: &[&str]) -> Result<String
     Ok(out)
 }
 
+pub(super) fn assert_all_partitions(r: &super::redact::Redaction, text: &str, accepted: bool) {
+    let expected = r.restore(text);
+    assert_eq!(expected.is_ok(), accepted, "batch: {text}");
+    let boundaries: Vec<_> = (0..=text.len())
+        .filter(|&at| text.is_char_boundary(at))
+        .collect();
+    for &a in &boundaries {
+        assert_eq!(
+            stream_chunks(r, &[&text[..a], &text[a..]]),
+            expected,
+            "two {a}: {text}"
+        );
+        for &b in boundaries.iter().filter(|&&b| b >= a) {
+            assert_eq!(
+                stream_chunks(r, &[&text[..a], &text[a..b], &text[b..]]),
+                expected,
+                "three {a}/{b}: {text}"
+            );
+        }
+    }
+    let chars: Vec<_> = text
+        .char_indices()
+        .map(|(at, c)| &text[at..at + c.len_utf8()])
+        .collect();
+    assert_eq!(stream_chunks(r, &chars), expected, "chars: {text}");
+}
+
+#[test]
+fn fullwidth_and_literal_boundaries_cannot_hide_mangled_twins() {
+    let r = redacted("电话 13812345678");
+    for twin in [
+        "[CN_MOBILE_１]",
+        "[ＣＮ＿ＭＯＢＩＬＥ＿１]",
+        "CN_MOBILE_１",
+        "[ＣＮ_MOBILE_1]",
+        "[CN＿MOBILE＿1]",
+        "[cn＿mobile_１]",
+        "ＣＮ＿mobile_1",
+        "[CN_MOBＩLE_1]",
+    ] {
+        assert_all_partitions(&r, &format!("[CN_MOBILE_1] {twin}"), false);
+    }
+    for (literal, twin) in [
+        ("[1]", "[CN_MOBILE_[1]]"),
+        ("[]", "[CN_MOBILE_[]1]"),
+        ("[１]", "[CN_MOBILE_[１]]"),
+        ("[MOBILE]", "[CN_[MOBILE]_1]"),
+        ("[CN] [MOBILE] [1]", "[CN][MOBILE][1]"),
+        ("[CN_MOBILE_]", "[CN_MOBILE_]1"),
+    ] {
+        let input = format!("参考 {literal} 电话 13812345678");
+        let r = redacted(&input);
+        assert_all_partitions(&r, &r.text, true);
+        assert_eq!(r.restore(&r.text).unwrap(), input);
+        assert_all_partitions(&r, &format!("[CN_MOBILE_1] {twin}"), false);
+    }
+}
+
+#[test]
+fn fullwidth_lowercase_long_and_nested_literals_round_trip() {
+    for literal in [
+        "[ＣＮ＿ＭＯＢＩＬＥ＿１]".to_owned(),
+        "[cn_mobile_1]".into(),
+        "[[ＣＮ＿ＭＯＢＩＬＥ＿１]".into(),
+        "[]".into(),
+        "[1]".into(),
+        format!("[ＰＥＲＳＯＮ＿{}]", "１".repeat(100)),
+        format!("[[cn_mobile_{}]", "1".repeat(100)),
+    ] {
+        let input = format!("参考 {literal} 电话 13812345678");
+        let r = redacted(&input);
+        assert_eq!(r.restore(&r.text).unwrap(), input);
+        assert_all_partitions(&r, &r.text, true);
+    }
+}
+
+#[test]
+fn allocator_skips_bare_normalized_name_collisions() {
+    for literal in [
+        "CN_MOBILE1",
+        "cn_mobile_1",
+        "cn mobile 1",
+        "ＣＮ＿ＭＯＢＩＬＥ＿１",
+    ] {
+        let input = format!("引用 {literal} 电话 13812345678");
+        let r = redacted(&input);
+        assert!(r.text.ends_with("[CN_MOBILE_2]"), "{}", r.text);
+        assert_all_partitions(&r, &r.text, true);
+        assert_eq!(r.restore(&r.text).unwrap(), input);
+    }
+}
+
 #[test]
 fn parser_contract_at_every_two_and_three_chunk_utf8_boundary() {
     let r = redacted("电话 13812345678");
@@ -266,6 +358,9 @@ fn parser_contract_at_every_two_and_three_chunk_utf8_boundary() {
         ("电话 [cn_mobile_1]".into(), false),
         ("电话 CN_MOBILE1".into(), false),
         ("[CN_MOBILE_1] [cn_mobile_1]".into(), false),
+        ("[CN_MOBILE_1] [person_１]".into(), false),
+        ("[CN_MOBILE_1] [ｐｅｒｓｏｎ＿１]".into(), false),
+        ("[CN_MOBILE_1] [ＣＮ＿ＭＯＢＩＬＥ＿９]".into(), false),
         ("[CN_MOBILE_1] [[cn_mobile_1]]".into(), false),
         ("[CN_MOBILE_1] [ [cn_mobile_1]".into(), false),
         ("[CN_MOBILE_1] [CN_MOBILE1]".into(), false),
@@ -291,6 +386,11 @@ fn parser_contract_at_every_two_and_three_chunk_utf8_boundary() {
     for (text, accepted) in rows {
         let expected = r.restore(&text);
         assert_eq!(expected.is_ok(), accepted, "contract: {text}");
+        let chars: Vec<_> = text
+            .char_indices()
+            .map(|(at, c)| &text[at..at + c.len_utf8()])
+            .collect();
+        assert_eq!(stream_chunks(&r, &chars), expected, "chars: {text}");
         for a in 0..=text.len() {
             if !text.is_char_boundary(a) {
                 continue;
@@ -362,26 +462,28 @@ fn empty_table_has_no_stream_only_rejections() {
 }
 
 proptest::proptest! {
-    #![proptest_config(proptest::test_runner::Config::with_cases(256))]
+    #![proptest_config(proptest::test_runner::Config::with_cases(10_000))]
     #[test]
     fn arbitrary_partitions_preserve_batch_verdict_and_output(
         pieces in proptest::collection::vec(proptest::sample::select(vec![
-            "[", "]", "_", "CN", "mobile", "1", " ", "-", "🌊", "step_2", "PERSON", "[CN_MOBILE_1]"
+            "[", "]", "_", "CN", "mobile", "1", " ", "-", "🌊", "step_2", "PERSON", "[CN_MOBILE_1]", "１", "ＣＮ", "＿", "[1]", "[]", "\u{200b}"
         ]), 0..80),
         cuts in proptest::collection::vec(proptest::bool::ANY, 0..200),
     ) {
-        let r = redacted("13812345678");
-        let text = format!("[CN_MOBILE_1] {}", pieces.concat());
-        let expected = r.restore(&text);
-        let mut chunks = Vec::new();
-        let mut start = 0;
-        for (n, (at, _)) in text.char_indices().enumerate() {
-            if cuts.get(n).copied().unwrap_or(false) { chunks.push(&text[start..at]); start = at; }
+        for input in ["13812345678", "参考 [1] [] 电话 13812345678", "参考 [ＣＮ＿ＭＯＢＩＬＥ＿１] 电话 13812345678"] {
+            let r = redacted(input);
+            let text = format!("{} {}", r.text, pieces.concat());
+            let expected = r.restore(&text);
+            let mut chunks = Vec::new();
+            let mut start = 0;
+            for (n, (at, _)) in text.char_indices().enumerate() {
+                if cuts.get(n).copied().unwrap_or(false) { chunks.push(&text[start..at]); start = at; }
+            }
+            chunks.push(&text[start..]);
+            let actual = stream_chunks(&r, &chunks);
+            proptest::prop_assert_eq!(actual.is_ok(), expected.is_ok());
+            if expected.is_ok() { proptest::prop_assert_eq!(actual, expected); }
         }
-        chunks.push(&text[start..]);
-        let actual = stream_chunks(&r, &chunks);
-        proptest::prop_assert_eq!(actual.is_ok(), expected.is_ok());
-        if expected.is_ok() { proptest::prop_assert_eq!(actual, expected); }
     }
 }
 
