@@ -127,7 +127,16 @@ impl Breaker {
                     failures: failures + 1,
                 }
             }
-            State::Open { until_ms } => State::Open { until_ms },
+            // A failure while the breaker is already open must not keep an
+            // expired deadline: the Supervisor path never claims `admit`, so
+            // nothing moves an expired Open to HalfOpen there. Keeping the old
+            // `until_ms` would admit the next request immediately, i.e. a model
+            // that keeps failing would be locked out for exactly one window.
+            // A still-valid window keeps its deadline; an expired one reopens.
+            State::Open { until_ms } if now_ms < until_ms => State::Open { until_ms },
+            State::Open { .. } => State::Open {
+                until_ms: now_ms.saturating_add(self.class.recovery_ms()),
+            },
             State::Closed { .. } | State::HalfOpen { .. } => State::Open {
                 until_ms: now_ms.saturating_add(self.class.recovery_ms()),
             },
@@ -338,5 +347,105 @@ mod tests {
         assert!(book.admit(&("omlx", "qwen-0.6b"), class, 1).admitted());
         book.on_success(&("omlx", "qwen-8b"), class);
         assert!(book.admit(&("omlx", "qwen-8b"), class, 2).admitted());
+    }
+}
+
+#[cfg(test)]
+mod lockout_window_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::{Breaker, CredentialClass};
+
+    /// Reviewed defect: the Supervisor path never claims `admit`, so an expired
+    /// `Open` was never moved to `HalfOpen`. `on_failure` then kept the stale
+    /// deadline and the next request was admitted — a model that keeps failing
+    /// was locked out for exactly one window and then admitted indefinitely.
+    #[test]
+    fn repeated_failures_past_the_window_reopen_the_lockout() {
+        let class = CredentialClass::Local;
+        let window = class.recovery_ms();
+        let mut breaker = Breaker::new(class);
+
+        // 2 faults (threshold for Local) lock it.
+        breaker.on_failure(0);
+        breaker.on_failure(0);
+        assert!(!breaker.would_admit(0), "two faults must lock the model");
+        assert!(!breaker.would_admit(window - 1), "still inside the window");
+
+        // The window expires, but nothing claimed a probe on this path.
+        assert!(breaker.would_admit(window), "window expired -> selectable");
+
+        // One more failure must re-lock, not inherit the expired deadline.
+        breaker.on_failure(window);
+        assert!(
+            !breaker.would_admit(window),
+            "a failure on the Supervisor path must reopen the lockout"
+        );
+        assert!(
+            !breaker.would_admit(window + window - 1),
+            "the reopened window still rejects"
+        );
+
+        // And once the reopened window passes, it is selectable again.
+        assert!(
+            breaker.would_admit(window + window),
+            "after the reopened window the model is admitted again"
+        );
+    }
+
+    /// The subscription relay path (`ChatProxy::report_outcome`) also never
+    /// claims `admit`, so it depends on the same reopen rule. OAuth: 3 faults,
+    /// 60 s window. Measured through the bare breaker because `open_providers`
+    /// reads the wall clock and this path is not time-injectable.
+    #[test]
+    fn oauth_relay_faults_past_the_window_reopen_the_lockout() {
+        let class = CredentialClass::OAuth;
+        let window = class.recovery_ms();
+        let mut breaker = Breaker::new(class);
+
+        for _ in 0..class.failure_threshold() {
+            breaker.on_failure(0);
+        }
+        assert!(!breaker.would_admit(0), "threshold faults must open it");
+
+        // 61 s later the window has expired: selection peeks and admits.
+        assert!(breaker.would_admit(window + 1_000), "expired window admits");
+
+        // A relay fault now must re-lock instead of inheriting the stale deadline.
+        breaker.on_failure(window + 1_000);
+        assert!(
+            !breaker.would_admit(window + 1_000),
+            "a fault on the relay path must reopen the OAuth lockout"
+        );
+        assert!(
+            !breaker.would_admit(window + 1_000 + window - 1),
+            "the reopened window still rejects"
+        );
+        assert!(
+            breaker.would_admit(window + 1_000 + window),
+            "after the reopened window it is admitted again"
+        );
+    }
+
+    /// Control: a failure inside a still-valid window keeps that deadline
+    /// instead of extending it, so a single window is not stretched by noise.
+    #[test]
+    fn a_failure_inside_a_valid_window_keeps_its_deadline() {
+        let class = CredentialClass::Local;
+        let window = class.recovery_ms();
+        let mut breaker = Breaker::new(class);
+        breaker.on_failure(0);
+        breaker.on_failure(0);
+        assert!(!breaker.would_admit(0));
+
+        breaker.on_failure(window / 2);
+        assert!(
+            !breaker.would_admit(window - 1),
+            "deadline must not move later than the original window"
+        );
+        assert!(
+            breaker.would_admit(window),
+            "original window still ends on time"
+        );
     }
 }
