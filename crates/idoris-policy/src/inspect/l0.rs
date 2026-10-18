@@ -6,6 +6,14 @@
 //! 只有标准手机号/身份证布局的窗口可忽略相邻杂项数字独立命中，银行卡
 //! 不走此例外。不跨 tab/换行拼接；不能保证任意布局或任意数字表格零误报。
 //!
+//! Contract: standard phone/ID windows remain position-independent, including
+//! double-sided numeric clutter. A numeric table containing `10 160 1920 1080
+//! 60` is indistinguishable here from counter 10, phone 16019201080, counter
+//! 60. The mixed-length matrix pins this accepted precision cost separately
+//! for each distribution and separator; it does not establish table safety.
+//! Edge/short-neighbour guards lose supported interior entities. Keep the
+//! shape and entity-kind limits: cards still require complete decomposition.
+//!
 //! 结构校验压倒校验和：身份证先看省级行政区划码和出生日期，校验位只决定
 //! 敏感度（X-2）；银行卡没有可用的结构信号，所以 Luhn 是必要条件。
 

@@ -790,6 +790,52 @@ fn standard_written_entities_survive_unrelated_numeric_neighbours() {
 }
 
 #[test]
+fn standard_written_entities_survive_double_sided_clutter() {
+    for (input, expected_mobiles) in [
+        ("Room 1203 138 1234 5678 1", 1),
+        ("qty 3 138 1234 5678 139 8765 4321 2", 2),
+        // Unicode separator equivalents (en dash, ideographic space) fold
+        // to the same ASCII space/hyphen `l0::is_separator` accepts, so the
+        // same double-sided-clutter recall must hold through them too.
+        ("Room\u{3000}1203\u{2013}138 1234 5678 1", 1),
+        ("qty 3 138\u{2013}1234\u{2013}5678 139 8765 4321 2", 2),
+    ] {
+        let response = inspect(input, &open_ctx());
+        assert_eq!(
+            response
+                .findings
+                .iter()
+                .filter(|f| f.kind == FindingKind::CnMobile)
+                .count(),
+            expected_mobiles,
+            "{input}: {response:?}"
+        );
+        assert_ne!(response.action, InspectAction::Allow, "{input}");
+    }
+    for input in [
+        "qty 3 110105 19491231 002X 9",
+        "9 qty 3 110105 19491231 002X 9",
+    ] {
+        let response = inspect(input, &open_ctx());
+        assert!(
+            kinds(&response).contains(&FindingKind::CnResidentId),
+            "{input}: {response:?}"
+        );
+        assert_ne!(response.action, InspectAction::Allow, "{input}");
+    }
+}
+
+// Unsupported mobile layout: this is a known recall gap, not a safe numeric row.
+#[test]
+fn unsupported_split_shape_with_clutter_documents_recall_gap() {
+    let response = inspect("99 1381 234 5678", &open_ctx());
+    assert!(
+        !kinds(&response).contains(&FindingKind::CnMobile),
+        "{response:?}"
+    );
+}
+
+#[test]
 fn third_review_groupings_and_numeric_rows() {
     // Any written grouping of one number is still that number.
     for (input, kind) in [
