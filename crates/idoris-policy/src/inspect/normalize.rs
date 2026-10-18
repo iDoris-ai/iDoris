@@ -15,16 +15,26 @@ pub(super) struct Normalized {
 }
 
 pub(super) fn normalize(units: &[u16]) -> Normalized {
-    normalize_with_letters(units, true)
+    normalize_with_options(units, true, true)
 }
 
 /// Keep digit/fullwidth normalization but preserve non-Latin token boundaries.
 /// This view is scanned too, so letter folding cannot erase existing findings.
 pub(super) fn normalize_without_letter_folding(units: &[u16]) -> Normalized {
-    normalize_with_letters(units, false)
+    normalize_with_options(units, false, true)
 }
 
-fn normalize_with_letters(units: &[u16], fold_letters: bool) -> Normalized {
+/// Independent letter and escape views prevent either fold from erasing hits.
+pub(super) fn views(units: &[u16]) -> [Normalized; 4] {
+    [
+        normalize(units),
+        normalize_without_letter_folding(units),
+        normalize_with_options(units, true, false),
+        normalize_with_options(units, false, false),
+    ]
+}
+
+fn normalize_with_options(units: &[u16], fold_letters: bool, fold_escapes: bool) -> Normalized {
     let mut out = Normalized {
         units: Vec::with_capacity(units.len()),
         origin: Vec::with_capacity(units.len()),
@@ -35,7 +45,8 @@ fn normalize_with_letters(units: &[u16], fold_letters: bool) -> Normalized {
         // A literal `\uXXXX` escape (JSON/JS source) stands for its unit, in
         // place, so it joins the surrounding text; a lone surrogate is
         // kept as-is rather than failing the decode.
-        let (unit, width) = if let Some(escaped) = unicode_escape(&units[i..]) {
+        let escaped = fold_escapes.then(|| unicode_escape(&units[i..])).flatten();
+        let (unit, width) = if let Some(escaped) = escaped {
             (escaped, 6)
         } else if let Some(digit) = math_digit(&units[i..]) {
             (digit, 2)

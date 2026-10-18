@@ -80,10 +80,8 @@ pub fn inspect(input: &str, ctx: &InspectCtx) -> InspectResponse {
         };
     }
     let units: Vec<u16> = input.encode_utf16().collect();
-    let normalized = normalize::normalize(&units);
-    let baseline = normalize::normalize_without_letter_folding(&units);
     let mut hits = Vec::new();
-    for view in [&normalized, &baseline] {
+    for view in normalize::views(&units) {
         for mut hit in l0::scan(&view.units) {
             (hit.start, hit.length) = view.original_span(hit.start, hit.length);
             hits.push(hit);

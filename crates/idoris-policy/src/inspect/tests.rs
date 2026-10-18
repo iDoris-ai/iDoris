@@ -835,6 +835,44 @@ fn tamil_zero_obeys_the_same_numeric_boundary_as_ascii_zero() {
     assert_eq!(tamil.findings, ascii.findings);
 }
 
+#[test]
+fn literal_unicode_prefix_does_not_swallow_following_entities() {
+    for (entity, kind) in [
+        ("110105195001010004", FindingKind::CnResidentId),
+        ("11010519491231002X", FindingKind::CnResidentId),
+        ("13812345678", FindingKind::CnMobile),
+        ("6222021234567894", FindingKind::BankCard),
+        ("6222 0212 3456 7894", FindingKind::BankCard),
+    ] {
+        let input = format!(r"\u{entity}");
+        let response = inspect(&input, &open_ctx());
+        assert!(
+            response
+                .findings
+                .iter()
+                .any(|f| f.kind == kind && covered(&input, f) == entity),
+            "{input:?}: {response:?}"
+        );
+        // report() also needs the non-escape view, without recursive decoding.
+        let encoded = input
+            .as_bytes()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
+        let decoded_response = inspect(&encoded, &open_ctx());
+        assert!(
+            kinds(&decoded_response).contains(&kind),
+            "{encoded}: {decoded_response:?}"
+        );
+    }
+}
+
+#[test]
+fn country_code_attached_to_first_mobile_group_is_supported() {
+    let input = "+86138 1234 5678";
+    assert!(kinds(&inspect(input, &open_ctx())).contains(&FindingKind::CnMobile));
+}
+
 fn valid_id() -> impl Strategy<Value = String> {
     (0usize..34, 1950u32..2030, 1u32..13, 1u32..29, 0u32..1000).prop_map(
         |(province, year, month, day, seq)| {
