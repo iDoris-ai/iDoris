@@ -156,7 +156,8 @@ pub(crate) fn inspect_body(
     }
     let mut text = String::new();
     // Scope token-id detection to the complete top-level input subtree, not
-    // metadata/tool schemas. Mixed arrays and objects cannot hide integer leaves.
+    // metadata/tool schemas. Mixed arrays/objects cannot hide nested nonempty
+    // all-integer arrays; isolated integer leaves are not classified as token IDs.
     let mut opaque = body.get("input").is_some_and(is_integer_token_array);
     collect(body, &mut text, &mut opaque);
     let ctx = InspectCtx {

@@ -640,9 +640,9 @@ fn review_regressions_grouped_split_and_invisible_variants() {
             &[FindingKind::CnResidentId, FindingKind::CnMobile],
         ),
         ("Room 1203 138 1234 5678", &[FindingKind::CnMobile]),
-        // F4: split across lines / text parts
-        ("1101011990\n0307737X", &[FindingKind::CnResidentId]),
-        ("110101199003\n07737X\n", &[FindingKind::CnResidentId]),
+        // Cross-line modern IDs require a valid checksum; JSON parts stay separate.
+        ("1101051949\n1231002X", &[FindingKind::CnResidentId]),
+        ("110105194912\n31002X\n", &[FindingKind::CnResidentId]),
         // F5: invisible separators and other digit scripts
         ("138\u{00A0}1234\u{00A0}5678", &[FindingKind::CnMobile]),
         ("138\u{200E}1234\u{200E}5678", &[FindingKind::CnMobile]),
@@ -742,7 +742,7 @@ proptest! {
 
 /// Reviewer A2: a pasted numeric table must stay public. Rows joined by a line
 /// break may not be licensed by the weak "16–19 digits + Luhn" card rule, while
-/// structural entities (resident id, mobile) may still cross a line break.
+/// only checksum-valid modern resident IDs may cross a line break.
 #[test]
 fn numeric_tables_do_not_become_bank_cards_across_line_breaks() {
     let table = "year qty\n2023 1203\n2024 1305\n2025 1411\n2026 1520";
@@ -754,17 +754,17 @@ fn numeric_tables_do_not_become_bank_cards_across_line_breaks() {
     );
     assert!(response.findings.is_empty(), "{response:?}");
 
-    // The structural wins from this PR survive: an id split across a line, and
-    // a mobile split across a line, are still found.
-    let id = inspect("1101011990\n0307737X", &open_ctx());
+    // Preserve cross-line checksum-valid modern IDs, not checksum-free phones.
+    let id = inspect("1101051949\n1231002X", &open_ctx());
     assert!(
         kinds(&id).contains(&FindingKind::CnResidentId),
         "an id split across a line break must still be found: {id:?}"
     );
     let mobile = inspect("138\n1234 5678", &open_ctx());
-    assert!(
-        kinds(&mobile).contains(&FindingKind::CnMobile),
-        "a mobile split across a line break must still be found: {mobile:?}"
+    assert_eq!(
+        mobile.action,
+        InspectAction::Allow,
+        "cross-line mobile recall is deliberately unsupported: {mobile:?}"
     );
 
     // And a card whose groups are all on one line is unaffected.
@@ -821,8 +821,14 @@ fn cross_line_entity_windows_must_cover_complete_numeric_lines() {
             "{table:?}: {response:?}"
         );
     }
-    for input in ["138\n1234 5678", "1101011990\n0307737X"] {
-        assert!(!inspect(input, &open_ctx()).findings.is_empty(), "{input}");
+    let valid = inspect("1101051949\n1231002X", &open_ctx());
+    assert_eq!(valid.sensitivity, Sensitivity::S3);
+    for input in ["138\n1234 5678", "1101011990\n0307737X", "1350\n2210\n980"] {
+        assert_eq!(
+            inspect(input, &open_ctx()).action,
+            InspectAction::Allow,
+            "{input}"
+        );
     }
 }
 

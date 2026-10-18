@@ -254,6 +254,25 @@ async fn ordinary_numeric_table_is_not_pinned_to_local() {
     }
 }
 
+#[test]
+fn checksum_free_numeric_lists_do_not_pin_chat_to_local_only() {
+    for text in ["1350\n2210\n980", "138\n1234 5678", "1101011990\n0307737X"] {
+        let body = json!({"messages": [{"role":"user", "content":text}]});
+        let result = inspect::inspect_body(&body, PrivacyClass::Any, false);
+        assert_eq!(
+            result.effective,
+            PrivacyClass::Any,
+            "{text}: {:?}",
+            result.response
+        );
+    }
+    let body = json!({"messages":[{"role":"user","content":"1101051949\n1231002X"}]});
+    assert_eq!(
+        inspect::inspect_body(&body, PrivacyClass::Any, false).effective,
+        PrivacyClass::LocalOnly
+    );
+}
+
 /// E (reviewer): the token-array rule must follow the top-level `input` subtree,
 /// not "any array of >= 8 integers anywhere". A tool schema's `enum` or a
 /// `metadata.scores` list used to pin a clean chat to local_only, which 503s

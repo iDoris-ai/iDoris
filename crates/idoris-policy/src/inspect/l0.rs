@@ -186,6 +186,20 @@ fn classify(c: &Candidate<'_>, hits: &mut Vec<Hit>) {
         });
     };
     let d = c.digits;
+    if c.crossed_line_break {
+        // Cross-line recall is restricted to a structurally valid modern ID
+        // with a valid check digit. Phones and legacy IDs have no checksum;
+        // joining numeric lists for them creates large table false positives.
+        let checked = match d.len() {
+            17 if c.x_suffix && id_structure(d) => Some((id_sensitivity(d, b'X'), c.end + 1)),
+            18 if id_structure(&d[..17]) => Some((id_sensitivity(&d[..17], b'0' + d[17]), c.end)),
+            _ => None,
+        };
+        if let Some((Sensitivity::S3, end)) = checked {
+            push(FindingKind::CnResidentId, end, Sensitivity::S3);
+        }
+        return;
+    }
     if d.len() == 17 && c.x_suffix && id_structure(d) {
         push(
             FindingKind::CnResidentId,
@@ -213,7 +227,7 @@ fn classify(c: &Candidate<'_>, hits: &mut Vec<Hit>) {
     }
     // A weak checksum joined across a line break is exactly the numeric-table
     // false positive: unrelated rows of a pasted table form a Luhn-valid run.
-    // Structural entities (id, mobile) above are allowed to cross lines.
+    // Only checksum-valid modern IDs may cross lines (handled above).
     if (16..=19).contains(&d.len()) && d[0] != 0 && luhn_valid(d) && !c.crossed_line_break {
         push(FindingKind::BankCard, c.end, Sensitivity::S3);
     }
