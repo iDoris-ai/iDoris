@@ -46,8 +46,11 @@ class Seen:
         self.cap = cap
         self.items: dict[str, None] = {}
 
+    def has(self, key: str) -> bool:
+        return not key or key in self.items
+
     def add(self, key: str) -> bool:
-        if not key or key in self.items:
+        if self.has(key):
             return False
         self.items[key] = None
         while len(self.items) > self.cap:
@@ -96,12 +99,15 @@ def log(text: str) -> None:
     print(f"{stamp} {text}", flush=True)
 
 
-def safe_error(exc: BaseException) -> str:
-    text = str(exc)
+def redact(text: str) -> str:
     text = re.sub(r"wss://\S+", "wss://…", text)
     text = re.sub(r"xapp-[A-Za-z0-9-]+", "xapp-…", text)
     text = re.sub(r"xox[baprs]-[A-Za-z0-9-]+", "xox-…", text)
     return text[:300]
+
+
+def safe_error(exc: BaseException) -> str:
+    return redact(str(exc))
 
 
 def load_env(path: Path = ENV_PATH) -> dict[str, str]:
@@ -174,7 +180,7 @@ def slack_form(method: str, token: str, form: dict[str, str]) -> dict:
 def slack_pages(method: str, token: str, form: dict[str, str], key: str) -> list:
     items: list = []
     cursor = ""
-    for _ in range(8):
+    for _ in range(50):
         body = dict(form)
         if cursor:
             body["cursor"] = cursor
@@ -182,8 +188,8 @@ def slack_pages(method: str, token: str, form: dict[str, str], key: str) -> list
         items.extend(result.get(key) or [])
         cursor = (result.get("response_metadata") or {}).get("next_cursor") or ""
         if not cursor:
-            break
-    return items
+            return items
+    raise RuntimeError(f"Slack {method} 超过 50 页，停止使用残缺结果")
 
 
 def looks_like_id(value: str, prefix: str) -> bool:
@@ -265,7 +271,9 @@ def resolve_policy(env: dict[str, str], config: Config) -> Policy:
     )
 
 
-def accept_event(event: dict, event_id: str, policy: Policy, seen: Seen) -> dict | None:
+def accept_event(
+    event: dict, event_id: str, policy: Policy, seen: Seen, *, remember: bool = True
+) -> dict | None:
     kind = event.get("type")
     if kind not in ("message", "app_mention"):
         return None
@@ -286,8 +294,10 @@ def accept_event(event: dict, event_id: str, policy: Policy, seen: Seen) -> dict
         return None
     ts = str(event.get("ts") or event.get("event_ts") or "")
     key = f"{channel}:{ts}" if ts else event_id
-    if not seen.add(key):
+    if seen.has(key):
         return None
+    if remember:
+        seen.add(key)
     return {
         "type": kind,
         "channel": channel,
@@ -317,7 +327,13 @@ def append_spool(directory: Path, record: dict) -> None:
     line = (json.dumps(record, ensure_ascii=False) + "\n").encode("utf-8")
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
     try:
-        os.write(fd, line)
+        view = memoryview(line)
+        while view:
+            written = os.write(fd, view)
+            if written <= 0:
+                raise OSError("事件记录写入失败")
+            view = view[written:]
+        os.fsync(fd)
     finally:
         os.close(fd)
 
@@ -359,14 +375,20 @@ def run_trigger(path: str, record: dict, timeout: float) -> None:
         stderr=subprocess.PIPE,
         start_new_session=True,
     )
+    payload = json.dumps(record, ensure_ascii=False).encode("utf-8")
     try:
-        _out, err = proc.communicate(json.dumps(record, ensure_ascii=False).encode("utf-8"), timeout=timeout)
+        _out, err = proc.communicate(payload, timeout=timeout)
     except subprocess.TimeoutExpired:
         os.killpg(proc.pid, signal.SIGTERM)
+        try:
+            proc.communicate(timeout=2)
+        except subprocess.TimeoutExpired:
+            os.killpg(proc.pid, signal.SIGKILL)
+            proc.communicate()
         log(f"触发超时，已终止：{path}")
         return
     if proc.returncode != 0:
-        detail = err.decode("utf-8", errors="replace").strip().replace("\n", " ")[:200]
+        detail = redact(err.decode("utf-8", errors="replace").strip().replace("\n", " "))
         log(f"触发退出 {proc.returncode}：{detail}")
 
 
@@ -529,10 +551,12 @@ def dispatch(message: dict, policy: Policy, seen: Seen, config: Config, events: 
     event = payload.get("event") or {}
     if not isinstance(event, dict):
         return
-    record = accept_event(event, str(payload.get("event_id") or ""), policy, seen)
+    record = accept_event(event, str(payload.get("event_id") or ""), policy, seen, remember=False)
     if record is None:
         return
     append_spool(config.spool_dir, record)
+    dedupe_key = f"{record['channel']}:{record['ts']}" if record["ts"] else record["event_id"]
+    seen.add(dedupe_key)
     write_status(config.spool_dir, last_event_at=record["received_at"], last_event_ts=record["ts"])
     where = record["channel_name"] or record["channel"]
     log(f"收到 #{where} user={record['user']} ts={record['ts']} 字数={len(record['text'])}")
@@ -544,7 +568,14 @@ def dispatch(message: dict, policy: Policy, seen: Seen, config: Config, events: 
         log("触发排队已满，这条只留在本地记录里")
 
 
-def run_socket(url: str, policy: Policy, seen: Seen, config: Config, events: queue.Queue | None) -> None:
+def run_socket(
+    url: str,
+    policy: Policy,
+    seen: Seen,
+    config: Config,
+    events: queue.Queue | None,
+    health: dict | None = None,
+) -> None:
     ws = open_websocket(url)
     current_sock["sock"] = ws.sock
     try:
@@ -566,15 +597,17 @@ def run_socket(url: str, policy: Policy, seen: Seen, config: Config, events: que
                 continue
             kind = message.get("type")
             if kind == "hello":
+                if health is not None:
+                    health["hello"] = True
                 log(f"Socket Mode 就绪，连接数 {message.get('num_connections')}")
                 continue
             if kind == "disconnect":
                 raise Disconnect(str(message.get("reason") or "disconnect"))
+            if kind == "events_api":
+                dispatch(message, policy, seen, config, events)
             envelope = message.get("envelope_id")
             if envelope:
                 ws.send_text(json.dumps({"envelope_id": envelope}))
-            if kind == "events_api":
-                dispatch(message, policy, seen, config, events)
     finally:
         current_sock["sock"] = None
         ws.close()
@@ -634,23 +667,25 @@ def main(argv: list[str]) -> int:
         worker = threading.Thread(target=trigger_worker, args=(events, config), daemon=True)
         worker.start()
     seen = Seen()
+    health = {"hello": False}
     delay = 1
     log(f"监听进程启动。记录目录 {config.spool_dir}。不调用模型，不发 Slack。")
     while not stop.is_set():
+        health["hello"] = False
         try:
             policy = resolve_policy(env, config)
             url = open_connection(env["SLACK_APP_TOKEN"])
             write_status(config.spool_dir, last_connect_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), last_error="")
-            run_socket(url, policy, seen, config, events)
+            run_socket(url, policy, seen, config, events, health)
             delay = 1
         except Disconnect as exc:
             log(f"Slack 要求重连：{safe_error(exc)}")
             write_status(config.spool_dir, last_error=safe_error(exc))
-            delay = 1
+            delay = 1 if health["hello"] else min(delay * 2, 60)
         except Exception as exc:
             log(f"连接中断：{safe_error(exc)}")
             write_status(config.spool_dir, last_error=safe_error(exc))
-            delay = min(delay * 2, 60)
+            delay = 1 if health["hello"] else min(delay * 2, 60)
         if stop.is_set() or stop.wait(delay):
             break
     if worker is not None:

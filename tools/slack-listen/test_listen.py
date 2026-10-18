@@ -10,6 +10,7 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import listen
 
@@ -132,6 +133,29 @@ class FilterTest(unittest.TestCase):
 
 
 class RedactTest(unittest.TestCase):
+    def test_uncommitted_event_can_be_accepted_again(self) -> None:
+        seen = listen.Seen()
+        event = {"type": "message", "channel": "C1", "user": "UOTHER", "text": "再试", "ts": "3.3"}
+        current = policy()
+        first = listen.accept_event(event, "Ev", current, seen, remember=False)
+        second = listen.accept_event(event, "Ev", current, seen, remember=False)
+        self.assertIsNotNone(first)
+        self.assertIsNotNone(second)
+        seen.add("C1:3.3")
+        self.assertIsNone(listen.accept_event(event, "Ev", current, seen, remember=False))
+
+    def test_trigger_stderr_is_redacted(self) -> None:
+        proc = mock.Mock()
+        proc.pid = 42
+        proc.returncode = 1
+        proc.communicate.return_value = (b"", b"leaked xoxb-1-SECRET and wss://example.slack.com/link/?ticket=SECRET")
+        with mock.patch.object(listen.subprocess, "Popen", return_value=proc):
+            with mock.patch.object(listen, "log") as logged:
+                listen.run_trigger("/bin/echo", {"text": "hi"}, 1)
+        line = logged.call_args[0][0]
+        self.assertNotIn("SECRET", line)
+        self.assertIn("xox-…", line)
+
     def test_safe_error_hides_tokens_and_socket_url(self) -> None:
         text = listen.safe_error(
             RuntimeError("bad wss://wss-primary.slack.com/link/?ticket=secret xapp-1-abc xoxb-1-secret")
