@@ -181,18 +181,27 @@ fn destination(raw: &str) -> Result<(String, String), CredentialError> {
         Some(port) => format!("{host}:{port}"),
         None => host.to_string(),
     };
-    // The URL parser already resolved `.`/`..` segments; encoded dots,
-    // slashes or backslashes inside a segment survive it but some upstreams
-    // decode them into a traversal, so refuse them outright.
+    // The URL parser already resolved literal `.`/`..` segments. A denylist
+    // of specific encodings (`%2e`, `%2f`, `%5c`, …) keeps missing the next
+    // one (`;` path parameters, double encoding, IIS `%u` escapes, …)
+    // because each upstream decodes differently, so instead allowlist the
+    // raw path: only unreserved characters and `/` survive, which means `%`
+    // itself — and therefore every percent-encoded or double-encoded
+    // traversal — is refused outright, with no encoding left to enumerate.
     let path = url.path().to_string();
-    let lower = path.to_ascii_lowercase();
-    if ["%2e", "%2f", "%5c"]
-        .iter()
-        .any(|encoded| lower.contains(encoded))
-    {
+    if !path_is_safe(&path) {
         return Err(CredentialError::InvalidDestination);
     }
     Ok((host, path))
+}
+
+/// Every byte is `[A-Za-z0-9._~-]` or `/`, and no segment is `.` or `..`
+/// (defense in depth; the URL parser already resolves those before this
+/// runs, since the path came from an absolute URL).
+fn path_is_safe(path: &str) -> bool {
+    path.bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b"-._~/".contains(&b))
+        && path.split('/').all(|segment| segment != "." && segment != "..")
 }
 
 /// `path` equals `prefix` or continues it at a segment boundary.
@@ -363,6 +372,91 @@ mod tests {
             }
         );
         assert!(!format!("{audit:?}").contains("sk-real-value"));
+    }
+
+    /// The old `["%2e", "%2f", "%5c"]` denylist on this branch never covered
+    /// `;` path parameters, double encoding or IIS `%u` escapes at all —
+    /// each of these must fail closed with zero reveals under the new
+    /// allowlist, which refuses any `%` or `;` regardless of what follows.
+    #[test]
+    fn percent_and_semicolon_encoded_bypasses_are_closed() {
+        let source = CountingSource {
+            reveals: Cell::new(0),
+        };
+        let secret = openai();
+        for url in [
+            // `;` path parameter: `..` disguised as `..;` (Tomcat/Spring).
+            "https://api.openai.com/v1/chat/..;/files",
+            // Encoded `;` path parameter.
+            "https://api.openai.com/v1/chat/..%3b/files",
+            // Double encoding: `%25` decodes to `%`, then `%2e` to `.`.
+            "https://api.openai.com/v1/chat/%252e%252e/files",
+            // IIS-style `%u` escape for `.`.
+            "https://api.openai.com/v1/chat/%u002e%u002e/files",
+            // Mixed-case percent hex, still just "a %".
+            "https://api.openai.com/v1/chat/%2E%2E/files",
+            // A literal `%` with no recognized escape at all must still be
+            // refused — the allowlist has no escape hatch to enumerate.
+            "https://api.openai.com/v1/chat/100%files",
+        ] {
+            let mut headers = Vec::new();
+            assert!(
+                broker(
+                    &grants(),
+                    &source,
+                    &request(&secret, url, "POST"),
+                    &mut headers
+                )
+                .is_err(),
+                "{url}"
+            );
+            assert!(headers.is_empty(), "{url}");
+        }
+        assert_eq!(source.reveals.get(), 0, "no bypass may reveal");
+    }
+
+    /// Positive control: ordinary granted paths — including ones with dots
+    /// inside a filename, which the allowlist must not confuse with a `..`
+    /// segment — still authorize and reveal exactly once.
+    #[test]
+    fn ordinary_paths_with_dots_still_authorize() {
+        let source = CountingSource {
+            reveals: Cell::new(0),
+        };
+        let secret = openai();
+        for url in [
+            "https://api.openai.com/v1/chat/completions",
+            "https://api.openai.com/v1/chat/completions.json",
+            "https://api.openai.com/v1/chat/v2.1/completions",
+        ] {
+            let mut headers = Vec::new();
+            broker(
+                &grants(),
+                &source,
+                &request(&secret, url, "POST"),
+                &mut headers,
+            )
+            .unwrap_or_else(|e| panic!("{url} should authorize, got {e:?}"));
+        }
+        assert_eq!(source.reveals.get(), 3);
+    }
+
+    /// Mutation check on the allowlist itself: a path segment that is
+    /// exactly `.` or `..` must be refused even though every individual byte
+    /// is allowlisted (this is the half of `path_is_safe` the byte-level
+    /// check alone cannot cover; it exists only because the URL parser is
+    /// trusted to resolve literal dot segments on an absolute URL — if that
+    /// trust were ever wrong, this is the backstop).
+    #[test]
+    fn bare_dot_segments_are_refused_even_though_every_byte_is_allowlisted() {
+        assert!(path_is_safe("/v1/chat/completions"));
+        assert!(path_is_safe("/v1/chat/v2.1/completions"));
+        assert!(!path_is_safe("/v1/chat/./files"));
+        assert!(!path_is_safe("/v1/chat/../files"));
+        assert!(!path_is_safe("/v1/chat/.."));
+        assert!(!path_is_safe("/v1/chat/%2e%2e/files"));
+        assert!(!path_is_safe("/v1/chat/a;b"));
+        assert!(!path_is_safe("/v1/chat\\..\\files"));
     }
 
     #[test]
