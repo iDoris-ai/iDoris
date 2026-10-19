@@ -74,6 +74,13 @@ impl Admission {
     }
 }
 
+/// A pair is refused before either admission is claimed.
+#[derive(Debug)]
+pub enum PairReject {
+    Duplicate,
+    Gate { first: Admission, second: Admission },
+}
+
 /// 一次放行的不透明票据。故意没有 `Copy`/`Clone`：同一次请求只能把票据
 /// 移交给一个回报方法，从类型上避免成功和失败各报一次。
 ///
@@ -136,6 +143,18 @@ impl Breaker {
             state: State::Closed { failures: 0 },
             generation: 0,
             open_cohort: None,
+        }
+    }
+
+    /// Inspect admission without allocating an issuer or claiming a probe.
+    pub fn readiness(&self, now_ms: u64) -> Admission {
+        match self.state {
+            State::Closed { .. } => Admission::Allowed,
+            State::Open { until_ms } if now_ms < until_ms => Admission::Rejected {
+                retry_after_ms: until_ms - now_ms,
+            },
+            State::Open { .. } | State::HalfOpen { probing: false } => Admission::Probe,
+            State::HalfOpen { probing: true } => Admission::Rejected { retry_after_ms: 0 },
         }
     }
 
@@ -325,6 +344,55 @@ impl<K: Eq + Hash + Clone> BreakerBook<K> {
         }
     }
 
+    /// Missing keys are ready without creating an entry or allocating an issuer.
+    pub fn readiness(&self, key: &K, class: CredentialClass, now_ms: u64) -> Admission {
+        self.breakers
+            .get(&(class, key.clone()))
+            .map_or(Admission::Allowed, |breaker| breaker.readiness(now_ms))
+    }
+
+    /// Claim two distinct class/key gates in input order at the same time.
+    ///
+    /// Every `Err` preserves entries and probes. Issuer allocation for both
+    /// missing entries precedes any probe claim. Clone/Hash/Eq user code and
+    /// allocation can panic; this is not a general panic/OOM rollback guarantee.
+    /// Both mutable lookups complete before claiming, with no user code between
+    /// the two calls to the existing admission transition.
+    pub fn admit_pair(
+        &mut self,
+        first: (&K, CredentialClass),
+        second: (&K, CredentialClass),
+        now_ms: u64,
+    ) -> Result<[Admit; 2], PairReject> {
+        if first.1 == second.1 && first.0 == second.0 {
+            return Err(PairReject::Duplicate);
+        }
+        let assessments = (
+            self.readiness(first.0, first.1, now_ms),
+            self.readiness(second.0, second.1, now_ms),
+        );
+        if !assessments.0.admitted() || !assessments.1.admitted() {
+            return Err(PairReject::Gate {
+                first: assessments.0,
+                second: assessments.1,
+            });
+        }
+        let keys = [(first.1, first.0.clone()), (second.1, second.0.clone())];
+        let prepared = keys
+            .each_ref()
+            .map(|key| (!self.breakers.contains_key(key)).then(|| Breaker::new(key.0)));
+        for (key, breaker) in keys.iter().zip(prepared) {
+            if let Some(breaker) = breaker {
+                self.breakers.entry(key.clone()).or_insert(breaker);
+            }
+        }
+        let [Some(first), Some(second)] = self.breakers.get_disjoint_mut([&keys[0], &keys[1]])
+        else {
+            panic!("prepared pair gates must exist");
+        };
+        Ok([first.admit(now_ms), second.admit(now_ms)])
+    }
+
     pub fn admit(&mut self, key: &K, class: CredentialClass, now_ms: u64) -> Admit {
         self.breakers
             .entry((class, key.clone()))
@@ -374,6 +442,84 @@ impl<K: Eq + Hash + Clone> BreakerBook<K> {
         if let Some(breaker) = self.breakers.get_mut(&(class, key.clone())) {
             breaker.on_retry_after(ticket, now_ms, ms);
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod pair_internal_tests {
+    use super::*;
+
+    #[test]
+    fn readiness_preserves_all_fields_including_unclaimed_half_open() {
+        let mut breaker = Breaker::new(CredentialClass::Local);
+        for state in [
+            State::Closed { failures: 1 },
+            State::Open { until_ms: 10 },
+            State::HalfOpen { probing: false },
+            State::HalfOpen { probing: true },
+        ] {
+            breaker.state = state;
+            breaker.generation = 7;
+            breaker.open_cohort = Some(6);
+            let before = (
+                breaker.issuer,
+                breaker.state,
+                breaker.generation,
+                breaker.open_cohort,
+            );
+            for _ in 0..4 {
+                let expected = breaker.readiness(10);
+                assert_eq!(breaker.readiness(10), expected);
+                assert_eq!(
+                    (
+                        breaker.issuer,
+                        breaker.state,
+                        breaker.generation,
+                        breaker.open_cohort
+                    ),
+                    before
+                );
+            }
+            assert_eq!(breaker.readiness(10), breaker.admit(10).admission);
+        }
+    }
+
+    #[test]
+    fn absent_readiness_and_refusals_do_not_insert_or_replace() {
+        let mut book = BreakerBook::new();
+        let class = CredentialClass::Local;
+        for _ in 0..4 {
+            assert_eq!(book.readiness(&"missing", class, 0), Admission::Allowed);
+        }
+        assert!(book.breakers.is_empty());
+        assert!(matches!(
+            book.admit_pair((&"missing", class), (&"missing", class), 0),
+            Err(PairReject::Duplicate)
+        ));
+        assert!(book.breakers.is_empty());
+        let owned = book.admit(&"blocked", class, 0).ticket.unwrap();
+        book.on_retry_after(&"blocked", class, owned, 0, 10);
+        let issuer = book.breakers[&(class, "blocked")].issuer;
+        for reversed in [false, true] {
+            let (a, b) = if reversed {
+                ("missing", "blocked")
+            } else {
+                ("blocked", "missing")
+            };
+            assert!(matches!(
+                book.admit_pair((&a, class), (&b, class), 0),
+                Err(PairReject::Gate { .. })
+            ));
+            assert_eq!(book.breakers.len(), 1);
+            assert_eq!(book.breakers[&(class, "blocked")].issuer, issuer);
+        }
+        let [a, b] = book
+            .admit_pair((&"blocked", class), (&"missing", class), 10)
+            .unwrap();
+        assert_eq!(book.breakers[&(class, "blocked")].issuer, issuer);
+        book.on_success(&"blocked", class, a.ticket.unwrap());
+        book.on_success(&"missing", class, b.ticket.unwrap());
     }
 }
 

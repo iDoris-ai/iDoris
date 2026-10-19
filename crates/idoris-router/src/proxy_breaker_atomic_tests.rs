@@ -252,11 +252,11 @@ fn toggles_preserve_captured_ownership_and_poisoned_settlement_recovers_probe() 
     assert!(p.admit_provider("provider", url).is_none());
     let mut book = p.breakers.lock().unwrap_err().into_inner();
     assert_eq!(
-        book.admit(&"provider".to_string(), CredentialClass::Local, 54_999)
+        book.admit(&provider_key("provider"), CredentialClass::Local, 54_999)
             .admission,
         Admission::Rejected { retry_after_ms: 1 }
     );
-    let probe = book.admit(&"provider".to_string(), CredentialClass::Local, 55_000);
+    let probe = book.admit(&provider_key("provider"), CredentialClass::Local, 55_000);
     assert_eq!(probe.admission, Admission::Probe);
 }
 #[test]
@@ -274,11 +274,11 @@ fn stale_completion_and_existing_long_deadline_survive_short_network_header() {
         .breakers
         .lock()
         .unwrap()
-        .admit(&"provider".to_string(), CredentialClass::Local, 15_000)
+        .admit(&provider_key("provider"), CredentialClass::Local, 15_000)
         .ticket
         .unwrap();
     p.breakers.lock().unwrap().on_retry_after(
-        &"provider".to_string(),
+        &provider_key("provider"),
         CredentialClass::Local,
         t,
         15_000,
@@ -402,7 +402,7 @@ async fn inflight_toggle_both_directions_settles_only_captured_ticket() {
         p.set_breakers_enabled(true);
         let mut book = p.breakers.lock().unwrap();
         let admission = book
-            .admit(&"provider".to_string(), CredentialClass::Local, 15_000)
+            .admit(&provider_key("provider"), CredentialClass::Local, 15_000)
             .admission;
         assert_eq!(
             admission,
@@ -465,7 +465,7 @@ fn poisoned_finish_settles_owned_probe_while_admission_stays_closed() {
     assert!(p.admit_provider("provider", url).is_none());
     let mut book = p.breakers.lock().unwrap_err().into_inner();
     assert_eq!(
-        book.admit(&"provider".to_string(), CredentialClass::Local, 15_000)
+        book.admit(&provider_key("provider"), CredentialClass::Local, 15_000)
             .admission,
         Admission::Allowed
     );
