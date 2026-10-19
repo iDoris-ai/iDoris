@@ -43,6 +43,39 @@ fn gb11643_example_id_is_s3_with_exact_span() {
     }
 }
 
+/// Literal backslash-u prefixes must not hide a resident id.
+///
+/// Issue #534 records that on PR #490 these two inputs are S0 Allow: a
+/// literal U+005C, `u`, and `110105195001010004`, plus the same input with
+/// the backslash doubled. That tree's `normalize()` decodes `\uXXXX` in
+/// place (`50caf46`, not an ancestor of this commit) and consumes the id's
+/// own leading hex digits. This tree does not decode those escapes, so both
+/// inputs are S3 Block and the span covers the id. The regression passes;
+/// it is not ignored.
+///
+/// Shorter prefixes (`\` + `u` + one to three ASCII digits glued to the same
+/// id) are longer digit runs and stay undetected. #534 records them. They
+/// are not asserted here, and the generator is unchanged.
+#[test]
+fn literal_backslash_u_prefix_keeps_the_resident_id() {
+    let id = "110105195001010004";
+    for input in [format!("身份证：\\u{id}"), format!("身份证：\\\\u{id}")] {
+        let response = inspect(&input, &open_ctx());
+        let found = response.findings.iter().any(|finding| {
+            finding.kind == FindingKind::CnResidentId && covered(&input, finding) == id
+        });
+        assert!(
+            found
+                && response.sensitivity == Sensitivity::S3
+                && response.action == InspectAction::Block,
+            "{input:?} sensitivity={:?} action={:?} findings={:?}",
+            response.sensitivity,
+            response.action,
+            response.findings
+        );
+    }
+}
+
 #[test]
 fn id_with_wrong_check_digit_is_downgraded_not_dropped() {
     let response = inspect("110105194912310021", &open_ctx());
