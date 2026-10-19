@@ -449,3 +449,24 @@ async fn singleflight_waiter_has_no_additional_claim_or_dispatch() {
     assert_eq!(n.load(Ordering::SeqCst), 1);
     server.abort();
 }
+
+#[test]
+fn poisoned_finish_settles_owned_probe_while_admission_stays_closed() {
+    let p = proxy();
+    let url = "http://localhost";
+    trip(&p, url);
+    clock(&p, 15_000);
+    let probe = p.admit_provider("provider", url).unwrap();
+    let _ = std::panic::catch_unwind(|| {
+        let _lock = p.breakers.lock().unwrap();
+        panic!("poison");
+    });
+    probe.finish(200, None);
+    assert!(p.admit_provider("provider", url).is_none());
+    let mut book = p.breakers.lock().unwrap_err().into_inner();
+    assert_eq!(
+        book.admit(&"provider".to_string(), CredentialClass::Local, 15_000)
+            .admission,
+        Admission::Allowed
+    );
+}

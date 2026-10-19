@@ -293,7 +293,8 @@ impl Breaker {
 }
 
 /// `Retry-After` 的整数秒形式；HTTP-date 形式与非法值返回 `None`，调用方
-/// 退回到凭据类别的恢复窗口。
+/// 退回到凭据类别的恢复窗口。ASCII delta-seconds saturate on overflow;
+/// this parser returns raw milliseconds without a network-boundary cap.
 pub fn parse_retry_after_ms(raw: &str) -> Option<u64> {
     let digits = raw.trim().as_bytes();
     if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {

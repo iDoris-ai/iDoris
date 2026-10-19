@@ -353,15 +353,15 @@ impl ProviderClaim<'_> {
 
 impl Drop for ProviderClaim<'_> {
     fn drop(&mut self) {
-        if self.probe {
-            if let Some(ticket) = self.ticket.take() {
-                // No IO or panicking poison unwrap; reopen from cancellation time.
-                self.proxy
-                    .breakers
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .on_failure(&self.key, self.class, ticket, self.proxy.now_ms());
-            }
+        if self.probe
+            && let Some(ticket) = self.ticket.take()
+        {
+            // No IO or panicking poison unwrap; reopen from cancellation time.
+            self.proxy
+                .breakers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .on_failure(&self.key, self.class, ticket, self.proxy.now_ms());
         }
     }
 }
@@ -403,7 +403,7 @@ fn is_loopback_url(url: &str) -> bool {
 pub struct ChatProxy {
     pub(crate) client: reqwest::Client,
     egress: Arc<EgressCounter>,
-    /// M5-14 provider-grain circuit breakers, keyed by provider id.
+    /// M5-14 provider breakers, keyed by dialed credential class and provider id.
     breakers: Mutex<idoris_policy::breaker::BreakerBook<String>>,
     /// On for a library-constructed proxy. The `idoris` binary turns it off
     /// unless `IDORIS_PROVIDER_BREAKER=1`: the shared conformance contract
@@ -434,9 +434,7 @@ pub struct ChatProxy {
 }
 
 impl ChatProxy {
-    /// Claims an upstream send for `provider_id`. A poisoned lock fails
-    /// closed: no send.
-    /// Turns provider breakers on or off for every later request.
+    /// Turns provider breakers on or off for every later admission.
     pub fn set_breakers_enabled(&self, enabled: bool) {
         self.breaker_enabled.store(enabled, Ordering::SeqCst);
     }
