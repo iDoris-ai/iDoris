@@ -230,6 +230,21 @@ pub fn decide_with_affinity_and_ready(
     affinity_key: Option<&str>,
     ready_candidate_ids: &BTreeSet<String>,
 ) -> Result<Decision, Rejection> {
+    decide_with_affinity_and_ready_selected(req, cards, ctx, affinity_key, ready_candidate_ids)
+        .map(|(decision, _)| decision)
+}
+
+/// Same pipeline as [`decide_with_affinity_and_ready`], also returning the exact
+/// input card chosen by the existing policy ordering. The borrow depends only
+/// on `cards`; request, context and tie-break snapshots need not outlive it.
+/// Catalogue validation and globally unique provider ids remain prerequisites.
+pub fn decide_with_affinity_and_ready_selected<'a>(
+    req: &RequestProfile,
+    cards: &'a [Card],
+    ctx: &PolicyCtx<'_>,
+    affinity_key: Option<&str>,
+    ready_candidate_ids: &BTreeSet<String>,
+) -> Result<(Decision, &'a Card), Rejection> {
     let mut reasons = Vec::new();
 
     // ---- ① 隐私（不变式 #2：只能收紧，不能放宽） --------------------------
@@ -382,11 +397,14 @@ pub fn decide_with_affinity_and_ready(
     let chosen = pick(&after_budget, affinity_key, ready_candidate_ids)
         .expect("after_budget is non-empty, pick always returns Some");
 
-    Ok(Decision {
-        chosen_id: chosen.id().to_string(),
-        reason_codes: reasons,
-        degradations,
-    })
+    Ok((
+        Decision {
+            chosen_id: chosen.id().to_string(),
+            reason_codes: reasons,
+            degradations,
+        },
+        chosen,
+    ))
 }
 
 #[cfg(test)]
@@ -456,3 +474,6 @@ mod local_capable_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod picked_card_tests;
