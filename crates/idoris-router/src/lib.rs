@@ -2468,15 +2468,41 @@ async fn chat_completions(
                 .task
                 .privacy
                 .unwrap_or(idoris_contracts::common::PrivacyClass::LocalOnly);
-            return match subscription::dispatch::dispatch_selected(
-                selected,
-                privacy,
-                lifecycle.peer(),
-                &state.subscriptions,
-                messages.clone(),
-                lifecycle.cancellation_token(),
-            )
-            .await
+            return match state
+                .proxy
+                .drive_external(
+                    idoris_policy::SUBSCRIPTION_PROVIDER_ID,
+                    idoris_policy::breaker::CredentialClass::OAuth,
+                    || async {
+                        subscription::dispatch::dispatch_selected(
+                            selected,
+                            privacy,
+                            lifecycle.peer(),
+                            &state.subscriptions,
+                            messages.clone(),
+                            lifecycle.cancellation_token(),
+                        )
+                        .await
+                    },
+                    |result| {
+                        use dispatch::ProviderOutcome;
+                        use idoris_upstream::subscription::error::SubscriptionErrorCode::*;
+                        use subscription::dispatch::SubscriptionDispatchError::*;
+                        match result {
+                            Ok(_) => ProviderOutcome::Success,
+                            Err(Relay(error)) => match error.code() {
+                                CliFailed | EmptyOutput | SpawnFailed | Timeout | CleanupFailed => {
+                                    ProviderOutcome::Fault
+                                }
+                                Cancelled | OutputLimit => ProviderOutcome::Ignored,
+                            },
+                            Err(Source(_) | PrivacyForbidden | Runtime(_) | NotSubscription) => {
+                                ProviderOutcome::Ignored
+                            }
+                        }
+                    },
+                )
+                .await
             {
                 Ok(chat) => subscription::response::success(
                     &chat,
@@ -2590,7 +2616,8 @@ async fn chat_completions(
                 completed_event_context.as_ref(),
                 budget_settled_event_context.as_ref(),
             )
-            .with_native(&native),
+            .with_native(&native)
+            .with_provider_admission(state.proxy.as_ref()),
             &parsed,
             dispatch::DispatchInput::with_model(model, &prompt).with_affinity(affinity_key),
             messages,

@@ -662,7 +662,103 @@ fn public_dispatch_result(
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum ProviderOutcome {
+    Success,
+    Fault,
+    Ignored,
+}
+
+pub(crate) struct ProviderCapture {
+    pub(crate) key: crate::proxy::BreakerKey,
+    pub(crate) class: idoris_policy::breaker::CredentialClass,
+    pub(crate) ticket: Option<idoris_policy::breaker::AdmissionTicket>,
+    pub(crate) probe: bool,
+}
+
+pub(crate) trait ProviderAdmission: Sync {
+    fn begin_provider(
+        &self,
+        provider_id: &str,
+        class: idoris_policy::breaker::CredentialClass,
+    ) -> ProviderCapture;
+    fn finish_provider(&self, capture: ProviderCapture, outcome: ProviderOutcome);
+}
+
+pub(crate) struct ProviderGuard<'a> {
+    admission: Option<&'a dyn ProviderAdmission>,
+    capture: Option<ProviderCapture>,
+}
+
+impl<'a> ProviderGuard<'a> {
+    pub(crate) fn begin(
+        admission: Option<&'a dyn ProviderAdmission>,
+        provider_id: &str,
+        class: idoris_policy::breaker::CredentialClass,
+    ) -> Self {
+        Self {
+            admission,
+            capture: admission.map(|admission| admission.begin_provider(provider_id, class)),
+        }
+    }
+
+    pub(crate) fn finish(mut self, outcome: ProviderOutcome) {
+        if let (Some(admission), Some(capture)) = (self.admission, self.capture.take()) {
+            admission.finish_provider(capture, outcome);
+        }
+    }
+}
+
+impl Drop for ProviderGuard<'_> {
+    fn drop(&mut self) {
+        if let (Some(admission), Some(capture)) = (self.admission, self.capture.take()) {
+            admission.finish_provider(capture, ProviderOutcome::Ignored);
+        }
+    }
+}
+
+fn native_provider_outcome(
+    error: &BackendError,
+    requested: &str,
+    loading: bool,
+) -> ProviderOutcome {
+    use BackendError::*;
+    match error {
+        // LOAD also covers eviction/startup: panic and unqualified errors lose provenance.
+        AdapterPanicked { model_id, .. } if !loading && model_id == requested => {
+            ProviderOutcome::Fault
+        }
+        Upstream { .. } if !loading => ProviderOutcome::Fault,
+        ModelUnavailable { model_id }
+        | Oom { model_id }
+        | ProbeTimedOut { model_id }
+        | AdapterTimedOut { model_id }
+        | LoadUnconfirmed { model_id, .. }
+        | LoadPostconditionFailed { model_id, .. } => {
+            if model_id == requested {
+                ProviderOutcome::Fault
+            } else {
+                ProviderOutcome::Ignored
+            }
+        }
+        AdapterPanicked { .. }
+        | Upstream { .. }
+        | ModelNotFound { .. }
+        | ModelLoading { .. }
+        | EvictionImpossible { .. }
+        | EvictionFailed { .. }
+        | Cancelled
+        | InvalidRequest { .. }
+        | SupervisorUnavailable
+        | Busy { .. }
+        | InvariantViolation { .. }
+        | LockPoisoned { .. }
+        | Internal { .. } => ProviderOutcome::Ignored,
+    }
+}
+
 pub(crate) struct LocalExecutionContext<'a> {
+    provider_admission: Option<&'a dyn ProviderAdmission>,
     native: Option<&'a idoris_backend::NativeCompletionRequest>,
     supervisor: Option<&'a BoundSupervisor>,
     budget_ledger: Option<&'a BudgetLedger>,
@@ -682,6 +778,7 @@ impl<'a> LocalExecutionContext<'a> {
         budget_settled_event: Option<&'a crate::BudgetSettledEventContext>,
     ) -> Self {
         Self {
+            provider_admission: None,
             native: None,
             supervisor,
             budget_ledger,
@@ -694,6 +791,11 @@ impl<'a> LocalExecutionContext<'a> {
 }
 
 impl<'a> LocalExecutionContext<'a> {
+    pub(crate) fn with_provider_admission(mut self, admission: &'a dyn ProviderAdmission) -> Self {
+        self.provider_admission = Some(admission);
+        self
+    }
+
     pub(crate) fn with_native(
         mut self,
         native: &'a idoris_backend::NativeCompletionRequest,
@@ -717,6 +819,7 @@ async fn dispatch_local_inner(
     cancel: CancellationToken,
 ) -> Result<ChatOutcome, ObservedDispatchError> {
     let LocalExecutionContext {
+        provider_admission,
         native,
         supervisor,
         budget_ledger,
@@ -773,6 +876,22 @@ async fn dispatch_local_inner(
             });
         }
     };
+    let Some(supervisor) = supervisor else {
+        return Ok(ChatOutcome {
+            decision,
+            served_locality,
+            result: Err(DispatchFailure::Backend(
+                BackendError::supervisor_unavailable(),
+            )),
+            actual_cost_minor: None,
+        });
+    };
+
+    let provider_guard = ProviderGuard::begin(
+        provider_admission,
+        &provider_id,
+        idoris_policy::breaker::CredentialClass::Local,
+    );
     if is_paid
         && let Some(context) = budget_event
         && crate::append_budget_reserved(context, selected)
@@ -785,17 +904,6 @@ async fn dispatch_local_inner(
     // any early return *and* on this future being dropped mid-`.await`
     // (client disconnect) — see its doc. Only the success path below
     // disarms it (via `take`) to settle instead.
-
-    let Some(supervisor) = supervisor else {
-        return Ok(ChatOutcome {
-            decision,
-            served_locality,
-            result: Err(DispatchFailure::Backend(
-                BackendError::supervisor_unavailable(),
-            )),
-            actual_cost_minor: None,
-        });
-    };
 
     // Cancelled on Drop too (in addition to whatever the caller does with
     // its own clone of `cancel`), so this future being dropped mid-`.await`
@@ -882,6 +990,7 @@ async fn dispatch_local_inner(
         .load(backend_model_id.clone(), admission_memory_gb, load_policy)
         .await
     {
+        provider_guard.finish(native_provider_outcome(&err, &backend_model_id, true));
         return Ok(ChatOutcome {
             decision,
             served_locality,
@@ -900,12 +1009,18 @@ async fn dispatch_local_inner(
         .chat(
             ChatRequest {
                 native: native.cloned(),
-                model: backend_model_id,
+                model: backend_model_id.clone(),
                 messages,
             },
             cancel,
         )
         .await;
+
+    let provider_outcome = match &chat_result {
+        Ok(_) => ProviderOutcome::Success,
+        Err(error) => native_provider_outcome(error, &backend_model_id, false),
+    };
+    provider_guard.finish(provider_outcome);
 
     // A successful upstream execution must be charged before any fallible
     // completion event append can return early and drop the reservation.
