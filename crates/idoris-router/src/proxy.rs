@@ -313,6 +313,77 @@ impl EgressCounter {
     }
 }
 
+use idoris_policy::breaker::{Admission, AdmissionTicket, CredentialClass};
+
+// Bound untrusted network headers only; the standalone core contract is uncapped.
+const MAX_PROVIDER_RETRY_AFTER_MS: u64 = 300_000;
+
+struct ProviderClaim<'a> {
+    proxy: &'a ChatProxy,
+    key: String,
+    class: CredentialClass,
+    ticket: Option<AdmissionTicket>,
+    probe: bool,
+}
+
+impl ProviderClaim<'_> {
+    fn finish(mut self, status: u16, retry_after_ms: Option<u64>) {
+        if let Some(ticket) = self.ticket.take() {
+            // Settlement owns an issued ticket and only runs core transitions.
+            // Recover poison here so ownership cannot strand a probe; admission fails closed.
+            let mut book = self
+                .proxy
+                .breakers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if status == 408 || status == 429 || (500..600).contains(&status) {
+                book.on_failure_with_retry_after(
+                    &self.key,
+                    self.class,
+                    ticket,
+                    self.proxy.now_ms(),
+                    retry_after_ms.filter(|_| status == 429 || status == 503),
+                );
+            } else {
+                book.on_success(&self.key, self.class, ticket);
+            }
+        }
+    }
+}
+
+impl Drop for ProviderClaim<'_> {
+    fn drop(&mut self) {
+        if self.probe
+            && let Some(ticket) = self.ticket.take()
+        {
+            // No IO or panicking poison unwrap; reopen from cancellation time.
+            self.proxy
+                .breakers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .on_failure(&self.key, self.class, ticket, self.proxy.now_ms());
+        }
+    }
+}
+
+/// The proxy only fronts `http_service` cards: loopback ones are local
+/// runtimes, anything else is treated as a keyed API.
+fn credential_class(url: &str) -> idoris_policy::breaker::CredentialClass {
+    if is_loopback_url(url) {
+        idoris_policy::breaker::CredentialClass::Local
+    } else {
+        idoris_policy::breaker::CredentialClass::ApiKey
+    }
+}
+
+fn wall_clock_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+        })
+}
+
 /// `localhost` or a loopback IP literal. Anything else — other names
 /// included, since they may resolve off-host — counts as egress.
 fn is_loopback_url(url: &str) -> bool {
@@ -332,6 +403,15 @@ fn is_loopback_url(url: &str) -> bool {
 pub struct ChatProxy {
     pub(crate) client: reqwest::Client,
     egress: Arc<EgressCounter>,
+    /// M5-14 provider breakers, keyed by dialed credential class and provider id.
+    breakers: Mutex<idoris_policy::breaker::BreakerBook<String>>,
+    /// On for a library-constructed proxy. The `idoris` binary turns it off
+    /// unless `IDORIS_PROVIDER_BREAKER=1`: the shared conformance contract
+    /// still says persistent 5xx is passed through verbatim, so enabling
+    /// breakers by default is an owner decision, not a silent change.
+    breaker_enabled: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    test_clock_ms: std::sync::atomic::AtomicU64,
     pub(crate) window: Duration,
     max_entries: usize,
     header_timeout: Duration,
@@ -354,6 +434,50 @@ pub struct ChatProxy {
 }
 
 impl ChatProxy {
+    /// Turns provider breakers on or off for every later admission.
+    pub fn set_breakers_enabled(&self, enabled: bool) {
+        self.breaker_enabled.store(enabled, Ordering::SeqCst);
+    }
+
+    fn breakers_enabled(&self) -> bool {
+        self.breaker_enabled.load(Ordering::SeqCst)
+    }
+
+    fn now_ms(&self) -> u64 {
+        #[cfg(test)]
+        {
+            let now = self.test_clock_ms.load(Ordering::SeqCst);
+            if now != u64::MAX {
+                return now;
+            }
+        }
+        wall_clock_ms()
+    }
+
+    fn admit_provider(&self, provider_id: &str, url: &str) -> Option<ProviderClaim<'_>> {
+        let class = credential_class(url);
+        let mut claim = ProviderClaim {
+            proxy: self,
+            key: provider_id.to_string(),
+            class,
+            ticket: None,
+            probe: false,
+        };
+        if self.breakers_enabled() {
+            let admit = self
+                .breakers
+                .lock()
+                .ok()?
+                .admit(&claim.key, class, self.now_ms());
+            if !admit.admitted() {
+                return None;
+            }
+            claim.probe = admit.admission == Admission::Probe;
+            claim.ticket = admit.ticket;
+        }
+        Some(claim)
+    }
+
     /// Off-host egress observed so far by this proxy.
     pub fn egress(&self) -> EgressSnapshot {
         self.egress.snapshot()
@@ -382,6 +506,10 @@ impl ChatProxy {
         Self {
             client,
             egress: Arc::new(EgressCounter::default()),
+            breakers: Mutex::new(idoris_policy::breaker::BreakerBook::new()),
+            breaker_enabled: std::sync::atomic::AtomicBool::new(true),
+            #[cfg(test)]
+            test_clock_ms: std::sync::atomic::AtomicU64::new(u64::MAX),
             window: DEFAULT_WINDOW,
             max_entries: DEFAULT_MAX_ENTRIES,
             header_timeout: Duration::from_secs(10),
@@ -1016,8 +1144,36 @@ impl ChatProxy {
             }
         }
 
+        // M5-14 provider breaker: an open provider is not sent to at all
+        // (no dispatched observation, nothing executed).
+        let Some(claim) = self.admit_provider(opts.provider_id, url) else {
+            return Ok(Self::flight_failure_with_execution(
+                503,
+                "provider_circuit_open",
+                ExecutionDisposition::NotExecuted,
+            ));
+        };
         observer().await?;
+        let mut retry_after_ms = None;
+        let Ok(outcome) = self
+            .send_buffered(url, payload, opts, uncertain, &mut retry_after_ms)
+            .await;
+        claim.finish(outcome.status, retry_after_ms);
+        Ok(outcome)
+    }
 
+    /// The buffered send with connection-failure retries. Only the upstream's
+    /// own answers and transport failures come out of here, which is what
+    /// the provider breaker counts (cache hits and local preflight exits
+    /// never reach it).
+    async fn send_buffered(
+        &self,
+        url: &str,
+        payload: &Value,
+        opts: &ForwardOpts<'_>,
+        uncertain: &mut bool,
+        retry_after_ms: &mut Option<u64>,
+    ) -> Result<ForwardOutcome, std::convert::Infallible> {
         let mut attempt = 0usize;
         loop {
             // Keep the transport error until retry classification: only a
@@ -1032,6 +1188,12 @@ impl ChatProxy {
                         .get(reqwest::header::CONTENT_TYPE)
                         .and_then(|v| v.to_str().ok())
                         .map(str::to_string);
+                    *retry_after_ms = resp
+                        .headers()
+                        .get(reqwest::header::RETRY_AFTER)
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(idoris_policy::breaker::parse_retry_after_ms)
+                        .map(|ms| ms.min(MAX_PROVIDER_RETRY_AFTER_MS));
                     #[allow(clippy::cast_possible_truncation)]
                     let retries = attempt as u32;
                     // A body that fails to read (connection dropped
@@ -1548,6 +1710,73 @@ mod tests {
         assert_eq!(body["marker"], "raw-passthrough");
     }
 
+    async fn upstream_sequence(statuses: &[(u16, Option<&str>)]) -> wiremock::MockServer {
+        let server = wiremock::MockServer::start().await;
+        for (priority, (status, retry_after)) in statuses.iter().enumerate() {
+            let mut template =
+                wiremock::ResponseTemplate::new(*status).set_body_json(serde_json::json!({}));
+            if let Some(seconds) = retry_after {
+                template = template.insert_header("retry-after", *seconds);
+            }
+            wiremock::Mock::given(wiremock::matchers::method("POST"))
+                .respond_with(template)
+                .up_to_n_times(1)
+                .with_priority(u8::try_from(priority + 1).unwrap())
+                .mount(&server)
+                .await;
+        }
+        server
+    }
+
+    async fn statuses(proxy: &ChatProxy, server: &wiremock::MockServer, n: usize) -> Vec<u16> {
+        let mut out = Vec::new();
+        for i in 0..n {
+            let record = format!("rec-{i}");
+            out.push(
+                proxy
+                    .forward_buffered(&server.uri(), &chat_body(), &opts(None, &record))
+                    .await
+                    .status,
+            );
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn local_provider_breaker_opens_after_two_failures() {
+        let server = upstream_sequence(&[(500, None), (502, None), (200, None)]).await;
+        let proxy = ChatProxy::new(reqwest::Client::new());
+        assert_eq!(statuses(&proxy, &server, 3).await, [500, 502, 503]);
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn retry_after_opens_the_breaker_before_the_threshold() {
+        let server = upstream_sequence(&[(429, Some("120")), (200, None)]).await;
+        let proxy = ChatProxy::new(reqwest::Client::new());
+        assert_eq!(statuses(&proxy, &server, 2).await, [429, 503]);
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn answers_that_are_not_provider_failures_keep_it_closed() {
+        let server = upstream_sequence(&[
+            (500, None),
+            (200, None),
+            (500, None),
+            (400, None),
+            (500, None),
+            (200, None),
+        ])
+        .await;
+        let proxy = ChatProxy::new(reqwest::Client::new());
+        assert_eq!(
+            statuses(&proxy, &server, 6).await,
+            [500, 200, 500, 400, 500, 200]
+        );
+        assert_eq!(server.received_requests().await.unwrap().len(), 6);
+    }
+
     #[test]
     fn only_localhost_and_loopback_literals_are_not_egress() {
         for url in [
@@ -2059,3 +2288,7 @@ mod k14_slow_reader_tests;
 #[cfg(test)]
 #[path = "proxy_stream_termination_tests.rs"]
 mod stream_termination_tests;
+
+#[cfg(test)]
+#[path = "proxy_breaker_atomic_tests.rs"]
+mod breaker_atomic_tests;

@@ -188,11 +188,15 @@ impl Breaker {
     }
 
     pub fn on_failure(&mut self, ticket: AdmissionTicket, now_ms: u64) {
+        self.on_failure_metadata(&ticket, now_ms);
+    }
+
+    fn on_failure_metadata(&mut self, ticket: &AdmissionTicket, now_ms: u64) {
         let AdmissionTicket {
             issuer,
             generation,
             probe,
-        } = ticket;
+        } = *ticket;
         if issuer != self.issuer {
             return;
         }
@@ -219,6 +223,27 @@ impl Breaker {
         }
     }
 
+    /// Count failure and apply its header atomically, consuming one ticket.
+    ///
+    /// ```compile_fail
+    /// use idoris_policy::breaker::{Breaker, CredentialClass};
+    /// let mut b = Breaker::new(CredentialClass::Local);
+    /// let ticket = b.admit(0).ticket.unwrap();
+    /// b.on_failure_with_retry_after(ticket, 0, Some(1000));
+    /// b.on_success(ticket);
+    /// ```
+    pub fn on_failure_with_retry_after(
+        &mut self,
+        ticket: AdmissionTicket,
+        now_ms: u64,
+        retry_after_ms: Option<u64>,
+    ) {
+        self.on_failure_metadata(&ticket, now_ms);
+        if let Some(ms) = retry_after_ms {
+            self.on_retry_after_metadata(&ticket, now_ms, ms);
+        }
+    }
+
     /// 上游明确给出 `Retry-After`：至少断开到那一刻（不会缩短已有窗口）。
     ///
     /// 票据只能使用一次。带 `Retry-After` 的响应只调用本方法，不要再调用
@@ -226,11 +251,20 @@ impl Breaker {
     /// 类别的完整恢复时间，header 更长时再延长。同一打开世代里、另一枚
     /// 尚未回报的票据仍可以延长窗口，但不能缩短。
     pub fn on_retry_after(&mut self, ticket: AdmissionTicket, now_ms: u64, retry_after_ms: u64) {
+        self.on_retry_after_metadata(&ticket, now_ms, retry_after_ms);
+    }
+
+    fn on_retry_after_metadata(
+        &mut self,
+        ticket: &AdmissionTicket,
+        now_ms: u64,
+        retry_after_ms: u64,
+    ) {
         let AdmissionTicket {
             issuer,
             generation,
             probe,
-        } = ticket;
+        } = *ticket;
         if issuer != self.issuer {
             return;
         }
@@ -259,9 +293,23 @@ impl Breaker {
 }
 
 /// `Retry-After` 的整数秒形式；HTTP-date 形式与非法值返回 `None`，调用方
-/// 退回到凭据类别的恢复窗口。
+/// 退回到凭据类别的恢复窗口。ASCII delta-seconds saturate on overflow;
+/// this parser returns raw milliseconds without a network-boundary cap.
 pub fn parse_retry_after_ms(raw: &str) -> Option<u64> {
-    raw.trim().parse::<u64>().ok()?.checked_mul(1000)
+    let digits = raw.trim().as_bytes();
+    if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    Some(
+        digits
+            .iter()
+            .fold(0_u64, |seconds, digit| {
+                seconds
+                    .saturating_mul(10)
+                    .saturating_add(u64::from(digit - b'0'))
+            })
+            .saturating_mul(1000),
+    )
 }
 
 /// 按（凭据类别，键）分开的一组断路器。同一个键的不同类别各有各的状态。
@@ -299,6 +347,19 @@ impl<K: Eq + Hash + Clone> BreakerBook<K> {
     ) {
         if let Some(breaker) = self.breakers.get_mut(&(class, key.clone())) {
             breaker.on_failure(ticket, now_ms);
+        }
+    }
+
+    pub fn on_failure_with_retry_after(
+        &mut self,
+        key: &K,
+        class: CredentialClass,
+        ticket: AdmissionTicket,
+        now_ms: u64,
+        ms: Option<u64>,
+    ) {
+        if let Some(breaker) = self.breakers.get_mut(&(class, key.clone())) {
+            breaker.on_failure_with_retry_after(ticket, now_ms, ms);
         }
     }
 

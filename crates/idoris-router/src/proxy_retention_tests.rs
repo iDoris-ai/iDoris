@@ -232,6 +232,9 @@ async fn flight_retention_is_byte_bounded_and_expires_without_reposting_ids() {
     proxy.max_flight_bytes = 96 * 1024;
     proxy.window = Duration::from_secs(60);
     proxy.permits = Arc::new(tokio::sync::Semaphore::new(1));
+    // Retention is under test here, not the provider breaker that eight
+    // consecutive 503s would otherwise open.
+    proxy.set_breakers_enabled(false);
 
     for i in 0..8 {
         let id = format!("large-{i}");

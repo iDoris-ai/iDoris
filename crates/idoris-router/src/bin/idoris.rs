@@ -313,6 +313,12 @@ async fn run(options: cli::ServeOptions) -> Result<(), String> {
         ..AppState::default()
     };
 
+    // M5-14: provider breakers stay off unless explicitly enabled; see
+    // ChatProxy::set_breakers_enabled.
+    state
+        .proxy
+        .set_breakers_enabled(env_flag("IDORIS_PROVIDER_BREAKER"));
+
     let addr = std::net::SocketAddr::from((bind_host, port));
     let data_listener = tokio::net::TcpListener::bind(addr)
         .await
