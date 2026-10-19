@@ -93,9 +93,70 @@ pub(super) fn scan_plain(units: &[u16]) -> Vec<Hit> {
         i = group_end;
     }
     scan_formatted(units, &mut hits);
+    scan_country_mobile(units, &mut hits);
     super::tokens::scan(units, &mut hits);
     super::secrets::scan(units, &mut hits);
     sort_dedup(hits)
+}
+
+/// Append exact 0086 mobile layouts without displacing existing numeric hits.
+fn scan_country_mobile(units: &[u16], hits: &mut Vec<Hit>) {
+    let mut i = 0;
+    while i < units.len() {
+        if !is_digit(units[i]) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < units.len() && is_digit(units[i]) {
+            i += 1;
+        }
+        if i - start > 15 {
+            continue;
+        }
+        let mut digits = [0u8; 15];
+        let mut lengths = [0usize; 4];
+        let mut total = i - start;
+        lengths[0] = total;
+        for (index, &unit) in units[start..i].iter().enumerate() {
+            digits[index] = (unit - u16::from(b'0')) as u8;
+        }
+        let mut end = i;
+        for count in 1..=4 {
+            if total == 15
+                && matches!(&lengths[..count], [15] | [4, 11] | [4, 3, 8] | [4, 3, 4, 4])
+                && digits[..4] == [0, 0, 8, 6]
+                && is_mobile(&digits[4..15])
+            {
+                hits.push(Hit {
+                    kind: FindingKind::CnMobile,
+                    start,
+                    length: end - start,
+                    sensitivity: Sensitivity::S2,
+                });
+                break;
+            }
+            if count == 4
+                || !units.get(end).is_some_and(|&u| is_formatted_separator(u))
+                || !units.get(end + 1).is_some_and(|&u| is_digit(u))
+            {
+                break;
+            }
+            let next_start = end + 1;
+            let mut next_end = next_start;
+            while next_end < units.len() && is_digit(units[next_end]) && total < 15 {
+                digits[total] = (units[next_end] - u16::from(b'0')) as u8;
+                total += 1;
+                next_end += 1;
+            }
+            // Do not accept a 15-digit prefix of an overlong maximal run.
+            if units.get(next_end).is_some_and(|&u| is_digit(u)) {
+                break;
+            }
+            lengths[count] = next_end - next_start;
+            end = next_end;
+        }
+    }
 }
 
 fn sort_dedup(mut hits: Vec<Hit>) -> Vec<Hit> {
