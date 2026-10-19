@@ -75,14 +75,17 @@ fn report(decoded: &[u8], start: usize, length: usize, hits: &mut Vec<Hit>) {
         return;
     };
     let units: Vec<u16> = text.encode_utf16().collect();
-    let normalized = super::normalize::normalize(&units);
-    for inner in super::l0::scan_plain(&normalized.units) {
-        hits.push(Hit {
-            kind: inner.kind,
-            start,
-            length,
-            sensitivity: inner.sensitivity,
-        });
+    // Plain-only scanning keeps the one-layer decode bound. Use the same
+    // independent fold views as inspect, including the non-escape views.
+    for view in super::normalize::views(&units) {
+        for inner in super::l0::scan_plain(&view.units) {
+            hits.push(Hit {
+                kind: inner.kind,
+                start,
+                length,
+                sensitivity: inner.sensitivity,
+            });
+        }
     }
 }
 

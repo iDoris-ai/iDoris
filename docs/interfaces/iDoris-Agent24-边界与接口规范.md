@@ -162,10 +162,10 @@
   - 鉴权：与协议端点同一套 virtual key，但**只看 key 的隐私上限**，不看 role（按 role 限定的 key 也能调用）。`X-iDoris-Privacy` 缺省为 `local_only`。调用方同意脱敏的线上表示尚未定义，所以目前只会返回 `BLOCK` / `ALLOW`，不会返回 `REDACT`。
 - **闸一在推理路径上的行为（M5，已实现，待评审）**：
   - `/v1/chat/completions`、`/v1/embeddings`、`/v1/rerank`、`/v1/messages` 在鉴权之后、路由策略和意图识别之前检查**整个请求体**（含 content parts、工具参数、数字字段）。判定不是 `ALLOW` 就把这次请求钉成 `local_only`（只收紧、不放宽）；没有可信本地卡时返回 `local_only_unavailable`，上游收到 0 个请求。
-  - 无法检查的内容（图片/音频/文件 part、`data:…;base64,`、token id 数组）不算"干净"，同样钉成 `local_only`。
+  - 无法检查的内容（图片/音频/文件 part、`data:…;base64,`）不算"干净"，同样钉成 `local_only`。本切片的整数数组启发式仅在一个数组至少有 8 项且各项均为整数时，将其视为 token id 数组并钉成本地；递归检查各子数组，不限于 `input` 字段。短整数数组（如 embeddings `input: [16,7529,4278,1234]`，或 `[[16,7529,4278,1234],[1,2,3]]`）不会仅因它们是整数数组而钉成本地；若没有其他命中，它们仍可保持 `any`。这是当前实现的覆盖缺口，不是内容已被证明安全。
   - chat 的 Event Log 多一个 `inspected` 事件（`request.received` 之后、`profiled` 之前），metadata 只有 `sensitivity`、`privacy`、`labels`（命中类别）和收紧时的 `reason`（`privacy_tightened_by_content` / `uninspectable_content` / `remote_kill_switch` / `inspect_failed`），不含原文和位置。
   - **远程熔断开关**：启动时 `IDORIS_REMOTE_KILL_SWITCH=1` 让所有请求按 `local_only` 处理；运行时切换需要 Admin v1 写接口（未定）。
-  - **provider 断路器**：二进制里默认关闭，`IDORIS_PROVIDER_BREAKER=1` 才启用（共享 conformance 仍约定"持续 5xx 原样透传"）。启用后：被断开的 provider 不再收到请求，选路会改选其他候选，全部断开时返回 503（发送前被拒为 `provider_circuit_open`）。
+  - **provider 断路器**：二进制里默认关闭，`IDORIS_PROVIDER_BREAKER=1` 才启用（共享 conformance 仍约定"持续 5xx 原样透传"）。在经 proxy 且执行断路器准入的路径上，OPEN 窗口内不向该 provider 发送请求，选路会尝试其他候选。本切片中全部候选因断路器被选路排除时，返回 503 `no_eligible_candidate`；只有请求已选中 provider、随后在 proxy 发送前被断路器拒绝时，才返回 503 `provider_circuit_open`。调用方不得假定所有断路器拒绝都带后一个原因码，也不得将此保证推广到 Supervisor 或订阅路径；这些路径的恢复窗口后持续锁定需由各自后续切片验证。
 
 ### 3.6 预算与计费
 
