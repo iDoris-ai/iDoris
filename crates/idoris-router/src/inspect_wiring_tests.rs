@@ -509,3 +509,48 @@ async fn only_post_is_routed() {
     let (status, _) = send(&app, request).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
+
+#[tokio::test]
+async fn opaque_data_urls_block_at_authenticated_inspect_endpoint() {
+    let (app, bearer) =
+        authenticated_app(vec![PrivacyClass::LocalOnly, PrivacyClass::Any], &["fast"]);
+    for input in [
+        "data:image/png;base64,YQ==",
+        "![label](DaTa:application/x-!opaque;BaSe64,YQ==)",
+        "<img src=\"data:text/plain;name=a!b;base64,YQ==\">",
+        "data:application/x-~opaque;base64,YQ==",
+        "data:;base64,YQ==",
+        "😀 label: 11010519491231002X data:image/png;base64,YQ==",
+    ] {
+        let body = json!({ "input": input }).to_string();
+        let (status, text) = send(
+            &app,
+            inspect_request(
+                &body,
+                &[("authorization", &bearer), ("x-idoris-privacy", "any")],
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{text}");
+        let response = contract(&text);
+        assert_eq!(response.sensitivity, Sensitivity::S3);
+        assert_eq!(response.action, InspectAction::Block);
+        assert!(!text.contains(input));
+        assert!(!text.contains("YQ=="));
+        assert!(!text.contains(ID));
+        if input.contains(ID) {
+            assert_eq!(
+                response.findings,
+                vec![InspectFinding {
+                    kind: FindingKind::CnResidentId,
+                    span: Some(InspectSpan {
+                        start: 10,
+                        length: 18
+                    }),
+                }]
+            );
+        } else {
+            assert!(response.findings.is_empty());
+        }
+    }
+}

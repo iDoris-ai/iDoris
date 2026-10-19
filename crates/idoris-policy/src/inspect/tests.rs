@@ -1576,3 +1576,139 @@ fn every_default_ignorable_range_still_breaks_an_entity_insertion() {
         );
     }
 }
+
+#[test]
+fn opaque_data_urls_block_both_consents_without_fabricated_findings() {
+    for input in [
+        "data:image/png;base64,YQ==",
+        "![label](data:image/png;base64,YQ==)",
+        "<img src=\"data:image/png;base64,YQ==\">",
+        "DaTa:Application/X-OPAQUE;BaSe64,YQ==",
+        "data:application/x-!opaque;base64,YQ==",
+        "data:text/plain;name=a!b;base64,YQ==",
+        "data:application/x-~opaque;base64,YQ==",
+        "data:;base64,YQ==",
+    ] {
+        for redact_consent in [false, true] {
+            let ctx = InspectCtx {
+                redact_consent,
+                ..open_ctx()
+            };
+            let response = inspect(input, &ctx);
+            assert_eq!(response.action, InspectAction::Block, "{input}");
+            assert_eq!(response.sensitivity, Sensitivity::S3, "{input}");
+            assert!(
+                response.findings.is_empty(),
+                "{input}: {:?}",
+                response.findings
+            );
+        }
+    }
+}
+
+#[test]
+fn opaque_header_alphabet_matches_accepted_ascii_predicate() {
+    for byte in 0u8..=127 {
+        let c = char::from(byte);
+        let expected = (33..=126).contains(&byte) && !b"\"()<>@,:\\[]?".contains(&byte);
+        assert_eq!(super::is_data_url_header_char(c), expected, "{byte}");
+        if expected {
+            let input = format!("data:application/x-{c};base64,YQ==");
+            let response = inspect(&input, &open_ctx());
+            assert_eq!(response.action, InspectAction::Block, "{input}");
+            assert_eq!(response.sensitivity, Sensitivity::S3, "{input}");
+        }
+    }
+    for c in ['é', '中', '😀'] {
+        assert!(!super::is_data_url_header_char(c));
+    }
+}
+
+#[test]
+fn opaque_lookalikes_and_header_terminators_do_not_trigger() {
+    for input in [
+        "ordinary data text",
+        "metadata: ordinary",
+        "data:text/plain,hello",
+        "data:text/plain;base64=YQ==",
+        "data:text/plain;base64",
+        "data:text/plain;base64;,YQ==",
+        "data:text/plain:bad;base64,YQ==",
+        "data:text/é;base64,YQ==",
+        "data:text/plain\n;base64,YQ==",
+        "data:text/plain\0;base64,YQ==",
+        "data:text/plain ;base64,YQ==",
+        "data:text/plain?x;base64,YQ==",
+    ] {
+        let response = inspect(input, &open_ctx());
+        assert_eq!(response.action, InspectAction::Allow, "{input}");
+        assert_eq!(response.sensitivity, Sensitivity::S0, "{input}");
+        assert!(response.findings.is_empty());
+    }
+    assert_eq!(
+        inspect("metadata: ordinary", &open_ctx()).action,
+        InspectAction::Allow
+    );
+}
+
+#[test]
+fn opaque_header_work_is_bounded_and_input_limit_precedes_helper() {
+    for (repeats, expected) in [(512, 2555), (4096, 20475)] {
+        super::reset_data_url_header_char_checks();
+        assert!(!super::contains_base64_data_url(&"data:".repeat(repeats)));
+        assert_eq!(super::data_url_header_char_checks(), expected);
+    }
+    let input = format!("data:application/x-{};base64,YQ==", "a".repeat(100_000));
+    let ctx = InspectCtx {
+        max_input_utf16: input.len() + 1,
+        ..open_ctx()
+    };
+    super::reset_data_url_header_char_checks();
+    assert_eq!(inspect(&input, &ctx).action, InspectAction::Block);
+    assert_eq!(super::data_url_header_char_checks(), 100_022);
+    super::reset_data_url_header_char_checks();
+    let limited = inspect(
+        &input,
+        &InspectCtx {
+            max_input_utf16: 16,
+            ..ctx
+        },
+    );
+    assert_eq!(super::data_url_header_char_checks(), 0);
+    assert_eq!(
+        limited.findings,
+        vec![InspectFinding {
+            kind: FindingKind::InputLimitExceeded,
+            span: None
+        }]
+    );
+}
+
+#[test]
+fn opaque_data_url_preserves_real_findings_and_supplementary_utf16_spans() {
+    for prefix in ["", "😀 label: "] {
+        let clean = format!("{prefix}11010519491231002X data:text/plain,hello");
+        let opaque = format!("{prefix}11010519491231002X data:text/plain;base64,YQ==");
+        for redact_consent in [false, true] {
+            let ctx = InspectCtx {
+                redact_consent,
+                ..open_ctx()
+            };
+            let expected = inspect(&clean, &ctx).findings;
+            assert_eq!(
+                expected,
+                vec![InspectFinding {
+                    kind: FindingKind::CnResidentId,
+                    span: Some(InspectSpan {
+                        start: prefix.encode_utf16().count() as u64,
+                        length: 18
+                    }),
+                }]
+            );
+            let response = inspect(&opaque, &ctx);
+            assert_eq!(response.findings, expected);
+            assert_eq!(response.sensitivity, Sensitivity::S3);
+            assert_eq!(response.action, InspectAction::Block);
+        }
+    }
+}

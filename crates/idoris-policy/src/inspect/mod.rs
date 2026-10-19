@@ -94,12 +94,22 @@ pub fn inspect(input: &str, ctx: &InspectCtx) -> InspectResponse {
     }
     let units: Vec<u16> = input.encode_utf16().collect();
     let hits = scan_all_views(&units, l0::scan);
-    let sensitivity = hits
-        .iter()
-        .map(|hit| hit.sensitivity)
-        .max()
-        .unwrap_or(Sensitivity::S0);
-    let action = decide_action(&hits, sensitivity, ctx);
+    // This ASCII data-URL rule blocks opaque payloads the scanner cannot inspect.
+    // Keep the real scanner findings and their original UTF-16 spans.
+    let opaque = contains_base64_data_url(input);
+    let sensitivity = if opaque {
+        Sensitivity::S3
+    } else {
+        hits.iter()
+            .map(|hit| hit.sensitivity)
+            .max()
+            .unwrap_or(Sensitivity::S0)
+    };
+    let action = if opaque {
+        InspectAction::Block
+    } else {
+        decide_action(&hits, sensitivity, ctx)
+    };
     let findings = hits
         .iter()
         .map(|hit| InspectFinding {
@@ -174,6 +184,65 @@ fn malformed_hkid_spelling(span: &[u16]) -> bool {
     let closes_full = span.iter().filter(|&&u| u == 0xFF09).count();
     let closes_ascii = span.iter().filter(|&&u| u == u16::from(b')')).count();
     span.contains(&0x3000) || opens_full != closes_full || opens_ascii != closes_ascii
+}
+
+/// `data:<mediatype>;base64,` anywhere, case-insensitive (RFC 2397).
+fn contains_base64_data_url(input: &str) -> bool {
+    let lower = input.to_ascii_lowercase();
+    lower.match_indices("data:").any(|(at, _)| {
+        let rest = &lower[at + 5..];
+        // End the header at the first character outside the MIME token
+        // alphabet plus `/`, `;` and `=` (RFC 2397 media type and
+        // parameters). Never search for a comma or whitespace: that walk
+        // can run to the end of every suffix. `:` is not a header
+        // character, so a repeated `data:data:…` input stops each scan at
+        // the very next occurrence — R4 of #454.
+        let header_end = rest
+            .find(|c: char| {
+                // Count every character this scan examines, including the
+                // terminator. A comma search that walks each suffix would
+                // blow this count up; the repeated-`data:` test pins it.
+                #[cfg(test)]
+                DATA_URL_HEADER_CHAR_CHECKS.with(|checks| checks.set(checks.get() + 1));
+                !is_data_url_header_char(c)
+            })
+            .unwrap_or(rest.len());
+        rest[..header_end].ends_with(";base64") && rest[header_end..].starts_with(',')
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    static DATA_URL_HEADER_CHAR_CHECKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn reset_data_url_header_char_checks() {
+    DATA_URL_HEADER_CHAR_CHECKS.with(|checks| checks.set(0));
+}
+
+#[cfg(test)]
+fn data_url_header_char_checks() -> u64 {
+    DATA_URL_HEADER_CHAR_CHECKS.with(std::cell::Cell::get)
+}
+
+/// Header character of a `data:` URL after ASCII lowercasing.
+///
+/// RFC 2045 `token` is US-ASCII 33–126 except `tspecials`. A data URL also
+/// needs the three tspecials `/` (type/subtype), `;` (parameter) and `=`
+/// (attribute value). `%` is already a token character. Everything else —
+/// space, controls, the remaining tspecials, and non-ASCII — ends the
+/// header. It is not skipped: skipping an unknown character would hide the
+/// comma and re-open the old quadratic scan. `:` stays a terminator so the
+/// next `data:` occurrence stops this scan in constant work.
+fn is_data_url_header_char(c: char) -> bool {
+    if !c.is_ascii() || c.is_ascii_control() || c == ' ' {
+        return false;
+    }
+    !matches!(
+        c,
+        '"' | '(' | ')' | '<' | '>' | '@' | ',' | ':' | '\\' | '[' | ']' | '?'
+    )
 }
 
 /// UTF-16 长度不会超过 UTF-8 字节数，所以字节数没超就一定没超，省掉一次计数。
