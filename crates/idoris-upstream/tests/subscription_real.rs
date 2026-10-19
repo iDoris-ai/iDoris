@@ -193,6 +193,7 @@ async fn wait_group_gone(group: i32) {
 
 fn request(model: &str, prompt: String) -> ChatRequest {
     ChatRequest {
+        native: None,
         model: model.to_string(),
         messages: vec![ChatMessage {
             role: "user".into(),

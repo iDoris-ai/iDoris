@@ -1,0 +1,8 @@
+{
+  "channels": ["pr"],
+  "users": [],
+  "mentions_only": false,
+  "trigger": "",
+  "trigger_timeout_seconds": 30,
+  "spool_dir": ""
+}

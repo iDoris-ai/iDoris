@@ -55,7 +55,7 @@ fn resident_card(endpoint: &str) -> ComponentCard {
             keepalive: Keepalive::Pinned { pinned: true },
             admission: Admission::Coexist,
         }),
-        extensions: None,
+        extensions: Some(serde_json::from_value(serde_json::json!({"_degradation":"No aliases when removed", "idoris_role_models":{"daily":"correlation-chat"}})).unwrap()),
     }
 }
 

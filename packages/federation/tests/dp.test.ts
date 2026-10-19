@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { addGaussianNoise, gaussianSigma, pairwiseMask, sumTensors, type Tensors } from "../src/index.js";
+import { addGaussianNoise, gaussianSigma, pairwiseMask, sumTensors, FederationError, type Tensors } from "../src/index.js";
 
 const plain: Tensors = { "layers.0.q_proj.lora_a": [0.5, -1.25, 3.0, 0.0] };
 
@@ -80,5 +80,33 @@ describe("T3.4.1 安全聚合：掩码在求和时抵消，单个上传量被遮
     const sum = sumTensors(masked).t ?? [];
     const expectSum = sumTensors(updates).t ?? [];
     for (let i = 0; i < sum.length; i += 1) expect(sum[i]).toBeCloseTo(expectSum[i] ?? 0, 9);
+  });
+});
+
+describe("sumTensors 拒绝不一致的张量长度", () => {
+  it("同一名字先短后长时拒绝，不丢掉多出来的坐标", () => {
+    const run = () => sumTensors([{ w: [1] }, { w: [10, 20] }]);
+    expect(run).toThrow(FederationError);
+    try {
+      run();
+    } catch (err) {
+      expect(err).toMatchObject({ code: "BASE_MISMATCH" });
+      expect((err as Error).message).toContain("w");
+      expect((err as Error).message).toContain("inconsistent length");
+    }
+  });
+
+  it("同一名字先长后短时拒绝，不把缺的坐标当成 0", () => {
+    const run = () => sumTensors([{ w: [1, 2] }, { w: [10] }]);
+    expect(run).toThrow(FederationError);
+    try {
+      run();
+    } catch (err) {
+      expect(err).toMatchObject({ code: "BASE_MISMATCH" });
+    }
+  });
+
+  it("长度一致时仍然逐坐标相加", () => {
+    expect(sumTensors([{ w: [1, 2] }, { w: [10, 20] }])).toEqual({ w: [11, 22] });
   });
 });

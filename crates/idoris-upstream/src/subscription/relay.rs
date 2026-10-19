@@ -112,6 +112,7 @@ impl SubscriptionRelay {
                 } else {
                     select_output(&workspace, &output.stdout, output.exit_code).map(|content| {
                         ChatResponse {
+                            native: None,
                             model: request.model,
                             content,
                         }

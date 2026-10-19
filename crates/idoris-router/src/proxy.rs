@@ -313,6 +313,59 @@ impl EgressCounter {
     }
 }
 
+use idoris_policy::breaker::{Admission, AdmissionTicket, CredentialClass};
+
+// Bound untrusted network headers only; the standalone core contract is uncapped.
+const MAX_PROVIDER_RETRY_AFTER_MS: u64 = 300_000;
+
+struct ProviderClaim<'a> {
+    proxy: &'a ChatProxy,
+    key: String,
+    class: CredentialClass,
+    ticket: Option<AdmissionTicket>,
+    probe: bool,
+}
+
+impl ProviderClaim<'_> {
+    fn finish(mut self, status: u16, retry_after_ms: Option<u64>) {
+        if let Some(ticket) = self.ticket.take() {
+            // Settlement owns an issued ticket and only runs core transitions.
+            // Recover poison here so ownership cannot strand a probe; admission fails closed.
+            let mut book = self
+                .proxy
+                .breakers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if status == 408 || status == 429 || (500..600).contains(&status) {
+                book.on_failure_with_retry_after(
+                    &self.key,
+                    self.class,
+                    ticket,
+                    self.proxy.now_ms(),
+                    retry_after_ms.filter(|_| status == 429 || status == 503),
+                );
+            } else {
+                book.on_success(&self.key, self.class, ticket);
+            }
+        }
+    }
+}
+
+impl Drop for ProviderClaim<'_> {
+    fn drop(&mut self) {
+        if self.probe {
+            if let Some(ticket) = self.ticket.take() {
+                // No IO or panicking poison unwrap; reopen from cancellation time.
+                self.proxy
+                    .breakers
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .on_failure(&self.key, self.class, ticket, self.proxy.now_ms());
+            }
+        }
+    }
+}
+
 /// The proxy only fronts `http_service` cards: loopback ones are local
 /// runtimes, anything else is treated as a keyed API.
 fn credential_class(url: &str) -> idoris_policy::breaker::CredentialClass {
@@ -357,6 +410,8 @@ pub struct ChatProxy {
     /// still says persistent 5xx is passed through verbatim, so enabling
     /// breakers by default is an owner decision, not a silent change.
     breaker_enabled: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    test_clock_ms: std::sync::atomic::AtomicU64,
     pub(crate) window: Duration,
     max_entries: usize,
     header_timeout: Duration,
@@ -390,50 +445,39 @@ impl ChatProxy {
         self.breaker_enabled.load(Ordering::SeqCst)
     }
 
-    fn admit_provider(&self, provider_id: &str, url: &str) -> bool {
-        if !self.breakers_enabled() {
-            return true;
+    fn now_ms(&self) -> u64 {
+        #[cfg(test)]
+        {
+            let now = self.test_clock_ms.load(Ordering::SeqCst);
+            if now != u64::MAX {
+                return now;
+            }
         }
-        let Ok(mut book) = self.breakers.lock() else {
-            return false;
-        };
-        book.admit(
-            &provider_id.to_string(),
-            credential_class(url),
-            wall_clock_ms(),
-        )
-        .admitted()
+        wall_clock_ms()
     }
 
-    /// 408, 429 and 5xx (including the proxy's own transport-failure 502/504)
-    /// count against the provider; any other answer proves it reachable. A
-    /// 429/503 `Retry-After` keeps it open at least that long.
-    fn report_provider(
-        &self,
-        provider_id: &str,
-        url: &str,
-        status: u16,
-        retry_after_ms: Option<u64>,
-    ) {
-        if !self.breakers_enabled() {
-            return;
-        }
-        let Ok(mut book) = self.breakers.lock() else {
-            return;
+    fn admit_provider(&self, provider_id: &str, url: &str) -> Option<ProviderClaim<'_>> {
+        let class = credential_class(url);
+        let mut claim = ProviderClaim {
+            proxy: self,
+            key: provider_id.to_string(),
+            class,
+            ticket: None,
+            probe: false,
         };
-        let (key, class, now_ms) = (
-            provider_id.to_string(),
-            credential_class(url),
-            wall_clock_ms(),
-        );
-        if status == 408 || status == 429 || (500..600).contains(&status) {
-            book.on_failure(&key, class, now_ms);
-            if let Some(ms) = retry_after_ms.filter(|_| status == 429 || status == 503) {
-                book.on_retry_after(&key, class, now_ms, ms);
+        if self.breakers_enabled() {
+            let admit = self
+                .breakers
+                .lock()
+                .ok()?
+                .admit(&claim.key, class, self.now_ms());
+            if !admit.admitted() {
+                return None;
             }
-        } else {
-            book.on_success(&key, class);
+            claim.probe = admit.admission == Admission::Probe;
+            claim.ticket = admit.ticket;
         }
+        Some(claim)
     }
 
     /// Off-host egress observed so far by this proxy.
@@ -466,6 +510,8 @@ impl ChatProxy {
             egress: Arc::new(EgressCounter::default()),
             breakers: Mutex::new(idoris_policy::breaker::BreakerBook::new()),
             breaker_enabled: std::sync::atomic::AtomicBool::new(true),
+            #[cfg(test)]
+            test_clock_ms: std::sync::atomic::AtomicU64::new(u64::MAX),
             window: DEFAULT_WINDOW,
             max_entries: DEFAULT_MAX_ENTRIES,
             header_timeout: Duration::from_secs(10),
@@ -1102,19 +1148,19 @@ impl ChatProxy {
 
         // M5-14 provider breaker: an open provider is not sent to at all
         // (no dispatched observation, nothing executed).
-        if !self.admit_provider(opts.provider_id, url) {
+        let Some(claim) = self.admit_provider(opts.provider_id, url) else {
             return Ok(Self::flight_failure_with_execution(
                 503,
                 "provider_circuit_open",
                 ExecutionDisposition::NotExecuted,
             ));
-        }
+        };
         observer().await?;
         let mut retry_after_ms = None;
         let Ok(outcome) = self
             .send_buffered(url, payload, opts, uncertain, &mut retry_after_ms)
             .await;
-        self.report_provider(opts.provider_id, url, outcome.status, retry_after_ms);
+        claim.finish(outcome.status, retry_after_ms);
         Ok(outcome)
     }
 
@@ -1148,7 +1194,8 @@ impl ChatProxy {
                         .headers()
                         .get(reqwest::header::RETRY_AFTER)
                         .and_then(|v| v.to_str().ok())
-                        .and_then(idoris_policy::breaker::parse_retry_after_ms);
+                        .and_then(idoris_policy::breaker::parse_retry_after_ms)
+                        .map(|ms| ms.min(MAX_PROVIDER_RETRY_AFTER_MS));
                     #[allow(clippy::cast_possible_truncation)]
                     let retries = attempt as u32;
                     // A body that fails to read (connection dropped
@@ -2243,3 +2290,7 @@ mod k14_slow_reader_tests;
 #[cfg(test)]
 #[path = "proxy_stream_termination_tests.rs"]
 mod stream_termination_tests;
+
+#[cfg(test)]
+#[path = "proxy_breaker_atomic_tests.rs"]
+mod breaker_atomic_tests;

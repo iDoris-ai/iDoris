@@ -21,7 +21,7 @@
 > 反面教材是「先把租户、路由、密钥、语音、发行五套设计一起建完再接消费者」——iDoris 现在零代码，一次背五套未验证设计必然返工。
 
 - **F1.1 契约层落地** — 把 06 §10 的五份契约从 YAML 片段变成可执行的 TS 类型 + zod schema + 校验器；组件卡缺策略字段即拒绝注册。这是整个体系的资产，先于任何实现。
-- **F1.2 能力③ 本地模型编排** — LoadPolicy 抽象 + oMLX 适配器（U0 已实测其 knob）+ 跨平台后端探测骨架。**不写死 oMLX**。
+- **F1.2 能力③ 本地模型编排** — LoadPolicy 抽象 + oMLX 适配器（U0 已实测其 knob）+ 跨平台后端探测骨架。**不写死 oMLX**。后端分配见 [`../18-推理后端与决策模型-vLLM与Decision3.0评估.md`](../18-推理后端与决策模型-vLLM与Decision3.0评估.md) §2（Mac 保留 oMLX，Linux 补 vLLM，Windows 补 Ollama）。
 - **F1.3 iDoris Router 薄编排层** — 统一 `/v1` 出口、控制面 header 解析、声明式 policy 解释引擎、fail-closed 隐私门禁、降级链。
 - **F1.4 能力① 订阅中转（可选/best-effort）** — spawn `claude -p` / `codex exec` 封 OpenAI-compat，loopback + 单用户硬绑定。**绝不作为核心正确性的必需 fallback**。
 - **F1.6 审计与用量账本（自 M2 上移）** — 审计记录（元数据白名单 + `reason`）、按 tenant 的用量聚合与账期时区凭据。**下游的计费依据，不进 M1 消费者就用不了。**
@@ -34,7 +34,7 @@
 - **F2.1 HardwareAwareModelRecommender** — 按 07 §5 的公式与伪代码实现：硬件探测 + 模型目录 + 打分 → 常驻/临时组合 + 警告 + sysctl 建议 + 可读 tradeoff。
 - **F2.2 容量接口与可观测** — `GET /capabilities` 暴露 `resident/estimated_memory_gb/ctx_limit/queue_depth/admission_status`；路由决策审计日志。
 - **F2.3 Agent24 集成交接** — 按 [`../09-对Agent24的需求.md`](../09-对Agent24的需求.md) R1–R6 交出需求与联调；iDoris 侧只提供 provider 与契约，**不改 Agent24 内核**。
-- **F2.4 语义意图路由** — 引入 semantic-router（[`../10-入口路由模型-调研对比.md`](../10-入口路由模型-调研对比.md) 首选），把 `X-iDoris-Intent` 从「调用方声明」升级为「可自动识别」。
+- **F2.4 语义意图路由** — 引入 semantic-router（[`../10-入口路由模型-调研对比.md`](../10-入口路由模型-调研对比.md) 首选），把 `X-iDoris-Intent` 从「调用方声明」升级为「可自动识别」。2026-10-15 方向为评测 Decision 3.0（经 oMLX `/v1/systemone`），达标后只提议、先 shadow 后生效、必要 judge 不可用默认拒绝；计划修订须经审核，开发另待 owner 许可，见 [`../18-…`](../18-推理后端与决策模型-vLLM与Decision3.0评估.md) §3；任务拆分见 [`plans/runtime-portability-and-decision-model.md`](plans/runtime-portability-and-decision-model.md)。
 - **F2.5 能力② 外部 API 槽位** — 仅 OpenAI-compat 冒烟证明槽位可接；OmniRoute/ClawRouter/LiteLLM 三选一与保真度矩阵 **BLOCKED**（缺 Anthropic/Gemini key + 无真实消费者）。
 
 ## M3 — 自增长与联邦（F0 → F1 → F2）
