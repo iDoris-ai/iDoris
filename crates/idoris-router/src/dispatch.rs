@@ -17,7 +17,7 @@ use idoris_contracts::load_policy::{Admission, Keepalive, LoadMode, LoadPolicy};
 use idoris_contracts::provider::Locality;
 use idoris_policy::{
     AdmissionStatus, Card, Decision, PolicyCtx, ROLES, ReasonCode, Rejection, RequestProfile,
-    decide_with_affinity_and_ready, effective_served_locality,
+    effective_served_locality,
 };
 use idoris_tenancy::budget::{BudgetError, BudgetLedger, ReservationId};
 use tokio_util::sync::CancellationToken;
@@ -286,16 +286,83 @@ pub fn select_with_affinity_and_ready(
     affinity_key: Option<&str>,
     ready_provider_ids: &BTreeSet<String>,
 ) -> Result<Selected, DispatchError> {
+    select_with_gate_snapshot(
+        cards,
+        profile,
+        prompt,
+        affinity_key,
+        ready_provider_ids,
+        &vec![false; cards.len()],
+    )
+}
+
+/// Two policy passes over one immutable, positional readiness snapshot.
+/// Only resident HTTP can fall back to the final atomic send refusal.
+pub(crate) fn select_with_gate_fallback(
+    cards: &[ComponentCard],
+    profile: &ParsedProfile,
+    prompt: &str,
+    affinity_key: Option<&str>,
+    ready_provider_ids: &BTreeSet<String>,
+    blocked: &[bool],
+) -> Result<Selected, DispatchError> {
+    match select_with_gate_snapshot(
+        cards,
+        profile,
+        prompt,
+        affinity_key,
+        ready_provider_ids,
+        blocked,
+    ) {
+        Err(DispatchError::Rejection(_)) => {
+            let fallback: Vec<bool> = cards
+                .iter()
+                .zip(blocked)
+                .map(|(card, blocked)| *blocked && !is_resident_http_service(card))
+                .collect();
+            select_with_gate_snapshot(
+                cards,
+                profile,
+                prompt,
+                affinity_key,
+                ready_provider_ids,
+                &fallback,
+            )
+        }
+        result => result,
+    }
+}
+
+pub(crate) fn select_with_gate_snapshot(
+    cards: &[ComponentCard],
+    profile: &ParsedProfile,
+    prompt: &str,
+    affinity_key: Option<&str>,
+    ready_provider_ids: &BTreeSet<String>,
+    blocked: &[bool],
+) -> Result<Selected, DispatchError> {
+    assert_eq!(
+        cards.len(),
+        blocked.len(),
+        "gate snapshot must match candidate slice"
+    );
     let candidates: Vec<Card> = cards
         .iter()
-        .filter(|card| {
+        .zip(blocked)
+        .filter(|(card, _)| {
             role_models(card).is_ok_and(|models| {
                 profile.role.is_none_or(|role| {
                     fixed_subscription_roles(card) || models.contains_key(role.as_str())
                 })
             })
         })
-        .map(|c| candidate(c, prompt))
+        .map(|(c, blocked)| {
+            let mut card = candidate(c, prompt);
+            if *blocked {
+                card.admission_status = AdmissionStatus::Blocked;
+            }
+            card
+        })
         .collect();
     let request_profile = RequestProfile {
         task: profile.task.clone(),
@@ -307,7 +374,7 @@ pub fn select_with_affinity_and_ready(
         min_ram_gb: None,
         budget: None,
     };
-    let decision = decide_with_affinity_and_ready(
+    let (decision, chosen) = idoris_policy::pipeline::decide_with_affinity_and_ready_selected(
         &request_profile,
         &candidates,
         &ctx,
@@ -315,12 +382,6 @@ pub fn select_with_affinity_and_ready(
         ready_provider_ids,
     )
     .map_err(DispatchError::Rejection)?;
-    let Some(chosen) = candidates.iter().find(|c| c.id() == decision.chosen_id) else {
-        return Err(DispatchError::Internal(format!(
-            "decide() returned chosen_id {:?} absent from its own candidate list",
-            decision.chosen_id
-        )));
-    };
     let served_locality = effective_served_locality(chosen);
     let load_policy = chosen
         .component

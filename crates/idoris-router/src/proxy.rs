@@ -505,6 +505,53 @@ impl ChatProxy {
         wall_clock_ms()
     }
 
+    /// Advisory readiness only: no entries, tickets, or probe ownership are created.
+    pub(crate) fn blocked_cards(&self, cards: &[idoris_contracts::ComponentCard]) -> Vec<bool> {
+        if !self.breakers_enabled() {
+            return vec![false; cards.len()];
+        }
+        let keys: Vec<_> = cards
+            .iter()
+            .map(|card| {
+                use crate::subscription::card::{CardBoundary, classify_subscription_card};
+                let (class, connection) = match classify_subscription_card(card) {
+                    Ok(CardBoundary::Subscription) => (CredentialClass::OAuth, None),
+                    Ok(CardBoundary::Ordinary)
+                        if crate::dispatch::is_resident_http_service(card) =>
+                    {
+                        (
+                            credential_class(&card.endpoint),
+                            connection_key(&card.endpoint),
+                        )
+                    }
+                    Ok(CardBoundary::Ordinary)
+                        if card.form == idoris_contracts::component_card::Form::HttpService =>
+                    {
+                        (CredentialClass::Local, None)
+                    }
+                    Ok(CardBoundary::Ordinary) | Err(_) => return None, // Retain the existing invalid-boundary rejection.
+                };
+                Some((provider_key(&card.provider.id), connection, class))
+            })
+            .collect();
+        let Ok(book) = self.breakers.lock() else {
+            return vec![true; cards.len()];
+        };
+        let now = self.now_ms();
+        keys.iter()
+            .map(|keys| {
+                keys.as_ref().is_some_and(|(provider, connection, class)| {
+                    matches!(
+                        book.readiness(provider, *class, now),
+                        Admission::Rejected { .. }
+                    ) || connection.as_ref().is_some_and(|key| {
+                        matches!(book.readiness(key, *class, now), Admission::Rejected { .. })
+                    })
+                })
+            })
+            .collect()
+    }
+
     fn claim_send(&self, provider_id: &str, url: &str) -> Option<CapturedSendClaim<'_>> {
         let mut claim = CapturedSendClaim {
             proxy: self,
@@ -2414,3 +2461,7 @@ mod breaker_pair_tests;
 #[cfg(test)]
 #[path = "proxy_stream_breaker_tests.rs"]
 mod stream_breaker_tests;
+
+#[cfg(test)]
+#[path = "proxy_card_selection_tests.rs"]
+mod card_selection_tests;
