@@ -1071,3 +1071,96 @@ async fn poisoned_issued_success_and_ignored_drop_preserve_exact_probe_floors() 
         }
     }
 }
+
+#[tokio::test]
+async fn paid_missing_supervisor_preserves_budget_event_precedence_refund_and_no_capture() {
+    use idoris_tenancy::event_log::{EventLogStore, EventType};
+    for fail_event in [false, true] {
+        let p = proxy();
+        let before_book = snapshot(&p);
+        let card = crate::tests::paid_component_card("native");
+        let profile = crate::profile::parse_profile(
+            &Default::default(),
+            None,
+            idoris_contracts::DeployMode::Personal,
+        )
+        .unwrap();
+        let selected = dispatch::select(std::slice::from_ref(&card), &profile, "hi").unwrap();
+        assert!(selected.estimated_cost_minor > 0);
+        let (_budget_root, ledger) = crate::tests::configured_budget_ledger(1_000_000);
+        let before = ledger
+            .tenant_readview(crate::budget::PERSONAL_TENANT_ID)
+            .unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let db = root.path().join("events.sqlite3");
+        let event_log = Arc::new(EventLogStore::open(&db).unwrap());
+        if fail_event {
+            rusqlite::Connection::open(&db).unwrap().execute_batch("CREATE TRIGGER fail_missing_supervisor_budget BEFORE INSERT ON event_log_events WHEN NEW.event_type='budget.reserved' BEGIN SELECT RAISE(ABORT,'test budget observer'); END;").unwrap();
+        }
+        let context = crate::BudgetReservedEventContext {
+            event_log: event_log.clone(),
+            tenant_id: crate::budget::PERSONAL_TENANT_ID.into(),
+            record_id: "missing-supervisor".into(),
+            correlation: Default::default(),
+        };
+        let result = dispatch::dispatch_local_preselected_observed(
+            &selected,
+            dispatch::LocalExecutionContext::new(
+                None,
+                Some(&ledger),
+                Some(&context),
+                None,
+                None,
+                None,
+            )
+            .with_provider_admission(&p),
+            &profile,
+            dispatch::DispatchInput::with_model(Some("native"), "hi"),
+            vec![],
+            CancellationToken::new(),
+        )
+        .await;
+        if fail_event {
+            assert!(
+                matches!(
+                    result,
+                    Err(dispatch::ObservedDispatchError::EventLogUnavailable)
+                ),
+                "parent budget-observer error must precede missing Supervisor"
+            );
+        } else {
+            let outcome = result.unwrap();
+            assert!(matches!(
+                outcome.result,
+                Err(dispatch::DispatchFailure::Backend(
+                    BackendError::SupervisorUnavailable
+                ))
+            ));
+        }
+        let events = event_log
+            .events_for_record(
+                Some(crate::budget::PERSONAL_TENANT_ID),
+                "missing-supervisor",
+            )
+            .unwrap();
+        assert_eq!(events.len(), usize::from(!fail_event));
+        if let Some(event) = events.first() {
+            assert_eq!(event.event.event_type, EventType::BudgetReserved);
+            assert_eq!(
+                event.event.metadata.get("reserved_minor"),
+                Some(&serde_json::json!(selected.estimated_cost_minor))
+            );
+        }
+        let after = ledger
+            .tenant_readview(crate::budget::PERSONAL_TENANT_ID)
+            .unwrap();
+        assert_eq!(after.spent_minor, before.spent_minor);
+        assert_eq!(after.reserved_minor, before.reserved_minor);
+        assert_eq!(after.available_minor, before.available_minor);
+        assert_eq!(
+            snapshot(&p),
+            before_book,
+            "missing Supervisor cannot capture or insert a provider"
+        );
+    }
+}

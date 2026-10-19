@@ -876,19 +876,8 @@ async fn dispatch_local_inner(
             });
         }
     };
-    let Some(supervisor) = supervisor else {
-        return Ok(ChatOutcome {
-            decision,
-            served_locality,
-            result: Err(DispatchFailure::Backend(
-                BackendError::supervisor_unavailable(),
-            )),
-            actual_cost_minor: None,
-        });
-    };
-
     let provider_guard = ProviderGuard::begin(
-        provider_admission,
+        provider_admission.filter(|_| supervisor.is_some()),
         &provider_id,
         idoris_policy::breaker::CredentialClass::Local,
     );
@@ -904,6 +893,17 @@ async fn dispatch_local_inner(
     // any early return *and* on this future being dropped mid-`.await`
     // (client disconnect) — see its doc. Only the success path below
     // disarms it (via `take`) to settle instead.
+
+    let Some(supervisor) = supervisor else {
+        return Ok(ChatOutcome {
+            decision,
+            served_locality,
+            result: Err(DispatchFailure::Backend(
+                BackendError::supervisor_unavailable(),
+            )),
+            actual_cost_minor: None,
+        });
+    };
 
     // Cancelled on Drop too (in addition to whatever the caller does with
     // its own clone of `cancel`), so this future being dropped mid-`.await`
