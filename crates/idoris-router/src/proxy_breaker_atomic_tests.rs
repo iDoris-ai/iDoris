@@ -310,17 +310,17 @@ async fn cache_and_preflight_bypass_admission_when_open() {
         .await
         .unwrap();
     assert_eq!(cached.status, 200);
-    let mut request = opts(None);
-    request.privacy = PrivacyClass::LocalOnly;
-    request.served_locality = Locality::Remote;
+    let request = opts(Some("cache"));
+    let different_body = serde_json::json!({"model":"different","messages":[]});
     let rejected = p
-        .forward_buffered_observed(&s.uri(), &body(), &request, || async {
+        .forward_buffered_observed(&s.uri(), &different_body, &request, || async {
             n.fetch_add(1, Ordering::SeqCst);
             Ok::<(), ()>(())
         })
         .await
         .unwrap();
-    assert_ne!(rejected.status, 200);
+    assert_eq!(rejected.status, 409);
+    assert_eq!(rejected.execution, ExecutionDisposition::NotExecuted);
     assert_eq!(n.load(Ordering::SeqCst), 0);
     assert_eq!(s.received_requests().await.unwrap().len(), 1);
 }
