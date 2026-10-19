@@ -533,8 +533,8 @@ async fn opaque_data_urls_block_at_authenticated_inspect_endpoint() {
         .await;
         assert_eq!(status, StatusCode::OK, "{text}");
         let response = contract(&text);
-        assert_eq!(response.sensitivity, Sensitivity::S3);
         assert_eq!(response.action, InspectAction::Block);
+        assert_eq!(response.sensitivity, Sensitivity::S3);
         assert!(!text.contains(input));
         assert!(!text.contains("YQ=="));
         assert!(!text.contains(ID));
