@@ -207,7 +207,14 @@ fn contains_base64_data_url(input: &str) -> bool {
                 !is_data_url_header_char(c)
             })
             .unwrap_or(rest.len());
-        rest[..header_end].ends_with(";base64") && rest[header_end..].starts_with(',')
+        // A header with no payload is a template or a sentence, not an opaque
+        // body. Require one base64 alphabet byte after the comma.
+        rest[..header_end].ends_with(";base64")
+            && rest[header_end..].starts_with(',')
+            && rest
+                .as_bytes()
+                .get(header_end + 1)
+                .is_some_and(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/'))
     })
 }
 

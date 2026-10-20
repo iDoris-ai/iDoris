@@ -1625,7 +1625,7 @@ fn opaque_header_alphabet_matches_accepted_ascii_predicate() {
 }
 
 #[test]
-fn opaque_lookalikes_and_header_terminators_do_not_trigger() {
+fn opaque_non_payloads_and_non_base64_headers_do_not_trigger() {
     for input in [
         "ordinary data text",
         "metadata: ordinary",
@@ -1633,12 +1633,10 @@ fn opaque_lookalikes_and_header_terminators_do_not_trigger() {
         "data:text/plain;base64=YQ==",
         "data:text/plain;base64",
         "data:text/plain;base64;,YQ==",
-        "data:text/plain:bad;base64,YQ==",
-        "data:text/é;base64,YQ==",
-        "data:text/plain\n;base64,YQ==",
-        "data:text/plain\0;base64,YQ==",
-        "data:text/plain ;base64,YQ==",
-        "data:text/plain?x;base64,YQ==",
+        "data:image/png;base64,",
+        "const src = `data:image/png;base64,${b64}`;",
+        "'data:image/jpeg;base64,' + data",
+        "Prefix the payload with data:image/png;base64, and then the bytes",
     ] {
         let response = inspect(input, &open_ctx());
         assert_eq!(response.action, InspectAction::Allow, "{input}");
@@ -1649,6 +1647,29 @@ fn opaque_lookalikes_and_header_terminators_do_not_trigger() {
         inspect("metadata: ordinary", &open_ctx()).action,
         InspectAction::Allow
     );
+}
+
+/// Known gap, not a lookalike claim. Node's WHATWG `data:` processor decodes
+/// these to `a`, because it strips whitespace and accepts a broader header.
+/// This linear scan still ends the header at space, controls, `:`, `?`, and
+/// non-ASCII, so these stay Allow until a single-pass decoder replaces it.
+#[test]
+fn opaque_browser_decoded_forms_are_a_known_gap() {
+    for input in [
+        "data:text/plain:bad;base64,YQ==",
+        "data:text/\u{00e9};base64,YQ==",
+        "data:text/plain\n;base64,YQ==",
+        "data:text/plain\0;base64,YQ==",
+        "data:text/plain ;base64,YQ==",
+        "data:text/plain?x;base64,YQ==",
+        "data:image/png; base64,YQ==",
+        "data:image/png;base64 ,YQ==",
+        "data:text/plain;charset=\"utf-8\";base64,YQ==",
+    ] {
+        let response = inspect(input, &open_ctx());
+        assert_eq!(response.action, InspectAction::Allow, "{input}");
+        assert_eq!(response.sensitivity, Sensitivity::S0, "{input}");
+    }
 }
 
 #[test]
