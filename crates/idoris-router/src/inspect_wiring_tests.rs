@@ -509,3 +509,65 @@ async fn only_post_is_routed() {
     let (status, _) = send(&app, request).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
+
+#[test]
+fn crossline_modern_ids_respect_json_value_boundaries() {
+    for body in [
+        json!(["1101051949", "1231002X"]),
+        json!({"1101051949": "1231002X"}),
+        json!([110105194912_u64, 310003_u64]),
+        json!({"nested": [["1101051949"], ["1231002X"]]}),
+        json!({"messages": [{"content": [{"text": "1101051949"}, {"text": "1231002X"}]}]}),
+        json!({"input": "\"1101051949\",\n\"1231002X\""}),
+    ] {
+        let result = inspect::inspect_body(&body, PrivacyClass::Any, false);
+        assert!(
+            !result
+                .response
+                .findings
+                .iter()
+                .any(|f| f.kind == FindingKind::CnResidentId),
+            "{body}: {:?}",
+            result.response
+        );
+    }
+    let body = json!({"input": "1101051949\n1231002X"});
+    let result = inspect::inspect_body(&body, PrivacyClass::Any, false);
+    assert_eq!(result.effective, PrivacyClass::LocalOnly);
+    assert!(result.tightened);
+    assert_eq!(result.response.action, InspectAction::Block);
+    assert_eq!(result.response.sensitivity, Sensitivity::S3);
+    assert!(result.response.findings.contains(&InspectFinding {
+        kind: FindingKind::CnResidentId,
+        span: Some(InspectSpan {
+            start: 6,
+            length: 19
+        }),
+    }));
+}
+
+#[tokio::test]
+async fn crossline_modern_id_is_blocked_by_authenticated_inspect_endpoint() {
+    let (app, bearer) = authenticated_app(vec![PrivacyClass::Any], &["fast"]);
+    for input in ["1101051949\n1231002X", "110105194912\n31002X\n"] {
+        let (status, text) = send(
+            &app,
+            inspect_request(
+                &json!({"input": input}).to_string(),
+                &[("authorization", &bearer), ("x-idoris-privacy", "any")],
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let response = contract(&text);
+        assert_eq!(response.action, InspectAction::Block);
+        assert_eq!(response.sensitivity, Sensitivity::S3);
+        assert!(response.findings.contains(&InspectFinding {
+            kind: FindingKind::CnResidentId,
+            span: Some(InspectSpan {
+                start: 0,
+                length: 19
+            }),
+        }));
+    }
+}
