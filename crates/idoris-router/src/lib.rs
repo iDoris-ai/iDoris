@@ -1126,6 +1126,7 @@ async fn messages_stream(
             &selected.card.endpoint,
             proxy::StreamingUpstreamPath::MESSAGES,
             body_value,
+            selected.card.provider.id.as_str(),
         )
         .await
     {
@@ -2726,12 +2727,17 @@ async fn chat_via_proxy_stream(
 ) -> Response {
     let outcome = state
         .proxy
-        .forward_stream_observed(&selected.card.endpoint, body_value, || async {
-            if let Some(context) = events.dispatched {
-                append_dispatched(context, selected).await?;
-            }
-            Ok::<(), ()>(())
-        })
+        .forward_stream_observed(
+            &selected.card.endpoint,
+            body_value,
+            selected.card.provider.id.as_str(),
+            || async {
+                if let Some(context) = events.dispatched {
+                    append_dispatched(context, selected).await?;
+                }
+                Ok::<(), ()>(())
+            },
+        )
         .await;
     let Ok(outcome) = outcome else {
         return event_log_unavailable_response();
