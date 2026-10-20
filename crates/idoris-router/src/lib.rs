@@ -116,7 +116,7 @@ use uuid::Uuid;
 
 use dispatch::{
     DispatchError, DispatchFailure, LocalExecutionContext, ObservedDispatchError, Selected,
-    dispatch_local, dispatch_local_preselected_observed, reason_header_value,
+    dispatch_local_preselected_observed, reason_header_value,
 };
 use profile::{ParsedProfile, ProfileError, parse_profile};
 
@@ -680,6 +680,9 @@ async fn embeddings(
     // Caller headers may further constrain routing elsewhere, but they cannot
     // turn an embeddings request into a chat/rerank dispatch.
     parsed.task.capabilities = Some(vec![Capability::Embedding]);
+    let request_id = headers
+        .get(HEADER_REQUEST_ID)
+        .and_then(|value| value.to_str().ok());
     if let Err(response) = enforce_protocol_key_scope(
         &state,
         &headers,
@@ -699,7 +702,22 @@ async fn embeddings(
         .into_iter()
         .filter(dispatch::is_resident_http_service)
         .collect::<Vec<_>>();
-    let selected = match dispatch::select(&cards, &parsed, "") {
+    let mut blocked = state.proxy.blocked_cards(&cards);
+    state.proxy.unmask_idempotent_bindings(
+        &cards,
+        &mut blocked,
+        parsed.tenant_id.as_deref(),
+        request_id,
+        "/v1/embeddings",
+    );
+    let selected = match dispatch::select_with_gate_fallback(
+        &cards,
+        &parsed,
+        "",
+        None,
+        &Default::default(),
+        &blocked,
+    ) {
         Ok(selected) => selected,
         Err(DispatchError::Rejection(rejection)) => return rejection_response(rejection),
         Err(DispatchError::Internal(message)) => {
@@ -831,6 +849,9 @@ async fn rerank(
         Err(error) => return error.into_response(),
     };
     parsed.task.capabilities = Some(vec![Capability::Rerank]);
+    let request_id = headers
+        .get(HEADER_REQUEST_ID)
+        .and_then(|value| value.to_str().ok());
     if let Err(response) = enforce_protocol_key_scope(
         &state,
         &headers,
@@ -850,7 +871,22 @@ async fn rerank(
         .into_iter()
         .filter(dispatch::is_resident_http_service)
         .collect::<Vec<_>>();
-    let selected = match dispatch::select(&cards, &parsed, "") {
+    let mut blocked = state.proxy.blocked_cards(&cards);
+    state.proxy.unmask_idempotent_bindings(
+        &cards,
+        &mut blocked,
+        parsed.tenant_id.as_deref(),
+        request_id,
+        "/v1/rerank",
+    );
+    let selected = match dispatch::select_with_gate_fallback(
+        &cards,
+        &parsed,
+        "",
+        None,
+        &Default::default(),
+        &blocked,
+    ) {
         Ok(selected) => selected,
         Err(DispatchError::Rejection(rejection)) => return rejection_response(rejection),
         Err(DispatchError::Internal(message)) => {
@@ -992,6 +1028,9 @@ async fn messages(
         Ok(parsed) => parsed,
         Err(error) => return error.into_response(),
     };
+    let request_id = headers
+        .get(HEADER_REQUEST_ID)
+        .and_then(|value| value.to_str().ok());
     parsed.task.capabilities = Some(vec![Capability::Chat]);
     if let Err(response) = enforce_protocol_key_scope(
         &state,
@@ -1012,7 +1051,22 @@ async fn messages(
         .into_iter()
         .filter(dispatch::is_resident_http_service)
         .collect::<Vec<_>>();
-    let selected = match dispatch::select(&cards, &parsed, "") {
+    let mut blocked = state.proxy.blocked_cards(&cards);
+    state.proxy.unmask_idempotent_bindings(
+        &cards,
+        &mut blocked,
+        parsed.tenant_id.as_deref(),
+        request_id,
+        "/v1/messages",
+    );
+    let selected = match dispatch::select_with_gate_fallback(
+        &cards,
+        &parsed,
+        "",
+        None,
+        &Default::default(),
+        &blocked,
+    ) {
         Ok(selected) => selected,
         Err(DispatchError::Rejection(rejection)) => return rejection_response(rejection),
         Err(DispatchError::Internal(message)) => {
@@ -2366,12 +2420,23 @@ async fn chat_completions(
         std::collections::BTreeSet::new()
     };
 
-    let selection = dispatch::select_with_affinity_and_ready(
+    let mut blocked = state.proxy.blocked_cards(&policy_cards.cards);
+    state.proxy.unmask_idempotent_bindings(
+        &policy_cards.cards,
+        &mut blocked,
+        parsed.tenant_id.as_deref(),
+        headers
+            .get(HEADER_REQUEST_ID)
+            .and_then(|value| value.to_str().ok()),
+        "/v1/chat/completions",
+    );
+    let selection = dispatch::select_with_gate_fallback(
         &policy_cards.cards,
         &parsed,
         &prompt,
         affinity_key,
         &ready_provider_ids,
+        &blocked,
     );
     let rejection_reason = match &selection {
         Ok(_) => None,
@@ -2538,7 +2603,13 @@ async fn chat_completions(
     // The request token is a fresh child of this TCP connection's lifetime.
     // Completing the request body does not cancel it; EOF/reset/shutdown of
     // the actual connection does.
-    let selected_for_dispatch = selection.ok();
+    let selected_for_dispatch = match selection {
+        Ok(selected) => Some(selected),
+        Err(DispatchError::Rejection(rejection)) => return rejection_response(rejection),
+        Err(DispatchError::Internal(message)) => {
+            return error_envelope(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", message);
+        }
+    };
     let selected_estimated_cost = selected_for_dispatch
         .as_ref()
         .map(|selected| selected.estimated_cost_minor);
@@ -2573,19 +2644,11 @@ async fn chat_completions(
             }
         }
     } else {
-        // Readiness only breaks ties between eligible targets. A failed
-        // selection has none, so this path can preserve the public dispatch
-        // input shape while reproducing the same rejection.
-        dispatch_local(
-            &policy_cards.cards,
-            supervisor,
-            budget_ledger,
-            &parsed,
-            dispatch::DispatchInput::with_model(model, &prompt).with_affinity(affinity_key),
-            messages,
-            lifecycle.cancellation_token(),
-        )
-        .await
+        return error_envelope(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal_error",
+            "missing selected candidate",
+        );
     };
     match dispatch_result {
         Err(DispatchError::Rejection(rejection)) => rejection_response(rejection),
