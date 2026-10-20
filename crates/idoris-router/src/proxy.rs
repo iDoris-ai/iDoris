@@ -505,6 +505,94 @@ impl ChatProxy {
         wall_clock_ms()
     }
 
+    /// Advisory readiness only: no entries, tickets, or probe ownership are created.
+    pub(crate) fn blocked_cards(&self, cards: &[idoris_contracts::ComponentCard]) -> Vec<bool> {
+        if !self.breakers_enabled() {
+            return vec![false; cards.len()];
+        }
+        let keys: Vec<_> = cards
+            .iter()
+            .map(|card| {
+                use crate::subscription::card::{CardBoundary, classify_subscription_card};
+                let (class, connection) = match classify_subscription_card(card) {
+                    Ok(CardBoundary::Subscription) => (CredentialClass::OAuth, None),
+                    Ok(CardBoundary::Ordinary)
+                        if crate::dispatch::is_resident_http_service(card) =>
+                    {
+                        (
+                            credential_class(&card.endpoint),
+                            connection_key(&card.endpoint),
+                        )
+                    }
+                    Ok(CardBoundary::Ordinary)
+                        if card.form == idoris_contracts::component_card::Form::HttpService =>
+                    {
+                        (CredentialClass::Local, None)
+                    }
+                    Ok(CardBoundary::Ordinary) | Err(_) => return None, // Retain the existing invalid-boundary rejection.
+                };
+                Some((provider_key(&card.provider.id), connection, class))
+            })
+            .collect();
+        let Ok(book) = self.breakers.lock() else {
+            return vec![true; cards.len()];
+        };
+        let now = self.now_ms();
+        keys.iter()
+            .map(|keys| {
+                keys.as_ref().is_some_and(|(provider, connection, class)| {
+                    matches!(
+                        book.readiness(provider, *class, now),
+                        Admission::Rejected { .. }
+                    ) || connection.as_ref().is_some_and(|key| {
+                        matches!(book.readiness(key, *class, now), Admission::Rejected { .. })
+                    })
+                })
+            })
+            .collect()
+    }
+
+    /// A cooling card that already owns this request-id must stay selectable.
+    /// Masking it first changes the cache key and executes the retry elsewhere.
+    pub(crate) fn unmask_idempotent_bindings(
+        &self,
+        cards: &[idoris_contracts::ComponentCard],
+        blocked: &mut [bool],
+        tenant_id: Option<&str>,
+        request_id: Option<&str>,
+        path: &str,
+    ) {
+        let Some(request_id) = request_id.filter(|id| !id.is_empty()) else {
+            return;
+        };
+        if blocked.len() != cards.len() {
+            return;
+        }
+        let tenant = tenant_id.unwrap_or("\u{0}personal");
+        for (card, blocked) in cards.iter().zip(blocked.iter_mut()) {
+            if !*blocked {
+                continue;
+            }
+            let url = format!("{}{path}", card.endpoint.trim_end_matches('/'));
+            let key = cache_key(tenant, &url, &card.provider.id, request_id);
+            if self.idempotent_key_present(&key) {
+                *blocked = false;
+            }
+        }
+    }
+
+    fn idempotent_key_present(&self, key: &str) -> bool {
+        if let Ok(cache) = self.cache.lock()
+            && let Some(entry) = cache.get(key)
+            && Instant::now().duration_since(entry.at) < self.window
+        {
+            return true;
+        }
+        self.flights
+            .lock()
+            .is_ok_and(|flights| flights.contains_key(key))
+    }
+
     fn claim_send(&self, provider_id: &str, url: &str) -> Option<CapturedSendClaim<'_>> {
         let mut claim = CapturedSendClaim {
             proxy: self,
@@ -1372,10 +1460,16 @@ impl ChatProxy {
     /// `opts.stream` (only the *retry* sub-branch inside it is gated on
     /// `!opts.stream`), so a streaming request whose upstream call fails
     /// outright still gets a plain JSON/text error body, never an SSE
-    /// stream carrying an error.
+    /// stream carrying an error. Without a configured card, the endpoint
+    /// is used as the provider key.
     pub async fn forward_stream(&self, endpoint: &str, body: &Value) -> StreamOutcome {
-        self.forward_stream_path(endpoint, StreamingUpstreamPath::CHAT_COMPLETIONS, body)
-            .await
+        self.forward_stream_path(
+            endpoint,
+            StreamingUpstreamPath::CHAT_COMPLETIONS,
+            body,
+            endpoint,
+        )
+        .await
     }
 
     pub(crate) async fn forward_stream_path(
@@ -1383,9 +1477,10 @@ impl ChatProxy {
         endpoint: &str,
         upstream_path: StreamingUpstreamPath,
         body: &Value,
+        provider_id: &str,
     ) -> StreamOutcome {
         let result = self
-            .forward_stream_path_observed(endpoint, upstream_path, body, || async {
+            .forward_stream_path_observed(endpoint, upstream_path, body, provider_id, || async {
                 Ok::<(), std::convert::Infallible>(())
             })
             .await;
@@ -1402,6 +1497,7 @@ impl ChatProxy {
         &self,
         endpoint: &str,
         body: &Value,
+        provider_id: &str,
         observer: F,
     ) -> Result<StreamOutcome, E>
     where
@@ -1412,16 +1508,19 @@ impl ChatProxy {
             endpoint,
             StreamingUpstreamPath::CHAT_COMPLETIONS,
             body,
+            provider_id,
             observer,
         )
         .await
     }
 
+    /// Account for initial headers only; later SSE fate is a stream outcome.
     async fn forward_stream_path_observed<F, Fut, E>(
         &self,
         endpoint: &str,
         upstream_path: StreamingUpstreamPath,
         body: &Value,
+        provider_id: &str,
         observer: F,
     ) -> Result<StreamOutcome, E>
     where
@@ -1440,6 +1539,15 @@ impl ChatProxy {
         if let Some(obj) = payload.as_object_mut() {
             obj.insert("stream".to_string(), Value::Bool(true));
         }
+        let Some(claim) = self.claim_send(provider_id, &url) else {
+            let failure = Self::flight_failure(503, "provider_circuit_open");
+            return Ok(StreamOutcome::Buffered {
+                status: failure.status,
+                body: failure.body,
+                content_type: failure.content_type,
+                execution: failure.execution,
+            });
+        };
         observer().await?;
         let sent =
             match tokio::time::timeout(self.header_timeout, self.outbound(&url, &payload).send())
@@ -1447,6 +1555,7 @@ impl ChatProxy {
             {
                 Ok(sent) => sent,
                 Err(_) => {
+                    claim.finish(504, None);
                     return Ok(Self::stream_failure(504, ExecutionDisposition::Uncertain));
                 }
             };
@@ -1458,6 +1567,12 @@ impl ChatProxy {
                     .get(reqwest::header::CONTENT_TYPE)
                     .and_then(|v| v.to_str().ok())
                     .map(str::to_string);
+                let retry_after_ms = resp
+                    .headers()
+                    .get(reqwest::header::RETRY_AFTER)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(idoris_policy::breaker::parse_retry_after_ms);
+                claim.finish(status, retry_after_ms);
                 if (200..300).contains(&status) {
                     let idle = self.stream_idle_timeout;
                     #[cfg(test)]
@@ -1602,14 +1717,18 @@ impl ChatProxy {
                     }
                 }
             }
-            Err(err) => Self::stream_failure(
-                if err.is_timeout() { 504 } else { 502 },
-                if err.is_connect() {
-                    ExecutionDisposition::NotExecuted
-                } else {
-                    ExecutionDisposition::Uncertain
-                },
-            ),
+            Err(err) => {
+                let status = if err.is_timeout() { 504 } else { 502 };
+                claim.finish(status, None);
+                Self::stream_failure(
+                    status,
+                    if err.is_connect() {
+                        ExecutionDisposition::NotExecuted
+                    } else {
+                        ExecutionDisposition::Uncertain
+                    },
+                )
+            }
         })
     }
 
@@ -2379,3 +2498,11 @@ mod breaker_atomic_tests;
 #[cfg(test)]
 #[path = "proxy_breaker_pair_tests.rs"]
 mod breaker_pair_tests;
+
+#[cfg(test)]
+#[path = "proxy_stream_breaker_tests.rs"]
+mod stream_breaker_tests;
+
+#[cfg(test)]
+#[path = "proxy_card_selection_tests.rs"]
+mod card_selection_tests;
