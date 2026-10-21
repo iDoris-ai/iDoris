@@ -618,6 +618,47 @@ impl ChatProxy {
             .collect()
     }
 
+    /// A cooling card that already owns this request-id must stay selectable.
+    /// Masking it first changes the cache key and executes the retry elsewhere.
+    pub(crate) fn unmask_idempotent_bindings(
+        &self,
+        cards: &[idoris_contracts::ComponentCard],
+        blocked: &mut [bool],
+        tenant_id: Option<&str>,
+        request_id: Option<&str>,
+        path: &str,
+    ) {
+        let Some(request_id) = request_id.filter(|id| !id.is_empty()) else {
+            return;
+        };
+        if blocked.len() != cards.len() {
+            return;
+        }
+        let tenant = tenant_id.unwrap_or("\u{0}personal");
+        for (card, blocked) in cards.iter().zip(blocked.iter_mut()) {
+            if !*blocked {
+                continue;
+            }
+            let url = format!("{}{path}", card.endpoint.trim_end_matches('/'));
+            let key = cache_key(tenant, &url, &card.provider.id, request_id);
+            if self.idempotent_key_present(&key) {
+                *blocked = false;
+            }
+        }
+    }
+
+    fn idempotent_key_present(&self, key: &str) -> bool {
+        if let Ok(cache) = self.cache.lock()
+            && let Some(entry) = cache.get(key)
+            && Instant::now().duration_since(entry.at) < self.window
+        {
+            return true;
+        }
+        self.flights
+            .lock()
+            .is_ok_and(|flights| flights.contains_key(key))
+    }
+
     fn claim_send(&self, provider_id: &str, url: &str) -> Option<CapturedSendClaim<'_>> {
         let mut claim = CapturedSendClaim {
             proxy: self,

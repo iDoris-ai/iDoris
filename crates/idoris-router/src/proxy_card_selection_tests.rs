@@ -574,3 +574,61 @@ fn fallback_preserves_role_capability_privacy_cost_and_ready_admission_order() {
         "unknown price cannot manufacture eligible fallback"
     );
 }
+
+#[tokio::test]
+async fn cached_request_id_replays_on_the_cooling_card_and_does_not_execute_the_alternate() {
+    let origin = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"marker": "a"})))
+        .expect(1)
+        .mount(&origin)
+        .await;
+    let alternate = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"marker": "b"})))
+        .expect(0)
+        .mount(&alternate)
+        .await;
+    let state = crate::AppState {
+        cards: vec![
+            resident_component_card("a", &origin.uri()),
+            resident_component_card("b", &alternate.uri()),
+        ],
+        ..crate::AppState::default()
+    };
+    state.proxy.set_breakers_enabled(true);
+    state.proxy.test_clock_ms.store(5_000, Ordering::SeqCst);
+    let proxy = std::sync::Arc::clone(&state.proxy);
+    let app = crate::build_app(state);
+    let body = r#"{"model":"idoris/daily","messages":[{"role":"user","content":"hi"}]}"#;
+    let first = app
+        .clone()
+        .oneshot(post_chat(body, &[("x-idoris-request-id", "retry-1")]))
+        .await
+        .unwrap();
+    assert_eq!(first.status(), axum::http::StatusCode::OK);
+    let first_body = first.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(&first_body[..], br#"{"marker":"a"}"#);
+    {
+        let mut book = proxy.breakers.lock().unwrap();
+        let key = provider_key("a");
+        let class = credential_class(&origin.uri());
+        let ticket = book.admit(&key, class, 5_000).ticket.unwrap();
+        book.on_retry_after(&key, class, ticket, 5_000, 60_000);
+    }
+    let second = app
+        .oneshot(post_chat(body, &[("x-idoris-request-id", "retry-1")]))
+        .await
+        .unwrap();
+    assert_eq!(second.status(), axum::http::StatusCode::OK);
+    assert_eq!(
+        second
+            .headers()
+            .get("x-idoris-cached")
+            .and_then(|value| value.to_str().ok()),
+        Some("true")
+    );
+    second.into_body().collect().await.unwrap();
+    origin.verify().await;
+    alternate.verify().await;
+}

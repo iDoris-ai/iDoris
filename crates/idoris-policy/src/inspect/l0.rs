@@ -93,9 +93,71 @@ pub(super) fn scan_plain(units: &[u16]) -> Vec<Hit> {
         i = group_end;
     }
     scan_formatted(units, &mut hits);
+    scan_country_mobile(units, &mut hits);
     super::tokens::scan(units, &mut hits);
     super::secrets::scan(units, &mut hits);
+    scan_crossline_modern_id(units, &mut hits);
     sort_dedup(hits)
+}
+
+/// Append exact 0086 mobile layouts without displacing existing numeric hits.
+fn scan_country_mobile(units: &[u16], hits: &mut Vec<Hit>) {
+    let mut i = 0;
+    while i < units.len() {
+        if !is_digit(units[i]) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < units.len() && is_digit(units[i]) {
+            i += 1;
+        }
+        if i - start > 15 {
+            continue;
+        }
+        let mut digits = [0u8; 15];
+        let mut lengths = [0usize; 4];
+        let mut total = i - start;
+        lengths[0] = total;
+        for (index, &unit) in units[start..i].iter().enumerate() {
+            digits[index] = (unit - u16::from(b'0')) as u8;
+        }
+        let mut end = i;
+        for count in 1..=4 {
+            if total == 15
+                && matches!(&lengths[..count], [15] | [4, 11] | [4, 3, 8] | [4, 3, 4, 4])
+                && digits[..4] == [0, 0, 8, 6]
+                && is_mobile(&digits[4..15])
+            {
+                hits.push(Hit {
+                    kind: FindingKind::CnMobile,
+                    start,
+                    length: end - start,
+                    sensitivity: Sensitivity::S2,
+                });
+                break;
+            }
+            if count == 4
+                || !units.get(end).is_some_and(|&u| is_formatted_separator(u))
+                || !units.get(end + 1).is_some_and(|&u| is_digit(u))
+            {
+                break;
+            }
+            let next_start = end + 1;
+            let mut next_end = next_start;
+            while next_end < units.len() && is_digit(units[next_end]) && total < 15 {
+                digits[total] = (units[next_end] - u16::from(b'0')) as u8;
+                total += 1;
+                next_end += 1;
+            }
+            // Do not accept a 15-digit prefix of an overlong maximal run.
+            if units.get(next_end).is_some_and(|&u| is_digit(u)) {
+                break;
+            }
+            lengths[count] = next_end - next_start;
+            end = next_end;
+        }
+    }
 }
 
 fn sort_dedup(mut hits: Vec<Hit>) -> Vec<Hit> {
@@ -356,4 +418,99 @@ fn valid_date(year: u32, month: u32, day: u32) -> bool {
         _ => return false,
     };
     (1..=days).contains(&day)
+}
+
+/// Append checksum-valid modern IDs across bounded ASCII gaps. Existing scans
+/// retain their own grammar and coverage. Each maximal run is an outer start
+/// once; lookahead consumes at most 18 digits, 17 three-unit gaps and boundary
+/// context. No candidate starts inside a run or retries a truncated suffix.
+fn scan_crossline_modern_id(units: &[u16], hits: &mut Vec<Hit>) {
+    let mut i = 0;
+    while i < units.len() {
+        if !is_digit(units[i]) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < units.len() && is_digit(units[i]) {
+            i += 1;
+        }
+        if i - start > 18 || crossline_left_neighbor(units, start) {
+            continue;
+        }
+        let mut digits = [0u8; 18];
+        let mut total = i - start;
+        for (index, &unit) in units[start..i].iter().enumerate() {
+            digits[index] = (unit - u16::from(b'0')) as u8;
+        }
+        let mut end = i;
+        let mut crossed = false;
+        loop {
+            let x_suffix = total == 17 && units.get(end).is_some_and(|&u| matches!(u, 88 | 120));
+            if total == 18 || x_suffix {
+                let check_end = end + usize::from(x_suffix);
+                let check = if x_suffix { b'X' } else { digits[17] + b'0' };
+                if crossed
+                    && !crossline_right_neighbor(units, check_end)
+                    && id_structure(&digits[..17])
+                    && id_sensitivity(&digits[..17], check) == Sensitivity::S3
+                {
+                    hits.push(Hit {
+                        kind: FindingKind::CnResidentId,
+                        start,
+                        length: check_end - start,
+                        sensitivity: Sensitivity::S3,
+                    });
+                }
+                break;
+            }
+            let Some((next, line_break)) = crossline_gap(units, end) else {
+                break;
+            };
+            let mut cursor = next;
+            while cursor < units.len() && is_digit(units[cursor]) && total < 18 {
+                digits[total] = (units[cursor] - u16::from(b'0')) as u8;
+                total += 1;
+                cursor += 1;
+            }
+            if units.get(cursor).is_some_and(|&u| is_digit(u)) {
+                break;
+            }
+            end = cursor;
+            crossed |= line_break;
+        }
+    }
+}
+
+/// Only a complete 1..=3-unit gap ending at a digit connects two runs.
+fn crossline_gap(units: &[u16], start: usize) -> Option<(usize, bool)> {
+    let mut end = start;
+    let mut line_break = false;
+    while end - start < 3 && units.get(end).is_some_and(|&u| crossline_separator(u)) {
+        line_break |= matches!(units[end], 10 | 13);
+        end += 1;
+    }
+    (end > start && units.get(end).is_some_and(|&u| is_digit(u))).then_some((end, line_break))
+}
+
+fn crossline_separator(unit: u16) -> bool {
+    matches!(unit, 32 | 45 | 9 | 10 | 13)
+}
+
+/// A preceding connected run on this line cannot be omitted from the ID.
+fn crossline_left_neighbor(units: &[u16], start: usize) -> bool {
+    let mut cursor = start;
+    let mut line_break = false;
+    while start - cursor < 3 && cursor > 0 && crossline_separator(units[cursor - 1]) {
+        cursor -= 1;
+        line_break |= matches!(units[cursor], 10 | 13);
+    }
+    cursor < start && cursor > 0 && !line_break && is_digit(units[cursor - 1])
+}
+
+/// Inspect context even at the digit cap, including digits after terminal X.
+/// A connected next line may bound the ID; a same-line numeric tail may not.
+fn crossline_right_neighbor(units: &[u16], end: usize) -> bool {
+    units.get(end).is_some_and(|&u| is_digit(u))
+        || crossline_gap(units, end).is_some_and(|(_, line_break)| !line_break)
 }

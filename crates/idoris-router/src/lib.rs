@@ -680,6 +680,9 @@ async fn embeddings(
     // Caller headers may further constrain routing elsewhere, but they cannot
     // turn an embeddings request into a chat/rerank dispatch.
     parsed.task.capabilities = Some(vec![Capability::Embedding]);
+    let request_id = headers
+        .get(HEADER_REQUEST_ID)
+        .and_then(|value| value.to_str().ok());
     if let Err(response) = enforce_protocol_key_scope(
         &state,
         &headers,
@@ -699,7 +702,14 @@ async fn embeddings(
         .into_iter()
         .filter(dispatch::is_resident_http_service)
         .collect::<Vec<_>>();
-    let blocked = state.proxy.blocked_cards(&cards);
+    let mut blocked = state.proxy.blocked_cards(&cards);
+    state.proxy.unmask_idempotent_bindings(
+        &cards,
+        &mut blocked,
+        parsed.tenant_id.as_deref(),
+        request_id,
+        "/v1/embeddings",
+    );
     let selected = match dispatch::select_with_gate_fallback(
         &cards,
         &parsed,
@@ -839,6 +849,9 @@ async fn rerank(
         Err(error) => return error.into_response(),
     };
     parsed.task.capabilities = Some(vec![Capability::Rerank]);
+    let request_id = headers
+        .get(HEADER_REQUEST_ID)
+        .and_then(|value| value.to_str().ok());
     if let Err(response) = enforce_protocol_key_scope(
         &state,
         &headers,
@@ -858,7 +871,14 @@ async fn rerank(
         .into_iter()
         .filter(dispatch::is_resident_http_service)
         .collect::<Vec<_>>();
-    let blocked = state.proxy.blocked_cards(&cards);
+    let mut blocked = state.proxy.blocked_cards(&cards);
+    state.proxy.unmask_idempotent_bindings(
+        &cards,
+        &mut blocked,
+        parsed.tenant_id.as_deref(),
+        request_id,
+        "/v1/rerank",
+    );
     let selected = match dispatch::select_with_gate_fallback(
         &cards,
         &parsed,
@@ -1008,6 +1028,9 @@ async fn messages(
         Ok(parsed) => parsed,
         Err(error) => return error.into_response(),
     };
+    let request_id = headers
+        .get(HEADER_REQUEST_ID)
+        .and_then(|value| value.to_str().ok());
     parsed.task.capabilities = Some(vec![Capability::Chat]);
     if let Err(response) = enforce_protocol_key_scope(
         &state,
@@ -1028,7 +1051,14 @@ async fn messages(
         .into_iter()
         .filter(dispatch::is_resident_http_service)
         .collect::<Vec<_>>();
-    let blocked = state.proxy.blocked_cards(&cards);
+    let mut blocked = state.proxy.blocked_cards(&cards);
+    state.proxy.unmask_idempotent_bindings(
+        &cards,
+        &mut blocked,
+        parsed.tenant_id.as_deref(),
+        request_id,
+        "/v1/messages",
+    );
     let selected = match dispatch::select_with_gate_fallback(
         &cards,
         &parsed,
@@ -2390,7 +2420,16 @@ async fn chat_completions(
         std::collections::BTreeSet::new()
     };
 
-    let blocked = state.proxy.blocked_cards(&policy_cards.cards);
+    let mut blocked = state.proxy.blocked_cards(&policy_cards.cards);
+    state.proxy.unmask_idempotent_bindings(
+        &policy_cards.cards,
+        &mut blocked,
+        parsed.tenant_id.as_deref(),
+        headers
+            .get(HEADER_REQUEST_ID)
+            .and_then(|value| value.to_str().ok()),
+        "/v1/chat/completions",
+    );
     let selection = dispatch::select_with_gate_fallback(
         &policy_cards.cards,
         &parsed,

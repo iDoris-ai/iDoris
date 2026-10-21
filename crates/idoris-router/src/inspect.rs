@@ -97,8 +97,8 @@ pub(crate) struct Inspection {
 }
 
 /// Inspects every object key, string and number in `body` — content parts,
-/// tool definitions and arguments included — joined by newlines so values
-/// never merge into one digit group. `declared` must already have passed the
+/// tool definitions and arguments included — joined by one-unit NUL boundaries so values
+/// never merge into a cross-line digit group. `declared` must already have passed the
 /// caller's key scope, so remote is allowed unless `kill_switch` is engaged.
 pub(crate) fn inspect_body(
     body: &serde_json::Value,
@@ -119,7 +119,7 @@ pub(crate) fn inspect_body(
     }
     fn push_line(out: &mut String, text: &str) {
         out.push_str(text);
-        out.push('\n');
+        out.push('\0');
     }
     let mut text = String::new();
     collect(body, &mut text);
