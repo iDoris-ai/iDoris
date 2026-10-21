@@ -49,6 +49,283 @@ Core product invariants:
 - 发布完成不等于 onboarding/Agent24 已完成：角色→真实模型绑定仍有缺口，默认 `idoris/daily` 会落到 `omlx` ID；需先修复并验收真实 Agent24 接入，再推进 M5。M5–M8 是后续计划，不是本版交付。
 - 保留既有暂停作业与 worker 所有权；远程评审为权威，不启动本地 PR Review Watcher。轮询遵循全局 5 分钟策略；禁止自动选择 Fast/priority 服务。
 
+## Historical CI audit — 2026-10-12 (not current; main has moved)
+
+- Full live audit found **39 original queued PRs with failed CLA checks**:
+  #422 and #424–#461. CLA signatures in the configured
+  `AAStarCommunity/Brood` `cla-signatures` store do not include `clestons`.
+  The contributor must sign personally; do not sign on their behalf, change
+  contributor attribution or bypass this gate. A green newer descendant
+  does not make these older PR heads green.
+- Three older jobs also failed independently of CLA:
+  - #439 / run 38152050067: descendant process-group cleanup; #466 contains
+    the fixture repair, but the older head still has a failed check.
+  - #448 / run 38152082197: Unicode decimal neighbour generated as
+    "non-digit" context. The original regression seed reproduces locally.
+  - #452 / run 38152099270: inline temporary script test returns sanitized
+    SpawnFailed. The underlying errno is unavailable; ETXTBSY is a plausible
+    filesystem failure pattern, not a proven diagnosis of this run.
+- New #490 (`5f443d06f4f87801774b3820b1e24aefcd8f3799`, base #489)
+  repairs the property domain,
+  retains the original seed and deterministic Unicode boundaries, and moves
+  both inline spawn scripts into the stable fake CLI fixture (74 changed
+  lines). Inspect 38 tests / 4096 property cases, spawn 5 tests, full
+  feature-enabled serial Rust tests, strict fmt/clippy/deny and all six TS
+  gates pass; TS conformance 134/8. All nine remote checks are now green
+  (both push/PR Linux Rust/TS and Linux/macOS subscription; original failed
+  spawn tests pass on Linux). Independent review remains pending. Production
+  behavior is unchanged; older failed heads remain red.
+- Original failed-head repair candidates are now available without rewriting
+  any queued branch: #493 (`a461327`, base #439; 141 lines), #494 (`a9ee06b`,
+  base #448; 142 lines), #495 (`8cd157f`, base #452; 141 lines). Each normally
+  merges #466 and backports the #490 spawn/property repairs. Production code
+  remains identical to its respective parent. Regressions follow each stage's
+  implemented folds: fullwidth on #439, BMP scripts on #448, BMP/math on #452.
+  Full serial feature-enabled Rust/strict fmt-clippy-deny and all six TS gates
+  pass on each candidate; conformance 134/8. #493 has all nine remote checks
+  green; #494/#495 are running. Original heads remain blocked until reviewed
+  backports merge and those parent heads rerun CI; CLA signing still applies.
+- #491 head `3334732` and #492 head `57a5573` passed all nine remote checks.
+  Live M4 readiness audit found no merge-ready node: all lack independent
+  approval, #374 retains CHANGES_REQUESTED, and #424 has failed CLA. Main is
+  still 792ed904. #420 is already merged in main; #422 is the handoff docs PR,
+  not an outstanding authentication prerequisite. No PR bases were changed.
+- M5 pure C-3 follow-up #492 (`57a55735f982024c3c9984d74ec7f8f388b4a139`,
+  base #490; 165 lines) blocks this exchange's credential in one-layer
+  base64/base64url, hex and percent echoes, including short values and
+  non-UTF-8 binary wrappers. Two baseline bypasses reproduced. Policy 139,
+  full local Rust/TS gates and release conformance 134/8 pass; removing
+  encoded lookup, raw-byte matching or short-token support makes the
+  corresponding safety assertion fail; restored tests pass. L0 thresholds
+  retain their original semantics. Remote CI/review are pending; delivery,
+  streaming, arbitrary/nested encoding and storage/API wiring remain open.
+- Checkpoint #491 at `a4890ae` passed all nine remote checks after importing
+  #466. Further updates only change documentation; its code remains c8a3ced.
+- Latest M4 #488 (`ef957893cbc172250e77a71a271961b524f0e69b`) and M5 #489
+  (`c7cfe8cc9ef77b71da4ce7e4757b1cee17404244`) have all remote checks green.
+  Neither has independent current-head approval. Main remains `792ed904`;
+  no `v0.3.0` tag or release has been created.
+- M4 dry run 38174477955 succeeded with Release skipped. Its downloaded
+  archive SHA-256 is
+  `f05cf6c047fe085c34139b11fce2432198a46c08f692817d648134cdcb5c3fe2`;
+  checksum and isolated local smoke pass at version 0.3.0. Always run the
+  fixed smoke script from #487/#488; older M5/docs worktrees still contain
+  the unsafe script that inherits the caller's default data directory.
+- Next: obtain the contributor's CLA signature and independent approvals;
+  land the diagnosed repairs through normal reviewed merges, then rerun
+  affected current-head checks. Preserve child bases before deleting parent
+  branches. Real M4 acceptance on main remains required before tagging.
+- Checkpoint #491 macOS run 38175922043 reproduced the same pre-#466
+  process-group race. The candidate now includes #466 through an ordinary
+  merge; all non-document files match exact commit `c8a3ced`. This imports
+  69 test/fixture lines without changing production behavior. The merged
+  candidate passed full local Rust/TS gates (conformance 134/8). #466 remains
+  an explicit review dependency; await checks on the new #491 head.
+- The existing default-DB recovery question and the authorization request
+  for one review-request comment remain unanswered; do not infer answers.
+
+## Historical snapshot — 2026-10-11 Codex takeover (not current)
+
+Do not follow this section as a live instruction. It was true on 2026-10-11 only.
+Current main is past `v0.3.0`; that tag exists. #374, #424, #439 and #493 are
+merged. Statements below that main is `792ed904`, that the tag does not exist,
+or that those PRs are still open are the old snapshot, not the present.
+
+- Goal mode is active; work continues on workstation B. Live main remains
+  `792ed904dfbfda984fff81ea5dd930e12bfe6a30`.
+- GitHub authentication is valid on this machine. All 40 queued PRs have been
+  created as **#422–#461**, preserving the queue's base/head pairs; #423 is
+  the draft M4 integration vehicle. No queued PR has been approved or merged.
+- #374's current review blocker is repaired at `2d1507616cfa67b15d3d705e5b6347a71d8391de`:
+  endpoint-valid bodies, eligible WireMock components, explicit zero-request
+  expectations and verification. Full feature-enabled Rust tests, strict
+  clippy, cargo deny and all TS gates passed locally (conformance 134/8).
+  Current-head independent approval and fresh CI are still required.
+- All open PRs currently lack APPROVED review status; do not bypass the
+  repository's last-push approval rule or mark M4 complete prematurely.
+- Owner decisions received in chat: accept `/v1/inspect` `{input: string}`
+  and UTF-16 spans; bump wire contract on endpoint publication. The new
+  version slice chooses additive minor **1.1.0**. REDACT consent and Admin v1
+  public write endpoints remain pending owner review; continue safety work.
+- Tenant key repair is published in independent <=300-line slices:
+  #463 `164444c` storage/issuance (172 lines) →
+  #465 `4c62d18` explicit conformance key binding (22 lines) →
+  #467 `29aff5d` HTTP tenant authority / events / audit (296 lines) →
+  #468 `1a5008c` (239-line PR delta,
+  including ordinary merge of #374's repaired test). The last slice also
+  denies missing authenticators in tenant library mode; real bound-key
+  cfg(test) fixtures preserve authorized routing tests. Three hand mutations
+  (binding bypass, untrusted audit scope, missing authenticator bypass) fail
+  by assertions; restored final heads pass full Rust/TS gates and release
+  conformance (134 passed / 8 todo). None is approved or merged yet.
+- #464 `aba5ecf` publishes additive wire contract **1.1.0** with Rust/TS/health
+  expectations synchronized. Full Rust/TS gates and release Rust conformance
+  (134 passed / 8 todo) pass locally. It ships with M5, not early with M4.
+- #466 `c8a3ced`, base `feat/subscription-test-hardening`, repairs the two
+  historical macOS fixture races: readiness marker after TERM trap, bounded
+  ESRCH-only descendant reaping, distinct port reservations and bounded
+  EADDRINUSE-only startup retries. Both affected suites passed 30 repetitions
+  each; all local gates pass (full Rust run serially). The old failed runs
+  were rerun once after logs were diagnosed; keep observing remote results.
+- Parallel full-suite execution hit portable_startup's existing 5s copied-
+  binary launch deadline on two different negative tests. Serial 8/8 and
+  final full serial gates pass. No production change or relaxed assertion.
+- Remote checks are advancing: #374/#463/#467 have green Linux Rust/TS/
+  subscription checks; macOS subscription remains queued on these runs.
+  No current-head approval exists. Do not conflate queued with failed.
+- 2026-10-12 after midnight: buffered/Event Log repair is published as
+  #469 `7d328e7` transport finalizer → #470 `493ba53` protocol cache ordering →
+  #471 `21c545d` protocol attempt terminals → #472 `f330a05` free-chat ordering →
+  #473 `3f13aab` chat attempt terminals → #474 `5be697f` paid pre-send release.
+  Each PR is <=300 total changed lines. All final heads pass feature-enabled
+  serial Rust tests, strict clippy/fmt, cargo deny and all pnpm gates;
+  protocol/chat behavior slices also pass release Rust conformance (134/8).
+- Failed completion never publishes a free/protocol 200 cache/replay or a
+  duplicate same-key POST in the retention window. Pending-hook cancellation
+  retains the existing generic failure marker. Recorded connect attempts
+  terminate with completed/failure without changing execution classification.
+  Direct preflight tests cover guards that an HTTP selection refusal masked;
+  hand mutations fail by assertions. Older tests expecting unfinished stream
+  chains were revised explicitly, not deleted.
+- Preserve the existing paid-chat rule: committed settlement keeps its success
+  response when completion logging fails. Do not move that append ahead of
+  paid cache publication without reviewing charged-response cancellation.
+- #474 additionally reproduces and fixes a paid pre-send error retaining 2051
+  budget units despite zero POSTs. With/without request ID and retries, restored
+  balances remain unchanged; cancellation/uncertain execution still retain.
+- #475 `9a715db` (127 lines) adds the HTTP → authorized runtime → repository
+  CLI fixture flow. Three real fixture failures open OAuth breaker; fourth
+  spawn stops. Removing handler feedback fails an assertion. Full local gates
+  pass (router 499/499). Real vendor CLI validation remains owner decision #6.
+- Draft #476 `7fea357` combines that stack with ordinary merges of #464 and
+  #466. The exact combined head passes every B gate and release Rust conformance
+  (134/8), at synchronized wire version **1.1.0**. Main and v0.3.0 tag refs
+  were checked again: main remains 792ed904; the tag does not exist.
+- Additional budget regressions are real: max_tokens=4096 under a 3000-unit
+  limit still reached the paid upstream because completion quote was fixed at
+  1024; a same-ID paid waiter returned 402 from a duplicate full reservation.
+- #477 `8a76839` (257 lines, cfg(test) coordinator) → #478 `f48f92f`
+  (243-line production wiring) moves priced reservation to the singleflight
+  leader. Cache/replay/waiters use zero-cost SpendGate; paid candidates still
+  require a ledger. Pre-send cancellation releases; armed cancellation retains.
+  All gates pass, and #478 release conformance is 134/8. One POST charges 2201
+  once and returns 200 to waiter/cache with no leftover reservation.
+- #479 `f8e7728` (188 changed lines) completes the explicit max_tokens
+  resident-HTTP quote fix, with #477/#478 underneath. Final feature-enabled
+  serial Rust suite passes (router **504/504**), strict clippy/fmt, cargo deny,
+  every pnpm gate, and release Rust conformance **134 passed / 8 todo**.
+  The 4096-cap/3000-budget case is 402 with zero POST/debit/reservation;
+  ignoring the cap fails an assertion. Small caps preserve their payload.
+- This closes the explicit cap case; other backends, missing/invalid caps and
+  prompt estimates retain legacy assumptions. No claim of arbitrary-provider
+  physical billing protection. REDACT consent and public Admin writes stay
+  pending, as do the other owner decisions described in the original handoff.
+- Remote CI: #476 and #479 complete push/PR checks, including both macOS
+  jobs, are SUCCESS. APPROVED search is empty. All M4 tail PR authors were
+  checked (#361/#362/#364–#367/#374/#398/#408/#416–#418/#423): jhfnetboy,
+  the current account. Do not self-approve or switch identities.
+- #480 `ea5c70e` (218 changed lines) adds gate-two buffered response inspection
+  core: this call's credential (including normalized Unicode escapes), L0
+  inspection of body/header names/header values, aggregate size and UTF-8
+  fail closed. Ten credential tests and both removed-check negative controls
+  pass; full serial feature-enabled Rust (policy 135/router 504), fmt/clippy/
+  deny and all pnpm gates pass (134/8). No runtime wiring, streaming, arbitrary
+  encoded payload handling or public/storage contract was added. C-3 is not
+  production-enforced yet. All remote push/PR CI is SUCCESS; FU-215 remains PR_OPEN.
+- #481 `81c2e75` adds warmed-cache revocation acceptance for all four buffered
+  inference endpoints: real cache hit before revoke, then 401/no cached payload,
+  one upstream POST and no added tenant events/audit rows. Removing SQL's active
+  predicate fails with 200 versus 401. Restored full gates pass (router 505,
+  shared conformance 134/8). This is test-only evidence, not a new behavior fix.
+- M4 #423 did not contain #374's latest repaired head. New #482 `2abf0c2`
+  branches from #424 and ordinarily merges `2d15076`; 34 changed test lines.
+  Full feature-enabled serial Rust (router 435), clippy/fmt/deny, every pnpm
+  gate and whitespace checks pass. Real paid-chat chain lookup, Event Log-only
+  audit and frozen exact-ready snapshot tests execute. Wire remains 1.0.1.
+- M4 tenant-key backport candidate is now complete in review slices:
+  #483 `98e7203` (155 lines) storage/issuance → #484 `afe3a6e` (138 lines)
+  real bound-key routing/conformance fixtures → #485 `27237cf` (294 lines)
+  admission/default-deny/trusted audit → #486 `687c6ce` (245 test lines)
+  final acceptance. Legacy keys stay unbound; reissue explicitly for tenant mode.
+- M4 baseline reproduced tenant-a key + valid tenant-b chat returning 200.
+  Final nine-endpoint rejection matrix uses valid bodies and eligible cards,
+  covers cross-tenant/unbound/anonymous/malformed/duplicate headers and missing
+  authenticators under both dev settings, with zero unauthorized egress/writes.
+  Binding, trusted audit and default-deny removals independently fail assertions.
+- #486 proves authorized tenant chain, four warmed-cache revocation paths and
+  no request.received before role scope. Late scope mutation fails; restored
+  15 key HTTP tests pass. Full serial feature-enabled Rust (router 441), strict
+  clippy/fmt/deny and all pnpm gates pass. Rebuilt release Rust/seeder and shared
+  conformance pass **134/8**, wire **1.0.1**, on source head `687c6ce`.
+- #483–#486 complete remote push/PR checks are SUCCESS. Independent
+  approval/main landing/v0.3.0 remain absent. Do not treat candidate verification
+  as real-main acceptance or publish early.
+- #487 `f64f7a0` (81 changed lines) fixes the reproduced release health
+  0.2.0-versus-tag-0.3.0 mismatch: all seven Rust crates/lock entries follow
+  the prior release convention at 0.3.0; wire remains 1.0.1. Operator migration
+  guide is `docs/releases/v0.3.0.md`. Full gates (router 441), release Rust
+  conformance 134/8 and actual five-file archive smoke at 0.3.0 pass locally.
+- Release smoke now isolates the child test user's default home/data/state
+  paths and still supplies no IDORIS_* settings. An invalid caller DB sentinel
+  stays untouched; removing isolation makes the real smoke fail. The initial
+  old-script baseline used workstation default DB. Existing history remains
+  (390 records/150 reservations), but previous budget configuration was not
+  captured and cannot be assumed unchanged. Owner question is pending; no
+  further writes or guessed restoration. Private impact counts are in
+  `night-evidence-2026-10-12/m4-release01-default-db-impact.json`.
+- Release dry run **38173125316** on #487 SUCCESS; release job SKIPPED.
+  Downloaded `release-assets` to `night-evidence-2026-10-12/release-dryrun-f64f7a0/`,
+  verified SHA-256 and independently ran the downloaded archive's isolated
+  local smoke at 0.3.0. No release/tag was created.
+- Another reproduced authority leak: personal mode ignored tenant-a binding
+  and returned tenant-b's stored event data (HTTP 200). #488 `ef95789` (101 lines)
+  enforces the binding's effective deployment scope; foreign bindings cannot
+  become personal authority. Explicit personal keys accept absent/matching
+  headers and reject foreign/empty/duplicate values; unbound legacy behavior
+  stays covered. Removal restores 200. Full gates (router 443), release 134/8,
+  fresh 0.3.0 archive smoke and all remote checks pass. New exact-head release
+  dry run **38174477955** SUCCESS (Release job skipped).
+- #489 `c7cfe8c` (103 lines), base #481, applies the same fix to M5. Full
+  feature-enabled serial Rust (router 507), all other gates and rebuilt release
+  Rust conformance 134/8 (wire 1.1.0) pass. Its independent removed-guard check
+  fails by assertion; restored source is clean/committed/pushed. Remote CI fresh.
+- Owner authorization question pending for one #488 review-request comment
+  per COLLAB §5. No notification has been sent; do not infer approval from time.
+  Concrete local draft: `night-evidence-2026-10-12/review-request-488.md`.
+- All new code is committed and pushed. Latest M5 validated stack head is #489;
+  latest M4 mode-ceiling candidate is #488;
+  #476 remains the historical combined integration snapshot, not a branch to
+  merge its descendants into (that would collapse the dependent PR diffs).
+- Resume: inspect #489 CI and incoming reviews; send the prepared single #488
+  review notification only if the owner explicitly authorizes it. Follow the
+  M4 release procedure after independent approvals. Keep the default-DB owner
+  question pending until answered; do not assume permission to restore data.
+  Follow independent approval/merge gates and re-run M4 acceptance on actual
+  main before tag. REDACT consent and Admin v1 public writes remain pending.
+  Do not recreate completed tests or collapse open parent/child review diffs.
+
+- Active worktrees lived beside the main checkout. Paths are omitted.
+  Current caches: `target-version-night` built M4 #488 (crate 0.3.0/wire 1.0.1);
+  `target-identity32-night` and `target-inspect22-release` built M5 #489
+  (crate 0.2.0/wire 1.1.0). All seven release crates were freshly recompiled (older M5 wire 1.1.0 artifacts
+  were cleaned). Clean workspace packages before reuse, keep dependency caches,
+  and run full suites serially. Logs/bodies in `night-evidence-2026-10-12/`
+  use `m4-security02..04`, `m4-release01`, `identity37/38` prefixes; `run-night-gates.py` records the full gate loop.
+
+
+## Live delta — 2026-10-11 Claude handoff (historical snapshot)
+
+Full handoff: `docs/agent/HANDOFF-2026-10-11-NIGHT.md` on branch `docs/handoff-2026-10-11-night` (`git fetch origin && git switch docs/handoff-2026-10-11-night`).
+
+- `origin/main = 792ed904dfbfda984fff81ea5dd930e12bfe6a30` (unchanged tonight; nothing merged).
+- M4 landing tail (#361 #362 #364–#367 #416–#418, #398 #408, #374) still waits for a current-head approval from someone other than the last pusher.
+- `integration/m4-landing-tail` merges all of them onto main without conflicts; the full final-main acceptance set is green on it (see `HANDOFF-2026-10-11-NIGHT.md`). Acceptance evidence gaps for claims 1/3/4 are closed in `test/m4-acceptance-gaps`.
+- M5 gate one is implemented as a stacked chain `feat/inspect-01-contract-freeze` → … → `feat/resilience-07-subscription-breaker` → review fixes → `fix/review-5-hardening` (stack top; see the handoff for every branch) (contract, pure L0 + rule packs, `/v1/inspect`, INSPECTED on chat and protocol endpoints, kill switch core, egress counter, evasion folding, one-layer decoding, REDACT engine, budget race acceptance test, three-grain breaker + proxy wiring + selection steering + Supervisor model lockout + subscription OAuth breaker). **No PRs opened yet**: `gh` auth is invalid on this Mac; bodies + opener committed in `docs/agent/pr-queue-2026-10-11/` on the `docs/handoff-2026-10-11-night` branch.
+- Pushed from the review account over SSH, so another account could approve. Key paths are omitted.
+- Owner decisions pending: redact-consent wire format; Admin v1 write surface (kill switch toggle, egress/breaker view); `/v1/inspect` request shape, kind list and wire-version bump; `credential_path` S2 vs S3; `provider_circuit_open` error type.
+- Four independent agent reviews ran tonight; their fail-open and false-positive findings are fixed with regression tests. Provider breakers are opt-in in the binary (`IDORIS_PROVIDER_BREAKER=1`) because on-by-default broke shared conformance.
+- Owner working rule (2026-10-11): when blocked on review, keep going by stacking new PRs on the open ones; the owner reviews later.
+
 ## Live delta — 2026-10-07 morning
 
 Live Git/GitHub has moved well beyond the 2026-10-06 snapshot below. Treat this
