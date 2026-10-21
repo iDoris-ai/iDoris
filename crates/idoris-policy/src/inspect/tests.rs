@@ -1281,17 +1281,18 @@ fn valid_id() -> impl Strategy<Value = String> {
 }
 
 #[test]
-fn normalized_fullwidth_neighbours_remain_part_of_the_number() {
+fn normalized_fullwidth_neighbours_follow_current_folding() {
     let id = "110105195001010004";
     for digit in ['０'] {
+        // Main folds fullwidth digits before scanning, so a neighbouring
+        // fullwidth digit no longer hides the ID.
         for input in [format!("{digit}{id}"), format!("{id}{digit}")] {
             let response = inspect(&input, &open_ctx());
             assert!(
-                !kinds(&response).contains(&FindingKind::CnResidentId),
+                kinds(&response).contains(&FindingKind::CnResidentId),
                 "{input}: {response:?}"
             );
         }
-        // A real text boundary separates the neighbouring digit from the ID.
         let input = format!("{digit}:身份证{id}!{digit}");
         let response = inspect(&input, &open_ctx());
         assert!(
