@@ -319,7 +319,7 @@ use idoris_policy::breaker::{Admission, AdmissionTicket, CredentialClass};
 const MAX_CONNECTION_RETRY_AFTER_MS: u64 = 300_000;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-enum BreakerKey {
+pub(crate) enum BreakerKey {
     Provider(String),
     Connection {
         scheme: String,
@@ -417,6 +417,53 @@ impl Drop for CapturedSendClaim<'_> {
     }
 }
 
+impl crate::dispatch::ProviderAdmission for ChatProxy {
+    fn begin_provider(
+        &self,
+        provider_id: &str,
+        class: CredentialClass,
+    ) -> crate::dispatch::ProviderCapture {
+        let mut capture = crate::dispatch::ProviderCapture {
+            key: provider_key(provider_id),
+            class,
+            ticket: None,
+            probe: false,
+        };
+        if self.breakers_enabled()
+            && let Ok(mut book) = self.breakers.lock()
+        {
+            let admit = book.admit(&capture.key, class, self.now_ms());
+            capture.probe = admit.admission == Admission::Probe;
+            capture.ticket = admit.ticket;
+        }
+        capture
+    }
+
+    fn finish_provider(
+        &self,
+        capture: crate::dispatch::ProviderCapture,
+        outcome: crate::dispatch::ProviderOutcome,
+    ) {
+        use crate::dispatch::ProviderOutcome;
+        let Some(ticket) = capture.ticket else {
+            return;
+        };
+        if matches!(outcome, ProviderOutcome::Ignored) && !capture.probe {
+            return;
+        }
+        let mut book = self
+            .breakers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match outcome {
+            ProviderOutcome::Success => book.on_success(&capture.key, capture.class, ticket),
+            ProviderOutcome::Fault | ProviderOutcome::Ignored => {
+                book.on_failure(&capture.key, capture.class, ticket, self.now_ms());
+            }
+        }
+    }
+}
+
 /// The proxy only fronts `http_service` cards: loopback ones are local
 /// runtimes, anything else is treated as a keyed API.
 fn credential_class(url: &str) -> idoris_policy::breaker::CredentialClass {
@@ -503,6 +550,25 @@ impl ChatProxy {
             }
         }
         wall_clock_ms()
+    }
+
+    pub(crate) async fn drive_external<T, F, Fut, C>(
+        &self,
+        provider_id: &str,
+        class: CredentialClass,
+        operation: F,
+        classify: C,
+    ) -> T
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = T>,
+        C: FnOnce(&T) -> crate::dispatch::ProviderOutcome,
+    {
+        let guard = crate::dispatch::ProviderGuard::begin(Some(self), provider_id, class);
+        let result = operation().await;
+        let outcome = classify(&result);
+        guard.finish(outcome);
+        result
     }
 
     /// Advisory readiness only: no entries, tickets, or probe ownership are created.
@@ -2506,3 +2572,7 @@ mod stream_breaker_tests;
 #[cfg(test)]
 #[path = "proxy_card_selection_tests.rs"]
 mod card_selection_tests;
+
+#[cfg(test)]
+#[path = "proxy_external_tests.rs"]
+mod external_tests;
