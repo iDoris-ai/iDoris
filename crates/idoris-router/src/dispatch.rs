@@ -17,7 +17,7 @@ use idoris_contracts::load_policy::{Admission, Keepalive, LoadMode, LoadPolicy};
 use idoris_contracts::provider::Locality;
 use idoris_policy::{
     AdmissionStatus, Card, Decision, PolicyCtx, ROLES, ReasonCode, Rejection, RequestProfile,
-    decide_with_affinity_and_ready, effective_served_locality,
+    effective_served_locality,
 };
 use idoris_tenancy::budget::{BudgetError, BudgetLedger, ReservationId};
 use tokio_util::sync::CancellationToken;
@@ -124,18 +124,60 @@ fn default_load_policy() -> LoadPolicy {
     }
 }
 
-/// R2-D simplification: every loaded component card is eligible for every
-/// catalog role and always `Ready` at `decide()` time — role→catalog
-/// mapping isn't wired yet, and real admission state is only known after
-/// asking the Supervisor (post-selection, see [`dispatch_local`]).
-/// `estimated_cost_minor` comes from [`budget::estimate_cost_minor`].
+/// Operator-owned backend model identities, independent of recommendation IDs.
+/// Missing configuration means no role eligibility; malformed configuration is
+/// rejected at startup and fails closed for programmatically supplied cards.
+pub(crate) fn role_models(
+    component: &ComponentCard,
+) -> Result<std::collections::BTreeMap<String, String>, String> {
+    let Some(value) = component
+        .extensions
+        .as_ref()
+        .and_then(|e| e.get("idoris_role_models"))
+    else {
+        return Ok(Default::default());
+    };
+    if component.provider.id == idoris_policy::SUBSCRIPTION_PROVIDER_ID {
+        return Err("idoris_role_models is unsupported on subscription providers".into());
+    }
+    let models: std::collections::BTreeMap<String, String> =
+        serde_json::from_value(value.clone()).map_err(|e| format!("idoris_role_models: {e}"))?;
+    for (role, model) in &models {
+        if !ROLES.iter().any(|r| r.as_str() == role)
+            || model.trim().is_empty()
+            || model != model.trim()
+            || model.chars().any(char::is_control)
+            || !matches!(idoris_policy::parse_model_role(model), Ok(None))
+        {
+            return Err(format!("invalid idoris_role_models binding for {role:?}"));
+        }
+    }
+    Ok(models)
+}
+
+// Subscription executes the authorized runtime's fixed model, not an HTTP
+// model target. Preserve its legacy role eligibility only without a mapping.
+fn fixed_subscription_roles(component: &ComponentCard) -> bool {
+    matches!(
+        crate::subscription::card::classify_subscription_card(component),
+        Ok(crate::subscription::card::CardBoundary::Subscription)
+    ) && !component
+        .extensions
+        .as_ref()
+        .is_some_and(|extensions| extensions.contains_key("idoris_role_models"))
+}
+
 fn candidate(component: &ComponentCard, prompt: &str) -> Card {
+    let models = role_models(component).unwrap_or_default();
     Card {
         component: component.clone(),
         roles: ROLES
             .iter()
             .copied()
-            .filter(|r| r.is_catalog_role())
+            .filter(|r| {
+                r.is_catalog_role()
+                    && (fixed_subscription_roles(component) || models.contains_key(r.as_str()))
+            })
             .collect(),
         experiment: false,
         min_ram_gb: 0.0,
@@ -244,7 +286,84 @@ pub fn select_with_affinity_and_ready(
     affinity_key: Option<&str>,
     ready_provider_ids: &BTreeSet<String>,
 ) -> Result<Selected, DispatchError> {
-    let candidates: Vec<Card> = cards.iter().map(|c| candidate(c, prompt)).collect();
+    select_with_gate_snapshot(
+        cards,
+        profile,
+        prompt,
+        affinity_key,
+        ready_provider_ids,
+        &vec![false; cards.len()],
+    )
+}
+
+/// Two policy passes over one immutable, positional readiness snapshot.
+/// Only resident HTTP can fall back to the final atomic send refusal.
+pub(crate) fn select_with_gate_fallback(
+    cards: &[ComponentCard],
+    profile: &ParsedProfile,
+    prompt: &str,
+    affinity_key: Option<&str>,
+    ready_provider_ids: &BTreeSet<String>,
+    blocked: &[bool],
+) -> Result<Selected, DispatchError> {
+    match select_with_gate_snapshot(
+        cards,
+        profile,
+        prompt,
+        affinity_key,
+        ready_provider_ids,
+        blocked,
+    ) {
+        Err(DispatchError::Rejection(_)) => {
+            let fallback: Vec<bool> = cards
+                .iter()
+                .zip(blocked)
+                .map(|(card, blocked)| *blocked && !is_resident_http_service(card))
+                .collect();
+            select_with_gate_snapshot(
+                cards,
+                profile,
+                prompt,
+                affinity_key,
+                ready_provider_ids,
+                &fallback,
+            )
+        }
+        result => result,
+    }
+}
+
+pub(crate) fn select_with_gate_snapshot(
+    cards: &[ComponentCard],
+    profile: &ParsedProfile,
+    prompt: &str,
+    affinity_key: Option<&str>,
+    ready_provider_ids: &BTreeSet<String>,
+    blocked: &[bool],
+) -> Result<Selected, DispatchError> {
+    assert_eq!(
+        cards.len(),
+        blocked.len(),
+        "gate snapshot must match candidate slice"
+    );
+    let candidates: Vec<Card> = cards
+        .iter()
+        .zip(blocked)
+        .filter(|(card, _)| {
+            role_models(card).is_ok_and(|models| {
+                profile.role.is_none_or(|role| {
+                    fixed_subscription_roles(card) || models.contains_key(role.as_str())
+                })
+            })
+        })
+        .map(|(c, blocked)| {
+            let mut card = candidate(c, prompt);
+            if *blocked {
+                card.admission_status = AdmissionStatus::Blocked;
+            }
+            card
+        })
+        .collect();
     let request_profile = RequestProfile {
         task: profile.task.clone(),
         role: profile.role,
@@ -255,7 +374,7 @@ pub fn select_with_affinity_and_ready(
         min_ram_gb: None,
         budget: None,
     };
-    let decision = decide_with_affinity_and_ready(
+    let (decision, chosen) = idoris_policy::pipeline::decide_with_affinity_and_ready_selected(
         &request_profile,
         &candidates,
         &ctx,
@@ -263,12 +382,6 @@ pub fn select_with_affinity_and_ready(
         ready_provider_ids,
     )
     .map_err(DispatchError::Rejection)?;
-    let Some(chosen) = candidates.iter().find(|c| c.id() == decision.chosen_id) else {
-        return Err(DispatchError::Internal(format!(
-            "decide() returned chosen_id {:?} absent from its own candidate list",
-            decision.chosen_id
-        )));
-    };
     let served_locality = effective_served_locality(chosen);
     let load_policy = chosen
         .component
@@ -299,12 +412,16 @@ pub fn is_resident_http_service(card: &ComponentCard) -> bool {
 pub(crate) fn backend_model_id(
     profile: &ParsedProfile,
     requested_model: Option<&str>,
-    provider_id: &str,
-) -> String {
-    if profile.role.is_none() {
-        requested_model.unwrap_or(provider_id).to_string()
-    } else {
-        provider_id.to_string()
+    card: &ComponentCard,
+) -> Result<String, DispatchError> {
+    match profile.role {
+        None => Ok(requested_model.unwrap_or(&card.provider.id).to_string()),
+        Some(role) => role_models(card)
+            .ok()
+            .and_then(|models| models.get(role.as_str()).cloned())
+            .ok_or(DispatchError::Rejection(Rejection::NoEligibleCandidate {
+                stage: idoris_policy::Stage::RoleCapability,
+            })),
     }
 }
 
@@ -428,7 +545,6 @@ pub struct DispatchInput<'a> {
     pub requested_model: Option<&'a str>,
     pub prompt: &'a str,
     pub affinity_key: Option<&'a str>,
-    pub ready_provider_ids: Option<&'a BTreeSet<String>>,
 }
 
 impl<'a> DispatchInput<'a> {
@@ -437,7 +553,6 @@ impl<'a> DispatchInput<'a> {
             requested_model: None,
             prompt,
             affinity_key: None,
-            ready_provider_ids: None,
         }
     }
 
@@ -446,7 +561,6 @@ impl<'a> DispatchInput<'a> {
             requested_model,
             prompt,
             affinity_key: None,
-            ready_provider_ids: None,
         }
     }
 
@@ -454,17 +568,12 @@ impl<'a> DispatchInput<'a> {
         self.affinity_key = affinity_key;
         self
     }
-
-    pub fn with_ready_providers(mut self, ready_provider_ids: &'a BTreeSet<String>) -> Self {
-        self.ready_provider_ids = Some(ready_provider_ids);
-        self
-    }
 }
 
 /// Runs the local decision + execution path for one request: builds
-/// decision-time [`Card`]s from `cards` (R2-D simplification, see
-/// `candidate`), calls [`idoris_policy::decide`], reserves budget for a
-/// selected candidate whenever a ledger is wired, including zero cost
+/// decision-time [`Card`]s from explicitly configured role bindings, calls
+/// [`idoris_policy::decide`], and reserves budget for a selected candidate
+/// whenever a ledger is wired, including zero cost
 /// (`SpendGate` is enforced by the ledger). With no ledger, paid candidates
 /// fail closed and free candidates remain usable. Loads the chosen model
 /// via the Supervisor if not already loaded, calls `chat`, then settles (success)
@@ -553,7 +662,106 @@ fn public_dispatch_result(
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum ProviderOutcome {
+    Success,
+    Fault,
+    Ignored,
+}
+
+pub(crate) struct ProviderCapture {
+    pub(crate) key: crate::proxy::BreakerKey,
+    pub(crate) class: idoris_policy::breaker::CredentialClass,
+    pub(crate) ticket: Option<idoris_policy::breaker::AdmissionTicket>,
+    pub(crate) probe: bool,
+}
+
+pub(crate) trait ProviderAdmission: Sync {
+    fn begin_provider(
+        &self,
+        provider_id: &str,
+        class: idoris_policy::breaker::CredentialClass,
+    ) -> ProviderCapture;
+    fn finish_provider(&self, capture: ProviderCapture, outcome: ProviderOutcome);
+}
+
+pub(crate) struct ProviderGuard<'a> {
+    admission: Option<&'a dyn ProviderAdmission>,
+    capture: Option<ProviderCapture>,
+}
+
+impl<'a> ProviderGuard<'a> {
+    pub(crate) fn begin(
+        admission: Option<&'a dyn ProviderAdmission>,
+        provider_id: &str,
+        class: idoris_policy::breaker::CredentialClass,
+    ) -> Self {
+        Self {
+            admission,
+            capture: admission.map(|admission| admission.begin_provider(provider_id, class)),
+        }
+    }
+
+    pub(crate) fn finish(mut self, outcome: ProviderOutcome) {
+        if let (Some(admission), Some(capture)) = (self.admission, self.capture.take()) {
+            admission.finish_provider(capture, outcome);
+        }
+    }
+}
+
+impl Drop for ProviderGuard<'_> {
+    fn drop(&mut self) {
+        if let (Some(admission), Some(capture)) = (self.admission, self.capture.take()) {
+            admission.finish_provider(capture, ProviderOutcome::Ignored);
+        }
+    }
+}
+
+fn native_provider_outcome(
+    error: &BackendError,
+    requested: &str,
+    loading: bool,
+) -> ProviderOutcome {
+    use BackendError::*;
+    match error {
+        // LOAD also covers eviction/startup: panic and unqualified errors lose provenance.
+        AdapterPanicked { model_id, .. } if !loading && model_id == requested => {
+            ProviderOutcome::Fault
+        }
+        // Unqualified Upstream has no HTTP status. Adapters fold 400 and 500
+        // into the same variant, so counting it would cool a healthy local
+        // runtime after two bad requests. Ignore it until a typed status exists.
+        ModelUnavailable { model_id }
+        | Oom { model_id }
+        | ProbeTimedOut { model_id }
+        | AdapterTimedOut { model_id }
+        | LoadUnconfirmed { model_id, .. }
+        | LoadPostconditionFailed { model_id, .. } => {
+            if model_id == requested {
+                ProviderOutcome::Fault
+            } else {
+                ProviderOutcome::Ignored
+            }
+        }
+        AdapterPanicked { .. }
+        | Upstream { .. }
+        | ModelNotFound { .. }
+        | ModelLoading { .. }
+        | EvictionImpossible { .. }
+        | EvictionFailed { .. }
+        | Cancelled
+        | InvalidRequest { .. }
+        | SupervisorUnavailable
+        | Busy { .. }
+        | InvariantViolation { .. }
+        | LockPoisoned { .. }
+        | Internal { .. } => ProviderOutcome::Ignored,
+    }
+}
+
 pub(crate) struct LocalExecutionContext<'a> {
+    provider_admission: Option<&'a dyn ProviderAdmission>,
+    native: Option<&'a idoris_backend::NativeCompletionRequest>,
     supervisor: Option<&'a BoundSupervisor>,
     budget_ledger: Option<&'a BudgetLedger>,
     budget_event: Option<&'a crate::BudgetReservedEventContext>,
@@ -572,6 +780,8 @@ impl<'a> LocalExecutionContext<'a> {
         budget_settled_event: Option<&'a crate::BudgetSettledEventContext>,
     ) -> Self {
         Self {
+            provider_admission: None,
+            native: None,
             supervisor,
             budget_ledger,
             budget_event,
@@ -579,6 +789,21 @@ impl<'a> LocalExecutionContext<'a> {
             completed_event,
             budget_settled_event,
         }
+    }
+}
+
+impl<'a> LocalExecutionContext<'a> {
+    pub(crate) fn with_provider_admission(mut self, admission: &'a dyn ProviderAdmission) -> Self {
+        self.provider_admission = Some(admission);
+        self
+    }
+
+    pub(crate) fn with_native(
+        mut self,
+        native: &'a idoris_backend::NativeCompletionRequest,
+    ) -> Self {
+        self.native = Some(native);
+        self
     }
 }
 
@@ -596,6 +821,8 @@ async fn dispatch_local_inner(
     cancel: CancellationToken,
 ) -> Result<ChatOutcome, ObservedDispatchError> {
     let LocalExecutionContext {
+        provider_admission,
+        native,
         supervisor,
         budget_ledger,
         budget_event,
@@ -607,19 +834,12 @@ async fn dispatch_local_inner(
     let prompt = input.prompt;
     let requested_model = input.requested_model;
     let affinity_key = input.affinity_key;
-    let ready_provider_ids = input.ready_provider_ids;
 
     let selected_owned;
     let selected = match selection {
         LocalSelection::Preselected(selected) => selected,
         LocalSelection::Cards(cards) => {
-            selected_owned = select_with_affinity_and_ready(
-                cards,
-                profile,
-                prompt,
-                affinity_key,
-                ready_provider_ids.unwrap_or(&BTreeSet::new()),
-            )?;
+            selected_owned = select_with_affinity(cards, profile, prompt, affinity_key)?;
             &selected_owned
         }
     };
@@ -639,7 +859,7 @@ async fn dispatch_local_inner(
     let load_policy = selected.load_policy;
     let estimated_cost_minor = selected.estimated_cost_minor;
     let provider_id = selected.card.provider.id.clone();
-    let backend_model_id = backend_model_id(profile, requested_model, &provider_id);
+    let backend_model_id = backend_model_id(profile, requested_model, &selected.card)?;
     let cost = selected.card.provider.cost;
     let is_paid = budget::is_paid(Some(estimated_cost_minor));
     let mut reservation_guard = match ReservationGuard::reserve(
@@ -658,6 +878,11 @@ async fn dispatch_local_inner(
             });
         }
     };
+    let provider_guard = ProviderGuard::begin(
+        provider_admission.filter(|_| supervisor.is_some()),
+        &provider_id,
+        idoris_policy::breaker::CredentialClass::Local,
+    );
     if is_paid
         && let Some(context) = budget_event
         && crate::append_budget_reserved(context, selected)
@@ -767,6 +992,7 @@ async fn dispatch_local_inner(
         .load(backend_model_id.clone(), admission_memory_gb, load_policy)
         .await
     {
+        provider_guard.finish(native_provider_outcome(&err, &backend_model_id, true));
         return Ok(ChatOutcome {
             decision,
             served_locality,
@@ -784,12 +1010,19 @@ async fn dispatch_local_inner(
     let chat_result = supervisor
         .chat(
             ChatRequest {
-                model: backend_model_id,
+                native: native.cloned(),
+                model: backend_model_id.clone(),
                 messages,
             },
             cancel,
         )
         .await;
+
+    let provider_outcome = match &chat_result {
+        Ok(_) => ProviderOutcome::Success,
+        Err(error) => native_provider_outcome(error, &backend_model_id, false),
+    };
+    provider_guard.finish(provider_outcome);
 
     // A successful upstream execution must be charged before any fallible
     // completion event append can return early and drop the reservation.

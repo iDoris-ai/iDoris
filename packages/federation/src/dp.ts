@@ -1,4 +1,4 @@
-import type { Tensors } from "./payload.js";
+import { FederationError, type Tensors } from "./payload.js";
 import { makeRng, pairSeed, standardNormal } from "./prng.js";
 
 /**
@@ -49,6 +49,9 @@ export function sumTensors(list: readonly Tensors[]): Tensors {
   for (const tensors of list) {
     for (const [name, values] of Object.entries(tensors)) {
       const acc = out[name] ?? new Array<number>(values.length).fill(0);
+      if (acc.length !== values.length) {
+        throw new FederationError("BASE_MISMATCH", "tensor " + name + " has inconsistent length across clients");
+      }
       for (let i = 0; i < acc.length; i += 1) acc[i] = (acc[i] ?? 0) + (values[i] ?? 0);
       out[name] = acc;
     }

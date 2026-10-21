@@ -1,1 +1,12 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 3f9b7dd9bb3b80d3d85edcb2b91d48674307e6d9afc63070bd290124372682d2 # shrinks to entity = "sk-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", lead = "‐", trail = "", inner = [], fold_entity = false
+cc 8de230abcd17affd5beebb715e07f3cdc9becc09554e13da6832a59cf4bc6d4d # shrinks to entity = "13812345678", lead = "a", trail = "", inner = ['\u{200b}'], fold_entity = false
+cc cb18570519ac92791f45d6c2eb8c25f16bcc85044f58f8ec87158b64be8c7569 # shrinks to entity = "13812345678", lead = "", trail = "１", inner = [], fold_entity = false, pre = ""
+cc f4b5d4234540bebdc66be60c3c9de53b3c0edf71ac7f340b2af9eb0b955b81bb # shrinks to entity = "sk-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", lead = "1", trail = "", inner = [], fold_entity = true, pre = "\u{200b}"
+# PR #490 historical seed. Replayed against this tree's strategies; not a generator narrowing.
 cc e0900722975e2f2af2b3e0d9d770ea4b6224bf0a36200c19df5b53dbfde497f9

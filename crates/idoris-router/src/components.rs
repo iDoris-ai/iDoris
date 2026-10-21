@@ -144,6 +144,10 @@ pub fn load_components(dir: &Path, allow_mock_env: bool) -> Result<Vec<Component
             file: file.clone(),
             message: e.to_string(),
         })?;
+        crate::dispatch::role_models(&card).map_err(|message| LoadError::Invalid {
+            file: file.clone(),
+            message,
+        })?;
         classify_subscription_card(&card).map_err(|error| LoadError::SubscriptionCard {
             id: card.provider.id.clone(),
             message: error.to_string(),

@@ -5,6 +5,12 @@
   "type": "object",
   "additionalProperties": false,
   "required": ["sensitivity", "findings", "action"],
+  "if": {
+    "properties": {
+      "findings": { "contains": { "properties": { "kind": { "const": "input_limit_exceeded" } } } }
+    }
+  },
+  "then": { "properties": { "action": { "const": "BLOCK" } } },
   "properties": {
     "sensitivity": { "enum": ["S0", "S1", "S2", "S3"] },
     "findings": {
@@ -13,6 +19,8 @@
         "type": "object",
         "additionalProperties": false,
         "required": ["kind"],
+        "if": { "properties": { "kind": { "const": "input_limit_exceeded" } } },
+        "then": { "properties": { "span": false } },
         "properties": {
           "kind": {
             "enum": [

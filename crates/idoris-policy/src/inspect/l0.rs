@@ -4,6 +4,10 @@
 //! `-` 分隔（`138-1234-5678`、`6222 0212 …`）。每个数字组既按整组（去掉分隔
 //! 符）判定，也按组内每一段连续数字单独判定，所以「手机号 空格 银行卡号」
 //! 被并成一个大组时，两段仍各自命中。宁可多报，也不能因为分组方式漏报。
+//! 另以最多 19 位、5 段的窗口识别空格、连字符、tab、点、斜线。每个起点取最短
+//! 命中，不要求整条数字链都能分解成实体，因此实体旁边的无关数字不再把窗口否决掉。
+//! 身份证窗口额外认 `6/8/4`、`6/4/4/4`，以及末段少一位且紧跟 `X`/`x` 的 17 位形式。
+//! 不跨连续分隔符或换行。下划线和逗号不在这组分隔符里。
 //!
 //! 结构校验压倒校验和：身份证先看省级行政区划码和出生日期，校验位只决定
 //! 敏感度（X-2）；银行卡没有可用的结构信号，所以 Luhn 是必要条件。
@@ -13,6 +17,7 @@ use idoris_contracts::inspect::{FindingKind, Sensitivity};
 use super::Hit;
 
 /// GB/T 2260 省级行政区划码（身份证前两位）。
+/// 83 不在这里：台湾居民居住证只在 18 位路径认地址码 `830000`。
 pub(super) const PROVINCES: &[u8] = &[
     11, 12, 13, 14, 15, 21, 22, 23, 31, 32, 33, 34, 35, 36, 37, 41, 42, 43, 44, 45, 46, 50, 51, 52,
     53, 54, 61, 62, 63, 64, 65, 71, 81, 82,
@@ -87,14 +92,87 @@ pub(super) fn scan_plain(units: &[u16]) -> Vec<Hit> {
         }
         i = group_end;
     }
+    scan_formatted(units, &mut hits);
+    scan_country_mobile(units, &mut hits);
     super::tokens::scan(units, &mut hits);
     super::secrets::scan(units, &mut hits);
+    scan_crossline_modern_id(units, &mut hits);
     sort_dedup(hits)
 }
 
+/// Append exact 0086 mobile layouts without displacing existing numeric hits.
+fn scan_country_mobile(units: &[u16], hits: &mut Vec<Hit>) {
+    let mut i = 0;
+    while i < units.len() {
+        if !is_digit(units[i]) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < units.len() && is_digit(units[i]) {
+            i += 1;
+        }
+        if i - start > 15 {
+            continue;
+        }
+        let mut digits = [0u8; 15];
+        let mut lengths = [0usize; 4];
+        let mut total = i - start;
+        lengths[0] = total;
+        for (index, &unit) in units[start..i].iter().enumerate() {
+            digits[index] = (unit - u16::from(b'0')) as u8;
+        }
+        let mut end = i;
+        for count in 1..=4 {
+            if total == 15
+                && matches!(&lengths[..count], [15] | [4, 11] | [4, 3, 8] | [4, 3, 4, 4])
+                && digits[..4] == [0, 0, 8, 6]
+                && is_mobile(&digits[4..15])
+            {
+                hits.push(Hit {
+                    kind: FindingKind::CnMobile,
+                    start,
+                    length: end - start,
+                    sensitivity: Sensitivity::S2,
+                });
+                break;
+            }
+            if count == 4
+                || !units.get(end).is_some_and(|&u| is_formatted_separator(u))
+                || !units.get(end + 1).is_some_and(|&u| is_digit(u))
+            {
+                break;
+            }
+            let next_start = end + 1;
+            let mut next_end = next_start;
+            while next_end < units.len() && is_digit(units[next_end]) && total < 15 {
+                digits[total] = (units[next_end] - u16::from(b'0')) as u8;
+                total += 1;
+                next_end += 1;
+            }
+            // Do not accept a 15-digit prefix of an overlong maximal run.
+            if units.get(next_end).is_some_and(|&u| is_digit(u)) {
+                break;
+            }
+            lengths[count] = next_end - next_start;
+            end = next_end;
+        }
+    }
+}
+
 fn sort_dedup(mut hits: Vec<Hit>) -> Vec<Hit> {
+    // Same (kind, start, length) may arrive at different sensitivities (e.g. a
+    // hex-encoded bad-checksum ID + valid ID both map to the whole encoded
+    // token). Keep the higher sensitivity so S3/Block is never downgraded.
     hits.sort_by_key(|hit| (hit.start, hit.length, hit.kind as u8));
-    hits.dedup_by_key(|hit| (hit.kind, hit.start, hit.length));
+    hits.dedup_by(|later, kept| {
+        if later.kind == kept.kind && later.start == kept.start && later.length == kept.length {
+            kept.sensitivity = kept.sensitivity.max(later.sensitivity);
+            true
+        } else {
+            false
+        }
+    });
     hits
 }
 
@@ -104,6 +182,117 @@ fn is_digit(u: u16) -> bool {
 
 fn is_separator(u: u16) -> bool {
     u == u16::from(b' ') || u == u16::from(b'-')
+}
+
+fn is_formatted_separator(u: u16) -> bool {
+    is_separator(u) || u == u16::from(b'\t') || u == u16::from(b'.') || u == u16::from(b'/')
+}
+
+fn is_check_x(u: u16) -> bool {
+    u == u16::from(b'X') || u == u16::from(b'x')
+}
+
+/// 常数边界：每条链每个起点最多看后面 5 段、合计 19 位。整链分解不再是否决条件。
+/// 同一起点取第一个命中（最短窗口），避免把已成立的卡号再吃进后面的数字。
+/// 被已发出窗口严格包住的内层窗口丢掉。
+fn scan_formatted(units: &[u16], hits: &mut Vec<Hit>) {
+    let mut i = 0;
+    while i < units.len() {
+        if !is_digit(units[i]) {
+            i += 1;
+            continue;
+        }
+        let mut segments = Vec::new();
+        loop {
+            let start = i;
+            while i < units.len() && is_digit(units[i]) {
+                i += 1;
+            }
+            segments.push((start, i));
+            let joins = units
+                .get(i)
+                .is_some_and(|&unit| is_formatted_separator(unit))
+                && units.get(i + 1).is_some_and(|&unit| is_digit(unit));
+            if !joins {
+                break;
+            }
+            i += 1;
+        }
+        let mut covered_until = 0;
+        for start in 0..segments.len() {
+            let mut best: Option<(usize, Vec<Hit>)> = None;
+            let mut digits = 0usize;
+            for end in start..segments.len().min(start + 5) {
+                digits += segments[end].1 - segments[end].0;
+                if digits > 19 {
+                    break;
+                }
+                let found = formatted_window(units, &segments[start..=end]);
+                if !found.is_empty() {
+                    best = Some((end + 1, found));
+                    break;
+                }
+            }
+            if let Some((end, found)) = best
+                && end > covered_until
+            {
+                hits.extend(found);
+                covered_until = end;
+            }
+        }
+    }
+}
+
+/// 手机号、四位分组银行卡，以及 `6/8/4`、`6/4/4/4` 身份证（含末位 `X`）。
+/// 长得像实体的普通数字行仍然无法和真号区分，这是有意的误报。
+fn formatted_window(units: &[u16], segments: &[(usize, usize)]) -> Vec<Hit> {
+    let count = segments.len();
+    if count == 0 || count > 5 {
+        return Vec::new();
+    }
+    let mut lengths = [0usize; 5];
+    let mut total = 0usize;
+    for (index, &(start, end)) in segments.iter().enumerate() {
+        let len = end - start;
+        lengths[index] = len;
+        total += len;
+    }
+    if total > 19 {
+        return Vec::new();
+    }
+    let lengths = &lengths[..count];
+    let mobile_shape = matches!(lengths, [3, 4, 4] | [2, 3, 4, 4] | [2, 11]);
+    let card_shape = (16..=19).contains(&total)
+        && count >= 4
+        && lengths[..count - 1].iter().all(|&len| len == 4)
+        && lengths.last().is_some_and(|len| (1..=4).contains(len));
+    let id_18 = matches!(lengths, [6, 8, 4] | [6, 4, 4, 4]);
+    let id_17 = matches!(lengths, [6, 8, 3] | [6, 4, 4, 3]);
+    let last_end = segments[count - 1].1;
+    let x_suffix = id_17 && units.get(last_end).is_some_and(|&unit| is_check_x(unit));
+    let id_shape = id_18 || x_suffix;
+    if !(count == 1 || mobile_shape || card_shape || id_shape) {
+        return Vec::new();
+    }
+    let digits: Vec<u8> = segments
+        .iter()
+        .flat_map(|&(start, end)| units[start..end].iter())
+        .map(|&unit| (unit - u16::from(b'0')) as u8)
+        .collect();
+    let mut hits = Vec::new();
+    classify(
+        &Candidate {
+            digits: &digits,
+            start: segments[0].0,
+            end: last_end,
+            x_suffix,
+        },
+        &mut hits,
+    );
+    if id_shape && !mobile_shape && !card_shape {
+        hits.retain(|hit| hit.kind == FindingKind::CnResidentId);
+    }
+    hits
 }
 
 /// 从 `start`（必须是数字）开始的数字组终点：分隔符只有在两侧都是数字时才算组内。
@@ -162,9 +351,12 @@ fn classify(c: &Candidate<'_>, hits: &mut Vec<Hit>) {
 }
 
 /// 18 位身份证前 17 位：省级区划码 + 合法的 YYYYMMDD 出生日期。
+/// 83 只认台湾居民居住证 `830000`，不接受其它 `83xxxx`，也不进入 15 位旧证。
 fn id_structure(d: &[u8]) -> bool {
     let year = number(&d[6..10]);
-    PROVINCES.contains(&(d[0] * 10 + d[1]))
+    let province = d[0] * 10 + d[1];
+    let province_ok = PROVINCES.contains(&province) || (province == 83 && d[2..6] == [0, 0, 0, 0]);
+    province_ok
         && (1900..=2100).contains(&year)
         && valid_date(year, number(&d[10..12]), number(&d[12..14]))
 }
@@ -226,4 +418,99 @@ fn valid_date(year: u32, month: u32, day: u32) -> bool {
         _ => return false,
     };
     (1..=days).contains(&day)
+}
+
+/// Append checksum-valid modern IDs across bounded ASCII gaps. Existing scans
+/// retain their own grammar and coverage. Each maximal run is an outer start
+/// once; lookahead consumes at most 18 digits, 17 three-unit gaps and boundary
+/// context. No candidate starts inside a run or retries a truncated suffix.
+fn scan_crossline_modern_id(units: &[u16], hits: &mut Vec<Hit>) {
+    let mut i = 0;
+    while i < units.len() {
+        if !is_digit(units[i]) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < units.len() && is_digit(units[i]) {
+            i += 1;
+        }
+        if i - start > 18 || crossline_left_neighbor(units, start) {
+            continue;
+        }
+        let mut digits = [0u8; 18];
+        let mut total = i - start;
+        for (index, &unit) in units[start..i].iter().enumerate() {
+            digits[index] = (unit - u16::from(b'0')) as u8;
+        }
+        let mut end = i;
+        let mut crossed = false;
+        loop {
+            let x_suffix = total == 17 && units.get(end).is_some_and(|&u| matches!(u, 88 | 120));
+            if total == 18 || x_suffix {
+                let check_end = end + usize::from(x_suffix);
+                let check = if x_suffix { b'X' } else { digits[17] + b'0' };
+                if crossed
+                    && !crossline_right_neighbor(units, check_end)
+                    && id_structure(&digits[..17])
+                    && id_sensitivity(&digits[..17], check) == Sensitivity::S3
+                {
+                    hits.push(Hit {
+                        kind: FindingKind::CnResidentId,
+                        start,
+                        length: check_end - start,
+                        sensitivity: Sensitivity::S3,
+                    });
+                }
+                break;
+            }
+            let Some((next, line_break)) = crossline_gap(units, end) else {
+                break;
+            };
+            let mut cursor = next;
+            while cursor < units.len() && is_digit(units[cursor]) && total < 18 {
+                digits[total] = (units[cursor] - u16::from(b'0')) as u8;
+                total += 1;
+                cursor += 1;
+            }
+            if units.get(cursor).is_some_and(|&u| is_digit(u)) {
+                break;
+            }
+            end = cursor;
+            crossed |= line_break;
+        }
+    }
+}
+
+/// Only a complete 1..=3-unit gap ending at a digit connects two runs.
+fn crossline_gap(units: &[u16], start: usize) -> Option<(usize, bool)> {
+    let mut end = start;
+    let mut line_break = false;
+    while end - start < 3 && units.get(end).is_some_and(|&u| crossline_separator(u)) {
+        line_break |= matches!(units[end], 10 | 13);
+        end += 1;
+    }
+    (end > start && units.get(end).is_some_and(|&u| is_digit(u))).then_some((end, line_break))
+}
+
+fn crossline_separator(unit: u16) -> bool {
+    matches!(unit, 32 | 45 | 9 | 10 | 13)
+}
+
+/// A preceding connected run on this line cannot be omitted from the ID.
+fn crossline_left_neighbor(units: &[u16], start: usize) -> bool {
+    let mut cursor = start;
+    let mut line_break = false;
+    while start - cursor < 3 && cursor > 0 && crossline_separator(units[cursor - 1]) {
+        cursor -= 1;
+        line_break |= matches!(units[cursor], 10 | 13);
+    }
+    cursor < start && cursor > 0 && !line_break && is_digit(units[cursor - 1])
+}
+
+/// Inspect context even at the digit cap, including digits after terminal X.
+/// A connected next line may bound the ID; a same-line numeric tail may not.
+fn crossline_right_neighbor(units: &[u16], end: usize) -> bool {
+    units.get(end).is_some_and(|&u| is_digit(u))
+        || crossline_gap(units, end).is_some_and(|(_, line_break)| !line_break)
 }

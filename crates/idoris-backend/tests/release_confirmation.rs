@@ -67,6 +67,7 @@ async fn failed_different_policy_oom_reload_keeps_original_capacity_reserved() {
         let chat_error = handle
             .chat(
                 ChatRequest {
+                    native: None,
                     model: "a".into(),
                     messages: vec![],
                 },

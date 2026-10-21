@@ -229,7 +229,7 @@ async fn inspected_append_failure_is_503_before_profiling_or_egress() {
             .iter()
             .map(|e| e.event.event_type)
             .collect::<Vec<_>>(),
-        [EventType::RequestReceived]
+        [EventType::RequestReceived, EventType::AuditFinalized]
     );
     assert!(upstream.received_requests().await.unwrap().is_empty());
 }

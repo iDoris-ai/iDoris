@@ -313,6 +313,157 @@ impl EgressCounter {
     }
 }
 
+use idoris_policy::breaker::{Admission, AdmissionTicket, CredentialClass};
+
+// Bound untrusted network headers only; the standalone core contract is uncapped.
+const MAX_CONNECTION_RETRY_AFTER_MS: u64 = 300_000;
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) enum BreakerKey {
+    Provider(String),
+    Connection {
+        scheme: String,
+        host: String,
+        port: u16,
+    },
+}
+
+fn provider_key(id: &str) -> BreakerKey {
+    BreakerKey::Provider(id.to_string())
+}
+
+fn connection_key(url: &str) -> Option<BreakerKey> {
+    let parsed = reqwest::Url::parse(url).ok()?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return None;
+    }
+    Some(BreakerKey::Connection {
+        scheme: parsed.scheme().to_string(),
+        host: parsed.host_str()?.to_string(),
+        port: parsed.port_or_known_default()?,
+    })
+}
+
+struct CapturedGate {
+    key: BreakerKey,
+    class: CredentialClass,
+    ticket: AdmissionTicket,
+    probe: bool,
+}
+
+struct CapturedSendClaim<'a> {
+    proxy: &'a ChatProxy,
+    gates: Vec<CapturedGate>,
+}
+
+impl CapturedSendClaim<'_> {
+    fn finish(mut self, status: u16, retry_after_ms: Option<u64>) {
+        if self.gates.is_empty() {
+            return;
+        }
+        let fault = status == 408 || status == 429 || (500..600).contains(&status);
+        let header = retry_after_ms
+            .filter(|_| status == 429 || status == 503)
+            .map(|ms| ms.min(MAX_CONNECTION_RETRY_AFTER_MS));
+        // One lock covers failure counting and header settlement for both owned gates.
+        // Admission fails closed on poison; settlement recovers only issued ownership.
+        let mut book = self
+            .proxy
+            .breakers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = self.proxy.now_ms();
+        for gate in self.gates.drain(..) {
+            match gate.key {
+                BreakerKey::Provider(_) if fault => {
+                    book.on_failure(&gate.key, gate.class, gate.ticket, now);
+                }
+                BreakerKey::Connection { .. } if fault && gate.probe => {
+                    book.on_failure_with_retry_after(
+                        &gate.key,
+                        gate.class,
+                        gate.ticket,
+                        now,
+                        header,
+                    );
+                }
+                BreakerKey::Connection { .. } if header.is_some() => {
+                    if let Some(ms) = header {
+                        book.on_retry_after(&gate.key, gate.class, gate.ticket, now, ms);
+                    }
+                }
+                _ if !fault => book.on_success(&gate.key, gate.class, gate.ticket),
+                _ => {} // Ordinary connection faults without headers do not accumulate failures.
+            }
+        }
+    }
+}
+
+impl Drop for CapturedSendClaim<'_> {
+    fn drop(&mut self) {
+        if self.gates.iter().any(|gate| gate.probe) {
+            let mut book = self
+                .proxy
+                .breakers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let now = self.proxy.now_ms();
+            for gate in self.gates.drain(..) {
+                if gate.probe {
+                    book.on_failure(&gate.key, gate.class, gate.ticket, now);
+                }
+            }
+        }
+    }
+}
+
+impl crate::dispatch::ProviderAdmission for ChatProxy {
+    fn begin_provider(
+        &self,
+        provider_id: &str,
+        class: CredentialClass,
+    ) -> crate::dispatch::ProviderCapture {
+        let mut capture = crate::dispatch::ProviderCapture {
+            key: provider_key(provider_id),
+            class,
+            ticket: None,
+            probe: false,
+        };
+        if self.breakers_enabled()
+            && let Ok(mut book) = self.breakers.lock()
+        {
+            let admit = book.admit(&capture.key, class, self.now_ms());
+            capture.probe = admit.admission == Admission::Probe;
+            capture.ticket = admit.ticket;
+        }
+        capture
+    }
+
+    fn finish_provider(
+        &self,
+        capture: crate::dispatch::ProviderCapture,
+        outcome: crate::dispatch::ProviderOutcome,
+    ) {
+        use crate::dispatch::ProviderOutcome;
+        let Some(ticket) = capture.ticket else {
+            return;
+        };
+        if matches!(outcome, ProviderOutcome::Ignored) && !capture.probe {
+            return;
+        }
+        let mut book = self
+            .breakers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match outcome {
+            ProviderOutcome::Success => book.on_success(&capture.key, capture.class, ticket),
+            ProviderOutcome::Fault | ProviderOutcome::Ignored => {
+                book.on_failure(&capture.key, capture.class, ticket, self.now_ms());
+            }
+        }
+    }
+}
+
 /// The proxy only fronts `http_service` cards: loopback ones are local
 /// runtimes, anything else is treated as a keyed API.
 fn credential_class(url: &str) -> idoris_policy::breaker::CredentialClass {
@@ -350,13 +501,15 @@ fn is_loopback_url(url: &str) -> bool {
 pub struct ChatProxy {
     pub(crate) client: reqwest::Client,
     egress: Arc<EgressCounter>,
-    /// M5-14 provider-grain circuit breakers, keyed by provider id.
-    breakers: Mutex<idoris_policy::breaker::BreakerBook<String>>,
+    /// Provider and HTTP origin gates, each qualified by dialed credential class.
+    breakers: Mutex<idoris_policy::breaker::BreakerBook<BreakerKey>>,
     /// On for a library-constructed proxy. The `idoris` binary turns it off
     /// unless `IDORIS_PROVIDER_BREAKER=1`: the shared conformance contract
     /// still says persistent 5xx is passed through verbatim, so enabling
     /// breakers by default is an owner decision, not a silent change.
     breaker_enabled: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    test_clock_ms: std::sync::atomic::AtomicU64,
     pub(crate) window: Duration,
     max_entries: usize,
     header_timeout: Duration,
@@ -379,9 +532,7 @@ pub struct ChatProxy {
 }
 
 impl ChatProxy {
-    /// Claims an upstream send for `provider_id`. A poisoned lock fails
-    /// closed: no send.
-    /// Turns provider breakers on or off for every later request.
+    /// Turns provider breakers on or off for every later admission.
     pub fn set_breakers_enabled(&self, enabled: bool) {
         self.breaker_enabled.store(enabled, Ordering::SeqCst);
     }
@@ -390,50 +541,178 @@ impl ChatProxy {
         self.breaker_enabled.load(Ordering::SeqCst)
     }
 
-    fn admit_provider(&self, provider_id: &str, url: &str) -> bool {
-        if !self.breakers_enabled() {
-            return true;
+    fn now_ms(&self) -> u64 {
+        #[cfg(test)]
+        {
+            let now = self.test_clock_ms.load(Ordering::SeqCst);
+            if now != u64::MAX {
+                return now;
+            }
         }
-        let Ok(mut book) = self.breakers.lock() else {
-            return false;
-        };
-        book.admit(
-            &provider_id.to_string(),
-            credential_class(url),
-            wall_clock_ms(),
-        )
-        .admitted()
+        wall_clock_ms()
     }
 
-    /// 408, 429 and 5xx (including the proxy's own transport-failure 502/504)
-    /// count against the provider; any other answer proves it reachable. A
-    /// 429/503 `Retry-After` keeps it open at least that long.
-    fn report_provider(
+    pub(crate) async fn drive_external<T, F, Fut, C>(
         &self,
         provider_id: &str,
-        url: &str,
-        status: u16,
-        retry_after_ms: Option<u64>,
-    ) {
+        class: CredentialClass,
+        operation: F,
+        classify: C,
+    ) -> T
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = T>,
+        C: FnOnce(&T) -> crate::dispatch::ProviderOutcome,
+    {
+        let guard = crate::dispatch::ProviderGuard::begin(Some(self), provider_id, class);
+        let result = operation().await;
+        let outcome = classify(&result);
+        guard.finish(outcome);
+        result
+    }
+
+    /// Advisory readiness only: no entries, tickets, or probe ownership are created.
+    pub(crate) fn blocked_cards(&self, cards: &[idoris_contracts::ComponentCard]) -> Vec<bool> {
         if !self.breakers_enabled() {
-            return;
+            return vec![false; cards.len()];
         }
-        let Ok(mut book) = self.breakers.lock() else {
+        let keys: Vec<_> = cards
+            .iter()
+            .map(|card| {
+                use crate::subscription::card::{CardBoundary, classify_subscription_card};
+                let (class, connection) = match classify_subscription_card(card) {
+                    Ok(CardBoundary::Subscription) => (CredentialClass::OAuth, None),
+                    Ok(CardBoundary::Ordinary)
+                        if crate::dispatch::is_resident_http_service(card) =>
+                    {
+                        (
+                            credential_class(&card.endpoint),
+                            connection_key(&card.endpoint),
+                        )
+                    }
+                    Ok(CardBoundary::Ordinary)
+                        if card.form == idoris_contracts::component_card::Form::HttpService =>
+                    {
+                        (CredentialClass::Local, None)
+                    }
+                    Ok(CardBoundary::Ordinary) | Err(_) => return None, // Retain the existing invalid-boundary rejection.
+                };
+                Some((provider_key(&card.provider.id), connection, class))
+            })
+            .collect();
+        let Ok(book) = self.breakers.lock() else {
+            return vec![true; cards.len()];
+        };
+        let now = self.now_ms();
+        keys.iter()
+            .map(|keys| {
+                keys.as_ref().is_some_and(|(provider, connection, class)| {
+                    matches!(
+                        book.readiness(provider, *class, now),
+                        Admission::Rejected { .. }
+                    ) || connection.as_ref().is_some_and(|key| {
+                        matches!(book.readiness(key, *class, now), Admission::Rejected { .. })
+                    })
+                })
+            })
+            .collect()
+    }
+
+    /// A cooling card that already owns this request-id must stay selectable.
+    /// Masking it first changes the cache key and executes the retry elsewhere.
+    pub(crate) fn unmask_idempotent_bindings(
+        &self,
+        cards: &[idoris_contracts::ComponentCard],
+        blocked: &mut [bool],
+        tenant_id: Option<&str>,
+        request_id: Option<&str>,
+        path: &str,
+    ) {
+        let Some(request_id) = request_id.filter(|id| !id.is_empty()) else {
             return;
         };
-        let (key, class, now_ms) = (
-            provider_id.to_string(),
-            credential_class(url),
-            wall_clock_ms(),
-        );
-        if status == 408 || status == 429 || (500..600).contains(&status) {
-            book.on_failure(&key, class, now_ms);
-            if let Some(ms) = retry_after_ms.filter(|_| status == 429 || status == 503) {
-                book.on_retry_after(&key, class, now_ms, ms);
-            }
-        } else {
-            book.on_success(&key, class);
+        if blocked.len() != cards.len() {
+            return;
         }
+        let tenant = tenant_id.unwrap_or("\u{0}personal");
+        for (card, blocked) in cards.iter().zip(blocked.iter_mut()) {
+            if !*blocked {
+                continue;
+            }
+            let url = format!("{}{path}", card.endpoint.trim_end_matches('/'));
+            let key = cache_key(tenant, &url, &card.provider.id, request_id);
+            if self.idempotent_key_present(&key) {
+                *blocked = false;
+            }
+        }
+    }
+
+    fn idempotent_key_present(&self, key: &str) -> bool {
+        if let Ok(cache) = self.cache.lock()
+            && let Some(entry) = cache.get(key)
+            && Instant::now().duration_since(entry.at) < self.window
+        {
+            return true;
+        }
+        self.flights
+            .lock()
+            .is_ok_and(|flights| flights.contains_key(key))
+    }
+
+    fn claim_send(&self, provider_id: &str, url: &str) -> Option<CapturedSendClaim<'_>> {
+        let mut claim = CapturedSendClaim {
+            proxy: self,
+            gates: Vec::new(),
+        };
+        if !self.breakers_enabled() {
+            return Some(claim);
+        }
+        let class = credential_class(url);
+        let provider = provider_key(provider_id);
+        let connection = connection_key(url);
+        let mut book = self.breakers.lock().ok()?;
+        let now = self.now_ms();
+        let admissions = if let Some(connection) = connection {
+            let pair = book
+                .admit_pair((&provider, class), (&connection, class), now)
+                .ok()?;
+            pair.into_iter()
+                .zip([provider, connection])
+                .map(|(admit, key)| (key, admit))
+                .collect::<Vec<_>>()
+        } else {
+            vec![(provider.clone(), book.admit(&provider, class, now))]
+        };
+        for (key, admit) in admissions {
+            let ticket = admit.ticket?;
+            claim.gates.push(CapturedGate {
+                key,
+                class,
+                ticket,
+                probe: admit.admission == Admission::Probe,
+            });
+        }
+        Some(claim)
+    }
+
+    #[cfg(test)]
+    fn admit_provider(&self, provider_id: &str, url: &str) -> Option<CapturedSendClaim<'_>> {
+        let mut claim = CapturedSendClaim {
+            proxy: self,
+            gates: Vec::new(),
+        };
+        if self.breakers_enabled() {
+            let key = provider_key(provider_id);
+            let class = credential_class(url);
+            let admit = self.breakers.lock().ok()?.admit(&key, class, self.now_ms());
+            claim.gates.push(CapturedGate {
+                key,
+                class,
+                ticket: admit.ticket?,
+                probe: admit.admission == Admission::Probe,
+            });
+        }
+        Some(claim)
     }
 
     /// Off-host egress observed so far by this proxy.
@@ -466,6 +745,8 @@ impl ChatProxy {
             egress: Arc::new(EgressCounter::default()),
             breakers: Mutex::new(idoris_policy::breaker::BreakerBook::new()),
             breaker_enabled: std::sync::atomic::AtomicBool::new(true),
+            #[cfg(test)]
+            test_clock_ms: std::sync::atomic::AtomicU64::new(u64::MAX),
             window: DEFAULT_WINDOW,
             max_entries: DEFAULT_MAX_ENTRIES,
             header_timeout: Duration::from_secs(10),
@@ -1100,21 +1381,21 @@ impl ChatProxy {
             }
         }
 
-        // M5-14 provider breaker: an open provider is not sent to at all
+        // Claim both gates before observation; either refusal sends nothing
         // (no dispatched observation, nothing executed).
-        if !self.admit_provider(opts.provider_id, url) {
+        let Some(claim) = self.claim_send(opts.provider_id, url) else {
             return Ok(Self::flight_failure_with_execution(
                 503,
                 "provider_circuit_open",
                 ExecutionDisposition::NotExecuted,
             ));
-        }
+        };
         observer().await?;
         let mut retry_after_ms = None;
         let Ok(outcome) = self
             .send_buffered(url, payload, opts, uncertain, &mut retry_after_ms)
             .await;
-        self.report_provider(opts.provider_id, url, outcome.status, retry_after_ms);
+        claim.finish(outcome.status, retry_after_ms);
         Ok(outcome)
     }
 
@@ -1148,7 +1429,8 @@ impl ChatProxy {
                         .headers()
                         .get(reqwest::header::RETRY_AFTER)
                         .and_then(|v| v.to_str().ok())
-                        .and_then(idoris_policy::breaker::parse_retry_after_ms);
+                        .and_then(idoris_policy::breaker::parse_retry_after_ms)
+                        .map(|ms| ms.min(MAX_CONNECTION_RETRY_AFTER_MS));
                     #[allow(clippy::cast_possible_truncation)]
                     let retries = attempt as u32;
                     // A body that fails to read (connection dropped
@@ -1244,10 +1526,16 @@ impl ChatProxy {
     /// `opts.stream` (only the *retry* sub-branch inside it is gated on
     /// `!opts.stream`), so a streaming request whose upstream call fails
     /// outright still gets a plain JSON/text error body, never an SSE
-    /// stream carrying an error.
+    /// stream carrying an error. Without a configured card, the endpoint
+    /// is used as the provider key.
     pub async fn forward_stream(&self, endpoint: &str, body: &Value) -> StreamOutcome {
-        self.forward_stream_path(endpoint, StreamingUpstreamPath::CHAT_COMPLETIONS, body)
-            .await
+        self.forward_stream_path(
+            endpoint,
+            StreamingUpstreamPath::CHAT_COMPLETIONS,
+            body,
+            endpoint,
+        )
+        .await
     }
 
     pub(crate) async fn forward_stream_path(
@@ -1255,9 +1543,10 @@ impl ChatProxy {
         endpoint: &str,
         upstream_path: StreamingUpstreamPath,
         body: &Value,
+        provider_id: &str,
     ) -> StreamOutcome {
         let result = self
-            .forward_stream_path_observed(endpoint, upstream_path, body, || async {
+            .forward_stream_path_observed(endpoint, upstream_path, body, provider_id, || async {
                 Ok::<(), std::convert::Infallible>(())
             })
             .await;
@@ -1274,6 +1563,7 @@ impl ChatProxy {
         &self,
         endpoint: &str,
         body: &Value,
+        provider_id: &str,
         observer: F,
     ) -> Result<StreamOutcome, E>
     where
@@ -1284,16 +1574,19 @@ impl ChatProxy {
             endpoint,
             StreamingUpstreamPath::CHAT_COMPLETIONS,
             body,
+            provider_id,
             observer,
         )
         .await
     }
 
+    /// Account for initial headers only; later SSE fate is a stream outcome.
     async fn forward_stream_path_observed<F, Fut, E>(
         &self,
         endpoint: &str,
         upstream_path: StreamingUpstreamPath,
         body: &Value,
+        provider_id: &str,
         observer: F,
     ) -> Result<StreamOutcome, E>
     where
@@ -1312,6 +1605,15 @@ impl ChatProxy {
         if let Some(obj) = payload.as_object_mut() {
             obj.insert("stream".to_string(), Value::Bool(true));
         }
+        let Some(claim) = self.claim_send(provider_id, &url) else {
+            let failure = Self::flight_failure(503, "provider_circuit_open");
+            return Ok(StreamOutcome::Buffered {
+                status: failure.status,
+                body: failure.body,
+                content_type: failure.content_type,
+                execution: failure.execution,
+            });
+        };
         observer().await?;
         let sent =
             match tokio::time::timeout(self.header_timeout, self.outbound(&url, &payload).send())
@@ -1319,6 +1621,7 @@ impl ChatProxy {
             {
                 Ok(sent) => sent,
                 Err(_) => {
+                    claim.finish(504, None);
                     return Ok(Self::stream_failure(504, ExecutionDisposition::Uncertain));
                 }
             };
@@ -1330,6 +1633,12 @@ impl ChatProxy {
                     .get(reqwest::header::CONTENT_TYPE)
                     .and_then(|v| v.to_str().ok())
                     .map(str::to_string);
+                let retry_after_ms = resp
+                    .headers()
+                    .get(reqwest::header::RETRY_AFTER)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(idoris_policy::breaker::parse_retry_after_ms);
+                claim.finish(status, retry_after_ms);
                 if (200..300).contains(&status) {
                     let idle = self.stream_idle_timeout;
                     #[cfg(test)]
@@ -1474,14 +1783,18 @@ impl ChatProxy {
                     }
                 }
             }
-            Err(err) => Self::stream_failure(
-                if err.is_timeout() { 504 } else { 502 },
-                if err.is_connect() {
-                    ExecutionDisposition::NotExecuted
-                } else {
-                    ExecutionDisposition::Uncertain
-                },
-            ),
+            Err(err) => {
+                let status = if err.is_timeout() { 504 } else { 502 };
+                claim.finish(status, None);
+                Self::stream_failure(
+                    status,
+                    if err.is_connect() {
+                        ExecutionDisposition::NotExecuted
+                    } else {
+                        ExecutionDisposition::Uncertain
+                    },
+                )
+            }
         })
     }
 
@@ -2243,3 +2556,23 @@ mod k14_slow_reader_tests;
 #[cfg(test)]
 #[path = "proxy_stream_termination_tests.rs"]
 mod stream_termination_tests;
+
+#[cfg(test)]
+#[path = "proxy_breaker_atomic_tests.rs"]
+mod breaker_atomic_tests;
+
+#[cfg(test)]
+#[path = "proxy_breaker_pair_tests.rs"]
+mod breaker_pair_tests;
+
+#[cfg(test)]
+#[path = "proxy_stream_breaker_tests.rs"]
+mod stream_breaker_tests;
+
+#[cfg(test)]
+#[path = "proxy_card_selection_tests.rs"]
+mod card_selection_tests;
+
+#[cfg(test)]
+#[path = "proxy_external_tests.rs"]
+mod external_tests;

@@ -2,15 +2,21 @@
 //!
 //! 对每个长得像编码串的 token 解码**一层**，解出合法 UTF-8 就用同一套 L0
 //! （先归一化再扫描）检查解码后的文本；有命中就按命中的类别和敏感度报告
-//! 整个编码串的原位置。只解一层：嵌套编码的成本无界，而且解不开的长随机串
-//! 已经由 B 组高熵规则兜住。
+//! 整个编码串的原位置。只解一层：嵌套编码的成本无界。
+//!
+//! 百分号编码：只要有 ≥ 1 个合法 `%XX` 就解码；非法 `%`（如 `%ZZ`）原样保留并
+//! 继续扫描，避免一个坏转义把整段合法内容抹掉。短百分号密钥（例如一个转义
+//! 藏起 `sk-`）不依赖高熵规则。
+//!
+//! 已知缺口（不在本层覆盖）：UTF-16LE base64（如 PowerShell `-EncodedCommand`）
+//! 解出的数字被 NUL 隔开；按 76 列折行的 MIME/PEM base64 跨行密钥。
 
 use super::Hit;
 
 /// 至少编码 9 个字节才值得解（短于 12 个字符的 base64 太容易撞上普通词）。
 const MIN_BASE64: usize = 12;
 const MIN_HEX: usize = 16;
-const MIN_PERCENT_ESCAPES: usize = 3;
+const MIN_PERCENT_ESCAPES: usize = 1;
 
 pub(super) fn scan(units: &[u16], hits: &mut Vec<Hit>) {
     // base64/hex: the base64url-or-standard alphabet plus up to two `=` of
@@ -28,11 +34,13 @@ pub(super) fn scan(units: &[u16], hits: &mut Vec<Hit>) {
             report(&decoded, start, end - start, hits);
         }
     }
-    for (start, end) in runs(units, |b| {
-        b.is_ascii_alphanumeric() || b"%._~+-".contains(&b)
-    }) {
-        if let Some(decoded) = decode_percent(&ascii_bytes(&units[start..end])) {
-            report(&decoded, start, end - start, hits);
+    if let Some(view) = decode_percent(units) {
+        for mut hit in super::scan_all_views(&view.units, super::l0::scan_plain) {
+            let first = view.origin[hit.start].0;
+            let end = view.origin[hit.start + hit.length - 1].1;
+            hit.start = first;
+            hit.length = end - first;
+            hits.push(hit);
         }
     }
 }
@@ -66,8 +74,7 @@ fn report(decoded: &[u8], start: usize, length: usize, hits: &mut Vec<Hit>) {
         return;
     };
     let units: Vec<u16> = text.encode_utf16().collect();
-    let normalized = super::normalize::normalize(&units);
-    for inner in super::l0::scan_plain(&normalized.units) {
+    for inner in super::scan_all_views(&units, super::l0::scan_plain) {
         hits.push(Hit {
             kind: inner.kind,
             start,
@@ -77,30 +84,62 @@ fn report(decoded: &[u8], start: usize, length: usize, hits: &mut Vec<Hit>) {
     }
 }
 
-fn decode_percent(token: &[u8]) -> Option<Vec<u8>> {
-    let mut out = Vec::with_capacity(token.len());
+struct PercentView {
+    units: Vec<u16>,
+    origin: Vec<(usize, usize)>,
+}
+
+/// Decode one percent layer across the whole input, preserving separators and
+/// UTF-16 source ranges. Invalid escapes/UTF-8 stay literal, never erase text.
+/// `+` stays literal: this is percent encoding, not form-urlencoded parsing.
+fn decode_percent(input: &[u16]) -> Option<PercentView> {
+    fn byte_at(input: &[u16], at: usize) -> Option<u8> {
+        let chunk = input.get(at..at + 3)?;
+        if chunk[0] != u16::from(b'%') {
+            return None;
+        }
+        Some(
+            hex_value(u8::try_from(chunk[1]).ok()?)? << 4
+                | hex_value(u8::try_from(chunk[2]).ok()?)?,
+        )
+    }
+    let mut view = PercentView {
+        units: Vec::with_capacity(input.len()),
+        origin: Vec::with_capacity(input.len()),
+    };
     let mut escapes = 0;
     let mut i = 0;
-    while i < token.len() {
-        match token[i] {
-            b'%' => {
-                let hi = hex_value(*token.get(i + 1)?)?;
-                let lo = hex_value(*token.get(i + 2)?)?;
-                out.push(hi << 4 | lo);
-                escapes += 1;
-                i += 3;
+    while i < input.len() {
+        let decoded = byte_at(input, i).and_then(|first| {
+            let width = match first {
+                0..=0x7f => 1,
+                0xc2..=0xdf => 2,
+                0xe0..=0xef => 3,
+                0xf0..=0xf4 => 4,
+                _ => return None,
+            };
+            let mut bytes = [0u8; 4];
+            for (n, byte) in bytes.iter_mut().enumerate().take(width) {
+                *byte = byte_at(input, i + n * 3)?;
             }
-            b'+' => {
-                out.push(b' ');
-                i += 1;
+            let text = std::str::from_utf8(&bytes[..width]).ok()?;
+            Some((text.chars().next()?, width * 3))
+        });
+        if let Some((character, consumed)) = decoded {
+            let mut buffer = [0; 2];
+            for &unit in character.encode_utf16(&mut buffer).iter() {
+                view.units.push(unit);
+                view.origin.push((i, i + consumed));
             }
-            byte => {
-                out.push(byte);
-                i += 1;
-            }
+            escapes += 1;
+            i += consumed;
+        } else {
+            view.units.push(input[i]);
+            view.origin.push((i, i + 1));
+            i += 1;
         }
     }
-    (escapes >= MIN_PERCENT_ESCAPES).then_some(out)
+    (escapes >= MIN_PERCENT_ESCAPES).then_some(view)
 }
 
 fn decode_hex(token: &[u8]) -> Option<Vec<u8>> {
