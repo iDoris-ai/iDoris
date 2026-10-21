@@ -124,7 +124,12 @@ Core product invariants:
 - The existing default-DB recovery question and the authorization request
   for one review-request comment remain unanswered; do not infer answers.
 
-## Live delta — 2026-10-11 Codex takeover (newest; read first)
+## Historical snapshot — 2026-10-11 Codex takeover (not current)
+
+Do not follow this section as a live instruction. It was true on 2026-10-11 only.
+Current main is past `v0.3.0`; that tag exists. #374, #424, #439 and #493 are
+merged. Statements below that main is `792ed904`, that the tag does not exist,
+or that those PRs are still open are the old snapshot, not the present.
 
 - Goal mode is active; work continues on workstation B. Live main remains
   `792ed904dfbfda984fff81ea5dd930e12bfe6a30`.
@@ -299,7 +304,7 @@ Core product invariants:
   main before tag. REDACT consent and Admin v1 public writes remain pending.
   Do not recreate completed tests or collapse open parent/child review diffs.
 
-- Active worktrees live beside the main checkout under `/Users/jason/Dev/iDoris/`.
+- Active worktrees lived beside the main checkout. Paths are omitted.
   Current caches: `target-version-night` built M4 #488 (crate 0.3.0/wire 1.0.1);
   `target-identity32-night` and `target-inspect22-release` built M5 #489
   (crate 0.2.0/wire 1.1.0). All seven release crates were freshly recompiled (older M5 wire 1.1.0 artifacts
@@ -316,7 +321,7 @@ Full handoff: `docs/agent/HANDOFF-2026-10-11-NIGHT.md` on branch `docs/handoff-2
 - M4 landing tail (#361 #362 #364–#367 #416–#418, #398 #408, #374) still waits for a current-head approval from someone other than the last pusher.
 - `integration/m4-landing-tail` merges all of them onto main without conflicts; the full final-main acceptance set is green on it (see `HANDOFF-2026-10-11-NIGHT.md`). Acceptance evidence gaps for claims 1/3/4 are closed in `test/m4-acceptance-gaps`.
 - M5 gate one is implemented as a stacked chain `feat/inspect-01-contract-freeze` → … → `feat/resilience-07-subscription-breaker` → review fixes → `fix/review-5-hardening` (stack top; see the handoff for every branch) (contract, pure L0 + rule packs, `/v1/inspect`, INSPECTED on chat and protocol endpoints, kill switch core, egress counter, evasion folding, one-layer decoding, REDACT engine, budget race acceptance test, three-grain breaker + proxy wiring + selection steering + Supervisor model lockout + subscription OAuth breaker). **No PRs opened yet**: `gh` auth is invalid on this Mac; bodies + opener committed in `docs/agent/pr-queue-2026-10-11/` on the `docs/handoff-2026-10-11-night` branch.
-- Pushed as **clestons** over SSH (`~/.ssh/cleston-ed25519`), so another account can approve.
+- Pushed from the review account over SSH, so another account could approve. Key paths are omitted.
 - Owner decisions pending: redact-consent wire format; Admin v1 write surface (kill switch toggle, egress/breaker view); `/v1/inspect` request shape, kind list and wire-version bump; `credential_path` S2 vs S3; `provider_circuit_open` error type.
 - Four independent agent reviews ran tonight; their fail-open and false-positive findings are fixed with regression tests. Provider breakers are opt-in in the binary (`IDORIS_PROVIDER_BREAKER=1`) because on-by-default broke shared conformance.
 - Owner working rule (2026-10-11): when blocked on review, keep going by stacking new PRs on the open ones; the owner reviews later.
