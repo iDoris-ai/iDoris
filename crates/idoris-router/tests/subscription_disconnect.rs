@@ -38,6 +38,7 @@ async fn relay_handler(
     body: Bytes,
 ) -> impl IntoResponse {
     let request = ChatRequest {
+        native: None,
         model: "claude-subscription".into(),
         messages: vec![ChatMessage {
             role: "user".into(),

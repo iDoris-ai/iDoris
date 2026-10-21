@@ -17,6 +17,24 @@ fn memory_event_log() -> Arc<EventLogStore> {
     Arc::new(EventLogStore::new(Connection::open_in_memory().unwrap()).unwrap())
 }
 
+fn events(
+    event_log: &EventLogStore,
+    response: &Response,
+) -> Vec<idoris_tenancy::event_log::EventLogEvent> {
+    let record_id = response
+        .headers()
+        .get(HEADER_RECORD_ID)
+        .unwrap()
+        .to_str()
+        .unwrap();
+    event_log
+        .events_for_record(Some(budget::PERSONAL_TENANT_ID), record_id)
+        .unwrap()
+        .into_iter()
+        .filter(|row| row.event.event_type != EventType::AuditFinalized)
+        .collect()
+}
+
 #[tokio::test]
 async fn request_received_persists_server_record_and_validated_correlation() {
     let upstream = wiremock::MockServer::start().await;
@@ -62,13 +80,41 @@ async fn request_received_persists_server_record_and_validated_correlation() {
 
     let events = event_log
         .events_for_record(Some(budget::PERSONAL_TENANT_ID), &record_id)
-        .unwrap();
-    assert_eq!(events.len(), 5);
+        .unwrap()
+        .into_iter()
+        .filter(|row| row.event.event_type != EventType::AuditFinalized)
+        .collect::<Vec<_>>();
+    assert_eq!(events.len(), 6);
     assert_eq!(events[0].event.event_type, EventType::RequestReceived);
-    assert_eq!(events[1].event.event_type, EventType::Profiled);
-    assert_eq!(events[2].event.event_type, EventType::Decided);
-    assert_eq!(events[3].event.event_type, EventType::Dispatched);
-    assert_eq!(events[4].event.event_type, EventType::Completed);
+    assert_eq!(events[1].event.event_type, EventType::Inspected);
+    assert_eq!(events[2].event.event_type, EventType::Profiled);
+    assert_eq!(events[3].event.event_type, EventType::Decided);
+    assert_eq!(events[4].event.event_type, EventType::Dispatched);
+    assert_eq!(events[5].event.event_type, EventType::Completed);
+    assert!(events[0].sequence < events[1].sequence);
+    assert!(events[1].sequence < events[2].sequence);
+    let inspected = &events[1].event;
+    assert_eq!(inspected.tenant_id, budget::PERSONAL_TENANT_ID);
+    assert_eq!(inspected.record_id, record_id);
+    assert_eq!(inspected.session_id.as_deref(), Some(" session-1 "));
+    assert_eq!(inspected.trace_id.as_deref(), Some("trace-1"));
+    assert_eq!(inspected.parent_id.as_deref(), Some("parent-1"));
+    assert!(inspected.request_id.is_none());
+    assert!(inspected.origin_record_id.is_none());
+    assert_eq!(inspected.metadata.get("sensitivity"), Some(&json!("S0")));
+    assert_eq!(
+        inspected.metadata.get("privacy"),
+        Some(&json!("local_only"))
+    );
+    assert!(inspected.metadata.get("labels").unwrap().is_array());
+    assert_eq!(inspected.metadata.get("labels"), Some(&json!([])));
+    assert!(!inspected.metadata.contains_key("reason"));
+    assert_eq!(inspected.metadata.len(), 3);
+    assert!(
+        !serde_json::to_string(&inspected.metadata)
+            .unwrap()
+            .contains("secret prompt")
+    );
     let event = &events[0].event;
     assert_eq!(event.tenant_id, budget::PERSONAL_TENANT_ID);
     assert_eq!(event.record_id, record_id);
@@ -76,7 +122,7 @@ async fn request_received_persists_server_record_and_validated_correlation() {
     assert_eq!(event.session_id.as_deref(), Some(" session-1 "));
     assert_eq!(event.trace_id.as_deref(), Some("trace-1"));
     assert_eq!(event.parent_id.as_deref(), Some("parent-1"));
-    assert!(event.request_id.is_none());
+    assert_eq!(event.request_id.as_deref(), Some(event.record_id.as_str()));
     assert!(event.origin_record_id.is_none());
     assert!(event.metadata.is_empty());
     assert_eq!(
@@ -89,7 +135,43 @@ async fn request_received_persists_server_record_and_validated_correlation() {
 }
 
 #[tokio::test]
-async fn tenant_mode_uses_parsed_tenant_not_untrusted_metadata() {
+async fn request_received_preserves_valid_request_id_and_falls_back_on_oversize() {
+    let event_log = memory_event_log();
+    let app = build_app(AppState {
+        event_log: Some(event_log.clone()),
+        ..AppState::default()
+    });
+    let valid = app
+        .clone()
+        .oneshot(super::tests::post_chat(
+            r#"{"messages":[{"role":"user","content":"valid id"}]}"#,
+            &[(HEADER_REQUEST_ID, "caller-request")],
+        ))
+        .await
+        .unwrap();
+    let valid_events = events(&event_log, &valid);
+    assert_eq!(
+        valid_events[0].event.request_id.as_deref(),
+        Some("caller-request")
+    );
+
+    let long = "r".repeat(129);
+    let fallback = app
+        .oneshot(super::tests::post_chat(
+            r#"{"messages":[{"role":"user","content":"oversize id"}]}"#,
+            &[(HEADER_REQUEST_ID, long.as_str())],
+        ))
+        .await
+        .unwrap();
+    let fallback_events = events(&event_log, &fallback);
+    assert_eq!(
+        fallback_events[0].event.request_id.as_deref(),
+        Some(fallback_events[0].event.record_id.as_str())
+    );
+}
+
+#[tokio::test]
+async fn tenant_mode_rejects_unauthenticated_request_before_event_write() {
     let event_log = memory_event_log();
     let app = build_app(AppState {
         deploy_mode: DeployMode::Tenant,
@@ -106,6 +188,7 @@ async fn tenant_mode_uses_parsed_tenant_not_untrusted_metadata() {
         ))
         .await
         .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     let record_id = response
         .headers()
         .get(HEADER_RECORD_ID)
@@ -115,16 +198,72 @@ async fn tenant_mode_uses_parsed_tenant_not_untrusted_metadata() {
     let events = event_log
         .events_for_record(Some("acme"), record_id)
         .unwrap();
-    assert_eq!(events.len(), 3);
-    assert_eq!(events[0].event.event_type, EventType::RequestReceived);
-    assert_eq!(events[1].event.event_type, EventType::Profiled);
-    assert_eq!(events[2].event.event_type, EventType::Decided);
+    // main authenticates before REQUEST_RECEIVED, so an unauthenticated tenant
+    // request fails closed and writes no event at all.
+    assert!(events.is_empty());
     assert!(
         event_log
             .events_for_record(Some("evil"), record_id)
             .unwrap()
             .is_empty()
     );
+}
+
+#[tokio::test]
+async fn tenant_mode_uses_bound_fixture_tenant_not_untrusted_metadata() {
+    let upstream = wiremock::MockServer::start().await;
+    wiremock::Mock::given(method("POST"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+            serde_json::json!({"id":"tenant-positive", "object":"chat.completion", "choices":[]}),
+        ))
+        .expect(1)
+        .mount(&upstream)
+        .await;
+    let event_log = memory_event_log();
+    let (app, key) = tenant_test_app(
+        AppState {
+            deploy_mode: DeployMode::Tenant,
+            cards: vec![super::tests::resident_component_card(
+                "tenant-event-test",
+                &upstream.uri(),
+            )],
+            event_log: Some(event_log.clone()),
+            ..AppState::default()
+        },
+        "acme",
+    );
+    let response = app.oneshot(tenant_test_request(
+        super::tests::post_chat(
+            r#"{"model":"idoris/daily","messages":[{"role":"user","content":"tenant fixture"}]}"#,
+            &[("x-idoris-tenant", "acme"), ("x-idoris-event-tenant", "evil")],
+        ),
+        &key,
+    )).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    upstream.verify().await;
+    let record_id = response
+        .headers()
+        .get(HEADER_RECORD_ID)
+        .unwrap()
+        .to_str()
+        .unwrap();
+    let rows = event_log
+        .events_for_record(Some("acme"), record_id)
+        .unwrap();
+    assert_eq!(rows[0].event.event_type, EventType::RequestReceived);
+    assert_eq!(rows[1].event.event_type, EventType::Inspected);
+    assert_eq!(rows[2].event.event_type, EventType::Profiled);
+    assert_eq!(rows[3].event.event_type, EventType::Decided);
+    assert!(rows.iter().all(|row| row.event.tenant_id == "acme"));
+    assert!(
+        event_log
+            .events_for_record(Some("evil"), record_id)
+            .unwrap()
+            .is_empty()
+    );
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(body["id"], "tenant-positive");
 }
 
 #[tokio::test]

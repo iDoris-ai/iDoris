@@ -18,6 +18,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{LocalRuntimeKind, LocalRuntimeLaunch, ManagedRuntimeProcess};
 
 const DEFAULT_CALL_TIMEOUT: Duration = Duration::from_secs(10);
+const DEFAULT_CHAT_TIMEOUT: Duration = Duration::from_secs(120);
 const DEFAULT_SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone)]
@@ -26,7 +27,10 @@ pub struct LocalHttpRuntimeConfig {
     pub model_id: String,
     pub memory_gb: f64,
     pub load_fence_path: PathBuf,
+    /// Readiness/management round trips; independent of generation.
     pub call_timeout: Duration,
+    /// Entire completion round trip, including response body.
+    pub chat_timeout: Duration,
     pub shutdown_grace: Duration,
 }
 
@@ -57,6 +61,7 @@ impl LocalHttpRuntimeConfig {
             memory_gb,
             load_fence_path,
             call_timeout: DEFAULT_CALL_TIMEOUT,
+            chat_timeout: DEFAULT_CHAT_TIMEOUT,
             shutdown_grace: DEFAULT_SHUTDOWN_GRACE,
         })
     }
@@ -69,12 +74,16 @@ pub struct LocalHttpRuntimeAdapter {
 }
 
 impl LocalHttpRuntimeAdapter {
-    pub fn new(config: LocalHttpRuntimeConfig) -> Result<Self, BackendError> {
-        if config.call_timeout.is_zero() || config.shutdown_grace.is_zero() {
+    pub fn new(mut config: LocalHttpRuntimeConfig) -> Result<Self, BackendError> {
+        if config.call_timeout.is_zero()
+            || config.chat_timeout.is_zero()
+            || config.shutdown_grace.is_zero()
+        {
             return Err(BackendError::internal(
                 "local runtime timeouts must be non-zero",
             ));
         }
+        config.launch = config.launch.with_model_alias(&config.model_id);
         let client = crate::http_client()
             .map_err(|_| BackendError::internal("failed to build local runtime HTTP client"))?;
         Ok(Self {
@@ -154,21 +163,11 @@ impl LocalHttpRuntimeAdapter {
             return Err(BackendError::model_unavailable(&req.model));
         }
         let url = format!("{}/v1/chat/completions", self.config.launch.endpoint());
-        let messages = req
-            .messages
-            .iter()
-            .map(|message| {
-                serde_json::json!({
-                    "role": message.role,
-                    "content": message.content,
-                })
-            })
-            .collect::<Vec<_>>();
         let engine_model = match self.config.launch.kind() {
             LocalRuntimeKind::MlxLmServer => "default_model".to_string(),
             LocalRuntimeKind::LlamaCpp => self.config.model_id.clone(),
         };
-        let body = serde_json::json!({"model": engine_model, "messages": messages});
+        let body = crate::native_completion_wire::request_body(&req, &engine_model);
         let attempt = async {
             let response = self
                 .client
@@ -194,11 +193,14 @@ impl LocalHttpRuntimeAdapter {
                     message: "local runtime chat response was not valid JSON".into(),
                 })
         };
-        let raw = tokio::time::timeout(self.config.call_timeout, attempt)
+        let raw = tokio::time::timeout(self.config.chat_timeout, attempt)
             .await
             .map_err(|_| BackendError::Upstream {
                 message: "local runtime chat timed out".into(),
             })??;
+        if req.native.is_some() {
+            return self.native_response(raw, &engine_model);
+        }
         let content = raw
             .pointer("/choices/0/message/content")
             .and_then(serde_json::Value::as_str)
@@ -207,9 +209,41 @@ impl LocalHttpRuntimeAdapter {
             })?
             .to_string();
         Ok(ChatResponse {
+            native: None,
             model: self.config.model_id.clone(),
             content,
         })
+    }
+
+    /// The engine is addressed by `engine_model` (mlx_lm.server's
+    /// `default_model` placeholder, or the configured id installed through
+    /// llama.cpp's actual `--alias` launch argument) and
+    /// must echo exactly that; anything else is not evidence this owned
+    /// single-model process served the call. A verified echo is then mapped
+    /// to the configured iDoris model id in both the response identity and
+    /// the native body's `model` field — the one deliberate exception to raw
+    /// native body pass-through. All other engine fields stay untouched.
+    fn native_response(
+        &self,
+        raw: serde_json::Value,
+        engine_model: &str,
+    ) -> Result<ChatResponse, BackendError> {
+        if raw.get("model").and_then(serde_json::Value::as_str) != Some(engine_model) {
+            return Err(BackendError::Upstream {
+                message:
+                    "local runtime native response model did not echo the requested engine model"
+                        .into(),
+            });
+        }
+        let mut response = crate::native_completion_wire::response(raw)?;
+        response.model = self.config.model_id.clone();
+        if let Some(serde_json::Value::Object(body)) = response.native.as_mut() {
+            body.insert(
+                "model".into(),
+                serde_json::Value::String(self.config.model_id.clone()),
+            );
+        }
+        Ok(response)
     }
 }
 
@@ -381,6 +415,7 @@ mod tests {
         let response = adapter
             .chat(
                 ChatRequest {
+                    native: None,
                     model: "single-model".into(),
                     messages: vec![ChatMessage {
                         role: "user".into(),
@@ -443,6 +478,7 @@ mod tests {
         let error = adapter
             .chat(
                 ChatRequest {
+                    native: None,
                     model: "single-model".into(),
                     messages: vec![],
                 },
@@ -502,6 +538,7 @@ mod tests {
             slow_adapter
                 .chat(
                     ChatRequest {
+                        native: None,
                         model: "single-model".into(),
                         messages: vec![ChatMessage {
                             role: "user".into(),
@@ -526,6 +563,7 @@ mod tests {
         let response = adapter
             .chat(
                 ChatRequest {
+                    native: None,
                     model: "single-model".into(),
                     messages: vec![ChatMessage {
                         role: "user".into(),

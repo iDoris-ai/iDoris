@@ -63,9 +63,21 @@ fn absent_or_blank_override_is_a_noop() {
         excluded: None,
     };
     let policy = RecommenderPolicy::default();
-    let current = choose_resident(&catalog, &host(24.0), &policy);
+    let current = choose_resident(
+        &catalog,
+        &host(24.0),
+        &policy,
+        &idoris_recommender::recommend::budget_breakdown(&host(24.0), &policy, None),
+    );
     for forced in [None, Some(""), Some("   ")] {
-        let result = apply_core_override(&catalog, &host(24.0), &policy, forced, current.clone());
+        let result = apply_core_override(
+            &catalog,
+            &host(24.0),
+            &policy,
+            forced,
+            current.clone(),
+            &idoris_recommender::recommend::budget_breakdown(&host(24.0), &policy, None),
+        );
         assert_eq!(result.resident, current);
         assert!(result.override_choice.is_none());
         assert!(result.warnings.is_empty());
@@ -86,6 +98,7 @@ fn trims_whole_input_uses_only_first_two_at_segments_and_exact_quant_can_exceed_
         &policy,
         Some(" forced@huge@ignored "),
         None,
+        &idoris_recommender::recommend::budget_breakdown(&host(24.0), &policy, None),
     );
     assert_eq!(result.resident.as_ref().unwrap().id, "forced");
     assert_eq!(result.resident.as_ref().unwrap().label, "huge");
@@ -106,13 +119,19 @@ fn unknown_model_preserves_auto_and_unknown_quant_falls_back() {
         excluded: None,
     };
     let policy = RecommenderPolicy::default();
-    let current = choose_resident(&catalog, &host(24.0), &policy);
+    let current = choose_resident(
+        &catalog,
+        &host(24.0),
+        &policy,
+        &idoris_recommender::recommend::budget_breakdown(&host(24.0), &policy, None),
+    );
     let missing = apply_core_override(
         &catalog,
         &host(24.0),
         &policy,
         Some("missing"),
         current.clone(),
+        &idoris_recommender::recommend::budget_breakdown(&host(24.0), &policy, None),
     );
     assert_eq!(missing.resident, current);
     assert!(missing.override_choice.is_none());
@@ -124,6 +143,7 @@ fn unknown_model_preserves_auto_and_unknown_quant_falls_back() {
         &policy,
         Some("auto@missing"),
         current,
+        &idoris_recommender::recommend::budget_breakdown(&host(24.0), &policy, None),
     );
     assert_eq!(quant.resident.as_ref().unwrap().label, "small");
     assert!(
@@ -144,11 +164,32 @@ fn oversized_experiment_is_forced_but_blocked_list_remains_intact_and_warnings_a
         excluded: None,
     };
     let policy = RecommenderPolicy::default();
-    let before = blocked_choices(&catalog, &host(24.0), &policy).unwrap();
+    let before = blocked_choices(
+        &catalog,
+        &host(24.0),
+        &policy,
+        &idoris_recommender::recommend::budget_breakdown(&host(24.0), &policy, None),
+    )
+    .unwrap();
     assert_eq!(before.len(), 1);
-    assert!(choose_resident(&catalog, &host(24.0), &policy).is_none());
+    assert!(
+        choose_resident(
+            &catalog,
+            &host(24.0),
+            &policy,
+            &idoris_recommender::recommend::budget_breakdown(&host(24.0), &policy, None)
+        )
+        .is_none()
+    );
 
-    let result = apply_core_override(&catalog, &host(24.0), &policy, Some("forced-big"), None);
+    let result = apply_core_override(
+        &catalog,
+        &host(24.0),
+        &policy,
+        Some("forced-big"),
+        None,
+        &idoris_recommender::recommend::budget_breakdown(&host(24.0), &policy, None),
+    );
     assert_eq!(result.resident.as_ref().unwrap().id, "forced-big");
     assert!(
         result
@@ -169,7 +210,13 @@ fn oversized_experiment_is_forced_but_blocked_list_remains_intact_and_warnings_a
             .any(|warning| warning.contains("yields"))
     );
     assert_eq!(
-        blocked_choices(&catalog, &host(24.0), &policy).unwrap(),
+        blocked_choices(
+            &catalog,
+            &host(24.0),
+            &policy,
+            &idoris_recommender::recommend::budget_breakdown(&host(24.0), &policy, None)
+        )
+        .unwrap(),
         before
     );
 }
@@ -189,6 +236,11 @@ fn unknown_quant_then_no_fitting_auto_quant_uses_lowest_and_warns_about_oom() {
         &RecommenderPolicy::default(),
         Some("forced-big@missing"),
         None,
+        &idoris_recommender::recommend::budget_breakdown(
+            &host(24.0),
+            &RecommenderPolicy::default(),
+            None,
+        ),
     );
     assert_eq!(result.resident.as_ref().unwrap().label, "huge");
     assert!(

@@ -31,7 +31,7 @@
 //! collision ambiguity.
 
 use std::io::{self, Write};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -280,8 +280,236 @@ impl Drop for FlightCancellationGuard {
     }
 }
 
+/// Requests and body bytes the proxy attempted to send to a non-loopback
+/// host: the M5 remote egress counter. Counted per attempt, before the send,
+/// from the exact serialized body, so a failed connection still counts — the
+/// number can over-state but never under-state what left the machine.
+/// Classified by the target URL's host, not by what the card claims.
+#[derive(Debug, Default)]
+pub struct EgressCounter {
+    requests: AtomicU64,
+    bytes: AtomicU64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct EgressSnapshot {
+    pub requests: u64,
+    pub bytes: u64,
+}
+
+impl EgressCounter {
+    fn record(&self, url: &str, bytes: usize) {
+        if !is_loopback_url(url) {
+            self.requests.fetch_add(1, Ordering::Relaxed);
+            self.bytes.fetch_add(bytes as u64, Ordering::Relaxed);
+        }
+    }
+
+    pub fn snapshot(&self) -> EgressSnapshot {
+        EgressSnapshot {
+            requests: self.requests.load(Ordering::Relaxed),
+            bytes: self.bytes.load(Ordering::Relaxed),
+        }
+    }
+}
+
+use idoris_policy::breaker::{Admission, AdmissionTicket, CredentialClass};
+
+// Bound untrusted network headers only; the standalone core contract is uncapped.
+const MAX_CONNECTION_RETRY_AFTER_MS: u64 = 300_000;
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) enum BreakerKey {
+    Provider(String),
+    Connection {
+        scheme: String,
+        host: String,
+        port: u16,
+    },
+}
+
+fn provider_key(id: &str) -> BreakerKey {
+    BreakerKey::Provider(id.to_string())
+}
+
+fn connection_key(url: &str) -> Option<BreakerKey> {
+    let parsed = reqwest::Url::parse(url).ok()?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return None;
+    }
+    Some(BreakerKey::Connection {
+        scheme: parsed.scheme().to_string(),
+        host: parsed.host_str()?.to_string(),
+        port: parsed.port_or_known_default()?,
+    })
+}
+
+struct CapturedGate {
+    key: BreakerKey,
+    class: CredentialClass,
+    ticket: AdmissionTicket,
+    probe: bool,
+}
+
+struct CapturedSendClaim<'a> {
+    proxy: &'a ChatProxy,
+    gates: Vec<CapturedGate>,
+}
+
+impl CapturedSendClaim<'_> {
+    fn finish(mut self, status: u16, retry_after_ms: Option<u64>) {
+        if self.gates.is_empty() {
+            return;
+        }
+        let fault = status == 408 || status == 429 || (500..600).contains(&status);
+        let header = retry_after_ms
+            .filter(|_| status == 429 || status == 503)
+            .map(|ms| ms.min(MAX_CONNECTION_RETRY_AFTER_MS));
+        // One lock covers failure counting and header settlement for both owned gates.
+        // Admission fails closed on poison; settlement recovers only issued ownership.
+        let mut book = self
+            .proxy
+            .breakers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = self.proxy.now_ms();
+        for gate in self.gates.drain(..) {
+            match gate.key {
+                BreakerKey::Provider(_) if fault => {
+                    book.on_failure(&gate.key, gate.class, gate.ticket, now);
+                }
+                BreakerKey::Connection { .. } if fault && gate.probe => {
+                    book.on_failure_with_retry_after(
+                        &gate.key,
+                        gate.class,
+                        gate.ticket,
+                        now,
+                        header,
+                    );
+                }
+                BreakerKey::Connection { .. } if header.is_some() => {
+                    if let Some(ms) = header {
+                        book.on_retry_after(&gate.key, gate.class, gate.ticket, now, ms);
+                    }
+                }
+                _ if !fault => book.on_success(&gate.key, gate.class, gate.ticket),
+                _ => {} // Ordinary connection faults without headers do not accumulate failures.
+            }
+        }
+    }
+}
+
+impl Drop for CapturedSendClaim<'_> {
+    fn drop(&mut self) {
+        if self.gates.iter().any(|gate| gate.probe) {
+            let mut book = self
+                .proxy
+                .breakers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let now = self.proxy.now_ms();
+            for gate in self.gates.drain(..) {
+                if gate.probe {
+                    book.on_failure(&gate.key, gate.class, gate.ticket, now);
+                }
+            }
+        }
+    }
+}
+
+impl crate::dispatch::ProviderAdmission for ChatProxy {
+    fn begin_provider(
+        &self,
+        provider_id: &str,
+        class: CredentialClass,
+    ) -> crate::dispatch::ProviderCapture {
+        let mut capture = crate::dispatch::ProviderCapture {
+            key: provider_key(provider_id),
+            class,
+            ticket: None,
+            probe: false,
+        };
+        if self.breakers_enabled()
+            && let Ok(mut book) = self.breakers.lock()
+        {
+            let admit = book.admit(&capture.key, class, self.now_ms());
+            capture.probe = admit.admission == Admission::Probe;
+            capture.ticket = admit.ticket;
+        }
+        capture
+    }
+
+    fn finish_provider(
+        &self,
+        capture: crate::dispatch::ProviderCapture,
+        outcome: crate::dispatch::ProviderOutcome,
+    ) {
+        use crate::dispatch::ProviderOutcome;
+        let Some(ticket) = capture.ticket else {
+            return;
+        };
+        if matches!(outcome, ProviderOutcome::Ignored) && !capture.probe {
+            return;
+        }
+        let mut book = self
+            .breakers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match outcome {
+            ProviderOutcome::Success => book.on_success(&capture.key, capture.class, ticket),
+            ProviderOutcome::Fault | ProviderOutcome::Ignored => {
+                book.on_failure(&capture.key, capture.class, ticket, self.now_ms());
+            }
+        }
+    }
+}
+
+/// The proxy only fronts `http_service` cards: loopback ones are local
+/// runtimes, anything else is treated as a keyed API.
+fn credential_class(url: &str) -> idoris_policy::breaker::CredentialClass {
+    if is_loopback_url(url) {
+        idoris_policy::breaker::CredentialClass::Local
+    } else {
+        idoris_policy::breaker::CredentialClass::ApiKey
+    }
+}
+
+fn wall_clock_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+        })
+}
+
+/// `localhost` or a loopback IP literal. Anything else — other names
+/// included, since they may resolve off-host — counts as egress.
+fn is_loopback_url(url: &str) -> bool {
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        return false;
+    };
+    parsed.host_str().is_some_and(|host| {
+        host.eq_ignore_ascii_case("localhost")
+            || host
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|ip| ip.is_loopback())
+    })
+}
+
 pub struct ChatProxy {
     pub(crate) client: reqwest::Client,
+    egress: Arc<EgressCounter>,
+    /// Provider and HTTP origin gates, each qualified by dialed credential class.
+    breakers: Mutex<idoris_policy::breaker::BreakerBook<BreakerKey>>,
+    /// On for a library-constructed proxy. The `idoris` binary turns it off
+    /// unless `IDORIS_PROVIDER_BREAKER=1`: the shared conformance contract
+    /// still says persistent 5xx is passed through verbatim, so enabling
+    /// breakers by default is an owner decision, not a silent change.
+    breaker_enabled: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    test_clock_ms: std::sync::atomic::AtomicU64,
     pub(crate) window: Duration,
     max_entries: usize,
     header_timeout: Duration,
@@ -304,12 +532,221 @@ pub struct ChatProxy {
 }
 
 impl ChatProxy {
+    /// Turns provider breakers on or off for every later admission.
+    pub fn set_breakers_enabled(&self, enabled: bool) {
+        self.breaker_enabled.store(enabled, Ordering::SeqCst);
+    }
+
+    fn breakers_enabled(&self) -> bool {
+        self.breaker_enabled.load(Ordering::SeqCst)
+    }
+
+    fn now_ms(&self) -> u64 {
+        #[cfg(test)]
+        {
+            let now = self.test_clock_ms.load(Ordering::SeqCst);
+            if now != u64::MAX {
+                return now;
+            }
+        }
+        wall_clock_ms()
+    }
+
+    pub(crate) async fn drive_external<T, F, Fut, C>(
+        &self,
+        provider_id: &str,
+        class: CredentialClass,
+        operation: F,
+        classify: C,
+    ) -> T
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = T>,
+        C: FnOnce(&T) -> crate::dispatch::ProviderOutcome,
+    {
+        let guard = crate::dispatch::ProviderGuard::begin(Some(self), provider_id, class);
+        let result = operation().await;
+        let outcome = classify(&result);
+        guard.finish(outcome);
+        result
+    }
+
+    /// Advisory readiness only: no entries, tickets, or probe ownership are created.
+    pub(crate) fn blocked_cards(&self, cards: &[idoris_contracts::ComponentCard]) -> Vec<bool> {
+        if !self.breakers_enabled() {
+            return vec![false; cards.len()];
+        }
+        let keys: Vec<_> = cards
+            .iter()
+            .map(|card| {
+                use crate::subscription::card::{CardBoundary, classify_subscription_card};
+                let (class, connection) = match classify_subscription_card(card) {
+                    Ok(CardBoundary::Subscription) => (CredentialClass::OAuth, None),
+                    Ok(CardBoundary::Ordinary)
+                        if crate::dispatch::is_resident_http_service(card) =>
+                    {
+                        (
+                            credential_class(&card.endpoint),
+                            connection_key(&card.endpoint),
+                        )
+                    }
+                    Ok(CardBoundary::Ordinary)
+                        if card.form == idoris_contracts::component_card::Form::HttpService =>
+                    {
+                        (CredentialClass::Local, None)
+                    }
+                    Ok(CardBoundary::Ordinary) | Err(_) => return None, // Retain the existing invalid-boundary rejection.
+                };
+                Some((provider_key(&card.provider.id), connection, class))
+            })
+            .collect();
+        let Ok(book) = self.breakers.lock() else {
+            return vec![true; cards.len()];
+        };
+        let now = self.now_ms();
+        keys.iter()
+            .map(|keys| {
+                keys.as_ref().is_some_and(|(provider, connection, class)| {
+                    matches!(
+                        book.readiness(provider, *class, now),
+                        Admission::Rejected { .. }
+                    ) || connection.as_ref().is_some_and(|key| {
+                        matches!(book.readiness(key, *class, now), Admission::Rejected { .. })
+                    })
+                })
+            })
+            .collect()
+    }
+
+    /// A cooling card that already owns this request-id must stay selectable.
+    /// Masking it first changes the cache key and executes the retry elsewhere.
+    pub(crate) fn unmask_idempotent_bindings(
+        &self,
+        cards: &[idoris_contracts::ComponentCard],
+        blocked: &mut [bool],
+        tenant_id: Option<&str>,
+        request_id: Option<&str>,
+        path: &str,
+    ) {
+        let Some(request_id) = request_id.filter(|id| !id.is_empty()) else {
+            return;
+        };
+        if blocked.len() != cards.len() {
+            return;
+        }
+        let tenant = tenant_id.unwrap_or("\u{0}personal");
+        for (card, blocked) in cards.iter().zip(blocked.iter_mut()) {
+            if !*blocked {
+                continue;
+            }
+            let url = format!("{}{path}", card.endpoint.trim_end_matches('/'));
+            let key = cache_key(tenant, &url, &card.provider.id, request_id);
+            if self.idempotent_key_present(&key) {
+                *blocked = false;
+            }
+        }
+    }
+
+    fn idempotent_key_present(&self, key: &str) -> bool {
+        if let Ok(cache) = self.cache.lock()
+            && let Some(entry) = cache.get(key)
+            && Instant::now().duration_since(entry.at) < self.window
+        {
+            return true;
+        }
+        self.flights
+            .lock()
+            .is_ok_and(|flights| flights.contains_key(key))
+    }
+
+    fn claim_send(&self, provider_id: &str, url: &str) -> Option<CapturedSendClaim<'_>> {
+        let mut claim = CapturedSendClaim {
+            proxy: self,
+            gates: Vec::new(),
+        };
+        if !self.breakers_enabled() {
+            return Some(claim);
+        }
+        let class = credential_class(url);
+        let provider = provider_key(provider_id);
+        let connection = connection_key(url);
+        let mut book = self.breakers.lock().ok()?;
+        let now = self.now_ms();
+        let admissions = if let Some(connection) = connection {
+            let pair = book
+                .admit_pair((&provider, class), (&connection, class), now)
+                .ok()?;
+            pair.into_iter()
+                .zip([provider, connection])
+                .map(|(admit, key)| (key, admit))
+                .collect::<Vec<_>>()
+        } else {
+            vec![(provider.clone(), book.admit(&provider, class, now))]
+        };
+        for (key, admit) in admissions {
+            let ticket = admit.ticket?;
+            claim.gates.push(CapturedGate {
+                key,
+                class,
+                ticket,
+                probe: admit.admission == Admission::Probe,
+            });
+        }
+        Some(claim)
+    }
+
+    #[cfg(test)]
+    fn admit_provider(&self, provider_id: &str, url: &str) -> Option<CapturedSendClaim<'_>> {
+        let mut claim = CapturedSendClaim {
+            proxy: self,
+            gates: Vec::new(),
+        };
+        if self.breakers_enabled() {
+            let key = provider_key(provider_id);
+            let class = credential_class(url);
+            let admit = self.breakers.lock().ok()?.admit(&key, class, self.now_ms());
+            claim.gates.push(CapturedGate {
+                key,
+                class,
+                ticket: admit.ticket?,
+                probe: admit.admission == Admission::Probe,
+            });
+        }
+        Some(claim)
+    }
+
+    /// Off-host egress observed so far by this proxy.
+    pub fn egress(&self) -> EgressSnapshot {
+        self.egress.snapshot()
+    }
+
+    /// The POST exactly as it goes on the wire, recorded in the egress
+    /// counter first when the host is not loopback.
+    fn outbound(&self, url: &str, payload: &Value) -> reqwest::RequestBuilder {
+        let request = self.client.post(url);
+        match serde_json::to_vec(payload) {
+            Ok(body) => {
+                self.egress.record(url, body.len());
+                request
+                    .header(reqwest::header::CONTENT_TYPE, "application/json")
+                    .body(body)
+            }
+            // Unreachable for a `Value`; let reqwest report its own error.
+            Err(_) => request.json(payload),
+        }
+    }
+
     /// Creates a proxy. The injected `client` must have redirects disabled
     /// for connection-failure retries to be safe, since a redirect can obscure
     /// whether the upstream accepted the POST.
     pub fn new(client: reqwest::Client) -> Self {
         Self {
             client,
+            egress: Arc::new(EgressCounter::default()),
+            breakers: Mutex::new(idoris_policy::breaker::BreakerBook::new()),
+            breaker_enabled: std::sync::atomic::AtomicBool::new(true),
+            #[cfg(test)]
+            test_clock_ms: std::sync::atomic::AtomicU64::new(u64::MAX),
             window: DEFAULT_WINDOW,
             max_entries: DEFAULT_MAX_ENTRIES,
             header_timeout: Duration::from_secs(10),
@@ -944,17 +1381,42 @@ impl ChatProxy {
             }
         }
 
+        // Claim both gates before observation; either refusal sends nothing
+        // (no dispatched observation, nothing executed).
+        let Some(claim) = self.claim_send(opts.provider_id, url) else {
+            return Ok(Self::flight_failure_with_execution(
+                503,
+                "provider_circuit_open",
+                ExecutionDisposition::NotExecuted,
+            ));
+        };
         observer().await?;
+        let mut retry_after_ms = None;
+        let Ok(outcome) = self
+            .send_buffered(url, payload, opts, uncertain, &mut retry_after_ms)
+            .await;
+        claim.finish(outcome.status, retry_after_ms);
+        Ok(outcome)
+    }
 
+    /// The buffered send with connection-failure retries. Only the upstream's
+    /// own answers and transport failures come out of here, which is what
+    /// the provider breaker counts (cache hits and local preflight exits
+    /// never reach it).
+    async fn send_buffered(
+        &self,
+        url: &str,
+        payload: &Value,
+        opts: &ForwardOpts<'_>,
+        uncertain: &mut bool,
+        retry_after_ms: &mut Option<u64>,
+    ) -> Result<ForwardOutcome, std::convert::Infallible> {
         let mut attempt = 0usize;
         loop {
             // Keep the transport error until retry classification: only a
             // connection failure proves that this POST was not executed.
-            let sent = tokio::time::timeout(
-                self.header_timeout,
-                self.client.post(url).json(payload).send(),
-            )
-            .await;
+            let sent =
+                tokio::time::timeout(self.header_timeout, self.outbound(url, payload).send()).await;
             match sent {
                 Ok(Ok(resp)) => {
                     let status = resp.status().as_u16();
@@ -963,6 +1425,12 @@ impl ChatProxy {
                         .get(reqwest::header::CONTENT_TYPE)
                         .and_then(|v| v.to_str().ok())
                         .map(str::to_string);
+                    *retry_after_ms = resp
+                        .headers()
+                        .get(reqwest::header::RETRY_AFTER)
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(idoris_policy::breaker::parse_retry_after_ms)
+                        .map(|ms| ms.min(MAX_CONNECTION_RETRY_AFTER_MS));
                     #[allow(clippy::cast_possible_truncation)]
                     let retries = attempt as u32;
                     // A body that fails to read (connection dropped
@@ -1058,10 +1526,16 @@ impl ChatProxy {
     /// `opts.stream` (only the *retry* sub-branch inside it is gated on
     /// `!opts.stream`), so a streaming request whose upstream call fails
     /// outright still gets a plain JSON/text error body, never an SSE
-    /// stream carrying an error.
+    /// stream carrying an error. Without a configured card, the endpoint
+    /// is used as the provider key.
     pub async fn forward_stream(&self, endpoint: &str, body: &Value) -> StreamOutcome {
-        self.forward_stream_path(endpoint, StreamingUpstreamPath::CHAT_COMPLETIONS, body)
-            .await
+        self.forward_stream_path(
+            endpoint,
+            StreamingUpstreamPath::CHAT_COMPLETIONS,
+            body,
+            endpoint,
+        )
+        .await
     }
 
     pub(crate) async fn forward_stream_path(
@@ -1069,9 +1543,10 @@ impl ChatProxy {
         endpoint: &str,
         upstream_path: StreamingUpstreamPath,
         body: &Value,
+        provider_id: &str,
     ) -> StreamOutcome {
         let result = self
-            .forward_stream_path_observed(endpoint, upstream_path, body, || async {
+            .forward_stream_path_observed(endpoint, upstream_path, body, provider_id, || async {
                 Ok::<(), std::convert::Infallible>(())
             })
             .await;
@@ -1088,6 +1563,7 @@ impl ChatProxy {
         &self,
         endpoint: &str,
         body: &Value,
+        provider_id: &str,
         observer: F,
     ) -> Result<StreamOutcome, E>
     where
@@ -1098,16 +1574,19 @@ impl ChatProxy {
             endpoint,
             StreamingUpstreamPath::CHAT_COMPLETIONS,
             body,
+            provider_id,
             observer,
         )
         .await
     }
 
+    /// Account for initial headers only; later SSE fate is a stream outcome.
     async fn forward_stream_path_observed<F, Fut, E>(
         &self,
         endpoint: &str,
         upstream_path: StreamingUpstreamPath,
         body: &Value,
+        provider_id: &str,
         observer: F,
     ) -> Result<StreamOutcome, E>
     where
@@ -1126,18 +1605,26 @@ impl ChatProxy {
         if let Some(obj) = payload.as_object_mut() {
             obj.insert("stream".to_string(), Value::Bool(true));
         }
-        observer().await?;
-        let sent = match tokio::time::timeout(
-            self.header_timeout,
-            self.client.post(&url).json(&payload).send(),
-        )
-        .await
-        {
-            Ok(sent) => sent,
-            Err(_) => {
-                return Ok(Self::stream_failure(504, ExecutionDisposition::Uncertain));
-            }
+        let Some(claim) = self.claim_send(provider_id, &url) else {
+            let failure = Self::flight_failure(503, "provider_circuit_open");
+            return Ok(StreamOutcome::Buffered {
+                status: failure.status,
+                body: failure.body,
+                content_type: failure.content_type,
+                execution: failure.execution,
+            });
         };
+        observer().await?;
+        let sent =
+            match tokio::time::timeout(self.header_timeout, self.outbound(&url, &payload).send())
+                .await
+            {
+                Ok(sent) => sent,
+                Err(_) => {
+                    claim.finish(504, None);
+                    return Ok(Self::stream_failure(504, ExecutionDisposition::Uncertain));
+                }
+            };
         Ok(match sent {
             Ok(resp) => {
                 let status = resp.status().as_u16();
@@ -1146,6 +1633,12 @@ impl ChatProxy {
                     .get(reqwest::header::CONTENT_TYPE)
                     .and_then(|v| v.to_str().ok())
                     .map(str::to_string);
+                let retry_after_ms = resp
+                    .headers()
+                    .get(reqwest::header::RETRY_AFTER)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(idoris_policy::breaker::parse_retry_after_ms);
+                claim.finish(status, retry_after_ms);
                 if (200..300).contains(&status) {
                     let idle = self.stream_idle_timeout;
                     #[cfg(test)]
@@ -1290,14 +1783,18 @@ impl ChatProxy {
                     }
                 }
             }
-            Err(err) => Self::stream_failure(
-                if err.is_timeout() { 504 } else { 502 },
-                if err.is_connect() {
-                    ExecutionDisposition::NotExecuted
-                } else {
-                    ExecutionDisposition::Uncertain
-                },
-            ),
+            Err(err) => {
+                let status = if err.is_timeout() { 504 } else { 502 };
+                claim.finish(status, None);
+                Self::stream_failure(
+                    status,
+                    if err.is_connect() {
+                        ExecutionDisposition::NotExecuted
+                    } else {
+                        ExecutionDisposition::Uncertain
+                    },
+                )
+            }
         })
     }
 
@@ -1479,6 +1976,133 @@ mod tests {
         assert_eq!(out.retries, 0);
         let body: Value = serde_json::from_slice(&out.body).unwrap();
         assert_eq!(body["marker"], "raw-passthrough");
+    }
+
+    async fn upstream_sequence(statuses: &[(u16, Option<&str>)]) -> wiremock::MockServer {
+        let server = wiremock::MockServer::start().await;
+        for (priority, (status, retry_after)) in statuses.iter().enumerate() {
+            let mut template =
+                wiremock::ResponseTemplate::new(*status).set_body_json(serde_json::json!({}));
+            if let Some(seconds) = retry_after {
+                template = template.insert_header("retry-after", *seconds);
+            }
+            wiremock::Mock::given(wiremock::matchers::method("POST"))
+                .respond_with(template)
+                .up_to_n_times(1)
+                .with_priority(u8::try_from(priority + 1).unwrap())
+                .mount(&server)
+                .await;
+        }
+        server
+    }
+
+    async fn statuses(proxy: &ChatProxy, server: &wiremock::MockServer, n: usize) -> Vec<u16> {
+        let mut out = Vec::new();
+        for i in 0..n {
+            let record = format!("rec-{i}");
+            out.push(
+                proxy
+                    .forward_buffered(&server.uri(), &chat_body(), &opts(None, &record))
+                    .await
+                    .status,
+            );
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn local_provider_breaker_opens_after_two_failures() {
+        let server = upstream_sequence(&[(500, None), (502, None), (200, None)]).await;
+        let proxy = ChatProxy::new(reqwest::Client::new());
+        assert_eq!(statuses(&proxy, &server, 3).await, [500, 502, 503]);
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn retry_after_opens_the_breaker_before_the_threshold() {
+        let server = upstream_sequence(&[(429, Some("120")), (200, None)]).await;
+        let proxy = ChatProxy::new(reqwest::Client::new());
+        assert_eq!(statuses(&proxy, &server, 2).await, [429, 503]);
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn answers_that_are_not_provider_failures_keep_it_closed() {
+        let server = upstream_sequence(&[
+            (500, None),
+            (200, None),
+            (500, None),
+            (400, None),
+            (500, None),
+            (200, None),
+        ])
+        .await;
+        let proxy = ChatProxy::new(reqwest::Client::new());
+        assert_eq!(
+            statuses(&proxy, &server, 6).await,
+            [500, 200, 500, 400, 500, 200]
+        );
+        assert_eq!(server.received_requests().await.unwrap().len(), 6);
+    }
+
+    #[test]
+    fn only_localhost_and_loopback_literals_are_not_egress() {
+        for url in [
+            "http://127.0.0.1:8080/v1",
+            "http://127.9.9.9",
+            "http://LOCALHOST:1",
+            "http://[::1]:2/x",
+        ] {
+            assert!(is_loopback_url(url), "{url}");
+        }
+        for url in [
+            "http://10.0.0.5:8080",
+            "https://api.openai.com/v1",
+            "http://127.0.0.1.nip.io",
+            "http://[::ffff:8.8.8.8]",
+            "not a url",
+        ] {
+            assert!(!is_loopback_url(url), "{url}");
+        }
+    }
+
+    #[tokio::test]
+    async fn off_host_attempts_count_exact_wire_bytes_and_loopback_does_not() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .mount(&server)
+            .await;
+        let client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_millis(50))
+            .build()
+            .unwrap();
+        let mut proxy = ChatProxy::new(client);
+        proxy.retry_delays = Vec::new();
+
+        let local = proxy
+            .forward_buffered(&server.uri(), &chat_body(), &opts(None, "rec-local"))
+            .await;
+        assert_eq!(local.status, 200);
+        assert_eq!(proxy.egress(), EgressSnapshot::default());
+        let wire_bytes = server.received_requests().await.unwrap()[0].body.len() as u64;
+
+        // TEST-NET-1: never reachable, so this only proves the attempt is
+        // counted before the send, with the same bytes the loopback got.
+        let _ = proxy
+            .forward_buffered(
+                "http://192.0.2.1:9",
+                &chat_body(),
+                &opts(None, "rec-remote"),
+            )
+            .await;
+        assert_eq!(
+            proxy.egress(),
+            EgressSnapshot {
+                requests: 1,
+                bytes: wire_bytes
+            }
+        );
     }
 
     #[tokio::test]
@@ -1932,3 +2556,23 @@ mod k14_slow_reader_tests;
 #[cfg(test)]
 #[path = "proxy_stream_termination_tests.rs"]
 mod stream_termination_tests;
+
+#[cfg(test)]
+#[path = "proxy_breaker_atomic_tests.rs"]
+mod breaker_atomic_tests;
+
+#[cfg(test)]
+#[path = "proxy_breaker_pair_tests.rs"]
+mod breaker_pair_tests;
+
+#[cfg(test)]
+#[path = "proxy_stream_breaker_tests.rs"]
+mod stream_breaker_tests;
+
+#[cfg(test)]
+#[path = "proxy_card_selection_tests.rs"]
+mod card_selection_tests;
+
+#[cfg(test)]
+#[path = "proxy_external_tests.rs"]
+mod external_tests;

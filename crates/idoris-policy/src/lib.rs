@@ -10,8 +10,11 @@
 //! 以及完整的决策管道 [`decide`]（这个 crate 按依赖顺序叠加的多个 PR
 //! landing，场景测试在下一个 PR 里加入）。
 
+pub mod breaker;
 pub mod budget;
 pub mod card;
+pub mod credentials;
+pub mod inspect;
 pub mod pipeline;
 pub mod privacy;
 pub mod registry;
@@ -21,7 +24,7 @@ pub use budget::{BudgetSnapshot, BudgetView};
 pub use card::{AdmissionStatus, Card};
 pub use pipeline::{
     Decision, Degradation, PolicyCtx, ReasonCode, Rejection, RequestProfile, Stage, decide,
-    decide_with_affinity,
+    decide_with_affinity, decide_with_affinity_and_ready,
 };
 pub use privacy::{
     SUBSCRIPTION_PROVIDER_ID, effective_privacy, effective_served_locality,

@@ -25,6 +25,9 @@ fn events(event_log: &EventLogStore, response: &Response) -> Vec<EventLogEvent> 
     event_log
         .events_for_record(Some(budget::PERSONAL_TENANT_ID), record_id)
         .unwrap()
+        .into_iter()
+        .filter(|row| row.event.event_type != EventType::AuditFinalized)
+        .collect()
 }
 
 #[tokio::test]
@@ -60,6 +63,7 @@ async fn paid_local_records_budget_settled_after_completed() {
             .collect::<Vec<_>>(),
         vec![
             EventType::RequestReceived,
+            EventType::Inspected,
             EventType::Profiled,
             EventType::Decided,
             EventType::BudgetReserved,

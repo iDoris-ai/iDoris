@@ -29,6 +29,7 @@ fn state_from(db: &std::path::Path) -> AppState {
         deploy_mode: DeployMode::Personal,
         budget_ledger: Some(persistent.budget),
         record_store: Some(persistent.records),
+        event_log: Some(persistent.event_log),
         ..AppState::default()
     }
 }
@@ -147,7 +148,7 @@ fn three_timezone_child_processes_return_fixed_monthly_answers() {
     ];
     for (timezone, expected_from, expected_to) in cases {
         let output = Command::new(&executable)
-            .args(["--exact", "timezone_child_probe", "--nocapture"])
+            .args(["--exact", "timezone_child_probe", "--nocapture", "--quiet"])
             .env("IDORIS_QUERY_ACCEPTANCE_CHILD_TZ", timezone)
             .output()
             .unwrap();

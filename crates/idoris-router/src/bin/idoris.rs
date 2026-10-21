@@ -83,6 +83,18 @@ fn issue_virtual_key() -> Result<(), String> {
     idoris_router::key_issue::issue_from_reader(&store, &mut stdin, &mut stdout)
 }
 
+const ALLOCATED_BUDGET_ENV: &str = "IDORIS_ALLOCATED_BUDGET_BYTES";
+
+fn parse_allocated_budget(raw: Option<&std::ffi::OsStr>) -> Result<Option<u64>, String> {
+    raw.map(|value| {
+        value
+            .to_str()
+            .and_then(|value| value.parse::<u64>().ok())
+            .ok_or_else(|| format!("{ALLOCATED_BUDGET_ENV} must be an unsigned integer byte count"))
+    })
+    .transpose()
+}
+
 fn env_flag(name: &str) -> bool {
     std::env::var(name).is_ok_and(|v| v == "1")
 }
@@ -162,6 +174,8 @@ fn validate_bind_authority(
 }
 
 async fn run(options: cli::ServeOptions) -> Result<(), String> {
+    let allocated_budget_bytes =
+        parse_allocated_budget(std::env::var_os(ALLOCATED_BUDGET_ENV).as_deref())?;
     let port =
         parse_port(std::env::var("IDORIS_PORT").ok().as_deref()).map_err(|err| err.to_string())?;
     let admin_port = match std::env::var(ADMIN_PORT_ENV) {
@@ -229,7 +243,13 @@ async fn run(options: cli::ServeOptions) -> Result<(), String> {
 
     let local_runtime_path = config::optional_env_path("IDORIS_LOCAL_RUNTIME_CONFIG")?;
     let local_runtime_configs = runtime_launch_config::load(local_runtime_path.as_deref())?;
-    let runtimes = RuntimeRegistry::spawn_with_local_configs(&cards, &local_runtime_configs)?;
+    let remote_kill_switch = env_flag("IDORIS_REMOTE_KILL_SWITCH");
+    let runtimes = RuntimeRegistry::spawn_with_local_configs_budget_and_kill_switch(
+        &cards,
+        &local_runtime_configs,
+        allocated_budget_bytes,
+        remote_kill_switch,
+    )?;
     // Preserve startup-gate precedence: component/policy/runtime validation
     // (including subscription authorization and fixed card gates) must fail
     // before tenant storage/config bootstrap can surface a later error.
@@ -258,11 +278,10 @@ async fn run(options: cli::ServeOptions) -> Result<(), String> {
                         catalog_path.display()
                     )
                 })?;
-            Some(Arc::new(LiveCapabilitiesProvider::new(
-                catalog,
-                facts,
-                runtimes.clone(),
-            )) as Arc<dyn CapabilitiesProvider>)
+            Some(Arc::new(
+                LiveCapabilitiesProvider::new(catalog, facts, runtimes.clone())
+                    .with_allocated_budget_bytes(allocated_budget_bytes),
+            ) as Arc<dyn CapabilitiesProvider>)
         }
         Err(error) => {
             eprintln!("[idoris] capabilities unavailable: {error}");
@@ -287,9 +306,18 @@ async fn run(options: cli::ServeOptions) -> Result<(), String> {
         virtual_key_authenticator: Some(virtual_key_authenticator),
         remote_bind_requires_auth: !bind_host.is_loopback(),
         dev_no_key_enabled,
+        remote_kill_switch: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+            remote_kill_switch,
+        )),
         event_log: Some(persistent.event_log),
         ..AppState::default()
     };
+
+    // M5-14: provider breakers stay off unless explicitly enabled; see
+    // ChatProxy::set_breakers_enabled.
+    state
+        .proxy
+        .set_breakers_enabled(env_flag("IDORIS_PROVIDER_BREAKER"));
 
     let addr = std::net::SocketAddr::from((bind_host, port));
     let data_listener = tokio::net::TcpListener::bind(addr)
@@ -310,6 +338,12 @@ async fn run(options: cli::ServeOptions) -> Result<(), String> {
         eprintln!(
             "[idoris] IDORIS_DEV_NO_KEY=1: unauthenticated chat is limited to free loopback local_only execution"
         );
+    }
+    if state
+        .remote_kill_switch
+        .load(std::sync::atomic::Ordering::SeqCst)
+    {
+        eprintln!("[idoris] IDORIS_REMOTE_KILL_SWITCH=1: every request is pinned to local_only");
     }
     println!(
         "idoris: 已注册组件 [{}]",
@@ -530,6 +564,28 @@ mod tests {
         Mock, MockServer, ResponseTemplate,
         matchers::{method, path},
     };
+
+    #[test]
+    fn allocated_budget_env_preserves_absence_zero_and_exact_bytes_and_rejects_invalid_values() {
+        assert_eq!(parse_allocated_budget(None).unwrap(), None);
+        for (raw, expected) in [
+            ("0", 0),
+            ("2000000002", 2_000_000_002),
+            ("18446744073709551615", u64::MAX),
+        ] {
+            assert_eq!(
+                parse_allocated_budget(Some(raw.as_ref())).unwrap(),
+                Some(expected)
+            );
+        }
+        for raw in ["", "-1", "1.5", "GB", "18446744073709551616"] {
+            assert!(
+                parse_allocated_budget(Some(raw.as_ref()))
+                    .unwrap_err()
+                    .contains(ALLOCATED_BUDGET_ENV)
+            );
+        }
+    }
 
     #[test]
     fn launcher_token_validation_never_echoes_secret() {

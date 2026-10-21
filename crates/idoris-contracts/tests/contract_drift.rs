@@ -14,6 +14,7 @@ use idoris_contracts::admin_v0::{
 };
 use idoris_contracts::component_card::ComponentCard;
 use idoris_contracts::deploy_mode::DEPLOY_MODE_VALUES;
+use idoris_contracts::inspect::{FINDING_KIND_VALUES, InspectRequest, InspectResponse};
 use idoris_contracts::load_policy::LoadPolicy;
 use idoris_contracts::provider::ProviderDescriptor;
 use idoris_contracts::routing_policy::RoutingPolicy;
@@ -234,4 +235,77 @@ fn deploy_mode_values_match_schema() {
         actual, expected,
         "DRIFT: deploy-mode.schema.json enum changed — update DeployMode and DEPLOY_MODE_VALUES"
     );
+}
+
+fn set_of(values: &[&str]) -> BTreeSet<String> {
+    values.iter().map(|s| s.to_string()).collect()
+}
+
+#[test]
+fn inspect_request_shape_matches_schema() {
+    assert_shape::<InspectRequest>();
+}
+
+#[test]
+fn inspect_response_shape_matches_schema() {
+    assert_shape::<InspectResponse>();
+    let schema = load_schema("inspect-response.schema.json");
+    let finding = &schema["properties"]["findings"]["items"];
+    assert_eq!(keys_of(finding, "properties"), set_of(&["kind", "span"]));
+    assert_eq!(keys_of(finding, "required"), set_of(&["kind"]));
+    let span = &finding["properties"]["span"];
+    assert_eq!(keys_of(span, "properties"), set_of(&["start", "length"]));
+    assert_eq!(keys_of(span, "required"), set_of(&["start", "length"]));
+    assert_eq!(
+        keys_of(&finding["properties"]["kind"], "enum"),
+        set_of(FINDING_KIND_VALUES),
+        "DRIFT: inspect-response.schema.json finding kinds changed — update FindingKind and FINDING_KIND_VALUES"
+    );
+    assert_eq!(
+        keys_of(&schema["properties"]["sensitivity"], "enum"),
+        set_of(&["S0", "S1", "S2", "S3"])
+    );
+    assert_eq!(
+        keys_of(&schema["properties"]["action"], "enum"),
+        set_of(&["BLOCK", "REDACT", "ALLOW"])
+    );
+}
+
+/// Every object in both inspect schemas is closed, and the response carries
+/// no free-form string anywhere: only enums and integers. That is what makes
+/// "no matched content or secret substring in responses" a property of the
+/// contract instead of a promise of the implementation.
+#[test]
+fn inspect_schemas_are_closed_and_response_is_content_free() {
+    fn walk(node: &Value, path: &str, allow_strings: bool) {
+        match node {
+            Value::Object(map) => {
+                if map.get("type") == Some(&Value::from("object")) {
+                    assert_eq!(
+                        map.get("additionalProperties"),
+                        Some(&Value::Bool(false)),
+                        "{path} must set additionalProperties:false"
+                    );
+                }
+                if !allow_strings {
+                    assert_ne!(
+                        map.get("type"),
+                        Some(&Value::from("string")),
+                        "{path} is a free-form string in the inspect response"
+                    );
+                }
+                for (key, child) in map {
+                    walk(child, &format!("{path}/{key}"), allow_strings);
+                }
+            }
+            Value::Array(items) => {
+                for (index, child) in items.iter().enumerate() {
+                    walk(child, &format!("{path}/{index}"), allow_strings);
+                }
+            }
+            _ => {}
+        }
+    }
+    walk(&load_schema("inspect-request.schema.json"), "#", true);
+    walk(&load_schema("inspect-response.schema.json"), "#", false);
 }

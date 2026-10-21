@@ -7,8 +7,9 @@ use uuid::Uuid;
 
 const MAX_STRING_UTF16_UNITS: usize = 500;
 const MAX_ARRAY_ITEMS: usize = 32;
-const SCALAR_KEYS: &str = "component,intent,privacy,tier,provider_id,model_id,tokens_in,tokens_out,cost_minor,latency_ms,status,reason,rule_id,served_locality,degraded,cached,reserved_minor,settled_minor,price_version,rating,outcome,failure_mode,sensitivity,training_eligible";
+const SCALAR_KEYS: &str = "component,intent,privacy,tier,provider_id,model_id,tokens_in,tokens_out,token_estimator,cost_minor,latency_ms,status,http_status,reason,rule_id,served_locality,degraded,cached,reserved_minor,settled_minor,price_version,rating,outcome,failure_mode,sensitivity,training_eligible";
 const ARRAY_KEYS: &str = "reason_codes,labels";
+const OBJECT_ARRAY_KEYS: &str = "rubric";
 const CONTENT_KEYS: &str = "prompt,prompts,input,inputs,content,contents,text,texts,body,messages,message,response,responses,output,outputs,completion,completions,corrected_output,query,answer,raw,data";
 
 macro_rules! event_types {
@@ -25,7 +26,7 @@ event_types! {
     RequestReceived => "request.received", Inspected => "inspected", Profiled => "profiled",
     Decided => "decided", BudgetReserved => "budget.reserved", Dispatched => "dispatched",
     StreamStarted => "stream.started", StreamChunk => "stream.chunk", StreamCompleted => "stream.completed", Completed => "completed",
-    BudgetSettled => "budget.settled", FeedbackReceived => "feedback.received",
+    BudgetSettled => "budget.settled", AuditFinalized => "audit.finalized", FeedbackReceived => "feedback.received",
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -49,6 +50,14 @@ pub struct EventLogEvent {
     pub event: NewEvent,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct EventLogQuery<'a> {
+    pub from_ts_utc_ms: Option<i64>,
+    pub to_ts_utc_ms: Option<i64>,
+    pub record_id: Option<&'a str>,
+    pub limit: usize,
+}
+
 #[derive(Debug, Error)]
 pub enum EventLogError {
     #[error("tenant scope is required")]
@@ -59,6 +68,8 @@ pub enum EventLogError {
     InvalidEventId,
     #[error("record_id is required")]
     InvalidRecordId,
+    #[error("event log query limit must be positive")]
+    InvalidLimit,
     #[error("invalid identifier field {0}")]
     InvalidIdentifier(&'static str),
     #[error("event timestamp must be non-negative")]
@@ -136,6 +147,107 @@ impl EventLogStore {
         let rows = stmt.query_map(rusqlite::params![scope, record_id], raw_event)?;
         rows.map(|row| decode(row?)).collect()
     }
+
+    pub fn events_for_tenant(
+        &self,
+        scope: Option<&str>,
+        query: &EventLogQuery<'_>,
+    ) -> Result<Vec<EventLogEvent>, EventLogError> {
+        let scope = required_scope(scope)?;
+        if let Some(record_id) = query.record_id {
+            if record_id.trim().is_empty() {
+                return Err(EventLogError::InvalidRecordId);
+            }
+            validate_id("record_id", record_id)?;
+        }
+        let limit = i64::try_from(query.limit).map_err(|_| EventLogError::InvalidLimit)?;
+        if limit <= 0 {
+            return Err(EventLogError::InvalidLimit);
+        }
+        let conn = self.0.lock().map_err(|_| EventLogError::LockPoisoned)?;
+        let mut stmt = conn.prepare(
+            "SELECT sequence,event_id,tenant_id,record_id,event_type,ts_utc_ms,request_id,session_id,trace_id,parent_id,origin_record_id,metadata \
+             FROM main.event_log_events \
+             WHERE tenant_id=?1 \
+               AND (?2 IS NULL OR ts_utc_ms>=?2) \
+               AND (?3 IS NULL OR ts_utc_ms<?3) \
+               AND (?4 IS NULL OR record_id=?4) \
+             ORDER BY sequence \
+             LIMIT ?5",
+        )?;
+        let rows = stmt.query_map(
+            rusqlite::params![
+                scope,
+                query.from_ts_utc_ms,
+                query.to_ts_utc_ms,
+                query.record_id,
+                limit
+            ],
+            raw_event,
+        )?;
+        rows.map(|row| decode(row?)).collect()
+    }
+
+    pub fn events_for_tenant_type(
+        &self,
+        scope: Option<&str>,
+        event_type: EventType,
+        query: &EventLogQuery<'_>,
+    ) -> Result<Vec<EventLogEvent>, EventLogError> {
+        let scope = required_scope(scope)?;
+        if let Some(record_id) = query.record_id {
+            if record_id.trim().is_empty() {
+                return Err(EventLogError::InvalidRecordId);
+            }
+            validate_id("record_id", record_id)?;
+        }
+        let limit = i64::try_from(query.limit).map_err(|_| EventLogError::InvalidLimit)?;
+        if limit <= 0 {
+            return Err(EventLogError::InvalidLimit);
+        }
+        let conn = self.0.lock().map_err(|_| EventLogError::LockPoisoned)?;
+        let sql = tenant_type_query(query);
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(
+            rusqlite::params![
+                scope,
+                event_type.as_str(),
+                query.from_ts_utc_ms,
+                query.to_ts_utc_ms,
+                query.record_id,
+                limit
+            ],
+            raw_event,
+        )?;
+        rows.map(|row| decode(row?)).collect()
+    }
+}
+
+// Keep optional bounds as direct comparisons so SQLite can seek the time index.
+fn tenant_type_query(query: &EventLogQuery<'_>) -> String {
+    let mut sql = String::from("SELECT e.* FROM main.event_log_events AS e");
+    if query.record_id.is_some() {
+        // Otherwise SQLite can prefer time ordering and scan unrelated records.
+        sql.push_str(" INDEXED BY event_log_tenant_record_sequence");
+    }
+    sql.push_str(" WHERE e.tenant_id=?1 AND e.event_type=?2");
+    if query.record_id.is_some() {
+        sql.push_str(" AND e.record_id=?5");
+    }
+    if query.from_ts_utc_ms.is_some() {
+        sql.push_str(" AND e.ts_utc_ms>=?3");
+    }
+    if query.to_ts_utc_ms.is_some() {
+        sql.push_str(" AND e.ts_utc_ms<?4");
+    }
+    // Supersession is by sequence across all timestamps, for this type only.
+    sql.push_str(
+        " AND NOT EXISTS (SELECT 1 FROM main.event_log_events AS later \
+           WHERE later.tenant_id=e.tenant_id AND later.record_id=e.record_id \
+             AND later.event_type=e.event_type AND later.sequence>e.sequence) \
+         ORDER BY e.ts_utc_ms, e.record_id, e.sequence LIMIT ?6",
+    );
+    sql
 }
 
 fn required_scope(scope: Option<&str>) -> Result<&str, EventLogError> {
@@ -192,14 +304,36 @@ fn validate_id(field: &'static str, value: &str) -> Result<(), EventLogError> {
 
 fn validate_metadata(metadata: &BTreeMap<String, Value>) -> Result<(), EventLogError> {
     for (key, value) in metadata {
-        if key_in(CONTENT_KEYS, key) || !key_in(SCALAR_KEYS, key) && !key_in(ARRAY_KEYS, key) {
+        if key_in(CONTENT_KEYS, key)
+            || !key_in(SCALAR_KEYS, key)
+                && !key_in(ARRAY_KEYS, key)
+                && !key_in(OBJECT_ARRAY_KEYS, key)
+        {
             return Err(EventLogError::InvalidMetadata(key.clone()));
         }
         let valid_string = |text: &str| {
             text.encode_utf16().count() <= MAX_STRING_UTF16_UNITS
                 && !text.chars().any(char::is_control)
         };
-        if key_in(ARRAY_KEYS, key) {
+        if key_in(OBJECT_ARRAY_KEYS, key) {
+            let ok = value.as_array().is_some_and(|items| {
+                items.len() <= MAX_ARRAY_ITEMS
+                    && items.iter().all(|item| {
+                        let Some(object) = item.as_object() else {
+                            return false;
+                        };
+                        object.len() == 2
+                            && object
+                                .get("id")
+                                .and_then(Value::as_str)
+                                .is_some_and(|id| !id.trim().is_empty() && valid_string(id))
+                            && object.get("pass").is_some_and(Value::is_boolean)
+                    })
+            });
+            if !ok {
+                return Err(EventLogError::InvalidMetadata(key.clone()));
+            }
+        } else if key_in(ARRAY_KEYS, key) {
             let ok = value.as_array().is_some_and(|items| {
                 items.len() <= MAX_ARRAY_ITEMS
                     && items.iter().all(|v| v.as_str().is_some_and(valid_string))
@@ -294,12 +428,15 @@ fn verify_canonical_migration_schema(conn: &Connection) -> Result<(), EventLogEr
     Ok(())
 }
 
-fn verify_canonical_schema(conn: &Connection) -> Result<(), EventLogError> {
+fn verify_canonical_schema(conn: &Connection, version: i64) -> Result<(), EventLogError> {
     let canonical = Connection::open_in_memory()?;
     canonical.execute_batch(
         "CREATE TABLE IF NOT EXISTS event_log_schema_migrations (version INTEGER PRIMARY KEY)",
     )?;
     canonical.execute_batch(include_str!("migrations/0001_events.sql"))?;
+    if version >= 2 {
+        canonical.execute_batch(include_str!("migrations/0002_tenant_type_time.sql"))?;
+    }
     if schema_objects(conn)? != schema_objects(&canonical)? {
         return Err(EventLogError::SchemaIncomplete);
     }
@@ -368,35 +505,39 @@ fn migrate(conn: &mut Connection) -> Result<(), EventLogError> {
     // migration marker: an unexpected trigger could otherwise forge Event
     // Log rows as a side effect of the version=1 INSERT.
     verify_canonical_migration_schema(&tx)?;
-    let unsupported = tx
-        .query_row(
-            "SELECT version FROM main.event_log_schema_migrations WHERE version<>1 LIMIT 1",
-            [],
-            |r| r.get::<_, i64>(0),
-        )
-        .optional()?;
-    if unsupported.is_some() {
-        return Err(EventLogError::SchemaIncomplete);
+    let versions = {
+        let mut stmt =
+            tx.prepare("SELECT version FROM main.event_log_schema_migrations ORDER BY version")?;
+        stmt.query_map([], |row| row.get::<_, i64>(0))?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    let version = match versions.as_slice() {
+        [] => 0,
+        [1] => 1,
+        [1, 2] => 2,
+        _ => return Err(EventLogError::SchemaIncomplete),
+    };
+    if version > 0 {
+        verify_canonical_schema(&tx, version)?;
     }
-    let applied = tx
-        .query_row(
-            "SELECT version FROM main.event_log_schema_migrations WHERE version=1",
-            [],
-            |r| r.get::<_, i64>(0),
-        )
-        .optional()?
-        .is_some();
-    if !applied {
+    if version == 0 {
         tx.execute_batch(include_str!("migrations/0001_events.sql"))?;
         tx.execute(
             "INSERT INTO main.event_log_schema_migrations(version) VALUES (1)",
             [],
         )?;
     }
+    if version < 2 {
+        tx.execute_batch(include_str!("migrations/0002_tenant_type_time.sql"))?;
+        tx.execute(
+            "INSERT INTO main.event_log_schema_migrations(version) VALUES (2)",
+            [],
+        )?;
+    }
     if tx.prepare("SELECT sequence,event_id,tenant_id,record_id,event_type,ts_utc_ms,request_id,session_id,trace_id,parent_id,origin_record_id,metadata FROM main.event_log_events LIMIT 0").is_err() {
         return Err(EventLogError::SchemaIncomplete);
     }
-    verify_canonical_schema(&tx)?;
+    verify_canonical_schema(&tx, 2)?;
     verify_append_only_guards(&tx)?;
     tx.commit()?;
     Ok(())

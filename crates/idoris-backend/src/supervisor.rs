@@ -31,6 +31,7 @@ use crate::eviction::{
     CAPACITY_EPSILON_GB, EvictionPlan, ModelEntry, ModelReq, ModelState, PlanEvictionError,
     Snapshot, occupies_budget, plan_eviction,
 };
+use crate::global_capacity::CapacityCharge;
 use crate::types::{BackendStatus, ChatRequest, ChatResponse, ModelInfo, Pressure};
 
 type LoadReply = oneshot::Sender<Result<(), BackendError>>;
@@ -53,6 +54,11 @@ pub struct SupervisorConfig {
     /// this, a hanging call would hold `active_op` (the global load/evict
     /// mutex) forever — llama-swap Issue #946's root cause.
     pub adapter_call_timeout: std::time::Duration,
+    /// Outer deadline for one `chat` adapter call only (excludes queueing
+    /// and loading, which stay under `adapter_call_timeout`). Generation
+    /// legitimately outlasts management calls. Equal adapter and Supervisor
+    /// chat deadlines may race; neither is guaranteed to report first.
+    pub chat_call_timeout: std::time::Duration,
     /// Poll interval/attempt bound for [`confirm_memory_released`] — used
     /// after an eviction's `unload`s (before the new model's `load`) and
     /// before an OOM retry, never blocking either forever.
@@ -70,6 +76,7 @@ impl Default for SupervisorConfig {
             probe_interval: std::time::Duration::from_millis(20),
             probe_max_attempts: 50,
             adapter_call_timeout: std::time::Duration::from_secs(30),
+            chat_call_timeout: std::time::Duration::from_secs(120),
             release_confirm_interval: std::time::Duration::from_millis(20),
             release_confirm_max_attempts: 10,
             oom_retry_backoff: std::time::Duration::from_millis(100),
@@ -79,6 +86,7 @@ impl Default for SupervisorConfig {
 
 struct ModelSlot {
     memory_gb: f64,
+    charge: CapacityCharge,
     state: ModelState,
     /// Monotonic "last used" counter (bumped on load-completion and on
     /// `chat`) — `plan_eviction`'s LRU ordering reads this via
@@ -107,6 +115,10 @@ enum Command {
     },
     Status {
         reply: oneshot::Sender<Result<BackendStatus, BackendError>>,
+    },
+    IsReady {
+        id: String,
+        reply: oneshot::Sender<Result<bool, BackendError>>,
     },
     Chat {
         req: ChatRequest,
@@ -174,6 +186,7 @@ struct PreviousModel {
     state: ModelState,
     policy: LoadPolicy,
     memory_gb: f64,
+    charge: CapacityCharge,
     inherited: bool,
 }
 
@@ -276,6 +289,20 @@ impl SupervisorHandle {
             .map_err(|_| BackendError::supervisor_unavailable())?
     }
 
+    /// Returns the actor's exact chat-ready state for one model id. This is
+    /// stricter than `status().loaded`, which also includes startup-inherited
+    /// residency that has not yet become `Ready`.
+    pub async fn is_ready(&self, id: impl Into<String>) -> Result<bool, BackendError> {
+        let (reply, rx) = oneshot::channel();
+        self.send(ActorMsg::Cmd(Command::IsReady {
+            id: id.into(),
+            reply,
+        }))
+        .await?;
+        rx.await
+            .map_err(|_| BackendError::supervisor_unavailable())?
+    }
+
     pub async fn chat(
         &self,
         req: ChatRequest,
@@ -333,11 +360,11 @@ impl SupervisorHandle {
 /// distinction matters, since a task blocked *inside* `acquire().await`
 /// would still count as one more accumulating detached task, defeating the
 /// point of bounding concurrency in the first place. A hanging adapter call
-/// is additionally bounded in *time* by `config.adapter_call_timeout` (see
-/// [`with_adapter_timeout`]), applied to every `list`/`chat`/`load`/
-/// `unload`/`probe_ready` call — so a permanently-hanging adapter stalls at
-/// most `max_concurrent_adapter_calls` real calls, each for at most that
-/// timeout, never an unbounded number of tasks held forever. Full
+/// is additionally bounded in *time* by `config.chat_call_timeout` for
+/// `chat` and `config.adapter_call_timeout` for management calls (see
+/// [`with_adapter_timeout`]) — so a permanently-hanging adapter stalls at
+/// most `max_concurrent_adapter_calls` real calls, each for at most its
+/// configured timeout, never an unbounded number of tasks held forever. Full
 /// graceful-shutdown task
 /// tracking/cancellation (stopping still-running spawned calls when the
 /// last handle drops) is a deliberately deferred concern for a future PR —
@@ -350,6 +377,18 @@ struct StartupCapacityTracking {
     ledger: Arc<GlobalCapacityLedger>,
     allocation_key: String,
     claimed_gb: f64,
+    exact_claim: Option<CapacityCharge>,
+}
+
+impl StartupCapacityTracking {
+    fn record_observed_claim(&mut self, gb: f64) -> Result<(), BackendError> {
+        self.exact_claim = self
+            .exact_claim
+            .map(|_| CapacityCharge::from_gb(gb))
+            .transpose()?;
+        self.claimed_gb = gb;
+        Ok(())
+    }
 }
 
 impl Supervisor {
@@ -363,18 +402,44 @@ impl Supervisor {
         adapter: Arc<dyn RuntimeAdapter>,
         config: SupervisorConfig,
     ) -> Result<SupervisorHandle, BackendError> {
-        Self::spawn_inner(adapter, config, None)
+        Self::spawn_inner(adapter, config, None, true)
     }
 
     /// Track this runtime's trusted startup residency in one shared process
-    /// capacity ledger. This API intentionally covers startup observation only;
-    /// load/unload global admission is wired separately once their confirmation
-    /// paths can update the same aggregate key atomically.
+    /// capacity ledger, then admit loads and settle confirmed lifecycle changes
+    /// through the same single-owner allocation.
     pub fn spawn_with_startup_capacity_tracking(
         adapter: Arc<dyn RuntimeAdapter>,
         config: SupervisorConfig,
         ledger: Arc<GlobalCapacityLedger>,
         runtime_id: impl Into<String>,
+    ) -> Result<SupervisorHandle, BackendError> {
+        Self::spawn_with_startup_capacity(adapter, config, ledger, runtime_id, true)
+    }
+
+    /// Same as [`Self::spawn_with_startup_capacity_tracking`], except the actor
+    /// does not call `adapter.status()` before accepting commands.
+    ///
+    /// The boot-time remote kill switch uses this for cards that are not
+    /// trusted-local, so startup sends no request. The runtime is left out of
+    /// the shared ledger: recording a fabricated zero would hide real
+    /// residency, and charging the whole budget would deny the trusted local
+    /// runtime the switch still allows.
+    pub fn spawn_with_startup_capacity_tracking_without_probe(
+        adapter: Arc<dyn RuntimeAdapter>,
+        config: SupervisorConfig,
+        ledger: Arc<GlobalCapacityLedger>,
+        runtime_id: impl Into<String>,
+    ) -> Result<SupervisorHandle, BackendError> {
+        Self::spawn_with_startup_capacity(adapter, config, ledger, runtime_id, false)
+    }
+
+    fn spawn_with_startup_capacity(
+        adapter: Arc<dyn RuntimeAdapter>,
+        config: SupervisorConfig,
+        ledger: Arc<GlobalCapacityLedger>,
+        runtime_id: impl Into<String>,
+        startup_probe: bool,
     ) -> Result<SupervisorHandle, BackendError> {
         let runtime_id = runtime_id.into();
         if runtime_id.trim().is_empty() {
@@ -386,10 +451,12 @@ impl Supervisor {
             adapter,
             config,
             Some(StartupCapacityTracking {
+                exact_claim: ledger.uses_exact_bytes().then(CapacityCharge::default),
                 ledger,
                 allocation_key: format!("runtime:{runtime_id}"),
                 claimed_gb: 0.0,
             }),
+            startup_probe,
         )
     }
 
@@ -397,6 +464,7 @@ impl Supervisor {
         adapter: Arc<dyn RuntimeAdapter>,
         config: SupervisorConfig,
         startup_capacity: Option<StartupCapacityTracking>,
+        startup_probe: bool,
     ) -> Result<SupervisorHandle, BackendError> {
         if !config.budget_gb.is_finite() || config.budget_gb < 0.0 {
             return Err(BackendError::internal(format!(
@@ -404,7 +472,7 @@ impl Supervisor {
                 config.budget_gb
             )));
         }
-        let (tx, _join) = spawn_actor_inner(adapter, config, startup_capacity);
+        let (tx, _join) = spawn_actor_inner(adapter, config, startup_capacity, startup_probe);
         Ok(SupervisorHandle { tx })
     }
 }
@@ -421,13 +489,14 @@ fn spawn_actor(
     adapter: Arc<dyn RuntimeAdapter>,
     config: SupervisorConfig,
 ) -> (mpsc::Sender<ActorMsg>, tokio::task::JoinHandle<()>) {
-    spawn_actor_inner(adapter, config, None)
+    spawn_actor_inner(adapter, config, None, true)
 }
 
 fn spawn_actor_inner(
     adapter: Arc<dyn RuntimeAdapter>,
     config: SupervisorConfig,
     startup_capacity: Option<StartupCapacityTracking>,
+    startup_probe: bool,
 ) -> (mpsc::Sender<ActorMsg>, tokio::task::JoinHandle<()>) {
     let (tx, rx) = mpsc::channel(64);
     let call_slots = Arc::new(Semaphore::new(config.max_concurrent_adapter_calls.max(1)));
@@ -445,6 +514,7 @@ fn spawn_actor_inner(
         call_slots,
         self_tx,
         startup_capacity,
+        startup_probe,
     ));
     (tx, join)
 }
@@ -947,6 +1017,37 @@ struct Env<'a> {
 }
 
 impl Env<'_> {
+    fn exact_reserved_charge(
+        &self,
+        models: &HashMap<String, ModelSlot>,
+    ) -> Result<CapacityCharge, BackendError> {
+        let covered = self.aggregate_covered.iter().try_fold(
+            CapacityCharge::default(),
+            |sum, (id, credit)| {
+                let charge = match models.get(id) {
+                    Some(slot) if occupies_budget(slot.state) && !slot.load_unconfirmed => {
+                        slot.charge.min(CapacityCharge::from_gb(*credit)?)
+                    }
+                    _ => CapacityCharge::default(),
+                };
+                sum.checked_add(charge)
+            },
+        )?;
+        Ok(CapacityCharge::from_gb(self.reserved_gb)?.saturating_sub(covered))
+    }
+
+    fn exact_charge<'a>(
+        &self,
+        models: &HashMap<String, ModelSlot>,
+        slots: impl Iterator<Item = &'a ModelSlot>,
+    ) -> Result<CapacityCharge, BackendError> {
+        slots
+            .filter(|slot| occupies_budget(slot.state))
+            .try_fold(self.exact_reserved_charge(models)?, |sum, slot| {
+                sum.checked_add(slot.charge)
+            })
+    }
+
     fn accounted_gb(&self, models: &HashMap<String, ModelSlot>) -> f64 {
         models
             .values()
@@ -956,10 +1057,24 @@ impl Env<'_> {
             + self.effective_reserved_gb(models)
     }
 
-    fn claim_runtime_capacity(&mut self, planned_gb: f64) -> Result<(), BackendError> {
+    fn claim_runtime_capacity(
+        &mut self,
+        planned_gb: f64,
+        planned_charge: Option<CapacityCharge>,
+    ) -> Result<(), BackendError> {
         let Some(tracking) = self.runtime_capacity.as_mut() else {
             return Ok(());
         };
+        if let Some(current) = tracking.exact_claim {
+            let planned = planned_charge
+                .ok_or_else(|| BackendError::invariant_violation("missing exact load charge"))?;
+            let next = current.max(planned);
+            tracking
+                .ledger
+                .claim_charge(&tracking.allocation_key, current, planned)?;
+            tracking.exact_claim = Some(next);
+            return Ok(());
+        }
         let next_gb = tracking.claimed_gb.max(planned_gb);
         if next_gb == tracking.claimed_gb {
             return Ok(());
@@ -977,11 +1092,36 @@ impl Env<'_> {
         &mut self,
         models: &HashMap<String, ModelSlot>,
     ) -> Result<(), BackendError> {
+        let exact = self
+            .runtime_capacity
+            .as_ref()
+            .is_some_and(|t| t.exact_claim.is_some());
+        let accounted_charge = exact
+            .then(|| self.exact_charge(models, models.values()))
+            .transpose()?;
         let accounted_gb = self.accounted_gb(models);
         let has_unconfirmed_load = models.values().any(|slot| slot.load_unconfirmed);
         let Some(tracking) = self.runtime_capacity.as_mut() else {
             return Ok(());
         };
+        if let (Some(current), Some(accounted)) = (tracking.exact_claim, accounted_charge) {
+            if accounted > current || !has_unconfirmed_load {
+                tracking.ledger.update_charge(
+                    &tracking.allocation_key,
+                    Some(current),
+                    accounted,
+                    accounted <= current,
+                )?;
+                tracking.exact_claim = Some(accounted);
+            }
+            return if accounted > current && !has_unconfirmed_load {
+                Err(BackendError::invariant_violation(
+                    "runtime capacity exceeded its admitted global claim",
+                ))
+            } else {
+                Ok(())
+            };
+        }
         if (accounted_gb - tracking.claimed_gb).abs() <= CAPACITY_EPSILON_GB {
             return Ok(());
         }
@@ -1346,6 +1486,36 @@ fn handle_load(
             })
             .map(|(_, slot)| slot.memory_gb)
             .sum::<f64>();
+    let charge_plan = (|| {
+        if env
+            .runtime_capacity
+            .as_ref()
+            .is_none_or(|t| t.exact_claim.is_none())
+        {
+            return Ok((None, CapacityCharge::default()));
+        }
+        let target = CapacityCharge::from_gb(memory_gb)?;
+        let charge = if inherited {
+            target.saturating_sub(env.exact_reserved_charge(models)?)
+        } else {
+            target
+        };
+        let remaining = models
+            .iter()
+            .filter(|(model_id, _)| model_id.as_str() != id && !evicted.contains(model_id.as_str()))
+            .map(|(_, slot)| slot);
+        Ok::<_, BackendError>((
+            Some(env.exact_charge(models, remaining)?.checked_add(charge)?),
+            charge,
+        ))
+    })();
+    let (planned_charge, charge) = match charge_plan {
+        Ok(plan) => plan,
+        Err(err) => {
+            let _ = reply.send(Err(err));
+            return;
+        }
+    };
     // Claim the durable fence before changing any ledger or operation state.
     // A rejected claim is a pure admission failure: chosen victims remain
     // untouched and no active operation is installed.
@@ -1362,7 +1532,7 @@ fn handle_load(
             return;
         }
     };
-    if let Err(err) = env.claim_runtime_capacity(planned_gb) {
+    if let Err(err) = env.claim_runtime_capacity(planned_gb, planned_charge) {
         let err = match load_fence.clear() {
             Ok(()) => err,
             Err(clear_err) => clear_err,
@@ -1384,12 +1554,14 @@ fn handle_load(
             state: slot.state,
             policy: slot.policy,
             memory_gb: slot.memory_gb,
+            charge: slot.charge,
             inherited: slot.inherited,
         });
     models.insert(
         id.clone(),
         ModelSlot {
             memory_gb: if inherited { request_charge } else { memory_gb },
+            charge,
             state: ModelState::Launching,
             last_used_seq,
             policy,
@@ -1530,6 +1702,7 @@ async fn run_actor(
     call_slots: Arc<Semaphore>,
     self_tx: mpsc::WeakSender<ActorMsg>,
     startup_capacity: Option<StartupCapacityTracking>,
+    startup_probe: bool,
 ) {
     let mut models: HashMap<String, ModelSlot> = HashMap::new();
     let mut active_op: Option<ActiveOp> = None;
@@ -1554,17 +1727,27 @@ async fn run_actor(
     let load_fence = load_fence_result.ok();
     // Sample engine residency once, before accepting commands. Spawning the
     // adapter call isolates panic; the timeout bounds startup even when the
-    // adapter never returns.
-    let startup_adapter = adapter.clone();
-    let startup_ownership = load_fence.clone();
-    let timeout = config.adapter_call_timeout;
-    let startup = tokio::spawn(async move {
-        let _ownership = startup_ownership;
-        with_adapter_timeout(startup_adapter.status(), timeout, "startup/status").await
-    })
-    .await
-    .map_err(|err| BackendError::adapter_panicked("startup/status", err.to_string()))
-    .and_then(|result| result);
+    // adapter never returns. `startup_probe == false` skips that call entirely
+    // (remote kill switch at boot) and does not join the shared ledger.
+    let startup = if startup_probe {
+        let startup_adapter = adapter.clone();
+        let startup_ownership = load_fence.clone();
+        let timeout = config.adapter_call_timeout;
+        tokio::spawn(async move {
+            let _ownership = startup_ownership;
+            with_adapter_timeout(startup_adapter.status(), timeout, "startup/status").await
+        })
+        .await
+        .map_err(|err| BackendError::adapter_panicked("startup/status", err.to_string()))
+        .and_then(|result| result)
+    } else {
+        Ok(BackendStatus {
+            pressure: Pressure::Unknown,
+            used_gb: 0.0,
+            model_memory_max_gb: config.budget_gb,
+            loaded: Vec::new(),
+        })
+    };
     let startup = startup.and_then(|status| {
         if !status.used_gb.is_finite()
             || status.used_gb < 0.0
@@ -1581,17 +1764,18 @@ async fn run_actor(
         .as_ref()
         .map(|status| status.used_gb)
         .unwrap_or_default();
-    let mut startup_capacity = startup_capacity;
+    let mut startup_capacity = if startup_probe {
+        startup_capacity
+    } else {
+        None
+    };
     let startup_capacity_error = match (&mut startup_capacity, &startup) {
         (Some(tracking), Ok(status)) => {
             match tracking
                 .ledger
                 .adopt_observed(&tracking.allocation_key, None, status.used_gb)
             {
-                Ok(()) => {
-                    tracking.claimed_gb = status.used_gb;
-                    None
-                }
+                Ok(()) => tracking.record_observed_claim(status.used_gb).err(),
                 Err(err) => Some(err),
             }
         }
@@ -1600,10 +1784,7 @@ async fn run_actor(
                 .ledger
                 .block_growth_for_unknown_residency(&tracking.allocation_key, None)
             {
-                Ok(claimed_gb) => {
-                    tracking.claimed_gb = claimed_gb;
-                    None
-                }
+                Ok(claimed_gb) => tracking.record_observed_claim(claimed_gb).err(),
                 Err(err) => Some(err),
             }
         }
@@ -1615,6 +1796,7 @@ async fn run_actor(
                 id.clone(),
                 ModelSlot {
                     memory_gb: 0.0,
+                    charge: CapacityCharge::default(),
                     state: ModelState::Error,
                     last_used_seq: 0,
                     policy: LoadPolicy {
@@ -1653,6 +1835,9 @@ async fn run_actor(
                         let _ = reply.send(Err(BackendError::invariant_violation(msg)));
                     }
                     Command::Status { reply } => {
+                        let _ = reply.send(Err(BackendError::invariant_violation(msg)));
+                    }
+                    Command::IsReady { reply, .. } => {
                         let _ = reply.send(Err(BackendError::invariant_violation(msg)));
                     }
                     Command::Chat { reply, .. } => {
@@ -1724,6 +1909,13 @@ async fn run_actor(
                 }));
             }
 
+            ActorMsg::Cmd(Command::IsReady { id, reply }) => {
+                let ready = models
+                    .get(&id)
+                    .is_some_and(|slot| slot.state == ModelState::Ready);
+                let _ = reply.send(Ok(ready));
+            }
+
             ActorMsg::Cmd(Command::Chat { req, cancel, reply }) => {
                 if let Some(err) = &env.startup_error {
                     let _ = reply.send(Err(err.clone()));
@@ -1751,7 +1943,7 @@ async fn run_actor(
                             slot.inflight += 1;
                         }
                         let adapter = adapter.clone();
-                        let timeout = config.adapter_call_timeout;
+                        let timeout = config.chat_call_timeout;
                         let self_tx = self_tx.clone();
                         let ownership = load_fence.clone();
                         tokio::spawn(async move {
@@ -1931,10 +2123,12 @@ async fn run_actor(
                                             previous.state = ModelState::Error;
                                             previous.memory_gb =
                                                 slot.memory_gb.max(previous.memory_gb);
+                                            previous.charge = slot.charge.max(previous.charge);
                                         }
                                         slot.state = previous.state;
                                         slot.policy = previous.policy;
                                         slot.memory_gb = previous.memory_gb;
+                                        slot.charge = previous.charge;
                                         slot.inherited = previous.inherited;
                                     }
                                     None => {
@@ -1951,6 +2145,7 @@ async fn run_actor(
                                         if let Some(previous) = previous {
                                             slot.policy = previous.policy;
                                             slot.memory_gb = slot.memory_gb.max(previous.memory_gb);
+                                            slot.charge = slot.charge.max(previous.charge);
                                         }
                                     }
                                     None => {
@@ -2129,6 +2324,40 @@ mod tests {
         assert_eq!(status.pressure, Pressure::Ok);
     }
 
+    #[tokio::test]
+    async fn exact_readiness_is_false_while_loading_stopping_or_error() {
+        let adapter = Arc::new(MockAdapter::new(catalog()));
+        adapter.set_load_delay("a", std::time::Duration::from_millis(100));
+        let handle = Supervisor::spawn(adapter.clone(), SupervisorConfig::default())
+            .expect("spawn should succeed");
+
+        let loading_handle = handle.clone();
+        let loading =
+            tokio::spawn(async move { loading_handle.load("a", 4.0, on_demand_policy()).await });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(!handle.is_ready("a").await.unwrap(), "Loading is not Ready");
+        loading.await.unwrap().unwrap();
+        assert!(handle.is_ready("a").await.unwrap());
+
+        adapter.set_unload_delay("a", std::time::Duration::from_millis(100));
+        let stopping_handle = handle.clone();
+        let stopping = tokio::spawn(async move { stopping_handle.unload("a").await });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(
+            !handle.is_ready("a").await.unwrap(),
+            "Stopping is not Ready"
+        );
+        stopping.await.unwrap().unwrap();
+
+        adapter.set_load_delay("a", std::time::Duration::ZERO);
+        adapter.set_load_script("a", vec![crate::mock::LoadOutcome::Fail]);
+        handle
+            .load("a", 4.0, on_demand_policy())
+            .await
+            .expect_err("scripted load failure should leave an Error slot");
+        assert!(!handle.is_ready("a").await.unwrap(), "Error is not Ready");
+    }
+
     /// Negative contrast: `chat` before any `load` fails `model_not_found`.
     #[tokio::test]
     async fn chat_before_any_load_lands_is_not_found() {
@@ -2138,6 +2367,7 @@ mod tests {
         let err = handle
             .chat(
                 ChatRequest {
+                    native: None,
                     model: "a".to_string(),
                     messages: vec![],
                 },
@@ -2213,6 +2443,7 @@ mod tests {
         let resp = handle
             .chat(
                 ChatRequest {
+                    native: None,
                     model: "a".to_string(),
                     messages: vec![],
                 },
@@ -2523,6 +2754,7 @@ mod tests {
         let err = handle
             .chat(
                 ChatRequest {
+                    native: None,
                     model: "a".to_string(),
                     messages: vec![],
                 },
@@ -2776,6 +3008,7 @@ mod tests {
             _cancel: CancellationToken,
         ) -> Result<ChatResponse, BackendError> {
             Ok(ChatResponse {
+                native: None,
                 model: req.model,
                 content: String::new(),
             })
@@ -2906,6 +3139,7 @@ mod tests {
             _cancel: CancellationToken,
         ) -> Result<ChatResponse, BackendError> {
             Ok(ChatResponse {
+                native: None,
                 model: req.model,
                 content: String::new(),
             })
@@ -3005,6 +3239,7 @@ mod tests {
             _cancel: CancellationToken,
         ) -> Result<ChatResponse, BackendError> {
             Ok(ChatResponse {
+                native: None,
                 model: req.model,
                 content: String::new(),
             })
@@ -3124,6 +3359,7 @@ mod tests {
             .expect("load a should succeed");
         let err = no_hang(handle.chat(
             ChatRequest {
+                native: None,
                 model: "a".to_string(),
                 messages: vec![],
             },
@@ -3144,6 +3380,75 @@ mod tests {
             .expect("a different id must not be busy after the panicking chat");
     }
 
+    /// Chat has its own outer deadline: a generation slower than
+    /// `adapter_call_timeout` (the load/unload/status bound) must still
+    /// complete when it is within `chat_call_timeout`.
+    #[tokio::test(start_paused = true)]
+    async fn chat_outlives_the_management_adapter_timeout() {
+        let adapter = Arc::new(MockAdapter::new(evictable_catalog()));
+        let handle = Supervisor::spawn(
+            adapter.clone(),
+            SupervisorConfig {
+                adapter_call_timeout: std::time::Duration::from_millis(50),
+                chat_call_timeout: std::time::Duration::from_secs(5),
+                ..SupervisorConfig::default()
+            },
+        )
+        .expect("spawn");
+        handle
+            .load("a", 4.0, on_demand_policy())
+            .await
+            .expect("load a");
+        adapter.set_chat_delay("a", std::time::Duration::from_millis(300));
+        let reply = handle
+            .chat(
+                ChatRequest {
+                    native: None,
+                    model: "a".to_string(),
+                    messages: vec![],
+                },
+                CancellationToken::new(),
+            )
+            .await
+            .expect("a 300ms chat must survive the 50ms management timeout");
+        assert_eq!(reply.model, "a");
+    }
+
+    /// The chat outer deadline is finite and releases the in-flight slot, so
+    /// a later unload is not wedged behind the timed-out chat.
+    #[tokio::test(start_paused = true)]
+    async fn chat_call_timeout_rejects_and_releases_inflight() {
+        let adapter = Arc::new(MockAdapter::new(evictable_catalog()));
+        let handle = Supervisor::spawn(
+            adapter.clone(),
+            SupervisorConfig {
+                chat_call_timeout: std::time::Duration::from_millis(50),
+                ..SupervisorConfig::default()
+            },
+        )
+        .expect("spawn");
+        handle
+            .load("a", 4.0, on_demand_policy())
+            .await
+            .expect("load a");
+        adapter.set_chat_delay("a", std::time::Duration::from_secs(3600));
+        let err = handle
+            .chat(
+                ChatRequest {
+                    native: None,
+                    model: "a".to_string(),
+                    messages: vec![],
+                },
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("chat must hit its own deadline");
+        assert_eq!(err.reason_code(), "adapter_timed_out");
+        no_hang(handle.unload("a"))
+            .await
+            .expect("inflight must be released after the chat timeout");
+    }
+
     /// C2: a model with an in-flight `chat` is never chosen as an
     /// eviction victim, even when it would otherwise be the LRU pick —
     /// unloading it mid-`chat` would abort real, in-progress work.
@@ -3161,6 +3466,7 @@ mod tests {
         let chat_a = tokio::spawn(async move {
             h2.chat(
                 ChatRequest {
+                    native: None,
                     model: "a".to_string(),
                     messages: vec![],
                 },
@@ -3198,6 +3504,7 @@ mod tests {
         let chat_a = tokio::spawn(async move {
             h2.chat(
                 ChatRequest {
+                    native: None,
                     model: "a".to_string(),
                     messages: vec![],
                 },
@@ -3216,6 +3523,7 @@ mod tests {
         );
         let err = no_hang(handle.chat(
             ChatRequest {
+                native: None,
                 model: "a".to_string(),
                 messages: vec![],
             },
@@ -3285,6 +3593,7 @@ mod tests {
             assert_eq!(handle.status().await.unwrap().used_gb, 8.0);
             let err = no_hang(handle.chat(
                 ChatRequest {
+                    native: None,
                     model: "a".to_string(),
                     messages: vec![],
                 },
@@ -3371,6 +3680,7 @@ mod tests {
         // a must still genuinely be servable, not just accounted-for.
         no_hang(handle.chat(
             ChatRequest {
+                native: None,
                 model: "a".to_string(),
                 messages: vec![],
             },
@@ -3503,6 +3813,7 @@ mod tests {
             _cancel: CancellationToken,
         ) -> Result<ChatResponse, BackendError> {
             Ok(ChatResponse {
+                native: None,
                 model: req.model,
                 content: String::new(),
             })
@@ -3649,6 +3960,7 @@ mod tests {
             self.chat_entered.notify_one();
             self.release_chat.notified().await;
             Ok(ChatResponse {
+                native: None,
                 model: req.model,
                 content: String::new(),
             })
@@ -3668,6 +3980,7 @@ mod tests {
         let chat = tokio::spawn(async move {
             h.chat(
                 ChatRequest {
+                    native: None,
                     model: "a".into(),
                     messages: vec![],
                 },
@@ -3904,6 +4217,7 @@ mod tests {
             _cancel: CancellationToken,
         ) -> Result<ChatResponse, BackendError> {
             Ok(ChatResponse {
+                native: None,
                 model: req.model,
                 content: String::new(),
             })
@@ -4104,6 +4418,7 @@ mod tests {
             _cancel: CancellationToken,
         ) -> Result<ChatResponse, BackendError> {
             Ok(ChatResponse {
+                native: None,
                 model: req.model,
                 content: String::new(),
             })
@@ -4328,14 +4643,20 @@ mod tests {
     async fn cleanup_and_standalone_unload_keep_unconfirmed_occupancy() {
         use crate::mock::LoadOutcome;
 
-        for (probe_fails, oom, loaded) in [
+        for (probe_fails, oom, loaded, strict) in [
             (false, true, vec!["a".into()]),
             (true, false, vec!["a".into()]),
             (false, false, vec!["a".into()]),
             (false, true, vec![]),
             (true, false, vec![]),
             (false, false, vec![]),
-        ] {
+        ]
+        .into_iter()
+        .flat_map(|(probe, oom, loaded)| {
+            [false, true]
+                .into_iter()
+                .map(move |strict| (probe, oom, loaded.clone(), strict))
+        }) {
             let adapter = Arc::new(UnverifiedReleaseAdapter {
                 startup: std::sync::atomic::AtomicBool::new(true),
                 inner: MockAdapter::new(two_model_catalog()),
@@ -4352,13 +4673,20 @@ mod tests {
                     .inner
                     .set_load_script("a", vec![LoadOutcome::Oom, LoadOutcome::Ok]);
             }
-            let handle = Supervisor::spawn(
-                adapter.clone(),
-                SupervisorConfig {
-                    budget_gb: 4.0,
-                    ..SupervisorConfig::default()
-                },
-            )
+            let config = SupervisorConfig {
+                budget_gb: 4.0,
+                ..SupervisorConfig::default()
+            };
+            let handle = if strict {
+                Supervisor::spawn_with_startup_capacity_tracking(
+                    adapter.clone(),
+                    config,
+                    Arc::new(GlobalCapacityLedger::new_bytes(4_000_000_000)),
+                    "unconfirmed",
+                )
+            } else {
+                Supervisor::spawn(adapter.clone(), config)
+            }
             .unwrap();
             if probe_fails || oom {
                 handle.load("a", 4.0, on_demand_policy()).await.unwrap_err();
@@ -4398,6 +4726,7 @@ mod tests {
                 ledger: ledger.clone(),
                 allocation_key: "runtime:test".into(),
                 claimed_gb: 1.0,
+                exact_claim: None,
             }),
             startup_error: None,
         };
@@ -4549,6 +4878,7 @@ mod tests {
             _cancel: CancellationToken,
         ) -> Result<ChatResponse, BackendError> {
             Ok(ChatResponse {
+                native: None,
                 model: req.model,
                 content: String::new(),
             })

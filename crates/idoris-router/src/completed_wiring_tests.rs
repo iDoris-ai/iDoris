@@ -110,6 +110,9 @@ fn events(event_log: &EventLogStore, response: &Response) -> Vec<EventLogEvent> 
     event_log
         .events_for_record(Some(budget::PERSONAL_TENANT_ID), record_id)
         .unwrap()
+        .into_iter()
+        .filter(|row| row.event.event_type != EventType::AuditFinalized)
+        .collect()
 }
 
 fn completed(events: &[EventLogEvent]) -> Vec<&EventLogEvent> {
@@ -145,6 +148,7 @@ async fn local_supervisor_records_one_content_free_completed_success() {
             .collect::<Vec<_>>(),
         vec![
             EventType::RequestReceived,
+            EventType::Inspected,
             EventType::Profiled,
             EventType::Decided,
             EventType::Dispatched,
@@ -160,7 +164,25 @@ async fn local_supervisor_records_one_content_free_completed_success() {
         event.metadata.get("served_locality"),
         Some(&json!("loopback"))
     );
-    assert_eq!(event.metadata.len(), 3);
+    assert_eq!(
+        event.metadata.get("tokens_in"),
+        Some(&json!(idoris_tenancy::budget::estimate_tokens(
+            "completion secret",
+            "unknown"
+        )))
+    );
+    assert_eq!(
+        event.metadata.get("tokens_out"),
+        Some(&json!(idoris_tenancy::budget::estimate_tokens(
+            "mock reply to: completion secret",
+            "unknown"
+        )))
+    );
+    assert_eq!(
+        event.metadata.get("token_estimator"),
+        Some(&json!("conservative"))
+    );
+    assert_eq!(event.metadata.len(), 6);
     assert_eq!(event.session_id.as_deref(), Some("completed-session"));
     assert_eq!(event.trace_id.as_deref(), Some("completed-trace"));
     assert_eq!(event.parent_id.as_deref(), Some("completed-parent"));
@@ -188,6 +210,12 @@ async fn backend_chat_error_records_completed_failure() {
     let chain = events(&event_log, &response);
     let completed = completed(&chain);
     assert_eq!(completed.len(), 1);
+    for key in ["tokens_in", "tokens_out", "token_estimator"] {
+        assert!(
+            !completed[0].event.metadata.contains_key(key),
+            "unexpected {key}"
+        );
+    }
     assert_eq!(
         completed[0].event.metadata.get("status"),
         Some(&json!("failure"))
@@ -262,4 +290,68 @@ async fn completed_append_failure_is_generic_503_after_chat() {
     let bytes = response.into_body().collect().await.unwrap().to_bytes();
     let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(json["error"]["reason_code"], "EVENT_LOG_APPEND_UNAVAILABLE");
+}
+
+#[tokio::test]
+async fn request_history_exposes_conservative_source_for_ascii_and_cjk() {
+    for (prompt, tokens_in, tokens_out, rough_in, rough_out) in [
+        ("completion secret", 6, 11, 5, 8),
+        ("你好世界，这是一个测试", 33, 38, 3, 7),
+    ] {
+        let event_log = memory_event_log();
+        let app = build_app(local_state(
+            event_log,
+            Arc::new(ObservedAdapter::new(false)),
+        ));
+        let response = app
+            .clone()
+            .oneshot(super::tests::post_chat(
+                &json!({"model":"idoris/daily", "messages":[{"role":"user", "content":prompt}]})
+                    .to_string(),
+                &[],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let record_id = response
+            .headers()
+            .get(HEADER_RECORD_ID)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let response_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(response_json["usage"]["prompt_tokens"], rough_in);
+        assert_eq!(response_json["usage"]["completion_tokens"], rough_out);
+
+        let history = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(format!(
+                        "/idoris/tenants/{}/requests/{record_id}",
+                        budget::PERSONAL_TENANT_ID
+                    ))
+                    .header("x-idoris-tenant", budget::PERSONAL_TENANT_ID)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(history.status(), StatusCode::OK);
+        let body = history.into_body().collect().await.unwrap().to_bytes();
+        let history: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let completed = history["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|event| event["event_type"] == "completed")
+            .collect::<Vec<_>>();
+        assert_eq!(completed.len(), 1);
+        let metadata = &completed[0]["metadata"];
+        assert_eq!(metadata["tokens_in"], tokens_in);
+        assert_eq!(metadata["tokens_out"], tokens_out);
+        assert_eq!(metadata["token_estimator"], "conservative");
+        assert!(!metadata.to_string().contains(prompt));
+    }
 }

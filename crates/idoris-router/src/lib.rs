@@ -31,6 +31,8 @@ pub mod routing_policy;
 /// The local decision + execution path (R2-D task 3): `decide()` → (if
 /// needed) `Supervisor` load → `Supervisor` chat.
 pub mod dispatch;
+#[cfg(test)]
+mod role_binding_tests;
 
 /// Read-only Admin API v0 status facts. HTTP exposure is intentionally
 /// deferred until the dedicated loopback + session-token listener slice.
@@ -69,6 +71,9 @@ pub mod reason;
 pub mod storage;
 mod usage;
 
+mod event_identifier;
+mod feedback;
+mod inspect;
 /// Direct HTTP forwarding for a generic `http_service` component card's
 /// `POST /v1/chat/completions` (R2-G) — retries, idempotency cache; wired
 /// into `chat_completions`/`AppState` below (see the module's own doc for
@@ -91,7 +96,7 @@ pub mod subscription;
 
 use std::net::IpAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use axum::body::{Body, Bytes};
@@ -111,7 +116,7 @@ use uuid::Uuid;
 
 use dispatch::{
     DispatchError, DispatchFailure, LocalExecutionContext, ObservedDispatchError, Selected,
-    dispatch_local, dispatch_local_preselected_observed, reason_header_value,
+    dispatch_local_preselected_observed, reason_header_value,
 };
 use profile::{ParsedProfile, ProfileError, parse_profile};
 
@@ -233,6 +238,11 @@ pub struct AppState {
     /// Explicit loopback-only developer escape hatch. Production startup
     /// leaves this false unless `IDORIS_DEV_NO_KEY=1` was set once.
     pub dev_no_key_enabled: bool,
+    /// M5 remote kill switch: while engaged, gate one treats remote egress as
+    /// not allowed, so every request is pinned to `local_only`. Shared so an
+    /// operator surface can flip it at runtime; startup engages it from
+    /// `IDORIS_REMOTE_KILL_SWITCH=1`.
+    pub remote_kill_switch: Arc<AtomicBool>,
     /// Persistent B6 Event Log capability. This slice only bootstraps and
     /// carries the handle; request event emission is wired separately.
     pub event_log: Option<Arc<idoris_tenancy::event_log::EventLogStore>>,
@@ -328,6 +338,7 @@ impl Default for AppState {
             virtual_key_authenticator: None,
             remote_bind_requires_auth: false,
             dev_no_key_enabled: false,
+            remote_kill_switch: Arc::new(AtomicBool::new(false)),
             event_log: None,
             audit_failures: Arc::new(AtomicU64::new(0)),
             models_health: Arc::new(health::HealthTracker::default()),
@@ -368,6 +379,11 @@ pub fn build_app(state: AppState) -> Router {
             "/v1/chat/completions",
             post(chat_completions).fallback(not_found),
         )
+        .route("/v1/feedback", post(post_feedback).fallback(not_found))
+        .route(
+            "/v1/inspect",
+            post(inspect::post_inspect).fallback(not_found),
+        )
         .route("/v1/embeddings", post(embeddings).fallback(not_found))
         .route("/v1/rerank", post(rerank).fallback(not_found))
         .route("/v1/messages", post(messages).fallback(not_found))
@@ -386,23 +402,156 @@ pub fn build_app(state: AppState) -> Router {
         .with_state(state)
 }
 
+async fn post_feedback(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Result<Json<feedback::FeedbackRequest>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let Json(request) = match body {
+        Ok(body) => body,
+        Err(_) => {
+            return error_envelope(
+                StatusCode::BAD_REQUEST,
+                "invalid_json",
+                "feedback body must be valid JSON matching the feedback schema",
+            );
+        }
+    };
+    let tenant_id = match state.deploy_mode {
+        idoris_contracts::DeployMode::Personal => budget::PERSONAL_TENANT_ID.to_string(),
+        idoris_contracts::DeployMode::Tenant => match query_scope_header(&headers) {
+            Some(tenant_id) if feedback::valid_event_identifier(tenant_id) => tenant_id.to_string(),
+            None => {
+                return error_envelope(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_tenant_scope",
+                    "feedback requires exactly one non-empty X-iDoris-Tenant",
+                );
+            }
+            Some(_) => {
+                return error_envelope(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_tenant_scope",
+                    "feedback tenant identifier is invalid",
+                );
+            }
+        },
+    };
+    if let Err(err) = request.validate() {
+        return error_envelope(StatusCode::BAD_REQUEST, "invalid_feedback", err.to_string());
+    }
+    let Some(event_log) = state.event_log.clone() else {
+        return event_log_unavailable_response();
+    };
+    let result = tokio::task::spawn_blocking(move || {
+        feedback::append_metadata_feedback(&event_log, &tenant_id, request)
+    })
+    .await;
+    match result {
+        Ok(Ok(())) => StatusCode::NO_CONTENT.into_response(),
+        Ok(Err(feedback::FeedbackError::InvalidRecordId)) => error_envelope(
+            StatusCode::BAD_REQUEST,
+            "invalid_record_id",
+            "record_id is invalid",
+        ),
+        Ok(Err(feedback::FeedbackError::NotFound)) => error_envelope(
+            StatusCode::NOT_FOUND,
+            "request_not_found",
+            "request record was not found",
+        ),
+        Ok(Err(feedback::FeedbackError::EventLog(_))) | Err(_) => event_log_unavailable_response(),
+        Ok(Err(feedback::FeedbackError::Invalid(_))) => error_envelope(
+            StatusCode::BAD_REQUEST,
+            "invalid_feedback",
+            "feedback payload is invalid",
+        ),
+    }
+}
+
 async fn remote_bind_auth_middleware(
     State(state): State<Arc<AppState>>,
     mut request: Request,
     next: Next,
 ) -> Response {
-    if !state.remote_bind_requires_auth || request.uri().path() == "/health" {
+    if request.uri().path() == "/health" {
+        return next.run(request).await;
+    }
+    let has_bearer = request
+        .headers()
+        .contains_key(axum::http::header::AUTHORIZATION);
+    let tenant_mode = state.deploy_mode == idoris_contracts::DeployMode::Tenant;
+    if tenant_mode
+        && matches!(
+            request.uri().path(),
+            "/v1/chat/completions" | "/v1/embeddings" | "/v1/rerank" | "/v1/messages"
+        )
+        && query_scope_header(request.headers()).is_none()
+    {
+        return error_envelope_with_reason(
+            StatusCode::BAD_REQUEST,
+            "tenant_missing",
+            "tenant_missing",
+            "deploy_mode=tenant requires a single, non-blank X-iDoris-Tenant; no default tenant fallback",
+        );
+    }
+    if state.dev_no_key_enabled && !state.remote_bind_requires_auth && !has_bearer && !tenant_mode {
         return next.run(request).await;
     }
     let Some(authenticator) = &state.virtual_key_authenticator else {
-        return virtual_key_unauthorized_response();
+        return if state.remote_bind_requires_auth || tenant_mode {
+            virtual_key_unauthorized_response()
+        } else {
+            // Library callers may intentionally omit the production
+            // authenticator; production startup always installs one.
+            next.run(request).await
+        };
     };
     let identity = match authenticator.authenticate(request.headers()).await {
         Ok(identity) => identity,
         Err(_) => return virtual_key_unauthorized_response(),
     };
+    // An explicit tenant grant remains a ceiling in personal deployments.
+    if state.deploy_mode == idoris_contracts::DeployMode::Personal
+        && let Some(bound_tenant) = identity.scope.tenant_id.as_deref()
+        && (bound_tenant != budget::PERSONAL_TENANT_ID
+            || (request.headers().contains_key("x-idoris-tenant")
+                && query_scope_header(request.headers()) != Some(bound_tenant)))
+    {
+        return virtual_key_scope_response(auth::VirtualKeyScopeError::TenantForbidden);
+    }
+    if tenant_mode {
+        let tenant_header = request.headers().get_all("x-idoris-tenant");
+        if tenant_header.iter().next().is_some() {
+            let Some(requested_tenant) = query_scope_header(request.headers()) else {
+                return error_envelope(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_tenant_scope",
+                    "request requires exactly one non-empty X-iDoris-Tenant",
+                );
+            };
+            if !feedback::valid_event_identifier(requested_tenant) {
+                return error_envelope(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_tenant_scope",
+                    "tenant identifier is invalid",
+                );
+            }
+            if identity.scope.tenant_id.as_deref() != Some(requested_tenant) {
+                return error_envelope(
+                    StatusCode::FORBIDDEN,
+                    "tenant_scope_forbidden",
+                    "virtual key does not authorize this tenant",
+                );
+            }
+        }
+    }
+    let verified_tenant_identity = tenant_mode.then(|| identity.clone());
     request.extensions_mut().insert(identity);
-    next.run(request).await
+    let mut response = next.run(request).await;
+    if let Some(identity) = verified_tenant_identity {
+        response.extensions_mut().insert(identity);
+    }
+    response
 }
 
 async fn enforce_protocol_key_scope(
@@ -411,13 +560,31 @@ async fn enforce_protocol_key_scope(
     remote_identity: Option<&idoris_tenancy::virtual_key::store::AuthenticatedVirtualKey>,
     parsed: &profile::ParsedProfile,
 ) -> Result<(), Response> {
+    let privacy = parsed.task.privacy.unwrap_or(PrivacyClass::LocalOnly);
+    enforce_key_scope_with(state, headers, remote_identity, privacy, |identity| {
+        auth::enforce_scope(identity, parsed)
+    })
+    .await
+}
+
+/// The authentication half of [`enforce_protocol_key_scope`] with the scope
+/// check injected, for endpoints whose authority is not role-shaped
+/// (`/v1/inspect` only needs the privacy ceiling).
+async fn enforce_key_scope_with(
+    state: &AppState,
+    headers: &HeaderMap,
+    remote_identity: Option<&idoris_tenancy::virtual_key::store::AuthenticatedVirtualKey>,
+    privacy: PrivacyClass,
+    check: impl Fn(
+        &idoris_tenancy::virtual_key::store::AuthenticatedVirtualKey,
+    ) -> Result<(), auth::VirtualKeyScopeError>,
+) -> Result<(), Response> {
     if let Some(identity) = remote_identity {
-        return auth::enforce_scope(identity, parsed).map_err(virtual_key_scope_response);
+        return check(identity).map_err(virtual_key_scope_response);
     }
     let has_bearer = headers.contains_key(axum::http::header::AUTHORIZATION);
     if state.dev_no_key_enabled && !has_bearer {
-        return if parsed.task.privacy.unwrap_or(PrivacyClass::LocalOnly) == PrivacyClass::LocalOnly
-        {
+        return if privacy == PrivacyClass::LocalOnly {
             Ok(())
         } else {
             Err(dev_no_key_scope_response())
@@ -428,12 +595,56 @@ async fn enforce_protocol_key_scope(
             .authenticate(headers)
             .await
             .map_err(|_| virtual_key_unauthorized_response())?;
-        return auth::enforce_scope(&identity, parsed).map_err(virtual_key_scope_response);
+        return check(&identity).map_err(virtual_key_scope_response);
     }
     if state.dev_no_key_enabled && has_bearer {
         return Err(virtual_key_unauthorized_response());
     }
     Ok(())
+}
+
+fn bound_http_body(
+    parsed: &ParsedProfile,
+    value: &serde_json::Value,
+    card: &idoris_contracts::ComponentCard,
+) -> Result<serde_json::Value, DispatchError> {
+    let mut body = value.clone();
+    if parsed.role.is_some() {
+        let target = dispatch::backend_model_id(
+            parsed,
+            value.get("model").and_then(serde_json::Value::as_str),
+            card,
+        )?;
+        body["model"] = serde_json::Value::String(target);
+    }
+    Ok(body)
+}
+
+fn model_resolution_error(error: DispatchError) -> Response {
+    match error {
+        DispatchError::Rejection(rejection) => rejection_response(rejection),
+        DispatchError::Internal(_) => error_envelope(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal_error",
+            "backend model resolution failed",
+        ),
+    }
+}
+
+/// Effective privacy for a protocol endpoint body after gate one
+/// ([`inspect::inspect_body`]). These endpoints keep no Event Log chain
+/// yet, so the verdict only tightens routing.
+fn protocol_inspected_privacy(
+    state: &AppState,
+    value: &serde_json::Value,
+    parsed: &profile::ParsedProfile,
+) -> PrivacyClass {
+    inspect::inspect_body(
+        value,
+        parsed.task.privacy.unwrap_or(PrivacyClass::LocalOnly),
+        state.remote_kill_switch.load(Ordering::SeqCst),
+    )
+    .effective
 }
 
 async fn embeddings(
@@ -469,6 +680,9 @@ async fn embeddings(
     // Caller headers may further constrain routing elsewhere, but they cannot
     // turn an embeddings request into a chat/rerank dispatch.
     parsed.task.capabilities = Some(vec![Capability::Embedding]);
+    let request_id = headers
+        .get(HEADER_REQUEST_ID)
+        .and_then(|value| value.to_str().ok());
     if let Err(response) = enforce_protocol_key_scope(
         &state,
         &headers,
@@ -479,13 +693,31 @@ async fn embeddings(
     {
         return response;
     }
+    // INSPECTED (M5-07): same gate as chat, after the key scope admitted
+    // the declared privacy and before the routing policy reads it.
+    parsed.task.privacy = Some(protocol_inspected_privacy(&state, &value, &parsed));
 
     let cards = dispatch::policy_cards(&state.cards, &state.routing_policy, &parsed)
         .cards
         .into_iter()
         .filter(dispatch::is_resident_http_service)
         .collect::<Vec<_>>();
-    let selected = match dispatch::select(&cards, &parsed, "") {
+    let mut blocked = state.proxy.blocked_cards(&cards);
+    state.proxy.unmask_idempotent_bindings(
+        &cards,
+        &mut blocked,
+        parsed.tenant_id.as_deref(),
+        request_id,
+        "/v1/embeddings",
+    );
+    let selected = match dispatch::select_with_gate_fallback(
+        &cards,
+        &parsed,
+        "",
+        None,
+        &Default::default(),
+        &blocked,
+    ) {
         Ok(selected) => selected,
         Err(DispatchError::Rejection(rejection)) => return rejection_response(rejection),
         Err(DispatchError::Internal(message)) => {
@@ -496,6 +728,11 @@ async fn embeddings(
     // B7-02 reuses the direct buffered transport. Paid embeddings need a
     // distinct usage-settlement contract (OpenAI embeddings do not report
     // chat completion_tokens), so this slice must fail closed before egress.
+    let value = match bound_http_body(&parsed, &value, &selected.card) {
+        Ok(body) => body,
+        Err(error) => return model_resolution_error(error),
+    };
+
     let cost = &selected.card.provider.cost;
     if cost.input_per_m != 0.0 || cost.output_per_m != 0.0 {
         return error_envelope(
@@ -612,6 +849,9 @@ async fn rerank(
         Err(error) => return error.into_response(),
     };
     parsed.task.capabilities = Some(vec![Capability::Rerank]);
+    let request_id = headers
+        .get(HEADER_REQUEST_ID)
+        .and_then(|value| value.to_str().ok());
     if let Err(response) = enforce_protocol_key_scope(
         &state,
         &headers,
@@ -622,18 +862,41 @@ async fn rerank(
     {
         return response;
     }
+    // INSPECTED (M5-07): same gate as chat, after the key scope admitted
+    // the declared privacy and before the routing policy reads it.
+    parsed.task.privacy = Some(protocol_inspected_privacy(&state, &value, &parsed));
 
     let cards = dispatch::policy_cards(&state.cards, &state.routing_policy, &parsed)
         .cards
         .into_iter()
         .filter(dispatch::is_resident_http_service)
         .collect::<Vec<_>>();
-    let selected = match dispatch::select(&cards, &parsed, "") {
+    let mut blocked = state.proxy.blocked_cards(&cards);
+    state.proxy.unmask_idempotent_bindings(
+        &cards,
+        &mut blocked,
+        parsed.tenant_id.as_deref(),
+        request_id,
+        "/v1/rerank",
+    );
+    let selected = match dispatch::select_with_gate_fallback(
+        &cards,
+        &parsed,
+        "",
+        None,
+        &Default::default(),
+        &blocked,
+    ) {
         Ok(selected) => selected,
         Err(DispatchError::Rejection(rejection)) => return rejection_response(rejection),
         Err(DispatchError::Internal(message)) => {
             return error_envelope(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", message);
         }
+    };
+
+    let value = match bound_http_body(&parsed, &value, &selected.card) {
+        Ok(body) => body,
+        Err(error) => return model_resolution_error(error),
     };
 
     let cost = &selected.card.provider.cost;
@@ -765,6 +1028,9 @@ async fn messages(
         Ok(parsed) => parsed,
         Err(error) => return error.into_response(),
     };
+    let request_id = headers
+        .get(HEADER_REQUEST_ID)
+        .and_then(|value| value.to_str().ok());
     parsed.task.capabilities = Some(vec![Capability::Chat]);
     if let Err(response) = enforce_protocol_key_scope(
         &state,
@@ -776,18 +1042,41 @@ async fn messages(
     {
         return response;
     }
+    // INSPECTED (M5-07): same gate as chat, after the key scope admitted
+    // the declared privacy and before the routing policy reads it.
+    parsed.task.privacy = Some(protocol_inspected_privacy(&state, &value, &parsed));
 
     let cards = dispatch::policy_cards(&state.cards, &state.routing_policy, &parsed)
         .cards
         .into_iter()
         .filter(dispatch::is_resident_http_service)
         .collect::<Vec<_>>();
-    let selected = match dispatch::select(&cards, &parsed, "") {
+    let mut blocked = state.proxy.blocked_cards(&cards);
+    state.proxy.unmask_idempotent_bindings(
+        &cards,
+        &mut blocked,
+        parsed.tenant_id.as_deref(),
+        request_id,
+        "/v1/messages",
+    );
+    let selected = match dispatch::select_with_gate_fallback(
+        &cards,
+        &parsed,
+        "",
+        None,
+        &Default::default(),
+        &blocked,
+    ) {
         Ok(selected) => selected,
         Err(DispatchError::Rejection(rejection)) => return rejection_response(rejection),
         Err(DispatchError::Internal(message)) => {
             return error_envelope(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", message);
         }
+    };
+
+    let value = match bound_http_body(&parsed, &value, &selected.card) {
+        Ok(body) => body,
+        Err(error) => return model_resolution_error(error),
     };
 
     let cost = &selected.card.provider.cost;
@@ -891,6 +1180,7 @@ async fn messages_stream(
             &selected.card.endpoint,
             proxy::StreamingUpstreamPath::MESSAGES,
             body_value,
+            selected.card.provider.id.as_str(),
         )
         .await
     {
@@ -1028,7 +1318,7 @@ async fn get_tenant_audit(
         }
     };
     let scope_tenant = query_scope_header(&headers).map(str::to_string);
-    let Some(store) = state.record_store.clone() else {
+    let Some(store) = state.event_log.clone() else {
         return error_envelope(
             StatusCode::SERVICE_UNAVAILABLE,
             "audit_unavailable",
@@ -1036,10 +1326,7 @@ async fn get_tenant_audit(
         );
     };
     let result = tokio::task::spawn_blocking(move || {
-        let guard = store
-            .lock()
-            .map_err(|_| queries::audit::AuditQueryError::StorePoisoned)?;
-        queries::audit::query_audit(&guard, &tenant_id, scope_tenant.as_deref(), &query)
+        queries::audit::query_event_audit(&store, &tenant_id, scope_tenant.as_deref(), &query)
     })
     .await;
     match result {
@@ -1215,6 +1502,7 @@ async fn list_models(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         &state.cards,
         &state.models_health,
         &state.subscriptions,
+        state.remote_kill_switch.load(Ordering::SeqCst),
     )
     .await
     {
@@ -1530,6 +1818,7 @@ async fn append_request_received(
     store: Arc<idoris_tenancy::event_log::EventLogStore>,
     tenant_id: String,
     record_id: String,
+    request_id: String,
     correlation: &correlation::RequestCorrelation,
 ) -> Result<(), ()> {
     let ts_utc_ms = SystemTime::now()
@@ -1543,7 +1832,7 @@ async fn append_request_received(
         record_id,
         event_type: idoris_tenancy::event_log::EventType::RequestReceived,
         ts_utc_ms,
-        request_id: None,
+        request_id: Some(request_id),
         session_id: correlation.session_id.clone(),
         trace_id: correlation.trace_id.clone(),
         parent_id: correlation.parent_id.clone(),
@@ -1806,6 +2095,24 @@ pub(crate) async fn append_completed(
         selected.card.provider.id.as_str(),
         selected.served_locality,
         status,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn append_completed_with_usage(
+    context: &CompletedEventContext,
+    selected: &Selected,
+    status: &'static str,
+    tokens_in: u64,
+    tokens_out: u64,
+) -> Result<(), ()> {
+    append_completed_fields(
+        context,
+        selected.card.provider.id.as_str(),
+        selected.served_locality,
+        status,
+        Some((tokens_in, tokens_out)),
     )
     .await
 }
@@ -1815,11 +2122,17 @@ async fn append_completed_fields(
     provider_id: &str,
     served_locality: idoris_contracts::provider::Locality,
     status: &'static str,
+    usage: Option<(u64, u64)>,
 ) -> Result<(), ()> {
     let mut metadata = std::collections::BTreeMap::new();
     metadata.insert("status".to_string(), json!(status));
     metadata.insert("provider_id".to_string(), json!(provider_id));
     metadata.insert("served_locality".to_string(), json!(served_locality));
+    if let Some((tokens_in, tokens_out)) = usage {
+        metadata.insert("tokens_in".to_string(), json!(tokens_in));
+        metadata.insert("tokens_out".to_string(), json!(tokens_out));
+        metadata.insert("token_estimator".to_string(), json!("conservative"));
+    }
     let ts_utc_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .ok()
@@ -1926,30 +2239,6 @@ async fn chat_completions(
         Ok(context) => context,
         Err(error) => return correlation_error_response(error),
     };
-    let event_context = if let Some(event_log) = state.event_log.clone() {
-        let tenant_id = match state.deploy_mode {
-            idoris_contracts::DeployMode::Personal => budget::PERSONAL_TENANT_ID.to_string(),
-            idoris_contracts::DeployMode::Tenant => match parsed.tenant_id.clone() {
-                Some(tenant_id) => tenant_id,
-                None => return event_log_unavailable_response(),
-            },
-        };
-        if append_request_received(
-            event_log.clone(),
-            tenant_id.clone(),
-            record_id.clone(),
-            &correlation,
-        )
-        .await
-        .is_err()
-        {
-            return event_log_unavailable_response();
-        }
-        Some((event_log, tenant_id))
-    } else {
-        None
-    };
-
     let authorization_present = headers.contains_key(axum::http::header::AUTHORIZATION);
     let dev_no_key_request = state.dev_no_key_enabled && !authorization_present;
     if dev_no_key_request {
@@ -1967,6 +2256,55 @@ async fn chat_completions(
     } else if state.dev_no_key_enabled && authorization_present {
         return virtual_key_unauthorized_response();
     }
+
+    let event_request_id = event_request_id(header_text(&headers, HEADER_REQUEST_ID), &record_id);
+    let event_context = if let Some(event_log) = state.event_log.clone() {
+        let tenant_id = match state.deploy_mode {
+            idoris_contracts::DeployMode::Personal => budget::PERSONAL_TENANT_ID.to_string(),
+            idoris_contracts::DeployMode::Tenant => match parsed.tenant_id.clone() {
+                Some(tenant_id) => tenant_id,
+                None => return event_log_unavailable_response(),
+            },
+        };
+        if append_request_received(
+            event_log.clone(),
+            tenant_id.clone(),
+            record_id.clone(),
+            event_request_id,
+            &correlation,
+        )
+        .await
+        .is_err()
+        {
+            return event_log_unavailable_response();
+        }
+        Some((event_log, tenant_id))
+    } else {
+        None
+    };
+
+    // INSPECTED: after the key scope admitted the declared privacy, before
+    // profiling, routing policy, or a remote intent detector can see `any`.
+    let mut parsed = parsed;
+    let inspection = inspect::inspect_body(
+        &value,
+        parsed.task.privacy.unwrap_or(PrivacyClass::LocalOnly),
+        state.remote_kill_switch.load(Ordering::SeqCst),
+    );
+    if let Some((event_log, tenant_id)) = event_context.as_ref()
+        && inspect::append_inspected(
+            event_log.clone(),
+            tenant_id.clone(),
+            record_id.clone(),
+            &correlation,
+            &inspection,
+        )
+        .await
+        .is_err()
+    {
+        return event_log_unavailable_response();
+    }
+    parsed.task.privacy = Some(inspection.effective);
     let affinity_key = session_affinity_key(&headers);
 
     let messages = extract_messages(object);
@@ -2059,8 +2397,47 @@ async fn chat_completions(
         };
     }
 
-    let selection =
-        dispatch::select_with_affinity(&policy_cards.cards, &parsed, &prompt, affinity_key);
+    // Freeze one exact lifecycle-readiness view for every decision this
+    // request performs. A session may prefer an already-Ready target only
+    // after policy admission/cost ties; without a session, preserve the
+    // pre-affinity selection order exactly.
+    let ready_provider_ids = if affinity_key.is_some() {
+        state
+            .runtimes
+            .exact_ready_providers(
+                policy_cards
+                    .cards
+                    .iter()
+                    .filter_map(|card| {
+                        dispatch::backend_model_id(&parsed, model, card)
+                            .ok()
+                            .map(|target| (card.provider.id.clone(), target))
+                    })
+                    .collect(),
+            )
+            .await
+    } else {
+        std::collections::BTreeSet::new()
+    };
+
+    let mut blocked = state.proxy.blocked_cards(&policy_cards.cards);
+    state.proxy.unmask_idempotent_bindings(
+        &policy_cards.cards,
+        &mut blocked,
+        parsed.tenant_id.as_deref(),
+        headers
+            .get(HEADER_REQUEST_ID)
+            .and_then(|value| value.to_str().ok()),
+        "/v1/chat/completions",
+    );
+    let selection = dispatch::select_with_gate_fallback(
+        &policy_cards.cards,
+        &parsed,
+        &prompt,
+        affinity_key,
+        &ready_provider_ids,
+        &blocked,
+    );
     let rejection_reason = match &selection {
         Ok(_) => None,
         Err(DispatchError::Rejection(rejection)) => Some(rejection.error_type()),
@@ -2130,15 +2507,41 @@ async fn chat_completions(
                 .task
                 .privacy
                 .unwrap_or(idoris_contracts::common::PrivacyClass::LocalOnly);
-            return match subscription::dispatch::dispatch_selected(
-                selected,
-                privacy,
-                lifecycle.peer(),
-                &state.subscriptions,
-                messages.clone(),
-                lifecycle.cancellation_token(),
-            )
-            .await
+            return match state
+                .proxy
+                .drive_external(
+                    idoris_policy::SUBSCRIPTION_PROVIDER_ID,
+                    idoris_policy::breaker::CredentialClass::OAuth,
+                    || async {
+                        subscription::dispatch::dispatch_selected(
+                            selected,
+                            privacy,
+                            lifecycle.peer(),
+                            &state.subscriptions,
+                            messages.clone(),
+                            lifecycle.cancellation_token(),
+                        )
+                        .await
+                    },
+                    |result| {
+                        use dispatch::ProviderOutcome;
+                        use idoris_upstream::subscription::error::SubscriptionErrorCode::*;
+                        use subscription::dispatch::SubscriptionDispatchError::*;
+                        match result {
+                            Ok(_) => ProviderOutcome::Success,
+                            Err(Relay(error)) => match error.code() {
+                                CliFailed | EmptyOutput | SpawnFailed | Timeout | CleanupFailed => {
+                                    ProviderOutcome::Fault
+                                }
+                                Cancelled | OutputLimit => ProviderOutcome::Ignored,
+                            },
+                            Err(Source(_) | PrivacyForbidden | Runtime(_) | NotSubscription) => {
+                                ProviderOutcome::Ignored
+                            }
+                        }
+                    },
+                )
+                .await
             {
                 Ok(chat) => subscription::response::success(
                     &chat,
@@ -2176,12 +2579,16 @@ async fn chat_completions(
             };
         }
         if dispatch::is_resident_http_service(&selected.card) {
+            let upstream_body = match bound_http_body(&parsed, &value, &selected.card) {
+                Ok(body) => body,
+                Err(error) => return model_resolution_error(error),
+            };
             return chat_via_proxy(
                 &state,
                 selected,
                 &headers,
                 &parsed,
-                &value,
+                &upstream_body,
                 &record_id,
                 ProxyEventContexts {
                     dispatched: dispatched_event_context.as_ref(),
@@ -2222,7 +2629,13 @@ async fn chat_completions(
     // The request token is a fresh child of this TCP connection's lifetime.
     // Completing the request body does not cancel it; EOF/reset/shutdown of
     // the actual connection does.
-    let selected_for_dispatch = selection.ok();
+    let selected_for_dispatch = match selection {
+        Ok(selected) => Some(selected),
+        Err(DispatchError::Rejection(rejection)) => return rejection_response(rejection),
+        Err(DispatchError::Internal(message)) => {
+            return error_envelope(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", message);
+        }
+    };
     let selected_estimated_cost = selected_for_dispatch
         .as_ref()
         .map(|selected| selected.estimated_cost_minor);
@@ -2230,6 +2643,7 @@ async fn chat_completions(
         .as_ref()
         .and_then(|selected| state.runtimes.get(&selected.card.provider.id));
     let budget_ledger = state.budget_ledger.as_deref();
+    let native = supervisor_parameters::payload(object);
     let dispatch_result = if let Some(selected) = selected_for_dispatch.as_ref() {
         match dispatch_local_preselected_observed(
             selected,
@@ -2240,7 +2654,9 @@ async fn chat_completions(
                 dispatched_event_context.as_ref(),
                 completed_event_context.as_ref(),
                 budget_settled_event_context.as_ref(),
-            ),
+            )
+            .with_native(&native)
+            .with_provider_admission(state.proxy.as_ref()),
             &parsed,
             dispatch::DispatchInput::with_model(model, &prompt).with_affinity(affinity_key),
             messages,
@@ -2255,16 +2671,11 @@ async fn chat_completions(
             }
         }
     } else {
-        dispatch_local(
-            &policy_cards.cards,
-            supervisor,
-            budget_ledger,
-            &parsed,
-            dispatch::DispatchInput::with_model(model, &prompt).with_affinity(affinity_key),
-            messages,
-            lifecycle.cancellation_token(),
-        )
-        .await
+        return error_envelope(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal_error",
+            "missing selected candidate",
+        );
     };
     match dispatch_result {
         Err(DispatchError::Rejection(rejection)) => rejection_response(rejection),
@@ -2275,7 +2686,22 @@ async fn chat_completions(
             Err(failure) => dispatch_failure_response(failure, &outcome),
             Ok(chat_response) => {
                 let (body, prompt_tokens, completion_tokens) =
-                    openai_chat_completion(&chat_response.content, &chat_response.model, &prompt);
+                    if let Some(body) = &chat_response.native {
+                        (
+                            body.clone(),
+                            body.pointer("/usage/prompt_tokens")
+                                .and_then(serde_json::Value::as_u64),
+                            body.pointer("/usage/completion_tokens")
+                                .and_then(serde_json::Value::as_u64),
+                        )
+                    } else {
+                        let (body, input, output) = openai_chat_completion(
+                            &chat_response.content,
+                            &chat_response.model,
+                            &prompt,
+                        );
+                        (body, Some(input), Some(output))
+                    };
                 let mut response = (StatusCode::OK, Json(body)).into_response();
                 apply_decision_headers(&mut response, &outcome);
                 let usage_cost_minor = match selected_estimated_cost {
@@ -2283,13 +2709,12 @@ async fn chat_completions(
                     Some(_) => outcome.actual_cost_minor,
                     None => None,
                 };
-                response
-                    .extensions_mut()
-                    .insert(usage::UsageFact::inference_with_tokens(
-                        usage_cost_minor,
-                        prompt_tokens,
-                        completion_tokens,
-                    ));
+                response.extensions_mut().insert(usage::UsageFact {
+                    cost_minor: usage_cost_minor,
+                    tokens_in: prompt_tokens,
+                    tokens_out: completion_tokens,
+                    inference: true,
+                });
                 // X-iDoris-Cost-Minor: only set for a genuinely paid,
                 // settled candidate -- omitted for free/local calls.
                 if let Some(cost_minor) = outcome.actual_cost_minor
@@ -2392,12 +2817,17 @@ async fn chat_via_proxy_stream(
 ) -> Response {
     let outcome = state
         .proxy
-        .forward_stream_observed(&selected.card.endpoint, body_value, || async {
-            if let Some(context) = events.dispatched {
-                append_dispatched(context, selected).await?;
-            }
-            Ok::<(), ()>(())
-        })
+        .forward_stream_observed(
+            &selected.card.endpoint,
+            body_value,
+            selected.card.provider.id.as_str(),
+            || async {
+                if let Some(context) = events.dispatched {
+                    append_dispatched(context, selected).await?;
+                }
+                Ok::<(), ()>(())
+            },
+        )
         .await;
     let Ok(outcome) = outcome else {
         return event_log_unavailable_response();
@@ -2497,9 +2927,15 @@ fn terminated_proxy_body_observed(
                 )),
                 Some(Err(err)) => {
                     let append_failed = if let Some(context) = event.take() {
-                        append_completed_fields(&context, &provider_id, served_locality, "failure")
-                            .await
-                            .is_err()
+                        append_completed_fields(
+                            &context,
+                            &provider_id,
+                            served_locality,
+                            "failure",
+                            None,
+                        )
+                        .await
+                        .is_err()
                     } else {
                         false
                     };
@@ -2517,6 +2953,7 @@ fn terminated_proxy_body_observed(
                             &provider_id,
                             served_locality,
                             "success",
+                            None,
                         )
                         .await
                         .is_err()
@@ -2777,13 +3214,22 @@ async fn record_id_middleware(
             req.uri().path(),
             "/v1/chat/completions" | "/v1/embeddings" | "/v1/rerank" | "/v1/messages"
         );
-    let audit_tenant = audit_tenant_id(&state, req.headers());
+    let requested_audit_tenant = audit_tenant_id(&state, req.headers());
     let audit_request_id = audit_header(req.headers(), HEADER_REQUEST_ID, None);
     let audit_privacy = audit_header(req.headers(), "x-idoris-privacy", Some("local_only"));
     let audit_intent = audit_header(req.headers(), "x-idoris-intent", None);
     req.extensions_mut()
         .insert(RequestRecordId(record_id.clone()));
     let mut response = next.run(req).await;
+    let audit_tenant = match state.deploy_mode {
+        idoris_contracts::DeployMode::Personal => requested_audit_tenant,
+        idoris_contracts::DeployMode::Tenant => response
+            .extensions()
+            .get::<idoris_tenancy::virtual_key::store::AuthenticatedVirtualKey>()
+            .and_then(|identity| identity.scope.tenant_id.as_ref())
+            .filter(|tenant| Some(tenant.as_str()) == requested_audit_tenant.as_deref())
+            .cloned(),
+    };
     if let Ok(value) = HeaderValue::from_str(&record_id) {
         response.headers_mut().insert(HEADER_RECORD_ID, value);
     }
@@ -2865,7 +3311,10 @@ fn header_text<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
 
 fn audit_header(headers: &HeaderMap, name: &str, default: Option<&str>) -> Option<String> {
     match header_text(headers, name) {
-        Some(value) if value.encode_utf16().count() <= audit::MAX_FIELD_UTF16_UNITS => {
+        Some(value)
+            if value.encode_utf16().count() <= audit::MAX_FIELD_UTF16_UNITS
+                && !value.chars().any(char::is_control) =>
+        {
             Some(value.to_string())
         }
         Some(_) => None,
@@ -2873,12 +3322,20 @@ fn audit_header(headers: &HeaderMap, name: &str, default: Option<&str>) -> Optio
     }
 }
 
+fn event_request_id(request_id: Option<&str>, record_id: &str) -> String {
+    request_id
+        .filter(|value| value.encode_utf16().count() <= 128)
+        .filter(|value| !value.chars().any(char::is_control))
+        .unwrap_or(record_id)
+        .to_string()
+}
+
 fn audit_tenant_id(state: &AppState, headers: &HeaderMap) -> Option<String> {
     match state.deploy_mode {
         idoris_contracts::DeployMode::Personal => Some(budget::PERSONAL_TENANT_ID.to_string()),
-        idoris_contracts::DeployMode::Tenant => {
-            header_text(headers, "x-idoris-tenant").map(str::to_string)
-        }
+        idoris_contracts::DeployMode::Tenant => header_text(headers, "x-idoris-tenant")
+            .filter(|tenant_id| event_identifier::valid(tenant_id))
+            .map(str::to_string),
     }
 }
 
@@ -2891,57 +3348,108 @@ fn is_event_stream(response: &Response) -> bool {
 }
 
 async fn finish_buffered_audit(state: Arc<AppState>, meta: BufferedAuditMeta) {
-    let (Some(store), Some(tenant_id)) = (state.record_store.clone(), meta.tenant_id) else {
+    let Some(tenant_id) = meta.tenant_id else {
         return;
     };
+    let store = state.record_store.clone();
+    if store.is_none() && state.event_log.is_none() {
+        return;
+    }
+    let finalized_at = match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(duration) => duration.as_millis().min(i64::MAX as u128) as i64,
+        Err(_) => {
+            state.audit_failures.fetch_add(1, Ordering::Relaxed);
+            eprintln!("idoris: audit finalization clock is before unix epoch");
+            return;
+        }
+    };
+    let request_id = event_request_id(meta.request_id.as_deref(), &meta.record_id);
     let mut payload = serde_json::Map::new();
-    payload.insert(
-        "request_id".into(),
-        json!(meta.request_id.unwrap_or_else(|| meta.record_id.clone())),
-    );
+    payload.insert("request_id".into(), json!(request_id.clone()));
     payload.insert("component".into(), json!("router"));
-    if let Some(privacy) = meta.privacy {
+    if let Some(privacy) = meta.privacy.as_ref() {
         payload.insert("privacy".into(), json!(privacy));
     }
-    if let Some(intent) = meta.intent {
+    if let Some(intent) = meta.intent.as_ref() {
         payload.insert("intent".into(), json!(intent));
     }
     payload.insert("status".into(), json!(meta.status.as_u16()));
-    payload.insert("reason".into(), json!(meta.reason));
+    payload.insert("reason".into(), json!(meta.reason.clone()));
     payload.insert("latency_ms".into(), json!(meta.latency_ms));
+    payload.insert("ts_utc".into(), json!(finalized_at));
 
     let failures = state.audit_failures.clone();
+    let event_log = state.event_log.clone();
     let result = tokio::task::spawn_blocking(move || -> Result<(), String> {
-        let guard = store
-            .lock()
-            .map_err(|_| "audit record store lock poisoned".to_string())?;
-        let writer = audit::AuditWriter::new(&guard);
-        let write = audit::AuditOnce::default().finish(
-            &writer,
-            &tenant_id,
-            &meta.record_id,
-            meta.origin_record_id.as_deref(),
-            &payload,
-        );
-        match write {
-            Ok(_) => Ok(()),
-            Err(audit::AuditError::Store(err)) => Err(err.to_string()),
-            Err(_) => {
-                let mut minimal = serde_json::Map::new();
-                minimal.insert("request_id".into(), json!(meta.record_id.clone()));
-                minimal.insert("component".into(), json!("router"));
-                minimal.insert("status".into(), json!(meta.status.as_u16()));
-                minimal.insert("reason".into(), json!(meta.reason));
-                writer
-                    .write_scoped(
-                        &tenant_id,
-                        Some(&meta.record_id),
-                        meta.origin_record_id.as_deref(),
-                        &minimal,
-                    )
-                    .map(|_| ())
-                    .map_err(|err| err.to_string())
+        let mut event_failed = false;
+        if let Some(event_log) = event_log {
+            let mut metadata = std::collections::BTreeMap::new();
+            metadata.insert("component".into(), json!("router"));
+            metadata.insert("http_status".into(), json!(meta.status.as_u16()));
+            metadata.insert("reason".into(), json!(meta.reason.clone()));
+            metadata.insert("latency_ms".into(), json!(meta.latency_ms));
+            if let Some(privacy) = meta.privacy.as_ref() {
+                metadata.insert("privacy".into(), json!(privacy));
             }
+            if let Some(intent) = meta.intent.as_ref() {
+                metadata.insert("intent".into(), json!(intent));
+            }
+            let event = idoris_tenancy::event_log::NewEvent {
+                event_id: Uuid::new_v4().to_string(),
+                tenant_id: tenant_id.clone(),
+                record_id: meta.record_id.clone(),
+                event_type: idoris_tenancy::event_log::EventType::AuditFinalized,
+                ts_utc_ms: finalized_at,
+                request_id: Some(request_id),
+                session_id: None,
+                trace_id: None,
+                parent_id: None,
+                origin_record_id: meta.origin_record_id.clone(),
+                metadata,
+            };
+            event_failed = event_log.append(Some(&tenant_id), &event).is_err();
+        }
+        let legacy_failed = if let Some(store) = store {
+            let guard = store
+                .lock()
+                .map_err(|_| "audit record store lock poisoned".to_string())?;
+            let writer = audit::AuditWriter::new(&guard);
+            let write = audit::AuditOnce::default().finish(
+                &writer,
+                &tenant_id,
+                &meta.record_id,
+                meta.origin_record_id.as_deref(),
+                &payload,
+            );
+            if let Err(error) = write {
+                if !matches!(error, audit::AuditError::Store(_)) {
+                    let mut minimal = serde_json::Map::new();
+                    minimal.insert("request_id".into(), json!(meta.record_id.clone()));
+                    minimal.insert("component".into(), json!("router"));
+                    minimal.insert("status".into(), json!(meta.status.as_u16()));
+                    minimal.insert("reason".into(), json!(meta.reason));
+                    minimal.insert("ts_utc".into(), json!(finalized_at));
+                    writer
+                        .write_scoped(
+                            &tenant_id,
+                            Some(&meta.record_id),
+                            meta.origin_record_id.as_deref(),
+                            &minimal,
+                        )
+                        .is_err()
+                } else {
+                    true
+                }
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        if event_failed || legacy_failed {
+            Err("audit finalization write failed".to_string())
+        } else {
+            Ok(())
         }
     })
     .await;
@@ -3020,6 +3528,24 @@ fn audit_reason(status: StatusCode, served_locality: bool, degraded: bool) -> St
 }
 
 #[cfg(test)]
+mod inspect_wiring_tests;
+
+#[cfg(test)]
+mod inspected_wiring_tests;
+
+#[cfg(test)]
+mod protocol_inspected_wiring_tests;
+
+#[cfg(test)]
+mod kill_switch_wiring_tests;
+
+#[cfg(test)]
+mod budget_concurrency_wiring_tests;
+
+#[cfg(test)]
+mod breaker_wiring_tests;
+
+#[cfg(test)]
 mod local_privacy_tests;
 
 #[cfg(test)]
@@ -3059,6 +3585,9 @@ mod stream_completed_wiring_tests;
 mod stream_buffered_completed_wiring_tests;
 
 #[cfg(test)]
+mod feedback_wiring_tests;
+
+#[cfg(test)]
 mod request_event_query_tests;
 
 #[cfg(test)]
@@ -3074,7 +3603,16 @@ mod messages_wiring_tests;
 mod protocol_stream_path_tests;
 
 #[cfg(test)]
+mod protocol_error_matrix_tests;
+
+#[cfg(test)]
 mod policy_wiring_tests;
+
+#[cfg(test)]
+mod tenant_test_support;
+
+#[cfg(test)]
+use tenant_test_support::{tenant_test_app, tenant_test_request};
 
 #[cfg(test)]
 mod tests {
@@ -3088,6 +3626,7 @@ mod tests {
     use idoris_contracts::component_card::{Egress, Form};
     use idoris_contracts::provider::{Cost, Family, Locality, ProviderDescriptor};
     use idoris_tenancy::budget::{BudgetLedger, BudgetScope, Price, SpendGate};
+    use idoris_tenancy::event_log::{EventLogStore, EventType, NewEvent};
     use idoris_tenancy::store::{RecordKind, TenantRecord, TenantStore};
     use rusqlite::Connection;
     use serde_json::{Map, json};
@@ -3118,7 +3657,13 @@ mod tests {
             fallback_policy: FallbackPolicy::FailClosed,
             fail_closed: true,
             load_policy: None,
-            extensions: None,
+            extensions: Some(
+                serde_json::from_value(json!({
+                    "_degradation": "Removing these bindings disables aliases.",
+                    "idoris_role_models": {"daily": id}
+                }))
+                .unwrap(),
+            ),
         }
     }
 
@@ -3295,6 +3840,219 @@ mod tests {
         Arc::new(std::sync::Mutex::new(
             TenantStore::new(Connection::open_in_memory().unwrap()).unwrap(),
         ))
+    }
+
+    #[tokio::test]
+    async fn audit_finalized_dual_write_covers_early_errors_with_exact_terminal_facts() {
+        let store = memory_record_store();
+        let event_log =
+            Arc::new(EventLogStore::new(Connection::open_in_memory().unwrap()).unwrap());
+        let response = build_app(AppState {
+            record_store: Some(store.clone()),
+            event_log: Some(event_log.clone()),
+            ..AppState::default()
+        })
+        .oneshot(post_chat("{", &[]))
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let record_id = response
+            .headers()
+            .get(HEADER_RECORD_ID)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        let legacy = audit_rows(&store);
+        assert_eq!(legacy.len(), 1);
+        let events = event_log
+            .events_for_record(Some(budget::PERSONAL_TENANT_ID), &record_id)
+            .unwrap();
+        assert_eq!(
+            events.len(),
+            1,
+            "early parse failure has only terminal audit fact"
+        );
+        let event = &events[0].event;
+        assert_eq!(event.event_type, EventType::AuditFinalized);
+        assert_eq!(event.request_id.as_deref(), Some(record_id.as_str()));
+        assert_eq!(event.metadata["http_status"], json!(400));
+        assert_eq!(event.metadata["reason"], legacy[0].payload["reason"]);
+        assert_eq!(
+            event.metadata["latency_ms"],
+            legacy[0].payload["latency_ms"]
+        );
+        assert_eq!(
+            event.ts_utc_ms,
+            legacy[0].payload["ts_utc"].as_i64().unwrap()
+        );
+        assert_eq!(event.metadata["component"], json!("router"));
+        assert_eq!(event.metadata["privacy"], legacy[0].payload["privacy"]);
+        assert!(!event.metadata.contains_key("intent"));
+    }
+
+    #[tokio::test]
+    async fn audit_finalized_is_written_without_legacy_record_store() {
+        let event_log =
+            Arc::new(EventLogStore::new(Connection::open_in_memory().unwrap()).unwrap());
+        let response = build_app(AppState {
+            event_log: Some(event_log.clone()),
+            ..AppState::default()
+        })
+        .oneshot(post_chat("{", &[]))
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let record_id = response
+            .headers()
+            .get(HEADER_RECORD_ID)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        let audit = queries::audit::query_event_audit(
+            &event_log,
+            budget::PERSONAL_TENANT_ID,
+            Some(budget::PERSONAL_TENANT_ID),
+            &queries::audit::AuditQuery {
+                from: None,
+                to: None,
+                limit: None,
+                record_id: Some(record_id.to_string()),
+            },
+        )
+        .unwrap();
+        assert_eq!(audit.records.len(), 1);
+        assert_eq!(audit.records[0].payload["status"], json!(400));
+    }
+
+    #[tokio::test]
+    async fn control_in_optional_audit_headers_does_not_drop_terminal_event() {
+        for header in ["x-idoris-intent", "x-idoris-privacy"] {
+            let store = memory_record_store();
+            let event_log =
+                Arc::new(EventLogStore::new(Connection::open_in_memory().unwrap()).unwrap());
+            let response = build_app(AppState {
+                record_store: Some(store.clone()),
+                event_log: Some(event_log.clone()),
+                ..AppState::default()
+            })
+            .oneshot(post_chat("{", &[(header, "left\tright")]))
+            .await
+            .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let record_id = response
+                .headers()
+                .get(HEADER_RECORD_ID)
+                .unwrap()
+                .to_str()
+                .unwrap();
+            let rows = audit_rows(&store);
+            assert_eq!(rows.len(), 1);
+            let events = event_log
+                .events_for_record(Some(budget::PERSONAL_TENANT_ID), record_id)
+                .unwrap();
+            assert_eq!(events.len(), 1, "{header}");
+            assert_eq!(events[0].event.event_type, EventType::AuditFinalized);
+            let field = if header == "x-idoris-intent" {
+                "intent"
+            } else {
+                "privacy"
+            };
+            assert!(!events[0].event.metadata.contains_key(field));
+            assert!(!rows[0].payload.contains_key(field));
+        }
+    }
+
+    #[tokio::test]
+    async fn audit_finalized_uses_the_same_request_id_boundary_as_request_received() {
+        let cases = [
+            ("r".repeat(128), true),
+            ("r".repeat(129), false),
+            ("r".repeat(audit::MAX_FIELD_UTF16_UNITS), false),
+            ("r".repeat(audit::MAX_FIELD_UTF16_UNITS + 1), false),
+            ("left\tright".to_string(), false),
+        ];
+        for (request_id, preserves_caller_id) in cases {
+            let store = memory_record_store();
+            let event_log =
+                Arc::new(EventLogStore::new(Connection::open_in_memory().unwrap()).unwrap());
+            let response = build_app(AppState {
+                record_store: Some(store.clone()),
+                event_log: Some(event_log.clone()),
+                ..AppState::default()
+            })
+            .oneshot(post_chat("{", &[(HEADER_REQUEST_ID, request_id.as_str())]))
+            .await
+            .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let record_id = response
+                .headers()
+                .get(HEADER_RECORD_ID)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string();
+            let expected_request_id = if preserves_caller_id {
+                request_id.as_str()
+            } else {
+                record_id.as_str()
+            };
+
+            let legacy = audit_rows(&store);
+            assert_eq!(legacy.len(), 1);
+            assert_eq!(legacy[0].payload["request_id"], json!(expected_request_id));
+
+            let event_records = queries::audit::query_event_audit(
+                &event_log,
+                budget::PERSONAL_TENANT_ID,
+                Some(budget::PERSONAL_TENANT_ID),
+                &queries::audit::AuditQuery {
+                    from: None,
+                    to: None,
+                    limit: None,
+                    record_id: Some(record_id.clone()),
+                },
+            )
+            .unwrap();
+            assert_eq!(event_records.records.len(), 1);
+            assert_eq!(event_records.records[0].request_id, expected_request_id);
+            assert_eq!(
+                event_records.records[0].payload["request_id"],
+                json!(expected_request_id)
+            );
+
+            let events = event_log
+                .events_for_record(Some(budget::PERSONAL_TENANT_ID), &record_id)
+                .unwrap();
+            let terminal = events.last().unwrap();
+            assert_eq!(terminal.event.event_type, EventType::AuditFinalized);
+            assert_eq!(
+                terminal.event.request_id.as_deref(),
+                Some(expected_request_id)
+            );
+        }
+    }
+
+    #[test]
+    fn audit_tenant_scope_matches_event_log_identifier_boundary() {
+        let state = AppState {
+            deploy_mode: idoris_contracts::DeployMode::Tenant,
+            ..AppState::default()
+        };
+        let accepted = "t".repeat(128);
+        let mut headers = HeaderMap::new();
+        headers.insert("x-idoris-tenant", HeaderValue::from_str(&accepted).unwrap());
+        assert_eq!(
+            audit_tenant_id(&state, &headers).as_deref(),
+            Some(accepted.as_str())
+        );
+
+        for rejected in ["t".repeat(129), "left\tright".to_string()] {
+            let mut headers = HeaderMap::new();
+            headers.insert("x-idoris-tenant", HeaderValue::from_str(&rejected).unwrap());
+            assert_eq!(audit_tenant_id(&state, &headers), None);
+        }
     }
 
     fn audit_rows(
@@ -3517,33 +4275,34 @@ mod tests {
 
     #[tokio::test]
     async fn audit_query_http_scopes_filters_and_rejects_unknown_params() {
-        let store = memory_record_store();
-        {
-            let guard = store.lock().unwrap();
-            for (tenant, id, ts) in [
-                (budget::PERSONAL_TENANT_ID, "own", 2_000_i64),
-                ("other", "private", 1_500_i64),
-            ] {
-                let mut payload = Map::new();
-                payload.insert("ts_utc".into(), json!(ts));
-                payload.insert("reason".into(), json!("intent_match"));
-                guard
-                    .put(
-                        Some(tenant),
-                        &TenantRecord {
-                            tenant_id: tenant.into(),
-                            kind: RecordKind::Audit,
-                            record_id: id.into(),
-                            request_id: format!("request-{id}"),
-                            origin_record_id: None,
-                            payload,
-                        },
-                    )
-                    .unwrap();
-            }
+        let event_log =
+            Arc::new(EventLogStore::new(Connection::open_in_memory().unwrap()).unwrap());
+        for (tenant, id, ts) in [
+            (budget::PERSONAL_TENANT_ID, "own", 2_000_i64),
+            ("other", "private", 1_500_i64),
+        ] {
+            let event = NewEvent {
+                event_id: Uuid::new_v4().to_string(),
+                tenant_id: tenant.into(),
+                record_id: id.into(),
+                event_type: EventType::AuditFinalized,
+                ts_utc_ms: ts,
+                request_id: Some(format!("request-{id}")),
+                session_id: None,
+                trace_id: None,
+                parent_id: None,
+                origin_record_id: None,
+                metadata: std::collections::BTreeMap::from([
+                    ("component".into(), json!("router")),
+                    ("http_status".into(), json!(200)),
+                    ("reason".into(), json!("intent_match: routed")),
+                    ("latency_ms".into(), json!(1)),
+                ]),
+            };
+            event_log.append(Some(tenant), &event).unwrap();
         }
         let app = build_app(AppState {
-            record_store: Some(store),
+            event_log: Some(event_log),
             ..AppState::default()
         });
         let tenant = budget::PERSONAL_TENANT_ID;
@@ -3598,6 +4357,154 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(unknown.status(), StatusCode::BAD_REQUEST);
+    }
+
+    fn legacy_only_audit_row(store: &Arc<std::sync::Mutex<TenantStore>>, record_id: &str) {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let mut payload = Map::new();
+        payload.insert("request_id".into(), json!(format!("request-{record_id}")));
+        payload.insert("component".into(), json!("router"));
+        payload.insert("status".into(), json!(200));
+        payload.insert("reason".into(), json!("intent_match: routed"));
+        payload.insert("latency_ms".into(), json!(1));
+        payload.insert("ts_utc".into(), json!(now));
+        store
+            .lock()
+            .unwrap()
+            .put(
+                Some(budget::PERSONAL_TENANT_ID),
+                &TenantRecord {
+                    tenant_id: budget::PERSONAL_TENANT_ID.into(),
+                    kind: RecordKind::Audit,
+                    record_id: record_id.into(),
+                    request_id: format!("request-{record_id}"),
+                    origin_record_id: None,
+                    payload,
+                },
+            )
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn audit_query_http_is_unavailable_with_only_the_legacy_record_store() {
+        // A real request lands a legacy audit row, but `/audit` never falls
+        // back to that store: without an Event Log it is unavailable.
+        let store = memory_record_store();
+        let app = build_app(AppState {
+            record_store: Some(store.clone()),
+            ..AppState::default()
+        });
+        let request = app
+            .clone()
+            .oneshot(post_chat("{not valid json", &[]))
+            .await
+            .unwrap();
+        assert_eq!(request.status(), StatusCode::BAD_REQUEST);
+        let record_id = request
+            .headers()
+            .get(HEADER_RECORD_ID)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(audit_rows(&store)[0].record_id, record_id);
+
+        let tenant = budget::PERSONAL_TENANT_ID;
+        for uri in [
+            format!("/idoris/tenants/{tenant}/audit"),
+            format!("/idoris/tenants/{tenant}/audit?record_id={record_id}"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(get_usage(&uri, Some(tenant)))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE, "{uri}");
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(json["error"]["type"], "audit_unavailable");
+            assert!(
+                !String::from_utf8(body.to_vec())
+                    .unwrap()
+                    .contains(&record_id)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn audit_query_http_never_returns_rows_present_only_in_the_legacy_record_store() {
+        // With both stores configured, a real request dual-writes its audit
+        // fact; a row planted only in the legacy store must stay invisible.
+        let store = memory_record_store();
+        let event_log =
+            Arc::new(EventLogStore::new(Connection::open_in_memory().unwrap()).unwrap());
+        legacy_only_audit_row(&store, "legacy-only");
+        let app = build_app(AppState {
+            record_store: Some(store.clone()),
+            event_log: Some(event_log),
+            ..AppState::default()
+        });
+        let request = app
+            .clone()
+            .oneshot(post_chat("{not valid json", &[]))
+            .await
+            .unwrap();
+        assert_eq!(request.status(), StatusCode::BAD_REQUEST);
+        let dual_written = request
+            .headers()
+            .get(HEADER_RECORD_ID)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        let mut legacy_ids = audit_rows(&store)
+            .into_iter()
+            .map(|row| row.record_id)
+            .collect::<Vec<_>>();
+        legacy_ids.sort();
+        let mut expected_legacy_ids = vec!["legacy-only".to_string(), dual_written.clone()];
+        expected_legacy_ids.sort();
+        assert_eq!(legacy_ids, expected_legacy_ids);
+
+        let tenant = budget::PERSONAL_TENANT_ID;
+        let all = app
+            .clone()
+            .oneshot(get_usage(
+                &format!("/idoris/tenants/{tenant}/audit"),
+                Some(tenant),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(all.status(), StatusCode::OK);
+        let body = all.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let ids = json["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["record_id"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, [dual_written.as_str()]);
+        assert!(
+            !String::from_utf8(body.to_vec())
+                .unwrap()
+                .contains("legacy-only")
+        );
+
+        let filtered = app
+            .oneshot(get_usage(
+                &format!("/idoris/tenants/{tenant}/audit?record_id=legacy-only"),
+                Some(tenant),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(filtered.status(), StatusCode::OK);
+        let body = filtered.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["records"].as_array().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -3716,8 +4623,11 @@ mod tests {
             deploy_mode: idoris_contracts::DeployMode::Tenant,
             ..AppState::default()
         };
-        let app = build_app(state);
-        let response = app.oneshot(post_chat("{}", &[])).await.unwrap();
+        let (app, key) = tenant_test_app(state, "acme");
+        let response = app
+            .oneshot(tenant_test_request(post_chat("{}", &[]), &key))
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
@@ -3850,6 +4760,149 @@ mod tests {
             usage[0].payload["tokens_out"],
             json["usage"]["completion_tokens"]
         );
+    }
+
+    #[tokio::test]
+    async fn chat_request_freezes_one_readiness_snapshot_for_all_decide_passes() {
+        let card = sample_component_card("local-1");
+        let adapter = std::sync::Arc::new(idoris_backend::MockAdapter::new(vec![
+            idoris_backend::ModelInfo {
+                id: "local-1".to_string(),
+                memory_gb: 1.0,
+            },
+        ]));
+        let supervisor =
+            idoris_backend::Supervisor::spawn(adapter, idoris_backend::SupervisorConfig::default())
+                .unwrap();
+        supervisor
+            .load(
+                "local-1",
+                1.0,
+                idoris_contracts::load_policy::LoadPolicy {
+                    mode: idoris_contracts::load_policy::LoadMode::OnDemand,
+                    keepalive: idoris_contracts::load_policy::Keepalive::IdleTtl { idle_ttl_s: 60 },
+                    admission: idoris_contracts::load_policy::Admission::Coexist,
+                },
+            )
+            .await
+            .unwrap();
+        let runtimes: runtime::RuntimeRegistry =
+            dispatch::BoundSupervisor::new(&card, supervisor).into();
+        let state = AppState {
+            cards: vec![card],
+            runtimes: runtimes.clone(),
+            ..AppState::default()
+        };
+
+        let response = build_app(state)
+            .oneshot(post_chat(
+                r#"{"model":"idoris/daily","messages":[{"role":"user","content":"hi"}]}"#,
+                &[("X-iDoris-Session", "run-42")],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(runtimes.ready_snapshot_calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn chat_request_serves_the_exact_ready_session_target_from_one_snapshot() {
+        // Two equal-cost eligible targets, only one exact-ready. Running both
+        // orientations under one session key means rendezvous hashing alone
+        // cannot explain the pick; the single frozen readiness view must.
+        for ready in ["local-a", "local-b"] {
+            let cards = vec![
+                sample_component_card("local-a"),
+                sample_component_card("local-b"),
+            ];
+            let mut adapters = Vec::new();
+            let mut bound = Vec::new();
+            for card in &cards {
+                let id = card.provider.id.clone();
+                let adapter = std::sync::Arc::new(idoris_backend::MockAdapter::new(vec![
+                    idoris_backend::ModelInfo {
+                        id: id.clone(),
+                        memory_gb: 1.0,
+                    },
+                ]));
+                let supervisor = idoris_backend::Supervisor::spawn(
+                    adapter.clone(),
+                    idoris_backend::SupervisorConfig::default(),
+                )
+                .unwrap();
+                // Warm with dispatch's default policy so serving the ready
+                // target is an idempotent no-op rather than a policy re-apply.
+                if id == ready {
+                    supervisor
+                        .load(
+                            id.as_str(),
+                            1.0,
+                            idoris_contracts::load_policy::LoadPolicy {
+                                mode: idoris_contracts::load_policy::LoadMode::OnDemand,
+                                keepalive: idoris_contracts::load_policy::Keepalive::IdleTtl {
+                                    idle_ttl_s: 300,
+                                },
+                                admission: idoris_contracts::load_policy::Admission::Coexist,
+                            },
+                        )
+                        .await
+                        .unwrap();
+                }
+                bound.push(dispatch::BoundSupervisor::new(card, supervisor));
+                adapters.push((id, adapter));
+            }
+            let runtimes = runtime::RuntimeRegistry::from_supervisors(bound);
+            let event_log =
+                Arc::new(EventLogStore::new(Connection::open_in_memory().unwrap()).unwrap());
+            let state = AppState {
+                cards,
+                runtimes: runtimes.clone(),
+                event_log: Some(event_log.clone()),
+                ..AppState::default()
+            };
+
+            let response = build_app(state)
+                .oneshot(post_chat(
+                    r#"{"model":"idoris/daily","messages":[{"role":"user","content":"hi"}]}"#,
+                    &[("X-iDoris-Session", "run-42")],
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{ready}");
+            assert_eq!(runtimes.ready_snapshot_calls(), 1, "{ready}");
+            assert_eq!(
+                response.headers().get(HEADER_SERVED_LOCALITY).unwrap(),
+                "loopback"
+            );
+            let record_id = response
+                .headers()
+                .get(HEADER_RECORD_ID)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string();
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(json["model"], ready);
+
+            // Only the ready upstream executed: the other was never loaded,
+            // and MockAdapter refuses chat for a model it has not loaded.
+            for (id, adapter) in &adapters {
+                let expected_loads = u32::from(id == ready);
+                assert_eq!(adapter.load_call_count(id), expected_loads, "{ready}: {id}");
+            }
+            // No provider header exists; the Event Log names the provider.
+            let chain = event_log
+                .events_for_record(Some(budget::PERSONAL_TENANT_ID), &record_id)
+                .unwrap();
+            for event_type in [EventType::Decided, EventType::Dispatched] {
+                let event = chain
+                    .iter()
+                    .find(|event| event.event.event_type == event_type)
+                    .unwrap();
+                assert_eq!(event.event.metadata["provider_id"], json!(ready));
+            }
+        }
     }
 
     #[tokio::test]
@@ -4618,7 +5671,7 @@ mod tests {
         wiremock::Mock::given(wiremock::matchers::method("POST"))
             .and(wiremock::matchers::path("/v1/chat/completions"))
             .and(wiremock::matchers::body_json(serde_json::json!({
-                "model": "idoris/daily",
+                "model": "omlx",
                 "stream": false,
                 "messages": [{"role": "user", "content": "redirect guard payload"}]
             })))

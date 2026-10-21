@@ -1,7 +1,7 @@
 # idoris-recommender
 
-Rust recommender port, kept behaviorally equivalent to **`packages/recommender`**
-(TS, kept as the reference implementation; see the root `README.md`).
+Maintained Rust recommender. Calls without an external allocation preserve the
+**`packages/recommender`** TS reference fixtures.
 
 ## B1 `/capabilities` consumer mapping
 
@@ -19,16 +19,17 @@ map public `Recommendation` output onto the seven-field TS
 | `queue_depth` | **B1 runtime/backend status only**; B2 must not fabricate it |
 | `admission_status` | resident=`ready`; temp status; blocked=`blocked` |
 
-A forced model may intentionally appear both as resident and blocked; consumers
-must preserve both rows rather than deduplicate away the warning/evidence.
+With no external allocation, a forced model may appear as both resident and
+blocked. Consumers preserve both legacy rows. With an allocation, a forced model
+cannot bypass total memory or the real host `min_ram_gb` gate.
 
 ## Scope (mirrors `packages/recommender/src/*`)
 
 | Rust module | TS source | Responsibility |
 |---|---|---|
 | `probe` | `src/probe.ts` | `HostFacts` + adapters over `node:os`/`system_profiler`. Recommendation logic depends only on `HostFacts`, never touches the OS directly, so it stays testable with injected facts. |
-| `memory` | `src/memory.ts` (T2.1.1, docs/07 §1–§3, Apple budget correction in docs/13 §3.1) | `footprint_gb = params_total_b * bpp(quant) + kv_gb(ctx) + overhead_gb`. Unit conventions are load-bearing and easy to get wrong: weights are decimal GB (1 GB = 1e9 B), KV is MiB (2^20 B), RAM budgets follow docs/13's table. Do not "simplify" the units without re-reading the TS header comment. |
-| `recommend` | `src/recommend.ts` (T2.1.2/T2.1.3, docs/07 §5.3, threshold correction in docs/13 §9.2) | `min_ram_gb` is a hard gate (below it, a combination is `BLOCKED`, no exceptions). Resident pick maximizes `capability.reasoning * quant.quality` subject to fitting the resident budget; on-demand candidates are admitted one at a time; `IDORIS_CORE_MODEL` forces a yield with a warning, never a silent override. |
+| `memory` | `src/memory.ts` (T2.1.1, docs/07 §1–§3, Apple budget correction in docs/13 §3.1) | `footprint_gb = params_total_b * bpp(quant) + kv_gb(ctx) + overhead_gb`. Unit conventions are load-bearing and easy to get wrong: weights and KV estimates are decimal GB (1 GB = 1e9 B); RAM budgets follow docs/13's table when no external allocation is supplied. Do not "simplify" the units without re-reading the TS header comment. |
+| `recommend` | `src/recommend.ts` (T2.1.2/T2.1.3, docs/07 §5.3, threshold correction in docs/13 §9.2) | `min_ram_gb` gates real host RAM. The legacy unbudgeted forced override can bypass it with a warning. Resident pick maximizes `capability.reasoning * quant.quality` subject to fitting the resident budget; on-demand candidates are admitted one at a time; `IDORIS_CORE_MODEL` forces a yield with a warning, never a silent override. |
 
 ## Public Rust boundary
 
@@ -40,7 +41,9 @@ Typical B1 consumption is explicit and side-effect free:
 
 ```rust
 let catalog = idoris_recommender::catalog::load_catalog("config/catalog.yaml")?;
-let rec = idoris_recommender::recommend::recommend(&facts, &catalog, None, None)?;
+let rec = idoris_recommender::recommend::recommend(
+    &facts, &catalog, None, None, Some(12_000_000_000),
+)?;
 let estimate = idoris_recommender::model::estimate_model(
     &catalog,
     "ornith-1.0-9b",
@@ -49,6 +52,72 @@ let estimate = idoris_recommender::model::estimate_model(
     rec.policy.kv_quant,
 )?;
 ```
+
+Both `recommend(hardware, catalog, partial_policy, forced, allocated_budget_bytes)`
+and `recommend_from_file(path, hardware, partial_policy, forced, allocated_budget_bytes)`
+accept `allocated_budget_bytes: Option<u64>`. Existing callers pass `None` for the
+legacy host-derived budget. This is a direct signature migration.
+
+### Allocated total and admission
+
+`Some(bytes)` replaces host-derived usable memory with the allocated total. It
+does not apply a wired fraction or subtract OS reserve again. `reserve_gb` is
+zero in this mode. Resident selection still reserves `3.5GB * temp_slots` and
+`1GB` of headroom within that total. On-demand candidates are evaluated one at
+a time against total minus the resident footprint, without cumulative deduction
+across alternatives.
+
+| Candidate footprint | Allocated admission |
+|---|---|
+| Fits remaining | `Ready` |
+| Exceeds remaining but fits total, including equality | `RequiresEviction` |
+| Even the smallest quant exceeds total | In `Recommendation.blocked`, absent from resident and temp |
+| Real host RAM is below `min_ram_gb` | In `Recommendation.blocked`, regardless of allocation size |
+
+`Some(0)` blocks every positive footprint. Quant selection still prefers the
+highest capability model and then quality; it does not switch to a weaker model
+when the highest capability candidate is blocked. The existing lowest-footprint
+quant fallback can relax the quality threshold. In allocated mode its status
+uses the actual footprint comparison with remaining memory.
+
+A forced quant must fit allocated total and real host eligibility. A rejected
+known override has `override_choice.active = false`, emits a `BLOCKED` warning,
+and preserves the automatic resident. A fitting override may spend the soft
+resident reserve but cannot exceed total. Unknown model overrides retain their
+existing automatic fallback.
+
+The router's `LiveCapabilitiesProvider::with_allocated_budget_bytes(Option<u64>)`
+passes the allocation into each snapshot. Blocked models map to HTTP
+`admission_status: "blocked"`. The maintained `idoris serve` binary accepts the
+optional `IDORIS_ALLOCATED_BUDGET_BYTES` unsigned integer environment variable;
+unset means `None`, and malformed or overflowing values reject startup. This
+configures recommendations and capability reporting, not a global runtime
+memory enforcer or a live Agent24 allocation negotiation protocol.
+
+### Units and footprint limits
+
+`HostFacts.ram_gb` represents real physical memory as
+`round(total_mem_bytes / 2^30)`, despite its historical name. OS sampling rounds
+to the nearest whole GiB, preserving the existing host-probe contract. Injected
+facts must describe the real host; the pure constructor continues to accept fractional fixture facts. `min_ram_gb` compares with those
+facts, never with an allocation disguised as RAM.
+
+Agent24 passes integer bytes at the boundary. iDoris converts the allocation
+once to decimal GB (`bytes / 1_000_000_000`) in `budget_breakdown` and shares the
+result across selection stages. It never converts the allocation through GiB.
+Weights, KV, overhead, and reported footprints use decimal GB. KV is computed
+from architecture, the policy's specified context, and KV quantization. The
+estimate is `weights + KV(context_target) + 1GB` per-model runtime overhead.
+Loading peaks, temporary loading buffers, and measured backend peaks are **not
+modeled**. This is an estimated admission limit, not a claim that observed peak
+RSS stays below the allocation. Estimates and GB comparisons use `f64`. Integer
+byte inputs are exactly representable up to 2^53 bytes, but conversion to GB and
+footprint arithmetic can still introduce rounding at ordinary model sizes
+(including approximately one byte at an admission boundary). This is not a
+byte-exact memory allocator; precision degrades further above 2^53 bytes.
+Loading peaks require separate margin and backend calibration.
+`recommended_sysctl` remains advice for the physical host, derived from its
+legacy usable memory and wired mode, independently of the allocation.
 
 The crate never loads a model, changes sysctl state, reads provider
 credentials, or talks to oMLX. B1 owns backend binding, live queue state and
@@ -59,7 +128,12 @@ Supervisor admission; A-machine acceptance owns real memory calibration.
 Shared fixtures pin the TS reference baseline at
 `49a66e86e65e9ddf26f3bf3c9d68041df49d8981`
 (`testdata/recommender/{ram,edges}.json`). Valid-input recommendation output,
-ordering, warnings/tradeoff text, and numeric results remain parity-sensitive.
+ordering, warnings/tradeoff text, and numeric results remain parity-sensitive
+when `allocated_budget_bytes` is `None`. In particular, the existing
+`temp-too-large-even-alone-requires-eviction` edge fixture labels a model above
+legacy usable memory as `RequiresEviction`, and oversized forced overrides can
+remain resident. These are explicit legacy exceptions. The allocated path
+rejects these admissions. All shared fixtures remain unchanged.
 
 Allowed Rust differences are intentionally narrow:
 

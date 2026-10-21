@@ -1,6 +1,9 @@
 //! Construct and index lifecycle-managed runtimes by component provider.
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
 use idoris_backend::{
     BackendError, BackendStatus, GlobalCapacityLedger, GlobalCapacitySnapshot, RuntimeAdapter,
@@ -17,6 +20,8 @@ use crate::dispatch::BoundSupervisor;
 pub struct RuntimeRegistry {
     supervisors: BTreeMap<String, BoundSupervisor>,
     startup_capacity: Option<Arc<GlobalCapacityLedger>>,
+    #[cfg(test)]
+    ready_snapshot_calls: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl RuntimeRegistry {
@@ -32,17 +37,77 @@ impl RuntimeRegistry {
     where
         F: Fn(&ComponentCard) -> Result<std::sync::Arc<dyn RuntimeAdapter>, BackendError>,
     {
-        let budget_gb = SupervisorConfig::default().budget_gb;
-        let startup_capacity = Arc::new(
-            GlobalCapacityLedger::new(budget_gb)
+        Self::spawn_with_factory_and_budget(cards, None, factory)
+    }
+
+    /// Same as [`Self::spawn_with_factory`] but with the remote kill switch
+    /// engaged at boot: cards that fail `is_local_capable` are not status-probed.
+    pub fn spawn_with_factory_budget_and_kill_switch<F>(
+        cards: &[ComponentCard],
+        allocated_budget_bytes: Option<u64>,
+        remote_kill_switch: bool,
+        factory: F,
+    ) -> Result<Self, String>
+    where
+        F: Fn(&ComponentCard) -> Result<std::sync::Arc<dyn RuntimeAdapter>, BackendError>,
+    {
+        Self::spawn_with_factory_budgeted(
+            cards,
+            allocated_budget_bytes,
+            remote_kill_switch,
+            factory,
+        )
+    }
+
+    /// Apply an already allocated model budget to both process-wide admission
+    /// and each runtime. Bytes use decimal GB, matching model memory estimates.
+    /// `None` preserves the historical default; no OS reserve is deducted here.
+    pub fn spawn_with_factory_and_budget<F>(
+        cards: &[ComponentCard],
+        allocated_budget_bytes: Option<u64>,
+        factory: F,
+    ) -> Result<Self, String>
+    where
+        F: Fn(&ComponentCard) -> Result<std::sync::Arc<dyn RuntimeAdapter>, BackendError>,
+    {
+        Self::spawn_with_factory_budgeted(cards, allocated_budget_bytes, false, factory)
+    }
+
+    fn spawn_with_factory_budgeted<F>(
+        cards: &[ComponentCard],
+        allocated_budget_bytes: Option<u64>,
+        remote_kill_switch: bool,
+        factory: F,
+    ) -> Result<Self, String>
+    where
+        F: Fn(&ComponentCard) -> Result<std::sync::Arc<dyn RuntimeAdapter>, BackendError>,
+    {
+        let config = SupervisorConfig {
+            budget_gb: allocated_budget_bytes
+                .map(|bytes| bytes as f64 / 1_000_000_000.0)
+                .unwrap_or_else(|| SupervisorConfig::default().budget_gb),
+            ..SupervisorConfig::default()
+        };
+        let budget_gb = config.budget_gb;
+        let startup_capacity = Arc::new(match allocated_budget_bytes {
+            Some(bytes) => GlobalCapacityLedger::new_bytes(bytes),
+            None => GlobalCapacityLedger::new(budget_gb)
                 .map_err(|error| format!("startup capacity ledger: {error}"))?,
-        );
+        });
         let mut registry = Self {
             supervisors: BTreeMap::new(),
             startup_capacity: Some(startup_capacity.clone()),
+            #[cfg(test)]
+            ready_snapshot_calls: Arc::default(),
         };
         for card in cards {
-            let Some(handle) = spawn_runtime_with_factory(card, &factory, Some(&startup_capacity))?
+            let Some(handle) = spawn_runtime_with_factory(
+                card,
+                &factory,
+                Some(&startup_capacity),
+                config.clone(),
+                remote_kill_switch,
+            )?
             else {
                 continue;
             };
@@ -63,6 +128,30 @@ impl RuntimeRegistry {
     pub fn spawn_with_local_configs(
         cards: &[ComponentCard],
         local: &BTreeMap<String, LocalHttpRuntimeConfig>,
+    ) -> Result<Self, String> {
+        Self::spawn_with_local_configs_and_budget(cards, local, None)
+    }
+
+    pub fn spawn_with_local_configs_and_budget(
+        cards: &[ComponentCard],
+        local: &BTreeMap<String, LocalHttpRuntimeConfig>,
+        allocated_budget_bytes: Option<u64>,
+    ) -> Result<Self, String> {
+        Self::spawn_with_local_configs_budget_and_kill_switch(
+            cards,
+            local,
+            allocated_budget_bytes,
+            false,
+        )
+    }
+
+    /// Startup entry point: both the allocated model budget and the remote kill
+    /// switch engaged at boot are threaded into the per-runtime construction.
+    pub fn spawn_with_local_configs_budget_and_kill_switch(
+        cards: &[ComponentCard],
+        local: &BTreeMap<String, LocalHttpRuntimeConfig>,
+        allocated_budget_bytes: Option<u64>,
+        remote_kill_switch: bool,
     ) -> Result<Self, String> {
         for (provider_id, config) in local {
             let card = cards
@@ -86,14 +175,19 @@ impl RuntimeRegistry {
             }
         }
 
-        let mut registry = Self::spawn_with_factory(cards, |card| {
-            if let Some(config) = local.get(&card.provider.id) {
-                return LocalHttpRuntimeAdapter::new(config.clone()).map(|adapter| {
-                    std::sync::Arc::new(adapter) as std::sync::Arc<dyn RuntimeAdapter>
-                });
-            }
-            create_adapter(card)
-        })?;
+        let mut registry = Self::spawn_with_factory_budgeted(
+            cards,
+            allocated_budget_bytes,
+            remote_kill_switch,
+            |card| {
+                if let Some(config) = local.get(&card.provider.id) {
+                    return LocalHttpRuntimeAdapter::new(config.clone()).map(|adapter| {
+                        std::sync::Arc::new(adapter) as std::sync::Arc<dyn RuntimeAdapter>
+                    });
+                }
+                create_adapter(card)
+            },
+        )?;
         for (provider_id, config) in local {
             if let Some(bound) = registry.supervisors.get_mut(provider_id) {
                 *bound = bound
@@ -126,6 +220,7 @@ impl RuntimeRegistry {
                 .map(|bound| (bound.provider_id().to_string(), bound))
                 .collect(),
             startup_capacity: None,
+            ready_snapshot_calls: Arc::default(),
         }
     }
 
@@ -138,8 +233,8 @@ impl RuntimeRegistry {
     }
 
     /// Wait for every lifecycle runtime's startup reconciliation, then return
-    /// the shared residency snapshot. This deliberately does not claim
-    /// load/unload admission authority yet.
+    /// the shared residency snapshot. The same ledger admits load claims
+    /// across runtimes and settles them after load/unload completion.
     pub async fn startup_capacity_snapshot(
         &self,
     ) -> Result<Option<GlobalCapacitySnapshot>, BackendError> {
@@ -159,6 +254,33 @@ impl RuntimeRegistry {
         }
         depth
     }
+
+    /// Return providers whose exact requested lifecycle target is currently
+    /// chat-ready. Errors are conservatively treated as not ready.
+    pub async fn exact_ready_providers(&self, targets: Vec<(String, String)>) -> BTreeSet<String> {
+        #[cfg(test)]
+        self.ready_snapshot_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let mut ready = BTreeSet::new();
+        for (provider_id, model_id) in targets {
+            if let Some(supervisor) = self.supervisors.get(&provider_id)
+                && ready_for_affinity(supervisor.is_ready(&model_id).await)
+            {
+                ready.insert(provider_id);
+            }
+        }
+        ready
+    }
+
+    #[cfg(test)]
+    pub(crate) fn ready_snapshot_calls(&self) -> usize {
+        self.ready_snapshot_calls
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+fn ready_for_affinity(result: Result<bool, BackendError>) -> bool {
+    result.unwrap_or(false)
 }
 
 fn add_status_depth(
@@ -185,6 +307,8 @@ impl From<BoundSupervisor> for RuntimeRegistry {
         Self {
             supervisors,
             startup_capacity: None,
+            #[cfg(test)]
+            ready_snapshot_calls: Arc::default(),
         }
     }
 }
@@ -200,13 +324,32 @@ impl From<Option<BoundSupervisor>> for RuntimeRegistry {
 /// # Panics
 /// Lifecycle construction requires a running Tokio runtime, like `Supervisor::spawn`.
 pub fn spawn_runtime(card: &ComponentCard) -> Result<Option<SupervisorHandle>, String> {
-    spawn_runtime_with_factory(card, &create_adapter, None)
+    spawn_runtime_with_factory(
+        card,
+        &create_adapter,
+        None,
+        SupervisorConfig::default(),
+        false,
+    )
+}
+
+fn is_trusted_local_card(card: &ComponentCard) -> bool {
+    idoris_policy::privacy::is_local_capable(&idoris_policy::Card {
+        component: card.clone(),
+        roles: Vec::new(),
+        experiment: false,
+        min_ram_gb: 0.0,
+        estimated_cost_minor: None,
+        admission_status: idoris_policy::AdmissionStatus::Ready,
+    })
 }
 
 fn spawn_runtime_with_factory<F>(
     card: &ComponentCard,
     factory: &F,
     startup_capacity: Option<&Arc<GlobalCapacityLedger>>,
+    config: SupervisorConfig,
+    remote_kill_switch: bool,
 ) -> Result<Option<SupervisorHandle>, String>
 where
     F: Fn(&ComponentCard) -> Result<std::sync::Arc<dyn RuntimeAdapter>, BackendError>,
@@ -225,16 +368,25 @@ where
     }
     let adapter =
         factory(card).map_err(|error| format!("provider {}: {error}", card.provider.id))?;
-    let config = SupervisorConfig::default();
-    let supervisor = if let Some(ledger) = startup_capacity {
-        Supervisor::spawn_with_startup_capacity_tracking(
+    // Engaged at boot: do not status-probe a card that fails `is_local_capable`.
+    // Trusted loopback local_only cards are still probed.
+    let skip_startup_probe = remote_kill_switch && !is_trusted_local_card(card);
+    let supervisor = match (startup_capacity, skip_startup_probe) {
+        (Some(ledger), true) => Supervisor::spawn_with_startup_capacity_tracking_without_probe(
             adapter,
             config,
             ledger.clone(),
             card.provider.id.clone(),
-        )
-    } else {
-        Supervisor::spawn(adapter, config)
+        ),
+        (Some(ledger), false) => Supervisor::spawn_with_startup_capacity_tracking(
+            adapter,
+            config,
+            ledger.clone(),
+            card.provider.id.clone(),
+        ),
+        // Registry startup always passes a ledger; `spawn_runtime` passes the
+        // switch as false, so a missing ledger never takes the skip arm.
+        (None, _) => Supervisor::spawn(adapter, config),
     };
     supervisor
         .map(Some)
@@ -281,6 +433,352 @@ mod tests {
             tenant_id: None,
             intent_source: IntentSource::Default,
         }
+    }
+
+    async fn budget_dispatch(
+        registry: &RuntimeRegistry,
+        card: &ComponentCard,
+        model: Option<&str>,
+    ) -> Result<idoris_backend::ChatResponse, DispatchFailure> {
+        dispatch_local(
+            std::slice::from_ref(card),
+            registry.get(&card.provider.id),
+            None,
+            &profile(),
+            DispatchInput::with_model(model, "hello"),
+            vec![ChatMessage {
+                role: "user".into(),
+                content: "hello".into(),
+            }],
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap()
+        .result
+    }
+
+    #[tokio::test]
+    async fn allocated_budget_zero_and_individually_oversized_models_never_reach_adapter() {
+        // Include a sub-epsilon positive footprint: zero means no positive loads.
+        for (bytes, memory_gb) in [(0, 1.0), (0, 1e-9), (1, 500e-9), (1_000_000_000, 2.0)] {
+            let card = named_card("budget-model");
+            let adapter = Arc::new(MockAdapter::new(vec![ModelInfo {
+                id: card.provider.id.clone(),
+                memory_gb,
+            }]));
+            let registry = RuntimeRegistry::spawn_with_factory_and_budget(
+                std::slice::from_ref(&card),
+                Some(bytes),
+                |_| Ok(adapter.clone()),
+            )
+            .unwrap();
+            assert!(
+                budget_dispatch(&registry, &card, None).await.is_err(),
+                "allocation {bytes} must deny footprint {memory_gb}; adapter loads: {}",
+                adapter.load_call_count(&card.provider.id)
+            );
+            assert_eq!(
+                registry
+                    .get(&card.provider.id)
+                    .unwrap()
+                    .status()
+                    .await
+                    .unwrap()
+                    .model_memory_max_gb,
+                bytes as f64 / 1_000_000_000.0
+            );
+            assert_eq!(adapter.load_call_count(&card.provider.id), 0);
+            assert_eq!(
+                registry
+                    .startup_capacity_snapshot()
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .reserved_gb,
+                0.0
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn allocated_budget_is_shared_across_dispatch_and_released_after_eviction() {
+        let a = named_card("budget-a");
+        let b = named_card("budget-b");
+        let adapter_a = Arc::new(MockAdapter::new(vec![
+            ModelInfo {
+                id: a.provider.id.clone(),
+                memory_gb: 1.0,
+            },
+            ModelInfo {
+                id: "replacement".into(),
+                memory_gb: 1.0,
+            },
+        ]));
+        let adapter_b = Arc::new(MockAdapter::new(vec![ModelInfo {
+            id: b.provider.id.clone(),
+            memory_gb: 1.0,
+        }]));
+        adapter_a.set_load_script("replacement", vec![idoris_backend::mock::LoadOutcome::Fail]);
+        let registry = RuntimeRegistry::spawn_with_factory_and_budget(
+            &[a.clone(), b.clone()],
+            Some(1_000_000_000),
+            |card| {
+                Ok(if card.provider.id == a.provider.id {
+                    adapter_a.clone()
+                } else {
+                    adapter_b.clone()
+                })
+            },
+        )
+        .unwrap();
+        assert!(budget_dispatch(&registry, &a, None).await.is_ok());
+        assert!(budget_dispatch(&registry, &b, None).await.is_err());
+        assert_eq!(adapter_a.load_call_count(&a.provider.id), 1);
+        assert_eq!(adapter_b.load_call_count(&b.provider.id), 0);
+        assert_eq!(
+            registry
+                .startup_capacity_snapshot()
+                .await
+                .unwrap()
+                .unwrap()
+                .reserved_gb,
+            1.0
+        );
+
+        // A real eviction unloads A, then a confirmed failed replacement releases its claim.
+        assert!(
+            budget_dispatch(&registry, &a, Some("replacement"))
+                .await
+                .is_err()
+        );
+        assert_eq!(adapter_a.unload_call_count(&a.provider.id), 1);
+        assert_eq!(adapter_a.load_call_count("replacement"), 1);
+        assert_eq!(
+            registry
+                .startup_capacity_snapshot()
+                .await
+                .unwrap()
+                .unwrap()
+                .reserved_gb,
+            0.0
+        );
+        assert!(budget_dispatch(&registry, &b, None).await.is_ok());
+        assert_eq!(adapter_b.load_call_count(&b.provider.id), 1);
+    }
+
+    #[tokio::test]
+    async fn allocated_budget_concurrent_dispatches_admit_only_one_adapter_load() {
+        let a = named_card("concurrent-a");
+        let b = named_card("concurrent-b");
+        let adapters: BTreeMap<_, _> = [&a, &b]
+            .into_iter()
+            .map(|card| {
+                let adapter = Arc::new(MockAdapter::new(vec![ModelInfo {
+                    id: card.provider.id.clone(),
+                    memory_gb: 1.0,
+                }]));
+                adapter.set_load_delay(&card.provider.id, std::time::Duration::from_millis(50));
+                (card.provider.id.clone(), adapter)
+            })
+            .collect();
+        let registry = RuntimeRegistry::spawn_with_factory_and_budget(
+            &[a.clone(), b.clone()],
+            Some(1_000_000_000),
+            |card| Ok(adapters[&card.provider.id].clone()),
+        )
+        .unwrap();
+        let (first, second) = tokio::join!(
+            budget_dispatch(&registry, &a, None),
+            budget_dispatch(&registry, &b, None),
+        );
+        assert_eq!(usize::from(first.is_ok()) + usize::from(second.is_ok()), 1);
+        let loads: u32 = adapters
+            .iter()
+            .map(|(id, adapter)| adapter.load_call_count(id))
+            .sum();
+        assert_eq!(loads, 1, "losing runtime must never call adapter.load");
+        assert_eq!(
+            registry
+                .startup_capacity_snapshot()
+                .await
+                .unwrap()
+                .unwrap()
+                .reserved_gb,
+            1.0
+        );
+    }
+
+    #[tokio::test]
+    async fn allocated_budget_cancelled_dispatch_retains_engine_residency_charge() {
+        let card = named_card("budget-cancel");
+        let adapter = Arc::new(MockAdapter::new(vec![ModelInfo {
+            id: card.provider.id.clone(),
+            memory_gb: 1.0,
+        }]));
+        adapter.set_load_delay(&card.provider.id, std::time::Duration::from_millis(50));
+        let registry = RuntimeRegistry::spawn_with_factory_and_budget(
+            std::slice::from_ref(&card),
+            Some(1_000_000_000),
+            |_| Ok(adapter.clone()),
+        )
+        .unwrap();
+        let task = {
+            let registry = registry.clone();
+            let card = card.clone();
+            tokio::spawn(async move { budget_dispatch(&registry, &card, None).await })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while adapter.load_call_count(&card.provider.id) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !registry
+                .get(&card.provider.id)
+                .unwrap()
+                .is_ready(&card.provider.id)
+                .await
+                .unwrap()
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            registry
+                .startup_capacity_snapshot()
+                .await
+                .unwrap()
+                .unwrap()
+                .reserved_gb,
+            1.0
+        );
+        assert_eq!(adapter.load_call_count(&card.provider.id), 1);
+        assert!(budget_dispatch(&registry, &card, None).await.is_ok());
+        assert_eq!(adapter.load_call_count(&card.provider.id), 1);
+    }
+
+    #[tokio::test]
+    async fn allocated_budget_positive_byte_boundaries_reach_adapter_only_when_admitted() {
+        for (bytes, memory_gb, admitted) in [
+            (1, 0.5e-9, true),
+            (125_000_000, 0.125, true),
+            (125_000_000, 0.125 + 0.5e-9, false),
+        ] {
+            let card = named_card("byte-boundary");
+            let adapter = Arc::new(MockAdapter::new(vec![ModelInfo {
+                id: card.provider.id.clone(),
+                memory_gb,
+            }]));
+            let registry = RuntimeRegistry::spawn_with_factory_and_budget(
+                std::slice::from_ref(&card),
+                Some(bytes),
+                |_| Ok(adapter.clone()),
+            )
+            .unwrap();
+            assert_eq!(
+                budget_dispatch(&registry, &card, None).await.is_ok(),
+                admitted
+            );
+            assert_eq!(
+                adapter.load_call_count(&card.provider.id),
+                u32::from(admitted)
+            );
+            let snapshot = registry.startup_capacity_snapshot().await.unwrap().unwrap();
+            assert!(snapshot.reserved_gb <= bytes as f64 / 1e9);
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_kill_switch_startup_sends_no_request_for_untrusted_omlx_http_cards() {
+        use idoris_contracts::common::PrivacyClass;
+        use idoris_contracts::provider::Locality;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        async fn startup_paths(mut card: ComponentCard, remote_kill_switch: bool) -> Vec<String> {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/api/status"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "loaded_models": [],
+                    "model_memory_used": 0,
+                    "model_memory_max": 0
+                })))
+                .mount(&server)
+                .await;
+            card.endpoint = server.uri();
+            let registry = RuntimeRegistry::spawn_with_local_configs_budget_and_kill_switch(
+                std::slice::from_ref(&card),
+                &BTreeMap::new(),
+                None,
+                remote_kill_switch,
+            )
+            .unwrap();
+            let _ = registry
+                .get(&card.provider.id)
+                .expect("omlx http card spawns a lifecycle runtime")
+                .status()
+                .await;
+            server
+                .received_requests()
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|request| request.url.path().to_string())
+                .collect()
+        }
+
+        let mut privacy_any_loopback = card();
+        privacy_any_loopback.privacy_class = PrivacyClass::Any;
+        privacy_any_loopback.provider.privacy_class = PrivacyClass::Any;
+        let mut lan = card();
+        lan.provider.locality = Locality::Lan;
+
+        for untrusted in [privacy_any_loopback, lan] {
+            let suppressed = startup_paths(untrusted.clone(), true).await;
+            assert!(
+                suppressed.is_empty(),
+                "kill switch on must send 0 requests, including /api/status, got {suppressed:?}"
+            );
+            let open = startup_paths(untrusted, false).await;
+            assert!(
+                open.iter().any(|path| path == "/api/status"),
+                "kill switch off must probe /api/status, got {open:?}"
+            );
+        }
+
+        let trusted = startup_paths(card(), true).await;
+        assert!(
+            trusted.iter().any(|path| path == "/api/status"),
+            "trusted loopback omlx card must still be probed, got {trusted:?}"
+        );
+    }
+    #[tokio::test]
+    async fn allocated_budget_none_preserves_default_load_behavior() {
+        let card = named_card("budget-default");
+        let adapter = Arc::new(MockAdapter::new(vec![ModelInfo {
+            id: card.provider.id.clone(),
+            // The historical positive-budget epsilon still applies for None.
+            memory_gb: SupervisorConfig::default().budget_gb + 500e-9,
+        }]));
+        let registry = RuntimeRegistry::spawn_with_factory_and_budget(
+            std::slice::from_ref(&card),
+            None,
+            |_| Ok(adapter.clone()),
+        )
+        .unwrap();
+        assert!(budget_dispatch(&registry, &card, None).await.is_ok());
+        let snapshot = registry.startup_capacity_snapshot().await.unwrap().unwrap();
+        assert_eq!(snapshot.budget_gb, SupervisorConfig::default().budget_gb);
+        assert!(snapshot.reserved_gb > snapshot.budget_gb);
+        assert!(snapshot.reserved_gb <= snapshot.budget_gb + 1e-6);
+        assert_eq!(adapter.load_call_count(&card.provider.id), 1);
     }
 
     #[tokio::test]
@@ -340,6 +838,7 @@ mod tests {
                 ("b".into(), mock_bound(&b)),
             ]),
             startup_capacity: None,
+            ready_snapshot_calls: Arc::default(),
         };
         for card in [&a, &b] {
             let outcome = dispatch_local(
@@ -359,6 +858,75 @@ mod tests {
             let response = outcome.result.unwrap();
             assert_eq!(response.model, card.provider.id);
         }
+    }
+
+    #[tokio::test]
+    async fn exact_ready_snapshot_requires_the_requested_model_to_be_ready() {
+        let card = named_card("runtime-b");
+        let adapter = Arc::new(MockAdapter::new(vec![ModelInfo {
+            id: "target".into(),
+            memory_gb: 1.0,
+        }]));
+        let handle = Supervisor::spawn(adapter, SupervisorConfig::default()).unwrap();
+        handle
+            .load("target", 1.0, card.load_policy.unwrap())
+            .await
+            .unwrap();
+        let registry = RuntimeRegistry::from(BoundSupervisor::new(&card, handle));
+
+        let ready = registry
+            .exact_ready_providers(vec![
+                ("runtime-b".into(), "target".into()),
+                ("runtime-b".into(), "other".into()),
+            ])
+            .await;
+        assert_eq!(ready, ["runtime-b".to_string()].into());
+    }
+
+    #[tokio::test]
+    async fn startup_inherited_residency_is_not_claimed_as_chat_ready() {
+        let card = named_card("runtime-b");
+        let adapter = Arc::new(MockAdapter::new(vec![ModelInfo {
+            id: "target".into(),
+            memory_gb: 1.0,
+        }]));
+        adapter
+            .load("target", card.load_policy.as_ref())
+            .await
+            .unwrap();
+        let handle = Supervisor::spawn(adapter, SupervisorConfig::default()).unwrap();
+        let registry = RuntimeRegistry::from(BoundSupervisor::new(&card, handle));
+
+        assert!(
+            registry
+                .exact_ready_providers(vec![("runtime-b".into(), "target".into())])
+                .await
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn readiness_query_errors_are_neutral_for_affinity() {
+        assert!(!ready_for_affinity(Err(BackendError::internal(
+            "readiness unavailable"
+        ))));
+    }
+
+    #[tokio::test]
+    async fn resident_direct_path_never_receives_lifecycle_readiness_boost() {
+        let mut resident = named_card("resident");
+        resident.load_policy.as_mut().unwrap().mode = LoadMode::Resident;
+        let registry = RuntimeRegistry::spawn_with_factory(std::slice::from_ref(&resident), |_| {
+            panic!("Resident direct path must not construct a lifecycle runtime")
+        })
+        .unwrap();
+
+        assert!(
+            registry
+                .exact_ready_providers(vec![("resident".into(), "resident".into())])
+                .await
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -425,15 +993,50 @@ mod tests {
             18111,
         )
         .unwrap();
+        let fences = tempfile::tempdir().unwrap();
         let config = LocalHttpRuntimeConfig::new(
             launch,
             "local-http",
             2.0,
-            "/tmp/idoris/local-http.pending".into(),
+            fences.path().join("default.pending"),
         )
         .unwrap();
-        let configs = BTreeMap::from([("local-http".to_string(), config)]);
+        let mut configs = BTreeMap::from([("local-http".to_string(), config)]);
         assert!(RuntimeRegistry::spawn_with_local_configs(&[custom.clone()], &configs).is_ok());
+        configs.get_mut("local-http").unwrap().load_fence_path =
+            fences.path().join("allocated.pending");
+        let allocated = RuntimeRegistry::spawn_with_local_configs_and_budget(
+            std::slice::from_ref(&custom),
+            &configs,
+            Some(1_000_000_000),
+        )
+        .unwrap();
+        assert_eq!(
+            allocated
+                .startup_capacity_snapshot()
+                .await
+                .unwrap()
+                .unwrap()
+                .budget_gb,
+            1.0
+        );
+        assert_eq!(
+            allocated
+                .get("local-http")
+                .unwrap()
+                .status()
+                .await
+                .unwrap()
+                .model_memory_max_gb,
+            1.0
+        );
+        let outcome = budget_dispatch(&allocated, &custom, None).await;
+        assert!(matches!(
+            outcome,
+            Err(DispatchFailure::Backend(
+                BackendError::EvictionImpossible { .. }
+            ))
+        ));
 
         custom.endpoint = "http://127.0.0.1:19999".into();
         assert!(RuntimeRegistry::spawn_with_local_configs(&[custom], &configs).is_err());
