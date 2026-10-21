@@ -50,8 +50,8 @@ case "$mode" in
       while :; do sleep 1; done
     ' sh "$marker" &
     child=$!
-    write_marker "parent:$$:$(ps -o pgid= -p $$ | tr -d ' ')"
     trap 'wait "$child" 2>/dev/null || true; exit 0' TERM INT
+    write_marker "parent:$$:$(ps -o pgid= -p $$ | tr -d ' ')"
     wait "$child"
     ;;
   ignore-term)
