@@ -730,6 +730,9 @@ async fn real_ambiguous_load_and_victim_panics_startup_upstream_and_victim_error
         FaultMode::LoadError(BackendError::Upstream {
             message: "unqualified load upstream".into(),
         }),
+        FaultMode::ChatError(BackendError::Upstream {
+            message: "HTTP 400".into(),
+        }),
     ] {
         let p = Arc::new(proxy());
         for _ in 0..3 {
@@ -771,12 +774,7 @@ async fn real_chat_panic_upstream_and_matching_typed_faults_count_wrong_ids_do_n
             },
         ]
     };
-    let mut faults = vec![
-        FaultMode::ChatPanic,
-        FaultMode::ChatError(BackendError::Upstream {
-            message: "chat upstream".into(),
-        }),
-    ];
+    let mut faults = vec![FaultMode::ChatPanic];
     for error in typed("native") {
         faults.extend([
             FaultMode::LoadError(error.clone()),

@@ -728,7 +728,9 @@ fn native_provider_outcome(
         AdapterPanicked { model_id, .. } if !loading && model_id == requested => {
             ProviderOutcome::Fault
         }
-        Upstream { .. } if !loading => ProviderOutcome::Fault,
+        // Unqualified Upstream has no HTTP status. Adapters fold 400 and 500
+        // into the same variant, so counting it would cool a healthy local
+        // runtime after two bad requests. Ignore it until a typed status exists.
         ModelUnavailable { model_id }
         | Oom { model_id }
         | ProbeTimedOut { model_id }
