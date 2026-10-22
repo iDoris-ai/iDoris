@@ -278,3 +278,84 @@ async fn chat_connect_failure_completes_the_attempt_without_charging() {
         assert_eq!(after.reserved_minor, before.reserved_minor);
     }
 }
+
+#[tokio::test]
+async fn chat_open_breaker_without_dispatch_never_records_completed() {
+    for (paid, streaming) in [(false, false), (false, true), (true, false)] {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(503).insert_header("Retry-After", "60"))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+        let proxy = proxy::ChatProxy::new(idoris_upstream::http_client().unwrap());
+        let body = serde_json::json!({"stream": streaming, "messages": [{"role":"user", "content":"attempt"}]});
+        let warmup = proxy.forward_stream(&upstream.uri(), &body).await;
+        drop(warmup);
+        let mut card = super::tests::resident_component_card("proxy", &upstream.uri());
+        if paid {
+            card.provider.cost = super::tests::paid_component_card("proxy").provider.cost;
+        }
+        let parsed = profile::parse_profile(
+            &HeaderMap::new(),
+            None,
+            idoris_contracts::DeployMode::Personal,
+        )
+        .unwrap();
+        let selected = dispatch::select(&[card], &parsed, "attempt").unwrap();
+        let (_dir, ledger) = super::tests::configured_budget_ledger(1_000_000);
+        let state = AppState {
+            proxy: Arc::new(proxy),
+            budget_ledger: Some(Arc::new(ledger)),
+            ..AppState::default()
+        };
+        let log = memory_event_log();
+        let dispatched = DispatchedEventContext {
+            event_log: log.clone(),
+            tenant_id: budget::PERSONAL_TENANT_ID.into(),
+            record_id: "preflight".into(),
+            correlation: correlation::RequestCorrelation::default(),
+        };
+        let completed = CompletedEventContext {
+            event_log: log.clone(),
+            tenant_id: budget::PERSONAL_TENANT_ID.into(),
+            record_id: "preflight".into(),
+            correlation: correlation::RequestCorrelation::default(),
+        };
+        let contexts = ProxyEventContexts {
+            dispatched: Some(&dispatched),
+            completed: Some(&completed),
+        };
+        let response = if streaming {
+            chat_via_proxy_stream(&state, &selected, &body, contexts).await
+        } else {
+            let mut reservation = dispatch::ReservationGuard::reserve(
+                state.budget_ledger.as_deref(),
+                None,
+                &selected.card.provider.id,
+                selected.estimated_cost_minor,
+            )
+            .unwrap();
+            chat_via_proxy_buffered(
+                &state,
+                &selected,
+                &HeaderMap::new(),
+                &parsed,
+                &body,
+                "preflight",
+                contexts,
+                &mut reservation,
+            )
+            .await
+        };
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(!response.headers().contains_key(HEADER_COST_MINOR));
+        assert!(
+            log.events_for_record(Some(budget::PERSONAL_TENANT_ID), "preflight")
+                .unwrap()
+                .is_empty(),
+            "paid={paid} streaming={streaming}"
+        );
+        upstream.verify().await;
+    }
+}
