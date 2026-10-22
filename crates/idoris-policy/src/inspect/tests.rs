@@ -1371,6 +1371,32 @@ fn findings_of_view(normalized: &super::normalize::Normalized) -> Vec<(FindingKi
         .collect()
 }
 
+/// Adjacent Nd digits must not hide the ID. Only U+FF10 is folded;
+/// Tamil and Arabic-Indic digits stay non-ASCII and are a boundary
+/// in the raw view, not a fold.
+#[test]
+fn normalized_bmp_decimal_neighbours_follow_current_folding() {
+    let id = "110105195001010004";
+    for digit in ['\u{0BE6}', '\u{FF10}', '\u{0660}'] {
+        for input in [format!("{digit}{id}"), format!("{id}{digit}")] {
+            let response = inspect(&input, &open_ctx());
+            assert!(
+                kinds(&response).contains(&FindingKind::CnResidentId),
+                "{input}: {response:?}"
+            );
+        }
+        let input = format!("{digit}:\u{8eab}\u{4efd}\u{8bc1}{id}!{digit}");
+        let response = inspect(&input, &open_ctx());
+        assert!(
+            response
+                .findings
+                .iter()
+                .any(|f| { f.kind == FindingKind::CnResidentId && covered(&input, f) == id }),
+            "{input}: {response:?}"
+        );
+    }
+}
+
 proptest! {
     /// The union must never be looser than *any* of the three views, and it must
     /// keep every entity each view found. Generated inputs deliberately mix the
