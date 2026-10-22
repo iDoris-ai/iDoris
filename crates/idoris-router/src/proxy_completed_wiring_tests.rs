@@ -157,6 +157,7 @@ async fn buffered_proxy_cache_replay_does_not_record_completed() {
         ))
         .await
         .unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
     assert_eq!(completed(&events(&event_log, &first)).len(), 1);
     let cached = app
         .oneshot(super::tests::post_chat(
@@ -166,7 +167,9 @@ async fn buffered_proxy_cache_replay_does_not_record_completed() {
         .await
         .unwrap();
     assert_eq!(cached.status(), StatusCode::OK);
+    assert_eq!(cached.headers().get(HEADER_CACHED).unwrap(), "true");
     assert_eq!(completed(&events(&event_log, &cached)).len(), 0);
+    upstream.verify().await;
 }
 
 #[tokio::test]
@@ -223,6 +226,63 @@ async fn paid_completed_append_failure_preserves_settled_response_with_and_witho
         let after = ledger.tenant_readview(budget::PERSONAL_TENANT_ID).unwrap();
         assert!(after.spent_minor > before.spent_minor);
         assert_eq!(after.reserved_minor, before.reserved_minor);
+        upstream.verify().await;
+    }
+}
+
+#[tokio::test]
+async fn free_chat_completion_failure_cannot_publish_a_cached_success() {
+    for request_id in [None, Some("free-completed-failure")] {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok":true})))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = dir.path().join("events.sqlite3");
+        let log = Arc::new(EventLogStore::open(&db).unwrap());
+        Connection::open(&db)
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER reject_completed BEFORE INSERT ON event_log_events \
+             WHEN NEW.event_type='completed' BEGIN SELECT RAISE(ABORT,'failure'); END;",
+            )
+            .unwrap();
+        let app = build_app(AppState {
+            cards: vec![super::tests::resident_component_card(
+                "free",
+                &upstream.uri(),
+            )],
+            event_log: Some(log.clone()),
+            ..AppState::default()
+        });
+        let headers = request_id
+            .map(|id| vec![(HEADER_REQUEST_ID, id)])
+            .unwrap_or_default();
+        let request = || {
+            super::tests::post_chat(
+                r#"{"messages":[{"role":"user","content":"same"}]}"#,
+                &headers,
+            )
+        };
+        let first = app.clone().oneshot(request()).await.unwrap();
+        assert_eq!(first.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            events(&log, &first).last().unwrap().event.event_type,
+            EventType::Dispatched
+        );
+        assert!(!first.headers().contains_key(HEADER_CACHED));
+        assert!(!first.headers().contains_key(HEADER_COST_MINOR));
+        if request_id.is_some() {
+            let replay = app.oneshot(request()).await.unwrap();
+            assert_eq!(replay.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert!(!replay.headers().contains_key(HEADER_CACHED));
+            assert!(events(&log, &replay).iter().all(|e| !matches!(
+                e.event.event_type,
+                EventType::Dispatched | EventType::Completed
+            )));
+        }
         upstream.verify().await;
     }
 }
