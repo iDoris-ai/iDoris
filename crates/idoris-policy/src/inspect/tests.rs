@@ -149,6 +149,31 @@ fn bank_card_requires_luhn() {
 }
 
 #[test]
+fn card_subwindows_stay_when_a_four_digit_neighbour_follows() {
+    let year = inspect("6222.0212.3456.7894 2028", &open_ctx());
+    assert_eq!(year.action, InspectAction::Block);
+    assert_eq!(
+        year.findings,
+        [InspectFinding {
+            kind: FindingKind::BankCard,
+            span: Some(InspectSpan {
+                start: 0,
+                length: 19
+            }),
+        }]
+    );
+    let pair = inspect("4111 1111 1111 1111 5500 0000 0000 0004", &open_ctx());
+    assert_eq!(
+        pair.findings
+            .iter()
+            .filter(|finding| finding.kind == FindingKind::BankCard)
+            .count(),
+        2,
+        "{pair:?}"
+    );
+}
+
+#[test]
 fn adjacent_entities_merged_into_one_group_are_each_found() {
     let input = "电话 13812345678 6222021234567894 结束";
     let response = inspect(input, &open_ctx());
