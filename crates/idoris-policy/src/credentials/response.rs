@@ -120,6 +120,58 @@ mod tests {
         );
         assert_eq!(guard.check(&[], b"ordinary result"), Ok("ordinary result"));
         assert_eq!(source.0.get(), 1);
+        assert_eq!(
+            guard.check(&[], "ordinary\u{200b}-secret".as_bytes()),
+            Err(ResponseBlocked)
+        );
+        assert_eq!(
+            guard.check(&[], "\u{ff4f}rdinary-secret".as_bytes()),
+            Err(ResponseBlocked)
+        );
+    }
+
+    #[test]
+    fn empty_or_control_secret_is_unavailable_and_headers_stay() {
+        for bad in ["", "a\r\nb", "a\tb", "a\u{007f}b"] {
+            struct Bad(String);
+            impl SecretSource for Bad {
+                fn reveal(&self, _: &SecretRef) -> Result<Secret, CredentialError> {
+                    Ok(Secret::new(self.0.clone()))
+                }
+            }
+            let secret = SecretRef::parse("secret://openai/default").unwrap();
+            let grant = Grant {
+                secret: secret.clone(),
+                host: "api.openai.com".into(),
+                methods: vec!["POST".into()],
+                path_prefix: "/v1/chat".into(),
+                header: "Authorization".into(),
+                scheme: HeaderScheme::Bearer,
+            };
+            let request = BrokerRequest {
+                secret: &secret,
+                url: "https://api.openai.com/v1/chat",
+                method: "POST",
+            };
+            let mut headers = vec![("authorization".into(), "caller-key".into())];
+            assert!(
+                matches!(
+                    broker_guarded(&[grant], &Bad(bad.into()), &request, &mut headers),
+                    Err(CredentialError::Unavailable)
+                ),
+                "{bad:?}"
+            );
+            assert_eq!(headers, [("authorization".into(), "caller-key".into())]);
+        }
+    }
+
+    #[test]
+    fn unicode_escape_markers_are_not_optional() {
+        let guard = ResponseGuard::new("ab1234cd".into());
+        assert_eq!(guard.check(&[], b"ab1234cd"), Err(ResponseBlocked));
+        let hyphen = ResponseGuard::new("ab-cd".into());
+        assert_eq!(hyphen.check(&[], b"abXu002dcd"), Ok("abXu002dcd"));
+        assert_eq!(hyphen.check(&[], b"ab\\X002dcd"), Ok("ab\\X002dcd"));
     }
 
     #[test]
