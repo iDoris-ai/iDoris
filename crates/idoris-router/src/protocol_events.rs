@@ -123,4 +123,11 @@ impl ProtocolEvents {
             correlation: self.correlation.clone(),
         }
     }
+
+    pub(crate) async fn completed_failure(&self, selected: &Selected) -> Result<(), ()> {
+        if !self.dispatched.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        append_completed(&self.completed_context(), selected, "failure").await
+    }
 }
