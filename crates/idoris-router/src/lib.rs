@@ -633,16 +633,19 @@ fn model_resolution_error(error: DispatchError) -> Response {
 }
 
 /// Effective privacy for a protocol endpoint body after gate one.
-fn protocol_inspected_privacy(
+async fn protocol_inspected_privacy(
     state: &AppState,
     value: &serde_json::Value,
+    raw_len: usize,
     parsed: &profile::ParsedProfile,
 ) -> PrivacyClass {
-    inspect::inspect_body(
+    inspect::inspect_body_on_request_path(
         value,
+        raw_len,
         parsed.task.privacy.unwrap_or(PrivacyClass::LocalOnly),
         state.remote_kill_switch.load(Ordering::SeqCst),
     )
+    .await
     .effective
 }
 
@@ -705,7 +708,8 @@ async fn embeddings(
     };
     // INSPECTED (M5-07): same gate as chat, after the key scope admitted
     // the declared privacy and before the routing policy reads it.
-    parsed.task.privacy = Some(protocol_inspected_privacy(&state, &value, &parsed));
+    parsed.task.privacy =
+        Some(protocol_inspected_privacy(&state, &value, body.len(), &parsed).await);
 
     let cards = dispatch::policy_cards(&state.cards, &state.routing_policy, &parsed)
         .cards
@@ -911,7 +915,8 @@ async fn rerank(
     };
     // INSPECTED (M5-07): same gate as chat, after the key scope admitted
     // the declared privacy and before the routing policy reads it.
-    parsed.task.privacy = Some(protocol_inspected_privacy(&state, &value, &parsed));
+    parsed.task.privacy =
+        Some(protocol_inspected_privacy(&state, &value, body.len(), &parsed).await);
 
     let cards = dispatch::policy_cards(&state.cards, &state.routing_policy, &parsed)
         .cards
@@ -1117,7 +1122,8 @@ async fn messages(
     }
     // INSPECTED (M5-07): same gate as chat, after the key scope admitted
     // the declared privacy and before the routing policy reads it.
-    parsed.task.privacy = Some(protocol_inspected_privacy(&state, &value, &parsed));
+    parsed.task.privacy =
+        Some(protocol_inspected_privacy(&state, &value, body.len(), &parsed).await);
 
     let cards = dispatch::policy_cards(&state.cards, &state.routing_policy, &parsed)
         .cards
@@ -2396,11 +2402,13 @@ async fn chat_completions(
     // INSPECTED: after the key scope admitted the declared privacy, before
     // profiling, routing policy, or a remote intent detector can see `any`.
     let mut parsed = parsed;
-    let inspection = inspect::inspect_body(
+    let inspection = inspect::inspect_body_on_request_path(
         &value,
+        body.len(),
         parsed.task.privacy.unwrap_or(PrivacyClass::LocalOnly),
         state.remote_kill_switch.load(Ordering::SeqCst),
-    );
+    )
+    .await;
     if let Some((event_log, tenant_id)) = event_context.as_ref()
         && inspect::append_inspected(
             event_log.clone(),
