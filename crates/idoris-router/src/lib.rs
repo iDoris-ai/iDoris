@@ -3068,6 +3068,15 @@ async fn chat_via_proxy_buffered(
             .await
     };
     let Ok(outcome) = outcome else {
+        // A returned pre-send observer error stopped the POST. Release its
+        // paid reservation; cancellation continues to retain uncertain work.
+        if is_paid && reservation.release_now().is_err() {
+            return error_envelope(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+                "付费上游预算预留释放失败",
+            );
+        }
         return event_log_unavailable_response();
     };
 
