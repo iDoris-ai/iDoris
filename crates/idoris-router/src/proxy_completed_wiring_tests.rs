@@ -226,3 +226,55 @@ async fn paid_completed_append_failure_preserves_settled_response_with_and_witho
         upstream.verify().await;
     }
 }
+
+#[tokio::test]
+async fn chat_connect_failure_completes_the_attempt_without_charging() {
+    for (paid, streaming) in [(false, false), (false, true), (true, false)] {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let mut card = super::tests::resident_component_card("proxy", &endpoint);
+        if paid {
+            card.provider.cost = super::tests::paid_component_card("proxy").provider.cost;
+        }
+        let (_dir, ledger) = super::tests::configured_budget_ledger(1_000_000);
+        let ledger = Arc::new(ledger);
+        let before = ledger.tenant_readview(budget::PERSONAL_TENANT_ID).unwrap();
+        let log = memory_event_log();
+        let app = build_app(AppState {
+            cards: vec![card],
+            event_log: Some(log.clone()),
+            budget_ledger: Some(ledger.clone()),
+            proxy: Arc::new(proxy::ChatProxy::with_config(
+                idoris_upstream::http_client().unwrap(),
+                std::time::Duration::from_secs(60),
+                vec![],
+            )),
+            ..AppState::default()
+        });
+        let body = format!(
+            r#"{{"stream":{streaming},"messages":[{{"role":"user","content":"attempt"}}]}}"#
+        );
+        drop(listener);
+        let response = app
+            .oneshot(super::tests::post_chat(&body, &[]))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_GATEWAY,
+            "{paid} {streaming}"
+        );
+        let chain = events(&log, &response);
+        assert_eq!(
+            chain.last().unwrap().event.event_type,
+            EventType::Completed,
+            "{paid} {streaming}: {chain:?}"
+        );
+        assert_eq!(completed(&chain).len(), 1);
+        assert_eq!(completed(&chain)[0].event.metadata["status"], "failure");
+        assert!(!response.headers().contains_key(HEADER_COST_MINOR));
+        let after = ledger.tenant_readview(budget::PERSONAL_TENANT_ID).unwrap();
+        assert_eq!(after.spent_minor, before.spent_minor);
+        assert_eq!(after.reserved_minor, before.reserved_minor);
+    }
+}
