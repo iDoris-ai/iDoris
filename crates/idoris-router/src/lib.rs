@@ -2815,6 +2815,7 @@ async fn chat_via_proxy_stream(
     body_value: &serde_json::Value,
     events: ProxyEventContexts<'_>,
 ) -> Response {
+    let dispatched = AtomicBool::new(false);
     let outcome = state
         .proxy
         .forward_stream_observed(
@@ -2824,6 +2825,7 @@ async fn chat_via_proxy_stream(
             || async {
                 if let Some(context) = events.dispatched {
                     append_dispatched(context, selected).await?;
+                    dispatched.store(true, Ordering::Release);
                 }
                 Ok::<(), ()>(())
             },
@@ -2840,7 +2842,8 @@ async fn chat_via_proxy_stream(
             execution,
         } => {
             let status = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
-            if execution != proxy::ExecutionDisposition::NotExecuted
+            if dispatched.load(Ordering::Acquire)
+                && execution != proxy::ExecutionDisposition::Replay
                 && let Some(context) = events.completed
                 && append_completed(context, selected, "failure")
                     .await
@@ -3008,6 +3011,7 @@ async fn chat_via_proxy_buffered(
         reservation.retain_on_drop();
     }
     let mut paid_settlement = None;
+    let dispatched = AtomicBool::new(false);
     let outcome = if is_paid {
         state
             .proxy
@@ -3051,6 +3055,7 @@ async fn chat_via_proxy_buffered(
                 || async {
                     if let Some(context) = events.dispatched {
                         append_dispatched(context, selected).await?;
+                        dispatched.store(true, Ordering::Release);
                     }
                     Ok::<(), ()>(())
                 },
@@ -3062,6 +3067,7 @@ async fn chat_via_proxy_buffered(
             .forward_buffered_observed(&selected.card.endpoint, body_value, &opts, || async {
                 if let Some(context) = events.dispatched {
                     append_dispatched(context, selected).await?;
+                    dispatched.store(true, Ordering::Release);
                 }
                 Ok::<(), ()>(())
             })
@@ -3107,8 +3113,8 @@ async fn chat_via_proxy_buffered(
     }
 
     let status = StatusCode::from_u16(outcome.status).unwrap_or(StatusCode::BAD_GATEWAY);
-    if !outcome.cached
-        && outcome.execution != proxy::ExecutionDisposition::NotExecuted
+    if dispatched.load(Ordering::Acquire)
+        && !outcome.cached
         && outcome.execution != proxy::ExecutionDisposition::Replay
         && let Some(context) = events.completed
     {
