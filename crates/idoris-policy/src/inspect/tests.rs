@@ -1306,6 +1306,29 @@ fn normalized_fullwidth_neighbours_follow_current_folding() {
     }
 }
 
+#[test]
+fn mathematical_digit_neighbour_does_not_hide_the_id() {
+    let id = "110105195001010004";
+    let digit = "\u{1D7CE}";
+    for input in [format!("{digit}{id}"), format!("{id}{digit}")] {
+        let response = inspect(&input, &open_ctx());
+        assert!(
+            response.findings.iter().any(|finding| {
+                finding.kind == FindingKind::CnResidentId && covered(&input, finding) == id
+            }),
+            "{input}: {response:?}"
+        );
+    }
+    let input = format!("{digit}:\u{8eab}\u{4efd}\u{8bc1}{id}!{digit}");
+    let response = inspect(&input, &open_ctx());
+    assert!(
+        response.findings.iter().any(|finding| {
+            finding.kind == FindingKind::CnResidentId && covered(&input, finding) == id
+        }),
+        "{input}: {response:?}"
+    );
+}
+
 fn sensitivity_rank(sensitivity: Sensitivity) -> u8 {
     match sensitivity {
         Sensitivity::S0 => 0,
