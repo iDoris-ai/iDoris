@@ -99,7 +99,9 @@ fn decode_json_escapes(input: &str) -> String {
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] != b'\\' || i + 1 == bytes.len() {
-            let ch = input[i..].chars().next().expect("valid UTF-8 boundary");
+            let Some(ch) = input[i..].chars().next() else {
+                break;
+            };
             out.push(ch);
             i += ch.len_utf8();
             continue;
@@ -198,10 +200,10 @@ fn encoded_contains(input: &[u8], credential: &[u16]) -> bool {
                 if contains_seq(&decoded, bytes) {
                     return true;
                 }
-                if let Ok(text) = std::str::from_utf8(&decoded) {
-                    if normalized_contains(text, credential) {
-                        return true;
-                    }
+                if let Ok(text) = std::str::from_utf8(&decoded)
+                    && normalized_contains(text, credential)
+                {
+                    return true;
                 }
             }
             for shift in 0..4.min(token.len()) {
@@ -209,10 +211,10 @@ fn encoded_contains(input: &[u8], credential: &[u16]) -> bool {
                     if contains_seq(&decoded, bytes) {
                         return true;
                     }
-                    if let Ok(text) = std::str::from_utf8(&decoded) {
-                        if normalized_contains(text, credential) {
-                            return true;
-                        }
+                    if let Ok(text) = std::str::from_utf8(&decoded)
+                        && normalized_contains(text, credential)
+                    {
+                        return true;
                     }
                 }
             }
