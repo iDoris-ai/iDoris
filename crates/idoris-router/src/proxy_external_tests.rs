@@ -922,6 +922,97 @@ async fn real_chat_panic_upstream_and_matching_typed_faults_count_wrong_ids_do_n
 }
 
 #[tokio::test]
+async fn real_local_model_faults_lock_out_while_ignored_results_preserve_prior_faults() {
+    let matching = FaultMode::ChatError(BackendError::ModelUnavailable {
+        model_id: "native".into(),
+    });
+    let p = Arc::new(proxy());
+    for _ in 0..2 {
+        let app = fault_app(p.clone(), matching.clone()).await;
+        assert_ne!(app.oneshot(native_request()).await.unwrap().status(), 200);
+    }
+    assert_eq!(
+        ready(&p, "native", CredentialClass::Local, 0),
+        Admission::Rejected {
+            retry_after_ms: 15_000,
+        },
+        "two matching Supervisor model failures open the local breaker"
+    );
+
+    clock(&p, 15_000);
+    let app = fault_app(p.clone(), matching).await;
+    assert_ne!(app.oneshot(native_request()).await.unwrap().status(), 200);
+    assert_eq!(
+        ready(&p, "native", CredentialClass::Local, 15_000),
+        Admission::Rejected {
+            retry_after_ms: 15_000,
+        },
+        "a failed real Supervisor probe starts a fresh full local recovery window"
+    );
+    assert_eq!(
+        ready(&p, "native", CredentialClass::Local, 29_999),
+        Admission::Rejected { retry_after_ms: 1 }
+    );
+    assert_eq!(
+        ready(&p, "native", CredentialClass::Local, 30_000),
+        Admission::Probe
+    );
+
+    for ignored in [
+        FaultMode::ChatError(BackendError::ModelUnavailable {
+            model_id: "another-model".into(),
+        }),
+        FaultMode::ChatError(BackendError::EvictionFailed {
+            model_id: "native".into(),
+        }),
+    ] {
+        let p = Arc::new(proxy());
+        let app = fault_app(
+            p.clone(),
+            FaultMode::ChatError(BackendError::ModelUnavailable {
+                model_id: "native".into(),
+            }),
+        )
+        .await;
+        assert_ne!(app.oneshot(native_request()).await.unwrap().status(), 200);
+        assert_eq!(
+            ready(&p, "native", CredentialClass::Local, 0),
+            Admission::Allowed,
+            "one matching failure is below the local threshold"
+        );
+
+        let app = fault_app(p.clone(), ignored.clone()).await;
+        assert_ne!(app.oneshot(native_request()).await.unwrap().status(), 200);
+        let app = fault_app(
+            p.clone(),
+            FaultMode::ChatError(BackendError::ModelUnavailable {
+                model_id: "native".into(),
+            }),
+        )
+        .await;
+        assert_ne!(app.oneshot(native_request()).await.unwrap().status(), 200);
+        assert_eq!(
+            ready(&p, "native", CredentialClass::Local, 0),
+            Admission::Rejected {
+                retry_after_ms: 15_000,
+            },
+            "ignored outcome must preserve the previous matching failure: {ignored:?}"
+        );
+
+        clock(&p, 15_000);
+        let app = fault_app(p.clone(), ignored.clone()).await;
+        assert_ne!(app.oneshot(native_request()).await.unwrap().status(), 200);
+        assert_eq!(
+            ready(&p, "native", CredentialClass::Local, 15_000),
+            Admission::Rejected {
+                retry_after_ms: 15_000,
+            },
+            "ignored probe must release ownership as failure, not clear lockout: {ignored:?}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn native_observer_failure_releases_probe_and_completed_observer_cannot_undo_success() {
     for completed in [false, true] {
         let p = proxy();
