@@ -74,6 +74,7 @@ mod usage;
 mod event_identifier;
 mod feedback;
 mod inspect;
+mod protocol_events;
 /// Direct HTTP forwarding for a generic `http_service` component card's
 /// `POST /v1/chat/completions` (R2-G) — retries, idempotency cache; wired
 /// into `chat_completions`/`AppState` below (see the module's own doc for
@@ -631,9 +632,7 @@ fn model_resolution_error(error: DispatchError) -> Response {
     }
 }
 
-/// Effective privacy for a protocol endpoint body after gate one
-/// ([`inspect::inspect_body`]). These endpoints keep no Event Log chain
-/// yet, so the verdict only tightens routing.
+/// Effective privacy for a protocol endpoint body after gate one.
 fn protocol_inspected_privacy(
     state: &AppState,
     value: &serde_json::Value,
@@ -693,6 +692,17 @@ async fn embeddings(
     {
         return response;
     }
+    let events = match protocol_events::ProtocolEvents::begin(
+        &state,
+        &headers,
+        parsed.tenant_id.as_deref(),
+        &record_id,
+    )
+    .await
+    {
+        Ok(events) => events,
+        Err(response) => return response,
+    };
     // INSPECTED (M5-07): same gate as chat, after the key scope admitted
     // the declared privacy and before the routing policy reads it.
     parsed.task.privacy = Some(protocol_inspected_privacy(&state, &value, &parsed));
@@ -772,15 +782,41 @@ async fn embeddings(
         privacy: parsed.task.privacy.unwrap_or(PrivacyClass::LocalOnly),
         require_openai_usage: false,
     };
-    let outcome = state
+    let dispatched = AtomicBool::new(false);
+    let dispatched_ref = &dispatched;
+    let events_ref = events.as_ref();
+    let selected_ref = &selected;
+    let outcome = match state
         .proxy
-        .forward_buffered_path(
+        .forward_buffered_path_finalized(
             &selected.card.endpoint,
             proxy::BufferedUpstreamPath::EMBEDDINGS,
             &value,
             &opts,
+            |_| Ok(()),
+            (
+                || async {
+                    if let Some(events) = events_ref {
+                        events.dispatched(selected_ref).await?;
+                        dispatched.store(true, Ordering::Release);
+                    }
+                    Ok::<(), ()>(())
+                },
+                |outcome| async move {
+                    if dispatched_ref.load(Ordering::Acquire)
+                        && let Some(events) = events_ref
+                    {
+                        events.completed(selected_ref, &outcome).await?;
+                    }
+                    Ok::<(), ()>(())
+                },
+            ),
         )
-        .await;
+        .await
+    {
+        Ok(outcome) => outcome,
+        Err(()) => return event_log_unavailable_response(),
+    };
     let status = StatusCode::from_u16(outcome.status).unwrap_or(StatusCode::BAD_GATEWAY);
     let mut response = (status, outcome.body).into_response();
     let content_type = outcome
@@ -862,6 +898,17 @@ async fn rerank(
     {
         return response;
     }
+    let events = match protocol_events::ProtocolEvents::begin(
+        &state,
+        &headers,
+        parsed.tenant_id.as_deref(),
+        &record_id,
+    )
+    .await
+    {
+        Ok(events) => events,
+        Err(response) => return response,
+    };
     // INSPECTED (M5-07): same gate as chat, after the key scope admitted
     // the declared privacy and before the routing policy reads it.
     parsed.task.privacy = Some(protocol_inspected_privacy(&state, &value, &parsed));
@@ -938,15 +985,41 @@ async fn rerank(
         privacy: parsed.task.privacy.unwrap_or(PrivacyClass::LocalOnly),
         require_openai_usage: false,
     };
-    let outcome = state
+    let dispatched = AtomicBool::new(false);
+    let dispatched_ref = &dispatched;
+    let events_ref = events.as_ref();
+    let selected_ref = &selected;
+    let outcome = match state
         .proxy
-        .forward_buffered_path(
+        .forward_buffered_path_finalized(
             &selected.card.endpoint,
             proxy::BufferedUpstreamPath::RERANK,
             &value,
             &opts,
+            |_| Ok(()),
+            (
+                || async {
+                    if let Some(events) = events_ref {
+                        events.dispatched(selected_ref).await?;
+                        dispatched.store(true, Ordering::Release);
+                    }
+                    Ok::<(), ()>(())
+                },
+                |outcome| async move {
+                    if dispatched_ref.load(Ordering::Acquire)
+                        && let Some(events) = events_ref
+                    {
+                        events.completed(selected_ref, &outcome).await?;
+                    }
+                    Ok::<(), ()>(())
+                },
+            ),
         )
-        .await;
+        .await
+    {
+        Ok(outcome) => outcome,
+        Err(()) => return event_log_unavailable_response(),
+    };
     let status = StatusCode::from_u16(outcome.status).unwrap_or(StatusCode::BAD_GATEWAY);
     let mut response = (status, outcome.body).into_response();
     let content_type = outcome
@@ -1111,6 +1184,17 @@ async fn messages(
         return messages_stream(&state, &selected, &value).await;
     }
 
+    let events = match protocol_events::ProtocolEvents::begin(
+        &state,
+        &headers,
+        parsed.tenant_id.as_deref(),
+        &record_id,
+    )
+    .await
+    {
+        Ok(events) => events,
+        Err(response) => return response,
+    };
     let opts = proxy::ForwardOpts {
         request_id: headers
             .get(HEADER_REQUEST_ID)
@@ -1122,15 +1206,41 @@ async fn messages(
         privacy: parsed.task.privacy.unwrap_or(PrivacyClass::LocalOnly),
         require_openai_usage: false,
     };
-    let outcome = state
+    let dispatched = AtomicBool::new(false);
+    let dispatched_ref = &dispatched;
+    let events_ref = events.as_ref();
+    let selected_ref = &selected;
+    let outcome = match state
         .proxy
-        .forward_buffered_path(
+        .forward_buffered_path_finalized(
             &selected.card.endpoint,
             proxy::BufferedUpstreamPath::MESSAGES,
             &value,
             &opts,
+            |_| Ok(()),
+            (
+                || async {
+                    if let Some(events) = events_ref {
+                        events.dispatched(selected_ref).await?;
+                        dispatched.store(true, Ordering::Release);
+                    }
+                    Ok::<(), ()>(())
+                },
+                |outcome| async move {
+                    if dispatched_ref.load(Ordering::Acquire)
+                        && let Some(events) = events_ref
+                    {
+                        events.completed(selected_ref, &outcome).await?;
+                    }
+                    Ok::<(), ()>(())
+                },
+            ),
         )
-        .await;
+        .await
+    {
+        Ok(outcome) => outcome,
+        Err(()) => return event_log_unavailable_response(),
+    };
     let status = StatusCode::from_u16(outcome.status).unwrap_or(StatusCode::BAD_GATEWAY);
     let mut response = (status, outcome.body).into_response();
     let content_type = outcome
@@ -3619,6 +3729,9 @@ mod budget_settled_wiring_tests;
 
 #[cfg(test)]
 mod proxy_completed_wiring_tests;
+
+#[cfg(test)]
+mod protocol_events_wiring_tests;
 
 #[cfg(test)]
 mod stream_completed_wiring_tests;

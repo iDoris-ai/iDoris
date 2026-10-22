@@ -990,6 +990,9 @@ impl ChatProxy {
         .await
     }
 
+    // These wrappers exist only for the generic-path unit test; runtime
+    // protocol callers use the finalized forwarding entry point directly.
+    #[cfg(test)]
     pub(crate) async fn forward_buffered_path(
         &self,
         endpoint: &str,
@@ -1025,6 +1028,7 @@ impl ChatProxy {
         .await
     }
 
+    #[cfg(test)]
     async fn forward_buffered_path_with_success_gate<F>(
         &self,
         endpoint: &str,
