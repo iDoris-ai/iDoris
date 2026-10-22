@@ -149,6 +149,18 @@ fn bank_card_requires_luhn() {
 }
 
 #[test]
+fn long_four_digit_column_is_not_a_sliding_card() {
+    let column = "4111 1111 1111 1111 2026 1305";
+    let response = inspect(column, &open_ctx());
+    assert!(
+        !kinds(&response).contains(&FindingKind::BankCard),
+        "{response:?}"
+    );
+    let alone = inspect("4111 1111 1111 1111", &open_ctx());
+    assert!(kinds(&alone).contains(&FindingKind::BankCard));
+}
+
+#[test]
 fn adjacent_entities_merged_into_one_group_are_each_found() {
     let input = "电话 13812345678 6222021234567894 结束";
     let response = inspect(input, &open_ctx());
