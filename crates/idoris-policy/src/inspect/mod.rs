@@ -71,43 +71,306 @@ impl InspectCtx {
     }
 }
 
-/// Compare a known credential after the same escape normalization used by L0.
+/// Compare a known credential in raw text, JSON-style escaped text, and one
+/// layer of common textual encodings. This deliberately does not recurse.
 pub(crate) fn contains_credential(input: &str, credential: &str) -> bool {
-    let input = decode_json_unicode_escapes(&input.encode_utf16().collect::<Vec<_>>());
-    let input = normalize::normalize(&input);
     let credential = normalize::normalize(&credential.encode_utf16().collect::<Vec<_>>());
-    credential.units.is_empty()
-        || input
-            .units
-            .windows(credential.units.len())
-            .any(|part| part == credential.units)
+    if credential.units.is_empty() {
+        return true;
+    }
+    let raw = input.as_bytes();
+    if normalized_contains(input, &credential.units) || encoded_contains(raw, &credential.units) {
+        return true;
+    }
+    let escaped = decode_json_escapes(input);
+    normalized_contains(&escaped, &credential.units)
+        || encoded_contains(escaped.as_bytes(), &credential.units)
 }
 
-/// A literal `\uXXXX` in JSON/JS source stands for that unit, so it can join a credential.
-fn decode_json_unicode_escapes(units: &[u16]) -> Vec<u16> {
-    let mut out = Vec::with_capacity(units.len());
-    let mut index = 0;
-    while index < units.len() {
-        if let Some(escaped) = json_unicode_escape(&units[index..]) {
-            out.push(escaped);
-            index += 6;
-        } else {
-            out.push(units[index]);
-            index += 1;
+fn normalized_contains(input: &str, credential: &[u16]) -> bool {
+    let input = normalize::normalize(&input.encode_utf16().collect::<Vec<_>>());
+    contains_seq(&input.units, credential)
+}
+
+/// Decode one JSON-style escape layer; malformed escapes remain literal.
+fn decode_json_escapes(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = String::with_capacity(input.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'\\' || i + 1 == bytes.len() {
+            let ch = input[i..].chars().next().expect("valid UTF-8 boundary");
+            out.push(ch);
+            i += ch.len_utf8();
+            continue;
+        }
+        match bytes[i + 1] {
+            b'/' => {
+                out.push('/');
+                i += 2;
+            }
+            b'\\' => {
+                out.push('\\');
+                i += 2;
+            }
+            b'"' => {
+                out.push('"');
+                i += 2;
+            }
+            b'u' if i + 6 <= bytes.len() => {
+                if let Some(first) = escaped_hex_unit(bytes, i + 2) {
+                    if (0xD800..=0xDBFF).contains(&first) && bytes.get(i + 6..i + 8) == Some(b"\\u")
+                    {
+                        if let Some(second) = escaped_hex_unit(bytes, i + 8)
+                            && (0xDC00..=0xDFFF).contains(&second)
+                        {
+                            let scalar = 0x1_0000
+                                + ((u32::from(first) - 0xD800) << 10)
+                                + (u32::from(second) - 0xDC00);
+                            if let Some(ch) = char::from_u32(scalar) {
+                                out.push(ch);
+                                i += 12;
+                                continue;
+                            }
+                        }
+                    } else if let Some(ch) = char::from_u32(u32::from(first)) {
+                        out.push(ch);
+                        i += 6;
+                        continue;
+                    }
+                }
+                out.push('\\');
+                i += 1;
+            }
+            _ => {
+                out.push('\\');
+                i += 1;
+            }
         }
     }
     out
 }
 
-fn json_unicode_escape(units: &[u16]) -> Option<u16> {
-    let window = units.get(..6)?;
-    if window[0] != u16::from(b'\\') || window[1] != u16::from(b'u') {
+fn escaped_hex_unit(bytes: &[u8], start: usize) -> Option<u16> {
+    bytes
+        .get(start..start + 4)?
+        .iter()
+        .try_fold(0u16, |value, byte| {
+            Some((value << 4) | u16::from(hex_value(*byte)?))
+        })
+}
+
+/// Match only one common encoding layer. Prefixes cannot shift the hex view.
+fn encoded_contains(input: &[u8], credential: &[u16]) -> bool {
+    let Ok(secret) = String::from_utf16(credential) else {
+        return false;
+    };
+    let bytes = secret.as_bytes();
+    let hex_len = bytes.len().saturating_mul(2);
+    if hex_len > 0 && hex_len <= input.len() {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut encoded = Vec::with_capacity(hex_len);
+        for byte in bytes {
+            encoded.push(HEX[usize::from(byte >> 4)]);
+            encoded.push(HEX[usize::from(byte & 15)]);
+        }
+        let lowered = input.iter().map(u8::to_ascii_lowercase).collect::<Vec<_>>();
+        if contains_seq(&lowered, &encoded) {
+            return true;
+        }
+    }
+    let mut start = 0;
+    while start < input.len() {
+        while start < input.len() && !is_encoded_member(input[start]) {
+            start += 1;
+        }
+        let begin = start;
+        while start < input.len() && is_encoded_member(input[start]) {
+            start += 1;
+        }
+        let mut end = start;
+        while end < input.len() && end - start < 2 && input[end] == b'=' {
+            end += 1;
+        }
+        if begin < start {
+            let token = &input[begin..end];
+            if let Some(decoded) = decode_hex_token(token) {
+                if contains_seq(&decoded, bytes) {
+                    return true;
+                }
+                if let Ok(text) = std::str::from_utf8(&decoded) {
+                    if normalized_contains(text, credential) {
+                        return true;
+                    }
+                }
+            }
+            for shift in 0..4.min(token.len()) {
+                if let Some(decoded) = decode_base64_token(&token[shift..]) {
+                    if contains_seq(&decoded, bytes) {
+                        return true;
+                    }
+                    if let Ok(text) = std::str::from_utf8(&decoded) {
+                        if normalized_contains(text, credential) {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        if end > start {
+            start = end;
+        }
+    }
+    percent_decoded(input).is_some_and(|decoded| {
+        contains_seq(&decoded, bytes)
+            || std::str::from_utf8(&decoded).is_ok_and(|text| normalized_contains(text, credential))
+    })
+}
+
+/// Linear-time exact substring matching, including long bounded fields.
+fn contains_seq<T: Eq>(haystack: &[T], needle: &[T]) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    let mut prefix = vec![0; needle.len()];
+    let mut matched = 0;
+    for i in 1..needle.len() {
+        while matched > 0 && needle[i] != needle[matched] {
+            matched = prefix[matched - 1];
+        }
+        if needle[i] == needle[matched] {
+            matched += 1;
+        }
+        prefix[i] = matched;
+    }
+    matched = 0;
+    for value in haystack {
+        while matched > 0 && *value != needle[matched] {
+            matched = prefix[matched - 1];
+        }
+        if *value == needle[matched] {
+            matched += 1;
+            if matched == needle.len() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn is_encoded_member(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b"+/_-".contains(&b)
+}
+
+fn decode_hex_token(token: &[u8]) -> Option<Vec<u8>> {
+    let token = token
+        .strip_prefix(b"0x")
+        .or_else(|| token.strip_prefix(b"0X"))
+        .unwrap_or(token);
+    if token.is_empty() || !token.len().is_multiple_of(2) {
         return None;
     }
-    window[2..].iter().try_fold(0u16, |acc, &unit| {
-        let digit = char::from_u32(u32::from(unit))?.to_digit(16)?;
-        Some(acc << 4 | u16::try_from(digit).ok()?)
-    })
+    token
+        .chunks_exact(2)
+        .map(|pair| Some(hex_value(pair[0])? << 4 | hex_value(pair[1])?))
+        .collect()
+}
+
+fn decode_base64_token(token: &[u8]) -> Option<Vec<u8>> {
+    let body = token
+        .strip_suffix(b"==")
+        .or_else(|| token.strip_suffix(b"="))
+        .unwrap_or(token);
+    if body.is_empty() || body.len() % 4 == 1 {
+        return None;
+    }
+    let mut output = Vec::with_capacity(body.len() * 3 / 4);
+    let (mut buffer, mut bits) = (0u32, 0u32);
+    for &b in body {
+        let value = match b {
+            b'A'..=b'Z' => b - b'A',
+            b'a'..=b'z' => b - b'a' + 26,
+            b'0'..=b'9' => b - b'0' + 52,
+            b'+' | b'-' => 62,
+            b'/' | b'_' => 63,
+            _ => return None,
+        };
+        buffer = (buffer << 6) | u32::from(value);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            output.push((buffer >> bits) as u8);
+            buffer &= (1 << bits) - 1;
+        }
+    }
+    Some(output)
+}
+
+fn percent_decoded(input: &[u8]) -> Option<Vec<u8>> {
+    let mut output = Vec::with_capacity(input.len());
+    let mut i = 0;
+    let mut escapes = 0;
+    while i < input.len() {
+        if input[i] == b'%' {
+            if let (Some(hi), Some(lo)) = (
+                input.get(i + 1).copied().and_then(hex_value),
+                input.get(i + 2).copied().and_then(hex_value),
+            ) {
+                output.push(hi << 4 | lo);
+                escapes += 1;
+                i += 3;
+            } else {
+                output.push(input[i]);
+                i += 1;
+            }
+        } else {
+            output.push(input[i]);
+            i += 1;
+        }
+    }
+    (escapes > 0).then_some(output)
+}
+
+fn hex_value(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod encoded_credential_tests {
+    use super::{contains_credential, decode_json_escapes, encoded_contains};
+
+    #[test]
+    fn exact_matcher_handles_prefixed_hex_and_binary_wrappers() {
+        let credential = "ordinary-secret".encode_utf16().collect::<Vec<_>>();
+        assert!(encoded_contains(
+            b"X-6f7264696e6172792d736563726574",
+            &credential
+        ));
+        assert!(encoded_contains(
+            b"prefix:QUFvcmRpbmFyeS1zZWNyZXRaWg==:suffix",
+            &credential
+        ));
+        assert!(encoded_contains(b"ordinary%2dsecret", &credential));
+        assert!(!encoded_contains(
+            b"X-6f7264696e6172792d726573756c74",
+            &credential
+        ));
+    }
+
+    #[test]
+    fn raw_and_json_simple_escape_views_are_both_compared() {
+        assert!(contains_credential("a/b", "a/b"));
+        assert!(contains_credential(r#"a\/b"#, "a/b"));
+        assert!(contains_credential(r#"a\\b"#, "a\\b"));
+        assert!(contains_credential(r#"a\"b"#, "a\"b"));
+        assert!(contains_credential(r#"\uD83D\uDE00"#, "😀"));
+        assert_eq!(decode_json_escapes(r#"a\/b"#), "a/b");
+    }
 }
 
 /// L0 的一条命中：类别、UTF-16 位置、这条命中自身的敏感度。

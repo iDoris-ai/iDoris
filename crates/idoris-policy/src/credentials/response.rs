@@ -175,6 +175,71 @@ mod tests {
     }
 
     #[test]
+    fn one_layer_encoded_echoes_are_blocked_in_body_and_headers() {
+        let guard = ResponseGuard::new("ordinary-secret".into());
+        let hex = "6f7264696e6172792d736563726574";
+        let base64 = "b3JkaW5hcnktc2VjcmV0";
+        let percent = "ordinary%2dsecret";
+        for encoded in [hex, base64, percent] {
+            assert_eq!(
+                guard.check(&[], encoded.as_bytes()),
+                Err(ResponseBlocked),
+                "{encoded}"
+            );
+            assert_eq!(
+                guard.check(&[(format!("X-{encoded}"), "ok".into())], b"ok"),
+                Err(ResponseBlocked),
+                "header name {encoded}"
+            );
+            assert_eq!(
+                guard.check(
+                    &[("X-Echo".into(), format!("prefix {encoded} suffix"))],
+                    b"ok"
+                ),
+                Err(ResponseBlocked),
+                "header value {encoded}"
+            );
+        }
+        // Known historical bypass: the X- prefix must not shift the hex view.
+        assert_eq!(
+            guard.check(&[], format!("X-{hex}").as_bytes()),
+            Err(ResponseBlocked)
+        );
+        let wrapped_base64 = "QUFvcmRpbmFyeS1zZWNyZXRaWg==";
+        assert_eq!(
+            guard.check(&[], wrapped_base64.as_bytes()),
+            Err(ResponseBlocked)
+        );
+    }
+
+    #[test]
+    fn encoded_echoes_cover_short_secrets_and_json_simple_escapes() {
+        let short = ResponseGuard::new("xy".into());
+        assert_eq!(short.check(&[], b"eHk="), Err(ResponseBlocked));
+        assert_eq!(short.check(&[], b"%78y"), Err(ResponseBlocked));
+
+        let slash = ResponseGuard::new("a/b".into());
+        assert_eq!(slash.check(&[], br#"a\/b"#), Err(ResponseBlocked));
+        let backslash = ResponseGuard::new("a\\b".into());
+        assert_eq!(backslash.check(&[], br#"a\\b"#), Err(ResponseBlocked));
+        let quote = ResponseGuard::new("a\"b".into());
+        assert_eq!(quote.check(&[], br#"a\"b"#), Err(ResponseBlocked));
+
+        // Raw matching stays active alongside decoded-only matching (G2).
+        assert_eq!(slash.check(&[], b"a/b"), Err(ResponseBlocked));
+    }
+
+    #[test]
+    fn unrelated_encoded_values_remain_clean_and_decoding_is_not_recursive() {
+        let guard = ResponseGuard::new("ordinary-secret".into());
+        for clean in ["c2FmZS1yZXN1bHQ", "1234abcd", "ordinary%2dresult"] {
+            assert_eq!(guard.check(&[], clean.as_bytes()), Ok(clean), "{clean}");
+        }
+        let twice = "YjNKa2FXNWFjbXR0YzJWamNtVjA";
+        assert_eq!(guard.check(&[], twice.as_bytes()), Ok(twice));
+    }
+
+    #[test]
     fn denied_guarded_request_does_not_reveal_or_mutate_headers() {
         let source = Source(Cell::new(0));
         let secret = SecretRef::parse("secret://openai/default").unwrap();
