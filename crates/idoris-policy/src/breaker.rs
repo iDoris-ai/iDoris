@@ -619,6 +619,30 @@ mod tests {
     }
 
     #[test]
+    fn failed_oauth_probe_after_expiry_relocks_for_a_full_window_from_probe_time() {
+        let mut breaker = tripped(CredentialClass::OAuth, 1_000);
+        let probe_time = 61_000;
+        let admit = breaker.admit(probe_time);
+        assert_eq!(admit.admission, Admission::Probe);
+        breaker.on_failure(ticket_of(admit), probe_time);
+
+        assert_eq!(
+            breaker.admit(probe_time).admission,
+            Admission::Rejected {
+                retry_after_ms: 60_000
+            }
+        );
+        assert_eq!(
+            breaker.admit(probe_time + 59_999).admission,
+            Admission::Rejected { retry_after_ms: 1 }
+        );
+        assert_eq!(
+            breaker.admit(probe_time + 60_000).admission,
+            Admission::Probe
+        );
+    }
+
+    #[test]
     fn late_failures_while_open_do_not_extend_the_window() {
         let mut breaker = Breaker::new(CredentialClass::Local);
         let early = ticket_of(breaker.admit(0));

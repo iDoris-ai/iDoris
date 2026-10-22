@@ -680,6 +680,108 @@ async fn actual_subscription_lib_relay_is_captured_with_oauth_before_suspended_c
     );
 }
 
+#[tokio::test]
+async fn three_real_subscription_failures_block_the_fourth_before_spawn() {
+    use crate::subscription::{config::*, runtime::*};
+    use idoris_upstream::subscription::{
+        profile::{SandboxProfile, SubscriptionCli},
+        relay::SubscriptionRelayConfig,
+    };
+    use std::collections::BTreeMap;
+    use std::ffi::OsString;
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = tempfile::tempdir().unwrap();
+    let counter = root.path().join("spawn-count");
+    let program = root.path().join("claude");
+    std::fs::write(
+        &program,
+        format!(
+            "#!/bin/sh\ncat >/dev/null\nn=$(cat '{}' 2>/dev/null || printf 0)\nn=$((n + 1))\nprintf '%s' \"$n\" > '{}'\nprintf relay-failure\nexit 1\n",
+            counter.display(),
+            counter.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let card: idoris_contracts::ComponentCard =
+        serde_yaml::from_str(include_str!("../../../config/components/subscription.yaml")).unwrap();
+    let cfg = SubscriptionConfig::snapshot(
+        Some("personal"),
+        Some("1"),
+        None,
+        Some(SANDBOX_PROFILE_ID),
+        Some("claude"),
+    );
+    let authorized = authorize_subscription(&cfg, &card).unwrap().unwrap();
+    let relay = SubscriptionRelayConfig::with_environment(
+        SandboxProfile::fixed(SubscriptionCli::Claude),
+        BTreeMap::from([(
+            OsString::from("PATH"),
+            OsString::from(format!("{}:/usr/bin:/bin", root.path().display())),
+        )]),
+    );
+    let handle =
+        SubscriptionRuntimeHandle::build_with_relay_config(authorized, &card, relay).unwrap();
+    let mut subscriptions = SubscriptionRuntimeRegistry::default();
+    subscriptions.insert(handle).unwrap();
+    let p = Arc::new(proxy());
+    let app = crate::build_app(crate::AppState {
+        cards: vec![card.clone()],
+        subscriptions,
+        proxy: p.clone(),
+        routing_policy: serde_yaml::from_str(
+            "routing_policy:\n  version: 1\n  rules: []\n  default: { tiers: [remote], fail_closed: true }\n",
+        )
+        .unwrap(),
+        ..Default::default()
+    });
+
+    for expected_spawns in 1..=3 {
+        let mut request = crate::tests::post_chat(
+            r#"{"model":"idoris/daily","messages":[{"role":"user","content":"hello"}]}"#,
+            &[("x-idoris-privacy", "any")],
+        );
+        request.extensions_mut().insert(axum::extract::ConnectInfo(
+            crate::connection::ConnectionInfo::from_parts(
+                "127.0.0.1:9000".parse().unwrap(),
+                CancellationToken::new(),
+            ),
+        ));
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), 502, "attempt {expected_spawns}");
+        let actual_spawns: usize = std::fs::read_to_string(&counter).unwrap().parse().unwrap();
+        assert_eq!(actual_spawns, expected_spawns);
+    }
+
+    assert_eq!(p.blocked_cards(std::slice::from_ref(&card)), [true]);
+    let mut fourth = crate::tests::post_chat(
+        r#"{"model":"idoris/daily","messages":[{"role":"user","content":"hello"}]}"#,
+        &[("x-idoris-privacy", "any")],
+    );
+    fourth.extensions_mut().insert(axum::extract::ConnectInfo(
+        crate::connection::ConnectionInfo::from_parts(
+            "127.0.0.1:9000".parse().unwrap(),
+            CancellationToken::new(),
+        ),
+    ));
+    let response = app.oneshot(fourth).await.unwrap();
+    assert_eq!(
+        response.status(),
+        503,
+        "the fourth request is breaker-rejected"
+    );
+    assert_eq!(std::fs::read_to_string(&counter).unwrap(), "3");
+    assert_eq!(p.blocked_cards(std::slice::from_ref(&card)), [true]);
+    assert_eq!(
+        ready(&p, "subscription", CredentialClass::OAuth, 0),
+        Admission::Rejected {
+            retry_after_ms: 60_000
+        }
+    );
+}
+
 async fn fault_app(p: Arc<ChatProxy>, fault: FaultMode) -> axum::Router {
     let victim = matches!(fault, FaultMode::VictimPanic | FaultMode::VictimError);
     let startup = matches!(fault, FaultMode::StartupUpstream);
