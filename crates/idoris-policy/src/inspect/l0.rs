@@ -227,7 +227,7 @@ fn scan_formatted(units: &[u16], hits: &mut Vec<Hit>) {
                 if digits > 19 {
                     break;
                 }
-                let found = formatted_window(units, &segments, start, end);
+                let found = formatted_window(units, &segments[start..=end]);
                 if !found.is_empty() {
                     best = Some((end + 1, found));
                     break;
@@ -243,32 +243,9 @@ fn scan_formatted(units: &[u16], hits: &mut Vec<Hit>) {
     }
 }
 
-fn inside_long_four_digit_run(segments: &[(usize, usize)], start: usize, end: usize) -> bool {
-    let four = |index: usize| segments[index].1 - segments[index].0 == 4;
-    if !(start..=end).all(four) {
-        return false;
-    }
-    let mut run_start = start;
-    while run_start > 0 && four(run_start - 1) {
-        run_start -= 1;
-    }
-    let mut run_end = end;
-    while run_end + 1 < segments.len() && four(run_end + 1) {
-        run_end += 1;
-    }
-    run_end - run_start + 1 > 4
-}
-
 /// 手机号、四位分组银行卡，以及 `6/8/4`、`6/4/4/4` 身份证（含末位 `X`）。
 /// 长得像实体的普通数字行仍然无法和真号区分，这是有意的误报。
-/// 一整串超过 4 段的 4 位数字不再用滑窗拼成银行卡。
-fn formatted_window(
-    units: &[u16],
-    all_segments: &[(usize, usize)],
-    start: usize,
-    end: usize,
-) -> Vec<Hit> {
-    let segments = &all_segments[start..=end];
+fn formatted_window(units: &[u16], segments: &[(usize, usize)]) -> Vec<Hit> {
     let count = segments.len();
     if count == 0 || count > 5 {
         return Vec::new();
@@ -288,8 +265,7 @@ fn formatted_window(
     let card_shape = (16..=19).contains(&total)
         && count >= 4
         && lengths[..count - 1].iter().all(|&len| len == 4)
-        && lengths.last().is_some_and(|len| (1..=4).contains(len))
-        && !inside_long_four_digit_run(all_segments, start, end);
+        && lengths.last().is_some_and(|len| (1..=4).contains(len));
     let id_18 = matches!(lengths, [6, 8, 4] | [6, 4, 4, 4]);
     let id_17 = matches!(lengths, [6, 8, 3] | [6, 4, 4, 3]);
     let last_end = segments[count - 1].1;

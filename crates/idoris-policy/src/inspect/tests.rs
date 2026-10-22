@@ -149,15 +149,28 @@ fn bank_card_requires_luhn() {
 }
 
 #[test]
-fn long_four_digit_column_is_not_a_sliding_card() {
-    let column = "4111 1111 1111 1111 2026 1305";
-    let response = inspect(column, &open_ctx());
-    assert!(
-        !kinds(&response).contains(&FindingKind::BankCard),
-        "{response:?}"
+fn card_subwindows_stay_when_a_four_digit_neighbour_follows() {
+    let year = inspect("6222.0212.3456.7894 2028", &open_ctx());
+    assert_eq!(year.action, InspectAction::Block);
+    assert_eq!(
+        year.findings,
+        [InspectFinding {
+            kind: FindingKind::BankCard,
+            span: Some(InspectSpan {
+                start: 0,
+                length: 19
+            }),
+        }]
     );
-    let alone = inspect("4111 1111 1111 1111", &open_ctx());
-    assert!(kinds(&alone).contains(&FindingKind::BankCard));
+    let pair = inspect("4111 1111 1111 1111 5500 0000 0000 0004", &open_ctx());
+    assert_eq!(
+        pair.findings
+            .iter()
+            .filter(|finding| finding.kind == FindingKind::BankCard)
+            .count(),
+        2,
+        "{pair:?}"
+    );
 }
 
 #[test]
