@@ -6,6 +6,7 @@ use axum::{
     body::Body,
     http::{Request, StatusCode},
 };
+use http_body_util::BodyExt;
 use idoris_contracts::common::Capability;
 use idoris_tenancy::event_log::{EventLogStore, EventType};
 use rusqlite::Connection;
@@ -52,18 +53,222 @@ fn post_with_request_id(path: &str, body: &serde_json::Value) -> Request<Body> {
 }
 
 fn terminal_events(log: &EventLogStore, response: &Response) -> Vec<EventType> {
+    terminal_events_for_tenant(log, budget::PERSONAL_TENANT_ID, response)
+}
+
+fn terminal_events_for_tenant(
+    log: &EventLogStore,
+    tenant: &str,
+    response: &Response,
+) -> Vec<EventType> {
     let record = response
         .headers()
         .get(HEADER_RECORD_ID)
         .unwrap()
         .to_str()
         .unwrap();
-    log.events_for_record(Some(budget::PERSONAL_TENANT_ID), record)
+    log.events_for_record(Some(tenant), record)
         .unwrap()
         .into_iter()
         .map(|row| row.event.event_type)
         .filter(|kind| matches!(kind, EventType::Dispatched | EventType::Completed))
         .collect()
+}
+
+#[tokio::test]
+async fn messages_stream_records_one_success_after_message_stop_in_tenant_scope() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_raw(
+                    "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+                    "text/event-stream",
+                ),
+        )
+        .expect(1)
+        .mount(&upstream)
+        .await;
+    let log = Arc::new(EventLogStore::new(Connection::open_in_memory().unwrap()).unwrap());
+    let (app, key) = tenant_test_app(
+        AppState {
+            deploy_mode: idoris_contracts::DeployMode::Tenant,
+            cards: vec![tests::resident_component_card("messages", &upstream.uri())],
+            event_log: Some(log.clone()),
+            ..AppState::default()
+        },
+        "tenant-a",
+    );
+    let mut request = post(
+        "/v1/messages",
+        &json!({"model":"m","max_tokens":8,"stream":true,"messages":[]}),
+    );
+    request
+        .headers_mut()
+        .insert("x-idoris-tenant", "tenant-a".parse().unwrap());
+    let response = app
+        .oneshot(tenant_test_request(request, &key))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let record = response.headers()[HEADER_RECORD_ID]
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        terminal_events_for_tenant(&log, "tenant-a", &response),
+        [EventType::Dispatched]
+    );
+    let _ = response.into_body().collect().await.unwrap();
+    let chain = log.events_for_record(Some("tenant-a"), &record).unwrap();
+    assert_eq!(
+        chain
+            .iter()
+            .filter(|row| row.event.event_type == EventType::Completed)
+            .count(),
+        1
+    );
+    assert!(chain.iter().all(|row| row.event.tenant_id == "tenant-a"));
+    let completed = chain
+        .iter()
+        .find(|row| row.event.event_type == EventType::Completed)
+        .unwrap();
+    assert_eq!(
+        completed.event.metadata.get("status"),
+        Some(&json!("success"))
+    );
+    upstream.verify().await;
+}
+
+#[tokio::test]
+async fn messages_stream_without_message_stop_records_one_failure() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_raw(
+                    "event: message_delta\ndata: {\"type\":\"message_delta\"}\n\n",
+                    "text/event-stream",
+                ),
+        )
+        .expect(1)
+        .mount(&upstream)
+        .await;
+    let log = Arc::new(EventLogStore::new(Connection::open_in_memory().unwrap()).unwrap());
+    let app = build_app(AppState {
+        cards: vec![tests::resident_component_card("messages", &upstream.uri())],
+        event_log: Some(log.clone()),
+        ..AppState::default()
+    });
+    let response = app
+        .oneshot(post(
+            "/v1/messages",
+            &json!({"model":"m","max_tokens":8,"stream":true,"messages":[]}),
+        ))
+        .await
+        .unwrap();
+    let record = response.headers()[HEADER_RECORD_ID]
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(response.into_body().collect().await.is_err());
+    let chain = log
+        .events_for_record(Some(budget::PERSONAL_TENANT_ID), &record)
+        .unwrap();
+    let completed = chain
+        .iter()
+        .filter(|row| row.event.event_type == EventType::Completed)
+        .collect::<Vec<_>>();
+    assert_eq!(completed.len(), 1);
+    assert_eq!(
+        completed[0].event.metadata.get("status"),
+        Some(&json!("failure"))
+    );
+    upstream.verify().await;
+}
+
+#[tokio::test]
+async fn messages_stream_buffered_and_connect_failures_complete_failure() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(429).set_body_string("rate limited"))
+        .expect(1)
+        .mount(&upstream)
+        .await;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let unavailable_endpoint = format!("http://{}", listener.local_addr().unwrap());
+    drop(listener);
+
+    for endpoint in [upstream.uri(), unavailable_endpoint] {
+        let log = Arc::new(EventLogStore::new(Connection::open_in_memory().unwrap()).unwrap());
+        let app = build_app(AppState {
+            cards: vec![tests::resident_component_card("messages", &endpoint)],
+            event_log: Some(log.clone()),
+            ..AppState::default()
+        });
+        let response = app
+            .oneshot(post(
+                "/v1/messages",
+                &json!({"model":"m","max_tokens":8,"stream":true,"messages":[]}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            terminal_events(&log, &response),
+            [EventType::Dispatched, EventType::Completed]
+        );
+        let record = response.headers()[HEADER_RECORD_ID].to_str().unwrap();
+        let chain = log
+            .events_for_record(Some(budget::PERSONAL_TENANT_ID), record)
+            .unwrap();
+        let completed = chain
+            .iter()
+            .filter(|row| row.event.event_type == EventType::Completed)
+            .collect::<Vec<_>>();
+        assert_eq!(completed.len(), 1);
+        assert_eq!(
+            completed[0].event.metadata.get("status"),
+            Some(&json!("failure"))
+        );
+    }
+    upstream.verify().await;
+}
+
+#[tokio::test]
+async fn messages_stream_breaker_preflight_has_no_dispatch_or_completion() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(503).insert_header("Retry-After", "60"))
+        .expect(1)
+        .mount(&upstream)
+        .await;
+    let mut card = tests::resident_component_card("messages", &upstream.uri());
+    card.provider.capabilities = vec![Capability::Chat];
+    let log = Arc::new(EventLogStore::new(Connection::open_in_memory().unwrap()).unwrap());
+    let proxy = proxy::ChatProxy::new(idoris_upstream::http_client().unwrap());
+    proxy.set_breakers_enabled(true);
+    let app = build_app(AppState {
+        cards: vec![card],
+        event_log: Some(log.clone()),
+        proxy: Arc::new(proxy),
+        ..AppState::default()
+    });
+    let body = json!({"model":"m","max_tokens":8,"stream":true,"messages":[]});
+    let dispatched = app
+        .clone()
+        .oneshot(post("/v1/messages", &body))
+        .await
+        .unwrap();
+    assert_eq!(
+        terminal_events(&log, &dispatched),
+        [EventType::Dispatched, EventType::Completed]
+    );
+    let refused = app.oneshot(post("/v1/messages", &body)).await.unwrap();
+    assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(terminal_events(&log, &refused).is_empty());
+    upstream.verify().await;
 }
 
 #[tokio::test]

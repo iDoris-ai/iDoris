@@ -1180,10 +1180,6 @@ async fn messages(
         }
     };
 
-    if stream_requested {
-        return messages_stream(&state, &selected, &value).await;
-    }
-
     let events = match protocol_events::ProtocolEvents::begin(
         &state,
         &headers,
@@ -1195,6 +1191,10 @@ async fn messages(
         Ok(events) => events,
         Err(response) => return response,
     };
+
+    if stream_requested {
+        return messages_stream(&state, &selected, &value, events.as_ref()).await;
+    }
     let opts = proxy::ForwardOpts {
         request_id: headers
             .get(HEADER_REQUEST_ID)
@@ -1283,23 +1283,38 @@ async fn messages_stream(
     state: &AppState,
     selected: &Selected,
     body_value: &serde_json::Value,
+    events: Option<&protocol_events::ProtocolEvents>,
 ) -> Response {
-    match state
+    let outcome = state
         .proxy
-        .forward_stream_path(
+        .forward_stream_path_observed(
             &selected.card.endpoint,
             proxy::StreamingUpstreamPath::MESSAGES,
             body_value,
             selected.card.provider.id.as_str(),
+            || async {
+                if let Some(events) = events {
+                    events.dispatched(selected).await?;
+                }
+                Ok::<(), ()>(())
+            },
         )
-        .await
-    {
+        .await;
+    let Ok(outcome) = outcome else {
+        return event_log_unavailable_response();
+    };
+    match outcome {
         proxy::StreamOutcome::Buffered {
             status,
             body,
             content_type,
             ..
         } => {
+            if let Some(events) = events
+                && let Err(()) = events.completed_failure(selected).await
+            {
+                return event_log_unavailable_response();
+            }
             let status = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
             let mut response = (status, body).into_response();
             let content_type = content_type.as_deref().unwrap_or("application/json");
@@ -1319,10 +1334,13 @@ async fn messages_stream(
             response: upstream,
         } => {
             let status = StatusCode::from_u16(status).unwrap_or(StatusCode::OK);
-            let body = Body::from_stream(sse::ensure_event_terminated(
-                upstream.into_data_stream(),
-                b"message_stop",
-            ));
+            let completed = events.map(protocol_events::ProtocolEvents::completed_context);
+            let body = completion_observed_body(
+                sse::ensure_event_terminated(upstream.into_data_stream(), b"message_stop"),
+                completed,
+                selected.card.provider.id.clone(),
+                selected.served_locality,
+            );
             let mut response = Response::builder()
                 .status(status)
                 .body(body)
@@ -3018,9 +3036,22 @@ fn terminated_proxy_body_observed(
     provider_id: String,
     served_locality: idoris_contracts::provider::Locality,
 ) -> Body {
+    completion_observed_body(
+        sse::ensure_terminated(upstream.into_data_stream()),
+        completed_event,
+        provider_id,
+        served_locality,
+    )
+}
+
+fn completion_observed_body(
+    guarded: impl futures_util::Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static,
+    completed_event: Option<CompletedEventContext>,
+    provider_id: String,
+    served_locality: idoris_contracts::provider::Locality,
+) -> Body {
     use futures_util::StreamExt;
 
-    let guarded = sse::ensure_terminated(upstream.into_data_stream());
     let observed = futures_util::stream::unfold(
         (
             Box::pin(guarded),
