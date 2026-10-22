@@ -2,18 +2,20 @@
 //! 注入、不含值的审计。**不含存储**——钥匙串 / Secure Enclave / 独立 UID 的
 //! broker 进程是部署决定，经 [`SecretSource`] 接进来。
 //!
-//! 三条硬性验收断言（docs/15 §2.3）在这里落成代码：
+//! 三条硬性验收断言（docs/15 §2.3）的纯逻辑基础：
 //!
 //! - **C-1** 注入**覆盖**调用方带来的同名头（大小写不敏感，重复的全删），
 //!   而不是「缺了才填」——否则调用方自带的 `Authorization` 会赢。
 //! - **C-2** 授权**先于取值**：[`broker`] 只有在 [`authorize`] 通过之后才调用
 //!   [`SecretSource::reveal`]，被拒的请求根本不接触密钥。
-//! - **C-3**（响应也要过闸一）不在本模块：由调用方对上游响应跑检查器。
+//! - **C-3** [`broker_guarded`] 返回缓冲响应检查器；部署层仍须在交付前调用。
 //!
-//! 模型、调用方、策略层与审计都只见到引用；值只存在于 [`Secret`] 里，且
-//! `Debug` 不打印它。
+//! 模型、策略层与审计只见到引用；broker 内部的 [`Secret`] 和响应检查器
+//! 保存值，它们的 `Debug` 均不打印值。
 
 use std::fmt;
+
+pub mod response;
 
 /// `secret://<provider>/<name>`：两段都是小写 ASCII 字母、数字、`-`、`_`。
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -147,20 +149,40 @@ pub fn broker(
     request: &BrokerRequest<'_>,
     headers: &mut Vec<(String, String)>,
 ) -> Result<AuditRecord, CredentialError> {
+    broker_guarded(grants, source, request, headers).map(|(audit, _guard)| audit)
+}
+
+/// Like [`broker`], with a guard retaining this call's credential for response checks.
+/// The caller must check the complete decoded response before returning or caching it.
+/// Streaming and arbitrary encoded payloads require separate integration.
+pub fn broker_guarded(
+    grants: &[Grant],
+    source: &dyn SecretSource,
+    request: &BrokerRequest<'_>,
+    headers: &mut Vec<(String, String)>,
+) -> Result<(AuditRecord, response::ResponseGuard), CredentialError> {
     let grant = authorize(grants, request)?;
     let secret = source.reveal(&grant.secret)?;
+    // A value with control characters would split or forge headers.
+    if secret.0.is_empty() || secret.0.bytes().any(|b| b.is_ascii_control()) {
+        return Err(CredentialError::Unavailable);
+    }
+    let guard = response::ResponseGuard::new(secret.0.clone());
     let value = match grant.scheme {
         HeaderScheme::Bearer => format!("Bearer {}", secret.0),
         HeaderScheme::Raw => secret.0,
     };
     inject(headers, &grant.header, value);
     let (host, path) = destination(request.url)?;
-    Ok(AuditRecord {
-        secret_id: grant.secret.id(),
-        host,
-        method: request.method.to_ascii_uppercase(),
-        path,
-    })
+    Ok((
+        AuditRecord {
+            secret_id: grant.secret.id(),
+            host,
+            method: request.method.to_ascii_uppercase(),
+            path,
+        },
+        guard,
+    ))
 }
 
 /// C-1: every caller-supplied header with this name (any case, any count)
