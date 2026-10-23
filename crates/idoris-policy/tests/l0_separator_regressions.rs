@@ -461,3 +461,49 @@ fn g3_entity_subwindows_ignore_unrelated_neighbors() {
         );
     }
 }
+
+#[test]
+fn short_lead_run_is_not_glued_into_a_card_length_entity() {
+    // `12` plus four four-digit groups reaches card length. The guard keeps the
+    // short run out of the window, so the card is reported from its own start
+    // and never as one entity spanning all five groups.
+    let response = inspect("12 6222 0212 3456 7894", &open_ctx());
+    assert_eq!(
+        response.findings,
+        [InspectFinding {
+            kind: FindingKind::BankCard,
+            span: Some(InspectSpan {
+                start: 3,
+                length: 19
+            }),
+        }],
+        "{response:?}"
+    );
+    // A country-code phone keeps its short run: the window never reaches card
+    // length, so `86.138.1234.5678` is still one 13-digit phone.
+    let phone = inspect("86.138.1234.5678", &open_ctx());
+    assert_eq!(
+        phone.findings,
+        [InspectFinding {
+            kind: FindingKind::CnMobile,
+            span: Some(InspectSpan {
+                start: 0,
+                length: 16
+            }),
+        }],
+        "{phone:?}"
+    );
+    // The prefixed span from the legacy test is unchanged by the guard.
+    let prefixed = inspect("😀号码：86.138.1234.5678。结束", &open_ctx());
+    assert_eq!(
+        prefixed.findings,
+        [InspectFinding {
+            kind: FindingKind::CnMobile,
+            span: Some(InspectSpan {
+                start: 5,
+                length: 16
+            }),
+        }],
+        "{prefixed:?}"
+    );
+}

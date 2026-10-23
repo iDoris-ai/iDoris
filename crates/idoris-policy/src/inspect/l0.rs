@@ -227,6 +227,18 @@ fn scan_formatted(units: &[u16], hits: &mut Vec<Hit>) {
                 if digits > 19 {
                     break;
                 }
+                // A run shorter than three digits may carry a country code
+                // (`86.138.1234.5678`, 13 digits), so it stays eligible while
+                // the window still looks like a phone. Once the window reaches
+                // card length the short run is only glue: `12 6222 0212 3456
+                // 7894` must not become one 19-digit card. The later starts of
+                // that chain stay eligible.
+                let short_run = segments[start..=end]
+                    .iter()
+                    .any(|&(from, to)| to - from < 3);
+                if end > start && digits >= 16 && short_run {
+                    break;
+                }
                 let found = formatted_window(units, &segments[start..=end]);
                 if !found.is_empty() {
                     best = Some((end + 1, found));
