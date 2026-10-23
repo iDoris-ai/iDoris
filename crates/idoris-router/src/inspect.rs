@@ -193,8 +193,8 @@ fn failed_inspection(declared: PrivacyClass) -> Inspection {
 }
 
 /// Appends the `inspected` fact: sensitivity, effective privacy, the
-/// distinct finding kinds, and a reason only when content tightened the
-/// caller's `any`. Never spans, never content.
+/// distinct finding kinds, and a reason for failed scans or when inspection
+/// tightened the caller's `any`. Never spans, never content.
 pub(crate) async fn append_inspected(
     store: Arc<idoris_tenancy::event_log::EventLogStore>,
     tenant_id: String,
@@ -219,14 +219,18 @@ pub(crate) async fn append_inspected(
         serde_json::to_value(inspection.effective).map_err(|_| ())?,
     );
     metadata.insert("labels".to_string(), serde_json::Value::Array(labels));
-    if inspection.tightened {
-        let reason = if inspection.failed {
-            "inspect_failed"
-        } else if inspection.killed {
+    let reason = if inspection.failed {
+        Some("inspect_failed")
+    } else if inspection.tightened {
+        Some(if inspection.killed {
             "remote_kill_switch"
         } else {
             "privacy_tightened_by_content"
-        };
+        })
+    } else {
+        None
+    };
+    if let Some(reason) = reason {
         metadata.insert("reason".to_string(), serde_json::Value::from(reason));
     }
     let ts_utc_ms = std::time::SystemTime::now()
@@ -256,6 +260,74 @@ mod request_path_tests {
 
     use super::*;
     use std::sync::mpsc;
+
+    async fn persisted_inspected_metadata(
+        inspection: &Inspection,
+    ) -> std::collections::BTreeMap<String, serde_json::Value> {
+        let store = Arc::new(
+            idoris_tenancy::event_log::EventLogStore::new(
+                rusqlite::Connection::open_in_memory().unwrap(),
+            )
+            .unwrap(),
+        );
+        append_inspected(
+            store.clone(),
+            "tenant".to_string(),
+            "record".to_string(),
+            &crate::correlation::RequestCorrelation::default(),
+            inspection,
+        )
+        .await
+        .unwrap();
+        let events = store.events_for_record(Some("tenant"), "record").unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].event.event_type,
+            idoris_tenancy::event_log::EventType::Inspected
+        );
+        events[0].event.metadata.clone()
+    }
+
+    #[tokio::test]
+    async fn failed_inspection_reason_is_persisted_for_any_and_local_only_without_content() {
+        for declared in [PrivacyClass::Any, PrivacyClass::LocalOnly] {
+            let failure = failed_inspection(declared);
+            let metadata = persisted_inspected_metadata(&failure).await;
+            assert_eq!(
+                metadata.get("reason"),
+                Some(&serde_json::json!("inspect_failed"))
+            );
+            assert_eq!(metadata["sensitivity"], "S3");
+            assert_eq!(metadata["privacy"], "local_only");
+            assert_eq!(metadata["labels"], serde_json::json!([]));
+            assert_eq!(metadata.len(), 4);
+            assert!(
+                !serde_json::to_string(&metadata)
+                    .unwrap()
+                    .contains("safe-looking")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn successful_local_only_inspection_has_no_failure_reason() {
+        let inspection = inspect_body(
+            &serde_json::json!({"messages": [{"content": "safe-looking"}]}),
+            PrivacyClass::LocalOnly,
+            false,
+        );
+        let metadata = persisted_inspected_metadata(&inspection).await;
+        assert_eq!(metadata["privacy"], "local_only");
+        assert_eq!(metadata["sensitivity"], "S0");
+        assert_eq!(metadata["labels"], serde_json::json!([]));
+        assert!(!metadata.contains_key("reason"));
+        assert_eq!(metadata.len(), 3);
+        assert!(
+            !serde_json::to_string(&metadata)
+                .unwrap()
+                .contains("safe-looking")
+        );
+    }
 
     #[tokio::test]
     async fn request_path_uses_inline_below_and_blocking_pool_at_and_above_threshold() {
