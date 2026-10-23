@@ -16,6 +16,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
 use super::*;
 
 const SECRET: &str = "11010519491231002X";
+const SYNTHETIC_PHONE: &str = "13812345678";
 const PROVIDER: &str = "selected-local";
 const MODEL: &str = "bound-local-model";
 
@@ -107,39 +108,24 @@ async fn selected(
     let tightening_count = reason_codes.map(|codes| {
         codes
             .as_array()
-            .expect("reason_codes metadata must be an array")
+            .unwrap()
             .iter()
-            .filter(|code| {
-                code.as_str().expect("reason_codes entries must be strings")
-                    == "privacy_tightened_by_content"
-            })
+            .filter(|code| code.as_str().unwrap() == "privacy_tightened_by_content")
             .count()
     });
-    if privacy == "any" {
-        assert_eq!(
-            tightening_count.expect("selected Any request must include reason_codes"),
-            1,
-            "{path}"
-        );
-    } else {
-        assert!(
-            tightening_count.unwrap_or(0) == 0,
-            "{path}: {reason_codes:?}"
-        );
-    }
     assert_eq!(rows[4].event.event_type, EventType::Dispatched, "{path}");
     assert_eq!(rows[4].event.metadata["provider_id"], PROVIDER, "{path}");
     assert_eq!(rows[5].event.event_type, EventType::Completed, "{path}");
     assert_eq!(rows[5].event.metadata["status"], "success", "{path}");
+    let serialized_metadata = serde_json::to_string(
+        &all_rows
+            .iter()
+            .map(|row| &row.event.metadata)
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
     assert!(
-        !serde_json::to_string(
-            &all_rows
-                .iter()
-                .map(|row| &row.event.metadata)
-                .collect::<Vec<_>>()
-        )
-        .unwrap()
-        .contains(SECRET),
+        !serialized_metadata.contains(SECRET) && !serialized_metadata.contains(SYNTHETIC_PHONE),
         "{path}: raw input in event metadata"
     );
     let _ = response.into_body().collect().await.unwrap();
@@ -151,18 +137,46 @@ async fn selected(
         "{path}: selected provider model binding"
     );
     upstream.verify().await;
-}
 
-#[tokio::test]
-async fn sensitive_any_protocol_requests_record_selected_local_tightening_once() {
-    for (path, capability, role, body) in cases() {
-        selected(path, capability, role, &body, "any").await;
+    if privacy == "any" {
+        assert_eq!(tightening_count.unwrap(), 1, "{path}");
+    } else {
+        assert_eq!(tightening_count.unwrap_or(0), 0, "{path}: {reason_codes:?}");
     }
 }
 
 #[tokio::test]
-async fn declared_local_only_protocol_requests_do_not_record_content_tightening() {
-    for (path, capability, role, body) in cases() {
-        selected(path, capability, role, &body, "local_only").await;
-    }
+async fn any_embeddings_records_selected_local_tightening_once() {
+    let (path, capability, role, body) = cases()[0].clone();
+    selected(path, capability, role, &body, "any").await;
+}
+
+#[tokio::test]
+async fn any_rerank_records_selected_local_tightening_once() {
+    let (path, capability, role, body) = cases()[1].clone();
+    selected(path, capability, role, &body, "any").await;
+}
+
+#[tokio::test]
+async fn any_messages_records_selected_local_tightening_once() {
+    let (path, capability, role, body) = cases()[2].clone();
+    selected(path, capability, role, &body, "any").await;
+}
+
+#[tokio::test]
+async fn local_only_embeddings_does_not_record_content_tightening() {
+    let (path, capability, role, body) = cases()[0].clone();
+    selected(path, capability, role, &body, "local_only").await;
+}
+
+#[tokio::test]
+async fn local_only_rerank_does_not_record_content_tightening() {
+    let (path, capability, role, body) = cases()[1].clone();
+    selected(path, capability, role, &body, "local_only").await;
+}
+
+#[tokio::test]
+async fn local_only_messages_does_not_record_content_tightening() {
+    let (path, capability, role, body) = cases()[2].clone();
+    selected(path, capability, role, &body, "local_only").await;
 }
