@@ -685,6 +685,7 @@ async fn actual_subscription_lib_relay_is_captured_with_oauth_before_suspended_c
 #[tokio::test]
 async fn three_real_subscription_failures_block_the_fourth_before_spawn() {
     use crate::subscription::{config::*, runtime::*};
+    use http_body_util::BodyExt;
     use idoris_upstream::subscription::{
         profile::{SandboxProfile, SubscriptionCli},
         relay::SubscriptionRelayConfig,
@@ -728,6 +729,7 @@ async fn three_real_subscription_failures_block_the_fourth_before_spawn() {
         SubscriptionRuntimeHandle::build_with_relay_config(authorized, &card, relay).unwrap();
     let mut subscriptions = SubscriptionRuntimeRegistry::default();
     subscriptions.insert(handle).unwrap();
+    let lifecycle = subscriptions.clone();
     let p = Arc::new(proxy());
     let app = crate::build_app(crate::AppState {
         cards: vec![card.clone()],
@@ -753,6 +755,22 @@ async fn three_real_subscription_failures_block_the_fourth_before_spawn() {
         ));
         let response = app.clone().oneshot(request).await.unwrap();
         assert_eq!(response.status(), 502, "attempt {expected_spawns}");
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            body["error"]["reason_code"], "RELAY_CLI_FAILED",
+            "attempt {expected_spawns} actual HTTP reason"
+        );
+        assert_eq!(
+            lifecycle
+                .get("subscription")
+                .unwrap()
+                .service()
+                .active_requests()
+                .await,
+            0,
+            "attempt {expected_spawns} must release its subscription request"
+        );
         let actual_spawns: usize = std::fs::read_to_string(&counter).unwrap().parse().unwrap();
         assert_eq!(actual_spawns, expected_spawns);
     }
@@ -782,6 +800,7 @@ async fn three_real_subscription_failures_block_the_fourth_before_spawn() {
             retry_after_ms: 60_000
         }
     );
+    lifecycle.shutdown_all().await.unwrap();
 }
 
 #[cfg(unix)]
