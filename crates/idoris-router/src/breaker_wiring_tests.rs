@@ -277,6 +277,7 @@ async fn native_only_lockout_returns_the_decided_rejection_without_a_third_load(
         let response = app.clone().oneshot(post_chat(body, &[])).await.unwrap();
         assert_ne!(response.status(), StatusCode::OK);
     }
+    assert_eq!(adapter.chats.load(Ordering::SeqCst), 2);
     let calls_before_refusal = (
         adapter.loads.load(Ordering::SeqCst),
         adapter.chats.load(Ordering::SeqCst),
@@ -285,6 +286,7 @@ async fn native_only_lockout_returns_the_decided_rejection_without_a_third_load(
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     let decided = decided_event(&event_log, &response);
     assert_eq!(decided["status"], "rejected");
+    assert_eq!(decided["reason"], "no_eligible_candidate");
     let record_id = response
         .headers()
         .get(HEADER_RECORD_ID)
@@ -303,6 +305,7 @@ async fn native_only_lockout_returns_the_decided_rejection_without_a_third_load(
     );
     let bytes = response.into_body().collect().await.unwrap().to_bytes();
     let envelope: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(envelope["error"]["type"], "no_eligible_candidate");
     assert_eq!(envelope["error"]["type"], decided["reason"]);
     assert_eq!(
         (
