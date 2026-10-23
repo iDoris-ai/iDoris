@@ -10,12 +10,15 @@ use idoris_tenancy::event_log::EventLogStore;
 
 use crate::{
     AppState, CompletedEventContext, DispatchedEventContext, HEADER_REQUEST_ID, append_completed,
-    append_dispatched, budget, correlation, correlation_error_response,
-    event_log_unavailable_response, event_request_id, header_text,
+    append_decided, append_dispatched, append_profiled, budget, correlation,
+    correlation_error_response, event_log_unavailable_response, event_request_id, header_text,
 };
 use crate::{
     dispatch::Selected,
+    inspect::{self, Inspection},
+    profile::ParsedProfile,
     proxy::{ExecutionDisposition, ForwardOutcome},
+    routing_policy::RouteDecision,
 };
 
 pub(crate) struct ProtocolEvents {
@@ -91,6 +94,46 @@ impl ProtocolEvents {
         Ok(())
     }
 
+    pub(crate) async fn inspected(&self, inspection: &Inspection) -> Result<(), ()> {
+        inspect::append_inspected(
+            self.log.clone(),
+            self.tenant_id.clone(),
+            self.record_id.clone(),
+            &self.correlation,
+            inspection,
+        )
+        .await
+    }
+
+    pub(crate) async fn profiled(&self, parsed: &ParsedProfile) -> Result<(), ()> {
+        append_profiled(
+            self.log.clone(),
+            self.tenant_id.clone(),
+            self.record_id.clone(),
+            &self.correlation,
+            parsed,
+        )
+        .await
+    }
+
+    pub(crate) async fn decided(
+        &self,
+        route: &RouteDecision,
+        selected: Option<&Selected>,
+        reason: Option<&str>,
+    ) -> Result<(), ()> {
+        append_decided(
+            self.log.clone(),
+            self.tenant_id.clone(),
+            self.record_id.clone(),
+            &self.correlation,
+            route,
+            selected,
+            reason,
+        )
+        .await
+    }
+
     pub(crate) async fn completed(
         &self,
         selected: &Selected,
@@ -122,5 +165,12 @@ impl ProtocolEvents {
             record_id: self.record_id.clone(),
             correlation: self.correlation.clone(),
         }
+    }
+
+    pub(crate) async fn completed_failure(&self, selected: &Selected) -> Result<(), ()> {
+        if !self.dispatched.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        append_completed(&self.completed_context(), selected, "failure").await
     }
 }

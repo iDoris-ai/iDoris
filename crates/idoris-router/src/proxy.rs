@@ -1630,7 +1630,7 @@ impl ChatProxy {
     }
 
     /// Account for initial headers only; later SSE fate is a stream outcome.
-    async fn forward_stream_path_observed<F, Fut, E>(
+    pub(crate) async fn forward_stream_path_observed<F, Fut, E>(
         &self,
         endpoint: &str,
         upstream_path: StreamingUpstreamPath,

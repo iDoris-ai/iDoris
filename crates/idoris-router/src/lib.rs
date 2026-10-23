@@ -632,23 +632,21 @@ fn model_resolution_error(error: DispatchError) -> Response {
     }
 }
 
-/// Effective privacy for a protocol endpoint body after gate one.
-async fn protocol_inspected_privacy(
+/// Inspects a protocol endpoint body after gate one, offloading large scans.
+async fn protocol_inspection(
     state: &AppState,
     value: &serde_json::Value,
     raw_len: usize,
-    parsed: &profile::ParsedProfile,
-) -> PrivacyClass {
+    declared: PrivacyClass,
+) -> inspect::Inspection {
     inspect::inspect_body_on_request_path(
         value,
         raw_len,
-        parsed.task.privacy.unwrap_or(PrivacyClass::LocalOnly),
+        declared,
         state.remote_kill_switch.load(Ordering::SeqCst),
     )
     .await
-    .effective
 }
-
 async fn embeddings(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -706,12 +704,28 @@ async fn embeddings(
         Ok(events) => events,
         Err(response) => return response,
     };
-    // INSPECTED (M5-07): same gate as chat, after the key scope admitted
-    // the declared privacy and before the routing policy reads it.
-    parsed.task.privacy =
-        Some(protocol_inspected_privacy(&state, &value, body.len(), &parsed).await);
+    let inspection = protocol_inspection(
+        &state,
+        &value,
+        body.len(),
+        parsed.task.privacy.unwrap_or(PrivacyClass::LocalOnly),
+    )
+    .await;
+    if let Some(events) = &events
+        && events.inspected(&inspection).await.is_err()
+    {
+        return event_log_unavailable_response();
+    }
+    parsed.task.privacy = Some(inspection.effective);
+    if let Some(events) = &events
+        && events.profiled(&parsed).await.is_err()
+    {
+        return event_log_unavailable_response();
+    }
 
-    let cards = dispatch::policy_cards(&state.cards, &state.routing_policy, &parsed)
+    let policy = dispatch::policy_cards(&state.cards, &state.routing_policy, &parsed);
+    let route = policy.route;
+    let cards = policy
         .cards
         .into_iter()
         .filter(dispatch::is_resident_http_service)
@@ -724,14 +738,28 @@ async fn embeddings(
         request_id,
         "/v1/embeddings",
     );
-    let selected = match dispatch::select_with_gate_fallback(
+    let selection = dispatch::select_with_gate_fallback(
         &cards,
         &parsed,
         "",
         None,
         &Default::default(),
         &blocked,
-    ) {
+    );
+    let reason = match &selection {
+        Ok(_) => None,
+        Err(DispatchError::Rejection(rejection)) => Some(rejection.error_type()),
+        Err(DispatchError::Internal(_)) => Some("internal_error"),
+    };
+    if let Some(events) = &events
+        && events
+            .decided(&route, selection.as_ref().ok(), reason)
+            .await
+            .is_err()
+    {
+        return event_log_unavailable_response();
+    }
+    let selected = match selection {
         Ok(selected) => selected,
         Err(DispatchError::Rejection(rejection)) => return rejection_response(rejection),
         Err(DispatchError::Internal(message)) => {
@@ -913,12 +941,28 @@ async fn rerank(
         Ok(events) => events,
         Err(response) => return response,
     };
-    // INSPECTED (M5-07): same gate as chat, after the key scope admitted
-    // the declared privacy and before the routing policy reads it.
-    parsed.task.privacy =
-        Some(protocol_inspected_privacy(&state, &value, body.len(), &parsed).await);
+    let inspection = protocol_inspection(
+        &state,
+        &value,
+        body.len(),
+        parsed.task.privacy.unwrap_or(PrivacyClass::LocalOnly),
+    )
+    .await;
+    if let Some(events) = &events
+        && events.inspected(&inspection).await.is_err()
+    {
+        return event_log_unavailable_response();
+    }
+    parsed.task.privacy = Some(inspection.effective);
+    if let Some(events) = &events
+        && events.profiled(&parsed).await.is_err()
+    {
+        return event_log_unavailable_response();
+    }
 
-    let cards = dispatch::policy_cards(&state.cards, &state.routing_policy, &parsed)
+    let policy = dispatch::policy_cards(&state.cards, &state.routing_policy, &parsed);
+    let route = policy.route;
+    let cards = policy
         .cards
         .into_iter()
         .filter(dispatch::is_resident_http_service)
@@ -931,14 +975,28 @@ async fn rerank(
         request_id,
         "/v1/rerank",
     );
-    let selected = match dispatch::select_with_gate_fallback(
+    let selection = dispatch::select_with_gate_fallback(
         &cards,
         &parsed,
         "",
         None,
         &Default::default(),
         &blocked,
-    ) {
+    );
+    let reason = match &selection {
+        Ok(_) => None,
+        Err(DispatchError::Rejection(rejection)) => Some(rejection.error_type()),
+        Err(DispatchError::Internal(_)) => Some("internal_error"),
+    };
+    if let Some(events) = &events
+        && events
+            .decided(&route, selection.as_ref().ok(), reason)
+            .await
+            .is_err()
+    {
+        return event_log_unavailable_response();
+    }
+    let selected = match selection {
         Ok(selected) => selected,
         Err(DispatchError::Rejection(rejection)) => return rejection_response(rejection),
         Err(DispatchError::Internal(message)) => {
@@ -1120,12 +1178,39 @@ async fn messages(
     {
         return response;
     }
-    // INSPECTED (M5-07): same gate as chat, after the key scope admitted
-    // the declared privacy and before the routing policy reads it.
-    parsed.task.privacy =
-        Some(protocol_inspected_privacy(&state, &value, body.len(), &parsed).await);
+    let events = match protocol_events::ProtocolEvents::begin(
+        &state,
+        &headers,
+        parsed.tenant_id.as_deref(),
+        &record_id,
+    )
+    .await
+    {
+        Ok(events) => events,
+        Err(response) => return response,
+    };
+    let inspection = protocol_inspection(
+        &state,
+        &value,
+        body.len(),
+        parsed.task.privacy.unwrap_or(PrivacyClass::LocalOnly),
+    )
+    .await;
+    if let Some(events) = &events
+        && events.inspected(&inspection).await.is_err()
+    {
+        return event_log_unavailable_response();
+    }
+    parsed.task.privacy = Some(inspection.effective);
+    if let Some(events) = &events
+        && events.profiled(&parsed).await.is_err()
+    {
+        return event_log_unavailable_response();
+    }
 
-    let cards = dispatch::policy_cards(&state.cards, &state.routing_policy, &parsed)
+    let policy = dispatch::policy_cards(&state.cards, &state.routing_policy, &parsed);
+    let route = policy.route;
+    let cards = policy
         .cards
         .into_iter()
         .filter(dispatch::is_resident_http_service)
@@ -1138,14 +1223,28 @@ async fn messages(
         request_id,
         "/v1/messages",
     );
-    let selected = match dispatch::select_with_gate_fallback(
+    let selection = dispatch::select_with_gate_fallback(
         &cards,
         &parsed,
         "",
         None,
         &Default::default(),
         &blocked,
-    ) {
+    );
+    let reason = match &selection {
+        Ok(_) => None,
+        Err(DispatchError::Rejection(rejection)) => Some(rejection.error_type()),
+        Err(DispatchError::Internal(_)) => Some("internal_error"),
+    };
+    if let Some(events) = &events
+        && events
+            .decided(&route, selection.as_ref().ok(), reason)
+            .await
+            .is_err()
+    {
+        return event_log_unavailable_response();
+    }
+    let selected = match selection {
         Ok(selected) => selected,
         Err(DispatchError::Rejection(rejection)) => return rejection_response(rejection),
         Err(DispatchError::Internal(message)) => {
@@ -1187,20 +1286,8 @@ async fn messages(
     };
 
     if stream_requested {
-        return messages_stream(&state, &selected, &value).await;
+        return messages_stream(&state, &selected, &value, events.as_ref()).await;
     }
-
-    let events = match protocol_events::ProtocolEvents::begin(
-        &state,
-        &headers,
-        parsed.tenant_id.as_deref(),
-        &record_id,
-    )
-    .await
-    {
-        Ok(events) => events,
-        Err(response) => return response,
-    };
     let opts = proxy::ForwardOpts {
         request_id: headers
             .get(HEADER_REQUEST_ID)
@@ -1289,23 +1376,38 @@ async fn messages_stream(
     state: &AppState,
     selected: &Selected,
     body_value: &serde_json::Value,
+    events: Option<&protocol_events::ProtocolEvents>,
 ) -> Response {
-    match state
+    let outcome = state
         .proxy
-        .forward_stream_path(
+        .forward_stream_path_observed(
             &selected.card.endpoint,
             proxy::StreamingUpstreamPath::MESSAGES,
             body_value,
             selected.card.provider.id.as_str(),
+            || async {
+                if let Some(events) = events {
+                    events.dispatched(selected).await?;
+                }
+                Ok::<(), ()>(())
+            },
         )
-        .await
-    {
+        .await;
+    let Ok(outcome) = outcome else {
+        return event_log_unavailable_response();
+    };
+    match outcome {
         proxy::StreamOutcome::Buffered {
             status,
             body,
             content_type,
             ..
         } => {
+            if let Some(events) = events
+                && let Err(()) = events.completed_failure(selected).await
+            {
+                return event_log_unavailable_response();
+            }
             let status = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
             let mut response = (status, body).into_response();
             let content_type = content_type.as_deref().unwrap_or("application/json");
@@ -1325,10 +1427,13 @@ async fn messages_stream(
             response: upstream,
         } => {
             let status = StatusCode::from_u16(status).unwrap_or(StatusCode::OK);
-            let body = Body::from_stream(sse::ensure_event_terminated(
-                upstream.into_data_stream(),
-                b"message_stop",
-            ));
+            let completed = events.map(protocol_events::ProtocolEvents::completed_context);
+            let body = completion_observed_body(
+                sse::ensure_event_terminated(upstream.into_data_stream(), b"message_stop"),
+                completed,
+                selected.card.provider.id.clone(),
+                selected.served_locality,
+            );
             let mut response = Response::builder()
                 .status(status)
                 .body(body)
@@ -3026,9 +3131,22 @@ fn terminated_proxy_body_observed(
     provider_id: String,
     served_locality: idoris_contracts::provider::Locality,
 ) -> Body {
+    completion_observed_body(
+        sse::ensure_terminated(upstream.into_data_stream()),
+        completed_event,
+        provider_id,
+        served_locality,
+    )
+}
+
+fn completion_observed_body(
+    guarded: impl futures_util::Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static,
+    completed_event: Option<CompletedEventContext>,
+    provider_id: String,
+    served_locality: idoris_contracts::provider::Locality,
+) -> Body {
     use futures_util::StreamExt;
 
-    let guarded = sse::ensure_terminated(upstream.into_data_stream());
     let observed = futures_util::stream::unfold(
         (
             Box::pin(guarded),
