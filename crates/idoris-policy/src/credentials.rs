@@ -537,8 +537,6 @@ mod tests {
         );
         assert_eq!(source.reveals.get(), 1);
 
-        // The default selected header and caller-supplied aliases are checked
-        // independently: removing x-api-key from the alias list must fail.
         let mut headers = vec![
             ("X-Api-Key".into(), "alternate".into()),
             ("Authorization ".into(), "Bearer spaced".into()),
