@@ -159,3 +159,137 @@ async fn missing_terminal_marker_after_success_never_opens_configured_provider()
         server.verify().await;
     }
 }
+
+#[tokio::test]
+async fn buffered_embeddings_fail_over_after_two_provider_faults() {
+    use idoris_contracts::common::Capability;
+    use tower::ServiceExt;
+
+    let failed = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(wiremock::matchers::path("/v1/embeddings"))
+        .respond_with(ResponseTemplate::new(503).set_body_json(json!({"error":"failed"})))
+        .expect(2)
+        .mount(&failed)
+        .await;
+    let healthy = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(wiremock::matchers::path("/v1/embeddings"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"data":[{"embedding":[0.1]}]})),
+        )
+        .expect(1)
+        .mount(&healthy)
+        .await;
+
+    let mut failing_card =
+        super::tests::resident_component_card("protocol-history-failing", &failed.uri());
+    failing_card.provider.capabilities = vec![Capability::Embedding];
+    let mut healthy_card =
+        super::tests::resident_component_card("protocol-history-healthy", &healthy.uri());
+    healthy_card.provider.capabilities = vec![Capability::Embedding];
+    let app = build_app(AppState {
+        cards: vec![failing_card, healthy_card],
+        ..AppState::default()
+    });
+    let request = || {
+        axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/embeddings")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"model":"embedding-history","input":"hello"}"#,
+            ))
+            .unwrap()
+    };
+
+    for attempt in 1..=2 {
+        let response = app.clone().oneshot(request()).await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "attempt {attempt}"
+        );
+    }
+    let response = app.oneshot(request()).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(failed.received_requests().await.unwrap().len(), 2);
+    let recovered = healthy.received_requests().await.unwrap();
+    assert_eq!(recovered.len(), 1);
+    assert_eq!(recovered[0].url.path(), "/v1/embeddings");
+    let forwarded: Value = serde_json::from_slice(&recovered[0].body).unwrap();
+    assert_eq!(forwarded["model"], "embedding-history");
+    failed.verify().await;
+    healthy.verify().await;
+}
+
+#[tokio::test]
+async fn buffered_protocol_endpoints_return_exact_open_reason_without_third_send() {
+    use idoris_contracts::common::Capability;
+    use tower::ServiceExt;
+
+    for (path, card_id, capability, payload) in [
+        (
+            "/v1/embeddings",
+            "protocol-open-embedding",
+            Capability::Embedding,
+            json!({"model":"embedding-open","input":"hello"}),
+        ),
+        (
+            "/v1/rerank",
+            "protocol-open-rerank",
+            Capability::Rerank,
+            json!({"model":"rerank-open","query":"hello","documents":["world"]}),
+        ),
+        (
+            "/v1/messages",
+            "protocol-open-messages",
+            Capability::Chat,
+            json!({"model":"messages-open","max_tokens":8,"stream":false,"messages":[]}),
+        ),
+    ] {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(wiremock::matchers::path(path))
+            .respond_with(ResponseTemplate::new(503).set_body_json(json!({"error":"failed"})))
+            .expect(2)
+            .mount(&upstream)
+            .await;
+        let mut card = super::tests::resident_component_card(card_id, &upstream.uri());
+        card.provider.capabilities = vec![capability];
+        let app = build_app(AppState {
+            cards: vec![card],
+            ..AppState::default()
+        });
+        let send = || {
+            axum::http::Request::builder()
+                .method("POST")
+                .uri(path)
+                .header("content-type", "application/json")
+                .body(Body::from(payload.to_string()))
+                .unwrap()
+        };
+
+        for attempt in 1..=2 {
+            let response = app.clone().oneshot(send()).await.unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{path} attempt {attempt}"
+            );
+        }
+        let response = app.oneshot(send()).await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{path} open refusal"
+        );
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let error: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(error["error"]["type"], "provider_circuit_open", "{path}");
+        let requests = upstream.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 2, "{path} must not send after opening");
+        assert!(requests.iter().all(|request| request.url.path() == path));
+        upstream.verify().await;
+    }
+}
