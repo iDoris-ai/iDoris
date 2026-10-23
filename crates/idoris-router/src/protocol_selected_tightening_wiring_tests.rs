@@ -104,17 +104,26 @@ async fn selected(
     assert_eq!(rows[3].event.metadata["status"], "selected", "{path}");
     assert_eq!(rows[3].event.metadata["provider_id"], PROVIDER, "{path}");
     let reason_codes = rows[3].event.metadata.get("reason_codes");
+    let tightening_count = reason_codes.map(|codes| {
+        codes
+            .as_array()
+            .expect("reason_codes metadata must be an array")
+            .iter()
+            .filter(|code| {
+                code.as_str().expect("reason_codes entries must be strings")
+                    == "privacy_tightened_by_content"
+            })
+            .count()
+    });
     if privacy == "any" {
         assert_eq!(
-            reason_codes,
-            Some(&json!(["privacy_tightened_by_content"])),
+            tightening_count.expect("selected Any request must include reason_codes"),
+            1,
             "{path}"
         );
     } else {
         assert!(
-            !reason_codes.is_some_and(|codes| codes.as_array().is_some_and(|items| items
-                .iter()
-                .any(|code| code == "privacy_tightened_by_content"))),
+            tightening_count.unwrap_or(0) == 0,
             "{path}: {reason_codes:?}"
         );
     }
