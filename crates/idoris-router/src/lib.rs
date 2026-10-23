@@ -3830,6 +3830,7 @@ mod local_privacy_tests;
 mod virtual_key_wiring_tests;
 
 #[cfg(test)]
+mod subscription_breaker_flow_tests;
 mod correlation_wiring_tests;
 
 #[cfg(test)]
