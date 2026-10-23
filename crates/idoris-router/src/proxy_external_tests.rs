@@ -983,6 +983,11 @@ async fn real_local_model_faults_lock_out_while_ignored_results_preserve_prior_f
 
         let app = fault_app(p.clone(), ignored.clone()).await;
         assert_ne!(app.oneshot(native_request()).await.unwrap().status(), 200);
+        assert_eq!(
+            ready(&p, "native", CredentialClass::Local, 0),
+            Admission::Allowed,
+            "ignored outcome must not count: {ignored:?}"
+        );
         let app = fault_app(
             p.clone(),
             FaultMode::ChatError(BackendError::ModelUnavailable {
