@@ -401,6 +401,18 @@ async fn buffered_protocol_success_is_completed_before_cache_replay() {
             [EventType::Dispatched, EventType::Completed],
             "{path}"
         );
+        let first_record = first.headers()[HEADER_RECORD_ID]
+            .to_str()
+            .unwrap()
+            .to_string();
+        let first_chain = log
+            .events_for_record(Some(budget::PERSONAL_TENANT_ID), &first_record)
+            .unwrap();
+        let completed = first_chain
+            .iter()
+            .find(|row| row.event.event_type == EventType::Completed)
+            .unwrap();
+        assert_eq!(completed.event.metadata["status"], "success", "{path}");
         let replay = app
             .oneshot(post_with_request_id(path, &body))
             .await
@@ -414,39 +426,174 @@ async fn buffered_protocol_success_is_completed_before_cache_replay() {
 #[tokio::test]
 async fn buffered_protocol_completed_append_failure_does_not_publish_success() {
     for (path, capability, body) in cases() {
-        let upstream = MockServer::start().await;
-        Mock::given(method("POST"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok":true})))
-            .expect(1)
-            .mount(&upstream)
-            .await;
-        let mut card = tests::resident_component_card("protocol", &upstream.uri());
-        card.provider.capabilities = vec![capability];
-        let dir = tempfile::TempDir::new().unwrap();
-        let db = dir.path().join("events.sqlite3");
-        let log = Arc::new(EventLogStore::open(&db).unwrap());
-        Connection::open(&db)
-            .unwrap()
-            .execute_batch(
-                "CREATE TRIGGER reject_completed BEFORE INSERT ON event_log_events \
-                 WHEN NEW.event_type='completed' BEGIN SELECT RAISE(ABORT,'failure'); END;",
-            )
-            .unwrap();
-        let app = build_app(AppState {
-            cards: vec![card],
-            event_log: Some(log),
-            proxy: Arc::new(proxy::ChatProxy::new(
-                idoris_upstream::http_client().unwrap(),
-            )),
-            ..AppState::default()
-        });
-        let response = app
-            .oneshot(post_with_request_id(path, &body))
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE, "{path}");
-        upstream.verify().await;
+        for request_id in [false, true] {
+            let upstream = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok":true})))
+                .expect(1)
+                .mount(&upstream)
+                .await;
+            let mut card = tests::resident_component_card("protocol", &upstream.uri());
+            card.provider.capabilities = vec![capability];
+            let dir = tempfile::TempDir::new().unwrap();
+            let db = dir.path().join("events.sqlite3");
+            let log = Arc::new(EventLogStore::open(&db).unwrap());
+            Connection::open(&db)
+                .unwrap()
+                .execute_batch(
+                    "CREATE TRIGGER reject_completed BEFORE INSERT ON event_log_events \
+                     WHEN NEW.event_type='completed' BEGIN SELECT RAISE(ABORT,'failure'); END;",
+                )
+                .unwrap();
+            let app = build_app(AppState {
+                cards: vec![card],
+                event_log: Some(log.clone()),
+                proxy: Arc::new(proxy::ChatProxy::new(
+                    idoris_upstream::http_client().unwrap(),
+                )),
+                ..AppState::default()
+            });
+            let make_request = || {
+                if request_id {
+                    post_with_request_id(path, &body)
+                } else {
+                    post(path, &body)
+                }
+            };
+            let response = app.clone().oneshot(make_request()).await.unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{path}, request_id={request_id}"
+            );
+            assert!(!response.headers().contains_key(HEADER_CACHED), "{path}");
+            assert!(
+                !response.headers().contains_key(HEADER_COST_MINOR),
+                "{path}"
+            );
+            let record = response.headers()[HEADER_RECORD_ID].to_str().unwrap();
+            let rows = log
+                .events_for_record(Some(budget::PERSONAL_TENANT_ID), record)
+                .unwrap();
+            assert_eq!(
+                rows.iter()
+                    .filter(|row| row.event.event_type == EventType::Dispatched)
+                    .count(),
+                1,
+                "{path}, request_id={request_id}"
+            );
+            assert_eq!(
+                rows.iter()
+                    .filter(|row| row.event.event_type == EventType::Completed)
+                    .count(),
+                0,
+                "{path}, request_id={request_id}"
+            );
+
+            if request_id {
+                let retry = app.oneshot(make_request()).await.unwrap();
+                assert_eq!(retry.status(), StatusCode::SERVICE_UNAVAILABLE, "{path}");
+                assert!(!retry.headers().contains_key(HEADER_CACHED), "{path}");
+                assert!(!retry.headers().contains_key(HEADER_COST_MINOR), "{path}");
+                assert!(terminal_events(&log, &retry).is_empty(), "{path}");
+                let original_rows = log
+                    .events_for_record(Some(budget::PERSONAL_TENANT_ID), record)
+                    .unwrap();
+                assert_eq!(
+                    original_rows
+                        .iter()
+                        .filter(|row| row.event.event_type == EventType::Dispatched)
+                        .count(),
+                    1,
+                    "{path}"
+                );
+                assert_eq!(
+                    original_rows
+                        .iter()
+                        .filter(|row| row.event.event_type == EventType::Completed)
+                        .count(),
+                    0,
+                    "{path}"
+                );
+            }
+            upstream.verify().await;
+        }
     }
+}
+
+async fn protocol_events_without_dispatch() -> (
+    protocol_events::ProtocolEvents,
+    Arc<EventLogStore>,
+    dispatch::Selected,
+) {
+    let log = Arc::new(EventLogStore::new(Connection::open_in_memory().unwrap()).unwrap());
+    let state = AppState {
+        event_log: Some(log.clone()),
+        ..AppState::default()
+    };
+    let events = protocol_events::ProtocolEvents::begin(
+        &state,
+        &HeaderMap::new(),
+        None,
+        "direct-no-dispatch",
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let parsed = profile::parse_profile(
+        &HeaderMap::new(),
+        None,
+        idoris_contracts::DeployMode::Personal,
+    )
+    .unwrap();
+    let card = tests::resident_component_card("protocol", "http://127.0.0.1:1");
+    let selected = dispatch::select(&[card], &parsed, "input").unwrap();
+    (events, log, selected)
+}
+
+#[tokio::test]
+async fn protocol_completed_direct_call_without_dispatch_writes_no_terminal() {
+    let (events, log, selected) = protocol_events_without_dispatch().await;
+    events
+        .completed(
+            &selected,
+            &proxy::ForwardOutcome {
+                status: 200,
+                body: Default::default(),
+                content_type: None,
+                cached: false,
+                origin_record_id: None,
+                replayed_served_locality: None,
+                retries: 0,
+                execution: proxy::ExecutionDisposition::Executed,
+            },
+        )
+        .await
+        .unwrap();
+    let rows = log
+        .events_for_record(Some(budget::PERSONAL_TENANT_ID), "direct-no-dispatch")
+        .unwrap();
+    assert_eq!(
+        rows.iter()
+            .map(|row| row.event.event_type)
+            .collect::<Vec<_>>(),
+        [EventType::RequestReceived]
+    );
+}
+
+#[tokio::test]
+async fn protocol_completed_failure_direct_call_without_dispatch_writes_no_terminal() {
+    let (events, log, selected) = protocol_events_without_dispatch().await;
+    events.completed_failure(&selected).await.unwrap();
+    let rows = log
+        .events_for_record(Some(budget::PERSONAL_TENANT_ID), "direct-no-dispatch")
+        .unwrap();
+    assert_eq!(
+        rows.iter()
+            .map(|row| row.event.event_type)
+            .collect::<Vec<_>>(),
+        [EventType::RequestReceived]
+    );
 }
 
 #[tokio::test]
