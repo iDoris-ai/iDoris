@@ -313,6 +313,25 @@ impl EgressCounter {
     }
 }
 
+/// Request fields that identify a caller or correlate requests across an
+/// off-host provider. Loopback runtimes retain the caller's original payload.
+const IDENTITY_FIELDS: &[&str] = &["user", "safety_identifier", "prompt_cache_key", "metadata"];
+
+fn decorrelate(payload: &Value) -> Value {
+    let mut stripped = payload.clone();
+    if let Some(object) = stripped.as_object_mut() {
+        for field in IDENTITY_FIELDS {
+            object.remove(*field);
+        }
+        if let Some(Value::Array(messages)) = object.get_mut("messages") {
+            for message in messages.iter_mut().filter_map(Value::as_object_mut) {
+                message.remove("name");
+            }
+        }
+    }
+    stripped
+}
+
 use idoris_policy::breaker::{Admission, AdmissionTicket, CredentialClass};
 
 // Bound untrusted network headers only; the standalone core contract is uncapped.
@@ -724,6 +743,15 @@ impl ChatProxy {
     /// counter first when the host is not loopback.
     fn outbound(&self, url: &str, payload: &Value) -> reqwest::RequestBuilder {
         let request = self.client.post(url);
+        // Keep local runtimes byte-for-byte compatible; remote providers get
+        // only the request body after the narrow identity-field scrub.
+        let decorrelated;
+        let payload = if is_loopback_url(url) {
+            payload
+        } else {
+            decorrelated = decorrelate(payload);
+            &decorrelated
+        };
         match serde_json::to_vec(payload) {
             Ok(body) => {
                 self.egress.record(url, body.len());
@@ -2152,6 +2180,140 @@ mod tests {
                 bytes: wire_bytes
             }
         );
+    }
+
+    fn off_host_alias_client(server: &wiremock::MockServer) -> reqwest::Client {
+        let address: std::net::SocketAddr =
+            server.uri().trim_start_matches("http://").parse().unwrap();
+        reqwest::Client::builder()
+            .no_proxy()
+            .resolve("provider.test", address)
+            .build()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn actual_off_host_buffered_and_streamed_sends_scrub_only_contract_fields() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_string("{}"))
+            .mount(&server)
+            .await;
+        let proxy = ChatProxy::new(off_host_alias_client(&server));
+        let endpoint = format!("http://provider.test:{}", server.address().port());
+        let original = serde_json::json!({
+            "model": "m",
+            "name": "top-level-name-survives",
+            "user": "alice",
+            "safety_identifier": ["opaque"],
+            "prompt_cache_key": 7,
+            "metadata": {"user_id": "alice"},
+            "messages": [
+                {"role": "user", "name": "alice", "content": [
+                    {"type": "text", "text": "hi", "name": "nested-name-survives"}
+                ], "tool_calls": [{"function": {"name": "lookup", "arguments": "{}"}}]},
+                "opaque-message",
+                {"role": "assistant", "content": "done"}
+            ],
+            "tools": [{"function": {"name": "tool-name-survives"}}]
+        });
+        let mut expected = original.clone();
+        for field in IDENTITY_FIELDS {
+            expected.as_object_mut().unwrap().remove(*field);
+        }
+        expected["messages"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("name");
+        expected["stream"] = Value::Bool(false);
+
+        let buffered = proxy
+            .forward_buffered(&endpoint, &original, &opts(None, "rec-remote"))
+            .await;
+        assert_eq!(buffered.status, 200);
+        assert_eq!(original["messages"][0]["name"], "alice");
+
+        let missing_messages = serde_json::json!({"model":"m","user":"bob"});
+        let missing_result = proxy
+            .forward_buffered(&endpoint, &missing_messages, &opts(None, "rec-missing"))
+            .await;
+        assert_eq!(missing_result.status, 200);
+
+        let wrong_type_messages =
+            serde_json::json!({"model":"m","messages":"unchanged","metadata":false});
+        let wrong_type_result = proxy
+            .forward_buffered(
+                &endpoint,
+                &wrong_type_messages,
+                &opts(None, "rec-wrong-type"),
+            )
+            .await;
+        assert_eq!(wrong_type_result.status, 200);
+
+        let stream_result = proxy.forward_stream(&endpoint, &original).await;
+        assert!(matches!(
+            stream_result,
+            StreamOutcome::Stream { status: 200, .. }
+        ));
+
+        let received = server.received_requests().await.unwrap();
+        assert_eq!(received.len(), 4);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&received[0].body).unwrap(),
+            expected
+        );
+        assert_eq!(
+            serde_json::from_slice::<Value>(&received[1].body).unwrap(),
+            serde_json::json!({"model":"m","stream":false})
+        );
+        assert_eq!(
+            serde_json::from_slice::<Value>(&received[2].body).unwrap(),
+            serde_json::json!({"model":"m","messages":"unchanged","stream":false})
+        );
+        expected["stream"] = Value::Bool(true);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&received[3].body).unwrap(),
+            expected
+        );
+        assert_eq!(
+            proxy.egress(),
+            EgressSnapshot {
+                requests: 4,
+                bytes: received
+                    .iter()
+                    .map(|request| request.body.len() as u64)
+                    .sum(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn loopback_wire_payload_preserves_identity_fields_and_message_names() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .mount(&server)
+            .await;
+        let proxy = ChatProxy::new(reqwest::Client::new());
+        let mut original = serde_json::json!({
+            "model": "m",
+            "user": "alice",
+            "safety_identifier": "sid",
+            "prompt_cache_key": "tenant-key",
+            "metadata": {"user_id": "alice"},
+            "messages": [{"role": "user", "name": "alice", "content": "hi"}]
+        });
+        let sent = proxy
+            .forward_buffered(&server.uri(), &original, &opts(None, "rec-local"))
+            .await;
+        assert_eq!(sent.status, 200);
+        let received = server.received_requests().await.unwrap();
+        original["stream"] = Value::Bool(false);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&received[0].body).unwrap(),
+            original
+        );
+        assert_eq!(proxy.egress(), EgressSnapshot::default());
     }
 
     #[tokio::test]
