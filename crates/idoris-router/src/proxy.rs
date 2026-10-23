@@ -1943,6 +1943,10 @@ mod path_tests;
 mod observation_tests;
 
 #[cfg(test)]
+#[path = "proxy/buffered_finalizer_tests.rs"]
+mod buffered_finalizer_tests;
+
+#[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
