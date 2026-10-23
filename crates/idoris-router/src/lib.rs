@@ -3830,6 +3830,9 @@ mod proxy_completed_wiring_tests;
 mod protocol_events_wiring_tests;
 
 #[cfg(test)]
+mod protocol_selected_tightening_wiring_tests;
+
+#[cfg(test)]
 mod stream_completed_wiring_tests;
 
 #[cfg(test)]
