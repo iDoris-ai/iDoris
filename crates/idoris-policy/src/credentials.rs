@@ -560,7 +560,7 @@ mod tests {
             headers,
             vec![
                 ("Content-Type".into(), "application/json".into()),
-                ("authorization".into(), "Bearer sk-real-value".into()),
+                ("Authorization".into(), "Bearer sk-real-value".into()),
             ]
         );
         assert_eq!(source.reveals.get(), 2);
