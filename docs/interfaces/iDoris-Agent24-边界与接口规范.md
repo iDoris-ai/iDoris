@@ -116,7 +116,15 @@ Agent24 拥有同机 host facts、core 占用与整机账，为 iDoris 划一个
   - `kind` 是封闭枚举（证件/手机/银行卡/统一社会信用代码/车牌/护照/港澳证件/邮箱/密钥类/凭据路径/`input_limit_exceeded`），新增类别属于契约变更。
   - `span = {start, length}`，按 **UTF-16 code unit** 计、半开区间 `[start, start+length)`，`length ≥ 1`；`input_limit_exceeded`（超限未扫描，按 X-1 直接 BLOCK）不带 span。
   - 响应里除枚举外没有任何字符串字段：命中原文、密钥子串不会出现在响应体，也不会经由响应进入日志。
+  - 鉴权：与协议端点同一套 virtual key，但只看 key 的隐私上限，不看 role；`X-iDoris-Privacy` 缺省为 `local_only`。声明 `local_only`（或远程熔断已开启）时任何输入都判 `BLOCK`，只有声明 `any` 且 key 上限允许 `any` 才可能得到 `ALLOW`。调用方同意脱敏目前没有线上表示，因此该端点只会返回 `BLOCK`/`ALLOW`，不会返回 `REDACT`。
 
+- **闸一在推理路径上的运行限制（I0 之后的 main 源码，不是 v0.3.0 发布能力；本节为静态源码核对，未作运行验收）**：
+  - `/v1/chat/completions`、`/v1/embeddings`、`/v1/rerank`、`/v1/messages` 四个推理端点都在鉴权之后、路由策略（chat 另含意图识别）之前检查整个请求体——对象键、字符串与数字都会被提取、拼接后送入闸一判定。只要判定不是 `ALLOW`，就把这次请求钉成 `local_only`（只收紧，不放宽）；没有可用本地候选时上游收到 0 个请求，常见错误是 503 `local_only_unavailable`，也可能是 503 `no_eligible_candidate`（预算/准入/熔断排除），调用方不得假定只有单一 503 原因码。
+  - 不透明内容的判定范围：闸一对上面提取并拼接的整段文本（含对象键，不限字符串值）做一次大小写不敏感的字面匹配 `data:…;base64,`，头部字符限定在 MIME token 字母表加 `/`、`;`、`=`，且要求逗号后有内容、其首字节是 ASCII 字母数字或 `+`/`/`；命中则整次请求按 S3/`BLOCK` 钉成本地。这条规则**不**声称覆盖全部 RFC 2397、浏览器或百分号编码写法。图片/音频/文件 content part（http(s) `image_url`、不带 `data:` 前缀的裸 base64 `source`/`input_audio.data`、文件 id）不会仅因其类型被钉成本地；token id 整数数组（任何长度、任何嵌套位置）也不会仅因是整数数组被钉成本地——数组里的数字只按十进制文本逐位扫描，不代表其编码的内容已被检查。以上都是当前实现的检测覆盖缺口，不是「已证明安全」：data URL 文本本身或解码后暴露的 PII 仍可能被其他规则独立命中并收紧，但不构成不透明性保证。需要「不透明即本地」的调用方应自行显式声明 `local_only`，不能依赖闸一兜底。
+  - 配置了事件存储时，chat 与上述三个协议端点各在 `request.received` 之后、`profiled` 之前写一个 `inspected` 事件；写入失败在发送前返回 503。metadata 只有 `sensitivity`、`privacy`、`labels`（命中类别，可为空）与 `reason`；`reason` 优先级为扫描失败 `inspect_failed` > 远程熔断 `remote_kill_switch` > 内容收紧 `privacy_tightened_by_content`，不含原文或位置，也不区分「内容命中」与「不透明内容」两类收紧。
+  - **远程熔断开关**：启动时 `IDORIS_REMOTE_KILL_SWITCH=1`（且只认这个精确值）让所有请求按 `local_only` 处理，同时跳过不可信远程卡的模型列举与启动探测；运行时切换依赖尚未定义的 Admin 写接口，当前 Admin v0 只读。
+  - **provider 断路器**：二进制默认关闭，`IDORIS_PROVIDER_BREAKER=1` 才启用（共享 conformance 仍约定“持续 5xx 原样透传”）。启用后，OPEN 窗口内不向该 provider 发送请求，选路改试其他候选；全部候选都被断路器排除时返回 503 `no_eligible_candidate`，只有请求已选中某 provider、随后在代理发送前被拒时才返回 503 `provider_circuit_open`——调用方不得假定所有断路器拒绝都带后一个原因码，也不能把这个保证推广到 Supervisor 或订阅路径。
+  - 未接线：响应侧检查（`idoris-policy::credentials::response`）与凭据 broker/`secret://` 注入授权（`idoris-policy::credentials`）目前都只是纯核心，没有 HTTP/流式调用方接入；不能据此声称响应内容或已知凭据注入已在运行时受检。
 
 - 原型请求为 `model=idoris/<role>` 加 `X-iDoris-Privacy`、`X-iDoris-Complexity: simple|complex`、`X-iDoris-Request-Id`。Intent/Capabilities/Fallback 等只按真实需求加法接入；关联 Session/Trace-Id/Request-Id 由内核生成，不信任模块。`X-iDoris-Caller` 可选且只作元数据，永不作为策略依据。近期 Agent24 接入不做流式。
 - 隐私只能维持或收紧。声明角色的调用不从内容重猜 task/role；显式 auto 才委托角色选择，仍不放宽 privacy。未声明角色的其他调用方可由静态规则/判定器选角色。处理顺序：隐私 → 角色/能力 → 付费预算 → 容量 → 选择/声明的降级；预算不足不被静默回落掩盖；仅显式声明 `X-iDoris-Fallback: next_in_chain` 才允许 iDoris 回落到免费候选，并在响应中说明降级。此授权不允许 Agent24 改走另一 provider；I0 router 的实现差距见 §4。
