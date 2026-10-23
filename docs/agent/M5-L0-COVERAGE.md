@@ -15,6 +15,12 @@
 
 允许实体形状的数字子段命中，意味着包含有效号码形状的数字表也可能被拦截。例如 `1111.6222.0212.3456.7894.2222` 中间的有效银行卡会命中。这是避免相邻数字遮蔽实体的保守取舍，不承诺零误报。
 
+## 跨行与 JSON 值边界
+
+跨行扫描只补充结构合法且校验位正确的现代居民身份证（[`scan_crossline_modern_id`](../../crates/idoris-policy/src/inspect/l0.rs#L427)）；手机号和银行卡不会因换行拼接。集成测试 [`crossline_does_not_classify_other_numeric_kinds`](../../crates/idoris-policy/tests/crossline_modern_id.rs#L153) 覆盖这两类跨行负例。数字子窗口的召回规则仍可能拦截含有效实体形状的数字表；#550 的表格抑制改动已撤回，因此这里不声称所有表格负例都已解决，也不把旧的宽表格矩阵算作本轮已执行验收。
+
+Router 会遍历 JSON 的字符串、数字和对象键，并在每个值后追加一个 NUL（[`push_line`](../../crates/idoris-router/src/inspect.rs#L120)）。所以单个字符串中的换行现代身份证会命中；不同 JSON 值之间不会拼成一个数字组。测试 [`crossline_modern_ids_respect_json_value_boundaries`](../../crates/idoris-router/src/inspect_wiring_tests.rs#L559) 验证这两种边界。
+
 ## 尚未覆盖的输入
 
 - **8 位台胞证尚未实现**，留待后续规则及误报边界验收，不称本轮已补齐历史 §1.7 的全部证件。
