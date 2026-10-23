@@ -784,6 +784,242 @@ async fn three_real_subscription_failures_block_the_fourth_before_spawn() {
     );
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn actual_subscription_http_classifier_pins_relay_reasons_and_ignored_interleave() {
+    use crate::subscription::{config::*, runtime::*};
+    use http_body_util::BodyExt;
+    use idoris_upstream::subscription::{
+        profile::{SandboxProfile, SubscriptionCli},
+        relay::SubscriptionRelayConfig,
+    };
+    use std::collections::BTreeMap;
+    use std::ffi::OsString;
+    use std::os::unix::fs::PermissionsExt;
+
+    async fn invoke(
+        app: &axum::Router,
+        peer: &str,
+        privacy: &str,
+        cancellation: CancellationToken,
+    ) -> (u16, serde_json::Value) {
+        let mut request = crate::tests::post_chat(
+            r#"{"model":"idoris/daily","messages":[{"role":"user","content":"hello"}]}"#,
+            &[("x-idoris-privacy", privacy)],
+        );
+        request.extensions_mut().insert(axum::extract::ConnectInfo(
+            crate::connection::ConnectionInfo::from_parts(peer.parse().unwrap(), cancellation),
+        ));
+        let response = app.clone().oneshot(request).await.unwrap();
+        let status = response.status().as_u16();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        (status, json)
+    }
+
+    fn make_app(root: &std::path::Path, p: Arc<ChatProxy>, script: Option<&str>) -> axum::Router {
+        let card: idoris_contracts::ComponentCard =
+            serde_yaml::from_str(include_str!("../../../config/components/subscription.yaml"))
+                .unwrap();
+        let cfg = SubscriptionConfig::snapshot(
+            Some("personal"),
+            Some("1"),
+            None,
+            Some(SANDBOX_PROFILE_ID),
+            Some("claude"),
+        );
+        let authorized = authorize_subscription(&cfg, &card).unwrap().unwrap();
+        if let Some(script) = script {
+            let program = root.join("claude");
+            std::fs::write(&program, script).unwrap();
+            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let relay = SubscriptionRelayConfig::with_environment(
+            SandboxProfile::fixed(SubscriptionCli::Claude),
+            BTreeMap::from([(
+                OsString::from("PATH"),
+                OsString::from(format!("{}:/usr/bin:/bin", root.display())),
+            )]),
+        );
+        let handle =
+            SubscriptionRuntimeHandle::build_with_relay_config(authorized, &card, relay).unwrap();
+        let mut subscriptions = SubscriptionRuntimeRegistry::default();
+        subscriptions.insert(handle).unwrap();
+        crate::build_app(crate::AppState {
+            cards: vec![card],
+            subscriptions,
+            proxy: p,
+            routing_policy: serde_yaml::from_str(
+                "routing_policy:\n  version: 1\n  rules: []\n  default: { tiers: [remote], fail_closed: true }\n",
+            )
+            .unwrap(),
+            ..Default::default()
+        })
+    }
+
+    fn assert_oauth(p: &ChatProxy, expected: Admission) {
+        assert_eq!(
+            ready(p, "subscription", CredentialClass::OAuth, 0),
+            expected
+        );
+        assert_eq!(
+            ready(p, "subscription", CredentialClass::Local, 0),
+            Admission::Allowed
+        );
+    }
+
+    // Each CLI run emits one deterministic outcome. Output-limit results are
+    // ignored by the production HTTP caller and must preserve existing faults.
+    let root = tempfile::tempdir().unwrap();
+    let counter = root.path().join("spawn-count");
+    let script = format!(
+        "#!/bin/sh\ncat >/dev/null\nn=$(cat '{}' 2>/dev/null || printf 0)\nn=$((n + 1))\nprintf '%s' \"$n\" > '{}'\ncase \"$n\" in\n1|3|5) printf relay-failure; exit 1 ;;\n2|4) head -c 262145 /dev/zero ;;\nesac\n",
+        counter.display(),
+        counter.display(),
+    );
+    let p = Arc::new(proxy());
+    let app = make_app(root.path(), p.clone(), Some(&script));
+    for (ordinal, expected_reason, expected_book) in [
+        (1, "RELAY_CLI_FAILED", Admission::Allowed),
+        (2, "RELAY_OUTPUT_LIMIT", Admission::Allowed),
+        (3, "RELAY_CLI_FAILED", Admission::Allowed),
+        (4, "RELAY_OUTPUT_LIMIT", Admission::Allowed),
+        (
+            5,
+            "RELAY_CLI_FAILED",
+            Admission::Rejected {
+                retry_after_ms: 60_000,
+            },
+        ),
+    ] {
+        let (status, body) = invoke(&app, "127.0.0.1:9000", "any", CancellationToken::new()).await;
+        assert_eq!(status, 502, "call {ordinal}");
+        assert_eq!(
+            body["error"]["reason_code"], expected_reason,
+            "call {ordinal}"
+        );
+        assert_oauth(&p, expected_book);
+        assert_eq!(
+            std::fs::read_to_string(&counter).unwrap(),
+            ordinal.to_string()
+        );
+    }
+
+    // A successful actual relay resets accumulated fault history. The next
+    // failure is therefore only fault one and leaves OAuth available.
+    let root = tempfile::tempdir().unwrap();
+    let counter = root.path().join("spawn-count");
+    let script = format!(
+        "#!/bin/sh\ncat >/dev/null\nn=$(cat '{}' 2>/dev/null || printf 0)\nn=$((n + 1))\nprintf '%s' \"$n\" > '{}'\ncase \"$n\" in\n1|2|4) printf relay-failure; exit 1 ;;\n3) printf relay-success ;;\nesac\n",
+        counter.display(),
+        counter.display(),
+    );
+    let p = Arc::new(proxy());
+    let app = make_app(root.path(), p.clone(), Some(&script));
+    for (ordinal, expected_reason, expected_status) in [
+        (1, Some("RELAY_CLI_FAILED"), 502),
+        (2, Some("RELAY_CLI_FAILED"), 502),
+        (3, None, 200),
+        (4, Some("RELAY_CLI_FAILED"), 502),
+    ] {
+        let (status, body) = invoke(&app, "127.0.0.1:9000", "any", CancellationToken::new()).await;
+        assert_eq!(status, expected_status, "call {ordinal}");
+        if let Some(reason) = expected_reason {
+            assert_eq!(body["error"]["reason_code"], reason, "call {ordinal}");
+        }
+        assert_oauth(&p, Admission::Allowed);
+        assert_eq!(
+            std::fs::read_to_string(&counter).unwrap(),
+            ordinal.to_string()
+        );
+    }
+
+    // Empty output and spawn failure are real relay errors with independent
+    // literal reason-code oracles. Neither is a simulated classifier input.
+    let root = tempfile::tempdir().unwrap();
+    let p = Arc::new(proxy());
+    let app = make_app(root.path(), p.clone(), Some("#!/bin/sh\ncat >/dev/null\n"));
+    let (status, body) = invoke(&app, "127.0.0.1:9000", "any", CancellationToken::new()).await;
+    assert_eq!(status, 502);
+    assert_eq!(body["error"]["reason_code"], "RELAY_EMPTY_OUTPUT");
+    assert_oauth(&p, Admission::Allowed);
+
+    let root = tempfile::tempdir().unwrap();
+    let p = Arc::new(proxy());
+    let app = make_app(root.path(), p.clone(), None);
+    let (status, body) = invoke(&app, "127.0.0.1:9000", "any", CancellationToken::new()).await;
+    assert_eq!(status, 502);
+    assert_eq!(body["error"]["reason_code"], "RELAY_SPAWN_FAILED");
+    assert_oauth(&p, Admission::Allowed);
+
+    // Pre-cancellation deterministically exercises the real ignored outcome
+    // before process spawn, without creating a process-cleanup race.
+    let root = tempfile::tempdir().unwrap();
+    let p = Arc::new(proxy());
+    let app = make_app(
+        root.path(),
+        p.clone(),
+        Some("#!/bin/sh\ncat >/dev/null\nprintf ok\n"),
+    );
+    let cancelled = CancellationToken::new();
+    cancelled.cancel();
+    let (status, body) = invoke(&app, "127.0.0.1:9000", "any", cancelled).await;
+    assert_eq!(status, 502);
+    assert_eq!(body["error"]["reason_code"], "RELAY_CANCELLED");
+    assert_oauth(&p, Admission::Allowed);
+
+    // Source refusal is a reachable pre-dispatch ignored result. It must not
+    // spawn the local fixture or change either provider class.
+    let root = tempfile::tempdir().unwrap();
+    let counter = root.path().join("spawn-count");
+    let script = format!(
+        "#!/bin/sh\nprintf x >> '{}'\ncat >/dev/null\nprintf ok\n",
+        counter.display()
+    );
+    let p = Arc::new(proxy());
+    let app = make_app(root.path(), p.clone(), Some(&script));
+    let (status, body) = invoke(&app, "10.0.0.2:9000", "any", CancellationToken::new()).await;
+    assert_eq!(status, 403);
+    assert_eq!(
+        body["error"]["reason_code"],
+        "SUBSCRIPTION_SOURCE_FORBIDDEN"
+    );
+    assert!(!counter.exists(), "source refusal must precede CLI spawn");
+    assert_oauth(&p, Admission::Allowed);
+
+    let (status, body) = invoke(
+        &app,
+        "127.0.0.1:9000",
+        "local_only",
+        CancellationToken::new(),
+    )
+    .await;
+    assert_eq!(status, 503);
+    assert_eq!(body["error"]["reason_code"], "local_only_unavailable");
+    assert!(!counter.exists(), "privacy refusal must precede CLI spawn");
+    assert_oauth(&p, Admission::Allowed);
+
+    let card: idoris_contracts::ComponentCard =
+        serde_yaml::from_str(include_str!("../../../config/components/subscription.yaml")).unwrap();
+    let p = Arc::new(proxy());
+    let app = crate::build_app(crate::AppState {
+        cards: vec![card],
+        proxy: p.clone(),
+        routing_policy: serde_yaml::from_str(
+            "routing_policy:\n  version: 1\n  rules: []\n  default: { tiers: [remote], fail_closed: true }\n",
+        )
+        .unwrap(),
+        ..Default::default()
+    });
+    let (status, body) = invoke(&app, "127.0.0.1:9000", "any", CancellationToken::new()).await;
+    assert_eq!(status, 503);
+    assert_eq!(
+        body["error"]["reason_code"],
+        "SUBSCRIPTION_RUNTIME_UNAVAILABLE"
+    );
+    assert_oauth(&p, Admission::Allowed);
+}
+
 async fn fault_app(p: Arc<ChatProxy>, fault: FaultMode) -> axum::Router {
     let victim = matches!(fault, FaultMode::VictimPanic | FaultMode::VictimError);
     let startup = matches!(fault, FaultMode::StartupUpstream);
