@@ -632,20 +632,6 @@ fn model_resolution_error(error: DispatchError) -> Response {
     }
 }
 
-/// Effective privacy for a protocol endpoint body after gate one.
-fn protocol_inspected_privacy(
-    state: &AppState,
-    value: &serde_json::Value,
-    parsed: &profile::ParsedProfile,
-) -> PrivacyClass {
-    inspect::inspect_body(
-        value,
-        parsed.task.privacy.unwrap_or(PrivacyClass::LocalOnly),
-        state.remote_kill_switch.load(Ordering::SeqCst),
-    )
-    .effective
-}
-
 async fn embeddings(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -703,11 +689,26 @@ async fn embeddings(
         Ok(events) => events,
         Err(response) => return response,
     };
-    // INSPECTED (M5-07): same gate as chat, after the key scope admitted
-    // the declared privacy and before the routing policy reads it.
-    parsed.task.privacy = Some(protocol_inspected_privacy(&state, &value, &parsed));
+    let inspection = inspect::inspect_body(
+        &value,
+        parsed.task.privacy.unwrap_or(PrivacyClass::LocalOnly),
+        state.remote_kill_switch.load(Ordering::SeqCst),
+    );
+    if let Some(events) = &events
+        && events.inspected(&inspection).await.is_err()
+    {
+        return event_log_unavailable_response();
+    }
+    parsed.task.privacy = Some(inspection.effective);
+    if let Some(events) = &events
+        && events.profiled(&parsed).await.is_err()
+    {
+        return event_log_unavailable_response();
+    }
 
-    let cards = dispatch::policy_cards(&state.cards, &state.routing_policy, &parsed)
+    let policy = dispatch::policy_cards(&state.cards, &state.routing_policy, &parsed);
+    let route = policy.route;
+    let cards = policy
         .cards
         .into_iter()
         .filter(dispatch::is_resident_http_service)
@@ -720,14 +721,28 @@ async fn embeddings(
         request_id,
         "/v1/embeddings",
     );
-    let selected = match dispatch::select_with_gate_fallback(
+    let selection = dispatch::select_with_gate_fallback(
         &cards,
         &parsed,
         "",
         None,
         &Default::default(),
         &blocked,
-    ) {
+    );
+    let reason = match &selection {
+        Ok(_) => None,
+        Err(DispatchError::Rejection(rejection)) => Some(rejection.error_type()),
+        Err(DispatchError::Internal(_)) => Some("internal_error"),
+    };
+    if let Some(events) = &events
+        && events
+            .decided(&route, selection.as_ref().ok(), reason)
+            .await
+            .is_err()
+    {
+        return event_log_unavailable_response();
+    }
+    let selected = match selection {
         Ok(selected) => selected,
         Err(DispatchError::Rejection(rejection)) => return rejection_response(rejection),
         Err(DispatchError::Internal(message)) => {
@@ -909,11 +924,26 @@ async fn rerank(
         Ok(events) => events,
         Err(response) => return response,
     };
-    // INSPECTED (M5-07): same gate as chat, after the key scope admitted
-    // the declared privacy and before the routing policy reads it.
-    parsed.task.privacy = Some(protocol_inspected_privacy(&state, &value, &parsed));
+    let inspection = inspect::inspect_body(
+        &value,
+        parsed.task.privacy.unwrap_or(PrivacyClass::LocalOnly),
+        state.remote_kill_switch.load(Ordering::SeqCst),
+    );
+    if let Some(events) = &events
+        && events.inspected(&inspection).await.is_err()
+    {
+        return event_log_unavailable_response();
+    }
+    parsed.task.privacy = Some(inspection.effective);
+    if let Some(events) = &events
+        && events.profiled(&parsed).await.is_err()
+    {
+        return event_log_unavailable_response();
+    }
 
-    let cards = dispatch::policy_cards(&state.cards, &state.routing_policy, &parsed)
+    let policy = dispatch::policy_cards(&state.cards, &state.routing_policy, &parsed);
+    let route = policy.route;
+    let cards = policy
         .cards
         .into_iter()
         .filter(dispatch::is_resident_http_service)
@@ -926,14 +956,28 @@ async fn rerank(
         request_id,
         "/v1/rerank",
     );
-    let selected = match dispatch::select_with_gate_fallback(
+    let selection = dispatch::select_with_gate_fallback(
         &cards,
         &parsed,
         "",
         None,
         &Default::default(),
         &blocked,
-    ) {
+    );
+    let reason = match &selection {
+        Ok(_) => None,
+        Err(DispatchError::Rejection(rejection)) => Some(rejection.error_type()),
+        Err(DispatchError::Internal(_)) => Some("internal_error"),
+    };
+    if let Some(events) = &events
+        && events
+            .decided(&route, selection.as_ref().ok(), reason)
+            .await
+            .is_err()
+    {
+        return event_log_unavailable_response();
+    }
+    let selected = match selection {
         Ok(selected) => selected,
         Err(DispatchError::Rejection(rejection)) => return rejection_response(rejection),
         Err(DispatchError::Internal(message)) => {
@@ -1115,11 +1159,37 @@ async fn messages(
     {
         return response;
     }
-    // INSPECTED (M5-07): same gate as chat, after the key scope admitted
-    // the declared privacy and before the routing policy reads it.
-    parsed.task.privacy = Some(protocol_inspected_privacy(&state, &value, &parsed));
+    let events = match protocol_events::ProtocolEvents::begin(
+        &state,
+        &headers,
+        parsed.tenant_id.as_deref(),
+        &record_id,
+    )
+    .await
+    {
+        Ok(events) => events,
+        Err(response) => return response,
+    };
+    let inspection = inspect::inspect_body(
+        &value,
+        parsed.task.privacy.unwrap_or(PrivacyClass::LocalOnly),
+        state.remote_kill_switch.load(Ordering::SeqCst),
+    );
+    if let Some(events) = &events
+        && events.inspected(&inspection).await.is_err()
+    {
+        return event_log_unavailable_response();
+    }
+    parsed.task.privacy = Some(inspection.effective);
+    if let Some(events) = &events
+        && events.profiled(&parsed).await.is_err()
+    {
+        return event_log_unavailable_response();
+    }
 
-    let cards = dispatch::policy_cards(&state.cards, &state.routing_policy, &parsed)
+    let policy = dispatch::policy_cards(&state.cards, &state.routing_policy, &parsed);
+    let route = policy.route;
+    let cards = policy
         .cards
         .into_iter()
         .filter(dispatch::is_resident_http_service)
@@ -1132,14 +1202,28 @@ async fn messages(
         request_id,
         "/v1/messages",
     );
-    let selected = match dispatch::select_with_gate_fallback(
+    let selection = dispatch::select_with_gate_fallback(
         &cards,
         &parsed,
         "",
         None,
         &Default::default(),
         &blocked,
-    ) {
+    );
+    let reason = match &selection {
+        Ok(_) => None,
+        Err(DispatchError::Rejection(rejection)) => Some(rejection.error_type()),
+        Err(DispatchError::Internal(_)) => Some("internal_error"),
+    };
+    if let Some(events) = &events
+        && events
+            .decided(&route, selection.as_ref().ok(), reason)
+            .await
+            .is_err()
+    {
+        return event_log_unavailable_response();
+    }
+    let selected = match selection {
         Ok(selected) => selected,
         Err(DispatchError::Rejection(rejection)) => return rejection_response(rejection),
         Err(DispatchError::Internal(message)) => {
@@ -1178,18 +1262,6 @@ async fn messages(
                 },
             );
         }
-    };
-
-    let events = match protocol_events::ProtocolEvents::begin(
-        &state,
-        &headers,
-        parsed.tenant_id.as_deref(),
-        &record_id,
-    )
-    .await
-    {
-        Ok(events) => events,
-        Err(response) => return response,
     };
 
     if stream_requested {
