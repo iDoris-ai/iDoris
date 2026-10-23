@@ -83,7 +83,8 @@ async fn failed_finalization_never_publishes_success_or_repeats_the_post() {
         ),
     )
     .await
-    .expect("retained failure replay did not finish in time");
+    .expect("retained failure replay did not finish in time")
+    .unwrap();
     assert_eq!(replay.status, 503);
     assert!(!replay.cached);
     assert_eq!(replay.execution, ExecutionDisposition::Replay);
@@ -173,7 +174,8 @@ async fn finalization_holds_the_cache_and_waiters_until_it_commits() {
     assert_eq!(leader_outcome.status, 200);
     let replay = tokio::time::timeout(BARRIER_TIMEOUT, waiter)
         .await
-        .expect("waiter did not receive the finalized result");
+        .expect("waiter did not receive the finalized result")
+        .unwrap();
     assert_eq!(replay.status, 200);
     assert!(replay.cached);
     assert_eq!(replay.execution, ExecutionDisposition::Replay);
@@ -199,7 +201,8 @@ async fn finalization_holds_the_cache_and_waiters_until_it_commits() {
         ),
     )
     .await
-    .expect("successful cache hit did not finish in time");
+    .expect("successful cache hit did not finish in time")
+    .unwrap();
     assert_eq!(cache_hit.status, 200);
     assert!(cache_hit.cached);
     assert_eq!(cache_hit.execution, ExecutionDisposition::Replay);
@@ -284,7 +287,8 @@ async fn cancellation_during_finalization_retains_the_executed_request_marker() 
         ),
     )
     .await
-    .expect("cancelled-operation replay did not finish in time");
+    .expect("cancelled-operation replay did not finish in time")
+    .unwrap();
     assert_eq!(replay.status, 502);
     assert!(!replay.cached);
     assert_eq!(replay.execution, ExecutionDisposition::Replay);
