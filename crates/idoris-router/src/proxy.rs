@@ -2213,15 +2213,20 @@ mod tests {
                     {"type": "text", "text": "hi", "name": "nested-name-survives"}
                 ], "tool_calls": [{"function": {"name": "lookup", "arguments": "{}"}}]},
                 "opaque-message",
+                {"role": "function", "name": "legacy-function", "content": "{}"},
                 {"role": "assistant", "content": "done"}
             ],
             "tools": [{"function": {"name": "tool-name-survives"}}]
         });
         let mut expected = original.clone();
-        for field in IDENTITY_FIELDS {
-            expected.as_object_mut().unwrap().remove(*field);
+        for field in ["user", "safety_identifier", "prompt_cache_key", "metadata"] {
+            expected.as_object_mut().unwrap().remove(field);
         }
         expected["messages"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("name");
+        expected["messages"][2]
             .as_object_mut()
             .unwrap()
             .remove("name");
@@ -2261,6 +2266,28 @@ mod tests {
         assert_eq!(
             serde_json::from_slice::<Value>(&received[0].body).unwrap(),
             expected
+        );
+        let buffered_wire: Value = serde_json::from_slice(&received[0].body).unwrap();
+        for field in ["user", "safety_identifier", "prompt_cache_key", "metadata"] {
+            assert!(
+                buffered_wire.get(field).is_none(),
+                "{field} survived off-host scrub"
+            );
+        }
+        assert!(buffered_wire["messages"][0].get("name").is_none());
+        assert!(buffered_wire["messages"][2].get("name").is_none());
+        assert_eq!(buffered_wire["name"], "top-level-name-survives");
+        assert_eq!(
+            buffered_wire["messages"][0]["content"][0]["name"],
+            "nested-name-survives"
+        );
+        assert_eq!(
+            buffered_wire["messages"][0]["tool_calls"][0]["function"]["name"],
+            "lookup"
+        );
+        assert_eq!(
+            buffered_wire["tools"][0]["function"]["name"],
+            "tool-name-survives"
         );
         assert_eq!(
             serde_json::from_slice::<Value>(&received[1].body).unwrap(),
