@@ -462,6 +462,10 @@ mod tests {
                 ..base.clone()
             },
             Grant {
+                header: String::new(),
+                ..base.clone()
+            },
+            Grant {
                 header: "Authorization ".into(),
                 ..base
             },
@@ -529,6 +533,73 @@ mod tests {
                 ("Content-Type".into(), "application/json".into()),
                 ("x-trace-id".into(), "trace-123".into()),
                 ("x-api-key".into(), "sk-real-value".into()),
+            ]
+        );
+        assert_eq!(source.reveals.get(), 1);
+
+        // The default selected header and caller-supplied aliases are checked
+        // independently: removing x-api-key from the alias list must fail.
+        let mut headers = vec![
+            ("X-Api-Key".into(), "alternate".into()),
+            ("Authorization ".into(), "Bearer spaced".into()),
+            (" cookie".into(), "session=spaced".into()),
+            ("Content-Type".into(), "application/json".into()),
+        ];
+        broker(
+            &grants(),
+            &source,
+            &request(
+                &secret,
+                "https://api.openai.com/v1/chat/completions",
+                "POST",
+            ),
+            &mut headers,
+        )
+        .unwrap();
+        assert_eq!(
+            headers,
+            vec![
+                ("Content-Type".into(), "application/json".into()),
+                ("authorization".into(), "Bearer sk-real-value".into()),
+            ]
+        );
+        assert_eq!(source.reveals.get(), 2);
+    }
+
+    #[test]
+    fn broker_deduplicates_custom_selected_header_case_insensitively() {
+        let source = CountingSource {
+            reveals: Cell::new(0),
+        };
+        let secret = openai();
+        let custom = vec![Grant {
+            header: "x-custom-key".into(),
+            scheme: HeaderScheme::Raw,
+            ..grants().remove(0)
+        }];
+        let mut headers = vec![
+            ("X-Custom-Key".into(), "attacker-first".into()),
+            ("x-custom-key".into(), "attacker-second".into()),
+            ("Content-Type".into(), "application/json".into()),
+        ];
+
+        broker(
+            &custom,
+            &source,
+            &request(
+                &secret,
+                "https://api.openai.com/v1/chat/completions",
+                "POST",
+            ),
+            &mut headers,
+        )
+        .unwrap();
+
+        assert_eq!(
+            headers,
+            vec![
+                ("Content-Type".into(), "application/json".into()),
+                ("x-custom-key".into(), "sk-real-value".into()),
             ]
         );
         assert_eq!(source.reveals.get(), 1);
