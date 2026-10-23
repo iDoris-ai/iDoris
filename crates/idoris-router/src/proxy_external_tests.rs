@@ -953,39 +953,119 @@ async fn actual_subscription_http_classifier_pins_relay_reasons_and_ignored_inte
         );
     }
 
-    // Empty output and spawn failure are real relay errors with independent
-    // literal reason-code oracles. Neither is a simulated classifier input.
+    // Empty output follows two actual CLI faults, so classifying it as ignored
+    // cannot hide behind an empty breaker book.
     let root = tempfile::tempdir().unwrap();
+    let counter = root.path().join("spawn-count");
+    let script = format!(
+        "#!/bin/sh\ncat >/dev/null\nn=$(cat '{}' 2>/dev/null || printf 0)\nn=$((n + 1))\nprintf '%s' \"$n\" > '{}'\ncase \"$n\" in\n1|2) printf relay-failure; exit 1 ;;\nesac\n",
+        counter.display(),
+        counter.display(),
+    );
     let p = Arc::new(proxy());
-    let app = make_app(root.path(), p.clone(), Some("#!/bin/sh\ncat >/dev/null\n"));
-    let (status, body) = invoke(&app, "127.0.0.1:9000", "any", CancellationToken::new()).await;
-    assert_eq!(status, 502);
-    assert_eq!(body["error"]["reason_code"], "RELAY_EMPTY_OUTPUT");
-    assert_oauth(&p, Admission::Allowed);
+    let app = make_app(root.path(), p.clone(), Some(&script));
+    for (ordinal, expected_reason, expected_book) in [
+        (1, "RELAY_CLI_FAILED", Admission::Allowed),
+        (2, "RELAY_CLI_FAILED", Admission::Allowed),
+        (
+            3,
+            "RELAY_EMPTY_OUTPUT",
+            Admission::Rejected {
+                retry_after_ms: 60_000,
+            },
+        ),
+    ] {
+        let (status, body) = invoke(&app, "127.0.0.1:9000", "any", CancellationToken::new()).await;
+        assert_eq!(status, 502, "empty-output witness call {ordinal}");
+        assert_eq!(
+            body["error"]["reason_code"], expected_reason,
+            "empty-output witness call {ordinal}"
+        );
+        assert_oauth(&p, expected_book);
+        assert_eq!(
+            std::fs::read_to_string(&counter).unwrap(),
+            ordinal.to_string()
+        );
+    }
 
+    // Two CLI failures establish the history before the executable disappears
+    // and the third call reaches the actual spawn-failure boundary.
     let root = tempfile::tempdir().unwrap();
+    let counter = root.path().join("spawn-count");
+    let script = format!(
+        "#!/bin/sh\ncat >/dev/null\nn=$(cat '{}' 2>/dev/null || printf 0)\nn=$((n + 1))\nprintf '%s' \"$n\" > '{}'\nprintf relay-failure\nexit 1\n",
+        counter.display(),
+        counter.display(),
+    );
     let p = Arc::new(proxy());
-    let app = make_app(root.path(), p.clone(), None);
+    let app = make_app(root.path(), p.clone(), Some(&script));
+    for ordinal in 1..=2 {
+        let (status, body) = invoke(&app, "127.0.0.1:9000", "any", CancellationToken::new()).await;
+        assert_eq!(status, 502, "spawn-failure witness call {ordinal}");
+        assert_eq!(
+            body["error"]["reason_code"], "RELAY_CLI_FAILED",
+            "spawn-failure witness call {ordinal}"
+        );
+        assert_oauth(&p, Admission::Allowed);
+        assert_eq!(
+            std::fs::read_to_string(&counter).unwrap(),
+            ordinal.to_string()
+        );
+    }
+    std::fs::remove_file(root.path().join("claude")).unwrap();
     let (status, body) = invoke(&app, "127.0.0.1:9000", "any", CancellationToken::new()).await;
     assert_eq!(status, 502);
     assert_eq!(body["error"]["reason_code"], "RELAY_SPAWN_FAILED");
-    assert_oauth(&p, Admission::Allowed);
-
-    // Pre-cancellation deterministically exercises the real ignored outcome
-    // before process spawn, without creating a process-cleanup race.
-    let root = tempfile::tempdir().unwrap();
-    let p = Arc::new(proxy());
-    let app = make_app(
-        root.path(),
-        p.clone(),
-        Some("#!/bin/sh\ncat >/dev/null\nprintf ok\n"),
+    assert_oauth(
+        &p,
+        Admission::Rejected {
+            retry_after_ms: 60_000,
+        },
     );
+    assert_eq!(std::fs::read_to_string(&counter).unwrap(), "2");
+
+    // Cancellation follows two actual CLI faults. It must be ignored without
+    // spawning, then the next real fault must open OAuth's breaker.
+    let root = tempfile::tempdir().unwrap();
+    let counter = root.path().join("spawn-count");
+    let script = format!(
+        "#!/bin/sh\ncat >/dev/null\nn=$(cat '{}' 2>/dev/null || printf 0)\nn=$((n + 1))\nprintf '%s' \"$n\" > '{}'\nprintf relay-failure\nexit 1\n",
+        counter.display(),
+        counter.display(),
+    );
+    let p = Arc::new(proxy());
+    let app = make_app(root.path(), p.clone(), Some(&script));
+    for ordinal in 1..=2 {
+        let (status, body) = invoke(&app, "127.0.0.1:9000", "any", CancellationToken::new()).await;
+        assert_eq!(status, 502, "cancelled witness call {ordinal}");
+        assert_eq!(
+            body["error"]["reason_code"], "RELAY_CLI_FAILED",
+            "cancelled witness call {ordinal}"
+        );
+        assert_oauth(&p, Admission::Allowed);
+        assert_eq!(
+            std::fs::read_to_string(&counter).unwrap(),
+            ordinal.to_string()
+        );
+    }
     let cancelled = CancellationToken::new();
     cancelled.cancel();
     let (status, body) = invoke(&app, "127.0.0.1:9000", "any", cancelled).await;
     assert_eq!(status, 502);
     assert_eq!(body["error"]["reason_code"], "RELAY_CANCELLED");
     assert_oauth(&p, Admission::Allowed);
+    assert_eq!(std::fs::read_to_string(&counter).unwrap(), "2");
+
+    let (status, body) = invoke(&app, "127.0.0.1:9000", "any", CancellationToken::new()).await;
+    assert_eq!(status, 502);
+    assert_eq!(body["error"]["reason_code"], "RELAY_CLI_FAILED");
+    assert_oauth(
+        &p,
+        Admission::Rejected {
+            retry_after_ms: 60_000,
+        },
+    );
+    assert_eq!(std::fs::read_to_string(&counter).unwrap(), "3");
 
     // Source refusal is a reachable pre-dispatch ignored result. It must not
     // spawn the local fixture or change either provider class.
