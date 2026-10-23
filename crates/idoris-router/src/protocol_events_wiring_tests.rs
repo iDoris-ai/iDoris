@@ -121,7 +121,26 @@ async fn messages_stream_records_one_success_after_message_stop_in_tenant_scope(
         [EventType::Dispatched]
     );
     let _ = response.into_body().collect().await.unwrap();
-    let chain = log.events_for_record(Some("tenant-a"), &record).unwrap();
+    let chain = log
+        .events_for_record(Some("tenant-a"), &record)
+        .unwrap()
+        .into_iter()
+        .filter(|row| row.event.event_type != EventType::AuditFinalized)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        chain
+            .iter()
+            .map(|row| row.event.event_type)
+            .collect::<Vec<_>>(),
+        [
+            EventType::RequestReceived,
+            EventType::Inspected,
+            EventType::Profiled,
+            EventType::Decided,
+            EventType::Dispatched,
+            EventType::Completed,
+        ]
+    );
     assert_eq!(
         chain
             .iter()
@@ -426,6 +445,228 @@ async fn buffered_protocol_completed_append_failure_does_not_publish_success() {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE, "{path}");
+        upstream.verify().await;
+    }
+}
+
+#[tokio::test]
+async fn protocol_success_records_six_events_in_order_for_every_endpoint() {
+    for (path, capability, body) in cases() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok":true})))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+        let mut card = tests::resident_component_card("protocol", &upstream.uri());
+        card.provider.capabilities = vec![capability];
+        let log = Arc::new(EventLogStore::new(Connection::open_in_memory().unwrap()).unwrap());
+        let response = build_app(AppState {
+            cards: vec![card],
+            event_log: Some(log.clone()),
+            ..AppState::default()
+        })
+        .oneshot(post(path, &body))
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{path}");
+        let record = response.headers()[HEADER_RECORD_ID]
+            .to_str()
+            .unwrap()
+            .to_string();
+        let _ = response.into_body().collect().await.unwrap();
+        let rows = log
+            .events_for_record(Some(budget::PERSONAL_TENANT_ID), &record)
+            .unwrap()
+            .into_iter()
+            .filter(|row| row.event.event_type != EventType::AuditFinalized)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.event.event_type)
+                .collect::<Vec<_>>(),
+            [
+                EventType::RequestReceived,
+                EventType::Inspected,
+                EventType::Profiled,
+                EventType::Decided,
+                EventType::Dispatched,
+                EventType::Completed,
+            ],
+            "{path}"
+        );
+        upstream.verify().await;
+    }
+}
+
+#[tokio::test]
+async fn tightened_protocol_request_records_content_free_rejection_without_egress() {
+    for (path, capability, mut body) in cases() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&upstream)
+            .await;
+        let secret = "11010519491231002X";
+        if path == "/v1/embeddings" {
+            body["input"] = json!(secret);
+        } else if path == "/v1/rerank" {
+            body["documents"] = json!([secret]);
+        } else {
+            body["messages"][0]["content"] = json!(secret);
+        }
+        let mut card = tests::resident_component_card("any-only", &upstream.uri());
+        card.provider.capabilities = vec![capability];
+        card.provider.privacy_class = idoris_contracts::common::PrivacyClass::Any;
+        card.privacy_class = idoris_contracts::common::PrivacyClass::Any;
+        let log = Arc::new(EventLogStore::new(Connection::open_in_memory().unwrap()).unwrap());
+        let mut request = post(path, &body);
+        request
+            .headers_mut()
+            .insert("x-idoris-privacy", "any".parse().unwrap());
+        let response = build_app(AppState {
+            cards: vec![card],
+            event_log: Some(log.clone()),
+            ..AppState::default()
+        })
+        .oneshot(request)
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE, "{path}");
+        let record = response.headers()[HEADER_RECORD_ID].to_str().unwrap();
+        let rows = log
+            .events_for_record(Some(budget::PERSONAL_TENANT_ID), record)
+            .unwrap()
+            .into_iter()
+            .filter(|row| row.event.event_type != EventType::AuditFinalized)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.event.event_type)
+                .collect::<Vec<_>>(),
+            [
+                EventType::RequestReceived,
+                EventType::Inspected,
+                EventType::Profiled,
+                EventType::Decided
+            ],
+            "{path}"
+        );
+        assert_eq!(rows[1].event.metadata["privacy"], "local_only");
+        assert_eq!(
+            rows[1].event.metadata["reason"],
+            "privacy_tightened_by_content"
+        );
+        assert_eq!(rows[3].event.metadata["status"], "rejected");
+        let metadata = serde_json::to_string(
+            &rows
+                .iter()
+                .map(|row| &row.event.metadata)
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        assert!(!metadata.contains(secret), "{path}: {metadata}");
+        assert!(
+            upstream.received_requests().await.unwrap().is_empty(),
+            "{path}"
+        );
+        upstream.verify().await;
+    }
+}
+
+#[tokio::test]
+async fn malformed_correlation_and_key_scope_denial_write_no_protocol_events() {
+    let log = Arc::new(EventLogStore::new(Connection::open_in_memory().unwrap()).unwrap());
+    let (app, key) = tenant_test_app(
+        AppState {
+            deploy_mode: idoris_contracts::DeployMode::Tenant,
+            event_log: Some(log.clone()),
+            ..AppState::default()
+        },
+        "tenant-a",
+    );
+    let mut malformed = post("/v1/messages", &cases()[2].2);
+    malformed
+        .headers_mut()
+        .insert("x-idoris-trace-id", "x".repeat(257).parse().unwrap());
+    let response = app
+        .clone()
+        .oneshot(tenant_test_request(malformed, &key))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let record = response.headers()[HEADER_RECORD_ID].to_str().unwrap();
+    assert!(
+        log.events_for_record(Some("tenant-a"), record)
+            .unwrap()
+            .is_empty()
+    );
+
+    let mut denied = post("/v1/messages", &cases()[2].2);
+    denied
+        .headers_mut()
+        .insert("x-idoris-tenant", "tenant-b".parse().unwrap());
+    let response = app
+        .oneshot(tenant_test_request(denied, &key))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let record = response.headers()[HEADER_RECORD_ID].to_str().unwrap();
+    assert!(
+        log.events_for_record(Some("tenant-a"), record)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        log.events_for_record(Some("tenant-b"), record)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn protocol_early_event_append_failures_are_generic_and_precede_egress() {
+    for event in ["request.received", "inspected", "profiled", "decided"] {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&upstream)
+            .await;
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = dir.path().join("events.sqlite3");
+        let log = Arc::new(EventLogStore::open(&db).unwrap());
+        Connection::open(&db)
+            .unwrap()
+            .execute_batch(&format!(
+                "CREATE TRIGGER reject_event BEFORE INSERT ON event_log_events WHEN NEW.event_type='{event}' BEGIN SELECT RAISE(ABORT,'failure'); END;"
+            ))
+            .unwrap();
+        let card = tests::resident_component_card("protocol", &upstream.uri());
+        let response = build_app(AppState {
+            cards: vec![card],
+            event_log: Some(log.clone()),
+            ..AppState::default()
+        })
+        .oneshot(post(
+            "/v1/messages",
+            &json!({"model":"m","max_tokens":8,"messages":[{"role":"user","content":"safe"}]}),
+        ))
+        .await
+        .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{event}"
+        );
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let payload: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(payload["error"]["type"], "event_log_unavailable", "{event}");
+        assert!(
+            upstream.received_requests().await.unwrap().is_empty(),
+            "{event}"
+        );
         upstream.verify().await;
     }
 }
