@@ -139,6 +139,31 @@ async fn injected_identifiers_send_zero_bytes_to_a_non_local_card() {
 }
 
 #[tokio::test]
+async fn large_chat_body_scans_the_full_body_before_routing() {
+    let (upstream, state, event_log) = any_only_upstream().await;
+    let body = json!({
+        "model": "idoris/daily",
+        "messages": [{"role": "user", "content": format!("{} {ID}", "x".repeat(32 * 1024))}],
+    });
+    let (status, record_id, text) = chat(state, body).await;
+    assert_eq!(
+        status,
+        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+        "{text}"
+    );
+    assert!(text.contains("local_only_unavailable"), "{text}");
+    assert!(upstream.received_requests().await.unwrap().is_empty());
+    let events = event_log
+        .events_for_record(Some(budget::PERSONAL_TENANT_ID), &record_id)
+        .unwrap();
+    assert_eq!(events[1].event.metadata["privacy"], "local_only");
+    assert_eq!(
+        events[1].event.metadata["reason"],
+        "privacy_tightened_by_content"
+    );
+}
+
+#[tokio::test]
 async fn declared_local_only_is_never_loosened_and_carries_no_tightening_reason() {
     let (_upstream, state, event_log) = any_only_upstream().await;
     let response = build_app(state)

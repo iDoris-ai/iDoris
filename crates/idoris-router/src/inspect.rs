@@ -94,6 +94,8 @@ pub(crate) struct Inspection {
     pub tightened: bool,
     /// The remote kill switch, not the content, is what pinned `any`.
     pub killed: bool,
+    /// The scan itself did not complete (docs/15 §1.5 `inspect_failed`).
+    pub failed: bool,
 }
 
 /// Inspects every object key, string and number in `body` — content parts,
@@ -136,15 +138,63 @@ pub(crate) fn inspect_body(
     let tightened = declared == PrivacyClass::Any && effective == PrivacyClass::LocalOnly;
     Inspection {
         killed: tightened && kill_switch,
+        failed: false,
         tightened,
         response,
         effective,
     }
 }
 
+/// Bodies this large are scanned away from the async request worker.
+const OFF_WORKER_BYTES: usize = 32 * 1024;
+
+/// Inspects a request body inline when small and on Tokio's blocking pool when large.
+/// A blocking-task failure pins the request to local_only with S3/BLOCK.
+pub(crate) async fn inspect_body_on_request_path(
+    body: &serde_json::Value,
+    raw_len: usize,
+    declared: PrivacyClass,
+    kill_switch: bool,
+) -> Inspection {
+    inspect_body_on_request_path_with(body, raw_len, declared, kill_switch, inspect_body).await
+}
+
+async fn inspect_body_on_request_path_with<F>(
+    body: &serde_json::Value,
+    raw_len: usize,
+    declared: PrivacyClass,
+    kill_switch: bool,
+    scanner: F,
+) -> Inspection
+where
+    F: FnOnce(&serde_json::Value, PrivacyClass, bool) -> Inspection + Send + 'static,
+{
+    if raw_len < OFF_WORKER_BYTES {
+        return scanner(body, declared, kill_switch);
+    }
+    let owned = body.clone();
+    tokio::task::spawn_blocking(move || scanner(&owned, declared, kill_switch))
+        .await
+        .unwrap_or_else(|_| failed_inspection(declared))
+}
+
+fn failed_inspection(declared: PrivacyClass) -> Inspection {
+    Inspection {
+        response: idoris_contracts::InspectResponse {
+            sensitivity: idoris_contracts::inspect::Sensitivity::S3,
+            findings: Vec::new(),
+            action: idoris_contracts::inspect::InspectAction::Block,
+        },
+        effective: PrivacyClass::LocalOnly,
+        tightened: declared == PrivacyClass::Any,
+        killed: false,
+        failed: true,
+    }
+}
+
 /// Appends the `inspected` fact: sensitivity, effective privacy, the
-/// distinct finding kinds, and a reason only when content tightened the
-/// caller's `any`. Never spans, never content.
+/// distinct finding kinds, and a reason for failed scans or when inspection
+/// tightened the caller's `any`. Never spans, never content.
 pub(crate) async fn append_inspected(
     store: Arc<idoris_tenancy::event_log::EventLogStore>,
     tenant_id: String,
@@ -169,12 +219,18 @@ pub(crate) async fn append_inspected(
         serde_json::to_value(inspection.effective).map_err(|_| ())?,
     );
     metadata.insert("labels".to_string(), serde_json::Value::Array(labels));
-    if inspection.tightened {
-        let reason = if inspection.killed {
+    let reason = if inspection.failed {
+        Some("inspect_failed")
+    } else if inspection.tightened {
+        Some(if inspection.killed {
             "remote_kill_switch"
         } else {
             "privacy_tightened_by_content"
-        };
+        })
+    } else {
+        None
+    };
+    if let Some(reason) = reason {
         metadata.insert("reason".to_string(), serde_json::Value::from(reason));
     }
     let ts_utc_ms = std::time::SystemTime::now()
@@ -196,4 +252,174 @@ pub(crate) async fn append_inspected(
         metadata,
     };
     crate::run_event_log_write(move || store.append(Some(&tenant_id), &event).map(|_| ())).await
+}
+
+#[cfg(test)]
+mod request_path_tests {
+    #![allow(clippy::unwrap_used)]
+
+    use super::*;
+    use std::sync::mpsc;
+
+    async fn persisted_inspected_metadata(
+        inspection: &Inspection,
+    ) -> std::collections::BTreeMap<String, serde_json::Value> {
+        let store = Arc::new(
+            idoris_tenancy::event_log::EventLogStore::new(
+                rusqlite::Connection::open_in_memory().unwrap(),
+            )
+            .unwrap(),
+        );
+        append_inspected(
+            store.clone(),
+            "tenant".to_string(),
+            "record".to_string(),
+            &crate::correlation::RequestCorrelation::default(),
+            inspection,
+        )
+        .await
+        .unwrap();
+        let events = store.events_for_record(Some("tenant"), "record").unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].event.event_type,
+            idoris_tenancy::event_log::EventType::Inspected
+        );
+        events[0].event.metadata.clone()
+    }
+
+    #[tokio::test]
+    async fn failed_inspection_reason_is_persisted_for_any_and_local_only_without_content() {
+        for declared in [PrivacyClass::Any, PrivacyClass::LocalOnly] {
+            let failure = failed_inspection(declared);
+            let metadata = persisted_inspected_metadata(&failure).await;
+            assert_eq!(
+                metadata.get("reason"),
+                Some(&serde_json::json!("inspect_failed"))
+            );
+            assert_eq!(metadata["sensitivity"], "S3");
+            assert_eq!(metadata["privacy"], "local_only");
+            assert_eq!(metadata["labels"], serde_json::json!([]));
+            assert_eq!(metadata.len(), 4);
+            assert!(
+                !serde_json::to_string(&metadata)
+                    .unwrap()
+                    .contains("safe-looking")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn successful_local_only_inspection_has_no_failure_reason() {
+        let inspection = inspect_body(
+            &serde_json::json!({"messages": [{"content": "safe-looking"}]}),
+            PrivacyClass::LocalOnly,
+            false,
+        );
+        let metadata = persisted_inspected_metadata(&inspection).await;
+        assert_eq!(metadata["privacy"], "local_only");
+        assert_eq!(metadata["sensitivity"], "S0");
+        assert_eq!(metadata["labels"], serde_json::json!([]));
+        assert!(!metadata.contains_key("reason"));
+        assert_eq!(metadata.len(), 3);
+        assert!(
+            !serde_json::to_string(&metadata)
+                .unwrap()
+                .contains("safe-looking")
+        );
+    }
+
+    #[tokio::test]
+    async fn request_path_uses_inline_below_and_blocking_pool_at_and_above_threshold() {
+        let body = serde_json::json!({"messages": []});
+        let caller = std::thread::current().id();
+        for (raw_len, expected_inline) in [
+            (OFF_WORKER_BYTES - 1, true),
+            (OFF_WORKER_BYTES, false),
+            (OFF_WORKER_BYTES + 1, false),
+        ] {
+            let (tx, rx) = mpsc::channel();
+            let scanner = move |value: &serde_json::Value, declared, kill_switch| {
+                tx.send(std::thread::current().id()).unwrap();
+                inspect_body(value, declared, kill_switch)
+            };
+            let result = inspect_body_on_request_path_with(
+                &body,
+                raw_len,
+                PrivacyClass::Any,
+                false,
+                scanner,
+            )
+            .await;
+            let scanner_thread = rx.recv().unwrap();
+            assert_eq!(
+                scanner_thread == caller,
+                expected_inline,
+                "raw_len={raw_len}"
+            );
+            assert!(!result.failed);
+        }
+    }
+
+    #[tokio::test]
+    async fn blocking_scanner_failure_fails_closed() {
+        let result = inspect_body_on_request_path_with(
+            &serde_json::json!({"content": "safe-looking"}),
+            OFF_WORKER_BYTES,
+            PrivacyClass::Any,
+            false,
+            |_, _, _| panic!("injected scanner task failure"),
+        )
+        .await;
+        assert_eq!(result.effective, PrivacyClass::LocalOnly);
+        assert!(result.tightened && result.failed);
+        assert_eq!(
+            result.response.sensitivity,
+            idoris_contracts::inspect::Sensitivity::S3
+        );
+        assert_eq!(
+            result.response.action,
+            idoris_contracts::inspect::InspectAction::Block
+        );
+        let local_only = failed_inspection(PrivacyClass::LocalOnly);
+        assert_eq!(local_only.effective, PrivacyClass::LocalOnly);
+        assert!(!local_only.tightened);
+        assert!(local_only.failed);
+    }
+
+    #[tokio::test]
+    async fn large_request_path_preserves_inline_verdict_and_json_value_boundaries() {
+        let body = serde_json::json!({
+            "messages": [{"content": format!("{}电话 13812345678", "x".repeat(OFF_WORKER_BYTES))}],
+            "number": 13812345678_i64,
+        });
+        let raw_len = serde_json::to_vec(&body).unwrap().len();
+        let off = inspect_body_on_request_path(&body, raw_len, PrivacyClass::Any, false).await;
+        let inline = inspect_body(&body, PrivacyClass::Any, false);
+        assert_eq!(off.response, inline.response);
+        assert_eq!(off.effective, inline.effective);
+        assert_eq!(off.tightened, inline.tightened);
+        assert_eq!(off.failed, inline.failed);
+        assert!(off.tightened && !off.failed);
+
+        let boundary = serde_json::json!({
+            "padding": "x".repeat(OFF_WORKER_BYTES),
+            "left": "1101051949",
+            "right": "1231002X",
+        });
+        let raw_len = serde_json::to_vec(&boundary).unwrap().len();
+        let async_result =
+            inspect_body_on_request_path(&boundary, raw_len, PrivacyClass::Any, false).await;
+        let inline_result = inspect_body(&boundary, PrivacyClass::Any, false);
+        assert_eq!(async_result.response, inline_result.response);
+        assert_eq!(
+            async_result.response.action,
+            idoris_contracts::inspect::InspectAction::Allow
+        );
+        assert!(!async_result
+            .response
+            .findings
+            .iter()
+            .any(|finding| finding.kind == idoris_contracts::inspect::FindingKind::CnResidentId));
+    }
 }

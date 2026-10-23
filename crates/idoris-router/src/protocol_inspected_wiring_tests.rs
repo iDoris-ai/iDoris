@@ -105,3 +105,15 @@ async fn identifiers_pin_protocol_bodies_local_with_zero_egress() {
         assert_eq!(received, 0, "remote egress must be zero for {path}");
     }
 }
+
+#[tokio::test]
+async fn large_protocol_bodies_are_fully_inspected_before_routing() {
+    for (path, capability, _, dirty) in cases() {
+        let mut large = dirty;
+        large["inspection_probe"] = json!(format!("{} {ID}", "x".repeat(32 * 1024)));
+        let (status, error, received) = send(path, capability, &large).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{path}: {error}");
+        assert_eq!(error["error"]["type"], "local_only_unavailable", "{path}");
+        assert_eq!(received, 0, "remote egress must be zero for {path}");
+    }
+}

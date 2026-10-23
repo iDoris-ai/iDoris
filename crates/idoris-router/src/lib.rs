@@ -632,6 +632,21 @@ fn model_resolution_error(error: DispatchError) -> Response {
     }
 }
 
+/// Inspects a protocol endpoint body after gate one, offloading large scans.
+async fn protocol_inspection(
+    state: &AppState,
+    value: &serde_json::Value,
+    raw_len: usize,
+    declared: PrivacyClass,
+) -> inspect::Inspection {
+    inspect::inspect_body_on_request_path(
+        value,
+        raw_len,
+        declared,
+        state.remote_kill_switch.load(Ordering::SeqCst),
+    )
+    .await
+}
 async fn embeddings(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -689,11 +704,13 @@ async fn embeddings(
         Ok(events) => events,
         Err(response) => return response,
     };
-    let inspection = inspect::inspect_body(
+    let inspection = protocol_inspection(
+        &state,
         &value,
+        body.len(),
         parsed.task.privacy.unwrap_or(PrivacyClass::LocalOnly),
-        state.remote_kill_switch.load(Ordering::SeqCst),
-    );
+    )
+    .await;
     if let Some(events) = &events
         && events.inspected(&inspection).await.is_err()
     {
@@ -924,11 +941,13 @@ async fn rerank(
         Ok(events) => events,
         Err(response) => return response,
     };
-    let inspection = inspect::inspect_body(
+    let inspection = protocol_inspection(
+        &state,
         &value,
+        body.len(),
         parsed.task.privacy.unwrap_or(PrivacyClass::LocalOnly),
-        state.remote_kill_switch.load(Ordering::SeqCst),
-    );
+    )
+    .await;
     if let Some(events) = &events
         && events.inspected(&inspection).await.is_err()
     {
@@ -1170,11 +1189,13 @@ async fn messages(
         Ok(events) => events,
         Err(response) => return response,
     };
-    let inspection = inspect::inspect_body(
+    let inspection = protocol_inspection(
+        &state,
         &value,
+        body.len(),
         parsed.task.privacy.unwrap_or(PrivacyClass::LocalOnly),
-        state.remote_kill_switch.load(Ordering::SeqCst),
-    );
+    )
+    .await;
     if let Some(events) = &events
         && events.inspected(&inspection).await.is_err()
     {
@@ -2486,11 +2507,13 @@ async fn chat_completions(
     // INSPECTED: after the key scope admitted the declared privacy, before
     // profiling, routing policy, or a remote intent detector can see `any`.
     let mut parsed = parsed;
-    let inspection = inspect::inspect_body(
+    let inspection = inspect::inspect_body_on_request_path(
         &value,
+        body.len(),
         parsed.task.privacy.unwrap_or(PrivacyClass::LocalOnly),
         state.remote_kill_switch.load(Ordering::SeqCst),
-    );
+    )
+    .await;
     if let Some((event_log, tenant_id)) = event_context.as_ref()
         && inspect::append_inspected(
             event_log.clone(),

@@ -76,6 +76,19 @@ pub enum HeaderScheme {
     Raw,
 }
 
+/// Caller headers that carry credentials or select the billed account.
+/// They are cleared before the single authorized credential is injected.
+const CREDENTIAL_HEADERS: &[&str] = &[
+    "authorization",
+    "proxy-authorization",
+    "x-api-key",
+    "api-key",
+    "x-goog-api-key",
+    "openai-organization",
+    "openai-project",
+    "cookie",
+];
+
 /// One allowed use of one secret: exact HTTPS host, methods, path prefix,
 /// and the header the value goes into.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -86,6 +99,20 @@ pub struct Grant {
     pub path_prefix: String,
     pub header: String,
     pub scheme: HeaderScheme,
+}
+
+impl Grant {
+    /// Reject grants that cannot be scoped or written as a valid header.
+    fn is_valid(&self) -> bool {
+        !self.host.is_empty()
+            && !self.methods.is_empty()
+            && self.path_prefix.starts_with('/')
+            && !self.header.is_empty()
+            && self
+                .header
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
+    }
 }
 
 /// What a caller asks the broker to do; carries no value.
@@ -131,7 +158,8 @@ pub fn authorize<'g>(
     grants
         .iter()
         .find(|grant| {
-            grant.secret == *request.secret
+            grant.is_valid()
+                && grant.secret == *request.secret
                 && grant.host == host
                 && grant
                     .methods
@@ -185,10 +213,16 @@ pub fn broker_guarded(
     ))
 }
 
-/// C-1: every caller-supplied header with this name (any case, any count)
-/// is removed before the injected one is added.
+/// C-1: every caller credential/billing header and every copy of the selected
+/// header (any case, any count) is removed before the authorized value is added.
 pub fn inject(headers: &mut Vec<(String, String)>, name: &str, value: String) {
-    headers.retain(|(existing, _)| !existing.eq_ignore_ascii_case(name));
+    headers.retain(|(existing, _)| {
+        let existing = existing.trim();
+        !existing.eq_ignore_ascii_case(name)
+            && !CREDENTIAL_HEADERS
+                .iter()
+                .any(|credential| existing.eq_ignore_ascii_case(credential))
+    });
     headers.push((name.to_string(), value));
 }
 
@@ -396,6 +430,177 @@ mod tests {
             }
         );
         assert!(!format!("{audit:?}").contains("sk-real-value"));
+    }
+
+    #[test]
+    fn malformed_grants_are_rejected_before_reveal_or_header_mutation() {
+        let source = CountingSource {
+            reveals: Cell::new(0),
+        };
+        let secret = openai();
+        let original_headers = vec![("Content-Type".to_string(), "application/json".to_string())];
+        let base = grants().remove(0);
+        let invalid = [
+            Grant {
+                host: String::new(),
+                ..base.clone()
+            },
+            Grant {
+                methods: Vec::new(),
+                ..base.clone()
+            },
+            Grant {
+                path_prefix: String::new(),
+                ..base.clone()
+            },
+            Grant {
+                path_prefix: "v1/chat".into(),
+                ..base.clone()
+            },
+            Grant {
+                header: "Authorization\r\nX-Evil: 1".into(),
+                ..base.clone()
+            },
+            Grant {
+                header: String::new(),
+                ..base.clone()
+            },
+            Grant {
+                header: "Authorization ".into(),
+                ..base
+            },
+        ];
+
+        for grant in invalid {
+            let mut headers = original_headers.clone();
+            assert_eq!(
+                broker(
+                    &[grant],
+                    &source,
+                    &request(
+                        &secret,
+                        "https://api.openai.com/v1/chat/completions",
+                        "POST"
+                    ),
+                    &mut headers,
+                ),
+                Err(CredentialError::NotGranted),
+            );
+            assert_eq!(headers, original_headers);
+        }
+        assert_eq!(source.reveals.get(), 0, "invalid grants must not reveal");
+    }
+
+    #[test]
+    fn broker_scrubs_alternate_credentials_and_billing_headers() {
+        let source = CountingSource {
+            reveals: Cell::new(0),
+        };
+        let secret = openai();
+        let raw_key = vec![Grant {
+            header: "x-api-key".into(),
+            scheme: HeaderScheme::Raw,
+            ..grants().remove(0)
+        }];
+        let mut headers = vec![
+            ("Authorization".into(), "Bearer attacker".into()),
+            ("aUtHoRiZaTiOn".into(), "Bearer duplicate".into()),
+            ("Proxy-Authorization".into(), "Basic attacker".into()),
+            ("API-Key".into(), "alternate".into()),
+            ("X-Goog-Api-Key".into(), "alternate".into()),
+            ("OpenAI-Organization".into(), "org-attacker".into()),
+            ("openai-project".into(), "project-attacker".into()),
+            ("Cookie".into(), "session=attacker".into()),
+            ("Content-Type".into(), "application/json".into()),
+            ("x-trace-id".into(), "trace-123".into()),
+        ];
+
+        broker(
+            &raw_key,
+            &source,
+            &request(
+                &secret,
+                "https://api.openai.com/v1/chat/completions",
+                "POST",
+            ),
+            &mut headers,
+        )
+        .unwrap();
+
+        assert_eq!(
+            headers,
+            vec![
+                ("Content-Type".into(), "application/json".into()),
+                ("x-trace-id".into(), "trace-123".into()),
+                ("x-api-key".into(), "sk-real-value".into()),
+            ]
+        );
+        assert_eq!(source.reveals.get(), 1);
+
+        let mut headers = vec![
+            ("X-Api-Key".into(), "alternate".into()),
+            ("Authorization ".into(), "Bearer spaced".into()),
+            (" cookie".into(), "session=spaced".into()),
+            ("Content-Type".into(), "application/json".into()),
+        ];
+        broker(
+            &grants(),
+            &source,
+            &request(
+                &secret,
+                "https://api.openai.com/v1/chat/completions",
+                "POST",
+            ),
+            &mut headers,
+        )
+        .unwrap();
+        assert_eq!(
+            headers,
+            vec![
+                ("Content-Type".into(), "application/json".into()),
+                ("Authorization".into(), "Bearer sk-real-value".into()),
+            ]
+        );
+        assert_eq!(source.reveals.get(), 2);
+    }
+
+    #[test]
+    fn broker_deduplicates_custom_selected_header_case_insensitively() {
+        let source = CountingSource {
+            reveals: Cell::new(0),
+        };
+        let secret = openai();
+        let custom = vec![Grant {
+            header: "x-custom-key".into(),
+            scheme: HeaderScheme::Raw,
+            ..grants().remove(0)
+        }];
+        let mut headers = vec![
+            ("X-Custom-Key".into(), "attacker-first".into()),
+            ("x-custom-key".into(), "attacker-second".into()),
+            ("Content-Type".into(), "application/json".into()),
+        ];
+
+        broker(
+            &custom,
+            &source,
+            &request(
+                &secret,
+                "https://api.openai.com/v1/chat/completions",
+                "POST",
+            ),
+            &mut headers,
+        )
+        .unwrap();
+
+        assert_eq!(
+            headers,
+            vec![
+                ("Content-Type".into(), "application/json".into()),
+                ("x-custom-key".into(), "sk-real-value".into()),
+            ]
+        );
+        assert_eq!(source.reveals.get(), 1);
     }
 
     /// The old `["%2e", "%2f", "%5c"]` denylist on this branch never covered
