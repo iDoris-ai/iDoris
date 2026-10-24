@@ -328,6 +328,7 @@ pub(crate) fn select_with_gate_fallback(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn select_with_gate_fallback_and_completion(
     cards: &[ComponentCard],
     profile: &ParsedProfile,
@@ -390,6 +391,7 @@ pub(crate) fn select_with_gate_snapshot(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn select_with_gate_snapshot_and_completion(
     cards: &[ComponentCard],
     profile: &ParsedProfile,
