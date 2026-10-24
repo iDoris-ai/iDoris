@@ -35,6 +35,10 @@ fn written_layouts_are_found_and_table_rows_stay_public() {
         ("2200 1234 5678 9019", FindingKind::BankCard),
         ("9792123456789018", FindingKind::BankCard),
         ("6222 0212 3456 7894", FindingKind::BankCard),
+        ("电话：138 123 45678", FindingKind::CnMobile),
+        ("手机 138-123-45678", FindingKind::CnMobile),
+        ("请联系 1391 2345 678", FindingKind::CnMobile),
+        ("我的号码是138 123 45678，加微信", FindingKind::CnMobile),
     ] {
         let response = response(input);
         assert!(
@@ -51,6 +55,8 @@ fn written_layouts_are_found_and_table_rows_stay_public() {
         "1949 1978 200",
         "共 1500 2000 300 元",
         "年份 1998 2005 100 1999 2006 200",
+        "139 000 00000",
+        "1500 2000 301",
     ] {
         let response = response(input);
         assert_eq!(

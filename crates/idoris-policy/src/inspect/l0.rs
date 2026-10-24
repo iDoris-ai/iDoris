@@ -111,8 +111,12 @@ pub(super) fn scan_plain(units: &[u16]) -> Vec<Hit> {
                 offset += len;
                 seg_start = seg_end + 1;
             }
-            // These two rows sum to a mobile. They are tables, not written phones.
-            if count == 3 && matches!(lengths, [3, 3, 5] | [4, 4, 3]) {
+            // These two rows sum to a mobile. Without a phone cue they are
+            // tables. A nearby 电话/手机/号码/联系/微信/tel/mobile keeps the hit.
+            if count == 3
+                && matches!(lengths, [3, 3, 5] | [4, 4, 3])
+                && !phone_context(units, i, group_end)
+            {
                 let span = group_end - i;
                 grouped.retain(|hit| {
                     hit.kind != FindingKind::CnMobile || hit.start != i || hit.length != span
@@ -128,6 +132,41 @@ pub(super) fn scan_plain(units: &[u16]) -> Vec<Hit> {
     super::secrets::scan(units, &mut hits);
     scan_crossline_modern_id(units, &mut hits);
     sort_dedup(hits)
+}
+
+fn phone_context(units: &[u16], start: usize, end: usize) -> bool {
+    let from = start.saturating_sub(24);
+    let to = (end + 24).min(units.len());
+    let window = &units[from..to];
+    contains_units(window, "电话")
+        || contains_units(window, "手机")
+        || contains_units(window, "号码")
+        || contains_units(window, "联系")
+        || contains_units(window, "微信")
+        || contains_ascii_ci(window, "tel")
+        || contains_ascii_ci(window, "mobile")
+}
+
+fn contains_units(window: &[u16], needle: &str) -> bool {
+    let needle: Vec<u16> = needle.encode_utf16().collect();
+    window.windows(needle.len()).any(|chunk| chunk == needle)
+}
+
+fn contains_ascii_ci(window: &[u16], needle: &str) -> bool {
+    let needle: Vec<u16> = needle
+        .chars()
+        .map(|unit| u16::from(unit.to_ascii_lowercase() as u8))
+        .collect();
+    window.windows(needle.len()).any(|chunk| {
+        chunk.iter().zip(&needle).all(|(&unit, &want)| {
+            let folded = if (b'A'..=b'Z').contains(&(unit as u8)) {
+                unit + 32
+            } else {
+                unit
+            };
+            folded == want
+        })
+    })
 }
 
 /// Append exact 0086 mobile layouts without displacing existing numeric hits.
