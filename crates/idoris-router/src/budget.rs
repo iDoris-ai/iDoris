@@ -216,6 +216,19 @@ pub fn reserve(
     )
 }
 
+/// Runs the same admission checks as [`reserve`] without inserting a row.
+pub fn check_admission(
+    ledger: &BudgetLedger,
+    tenant_id: Option<&str>,
+    provider_id: &str,
+    estimated_cost_minor: i64,
+) -> Result<(), BudgetError> {
+    ledger.check_admission(
+        &scope(tenant_id, provider_id),
+        Price::Known(estimated_cost_minor),
+    )
+}
+
 /// Finalizes a reservation with the actual cost, returning the amount
 /// actually charged.
 pub fn settle(

@@ -38,7 +38,14 @@ impl<'a> ProxyBudget<'a> {
         if budget::is_paid(Some(estimate)) && ledger.is_none() {
             return Err(budget::ledger_unavailable_error(tenant_id, provider_id));
         }
-        let admission = ReservationGuard::vacant(ledger, tenant_id);
+        let admission = if budget::is_paid(Some(estimate)) {
+            if let Some(ledger) = ledger {
+                budget::check_admission(ledger, tenant_id, provider_id, 0)?;
+            }
+            ReservationGuard::vacant(ledger, tenant_id)
+        } else {
+            ReservationGuard::reserve(ledger, tenant_id, provider_id, 0)?
+        };
         Ok(Self {
             ledger,
             tenant_id,
@@ -194,6 +201,34 @@ mod tests {
         let view = ledger.tenant_readview(budget::PERSONAL_TENANT_ID).unwrap();
         assert_eq!(view.spent_minor, 9);
         assert_eq!(view.reserved_minor, 0);
+    }
+
+    #[test]
+    fn paid_replay_admission_is_denied_without_inserting_a_row() {
+        let (dir, ledger) = crate::tests::configured_budget_ledger(0);
+        ledger
+            .configure_tenant(
+                budget::PERSONAL_TENANT_ID,
+                0,
+                "UTC",
+                idoris_tenancy::budget::SpendGate::All,
+            )
+            .unwrap();
+        let quote = budget::estimate_cost_minor(
+            &crate::tests::paid_component_card("paid").provider.cost,
+            "replay",
+        )
+        .unwrap();
+        let db = dir.path().join("b.sqlite3");
+        let count = || {
+            rusqlite::Connection::open(&db)
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM reservations", [], |row| row.get::<_, i64>(0))
+                .unwrap()
+        };
+        let before = count();
+        assert!(ProxyBudget::new(Some(&ledger), None, "paid", quote).is_err());
+        assert_eq!(count(), before);
     }
     #[test]
     fn cancelled_before_send_releases_but_armed_execution_retains() {
