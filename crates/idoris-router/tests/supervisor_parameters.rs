@@ -70,6 +70,7 @@ async fn unsupported_options_are_400_before_any_upstream_call() {
         ("prediction", json!({})),
         ("future_option", Value::Null),
         ("max_tokens", Value::Null),
+        ("max_completion_tokens", Value::Null),
     ] {
         let mut body = json!({"model":"idoris/daily", "messages":[{"role":"user","content":"hi"}]});
         body[key] = value;
@@ -116,6 +117,25 @@ async fn stream_validation_precedes_parameter_validation() {
             serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
                 .unwrap();
         assert_eq!(body["error"]["reason_code"], expected_reason);
+    }
+    // Non-null invalid caps intentionally fail global preflight before Supervisor checks.
+    for stream in [false, true] {
+        let response = app
+            .clone()
+            .oneshot(request(json!({
+                "model": "idoris/daily",
+                "stream": stream,
+                "max_tokens": "4096",
+                "messages": [{"role":"user","content":"hi"}]
+            })))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(!response.headers().contains_key("x-idoris-served-locality"));
+        let body: Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(body["error"]["type"], "invalid_completion_cap");
     }
     assert!(upstream.received_requests().await.unwrap().is_empty());
 }
