@@ -106,14 +106,16 @@ pub(crate) struct Inspection {
 /// caller's key scope, so remote is allowed unless `kill_switch` is engaged.
 ///
 /// Images, audio, files, documents, `data:…;base64,` payloads, and integer
-/// arrays under `input` cannot be read by L0. Their presence pins `any` to
-/// `local_only` even when the text scan allows the body.
+/// arrays under `input` cannot be read by L0. A content-array part is readable
+/// only when its `type` is text, input_text, output_text, tool_use, tool_result,
+/// or function. Any other part type, or an object carrying media bytes, pins
+/// `any` to `local_only` even when the text scan allows the body.
 pub(crate) fn inspect_body(
     body: &serde_json::Value,
     declared: PrivacyClass,
     kill_switch: bool,
 ) -> Inspection {
-    fn collect(value: &serde_json::Value, out: &mut String, opaque: &mut bool) {
+    fn collect(value: &serde_json::Value, out: &mut String, opaque: &mut bool, in_content: bool) {
         match value {
             serde_json::Value::String(text) => {
                 *opaque |= is_data_url(text);
@@ -121,16 +123,34 @@ pub(crate) fn inspect_body(
             }
             serde_json::Value::Number(number) => push_line(out, &number.to_string()),
             serde_json::Value::Array(items) => {
-                items.iter().for_each(|item| collect(item, out, opaque));
+                items
+                    .iter()
+                    .for_each(|item| collect(item, out, opaque, in_content));
             }
             serde_json::Value::Object(map) => {
-                *opaque |= map
-                    .get("type")
-                    .and_then(serde_json::Value::as_str)
-                    .is_some_and(|kind| OPAQUE_PART_TYPES.contains(&kind));
+                *opaque |= map.keys().any(|key| {
+                    OPAQUE_MEDIA_KEYS
+                        .iter()
+                        .any(|name| key.eq_ignore_ascii_case(name))
+                });
+                if let Some(kind) = map.get("type").and_then(serde_json::Value::as_str) {
+                    let media = MEDIA_TYPE_NAMES
+                        .iter()
+                        .any(|name| kind.eq_ignore_ascii_case(name));
+                    let unread_content = in_content
+                        && !READABLE_PART_TYPES
+                            .iter()
+                            .any(|name| kind.eq_ignore_ascii_case(name));
+                    *opaque |= media || unread_content;
+                }
                 map.iter().for_each(|(key, item)| {
                     push_line(out, key);
-                    collect(item, out, opaque);
+                    collect(
+                        item,
+                        out,
+                        opaque,
+                        in_content || key.eq_ignore_ascii_case("content"),
+                    );
                 });
             }
             serde_json::Value::Bool(_) | serde_json::Value::Null => {}
@@ -141,13 +161,16 @@ pub(crate) fn inspect_body(
         out.push('\0');
     }
     fn is_data_url(text: &str) -> bool {
-        text.get(..5)
-            .is_some_and(|scheme| scheme.eq_ignore_ascii_case("data:"))
-            && text.contains(";base64,")
+        let bytes = text.as_bytes();
+        bytes.len() >= 5
+            && bytes[..5].eq_ignore_ascii_case(b"data:")
+            && bytes
+                .windows(b";base64,".len())
+                .any(|window| window.eq_ignore_ascii_case(b";base64,"))
     }
     let mut text = String::new();
     let mut opaque = body.get("input").is_some_and(is_integer_token_array);
-    collect(body, &mut text, &mut opaque);
+    collect(body, &mut text, &mut opaque, false);
     let ctx = InspectCtx {
         declared,
         remote_allowed: !kill_switch,
@@ -169,15 +192,40 @@ pub(crate) fn inspect_body(
     }
 }
 
-const OPAQUE_PART_TYPES: &[&str] = &[
+const READABLE_PART_TYPES: &[&str] = &[
+    "text",
+    "input_text",
+    "output_text",
+    "tool_use",
+    "tool_result",
+    "function",
+];
+
+const OPAQUE_MEDIA_KEYS: &[&str] = &[
+    "image_url",
+    "audio_url",
+    "video_url",
+    "input_audio",
+    "inline_data",
+    "file",
+];
+
+const MEDIA_TYPE_NAMES: &[&str] = &[
     "image_url",
     "input_image",
     "image",
+    "image_file",
     "input_audio",
     "audio",
+    "audio_url",
+    "video",
+    "video_url",
+    "input_video",
     "file",
     "input_file",
     "document",
+    "document_url",
+    "inline_data",
 ];
 
 fn is_integer_token_array(value: &serde_json::Value) -> bool {
@@ -509,6 +557,42 @@ mod request_path_tests {
             false,
         );
         assert!(!elsewhere.uninspectable);
+        let empty_input = inspect_body(&serde_json::json!({"input": []}), PrivacyClass::Any, false);
+        assert!(!empty_input.uninspectable);
+
+        for kind in [
+            "video_url",
+            "audio_url",
+            "image_file",
+            "input_video",
+            "document_url",
+            "Image_URL",
+        ] {
+            let part = inspect_body(
+                &serde_json::json!({"messages": [{"content": [{"type": kind}]}]}),
+                PrivacyClass::Any,
+                false,
+            );
+            assert!(part.uninspectable, "{kind}");
+        }
+        let typeless = inspect_body(
+            &serde_json::json!({"messages": [{"content": [{"image_url": {"url": "https://example.test/a.png"}}]}]}),
+            PrivacyClass::Any,
+            false,
+        );
+        assert!(typeless.uninspectable);
+        let data_only = inspect_body(
+            &serde_json::json!({"url": "DATA:image/png;BASE64,aaaa"}),
+            PrivacyClass::Any,
+            false,
+        );
+        assert!(data_only.uninspectable);
+        let inline = inspect_body(
+            &serde_json::json!({"inline_data": {"mime_type": "image/png", "data": "aaaa"}}),
+            PrivacyClass::Any,
+            false,
+        );
+        assert!(inline.uninspectable);
 
         let beside_id = inspect_body(
             &serde_json::json!({
