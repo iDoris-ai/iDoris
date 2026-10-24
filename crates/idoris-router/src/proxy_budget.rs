@@ -38,7 +38,7 @@ impl<'a> ProxyBudget<'a> {
         if budget::is_paid(Some(estimate)) && ledger.is_none() {
             return Err(budget::ledger_unavailable_error(tenant_id, provider_id));
         }
-        let admission = ReservationGuard::reserve(ledger, tenant_id, provider_id, 0)?;
+        let admission = ReservationGuard::vacant(ledger, tenant_id);
         Ok(Self {
             ledger,
             tenant_id,

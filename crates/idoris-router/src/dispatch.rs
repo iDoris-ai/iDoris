@@ -522,6 +522,17 @@ impl<'a> ReservationGuard<'a> {
         })
     }
 
+    /// In-memory placeholder. It does not insert a ledger row, so a later
+    /// paid `reserve` remains the only row for that request.
+    pub(crate) fn vacant(ledger: Option<&'a BudgetLedger>, tenant_id: Option<&'a str>) -> Self {
+        Self {
+            ledger,
+            tenant_id,
+            id: None,
+            release_on_drop: true,
+        }
+    }
+
     /// Takes the id for settling — after this, `Drop` is a no-op.
     fn take(&mut self) -> Option<ReservationId> {
         self.id.take()
