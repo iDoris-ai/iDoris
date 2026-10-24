@@ -745,6 +745,7 @@ async fn embeddings(
         None,
         &Default::default(),
         &blocked,
+        inspection.tightened && !inspection.killed,
     );
     let reason = match &selection {
         Ok(_) => None,
@@ -982,6 +983,7 @@ async fn rerank(
         None,
         &Default::default(),
         &blocked,
+        inspection.tightened && !inspection.killed,
     );
     let reason = match &selection {
         Ok(_) => None,
@@ -1230,6 +1232,7 @@ async fn messages(
         None,
         &Default::default(),
         &blocked,
+        inspection.tightened && !inspection.killed,
     );
     let reason = match &selection {
         Ok(_) => None,
@@ -2660,6 +2663,7 @@ async fn chat_completions(
         affinity_key,
         &ready_provider_ids,
         &blocked,
+        inspection.tightened && !inspection.killed,
     );
     let rejection_reason = match &selection {
         Ok(_) => None,

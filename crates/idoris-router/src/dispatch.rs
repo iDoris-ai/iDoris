@@ -293,6 +293,7 @@ pub fn select_with_affinity_and_ready(
         affinity_key,
         ready_provider_ids,
         &vec![false; cards.len()],
+        false,
     )
 }
 
@@ -305,6 +306,7 @@ pub(crate) fn select_with_gate_fallback(
     affinity_key: Option<&str>,
     ready_provider_ids: &BTreeSet<String>,
     blocked: &[bool],
+    content_tightened: bool,
 ) -> Result<Selected, DispatchError> {
     match select_with_gate_snapshot(
         cards,
@@ -313,6 +315,7 @@ pub(crate) fn select_with_gate_fallback(
         affinity_key,
         ready_provider_ids,
         blocked,
+        content_tightened,
     ) {
         Err(DispatchError::Rejection(_)) => {
             let fallback: Vec<bool> = cards
@@ -327,6 +330,7 @@ pub(crate) fn select_with_gate_fallback(
                 affinity_key,
                 ready_provider_ids,
                 &fallback,
+                content_tightened,
             )
         }
         result => result,
@@ -340,6 +344,7 @@ pub(crate) fn select_with_gate_snapshot(
     affinity_key: Option<&str>,
     ready_provider_ids: &BTreeSet<String>,
     blocked: &[bool],
+    content_tightened: bool,
 ) -> Result<Selected, DispatchError> {
     assert_eq!(
         cards.len(),
@@ -364,11 +369,19 @@ pub(crate) fn select_with_gate_snapshot(
             card
         })
         .collect();
+    // Inspection has already written the effective floor onto the profile so
+    // intent detection cannot see `any`. The tightening reason only fires when
+    // decide still sees the declared `any` floor plus `content_tightening`.
+    let mut task = profile.task.clone();
+    let content_tightening = content_tightened.then(|| {
+        task.privacy = Some(idoris_contracts::common::PrivacyClass::Any);
+        idoris_contracts::common::PrivacyClass::LocalOnly
+    });
     let request_profile = RequestProfile {
-        task: profile.task.clone(),
+        task,
         role: profile.role,
         tenant_id: profile.tenant_id.clone(),
-        content_tightening: None,
+        content_tightening,
     };
     let ctx = PolicyCtx {
         min_ram_gb: None,
