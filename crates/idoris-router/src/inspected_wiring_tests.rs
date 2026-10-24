@@ -258,3 +258,44 @@ async fn inspected_append_failure_is_503_before_profiling_or_egress() {
     );
     assert!(upstream.received_requests().await.unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn a_tightened_request_served_locally_says_why_in_decided() {
+    let (_any_upstream, mut state, event_log) = any_only_upstream().await;
+    let local = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"marker": "local"})))
+        .mount(&local)
+        .await;
+    state
+        .cards
+        .push(resident_component_card("trusted-local", &local.uri()));
+    let response = build_app(state)
+        .oneshot(post_chat(
+            &json!({"model": "idoris/daily", "messages": [{"role": "user", "content": format!("身份证 {ID}")}]}).to_string(),
+            &[("x-idoris-privacy", "any")],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let record_id = response
+        .headers()
+        .get(HEADER_RECORD_ID)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(local.received_requests().await.unwrap().len(), 1);
+    let events = event_log
+        .events_for_record(Some(budget::PERSONAL_TENANT_ID), &record_id)
+        .unwrap();
+    let decided = events
+        .iter()
+        .find(|event| event.event.event_type == EventType::Decided)
+        .unwrap();
+    assert_eq!(decided.event.metadata["provider_id"], "trusted-local");
+    assert_eq!(
+        decided.event.metadata["reason_codes"][0],
+        "privacy_tightened_by_content"
+    );
+}

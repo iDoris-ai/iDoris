@@ -38,6 +38,7 @@ fn select(
         None,
         &Default::default(),
         &proxy.blocked_cards(cards),
+        false,
     )
 }
 async fn server() -> MockServer {
@@ -427,6 +428,7 @@ fn mask_length_is_checked_before_filtering() {
         None,
         &Default::default(),
         &[],
+        false,
     )
     .unwrap();
 }
@@ -532,11 +534,18 @@ fn fallback_preserves_role_capability_privacy_cost_and_ready_admission_order() {
     let native = sample_component_card("z-native");
     let mut parsed = profile();
     let ready = ["a-http".to_owned()].into_iter().collect();
-    let choose = |cards: &[ComponentCard],
-                  parsed: &crate::profile::ParsedProfile,
-                  blocked: &[bool]| {
-        dispatch::select_with_gate_fallback(cards, parsed, "hi", Some("session"), &ready, blocked)
-    };
+    let choose =
+        |cards: &[ComponentCard], parsed: &crate::profile::ParsedProfile, blocked: &[bool]| {
+            dispatch::select_with_gate_fallback(
+                cards,
+                parsed,
+                "hi",
+                Some("session"),
+                &ready,
+                blocked,
+                false,
+            )
+        };
     assert_eq!(
         choose(&[http.clone(), native.clone()], &parsed, &[true, false])
             .unwrap()
