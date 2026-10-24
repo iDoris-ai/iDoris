@@ -96,26 +96,43 @@ pub(crate) struct Inspection {
     pub killed: bool,
     /// The scan itself did not complete (docs/15 §1.5 `inspect_failed`).
     pub failed: bool,
+    /// Opaque content pinned `any` and the text scan found nothing else.
+    pub uninspectable: bool,
 }
 
 /// Inspects every object key, string and number in `body` — content parts,
 /// tool definitions and arguments included — joined by one-unit NUL boundaries so values
 /// never merge into a cross-line digit group. `declared` must already have passed the
 /// caller's key scope, so remote is allowed unless `kill_switch` is engaged.
+///
+/// Images, audio, files, documents, `data:…;base64,` payloads, and integer
+/// arrays under `input` cannot be read by L0. Their presence pins `any` to
+/// `local_only` even when the text scan allows the body.
 pub(crate) fn inspect_body(
     body: &serde_json::Value,
     declared: PrivacyClass,
     kill_switch: bool,
 ) -> Inspection {
-    fn collect(value: &serde_json::Value, out: &mut String) {
+    fn collect(value: &serde_json::Value, out: &mut String, opaque: &mut bool) {
         match value {
-            serde_json::Value::String(text) => push_line(out, text),
+            serde_json::Value::String(text) => {
+                *opaque |= is_data_url(text);
+                push_line(out, text);
+            }
             serde_json::Value::Number(number) => push_line(out, &number.to_string()),
-            serde_json::Value::Array(items) => items.iter().for_each(|item| collect(item, out)),
-            serde_json::Value::Object(map) => map.iter().for_each(|(key, item)| {
-                push_line(out, key);
-                collect(item, out);
-            }),
+            serde_json::Value::Array(items) => {
+                items.iter().for_each(|item| collect(item, out, opaque));
+            }
+            serde_json::Value::Object(map) => {
+                *opaque |= map
+                    .get("type")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|kind| OPAQUE_PART_TYPES.contains(&kind));
+                map.iter().for_each(|(key, item)| {
+                    push_line(out, key);
+                    collect(item, out, opaque);
+                });
+            }
             serde_json::Value::Bool(_) | serde_json::Value::Null => {}
         }
     }
@@ -123,8 +140,14 @@ pub(crate) fn inspect_body(
         out.push_str(text);
         out.push('\0');
     }
+    fn is_data_url(text: &str) -> bool {
+        text.get(..5)
+            .is_some_and(|scheme| scheme.eq_ignore_ascii_case("data:"))
+            && text.contains(";base64,")
+    }
     let mut text = String::new();
-    collect(body, &mut text);
+    let mut opaque = body.get("input").is_some_and(is_integer_token_array);
+    collect(body, &mut text, &mut opaque);
     let ctx = InspectCtx {
         declared,
         remote_allowed: !kill_switch,
@@ -132,16 +155,39 @@ pub(crate) fn inspect_body(
         max_input_utf16: DEFAULT_MAX_INPUT_UTF16,
     };
     let response = inspect(&text, &ctx);
-    let tightening = (response.action != idoris_contracts::inspect::InspectAction::Allow)
+    let tightening = (opaque || response.action != idoris_contracts::inspect::InspectAction::Allow)
         .then_some(PrivacyClass::LocalOnly);
     let effective = idoris_policy::effective_privacy(declared, tightening);
     let tightened = declared == PrivacyClass::Any && effective == PrivacyClass::LocalOnly;
     Inspection {
         killed: tightened && kill_switch,
         failed: false,
+        uninspectable: tightened && opaque && !kill_switch && response.findings.is_empty(),
         tightened,
         response,
         effective,
+    }
+}
+
+const OPAQUE_PART_TYPES: &[&str] = &[
+    "image_url",
+    "input_image",
+    "image",
+    "input_audio",
+    "audio",
+    "file",
+    "input_file",
+    "document",
+];
+
+fn is_integer_token_array(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Array(items) => {
+            (!items.is_empty() && items.iter().all(|item| item.is_i64() || item.is_u64()))
+                || items.iter().any(is_integer_token_array)
+        }
+        serde_json::Value::Object(map) => map.values().any(is_integer_token_array),
+        _ => false,
     }
 }
 
@@ -189,6 +235,7 @@ fn failed_inspection(declared: PrivacyClass) -> Inspection {
         tightened: declared == PrivacyClass::Any,
         killed: false,
         failed: true,
+        uninspectable: false,
     }
 }
 
@@ -221,12 +268,12 @@ pub(crate) async fn append_inspected(
     metadata.insert("labels".to_string(), serde_json::Value::Array(labels));
     let reason = if inspection.failed {
         Some("inspect_failed")
+    } else if inspection.killed {
+        Some("remote_kill_switch")
+    } else if inspection.uninspectable {
+        Some("uninspectable_content")
     } else if inspection.tightened {
-        Some(if inspection.killed {
-            "remote_kill_switch"
-        } else {
-            "privacy_tightened_by_content"
-        })
+        Some("privacy_tightened_by_content")
     } else {
         None
     };
@@ -421,5 +468,71 @@ mod request_path_tests {
             .findings
             .iter()
             .any(|finding| finding.kind == idoris_contracts::inspect::FindingKind::CnResidentId));
+    }
+
+    #[test]
+    fn opaque_parts_pin_any_without_a_text_finding() {
+        let image = inspect_body(
+            &serde_json::json!({
+                "messages": [{
+                    "role": "user",
+                    "content": [{
+                        "type": "image_url",
+                        "image_url": {"url": "data:image/png;base64,iVBORw0KGgo="}
+                    }]
+                }]
+            }),
+            PrivacyClass::Any,
+            false,
+        );
+        assert_eq!(image.effective, PrivacyClass::LocalOnly);
+        assert!(image.uninspectable && image.tightened);
+        assert!(image.response.findings.is_empty());
+
+        let text = inspect_body(
+            &serde_json::json!({"messages": [{"type": "text", "content": "hello"}]}),
+            PrivacyClass::Any,
+            false,
+        );
+        assert_eq!(text.effective, PrivacyClass::Any);
+        assert!(!text.uninspectable);
+
+        let tokens = inspect_body(
+            &serde_json::json!({"input": [1, 2, 3]}),
+            PrivacyClass::Any,
+            false,
+        );
+        assert!(tokens.uninspectable);
+        let elsewhere = inspect_body(
+            &serde_json::json!({"metadata": [1, 2, 3]}),
+            PrivacyClass::Any,
+            false,
+        );
+        assert!(!elsewhere.uninspectable);
+
+        let beside_id = inspect_body(
+            &serde_json::json!({
+                "messages": [{
+                    "type": "image_url",
+                    "text": "11010519491231002X"
+                }]
+            }),
+            PrivacyClass::Any,
+            false,
+        );
+        assert!(beside_id.tightened && !beside_id.uninspectable);
+        assert!(!beside_id.response.findings.is_empty());
+    }
+
+    #[tokio::test]
+    async fn opaque_inspection_records_uninspectable_content() {
+        let inspection = inspect_body(
+            &serde_json::json!({"messages": [{"type": "input_audio", "content": "hello"}]}),
+            PrivacyClass::Any,
+            false,
+        );
+        let metadata = persisted_inspected_metadata(&inspection).await;
+        assert_eq!(metadata["reason"], "uninspectable_content");
+        assert_eq!(metadata["privacy"], "local_only");
     }
 }
