@@ -163,7 +163,7 @@ fn contains_ascii_ci(window: &[u16], needle: &str) -> bool {
         .collect();
     window.windows(needle.len()).any(|chunk| {
         chunk.iter().zip(&needle).all(|(&unit, &want)| {
-            let folded = if (b'A'..=b'Z').contains(&(unit as u8)) {
+            let folded = if (unit as u8).is_ascii_uppercase() {
                 unit + 32
             } else {
                 unit
