@@ -4,6 +4,8 @@
 //! `-` 分隔（`138-1234-5678`、`6222 0212 …`）。每个数字组既按整组（去掉分隔
 //! 符）判定，也按组内每一段连续数字单独判定，所以「手机号 空格 银行卡号」
 //! 被并成一个大组时，两段仍各自命中。宁可多报，也不能因为分组方式漏报。
+//! 空格或 `-` 拼出的 `3-3-5`、`4-4-3`（`138 123 45678`、`1998 2005 100`）
+//! 不按手机号上报。`3-8`、`4-7`、`3-4-4` 仍按整组上报。
 //! 另以最多 19 位、5 段的窗口识别空格、连字符、tab、点、斜线。每个起点取最短
 //! 命中，不要求整条数字链都能分解成实体，因此实体旁边的无关数字不再把窗口否决掉。
 //! 身份证窗口额外认 `6/8/4`、`6/4/4/4`，以及末段少一位且紧跟 `X`/`x` 的 17 位形式。
@@ -60,16 +62,30 @@ pub(super) fn scan_plain(units: &[u16]) -> Vec<Hit> {
             .filter(|&&u| is_digit(u))
             .map(|&u| (u - u16::from(b'0')) as u8)
             .collect();
-        classify(
-            &Candidate {
-                digits: &joined,
-                start: i,
-                end: group_end,
-                x_suffix,
-            },
-            &mut hits,
-        );
-        if joined.len() != group_end - i {
+        let separated = joined.len() != group_end - i;
+        if !separated {
+            classify(
+                &Candidate {
+                    digits: &joined,
+                    start: i,
+                    end: group_end,
+                    x_suffix,
+                },
+                &mut hits,
+            );
+        } else {
+            let mut grouped = Vec::new();
+            classify(
+                &Candidate {
+                    digits: &joined,
+                    start: i,
+                    end: group_end,
+                    x_suffix,
+                },
+                &mut grouped,
+            );
+            let mut lengths = [0usize; 3];
+            let mut count = 0usize;
             let mut offset = 0;
             let mut seg_start = i;
             while seg_start < group_end {
@@ -78,17 +94,31 @@ pub(super) fn scan_plain(units: &[u16]) -> Vec<Hit> {
                     seg_end += 1;
                 }
                 let len = seg_end - seg_start;
+                if count < lengths.len() {
+                    lengths[count] = len;
+                }
+                count += 1;
                 let last = seg_end == group_end;
-                let candidate = Candidate {
-                    digits: &joined[offset..offset + len],
-                    start: seg_start,
-                    end: seg_end,
-                    x_suffix: last && x_suffix,
-                };
-                classify(&candidate, &mut hits);
+                classify(
+                    &Candidate {
+                        digits: &joined[offset..offset + len],
+                        start: seg_start,
+                        end: seg_end,
+                        x_suffix: last && x_suffix,
+                    },
+                    &mut grouped,
+                );
                 offset += len;
                 seg_start = seg_end + 1;
             }
+            // These two rows sum to a mobile. They are tables, not written phones.
+            if count == 3 && matches!(lengths, [3, 3, 5] | [4, 4, 3]) {
+                let span = group_end - i;
+                grouped.retain(|hit| {
+                    hit.kind != FindingKind::CnMobile || hit.start != i || hit.length != span
+                });
+            }
+            hits.extend(grouped);
         }
         i = group_end;
     }
