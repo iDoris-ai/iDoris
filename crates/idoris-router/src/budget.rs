@@ -13,15 +13,37 @@ use idoris_tenancy::budget::{
 };
 use serde_json::Value;
 
-/// Conservative placeholder for the completion side of a cost estimate.
-/// This crate doesn't parse a caller-supplied `max_tokens` out of the
-/// request body yet, so every reservation assumes this many completion
-/// tokens regardless of the actual request. Deliberately on the high side:
-/// overestimating a reservation only shrinks the headroom visible to other
-/// concurrent requests until [`settle`] corrects it to the real number;
-/// underestimating could let a request through a tighter budget should
-/// have blocked.
-const RESERVED_COMPLETION_TOKENS: u64 = 1024;
+/// Legacy reservation floor when no larger explicit output cap is supplied.
+/// A smaller caller cap never reduces the existing conservative reservation.
+pub(crate) const RESERVED_COMPLETION_TOKENS: u64 = 1024;
+
+/// Validate both forwarded output caps before any quotation. Reject explicit
+/// non-integers rather than letting an upstream coerce a larger cap than quoted.
+/// Null is absent for quotation. The inclusive 2^53 ceiling preserves the
+/// integer cap conversion; floating-point rate arithmetic may still round.
+/// When both fields are present, quote their maximum regardless of upstream
+/// precedence; retain the original fields and the legacy 1024-token floor.
+pub(crate) fn completion_reservation_tokens(body: &Value) -> Result<u64, &'static str> {
+    // Quotation accounts for one completion; reject multiplicity before forwarding.
+    if body
+        .get("n")
+        .is_some_and(|count| !count.is_null() && count.as_u64() != Some(1))
+    {
+        return Err("n");
+    }
+    const MAX_EXACT_COMPLETION_TOKENS: u64 = 1_u64 << 53;
+    let mut completion = RESERVED_COMPLETION_TOKENS;
+    for field in ["max_tokens", "max_completion_tokens"] {
+        if let Some(value) = body.get(field).filter(|value| !value.is_null()) {
+            let cap = value
+                .as_u64()
+                .filter(|cap| *cap <= MAX_EXACT_COMPLETION_TOKENS)
+                .ok_or(field)?;
+            completion = completion.max(cap);
+        }
+    }
+    Ok(completion)
+}
 
 /// No virtual-key system exists yet (interface spec §3.2's key vault isn't
 /// implemented) — every reservation uses this fixed key id until one is.
@@ -126,13 +148,21 @@ pub fn actual_cost_from_usage(
         .ok_or(UsageEvidenceError::InvalidPriceOrAmount)
 }
 
-/// A per-request, per-candidate cost estimate in minor currency units, used
-/// to size a [`reserve`] call *before* the real usage is known — see
-/// `RESERVED_COMPLETION_TOKENS`'s doc for why the completion side is a
-/// fixed placeholder here.
+/// Per-candidate quote using the legacy output reservation floor.
 pub fn estimate_cost_minor(cost: &Cost, prompt: &str) -> Option<i64> {
-    let prompt_tokens = estimate_tokens(prompt, "unknown");
-    priced_minor(cost, prompt_tokens, RESERVED_COMPLETION_TOKENS)
+    estimate_cost_minor_with_completion(cost, prompt, RESERVED_COMPLETION_TOKENS)
+}
+
+pub(crate) fn estimate_cost_minor_with_completion(
+    cost: &Cost,
+    prompt: &str,
+    completion: u64,
+) -> Option<i64> {
+    priced_minor(
+        cost,
+        estimate_tokens(prompt, "unknown"),
+        completion.max(RESERVED_COMPLETION_TOKENS),
+    )
 }
 
 /// The *actual* cost once both the prompt and the real completion text are
