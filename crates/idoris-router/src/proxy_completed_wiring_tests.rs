@@ -383,13 +383,14 @@ async fn chat_open_breaker_without_dispatch_never_records_completed() {
             correlation: correlation::RequestCorrelation::default(),
         };
         let contexts = ProxyEventContexts {
+            budget_reserved: None,
             dispatched: Some(&dispatched),
             completed: Some(&completed),
         };
         let response = if streaming {
             chat_via_proxy_stream(&state, &selected, &body, contexts).await
         } else {
-            let mut reservation = dispatch::ReservationGuard::reserve(
+            let reservation = proxy_budget::ProxyBudget::new(
                 state.budget_ledger.as_deref(),
                 None,
                 &selected.card.provider.id,
@@ -404,7 +405,7 @@ async fn chat_open_breaker_without_dispatch_never_records_completed() {
                 &body,
                 "preflight",
                 contexts,
-                &mut reservation,
+                &reservation,
             )
             .await
         };

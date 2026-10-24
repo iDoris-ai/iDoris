@@ -167,7 +167,7 @@ fn fixed_subscription_roles(component: &ComponentCard) -> bool {
         .is_some_and(|extensions| extensions.contains_key("idoris_role_models"))
 }
 
-fn candidate(component: &ComponentCard, prompt: &str) -> Card {
+fn candidate(component: &ComponentCard, prompt: &str, completion: u64) -> Card {
     let models = role_models(component).unwrap_or_default();
     Card {
         component: component.clone(),
@@ -181,7 +181,15 @@ fn candidate(component: &ComponentCard, prompt: &str) -> Card {
             .collect(),
         experiment: false,
         min_ram_gb: 0.0,
-        estimated_cost_minor: budget::estimate_cost_minor(&component.provider.cost, prompt),
+        estimated_cost_minor: if is_resident_http_service(component) {
+            budget::estimate_cost_minor_with_completion(
+                &component.provider.cost,
+                prompt,
+                completion,
+            )
+        } else {
+            budget::estimate_cost_minor(&component.provider.cost, prompt)
+        },
         admission_status: AdmissionStatus::Ready,
     }
 }
@@ -308,13 +316,37 @@ pub(crate) fn select_with_gate_fallback(
     blocked: &[bool],
     content_tightened: bool,
 ) -> Result<Selected, DispatchError> {
-    match select_with_gate_snapshot(
+    select_with_gate_fallback_and_completion(
         cards,
         profile,
         prompt,
         affinity_key,
         ready_provider_ids,
         blocked,
+        budget::RESERVED_COMPLETION_TOKENS,
+        content_tightened,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn select_with_gate_fallback_and_completion(
+    cards: &[ComponentCard],
+    profile: &ParsedProfile,
+    prompt: &str,
+    affinity_key: Option<&str>,
+    ready_provider_ids: &BTreeSet<String>,
+    blocked: &[bool],
+    completion: u64,
+    content_tightened: bool,
+) -> Result<Selected, DispatchError> {
+    match select_with_gate_snapshot_and_completion(
+        cards,
+        profile,
+        prompt,
+        affinity_key,
+        ready_provider_ids,
+        blocked,
+        completion,
         content_tightened,
     ) {
         Err(DispatchError::Rejection(_)) => {
@@ -323,13 +355,14 @@ pub(crate) fn select_with_gate_fallback(
                 .zip(blocked)
                 .map(|(card, blocked)| *blocked && !is_resident_http_service(card))
                 .collect();
-            select_with_gate_snapshot(
+            select_with_gate_snapshot_and_completion(
                 cards,
                 profile,
                 prompt,
                 affinity_key,
                 ready_provider_ids,
                 &fallback,
+                completion,
                 content_tightened,
             )
         }
@@ -344,6 +377,29 @@ pub(crate) fn select_with_gate_snapshot(
     affinity_key: Option<&str>,
     ready_provider_ids: &BTreeSet<String>,
     blocked: &[bool],
+    content_tightened: bool,
+) -> Result<Selected, DispatchError> {
+    select_with_gate_snapshot_and_completion(
+        cards,
+        profile,
+        prompt,
+        affinity_key,
+        ready_provider_ids,
+        blocked,
+        budget::RESERVED_COMPLETION_TOKENS,
+        content_tightened,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn select_with_gate_snapshot_and_completion(
+    cards: &[ComponentCard],
+    profile: &ParsedProfile,
+    prompt: &str,
+    affinity_key: Option<&str>,
+    ready_provider_ids: &BTreeSet<String>,
+    blocked: &[bool],
+    completion: u64,
     content_tightened: bool,
 ) -> Result<Selected, DispatchError> {
     assert_eq!(
@@ -362,7 +418,7 @@ pub(crate) fn select_with_gate_snapshot(
             })
         })
         .map(|(c, blocked)| {
-            let mut card = candidate(c, prompt);
+            let mut card = candidate(c, prompt, completion);
             if *blocked {
                 card.admission_status = AdmissionStatus::Blocked;
             }
@@ -483,6 +539,17 @@ impl<'a> ReservationGuard<'a> {
             id,
             release_on_drop: true,
         })
+    }
+
+    /// In-memory placeholder. It does not insert a ledger row, so a later
+    /// paid `reserve` remains the only row for that request.
+    pub(crate) fn vacant(ledger: Option<&'a BudgetLedger>, tenant_id: Option<&'a str>) -> Self {
+        Self {
+            ledger,
+            tenant_id,
+            id: None,
+            release_on_drop: true,
+        }
     }
 
     /// Takes the id for settling — after this, `Drop` is a no-op.

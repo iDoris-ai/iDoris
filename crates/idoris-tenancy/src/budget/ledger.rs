@@ -576,6 +576,27 @@ impl BudgetLedger {
         scope: &BudgetScope,
         estimated_cost: Price,
     ) -> Result<ReservationId, BudgetError> {
+        self.admit(scope, estimated_cost, true)?
+            .ok_or_else(|| BudgetError::Storage("persisted reservation missing".to_string()))
+    }
+
+    /// Same scope, configuration and spend-gate checks as [`reserve`],
+    /// without inserting a row. Used when a later `reserve` must remain the
+    /// only ledger row for the request.
+    pub fn check_admission(
+        &self,
+        scope: &BudgetScope,
+        estimated_cost: Price,
+    ) -> Result<(), BudgetError> {
+        self.admit(scope, estimated_cost, false).map(|_| ())
+    }
+
+    fn admit(
+        &self,
+        scope: &BudgetScope,
+        estimated_cost: Price,
+        persist: bool,
+    ) -> Result<Option<ReservationId>, BudgetError> {
         // prdaemon review on #48: since B-3 made the sub-scope `configure`
         // call optional, `reserve` could be called for a tenant that only
         // ever called `configure_tenant` — with `scope.key_id`/
@@ -717,6 +738,11 @@ impl BudgetLedger {
             }
         }
 
+        if !persist {
+            tx.commit()?;
+            return Ok(None);
+        }
+
         // B-8 mutation-testing hook (see `test_hooks` doc comment) — a
         // no-op unless a test has explicitly armed it. When armed, this
         // reproduces the split-transaction bug class on purpose: commit the
@@ -763,7 +789,7 @@ impl BudgetLedger {
         // COMMIT itself may consume the remaining TTL. Even though the row
         // is now persisted, it is expired and must never authorize a call.
         self.check_reservation_deadline(&id, expires_at_ms)?;
-        Ok(ReservationId(id))
+        Ok(Some(ReservationId(id)))
     }
 
     /// Fail closed if transaction work consumed the TTL. Returning before
