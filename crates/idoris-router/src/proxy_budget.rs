@@ -223,7 +223,9 @@ mod tests {
         let count = || {
             rusqlite::Connection::open(&db)
                 .unwrap()
-                .query_row("SELECT COUNT(*) FROM reservations", [], |row| row.get::<_, i64>(0))
+                .query_row("SELECT COUNT(*) FROM reservations", [], |row| {
+                    row.get::<_, i64>(0)
+                })
                 .unwrap()
         };
         let before = count();

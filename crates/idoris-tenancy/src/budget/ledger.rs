@@ -576,8 +576,8 @@ impl BudgetLedger {
         scope: &BudgetScope,
         estimated_cost: Price,
     ) -> Result<ReservationId, BudgetError> {
-        self.admit(scope, estimated_cost, true)
-            .map(|id| id.expect("persisted reservation"))
+        self.admit(scope, estimated_cost, true)?
+            .ok_or_else(|| BudgetError::Storage("persisted reservation missing".to_string()))
     }
 
     /// Same scope, configuration and spend-gate checks as [`reserve`],
