@@ -14,18 +14,22 @@
 //! （`idoris_contracts::inspect` 模块文档）。逃逸归一化只删或折叠字符、
 //! 不增字符。
 //!
-//! 一共扫**三个视图**，各自把命中映射回原文坐标后取并集：
+//! 一共扫**四个视图**，各自把命中映射回原文坐标后取并集：
 //!
 //! 1. **原文**（`normalize::identity`）：不折叠、不删除。这是 base 的覆盖，
 //!    保证「原文能抓到的，归一化后绝不放行」。折叠本身也会粘合（全角字母
-//!    数字、横线变体贴在实体边上），只有这一路不受影响。
+//!    数字、横线变体、十进制数字、同形字母贴在实体边上），只有这一路不受影响。
 //! 2. **折叠并保留**（`normalize::fold_keeping_ignorables`）：可忽略字符留在
 //!    原地当边界，所以「可忽略字符 + 全角实体」这种形状只有它能命中。
 //! 3. **折叠并删除**（`normalize::normalize`）：实体内部的隐形插入被去掉，
 //!    所以「零宽字符夹在实体中间」只有它能命中。
+//! 4. **数字与同形**（`normalize::fold_digits_and_homoglyphs`）：在删除可忽略
+//!    字符的折叠上，再折 35 个 BMP 十进制数字块和选定的拉丁同形字母。它只
+//!    增加命中，不替代前三路。
 //!
-//! 三路缺一不可：`tests::union_is_never_looser_than_any_single_view` 会在
-//! 任意一路被删掉时变红。
+//! 前三路缺一不可：`tests::union_is_never_looser_than_any_single_view` 会在
+//! 任意一路被删掉时变红。第四路也不折进前三路，泰米尔零紧贴合法证件号、
+//! 非拉丁文本旁边的原文密钥，仍然由原文视图保住。
 
 mod decode;
 mod l0;
@@ -438,6 +442,7 @@ fn scan_all_views(units: &[u16], scan: fn(&[u16]) -> Vec<Hit>) -> Vec<Hit> {
     for view in [
         normalize::fold_keeping_ignorables(units),
         normalize::normalize(units),
+        normalize::fold_digits_and_homoglyphs(units),
     ] {
         hits.extend(drop_folded_malformed_hkid(scan_view(&view, scan), units));
     }
