@@ -23,6 +23,7 @@ fn response(input: &str) -> InspectResponse {
 
 #[test]
 fn written_layouts_are_found_and_table_rows_stay_public() {
+    let spaced = format!("电话{}138 123 45678", " ".repeat(23));
     for (input, kind) in [
         ("138-12345678", FindingKind::CnMobile),
         ("1381 2345678", FindingKind::CnMobile),
@@ -39,6 +40,16 @@ fn written_layouts_are_found_and_table_rows_stay_public() {
         ("手机 138-123-45678", FindingKind::CnMobile),
         ("请联系 1391 2345 678", FindingKind::CnMobile),
         ("我的号码是138 123 45678，加微信", FindingKind::CnMobile),
+        ("phone: 138 123 45678", FindingKind::CnMobile),
+        ("Phone 138 123 45678", FindingKind::CnMobile),
+        ("call: 1391 2345 678", FindingKind::CnMobile),
+        ("cell 138 123 45678", FindingKind::CnMobile),
+        ("Contact: 138 123 45678", FindingKind::CnMobile),
+        ("WeChat: 138 123 45678", FindingKind::CnMobile),
+        ("WhatsApp: 138 123 45678", FindingKind::CnMobile),
+        ("手機：138 123 45678", FindingKind::CnMobile),
+        ("號碼138 123 45678", FindingKind::CnMobile),
+        ("聯繫1391 2345 678", FindingKind::CnMobile),
     ] {
         let response = response(input);
         assert!(
@@ -46,6 +57,14 @@ fn written_layouts_are_found_and_table_rows_stay_public() {
             "{input:?} must be {kind:?}: {response:?}"
         );
     }
+    let spaced_response = response(&spaced);
+    assert!(
+        spaced_response
+            .findings
+            .iter()
+            .any(|finding| finding.kind == FindingKind::CnMobile),
+        "cue 23 spaces before the digits must still hit: {spaced_response:?}"
+    );
 
     for input in [
         "138 123 45678",

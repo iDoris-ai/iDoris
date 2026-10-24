@@ -135,16 +135,20 @@ pub(super) fn scan_plain(units: &[u16]) -> Vec<Hit> {
 }
 
 fn phone_context(units: &[u16], start: usize, end: usize) -> bool {
-    let from = start.saturating_sub(24);
-    let to = (end + 24).min(units.len());
+    let from = start.saturating_sub(64);
+    let to = (end + 64).min(units.len());
     let window = &units[from..to];
-    contains_units(window, "电话")
-        || contains_units(window, "手机")
-        || contains_units(window, "号码")
-        || contains_units(window, "联系")
-        || contains_units(window, "微信")
-        || contains_ascii_ci(window, "tel")
-        || contains_ascii_ci(window, "mobile")
+    const CUES: &[&str] = &[
+        "电话", "手机", "号码", "联系", "微信", "手機", "號碼", "聯繫", "tel", "mobile", "phone",
+        "cell", "call", "contact", "wechat", "whatsapp",
+    ];
+    CUES.iter().any(|cue| {
+        if cue.is_ascii() {
+            contains_ascii_ci(window, cue)
+        } else {
+            contains_units(window, cue)
+        }
+    })
 }
 
 fn contains_units(window: &[u16], needle: &str) -> bool {
