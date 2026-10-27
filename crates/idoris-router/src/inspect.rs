@@ -109,25 +109,42 @@ pub(crate) struct Inspection {
 /// arrays under `input` cannot be read by L0. A *direct* content part (an
 /// object that is the value of a `content` key, or an element of a `content`
 /// array) is readable only when it has a string `type` that is text,
-/// input_text, output_text, tool_use, tool_result, function, thinking, or
-/// refusal. A direct part with any other `type`, no `type`, a non-string
+/// input_text, output_text, tool_use, tool_result, function, thinking,
+/// refusal, or one of the Anthropic replay blocks (redacted_thinking,
+/// server_tool_use, mcp_tool_use, mcp_tool_result, web_search_tool_result,
+/// web_search_result; media inside them is still caught by the global media
+/// checks). A direct part with any other `type`, no `type`, a non-string
 /// `type`, or a wrong-case `Type` key pins `any` to `local_only`. Objects
-/// nested deeper (`cache_control`, `tool_use.input`, annotations, tool
-/// schemas) are not parts and are not subject to the allow-list. Media keys,
-/// media type names and `data:…;base64,` URLs are checked at every depth.
-/// An object carrying media bytes pins `any` to `local_only` even when the
-/// text scan allows the body.
+/// nested deeper (`cache_control`, annotations) are not parts and are not
+/// subject to the allow-list.
+///
+/// The allow-list is switched off (`suppress_part_check`) inside subtrees
+/// where a key named `content` is data, not a message part: `input_schema`,
+/// `parameters`, `json_schema` (tool and response schemas) and the `input` of
+/// a `tool_use` / `server_tool_use` / `mcp_tool_use` part. Cost: a shape such
+/// as `{"content":[{"type":"unknown_media"}]}` hidden inside tool arguments
+/// or a schema is no longer caught by the allow-list. Media keys, media type
+/// names and `data:…;base64,` URLs are still checked at every depth, in
+/// those subtrees too. An object carrying media bytes pins `any` to
+/// `local_only` even when the text scan allows the body.
 ///
 /// Coverage is limited to the OpenAI (chat, embeddings, rerank) and
 /// Anthropic Messages request shapes; other vendors' media encodings (e.g.
 /// Gemini `fileData`) are not recognised. Raw base64 under an unknown key
-/// inside an otherwise readable text part stays `any`.
+/// inside an otherwise readable text part stays `any`, and so does an OpenAI
+/// assistant `audio: {"id": ..}` reference (an id, no bytes).
 pub(crate) fn inspect_body(
     body: &serde_json::Value,
     declared: PrivacyClass,
     kill_switch: bool,
 ) -> Inspection {
-    fn collect(value: &serde_json::Value, out: &mut String, opaque: &mut bool, direct: bool) {
+    fn collect(
+        value: &serde_json::Value,
+        out: &mut String,
+        opaque: &mut bool,
+        direct: bool,
+        suppress_part_check: bool,
+    ) {
         match value {
             serde_json::Value::String(text) => {
                 *opaque |= is_data_url(text);
@@ -137,7 +154,7 @@ pub(crate) fn inspect_body(
             serde_json::Value::Array(items) => {
                 items
                     .iter()
-                    .for_each(|item| collect(item, out, opaque, direct));
+                    .for_each(|item| collect(item, out, opaque, direct, suppress_part_check));
             }
             serde_json::Value::Object(map) => {
                 *opaque |= map.keys().any(|key| {
@@ -151,6 +168,7 @@ pub(crate) fn inspect_body(
                         .any(|name| kind.eq_ignore_ascii_case(name));
                 }
                 let unread_content = direct
+                    && !suppress_part_check
                     && !map
                         .get("type")
                         .and_then(serde_json::Value::as_str)
@@ -160,9 +178,28 @@ pub(crate) fn inspect_body(
                                 .any(|name| kind.eq_ignore_ascii_case(name))
                         });
                 *opaque |= unread_content;
+                let tool_call_part = map
+                    .get("type")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|kind| {
+                        TOOL_CALL_PART_TYPES
+                            .iter()
+                            .any(|name| kind.eq_ignore_ascii_case(name))
+                    });
                 map.iter().for_each(|(key, item)| {
                     push_line(out, key);
-                    collect(item, out, opaque, key.eq_ignore_ascii_case("content"));
+                    let suppress = suppress_part_check
+                        || SCHEMA_KEYS
+                            .iter()
+                            .any(|name| key.eq_ignore_ascii_case(name))
+                        || (tool_call_part && key.eq_ignore_ascii_case("input"));
+                    collect(
+                        item,
+                        out,
+                        opaque,
+                        key.eq_ignore_ascii_case("content") && !suppress,
+                        suppress,
+                    );
                 });
             }
             serde_json::Value::Bool(_) | serde_json::Value::Null => {}
@@ -182,7 +219,7 @@ pub(crate) fn inspect_body(
     }
     let mut text = String::new();
     let mut opaque = body.get("input").is_some_and(is_integer_token_array);
-    collect(body, &mut text, &mut opaque, false);
+    collect(body, &mut text, &mut opaque, false, false);
     let ctx = InspectCtx {
         declared,
         remote_allowed: !kill_switch,
@@ -213,7 +250,19 @@ const READABLE_PART_TYPES: &[&str] = &[
     "function",
     "thinking",
     "refusal",
+    "redacted_thinking",
+    "server_tool_use",
+    "mcp_tool_use",
+    "mcp_tool_result",
+    "web_search_tool_result",
+    "web_search_result",
 ];
+
+/// Part types whose `input` holds arbitrary tool arguments.
+const TOOL_CALL_PART_TYPES: &[&str] = &["tool_use", "server_tool_use", "mcp_tool_use"];
+
+/// Keys whose subtree is a tool / response schema.
+const SCHEMA_KEYS: &[&str] = &["input_schema", "parameters", "json_schema"];
 
 const OPAQUE_MEDIA_KEYS: &[&str] = &[
     "image_url",
@@ -701,6 +750,50 @@ mod request_path_tests {
         for body in bodies {
             assert!(stays_any(body.clone()), "{body}");
         }
+    }
+
+    #[test]
+    fn content_named_data_in_schemas_and_tool_input_stays_any() {
+        let bodies = [
+            serde_json::json!({"model": "m", "tools": [{"name": "Write", "input_schema": {"type": "object",
+                "properties": {"file_path": {"type": "string"}, "content": {"type": "string"}}}}]}),
+            serde_json::json!({"messages": [{"role": "user", "content": "hi"}], "tools": [{"type": "function",
+                "function": {"name": "w", "parameters": {"type": "object",
+                "properties": {"content": {"type": "string", "description": "x"}}}}}]}),
+            serde_json::json!({"messages": [{"role": "user", "content": "hi"}], "response_format": {
+                "type": "json_schema", "json_schema": {"name": "r", "schema": {"type": "object",
+                "properties": {"content": {"type": "string"}}}}}}),
+            serde_json::json!({"messages": [{"role": "assistant", "content": [
+                {"type": "tool_use", "id": "t", "name": "w", "input": {"content": {"a": 1}}}]}]}),
+            serde_json::json!({"messages": [{"role": "assistant", "content": [
+                {"type": "tool_use", "id": "t", "name": "w", "input": {"content": [{"k": "v"}]}}]}]}),
+            serde_json::json!({"messages": [{"role": "assistant", "content": [
+                {"type": "server_tool_use", "id": "t", "name": "web_search", "input": {"content": [{"k": "v"}]}}]}]}),
+        ];
+        for body in bodies {
+            assert!(stays_any(body.clone()), "{body}");
+        }
+        for kind in [
+            "redacted_thinking",
+            "server_tool_use",
+            "mcp_tool_use",
+            "web_search_tool_result",
+        ] {
+            let body = serde_json::json!({"messages": [{"role": "assistant", "content": [{"type": kind, "data": "x"}]}]});
+            assert!(stays_any(body), "{kind}");
+        }
+        // Media checks stay global inside the suppressed subtrees.
+        assert!(pins_uninspectable(
+            serde_json::json!({"messages": [{"role": "assistant", "content": [
+            {"type": "tool_use", "id": "t", "name": "w", "input": {"image_url": "https://example.test/a.png"}}]}]})
+        ));
+        assert!(pins_uninspectable(
+            serde_json::json!({"tools": [{"input_schema": {"default": "data:image/png;base64,aaaa"}}]})
+        ));
+        // Outside the suppressed subtrees the allow-list still applies.
+        assert!(pins_uninspectable(
+            serde_json::json!({"content": [{"source": {"type": "base64", "data": "aaaa"}}]})
+        ));
     }
 
     #[test]
