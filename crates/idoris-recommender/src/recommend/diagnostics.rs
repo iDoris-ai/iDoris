@@ -8,7 +8,7 @@ use super::forced::apply_core_override;
 use super::resident::{blocked_choices, budget_breakdown, choose_resident};
 use super::temp::temp_admission;
 use super::types::{
-    HEADROOM_GB, PartialPolicy, RecommendError, Recommendation, RecommenderPolicy,
+    BudgetBreakdown, HEADROOM_GB, PartialPolicy, RecommendError, Recommendation, RecommenderPolicy,
     SysctlRecommendation, TempStatus,
 };
 
@@ -26,11 +26,28 @@ pub fn recommend(
 ) -> Result<Recommendation, RecommendError> {
     let policy = RecommenderPolicy::merged(partial_policy);
     let budget = budget_breakdown(hardware, &policy, allocated_budget_bytes);
-    let blocked = blocked_choices(catalog, hardware, &policy, &budget)?;
+    let mut blocked = blocked_choices(catalog, hardware, &policy, &budget)?;
     let automatic = choose_resident(catalog, hardware, &policy, &budget);
+    let automatic_score = automatic.as_ref().map(|current| current.score);
     let forced_result = apply_core_override(catalog, hardware, &policy, forced, automatic, &budget);
+    let headroom_breach_option = if forced_result.override_choice.is_some() {
+        None
+    } else {
+        // resident_budget + HEADROOM == usable - temp_reserve, never above usable.
+        let relaxed = BudgetBreakdown {
+            resident_budget_gb: (budget.resident_budget_gb + HEADROOM_GB).min(budget.usable_gb),
+            ..budget
+        };
+        choose_resident(catalog, hardware, &policy, &relaxed)
+            .filter(|candidate| automatic_score.is_none_or(|current| candidate.score > current))
+    };
     let resident = forced_result.resident;
     let temp_result = temp_admission(catalog, hardware, &policy, resident.as_ref(), &budget);
+    for (id, alternative) in &temp_result.blocked_alternatives {
+        if let Some(entry) = blocked.iter_mut().find(|entry| &entry.id == id) {
+            entry.degraded_alternative = Some(alternative.clone());
+        }
+    }
 
     let budget_source = allocated_budget_bytes.map_or_else(
         || format!("{}GB {}", compact(hardware.ram_gb), wired_mode(&policy)),
@@ -87,6 +104,7 @@ pub fn recommend(
         },
         tradeoff,
         override_choice: forced_result.override_choice,
+        headroom_breach_option,
     })
 }
 

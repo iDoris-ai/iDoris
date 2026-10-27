@@ -113,6 +113,9 @@ pub struct BlockedChoice {
     pub min_ram_gb: f64,
     pub estimated_memory_gb: f64,
     pub reason: String,
+    /// Set only when this model is the best on-demand model for a needed
+    /// capability but exceeds the allocated total. See [`TempAlternative`].
+    pub degraded_alternative: Option<TempAlternative>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -151,6 +154,26 @@ pub enum TempStatus {
     RequiresEviction,
 }
 
+/// A smaller same-capability model that fits the remaining budget right now
+/// without evicting anything (owner decision 2026-10-27, option (b)).
+#[derive(Debug, Clone, PartialEq)]
+pub struct TempAlternative {
+    pub id: String,
+    pub quant: QuantPick,
+    pub reason: String,
+}
+
+/// Best on-demand model for a capability.
+///
+/// When the best model does not fit, the user is offered two choices:
+/// (a) evict unused models, then load this model: this is the choice itself
+///     (`status == RequiresEviction`, `quant`); or
+/// (b) do not evict and degrade to `degraded_alternative`.
+///
+/// `degraded_alternative` is `Some` only for `RequiresEviction` (and, in
+/// allocated mode, for the blocked model, see `BlockedChoice` and
+/// `TempResult::blocked_alternatives`) and only if another eligible model
+/// for the same capability fits the remaining budget now.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TempChoice {
     pub id: String,
@@ -159,12 +182,16 @@ pub struct TempChoice {
     pub min_ram_gb: f64,
     pub quant: QuantPick,
     pub reason: String,
+    pub degraded_alternative: Option<TempAlternative>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct TempResult {
     pub choices: Vec<TempChoice>,
     pub warnings: Vec<String>,
+    /// Allocated mode: `(blocked model id, alternative)` for best models that
+    /// exceed the allocated total. They are not in `choices`.
+    pub blocked_alternatives: Vec<(String, TempAlternative)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -188,6 +215,10 @@ pub struct Recommendation {
     pub recommended_sysctl: SysctlRecommendation,
     pub tradeoff: String,
     pub override_choice: Option<CoreOverride>,
+    /// Optional better resident reachable only by spending the `HEADROOM_GB`
+    /// reserve. Never applied automatically: the user must confirm each time
+    /// (owner decision). It does not replace `resident` or affect temp admission.
+    pub headroom_breach_option: Option<ResidentChoice>,
 }
 
 #[derive(Debug)]

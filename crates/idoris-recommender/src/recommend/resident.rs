@@ -66,6 +66,7 @@ pub fn blocked_choices(
             min_ram_gb: model.min_ram_gb,
             estimated_memory_gb: pick.footprint_gb,
             reason,
+            degraded_alternative: None,
         });
     }
     Ok(blocked)
