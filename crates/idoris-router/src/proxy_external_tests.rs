@@ -550,7 +550,7 @@ async fn actual_subscription_lib_relay_is_captured_with_oauth_before_suspended_c
     };
     use std::collections::BTreeMap;
     use std::ffi::OsString;
-    use std::io::{Read, Write};
+    use std::io::Write;
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     let root = tempfile::tempdir().unwrap();
     let entered_path = root.path().join("entered");
@@ -571,7 +571,10 @@ async fn actual_subscription_lib_relay_is_captured_with_oauth_before_suspended_c
             .open(path)
             .unwrap()
     };
-    let entered = tokio::io::unix::AsyncFd::new(fifo(&entered_path)).unwrap();
+    // Safe FIFO receiver over the O_NONBLOCK read+write handle (portable, so no EOF without a
+    // writer); avoids `AsyncFd`, whose constructors are deprecated/unsafe and this workspace
+    // forbids unsafe code.
+    let entered = tokio::net::unix::pipe::Receiver::from_file(fifo(&entered_path)).unwrap();
     let mut release = fifo(&release_path);
     let program = root.path().join("claude");
     std::fs::write(
@@ -625,14 +628,13 @@ async fn actual_subscription_lib_relay_is_captured_with_oauth_before_suspended_c
     // Readiness notification comes from the real relay's fixture, never a sleep.
     let notified = async {
         loop {
-            let mut ready = entered.readable().await.unwrap();
-            if let Ok(result) = ready.try_io(|fd| {
-                let mut file = fd.get_ref();
-                let mut byte = [0];
-                file.read_exact(&mut byte)
-            }) {
-                result.unwrap();
-                break;
+            entered.readable().await.unwrap();
+            let mut byte = [0];
+            match entered.try_read(&mut byte) {
+                Ok(1) => break,
+                Ok(_) => panic!("fixture barrier FIFO reported EOF"),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(e) => panic!("fixture barrier read failed: {e}"),
             }
         }
     };
