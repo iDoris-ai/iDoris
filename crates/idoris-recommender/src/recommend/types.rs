@@ -113,9 +113,10 @@ pub struct BlockedChoice {
     pub min_ram_gb: f64,
     pub estimated_memory_gb: f64,
     pub reason: String,
-    /// Set only when this model is the best on-demand model for a needed
-    /// capability but exceeds the allocated total. See [`TempAlternative`].
-    pub degraded_alternative: Option<TempAlternative>,
+    /// One entry per needed capability for which this model is the best
+    /// on-demand model but exceeds the allocated total and a no-eviction
+    /// alternative exists (each carries its `capability`). Empty otherwise.
+    pub degraded_alternatives: Vec<TempAlternative>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -159,6 +160,7 @@ pub enum TempStatus {
 #[derive(Debug, Clone, PartialEq)]
 pub struct TempAlternative {
     pub id: String,
+    pub capability: Capability,
     pub quant: QuantPick,
     pub reason: String,
 }
@@ -190,7 +192,8 @@ pub struct TempResult {
     pub choices: Vec<TempChoice>,
     pub warnings: Vec<String>,
     /// Allocated mode: `(blocked model id, alternative)` for best models that
-    /// exceed the allocated total. They are not in `choices`.
+    /// exceed the allocated total, one entry per capability (the alternative
+    /// carries its `capability`). They are not in `choices`.
     pub blocked_alternatives: Vec<(String, TempAlternative)>,
 }
 

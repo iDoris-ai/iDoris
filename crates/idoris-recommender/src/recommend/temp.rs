@@ -48,7 +48,12 @@ pub fn temp_admission(
                 *capability,
                 model,
                 remaining,
-            ) {
+            ) && !blocked_alternatives
+                .iter()
+                .any(|(id, known): &(String, TempAlternative)| {
+                    id == &model.id && known.capability == alt.capability
+                })
+            {
                 blocked_alternatives.push((model.id.clone(), alt));
             }
             continue;
@@ -135,6 +140,7 @@ fn degraded_alternative(
     }
     found.map(|(_, model, quant)| TempAlternative {
         id: model.id.clone(),
+        capability,
         reason: format!(
             "不驱逐降级：footprint {:.2}GB ≤ 剩余 {:.2}GB",
             quant.footprint_gb, remaining

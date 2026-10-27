@@ -45,7 +45,7 @@ pub fn recommend(
     let temp_result = temp_admission(catalog, hardware, &policy, resident.as_ref(), &budget);
     for (id, alternative) in &temp_result.blocked_alternatives {
         if let Some(entry) = blocked.iter_mut().find(|entry| &entry.id == id) {
-            entry.degraded_alternative = Some(alternative.clone());
+            entry.degraded_alternatives.push(alternative.clone());
         }
     }
 

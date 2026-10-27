@@ -160,6 +160,10 @@ fn allocated_blocked_surfaces_alternative_without_temp_choice() {
     assert_eq!(result.blocked_alternatives.len(), 1);
     assert_eq!(result.blocked_alternatives[0].0, "huge");
     assert_eq!(result.blocked_alternatives[0].1.id, "small");
+    assert_eq!(
+        result.blocked_alternatives[0].1.capability,
+        Capability::Vision
+    );
 }
 
 #[test]

@@ -172,15 +172,18 @@ budget, the user must be told and offered two choices:
 - (a) evict unused models, then load the best model. This is the existing
   `TempChoice` itself (`status = RequiresEviction`, `quant`).
 - (b) do not evict and degrade to a smaller model that fits now. This is the new
-  `TempChoice.degraded_alternative: Option<TempAlternative>` (`id`, `quant`,
-  `reason`).
+  `TempChoice.degraded_alternative: Option<TempAlternative>` (`id`, `capability`,
+  `quant`, `reason`).
 
 `degraded_alternative` is `Some` only for `RequiresEviction`: the best-scoring
 other eligible model (not experiment, `min_ram_gb` satisfied, not the resident)
 for the same capability whose quant fits the remaining budget without eviction.
 It is `None` for `Ready` or when nothing fits. In allocated mode, a best model
 larger than the allocated total stays out of `temp` (it is in `blocked`); its
-alternative is on `BlockedChoice.degraded_alternative`. Existing warnings,
+alternatives are on `BlockedChoice.degraded_alternatives`, one per capability
+(each `TempAlternative` carries its `capability`). As with `Ready`, remaining
+memory is not deducted cumulatively across capabilities, so alternatives for
+different capabilities may not fit together. Existing warnings,
 reasons and tradeoff text are unchanged, and the HTTP `/capabilities` shape is
 unchanged (the router does not expose the alternative yet).
 
