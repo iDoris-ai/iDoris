@@ -147,6 +147,18 @@ pub struct ForwardOpts<'a> {
     pub require_openai_usage: bool,
 }
 
+/// Provider id for which `create_adapter` (lifecycle path) builds the oMLX
+/// adapter, and therefore the only one that receives the oMLX key here.
+const OMLX_PROVIDER_ID: &str = "omlx";
+
+/// Deliberate trade-off: every proxied provider's 401/403 maps to
+/// `upstream_auth_failed`. A remote provider's 403 can also mean a model,
+/// region or content-policy refusal rather than a credential problem; that
+/// detail is intentionally collapsed (and the upstream text never relayed).
+fn is_upstream_auth_status(status: u16) -> bool {
+    matches!(status, 401 | 403)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct BufferedUpstreamPath {
     path: &'static str,
@@ -741,8 +753,19 @@ impl ChatProxy {
 
     /// The POST exactly as it goes on the wire, recorded in the egress
     /// counter first when the host is not loopback.
-    fn outbound(&self, url: &str, payload: &Value) -> reqwest::RequestBuilder {
-        let request = self.client.post(url);
+    ///
+    /// The request is built from scratch, so no caller header (notably the
+    /// iDoris virtual key in `Authorization`) can reach the upstream. The
+    /// oMLX inference key is attached only for the `omlx` provider — the same
+    /// selector the lifecycle path's `create_adapter` uses — from the same
+    /// env var, and is never logged.
+    fn outbound(&self, url: &str, payload: &Value, provider_id: &str) -> reqwest::RequestBuilder {
+        let mut request = self.client.post(url);
+        if provider_id == OMLX_PROVIDER_ID
+            && let Ok(key) = std::env::var(idoris_upstream::omlx::OMLX_API_KEY_ENV)
+        {
+            request = request.bearer_auth(key);
+        }
         // Keep local runtimes byte-for-byte compatible; remote providers get
         // only the request body after the narrow identity-field scrub.
         let decorrelated;
@@ -1469,10 +1492,22 @@ impl ChatProxy {
         };
         observer().await?;
         let mut retry_after_ms = None;
+        let mut raw_auth_status = None;
         let Ok(outcome) = self
-            .send_buffered(url, payload, opts, uncertain, &mut retry_after_ms)
+            .send_buffered(
+                url,
+                payload,
+                opts,
+                uncertain,
+                &mut retry_after_ms,
+                &mut raw_auth_status,
+            )
             .await;
-        claim.finish(outcome.status, retry_after_ms);
+        // An upstream 401/403 is recorded with its original status (not the
+        // mapped 502), exactly like the stream path: auth rejections are not
+        // breaker faults, so operators keep seeing `upstream_auth_failed`
+        // rather than `provider_circuit_open`.
+        claim.finish(raw_auth_status.unwrap_or(outcome.status), retry_after_ms);
         Ok(outcome)
     }
 
@@ -1487,13 +1522,17 @@ impl ChatProxy {
         opts: &ForwardOpts<'_>,
         uncertain: &mut bool,
         retry_after_ms: &mut Option<u64>,
+        raw_auth_status: &mut Option<u16>,
     ) -> Result<ForwardOutcome, std::convert::Infallible> {
         let mut attempt = 0usize;
         loop {
             // Keep the transport error until retry classification: only a
             // connection failure proves that this POST was not executed.
-            let sent =
-                tokio::time::timeout(self.header_timeout, self.outbound(url, payload).send()).await;
+            let sent = tokio::time::timeout(
+                self.header_timeout,
+                self.outbound(url, payload, opts.provider_id).send(),
+            )
+            .await;
             match sent {
                 Ok(Ok(resp)) => {
                     let status = resp.status().as_u16();
@@ -1510,6 +1549,13 @@ impl ChatProxy {
                         .map(|ms| ms.min(MAX_CONNECTION_RETRY_AFTER_MS));
                     #[allow(clippy::cast_possible_truncation)]
                     let retries = attempt as u32;
+                    // Decide on the status line alone: the body of a 401/403
+                    // is discarded unread, so an oversized or broken body
+                    // cannot turn this into a different error.
+                    if is_upstream_auth_status(status) {
+                        *raw_auth_status = Some(status);
+                        return Ok(Self::upstream_auth_failure(retries));
+                    }
                     // A body that fails to read (connection dropped
                     // mid-body, ...) is an upstream failure, not an empty
                     // success: never surface — let alone cache and replay
@@ -1692,16 +1738,18 @@ impl ChatProxy {
             });
         };
         observer().await?;
-        let sent =
-            match tokio::time::timeout(self.header_timeout, self.outbound(&url, &payload).send())
-                .await
-            {
-                Ok(sent) => sent,
-                Err(_) => {
-                    claim.finish(504, None);
-                    return Ok(Self::stream_failure(504, ExecutionDisposition::Uncertain));
-                }
-            };
+        let sent = match tokio::time::timeout(
+            self.header_timeout,
+            self.outbound(&url, &payload, provider_id).send(),
+        )
+        .await
+        {
+            Ok(sent) => sent,
+            Err(_) => {
+                claim.finish(504, None);
+                return Ok(Self::stream_failure(504, ExecutionDisposition::Uncertain));
+            }
+        };
         Ok(match sent {
             Ok(resp) => {
                 let status = resp.status().as_u16();
@@ -1846,6 +1894,14 @@ impl ChatProxy {
                         content_type,
                         response: axum::body::Body::from_stream(stream),
                     }
+                } else if is_upstream_auth_status(status) {
+                    let failure = Self::upstream_auth_failure(0);
+                    StreamOutcome::Buffered {
+                        status: failure.status,
+                        body: failure.body,
+                        content_type: failure.content_type,
+                        execution: ExecutionDisposition::Executed,
+                    }
                 } else {
                     match self.read_buffered(resp).await {
                         Ok(body) => StreamOutcome::Buffered {
@@ -1873,6 +1929,24 @@ impl ChatProxy {
                 )
             }
         })
+    }
+
+    /// The backend rejected iDoris's own upstream credential (or lack of
+    /// one). That is an operator-side fault, not the caller's: surface a
+    /// structured 502 and never relay the upstream's message text.
+    fn upstream_auth_failure(retries: u32) -> ForwardOutcome {
+        ForwardOutcome {
+            status: 502,
+            body: Bytes::from_static(
+                br#"{"error":{"type":"upstream_auth_failed","reason_code":"upstream_auth_failed"}}"#,
+            ),
+            content_type: Some("application/json".into()),
+            cached: false,
+            origin_record_id: None,
+            replayed_served_locality: None,
+            retries,
+            execution: ExecutionDisposition::Executed,
+        }
     }
 
     fn stream_failure(status: u16, execution: ExecutionDisposition) -> StreamOutcome {
