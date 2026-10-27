@@ -147,6 +147,14 @@ pub struct ForwardOpts<'a> {
     pub require_openai_usage: bool,
 }
 
+/// Provider id for which `create_adapter` (lifecycle path) builds the oMLX
+/// adapter, and therefore the only one that receives the oMLX key here.
+const OMLX_PROVIDER_ID: &str = "omlx";
+
+fn is_upstream_auth_status(status: u16) -> bool {
+    matches!(status, 401 | 403)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct BufferedUpstreamPath {
     path: &'static str,
@@ -741,8 +749,19 @@ impl ChatProxy {
 
     /// The POST exactly as it goes on the wire, recorded in the egress
     /// counter first when the host is not loopback.
-    fn outbound(&self, url: &str, payload: &Value) -> reqwest::RequestBuilder {
-        let request = self.client.post(url);
+    ///
+    /// The request is built from scratch, so no caller header (notably the
+    /// iDoris virtual key in `Authorization`) can reach the upstream. The
+    /// oMLX inference key is attached only for the `omlx` provider — the same
+    /// selector the lifecycle path's `create_adapter` uses — from the same
+    /// env var, and is never logged.
+    fn outbound(&self, url: &str, payload: &Value, provider_id: &str) -> reqwest::RequestBuilder {
+        let mut request = self.client.post(url);
+        if provider_id == OMLX_PROVIDER_ID
+            && let Ok(key) = std::env::var(idoris_upstream::omlx::OMLX_API_KEY_ENV)
+        {
+            request = request.bearer_auth(key);
+        }
         // Keep local runtimes byte-for-byte compatible; remote providers get
         // only the request body after the narrow identity-field scrub.
         let decorrelated;
@@ -1492,8 +1511,11 @@ impl ChatProxy {
         loop {
             // Keep the transport error until retry classification: only a
             // connection failure proves that this POST was not executed.
-            let sent =
-                tokio::time::timeout(self.header_timeout, self.outbound(url, payload).send()).await;
+            let sent = tokio::time::timeout(
+                self.header_timeout,
+                self.outbound(url, payload, opts.provider_id).send(),
+            )
+            .await;
             match sent {
                 Ok(Ok(resp)) => {
                     let status = resp.status().as_u16();
@@ -1527,6 +1549,9 @@ impl ChatProxy {
                             ));
                         }
                     };
+                    if is_upstream_auth_status(status) {
+                        return Ok(Self::upstream_auth_failure(retries));
+                    }
                     if (200..300).contains(&status)
                         && opts.require_openai_usage
                         && crate::budget::parse_openai_usage(&body_bytes).is_err()
@@ -1692,16 +1717,18 @@ impl ChatProxy {
             });
         };
         observer().await?;
-        let sent =
-            match tokio::time::timeout(self.header_timeout, self.outbound(&url, &payload).send())
-                .await
-            {
-                Ok(sent) => sent,
-                Err(_) => {
-                    claim.finish(504, None);
-                    return Ok(Self::stream_failure(504, ExecutionDisposition::Uncertain));
-                }
-            };
+        let sent = match tokio::time::timeout(
+            self.header_timeout,
+            self.outbound(&url, &payload, provider_id).send(),
+        )
+        .await
+        {
+            Ok(sent) => sent,
+            Err(_) => {
+                claim.finish(504, None);
+                return Ok(Self::stream_failure(504, ExecutionDisposition::Uncertain));
+            }
+        };
         Ok(match sent {
             Ok(resp) => {
                 let status = resp.status().as_u16();
@@ -1846,6 +1873,14 @@ impl ChatProxy {
                         content_type,
                         response: axum::body::Body::from_stream(stream),
                     }
+                } else if is_upstream_auth_status(status) {
+                    let failure = Self::upstream_auth_failure(0);
+                    StreamOutcome::Buffered {
+                        status: failure.status,
+                        body: failure.body,
+                        content_type: failure.content_type,
+                        execution: ExecutionDisposition::Executed,
+                    }
                 } else {
                     match self.read_buffered(resp).await {
                         Ok(body) => StreamOutcome::Buffered {
@@ -1873,6 +1908,24 @@ impl ChatProxy {
                 )
             }
         })
+    }
+
+    /// The backend rejected iDoris's own upstream credential (or lack of
+    /// one). That is an operator-side fault, not the caller's: surface a
+    /// structured 502 and never relay the upstream's message text.
+    fn upstream_auth_failure(retries: u32) -> ForwardOutcome {
+        ForwardOutcome {
+            status: 502,
+            body: Bytes::from_static(
+                br#"{"error":{"type":"upstream_auth_failed","reason_code":"upstream_auth_failed"}}"#,
+            ),
+            content_type: Some("application/json".into()),
+            cached: false,
+            origin_record_id: None,
+            replayed_served_locality: None,
+            retries,
+            execution: ExecutionDisposition::Executed,
+        }
     }
 
     fn stream_failure(status: u16, execution: ExecutionDisposition) -> StreamOutcome {
