@@ -106,16 +106,28 @@ pub(crate) struct Inspection {
 /// caller's key scope, so remote is allowed unless `kill_switch` is engaged.
 ///
 /// Images, audio, files, documents, `data:…;base64,` payloads, and integer
-/// arrays under `input` cannot be read by L0. A content-array part is readable
-/// only when its `type` is text, input_text, output_text, tool_use, tool_result,
-/// or function. Any other part type, or an object carrying media bytes, pins
-/// `any` to `local_only` even when the text scan allows the body.
+/// arrays under `input` cannot be read by L0. A *direct* content part (an
+/// object that is the value of a `content` key, or an element of a `content`
+/// array) is readable only when it has a string `type` that is text,
+/// input_text, output_text, tool_use, tool_result, function, thinking, or
+/// refusal. A direct part with any other `type`, no `type`, a non-string
+/// `type`, or a wrong-case `Type` key pins `any` to `local_only`. Objects
+/// nested deeper (`cache_control`, `tool_use.input`, annotations, tool
+/// schemas) are not parts and are not subject to the allow-list. Media keys,
+/// media type names and `data:…;base64,` URLs are checked at every depth.
+/// An object carrying media bytes pins `any` to `local_only` even when the
+/// text scan allows the body.
+///
+/// Coverage is limited to the OpenAI (chat, embeddings, rerank) and
+/// Anthropic Messages request shapes; other vendors' media encodings (e.g.
+/// Gemini `fileData`) are not recognised. Raw base64 under an unknown key
+/// inside an otherwise readable text part stays `any`.
 pub(crate) fn inspect_body(
     body: &serde_json::Value,
     declared: PrivacyClass,
     kill_switch: bool,
 ) -> Inspection {
-    fn collect(value: &serde_json::Value, out: &mut String, opaque: &mut bool, in_content: bool) {
+    fn collect(value: &serde_json::Value, out: &mut String, opaque: &mut bool, direct: bool) {
         match value {
             serde_json::Value::String(text) => {
                 *opaque |= is_data_url(text);
@@ -125,7 +137,7 @@ pub(crate) fn inspect_body(
             serde_json::Value::Array(items) => {
                 items
                     .iter()
-                    .for_each(|item| collect(item, out, opaque, in_content));
+                    .for_each(|item| collect(item, out, opaque, direct));
             }
             serde_json::Value::Object(map) => {
                 *opaque |= map.keys().any(|key| {
@@ -134,23 +146,23 @@ pub(crate) fn inspect_body(
                         .any(|name| key.eq_ignore_ascii_case(name))
                 });
                 if let Some(kind) = map.get("type").and_then(serde_json::Value::as_str) {
-                    let media = MEDIA_TYPE_NAMES
+                    *opaque |= MEDIA_TYPE_NAMES
                         .iter()
                         .any(|name| kind.eq_ignore_ascii_case(name));
-                    let unread_content = in_content
-                        && !READABLE_PART_TYPES
-                            .iter()
-                            .any(|name| kind.eq_ignore_ascii_case(name));
-                    *opaque |= media || unread_content;
                 }
+                let unread_content = direct
+                    && !map
+                        .get("type")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|kind| {
+                            READABLE_PART_TYPES
+                                .iter()
+                                .any(|name| kind.eq_ignore_ascii_case(name))
+                        });
+                *opaque |= unread_content;
                 map.iter().for_each(|(key, item)| {
                     push_line(out, key);
-                    collect(
-                        item,
-                        out,
-                        opaque,
-                        in_content || key.eq_ignore_ascii_case("content"),
-                    );
+                    collect(item, out, opaque, key.eq_ignore_ascii_case("content"));
                 });
             }
             serde_json::Value::Bool(_) | serde_json::Value::Null => {}
@@ -199,6 +211,8 @@ const READABLE_PART_TYPES: &[&str] = &[
     "tool_use",
     "tool_result",
     "function",
+    "thinking",
+    "refusal",
 ];
 
 const OPAQUE_MEDIA_KEYS: &[&str] = &[
@@ -606,6 +620,94 @@ mod request_path_tests {
         );
         assert!(beside_id.tightened && !beside_id.uninspectable);
         assert!(!beside_id.response.findings.is_empty());
+    }
+
+    fn pins_uninspectable(body: serde_json::Value) -> bool {
+        let got = inspect_body(&body, PrivacyClass::Any, false);
+        got.tightened && got.uninspectable
+    }
+
+    fn stays_any(body: serde_json::Value) -> bool {
+        let got = inspect_body(&body, PrivacyClass::Any, false);
+        !got.tightened && got.effective == PrivacyClass::Any
+    }
+
+    #[test]
+    fn unknown_or_typeless_direct_part_pins_any() {
+        let bodies = [
+            serde_json::json!({"content": [{"type": "some_future_media"}]}),
+            serde_json::json!({"content": {"type": "some_future_media"}}),
+            serde_json::json!({"messages": [{"role": "user", "content": [{"type": "some_future_media"}]}]}),
+            serde_json::json!({"messages": [{"role": "user", "content": [
+                {"type": "tool_result", "content": [{"type": "some_future_media"}]}
+            ]}]}),
+            serde_json::json!({"messages": [{"role": "user", "content": [
+                {"type": "tool_result", "content": [{"type": "image", "source": {"type": "base64", "data": "aaaa"}}]}
+            ]}]}),
+            serde_json::json!({"messages": [{"role": "user", "content": [{"text": "x"}]}]}),
+            serde_json::json!({"messages": [{"content": [{"source": {"type": "base64", "data": "aaaa"}}]}]}),
+            serde_json::json!({"messages": [{"content": [
+                {"type": "document", "content": [{"source": {"data": "aaaa"}}]}
+            ]}]}),
+            serde_json::json!({"messages": [{"content": [{"Type": "some_future_media"}]}]}),
+            serde_json::json!({"messages": [{"content": [{"type": ["some_future_media"]}]}]}),
+            serde_json::json!({"messages": [{"content": [{"type": 7}]}]}),
+        ];
+        for body in bodies {
+            assert!(pins_uninspectable(body.clone()), "{body}");
+        }
+    }
+
+    #[test]
+    fn readable_parts_and_non_part_types_stay_any() {
+        for kind in [
+            "text",
+            "input_text",
+            "output_text",
+            "tool_use",
+            "tool_result",
+            "function",
+            "thinking",
+            "refusal",
+        ] {
+            let body = serde_json::json!({"messages": [{"role": "user", "content": [{"type": kind, "text": "hi"}]}]});
+            assert!(stays_any(body), "{kind}");
+        }
+        let bodies = [
+            serde_json::json!({"messages": [{"role": "user", "content": [
+                {"type": "text", "text": "hi", "cache_control": {"type": "ephemeral"}}
+            ]}]}),
+            serde_json::json!({"messages": [{"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t", "content": "ok", "cache_control": {"type": "ephemeral"}}
+            ]}]}),
+            serde_json::json!({"messages": [{"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "hmm", "signature": "sig"}
+            ]}]}),
+            serde_json::json!({"messages": [{"role": "assistant", "content": [
+                {"type": "refusal", "refusal": "no"}
+            ]}]}),
+            serde_json::json!({"messages": [{"role": "assistant", "content": [
+                {"type": "output_text", "text": "see", "annotations": [{"type": "url_citation", "url": "https://example.test"}]}
+            ]}]}),
+            serde_json::json!({"messages": [{"role": "assistant", "content": [
+                {"type": "tool_use", "id": "t", "name": "f", "input": {"type": "bug"}}
+            ]}]}),
+            serde_json::json!({"messages": [{"role": "user", "content": "hi"}],
+                "tools": [{"type": "function", "function": {"name": "f", "parameters": {"type": "object", "properties": {"a": {"type": "string"}}}}}]}),
+            serde_json::json!({"messages": [{"role": "user", "content": [
+                {"type": "text", "text": "x", "data": "iVBORw0KGgo"}
+            ]}]}),
+        ];
+        for body in bodies {
+            assert!(stays_any(body.clone()), "{body}");
+        }
+    }
+
+    #[test]
+    fn nested_integer_token_array_pins_any() {
+        assert!(pins_uninspectable(
+            serde_json::json!({"input": [[1, 2, 3]]})
+        ));
     }
 
     #[tokio::test]
