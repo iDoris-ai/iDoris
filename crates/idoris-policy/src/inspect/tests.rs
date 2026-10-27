@@ -53,9 +53,7 @@ fn gb11643_example_id_is_s3_with_exact_span() {
 /// inputs are S3 Block and the span covers the id. The regression passes;
 /// it is not ignored.
 ///
-/// Shorter prefixes (`\` + `u` + one to three ASCII digits glued to the same
-/// id) are longer digit runs and stay undetected. #534 records them. They
-/// are not asserted here, and the generator is unchanged.
+/// Shorter digit prefixes are covered by the next test (#534).
 #[test]
 fn literal_backslash_u_prefix_keeps_the_resident_id() {
     let id = "110105195001010004";
@@ -73,6 +71,32 @@ fn literal_backslash_u_prefix_keeps_the_resident_id() {
             response.action,
             response.findings
         );
+    }
+}
+
+/// Issue #534: a literal `\u` plus one to three digits glued to the id makes a
+/// longer digit run (`\u1` + id is 19 digits). Spans stay in original UTF-16
+/// coordinates and cover exactly the 18-digit id.
+#[test]
+fn literal_backslash_u_short_digit_prefix_keeps_the_resident_id() {
+    let id = "110105195001010004";
+    for digits in ["1", "11", "111"] {
+        for slashes in ["\\", "\\\\"] {
+            let input = format!("身份证：{slashes}u{digits}{id}");
+            let response = inspect(&input, &open_ctx());
+            let found = response.findings.iter().any(|finding| {
+                finding.kind == FindingKind::CnResidentId && covered(&input, finding) == id
+            });
+            assert!(
+                found
+                    && response.sensitivity == Sensitivity::S3
+                    && response.action == InspectAction::Block,
+                "{input:?} sensitivity={:?} action={:?} findings={:?}",
+                response.sensitivity,
+                response.action,
+                response.findings
+            );
+        }
     }
 }
 

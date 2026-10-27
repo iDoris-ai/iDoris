@@ -165,3 +165,41 @@ Current status: fixture parity, injected HostFacts, catalog parsing, formulas,
 recommendation and B1 consumer contracts are tested. Real M1 Max model
 footprint calibration and live B1 task15/task33 backend consumption remain
 A-machine acceptance work and must not be described as already verified.
+
+## Degraded alternative (owner decision 2026-10-27)
+
+When the best on-demand model for a capability does not fit the remaining
+budget, the user must be told and offered two choices:
+
+- (a) evict unused models, then load the best model. This is the existing
+  `TempChoice` itself (`status = RequiresEviction`, `quant`).
+- (b) do not evict and degrade to a smaller model that fits now. This is the new
+  `TempChoice.degraded_alternative: Option<TempAlternative>` (`id`, `capability`,
+  `quant`, `reason`).
+
+`degraded_alternative` is `Some` only for `RequiresEviction`: the best-scoring
+other eligible model (not experiment, `min_ram_gb` satisfied, not the resident)
+for the same capability whose quant fits the remaining budget without eviction.
+It is `None` for `Ready` or when nothing fits. In allocated mode, a best model
+larger than the allocated total stays out of `temp` (it is in `blocked`); its
+alternatives are on `BlockedChoice.degraded_alternatives`, one per capability
+(each `TempAlternative` carries its `capability`). As with `Ready`, remaining
+memory is not deducted cumulatively across capabilities, so alternatives for
+different capabilities may not fit together. Existing warnings,
+reasons and tradeoff text are unchanged, and the HTTP `/capabilities` shape is
+unchanged (the router does not expose the alternative yet).
+
+## Headroom breach option (owner decision)
+
+The `HEADROOM_GB` (1GB) margin is kept by default. `Recommendation.headroom_breach_option:
+Option<ResidentChoice>` is the best resident that would fit if that margin were
+spent (resident budget + `HEADROOM_GB`, never above the allocated total or
+usable memory). It is filled only when its score is strictly higher than the
+automatic resident (or there is no automatic resident) and no forced override
+is active. It never replaces `resident`, never changes temp admission, and does
+not appear in warnings or tradeoff text.
+
+The option takes effect only after the user confirms it each time; it must
+never be applied automatically. The confirmation UI belongs to Agent24; how the
+option is exposed over HTTP is deferred to a later phase to be agreed with
+Agent24.

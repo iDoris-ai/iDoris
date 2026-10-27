@@ -446,6 +446,11 @@ fn scan_all_views(units: &[u16], scan: fn(&[u16]) -> Vec<Hit>) -> Vec<Hit> {
     ] {
         hits.extend(drop_folded_malformed_hkid(scan_view(&view, scan), units));
     }
+    for k in 1..=3 {
+        if let Some(view) = normalize::skip_short_escape_digits(units, k) {
+            hits.extend(drop_folded_malformed_hkid(scan_view(&view, scan), units));
+        }
+    }
     hits.sort_by_key(|hit| {
         (
             hit.start,
