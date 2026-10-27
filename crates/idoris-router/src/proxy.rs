@@ -151,6 +151,10 @@ pub struct ForwardOpts<'a> {
 /// adapter, and therefore the only one that receives the oMLX key here.
 const OMLX_PROVIDER_ID: &str = "omlx";
 
+/// Deliberate trade-off: every proxied provider's 401/403 maps to
+/// `upstream_auth_failed`. A remote provider's 403 can also mean a model,
+/// region or content-policy refusal rather than a credential problem; that
+/// detail is intentionally collapsed (and the upstream text never relayed).
 fn is_upstream_auth_status(status: u16) -> bool {
     matches!(status, 401 | 403)
 }
@@ -1488,10 +1492,22 @@ impl ChatProxy {
         };
         observer().await?;
         let mut retry_after_ms = None;
+        let mut raw_auth_status = None;
         let Ok(outcome) = self
-            .send_buffered(url, payload, opts, uncertain, &mut retry_after_ms)
+            .send_buffered(
+                url,
+                payload,
+                opts,
+                uncertain,
+                &mut retry_after_ms,
+                &mut raw_auth_status,
+            )
             .await;
-        claim.finish(outcome.status, retry_after_ms);
+        // An upstream 401/403 is recorded with its original status (not the
+        // mapped 502), exactly like the stream path: auth rejections are not
+        // breaker faults, so operators keep seeing `upstream_auth_failed`
+        // rather than `provider_circuit_open`.
+        claim.finish(raw_auth_status.unwrap_or(outcome.status), retry_after_ms);
         Ok(outcome)
     }
 
@@ -1506,6 +1522,7 @@ impl ChatProxy {
         opts: &ForwardOpts<'_>,
         uncertain: &mut bool,
         retry_after_ms: &mut Option<u64>,
+        raw_auth_status: &mut Option<u16>,
     ) -> Result<ForwardOutcome, std::convert::Infallible> {
         let mut attempt = 0usize;
         loop {
@@ -1532,6 +1549,13 @@ impl ChatProxy {
                         .map(|ms| ms.min(MAX_CONNECTION_RETRY_AFTER_MS));
                     #[allow(clippy::cast_possible_truncation)]
                     let retries = attempt as u32;
+                    // Decide on the status line alone: the body of a 401/403
+                    // is discarded unread, so an oversized or broken body
+                    // cannot turn this into a different error.
+                    if is_upstream_auth_status(status) {
+                        *raw_auth_status = Some(status);
+                        return Ok(Self::upstream_auth_failure(retries));
+                    }
                     // A body that fails to read (connection dropped
                     // mid-body, ...) is an upstream failure, not an empty
                     // success: never surface — let alone cache and replay
@@ -1549,9 +1573,6 @@ impl ChatProxy {
                             ));
                         }
                     };
-                    if is_upstream_auth_status(status) {
-                        return Ok(Self::upstream_auth_failure(retries));
-                    }
                     if (200..300).contains(&status)
                         && opts.require_openai_usage
                         && crate::budget::parse_openai_usage(&body_bytes).is_err()

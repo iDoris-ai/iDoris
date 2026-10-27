@@ -261,6 +261,62 @@ async fn run_case(case: &str) {
             assert_eq!(status, StatusCode::OK, "{body}");
             assert_no_caller_key(&upstream.received_requests().await.unwrap());
         }
+        "breaker_sequence" => {
+            // Upstream always 401; auth rejections must never trip the breaker.
+            let upstream = auth_backend().await;
+            let app = build_app(AppState {
+                cards: vec![card("omlx", &upstream.uri(), LoadMode::Resident)],
+                ..AppState::default()
+            });
+            let order = [false, false, false, false, true, false];
+            for (i, stream) in order.into_iter().enumerate() {
+                let (status, body) = body_of(
+                    app.clone()
+                        .oneshot(post("/v1/chat/completions", chat(stream)))
+                        .await
+                        .unwrap(),
+                )
+                .await;
+                assert_mapped_auth_error(status, &body);
+                assert!(!body.contains("circuit"), "request {i}: {body}");
+                assert_eq!(
+                    upstream.received_requests().await.unwrap().len(),
+                    i + 1,
+                    "request {i} must reach the upstream (breaker stayed closed)"
+                );
+            }
+        }
+        "oversized_401" => {
+            // 401 head with a Content-Length above the body cap, then a dead body.
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            std::thread::spawn(move || {
+                use std::io::{Read, Write};
+                for conn in listener.incoming() {
+                    let mut conn = conn.unwrap();
+                    let mut buf = [0u8; 4096];
+                    let _ = conn.read(&mut buf);
+                    let _ = conn.write_all(
+                        b"HTTP/1.1 401 Unauthorized\r\ncontent-type: application/json\r\n\
+                          content-length: 8388609\r\n\r\n{\"error\":\"API key required\"",
+                    );
+                }
+            });
+            let app = build_app(AppState {
+                cards: vec![card("omlx", &format!("http://{addr}"), LoadMode::Resident)],
+                ..AppState::default()
+            });
+            for stream in [false, true] {
+                let (status, body) = body_of(
+                    app.clone()
+                        .oneshot(post("/v1/chat/completions", chat(stream)))
+                        .await
+                        .unwrap(),
+                )
+                .await;
+                assert_mapped_auth_error(status, &body);
+            }
+        }
         other => panic!("unknown case {other}"),
     }
 }
@@ -276,6 +332,8 @@ async fn resident_omlx_key_attachment_and_auth_error_mapping() {
         ("resident_nokey", None),
         ("non_omlx", Some(KEY)),
         ("on_demand", Some(KEY)),
+        ("breaker_sequence", None),
+        ("oversized_401", None),
     ] {
         let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
         cmd.args([
