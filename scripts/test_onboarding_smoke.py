@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Pin v0.3.0 behavior (adapt expectations before use with v0.3.1).
+"""Pin v0.3.1 release behavior.
 
 Exercise a release binary in disposable storage, with a loopback HTTP fixture.
 
@@ -120,7 +120,7 @@ def server(binary, cwd, env, token):
 
 
 def late_backend_case(binary, root, env, token, key, card, components, base):
-    """Released 0.3.0 latches startup_error until our own service restarts."""
+    """The release latches startup_error until our own service restarts."""
     LOADED.clear()
     with socket.socket() as unavailable:
         unavailable.bind(('127.0.0.1', 0))
@@ -196,7 +196,7 @@ def main(binary, late_backend_only=False):
             env['IDORIS_COMPONENTS_DIR'] = str(components)
             with server(binary, root, env, token):
                 health = json.loads(request(base + '/health')[2])
-                assert health['version'] == '0.3.0', health
+                assert health['version'] == '0.3.1', health
                 assert request(base + '/v1/chat/completions', body={'model': 'm', 'messages': []})[0] == 401
                 assert json.loads(request(base + '/v1/models', key)[2])['data'] == []
                 assert request(admin + '/admin/api/v1/status')[0] == 401
@@ -215,6 +215,11 @@ def main(binary, late_backend_only=False):
             card = card.replace('http://127.0.0.1:8000', 'http://127.0.0.1:' + str(upstream.server_port))
             card = card.replace('id: omlx', 'id: fixture-local').replace('omlx@0.6.4', 'fixture@1')
             card = card.replace('mode: on_demand', 'mode: resident').replace('admission: requires_eviction', 'admission: coexist').replace('idle_ttl_s: 300', 'pinned: true')
+            # v0.3.1 (#510): role requests need an explicit operator binding to a real backend model ID.
+            card += ('\nextensions:\n'
+                     '  _degradation: "Removing these bindings disables role aliases on this backend."\n'
+                     '  idoris_role_models:\n'
+                     '    daily: fixture-model\n')
             (components / 'local.yaml').write_text(card)
             with server(binary, root, env, token):
                 models = json.loads(request(base + '/v1/models', key)[2])
@@ -234,8 +239,8 @@ def main(binary, late_backend_only=False):
                                         env=env, input=token + '\n', text=True, capture_output=True, check=True)
                 assert json.loads(result.stdout)
                 assert len(SEEN) == 2, SEEN
-                assert SEEN[1]['model'] == 'idoris/daily', SEEN
-                print('PASS persisted key bootstrap/restart; model discovery; concrete+daily calls; locality/record headers; role denial; Admin CLI')
+                assert SEEN[1]['model'] == 'fixture-model', SEEN  # the bound real ID, never the alias
+                print('PASS persisted key bootstrap/restart; model discovery; concrete+bound daily calls; locality/record headers; role denial; Admin CLI')
                 print('Fixture received model fields:', [item['model'] for item in SEEN])
             # Restore the packaged lifecycle card shape against our oMLX-shaped fixture.
             lifecycle = (binary.parent / 'config/components/omlx.yaml').read_text()
@@ -248,17 +253,20 @@ def main(binary, late_backend_only=False):
                 assert LOADED == ['fixture-model']
                 assert SEEN[-1]['model'] == 'fixture-model'
                 count = len(SEEN)
-                body['max_tokens'] = 8
+                body['temperature'] = 0.2
                 status, _, raw = request(base + '/v1/chat/completions', key, body)
-                assert status == 400 and json.loads(raw)['error']['type'] == 'unsupported_field'
-                del body['max_tokens']
+                assert status == 400 and json.loads(raw)['error']['type'] == 'unsupported_field', (status, raw)
+                assert json.loads(raw)['error']['reason_code'] == 'unsupported_parameter', raw
+                assert len(SEEN) == count, 'rejected sampling field unexpectedly invoked a model'
+                del body['temperature']
                 body['model'] = 'idoris/daily'
                 status, _, raw = request(base + '/v1/chat/completions', limited_key, body)
                 assert status == 503, (status, raw)
                 assert json.loads(raw)['error']['type'] == 'local_only_unavailable'
-                assert json.loads(raw)['error']['remediation'] == 'model not found: omlx', raw
+                # v0.3.1 redacts internal role-resolution detail from the caller-facing error.
+                assert 'omlx' not in json.loads(raw)['error']['remediation'], raw
                 assert len(SEEN) == count, 'unresolved role unexpectedly invoked a model'
-                print('PASS oMLX-shaped list/status/load/chat; concrete model works; default daily alias fails closed (known product gap)')
+                print('PASS oMLX-shaped list/status/load/chat; concrete model works; temperature rejected before dispatch; unbound daily alias fails closed')
         finally:
             upstream.shutdown()
             upstream.server_close()
