@@ -91,8 +91,10 @@ passes the allocation into each snapshot. Blocked models map to HTTP
 `admission_status: "blocked"`. The maintained `idoris serve` binary accepts the
 optional `IDORIS_ALLOCATED_BUDGET_BYTES` unsigned integer environment variable;
 unset means `None`, and malformed or overflowing values reject startup. This
-configures recommendations and capability reporting, not a global runtime
-memory enforcer or a live Agent24 allocation negotiation protocol.
+configures recommendations and capability reporting; the same `Option<u64>` also
+sets the capacity ledger for lifecycle (Supervisor) load admission. It does not
+hard-limit external resident services or actual RSS, and there is no dynamic
+budget API or live Agent24 allocation negotiation protocol.
 
 ### Units and footprint limits
 
