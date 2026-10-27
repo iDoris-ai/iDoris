@@ -88,6 +88,31 @@ pub(super) fn fold_digits_and_homoglyphs(units: &[u16]) -> Normalized {
     rewrite(units, true, true)
 }
 
+/// 字面 `\u` 后紧跟 1-3 个数字再贴着更长的数字 run（`\u1` + 18 位身份证 = 19 位）
+/// 会让精确长度判断放行。本树不解码 `\u`，所以这里把 `\u` 之后最前面的 `k`
+/// 个 ASCII 数字当作转义前缀跳过，其余 unit 原样保留并映射回原文坐标。
+/// 只有存在 `\u` + 至少 `k + 1` 个连续数字时才返回视图，否则为 `None`。
+pub(super) fn skip_short_escape_digits(units: &[u16], k: usize) -> Option<Normalized> {
+    let digit = |u: u16| (u16::from(b'0')..=u16::from(b'9')).contains(&u);
+    let mut out = Normalized {
+        units: Vec::with_capacity(units.len()),
+        origin: Vec::with_capacity(units.len()),
+    };
+    let mut changed = false;
+    let mut i = 0;
+    while i < units.len() {
+        out.units.push(units[i]);
+        out.origin.push(i);
+        let after_escape = units[i] == u16::from(b'u') && i > 0 && units[i - 1] == u16::from(b'\\');
+        i += 1;
+        if after_escape && i + k < units.len() && units[i..=i + k].iter().all(|&u| digit(u)) {
+            i += k;
+            changed = true;
+        }
+    }
+    changed.then_some(out)
+}
+
 fn rewrite(units: &[u16], drop_ignorables: bool, fold_scripts: bool) -> Normalized {
     let mut out = Normalized {
         units: Vec::with_capacity(units.len()),
