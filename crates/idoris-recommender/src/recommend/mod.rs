@@ -13,5 +13,6 @@ pub use temp::temp_admission;
 pub use types::{
     BlockedChoice, BudgetBreakdown, CoreOverride, ForcedResult, HEADROOM_GB, PartialPolicy,
     QuantPick, RecommendError, Recommendation, RecommenderPolicy, ResidentChoice, ResidentError,
-    SysctlRecommendation, TEMP_SLOT_RESERVE_GB, TempChoice, TempResult, TempStatus,
+    SysctlRecommendation, TEMP_SLOT_RESERVE_GB, TempAlternative, TempChoice, TempResult,
+    TempStatus,
 };
