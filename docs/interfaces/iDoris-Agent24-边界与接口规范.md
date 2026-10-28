@@ -164,7 +164,10 @@ agent24d 托管 iDoris 时，按下表执行。表中都是已冻结的接口，
 - `GET /capabilities` 的条目可能带三个新字段：`degraded_alternative`（只出现在 `requires_eviction` 条目上，`{id, capability, estimated_memory_gb, quant, reason}` 或 `null`）、`degraded_alternatives`（只出现在 `blocked` 条目上，是数组）、`headroom_breach_option`（`{id, quant, estimated_memory_gb, ctx_limit}`，整份快照最多一个条目带这个字段，条目 id 唯一）。`reason` 是稳定的代码，例如 `fits_without_eviction`。解析时看哪个条目带了 `headroom_breach_option`，不要靠 `resident:true` 来定位。
 - 用户选「清理后用最优模型」或「降级」时，直接请求对应的模型 id 即可，不需要新接口。
 - **1GB 余量**：设置了 `IDORIS_ALLOCATED_BUDGET_BYTES` 时，生命周期加载默认最多用到额度减 1GB。`POST /v1/chat/completions` 带上 `X-iDoris-Headroom-Breach: confirmed`（只接受这一个值），表示用户已确认，这一次加载可以用满全部额度。确认只对单次请求有效，不会被记住。它是 Agent24 问过用户之后代为发出的约定，不是权限边界。
-- 没带确认、而这次加载只有用掉余量才放得下时，返回 `503 headroom_confirmation_required`，此时应询问用户。另一个请求正在以不同的确认状态加载同一个模型时，返回 `503 supervisor_busy`，有限退避后用同一个请求头重试即可，不要询问用户。其它 503 按原规则处理。
+- 没带确认、而这次加载只有用掉余量才放得下时，返回 HTTP 503，`error.type` 与 `error.reason_code` 都是 `headroom_confirmation_required`，此时应询问用户。
+- 生命周期繁忙时（包括另一个请求正在以不同的确认状态加载同一个模型），返回 HTTP 503，`error.type` 是 `local_only_unavailable`，`error.reason_code` 是 `supervisor_busy`。必须按 `reason_code` 区分，有限退避后用同一个请求头重试即可，不要询问用户。
+- 带了确认也放不下（超过整个额度）时，`error.type` 是 `local_only_unavailable`，`reason_code` 不是 `headroom_confirmation_required`，为终态，不应弹出确认。其它 503 按原规则处理。
+- `remediation` 是给人看的说明文字，不属于契约，不得用于匹配。
 
 ## 3. 拟议 v0.3.1 local_only 数据面切片（待联合验收）
 
