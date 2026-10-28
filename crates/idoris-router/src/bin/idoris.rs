@@ -86,8 +86,8 @@ async fn main() {
                 }
             }
         }
-        cli::Command::Key(cli::KeyCommand::Issue) => {
-            if let Err(message) = issue_virtual_key() {
+        cli::Command::Key(command) => {
+            if let Err(message) = run_key_command(command) {
                 eprintln!("[idoris] {message}");
                 std::process::exit(1);
             }
@@ -95,11 +95,19 @@ async fn main() {
     }
 }
 
-fn issue_virtual_key() -> Result<(), String> {
+fn run_key_command(command: cli::KeyCommand) -> Result<(), String> {
     let store = storage::open_virtual_key_store_process()?;
-    let mut stdin = std::io::stdin().lock();
     let mut stdout = std::io::stdout().lock();
-    idoris_router::key_issue::issue_from_reader(&store, &mut stdin, &mut stdout)
+    match command {
+        cli::KeyCommand::Issue => {
+            let mut stdin = std::io::stdin().lock();
+            idoris_router::key_issue::issue_from_reader(&store, &mut stdin, &mut stdout)
+        }
+        cli::KeyCommand::List => idoris_router::key_manage::list(&store, &mut stdout),
+        cli::KeyCommand::Revoke(key_id) => {
+            idoris_router::key_manage::revoke(&store, &key_id, &mut stdout)
+        }
+    }
 }
 
 const ALLOCATED_BUDGET_ENV: &str = "IDORIS_ALLOCATED_BUDGET_BYTES";
