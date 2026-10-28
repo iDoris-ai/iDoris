@@ -61,6 +61,9 @@ pub struct GlobalCapacityLedger {
     budget_gb: f64,
     budget_units: u128,
     admission_epsilon_units: u128,
+    /// Bytes kept unreserved unless a request explicitly confirms the breach.
+    /// Zero (legacy and plain `new_bytes`) means the full budget is always usable.
+    headroom_units: u128,
     allocations: Mutex<BTreeMap<String, CapacityAllocation>>,
 }
 
@@ -86,6 +89,7 @@ impl GlobalCapacityLedger {
             }),
             admit_growth,
             None,
+            true,
         )
     }
 
@@ -96,6 +100,7 @@ impl GlobalCapacityLedger {
         key: &str,
         current: CapacityCharge,
         planned: CapacityCharge,
+        allow_headroom_breach: bool,
     ) -> Result<(), BackendError> {
         let held = current.max(planned);
         self.replace_allocation(
@@ -107,6 +112,7 @@ impl GlobalCapacityLedger {
             }),
             true,
             Some(planned),
+            allow_headroom_breach,
         )
     }
 
@@ -116,6 +122,7 @@ impl GlobalCapacityLedger {
             budget_gb,
             budget_units,
             admission_epsilon_units: CAPACITY_EPSILON_UNITS,
+            headroom_units: 0,
             allocations: Mutex::new(BTreeMap::new()),
         })
     }
@@ -124,18 +131,67 @@ impl GlobalCapacityLedger {
     /// Model estimates still round upward to whole bytes; the floating-point
     /// snapshot is informational and never determines this admission limit.
     pub fn new_bytes(budget_bytes: u64) -> Self {
+        Self::new_bytes_with_headroom(budget_bytes, 0)
+    }
+
+    /// Like [`Self::new_bytes`], but `headroom_bytes` stay unreserved unless
+    /// the admitting request confirms the breach (see
+    /// [`Self::reserve_with_headroom`]). A budget below the headroom has no
+    /// usable capacity without confirmation.
+    pub fn new_bytes_with_headroom(budget_bytes: u64, headroom_bytes: u64) -> Self {
         Self {
             budget_gb: units_to_gb(u128::from(budget_bytes)),
             budget_units: u128::from(budget_bytes),
             admission_epsilon_units: 0,
+            headroom_units: u128::from(headroom_bytes),
             allocations: Mutex::new(BTreeMap::new()),
         }
+    }
+
+    /// One atomic admission decision for `total_units` against the full
+    /// ceiling (`Oom`) and, unless the breach is confirmed, the ceiling minus
+    /// headroom. Full-allocation overflow wins so a hopeless request is never
+    /// told that confirmation would help.
+    fn check_admission(
+        &self,
+        key: &str,
+        total_units: u128,
+        allow_headroom_breach: bool,
+    ) -> Result<(), BackendError> {
+        let full = self
+            .budget_units
+            .saturating_add(self.admission_epsilon_units);
+        if total_units > full {
+            return Err(BackendError::Oom {
+                model_id: key.to_string(),
+            });
+        }
+        let reduced = self
+            .budget_units
+            .saturating_sub(self.headroom_units)
+            .saturating_add(self.admission_epsilon_units);
+        if !allow_headroom_breach && total_units > reduced {
+            return Err(BackendError::headroom_confirmation_required(key));
+        }
+        Ok(())
     }
 
     /// Reserve one runtime/model allocation. Repeating the exact same key and
     /// amount is idempotent; changing an existing amount is an invariant error
     /// so two owners cannot silently rewrite each other's accounting.
     pub fn reserve(&self, key: &str, memory_gb: f64) -> Result<(), BackendError> {
+        self.reserve_with_headroom(key, memory_gb, true)
+    }
+
+    /// [`Self::reserve`] with the headroom decision made under the same lock.
+    /// Without `allow_headroom_breach`, a reservation that fits only inside
+    /// the headroom fails with `HeadroomConfirmationRequired`.
+    pub fn reserve_with_headroom(
+        &self,
+        key: &str,
+        memory_gb: f64,
+        allow_headroom_breach: bool,
+    ) -> Result<(), BackendError> {
         let charged_units = to_capacity_units("memory_gb", memory_gb, Rounding::Up)?;
         if key.trim().is_empty() {
             return Err(BackendError::invalid_request(
@@ -162,16 +218,12 @@ impl GlobalCapacityLedger {
                 model_id: key.to_string(),
             });
         };
-        if (self.budget_gb == 0.0 && charged_units > 0)
-            || requested_total_units
-                > self
-                    .budget_units
-                    .saturating_add(self.admission_epsilon_units)
-        {
+        if self.budget_gb == 0.0 && charged_units > 0 {
             return Err(BackendError::Oom {
                 model_id: key.to_string(),
             });
         }
+        self.check_admission(key, requested_total_units, allow_headroom_breach)?;
         allocations.insert(
             key.to_string(),
             CapacityAllocation {
@@ -256,6 +308,7 @@ impl GlobalCapacityLedger {
             next,
             enforce_growth_admission,
             None,
+            true,
         )
     }
 
@@ -266,6 +319,7 @@ impl GlobalCapacityLedger {
         next: Option<CapacityAllocation>,
         enforce_growth_admission: bool,
         planned_charge: Option<CapacityCharge>,
+        allow_headroom_breach: bool,
     ) -> Result<(), BackendError> {
         if key.trim().is_empty() {
             return Err(BackendError::invalid_request(
@@ -300,26 +354,31 @@ impl GlobalCapacityLedger {
         let requested_total_units = other_units.checked_add(next_units).ok_or_else(|| {
             BackendError::invariant_violation("global capacity exact total overflowed")
         })?;
-        if let Some(planned) = planned_charge
-            && other_units
-                .checked_add(planned.0)
-                .is_none_or(|total| total > self.budget_units)
-        {
-            return Err(BackendError::Oom {
-                model_id: key.to_string(),
-            });
+        if let Some(planned) = planned_charge {
+            let Some(total) = other_units.checked_add(planned.0) else {
+                return Err(BackendError::Oom {
+                    model_id: key.to_string(),
+                });
+            };
+            // The plan is judged against the bare budget (no epsilon).
+            if total > self.budget_units {
+                return Err(BackendError::Oom {
+                    model_id: key.to_string(),
+                });
+            }
+            if !allow_headroom_breach
+                && total > self.budget_units.saturating_sub(self.headroom_units)
+            {
+                return Err(BackendError::headroom_confirmation_required(key));
+            }
         }
-        if enforce_growth_admission
-            && next_units > current_units
-            && (self.budget_gb == 0.0
-                || requested_total_units
-                    > self
-                        .budget_units
-                        .saturating_add(self.admission_epsilon_units))
-        {
-            return Err(BackendError::Oom {
-                model_id: key.to_string(),
-            });
+        if enforce_growth_admission && next_units > current_units {
+            if self.budget_gb == 0.0 {
+                return Err(BackendError::Oom {
+                    model_id: key.to_string(),
+                });
+            }
+            self.check_admission(key, requested_total_units, allow_headroom_breach)?;
         }
 
         match next {
@@ -463,6 +522,132 @@ mod tests {
         ledger
             .update_charge("runtime", Some(next), full, true)
             .unwrap();
+    }
+
+    const GB: u128 = 1_000_000_000;
+
+    fn claim(
+        ledger: &GlobalCapacityLedger,
+        key: &str,
+        bytes: u128,
+        allow: bool,
+    ) -> Result<(), BackendError> {
+        // Runtimes register a zero claim at startup; repeating it is a harmless error.
+        let _ = ledger.update_charge(key, None, CapacityCharge::default(), true);
+        ledger.claim_charge(key, CapacityCharge::default(), CapacityCharge(bytes), allow)
+    }
+
+    #[test]
+    fn headroom_is_kept_unreserved_to_the_exact_byte() {
+        let ledger = GlobalCapacityLedger::new_bytes_with_headroom(5_000_000_000, 1_000_000_000);
+        claim(&ledger, "a", 4 * GB, false).unwrap();
+        // One byte into the headroom: refused without confirmation, even for another key.
+        assert!(matches!(
+            claim(&ledger, "b", 1, false),
+            Err(BackendError::HeadroomConfirmationRequired { .. })
+        ));
+        // The refusal reserved nothing; confirmation admits exactly the remainder.
+        claim(&ledger, "b", GB, true).unwrap();
+        assert!(matches!(
+            claim(&ledger, "c", 1, true),
+            Err(BackendError::Oom { .. })
+        ));
+    }
+
+    #[test]
+    fn a_non_growing_plan_still_needs_confirmation_when_it_sits_in_the_headroom() {
+        let ledger = GlobalCapacityLedger::new_bytes_with_headroom(5_000_000_000, 1_000_000_000);
+        let held = CapacityCharge(9 * GB / 2);
+        ledger
+            .update_charge("a", None, CapacityCharge::default(), true)
+            .unwrap();
+        ledger
+            .claim_charge("a", CapacityCharge::default(), held, true)
+            .unwrap();
+        assert!(matches!(
+            ledger.claim_charge("a", held, held, false),
+            Err(BackendError::HeadroomConfirmationRequired { .. })
+        ));
+        ledger.claim_charge("a", held, held, true).unwrap();
+    }
+
+    #[test]
+    fn beyond_the_full_allocation_keeps_the_old_error_either_way() {
+        for allow in [false, true] {
+            let ledger =
+                GlobalCapacityLedger::new_bytes_with_headroom(5_000_000_000, 1_000_000_000);
+            assert!(matches!(
+                claim(&ledger, "a", 5 * GB + 1, allow),
+                Err(BackendError::Oom { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn a_budget_below_the_headroom_needs_confirmation_for_any_growth() {
+        let ledger = GlobalCapacityLedger::new_bytes_with_headroom(500_000_000, 1_000_000_000);
+        assert!(matches!(
+            claim(&ledger, "a", 1, false),
+            Err(BackendError::HeadroomConfirmationRequired { .. })
+        ));
+        claim(&ledger, "a", 500_000_000, true).unwrap();
+        assert!(matches!(
+            claim(&ledger, "b", 1, true),
+            Err(BackendError::Oom { .. })
+        ));
+    }
+
+    #[test]
+    fn plain_new_bytes_and_legacy_gb_ledgers_ignore_headroom() {
+        let exact = GlobalCapacityLedger::new_bytes(5_000_000_000);
+        claim(&exact, "a", 5 * GB, false).unwrap();
+        let legacy = GlobalCapacityLedger::new(5.0).unwrap();
+        legacy.reserve_with_headroom("a", 5.0, false).unwrap();
+        assert!(matches!(
+            legacy.reserve_with_headroom("b", 1.0, false),
+            Err(BackendError::Oom { .. })
+        ));
+    }
+
+    #[test]
+    fn reserve_applies_the_same_decision_under_its_own_lock() {
+        let ledger = GlobalCapacityLedger::new_bytes_with_headroom(5_000_000_000, 1_000_000_000);
+        ledger.reserve_with_headroom("a", 4.0, false).unwrap();
+        assert!(matches!(
+            ledger.reserve_with_headroom("b", 0.5, false),
+            Err(BackendError::HeadroomConfirmationRequired { .. })
+        ));
+        ledger.reserve_with_headroom("b", 0.5, true).unwrap();
+        // Plain `reserve` keeps its old full-allocation meaning.
+        ledger.reserve("c", 0.5).unwrap();
+        assert!(matches!(
+            ledger.reserve("d", 0.5),
+            Err(BackendError::Oom { .. })
+        ));
+    }
+
+    #[test]
+    fn concurrent_unconfirmed_claims_never_cross_the_reduced_cap() {
+        let ledger = Arc::new(GlobalCapacityLedger::new_bytes_with_headroom(
+            5_000_000_000,
+            1_000_000_000,
+        ));
+        let barrier = Arc::new(Barrier::new(8));
+        let handles: Vec<_> = (0..8)
+            .map(|i| {
+                let (ledger, barrier) = (ledger.clone(), barrier.clone());
+                thread::spawn(move || {
+                    barrier.wait();
+                    claim(&ledger, &format!("k{i}"), GB, false).is_ok()
+                })
+            })
+            .collect();
+        let admitted = handles
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .filter(|ok| *ok)
+            .count();
+        assert_eq!(admitted, 4);
     }
 
     #[test]

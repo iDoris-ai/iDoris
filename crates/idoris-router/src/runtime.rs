@@ -16,6 +16,10 @@ use idoris_upstream::{LocalHttpRuntimeAdapter, LocalHttpRuntimeConfig};
 
 use crate::dispatch::BoundSupervisor;
 
+/// Decimal 1GB kept unreserved inside an allocated budget unless a chat
+/// request confirms the breach (`X-iDoris-Headroom-Breach: confirmed`).
+const HEADROOM_BYTES: u64 = 1_000_000_000;
+
 #[derive(Debug, Clone, Default)]
 pub struct RuntimeRegistry {
     supervisors: BTreeMap<String, BoundSupervisor>,
@@ -90,7 +94,7 @@ impl RuntimeRegistry {
         };
         let budget_gb = config.budget_gb;
         let startup_capacity = Arc::new(match allocated_budget_bytes {
-            Some(bytes) => GlobalCapacityLedger::new_bytes(bytes),
+            Some(bytes) => GlobalCapacityLedger::new_bytes_with_headroom(bytes, HEADROOM_BYTES),
             None => GlobalCapacityLedger::new(budget_gb)
                 .map_err(|error| format!("startup capacity ledger: {error}"))?,
         });
@@ -507,21 +511,21 @@ mod tests {
         let adapter_a = Arc::new(MockAdapter::new(vec![
             ModelInfo {
                 id: a.provider.id.clone(),
-                memory_gb: 1.0,
+                memory_gb: 2.0,
             },
             ModelInfo {
                 id: "replacement".into(),
-                memory_gb: 1.0,
+                memory_gb: 2.0,
             },
         ]));
         let adapter_b = Arc::new(MockAdapter::new(vec![ModelInfo {
             id: b.provider.id.clone(),
-            memory_gb: 1.0,
+            memory_gb: 2.0,
         }]));
         adapter_a.set_load_script("replacement", vec![idoris_backend::mock::LoadOutcome::Fail]);
         let registry = RuntimeRegistry::spawn_with_factory_and_budget(
             &[a.clone(), b.clone()],
-            Some(1_000_000_000),
+            Some(2_000_000_000 + HEADROOM_BYTES),
             |card| {
                 Ok(if card.provider.id == a.provider.id {
                     adapter_a.clone()
@@ -542,7 +546,7 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .reserved_gb,
-            1.0
+            2.0
         );
 
         // A real eviction unloads A, then a confirmed failed replacement releases its claim.
@@ -583,7 +587,7 @@ mod tests {
             .collect();
         let registry = RuntimeRegistry::spawn_with_factory_and_budget(
             &[a.clone(), b.clone()],
-            Some(1_000_000_000),
+            Some(1_000_000_000 + HEADROOM_BYTES),
             |card| Ok(adapters[&card.provider.id].clone()),
         )
         .unwrap();
@@ -618,7 +622,7 @@ mod tests {
         adapter.set_load_delay(&card.provider.id, std::time::Duration::from_millis(50));
         let registry = RuntimeRegistry::spawn_with_factory_and_budget(
             std::slice::from_ref(&card),
-            Some(1_000_000_000),
+            Some(1_000_000_000 + HEADROOM_BYTES),
             |_| Ok(adapter.clone()),
         )
         .unwrap();
@@ -677,7 +681,8 @@ mod tests {
             }]));
             let registry = RuntimeRegistry::spawn_with_factory_and_budget(
                 std::slice::from_ref(&card),
-                Some(bytes),
+                // Reduced cap (budget minus headroom) is the byte boundary under test.
+                Some(bytes + HEADROOM_BYTES),
                 |_| Ok(adapter.clone()),
             )
             .unwrap();
