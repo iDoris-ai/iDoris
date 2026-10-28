@@ -244,4 +244,4 @@ agent24d 托管 iDoris 时，按下表执行。表中都是已冻结的接口，
 | R7 | 2026-09-27 | 双方 | iDoris 采纳全部措辞修订与条件，并对 J-4、J-2 各加一处限定；Agent24 确认；jason 拍板 J-1…J-8 全部选 (a) | **v1.1** |
 | R8 | 2026-09-27 | Agent24 | 审阅 v1.1：无异议；建议 loopback 免 key 仅作为显式开发者选项，免 key 时视为 local_only | 已采纳，写入 §3.2 |
 | R9 | 2026-10-15 | iDoris | [文档修订 1.2 整合与三个 owner 决策](negotiation/R9-v1.2-协商提案.md)；local_only v0.3.1 最小数据面与 launcher 解耦 | OD-1/OD-2 已由修订 1.3 决定（见 §2.7）；fast/daily 标签重标仍 **OWNER REVIEW PENDING** |
-| R10 | 2026-10-28 | jason / 双方 | 文档修订 1.3：owner 要求 Agent24 桌面端一站式「下载 → 运行 → 连接」，由此定下 OD-1（宿主为 agent24d）、OD-2（用户在桌面端同意）；新增 §2.7 launcher 托管契约（iDoris v0.4.0 起）、§2.8 wire 契约 1.1.0 | Agent24 已确认 §2.7 / §2.8 契约，实现跟进中（登记为 ID-HR，v0.4.0 发版后实现；launcher 设计见 Agent24#1437） |
+| R10 | 2026-10-28 | jason / 双方 | 文档修订 1.3：owner 要求 Agent24 桌面端一站式「下载 → 运行 → 连接」，由此定下 OD-1（宿主为 agent24d）、OD-2（用户在桌面端同意）；新增 §2.7 launcher 托管契约（iDoris v0.4.0 起）、§2.8 wire 契约 1.1.0 | launcher 设计已合入 [Agent24#1437](https://github.com/iDoris-ai/Agent24/pull/1437)；按 v0.4.0 的实现与验收是 Agent24 的 IL-01 起各项，尚未完成。其中「额度紧时 503 `headroom_confirmation_required` → 用户确认 → 重发」的确认交互登记为 ID-HR，见 [Agent24#1442](https://github.com/iDoris-ai/Agent24/pull/1442) |
