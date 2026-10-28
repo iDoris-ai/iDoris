@@ -1428,11 +1428,18 @@ fn handle_load(
         } = &mut active.kind
             && *active_policy == policy
             && *active_memory_gb == memory_gb
+        {
             // A joiner must not inherit another request's confirmation, nor
             // lend its own to a load admitted without it.
-            && *active_allow_breach == allow_headroom_breach
-        {
-            waiters.push(reply);
+            if *active_allow_breach == allow_headroom_breach {
+                waiters.push(reply);
+            } else {
+                let _ = reply.send(Err(BackendError::busy(
+                    "another request is loading this model with a different headroom confirmation; retry shortly",
+                    Some(id.clone()),
+                    None,
+                )));
+            }
         } else {
             let _ = reply.send(Err(BackendError::busy(
                 "a load for this id with a different policy or memory_gb is already in flight",

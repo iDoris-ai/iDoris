@@ -169,3 +169,53 @@ async fn without_an_allocated_budget_nothing_changes() {
     assert_eq!(chat(&app, "big", &[]).await.0, StatusCode::OK);
     assert_eq!(adapter.load_call_count("big"), 1);
 }
+
+const JOIN_REASON: &str = "different headroom confirmation";
+
+async fn staggered(
+    app: &Router,
+    model: &str,
+    first: &[(&str, &str)],
+    second: &[(&str, &str)],
+) -> ((StatusCode, Value), (StatusCode, Value)) {
+    let late = async {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        chat(app, model, second).await
+    };
+    tokio::join!(chat(app, model, first), late)
+}
+
+#[tokio::test]
+async fn unconfirmed_request_cannot_join_an_in_flight_confirmed_load() {
+    let (app, adapter) = app(Some(BUDGET));
+    adapter.set_load_delay("big", std::time::Duration::from_millis(400));
+    let (confirmed, plain) = staggered(&app, "big", &[CONFIRM], &[]).await;
+    assert_eq!(confirmed.0, StatusCode::OK);
+    assert_ne!(plain.0, StatusCode::OK);
+    assert_eq!(plain.1["error"]["reason_code"], "supervisor_busy");
+    assert!(
+        plain.1["error"]["remediation"]
+            .as_str()
+            .unwrap()
+            .contains(JOIN_REASON),
+        "{plain:?}"
+    );
+    assert_eq!(adapter.load_call_count("big"), 1);
+}
+
+#[tokio::test]
+async fn confirmed_request_cannot_join_an_in_flight_unconfirmed_load() {
+    let (app, adapter) = app(Some(BUDGET));
+    adapter.set_load_delay("small", std::time::Duration::from_millis(400));
+    let (plain, confirmed) = staggered(&app, "small", &[], &[CONFIRM]).await;
+    assert_eq!(plain.0, StatusCode::OK);
+    assert_ne!(confirmed.0, StatusCode::OK);
+    assert!(
+        confirmed.1["error"]["remediation"]
+            .as_str()
+            .unwrap()
+            .contains(JOIN_REASON),
+        "{confirmed:?}"
+    );
+    assert_eq!(adapter.load_call_count("small"), 1);
+}
