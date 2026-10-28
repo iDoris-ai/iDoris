@@ -13,5 +13,5 @@
 /// `1.1.0`: additive only. `GET /capabilities` entries gain optional choice
 /// fields (`degraded_alternative`, `degraded_alternatives`,
 /// `headroom_breach_option`), and `POST /v1/chat/completions` accepts the
-/// `X-iDoris-Headroom-Breach` request header (implemented by a sibling PR).
+/// per-request `X-iDoris-Headroom-Breach: confirmed` header.
 pub const CONTRACT_VERSION: &str = "1.1.0";
