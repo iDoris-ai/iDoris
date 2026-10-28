@@ -7,6 +7,8 @@ use thiserror::Error;
 
 use super::{VirtualKeyHash, VirtualKeySecret};
 
+const OPEN_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VirtualKeyScope {
     pub owner: String,
@@ -41,8 +43,13 @@ pub struct VirtualKeyStore {
 }
 
 impl VirtualKeyStore {
+    /// Opens the shared database file. Offline key commands open it while
+    /// `idoris serve` may be writing, so wait (like the budget ledger) instead
+    /// of failing at once with `database is locked`.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, VirtualKeyStoreError> {
-        Self::new(Connection::open(path)?)
+        let conn = Connection::open(path)?;
+        conn.busy_timeout(OPEN_BUSY_TIMEOUT)?;
+        Self::new(conn)
     }
 
     pub fn new(mut conn: Connection) -> Result<Self, VirtualKeyStoreError> {
@@ -303,6 +310,32 @@ mod tests {
             expires_at_ms,
             admin_scopes: Vec::new(),
         }
+    }
+
+    #[test]
+    fn opened_store_waits_for_a_concurrent_writer_instead_of_failing() {
+        let path = std::env::temp_dir().join(format!(
+            "idoris-virtual-key-busy-{}.sqlite3",
+            uuid::Uuid::new_v4().simple()
+        ));
+        drop(VirtualKeyStore::open(&path).unwrap());
+        let mut holder = Connection::open(&path).unwrap();
+        let tx = holder
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        let writer = {
+            let path = path.clone();
+            std::thread::spawn(move || {
+                let store = VirtualKeyStore::open(&path).unwrap();
+                let minted = MintedVirtualKey::mint();
+                store.insert_active(&minted.key_id, minted.hash, &scope(None))
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        tx.commit().unwrap();
+        writer.join().unwrap().unwrap();
+        drop(holder);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
