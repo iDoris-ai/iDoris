@@ -1,5 +1,7 @@
 # iDoris × Agent24 分工边界与接口数据规范
 
+> **文档修订 1.3，2026-10-28**：owner 要求 Agent24 桌面端一站式「下载 → 运行 → 连接」iDoris，这定下了 R9 的 OD-1（launcher 宿主为 agent24d）和 OD-2（由用户在桌面端同意）。§2.1 第一条随之改写，新增 §2.7（launcher 托管契约，iDoris v0.4.0 起）与 §2.8（wire 契约 1.1.0）。已接受条款以正文为准。
+>
 > **文档修订 1.2，2026-10-15**：将 R0–R8 已接受条款合并到正文，消除“后补章节覆盖前文”的阅读方式；新增的 v0.3.1 范围及 R9 三项决策仍是 **OWNER REVIEW PENDING**，不借文档修订授权实现。
 > **唯一跨仓规范权威**：本文件。iDoris 主持，Agent24 作为消费者审阅；Agent24 应保留短消费方指针、实现证据及反向硬件权威链接，不复制第二份契约。总体规划的项目里程碑仍见 [总体规划](../iDoris-总体规划.md)。
 
@@ -58,7 +60,7 @@
 
 ### 2.1 接入、生命周期与四类凭证
 
-- Agent24 不拥有、启动或托管 iDoris daemon；iDoris daemon 不启动 Agent24。用户或可信外部 launcher 负责启动。launcher 宿主尚未决定（R9），不自动变成 Desktop 的 sidecar。
+- **修订 1.3**：agent24d 是 iDoris 的执行宿主，负责下载、安装、生成配置、签发 key、启动和停止，契约见 §2.7。iDoris daemon 不启动 Agent24。用户也可以自己手动启动 iDoris，这条路径继续支持。
 - `IDORIS_URL` 必须显式配置，无隐含端口。D-1(a)：配置后独占 iDoris，不留直连 oMLX/Ollama 回退；缺 key、服务不可用或身份不符都明确失败。
 - 已接受完整模型是两个逻辑 provider：`idoris-local`=Local，固定 `local_only`；`idoris-any`=Remote，固定 `any`。按 URL 去重 models/容量，不能相加。D-6 两把 key 分别限定 `[local_only]` 与 `[local_only,any]`。§3 提议仅交付 local 子集，第二 provider/key 延后，不撤销 D-6。
 - 模块 manifest 未声明或声明 `local_only` 时使用 `idoris-local`；只有 `remote_allowed` 才有资格进入 `idoris-any`，仍不能扩大调用方已授予的权限。
@@ -138,6 +140,31 @@ Agent24 拥有同机 host facts、core 占用与整机账，为 iDoris 划一个
 Agent24 事件日志是 Evolver 主数据源，运行期记忆不是训练副本。双方审计不合并、不互抄，仅 record_id/trace_id 关联。默认不推送 trajectories；iDoris 用户开启 full/训练且完成确认后才考虑 ATIF v1.8 交换，命名空间分别 extra.idoris/extra.agent24，互不写入。feedback 方向已接受，Agent24 等有反馈 UI 再接。
 
 **M5 既定决定不变**：敏感开关只由用户在 iDoris 本地控制台完成一次性确认；Agent24 可发起/展示 diff/深链接，不能代理确认。未来“有持续时间的 caller consent”仍延期，不在本轮改成已接受机制。Admin proposals/confirm、inspect、vault、kill switch、训练/晋升与 systemone 均须依各里程碑/API 单独交付，不因职责表而成为 v0.3.0 能力。本地判定器不可用须显式报错，不静默降级；判定 engine 如实返回。
+
+### 2.7 launcher 托管契约（修订 1.3，iDoris v0.4.0 起，#588）
+
+agent24d 托管 iDoris 时，按下表执行。表中都是已冻结的接口，改动必须走本规范的修订。
+
+| 环节 | 契约 |
+|---|---|
+| 下载 | Release 资产为 `idoris-v<ver>-aarch64-apple-darwin.tar.gz` 和同名 `.sha256`。launcher 锁定 tag 和 sha256，并校验 `codesign` 的 TeamIdentifier 为 `HYAP444FN9`。只支持 v0.4.0 及以上版本 |
+| 布局 | 包里恰好有 5 个文件：`idoris`、`config/{catalog,routing-policy}.yaml`、`config/components/{omlx,subscription}.yaml`。配置路径相对可执行文件所在目录解析，与 cwd 无关 |
+| 组件配置 | `idoris setup omlx --endpoint <loopback url> --out-dir <dir> [--bind role=model]… [--load-mode on_demand\|resident] [--api-key-stdin] [--force]`，输出 JSON。共 11 个错误码：`unreachable`、`auth_required`、`auth_failed`、`not_omlx`、`model_not_found`、`invalid_endpoint`、`invalid_role`、`out_dir_not_empty`、`validation_failed`、`write_failed`、`invalid_api_key_input`。只会写 out-dir 及其同级的 `.idoris-setup-*` 暂存目录。`--force` 的替换要么全部成功，要么全部不生效。key 只从 stdin 读入，只用于探测。运行时的 oMLX key 仍走 `IDORIS_OMLX_API_KEY`。Agent24 不写 YAML |
+| 数据 key | `idoris key issue --spec-stdin` / `key list` / `key revoke <vk_…>`，离线运行，不需要 serve 在跑，也不取实例锁，但必须和 serve 使用同一个 `IDORIS_DB_PATH`。吊销立即生效，可以在线轮换。owner 字段建议用唯一值 `agent24d:<install_id>:<nonce>`，签发结果丢失时可以按 owner 找到对应的 key 再吊销 |
+| 启动 | `idoris serve --admin-token-stdin`，进程常驻前台。Admin token 由 launcher 用 CSPRNG 生成，格式为 64 位小写 hex 加 LF，共 65 字节，10 秒内写入 stdin，不得出现在 argv、环境变量、文件或日志里 |
+| 就绪 | 轮询 `GET /health`：`status=="ok"`，`version` 符合锁定的版本，`contract_version` 的 major 为 1，并且进程仍然存活。stdout 不属于契约。启动前应确认 oMLX 可达 |
+| 停止 | SIGTERM 和 SIGINT 都会优雅停机，总时长约 15 秒（10 秒加上回收 runtime 子进程的 5 秒）。launcher 应先发 SIGTERM，17 秒后仍未退出再发 SIGKILL |
+| 退出码 | 0 表示正常；1 表示启动失败或停止失败（停止超时会输出 `[idoris] 停止失败：…`）；3 表示同一数据库已有实例在运行（按 canonical 路径判断，符号链接视为同一个数据库） |
+| 不承诺 | 自动升级、一致备份和回滚（M-IDL2 再做）；aarch64 以外的平台 |
+
+### 2.8 wire 契约 1.1.0（iDoris v0.4.0）
+
+只有新增，1.0.x 的调用方不受影响。版本兼容规则：minor 版本只增加内容，不改变已有语义；破坏性变更会升 major。
+
+- `GET /capabilities` 的条目可能带三个新字段：`degraded_alternative`（只出现在 `requires_eviction` 条目上，`{id, capability, estimated_memory_gb, quant, reason}` 或 `null`）、`degraded_alternatives`（只出现在 `blocked` 条目上，是数组）、`headroom_breach_option`（`{id, quant, estimated_memory_gb, ctx_limit}`，整份快照最多一个条目带这个字段，条目 id 唯一）。`reason` 是稳定的代码，例如 `fits_without_eviction`。解析时看哪个条目带了 `headroom_breach_option`，不要靠 `resident:true` 来定位。
+- 用户选「清理后用最优模型」或「降级」时，直接请求对应的模型 id 即可，不需要新接口。
+- **1GB 余量**：设置了 `IDORIS_ALLOCATED_BUDGET_BYTES` 时，生命周期加载默认最多用到额度减 1GB。`POST /v1/chat/completions` 带上 `X-iDoris-Headroom-Breach: confirmed`（只接受这一个值），表示用户已确认，这一次加载可以用满全部额度。确认只对单次请求有效，不会被记住。它是 Agent24 问过用户之后代为发出的约定，不是权限边界。
+- 没带确认、而这次加载只有用掉余量才放得下时，返回 `503 headroom_confirmation_required`，此时应询问用户。另一个请求正在以不同的确认状态加载同一个模型时，返回 `503 supervisor_busy`，有限退避后用同一个请求头重试即可，不要询问用户。其它 503 按原规则处理。
 
 ## 3. 拟议 v0.3.1 local_only 数据面切片（待联合验收）
 
