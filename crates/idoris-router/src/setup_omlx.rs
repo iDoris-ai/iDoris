@@ -225,7 +225,7 @@ pub async fn run(options: &SetupOmlxOptions, api_key: Option<&str>) -> Result<Va
             ));
         }
     }
-    check_out_dir(&options.out_dir, options.force)?;
+    check_out_dir(&options.out_dir, options.force, None)?;
     let (models, auth_required) = probe(&endpoint, api_key, options.load_mode).await?;
     for (role, model) in &options.bindings {
         if !models.contains(model) {
@@ -256,7 +256,13 @@ pub async fn run(options: &SetupOmlxOptions, api_key: Option<&str>) -> Result<Va
 
 pub const KEY_ENV: &str = idoris_upstream::omlx::OMLX_API_KEY_ENV;
 
-fn check_out_dir(dir: &Path, force: bool) -> Result<(), SetupError> {
+/// `own_stage` is this run's staging dir: with `--out-dir .` it sits inside
+/// `dir` and must not count as a foreign file.
+fn check_out_dir(
+    dir: &Path,
+    force: bool,
+    own_stage: Option<&std::ffi::OsStr>,
+) -> Result<(), SetupError> {
     let not_empty = |m: &str| SetupError::new("out_dir_not_empty", m.to_string());
     if !dir.exists() {
         return Ok(());
@@ -265,6 +271,7 @@ fn check_out_dir(dir: &Path, force: bool) -> Result<(), SetupError> {
     let names: Vec<_> = entries
         .filter_map(Result::ok)
         .map(|e| e.file_name())
+        .filter(|name| Some(name.as_os_str()) != own_stage)
         .collect();
     if names.is_empty() {
         return Ok(());
@@ -305,7 +312,7 @@ fn write_validated(out_dir: &Path, force: bool, card: &str) -> Result<PathBuf, S
                     .replace(&stage.display().to_string(), "<staging>"),
             )
         })?;
-        check_out_dir(out_dir, force)?;
+        check_out_dir(out_dir, force, stage.file_name())?;
         if out_dir.exists() {
             replace_managed(&stage, out_dir).map_err(io)?;
         } else {
@@ -336,19 +343,29 @@ fn replace_managed(stage: &Path, out_dir: &Path) -> std::io::Result<()> {
         }
         Ok(())
     })();
-    if attempt.is_err() {
-        for name in &placed {
-            let _ = std::fs::rename(out_dir.join(name), stage.join(name));
-        }
-        for name in &backed_up {
-            let _ = std::fs::rename(out_dir.join(format!("{name}{tag}")), out_dir.join(name));
-        }
-    } else {
+    let Err(err) = attempt else {
         for name in &backed_up {
             let _ = std::fs::remove_file(out_dir.join(format!("{name}{tag}")));
         }
+        return Ok(());
+    };
+    for name in &placed {
+        let _ = std::fs::rename(out_dir.join(name), stage.join(name));
     }
-    attempt
+    let stranded: Vec<String> = backed_up
+        .iter()
+        .filter(|name| {
+            std::fs::rename(out_dir.join(format!("{name}{tag}")), out_dir.join(name)).is_err()
+        })
+        .map(|name| format!("{name}{tag}"))
+        .collect();
+    if stranded.is_empty() {
+        return Err(err);
+    }
+    Err(std::io::Error::other(format!(
+        "{err}；回滚未完成，旧文件保留为 {}",
+        stranded.join("、")
+    )))
 }
 
 #[cfg(test)]

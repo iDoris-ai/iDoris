@@ -63,7 +63,18 @@ struct Out {
 }
 
 async fn setup(endpoint: &str, out: &Path, extra: &[&str], stdin: Option<&str>) -> Out {
-    let (endpoint, out, extra, stdin) = (
+    setup_in(None, endpoint, out, extra, stdin).await
+}
+
+async fn setup_in(
+    cwd: Option<&Path>,
+    endpoint: &str,
+    out: &Path,
+    extra: &[&str],
+    stdin: Option<&str>,
+) -> Out {
+    let (cwd, endpoint, out, extra, stdin) = (
+        cwd.map(Path::to_owned),
         endpoint.to_string(),
         out.to_owned(),
         extra.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
@@ -71,6 +82,9 @@ async fn setup(endpoint: &str, out: &Path, extra: &[&str], stdin: Option<&str>) 
     );
     tokio::task::spawn_blocking(move || {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_idoris"));
+        if let Some(cwd) = &cwd {
+            cmd.current_dir(cwd);
+        }
         cmd.args(["setup", "omlx", "--endpoint", &endpoint, "--out-dir"])
             .arg(&out)
             .args(&extra)
@@ -329,6 +343,31 @@ async fn out_dir_rules() {
             .contains(&server.uri())
     );
     idoris_router::components::load_components(&out, false).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn out_dir_dot_is_the_working_directory() {
+    // The staging dir for `.` sits inside it; it must not count as foreign.
+    let server = fake(None, &["m1"]).await;
+    let tmp = TempDir::new().unwrap();
+    let cwd = tmp.path().join("comp");
+    fs::create_dir(&cwd).unwrap();
+    let dot = Path::new(".");
+    let o = setup_in(Some(&cwd), &server.uri(), dot, &[], None).await;
+    assert_eq!(o.code, 0, "{}", o.stdout);
+    let o = setup_in(Some(&cwd), &server.uri(), dot, &["--force"], None).await;
+    assert_eq!(o.code, 0, "{}", o.stdout);
+    let mut names: Vec<_> = fs::read_dir(&cwd)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    names.sort();
+    assert_eq!(names, ["omlx.yaml", "subscription.yaml"]);
+    idoris_router::components::load_components(&cwd, false).unwrap();
+
+    fs::write(cwd.join("other.txt"), "x").unwrap();
+    let o = setup_in(Some(&cwd), &server.uri(), dot, &["--force"], None).await;
+    assert_eq!(err_code(&o), "out_dir_not_empty");
 }
 
 #[tokio::test(flavor = "multi_thread")]
