@@ -10,7 +10,9 @@ use std::sync::Arc;
 
 use idoris_recommender::catalog::Catalog;
 use idoris_recommender::probe::HostFacts;
-use idoris_recommender::recommend::{PartialPolicy, Recommendation, TempStatus, recommend};
+use idoris_recommender::recommend::{
+    PartialPolicy, Recommendation, TempAlternative, TempStatus, recommend,
+};
 use serde::Serialize;
 
 use crate::runtime::RuntimeRegistry;
@@ -35,6 +37,42 @@ pub struct CapabilityEntry {
     pub ctx_limit: u64,
     pub queue_depth: u64,
     pub admission_status: AdmissionStatus,
+    /// Only on `requires_eviction` entries: `null` when no no-eviction
+    /// alternative exists. Absent on all other entries.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub degraded_alternative: Option<Option<AlternativeEntry>>,
+    /// Only on `blocked` entries (may be `[]`). Absent on all other entries.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub degraded_alternatives: Option<Vec<AlternativeEntry>>,
+    /// Only on the resident entry, and only when the recommender offers it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub headroom_breach_option: Option<HeadroomBreachOption>,
+}
+
+/// Wire form of a no-eviction fallback model (`reason` is the recommender's
+/// human-readable text, passed through verbatim).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct AlternativeEntry {
+    pub id: String,
+    pub estimated_memory_gb: f64,
+    pub quant: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct HeadroomBreachOption {
+    pub id: String,
+    pub estimated_memory_gb: f64,
+    pub ctx_limit: u64,
+}
+
+fn alternative_entry(alt: &TempAlternative) -> AlternativeEntry {
+    AlternativeEntry {
+        id: alt.id.clone(),
+        estimated_memory_gb: round_gb(alt.quant.footprint_gb),
+        quant: alt.quant.label.clone(),
+        reason: alt.reason.clone(),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -138,19 +176,35 @@ fn map_recommendation(
             ctx_limit: resident.ctx,
             queue_depth,
             admission_status: AdmissionStatus::Ready,
+            degraded_alternative: None,
+            degraded_alternatives: None,
+            headroom_breach_option: recommendation
+                .headroom_breach_option
+                .as_ref()
+                .map(|option| HeadroomBreachOption {
+                    id: option.id.clone(),
+                    estimated_memory_gb: round_gb(option.footprint_gb),
+                    ctx_limit: option.ctx,
+                }),
         });
     }
-    entries.extend(recommendation.temp.iter().map(|temp| CapabilityEntry {
-        id: temp.id.clone(),
-        capability: capability_name(temp.capability).to_string(),
-        resident: false,
-        estimated_memory_gb: round_gb(temp.quant.footprint_gb),
-        ctx_limit: recommendation.policy.context_target,
-        queue_depth,
-        admission_status: match temp.status {
-            TempStatus::Ready => AdmissionStatus::Ready,
-            TempStatus::RequiresEviction => AdmissionStatus::RequiresEviction,
-        },
+    entries.extend(recommendation.temp.iter().map(|temp| {
+        CapabilityEntry {
+            id: temp.id.clone(),
+            capability: capability_name(temp.capability).to_string(),
+            resident: false,
+            estimated_memory_gb: round_gb(temp.quant.footprint_gb),
+            ctx_limit: recommendation.policy.context_target,
+            queue_depth,
+            admission_status: match temp.status {
+                TempStatus::Ready => AdmissionStatus::Ready,
+                TempStatus::RequiresEviction => AdmissionStatus::RequiresEviction,
+            },
+            degraded_alternative: (temp.status == TempStatus::RequiresEviction)
+                .then(|| temp.degraded_alternative.as_ref().map(alternative_entry)),
+            degraded_alternatives: None,
+            headroom_breach_option: None,
+        }
     }));
     entries.extend(recommendation.blocked.iter().map(|blocked| {
         let model = catalog.catalog.iter().find(|model| model.id == blocked.id);
@@ -162,6 +216,15 @@ fn map_recommendation(
             ctx_limit: recommendation.policy.context_target,
             queue_depth,
             admission_status: AdmissionStatus::Blocked,
+            degraded_alternative: None,
+            degraded_alternatives: Some(
+                blocked
+                    .degraded_alternatives
+                    .iter()
+                    .map(alternative_entry)
+                    .collect(),
+            ),
+            headroom_breach_option: None,
         }
     }));
     entries
@@ -409,6 +472,146 @@ mod tests {
             assert!(!vision.resident);
             assert_eq!(vision.queue_depth, 0);
             assert_eq!(entries.iter().filter(|e| e.id == vision.id).count(), 1);
+        }
+    }
+
+    async fn choice_json(gb: u64) -> serde_json::Value {
+        let catalog = load_catalog(repo_root().join("config/catalog.yaml")).unwrap();
+        let entries =
+            LiveCapabilitiesProvider::new(catalog, facts(64.0), RuntimeRegistry::default())
+                .with_policy(PartialPolicy {
+                    temp_slots: Some(1),
+                    ..Default::default()
+                })
+                .with_allocated_budget_bytes(Some(gb * 1_000_000_000))
+                .snapshot()
+                .await
+                .unwrap();
+        serde_json::to_value(entries).unwrap()
+    }
+
+    fn entry<'a>(
+        json: &'a serde_json::Value,
+        id: &str,
+    ) -> &'a serde_json::Map<String, serde_json::Value> {
+        json.as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["id"] == id)
+            .unwrap()
+            .as_object()
+            .unwrap()
+    }
+
+    const CHOICE_KEYS: [&str; 3] = [
+        "degraded_alternative",
+        "degraded_alternatives",
+        "headroom_breach_option",
+    ];
+
+    #[tokio::test]
+    async fn requires_eviction_entries_expose_degraded_alternative_or_null() {
+        let json = choice_json(18).await;
+        let with_alt = entry(&json, "agents-a1-35b");
+        assert_eq!(with_alt["admission_status"], "requires_eviction");
+        let alt = with_alt["degraded_alternative"].as_object().unwrap();
+        assert_eq!(alt["id"], "nanbeige4.2-3b");
+        assert_eq!(alt["estimated_memory_gb"], 4.78);
+        assert_eq!(alt["quant"], "q4_k_m");
+        assert!(alt["reason"].as_str().unwrap().contains("4.78GB"));
+        assert_eq!(alt.len(), 4);
+        assert!(!with_alt.contains_key("degraded_alternatives"));
+        assert!(!with_alt.contains_key("headroom_breach_option"));
+
+        let none = entry(&json, "qwen2.5-vl-7b");
+        assert_eq!(none["admission_status"], "requires_eviction");
+        assert!(none.contains_key("degraded_alternative"));
+        assert!(none["degraded_alternative"].is_null());
+    }
+
+    #[tokio::test]
+    async fn blocked_entries_expose_degraded_alternatives_array_possibly_empty() {
+        let json = choice_json(16).await;
+        let with_alt = entry(&json, "agents-a1-35b");
+        assert_eq!(with_alt["admission_status"], "blocked");
+        let alts = with_alt["degraded_alternatives"].as_array().unwrap();
+        assert_eq!(alts.len(), 1);
+        assert_eq!(alts[0]["id"], "nanbeige4.2-3b");
+        assert_eq!(alts[0]["estimated_memory_gb"], 4.78);
+        assert_eq!(alts[0]["quant"], "q4_k_m");
+        assert!(alts[0]["reason"].is_string());
+        assert!(!with_alt.contains_key("degraded_alternative"));
+        assert!(!with_alt.contains_key("headroom_breach_option"));
+
+        let empty = entry(&json, "qwen3.6-35b-a3b");
+        assert_eq!(empty["admission_status"], "blocked");
+        assert_eq!(empty["degraded_alternatives"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn resident_entry_exposes_headroom_breach_option_only_when_offered() {
+        let json = choice_json(12).await;
+        let resident = json
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["resident"] == true)
+            .unwrap()
+            .as_object()
+            .unwrap();
+        let option = resident["headroom_breach_option"].as_object().unwrap();
+        assert_eq!(option["id"], "qwen3-8b");
+        assert_eq!(option["estimated_memory_gb"], 7.92);
+        assert!(option["ctx_limit"].as_u64().unwrap() > 0);
+        assert_eq!(option.len(), 3);
+        assert!(!resident.contains_key("degraded_alternative"));
+        assert!(!resident.contains_key("degraded_alternatives"));
+
+        // No option offered: the key is omitted, not null.
+        let json = choice_json(16).await;
+        let resident = json
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["resident"] == true)
+            .unwrap();
+        assert!(
+            !resident
+                .as_object()
+                .unwrap()
+                .contains_key("headroom_breach_option")
+        );
+    }
+
+    #[tokio::test]
+    async fn ready_entries_and_legacy_snapshot_never_gain_choice_keys() {
+        // Ready temp entries (24GB) and the legacy unallocated path.
+        let catalog = load_catalog(repo_root().join("config/catalog.yaml")).unwrap();
+        let legacy = serde_json::to_value(
+            LiveCapabilitiesProvider::new(catalog, facts(24.0), RuntimeRegistry::default())
+                .snapshot()
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        for json in [choice_json(24).await, legacy] {
+            for e in json.as_array().unwrap() {
+                let obj = e.as_object().unwrap();
+                let status = obj["admission_status"].as_str().unwrap();
+                for key in CHOICE_KEYS {
+                    let allowed = match key {
+                        "degraded_alternative" => status == "requires_eviction",
+                        "degraded_alternatives" => status == "blocked",
+                        _ => obj["resident"] == true,
+                    };
+                    if !allowed {
+                        assert!(!obj.contains_key(key), "{} has {key}", obj["id"]);
+                    }
+                }
+                if status == "ready" && obj["resident"] == false {
+                    assert_eq!(obj.len(), 7, "ready temp keeps the 1.0.x shape");
+                }
+            }
         }
     }
 

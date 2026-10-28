@@ -9,4 +9,9 @@
 /// response-header/error-body detail fixes, no breaking field-semantics
 /// change) — `conformance/tests/response-headers.test.ts` locks this exact
 /// string, not just "some non-empty version".
-pub const CONTRACT_VERSION: &str = "1.0.1";
+///
+/// `1.1.0`: additive only. `GET /capabilities` entries gain optional choice
+/// fields (`degraded_alternative`, `degraded_alternatives`,
+/// `headroom_breach_option`), and `POST /v1/chat/completions` accepts the
+/// `X-iDoris-Headroom-Breach` request header (implemented by a sibling PR).
+pub const CONTRACT_VERSION: &str = "1.1.0";

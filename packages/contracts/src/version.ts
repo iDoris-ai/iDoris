@@ -9,6 +9,9 @@
  * - v1.0（2026-09-27 定稿）：本契约第一次定稿并进入生产实现（M4 接入前置）。
  * - v1.0.1：PR #46 复审后的加法修订（响应头/错误体细节修正，不改变已发布的
  *   字段语义），规范文档同步升到 v1.0.1。
+ * - v1.1.0：加法新增 —— `GET /capabilities` 条目的可选选择字段
+ *   （degraded_alternative / degraded_alternatives / headroom_breach_option），
+ *   以及 chat/completions 的 `X-iDoris-Headroom-Breach` 请求头（由并行 PR 实现）。
  *
  * 后续演进按同文档 G-5「加法优先、零回归」处理：
  * - 加法新增字段/端点/枚举值 → 升 minor；
@@ -17,4 +20,4 @@
  * `pnpm check:contract-drift` 会把本常量、Rust 常量与 conformance 的 health
  * 期望机械比对；任何一侧单独修改都会失败（B1 task39 / FU-21 的常量漂移部分）。
  */
-export const CONTRACT_VERSION = "1.0.1";
+export const CONTRACT_VERSION = "1.1.0";

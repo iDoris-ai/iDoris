@@ -37,6 +37,9 @@ impl CapabilitiesProvider for FakeProvider {
                 ctx_limit: 4096,
                 queue_depth: 1,
                 admission_status: AdmissionStatus::Ready,
+                degraded_alternative: None,
+                degraded_alternatives: None,
+                headroom_breach_option: None,
             }])
         })
     }
