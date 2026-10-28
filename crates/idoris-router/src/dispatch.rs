@@ -829,6 +829,7 @@ fn native_provider_outcome(
         | ModelLoading { .. }
         | EvictionImpossible { .. }
         | EvictionFailed { .. }
+        | HeadroomConfirmationRequired { .. }
         | Cancelled
         | InvalidRequest { .. }
         | SupervisorUnavailable
@@ -848,6 +849,8 @@ pub(crate) struct LocalExecutionContext<'a> {
     dispatched_event: Option<&'a crate::DispatchedEventContext>,
     completed_event: Option<&'a crate::CompletedEventContext>,
     budget_settled_event: Option<&'a crate::BudgetSettledEventContext>,
+    /// This request alone may use the allocated budget's reserved headroom.
+    headroom_breach_confirmed: bool,
 }
 
 impl<'a> LocalExecutionContext<'a> {
@@ -868,6 +871,7 @@ impl<'a> LocalExecutionContext<'a> {
             dispatched_event,
             completed_event,
             budget_settled_event,
+            headroom_breach_confirmed: false,
         }
     }
 }
@@ -875,6 +879,11 @@ impl<'a> LocalExecutionContext<'a> {
 impl<'a> LocalExecutionContext<'a> {
     pub(crate) fn with_provider_admission(mut self, admission: &'a dyn ProviderAdmission) -> Self {
         self.provider_admission = Some(admission);
+        self
+    }
+
+    pub(crate) fn with_headroom_breach_confirmed(mut self, confirmed: bool) -> Self {
+        self.headroom_breach_confirmed = confirmed;
         self
     }
 
@@ -909,6 +918,7 @@ async fn dispatch_local_inner(
         dispatched_event,
         completed_event,
         budget_settled_event,
+        headroom_breach_confirmed,
     } = execution;
     let tenant_id = profile.tenant_id.as_deref();
     let prompt = input.prompt;
@@ -1069,7 +1079,12 @@ async fn dispatch_local_inner(
     // Supervisor's idempotent load path before chatting so it can establish
     // readiness and apply the requested policy.
     if let Err(err) = supervisor
-        .load(backend_model_id.clone(), admission_memory_gb, load_policy)
+        .load_with_headroom(
+            backend_model_id.clone(),
+            admission_memory_gb,
+            load_policy,
+            headroom_breach_confirmed,
+        )
         .await
     {
         provider_guard.finish(native_provider_outcome(&err, &backend_model_id, true));
