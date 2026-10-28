@@ -330,3 +330,66 @@ async fn out_dir_rules() {
     );
     idoris_router::components::load_components(&out, false).unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn redirects_are_not_followed() {
+    let target = fake(None, &["m1"]).await;
+    let redirector = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(
+            ResponseTemplate::new(302)
+                .insert_header("location", format!("{}/v1/models", target.uri()).as_str()),
+        )
+        .mount(&redirector)
+        .await;
+    let tmp = TempDir::new().unwrap();
+    let out = tmp.path().join("comp");
+    let o = setup(&redirector.uri(), &out, &[], None).await;
+    assert_eq!(err_code(&o), "not_omlx", "{}", o.stdout);
+    assert!(!out.exists());
+    assert!(
+        target.received_requests().await.unwrap().is_empty(),
+        "redirect target must never be requested"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn oversized_models_body_is_rejected() {
+    let server = MockServer::start().await;
+    let pad = "x".repeat(3 * 1024 * 1024);
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"data": [{"id": "m1"}], "pad": pad})),
+        )
+        .mount(&server)
+        .await;
+    let tmp = TempDir::new().unwrap();
+    let out = tmp.path().join("comp");
+    let o = setup(&server.uri(), &out, &["--load-mode", "resident"], None).await;
+    assert_eq!(err_code(&o), "not_omlx", "{}", o.stdout);
+    assert!(!out.exists());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn models_body_just_under_the_cap_is_accepted() {
+    let server = MockServer::start().await;
+    let pad = "x".repeat(1024 * 1024);
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"data": [{"id": "m1"}], "pad": pad})),
+        )
+        .mount(&server)
+        .await;
+    let tmp = TempDir::new().unwrap();
+    let o = setup(
+        &server.uri(),
+        &tmp.path().join("comp"),
+        &["--load-mode", "resident"],
+        None,
+    )
+    .await;
+    assert_eq!(o.code, 0, "{}", o.stdout);
+}

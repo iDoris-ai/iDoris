@@ -112,7 +112,7 @@ pub fn acquire_instance_lock() -> Result<std::fs::File, InstanceLockError> {
             ))
         })?;
     }
-    let mut lock_path = db_path.clone().into_os_string();
+    let mut lock_path = canonical_lock_base(&db_path).into_os_string();
     lock_path.push(".lock");
     let file = std::fs::OpenOptions::new()
         .create(true)
@@ -132,6 +132,26 @@ pub fn acquire_instance_lock() -> Result<std::fs::File, InstanceLockError> {
             "无法获取实例锁 \"{}\"：{err}",
             Path::new(&lock_path).display()
         ))),
+    }
+}
+
+/// Path the lock file is derived from, so every alias of one database maps to
+/// one lock. An existing DB file is canonicalized (resolves a symlinked file
+/// and symlinked directories). A not-yet-created file is `canonical(parent)`
+/// joined with its name; a dangling symlink or any canonicalize failure falls
+/// back to the literal path (best effort, same as before). Odd names such as
+/// `:memory:` just resolve against the working directory.
+fn canonical_lock_base(db_path: &Path) -> PathBuf {
+    if let Ok(real) = std::fs::canonicalize(db_path) {
+        return real;
+    }
+    let parent = db_path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    match (std::fs::canonicalize(parent), db_path.file_name()) {
+        (Ok(parent), Some(name)) => parent.join(name),
+        _ => db_path.to_path_buf(),
     }
 }
 
