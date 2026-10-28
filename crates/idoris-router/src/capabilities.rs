@@ -49,14 +49,17 @@ pub struct CapabilityEntry {
     pub headroom_breach_option: Option<HeadroomBreachOption>,
 }
 
-/// Wire form of a no-eviction fallback model (`reason` is the recommender's
-/// human-readable text, passed through verbatim).
+/// Stable wire code for why a fallback is offered. The recommender's
+/// human-readable reason text (with live numbers) never goes on the wire.
+pub const REASON_FITS_WITHOUT_EVICTION: &str = "fits_without_eviction";
+
+/// Wire form of a no-eviction fallback model.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct AlternativeEntry {
     pub id: String,
     pub estimated_memory_gb: f64,
     pub quant: String,
-    pub reason: String,
+    pub reason: &'static str,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -71,7 +74,7 @@ fn alternative_entry(alt: &TempAlternative) -> AlternativeEntry {
         id: alt.id.clone(),
         estimated_memory_gb: round_gb(alt.quant.footprint_gb),
         quant: alt.quant.label.clone(),
-        reason: alt.reason.clone(),
+        reason: REASON_FITS_WITHOUT_EVICTION,
     }
 }
 
@@ -518,7 +521,7 @@ mod tests {
         assert_eq!(alt["id"], "nanbeige4.2-3b");
         assert_eq!(alt["estimated_memory_gb"], 4.78);
         assert_eq!(alt["quant"], "q4_k_m");
-        assert!(alt["reason"].as_str().unwrap().contains("4.78GB"));
+        assert_eq!(alt["reason"], "fits_without_eviction");
         assert_eq!(alt.len(), 4);
         assert!(!with_alt.contains_key("degraded_alternatives"));
         assert!(!with_alt.contains_key("headroom_breach_option"));
@@ -539,7 +542,7 @@ mod tests {
         assert_eq!(alts[0]["id"], "nanbeige4.2-3b");
         assert_eq!(alts[0]["estimated_memory_gb"], 4.78);
         assert_eq!(alts[0]["quant"], "q4_k_m");
-        assert!(alts[0]["reason"].is_string());
+        assert_eq!(alts[0]["reason"], "fits_without_eviction");
         assert!(!with_alt.contains_key("degraded_alternative"));
         assert!(!with_alt.contains_key("headroom_breach_option"));
 
