@@ -7,8 +7,6 @@ use thiserror::Error;
 
 use super::{VirtualKeyHash, VirtualKeySecret};
 
-const OPEN_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VirtualKeyScope {
     pub owner: String,
@@ -43,13 +41,8 @@ pub struct VirtualKeyStore {
 }
 
 impl VirtualKeyStore {
-    /// Opens the shared database file. Offline key commands open it while
-    /// `idoris serve` may be writing, so wait (like the budget ledger) instead
-    /// of failing at once with `database is locked`.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, VirtualKeyStoreError> {
-        let conn = Connection::open(path)?;
-        conn.busy_timeout(OPEN_BUSY_TIMEOUT)?;
-        Self::new(conn)
+        Self::new(Connection::open(path)?)
     }
 
     pub fn new(mut conn: Connection) -> Result<Self, VirtualKeyStoreError> {
@@ -314,6 +307,9 @@ mod tests {
 
     #[test]
     fn opened_store_waits_for_a_concurrent_writer_instead_of_failing() {
+        // Offline key commands open the DB while `idoris serve` may be writing.
+        // rusqlite's `Connection::open` sets a 5s busy timeout; this pins that
+        // they wait instead of failing at once with `database is locked`.
         let path = std::env::temp_dir().join(format!(
             "idoris-virtual-key-busy-{}.sqlite3",
             uuid::Uuid::new_v4().simple()
