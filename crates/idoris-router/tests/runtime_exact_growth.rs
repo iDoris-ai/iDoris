@@ -11,6 +11,9 @@ use idoris_router::{
 };
 use tokio_util::sync::CancellationToken;
 
+/// Allocated budgets keep 1GB unreserved; tests add it to exercise the reduced cap.
+const HEADROOM: u64 = 1_000_000_000;
+
 fn card(id: &str) -> ComponentCard {
     let mut card: ComponentCard =
         serde_yaml::from_str(include_str!("../../../config/components/omlx.yaml")).unwrap();
@@ -63,7 +66,7 @@ async fn full_allocation_denies_positive_growth_lost_by_float_aggregation() {
         ]));
         let registry = RuntimeRegistry::spawn_with_factory_and_budget(
             std::slice::from_ref(&card),
-            Some(bytes),
+            Some(bytes + HEADROOM),
             |_| Ok(adapter.clone()),
         )
         .unwrap();
@@ -96,7 +99,7 @@ async fn each_model_rounds_up_before_same_runtime_and_cross_runtime_sums() {
         let ab = Arc::new(MockAdapter::new(vec![model("tiny", tiny)]));
         let registry = RuntimeRegistry::spawn_with_factory_and_budget(
             &[a.clone(), b.clone()],
-            Some(bytes + 1),
+            Some(bytes + 1 + HEADROOM),
             |card| {
                 Ok(if card.provider.id == "a" {
                     aa.clone()
@@ -132,7 +135,7 @@ async fn separate_sub_byte_models_cannot_share_one_rounded_byte() {
     ]));
     let registry = RuntimeRegistry::spawn_with_factory_and_budget(
         std::slice::from_ref(&card),
-        Some(1),
+        Some(1 + HEADROOM),
         |_| Ok(adapter.clone()),
     )
     .unwrap();
