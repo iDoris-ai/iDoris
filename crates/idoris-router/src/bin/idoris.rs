@@ -43,6 +43,29 @@ use std::{
 };
 use tokio_util::sync::CancellationToken;
 
+/// Exit code when another `idoris serve` already holds the database lock.
+/// Other failures (including a shutdown that exceeds `SHUTDOWN_GRACE`) exit 1.
+const EXIT_ALREADY_RUNNING: i32 = 3;
+/// Upper bound for graceful shutdown after SIGTERM/SIGINT; if in-flight
+/// requests or subscriptions do not finish in time we exit with code 1.
+const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Resolves on SIGINT or (unix) SIGTERM; both take the same graceful path.
+async fn termination_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        if let Ok(mut term) = signal(SignalKind::terminate()) {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = term.recv() => {}
+            }
+            return;
+        }
+    }
+    let _ = tokio::signal::ctrl_c().await;
+}
+
 const BIND_HOST_ENV: &str = "IDORIS_BIND_HOST";
 
 #[tokio::main]
@@ -65,6 +88,25 @@ async fn main() {
             if let Err(message) = admin_read(resource, options).await {
                 eprintln!("[idoris] Admin 操作失败：{message}");
                 std::process::exit(1);
+            }
+        }
+        cli::Command::SetupOmlx(options) => {
+            let outcome = match options.api_key_stdin {
+                true => {
+                    idoris_router::setup_omlx::read_api_key(&mut std::io::stdin().lock()).map(Some)
+                }
+                false => Ok(None),
+            };
+            let outcome = match outcome {
+                Ok(key) => idoris_router::setup_omlx::run(&options, key.as_deref()).await,
+                Err(error) => Err(error),
+            };
+            match outcome {
+                Ok(report) => println!("{report}"),
+                Err(error) => {
+                    println!("{}", error.to_json());
+                    std::process::exit(1);
+                }
             }
         }
         cli::Command::Key(command) => {
@@ -251,6 +293,22 @@ async fn run(options: cli::ServeOptions) -> Result<(), String> {
 
     let local_runtime_path = config::optional_env_path("IDORIS_LOCAL_RUNTIME_CONFIG")?;
     let local_runtime_configs = runtime_launch_config::load(local_runtime_path.as_deref())?;
+    // Held until `run` returns (the OS also frees it on any exit). Taken after
+    // config validation but before runtimes spawn or ports bind. Non-contention
+    // errors (e.g. unusable DB dir) are left for storage bootstrap to report
+    // with its established precedence.
+    let _instance_lock = match storage::acquire_instance_lock() {
+        Ok(lock) => Some(lock),
+        Err(storage::InstanceLockError::Held(db)) => {
+            eprintln!(
+                "[idoris] 启动失败：已有 iDoris 实例在使用同一数据库 {}",
+                db.display()
+            );
+            std::process::exit(EXIT_ALREADY_RUNNING);
+        }
+        Err(storage::InstanceLockError::Deferred(_)) => None,
+        Err(storage::InstanceLockError::Other(message)) => return Err(message),
+    };
     let remote_kill_switch = env_flag("IDORIS_REMOTE_KILL_SWITCH");
     let runtimes = RuntimeRegistry::spawn_with_local_configs_budget_and_kill_switch(
         &cards,
@@ -263,6 +321,17 @@ async fn run(options: cli::ServeOptions) -> Result<(), String> {
     // before tenant storage/config bootstrap can surface a later error.
     let persistent = storage::bootstrap_process(deploy_mode)
         .map_err(|err| format!("无法初始化持久化存储：{err}"))?;
+    // Never run without the lock: if the early attempt was deferred, retry
+    // now that storage is known to be usable.
+    let _instance_lock = match _instance_lock {
+        Some(lock) => lock,
+        None => storage::acquire_instance_lock().map_err(|err| match err {
+            storage::InstanceLockError::Held(db) => {
+                format!("已有 iDoris 实例在使用同一数据库 {}", db.display())
+            }
+            storage::InstanceLockError::Deferred(m) | storage::InstanceLockError::Other(m) => m,
+        })?,
+    };
     let has_active_key = {
         let now_ms = server_now_ms()?;
         let store = persistent
@@ -361,10 +430,16 @@ async fn run(options: cli::ServeOptions) -> Result<(), String> {
             &component_list
         }
     );
-    serve_bound(data_listener, admin_listener, state, admin_token, async {
-        let _ = tokio::signal::ctrl_c().await;
-    })
-    .await
+    serve_bound(
+        data_listener,
+        admin_listener,
+        state,
+        admin_token,
+        termination_signal(),
+    )
+    .await?;
+    println!("idoris: 已停止");
+    Ok(())
 }
 
 fn read_admin_token_from_stdin() -> Result<AdminSessionToken, String> {
@@ -528,39 +603,49 @@ where
     };
     shutdown.cancel();
 
-    let server_result = match exit {
-        Exit::Signal => {
-            let (data, admin) = tokio::join!(&mut data_server, &mut admin_server);
-            match data {
-                Err(err) => Err(format!("data server error: {err}")),
-                Ok(()) => admin.map_err(|err| format!("admin server error: {err}")),
+    let drain = async {
+        let server_result = match exit {
+            Exit::Signal => {
+                let (data, admin) = tokio::join!(&mut data_server, &mut admin_server);
+                match data {
+                    Err(err) => Err(format!("data server error: {err}")),
+                    Ok(()) => admin.map_err(|err| format!("admin server error: {err}")),
+                }
             }
-        }
-        Exit::Data(result) => {
-            let _peer = admin_server.await;
-            match result {
-                Ok(()) => Err("data server exited unexpectedly".to_string()),
-                Err(err) => Err(format!("data server error: {err}")),
+            Exit::Data(result) => {
+                let _peer = admin_server.await;
+                match result {
+                    Ok(()) => Err("data server exited unexpectedly".to_string()),
+                    Err(err) => Err(format!("data server error: {err}")),
+                }
             }
-        }
-        Exit::Admin(result) => {
-            let _peer = data_server.await;
-            match result {
-                Ok(()) => Err("admin server exited unexpectedly".to_string()),
-                Err(err) => Err(format!("admin server error: {err}")),
+            Exit::Admin(result) => {
+                let _peer = data_server.await;
+                match result {
+                    Ok(()) => Err("admin server exited unexpectedly".to_string()),
+                    Err(err) => Err(format!("admin server error: {err}")),
+                }
             }
+        };
+        let subscription_result = subscriptions
+            .shutdown_all()
+            .await
+            .map_err(|error| format!("subscription shutdown failed: {error}"));
+        match (server_result, subscription_result) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(server), Ok(())) => Err(server),
+            (Ok(()), Err(subscription)) => Err(subscription),
+            (Err(server), Err(subscription)) => Err(format!("{server}; {subscription}")),
         }
     };
-    let subscription_result = subscriptions
-        .shutdown_all()
+    tokio::time::timeout(SHUTDOWN_GRACE, drain)
         .await
-        .map_err(|error| format!("subscription shutdown failed: {error}"));
-    match (server_result, subscription_result) {
-        (Ok(()), Ok(())) => Ok(()),
-        (Err(server), Ok(())) => Err(server),
-        (Ok(()), Err(subscription)) => Err(subscription),
-        (Err(server), Err(subscription)) => Err(format!("{server}; {subscription}")),
-    }
+        .unwrap_or_else(|_| {
+            Err(format!(
+                "优雅停机超过 {}s，强制退出",
+                SHUTDOWN_GRACE.as_secs()
+            ))
+        })
 }
 
 #[cfg(test)]
