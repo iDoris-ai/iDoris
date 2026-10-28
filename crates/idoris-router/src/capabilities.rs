@@ -45,9 +45,10 @@ pub struct CapabilityEntry {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub degraded_alternatives: Option<Vec<AlternativeEntry>>,
     /// Only when the recommender offers it, and then on at most one entry:
-    /// the resident entry, else the first entry already using that model's
-    /// id, else a synthesized blocked resident entry. Dropped when a temp
-    /// entry already offers the same model and quant (see `map_recommendation`).
+    /// the resident entry; else the first blocked entry with that model's id;
+    /// else the first temp entry with that id, unless that temp entry already
+    /// has the same quant (then dropped); else a synthesized blocked resident
+    /// entry (see `map_recommendation`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub headroom_breach_option: Option<HeadroomBreachOption>,
 }
@@ -711,7 +712,7 @@ mod tests {
         blocked.id = option_id.clone();
         rec.temp.retain(|t| t.id != option_id);
         rec.blocked.retain(|b| b.id != option_id);
-        rec.blocked.push(blocked);
+        rec.blocked.push(blocked.clone());
         let json = serde_json::to_value(map_recommendation(&rec, &catalog, 0)).unwrap();
         let same: Vec<_> = json
             .as_array()
@@ -723,6 +724,23 @@ mod tests {
         assert_eq!(same[0]["admission_status"], "blocked");
         assert_eq!(same[0]["resident"], false);
         assert_eq!(same[0]["headroom_breach_option"]["id"], option_id.as_str());
+
+        // Two blocked entries for the same model: only the first carries it.
+        rec.blocked.push(blocked);
+        let json = serde_json::to_value(map_recommendation(&rec, &catalog, 0)).unwrap();
+        let same: Vec<_> = json
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["id"] == option_id.as_str())
+            .collect();
+        assert_eq!(same.len(), 2);
+        let carriers = same
+            .iter()
+            .filter(|e| e.get("headroom_breach_option").is_some())
+            .count();
+        assert_eq!(carriers, 1);
+        assert!(same[0].get("headroom_breach_option").is_some());
     }
 
     #[test]
