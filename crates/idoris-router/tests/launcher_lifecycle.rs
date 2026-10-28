@@ -197,3 +197,20 @@ async fn offline_key_issue_works_while_server_holds_the_lock() {
     send("-TERM", &server);
     wait_exit(&mut server, Duration::from_secs(12));
 }
+
+#[test]
+fn unusable_lock_file_fails_startup_with_exit_1_and_never_serves() {
+    let env = Env::new();
+    fs::create_dir(env.state.path().join("state.sqlite3.lock")).unwrap();
+    let (port, admin) = (free_port(), free_port());
+    let mut child = env.serve(port, admin);
+    let status = wait_exit(&mut child, Duration::from_secs(10));
+    let stdout = read_all(child.stdout.take().unwrap());
+    let stderr = read_all(child.stderr.take().unwrap());
+    assert_eq!(status.code(), Some(1), "{stderr}");
+    assert!(
+        stderr.contains("[idoris] 启动失败：无法获取实例锁"),
+        "{stderr}"
+    );
+    assert!(!stdout.contains("listening"), "{stdout}");
+}

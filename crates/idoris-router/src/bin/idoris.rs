@@ -279,7 +279,8 @@ async fn run(options: cli::ServeOptions) -> Result<(), String> {
             );
             std::process::exit(EXIT_ALREADY_RUNNING);
         }
-        Err(storage::InstanceLockError::Other(_)) => None,
+        Err(storage::InstanceLockError::Deferred(_)) => None,
+        Err(storage::InstanceLockError::Other(message)) => return Err(message),
     };
     let remote_kill_switch = env_flag("IDORIS_REMOTE_KILL_SWITCH");
     let runtimes = RuntimeRegistry::spawn_with_local_configs_budget_and_kill_switch(
@@ -293,6 +294,17 @@ async fn run(options: cli::ServeOptions) -> Result<(), String> {
     // before tenant storage/config bootstrap can surface a later error.
     let persistent = storage::bootstrap_process(deploy_mode)
         .map_err(|err| format!("无法初始化持久化存储：{err}"))?;
+    // Never run without the lock: if the early attempt was deferred, retry
+    // now that storage is known to be usable.
+    let _instance_lock = match _instance_lock {
+        Some(lock) => lock,
+        None => storage::acquire_instance_lock().map_err(|err| match err {
+            storage::InstanceLockError::Held(db) => {
+                format!("已有 iDoris 实例在使用同一数据库 {}", db.display())
+            }
+            storage::InstanceLockError::Deferred(m) | storage::InstanceLockError::Other(m) => m,
+        })?,
+    };
     let has_active_key = {
         let now_ms = server_now_ms()?;
         let store = persistent

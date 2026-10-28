@@ -91,6 +91,10 @@ pub fn open_virtual_key_store_process() -> Result<VirtualKeyStore, String> {
 pub enum InstanceLockError {
     /// Another `idoris serve` already holds the lock for this database.
     Held(PathBuf),
+    /// DB path/dir problem; storage bootstrap reports the same failure with
+    /// its established error precedence, so the caller may defer to it.
+    Deferred(String),
+    /// Lock file unusable: startup must fail.
     Other(String),
 }
 
@@ -99,10 +103,10 @@ pub enum InstanceLockError {
 /// releases it on any exit, including a crash, so there is no stale-lock
 /// state. `File` is opened close-on-exec, so spawned runtimes never inherit it.
 pub fn acquire_instance_lock() -> Result<std::fs::File, InstanceLockError> {
-    let db_path = process_db_path().map_err(InstanceLockError::Other)?;
+    let db_path = process_db_path().map_err(InstanceLockError::Deferred)?;
     if let Some(parent) = db_path.parent().filter(|path| !path.as_os_str().is_empty()) {
         std::fs::create_dir_all(parent).map_err(|err| {
-            InstanceLockError::Other(format!(
+            InstanceLockError::Deferred(format!(
                 "无法创建数据库目录 \"{}\"：{err}",
                 parent.display()
             ))
@@ -117,7 +121,7 @@ pub fn acquire_instance_lock() -> Result<std::fs::File, InstanceLockError> {
         .open(&lock_path)
         .map_err(|err| {
             InstanceLockError::Other(format!(
-                "无法打开实例锁文件 \"{}\"：{err}",
+                "无法获取实例锁（锁文件不可用） \"{}\"：{err}",
                 Path::new(&lock_path).display()
             ))
         })?;
