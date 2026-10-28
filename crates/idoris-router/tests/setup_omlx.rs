@@ -63,7 +63,18 @@ struct Out {
 }
 
 async fn setup(endpoint: &str, out: &Path, extra: &[&str], stdin: Option<&str>) -> Out {
-    let (endpoint, out, extra, stdin) = (
+    setup_in(None, endpoint, out, extra, stdin).await
+}
+
+async fn setup_in(
+    cwd: Option<&Path>,
+    endpoint: &str,
+    out: &Path,
+    extra: &[&str],
+    stdin: Option<&str>,
+) -> Out {
+    let (cwd, endpoint, out, extra, stdin) = (
+        cwd.map(Path::to_owned),
         endpoint.to_string(),
         out.to_owned(),
         extra.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
@@ -71,6 +82,9 @@ async fn setup(endpoint: &str, out: &Path, extra: &[&str], stdin: Option<&str>) 
     );
     tokio::task::spawn_blocking(move || {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_idoris"));
+        if let Some(cwd) = &cwd {
+            cmd.current_dir(cwd);
+        }
         cmd.args(["setup", "omlx", "--endpoint", &endpoint, "--out-dir"])
             .arg(&out)
             .args(&extra)
@@ -329,4 +343,92 @@ async fn out_dir_rules() {
             .contains(&server.uri())
     );
     idoris_router::components::load_components(&out, false).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn out_dir_dot_is_the_working_directory() {
+    // The staging dir for `.` sits inside it; it must not count as foreign.
+    let server = fake(None, &["m1"]).await;
+    let tmp = TempDir::new().unwrap();
+    let cwd = tmp.path().join("comp");
+    fs::create_dir(&cwd).unwrap();
+    let dot = Path::new(".");
+    let o = setup_in(Some(&cwd), &server.uri(), dot, &[], None).await;
+    assert_eq!(o.code, 0, "{}", o.stdout);
+    let o = setup_in(Some(&cwd), &server.uri(), dot, &["--force"], None).await;
+    assert_eq!(o.code, 0, "{}", o.stdout);
+    let mut names: Vec<_> = fs::read_dir(&cwd)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    names.sort();
+    assert_eq!(names, ["omlx.yaml", "subscription.yaml"]);
+    idoris_router::components::load_components(&cwd, false).unwrap();
+
+    fs::write(cwd.join("other.txt"), "x").unwrap();
+    let o = setup_in(Some(&cwd), &server.uri(), dot, &["--force"], None).await;
+    assert_eq!(err_code(&o), "out_dir_not_empty");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn redirects_are_not_followed() {
+    let target = fake(None, &["m1"]).await;
+    let redirector = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(
+            ResponseTemplate::new(302)
+                .insert_header("location", format!("{}/v1/models", target.uri()).as_str()),
+        )
+        .mount(&redirector)
+        .await;
+    let tmp = TempDir::new().unwrap();
+    let out = tmp.path().join("comp");
+    let o = setup(&redirector.uri(), &out, &[], None).await;
+    assert_eq!(err_code(&o), "not_omlx", "{}", o.stdout);
+    assert!(!out.exists());
+    assert!(
+        target.received_requests().await.unwrap().is_empty(),
+        "redirect target must never be requested"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn oversized_models_body_is_rejected() {
+    let server = MockServer::start().await;
+    let pad = "x".repeat(3 * 1024 * 1024);
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"data": [{"id": "m1"}], "pad": pad})),
+        )
+        .mount(&server)
+        .await;
+    let tmp = TempDir::new().unwrap();
+    let out = tmp.path().join("comp");
+    let o = setup(&server.uri(), &out, &["--load-mode", "resident"], None).await;
+    assert_eq!(err_code(&o), "not_omlx", "{}", o.stdout);
+    assert!(!out.exists());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn models_body_just_under_the_cap_is_accepted() {
+    let server = MockServer::start().await;
+    let pad = "x".repeat(1024 * 1024);
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"data": [{"id": "m1"}], "pad": pad})),
+        )
+        .mount(&server)
+        .await;
+    let tmp = TempDir::new().unwrap();
+    let o = setup(
+        &server.uri(),
+        &tmp.path().join("comp"),
+        &["--load-mode", "resident"],
+        None,
+    )
+    .await;
+    assert_eq!(o.code, 0, "{}", o.stdout);
 }

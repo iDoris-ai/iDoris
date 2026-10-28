@@ -225,7 +225,7 @@ pub async fn run(options: &SetupOmlxOptions, api_key: Option<&str>) -> Result<Va
             ));
         }
     }
-    check_out_dir(&options.out_dir, options.force)?;
+    check_out_dir(&options.out_dir, options.force, None)?;
     let (models, auth_required) = probe(&endpoint, api_key, options.load_mode).await?;
     for (role, model) in &options.bindings {
         if !models.contains(model) {
@@ -236,7 +236,7 @@ pub async fn run(options: &SetupOmlxOptions, api_key: Option<&str>) -> Result<Va
         }
     }
     let card = build_card(&endpoint, options.load_mode, &options.bindings)?;
-    let dir = write_validated(&options.out_dir, &card)?;
+    let dir = write_validated(&options.out_dir, options.force, &card)?;
     let bindings: serde_json::Map<String, Value> = options
         .bindings
         .iter()
@@ -256,7 +256,13 @@ pub async fn run(options: &SetupOmlxOptions, api_key: Option<&str>) -> Result<Va
 
 pub const KEY_ENV: &str = idoris_upstream::omlx::OMLX_API_KEY_ENV;
 
-fn check_out_dir(dir: &Path, force: bool) -> Result<(), SetupError> {
+/// `own_stage` is this run's staging dir: with `--out-dir .` it sits inside
+/// `dir` and must not count as a foreign file.
+fn check_out_dir(
+    dir: &Path,
+    force: bool,
+    own_stage: Option<&std::ffi::OsStr>,
+) -> Result<(), SetupError> {
     let not_empty = |m: &str| SetupError::new("out_dir_not_empty", m.to_string());
     if !dir.exists() {
         return Ok(());
@@ -265,6 +271,7 @@ fn check_out_dir(dir: &Path, force: bool) -> Result<(), SetupError> {
     let names: Vec<_> = entries
         .filter_map(Result::ok)
         .map(|e| e.file_name())
+        .filter(|name| Some(name.as_os_str()) != own_stage)
         .collect();
     if names.is_empty() {
         return Ok(());
@@ -278,9 +285,13 @@ fn check_out_dir(dir: &Path, force: bool) -> Result<(), SetupError> {
 }
 
 /// Stage in a sibling dir, run the server's loader on it, then move into
-/// place. Nothing in `out_dir` changes unless validation passed.
-fn write_validated(out_dir: &Path, card: &str) -> Result<PathBuf, SetupError> {
-    let io = |e: std::io::Error| SetupError::new("validation_failed", format!("写入失败：{e}"));
+/// place. Nothing in `out_dir` changes unless validation passed, and replacing
+/// an existing dir is all-or-nothing: the old managed files are renamed aside
+/// first and restored if any later step fails. `out_dir` is re-checked right
+/// before replacing (the probe may have taken seconds), so a dir that gained
+/// foreign files meanwhile is not clobbered. Write failures are `write_failed`.
+fn write_validated(out_dir: &Path, force: bool, card: &str) -> Result<PathBuf, SetupError> {
+    let io = |e: std::io::Error| SetupError::new("write_failed", format!("写入失败：{e}"));
     let parent = match out_dir.parent() {
         Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
         _ => PathBuf::from("."),
@@ -301,10 +312,9 @@ fn write_validated(out_dir: &Path, card: &str) -> Result<PathBuf, SetupError> {
                     .replace(&stage.display().to_string(), "<staging>"),
             )
         })?;
+        check_out_dir(out_dir, force, stage.file_name())?;
         if out_dir.exists() {
-            for name in MANAGED {
-                std::fs::rename(stage.join(name), out_dir.join(name)).map_err(io)?;
-            }
+            replace_managed(&stage, out_dir).map_err(io)?;
         } else {
             std::fs::rename(&stage, out_dir).map_err(io)?;
         }
@@ -312,4 +322,117 @@ fn write_validated(out_dir: &Path, card: &str) -> Result<PathBuf, SetupError> {
     })();
     let _ = std::fs::remove_dir_all(&stage);
     result
+}
+
+/// Moves the staged managed files into an existing `out_dir`, all or nothing.
+fn replace_managed(stage: &Path, out_dir: &Path) -> std::io::Result<()> {
+    let tag = format!(".idoris-bak-{}", std::process::id());
+    let mut backed_up: Vec<&str> = Vec::new();
+    let mut placed: Vec<&str> = Vec::new();
+    let attempt = (|| {
+        for name in MANAGED {
+            let target = out_dir.join(name);
+            if target.exists() {
+                std::fs::rename(&target, out_dir.join(format!("{name}{tag}")))?;
+                backed_up.push(name);
+            }
+        }
+        for name in MANAGED {
+            std::fs::rename(stage.join(name), out_dir.join(name))?;
+            placed.push(name);
+        }
+        Ok(())
+    })();
+    let Err(err) = attempt else {
+        for name in &backed_up {
+            let _ = std::fs::remove_file(out_dir.join(format!("{name}{tag}")));
+        }
+        return Ok(());
+    };
+    for name in &placed {
+        let _ = std::fs::rename(out_dir.join(name), stage.join(name));
+    }
+    let stranded: Vec<String> = backed_up
+        .iter()
+        .filter(|name| {
+            std::fs::rename(out_dir.join(format!("{name}{tag}")), out_dir.join(name)).is_err()
+        })
+        .map(|name| format!("{name}{tag}"))
+        .collect();
+    if stranded.is_empty() {
+        return Err(err);
+    }
+    Err(std::io::Error::other(format!(
+        "{err}；回滚未完成，旧文件保留为 {}",
+        stranded.join("、")
+    )))
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+
+    use super::*;
+
+    fn card() -> String {
+        build_card("http://127.0.0.1:8000", LoadMode::OnDemand, &[]).unwrap()
+    }
+
+    #[test]
+    fn foreign_file_appearing_after_the_first_check_is_not_clobbered() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("comp");
+        std::fs::create_dir(&out).unwrap();
+        // Simulates a dir populated while the probe was in flight.
+        std::fs::write(out.join("mine.txt"), "keep").unwrap();
+        std::fs::write(out.join("omlx.yaml"), "old").unwrap();
+        let err = write_validated(&out, true, &card()).unwrap_err();
+        assert_eq!(err.code, "out_dir_not_empty");
+        assert_eq!(
+            std::fs::read_to_string(out.join("mine.txt")).unwrap(),
+            "keep"
+        );
+        assert_eq!(
+            std::fs::read_to_string(out.join("omlx.yaml")).unwrap(),
+            "old"
+        );
+    }
+
+    #[test]
+    fn mid_replace_failure_restores_the_previous_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("comp");
+        let stage = tmp.path().join("stage");
+        std::fs::create_dir(&out).unwrap();
+        std::fs::create_dir(&stage).unwrap();
+        std::fs::write(out.join("omlx.yaml"), "old-omlx").unwrap();
+        std::fs::write(out.join("subscription.yaml"), "old-sub").unwrap();
+        std::fs::write(stage.join("omlx.yaml"), "new-omlx").unwrap();
+        // subscription.yaml missing from the stage: the second move fails
+        // after omlx.yaml was already replaced.
+        replace_managed(&stage, &out).unwrap_err();
+        assert_eq!(
+            std::fs::read_to_string(out.join("omlx.yaml")).unwrap(),
+            "old-omlx"
+        );
+        assert_eq!(
+            std::fs::read_to_string(out.join("subscription.yaml")).unwrap(),
+            "old-sub"
+        );
+        let mut names: Vec<_> = std::fs::read_dir(&out)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["omlx.yaml", "subscription.yaml"]);
+    }
+
+    #[test]
+    fn io_failure_is_write_failed_not_validation_failed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let blocker = tmp.path().join("file");
+        std::fs::write(&blocker, "x").unwrap();
+        let err = write_validated(&blocker.join("comp"), false, &card()).unwrap_err();
+        assert_eq!(err.code, "write_failed");
+    }
 }

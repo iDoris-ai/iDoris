@@ -214,3 +214,40 @@ fn unusable_lock_file_fails_startup_with_exit_1_and_never_serves() {
     );
     assert!(!stdout.contains("listening"), "{stdout}");
 }
+
+#[tokio::test]
+async fn symlinked_db_path_shares_the_same_instance_lock() {
+    let env = Env::new();
+    let real = env.state.path().join("real.sqlite3");
+    let alias = env.state.path().join("alias.sqlite3");
+    fs::write(&real, b"").unwrap();
+    std::os::unix::fs::symlink(&real, &alias).unwrap();
+
+    let (port, admin) = (free_port(), free_port());
+    let spawn = |db: &Path, port: u16, admin: u16| {
+        let mut command = env.command(port, admin);
+        command.env("IDORIS_DB_PATH", db);
+        let mut child = command
+            .args(["serve", "--admin-token-stdin"])
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(format!("{SECRET}\n").as_bytes())
+            .unwrap();
+        child
+    };
+    let mut first = spawn(&real, port, admin);
+    wait_health(&mut first, port).await;
+
+    let mut second = spawn(&alias, free_port(), free_port());
+    let status = wait_exit(&mut second, Duration::from_secs(10));
+    let stderr = read_all(second.stderr.take().unwrap());
+    assert_eq!(status.code(), Some(3), "{stderr}");
+    assert!(stderr.contains("已有 iDoris 实例"), "{stderr}");
+
+    send("-TERM", &first);
+    wait_exit(&mut first, Duration::from_secs(12));
+}
