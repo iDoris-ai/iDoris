@@ -675,6 +675,9 @@ mod tests {
             ctx_limit: 131_072,
             queue_depth: 3,
             admission_status: crate::capabilities::AdmissionStatus::RequiresEviction,
+            degraded_alternative: None,
+            degraded_alternatives: None,
+            headroom_breach_option: None,
         };
         for entries in [vec![entry.clone()], Vec::new()] {
             let expected = entries
@@ -744,6 +747,9 @@ mod tests {
                         ctx_limit: 131_072,
                         queue_depth: 0,
                         admission_status: crate::capabilities::AdmissionStatus::Ready,
+                        degraded_alternative: None,
+                        degraded_alternatives: None,
+                        headroom_breach_option: None,
                     }]),
                 })),
                 ..AppState::default()
@@ -1003,6 +1009,9 @@ mod tests {
             ctx_limit: 131_072,
             queue_depth: 3,
             admission_status: crate::capabilities::AdmissionStatus::Ready,
+            degraded_alternative: None,
+            degraded_alternatives: None,
+            headroom_breach_option: None,
         };
         for entries in [Some(vec![entry]), None] {
             let token = AdminSessionToken::mint();

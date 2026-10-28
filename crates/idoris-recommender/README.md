@@ -186,8 +186,10 @@ alternatives are on `BlockedChoice.degraded_alternatives`, one per capability
 (each `TempAlternative` carries its `capability`). As with `Ready`, remaining
 memory is not deducted cumulatively across capabilities, so alternatives for
 different capabilities may not fit together. Existing warnings,
-reasons and tradeoff text are unchanged, and the HTTP `/capabilities` shape is
-unchanged (the router does not expose the alternative yet).
+reasons and tradeoff text are unchanged. Since contract 1.1.0 the router exposes
+these on HTTP `/capabilities` as `degraded_alternative` / `degraded_alternatives`
+(with a stable `reason` code, not this text); see
+`crates/idoris-router/src/capabilities.rs`.
 
 ## Headroom breach option (owner decision)
 
@@ -200,6 +202,8 @@ is active. It never replaces `resident`, never changes temp admission, and does
 not appear in warnings or tradeoff text.
 
 The option takes effect only after the user confirms it each time; it must
-never be applied automatically. The confirmation UI belongs to Agent24; how the
-option is exposed over HTTP is deferred to a later phase to be agreed with
-Agent24.
+never be applied automatically. The confirmation UI belongs to Agent24. Since
+contract 1.1.0, `/capabilities` exposes it as `headroom_breach_option` (with
+`quant`) on the resident entry; when no resident fits without the headroom, it
+is carried by a `resident: true`, `admission_status: "blocked"` entry. The user's
+per-request confirmation is the `X-iDoris-Headroom-Breach: confirmed` header.
