@@ -164,7 +164,10 @@ agent24d 托管 iDoris 时，按下表执行。表中都是已冻结的接口，
 - `GET /capabilities` 的条目可能带三个新字段：`degraded_alternative`（只出现在 `requires_eviction` 条目上，`{id, capability, estimated_memory_gb, quant, reason}` 或 `null`）、`degraded_alternatives`（只出现在 `blocked` 条目上，是数组）、`headroom_breach_option`（`{id, quant, estimated_memory_gb, ctx_limit}`，整份快照最多一个条目带这个字段，条目 id 唯一）。`reason` 是稳定的代码，例如 `fits_without_eviction`。解析时看哪个条目带了 `headroom_breach_option`，不要靠 `resident:true` 来定位。
 - 用户选「清理后用最优模型」或「降级」时，直接请求对应的模型 id 即可，不需要新接口。
 - **1GB 余量**：设置了 `IDORIS_ALLOCATED_BUDGET_BYTES` 时，生命周期加载默认最多用到额度减 1GB。`POST /v1/chat/completions` 带上 `X-iDoris-Headroom-Breach: confirmed`（只接受这一个值），表示用户已确认，这一次加载可以用满全部额度。确认只对单次请求有效，不会被记住。它是 Agent24 问过用户之后代为发出的约定，不是权限边界。
-- 没带确认、而这次加载只有用掉余量才放得下时，返回 `503 headroom_confirmation_required`，此时应询问用户。另一个请求正在以不同的确认状态加载同一个模型时，返回 `503 supervisor_busy`，有限退避后用同一个请求头重试即可，不要询问用户。其它 503 按原规则处理。
+- 没带确认、而这次加载只有用掉余量才放得下时，返回 HTTP 503，`error.type` 与 `error.reason_code` 都是 `headroom_confirmation_required`，此时应询问用户。
+- 生命周期繁忙时（包括另一个请求正在以不同的确认状态加载同一个模型），返回 HTTP 503，`error.type` 是 `local_only_unavailable`，`error.reason_code` 是 `supervisor_busy`。必须按 `reason_code` 区分，有限退避后用同一个请求头重试即可，不要询问用户。
+- 带了确认也放不下（超过整个额度）时，`error.type` 是 `local_only_unavailable`，`reason_code` 不是 `headroom_confirmation_required`，为终态，不应弹出确认。其它 503 按原规则处理。
+- `remediation` 是给人看的说明文字，不属于契约，不得用于匹配。
 
 ## 3. 拟议 v0.3.1 local_only 数据面切片（待联合验收）
 
@@ -244,4 +247,4 @@ agent24d 托管 iDoris 时，按下表执行。表中都是已冻结的接口，
 | R7 | 2026-09-27 | 双方 | iDoris 采纳全部措辞修订与条件，并对 J-4、J-2 各加一处限定；Agent24 确认；jason 拍板 J-1…J-8 全部选 (a) | **v1.1** |
 | R8 | 2026-09-27 | Agent24 | 审阅 v1.1：无异议；建议 loopback 免 key 仅作为显式开发者选项，免 key 时视为 local_only | 已采纳，写入 §3.2 |
 | R9 | 2026-10-15 | iDoris | [文档修订 1.2 整合与三个 owner 决策](negotiation/R9-v1.2-协商提案.md)；local_only v0.3.1 最小数据面与 launcher 解耦 | OD-1/OD-2 已由修订 1.3 决定（见 §2.7）；fast/daily 标签重标仍 **OWNER REVIEW PENDING** |
-| R10 | 2026-10-28 | jason / 双方 | 文档修订 1.3：owner 要求 Agent24 桌面端一站式「下载 → 运行 → 连接」，由此定下 OD-1（宿主为 agent24d）、OD-2（用户在桌面端同意）；新增 §2.7 launcher 托管契约（iDoris v0.4.0 起）、§2.8 wire 契约 1.1.0 | Agent24 已确认 §2.7 / §2.8 契约，实现跟进中（登记为 ID-HR，v0.4.0 发版后实现；launcher 设计见 Agent24#1437） |
+| R10 | 2026-10-28 | jason / 双方 | 文档修订 1.3：owner 要求 Agent24 桌面端一站式「下载 → 运行 → 连接」，由此定下 OD-1（宿主为 agent24d）、OD-2（用户在桌面端同意）；新增 §2.7 launcher 托管契约（iDoris v0.4.0 起）、§2.8 wire 契约 1.1.0 | launcher 设计已合入 [Agent24#1437](https://github.com/iDoris-ai/Agent24/pull/1437)；按 v0.4.0 的实现与验收是 Agent24 的 IL-01 起各项，尚未完成。其中「额度紧时 503 `headroom_confirmation_required` → 用户确认 → 重发」的确认交互登记为 ID-HR，见 [Agent24#1442](https://github.com/iDoris-ai/Agent24/pull/1442) |
