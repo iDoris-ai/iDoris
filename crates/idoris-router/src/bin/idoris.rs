@@ -68,26 +68,64 @@ async fn termination_signal() {
 
 const BIND_HOST_ENV: &str = "IDORIS_BIND_HOST";
 
-#[tokio::main]
-async fn main() {
+/// How long dropping the tokio runtime may wait for blocking tasks after the
+/// async work finished. Dropping the runtime drops every task (and with it the
+/// `RuntimeRegistry` clones that own local runtime process groups), so
+/// children are reaped even when `run` bailed out on a stuck graceful stop.
+/// Worst case total stop time is `SHUTDOWN_GRACE` + this bound.
+const RUNTIME_DROP_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+fn shutdown_timeout_message() -> String {
+    format!("优雅停机超过 {}s，强制退出", SHUTDOWN_GRACE.as_secs())
+}
+
+/// Label for a `run` failure: a stuck stop is not a startup failure.
+fn serve_failure_label(message: &str) -> &'static str {
+    if message == shutdown_timeout_message() {
+        "停止失败"
+    } else {
+        "启动失败"
+    }
+}
+
+fn main() -> std::process::ExitCode {
+    let runtime = match tokio::runtime::Runtime::new() {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            eprintln!("[idoris] 启动失败：无法创建异步运行时：{error}");
+            return std::process::ExitCode::from(1);
+        }
+    };
+    let code = runtime.block_on(real_main());
+    // Not `process::exit`: that skips destructors and would leak local
+    // runtime children (own process groups) after a forced stop.
+    stop_runtime(runtime, RUNTIME_DROP_GRACE);
+    std::process::ExitCode::from(code)
+}
+
+fn stop_runtime(runtime: tokio::runtime::Runtime, grace: std::time::Duration) {
+    runtime.shutdown_timeout(grace);
+}
+
+async fn real_main() -> u8 {
     let command = match cli::parse_args(std::env::args_os().skip(1)) {
         Ok(command) => command,
         Err(message) => {
             eprintln!("[idoris] {message}");
-            std::process::exit(1);
+            return 1;
         }
     };
     match command {
         cli::Command::Serve(options) => {
             if let Err(message) = run(options).await {
-                eprintln!("[idoris] 启动失败：{message}");
-                std::process::exit(1);
+                eprintln!("[idoris] {}：{message}", serve_failure_label(&message));
+                return 1;
             }
         }
         cli::Command::Admin(cli::AdminCommand::Read(resource, options)) => {
             if let Err(message) = admin_read(resource, options).await {
                 eprintln!("[idoris] Admin 操作失败：{message}");
-                std::process::exit(1);
+                return 1;
             }
         }
         cli::Command::SetupOmlx(options) => {
@@ -105,17 +143,18 @@ async fn main() {
                 Ok(report) => println!("{report}"),
                 Err(error) => {
                     println!("{}", error.to_json());
-                    std::process::exit(1);
+                    return 1;
                 }
             }
         }
         cli::Command::Key(command) => {
             if let Err(message) = run_key_command(command) {
                 eprintln!("[idoris] {message}");
-                std::process::exit(1);
+                return 1;
             }
         }
     }
+    0
 }
 
 fn run_key_command(command: cli::KeyCommand) -> Result<(), String> {
@@ -640,12 +679,7 @@ where
     };
     tokio::time::timeout(SHUTDOWN_GRACE, drain)
         .await
-        .unwrap_or_else(|_| {
-            Err(format!(
-                "优雅停机超过 {}s，强制退出",
-                SHUTDOWN_GRACE.as_secs()
-            ))
-        })
+        .unwrap_or_else(|_| Err(shutdown_timeout_message()))
 }
 
 #[cfg(test)]
@@ -657,6 +691,68 @@ mod tests {
         Mock, MockServer, ResponseTemplate,
         matchers::{method, path},
     };
+
+    #[test]
+    fn stop_timeout_is_labelled_as_stop_failure_not_startup_failure() {
+        assert_eq!(shutdown_timeout_message(), "优雅停机超过 10s，强制退出");
+        assert_eq!(serve_failure_label(&shutdown_timeout_message()), "停止失败");
+        assert_eq!(serve_failure_label("无法绑定 127.0.0.1:1"), "启动失败");
+    }
+
+    #[cfg(unix)]
+    fn process_alive(pid: u32) -> bool {
+        let out = std::process::Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+            .unwrap();
+        let stat = String::from_utf8_lossy(&out.stdout);
+        let stat = stat.trim();
+        !stat.is_empty() && !stat.starts_with('Z')
+    }
+
+    /// Forced-stop path: a task that never finishes (a stuck graceful stop)
+    /// still owns a local runtime process group. Dropping the runtime the way
+    /// `main` does must reap it, unlike `process::exit`.
+    #[cfg(unix)]
+    #[test]
+    fn dropping_runtime_after_stuck_task_reaps_local_runtime_children() {
+        use idoris_upstream::{LocalRuntimeKind, LocalRuntimeLaunch, ManagedRuntimeProcess};
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("fake-runtime.sh");
+        std::fs::write(&script, "#!/bin/sh\nsleep 60\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let launch = LocalRuntimeLaunch::new(
+            LocalRuntimeKind::MlxLmServer,
+            &script,
+            dir.path().join("model"),
+            18999,
+        )
+        .unwrap();
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        runtime.spawn(async move {
+            let process = ManagedRuntimeProcess::spawn(&launch).unwrap();
+            tx.send(process.id().unwrap()).unwrap();
+            let _owned = process;
+            std::future::pending::<()>().await;
+        });
+        let pid = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        assert!(process_alive(pid));
+
+        stop_runtime(runtime, std::time::Duration::from_secs(2));
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while process_alive(pid) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "runtime child {pid} survived runtime drop"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
 
     #[test]
     fn allocated_budget_env_preserves_absence_zero_and_exact_bytes_and_rejects_invalid_values() {

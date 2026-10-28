@@ -112,7 +112,7 @@ pub fn acquire_instance_lock() -> Result<std::fs::File, InstanceLockError> {
             ))
         })?;
     }
-    let mut lock_path = db_path.clone().into_os_string();
+    let mut lock_path = canonical_lock_base(&db_path).into_os_string();
     lock_path.push(".lock");
     let file = std::fs::OpenOptions::new()
         .create(true)
@@ -132,6 +132,40 @@ pub fn acquire_instance_lock() -> Result<std::fs::File, InstanceLockError> {
             "无法获取实例锁 \"{}\"：{err}",
             Path::new(&lock_path).display()
         ))),
+    }
+}
+
+/// Path the lock file is derived from, so every alias of one database maps to
+/// one lock. An existing DB file is canonicalized (resolves a symlinked file
+/// and symlinked directories). A not-yet-created file is `canonical(parent)`
+/// joined with its name; a dangling symlink is first followed to the file it
+/// will create, so the lock is the same before and after the first start
+/// creates it. If the parent cannot be canonicalized either, the literal path
+/// is used (best effort). Odd names such as `:memory:` just resolve against
+/// the working directory.
+fn canonical_lock_base(db_path: &Path) -> PathBuf {
+    if let Ok(real) = std::fs::canonicalize(db_path) {
+        return real;
+    }
+    // Bounded like the kernel's own symlink limit, so a loop cannot hang.
+    let mut target = db_path.to_path_buf();
+    for _ in 0..40 {
+        let Ok(next) = std::fs::read_link(&target) else {
+            break;
+        };
+        target = match target.parent() {
+            Some(dir) => dir.join(next),
+            None => next,
+        };
+    }
+    let db_path = target.as_path();
+    let parent = db_path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    match (std::fs::canonicalize(parent), db_path.file_name()) {
+        (Ok(parent), Some(name)) => parent.join(name),
+        _ => db_path.to_path_buf(),
     }
 }
 
@@ -437,6 +471,36 @@ mod tests {
     use serde_json::{Map, json};
     use std::collections::BTreeMap;
     use uuid::Uuid;
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_symlinked_db_keeps_its_lock_after_the_first_start() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("data").join("real.db");
+        std::fs::create_dir(real.parent().unwrap()).unwrap();
+        let alias = tmp.path().join("alias.db");
+        std::os::unix::fs::symlink("data/real.db", &alias).unwrap();
+        let before = canonical_lock_base(&alias);
+        std::fs::write(&real, "").unwrap();
+        let after = canonical_lock_base(&alias);
+        assert_eq!(before, after);
+        assert_eq!(after, std::fs::canonicalize(&real).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_loop_falls_back_without_hanging() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a.db");
+        let b = tmp.path().join("b.db");
+        std::os::unix::fs::symlink(&b, &a).unwrap();
+        std::os::unix::fs::symlink(&a, &b).unwrap();
+        let base = canonical_lock_base(&a);
+        assert_eq!(
+            base.parent(),
+            Some(std::fs::canonicalize(tmp.path()).unwrap().as_path())
+        );
+    }
 
     fn virtual_key_scope() -> VirtualKeyScope {
         VirtualKeyScope {

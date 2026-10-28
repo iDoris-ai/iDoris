@@ -58,8 +58,8 @@ IDORIS_SUBSCRIPTION_CLI=claude \
 
 ## 进程生命周期（由启动器托管时）
 
-- **停止**：`SIGTERM` 与 `SIGINT` 走同一条优雅停机路径（停止接收新连接、收尾订阅运行时），成功时打印 `idoris: 已停止` 并以 0 退出；若 10 秒内未收尾则强制以 1 退出。
-- **单实例**：`idoris serve` 启动时对 `<IDORIS_DB_PATH>.lock` 加独占咨询锁（进程退出由操作系统自动释放，无陈旧锁）。同一数据库已有实例时，在绑定端口前输出 `[idoris] 启动失败：已有 iDoris 实例在使用同一数据库 <path>` 并以退出码 **3** 退出（其他启动失败为 1）。离线的 `idoris key issue` / `idoris admin` 不受该锁影响。
+- **停止**：`SIGTERM` 与 `SIGINT` 走同一条优雅停机路径（停止接收新连接、收尾订阅运行时），成功时打印 `idoris: 已停止` 并以 0 退出；若 10 秒内未收尾则输出 `[idoris] 停止失败：优雅停机超过 10s，强制退出` 并以 1 退出；退出前会销毁异步运行时（最多再等 5 秒）以回收本地 runtime 子进程组，总停机时间上限约 15 秒。
+- **单实例**：`idoris serve` 启动时对 `<IDORIS_DB_PATH>.lock`（路径先经 canonicalize，符号链接别名共用同一把锁）加独占咨询锁（进程退出由操作系统自动释放，无陈旧锁）。同一数据库已有实例时，在绑定端口前输出 `[idoris] 启动失败：已有 iDoris 实例在使用同一数据库 <path>` 并以退出码 **3** 退出（其他启动失败为 1）。离线的 `idoris key issue` / `idoris admin` 不受该锁影响。
 
 ## License
 
