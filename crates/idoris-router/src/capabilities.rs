@@ -177,6 +177,7 @@ fn map_recommendation(
     queue_depth: u64,
 ) -> Vec<CapabilityEntry> {
     let mut entries = Vec::new();
+    let mut blocked_option: Option<HeadroomBreachOption> = None;
     let headroom_option = recommendation
         .headroom_breach_option
         .as_ref()
@@ -200,20 +201,27 @@ fn map_recommendation(
             headroom_breach_option: headroom_option,
         });
     } else if let Some(option) = headroom_option {
-        // No resident fits without the headroom: surface the option as a
-        // blocked resident entry so the caller can still offer it.
-        entries.push(CapabilityEntry {
-            id: option.id.clone(),
-            capability: "reasoning".into(),
-            resident: true,
-            estimated_memory_gb: option.estimated_memory_gb,
-            ctx_limit: option.ctx_limit,
-            queue_depth,
-            admission_status: AdmissionStatus::Blocked,
-            degraded_alternative: None,
-            degraded_alternatives: Some(Vec::new()),
-            headroom_breach_option: Some(option),
-        });
+        // No resident fits without the headroom. Keep ids unique: attach the
+        // option to the model's blocked entry if it has one; drop it if the
+        // model is already a temp entry (usable as is); otherwise surface it
+        // as its own blocked resident entry.
+        if recommendation.blocked.iter().any(|b| b.id == option.id) {
+            blocked_option = Some(option);
+        } else if !recommendation.temp.iter().any(|t| t.id == option.id) {
+            let model = catalog.catalog.iter().find(|model| model.id == option.id);
+            entries.push(CapabilityEntry {
+                id: option.id.clone(),
+                capability: top_capability(model).to_string(),
+                resident: true,
+                estimated_memory_gb: option.estimated_memory_gb,
+                ctx_limit: option.ctx_limit,
+                queue_depth,
+                admission_status: AdmissionStatus::Blocked,
+                degraded_alternative: None,
+                degraded_alternatives: Some(Vec::new()),
+                headroom_breach_option: Some(option),
+            });
+        }
     }
     entries.extend(recommendation.temp.iter().map(|temp| {
         CapabilityEntry {
@@ -251,7 +259,10 @@ fn map_recommendation(
                     .map(alternative_entry)
                     .collect(),
             ),
-            headroom_breach_option: None,
+            headroom_breach_option: blocked_option
+                .as_ref()
+                .filter(|option| option.id == blocked.id)
+                .cloned(),
         }
     }));
     entries
@@ -611,6 +622,98 @@ mod tests {
                 .unwrap()
                 .contains_key("headroom_breach_option")
         );
+    }
+
+    #[test]
+    fn snapshot_ids_stay_unique_and_headroom_option_is_carried_once() {
+        // Small Macs (8/12GB) are where no resident fits and the headroom
+        // option can name a model that is also a temp or blocked entry.
+        let catalog = load_catalog(repo_root().join("config/catalog.yaml")).unwrap();
+        let mut offered = 0;
+        for ram in [8.0, 12.0, 16.0, 24.0, 64.0] {
+            for slots in 0..=3 {
+                let policy = PartialPolicy {
+                    temp_slots: Some(slots),
+                    ..Default::default()
+                };
+                let budgets = std::iter::once(None)
+                    .chain((1..=ram as u64).map(|gb| Some(gb * 1_000_000_000)));
+                for budget in budgets {
+                    let rec =
+                        recommend(&facts(ram), &catalog, Some(&policy), None, budget).unwrap();
+                    let entries = map_recommendation(&rec, &catalog, 0);
+                    let mut ids: Vec<_> = entries.iter().map(|e| e.id.as_str()).collect();
+                    ids.sort_unstable();
+                    let before = ids.len();
+                    ids.dedup();
+                    assert_eq!(
+                        ids.len(),
+                        before,
+                        "duplicate id at {ram}GB/{slots}/{budget:?}"
+                    );
+                    let carriers = entries
+                        .iter()
+                        .filter(|e| e.headroom_breach_option.is_some())
+                        .count();
+                    match &rec.headroom_breach_option {
+                        Some(option)
+                            if rec.resident.is_some()
+                                || !rec.temp.iter().any(|t| t.id == option.id) =>
+                        {
+                            offered += 1;
+                            assert_eq!(carriers, 1, "{ram}GB/{slots}/{budget:?}");
+                        }
+                        _ => assert_eq!(carriers, 0, "{ram}GB/{slots}/{budget:?}"),
+                    }
+                }
+            }
+        }
+        assert!(offered > 0);
+    }
+
+    #[test]
+    fn headroom_option_naming_a_blocked_model_rides_on_that_entry() {
+        // Not produced by today's catalog, but the id must still stay unique:
+        // the option attaches to the existing blocked entry instead.
+        let catalog = load_catalog(repo_root().join("config/catalog.yaml")).unwrap();
+        let policy = PartialPolicy {
+            temp_slots: Some(1),
+            ..Default::default()
+        };
+        let mut rec = recommend(
+            &facts(64.0),
+            &catalog,
+            Some(&policy),
+            None,
+            Some(9_000_000_000),
+        )
+        .unwrap();
+        assert!(rec.resident.is_none());
+        let option_id = rec.headroom_breach_option.as_ref().unwrap().id.clone();
+        let donor = recommend(
+            &facts(64.0),
+            &catalog,
+            Some(&policy),
+            None,
+            Some(16_000_000_000),
+        )
+        .unwrap();
+        let mut blocked = donor.blocked[0].clone();
+        blocked.id = option_id.clone();
+        rec.temp.retain(|t| t.id != option_id);
+        rec.blocked.retain(|b| b.id != option_id);
+        rec.blocked.push(blocked);
+        let json = serde_json::to_value(map_recommendation(&rec, &catalog, 0)).unwrap();
+        let same: Vec<_> = json
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["id"] == option_id.as_str())
+            .collect();
+        assert_eq!(same.len(), 1);
+        assert_eq!(same[0]["admission_status"], "blocked");
+        assert_eq!(same[0]["resident"], false);
+        assert_eq!(same[0]["headroom_breach_option"]["id"], option_id.as_str());
     }
 
     #[test]
