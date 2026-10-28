@@ -44,9 +44,11 @@ pub struct CapabilityEntry {
     /// Only on `blocked` entries (may be `[]`). Absent on all other entries.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub degraded_alternatives: Option<Vec<AlternativeEntry>>,
-    /// Only when the recommender offers it, and then on exactly one entry:
-    /// the resident entry, else the entry already using that model's id,
-    /// else a synthesized blocked resident entry (see `map_recommendation`).
+    /// Only when the recommender offers it, and then on at most one entry:
+    /// the resident entry; else the first blocked entry with that model's id;
+    /// else the first temp entry with that id, unless that temp entry already
+    /// has the same quant (then dropped); else a synthesized blocked resident
+    /// entry (see `map_recommendation`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub headroom_breach_option: Option<HeadroomBreachOption>,
 }
@@ -247,10 +249,9 @@ fn map_recommendation(
             degraded_alternative: (temp.status == TempStatus::RequiresEviction)
                 .then(|| temp.degraded_alternative.as_ref().map(alternative_entry)),
             degraded_alternatives: None,
-            headroom_breach_option: temp_option
-                .as_ref()
-                .filter(|option| option.id == temp.id)
-                .cloned(),
+            // `take`: the recommender can list one model once per capability;
+            // only the first such entry carries the option.
+            headroom_breach_option: temp_option.take_if(|option| option.id == temp.id),
         }
     }));
     entries.extend(recommendation.blocked.iter().map(|blocked| {
@@ -271,10 +272,7 @@ fn map_recommendation(
                     .map(alternative_entry)
                     .collect(),
             ),
-            headroom_breach_option: blocked_option
-                .as_ref()
-                .filter(|option| option.id == blocked.id)
-                .cloned(),
+            headroom_breach_option: blocked_option.take_if(|option| option.id == blocked.id),
         }
     }));
     entries
@@ -714,7 +712,7 @@ mod tests {
         blocked.id = option_id.clone();
         rec.temp.retain(|t| t.id != option_id);
         rec.blocked.retain(|b| b.id != option_id);
-        rec.blocked.push(blocked);
+        rec.blocked.push(blocked.clone());
         let json = serde_json::to_value(map_recommendation(&rec, &catalog, 0)).unwrap();
         let same: Vec<_> = json
             .as_array()
@@ -726,6 +724,23 @@ mod tests {
         assert_eq!(same[0]["admission_status"], "blocked");
         assert_eq!(same[0]["resident"], false);
         assert_eq!(same[0]["headroom_breach_option"]["id"], option_id.as_str());
+
+        // Two blocked entries for the same model: only the first carries it.
+        rec.blocked.push(blocked);
+        let json = serde_json::to_value(map_recommendation(&rec, &catalog, 0)).unwrap();
+        let same: Vec<_> = json
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["id"] == option_id.as_str())
+            .collect();
+        assert_eq!(same.len(), 2);
+        let carriers = same
+            .iter()
+            .filter(|e| e.get("headroom_breach_option").is_some())
+            .count();
+        assert_eq!(carriers, 1);
+        assert!(same[0].get("headroom_breach_option").is_some());
     }
 
     #[test]
@@ -763,6 +778,9 @@ mod tests {
             let mut temp = donor.temp[0].clone();
             temp.id = option.id.clone();
             temp.quant.label = label.to_string();
+            rec.temp.push(temp.clone());
+            // Same model listed for a second capability must not carry it twice.
+            temp.capability = idoris_contracts::common::Capability::Vision;
             rec.temp.push(temp);
             let json = serde_json::to_value(map_recommendation(&rec, &catalog, 0)).unwrap();
             let same: Vec<_> = json
@@ -771,8 +789,14 @@ mod tests {
                 .iter()
                 .filter(|e| e["id"] == option.id.as_str())
                 .collect();
-            assert_eq!(same.len(), 1, "{label}");
-            assert_eq!(same[0]["resident"], false, "{label}");
+            assert_eq!(same.len(), 2, "{label}");
+            let carriers = json
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|e| e.get("headroom_breach_option").is_some())
+                .count();
+            assert_eq!(carriers, usize::from(carried), "{label}");
             assert_eq!(
                 same[0].get("headroom_breach_option").is_some(),
                 carried,
