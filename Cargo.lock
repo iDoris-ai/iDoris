@@ -1152,7 +1152,7 @@ dependencies = [
 
 [[package]]
 name = "idoris-backend"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "idoris-contracts",
@@ -1165,7 +1165,7 @@ dependencies = [
 
 [[package]]
 name = "idoris-contracts"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "jsonschema",
  "serde",
@@ -1174,7 +1174,7 @@ dependencies = [
 
 [[package]]
 name = "idoris-policy"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "idoris-contracts",
  "proptest",
@@ -1183,7 +1183,7 @@ dependencies = [
 
 [[package]]
 name = "idoris-recommender"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "idoris-contracts",
  "idoris-policy",
@@ -1194,7 +1194,7 @@ dependencies = [
 
 [[package]]
 name = "idoris-router"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -1226,7 +1226,7 @@ dependencies = [
 
 [[package]]
 name = "idoris-tenancy"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "chrono",
  "chrono-tz",
@@ -1242,7 +1242,7 @@ dependencies = [
 
 [[package]]
 name = "idoris-upstream"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "futures-core",

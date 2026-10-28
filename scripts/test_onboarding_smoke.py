@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Pin v0.3.2 release behavior.
+"""Pin v0.4.0 release behavior.
 
 Exercise a release binary in disposable storage, with a loopback HTTP fixture.
 
@@ -196,7 +196,7 @@ def main(binary, late_backend_only=False):
             env['IDORIS_COMPONENTS_DIR'] = str(components)
             with server(binary, root, env, token):
                 health = json.loads(request(base + '/health')[2])
-                assert health['version'] == '0.3.2', health
+                assert health['version'] == '0.4.0', health
                 assert request(base + '/v1/chat/completions', body={'model': 'm', 'messages': []})[0] == 401
                 assert json.loads(request(base + '/v1/models', key)[2])['data'] == []
                 assert request(admin + '/admin/api/v1/status')[0] == 401
