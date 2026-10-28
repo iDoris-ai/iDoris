@@ -57,6 +57,9 @@ pub const REASON_FITS_WITHOUT_EVICTION: &str = "fits_without_eviction";
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct AlternativeEntry {
     pub id: String,
+    /// The capability this fallback covers. A blocked model can need several
+    /// capabilities, each with its own fallback.
+    pub capability: &'static str,
     pub estimated_memory_gb: f64,
     pub quant: String,
     pub reason: &'static str,
@@ -65,6 +68,9 @@ pub struct AlternativeEntry {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct HeadroomBreachOption {
     pub id: String,
+    /// Quant label; the option can be the current resident model at a
+    /// higher-precision quant, so `id` alone does not identify it.
+    pub quant: String,
     pub estimated_memory_gb: f64,
     pub ctx_limit: u64,
 }
@@ -72,6 +78,7 @@ pub struct HeadroomBreachOption {
 fn alternative_entry(alt: &TempAlternative) -> AlternativeEntry {
     AlternativeEntry {
         id: alt.id.clone(),
+        capability: capability_name(alt.capability),
         estimated_memory_gb: round_gb(alt.quant.footprint_gb),
         quant: alt.quant.label.clone(),
         reason: REASON_FITS_WITHOUT_EVICTION,
@@ -170,6 +177,15 @@ fn map_recommendation(
     queue_depth: u64,
 ) -> Vec<CapabilityEntry> {
     let mut entries = Vec::new();
+    let headroom_option = recommendation
+        .headroom_breach_option
+        .as_ref()
+        .map(|option| HeadroomBreachOption {
+            id: option.id.clone(),
+            quant: option.label.clone(),
+            estimated_memory_gb: round_gb(option.footprint_gb),
+            ctx_limit: option.ctx,
+        });
     if let Some(resident) = &recommendation.resident {
         entries.push(CapabilityEntry {
             id: resident.id.clone(),
@@ -181,14 +197,22 @@ fn map_recommendation(
             admission_status: AdmissionStatus::Ready,
             degraded_alternative: None,
             degraded_alternatives: None,
-            headroom_breach_option: recommendation
-                .headroom_breach_option
-                .as_ref()
-                .map(|option| HeadroomBreachOption {
-                    id: option.id.clone(),
-                    estimated_memory_gb: round_gb(option.footprint_gb),
-                    ctx_limit: option.ctx,
-                }),
+            headroom_breach_option: headroom_option,
+        });
+    } else if let Some(option) = headroom_option {
+        // No resident fits without the headroom: surface the option as a
+        // blocked resident entry so the caller can still offer it.
+        entries.push(CapabilityEntry {
+            id: option.id.clone(),
+            capability: "reasoning".into(),
+            resident: true,
+            estimated_memory_gb: option.estimated_memory_gb,
+            ctx_limit: option.ctx_limit,
+            queue_depth,
+            admission_status: AdmissionStatus::Blocked,
+            degraded_alternative: None,
+            degraded_alternatives: Some(Vec::new()),
+            headroom_breach_option: Some(option),
         });
     }
     entries.extend(recommendation.temp.iter().map(|temp| {
@@ -521,8 +545,9 @@ mod tests {
         assert_eq!(alt["id"], "nanbeige4.2-3b");
         assert_eq!(alt["estimated_memory_gb"], 4.78);
         assert_eq!(alt["quant"], "q4_k_m");
+        assert_eq!(alt["capability"], "coding");
         assert_eq!(alt["reason"], "fits_without_eviction");
-        assert_eq!(alt.len(), 4);
+        assert_eq!(alt.len(), 5);
         assert!(!with_alt.contains_key("degraded_alternatives"));
         assert!(!with_alt.contains_key("headroom_breach_option"));
 
@@ -542,6 +567,7 @@ mod tests {
         assert_eq!(alts[0]["id"], "nanbeige4.2-3b");
         assert_eq!(alts[0]["estimated_memory_gb"], 4.78);
         assert_eq!(alts[0]["quant"], "q4_k_m");
+        assert_eq!(alts[0]["capability"], "coding");
         assert_eq!(alts[0]["reason"], "fits_without_eviction");
         assert!(!with_alt.contains_key("degraded_alternative"));
         assert!(!with_alt.contains_key("headroom_breach_option"));
@@ -564,9 +590,10 @@ mod tests {
             .unwrap();
         let option = resident["headroom_breach_option"].as_object().unwrap();
         assert_eq!(option["id"], "qwen3-8b");
+        assert!(option["quant"].is_string());
         assert_eq!(option["estimated_memory_gb"], 7.92);
         assert!(option["ctx_limit"].as_u64().unwrap() > 0);
-        assert_eq!(option.len(), 3);
+        assert_eq!(option.len(), 4);
         assert!(!resident.contains_key("degraded_alternative"));
         assert!(!resident.contains_key("degraded_alternatives"));
 
@@ -584,6 +611,79 @@ mod tests {
                 .unwrap()
                 .contains_key("headroom_breach_option")
         );
+    }
+
+    #[test]
+    fn each_alternative_carries_its_own_capability() {
+        // A blocked model can get one fallback per needed capability; the
+        // wire must not collapse them onto the parent entry's capability.
+        let catalog = load_catalog(repo_root().join("config/catalog.yaml")).unwrap();
+        let policy = PartialPolicy {
+            temp_slots: Some(1),
+            ..Default::default()
+        };
+        let mut rec = recommend(
+            &facts(64.0),
+            &catalog,
+            Some(&policy),
+            None,
+            Some(16_000_000_000),
+        )
+        .unwrap();
+        let blocked = rec
+            .blocked
+            .iter_mut()
+            .find(|b| !b.degraded_alternatives.is_empty())
+            .unwrap();
+        let mut vision = blocked.degraded_alternatives[0].clone();
+        vision.capability = idoris_contracts::common::Capability::Vision;
+        blocked.degraded_alternatives.push(vision);
+        let id = blocked.id.clone();
+        let json = serde_json::to_value(map_recommendation(&rec, &catalog, 0)).unwrap();
+        let caps: Vec<_> = entry(&json, &id)["degraded_alternatives"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a["capability"].clone())
+            .collect();
+        assert_eq!(caps, ["coding", "vision"]);
+    }
+
+    #[tokio::test]
+    async fn headroom_option_quant_distinguishes_same_model_upgrade() {
+        // 15GB: the option is the resident model itself at a larger quant.
+        let json = choice_json(15).await;
+        let resident = json
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["resident"] == true)
+            .unwrap();
+        let option = &resident["headroom_breach_option"];
+        assert_eq!(option["id"], resident["id"]);
+        assert!(option["estimated_memory_gb"].as_f64() > resident["estimated_memory_gb"].as_f64());
+        assert_eq!(option["quant"], "q6_k");
+    }
+
+    #[tokio::test]
+    async fn headroom_option_without_resident_is_a_blocked_resident_entry() {
+        // 9GB: nothing fits as resident without spending the headroom.
+        let json = choice_json(9).await;
+        let residents: Vec<_> = json
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["resident"] == true)
+            .collect();
+        assert_eq!(residents.len(), 1);
+        let entry = residents[0];
+        assert_eq!(entry["admission_status"], "blocked");
+        assert_eq!(entry["degraded_alternatives"], serde_json::json!([]));
+        let option = &entry["headroom_breach_option"];
+        assert_eq!(option["id"], "nanbeige4.2-3b");
+        assert_eq!(option["quant"], "q4_k_m");
+        assert_eq!(entry["id"], option["id"]);
+        assert_eq!(entry["estimated_memory_gb"], option["estimated_memory_gb"]);
     }
 
     #[tokio::test]
