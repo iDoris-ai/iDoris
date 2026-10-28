@@ -2,7 +2,7 @@
 
 use std::ffi::OsString;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
     Serve(ServeOptions),
     Admin(AdminCommand),
@@ -45,12 +45,14 @@ pub struct AdminOptions {
     pub token_stdin: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KeyCommand {
     Issue,
+    List,
+    Revoke(String),
 }
 
-const USAGE: &str = "用法: idoris [serve [--admin-token-stdin]] | idoris admin <status|backends|models|roles|runtimes> --token-stdin | idoris key issue --spec-stdin";
+const USAGE: &str = "用法: idoris [serve [--admin-token-stdin]] | idoris admin <status|backends|models|roles|runtimes> --token-stdin | idoris key issue --spec-stdin | idoris key list | idoris key revoke <key_id>";
 
 pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Command, String> {
     let args = args.into_iter().collect::<Vec<_>>();
@@ -79,6 +81,12 @@ pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Command, S
         [key, issue, option] if key == "key" && issue == "issue" && option == "--spec-stdin" => {
             Ok(Command::Key(KeyCommand::Issue))
         }
+        [key, list] if key == "key" && list == "list" => Ok(Command::Key(KeyCommand::List)),
+        [key, revoke, key_id] if key == "key" && revoke == "revoke" => key_id
+            .to_str()
+            .filter(|id| crate::key_manage::valid_key_id(id))
+            .map(|id| Command::Key(KeyCommand::Revoke(id.to_string())))
+            .ok_or_else(|| USAGE.to_string()),
         _ => Err(USAGE.to_string()),
     }
 }
@@ -149,6 +157,28 @@ mod tests {
             .unwrap(),
             Command::Key(KeyCommand::Issue)
         );
+        assert_eq!(
+            parse_args([OsString::from("key"), OsString::from("list")]).unwrap(),
+            Command::Key(KeyCommand::List)
+        );
+        let id = format!("vk_{}", "a".repeat(32));
+        assert_eq!(
+            parse_args(["key", "revoke", id.as_str()].map(OsString::from)).unwrap(),
+            Command::Key(KeyCommand::Revoke(id.clone()))
+        );
+        for bad in [
+            vec!["key", "list", "extra"],
+            vec!["key", "revoke"],
+            vec!["key", "revoke", "vk_short"],
+            vec!["key", "revoke", "../etc"],
+            vec!["key", "revoke", "VK_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"],
+            vec!["key", "revoke", id.as_str(), "extra"],
+        ] {
+            assert_eq!(
+                parse_args(bad.into_iter().map(OsString::from)).unwrap_err(),
+                USAGE
+            );
+        }
         assert_eq!(AdminResource::Status.path(), "status");
         assert_eq!(AdminResource::Backends.path(), "backends");
         assert_eq!(AdminResource::Models.path(), "models");

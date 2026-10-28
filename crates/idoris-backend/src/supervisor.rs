@@ -129,6 +129,8 @@ enum Command {
         id: String,
         memory_gb: f64,
         policy: LoadPolicy,
+        /// Per-request: this load may use the allocation's reserved headroom.
+        allow_headroom_breach: bool,
         reply: LoadReply,
     },
     Unload {
@@ -226,6 +228,8 @@ enum ActiveKind {
         /// first, since the eviction plan (and therefore the outcome
         /// either caller can trust) was built against only one of them.
         memory_gb: f64,
+        /// Joined only by requests with the same confirmation (see `handle_load`).
+        allow_headroom_breach: bool,
         waiters: Vec<LoadReply>,
     },
     Unload {
@@ -321,11 +325,24 @@ impl SupervisorHandle {
         memory_gb: f64,
         policy: LoadPolicy,
     ) -> Result<(), BackendError> {
+        self.load_with_headroom(id, memory_gb, policy, false).await
+    }
+
+    /// [`Self::load`], where `allow_headroom_breach` lets this one load use
+    /// the shared ledger's reserved headroom. Nothing is remembered.
+    pub async fn load_with_headroom(
+        &self,
+        id: impl Into<String>,
+        memory_gb: f64,
+        policy: LoadPolicy,
+        allow_headroom_breach: bool,
+    ) -> Result<(), BackendError> {
         let (reply, rx) = oneshot::channel();
         self.send(ActorMsg::Cmd(Command::Load {
             id: id.into(),
             memory_gb,
             policy,
+            allow_headroom_breach,
             reply,
         }))
         .await?;
@@ -1061,6 +1078,7 @@ impl Env<'_> {
         &mut self,
         planned_gb: f64,
         planned_charge: Option<CapacityCharge>,
+        allow_headroom_breach: bool,
     ) -> Result<(), BackendError> {
         let Some(tracking) = self.runtime_capacity.as_mut() else {
             return Ok(());
@@ -1069,9 +1087,12 @@ impl Env<'_> {
             let planned = planned_charge
                 .ok_or_else(|| BackendError::invariant_violation("missing exact load charge"))?;
             let next = current.max(planned);
-            tracking
-                .ledger
-                .claim_charge(&tracking.allocation_key, current, planned)?;
+            tracking.ledger.claim_charge(
+                &tracking.allocation_key,
+                current,
+                planned,
+                allow_headroom_breach,
+            )?;
             tracking.exact_claim = Some(next);
             return Ok(());
         }
@@ -1374,10 +1395,12 @@ fn start_load(
 /// funnels through (§4), now backed by [`plan_eviction`] for a real
 /// capacity check; no queueing yet — a different id than the active op
 /// fails fast with `BackendError::Busy`.
+#[allow(clippy::too_many_arguments)]
 fn handle_load(
     id: String,
     memory_gb: f64,
     policy: LoadPolicy,
+    allow_headroom_breach: bool,
     reply: LoadReply,
     models: &mut HashMap<String, ModelSlot>,
     active_op: &mut Option<ActiveOp>,
@@ -1400,12 +1423,23 @@ fn handle_load(
         if let ActiveKind::Load {
             policy: active_policy,
             memory_gb: active_memory_gb,
+            allow_headroom_breach: active_allow_breach,
             waiters,
         } = &mut active.kind
             && *active_policy == policy
             && *active_memory_gb == memory_gb
         {
-            waiters.push(reply);
+            // A joiner must not inherit another request's confirmation, nor
+            // lend its own to a load admitted without it.
+            if *active_allow_breach == allow_headroom_breach {
+                waiters.push(reply);
+            } else {
+                let _ = reply.send(Err(BackendError::busy(
+                    "another request is loading this model with a different headroom confirmation; retry shortly",
+                    Some(id.clone()),
+                    None,
+                )));
+            }
         } else {
             let _ = reply.send(Err(BackendError::busy(
                 "a load for this id with a different policy or memory_gb is already in flight",
@@ -1532,7 +1566,8 @@ fn handle_load(
             return;
         }
     };
-    if let Err(err) = env.claim_runtime_capacity(planned_gb, planned_charge) {
+    if let Err(err) = env.claim_runtime_capacity(planned_gb, planned_charge, allow_headroom_breach)
+    {
         let err = match load_fence.clear() {
             Ok(()) => err,
             Err(clear_err) => clear_err,
@@ -1575,6 +1610,7 @@ fn handle_load(
         kind: ActiveKind::Load {
             policy,
             memory_gb,
+            allow_headroom_breach,
             waiters: vec![reply],
         },
     });
@@ -1986,6 +2022,7 @@ async fn run_actor(
                 id,
                 memory_gb,
                 policy,
+                allow_headroom_breach,
                 reply,
             }) => {
                 if let Some(err) = &env.startup_error {
@@ -1996,6 +2033,7 @@ async fn run_actor(
                     id,
                     memory_gb,
                     policy,
+                    allow_headroom_breach,
                     reply,
                     &mut models,
                     &mut active_op,

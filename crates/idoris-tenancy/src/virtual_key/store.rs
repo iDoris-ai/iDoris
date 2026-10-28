@@ -151,6 +151,51 @@ impl VirtualKeyStore {
     }
 }
 
+/// Management view of one stored key. Never carries the verifier hash.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VirtualKeyRecord {
+    pub key_id: String,
+    pub scope: VirtualKeyScope,
+    pub revoked_at_ms: Option<i64>,
+}
+
+impl VirtualKeyStore {
+    /// Lists all keys in insertion order (rowid; creation time is not stored).
+    pub fn list(&self) -> Result<Vec<VirtualKeyRecord>, VirtualKeyStoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT key_id, owner, tenant_id, allowed_privacy, allowed_roles, budget_ref,
+                    expires_at_ms, admin_scopes, revoked_at_ms
+             FROM virtual_keys ORDER BY rowid, key_id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                (
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                ),
+                row.get::<_, Option<i64>>(8)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (raw, revoked_at_ms) = row?;
+            let key = raw_to_identity(raw)?;
+            out.push(VirtualKeyRecord {
+                key_id: key.key_id,
+                scope: key.scope,
+                revoked_at_ms,
+            });
+        }
+        Ok(out)
+    }
+}
+
 type RawVirtualKey = (
     String,
     String,
@@ -258,6 +303,35 @@ mod tests {
             expires_at_ms,
             admin_scopes: Vec::new(),
         }
+    }
+
+    #[test]
+    fn opened_store_waits_for_a_concurrent_writer_instead_of_failing() {
+        // Offline key commands open the DB while `idoris serve` may be writing.
+        // rusqlite's `Connection::open` sets a 5s busy timeout; this pins that
+        // they wait instead of failing at once with `database is locked`.
+        let path = std::env::temp_dir().join(format!(
+            "idoris-virtual-key-busy-{}.sqlite3",
+            uuid::Uuid::new_v4().simple()
+        ));
+        drop(VirtualKeyStore::open(&path).unwrap());
+        let mut holder = Connection::open(&path).unwrap();
+        let tx = holder
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        let writer = {
+            let path = path.clone();
+            std::thread::spawn(move || {
+                let store = VirtualKeyStore::open(&path).unwrap();
+                let minted = MintedVirtualKey::mint();
+                store.insert_active(&minted.key_id, minted.hash, &scope(None))
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        tx.commit().unwrap();
+        writer.join().unwrap().unwrap();
+        drop(holder);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

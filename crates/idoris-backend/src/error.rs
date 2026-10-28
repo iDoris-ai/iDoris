@@ -80,6 +80,14 @@ pub enum BackendError {
     #[error("out of memory while loading {model_id}")]
     Oom { model_id: String },
 
+    /// The load fits the allocated budget only by using the reserved headroom,
+    /// which the caller has not confirmed for this request. An admission
+    /// refusal, not a fault: nothing was loaded or evicted.
+    #[error(
+        "loading {model_id} needs the reserved memory headroom; explicit confirmation required"
+    )]
+    HeadroomConfirmationRequired { model_id: String },
+
     /// A `RuntimeAdapter::probe_ready` polling loop exhausted its attempt
     /// budget without observing the model become ready.
     #[error("timed out waiting for {model_id} to become ready")]
@@ -218,6 +226,7 @@ impl BackendError {
             BackendError::EvictionImpossible { .. } => "eviction_impossible",
             BackendError::EvictionFailed { .. } => "eviction_failed",
             BackendError::Oom { .. } => "oom",
+            BackendError::HeadroomConfirmationRequired { .. } => "headroom_confirmation_required",
             BackendError::ProbeTimedOut { .. } => "probe_timed_out",
             BackendError::AdapterTimedOut { .. } => "adapter_timed_out",
             BackendError::AdapterPanicked { .. } => "adapter_panicked",
@@ -280,6 +289,12 @@ impl BackendError {
 
     pub fn oom(model_id: impl Into<String>) -> Self {
         Self::Oom {
+            model_id: model_id.into(),
+        }
+    }
+
+    pub fn headroom_confirmation_required(model_id: impl Into<String>) -> Self {
+        Self::HeadroomConfirmationRequired {
             model_id: model_id.into(),
         }
     }

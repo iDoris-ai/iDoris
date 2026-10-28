@@ -65,6 +65,7 @@ pub mod host_facts;
 /// Offline, local-only virtual-key issuance. Plaintext is returned once to
 /// the caller and is never persisted.
 pub mod key_issue;
+pub mod key_manage;
 /// Stable four-way routing/audit reason taxonomy.
 pub mod reason;
 /// Persistent record/budget storage bootstrap (B1 task18).
@@ -125,6 +126,7 @@ const HEADER_SERVED_LOCALITY: &str = "X-iDoris-Served-Locality";
 const HEADER_REASON: &str = "X-iDoris-Reason";
 const HEADER_DEGRADED: &str = "X-iDoris-Degraded";
 const HEADER_COST_MINOR: &str = "X-iDoris-Cost-Minor";
+const HEADER_HEADROOM_BREACH: &str = "x-idoris-headroom-breach";
 const HEADER_REQUEST_ID: &str = "x-idoris-request-id";
 const HEADER_SESSION: &str = "x-idoris-session";
 const HEADER_CACHED: &str = "X-iDoris-Cached";
@@ -1912,6 +1914,19 @@ fn locality_str(locality: idoris_contracts::provider::Locality) -> &'static str 
 /// `reason_code()` for diagnostics and — critically — still setting
 /// `X-iDoris-Served-Locality`, since a candidate genuinely was selected.
 fn backend_error_response(err: &BackendError, outcome: &dispatch::ChatOutcome) -> Response {
+    // Same status as every other lifecycle admission refusal, but a distinct
+    // type so the caller knows to ask the user instead of giving up.
+    if matches!(err, BackendError::HeadroomConfirmationRequired { .. }) {
+        let mut response = error_envelope_with_reason(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "headroom_confirmation_required",
+            err.reason_code(),
+            "This request needs the reserved memory headroom. Ask the user to confirm, \
+             then retry it with the header `X-iDoris-Headroom-Breach: confirmed`.",
+        );
+        apply_decision_headers(&mut response, outcome);
+        return response;
+    }
     let mut response = error_envelope_with_reason(
         StatusCode::SERVICE_UNAVAILABLE,
         "local_only_unavailable",
@@ -1954,6 +1969,17 @@ fn budget_error_response(err: &BudgetError, outcome: &dispatch::ChatOutcome) -> 
     };
     apply_decision_headers(&mut response, outcome);
     response
+}
+
+/// Per-request override for `POST /v1/chat/completions` only: exactly one
+/// header value, exactly `confirmed` (ASCII case-insensitive). Anything else
+/// counts as absent; nothing is remembered between requests.
+fn headroom_breach_confirmed(headers: &HeaderMap) -> bool {
+    let mut values = headers.get_all(HEADER_HEADROOM_BREACH).iter();
+    matches!(
+        (values.next(), values.next()),
+        (Some(value), None) if value.as_bytes().eq_ignore_ascii_case(b"confirmed")
+    )
 }
 
 fn dispatch_failure_response(
@@ -2901,6 +2927,7 @@ async fn chat_completions(
                 budget_settled_event_context.as_ref(),
             )
             .with_native(&native)
+            .with_headroom_breach_confirmed(headroom_breach_confirmed(&headers))
             .with_provider_admission(state.proxy.as_ref()),
             &parsed,
             dispatch::DispatchInput::with_model(model, &prompt).with_affinity(affinity_key),
