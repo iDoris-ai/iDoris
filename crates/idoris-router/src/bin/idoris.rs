@@ -67,6 +67,25 @@ async fn main() {
                 std::process::exit(1);
             }
         }
+        cli::Command::SetupOmlx(options) => {
+            let outcome = match options.api_key_stdin {
+                true => {
+                    idoris_router::setup_omlx::read_api_key(&mut std::io::stdin().lock()).map(Some)
+                }
+                false => Ok(None),
+            };
+            let outcome = match outcome {
+                Ok(key) => idoris_router::setup_omlx::run(&options, key.as_deref()).await,
+                Err(error) => Err(error),
+            };
+            match outcome {
+                Ok(report) => println!("{report}"),
+                Err(error) => {
+                    println!("{}", error.to_json());
+                    std::process::exit(1);
+                }
+            }
+        }
         cli::Command::Key(cli::KeyCommand::Issue) => {
             if let Err(message) = issue_virtual_key() {
                 eprintln!("[idoris] {message}");

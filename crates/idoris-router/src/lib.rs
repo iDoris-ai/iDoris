@@ -12,6 +12,9 @@ pub mod profile;
 /// Packaged binary command-line parsing.
 pub mod cli;
 
+/// `idoris setup omlx`: offline oMLX probe + validated components-dir writer.
+pub mod setup_omlx;
+
 /// Offline intent embedding primitives (B1 task 09).
 pub mod intent;
 
