@@ -2,7 +2,7 @@
 
 > **文档修订 1.3，2026-10-28**：owner 要求 Agent24 桌面端一站式「下载 → 运行 → 连接」iDoris，这定下了 R9 的 OD-1（launcher 宿主为 agent24d）和 OD-2（由用户在桌面端同意）。§2.1 第一条随之改写，新增 §2.7（launcher 托管契约，iDoris v0.4.0 起）与 §2.8（wire 契约 1.1.0）。已接受条款以正文为准。
 >
-> **文档修订 1.2，2026-10-15**：将 R0–R8 已接受条款合并到正文，消除“后补章节覆盖前文”的阅读方式；新增的 v0.3.1 范围及 R9 三项决策仍是 **OWNER REVIEW PENDING**，不借文档修订授权实现。
+> **文档修订 1.2，2026-10-15**：将 R0–R8 已接受条款合并到正文，消除“后补章节覆盖前文”的阅读方式；当时新增的 v0.3.1 范围及 R9 三项决策仍是 **OWNER REVIEW PENDING**。（其中 OD-1、OD-2 已由修订 1.3 决定，见 §2.7；fast/daily 标签重标仍待定。）
 > **唯一跨仓规范权威**：本文件。iDoris 主持，Agent24 作为消费者审阅；Agent24 应保留短消费方指针、实现证据及反向硬件权威链接，不复制第二份契约。总体规划的项目里程碑仍见 [总体规划](../iDoris-总体规划.md)。
 
 ## 0. 版本、状态与证据边界
@@ -11,11 +11,11 @@
 
 | 标识 | 含义与基线 |
 |---|---|
-| 文档修订 `1.2` | 本次文字整合；不是服务 wire version，不触发代码或 schema 升级 |
+| 文档修订 `1.3` | 文字修订；不是服务 wire version。wire 契约版本见 §2.8 |
 | iDoris release `v0.3.0` | 实现提交 `03c079c70611331a8c85a1666e32a75df6359d09`（下称 I0） |
 | runtime `contract_version=1.0.1` | I0 的 `crates/idoris-contracts/src/version.rs::CONTRACT_VERSION`；TS `packages/contracts/src/version.ts` 同值 |
 | Agent24 审计基线 | `6072fd373142eb3dbf1a6a4a3222e6eec82c74f6`（下称 A0，固定历史快照，非当前 main）；main 源码状态不等于 stable 已发给用户 |
-| v0.3.1 | 拟议集成目标，尚未发布/验收；本规范不选择未来 wire version 或猜最低 Agent24 release |
+| v0.3.1 / v0.3.2 | 已发布；launcher 托管从 v0.4.0 起，见 §2.7 |
 
 除明确标为“提案/目标”的部分外，正文表达 R0–R8 的既有边界；§4 标明其实现差距。已有 JSON Schema 对它覆盖的 wire 结构是机器真源；未覆盖条款为文字规范，不能声称 schema 已齐全。发生实现差距时须如实失败或显示不可用，不能把目标字段当作当前 API。
 
@@ -228,7 +228,7 @@ agent24d 托管 iDoris 时，按下表执行。表中都是已冻结的接口，
 
 ## 6. R9 与剩余决定
 
-见 [R9 协商提案](negotiation/R9-v1.2-协商提案.md)：launcher 宿主、同意后安装执行方式、fast/daily 标签重标均 **OWNER REVIEW PENDING**。未经决定不新增写 API、下载器、FD framing、角色标签或 M5 consent 机制。v0.3.1 local 子集待双方确认；数据面可以独立于 launcher 推进，完整 readiness 仍需组合与干净环境验收。
+见 [R9 协商提案](negotiation/R9-v1.2-协商提案.md)。launcher 宿主（OD-1：agent24d）和同意后安装执行方式（OD-2：由用户在桌面端同意）已由修订 1.3 决定，契约见 §2.7，以 §2.7 为准；fast/daily 标签重标仍 **OWNER REVIEW PENDING**，未经决定不新增角色标签或 M5 consent 机制。数据面可以独立于 launcher 推进；完整 readiness 仍需组合与干净环境验收。
 
 ## 7. 协商记录（历史原样保留）
 
@@ -243,4 +243,5 @@ agent24d 托管 iDoris 时，按下表执行。表中都是已冻结的接口，
 | R6 | 2026-09-27 | iDoris | jason 提出，iDoris 提议：请求阶段职责划分 S0–S7；统一凭证模块 vault | Agent24 方向同意，提出措辞修订与五个条件 |
 | R7 | 2026-09-27 | 双方 | iDoris 采纳全部措辞修订与条件，并对 J-4、J-2 各加一处限定；Agent24 确认；jason 拍板 J-1…J-8 全部选 (a) | **v1.1** |
 | R8 | 2026-09-27 | Agent24 | 审阅 v1.1：无异议；建议 loopback 免 key 仅作为显式开发者选项，免 key 时视为 local_only | 已采纳，写入 §3.2 |
-| R9 | 2026-10-15 | iDoris | [文档修订 1.2 整合与三个 owner 决策](negotiation/R9-v1.2-协商提案.md)；local_only v0.3.1 最小数据面与 launcher 解耦 | **OWNER REVIEW PENDING**；不是新实现或双方最终同意 |
+| R9 | 2026-10-15 | iDoris | [文档修订 1.2 整合与三个 owner 决策](negotiation/R9-v1.2-协商提案.md)；local_only v0.3.1 最小数据面与 launcher 解耦 | OD-1/OD-2 已由修订 1.3 决定（见 §2.7）；fast/daily 标签重标仍 **OWNER REVIEW PENDING** |
+| R10 | 2026-10-28 | jason / 双方 | 文档修订 1.3：owner 要求 Agent24 桌面端一站式「下载 → 运行 → 连接」，由此定下 OD-1（宿主为 agent24d）、OD-2（用户在桌面端同意）；新增 §2.7 launcher 托管契约（iDoris v0.4.0 起）、§2.8 wire 契约 1.1.0 | Agent24 确认按 §2.7 / §2.8 实现（launcher 设计见 Agent24#1437） |
