@@ -7,6 +7,70 @@ pub enum Command {
     Serve(ServeOptions),
     Admin(AdminCommand),
     Key(KeyCommand),
+    SetupOmlx(SetupOmlxOptions),
+}
+
+/// `idoris setup omlx` — offline probe + components-dir generator.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SetupOmlxOptions {
+    pub endpoint: String,
+    pub out_dir: std::path::PathBuf,
+    /// `(role, model_id)` in command-line order; roles are unique.
+    pub bindings: Vec<(String, String)>,
+    pub load_mode: idoris_contracts::load_policy::LoadMode,
+    pub api_key_stdin: bool,
+    pub force: bool,
+}
+
+fn parse_setup_omlx(args: &[OsString]) -> Result<SetupOmlxOptions, String> {
+    use idoris_contracts::load_policy::LoadMode;
+    let (mut endpoint, mut out_dir, mut load_mode) = (None, None, None);
+    let (mut bindings, mut api_key_stdin, mut force) = (Vec::new(), false, false);
+    let mut it = args.iter();
+    while let Some(flag) = it.next() {
+        let flag = flag.to_str().ok_or_else(|| USAGE.to_string())?;
+        match flag {
+            "--api-key-stdin" if !api_key_stdin => api_key_stdin = true,
+            "--force" if !force => force = true,
+            "--endpoint" | "--out-dir" | "--bind" | "--load-mode" => {
+                let value = it.next().ok_or_else(|| USAGE.to_string())?;
+                match flag {
+                    "--endpoint" if endpoint.is_none() => {
+                        endpoint = Some(value.to_str().ok_or(USAGE)?.to_string())
+                    }
+                    "--out-dir" if out_dir.is_none() => out_dir = Some(value.into()),
+                    "--load-mode" if load_mode.is_none() => {
+                        load_mode = Some(match value.to_str() {
+                            Some("on_demand") => LoadMode::OnDemand,
+                            Some("resident") => LoadMode::Resident,
+                            _ => return Err(USAGE.to_string()),
+                        })
+                    }
+                    "--bind" => {
+                        let (role, model) = value
+                            .to_str()
+                            .and_then(|v| v.split_once('='))
+                            .filter(|(r, m)| !r.is_empty() && !m.is_empty())
+                            .ok_or_else(|| USAGE.to_string())?;
+                        if bindings.iter().any(|(r, _): &(String, String)| r == role) {
+                            return Err(USAGE.to_string());
+                        }
+                        bindings.push((role.to_string(), model.to_string()));
+                    }
+                    _ => return Err(USAGE.to_string()),
+                }
+            }
+            _ => return Err(USAGE.to_string()),
+        }
+    }
+    Ok(SetupOmlxOptions {
+        endpoint: endpoint.ok_or_else(|| USAGE.to_string())?,
+        out_dir: out_dir.ok_or_else(|| USAGE.to_string())?,
+        bindings,
+        load_mode: load_mode.unwrap_or(LoadMode::OnDemand),
+        api_key_stdin,
+        force,
+    })
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -52,7 +116,7 @@ pub enum KeyCommand {
     Revoke(String),
 }
 
-const USAGE: &str = "用法: idoris [serve [--admin-token-stdin]] | idoris admin <status|backends|models|roles|runtimes> --token-stdin | idoris key issue --spec-stdin | idoris key list | idoris key revoke <key_id>";
+const USAGE: &str = "用法: idoris [serve [--admin-token-stdin]] | idoris admin <status|backends|models|roles|runtimes> --token-stdin | idoris key issue --spec-stdin | idoris key list | idoris key revoke <key_id> | idoris setup omlx --endpoint <url> --out-dir <dir> [--bind <role>=<model>]... [--load-mode on_demand|resident] [--api-key-stdin] [--force]";
 
 pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Command, String> {
     let args = args.into_iter().collect::<Vec<_>>();
@@ -87,6 +151,9 @@ pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Command, S
             .filter(|id| crate::key_manage::valid_key_id(id))
             .map(|id| Command::Key(KeyCommand::Revoke(id.to_string())))
             .ok_or_else(|| USAGE.to_string()),
+        [setup, omlx, rest @ ..] if setup == "setup" && omlx == "omlx" => {
+            parse_setup_omlx(rest).map(Command::SetupOmlx)
+        }
         _ => Err(USAGE.to_string()),
     }
 }
@@ -220,6 +287,83 @@ mod tests {
             ],
         ] {
             assert_eq!(parse_args(args).unwrap_err(), USAGE);
+        }
+    }
+
+    fn setup(args: &[&str]) -> Result<SetupOmlxOptions, String> {
+        let mut all = vec![OsString::from("setup"), OsString::from("omlx")];
+        all.extend(args.iter().map(OsString::from));
+        match parse_args(all)? {
+            Command::SetupOmlx(options) => Ok(options),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_setup_omlx_flags_and_rejects_bad_forms() {
+        use idoris_contracts::load_policy::LoadMode;
+        let ok = setup(&[
+            "--endpoint",
+            "http://127.0.0.1:8088",
+            "--out-dir",
+            "o",
+            "--bind",
+            "daily=a=b",
+            "--bind",
+            "fast=m",
+            "--load-mode",
+            "resident",
+            "--api-key-stdin",
+            "--force",
+        ])
+        .unwrap();
+        assert_eq!(ok.endpoint, "http://127.0.0.1:8088");
+        assert_eq!(
+            ok.bindings,
+            [("daily".into(), "a=b".into()), ("fast".into(), "m".into())]
+        );
+        assert_eq!(ok.load_mode, LoadMode::Resident);
+        assert!(ok.api_key_stdin && ok.force);
+        let min = setup(&["--endpoint", "e", "--out-dir", "o"]).unwrap();
+        assert_eq!(min.load_mode, LoadMode::OnDemand);
+        assert!(min.bindings.is_empty() && !min.api_key_stdin && !min.force);
+        for bad in [
+            vec!["--out-dir", "o"],
+            vec!["--endpoint", "e"],
+            vec!["--endpoint", "e", "--out-dir", "o", "--nope"],
+            vec![
+                "--endpoint",
+                "e",
+                "--out-dir",
+                "o",
+                "--bind",
+                "daily=a",
+                "--bind",
+                "daily=b",
+            ],
+            vec!["--endpoint", "e", "--out-dir", "o", "--bind", "daily"],
+            vec!["--endpoint", "e", "--out-dir", "o", "--bind", "=m"],
+            vec!["--endpoint", "e", "--endpoint", "f", "--out-dir", "o"],
+            vec![
+                "--endpoint",
+                "e",
+                "--out-dir",
+                "o",
+                "--load-mode",
+                "evict_to_load",
+            ],
+            vec![
+                "--endpoint",
+                "e",
+                "--out-dir",
+                "o",
+                "--api-key-stdin",
+                "--api-key-stdin",
+            ],
+            vec!["--endpoint", "e", "--out-dir"],
+            vec!["--endpoint", "e", "--out-dir", "o", "--api-key", "secret"],
+        ] {
+            assert_eq!(setup(&bad).unwrap_err(), USAGE, "{bad:?}");
         }
     }
 }
