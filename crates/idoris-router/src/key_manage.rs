@@ -139,6 +139,15 @@ mod tests {
             let json: serde_json::Value = serde_json::from_slice(&out).unwrap();
             assert_eq!(json["keys"][0]["status"], want);
         }
+        // Revoking an already-expired key (the common launcher cleanup) must
+        // report `revoked`, not `expired`.
+        let mut sink = Vec::new();
+        revoke(&store, &minted.key_id, &mut sink).unwrap();
+        let mut out = Vec::new();
+        list_at(&store, &mut out, 2000).unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(json["keys"][0]["status"], "revoked");
+        let mut out = Vec::new();
         let err = revoke(&store, &format!("vk_{}", "a".repeat(32)), &mut out).unwrap_err();
         assert!(err.contains("未找到"));
     }

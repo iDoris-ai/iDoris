@@ -44,7 +44,10 @@ pub struct CapabilityEntry {
     /// Only on `blocked` entries (may be `[]`). Absent on all other entries.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub degraded_alternatives: Option<Vec<AlternativeEntry>>,
-    /// Only on the resident entry, and only when the recommender offers it.
+    /// Only when the recommender offers it, and then on at most one entry:
+    /// the resident entry, else the first entry already using that model's
+    /// id, else a synthesized blocked resident entry. Dropped when a temp
+    /// entry already offers the same model and quant (see `map_recommendation`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub headroom_breach_option: Option<HeadroomBreachOption>,
 }
@@ -178,6 +181,7 @@ fn map_recommendation(
 ) -> Vec<CapabilityEntry> {
     let mut entries = Vec::new();
     let mut blocked_option: Option<HeadroomBreachOption> = None;
+    let mut temp_option: Option<HeadroomBreachOption> = None;
     let headroom_option = recommendation
         .headroom_breach_option
         .as_ref()
@@ -207,7 +211,13 @@ fn map_recommendation(
         // as its own blocked resident entry.
         if recommendation.blocked.iter().any(|b| b.id == option.id) {
             blocked_option = Some(option);
-        } else if !recommendation.temp.iter().any(|t| t.id == option.id) {
+        } else if let Some(temp) = recommendation.temp.iter().find(|t| t.id == option.id) {
+            // Same model as a temp entry: the option adds nothing when the
+            // quant matches too; otherwise ride on that entry (ids stay unique).
+            if temp.quant.label != option.quant {
+                temp_option = Some(option);
+            }
+        } else {
             let model = catalog.catalog.iter().find(|model| model.id == option.id);
             entries.push(CapabilityEntry {
                 id: option.id.clone(),
@@ -238,7 +248,9 @@ fn map_recommendation(
             degraded_alternative: (temp.status == TempStatus::RequiresEviction)
                 .then(|| temp.degraded_alternative.as_ref().map(alternative_entry)),
             degraded_alternatives: None,
-            headroom_breach_option: None,
+            // `take`: the recommender can list one model once per capability;
+            // only the first such entry carries the option.
+            headroom_breach_option: temp_option.take_if(|option| option.id == temp.id),
         }
     }));
     entries.extend(recommendation.blocked.iter().map(|blocked| {
@@ -259,10 +271,7 @@ fn map_recommendation(
                     .map(alternative_entry)
                     .collect(),
             ),
-            headroom_breach_option: blocked_option
-                .as_ref()
-                .filter(|option| option.id == blocked.id)
-                .cloned(),
+            headroom_breach_option: blocked_option.take_if(|option| option.id == blocked.id),
         }
     }));
     entries
@@ -714,6 +723,68 @@ mod tests {
         assert_eq!(same[0]["admission_status"], "blocked");
         assert_eq!(same[0]["resident"], false);
         assert_eq!(same[0]["headroom_breach_option"]["id"], option_id.as_str());
+    }
+
+    #[test]
+    fn headroom_option_at_another_quant_of_a_temp_model_rides_on_that_entry() {
+        // A catalog with an extra quant could make the temp entry and the
+        // option the same id at different quants; keep the option, keep ids
+        // unique. Same id and quant: the option adds nothing and is dropped.
+        let catalog = load_catalog(repo_root().join("config/catalog.yaml")).unwrap();
+        let policy = PartialPolicy {
+            temp_slots: Some(1),
+            ..Default::default()
+        };
+        let base = recommend(
+            &facts(64.0),
+            &catalog,
+            Some(&policy),
+            None,
+            Some(9_000_000_000),
+        )
+        .unwrap();
+        assert!(base.resident.is_none());
+        let option = base.headroom_breach_option.clone().unwrap();
+        let donor = recommend(
+            &facts(64.0),
+            &catalog,
+            Some(&policy),
+            None,
+            Some(18_000_000_000),
+        )
+        .unwrap();
+        for (label, carried) in [("q8_0-test", true), (option.label.as_str(), false)] {
+            let mut rec = base.clone();
+            rec.blocked.retain(|b| b.id != option.id);
+            rec.temp.retain(|t| t.id != option.id);
+            let mut temp = donor.temp[0].clone();
+            temp.id = option.id.clone();
+            temp.quant.label = label.to_string();
+            rec.temp.push(temp.clone());
+            // Same model listed for a second capability must not carry it twice.
+            temp.capability = idoris_contracts::common::Capability::Vision;
+            rec.temp.push(temp);
+            let json = serde_json::to_value(map_recommendation(&rec, &catalog, 0)).unwrap();
+            let same: Vec<_> = json
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|e| e["id"] == option.id.as_str())
+                .collect();
+            assert_eq!(same.len(), 2, "{label}");
+            let carriers = json
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|e| e.get("headroom_breach_option").is_some())
+                .count();
+            assert_eq!(carriers, usize::from(carried), "{label}");
+            assert_eq!(
+                same[0].get("headroom_breach_option").is_some(),
+                carried,
+                "{label}"
+            );
+        }
     }
 
     #[test]
