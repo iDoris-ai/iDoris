@@ -86,6 +86,55 @@ pub fn open_virtual_key_store_process() -> Result<VirtualKeyStore, String> {
         .map_err(|err| format!("无法打开虚拟 key 数据库 \"{}\"：{err}", db_path.display()))
 }
 
+/// Why [`acquire_instance_lock`] failed.
+#[derive(Debug)]
+pub enum InstanceLockError {
+    /// Another `idoris serve` already holds the lock for this database.
+    Held(PathBuf),
+    /// DB path/dir problem; storage bootstrap reports the same failure with
+    /// its established error precedence, so the caller may defer to it.
+    Deferred(String),
+    /// Lock file unusable: startup must fail.
+    Other(String),
+}
+
+/// Takes an exclusive OS advisory lock on `<db_path>.lock` for the whole
+/// process lifetime (the caller keeps the returned file alive). The kernel
+/// releases it on any exit, including a crash, so there is no stale-lock
+/// state. `File` is opened close-on-exec, so spawned runtimes never inherit it.
+pub fn acquire_instance_lock() -> Result<std::fs::File, InstanceLockError> {
+    let db_path = process_db_path().map_err(InstanceLockError::Deferred)?;
+    if let Some(parent) = db_path.parent().filter(|path| !path.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent).map_err(|err| {
+            InstanceLockError::Deferred(format!(
+                "无法创建数据库目录 \"{}\"：{err}",
+                parent.display()
+            ))
+        })?;
+    }
+    let mut lock_path = db_path.clone().into_os_string();
+    lock_path.push(".lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)
+        .map_err(|err| {
+            InstanceLockError::Other(format!(
+                "无法获取实例锁（锁文件不可用） \"{}\"：{err}",
+                Path::new(&lock_path).display()
+            ))
+        })?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(std::fs::TryLockError::WouldBlock) => Err(InstanceLockError::Held(db_path)),
+        Err(std::fs::TryLockError::Error(err)) => Err(InstanceLockError::Other(format!(
+            "无法获取实例锁 \"{}\"：{err}",
+            Path::new(&lock_path).display()
+        ))),
+    }
+}
+
 fn process_db_path() -> Result<PathBuf, String> {
     match env_path("IDORIS_DB_PATH")? {
         Some(path) => Ok(path),

@@ -56,6 +56,11 @@ IDORIS_SUBSCRIPTION_CLI=claude \
 
 - **付费 `Resident` 直连卡支持 buffered 请求，暂不支持付费 streaming**：`form: http_service` + `load_policy.mode: resident` 走独立 HTTP 代理；付费非流式请求执行预算预留与结算，付费流式请求在调用上游前拒绝。付费 resident 卡不会被全局启动门禁拒绝；resident 代理不能替代 Supervisor 的模型加载、驱逐与状态核对。
 
+## 进程生命周期（由启动器托管时）
+
+- **停止**：`SIGTERM` 与 `SIGINT` 走同一条优雅停机路径（停止接收新连接、收尾订阅运行时），成功时打印 `idoris: 已停止` 并以 0 退出；若 10 秒内未收尾则强制以 1 退出。
+- **单实例**：`idoris serve` 启动时对 `<IDORIS_DB_PATH>.lock` 加独占咨询锁（进程退出由操作系统自动释放，无陈旧锁）。同一数据库已有实例时，在绑定端口前输出 `[idoris] 启动失败：已有 iDoris 实例在使用同一数据库 <path>` 并以退出码 **3** 退出（其他启动失败为 1）。离线的 `idoris key issue` / `idoris admin` 不受该锁影响。
+
 ## License
 
 This project is licensed under the [Apache License, Version 2.0](LICENSE).  
