@@ -5,7 +5,7 @@ coverage/
 .DS_Store
 
 # Rust workspace build output (crates/) — TS packages/ stay untouched, see root README.
-/target/
+/target
 
 # tsc leftovers next to generated contract sources (drift gate compares .ts sources only)
 packages/contracts/src/generated/*.js
