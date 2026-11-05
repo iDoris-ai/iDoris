@@ -1,5 +1,7 @@
 # idoris.ai/api 综合 AI 计算服务：脑暴与架构草案
 
+> **已被定稿取代**：请看 [`compute-service-design.md`](compute-service-design.md)（定稿 1.0）。本稿保留，作为供应商调研、价格、场景和模型候选的依据；和定稿冲突时，以定稿为准。
+
 > 状态：脑暴稿（2026-11-05），分支 `feat/compute-service`。§8 的产品决策已经由 owner 拍板（2026-11-05）；§9–§11 是在这些决策之后补的。还不是规范，也没有排期。
 > 定位：给 **eduai**（教育）和 **Agent24**（办公 agent）供应 token 的「迷你 OpenRouter」。对外接口兼容 OpenAI，调用方只拿三样东西：**接口地址 `https://idoris.ai/api/v1`、密钥、模型名**。算力来自别人的硬件：token API、按需 GPU、租赁 GPU，再加上用户自己的 Mac。
 > 价格数据大多来自第三方聚合站，只有 Modal、RunPod 来自官网。各家口径和日期不一致，下单前要逐家核对（见文末来源）。
