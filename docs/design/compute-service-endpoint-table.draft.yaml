@@ -89,7 +89,7 @@ endpoints:
       stream_usage: "Chat Completions 流在结束前必带 usage。stream_options.include_usage 已弃用且不起作用"
       cache_pricing: "网关返回 cached_tokens 与 cache_write_tokens；是否打折取决于下游。内存缓存仍被视为可在 ZDR 路由中使用"
       structured_output: "网关支持 json_schema；模型不支持则失败"
-      cancel: "仅流式，且仅名单内下游会停算停计费。DeepInfra、Together、Fireworks、DeepSeek 在名单内。Bedrock、Groq、Google、Alibaba 写明尚未支持"
+      cancel: "仅流式，且仅名单内下游会停算停计费。DeepInfra、Together、Fireworks、DeepSeek 在名单内。Groq、Google、Alibaba 写明尚未支持"
     verified_at: "2026-11-12"
     confidence: "高（路由规则）；具体模型当前端点政策为 unverified"
     notes: "自助账户未选择时默认允许 Safety Retention，那不是本行。本行要求人在后台设为 ZDR only 并排除 Safety Retention。即便如此，疑似 CSAM 仍可能被留存。自助条款禁止为转售 API 或建设竞争服务而使用；企业协议第 2.1(a)(ii) 条明文允许提供给终端客户，第 2.3.7 条禁止转租转卖访问权，定性待律师确认（2026-11-12 主会话复核原文）。账户持有人须年满 18 岁。DPA 对商业使用经条款并入，签字件需向企业方案申请。下游默认分类见 OpenRouter provider-logging 页，与各家自己的条款可能不一致。抽成与模型现价：unverified。"
@@ -250,25 +250,7 @@ endpoints:
       - "https://www.alibabacloud.com/help/en/model-studio/data-retention-policy"
       - "https://www.alibabacloud.com/help/en/model-studio/regions/"
 
-  - endpoint: "aws-bedrock / 源区域 ap-southeast-1 的 global 跨区域推理配置文件 / OpenAI 兼容路径 /openai/v1（博客所述）"
-    processing_region: "源区域可以是新加坡。global 配置文件的目的地是部署了该模型的受支持商业 AWS 区域，不是新加坡。某个聊天模型是否另有只含亚太的配置文件：unverified"
-    retention: "有例外"
-    dpa: unverified
-    allowed_data_classes: unverified
-    capabilities:
-      tool_calls: unverified
-      stream_usage: unverified
-      cache_pricing: unverified
-      structured_output: unverified
-      cancel: "OpenRouter 把 AWS Bedrock 列为流式取消尚未支持"
-    verified_at: "2026-11-12"
-    confidence: "中（留存与 global 目的地有用户指南和官方博客；具体型号的亚太配置文件未核实）"
-    notes: "留存可按区域在账户或项目上配置。未配置则 inherit 到模型默认。default 模式可能为滥用检测留存。部分 OpenAI 模型的被标记流量最多 30 天；Claude Fable 5 系列的全部流量最多 30 天。完整 ZDR 要向 AWS 客户团队申请。跨区域打开时，留下来的输入输出存在目的地区域。AWS 数据处理附录正文本次未读，故 dpa 为 unverified。儿童与转售：unverified。不要把本行当成新加坡推理。"
-    sources:
-      - "https://docs.aws.amazon.com/bedrock/latest/userguide/data-retention.html"
-      - "https://docs.aws.amazon.com/bedrock/latest/userguide/abuse-detection.html"
-      - "https://aws.amazon.com/blogs/machine-learning/accessing-openai-gpt-models-on-amazon-bedrock-with-global-cross-region-inference-in-thailand-malaysia-singapore-indonesia-and-taiwan/"
-      - "https://docs.aws.amazon.com/bedrock/latest/userguide/bda-cris.html"
+  # AWS Bedrock：按 owner 2026-11-12 决定排除。
 
   - endpoint: "google-vertex / 区域端点 asia-southeast1 / 生成式模型（具体型号 ID：unverified）"
     processing_region: "数据驻留文档写：机器学习处理发生在发出请求的区域或多区域；静态数据留在所选位置。新加坡列在驻留表中。2026-11-12 当天该区域在售型号清单：unverified。全球端点不在本行，其缓存可以来自任何区域。"

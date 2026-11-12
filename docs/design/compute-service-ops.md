@@ -1,6 +1,6 @@
 # 计算服务 §10 运维边界落地方案
 
-> 日期：2026-11-12。只写方案和脚本草案，不改 Rust，不部署，不开云账号。
+> 日期：2026-11-12。同日按 owner 决定修订选型。只写方案和脚本草案，不改 Rust，不部署，不开云账号。
 > 权威顺序：定稿 `docs/design/compute-service-design.md`（定稿 1.0）高于本文。本文把 §10 写成可执行的运维方案。代码现状以本工作区当天读到的源码为准，行号也是这一天的。上一轮勘察见 `docs/design/compute-service-code-recon.md`。
 > 跨境和法律定性以 `docs/design/compute-service-compliance-research.md` 为准。本文不另下法律结论。那份研究写明它不是法律意见，本文同样不是。
 > 外部事实后面附 URL 和查询日期。查不到或来源不够的，写「未核实」。
@@ -19,12 +19,15 @@ P0 维持设计稿：一个活动写节点，SQLite 放在持久卷上，WAL 持
 
 **计算节点放在新加坡，库文件放在该节点的持久卷上。** 卷的每日快照只是第二道，达不到 1 分钟 RPO，也不能代替对象存储副本。Fly 自己也写明卷快照不应当是唯一备份。
 
-**对象存储副本优先选能说清「数据在新加坡」的 S3 兼容服务：**
+**对象存储副本优先选能说清「数据在新加坡」、S3 兼容、并且 Litestream 0.5.x 有文档支持的服务。** 各家的区域、卷、价格和驻留原句在第 2.4 节。价格是公开标价，不是报价。查询日期都是 2026-11-12。
 
-- 首选 Amazon S3，区域 `ap-southeast-1`。Litestream 直接支持 S3。本次从 AWS 价目文件核实了这里的存储和请求单价（第 2 节）。
-- 若计算节点就在 DigitalOcean 的 SGP1，可以用同区 Spaces。同区 Droplet 访问 SGP1 Spaces 的出站流量，官方计费说明里是免费的。
+- AWS：按 owner 2026-11-12 决定排除。
+- **首选：DigitalOcean SGP1。** 库文件放在 SGP1 的标准卷上，WAL 副本用同区 Spaces，不打开 CDN。Litestream 0.5 把 `*.digitaloceanspaces.com` 列为自动识别的 S3 兼容端点，区域表写明新加坡是 `sgp1.digitaloceanspaces.com`。同区 Droplet 访问 SGP1 Spaces 的出站，计费说明里不计 Spaces 出站费。桶在创建时选定数据中心，之后不能改区域。官方没有「对象字节不会离开该数据中心」这种句子。CDN 接入点是全球的，备份桶不能开。
+- **备选：Fly.io 区域 `sin` 上的单写 Machine 加卷，副本用 Tigris 单区域 `sin`。** Litestream 0.5.3 起识别 Tigris。Tigris 写明单区域桶的对象数据不会离开所选区域。对象键、大小和系统元数据会复制到所有区域。默认 Global 桶按访问搬数据，不能用。Litestream 指南里的 `fly storage create` 没有写区域，不能拿那个默认桶当生产副本。
 - **不要把 Cloudflare R2 当作唯一副本。** R2 的司法辖区只有欧盟、美国和 FedRAMP，没有新加坡。`apac` 只是创建桶时的位置提示，不是驻留保证。儿童相关账本放到一个说不清落点的桶里，就是合规研究里「新加坡再向外送一跳」还没做决定的情况。
 - **不要用 Hetzner Object Storage 做这份副本。** 官方地点表里，对象存储只在法尔肯施泰因、纽伦堡和赫尔辛基，不在新加坡。从新加坡机器写过去，账本离开新加坡。
+
+阿里云国际站新加坡有 Litestream 原生 `type: oss`（v0.5.3 起），创建桶的文档把 Region 写成数据的物理位置。它不进首选或备选：示例区域是 `cn-hangzhou` 和 `us-west-1`，没有点名新加坡，本次未实测；走 S3 兼容层时，官方写 boto3 的 Signature V4 与分块编码不兼容。新加坡云盘和 OSS 单价，本次抓到的价目表不能确认绑在新加坡上。Vultr、Akamai/Linode、腾讯云国际站、Google Cloud 的缺口也在第 2.4 节，同样不进首选或备选。
 
 Litestream 不绑定某一个云的「新加坡产品」。区域是副本 URL 里的 endpoint 和 region。只要该 endpoint 在新加坡，复制间隔就跟区域无关。
 
@@ -39,7 +42,7 @@ Litestream 不绑定某一个云的「新加坡产品」。区域是副本 URL �
 - 最新发布是 v0.5.18，发布者 benbjohnson，日期 2026-11-03。支持 Linux（amd64、arm64、armv6、armv7）和 macOS（amd64、arm64）。Windows 二进制有，但发行说明写明不是官方支持平台。https://github.com/benbjohnson/litestream/releases
 - 文档站把 v0.5.x 标成当前维护线，有功能和修复；v0.3.14 是上一线。https://litestream.io/tips/
 - 维护活动：GitHub 提交历史在 2026-10-20 仍有提交（例如保持读锁）。https://github.com/benbjohnson/litestream/commits/main/ 本次只看到检索摘要，没有逐条打开每个 commit。
-- 复制是异步的。默认大约每秒把新变更复制到 S3。这段还没复制出去的数据，在整机灾难时会丢。收到关闭信号时，会尽量先把未同步的 WAL 同步到副本再退出。同步复制在路线图上，还没有。https://litestream.io/tips/ （Data loss window）
+- 复制是异步的。默认大约每秒把新变更复制到副本（该页以 S3 兼容副本为例）。这段还没复制出去的数据，在整机灾难时会丢。收到关闭信号时，会尽量先把未同步的 WAL 同步到副本再退出。同步复制在路线图上，还没有。https://litestream.io/tips/ （Data loss window）
 - 配置参考里，时间类全局默认可以写 `sync-interval: 1s`。每个库还有 `monitor-interval`，默认 `1s`。https://litestream.io/reference/config/
 - 恢复粒度是整个 LTX 文件，不会套用半个文件。保留策略删掉细粒度 L0 之后，能恢复到的时间点变粗。L0 不能永久保留（`l0-retention: 0` 会被拒绝）。https://litestream.io/how-it-works/
 - 快照默认每 24 小时一次，保留 24 小时。写得勤时，文档建议把 `snapshot.interval` 降到 `1h`，否则恢复要重放很多增量，恢复变慢。https://litestream.io/tips/
@@ -53,7 +56,8 @@ Litestream 不绑定某一个云的「新加坡产品」。区域是副本 URL �
 - 恢复命令是 `litestream restore`。可以按时间点：`litestream restore -timestamp ... -o restored.db`。恢复后应用自己跑 `PRAGMA integrity_check`。https://litestream.io/docs/troubleshooting
 - v0.5.7 起有 `validation` 块，按间隔检查 LTX 的顺序和是否连续（空隙、重叠、乱序）。默认关闭。这不是把恢复出来的库跑一遍 `integrity_check`。https://litestream.io/reference/config/ （Validation）
 - v0.5.18 的变更列表里有一条「opt-in PutObject checksums」。本次没有在配置参考里看到对应的 YAML 键名，键名未核实。https://github.com/benbjohnson/litestream/releases
-- S3 兼容：文档列出 MinIO、DigitalOcean Spaces、Hetzner（`*.your-objectstorage.com`，v0.5.9 起自动探测）、Cloudflare R2 等。R2 的 region 写 `auto`，欧盟司法辖区用 `<ACCOUNT_ID>.eu.r2.cloudflarestorage.com`（v0.5.8）。没有单独的「新加坡区域」开关；新加坡取决于桶所在的 endpoint。https://litestream.io/guides/s3-compatible/
+- S3 兼容：文档列出 MinIO、DigitalOcean Spaces、Hetzner（`*.your-objectstorage.com`，v0.5.9 起自动探测）、Cloudflare R2、Tigris 等。R2 的 region 写 `auto`，欧盟司法辖区用 `<ACCOUNT_ID>.eu.r2.cloudflarestorage.com`（v0.5.8）。没有单独的「新加坡区域」开关；新加坡取决于桶所在的 endpoint。https://litestream.io/guides/s3-compatible/ 与 https://litestream.io/reference/config/
+- 同一配置参考还有不是 S3 副本类型的后端：`type: gs` 是 Google Cloud Storage，用应用默认凭证；`type: oss` 是阿里云 OSS，用官方 SDK（v0.5.3）。这两条不走 S3 兼容端点。https://litestream.io/reference/config/
 - 多个 SQLite 连接可以同时使用这个库。Litestream 的要求是 WAL，以及应用在它 checkpoint 时不要立刻失败。它没有要求进程里只有一条连接。高写入下的限制是上面的 autocheckpoint，不是「禁止多连接」。https://litestream.io/tips/
 
 ### 2.2 替代方案
@@ -79,17 +83,17 @@ Litestream 不绑定某一个云的「新加坡产品」。区域是副本 URL �
 
 - 有新加坡区域 `sin`。计算价格是阿什本价格乘区域系数；`sin` 的系数是 1.269。`shared-cpu-1x · 256MB` 在 sin 的月价示例是 $2.78。卷和快照不加这个系数。https://fly.io/pricing.md （检索摘录，2026-11-12）
 - 卷 $0.15/GB/月，按划定容量计费，卸下或机器停了也计费。快照 $0.08/GB/月，每月前 10GB 免费。新卷默认每天自动快照、保留 5 天，可改成 1 到 60 天或关掉。快照按实际存的数据计费，增量。https://fly.io/docs/about/pricing/ 与 https://fly.io/docs/volumes/snapshots/
-- 卷属于一个应用，落在一台机器、一个区域上，不是网络共享盘。每天的快照可能没有最新数据，不能当唯一备份。可以从快照拉出一个不小于原卷的新卷。https://fly.io/docs/volumes/overview/
+- 卷属于一个应用，落在一台机器、一个区域上，不是网络共享盘。每天的快照可能没有最新数据，不能当唯一备份。可以从快照拉出一个不小于原卷的新卷。https://fly.io/docs/volumes/overview/ 同页原句：snapshots shouldn’t be your primary backup method；Daily automatic snapshots may not have your latest data。
 
-**Amazon S3，`ap-southeast-1`**
+**Tigris（Fly 上的对象存储）**
 
-价目文件 `https://pricing.us-east-1.amazonaws.com/offers/v1.0/aws/AmazonS3/current/ap-southeast-1/index.json`，本次下载解析（HTTP 200，文件日期头 2026-11-12 前后的缓存）：
-
-- 标准存储：前 50 TB 为 $0.025 / GB-月，接下来 450 TB 为 $0.024，超过 500 TB 为 $0.023。用量类型 `APS1-TimedStorage-ByteHrs`。
-- PUT、COPY、POST、LIST：`$0.005 / 1,000` 请求（`APS1-Requests-Tier1`）。
-- GET 及其他：价目描述是 `$0.004 / 10,000` 请求，即 `$0.0004 / 1,000`（`APS1-Requests-Tier2`）。
-- 这份价目里看到的出站条目是 MRAP 的 $0.0033/GB，不是普通互联网出站。普通出站单价未核实。
-- EBS（gp3）的新加坡单价没有下载（EC2 价目文件约 357MB）。未核实。
+- S3 兼容。Litestream 配置参考把 Tigris (Fly.io) 列在签名表里：`sign-payload: true`，`require-content-md5: false`，并写明识别端点 `fly.storage.tigris.dev`、region 用 `auto`（v0.5.3）。指南在 v0.5.4。https://litestream.io/reference/config/ 与 https://litestream.io/guides/tigris/
+- 区域表有 Asia-Pacific `sin` Singapore。https://www.tigrisdata.com/docs/concepts/regions/ （页面可见 2026-09-25 一带的发布标记；查询 2026-11-12）
+- 桶位置在创建时选定。单区域：object data never leaves the chosen region。Global 按访问分布，not suitable for strict data residency requirements。Residency applies to object data. Object keys, sizes and other system metadata, along with bucket settings, are replicated to all regions. https://www.tigrisdata.com/docs/buckets/locations/ （页上可见 2026-11-11 的更新标记）
+- 自定义元数据还会复制到同一地理的灾难恢复区域。例子是法兰克福对应伦敦和阿姆斯特丹。新加坡 `sin` 的灾难恢复区域叫什么：未核实。
+- Litestream 指南的创建命令是 `fly storage create`，没有区域参数。那不等于单区域 `sin`。博客示例是 `tigris mk my-bucket --locations sin`。https://www.tigrisdata.com/blog/multi-region-dual-region-buckets/ （文内日期 2026-03-24）Litestream 上传时会不会另送区域头、从而改掉桶级位置：未核实。
+- 价格：Global / Single-Region 标准存储 $0.02/GB/月，Class A $0.005/1000 次，Class B $0.0005/1000 次，出站免费。每月含 5 GB、1 万次 Class A、10 万次 Class B。https://www.tigrisdata.com/pricing.md （页上日期 2026-10-22）币种是美元。
+- 本次没有用真实 Tigris 桶做复制。
 
 **Cloudflare R2**
 
@@ -104,6 +108,59 @@ Litestream 不绑定某一个云的「新加坡产品」。区域是副本 URL �
 - 卷 $0.10 / GiB-月，1 GiB 到 16 TiB，不挂上也计费。https://docs.digitalocean.com/products/volumes/details/pricing/ （Last verified 11 Nov 2026）
 - 卷快照 $0.06 / GiB-月。https://docs.digitalocean.com/products/snapshots/details/pricing/ （Last verified 12 Nov 2026）
 - 卷快照是崩溃一致：冻结某一刻已写到盘上的块，不是应用事务一致。https://docs.digitalocean.com/products/snapshots/how-to/snapshot-volumes/
+- 标准卷在 SGP1 可用。卷是区域资源，只能在同一数据中心的 Droplet 之间移动。高性能卷的私有预览名单里没有 SGP1。https://docs.digitalocean.com/products/volumes/details/availability/ （Generated on 12 Nov 2026）
+- Spaces 在 SGP1 的标准存储和冷存储都标了 Available。https://docs.digitalocean.com/products/spaces/details/availability/ （Generated on 12 Nov 2026）
+- 创建桶：Choose a datacenter region，所选数据中心会进 endpoint。Once a bucket is created, its region cannot be changed. https://docs.digitalocean.com/products/spaces/how-to/create/ 与 https://docs.digitalocean.com/products/spaces/how-to/transfer-between-regions/ 没有查到「对象字节不会离开该数据中心」的原句。
+- CDN 在每个有 Spaces 的区域都能开。接入点表的 Asia 一行包含 Singapore，也包含曼谷、东京、香港和其他城市。https://docs.digitalocean.com/products/spaces/details/availability/ 备份桶不要开 CDN。
+- 数据中心表有 SGP1，Singapore。https://docs.digitalocean.com/platform/regional-availability/ Droplet 各档在 SGP1 的勾选，本次打开的 markdown 表格没有把图标转成文字，不逐档写成已可用。SGP1 的 Droplet 月价：未核实。
+- Litestream：自动识别 `*.digitaloceanspaces.com`，`sign-payload: true`。区域表有 Singapore 1 `sgp1.digitaloceanspaces.com`。https://litestream.io/guides/s3-compatible/ 与 https://litestream.io/reference/config/ 这是文档支持，不是本次对 SGP1 的实测复制。
+
+**Vultr 新加坡**
+
+- 对象存储 FAQ 把地点和主机名写成 Singapore：`sgp1.vultrobjects.com`。同页写 Yes, Vultr Object Storage subscription is S3-compatible。https://docs.vultr.com/products/cloud-storage/object-storage/faq 产品页也把 Singapore SG 列在存储枢纽里。https://www.vultr.com/products/object-storage/ 两页的城市名单不完全相同，以 FAQ 的主机名表为准：新加坡在表内。没有查到「对象只存在该主机名对应城市」的合同原句。
+- 兼容矩阵：Put Object、Get Object、Multipart Uploads、Delete Object 为 Yes；Bucket Lifecycle 为 No。https://docs.vultr.com/products/cloud-storage/object-storage/s3-compatibility-matrix （Updated on 10 September, 2025；查询 2026-11-12）不能把删除交给桶的生命周期规则。
+- 价目页：Standard Object Storage 展示为 $18/月，含 1 TB 存储和 1 TB 带宽；额外存储 $18/TB（合 $0.018/GB），额外传输 $10/TB（合 $0.01/GB）。https://www.vultr.com/pricing 同页 FAQ：部分数据中心的小时价和月价可能不同。新加坡是否同价：未核实。美元。
+- 块存储：价目页展示 NVMe 10 GB 为 $1.00/月。文档有创建块存储快照的 API。https://docs.vultr.com/products/storage/block-storage 快照的新加坡单价，以及快照字节是否留在新加坡：未核实。
+- 实例快照 $0.05/GB/月，按压缩后大小。Vultr Snapshots span across all regions。https://docs.vultr.com/products/storage/snapshots/faq （last_updated 2026-10-23）这不是钉在新加坡的副本。
+- BGP 社区表把 Singapore, SG 列为 POP。https://docs.vultr.com 的 ASN 说明 PDF（页眉 2026）只证明有这个接入点，不证明块存储或对象存储的字节位置。
+- Litestream 的自动识别表和配置参考里没有 Vultr。用通用 S3 endpoint 能否复制：未核实，本次未实测。
+
+**Akamai / Linode 新加坡**
+
+- 对象存储概述原句：Amazon S3-compatible method，并再次写 Amazon S3-compatible storage solution。https://techdocs.akamai.com/cloud-computing/docs/object-storage
+- 端点页：Singapore 的区域 ID 是 `ap-south`，标在 E0；Singapore 2 的 ID 是 `sg-sin-2`。2025-01-13 变更写 Object Storage E2 endpoints are now Generally Available (GA) in Melbourne and Singapore。https://techdocs.akamai.com/cloud-computing/docs/object-storage-limited-availability 与 https://techdocs.akamai.com/cloud-computing/changelog/jan-13-2025-object-storage `sg-sin-2` 属于哪一档端点，本次表格摘录不完整，不写死。
+- 没有查到「桶内字节不会离开所建区域」的原句。
+- 亚太价目页写可用地包含 Singapore。块存储 10 GB 为 $1.00/月，表上按 10 GB 一档翻倍，合 $0.10/GB/月。对象存储一行是 $0.02/GB，出站 $0.005/GB，每月前 1 TB 出站免费。https://www.akamai.com/cloud/pricing/asia-pacific （页上日期 2026-06-24；查询 2026-11-12）对象存储说明另写 $5/月含 250 GB，超出默认 $0.02/GB，并写超额可能因数据中心而不同。https://www.akamai.com/cloud/pricing/object-storage 雅加达和圣保罗被点名为不同的超额；新加坡没有被点名。当前不按请求收费，并写按请求收费不会早于 2027-10-01 出现在账单上。https://techdocs.akamai.com/cloud-computing/docs/object-storage-pricing 美元。共享 CPU 入门机的新加坡月价：未核实。
+- 块存储在全部 core compute 区域可用，不在 distributed 区域。最小 10 GB，最大 16 TB，NVMe。卷和 Linode 必须在同一数据中心。https://techdocs.akamai.com/cloud-computing/docs/block-storage Backups 服务不备份块存储卷，即便卷已经挂上。可以克隆卷。https://techdocs.akamai.com/cloud-computing/docs/faqs-for-the-backup-service 实例备份存在同一数据中心的另一套硬件上。卷本身没有快照产品。克隆是否留在同一数据中心：未核实。
+- Litestream 文档没有列出 Akamai 或 Linode。未实测。
+
+**阿里云国际站，新加坡**
+
+- OSS 地域表：Singapore，区域 ID `ap-southeast-1`，公网 `oss-ap-southeast-1.aliyuncs.com`，内网 `oss-ap-southeast-1-internal.aliyuncs.com`。https://www.alibabacloud.com/help/en/oss/user-guide/regions-and-endpoints
+- 创建桶：Region determines the physical location of your data。同页把合规写成选区域的第一条，并写 ECS 与 OSS 同地域可走内网。核心设置创建后不能改。https://www.alibabacloud.com/help/en/oss/user-guide/create-a-bucket-4 已有桶不能改区域。https://www.alibabacloud.com/help/en/oss/user-guide/0015-00000227
+- 标准存储在新加坡可以用同城冗余：多个可用区、同一地域。https://www.alibabacloud.com/help/en/oss/user-guide/overview-of-storage-redundancy-types 与 https://www.alibabacloud.com/help/en/oss/user-guide/overview-53/
+- S3 兼容：OSS 支持 Signature Version 4。Python boto3 必须用 Signature V2，因为该客户端的 V4 与分块编码绑在一起。Go v2 的 Manager API 对大文件可能使用分块编码。https://www.alibabacloud.com/help/en/oss/developer-reference/use-aws-sdks-to-access-oss
+- Litestream 的受支持路径不是这条 S3 层。配置参考：v0.5.3 起有原生 `type: oss`，用官方 SDK。示例 URL 是 `oss://mybucket.oss-cn-hangzhou.aliyuncs.com/db`，区域例子是 `cn-hangzhou`、`us-west-1`。https://litestream.io/reference/config/ 新加坡区域 ID 能否填进 `region`：未核实，本次未实测。
+- OSS 价目页列出 Singapore (Singapore)，并展示标准存储（本地冗余）超过 5 GB 为 US$0.0173、同城冗余 US$0.0232。同一页先列出青岛、北京等一串地域名。本次抓取不能确认这些数字属于新加坡而不是默认地域。新加坡 OSS 单价：未核实。https://www.alibabacloud.com/en/product/oss-pricing-list/en
+- 云盘按容量计费，创建后即计费，与是否挂载无关；单价可能因地域不同，文档让读者去 ECS 定价页。快照示例里的 US$0.0173/GB-月写的是中国（杭州），不是新加坡。https://www.alibabacloud.com/help/zh/ecs/block-storage-devices 与 https://www.alibabacloud.com/help/doc-detail/56159.htm 新加坡云盘单价和新加坡快照单价：未核实。ECS 各规格是否在新加坡在售：本次没有打开 ECS 地域清单，未核实。
+
+**腾讯云国际站，新加坡**
+
+- 国际站文档：地域是托管机房的分布地区，对象存储的数据存放在这些地域的存储桶中。新加坡地域简称 `ap-singapore`，默认域名 `<BucketName-APPID>.cos.ap-singapore.myqcloud.com`。最后更新时间 2026-10-13。https://intl.cloud.tencent.com/zh/document/product/436/6224
+- 多 AZ 当前包括新加坡，数据分散在同一城市的多个数据中心。https://intl.cloud.tencent.com/zh/document/product/436/35208 （最后更新 2026-05-29）
+- S3：COS provides an S3-compatible implementation，并写 COS does not guarantee full compatibility with S3。另一页写 COS 提供 S3 兼容 API，示例区域是 `ap-guangzhou`。https://intl.cloud.tencent.com/document/product/436/34688 与 https://intl.cloud.tencent.com/document/product/436/32537
+- Litestream 的提供商表没有腾讯云 COS。未实测。
+- 云硬盘价目页有 Southeast Asia (Singapore) 一行。快照表写明该地域 Snapshot capacity 为 $0.000036 / GiB-小时，折合 $0.026 / GiB-月。https://buy.tencentcloud.com/pricing/cbs 云硬盘各类型的列在本次摘录里没有列名，不把同一行里的 0.05、0.11、0.18、0.22 安到某一种盘上。分类型单价：未核实。美元。
+- COS 按量价目页展示 STANDARD 存储使用费 0.016 USD/GB/月，标准读写请求各 0.002 USD/万次。https://buy.tencentcloud.com/pricing/cos 摘录没有写这一列是不是新加坡。新加坡对象存储单价：未核实。
+- CVM 新加坡的实例月价：未核实。
+
+**Google Cloud，`asia-southeast1`**
+
+- 位置表把 `ASIA-SOUTHEAST1` 写成 Singapore。Cloud Storage stores object data in the selected location in accordance with the Service Specific Terms。区域位置是同步的可用区冗余，读同一区域的数据没有出站费。https://docs.cloud.google.com/storage/docs/locations （页面时间 2026-11-03）服务条款正文没有通读。
+- 持久盘和快照产品存在。快照可以放在区域位置，例如文档列举的 `asia-south1`。源盘若位于某个多区域所覆盖的位置，项目的默认快照位置是该多区域；举例 `us-central1` 落到 `us`，`australia-southeast1` 落到 `asia`。可以改成与源盘相同的区域。https://docs.cloud.google.com/compute/docs/disks/snapshot-settings 与 https://docs.cloud.google.com/compute/docs/disks/snapshots （后者页面时间 2026-11-10）`asia-southeast1` 的默认快照是不是只在新加坡：未核实。不改默认值就不能把快照当成新加坡副本。
+- Litestream 对 GCS 的支持方式是原生类型，不是 S3 副本。配置参考：`type: gs` 或 `url: gs://...`，认证用 Application Default Credentials（v0.5.0 起的副本类型列表含 `gs`）。https://litestream.io/reference/config/ 另有 XML API，可换端点 `https://storage.googleapis.com` 并用 HMAC 键，给一部分 S3 工具用。https://docs.cloud.google.com/storage/docs/interoperability Litestream 是否接受用这条 XML 端点配 `type: s3`：未核实。因此 GCS 不满足「S3 兼容且按 Litestream 的 S3 路径使用」。
+- 存储价目页按区域展开。本次抓取在列出 Singapore (`asia-southeast1`) 的同时看到标准存储 $0.000027397 / GiB-小时。页面按区域切换，摘录没有标明这个数字属于新加坡。新加坡标准存储单价：未核实。https://cloud.google.com/storage/pricing 持久盘的新加坡单价：未核实。
+- 本次没有用 GCS 做复制。
 
 **Hetzner**
 
@@ -202,12 +259,17 @@ logging:
 dbs:
   - path: /var/lib/idoris/idoris.sqlite3
     replica:
-      url: s3://idoris-ledger-sin/prod/idoris.sqlite3
-      region: ap-southeast-1
+      type: s3
+      bucket: idoris-ledger-sin
+      path: prod/idoris.sqlite3
+      endpoint: sgp1.digitaloceanspaces.com
+      region: sgp1
       sync-interval: 10s
 ```
 
-若用 Spaces，endpoint 用该区域的 Spaces endpoint，region 用 `sgp1`。具体键名以 Litestream 0.5.18 的配置参考为准：https://litestream.io/reference/config/
+这是首选 Spaces 的形状，键名按 Litestream 的 Spaces 指南。https://litestream.io/guides/s3-compatible/ 与 https://litestream.io/reference/config/ 不要打开这个桶的 CDN。
+
+备选 Tigris 必须是创建时就限定为单区域 `sin` 的桶。Litestream 侧的端点是 `fly.storage.tigris.dev`，region 填 `auto`。指南里的 URL 形状是 `s3://BUCKETNAME?endpoint=fly.storage.tigris.dev&region=auto`。https://litestream.io/guides/tigris/ 这条 URL 本身不选择新加坡；区域是桶的位置，不是这个 `region=auto`。
 
 ### 4.2 恢复步骤
 
@@ -215,7 +277,7 @@ dbs:
 
 1. 确认旧进程已经不在。旧机器若还活着，先停应用和 Litestream，避免两个写者。`<db>.lock` 只在同一台机器上有效，换机器时锁不起作用。
 2. 在新卷上准备空目录。不要把旧的 `-wal`、`-shm` 或 `.<file>-litestream` 拷进去。
-3. `litestream restore -o /var/lib/idoris/idoris.sqlite3 s3://...`。需要回到某个时间点时加 `-timestamp`。时间用 UTC。
+3. `litestream restore -o /var/lib/idoris/idoris.sqlite3 s3://idoris-ledger-sin.sgp1.digitaloceanspaces.com/prod/idoris.sqlite3`。需要回到某个时间点时加 `-timestamp`。时间用 UTC。备选 Tigris 用它自己的 endpoint 查询参数，不要把 Spaces 的 URL 拿去恢复 Tigris 桶。
 4. 打开恢复出的文件，执行 `PRAGMA integrity_check;`，结果必须是单独一行 `ok`。然后 `PRAGMA journal_mode;` 必须是 `wal`。
 5. 扫描库里不应出现的正文键（第 6 节的扫描）。有命中就不对外服务，先隔离这份库。
 6. 跑第 7 节的对账。对账完成前，入口保持拒绝新的付费和补贴请求。只读查询可以开，写入不开。
@@ -462,8 +524,8 @@ apply(item):
 
 ## 10. 需要 owner 决定的事
 
-1. 计算节点用哪一家的新加坡：Fly `sin`、DigitalOcean SGP1、Hetzner `sin`，或 AWS `ap-southeast-1` 上的虚拟机。本文只比较了公开的卷和对象存储能力，没有测延迟。
-2. 副本用 S3 `ap-southeast-1` 还是 Spaces SGP1。不要在没做跨境决定时改用 R2 或 Hetzner 对象存储。
+1. 计算节点按本文首选放在 DigitalOcean SGP1，还是改用备选 Fly.io `sin`。本文只比较了公开的卷和对象存储能力，没有测延迟。
+2. 副本按首选用 Spaces SGP1，还是改用备选 Tigris 单区域 `sin`。不要在没做跨境决定时改用 R2 或 Hetzner 对象存储。Tigris 若用，桶必须在创建时限定为 `sin`，并接受对象键和系统元数据会复制到所有区域。
 3. 账本和副本的保留天数。必须和合规研究里的保存限制一致，不能为了恢复方便无限保留假名 id。
 4. 持有期：`maybe_executed` 在「查无此单」之后再挂多久才允许 `release`。
 5. `synchronous=FULL` 是否在压测后改成 `NORMAL`。默认维持 FULL。
@@ -476,8 +538,14 @@ apply(item):
 ## 11. 本次没有核实或没有做成的
 
 - MinIO 演练没有跑。镜像拉不下来。步骤在第 4.3 节。
-- 没有用真实的 S3、Spaces 或 R2 做复制。文件副本演练不能证明云上的延迟和权限。
-- S3 普通互联网出站单价、EBS 新加坡单价、Hetzner 卷的每 GB 单价：未核实。
+- 没有用真实的 Spaces、Tigris、OSS、COS、GCS、Vultr 或 R2 做复制。文件副本演练不能证明云上的延迟和权限。
+- DigitalOcean SGP1 的 Droplet 月价、Hetzner 卷的每 GB 单价：未核实。
+- Vultr 块存储快照的单价和字节位置、新加坡计算与对象存储是否与标价页同价：未核实。
+- Akamai 共享 CPU 入门机的新加坡月价、卷克隆是否留在同一数据中心、`sg-sin-2` 的端点等级：未核实。
+- 阿里云新加坡的 OSS 单价、云盘单价、快照单价、ECS 规格是否在售，以及 Litestream `region: ap-southeast-1` 能否工作：未核实。
+- 腾讯云新加坡的 COS 按量单价、云硬盘分类型单价、CVM 月价，以及 Litestream 对 COS 的兼容：未核实。
+- Google Cloud `asia-southeast1` 的标准存储单价、持久盘单价、默认快照是否只在新加坡，以及 Litestream 用 XML/HMAC 端点走 `type: s3`：未核实。
+- Tigris 单区域 `sin` 的灾难恢复区域叫什么、Litestream 上传会不会改掉桶级位置：未核实。
 - LiteFS v0.5.14 的发布年份：未核实。
 - Litestream PutObject checksum 的配置键名：未核实。
 - sqlite3_rsync 在 3.51 是否还包含 3.50.4 的损坏问题：未核实。
