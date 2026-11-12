@@ -1,6 +1,9 @@
 //! Release binaries find bundled config beside the executable, independent of cwd.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+#[path = "support/startup_wait.rs"]
+mod startup_wait;
+
 use idoris_contracts::common::PrivacyClass;
 use idoris_tenancy::virtual_key::VirtualKeySecret;
 use idoris_tenancy::virtual_key::store::{VirtualKeyScope, VirtualKeyStore};
@@ -64,7 +67,10 @@ fn fixture() -> (TempDir, TempDir, std::path::PathBuf, u16) {
     fs::create_dir_all(cwd.path().join("config/components")).unwrap();
     fs::write(cwd.path().join("config/components/bad.yaml"), "not: [valid").unwrap();
     let port = free_port();
-    (root, cwd, bin.join("idoris"), port)
+    let exe = bin.join("idoris");
+    // First exec of this copy is outside every failure and readiness deadline.
+    startup_wait::warm_exec(&exe);
+    (root, cwd, exe, port)
 }
 
 fn spawn(exe: &Path, cwd: &Path, port: u16, env: &[(&str, &str)]) -> Running {
@@ -81,22 +87,10 @@ fn spawn(exe: &Path, cwd: &Path, port: u16, env: &[(&str, &str)]) -> Running {
         .envs(env.iter().copied())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let deadline = Instant::now() + Duration::from_secs(1);
-    loop {
-        match cmd.spawn() {
-            Ok(child) => return Running(Some(child)),
-            Err(err)
-                if err.kind() == std::io::ErrorKind::ExecutableFileBusy
-                    && Instant::now() < deadline =>
-            {
-                // Linux may briefly reject exec immediately after fs::copy
-                // closes a newly written executable. Retry only ETXTBSY;
-                // every other spawn failure remains an immediate test error.
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            Err(err) => panic!("failed to spawn copied idoris binary: {err}"),
-        }
-    }
+    // Linux may briefly reject exec immediately after fs::copy closes a
+    // newly written executable. Retry only ETXTBSY; every other spawn
+    // failure remains an immediate test error.
+    Running(Some(startup_wait::spawn_when_executable(&mut cmd)))
 }
 
 fn seed_portable_key(cwd: &Path) {
@@ -125,7 +119,10 @@ fn seed_portable_key(cwd: &Path) {
 }
 
 fn failed(mut child: Running, expected: &str) {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    // Outer wait only. Exit code, empty stdout, and `expected` are unchanged:
+    // a process that is still running when this expires fails the test.
+    let limit = startup_wait::startup_observe_limit();
+    let deadline = Instant::now() + limit;
     loop {
         if child.0.as_mut().unwrap().try_wait().unwrap().is_some() {
             let output = child.0.take().unwrap().wait_with_output().unwrap();
@@ -135,7 +132,11 @@ fn failed(mut child: Running, expected: &str) {
             assert!(stderr.contains(expected), "{stderr}");
             return;
         }
-        assert!(Instant::now() < deadline, "startup did not fail");
+        assert!(
+            Instant::now() < deadline,
+            "startup did not fail within {}s",
+            limit.as_secs()
+        );
         std::thread::sleep(Duration::from_millis(10));
     }
 }
@@ -200,11 +201,12 @@ fn tenant_mode_non_loopback_refuses_until_tenant_authority_is_cryptographic() {
 
 async fn wait_health(child: &mut Running, port: u16) {
     let client = reqwest::Client::builder().no_proxy().build().unwrap();
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let limit = startup_wait::startup_observe_limit();
+    let deadline = Instant::now() + limit;
     loop {
         if let Ok(response) = client
             .get(format!("http://127.0.0.1:{port}/health"))
-            .timeout(Duration::from_millis(300))
+            .timeout(startup_wait::HTTP_PROBE_TIMEOUT)
             .send()
             .await
             && response.status().is_success()
@@ -212,7 +214,11 @@ async fn wait_health(child: &mut Running, port: u16) {
             return;
         }
         assert!(child.0.as_mut().unwrap().try_wait().unwrap().is_none());
-        assert!(Instant::now() < deadline, "health readiness timed out");
+        assert!(
+            Instant::now() < deadline,
+            "health readiness timed out after {}s",
+            limit.as_secs()
+        );
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
 }
@@ -271,18 +277,23 @@ async fn bundled_config_starts_from_an_unrelated_working_directory() {
         &[("IDORIS_ADMIN_PORT", admin_port.as_str())],
     );
     let client = reqwest::Client::builder().no_proxy().build().unwrap();
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let limit = startup_wait::startup_observe_limit();
+    let deadline = Instant::now() + limit;
     let response = loop {
         if let Ok(response) = client
             .get(format!("http://127.0.0.1:{port}/health"))
-            .timeout(Duration::from_millis(300))
+            .timeout(startup_wait::HTTP_PROBE_TIMEOUT)
             .send()
             .await
         {
             break response;
         }
         assert!(child.0.as_mut().unwrap().try_wait().unwrap().is_none());
-        assert!(Instant::now() < deadline, "health readiness timed out");
+        assert!(
+            Instant::now() < deadline,
+            "health readiness timed out after {}s",
+            limit.as_secs()
+        );
         tokio::time::sleep(Duration::from_millis(25)).await;
     };
     assert!(response.status().is_success());
@@ -290,7 +301,7 @@ async fn bundled_config_starts_from_an_unrelated_working_directory() {
     assert_eq!(health["status"], "ok");
     let admin = client
         .get(format!("http://127.0.0.1:{admin_port}/admin/api/v1/status"))
-        .timeout(Duration::from_secs(1))
+        .timeout(startup_wait::startup_observe_limit())
         .send()
         .await
         .unwrap();
@@ -299,7 +310,7 @@ async fn bundled_config_starts_from_an_unrelated_working_directory() {
         .post(format!("http://127.0.0.1:{port}/v1/chat/completions"))
         .bearer_auth(PORTABLE_TEST_KEY)
         .json(&serde_json::json!({"model":"idoris/daily","messages":[{"role":"user","content":"hi"}]}))
-        .timeout(Duration::from_secs(5))
+        .timeout(startup_wait::startup_observe_limit())
         .send()
         .await
         .unwrap();
@@ -331,7 +342,7 @@ async fn bundled_config_starts_from_an_unrelated_working_directory() {
             .post(format!("http://127.0.0.1:{port}/v1/chat/completions"))
             .bearer_auth(PORTABLE_TEST_KEY)
             .json(&body)
-            .timeout(Duration::from_secs(5))
+            .timeout(startup_wait::startup_observe_limit())
             .send()
             .await
             .unwrap();
@@ -362,7 +373,7 @@ async fn bundled_config_starts_from_an_unrelated_working_directory() {
             "model": "another-model",
             "messages": [{"role":"user","content":"hi"}]
         }))
-        .timeout(Duration::from_secs(5))
+        .timeout(startup_wait::startup_observe_limit())
         .send()
         .await
         .unwrap();
