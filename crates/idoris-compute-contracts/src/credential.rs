@@ -384,8 +384,11 @@ pub fn resolve_payment_context(
                 .collect();
             match active.as_slice() {
                 [] => {
-                    let revoked = candidates[0];
-                    return Err(ResolveError::MembershipRevoked(revoked.id.clone()));
+                    // 范围内有成员关系，但没有一个有效：全部已撤销
+                    return Err(match candidates.first() {
+                        Some(revoked) => ResolveError::MembershipRevoked(revoked.id.clone()),
+                        None => ResolveError::MemberNotInScope, // 上面已排除空，不会走到
+                    });
                 }
                 [only] => match &only.account {
                     Some(payer) => (payer.clone(), Some(who.clone()), Some(only.id.clone())),

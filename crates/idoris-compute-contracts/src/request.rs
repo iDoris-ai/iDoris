@@ -389,7 +389,10 @@ impl Request {
                 self.attempts.len()
             )));
         }
-        let last = self.attempts.len() - 1;
+        let Some(latest) = self.attempts.last() else {
+            return Err(invalid("a request needs at least one attempt"));
+        };
+        let last = self.attempts.len().saturating_sub(1);
         for (i, attempt) in self.attempts.iter().enumerate() {
             if attempt.id.request() != &self.id || usize::from(attempt.id.index().0) != i {
                 return Err(invalid(format!(
@@ -418,7 +421,7 @@ impl Request {
             if usize::from(published.0) != last {
                 return Err(invalid("only the latest attempt may have published"));
             }
-            match self.attempts[last].state.kind() {
+            match latest.state.kind() {
                 AttemptStateKind::MaybeExecuted
                 | AttemptStateKind::ExecutedUsageKnown
                 | AttemptStateKind::ExecutedUsageUnknown

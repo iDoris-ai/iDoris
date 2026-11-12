@@ -56,7 +56,7 @@ use crate::pricing::Usage;
 
 /// 一次尝试的状态。
 ///
-/// 反序列化走 [`AttemptStateWire`]：serde 对「内部标签枚举的单元变体」不检查未知字段
+/// 反序列化走私有的镜像类型 `AttemptStateWire`：serde 对「内部标签枚举的单元变体」不检查未知字段
 /// （`{"state":"sending","x":1}` 会被悄悄接受），而本仓库的约定是未知字段一律拒绝，
 /// 所以线上形式用「空结构变体」的镜像类型来解析，再转成这个更好用的类型。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
