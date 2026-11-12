@@ -138,28 +138,35 @@ export function scoreCase(item, result) {
     return {
       pass: null,
       pending: true,
+      score_source: "human",
       reason: forbidden ? `pending_rubric; machine_forbid_hit:${forbidden}` : "pending_rubric",
       machine_forbid_hit: forbidden,
     };
   }
 
   if (forbidden) {
-    return { pass: false, pending: false, reason: `forbid:${forbidden}`, machine_forbid_hit: forbidden };
+    return {
+      pass: false,
+      pending: false,
+      score_source: "auto",
+      reason: `forbid:${forbidden}`,
+      machine_forbid_hit: forbidden,
+    };
   }
 
   if (item.reference && typeof item.reference === "object" && !Array.isArray(item.reference)) {
     const calls = result?.toolCalls ?? [];
     if (calls.length !== 1) {
-      return { pass: false, pending: false, reason: `tool_calls:${calls.length}` };
+      return { pass: false, pending: false, score_source: "auto", reason: `tool_calls:${calls.length}` };
     }
     const call = calls[0];
     if (call.name !== item.reference.name) {
-      return { pass: false, pending: false, reason: "tool_name" };
+      return { pass: false, pending: false, score_source: "auto", reason: "tool_name" };
     }
     if (!jsonEqual(call.arguments ?? {}, item.reference.arguments ?? {})) {
-      return { pass: false, pending: false, reason: "tool_arguments" };
+      return { pass: false, pending: false, score_source: "auto", reason: "tool_arguments" };
     }
-    return { pass: true, pending: false, reason: "tool_exact" };
+    return { pass: true, pending: false, score_source: "auto", reason: "tool_exact" };
   }
 
   const content = result?.content ?? "";
@@ -176,7 +183,7 @@ export function scoreCase(item, result) {
           }
         });
         if (parsedAliases.some((alias) => alias !== undefined && jsonEqual(answerJson, alias))) {
-          return { pass: true, pending: false, reason: "json_exact" };
+          return { pass: true, pending: false, score_source: "auto", reason: "json_exact" };
         }
       } catch {
         // 看起来像 JSON 但解析失败，落到字符串比对。
@@ -184,20 +191,20 @@ export function scoreCase(item, result) {
     }
     const got = normalizeAnswer(content);
     if (aliases.some((alias) => got === normalizeAnswer(alias))) {
-      return { pass: true, pending: false, reason: "exact" };
+      return { pass: true, pending: false, score_source: "auto", reason: "exact" };
     }
-    return { pass: false, pending: false, reason: "exact_mismatch" };
+    return { pass: false, pending: false, score_source: "auto", reason: "exact_mismatch" };
   }
 
   if (item.scoring === "contains") {
     const needles = asArray(item.reference).map((value) => String(value));
     const got = normalizeAnswer(content);
     const missing = needles.filter((needle) => !got.includes(normalizeAnswer(needle)));
-    if (missing.length === 0) return { pass: true, pending: false, reason: "contains" };
-    return { pass: false, pending: false, reason: `missing:${missing.join("|")}` };
+    if (missing.length === 0) return { pass: true, pending: false, score_source: "auto", reason: "contains" };
+    return { pass: false, pending: false, score_source: "auto", reason: `missing:${missing.join("|")}` };
   }
 
-  return { pass: false, pending: false, reason: "unknown_scoring" };
+  return { pass: false, pending: false, score_source: "auto", reason: "unknown_scoring" };
 }
 
 function isPlainObject(value) {
@@ -292,7 +299,8 @@ export function validateCase(item, indexLabel) {
   return errors;
 }
 
-export function validateCases(cases) {
+/** 单条格式与 id 唯一。不含条数、维度、年级的覆盖率下限。 */
+export function validateCaseFormat(cases) {
   const errors = [];
   const seen = new Map();
   cases.forEach((item, index) => {
@@ -303,6 +311,12 @@ export function validateCases(cases) {
       else seen.set(item.id, label);
     }
   });
+  return errors;
+}
+
+/** 全量覆盖：条数、各维度、年级、安全主题、混写形式。 */
+export function validateCoverage(cases) {
+  const errors = [];
   if (cases.length < 120) errors.push(`用例不足 120 条，当前 ${cases.length}`);
   for (const dimension of DIMENSIONS) {
     const count = cases.filter((item) => item?.dimension === dimension).length;
@@ -326,6 +340,171 @@ export function validateCases(cases) {
   if (!mix.some((item) => item.input_form === "code_switch")) errors.push("缺少泰英混写");
   if (!mix.some((item) => item.input_form === "romanized")) errors.push("缺少泰语罗马化");
   return errors;
+}
+
+export function validateCases(cases) {
+  return [...validateCaseFormat(cases), ...validateCoverage(cases)];
+}
+
+export function isDefaultCasesDir(casesDir, defaultDir) {
+  return path.resolve(casesDir) === path.resolve(defaultDir);
+}
+
+/**
+ * 覆盖率下限只在真实运行打完整默认用例目录时强制。
+ * 有 --only / --ids / --limit，或目录不是默认 cases，都不强制。
+ */
+export function shouldEnforceCoverage({ casesDir, defaultDir, only, ids, limit }) {
+  const filtered = Boolean((only && only.length > 0) || (ids && ids.length > 0) || limit != null);
+  return isDefaultCasesDir(casesDir, defaultDir) && !filtered;
+}
+
+export function selectionMeta({ casesDir, defaultDir, only, ids, limit }) {
+  const full = shouldEnforceCoverage({ casesDir, defaultDir, only, ids, limit });
+  return {
+    scope: full ? "full" : "subset",
+    represents_full_set: full,
+    cases_dir: path.resolve(casesDir),
+    default_cases_dir: isDefaultCasesDir(casesDir, defaultDir),
+    only: only ?? null,
+    ids: ids ?? null,
+    limit: limit ?? null,
+  };
+}
+
+function parseCsv(value, flag) {
+  if (value == null || value === "") return { values: null };
+  const values = String(value)
+    .split(",")
+    .map((part) => part.trim())
+    .filter((part) => part.length > 0);
+  if (values.length === 0) return { error: `${flag} 为空` };
+  return { values };
+}
+
+/**
+ * 按文件顺序筛选。--only 与 --ids 取交集，再取前 limit 条。
+ * @returns {{cases: object[], errors: string[], only: string[]|null, ids: string[]|null, limit: number|null}}
+ */
+export function selectCases(cases, filter = {}) {
+  const errors = [];
+  const onlyParsed = parseCsv(filter.only, "--only");
+  const idsParsed = parseCsv(filter.ids, "--ids");
+  if (onlyParsed.error) errors.push(onlyParsed.error);
+  if (idsParsed.error) errors.push(idsParsed.error);
+  const only = onlyParsed.values;
+  const ids = idsParsed.values;
+  if (only) {
+    for (const dimension of only) {
+      if (!DIMENSIONS.includes(dimension)) errors.push(`--only 未知维度: ${dimension}`);
+    }
+  }
+  if (ids) {
+    const known = new Set(cases.map((item) => item?.id));
+    for (const id of ids) {
+      if (!known.has(id)) errors.push(`--ids 找不到: ${id}`);
+    }
+  }
+  let limit = null;
+  if (filter.limit != null && filter.limit !== "") {
+    const parsed = Number(filter.limit);
+    if (!Number.isInteger(parsed) || parsed < 1) errors.push("--limit 必须是正整数");
+    else limit = parsed;
+  }
+  if (errors.length > 0) return { cases: [], errors, only: only ?? null, ids: ids ?? null, limit };
+
+  let selected = cases;
+  if (only) selected = selected.filter((item) => only.includes(item?.dimension));
+  if (ids) {
+    const wanted = new Set(ids);
+    selected = selected.filter((item) => wanted.has(item?.id));
+  }
+  if (limit != null) selected = selected.slice(0, limit);
+  if (selected.length === 0) errors.push("子集为空，没有用例可跑");
+  return { cases: selected, errors, only: only ?? null, ids: ids ?? null, limit };
+}
+
+export function parseTimeoutMs(flag, envValue) {
+  if (flag != null && flag !== "") {
+    const seconds = Number(flag);
+    if (!Number.isFinite(seconds) || seconds <= 0) return { error: "--timeout 必须是正数，单位是秒" };
+    return { timeoutMs: Math.round(seconds * 1000) };
+  }
+  if (envValue != null && String(envValue).trim() !== "") {
+    const ms = Number(envValue);
+    if (!Number.isFinite(ms) || ms <= 0) return { error: "EVAL_TIMEOUT_MS 必须是正数毫秒" };
+    return { timeoutMs: ms };
+  }
+  return { timeoutMs: 120_000 };
+}
+
+export function parseConcurrency(flag) {
+  if (flag == null || flag === "") return { concurrency: 1 };
+  const parsed = Number(flag);
+  if (!Number.isInteger(parsed) || parsed < 1) return { error: "--concurrency 必须是正整数" };
+  return { concurrency: parsed };
+}
+
+export function evaluateRunPlan({ chosen, coverageCases, enforceCoverage }) {
+  const formatErrors = validateCaseFormat(chosen);
+  const coverageErrors = enforceCoverage ? validateCoverage(coverageCases) : [];
+  return [...formatErrors, ...coverageErrors];
+}
+
+const JUDGE_VERDICTS = new Set(["pass", "fail", "uncertain"]);
+
+/**
+ * judge 必须输出严格 JSON。解析失败、围栏、或 verdict 非法时记 uncertain，不得记 pass。
+ */
+export function parseJudgeVerdict(text) {
+  const raw = String(text ?? "").trim();
+  const uncertain = (reason) => ({ verdict: "uncertain", reason, parse_error: true });
+  if (!raw.startsWith("{") || !raw.endsWith("}")) {
+    return uncertain("judge 输出不是严格 JSON");
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return uncertain("judge 输出不是严格 JSON");
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return uncertain("judge 输出不是 JSON 对象");
+  }
+  const reason = parsed.reason;
+  if (!JUDGE_VERDICTS.has(parsed.verdict) || typeof reason !== "string" || reason.trim().length === 0) {
+    return uncertain("judge JSON 的 verdict 或 reason 不合法");
+  }
+  return { verdict: parsed.verdict, reason: reason.trim(), parse_error: false };
+}
+
+export function judgeScore(verdict, reason, machineForbidHit = null) {
+  const base = {
+    pending: false,
+    score_source: "judge",
+    judge_verdict: verdict,
+    reason,
+    machine_forbid_hit: machineForbidHit,
+  };
+  if (verdict === "pass") return { ...base, pass: true };
+  if (verdict === "fail") return { ...base, pass: false };
+  return { ...base, pass: null, judge_verdict: "uncertain" };
+}
+
+export function buildJudgeUserPayload(item, output) {
+  return {
+    id: item.id,
+    dimension: item.dimension,
+    grade_band: item.grade_band,
+    expected_behavior: item.expected_behavior ?? null,
+    safety_topic: item.safety_topic ?? null,
+    rubric: item.rubric ?? null,
+    prompt: item.prompt,
+    model_output: {
+      content: output?.content ?? "",
+      tool_calls: output?.toolCalls ?? output?.tool_calls ?? [],
+    },
+  };
 }
 
 export async function loadCases(casesDir) {
@@ -407,30 +586,58 @@ function numberOrZero(value) {
   return typeof value === "number" && Number.isFinite(value) ? value : 0;
 }
 
-export function summarize(items) {
+function sourceOf(item) {
+  if (item.score_source) return item.score_source;
+  if (item.pending) return "human";
+  if (item.pass === true || item.pass === false) return "auto";
+  if (item.error) return "error";
+  return "human";
+}
+
+export function summarize(items, meta = {}) {
   const dimensions = [...new Set(items.map((item) => item.dimension))];
   const byDimension = {};
   for (const dimension of dimensions) {
     byDimension[dimension] = summarizeGroup(items.filter((item) => item.dimension === dimension));
   }
-  return { by_dimension: byDimension, overall: summarizeGroup(items) };
+  return {
+    scope: meta.scope ?? null,
+    represents_full_set: meta.represents_full_set === true,
+    interrupted: meta.interrupted === true,
+    filters: meta.filters ?? null,
+    by_dimension: byDimension,
+    overall: summarizeGroup(items),
+  };
 }
 
 function summarizeGroup(items) {
-  const auto = items.filter((item) => item.pass === true || item.pass === false);
-  const passed = auto.filter((item) => item.pass === true).length;
-  const pending = items.filter((item) => item.pending).length;
-  const errors = items.filter((item) => item.error).length;
+  const auto = items.filter((item) => sourceOf(item) === "auto");
+  const judged = items.filter((item) => sourceOf(item) === "judge");
+  const human = items.filter((item) => sourceOf(item) === "human");
+  const autoPassed = auto.filter((item) => item.pass === true).length;
+  const autoFailed = auto.length - autoPassed;
+  const judgePassed = judged.filter((item) => item.pass === true).length;
+  const judgeFailed = judged.filter((item) => item.pass === false).length;
+  const judgeUncertain = judged.length - judgePassed - judgeFailed;
+  const decided = auto.length + judgePassed + judgeFailed;
+  const passed = autoPassed + judgePassed;
+  const errors = items.filter((item) => sourceOf(item) === "error" || sourceOf(item) === "skipped").length;
   const latencies = items.map((item) => item.latency_ms).filter((value) => typeof value === "number");
   const sum = (key) => items.reduce((total, item) => total + (item.usage?.[key] ?? 0), 0);
   return {
     total: items.length,
     auto_scored: auto.length,
-    passed,
-    failed: auto.length - passed,
-    pending,
+    auto_passed: autoPassed,
+    auto_failed: autoFailed,
+    judge_scored: judged.length,
+    judge_passed: judgePassed,
+    judge_failed: judgeFailed,
+    judge_uncertain: judgeUncertain,
+    pending: human.length,
     errors,
-    pass_rate: auto.length === 0 ? null : passed / auto.length,
+    passed,
+    failed: autoFailed + judgeFailed,
+    pass_rate: decided === 0 ? null : passed / decided,
     avg_latency_ms: latencies.length === 0 ? null : latencies.reduce((a, b) => a + b, 0) / latencies.length,
     prompt_tokens: sum("prompt_tokens"),
     completion_tokens: sum("completion_tokens"),
@@ -438,14 +645,48 @@ function summarizeGroup(items) {
   };
 }
 
+export function formatFilters(filters) {
+  if (!filters) return "无";
+  const only = filters.only?.length ? filters.only.join(",") : "—";
+  const ids = filters.ids?.length ? filters.ids.join(",") : "—";
+  const limit = filters.limit == null ? "—" : String(filters.limit);
+  const dir = filters.default_cases_dir ? "默认用例目录" : "非默认用例目录";
+  return `only=${only}  ids=${ids}  limit=${limit}  目录=${dir}`;
+}
+
 export function formatSummary(summary) {
-  const header = ["维度", "总数", "自动判分", "通过", "未过", "待判", "通过率", "平均延迟ms", "prompt", "completion"];
+  const lines = [];
+  if (summary.interrupted) lines.push("本次运行被中断，下面只统计已经写盘的用例。");
+  if (summary.represents_full_set === true) {
+    lines.push("范围: 全量默认用例目录");
+  } else {
+    lines.push("范围: 子集（不是全量评测，不能当作全量结果）");
+    lines.push(`过滤: ${formatFilters(summary.filters)}`);
+  }
+  const header = [
+    "维度",
+    "总数",
+    "自动判",
+    "自动通过",
+    "judge判",
+    "judge通过",
+    "judge未过",
+    "不确定",
+    "待人工",
+    "错误",
+    "通过率",
+    "平均延迟ms",
+    "prompt",
+    "completion",
+  ];
+  const totalLabel = summary.represents_full_set === true ? "合计" : "本次合计";
   const rows = [header, ...Object.entries(summary.by_dimension).map(([dimension, stats]) => row(dimension, stats))];
-  rows.push(row("合计", summary.overall));
+  rows.push(row(totalLabel, summary.overall));
   const widths = header.map((_, column) => Math.max(...rows.map((line) => displayWidth(line[column]))));
-  return rows
-    .map((line) => line.map((cell, column) => pad(cell, widths[column])).join("  "))
-    .join("\n");
+  lines.push(rows.map((line) => line.map((cell, column) => pad(cell, widths[column])).join("  ")).join("\n"));
+  lines.push("通过率分母 = 自动判 + judge通过 + judge未过。不含不确定、待人工、错误。");
+  lines.push("自动判、judge判、待人工是三种来源，不能加在一起冒充已完成的全量判分。");
+  return lines.join("\n");
 }
 
 function row(label, stats) {
@@ -455,9 +696,13 @@ function row(label, stats) {
     label,
     String(stats.total),
     String(stats.auto_scored),
-    String(stats.passed),
-    String(stats.failed),
+    String(stats.auto_passed),
+    String(stats.judge_scored),
+    String(stats.judge_passed),
+    String(stats.judge_failed),
+    String(stats.judge_uncertain),
     String(stats.pending),
+    String(stats.errors),
     rate,
     latency,
     String(stats.prompt_tokens),
