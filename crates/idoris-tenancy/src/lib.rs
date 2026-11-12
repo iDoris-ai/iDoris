@@ -31,3 +31,7 @@ pub mod event_log;
 /// issuance; persistence layers store [`virtual_key::VirtualKeyHash`] plus
 /// non-secret scope metadata.
 pub mod virtual_key;
+
+/// idoris.ai/api 计算服务 S4：每次请求的每次尝试、转移日志与结算分录（SQLite，只追加），
+/// 持久化 S0 契约（`idoris-compute-contracts`）的状态机与结算计划。
+pub mod attempts;

@@ -1214,6 +1214,7 @@ dependencies = [
  "futures-util",
  "http-body-util",
  "idoris-backend",
+ "idoris-compute-contracts",
  "idoris-contracts",
  "idoris-policy",
  "idoris-recommender",
@@ -1243,6 +1244,7 @@ version = "0.4.0"
 dependencies = [
  "chrono",
  "chrono-tz",
+ "idoris-compute-contracts",
  "idoris-contracts",
  "rusqlite",
  "serde",
