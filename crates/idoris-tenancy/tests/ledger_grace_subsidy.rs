@@ -669,6 +669,40 @@ fn issuing_twice_for_the_same_member_and_month_is_idempotent() {
 }
 
 #[test]
+fn a_revoked_free_tier_grant_is_not_revived_by_rerunning_the_monthly_job() {
+    // 管理员把这个月的免费额度撤销了（S2 的「关授信」）：运维重跑月度任务，同一个 (主体, 月份) 的键已经用过，
+    // 回放不能把它复活——成员仍然花不了，池也仍然按发出去的额度占着
+    let db = TempDb::new("free-revoked-replay");
+    let store = subsidy_world(&db, 1_000_000);
+    let first = issue(&store, "p-a", "kid-a", 2026, 11, 1_000, T0).unwrap();
+    let id = first.allocation().id.to_string();
+    let request = Req::new(&store, "r-1", 0, "cred-a", 100);
+    assert!(store.admit_attempt(&request.input()).unwrap().is_admitted());
+    store
+        .release_attempt(&request.attempt, ts(T0 + 10))
+        .unwrap();
+
+    revoke_allocation(&db, &id);
+    let again = issue(&store, "p-a", "kid-a", 2026, 11, 1_000, T0 + 5_000).unwrap();
+    assert!(
+        matches!(&again, FreeTierOutcome::Replayed(existing) if existing.id == first.allocation().id),
+        "{again:?}"
+    );
+    let blocked = Req::new(&store, "r-2", 0, "cred-a", 100).at(T0 + 6_000);
+    assert_eq!(
+        denied(&store.admit_attempt(&blocked.input()).unwrap()),
+        Some(ReasonCode::BudgetExhausted)
+    );
+    assert_eq!(
+        store
+            .pool_report(&aid("pool"), month(2026, 11))
+            .unwrap()
+            .granted,
+        thb(1_000)
+    );
+}
+
+#[test]
 fn the_pool_cap_bounds_what_can_be_granted_in_a_period() {
     let db = TempDb::new("free-pool-cap");
     let store = subsidy_world(&db, 1_000);

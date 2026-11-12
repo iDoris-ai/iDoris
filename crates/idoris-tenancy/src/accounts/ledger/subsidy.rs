@@ -42,7 +42,7 @@ use super::period::period_bounds;
 use super::project::{load_config, pool_cap_micros};
 use super::types::{FreeTierIssue, FreeTierOutcome};
 use crate::accounts::AccountStoreError;
-use crate::accounts::rows::{load_account, load_allocation_by_key, load_ancestors};
+use crate::accounts::rows::{load_account, load_ancestors};
 
 /// 在调用方已经开着的写事务里发放一份免费额度。语义见模块文档。
 pub(super) fn issue_free_tier_in(
@@ -76,17 +76,53 @@ pub(super) fn issue_free_tier_in(
     })?;
     let (start_ms, end_ms) = period_bounds(input.month, &config.billing_timezone)?;
 
-    // 1. 幂等：这个 (主体, 月份) 已经发过了吗
-    if let Some(existing) = load_allocation_by_key(conn, &key)? {
-        let ceiling = &existing.ceiling;
-        let same = existing.parent == parent
-            && existing.child == member.id
-            && ceiling.amount() == &input.amount
-            && ceiling.purpose() == Purpose::FreeTier
-            && ceiling.valid_from().millis() == start_ms
-            && ceiling.valid_until().millis() == end_ms;
+    // 1. 幂等：这个 (主体, 月份) 已经发过了吗。
+    //    直接读 `allocations` 的列来比对，不借用账户存储里按幂等键取额度的读函数：那个函数会随额度撤销（S2）改形状。
+    //    被撤销的额度也算「已经发过」：撤销是管理员明确关掉的，不会因为运维重跑月度任务就复活
+    //    （撤销本身记在 S2 的侧表里，`Replayed` 只表示这个键用过）。
+    type Issued = (String, String, String, String, i64, String, i64, i64);
+    let existing: Option<Issued> = conn
+        .query_row(
+            "SELECT allocation_id, parent_id, child_id, ceiling_unit, ceiling_micros, purpose,
+                    valid_from_ms, valid_until_ms
+               FROM allocations WHERE idempotency_key = ?1",
+            [key.as_str()],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                ))
+            },
+        )
+        .optional()?;
+    if let Some((id, parent_id, child_id, unit, micros, purpose, from_ms, until_ms)) = existing {
+        let same = parent_id == parent.as_str()
+            && child_id == member.id.as_str()
+            && unit == input.amount.unit.to_string()
+            && micros == input.amount.micros
+            && purpose == "free_tier"
+            && from_ms == start_ms
+            && until_ms == end_ms;
         return if same {
-            Ok(FreeTierOutcome::Replayed(existing))
+            Ok(FreeTierOutcome::Replayed(Allocation {
+                id: AllocationId::new(id)?,
+                parent: parent.clone(),
+                child: member.id.clone(),
+                ceiling: Grant::new(
+                    input.amount.clone(),
+                    Purpose::FreeTier,
+                    TimestampMs(start_ms),
+                    TimestampMs(end_ms),
+                )
+                .map_err(AccountStoreError::from)?,
+                idempotency_key: Some(key.clone()),
+            }))
         } else {
             Err(LedgerError::GrantConflict(format!(
                 "{key} was already granted with a different amount, member or window"
