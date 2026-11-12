@@ -744,10 +744,19 @@ async fn a_connection_that_closes_before_any_response_byte_switches_too() {
     .await;
     let reply = post(&s.harness.app, &simple_body(100)).await;
     assert_eq!(reply.status, 200);
-    let attempts = rows(&s.harness, &reply.request_id());
+    let id = reply.request_id();
+    let attempts = rows(&s.harness, &id);
     assert_eq!(attempts[0].state, AttemptState::MaybeExecuted);
     assert_eq!(attempts[0].failure_kind.as_deref(), Some("send_failed"));
     assert_eq!((s.alpha.request_count(), s.beta.request_count()), (1, 1));
+    // 断开前可能已经执行：成本按预留额挂账（hold），不是释放；用户侧的价预留释放
+    assert_eq!(
+        postings(&s.harness, &id)[..2],
+        [
+            p(0, "hold", RESERVED_COST, "USD"),
+            p(0, "release", RESERVED_PRICE, "THB")
+        ]
+    );
 }
 
 /// 连接被拒：没有字节到达上游，但 reqwest 的 `send` 把「连接」和「写字节」合在一个 future 里，没法在两者之间落库，
@@ -767,10 +776,19 @@ async fn a_refused_connection_is_recorded_conservatively_as_maybe_executed_with_
     );
     let reply = post(&h.app, &simple_body(100)).await;
     assert_eq!(reply.status, 200);
-    let attempts = rows(&h, &reply.request_id());
+    let id = reply.request_id();
+    let attempts = rows(&h, &id);
     assert_eq!(attempts[0].state, AttemptState::MaybeExecuted);
     assert_eq!(attempts[0].failure_kind.as_deref(), Some("connect_failed"));
     assert_eq!(beta.request_count(), 1);
+    // 保守：没连上也先按「可能执行」挂账（hold），等对账查无此单后才释放
+    assert_eq!(
+        postings(&h, &id)[..2],
+        [
+            p(0, "hold", RESERVED_COST, "USD"),
+            p(0, "release", RESERVED_PRICE, "THB")
+        ]
+    );
 }
 
 #[tokio::test]
