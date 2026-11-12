@@ -23,7 +23,11 @@ use idoris_router::{
     auth::VirtualKeyAuthenticator,
     build_app,
     capabilities::{CapabilitiesProvider, LiveCapabilitiesProvider},
-    cli, components, config,
+    cli,
+    cloud::ingress::{
+        CloudIngress, bind::ListenPlan, bind::parse_cloud_bind_host, bind::validate_public_bind,
+    },
+    components, config,
     connection::{ConnectionInfo, ConnectionListener},
     control::{AccountGate, ControlPlane, SystemControlClock},
     host_facts, parse_port, profile, routing_policy,
@@ -329,7 +333,19 @@ async fn run(options: cli::ServeOptions) -> Result<(), String> {
     let startup_form = StartupForm::from_env_value(deploy_mode, form_raw.as_deref())
         .map_err(|err| format!("{} 无效：{err}", StartupForm::ENV_VAR))?;
     let dev_no_key_enabled = env_flag("IDORIS_DEV_NO_KEY");
-    let bind_host = parse_bind_host(std::env::var(BIND_HOST_ENV).ok().as_deref())?;
+    // Compute service S5: only the cloud form may listen beyond loopback (with an explicit public configuration,
+    // checked below once the ingress configuration is loaded). Every other form parses `IDORIS_BIND_HOST` exactly
+    // as before.
+    let cloud = startup_form.is_cloud();
+    if cloud && dev_no_key_enabled {
+        return Err("IDORIS_DEV_NO_KEY=1 在云形态下不允许：云入口没有免密钥的路径".to_string());
+    }
+    let bind_host_raw = std::env::var(BIND_HOST_ENV).ok();
+    let bind_host = if cloud {
+        parse_cloud_bind_host(bind_host_raw.as_deref(), BIND_HOST_ENV)?
+    } else {
+        parse_bind_host(bind_host_raw.as_deref())?
+    };
 
     let components_dir =
         config::resolve_env("IDORIS_COMPONENTS_DIR", components::DEFAULT_COMPONENTS_DIR)?;
@@ -431,7 +447,9 @@ async fn run(options: cli::ServeOptions) -> Result<(), String> {
             .has_active_key(now_ms)
             .map_err(|err| format!("无法检查 virtual key 启动权限：{err}"))?
     };
-    validate_bind_authority(bind_host, deploy_mode, dev_no_key_enabled, has_active_key)?;
+    if !cloud {
+        validate_bind_authority(bind_host, deploy_mode, dev_no_key_enabled, has_active_key)?;
+    }
     let mut virtual_key_authenticator =
         VirtualKeyAuthenticator::new(persistent.virtual_keys.clone());
     // Compute service S2 (organization and cloud forms only: the account store exists only there). The gate makes
@@ -448,6 +466,9 @@ async fn run(options: cli::ServeOptions) -> Result<(), String> {
         }
         None => None,
     };
+
+    // The cloud ingress authenticates with the very same authenticator (virtual keys + the account gate).
+    let ingress_authenticator = cloud.then(|| virtual_key_authenticator.clone());
 
     let catalog_path = config::resolve_env("IDORIS_CATALOG", "config/catalog.yaml")?;
     let capabilities = match host_facts::current_host_facts() {
@@ -494,11 +515,37 @@ async fn run(options: cli::ServeOptions) -> Result<(), String> {
         ..AppState::default()
     };
 
-    // idoris.ai/api cloud upstream (S4): off unless IDORIS_CLOUD_UPSTREAM_CONFIG is set,
-    // and then only in tenant (cloud) form.
+    // idoris.ai/api cloud upstream (S4, form rule from S5): the cloud form requires it
+    // (IDORIS_CLOUD_UPSTREAM_CONFIG), every other form refuses it.
     let mut state = state;
-    state.cloud = idoris_router::cloud::CloudUpstream::from_env(deploy_mode)?;
+    state.cloud = idoris_router::cloud::CloudUpstream::from_env_for_form(&startup_form)?;
     state.control = control;
+
+    // idoris.ai/api cloud ingress (S5): `/api/v1`, credential-derived callers, three-level limits, public abuse
+    // protection. Cloud form only; it also decides whether the public bind is acceptable.
+    if let (Some(authenticator), Some(accounts), Some(upstream)) = (
+        ingress_authenticator,
+        persistent.accounts.clone(),
+        state.cloud.clone(),
+    ) {
+        let ingress = CloudIngress::from_env(accounts.clone(), authenticator, &upstream)?;
+        validate_public_bind(bind_host, ingress.config(), has_active_key, BIND_HOST_ENV)?;
+        for warning in ingress.startup_warnings(&accounts) {
+            eprintln!("[idoris] 警告：{warning}");
+        }
+        eprintln!(
+            "[idoris] 云入口已启用：/api/v1；受信反向代理 {} 条；控制面{}",
+            ingress.config().trusted_proxies.len(),
+            if ingress.config().control_plane_public {
+                "挂在公网监听上（control_plane.public: true）"
+            } else {
+                "不挂在公网监听上（本机运维命令仍可用）"
+            }
+        );
+        state.cloud_ingress = Some(ingress);
+    } else if cloud {
+        return Err("云形态缺少账户存储或云上游（不应该发生）".to_string());
+    }
 
     // M5-14: provider breakers stay off unless explicitly enabled; see
     // ChatProxy::set_breakers_enabled.
@@ -506,14 +553,16 @@ async fn run(options: cli::ServeOptions) -> Result<(), String> {
         .proxy
         .set_breakers_enabled(env_flag("IDORIS_PROVIDER_BREAKER"));
 
-    let addr = std::net::SocketAddr::from((bind_host, port));
+    // The listen plan is the single source of both listen addresses; Admin v0 stays on loopback whatever the data
+    // plane binds (compute service S5).
+    let plan = ListenPlan::new(bind_host, port, admin_bind)?;
+    let addr = plan.data;
     let data_listener = tokio::net::TcpListener::bind(addr)
         .await
         .map_err(|err| format!("无法绑定 {addr}：{err}"))?;
-    let admin_listener = admin_bind
-        .bind()
+    let admin_listener = tokio::net::TcpListener::bind(plan.admin)
         .await
-        .map_err(|err| format!("无法绑定 Admin {}：{err}", admin_bind.addr()))?;
+        .map_err(|err| format!("无法绑定 Admin {}：{err}", plan.admin))?;
     let admin_token = if options.admin_token_stdin {
         read_admin_token_from_stdin()?
     } else {
