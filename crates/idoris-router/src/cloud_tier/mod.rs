@@ -110,7 +110,9 @@ use idoris_contracts::common::{Capability, FallbackPolicy, PrivacyClass, Tier};
 use idoris_contracts::component_card::{Egress, Form};
 use idoris_contracts::load_policy::{Admission, Keepalive, LoadMode, LoadPolicy};
 use idoris_contracts::provider::{Cost, Family, Locality, ProviderDescriptor};
-use idoris_tenancy::cloud_tier::{CallFinish, CallOutcome, CallTicket, CloudTierStore};
+use idoris_tenancy::cloud_tier::{
+    CallFinish, CallOutcome, CallTicket, CloudTierStore, CloudTierStoreError,
+};
 use serde_json::Value;
 
 use crate::cloud::{Clock, SystemClock};
@@ -385,18 +387,32 @@ impl CloudTier {
             .unwrap_or(Err(CredentialError::Unreadable))
     }
 
-    async fn record_begin(&self, local_request_id: &str) -> Option<CallTicket> {
+    /// 先落一行 `pending`，落不下返回 `None`（调用方不出网）。返回的 [`PendingCall`] 看守着这一行：
+    /// 在它被 [`PendingCall::disarm`] 之前被丢掉（调用方挂断，整个处理 future 被丢），这一行会被写成 `cancelled`。
+    ///
+    /// 写库在 `spawn_blocking` 里做；「行已经落下」和「看守已经存在」之间没有任何让出点：如果调用方正好在写库时挂断
+    /// （接收端已经没了），看守在阻塞线程里当场被丢掉，同样把这一行写成 `cancelled`。
+    async fn record_begin(&self, local_request_id: &str) -> Option<PendingCall> {
         let store = self.store.clone();
+        let clock = self.clock.clone();
         let id = local_request_id.to_string();
         let now = self.now_ms();
-        tokio::task::spawn_blocking(move || store.begin_call(&id, 1, now))
-            .await
-            .ok()?
-            .map_err(|error| eprintln!("[idoris] 云端档：无法记录出网调用，不发送：{error}"))
-            .ok()
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        tokio::task::spawn_blocking(move || match store.begin_call(&id, 1, now) {
+            Ok(ticket) => {
+                // `Err(guard)`（接收端已经被丢掉）：guard 在这里被 drop，把刚落下的行写成 cancelled
+                let _ = sender.send(PendingCall::armed(store, clock, ticket));
+            }
+            Err(error) => eprintln!("[idoris] 云端档：无法记录出网调用，不发送：{error}"),
+        });
+        receiver.await.ok()
     }
 
-    async fn record_finish(&self, ticket: CallTicket, finish: OwnedFinish) -> Result<(), String> {
+    async fn record_finish(
+        &self,
+        ticket: CallTicket,
+        finish: OwnedFinish,
+    ) -> Result<(), CloudTierStoreError> {
         let store = self.store.clone();
         let result = tokio::task::spawn_blocking(move || {
             store.finish_call(
@@ -414,9 +430,10 @@ impl CloudTier {
         })
         .await;
         match result {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(error)) => Err(error.to_string()),
-            Err(_) => Err("record worker failed".to_string()),
+            Ok(outcome) => outcome,
+            Err(_) => Err(CloudTierStoreError::Corrupt(
+                "record worker failed".to_string(),
+            )),
         }
     }
 }
@@ -430,6 +447,52 @@ struct OwnedFinish {
     cloud_reason: Option<String>,
     tokens_in: Option<u64>,
     tokens_out: Option<u64>,
+}
+
+/// 一行已经落下、还没有终态的 `pending` 调用记录的看守。
+///
+/// 调用方在回落途中挂断时，hyper 会把整个处理 future 丢掉（本机路径里 `ReservationGuard` / `CancelOnDrop` 应对的是同一件事）。
+/// 没有这个看守，那一行会一直是 `pending`：对账游标不能越过 `pending` 行，要等到下次启动才会被标成 `interrupted`。
+/// 出网的请求随 future 一起被丢掉（连接关闭），所以这时的结局是 `cancelled`：出网了、没有答复、没有金额。
+///
+/// 正常路径自己写终态：先 [`Self::disarm`]（之后 drop 什么都不做），紧接着（中间没有任何让出点）调 `record_finish`。
+struct PendingCall {
+    store: Arc<CloudTierStore>,
+    clock: Arc<dyn Clock>,
+    ticket: CallTicket,
+    armed: bool,
+}
+
+impl PendingCall {
+    fn armed(store: Arc<CloudTierStore>, clock: Arc<dyn Clock>, ticket: CallTicket) -> Self {
+        Self {
+            store,
+            clock,
+            ticket,
+            armed: true,
+        }
+    }
+
+    /// 拿回凭条，自己来写终态。
+    fn disarm(&mut self) -> CallTicket {
+        self.armed = false;
+        self.ticket.clone()
+    }
+}
+
+impl Drop for PendingCall {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let finish = CallFinish::without_answer(CallOutcome::Cancelled, self.clock.now().0);
+        match self.store.finish_call(&self.ticket, &finish) {
+            Ok(()) | Err(CloudTierStoreError::AlreadyFinal(_)) => {}
+            Err(error) => eprintln!(
+                "[idoris] 云端档：调用方挂断后无法把调用记录写成 cancelled（{error}），这一行会在下次启动时被标成 interrupted"
+            ),
+        }
+    }
 }
 
 fn fail_fast(provider: &dyn CredentialProvider, what: &str) -> Result<(), String> {
@@ -643,7 +706,9 @@ pub(crate) async fn fallback(
     {
         return annotate(original, "audit_unavailable");
     }
-    let Some(ticket) = tier.record_begin(scope.record_id).await else {
+    let Some(mut pending) = tier.record_begin(scope.record_id).await else {
+        // 前面的 dispatched 事件已经写了：补一个 completed（失败），事件流不留一个有头无尾的出网尝试
+        complete_event(scope, &selected, "failure").await;
         return annotate(original, "store_unavailable");
     };
 
@@ -661,6 +726,9 @@ pub(crate) async fn fallback(
     )
     .await;
     drop(loaded);
+    // 这一步之前被丢掉（调用方挂断）：`pending` 把行写成 cancelled。从这里起终态由下面的 `record_finish` 写；
+    // 它在第一次被 poll 时就把写库交给了阻塞线程池，之后即使 future 被丢掉，写库也会完成。
+    let ticket = pending.disarm();
 
     match result {
         Ok(answer) => {
@@ -675,7 +743,7 @@ pub(crate) async fn fallback(
             };
             if let Err(error) = tier.record_finish(ticket.clone(), finish).await {
                 // 同一个云端 record id 已经对应了别的本机请求：这个答复不可信，不交给调用方。
-                if error.contains("already recorded for another local request") {
+                if matches!(error, CloudTierStoreError::CloudRecordConflict) {
                     let retry = OwnedFinish {
                         outcome: CallOutcome::InvalidResponse,
                         finished_at_ms: tier.now_ms(),

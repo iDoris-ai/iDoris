@@ -547,6 +547,141 @@ fn crash_leftovers_are_marked_interrupted_when_the_tier_starts() {
 }
 
 // ------------------------------------------------------------------------------------------------
+// pending 行的看守：调用方挂断（处理 future 被丢掉）时，这一行必须落成终态，不能一直 pending
+// ------------------------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_pending_call_that_is_dropped_is_finished_as_cancelled_and_a_disarmed_one_is_left_to_its_owner()
+ {
+    use idoris_tenancy::cloud_tier::CallState;
+    let tier = tier_for_body_tests();
+
+    // 没有 disarm 就被丢掉（调用方在出网途中挂断）：写成 cancelled，没有云端 id、没有金额
+    let pending = tier.record_begin("req-dropped").await.unwrap();
+    let row = tier
+        .store()
+        .call_by_local_id("req-dropped", 1)
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.state, CallState::Pending);
+    drop(pending);
+    let row = tier
+        .store()
+        .call_by_local_id("req-dropped", 1)
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.state, CallState::Final(CallOutcome::Cancelled));
+    assert!(row.finished_at_ms.is_some());
+    assert_eq!(
+        (
+            row.cloud_record_id,
+            row.http_status,
+            row.cloud_reason,
+            row.tokens_in,
+            row.tokens_out
+        ),
+        (None, None, None, None, None)
+    );
+
+    // disarm 之后 drop 什么都不做：终态由正常路径写（这里写成 served，带云端 id 和用量）
+    let mut pending = tier.record_begin("req-finished").await.unwrap();
+    let ticket = pending.disarm();
+    drop(pending);
+    assert_eq!(
+        tier.store()
+            .call_by_local_id("req-finished", 1)
+            .unwrap()
+            .unwrap()
+            .state,
+        CallState::Pending,
+        "dropping a disarmed guard must not touch the row"
+    );
+    tier.record_finish(
+        ticket,
+        OwnedFinish {
+            outcome: CallOutcome::Served,
+            finished_at_ms: 9,
+            cloud_record_id: Some("cloud-1".to_string()),
+            http_status: Some(200),
+            cloud_reason: None,
+            tokens_in: Some(3),
+            tokens_out: Some(4),
+        },
+    )
+    .await
+    .unwrap();
+    let row = tier
+        .store()
+        .call_by_local_id("req-finished", 1)
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.state, CallState::Final(CallOutcome::Served));
+    assert_eq!(row.cloud_record_id.as_deref(), Some("cloud-1"));
+
+    // 已经有终态的行：看守再被丢掉也不覆盖它
+    let mut pending = tier.record_begin("req-already-final").await.unwrap();
+    let ticket = pending.disarm();
+    tier.record_finish(
+        ticket,
+        OwnedFinish {
+            outcome: CallOutcome::Timeout,
+            finished_at_ms: 9,
+            cloud_record_id: None,
+            http_status: None,
+            cloud_reason: None,
+            tokens_in: None,
+            tokens_out: None,
+        },
+    )
+    .await
+    .unwrap();
+    pending.armed = true;
+    drop(pending);
+    assert_eq!(
+        tier.store()
+            .call_by_local_id("req-already-final", 1)
+            .unwrap()
+            .unwrap()
+            .state,
+        CallState::Final(CallOutcome::Timeout)
+    );
+}
+
+#[tokio::test]
+async fn a_caller_that_hangs_up_while_the_pending_row_is_being_written_still_ends_up_with_a_final_row()
+ {
+    use idoris_tenancy::cloud_tier::CallState;
+    let tier = tier_for_body_tests();
+    // 零时限：`record_begin` 被 poll 一次（写库已经交给了阻塞线程）就被丢掉，接收端随之消失
+    let attempt = tokio::time::timeout(
+        std::time::Duration::ZERO,
+        tier.record_begin("req-hangup-during-begin"),
+    )
+    .await;
+    // 写库抢在丢弃之前完成时，看守已经在手上：它也一样被丢掉
+    drop(attempt);
+    // 不管谁抢在前：这一行最终必须是 cancelled，不能停在 pending
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let row = tier
+            .store()
+            .call_by_local_id("req-hangup-during-begin", 1)
+            .unwrap();
+        if let Some(row) = row
+            && row.state != CallState::Pending
+        {
+            assert_eq!(row.state, CallState::Final(CallOutcome::Cancelled));
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the row stayed pending after the caller hung up"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+// ------------------------------------------------------------------------------------------------
 // 本地密钥探针
 // ------------------------------------------------------------------------------------------------
 
