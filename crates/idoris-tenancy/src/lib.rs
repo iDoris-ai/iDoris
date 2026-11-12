@@ -38,5 +38,11 @@ pub mod virtual_key;
 /// tenant deployments keep their connections exactly as they were.
 pub mod sqlite_conn;
 
+/// Account storage for the compute service (S1): principals, memberships,
+/// payment accounts (the allocation-delegation tree), credentials and
+/// allocations, stored as the frozen S0 contract types. Opened only by the
+/// organization and cloud forms.
+pub mod accounts;
+
 #[cfg(test)]
 pub(crate) mod test_support;
