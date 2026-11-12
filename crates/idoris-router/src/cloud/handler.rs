@@ -16,7 +16,17 @@
 //! | 流中途失败（首字节之后） | 状态码已经是 200 | 流以一个 `{"error":{"type":"upstream_error",...}}` 事件结束，**没有** `[DONE]` |
 //!
 //! edu（`child_edu`）租户在 P0 **一律非流式**（设计稿 §6）：流式请求在任何上游调用之前就被拒绝
-//! （400 `streaming_not_allowed`）。完整输出检查本身是 S6 的事。
+//! （400 `streaming_not_allowed`）。儿童安全管线（S6）在执行器里：输入检查 -> 上游非流式调用 -> 完整输出检查，
+//! 通过之后才有可发布的回答；这里只负责把结果翻译成 HTTP：
+//!
+//! | 情形 | 状态码 | `error.type` / `reason_code` / 头 |
+//! |---|---|---|
+//! | 输入检查拒绝（上游没有收到任何字节，用户付 0） | 422 | `safety_input_blocked`；`stage` / `category`；`X-iDoris-Reason` |
+//! | 完整输出检查拒绝（回答没有发给客户端，用户付 0，成本由平台承担） | 422 | `safety_output_blocked`；同上 |
+//! | 安全检查没能给出结论（超时、出错、返回无法解析、没有配置……），失败即关闭 | 503 | `safety_unavailable`；`stage` / `cause`；`X-iDoris-Reason` |
+//!
+//! 给 eduai 的是稳定的码，**不回显被拒的内容**；`category`（自伤、成人内容……）只在这次响应里给，让 eduai 选对给孩子的话术，
+//! 不写进任何账本、日志或审计。
 
 use std::sync::Arc;
 
@@ -26,6 +36,9 @@ use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use idoris_compute_contracts::ids::RequestId;
 use idoris_compute_contracts::reason::ReasonCode;
+use idoris_compute_contracts::safety::{
+    SafetyCategory, SafetyReasonCode, SafetyStage, SafetyUnavailableCause,
+};
 use idoris_tenancy::virtual_key::store::AuthenticatedVirtualKey;
 
 use super::answer::{AnswerMeta, CloudOutcome};
@@ -70,14 +83,9 @@ pub(crate) async fn chat_completions(
             "the requested model is not served by this endpoint",
         );
     };
-    // edu 一律非流式（设计稿 §6）：先于任何上游调用拒绝
+    // edu 一律非流式（设计稿 §6）：先于任何上游调用拒绝（执行器里还有一道同样的检查）
     if request.stream && caller.tenant.handles_child_data() {
-        return error_envelope_with_reason(
-            StatusCode::BAD_REQUEST,
-            "streaming_not_allowed",
-            "streaming_not_allowed",
-            "streaming is not available for this tenant; send a non-streaming request",
-        );
+        return error_response(&CloudError::StreamingNotAllowed);
     }
     let Ok(request_id) = RequestId::new(record_id.clone()) else {
         return error_envelope(
@@ -272,6 +280,26 @@ pub(crate) fn error_response(error: &CloudError) -> Response {
             "client_cancelled",
             "the client closed the request",
         ),
+        CloudError::StreamingNotAllowed => error_envelope_with_reason(
+            StatusCode::BAD_REQUEST,
+            "streaming_not_allowed",
+            "streaming_not_allowed",
+            "streaming is not available for this tenant; send a non-streaming request",
+        ),
+        CloudError::SafetyBlocked { stage, category } => safety_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            SafetyReasonCode::blocked_at(*stage),
+            *stage,
+            Some(*category),
+            None,
+        ),
+        CloudError::SafetyUnavailable { stage, cause } => safety_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            SafetyReasonCode::SafetyUnavailable,
+            *stage,
+            None,
+            Some(*cause),
+        ),
         CloudError::Admission(_) | CloudError::Ledger(_) | CloudError::Internal(_) => {
             // 内部细节只进日志（日志里没有请求内容，也没有密钥），不进响应
             eprintln!("[idoris] cloud: request failed closed: {error}");
@@ -282,4 +310,80 @@ pub(crate) fn error_response(error: &CloudError) -> Response {
             )
         }
     }
+}
+
+/// 儿童安全的拒绝响应（S6）：稳定的码 + 阶段 + 类别或原因细节。**没有任何被拒的内容。**
+/// 码同时放进 `X-iDoris-Reason` 响应头（浏览器读不到响应体里的 `error.reason_code`，但能读响应头，设计稿 §5）。
+fn safety_response(
+    status: StatusCode,
+    code: SafetyReasonCode,
+    stage: SafetyStage,
+    category: Option<SafetyCategory>,
+    cause: Option<SafetyUnavailableCause>,
+) -> Response {
+    let remediation = match (code, stage) {
+        (SafetyReasonCode::SafetyInputBlocked, _) => {
+            "the request did not pass the child-safety check; nothing was sent to a model"
+        }
+        (SafetyReasonCode::SafetyOutputBlocked, _) => {
+            "the reply did not pass the child-safety check and was withheld; nothing was delivered"
+        }
+        (SafetyReasonCode::SafetyUnavailable, SafetyStage::Input) => {
+            "the child-safety check could not be completed; nothing was sent to a model"
+        }
+        (SafetyReasonCode::SafetyUnavailable, SafetyStage::Output) => {
+            "the child-safety check could not be completed; the reply was withheld and nothing was delivered"
+        }
+    };
+    let mut error = serde_json::json!({
+        "type": code.as_str(),
+        "rule_id": null,
+        "reason_code": code.as_str(),
+        "evidence": null,
+        "remediation": remediation,
+        "stage": stage.as_str(),
+    });
+    if let Some(category) = category {
+        error["category"] = serde_json::Value::String(category.as_str().to_string());
+    }
+    if let Some(cause) = cause {
+        error["cause"] = serde_json::Value::String(cause.as_str().to_string());
+    }
+    let mut response = (status, axum::Json(serde_json::json!({ "error": error }))).into_response();
+    response
+        .headers_mut()
+        .insert(HEADER_REASON, HeaderValue::from_static(code.as_str()));
+    response
+}
+
+/// 云形态打开时挂在旧推理路由（`/v1/messages`、`/v1/embeddings`、`/v1/rerank`）前面的守卫（S6）：
+/// 这些路由是旧的本地流水线，**没有儿童安全管线**。处理儿童数据的租户走到这里一律 403，
+/// 否则孩子的 key 换个路径就绕过了输入检查和完整输出检查（也绕过了 edu 关缓存）。
+///
+/// 解析方式和 [`chat_completions`] 完全一样：看已验明的虚拟 key 上的租户，在调用方簿里找数据策略；
+/// 不看任何请求头、请求体字段。簿里没有的租户（不是云调用方）照旧由旧流水线处理，不在这里改变任何行为。
+pub(crate) async fn child_route_guard(
+    State(state): State<Arc<AppState>>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    if let Some(cloud) = state.cloud.as_ref() {
+        let tenant_id = request
+            .extensions()
+            .get::<AuthenticatedVirtualKey>()
+            .and_then(|identity| identity.scope.tenant_id.as_deref());
+        if cloud
+            .callers
+            .resolve(tenant_id)
+            .is_some_and(|caller| caller.tenant.handles_child_data())
+        {
+            return error_envelope_with_reason(
+                StatusCode::FORBIDDEN,
+                "child_route_unavailable",
+                "child_route_unavailable",
+                "this endpoint is not available for tenants that process children's data; use POST /v1/chat/completions",
+            );
+        }
+    }
+    next.run(request).await
 }

@@ -87,6 +87,8 @@ use serde::de::{self, Visitor};
 use serde::{Deserialize, Deserializer};
 use serde_json::{Map, Value};
 
+use super::safety::config::{BuildInputs, SafetyConfig, SafetySetup};
+
 /// 指向配置文件的环境变量。不设 = 云上游关闭。
 pub const CONFIG_ENV: &str = "IDORIS_CLOUD_UPSTREAM_CONFIG";
 
@@ -278,6 +280,9 @@ pub struct CloudConfigFile {
     pub endpoints: Vec<EndpointConfig>,
     pub routes: Vec<RouteConfig>,
     pub callers: Vec<CallerConfig>,
+    /// S6 儿童安全：有处理儿童数据的调用方（`data_classes` 含 `child_edu`）时必填，见 [`super::safety::config`]。
+    #[serde(default)]
+    pub safety: Option<SafetyConfig>,
 }
 
 // ---------------------------------------------------------------------------
@@ -393,6 +398,34 @@ impl CallerBook {
             None => self.default.as_ref(),
         }
     }
+
+    /// 是否有任何调用方处理儿童数据（`data_classes` 含 `child_edu`）。
+    pub fn has_child_data_callers(&self) -> bool {
+        self.by_tenant
+            .values()
+            .chain(self.default.iter())
+            .any(|caller| caller.tenant.handles_child_data())
+    }
+
+    /// 处理儿童数据的调用方的租户标识，格式与 `ChatProxy` 的缓存键里的租户范围一致：
+    /// 有租户的就是租户 id；默认调用方（没有租户）是 `"\u{0}personal"`。
+    /// 用来关掉这些租户在旧代理路径上的响应缓存（S6：edu 关缓存）。
+    pub fn child_data_tenant_scopes(&self) -> std::collections::BTreeSet<String> {
+        let mut scopes: std::collections::BTreeSet<String> = self
+            .by_tenant
+            .iter()
+            .filter(|(_, caller)| caller.tenant.handles_child_data())
+            .map(|(tenant, _)| tenant.clone())
+            .collect();
+        if self
+            .default
+            .as_ref()
+            .is_some_and(|caller| caller.tenant.handles_child_data())
+        {
+            scopes.insert("\u{0}personal".to_string());
+        }
+        scopes
+    }
 }
 
 /// 加载好的全部部件。
@@ -403,6 +436,8 @@ pub struct CloudParts {
     pub callers: CallerBook,
     pub limits: CloudLimits,
     pub reserve_policy: ReservePolicy,
+    /// S6：安全检查（检查器、上限、启动警告）。没有配置 `safety:` 段为 `None`（只有在没有儿童调用方时才可能）。
+    pub safety: Option<SafetySetup>,
 }
 
 // ---------------------------------------------------------------------------
@@ -445,7 +480,10 @@ fn parse_unit(field: &str, text: &str) -> Result<Unit, String> {
     Ok(unit)
 }
 
-fn rate_card_cost(field: &str, rate: &RateConfig) -> Result<(Unit, RateCard<Cost>), String> {
+pub(crate) fn rate_card_cost(
+    field: &str,
+    rate: &RateConfig,
+) -> Result<(Unit, RateCard<Cost>), String> {
     let unit = parse_unit(field, &rate.unit)?;
     let make = |name: &str, text: &str| -> Result<Cost, String> {
         Cost::from_micros(
@@ -487,12 +525,14 @@ fn rate_card_price(field: &str, rate: &RateConfig) -> Result<(Unit, RateCard<Pri
     Ok((unit, card))
 }
 
-fn key_of(provider: &str, model: &str, endpoint: &str) -> Result<EndpointKey, String> {
+pub(crate) fn key_of(provider: &str, model: &str, endpoint: &str) -> Result<EndpointKey, String> {
     EndpointKey::new(provider, model, endpoint)
         .map_err(|e| bad(format!("端点 {provider}/{model}@{endpoint}: {e}")))
 }
 
-fn build_credentials(config: &EndpointConfig) -> Result<Arc<dyn CredentialSource>, String> {
+pub(crate) fn build_credentials(
+    config: &EndpointConfig,
+) -> Result<Arc<dyn CredentialSource>, String> {
     match (&config.api_key_env, &config.api_key_file) {
         (Some(env), None) if !env.trim().is_empty() => Ok(Arc::new(EnvCredentialSource::new(env))),
         (None, Some(path)) => Ok(Arc::new(FileCredentialSource::new(path))),
@@ -716,11 +756,38 @@ pub fn parse(text: &str, base_dir: &Path, now: TimestampMs) -> Result<CloudParts
         }
     }
 
+    // 安全检查（S6）：有儿童调用方就必须配置；LLM 检查端点要用许可表校验，不合规启动失败
+    let child_policies: Vec<&TenantDataPolicy> = by_tenant
+        .values()
+        .chain(default.iter())
+        .map(|caller: &CallerPolicy| &caller.tenant)
+        .filter(|tenant| tenant.handles_child_data())
+        .collect();
+    let safety = match &file.safety {
+        Some(config) => Some(super::safety::config::build(
+            config,
+            &BuildInputs {
+                permits: &Arc::new(permits.clone()),
+                endpoints: &file.endpoints,
+                http: &http,
+                child_policies: child_policies.clone(),
+                now,
+            },
+        )?),
+        None if !child_policies.is_empty() => {
+            return Err(bad(
+                "有调用方处理儿童数据（data_classes 含 child_edu），必须配置 safety: 段（安全检查是儿童业务上线的前提，设计稿 §7）",
+            ));
+        }
+        None => None,
+    };
+
     Ok(CloudParts {
         permits,
         endpoints: EndpointRegistry::new(runtimes),
         routes: RouteBook::new(routes),
         callers: CallerBook::new(by_tenant, default),
+        safety,
         limits: CloudLimits {
             total_deadline: Duration::from_millis(limits.total_deadline_ms),
             response_head: Duration::from_millis(limits.response_head_timeout_ms),

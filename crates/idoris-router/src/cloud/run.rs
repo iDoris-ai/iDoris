@@ -23,6 +23,7 @@ use std::sync::Arc;
 
 use idoris_compute_contracts::attempt::{AttemptEvent, AttemptState, AttemptStateKind};
 use idoris_compute_contracts::ids::{AttemptId, AttemptIndex, SupplierRequestId};
+use idoris_compute_contracts::permit::DataClass;
 use idoris_compute_contracts::pricing::{USAGE_ROUNDING, Usage, usage_amount};
 use idoris_compute_contracts::reason::ReasonCode;
 use idoris_compute_contracts::request::{AdmittedCandidate, Attempt, Request};
@@ -52,6 +53,12 @@ pub(crate) struct RunState {
     finalized: bool,
     /// 没有任何尝试发布时，写进请求记录的稳定原因。
     pub(crate) close_reason: Option<&'static str>,
+    /// 这个请求的租户处理儿童数据（`child_edu`）：回答必须先通过完整输出检查（S6）才能发布。
+    /// 由请求的数据类别**在创建时**决定（`NewRequest::data_classes`），不是调用方事后设置的：
+    /// 以后不论谁新增一个 HTTP 入口、谁在哪里调用 `publish`，儿童租户的回答没有放行标记就发布不出去。
+    requires_clearance: bool,
+    /// 完整输出检查已经放行（只有 [`RunState::clear_for_publication`] 能置位）。
+    cleared: bool,
 }
 
 impl RunState {
@@ -81,7 +88,14 @@ impl RunState {
             admission_reasons: vec![reason],
             finalized: false,
             close_reason: None,
+            requires_clearance: meta.data_classes.contains(&DataClass::ChildEdu),
+            cleared: false,
         })
+    }
+
+    /// 完整输出检查放行了：之后才能发布（S6）。
+    pub(crate) fn clear_for_publication(&mut self) {
+        self.cleared = true;
     }
 
     fn now(&self) -> idoris_compute_contracts::ids::TimestampMs {
@@ -215,6 +229,13 @@ impl RunState {
     /// 记下「已向客户端输出第一个字节」：**先落库，再改内存**。失败时调用方**不能**把内容交给客户端
     /// （否则用户拿到了输出却没有记账）。
     pub(crate) fn publish(&mut self, idx: AttemptIndex) -> Result<(), CloudError> {
+        // 儿童租户的回答没有通过完整输出检查就不能发布：不记发布、不交付任何字节（失败即关闭）
+        if self.requires_clearance && !self.cleared {
+            return Err(CloudError::Internal(
+                "a child-data answer cannot be published before the full-output safety check cleared it"
+                    .to_string(),
+            ));
+        }
         let id = self.attempt_id(idx)?;
         self.store
             .record_publish(&id, self.now())

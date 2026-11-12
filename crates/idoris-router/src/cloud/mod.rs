@@ -11,6 +11,7 @@
 //! | [`admission`] | 候选准入的接口（S3 的接缝）与 S4 的简单实现（只算预留额，一律放行，TODO(S3)） |
 //! | [`config`] | 云上游配置（YAML）：地址、密钥来源、价目、路由、静态调用方 |
 //! | [`clock`] | 时钟（许可表的核验过期按「现在」判，测试要能拨） |
+//! | [`safety`] | **S6 儿童安全**：租户属性绑定的安全管线、规则 / LLM 检查器、成本接口、进程级「不落盘」加固 |
 //!
 //! 协议与传输（OpenAI 兼容的请求、SSE、usage 解析、超时、密钥不外泄）在 `idoris-upstream::cloud`；
 //! 尝试记录与结算分录（SQLite，只追加，触发器兜底）在 `idoris-tenancy::attempts`。
@@ -27,8 +28,11 @@
 //! - **S3**：实现 [`admission::CandidateAdmission`]（五项准入、有担保的负值、宽限），换掉 [`admission::SimpleAdmission`]；
 //! - **S1 / S2 / S5**：[`config::CallerBook`] 是静态替身，换成按凭证解析的付款上下文（`resolve_payment_context`）
 //!   和租户数据策略；云入口（`/api/v1`、从凭证推导租户）接在 `handler` 前面；
-//! - **S6**：非流式回答在发布前停在 [`answer::PendingAnswer`]，完整输出检查放在 `publish()` 之前，不通过就
-//!   `withhold(..)`（用户付 0）；edu 一律非流式的拒绝已经在 `handler` 里（先于任何上游调用）。
+//! - **S6**（已完成）：非流式回答在发布前停在 [`answer::PendingAnswer`]，完整输出检查放在 `publish()` 之前，不通过就
+//!   `withhold(..)`（用户付 0）；edu 一律非流式的拒绝在 `handler` 里（先于任何上游调用），执行器里再查一道。
+//!   管线在 [`CloudExecutor::execute`]：处理儿童数据的租户（`TenantDataPolicy::handles_child_data()`）输入检查 -> 上游调用 ->
+//!   完整输出检查，见 [`safety`] 的流程图。S6 留给 S3 的接缝是 [`safety::ExtraCostMeter`]（安全检查成本的预留与结算，
+//!   现在是 [`safety::SimpleExtraCost`]，`TODO(S3)`）。
 
 //!
 //! # 对设计稿 / S0 含糊处的理解（没有悄悄拍板，等 owner 确认）
@@ -62,6 +66,34 @@
 //!     `QUOTA` 单位在云形态被拒绝。S1 / S2 / S5 落地后换成账户库里按凭证解析的真实付款上下文。
 //! 12. **`Request` 的持久化**：创建时的快照 JSON（不可变）+ 规范化的查询列；`state_json` 是状态的真相，`state`、`certainty`、
 //!     usage 是它的派生列（CHECK 与生成列）。
+//!
+//! # S6（儿童安全）对设计稿 / S0 含糊处的理解（没有悄悄拍板，等 owner 确认）
+//!
+//! 13. **「租户属性」就是 `TenantDataPolicy::handles_child_data()`**（`data_classes` 含 `child_edu`），来自服务端配置的调用方簿
+//!     （S1/S2/S5 之后是账户存储），经虚拟 key 绑定的租户解析；模型名、路由别名、任何请求头和请求体字段都改不了它。
+//!     没有另设一个布尔字段：S0 已经有这个属性，并且它同时决定了端点许可表的硬约束（ZDR + 已签 DPA）。
+//! 14. **管线放在执行器里，不是 handler 里**：任何入口（S5 的云入口、测试直接调执行器）走到执行器，edu 都绕不过。
+//!     `RunState` 还有一道发布守卫：儿童请求的回答没有「输出检查放行」标记就发布不出去，标记在请求创建时由数据类别决定。
+//! 15. **edu 的响应体是重建的，不是上游原样**：只含 `content` / `refusal` / `tool_calls` 和校验过的 `id` / `model` /
+//!     `finish_reason` / 只含数字的 `usage`；上游多出来的文本字段（`reasoning_content`、`annotations`、`provider`……）不转发，
+//!     因为没有检查过。非 edu 的响应体照旧原样。
+//! 16. **输出被拒不换候选重试**：被拒的回答对应的尝试已经执行了（用户付 0，平台承担成本）；P0 不为了「换个模型再答一次」
+//!     继续花钱，也不给孩子（或试探者）一个反复试探安全系统的循环。
+//! 17. **检查结果和拒绝码**：`safety_input_blocked` / `safety_output_blocked` 用 HTTP 422，`safety_unavailable` 用 503
+//!     （4xx 不会被 OpenAI 兼容客户端自动重试，503 才应该稍后重试）。设计稿只说「拒绝放行」，没有定状态码。
+//! 18. **类别不落盘**：拦截类别（自伤、成人内容……）是从孩子的话里推出来的敏感推断，只在当次响应里给 eduai；
+//!     请求记录里只有粗的码（`safety_input_blocked`），日志里也没有类别（PDPA 第 26 条把健康等列为敏感数据，设计稿 §7 要求最小化）。
+//! 19. **系统消息只查越狱类规则**：运营方的系统提示会复述要拒绝的话题（评测集的 `DEFAULT_SYSTEM` 就是），按话题规则查会把
+//!     自己的提示拒掉。代价是：孩子的话被塞进 `system` 角色时，规则检查器只会按越狱类查它（LLM 检查器查全部）。
+//!     要更严需要系统提示白名单（哈希），P0 没做，等 owner 决定。
+//! 20. **只用规则检查器必须显式确认**：`safety.mode` 必填，`rules_only` 启动时留一行警告。是否强制 child_edu 必须配 LLM 检查器
+//!     （建议是），等 owner 决定。
+//! 21. **安全检查成本只有接口，没有账本**：[`safety::SimpleExtraCost`] 只在内存里记账，进程重启就丢，所以在 S3 的实现接上之前，
+//!     LLM 检查器的成本**没有**真正计入准入和结算；谁承担（用户还是平台）也是 S3 的决定。
+//! 22. **非文本内容、过长文本一律拒绝**：图片、音频、文件等无法检查的内容按 `unsupported_content` 拒绝；超过检查上限的文本按
+//!     `safety_unavailable`（`too_large`）拒绝。语音转写的检查是 P1。
+//! 23. **旧路由对儿童租户关闭**：云形态打开时，`/v1/messages`、`/v1/embeddings`、`/v1/rerank` 仍是旧的本地流水线，没有安全管线，
+//!     对儿童租户一律 403（`child_route_unavailable`）；`ChatProxy` 对这些租户同时关闭响应缓存。
 
 use std::path::Path;
 use std::sync::Arc;
@@ -77,6 +109,7 @@ pub mod executor;
 mod handler;
 mod request;
 mod run;
+pub mod safety;
 
 pub use admission::{AdmissionError, AdmissionRequest, CandidateAdmission, SimpleAdmission};
 pub use answer::{AnswerMeta, CloudOutcome, CloudStream, PendingAnswer, PublishedAnswer};
@@ -86,8 +119,12 @@ pub use config::{
 };
 pub use executor::{CloudCall, CloudError, CloudExecutor, FailureInfo, status_allows_failover};
 pub use run::Settled;
+pub use safety::{
+    ExtraCostMeter, GateDenial, SafetyChecker, SafetyGate, SafetyLimits, SafetyPipeline,
+    SimpleExtraCost, Verdict,
+};
 
-pub(crate) use handler::chat_completions;
+pub(crate) use handler::{chat_completions, child_route_guard};
 
 /// 云上游：执行器 + 路由簿 + 调用方簿。挂在 `AppState.cloud` 上。
 pub struct CloudUpstream {
@@ -119,26 +156,67 @@ impl CloudUpstream {
             callers,
             limits,
             reserve_policy,
+            safety,
         } = parts;
+        let mut executor = CloudExecutor::new(
+            Arc::new(permits),
+            Arc::new(endpoints),
+            admission,
+            store,
+            clock,
+            reserve_policy,
+            limits,
+        );
+        if let Some(setup) = safety {
+            // TODO(S3)：换成读写账本的 ExtraCostMeter（见 `with_extra_cost_meter`）
+            executor =
+                executor.with_safety(Arc::new(setup.into_gate(Arc::new(SimpleExtraCost::new()))));
+        }
         Self {
-            executor: CloudExecutor::new(
-                Arc::new(permits),
-                Arc::new(endpoints),
-                admission,
-                store,
-                clock,
-                reserve_policy,
-                limits,
-            ),
+            executor,
             callers,
             routes,
         }
+    }
+
+    /// 用给定的儿童安全 gate 换掉配置里的（测试和装配用）。
+    pub fn with_safety(mut self, gate: SafetyGate) -> Self {
+        self.executor = self.executor.with_safety(Arc::new(gate));
+        self
+    }
+
+    /// 换掉安全检查成本的计量器（S3 的接缝，`TODO(S3)`）。没有装安全 gate 时什么都不做。
+    pub fn with_extra_cost_meter(mut self, meter: Arc<dyn ExtraCostMeter>) -> Self {
+        if let Some(gate) = self.executor.safety.take() {
+            self.executor.safety = Some(Arc::new(gate.as_ref().clone().with_cost(meter)));
+        }
+        self
+    }
+
+    /// 配置里有没有处理儿童数据的调用方。
+    pub fn has_child_data_callers(&self) -> bool {
+        self.callers.has_child_data_callers()
+    }
+
+    /// 处理儿童数据的租户标识（`ChatProxy` 缓存键里的租户范围格式），给旧代理路径关缓存用。
+    pub fn child_data_tenant_scopes(&self) -> std::collections::BTreeSet<String> {
+        self.callers.child_data_tenant_scopes()
+    }
+
+    /// 是否装了儿童安全 gate。
+    pub fn has_safety_gate(&self) -> bool {
+        self.executor.safety.is_some()
     }
 
     /// 从配置文件加载，用系统时钟和 S4 的简单准入；尝试记录库打开在 `db_path`（与其它 store 共用同一个 SQLite 文件）。
     pub fn from_file(path: &Path, db_path: &Path) -> Result<Self, String> {
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
         let parts = config::load(path, clock.now())?;
+        if let Some(safety) = &parts.safety {
+            for warning in &safety.warnings {
+                eprintln!("[idoris] cloud: {warning}");
+            }
+        }
         let store = AttemptStore::open(db_path)
             .map_err(|e| format!("无法打开尝试记录数据库 \"{}\"：{e}", db_path.display()))?;
         Ok(Self::new(
