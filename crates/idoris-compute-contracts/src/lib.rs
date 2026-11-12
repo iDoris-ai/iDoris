@@ -3,6 +3,7 @@ pub mod account;
 pub mod admission;
 pub mod attempt;
 pub mod credential;
+pub mod form;
 pub mod grant;
 pub mod ids;
 pub mod money;
