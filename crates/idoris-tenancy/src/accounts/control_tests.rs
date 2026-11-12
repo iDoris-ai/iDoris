@@ -2221,9 +2221,19 @@ fn credentials_can_be_frozen_unfrozen_and_revoked_and_revocation_is_final() {
         credential: device.id().to_string(),
         status,
     };
+    // 冻结之前，设备凭证本人可以问「我是谁」（whoami 不需要管理权限，只要凭证此刻可用）
+    assert!(env.store.control_whoami(&device.who(), ts(T0)).is_ok());
     assert_eq!(
         set(CredentialStatus::Frozen).run(&env, &who, T0 + 1),
         Ok(WriteResult::Updated)
+    );
+    // 冻结之后：连 whoami 也被拒（不依赖授权判定，认证这一步就拒绝）
+    assert_eq!(
+        env.store
+            .control_whoami(&device.who(), ts(T0 + 1))
+            .unwrap_err()
+            .reason,
+        ControlReason::CredentialFrozen
     );
     assert_eq!(
         set(CredentialStatus::Frozen).run(&env, &who, T0 + 2),
@@ -2232,6 +2242,21 @@ fn credentials_can_be_frozen_unfrozen_and_revoked_and_revocation_is_final() {
     assert_eq!(
         set(CredentialStatus::Active).run(&env, &who, T0 + 3),
         Ok(WriteResult::Updated)
+    );
+    assert!(env.store.control_whoami(&device.who(), ts(T0 + 3)).is_ok());
+    // 过期同样：认证这一步就拒绝（右端开）
+    let expiring = env.issue_as_operator(Issue::member("m-kid2").expiring(T0 + 1_000));
+    assert!(
+        env.store
+            .control_whoami(&expiring.who(), ts(T0 + 999))
+            .is_ok()
+    );
+    assert_eq!(
+        env.store
+            .control_whoami(&expiring.who(), ts(T0 + 1_000))
+            .unwrap_err()
+            .reason,
+        ControlReason::CredentialExpired
     );
     // 撤销：数据库里的验证器同时标成已撤销（数据面认证直接认不出它）
     assert!(
