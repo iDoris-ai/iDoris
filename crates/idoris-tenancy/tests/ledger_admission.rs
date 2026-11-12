@@ -107,6 +107,39 @@ fn an_expired_allowance_is_zero_not_unbounded() {
     );
 }
 
+#[test]
+fn an_allowance_is_active_from_its_start_up_to_but_not_including_its_end() {
+    // `allocate_chain` 铺的窗口是 [T0 - 1 天, T0 + 60 天)：起点含，终点不含，各差 1 毫秒都要分得出来
+    let db = TempDb::new("allowance-window-edges");
+    let store = world(&db);
+    allowance_chain_a(&store, 100_000);
+    // 链经过补贴池：起点在 2026-10，终点附近在 2026-12，两个账期都要有池上限，否则先被池拦下
+    for (y, m) in [(2026, 10), (2026, 12)] {
+        store
+            .set_pool_cap(&aid("pool"), month(y, m), &thb(10_000_000), t0())
+            .unwrap();
+    }
+    let start = T0 - DAY;
+    let end = T0 + 60 * DAY;
+    for (request, now, admitted) in [
+        ("r-before", start - 1, false),
+        ("r-start", start, true),
+        ("r-last", end - 1, true),
+        ("r-end", end, false),
+    ] {
+        let req = Req::new(&store, request, 0, "cred-a", 100).at(now);
+        let decision = admit(&store, &req);
+        assert_eq!(decision.is_admitted(), admitted, "{request}: {decision:?}");
+        if !admitted {
+            assert_eq!(
+                denied(&decision),
+                Some(ReasonCode::BudgetExhausted),
+                "{request}"
+            );
+        }
+    }
+}
+
 // ------------------------------------------------------------------------------------------
 // 放行：沿链每个账户各一条分录；可用额是分录的投影
 // ------------------------------------------------------------------------------------------
@@ -657,6 +690,39 @@ fn check_5_subsidy_pool_cap_alone_rejects_and_a_month_without_a_cap_is_zero() {
         admit(&store, &r5),
         AdmissionDecision::Allow { .. }
     ));
+    assert_clean(&store);
+}
+
+#[test]
+fn a_pool_months_consumption_window_is_half_open_so_every_entry_belongs_to_exactly_one_month() {
+    // 11 月 = [11-01 00:00, 12-01 00:00)（UTC）：12 月第一毫秒的预留算 12 月，不算 11 月；11 月最后一毫秒的算 11 月
+    let db = TempDb::new("pool-month-edges");
+    let store = world(&db);
+    allocate_chain(&store, "c", &["pool", "school", "kid-c"], 10_000_000);
+    store
+        .set_pool_cap(&aid("pool"), month(2026, 11), &thb(500), t0())
+        .unwrap();
+    store
+        .set_pool_cap(&aid("pool"), month(2026, 12), &thb(300), t0())
+        .unwrap();
+    let december = 1_796_083_200_000; // 2026-12-01T00:00:00Z
+    // 11 月最后一毫秒：消耗 210 记在 11 月
+    let a = Req::new(&store, "r-a", 0, "cred-c", 100).at(december - 1);
+    assert!(admit(&store, &a).is_admitted());
+    // 12 月第一毫秒：消耗 210 记在 12 月（12 月上限 300）
+    let b = Req::new(&store, "r-b", 0, "cred-c", 100).at(december);
+    assert!(admit(&store, &b).is_admitted());
+    // 12 月再来一个：已经有 b 的 210，放不下。b 恰好在 12 月的起点，必须算进 12 月
+    let c = Req::new(&store, "r-c", 0, "cred-c", 100).at(december + 1);
+    assert_eq!(
+        denied(&admit(&store, &c)),
+        Some(ReasonCode::SubsidyPoolExhausted)
+    );
+    // 并发请求各自读时钟，读数可以比已有的分录早：回到 11 月最后一毫秒，11 月上限 500，已有 a 的 210，
+    // 再放一个 210 刚好放得下；12 月起点的 b 不能算进 11 月
+    let d = Req::new(&store, "r-d", 0, "cred-c", 100).at(december - 1);
+    let decision = admit(&store, &d);
+    assert!(decision.is_admitted(), "{decision:?}");
     assert_clean(&store);
 }
 
