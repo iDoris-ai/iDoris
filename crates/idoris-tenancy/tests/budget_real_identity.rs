@@ -175,12 +175,23 @@ const LIMIT: i64 = 1_000;
 
 /// 每个线程一条自己的连接（靠 SQLite 的锁串行化，不是进程内的互斥）、一个自己的 key 和一个自己的模型，
 /// 屏障放行后对同一个租户先预留再结算。`settle_to` 是结算金额。返回每个线程的预留结果。
-fn run_threads(db: &TempDb, tenant: &'static str, settle_to: i64) -> Vec<Result<(), BudgetError>> {
+///
+/// `hold_in_flight`：为真时，所有线程都做完预留尝试之后才开始结算（并多停 50 毫秒），也就是
+/// **所有被放行的预留同时在途**。这是检出「租户级准入没把在途预留算进去」的前提：如果每个线程预留完立刻
+/// 结算，已结算额度会很快追上来，这类错误只会偶然超发，测试不能依赖偶然。
+fn run_threads(
+    db: &TempDb,
+    tenant: &'static str,
+    settle_to: i64,
+    hold_in_flight: bool,
+) -> Vec<Result<(), BudgetError>> {
     let barrier = Arc::new(Barrier::new(THREADS));
+    let settle_gate = Arc::new(Barrier::new(THREADS));
     let handles: Vec<_> = (0..THREADS)
         .map(|index| {
             let path = db.path().to_path_buf();
             let barrier = Arc::clone(&barrier);
+            let settle_gate = Arc::clone(&settle_gate);
             thread::spawn(move || {
                 let ledger = BudgetLedger::open(&path).unwrap();
                 let scope = BudgetScope::new(
@@ -190,7 +201,13 @@ fn run_threads(db: &TempDb, tenant: &'static str, settle_to: i64) -> Vec<Result<
                     format!("model-{index:02}"),
                 );
                 barrier.wait();
-                match ledger.reserve(&scope, Price::Known(PER_RESERVE)) {
+                let reserved = ledger.reserve(&scope, Price::Known(PER_RESERVE));
+                if hold_in_flight {
+                    // 每个线程（包括预留被拒的）都到这里；放行后被放行的预留才结算
+                    settle_gate.wait();
+                    thread::sleep(std::time::Duration::from_millis(50));
+                }
+                match reserved {
                     Ok(id) => {
                         ledger.settle(tenant, &id, settle_to).unwrap();
                         Ok(())
@@ -234,8 +251,8 @@ fn concurrent_reserve_and_settle_under_distinct_keys_never_overspend_the_one_ten
         })
     };
 
-    // 结算金额等于预留金额：结算不释放额度，所以不论怎么交错，恰好 LIMIT / PER_RESERVE 个预留成功。
-    let results = run_threads(&db, "acme", PER_RESERVE);
+    // 所有预留同时在途，结算金额等于预留金额：恰好 LIMIT / PER_RESERVE 个预留成功，其余被拒。
+    let results = run_threads(&db, "acme", PER_RESERVE, true);
     stop.store(true, Ordering::SeqCst);
     let samples = monitor.join().unwrap();
     assert!(samples > 0);
@@ -311,7 +328,7 @@ fn concurrent_settles_that_release_headroom_conserve_the_total() {
             .configure_tenant("acme", LIMIT, "UTC", SpendGate::PaidOnly)
             .unwrap();
     }
-    let results = run_threads(&db, "acme", ACTUAL);
+    let results = run_threads(&db, "acme", ACTUAL, false);
     let ok = i64::try_from(results.iter().filter(|r| r.is_ok()).count()).unwrap();
     assert!(
         ok >= LIMIT / PER_RESERVE,
