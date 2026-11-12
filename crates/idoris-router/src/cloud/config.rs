@@ -1101,4 +1101,72 @@ callers:
         .unwrap();
         assert_eq!(ok.input_per_mtok.0, "0.26");
     }
+
+    /// S6：哪些调用方算「处理儿童数据」只由 `data_classes` 含 `child_edu` 决定（默认调用方也算）；
+    /// 旧代理缓存的关闭范围与缓存键里的租户范围写法一致，启动日志的摘要里只有租户标识。
+    #[test]
+    fn child_data_callers_are_identified_by_their_data_classes_alone() {
+        // 没有儿童调用方：没有关闭范围，摘要里全是「其它」
+        let parts = load(VALID).unwrap();
+        assert!(!parts.callers.has_child_data_callers());
+        assert!(parts.callers.child_data_tenant_scopes().is_empty());
+        let (child, other) = parts.callers.caller_summary();
+        assert!(child.is_empty());
+        assert_eq!(other, ["agent24", "(default)"]);
+
+        // 一个具名儿童租户、一个普通租户、一个同时含 child_edu 的默认调用方（`data_classes` 里只要有 child_edu 就算）
+        let head = VALID.split("callers:\n").next().unwrap();
+        let yaml = format!(
+            "{head}callers:
+  - tenant_id: edu-th
+    credential_id: cred-edu
+    payer_account: acct-edu
+    unit: THB
+    billing: paid
+    data_classes: [child_edu]
+    max_retention: zdr
+  - tenant_id: agent24
+    credential_id: cred-agent24
+    payer_account: acct-agent24
+    unit: THB
+    billing: paid
+    data_classes: [adult]
+    max_retention: with_exceptions
+  - credential_id: cred-default
+    payer_account: acct-default
+    unit: THB
+    billing: paid
+    data_classes: [child_edu, adult]
+    max_retention: zdr
+safety:
+  mode: rules_only
+"
+        );
+        let parts = load(&yaml).unwrap();
+        assert!(parts.callers.has_child_data_callers());
+        assert_eq!(
+            parts
+                .callers
+                .child_data_tenant_scopes()
+                .into_iter()
+                .collect::<Vec<_>>(),
+            ["\u{0}personal", "edu-th"],
+            "没有租户的默认调用方用缓存键里的 \\0personal 写法"
+        );
+        let (child, other) = parts.callers.caller_summary();
+        assert_eq!(child, ["edu-th", "(default)"]);
+        assert_eq!(other, ["agent24"]);
+        // 摘要里只有租户标识：没有凭证号、付款账户这些别的东西
+        for name in child.iter().chain(other.iter()) {
+            assert!(!name.contains("cred-") && !name.contains("acct-"), "{name}");
+        }
+
+        // 儿童调用方存在而没有 safety 段：加载失败（安全检查是儿童业务上线的前提）
+        let without_safety = yaml.replace("safety:\n  mode: rules_only\n", "");
+        let error = match load(&without_safety) {
+            Ok(_) => panic!("a child caller without a safety section must not load"),
+            Err(error) => error,
+        };
+        assert!(error.contains("必须配置 safety"), "{error}");
+    }
 }
