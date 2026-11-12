@@ -10,12 +10,14 @@
 pub mod abuse;
 pub mod bind;
 pub mod bucket;
+pub mod caller;
 pub mod config;
 pub mod cors;
 pub mod limits;
 pub mod net;
 pub mod reason;
 
+pub use caller::{CallerResolver, IngressContext, Refusal, ResolvedCaller};
 pub use config::{IngressConfig, TenantProfile};
 pub use limits::{CallerLimits, LevelLimits, LimitKeys, Limiter, Scope};
 pub use net::{ClientAddr, TrustedProxies};

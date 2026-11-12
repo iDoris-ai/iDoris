@@ -277,6 +277,9 @@ pub struct CloudConfigFile {
     pub reserve: ReserveConfig,
     pub endpoints: Vec<EndpointConfig>,
     pub routes: Vec<RouteConfig>,
+    /// 静态调用方簿：S4 的测试夹具。**生产（云入口生效时）必须是空的**，付款上下文由凭证解析（S5，见
+    /// `ingress::caller`）；所以这个键可以不写。
+    #[serde(default)]
     pub callers: Vec<CallerConfig>,
 }
 
@@ -364,6 +367,11 @@ impl RouteBook {
     pub fn candidates(&self, model: &str) -> Option<&[EndpointKey]> {
         self.0.get(model).map(Vec::as_slice)
     }
+
+    /// 全部客户端模型名（按名字排序）：`GET /api/v1/models` 列的就是它们。
+    pub fn models(&self) -> impl Iterator<Item = &str> {
+        self.0.keys().map(String::as_str)
+    }
 }
 
 /// 一个调用方的付款上下文与数据处理要求。
@@ -376,6 +384,10 @@ pub struct CallerPolicy {
 
 /// 调用方簿：按虚拟 key 上的 `tenant_id` 找。**有 tenant_id 但簿里没有的，拒绝**（不回落到默认调用方）；
 /// 没有 tenant_id 的才用默认调用方（如果配置了）。
+///
+/// **S5 之后这只是测试夹具**：云入口（`ingress`）生效时，付款上下文、租户、数据类别全部从凭证推导，
+/// 处理函数读请求扩展里的 [`CallerPolicy`]，不看这本簿；`CloudIngress::new` 拒绝启动一个簿不为空的云上游，
+/// 所以生产里它永远是空的。S4 / S3 的端到端测试和 S6 的夹具继续用它来隔离「付款上下文」以外的行为。
 #[derive(Debug, Default, Clone)]
 pub struct CallerBook {
     by_tenant: BTreeMap<String, CallerPolicy>,
@@ -392,6 +404,11 @@ impl CallerBook {
             Some(tenant) => self.by_tenant.get(tenant),
             None => self.default.as_ref(),
         }
+    }
+
+    /// 簿里一个调用方都没有（生产的云入口要求这样）。
+    pub fn is_empty(&self) -> bool {
+        self.by_tenant.is_empty() && self.default.is_none()
     }
 }
 
