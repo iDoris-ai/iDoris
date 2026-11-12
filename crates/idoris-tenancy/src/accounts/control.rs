@@ -438,6 +438,26 @@ impl AccountStore {
         outcome
     }
 
+    /// 请求体在 HTTP 层就解析失败了（不是 JSON、缺字段、多字段、id 字符集不对……），没有走到任何操作：
+    /// 调用者被认出之后，仍然留一行 `rejected / invalid_request` 的审计（操作名由路由决定，没有目标）；
+    /// 调用者此刻不可用时留的是它不可用的原因（和别的写操作一致）。认不出的密钥不写审计。
+    /// 返回应该回给调用方的失败。
+    pub fn control_reject_invalid_request(
+        &self,
+        who: &Who<'_>,
+        meta: &Meta<'_>,
+        op: &'static str,
+    ) -> Failure {
+        let spec = AuditSpec::new(op, TargetKind::None);
+        match self.control_write::<()>(who, meta, spec, |_, _, _| {
+            Err(Failure::new(ControlReason::InvalidRequest))
+        }) {
+            Err(failure) => failure,
+            // body 永远返回 Err；走到这里是代码错误，当作内部错误而不是放行。
+            Ok(_) => Failure::internal("an invalid request was accepted"),
+        }
+    }
+
     /// 只读操作的统一入口：认证调用者、在一个读事务里执行 `body`。读不写审计（见 `control_reads.rs`）。
     pub(super) fn control_read<T>(
         &self,

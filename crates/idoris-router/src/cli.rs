@@ -8,6 +8,16 @@ pub enum Command {
     Admin(AdminCommand),
     Key(KeyCommand),
     SetupOmlx(SetupOmlxOptions),
+    /// Local operator commands of the compute-service control plane (S2); organization and cloud forms only.
+    Control(ControlCommand),
+}
+
+/// `idoris control …` — local operator commands. They run with the authority of whoever owns the
+/// database file and are the only way to create the platform root and the first administrative credential.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControlCommand {
+    /// `idoris control bootstrap --spec-stdin`: accounts, allocations and credentials from a JSON spec.
+    Bootstrap,
 }
 
 /// `idoris setup omlx` — offline probe + components-dir generator.
@@ -116,7 +126,7 @@ pub enum KeyCommand {
     Revoke(String),
 }
 
-const USAGE: &str = "用法: idoris [serve [--admin-token-stdin]] | idoris admin <status|backends|models|roles|runtimes> --token-stdin | idoris key issue --spec-stdin | idoris key list | idoris key revoke <key_id> | idoris setup omlx --endpoint <url> --out-dir <dir> [--bind <role>=<model>]... [--load-mode on_demand|resident] [--api-key-stdin] [--force]";
+const USAGE: &str = "用法: idoris [serve [--admin-token-stdin]] | idoris admin <status|backends|models|roles|runtimes> --token-stdin | idoris key issue --spec-stdin | idoris key list | idoris key revoke <key_id> | idoris control bootstrap --spec-stdin | idoris setup omlx --endpoint <url> --out-dir <dir> [--bind <role>=<model>]... [--load-mode on_demand|resident] [--api-key-stdin] [--force]";
 
 pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Command, String> {
     let args = args.into_iter().collect::<Vec<_>>();
@@ -151,6 +161,11 @@ pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Command, S
             .filter(|id| crate::key_manage::valid_key_id(id))
             .map(|id| Command::Key(KeyCommand::Revoke(id.to_string())))
             .ok_or_else(|| USAGE.to_string()),
+        [control, bootstrap, option]
+            if control == "control" && bootstrap == "bootstrap" && option == "--spec-stdin" =>
+        {
+            Ok(Command::Control(ControlCommand::Bootstrap))
+        }
         [setup, omlx, rest @ ..] if setup == "setup" && omlx == "omlx" => {
             parse_setup_omlx(rest).map(Command::SetupOmlx)
         }

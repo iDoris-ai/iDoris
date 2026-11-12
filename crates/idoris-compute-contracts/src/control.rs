@@ -508,10 +508,7 @@ pub fn authorize(
         Err(DelegationError::ExceedsGrantor { .. }) => {
             // 区分「子树不对」和「子树对，但金额超了」：有没有一条权限的子树覆盖了目标。
             let covers_target = caller.admin_scopes().iter().any(|scope| {
-                scope.op == op
-                    && dir
-                        .tree()
-                        .is_descendant_or_self(target, &scope.subtree)
+                scope.op == op && dir.tree().is_descendant_or_self(target, &scope.subtree)
             });
             Err(if covers_target {
                 ControlReason::AmountExceedsAuthority
@@ -587,10 +584,7 @@ mod tests {
             );
             assert!(seen.insert(text), "duplicate string {text}");
             assert_eq!(text.parse::<ControlReason>().unwrap(), *code);
-            assert_eq!(
-                serde_json::to_string(code).unwrap(),
-                format!("\"{text}\"")
-            );
+            assert_eq!(serde_json::to_string(code).unwrap(), format!("\"{text}\""));
             assert_eq!(
                 serde_json::from_str::<ControlReason>(&format!("\"{text}\"")).unwrap(),
                 *code
@@ -831,7 +825,11 @@ mod tests {
                 None,
             );
             if expected_inactive {
-                assert_eq!(result, Err(ControlReason::AccountInactive), "{anchor_status:?}");
+                assert_eq!(
+                    result,
+                    Err(ControlReason::AccountInactive),
+                    "{anchor_status:?}"
+                );
             } else {
                 assert_eq!(result, Ok(()));
             }
@@ -841,7 +839,12 @@ mod tests {
             .into_iter()
             .map(|a| {
                 if a.id == aid("pool") {
-                    account("pool", AccountKind::SubsidyPool, Some("platform"), AccountStatus::Frozen)
+                    account(
+                        "pool",
+                        AccountKind::SubsidyPool,
+                        Some("platform"),
+                        AccountStatus::Frozen,
+                    )
                 } else {
                     a
                 }
@@ -858,7 +861,12 @@ mod tests {
             .into_iter()
             .map(|a| {
                 if a.id == aid("s1") {
-                    account("s1", AccountKind::Member, Some("teacher"), AccountStatus::Frozen)
+                    account(
+                        "s1",
+                        AccountKind::Member,
+                        Some("teacher"),
+                        AccountStatus::Frozen,
+                    )
                 } else {
                     a
                 }
@@ -870,7 +878,14 @@ mod tests {
             vec![scope(ControlOp::SetAccountStatus, "eduai", None)],
         );
         assert_eq!(
-            authorize(&dir, &caller, NOW, ControlOp::SetAccountStatus, &aid("s1"), None),
+            authorize(
+                &dir,
+                &caller,
+                NOW,
+                ControlOp::SetAccountStatus,
+                &aid("s1"),
+                None
+            ),
             Ok(())
         );
     }
@@ -980,7 +995,14 @@ mod tests {
             ],
         );
         assert_eq!(
-            authorize(&dir, &caller, NOW, ControlOp::SetAccountStatus, &aid("s1"), None),
+            authorize(
+                &dir,
+                &caller,
+                NOW,
+                ControlOp::SetAccountStatus,
+                &aid("s1"),
+                None
+            ),
             Err(ControlReason::OpNotGranted)
         );
         assert_eq!(
@@ -1125,10 +1147,9 @@ mod tests {
         ])
         .unwrap();
         let dir = sample_directory_with(tree, |parts| {
-            parts.principals.push(principal(
-                "pa",
-                crate::account::PrincipalStatus::Active,
-            ));
+            parts
+                .principals
+                .push(principal("pa", crate::account::PrincipalStatus::Active));
             parts.memberships.clear();
             parts.memberships.push(membership(
                 "m-a",

@@ -25,6 +25,7 @@ use idoris_router::{
     capabilities::{CapabilitiesProvider, LiveCapabilitiesProvider},
     cli, components, config,
     connection::{ConnectionInfo, ConnectionListener},
+    control::{AccountGate, ControlPlane, SystemControlClock},
     host_facts, parse_port, profile, routing_policy,
     runtime::RuntimeRegistry,
     runtime_launch_config,
@@ -155,8 +156,43 @@ async fn real_main() -> u8 {
                 return 1;
             }
         }
+        cli::Command::Control(command) => {
+            if let Err(message) = run_control_command(command) {
+                eprintln!("[idoris] {message}");
+                return 1;
+            }
+        }
     }
     0
+}
+
+/// Local operator commands of the control plane (compute service S2). Only the organization and cloud
+/// forms have an account store, so anything else is refused before the database is touched.
+fn run_control_command(command: cli::ControlCommand) -> Result<(), String> {
+    let deploy_mode =
+        profile::deploy_mode_from_env(std::env::var("IDORIS_DEPLOY_MODE").ok().as_deref());
+    let form_raw = match std::env::var(StartupForm::ENV_VAR) {
+        Ok(value) => Some(value),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err(format!("{} 不是有效的 Unicode", StartupForm::ENV_VAR));
+        }
+    };
+    let startup_form = StartupForm::from_env_value(deploy_mode, form_raw.as_deref())
+        .map_err(|err| format!("{} 无效：{err}", StartupForm::ENV_VAR))?;
+    let accounts = storage::open_account_store_process(startup_form)?;
+    match command {
+        cli::ControlCommand::Bootstrap => {
+            let mut stdin = std::io::stdin().lock();
+            let mut stdout = std::io::stdout().lock();
+            idoris_router::control::bootstrap::run(
+                &accounts,
+                &mut stdin,
+                &mut stdout,
+                &SystemControlClock,
+            )
+        }
+    }
 }
 
 fn run_key_command(command: cli::KeyCommand) -> Result<(), String> {
@@ -396,7 +432,22 @@ async fn run(options: cli::ServeOptions) -> Result<(), String> {
             .map_err(|err| format!("无法检查 virtual key 启动权限：{err}"))?
     };
     validate_bind_authority(bind_host, deploy_mode, dev_no_key_enabled, has_active_key)?;
-    let virtual_key_authenticator = VirtualKeyAuthenticator::new(persistent.virtual_keys.clone());
+    let mut virtual_key_authenticator =
+        VirtualKeyAuthenticator::new(persistent.virtual_keys.clone());
+    // Compute service S2 (organization and cloud forms only: the account store exists only there). The gate makes
+    // revocation immediate on the data plane; the control plane serves `/control/v1`. In the personal form and in
+    // legacy tenant deployments `persistent.accounts` is `None` and neither is installed.
+    let control = match &persistent.accounts {
+        Some(accounts) => {
+            virtual_key_authenticator =
+                virtual_key_authenticator.with_gate(Arc::new(AccountGate::new(accounts.clone())));
+            Some(Arc::new(ControlPlane::new(
+                accounts.clone(),
+                startup_form.form(),
+            )?))
+        }
+        None => None,
+    };
 
     let catalog_path = config::resolve_env("IDORIS_CATALOG", "config/catalog.yaml")?;
     let capabilities = match host_facts::current_host_facts() {
@@ -447,6 +498,7 @@ async fn run(options: cli::ServeOptions) -> Result<(), String> {
     // and then only in tenant (cloud) form.
     let mut state = state;
     state.cloud = idoris_router::cloud::CloudUpstream::from_env(deploy_mode)?;
+    state.control = control;
 
     // M5-14: provider breakers stay off unless explicitly enabled; see
     // ChatProxy::set_breakers_enabled.
