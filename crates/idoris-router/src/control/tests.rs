@@ -2996,6 +2996,96 @@ fn bootstrap_is_audited_as_an_operator_is_idempotent_for_accounts_and_never_logs
     }
 }
 
+#[tokio::test]
+async fn platform_level_emergency_actions_belong_to_the_operator_only() {
+    // 顶层组织（eduai 的父账户是补贴池、school-b 的父账户是平台）没有任何凭证能管：它们的管理凭证只能管自己的子树。
+    let world = World::new();
+    world.people().await;
+    let member = world.member_credential("m-kid1").await;
+    for token in [
+        &world.root.secret,
+        &world.other.secret,
+        &world.teacher.secret,
+    ] {
+        for (uri, body) in [
+            (
+                "/control/v1/accounts/eduai/status",
+                json!({"status": "frozen"}),
+            ),
+            (
+                "/control/v1/accounts/pool/status",
+                json!({"status": "frozen"}),
+            ),
+            (
+                "/control/v1/accounts/platform/status",
+                json!({"status": "closed"}),
+            ),
+        ] {
+            let reply = world.call("POST", uri, Some(token), Some(body)).await;
+            assert_eq!(reply.status, StatusCode::FORBIDDEN, "{uri}: {}", reply.raw);
+            assert!(
+                matches!(reply.reason(), "would_disable_caller" | "out_of_scope"),
+                "{uri}: {}",
+                reply.reason()
+            );
+        }
+    }
+    assert_eq!(world.data_plane(&member.secret).await, StatusCode::OK);
+    // 运维用 `idoris control bootstrap`（同一个函数）冻结 eduai：整个子树的凭证在数据面立即被拒；再解冻立即恢复
+    let run = |spec: Value| {
+        let mut output = Vec::new();
+        bootstrap::run(
+            &world.accounts,
+            &mut spec.to_string().as_bytes(),
+            &mut output,
+            world.clock.as_ref(),
+        )
+        .map(|()| String::from_utf8(output).unwrap())
+    };
+    let output =
+        run(json!({"account_statuses": [{"account_id": "eduai", "status": "frozen"}]})).unwrap();
+    assert!(output.contains("\"result\":\"updated\""), "{output}");
+    for token in [&world.root.secret, &member.secret, &world.reader.secret] {
+        assert_eq!(world.data_plane(token).await, StatusCode::UNAUTHORIZED);
+    }
+    assert_eq!(
+        world.data_plane(&world.other.secret).await,
+        StatusCode::OK,
+        "school-b is a different organization"
+    );
+    run(json!({"account_statuses": [{"account_id": "eduai", "status": "active"}]})).unwrap();
+    assert_eq!(world.data_plane(&member.secret).await, StatusCode::OK);
+    // 运维撤销一张凭证
+    let output =
+        run(json!({"credential_statuses": [{"credential_id": member.id, "status": "revoked"}]}))
+            .unwrap();
+    assert!(output.contains("\"kind\":\"credential_status\""));
+    assert_eq!(
+        world.data_plane(&member.secret).await,
+        StatusCode::UNAUTHORIZED
+    );
+    // 都留了审计，actor 是 operator
+    let rows = world.audit_rows();
+    assert!(
+        rows.iter()
+            .filter(|r| r.0 == "operator" && r.2 == "set_account_status")
+            .count()
+            >= 2
+    );
+    assert!(
+        rows.iter()
+            .any(|r| r.0 == "operator" && r.2 == "revoke_credential")
+    );
+    // 存储层的状态机照旧：关闭是终态，运维也不能重开
+    run(json!({"account_statuses": [{"account_id": "b1", "status": "closed"}]})).unwrap();
+    let error =
+        run(json!({"account_statuses": [{"account_id": "b1", "status": "active"}]})).unwrap_err();
+    assert!(error.contains("illegal_transition"), "{error}");
+    // 反复冻结同一个账户是 unchanged，不是错误
+    let output = run(json!({"account_statuses": [{"account_id": "s2", "status": "frozen"}, {"account_id": "s2", "status": "frozen"}]})).unwrap();
+    assert!(output.contains("\"result\":\"unchanged\""));
+}
+
 #[test]
 fn bootstrap_rejects_bad_specs_before_touching_the_database_and_stops_at_the_first_failure() {
     let world = World::new();

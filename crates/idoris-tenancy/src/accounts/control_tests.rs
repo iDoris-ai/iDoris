@@ -809,6 +809,81 @@ fn authorization_matrix_every_operation() {
             "{op:?} no scopes"
         );
 
+        // 3b. 下发超过授权者：调用者能在 eduai 签发凭证，但这个操作自己的权限只在 teacher 子树（发额度另有单笔上限）。
+        //     想签一张带「更大的」同一操作权限的凭证：更大的子树、（发额度时）更高的上限 / 没有上限，全部被拒，并留审计。
+        let own = |subtree: &str, cap: Option<i64>| sc(op, subtree, cap);
+        let own_cap = (op == ControlOp::GrantAllocation).then_some(5_000_000);
+        let mut own_scopes = vec![own("teacher", own_cap)];
+        if op != ControlOp::IssueCredential {
+            own_scopes.push(sc(ControlOp::IssueCredential, "eduai", None));
+        } else {
+            // 对 issue_credential 自己：它的权限范围就是 eduai，更大的就是 eduai 之上的补贴池
+            own_scopes = vec![sc(ControlOp::IssueCredential, "eduai", None)];
+        }
+        let delegator = env.issue_as_operator(Issue::service("eduai", own_scopes));
+        let mut attempts: Vec<(&str, AdminScope)> = vec![(
+            "wider subtree",
+            own(
+                if op == ControlOp::IssueCredential {
+                    "pool"
+                } else {
+                    "eduai"
+                },
+                own_cap,
+            ),
+        )];
+        if op == ControlOp::GrantAllocation {
+            attempts.push(("higher cap", own("teacher", Some(5_000_001))));
+            attempts.push(("no cap", own("teacher", None)));
+        }
+        for (label, scope) in attempts {
+            let before = env.audit().len();
+            let key = MintedVirtualKey::mint();
+            let rid = env.rid();
+            let result = env.store.control_issue_credential(
+                &delegator.who(),
+                &env.meta(T0 + 3, &rid),
+                &Issue::service("eduai", vec![scope]).request(&key),
+            );
+            assert_eq!(
+                failure_reason(result),
+                ControlReason::ScopeExceedsGrantor,
+                "{op:?} {label}"
+            );
+            let audit = env.audit();
+            assert_eq!(audit.len(), before + 1, "{op:?} {label}: audited");
+            let last = audit.last().unwrap();
+            assert_eq!(
+                (last.outcome.as_str(), last.reason_code.as_str()),
+                ("denied", "scope_exceeds_grantor"),
+                "{op:?} {label}"
+            );
+            assert_eq!(last.actor_id, delegator.id());
+            assert!(
+                env.keys
+                    .authenticate(&key.secret, T0 + 3)
+                    .unwrap()
+                    .is_none(),
+                "{op:?} {label}: nothing was issued"
+            );
+        }
+        // 对照：和自己一样大的权限可以下发（说明上面的拒绝来自「更大」，不是签发本身坏了）
+        let same = Issue::service("eduai", vec![own("teacher", own_cap)]);
+        if op != ControlOp::IssueCredential {
+            let key = MintedVirtualKey::mint();
+            let rid = env.rid();
+            assert!(
+                env.store
+                    .control_issue_credential(
+                        &delegator.who(),
+                        &env.meta(T0 + 3, &rid),
+                        &same.request(&key)
+                    )
+                    .is_ok(),
+                "{op:?}: an equal scope may be delegated"
+            );
+        }
+
         // 4. 被撤销 / 冻结 / 已过期的调用者：拒绝，原因码对应；写操作留下 denied 审计，actor 是它的凭证 id
         for (label, expected) in [
             ("revoked", ControlReason::CredentialRevoked),
@@ -1001,6 +1076,156 @@ fn a_caller_can_never_issue_a_credential_with_more_authority_than_its_own() {
     assert_eq!(
         failure_reason(issue_as(&env, &who, &with_scopes, T0 + 3)),
         ControlReason::InvalidCredential
+    );
+}
+
+#[test]
+fn a_credential_that_may_only_grant_in_one_subtree_cannot_sign_anything_or_reach_outside() {
+    // 越权签发的核心场景：一张只有「给 teacher 子树发额度（单笔 5 THB）」权限的凭证，
+    // 尝试签更大的凭证、给子树外发额度、给自己加权限、签配对码，全部被拒，并且各留一行审计，什么都没有被创建。
+    let env = Env::new();
+    env.tree();
+    env.allocation_chain();
+    let grant_only = env.issue_as_operator(Issue::service(
+        "eduai",
+        vec![sc(ControlOp::GrantAllocation, "teacher", Some(5_000_000))],
+    ));
+    let who = grant_only.who();
+    let credentials_before: i64 = env
+        .raw()
+        .query_row("SELECT count(*) FROM credentials", [], |r| r.get(0))
+        .unwrap();
+    let audit_before = env.audit().len();
+    let mut attempted = 0;
+    let mut expect =
+        |result: Result<WriteResult, ControlReason>, expected: ControlReason, what: &str| {
+            attempted += 1;
+            assert_eq!(result, Err(expected), "{what}");
+        };
+    // 签一张权限更大的凭证（绑自己的账户）：它没有 issue_credential 权限，连签发都不行
+    let bigger = Issue::service("eduai", all_ops("eduai", 1_000_000_000));
+    let key = MintedVirtualKey::mint();
+    let rid = env.rid();
+    expect(
+        env.store
+            .control_issue_credential(&who, &env.meta(T0 + 1, &rid), &bigger.request(&key))
+            .map(|w| w.result)
+            .map_err(|f| f.reason),
+        ControlReason::OpNotGranted,
+        "a bigger credential for its own org",
+    );
+    // 「给自己加权限」：签一张和自己一样的凭证再多一条权限，同样不行
+    let mut superset = Issue::service(
+        "eduai",
+        vec![
+            sc(ControlOp::GrantAllocation, "teacher", Some(5_000_000)),
+            sc(ControlOp::Read, "teacher", None),
+        ],
+    );
+    superset.tenant = Some("tenant-edu".into());
+    let key = MintedVirtualKey::mint();
+    let rid = env.rid();
+    expect(
+        env.store
+            .control_issue_credential(&who, &env.meta(T0 + 1, &rid), &superset.request(&key))
+            .map(|w| w.result)
+            .map_err(|f| f.reason),
+        ControlReason::OpNotGranted,
+        "a superset of itself",
+    );
+    // 给成员签凭证（子树里）、签配对码：同样没有 issue_credential 权限
+    expect(
+        Action::IssueCredential {
+            membership: "m-kid1",
+        }
+        .run(&env, &who, T0 + 1),
+        ControlReason::OpNotGranted,
+        "a member credential",
+    );
+    // 给子树外的账户发额度
+    for (id, parent, child) in [
+        ("o-1", "eduai", "s2"),
+        ("o-2", "pool", "eduai"),
+        ("o-3", "school-b", "b1"),
+        ("o-4", "platform", "pool"),
+    ] {
+        expect(
+            Action::GrantAllocation {
+                id,
+                parent,
+                child,
+                micros: 1,
+            }
+            .run(&env, &who, T0 + 1),
+            ControlReason::OutOfScope,
+            id,
+        );
+    }
+    // 超过自己的单笔上限
+    expect(
+        Action::GrantAllocation {
+            id: "o-5",
+            parent: "teacher",
+            child: "s1",
+            micros: 5_000_001,
+        }
+        .run(&env, &who, T0 + 1),
+        ControlReason::AmountExceedsAuthority,
+        "over its cap",
+    );
+    // 别的操作：全部没有权限
+    expect(
+        Action::SetAccountStatus {
+            account: "s1",
+            status: AccountStatus::Frozen,
+        }
+        .run(&env, &who, T0 + 1),
+        ControlReason::OpNotGranted,
+        "freeze an account",
+    );
+    expect(
+        Action::CreateAccount {
+            id: "o-acct",
+            parent: "teacher",
+        }
+        .run(&env, &who, T0 + 1),
+        ControlReason::OpNotGranted,
+        "create an account",
+    );
+    expect(
+        Action::SetCredential {
+            credential: grant_only.id().to_string(),
+            status: CredentialStatus::Revoked,
+        }
+        .run(&env, &who, T0 + 1),
+        ControlReason::OpNotGranted,
+        "revoke itself",
+    );
+    // 全部被拒：每次一行 denied 审计，actor 是它；没有任何凭证、额度被创建
+    let audit = env.audit();
+    assert_eq!(audit.len(), audit_before + attempted);
+    for row in &audit[audit_before..] {
+        assert_eq!(
+            (row.outcome.as_str(), row.actor_id.as_str()),
+            ("denied", grant_only.id()),
+            "{row:?}"
+        );
+    }
+    let credentials_after: i64 = env
+        .raw()
+        .query_row("SELECT count(*) FROM credentials", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(credentials_after, credentials_before);
+    // 对照：它自己的权限范围内，发额度是通的
+    assert_eq!(
+        Action::GrantAllocation {
+            id: "ok-1",
+            parent: "teacher",
+            child: "s1",
+            micros: 5_000_000
+        }
+        .run(&env, &who, T0 + 2),
+        Ok(WriteResult::Created)
     );
 }
 
@@ -1853,6 +2078,95 @@ fn accounts_and_memberships_are_idempotent_and_validated_by_the_contract() {
         Action::RevokeMembership { id: "m-ghost" }.run(&env, &who, T0 + 14),
         Err(ControlReason::OutOfScope)
     );
+}
+
+#[test]
+fn accounts_cannot_be_created_under_a_frozen_or_closed_parent() {
+    let env = Env::new();
+    env.tree();
+    let root = env.issue_as_operator(Issue::service("eduai", all_ops("eduai", 1)));
+    let who = root.who();
+    for status in [AccountStatus::Frozen, AccountStatus::Closed] {
+        let id = if status == AccountStatus::Frozen {
+            "under-frozen"
+        } else {
+            "under-closed"
+        };
+        env.store.set_account_status(&aid("s2"), status).unwrap();
+        env.store
+            .set_account_status(&aid("teacher"), status)
+            .unwrap();
+        assert_eq!(
+            Action::CreateAccount {
+                id,
+                parent: "teacher"
+            }
+            .run(&env, &who, T0 + 1),
+            Err(ControlReason::InvalidAccount),
+            "{status:?}"
+        );
+        let last = env.last_audit();
+        assert_eq!(
+            (last.outcome.as_str(), last.reason_code.as_str()),
+            ("rejected", "invalid_account")
+        );
+        if status == AccountStatus::Frozen {
+            env.store
+                .set_account_status(&aid("teacher"), AccountStatus::Active)
+                .unwrap();
+            env.store
+                .set_account_status(&aid("s2"), AccountStatus::Active)
+                .unwrap();
+            assert_eq!(
+                Action::CreateAccount {
+                    id,
+                    parent: "teacher"
+                }
+                .run(&env, &who, T0 + 2),
+                Ok(WriteResult::Created),
+                "thawed"
+            );
+        }
+    }
+}
+
+#[test]
+fn revoking_only_the_key_verifier_with_the_local_command_still_blocks_the_credential() {
+    // `idoris key revoke <key_id>` 只撤销 virtual_keys 里的验证器，不动 credentials 行。
+    let env = Env::new();
+    env.tree();
+    let admin = env.issue_as_operator(Issue::service("eduai", all_ops("eduai", 1)));
+    let device = env.issue_as_operator(Issue::member("m-kid1"));
+    assert!(env.keys.revoke(device.id(), T0 + 5).unwrap());
+    // 数据面：虚拟 key 认证已经认不出它
+    assert!(
+        env.keys
+            .authenticate(&device.key.secret, T0 + 6)
+            .unwrap()
+            .is_none()
+    );
+    // 控制面：同样当作已撤销（并留审计）
+    assert_eq!(
+        Action::Read { account: "eduai" }.run(&env, &device.who(), T0 + 6),
+        Err(ControlReason::CredentialRevoked)
+    );
+    // 查询里两个状态都看得到：凭证行还是 active，验证器已撤销
+    let view = env
+        .store
+        .control_read_credentials(&admin.who(), ts(T0 + 7), &aid("s1"))
+        .unwrap();
+    let entry = view
+        .credentials
+        .iter()
+        .find(|c| c.credential.id().as_str() == device.id())
+        .unwrap();
+    assert_eq!(entry.credential.status(), CredentialStatus::Active);
+    assert_eq!(entry.key_status, "revoked");
+    let other = view
+        .credentials
+        .iter()
+        .find(|c| c.credential.id().as_str() != device.id());
+    assert!(other.is_none_or(|c| c.key_status == "active"));
 }
 
 #[test]

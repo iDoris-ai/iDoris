@@ -27,20 +27,32 @@
 //! }
 //! ```
 //!
-//! 顺序固定：账户 -> 额度 -> 凭证。先把整份请求体解析、校验完才开始写；之后每一项各自一个事务，**逐项输出一行 JSON**
-//! （签发的凭证带只出现一次的明文密钥，先入库、后输出）。某一项失败就停下，已经完成的不回滚（账户和额度重跑是幂等的，
-//! 已经输出过的密钥不会丢）。**凭证不幂等**：重跑同一份请求体会再签发一批新凭证。
+//! 顺序固定：账户 -> 额度 -> 凭证 -> 账户状态 -> 凭证状态。先把整份请求体解析、校验完才开始写；之后每一项各自一个事务，
+//! **逐项输出一行 JSON**（签发的凭证带只出现一次的明文密钥，先入库、后输出）。某一项失败就停下，已经完成的不回滚
+//! （账户和额度重跑是幂等的，已经输出过的密钥不会丢）。**凭证不幂等**：重跑同一份请求体会再签发一批新凭证。
+//!
+//! 最后两组是平台层面的紧急操作，同样只有运维能做（没有任何凭证能管到顶层组织）：
+//!
+//! ```json
+//! { "account_statuses":    [{ "account_id": "eduai", "status": "frozen" }],
+//!   "credential_statuses": [{ "credential_id": "vk_…", "status": "revoked" }] }
+//! ```
+//!
+//! 冻结（或关闭）一个组织，它子树里所有凭证在数据面的下一次请求就被拒；撤销凭证同理。
 
 use std::io::{Read, Write};
 
 use idoris_compute_contracts::account::{Account, AccountKind, AccountStatus};
 use idoris_compute_contracts::control::WriteResult;
-use idoris_compute_contracts::credential::CredentialBinding;
+use idoris_compute_contracts::credential::{CredentialBinding, CredentialStatus};
 use idoris_compute_contracts::grant::Purpose;
-use idoris_compute_contracts::ids::{AccountId, AllocationId, BillingMonth, TimestampMs};
+use idoris_compute_contracts::ids::{
+    AccountId, AllocationId, BillingMonth, CredentialId, TimestampMs,
+};
 use idoris_compute_contracts::money::{Money, Unit};
 use idoris_tenancy::accounts::{
-    AccountStore, CreateAccount, GrantAllocation, IssueCredential, Meta, Who,
+    AccountStore, CreateAccount, GrantAllocation, IssueCredential, Meta, SetAccountStatus,
+    SetCredentialStatus, Who,
 };
 use idoris_tenancy::virtual_key::MintedVirtualKey;
 use serde::Deserialize;
@@ -63,6 +75,24 @@ struct Spec {
     allocations: Vec<AllocationSpec>,
     #[serde(default)]
     credentials: Vec<CredentialSpec>,
+    #[serde(default)]
+    account_statuses: Vec<AccountStatusSpec>,
+    #[serde(default)]
+    credential_statuses: Vec<CredentialStatusSpec>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AccountStatusSpec {
+    account_id: AccountId,
+    status: AccountStatus,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CredentialStatusSpec {
+    credential_id: CredentialId,
+    status: CredentialStatus,
 }
 
 #[derive(Debug, Deserialize)]
@@ -243,6 +273,62 @@ pub fn run(
                 "credential_id": key.key_id,
                 "secret": key.secret.expose_secret(),
                 "credential": outcome.value,
+                "request_id": request_id,
+            }),
+        )?;
+    }
+
+    for (index, item) in spec.account_statuses.iter().enumerate() {
+        let request_id = Uuid::new_v4().to_string();
+        let meta = Meta {
+            now: clock.now(),
+            request_id: &request_id,
+        };
+        let outcome = accounts
+            .control_set_account_status(
+                &who,
+                &meta,
+                &SetAccountStatus {
+                    account: item.account_id.clone(),
+                    status: item.status,
+                },
+            )
+            .map_err(|failure| format!("account_statuses[{index}] 失败：{failure}"))?;
+        emit(
+            writer,
+            &json!({
+                "kind": "account_status",
+                "account_id": item.account_id,
+                "status": item.status,
+                "result": written(outcome.result),
+                "request_id": request_id,
+            }),
+        )?;
+    }
+
+    for (index, item) in spec.credential_statuses.iter().enumerate() {
+        let request_id = Uuid::new_v4().to_string();
+        let meta = Meta {
+            now: clock.now(),
+            request_id: &request_id,
+        };
+        let outcome = accounts
+            .control_set_credential_status(
+                &who,
+                &meta,
+                &SetCredentialStatus {
+                    credential: item.credential_id.clone(),
+                    status: item.status,
+                },
+            )
+            .map_err(|failure| format!("credential_statuses[{index}] 失败：{failure}"))?;
+        emit(
+            writer,
+            &json!({
+                "kind": "credential_status",
+                "credential_id": item.credential_id,
+                "status": item.status,
+                "result": written(outcome.result),
                 "request_id": request_id,
             }),
         )?;

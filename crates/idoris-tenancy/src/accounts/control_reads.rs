@@ -64,6 +64,10 @@ pub struct CredentialView {
     /// 谁签发的：（种类，id）。
     pub issued_by: Option<(String, String)>,
     pub device: Option<DeviceView>,
+    /// 数据面验证器（`virtual_keys` 那一行）的状态：`active` / `revoked` / `missing`。凭证行的状态是控制面
+    /// 管的；运维用 `idoris key revoke` 只撤销验证器的话，凭证行仍是 `active`，但这张凭证已经不可用，
+    /// 所以两个状态都要看。
+    pub key_status: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -269,10 +273,19 @@ impl AccountStore {
                     )
                     .optional()
                     .map_err(internal)?;
+                let key_status: Option<String> = conn
+                    .query_row(
+                        "SELECT status FROM virtual_keys WHERE key_id = ?1",
+                        [id.as_str()],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .map_err(internal)?;
                 credentials.push(CredentialView {
                     credential,
                     issued_by,
                     device,
+                    key_status: key_status.unwrap_or_else(|| "missing".to_string()),
                 });
             }
             Ok(CredentialsView {

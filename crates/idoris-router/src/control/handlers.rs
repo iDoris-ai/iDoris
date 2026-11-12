@@ -754,6 +754,7 @@ pub(super) async fn read_credentials(
                 .map(|entry| {
                     json!({
                         "credential": to_json(&entry.credential),
+                        "key_status": entry.key_status,
                         "issued_by": entry.issued_by.as_ref().map(|(kind, id)| json!({ "kind": kind, "id": id })),
                         "device": entry.device.as_ref().map(|device| json!({
                             "pairing_id": device.pairing_id,

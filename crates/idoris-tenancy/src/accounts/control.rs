@@ -990,6 +990,15 @@ fn create_account_row(
             ))
         };
     }
+    // 不在已经冻结或关闭的账户下面建新账户：它从出生起就不可用，只会制造困惑。
+    if let Some(parent) = &account.parent
+        && load_account(conn, parent)?.is_some_and(|found| found.status != AccountStatus::Active)
+    {
+        return Err(Failure::with_detail(
+            ControlReason::InvalidAccount,
+            "the parent account is frozen or closed",
+        ));
+    }
     create_account_in(conn, account, now)
         .map_err(|error| Failure::from_store(error, Ctx::Account))?;
     Ok(Written {
