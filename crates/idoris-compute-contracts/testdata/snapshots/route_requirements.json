@@ -1,0 +1,22 @@
+{
+  "billing": "subsidized",
+  "form": "cloud",
+  "needs": {
+    "cache_pricing": false,
+    "cancellation": false,
+    "stream_usage": false,
+    "structured_output": false,
+    "tool_calling": true
+  },
+  "stream": false,
+  "tenant": {
+    "allowed_regions": [
+      "us"
+    ],
+    "data_classes": [
+      "child_edu"
+    ],
+    "max_retention": "zdr",
+    "require_dpa": true
+  }
+}

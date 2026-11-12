@@ -171,6 +171,8 @@ pub enum AdmissionError {
     },
     #[error("reason code {0} is not a denial and cannot be used as a rejection")]
     NotADenial(ReasonCode),
+    #[error("reason code {0} is not a degradation reason")]
+    NotADegradation(ReasonCode),
     #[error(transparent)]
     Money(#[from] MoneyError),
 }
@@ -475,8 +477,11 @@ pub struct Admitted {
 }
 
 /// 降级的原因（设计稿 §5 第 2 级）。
+///
+/// 线上形式**就是**稳定原因码字符串（`budget_degraded` / `capacity_degraded` / `upstream_failover`），
+/// 不另起一套名字：同一个概念只有一个线上字符串。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(try_from = "ReasonCode", into = "ReasonCode")]
 pub enum DegradeReason {
     /// 额度紧，换了更便宜的模型或压低了 `max_tokens`。
     Budget,
@@ -492,6 +497,24 @@ impl DegradeReason {
             DegradeReason::Budget => ReasonCode::BudgetDegraded,
             DegradeReason::Capacity => ReasonCode::CapacityDegraded,
             DegradeReason::UpstreamFailover => ReasonCode::UpstreamFailover,
+        }
+    }
+}
+
+impl From<DegradeReason> for ReasonCode {
+    fn from(reason: DegradeReason) -> ReasonCode {
+        reason.reason_code()
+    }
+}
+
+impl TryFrom<ReasonCode> for DegradeReason {
+    type Error = AdmissionError;
+    fn try_from(code: ReasonCode) -> Result<Self, AdmissionError> {
+        match code {
+            ReasonCode::BudgetDegraded => Ok(DegradeReason::Budget),
+            ReasonCode::CapacityDegraded => Ok(DegradeReason::Capacity),
+            ReasonCode::UpstreamFailover => Ok(DegradeReason::UpstreamFailover),
+            other => Err(AdmissionError::NotADegradation(other)),
         }
     }
 }
@@ -1213,6 +1236,39 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    #[test]
+    fn degrade_reason_serializes_as_the_stable_reason_code_not_a_second_name() {
+        for (reason, text) in [
+            (DegradeReason::Budget, "budget_degraded"),
+            (DegradeReason::Capacity, "capacity_degraded"),
+            (DegradeReason::UpstreamFailover, "upstream_failover"),
+        ] {
+            assert_eq!(
+                serde_json::to_string(&reason).unwrap(),
+                format!("\"{text}\"")
+            );
+            assert_eq!(
+                serde_json::from_str::<DegradeReason>(&format!("\"{text}\"")).unwrap(),
+                reason
+            );
+            assert_eq!(DegradeReason::try_from(reason.reason_code()), Ok(reason));
+        }
+        // 其它原因码、旧写法都不是降级原因
+        for bad in ["grace_used", "budget_exhausted", "budget", "capacity"] {
+            assert!(
+                serde_json::from_str::<DegradeReason>(&format!("\"{bad}\"")).is_err(),
+                "{bad}"
+            );
+        }
+        for code in ReasonCode::ALL {
+            assert_eq!(
+                DegradeReason::try_from(code).is_ok(),
+                code.class() == crate::reason::ReasonClass::Degradation,
+                "{code:?}"
+            );
+        }
     }
 
     #[test]
