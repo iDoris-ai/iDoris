@@ -213,4 +213,29 @@ curl -sS "http://127.0.0.1:${remote_port}/v1/models" >/dev/null || true
 stop_group "${groups[1]}"
 check_trace "$tmp/remote.trace" positive
 
-echo "[egress] PASS: local path stayed loopback and positive control caught remote connect"
+# 云端档（计算服务 S7）：配置了云端档（指向一个解析不了的非回环地址）时，启动、/health、/v1/models 仍然零出网。
+# 云端档只在请求路径上、本机失败之后才会被问到（还要隐私为 any、调用方显式同意、已配对），从不在启动时拨号探测。
+mkdir -p "$tmp/tier/components"
+write_policy "$tmp/tier/policy.yaml"
+write_local_card "$tmp/tier/components/local.yaml" "$upstream_port"
+cat >"$tmp/tier/cloud-tier.yaml" <<YAML
+schema_version: 1
+base_url: https://cloud-tier-egress-check.invalid/api
+model: idoris/agent
+state_dir: $tmp/tier/state
+YAML
+tier_port="$(free_port)"
+export IDORIS_CLOUD_TIER_CONFIG="$tmp/tier/cloud-tier.yaml"
+start_traced_router "$tmp/tier/components" "$tmp/tier/policy.yaml" "$tmp/tier.trace" "$tmp/tier.log" "$tier_port" "$tmp/tier.sqlite3"
+unset IDORIS_CLOUD_TIER_CONFIG
+grep -q "云端档已启用" "$tmp/tier.log" || {
+  echo "[egress] the cloud tier was not enabled in the traced router" >&2
+  cat "$tmp/tier.log" >&2
+  exit 1
+}
+curl -fsS "http://127.0.0.1:${tier_port}/health" >/dev/null
+curl -fsS "http://127.0.0.1:${tier_port}/v1/models" >/dev/null
+stop_group "${groups[2]}"
+check_trace "$tmp/tier.trace" local
+
+echo "[egress] PASS: local path stayed loopback, positive control caught remote connect, and a configured cloud tier dialled nothing at start-up"
