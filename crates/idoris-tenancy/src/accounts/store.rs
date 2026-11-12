@@ -49,16 +49,22 @@ use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior};
 
 use super::error::{AccountStoreError, PaymentContextError};
 use super::rows::{
-    account_exists, from_text, load_account, load_all_accounts, load_all_memberships,
-    load_all_principals, load_allocation, load_allocation_by_key, load_allocations_where,
-    load_ancestors, load_credential, load_membership, load_memberships_of, load_platform_roots,
-    load_principal, load_status_text, merge_chains, to_text,
+    AllocationRecord, account_exists, from_text, load_account, load_all_accounts,
+    load_all_memberships, load_all_principals, load_allocation, load_allocation_record,
+    load_allocation_record_by_key, load_allocations_where, load_ancestors, load_credential,
+    load_membership, load_memberships_of, load_platform_roots, load_principal, load_status_text,
+    merge_chains, to_text,
 };
 use crate::sqlite_conn::{
     PragmaSnapshot, STANDARD_BUSY_TIMEOUT, apply_standard, snapshot as pragma_snapshot,
 };
 
-const MIGRATIONS: &[&str] = &[include_str!("migrations/0001_accounts.sql")];
+/// 迁移按顺序执行，版本号 = 下标 + 1。0001 是 S1 的账户存储；0002 是 S2 的控制面（审计、凭证来源、主体登记、
+/// 额度撤销、配对）。**只能在末尾追加**，已经发布的文件不能改。
+const MIGRATIONS: &[&str] = &[
+    include_str!("migrations/0001_accounts.sql"),
+    include_str!("migrations/0002_control.sql"),
+];
 
 /// A credential carries at most this many control-plane scopes (also a CHECK on
 /// `credentials.scope_count` in the migration).
@@ -107,14 +113,14 @@ impl AccountStore {
     }
 
     /// 中毒的锁只会在上一次调用中途 panic 时出现。每个写函数要么提交要么随事务一起回滚，库本身不会被写坏，所以直接接着用。
-    fn lock(&self) -> MutexGuard<'_, Connection> {
+    pub(super) fn lock(&self) -> MutexGuard<'_, Connection> {
         self.conn
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// 一个写事务：`BEGIN IMMEDIATE`，`f` 返回 `Ok` 才提交，返回 `Err` 随事务丢弃而回滚。
-    fn write<T>(
+    pub(super) fn write<T>(
         &self,
         f: impl FnOnce(&Transaction<'_>) -> Result<T, AccountStoreError>,
     ) -> Result<T, AccountStoreError> {
@@ -126,7 +132,7 @@ impl AccountStore {
     }
 
     /// 一个只读事务：同一个快照里读多张表，读完回滚。
-    fn read<T>(
+    pub(super) fn read<T>(
         &self,
         f: impl FnOnce(&Transaction<'_>) -> Result<T, AccountStoreError>,
     ) -> Result<T, AccountStoreError> {
@@ -148,21 +154,7 @@ impl AccountStore {
         id: &PrincipalId,
         now: TimestampMs,
     ) -> Result<Principal, AccountStoreError> {
-        self.write(|tx| {
-            // Check, then insert, inside one `BEGIN IMMEDIATE` transaction. Not `INSERT OR IGNORE`: the
-            // database refuses every insert that would collide with an existing row (see the
-            // `*_insert_no_conflict` triggers), which is also what keeps `INSERT OR REPLACE` from
-            // reviving a revoked principal.
-            if load_principal(tx, id)?.is_none() {
-                tx.execute(
-                    "INSERT INTO principals (principal_id, status, created_at_ms, revoked_at_ms) \
-                     VALUES (?1, 'active', ?2, NULL)",
-                    rusqlite::params![id.as_str(), now.0],
-                )?;
-            }
-            load_principal(tx, id)?
-                .ok_or_else(|| AccountStoreError::not_found("principal", id.as_str()))
-        })
+        self.write(|tx| ensure_principal_in(tx, id, now))
     }
 
     pub fn get_principal(&self, id: &PrincipalId) -> Result<Option<Principal>, AccountStoreError> {
@@ -176,20 +168,7 @@ impl AccountStore {
         id: &PrincipalId,
         now: TimestampMs,
     ) -> Result<bool, AccountStoreError> {
-        self.write(|tx| {
-            let current = load_status_text(tx, "principals", "principal_id", id.as_str())?
-                .ok_or_else(|| AccountStoreError::not_found("principal", id.as_str()))?;
-            if from_text::<PrincipalStatus>("principal status", &current)?
-                == PrincipalStatus::Revoked
-            {
-                return Ok(false);
-            }
-            tx.execute(
-                "UPDATE principals SET status = 'revoked', revoked_at_ms = ?2 WHERE principal_id = ?1",
-                rusqlite::params![id.as_str(), now.0],
-            )?;
-            Ok(true)
-        })
+        self.write(|tx| revoke_principal_in(tx, id, now))
     }
 
     // ------------------------------------------------------------------ 账户
@@ -204,43 +183,7 @@ impl AccountStore {
         account: &Account,
         now: TimestampMs,
     ) -> Result<(), AccountStoreError> {
-        self.write(|tx| {
-            if account_exists(tx, &account.id)? {
-                return Err(AccountStoreError::already_exists(
-                    "account",
-                    account.id.as_str(),
-                ));
-            }
-            let mut slice = match &account.parent {
-                Some(parent) => {
-                    let chain = load_ancestors(tx, parent)?;
-                    if chain.is_empty() {
-                        return Err(TreeError::MissingParent {
-                            child: account.id.clone(),
-                            parent: parent.clone(),
-                        }
-                        .into());
-                    }
-                    chain
-                }
-                None => load_platform_roots(tx)?,
-            };
-            slice.push(account.clone());
-            AccountTree::build(slice)?;
-            tx.execute(
-                "INSERT INTO accounts (account_id, kind, parent_id, unit, status, created_at_ms) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                rusqlite::params![
-                    account.id.as_str(),
-                    to_text(&account.kind)?,
-                    account.parent.as_ref().map(AccountId::as_str),
-                    account.unit.to_string(),
-                    to_text(&account.status)?,
-                    now.0,
-                ],
-            )?;
-            Ok(())
-        })
+        self.write(|tx| create_account_in(tx, account, now))
     }
 
     pub fn get_account(&self, id: &AccountId) -> Result<Option<Account>, AccountStoreError> {
@@ -280,27 +223,7 @@ impl AccountStore {
         id: &AccountId,
         status: AccountStatus,
     ) -> Result<(), AccountStoreError> {
-        self.write(|tx| {
-            let current = load_status_text(tx, "accounts", "account_id", id.as_str())?
-                .ok_or_else(|| AccountStoreError::not_found("account", id.as_str()))?;
-            let current = from_text::<AccountStatus>("account status", &current)?;
-            if current == status {
-                return Ok(());
-            }
-            if current == AccountStatus::Closed {
-                return Err(AccountStoreError::IllegalTransition {
-                    kind: "account",
-                    id: id.to_string(),
-                    from: to_text(&current)?,
-                    to: to_text(&status)?,
-                });
-            }
-            tx.execute(
-                "UPDATE accounts SET status = ?2 WHERE account_id = ?1",
-                rusqlite::params![id.as_str(), to_text(&status)?],
-            )?;
-            Ok(())
-        })
+        self.write(|tx| set_account_status_in(tx, id, status))
     }
 
     /// 整棵树（校验过）。库里还没有任何账户返回 `None`。这是 O(账户数) 的，给控制面和对照测试用，不要放进热路径；
@@ -324,71 +247,7 @@ impl AccountStore {
         membership: &Membership,
         now: TimestampMs,
     ) -> Result<(), AccountStoreError> {
-        self.write(|tx| {
-            if load_membership(tx, &membership.id)?.is_some() {
-                return Err(AccountStoreError::already_exists(
-                    "membership",
-                    membership.id.as_str(),
-                ));
-            }
-            let principal = load_principal(tx, &membership.principal)?.ok_or_else(|| {
-                DirectoryError::UnknownPrincipal {
-                    membership: membership.id.clone(),
-                    principal: membership.principal.clone(),
-                }
-            })?;
-            let mut accounts = BTreeMap::new();
-            let org_chain = load_ancestors(tx, &membership.org)?;
-            if org_chain.is_empty() {
-                return Err(DirectoryError::UnknownOrg {
-                    membership: membership.id.clone(),
-                    org: membership.org.clone(),
-                }
-                .into());
-            }
-            merge_chains(&mut accounts, org_chain);
-            if let Some(account) = &membership.account {
-                merge_chains(&mut accounts, load_ancestors(tx, account)?);
-            }
-            let tree = AccountTree::build(accounts.into_values().collect())?;
-            // 结构错误（角色与账户种类对不上、账户不在组织子树里……）先由 S0 报；
-            // 通过之后才查「这个账户是不是已经属于别的成员关系」，那是 S0 看一小片数据看不到的跨成员关系的规则。
-            Directory::build(tree, vec![principal], vec![membership.clone()])?;
-            if let Some(account) = &membership.account {
-                let bound: Option<String> = tx
-                    .query_row(
-                        "SELECT membership_id FROM memberships WHERE account_id = ?1",
-                        [account.as_str()],
-                        |row| row.get(0),
-                    )
-                    .optional()?;
-                if let Some(first) = bound {
-                    return Err(DirectoryError::AccountAlreadyBound {
-                        account: account.clone(),
-                        first: MembershipId::new(first)?,
-                        second: membership.id.clone(),
-                    }
-                    .into());
-                }
-            }
-            let revoked_at = (membership.status == MembershipStatus::Revoked).then_some(now.0);
-            tx.execute(
-                "INSERT INTO memberships \
-                    (membership_id, principal_id, org_id, role, account_id, status, created_at_ms, revoked_at_ms) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                rusqlite::params![
-                    membership.id.as_str(),
-                    membership.principal.as_str(),
-                    membership.org.as_str(),
-                    to_text(&membership.role)?,
-                    membership.account.as_ref().map(AccountId::as_str),
-                    to_text(&membership.status)?,
-                    now.0,
-                    revoked_at,
-                ],
-            )?;
-            Ok(())
-        })
+        self.write(|tx| create_membership_in(tx, membership, now))
     }
 
     pub fn get_membership(
@@ -412,20 +271,7 @@ impl AccountStore {
         id: &MembershipId,
         now: TimestampMs,
     ) -> Result<bool, AccountStoreError> {
-        self.write(|tx| {
-            let current = load_status_text(tx, "memberships", "membership_id", id.as_str())?
-                .ok_or_else(|| AccountStoreError::not_found("membership", id.as_str()))?;
-            if from_text::<MembershipStatus>("membership status", &current)?
-                == MembershipStatus::Revoked
-            {
-                return Ok(false);
-            }
-            tx.execute(
-                "UPDATE memberships SET status = 'revoked', revoked_at_ms = ?2 WHERE membership_id = ?1",
-                rusqlite::params![id.as_str(), now.0],
-            )?;
-            Ok(true)
-        })
+        self.write(|tx| revoke_membership_in(tx, id, now))
     }
 
     // ------------------------------------------------------------------ 凭证
@@ -443,95 +289,7 @@ impl AccountStore {
         credential: &Credential,
         now: TimestampMs,
     ) -> Result<(), AccountStoreError> {
-        self.write(|tx| {
-            if load_status_text(tx, "credentials", "credential_id", credential.id().as_str())?
-                .is_some()
-            {
-                return Err(AccountStoreError::already_exists(
-                    "credential",
-                    credential.id().as_str(),
-                ));
-            }
-            if credential.admin_scopes().len() > MAX_ADMIN_SCOPES_PER_CREDENTIAL {
-                return Err(AccountStoreError::InvalidBinding(format!(
-                    "a credential carries at most {MAX_ADMIN_SCOPES_PER_CREDENTIAL} admin scopes, got {}",
-                    credential.admin_scopes().len()
-                )));
-            }
-            let (kind, account, membership, anchor) = match credential.binding() {
-                CredentialBinding::Service { account } => {
-                    ("service", Some(account), None, org_anchor(tx, account)?)
-                }
-                CredentialBinding::Node { account } => {
-                    ("node", Some(account), None, org_anchor(tx, account)?)
-                }
-                CredentialBinding::Member { membership } => {
-                    let found = load_membership(tx, membership)?.ok_or_else(|| {
-                        AccountStoreError::not_found("membership", membership.as_str())
-                    })?;
-                    let payer = match (found.role, found.account) {
-                        (MembershipRole::Member | MembershipRole::Sponsor, Some(payer)) => payer,
-                        _ => {
-                            return Err(AccountStoreError::InvalidBinding(format!(
-                                "membership {membership} has no payment account (administrators cannot be bound)"
-                            )));
-                        }
-                    };
-                    ("member", None, Some(membership), payer)
-                }
-            };
-            for scope in credential.admin_scopes() {
-                let chain = load_ancestors(tx, &scope.subtree)?;
-                if chain.is_empty() {
-                    return Err(AccountStoreError::not_found(
-                        "account",
-                        scope.subtree.as_str(),
-                    ));
-                }
-                if !chain.iter().any(|ancestor| ancestor.id == anchor) {
-                    return Err(AccountStoreError::InvalidBinding(format!(
-                        "admin scope subtree {} is outside the credential's own binding {anchor}",
-                        scope.subtree
-                    )));
-                }
-            }
-            let status = credential.status();
-            // `scope_count` is fixed here, at issuance: the database refuses admin-scope rows beyond it
-            // (and refuses to change it), so scopes can never be appended to an existing credential.
-            tx.execute(
-                "INSERT INTO credentials \
-                    (credential_id, binding_kind, account_id, membership_id, status, expires_at_ms, \
-                     created_at_ms, revoked_at_ms, scope_count) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                rusqlite::params![
-                    credential.id().as_str(),
-                    kind,
-                    account.map(AccountId::as_str),
-                    membership.map(MembershipId::as_str),
-                    to_text(&status)?,
-                    credential.expires_at().map(|at| at.0),
-                    now.0,
-                    (status == CredentialStatus::Revoked).then_some(now.0),
-                    i64::try_from(credential.admin_scopes().len()).unwrap_or(i64::MAX),
-                ],
-            )?;
-            for (position, scope) in credential.admin_scopes().iter().enumerate() {
-                tx.execute(
-                    "INSERT INTO credential_admin_scopes \
-                        (credential_id, position, op, subtree_id, max_amount_unit, max_amount_micros) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                    rusqlite::params![
-                        credential.id().as_str(),
-                        i64::try_from(position).unwrap_or(i64::MAX),
-                        to_text(&scope.op)?,
-                        scope.subtree.as_str(),
-                        scope.max_amount.as_ref().map(|money| money.unit.to_string()),
-                        scope.max_amount.as_ref().map(|money| money.micros),
-                    ],
-                )?;
-            }
-            Ok(())
-        })
+        self.write(|tx| create_credential_in(tx, credential, now))
     }
 
     pub fn get_credential(
@@ -549,33 +307,7 @@ impl AccountStore {
         status: CredentialStatus,
         now: TimestampMs,
     ) -> Result<(), AccountStoreError> {
-        self.write(|tx| {
-            // Status column only (not the whole credential): revoking must keep working even if the
-            // credential's scope rows are unreadable.
-            let current = load_status_text(tx, "credentials", "credential_id", id.as_str())?
-                .ok_or_else(|| AccountStoreError::not_found("credential", id.as_str()))?;
-            let current = from_text::<CredentialStatus>("credential status", &current)?;
-            if current == status {
-                return Ok(());
-            }
-            if current == CredentialStatus::Revoked {
-                return Err(AccountStoreError::IllegalTransition {
-                    kind: "credential",
-                    id: id.to_string(),
-                    from: to_text(&current)?,
-                    to: to_text(&status)?,
-                });
-            }
-            tx.execute(
-                "UPDATE credentials SET status = ?2, revoked_at_ms = ?3 WHERE credential_id = ?1",
-                rusqlite::params![
-                    id.as_str(),
-                    to_text(&status)?,
-                    (status == CredentialStatus::Revoked).then_some(now.0),
-                ],
-            )?;
-            Ok(())
-        })
+        self.write(|tx| set_credential_status_in(tx, id, status, now))
     }
 
     // ------------------------------------------------------------------ 额度
@@ -596,59 +328,11 @@ impl AccountStore {
         allocation: &Allocation,
         now: TimestampMs,
     ) -> Result<AllocationOutcome, AccountStoreError> {
-        self.write(|tx| {
-            if let Some(key) = &allocation.idempotency_key
-                && let Some(existing) = load_allocation_by_key(tx, key)?
-            {
-                return if same_issuance(&existing, allocation) {
-                    Ok(AllocationOutcome::Replayed(existing))
-                } else {
-                    Err(AllocationError::DuplicateIdempotencyKey(key.clone()).into())
-                };
-            }
-            check_subsidy_key(tx, allocation)?;
-            let mut accounts = BTreeMap::new();
-            merge_chains(&mut accounts, load_ancestors(tx, &allocation.child)?);
-            merge_chains(&mut accounts, load_ancestors(tx, &allocation.parent)?);
-            if !accounts.contains_key(&allocation.child) {
-                return Err(AllocationError::UnknownAccount(allocation.child.clone()).into());
-            }
-            if !accounts.contains_key(&allocation.parent) {
-                return Err(AllocationError::UnknownAccount(allocation.parent.clone()).into());
-            }
-            let tree = AccountTree::build(accounts.into_values().collect())?;
-            // `validate_allocation` 读 `existing` 的三种信息：同 id、同幂等键、流入父账户的额度。
-            let mut existing = load_allocations_where(tx, "child_id", &allocation.parent)?;
-            if let Some(same_id) = load_allocation(tx, &allocation.id)? {
-                existing.push(same_id);
-            }
-            validate_allocation(&tree, &existing, allocation)?;
-            let ceiling = &allocation.ceiling;
-            tx.execute(
-                "INSERT INTO allocations \
-                    (allocation_id, parent_id, child_id, ceiling_unit, ceiling_micros, purpose, \
-                     valid_from_ms, valid_until_ms, transferable, idempotency_key, created_at_ms) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?10)",
-                rusqlite::params![
-                    allocation.id.as_str(),
-                    allocation.parent.as_str(),
-                    allocation.child.as_str(),
-                    ceiling.unit().to_string(),
-                    ceiling.amount().micros,
-                    to_text(&ceiling.purpose())?,
-                    ceiling.valid_from().0,
-                    ceiling.valid_until().0,
-                    allocation
-                        .idempotency_key
-                        .as_ref()
-                        .map(IdempotencyKey::as_str),
-                    now.0,
-                ],
-            )?;
-            Ok(AllocationOutcome::Created)
-        })
+        self.write(|tx| create_allocation_in(tx, allocation, now))
     }
 
+    /// 按 id 取一笔**有效的**额度。被撤销的额度读不到（它不再给任何人授权）；要连同撤销时间一起看，用
+    /// [`allocation_record`](Self::allocation_record)。
     pub fn get_allocation(
         &self,
         id: &AllocationId,
@@ -656,7 +340,15 @@ impl AccountStore {
         self.read(|tx| load_allocation(tx, id))
     }
 
-    /// 流入 `child` 的全部额度（谁给了它多少上限），按 id 排序。
+    /// 按 id 取一笔额度和它的撤销时间，不管有没有被撤销（S2：`allocations.revoked_at_ms`）。
+    pub fn allocation_record(
+        &self,
+        id: &AllocationId,
+    ) -> Result<Option<AllocationRecord>, AccountStoreError> {
+        self.read(|tx| load_allocation_record(tx, id))
+    }
+
+    /// 流入 `child` 的全部**有效的**额度（谁给了它多少上限），按 id 排序。被撤销的不算：它们不再给任何人授权。
     pub fn allocations_into(
         &self,
         child: &AccountId,
@@ -664,7 +356,7 @@ impl AccountStore {
         self.read(|tx| load_allocations_where(tx, "child_id", child))
     }
 
-    /// `parent` 下发出去的全部额度，按 id 排序。
+    /// `parent` 下发出去的全部**有效的**额度，按 id 排序。被撤销的不算。
     pub fn allocations_from(
         &self,
         parent: &AccountId,
@@ -719,8 +411,406 @@ impl AccountStore {
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// 写入的实现：每个函数在**调用方已经开好的**事务（或保存点）里做「读出一小片 -> S0 校验 -> 写入」。
+// 公开的 `AccountStore::*` 方法各开一个 `BEGIN IMMEDIATE` 事务调用它们；S2 控制面（`control.rs`）在自己的事务里
+// 先授权、再调用它们、最后写审计，所以「授权 + 写入 + 审计」是同一个事务。
+// ---------------------------------------------------------------------------------------------
+
+/// 幂等地登记一个主体，见 [`AccountStore::ensure_principal`]。
+pub(super) fn ensure_principal_in(
+    tx: &Connection,
+    id: &PrincipalId,
+    now: TimestampMs,
+) -> Result<Principal, AccountStoreError> {
+    // Check, then insert, inside one `BEGIN IMMEDIATE` transaction. Not `INSERT OR IGNORE`: the
+    // database refuses every insert that would collide with an existing row (see the
+    // `*_insert_no_conflict` triggers), which is also what keeps `INSERT OR REPLACE` from
+    // reviving a revoked principal.
+    if load_principal(tx, id)?.is_none() {
+        tx.execute(
+            "INSERT INTO principals (principal_id, status, created_at_ms, revoked_at_ms) \
+             VALUES (?1, 'active', ?2, NULL)",
+            rusqlite::params![id.as_str(), now.0],
+        )?;
+    }
+    load_principal(tx, id)?.ok_or_else(|| AccountStoreError::not_found("principal", id.as_str()))
+}
+
+/// 撤销主体，见 [`AccountStore::revoke_principal`]。
+pub(super) fn revoke_principal_in(
+    tx: &Connection,
+    id: &PrincipalId,
+    now: TimestampMs,
+) -> Result<bool, AccountStoreError> {
+    let current = load_status_text(tx, "principals", "principal_id", id.as_str())?
+        .ok_or_else(|| AccountStoreError::not_found("principal", id.as_str()))?;
+    if from_text::<PrincipalStatus>("principal status", &current)? == PrincipalStatus::Revoked {
+        return Ok(false);
+    }
+    tx.execute(
+        "UPDATE principals SET status = 'revoked', revoked_at_ms = ?2 WHERE principal_id = ?1",
+        rusqlite::params![id.as_str(), now.0],
+    )?;
+    Ok(true)
+}
+
+/// 新增账户，见 [`AccountStore::create_account`]。
+pub(super) fn create_account_in(
+    tx: &Connection,
+    account: &Account,
+    now: TimestampMs,
+) -> Result<(), AccountStoreError> {
+    if account_exists(tx, &account.id)? {
+        return Err(AccountStoreError::already_exists(
+            "account",
+            account.id.as_str(),
+        ));
+    }
+    let mut slice = match &account.parent {
+        Some(parent) => {
+            let chain = load_ancestors(tx, parent)?;
+            if chain.is_empty() {
+                return Err(TreeError::MissingParent {
+                    child: account.id.clone(),
+                    parent: parent.clone(),
+                }
+                .into());
+            }
+            chain
+        }
+        None => load_platform_roots(tx)?,
+    };
+    slice.push(account.clone());
+    AccountTree::build(slice)?;
+    tx.execute(
+        "INSERT INTO accounts (account_id, kind, parent_id, unit, status, created_at_ms) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        rusqlite::params![
+            account.id.as_str(),
+            to_text(&account.kind)?,
+            account.parent.as_ref().map(AccountId::as_str),
+            account.unit.to_string(),
+            to_text(&account.status)?,
+            now.0,
+        ],
+    )?;
+    Ok(())
+}
+
+/// 改账户状态，见 [`AccountStore::set_account_status`]。
+pub(super) fn set_account_status_in(
+    tx: &Connection,
+    id: &AccountId,
+    status: AccountStatus,
+) -> Result<(), AccountStoreError> {
+    let current = load_status_text(tx, "accounts", "account_id", id.as_str())?
+        .ok_or_else(|| AccountStoreError::not_found("account", id.as_str()))?;
+    let current = from_text::<AccountStatus>("account status", &current)?;
+    if current == status {
+        return Ok(());
+    }
+    if current == AccountStatus::Closed {
+        return Err(AccountStoreError::IllegalTransition {
+            kind: "account",
+            id: id.to_string(),
+            from: to_text(&current)?,
+            to: to_text(&status)?,
+        });
+    }
+    tx.execute(
+        "UPDATE accounts SET status = ?2 WHERE account_id = ?1",
+        rusqlite::params![id.as_str(), to_text(&status)?],
+    )?;
+    Ok(())
+}
+
+/// 新增成员关系，见 [`AccountStore::create_membership`]。
+pub(super) fn create_membership_in(
+    tx: &Connection,
+    membership: &Membership,
+    now: TimestampMs,
+) -> Result<(), AccountStoreError> {
+    if load_membership(tx, &membership.id)?.is_some() {
+        return Err(AccountStoreError::already_exists(
+            "membership",
+            membership.id.as_str(),
+        ));
+    }
+    let principal = load_principal(tx, &membership.principal)?.ok_or_else(|| {
+        DirectoryError::UnknownPrincipal {
+            membership: membership.id.clone(),
+            principal: membership.principal.clone(),
+        }
+    })?;
+    let mut accounts = BTreeMap::new();
+    let org_chain = load_ancestors(tx, &membership.org)?;
+    if org_chain.is_empty() {
+        return Err(DirectoryError::UnknownOrg {
+            membership: membership.id.clone(),
+            org: membership.org.clone(),
+        }
+        .into());
+    }
+    merge_chains(&mut accounts, org_chain);
+    if let Some(account) = &membership.account {
+        merge_chains(&mut accounts, load_ancestors(tx, account)?);
+    }
+    let tree = AccountTree::build(accounts.into_values().collect())?;
+    // 结构错误（角色与账户种类对不上、账户不在组织子树里……）先由 S0 报；
+    // 通过之后才查「这个账户是不是已经属于别的成员关系」，那是 S0 看一小片数据看不到的跨成员关系的规则。
+    Directory::build(tree, vec![principal], vec![membership.clone()])?;
+    if let Some(account) = &membership.account {
+        let bound: Option<String> = tx
+            .query_row(
+                "SELECT membership_id FROM memberships WHERE account_id = ?1",
+                [account.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(first) = bound {
+            return Err(DirectoryError::AccountAlreadyBound {
+                account: account.clone(),
+                first: MembershipId::new(first)?,
+                second: membership.id.clone(),
+            }
+            .into());
+        }
+    }
+    let revoked_at = (membership.status == MembershipStatus::Revoked).then_some(now.0);
+    tx.execute(
+        "INSERT INTO memberships \
+            (membership_id, principal_id, org_id, role, account_id, status, created_at_ms, revoked_at_ms) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        rusqlite::params![
+            membership.id.as_str(),
+            membership.principal.as_str(),
+            membership.org.as_str(),
+            to_text(&membership.role)?,
+            membership.account.as_ref().map(AccountId::as_str),
+            to_text(&membership.status)?,
+            now.0,
+            revoked_at,
+        ],
+    )?;
+    Ok(())
+}
+
+/// 撤销成员关系，见 [`AccountStore::revoke_membership`]。
+pub(super) fn revoke_membership_in(
+    tx: &Connection,
+    id: &MembershipId,
+    now: TimestampMs,
+) -> Result<bool, AccountStoreError> {
+    let current = load_status_text(tx, "memberships", "membership_id", id.as_str())?
+        .ok_or_else(|| AccountStoreError::not_found("membership", id.as_str()))?;
+    if from_text::<MembershipStatus>("membership status", &current)? == MembershipStatus::Revoked {
+        return Ok(false);
+    }
+    tx.execute(
+        "UPDATE memberships SET status = 'revoked', revoked_at_ms = ?2 WHERE membership_id = ?1",
+        rusqlite::params![id.as_str(), now.0],
+    )?;
+    Ok(true)
+}
+
+/// 新增凭证（只有元数据），见 [`AccountStore::create_credential`]。
+pub(super) fn create_credential_in(
+    tx: &Connection,
+    credential: &Credential,
+    now: TimestampMs,
+) -> Result<(), AccountStoreError> {
+    if load_status_text(tx, "credentials", "credential_id", credential.id().as_str())?.is_some() {
+        return Err(AccountStoreError::already_exists(
+            "credential",
+            credential.id().as_str(),
+        ));
+    }
+    if credential.admin_scopes().len() > MAX_ADMIN_SCOPES_PER_CREDENTIAL {
+        return Err(AccountStoreError::InvalidBinding(format!(
+            "a credential carries at most {MAX_ADMIN_SCOPES_PER_CREDENTIAL} admin scopes, got {}",
+            credential.admin_scopes().len()
+        )));
+    }
+    let (kind, account, membership, anchor) = match credential.binding() {
+        CredentialBinding::Service { account } => {
+            ("service", Some(account), None, org_anchor(tx, account)?)
+        }
+        CredentialBinding::Node { account } => {
+            ("node", Some(account), None, org_anchor(tx, account)?)
+        }
+        CredentialBinding::Member { membership } => {
+            let found = load_membership(tx, membership)?
+                .ok_or_else(|| AccountStoreError::not_found("membership", membership.as_str()))?;
+            let payer = match (found.role, found.account) {
+                (MembershipRole::Member | MembershipRole::Sponsor, Some(payer)) => payer,
+                _ => {
+                    return Err(AccountStoreError::InvalidBinding(format!(
+                        "membership {membership} has no payment account (administrators cannot be bound)"
+                    )));
+                }
+            };
+            ("member", None, Some(membership), payer)
+        }
+    };
+    for scope in credential.admin_scopes() {
+        let chain = load_ancestors(tx, &scope.subtree)?;
+        if chain.is_empty() {
+            return Err(AccountStoreError::not_found(
+                "account",
+                scope.subtree.as_str(),
+            ));
+        }
+        if !chain.iter().any(|ancestor| ancestor.id == anchor) {
+            return Err(AccountStoreError::InvalidBinding(format!(
+                "admin scope subtree {} is outside the credential's own binding {anchor}",
+                scope.subtree
+            )));
+        }
+    }
+    let status = credential.status();
+    // `scope_count` is fixed here, at issuance: the database refuses admin-scope rows beyond it
+    // (and refuses to change it), so scopes can never be appended to an existing credential.
+    tx.execute(
+        "INSERT INTO credentials \
+            (credential_id, binding_kind, account_id, membership_id, status, expires_at_ms, \
+             created_at_ms, revoked_at_ms, scope_count) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        rusqlite::params![
+            credential.id().as_str(),
+            kind,
+            account.map(AccountId::as_str),
+            membership.map(MembershipId::as_str),
+            to_text(&status)?,
+            credential.expires_at().map(|at| at.0),
+            now.0,
+            (status == CredentialStatus::Revoked).then_some(now.0),
+            i64::try_from(credential.admin_scopes().len()).unwrap_or(i64::MAX),
+        ],
+    )?;
+    for (position, scope) in credential.admin_scopes().iter().enumerate() {
+        tx.execute(
+            "INSERT INTO credential_admin_scopes \
+                (credential_id, position, op, subtree_id, max_amount_unit, max_amount_micros) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![
+                credential.id().as_str(),
+                i64::try_from(position).unwrap_or(i64::MAX),
+                to_text(&scope.op)?,
+                scope.subtree.as_str(),
+                scope
+                    .max_amount
+                    .as_ref()
+                    .map(|money| money.unit.to_string()),
+                scope.max_amount.as_ref().map(|money| money.micros),
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+/// 改凭证状态，见 [`AccountStore::set_credential_status`]。
+pub(super) fn set_credential_status_in(
+    tx: &Connection,
+    id: &CredentialId,
+    status: CredentialStatus,
+    now: TimestampMs,
+) -> Result<(), AccountStoreError> {
+    // Status column only (not the whole credential): revoking must keep working even if the
+    // credential's scope rows are unreadable.
+    let current = load_status_text(tx, "credentials", "credential_id", id.as_str())?
+        .ok_or_else(|| AccountStoreError::not_found("credential", id.as_str()))?;
+    let current = from_text::<CredentialStatus>("credential status", &current)?;
+    if current == status {
+        return Ok(());
+    }
+    if current == CredentialStatus::Revoked {
+        return Err(AccountStoreError::IllegalTransition {
+            kind: "credential",
+            id: id.to_string(),
+            from: to_text(&current)?,
+            to: to_text(&status)?,
+        });
+    }
+    tx.execute(
+        "UPDATE credentials SET status = ?2, revoked_at_ms = ?3 WHERE credential_id = ?1",
+        rusqlite::params![
+            id.as_str(),
+            to_text(&status)?,
+            (status == CredentialStatus::Revoked).then_some(now.0),
+        ],
+    )?;
+    Ok(())
+}
+
+/// 新增额度（或幂等重发），见 [`AccountStore::create_allocation`]。
+pub(super) fn create_allocation_in(
+    tx: &Connection,
+    allocation: &Allocation,
+    now: TimestampMs,
+) -> Result<AllocationOutcome, AccountStoreError> {
+    if let Some(key) = &allocation.idempotency_key
+        && let Some(existing) = load_allocation_record_by_key(tx, key)?
+    {
+        return if !same_issuance(&existing.allocation, allocation) {
+            Err(AllocationError::DuplicateIdempotencyKey(key.clone()).into())
+        } else if existing.revoked_at_ms.is_some() {
+            // 同一次发放，但这笔额度已经被撤销：重发不能把它「复活」，也不能假装它还有效。
+            Err(AccountStoreError::AllocationRevoked {
+                id: existing.allocation.id.to_string(),
+            })
+        } else {
+            Ok(AllocationOutcome::Replayed(existing.allocation))
+        };
+    }
+    check_subsidy_key(tx, allocation)?;
+    let mut accounts = BTreeMap::new();
+    merge_chains(&mut accounts, load_ancestors(tx, &allocation.child)?);
+    merge_chains(&mut accounts, load_ancestors(tx, &allocation.parent)?);
+    if !accounts.contains_key(&allocation.child) {
+        return Err(AllocationError::UnknownAccount(allocation.child.clone()).into());
+    }
+    if !accounts.contains_key(&allocation.parent) {
+        return Err(AllocationError::UnknownAccount(allocation.parent.clone()).into());
+    }
+    let tree = AccountTree::build(accounts.into_values().collect())?;
+    // `validate_allocation` 读 `existing` 的三种信息：同 id、同幂等键、流入父账户的额度。
+    // 流入父账户的额度只算**有效的**（被撤销的不再给父账户授权）；同 id 的要连被撤销的一起看：
+    // id 一旦用过就不能换一个含义再用。
+    let mut existing = load_allocations_where(tx, "child_id", &allocation.parent)?;
+    if let Some(same_id) = load_allocation_record(tx, &allocation.id)?
+        && !existing.iter().any(|a| a.id == same_id.allocation.id)
+    {
+        existing.push(same_id.allocation);
+    }
+    validate_allocation(&tree, &existing, allocation)?;
+    let ceiling = &allocation.ceiling;
+    tx.execute(
+        "INSERT INTO allocations \
+            (allocation_id, parent_id, child_id, ceiling_unit, ceiling_micros, purpose, \
+             valid_from_ms, valid_until_ms, transferable, idempotency_key, created_at_ms) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?10)",
+        rusqlite::params![
+            allocation.id.as_str(),
+            allocation.parent.as_str(),
+            allocation.child.as_str(),
+            ceiling.unit().to_string(),
+            ceiling.amount().micros,
+            to_text(&ceiling.purpose())?,
+            ceiling.valid_from().0,
+            ceiling.valid_until().0,
+            allocation
+                .idempotency_key
+                .as_ref()
+                .map(IdempotencyKey::as_str),
+            now.0,
+        ],
+    )?;
+    Ok(AllocationOutcome::Created)
+}
+
 /// `Service` / `Node` 凭证的绑定账户必须存在且是 `Org`。返回它（也是权限范围的外框）。
-fn org_anchor(tx: &Transaction<'_>, account: &AccountId) -> Result<AccountId, AccountStoreError> {
+fn org_anchor(tx: &Connection, account: &AccountId) -> Result<AccountId, AccountStoreError> {
     let found = load_account(tx, account)?
         .ok_or_else(|| AccountStoreError::not_found("account", account.as_str()))?;
     if found.kind != AccountKind::Org {
@@ -738,10 +828,7 @@ fn same_issuance(left: &Allocation, right: &Allocation) -> bool {
 }
 
 /// 免费额度的幂等键规则（见 [`AccountStore::create_allocation`] 第 2 条）。
-fn check_subsidy_key(
-    tx: &Transaction<'_>,
-    allocation: &Allocation,
-) -> Result<(), AccountStoreError> {
+fn check_subsidy_key(tx: &Connection, allocation: &Allocation) -> Result<(), AccountStoreError> {
     const PREFIX: &str = "subsidy:";
     let key = allocation.idempotency_key.as_ref();
     if allocation.ceiling.purpose() != Purpose::FreeTier {
@@ -792,15 +879,15 @@ fn check_subsidy_key(
 /// - `Member`：该成员关系、它的主体，以及它的组织链和账户链。
 ///
 /// 所有链都止于同一个平台根，所以合起来是一棵合法的树；`Directory::build` 会再校验一遍。
-fn directory_slice(
-    tx: &Transaction<'_>,
+pub(super) fn directory_slice(
+    tx: &Connection,
     credential: &Credential,
     asserted_member: Option<&PrincipalId>,
 ) -> Result<Directory, AccountStoreError> {
     let mut accounts = BTreeMap::new();
     let mut principals: Vec<Principal> = Vec::new();
     let mut memberships: Vec<Membership> = Vec::new();
-    let mut add_membership = |tx: &Transaction<'_>,
+    let mut add_membership = |tx: &Connection,
                               accounts: &mut BTreeMap<AccountId, Account>,
                               membership: Membership|
      -> Result<(), AccountStoreError> {

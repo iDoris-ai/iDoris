@@ -100,7 +100,7 @@ fn the_two_stores_share_one_database_without_touching_each_others_schema() {
             open_accounts(db.path());
         }
         assert_eq!(objects(db.path()), union, "accounts_first={accounts_first}");
-        assert_eq!(versions(db.path(), "account_schema_migrations"), [1]);
+        assert_eq!(versions(db.path(), "account_schema_migrations"), [1, 2]);
         assert_eq!(
             versions(db.path(), "compute_attempt_schema_migrations"),
             [1]
@@ -112,7 +112,7 @@ fn the_two_stores_share_one_database_without_touching_each_others_schema() {
             open_attempts(db.path());
         }
         assert_eq!(objects(db.path()), union, "accounts_first={accounts_first}");
-        assert_eq!(versions(db.path(), "account_schema_migrations"), [1]);
+        assert_eq!(versions(db.path(), "account_schema_migrations"), [1, 2]);
         assert_eq!(
             versions(db.path(), "compute_attempt_schema_migrations"),
             [1]

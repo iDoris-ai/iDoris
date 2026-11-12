@@ -309,6 +309,10 @@ pub(super) fn load_all_memberships(
 pub(super) const ALLOCATION_COLUMNS: &str = "allocation_id, parent_id, child_id, ceiling_unit, \
      ceiling_micros, purpose, valid_from_ms, valid_until_ms, idempotency_key";
 
+/// 子查询：这笔额度被撤销的时间（没有撤销行就是 NULL）。只能和 `FROM allocations` 一起用。
+pub(super) const REVOKED_AT: &str = "(SELECT revoked_at_ms FROM allocation_revocations r \
+     WHERE r.allocation_id = allocations.allocation_id)";
+
 pub(super) struct RawAllocation {
     id: String,
     parent: String,
@@ -353,42 +357,72 @@ impl RawAllocation {
     }
 }
 
+/// 一笔额度连同它的撤销时间（S2：`allocation_revocations` 里的那一行，`None` = 有效）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AllocationRecord {
+    pub allocation: Allocation,
+    pub revoked_at_ms: Option<i64>,
+}
+
+/// 按 id 取一笔额度，**不管有没有被撤销**。返回值带着撤销时间，调用方必须自己看。
+pub(super) fn load_allocation_record(
+    conn: &Connection,
+    id: &AllocationId,
+) -> Result<Option<AllocationRecord>, AccountStoreError> {
+    load_record_where(conn, "allocation_id", id.as_str())
+}
+
+/// 按幂等键取一笔额度，**不管有没有被撤销**（幂等重发要能认出「这个键已经用过」，包括用过之后被撤销的）。
+pub(super) fn load_allocation_record_by_key(
+    conn: &Connection,
+    key: &IdempotencyKey,
+) -> Result<Option<AllocationRecord>, AccountStoreError> {
+    load_record_where(conn, "idempotency_key", key.as_str())
+}
+
+fn load_record_where(
+    conn: &Connection,
+    column: &'static str,
+    value: &str,
+) -> Result<Option<AllocationRecord>, AccountStoreError> {
+    let raw: Option<(RawAllocation, Option<i64>)> = conn
+        .query_row(
+            &format!(
+                "SELECT {ALLOCATION_COLUMNS}, {REVOKED_AT} FROM allocations WHERE {column} = ?1"
+            ),
+            [value],
+            |row| Ok((RawAllocation::read(row)?, row.get(9)?)),
+        )
+        .optional()?;
+    raw.map(|(raw, revoked_at_ms)| {
+        Ok(AllocationRecord {
+            allocation: raw.into_allocation()?,
+            revoked_at_ms,
+        })
+    })
+    .transpose()
+}
+
+/// 按 id 取一笔**有效的**（没有被撤销的）额度。被撤销的额度不再给任何人授权，所以这里读不到它。
 pub(super) fn load_allocation(
     conn: &Connection,
     id: &AllocationId,
 ) -> Result<Option<Allocation>, AccountStoreError> {
-    conn.query_row(
-        &format!("SELECT {ALLOCATION_COLUMNS} FROM allocations WHERE allocation_id = ?1"),
-        [id.as_str()],
-        RawAllocation::read,
-    )
-    .optional()?
-    .map(RawAllocation::into_allocation)
-    .transpose()
+    Ok(load_allocation_record(conn, id)?
+        .filter(|record| record.revoked_at_ms.is_none())
+        .map(|record| record.allocation))
 }
 
-pub(super) fn load_allocation_by_key(
-    conn: &Connection,
-    key: &IdempotencyKey,
-) -> Result<Option<Allocation>, AccountStoreError> {
-    conn.query_row(
-        &format!("SELECT {ALLOCATION_COLUMNS} FROM allocations WHERE idempotency_key = ?1"),
-        [key.as_str()],
-        RawAllocation::read,
-    )
-    .optional()?
-    .map(RawAllocation::into_allocation)
-    .transpose()
-}
-
-/// 某一列（`parent_id` 或 `child_id`，调用方写死，不是用户输入）等于 `account` 的全部额度，按 id 排序。
+/// 某一列（`parent_id` 或 `child_id`，调用方写死，不是用户输入）等于 `account` 的全部**有效的**额度
+/// （被撤销的不算），按 id 排序。
 pub(super) fn load_allocations_where(
     conn: &Connection,
     column: &'static str,
     account: &AccountId,
 ) -> Result<Vec<Allocation>, AccountStoreError> {
     let mut stmt = conn.prepare(&format!(
-        "SELECT {ALLOCATION_COLUMNS} FROM allocations WHERE {column} = ?1 ORDER BY allocation_id"
+        "SELECT {ALLOCATION_COLUMNS} FROM allocations \
+         WHERE {column} = ?1 AND {REVOKED_AT} IS NULL ORDER BY allocation_id"
     ))?;
     stmt.query_map([account.as_str()], RawAllocation::read)?
         .collect::<Result<Vec<_>, _>>()?

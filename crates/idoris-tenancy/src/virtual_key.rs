@@ -87,6 +87,13 @@ impl VirtualKeyHash {
     pub fn fingerprint(&self) -> String {
         hex(&self.0[..6])
     }
+
+    /// The SHA-256 of the secret, for stores that look a key up by its hash (the account store's
+    /// control plane does, so it can authenticate and authorize in one transaction). The hash is the
+    /// persisted verifier, not the secret; it still must never be logged or returned to callers.
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
 }
 
 impl std::fmt::Debug for VirtualKeyHash {
