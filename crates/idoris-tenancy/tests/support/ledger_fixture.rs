@@ -187,8 +187,9 @@ pub fn allocate(store: &AccountStore, id: &str, parent: &str, child: &str, micro
         .unwrap();
 }
 
-/// 撤销一笔额度（S2 的「关授信」）。撤销记在 S2 的侧表 `allocation_revocations` 里（只追加，`allocations` 不动），
-/// 这张表在 S2 合入之前不存在，所以这里模拟它：只建账本读到的那一列。账本看到这张表就把有撤销行的额度排除。
+/// 撤销一笔额度（S2 的「关授信」）。撤销记在 S2 的侧表 `allocation_revocations` 里（只追加，`allocations` 不动）。
+/// 这张表在 S2 合入之前不存在，所以这里模拟它：只建账本读到的那一列（账本看到这张表就把有撤销行的额度排除）。
+/// S2 合入之后表是它的迁移建的、还有「谁撤销的」两列，这里按表里有没有这两列决定怎么插，所以夹具两种情形都能用。
 pub fn revoke_allocation(db: &TempDb, allocation_id: &str) {
     let conn = rusqlite::Connection::open(db.path()).unwrap();
     conn.execute_batch(
@@ -198,11 +199,21 @@ pub fn revoke_allocation(db: &TempDb, allocation_id: &str) {
          )",
     )
     .unwrap();
-    conn.execute(
-        "INSERT INTO allocation_revocations (allocation_id, revoked_at_ms) VALUES (?1, ?2)",
-        rusqlite::params![allocation_id, T0],
-    )
-    .unwrap();
+    let with_actor: bool = conn
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM pragma_table_info('allocation_revocations') WHERE name = 'revoked_by_kind'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let sql = if with_actor {
+        "INSERT INTO allocation_revocations (allocation_id, revoked_at_ms, revoked_by_kind, revoked_by_id)
+         VALUES (?1, ?2, 'operator', 'ledger-test')"
+    } else {
+        "INSERT INTO allocation_revocations (allocation_id, revoked_at_ms) VALUES (?1, ?2)"
+    };
+    conn.execute(sql, rusqlite::params![allocation_id, T0])
+        .unwrap();
 }
 
 /// 沿一条链从平台往下铺同样大小的额度：`chain` 是 `[平台的直接子账户, ..., 叶子]`。
