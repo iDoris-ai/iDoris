@@ -5,7 +5,10 @@ use crate::account::{
     Account, AccountKind, AccountStatus, AccountTree, Directory, Membership, MembershipRole,
     MembershipStatus, Principal, PrincipalStatus,
 };
-use crate::ids::{AccountId, MembershipId, PrincipalId};
+use crate::credential::{
+    Credential, CredentialBinding, CredentialStatus, PaymentContext, resolve_payment_context,
+};
+use crate::ids::{AccountId, CredentialId, MembershipId, PrincipalId, TimestampMs};
 use crate::money::Unit;
 
 pub(crate) fn aid(s: &str) -> AccountId {
@@ -81,6 +84,22 @@ pub(crate) fn membership(
         account: account.map(aid),
         status: MembershipStatus::Active,
     }
+}
+
+/// 学生 kid1 的成员子凭证解析出来的付款上下文：付款账户 `s1`，单位泰铢。
+pub(crate) fn sample_payment_context() -> PaymentContext {
+    let dir = sample_directory();
+    let credential = Credential::new(
+        CredentialId::new("c-kid1").unwrap(),
+        CredentialBinding::Member {
+            membership: mid("m-kid1"),
+        },
+        CredentialStatus::Active,
+        None,
+        vec![],
+    )
+    .unwrap();
+    resolve_payment_context(&dir, &credential, None, TimestampMs(0)).unwrap()
 }
 
 /// 主体 kid1/kid2（学生）、tch（老师，同时是担保人和管理员）、adult（个人用户）。
