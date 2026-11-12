@@ -279,6 +279,9 @@ pub struct CloudConfigFile {
     pub reserve: ReserveConfig,
     pub endpoints: Vec<EndpointConfig>,
     pub routes: Vec<RouteConfig>,
+    /// 静态调用方簿：S4 的测试夹具。**生产（云入口生效时）必须是空的**，付款上下文由凭证解析（S5，见
+    /// `ingress::caller`）；所以这个键可以不写。
+    #[serde(default)]
     pub callers: Vec<CallerConfig>,
     /// S6 儿童安全：有处理儿童数据的调用方（`data_classes` 含 `child_edu`）时必填，见 [`super::safety::config`]。
     #[serde(default)]
@@ -369,6 +372,11 @@ impl RouteBook {
     pub fn candidates(&self, model: &str) -> Option<&[EndpointKey]> {
         self.0.get(model).map(Vec::as_slice)
     }
+
+    /// 全部客户端模型名（按名字排序）：`GET /api/v1/models` 列的就是它们。
+    pub fn models(&self) -> impl Iterator<Item = &str> {
+        self.0.keys().map(String::as_str)
+    }
 }
 
 /// 一个调用方的付款上下文与数据处理要求。
@@ -381,6 +389,10 @@ pub struct CallerPolicy {
 
 /// 调用方簿：按虚拟 key 上的 `tenant_id` 找。**有 tenant_id 但簿里没有的，拒绝**（不回落到默认调用方）；
 /// 没有 tenant_id 的才用默认调用方（如果配置了）。
+///
+/// **S5 之后这只是测试夹具**：云入口（`ingress`）生效时，付款上下文、租户、数据类别全部从凭证推导，
+/// 处理函数读请求扩展里的 [`CallerPolicy`]，不看这本簿；`CloudIngress::new` 拒绝启动一个簿不为空的云上游，
+/// 所以生产里它永远是空的。S4 / S3 的端到端测试和 S6 的夹具继续用它来隔离「付款上下文」以外的行为。
 #[derive(Debug, Default, Clone)]
 pub struct CallerBook {
     by_tenant: BTreeMap<String, CallerPolicy>,
@@ -397,6 +409,11 @@ impl CallerBook {
             Some(tenant) => self.by_tenant.get(tenant),
             None => self.default.as_ref(),
         }
+    }
+
+    /// 簿里一个调用方都没有（生产的云入口要求这样）。
+    pub fn is_empty(&self) -> bool {
+        self.by_tenant.is_empty() && self.default.is_none()
     }
 
     /// 是否有任何调用方处理儿童数据（`data_classes` 含 `child_edu`）。
@@ -630,8 +647,29 @@ fn build_caller(config: &CallerConfig, now: TimestampMs) -> Result<CallerPolicy,
     })
 }
 
+/// 云入口（S5）配置里声明的租户和它的数据处理要求。它们不在静态调用方簿里（生产里簿是空的），但调用方的数据处理要求
+/// 同样决定走不走儿童安全管线（`handles_child_data()`），所以加载云上游配置时要把它们和簿里的调用方**一起**算进
+/// S6 的启动校验：其中有儿童租户就必须有 `safety:` 段，LLM 检查端点要满足它们每一个的区域 / 留存 / DPA 要求，
+/// 只用规则检查器要留警告；启动日志也按「走 / 不走儿童管线」把它们列出来，运营方一眼能核对。
+#[derive(Debug, Clone)]
+pub struct IngressTenant {
+    /// 租户的账户 id（只用来写进错误和日志，没有任何内容）。
+    pub name: String,
+    pub policy: TenantDataPolicy,
+}
+
 /// 从 YAML 文本构造全部部件。`base_dir` 用来解析相对路径（许可表）；`now` 用来解析静态付款上下文。
 pub fn parse(text: &str, base_dir: &Path, now: TimestampMs) -> Result<CloudParts, String> {
+    parse_with_ingress_tenants(text, base_dir, now, &[])
+}
+
+/// 同 [`parse`]，另外把云入口配置里声明的租户算进 S6 的启动校验（见 [`IngressTenant`]）。
+pub fn parse_with_ingress_tenants(
+    text: &str,
+    base_dir: &Path,
+    now: TimestampMs,
+    ingress_tenants: &[IngressTenant],
+) -> Result<CloudParts, String> {
     let file: CloudConfigFile =
         serde_yaml::from_str(text).map_err(|e| bad(format!("无法解析 YAML：{e}")))?;
     if file.schema_version != CONFIG_SCHEMA_VERSION {
@@ -780,6 +818,12 @@ pub fn parse(text: &str, base_dir: &Path, now: TimestampMs) -> Result<CloudParts
         .chain(default.iter())
         .map(|caller: &CallerPolicy| &caller.tenant)
         .filter(|tenant| tenant.handles_child_data())
+        .chain(
+            ingress_tenants
+                .iter()
+                .map(|tenant| &tenant.policy)
+                .filter(|policy| policy.handles_child_data()),
+        )
         .collect();
     let safety = match &file.safety {
         Some(config) => Some(super::safety::config::build(
@@ -794,7 +838,7 @@ pub fn parse(text: &str, base_dir: &Path, now: TimestampMs) -> Result<CloudParts
         )?),
         None if !child_policies.is_empty() => {
             return Err(bad(
-                "有调用方处理儿童数据（data_classes 含 child_edu），必须配置 safety: 段（安全检查是儿童业务上线的前提，设计稿 §7）",
+                "有调用方（含云入口配置里的租户）处理儿童数据（data_classes 含 child_edu），必须配置 safety: 段（安全检查是儿童业务上线的前提，设计稿 §7）",
             ));
         }
         None => None,
@@ -846,10 +890,19 @@ pub fn parse(text: &str, base_dir: &Path, now: TimestampMs) -> Result<CloudParts
 
 /// 从文件加载。
 pub fn load(path: &Path, now: TimestampMs) -> Result<CloudParts, String> {
+    load_with_ingress_tenants(path, now, &[])
+}
+
+/// 同 [`load`]，另外把云入口配置里声明的租户算进 S6 的启动校验（见 [`IngressTenant`]）。
+pub fn load_with_ingress_tenants(
+    path: &Path,
+    now: TimestampMs,
+    ingress_tenants: &[IngressTenant],
+) -> Result<CloudParts, String> {
     let text = std::fs::read_to_string(path)
         .map_err(|e| bad(format!("无法读取 {}：{e}", path.display())))?;
     let base = path.parent().unwrap_or_else(|| Path::new("."));
-    parse(&text, base, now)
+    parse_with_ingress_tenants(&text, base, now, ingress_tenants)
 }
 
 #[cfg(test)]

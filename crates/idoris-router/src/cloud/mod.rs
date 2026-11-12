@@ -11,6 +11,7 @@
 //! | [`admission`] | 候选准入的接口（S3 的接缝）与 S4 的简单实现（只算预留额，一律放行，TODO(S3)） |
 //! | [`config`] | 云上游配置（YAML）：地址、密钥来源、价目、路由、静态调用方 |
 //! | [`clock`] | 时钟（许可表的核验过期按「现在」判，测试要能拨） |
+//! | [`ingress`] | **S5：云入口**——`/api/v1`、从凭证推导调用方、三级上限、公网防滥用、CORS、公网监听 |
 //! | [`safety`] | **S6 儿童安全**：租户属性绑定的安全管线、规则 / LLM 检查器、成本接口、进程级「不落盘」加固 |
 //!
 //! 协议与传输（OpenAI 兼容的请求、SSE、usage 解析、超时、密钥不外泄）在 `idoris-upstream::cloud`；
@@ -31,8 +32,10 @@
 //!   （`AttemptStore::install_ledger_hook`）；候选没被采用时执行器会 [`admission::CandidateAdmission::release`]；
 //!   体验分级的响应头见 `handler` 模块文档（`X-iDoris-Reason` / `X-iDoris-Tier` / `X-iDoris-Max-Tokens`，
 //!   以及 [`EXPOSED_HEADERS`]，S5 的 CORS 层要用它）；
-//! - **S1 / S2 / S5**：[`config::CallerBook`] 是静态替身，换成按凭证解析的付款上下文（`resolve_payment_context`）
-//!   和租户数据策略；云入口（`/api/v1`、从凭证推导租户）接在 `handler` 前面；
+//! - **S1 / S2 / S5（已完成）**：付款上下文、租户、数据类别现在由 [`ingress`] 从凭证推导（`AccountStore::payment_context`，
+//!   成员 id 逐次验证），处理函数读请求扩展里的 [`CallerPolicy`]；[`config::CallerBook`] 只剩测试夹具的用途
+//!   （`CloudIngress::new` 拒绝非空的簿）。云入口（`/api/v1`）接在 `handler` 前面。云上游开关现在**要求**
+//!   `IDORIS_FORM=cloud`（[`CloudUpstream::from_env_for_form`]）；
 //! - **S6**（已完成）：非流式回答在发布前停在 [`answer::PendingAnswer`]，完整输出检查放在 `publish()` 之前，不通过就
 //!   `withhold(..)`（用户付 0）；edu 一律非流式的拒绝在 `handler` 里（先于任何上游调用），执行器里再查一道。
 //!   管线在 [`CloudExecutor::execute`]：处理儿童数据的租户（`TenantDataPolicy::handles_child_data()`）输入检查 -> 上游调用 ->
@@ -68,14 +71,15 @@
 //!    （先于任何上游调用，400 `streaming_not_allowed`）。
 //! 10. **后一个候选被准入拒绝**：已经有尝试失败时，请求以上游失败（502）结束，不是 402。
 //! 11. **付款上下文**：静态调用方簿经 S0 的 `resolve_payment_context`（平台 -> 组织账户、节点凭证）得到，不绕过契约的唯一入口；
-//!     `QUOTA` 单位在云形态被拒绝。S1 / S2 / S5 落地后换成账户库里按凭证解析的真实付款上下文。
+//!     `QUOTA` 单位在云形态被拒绝。S5 落地后生产里换成账户库里按凭证解析的真实付款上下文（见 [`ingress`]）。
 //! 12. **`Request` 的持久化**：创建时的快照 JSON（不可变）+ 规范化的查询列；`state_json` 是状态的真相，`state`、`certainty`、
 //!     usage 是它的派生列（CHECK 与生成列）。
 //!
 //! # S6（儿童安全）对设计稿 / S0 含糊处的理解（没有悄悄拍板，等 owner 确认）
 //!
 //! 13. **「租户属性」就是 `TenantDataPolicy::handles_child_data()`**（`data_classes` 含 `child_edu`），来自服务端配置的调用方簿
-//!     （S1/S2/S5 之后是账户存储），经虚拟 key 绑定的租户解析；模型名、路由别名、任何请求头和请求体字段都改不了它。
+//!     （S5 之后，生产里是云入口配置的 `tenants:`：租户从付款账户推导，见 [`ingress`]），经虚拟 key 绑定的租户解析；
+//!     模型名、路由别名、任何请求头和请求体字段都改不了它。
 //!     没有另设一个布尔字段：S0 已经有这个属性，并且它同时决定了端点许可表的硬约束（ZDR + 已签 DPA）。
 //! 14. **管线放在执行器里，不是 handler 里**：任何入口（S5 的云入口、测试直接调执行器）走到执行器，edu 都绕不过。
 //!     `RunState` 还有一道发布守卫：儿童请求的回答没有「输出检查放行」标记就发布不出去，标记在请求创建时由数据类别决定。
@@ -101,8 +105,10 @@
 //!     结算失败只写日志（预留有 TTL 兜底）。没有账本的装配（测试）用内存里的 [`safety::SimpleExtraCost`]。
 //! 22. **非文本内容、过长文本一律拒绝**：图片、音频、文件等无法检查的内容按 `unsupported_content` 拒绝；超过检查上限的文本按
 //!     `safety_unavailable`（`too_large`）拒绝。语音转写的检查是 P1。
-//! 23. **旧路由对儿童租户关闭**：云形态打开时，`/v1/messages`、`/v1/embeddings`、`/v1/rerank` 仍是旧的本地流水线，没有安全管线，
-//!     对儿童租户一律 403（`child_route_unavailable`）；`ChatProxy` 对这些租户同时关闭响应缓存。
+//! 23. **旧路由对儿童租户关闭**：`build_app`（本地流水线加云处理函数）里，`/v1/messages`、`/v1/embeddings`、`/v1/rerank`
+//!     仍是旧的本地流水线，没有安全管线，对儿童租户一律 403（`child_route_unavailable`）；`ChatProxy` 对这些租户同时关闭响应缓存。
+//!     S5 的云入口（`IDORIS_FORM=cloud` 的生产装配）的数据面根本不挂载它们（`/v1/*` 的任何路由都不挂载，`/api/v1` 下也没有
+//!     同名路径）：404，请求连认证都过不了，比 403 更严（见 [`ingress`]）。
 //! 24. **谁为安全检查付钱**（设计稿 §7 只说「计入准入和结算」）：给出了结论的检查（放行或拦截）按实际用量向付款账户收费，
 //!     用量未知按预留额（和 S4 对「用量未知」的规则一样）；规则检查器就拦下的（没有调用 LLM）、没能给出结论的（超时、出错、
 //!     返回垃圾、客户端断开）收 0，由平台承担——故障的安全服务不该向孩子的账户收钱。备选：只为交付了回答的请求收检查费；
@@ -128,6 +134,7 @@ pub mod clock;
 pub mod config;
 pub mod executor;
 mod handler;
+pub mod ingress;
 mod request;
 mod run;
 pub mod safety;
@@ -142,6 +149,7 @@ pub use config::{
     CallerBook, CallerPolicy, CloudLimits, CloudParts, EndpointRegistry, EndpointRuntime, RouteBook,
 };
 pub use executor::{CloudCall, CloudError, CloudExecutor, FailureInfo, status_allows_failover};
+pub use ingress::{CloudIngress, IngressContext, build_cloud_app};
 pub use run::Settled;
 pub use safety::{
     ExtraCostMeter, GateDenial, SafetyChecker, SafetyGate, SafetyLimits, SafetyPipeline,
@@ -260,10 +268,28 @@ impl CloudUpstream {
     /// 账户存储里没有的付款账户 / 凭证（比如还在用静态调用方簿 `callers:`，账户库里没有对应的账户）一律被准入拒绝：
     /// 账本不认识的付款人不能花钱。
     pub fn from_file(path: &Path, db_path: &Path) -> Result<Self, String> {
+        Self::from_file_with_ingress_tenants(path, db_path, &[])
+    }
+
+    /// 同 [`from_file`](Self::from_file)，另外把云入口（S5）配置里声明的儿童租户算进 S6 的启动校验：它们不在静态调用方簿里，
+    /// 但同样走儿童安全管线，所以有儿童租户就必须有 `safety:` 段、LLM 检查端点要满足它们每一个的数据策略。
+    pub fn from_file_with_ingress_tenants(
+        path: &Path,
+        db_path: &Path,
+        ingress_tenants: &[config::IngressTenant],
+    ) -> Result<Self, String> {
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
-        let parts = config::load(path, clock.now())?;
+        let parts = config::load_with_ingress_tenants(path, clock.now(), ingress_tenants)?;
         // 启动日志（S6）：哪些调用方走儿童安全管线（只有租户标识）。运营方一眼能核对「edu 租户的属性确实是 child_edu」
-        let (child, other) = parts.callers.caller_summary();
+        let (mut child, mut other) = parts.callers.caller_summary();
+        for tenant in ingress_tenants {
+            let listed = format!("{} (cloud ingress)", tenant.name);
+            if tenant.policy.handles_child_data() {
+                child.push(listed);
+            } else {
+                other.push(listed);
+            }
+        }
         eprintln!(
             "[idoris] cloud: child-data callers (safety pipeline ON): [{}]; other callers (no safety pipeline): [{}]; safety: {}",
             child.join(", "),
@@ -312,8 +338,65 @@ impl CloudUpstream {
         .with_ledger_extra_cost(accounts))
     }
 
+    /// **启动用的入口**（S5）：云上游只属于云形态（`IDORIS_FORM=cloud`），反过来云形态必须配云上游。
+    ///
+    /// - 云形态：[`config::CONFIG_ENV`] 必须设置，没设就是启动错误（云形态没有本机模型，没有上游的公网入口什么都服务不了，
+    ///   不如启动失败）；
+    /// - 其它形态：设了 [`config::CONFIG_ENV`] 就是启动错误，没设就是关闭（什么都不变）。
+    ///
+    /// 为什么要求显式的 `IDORIS_FORM=cloud`，而不是 S4 的「`deploy_mode=tenant` 就行」：云上游的付款上下文必须由账户库里
+    /// 的凭证解析，而账户库只在显式声明的组织、云形态才会打开；`deploy_mode=tenant` 还包括存量的 tenant 部署，
+    /// 那里的租户来自可以被调用方自己写的 `X-iDoris-Tenant`（本地契约），不能拿来决定谁付款。组织形态是云的客户
+    /// （S7 的云端档），不是云本身（能力表 `uses_endpoint_permit_table` 只有云形态为真）。
+    ///
+    /// `ingress_tenants` 是云入口配置里声明的租户和它们的数据处理要求（非云形态传空）：其中的儿童租户和静态调用方簿里的
+    /// 儿童调用方一起过 S6 的启动校验，启动日志按「走 / 不走儿童管线」把它们列出来。
+    pub fn from_env_for_form(
+        startup: &crate::startup_form::StartupForm,
+        ingress_tenants: &[config::IngressTenant],
+    ) -> Result<Option<Arc<Self>>, String> {
+        let path = crate::config::optional_env_path(config::CONFIG_ENV)?;
+        Self::resolve_for_form(
+            startup,
+            path,
+            crate::storage::process_db_path,
+            ingress_tenants,
+        )
+    }
+
+    /// [`Self::from_env_for_form`] 的可测版本：路径与数据库路径由调用方给。
+    pub fn resolve_for_form(
+        startup: &crate::startup_form::StartupForm,
+        config_path: Option<std::path::PathBuf>,
+        db_path: impl FnOnce() -> Result<std::path::PathBuf, String>,
+        ingress_tenants: &[config::IngressTenant],
+    ) -> Result<Option<Arc<Self>>, String> {
+        if startup.is_cloud() {
+            let Some(path) = config_path else {
+                return Err(format!(
+                    "云形态（IDORIS_FORM=cloud）必须设置 {}：没有云上游，公网入口什么都服务不了",
+                    config::CONFIG_ENV
+                ));
+            };
+            return Ok(Some(Arc::new(Self::from_file_with_ingress_tenants(
+                &path,
+                &db_path()?,
+                ingress_tenants,
+            )?)));
+        }
+        if config_path.is_some() {
+            return Err(format!(
+                "{} 只能在 IDORIS_FORM=cloud（云形态）下启用：云上游的付款上下文由账户库里的凭证解析，\
+                 个人、组织形态和存量 tenant 部署不会把请求送到云上游",
+                config::CONFIG_ENV
+            ));
+        }
+        Ok(None)
+    }
+
     /// 读环境变量 [`config::CONFIG_ENV`]：没设（或为空）就是关闭（返回 `None`，什么都不改变）。
     /// 设了就必须是云形态（`deploy_mode=tenant`），否则启动失败：个人形态不会把请求送到云上游。
+    /// （S4 的入口，只看 `deploy_mode`；启动用 [`Self::from_env_for_form`]，它还要求 `IDORIS_FORM=cloud`。）
     pub fn from_env(
         deploy_mode: idoris_contracts::DeployMode,
     ) -> Result<Option<Arc<Self>>, String> {

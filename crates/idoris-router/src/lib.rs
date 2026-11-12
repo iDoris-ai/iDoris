@@ -296,6 +296,10 @@ pub struct AppState {
     /// personal form and in legacy tenant deployments) mounts nothing; `Some`
     /// makes `build_app` merge the `/control/v1` routes in.
     pub control: Option<Arc<control::ControlPlane>>,
+    /// idoris.ai/api cloud ingress (S5): the public `/api/v1` surface, credential-derived callers, the three-level
+    /// limits and the public abuse protection. `None` (the default, and always outside the cloud form) leaves
+    /// `build_app` exactly as it was; `Some` makes `build_app` hand over to [`cloud::ingress::build_cloud_app`].
+    pub cloud_ingress: Option<Arc<cloud::ingress::CloudIngress>>,
 }
 
 impl std::fmt::Debug for AppState {
@@ -336,6 +340,10 @@ impl std::fmt::Debug for AppState {
             .field("proxy", &"ChatProxy { .. }")
             .field("cloud", &self.cloud.as_ref().map(|_| "configured"))
             .field("control", &self.control.as_ref().map(|_| "configured"))
+            .field(
+                "cloud_ingress",
+                &self.cloud_ingress.as_ref().map(|_| "configured"),
+            )
             .finish()
     }
 }
@@ -378,6 +386,7 @@ impl Default for AppState {
             proxy: Arc::new(proxy::ChatProxy::new(http_client.clone())),
             cloud: None,
             control: None,
+            cloud_ingress: None,
             http_client,
         }
     }
@@ -387,6 +396,11 @@ impl Default for AppState {
 /// `501` fallback for everything else, and the `X-iDoris-Record-Id`
 /// middleware applied to every response.
 pub fn build_app(state: AppState) -> Router {
+    // Cloud form (S5): the public data plane is a different router (`/api/v1`, credential-derived callers, the
+    // ingress guards); nothing of the local pipeline below is mounted there.
+    if let Some(ingress) = state.cloud_ingress.clone() {
+        return cloud::ingress::build_cloud_app(state, ingress);
+    }
     let state = Arc::new(state);
     // Cloud upstream (S4): only when configured; otherwise the router is built exactly as before.
     let chat_completions_route = if state.cloud.is_some() {
