@@ -411,3 +411,100 @@ pub(crate) fn judge_usage(parse: &UsageParse, attempt: &Attempt) -> (Option<Usag
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use std::collections::BTreeSet;
+
+    use idoris_compute_contracts::admission::{AdmissionDecision, Admitted, Reservation};
+    use idoris_compute_contracts::form::DeploymentForm;
+    use idoris_compute_contracts::ids::{EndpointKey, PriceVersion, RequestId, TimestampMs};
+    use idoris_compute_contracts::money::Unit;
+    use idoris_compute_contracts::permit::Billing;
+    use idoris_compute_contracts::pricing::{Cost, Price, RateCard};
+
+    use super::*;
+    use crate::cloud::ManualClock;
+    use crate::cloud::safety::test_support::payment_context;
+
+    /// 一个已经发出请求（`maybe_executed`，可以发布）的运行状态。
+    fn running(classes: &[DataClass]) -> (RunState, AttemptIndex, Arc<AttemptStore>, RequestId) {
+        let payment = payment_context();
+        let endpoint =
+            EndpointKey::new("example-zdr", "example-org/chat-70b", "openai-compat").unwrap();
+        let price = |micros| Price::from_micros(Unit::Thb, micros).unwrap();
+        let cost = |micros| Cost::from_micros(Unit::Usd, micros).unwrap();
+        let candidate = AdmittedCandidate {
+            decision: AdmissionDecision::Allow {
+                admitted: Admitted {
+                    endpoint,
+                    payer: payment.payer().clone(),
+                    effective_max_tokens: 10,
+                    reservation: Reservation {
+                        price: price(100),
+                        cost: cost(10),
+                    },
+                },
+            },
+            price_version: PriceVersion::new("pv-1").unwrap(),
+            cost_rates: RateCard::new(cost(260_000), cost(380_000), None).unwrap(),
+            price_rates: RateCard::new(price(10_000_000), price(40_000_000), None).unwrap(),
+        };
+        let store = Arc::new(AttemptStore::open_in_memory().unwrap());
+        let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(TimestampMs(1)));
+        let id = RequestId::new("req-guard-1").unwrap();
+        let data_classes: BTreeSet<DataClass> = classes.iter().copied().collect();
+        let meta = NewRequest {
+            id: &id,
+            payment: &payment,
+            form: DeploymentForm::Cloud,
+            billing: Billing::Paid,
+            stream: false,
+            data_classes: &data_classes,
+            created_at: TimestampMs(1),
+        };
+        let mut run = RunState::begin(store.clone(), clock, &meta, candidate).unwrap();
+        let idx = AttemptIndex(0);
+        run.apply(
+            idx,
+            &[AttemptEvent::Dispatch, AttemptEvent::WireWriteStarted],
+        )
+        .unwrap();
+        (run, idx, store, id)
+    }
+
+    #[test]
+    fn a_child_answer_cannot_be_published_until_the_output_check_cleared_it() {
+        let (mut run, idx, store, id) = running(&[DataClass::ChildEdu]);
+        let error = run.publish(idx).unwrap_err();
+        assert!(matches!(error, CloudError::Internal(_)), "{error:?}");
+        // 被拒绝的发布没有任何痕迹：没有记发布，内存里也没有
+        assert_eq!(
+            store.request_row(&id).unwrap().unwrap().published_attempt,
+            None
+        );
+        assert!(!run.is_published());
+        // 放行之后才能发布
+        run.clear_for_publication();
+        run.publish(idx).unwrap();
+        assert!(run.is_published());
+        assert_eq!(
+            store.request_row(&id).unwrap().unwrap().published_attempt,
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn the_guard_follows_the_data_class_set_at_creation_not_anything_the_caller_does_later() {
+        // 只要数据类别里有 child_edu（哪怕还有别的），就要放行标记
+        let (mut run, idx, _store, _id) = running(&[DataClass::Adult, DataClass::ChildEdu]);
+        assert!(run.publish(idx).is_err());
+        // 成人 / 公开数据：不需要
+        for classes in [vec![DataClass::Adult], vec![DataClass::Public]] {
+            let (mut run, idx, _store, _id) = running(&classes);
+            run.publish(idx).unwrap();
+        }
+    }
+}

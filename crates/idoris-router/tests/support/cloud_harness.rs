@@ -15,8 +15,8 @@ use idoris_compute_contracts::ids::{RequestId, TimestampMs};
 use idoris_compute_contracts::reason::ReasonCode;
 use idoris_router::cloud::config::{self};
 use idoris_router::cloud::{
-    AdmissionError, AdmissionRequest, CandidateAdmission, CloudUpstream, ManualClock, SafetyGate,
-    SimpleAdmission,
+    AdmissionError, AdmissionRequest, CandidateAdmission, CloudUpstream, ExtraCostMeter,
+    ManualClock, SafetyGate, SimpleAdmission,
 };
 use idoris_router::{AppState, build_app};
 use idoris_tenancy::attempts::AttemptStore;
@@ -164,6 +164,8 @@ pub struct Options {
     /// 配置里 `safety:` 段的 YAML（整段，含 `safety:` 这个键）。
     pub safety_yaml: String,
     pub safety: SafetyOption,
+    /// 换掉安全检查成本的计量器（S3 的接缝）：测试用它观察预留与结算，或模拟额度被拒。
+    pub extra_cost: Option<Arc<dyn ExtraCostMeter>>,
     pub admission: Option<Arc<dyn CandidateAdmission>>,
     /// `limits:` 段（YAML 片段，缩进两格）。
     pub limits: String,
@@ -180,6 +182,7 @@ impl Default for Options {
             callers: vec![Caller::adult_default()],
             safety_yaml: "safety:\n  mode: rules_only\n".to_string(),
             safety: SafetyOption::FromConfig,
+            extra_cost: None,
             admission: None,
             limits: "  total_deadline_ms: 6000\n  connect_timeout_ms: 500\n  response_head_timeout_ms: 800\n  body_timeout_ms: 2000\n  stream_idle_timeout_ms: 600\n  stream_total_timeout_ms: 10000\n  max_attempts: 3\n".to_string(),
             routes: None,
@@ -328,6 +331,9 @@ pub fn build(endpoints: Vec<Endpoint>, options: Options) -> Harness {
     let mut cloud = CloudUpstream::new(parts, store.clone(), clock.clone(), admission);
     if let SafetyOption::Gate(gate) = options.safety {
         cloud = cloud.with_safety(gate);
+    }
+    if let Some(meter) = options.extra_cost {
+        cloud = cloud.with_extra_cost_meter(meter);
     }
     let cloud = Arc::new(cloud);
     let mut state = AppState {
