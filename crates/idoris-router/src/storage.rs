@@ -169,7 +169,7 @@ fn canonical_lock_base(db_path: &Path) -> PathBuf {
     }
 }
 
-fn process_db_path() -> Result<PathBuf, String> {
+pub(crate) fn process_db_path() -> Result<PathBuf, String> {
     match env_path("IDORIS_DB_PATH")? {
         Some(path) => Ok(path),
         None => default_db_path(),

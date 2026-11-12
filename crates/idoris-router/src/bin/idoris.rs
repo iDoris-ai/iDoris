@@ -429,6 +429,11 @@ async fn run(options: cli::ServeOptions) -> Result<(), String> {
         ..AppState::default()
     };
 
+    // idoris.ai/api cloud upstream (S4): off unless IDORIS_CLOUD_UPSTREAM_CONFIG is set,
+    // and then only in tenant (cloud) form.
+    let mut state = state;
+    state.cloud = idoris_router::cloud::CloudUpstream::from_env(deploy_mode)?;
+
     // M5-14: provider breakers stay off unless explicitly enabled; see
     // ChatProxy::set_breakers_enabled.
     state
