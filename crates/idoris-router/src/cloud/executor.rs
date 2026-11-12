@@ -60,7 +60,7 @@ use idoris_upstream::cloud::{
 use serde_json::{Map, Value};
 use tokio_util::sync::CancellationToken;
 
-use super::admission::{AdmissionError, AdmissionRequest, CandidateAdmission};
+use super::admission::{AdmissionError, AdmissionRequest, CandidateAdmission, ReleaseRequest};
 use super::answer::{
     AnswerMeta, CloudOutcome, CloudStream, Ingested, PendingAnswer, StreamParts, StreamState,
     StreamTracker,
@@ -566,50 +566,79 @@ impl CloudExecutor {
                 }
             };
 
-            // ---- 2. 准入：按偏好顺序，第一个被放行的候选 ----
+            // ---- 2. 准入：设计稿 §5 的体验分级，沿候选列表走两遍 ----
+            // 第一遍（不允许宽限）：按偏好顺序，每个候选先正常放行，钱不够就压低 `max_tokens`（降级），
+            // 压到最低有用值也放不下就换下一个候选（同场景更便宜的）。第一个被放行的候选胜出。
+            // 第二遍（只在第一遍有候选因为「钱不够」被拒、而且这个请求还没有开始任何一次尝试时）：允许用本周期
+            // 唯一的宽限，同样按偏好顺序。所以宽限永远是最后一招，排在压低 `max_tokens` 和换更便宜的候选之后；再不行才是 402。
+            // 宽限只用来救「否则会被 402 拒之门外」的请求：已经开始过尝试的请求（`slot` 有值）说明它至少被正常放行过一次，
+            // 后面的候选钱不够只是换不了候选，仍按上游失败（502）报，不再去动宽限——这也让 S4 的「被拒的候选不会被调用、
+            // 请求以第一次失败的原因结束」保持原样。
+            // 第二遍只重问那些因为「钱不够」被拒的候选：速率 / 在途 / 补贴池这类平台保护，宽限绕不过，不必再问一次。
             let mut picked: Option<(&EndpointRuntime, AdmittedCandidate)> = None;
-            for key in compliant {
-                tried.insert(key.clone());
-                let Some(endpoint) = self.endpoints.get(&key) else {
-                    unconfigured = true;
-                    continue;
-                };
-                let Some(price_rates) = endpoint.price_rates.get(call.payment.unit()) else {
-                    no_price = true;
-                    continue;
-                };
-                let decision = self
-                    .admission
-                    .admit(&AdmissionRequest {
-                        request_id: &call.request_id,
-                        payment: &call.payment,
-                        endpoint: &key,
-                        sizing: ReserveRequest {
-                            requested_max_tokens: call.requested_max_tokens,
-                            input_tokens_estimate: call.input_tokens_estimate,
-                        },
-                        policy: &self.reserve_policy,
-                        price_rates,
-                        cost_rates: &endpoint.cost_rates,
-                        candidate_ordinal: started,
-                        now: self.clock.now(),
-                    })
-                    .map_err(|e| self.stop(call, slot, CloudError::Admission(e)))?;
-                match decision {
-                    AdmissionDecision::Reject { reason } => {
-                        denial.get_or_insert(reason.code());
-                    }
-                    admitted => {
-                        picked = Some((
-                            endpoint,
-                            AdmittedCandidate {
-                                decision: admitted,
-                                price_version: endpoint.price_version.clone(),
-                                cost_rates: endpoint.cost_rates.clone(),
-                                price_rates: price_rates.clone(),
-                            },
-                        ));
+            let mut budget_denied = false;
+            let mut budget_blocked: Vec<&EndpointKey> = Vec::new();
+            'passes: for allow_grace in [false, true] {
+                let round: Vec<&EndpointKey> = if allow_grace {
+                    if slot.is_some() || budget_blocked.is_empty() {
                         break;
+                    }
+                    std::mem::take(&mut budget_blocked)
+                } else {
+                    compliant.iter().collect()
+                };
+                for key in round {
+                    if !allow_grace {
+                        tried.insert(key.clone());
+                    }
+                    let Some(endpoint) = self.endpoints.get(key) else {
+                        unconfigured = true;
+                        continue;
+                    };
+                    let Some(price_rates) = endpoint.price_rates.get(call.payment.unit()) else {
+                        no_price = true;
+                        continue;
+                    };
+                    let decision = self
+                        .admission
+                        .admit(&AdmissionRequest {
+                            request_id: &call.request_id,
+                            payment: &call.payment,
+                            endpoint: key,
+                            sizing: ReserveRequest {
+                                requested_max_tokens: call.requested_max_tokens,
+                                input_tokens_estimate: call.input_tokens_estimate,
+                            },
+                            policy: &self.reserve_policy,
+                            price_rates,
+                            cost_rates: &endpoint.cost_rates,
+                            candidate_ordinal: started,
+                            now: self.clock.now(),
+                            allow_grace,
+                        })
+                        .map_err(|e| self.stop(call, slot, CloudError::Admission(e)))?;
+                    match decision {
+                        AdmissionDecision::Reject { reason } => {
+                            denial.get_or_insert(reason.code());
+                            if reason.code() == ReasonCode::BudgetExhausted {
+                                budget_denied = true;
+                                if !allow_grace {
+                                    budget_blocked.push(key);
+                                }
+                            }
+                        }
+                        admitted => {
+                            picked = Some((
+                                endpoint,
+                                AdmittedCandidate {
+                                    decision: admitted,
+                                    price_version: endpoint.price_version.clone(),
+                                    cost_rates: endpoint.cost_rates.clone(),
+                                    price_rates: price_rates.clone(),
+                                },
+                            ));
+                            break 'passes;
+                        }
                     }
                 }
             }
@@ -619,6 +648,9 @@ impl CloudExecutor {
                         last: last_failure,
                         attempts: started,
                     }
+                } else if budget_denied {
+                    // 有候选是因为「钱不够」被拒：这是最确定的原因（等一会儿不会好），比别的候选的速率拒绝更值得告诉调用方
+                    CloudError::Denied(ReasonCode::BudgetExhausted)
                 } else if let Some(code) = denial {
                     CloudError::Denied(code)
                 } else if no_price {
@@ -639,19 +671,29 @@ impl CloudExecutor {
             };
 
             // ---- 3. 开始这次尝试（契约校验 + 落库）----
-            let idx = match slot.as_mut() {
+            // 准入放行的预留已经占住了。如果这个候选最终没能成为一次尝试（契约拒绝切换、尝试记录库写失败、
+            // 账本钩子拒绝创建），**必须把预留放回去**，否则额度要等 TTL 才回来（设计稿 §6；S4 交接说明）。
+            let began: Result<AttemptIndex, CloudError> = match slot.as_mut() {
                 None => {
                     let classes = call.tenant.data_classes();
                     let meta = self.new_request(call, classes);
-                    *slot = Some(RunState::begin(
-                        self.store.clone(),
-                        self.clock.clone(),
-                        &meta,
-                        candidate,
-                    )?);
-                    AttemptIndex(0)
+                    match RunState::begin(self.store.clone(), self.clock.clone(), &meta, candidate)
+                    {
+                        Ok(run) => {
+                            *slot = Some(run);
+                            Ok(AttemptIndex(0))
+                        }
+                        Err(error) => Err(error),
+                    }
                 }
-                Some(run) => run.begin_next(candidate)?,
+                Some(run) => run.begin_next(candidate),
+            };
+            let idx = match began {
+                Ok(idx) => idx,
+                Err(error) => {
+                    self.release_unused(call, started);
+                    return Err(error);
+                }
             };
             started += 1;
             let run = slot
@@ -680,6 +722,7 @@ impl CloudExecutor {
                     let meta = AnswerMeta {
                         reasons: run.prospective_reasons(idx),
                         request_id: call.request_id.to_string(),
+                        max_tokens_reduced_to: run.reduced_max_tokens(idx),
                     };
                     return Ok(match answered {
                         Answered::Complete { body } => {
@@ -719,6 +762,15 @@ impl CloudExecutor {
                 }
             }
         }
+    }
+
+    /// 释放一个没有成为尝试的候选的预留（见 [`CandidateAdmission::release`]）。
+    fn release_unused(&self, call: &CloudCall, ordinal: usize) {
+        self.admission.release(&ReleaseRequest {
+            request_id: &call.request_id,
+            candidate_ordinal: ordinal,
+            now: self.clock.now(),
+        });
     }
 
     /// 在循环里遇到不可恢复的错误：已经开始的请求交给 `execute` 收尾；没开始的留一行拒绝记录。

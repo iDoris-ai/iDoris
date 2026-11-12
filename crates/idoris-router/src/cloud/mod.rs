@@ -25,7 +25,12 @@
 //!
 //! # 交接给 S1 / S3 / S5 / S6
 //!
-//! - **S3**：实现 [`admission::CandidateAdmission`]（五项准入、有担保的负值、宽限），换掉 [`admission::SimpleAdmission`]；
+//! - **S3（已完成）**：[`admission::LedgerAdmission`] 包住账户存储里的准入账本（`idoris_tenancy::accounts::ledger`：
+//!   五项准入、有担保的负值、宽限、免费额度），生产装配（[`CloudUpstream::from_file`]）已经换掉了
+//!   [`admission::SimpleAdmission`]（它现在只是 S4 的测试替身）。尝试记录的收尾和账本结算在同一个事务里
+//!   （`AttemptStore::install_ledger_hook`）；候选没被采用时执行器会 [`admission::CandidateAdmission::release`]；
+//!   体验分级的响应头见 `handler` 模块文档（`X-iDoris-Reason` / `X-iDoris-Tier` / `X-iDoris-Max-Tokens`，
+//!   以及 [`EXPOSED_HEADERS`]，S5 的 CORS 层要用它）；
 //! - **S1 / S2 / S5**：[`config::CallerBook`] 是静态替身，换成按凭证解析的付款上下文（`resolve_payment_context`）
 //!   和租户数据策略；云入口（`/api/v1`、从凭证推导租户）接在 `handler` 前面；
 //! - **S6**（已完成）：非流式回答在发布前停在 [`answer::PendingAnswer`]，完整输出检查放在 `publish()` 之前，不通过就
@@ -99,6 +104,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use idoris_compute_contracts::ids::TimestampMs;
+use idoris_tenancy::accounts::AccountStore;
 use idoris_tenancy::attempts::AttemptStore;
 
 pub mod admission;
@@ -111,7 +117,10 @@ mod request;
 mod run;
 pub mod safety;
 
-pub use admission::{AdmissionError, AdmissionRequest, CandidateAdmission, SimpleAdmission};
+pub use admission::{
+    AdmissionError, AdmissionRequest, CandidateAdmission, LedgerAdmission, ReleaseRequest,
+    SimpleAdmission,
+};
 pub use answer::{AnswerMeta, CloudOutcome, CloudStream, PendingAnswer, PublishedAnswer};
 pub use clock::{Clock, ManualClock, SystemClock};
 pub use config::{
@@ -124,6 +133,7 @@ pub use safety::{
     SimpleExtraCost, Verdict,
 };
 
+pub use handler::{EXPOSED_HEADERS, HEADER_MAX_TOKENS, HEADER_TIER};
 pub(crate) use handler::{chat_completions, child_route_guard};
 
 /// 云上游：执行器 + 路由簿 + 调用方簿。挂在 `AppState.cloud` 上。
@@ -208,7 +218,18 @@ impl CloudUpstream {
         self.executor.safety.is_some()
     }
 
-    /// 从配置文件加载，用系统时钟和 S4 的简单准入；尝试记录库打开在 `db_path`（与其它 store 共用同一个 SQLite 文件）。
+    /// 从配置文件加载，用系统时钟和 **S3 的准入账本**（[`LedgerAdmission`]）；账户存储（含账本）和尝试记录库
+    /// 都打开在 `db_path`（与其它 store 共用同一个 SQLite 文件）。
+    ///
+    /// 装配的三件事，缺一不可：
+    ///
+    /// 1. 准入走账本（沿付款账户所有祖先的五项原子检查，占预留）；
+    /// 2. 尝试记录装上账本钩子：创建尝试要有匹配的预留，收尾时账本在**同一个事务里**结算；
+    /// 3. 预留 TTL 必须长于一次请求可能持续的最长时间（总期限 + 流的总时长）：预留在上游还在计费时就过期，
+    ///    额度会提前放回去。不满足就启动失败（失败即关闭），不是悄悄放行。
+    ///
+    /// 账户存储里没有的付款账户 / 凭证（比如还在用静态调用方簿 `callers:`，账户库里没有对应的账户）一律被准入拒绝：
+    /// 账本不认识的付款人不能花钱。
     pub fn from_file(path: &Path, db_path: &Path) -> Result<Self, String> {
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
         let parts = config::load(path, clock.now())?;
@@ -231,13 +252,32 @@ impl CloudUpstream {
                 eprintln!("[idoris] cloud: {warning}");
             }
         }
+        let accounts = Arc::new(
+            AccountStore::open(db_path)
+                .map_err(|e| format!("无法打开账户数据库 \"{}\"：{e}", db_path.display()))?,
+        );
         let store = AttemptStore::open(db_path)
             .map_err(|e| format!("无法打开尝试记录数据库 \"{}\"：{e}", db_path.display()))?;
+        store
+            .install_ledger_hook(accounts.attempt_ledger_hook())
+            .map_err(|e| format!("无法安装准入账本钩子：{e}"))?;
+        let ttl_ms = accounts
+            .ledger_config()
+            .map_err(|e| format!("无法读取准入账本配置：{e}"))?
+            .reservation_ttl_ms;
+        let longest = parts.limits.total_deadline + parts.limits.stream_total;
+        if u128::try_from(ttl_ms).unwrap_or(0) <= longest.as_millis() {
+            return Err(format!(
+                "准入账本的预留 TTL（{ttl_ms} ms）必须长于一次请求可能持续的最长时间（总期限 + 流的总时长 = {} ms）：\
+                 否则预留会在上游还在计费时过期，额度提前放回去",
+                longest.as_millis()
+            ));
+        }
         Ok(Self::new(
             parts,
             Arc::new(store),
             clock,
-            Arc::new(SimpleAdmission),
+            Arc::new(LedgerAdmission::new(accounts)),
         ))
     }
 

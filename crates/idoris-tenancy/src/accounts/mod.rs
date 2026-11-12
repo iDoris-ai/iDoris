@@ -14,6 +14,9 @@
 mod control;
 mod control_reads;
 mod error;
+/// S3 准入账本：沿付款账户所有祖先的五项原子检查、预留 / 结算 / 释放 / 过期（只追加的分录）、有担保的负值与宽限、
+/// 免费额度发放。是 [`AccountStore`] 上的一组方法，说明见模块文档。
+pub mod ledger;
 mod pairing;
 mod rows;
 mod store;

@@ -40,6 +40,9 @@ pub struct AnswerMeta {
     /// 被服务时带的原因码（降级、宽限、首字节前切换过）。
     pub reasons: Vec<ReasonCode>,
     pub request_id: String,
+    /// 准入因为钱不够**压低了 `max_tokens`**（`budget_degraded`）时，实际发给上游的 `max_tokens`。
+    /// 调用方可以据此知道回答可能因为长度被截断（`finish_reason: length`）；没压低就是 `None`。
+    pub max_tokens_reduced_to: Option<u64>,
 }
 
 /// 一个等待发布的完整回答（非流式）。
@@ -89,6 +92,7 @@ impl PendingAnswer {
         let meta = AnswerMeta {
             reasons: self.run.served_reasons(),
             request_id: self.meta.request_id.clone(),
+            max_tokens_reduced_to: self.run.reduced_max_tokens(self.idx),
         };
         let settled = match self.run.finalize() {
             Ok(settled) => Some(settled),

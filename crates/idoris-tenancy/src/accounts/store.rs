@@ -101,6 +101,8 @@ impl AccountStore {
         let mut conn = Connection::open(path.as_ref())?;
         apply_standard(&conn, busy_timeout)?;
         run_migrations(&mut conn)?;
+        // S3 准入账本的表（自己的版本表，和上面的账户迁移互不共用）。
+        super::ledger::run_migrations(&mut conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
         })

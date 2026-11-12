@@ -35,7 +35,7 @@
 
 use std::collections::BTreeSet;
 use std::path::Path;
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use idoris_compute_contracts::attempt::{
     AttemptEvent, AttemptState, AttemptStateKind, SettleBasis, TransitionError, transition,
@@ -81,6 +81,10 @@ pub enum AttemptStoreError {
     PostingConflict { key: String },
     #[error("stored record is corrupt: {0}")]
     Corrupt(String),
+    /// 准入账本的钩子（S3）拒绝了这次写入：创建尝试时没有匹配的预留，或结算时账本报错。
+    /// 钩子和这次写入在同一个事务里，所以出了这个错误什么都没有写进去。
+    #[error("ledger hook refused the write: {0}")]
+    LedgerHook(String),
 }
 
 /// 请求的结局。
@@ -386,9 +390,43 @@ pub struct FinalizeReport {
     pub replayed: bool,
 }
 
+/// 准入账本（S3）和尝试记录的**同一个事务**的接口。
+///
+/// 账本的预留、结算、释放是另一张账（`accounts::ledger`，沿付款账户链的分录）；尝试记录里有每次尝试的预留
+/// 和结算分录。两张账必须对得上，而且「收尾」这一步不能只成功一半：尝试已经关闭、分录已经写了，账本却没有
+/// 结算，用户那一笔钱就悄悄没了（少扣）；反过来账本扣了、尝试没关，对账就会对不上。所以钩子在尝试记录自己的
+/// 事务里被调用，和它同生共死：
+///
+/// - [`attempt_created`](Self::attempt_created)：每次尝试（第一次、切换候选）写入之后、提交之前。账本核对
+///   这次尝试有一个还没过期、金额一致、付款账户一致的预留；没有就拒绝，尝试不会被创建（没有预留的请求不能跑）。
+/// - [`request_finalized`](Self::request_finalized)：收尾的分录写完、请求关闭之后、提交之前。账本按同一份结算计划把每个
+///   尝试的预留结算 / 释放（发布了的那次按向用户收的钱结算，其余释放）。重放（请求已经关闭又收尾一次）同样会调用，
+///   账本这一侧是幂等的，所以重放既不会重复扣，也能把上次中途崩掉没做完的账本结算补上。
+///
+/// 钩子拿到的是尝试记录自己的事务（`rusqlite::Transaction`），账本的表和尝试记录的表在同一个库文件里。
+/// 没有安装钩子时（个人形态、S4 的测试）行为和以前完全一样。
+pub trait AttemptLedgerHook: Send + Sync {
+    fn attempt_created(
+        &self,
+        tx: &rusqlite::Transaction<'_>,
+        attempt: &Attempt,
+        at: TimestampMs,
+    ) -> Result<(), String>;
+
+    /// 返回要在**提交之后**写日志的行（告警）。
+    fn request_finalized(
+        &self,
+        tx: &rusqlite::Transaction<'_>,
+        plan: &SettlementPlan,
+        at: TimestampMs,
+    ) -> Result<Vec<String>, String>;
+}
+
 /// 尝试记录存储。
 pub struct AttemptStore {
     conn: Mutex<Connection>,
+    /// 准入账本钩子（S3）。安装一次，之后不能换（换了就是两个事务语义混在一起）。
+    ledger_hook: OnceLock<Arc<dyn AttemptLedgerHook>>,
 }
 
 impl std::fmt::Debug for AttemptStore {
@@ -407,6 +445,7 @@ impl AttemptStore {
         Self::from_connection(&mut conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
+            ledger_hook: OnceLock::new(),
         })
     }
 
@@ -416,7 +455,47 @@ impl AttemptStore {
         Self::from_connection(&mut conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
+            ledger_hook: OnceLock::new(),
         })
+    }
+
+    /// 安装准入账本钩子（见 [`AttemptLedgerHook`]）。只能装一次；装之前必须保证账本的表已经存在
+    /// （`AccountStore::open` 会建）。
+    pub fn install_ledger_hook(
+        &self,
+        hook: Arc<dyn AttemptLedgerHook>,
+    ) -> Result<(), AttemptStoreError> {
+        self.ledger_hook
+            .set(hook)
+            .map_err(|_| AttemptStoreError::Invariant("a ledger hook is already installed"))
+    }
+
+    fn hook_attempt_created(
+        &self,
+        tx: &rusqlite::Transaction<'_>,
+        attempt: &Attempt,
+        at: TimestampMs,
+    ) -> Result<(), AttemptStoreError> {
+        match self.ledger_hook.get() {
+            Some(hook) => hook
+                .attempt_created(tx, attempt, at)
+                .map_err(AttemptStoreError::LedgerHook),
+            None => Ok(()),
+        }
+    }
+
+    fn hook_request_finalized(
+        &self,
+        tx: &rusqlite::Transaction<'_>,
+        plan: &SettlementPlan,
+        at: TimestampMs,
+    ) -> Result<Vec<String>, AttemptStoreError> {
+        match self.ledger_hook.get() {
+            Some(hook) => hook
+                .request_finalized(tx, plan, at)
+                .map_err(AttemptStoreError::LedgerHook),
+            None => Ok(Vec::new()),
+        }
     }
 
     fn from_connection(conn: &mut Connection) -> Result<(), AttemptStoreError> {
@@ -452,6 +531,7 @@ impl AttemptStore {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         insert_request(&tx, new, None)?;
         insert_attempt(&tx, first, new.created_at)?;
+        self.hook_attempt_created(&tx, first, new.created_at)?;
         tx.commit()?;
         Ok(())
     }
@@ -518,6 +598,7 @@ impl AttemptStore {
             ));
         }
         insert_attempt(&tx, attempt, at)?;
+        self.hook_attempt_created(&tx, attempt, at)?;
         tx.commit()?;
         Ok(())
     }
@@ -860,7 +941,12 @@ impl AttemptStore {
                 ],
             )?;
         }
+        // 账本在同一个事务里结算（见 `AttemptLedgerHook`）。重放同样会走到这里，账本一侧是幂等的。
+        let ledger_logs = self.hook_request_finalized(&tx, plan, close.at)?;
         tx.commit()?;
+        for line in ledger_logs {
+            eprintln!("{line}");
+        }
         Ok(FinalizeReport {
             postings_added,
             settled,
