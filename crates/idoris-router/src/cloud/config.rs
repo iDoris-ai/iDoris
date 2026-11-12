@@ -87,6 +87,8 @@ use serde::de::{self, Visitor};
 use serde::{Deserialize, Deserializer};
 use serde_json::{Map, Value};
 
+use super::safety::config::{BuildInputs, SafetyConfig, SafetySetup};
+
 /// 指向配置文件的环境变量。不设 = 云上游关闭。
 pub const CONFIG_ENV: &str = "IDORIS_CLOUD_UPSTREAM_CONFIG";
 
@@ -278,6 +280,9 @@ pub struct CloudConfigFile {
     pub endpoints: Vec<EndpointConfig>,
     pub routes: Vec<RouteConfig>,
     pub callers: Vec<CallerConfig>,
+    /// S6 儿童安全：有处理儿童数据的调用方（`data_classes` 含 `child_edu`）时必填，见 [`super::safety::config`]。
+    #[serde(default)]
+    pub safety: Option<SafetyConfig>,
 }
 
 // ---------------------------------------------------------------------------
@@ -393,6 +398,52 @@ impl CallerBook {
             None => self.default.as_ref(),
         }
     }
+
+    /// 是否有任何调用方处理儿童数据（`data_classes` 含 `child_edu`）。
+    pub fn has_child_data_callers(&self) -> bool {
+        self.by_tenant
+            .values()
+            .chain(self.default.iter())
+            .any(|caller| caller.tenant.handles_child_data())
+    }
+
+    /// 启动日志用：(处理儿童数据的调用方, 其它调用方)。只有租户标识，没有任何内容；默认调用方写成 `(default)`。
+    pub fn caller_summary(&self) -> (Vec<String>, Vec<String>) {
+        let (mut child, mut other) = (Vec::new(), Vec::new());
+        let named = self
+            .by_tenant
+            .iter()
+            .map(|(tenant, caller)| (tenant.as_str(), caller));
+        let default = self.default.iter().map(|caller| ("(default)", caller));
+        for (name, caller) in named.chain(default) {
+            if caller.tenant.handles_child_data() {
+                child.push(name.to_string());
+            } else {
+                other.push(name.to_string());
+            }
+        }
+        (child, other)
+    }
+
+    /// 处理儿童数据的调用方的租户标识，格式与 `ChatProxy` 的缓存键里的租户范围一致：
+    /// 有租户的就是租户 id；默认调用方（没有租户）是 `"\u{0}personal"`。
+    /// 用来关掉这些租户在旧代理路径上的响应缓存（S6：edu 关缓存）。
+    pub fn child_data_tenant_scopes(&self) -> std::collections::BTreeSet<String> {
+        let mut scopes: std::collections::BTreeSet<String> = self
+            .by_tenant
+            .iter()
+            .filter(|(_, caller)| caller.tenant.handles_child_data())
+            .map(|(tenant, _)| tenant.clone())
+            .collect();
+        if self
+            .default
+            .as_ref()
+            .is_some_and(|caller| caller.tenant.handles_child_data())
+        {
+            scopes.insert("\u{0}personal".to_string());
+        }
+        scopes
+    }
 }
 
 /// 加载好的全部部件。
@@ -403,6 +454,8 @@ pub struct CloudParts {
     pub callers: CallerBook,
     pub limits: CloudLimits,
     pub reserve_policy: ReservePolicy,
+    /// S6：安全检查（检查器、上限、启动警告）。没有配置 `safety:` 段为 `None`（只有在没有儿童调用方时才可能）。
+    pub safety: Option<SafetySetup>,
 }
 
 // ---------------------------------------------------------------------------
@@ -445,7 +498,10 @@ fn parse_unit(field: &str, text: &str) -> Result<Unit, String> {
     Ok(unit)
 }
 
-fn rate_card_cost(field: &str, rate: &RateConfig) -> Result<(Unit, RateCard<Cost>), String> {
+pub(crate) fn rate_card_cost(
+    field: &str,
+    rate: &RateConfig,
+) -> Result<(Unit, RateCard<Cost>), String> {
     let unit = parse_unit(field, &rate.unit)?;
     let make = |name: &str, text: &str| -> Result<Cost, String> {
         Cost::from_micros(
@@ -487,12 +543,14 @@ fn rate_card_price(field: &str, rate: &RateConfig) -> Result<(Unit, RateCard<Pri
     Ok((unit, card))
 }
 
-fn key_of(provider: &str, model: &str, endpoint: &str) -> Result<EndpointKey, String> {
+pub(crate) fn key_of(provider: &str, model: &str, endpoint: &str) -> Result<EndpointKey, String> {
     EndpointKey::new(provider, model, endpoint)
         .map_err(|e| bad(format!("端点 {provider}/{model}@{endpoint}: {e}")))
 }
 
-fn build_credentials(config: &EndpointConfig) -> Result<Arc<dyn CredentialSource>, String> {
+pub(crate) fn build_credentials(
+    config: &EndpointConfig,
+) -> Result<Arc<dyn CredentialSource>, String> {
     match (&config.api_key_env, &config.api_key_file) {
         (Some(env), None) if !env.trim().is_empty() => Ok(Arc::new(EnvCredentialSource::new(env))),
         (None, Some(path)) => Ok(Arc::new(FileCredentialSource::new(path))),
@@ -716,11 +774,63 @@ pub fn parse(text: &str, base_dir: &Path, now: TimestampMs) -> Result<CloudParts
         }
     }
 
+    // 安全检查（S6）：有儿童调用方就必须配置；LLM 检查端点要用许可表校验，不合规启动失败
+    let child_policies: Vec<&TenantDataPolicy> = by_tenant
+        .values()
+        .chain(default.iter())
+        .map(|caller: &CallerPolicy| &caller.tenant)
+        .filter(|tenant| tenant.handles_child_data())
+        .collect();
+    let safety = match &file.safety {
+        Some(config) => Some(super::safety::config::build(
+            config,
+            &BuildInputs {
+                permits: &Arc::new(permits.clone()),
+                endpoints: &file.endpoints,
+                http: &http,
+                child_policies: child_policies.clone(),
+                now,
+            },
+        )?),
+        None if !child_policies.is_empty() => {
+            return Err(bad(
+                "有调用方处理儿童数据（data_classes 含 child_edu），必须配置 safety: 段（安全检查是儿童业务上线的前提，设计稿 §7）",
+            ));
+        }
+        None => None,
+    };
+
+    // 安全检查（LLM）端点要对每个儿童调用方的付款单位有价目：检查的成本要折算成付款单位去占额度
+    // （`safety::LedgerExtraCost`：检查端点的 `prices` × 检查器给出的 token 上界），没有价目就没法计价，
+    // 运行时只能失败即关闭——不如启动时就拒绝这种配置，和「LLM 检查端点必须在许可表里」是同一类校验。
+    if let Some(judge) = safety.as_ref().and_then(|setup| setup.judge.as_ref()) {
+        let judge_runtime = runtimes
+            .iter()
+            .find(|runtime| runtime.key == *judge.endpoint());
+        let named = by_tenant
+            .iter()
+            .map(|(tenant, caller)| (tenant.as_str(), caller));
+        let unnamed = default.iter().map(|caller| ("(default)", caller));
+        for (name, caller) in named.chain(unnamed) {
+            if !caller.tenant.handles_child_data() {
+                continue;
+            }
+            let unit = caller.payment.unit();
+            if !judge_runtime.is_some_and(|runtime| runtime.price_rates.contains_key(unit)) {
+                return Err(bad(format!(
+                    "安全检查端点 {} 没有配置付款单位 {unit} 的价目（prices）：调用方 {name} 的检查成本无法折算成付款单位占额度",
+                    judge.endpoint()
+                )));
+            }
+        }
+    }
+
     Ok(CloudParts {
         permits,
         endpoints: EndpointRegistry::new(runtimes),
         routes: RouteBook::new(routes),
         callers: CallerBook::new(by_tenant, default),
+        safety,
         limits: CloudLimits {
             total_deadline: Duration::from_millis(limits.total_deadline_ms),
             response_head: Duration::from_millis(limits.response_head_timeout_ms),
@@ -1015,5 +1125,73 @@ callers:
         )
         .unwrap();
         assert_eq!(ok.input_per_mtok.0, "0.26");
+    }
+
+    /// S6：哪些调用方算「处理儿童数据」只由 `data_classes` 含 `child_edu` 决定（默认调用方也算）；
+    /// 旧代理缓存的关闭范围与缓存键里的租户范围写法一致，启动日志的摘要里只有租户标识。
+    #[test]
+    fn child_data_callers_are_identified_by_their_data_classes_alone() {
+        // 没有儿童调用方：没有关闭范围，摘要里全是「其它」
+        let parts = load(VALID).unwrap();
+        assert!(!parts.callers.has_child_data_callers());
+        assert!(parts.callers.child_data_tenant_scopes().is_empty());
+        let (child, other) = parts.callers.caller_summary();
+        assert!(child.is_empty());
+        assert_eq!(other, ["agent24", "(default)"]);
+
+        // 一个具名儿童租户、一个普通租户、一个同时含 child_edu 的默认调用方（`data_classes` 里只要有 child_edu 就算）
+        let head = VALID.split("callers:\n").next().unwrap();
+        let yaml = format!(
+            "{head}callers:
+  - tenant_id: edu-th
+    credential_id: cred-edu
+    payer_account: acct-edu
+    unit: THB
+    billing: paid
+    data_classes: [child_edu]
+    max_retention: zdr
+  - tenant_id: agent24
+    credential_id: cred-agent24
+    payer_account: acct-agent24
+    unit: THB
+    billing: paid
+    data_classes: [adult]
+    max_retention: with_exceptions
+  - credential_id: cred-default
+    payer_account: acct-default
+    unit: THB
+    billing: paid
+    data_classes: [child_edu, adult]
+    max_retention: zdr
+safety:
+  mode: rules_only
+"
+        );
+        let parts = load(&yaml).unwrap();
+        assert!(parts.callers.has_child_data_callers());
+        assert_eq!(
+            parts
+                .callers
+                .child_data_tenant_scopes()
+                .into_iter()
+                .collect::<Vec<_>>(),
+            ["\u{0}personal", "edu-th"],
+            "没有租户的默认调用方用缓存键里的 \\0personal 写法"
+        );
+        let (child, other) = parts.callers.caller_summary();
+        assert_eq!(child, ["edu-th", "(default)"]);
+        assert_eq!(other, ["agent24"]);
+        // 摘要里只有租户标识：没有凭证号、付款账户这些别的东西
+        for name in child.iter().chain(other.iter()) {
+            assert!(!name.contains("cred-") && !name.contains("acct-"), "{name}");
+        }
+
+        // 儿童调用方存在而没有 safety 段：加载失败（安全检查是儿童业务上线的前提）
+        let without_safety = yaml.replace("safety:\n  mode: rules_only\n", "");
+        let error = match load(&without_safety) {
+            Ok(_) => panic!("a child caller without a safety section must not load"),
+            Err(error) => error,
+        };
+        assert!(error.contains("必须配置 safety"), "{error}");
     }
 }
