@@ -1164,6 +1164,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "idoris-compute-contracts"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "idoris-contracts",
+ "proptest",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "thiserror",
+]
+
+[[package]]
 name = "idoris-contracts"
 version = "0.4.0"
 dependencies = [
