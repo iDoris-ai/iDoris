@@ -185,6 +185,11 @@ token_id!(
     IdempotencyKey, kind = "idempotency key", max = MAX_IDEMPOTENCY_KEY_LEN, colon_tilde = true
 );
 token_id!(
+    /// 价格版本：一次尝试计价所用价目表的版本标签（设计稿 §6：每次尝试记录「价格版本」）。
+    /// 价目表变更后，已经发生的尝试仍按当时的版本结算和对账。
+    PriceVersion, kind = "price version", max = MAX_NODE_ID_LEN, colon_tilde = true
+);
+token_id!(
     /// 具体端点名（许可表里的 `endpoint`）：同一个供应商、同一个模型下，不同的 API 面或路由方式，
     /// 例如 `openrouter-zdr` 与 `openrouter-default` 是两个端点，留存不同。只是标签，不含 URL。
     EndpointName, kind = "endpoint name", max = MAX_ID_LEN, colon_tilde = false
@@ -250,6 +255,37 @@ impl FromStr for ModelId {
 impl fmt::Display for ModelId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
+    }
+}
+
+/// 端点的键：供应商 + 模型 + 具体端点（设计稿 §8 许可表的「端点」列）。
+///
+/// 许可表里的条目、路由候选、尝试记录里的「供应商、模型」都用它标识，三处对得上才算同一个端点。
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EndpointKey {
+    pub provider: ProviderId,
+    pub model: ModelId,
+    pub endpoint: EndpointName,
+}
+
+impl EndpointKey {
+    pub fn new(
+        provider: impl Into<String>,
+        model: impl Into<String>,
+        endpoint: impl Into<String>,
+    ) -> Result<Self, IdError> {
+        Ok(Self {
+            provider: ProviderId::new(provider)?,
+            model: ModelId::new(model)?,
+            endpoint: EndpointName::new(endpoint)?,
+        })
+    }
+}
+
+impl fmt::Display for EndpointKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}/{}@{}", self.provider, self.model, self.endpoint)
     }
 }
 
@@ -493,6 +529,36 @@ mod tests {
         assert!(ModelId::new("a@b").is_err());
         assert!(ModelId::new("").is_err());
         assert!(ModelId::new("x".repeat(MAX_ID_LEN + 1)).is_err());
+    }
+
+    #[test]
+    fn endpoint_key_is_a_three_part_key_with_strict_json() {
+        let key =
+            EndpointKey::new("deepinfra", "deepseek-ai/DeepSeek-V3.2", "openai-compat").unwrap();
+        assert_eq!(
+            key.to_string(),
+            "deepinfra/deepseek-ai/DeepSeek-V3.2@openai-compat"
+        );
+        let json = serde_json::to_string(&key).unwrap();
+        assert_eq!(
+            json,
+            r#"{"provider":"deepinfra","model":"deepseek-ai/DeepSeek-V3.2","endpoint":"openai-compat"}"#
+        );
+        assert_eq!(serde_json::from_str::<EndpointKey>(&json).unwrap(), key);
+        // 同一个供应商和模型下，不同端点是不同的键（比如 OpenRouter 的 ZDR 路由）
+        let zdr = EndpointKey::new("openrouter", "m", "zdr").unwrap();
+        let default = EndpointKey::new("openrouter", "m", "default").unwrap();
+        assert_ne!(zdr, default);
+        // 供应商 id 与端点名不允许 `:` `~`；缺字段、多字段都拒绝
+        assert!(EndpointKey::new("a:b", "m", "e").is_err());
+        assert!(EndpointKey::new("p", "m", "e~f").is_err());
+        assert!(serde_json::from_str::<EndpointKey>(r#"{"provider":"p","model":"m"}"#).is_err());
+        assert!(
+            serde_json::from_str::<EndpointKey>(
+                r#"{"provider":"p","model":"m","endpoint":"e","x":1}"#
+            )
+            .is_err()
+        );
     }
 
     #[test]
