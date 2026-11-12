@@ -259,11 +259,10 @@ impl RunState {
     ///
     /// 1. 还在 `admitted`/`sending` 的尝试：写入 `WireWriteStarted` 之前没有字节离开本机，
     ///    用 `NeverLeftHost` 结掉；
-    /// 2. 已发布、却还停在 `maybe_executed` 的尝试（流被丢弃、没来得及观察结果）：已经有上游字节交给了客户端，
-    ///    执行是确定的，用 `ExecutionObservedUsageUnknown`；
-    /// 3. 用 S0 `plan_settlement` 算计划；
-    /// 4. 同一个事务里：可结算的尝试 `Settle`、追加分录、关闭请求（`AttemptStore::finalize_request`）；
-    /// 5. 内存里同样 `Settle`。
+    /// 2. 用 S0 `plan_settlement` 算计划（已发布却还停在 `maybe_executed` 的尝试——比如客户端断开而上游没有「取消」能力，
+    ///    不确定是否停计费——用户按预留价付费，成本按预留额挂账，状态保持 `maybe_executed`，不释放）；
+    /// 3. 同一个事务里：可结算的尝试 `Settle`、追加分录、关闭请求（`AttemptStore::finalize_request`）；
+    /// 4. 内存里同样 `Settle`。
     pub(crate) fn finalize(&mut self) -> Result<Settled, CloudError> {
         if self.finalized {
             return Ok(Settled {
@@ -286,16 +285,7 @@ impl RunState {
         for idx in in_flight {
             self.apply(idx, &[AttemptEvent::NeverLeftHost])?;
         }
-        // 2. 已发布却没有结论的尝试
-        if let Some(published) = self.request.published()
-            && self
-                .request
-                .attempt(published)
-                .is_some_and(|a| a.state().kind() == AttemptStateKind::MaybeExecuted)
-        {
-            self.apply(published, &[AttemptEvent::ExecutionObservedUsageUnknown])?;
-        }
-        // 3. 计划
+        // 2. 计划
         let plan = self
             .request
             .plan_settlement()
@@ -323,7 +313,7 @@ impl RunState {
         } else {
             self.close_reason
         };
-        // 4. 落账
+        // 3. 落账
         self.store
             .finalize_request(
                 &plan,
@@ -335,7 +325,7 @@ impl RunState {
                 },
             )
             .map_err(CloudError::ledger)?;
-        // 5. 内存跟上
+        // 4. 内存跟上
         for id in &to_settle {
             let idx = id.index();
             self.request

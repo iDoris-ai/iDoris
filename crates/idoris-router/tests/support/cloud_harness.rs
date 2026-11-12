@@ -46,6 +46,8 @@ pub struct Endpoint {
     pub stream_usage: bool,
     pub tool_calling: bool,
     pub structured_output: bool,
+    /// 许可表里的「取消」能力：断开连接后上游是否停止生成与计费。
+    pub cancellation: bool,
     pub verified_at: &'static str,
     pub extra_body: Option<Value>,
 }
@@ -64,9 +66,16 @@ impl Endpoint {
             stream_usage: true,
             tool_calling: true,
             structured_output: true,
+            cancellation: true,
             verified_at: "2026-11-12",
             extra_body: None,
         }
+    }
+
+    /// 上游断开连接后不一定停止计费。
+    pub fn no_cancellation(mut self) -> Self {
+        self.cancellation = false;
+        self
     }
 
     /// 允许 `child_edu` 的端点：ZDR + 已签 DPA。**今天没有任何真实端点是这样的**（S8 的核验结论），
@@ -191,7 +200,7 @@ pub fn permit_table_yaml(endpoints: &[Endpoint]) -> String {
     let mut out = String::from("schema_version: 1\nverification_max_age_days: 90\nendpoints:\n");
     for e in endpoints {
         out.push_str(&format!(
-            "  - provider: {}\n    model: example-org/chat-70b\n    endpoint: openai-compat\n    access: {}\n    processing_regions: {}\n    retention: {}\n    dpa: {}\n    allowed_data_classes: {}\n    capabilities:\n      tool_calling: {}\n      stream_usage: {}\n      cache_pricing: false\n      structured_output: {}\n      cancellation: true\n    verified_at: \"{}\"\n",
+            "  - provider: {}\n    model: example-org/chat-70b\n    endpoint: openai-compat\n    access: {}\n    processing_regions: {}\n    retention: {}\n    dpa: {}\n    allowed_data_classes: {}\n    capabilities:\n      tool_calling: {}\n      stream_usage: {}\n      cache_pricing: false\n      structured_output: {}\n      cancellation: {}\n    verified_at: \"{}\"\n",
             e.provider,
             e.access,
             yaml_list(&e.regions),
@@ -201,6 +210,7 @@ pub fn permit_table_yaml(endpoints: &[Endpoint]) -> String {
             e.tool_calling,
             e.stream_usage,
             e.structured_output,
+            e.cancellation,
             e.verified_at,
         ));
     }

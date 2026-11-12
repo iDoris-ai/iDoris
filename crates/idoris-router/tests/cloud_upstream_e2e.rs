@@ -1218,6 +1218,68 @@ async fn a_client_that_disconnects_mid_stream_cancels_the_upstream_and_is_billed
     );
 }
 
+/// 上游的「取消」能力是 false（断开连接后可能还在生成、还在计费）：我们关掉了连接，但是否停计费不确定，
+/// 所以不下结论——尝试保持 `maybe_executed`（成本按预留额挂账、不释放），用户仍按预留价付费（契约的规则），
+/// 对账扫描能直接找到它。
+#[tokio::test]
+async fn a_disconnect_from_an_upstream_that_may_keep_billing_stays_maybe_executed() {
+    let alpha = FakeUpstream::start(vec![Behavior::sse(vec![
+        SseStep::Send(content_event("c", "Hel")),
+        SseStep::Hang,
+    ])])
+    .await;
+    let h = build(
+        vec![Endpoint::adult("example-alpha", alpha.url()).no_cancellation()],
+        Options::default(),
+    );
+    let mut body = simple_body(100);
+    body["stream"] = json!(true);
+    let response = harness::send(&h.app, harness::chat_request(&body)).await;
+    let request_id = RequestId::new(
+        response
+            .headers()
+            .get("x-idoris-record-id")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+    )
+    .unwrap();
+    let mut stream = response.into_body();
+    http_body_util::BodyExt::frame(&mut stream)
+        .await
+        .unwrap()
+        .unwrap();
+    drop(stream);
+
+    assert!(alpha.client_closed(0, Duration::from_secs(3)).await);
+    wait_closed(&h, &request_id).await;
+    let attempts = rows(&h, &request_id);
+    assert_eq!(
+        attempts[0].state,
+        AttemptState::MaybeExecuted,
+        "whether billing stopped is not known"
+    );
+    assert!(attempts[0].pays_user);
+    assert_eq!(attempts[0].failure_kind.as_deref(), Some("client_gone"));
+    let request = h.store.request_row(&request_id).unwrap().unwrap();
+    assert_eq!(request.outcome, Some(RequestOutcome::Answered));
+    assert_eq!(request.charged_micros, Some(RESERVED_PRICE));
+    assert_eq!(request.charged_basis.as_deref(), Some("reserved_amount"));
+    assert_eq!(
+        postings(&h, &request_id),
+        vec![
+            p(0, "user_price", RESERVED_PRICE, "THB"),
+            p(0, "hold", RESERVED_COST, "USD"),
+        ]
+    );
+    // 对账能直接找到它
+    let held = h
+        .store
+        .attempts_in_states(&[AttemptStateKind::MaybeExecuted], 10)
+        .unwrap();
+    assert_eq!(held.len(), 1);
+}
+
 /// 客户端在任何一个字节之前断开（这里是丢弃整个请求 future）：向上游取消；上游是否停计费不确定，
 /// 尝试保持 `maybe_executed`（成本保留待核销，**不释放**）；没有发布，用户付 0。
 #[tokio::test]

@@ -234,6 +234,8 @@ pub(crate) struct StreamState {
     pub(crate) cancel: CancellationToken,
     pub(crate) deadline: Instant,
     pub(crate) published: bool,
+    /// 许可表里这个端点的「取消」能力：客户端断开、我们关掉连接之后，上游是否停止生成与计费。
+    upstream_stops_on_cancel: bool,
     phase: Phase,
     concluded: bool,
 }
@@ -248,6 +250,8 @@ pub(crate) struct StreamParts {
     pub(crate) pending: VecDeque<Vec<u8>>,
     pub(crate) cancel: CancellationToken,
     pub(crate) stream_total: Duration,
+    /// 见 [`StreamState`] 的同名字段。
+    pub(crate) upstream_stops_on_cancel: bool,
 }
 
 impl StreamState {
@@ -262,6 +266,7 @@ impl StreamState {
             cancel: parts.cancel,
             deadline: Instant::now() + parts.stream_total,
             published: false,
+            upstream_stops_on_cancel: parts.upstream_stops_on_cancel,
             phase: Phase::Reading,
             concluded: false,
         }
@@ -391,9 +396,16 @@ impl StreamState {
         if !matches!(self.tracker.usage, UsageParse::Absent) || end == End::Complete {
             self.run.record_usage_claim(self.idx, &claim);
         }
-        let event = match usage {
-            Some(usage) => AttemptEvent::UsageReported { usage },
-            None => AttemptEvent::ExecutionObservedUsageUnknown,
+        // 状态机事件：
+        // - 看到了通过判定的最终 usage：`UsageReported`（不管流是怎么结束的）；
+        // - 否则：确认执行了、usage 未知（`ExecutionObservedUsageUnknown`，按预留结算）——
+        //   **除了**客户端断开、而许可表里这个端点没有「取消」能力的情形：我们关掉了连接，但上游可能还在生成、
+        //   还在计费，是否停计费不确定，所以不下结论，保持 `maybe_executed`（成本按预留额挂账待核销，
+        //   用户按预留价付费——这一点与 `executed_usage_unknown` 的结算数字相同，区别只在于状态诚实地写着「不确定」）。
+        let event = match (usage, end) {
+            (Some(usage), _) => Some(AttemptEvent::UsageReported { usage }),
+            (None, End::ClientGone) if !self.upstream_stops_on_cancel => None,
+            (None, _) => Some(AttemptEvent::ExecutionObservedUsageUnknown),
         };
         match end {
             End::Failed(failure) => {
@@ -404,7 +416,9 @@ impl StreamState {
             End::PublishFailed => self.run.note_failure(self.idx, "publish_failed", None),
             End::Complete => {}
         }
-        if let Err(error) = self.run.apply(self.idx, &[event]) {
+        if let Some(event) = event
+            && let Err(error) = self.run.apply(self.idx, &[event])
+        {
             eprintln!("[idoris] cloud: could not record the stream outcome: {error}");
         }
         self.run.close_reason = Some(match end {

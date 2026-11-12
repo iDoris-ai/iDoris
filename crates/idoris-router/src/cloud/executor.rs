@@ -539,6 +539,10 @@ impl CloudExecutor {
                                     pending,
                                     cancel: call.cancel.clone(),
                                     stream_total: self.limits.stream_total,
+                                    upstream_stops_on_cancel: self
+                                        .permits
+                                        .lookup(&endpoint.key)
+                                        .is_some_and(|permit| permit.capabilities.cancellation),
                                 }),
                                 meta,
                             ))
