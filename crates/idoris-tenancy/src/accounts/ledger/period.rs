@@ -17,6 +17,11 @@ fn tz_of(timezone: &str) -> Result<Tz, LedgerError> {
         .map_err(|_| LedgerError::Invalid(format!("unknown billing time zone {timezone:?}")))
 }
 
+/// 时区名是不是合法的 IANA 名字（不认识的名字是错误，不会当成 UTC）。
+pub(super) fn validate_timezone(timezone: &str) -> Result<(), LedgerError> {
+    tz_of(timezone).map(|_| ())
+}
+
 /// 一个时刻落在哪个账期。
 pub(super) fn period_of(now_ms: i64, timezone: &str) -> Result<BillingMonth, LedgerError> {
     let tz = tz_of(timezone)?;

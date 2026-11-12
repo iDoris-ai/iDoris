@@ -221,6 +221,7 @@ pub fn policy() -> ReservePolicy {
 }
 
 /// 一次准入请求的输入（自己拥有所有被借用的东西）。
+#[derive(Clone)]
 pub struct Req {
     pub attempt: AttemptId,
     pub payment: PaymentContext,
@@ -242,9 +243,33 @@ impl Req {
         credential: &str,
         max_tokens: u64,
     ) -> Self {
+        Self::with_payment(request, index, payment(store, credential), max_tokens)
+    }
+
+    /// 同 [`Req::new`]，但凭证此刻解析不出付款上下文（被冻结、撤销……）时返回 `None`。
+    pub fn try_new(
+        store: &AccountStore,
+        request: &str,
+        index: u8,
+        credential: &str,
+        max_tokens: u64,
+        now: i64,
+    ) -> Option<Self> {
+        let payment = store
+            .payment_context(&cid(credential), None, ts(now))
+            .ok()?;
+        Some(Self::with_payment(request, index, payment, max_tokens).at(now))
+    }
+
+    pub fn with_payment(
+        request: &str,
+        index: u8,
+        payment: PaymentContext,
+        max_tokens: u64,
+    ) -> Self {
         Self {
             attempt: AttemptId::new(RequestId::new(request).unwrap(), AttemptIndex(index)),
-            payment: payment(store, credential),
+            payment,
             endpoint: EndpointKey::new("example-provider", "example-org/model", "default").unwrap(),
             sizing: ReserveRequest {
                 requested_max_tokens: Some(max_tokens),

@@ -403,7 +403,7 @@ impl AccountStore {
     /// （含流式）：预留在上游还在计费的时候过期，额度就提前放回去了。已经存在的预留不受影响（它们的过期时间
     /// 在创建时就定了）。
     pub fn set_ledger_config(&self, config: &LedgerConfig) -> Result<(), LedgerError> {
-        period::period_of(0, &config.billing_timezone)?;
+        period::validate_timezone(&config.billing_timezone)?;
         if config.reservation_ttl_ms <= 0 {
             return Err(LedgerError::Invalid(
                 "the reservation TTL must be positive".into(),
