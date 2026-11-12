@@ -114,6 +114,12 @@ impl StartupForm {
     pub fn opens_account_store(&self) -> bool {
         self.declared && self.form.profile().control_plane
     }
+
+    /// 显式声明了云形态（`IDORIS_FORM=cloud`）。云上游、云入口（`/api/v1`、公网监听、三级上限、防滥用）
+    /// 只在这种启动里存在（计算服务 S5）；存量部署和组织形态永远不是。
+    pub fn is_cloud(&self) -> bool {
+        self.declared && self.form == DeploymentForm::Cloud
+    }
 }
 
 #[cfg(test)]
@@ -182,6 +188,31 @@ mod tests {
             parse(DeployMode::Tenant, Some("cloud")).unwrap().form(),
             DeploymentForm::Cloud
         );
+    }
+
+    #[test]
+    fn only_an_explicit_cloud_form_is_cloud() {
+        for mode in [DeployMode::Personal, DeployMode::Tenant] {
+            assert!(!StartupForm::legacy(mode).is_cloud(), "{mode:?}");
+        }
+        assert!(parse(DeployMode::Tenant, Some("cloud")).unwrap().is_cloud());
+        assert!(
+            parse(DeployMode::Tenant, Some(" CLOUD "))
+                .unwrap()
+                .is_cloud()
+        );
+        assert!(
+            !parse(DeployMode::Tenant, Some("organization"))
+                .unwrap()
+                .is_cloud()
+        );
+        assert!(
+            !parse(DeployMode::Personal, Some("personal"))
+                .unwrap()
+                .is_cloud()
+        );
+        // 没写 IDORIS_FORM 的 tenant 部署（存量）即使按 S0 解析成组织，也不是云
+        assert!(!parse(DeployMode::Tenant, None).unwrap().is_cloud());
     }
 
     #[test]

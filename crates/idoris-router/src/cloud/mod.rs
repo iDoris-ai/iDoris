@@ -11,6 +11,7 @@
 //! | [`admission`] | 候选准入的接口（S3 的接缝）与 S4 的简单实现（只算预留额，一律放行，TODO(S3)） |
 //! | [`config`] | 云上游配置（YAML）：地址、密钥来源、价目、路由、静态调用方 |
 //! | [`clock`] | 时钟（许可表的核验过期按「现在」判，测试要能拨） |
+//! | [`ingress`] | **S5：云入口**——`/api/v1`、从凭证推导调用方、三级上限、公网防滥用、CORS、公网监听 |
 //!
 //! 协议与传输（OpenAI 兼容的请求、SSE、usage 解析、超时、密钥不外泄）在 `idoris-upstream::cloud`；
 //! 尝试记录与结算分录（SQLite，只追加，触发器兜底）在 `idoris-tenancy::attempts`。
@@ -30,8 +31,10 @@
 //!   （`AttemptStore::install_ledger_hook`）；候选没被采用时执行器会 [`admission::CandidateAdmission::release`]；
 //!   体验分级的响应头见 `handler` 模块文档（`X-iDoris-Reason` / `X-iDoris-Tier` / `X-iDoris-Max-Tokens`，
 //!   以及 [`EXPOSED_HEADERS`]，S5 的 CORS 层要用它）；
-//! - **S1 / S2 / S5**：[`config::CallerBook`] 是静态替身，换成按凭证解析的付款上下文（`resolve_payment_context`）
-//!   和租户数据策略；云入口（`/api/v1`、从凭证推导租户）接在 `handler` 前面；
+//! - **S1 / S2 / S5（已完成）**：付款上下文、租户、数据类别现在由 [`ingress`] 从凭证推导（`AccountStore::payment_context`，
+//!   成员 id 逐次验证），处理函数读请求扩展里的 [`CallerPolicy`]；[`config::CallerBook`] 只剩测试夹具的用途
+//!   （`CloudIngress::new` 拒绝非空的簿）。云入口（`/api/v1`）接在 `handler` 前面。云上游开关现在**要求**
+//!   `IDORIS_FORM=cloud`（[`CloudUpstream::from_env_for_form`]）；
 //! - **S6**：非流式回答在发布前停在 [`answer::PendingAnswer`]，完整输出检查放在 `publish()` 之前，不通过就
 //!   `withhold(..)`（用户付 0）；edu 一律非流式的拒绝已经在 `handler` 里（先于任何上游调用）。
 
@@ -64,7 +67,7 @@
 //!    （先于任何上游调用，400 `streaming_not_allowed`）。
 //! 10. **后一个候选被准入拒绝**：已经有尝试失败时，请求以上游失败（502）结束，不是 402。
 //! 11. **付款上下文**：静态调用方簿经 S0 的 `resolve_payment_context`（平台 -> 组织账户、节点凭证）得到，不绕过契约的唯一入口；
-//!     `QUOTA` 单位在云形态被拒绝。S1 / S2 / S5 落地后换成账户库里按凭证解析的真实付款上下文。
+//!     `QUOTA` 单位在云形态被拒绝。S5 落地后生产里换成账户库里按凭证解析的真实付款上下文（见 [`ingress`]）。
 //! 12. **`Request` 的持久化**：创建时的快照 JSON（不可变）+ 规范化的查询列；`state_json` 是状态的真相，`state`、`certainty`、
 //!     usage 是它的派生列（CHECK 与生成列）。
 
@@ -95,6 +98,7 @@ pub use config::{
     CallerBook, CallerPolicy, CloudLimits, CloudParts, EndpointRegistry, EndpointRuntime, RouteBook,
 };
 pub use executor::{CloudCall, CloudError, CloudExecutor, FailureInfo, status_allows_failover};
+pub use ingress::{CloudIngress, IngressContext, build_cloud_app};
 pub use run::Settled;
 
 pub(crate) use handler::chat_completions;
@@ -190,8 +194,51 @@ impl CloudUpstream {
         ))
     }
 
+    /// **启动用的入口**（S5）：云上游只属于云形态（`IDORIS_FORM=cloud`），反过来云形态必须配云上游。
+    ///
+    /// - 云形态：[`config::CONFIG_ENV`] 必须设置，没设就是启动错误（云形态没有本机模型，没有上游的公网入口什么都服务不了，
+    ///   不如启动失败）；
+    /// - 其它形态：设了 [`config::CONFIG_ENV`] 就是启动错误，没设就是关闭（什么都不变）。
+    ///
+    /// 为什么要求显式的 `IDORIS_FORM=cloud`，而不是 S4 的「`deploy_mode=tenant` 就行」：云上游的付款上下文必须由账户库里
+    /// 的凭证解析，而账户库只在显式声明的组织、云形态才会打开；`deploy_mode=tenant` 还包括存量的 tenant 部署，
+    /// 那里的租户来自可以被调用方自己写的 `X-iDoris-Tenant`（本地契约），不能拿来决定谁付款。组织形态是云的客户
+    /// （S7 的云端档），不是云本身（能力表 `uses_endpoint_permit_table` 只有云形态为真）。
+    pub fn from_env_for_form(
+        startup: &crate::startup_form::StartupForm,
+    ) -> Result<Option<Arc<Self>>, String> {
+        let path = crate::config::optional_env_path(config::CONFIG_ENV)?;
+        Self::resolve_for_form(startup, path, crate::storage::process_db_path)
+    }
+
+    /// [`Self::from_env_for_form`] 的可测版本：路径与数据库路径由调用方给。
+    pub fn resolve_for_form(
+        startup: &crate::startup_form::StartupForm,
+        config_path: Option<std::path::PathBuf>,
+        db_path: impl FnOnce() -> Result<std::path::PathBuf, String>,
+    ) -> Result<Option<Arc<Self>>, String> {
+        if startup.is_cloud() {
+            let Some(path) = config_path else {
+                return Err(format!(
+                    "云形态（IDORIS_FORM=cloud）必须设置 {}：没有云上游，公网入口什么都服务不了",
+                    config::CONFIG_ENV
+                ));
+            };
+            return Ok(Some(Arc::new(Self::from_file(&path, &db_path()?)?)));
+        }
+        if config_path.is_some() {
+            return Err(format!(
+                "{} 只能在 IDORIS_FORM=cloud（云形态）下启用：云上游的付款上下文由账户库里的凭证解析，\
+                 个人、组织形态和存量 tenant 部署不会把请求送到云上游",
+                config::CONFIG_ENV
+            ));
+        }
+        Ok(None)
+    }
+
     /// 读环境变量 [`config::CONFIG_ENV`]：没设（或为空）就是关闭（返回 `None`，什么都不改变）。
     /// 设了就必须是云形态（`deploy_mode=tenant`），否则启动失败：个人形态不会把请求送到云上游。
+    /// （S4 的入口，只看 `deploy_mode`；启动用 [`Self::from_env_for_form`]，它还要求 `IDORIS_FORM=cloud`。）
     pub fn from_env(
         deploy_mode: idoris_contracts::DeployMode,
     ) -> Result<Option<Arc<Self>>, String> {

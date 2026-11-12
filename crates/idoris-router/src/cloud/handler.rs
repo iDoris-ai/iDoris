@@ -1,8 +1,14 @@
-//! 云上游的 HTTP 处理：`POST /v1/chat/completions`（仅当云上游开关打开时由 `build_app` 挂载，替代本地流水线）。
+//! 云上游的 HTTP 处理：`POST /v1/chat/completions`（仅当云上游开关打开时由 `build_app` 挂载，替代本地流水线）；
+//! 云形态下由云入口（S5）挂在 `POST /api/v1/chat/completions`。
 //!
-//! **认证**沿用既有的中间件（`remote_bind_auth_middleware`）：它已经验过虚拟 key，并把 `AuthenticatedVirtualKey`
-//! 放进请求扩展；本处理函数只读它，不碰认证代码。拿到的 `tenant_id` 用来在静态调用方簿里找付款上下文与数据处理要求
-//! （S1/S2/S5 落地后换成账户库里按凭证解析的真实付款上下文，见 [`super::config::CallerBook`]）。
+//! **调用方**（付款上下文、租户数据处理要求、计费性质）有两个来源：
+//!
+//! - **云入口（S5，生产）**：`ingress` 的中间件已经认证了凭证、从凭证推导出付款上下文和租户，并把 [`CallerPolicy`]
+//!   放进请求扩展；本处理函数直接用它，不看请求里的任何东西（`X-iDoris-Tenant` 在入口最外层就被删了）。
+//! - **静态调用方簿（S4 的测试夹具）**：没有云入口、用 `build_app` 直接挂这个处理函数的测试，沿用既有的中间件
+//!   （`remote_bind_auth_middleware`）放进扩展里的 `AuthenticatedVirtualKey.tenant_id` 在簿里找
+//!   （见 [`super::config::CallerBook`]）。生产里簿是空的（`CloudIngress::new` 拒绝非空的簿），而且云入口总会设置扩展，
+//!   所以走不到这里；走到了也只会得到 403 `caller_not_configured`（失败即关闭）。
 //!
 //! 响应（稳定的原因码，设计稿 §5）：
 //!
@@ -19,7 +25,7 @@
 //! | 流中途失败（首字节之后） | 状态码已经是 200 | 流以一个 `{"error":{"type":"upstream_error",...}}` 事件结束，**没有** `[DONE]` |
 //!
 //! 体验分级的头全部列在 [`EXPOSED_HEADERS`] 里，并写进每个带它们的响应的 `Access-Control-Expose-Headers`，浏览器的 JS
-//! 读得到（设计稿 §5，评审 L2）；跨域放行本身（`Access-Control-Allow-Origin`、预检）是云入口 S5 的事。
+//! 读得到（设计稿 §5，评审 L2）；跨域放行本身（`Access-Control-Allow-Origin`、预检）是云入口 S5 的事（`ingress::cors`，复用这个列表）。
 //!
 //! edu（`child_edu`）租户在 P0 **一律非流式**（设计稿 §6）：流式请求在任何上游调用之前就被拒绝
 //! （400 `streaming_not_allowed`）。完整输出检查本身是 S6 的事。
@@ -35,6 +41,7 @@ use idoris_compute_contracts::reason::{ExperienceTier, ReasonCode};
 use idoris_tenancy::virtual_key::store::AuthenticatedVirtualKey;
 
 use super::answer::{AnswerMeta, CloudOutcome};
+use super::config::CallerPolicy;
 use super::executor::{CloudCall, CloudError};
 use super::request::{RequestProblem, parse_client_request};
 use crate::connection::RequestLifecycle;
@@ -48,6 +55,7 @@ pub(crate) async fn chat_completions(
     Extension(RequestRecordId(record_id)): Extension<RequestRecordId>,
     Extension(lifecycle): Extension<RequestLifecycle>,
     identity: Option<Extension<AuthenticatedVirtualKey>>,
+    resolved: Option<Extension<CallerPolicy>>,
     body: Bytes,
 ) -> Response {
     let Some(cloud) = state.cloud.as_ref() else {
@@ -58,15 +66,25 @@ pub(crate) async fn chat_completions(
         Ok(request) => request,
         Err(problem) => return problem_response(problem),
     };
-    let tenant_id = identity
-        .as_ref()
-        .and_then(|Extension(identity)| identity.scope.tenant_id.as_deref());
-    let Some(caller) = cloud.callers.resolve(tenant_id) else {
-        return error_envelope(
-            StatusCode::FORBIDDEN,
-            "caller_not_configured",
-            "this credential has no cloud payment context",
-        );
+    let caller = match resolved {
+        // 云入口（S5）从凭证推导出来的调用方
+        Some(Extension(caller)) => caller,
+        // 静态调用方簿：测试夹具（生产里是空的）
+        None => {
+            let tenant_id = identity
+                .as_ref()
+                .and_then(|Extension(identity)| identity.scope.tenant_id.as_deref());
+            match cloud.callers.resolve(tenant_id) {
+                Some(caller) => caller.clone(),
+                None => {
+                    return error_envelope(
+                        StatusCode::FORBIDDEN,
+                        "caller_not_configured",
+                        "this credential has no cloud payment context",
+                    );
+                }
+            }
+        }
     };
     let Some(candidates) = cloud.routes.candidates(&request.model) else {
         return error_envelope_with_reason(

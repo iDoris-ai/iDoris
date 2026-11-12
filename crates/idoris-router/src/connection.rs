@@ -49,6 +49,14 @@ impl ConnectionInfo {
     pub fn request_token(&self) -> CancellationToken {
         self.cancellation.child_token()
     }
+
+    /// A connection record for a peer that did not come through the real listener — for tests and embedders that
+    /// drive the router directly (`tower::ServiceExt::oneshot`) and still need the TCP peer address to be known
+    /// (the cloud ingress attributes client addresses to it). Insert it as `ConnectInfo(ConnectionInfo::for_peer(..))`
+    /// into the request extensions. The cancellation token is fresh and never fires.
+    pub fn for_peer(peer: SocketAddr) -> Self {
+        Self::from_parts(peer, CancellationToken::new())
+    }
 }
 
 #[derive(Clone, Debug)]
