@@ -23,6 +23,8 @@ idoris-contracts = { workspace = true }
 idoris-policy = { workspace = true }
 idoris-backend = { workspace = true }
 idoris-tenancy = { workspace = true }
+# S1: deployment form (`IDORIS_FORM`) and the frozen model-id type; workspace-internal path dependency.
+idoris-compute-contracts = { workspace = true }
 idoris-recommender = { workspace = true }
 # R2-G task 1 (CLI wiring): a real oMLX-shaped card (LoadMode::OnDemand/
 # EvictToLoad, needing the Supervisor's explicit load/unload lifecycle) is

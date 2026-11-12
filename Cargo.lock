@@ -1214,6 +1214,7 @@ dependencies = [
  "futures-util",
  "http-body-util",
  "idoris-backend",
+ "idoris-compute-contracts",
  "idoris-contracts",
  "idoris-policy",
  "idoris-recommender",

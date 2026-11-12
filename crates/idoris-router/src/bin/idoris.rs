@@ -27,7 +27,9 @@ use idoris_router::{
     connection::{ConnectionInfo, ConnectionListener},
     host_facts, parse_port, profile, routing_policy,
     runtime::RuntimeRegistry,
-    runtime_launch_config, storage,
+    runtime_launch_config,
+    startup_form::StartupForm,
+    storage,
     subscription::{
         config::SubscriptionConfig,
         runtime::{SubscriptionRuntimeHandle, SubscriptionRuntimeRegistry, authorize_subscription},
@@ -278,6 +280,18 @@ async fn run(options: cli::ServeOptions) -> Result<(), String> {
         AdminBindConfig::parse(admin_port.as_deref()).map_err(|err| err.to_string())?;
     let deploy_mode =
         profile::deploy_mode_from_env(std::env::var("IDORIS_DEPLOY_MODE").ok().as_deref());
+    // Compute-service deployment form (S1). Unset = exactly the pre-S1 behaviour. Unlike
+    // IDORIS_DEPLOY_MODE this variable is strict: an unknown value, a non-Unicode value or a form
+    // that conflicts with the deploy mode stops start-up instead of being guessed.
+    let form_raw = match std::env::var(StartupForm::ENV_VAR) {
+        Ok(value) => Some(value),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err(format!("{} 不是有效的 Unicode", StartupForm::ENV_VAR));
+        }
+    };
+    let startup_form = StartupForm::from_env_value(deploy_mode, form_raw.as_deref())
+        .map_err(|err| format!("{} 无效：{err}", StartupForm::ENV_VAR))?;
     let dev_no_key_enabled = env_flag("IDORIS_DEV_NO_KEY");
     let bind_host = parse_bind_host(std::env::var(BIND_HOST_ENV).ok().as_deref())?;
 
@@ -358,7 +372,7 @@ async fn run(options: cli::ServeOptions) -> Result<(), String> {
     // Preserve startup-gate precedence: component/policy/runtime validation
     // (including subscription authorization and fixed card gates) must fail
     // before tenant storage/config bootstrap can surface a later error.
-    let persistent = storage::bootstrap_process(deploy_mode)
+    let persistent = storage::bootstrap_process_with_form(startup_form)
         .map_err(|err| format!("无法初始化持久化存储：{err}"))?;
     // Never run without the lock: if the early attempt was deferred, retry
     // now that storage is known to be usable.

@@ -71,6 +71,8 @@ pub mod key_issue;
 pub mod key_manage;
 /// Stable four-way routing/audit reason taxonomy.
 pub mod reason;
+/// Deployment form (`IDORIS_FORM`) wired into start-up (compute service S1).
+pub mod startup_form;
 /// Persistent record/budget storage bootstrap (B1 task18).
 pub mod storage;
 mod usage;

@@ -91,6 +91,16 @@ pub fn apply_standard(
     Ok(())
 }
 
+/// 打开 `path`（必要时创建）并应用 [`ConnectionProfile::Standard`]，返回现成的连接。
+/// 给 `TenantStore::new` / `VirtualKeyStore::new` / `EventLogStore::new` 这些接受现成连接的存储用。
+pub fn open_standard(
+    path: impl AsRef<std::path::Path>,
+) -> Result<Connection, ConnectionSetupError> {
+    let conn = Connection::open(path.as_ref())?;
+    apply_standard(&conn, STANDARD_BUSY_TIMEOUT)?;
+    Ok(conn)
+}
+
 /// 读出连接当前的三项设置。
 pub fn snapshot(conn: &Connection) -> Result<PragmaSnapshot, rusqlite::Error> {
     let journal_mode: String = conn.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
