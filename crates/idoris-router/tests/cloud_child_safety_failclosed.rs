@@ -31,7 +31,7 @@ use idoris_router::cloud::safety::{
     ExtraCostOutcome, ExtraCostRefusal, ExtraCostRequest, ExtraCostTicket,
 };
 use idoris_router::cloud::{
-    ExtraCostMeter, ManualClock, SafetyGate, SafetyLimits, SimpleExtraCost,
+    EXPOSED_HEADERS, ExtraCostMeter, ManualClock, SafetyGate, SafetyLimits, SimpleExtraCost,
 };
 use idoris_tenancy::attempts::RequestOutcome;
 use serde_json::json;
@@ -43,6 +43,11 @@ fn unavailable(reply: &harness::Reply, stage: &str, cause: &str) {
     assert_eq!(reply.json()["error"]["stage"], stage, "{}", reply.text());
     assert_eq!(reply.json()["error"]["cause"], cause, "{}", reply.text());
     assert_eq!(reply.header("x-idoris-reason"), Some("safety_unavailable"));
+    // 浏览器读得到这个码：同一套 EXPOSED_HEADERS
+    assert_eq!(
+        reply.header("access-control-expose-headers"),
+        Some(EXPOSED_HEADERS.join(", ").as_str())
+    );
 }
 
 /// 没有任何内容泄露给客户端：回答的哨兵、孩子的哨兵都不在响应里。

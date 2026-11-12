@@ -32,7 +32,7 @@ use idoris_compute_contracts::permit::{
 use idoris_contracts::DeployMode;
 use idoris_contracts::common::PrivacyClass;
 use idoris_router::auth::VirtualKeyAuthenticator;
-use idoris_router::cloud::{CloudCall, CloudError};
+use idoris_router::cloud::{CloudCall, CloudError, EXPOSED_HEADERS};
 use idoris_tenancy::attempts::RequestOutcome;
 use idoris_tenancy::virtual_key::MintedVirtualKey;
 use idoris_tenancy::virtual_key::store::{VirtualKeyScope, VirtualKeyStore};
@@ -44,6 +44,11 @@ fn blocked(reply: &harness::Reply, code: &str) {
     assert_eq!(reply.json()["error"]["type"], code, "{}", reply.text());
     assert_eq!(reply.json()["error"]["reason_code"], code);
     assert_eq!(reply.header("x-idoris-reason"), Some(code));
+    // 浏览器读得到这个码：和 S3 的体验分级头同一套 EXPOSED_HEADERS（不另列一份），写进 Access-Control-Expose-Headers
+    assert_eq!(
+        reply.header("access-control-expose-headers"),
+        Some(EXPOSED_HEADERS.join(", ").as_str())
+    );
     // 被拒时给 eduai 的是码，不回显被拒的内容
     assert!(!reply.text().contains(CHILD_SENTINEL), "{}", reply.text());
 }
