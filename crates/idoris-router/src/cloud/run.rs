@@ -243,6 +243,18 @@ impl RunState {
         reasons
     }
 
+    /// 这次尝试准入时因为钱不够**压低了 `max_tokens`**（`budget_degraded`）的话，实际发给上游的 `max_tokens`；
+    /// 否则 `None`（响应头 `X-iDoris-Max-Tokens` 用）。
+    pub(crate) fn reduced_max_tokens(&self, idx: AttemptIndex) -> Option<u64> {
+        match self.admission_reasons.get(usize::from(idx.0)) {
+            Some(Some(ReasonCode::BudgetDegraded)) => self
+                .request
+                .attempt(idx)
+                .map(idoris_compute_contracts::request::Attempt::effective_max_tokens),
+            _ => None,
+        }
+    }
+
     /// 还没发布时，给调用方预估「如果现在发布会带哪些原因码」（流在交接给 HTTP 层时用）。
     pub(crate) fn prospective_reasons(&self, idx: AttemptIndex) -> Vec<ReasonCode> {
         let mut reasons = Vec::new();
