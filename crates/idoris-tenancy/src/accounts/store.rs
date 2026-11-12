@@ -95,6 +95,8 @@ impl AccountStore {
         let mut conn = Connection::open(path.as_ref())?;
         apply_standard(&conn, busy_timeout)?;
         run_migrations(&mut conn)?;
+        // S3 准入账本的表（自己的版本表，和上面的账户迁移互不共用）。
+        super::ledger::run_migrations(&mut conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -107,7 +109,7 @@ impl AccountStore {
     }
 
     /// 中毒的锁只会在上一次调用中途 panic 时出现。每个写函数要么提交要么随事务一起回滚，库本身不会被写坏，所以直接接着用。
-    fn lock(&self) -> MutexGuard<'_, Connection> {
+    pub(super) fn lock(&self) -> MutexGuard<'_, Connection> {
         self.conn
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
