@@ -721,6 +721,63 @@ fn losing_authority_before_redemption_voids_the_code() {
 }
 
 #[test]
+fn redemption_rechecks_the_issuers_authority_even_for_a_code_row_written_behind_the_stores_back() {
+    // 纵深防御：码是在创建时按签发者的权限校验过的，但兑换不信任「库里有这一行」本身——
+    // 一行由别的代码（或手工 SQL）写进去的、签发者其实没有权限的码，兑换时同样被拒绝。
+    let (env, _service) = setup();
+    let reader = env.issue_as_operator(Issue::service(
+        "eduai",
+        vec![sc(ControlOp::Read, "eduai", None)],
+    ));
+    let narrow = env.issue_as_operator(Issue::service(
+        "eduai",
+        vec![sc(ControlOp::IssueCredential, "teacher", None)],
+    ));
+    for (label, issuer, membership, expected) in [
+        (
+            "an issuer with no issue_credential authority",
+            reader.id(),
+            "m-kid1",
+            ControlReason::OpNotGranted,
+        ),
+        (
+            "an issuer whose authority does not reach the member's account",
+            narrow.id(),
+            "m-kid2",
+            ControlReason::OutOfScope,
+        ),
+    ] {
+        let code = new_code("forged");
+        env.raw()
+            .execute(
+                "INSERT INTO pairing_codes \
+                    (pairing_id, code_hash, membership_id, issued_by, created_at_ms, expires_at_ms, status, \
+                     device_privacy, device_roles) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', '[\"local_only\"]', '[\"fast\"]')",
+                rusqlite::params![
+                    code.pairing_id,
+                    &code.hash[..],
+                    membership,
+                    issuer,
+                    T0,
+                    T0 + TTL
+                ],
+            )
+            .unwrap();
+        assert_eq!(
+            redeem(&env, &code, "x", T0 + 1).err(),
+            Some(expected),
+            "{label}"
+        );
+    }
+    let devices: i64 = env
+        .raw()
+        .query_row("SELECT count(*) FROM pairing_devices", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(devices, 0);
+}
+
+#[test]
 fn a_device_credential_cannot_outlive_its_issuer_or_exceed_its_ceilings() {
     let env = Env::new();
     env.tree();
