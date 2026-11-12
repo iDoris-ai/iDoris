@@ -240,13 +240,18 @@ fn opening_twice_applies_the_migration_once() {
     let reopened = AccountStore::open(&path).unwrap();
     drop(reopened);
     let conn = Connection::open(&path).unwrap();
+    // 两个迁移（0001 账户存储、0002 S2 控制面），各应用一次。
     assert_eq!(
         count(&conn, "SELECT count(*) FROM account_schema_migrations"),
+        2
+    );
+    assert_eq!(
+        count(&conn, "SELECT min(version) FROM account_schema_migrations"),
         1
     );
     assert_eq!(
-        count(&conn, "SELECT version FROM account_schema_migrations"),
-        1
+        count(&conn, "SELECT max(version) FROM account_schema_migrations"),
+        2
     );
     for table in [
         "principals",
@@ -255,6 +260,13 @@ fn opening_twice_applies_the_migration_once() {
         "credentials",
         "credential_admin_scopes",
         "allocations",
+        // S2 控制面（0002）
+        "control_audit",
+        "credential_issuance",
+        "principal_registrations",
+        "allocation_revocations",
+        "pairing_codes",
+        "pairing_devices",
     ] {
         let found: i64 = conn
             .query_row(

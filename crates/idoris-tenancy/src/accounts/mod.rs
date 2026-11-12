@@ -11,12 +11,34 @@
 //! 入口：[`AccountStore`]。写入、读取和各自遵守的规则见 `store.rs` 的模块文档；表结构和约束见
 //! `migrations/0001_accounts.sql` 的注释。
 
+mod control;
+mod control_reads;
 mod error;
+mod pairing;
 mod rows;
 mod store;
 
 #[cfg(test)]
+mod control_tests;
+#[cfg(test)]
+mod pairing_tests;
+#[cfg(test)]
 mod tests;
 
+pub use control::{
+    AuditSpec, CallerInfo, CreateAccount, CreateMembership, CreatePrincipal, Failure,
+    GrantAllocation, IssueCredential, KeyCeilings, Meta, RevokeAllocation, RevokeMembership,
+    RevokePrincipal, SetAccountStatus, SetCredentialStatus, TargetKind, Who, Written,
+};
+pub use control_reads::{
+    AccountView, AllocationsView, AuditRow, AuditView, CredentialView, CredentialsView, DeviceView,
+    MAX_READ_ROWS, MembershipsView, Subtree,
+};
 pub use error::{AccountStoreError, PaymentContextError};
+pub use pairing::{
+    CreatePairingCode, DEFAULT_PAIRING_TTL_MS, GateVerdict, MAX_ACTIVE_DEVICES_PER_MEMBERSHIP,
+    MAX_DEVICE_LABEL_CHARS, MAX_PAIRING_TTL_MS, MIN_PAIRING_TTL_MS, PairedDevice, PairingRecord,
+    PairingStatus, RedeemPairingCode, RevokePairingCode,
+};
+pub use rows::AllocationRecord;
 pub use store::{AccountStore, AllocationOutcome};
