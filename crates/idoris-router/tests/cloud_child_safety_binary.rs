@@ -1,7 +1,7 @@
 //! 计算服务 S6 儿童安全：**真实进程**里的验收。设计稿 §13：「edu 在安全服务超时时拒绝放行；改用具体模型名绕不过安全检查；
 //! 全链路扫描确认没有正文落盘」。
 //!
-//! 前面的测试在进程内驱动路由；这里起真正的 `idoris` 二进制（真的监听端口、真的虚拟 key 认证、真的 SQLite 文件、
+//! 前面的测试在进程内驱动路由；这里起真正的 `idoris` 二进制（真的监听端口、真的凭证认证、真的 SQLite 文件、
 //! 真的 stderr 管道），证明启动接线是对的：
 //!
 //! - 配置里有儿童租户却没有 `safety:` 段、LLM 检查端点不满足许可表的儿童约束：**进程拒绝启动**（退出码 1，什么都没监听）；
@@ -9,6 +9,14 @@
 //! - 正常启动后：走真实的 HTTP 和认证，成功 / 输入被拒 / 输出被拒 / 安全服务超时 / 旧路由 / 流式 / 冒用租户，
 //!   然后**杀掉进程**（WAL 没有检查点，库里所有写过的东西都还在 WAL 里），扫描整个运行目录（数据库、WAL、SHM、配置、
 //!   所有文件）和进程的 stdout / stderr：两个哨兵、孩子的泰语原文、模型的有害回答片段都不在任何地方。
+//!
+//! # 和云入口（S5）的衔接
+//!
+//! 云形态的数据面是云入口：调用方（租户、付款账户）由**凭证**推导，租户的数据处理要求来自云入口配置
+//! （`IDORIS_CLOUD_INGRESS_CONFIG`），数据面只有 `/api/v1/models` 和 `/api/v1/chat/completions`。所以这里的儿童租户是
+//! 云入口配置里声明了 `child_edu` 的 `eduai`（云上游配置里的静态调用方簿是空的），开户和凭证用本机运维命令
+//! `idoris control bootstrap`，请求走 `/api/v1/chat/completions`；S6 原来针对旧路由的 403 在云形态变成 404（那些路由
+//! 根本不挂载，请求连认证都过不了，更到不了任何上游），403 本身仍由进程内的 S6 测试在非云入口的应用上钉着。
 //!
 //! 全部对本地假上游进行，**不连接任何真实的推理或安全服务**。
 #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -31,7 +39,7 @@ use child_safety::{
     content_needles, files_under, harmful_question, judge_allow,
 };
 use fake_upstream::{Behavior, FakeUpstream};
-use harness::{Caller, Endpoint, LedgerFunds, Options, seed_ledger};
+use harness::{Endpoint, Options};
 use idoris_compute_contracts::ids::{AttemptId, AttemptIndex, RequestId};
 use idoris_tenancy::accounts::AccountStore;
 use idoris_tenancy::accounts::ledger::HoldState;
@@ -157,7 +165,7 @@ impl Fixture {
         path
     }
 
-    /// 写云上游配置（儿童调用方 `eduai`，主上游 + 检查端点），返回配置文件路径。
+    /// 写云上游配置（主上游 + 检查端点；静态调用方簿是空的）和云入口配置（儿童租户 `eduai`），返回云上游配置文件路径。
     fn cloud_config(&self, main_url: &str, judge_url: &str, safety_yaml: &str) -> PathBuf {
         self.cloud_config_with(
             Endpoint::child_edu_compliant("example-judge", judge_url.to_string())
@@ -188,16 +196,20 @@ impl Fixture {
             harness::permit_table_yaml(&endpoints),
         )
         .unwrap();
-        let caller = Caller {
-            tenant_id: Some("eduai"),
-            ..if child {
-                Caller::child_edu()
-            } else {
-                Caller::adult_default()
-            }
+        // 租户 `eduai` 的数据处理要求在云入口配置里声明：child_edu（零留存 + 已签 DPA）或者成人。
+        // 这里测的是儿童安全管线，不是限流（限流有自己的测试）：各级上限开到不会碰到。
+        let tenant = if child {
+            "  - account: eduai\n    data_classes: [child_edu]\n    max_retention: zdr\n    require_dpa: true\n    billing: paid\n"
+        } else {
+            "  - account: eduai\n    data_classes: [adult]\n    max_retention: with_exceptions\n    billing: paid\n"
         };
+        let level = "{requests_per_minute: 6000, burst: 200, max_concurrent: 50}";
+        let ingress = format!(
+            "schema_version: 1\nlimits:\n  platform: {level}\n  tenant: {level}\n  member: {level}\ntenants:\n{tenant}"
+        );
+        fs::write(self.ingress_config(), ingress).unwrap();
         let options = Options {
-            callers: vec![caller],
+            callers: Vec::new(),
             safety_yaml: safety_yaml.to_string(),
             routes: Some(vec![("idoris/agent", vec!["example-zdr"])]),
             ..Options::default()
@@ -206,6 +218,10 @@ impl Fixture {
         let path = dir.join("cloud.yaml");
         fs::write(&path, yaml).unwrap();
         path
+    }
+
+    fn ingress_config(&self) -> PathBuf {
+        self.cwd.join("cloud").join("ingress.yaml")
     }
 
     fn server_env<'a>(
@@ -227,6 +243,10 @@ impl Fixture {
             (
                 "IDORIS_CLOUD_UPSTREAM_CONFIG".into(),
                 cloud.to_str().unwrap().into(),
+            ),
+            (
+                "IDORIS_CLOUD_INGRESS_CONFIG".into(),
+                self.ingress_config().to_str().unwrap().into(),
             ),
         ]
     }
@@ -250,28 +270,12 @@ impl Fixture {
         }
     }
 
-    /// 账户存储（S3 的账本）里的付款账户和凭证：云配置里的 `acct-default` / `cred-acct-default`。准入只认账户库里有的付款人
-    /// （`CloudUpstream::from_file` 不接受账户库里没有对应账户的静态调用方），所以起进程之前要先播种：
-    /// `platform` -> `acct-default`，一张节点凭证，充值。账户、凭证、充值行都不含正文。
-    fn seed_accounts(&self) {
-        let accounts = AccountStore::open(self.db()).unwrap();
-        seed_ledger(
-            &accounts,
-            &[Caller {
-                tenant_id: Some("eduai"),
-                ..Caller::child_edu()
-            }],
-            LedgerFunds {
-                micros: 1_000_000_000,
-            },
-        );
-    }
-
-    /// 用 `idoris key issue --spec-stdin` 给租户 eduai 发一把虚拟 key，返回明文密钥。
-    fn issue_key(&self) -> String {
-        let mut cmd = self.command(&[]);
-        let mut child = cmd
-            .args(["key", "issue", "--spec-stdin"])
+    /// 本机运维命令 `idoris control bootstrap --spec-stdin`（生产里运维开户、发凭证走的就是这条路），返回它输出的每一行 JSON。
+    fn bootstrap(&self, env: &[(String, String)], spec: &Value) -> Vec<Value> {
+        let pairs: Vec<(&str, &str)> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let mut child = self
+            .command(&pairs)
+            .args(["control", "bootstrap", "--spec-stdin"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -281,14 +285,49 @@ impl Fixture {
             .stdin
             .take()
             .unwrap()
-            .write_all(
-                br#"{"owner":"eduai-backend","tenant_id":"eduai","allowed_privacy":["any"],"allowed_roles":["fast"]}"#,
-            )
+            .write_all(spec.to_string().as_bytes())
             .unwrap();
         let output = child.wait_with_output().unwrap();
-        assert!(output.status.success(), "{output:?}");
-        let json: Value = serde_json::from_slice(&output.stdout).unwrap();
-        json["secret"].as_str().unwrap().to_string()
+        assert!(
+            output.status.success(),
+            "bootstrap failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
+    /// 开户、充值、发凭证：`platform` -> `eduai`（和云入口配置里声明的租户同名，租户 = 付款账户祖先链里平台根之下的那个客户），
+    /// 一张绑在 `eduai` 上的节点凭证（不带成员 id）。返回凭证明文。账户、凭证、充值行都不含正文。
+    fn provision(&self, env: &[(String, String)]) -> String {
+        let issued = self.bootstrap(
+            env,
+            &json!({
+                "accounts": [
+                    {"account_id": "platform", "kind": "platform", "unit": "THB"},
+                    {"account_id": "eduai", "kind": "org", "parent": "platform", "unit": "THB"}
+                ],
+                "allocations": [{
+                    "allocation_id": "a-eduai", "parent": "platform", "child": "eduai",
+                    "amount": {"unit": "THB", "micros": 1_000_000_000_i64}, "purpose": "prepaid",
+                    "valid_from_ms": 1_700_000_000_000_i64, "valid_until_ms": 4_000_000_000_000_i64
+                }],
+                "credentials": [{
+                    "binding": {"kind": "node", "account": "eduai"},
+                    "allowed_privacy": ["local_only"], "allowed_roles": []
+                }]
+            }),
+        );
+        issued
+            .iter()
+            .find(|line| line["kind"] == "credential")
+            .expect("bootstrap issues the credential")["secret"]
+            .as_str()
+            .unwrap()
+            .to_string()
     }
 }
 
@@ -341,20 +380,34 @@ struct Reply {
     raw: Vec<u8>,
 }
 
+/// 带凭证、不带任何多余头的请求（云入口里租户只来自凭证，请求用不着再说一遍）。
 async fn chat(
     client: &reqwest::Client,
     port: u16,
     secret: &str,
-    tenant: Option<&str>,
+    path: &str,
+    body: &Value,
+) -> Reply {
+    chat_with(client, port, Some(secret), &[], path, body).await
+}
+
+/// 完整形式：凭证可以没有，还可以带任意额外的头（冒用租户、想关安全检查之类）。
+async fn chat_with(
+    client: &reqwest::Client,
+    port: u16,
+    secret: Option<&str>,
+    headers: &[(&str, &str)],
     path: &str,
     body: &Value,
 ) -> Reply {
     let mut request = client
         .post(format!("http://127.0.0.1:{port}{path}"))
-        .bearer_auth(secret)
         .json(body);
-    if let Some(tenant) = tenant {
-        request = request.header("x-idoris-tenant", tenant);
+    if let Some(secret) = secret {
+        request = request.bearer_auth(secret);
+    }
+    for (name, value) in headers {
+        request = request.header(*name, *value);
     }
     let response = request.send().await.unwrap();
     let status = response.status().as_u16();
@@ -454,7 +507,7 @@ async fn rules_only_starts_with_a_loud_warning_and_adult_only_configs_need_no_sa
     );
     // 启动日志把「谁走儿童安全管线」列出来：运营方一眼能核对 edu 租户的属性确实是 child_edu
     assert!(
-        stderr.contains("child-data callers (safety pipeline ON): [eduai]; other callers (no safety pipeline): []; safety: rules_only"),
+        stderr.contains("child-data callers (safety pipeline ON): [eduai (cloud ingress)]; other callers (no safety pipeline): []; safety: rules_only"),
         "{stderr}"
     );
 
@@ -472,7 +525,7 @@ async fn rules_only_starts_with_a_loud_warning_and_adult_only_configs_need_no_sa
     let (_stdout, stderr) = server.kill();
     assert!(!stderr.contains("WARNING"), "{stderr}");
     assert!(
-        stderr.contains("child-data callers (safety pipeline ON): []; other callers (no safety pipeline): [eduai]; safety: not configured"),
+        stderr.contains("child-data callers (safety pipeline ON): []; other callers (no safety pipeline): [eduai (cloud ingress)]; safety: not configured"),
         "{stderr}"
     );
 }
@@ -514,20 +567,18 @@ async fn through_the_real_process_nothing_of_the_child_or_the_answer_is_written_
     ])
     .await;
     let cloud = f.cloud_config(&main.url(), &judge.url(), &child_safety::judge_yaml(700));
-    let secret = f.issue_key();
-    f.seed_accounts();
     let (port, admin) = (free_port(), free_port());
     let env = f.server_env(port, admin, &tenants, &cloud);
+    let secret = f.provision(&env);
     let mut server = f.spawn(&env);
     let client = wait_healthy(&mut server, port).await;
-    let chat_path = "/v1/chat/completions";
+    let chat_path = "/api/v1/chat/completions";
 
     // 场景 1：成功
     let r = chat(
         &client,
         port,
         &secret,
-        Some("eduai"),
         chat_path,
         &child_body(&benign_question()),
     )
@@ -541,7 +592,6 @@ async fn through_the_real_process_nothing_of_the_child_or_the_answer_is_written_
         &client,
         port,
         &secret,
-        Some("eduai"),
         chat_path,
         &child_body(&harmful_question()),
     )
@@ -557,7 +607,6 @@ async fn through_the_real_process_nothing_of_the_child_or_the_answer_is_written_
         &client,
         port,
         &secret,
-        Some("eduai"),
         chat_path,
         &child_body(&benign_question()),
     )
@@ -572,7 +621,6 @@ async fn through_the_real_process_nothing_of_the_child_or_the_answer_is_written_
         &client,
         port,
         &secret,
-        Some("eduai"),
         chat_path,
         &child_body(&benign_question()),
     )
@@ -588,7 +636,6 @@ async fn through_the_real_process_nothing_of_the_child_or_the_answer_is_written_
         &client,
         port,
         &secret,
-        Some("eduai"),
         chat_path,
         &child_body(&benign_question()),
     )
@@ -602,7 +649,6 @@ async fn through_the_real_process_nothing_of_the_child_or_the_answer_is_written_
         &client,
         port,
         &secret,
-        Some("eduai"),
         chat_path,
         &child_body(&benign_question()),
     )
@@ -611,41 +657,50 @@ async fn through_the_real_process_nothing_of_the_child_or_the_answer_is_written_
     assert_eq!(r.json["error"]["stage"], "input");
     ids.push(r.request_id.clone().unwrap());
 
-    // 绕过：流式、旧路由、不带租户头、错误的密钥、冒用别的租户
+    // 绕过：流式、不经过管线的路由、没有凭证、错误的凭证、冒用别的租户 / 想关掉安全检查
     let mut streaming = child_body(&benign_question());
     streaming["stream"] = json!(true);
-    let r = chat(&client, port, &secret, Some("eduai"), chat_path, &streaming).await;
+    let r = chat(&client, port, &secret, chat_path, &streaming).await;
     assert_eq!(
         (r.status, &r.json["error"]["type"]),
         (400, &json!("streaming_not_allowed"))
     );
-    for path in ["/v1/messages", "/v1/embeddings", "/v1/rerank"] {
-        let r = chat(&client, port, &secret, Some("eduai"), path, &json!({"model": "idoris/daily", "input": "x", "messages": [{"role": "user", "content": "x"}], "max_tokens": 4})).await;
-        assert_eq!(r.status, 403, "{path}");
-        assert_eq!(r.json["error"]["type"], "child_route_unavailable", "{path}");
+    // 云入口的数据面只有 /api/v1/models 和 /api/v1/chat/completions：不经过儿童安全管线的旧路由（还有它们在 /api/v1 下的
+    // 同名路径）根本不挂载，404，请求连认证都过不了
+    let other_body = json!({"model": "idoris/daily", "input": "x", "messages": [{"role": "user", "content": "x"}], "max_tokens": 4});
+    for path in [
+        "/v1/chat/completions",
+        "/v1/messages",
+        "/v1/embeddings",
+        "/v1/rerank",
+        "/api/v1/messages",
+        "/api/v1/embeddings",
+        "/api/v1/rerank",
+    ] {
+        let r = chat(&client, port, &secret, path, &other_body).await;
+        assert_eq!(r.status, 404, "{path}");
     }
-    let r = chat(&client, port, &secret, None, chat_path, &child_body("hi")).await;
-    assert_eq!(r.status, 400);
-    let r = chat(
-        &client,
-        port,
-        "idk_not-a-key",
-        Some("eduai"),
-        chat_path,
-        &child_body("hi"),
-    )
-    .await;
+    let r = chat_with(&client, port, None, &[], chat_path, &child_body("hi")).await;
     assert_eq!(r.status, 401);
-    let r = chat(
+    let r = chat(&client, port, "idk_not-a-key", chat_path, &child_body("hi")).await;
+    assert_eq!(r.status, 401);
+    // 冒用别的租户、写明自己不是儿童、要求关掉安全检查：租户和数据处理要求只从凭证推导，请求里写什么都没用，
+    // 明显有害的输入照样在进程里被规则检查器拦下（不会调用任何上游，所以也不消耗上面的脚本）
+    let r = chat_with(
         &client,
         port,
-        &secret,
-        Some("someone-else"),
+        Some(&secret),
+        &[
+            ("x-idoris-tenant", "someone-else"),
+            ("x-idoris-safety", "off"),
+            ("x-idoris-child", "false"),
+        ],
         chat_path,
-        &child_body("hi"),
+        &child_body(&harmful_question()),
     )
     .await;
-    assert_eq!(r.status, 403);
+    assert_eq!(r.status, 422, "{}", String::from_utf8_lossy(&r.raw));
+    assert_eq!(r.json["error"]["type"], "safety_input_blocked");
 
     // 杀掉进程（WAL 保持原样），扫描整个运行目录和进程输出
     let (stdout, stderr) = server.kill();
