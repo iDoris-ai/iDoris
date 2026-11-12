@@ -1621,14 +1621,19 @@ mod tests {
     enum Op {
         BeginNext(bool),
         Apply(u8, u8),
+        /// 对最新一次尝试应用「下一个合法事件」：让随机序列能稳定走到很深的状态
+        /// （发布之后、多次切换之后），而不是大多数时候卡在非法操作上。
+        Progress,
         Publish(u8),
     }
 
     fn op_strategy() -> impl Strategy<Value = Op> {
         prop_oneof![
-            any::<bool>().prop_map(Op::BeginNext),
-            (0u8..5, 0u8..7).prop_map(|(i, e)| Op::Apply(i, e)),
-            (0u8..5).prop_map(Op::Publish),
+            1 => Just(Op::BeginNext(false)),
+            4 => Just(Op::BeginNext(true)),
+            6 => (0u8..4, 0u8..7).prop_map(|(i, e)| Op::Apply(i, e)),
+            8 => Just(Op::Progress),
+            4 => (0u8..4).prop_map(Op::Publish),
         ]
     }
 
@@ -1668,6 +1673,7 @@ mod tests {
     }
 
     proptest! {
+        #![proptest_config(ProptestConfig::with_cases(512))]
         #[test]
         fn request_follows_the_reference_model_and_settlement_invariants_hold(
             ops in proptest::collection::vec(op_strategy(), 0..40)
@@ -1675,7 +1681,19 @@ mod tests {
             let mut req = new_request();
             let mut model = Model { states: vec![AttemptStateKind::Admitted], published: None };
             for op in ops {
+                // `Progress` 先翻译成对最新尝试的、模型认为合法的下一个事件
+                let op = match op {
+                    Op::Progress => {
+                        let latest = model.states.len() - 1;
+                        let code = (0u8..7)
+                            .find(|c| Model::legal(model.states[latest], *c).is_some())
+                            .unwrap_or(0);
+                        Op::Apply(u8::try_from(latest).unwrap(), code)
+                    }
+                    other => other,
+                };
                 match op {
+                    Op::Progress => unreachable!("translated above"),
                     Op::BeginNext(admit) => {
                         let cand = if admit {
                             candidate("m")
