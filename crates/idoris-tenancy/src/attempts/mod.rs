@@ -46,7 +46,6 @@ use idoris_compute_contracts::ids::{AttemptId, RequestId, SupplierRequestId, Tim
 use idoris_compute_contracts::money::{Money, Unit};
 use idoris_compute_contracts::permit::{Billing, DataClass};
 use idoris_compute_contracts::pricing::Usage;
-use idoris_compute_contracts::reason::ReasonCode;
 use idoris_compute_contracts::request::{
     Attempt, AttemptRole, ChargeBasis, CostBasis, MAX_ATTEMPTS_PER_REQUEST, Request, SettlementPlan,
 };
@@ -117,10 +116,11 @@ impl RequestOutcome {
 
 /// 关闭一个请求。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RequestClose {
+pub struct RequestClose<'a> {
     pub outcome: RequestOutcome,
-    /// 稳定原因码（拒绝或降级时有）。
-    pub reason: Option<ReasonCode>,
+    /// 稳定的原因字符串：S0 的原因码（`ReasonCode::as_str`，拒绝或降级时有），或路由层自己的稳定代码
+    /// （比如 `upstream_unavailable`、`client_cancelled`）。
+    pub reason: Option<&'a str>,
     pub at: TimestampMs,
 }
 
@@ -461,7 +461,7 @@ impl AttemptStore {
     pub fn record_rejected_request(
         &self,
         new: &NewRequest<'_>,
-        reason: ReasonCode,
+        reason: &str,
     ) -> Result<(), AttemptStoreError> {
         let mut conn = self.lock();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -735,7 +735,7 @@ impl AttemptStore {
         &self,
         plan: &SettlementPlan,
         settle: &[AttemptId],
-        close: RequestClose,
+        close: RequestClose<'_>,
     ) -> Result<FinalizeReport, AttemptStoreError> {
         let mut conn = self.lock();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -851,7 +851,7 @@ impl AttemptStore {
                 params![
                     request.as_str(),
                     close.outcome.as_str(),
-                    close.reason.map(ReasonCode::as_str),
+                    close.reason,
                     close.at.millis(),
                     charged,
                     basis,
@@ -1181,7 +1181,7 @@ fn data_classes_text(classes: &BTreeSet<DataClass>) -> Result<String, AttemptSto
 fn insert_request(
     tx: &rusqlite::Transaction<'_>,
     new: &NewRequest<'_>,
-    close: Option<RequestClose>,
+    close: Option<RequestClose<'_>>,
 ) -> Result<(), AttemptStoreError> {
     let payment = serde_json::to_string(new.payment)?;
     tx.execute(
@@ -1201,7 +1201,7 @@ fn insert_request(
             data_classes_text(new.data_classes)?,
             new.created_at.millis(),
             close.map(|c| c.outcome.as_str()),
-            close.and_then(|c| c.reason).map(ReasonCode::as_str),
+            close.and_then(|c| c.reason),
             close.map(|c| c.at.millis()),
         ],
     )?;

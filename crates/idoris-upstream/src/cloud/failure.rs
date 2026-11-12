@@ -31,6 +31,8 @@ pub enum CloudFailure {
     /// 流在没有 `[DONE]`（或没有以空行结束的最后一个事件）时结束了。
     StreamTruncated,
     StreamIdleTimeout,
+    /// 流的总时长超过了上限（一直在涓涓细流地发，但永远不结束）。
+    StreamTotalTimeout,
     StreamEventTooLarge,
     /// 上游在流里用一个 `error` 事件报错。
     StreamErrorEvent,
@@ -53,6 +55,7 @@ impl CloudFailure {
             CloudFailure::Response(error) => error.code(),
             CloudFailure::StreamTruncated => "stream_truncated",
             CloudFailure::StreamIdleTimeout => "stream_idle_timeout",
+            CloudFailure::StreamTotalTimeout => "stream_total_timeout",
             CloudFailure::StreamEventTooLarge => "stream_event_too_large",
             CloudFailure::StreamErrorEvent => "stream_error_event",
             CloudFailure::StreamMalformed => "stream_malformed",
@@ -75,6 +78,7 @@ impl CloudFailure {
                 | CloudFailure::ResponseHeadTimeout
                 | CloudFailure::BodyTimeout
                 | CloudFailure::StreamIdleTimeout
+                | CloudFailure::StreamTotalTimeout
         )
     }
 }
@@ -109,6 +113,7 @@ mod tests {
             CloudFailure::Response(CompletionError::NoChoices),
             CloudFailure::StreamTruncated,
             CloudFailure::StreamIdleTimeout,
+            CloudFailure::StreamTotalTimeout,
             CloudFailure::StreamEventTooLarge,
             CloudFailure::StreamErrorEvent,
             CloudFailure::StreamMalformed,
@@ -134,6 +139,7 @@ mod tests {
                 "response_no_choices",
                 "stream_truncated",
                 "stream_idle_timeout",
+                "stream_total_timeout",
                 "stream_event_too_large",
                 "stream_error_event",
                 "stream_malformed",

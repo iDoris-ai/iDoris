@@ -448,7 +448,7 @@ async fn sleep_or_closed(d: Duration, closed: &ClientClosed) -> bool {
     }
     tokio::select! {
         () = tokio::time::sleep(d) => closed.is_closed(),
-        _ = closed.wait(d) => true,
+        was_closed = closed.wait(d) => was_closed,
     }
 }
 

@@ -6,6 +6,7 @@ use idoris_compute_contracts::admission::{AdmissionDecision, Admitted, Reservati
 use idoris_compute_contracts::attempt::{AttemptEvent, AttemptEventKind, SettleBasis};
 use idoris_compute_contracts::ids::{AccountId, AttemptIndex, EndpointKey, PriceVersion};
 use idoris_compute_contracts::pricing::{Cost, Price, RateCard};
+use idoris_compute_contracts::reason::ReasonCode;
 use idoris_compute_contracts::request::AdmittedCandidate;
 
 use super::*;
@@ -561,7 +562,7 @@ fn finalize_charges_the_user_once_and_holds_the_maybe_executed_cost() {
             &[request.attempts()[1].id().clone()],
             RequestClose {
                 outcome: RequestOutcome::Answered,
-                reason: Some(ReasonCode::UpstreamFailover),
+                reason: Some(ReasonCode::UpstreamFailover.as_str()),
                 at: at(5),
             },
         )
@@ -620,7 +621,7 @@ fn finalize_charges_the_user_once_and_holds_the_maybe_executed_cost() {
             &[request.attempts()[1].id().clone()],
             RequestClose {
                 outcome: RequestOutcome::Answered,
-                reason: Some(ReasonCode::UpstreamFailover),
+                reason: Some(ReasonCode::UpstreamFailover.as_str()),
                 at: at(6),
             },
         )
@@ -641,7 +642,7 @@ fn finalize_charges_the_user_once_and_holds_the_maybe_executed_cost() {
             &[],
             RequestClose {
                 outcome: RequestOutcome::Answered,
-                reason: Some(ReasonCode::UpstreamFailover),
+                reason: Some(ReasonCode::UpstreamFailover.as_str()),
                 at: at(7),
             },
         )
@@ -810,7 +811,7 @@ fn a_rejected_request_leaves_an_audit_row_and_no_attempts() {
     store
         .record_rejected_request(
             &new_request(&id, &payment, &classes),
-            ReasonCode::NoCompliantEndpoint,
+            ReasonCode::NoCompliantEndpoint.as_str(),
         )
         .unwrap();
     let row = store.request_row(&id).unwrap().unwrap();
