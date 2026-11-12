@@ -46,3 +46,7 @@ pub mod accounts;
 
 #[cfg(test)]
 pub(crate) mod test_support;
+
+/// idoris.ai/api 计算服务 S4：每次请求的每次尝试、转移日志与结算分录（SQLite，只追加），
+/// 持久化 S0 契约（`idoris-compute-contracts`）的状态机与结算计划。
+pub mod attempts;

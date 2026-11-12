@@ -101,6 +101,12 @@ pub mod connection;
 /// Subscription registration/runtime/dispatch gates.
 pub mod subscription;
 
+/// idoris.ai/api compute service S4: the cloud upstream (OpenAI-compatible
+/// third-party endpoints driven by the `idoris-compute-contracts` state
+/// machine). Default off: `AppState::cloud` is `None` unless
+/// `IDORIS_CLOUD_UPSTREAM_CONFIG` is set, and then nothing else changes.
+pub mod cloud;
+
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -275,6 +281,10 @@ pub struct AppState {
     /// `Arc` because `ChatProxy` holds a `Mutex`-guarded cache, same reason
     /// `budget_ledger` above is `Arc`-wrapped rather than `Clone`.
     pub proxy: Arc<proxy::ChatProxy>,
+    /// idoris.ai/api cloud upstream (S4). `None` (the default) leaves every
+    /// existing route and behavior exactly as it was; `Some` replaces the
+    /// `POST /v1/chat/completions` handler with the cloud one in `build_app`.
+    pub cloud: Option<Arc<cloud::CloudUpstream>>,
 }
 
 impl std::fmt::Debug for AppState {
@@ -313,6 +323,7 @@ impl std::fmt::Debug for AppState {
             )
             .field("subscriptions", &self.subscriptions.len())
             .field("proxy", &"ChatProxy { .. }")
+            .field("cloud", &self.cloud.as_ref().map(|_| "configured"))
             .finish()
     }
 }
@@ -353,6 +364,7 @@ impl Default for AppState {
             capabilities: None,
             subscriptions: subscription::runtime::SubscriptionRuntimeRegistry::default(),
             proxy: Arc::new(proxy::ChatProxy::new(http_client.clone())),
+            cloud: None,
             http_client,
         }
     }
@@ -363,6 +375,12 @@ impl Default for AppState {
 /// middleware applied to every response.
 pub fn build_app(state: AppState) -> Router {
     let state = Arc::new(state);
+    // Cloud upstream (S4): only when configured; otherwise the router is built exactly as before.
+    let chat_completions_route = if state.cloud.is_some() {
+        post(cloud::chat_completions).fallback(not_found)
+    } else {
+        post(chat_completions).fallback(not_found)
+    };
     Router::new()
         .route("/health", get(health))
         .route("/v1/models", get(list_models).fallback(not_found))
@@ -383,10 +401,7 @@ pub fn build_app(state: AppState) -> Router {
             "/idoris/tenants/{tenant_id}/budget",
             get(get_tenant_budget).fallback(not_found),
         )
-        .route(
-            "/v1/chat/completions",
-            post(chat_completions).fallback(not_found),
-        )
+        .route("/v1/chat/completions", chat_completions_route)
         .route("/v1/feedback", post(post_feedback).fallback(not_found))
         .route(
             "/v1/inspect",
