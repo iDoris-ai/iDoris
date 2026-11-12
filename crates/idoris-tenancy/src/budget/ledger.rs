@@ -688,6 +688,21 @@ impl BudgetLedger {
         })
     }
 
+    /// How many tenants a database-authoritative start-up has ever initialised: the number of rows in
+    /// `tenant_bootstrap`. Zero for a database that has only run the personal form or a legacy tenant start
+    /// (the table exists after the additive migration, but those paths never write to it).
+    ///
+    /// Start-up uses it to refuse a *file-authoritative* start on a database that was once initialised by the
+    /// organization or cloud form: that start would overwrite the limit of every listed tenant with the file's
+    /// and revoke the tenants the file does not list, which is exactly what those forms exist to prevent.
+    pub fn seeded_tenant_count(&self) -> Result<usize, BudgetError> {
+        let conn = self.lock();
+        let count: i64 = conn.query_row("SELECT count(*) FROM tenant_bootstrap", [], |row| {
+            row.get(0)
+        })?;
+        Ok(usize::try_from(count).unwrap_or(usize::MAX))
+    }
+
     /// Read-only remaining balance for `scope`: `limit - settled_spend -
     /// active_reservations`. All three reads share one `BEGIN DEFERRED`
     /// transaction for a consistent snapshot — otherwise a racing `settle()`

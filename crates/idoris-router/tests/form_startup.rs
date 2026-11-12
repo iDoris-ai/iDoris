@@ -285,6 +285,63 @@ async fn the_organization_form_keeps_a_removed_tenant_across_real_process_restar
 }
 
 #[tokio::test]
+async fn a_start_that_lost_the_form_is_refused_and_leaves_the_database_alone() {
+    // A service unit that loses IDORIS_FORM must not silently turn an organization database back into a
+    // file-authoritative one: that start would lower acme to the file's limit and revoke beta.
+    let _guard = PROCESS_TEST_LOCK.lock().await;
+    let f = fixture();
+    let tenants = f.tenants(&[("acme", 100), ("beta", 100)]);
+    let with_form = [
+        ("IDORIS_DEPLOY_MODE", "tenant"),
+        ("IDORIS_FORM", "organization"),
+        ("IDORIS_TENANTS_CONFIG", tenants.to_str().unwrap()),
+    ];
+    let port = free_port();
+    let mut first = f.spawn(port, &with_form);
+    wait_health(&mut first, port).await;
+    drop(first.stop());
+
+    // The database moved on: acme's limit was raised there, and the file now lists only acme.
+    Connection::open(f.db())
+        .unwrap()
+        .execute(
+            "UPDATE tenant_config SET limit_minor = 999 WHERE tenant_id = 'acme'",
+            [],
+        )
+        .unwrap();
+    f.tenants(&[("acme", 100)]);
+    let acme_limit = |db: &Path| -> i64 {
+        Connection::open(db)
+            .unwrap()
+            .query_row(
+                "SELECT limit_minor FROM tenant_config WHERE tenant_id = 'acme'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+    };
+
+    let without_form = [
+        ("IDORIS_DEPLOY_MODE", "tenant"),
+        ("IDORIS_TENANTS_CONFIG", tenants.to_str().unwrap()),
+    ];
+    failed(
+        f.spawn(free_port(), &without_form),
+        "IDORIS_FORM=organization",
+    );
+    assert_eq!(tenant_ids(&f.db()), ["acme", "beta"]);
+    assert_eq!(acme_limit(&f.db()), 999);
+
+    // With the form back the very same database starts, and the database is still the authority.
+    let port = free_port();
+    let mut again = f.spawn(port, &with_form);
+    wait_health(&mut again, port).await;
+    drop(again.stop());
+    assert_eq!(tenant_ids(&f.db()), ["acme", "beta"]);
+    assert_eq!(acme_limit(&f.db()), 999);
+}
+
+#[tokio::test]
 async fn without_the_form_a_removed_tenant_is_still_revoked_as_before() {
     // Control for the test above: the very same sequence with no IDORIS_FORM is the pre-S1 behaviour.
     let _guard = PROCESS_TEST_LOCK.lock().await;

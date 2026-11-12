@@ -84,6 +84,40 @@ fn the_first_seed_writes_the_tenant_and_marks_it_as_seeded() {
 }
 
 #[test]
+fn the_seeded_tenant_count_is_what_start_up_uses_to_recognise_a_database_authoritative_database() {
+    let db = TempDb::new("count");
+    let ledger = BudgetLedger::open(db.path()).unwrap();
+    // 个人和存量 tenant 启动只用 configure_tenant：从不写标记，所以数量一直是 0
+    assert_eq!(ledger.seeded_tenant_count().unwrap(), 0);
+    ledger
+        .configure_tenant("legacy", 10, "UTC", SpendGate::All)
+        .unwrap();
+    let keep: BTreeSet<String> = ["legacy".to_string()].into();
+    ledger.retain_tenants(&keep).unwrap();
+    assert_eq!(ledger.seeded_tenant_count().unwrap(), 0);
+    // 组织、云启动的种子写标记；重复种子不重复计数；被收养的（库里本来就有的）也计
+    ledger
+        .seed_tenant(&seed("acme", 1_000, "UTC", SpendGate::All))
+        .unwrap();
+    assert_eq!(ledger.seeded_tenant_count().unwrap(), 1);
+    ledger
+        .seed_tenant(&seed("acme", 1_000, "UTC", SpendGate::All))
+        .unwrap();
+    assert_eq!(ledger.seeded_tenant_count().unwrap(), 1);
+    let report = ledger
+        .seed_tenant(&seed("legacy", 10, "UTC", SpendGate::All))
+        .unwrap();
+    assert_eq!(report.outcome, SeedOutcome::Adopted);
+    assert_eq!(ledger.seeded_tenant_count().unwrap(), 2);
+    // 数的是标记，不是租户配置：删掉租户配置、标记还在
+    Connection::open(db.path())
+        .unwrap()
+        .execute("DELETE FROM tenant_config WHERE tenant_id = 'acme'", [])
+        .unwrap();
+    assert_eq!(ledger.seeded_tenant_count().unwrap(), 2);
+}
+
+#[test]
 fn seeding_again_is_a_no_op_across_restarts() {
     let db = TempDb::new("again");
     for round in 0..3 {
