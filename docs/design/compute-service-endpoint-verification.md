@@ -532,3 +532,51 @@ adult 在设计稿里不要求同一套儿童门槛，但仍要过租户自己�
 - SiliconFlow 国际站与中文站哪一份政策适用。
 - 除已点名的 Typhoon 页面外，其他泰语模型的托管清单。
 - DPA 正文里的标准合同条款、子处理者名单细节、责任上限。正文没有打开的，都不摘要。
+
+## 10. 正式许可表
+
+第 8 节第 10 条写的时候，S0 的 schema 还没冻结。现在 schema 在 `crates/idoris-compute-contracts/src/permit.rs`，正式文件是 `config/compute/endpoint-permit-table.yaml`。草案 `compute-service-endpoint-table.draft.yaml` 仍然只是调研底稿，加载器读不了它。
+
+调用 URL 不在许可表里。对照表是 `config/compute/endpoint-urls.md`。S4 的供应商配置按 EndpointKey（`provider` + `model` + `endpoint`）去那份对照表找 URL。
+
+这张正式表能被加载，但不授权任何一次请求。17 条草案端点各占一行（owner 已排除的上游没有写回来）。每一条的 `allowed_data_classes` 都是空列表，路由不会选中它们。
+
+### 最坏值规则
+
+契约没有「未知」这个取值。草案写了 `unverified`，或者这个字段没有核实到可以放宽的结论时，正式表写成对数据保护更严的那一档（`permit.rs` 模块文档「没核实的值怎么写」）：
+
+| 字段 | 正式表里的写法 |
+|---|---|
+| `allowed_data_classes` | `[]`。不因为「大概可以走公开数据」就写上 `public` |
+| `retention` | 草案写明「有例外」的写成 `with_exceptions`，写明「会留存」的写成 `retained`。栏位本身是 `unverified`，或「有例外」依赖一条没核实的前提时，写成 `retained`。DeepInfra 上的 Qwen3.6-35B-A3B 属于后一种：草案留存栏写「有例外」，但同一条写明没有核对是不是自托管，而条款写第三方模型不适用 ZDR |
+| `dpa` | 一律 `unsigned`。本项目没有签署任何一份。草案写「未签」或 `unverified` 都一样 |
+| `capabilities` 五项 | 该能力的草案正文含 `unverified`，或没有肯定到本条目，写成 `false` |
+| `processing_regions` | 实际执行区域没有核实完、没有合同锁定、或文档明确说不是单城且节点没列全的，写成 `[unknown]`。`unknown` 不会出现在租户的允许区域里。Google 的新加坡区域端点例外：数据驻留文档写处理发生在发出请求的区域，这一条写成 `[sg]`，型号清单仍未核实，所以 `model` 用 `unspecified` |
+
+`verification_max_age_days` 取 schema 示例里的 90。设计稿 §8 只说核验过期就停用，没有另定天数。这个数只能在 1 到 365 之间。
+
+### 怎么校验
+
+在仓库根目录执行。不要设置 `CARGO_TARGET_DIR`。
+
+```text
+cargo run -p idoris-compute-contracts --example validate_permit_table -- config/compute/endpoint-permit-table.yaml 2026-11-12
+```
+
+加载失败会以非 0 退出，并打印是哪一个端点、哪一条规则。通过时会列出每个端点在给定日期是 `fresh` 还是 `STALE`，以及允许的数据类别。空列表显示为 `NONE (never selected)`。
+
+另外有一条只读配置的测试，断言没有任何条目的 `allowed_data_classes` 含 `child_edu`：
+
+```text
+cargo test -p idoris-compute-contracts --test permit_table_no_child_edu
+```
+
+### 什么时候才能给某一条加上 child_edu
+
+三条都要先成立。少一条，就不要改 `allowed_data_classes`。
+
+1. **DPA 签署。** 本项目以自己的名义拿到该端点的签字 DPA 之后，这一条的 `dpa` 才能从 `unsigned` 改成 `signed`。条款里「并入」一份我们没签、正文也没读完的 DPA，不算签署。
+2. **留存例外经律师认可。** `child_edu` 在加载时要求 `retention: zdr` 且 `dpa: signed`，否则整张表被拒绝。现在写着 `with_exceptions` 或 `retained` 的，工程侧不能直接改成 `zdr`。律师书面认可「条款里的那些例外仍然满足设计稿要求的 ZDR」之后，才能把该条改成 `zdr`。律师不认可，就保持原样，这一条不能带 `child_edu`。
+3. **核验日期更新。** 按新的证据改完字段后，把 `verified_at` 写成这次核验的日期。校验用的「现在」必须落在 `verified_at` 起 `verification_max_age_days` 天之内。过期的端点自动停用，就算类别写对了也不会被选中。
+
+三条都满足、加载器接受之后，才把 `child_edu` 加进该条的 `allowed_data_classes`。只加类别、不改前三项，加载器会拒绝这张表。区域、转售许可和能力仍然要按当时的证据改；它们不决定加载器放不放行 `child_edu`，但区域仍是 `unknown` 或能力仍是 `false` 的端点，在对应的租户约束下还是不会被选中。
