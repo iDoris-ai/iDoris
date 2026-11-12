@@ -1562,21 +1562,27 @@ fn insert_account_sql(id: &str, kind: &str, parent: Option<&str>, unit: &str) ->
 }
 
 #[test]
-fn db_a_second_platform_root_hits_the_unique_index() {
+fn db_a_second_platform_root_is_rejected_and_the_unique_index_alone_would_reject_it_too() {
     let env = seeded();
     let conn = raw(&env);
     assert_rejected(
         &conn,
         &insert_account_sql("plat-2", "platform", None, "THB"),
-        "UNIQUE constraint failed",
+        "UNIQUE constraint failed|platform root already exists",
     );
-    // 对照：同样的语句在没有根的库里能写进去（见下一个测试的空库），这里证明是索引而不是别的东西拦的
     assert_eq!(
         count(
             &conn,
             "SELECT count(*) FROM accounts WHERE kind = 'platform'"
         ),
         1
+    );
+    // 纵深防御：把「不许与已有行冲突」的触发器拿掉，单靠唯一索引也拦得住第二个平台根。
+    assert_accepted(&conn, "DROP TRIGGER accounts_insert_no_conflict;");
+    assert_rejected(
+        &conn,
+        &insert_account_sql("plat-2", "platform", None, "THB"),
+        "UNIQUE constraint failed",
     );
 }
 
@@ -1593,7 +1599,9 @@ fn db_root_shape_checks_reject_a_parentless_non_platform_and_a_platform_with_a_p
     assert_rejected(
         &conn,
         &insert_account_sql("plat-child", "platform", Some("plat"), "THB"),
-        "CHECK constraint failed|kind is not allowed under its parent kind",
+        // three independent guards reject this (the platform-root trigger, the kind-matrix trigger
+        // and the CHECK); whichever fires first reports it
+        "CHECK constraint failed|kind is not allowed under its parent kind|platform root already exists",
     );
     // 自己当自己的父账户
     assert_rejected(
@@ -1749,26 +1757,42 @@ fn db_account_identity_is_immutable_so_the_tree_cannot_grow_a_cycle() {
 }
 
 #[test]
-fn db_accounts_cannot_be_deleted_while_something_refers_to_them() {
+fn db_accounts_are_never_deleted_referenced_or_not() {
     let env = seeded();
     let conn = raw(&env);
+    // 被引用的账户（有子账户）和没人引用的叶子一样，都不能删：撤销 / 关闭用状态表示，id 不能被换一个含义再用。
     assert_rejected(
         &conn,
         "DELETE FROM accounts WHERE account_id = 'org-a';",
-        "FOREIGN KEY constraint failed",
+        "accounts are never deleted",
     );
-    // 对照：没有任何东西引用的叶子可以删（库不禁止删除，只保护被引用的行）
     assert_accepted(
         &conn,
-        "DELETE FROM accounts WHERE account_id = 'stu-b' AND NOT EXISTS (SELECT 1 FROM memberships WHERE account_id = 'stu-b');",
+        &insert_account_sql("lonely", "member", Some("org-a"), "THB"),
+    );
+    assert_rejected(
+        &conn,
+        "DELETE FROM accounts WHERE account_id = 'lonely';",
+        "accounts are never deleted",
     );
     assert_eq!(
         count(
             &conn,
-            "SELECT count(*) FROM accounts WHERE account_id = 'stu-b'"
+            "SELECT count(*) FROM accounts WHERE account_id = 'lonely'"
         ),
-        1,
-        "stu-b is bound by a membership, so nothing was deleted"
+        1
+    );
+    // 对照：关闭是允许的
+    assert_accepted(
+        &conn,
+        "UPDATE accounts SET status = 'closed' WHERE account_id = 'lonely';",
+    );
+    // 纵深防御：没有删除触发器时，外键仍然保护被引用的行
+    assert_accepted(&conn, "DROP TRIGGER accounts_never_deleted;");
+    assert_rejected(
+        &conn,
+        "DELETE FROM accounts WHERE account_id = 'org-a';",
+        "FOREIGN KEY constraint failed",
     );
 }
 
@@ -1851,10 +1875,20 @@ fn db_memberships_hit_foreign_keys_checks_the_unique_binding_and_the_shape_trigg
         &insert("m1", "p-bob", "org-a", "member", Some("ghost")),
         "FOREIGN KEY constraint failed",
     );
+    // 下面的反例各自用一个还没被任何成员关系占用的账户，这样被检查的只会是那一条规则
+    // （「账户已被占用」的触发器先于 CHECK 触发，用已占用的账户会被它抢先拦下，测不到想测的约束）。
+    assert_accepted(
+        &conn,
+        &insert_account_sql("free-a", "member", Some("org-a"), "THB"),
+    );
+    assert_accepted(
+        &conn,
+        &insert_account_sql("free-b", "member", Some("org-b"), "THB"),
+    );
     // 角色 / 账户的空与非空
     assert_rejected(
         &conn,
-        &insert("m1", "p-bob", "org-a", "admin", Some("stu-2")),
+        &insert("m1", "p-bob", "org-a", "admin", Some("free-a")),
         "CHECK constraint failed",
     );
     assert_rejected(
@@ -1875,22 +1909,26 @@ fn db_memberships_hit_foreign_keys_checks_the_unique_binding_and_the_shape_trigg
     );
     assert_rejected(
         &conn,
-        &insert("m1", "p-bob", "org-a", "sponsor", Some("stu-2")),
+        &insert("m1", "p-bob", "org-a", "sponsor", Some("free-a")),
         "does not match its account kind",
     );
     assert_rejected(
         &conn,
-        &insert("m1", "p-bob", "org-a", "member", Some("stu-b")),
+        &insert("m1", "p-bob", "org-a", "member", Some("free-b")),
         "not under its org",
     );
     // 一个账户至多一个成员关系
     assert_rejected(
         &conn,
         &insert("m1", "p-alice", "org-a", "member", Some("stu-1")),
-        "UNIQUE constraint failed",
+        "UNIQUE constraint failed|account is already bound",
     );
     // 对照：同样的位置、合法的内容能写进去（账户在组织的更深一层也算子树）
     assert_accepted(&conn, &insert("m-ok", "p-alice", "org-a", "admin", None));
+    assert_accepted(
+        &conn,
+        &insert("m-ok-free", "p-alice", "org-a", "member", Some("free-a")),
+    );
     assert_accepted(
         &conn,
         &insert_account_sql("sp-a3", "sponsor", Some("org-a"), "THB"),
@@ -1917,9 +1955,31 @@ fn db_memberships_hit_foreign_keys_checks_the_unique_binding_and_the_shape_trigg
 }
 
 #[test]
-fn db_a_principal_with_memberships_cannot_be_deleted() {
+fn db_principals_and_memberships_are_never_deleted() {
     let env = seeded();
     let conn = raw(&env);
+    // p-bob has a membership; a principal with nothing referencing it is refused just the same
+    assert_rejected(
+        &conn,
+        "DELETE FROM principals WHERE principal_id = 'p-bob';",
+        "principals are never deleted",
+    );
+    assert_accepted(
+        &conn,
+        "INSERT INTO principals (principal_id, status, created_at_ms, revoked_at_ms) VALUES ('p-lonely', 'active', 0, NULL);",
+    );
+    assert_rejected(
+        &conn,
+        "DELETE FROM principals WHERE principal_id = 'p-lonely';",
+        "principals are never deleted",
+    );
+    assert_rejected(
+        &conn,
+        "DELETE FROM memberships WHERE membership_id = 'm-admin-a';",
+        "memberships are never deleted",
+    );
+    // 纵深防御：没有删除触发器时，外键仍然保护被引用的主体
+    assert_accepted(&conn, "DROP TRIGGER principals_never_deleted;");
     assert_rejected(
         &conn,
         "DELETE FROM principals WHERE principal_id = 'p-bob';",
@@ -2055,7 +2115,7 @@ fn db_credential_admin_scopes_are_shaped_append_only_and_tied_to_real_accounts()
     assert_rejected(
         &conn,
         &insert(1, "create_account", "stu-2", None, None),
-        "UNIQUE constraint failed",
+        "UNIQUE constraint failed|admin scope already exists",
     );
     // 外键：子树必须是真实账户
     assert_rejected(
@@ -2209,7 +2269,11 @@ fn db_allocation_rows_reject_bad_amounts_windows_units_and_transfers() {
         "must equal the child account unit",
     );
     // id 重复
-    assert_rejected(&conn, &base("ok-1"), "UNIQUE constraint failed");
+    assert_rejected(
+        &conn,
+        &base("ok-1"),
+        "UNIQUE constraint failed|allocation already exists",
+    );
     // 追加式
     assert_rejected(
         &conn,
@@ -2237,7 +2301,19 @@ fn db_the_subsidy_idempotency_key_is_unique_and_free_tier_requires_it() {
     };
     let key = subsidy_key_of("p-sub");
     assert_accepted(&conn, &insert("s1", "pool-stu-1", "free_tier", Some(&key)));
-    // 同一个 (成员, 月份) 的键重复：唯一索引拦下，换账户、换 id 都一样
+    // 同一个 (成员, 月份) 的键重复：数据库拦下，换账户、换 id 都一样
+    assert_rejected(
+        &conn,
+        &insert("s2", "pool-stu-b", "free_tier", Some(&key)),
+        "UNIQUE constraint failed: allocations.idempotency_key|idempotency key was already used",
+    );
+    assert_rejected(
+        &conn,
+        &insert("s3", "pool-stu-1", "free_tier", Some(&key)),
+        "UNIQUE constraint failed: allocations.idempotency_key|idempotency key was already used",
+    );
+    // 纵深防御：把「不许与已有行冲突」的触发器拿掉，单靠唯一索引也拦得住重复的补贴幂等键。
+    assert_accepted(&conn, "DROP TRIGGER allocations_insert_no_conflict;");
     assert_rejected(
         &conn,
         &insert("s2", "pool-stu-b", "free_tier", Some(&key)),
@@ -2274,6 +2350,211 @@ fn db_the_subsidy_idempotency_key_is_unique_and_free_tier_requires_it() {
     assert_accepted(
         &conn,
         &insert("s9", "pool-stu-1", "free_tier", Some(december.as_str())),
+    );
+}
+
+// ================================================================ 数据库层：REPLACE 与「删了再插」不能绕过保护
+
+/// SQLite 的 `INSERT OR REPLACE` 在主键 / 唯一约束冲突时先删旧行再插新行，而 `recursive_triggers`
+/// 默认关闭，此时 DELETE 触发器不触发，所以「不可改」「终态」「追加式」的触发器管不到它；
+/// 「删掉再用同一个 id 插入」是同一条路。迁移里用 BEFORE INSERT 的「不许冲突」触发器和「永不删除」触发器堵住，
+/// 这里逐张表证明：每一种绕过都被拦下，状态原样；并且在拿掉对应触发器之后绕过确实成功——证明攻击是真的，
+/// 拦住它的就是这些触发器，而不是别的东西碰巧挡着。
+#[test]
+fn db_replace_and_delete_then_insert_cannot_bypass_immutability_terminal_states_or_append_only() {
+    let env = payment_env();
+    with_pool_members(&env);
+    let s = &env.store;
+    let key = subsidy_key_of("p-sub");
+    s.create_allocation(
+        &allocation(
+            "a-top",
+            "plat",
+            "org-a",
+            grant(1_000_000_000, Purpose::Prepaid),
+            None,
+        ),
+        now(),
+    )
+    .unwrap();
+    s.create_allocation(
+        &allocation(
+            "sub-1",
+            "pool",
+            "pool-stu-1",
+            grant(5_000_000, Purpose::FreeTier),
+            Some(&key),
+        ),
+        now(),
+    )
+    .unwrap();
+    let scoped = Credential::new(
+        cid("svc-scoped"),
+        CredentialBinding::Service {
+            account: aid("org-a"),
+        },
+        CredentialStatus::Active,
+        None,
+        vec![scope(ControlOp::GrantAllocation, "org-a", Some(thb(1_000)))],
+    )
+    .unwrap();
+    s.create_credential(&scoped, now()).unwrap();
+    s.set_credential_status(&cid("node-a"), CredentialStatus::Revoked, now())
+        .unwrap();
+    s.ensure_principal(&pid("p-lonely"), now()).unwrap();
+    s.revoke_principal(&pid("p-lonely"), now()).unwrap();
+    let conn = raw(&env);
+
+    let credential_row = |id: &str, kind: &str, account: &str, status: &str, revoked: &str| {
+        format!(
+            "INSERT OR REPLACE INTO credentials (credential_id, binding_kind, account_id, membership_id, status, expires_at_ms, created_at_ms, revoked_at_ms) \
+             VALUES ('{id}', '{kind}', '{account}', NULL, '{status}', NULL, 0, {revoked});"
+        )
+    };
+    let allocation_row = |id: &str, parent: &str, child: &str, micros: i64, key: Option<&str>| {
+        let (purpose, key) = match key {
+            Some(k) => ("free_tier", format!("'{k}'")),
+            None => ("prepaid", "NULL".to_string()),
+        };
+        format!(
+            "INSERT OR REPLACE INTO allocations (allocation_id, parent_id, child_id, ceiling_unit, ceiling_micros, purpose, valid_from_ms, valid_until_ms, transferable, idempotency_key, created_at_ms) \
+             VALUES ('{id}', '{parent}', '{child}', 'THB', {micros}, '{purpose}', 1, 2, 0, {key}, 0);"
+        )
+    };
+
+    // ---- 凭证：REPLACE 改绑付款账户 / 把撤销的凭证变回有效；删了再插
+    assert_rejected(
+        &conn,
+        &credential_row("node-a", "node", "org-b", "active", "NULL"),
+        "credential already exists",
+    );
+    assert_rejected(
+        &conn,
+        "DELETE FROM credentials WHERE credential_id = 'cred-alice';",
+        "credentials are never deleted",
+    );
+    let after = s.get_credential(&cid("node-a")).unwrap().unwrap();
+    assert_eq!(after.status(), CredentialStatus::Revoked);
+    assert_eq!(
+        after.binding(),
+        &CredentialBinding::Node {
+            account: aid("org-a")
+        }
+    );
+
+    // ---- 主体：把撤销的主体 REPLACE 回有效；INSERT OR IGNORE 也被拒（所以 ensure_principal 是先查再插）
+    assert_rejected(
+        &conn,
+        "INSERT OR REPLACE INTO principals (principal_id, status, created_at_ms, revoked_at_ms) VALUES ('p-lonely', 'active', 0, NULL);",
+        "principal already exists",
+    );
+    assert_rejected(
+        &conn,
+        "INSERT OR IGNORE INTO principals (principal_id, status, created_at_ms, revoked_at_ms) VALUES ('p-lonely', 'active', 0, NULL);",
+        "principal already exists",
+    );
+    assert_eq!(
+        s.get_principal(&pid("p-lonely")).unwrap().unwrap().status,
+        PrincipalStatus::Revoked
+    );
+
+    // ---- 额度：按 id 改写上限；按幂等键「重发」成另一笔
+    assert_rejected(
+        &conn,
+        &allocation_row("a-top", "plat", "org-a", 999_999_999_999, None),
+        "allocation already exists",
+    );
+    assert_rejected(
+        &conn,
+        &allocation_row("sub-again", "pool", "pool-stu-b", 77, Some(&key)),
+        "idempotency key was already used",
+    );
+    assert_eq!(
+        s.get_allocation(&alid("a-top"))
+            .unwrap()
+            .unwrap()
+            .ceiling
+            .amount()
+            .micros,
+        1_000_000_000
+    );
+    assert_eq!(
+        s.get_allocation(&alid("sub-1"))
+            .unwrap()
+            .unwrap()
+            .ceiling
+            .amount()
+            .micros,
+        5_000_000
+    );
+
+    // ---- 成员关系：把已被占用的付款账户 REPLACE 给别人
+    assert_rejected(
+        &conn,
+        "INSERT OR REPLACE INTO memberships (membership_id, principal_id, org_id, role, account_id, status, created_at_ms, revoked_at_ms) \
+         VALUES ('m-hijack', 'p-alice', 'org-a', 'member', 'stu-1', 'active', 0, NULL);",
+        "already bound",
+    );
+    assert_eq!(
+        s.get_membership(&mid("m-bob-a"))
+            .unwrap()
+            .unwrap()
+            .principal,
+        pid("p-bob")
+    );
+
+    // ---- 账户：REPLACE 把叶子账户搬到别的父账户下 / 换成别的种类；第二个平台根
+    assert_rejected(
+        &conn,
+        "INSERT OR REPLACE INTO accounts (account_id, kind, parent_id, unit, status, created_at_ms) VALUES ('stu-2', 'member', 'org-b', 'THB', 'active', 0);",
+        "already exists",
+    );
+    assert_rejected(
+        &conn,
+        "INSERT OR REPLACE INTO accounts (account_id, kind, parent_id, unit, status, created_at_ms) VALUES ('plat-2', 'platform', NULL, 'THB', 'active', 0);",
+        "platform root already exists",
+    );
+    assert_eq!(
+        s.get_account(&aid("stu-2")).unwrap().unwrap().parent,
+        Some(aid("org-a"))
+    );
+
+    // ---- 权限范围：同一个 (凭证, 位置) 被 REPLACE 成别的子树和额度上限
+    assert_rejected(
+        &conn,
+        "INSERT OR REPLACE INTO credential_admin_scopes (credential_id, position, op, subtree_id, max_amount_unit, max_amount_micros) \
+         VALUES ('svc-scoped', 0, 'grant_allocation', 'org-a', 'THB', 9999999999);",
+        "admin scope already exists",
+    );
+    assert_eq!(
+        s.get_credential(&cid("svc-scoped"))
+            .unwrap()
+            .unwrap()
+            .admin_scopes()[0]
+            .max_amount,
+        Some(thb(1_000))
+    );
+
+    // ---- 对照：拿掉「不许冲突」触发器，同样的 REPLACE 就成功了（攻击是真的）；全新的 id 一直能正常插入。
+    assert_accepted(&conn, "DROP TRIGGER credentials_insert_no_conflict;");
+    assert_accepted(&conn, "DROP TRIGGER credentials_binding_immutable;");
+    assert_accepted(
+        &conn,
+        &credential_row("cred-alice", "node", "org-b", "active", "NULL"),
+    );
+    assert_eq!(
+        s.get_credential(&cid("cred-alice"))
+            .unwrap()
+            .unwrap()
+            .binding(),
+        &CredentialBinding::Node {
+            account: aid("org-b")
+        },
+        "without the trigger, REPLACE silently re-pointed the credential at another payer"
+    );
+    assert_accepted(
+        &conn,
+        "INSERT INTO principals (principal_id, status, created_at_ms, revoked_at_ms) VALUES ('p-fresh', 'active', 0, NULL);",
     );
 }
 

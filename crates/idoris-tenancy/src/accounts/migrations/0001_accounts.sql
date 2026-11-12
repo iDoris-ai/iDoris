@@ -307,3 +307,78 @@ CREATE TRIGGER allocations_append_only_delete BEFORE DELETE ON allocations
 BEGIN
     SELECT RAISE(ABORT, 'allocations are append-only');
 END;
+
+-- ===========================================================================================
+-- 堵住 REPLACE 和「删了再插」这两条绕过上面所有保护的路
+-- ===========================================================================================
+--
+-- 1. INSERT OR REPLACE / REPLACE INTO 在主键或唯一约束冲突时，会先删掉旧行再插入新行；而 recursive_triggers
+--    默认是关的，这时 DELETE 触发器不会触发。于是上面所有「不可改」「终态」「追加式」的保护都能被它绕过
+--    （把一张凭证 REPLACE 成指向别人账户的新行，把撤销的主体 REPLACE 回 active，改写一笔额度的上限……）。
+--    SQLite 里 BEFORE INSERT 触发器先于冲突处理执行，所以这里一律拒绝「会与已有行冲突的插入」，
+--    REPLACE 没有机会生效。INSERT OR IGNORE 同样会被拒绝（调用方要先查再插，见 `AccountStore::ensure_principal`）。
+--    每个主键和每个唯一索引都要有对应的检查；加新的唯一约束时在这里补一条。
+CREATE TRIGGER principals_insert_no_conflict BEFORE INSERT ON principals
+WHEN EXISTS (SELECT 1 FROM principals WHERE principal_id = NEW.principal_id)
+BEGIN
+    SELECT RAISE(ABORT, 'principal already exists');
+END;
+
+CREATE TRIGGER accounts_insert_no_conflict BEFORE INSERT ON accounts
+WHEN EXISTS (SELECT 1 FROM accounts WHERE account_id = NEW.account_id)
+  OR (NEW.kind = 'platform' AND EXISTS (SELECT 1 FROM accounts WHERE kind = 'platform'))
+BEGIN
+    SELECT RAISE(ABORT, 'account already exists, or the platform root already exists');
+END;
+
+CREATE TRIGGER memberships_insert_no_conflict BEFORE INSERT ON memberships
+WHEN EXISTS (SELECT 1 FROM memberships WHERE membership_id = NEW.membership_id)
+  OR (NEW.account_id IS NOT NULL AND EXISTS (SELECT 1 FROM memberships WHERE account_id = NEW.account_id))
+BEGIN
+    SELECT RAISE(ABORT, 'membership already exists, or its account is already bound');
+END;
+
+CREATE TRIGGER credentials_insert_no_conflict BEFORE INSERT ON credentials
+WHEN EXISTS (SELECT 1 FROM credentials WHERE credential_id = NEW.credential_id)
+BEGIN
+    SELECT RAISE(ABORT, 'credential already exists');
+END;
+
+CREATE TRIGGER credential_admin_scopes_insert_no_conflict BEFORE INSERT ON credential_admin_scopes
+WHEN EXISTS (
+    SELECT 1 FROM credential_admin_scopes
+     WHERE credential_id = NEW.credential_id AND position = NEW.position)
+BEGIN
+    SELECT RAISE(ABORT, 'credential admin scope already exists');
+END;
+
+CREATE TRIGGER allocations_insert_no_conflict BEFORE INSERT ON allocations
+WHEN EXISTS (SELECT 1 FROM allocations WHERE allocation_id = NEW.allocation_id)
+  OR (NEW.idempotency_key IS NOT NULL
+      AND EXISTS (SELECT 1 FROM allocations WHERE idempotency_key = NEW.idempotency_key))
+BEGIN
+    SELECT RAISE(ABORT, 'allocation already exists, or its idempotency key was already used');
+END;
+
+-- 2. 身份表的行永远不删，撤销、关闭用状态表示。id 一旦用过就不能换一个含义再用：删掉再插入同一个 id，
+--    就能把撤销的凭证变回有效、把凭证改绑到别人的账户、把账户搬到别的父账户下，历史账目会被悄悄改归属。
+--    （allocations 和 credential_admin_scopes 的追加式触发器已经禁止了删除。）
+CREATE TRIGGER principals_never_deleted BEFORE DELETE ON principals
+BEGIN
+    SELECT RAISE(ABORT, 'principals are never deleted; revoke them');
+END;
+
+CREATE TRIGGER accounts_never_deleted BEFORE DELETE ON accounts
+BEGIN
+    SELECT RAISE(ABORT, 'accounts are never deleted; close them');
+END;
+
+CREATE TRIGGER memberships_never_deleted BEFORE DELETE ON memberships
+BEGIN
+    SELECT RAISE(ABORT, 'memberships are never deleted; revoke them');
+END;
+
+CREATE TRIGGER credentials_never_deleted BEFORE DELETE ON credentials
+BEGIN
+    SELECT RAISE(ABORT, 'credentials are never deleted; revoke them');
+END;

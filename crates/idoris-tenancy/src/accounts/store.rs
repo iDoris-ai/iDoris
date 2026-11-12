@@ -145,12 +145,19 @@ impl AccountStore {
         now: TimestampMs,
     ) -> Result<Principal, AccountStoreError> {
         self.write(|tx| {
-            tx.execute(
-                "INSERT OR IGNORE INTO principals (principal_id, status, created_at_ms, revoked_at_ms) \
-                 VALUES (?1, 'active', ?2, NULL)",
-                rusqlite::params![id.as_str(), now.0],
-            )?;
-            load_principal(tx, id)?.ok_or_else(|| AccountStoreError::not_found("principal", id.as_str()))
+            // Check, then insert, inside one `BEGIN IMMEDIATE` transaction. Not `INSERT OR IGNORE`: the
+            // database refuses every insert that would collide with an existing row (see the
+            // `*_insert_no_conflict` triggers), which is also what keeps `INSERT OR REPLACE` from
+            // reviving a revoked principal.
+            if load_principal(tx, id)?.is_none() {
+                tx.execute(
+                    "INSERT INTO principals (principal_id, status, created_at_ms, revoked_at_ms) \
+                     VALUES (?1, 'active', ?2, NULL)",
+                    rusqlite::params![id.as_str(), now.0],
+                )?;
+            }
+            load_principal(tx, id)?
+                .ok_or_else(|| AccountStoreError::not_found("principal", id.as_str()))
         })
     }
 
