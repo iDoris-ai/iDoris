@@ -7,6 +7,7 @@ pub mod form;
 pub mod grant;
 pub mod ids;
 pub mod money;
+pub mod permit;
 pub mod pricing;
 pub mod reason;
 pub mod request;
