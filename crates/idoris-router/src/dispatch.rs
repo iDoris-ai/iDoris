@@ -518,6 +518,7 @@ impl<'a> ReservationGuard<'a> {
     pub(crate) fn reserve(
         ledger: Option<&'a BudgetLedger>,
         tenant_id: Option<&'a str>,
+        identity: &budget::BudgetIdentity,
         provider_id: &str,
         estimated_cost_minor: i64,
     ) -> Result<Self, BudgetError> {
@@ -525,11 +526,16 @@ impl<'a> ReservationGuard<'a> {
             Some(ledger) => Some(budget::reserve(
                 ledger,
                 tenant_id,
+                identity,
                 provider_id,
                 estimated_cost_minor,
             )?),
             None if budget::is_paid(Some(estimated_cost_minor)) => {
-                return Err(budget::ledger_unavailable_error(tenant_id, provider_id));
+                return Err(budget::ledger_unavailable_error(
+                    tenant_id,
+                    identity,
+                    provider_id,
+                ));
             }
             None => None,
         };
@@ -851,6 +857,9 @@ pub(crate) struct LocalExecutionContext<'a> {
     budget_settled_event: Option<&'a crate::BudgetSettledEventContext>,
     /// This request alone may use the allocated budget's reserved headroom.
     headroom_breach_confirmed: bool,
+    /// Id of the virtual key that authenticated this request; `None` when no
+    /// virtual key is involved. The reservation is recorded under it (S1).
+    budget_key_id: Option<&'a str>,
 }
 
 impl<'a> LocalExecutionContext<'a> {
@@ -872,11 +881,19 @@ impl<'a> LocalExecutionContext<'a> {
             completed_event,
             budget_settled_event,
             headroom_breach_confirmed: false,
+            budget_key_id: None,
         }
     }
 }
 
 impl<'a> LocalExecutionContext<'a> {
+    /// Records this request's reservation under the authenticated virtual key
+    /// instead of the no-key placeholder (see [`budget::BudgetIdentity`]).
+    pub(crate) fn with_budget_key_id(mut self, key_id: Option<&'a str>) -> Self {
+        self.budget_key_id = key_id;
+        self
+    }
+
     pub(crate) fn with_provider_admission(mut self, admission: &'a dyn ProviderAdmission) -> Self {
         self.provider_admission = Some(admission);
         self
@@ -919,6 +936,7 @@ async fn dispatch_local_inner(
         completed_event,
         budget_settled_event,
         headroom_breach_confirmed,
+        budget_key_id,
     } = execution;
     let tenant_id = profile.tenant_id.as_deref();
     let prompt = input.prompt;
@@ -952,9 +970,14 @@ async fn dispatch_local_inner(
     let backend_model_id = backend_model_id(profile, requested_model, &selected.card)?;
     let cost = selected.card.provider.cost;
     let is_paid = budget::is_paid(Some(estimated_cost_minor));
+    // The real virtual key and the model that will actually be loaded (S1); the
+    // reservation row — and therefore its settlement — carries both.
+    let budget_identity =
+        budget::BudgetIdentity::resolve(budget_key_id, Some(&backend_model_id), &provider_id);
     let mut reservation_guard = match ReservationGuard::reserve(
         budget_ledger,
         tenant_id,
+        &budget_identity,
         &provider_id,
         estimated_cost_minor,
     ) {

@@ -5,8 +5,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use idoris_contracts::DeployMode;
-use idoris_tenancy::budget::{BudgetLedger, SpendGate};
+use idoris_tenancy::accounts::AccountStore;
+use idoris_tenancy::budget::{BudgetLedger, SeedDrift, SeedOutcome, SpendGate, TenantSeed};
 use idoris_tenancy::event_log::{EventLogError, EventLogStore, EventType, NewEvent};
+use idoris_tenancy::sqlite_conn::{ConnectionProfile, open_standard};
 use idoris_tenancy::store::{TenantRecord, TenantStore};
 use idoris_tenancy::virtual_key::store::VirtualKeyStore;
 use serde::Deserialize;
@@ -14,6 +16,7 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::budget::PERSONAL_TENANT_ID;
+use crate::startup_form::StartupForm;
 
 const DEFAULT_TENANTS_RELATIVE: &str = "config/tenants.yaml";
 
@@ -56,9 +59,22 @@ pub struct StorageBootstrap {
     /// Persistent verifier storage only; request authentication is wired separately.
     pub virtual_keys: Arc<Mutex<VirtualKeyStore>>,
     pub event_log: Arc<EventLogStore>,
+    /// Compute-service account storage (principals, memberships, payment
+    /// accounts, credentials, allocations). Opened **only** when
+    /// `IDORIS_FORM` declares the organization or cloud form; `None` for the
+    /// personal form and for every legacy tenant deployment, whose database
+    /// then never gets these tables.
+    pub accounts: Option<Arc<AccountStore>>,
 }
 
 pub fn bootstrap_process(deploy_mode: DeployMode) -> Result<StorageBootstrap, String> {
+    bootstrap_process_with_form(StartupForm::legacy(deploy_mode))
+}
+
+/// As [`bootstrap_process`], with the deployment form resolved from
+/// `IDORIS_FORM` (see [`StartupForm`]).
+pub fn bootstrap_process_with_form(startup: StartupForm) -> Result<StorageBootstrap, String> {
+    let deploy_mode = startup.deploy_mode();
     let executable =
         std::env::current_exe().map_err(|err| format!("无法定位当前可执行文件：{err}"))?;
     let parent = executable
@@ -70,7 +86,7 @@ pub fn bootstrap_process(deploy_mode: DeployMode) -> Result<StorageBootstrap, St
         None if deploy_mode == DeployMode::Tenant => Some(parent.join(DEFAULT_TENANTS_RELATIVE)),
         None => None,
     };
-    bootstrap(&db_path, config_path.as_deref(), deploy_mode)
+    bootstrap_with_form(&db_path, config_path.as_deref(), startup)
 }
 
 /// Opens only the persistent virtual-key verifier store using the same
@@ -176,28 +192,117 @@ pub(crate) fn process_db_path() -> Result<PathBuf, String> {
     }
 }
 
+/// Opens the persistent stores with the pre-S1 behaviour (no deployment form
+/// declared). Identical to [`bootstrap_with_form`] with
+/// [`StartupForm::legacy`]: the configuration file is the authority for
+/// tenants and every start prunes tenants it no longer lists.
 pub fn bootstrap(
     db_path: &Path,
     tenant_config_path: Option<&Path>,
     deploy_mode: DeployMode,
 ) -> Result<StorageBootstrap, String> {
+    bootstrap_with_form(
+        db_path,
+        tenant_config_path,
+        StartupForm::legacy(deploy_mode),
+    )
+}
+
+/// The four stores, opened either exactly as before S1 ([`ConnectionProfile::Legacy`])
+/// or with the compute-service connection settings ([`ConnectionProfile::Standard`]).
+type OpenedStores = (TenantStore, BudgetLedger, VirtualKeyStore, EventLogStore);
+
+fn open_stores(db_path: &Path, profile: ConnectionProfile) -> Result<OpenedStores, String> {
+    match profile {
+        ConnectionProfile::Legacy => {
+            let records = TenantStore::open(db_path).map_err(|err| {
+                format!("无法打开租户记录数据库 \"{}\"：{err}", db_path.display())
+            })?;
+            let budget = BudgetLedger::open(db_path)
+                .map_err(|err| format!("无法打开预算数据库 \"{}\"：{err}", db_path.display()))?;
+            // Open the verifier schema during startup so a broken key store fails closed.
+            let virtual_keys = VirtualKeyStore::open(db_path).map_err(|err| {
+                format!("无法打开虚拟 key 数据库 \"{}\"：{err}", db_path.display())
+            })?;
+            let event_log = EventLogStore::open(db_path).map_err(|err| {
+                format!("无法打开事件日志数据库 \"{}\"：{err}", db_path.display())
+            })?;
+            Ok((records, budget, virtual_keys, event_log))
+        }
+        ConnectionProfile::Standard => {
+            let standard = || {
+                open_standard(db_path)
+                    .map_err(|err| format!("无法设置数据库连接 \"{}\"：{err}", db_path.display()))
+            };
+            let records = TenantStore::new(standard()?).map_err(|err| {
+                format!("无法打开租户记录数据库 \"{}\"：{err}", db_path.display())
+            })?;
+            let budget = BudgetLedger::open_with_profile(db_path, ConnectionProfile::Standard)
+                .map_err(|err| format!("无法打开预算数据库 \"{}\"：{err}", db_path.display()))?;
+            let virtual_keys = VirtualKeyStore::new(standard()?).map_err(|err| {
+                format!("无法打开虚拟 key 数据库 \"{}\"：{err}", db_path.display())
+            })?;
+            let event_log = EventLogStore::new(standard()?).map_err(|err| {
+                format!("无法打开事件日志数据库 \"{}\"：{err}", db_path.display())
+            })?;
+            Ok((records, budget, virtual_keys, event_log))
+        }
+    }
+}
+
+/// What reconciling the tenant list with the database did, for one summary
+/// line at start-up (database-authoritative forms only).
+#[derive(Default)]
+struct SeedSummary {
+    seeded: usize,
+    adopted: usize,
+    stale: Vec<(String, SeedDrift)>,
+}
+
+/// Opens every persistent store and reconciles the tenant list.
+///
+/// - **No `IDORIS_FORM`** (legacy, and the explicit personal form): the
+///   trusted configuration file is the authority. Every listed tenant is
+///   upserted with `configure_tenant`, then `retain_tenants` revokes the
+///   configuration of tenants the file no longer lists. Byte-for-byte what
+///   start-up did before S1 — with one new refusal: a database that an
+///   organization/cloud start already initialised (`tenant_bootstrap` has
+///   rows) is not started this way, because that would overwrite its limits
+///   and delete its tenants (see
+///   `refuse_file_authority_over_a_database_authoritative_database`).
+/// - **Organization / cloud** (design §9 item 2): the database is the
+///   authority. The file only *seeds* tenants it lists that the database has
+///   never seen (`BudgetLedger::seed_tenant`); nothing is overwritten and
+///   `retain_tenants` is **not** called, so removing a tenant from the file
+///   neither deletes it nor its data. These forms also open the account store
+///   and use the standard connection settings.
+pub fn bootstrap_with_form(
+    db_path: &Path,
+    tenant_config_path: Option<&Path>,
+    startup: StartupForm,
+) -> Result<StorageBootstrap, String> {
+    let deploy_mode = startup.deploy_mode();
     if let Some(parent) = db_path.parent().filter(|path| !path.as_os_str().is_empty()) {
         std::fs::create_dir_all(parent)
             .map_err(|err| format!("无法创建数据库目录 \"{}\"：{err}", parent.display()))?;
     }
 
     let configs = load_configs(tenant_config_path, deploy_mode)?;
-    let records = TenantStore::open(db_path)
-        .map_err(|err| format!("无法打开租户记录数据库 \"{}\"：{err}", db_path.display()))?;
-    let budget = BudgetLedger::open(db_path)
-        .map_err(|err| format!("无法打开预算数据库 \"{}\"：{err}", db_path.display()))?;
-    // Open the verifier schema during startup so a broken key store fails closed.
-    let virtual_keys = VirtualKeyStore::open(db_path)
-        .map_err(|err| format!("无法打开虚拟 key 数据库 \"{}\"：{err}", db_path.display()))?;
-    let event_log = EventLogStore::open(db_path)
-        .map_err(|err| format!("无法打开事件日志数据库 \"{}\"：{err}", db_path.display()))?;
+    let (records, budget, virtual_keys, event_log) =
+        open_stores(db_path, startup.connection_profile())?;
+    if !startup.tenants_are_database_authoritative() {
+        refuse_file_authority_over_a_database_authoritative_database(&budget, db_path)?;
+    }
+    let accounts = if startup.opens_account_store() {
+        Some(Arc::new(AccountStore::open(db_path).map_err(|err| {
+            format!("无法打开账户数据库 \"{}\"：{err}", db_path.display())
+        })?))
+    } else {
+        None
+    };
 
     let mut seen = BTreeSet::new();
+    let mut summary = SeedSummary::default();
     for config in configs {
         let tenant_id = config.tenant_id.trim();
         if tenant_id.is_empty() {
@@ -206,25 +311,48 @@ pub fn bootstrap(
         if !seen.insert(tenant_id.to_string()) {
             return Err(format!("租户配置重复 tenant_id {tenant_id:?}"));
         }
-        budget
-            .configure_tenant(
-                tenant_id,
-                config.limit_minor,
-                &config.billing_timezone,
-                config.scope.into(),
-            )
-            .map_err(|err| format!("租户 {tenant_id:?} 配置无效：{err}"))?;
+        if startup.tenants_are_database_authoritative() {
+            let report = budget
+                .seed_tenant(&TenantSeed {
+                    tenant_id: tenant_id.to_string(),
+                    limit_minor: config.limit_minor,
+                    billing_timezone: config.billing_timezone.clone(),
+                    gate: config.scope.into(),
+                })
+                .map_err(|err| format!("租户 {tenant_id:?} 配置无效：{err}"))?;
+            match report.outcome {
+                SeedOutcome::Seeded => summary.seeded += 1,
+                SeedOutcome::Adopted => summary.adopted += 1,
+                SeedOutcome::Kept => {}
+            }
+            if report.drift != SeedDrift::InSync {
+                summary.stale.push((tenant_id.to_string(), report.drift));
+            }
+        } else {
+            budget
+                .configure_tenant(
+                    tenant_id,
+                    config.limit_minor,
+                    &config.billing_timezone,
+                    config.scope.into(),
+                )
+                .map_err(|err| format!("租户 {tenant_id:?} 配置无效：{err}"))?;
+        }
     }
     if deploy_mode == DeployMode::Personal && !seen.contains(PERSONAL_TENANT_ID) {
         return Err(format!(
             "personal 模式必须配置固定内部租户 {PERSONAL_TENANT_ID:?}"
         ));
     }
-    let revoked = budget
-        .retain_tenants(&seen)
-        .map_err(|err| format!("无法对账可信租户清单：{err}"))?;
-    if revoked > 0 {
-        eprintln!("idoris: 已撤销 {revoked} 个不再存在于可信配置中的租户");
+    if startup.prunes_unlisted_tenants_on_startup() {
+        let revoked = budget
+            .retain_tenants(&seen)
+            .map_err(|err| format!("无法对账可信租户清单：{err}"))?;
+        if revoked > 0 {
+            eprintln!("idoris: 已撤销 {revoked} 个不再存在于可信配置中的租户");
+        }
+    } else {
+        report_seed_summary(&summary);
     }
 
     let migration = backfill_legacy_audits(&records, &event_log)?;
@@ -240,7 +368,58 @@ pub fn bootstrap(
         budget: Arc::new(budget),
         virtual_keys: Arc::new(Mutex::new(virtual_keys)),
         event_log: Arc::new(event_log),
+        accounts,
     })
+}
+
+/// A database that an organization or cloud start has initialised (`tenant_bootstrap` has rows) must not be
+/// started file-authoritatively. That path overwrites every listed tenant's limit with the file's and revokes
+/// the tenants the file does not list, which is exactly what the database-authoritative forms exist to prevent.
+/// The usual way to get here is a lost `IDORIS_FORM` (a service-unit edit, a copied environment), so fail
+/// closed, before anything is written, and say how to fix it.
+///
+/// Databases that only ever ran the personal form or a legacy tenant start have no markers and are unaffected.
+fn refuse_file_authority_over_a_database_authoritative_database(
+    budget: &BudgetLedger,
+    db_path: &Path,
+) -> Result<(), String> {
+    let seeded = budget
+        .seeded_tenant_count()
+        .map_err(|err| format!("无法读取租户初始化记录：{err}"))?;
+    if seeded == 0 {
+        return Ok(());
+    }
+    Err(format!(
+        "数据库 \"{}\" 已经按组织/云形态初始化过 {seeded} 个租户（tenant_bootstrap 表里有记录），\
+         但这次启动没有声明该形态。继续按配置文件为准启动，会用配置文件覆盖数据库里的租户限额，\
+         并删除配置文件里没有列出的租户。请设置 IDORIS_FORM=organization（或 cloud），\
+         并保持 IDORIS_DEPLOY_MODE=tenant；如果确实要回到按配置文件为准的旧方式，\
+         请先备份数据库，再清空 tenant_bootstrap 表（DELETE FROM tenant_bootstrap）后重新启动",
+        db_path.display()
+    ))
+}
+
+/// One line when this start wrote anything, and one warning per tenant whose
+/// database row differs from (or is missing relative to) the file. The usual
+/// restart, where nothing was seeded and everything agrees, prints nothing.
+fn report_seed_summary(summary: &SeedSummary) {
+    if summary.seeded > 0 || summary.adopted > 0 {
+        eprintln!(
+            "idoris: 租户初始化：从配置文件新写入 {} 个，沿用数据库里已有配置的 {} 个（之后以数据库为准，不再按配置文件删除租户）",
+            summary.seeded, summary.adopted
+        );
+    }
+    for (tenant_id, drift) in &summary.stale {
+        match drift {
+            SeedDrift::Changed => eprintln!(
+                "idoris: 警告：租户 {tenant_id:?} 在数据库里的配置与配置文件不同，以数据库为准（配置文件只在第一次初始化时使用）"
+            ),
+            SeedDrift::MissingInDb => eprintln!(
+                "idoris: 警告：租户 {tenant_id:?} 在配置文件里，但数据库里已没有它的配置；配置文件不会把它加回来"
+            ),
+            SeedDrift::InSync => {}
+        }
+    }
 }
 
 #[derive(Default, Debug, PartialEq, Eq)]
@@ -862,5 +1041,409 @@ mod tests {
             Err(BudgetError::NotConfigured { .. })
         ));
         assert!(reopened.budget.tenant_readview("acme").is_ok());
+    }
+
+    // ------------------------------------------------------------------
+    // S1: deployment form (`IDORIS_FORM`) and database-authoritative tenants.
+    // Every test below has a control that runs the same sequence through the
+    // legacy path, so a pass proves the *form switch* made the difference.
+    // ------------------------------------------------------------------
+
+    use crate::startup_form::StartupForm;
+    use idoris_compute_contracts::form::DeploymentForm;
+
+    fn tenants_yaml(entries: &[(&str, i64)]) -> String {
+        let mut out = String::from("tenants:\n");
+        for (tenant, limit) in entries {
+            out.push_str(&format!(
+                "  - tenant_id: {tenant}\n    limit_minor: {limit}\n    billing_timezone: UTC\n    scope: all\n"
+            ));
+        }
+        out
+    }
+
+    fn form(deploy_mode: DeployMode, form: DeploymentForm) -> StartupForm {
+        StartupForm::declared(deploy_mode, form).unwrap()
+    }
+
+    fn settle_some_spend(storage: &StorageBootstrap, tenant: &str, key: &str, spent: i64) {
+        let scope = BudgetScope::new(tenant, key, "provider", "model");
+        let id = storage.budget.reserve(&scope, Price::Known(spent)).unwrap();
+        storage.budget.settle(tenant, &id, spent).unwrap();
+    }
+
+    #[test]
+    fn organization_and_cloud_keep_a_tenant_removed_from_the_file_together_with_its_data() {
+        for target in [DeploymentForm::Organization, DeploymentForm::Cloud] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let db = dir.path().join("tenant.sqlite3");
+            let config = dir.path().join("tenants.yaml");
+            std::fs::write(&config, tenants_yaml(&[("acme", 1_000), ("beta", 1_000)])).unwrap();
+            let startup = form(DeployMode::Tenant, target);
+
+            let first = bootstrap_with_form(&db, Some(&config), startup).unwrap();
+            settle_some_spend(&first, "beta", "vk_beta", 250);
+            drop(first);
+
+            // The file no longer lists beta; restart twice.
+            std::fs::write(&config, tenants_yaml(&[("acme", 1_000)])).unwrap();
+            for round in 0..2 {
+                let reopened = bootstrap_with_form(&db, Some(&config), startup).unwrap();
+                let view = reopened
+                    .budget
+                    .tenant_readview("beta")
+                    .unwrap_or_else(|err| {
+                        panic!("{target:?} round {round}: beta must survive a restart: {err}")
+                    });
+                assert_eq!((view.limit_minor, view.spent_minor), (1_000, 250));
+                // beta can still spend; the data and the configuration are both still there.
+                let scope = BudgetScope::new("beta", "vk_beta", "provider", "model");
+                reopened.budget.reserve(&scope, Price::Known(1)).unwrap();
+                assert!(reopened.budget.tenant_readview("acme").is_ok());
+            }
+        }
+    }
+
+    #[test]
+    fn the_same_sequence_through_the_legacy_path_still_revokes_the_removed_tenant() {
+        // Control for the test above: only the form switch differs.
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = dir.path().join("tenant.sqlite3");
+        let config = dir.path().join("tenants.yaml");
+        std::fs::write(&config, tenants_yaml(&[("acme", 1_000), ("beta", 1_000)])).unwrap();
+        let first = bootstrap(&db, Some(&config), DeployMode::Tenant).unwrap();
+        settle_some_spend(&first, "beta", "vk_beta", 250);
+        drop(first);
+        std::fs::write(&config, tenants_yaml(&[("acme", 1_000)])).unwrap();
+        let reopened = bootstrap(&db, Some(&config), DeployMode::Tenant).unwrap();
+        assert!(matches!(
+            reopened.budget.tenant_readview("beta"),
+            Err(BudgetError::TenantNotConfigured { .. })
+        ));
+        // `StartupForm::legacy` is the same thing spelled out.
+        drop(reopened);
+        let legacy =
+            bootstrap_with_form(&db, Some(&config), StartupForm::legacy(DeployMode::Tenant))
+                .unwrap();
+        assert!(legacy.budget.tenant_readview("beta").is_err());
+    }
+
+    #[test]
+    fn an_explicit_personal_form_still_prunes_like_the_default_personal_start() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = dir.path().join("personal.sqlite3");
+        let config = dir.path().join("tenants.yaml");
+        std::fs::write(
+            &config,
+            tenants_yaml(&[(PERSONAL_TENANT_ID, 1_000), ("stray", 1)]),
+        )
+        .unwrap();
+        let startup = form(DeployMode::Personal, DeploymentForm::Personal);
+        drop(bootstrap_with_form(&db, Some(&config), startup).unwrap());
+        std::fs::write(&config, tenants_yaml(&[(PERSONAL_TENANT_ID, 1_000)])).unwrap();
+        let reopened = bootstrap_with_form(&db, Some(&config), startup).unwrap();
+        assert!(matches!(
+            reopened.budget.tenant_readview("stray"),
+            Err(BudgetError::TenantNotConfigured { .. })
+        ));
+        assert!(reopened.accounts.is_none());
+    }
+
+    #[test]
+    fn the_database_is_the_authority_after_the_first_start() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = dir.path().join("tenant.sqlite3");
+        let config = dir.path().join("tenants.yaml");
+        std::fs::write(&config, tenants_yaml(&[("acme", 100)])).unwrap();
+        let startup = form(DeployMode::Tenant, DeploymentForm::Organization);
+        let first = bootstrap_with_form(&db, Some(&config), startup).unwrap();
+        // An administrator raises the limit in the database.
+        first
+            .budget
+            .configure_tenant("acme", 999, "UTC", SpendGate::All)
+            .unwrap();
+        drop(first);
+        // The file still says 100; the restart must not take it back.
+        let reopened = bootstrap_with_form(&db, Some(&config), startup).unwrap();
+        assert_eq!(
+            reopened.budget.tenant_readview("acme").unwrap().limit_minor,
+            999
+        );
+        drop(reopened);
+        // Control: on a database that never saw the organization form, the legacy path lets the file
+        // win on every start (the same sequence, only the form switch differs).
+        let control_dir = tempfile::TempDir::new().unwrap();
+        let control_db = control_dir.path().join("tenant.sqlite3");
+        let first = bootstrap(&control_db, Some(&config), DeployMode::Tenant).unwrap();
+        first
+            .budget
+            .configure_tenant("acme", 999, "UTC", SpendGate::All)
+            .unwrap();
+        drop(first);
+        let legacy = bootstrap(&control_db, Some(&config), DeployMode::Tenant).unwrap();
+        assert_eq!(
+            legacy.budget.tenant_readview("acme").unwrap().limit_minor,
+            100
+        );
+    }
+
+    #[test]
+    fn a_database_initialised_by_the_organization_form_refuses_a_start_that_lost_the_form() {
+        for target in [DeploymentForm::Organization, DeploymentForm::Cloud] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let db = dir.path().join("tenant.sqlite3");
+            let config = dir.path().join("tenants.yaml");
+            std::fs::write(&config, tenants_yaml(&[("acme", 100), ("beta", 100)])).unwrap();
+            let startup = form(DeployMode::Tenant, target);
+            let first = bootstrap_with_form(&db, Some(&config), startup).unwrap();
+            // An administrator raises acme's limit in the database; the file drops beta.
+            first
+                .budget
+                .configure_tenant("acme", 999, "UTC", SpendGate::All)
+                .unwrap();
+            drop(first);
+            std::fs::write(&config, tenants_yaml(&[("acme", 100)])).unwrap();
+
+            // The same database started without the form (legacy tenant start) or as personal is
+            // refused, before anything is written: the file-authoritative path would lower acme to
+            // 100 and revoke beta.
+            let refusals = [
+                bootstrap(&db, Some(&config), DeployMode::Tenant),
+                bootstrap_with_form(&db, Some(&config), StartupForm::legacy(DeployMode::Tenant)),
+                bootstrap(&db, None, DeployMode::Personal),
+                bootstrap_with_form(
+                    &db,
+                    None,
+                    form(DeployMode::Personal, DeploymentForm::Personal),
+                ),
+            ];
+            for refusal in refusals {
+                let err = refusal
+                    .err()
+                    .unwrap_or_else(|| panic!("{target:?}: a start that lost the form must fail"));
+                assert!(
+                    err.contains("IDORIS_FORM=organization")
+                        && err.contains("tenant_bootstrap")
+                        && err.contains("2 个租户"),
+                    "{err}"
+                );
+            }
+            let rows = |db: &Path| -> Vec<(String, i64)> {
+                let conn = Connection::open(db).unwrap();
+                let mut stmt = conn
+                    .prepare("SELECT tenant_id, limit_minor FROM tenant_config ORDER BY tenant_id")
+                    .unwrap();
+                stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                    .unwrap()
+                    .collect::<Result<_, _>>()
+                    .unwrap()
+            };
+            assert_eq!(
+                rows(&db),
+                [("acme".to_string(), 999), ("beta".to_string(), 100)],
+                "{target:?}: the refused starts must not have touched a thing"
+            );
+
+            // The declared form still starts, and the database is still the authority.
+            let again = bootstrap_with_form(&db, Some(&config), startup).unwrap();
+            assert_eq!(
+                again.budget.tenant_readview("acme").unwrap().limit_minor,
+                999
+            );
+            assert!(again.budget.tenant_readview("beta").is_ok());
+            drop(again);
+
+            // The documented way back to the file-authoritative start: clear the markers.
+            Connection::open(&db)
+                .unwrap()
+                .execute("DELETE FROM tenant_bootstrap", [])
+                .unwrap();
+            let legacy = bootstrap(&db, Some(&config), DeployMode::Tenant).unwrap();
+            assert_eq!(
+                legacy.budget.tenant_readview("acme").unwrap().limit_minor,
+                100
+            );
+            assert!(legacy.budget.tenant_readview("beta").is_err());
+        }
+    }
+
+    #[test]
+    fn databases_that_never_ran_the_organization_form_start_legacy_as_before() {
+        // No markers: the guard stays out of the way for personal and legacy tenant databases, on
+        // every restart.
+        let dir = tempfile::TempDir::new().unwrap();
+        let tenant_db = dir.path().join("tenant.sqlite3");
+        let personal_db = dir.path().join("personal.sqlite3");
+        let config = dir.path().join("tenants.yaml");
+        std::fs::write(&config, tenants_yaml(&[("acme", 100)])).unwrap();
+        for _ in 0..3 {
+            let tenant = bootstrap(&tenant_db, Some(&config), DeployMode::Tenant).unwrap();
+            assert_eq!(tenant.budget.seeded_tenant_count().unwrap(), 0);
+            let personal = bootstrap(&personal_db, None, DeployMode::Personal).unwrap();
+            assert_eq!(personal.budget.seeded_tenant_count().unwrap(), 0);
+        }
+    }
+
+    #[test]
+    fn a_tenant_deleted_from_the_database_is_not_brought_back_by_the_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = dir.path().join("tenant.sqlite3");
+        let config = dir.path().join("tenants.yaml");
+        std::fs::write(&config, tenants_yaml(&[("acme", 100), ("beta", 100)])).unwrap();
+        let startup = form(DeployMode::Tenant, DeploymentForm::Cloud);
+        drop(bootstrap_with_form(&db, Some(&config), startup).unwrap());
+        Connection::open(&db)
+            .unwrap()
+            .execute("DELETE FROM tenant_config WHERE tenant_id = 'beta'", [])
+            .unwrap();
+        let reopened = bootstrap_with_form(&db, Some(&config), startup).unwrap();
+        assert!(matches!(
+            reopened.budget.tenant_readview("beta"),
+            Err(BudgetError::TenantNotConfigured { .. })
+        ));
+        assert!(reopened.budget.tenant_readview("acme").is_ok());
+    }
+
+    #[test]
+    fn switching_an_existing_tenant_database_to_the_organization_form_adopts_it_unchanged() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = dir.path().join("tenant.sqlite3");
+        let config = dir.path().join("tenants.yaml");
+        std::fs::write(&config, tenants_yaml(&[("acme", 100), ("beta", 100)])).unwrap();
+        // Written by the pre-S1 start-up (no IDORIS_FORM).
+        let legacy = bootstrap(&db, Some(&config), DeployMode::Tenant).unwrap();
+        settle_some_spend(&legacy, "acme", "default", 40);
+        drop(legacy);
+        // Now the operator declares the organization form; the file disagrees about acme and
+        // no longer lists beta.
+        std::fs::write(&config, tenants_yaml(&[("acme", 555), ("gamma", 77)])).unwrap();
+        let startup = form(DeployMode::Tenant, DeploymentForm::Organization);
+        let adopted = bootstrap_with_form(&db, Some(&config), startup).unwrap();
+        let acme = adopted.budget.tenant_readview("acme").unwrap();
+        assert_eq!(
+            (acme.limit_minor, acme.spent_minor),
+            (100, 40),
+            "the database row and its history stay"
+        );
+        assert!(
+            adopted.budget.tenant_readview("beta").is_ok(),
+            "beta is not pruned"
+        );
+        assert_eq!(
+            adopted.budget.tenant_readview("gamma").unwrap().limit_minor,
+            77
+        );
+    }
+
+    #[test]
+    fn organization_start_uses_standard_connections_and_opens_the_account_store() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = dir.path().join("tenant.sqlite3");
+        let config = dir.path().join("tenants.yaml");
+        std::fs::write(&config, tenants_yaml(&[("acme", 100)])).unwrap();
+        let startup = form(DeployMode::Tenant, DeploymentForm::Organization);
+        let opened = bootstrap_with_form(&db, Some(&config), startup).unwrap();
+        let standard = idoris_tenancy::sqlite_conn::PragmaSnapshot {
+            journal_mode: "wal".into(),
+            busy_timeout_ms: 5_000,
+            foreign_keys: true,
+        };
+        assert_eq!(
+            opened.records.lock().unwrap().connection_pragmas().unwrap(),
+            standard
+        );
+        assert_eq!(opened.budget.connection_pragmas().unwrap(), standard);
+        assert_eq!(
+            opened
+                .virtual_keys
+                .lock()
+                .unwrap()
+                .connection_pragmas()
+                .unwrap(),
+            standard
+        );
+        assert_eq!(opened.event_log.connection_pragmas().unwrap(), standard);
+        // The organization form opens the account store.
+        let accounts = opened.accounts.as_ref().unwrap();
+        assert_eq!(accounts.connection_pragmas().unwrap(), standard);
+        let tables: i64 = Connection::open(&db)
+            .unwrap()
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ('accounts','principals','memberships','credentials','allocations')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(tables, 5);
+    }
+
+    #[test]
+    fn legacy_starts_never_open_the_account_store_or_create_its_tables() {
+        for (deploy_mode, with_config) in
+            [(DeployMode::Personal, false), (DeployMode::Tenant, true)]
+        {
+            let dir = tempfile::TempDir::new().unwrap();
+            let db = dir.path().join("legacy.sqlite3");
+            let config = dir.path().join("tenants.yaml");
+            std::fs::write(&config, tenants_yaml(&[("acme", 100)])).unwrap();
+            let opened =
+                bootstrap(&db, with_config.then_some(config.as_path()), deploy_mode).unwrap();
+            assert!(opened.accounts.is_none(), "{deploy_mode:?}");
+            let conn = Connection::open(&db).unwrap();
+            let account_tables: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE name IN \
+                     ('accounts','principals','memberships','credentials','credential_admin_scopes','allocations','account_schema_migrations')",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                account_tables, 0,
+                "{deploy_mode:?}: no compute-service tables in a legacy database"
+            );
+            // The additive ledger migration exists but the legacy path never writes to it.
+            let markers: i64 = conn
+                .query_row("SELECT count(*) FROM tenant_bootstrap", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(markers, 0, "{deploy_mode:?}");
+            // And it keeps exactly the pre-S1 connection settings: WAL and the 5 s busy timeout.
+            let ledger = opened.budget.connection_pragmas().unwrap();
+            assert_eq!(
+                (ledger.journal_mode.as_str(), ledger.busy_timeout_ms),
+                ("wal", 5_000)
+            );
+        }
+    }
+
+    #[test]
+    fn a_broken_tenant_file_stops_the_organization_form_too() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = dir.path().join("tenant.sqlite3");
+        let config = dir.path().join("tenants.yaml");
+        let startup = form(DeployMode::Tenant, DeploymentForm::Organization);
+        // missing file
+        let err = bootstrap_with_form(&db, Some(&config), startup)
+            .err()
+            .unwrap();
+        assert!(err.contains("无法读取租户配置"), "{err}");
+        // typo in a time zone: fails even for a tenant that is already seeded
+        std::fs::write(&config, tenants_yaml(&[("acme", 100)])).unwrap();
+        drop(bootstrap_with_form(&db, Some(&config), startup).unwrap());
+        std::fs::write(
+            &config,
+            "tenants:\n  - tenant_id: acme\n    limit_minor: 100\n    billing_timezone: Not/AZone\n",
+        )
+        .unwrap();
+        let err = bootstrap_with_form(&db, Some(&config), startup)
+            .err()
+            .unwrap();
+        assert!(err.contains("配置无效"), "{err}");
+        // duplicates are rejected as before
+        std::fs::write(&config, tenants_yaml(&[("acme", 1), ("acme", 2)])).unwrap();
+        let err = bootstrap_with_form(&db, Some(&config), startup)
+            .err()
+            .unwrap();
+        assert!(err.contains("租户配置重复"), "{err}");
     }
 }

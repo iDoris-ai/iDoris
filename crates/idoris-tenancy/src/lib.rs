@@ -32,6 +32,21 @@ pub mod event_log;
 /// non-secret scope metadata.
 pub mod virtual_key;
 
+/// Shared SQLite connection setup for the compute-service forms (S1):
+/// `journal_mode=WAL`, an explicit `busy_timeout` and `foreign_keys=ON`,
+/// applied only to the organization and cloud forms; personal and legacy
+/// tenant deployments keep their connections exactly as they were.
+pub mod sqlite_conn;
+
+/// Account storage for the compute service (S1): principals, memberships,
+/// payment accounts (the allocation-delegation tree), credentials and
+/// allocations, stored as the frozen S0 contract types. Opened only by the
+/// organization and cloud forms.
+pub mod accounts;
+
+#[cfg(test)]
+pub(crate) mod test_support;
+
 /// idoris.ai/api 计算服务 S4：每次请求的每次尝试、转移日志与结算分录（SQLite，只追加），
 /// 持久化 S0 契约（`idoris-compute-contracts`）的状态机与结算计划。
 pub mod attempts;

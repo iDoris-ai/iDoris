@@ -71,6 +71,8 @@ pub mod key_issue;
 pub mod key_manage;
 /// Stable four-way routing/audit reason taxonomy.
 pub mod reason;
+/// Deployment form (`IDORIS_FORM`) wired into start-up (compute service S1).
+pub mod startup_form;
 /// Persistent record/budget storage bootstrap (B1 task18).
 pub mod storage;
 mod usage;
@@ -804,9 +806,19 @@ async fn embeddings(
             "paid embeddings are unavailable until embeddings usage settlement is defined",
         );
     }
+    // Recorded under the real virtual key (from the authenticated identity the middleware attached)
+    // and the model forwarded upstream (S1).
+    let budget_identity = budget::BudgetIdentity::for_request(
+        remote_identity
+            .as_ref()
+            .map(|identity| identity.0.key_id.as_str()),
+        &value,
+        &selected.card.provider.id,
+    );
     let _reservation = match dispatch::ReservationGuard::reserve(
         state.budget_ledger.as_deref(),
         parsed.tenant_id.as_deref(),
+        &budget_identity,
         &selected.card.provider.id,
         selected.estimated_cost_minor,
     ) {
@@ -1039,9 +1051,19 @@ async fn rerank(
             "paid rerank is unavailable until rerank usage settlement is defined",
         );
     }
+    // Recorded under the real virtual key (from the authenticated identity the middleware attached)
+    // and the model forwarded upstream (S1).
+    let budget_identity = budget::BudgetIdentity::for_request(
+        remote_identity
+            .as_ref()
+            .map(|identity| identity.0.key_id.as_str()),
+        &value,
+        &selected.card.provider.id,
+    );
     let _reservation = match dispatch::ReservationGuard::reserve(
         state.budget_ledger.as_deref(),
         parsed.tenant_id.as_deref(),
+        &budget_identity,
         &selected.card.provider.id,
         selected.estimated_cost_minor,
     ) {
@@ -1288,9 +1310,19 @@ async fn messages(
             "paid messages are unavailable until Anthropic usage settlement is defined",
         );
     }
+    // Recorded under the real virtual key (from the authenticated identity the middleware attached)
+    // and the model forwarded upstream (S1).
+    let budget_identity = budget::BudgetIdentity::for_request(
+        remote_identity
+            .as_ref()
+            .map(|identity| identity.0.key_id.as_str()),
+        &value,
+        &selected.card.provider.id,
+    );
     let _reservation = match dispatch::ReservationGuard::reserve(
         state.budget_ledger.as_deref(),
         parsed.tenant_id.as_deref(),
+        &budget_identity,
         &selected.card.provider.id,
         selected.estimated_cost_minor,
     ) {
@@ -2509,6 +2541,9 @@ async fn chat_completions(
     };
     let authorization_present = headers.contains_key(axum::http::header::AUTHORIZATION);
     let dev_no_key_request = state.dev_no_key_enabled && !authorization_present;
+    // The id of the virtual key that authenticated this request (S1): the budget records the
+    // reservation under it instead of a placeholder. `None` = no virtual key was involved.
+    let mut budget_key_id: Option<String> = None;
     if dev_no_key_request {
         if parsed.task.privacy.unwrap_or(PrivacyClass::LocalOnly) != PrivacyClass::LocalOnly {
             return dev_no_key_scope_response();
@@ -2521,6 +2556,7 @@ async fn chat_completions(
         if let Err(error) = auth::enforce_scope(&identity, &parsed) {
             return virtual_key_scope_response(error);
         }
+        budget_key_id = Some(identity.key_id);
     } else if state.dev_no_key_enabled && authorization_present {
         return virtual_key_unauthorized_response();
     }
@@ -2884,6 +2920,7 @@ async fn chat_completions(
                     dispatched: dispatched_event_context.as_ref(),
                     completed: completed_event_context.as_ref(),
                 },
+                budget_key_id.as_deref(),
             )
             .await;
         }
@@ -2946,6 +2983,7 @@ async fn chat_completions(
             )
             .with_native(&native)
             .with_headroom_breach_confirmed(headroom_breach_confirmed(&headers))
+            .with_budget_key_id(budget_key_id.as_deref())
             .with_provider_admission(state.proxy.as_ref()),
             &parsed,
             dispatch::DispatchInput::with_model(model, &prompt).with_affinity(affinity_key),
@@ -3041,10 +3079,15 @@ async fn chat_via_proxy(
     body_value: &serde_json::Value,
     record_id: &str,
     events: ProxyEventContexts<'_>,
+    budget_key_id: Option<&str>,
 ) -> Response {
+    // Record the reservation under the real virtual key and the model forwarded upstream (S1).
+    let budget_identity =
+        budget::BudgetIdentity::for_request(budget_key_id, body_value, &selected.card.provider.id);
     let proxy_budget = match proxy_budget::ProxyBudget::new(
         state.budget_ledger.as_deref(),
         parsed.tenant_id.as_deref(),
+        budget_identity,
         &selected.card.provider.id,
         selected.estimated_cost_minor,
     ) {
@@ -3831,6 +3874,9 @@ mod kill_switch_wiring_tests;
 
 #[cfg(test)]
 mod budget_concurrency_wiring_tests;
+
+#[cfg(test)]
+mod budget_identity_wiring_tests;
 
 #[cfg(test)]
 mod breaker_wiring_tests;

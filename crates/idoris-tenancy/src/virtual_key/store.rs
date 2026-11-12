@@ -50,6 +50,14 @@ impl VirtualKeyStore {
         Ok(Self { conn })
     }
 
+    /// This connection's `journal_mode` / `busy_timeout` / `foreign_keys`, for
+    /// assertions and diagnostics (see [`crate::sqlite_conn`]).
+    pub fn connection_pragmas(
+        &self,
+    ) -> Result<crate::sqlite_conn::PragmaSnapshot, VirtualKeyStoreError> {
+        crate::sqlite_conn::snapshot(&self.conn).map_err(VirtualKeyStoreError::from)
+    }
+
     /// Inserts an active virtual-key verifier. Plaintext key material never
     /// crosses this API boundary.
     pub fn insert_active(
