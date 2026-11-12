@@ -2516,3 +2516,49 @@ fn the_full_directory_reads_back_through_the_contract_validation() {
     let tree: AccountTree = env.store.load_tree().unwrap().unwrap();
     assert_eq!(tree.root().id, aid("plat"));
 }
+
+// ================================================================ 打开、等锁、空读
+
+#[test]
+fn opening_a_store_somewhere_that_cannot_hold_a_database_fails_loudly() {
+    let dir = TempDir::new("open-fail");
+    // 父目录不存在
+    assert!(AccountStore::open(dir.db("no/such/dir/accounts.sqlite3")).is_err());
+    // 路径本身是个目录
+    assert!(AccountStore::open(dir.db("")).is_err());
+    // 对照：正常的路径可以
+    assert!(AccountStore::open(dir.db("fine.sqlite3")).is_ok());
+}
+
+#[test]
+fn a_store_honours_an_explicit_busy_timeout_and_reports_busy_instead_of_hanging() {
+    let Env { _dir, path, store } = env();
+    drop(store);
+    let short =
+        AccountStore::open_with_busy_timeout(&path, std::time::Duration::from_millis(50)).unwrap();
+    assert_eq!(short.connection_pragmas().unwrap().busy_timeout_ms, 50);
+    // 另一条连接占着写锁：写入在 50 毫秒后返回 Busy，而不是无限等或报成别的错误
+    let holder = Connection::open(&path).unwrap();
+    holder.execute_batch("BEGIN IMMEDIATE").unwrap();
+    match short.ensure_principal(&pid("p-busy"), now()) {
+        Err(AccountStoreError::Busy) => {}
+        other => panic!("{other:?}"),
+    }
+    // 读不受写锁影响（WAL）
+    assert!(short.get_principal(&pid("p-busy")).unwrap().is_none());
+    // 对照：锁放掉以后同一个调用成功
+    holder.execute_batch("ROLLBACK").unwrap();
+    assert!(short.ensure_principal(&pid("p-busy"), now()).is_ok());
+}
+
+#[test]
+fn reads_for_things_that_do_not_exist_or_have_no_rows_are_empty_not_errors() {
+    let env = seeded();
+    let s = &env.store;
+    assert!(s.children(&aid("stu-1")).unwrap().is_empty()); // 叶子没有子账户
+    assert!(s.children(&aid("ghost")).unwrap().is_empty());
+    assert!(s.allocations_into(&aid("org-b")).unwrap().is_empty());
+    assert!(s.allocations_from(&aid("plat")).unwrap().is_empty());
+    assert!(s.get_allocation(&alid("ghost")).unwrap().is_none());
+    assert!(s.memberships_of(&pid("ghost")).unwrap().is_empty());
+}
