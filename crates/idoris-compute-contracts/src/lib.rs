@@ -30,6 +30,7 @@
 //! | [`request`] | §6 | `Request`（一组尝试、重新准入、发布边界）、`settle_attempts`（谁付多少）、`split_overage` |
 //! | [`permit`] | §8 | 端点级许可表：YAML schema、加载校验、`select_compliant` 硬约束过滤 |
 //! | [`form`] | §9 | `DeploymentForm`（个人 / 组织 / 云）及能力开关，与既有 `deploy_mode` 共存 |
+//! | [`safety`] | §7 | S6 新增（加法，没有改动上面任何一个字符串）：儿童安全的 3 个稳定原因码、拦截类别、检查阶段、「检查没能给出结论」的原因 |
 //!
 //! # 全 crate 的约定
 //!
@@ -83,7 +84,8 @@
 //! - **S5**（云入口）：`credential::resolve_payment_context` 得到付款上下文，原因码映射见
 //!   `ResolveError::reason_code`；形态判定用 `form`。
 //! - **S6**（儿童安全）：`edu` 租户的 `TenantDataPolicy` 含 `child_edu`；本 crate **不**强制「edu 一律非流式」
-//!   与安全检查，那是 S6 的契约，新增原因码只做加法。
+//!   与安全检查（那是路由层 `idoris-router::cloud::safety` 的事），只提供 S6 新增的稳定字符串：
+//!   [`safety::SafetyReasonCode`] / [`safety::SafetyCategory`] / [`safety::SafetyUnavailableCause`]，纯加法。
 //! - **S7**（云端档适配器）：`form::DeploymentForm`、`request::Request`。
 //!
 //! 命名提醒：`pricing::Price` 与 `idoris_tenancy::budget::Price` 同名但无关；同时引用时请用模块路径。
@@ -129,5 +131,6 @@ pub mod pricing;
 pub mod reason;
 pub mod request;
 pub mod reserve;
+pub mod safety;
 #[cfg(test)]
 pub(crate) mod test_support;

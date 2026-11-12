@@ -1,0 +1,32 @@
+{
+  "categories": [
+    "self_harm",
+    "adult_content",
+    "dangerous_act",
+    "pii_solicit",
+    "jailbreak",
+    "pii_disclosure",
+    "abusive_language",
+    "unsupported_content",
+    "other"
+  ],
+  "codes": [
+    "safety_input_blocked",
+    "safety_output_blocked",
+    "safety_unavailable"
+  ],
+  "stages": [
+    "input",
+    "output"
+  ],
+  "unavailable_causes": [
+    "not_configured",
+    "timeout",
+    "service_error",
+    "bad_response",
+    "no_compliant_checker",
+    "too_large",
+    "malformed",
+    "internal"
+  ]
+}
