@@ -8,12 +8,18 @@
 //!
 //! | 情形 | 状态码 | `error.type` / 头 |
 //! |---|---|---|
-//! | 成功（非流式） | 200 | 上游响应体原样；有降级时带 `X-iDoris-Reason` 与 `X-iDoris-Degraded: true` |
+//! | 成功（非流式），正常 | 200 | 上游响应体原样；`X-iDoris-Tier: normal`，没有原因码 |
+//! | 成功，压低了 `max_tokens`（第 2 级） | 200 | `X-iDoris-Reason: budget_degraded`、`X-iDoris-Degraded: true`、`X-iDoris-Tier: degraded`、`X-iDoris-Max-Tokens: <发给上游的值>` |
+//! | 成功，宽限一轮（第 3 级） | 200 | `X-iDoris-Reason: grace_used`、`X-iDoris-Tier: grace`（担保人在账本里有一条可查询的告警） |
 //! | 成功（流式） | 200 `text/event-stream` | 同上；上游的流内 usage 块只在客户端要了 `include_usage` 时转发 |
 //! | 没有合规候选 | 503 | `no_compliant_endpoint` |
-//! | 准入拒绝 | 402 `budget_exhausted`；429 `rate_limited` / `in_flight_limited` / `subsidy_pool_exhausted`；其余 403 | 原因码 |
+//! | 准入拒绝：钱不够（第 4 级） | 402 | `budget_exhausted`；`X-iDoris-Reason: budget_exhausted`、`X-iDoris-Tier: exhausted` |
+//! | 准入拒绝：平台保护 | 429 `rate_limited` / `in_flight_limited` / `subsidy_pool_exhausted`；其余 403 | 原因码（`X-iDoris-Reason`），没有 `X-iDoris-Tier`（不在四级阶梯上） |
 //! | 所有上游都失败 | 502（超时 504） | `upstream_error`，`reason_code` 是最后一次失败的稳定代码 |
 //! | 流中途失败（首字节之后） | 状态码已经是 200 | 流以一个 `{"error":{"type":"upstream_error",...}}` 事件结束，**没有** `[DONE]` |
+//!
+//! 体验分级的头全部列在 [`EXPOSED_HEADERS`] 里，并写进每个带它们的响应的 `Access-Control-Expose-Headers`，浏览器的 JS
+//! 读得到（设计稿 §5，评审 L2）；跨域放行本身（`Access-Control-Allow-Origin`、预检）是云入口 S5 的事。
 //!
 //! edu（`child_edu`）租户在 P0 **一律非流式**（设计稿 §6）：流式请求在任何上游调用之前就被拒绝
 //! （400 `streaming_not_allowed`）。完整输出检查本身是 S6 的事。
@@ -25,7 +31,7 @@ use axum::extract::{Extension, State};
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use idoris_compute_contracts::ids::RequestId;
-use idoris_compute_contracts::reason::ReasonCode;
+use idoris_compute_contracts::reason::{ExperienceTier, ReasonCode};
 use idoris_tenancy::virtual_key::store::AuthenticatedVirtualKey;
 
 use super::answer::{AnswerMeta, CloudOutcome};
@@ -33,7 +39,7 @@ use super::executor::{CloudCall, CloudError};
 use super::request::{RequestProblem, parse_client_request};
 use crate::connection::RequestLifecycle;
 use crate::{
-    AppState, HEADER_DEGRADED, HEADER_REASON, RequestRecordId, error_envelope,
+    AppState, HEADER_DEGRADED, HEADER_REASON, HEADER_RECORD_ID, RequestRecordId, error_envelope,
     error_envelope_with_reason,
 };
 
@@ -131,7 +137,64 @@ pub(crate) async fn chat_completions(
     }
 }
 
+/// 体验分级（设计稿 §5）的级别，响应头 `X-iDoris-Tier`：`normal` / `degraded` / `grace` / `exhausted`。
+/// 不在四级阶梯上的拒绝（`rate_limited`、`credential_frozen`……）没有这个头：它们不是「钱不够」。
+pub const HEADER_TIER: &str = "X-iDoris-Tier";
+
+/// 钱不够压低了 `max_tokens` 时，实际发给上游的 `max_tokens`（回答可能因为长度被截断），响应头
+/// `X-iDoris-Max-Tokens`。没压低就没有这个头。
+pub const HEADER_MAX_TOKENS: &str = "X-iDoris-Max-Tokens";
+
+/// 浏览器要读到的响应头，即 CORS 的 `Access-Control-Expose-Headers`（设计稿 §5 评审 L2：降级响应头是契约，
+/// 浏览器能读）。浏览器默认只暴露 CORS 安全的几个头，不列在这里的头前端的 JS 读不到。
+///
+/// 这个列表会写进**每个带原因码 / 级别头的云响应**的 `Access-Control-Expose-Headers`（对不是跨域的调用无害）。
+/// 真正的跨域放行（`Access-Control-Allow-Origin`、预检）是云入口（S5）的事，S5 的 CORS 层应当用这个列表，
+/// 不要另列一份。
+pub const EXPOSED_HEADERS: &[&str] = &[
+    HEADER_REASON,
+    HEADER_DEGRADED,
+    HEADER_TIER,
+    HEADER_MAX_TOKENS,
+    HEADER_RECORD_ID,
+];
+
+fn expose_headers(response: &mut Response) {
+    if let Ok(value) = HeaderValue::from_str(&EXPOSED_HEADERS.join(", ")) {
+        response
+            .headers_mut()
+            .insert(header::ACCESS_CONTROL_EXPOSE_HEADERS, value);
+    }
+}
+
+fn set_tier(response: &mut Response, tier: ExperienceTier) {
+    let text = match tier {
+        ExperienceTier::Normal => "normal",
+        ExperienceTier::Degraded => "degraded",
+        ExperienceTier::Grace => "grace",
+        ExperienceTier::Exhausted => "exhausted",
+    };
+    response
+        .headers_mut()
+        .insert(HEADER_TIER, HeaderValue::from_static(text));
+}
+
 fn apply_reason_headers(response: &mut Response, meta: &AnswerMeta) {
+    // 被服务的请求总有级别：没有原因码就是正常（第 1 级），否则取原因码里最高的那一级
+    // （降级 < 宽限；首字节前切换是降级）。
+    let tier = meta
+        .reasons
+        .iter()
+        .filter_map(|code| code.tier())
+        .max()
+        .unwrap_or(ExperienceTier::Normal);
+    set_tier(response, tier);
+    if let Some(max_tokens) = meta.max_tokens_reduced_to
+        && let Ok(value) = HeaderValue::from_str(&max_tokens.to_string())
+    {
+        response.headers_mut().insert(HEADER_MAX_TOKENS, value);
+    }
+    expose_headers(response);
     if meta.reasons.is_empty() {
         return;
     }
@@ -147,7 +210,7 @@ fn apply_reason_headers(response: &mut Response, meta: &AnswerMeta) {
     if meta
         .reasons
         .iter()
-        .any(|code| code.tier() == Some(idoris_compute_contracts::reason::ExperienceTier::Degraded))
+        .any(|code| code.tier() == Some(ExperienceTier::Degraded))
     {
         response
             .headers_mut()
@@ -194,10 +257,15 @@ fn denial_status(code: ReasonCode) -> StatusCode {
 }
 
 /// 拒绝类原因码也放进响应头：浏览器读不到响应体里的 `error.reason_code`，但能读响应头（设计稿 §5，评审 L2）。
+/// 在四级阶梯上的拒绝（`budget_exhausted` = 第 4 级）同时带 `X-iDoris-Tier: exhausted`。
 fn with_reason_header(mut response: Response, code: ReasonCode) -> Response {
     response
         .headers_mut()
         .insert(HEADER_REASON, HeaderValue::from_static(code.as_str()));
+    if let Some(tier) = code.tier() {
+        set_tier(&mut response, tier);
+    }
+    expose_headers(&mut response);
     response
 }
 
