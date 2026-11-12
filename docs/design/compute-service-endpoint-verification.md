@@ -133,7 +133,6 @@ https://openrouter.ai/docs/guides/features/zdr （查询 2026-11-12）
 | Fireworks | Zero retention | 不训练 |
 | Groq | Zero retention | 不训练 |
 | SiliconFlow | Zero retention | 不训练 |
-| Amazon Bedrock | Zero retention | 不训练 |
 | Google Vertex | Zero retention | 不训练 |
 | Google AI Studio | 55 天 | 不训练 |
 | Alibaba Cloud Int. | 留存期未知 | 不训练 |
@@ -173,7 +172,7 @@ iDoris 计算服务的产品形态就是把上游 token 提供给 eduai 和 Agen
 | 流式 usage | Chat Completions 的流在 `[DONE]` 前必有一块 usage。`stream_options.include_usage` 与 `usage: {include: true}` 已弃用，且不再起作用 | https://openrouter.ai/docs/guides/administration/usage-accounting 与 https://openrouter.ai/docs/api_reference/streaming |
 | 结构化输出 | `response_format.type = json_schema`，建议 `strict: true`。模型不支持时请求失败 | https://openrouter.ai/docs/features/structured-outputs |
 | 缓存计价 | 多数供应商自动缓存；用量里有 `cached_tokens` 与 `cache_write_tokens`。OpenRouter 会尽量把后续请求送到同一家以碰到热缓存 | https://openrouter.ai/docs/features/prompt-caching 与 usage accounting 页 |
-| 取消 | 断开流式连接。名单内的供应商会停算停计费，包括 Fireworks、DeepInfra、Together、DeepSeek。明确写尚未支持的包括 AWS Bedrock、Groq、Google、Google AI Studio、Alibaba、Nebius。非流式或不支持的供应商会继续算完并计费 | https://openrouter.ai/docs/api_reference/streaming |
+| 取消 | 断开流式连接。名单内的供应商会停算停计费，包括 Fireworks、DeepInfra、Together、DeepSeek。明确写尚未支持的包括 Groq、Google、Google AI Studio、Alibaba、Nebius。非流式或不支持的供应商会继续算完并计费 | https://openrouter.ai/docs/api_reference/streaming |
 
 ### 仍要人做的事
 
@@ -272,7 +271,6 @@ iDoris 计算服务的产品形态就是把上游 token 提供给 eduai 和 Agen
 | Fireworks | 开放模型默认不把 prompt 写入持久存储；企业策略可以拒绝会落盘的功能。公开的数据驻留表只写了美国。API 枚举里有 `APAC`，没有公开的新加坡无服务器端点。DPA 在 Trust Center，正文未读。 |
 | Groq | 推理默认不留客户数据，但可靠性和滥用调查可以留最多 30 天。文档写被留下的客户数据在美国 GCP。处理者协议列在政策页，正文未读。不是亚太。 |
 | 阿里云百炼国际站，新加坡接入 | 接入区域可以是新加坡，但新加坡的推理部署范围是「国际、不含中国大陆的全球节点」，不是钉在新加坡。默认留存不超过 30 天。ZDR 要企业客户找客户经理开通，且只覆盖已适配型号；即便开通，也有最长约 24 小时的加密缓存窗口，被安全过滤标记的日志最长 2 年。 |
-| AWS Bedrock，源区域新加坡 | 可以按区域配置是否留存。滥用检测对部分模型仍要留存，完整 ZDR 要向客户团队申请。从新加坡走 global 推理配置文件时，目的地可以是任何已部署该模型的商业区域。源区域不等于处理区域。 |
 | Google Vertex / Gemini Enterprise Agent Platform，区域端点 | 训练限制写在服务条款里。零留存不是默认：滥用日志、默认开启的持久上下文缓存（最长约 24 小时）、Grounding、Interactions API 的 `store` 默认 true，都要单独关掉或申请例外。区域端点的处理是否留在所选区域，以数据驻留文档为准；本次没有核完新加坡当前有哪些型号。 |
 | SiliconFlow | 英文隐私政策与中文摘要对「会不会保存 prompt」说法不同。OpenRouter 把它标成零留存。推理区域未核实。 |
 | Moonshot AI | 只看到 OpenRouter 写总部新加坡、零留存、不训练。一手隐私政策和区域文档本次没打开。除这一句线索外全部未核实。 |
@@ -338,21 +336,7 @@ DPA、转售、儿童：本次没有打开对应条款。**未核实。**
 
 价格见第 6 节。币种为文档中的美元。
 
-### AWS Bedrock（新加坡作为源区域）
-
-https://docs.aws.amazon.com/bedrock/latest/userguide/data-retention.html （页面时间 2026-11-12）
-
-- 可以在某个 AWS 区域的账户或项目上配置推理 prompt 和输出是否留存，对该区域的 Messages、Chat Completions、Responses API 生效。未配置的区域保持 `inherit`，回到该模型的默认。
-- `default` 模式：可能为滥用检测而留存，细节指向滥用检测页。
-- 滥用检测页（2026-11-11）：除列出的 GPT OSS Safeguard 与 gpt-oss 外，OpenAI 模型被分类器标记的流量最多留 30 天。Claude Fable 5 系列则是全部流量最多 30 天，并可能由 AWS 人工审阅。合格客户可通过客户团队申请完整 ZDR。跨区域推理打开时，留下来的输入输出存在**目的地区域**。https://docs.aws.amazon.com/bedrock/latest/userguide/abuse-detection.html
-
-处理区域。AWS 机器学习博客，2026-10-12：可以从亚太（新加坡）用 global 跨区域推理配置文件调用 OpenAI 模型，目的地是「部署了该模型的受支持商业区域」，不是新加坡。同文写 OpenAI 兼容 API 在 `/openai/v1`。https://aws.amazon.com/blogs/machine-learning/accessing-openai-gpt-models-on-amazon-bedrock-with-global-cross-region-inference-in-thailand-malaysia-singapore-indonesia-and-taiwan/
-
-Bedrock Data Automation 的说明更直接：新加坡目前的数据自动化配置文件是 global，目的地可以是提供该模型的全部商业区域。https://docs.aws.amazon.com/bedrock/latest/userguide/bda-cris.html 这是数据自动化产品，不能自动套到每一个聊天模型。**某个具体聊天模型在 `ap-southeast-1` 是否有「只在亚太地理范围内」的配置文件：未核实。**
-
-DPA：本次没有打开 AWS 客户协议或数据处理附录的正文。Bedrock 文档把留存控制描述为账户配置，把完整 ZDR 描述为向客户团队申请。签署状态按本项目计为未签；附录是否自动构成设计稿要求的「已签 DPA」：**未核实，要律师看。**
-
-儿童与转售：**未核实。**
+AWS Bedrock：按 owner 2026-11-12 决定排除。
 
 ### Google（Vertex / Gemini Enterprise Agent Platform）
 
@@ -410,7 +394,7 @@ OpenAI 兼容接口在新加坡是否提供：**未核实**（本次没有打开
 | Together | Typhoon 2 8B Instruct 页面写：「This model is not available on Together’s Serverless API.」https://www.together.ai/models/typhoon-2-8b-instruct （页面时间 2026-11-05，查询 2026-11-12） | 其他 Typhoon 型号是否还有专属部署，未逐个打开 |
 | OpenRouter | URL `https://openrouter.ai/scb10x/llama3.1-typhoon2-70b-instruct` 返回了站点外壳。正文里的价格、在线供应商、是否仍在售，抓取结果里没有 | 能否实际调用：未核实。Typhoon 博客曾写 70B 计划在 2025-08-20 弃用，那是旧通知，不能单独证明今天的上下架 |
 | DeepInfra 定价页 | 已读的 DeepSeek 与 Qwen 分组里没有 Typhoon 字样。https://deepinfra.com/pricing | 没有做全站穷尽搜索，不能写成「确定没有」 |
-| Fireworks、Groq、百炼、Bedrock、Vertex | 本次检索没有打开到 Typhoon 型号页 | 托管与价格：未核实 |
+| Fireworks、Groq、百炼、Vertex | 本次检索没有打开到 Typhoon 型号页 | 托管与价格：未核实 |
 | SiliconFlow 价目页 | 已展示的厂商分组里没有 Typhoon。https://www.siliconflow.cn/pricing | 同上，未穷尽 |
 
 SeaLLM、OpenThaiGPT 以及其他泰语能力较强的开源模型，本次没有逐家检索到托管页。**未核实。** 不把印象中的旧托管写成现价。
@@ -508,10 +492,9 @@ FAQ：免费。没有每百万 token 的 API 价。速率限制见第 5 节。
 2. 若只比「公开文件离要求有多近」：DeepInfra 自托管开源型号（排除 Google / Anthropic、图像、批量、付费缓存保留）的合同文字最完整，区域是美国，转售要服务订单。它不是亚太。
 3. 阿里云百炼国际站新加坡工作空间，在客户经理开通 ZDR、且型号在已适配清单内、且不走 RAG / 批量 / 有状态 Responses 时，接入区域最近。推理仍可能在「不含中国大陆的全球节点」之间调度，24 小时缓存窗口和最长 2 年的安全日志也还在。区域没有钉死之前，不能把它写成新加坡推理。
 4. Google 区域端点 `asia-southeast1`：只有在关掉持久缓存、不用 Grounding、Interactions 明确 `store=false`、并拿到滥用监测例外之后，才接近零留存。型号是否在新加坡提供，要按当时的型号表再核一次。OpenAI 兼容未核实。
-5. AWS Bedrock：只有不用全球目的地的推理配置、并把该区域的留存设到可接受的模式、需要时向客户团队申请 ZDR，才值得进入短名单。本次看到的新加坡 global 配置不符合「处理留在新加坡附近」。
-6. OpenRouter 的 ZDR only **不要排在前面**。自助条款禁止转售 API 访问，只能走企业协议（有终端客户许可）；自助默认还允许 Safety Retention；CSAM 例外仍在；下游区域除企业版的欧盟/美国主机名外不可控。它适合作为「模型很多」的线索，不适合作为儿童数据的上游，除非走企业协议、律师确认定性并且后台逐个端点核过。
-7. Together、Fireworks、Groq 的公开材料都比「已签 DPA + 无例外 ZDR + 亚太」少一截。Fireworks 的默认不落盘较接近，但亚太无服务器没有公开端点。Groq 的 30 天滥用/可靠性日志不符合严格零留存。
-8. SiliconFlow、OpenTyphoon 官方免费 API、DeepSeek 官方：不进入 child_edu 短名单。前两者的留存陈述分别是冲突或明确用于改进；DeepSeek 官方是设计稿已经排除的，本次阅读支持这个排除。
+5. OpenRouter 的 ZDR only **不要排在前面**。自助条款禁止转售 API 访问，只能走企业协议（有终端客户许可）；自助默认还允许 Safety Retention；CSAM 例外仍在；下游区域除企业版的欧盟/美国主机名外不可控。它适合作为「模型很多」的线索，不适合作为儿童数据的上游，除非走企业协议、律师确认定性并且后台逐个端点核过。
+6. Together、Fireworks、Groq 的公开材料都比「已签 DPA + 无例外 ZDR + 亚太」少一截。Fireworks 的默认不落盘较接近，但亚太无服务器没有公开端点。Groq 的 30 天滥用/可靠性日志不符合严格零留存。
+7. SiliconFlow、OpenTyphoon 官方免费 API、DeepSeek 官方：不进入 child_edu 短名单。前两者的留存陈述分别是冲突或明确用于改进；DeepSeek 官方是设计稿已经排除的，本次阅读支持这个排除。
 
 ### adult
 
@@ -534,17 +517,16 @@ adult 在设计稿里不要求同一套儿童门槛，但仍要过租户自己�
 3. **OpenRouter 企业销售**：确认企业协议第 2.1(a)(ii) 条的终端客户许可覆盖 iDoris 云形态（把 token 经自己的账户与预算提供给 eduai、Agent24），并书面排除第 2.3.7 条的适用；要签字 DPA；开通后由人登录隐私设置，把各模型组设为 ZDR only，并排除 Safety Retention；对每个要上的模型看端点政策。
 4. **DeepSeek**：登录开放平台确认训练退出开关是否覆盖 API；若 adult 需要 DPA，提交合作协议工单并让律师看中国存储。不要为 child_edu 提这个工单当解决方案。
 5. **阿里云客户经理**：评估并开通工作空间 ZDR；书面确认推理节点的地理范围能不能收成新加坡；确认要买的型号在 ZDR 清单内；提供 DPA。开通前默认按最多 30 天留存对待。
-6. **AWS 客户团队**：列出拟用模型在 `ap-southeast-1` 的推理配置文件和目的地区域；申请需要的 ZDR；确认留存设置在账户里是什么模式。不要用 global 配置文件承载有区域约束的数据。
-7. **Google Cloud 客户团队**：为将使用的项目申请滥用监测例外；关掉持久缓存；核对 `asia-southeast1` 当天的型号表；确认结算方式会不会改变滥用日志的适用范围（文档把「受 GCP 条款约束」写成日志条件，发票账户是否除外要以账户团队的书面答复为准，本次两版文档措辞不完全相同）。
-8. **Together / Fireworks / Groq**：若短名单需要他们，向 Trust Center 要 DPA 正文。Fireworks 问 APAC 枚举是否已有可买的区域端点。Together 在组织设置关掉 Prompt storage 之后再谈。
-9. **Typhoon**：向 SCB 10X 或 OpenTyphoon 确认免费 API 是否仍是 2025-12 文档中的四个 ID，以及预告的 AWS 生产 API 是否已上线、区域和合同。在此之前不要把 Together 或 OpenRouter 写成 Typhoon 的生产上游。
-10. **延迟**：设计稿 §15 要求实测新加坡到各上游。本次没有测。
-11. **S0**：把本草案的字段收成契约。在那之前，yaml 里的值不能被路由器读取为授权。
+6. **Google Cloud 客户团队**：为将使用的项目申请滥用监测例外；关掉持久缓存；核对 `asia-southeast1` 当天的型号表；确认结算方式会不会改变滥用日志的适用范围（文档把「受 GCP 条款约束」写成日志条件，发票账户是否除外要以账户团队的书面答复为准，本次两版文档措辞不完全相同）。
+7. **Together / Fireworks / Groq**：若短名单需要他们，向 Trust Center 要 DPA 正文。Fireworks 问 APAC 枚举是否已有可买的区域端点。Together 在组织设置关掉 Prompt storage 之后再谈。
+8. **Typhoon**：向 SCB 10X 或 OpenTyphoon 确认免费 API 是否仍是 2025-12 文档中的四个 ID，以及预告的 AWS 生产 API 是否已上线、区域和合同。在此之前不要把 Together 或 OpenRouter 写成 Typhoon 的生产上游。
+9. **延迟**：设计稿 §15 要求实测新加坡到各上游。本次没有测。
+10. **S0**：把本草案的字段收成契约。在那之前，yaml 里的值不能被路由器读取为授权。
 
 ## 9. 本次故意没有写成事实的内容
 
 - 任何供应商「可以处理儿童数据」或「已经允许 iDoris 转售」。
-- DeepInfra、OpenRouter、Bedrock、Vertex 的推理延迟。
+- DeepInfra、OpenRouter、Vertex 的推理延迟。
 - OpenRouter 当前抽成比例和具体模型现价。
 - Moonshot、MiniMax 的一手留存与区域。
 - SiliconFlow 国际站与中文站哪一份政策适用。
