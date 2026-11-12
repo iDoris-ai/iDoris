@@ -253,21 +253,46 @@ fn the_database_allows_at_most_one_active_grace_per_account_per_period() {
     let db = TempDb::new("grace-unique");
     let store = paid_chain(&db, 20);
     admit_with_ladder(&store, "r-1", 0, "cred-e", 100, T0);
-    // 绕过 Rust 层再塞一行同账户同周期没作废的宽限：唯一索引拒绝
+    // 绕过 Rust 层：先塞一个同账户同账期的（伪造的）开放预留，再给它塞一行没作废的宽限。
+    // 预留是新的 hold_id，别的触发器（hold_id 唯一、宽限必须属于同账户同单位同账期同下限的开放预留）都放行，
+    // 所以挡住第二行的只可能是「每账户每账期至多一行没作废的宽限」这条唯一索引。
     let conn = rusqlite::Connection::open(db.path()).unwrap();
+    conn.execute(
+        "INSERT INTO ledger_holds (hold_id, attempt_id, component, request_id, attempt_index, payer_account,
+                                   credential_id, unit, reserved_micros, period, created_at_ms, expires_at_ms,
+                                   grace_floor_micros, state)
+         SELECT 'r-9#0', 'r-9#0', 'model', 'r-9', 0, payer_account, credential_id, unit, reserved_micros, period,
+                created_at_ms, expires_at_ms, grace_floor_micros, 'open'
+           FROM ledger_holds WHERE hold_id = 'r-1#0'",
+        [],
+    )
+    .unwrap();
     let err = conn
         .execute(
             "INSERT INTO ledger_grace_uses (account_id, period, hold_id, unit, reserve_micros, shortfall_micros,
                                             floor_micros, used_at_ms)
-             VALUES ('emp', '2026-11', 'r-1#0', 'THB', 210, 190, 20, 0)",
+             VALUES ('emp', '2026-11', 'r-9#0', 'THB', 210, 190, 20, 0)",
             [],
         )
         .unwrap_err()
         .to_string();
     assert!(
-        err.contains("already exists") || err.contains("UNIQUE"),
+        err.contains("UNIQUE") && err.contains("ledger_grace_uses"),
         "{err}"
     );
+    // 作废了第一行之后，同一个账期可以再有一行：唯一的是「没作废的」
+    conn.execute(
+        "UPDATE ledger_grace_uses SET voided_at_ms = 1 WHERE hold_id = 'r-1#0'",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO ledger_grace_uses (account_id, period, hold_id, unit, reserve_micros, shortfall_micros,
+                                        floor_micros, used_at_ms)
+         VALUES ('emp', '2026-11', 'r-9#0', 'THB', 210, 190, 20, 0)",
+        [],
+    )
+    .unwrap();
 }
 
 #[test]
