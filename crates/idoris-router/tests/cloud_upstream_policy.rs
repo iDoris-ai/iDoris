@@ -190,6 +190,107 @@ async fn a_failed_compliant_endpoint_never_falls_back_to_a_non_compliant_one() {
     assert_eq!(rows(&h, &reply.request_id()).len(), 1);
 }
 
+type Tweak = fn(&mut Endpoint);
+
+struct Isolation {
+    name: &'static str,
+    caller: Caller,
+    /// 只违反这一条约束的端点。
+    violating: Tweak,
+    /// 满足全部约束的端点。
+    compliant: Tweak,
+}
+
+/// 每一条硬约束**单独**也能把端点排除掉：违反且只违反这一条的端点排在前面，它一个字节也收不到；
+/// 满足全部约束的端点排在后面，由它服务。
+///
+/// 这个测试是变异自查逼出来的：只看「child_edu 请求被拒」，数据类别检查失效了也照样被拒
+/// （同一批端点的留存和 DPA 也不合规）——约束之间互相掩护，单独一条失效不会让测试变红。
+#[tokio::test]
+async fn each_hard_constraint_excludes_an_endpoint_on_its_own() {
+    let cases = vec![
+        Isolation {
+            name: "data class: zdr + signed DPA but not allowed for child_edu",
+            caller: Caller::child_edu(),
+            violating: |e| {
+                e.retention = "zdr";
+                e.dpa = "signed";
+                e.classes = vec!["adult", "public"];
+            },
+            compliant: |e| {
+                e.retention = "zdr";
+                e.dpa = "signed";
+                e.classes = vec!["child_edu", "adult", "public"];
+            },
+        },
+        Isolation {
+            name: "data class: public-only endpoint for an adult tenant",
+            caller: Caller::adult_default(),
+            violating: |e| e.classes = vec!["public"],
+            compliant: |_| {},
+        },
+        Isolation {
+            name: "retention: the tenant accepts zdr only",
+            caller: Caller {
+                max_retention: "zdr",
+                ..Caller::adult_default()
+            },
+            violating: |e| e.retention = "with_exceptions",
+            compliant: |e| e.retention = "zdr",
+        },
+        Isolation {
+            name: "dpa: the tenant requires a signed DPA",
+            caller: Caller {
+                require_dpa: true,
+                ..Caller::adult_default()
+            },
+            violating: |e| e.dpa = "unsigned",
+            compliant: |e| e.dpa = "signed",
+        },
+        Isolation {
+            name: "region: one of the endpoint's processing regions is not allowed",
+            caller: Caller {
+                allowed_regions: Some(vec!["sg-1"]),
+                ..Caller::adult_default()
+            },
+            violating: |e| e.regions = vec!["sg-1", "eu-1"],
+            compliant: |e| e.regions = vec!["sg-1"],
+        },
+    ];
+    for case in cases {
+        let bad = FakeUpstream::start(vec![ok("must-never-be-called")]).await;
+        let good = FakeUpstream::start(vec![ok("from-compliant")]).await;
+        let admission = RecordingAdmission::new();
+        let mut violating = Endpoint::adult("example-violating", bad.url());
+        (case.violating)(&mut violating);
+        let mut compliant = Endpoint::adult("example-compliant", good.url());
+        (case.compliant)(&mut compliant);
+        let h = build(
+            vec![violating, compliant],
+            Options {
+                callers: vec![case.caller.clone()],
+                admission: Some(admission.clone()),
+                ..Options::default()
+            },
+        );
+        let reply = post(&h.app, &simple_body(100)).await;
+        assert_eq!(reply.status, 200, "{}", case.name);
+        assert_eq!(reply.json()["id"], "from-compliant", "{}", case.name);
+        assert_eq!(
+            bad.connection_count(),
+            0,
+            "{}: the violating endpoint received nothing",
+            case.name
+        );
+        assert_eq!(
+            admission.providers(),
+            vec!["example-compliant"],
+            "{}",
+            case.name
+        );
+    }
+}
+
 #[tokio::test]
 async fn the_tenants_regions_must_contain_every_region_the_endpoint_may_process_in() {
     let a = FakeUpstream::start(vec![ok("never")]).await;

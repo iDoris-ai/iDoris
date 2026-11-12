@@ -1063,6 +1063,36 @@ impl AttemptStore {
         Ok(out)
     }
 
+    /// 还没有关闭的请求（崩溃恢复扫描用）：创建时间早于 `created_before`，最多 `limit` 个，按创建时间。
+    ///
+    /// 进程崩溃时正在进行的请求会留在这里：尝试停在 `maybe_executed` / `executed_*`，没有结算。
+    /// 恢复时用 [`AttemptStore::load_request`] 重建、`Request::plan_settlement` 算计划、
+    /// [`AttemptStore::finalize_request`] 收尾（幂等）；`maybe_executed` 的成本保持挂账等对账。
+    pub fn open_requests(
+        &self,
+        created_before: TimestampMs,
+        limit: usize,
+    ) -> Result<Vec<RequestId>, AttemptStoreError> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT request_id FROM compute_requests
+             WHERE outcome IS NULL AND created_at_ms < ?1
+             ORDER BY created_at_ms, request_id LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(
+            params![
+                created_before.millis(),
+                i64::try_from(limit).unwrap_or(i64::MAX)
+            ],
+            |row| row.get::<_, String>(0),
+        )?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(RequestId::new(row?).map_err(corrupt)?);
+        }
+        Ok(out)
+    }
+
     /// 一个请求的全部分录，按写入顺序。
     pub fn postings(&self, request: &RequestId) -> Result<Vec<PostingRow>, AttemptStoreError> {
         let conn = self.lock();

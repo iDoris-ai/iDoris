@@ -169,20 +169,18 @@ async fn a_cancelled_request_cancels_the_upstream_call_and_is_settled_as_cancell
         Options::default(),
     );
     let token = CancellationToken::new();
-    tokio::spawn({
-        let token = token.clone();
-        async move {
-            tokio::time::sleep(Duration::from_millis(250)).await;
-            token.cancel();
-        }
-    });
     let call = direct_call(
         &h,
         "req-cancel-1",
         &["example-alpha", "example-beta"],
-        token,
+        token.clone(),
     );
-    let result = h.cloud.executor().execute(call).await;
+    // 请求确实到了上游之后再取消（不睡固定时长：机器负载高时固定时长会让测试不稳）
+    let canceller = async {
+        assert!(a.wait_for_requests(1, Duration::from_secs(10)).await);
+        token.cancel();
+    };
+    let (result, ()) = tokio::join!(h.cloud.executor().execute(call), canceller);
     assert!(matches!(result, Err(CloudError::Cancelled)), "{result:?}");
     assert!(
         a.client_closed(0, Duration::from_secs(3)).await,

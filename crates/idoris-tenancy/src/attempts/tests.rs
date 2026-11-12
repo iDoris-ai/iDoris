@@ -447,6 +447,93 @@ fn history_and_postings_are_append_only_and_identity_is_immutable() {
 }
 
 /// 「用户只付一次」在数据库里也是结构保证：一个请求至多一个向用户收费的尝试、至多一条正的 user_price 分录。
+/// 进程在「已发布、还没结算」时崩溃：只靠数据库就能恢复并结算（重放幂等），用户只付一次。
+#[test]
+fn a_crashed_request_is_found_and_settled_from_the_database_alone() {
+    let dir = tempfile_dir();
+    let path = dir.join("crash.sqlite3");
+    let id = rid("req-crash");
+    {
+        let store = AttemptStore::open(&path).unwrap();
+        let mut request = Request::admit(id.clone(), payment(), candidate("model-a")).unwrap();
+        let classes = classes();
+        store
+            .create_request(
+                &new_request(request.id(), request.payment(), &classes),
+                &request.attempts()[0],
+            )
+            .unwrap();
+        apply(
+            &store,
+            &mut request,
+            0,
+            &[
+                AttemptEvent::Dispatch,
+                AttemptEvent::WireWriteStarted,
+                AttemptEvent::UsageReported { usage: usage() },
+            ],
+            1,
+        );
+        store
+            .record_publish(request.attempts()[0].id(), at(2))
+            .unwrap();
+        // 崩溃：进程在这里消失，store 被丢弃，没有任何结算
+    }
+    let store = AttemptStore::open(&path).unwrap();
+    // 太新的请求不算（可能还在进行中）
+    assert!(
+        store
+            .open_requests(TimestampMs(NOW.0), 10)
+            .unwrap()
+            .is_empty()
+    );
+    let open = store.open_requests(at(60_000), 10).unwrap();
+    assert_eq!(open, vec![id.clone()]);
+
+    let mut recovered = store.load_request(&id).unwrap().unwrap();
+    let plan = recovered.plan_settlement().unwrap();
+    let to_settle: Vec<AttemptId> = recovered
+        .attempts()
+        .iter()
+        .filter(|a| {
+            matches!(
+                a.state().kind(),
+                AttemptStateKind::ExecutedUsageKnown | AttemptStateKind::ExecutedUsageUnknown
+            )
+        })
+        .map(|a| a.id().clone())
+        .collect();
+    let close = RequestClose {
+        outcome: RequestOutcome::Answered,
+        reason: None,
+        at: at(61_000),
+    };
+    let first = store.finalize_request(&plan, &to_settle, close).unwrap();
+    assert_eq!(first.settled, to_settle);
+    assert_eq!(first.postings_added, 3);
+    // 恢复过程本身再崩一次、重放：幂等
+    let again = store.finalize_request(&plan, &to_settle, close).unwrap();
+    assert!(again.replayed && again.postings_added == 0);
+    assert!(store.open_requests(at(120_000), 10).unwrap().is_empty());
+    let kinds: Vec<(String, i64)> = store
+        .postings(&id)
+        .unwrap()
+        .into_iter()
+        .map(|p| (p.kind, p.money.micros))
+        .collect();
+    assert_eq!(
+        kinds,
+        vec![
+            ("user_price".to_string(), 18_000),
+            ("platform_cost".to_string(), 364),
+            ("release".to_string(), 2_000)
+        ]
+    );
+    recovered
+        .apply(AttemptIndex(0), AttemptEvent::Settle)
+        .unwrap();
+}
+
 #[test]
 fn the_user_can_only_be_charged_once_per_request_at_the_database_level() {
     let (store, mut request) = started("req-once");

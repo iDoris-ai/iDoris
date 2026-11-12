@@ -1287,13 +1287,13 @@ async fn a_client_that_disconnects_before_any_byte_leaves_maybe_executed_held_an
 {
     let s = two_upstreams(vec![Behavior::Hang], vec![ok_completion("never", None)]).await;
     let request = harness::chat_request(&simple_body(100));
-    let outcome = tokio::time::timeout(
-        Duration::from_millis(300),
-        harness::send(&s.harness.app, request),
-    )
-    .await;
+    let app = s.harness.app.clone();
+    let task = tokio::spawn(async move { harness::send(&app, request).await });
+    // 等到请求确实到了上游再让客户端离开（不睡固定时长：机器负载高时固定时长会让测试不稳）
+    assert!(s.alpha.wait_for_requests(1, Duration::from_secs(10)).await);
+    task.abort();
     assert!(
-        outcome.is_err(),
+        task.await.unwrap_err().is_cancelled(),
         "the request was still waiting on the upstream when the client left"
     );
 
