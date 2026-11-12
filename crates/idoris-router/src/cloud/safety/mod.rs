@@ -14,7 +14,7 @@
 //!    ├─ 没有配置安全检查器 ──────────────────────▶ 503 safety_unavailable（not_configured）
 //!    ▼
 //!  ① 输入检查  extract_input：messages / tools / tool_choice / response_format / stop 里的**所有**字符串
-//!    │          ExtraCostMeter::reserve（LLM 检查的成本占额度；放不下 = 准入拒绝，不检查、不出网）
+//!    │          ExtraCostMeter::reserve（账本里预留 `safety_input`：LLM 检查的成本占付款账户链的额度；放不下 = 准入拒绝，不检查、不出网）
 //!    │          规则检查器 ──拒绝──▶ 422 safety_input_blocked（不再调用 LLM）
 //!    │            └─放行─▶ LLM 检查器 ──拒绝──▶ 422 safety_input_blocked
 //!    │          超时 / 出错 / 返回垃圾 / 分类器不可用 ──▶ 503 safety_unavailable
@@ -23,6 +23,7 @@
 //!  ② 上游非流式调用  （S4 的执行器：许可表硬约束、准入、尝试记录、首字节前切换）
 //!    ▼
 //!  ③ 完整输出检查  rebuild_response：只取 content / refusal / tool_calls，重建响应体（没检查的字段不发）
+//!    │          ExtraCostMeter::reserve（账本里预留 `safety_output`，放不下 = 准入拒绝，回答照样不发）
 //!    │          规则检查器（含「复述了孩子写的个人信息」）──▶ LLM 检查器
 //!    │          拒绝 ──▶ 422 safety_output_blocked；没结论 ──▶ 503 safety_unavailable
 //!    │          ── PendingAnswer::withhold：**客户端一个正文字节都收不到**，用户付 0，上游成本由平台承担 ──
@@ -41,7 +42,8 @@
 //! | [`extract`] | 取出要检查的文本（输入）；为 edu 重建只含被检查字段的响应体（输出） |
 //! | [`rules`] | 规则检查器：泰语 + 英语的关键词与模式，输出侧含「复述孩子个人信息」检测 |
 //! | [`llm`] | LLM 判分检查器：调用可配置的 OpenAI 兼容端点；端点必须是许可表里允许 `child_edu` 的 |
-//! | [`cost`] | 安全检查成本计入准入和结算的接口（S3 的接缝）与简单实现 |
+//! | [`cost`] | 安全检查成本计入准入和结算的接口（[`ExtraCostMeter`]）与没有账本的简单实现 |
+//! | [`ledger_cost`] | 接口的账本实现（S3）：输入 / 输出检查各预留一次，按检查端点的价目表折算，按实际用量结算 |
 //! | [`config`] | 配置里的 `safety:` 段，以及用端点许可表校验 LLM 检查端点（不合规启动失败） |
 //! | [`hardening`] | 进程级「不落盘」加固：panic 信息脱敏、关闭 core dump |
 //!
@@ -71,6 +73,7 @@ pub mod config;
 pub mod cost;
 pub mod extract;
 pub mod hardening;
+pub mod ledger_cost;
 pub mod llm;
 pub mod rules;
 pub mod text;
@@ -83,6 +86,7 @@ pub use cost::{
     ExtraCostRefusal, ExtraCostRequest, ExtraCostTicket, SimpleExtraCost, SpendItem,
 };
 pub use extract::{CheckedInput, CheckedOutput, ExtractError, Origin, Segment, ToolCallText};
+pub use ledger_cost::LedgerExtraCost;
 pub use rules::RuleChecker;
 
 use extract::{extract_input, rebuild_response};
@@ -381,7 +385,7 @@ impl SafetyGate {
         )
     }
 
-    /// 换掉安全检查成本的计量器（S3 的接缝，`TODO(S3)`：换成读写账本的实现）。
+    /// 换掉安全检查成本的计量器：生产装配换成读写账本的 [`LedgerExtraCost`]（`CloudUpstream::with_ledger_extra_cost`）。
     pub fn with_cost(mut self, cost: Arc<dyn ExtraCostMeter>) -> Self {
         self.cost = cost;
         self
@@ -574,7 +578,16 @@ impl SafetyGate {
             }
             StageOutcome::Report(report) => {
                 if let Some(guard) = guard {
-                    guard.finish(ExtraCostOutcome::Spent(report.spend));
+                    // 给出了结论（放行或拦截）：按这次检查报告的花费结算。没能给出结论（超时、出错、返回垃圾、分类器
+                    // 不可用……）：检查可能已经调用了上游，花了多少不知道，这是 `Unknown`，不是「花了估算的那么多」——
+                    // 账本实现对前者按实际用量向付款账户收费，对后者不收（故障的安全服务不该向孩子的账户收钱）。
+                    let outcome = match report.verdict {
+                        Verdict::Deny(Denial::Unavailable(_)) => ExtraCostOutcome::Unknown,
+                        Verdict::Allow | Verdict::Deny(Denial::Blocked(_)) => {
+                            ExtraCostOutcome::Spent(report.spend)
+                        }
+                    };
+                    guard.finish(outcome);
                 }
                 match report.verdict {
                     Verdict::Allow => Ok(()),
@@ -1052,6 +1065,8 @@ mod tests {
                     100,
                 )
                 .unwrap(),
+                max_input_tokens: 100,
+                max_output_tokens: 10,
             })
         }
     }
@@ -1176,6 +1191,8 @@ mod tests {
                         100,
                     )
                     .unwrap(),
+                    max_input_tokens: 100,
+                    max_output_tokens: 10,
                 })
             }
         }

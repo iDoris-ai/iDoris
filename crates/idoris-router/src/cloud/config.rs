@@ -800,6 +800,31 @@ pub fn parse(text: &str, base_dir: &Path, now: TimestampMs) -> Result<CloudParts
         None => None,
     };
 
+    // 安全检查（LLM）端点要对每个儿童调用方的付款单位有价目：检查的成本要折算成付款单位去占额度
+    // （`safety::LedgerExtraCost`：检查端点的 `prices` × 检查器给出的 token 上界），没有价目就没法计价，
+    // 运行时只能失败即关闭——不如启动时就拒绝这种配置，和「LLM 检查端点必须在许可表里」是同一类校验。
+    if let Some(judge) = safety.as_ref().and_then(|setup| setup.judge.as_ref()) {
+        let judge_runtime = runtimes
+            .iter()
+            .find(|runtime| runtime.key == *judge.endpoint());
+        let named = by_tenant
+            .iter()
+            .map(|(tenant, caller)| (tenant.as_str(), caller));
+        let unnamed = default.iter().map(|caller| ("(default)", caller));
+        for (name, caller) in named.chain(unnamed) {
+            if !caller.tenant.handles_child_data() {
+                continue;
+            }
+            let unit = caller.payment.unit();
+            if !judge_runtime.is_some_and(|runtime| runtime.price_rates.contains_key(unit)) {
+                return Err(bad(format!(
+                    "安全检查端点 {} 没有配置付款单位 {unit} 的价目（prices）：调用方 {name} 的检查成本无法折算成付款单位占额度",
+                    judge.endpoint()
+                )));
+            }
+        }
+    }
+
     Ok(CloudParts {
         permits,
         endpoints: EndpointRegistry::new(runtimes),

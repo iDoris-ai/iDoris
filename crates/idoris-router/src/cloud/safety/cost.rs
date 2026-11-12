@@ -5,37 +5,31 @@
 //! 规则检查器没有成本。LLM 检查器每次检查都要调用一个上游模型，花真钱：输入检查一次、输出检查一次，
 //! 每次可能还要分块多次调用。这笔钱必须像回答本身一样：**事前占额度**（准入）、**事后按实际用量结算**。
 //!
-//! 准入和账本是 S3 的事（S3 正在同时开发）。这里只定义 S6 需要的接口形状，并给一个简单实现：
-//!
 //! | 阶段 | 调用 | 说明 |
 //! |---|---|---|
 //! | 检查之前 | [`ExtraCostMeter::reserve`] | 按检查器给出的**上界**占额度。被拒（付款账户链放不下）就不检查、不调用上游：返回准入类的拒绝（`budget_exhausted` 等） |
 //! | 检查之后 | [`ExtraCostMeter::settle`] | 按实际用量结算；用量未知按预留额结算；检查根本没跑就释放。**每个 ticket 恰好结算一次**（[`ExtraCostGuard`] 在被丢弃时兜底） |
 //!
-//! 谁承担这笔钱（用户还是平台）是 S3 的决定：设计稿 §6 把「额外尝试的成本」记给平台，§7 只说「计入准入和结算」。
-//! 接口里每笔花费同时给出上游成本（`Cost`，供应商币种）和用量，S3 想怎么记都够用。
+//! # 两个实现
 //!
-//! # 简单实现：`SimpleExtraCost`（TODO(S3)）
+//! - [`super::ledger_cost::LedgerExtraCost`]（**生产用，S3 的账本**）：输入检查发生在任何尝试之前，用
+//!   `AccountStore::reserve_request_component`；输出检查同样用它，两个阶段都挂在这个请求的 `#0` 名下
+//!   （component 名 `safety_input` / `safety_output`）；结算 / 释放用 `settle_component`。预留额按**检查端点的价目表**
+//!   折算成付款单位（上游成本 `Cost` 是供应商币种，不能直接当价用），规则见那个模块的文档。
+//!   [`CloudUpstream::from_file`](crate::cloud::CloudUpstream::from_file) 装配它。
+//! - [`SimpleExtraCost`]：一律放行，只把结算记在**内存里**（有上限的环形缓冲）。**不进账本**，进程重启就丢；
+//!   只给没有账本的装配（测试、嵌入式）用，生产装配不会用它。
 //!
-//! 一律放行，只把结算记在**内存里**（有上限的环形缓冲，测试和排障能看到）。**它不进账本**：进程重启就丢，
-//! 所以在 S3 的实现接上之前，LLM 检查器的成本**没有**真正计入准入和结算。`TODO(S3)`：换成读写账本的实现，
-//! 见本模块末尾的「S3 需要提供什么」。
-//!
-//! # S3 需要提供什么
-//!
-//! 1. 一个能按 `(request_id, 阶段)` 幂等预留的入口：在付款上下文的**同一条祖先链**上占 `max_cost` 折算成付款单位后的额度
-//!    （上游成本 `Cost` 的币种和付款账户的单位可能不同，需要 S3 的汇率/价目换算），放不下返回一个准入类的拒绝原因码；
-//! 2. 与之对应的结算入口：`Spent`（带实际 `Cost` 与用量）、`Unknown`（按预留额挂账待核销）、`NotRun`（释放）；
-//! 3. 分录要有能区分「安全检查」的 `kind`（现在 `compute_postings.kind` 只有 `user_price` / `platform_cost` / `hold` / `release`，
-//!    输入检查发生在任何尝试之前，没有 `attempt_id` 可挂），并保证**用户只付一次**不受影响；
-//! 4. 对账：`Unknown` 的安全检查成本和 `maybe_executed` 的尝试一样，保留待核销。
+//! 谁承担这笔钱：为「给出了结论的检查」按实际用量计入付款账户（放行还是拦截都一样）；没能给出结论的检查
+//! （超时、出错、返回垃圾、客户端断开）付 0，由平台承担——故障的安全服务不该向孩子的账户收钱。这是对设计稿的一处理解，
+//! 见 `cloud/mod.rs` 的含糊点清单。
 
 use std::collections::VecDeque;
 use std::sync::Mutex;
 
 use idoris_compute_contracts::credential::PaymentContext;
 use idoris_compute_contracts::ids::{EndpointKey, RequestId, TimestampMs};
-use idoris_compute_contracts::pricing::{Cost, Usage};
+use idoris_compute_contracts::pricing::{Cost, Price, Usage};
 use idoris_compute_contracts::reason::ReasonCode;
 use idoris_compute_contracts::safety::SafetyStage;
 
@@ -46,6 +40,11 @@ pub struct ExtraCostEstimate {
     pub endpoint: EndpointKey,
     /// 这次检查最多花多少（上游成本，供应商币种）。
     pub max_cost: Cost,
+    /// `max_cost` 用到的输入 token 上界。账本要的是付款单位的**价**，不是供应商币种的成本：用**同样的 token 数**
+    /// 乘检查端点配置里的 `prices`（付款单位的价目表）折算，见 [`super::ledger_cost::LedgerExtraCost`]。
+    pub max_input_tokens: u64,
+    /// `max_cost` 用到的输出 token 上界（多块检查时是各块之和）。
+    pub max_output_tokens: u64,
 }
 
 /// 一次实际的花费。
@@ -78,6 +77,8 @@ pub struct ExtraCostTicket {
     pub stage: SafetyStage,
     pub endpoint: EndpointKey,
     pub max_cost: Cost,
+    /// 账本实现占住的预留额（付款单位的价）；没有账本的实现（[`SimpleExtraCost`]）是 `None`。
+    pub reserved_price: Option<Price>,
 }
 
 /// 预留被拒。
@@ -92,9 +93,10 @@ pub enum ExtraCostRefusal {
 /// 检查的结局，用来结算。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExtraCostOutcome {
-    /// 检查跑了，这是实际花费（可能是零笔：规则检查器拒绝了，没有调用 LLM）。
+    /// 检查给出了结论（放行或拦截），这是实际花费（可能是零笔：规则检查器拦下了，没有调用 LLM）。
     Spent(Vec<SpendItem>),
-    /// 检查可能跑了（超时、客户端断开、future 被丢弃），不知道花了多少：按预留额挂账待核销。
+    /// 检查可能跑了，但**没有给出结论**（超时、出错、返回垃圾、客户端断开、future 被丢弃），不知道花了多少：
+    /// 账本实现不向付款账户收钱（平台承担）；没有账本的实现按预留额挂账待核销。
     Unknown,
     /// 检查没有跑：释放预留。
     NotRun,
@@ -149,7 +151,7 @@ pub struct ExtraCostEntry {
     pub outcome: ExtraCostOutcome,
 }
 
-/// 简单实现（TODO(S3)）：一律放行，结算只记在内存里的环形缓冲。**不进账本**。
+/// 没有账本的实现：一律放行，结算只记在内存里的环形缓冲。**不进账本**（生产装配用 [`super::ledger_cost::LedgerExtraCost`]）。
 #[derive(Debug)]
 pub struct SimpleExtraCost {
     capacity: usize,
@@ -211,6 +213,7 @@ impl ExtraCostMeter for SimpleExtraCost {
             stage: request.stage,
             endpoint: request.estimate.endpoint.clone(),
             max_cost: request.estimate.max_cost.clone(),
+            reserved_price: None,
         })
     }
 
@@ -246,6 +249,8 @@ mod tests {
         ExtraCostEstimate {
             endpoint: key(),
             max_cost: Cost::from_micros(Unit::Usd, 500).unwrap(),
+            max_input_tokens: 100,
+            max_output_tokens: 10,
         }
     }
 

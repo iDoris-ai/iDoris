@@ -592,28 +592,23 @@ impl SafetyChecker for LlmJudge {
         let input_tokens = chunks
             .saturating_mul(PROMPT_OVERHEAD_TOKENS)
             .saturating_add(text_bytes as u64);
-        let per_call = self.bound(input_tokens)?;
-        // 多块时输出 token 也按块数累加
-        let max_cost = if chunks > 1 {
-            reserve(
-                &ReservePolicy::new(self.settings.max_output_tokens.saturating_mul(chunks), 1)
-                    .ok()?,
-                &ReserveRequest {
-                    requested_max_tokens: Some(
-                        self.settings.max_output_tokens.saturating_mul(chunks),
-                    ),
-                    input_tokens_estimate: input_tokens,
-                },
-                &self.settings.cost_rates,
-            )
-            .ok()?
-            .amount
-        } else {
-            per_call
-        };
+        // 多块时输出 token 也按块数累加（一块时就是一次调用的上界）
+        let output_cap = self.settings.max_output_tokens.saturating_mul(chunks);
+        let reserved = reserve(
+            &ReservePolicy::new(output_cap, 1).ok()?,
+            &ReserveRequest {
+                requested_max_tokens: Some(output_cap),
+                input_tokens_estimate: input_tokens,
+            },
+            &self.settings.cost_rates,
+        )
+        .ok()?;
+        // token 数一并给出：账本要付款单位的价，用检查端点的价目表按同样的 token 数折算（见 `ledger_cost`）
         Some(ExtraCostEstimate {
             endpoint: self.settings.endpoint.clone(),
-            max_cost,
+            max_cost: reserved.amount,
+            max_input_tokens: input_tokens,
+            max_output_tokens: reserved.effective_max_tokens,
         })
     }
 }

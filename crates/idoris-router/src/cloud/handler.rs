@@ -32,7 +32,8 @@
 //! | 安全检查没能给出结论（超时、出错、返回无法解析、没有配置……），失败即关闭 | 503 | `safety_unavailable`；`stage` / `cause`；`X-iDoris-Reason` |
 //!
 //! 给 eduai 的是稳定的码，**不回显被拒的内容**；`category`（自伤、成人内容……）只在这次响应里给，让 eduai 选对给孩子的话术，
-//! 不写进任何账本、日志或审计。
+//! 不写进任何账本、日志或审计。码同时在 `X-iDoris-Reason` 头里，和体验分级的头同一套 [`EXPOSED_HEADERS`]（浏览器读得到）。
+//! 安全检查本身的成本被准入拒绝（余额、速率、在途、补贴池……）时，返回准入类的原因码（402 / 429 / 403，同上表），不检查、不出网。
 
 use std::sync::Arc;
 
@@ -421,6 +422,9 @@ fn safety_response(
     response
         .headers_mut()
         .insert(HEADER_REASON, HeaderValue::from_static(code.as_str()));
+    // 和 S3 的体验分级头同一套：`X-iDoris-Reason` 在 [`EXPOSED_HEADERS`] 里，浏览器的 JS 读得到；不另列一份。
+    // 安全拒绝不在四级阶梯上（不是「钱不够」），所以没有 `X-iDoris-Tier`。
+    expose_headers(&mut response);
     response
 }
 
