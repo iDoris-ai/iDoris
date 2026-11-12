@@ -6,7 +6,7 @@
 >
 > 本次没有登录任何供应商后台，没有调用付费 API，没有测量新加坡到上游的延迟。设计稿 §15 里的泰国 PDPA 条文、AI 法草案、SQLite 负载，不在这次范围内。
 
-设计稿 §8（定稿 1.0）规定：`child_edu` 只用「零数据留存（ZDR）且已签数据处理协议（DPA）」的端点，候选是 DeepInfra 与 OpenRouter 的 ZDR 路由，不用 DeepSeek 官方；`adult` 可以再加 DeepSeek 官方。本次核验的结论是：**这两个候选今天都不能写入「已允许 child_edu」**。公开条款里的 ZDR 都有例外，DPA 都还没有以本项目的名义签署，OpenRouter 的服务条款还禁止转售 API。
+设计稿 §8（定稿 1.0）规定：`child_edu` 只用「零数据留存（ZDR）且已签数据处理协议（DPA）」的端点，候选是 DeepInfra 与 OpenRouter 的 ZDR 路由，不用 DeepSeek 官方；`adult` 可以再加 DeepSeek 官方。本次核验的结论是：**这两个候选今天都不能写入「已允许 child_edu」**。公开条款里的 ZDR 都有例外，DPA 都还没有以本项目的名义签署，OpenRouter 的自助条款还禁止为转售 API 访问而使用（企业协议另有明文的终端客户许可，见 §2 复核更正）。
 
 ## 怎么读置信度
 
@@ -157,9 +157,11 @@ https://openrouter.ai/docs/guides/features/zdr （查询 2026-11-12）
 
 条款写：使用服务的人必须年满 18 岁。禁止「access the Site or Service for purposes of reselling API access to Models or otherwise developing a competing service」。另禁止出售或转让访问权。https://openrouter.ai/terms
 
-企业准入协议第 2.3.7 条同样禁止出租、转售或让第三方访问、使用服务。https://openrouter.ai/terms-of-service-enterprise
+企业准入协议（页面标注更新于 2026-06-22）第 2.3.7 条禁止「rent, resell or otherwise allow any third-party access to or use of the Service」。**但同一协议第 2.1(a)(ii) 条明文授予许可，可以「making the Service available to Customer's End Customers」**；第 1.11 条把 End Customers 定义为通过本协议访问服务的客户的客户，序言也写明服务用于「customers' products and services」。协议没有正面调和这两条；按常见读法，2.1(a)(ii) 是对终端客户使用的专门授权，2.3.7 针对的是把访问权本身拿去出租或转卖。该许可不可再许可（non-sublicensable）。https://openrouter.ai/terms-of-service-enterprise （2026-11-12 主会话复核原文）
 
-iDoris 计算服务的产品形态就是把上游 token 提供给 eduai 和 Agent24。这与上述句子直接相关。在拿到书面例外之前，不能把 OpenRouter 当成已允许的上游。年龄条款约束的是账户持有人，没有写成「禁止处理终端用户中的儿童数据」，也没有写成允许。**儿童数据是否被 DPA 或 AUP 排除：未核实。**
+> **复核更正（2026-11-12，主会话）**：初稿只写了 2.3.7 的禁止，漏了 2.1(a)(ii) 的终端客户许可，因此把 OpenRouter 写成「卡在转售禁令上」。更正后的结论是：**自助条款**（第 7 条第 4 项）禁止为转售 API 访问而使用，且自助条款没有明文授予终端客户使用权，只在 §5.1 承认「客户把服务嵌入自己的产品」；**企业协议**明文允许把服务提供给自己的终端客户。iDoris 云形态把 token 经自己的账户、凭证、预算提供给 eduai 和 Agent24，更接近「嵌入自己的产品」而不是「转卖原始 API 访问」，但这一定性仍须律师确认。
+
+iDoris 计算服务的产品形态就是把上游 token 提供给 eduai 和 Agent24。走自助账户时，这与第 7 条第 4 项直接相关，不应接入；走企业协议时，有明文的终端客户许可，转售问题基本可解，剩下的是 DPA 正文、留存例外和儿童数据。年龄条款约束的是账户持有人，没有写成「禁止处理终端用户中的儿童数据」，也没有写成允许。**儿童数据是否被 DPA 或 AUP 排除：未核实。**
 
 ### 能力
 
@@ -175,7 +177,7 @@ iDoris 计算服务的产品形态就是把上游 token 提供给 eduai 和 Agen
 
 ### 仍要人做的事
 
-- 若仍想用：先让律师看转售禁令，没有书面例外就不要接入。
+- 若仍想用：只走企业协议（第 2.1(a)(ii) 条有终端客户许可），不走自助账户；让律师确认 iDoris 云形态属于「提供给终端客户」而不是第 2.3.7 条的「转售」。
 - 企业方案、签字 DPA、账户设为全模型组 ZDR only，并排除 Google 与其他模型的 Safety Retention。
 - 确认没有打开输入输出日志，也没有打开 1% 折扣的数据使用。
 - 登录每个候选模型页，核对当前端点的数据政策不是 Safety Retention，也不是「政策不明所以按留存+训练处理」。
@@ -507,7 +509,7 @@ FAQ：免费。没有每百万 token 的 API 价。速率限制见第 5 节。
 3. 阿里云百炼国际站新加坡工作空间，在客户经理开通 ZDR、且型号在已适配清单内、且不走 RAG / 批量 / 有状态 Responses 时，接入区域最近。推理仍可能在「不含中国大陆的全球节点」之间调度，24 小时缓存窗口和最长 2 年的安全日志也还在。区域没有钉死之前，不能把它写成新加坡推理。
 4. Google 区域端点 `asia-southeast1`：只有在关掉持久缓存、不用 Grounding、Interactions 明确 `store=false`、并拿到滥用监测例外之后，才接近零留存。型号是否在新加坡提供，要按当时的型号表再核一次。OpenAI 兼容未核实。
 5. AWS Bedrock：只有不用全球目的地的推理配置、并把该区域的留存设到可接受的模式、需要时向客户团队申请 ZDR，才值得进入短名单。本次看到的新加坡 global 配置不符合「处理留在新加坡附近」。
-6. OpenRouter 的 ZDR only **不要排在前面**。转售被条款禁止；自助默认还允许 Safety Retention；CSAM 例外仍在；下游区域除企业版的欧盟/美国主机名外不可控。它适合作为「模型很多」的线索，不适合作为儿童数据的上游，除非律师拿到书面例外并且后台逐个端点核过。
+6. OpenRouter 的 ZDR only **不要排在前面**。自助条款禁止转售 API 访问，只能走企业协议（有终端客户许可）；自助默认还允许 Safety Retention；CSAM 例外仍在；下游区域除企业版的欧盟/美国主机名外不可控。它适合作为「模型很多」的线索，不适合作为儿童数据的上游，除非走企业协议、律师确认定性并且后台逐个端点核过。
 7. Together、Fireworks、Groq 的公开材料都比「已签 DPA + 无例外 ZDR + 亚太」少一截。Fireworks 的默认不落盘较接近，但亚太无服务器没有公开端点。Groq 的 30 天滥用/可靠性日志不符合严格零留存。
 8. SiliconFlow、OpenTyphoon 官方免费 API、DeepSeek 官方：不进入 child_edu 短名单。前两者的留存陈述分别是冲突或明确用于改进；DeepSeek 官方是设计稿已经排除的，本次阅读支持这个排除。
 
@@ -519,7 +521,7 @@ adult 在设计稿里不要求同一套儿童门槛，但仍要过租户自己�
 2. DeepSeek 官方 `deepseek-flash` / `deepseek-v4-pro`，仅在接受中国处理与存储、以及第 4.3 条改进用途（或确认 API 侧已经退出）之后。价格文档完整，缓存折扣大。没有公开 DPA。
 3. 阿里云百炼新加坡接入，适合「希望接入点在新加坡」的 adult 流量。默认是最多 30 天留存。要更严就走企业 ZDR，并接受推理范围不是单城。
 4. Fireworks、Together、Groq 作为价格或延迟的对照，不在 DPA 正文读完前替代前三名。Together 默认留存，必须先关 Prompt storage。
-5. OpenRouter 仍然卡在转售禁令上。adult 产品若也是把 token 提供给下游用户，禁令一样适用。
+5. OpenRouter 只能走企业协议：自助条款禁止转售 API 访问，企业协议第 2.1(a)(ii) 条允许提供给终端客户。adult 同样适用这一前提。
 
 泰语质量不在这次排序里。设计稿写模型选型以泰语评测集为准。托管上，今天能指出的可用接口只有 OpenTyphoon 文档里的免费研究 API，且它收集数据用于改进，不能进 child_edu。Together 上的 Typhoon 2 8B 无服务器已不可用。AWS 上的下一代 Typhoon API 是否上线，未核实。
 
@@ -529,7 +531,7 @@ adult 在设计稿里不要求同一套儿童门槛，但仍要过租户自己�
 
 1. **律师**看设计稿「ZDR」是否允许：法律/滥用例外、内存缓存、CSAM 保全、阿里云 24 小时缓存窗口、Groq 最多 30 天的可靠性日志。看完再改许可表，不要由工程侧把「有例外」改成 ZDR。
 2. **DeepInfra 销售或 Trust Center**：索取 DPA 全文；服务订单写明可以让终端用户使用；确认无服务器推理区域；问清楚滥用抽存会不会保存正文。
-3. **OpenRouter 企业销售**：在现有条款禁止转售和竞争服务的前提下，是否提供书面例外；要签字 DPA；开通后由人登录隐私设置，把各模型组设为 ZDR only，并排除 Safety Retention；对每个要上的模型看端点政策。
+3. **OpenRouter 企业销售**：确认企业协议第 2.1(a)(ii) 条的终端客户许可覆盖 iDoris 云形态（把 token 经自己的账户与预算提供给 eduai、Agent24），并书面排除第 2.3.7 条的适用；要签字 DPA；开通后由人登录隐私设置，把各模型组设为 ZDR only，并排除 Safety Retention；对每个要上的模型看端点政策。
 4. **DeepSeek**：登录开放平台确认训练退出开关是否覆盖 API；若 adult 需要 DPA，提交合作协议工单并让律师看中国存储。不要为 child_edu 提这个工单当解决方案。
 5. **阿里云客户经理**：评估并开通工作空间 ZDR；书面确认推理节点的地理范围能不能收成新加坡；确认要买的型号在 ZDR 清单内；提供 DPA。开通前默认按最多 30 天留存对待。
 6. **AWS 客户团队**：列出拟用模型在 `ap-southeast-1` 的推理配置文件和目的地区域；申请需要的 ZDR；确认留存设置在账户里是什么模式。不要用 global 配置文件承载有区域约束的数据。

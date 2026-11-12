@@ -92,7 +92,7 @@ endpoints:
       cancel: "仅流式，且仅名单内下游会停算停计费。DeepInfra、Together、Fireworks、DeepSeek 在名单内。Bedrock、Groq、Google、Alibaba 写明尚未支持"
     verified_at: "2026-11-12"
     confidence: "高（路由规则）；具体模型当前端点政策为 unverified"
-    notes: "自助账户未选择时默认允许 Safety Retention，那不是本行。本行要求人在后台设为 ZDR only 并排除 Safety Retention。即便如此，疑似 CSAM 仍可能被留存。条款禁止为转售 API 或建设竞争服务而使用，企业协议同样禁止转售。账户持有人须年满 18 岁。DPA 对商业使用经条款并入，签字件需向企业方案申请。下游默认分类见 OpenRouter provider-logging 页，与各家自己的条款可能不一致。抽成与模型现价：unverified。"
+    notes: "自助账户未选择时默认允许 Safety Retention，那不是本行。本行要求人在后台设为 ZDR only 并排除 Safety Retention。即便如此，疑似 CSAM 仍可能被留存。自助条款禁止为转售 API 或建设竞争服务而使用；企业协议第 2.1(a)(ii) 条明文允许提供给终端客户，第 2.3.7 条禁止转租转卖访问权，定性待律师确认（2026-11-12 主会话复核原文）。账户持有人须年满 18 岁。DPA 对商业使用经条款并入，签字件需向企业方案申请。下游默认分类见 OpenRouter provider-logging 页，与各家自己的条款可能不一致。抽成与模型现价：unverified。"
     sources:
       - "https://openrouter.ai/docs/guides/features/zdr"
       - "https://openrouter.ai/docs/guides/privacy/data-collection"
