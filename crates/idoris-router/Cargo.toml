@@ -62,7 +62,9 @@ ring = "0.17"
 subtle = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
-nix = { workspace = true, features = ["poll"] }
+# S6：`resource` 只用来调用 `setrlimit(RLIMIT_CORE, 0, 0)`（处理儿童数据的部署关闭崩溃转储，见
+# `cloud::safety::hardening`）。这是已有依赖的一个 feature，没有新增任何 crate，Cargo.lock 不变。
+nix = { workspace = true, features = ["poll", "resource"] }
 
 [dev-dependencies]
 async-trait = { workspace = true }

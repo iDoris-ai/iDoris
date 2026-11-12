@@ -381,6 +381,20 @@ pub fn build_app(state: AppState) -> Router {
     } else {
         post(chat_completions).fallback(not_found)
     };
+    // S6：云形态打开时，这三条旧的推理路由没有儿童安全管线，对处理儿童数据的租户一律关闭（不然换个路径就绕过了）。
+    // 云形态没打开时一字不变：路由、顺序、层都和以前一样。
+    let legacy_inference_routes = Router::new()
+        .route("/v1/embeddings", post(embeddings).fallback(not_found))
+        .route("/v1/rerank", post(rerank).fallback(not_found))
+        .route("/v1/messages", post(messages).fallback(not_found));
+    let legacy_inference_routes = if state.cloud.is_some() {
+        legacy_inference_routes.route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            cloud::child_route_guard,
+        ))
+    } else {
+        legacy_inference_routes
+    };
     Router::new()
         .route("/health", get(health))
         .route("/v1/models", get(list_models).fallback(not_found))
@@ -407,9 +421,7 @@ pub fn build_app(state: AppState) -> Router {
             "/v1/inspect",
             post(inspect::post_inspect).fallback(not_found),
         )
-        .route("/v1/embeddings", post(embeddings).fallback(not_found))
-        .route("/v1/rerank", post(rerank).fallback(not_found))
-        .route("/v1/messages", post(messages).fallback(not_found))
+        .merge(legacy_inference_routes)
         .fallback(not_found)
         .layer(middleware::from_fn(
             connection::request_lifecycle_middleware,
