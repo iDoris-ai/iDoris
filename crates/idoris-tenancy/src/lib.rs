@@ -31,3 +31,12 @@ pub mod event_log;
 /// issuance; persistence layers store [`virtual_key::VirtualKeyHash`] plus
 /// non-secret scope metadata.
 pub mod virtual_key;
+
+/// Shared SQLite connection setup for the compute-service forms (S1):
+/// `journal_mode=WAL`, an explicit `busy_timeout` and `foreign_keys=ON`,
+/// applied only to the organization and cloud forms; personal and legacy
+/// tenant deployments keep their connections exactly as they were.
+pub mod sqlite_conn;
+
+#[cfg(test)]
+pub(crate) mod test_support;
