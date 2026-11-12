@@ -11,7 +11,6 @@ mod fixture;
 use fixture::*;
 use idoris_compute_contracts::admission::AdmissionDecision;
 use idoris_compute_contracts::credential::CredentialStatus;
-use idoris_compute_contracts::grant::Purpose;
 use idoris_compute_contracts::ids::{AttemptId, AttemptIndex, IdempotencyKey, RequestId};
 use idoris_compute_contracts::reason::ReasonCode;
 use idoris_tenancy::accounts::AccountStore;
@@ -1131,5 +1130,4 @@ fn releasing_is_idempotent_and_a_missing_hold_is_nothing_to_release() {
             "reserve", "reserve", "reserve", "release", "release", "release"
         ]
     );
-    let _ = Purpose::FreeTier;
 }

@@ -659,7 +659,7 @@ fn extra_costs_left_unsettled_at_close_are_released_with_a_visible_alert() {
 fn reconciliation_really_detects_the_failure_modes_the_hook_exists_to_prevent() {
     // 对账不能只会说「干净」：每一种「两张账不一致」都要真的被发现。
     let env = env("attempts-reconcile-detect", 1_000);
-    let (req, mut request) = start(&env, "rd-1", "cred-e", 100);
+    let (_, mut request) = start(&env, "rd-1", "cred-e", 100);
     apply(
         &env,
         &mut request,
@@ -777,5 +777,4 @@ fn reconciliation_really_detects_the_failure_modes_the_hook_exists_to_prevent() 
         "{:#?}",
         report.mismatches
     );
-    let _ = req;
 }

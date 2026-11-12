@@ -8,7 +8,7 @@
 mod fixture;
 
 use fixture::*;
-use idoris_compute_contracts::account::{AccountKind, AccountStatus};
+use idoris_compute_contracts::account::AccountStatus;
 use idoris_compute_contracts::admission::AdmissionDecision;
 use idoris_compute_contracts::grant::Purpose;
 use idoris_compute_contracts::ids::IdempotencyKey;
@@ -340,16 +340,22 @@ fn grace_eligibility_does_not_depend_on_earlier_overage() {
     let store = paid_chain(&db, 400);
     let first = Req::new(&store, "r-0", 0, "cred-e", 100);
     store.admit_attempt(&first.input()).unwrap();
-    store
+    let outcome = store
         .settle_attempt(&first.attempt, &price(400), ts(T0 + 1_000))
-        .unwrap(); // overage 190，担保人承担
+        .unwrap();
+    // 预留 210，实际 400：overage 190，链上还能吸收（emp 剩 190，paid 很多），全部由担保人承担，平台没有损失
+    assert_eq!(outcome.overage, thb(190));
+    assert_eq!(outcome.sponsor_covered, thb(190));
+    assert_eq!(outcome.platform_loss, thb(0));
+    assert!(!outcome.credential_frozen);
     assert!(
-        !store
+        store
             .alerts(Some(AlertKind::PlatformLoss))
             .unwrap()
             .is_empty()
-            || balance(&store, "emp", T0 + 1_000) == 0
     );
+    // overage 是事实，照常记账：已花是实际的 400，余额 0
+    assert_eq!(balance(&store, "emp", T0 + 1_000), 0);
     store
         .fund_account(&aid("emp"), &thb(20), &key("f-emp-2"), ts(T0 + 2_000))
         .unwrap();
@@ -439,6 +445,39 @@ fn grace_is_never_given_to_an_account_that_is_already_overdrawn() {
 }
 
 #[test]
+fn an_account_that_was_never_provisioned_gets_no_grace_but_one_whose_allowance_ran_out_does() {
+    // 宽限是「额度用完之后的最后一单」。一个什么都没配置过的账户（可用额是失败即关闭填出来的 0）没有「用完」，
+    // 给它宽限就是让每个新账户每月白拿一次完整的预留（平台买单）。
+    let db = TempDb::new("grace-unprovisioned");
+    let store = world(&db);
+    let decision = admit_with_ladder(&store, "r-1", 0, "cred-e", 100, T0);
+    assert_eq!(
+        denied(&decision),
+        Some(ReasonCode::BudgetExhausted),
+        "{decision:?}"
+    );
+    assert!(store.grace_uses(&aid("emp")).unwrap().is_empty());
+    // 对照：有过额度、现在过期了（比如上个月的免费额度，新一个月的还没发）：算「用完」，可以宽限一轮
+    let db2 = TempDb::new("grace-expired-allowance");
+    let store2 = subsidy_world(&db2, 1_000_000);
+    issue(&store2, "p-a", "kid-a", 2026, 11, 1_000, T0).unwrap();
+    store2
+        .set_pool_cap(
+            &aid("pool"),
+            month(2026, 12),
+            &thb(1_000_000),
+            ts(T0 + 31 * DAY),
+        )
+        .unwrap();
+    let december = T0 + 31 * DAY;
+    let decision = admit_with_ladder(&store2, "r-1", 0, "cred-a", 100, december);
+    assert!(
+        matches!(decision, AdmissionDecision::Grace { .. }),
+        "{decision:?}"
+    );
+}
+
+#[test]
 fn allow_grace_false_never_returns_grace() {
     let db = TempDb::new("grace-flag");
     let store = paid_chain(&db, 20);
@@ -448,9 +487,6 @@ fn allow_grace_false_never_returns_grace() {
         AdmissionDecision::Grace { .. }
     ));
     assert!(store.grace_uses(&aid("emp")).unwrap().is_empty());
-    let _ = AccountKind::Member;
-    let _ = AccountStatus::Active;
-    let _ = SettleResult::Settled;
 }
 
 // ------------------------------------------------------------------------------------------

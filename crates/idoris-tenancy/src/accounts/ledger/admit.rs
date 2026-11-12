@@ -162,6 +162,17 @@ fn credit_users(report: &AdmissionReport, chain: &[Account]) -> Vec<(usize, i64)
         .collect()
 }
 
+/// 这个账户有没有被配置过：充值过，或者有过花费类额度（不管现在还生不生效）。
+fn is_provisioned(conn: &Connection, account: &AccountId) -> Result<bool, LedgerError> {
+    Ok(conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM ledger_entries WHERE account_id = ?1 AND kind = 'fund')
+             OR EXISTS (SELECT 1 FROM allocations
+                         WHERE child_id = ?1 AND purpose IN ('free_tier', 'prepaid', 'org_quota'))",
+        [account.as_str()],
+        |row| row.get(0),
+    )?)
+}
+
 /// 读：这个账户本账期已经用掉几次宽限（没作废的）。
 fn active_grace_uses(
     conn: &Connection,
@@ -366,6 +377,11 @@ fn try_grace(
     let Some(available) = available_of(payer_view)? else {
         return Ok(None);
     };
+    // 宽限是「额度用完之后的最后一单」：账户必须有过额度或资金。一个什么都没配置过的账户（可用额是失败即关闭
+    // 填出来的 0）没有「用完」这回事，给它宽限就是让每个新账户每月白拿一次完整的预留（平台买单）。
+    if !is_provisioned(conn, &payer_account.id)? {
+        return Ok(None);
+    }
     let used = active_grace_uses(conn, &payer_account.id, period)?;
     match check_grace(used, &available, reserve_price) {
         Ok(grant) => {
