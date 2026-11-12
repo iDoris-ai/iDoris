@@ -525,7 +525,7 @@ fn every_enum_rejects_unknown_variants_wrong_case_and_wrong_types() {
         CapabilityKind::Cancellation,
     ]);
     // 带校验的字符串类型：region（Unit 的大小写规则另有专门测试，见 money.rs）
-    assert_strict_enum(&[Region::new("us").unwrap()]);
+    assert_strict_enum(&[Region::new("sg-1").unwrap()]);
 }
 
 #[test]

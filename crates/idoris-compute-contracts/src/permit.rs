@@ -13,10 +13,11 @@
 //!     model: example-org/chat-70b            # 模型 id：[A-Za-z0-9._:~/-]，<=128
 //!     endpoint: openai-compat                # 具体端点名：[A-Za-z0-9._-]，<=128。
 //!                                            #   同一供应商同一模型下不同的 API 面/路由方式各一条
-//!                                            #   （如 openrouter 的 `zdr-route` 与 `default-route`）
+//!                                            #   （如 example-router 的 `zdr-route` 与 `default-route`）
 //!     access: api                            # api | subscription。subscription 走 CLI，云形态排除
-//!     processing_regions: [us]               # 推理实际执行的区域，非空、不重复，小写两位字母（ISO 3166-1
-//!                                            #   alpha-2，如 us sg th eu）。路由时必须**全部**被租户允许
+//!     processing_regions: [sg-1]             # 推理实际执行的区域，非空、不重复；与供应商无关的小写标签
+//!                                            #   （如 sg、eu-1、sg-1，格式见 `Region`），表和租户策略必须用同一套
+//!                                            #   标签。路由时必须**全部**被租户允许
 //!     retention: zdr                         # zdr | with_exceptions | retained
 //!                                            #   zdr = 零数据留存；with_exceptions = 有例外（如 Safety
 //!                                            #   Retention）；retained = 会留存
@@ -142,7 +143,16 @@ pub enum AccessPath {
     Subscription,
 }
 
-/// 处理区域：小写两位字母（ISO 3166-1 alpha-2，如 `us`、`sg`、`th`、`eu`）。
+/// 区域标签的最大长度。
+pub const MAX_REGION_LEN: usize = 32;
+
+/// 处理区域：与供应商**无关**的小写标签，表示推理实际在哪里执行。
+///
+/// 格式：以小写字母开头；由小写字母和数字组成的片段，用单个 `-` 连接；总长 `2..=MAX_REGION_LEN`。
+/// 例：`sg`、`eu`、`sg-1`、`th-central`。
+///
+/// 契约**不收录任何云厂商专属的区域名**（没有枚举、没有默认值、没有示例）：区域只是标签，
+/// 由许可表的维护者和租户策略约定，二者必须使用同一套标签（精确匹配）。
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub struct Region(String);
@@ -150,7 +160,15 @@ pub struct Region(String);
 impl Region {
     pub fn new(code: impl Into<String>) -> Result<Self, PermitProblem> {
         let code = code.into();
-        if code.len() == 2 && code.bytes().all(|b| b.is_ascii_lowercase()) {
+        let well_formed = (2..=MAX_REGION_LEN).contains(&code.len())
+            && code.as_bytes().first().is_some_and(u8::is_ascii_lowercase)
+            && code.split('-').all(|segment| {
+                !segment.is_empty()
+                    && segment
+                        .bytes()
+                        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+            });
+        if well_formed {
             Ok(Self(code))
         } else {
             Err(PermitProblem::InvalidRegion(code))
@@ -360,7 +378,9 @@ impl EndpointPermit {
 /// 许可表加载 / 校验的问题。
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum PermitProblem {
-    #[error("invalid region {0:?}: expected two lowercase letters (ISO 3166-1 alpha-2)")]
+    #[error(
+        "invalid region {0:?}: expected a lowercase label like \"sg\" or \"sg-1\" (letters and digits joined by single hyphens, starting with a letter, 2..=32 chars)"
+    )]
     InvalidRegion(String),
     #[error("invalid timestamp {0:?}: expected RFC 3339 or YYYY-MM-DD")]
     InvalidTimestamp(String),
@@ -1052,21 +1072,51 @@ mod tests {
     }
 
     #[test]
-    fn region_is_two_lowercase_letters() {
-        for ok in ["us", "sg", "th", "eu", "cn"] {
+    fn region_is_a_provider_agnostic_lowercase_label() {
+        for ok in [
+            "sg",
+            "eu",
+            "sg-1",
+            "th-1",
+            "th-central",
+            "a1",
+            "region-a-2",
+            &"x".repeat(MAX_REGION_LEN),
+        ] {
             assert_eq!(Region::new(ok).unwrap().as_str(), ok);
         }
-        for bad in ["", "u", "usa", "US", "u1", "u-", "ü", "u s"] {
+        for bad in [
+            "",
+            "u",
+            "US",
+            "SG-1",
+            "Sg-1",
+            "1sg",
+            "-sg",
+            "sg-",
+            "sg--1",
+            "sg_1",
+            "sg 1",
+            "sg.1",
+            "sg/1",
+            "ü",
+            "sg-1\n",
+            &"x".repeat(MAX_REGION_LEN + 1),
+        ] {
             assert!(Region::new(bad).is_err(), "{bad:?}");
         }
-        assert!(serde_json::from_str::<Region>("\"US\"").is_err());
+        assert!(serde_json::from_str::<Region>("\"SG-1\"").is_err());
+        assert_eq!(
+            serde_json::to_string(&Region::new("sg-1").unwrap()).unwrap(),
+            "\"sg-1\""
+        );
     }
 
     // ---------- 加载与校验 ----------
 
     fn entry_yaml(provider: &str, extra: &str) -> String {
         format!(
-            "  - provider: {provider}\n    model: m\n    endpoint: e\n    access: api\n    processing_regions: [us]\n    retention: zdr\n    dpa: signed\n    allowed_data_classes: [adult]\n    capabilities: {{tool_calling: true, stream_usage: true, cache_pricing: false, structured_output: true, cancellation: true}}\n    verified_at: \"2026-11-05\"\n{extra}"
+            "  - provider: {provider}\n    model: m\n    endpoint: e\n    access: api\n    processing_regions: [sg-1]\n    retention: zdr\n    dpa: signed\n    allowed_data_classes: [adult]\n    capabilities: {{tool_calling: true, stream_usage: true, cache_pricing: false, structured_output: true, cancellation: true}}\n    verified_at: \"2026-11-05\"\n{extra}"
         )
     }
 
@@ -1165,7 +1215,7 @@ mod tests {
                 base.replace("    verified_at: \"2026-11-05\"\n", ""),
             ),
             ("bad verified_at", base.replace("2026-11-05", "05/11/2026")),
-            ("bad region", base.replace("[us]", "[usa]")),
+            ("bad region", base.replace("[sg-1]", "[SG-1]")),
             (
                 "capability not a bool",
                 base.replace("tool_calling: true", "tool_calling: yes please"),
@@ -1201,14 +1251,18 @@ mod tests {
             ))
         };
         assert_eq!(
-            bad("processing_regions: [us]", "processing_regions: []").unwrap_err(),
+            bad("processing_regions: [sg-1]", "processing_regions: []").unwrap_err(),
             PermitError::Entry {
                 endpoint: key("p", "m", "e"),
                 problem: PermitProblem::NoRegions
             }
         );
         assert!(matches!(
-            bad("processing_regions: [us]", "processing_regions: [us, us]").unwrap_err(),
+            bad(
+                "processing_regions: [sg-1]",
+                "processing_regions: [sg-1, sg-1]"
+            )
+            .unwrap_err(),
             PermitError::Entry {
                 problem: PermitProblem::DuplicateRegion(_),
                 ..
@@ -1522,14 +1576,14 @@ mod tests {
     #[test]
     fn regions_must_all_be_allowed() {
         let t = table();
-        let multi = key("example-router", "example-org/chat-70b", "zdr-route"); // regions [us, eu]
+        let multi = key("example-router", "example-org/chat-70b", "zdr-route"); // regions [sg-1, eu-1]
         for (allowed, ok) in [
             (None, true),
-            (Some(regions(&["us", "eu"])), true),
-            (Some(regions(&["us", "eu", "sg"])), true),
-            (Some(regions(&["us"])), false), // eu 不被允许：只要有一个不允许就不行
-            (Some(regions(&["eu"])), false),
-            (Some(regions(&["sg"])), false),
+            (Some(regions(&["sg-1", "eu-1"])), true),
+            (Some(regions(&["sg-1", "eu-1", "th-1"])), true),
+            (Some(regions(&["sg-1"])), false), // eu-1 不被允许：只要有一个不允许就不行
+            (Some(regions(&["eu-1"])), false),
+            (Some(regions(&["th-1"])), false),
         ] {
             let tenant = TenantDataPolicy::new(
                 classes(&[DataClass::Adult]),
@@ -1548,7 +1602,7 @@ mod tests {
         }
         let tenant = TenantDataPolicy::new(
             classes(&[DataClass::Adult]),
-            Some(regions(&["us"])),
+            Some(regions(&["sg-1"])),
             Retention::Retained,
             false,
         )
@@ -1563,7 +1617,7 @@ mod tests {
         assert_eq!(
             err.excluded[0].reasons,
             vec![ExcludeReason::RegionNotAllowed {
-                regions: vec![Region::new("eu").unwrap()]
+                regions: vec![Region::new("eu-1").unwrap()]
             }]
         );
     }
@@ -1816,10 +1870,10 @@ mod tests {
     #[test]
     fn every_reason_for_one_endpoint_is_reported_together() {
         let t = table();
-        let official = key("example-official", "example-org/chat-70b", "official-api"); // retained, unsigned, [cn], adult+public, stream_usage?
+        let official = key("example-official", "example-org/chat-70b", "official-api"); // retained, unsigned, [cn-1], adult+public, 无流式 usage 与缓存计价
         let tenant = TenantDataPolicy::new(
             classes(&[DataClass::ChildEdu]),
-            Some(regions(&["th"])),
+            Some(regions(&["th-1"])),
             Retention::Zdr,
             true,
         )
@@ -1877,7 +1931,7 @@ mod tests {
         );
         let p = TenantDataPolicy::new(
             classes(&[DataClass::Adult, DataClass::Public]),
-            Some(regions(&["sg", "us"])),
+            Some(regions(&["th-1", "sg-1"])),
             Retention::WithExceptions,
             true,
         )
@@ -1885,7 +1939,7 @@ mod tests {
         let json = serde_json::to_string(&p).unwrap();
         assert_eq!(
             json,
-            r#"{"data_classes":["adult","public"],"allowed_regions":["sg","us"],"max_retention":"with_exceptions","require_dpa":true}"#
+            r#"{"data_classes":["adult","public"],"allowed_regions":["sg-1","th-1"],"max_retention":"with_exceptions","require_dpa":true}"#
         );
         assert_eq!(serde_json::from_str::<TenantDataPolicy>(&json).unwrap(), p);
         assert!(serde_json::from_str::<TenantDataPolicy>(r#"{"data_classes":[],"allowed_regions":null,"max_retention":"zdr","require_dpa":false}"#).is_err());

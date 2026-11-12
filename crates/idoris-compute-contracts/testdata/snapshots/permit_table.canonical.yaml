@@ -6,7 +6,7 @@ endpoints:
   endpoint: openai-compat
   access: api
   processing_regions:
-  - us
+  - sg-1
   retention: zdr
   dpa: signed
   allowed_data_classes:
@@ -28,8 +28,8 @@ endpoints:
   endpoint: zdr-route
   access: api
   processing_regions:
-  - us
-  - eu
+  - sg-1
+  - eu-1
   retention: zdr
   dpa: signed
   allowed_data_classes:
@@ -43,14 +43,14 @@ endpoints:
     structured_output: true
     cancellation: true
   verified_at: 2026-11-05T08:30:00Z
-  notes: 假数据：聚合路由的「只走 ZDR」路由；推理可能落在 us 或 eu，所以两个区域都要列。
+  notes: 假数据：聚合路由的「只走 ZDR」路由；推理可能落在 sg-1 或 eu-1，所以两个区域都要列。
 - provider: example-router
   model: example-org/chat-70b
   endpoint: default-route
   access: api
   processing_regions:
-  - us
-  - eu
+  - sg-1
+  - eu-1
   retention: with_exceptions
   dpa: signed
   allowed_data_classes:
@@ -69,7 +69,7 @@ endpoints:
   endpoint: official-api
   access: api
   processing_regions:
-  - cn
+  - cn-1
   retention: retained
   dpa: unsigned
   allowed_data_classes:
@@ -87,7 +87,7 @@ endpoints:
   endpoint: openai-compat
   access: api
   processing_regions:
-  - sg
+  - th-1
   retention: zdr
   dpa: signed
   allowed_data_classes:
@@ -104,7 +104,7 @@ endpoints:
   endpoint: subscription-cli
   access: subscription
   processing_regions:
-  - us
+  - sg-1
   retention: retained
   dpa: unsigned
   allowed_data_classes:
@@ -123,7 +123,7 @@ endpoints:
   endpoint: openai-compat
   access: api
   processing_regions:
-  - us
+  - sg-1
   retention: zdr
   dpa: signed
   allowed_data_classes:

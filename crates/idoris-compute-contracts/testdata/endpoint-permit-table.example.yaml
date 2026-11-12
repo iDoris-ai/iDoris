@@ -1,14 +1,14 @@
 # 端点级许可表 —— schema 示例与测试夹具。
 #
-# 这里全部是**明显的假数据**：供应商、模型、端点都叫 `example-*`，不对应任何真实供应商，
-# 不代表任何真实的留存、DPA 或区域结论。真实数据由 S8（端点核验）另行产出，必须符合本文件展示的 schema。
-# 字段名与取值的完整说明见 `idoris_compute_contracts::permit` 的模块文档。
+# 这里全部是**明显的假数据**：供应商、模型、端点都叫 `example-*`，区域是假标签（`sg-1`、`eu-1` ……），
+# 不对应任何真实的供应商或云厂商，不代表任何真实的留存、DPA 或区域结论。真实数据由 S8（端点核验）另行产出，
+# 必须符合本文件展示的 schema。字段名与取值的完整说明见 `idoris_compute_contracts::permit` 的模块文档。
 #
 # 这份文件同时覆盖每一条路由规则（见 permit.rs 的测试）：
 #   1. example-zdr-host     ZDR + 已签 DPA，允许 child_edu，单区域
-#   2. example-router/zdr   ZDR + 已签 DPA，允许 child_edu，多区域（us + eu）
+#   2. example-router/zdr   ZDR + 已签 DPA，允许 child_edu，多区域（sg-1 + eu-1）
 #   3. example-router/default  有例外（with_exceptions），不允许 child_edu
-#   4. example-official     会留存、未签 DPA、区域 cn、不支持流式 usage
+#   4. example-official     会留存、未签 DPA、区域 cn-1、不支持流式 usage
 #   5. example-cheap-host   只允许 public，不支持流式 usage
 #   6. example-cli          subscription 路径（走 CLI），云形态排除
 #   7. example-stale-host   核验时间很早：到测试用的「现在」已经过期，自动停用
@@ -21,7 +21,7 @@ endpoints:
     model: example-org/chat-70b
     endpoint: openai-compat
     access: api
-    processing_regions: [us]
+    processing_regions: [sg-1]
     retention: zdr
     dpa: signed
     allowed_data_classes: [child_edu, adult, public]
@@ -39,7 +39,7 @@ endpoints:
     model: example-org/chat-70b
     endpoint: zdr-route
     access: api
-    processing_regions: [us, eu]
+    processing_regions: [sg-1, eu-1]
     retention: zdr
     dpa: signed
     allowed_data_classes: [child_edu, adult, public]
@@ -50,13 +50,13 @@ endpoints:
       structured_output: true
       cancellation: true
     verified_at: "2026-11-05T08:30:00Z"
-    notes: "假数据：聚合路由的「只走 ZDR」路由；推理可能落在 us 或 eu，所以两个区域都要列。"
+    notes: "假数据：聚合路由的「只走 ZDR」路由；推理可能落在 sg-1 或 eu-1，所以两个区域都要列。"
 
   - provider: example-router
     model: example-org/chat-70b
     endpoint: default-route
     access: api
-    processing_regions: [us, eu]
+    processing_regions: [sg-1, eu-1]
     retention: with_exceptions
     dpa: signed
     allowed_data_classes: [adult, public]
@@ -73,7 +73,7 @@ endpoints:
     model: example-org/chat-70b
     endpoint: official-api
     access: api
-    processing_regions: [cn]
+    processing_regions: [cn-1]
     retention: retained
     dpa: unsigned
     allowed_data_classes: [adult, public]
@@ -89,7 +89,7 @@ endpoints:
     model: example-org/small-8b
     endpoint: openai-compat
     access: api
-    processing_regions: [sg]
+    processing_regions: [th-1]
     retention: zdr
     dpa: signed
     allowed_data_classes: [public]
@@ -105,7 +105,7 @@ endpoints:
     model: example-org/chat-70b
     endpoint: subscription-cli
     access: subscription
-    processing_regions: [us]
+    processing_regions: [sg-1]
     retention: retained
     dpa: unsigned
     allowed_data_classes: [adult, public]
@@ -122,7 +122,7 @@ endpoints:
     model: example-org/chat-70b
     endpoint: openai-compat
     access: api
-    processing_regions: [us]
+    processing_regions: [sg-1]
     retention: zdr
     dpa: signed
     allowed_data_classes: [child_edu, adult, public]

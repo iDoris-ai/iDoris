@@ -22,7 +22,7 @@
       "model": "example-org/chat-70b",
       "notes": "假数据：单区域的 ZDR 托管方。",
       "processing_regions": [
-        "us"
+        "sg-1"
       ],
       "provider": "example-zdr-host",
       "retention": "zdr",
@@ -45,10 +45,10 @@
       "dpa": "signed",
       "endpoint": "zdr-route",
       "model": "example-org/chat-70b",
-      "notes": "假数据：聚合路由的「只走 ZDR」路由；推理可能落在 us 或 eu，所以两个区域都要列。",
+      "notes": "假数据：聚合路由的「只走 ZDR」路由；推理可能落在 sg-1 或 eu-1，所以两个区域都要列。",
       "processing_regions": [
-        "us",
-        "eu"
+        "sg-1",
+        "eu-1"
       ],
       "provider": "example-router",
       "retention": "zdr",
@@ -72,8 +72,8 @@
       "model": "example-org/chat-70b",
       "notes": "假数据：同一个聚合路由的默认路由，有例外留存（比如安全留存），所以不能用于 child_edu。",
       "processing_regions": [
-        "us",
-        "eu"
+        "sg-1",
+        "eu-1"
       ],
       "provider": "example-router",
       "retention": "with_exceptions",
@@ -96,7 +96,7 @@
       "endpoint": "official-api",
       "model": "example-org/chat-70b",
       "processing_regions": [
-        "cn"
+        "cn-1"
       ],
       "provider": "example-official",
       "retention": "retained",
@@ -118,7 +118,7 @@
       "endpoint": "openai-compat",
       "model": "example-org/small-8b",
       "processing_regions": [
-        "sg"
+        "th-1"
       ],
       "provider": "example-cheap-host",
       "retention": "zdr",
@@ -142,7 +142,7 @@
       "model": "example-org/chat-70b",
       "notes": "假数据：订阅账号走 CLI，云形态必须排除。",
       "processing_regions": [
-        "us"
+        "sg-1"
       ],
       "provider": "example-cli",
       "retention": "retained",
@@ -167,7 +167,7 @@
       "model": "example-org/chat-70b",
       "notes": "假数据：核验时间很早，用来演示过期自动停用。",
       "processing_regions": [
-        "us"
+        "sg-1"
       ],
       "provider": "example-stale-host",
       "retention": "zdr",

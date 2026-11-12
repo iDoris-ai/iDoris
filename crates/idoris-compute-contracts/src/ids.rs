@@ -176,7 +176,7 @@ token_id!(
     NodeId, kind = "node id", max = MAX_NODE_ID_LEN, colon_tilde = false
 );
 token_id!(
-    /// 供应商 id（许可表里的 `provider`），如 `deepinfra`。
+    /// 供应商 id（许可表里的 `provider`），如 `example-provider`。
     ProviderId, kind = "provider id", max = MAX_ID_LEN, colon_tilde = false
 );
 token_id!(
@@ -191,13 +191,13 @@ token_id!(
 );
 token_id!(
     /// 具体端点名（许可表里的 `endpoint`）：同一个供应商、同一个模型下，不同的 API 面或路由方式，
-    /// 例如 `openrouter-zdr` 与 `openrouter-default` 是两个端点，留存不同。只是标签，不含 URL。
+    /// 例如 `example-router-zdr` 与 `example-router-default` 是两个端点，留存不同。只是标签，不含 URL。
     EndpointName, kind = "endpoint name", max = MAX_ID_LEN, colon_tilde = false
 );
 
 /// 模型 id。
 ///
-/// 供应商的模型名里常见 `/` 和 `:`（`deepseek-ai/DeepSeek-V3.2`、`qwen3:32b`），所以字符集比
+/// 供应商的模型名里常见 `/` 和 `:`（`example-org/example-model-v1`、`example-model:32b`），所以字符集比
 /// 其它 id 宽：在 `A-Za-z0-9 . _ - : ~ /` 之间。仍然禁止空白、`@`、`#`。
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
@@ -523,8 +523,8 @@ mod tests {
 
     #[test]
     fn model_id_allows_slash_and_colon_but_not_whitespace() {
-        assert!(ModelId::new("deepseek-ai/DeepSeek-V3.2").is_ok());
-        assert!(ModelId::new("qwen3:32b").is_ok());
+        assert!(ModelId::new("example-org/example-model-v1").is_ok());
+        assert!(ModelId::new("example-model:32b").is_ok());
         assert!(ModelId::new("a b").is_err());
         assert!(ModelId::new("a@b").is_err());
         assert!(ModelId::new("").is_err());
@@ -533,21 +533,25 @@ mod tests {
 
     #[test]
     fn endpoint_key_is_a_three_part_key_with_strict_json() {
-        let key =
-            EndpointKey::new("deepinfra", "deepseek-ai/DeepSeek-V3.2", "openai-compat").unwrap();
+        let key = EndpointKey::new(
+            "example-provider",
+            "example-org/example-model-v1",
+            "compat-api",
+        )
+        .unwrap();
         assert_eq!(
             key.to_string(),
-            "deepinfra/deepseek-ai/DeepSeek-V3.2@openai-compat"
+            "example-provider/example-org/example-model-v1@compat-api"
         );
         let json = serde_json::to_string(&key).unwrap();
         assert_eq!(
             json,
-            r#"{"provider":"deepinfra","model":"deepseek-ai/DeepSeek-V3.2","endpoint":"openai-compat"}"#
+            r#"{"provider":"example-provider","model":"example-org/example-model-v1","endpoint":"compat-api"}"#
         );
         assert_eq!(serde_json::from_str::<EndpointKey>(&json).unwrap(), key);
-        // 同一个供应商和模型下，不同端点是不同的键（比如 OpenRouter 的 ZDR 路由）
-        let zdr = EndpointKey::new("openrouter", "m", "zdr").unwrap();
-        let default = EndpointKey::new("openrouter", "m", "default").unwrap();
+        // 同一个供应商和模型下，不同端点是不同的键（比如聚合路由的 ZDR 路由与默认路由）
+        let zdr = EndpointKey::new("example-router", "m", "zdr").unwrap();
+        let default = EndpointKey::new("example-router", "m", "default").unwrap();
         assert_ne!(zdr, default);
         // 供应商 id 与端点名不允许 `:` `~`；缺字段、多字段都拒绝
         assert!(EndpointKey::new("a:b", "m", "e").is_err());

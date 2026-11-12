@@ -406,7 +406,7 @@ fn endpoint_permit_table_in_json_and_canonical_yaml() {
             .into_iter()
             .collect(),
         Some(
-            [idoris_compute_contracts::permit::Region::new("us").unwrap()]
+            [idoris_compute_contracts::permit::Region::new("sg-1").unwrap()]
                 .into_iter()
                 .collect(),
         ),

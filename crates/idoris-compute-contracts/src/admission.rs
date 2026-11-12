@@ -1163,7 +1163,8 @@ mod tests {
 
     fn admitted() -> Admitted {
         Admitted {
-            endpoint: EndpointKey::new("deepinfra", "org/model", "default").unwrap(),
+            endpoint: EndpointKey::new("example-provider", "example-org/example-model", "default")
+                .unwrap(),
             payer: aid("s1"),
             effective_max_tokens: 400,
             reservation: Reservation {
