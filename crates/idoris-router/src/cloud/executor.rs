@@ -327,6 +327,15 @@ impl CloudExecutor {
 
     /// 没有任何尝试发出就被拒：留一行已关闭的请求记录（审计），然后返回错误。
     fn reject(&self, call: &CloudCall, error: CloudError) -> CloudError {
+        if let CloudError::NoCompliantEndpoint(none) = &error {
+            // 只有端点名和排除原因的枚举，没有任何请求内容：给运维看「为什么没有合规候选」
+            for excluded in &none.excluded {
+                eprintln!(
+                    "[idoris] cloud: request {} excluded {}: {:?}",
+                    call.request_id, excluded.endpoint, excluded.reasons
+                );
+            }
+        }
         let classes = call.tenant.data_classes();
         if let Err(record_error) = self
             .store

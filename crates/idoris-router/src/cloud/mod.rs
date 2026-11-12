@@ -30,6 +30,39 @@
 //! - **S6**：非流式回答在发布前停在 [`answer::PendingAnswer`]，完整输出检查放在 `publish()` 之前，不通过就
 //!   `withhold(..)`（用户付 0）；edu 一律非流式的拒绝已经在 `handler` 里（先于任何上游调用）。
 
+//!
+//! # 对设计稿 / S0 含糊处的理解（没有悄悄拍板，等 owner 确认）
+//!
+//! 1. **连接失败不回到 `not_sent`**：`reqwest` 的 `send` 把连接、写请求、等响应头合在一个 future 里，没法在「连接成功」
+//!    与「开始写」之间落库。为了守住「先记 `WireWriteStarted` 再写字节」，`send` 一开始就按「字节可能已经出去」算：
+//!    连接被拒 / DNS / TLS 失败的尝试保持 `maybe_executed`（成本按预留额挂账，对账查无此单后释放），失败标注是
+//!    `connect_failed`。`never_left_host` 只用于 `prepare` 阶段的本地失败（取不到密钥、请求体不合法）。要做到精确，
+//!    得给 `reqwest` 的连接器插一层（新增 `tower` 直接依赖并关掉连接复用）或给契约加「连接失败证据」事件——都没有做。
+//! 2. **所有 4xx 都按契约当作「没执行」**（含 408、429；既有 `ChatProxy` 把 408 当作不确定）；**2xx 之后的任何失败**
+//!    （响应体坏、流里报错、首个事件前断开）按「确认执行了、usage 未知」（`ExecutionObservedUsageUnknown`）。
+//! 3. **哪些首字节前的失败会切换**：见 [`status_allows_failover`]。请求形状被拒的 4xx（400 / 413 / 422……）不切换：
+//!    换一个同样合规的上游多半也被拒，而每多发一次，孩子的输入就多送给一个上游（数据最小化）。
+//! 4. **错 usage = usage 未知**：结构不对、`total_tokens` 对不上、缓存大于输入、输出超过发给上游的 `max_tokens`、
+//!    金额溢出，用户按预留价付费；上游声称的数字（只含数字字段）进 `usage_claim_json` 供对账。
+//! 5. **客户端取消**：首字节前取消，尝试保持 `maybe_executed`；首字节后断开，看许可表里这个端点的「取消」能力：
+//!    有 → 执行确认、usage 未知（按预留结算）；没有 → 上游可能还在计费，保持 `maybe_executed`。两种情况用户都按预留价付费
+//!    （契约规则：已发布且 usage 未知）——产品上可能想按已转发量估算，没做。
+//! 6. **供应商请求号**：正文里的 `id` 优先，其次是配置的响应头；格式不对只留标注；同一供应商下别的尝试用过同一个号、
+//!    或流中途换了号：两条记录都保留并标注，不拒绝服务（丢掉审计痕迹比重复更糟）。
+//! 7. **分录**：`user_price`（只有发布的那次）、`platform_cost`（按实际用量的成本）、`hold`（按预留额挂账待核销的成本，
+//!    `maybe_executed` 与 usage 未知）、`release`（从用户额度释放的价预留）；零金额不记；
+//!    一个请求至多一个付费尝试、至多一条正的 `user_price`（唯一索引）。
+//! 8. **S0 `ReasonCode` 之外的稳定字符串**：请求记录的 `reason_code` 里还有 `upstream_unavailable`、`client_cancelled`、
+//!    `upstream_stream_failed` 等；HTTP `error.type` 里还有 `upstream_error`、`caller_not_configured`、`cloud_unavailable`、
+//!    `streaming_not_allowed`。S0 没有「所有上游都失败」这一类原因码。
+//! 9. **edu 一律非流式**：S0 把它划给 S6，但漏掉它会让儿童数据绕过完整输出检查，所以 S4 在处理函数里就拒绝
+//!    （先于任何上游调用，400 `streaming_not_allowed`）。
+//! 10. **后一个候选被准入拒绝**：已经有尝试失败时，请求以上游失败（502）结束，不是 402。
+//! 11. **付款上下文**：静态调用方簿经 S0 的 `resolve_payment_context`（平台 -> 组织账户、节点凭证）得到，不绕过契约的唯一入口；
+//!     `QUOTA` 单位在云形态被拒绝。S1 / S2 / S5 落地后换成账户库里按凭证解析的真实付款上下文。
+//! 12. **`Request` 的持久化**：创建时的快照 JSON（不可变）+ 规范化的查询列；`state_json` 是状态的真相，`state`、`certainty`、
+//!     usage 是它的派生列（CHECK 与生成列）。
+
 use std::path::Path;
 use std::sync::Arc;
 
