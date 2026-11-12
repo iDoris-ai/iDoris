@@ -26,9 +26,9 @@
 //!
 //! | [`CredentialBinding`] | 例子 | 付款账户 |
 //! |---|---|---|
-//! | `Service { account }` | eduai 后端的服务凭证 | 请求必须带一个成员（主体）id；付款账户是该主体在 `account`（须是 `Org`）子树里**唯一**的、有效的成员子账户 |
+//! | `Service { account }` | eduai 后端的服务凭证 | 请求必须带一个成员（主体）id；付款账户是该主体在 `account`（须是 `Org`）子树里**唯一**的、有效的可付款账户（成员子账户，或担保人自己的账户） |
 //! | `Node { account }` | 组织节点调用云端档的凭证 | 就是 `account`（须是 `Org`）本身；**不允许**带成员 id（云端只认组织付款账户，设计稿 §9） |
-//! | `Member { membership }` | 成员子凭证 / Agent24 个人云账号 | 该成员关系的成员子账户；若带了成员 id，必须就是自己 |
+//! | `Member { membership }` | 成员子凭证 / Agent24 个人云账号 | 该成员关系的付款账户（成员角色或担保人角色；管理员关系没有付款账户，不能绑）；若带了成员 id，必须就是自己 |
 //!
 //! # 下发的权限不能超过授权者本人
 //!
@@ -321,6 +321,12 @@ impl ResolveError {
     }
 }
 
+/// 成员关系的角色是否有付款账户：成员（学生、Agent24 实例）和担保人（老师自己备课也要花钱）有，
+/// 管理员没有。
+fn is_payable_role(role: MembershipRole) -> bool {
+    matches!(role, MembershipRole::Member | MembershipRole::Sponsor)
+}
+
 /// 由凭证（加上经校验的成员 id）得到这次请求唯一的付款上下文。
 ///
 /// 检查顺序固定（所以同一份坏数据永远报同一个错）：
@@ -359,10 +365,10 @@ pub fn resolve_payment_context(
             if principal.status == PrincipalStatus::Revoked {
                 return Err(ResolveError::PrincipalRevoked(principal.id.clone()));
             }
-            // 该主体在 `anchor` 子树里的全部「成员」角色成员关系
+            // 该主体在 `anchor` 子树里的全部「可付款」成员关系（成员或担保人角色，都有付款账户）
             let candidates: Vec<_> = dir
                 .memberships_of(who)
-                .filter(|m| m.role == MembershipRole::Member)
+                .filter(|m| is_payable_role(m.role))
                 .filter(|m| {
                     m.account
                         .as_ref()
@@ -415,7 +421,7 @@ pub fn resolve_payment_context(
                     target: format!("membership {} without a payment account", m.id),
                 });
             };
-            if m.role != MembershipRole::Member {
+            if !is_payable_role(m.role) {
                 return Err(ResolveError::InvalidBinding {
                     binding: "member",
                     target: format!("{:?} membership {}", m.role, m.id),
@@ -648,6 +654,10 @@ mod tests {
         assert_eq!(ctx.unit(), &Unit::Thb);
         let ctx2 = resolve(&dir, &c, Some("kid2")).unwrap();
         assert_eq!(ctx2.payer(), &aid("s2"));
+        // 担保人（老师）自己用，从她自己的担保人账户付；她同时还有一个没有付款账户的管理员关系，不影响
+        let teacher = resolve(&dir, &c, Some("tch")).unwrap();
+        assert_eq!(teacher.payer(), &aid("teacher"));
+        assert_eq!(teacher.membership(), Some(&mid("m-tch")));
     }
 
     #[test]
@@ -659,9 +669,21 @@ mod tests {
             resolve(&dir, &c, Some("adult")).unwrap_err(),
             ResolveError::MemberNotInScope
         );
-        // 老师没有「成员」角色的成员关系
+        // 只有管理员关系、没有付款账户的主体：不是付款方
+        let admin_only = sample_directory_with(sample_tree(), |parts| {
+            parts
+                .principals
+                .push(principal("boss", PrincipalStatus::Active));
+            parts.memberships.push(crate::test_support::membership(
+                "m-boss",
+                "boss",
+                "eduai",
+                MembershipRole::Admin,
+                None,
+            ));
+        });
         assert_eq!(
-            resolve(&dir, &c, Some("tch")).unwrap_err(),
+            resolve(&admin_only, &c, Some("boss")).unwrap_err(),
             ResolveError::MemberNotInScope
         );
         // 不存在的主体，和「不在范围」同一个错误（不泄露存在性）
@@ -718,6 +740,12 @@ mod tests {
         // 个人云账号：成员挂在平台下
         let p = member("c-adult", "m-adult");
         assert_eq!(resolve(&dir, &p, None).unwrap().payer(), &aid("p1"));
+        // 担保人的成员子凭证：从担保人账户付
+        let t = member("c-tch", "m-tch");
+        assert_eq!(
+            resolve(&dir, &t, Some("tch")).unwrap().payer(),
+            &aid("teacher")
+        );
     }
 
     #[test]
@@ -746,14 +774,7 @@ mod tests {
                 "{account}"
             );
         }
-        // Member 凭证只能绑「成员」角色的成员关系
-        assert!(matches!(
-            resolve(&dir, &member("c", "m-tch"), None).unwrap_err(),
-            ResolveError::InvalidBinding {
-                binding: "member",
-                ..
-            }
-        ));
+        // Member 凭证只能绑「可付款」的成员关系（成员或担保人角色）；管理员关系没有付款账户
         assert!(matches!(
             resolve(&dir, &member("c", "m-adm"), None).unwrap_err(),
             ResolveError::InvalidBinding {
