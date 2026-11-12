@@ -46,9 +46,15 @@
 //!
 //! # 给 S6（儿童安全）的存储层函数
 //!
-//! 安全检查的成本是附加成本，计入准入和结算：[`reserve_component`](AccountStore::reserve_component) /
-//! [`settle_component`](AccountStore::settle_component) / [`release_component`](AccountStore::release_component)，
-//! 用法见 `components.rs`。
+//! 安全检查的成本是附加成本，计入准入和结算。两个阶段，两个入口：
+//!
+//! | 阶段 | 预留 | 说明 |
+//! |---|---|---|
+//! | 输入检查（**任何尝试之前**） | [`reserve_request_component`](AccountStore::reserve_request_component) | 没有尝试，付款人取自付款上下文；挂在 `<请求 id>#0~<component>` 下 |
+//! | 完整输出检查（尝试的主要预留还开着） | [`reserve_component`](AccountStore::reserve_component) | 挂在作答的那次尝试名下 |
+//!
+//! 结算 / 释放都是 [`settle_component`](AccountStore::settle_component) /
+//! [`release_component`](AccountStore::release_component)（`attempt` 传预留挂靠的那个尝试 id）。用法见 `components.rs`。
 //!
 //! # 给云执行器（S4）的接线
 //!
@@ -104,8 +110,9 @@ pub use types::{
 use std::sync::Arc;
 
 use idoris_compute_contracts::admission::{AdmissionDecision, AncestorView};
+use idoris_compute_contracts::credential::PaymentContext;
 use idoris_compute_contracts::ids::{
-    AccountId, AttemptId, BillingMonth, IdempotencyKey, TimestampMs,
+    AccountId, AttemptId, BillingMonth, IdempotencyKey, RequestId, TimestampMs,
 };
 use idoris_compute_contracts::money::Money;
 use idoris_compute_contracts::pricing::Price;
@@ -279,6 +286,23 @@ impl AccountStore {
     ) -> Result<ComponentDecision, LedgerError> {
         self.ledger_write(|tx| {
             components::reserve_component_in(tx, attempt, component, amount, now)
+        })
+    }
+
+    /// 在**任何尝试出现之前**预留附加成本（比如输入检查：先检查，通过了才去调用模型）。付款人取自付款上下文，
+    /// 预留挂在这个请求的第 0 号尝试名下（`<请求 id>#0~<component>`），结算 / 释放用
+    /// [`settle_component`](Self::settle_component) / [`release_component`](Self::release_component)，`attempt` 参数传
+    /// `AttemptId::new(request, AttemptIndex(0))`。见 `components.rs`。
+    pub fn reserve_request_component(
+        &self,
+        request: &RequestId,
+        component: &str,
+        payment: &PaymentContext,
+        amount: &Price,
+        now: TimestampMs,
+    ) -> Result<ComponentDecision, LedgerError> {
+        self.ledger_write(|tx| {
+            components::reserve_request_component_in(tx, request, component, payment, amount, now)
         })
     }
 

@@ -27,6 +27,7 @@ use idoris_compute_contracts::admission::{
     AdmissionDecision, AdmissionReport, Admitted, CheckKind, CheckOutcome, DegradeReason,
     GraceDenied, Reservation, check_grace, evaluate_admission,
 };
+use idoris_compute_contracts::credential::PaymentContext;
 use idoris_compute_contracts::ids::AccountId;
 use idoris_compute_contracts::money::Unit;
 use idoris_compute_contracts::pricing::Price;
@@ -80,16 +81,16 @@ fn reject(code: ReasonCode) -> Result<AdmitPlan, LedgerError> {
 /// 这些都必须在**占预留的同一个事务里**拦住，不留「撤销了还放行一次」的缝。
 ///
 /// 顺序与 S0 `resolve_payment_context` 一致：凭证（撤销 → 冻结 → 过期）→ 主体 → 成员关系 → 账户。
-fn gate(
+pub(super) fn gate(
     conn: &Connection,
-    input: &AdmitInput<'_>,
+    payment: &PaymentContext,
     chain: &[Account],
     now_ms: i64,
 ) -> Result<Option<ReasonCode>, LedgerError> {
     let credential: Option<(String, Option<i64>)> = conn
         .query_row(
             "SELECT status, expires_at_ms FROM credentials WHERE credential_id = ?1",
-            [input.payment.credential().as_str()],
+            [payment.credential().as_str()],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()?;
@@ -112,7 +113,7 @@ fn gate(
     {
         return Ok(Some(ReasonCode::CredentialExpired));
     }
-    if let Some(principal) = input.payment.principal() {
+    if let Some(principal) = payment.principal() {
         let status: Option<String> = conn
             .query_row(
                 "SELECT status FROM principals WHERE principal_id = ?1",
@@ -126,7 +127,7 @@ fn gate(
             _ => return Ok(Some(ReasonCode::PaymentContextInvalid)),
         }
     }
-    if let Some(membership) = input.payment.membership() {
+    if let Some(membership) = payment.membership() {
         let status: Option<String> = conn
             .query_row(
                 "SELECT status FROM memberships WHERE membership_id = ?1",
@@ -232,7 +233,7 @@ pub(super) fn decide(conn: &Connection, input: &AdmitInput<'_>) -> Result<AdmitP
     if payer_account.unit != *unit {
         return reject(ReasonCode::PaymentContextInvalid);
     }
-    if let Some(code) = gate(conn, input, &chain, now_ms)? {
+    if let Some(code) = gate(conn, input.payment, &chain, now_ms)? {
         return reject(code);
     }
 

@@ -967,6 +967,137 @@ fn an_extra_cost_is_reserved_along_every_ancestor_and_settled_like_the_main_rese
 }
 
 #[test]
+fn an_input_check_cost_is_reserved_before_any_attempt_exists_and_settled_like_any_extra_cost() {
+    // S6 的输入检查发生在任何尝试之前（检查通过了才去调用模型）：没有尝试就没有主要预留，付款人取自付款上下文
+    let db = TempDb::new("component-request");
+    let store = paid_chain(&db, 1_000);
+    let ctx = payment(&store, "cred-e");
+    let request = idoris_compute_contracts::ids::RequestId::new("r-1").unwrap();
+    let decision = store
+        .reserve_request_component(&request, "safety_input", &ctx, &price(40), t0())
+        .unwrap();
+    assert_eq!(
+        decision,
+        ComponentDecision::Reserved {
+            hold_id: "r-1#0~safety_input".into()
+        }
+    );
+    // 沿付款账户链的每个账户占住（包括根）
+    assert_eq!(balance(&store, "emp", T0), 960);
+    assert_eq!(balance(&store, "paid", T0), 1_000_000 - 40);
+    let entries = store
+        .entries_of_hold(&attempt("r-1", 0), "safety_input")
+        .unwrap();
+    let accounts: Vec<&str> = entries.iter().map(|e| e.account.as_str()).collect();
+    assert_eq!(accounts, ["emp", "paid", "platform"]);
+    // 同一个请求同一个阶段只能预留一次：重复是错误，不会重复占额度
+    let err = store
+        .reserve_request_component(&request, "safety_input", &ctx, &price(40), t0())
+        .unwrap_err();
+    assert!(matches!(err, LedgerError::HoldExists(_)), "{err}");
+    assert_eq!(balance(&store, "emp", T0), 960);
+    // 检查通过了，模型调用照常准入：第 0 号尝试，主要预留是另一行
+    let req = Req::new(&store, "r-1", 0, "cred-e", 100);
+    store.admit_attempt(&req.input()).unwrap();
+    assert_eq!(balance(&store, "emp", T0), 1_000 - 40 - 210);
+    // 输入检查按实际成本 25 结算，主要预留按 100 结算
+    let outcome = store
+        .settle_component(&req.attempt, "safety_input", &price(25), ts(T0 + 1_000))
+        .unwrap();
+    assert_eq!(outcome.result, SettleResult::Settled);
+    store
+        .settle_attempt(&req.attempt, &price(100), ts(T0 + 2_000))
+        .unwrap();
+    assert_eq!(balance(&store, "emp", T0 + 2_000), 1_000 - 25 - 100);
+    assert_clean(&store);
+}
+
+#[test]
+fn an_input_check_cost_is_gated_like_an_admission_and_a_rejection_holds_nothing() {
+    let request = idoris_compute_contracts::ids::RequestId::new("r-1").unwrap();
+    // 钱不够
+    let db = TempDb::new("component-request-budget");
+    let store = paid_chain(&db, 30);
+    let ctx = payment(&store, "cred-e");
+    assert_eq!(
+        store
+            .reserve_request_component(&request, "safety_input", &ctx, &price(40), t0())
+            .unwrap(),
+        ComponentDecision::Rejected(ReasonCode::BudgetExhausted)
+    );
+    assert!(
+        store
+            .hold(&attempt("r-1", 0), "safety_input")
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(balance(&store, "emp", T0), 30);
+    // 凭证在解析付款上下文之后被撤销 / 冻结：和准入一样，在预留的同一个事务里拦住
+    for (status, code) in [
+        (
+            idoris_compute_contracts::credential::CredentialStatus::Revoked,
+            ReasonCode::CredentialRevoked,
+        ),
+        (
+            idoris_compute_contracts::credential::CredentialStatus::Frozen,
+            ReasonCode::CredentialFrozen,
+        ),
+    ] {
+        let db = TempDb::new("component-request-credential");
+        let store = paid_chain(&db, 1_000);
+        let ctx = payment(&store, "cred-e");
+        store
+            .set_credential_status(&cid("cred-e"), status, t0())
+            .unwrap();
+        assert_eq!(
+            store
+                .reserve_request_component(&request, "safety_input", &ctx, &price(10), t0())
+                .unwrap(),
+            ComponentDecision::Rejected(code),
+            "{status:?}"
+        );
+        assert_eq!(scalar(&db, "SELECT count(*) FROM ledger_holds"), 0);
+    }
+    // 速率闸门同样适用
+    let db = TempDb::new("component-request-rate");
+    let store = paid_chain(&db, 1_000);
+    store
+        .set_account_limits(
+            &aid("emp"),
+            &AccountLimits {
+                minute_cap: Some(thb(30)),
+                ..AccountLimits::default()
+            },
+            t0(),
+        )
+        .unwrap();
+    let ctx = payment(&store, "cred-e");
+    assert_eq!(
+        store
+            .reserve_request_component(&request, "safety_input", &ctx, &price(40), t0())
+            .unwrap(),
+        ComponentDecision::Rejected(ReasonCode::RateLimited)
+    );
+    // 输入不合法：component 名、单位不对
+    assert!(
+        store
+            .reserve_request_component(&request, "model", &ctx, &price(1), t0())
+            .is_err()
+    );
+    let usd = idoris_compute_contracts::pricing::Price::from_micros(
+        idoris_compute_contracts::money::Unit::Usd,
+        1,
+    )
+    .unwrap();
+    assert!(
+        store
+            .reserve_request_component(&request, "safety_input", &ctx, &usd, t0())
+            .is_err()
+    );
+    assert_clean(&store);
+}
+
+#[test]
 fn an_extra_cost_is_checked_like_any_admission_and_a_rejection_holds_nothing() {
     let db = TempDb::new("component-reject");
     let store = paid_chain(&db, 230);

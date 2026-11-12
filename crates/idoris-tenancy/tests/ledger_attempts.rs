@@ -17,7 +17,7 @@ use fixture::*;
 use idoris_compute_contracts::admission::AdmissionDecision;
 use idoris_compute_contracts::attempt::AttemptEvent;
 use idoris_compute_contracts::form::DeploymentForm;
-use idoris_compute_contracts::ids::{AttemptIndex, IdempotencyKey, PriceVersion};
+use idoris_compute_contracts::ids::{AttemptIndex, IdempotencyKey, PriceVersion, RequestId};
 use idoris_compute_contracts::permit::{Billing, DataClass};
 use idoris_compute_contracts::pricing::Usage;
 use idoris_compute_contracts::request::{AdmittedCandidate, Request};
@@ -652,6 +652,56 @@ fn extra_costs_left_unsettled_at_close_are_released_with_a_visible_alert() {
         1_000 - 70,
         "附加成本的预留已经放回去"
     );
+    assert_clean(&env.accounts);
+}
+
+#[test]
+fn an_input_check_reserved_before_the_first_attempt_is_released_at_close_if_nobody_settled_it() {
+    // S6 的输入检查在任何尝试之前预留（挂在 `<请求 id>#0~safety_input` 下）；请求收尾时它还没结算：
+    // 和别的附加成本一样按 0 释放并留 extra_unsettled 告警，额度放回去
+    let env = env("attempts-extra-input", 1_000);
+    let ctx = payment(&env.accounts, "cred-e");
+    let request_id = RequestId::new("ex-2").unwrap();
+    let reserved = env
+        .accounts
+        .reserve_request_component(&request_id, "safety_input", &ctx, &price(40), ts(T0))
+        .unwrap();
+    assert!(matches!(reserved, ComponentDecision::Reserved { .. }));
+    let (req, mut request) = start(&env, "ex-2", "cred-e", 100);
+    assert_eq!(balance(&env, "emp", T0), 1_000 - 40 - 210);
+    apply(
+        &env,
+        &mut request,
+        0,
+        &[AttemptEvent::Dispatch, AttemptEvent::WireWriteStarted],
+        T0 + 100,
+    );
+    apply(
+        &env,
+        &mut request,
+        0,
+        &[AttemptEvent::UsageReported { usage: usage_70() }],
+        T0 + 200,
+    );
+    publish(&env, &mut request, 0, T0 + 300);
+    finalize(&env, &mut request, T0 + 400).unwrap();
+    let extra = env
+        .accounts
+        .hold(&req.attempt, "safety_input")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (extra.state, extra.charged),
+        (HoldState::Released, Some(thb(0)))
+    );
+    assert_eq!(
+        env.accounts
+            .alerts(Some(AlertKind::ExtraUnsettled))
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(balance(&env, "emp", T0 + 400), 1_000 - 70);
     assert_clean(&env.accounts);
 }
 

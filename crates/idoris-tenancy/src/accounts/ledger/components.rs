@@ -23,17 +23,21 @@
 //! 请求收尾时，该尝试下还没结算的附加成本按 0 释放，并留一条 `extra_unsettled` 告警（见 `hook.rs`）：
 //! S6 应当在收尾之前自己结算；没结算就是少收，告警是让这件事看得见。
 
-use idoris_compute_contracts::ids::{AttemptId, TimestampMs};
+use idoris_compute_contracts::credential::PaymentContext;
+use idoris_compute_contracts::ids::{AttemptId, AttemptIndex, RequestId, TimestampMs};
 use idoris_compute_contracts::pricing::Price;
+use idoris_compute_contracts::reason::ReasonCode;
+use rusqlite::Connection;
 
-use super::admit::check_extra;
+use super::admit::{check_extra, gate};
 use super::error::{LedgerError, add};
 use super::holds::{
     NewHold, hold_id_of, insert_hold_and_reserve, load_hold, settle_hold_in, sweep_expired_in,
 };
+use super::period::period_of;
 use super::project::load_config;
 use super::types::{ComponentDecision, HoldState, MODEL_COMPONENT, SettleOutcome};
-use rusqlite::Connection;
+use crate::accounts::rows::load_ancestors;
 
 /// component 名：小写字母、数字、下划线，1 到 32 个字符，不能是主要预留的名字。
 pub(super) fn validate_component(component: &str) -> Result<(), LedgerError> {
@@ -98,6 +102,74 @@ pub(super) fn reserve_component_in(
             unit: &main.unit,
             reserved: amount.micros(),
             period: &main.period,
+            now_ms,
+            expires_at_ms: add(now_ms, config.reservation_ttl_ms)?,
+            grace_floor: None,
+        },
+    )?;
+    Ok(ComponentDecision::Reserved { hold_id })
+}
+
+/// 附加成本要在**任何尝试出现之前**预留的情形（比如输入检查：先检查，通过了才去调用模型）。
+///
+/// 没有尝试就没有主要预留可以借付款人，所以付款人、凭证、单位取自付款上下文，并且像准入一样在预留的同一个事务里
+/// 核对凭证、主体、成员关系、账户链此刻还有效（失败就是 `Rejected`，不占额度）。预留挂在这个请求的**第 0 号尝试**名下
+/// （`<请求 id>#0~<component>`）：之后第 0 号尝试正常准入（主要预留是另一行），结算 / 释放仍然用
+/// [`settle_component_in`] 和这个 id；请求收尾时还没结算的按 0 释放并留 `extra_unsettled` 告警，和别的附加成本一样。
+/// 请求在任何尝试之前就被拒绝（比如输入检查没通过）时没有收尾这一步，调用方必须自己结算 / 释放；
+/// 忘了的话预留有 TTL 兜底，过期后额度自动放回去。
+pub(super) fn reserve_request_component_in(
+    conn: &Connection,
+    request: &RequestId,
+    component: &str,
+    payment: &PaymentContext,
+    amount: &Price,
+    now: TimestampMs,
+) -> Result<ComponentDecision, LedgerError> {
+    validate_component(component)?;
+    let config = load_config(conn)?;
+    let now_ms = now.millis();
+    sweep_expired_in(conn, now_ms)?;
+    if amount.unit() != payment.unit() {
+        return Err(LedgerError::Invalid(format!(
+            "the extra cost is in {} but the payer pays in {}",
+            amount.unit(),
+            payment.unit()
+        )));
+    }
+    let attempt = AttemptId::new(request.clone(), AttemptIndex(0));
+    let hold_id = hold_id_of(&attempt, component);
+    if load_hold(conn, &hold_id)?.is_some() {
+        return Err(LedgerError::HoldExists(hold_id));
+    }
+    let chain = load_ancestors(conn, payment.payer())?;
+    match chain.first() {
+        Some(payer) if payer.unit == *payment.unit() => {}
+        _ => {
+            return Ok(ComponentDecision::Rejected(
+                ReasonCode::PaymentContextInvalid,
+            ));
+        }
+    }
+    if let Some(code) = gate(conn, payment, &chain, now_ms)? {
+        return Ok(ComponentDecision::Rejected(code));
+    }
+    let (chain, rejection) = check_extra(conn, payment.payer(), amount, now_ms, &config)?;
+    if let Some(code) = rejection {
+        return Ok(ComponentDecision::Rejected(code));
+    }
+    let period = period_of(now_ms, &config.billing_timezone)?.to_string();
+    insert_hold_and_reserve(
+        conn,
+        &chain,
+        &NewHold {
+            attempt: &attempt,
+            component,
+            payer: payment.payer(),
+            credential: payment.credential(),
+            unit: payment.unit(),
+            reserved: amount.micros(),
+            period: &period,
             now_ms,
             expires_at_ms: add(now_ms, config.reservation_ttl_ms)?,
             grace_floor: None,
