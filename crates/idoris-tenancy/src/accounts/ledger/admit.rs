@@ -40,7 +40,9 @@ use super::holds::{
     release_earlier_attempts, sweep_expired_in,
 };
 use super::period::period_of;
-use super::project::{available_of, load_config, project_chain};
+use super::project::{
+    SPENDABLE_PURPOSES, available_of, load_config, not_revoked_clause, project_chain,
+};
 use super::types::{AdmitInput, AlertKind, MODEL_COMPONENT};
 use crate::accounts::rows::load_ancestors;
 
@@ -162,12 +164,17 @@ fn credit_users(report: &AdmissionReport, chain: &[Account]) -> Vec<(usize, i64)
         .collect()
 }
 
-/// 这个账户有没有被配置过：充值过，或者有过花费类额度（不管现在还生不生效）。
+/// 这个账户有没有被配置过：充值过，或者有过花费类额度（不管现在还生不生效，**但被撤销的不算**）。
+///
+/// 被撤销的额度是管理员明确关掉的（S2 的「关授信」）：撤销之后这个账户不该再有一次免费的宽限。
 fn is_provisioned(conn: &Connection, account: &AccountId) -> Result<bool, LedgerError> {
+    let not_revoked = not_revoked_clause(conn)?;
     Ok(conn.query_row(
-        "SELECT EXISTS (SELECT 1 FROM ledger_entries WHERE account_id = ?1 AND kind = 'fund')
-             OR EXISTS (SELECT 1 FROM allocations
-                         WHERE child_id = ?1 AND purpose IN ('free_tier', 'prepaid', 'org_quota'))",
+        &format!(
+            "SELECT EXISTS (SELECT 1 FROM ledger_entries WHERE account_id = ?1 AND kind = 'fund')
+                 OR EXISTS (SELECT 1 FROM allocations
+                             WHERE child_id = ?1 AND purpose IN {SPENDABLE_PURPOSES}{not_revoked})"
+        ),
         [account.as_str()],
         |row| row.get(0),
     )?)

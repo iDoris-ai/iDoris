@@ -393,6 +393,35 @@ fn grace_eligibility_does_not_depend_on_earlier_overage() {
 }
 
 #[test]
+fn a_revoked_allowance_does_not_earn_a_grace_round() {
+    // emp 只有一笔 20 的额度（放不下最低有用的预留 30）：没撤销时宽限一轮；管理员把这笔额度撤销之后，
+    // 账户就是「被明确关掉」，不该再有一次平台买单的宽限
+    let build = |tag: &str| {
+        let db = TempDb::new(tag);
+        let store = world(&db);
+        allocate(&store, "e-0", "platform", "paid", 9_000_000);
+        allocate(&store, "e-1", "paid", "emp", 20);
+        (db, store)
+    };
+    let (_db, store) = build("grace-allowance-live");
+    let decision = admit_with_ladder(&store, "r-1", 0, "cred-e", 100, T0);
+    assert!(
+        matches!(decision, AdmissionDecision::Grace { .. }),
+        "{decision:?}"
+    );
+
+    let (db, store) = build("grace-allowance-revoked");
+    revoke_allocation(&db, "e-1");
+    let decision = admit_with_ladder(&store, "r-1", 0, "cred-e", 100, T0);
+    assert_eq!(
+        denied(&decision),
+        Some(ReasonCode::BudgetExhausted),
+        "{decision:?}"
+    );
+    assert!(store.grace_uses(&aid("emp")).unwrap().is_empty());
+}
+
+#[test]
 fn grace_cannot_rescue_what_is_not_the_payers_own_money() {
     // 缺钱的是组织（祖先），不是付款账户自己：那是别人的钱，宽限帮不了
     let db = TempDb::new("grace-ancestor");

@@ -35,7 +35,25 @@ pub(super) const MINUTE_MS: i64 = 60_000;
 pub(super) const HOUR_MS: i64 = 3_600_000;
 
 /// 花费类额度的用途（授信不算：它是透支下限，不是可花的额度）。
-const SPENDABLE_PURPOSES: &str = "('free_tier', 'prepaid', 'org_quota')";
+pub(super) const SPENDABLE_PURPOSES: &str = "('free_tier', 'prepaid', 'org_quota')";
+
+/// S2 的额度撤销（「关授信」）：被撤销的额度不再给任何人授权。撤销记在 S2 的侧表 `allocation_revocations`
+/// 里（只追加，`allocations` 本身不动），所以**读 `allocations` 的 SQL 都要带上这个子句**——和 S2 的读函数是同一条规矩。
+///
+/// 这张表在 S2 合入之前不存在，所以按表在不在拼子句：在，就排除有撤销行的额度；不在，什么都不排除。
+/// 这样 S2 合入之后撤销立刻对准入生效，不需要再回来改账本。子句只能和 `FROM allocations` 一起用。
+pub(super) fn not_revoked_clause(conn: &Connection) -> Result<&'static str, LedgerError> {
+    let present: bool = conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'allocation_revocations')",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(if present {
+        " AND NOT EXISTS (SELECT 1 FROM allocation_revocations r WHERE r.allocation_id = allocations.allocation_id)"
+    } else {
+        ""
+    })
+}
 
 /// 读账本配置。
 pub(super) fn load_config(conn: &Connection) -> Result<LedgerConfig, LedgerError> {
@@ -183,22 +201,24 @@ pub(super) fn project_chain(
 ) -> Result<Vec<AncestorView>, LedgerError> {
     let period = period_of(now_ms, &config.billing_timezone)?;
     let (period_start, period_end) = period_bounds(period, &config.billing_timezone)?;
+    let not_revoked = not_revoked_clause(conn)?;
     let mut views = Vec::with_capacity(chain.len());
     for account in chain {
         let unit = &account.unit;
         let money = |micros: i64| Money::new(unit.clone(), micros);
         let id = account.id.as_str();
 
-        // 流入这个账户的、此刻有效的花费类额度
+        // 流入这个账户的、此刻有效的（窗口内、没被撤销的）花费类额度
         let (ceiling_sum, window_start, active): (i64, Option<i64>, i64) = conn.query_row(
             &format!(
                 "SELECT COALESCE(SUM(ceiling_micros), 0), MIN(valid_from_ms), COUNT(*) FROM allocations
                   WHERE child_id = ?1 AND purpose IN {SPENDABLE_PURPOSES}
-                    AND valid_from_ms <= ?2 AND ?2 < valid_until_ms"
+                    AND valid_from_ms <= ?2 AND ?2 < valid_until_ms{not_revoked}"
             ),
             rusqlite::params![id, now_ms],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )?;
+        // 曾经有过额度（被撤销的也算）：现在一个都不生效就是 `Some(0)`，不是「没配置」的 `None`
         let ever_had_allocation: bool = conn.query_row(
             &format!(
                 "SELECT EXISTS (SELECT 1 FROM allocations WHERE child_id = ?1 AND purpose IN {SPENDABLE_PURPOSES})"

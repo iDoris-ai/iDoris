@@ -140,6 +140,35 @@ fn an_allowance_is_active_from_its_start_up_to_but_not_including_its_end() {
     }
 }
 
+#[test]
+fn a_revoked_allowance_authorizes_nothing_whether_it_is_the_leafs_or_an_ancestors() {
+    // S2 的「关授信」：被撤销的额度不再给任何人授权。叶子自己的额度被撤销、或者祖先的额度被撤销，都拦得住
+    for (revoked, whose) in [("c-2", "the leaf's own"), ("c-1", "an ancestor's")] {
+        let db = TempDb::new(&format!("revoked-{revoked}"));
+        let store = world(&db);
+        allocate_chain(&store, "c", &["pool", "school", "kid-c"], 1_000_000);
+        store
+            .set_pool_cap(&aid("pool"), month(2026, 11), &thb(10_000_000), t0())
+            .unwrap();
+        let before = Req::new(&store, "r-1", 0, "cred-c", 100);
+        assert!(admit(&store, &before).is_admitted(), "{whose}: before");
+        store.release_attempt(&before.attempt, t0()).unwrap();
+
+        revoke_allocation(&db, revoked);
+        let after = Req::new(&store, "r-2", 0, "cred-c", 100);
+        assert_eq!(
+            denied(&admit(&store, &after)),
+            Some(ReasonCode::BudgetExhausted),
+            "{whose}: after the revocation"
+        );
+        // 撤销之后账户是「曾经有过额度、现在一个都不生效」：Some(0)，不是没配置的 None
+        let view = store.account_view(&aid("kid-c"), t0()).unwrap();
+        let school = store.account_view(&aid("school"), t0()).unwrap();
+        let zeroed = if revoked == "c-2" { view } else { school };
+        assert_eq!(zeroed.ceiling_remaining, Some(thb(0)), "{whose}");
+    }
+}
+
 // ------------------------------------------------------------------------------------------
 // 放行：沿链每个账户各一条分录；可用额是分录的投影
 // ------------------------------------------------------------------------------------------
