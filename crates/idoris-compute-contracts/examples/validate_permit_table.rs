@@ -59,18 +59,29 @@ fn main() -> ExitCode {
         "evaluated at {}",
         format_verified_at(now).unwrap_or_else(|| now.millis().to_string())
     );
+    println!("（fresh = 核验未过期；是否会被某个请求选中，还要看数据类别、留存、DPA、区域、能力）");
     for entry in table.endpoints() {
         let state = if table.is_verified_at(entry, now) {
-            "active "
+            "fresh"
         } else {
-            "STALE  "
+            "STALE"
         };
         let expires = table
             .expires_at(entry)
             .and_then(format_verified_at)
             .unwrap_or_else(|| "?".to_string());
+        let classes: Vec<String> = entry
+            .allowed_data_classes
+            .iter()
+            .map(|c| format!("{c:?}"))
+            .collect();
+        let permitted = if classes.is_empty() {
+            "NONE (never selected)".to_string()
+        } else {
+            classes.join(",")
+        };
         println!(
-            "  {state} {}  (verification expires {expires})",
+            "  {state:5} {}  verification expires {expires}; data classes: {permitted}",
             entry.key()
         );
     }

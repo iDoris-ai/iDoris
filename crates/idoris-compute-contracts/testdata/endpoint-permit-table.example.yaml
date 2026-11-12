@@ -12,6 +12,9 @@
 #   5. example-cheap-host   只允许 public，不支持流式 usage
 #   6. example-cli          subscription 路径（走 CLI），云形态排除
 #   7. example-stale-host   核验时间很早：到测试用的「现在」已经过期，自动停用
+#   8. example-unverified-host  调研过但什么都没核实出来：没核实的值一律写成最坏的那个
+#                           （allowed_data_classes: []、retained、unsigned、能力全 false、区域写 unknown），
+#                           所以永远不会被选中
 
 schema_version: 1
 verification_max_age_days: 90
@@ -134,3 +137,20 @@ endpoints:
       cancellation: true
     verified_at: "2026-06-01"
     notes: "假数据：核验时间很早，用来演示过期自动停用。"
+
+  - provider: example-unverified-host
+    model: example-org/chat-70b
+    endpoint: openai-compat
+    access: api
+    processing_regions: [unknown]
+    retention: retained
+    dpa: unsigned
+    allowed_data_classes: []
+    capabilities:
+      tool_calling: false
+      stream_usage: false
+      cache_pricing: false
+      structured_output: false
+      cancellation: false
+    verified_at: "2026-11-05"
+    notes: "假数据：调研过，但留存、DPA、区域、能力都没核实出来。没核实的值一律写成最坏的那个（见 permit.rs 的模块文档），所以这个端点永远不会被任何请求选中。"

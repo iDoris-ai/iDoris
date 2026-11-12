@@ -212,6 +212,19 @@ impl Money {
         Self { unit, micros: 0 }
     }
 
+    /// 把既有的「最小货币单位」整数（`idoris-tenancy` 里 `limit_minor` / `spent_minor` 一类）换成带单位的
+    /// 微单位金额：`minor × 10^(6 - display_decimals)`，即泰铢、美元 `× 10_000`（1 satang / cent =
+    /// 10_000 微单位），`QUOTA` `× 1_000_000`（最小单位是 1 个 token 当量）。允许负数；溢出返回
+    /// [`MoneyError::Overflow`]。
+    ///
+    /// **只有知道币种时才安全**。既有预算数据没有币种，调用方必须自己先确定币种再调用；
+    /// 这个函数不替你猜，更不存在「默认币种」。
+    pub fn from_minor(unit: Unit, minor: i64) -> Result<Self, MoneyError> {
+        let factor = 10_i64.pow(u32::from(6_u8.saturating_sub(unit.display_decimals())));
+        let micros = minor.checked_mul(factor).ok_or(MoneyError::Overflow)?;
+        Ok(Self { unit, micros })
+    }
+
     pub fn is_zero(&self) -> bool {
         self.micros == 0
     }
@@ -657,6 +670,53 @@ mod tests {
             let shown = money.display();
             assert_eq!(shown.minor_units, minor, "{money:?}");
             assert_eq!(shown.to_string(), text, "{money:?}");
+        }
+    }
+
+    #[test]
+    fn from_minor_converts_known_units_exactly_and_checks_overflow() {
+        // (单位, minor, 期望微单位)
+        for (unit, minor, micros) in [
+            (Unit::Thb, 0, 0),
+            (Unit::Thb, 1, 10_000),
+            (Unit::Thb, 150, 1_500_000),
+            (Unit::Usd, -250, -2_500_000),
+            (quota("n", 0).unit, 3, 3_000_000),
+            (quota("n", 0).unit, -2, -2_000_000),
+        ] {
+            let m = Money::from_minor(unit.clone(), minor).unwrap();
+            assert_eq!(m, Money::new(unit, micros));
+        }
+        // 溢出边界：THB 因子 10_000，QUOTA 因子 1_000_000
+        let max_thb = i64::MAX / 10_000;
+        assert_eq!(
+            Money::from_minor(Unit::Thb, max_thb).unwrap().micros,
+            max_thb * 10_000
+        );
+        assert_eq!(
+            Money::from_minor(Unit::Thb, max_thb + 1).unwrap_err(),
+            MoneyError::Overflow
+        );
+        assert_eq!(
+            Money::from_minor(Unit::Thb, i64::MIN).unwrap_err(),
+            MoneyError::Overflow
+        );
+        let q = quota("n", 0).unit;
+        assert_eq!(
+            Money::from_minor(q.clone(), i64::MAX / 1_000_000 + 1).unwrap_err(),
+            MoneyError::Overflow
+        );
+        assert!(Money::from_minor(q, i64::MAX / 1_000_000).is_ok());
+    }
+
+    proptest! {
+        /// `from_minor` 与展示是互逆的：换成微单位再展示，得到的 minor 就是原来的 minor（不丢精度）。
+        #[test]
+        fn from_minor_then_display_round_trips(minor in -9_000_000_000_000i64..9_000_000_000_000) {
+            for unit in [Unit::Thb, Unit::Usd] {
+                let m = Money::from_minor(unit, minor).unwrap();
+                prop_assert_eq!(m.display().minor_units, minor);
+            }
         }
     }
 

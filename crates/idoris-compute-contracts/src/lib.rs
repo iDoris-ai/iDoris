@@ -71,6 +71,7 @@
 //! - **S1**（账户存储）：把库里的行读成 `Account` / `Principal` / `Membership`，用 `AccountTree::build` 和
 //!   `Directory::build` 校验；存储里的 `Request` 记录经 `serde` 读回来会重新校验。`Directory` 是校验过的内存
 //!   快照、查找是线性的：热路径上按请求取一个自洽的小切片（付款账户的祖先链 + 该主体的成员关系）再构造即可。
+//!   既有预算里的 `*_minor` 整数没有币种；**确定了币种之后**用 `money::Money::from_minor` 换成微单位，不要自己乘。
 //! - **S2**（控制面）：用 `validate_allocation`、`check_credential_issuance`；免费额度的幂等键用
 //!   `account::subsidy_idempotency_key`。
 //! - **S3**（准入）：在事务里读出 `tree.ancestors(payer)` 每个账户的计数器，填 `AncestorView`，调
@@ -108,6 +109,9 @@
 //!     厂商专属的区域名、枚举或默认值（`tests/no_vendor_specific_names.rs` 守着这条）。
 //! 12. §9 存量的 `deploy_mode=tenant` 没有 `form` 时按组织形态处理；云形态的「补贴额度」按货币单位 +
 //!     `FreeTier` 用途处理，不是 `QUOTA`。
+//! 13. §8 调研里的「没核实」：契约没有「未知」取值，规则是没核实的值一律写成最坏的那个
+//!     （`allowed_data_classes: []`、`retained`、`unsigned`、能力 `false`、区域 `unknown`），表读出来永远不会比
+//!     真实情况更宽松；所以 `allowed_data_classes` 允许为空列表（这样的端点永远选不中）。见 `permit` 模块文档。
 
 pub mod account;
 pub mod admission;

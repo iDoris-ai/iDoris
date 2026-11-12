@@ -138,3 +138,20 @@ endpoints:
     cancellation: true
   verified_at: 2026-06-01T00:00:00Z
   notes: 假数据：核验时间很早，用来演示过期自动停用。
+- provider: example-unverified-host
+  model: example-org/chat-70b
+  endpoint: openai-compat
+  access: api
+  processing_regions:
+  - unknown
+  retention: retained
+  dpa: unsigned
+  allowed_data_classes: []
+  capabilities:
+    tool_calling: false
+    stream_usage: false
+    cache_pricing: false
+    structured_output: false
+    cancellation: false
+  verified_at: 2026-11-05T00:00:00Z
+  notes: 假数据：调研过，但留存、DPA、区域、能力都没核实出来。没核实的值一律写成最坏的那个（见 permit.rs 的模块文档），所以这个端点永远不会被任何请求选中。

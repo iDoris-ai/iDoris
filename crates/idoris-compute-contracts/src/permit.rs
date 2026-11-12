@@ -22,7 +22,8 @@
 //!                                            #   zdr = 零数据留存；with_exceptions = 有例外（如 Safety
 //!                                            #   Retention）；retained = 会留存
 //!     dpa: signed                            # signed | unsigned
-//!     allowed_data_classes: [child_edu, adult, public]   # 非空、不重复
+//!     allowed_data_classes: [child_edu, adult, public]   # 不重复；可以是空列表 `[]`（已调研，但目前没有任何
+//!                                            #   类别被允许，这个端点不会被任何请求选中）
 //!     capabilities:                          # 五项都必须写明 true/false，没有缺省
 //!       tool_calling: true                   #   工具调用
 //!       stream_usage: true                   #   流式响应里带 usage（stream_options.include_usage）
@@ -41,6 +42,21 @@
 //! 加载时的自洽校验（[`PermitTable::from_yaml_str`]）：声明了 `child_edu` 的条目**自己**必须是
 //! `retention: zdr` 且 `dpa: signed`，坏表不能给自己发通行证；路由时（[`select_compliant`]）会**再查一遍**，
 //! 纵深防御。
+//!
+//! # 没核实的值怎么写：一律写成最坏的那个
+//!
+//! 调研时常有「没核实」的值，契约里**没有**「未知」这个取值。规则是：没核实的就写成对数据保护最坏的那个，
+//! 这样表读出来永远不会比真实情况更宽松（失败即关闭）：
+//!
+//! | 字段 | 没核实时写 |
+//! |---|---|
+//! | `allowed_data_classes` | `[]`：没有任何类别被允许。**不要**写成「先允许 public」 |
+//! | `retention` | `retained` |
+//! | `dpa` | `unsigned` |
+//! | `capabilities.*` | `false` |
+//! | `processing_regions` | `[unknown]`：`unknown` 只是一个标签，不会出现在任何租户的允许区域里，所以限定了区域的租户不会选中它 |
+//!
+//! 「为什么没核实」「证据在哪」写进 `notes` / `evidence`。
 //!
 //! # 硬约束过滤（[`select_compliant`]）
 //!
@@ -342,9 +358,8 @@ impl EndpointPermit {
                 return Err(PermitProblem::DuplicateRegion(region.clone()));
             }
         }
-        if self.allowed_data_classes.is_empty() {
-            return Err(PermitProblem::NoDataClasses);
-        }
+        // 空列表是合法的：表示「已调研，目前没有任何类别被允许」。这样的端点永远选不中
+        // （租户的数据类别非空，不可能是空集的子集），所以不会放宽任何权限。
         let mut seen = BTreeSet::new();
         for class in &self.allowed_data_classes {
             if !seen.insert(*class) {
@@ -388,7 +403,7 @@ pub enum PermitProblem {
     NoRegions,
     #[error("duplicate processing region {0}")]
     DuplicateRegion(Region),
-    #[error("allowed_data_classes must not be empty")]
+    #[error("a tenant must declare at least one data class")]
     NoDataClasses,
     #[error("duplicate data class {0:?}")]
     DuplicateDataClass(DataClass),
@@ -978,7 +993,7 @@ mod tests {
     fn the_example_file_loads_and_covers_every_rule() {
         let t = table();
         assert_eq!(t.verification_max_age_days(), 90);
-        assert_eq!(t.len(), 7);
+        assert_eq!(t.len(), 8);
         assert!(!t.is_empty());
         // 每种留存、两种 DPA、三种数据类别、两种访问路径、多区域，示例里都出现过
         let all = t.endpoints();
@@ -1268,13 +1283,8 @@ mod tests {
                 ..
             }
         ));
-        assert!(matches!(
-            bad("[adult]", "[]").unwrap_err(),
-            PermitError::Entry {
-                problem: PermitProblem::NoDataClasses,
-                ..
-            }
-        ));
+        // 空的 allowed_data_classes 是合法的（「已调研，目前没有任何类别被允许」），见下面专门的测试
+        assert!(bad("[adult]", "[]").is_ok());
         assert!(matches!(
             bad("[adult]", "[adult, adult]").unwrap_err(),
             PermitError::Entry {
@@ -1773,6 +1783,103 @@ mod tests {
             .into_iter()
             .collect()
         );
+    }
+
+    // ---------- 没核实的值：写成最坏的那个，永远选不中 ----------
+
+    #[test]
+    fn an_entry_with_no_permitted_data_class_loads_but_can_never_be_selected() {
+        let yaml = one_entry_table(1, 90, &entry_yaml("p", "").replace("[adult]", "[]"));
+        let t = PermitTable::from_yaml_str(&yaml).unwrap();
+        assert!(t.endpoints()[0].allowed_data_classes.is_empty());
+        let only = [key("p", "m", "e")];
+        // 租户的数据类别非空，所以不可能是空集的子集：任何类别组合都选不中
+        for tenant_classes in [
+            vec![DataClass::Public],
+            vec![DataClass::Adult],
+            vec![DataClass::ChildEdu],
+            vec![DataClass::Adult, DataClass::Public],
+            vec![DataClass::ChildEdu, DataClass::Adult, DataClass::Public],
+        ] {
+            let r = req(DeploymentForm::Cloud, tenant(&tenant_classes));
+            let err = select_compliant(&t, &only, &r, now()).unwrap_err();
+            assert!(
+                err.excluded[0]
+                    .reasons
+                    .iter()
+                    .any(|x| matches!(x, ExcludeReason::DataClassNotAllowed { .. })),
+                "{tenant_classes:?}"
+            );
+        }
+        // 反序列化 / 序列化往返保持空列表（不会被悄悄补上什么）
+        let back = PermitTable::from_yaml_str(&serde_yaml::to_string(&t).unwrap()).unwrap();
+        assert_eq!(back, t);
+    }
+
+    #[test]
+    fn the_all_unverified_example_entry_is_never_selected_for_any_request_shape() {
+        let t = table();
+        let k = key(
+            "example-unverified-host",
+            "example-org/chat-70b",
+            "openai-compat",
+        );
+        let e = t.lookup(&k).unwrap();
+        // 示例里的「什么都没核实」条目：全部按最坏值写
+        assert!(e.allowed_data_classes.is_empty());
+        assert_eq!(e.retention, Retention::Retained);
+        assert_eq!(e.dpa, Dpa::Unsigned);
+        assert_eq!(e.processing_regions, vec![Region::new("unknown").unwrap()]);
+        let c = e.capabilities;
+        assert!(
+            !(c.tool_calling
+                || c.stream_usage
+                || c.cache_pricing
+                || c.structured_output
+                || c.cancellation)
+        );
+        // 穷举：每一种非空的租户类别组合 × 三种形态 × 流式与否 × 三种计费 × 租户松紧，一个都选不中
+        let class_sets: Vec<Vec<DataClass>> = (1u8..8)
+            .map(|mask| {
+                [DataClass::ChildEdu, DataClass::Adult, DataClass::Public]
+                    .into_iter()
+                    .enumerate()
+                    .filter(|(i, _)| mask & (1 << i) != 0)
+                    .map(|(_, c)| c)
+                    .collect()
+            })
+            .collect();
+        let mut combos = 0;
+        for classes_set in &class_sets {
+            for form in DeploymentForm::ALL {
+                for stream in [false, true] {
+                    for billing in [Billing::Paid, Billing::Subsidized, Billing::Unbilled] {
+                        for (regions_allowed, max_retention, require_dpa) in [
+                            (None, Retention::Retained, false),
+                            (Some(regions(&["unknown"])), Retention::Retained, false),
+                            (None, Retention::Zdr, true),
+                        ] {
+                            let tenant = TenantDataPolicy::new(
+                                classes(classes_set),
+                                regions_allowed,
+                                max_retention,
+                                require_dpa,
+                            )
+                            .unwrap();
+                            let mut r = req(form, tenant);
+                            r.stream = stream;
+                            r.billing = billing;
+                            combos += 1;
+                            assert!(
+                                select_compliant(&t, std::slice::from_ref(&k), &r, now()).is_err(),
+                                "selected for {classes_set:?} {form:?} stream={stream} {billing:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(combos, 7 * 3 * 2 * 3 * 3);
     }
 
     // ---------- 云形态排除 subscription ----------

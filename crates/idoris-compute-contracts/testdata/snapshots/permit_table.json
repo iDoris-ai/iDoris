@@ -172,6 +172,27 @@
       "provider": "example-stale-host",
       "retention": "zdr",
       "verified_at": "2026-06-01T00:00:00Z"
+    },
+    {
+      "access": "api",
+      "allowed_data_classes": [],
+      "capabilities": {
+        "cache_pricing": false,
+        "cancellation": false,
+        "stream_usage": false,
+        "structured_output": false,
+        "tool_calling": false
+      },
+      "dpa": "unsigned",
+      "endpoint": "openai-compat",
+      "model": "example-org/chat-70b",
+      "notes": "假数据：调研过，但留存、DPA、区域、能力都没核实出来。没核实的值一律写成最坏的那个（见 permit.rs 的模块文档），所以这个端点永远不会被任何请求选中。",
+      "processing_regions": [
+        "unknown"
+      ],
+      "provider": "example-unverified-host",
+      "retention": "retained",
+      "verified_at": "2026-11-05T00:00:00Z"
     }
   ],
   "schema_version": 1,
