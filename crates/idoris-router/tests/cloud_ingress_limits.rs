@@ -426,6 +426,27 @@ async fn auth_failures_are_counted_per_credential_prefix_not_per_ip() {
         )
         .await;
     assert_eq!(elsewhere.code(), "auth_throttled");
+    // 同一个前缀、只有最后一位不同（输错了最后几位再试）：聚在同一个计数里，同样被限流
+    let mut tail_typo = stale.clone();
+    tail_typo.pop();
+    tail_typo.push('f');
+    assert_ne!(tail_typo, stale);
+    let typo = w
+        .send(&from(
+            Req::chat(w.cred("mem_kid1")).bearer_raw(Some(&tail_typo)),
+        ))
+        .await;
+    assert_eq!(typo.code(), "auth_throttled");
+    // 前 16 个字符里有一位不同（只知道 masked 显示的前 8 位的人没法投毒）：不同的计数，只是 401
+    let mut head_changed = stale.clone();
+    head_changed.replace_range(16..17, "e");
+    assert_ne!(head_changed, stale);
+    let head = w
+        .send(&from(
+            Req::chat(w.cred("mem_kid1")).bearer_raw(Some(&head_changed)),
+        ))
+        .await;
+    assert_eq!(head.status, 401);
     // 同一个 IP 上另一把写错的密钥（前缀不同）：只是 401，不受那把密钥的影响
     let other_bad = w
         .send(&from(

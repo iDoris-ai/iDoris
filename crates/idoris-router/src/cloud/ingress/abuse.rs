@@ -15,20 +15,26 @@
 //! | | 谁被它限制 | 键 | 作用 |
 //! |---|---|---|---|
 //! | [`AnonymousLimiter`] | 没有凭证、或者认证失败的请求 | 来源地址（IPv6 取 /64）的软配额 + 全局总配额 | 防扫描、防海量垃圾请求把入口占满。**永远不会被带着有效凭证的请求碰到。** |
-//! | [`FailureThrottle`] | 带着格式正确、但认证失败的凭证的请求 | **凭证前缀**（凭证明文 `idk_` 之后的前 8 个十六进制字符） | 防爆破，也防一个带着已撤销凭证死循环重试的客户端把库打满。同一个前缀在窗口内失败太多次，之后同前缀的请求先在内存里被拒绝，不碰数据库。 |
+//! | [`FailureThrottle`] | 带着格式正确、但认证失败的凭证的请求 | **凭证前缀**（凭证明文 `idk_` 之后的前 16 个十六进制字符，64 位，加盐哈希之后做键） | 防爆破，也防一个带着已撤销凭证死循环重试的客户端把库打满。同一个前缀在窗口内失败太多次，之后同前缀的请求先在内存里被拒绝，不碰数据库。 |
 //!
 //! 失败计数**不按纯 IP**：按凭证前缀。一个学校里一个学生把密钥输错，只会让「这个错的密钥」被限流，同一个出口后面
 //! 其他学生的密钥（前缀不同）完全不受影响。
 //!
-//! 前缀只有 32 位，是明文凭证 256 位随机量的一小部分，只存在内存里、不写日志、不落盘。没有用整个凭证的哈希
-//! 做键，是为了让「同一把钥匙输错了最后几位再试」也能聚到一起；代价是别人理论上可以对着已知前缀的凭证发垃圾
-//! 把它那个桶占满——但要做到这一点必须先拿到那把钥匙的前缀，而前缀不出现在任何响应、日志或审计里。
+//! # 为什么是 64 位前缀、加盐哈希
+//!
+//! 凭证明文是 256 位随机量。前缀取前 64 位，用每个进程随机的盐哈希之后才做键：内存里不留任何明文凭证的片段。
+//! 64 位而不是更短，是为了防**定向投毒**：失败前缀是在认证**之前**预检的，如果前缀短到可以从「masked key」的显示
+//! （许多控制台只显示 `idk_abcd1234…`）里读出来，别人就能对着这个前缀发几个垃圾凭证，把真凭证的请求也挡在预检外面。
+//! 64 位前缀只靠显示出来的头几个字符猜不出来（要猜出剩下的位，得先发出天文数字的请求，而那些请求自己就先被
+//! 来源软配额挡住了）。用前缀而不是整个凭证的哈希，是为了让「同一把钥匙输错了最后几位再试」也能聚到一起。
 //!
 //! # 表的大小
 //!
 //! 两张表的键（地址、前缀）有一部分来自攻击者，所以都是 [`Bounded`]：满了先丢空闲条目，再丢最老的，
 //! 内存用量不由攻击者决定（见 `bucket`）。
 
+use std::collections::hash_map::RandomState;
+use std::hash::BuildHasher;
 use std::net::{IpAddr, Ipv6Addr};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
@@ -109,13 +115,8 @@ impl AnonymousLimiter {
     }
 }
 
-/// 凭证前缀：明文凭证 `idk_<64 位十六进制>` 里 `idk_` 之后的前 8 个十六进制字符，当作一个 `u32`。
-/// 参数是已经校验过格式的明文凭证（`VirtualKeySecret::expose_secret`）；格式不对返回 `None`。
-pub fn credential_prefix(secret: &str) -> Option<u32> {
-    let payload = secret.strip_prefix(idoris_tenancy::virtual_key::VIRTUAL_KEY_PREFIX)?;
-    let head = payload.get(..8)?;
-    u32::from_str_radix(head, 16).ok()
-}
+/// 失败计数用的前缀长度：明文凭证 `idk_` 之后的前 16 个十六进制字符（64 位）。
+pub const PREFIX_HEX_CHARS: usize = 16;
 
 #[derive(Debug, Clone, Copy)]
 struct Failures {
@@ -127,7 +128,9 @@ struct Failures {
 pub struct FailureThrottle {
     max_failures: u32,
     window_ms: i64,
-    table: Mutex<Bounded<u32, Failures>>,
+    /// 每个进程随机的盐：键是 `盐 + 前缀` 的哈希，内存里没有任何明文凭证的片段，也没人能预先算出一个前缀的键。
+    salt: RandomState,
+    table: Mutex<Bounded<u64, Failures>>,
 }
 
 impl std::fmt::Debug for FailureThrottle {
@@ -145,8 +148,19 @@ impl FailureThrottle {
         Self {
             max_failures: max_failures.max(1),
             window_ms: i64::try_from(window_secs.saturating_mul(1000)).unwrap_or(i64::MAX),
+            salt: RandomState::new(),
             table: Mutex::new(Bounded::new(MAX_FAILURE_ENTRIES)),
         }
+    }
+
+    /// 一个明文凭证（`VirtualKeySecret::expose_secret`，格式已经校验过）的失败计数键：前 [`PREFIX_HEX_CHARS`] 个十六进制
+    /// 字符的加盐哈希。格式不对返回 `None`。
+    pub fn key_of(&self, secret: &str) -> Option<u64> {
+        let payload = secret.strip_prefix(idoris_tenancy::virtual_key::VIRTUAL_KEY_PREFIX)?;
+        let head = payload.get(..PREFIX_HEX_CHARS)?;
+        head.bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+            .then(|| self.salt.hash_one(head))
     }
 
     fn expired(&self, entry: &Failures, now_ms: i64) -> bool {
@@ -154,7 +168,7 @@ impl FailureThrottle {
     }
 
     /// 认证之前先问一次：这个前缀已经被限流了吗？`Err(秒数)` = 被限流，该等多久（至少 1）。
-    pub fn check(&self, prefix: u32, now_ms: i64) -> Result<(), u64> {
+    pub fn check(&self, prefix: u64, now_ms: i64) -> Result<(), u64> {
         let mut table = lock(&self.table);
         let Some(entry) = table.get_mut(&prefix) else {
             return Ok(());
@@ -173,7 +187,7 @@ impl FailureThrottle {
     }
 
     /// 一次认证失败。
-    pub fn record_failure(&self, prefix: u32, now_ms: i64) {
+    pub fn record_failure(&self, prefix: u64, now_ms: i64) {
         let window_ms = self.window_ms;
         let mut table = lock(&self.table);
         let entry = table.get_or_insert_with(
@@ -195,7 +209,7 @@ impl FailureThrottle {
     }
 
     /// 这个前缀认证成功了（比如被冻结的凭证被解冻）：清掉它的失败记录。
-    pub fn record_success(&self, prefix: u32) {
+    pub fn record_success(&self, prefix: u64) {
         lock(&self.table).remove(&prefix);
     }
 }
@@ -288,12 +302,32 @@ mod tests {
     // ---------- 凭证前缀 ----------
 
     #[test]
-    fn the_credential_prefix_is_the_first_eight_hex_digits_after_the_scheme() {
-        let secret = format!("idk_{}", "0123456789abcdef".repeat(4));
-        assert_eq!(credential_prefix(&secret), Some(0x0123_4567));
-        assert_eq!(credential_prefix("idk_short"), None);
-        assert_eq!(credential_prefix("sk_0123456789abcdef"), None);
-        assert_eq!(credential_prefix("idk_zzzzzzzz0123"), None);
+    fn the_failure_key_covers_the_first_sixteen_hex_digits_and_is_salted() {
+        let throttle = FailureThrottle::new(3, 60);
+        let secret = |tail: &str| format!("idk_0123456789abcdef{tail}");
+        let tail = "0".repeat(48);
+        let base = throttle.key_of(&secret(&tail)).unwrap();
+        // 前 16 位之后的字符不同：同一个键（输错最后几位再试，聚在一起）
+        assert_eq!(base, throttle.key_of(&secret(&"f".repeat(48))).unwrap());
+        // 前 16 位里任何一位不同：不同的键（只知道 masked 显示的前 8 位，投不了毒）
+        let other_head = format!("idk_0123456789abcdee{tail}");
+        assert_ne!(base, throttle.key_of(&other_head).unwrap());
+        let other_start = format!("idk_1123456789abcdef{tail}");
+        assert_ne!(base, throttle.key_of(&other_start).unwrap());
+        // 加盐：另一个实例（另一个进程）对同一个前缀算出的键不同，没人能预先算出键
+        assert_ne!(
+            base,
+            FailureThrottle::new(3, 60).key_of(&secret(&tail)).unwrap()
+        );
+        // 格式不对没有键
+        for bad in [
+            "idk_short",
+            "sk_0123456789abcdef0123",
+            "idk_zzzzzzzzzzzzzzzz0123",
+            "",
+        ] {
+            assert_eq!(throttle.key_of(bad), None, "{bad:?}");
+        }
     }
 
     // ---------- 认证失败 ----------
@@ -301,7 +335,7 @@ mod tests {
     #[test]
     fn failures_throttle_only_their_own_prefix_and_only_after_the_limit() {
         let throttle = FailureThrottle::new(3, 60);
-        let (bad, other) = (0xDEAD_BEEF, 0x1234_5678);
+        let (bad, other) = (0xDEAD_BEEF_u64, 0x1234_5678_u64);
         for _ in 0..3 {
             assert_eq!(throttle.check(bad, 0), Ok(()));
             throttle.record_failure(bad, 0);
@@ -318,7 +352,7 @@ mod tests {
     #[test]
     fn the_failure_window_resets_and_a_success_forgives() {
         let throttle = FailureThrottle::new(2, 10);
-        let prefix = 7;
+        let prefix = 7_u64;
         throttle.record_failure(prefix, 0);
         throttle.record_failure(prefix, 5_000);
         assert!(throttle.check(prefix, 6_000).is_err());
@@ -335,9 +369,9 @@ mod tests {
     #[test]
     fn a_flood_of_distinct_bad_prefixes_neither_throttles_a_valid_one_nor_grows_the_table() {
         let throttle = FailureThrottle::new(5, 60);
-        let valid_prefix = 0xAAAA_0001;
+        let valid_prefix = 0xAAAA_0001_u64;
         // 攻击者发 50000 个各不相同的垃圾前缀，每个失败一次
-        for junk in 0..50_000u32 {
+        for junk in 0..50_000u64 {
             throttle.record_failure(junk, 1_000);
         }
         // 这些垃圾前缀没有一个攒到 5 次：有效凭证的前缀不受影响

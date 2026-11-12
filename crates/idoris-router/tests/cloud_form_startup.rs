@@ -566,6 +566,10 @@ async fn the_cloud_ingress_serves_api_v1_from_operator_bootstrap_to_a_call_in_a_
         .await
         .unwrap();
     assert_eq!(models.status(), 200);
+    assert!(
+        models.content_length().is_some(),
+        "a complete answer carries an exact Content-Length, not chunked transfer"
+    );
     let models: serde_json::Value = models.json().await.unwrap();
     assert_eq!(models["data"][0]["id"], "idoris/agent");
     let chat = client
@@ -578,6 +582,10 @@ async fn the_cloud_ingress_serves_api_v1_from_operator_bootstrap_to_a_call_in_a_
         .await
         .unwrap();
     assert_eq!(chat.status(), 200);
+    assert!(
+        chat.content_length().is_some(),
+        "a complete answer carries an exact Content-Length, not chunked transfer"
+    );
     let chat: serde_json::Value = chat.json().await.unwrap();
     assert_eq!(chat["choices"][0]["message"]["content"], "hello");
     assert_eq!(fake.request_count(), 1);

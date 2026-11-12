@@ -20,7 +20,8 @@
 //! 5. **付款上下文 + 租户 + 数据处理要求**（`caller`）：失败 -> 401 / 403 / 503，**不回落**。
 //! 6. **三级上限**（成员 -> 租户 -> 平台）：被限 -> 429，带 `Retry-After` 和 `X-iDoris-Limit-Scope`。
 //! 7. **读请求体**（有上限、有期限）：太大 -> 413，太慢 -> 408。放在认证和限流**之后**：没有资格的请求不会让我们为它缓冲一兆字节。
-//! 8. 交给处理函数；响应体持有并发名额，直到整个响应（含流）发完或客户端断开。
+//! 8. 交给处理函数。非流式的 JSON 回答（带确切的 `Content-Length`）处理完就释放并发名额；流式响应的响应体持有名额，
+//!    直到整个流发完、出错或客户端断开。
 //!
 //! 控制面（`/control/v1`，只有配置里 `control_plane.public: true` 才挂）不经过上面这些：它自己认证、自己授权。
 //! 只给它加了一道请求体读取期限（慢请求），其它一概不动。
@@ -210,7 +211,7 @@ pub(super) async fn data_plane_guard(
         Ok(secret) => secret,
         Err(_) => return deny_unauthenticated(&ingress, source, now.0),
     };
-    let prefix = abuse::credential_prefix(secret.expose_secret());
+    let prefix = ingress.failures.key_of(secret.expose_secret());
 
     // 2. 失败前缀预检（内存里，不碰库）。键是凭证前缀，**不是**来源地址：同一个出口后面别的学生的凭证前缀不同，不受影响。
     if let Some(prefix) = prefix
@@ -286,7 +287,7 @@ pub(super) async fn data_plane_guard(
     request.extensions_mut().insert(resolved.policy);
     request.extensions_mut().insert(resolved.context);
     let response = next.run(request).await;
-    hold_permit(response, permit)
+    hold_permit(response, permit).await
 }
 
 /// 读完请求体：有上限、有期限。`Content-Length` 先查（诚实的客户端不用读一个字节就被拒绝）；分块上传边读边数。
@@ -357,10 +358,28 @@ impl<S: Stream + Unpin> Stream for PermitBody<S> {
     }
 }
 
-/// 把并发名额挂在响应体上：响应体被完整发完、出错、或者客户端断开后被丢弃时才释放。
-/// 流式响应因此在整个流持续期间都占着名额。
-fn hold_permit(response: Response, permit: Permit) -> Response {
+/// 内存里的 JSON 回答最大允许多大才会被收拢成一块（远大于上游响应体上限 `max_response_bytes` 的默认值 4 MiB）。
+const MAX_BUFFERED_JSON_BYTES: usize = 32 * 1024 * 1024;
+
+/// 把并发名额跟响应体绑在一起。
+///
+/// - **JSON 回答**（非流式的完整回答、错误信封、模型列表）已经整个在内存里：收拢成一块，这样响应带确切的
+///   `Content-Length`（不是分块传输，和本地路由器的行为一致），名额当场释放——处理已经结束了；
+/// - **其它**（流式的 `text/event-stream`）：名额挂在响应体上，响应体被完整发完、出错、或者客户端断开后
+///   被丢弃时才释放，所以流式响应在整个流持续期间都占着名额。
+async fn hold_permit(response: Response, permit: Permit) -> Response {
+    let is_json = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("application/json"));
     let (parts, body) = response.into_parts();
+    if is_json {
+        return match axum::body::to_bytes(body, MAX_BUFFERED_JSON_BYTES).await {
+            Ok(bytes) => Response::from_parts(parts, Body::from(bytes)),
+            Err(_) => unavailable(),
+        };
+    }
     let guarded = PermitBody {
         inner: body.into_data_stream(),
         _permit: permit,
