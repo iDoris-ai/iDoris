@@ -272,18 +272,9 @@ impl DeviceStore {
     /// 读设备凭证。没有文件是 `Ok(None)`；有文件但不可用（权限、格式、符号链接）是错误：失败即关闭。
     #[cfg(unix)]
     pub fn read(&self) -> Result<Option<DeviceRecord>, CredentialError> {
-        use std::os::unix::fs::PermissionsExt;
-
-        let path = self.path();
-        let metadata = match std::fs::symlink_metadata(&path) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(_) => return Err(CredentialError::Unreadable),
+        let Some(text) = read_private_regular_file(&self.path())? else {
+            return Ok(None);
         };
-        if !metadata.file_type().is_file() || metadata.permissions().mode() & 0o077 != 0 {
-            return Err(CredentialError::InsecureFile);
-        }
-        let text = std::fs::read_to_string(&path).map_err(|_| CredentialError::Unreadable)?;
         let file: DeviceFile =
             serde_json::from_str(&text).map_err(|_| CredentialError::Malformed)?;
         if file.version != DEVICE_FILE_VERSION
@@ -391,6 +382,45 @@ impl DeviceStore {
     }
 }
 
+/// 凭证文件的大小上限：一个凭证文件只有几百个字节，更大的东西不是凭证文件。
+#[cfg(unix)]
+const MAX_CREDENTIAL_FILE_BYTES: u64 = 16 * 1024;
+
+/// 读一个只有属主能读写的普通文件（`Ok(None)` = 不存在）。检查和读取落在**同一个 inode** 上：
+/// 先 `lstat`（不跟随符号链接：必须是普通文件、没有 group / other 位），再打开，再 `fstat` 已打开的文件，
+/// 要求设备号和 inode 号与 `lstat` 看到的一致——检查完、读取前文件被换成符号链接或别的文件，会被发现，不会被读出来。
+#[cfg(unix)]
+fn read_private_regular_file(path: &Path) -> Result<Option<String>, CredentialError> {
+    use std::io::Read;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let before = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(CredentialError::Unreadable),
+    };
+    if !before.file_type().is_file() || before.permissions().mode() & 0o077 != 0 {
+        return Err(CredentialError::InsecureFile);
+    }
+    let file = std::fs::File::open(path).map_err(|_| CredentialError::Unreadable)?;
+    let after = file.metadata().map_err(|_| CredentialError::Unreadable)?;
+    if !after.file_type().is_file()
+        || after.dev() != before.dev()
+        || after.ino() != before.ino()
+        || after.permissions().mode() & 0o077 != 0
+    {
+        return Err(CredentialError::InsecureFile);
+    }
+    let mut text = String::new();
+    file.take(MAX_CREDENTIAL_FILE_BYTES + 1)
+        .read_to_string(&mut text)
+        .map_err(|_| CredentialError::Unreadable)?;
+    if u64::try_from(text.len()).unwrap_or(u64::MAX) > MAX_CREDENTIAL_FILE_BYTES {
+        return Err(CredentialError::Malformed);
+    }
+    Ok(Some(text))
+}
+
 /// 新建（`O_EXCL`）一个只有属主能读写的文件。
 #[cfg(unix)]
 fn open_private_new(path: &Path) -> std::io::Result<std::fs::File> {
@@ -482,14 +512,7 @@ impl NodeFileProvider {
 impl CredentialProvider for NodeFileProvider {
     #[cfg(unix)]
     fn load(&self) -> Result<LoadedCredential, CredentialError> {
-        use std::os::unix::fs::PermissionsExt;
-
-        let metadata =
-            std::fs::symlink_metadata(&self.path).map_err(|_| CredentialError::Unreadable)?;
-        if !metadata.file_type().is_file() || metadata.permissions().mode() & 0o077 != 0 {
-            return Err(CredentialError::InsecureFile);
-        }
-        let text = std::fs::read_to_string(&self.path).map_err(|_| CredentialError::Unreadable)?;
+        let text = read_private_regular_file(&self.path)?.ok_or(CredentialError::Unreadable)?;
         let secret = CloudCredential::parse(text.trim())?;
         refuse_local_key(self.probe.as_deref(), &secret)?;
         Ok(LoadedCredential {
@@ -885,5 +908,49 @@ mod tests {
         let json = serde_json::to_string(&summary).unwrap();
         assert!(!json.contains("idk_") && !json.contains("secret"));
         assert!(!json.contains("0123456789abcdef0123456789abcdef"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_credential_file_is_read_through_one_inode_and_is_size_capped() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big.key");
+        std::fs::write(&path, format!("{}\n{}", secret('a'), "x".repeat(20 * 1024))).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        // 一个凭证文件只有几百个字节；更大的东西不是凭证文件，不读
+        assert_eq!(
+            NodeFileProvider::new(&path, None).load().unwrap_err(),
+            CredentialError::Malformed
+        );
+        // 不存在是 None（设备凭证用它表示「还没配对」），Node 凭证文件不存在是 Unreadable
+        let missing = dir.path().join("missing.key");
+        assert_eq!(read_private_regular_file(&missing).unwrap(), None);
+        assert_eq!(
+            NodeFileProvider::new(&missing, None).load().unwrap_err(),
+            CredentialError::Unreadable
+        );
+        // 目录、符号链接都不是「普通文件」
+        assert_eq!(
+            read_private_regular_file(dir.path()).unwrap_err(),
+            CredentialError::InsecureFile
+        );
+        let target = dir.path().join("target.key");
+        std::fs::write(&target, secret('b')).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let link = dir.path().join("link.key");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert_eq!(
+            NodeFileProvider::new(&link, None).load().unwrap_err(),
+            CredentialError::InsecureFile
+        );
+        assert_eq!(
+            NodeFileProvider::new(&target, None)
+                .load()
+                .unwrap()
+                .secret
+                .expose_secret(),
+            secret('b')
+        );
     }
 }
