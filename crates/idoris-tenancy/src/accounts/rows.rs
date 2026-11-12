@@ -104,6 +104,25 @@ pub(super) fn load_account(
     .transpose()
 }
 
+/// 只读一行的 `status` 文本（`table` 和 `id_column` 是调用方写死的字面量，不是用户输入）。
+///
+/// 撤销、冻结、关闭这类状态变更不能依赖「整行（连同它的子表）都读得出来」：某张凭证的权限范围行坏了，
+/// 读整张凭证会失败，但它必须仍然能被撤销，所以这些路径只读状态这一列。
+pub(super) fn load_status_text(
+    conn: &Connection,
+    table: &'static str,
+    id_column: &'static str,
+    id: &str,
+) -> Result<Option<String>, AccountStoreError> {
+    conn.query_row(
+        &format!("SELECT status FROM {table} WHERE {id_column} = ?1"),
+        [id],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(AccountStoreError::from)
+}
+
 pub(super) fn account_exists(conn: &Connection, id: &AccountId) -> Result<bool, AccountStoreError> {
     let found: Option<i64> = conn
         .query_row(
@@ -391,10 +410,12 @@ pub(super) fn load_credential(
         Option<String>,
         String,
         Option<i64>,
+        i64,
     );
     let raw: Option<Raw> = conn
         .query_row(
-            "SELECT credential_id, binding_kind, account_id, membership_id, status, expires_at_ms \
+            "SELECT credential_id, binding_kind, account_id, membership_id, status, expires_at_ms, \
+                    scope_count \
              FROM credentials WHERE credential_id = ?1",
             [id.as_str()],
             |row| {
@@ -405,11 +426,12 @@ pub(super) fn load_credential(
                     row.get(3)?,
                     row.get(4)?,
                     row.get(5)?,
+                    row.get(6)?,
                 ))
             },
         )
         .optional()?;
-    let Some((cred_id, kind, account, membership, status, expires_at)) = raw else {
+    let Some((cred_id, kind, account, membership, status, expires_at, scope_count)) = raw else {
         return Ok(None);
     };
     let binding = match (kind.as_str(), account, membership) {
@@ -442,6 +464,14 @@ pub(super) fn load_credential(
             ))
         })?
         .collect::<Result<Vec<_>, _>>()?;
+    // The number of scope rows is fixed at issuance (`credentials.scope_count`): a mismatch means rows
+    // were removed or added behind the store's back, so the credential is not what was issued.
+    if i64::try_from(raw_scopes.len()).ok() != Some(scope_count) {
+        return Err(AccountStoreError::Corrupt(format!(
+            "credential {cred_id} was issued with {scope_count} admin scopes but has {} stored",
+            raw_scopes.len()
+        )));
+    }
     let mut admin_scopes = Vec::with_capacity(raw_scopes.len());
     for (op, subtree, unit, micros) in raw_scopes {
         let max_amount = match (unit, micros) {

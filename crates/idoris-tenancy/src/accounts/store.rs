@@ -49,16 +49,20 @@ use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior};
 
 use super::error::{AccountStoreError, PaymentContextError};
 use super::rows::{
-    account_exists, load_account, load_all_accounts, load_all_memberships, load_all_principals,
-    load_allocation, load_allocation_by_key, load_allocations_where, load_ancestors,
-    load_credential, load_membership, load_memberships_of, load_platform_roots, load_principal,
-    merge_chains, to_text,
+    account_exists, from_text, load_account, load_all_accounts, load_all_memberships,
+    load_all_principals, load_allocation, load_allocation_by_key, load_allocations_where,
+    load_ancestors, load_credential, load_membership, load_memberships_of, load_platform_roots,
+    load_principal, load_status_text, merge_chains, to_text,
 };
 use crate::sqlite_conn::{
     PragmaSnapshot, STANDARD_BUSY_TIMEOUT, apply_standard, snapshot as pragma_snapshot,
 };
 
 const MIGRATIONS: &[&str] = &[include_str!("migrations/0001_accounts.sql")];
+
+/// A credential carries at most this many control-plane scopes (also a CHECK on
+/// `credentials.scope_count` in the migration).
+const MAX_ADMIN_SCOPES_PER_CREDENTIAL: usize = 64;
 
 /// 创建额度的结果。带幂等键的额度重发时返回已有的那一条，不再写第二条。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -173,9 +177,11 @@ impl AccountStore {
         now: TimestampMs,
     ) -> Result<bool, AccountStoreError> {
         self.write(|tx| {
-            let current = load_principal(tx, id)?
+            let current = load_status_text(tx, "principals", "principal_id", id.as_str())?
                 .ok_or_else(|| AccountStoreError::not_found("principal", id.as_str()))?;
-            if current.status == PrincipalStatus::Revoked {
+            if from_text::<PrincipalStatus>("principal status", &current)?
+                == PrincipalStatus::Revoked
+            {
                 return Ok(false);
             }
             tx.execute(
@@ -275,16 +281,17 @@ impl AccountStore {
         status: AccountStatus,
     ) -> Result<(), AccountStoreError> {
         self.write(|tx| {
-            let current = load_account(tx, id)?
+            let current = load_status_text(tx, "accounts", "account_id", id.as_str())?
                 .ok_or_else(|| AccountStoreError::not_found("account", id.as_str()))?;
-            if current.status == status {
+            let current = from_text::<AccountStatus>("account status", &current)?;
+            if current == status {
                 return Ok(());
             }
-            if current.status == AccountStatus::Closed {
+            if current == AccountStatus::Closed {
                 return Err(AccountStoreError::IllegalTransition {
                     kind: "account",
                     id: id.to_string(),
-                    from: to_text(&current.status)?,
+                    from: to_text(&current)?,
                     to: to_text(&status)?,
                 });
             }
@@ -406,9 +413,11 @@ impl AccountStore {
         now: TimestampMs,
     ) -> Result<bool, AccountStoreError> {
         self.write(|tx| {
-            let current = load_membership(tx, id)?
+            let current = load_status_text(tx, "memberships", "membership_id", id.as_str())?
                 .ok_or_else(|| AccountStoreError::not_found("membership", id.as_str()))?;
-            if current.status == MembershipStatus::Revoked {
+            if from_text::<MembershipStatus>("membership status", &current)?
+                == MembershipStatus::Revoked
+            {
                 return Ok(false);
             }
             tx.execute(
@@ -435,11 +444,19 @@ impl AccountStore {
         now: TimestampMs,
     ) -> Result<(), AccountStoreError> {
         self.write(|tx| {
-            if load_credential(tx, credential.id())?.is_some() {
+            if load_status_text(tx, "credentials", "credential_id", credential.id().as_str())?
+                .is_some()
+            {
                 return Err(AccountStoreError::already_exists(
                     "credential",
                     credential.id().as_str(),
                 ));
+            }
+            if credential.admin_scopes().len() > MAX_ADMIN_SCOPES_PER_CREDENTIAL {
+                return Err(AccountStoreError::InvalidBinding(format!(
+                    "a credential carries at most {MAX_ADMIN_SCOPES_PER_CREDENTIAL} admin scopes, got {}",
+                    credential.admin_scopes().len()
+                )));
             }
             let (kind, account, membership, anchor) = match credential.binding() {
                 CredentialBinding::Service { account } => {
@@ -479,11 +496,13 @@ impl AccountStore {
                 }
             }
             let status = credential.status();
+            // `scope_count` is fixed here, at issuance: the database refuses admin-scope rows beyond it
+            // (and refuses to change it), so scopes can never be appended to an existing credential.
             tx.execute(
                 "INSERT INTO credentials \
                     (credential_id, binding_kind, account_id, membership_id, status, expires_at_ms, \
-                     created_at_ms, revoked_at_ms) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                     created_at_ms, revoked_at_ms, scope_count) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 rusqlite::params![
                     credential.id().as_str(),
                     kind,
@@ -493,6 +512,7 @@ impl AccountStore {
                     credential.expires_at().map(|at| at.0),
                     now.0,
                     (status == CredentialStatus::Revoked).then_some(now.0),
+                    i64::try_from(credential.admin_scopes().len()).unwrap_or(i64::MAX),
                 ],
             )?;
             for (position, scope) in credential.admin_scopes().iter().enumerate() {
@@ -530,9 +550,11 @@ impl AccountStore {
         now: TimestampMs,
     ) -> Result<(), AccountStoreError> {
         self.write(|tx| {
-            let current = load_credential(tx, id)?
-                .ok_or_else(|| AccountStoreError::not_found("credential", id.as_str()))?
-                .status();
+            // Status column only (not the whole credential): revoking must keep working even if the
+            // credential's scope rows are unreadable.
+            let current = load_status_text(tx, "credentials", "credential_id", id.as_str())?
+                .ok_or_else(|| AccountStoreError::not_found("credential", id.as_str()))?;
+            let current = from_text::<CredentialStatus>("credential status", &current)?;
             if current == status {
                 return Ok(());
             }

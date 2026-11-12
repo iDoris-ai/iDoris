@@ -1603,7 +1603,13 @@ fn db_root_shape_checks_reject_a_parentless_non_platform_and_a_platform_with_a_p
         // and the CHECK); whichever fires first reports it
         "CHECK constraint failed|kind is not allowed under its parent kind|platform root already exists",
     );
-    // 自己当自己的父账户
+    // 自己当自己的父账户：触发器先说「父账户还不存在」；拿掉触发器之后，CHECK 仍然单独拦得住。
+    assert_rejected(
+        &conn,
+        &insert_account_sql("loop", "org", Some("loop"), "THB"),
+        "CHECK constraint failed|parent account must exist",
+    );
+    assert_accepted(&conn, "DROP TRIGGER accounts_insert_rules;");
     assert_rejected(
         &conn,
         &insert_account_sql("loop", "org", Some("loop"), "THB"),
@@ -1612,18 +1618,155 @@ fn db_root_shape_checks_reject_a_parentless_non_platform_and_a_platform_with_a_p
 }
 
 #[test]
-fn db_a_missing_parent_hits_the_foreign_key() {
+fn db_a_missing_parent_is_rejected_by_the_trigger_and_by_the_foreign_key_alone() {
     let env = seeded();
     let conn = raw(&env);
     assert_rejected(
         &conn,
         &insert_account_sql("kid", "org", Some("ghost"), "THB"),
-        "FOREIGN KEY constraint failed",
+        "parent account must exist before its child",
     );
     assert_accepted(
         &conn,
         &insert_account_sql("kid", "org", Some("plat"), "THB"),
     ); // 对照
+    // 纵深防御：拿掉触发器，外键仍然单独拦得住指向不存在父账户的新账户
+    assert_accepted(&conn, "DROP TRIGGER accounts_insert_rules;");
+    assert_rejected(
+        &conn,
+        &insert_account_sql("kid-2", "org", Some("ghost"), "THB"),
+        "FOREIGN KEY constraint failed",
+    );
+}
+
+/// 一次写入多行（或者放宽外键检查）能不能把「先子后父」塞进去，进而造出环、超深的链、父子单位不符的账户？
+/// 外键默认按语句检查，所以光靠外键拦不住；触发器显式要求「父账户在这一行插入时已经存在」。
+#[test]
+fn db_a_child_cannot_precede_its_parent_by_multi_row_insert_select_deferred_or_disabled_foreign_keys()
+ {
+    let env = seeded();
+    let conn = raw(&env);
+    let accounts_before = count(&conn, "SELECT count(*) FROM accounts");
+    let unchanged = |conn: &Connection| {
+        assert_eq!(
+            count(conn, "SELECT count(*) FROM accounts"),
+            accounts_before,
+            "a rejected statement must leave no rows behind"
+        );
+    };
+    let values = |rows: &[(&str, &str, &str, &str)]| {
+        let rows: Vec<String> = rows
+            .iter()
+            .map(|(id, kind, parent, unit)| {
+                format!("('{id}', '{kind}', '{parent}', '{unit}', 'active', 0)")
+            })
+            .collect();
+        format!(
+            "INSERT INTO accounts (account_id, kind, parent_id, unit, status, created_at_ms) VALUES {};",
+            rows.join(", ")
+        )
+    };
+    let missing_parent = "parent account must exist before its child";
+
+    // 1. 环：a 的父账户是 b，b 的父账户是 a，同一条语句里
+    assert_rejected(
+        &conn,
+        &values(&[
+            ("cy-a", "org", "cy-b", "THB"),
+            ("cy-b", "org", "cy-a", "THB"),
+        ]),
+        missing_parent,
+    );
+    unchanged(&conn);
+
+    // 2. 先插子、后插父：既乱序又单位不符（子是 USD，父是 THB）
+    assert_rejected(
+        &conn,
+        &values(&[
+            ("mm-child", "member", "mm-parent", "USD"),
+            ("mm-parent", "sponsor", "org-a", "THB"),
+        ]),
+        missing_parent,
+    );
+    unchanged(&conn);
+
+    // 3. 一条 9 层深的链，最深的先插：深度检查看不到还没插进去的祖先
+    let chain: Vec<(String, String)> = (1..=8)
+        .rev()
+        .map(|depth| {
+            let parent = if depth == 1 {
+                "plat".to_string()
+            } else {
+                format!("deep-{}", depth - 1)
+            };
+            (format!("deep-{depth}"), parent)
+        })
+        .collect();
+    let rows: Vec<(&str, &str, &str, &str)> = chain
+        .iter()
+        .map(|(id, parent)| (id.as_str(), "org", parent.as_str(), "THB"))
+        .collect();
+    assert_rejected(&conn, &values(&rows), missing_parent);
+    unchanged(&conn);
+
+    // 4. INSERT … SELECT，按「深的在前」排序
+    assert_accepted(
+        &conn,
+        "CREATE TEMP TABLE staging (account_id TEXT, kind TEXT, parent_id TEXT, unit TEXT, rank INTEGER);
+         INSERT INTO staging VALUES ('st-1', 'org', 'plat', 'THB', 1), ('st-2', 'org', 'st-1', 'THB', 2), ('st-3', 'org', 'st-2', 'THB', 3);",
+    );
+    assert_rejected(
+        &conn,
+        "INSERT INTO accounts (account_id, kind, parent_id, unit, status, created_at_ms)
+         SELECT account_id, kind, parent_id, unit, 'active', 0 FROM staging ORDER BY rank DESC;",
+        missing_parent,
+    );
+    unchanged(&conn);
+    // 对照：同一批行按「父在前」的顺序一次性插入没有问题（合法的批量写入不受影响）
+    assert_accepted(
+        &conn,
+        "INSERT INTO accounts (account_id, kind, parent_id, unit, status, created_at_ms)
+         SELECT account_id, kind, parent_id, unit, 'active', 0 FROM staging ORDER BY rank ASC;",
+    );
+    assert_eq!(
+        count(&conn, "SELECT count(*) FROM accounts"),
+        accounts_before + 3
+    );
+
+    // 5. defer_foreign_keys：把外键检查推迟到事务结束，也不能让「环」进来
+    assert_accepted(&conn, "BEGIN; PRAGMA defer_foreign_keys = ON;");
+    assert_rejected(
+        &conn,
+        &values(&[("df-a", "org", "df-b", "THB")]),
+        missing_parent,
+    );
+    assert_accepted(&conn, "ROLLBACK;");
+    assert_eq!(
+        count(&conn, "SELECT count(*) FROM accounts"),
+        accounts_before + 3
+    );
+
+    // 6. foreign_keys = OFF（sqlite3 命令行的默认值）：触发器不依赖外键
+    assert_accepted(&conn, "PRAGMA foreign_keys = OFF;");
+    assert_rejected(
+        &conn,
+        &values(&[("ff-a", "org", "ghost", "THB")]),
+        missing_parent,
+    );
+    assert_rejected(
+        &conn,
+        &values(&[
+            ("ff-a", "org", "ff-b", "THB"),
+            ("ff-b", "org", "ff-a", "THB"),
+        ]),
+        missing_parent,
+    );
+    assert_eq!(
+        count(&conn, "SELECT count(*) FROM accounts"),
+        accounts_before + 3
+    );
+    // 对照：这个连接上的外键确实是关着的（上面的拒绝全是触发器的功劳）
+    assert_eq!(count(&conn, "PRAGMA foreign_keys"), 0);
 }
 
 #[test]
@@ -1859,21 +2002,21 @@ fn db_memberships_hit_foreign_keys_checks_the_unique_binding_and_the_shape_trigg
              VALUES ('{id}', '{principal}', '{org}', '{role}', {acct}, 'active', 0, NULL);"
         )
     };
-    // 外键
+    // 引用的主体、组织、账户必须已经存在（触发器显式检查；外键是第二道防线，见本测试末尾）
     assert_rejected(
         &conn,
         &insert("m1", "ghost", "org-a", "admin", None),
-        "FOREIGN KEY constraint failed",
+        "membership principal must exist",
     );
     assert_rejected(
         &conn,
         &insert("m1", "p-bob", "ghost", "admin", None),
-        "FOREIGN KEY constraint failed",
+        "membership org must exist",
     );
     assert_rejected(
         &conn,
         &insert("m1", "p-bob", "org-a", "member", Some("ghost")),
-        "FOREIGN KEY constraint failed",
+        "membership account must exist",
     );
     // 下面的反例各自用一个还没被任何成员关系占用的账户，这样被检查的只会是那一条规则
     // （「账户已被占用」的触发器先于 CHECK 触发，用已占用的账户会被它抢先拦下，测不到想测的约束）。
@@ -1952,6 +2095,23 @@ fn db_memberships_hit_foreign_keys_checks_the_unique_binding_and_the_shape_trigg
         "UPDATE memberships SET status='active', revoked_at_ms=NULL WHERE membership_id='m-bob-a';",
         "cannot be changed",
     );
+    // 纵深防御：拿掉结构触发器，外键仍然单独拦得住指向不存在的主体、组织、账户的成员关系
+    assert_accepted(&conn, "DROP TRIGGER memberships_insert_rules;");
+    assert_rejected(
+        &conn,
+        &insert("m-g1", "ghost", "org-a", "admin", None),
+        "FOREIGN KEY constraint failed",
+    );
+    assert_rejected(
+        &conn,
+        &insert("m-g2", "p-bob", "ghost", "admin", None),
+        "FOREIGN KEY constraint failed",
+    );
+    assert_rejected(
+        &conn,
+        &insert("m-g3", "p-bob", "org-a", "member", Some("ghost")),
+        "FOREIGN KEY constraint failed",
+    );
 }
 
 #[test]
@@ -2022,16 +2182,16 @@ fn db_credentials_enforce_one_binding_target_kinds_and_final_revocation() {
         &insert("c1", "ghost-kind", Some("org-a"), None),
         "CHECK constraint failed",
     );
-    // 外键
+    // 绑定目标必须已经存在（触发器显式检查；外键是第二道防线，见本测试末尾）
     assert_rejected(
         &conn,
         &insert("c1", "service", Some("ghost"), None),
-        "FOREIGN KEY constraint failed",
+        "credential account must exist",
     );
     assert_rejected(
         &conn,
         &insert("c1", "member", None, Some("ghost")),
-        "FOREIGN KEY constraint failed",
+        "credential membership must exist",
     );
     // 绑定目标的种类
     assert_rejected(
@@ -2092,19 +2252,56 @@ fn db_credentials_enforce_one_binding_target_kinds_and_final_revocation() {
         "UPDATE credentials SET status='revoked' WHERE credential_id='c-ok-2';",
         "CHECK constraint failed",
     );
+    // 纵深防御：拿掉结构触发器，外键仍然单独拦得住指向不存在的账户 / 成员关系的凭证
+    assert_accepted(&conn, "DROP TRIGGER credentials_insert_rules;");
+    assert_rejected(
+        &conn,
+        &insert("c-g1", "service", Some("ghost"), None),
+        "FOREIGN KEY constraint failed",
+    );
+    assert_rejected(
+        &conn,
+        &insert("c-g2", "member", None, Some("ghost")),
+        "FOREIGN KEY constraint failed",
+    );
+}
+
+/// 用原始 SQL 直接建一张 service 凭证，签发时声明 `scope_count` 条控制面权限
+/// （和 `AccountStore::create_credential` 写下的凭证行一样）。
+fn insert_service_credential_sql(id: &str, account: &str, scope_count: i64) -> String {
+    format!(
+        "INSERT INTO credentials (credential_id, binding_kind, account_id, membership_id, status, expires_at_ms, created_at_ms, revoked_at_ms, scope_count) \
+         VALUES ('{id}', 'service', '{account}', NULL, 'active', NULL, 0, NULL, {scope_count});"
+    )
+}
+
+fn insert_scope_sql(
+    credential: &str,
+    position: i64,
+    op: &str,
+    subtree: &str,
+    unit: Option<&str>,
+    micros: Option<i64>,
+) -> String {
+    let u = unit.map_or("NULL".to_string(), |v| format!("'{v}'"));
+    let m = micros.map_or("NULL".to_string(), |v| v.to_string());
+    format!(
+        "INSERT INTO credential_admin_scopes (credential_id, position, op, subtree_id, max_amount_unit, max_amount_micros) \
+         VALUES ('{credential}', {position}, '{op}', '{subtree}', {u}, {m});"
+    )
 }
 
 #[test]
 fn db_credential_admin_scopes_are_shaped_append_only_and_tied_to_real_accounts() {
     let env = payment_env();
     let conn = raw(&env);
+    // 签发时声明了 3 条权限的凭证：权限行只能填满 position 0..3
+    assert_accepted(
+        &conn,
+        &insert_service_credential_sql("svc-scoped", "org-a", 3),
+    );
     let insert = |pos: i64, op: &str, subtree: &str, unit: Option<&str>, micros: Option<i64>| {
-        let u = unit.map_or("NULL".to_string(), |v| format!("'{v}'"));
-        let m = micros.map_or("NULL".to_string(), |v| v.to_string());
-        format!(
-            "INSERT INTO credential_admin_scopes (credential_id, position, op, subtree_id, max_amount_unit, max_amount_micros) \
-             VALUES ('svc-a', {pos}, '{op}', '{subtree}', {u}, {m});"
-        )
+        insert_scope_sql("svc-scoped", pos, op, subtree, unit, micros)
     };
     assert_accepted(
         &conn,
@@ -2117,11 +2314,11 @@ fn db_credential_admin_scopes_are_shaped_append_only_and_tied_to_real_accounts()
         &insert(1, "create_account", "stu-2", None, None),
         "UNIQUE constraint failed|admin scope already exists",
     );
-    // 外键：子树必须是真实账户
+    // 子树必须是真实账户（触发器显式检查；外键是第二道防线，见本测试末尾）
     assert_rejected(
         &conn,
         &insert(2, "create_account", "ghost", None, None),
-        "FOREIGN KEY constraint failed",
+        "admin scope subtree account must exist",
     );
     // 额度上限只给 grant_allocation，且不能为负，单位和数值要成对
     assert_rejected(
@@ -2145,11 +2342,19 @@ fn db_credential_admin_scopes_are_shaped_append_only_and_tied_to_real_accounts()
         "CHECK constraint failed",
     );
     // 操作名只限制形状，不写死集合（S2 可以新增操作）
+    for bad in ["Not-Valid", "", "has space", "with9digit"] {
+        assert_rejected(
+            &conn,
+            &insert(2, bad, "org-a", None, None),
+            "CHECK constraint failed",
+        );
+    }
     assert_accepted(&conn, &insert(2, "some_future_op", "org-a", None, None));
+    // 超出签发时声明的条数：签发之后不能追加（见下一个测试对各种绕过路径的逐条验证）
     assert_rejected(
         &conn,
-        &insert(3, "Not-Valid", "org-a", None, None),
-        "CHECK constraint failed",
+        &insert(3, "create_account", "org-a", None, None),
+        "admin scopes can only be added when the credential is issued",
     );
     // 追加式：不能改、不能删
     assert_rejected(
@@ -2163,11 +2368,392 @@ fn db_credential_admin_scopes_are_shaped_append_only_and_tied_to_real_accounts()
         "append-only",
     );
     // 读回来：认不得的操作名是错误，不是静默跳过
-    match env.store.get_credential(&cid("svc-a")) {
+    match env.store.get_credential(&cid("svc-scoped")) {
         Err(AccountStoreError::Corrupt(message)) => {
             assert!(message.contains("some_future_op"), "{message}")
         }
         other => panic!("{other:?}"),
+    }
+    // 纵深防御：拿掉结构触发器，外键仍然单独拦得住指向不存在的账户 / 凭证的权限行
+    assert_accepted(&conn, "DROP TRIGGER credential_admin_scopes_insert_rules;");
+    assert_rejected(
+        &conn,
+        &insert_scope_sql("svc-scoped", 9, "create_account", "ghost", None, None),
+        "FOREIGN KEY constraint failed",
+    );
+    assert_rejected(
+        &conn,
+        &insert_scope_sql("ghost-credential", 0, "create_account", "org-a", None, None),
+        "FOREIGN KEY constraint failed",
+    );
+}
+
+#[test]
+fn db_admin_scopes_stay_inside_the_credential_binding_and_only_service_and_node_credentials_carry_them()
+ {
+    let env = payment_env();
+    let conn = raw(&env);
+    assert_accepted(
+        &conn,
+        &insert_service_credential_sql("svc-bound", "org-a", 6),
+    );
+    let insert = |pos: i64, subtree: &str| {
+        insert_scope_sql("svc-bound", pos, "create_account", subtree, None, None)
+    };
+    // 子树在凭证绑定的账户之内：绑定的账户本身、它的后代（含更深一层）
+    assert_accepted(&conn, &insert(0, "org-a"));
+    assert_accepted(&conn, &insert(1, "sp-a"));
+    assert_accepted(&conn, &insert(2, "stu-1"));
+    // 越出绑定：别的组织及其后代、绑定账户的祖先（平台）、和它没有血缘关系的账户
+    for subtree in ["org-b", "stu-b", "plat", "pool"] {
+        assert_rejected(
+            &conn,
+            &insert(3, subtree),
+            "admin scope subtree is outside the credential binding",
+        );
+    }
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT count(*) FROM credential_admin_scopes WHERE credential_id = 'svc-bound'"
+        ),
+        3
+    );
+    // 成员凭证不带控制面权限：不能给它加权限行，它的 scope_count 也只能是 0
+    assert_rejected(
+        &conn,
+        &insert_scope_sql("cred-bob", 0, "create_account", "stu-1", None, None),
+        "only service and node credentials carry admin scopes",
+    );
+    assert_rejected(
+        &conn,
+        "INSERT INTO credentials (credential_id, binding_kind, account_id, membership_id, status, expires_at_ms, created_at_ms, revoked_at_ms, scope_count) \
+         VALUES ('mc-scoped', 'member', NULL, 'm-bob-a', 'active', NULL, 0, NULL, 1);",
+        "CHECK constraint failed",
+    );
+    // scope_count 有范围：0..=64
+    assert_accepted(
+        &conn,
+        &insert_service_credential_sql("svc-max", "org-a", 64),
+    );
+    for bad in [65, -1] {
+        assert_rejected(
+            &conn,
+            &insert_service_credential_sql("svc-bad", "org-a", bad),
+            "CHECK constraint failed",
+        );
+    }
+}
+
+#[test]
+fn db_admin_scopes_cannot_be_appended_to_an_issued_credential_by_any_route() {
+    let env = payment_env();
+    let conn = raw(&env);
+    // svc-a 签发时没有带控制面权限（scope_count = 0）
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT scope_count FROM credentials WHERE credential_id = 'svc-a'"
+        ),
+        0
+    );
+    // 直接追加一条权限行：越出了签发时声明的条数
+    assert_rejected(
+        &conn,
+        &insert_scope_sql(
+            "svc-a",
+            0,
+            "grant_allocation",
+            "org-a",
+            Some("THB"),
+            Some(1),
+        ),
+        "admin scopes can only be added when the credential is issued",
+    );
+    // 先把 scope_count 改大再追加：scope_count 不可改
+    assert_rejected(
+        &conn,
+        "UPDATE credentials SET scope_count = 3 WHERE credential_id = 'svc-a';",
+        "immutable",
+    );
+    // 用 REPLACE 把凭证行换成 scope_count 更大的新行：冲突被「不许冲突」触发器拒绝
+    assert_rejected(
+        &conn,
+        "INSERT OR REPLACE INTO credentials (credential_id, binding_kind, account_id, membership_id, status, expires_at_ms, created_at_ms, revoked_at_ms, scope_count) \
+         VALUES ('svc-a', 'service', 'org-a', NULL, 'active', NULL, 0, NULL, 3);",
+        "credential already exists",
+    );
+    // 删了再插：凭证行永不删除
+    assert_rejected(
+        &conn,
+        "DELETE FROM credentials WHERE credential_id = 'svc-a';",
+        "credentials are never deleted",
+    );
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT scope_count FROM credentials WHERE credential_id = 'svc-a'"
+        ),
+        0
+    );
+    assert_eq!(
+        count(&conn, "SELECT count(*) FROM credential_admin_scopes"),
+        0
+    );
+    // 存储层这条路：同一个 id 再签发一次是 AlreadyExists，原凭证不变
+    let widened = Credential::new(
+        cid("svc-a"),
+        CredentialBinding::Service {
+            account: aid("org-a"),
+        },
+        CredentialStatus::Active,
+        None,
+        vec![scope(ControlOp::GrantAllocation, "org-a", Some(thb(1)))],
+    )
+    .unwrap();
+    assert!(matches!(
+        env.store.create_credential(&widened, now()),
+        Err(AccountStoreError::AlreadyExists {
+            kind: "credential",
+            ..
+        })
+    ));
+    assert!(
+        env.store
+            .get_credential(&cid("svc-a"))
+            .unwrap()
+            .unwrap()
+            .admin_scopes()
+            .is_empty()
+    );
+}
+
+#[test]
+fn create_credential_records_the_scope_count_and_refuses_more_than_the_maximum() {
+    let env = seeded();
+    let s = &env.store;
+    let many = |n: usize| {
+        Credential::new(
+            cid(&format!("many-{n}")),
+            CredentialBinding::Service {
+                account: aid("org-a"),
+            },
+            CredentialStatus::Active,
+            None,
+            (0..n)
+                .map(|_| scope(ControlOp::CreateAccount, "org-a", None))
+                .collect(),
+        )
+        .unwrap()
+    };
+    let conn = raw(&env);
+    // 0 条和 64 条（上限）都能签发，库里记的条数等于权限条数，读回来一致
+    for n in [0, 1, 64] {
+        s.create_credential(&many(n), now()).unwrap();
+        assert_eq!(
+            count(
+                &conn,
+                &format!("SELECT scope_count FROM credentials WHERE credential_id = 'many-{n}'")
+            ),
+            i64::try_from(n).unwrap()
+        );
+        assert_eq!(
+            s.get_credential(&cid(&format!("many-{n}")))
+                .unwrap()
+                .unwrap(),
+            many(n)
+        );
+    }
+    // 65 条：被拒绝，不留任何痕迹
+    match s.create_credential(&many(65), now()) {
+        Err(AccountStoreError::InvalidBinding(message)) => {
+            assert!(message.contains("at most 64"), "{message}")
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(s.get_credential(&cid("many-65")).unwrap().is_none());
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT count(*) FROM credentials WHERE credential_id = 'many-65'"
+        ),
+        0
+    );
+}
+
+#[test]
+fn a_credential_whose_scope_rows_were_tampered_with_reads_as_corrupt_but_can_still_be_revoked() {
+    let env = seeded();
+    let s = &env.store;
+    let issued = Credential::new(
+        cid("svc-t"),
+        CredentialBinding::Service {
+            account: aid("org-a"),
+        },
+        CredentialStatus::Active,
+        None,
+        vec![
+            scope(ControlOp::CreateAccount, "org-a", None),
+            scope(ControlOp::IssueCredential, "sp-a", None),
+        ],
+    )
+    .unwrap();
+    s.create_credential(&issued, now()).unwrap();
+    assert_eq!(s.get_credential(&cid("svc-t")).unwrap().unwrap(), issued);
+
+    // 只有能改表结构的人才做得到：先拿掉追加式触发器，再删掉一条权限行
+    let conn = raw(&env);
+    assert_accepted(
+        &conn,
+        "DROP TRIGGER credential_admin_scopes_append_only_delete;
+         DELETE FROM credential_admin_scopes WHERE credential_id = 'svc-t' AND position = 1;",
+    );
+    // 读出来的不是签发时的那张凭证：错误，不是静默少一条权限
+    match s.get_credential(&cid("svc-t")) {
+        Err(AccountStoreError::Corrupt(message)) => {
+            assert!(
+                message.contains("issued with 2 admin scopes but has 1 stored"),
+                "{message}"
+            )
+        }
+        other => panic!("{other:?}"),
+    }
+    // 但撤销只看状态这一列：读不全整行，也要能撤销
+    s.set_credential_status(&cid("svc-t"), CredentialStatus::Revoked, now())
+        .unwrap();
+    let status: String = conn
+        .query_row(
+            "SELECT status FROM credentials WHERE credential_id = 'svc-t'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(status, "revoked");
+    // 撤销仍然是终态
+    assert!(matches!(
+        s.set_credential_status(&cid("svc-t"), CredentialStatus::Active, now()),
+        Err(AccountStoreError::IllegalTransition {
+            kind: "credential",
+            ..
+        })
+    ));
+}
+
+#[test]
+fn an_account_with_an_unreadable_row_can_still_be_closed() {
+    let env = seeded();
+    let s = &env.store;
+    // 把 stu-2 的 kind 写成认不得的值：需要同时绕过 CHECK 和「身份不可改」触发器，只有能动库文件的人才做得到
+    let conn = raw(&env);
+    assert_accepted(
+        &conn,
+        "PRAGMA ignore_check_constraints = ON;
+         DROP TRIGGER accounts_identity_immutable;
+         UPDATE accounts SET kind = 'wizard' WHERE account_id = 'stu-2';
+         PRAGMA ignore_check_constraints = OFF;",
+    );
+    assert!(matches!(
+        s.get_account(&aid("stu-2")),
+        Err(AccountStoreError::Corrupt(_))
+    ));
+    // 关闭只看状态这一列
+    s.set_account_status(&aid("stu-2"), AccountStatus::Closed)
+        .unwrap();
+    let status: String = conn
+        .query_row(
+            "SELECT status FROM accounts WHERE account_id = 'stu-2'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(status, "closed");
+    // 其它账户不受影响
+    assert!(s.get_account(&aid("stu-1")).unwrap().is_some());
+}
+
+/// 引用的行必须在插入这一行的时候就存在：外键按语句检查（`defer_foreign_keys` 推迟到事务结束，
+/// `foreign_keys = OFF` 干脆不查），所以光靠外键，「先写引用、后补被引用的行」能进来。
+#[test]
+fn db_references_must_exist_when_the_row_is_inserted_even_with_deferred_or_disabled_foreign_keys() {
+    let env = seeded();
+    let conn = raw(&env);
+    let membership_before_its_principal = "INSERT INTO memberships (membership_id, principal_id, org_id, role, account_id, status, created_at_ms, revoked_at_ms) \
+         VALUES ('m-early', 'p-late', 'org-a', 'admin', NULL, 'active', 0, NULL);";
+    let principal_late = "INSERT INTO principals (principal_id, status, created_at_ms, revoked_at_ms) VALUES ('p-late', 'active', 0, NULL);";
+
+    // 1. defer_foreign_keys：先写成员关系、再补主体，同一个事务里
+    assert_accepted(&conn, "BEGIN; PRAGMA defer_foreign_keys = ON;");
+    assert_rejected(
+        &conn,
+        membership_before_its_principal,
+        "membership principal must exist",
+    );
+    assert_accepted(&conn, principal_late);
+    assert_accepted(&conn, "COMMIT;");
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT count(*) FROM memberships WHERE membership_id = 'm-early'"
+        ),
+        0
+    );
+    // 对照：主体先写，成员关系才写得进去
+    assert_accepted(&conn, membership_before_its_principal);
+
+    // 2. foreign_keys = OFF：每张表的每条引用，都被触发器拦下
+    assert_accepted(&conn, "PRAGMA foreign_keys = OFF;");
+    assert_eq!(count(&conn, "PRAGMA foreign_keys"), 0);
+    let attempts = [
+        (
+            "membership with a ghost principal",
+            "INSERT INTO memberships VALUES ('m-g1', 'ghost', 'org-a', 'admin', NULL, 'active', 0, NULL);",
+            "membership principal must exist",
+        ),
+        (
+            "membership with a ghost org",
+            "INSERT INTO memberships VALUES ('m-g2', 'p-late', 'ghost', 'admin', NULL, 'active', 0, NULL);",
+            "membership org must exist",
+        ),
+        (
+            "membership with a ghost account",
+            "INSERT INTO memberships VALUES ('m-g3', 'p-late', 'org-a', 'member', 'ghost', 'active', 0, NULL);",
+            "membership account must exist",
+        ),
+        (
+            "credential with a ghost account",
+            "INSERT INTO credentials VALUES ('c-g1', 'service', 'ghost', NULL, 'active', NULL, 0, NULL, 0);",
+            "credential account must exist",
+        ),
+        (
+            "credential with a ghost membership",
+            "INSERT INTO credentials VALUES ('c-g2', 'member', NULL, 'ghost', 'active', NULL, 0, NULL, 0);",
+            "credential membership must exist",
+        ),
+        (
+            "allocation with a ghost parent",
+            "INSERT INTO allocations VALUES ('a-g1', 'ghost', 'org-a', 'THB', 1, 'prepaid', 1, 2, 0, NULL, 0);",
+            "allocation parent account must exist",
+        ),
+        (
+            "allocation with a ghost child",
+            "INSERT INTO allocations VALUES ('a-g2', 'plat', 'ghost', 'THB', 1, 'prepaid', 1, 2, 0, NULL, 0);",
+            "allocation child account must exist",
+        ),
+        (
+            "admin scope with a ghost credential",
+            "INSERT INTO credential_admin_scopes VALUES ('ghost', 0, 'create_account', 'org-a', NULL, NULL);",
+            "admin scope credential must exist",
+        ),
+    ];
+    for (label, sql, needle) in attempts {
+        let outcome = conn.execute_batch(sql);
+        let error = outcome
+            .err()
+            .unwrap_or_else(|| panic!("{label}: expected the database to reject it"));
+        assert!(
+            error.to_string().contains(needle),
+            "{label}: rejected with {error} instead of {needle:?}"
+        );
     }
 }
 
@@ -2246,16 +2832,16 @@ fn db_allocation_rows_reject_bad_amounts_windows_units_and_transfers() {
         &insert("x", "org-a", "org-a", "THB", 1, "prepaid", 10, 20, 0, None),
         "CHECK constraint failed|direct child of its parent",
     );
-    // 外键
+    // 父、子账户必须已经存在（触发器显式检查；外键是第二道防线，见本测试末尾）
     assert_rejected(
         &conn,
         &insert("x", "ghost", "org-a", "THB", 1, "prepaid", 10, 20, 0, None),
-        "FOREIGN KEY constraint failed",
+        "allocation parent account must exist",
     );
     assert_rejected(
         &conn,
         &insert("x", "plat", "ghost", "THB", 1, "prepaid", 10, 20, 0, None),
-        "FOREIGN KEY constraint failed",
+        "allocation child account must exist",
     );
     // 只沿树边、单位等于子账户的单位
     assert_rejected(
@@ -2284,6 +2870,18 @@ fn db_allocation_rows_reject_bad_amounts_windows_units_and_transfers() {
         &conn,
         "DELETE FROM allocations WHERE allocation_id='ok-1';",
         "append-only",
+    );
+    // 纵深防御：拿掉结构触发器，外键仍然单独拦得住指向不存在的账户的额度
+    assert_accepted(&conn, "DROP TRIGGER allocations_insert_rules;");
+    assert_rejected(
+        &conn,
+        &insert("g1", "ghost", "org-a", "THB", 1, "prepaid", 10, 20, 0, None),
+        "FOREIGN KEY constraint failed",
+    );
+    assert_rejected(
+        &conn,
+        &insert("g2", "plat", "ghost", "THB", 1, "prepaid", 10, 20, 0, None),
+        "FOREIGN KEY constraint failed",
     );
 }
 
@@ -2335,6 +2933,35 @@ fn db_the_subsidy_idempotency_key_is_unique_and_free_tier_requires_it() {
         &insert("s5", "pool-stu-b", "free_tier", Some("monthly-grant-1")),
         "CHECK constraint failed",
     );
+    // 键的形状必须是 `subsidy:<主体>:<YYYY-MM>`：只有 `subsidy:` 前缀不够（主体是不是子账户所属成员的主体、
+    // 月份是不是真实的月份，由 Rust 层查成员关系和 `BillingMonth` 检查）
+    for (n, bad) in [
+        "subsidy:x:garbage",
+        "subsidy::2026-11",
+        "subsidy:p-sub:2026-1",
+        "subsidy:p-sub:26-11",
+        "subsidy:p-sub:2026-11x",
+        "subsidy:p-sub",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_rejected(
+            &conn,
+            &insert(&format!("shape-{n}"), "pool-stu-b", "free_tier", Some(bad)),
+            "CHECK constraint failed",
+        );
+    }
+    // 对照：主体 id 本身带冒号（`eduai:3fa9c0` 这种假名）的键，形状是对的
+    assert_accepted(
+        &conn,
+        &insert(
+            "shape-ok",
+            "pool-stu-b",
+            "free_tier",
+            Some("subsidy:eduai:3fa9c0:2026-11"),
+        ),
+    );
     // `subsidy:` 键只给免费额度
     assert_rejected(
         &conn,
@@ -2351,6 +2978,95 @@ fn db_the_subsidy_idempotency_key_is_unique_and_free_tier_requires_it() {
         &conn,
         &insert("s9", "pool-stu-1", "free_tier", Some(december.as_str())),
     );
+}
+
+// ================================================================ 数据库层：NUL 字节
+
+/// `length()`、GLOB、LIKE 看到字符串里的 NUL 字节就停了，所以 `abc\0@x.com` 这样的值能骗过只靠它们的 CHECK，
+/// 把邮箱形状的值、非法的单位写进库里。迁移里每条 id / 单位 / 幂等键 / 操作名的 CHECK 另外用 `instr(CAST(.. AS BLOB), x'00')`
+/// 拒绝 NUL；这里逐列证明：带 NUL 的值被拒绝，去掉 NUL 的同一个值写得进去（对照）。
+#[test]
+fn db_a_nul_byte_cannot_smuggle_characters_past_the_id_unit_key_and_op_checks() {
+    let env = payment_env();
+    let conn = raw(&env);
+    assert_accepted(&conn, &insert_service_credential_sql("svc-nul", "org-a", 2));
+    let cases = [
+        (
+            "principal id",
+            "INSERT INTO principals VALUES (?1, 'active', 0, NULL)",
+            "n-p1",
+        ),
+        (
+            "account id",
+            "INSERT INTO accounts VALUES (?1, 'member', 'org-a', 'THB', 'active', 0)",
+            "n-a1",
+        ),
+        (
+            "membership id",
+            "INSERT INTO memberships VALUES (?1, 'p-bob', 'org-a', 'admin', NULL, 'active', 0, NULL)",
+            "n-m1",
+        ),
+        (
+            "credential id",
+            "INSERT INTO credentials VALUES (?1, 'service', 'org-a', NULL, 'active', NULL, 0, NULL, 0)",
+            "n-c1",
+        ),
+        (
+            "allocation id",
+            "INSERT INTO allocations VALUES (?1, 'plat', 'org-a', 'THB', 1, 'prepaid', 1, 2, 0, NULL, 0)",
+            "n-al1",
+        ),
+        (
+            "allocation idempotency key",
+            "INSERT INTO allocations VALUES ('n-al2', 'plat', 'org-a', 'THB', 1, 'prepaid', 1, 2, 0, ?1, 0)",
+            "topup-9",
+        ),
+        (
+            "admin scope operation",
+            "INSERT INTO credential_admin_scopes VALUES ('svc-nul', 0, ?1, 'org-a', NULL, NULL)",
+            "create_account",
+        ),
+        (
+            "admin scope amount unit",
+            "INSERT INTO credential_admin_scopes VALUES ('svc-nul', 1, 'grant_allocation', 'org-a', ?1, 5)",
+            "QUOTA:node-1",
+        ),
+    ];
+    for (label, sql, clean) in cases {
+        let smuggled = format!("{clean}\0@x.com");
+        let error = conn.execute(sql, [smuggled.as_str()]).expect_err(&format!(
+            "{label}: a value carrying a NUL byte must be rejected"
+        ));
+        assert!(
+            error.to_string().contains("CHECK constraint failed"),
+            "{label}: rejected with {error}"
+        );
+        conn.execute(sql, [clean]).unwrap_or_else(|error| {
+            panic!("{label}: the same value without NUL must be accepted: {error}")
+        });
+    }
+    // 一行也没有写进去过带 NUL 的值
+    for (table, column) in [
+        ("principals", "principal_id"),
+        ("accounts", "account_id"),
+        ("memberships", "membership_id"),
+        ("credentials", "credential_id"),
+        ("allocations", "allocation_id"),
+        ("allocations", "idempotency_key"),
+        ("credential_admin_scopes", "op"),
+        ("credential_admin_scopes", "max_amount_unit"),
+    ] {
+        assert_eq!(
+            count(
+                &conn,
+                &format!(
+                    "SELECT count(*) FROM {table} WHERE instr(CAST({column} AS BLOB), x'00') > 0"
+                )
+            ),
+            0,
+            "{table}.{column}"
+        );
+    }
 }
 
 // ================================================================ 数据库层：REPLACE 与「删了再插」不能绕过保护
@@ -2706,7 +3422,8 @@ fn the_check_sets_in_the_migration_accept_exactly_the_contracts_wire_strings() {
 fn the_id_check_in_the_migration_matches_the_contracts_id_validation_for_every_ascii_character() {
     let env = env();
     let conn = raw(&env);
-    for code in 1_u8..=127 {
+    // 从 0 开始：NUL 字节也要一致（`length()` 和 GLOB 看不见 NUL，迁移里的 CHECK 另外用 instr 拒绝它）
+    for code in 0_u8..=127 {
         let ch = char::from(code);
         let candidate = format!("a{ch}b");
         let rust_ok = PrincipalId::new(candidate.clone()).is_ok();
@@ -2764,6 +3481,10 @@ fn the_unit_check_in_the_migration_matches_the_contracts_unit_parser() {
         "QUOTA:a b",
         "quota:node-1",
         "QUOTA:学",
+        // NUL 字节：`length()` 和 GLOB 到它为止，迁移里的 CHECK 另外用 instr 拒绝
+        "THB\0",
+        "QUOTA:a\0 junk@@",
+        "QUOTA:node-1\0",
         long_node.as_str(),
         too_long_node.as_str(),
     ];
