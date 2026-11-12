@@ -98,6 +98,9 @@ pub fn build_http_client(connect_timeout: Duration) -> Result<reqwest::Client, C
         .redirect(reqwest::redirect::Policy::none())
         .no_proxy()
         .connect_timeout(connect_timeout)
+        // 空闲连接比常见的网关空闲超时（60s 左右）早关：避免复用已经被对端关掉的连接，
+        // 否则一次本可成功的调用会因为「连接在写请求时被重置」而白白失败、触发切换。
+        .pool_idle_timeout(Duration::from_secs(30))
         .build()
         .map_err(|_| ConfigError::HttpClient)
 }

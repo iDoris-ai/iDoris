@@ -301,8 +301,9 @@ mod tests {
         let mut body = base();
         body["messages"] = json!([{"role": "user", "content": thai.clone()}]);
         let estimate = parse(body).unwrap().input_tokens_estimate;
+        let non_ascii_bytes = thai.bytes().filter(|b| !b.is_ascii()).count() as u64;
         assert!(
-            estimate >= thai.len() as u64,
+            estimate >= non_ascii_bytes,
             "1 token per non-ASCII byte at least"
         );
     }

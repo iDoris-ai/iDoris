@@ -804,3 +804,61 @@ fn usage_event(usage: Option<Usage>) -> AttemptEvent {
         None => AttemptEvent::ExecutionObservedUsageUnknown,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failover_policy_by_status() {
+        // 说明「我们自己的凭证 / 额度 / 路由有问题」或临时性的：换下一个候选
+        for status in [401, 402, 403, 404, 408, 425, 429] {
+            assert!(status_allows_failover(status), "{status}");
+        }
+        // 请求形状本身被拒：不换（数据最小化：不把输入多送给一个上游）
+        for status in [400, 405, 406, 410, 413, 414, 415, 422, 431, 451] {
+            assert!(!status_allows_failover(status), "{status}");
+        }
+        // 3xx / 5xx / 其它：都换（它们不能证明没执行，状态保持 maybe_executed）
+        for status in [
+            300, 301, 302, 307, 500, 501, 502, 503, 504, 520, 599, 0, 600,
+        ] {
+            assert!(status_allows_failover(status), "{status}");
+        }
+    }
+
+    #[test]
+    fn close_reasons_are_stable_strings() {
+        assert_eq!(CloudError::Cancelled.close_reason(), "client_cancelled");
+        assert_eq!(
+            CloudError::DeadlineExceeded.close_reason(),
+            "deadline_exceeded"
+        );
+        assert_eq!(
+            CloudError::UpstreamUnavailable {
+                last: None,
+                attempts: 1
+            }
+            .close_reason(),
+            "upstream_unavailable"
+        );
+        assert_eq!(
+            CloudError::Denied(ReasonCode::BudgetExhausted).close_reason(),
+            "budget_exhausted"
+        );
+        assert_eq!(
+            CloudError::Ledger("x".into()).close_reason(),
+            "ledger_unavailable"
+        );
+    }
+
+    #[test]
+    fn errors_print_without_content_or_secrets() {
+        let text = format!(
+            "{} | {}",
+            CloudError::Ledger("disk full".into()),
+            CloudError::UpstreamRejected { status: 400 }
+        );
+        assert!(text.contains("disk full") && text.contains("HTTP 400"));
+    }
+}

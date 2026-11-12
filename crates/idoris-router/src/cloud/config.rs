@@ -785,6 +785,224 @@ mod tests {
         }
     }
 
+    const PERMITS: &str = "schema_version: 1
+verification_max_age_days: 90
+endpoints:
+  - provider: example-alpha
+    model: example-org/chat-70b
+    endpoint: openai-compat
+    access: api
+    processing_regions: [sg-1]
+    retention: with_exceptions
+    dpa: unsigned
+    allowed_data_classes: [adult]
+    capabilities: {tool_calling: true, stream_usage: true, cache_pricing: false, structured_output: true, cancellation: true}
+    verified_at: \"2026-11-12\"
+";
+
+    const VALID: &str = "schema_version: 1
+permit_table: permits.yaml
+endpoints:
+  - provider: example-alpha
+    model: example-org/chat-70b
+    endpoint: openai-compat
+    base_url: https://api.example.invalid/v1
+    api_key_env: EXAMPLE_ALPHA_API_KEY
+    price_version: pv-1
+    cost: {unit: USD, input_per_mtok: \"0.26\", output_per_mtok: \"0.38\"}
+    prices:
+      - {unit: THB, input_per_mtok: \"10\", output_per_mtok: \"40\"}
+routes:
+  - model: idoris/agent
+    candidates:
+      - {provider: example-alpha, model: example-org/chat-70b, endpoint: openai-compat}
+callers:
+  - tenant_id: agent24
+    credential_id: cred-agent24
+    payer_account: acct-agent24
+    unit: THB
+    billing: paid
+    data_classes: [adult]
+    max_retention: with_exceptions
+  - credential_id: cred-default
+    payer_account: acct-default
+    unit: THB
+    billing: paid
+    data_classes: [adult]
+    max_retention: with_exceptions
+";
+
+    fn load(yaml: &str) -> Result<CloudParts, String> {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("permits.yaml"), PERMITS).unwrap();
+        parse(yaml, dir.path(), TimestampMs(1_794_528_000_000))
+    }
+
+    fn expect_error(yaml: &str, needle: &str) {
+        let error = match load(yaml) {
+            Ok(_) => panic!("expected an error containing {needle:?}"),
+            Err(error) => error,
+        };
+        assert!(error.contains(needle), "{needle:?} not in {error}");
+        // 配置里没有密钥，错误里也不会有
+        assert!(!error.contains("sk-"));
+    }
+
+    #[test]
+    fn a_valid_config_loads_every_part() {
+        let parts = load(VALID).unwrap();
+        assert_eq!(parts.endpoints.len(), 1);
+        let key =
+            EndpointKey::new("example-alpha", "example-org/chat-70b", "openai-compat").unwrap();
+        let endpoint = parts.endpoints.get(&key).unwrap();
+        assert_eq!(endpoint.price_version.as_str(), "pv-1");
+        assert_eq!(endpoint.cost_rates.input_per_mtok().micros(), 260_000);
+        assert_eq!(
+            endpoint.price_rates[&Unit::Thb].output_per_mtok().micros(),
+            40_000_000
+        );
+        assert_eq!(parts.routes.candidates("idoris/agent").unwrap(), &[key]);
+        assert!(parts.routes.candidates("idoris/other").is_none());
+        // 有 tenant_id 的找得到；没有 tenant_id 的用默认；认识的 tenant_id 之外的不回落到默认
+        let tenant = parts.callers.resolve(Some("agent24")).unwrap();
+        assert_eq!(tenant.payment.payer().as_str(), "acct-agent24");
+        assert_eq!(
+            parts
+                .callers
+                .resolve(None)
+                .unwrap()
+                .payment
+                .payer()
+                .as_str(),
+            "acct-default"
+        );
+        assert!(parts.callers.resolve(Some("stranger")).is_none());
+        assert_eq!(parts.limits.max_attempts, 3);
+        assert_eq!(parts.reserve_policy.max_tokens_hard_cap, 4_096);
+    }
+
+    #[test]
+    fn broken_configs_are_refused_with_a_reason() {
+        expect_error(
+            &VALID.replace("schema_version: 1", "schema_version: 2"),
+            "schema_version",
+        );
+        // 未知字段
+        expect_error(&format!("{VALID}surprise: true\n"), "unknown field");
+        expect_error(
+            &VALID.replace(
+                "price_version: pv-1",
+                "price_version: pv-1\n    api_key: sk-inline-secret",
+            ),
+            "unknown field",
+        );
+        // 端点不在许可表里（几乎一定是拼写错误）
+        expect_error(&VALID.replace("provider: example-alpha\n    model: example-org/chat-70b\n    endpoint: openai-compat\n    base_url", "provider: example-typo\n    model: example-org/chat-70b\n    endpoint: openai-compat\n    base_url"), "不在端点许可表里");
+        // 路由引用了没有配置的端点
+        expect_error(
+            &VALID.replace(
+                "candidates:\n      - {provider: example-alpha",
+                "candidates:\n      - {provider: example-nope",
+            ),
+            "没有配置的端点",
+        );
+        // 密钥来源：必须且只能有一个
+        expect_error(
+            &VALID.replace("    api_key_env: EXAMPLE_ALPHA_API_KEY\n", ""),
+            "api_key_env 或 api_key_file",
+        );
+        expect_error(
+            &VALID.replace(
+                "api_key_env: EXAMPLE_ALPHA_API_KEY",
+                "api_key_env: A\n    api_key_file: /tmp/k",
+            ),
+            "api_key_env 或 api_key_file",
+        );
+        // 明文 http、带凭证的 URL
+        expect_error(
+            &VALID.replace(
+                "https://api.example.invalid/v1",
+                "http://api.example.invalid/v1",
+            ),
+            "https",
+        );
+        expect_error(
+            &VALID.replace(
+                "https://api.example.invalid/v1",
+                "https://user:pw@api.example.invalid/v1",
+            ),
+            "credentials",
+        );
+        // 价格：浮点、负数、多于 6 位小数
+        expect_error(
+            &VALID.replace("input_per_mtok: \"0.26\"", "input_per_mtok: 0.26"),
+            "quoted string",
+        );
+        expect_error(
+            &VALID.replace("input_per_mtok: \"0.26\"", "input_per_mtok: \"-1\""),
+            "十进制",
+        );
+        expect_error(
+            &VALID.replace("input_per_mtok: \"0.26\"", "input_per_mtok: \"0.1234567\""),
+            "6 位小数",
+        );
+        // 重复的调用方、两个默认调用方、QUOTA 单位
+        expect_error(
+            &VALID.replace(
+                "  - credential_id: cred-default",
+                "  - tenant_id: agent24\n    credential_id: cred-default",
+            ),
+            "出现了两次",
+        );
+        expect_error(
+            &VALID.replace(
+                "  - tenant_id: agent24\n    credential_id: cred-agent24",
+                "  - credential_id: cred-agent24",
+            ),
+            "最多只能有一个默认调用方",
+        );
+        expect_error(&VALID.replace("unit: THB\n    billing: paid\n    data_classes: [adult]\n    max_retention: with_exceptions\n  - credential_id", "unit: QUOTA:node-1\n    billing: paid\n    data_classes: [adult]\n    max_retention: with_exceptions\n  - credential_id"), "QUOTA");
+        // 限制
+        expect_error(
+            &format!("{VALID}limits:\n  max_attempts: 0\n"),
+            "max_attempts",
+        );
+        expect_error(
+            &format!("{VALID}limits:\n  max_attempts: 5\n"),
+            "max_attempts",
+        );
+        expect_error(
+            &format!(
+                "{VALID}limits:\n  connect_timeout_ms: 9000\n  response_head_timeout_ms: 1000\n"
+            ),
+            "connect_timeout_ms",
+        );
+        expect_error(
+            &format!("{VALID}limits:\n  stream_idle_timeout_ms: 0\n"),
+            "必须大于 0",
+        );
+    }
+
+    #[test]
+    fn a_missing_or_broken_permit_table_is_a_startup_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let error = match parse(VALID, dir.path(), TimestampMs(0)) {
+            Ok(_) => panic!("no permit table"),
+            Err(error) => error,
+        };
+        assert!(error.contains("无法读取端点许可表"), "{error}");
+        std::fs::write(
+            dir.path().join("permits.yaml"),
+            "schema_version: 1\nendpoints: []\n",
+        )
+        .unwrap();
+        let error = match parse(VALID, dir.path(), TimestampMs(0)) {
+            Ok(_) => panic!("broken permit table"),
+            Err(error) => error,
+        };
+        assert!(error.contains("端点许可表"), "{error}");
+    }
+
     #[test]
     fn a_yaml_float_is_not_a_price() {
         let yaml = "unit: USD\ninput_per_mtok: 0.26\noutput_per_mtok: \"0.38\"\n";

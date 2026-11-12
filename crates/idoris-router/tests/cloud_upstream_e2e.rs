@@ -868,6 +868,7 @@ async fn an_admission_denial_of_the_only_candidate_is_a_402_without_any_upstream
     let reply = post(&h.app, &simple_body(100)).await;
     assert_eq!(reply.status, 402);
     assert_eq!(reply.json()["error"]["type"], "budget_exhausted");
+    assert_eq!(reply.header("x-idoris-reason"), Some("budget_exhausted"));
     assert_eq!(alpha.connection_count(), 0);
     let request = h.store.request_row(&reply.request_id()).unwrap().unwrap();
     assert_eq!(request.outcome, Some(RequestOutcome::Rejected));
@@ -931,6 +932,42 @@ async fn a_stream_that_fails_before_its_first_event_switches_and_the_client_sees
             p(1, "platform_cost", 4, "USD"),
             p(1, "release", RESERVED_PRICE - 200, "THB"),
         ]
+    );
+}
+
+#[tokio::test]
+async fn a_stream_that_closes_right_after_the_headers_switches_before_any_byte_reaches_the_client()
+{
+    let s = two_upstreams(
+        // 200 + 事件流头，然后什么事件都没有就断开
+        vec![Behavior::sse(vec![SseStep::Close])],
+        vec![Behavior::sse(vec![
+            SseStep::Send(content_event("from-beta", "ok")),
+            SseStep::Send(usage_event("from-beta", usage(12, 2))),
+            SseStep::Send(done_event()),
+            SseStep::Finish,
+        ])],
+    )
+    .await;
+    let mut body = simple_body(100);
+    body["stream"] = json!(true);
+    let reply = post(&s.harness.app, &body).await;
+    let h = &s.harness;
+    assert_eq!(reply.status, 200);
+    assert_eq!(reply.header("x-idoris-reason"), Some("upstream_failover"));
+    assert!(reply.text().contains("from-beta"));
+    let id = reply.request_id();
+    let attempts = rows(h, &id);
+    assert_eq!(
+        attempts[0].failure_kind.as_deref(),
+        Some("stream_truncated")
+    );
+    assert!(!attempts[0].pays_user);
+    assert_eq!(attempts[1].provider, "example-beta");
+    assert_eq!(
+        h.store.request_row(&id).unwrap().unwrap().charged_micros,
+        Some(200),
+        "the user pays only the answering attempt"
     );
 }
 

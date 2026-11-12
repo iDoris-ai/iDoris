@@ -156,19 +156,15 @@ fn apply_reason_headers(response: &mut Response, meta: &AnswerMeta) {
 }
 
 fn problem_response(problem: RequestProblem) -> Response {
-    let status = match problem {
-        RequestProblem::MissingModel => StatusCode::BAD_REQUEST,
-        _ => StatusCode::BAD_REQUEST,
-    };
     match problem {
         RequestProblem::MissingModel => error_envelope_with_reason(
-            status,
+            StatusCode::BAD_REQUEST,
             "unsupported_field",
             "unsupported_model",
             problem.message(),
         ),
         _ => error_envelope_with_reason(
-            status,
+            StatusCode::BAD_REQUEST,
             problem_type(problem),
             problem.code(),
             problem.message(),
@@ -197,17 +193,31 @@ fn denial_status(code: ReasonCode) -> StatusCode {
     }
 }
 
+/// 拒绝类原因码也放进响应头：浏览器读不到响应体里的 `error.reason_code`，但能读响应头（设计稿 §5，评审 L2）。
+fn with_reason_header(mut response: Response, code: ReasonCode) -> Response {
+    response
+        .headers_mut()
+        .insert(HEADER_REASON, HeaderValue::from_static(code.as_str()));
+    response
+}
+
 pub(crate) fn error_response(error: &CloudError) -> Response {
     match error {
-        CloudError::NoCompliantEndpoint(_) => error_envelope(
-            StatusCode::SERVICE_UNAVAILABLE,
-            ReasonCode::NoCompliantEndpoint.as_str(),
-            "no upstream endpoint is permitted to process this request",
+        CloudError::NoCompliantEndpoint(_) => with_reason_header(
+            error_envelope(
+                StatusCode::SERVICE_UNAVAILABLE,
+                ReasonCode::NoCompliantEndpoint.as_str(),
+                "no upstream endpoint is permitted to process this request",
+            ),
+            ReasonCode::NoCompliantEndpoint,
         ),
-        CloudError::Denied(code) => error_envelope(
-            denial_status(*code),
-            code.as_str(),
-            "the request was not admitted",
+        CloudError::Denied(code) => with_reason_header(
+            error_envelope(
+                denial_status(*code),
+                code.as_str(),
+                "the request was not admitted",
+            ),
+            *code,
         ),
         CloudError::NoPricedEndpoint => error_envelope(
             StatusCode::SERVICE_UNAVAILABLE,

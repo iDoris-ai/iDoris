@@ -105,6 +105,12 @@ CREATE INDEX IF NOT EXISTS idx_compute_attempts_supplier
     ON compute_attempts (provider, supplier_request_id)
     WHERE supplier_request_id IS NOT NULL;
 
+-- 用户只付一次（设计稿 §6），在数据库里也是结构保证：一个请求至多一个向用户收费的尝试（`pays_user = 1`），
+-- 至多一条正的 `user_price` 分录（冲正是负数分录，不受这条限制）。
+CREATE UNIQUE INDEX IF NOT EXISTS idx_compute_attempts_one_payer
+    ON compute_attempts (request_id)
+    WHERE pays_user = 1;
+
 -- 对账扫描用：还没落定的尝试。
 CREATE INDEX IF NOT EXISTS idx_compute_attempts_unsettled
     ON compute_attempts (state)
@@ -144,6 +150,10 @@ CREATE TABLE IF NOT EXISTS compute_postings (
 
 CREATE INDEX IF NOT EXISTS idx_compute_postings_attempt
     ON compute_postings (attempt_id, kind);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_compute_postings_one_user_price
+    ON compute_postings (request_id)
+    WHERE kind = 'user_price' AND amount_micros > 0;
 
 -- ---------------------------------------------------------------------------
 -- 触发器

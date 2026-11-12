@@ -40,7 +40,7 @@ pub struct AdmissionRequest<'a> {
     /// 这个候选对付款账户单位的价目与上游成本价目。
     pub price_rates: &'a RateCard<Price>,
     pub cost_rates: &'a RateCard<Cost>,
-    /// 这是第几个被准入的候选（0 = 第一个）。切换（>0）时要重新做全套检查。
+    /// 这个请求已经开始的尝试数：0 = 这是第一次尝试，>0 = 这是首字节之前失败后的切换，要重新做全套检查。
     pub candidate_ordinal: usize,
     pub now: TimestampMs,
 }

@@ -446,6 +446,66 @@ fn history_and_postings_are_append_only_and_identity_is_immutable() {
     assert!(err.is_err(), "state and state_json must agree");
 }
 
+/// 「用户只付一次」在数据库里也是结构保证：一个请求至多一个向用户收费的尝试、至多一条正的 user_price 分录。
+#[test]
+fn the_user_can_only_be_charged_once_per_request_at_the_database_level() {
+    let (store, mut request) = started("req-once");
+    apply(
+        &store,
+        &mut request,
+        0,
+        &[
+            AttemptEvent::Dispatch,
+            AttemptEvent::WireWriteStarted,
+            AttemptEvent::UsageReported { usage: usage() },
+        ],
+        1,
+    );
+    request.begin_next_attempt(candidate("model-b")).unwrap();
+    store
+        .append_attempt(request.id(), &request.attempts()[1], at(2))
+        .unwrap();
+    apply(
+        &store,
+        &mut request,
+        1,
+        &[AttemptEvent::Dispatch, AttemptEvent::WireWriteStarted],
+        3,
+    );
+    // 最新的一次（序号 1）发布，它向用户收费
+    store
+        .record_publish(request.attempts()[1].id(), at(4))
+        .unwrap();
+    let conn = store.lock();
+    let a0 = request.attempts()[0].id().to_string();
+    let a1 = request.attempts()[1].id().to_string();
+    // 第一次尝试也被标成向用户收费：违反唯一索引
+    let second_payer = conn.execute(
+        "UPDATE compute_attempts SET pays_user = 1 WHERE attempt_id = ?1",
+        [&a0],
+    );
+    assert!(
+        second_payer.is_err(),
+        "a second paying attempt must be refused"
+    );
+    // 一条正的 user_price 分录可以，第二条（即使是另一次尝试、另一个键）不行；负数冲正可以
+    let insert = |attempt: &str, amount: i64, key: &str| {
+        conn.execute(
+            "INSERT INTO compute_postings
+               (request_id, attempt_id, kind, role, basis, unit, amount_micros, idempotency_key, created_at_ms)
+             VALUES (?1, ?2, 'user_price', 'answering', 'actual_usage', 'THB', ?3, ?4, 0)",
+            params![request.id().as_str(), attempt, amount, key],
+        )
+    };
+    insert(&a0, 100, "k1").unwrap();
+    assert!(
+        insert(&a1, 100, "k2").is_err(),
+        "a second positive user_price must be refused"
+    );
+    assert!(insert(&a0, 7, "k3").is_err());
+    insert(&a0, -100, "k4").unwrap();
+}
+
 #[test]
 fn the_publish_boundary_is_enforced_by_the_database_too() {
     let (store, mut request) = started("req-boundary");
