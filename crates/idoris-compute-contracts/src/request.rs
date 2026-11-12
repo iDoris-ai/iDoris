@@ -3,7 +3,7 @@
 //! 单次尝试的合法转移见 [`crate::attempt`]。本模块管跨尝试的规则，每一条都有测试：
 //!
 //! 1. **每次尝试单独记录**：[`Attempt`] 记供应商/模型/端点（[`EndpointKey`]）、价格版本、用量、
-//!    执行确定性、预留。
+//!    执行确定性、预留，以及供应商给的请求号（对账用，[`Request::record_supplier_request_id`]）。
 //! 2. **切换候选前要重新准入**：[`Request::begin_next_attempt`] 必须带一个新的 [`AdmittedCandidate`]，
 //!    里面是对**新候选**的准入决定；它必须是放行类（放行/降级/宽限），付款账户必须就是本次请求的付款上下文。
 //!    拒绝的决定进不来。
@@ -42,7 +42,9 @@ use crate::attempt::{
     TransitionError, transition,
 };
 use crate::credential::PaymentContext;
-use crate::ids::{AccountId, AttemptId, AttemptIndex, EndpointKey, PriceVersion, RequestId};
+use crate::ids::{
+    AccountId, AttemptId, AttemptIndex, EndpointKey, PriceVersion, RequestId, SupplierRequestId,
+};
 use crate::money::{MoneyError, Unit};
 use crate::pricing::{Cost, Price, RateCard, USAGE_ROUNDING, usage_amount};
 use crate::reason::ReasonCode;
@@ -76,6 +78,9 @@ pub struct Attempt {
     price_rates: RateCard<Price>,
     effective_max_tokens: u64,
     reservation: Reservation,
+    /// 供应商给这次调用的请求号，对账用。见 [`Request::record_supplier_request_id`]。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    supplier_request_id: Option<SupplierRequestId>,
     state: AttemptState,
 }
 
@@ -111,6 +116,10 @@ impl Attempt {
 
     pub fn reservation(&self) -> &Reservation {
         &self.reservation
+    }
+
+    pub fn supplier_request_id(&self) -> Option<&SupplierRequestId> {
+        self.supplier_request_id.as_ref()
     }
 
     pub fn state(&self) -> &AttemptState {
@@ -163,6 +172,13 @@ pub enum RequestError {
     },
     #[error("attempt {0:?} already published bytes; it cannot be declared not executed")]
     PublishedAttemptCannotBeRefused(AttemptIndex),
+    #[error("attempt {index:?} is {state:?}: nothing has come back from the supplier yet")]
+    SupplierRequestIdTooEarly {
+        index: AttemptIndex,
+        state: AttemptStateKind,
+    },
+    #[error("attempt {index:?} already has a different supplier request id")]
+    SupplierRequestIdConflict { index: AttemptIndex },
     #[error("invalid request record: {0}")]
     InvalidRecord(String),
 }
@@ -188,6 +204,7 @@ struct AttemptWire {
     price_rates: RateCard<Price>,
     effective_max_tokens: u64,
     reservation: Reservation,
+    supplier_request_id: Option<SupplierRequestId>,
     state: AttemptState,
 }
 
@@ -218,6 +235,7 @@ impl TryFrom<RequestWire> for Request {
                     price_rates: a.price_rates,
                     effective_max_tokens: a.effective_max_tokens,
                     reservation: a.reservation,
+                    supplier_request_id: a.supplier_request_id,
                     state: a.state,
                 })
                 .collect(),
@@ -339,6 +357,41 @@ impl Request {
         Ok(&attempt.state)
     }
 
+    /// 记下供应商给这次调用的请求号（响应里的 id），恢复后对账用它把本地尝试和供应商账单对上。
+    ///
+    /// - 只能在上游已经有东西回来之后记：`admitted` / `sending` 时报
+    ///   [`RequestError::SupplierRequestIdTooEarly`]；其余状态（含已 `settled` 的，账单回来再补也行）都可以；
+    /// - 幂等：重复记同一个值是 `Ok`；已经记过**不同**的值是 [`RequestError::SupplierRequestIdConflict`]，
+    ///   不会被悄悄覆盖。
+    ///
+    /// 这不是状态转移：不改变尝试的状态，也不影响结算计划。
+    pub fn record_supplier_request_id(
+        &mut self,
+        index: AttemptIndex,
+        id: SupplierRequestId,
+    ) -> Result<(), RequestError> {
+        let attempt = self
+            .attempts
+            .get_mut(usize::from(index.0))
+            .ok_or(RequestError::NoSuchAttempt(index))?;
+        if attempt.state.is_in_flight() {
+            return Err(RequestError::SupplierRequestIdTooEarly {
+                index,
+                state: attempt.state.kind(),
+            });
+        }
+        match &attempt.supplier_request_id {
+            Some(existing) if *existing != id => {
+                Err(RequestError::SupplierRequestIdConflict { index })
+            }
+            Some(_) => Ok(()),
+            None => {
+                attempt.supplier_request_id = Some(id);
+                Ok(())
+            }
+        }
+    }
+
     /// 记下「已向客户端输出第一个字节」。
     ///
     /// - 只能发布一次；
@@ -408,6 +461,12 @@ impl Request {
             }
             if attempt.effective_max_tokens == 0 {
                 return Err(invalid(format!("attempt {} has max_tokens 0", attempt.id)));
+            }
+            if attempt.supplier_request_id.is_some() && attempt.state.is_in_flight() {
+                return Err(invalid(format!(
+                    "attempt {} has a supplier request id but nothing was sent",
+                    attempt.id
+                )));
             }
             check_units(
                 &self.payment,
@@ -504,6 +563,7 @@ fn make_attempt(
         price_rates,
         effective_max_tokens: admitted.effective_max_tokens,
         reservation: admitted.reservation,
+        supplier_request_id: None,
         state: AttemptState::Admitted,
     })
 }
@@ -1287,6 +1347,116 @@ mod tests {
             req.apply(ix(0), AttemptEvent::UpstreamRefused { http_status: 429 })
                 .is_ok()
         );
+    }
+
+    // ---------- 供应商请求号（对账用） ----------
+
+    fn sid(s: &str) -> SupplierRequestId {
+        SupplierRequestId::new(s).unwrap()
+    }
+
+    #[test]
+    fn supplier_request_id_is_recorded_after_bytes_leave_idempotently_and_never_overwritten() {
+        let mut req = new_request();
+        // admitted / sending：上游还没有任何东西回来
+        for state in [AttemptStateKind::Admitted, AttemptStateKind::Sending] {
+            assert_eq!(
+                req.record_supplier_request_id(ix(0), sid("chatcmpl-1"))
+                    .unwrap_err(),
+                RequestError::SupplierRequestIdTooEarly {
+                    index: ix(0),
+                    state
+                }
+            );
+            if state == AttemptStateKind::Admitted {
+                drive(&mut req, 0, &[AttemptEvent::Dispatch]);
+            }
+        }
+        assert_eq!(req.attempt(ix(0)).unwrap().supplier_request_id(), None);
+        drive(&mut req, 0, &[AttemptEvent::WireWriteStarted]);
+        // 字节出去之后可以记；重复记同一个值是幂等的
+        req.record_supplier_request_id(ix(0), sid("chatcmpl-1"))
+            .unwrap();
+        req.record_supplier_request_id(ix(0), sid("chatcmpl-1"))
+            .unwrap();
+        assert_eq!(
+            req.attempt(ix(0)).unwrap().supplier_request_id(),
+            Some(&sid("chatcmpl-1"))
+        );
+        // 不同的值：拒绝，不覆盖
+        assert_eq!(
+            req.record_supplier_request_id(ix(0), sid("chatcmpl-2"))
+                .unwrap_err(),
+            RequestError::SupplierRequestIdConflict { index: ix(0) }
+        );
+        assert_eq!(
+            req.attempt(ix(0)).unwrap().supplier_request_id(),
+            Some(&sid("chatcmpl-1"))
+        );
+        // 不存在的尝试
+        assert_eq!(
+            req.record_supplier_request_id(ix(3), sid("x")).unwrap_err(),
+            RequestError::NoSuchAttempt(ix(3))
+        );
+        // 这不是状态转移：状态和结算计划都不受影响
+        assert_eq!(
+            req.attempt(ix(0)).unwrap().state(),
+            &AttemptState::MaybeExecuted
+        );
+    }
+
+    #[test]
+    fn supplier_request_id_can_arrive_after_settlement_and_after_a_switch() {
+        let mut req = new_request();
+        to_maybe_executed(&mut req, 0);
+        req.begin_next_attempt(candidate("m1")).unwrap();
+        // 已被放弃、仍是 maybe_executed 的旧尝试：账单回来后补上请求号
+        req.record_supplier_request_id(ix(0), sid("late-1"))
+            .unwrap();
+        drive(
+            &mut req,
+            1,
+            &[
+                AttemptEvent::Dispatch,
+                AttemptEvent::WireWriteStarted,
+                AttemptEvent::UsageReported { usage: usage() },
+            ],
+        );
+        req.publish_first_byte(ix(1)).unwrap();
+        drive(&mut req, 1, &[AttemptEvent::Settle]);
+        req.record_supplier_request_id(ix(1), sid("done-1"))
+            .unwrap();
+        // 对结算计划没有任何影响
+        let before = req.plan_settlement().unwrap();
+        let mut copy = req.clone();
+        copy.record_supplier_request_id(ix(0), sid("late-1"))
+            .unwrap();
+        assert_eq!(copy.plan_settlement().unwrap(), before);
+    }
+
+    #[test]
+    fn supplier_request_id_survives_storage_and_a_forged_one_on_an_unsent_attempt_is_rejected() {
+        let mut req = new_request();
+        to_maybe_executed(&mut req, 0);
+        req.record_supplier_request_id(ix(0), sid("chatcmpl-1"))
+            .unwrap();
+        let json = json_of(&req);
+        assert_eq!(json["attempts"][0]["supplier_request_id"], "chatcmpl-1");
+        assert_eq!(serde_json::from_value::<Request>(json).unwrap(), req);
+        // 没记过的尝试不输出这个键（形状与加法前一致）
+        assert!(
+            json_of(&new_request())["attempts"][0]
+                .get("supplier_request_id")
+                .is_none()
+        );
+        // 伪造：还在 admitted 的尝试带着供应商请求号
+        let mut forged = json_of(&new_request());
+        forged["attempts"][0]["supplier_request_id"] = serde_json::json!("forged-1");
+        assert!(serde_json::from_value::<Request>(forged).is_err());
+        // 非法的请求号字符
+        let mut bad = json_of(&req);
+        bad["attempts"][0]["supplier_request_id"] = serde_json::json!("a b");
+        assert!(serde_json::from_value::<Request>(bad).is_err());
     }
 
     // ---------- 其它规则 ----------

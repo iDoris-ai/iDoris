@@ -385,6 +385,17 @@ fn request_lifecycle_with_failover_and_settlement() {
     }
     req.publish_first_byte(AttemptIndex(1)).unwrap();
     req.apply(AttemptIndex(1), AttemptEvent::Settle).unwrap();
+    // 对账用的供应商请求号：被放弃的第 0 次在账单回来后补上，第 1 次在响应里就有
+    req.record_supplier_request_id(
+        AttemptIndex(0),
+        idoris_compute_contracts::ids::SupplierRequestId::new("gen-late-0001").unwrap(),
+    )
+    .unwrap();
+    req.record_supplier_request_id(
+        AttemptIndex(1),
+        idoris_compute_contracts::ids::SupplierRequestId::new("chatcmpl-0002").unwrap(),
+    )
+    .unwrap();
     let plan = settle_attempts(req.id(), req.attempts(), req.published()).unwrap();
     assert_snapshot(
         "request_lifecycle",

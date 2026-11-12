@@ -42,7 +42,8 @@
         },
         "state": {
           "state": "maybe_executed"
-        }
+        },
+        "supplier_request_id": "gen-late-0001"
       },
       {
         "cost_rates": {
@@ -92,7 +93,8 @@
             }
           },
           "state": "settled"
-        }
+        },
+        "supplier_request_id": "chatcmpl-0002"
       }
     ],
     "id": "req-1",

@@ -78,7 +78,8 @@
 //!   `evaluate_admission`；用 `AdmissionReport::headroom` 喂 `fit_max_tokens`；决定本身（什么时候降级、
 //!   什么时候用宽限）由你写，用 `AdmissionDecision` 表达；宽限资格用 `check_grace`。
 //! - **S4**（云供应商）：每次尝试用 `Request::apply` 推进状态机；**先记 `WireWriteStarted` 再写字节**；
-//!   路由用 `permit::select_compliant`，兜底候选走同一个函数。
+//!   拿到供应商的请求号就 `Request::record_supplier_request_id`（恢复后对账用，见
+//!   `docs/design/compute-service-ops.md` §7）；路由用 `permit::select_compliant`，兜底候选走同一个函数。
 //! - **S5**（云入口）：`credential::resolve_payment_context` 得到付款上下文，原因码映射见
 //!   `ResolveError::reason_code`；形态判定用 `form`。
 //! - **S6**（儿童安全）：`edu` 租户的 `TenantDataPolicy` 含 `child_edu`；本 crate **不**强制「edu 一律非流式」
@@ -112,6 +113,8 @@
 //! 13. §8 调研里的「没核实」：契约没有「未知」取值，规则是没核实的值一律写成最坏的那个
 //!     （`allowed_data_classes: []`、`retained`、`unsigned`、能力 `false`、区域 `unknown`），表读出来永远不会比
 //!     真实情况更宽松；所以 `allowed_data_classes` 允许为空列表（这样的端点永远选不中）。见 `permit` 模块文档。
+//! 14. §6 每次尝试的字段列表里没有「供应商请求号」，但 §10 的恢复后对账需要一个能和供应商账单对上的键
+//!     （ops 文档 §7.1 也列了 `supplier_request_id`），所以它是 `Attempt` 上的可选字段，不是状态转移。
 
 pub mod account;
 pub mod admission;

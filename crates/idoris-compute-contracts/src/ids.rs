@@ -190,6 +190,12 @@ token_id!(
     PriceVersion, kind = "price version", max = MAX_NODE_ID_LEN, colon_tilde = true
 );
 token_id!(
+    /// 供应商为这次调用返回的请求号（响应里的 id）。恢复后对账要用它把本地的尝试和供应商账单对上
+    /// （设计稿 §10；`docs/design/compute-service-ops.md` §7 的 `supplier_request_id`）。
+    /// 由供应商生成，所以字符集取宽松的一档（字母数字与 `. _ - : ~`），长度同一般 id。
+    SupplierRequestId, kind = "supplier request id", max = MAX_ID_LEN, colon_tilde = true
+);
+token_id!(
     /// 具体端点名（许可表里的 `endpoint`）：同一个供应商、同一个模型下，不同的 API 面或路由方式，
     /// 例如 `example-router-zdr` 与 `example-router-default` 是两个端点，留存不同。只是标签，不含 URL。
     EndpointName, kind = "endpoint name", max = MAX_ID_LEN, colon_tilde = false
@@ -529,6 +535,22 @@ mod tests {
         assert!(ModelId::new("a@b").is_err());
         assert!(ModelId::new("").is_err());
         assert!(ModelId::new("x".repeat(MAX_ID_LEN + 1)).is_err());
+    }
+
+    #[test]
+    fn supplier_request_id_accepts_typical_vendor_ids_and_rejects_junk() {
+        for ok in [
+            "chatcmpl-9fAbC123",
+            "req_01HZX",
+            "gen-1730000000-AbCdEf",
+            "a:b~c.d",
+        ] {
+            assert_eq!(SupplierRequestId::new(ok).unwrap().as_str(), ok);
+        }
+        for bad in ["", "a b", "a/b", "a@b", "x\n"] {
+            assert!(SupplierRequestId::new(bad).is_err(), "{bad:?}");
+        }
+        assert!(SupplierRequestId::new("x".repeat(MAX_ID_LEN + 1)).is_err());
     }
 
     #[test]
