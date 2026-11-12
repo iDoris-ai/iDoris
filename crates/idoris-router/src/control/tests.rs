@@ -876,6 +876,23 @@ async fn write_operations_return_one_stable_result_shape_and_a_correlation_id() 
         (invalid.status, invalid.reason()),
         (StatusCode::BAD_REQUEST, "invalid_account")
     );
+    // 「给自己所在的组织发额度」：接收方 eduai 在 root 的子树里，授权方补贴池不在，所以被拒
+    let self_grant = world
+        .call(
+            "POST",
+            "/control/v1/allocations",
+            Some(&root),
+            Some(
+                json!({"allocation_id": "self-1", "parent": "pool", "child": "eduai",
+                        "amount": {"unit": "THB", "micros": 1}, "purpose": "prepaid",
+                        "valid_from_ms": T0, "valid_until_ms": T0 + DAY_MS}),
+            ),
+        )
+        .await;
+    assert_eq!(
+        (self_grant.status, self_grant.reason()),
+        (StatusCode::FORBIDDEN, "out_of_scope")
+    );
     // 额度：发放、重发、撤销
     let grant = json!({"allocation_id": "g1", "parent": "teacher", "child": "s1",
         "amount": {"unit": "THB", "micros": 2_000_000}, "purpose": "prepaid",

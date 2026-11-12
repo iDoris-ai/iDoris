@@ -1433,6 +1433,34 @@ fn allocations_are_bounded_by_the_callers_cap_the_grantors_own_ceiling_and_the_s
         .run(&env, &who, T0 + 1),
         Ok(WriteResult::Created)
     );
+    // 「给自己所在的组织发额度」：接收方 eduai 在这个没有上限的调用者的子树里，但授权方（补贴池 / 平台）不在——
+    // 授权看授权方，所以被拒，库里也没有多出任何额度。
+    let allocations_before: i64 = env
+        .raw()
+        .query_row("SELECT count(*) FROM allocations", [], |r| r.get(0))
+        .unwrap();
+    for (id, parent, child) in [
+        ("self-1", "pool", "eduai"),
+        ("self-2", "platform", "pool"),
+        ("self-3", "platform", "school-b"),
+    ] {
+        assert_eq!(
+            Action::GrantAllocation {
+                id,
+                parent,
+                child,
+                micros: 1
+            }
+            .run(&env, &who, T0 + 1),
+            Err(ControlReason::OutOfScope),
+            "{parent} -> {child}"
+        );
+    }
+    let allocations_after: i64 = env
+        .raw()
+        .query_row("SELECT count(*) FROM allocations", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(allocations_after, allocations_before);
     // 每次拒绝都留审计
     let denied: Vec<_> = env
         .audit()
@@ -1639,6 +1667,19 @@ fn a_revoked_allocation_no_longer_authorizes_anything_and_cannot_be_revived() {
     assert_eq!(
         Action::RevokeAllocation { id: "a-teacher-2" }.run(&env, &small.who(), T0 + 7),
         Err(ControlReason::AmountExceedsAuthority)
+    );
+    // 流入 eduai 本身的额度（补贴池 -> eduai）：接收方 eduai 在调用者的子树里，授权方补贴池不在——
+    // 组织的管理凭证不能撤销（也不能自己发）补贴池给它的额度
+    assert_eq!(
+        Action::RevokeAllocation { id: "a-edu" }.run(&env, &who, T0 + 7),
+        Err(ControlReason::OutOfScope)
+    );
+    assert!(
+        env.store
+            .get_allocation(&AllocationId::new("a-edu").unwrap())
+            .unwrap()
+            .is_some(),
+        "the pool's allocation to the organization is untouched"
     );
     // 数据库层：撤销记录只追加
     let raw = env.raw();
