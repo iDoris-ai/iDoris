@@ -3,6 +3,7 @@ resolver = "2"
 exclude = ["vendor/genai"]
 members = [
     "crates/idoris-contracts",
+    "crates/idoris-compute-contracts",
     "crates/idoris-backend",
     "crates/idoris-router",
     "crates/idoris-tenancy",
@@ -95,6 +96,7 @@ chrono = { version = "0.4", default-features = false, features = ["std"] }
 chrono-tz = "0.10"
 
 idoris-contracts = { path = "crates/idoris-contracts" }
+idoris-compute-contracts = { path = "crates/idoris-compute-contracts" }
 idoris-backend = { path = "crates/idoris-backend" }
 idoris-tenancy = { path = "crates/idoris-tenancy" }
 idoris-recommender = { path = "crates/idoris-recommender" }

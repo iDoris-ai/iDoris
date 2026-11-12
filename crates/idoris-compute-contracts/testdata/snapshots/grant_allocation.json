@@ -1,0 +1,34 @@
+{
+  "allocation": {
+    "ceiling": {
+      "amount": {
+        "micros": 5000000,
+        "unit": "THB"
+      },
+      "purpose": "free_tier",
+      "transferable": false,
+      "valid_from": 1793836800000,
+      "valid_until": 1796428800000
+    },
+    "child": "eduai",
+    "id": "alloc-1",
+    "idempotency_key": "subsidy:kid1:2026-11",
+    "parent": "pool"
+  },
+  "grant": {
+    "amount": {
+      "micros": 5000000,
+      "unit": "THB"
+    },
+    "purpose": "free_tier",
+    "transferable": false,
+    "valid_from": 1793836800000,
+    "valid_until": 1796428800000
+  },
+  "purposes": [
+    "free_tier",
+    "prepaid",
+    "credit_line",
+    "org_quota"
+  ]
+}

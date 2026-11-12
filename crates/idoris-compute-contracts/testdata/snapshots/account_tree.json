@@ -1,0 +1,77 @@
+{
+  "membership": {
+    "account": "s1",
+    "id": "m-kid1",
+    "org": "eduai",
+    "principal": "kid1",
+    "role": "member",
+    "status": "active"
+  },
+  "principal": {
+    "id": "kid1",
+    "status": "active"
+  },
+  "roles": [
+    "member",
+    "sponsor",
+    "admin"
+  ],
+  "tree": [
+    {
+      "id": "eduai",
+      "kind": "org",
+      "parent": "pool",
+      "status": "active",
+      "unit": "THB"
+    },
+    {
+      "id": "p1",
+      "kind": "member",
+      "parent": "platform",
+      "status": "active",
+      "unit": "THB"
+    },
+    {
+      "id": "platform",
+      "kind": "platform",
+      "parent": null,
+      "status": "active",
+      "unit": "THB"
+    },
+    {
+      "id": "pool",
+      "kind": "subsidy_pool",
+      "parent": "platform",
+      "status": "active",
+      "unit": "THB"
+    },
+    {
+      "id": "s1",
+      "kind": "member",
+      "parent": "teacher",
+      "status": "active",
+      "unit": "THB"
+    },
+    {
+      "id": "s2",
+      "kind": "member",
+      "parent": "eduai",
+      "status": "active",
+      "unit": "THB"
+    },
+    {
+      "id": "school-b",
+      "kind": "org",
+      "parent": "platform",
+      "status": "active",
+      "unit": "THB"
+    },
+    {
+      "id": "teacher",
+      "kind": "sponsor",
+      "parent": "eduai",
+      "status": "active",
+      "unit": "THB"
+    }
+  ]
+}
