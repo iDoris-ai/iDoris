@@ -49,6 +49,9 @@ use idoris_compute_contracts::pricing::Usage;
 use idoris_compute_contracts::reason::ReasonCode;
 use idoris_compute_contracts::request::AdmittedCandidate;
 use idoris_compute_contracts::reserve::{ReservePolicy, ReserveRequest};
+use idoris_compute_contracts::safety::{
+    SafetyCategory, SafetyReasonCode, SafetyStage, SafetyUnavailableCause,
+};
 use idoris_tenancy::attempts::{AttemptStore, AttemptStoreError, NewRequest};
 use idoris_upstream::cloud::{
     BuildError, ChatCall, CloudFailure, CloudTimeouts, PrepareError, ResponseHead, SseError,
@@ -65,6 +68,7 @@ use super::answer::{
 use super::clock::Clock;
 use super::config::{CloudLimits, EndpointRegistry, EndpointRuntime};
 use super::run::{RunState, judge_usage};
+use super::safety::{GateDenial, SafetyCall, SafetyGate};
 
 /// 一次云调用的输入。
 pub struct CloudCall {
@@ -144,6 +148,34 @@ pub enum CloudError {
     /// 尝试记录库出错（失败即关闭：不放行、不出网）。
     Ledger(String),
     Internal(String),
+    /// edu 租户在 P0 一律非流式（设计稿 §6）：流式请求在任何上游调用之前被拒绝。
+    StreamingNotAllowed,
+    /// 儿童安全检查拒绝了内容（S6）。输入阶段上游没有收到任何字节；输出阶段回答没有发给客户端。
+    SafetyBlocked {
+        stage: SafetyStage,
+        category: SafetyCategory,
+    },
+    /// 儿童安全检查没能给出结论（超时、出错、返回无法解析、分类器不可用、没有配置……）：失败即关闭（S6）。
+    SafetyUnavailable {
+        stage: SafetyStage,
+        cause: SafetyUnavailableCause,
+    },
+}
+
+impl From<GateDenial> for CloudError {
+    fn from(denial: GateDenial) -> Self {
+        match denial {
+            GateDenial::Blocked { stage, category } => {
+                CloudError::SafetyBlocked { stage, category }
+            }
+            GateDenial::Unavailable { stage, cause } => {
+                CloudError::SafetyUnavailable { stage, cause }
+            }
+            // 安全检查的成本没通过准入：和主调用的准入拒绝一样处理（402 / 429 / 403）
+            GateDenial::Admission(code) => CloudError::Denied(code),
+            GateDenial::Cancelled => CloudError::Cancelled,
+        }
+    }
 }
 
 impl CloudError {
@@ -165,6 +197,12 @@ impl CloudError {
             CloudError::Cancelled => "client_cancelled",
             CloudError::Admission(_) | CloudError::Ledger(_) => "ledger_unavailable",
             CloudError::Internal(_) => "internal_error",
+            CloudError::StreamingNotAllowed => "streaming_not_allowed",
+            // 只记粗的稳定码：拦截类别是从孩子的话里推出来的敏感推断，不进账本
+            CloudError::SafetyBlocked { stage, .. } => {
+                SafetyReasonCode::blocked_at(*stage).as_str()
+            }
+            CloudError::SafetyUnavailable { .. } => SafetyReasonCode::SafetyUnavailable.as_str(),
         }
     }
 }
@@ -198,6 +236,19 @@ impl std::fmt::Display for CloudError {
             CloudError::Admission(e) => write!(f, "{e}"),
             CloudError::Ledger(e) => write!(f, "attempt ledger error: {e}"),
             CloudError::Internal(e) => write!(f, "internal error: {e}"),
+            CloudError::StreamingNotAllowed => {
+                f.write_str("streaming is not available for child-data tenants")
+            }
+            // 不含类别，更不含内容
+            CloudError::SafetyBlocked { stage, .. } => {
+                write!(f, "the {stage} did not pass the child-safety check")
+            }
+            CloudError::SafetyUnavailable { stage, cause } => {
+                write!(
+                    f,
+                    "the child-safety check of the {stage} could not be completed: {cause}"
+                )
+            }
         }
     }
 }
@@ -248,6 +299,8 @@ pub struct CloudExecutor {
     pub(crate) clock: Arc<dyn Clock>,
     pub(crate) reserve_policy: ReservePolicy,
     pub(crate) limits: CloudLimits,
+    /// 儿童安全 gate（S6）。处理儿童数据的租户**必须**走它；没有配置时这类请求一律被拒（失败即关闭）。
+    pub(crate) safety: Option<Arc<SafetyGate>>,
 }
 
 impl std::fmt::Debug for CloudExecutor {
@@ -277,13 +330,119 @@ impl CloudExecutor {
             clock,
             reserve_policy,
             limits,
+            safety: None,
         }
     }
 
+    /// 装上儿童安全 gate（S6）。
+    pub fn with_safety(mut self, gate: Arc<SafetyGate>) -> Self {
+        self.safety = Some(gate);
+        self
+    }
+
     /// 执行一次云调用。成功返回一个等待发布的回答或一条流；失败时请求已经收尾（没有悬空的尝试）。
+    ///
+    /// 租户处理儿童数据（`TenantDataPolicy::handles_child_data()`）时走儿童安全管线 [`Self::execute_child`]：
+    /// 输入检查 -> 上游非流式调用 -> 完整输出检查通过后才返回可发布的回答。其它租户一字不变。
+    /// 是否走管线只看 `call.tenant`（服务端从凭证解析出来的），不看模型名、路由别名、请求头。
     pub async fn execute(&self, call: CloudCall) -> Result<CloudOutcome, CloudError> {
+        if call.tenant.handles_child_data() {
+            self.execute_child(&call).await
+        } else {
+            self.execute_unchecked(&call).await
+        }
+    }
+
+    /// 儿童安全管线（设计稿 §7，S6）。每一步失败都是失败即关闭：不放行、不交付任何正文字节。
+    async fn execute_child(&self, call: &CloudCall) -> Result<CloudOutcome, CloudError> {
+        // 0. edu 一律非流式（设计稿 §6）。handler 里已经拒绝过一次；这里是纵深防御：不论哪个入口走到执行器都一样
+        if call.stream {
+            return Err(self.reject(call, CloudError::StreamingNotAllowed));
+        }
+        // 1. 便宜的检查先做：没有合规的主上游候选就不跑安全检查（不白花检查成本，也不把孩子的话送给检查模型）。
+        //    和 `execute_inner` 里的筛选是同一个纯函数，结果一致
+        let requirements = RouteRequirements {
+            form: DeploymentForm::Cloud,
+            tenant: call.tenant.clone(),
+            stream: false,
+            billing: call.billing,
+            needs: call.needs,
+        };
+        if let Err(none) = select_compliant(
+            &self.permits,
+            &call.candidates,
+            &requirements,
+            self.clock.now(),
+        ) {
+            return Err(self.reject(call, CloudError::NoCompliantEndpoint(none)));
+        }
+        // 2. 必须有安全检查器：没配置就拒绝，绝不「没有检查器所以不检查」
+        let Some(gate) = self.safety.clone() else {
+            return Err(self.reject(
+                call,
+                CloudError::SafetyUnavailable {
+                    stage: SafetyStage::Input,
+                    cause: SafetyUnavailableCause::NotConfigured,
+                },
+            ));
+        };
+        let mut safety_call = SafetyCall {
+            request_id: &call.request_id,
+            payment: &call.payment,
+            tenant: &call.tenant,
+            billing: call.billing,
+            now: self.clock.now(),
+            cancel: &call.cancel,
+        };
+        // 3. 输入检查：通过之前上游一个字节都收不到
+        let input = match gate.check_input(&safety_call, &call.client_body).await {
+            Ok(input) => input,
+            Err(denial) => return Err(self.reject(call, CloudError::from(denial))),
+        };
+        // 4. 上游非流式调用（S4 的执行器：许可表硬约束、准入、尝试记录、首字节前切换）
+        let outcome = self.execute_unchecked(call).await?;
+        // 5. 完整输出检查：通过之后才把回答交给调用方发布
+        match outcome {
+            CloudOutcome::Complete(mut pending) => {
+                // 上游调用可能花了很久：输出检查用「现在」判断检查端点的核验有没有过期，不用请求开始时的时间
+                safety_call.now = self.clock.now();
+                match gate
+                    .check_output(&safety_call, &input, pending.body())
+                    .await
+                {
+                    Ok(body) => {
+                        // 发给客户端的是重建后的响应体（只含被检查过的字段），不是上游的原始字节
+                        pending.body = body;
+                        pending.run.clear_for_publication();
+                        Ok(CloudOutcome::Complete(pending))
+                    }
+                    Err(denial) => {
+                        let error = CloudError::from(denial);
+                        // 不发布：用户付 0，上游成本由平台承担；回答随 `pending` 一起丢掉
+                        if let Err(withhold_error) = pending.withhold(error.close_reason()) {
+                            eprintln!(
+                                "[idoris] cloud: could not settle a withheld answer: {withhold_error}"
+                            );
+                        }
+                        Err(error)
+                    }
+                }
+            }
+            // edu 永远非流式，走不到这里；万一走到，丢掉这条流（Drop 会按客户端断开收尾），一个字节都不发
+            CloudOutcome::Stream(stream) => {
+                drop(stream);
+                Err(CloudError::Internal(
+                    "a child-data request produced a stream".to_string(),
+                ))
+            }
+        }
+    }
+
+    /// S4 的原始路径：候选选择 -> 准入 -> 尝试 -> 发布边界 -> 结算，没有任何内容检查。
+    /// 只有非儿童租户直接走这里；儿童租户只在 [`Self::execute_child`] 的输入检查通过之后才会走到。
+    async fn execute_unchecked(&self, call: &CloudCall) -> Result<CloudOutcome, CloudError> {
         let mut slot: Option<RunState> = None;
-        match self.execute_inner(&call, &mut slot).await {
+        match self.execute_inner(call, &mut slot).await {
             Ok(outcome) => Ok(outcome),
             Err(error) => {
                 // 已经开始的请求：记下原因并收尾。没开始的（被拒绝）已经在 execute_inner 里记了一行。

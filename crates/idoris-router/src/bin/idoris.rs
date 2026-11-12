@@ -520,6 +520,17 @@ async fn run(options: cli::ServeOptions) -> Result<(), String> {
     let mut state = state;
     state.cloud = idoris_router::cloud::CloudUpstream::from_env_for_form(&startup_form)?;
     state.control = control;
+    // S6（儿童安全）：配置里有处理儿童数据的租户时，进程要保证正文只在内存里：
+    // 旧代理路径对这些租户关闭响应缓存；panic 信息脱敏（只打位置，不打 payload）；关闭 core dump。
+    // 任何一步做不到就拒绝启动（失败即关闭）。
+    if let Some(cloud) = &state.cloud
+        && cloud.has_child_data_callers()
+    {
+        state
+            .proxy
+            .disable_cache_for_tenants(cloud.child_data_tenant_scopes());
+        idoris_router::cloud::safety::hardening::harden_process_for_child_data()?;
+    }
 
     // idoris.ai/api cloud ingress (S5): `/api/v1`, credential-derived callers, three-level limits, public abuse
     // protection. Cloud form only; it also decides whether the public bind is acceptable.
