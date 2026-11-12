@@ -81,6 +81,7 @@ pub mod clock;
 pub mod config;
 pub mod executor;
 mod handler;
+pub mod ingress;
 mod request;
 mod run;
 
