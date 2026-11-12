@@ -329,7 +329,7 @@ impl EgressCounter {
 /// off-host provider. Loopback runtimes retain the caller's original payload.
 const IDENTITY_FIELDS: &[&str] = &["user", "safety_identifier", "prompt_cache_key", "metadata"];
 
-fn decorrelate(payload: &Value) -> Value {
+pub(crate) fn decorrelate(payload: &Value) -> Value {
     let mut stripped = payload.clone();
     if let Some(object) = stripped.as_object_mut() {
         for field in IDENTITY_FIELDS {

@@ -114,6 +114,13 @@ pub mod cloud;
 /// personal form and every legacy tenant deployment behave exactly as before.
 pub mod control;
 
+/// idoris.ai/api compute service S7: the local / organization **cloud tier** — a fallback channel from this node to
+/// idoris.ai/api for requests whose privacy class allows it, whose caller explicitly consented and which this node
+/// cannot serve. Default off: `AppState::cloud_tier` is `None` unless `IDORIS_CLOUD_TIER_CONFIG` is set, and then every
+/// existing route, header and error body is exactly as it was (the hooks in `chat_completions` return the local
+/// response untouched). `local_only` requests never reach it.
+pub mod cloud_tier;
+
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -300,6 +307,10 @@ pub struct AppState {
     /// limits and the public abuse protection. `None` (the default, and always outside the cloud form) leaves
     /// `build_app` exactly as it was; `Some` makes `build_app` hand over to [`cloud::ingress::build_cloud_app`].
     pub cloud_ingress: Option<Arc<cloud::ingress::CloudIngress>>,
+    /// idoris.ai/api cloud tier (S7): the local node's fallback channel to the cloud. `None` (the default) leaves every
+    /// existing behaviour byte-for-byte as it was; `Some` is consulted only after the local path has failed, and only
+    /// for requests that pass the privacy gate and carry the caller's explicit consent (see `cloud_tier`).
+    pub cloud_tier: Option<Arc<cloud_tier::CloudTier>>,
 }
 
 impl std::fmt::Debug for AppState {
@@ -344,6 +355,10 @@ impl std::fmt::Debug for AppState {
                 "cloud_ingress",
                 &self.cloud_ingress.as_ref().map(|_| "configured"),
             )
+            .field(
+                "cloud_tier",
+                &self.cloud_tier.as_ref().map(|_| "configured"),
+            )
             .finish()
     }
 }
@@ -387,6 +402,7 @@ impl Default for AppState {
             cloud: None,
             control: None,
             cloud_ingress: None,
+            cloud_tier: None,
             http_client,
         }
     }
@@ -2733,6 +2749,27 @@ async fn chat_completions(
         .collect::<Vec<_>>()
         .join("\n");
 
+    // Cloud tier (S7): `None` unless one is configured, in which case every hook below returns the local response
+    // untouched. It is consulted only after the local path has already failed (see `cloud_tier`).
+    let cloud_scope = cloud_tier::FallbackScope::new(cloud_tier::ScopeInputs {
+        state: &state,
+        headers: &headers,
+        body: &value,
+        parsed: &parsed,
+        pinned_local_by_content: inspection.tightened
+            || inspection.killed
+            || inspection.failed
+            || inspection.uninspectable,
+        content_tightened: inspection.tightened && !inspection.killed,
+        prompt: &prompt,
+        completion_tokens: completion_reservation,
+        record_id: &record_id,
+        lifecycle: &lifecycle,
+        dev_no_key: dev_no_key_request,
+        dispatched: dispatched_event_context.as_ref(),
+        completed: completed_event_context.as_ref(),
+    });
+
     let policy_cards = dispatch::policy_cards(&state.cards, &state.routing_policy, &parsed);
     if policy_cards.cards.is_empty() {
         let reason = if policy_cards.route.fail_closed {
@@ -2755,7 +2792,7 @@ async fn chat_completions(
         {
             return event_log_unavailable_response();
         }
-        return if policy_cards.route.fail_closed {
+        let original = if policy_cards.route.fail_closed {
             rejection_response(idoris_policy::Rejection::LocalOnlyUnavailable)
         } else {
             error_envelope(
@@ -2764,6 +2801,12 @@ async fn chat_completions(
                 "no candidate matches routing policy",
             )
         };
+        return cloud_tier::fallback(
+            cloud_scope.as_ref(),
+            cloud_tier::LocalFailure::NoCandidate,
+            original,
+        )
+        .await;
     }
 
     // Freeze one exact lifecycle-readiness view for every decision this
@@ -3003,7 +3046,15 @@ async fn chat_completions(
     // the actual connection does.
     let selected_for_dispatch = match selection {
         Ok(selected) => Some(selected),
-        Err(DispatchError::Rejection(rejection)) => return rejection_response(rejection),
+        Err(DispatchError::Rejection(rejection)) => {
+            let original = rejection_response(rejection.clone());
+            return cloud_tier::fallback(
+                cloud_scope.as_ref(),
+                cloud_tier::LocalFailure::Rejection(&rejection),
+                original,
+            )
+            .await;
+        }
         Err(DispatchError::Internal(message)) => {
             return error_envelope(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", message);
         }
@@ -3057,7 +3108,21 @@ async fn chat_completions(
             error_envelope(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", message)
         }
         Ok(outcome) => match &outcome.result {
-            Err(failure) => dispatch_failure_response(failure, &outcome),
+            Err(failure) => {
+                let original = dispatch_failure_response(failure, &outcome);
+                match failure {
+                    DispatchFailure::Backend(error) => {
+                        cloud_tier::fallback(
+                            cloud_scope.as_ref(),
+                            cloud_tier::LocalFailure::Backend(error),
+                            original,
+                        )
+                        .await
+                    }
+                    // A local budget decision (402) is a commercial constraint, never a reason to go to the cloud.
+                    DispatchFailure::Budget(_) => original,
+                }
+            }
             Ok(chat_response) => {
                 let (body, prompt_tokens, completion_tokens) =
                     if let Some(body) = &chat_response.native {

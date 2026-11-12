@@ -63,6 +63,8 @@ impl ConnectionInfo {
 pub struct RequestLifecycle {
     peer: Option<SocketAddr>,
     cancellation: CancellationToken,
+    /// A sibling of `cancellation` (same parent: the connection token). See [`Self::fallback_cancellation_token`].
+    fallback: CancellationToken,
 }
 
 impl RequestLifecycle {
@@ -74,10 +76,20 @@ impl RequestLifecycle {
         self.cancellation.clone()
     }
 
+    /// A sibling of [`Self::cancellation_token`]: it also fires when the caller's connection goes away, but unlike the
+    /// request token it is **not** cancelled when a local dispatch finishes (`dispatch::CancelOnDrop` cancels the request
+    /// token on every exit, which is harmless there but would cancel anything that still has to run afterwards). The cloud
+    /// tier's fallback call runs after the local attempt has ended; it must be cancelled by the caller leaving and by
+    /// nothing else.
+    pub fn fallback_cancellation_token(&self) -> CancellationToken {
+        self.fallback.clone()
+    }
+
     fn detached() -> Self {
         Self {
             peer: None,
             cancellation: CancellationToken::new(),
+            fallback: CancellationToken::new(),
         }
     }
 }
@@ -89,6 +101,7 @@ pub async fn request_lifecycle_middleware(mut request: Request, next: Next) -> R
         .map(|ConnectInfo(connection)| RequestLifecycle {
             peer: Some(connection.peer()),
             cancellation: connection.request_token(),
+            fallback: connection.request_token(),
         })
         .unwrap_or_else(RequestLifecycle::detached);
     request.extensions_mut().insert(lifecycle);
