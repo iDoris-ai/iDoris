@@ -57,11 +57,17 @@
 //!
 //! # 交接给 S6 / S7
 //!
-//! - **S6（儿童安全）**：处理函数能从请求扩展里取到两样东西。[`crate::cloud::CallerPolicy`]（和 S4 一样）——
+//! - **S6（儿童安全，已接上）**：处理函数能从请求扩展里取到两样东西。[`crate::cloud::CallerPolicy`]（和 S4 一样）——
 //!   `caller.tenant` 就是租户的 `TenantDataPolicy`，`caller.tenant.handles_child_data()` 是「这是不是 `child_edu`
 //!   租户」，`caller.tenant.data_classes()` 是完整的类别集合，来源是云入口配置里该租户的声明；以及
-//!   [`IngressContext`]（推导出来的租户账户 id、主体、凭证 id）。数据类别绑定在租户上，不在模型别名上，
-//!   换具体模型名绕不过去。
+//!   [`IngressContext`]（推导出来的租户账户 id、主体、凭证 id）。`CallerPolicy.tenant` 原样进 `CloudCall.tenant`，
+//!   S6 的执行器就是看 `call.tenant.handles_child_data()` 决定走不走儿童管线，所以**经云入口来的 eduai 请求一定走管线**，
+//!   请求里的头、字段、模型名都改不了它。数据类别绑定在租户上，不在模型别名上，换具体模型名绕不过去。
+//!   衔接的三处（都在启动时，不等第一个孩子的请求）：云入口配置里声明的儿童租户（a）和静态调用方簿里的儿童调用方
+//!   一起过云上游配置的 S6 校验（必须有 `safety:` 段；LLM 检查端点要满足它们每一个的区域 / 留存 / DPA；只用规则检查器要留
+//!   警告，见 `cloud::config::parse_with_ingress_tenants`）；（b）`CloudIngress::new` 在云上游没有装安全 gate 时拒绝构造；
+//!   （c）进程要做「正文不落盘」的加固（关 core dump、panic 信息脱敏，`bin/idoris.rs`）。S6 的旧推理路由
+//!   （`/v1/messages`、`/v1/embeddings`、`/v1/rerank`）在云形态下**根本不存在**（404，不是 403）：没有路由，就没有绕过管线的路。
 //! - **S7（本地到云的云端档）**：组织节点用 `Node` 凭证调云，不带 `X-iDoris-Member`；个人云账号用成员凭证。
 //!   两者都只需要「地址加密钥」，调 `POST /api/v1/chat/completions`。节点凭证没有主体，成员级上限按（租户，凭证）算。
 //!
@@ -153,6 +159,20 @@ impl CloudIngress {
         clock: Arc<dyn Clock>,
         cloud: &super::CloudUpstream,
     ) -> Result<Self, String> {
+        // 处理儿童数据的租户（`child_edu`）的请求一定要走 S6 的儿童安全管线。管线是否生效看执行器里有没有装安全 gate；
+        // 没装就在启动时拒绝，不等第一个孩子的请求才发现每个请求都是 503（执行器里还有一道失败即关闭兜底）。
+        if config.has_child_data_tenants() && !cloud.has_safety_gate() {
+            let names: Vec<String> = config
+                .tenants()
+                .filter(|tenant| tenant.data.handles_child_data())
+                .map(|tenant| tenant.account.to_string())
+                .collect();
+            return Err(format!(
+                "云入口配置里声明了处理儿童数据的租户 [{}]，但云上游没有装儿童安全检查：请在云上游配置里写 safety: 段\
+                 （安全检查是儿童业务上线的前提，设计稿 §7）",
+                names.join(", ")
+            ));
+        }
         if !cloud.callers.is_empty() {
             return Err(
                 "云上游配置里还有静态调用方 callers:：云入口生效时付款上下文只由凭证解析，\
@@ -178,29 +198,6 @@ impl CloudIngress {
             authenticator,
             clock,
         })
-    }
-
-    /// 读环境变量 [`config::CONFIG_ENV`] 指向的文件。**云形态必须配**：没设就是启动错误。
-    pub fn from_env(
-        accounts: Arc<AccountStore>,
-        authenticator: VirtualKeyAuthenticator,
-        cloud: &super::CloudUpstream,
-    ) -> Result<Arc<Self>, String> {
-        let Some(path) = crate::config::optional_env_path(config::CONFIG_ENV)? else {
-            return Err(format!(
-                "云形态（IDORIS_FORM=cloud）必须设置 {}：它声明受信反向代理、各级上限、防滥用和每个租户的数据处理要求",
-                config::CONFIG_ENV
-            ));
-        };
-        let config = IngressConfig::load(&path)?;
-        let ingress = Self::new(
-            config,
-            accounts,
-            authenticator,
-            Arc::new(super::SystemClock),
-            cloud,
-        )?;
-        Ok(Arc::new(ingress))
     }
 
     pub fn config(&self) -> &IngressConfig {

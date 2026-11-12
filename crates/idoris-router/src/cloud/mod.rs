@@ -78,7 +78,8 @@
 //! # S6（儿童安全）对设计稿 / S0 含糊处的理解（没有悄悄拍板，等 owner 确认）
 //!
 //! 13. **「租户属性」就是 `TenantDataPolicy::handles_child_data()`**（`data_classes` 含 `child_edu`），来自服务端配置的调用方簿
-//!     （S1/S2/S5 之后是账户存储），经虚拟 key 绑定的租户解析；模型名、路由别名、任何请求头和请求体字段都改不了它。
+//!     （S5 之后，生产里是云入口配置的 `tenants:`：租户从付款账户推导，见 [`ingress`]），经虚拟 key 绑定的租户解析；
+//!     模型名、路由别名、任何请求头和请求体字段都改不了它。
 //!     没有另设一个布尔字段：S0 已经有这个属性，并且它同时决定了端点许可表的硬约束（ZDR + 已签 DPA）。
 //! 14. **管线放在执行器里，不是 handler 里**：任何入口（S5 的云入口、测试直接调执行器）走到执行器，edu 都绕不过。
 //!     `RunState` 还有一道发布守卫：儿童请求的回答没有「输出检查放行」标记就发布不出去，标记在请求创建时由数据类别决定。
@@ -265,10 +266,28 @@ impl CloudUpstream {
     /// 账户存储里没有的付款账户 / 凭证（比如还在用静态调用方簿 `callers:`，账户库里没有对应的账户）一律被准入拒绝：
     /// 账本不认识的付款人不能花钱。
     pub fn from_file(path: &Path, db_path: &Path) -> Result<Self, String> {
+        Self::from_file_with_ingress_tenants(path, db_path, &[])
+    }
+
+    /// 同 [`from_file`](Self::from_file)，另外把云入口（S5）配置里声明的儿童租户算进 S6 的启动校验：它们不在静态调用方簿里，
+    /// 但同样走儿童安全管线，所以有儿童租户就必须有 `safety:` 段、LLM 检查端点要满足它们每一个的数据策略。
+    pub fn from_file_with_ingress_tenants(
+        path: &Path,
+        db_path: &Path,
+        ingress_tenants: &[config::IngressTenant],
+    ) -> Result<Self, String> {
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
-        let parts = config::load(path, clock.now())?;
+        let parts = config::load_with_ingress_tenants(path, clock.now(), ingress_tenants)?;
         // 启动日志（S6）：哪些调用方走儿童安全管线（只有租户标识）。运营方一眼能核对「edu 租户的属性确实是 child_edu」
-        let (child, other) = parts.callers.caller_summary();
+        let (mut child, mut other) = parts.callers.caller_summary();
+        for tenant in ingress_tenants {
+            let listed = format!("{} (cloud ingress)", tenant.name);
+            if tenant.policy.handles_child_data() {
+                child.push(listed);
+            } else {
+                other.push(listed);
+            }
+        }
         eprintln!(
             "[idoris] cloud: child-data callers (safety pipeline ON): [{}]; other callers (no safety pipeline): [{}]; safety: {}",
             child.join(", "),
@@ -327,11 +346,20 @@ impl CloudUpstream {
     /// 的凭证解析，而账户库只在显式声明的组织、云形态才会打开；`deploy_mode=tenant` 还包括存量的 tenant 部署，
     /// 那里的租户来自可以被调用方自己写的 `X-iDoris-Tenant`（本地契约），不能拿来决定谁付款。组织形态是云的客户
     /// （S7 的云端档），不是云本身（能力表 `uses_endpoint_permit_table` 只有云形态为真）。
+    ///
+    /// `ingress_tenants` 是云入口配置里声明的租户和它们的数据处理要求（非云形态传空）：其中的儿童租户和静态调用方簿里的
+    /// 儿童调用方一起过 S6 的启动校验，启动日志按「走 / 不走儿童管线」把它们列出来。
     pub fn from_env_for_form(
         startup: &crate::startup_form::StartupForm,
+        ingress_tenants: &[config::IngressTenant],
     ) -> Result<Option<Arc<Self>>, String> {
         let path = crate::config::optional_env_path(config::CONFIG_ENV)?;
-        Self::resolve_for_form(startup, path, crate::storage::process_db_path)
+        Self::resolve_for_form(
+            startup,
+            path,
+            crate::storage::process_db_path,
+            ingress_tenants,
+        )
     }
 
     /// [`Self::from_env_for_form`] 的可测版本：路径与数据库路径由调用方给。
@@ -339,6 +367,7 @@ impl CloudUpstream {
         startup: &crate::startup_form::StartupForm,
         config_path: Option<std::path::PathBuf>,
         db_path: impl FnOnce() -> Result<std::path::PathBuf, String>,
+        ingress_tenants: &[config::IngressTenant],
     ) -> Result<Option<Arc<Self>>, String> {
         if startup.is_cloud() {
             let Some(path) = config_path else {
@@ -347,7 +376,11 @@ impl CloudUpstream {
                     config::CONFIG_ENV
                 ));
             };
-            return Ok(Some(Arc::new(Self::from_file(&path, &db_path()?)?)));
+            return Ok(Some(Arc::new(Self::from_file_with_ingress_tenants(
+                &path,
+                &db_path()?,
+                ingress_tenants,
+            )?)));
         }
         if config_path.is_some() {
             return Err(format!(

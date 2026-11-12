@@ -38,7 +38,7 @@ use idoris_compute_contracts::ids::{
 use idoris_compute_contracts::money::{Money, Unit};
 use idoris_router::auth::VirtualKeyAuthenticator;
 use idoris_router::cloud::ingress::IngressConfig;
-use idoris_router::cloud::{CloudIngress, CloudUpstream, LedgerAdmission, ManualClock};
+use idoris_router::cloud::{CloudIngress, CloudUpstream, LedgerAdmission, ManualClock, SafetyGate};
 use idoris_router::connection::ConnectionInfo;
 use idoris_router::control::{AccountGate, ControlClock, ControlPlane, bootstrap};
 use idoris_tenancy::accounts::AccountStore;
@@ -371,6 +371,10 @@ pub struct WorldOptions {
     pub ingress: IngressYaml,
     /// 云上游配置的 `limits:` 段（YAML 片段，缩进两格）；`None` = 夹具默认。
     pub cloud_limits: Option<String>,
+    /// 路由：客户端模型名 -> 候选的 provider 列表；`None` = 默认 `idoris/agent` -> 唯一的端点。
+    pub routes: Option<Vec<(&'static str, Vec<&'static str>)>>,
+    /// 换掉配置里 `safety:` 段装出来的儿童安全 gate（测试用计数检查器观察管线有没有被走到）。
+    pub safety_gate: Option<SafetyGate>,
 }
 
 impl WorldOptions {
@@ -476,9 +480,18 @@ impl World {
         if let Some(limits) = options.cloud_limits {
             cloud_options.limits = limits;
         }
+        cloud_options.routes = options.routes;
         let yaml = base::config_yaml(&endpoints, key_file.to_str().unwrap(), &cloud_options);
-        let parts = idoris_router::cloud::config::parse(&yaml, dir.path(), ts())
-            .unwrap_or_else(|e| panic!("fixture config must load: {e}\n{yaml}"));
+        // 和生产启动同一个顺序：云入口配置先加载，它声明的儿童租户和静态簿里的儿童调用方一起过 S6 的启动校验
+        let ingress_config = IngressConfig::parse(&options.ingress.render())
+            .unwrap_or_else(|e| panic!("{e}\n{}", options.ingress.render()));
+        let parts = idoris_router::cloud::config::parse_with_ingress_tenants(
+            &yaml,
+            dir.path(),
+            ts(),
+            &ingress_config.tenant_policies(),
+        )
+        .unwrap_or_else(|e| panic!("fixture config must load: {e}\n{yaml}"));
 
         let db_path = dir.path().join("idoris.sqlite3");
         let keys = Arc::new(Mutex::new(VirtualKeyStore::open(&db_path).unwrap()));
@@ -492,19 +505,22 @@ impl World {
         let mut world_creds = BTreeMap::new();
         Self::seed(&accounts, &clock, &mut world_creds);
 
-        let cloud = Arc::new(CloudUpstream::new(
+        let mut cloud_upstream = CloudUpstream::new(
             parts,
             attempts.clone(),
             clock.clone(),
             Arc::new(LedgerAdmission::new(accounts.clone())),
-        ));
+        );
+        if let Some(gate) = options.safety_gate {
+            cloud_upstream = cloud_upstream.with_safety(gate);
+        }
+        // 生产装配（`CloudUpstream::from_file`）同样把安全检查的成本接上账本
+        let cloud = Arc::new(cloud_upstream.with_ledger_extra_cost(accounts.clone()));
         let authenticator = VirtualKeyAuthenticator::new(keys.clone())
             .with_gate(Arc::new(AccountGate::new(accounts.clone())));
-        let config = IngressConfig::parse(&options.ingress.render())
-            .unwrap_or_else(|e| panic!("{e}\n{}", options.ingress.render()));
         let ingress = Arc::new(
             CloudIngress::new(
-                config,
+                ingress_config,
                 accounts.clone(),
                 authenticator.clone(),
                 clock.clone(),

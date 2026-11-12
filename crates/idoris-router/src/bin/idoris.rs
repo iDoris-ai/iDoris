@@ -24,8 +24,10 @@ use idoris_router::{
     build_app,
     capabilities::{CapabilitiesProvider, LiveCapabilitiesProvider},
     cli,
+    cloud::SystemClock,
     cloud::ingress::{
-        CloudIngress, bind::ListenPlan, bind::parse_cloud_bind_host, bind::validate_public_bind,
+        CloudIngress, IngressConfig, bind::ListenPlan, bind::parse_cloud_bind_host,
+        bind::validate_public_bind,
     },
     components, config,
     connection::{ConnectionInfo, ConnectionListener},
@@ -517,29 +519,58 @@ async fn run(options: cli::ServeOptions) -> Result<(), String> {
 
     // idoris.ai/api cloud upstream (S4, form rule from S5): the cloud form requires it
     // (IDORIS_CLOUD_UPSTREAM_CONFIG), every other form refuses it.
+    // The cloud ingress configuration is loaded first: the tenants it declares as child-data tenants take part in S6's
+    // start-up validation of the cloud upstream (a safety section is mandatory, the LLM checker must satisfy their data
+    // policies), exactly like the child callers of the static book do.
+    let ingress_config = if cloud {
+        Some(IngressConfig::from_env()?)
+    } else {
+        None
+    };
+    let ingress_tenants = ingress_config
+        .as_ref()
+        .map(IngressConfig::tenant_policies)
+        .unwrap_or_default();
+    let ingress_child_tenants = ingress_tenants
+        .iter()
+        .filter(|tenant| tenant.policy.handles_child_data())
+        .count();
     let mut state = state;
-    state.cloud = idoris_router::cloud::CloudUpstream::from_env_for_form(&startup_form)?;
+    state.cloud =
+        idoris_router::cloud::CloudUpstream::from_env_for_form(&startup_form, &ingress_tenants)?;
     state.control = control;
     // S6（儿童安全）：配置里有处理儿童数据的租户时，进程要保证正文只在内存里：
     // 旧代理路径对这些租户关闭响应缓存；panic 信息脱敏（只打位置，不打 payload）；关闭 core dump。
     // 任何一步做不到就拒绝启动（失败即关闭）。
     if let Some(cloud) = &state.cloud
-        && cloud.has_child_data_callers()
+        && (cloud.has_child_data_callers() || ingress_child_tenants > 0)
     {
         state
             .proxy
             .disable_cache_for_tenants(cloud.child_data_tenant_scopes());
         idoris_router::cloud::safety::hardening::harden_process_for_child_data()?;
+        eprintln!(
+            "[idoris] 儿童数据加固已启用：core dump 已关闭，panic 信息已脱敏（只打位置）；处理儿童数据的租户：静态调用方簿 {} 个，云入口配置 {} 个",
+            cloud.child_data_tenant_scopes().len(),
+            ingress_child_tenants
+        );
     }
 
     // idoris.ai/api cloud ingress (S5): `/api/v1`, credential-derived callers, three-level limits, public abuse
     // protection. Cloud form only; it also decides whether the public bind is acceptable.
-    if let (Some(authenticator), Some(accounts), Some(upstream)) = (
+    if let (Some(authenticator), Some(accounts), Some(upstream), Some(config)) = (
         ingress_authenticator,
         persistent.accounts.clone(),
         state.cloud.clone(),
+        ingress_config,
     ) {
-        let ingress = CloudIngress::from_env(accounts.clone(), authenticator, &upstream)?;
+        let ingress = Arc::new(CloudIngress::new(
+            config,
+            accounts.clone(),
+            authenticator,
+            Arc::new(SystemClock),
+            &upstream,
+        )?);
         validate_public_bind(bind_host, ingress.config(), has_active_key, BIND_HOST_ENV)?;
         for warning in ingress.startup_warnings(&accounts) {
             eprintln!("[idoris] 警告：{warning}");

@@ -647,8 +647,29 @@ fn build_caller(config: &CallerConfig, now: TimestampMs) -> Result<CallerPolicy,
     })
 }
 
+/// 云入口（S5）配置里声明的租户和它的数据处理要求。它们不在静态调用方簿里（生产里簿是空的），但调用方的数据处理要求
+/// 同样决定走不走儿童安全管线（`handles_child_data()`），所以加载云上游配置时要把它们和簿里的调用方**一起**算进
+/// S6 的启动校验：其中有儿童租户就必须有 `safety:` 段，LLM 检查端点要满足它们每一个的区域 / 留存 / DPA 要求，
+/// 只用规则检查器要留警告；启动日志也按「走 / 不走儿童管线」把它们列出来，运营方一眼能核对。
+#[derive(Debug, Clone)]
+pub struct IngressTenant {
+    /// 租户的账户 id（只用来写进错误和日志，没有任何内容）。
+    pub name: String,
+    pub policy: TenantDataPolicy,
+}
+
 /// 从 YAML 文本构造全部部件。`base_dir` 用来解析相对路径（许可表）；`now` 用来解析静态付款上下文。
 pub fn parse(text: &str, base_dir: &Path, now: TimestampMs) -> Result<CloudParts, String> {
+    parse_with_ingress_tenants(text, base_dir, now, &[])
+}
+
+/// 同 [`parse`]，另外把云入口配置里声明的租户算进 S6 的启动校验（见 [`IngressTenant`]）。
+pub fn parse_with_ingress_tenants(
+    text: &str,
+    base_dir: &Path,
+    now: TimestampMs,
+    ingress_tenants: &[IngressTenant],
+) -> Result<CloudParts, String> {
     let file: CloudConfigFile =
         serde_yaml::from_str(text).map_err(|e| bad(format!("无法解析 YAML：{e}")))?;
     if file.schema_version != CONFIG_SCHEMA_VERSION {
@@ -797,6 +818,12 @@ pub fn parse(text: &str, base_dir: &Path, now: TimestampMs) -> Result<CloudParts
         .chain(default.iter())
         .map(|caller: &CallerPolicy| &caller.tenant)
         .filter(|tenant| tenant.handles_child_data())
+        .chain(
+            ingress_tenants
+                .iter()
+                .map(|tenant| &tenant.policy)
+                .filter(|policy| policy.handles_child_data()),
+        )
         .collect();
     let safety = match &file.safety {
         Some(config) => Some(super::safety::config::build(
@@ -811,7 +838,7 @@ pub fn parse(text: &str, base_dir: &Path, now: TimestampMs) -> Result<CloudParts
         )?),
         None if !child_policies.is_empty() => {
             return Err(bad(
-                "有调用方处理儿童数据（data_classes 含 child_edu），必须配置 safety: 段（安全检查是儿童业务上线的前提，设计稿 §7）",
+                "有调用方（含云入口配置里的租户）处理儿童数据（data_classes 含 child_edu），必须配置 safety: 段（安全检查是儿童业务上线的前提，设计稿 §7）",
             ));
         }
         None => None,
@@ -863,10 +890,19 @@ pub fn parse(text: &str, base_dir: &Path, now: TimestampMs) -> Result<CloudParts
 
 /// 从文件加载。
 pub fn load(path: &Path, now: TimestampMs) -> Result<CloudParts, String> {
+    load_with_ingress_tenants(path, now, &[])
+}
+
+/// 同 [`load`]，另外把云入口配置里声明的租户算进 S6 的启动校验（见 [`IngressTenant`]）。
+pub fn load_with_ingress_tenants(
+    path: &Path,
+    now: TimestampMs,
+    ingress_tenants: &[IngressTenant],
+) -> Result<CloudParts, String> {
     let text = std::fs::read_to_string(path)
         .map_err(|e| bad(format!("无法读取 {}：{e}", path.display())))?;
     let base = path.parent().unwrap_or_else(|| Path::new("."));
-    parse(&text, base, now)
+    parse_with_ingress_tenants(&text, base, now, ingress_tenants)
 }
 
 #[cfg(test)]

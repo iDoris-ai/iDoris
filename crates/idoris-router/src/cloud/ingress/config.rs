@@ -47,11 +47,20 @@
 //! 也不能由租户自己的管理员通过控制面改（否则一所学校的管理员可以把自己从 `child_edu` 改成 `adult` 来绕过
 //! 儿童保护）。所以它在运维控制的这份配置里，由租户账户 id 索引；改它要改文件、重启，没有任何网络入口能动它。
 //! 一个租户没有在这里声明，它的请求一律被拒（403 `tenant_not_provisioned`）：不知道用什么标准处理数据，就不处理。
+//!
+//! # 声明了 `child_edu` 的租户：衔接 S6 的儿童安全管线
+//!
+//! 这里声明的 `data_classes` 原样变成 S4 处理函数拿到的 `CallerPolicy.tenant`，进 `CloudCall.tenant`，S6 的执行器看
+//! `call.tenant.handles_child_data()` 决定走不走儿童管线。所以声明了 `child_edu` 的租户，经云入口来的每个请求都走管线，
+//! 请求里写什么都关不掉它。启动时这些租户和静态调用方簿里的儿童调用方一样，要过云上游配置的 S6 校验：
+//! 必须有 `safety:` 段、LLM 检查端点要满足它们每一个的区域 / 留存 / DPA、只用规则检查器要留警告；进程还要做
+//! 「正文不落盘」的加固（见 [`IngressConfig::tenant_policies`]）。
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::time::Duration;
 
+use crate::cloud::config::IngressTenant;
 use idoris_compute_contracts::ids::AccountId;
 use idoris_compute_contracts::permit::{Billing, DataClass, Region, Retention, TenantDataPolicy};
 use serde::Deserialize;
@@ -286,6 +295,36 @@ impl IngressConfig {
         self.tenants.values()
     }
 
+    /// 是否声明了处理儿童数据（`data_classes` 含 `child_edu`）的租户。有的话：云上游必须配置 `safety:`（儿童安全管线是
+    /// 这些租户的请求一定会走的路，见 `cloud::safety`），进程要做「正文不落盘」的加固（关 core dump、panic 信息脱敏）。
+    pub fn has_child_data_tenants(&self) -> bool {
+        self.tenants
+            .values()
+            .any(|tenant| tenant.data.handles_child_data())
+    }
+
+    /// 全部租户的数据处理要求，给云上游配置的 S6 启动校验用：它们不在静态调用方簿里，但数据处理要求同样决定走不走
+    /// 儿童安全管线（`handles_child_data()`），其中的儿童租户要和簿里的儿童调用方一起过校验、一起出现在启动日志里。
+    pub fn tenant_policies(&self) -> Vec<IngressTenant> {
+        self.tenants
+            .values()
+            .map(|tenant| IngressTenant {
+                name: tenant.account.to_string(),
+                policy: tenant.data.clone(),
+            })
+            .collect()
+    }
+
+    /// 读环境变量 [`CONFIG_ENV`] 指向的文件。**云形态必须配**：没设就是启动错误。
+    pub fn from_env() -> Result<Self, String> {
+        let Some(path) = crate::config::optional_env_path(CONFIG_ENV)? else {
+            return Err(format!(
+                "云形态（IDORIS_FORM=cloud）必须设置 {CONFIG_ENV}：它声明受信反向代理、各级上限、防滥用和每个租户的数据处理要求"
+            ));
+        };
+        Self::load(&path)
+    }
+
     /// 从 YAML 文本构造并校验。
     pub fn parse(text: &str) -> Result<Self, String> {
         let file: IngressFile =
@@ -518,6 +557,37 @@ tenants:
             config.default_limits
         );
         assert_eq!(config.tenants().count(), 2);
+    }
+
+    #[test]
+    fn child_data_tenants_are_found_by_their_declared_data_classes_alone() {
+        // 只有 adult 租户：没有儿童租户，不要求 safety、不加固
+        let adult_only = IngressConfig::parse(MINIMAL).unwrap();
+        assert!(!adult_only.has_child_data_tenants());
+        assert!(
+            adult_only
+                .tenant_policies()
+                .iter()
+                .all(|tenant| !tenant.policy.handles_child_data())
+        );
+        // eduai 声明了 child_edu：只有它是儿童租户；交给云上游配置的是它的数据策略（ZDR + 已签 DPA 是 child_edu 固定的）
+        let config = IngressConfig::parse(FULL).unwrap();
+        assert!(config.has_child_data_tenants());
+        let all = config.tenant_policies();
+        assert_eq!(all.len(), 2, "every declared tenant is handed over");
+        let children: Vec<_> = all
+            .iter()
+            .filter(|tenant| tenant.policy.handles_child_data())
+            .collect();
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].name, "eduai");
+        assert!(children[0].policy.handles_child_data());
+        assert_eq!(children[0].policy.effective_max_retention(), Retention::Zdr);
+        assert!(children[0].policy.effective_require_dpa());
+        // 一个租户既声明 child_edu 又声明 adult：只要含 child_edu 就是儿童租户（数据类别是并集，取最严的）
+        let mixed =
+            IngressConfig::parse(&MINIMAL.replace("[adult]", "[adult, child_edu]")).unwrap();
+        assert!(mixed.has_child_data_tenants());
     }
 
     #[test]
