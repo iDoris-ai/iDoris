@@ -19,6 +19,7 @@
 //!   [`remote::CredentialSource`] only).
 
 pub mod chat;
+pub mod cloud;
 pub mod detect;
 pub mod error;
 pub mod factory;
