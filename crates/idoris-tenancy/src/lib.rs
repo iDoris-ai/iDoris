@@ -50,3 +50,8 @@ pub(crate) mod test_support;
 /// idoris.ai/api 计算服务 S4：每次请求的每次尝试、转移日志与结算分录（SQLite，只追加），
 /// 持久化 S0 契约（`idoris-compute-contracts`）的状态机与结算计划。
 pub mod attempts;
+
+/// idoris.ai/api 计算服务 S7：本机云端档的调用记录与对账游标（SQLite，只追加）：本机请求 id 与云端
+/// `X-iDoris-Record-Id` 的对应关系，加上云端报告的 token 用量；没有余额、没有额度、没有正文。
+/// 只有配置了云端档才会打开，默认不碰数据库文件。
+pub mod cloud_tier;

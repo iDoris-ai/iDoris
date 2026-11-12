@@ -168,6 +168,16 @@ async fn real_main() -> u8 {
                 return 1;
             }
         }
+        // Device side of the cloud-account pairing (compute service S7). Reads and writes only the device credential
+        // file; opens no database, touches no Admin or local-key state.
+        cli::Command::Cloud(command) => match idoris_router::cloud_tier::cli::run(command).await {
+            Ok(0) => {}
+            Ok(code) => return code,
+            Err(message) => {
+                eprintln!("[idoris] {message}");
+                return 1;
+            }
+        },
     }
     0
 }
@@ -539,6 +549,24 @@ async fn run(options: cli::ServeOptions) -> Result<(), String> {
     state.cloud =
         idoris_router::cloud::CloudUpstream::from_env_for_form(&startup_form, &ingress_tenants)?;
     state.control = control;
+    // idoris.ai/api cloud tier (S7): default off. Unset (`IDORIS_CLOUD_TIER_CONFIG`) = nothing is read, opened or sent and
+    // every existing behaviour is byte-for-byte as before. Set = the local node may fall back to the cloud for requests
+    // that are `any`, explicitly consented and not servable locally. No network request is made at start-up.
+    {
+        let local_key_probe: Arc<dyn idoris_router::cloud_tier::LocalSecretProbe> = Arc::new(
+            idoris_router::cloud_tier::VirtualKeyProbe(persistent.virtual_keys.clone()),
+        );
+        state.cloud_tier = idoris_router::cloud_tier::CloudTier::from_env_for_form(
+            &startup_form,
+            Some(local_key_probe),
+        )?;
+        if let Some(tier) = &state.cloud_tier {
+            eprintln!(
+                "[idoris] 云端档已启用：{}（只在调用方带 X-iDoris-Cloud-Fallback: allow、隐私为 any、本机服务不了时才会出网；local_only 永不出网）",
+                tier.config().origin()
+            );
+        }
+    }
     // S6（儿童安全）：配置里有处理儿童数据的租户时，进程要保证正文只在内存里：
     // 旧代理路径对这些租户关闭响应缓存；panic 信息脱敏（只打位置，不打 payload）；关闭 core dump。
     // 任何一步做不到就拒绝启动（失败即关闭）。
