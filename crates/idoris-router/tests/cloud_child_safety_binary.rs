@@ -31,7 +31,10 @@ use child_safety::{
     content_needles, files_under, harmful_question, judge_allow,
 };
 use fake_upstream::{Behavior, FakeUpstream};
-use harness::{Caller, Endpoint, Options};
+use harness::{Caller, Endpoint, LedgerFunds, Options, seed_ledger};
+use idoris_compute_contracts::ids::{AttemptId, AttemptIndex, RequestId};
+use idoris_tenancy::accounts::AccountStore;
+use idoris_tenancy::accounts::ledger::HoldState;
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
@@ -247,6 +250,23 @@ impl Fixture {
         }
     }
 
+    /// 账户存储（S3 的账本）里的付款账户和凭证：云配置里的 `acct-default` / `cred-acct-default`。准入只认账户库里有的付款人
+    /// （`CloudUpstream::from_file` 不接受账户库里没有对应账户的静态调用方），所以起进程之前要先播种：
+    /// `platform` -> `acct-default`，一张节点凭证，充值。账户、凭证、充值行都不含正文。
+    fn seed_accounts(&self) {
+        let accounts = AccountStore::open(self.db()).unwrap();
+        seed_ledger(
+            &accounts,
+            &[Caller {
+                tenant_id: Some("eduai"),
+                ..Caller::child_edu()
+            }],
+            LedgerFunds {
+                micros: 1_000_000_000,
+            },
+        );
+    }
+
     /// 用 `idoris key issue --spec-stdin` 给租户 eduai 发一把虚拟 key，返回明文密钥。
     fn issue_key(&self) -> String {
         let mut cmd = self.command(&[]);
@@ -315,6 +335,8 @@ async fn wait_healthy(child: &mut Running, port: u16) -> reqwest::Client {
 struct Reply {
     status: u16,
     reason: Option<String>,
+    /// 服务端给这次请求的记录号（`X-iDoris-Record-Id`），账本里的预留用它做身份。
+    request_id: Option<String>,
     json: Value,
     raw: Vec<u8>,
 }
@@ -340,10 +362,15 @@ async fn chat(
         .headers()
         .get("x-idoris-reason")
         .map(|v| v.to_str().unwrap().to_string());
+    let request_id = response
+        .headers()
+        .get("x-idoris-record-id")
+        .map(|v| v.to_str().unwrap().to_string());
     let raw = response.bytes().await.unwrap().to_vec();
     Reply {
         status,
         reason,
+        request_id,
         json: serde_json::from_slice(&raw).unwrap_or(Value::Null),
         raw,
     }
@@ -488,6 +515,7 @@ async fn through_the_real_process_nothing_of_the_child_or_the_answer_is_written_
     .await;
     let cloud = f.cloud_config(&main.url(), &judge.url(), &child_safety::judge_yaml(700));
     let secret = f.issue_key();
+    f.seed_accounts();
     let (port, admin) = (free_port(), free_port());
     let env = f.server_env(port, admin, &tenants, &cloud);
     let mut server = f.spawn(&env);
@@ -506,6 +534,7 @@ async fn through_the_real_process_nothing_of_the_child_or_the_answer_is_written_
     .await;
     assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.raw));
     assert_eq!(r.json["choices"][0]["message"]["content"], "สี่");
+    let mut ids: Vec<String> = vec![r.request_id.clone().unwrap()];
 
     // 场景 2：输入被规则拒绝（LLM 不会被调用，所以不消耗检查服务的脚本）
     let r = chat(
@@ -521,6 +550,7 @@ async fn through_the_real_process_nothing_of_the_child_or_the_answer_is_written_
     assert_eq!(r.json["error"]["type"], "safety_input_blocked");
     assert_eq!(r.reason.as_deref(), Some("safety_input_blocked"));
     assert!(!contains(&r.raw, CHILD_SENTINEL));
+    ids.push(r.request_id.clone().unwrap());
 
     // 场景 2b：输入检查（LLM）放行，输出被规则拒绝（有害回答），LLM 的输出检查不会被调用
     let r = chat(
@@ -535,6 +565,7 @@ async fn through_the_real_process_nothing_of_the_child_or_the_answer_is_written_
     assert_eq!(r.status, 422, "{}", String::from_utf8_lossy(&r.raw));
     assert_eq!(r.json["error"]["type"], "safety_output_blocked");
     assert!(!contains(&r.raw, ANSWER_SENTINEL));
+    ids.push(r.request_id.clone().unwrap());
 
     // 场景 3：输入放行，输出阶段安全服务超时：回答存在过，客户端什么都没收到
     let r = chat(
@@ -550,6 +581,7 @@ async fn through_the_real_process_nothing_of_the_child_or_the_answer_is_written_
     assert_eq!(r.json["error"]["type"], "safety_unavailable");
     assert_eq!(r.json["error"]["stage"], "output");
     assert!(!contains(&r.raw, ANSWER_SENTINEL));
+    ids.push(r.request_id.clone().unwrap());
 
     // 场景 4：输入放行，上游 500（错误正文回显孩子的话）
     let r = chat(
@@ -563,6 +595,7 @@ async fn through_the_real_process_nothing_of_the_child_or_the_answer_is_written_
     .await;
     assert_eq!(r.status, 502, "{}", String::from_utf8_lossy(&r.raw));
     assert!(!contains(&r.raw, CHILD_SENTINEL));
+    ids.push(r.request_id.clone().unwrap());
 
     // 场景 5：输入阶段安全服务超时
     let r = chat(
@@ -576,6 +609,7 @@ async fn through_the_real_process_nothing_of_the_child_or_the_answer_is_written_
     .await;
     assert_eq!(r.status, 503);
     assert_eq!(r.json["error"]["stage"], "input");
+    ids.push(r.request_id.clone().unwrap());
 
     // 绕过：流式、旧路由、不带租户头、错误的密钥、冒用别的租户
     let mut streaming = child_body(&benign_question());
@@ -674,5 +708,42 @@ async fn through_the_real_process_nothing_of_the_child_or_the_answer_is_written_
             );
         }
         assert!(!stderr.contains(secret_text) && !stdout.contains(secret_text));
+    }
+
+    // 最后才读账本（读完最后一个连接关闭会做 WAL 检查点，所以要在上面的扫描之后）：真实进程里安全检查的成本确实走了账本，
+    // 每个阶段的预留都收了尾，没有留着不关的。场景顺序：成功 / 规则拦输入 / 规则拦输出 / 输出阶段检查服务超时 / 上游 500 / 输入阶段超时
+    let accounts = AccountStore::open(f.db()).unwrap();
+    let state = |id: &str, component: &str| {
+        accounts
+            .hold(
+                &AttemptId::new(RequestId::new(id).unwrap(), AttemptIndex(0)),
+                component,
+            )
+            .unwrap()
+            .map(|row| row.state)
+    };
+    use HoldState::{Released, Settled};
+    let expected = [
+        // (输入检查, 输出检查, 回答本身)
+        (Some(Settled), Some(Settled), Some(Settled)),
+        (Some(Released), None, None),
+        (Some(Settled), Some(Released), Some(Released)),
+        (Some(Settled), Some(Released), Some(Released)),
+        (Some(Settled), None, Some(Released)),
+        (Some(Released), None, None),
+    ];
+    assert_eq!(ids.len(), expected.len());
+    for (n, (id, (input, output, model))) in ids.iter().zip(expected).enumerate() {
+        assert_eq!(
+            state(id, "safety_input"),
+            input,
+            "scenario {n}: input check"
+        );
+        assert_eq!(
+            state(id, "safety_output"),
+            output,
+            "scenario {n}: output check"
+        );
+        assert_eq!(state(id, "model"), model, "scenario {n}: the answer itself");
     }
 }

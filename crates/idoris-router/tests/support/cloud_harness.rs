@@ -10,15 +10,21 @@ use axum::Router;
 use axum::body::Body;
 use axum::http::{HeaderMap, Request, Response, StatusCode};
 use http_body_util::BodyExt;
+use idoris_compute_contracts::account::{Account, AccountKind, AccountStatus};
 use idoris_compute_contracts::admission::AdmissionDecision;
-use idoris_compute_contracts::ids::{RequestId, TimestampMs};
+use idoris_compute_contracts::credential::{Credential, CredentialBinding, CredentialStatus};
+use idoris_compute_contracts::ids::{
+    AccountId, CredentialId, IdempotencyKey, RequestId, TimestampMs,
+};
+use idoris_compute_contracts::money::{Money, Unit};
 use idoris_compute_contracts::reason::ReasonCode;
 use idoris_router::cloud::config::{self};
 use idoris_router::cloud::{
     AdmissionError, AdmissionRequest, CandidateAdmission, CloudUpstream, ExtraCostMeter,
-    ManualClock, SafetyGate, SimpleAdmission,
+    LedgerAdmission, ManualClock, SafetyGate, SimpleAdmission,
 };
 use idoris_router::{AppState, build_app};
+use idoris_tenancy::accounts::AccountStore;
 use idoris_tenancy::attempts::AttemptStore;
 use serde_json::{Value, json};
 use tower::ServiceExt;
@@ -174,6 +180,16 @@ pub struct Options {
     pub state: Option<Box<dyn FnOnce(AppState) -> AppState>>,
     /// 提前造好的时钟（测试要在准入钩子里拨它）；默认新建一个停在 [`NOW_MS`] 的。
     pub clock: Option<Arc<ManualClock>>,
+    /// 用 S3 的真实账本代替 S4 的简单准入：准入走 `LedgerAdmission`，尝试记录装账本钩子，安全检查的成本走
+    /// `LedgerExtraCost`；账户存储与尝试记录库共用同一个文件，和生产装配一样。`None` = 原来的简单准入（S4 的测试都用它）。
+    pub ledger: Option<LedgerFunds>,
+}
+
+/// 真实账本的夹具：每个调用方一个组织账户（`platform` 的子账户）+ 一张节点凭证（`cred-<payer>`，和夹具的静态调用方簿一致）。
+#[derive(Debug, Clone, Copy)]
+pub struct LedgerFunds {
+    /// 每个付款账户充值多少微单位（0 = 不充值：可用额度是 0，什么都放不下）。
+    pub micros: i64,
 }
 
 impl Default for Options {
@@ -188,6 +204,7 @@ impl Default for Options {
             routes: None,
             state: None,
             clock: None,
+            ledger: None,
         }
     }
 }
@@ -304,6 +321,14 @@ pub fn config_yaml(endpoints: &[Endpoint], key_file: &str, options: &Options) ->
 }
 
 pub fn build(endpoints: Vec<Endpoint>, options: Options) -> Harness {
+    build_with_accounts(endpoints, options).0
+}
+
+/// 同 [`build`]，另外返回真实账本的账户存储（[`Options::ledger`] 打开时才有）：测试用它读预留、分录、告警。
+pub fn build_with_accounts(
+    endpoints: Vec<Endpoint>,
+    options: Options,
+) -> (Harness, Option<Arc<AccountStore>>) {
     let dir = tempfile::tempdir().unwrap();
     let key_file = dir.path().join("upstream.key");
     std::fs::write(&key_file, format!("{KEY}\n")).unwrap();
@@ -323,17 +348,30 @@ pub fn build(endpoints: Vec<Endpoint>, options: Options) -> Harness {
         parts.safety = None;
     }
     let db_path = dir.path().join("idoris.sqlite3");
+    // 账户存储（含账本）与尝试记录存储共用同一个库文件，先开账户存储：和 `CloudUpstream::from_file` 同一个顺序
+    let accounts = options
+        .ledger
+        .map(|_| Arc::new(AccountStore::open(&db_path).unwrap()));
     let store = Arc::new(AttemptStore::open(&db_path).unwrap());
-    let admission = options
-        .admission
-        .clone()
-        .unwrap_or_else(|| Arc::new(SimpleAdmission));
+    if let (Some(accounts), Some(funds)) = (&accounts, options.ledger) {
+        store
+            .install_ledger_hook(accounts.attempt_ledger_hook())
+            .unwrap();
+        seed_ledger(accounts, &options.callers, funds);
+    }
+    let admission: Arc<dyn CandidateAdmission> = match (&options.admission, &accounts) {
+        (Some(admission), _) => admission.clone(),
+        (None, Some(accounts)) => Arc::new(LedgerAdmission::new(accounts.clone())),
+        (None, None) => Arc::new(SimpleAdmission),
+    };
     let mut cloud = CloudUpstream::new(parts, store.clone(), clock.clone(), admission);
     if let SafetyOption::Gate(gate) = options.safety {
         cloud = cloud.with_safety(gate);
     }
     if let Some(meter) = options.extra_cost {
         cloud = cloud.with_extra_cost_meter(meter);
+    } else if let Some(accounts) = &accounts {
+        cloud = cloud.with_ledger_extra_cost(accounts.clone());
     }
     let cloud = Arc::new(cloud);
     let mut state = AppState {
@@ -343,13 +381,90 @@ pub fn build(endpoints: Vec<Endpoint>, options: Options) -> Harness {
     if let Some(tweak) = options.state {
         state = tweak(state);
     }
-    Harness {
-        app: build_app(state),
-        cloud,
-        store,
-        clock,
-        db_path,
-        dir,
+    (
+        Harness {
+            app: build_app(state),
+            cloud,
+            store,
+            clock,
+            db_path,
+            dir,
+        },
+        accounts,
+    )
+}
+
+fn unit_of(text: &str) -> Unit {
+    match text {
+        "THB" => Unit::Thb,
+        "USD" => Unit::Usd,
+        other => panic!("the ledger fixture only knows THB and USD, not {other}"),
+    }
+}
+
+/// 账户树和凭证：`platform` -> 每个调用方一个组织账户（去重），一张节点凭证，充值。
+pub fn seed_ledger(accounts: &AccountStore, callers: &[Caller], funds: LedgerFunds) {
+    let now = TimestampMs(NOW_MS);
+    let platform = AccountId::new("platform").unwrap();
+    let platform_unit = callers
+        .first()
+        .map_or(Unit::Thb, |caller| unit_of(caller.unit));
+    accounts
+        .create_account(
+            &Account {
+                id: platform.clone(),
+                kind: AccountKind::Platform,
+                parent: None,
+                unit: platform_unit,
+                status: AccountStatus::Active,
+            },
+            now,
+        )
+        .unwrap();
+    let mut seen = BTreeSet::new();
+    for caller in callers {
+        if !seen.insert(caller.payer) {
+            continue;
+        }
+        let payer = AccountId::new(caller.payer).unwrap();
+        let unit = unit_of(caller.unit);
+        accounts
+            .create_account(
+                &Account {
+                    id: payer.clone(),
+                    kind: AccountKind::Org,
+                    parent: Some(platform.clone()),
+                    unit: unit.clone(),
+                    status: AccountStatus::Active,
+                },
+                now,
+            )
+            .unwrap();
+        accounts
+            .create_credential(
+                &Credential::new(
+                    CredentialId::new(format!("cred-{}", caller.payer)).unwrap(),
+                    CredentialBinding::Node {
+                        account: payer.clone(),
+                    },
+                    CredentialStatus::Active,
+                    None,
+                    Vec::new(),
+                )
+                .unwrap(),
+                now,
+            )
+            .unwrap();
+        if funds.micros > 0 {
+            accounts
+                .fund_account(
+                    &payer,
+                    &Money::new(unit, funds.micros),
+                    &IdempotencyKey::new(format!("fund-{}", caller.payer)).unwrap(),
+                    now,
+                )
+                .unwrap();
+        }
     }
 }
 

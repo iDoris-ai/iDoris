@@ -10,10 +10,11 @@ use idoris_router::cloud::safety::{
     RuleChecker,
 };
 use idoris_router::cloud::{SafetyChecker, SafetyGate, SafetyLimits, SimpleExtraCost};
+use idoris_tenancy::accounts::AccountStore;
 use serde_json::{Value, json};
 
 use super::fake_upstream::{Behavior, FakeUpstream, completion, usage};
-use super::harness::{Caller, Endpoint, Harness, Options, build};
+use super::harness::{Caller, Endpoint, Harness, Options, build, build_with_accounts};
 
 /// 孩子写在提示里的独一无二的哨兵：它不该出现在任何数据库文件、日志、响应、错误里（除了被明确允许的地方）。
 pub const CHILD_SENTINEL: &str = "CHILDINPUT-SENTINEL-4f81c2d7";
@@ -155,6 +156,8 @@ pub struct Child {
     pub h: Harness,
     pub main: FakeUpstream,
     pub judge: FakeUpstream,
+    /// 真实账本的账户存储（`Options::ledger` 打开时才有）。
+    pub accounts: Option<Arc<AccountStore>>,
 }
 
 /// 主上游脚本 + 检查服务脚本。`judge_timeout_ms` 是一个阶段的检查预算。
@@ -182,14 +185,19 @@ pub async fn child_with(
         ..Options::default()
     };
     tweak(&mut options);
-    let h = build(
+    let (h, accounts) = build_with_accounts(
         vec![
             Endpoint::child_edu_compliant("example-zdr", main.url()),
             Endpoint::child_edu_compliant("example-judge", judge.url()),
         ],
         options,
     );
-    Child { h, main, judge }
+    Child {
+        h,
+        main,
+        judge,
+        accounts,
+    }
 }
 
 /// 只有规则检查器的儿童租户（没有 LLM）。
