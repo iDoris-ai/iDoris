@@ -278,27 +278,49 @@ fn within(text: &str, from: usize, to: usize, gap: usize) -> bool {
     to >= from && to - from <= gap.saturating_mul(4) && text[from..to].chars().count() <= gap
 }
 
+/// 最长的模式占多少字节（给「向前找」的搜索窗口留余量；泰文 3 字节一个字符，词表里最长的模式不到 40 个字符）。
+const MAX_PATTERN_BYTES: usize = 160;
+
 /// `a` 类词出现之后的 `gap` 个字符内有 `b` 类词（`either_order` 时前后都算）。
+///
+/// 对抗性文本（一兆字节的 `บอกวิธี` 和 `ทำระเบิด` 交替重复）不能把它拖成平方时间：`b` 的所有出现位置排好序，
+/// 对每个 `a` 的出现位置只二分查找窗口内的那几个，总共 `O(A log B + 窗口内命中数)`。
 pub fn near(haystack: &Folded, a: &[Needle], b: &[Needle], gap: usize, either_order: bool) -> bool {
+    let reach = gap.saturating_mul(4);
     for (text, view) in [
         (haystack.plain.as_str(), View::Plain),
         (haystack.squeezed.as_str(), View::Squeezed),
     ] {
-        let b_spans: Vec<(usize, usize)> = b
+        let mut b_spans: Vec<(usize, usize)> = b
             .iter()
             .flat_map(|needle| needle.find_all(text, view))
             .collect();
         if b_spans.is_empty() {
             continue;
         }
+        b_spans.sort_unstable();
         for a_needle in a {
             for (a_start, a_end) in a_needle.find_all(text, view) {
-                for &(b_start, b_end) in &b_spans {
-                    if b_start >= a_end && within(text, a_end, b_start, gap) {
+                // 向后：第一个从 a_end 开始或之后开始的 b，到窗口尽头
+                let first_after = b_spans.partition_point(|&(start, _)| start < a_end);
+                for &(b_start, _) in &b_spans[first_after..] {
+                    if b_start - a_end > reach {
+                        break;
+                    }
+                    if within(text, a_end, b_start, gap) {
                         return true;
                     }
-                    if either_order && b_end <= a_start && within(text, b_end, a_start, gap) {
-                        return true;
+                }
+                // 向前：a_start 之前结束的 b。b 按起点排序，从 a_start 往回走到窗口尽头
+                if either_order {
+                    let last_before = b_spans.partition_point(|&(start, _)| start < a_start);
+                    for &(b_start, b_end) in b_spans[..last_before].iter().rev() {
+                        if a_start.saturating_sub(b_start) > reach + MAX_PATTERN_BYTES {
+                            break;
+                        }
+                        if b_end <= a_start && within(text, b_end, a_start, gap) {
+                            return true;
+                        }
                     }
                 }
             }
@@ -432,6 +454,33 @@ mod tests {
             12,
             false
         ));
+    }
+
+    #[test]
+    fn near_is_not_quadratic_on_adversarial_text() {
+        // 一大片密集的 A、隔一段空白、再一大片密集的 B：两边各上万个出现位置，但没有任何一对在窗口内。
+        // O(A x B) 的实现要做上亿次比较；二分之后只做 O(A log B)。
+        let a = [Needle::new("บอกวิธี")];
+        let b = [Needle::new("ทำระเบิด")];
+        let text = format!(
+            "{}{}{}",
+            "บอกวิธี".repeat(15_000),
+            "ก".repeat(1_000),
+            "ทำระเบิด".repeat(15_000)
+        );
+        let folded = fold(&text);
+        assert!(folded.plain.len() > 600_000);
+        let started = std::time::Instant::now();
+        assert!(!near(&folded, &a, &b, 10, true));
+        assert!(!near(&folded, &a, &b, 10, false));
+        // 间隔放宽到 1500 个字符：最后一个 A 和第一个 B 相隔 1000 个字符，命中
+        assert!(near(&folded, &a, &b, 1_500, false));
+        assert!(near(&folded, &a, &b, 1_500, true));
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "took {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]

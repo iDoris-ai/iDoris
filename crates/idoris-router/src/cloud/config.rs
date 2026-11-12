@@ -407,6 +407,24 @@ impl CallerBook {
             .any(|caller| caller.tenant.handles_child_data())
     }
 
+    /// 启动日志用：(处理儿童数据的调用方, 其它调用方)。只有租户标识，没有任何内容；默认调用方写成 `(default)`。
+    pub fn caller_summary(&self) -> (Vec<String>, Vec<String>) {
+        let (mut child, mut other) = (Vec::new(), Vec::new());
+        let named = self
+            .by_tenant
+            .iter()
+            .map(|(tenant, caller)| (tenant.as_str(), caller));
+        let default = self.default.iter().map(|caller| ("(default)", caller));
+        for (name, caller) in named.chain(default) {
+            if caller.tenant.handles_child_data() {
+                child.push(name.to_string());
+            } else {
+                other.push(name.to_string());
+            }
+        }
+        (child, other)
+    }
+
     /// 处理儿童数据的调用方的租户标识，格式与 `ChatProxy` 的缓存键里的租户范围一致：
     /// 有租户的就是租户 id；默认调用方（没有租户）是 `"\u{0}personal"`。
     /// 用来关掉这些租户在旧代理路径上的响应缓存（S6：edu 关缓存）。

@@ -987,11 +987,20 @@ pub(crate) struct PersonalSpans {
     emails: BTreeSet<String>,
     /// 孩子标明了身份的姓名、学校、住址（折叠后的 `plain` 形式）。
     labelled: BTreeSet<String>,
+    /// 标明了身份的片段多到超过 [`MAX_LABELLED_SPANS`]：这是垃圾输入（也可能是想把检查拖慢），
+    /// 不再逐个收集，输出检查按失败即关闭处理（直接拒绝）。
+    overflow: bool,
 }
+
+/// 最多收集多少个标明了身份的片段（每个都要在输出里查一遍，不能让输入决定检查的代价）。
+const MAX_LABELLED_SPANS: usize = 64;
 
 impl PersonalSpans {
     pub(crate) fn is_empty(&self) -> bool {
-        self.phones.is_empty() && self.emails.is_empty() && self.labelled.is_empty()
+        self.phones.is_empty()
+            && self.emails.is_empty()
+            && self.labelled.is_empty()
+            && !self.overflow
     }
 }
 
@@ -1145,6 +1154,10 @@ pub(crate) fn personal_spans<'a>(texts: impl Iterator<Item = &'a str>) -> Person
                 {
                     continue;
                 }
+                if spans.labelled.len() >= MAX_LABELLED_SPANS && !spans.labelled.contains(&value) {
+                    spans.overflow = true;
+                    continue;
+                }
                 spans.labelled.insert(value);
             }
         }
@@ -1159,6 +1172,9 @@ pub(crate) fn echoes_personal_info<'a>(
 ) -> bool {
     if spans.is_empty() {
         return false;
+    }
+    if spans.overflow {
+        return true;
     }
     for text in output_texts {
         let folded = fold(text);

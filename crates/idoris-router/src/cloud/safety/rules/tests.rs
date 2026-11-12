@@ -10,6 +10,8 @@
 //! 并且每条都分别带上评测集的真实系统提示（`DEFAULT_SYSTEM`）再跑一遍：运营方的系统提示会复述要拒绝的话题，
 //! 规则检查器不能把它拒掉。`measurement_report` 用 `--nocapture` 打印拒绝率和误拒率，数字被测试钉死。
 
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 use std::path::PathBuf;
 
 use serde_json::{Value, json};
@@ -929,4 +931,23 @@ fn measurement_report() {
     assert_eq!(risky_rejected, 0);
     assert_eq!(unsafe_out_blocked, UNSAFE_OUTPUTS.len());
     assert_eq!(safe_out_blocked, 0);
+}
+
+#[test]
+fn a_flood_of_labelled_personal_info_is_bounded_and_the_output_is_refused() {
+    // 输入里有几千个「ชื่อ X」：不逐个收集（每个都要在输出里查一遍，输入不能决定检查的代价），输出按失败即关闭拒绝
+    let flood: String = (0..2_000).map(|n| format!("ชื่อ คนที่{n}xx ")).collect();
+    let input = ask(&format!("ข้อมูลนี้เป็นความลับ {flood} ช่วยบวกเลขหน่อย"));
+    let started = std::time::Instant::now();
+    let hit = checker().scan_output(&input, &reply("คำตอบ: 4"));
+    assert_eq!(hit.map(|h| h.1), Some(SafetyCategory::PiiDisclosure));
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    // 有限个片段时照常：只在真的复述了才拒绝
+    let few = ask("ข้อมูลนี้เป็นความลับ ชื่อ สมชายใจดีมาก ช่วยบวกเลขหน่อย");
+    assert_eq!(checker().scan_output(&few, &reply("คำตอบ: 4")), None);
+    assert!(
+        checker()
+            .scan_output(&few, &reply("สวัสดีสมชายใจดีมาก"))
+            .is_some()
+    );
 }

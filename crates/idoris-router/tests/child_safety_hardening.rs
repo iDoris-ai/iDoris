@@ -26,12 +26,16 @@ fn panic_reports_carry_the_location_and_never_the_payload_and_core_dumps_are_off
     let _ = std::panic::catch_unwind(|| panic!("{SECRET}"));
     let _ = std::panic::catch_unwind(|| panic!("literal {} formatted", SECRET));
     let _ = std::panic::catch_unwind(|| {
-        let result: Result<(), String> = Err(SECRET.to_string());
-        result.unwrap();
+        fn fails() -> Result<(), String> {
+            Err(SECRET.to_string())
+        }
+        fails().unwrap();
     });
     let _ = std::panic::catch_unwind(|| {
-        let none: Option<u8> = None;
-        none.expect(SECRET);
+        fn nothing() -> Option<u8> {
+            None
+        }
+        nothing().expect(SECRET);
     });
     let _ = std::panic::catch_unwind(|| {
         assert_eq!(SECRET, "something else entirely");

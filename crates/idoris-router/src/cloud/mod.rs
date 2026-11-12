@@ -212,6 +212,20 @@ impl CloudUpstream {
     pub fn from_file(path: &Path, db_path: &Path) -> Result<Self, String> {
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
         let parts = config::load(path, clock.now())?;
+        // 启动日志：哪些调用方走儿童安全管线（只有租户标识）。运营方一眼能核对「edu 租户的属性确实是 child_edu」
+        let (child, other) = parts.callers.caller_summary();
+        eprintln!(
+            "[idoris] cloud: child-data callers (safety pipeline ON): [{}]; other callers (no safety pipeline): [{}]; safety: {}",
+            child.join(", "),
+            other.join(", "),
+            parts
+                .safety
+                .as_ref()
+                .map_or("not configured", |safety| match safety.mode {
+                    safety::config::SafetyMode::RulesOnly => "rules_only",
+                    safety::config::SafetyMode::RulesAndLlm => "rules_and_llm",
+                })
+        );
         if let Some(safety) = &parts.safety {
             for warning in &safety.warnings {
                 eprintln!("[idoris] cloud: {warning}");

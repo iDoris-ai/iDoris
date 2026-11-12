@@ -561,13 +561,23 @@ fn the_safety_section_rules() {
     let child = [Caller::child_edu()];
     let both = [main.clone(), judge];
     // 有儿童调用方却没有 safety 段：加载失败
-    let error = load(&[main.clone()], &child, "").unwrap_err();
+    let error = load(std::slice::from_ref(&main), &child, "").unwrap_err();
     assert!(error.contains("必须配置 safety"), "{error}");
     // mode 必填：没有默认值（只用规则检查器必须是显式的选择）
-    let error = load(&[main.clone()], &child, "safety:\n  timeout_ms: 1000\n").unwrap_err();
+    let error = load(
+        std::slice::from_ref(&main),
+        &child,
+        "safety:\n  timeout_ms: 1000\n",
+    )
+    .unwrap_err();
     assert!(error.contains("mode"), "{error}");
     // rules_only 可以，不能同时写 llm_judge
-    load(&[main.clone()], &child, "safety:\n  mode: rules_only\n").unwrap();
+    load(
+        std::slice::from_ref(&main),
+        &child,
+        "safety:\n  mode: rules_only\n",
+    )
+    .unwrap();
     let error = load(
         &both,
         &child,
@@ -576,10 +586,15 @@ fn the_safety_section_rules() {
     .unwrap_err();
     assert!(error.contains("不能同时配置 llm_judge"), "{error}");
     // rules_and_llm 必须有 llm_judge
-    let error = load(&[main.clone()], &child, "safety:\n  mode: rules_and_llm\n").unwrap_err();
+    let error = load(
+        std::slice::from_ref(&main),
+        &child,
+        "safety:\n  mode: rules_and_llm\n",
+    )
+    .unwrap_err();
     assert!(error.contains("必须配置 llm_judge"), "{error}");
     // LLM 检查端点必须在 endpoints 里配置
-    let error = load(&[main.clone()], &child, &judge_yaml(1_000)).unwrap_err();
+    let error = load(std::slice::from_ref(&main), &child, &judge_yaml(1_000)).unwrap_err();
     assert!(error.contains("不在端点许可表里"), "{error}");
     // 上限
     for yaml in [
@@ -588,10 +603,13 @@ fn the_safety_section_rules() {
         "safety:\n  mode: rules_only\n  max_input_bytes: 0\n",
         "safety:\n  mode: rules_only\n  surprise: true\n",
     ] {
-        assert!(load(&[main.clone()], &child, yaml).is_err(), "{yaml}");
+        assert!(
+            load(std::slice::from_ref(&main), &child, yaml).is_err(),
+            "{yaml}"
+        );
     }
     // 没有儿童调用方时，safety 段可以没有；有也行（成人租户不受影响）
-    load(&[main.clone()], &[Caller::adult_default()], "").unwrap();
+    load(std::slice::from_ref(&main), &[Caller::adult_default()], "").unwrap();
     load(
         &[main],
         &[Caller::adult_default()],

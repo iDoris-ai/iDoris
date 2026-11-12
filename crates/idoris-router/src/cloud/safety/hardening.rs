@@ -54,6 +54,8 @@ pub fn disable_core_dumps() -> Result<(), String> {
 #[cfg(unix)]
 pub fn core_dump_limits() -> Result<(u64, u64), String> {
     use nix::sys::resource::{Resource, getrlimit};
+    // `rlim_t` 在我们构建的目标上就是 u64，但不是每个 Unix 都保证：这里统一成 u64 给调用方
+    #[allow(clippy::unnecessary_cast)]
     getrlimit(Resource::RLIMIT_CORE)
         .map(|(soft, hard)| (soft as u64, hard as u64))
         .map_err(|error| error.to_string())

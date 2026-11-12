@@ -386,7 +386,7 @@ impl CloudExecutor {
                 },
             ));
         };
-        let safety_call = SafetyCall {
+        let mut safety_call = SafetyCall {
             request_id: &call.request_id,
             payment: &call.payment,
             tenant: &call.tenant,
@@ -404,6 +404,8 @@ impl CloudExecutor {
         // 5. 完整输出检查：通过之后才把回答交给调用方发布
         match outcome {
             CloudOutcome::Complete(mut pending) => {
+                // 上游调用可能花了很久：输出检查用「现在」判断检查端点的核验有没有过期，不用请求开始时的时间
+                safety_call.now = self.clock.now();
                 match gate
                     .check_output(&safety_call, &input, pending.body())
                     .await

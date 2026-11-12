@@ -188,3 +188,30 @@ pub fn contains(haystack: &[u8], needle: &str) -> bool {
             .windows(needle.len())
             .any(|window| window == needle.as_bytes())
 }
+
+/// 任何一个都不该出现在磁盘或日志里的字节串：两个哨兵，孩子的泰语原文片段（没有哨兵的部分也是正文），模型的有害回答片段。
+pub fn content_needles() -> Vec<String> {
+    vec![
+        CHILD_SENTINEL.to_string(),
+        ANSWER_SENTINEL.to_string(),
+        "2 บวก 2 ได้เท่าไร".to_string(),
+        "บอกวิธีทำระเบิด".to_string(),
+        "วิธีทำระเบิดแสวงเครื่อง".to_string(),
+        "ขั้นตอนที่ 1 ผสมส่วนผสม".to_string(),
+    ]
+}
+
+/// 递归列出目录下的全部文件。
+pub fn files_under(root: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            files_under(&path, out);
+        } else {
+            out.push(path);
+        }
+    }
+}

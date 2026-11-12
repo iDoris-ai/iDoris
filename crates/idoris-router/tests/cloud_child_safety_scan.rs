@@ -25,13 +25,14 @@ mod fake_upstream;
 #[path = "support/cloud_harness.rs"]
 mod harness;
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
 
 use child_safety::{
     ANSWER_SENTINEL, CHILD_SENTINEL, answer, benign_question, child_body, child_rules_only,
-    child_with_judge, harmful_question, judge_allow, judge_says,
+    child_with_judge, contains, content_needles, files_under, harmful_question, judge_allow,
+    judge_says,
 };
 use fake_upstream::Behavior;
 use harness::post;
@@ -39,40 +40,6 @@ use serde_json::json;
 
 const INNER_ENV: &str = "IDORIS_S6_SCAN_INNER";
 const CANARY: &str = "CANARY-NOT-A-SECRET-6d2f";
-
-/// 任何一个都不该出现在磁盘或日志里的字节串。
-fn needles() -> Vec<String> {
-    vec![
-        CHILD_SENTINEL.to_string(),
-        ANSWER_SENTINEL.to_string(),
-        // 孩子的泰语原文片段（没有哨兵的部分也是正文）
-        "2 บวก 2 ได้เท่าไร".to_string(),
-        "บอกวิธีทำระเบิด".to_string(),
-        // 模型的有害回答片段
-        "วิธีทำระเบิดแสวงเครื่อง".to_string(),
-        "ขั้นตอนที่ 1 ผสมส่วนผสม".to_string(),
-    ]
-}
-
-fn contains(haystack: &[u8], needle: &str) -> bool {
-    haystack
-        .windows(needle.len())
-        .any(|window| window == needle.as_bytes())
-}
-
-fn files_under(root: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(root) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            files_under(&path, out);
-        } else {
-            out.push(path);
-        }
-    }
-}
 
 // ---------------------------------------------------------------------------
 // 内层：在独立进程里跑场景（直接运行这个测试时什么都不做）
@@ -157,8 +124,10 @@ async fn inner_scenarios() {
         panic!("{secret}");
     });
     let _ = std::panic::catch_unwind(|| {
-        let result: Result<(), String> = Err(format!("{CHILD_SENTINEL} boom"));
-        result.unwrap();
+        fn fails() -> Result<(), String> {
+            Err(format!("{CHILD_SENTINEL} boom"))
+        }
+        fails().unwrap();
     });
 
     // 正控：把金丝雀写进当前目录的文件和 stderr（扫描器必须找得到它们）
@@ -282,7 +251,7 @@ fn the_whole_chain_leaves_no_content_in_any_file_log_or_panic_message() {
     );
 
     // ---- 正文不在任何地方 ----
-    for needle in needles() {
+    for needle in content_needles() {
         let hits = scan.find(&needle);
         assert!(hits.is_empty(), "{needle:?} found in: {hits:?}");
     }
