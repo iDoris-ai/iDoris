@@ -286,6 +286,63 @@ async fn the_tenant_header_is_ignored_and_the_tenant_always_comes_from_the_crede
     assert_eq!(w.spent("r1"), 0);
 }
 
+#[tokio::test]
+async fn a_forged_forwarded_for_changes_neither_who_pays_nor_which_tenant_it_is() {
+    // 配置里把 10.0.0.0/8 列为受信代理；这些请求的对端是公网地址，不在名单里，X-Forwarded-For 是伪造的。
+    // 伪造的头想冒充一个受信代理转发来的、属于别的租户的客户端：对付款上下文和租户没有任何影响。
+    let w = World::new(WorldOptions {
+        script: ok_script(5),
+        ingress: IngressYaml::default().trusted(&["10.0.0.0/8"]),
+        ..WorldOptions::default()
+    })
+    .await;
+    let forged = |request: Req| {
+        request
+            .peer("203.0.113.50")
+            .header("x-forwarded-for", "10.0.0.9, 198.51.100.77, 10.0.0.1")
+    };
+    let reply = w
+        .send(&forged(Req::chat(w.cred("svc_eduai")).member("kid-1")))
+        .await;
+    assert_eq!(reply.status, 200, "{}", reply.text());
+    // 同一个请求想越权：断言别的租户的成员，伪造的头一点帮助都没有
+    let reply = w
+        .send(&forged(Req::chat(w.cred("svc_eduai")).member("agent-1")))
+        .await;
+    assert_eq!(reply.status, 403, "{}", reply.text());
+    assert_eq!(reply.code(), "payment_context_invalid");
+    // 受信代理转发来的请求（对端在名单里）带着同样的头：凭证推导出来的账户一样，头只影响辅助信号的归属
+    let via_proxy = w
+        .send(
+            &Req::chat(w.cred("svc_eduai"))
+                .member("kid-2")
+                .peer("10.0.0.2")
+                .header("x-forwarded-for", "198.51.100.77"),
+        )
+        .await;
+    assert_eq!(via_proxy.status, 200);
+    assert_eq!(
+        w.request_rows()
+            .iter()
+            .map(|row| (row.0.as_str(), row.2.as_str(), row.3.as_str()))
+            .collect::<Vec<_>>(),
+        vec![
+            ("s1", "child_edu", "subsidized"),
+            ("s2", "child_edu", "subsidized")
+        ]
+    );
+    assert_eq!(
+        (w.spent("s1"), w.spent("s2")),
+        (ACTUAL_MICROS, ACTUAL_MICROS)
+    );
+    assert_eq!(
+        w.spent("eduai"),
+        2 * ACTUAL_MICROS,
+        "only the shared parent saw both"
+    );
+    assert_eq!((w.spent("a1"), w.spent("agent24")), (0, 0));
+}
+
 // ---------------------------------------------------------------------------
 // 路由表：云形态只有文档里的几条
 // ---------------------------------------------------------------------------

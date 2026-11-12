@@ -45,7 +45,7 @@ use super::caller::Refusal;
 use super::limits::{Denied, LimitKind, Permit};
 use super::net::ClientAddr;
 use super::reason::IngressReason;
-use super::{CloudIngress, HEADER_LIMIT_SCOPE, HEADER_MEMBER, abuse};
+use super::{CloudIngress, HEADER_LIMIT_SCOPE, HEADER_MEMBER};
 use crate::auth::VirtualKeyAuthError;
 use crate::{HEADER_REASON, error_envelope, virtual_key_unauthorized_response};
 
