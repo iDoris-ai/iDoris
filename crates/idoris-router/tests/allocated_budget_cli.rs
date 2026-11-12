@@ -5,12 +5,18 @@
 //! Windows spawn+HOME isolation is unverified here.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+#[path = "support/startup_wait.rs"]
+mod startup_wait;
+
 use std::{
     fs,
     io::{Read, Seek, SeekFrom},
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Output, Stdio},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        Once,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -50,6 +56,13 @@ fn clean_command() -> Command {
 
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
+}
+
+/// First exec of the packaged binary can be stalled by macOS assessment.
+/// Do it once per process, before any readiness or exit deadline starts.
+fn warm_packaged_binary() {
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| startup_wait::warm_exec(Path::new(env!("CARGO_BIN_EXE_idoris"))));
 }
 
 struct IsolatedHome {
@@ -206,9 +219,11 @@ async fn spawn_serve(upstream: &MockServer, budget: Option<&str>) -> ServeChild 
             command.env_remove("IDORIS_ALLOCATED_BUDGET_BYTES");
         }
     }
-    let mut child = command.spawn().unwrap();
+    warm_packaged_binary();
+    let mut child = startup_wait::spawn_when_executable(&mut command);
     let client = reqwest::Client::builder().no_proxy().build().unwrap();
-    let deadline = Instant::now() + Duration::from_secs(20);
+    let limit = startup_wait::startup_observe_limit();
+    let deadline = Instant::now() + limit;
     loop {
         if child.try_wait().unwrap().is_some() {
             let output = child.wait_with_output().unwrap();
@@ -221,7 +236,7 @@ async fn spawn_serve(upstream: &MockServer, budget: Option<&str>) -> ServeChild 
         }
         if let Ok(response) = client
             .get(format!("http://127.0.0.1:{data_port}/health"))
-            .timeout(Duration::from_millis(200))
+            .timeout(startup_wait::HTTP_PROBE_TIMEOUT)
             .send()
             .await
             && response.status().is_success()
@@ -230,7 +245,8 @@ async fn spawn_serve(upstream: &MockServer, budget: Option<&str>) -> ServeChild 
         }
         assert!(
             Instant::now() < deadline,
-            "health readiness timed out for budget={budget:?}"
+            "health readiness timed out after {}s for budget={budget:?}",
+            limit.as_secs()
         );
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
@@ -249,7 +265,7 @@ async fn post_chat(port: u16) -> reqwest::Response {
         .post(format!("http://127.0.0.1:{port}/v1/chat/completions"))
         .header("content-type", "application/json")
         .header("X-iDoris-Privacy", "local_only")
-        .timeout(Duration::from_secs(10))
+        .timeout(startup_wait::startup_observe_limit())
         .body(
             r#"{"model":"idoris/daily","stream":false,"messages":[{"role":"user","content":"hi"}]}"#,
         )
@@ -258,13 +274,24 @@ async fn post_chat(port: u16) -> reqwest::Response {
         .unwrap()
 }
 
+/// How long a server that has already bound both ports must stay up before
+/// this helper kills and reaps it. This is the behavior under test. It is
+/// not a startup SLA and it does not grow under load.
 const STARTUP_EXIT_TIMEOUT: Duration = Duration::from_secs(3);
+/// Outer bound on noticing that deadline and on `kill` + `wait`. Load can
+/// stall the test thread; a reap that never finishes still fails the test.
+const REAP_SLACK: Duration = Duration::from_secs(30);
 
 #[derive(Debug)]
 struct StartupTimeout {
     pid: u32,
     status: ExitStatus,
     ports_bound: bool,
+    /// Time both ports had been observed bound when the helper decided to reap.
+    /// `None` when the observe limit expired without a bind.
+    dwell_after_bind: Option<Duration>,
+    /// Wall time from the reap decision until `wait` returned.
+    reap_elapsed: Duration,
 }
 
 struct StartupChild(Child);
@@ -304,29 +331,33 @@ fn startup_with_budget(raw: &str) -> Result<Output, StartupTimeout> {
     // Regular files cannot fill a pipe and deadlock the child before exit.
     let stdout = tempfile::tempfile().unwrap();
     let stderr = tempfile::tempfile().unwrap();
-    let mut child = StartupChild(
-        clean_command()
-            .arg("serve")
-            .current_dir(&repo)
-            .env("HOME", &home.path)
-            .env("IDORIS_COMPONENTS_DIR", components.path())
-            .env(
-                "IDORIS_ROUTING_POLICY",
-                repo.join("config/routing-policy.yaml"),
-            )
-            .env("IDORIS_CATALOG", repo.join("config/catalog.yaml"))
-            .env("IDORIS_PORT", data_port.to_string())
-            .env("IDORIS_ADMIN_PORT", admin_port.to_string())
-            .env("IDORIS_DB_PATH", state.path().join("state.sqlite3"))
-            .env("IDORIS_ALLOCATED_BUDGET_BYTES", raw)
-            .stdin(Stdio::null())
-            .stdout(stdout.try_clone().unwrap())
-            .stderr(stderr.try_clone().unwrap())
-            .spawn()
-            .unwrap(),
-    );
-    let deadline = Instant::now() + STARTUP_EXIT_TIMEOUT;
+    let mut command = clean_command();
+    command
+        .arg("serve")
+        .current_dir(&repo)
+        .env("HOME", &home.path)
+        .env("IDORIS_COMPONENTS_DIR", components.path())
+        .env(
+            "IDORIS_ROUTING_POLICY",
+            repo.join("config/routing-policy.yaml"),
+        )
+        .env("IDORIS_CATALOG", repo.join("config/catalog.yaml"))
+        .env("IDORIS_PORT", data_port.to_string())
+        .env("IDORIS_ADMIN_PORT", admin_port.to_string())
+        .env("IDORIS_DB_PATH", state.path().join("state.sqlite3"))
+        .env("IDORIS_ALLOCATED_BUDGET_BYTES", raw)
+        .stdin(Stdio::null())
+        .stdout(stdout.try_clone().unwrap())
+        .stderr(stderr.try_clone().unwrap());
+    warm_packaged_binary();
+    let mut child = StartupChild(startup_wait::spawn_when_executable(&mut command));
+    // Clock starts after the binary is warm and the process exists. A failing
+    // config must exit on its own inside the observe limit; only a server
+    // that has bound both ports is held for STARTUP_EXIT_TIMEOUT and then reaped.
+    let started = Instant::now();
+    let observe_limit = startup_wait::startup_observe_limit();
     let mut ports_bound = false;
+    let mut bound_at = None;
     loop {
         if child.0.try_wait().unwrap().is_some() {
             let status = child.0.wait().expect("reap exited startup child");
@@ -336,7 +367,22 @@ fn startup_with_budget(raw: &str) -> Result<Output, StartupTimeout> {
                 stderr: captured_output(stderr),
             });
         }
-        if Instant::now() >= deadline {
+        if bound_at.is_none() {
+            let listening = |port| {
+                let address = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+                std::net::TcpStream::connect_timeout(&address, Duration::from_secs(1)).is_ok()
+            };
+            if listening(data_port) && listening(admin_port) {
+                bound_at = Some(Instant::now());
+                ports_bound = true;
+            }
+        }
+        let now = Instant::now();
+        let behavior_elapsed = bound_at.is_some_and(|bound| now >= bound + STARTUP_EXIT_TIMEOUT);
+        let observe_elapsed = bound_at.is_none() && now >= started + observe_limit;
+        if behavior_elapsed || observe_elapsed {
+            let decision = Instant::now();
+            let dwell_after_bind = bound_at.map(|bound| decision.saturating_duration_since(bound));
             let pid = child.0.id();
             if let Err(error) = child.0.kill() {
                 assert!(
@@ -351,13 +397,10 @@ fn startup_with_budget(raw: &str) -> Result<Output, StartupTimeout> {
                 pid,
                 status,
                 ports_bound,
+                dwell_after_bind,
+                reap_elapsed: decision.elapsed(),
             });
         }
-        let listening = |port| {
-            let address = std::net::SocketAddr::from(([127, 0, 0, 1], port));
-            std::net::TcpStream::connect_timeout(&address, Duration::from_millis(20)).is_ok()
-        };
-        ports_bound |= listening(data_port) && listening(admin_port);
         std::thread::sleep(Duration::from_millis(10));
     }
 }
@@ -391,14 +434,28 @@ fn illegal_and_negative_budget_configs_fail_startup() {
 
 #[test]
 fn valid_budget_times_out_and_reaps_the_owned_startup_child() {
-    let started = Instant::now();
     let timeout = startup_with_budget(&SUFFICIENT_BUDGET_BYTES.to_string())
         .expect_err("a valid budget starts the server, so the exit-only helper must time out");
-    assert!(started.elapsed() >= STARTUP_EXIT_TIMEOUT);
-    assert!(started.elapsed() < STARTUP_EXIT_TIMEOUT + Duration::from_secs(2));
     assert!(
         timeout.ports_bound,
         "valid startup must bind both isolated listener ports"
+    );
+    let dwell = timeout
+        .dwell_after_bind
+        .expect("bound ports must record how long the server stayed up");
+    assert!(
+        dwell >= STARTUP_EXIT_TIMEOUT,
+        "owned server must stay up for the behavior timeout ({STARTUP_EXIT_TIMEOUT:?}) after bind before it is reaped; dwell={dwell:?}"
+    );
+    // Notice delay and reap are outer waits. The 3s behavior timeout above is unchanged.
+    assert!(
+        dwell < STARTUP_EXIT_TIMEOUT + REAP_SLACK,
+        "reap decision drifted {dwell:?} past {STARTUP_EXIT_TIMEOUT:?}"
+    );
+    assert!(
+        timeout.reap_elapsed < REAP_SLACK,
+        "reaping the owned startup child took {:?}, outer bound is {REAP_SLACK:?}",
+        timeout.reap_elapsed
     );
     assert!(
         !timeout.status.success(),
