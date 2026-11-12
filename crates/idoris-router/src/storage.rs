@@ -102,6 +102,33 @@ pub fn open_virtual_key_store_process() -> Result<VirtualKeyStore, String> {
         .map_err(|err| format!("无法打开虚拟 key 数据库 \"{}\"：{err}", db_path.display()))
 }
 
+/// Opens the account store for the offline `idoris control …` commands (compute service S2), with the same
+/// database resolution as daemon startup and none of its tenant/budget side effects. Only the organization and
+/// cloud forms (declared through `IDORIS_FORM`) have an account store, so every other start is refused *before*
+/// the database is touched. The virtual-key store is opened first, exactly like daemon startup does: the control
+/// plane writes the key verifier of a credential it issues in the same transaction as the credential itself.
+pub fn open_account_store_process(startup: StartupForm) -> Result<AccountStore, String> {
+    if !startup.opens_account_store() {
+        return Err(
+            "控制面运维命令只在组织、云形态可用：请设置 IDORIS_DEPLOY_MODE=tenant 和 IDORIS_FORM=organization（或 cloud）"
+                .to_string(),
+        );
+    }
+    let db_path = process_db_path()?;
+    if let Some(parent) = db_path.parent().filter(|path| !path.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)
+            .map_err(|err| format!("无法创建数据库目录 \"{}\"：{err}", parent.display()))?;
+    }
+    let standard = open_standard(&db_path)
+        .map_err(|err| format!("无法设置数据库连接 \"{}\"：{err}", db_path.display()))?;
+    drop(
+        VirtualKeyStore::new(standard)
+            .map_err(|err| format!("无法打开虚拟 key 数据库 \"{}\"：{err}", db_path.display()))?,
+    );
+    AccountStore::open(&db_path)
+        .map_err(|err| format!("无法打开账户数据库 \"{}\"：{err}", db_path.display()))
+}
+
 /// Why [`acquire_instance_lock`] failed.
 #[derive(Debug)]
 pub enum InstanceLockError {
@@ -1393,7 +1420,8 @@ mod tests {
             let account_tables: i64 = conn
                 .query_row(
                     "SELECT count(*) FROM sqlite_master WHERE name IN \
-                     ('accounts','principals','memberships','credentials','credential_admin_scopes','allocations','account_schema_migrations')",
+                     ('accounts','principals','memberships','credentials','credential_admin_scopes','allocations','account_schema_migrations',\
+                      'control_audit','credential_issuance','principal_registrations','allocation_revocations','pairing_codes','pairing_devices')",
                     [],
                     |r| r.get(0),
                 )

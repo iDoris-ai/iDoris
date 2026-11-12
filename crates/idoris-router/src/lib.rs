@@ -107,6 +107,13 @@ pub mod subscription;
 /// `IDORIS_CLOUD_UPSTREAM_CONFIG` is set, and then nothing else changes.
 pub mod cloud;
 
+/// idoris.ai/api compute service S2: the write-side control plane
+/// (`/control/v1`, separate from the read-only Admin v0) and the data-plane
+/// credential gate. Default off: `AppState::control` is `None` unless the
+/// organization or cloud form is declared (`IDORIS_FORM`), and then the
+/// personal form and every legacy tenant deployment behave exactly as before.
+pub mod control;
+
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -285,6 +292,10 @@ pub struct AppState {
     /// existing route and behavior exactly as it was; `Some` replaces the
     /// `POST /v1/chat/completions` handler with the cloud one in `build_app`.
     pub cloud: Option<Arc<cloud::CloudUpstream>>,
+    /// idoris.ai/api control plane (S2). `None` (the default, and always in the
+    /// personal form and in legacy tenant deployments) mounts nothing; `Some`
+    /// makes `build_app` merge the `/control/v1` routes in.
+    pub control: Option<Arc<control::ControlPlane>>,
 }
 
 impl std::fmt::Debug for AppState {
@@ -324,6 +335,7 @@ impl std::fmt::Debug for AppState {
             .field("subscriptions", &self.subscriptions.len())
             .field("proxy", &"ChatProxy { .. }")
             .field("cloud", &self.cloud.as_ref().map(|_| "configured"))
+            .field("control", &self.control.as_ref().map(|_| "configured"))
             .finish()
     }
 }
@@ -365,6 +377,7 @@ impl Default for AppState {
             subscriptions: subscription::runtime::SubscriptionRuntimeRegistry::default(),
             proxy: Arc::new(proxy::ChatProxy::new(http_client.clone())),
             cloud: None,
+            control: None,
             http_client,
         }
     }
@@ -395,7 +408,10 @@ pub fn build_app(state: AppState) -> Router {
     } else {
         legacy_inference_routes
     };
-    Router::new()
+    // Control plane (S2): merged in *after* the data-plane layers below, so it never passes through the
+    // data-plane middleware (it authenticates and authorizes every request itself). Absent = nothing is mounted.
+    let control = state.control.clone();
+    let app = Router::new()
         .route("/health", get(health))
         .route("/v1/models", get(list_models).fallback(not_found))
         .route("/capabilities", get(get_capabilities).fallback(not_found))
@@ -434,7 +450,11 @@ pub fn build_app(state: AppState) -> Router {
             state.clone(),
             record_id_middleware,
         ))
-        .with_state(state)
+        .with_state(state);
+    match control {
+        Some(plane) => app.merge(control::router(plane)),
+        None => app,
+    }
 }
 
 async fn post_feedback(

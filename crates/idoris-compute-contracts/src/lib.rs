@@ -23,6 +23,7 @@
 //! | [`grant`] | §4 | `Grant`：每笔金额带用途、有效期、不可转让 |
 //! | [`account`] | §3 | `Principal` / `Membership` / `Account` / `AccountTree` / `Directory` / `Allocation`，以及 `validate_allocation` |
 //! | [`credential`] | §3、§9 | `Credential`、`resolve_payment_context`、`AdminScope`、`check_scope_delegation`、`check_credential_issuance` |
+//! | [`control`] | §9 | S2 控制面：`ControlReason`（稳定原因码）、`authorize`（操作 × 资源范围）、`would_disable_caller` |
 //! | [`reason`] | §5 | 16 个稳定原因码与四级体验分级 |
 //! | [`reserve`] | §5 | 预留额公式 `reserve`、压低 `max_tokens` 的 `fit_max_tokens` |
 //! | [`admission`] | §5 | 五项检查的输入输出、`evaluate_admission`、准入决定、`check_grace` |
@@ -121,6 +122,7 @@
 pub mod account;
 pub mod admission;
 pub mod attempt;
+pub mod control;
 pub mod credential;
 pub mod form;
 pub mod grant;

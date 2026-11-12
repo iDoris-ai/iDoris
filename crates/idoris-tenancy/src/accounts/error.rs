@@ -44,6 +44,9 @@ pub enum AccountStoreError {
     /// 免费额度的幂等键不是 `subsidy:<子账户所属成员的主体>:<YYYY-MM>`，或别的用途用了 `subsidy:` 键。
     #[error("subsidy idempotency key rejected: {0}")]
     SubsidyKey(String),
+    /// 同一次发放（同一个幂等键、同样内容）的额度已经存在，但已经被撤销（S2）：重发不会让它复活。
+    #[error("allocation {id} was already issued and has been revoked")]
+    AllocationRevoked { id: String },
     /// 库里存的东西读出来不合法（被绕过 Rust 层改坏了，或版本不匹配）。
     #[error("stored row is corrupt: {0}")]
     Corrupt(String),

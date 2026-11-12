@@ -459,3 +459,27 @@ fn deployment_forms_profiles_and_deploy_config() {
         }),
     );
 }
+
+/// S2 控制面：全部原因码、结果类别、审计结果和操作的线上字符串。新增只能加变体，旧字符串不能改。
+#[test]
+fn control_plane_reason_codes_results_operations_and_audit_outcomes() {
+    use idoris_compute_contracts::control::{AuditOutcome, ControlReason, WriteResult};
+    let reasons: Vec<serde_json::Value> = ControlReason::ALL
+        .iter()
+        .map(|code| {
+            json!({
+                "code": code.as_str(),
+                "audit_outcome": code.audit_outcome().as_str(),
+            })
+        })
+        .collect();
+    assert_snapshot(
+        "control_reason_codes",
+        &json!({
+            "reasons": reasons,
+            "write_results": WriteResult::ALL.iter().map(|r| r.as_str()).collect::<Vec<_>>(),
+            "audit_outcomes": AuditOutcome::ALL.iter().map(|o| o.as_str()).collect::<Vec<_>>(),
+            "operations": ControlOp::ALL.iter().map(|op| op.as_str()).collect::<Vec<_>>(),
+        }),
+    );
+}
