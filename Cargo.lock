@@ -1243,6 +1243,7 @@ version = "0.4.0"
 dependencies = [
  "chrono",
  "chrono-tz",
+ "idoris-compute-contracts",
  "idoris-contracts",
  "rusqlite",
  "serde",

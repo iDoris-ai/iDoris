@@ -52,6 +52,8 @@ required-features = ["mutation-test-hooks"]
 
 [dependencies]
 idoris-contracts = { workspace = true }
+# S4：尝试记录与结算分录（`attempts`）持久化 S0 契约类型，状态变更只走契约的 `transition`。
+idoris-compute-contracts = { workspace = true }
 rusqlite = { workspace = true }
 uuid = { workspace = true }
 sha2 = { workspace = true }
