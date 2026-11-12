@@ -587,4 +587,35 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn the_shipped_example_is_a_valid_configuration() {
+        // 示例文件是运维会照抄的东西：它必须能被加载（而且示例里被注释掉的备选项取消注释之后也是合法的）。
+        let example = include_str!("../../../../config/compute/cloud-tier.example.yaml");
+        let config = CloudTierConfig::parse(example, Path::new("/etc/idoris")).unwrap();
+        assert_eq!(config.credential, CredentialSourceConfig::PairedDevice);
+        assert_eq!(config.cloud_model_for(None), Some("idoris/agent"));
+        for role in CLOUD_ROLES {
+            assert_eq!(
+                config.cloud_model_for(Some(role)),
+                Some("idoris/agent"),
+                "{role}"
+            );
+        }
+        assert_eq!(
+            config.chat_url.as_str(),
+            "https://idoris.ai/api/v1/chat/completions"
+        );
+        assert_eq!(config.control_url.as_str(), "https://idoris.ai/control/v1");
+        // 组织形态的备选：把 credential 段换成 node_file
+        let org = example.replace(
+            "  source: paired_device          # 个人",
+            "  source: node_file\n  file: /etc/idoris/cloud-node-credential\n  #                              # 个人",
+        );
+        let config = CloudTierConfig::parse(&org, Path::new("/etc/idoris")).unwrap();
+        assert_eq!(
+            config.credential,
+            CredentialSourceConfig::NodeFile(PathBuf::from("/etc/idoris/cloud-node-credential"))
+        );
+    }
 }
