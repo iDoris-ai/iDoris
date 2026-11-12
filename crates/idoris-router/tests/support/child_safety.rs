@@ -75,6 +75,48 @@ impl SafetyChecker for Counting {
     }
 }
 
+/// 不守时的检查器：指定阶段**永远不返回**（模拟卡死在内部锁上、或者忽略 `ctx.deadline` 的检查器实现），另一个阶段交给规则检查器。
+/// 用来证明预算是 gate 从外面强制的：检查器自己不遵守截止时间，请求也不会挂住，更不会被放行。
+#[derive(Debug)]
+pub struct Stuck {
+    inner: RuleChecker,
+    stuck_at: idoris_compute_contracts::safety::SafetyStage,
+}
+
+impl Stuck {
+    pub fn at(stage: idoris_compute_contracts::safety::SafetyStage) -> Arc<Self> {
+        Arc::new(Self {
+            inner: RuleChecker::new(),
+            stuck_at: stage,
+        })
+    }
+}
+
+impl SafetyChecker for Stuck {
+    fn check_input<'a>(
+        &'a self,
+        ctx: &'a CheckContext<'a>,
+        input: &'a CheckedInput,
+    ) -> BoxFuture<'a, CheckReport> {
+        if self.stuck_at == idoris_compute_contracts::safety::SafetyStage::Input {
+            return Box::pin(std::future::pending());
+        }
+        self.inner.check_input(ctx, input)
+    }
+
+    fn check_output<'a>(
+        &'a self,
+        ctx: &'a CheckContext<'a>,
+        input: &'a CheckedInput,
+        output: &'a CheckedOutput,
+    ) -> BoxFuture<'a, CheckReport> {
+        if self.stuck_at == idoris_compute_contracts::safety::SafetyStage::Output {
+            return Box::pin(std::future::pending());
+        }
+        self.inner.check_output(ctx, input, output)
+    }
+}
+
 pub fn gate_with(checker: Arc<dyn SafetyChecker>) -> SafetyGate {
     SafetyGate::new(
         checker,

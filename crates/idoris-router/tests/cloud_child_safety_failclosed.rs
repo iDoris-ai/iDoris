@@ -17,12 +17,12 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use child_safety::{
-    ANSWER_SENTINEL, CHILD_SENTINEL, Child, answer, benign_question, child_body, child_rules_only,
-    child_with, child_with_judge, contains, harmful_question, judge_allow, judge_block, judge_says,
-    judge_yaml,
+    ANSWER_SENTINEL, CHILD_SENTINEL, Child, Stuck, answer, benign_question, child_body,
+    child_rules_only, child_with, child_with_judge, contains, harmful_question, judge_allow,
+    judge_block, judge_says, judge_yaml,
 };
 use fake_upstream::{Behavior, FakeUpstream};
-use harness::{Caller, Endpoint, Options, build, post};
+use harness::{Caller, Endpoint, Options, SafetyOption, build, post};
 use idoris_compute_contracts::ids::TimestampMs;
 use idoris_compute_contracts::pricing::Cost;
 use idoris_compute_contracts::reason::ReasonCode;
@@ -30,7 +30,9 @@ use idoris_compute_contracts::safety::SafetyStage;
 use idoris_router::cloud::safety::{
     ExtraCostOutcome, ExtraCostRefusal, ExtraCostRequest, ExtraCostTicket,
 };
-use idoris_router::cloud::{ExtraCostMeter, ManualClock, SimpleExtraCost};
+use idoris_router::cloud::{
+    ExtraCostMeter, ManualClock, SafetyGate, SafetyLimits, SimpleExtraCost,
+};
 use idoris_tenancy::attempts::RequestOutcome;
 use serde_json::json;
 
@@ -218,6 +220,67 @@ async fn a_refused_connection_to_the_safety_service_fails_closed_too() {
     unavailable(&reply, "input", "service_error");
     assert_no_content(&reply);
     assert_eq!(main.connection_count(), 0);
+}
+
+/// `LlmJudge` 自己守时是第一道；检查器实现不守时（永远不返回）时，gate 从外面按 `check_timeout` 切断，这是第二道。
+/// 两个阶段都一样：不挂住、503 `safety_unavailable`（cause=timeout）、没有任何正文、没有发布、用户付 0。
+#[tokio::test]
+async fn a_checker_that_never_returns_is_cut_off_from_outside_and_never_waves_anything_through() {
+    for stage in SafetyStage::ALL {
+        let main = FakeUpstream::start(vec![answer(ANSWER_SENTINEL)]).await;
+        let gate = SafetyGate::new(
+            Stuck::at(stage),
+            SafetyLimits {
+                check_timeout: Duration::from_millis(300),
+                ..SafetyLimits::default()
+            },
+            Arc::new(SimpleExtraCost::new()),
+        );
+        let h = build(
+            vec![Endpoint::child_edu_compliant("example-zdr", main.url())],
+            Options {
+                callers: vec![Caller::child_edu()],
+                safety: SafetyOption::Gate(gate),
+                ..Options::default()
+            },
+        );
+        let started = Instant::now();
+        let reply = post(&h.app, &child_body(&benign_question())).await;
+        let stage_name = match stage {
+            SafetyStage::Input => "input",
+            SafetyStage::Output => "output",
+        };
+        unavailable(&reply, stage_name, "timeout");
+        assert_no_content(&reply);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{stage:?}: the budget is enforced from outside, not by the checker's own pace"
+        );
+        let id = reply.request_id();
+        let row = h.store.request_row(&id).unwrap().unwrap();
+        assert_eq!(row.published_attempt, None, "{stage:?}: nothing published");
+        assert_eq!(row.charged_micros, None, "{stage:?}: the user pays 0");
+        assert_eq!(
+            row.reason_code.as_deref(),
+            Some("safety_unavailable"),
+            "{stage:?}"
+        );
+        let postings = h.store.postings(&id).unwrap();
+        assert!(postings.iter().all(|p| p.kind != "user_price"), "{stage:?}");
+        match stage {
+            // 输入阶段卡死：孩子的话一个字节都没有送到上游
+            SafetyStage::Input => {
+                assert_eq!(main.connection_count(), 0);
+                assert_eq!(row.outcome, Some(RequestOutcome::Rejected));
+            }
+            // 输出阶段卡死：上游已经答过了，但回答没有发出去，成本平台承担
+            SafetyStage::Output => {
+                assert_eq!(main.request_count(), 1);
+                assert_eq!(row.outcome, Some(RequestOutcome::Unanswered));
+                assert!(postings.iter().any(|p| p.kind == "platform_cost"));
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
