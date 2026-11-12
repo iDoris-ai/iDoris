@@ -67,7 +67,9 @@ pub enum CredentialBinding {
     Member { membership: MembershipId },
 }
 
-/// 控制面操作（写操作）。S2 可以按需**加**变体，不能改已有的线上字符串。
+/// 控制面操作。S2 可以按需**加**变体，不能改已有的线上字符串（前 7 个是 S0 冻结的，后 3 个是 S2 加的）。
+///
+/// 每个操作的资源范围（它的 `subtree` 要覆盖哪个账户）见 [`crate::control`] 模块文档的表。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ControlOp {
@@ -78,6 +80,44 @@ pub enum ControlOp {
     RevokeCredential,
     FreezeCredential,
     GrantAllocation,
+    /// S2：登记主体（开通方提供的假名 id）。资源范围 = 主体登记在哪个组织名下。
+    CreatePrincipal,
+    /// S2：撤销主体（同意撤回，设计稿 §7）。资源范围 = 该主体全部成员关系所在的账户。
+    RevokePrincipal,
+    /// S2：只读查询。资源范围 = 被查询的账户。
+    Read,
+}
+
+impl ControlOp {
+    /// 全部操作，顺序固定（= 变体声明顺序）。测试用它保证授权矩阵没有漏掉任何一个操作。
+    pub const ALL: [ControlOp; 10] = [
+        ControlOp::CreateAccount,
+        ControlOp::SetAccountStatus,
+        ControlOp::ManageMembership,
+        ControlOp::IssueCredential,
+        ControlOp::RevokeCredential,
+        ControlOp::FreezeCredential,
+        ControlOp::GrantAllocation,
+        ControlOp::CreatePrincipal,
+        ControlOp::RevokePrincipal,
+        ControlOp::Read,
+    ];
+
+    /// 线上字符串（与 `serde` 形式一致，也是数据库里 `credential_admin_scopes.op` 的写法）。**不可变**。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ControlOp::CreateAccount => "create_account",
+            ControlOp::SetAccountStatus => "set_account_status",
+            ControlOp::ManageMembership => "manage_membership",
+            ControlOp::IssueCredential => "issue_credential",
+            ControlOp::RevokeCredential => "revoke_credential",
+            ControlOp::FreezeCredential => "freeze_credential",
+            ControlOp::GrantAllocation => "grant_allocation",
+            ControlOp::CreatePrincipal => "create_principal",
+            ControlOp::RevokePrincipal => "revoke_principal",
+            ControlOp::Read => "read",
+        }
+    }
 }
 
 /// 控制面权限：能对 `subtree`（含）下的账户做 `op`。`op == GrantAllocation` 时还可以带
@@ -1259,10 +1299,46 @@ mod tests {
             (ControlOp::RevokeCredential, "revoke_credential"),
             (ControlOp::FreezeCredential, "freeze_credential"),
             (ControlOp::GrantAllocation, "grant_allocation"),
+            // S2 新增
+            (ControlOp::CreatePrincipal, "create_principal"),
+            (ControlOp::RevokePrincipal, "revoke_principal"),
+            (ControlOp::Read, "read"),
         ] {
             assert_eq!(serde_json::to_string(&op).unwrap(), format!("\"{text}\""));
+            assert_eq!(op.as_str(), text);
+            assert_eq!(
+                serde_json::from_str::<ControlOp>(&format!("\"{text}\"")).unwrap(),
+                op
+            );
         }
+        // ALL 与变体一一对应：没有重复，也没有遗漏（`as_str` 的 match 是穷尽的，所以新增变体会先在这里编译失败）
+        let mut seen = std::collections::BTreeSet::new();
+        for op in ControlOp::ALL {
+            assert!(seen.insert(op.as_str()), "{op:?} listed twice");
+        }
+        assert_eq!(seen.len(), 10);
         assert!(serde_json::from_str::<ControlOp>("\"read_ledger\"").is_err());
+    }
+
+    #[test]
+    fn an_amount_cap_is_only_allowed_on_grant_allocation_even_for_the_new_operations() {
+        for op in ControlOp::ALL {
+            let scope = AdminScope {
+                op,
+                subtree: aid("eduai"),
+                max_amount: Some(Money::new(Unit::Thb, 1)),
+            };
+            let result = Credential::new(
+                CredentialId::new("c-x").unwrap(),
+                CredentialBinding::Service {
+                    account: aid("eduai"),
+                },
+                CredentialStatus::Active,
+                None,
+                vec![scope],
+            );
+            assert_eq!(result.is_ok(), op == ControlOp::GrantAllocation, "{op:?}");
+        }
     }
 
     #[test]

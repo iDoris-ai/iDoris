@@ -23,6 +23,7 @@ use idoris_compute_contracts::admission::{
 use idoris_compute_contracts::attempt::{
     AttemptEvent, AttemptEventKind, AttemptState, AttemptStateKind, Certainty, SettleBasis,
 };
+use idoris_compute_contracts::control::{AuditOutcome, ControlReason, WriteResult};
 use idoris_compute_contracts::credential::{
     AdminScope, ControlOp, Credential, CredentialBinding, CredentialStatus,
 };
@@ -458,7 +459,13 @@ fn every_enum_rejects_unknown_variants_wrong_case_and_wrong_types() {
         ControlOp::RevokeCredential,
         ControlOp::FreezeCredential,
         ControlOp::GrantAllocation,
+        ControlOp::CreatePrincipal,
+        ControlOp::RevokePrincipal,
+        ControlOp::Read,
     ]);
+    assert_strict_enum(&ControlReason::ALL);
+    assert_strict_enum(&AuditOutcome::ALL);
+    assert_strict_enum(&WriteResult::ALL);
     assert_strict_enum(&CheckKind::ALL);
     assert_strict_enum(&[RateWindowKind::Minute, RateWindowKind::Hour]);
     assert_strict_enum(&[
