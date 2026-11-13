@@ -1173,6 +1173,15 @@ struct RouteCase {
 
 async fn route_cases(world: &World) -> Vec<RouteCase> {
     world.people().await;
+    // 撤销主体要对「登记它的组织」和它每个成员关系的账户都有权限（Codex r1 #1）：teacher 子树里「范围内放行」的
+    // 那个主体，必须是在 teacher 名下登记的（kid1 是 eduai 登记的，teacher 子树的凭证撤销不了它）
+    world
+        .ok(
+            "/control/v1/principals",
+            &world.root.secret,
+            json!({"principal_id": "p-teach", "org": "teacher"}),
+        )
+        .await;
     let member_in = world.member_credential("m-kid1").await; // s1，teacher 子树里
     let member_out = world.member_credential("m-kid2").await; // s2，teacher 子树外
     let account = |id: &str, parent: &str| json!({"account_id": id, "kind": "member", "parent": parent, "unit": "THB"});
@@ -1198,7 +1207,7 @@ async fn route_cases(world: &World) -> Vec<RouteCase> {
             name: "revoke_principal",
             verb: "POST",
             inside: (
-                "/control/v1/principals/kid1/revoke".into(),
+                "/control/v1/principals/p-teach/revoke".into(),
                 Some(json!({"org": "teacher"})),
             ),
             outside: (
@@ -2817,6 +2826,79 @@ async fn wrong_pairing_codes_are_rate_limited_globally_and_cannot_be_enumerated(
     let (another, _) = pairing_code(&world, "m-kid2").await;
     assert_eq!(
         redeem(&world, &another, "still open").await.status,
+        StatusCode::CREATED
+    );
+}
+
+#[tokio::test]
+async fn parallel_wrong_pairing_codes_cannot_all_get_to_the_database_lookup() {
+    // PR-Daemon S2 F1：限速器「先检查、后记录」——失败要等数据库查完才记，所以并发的猜码全都先过了检查。
+    // 200 个并发的错码，旧代码全部走到了查询（200 个 pairing_code_invalid）。现在先占名额再查：窗口里最多 20 次
+    // 尝试能走到查询，其余在查询之前就是 429。
+    let world = Arc::new(World::new());
+    world.people().await;
+    let (good, _) = pairing_code(&world, "m-kid1").await;
+    let mut handles = Vec::new();
+    for i in 0..200_u32 {
+        let world = world.clone();
+        handles.push(tokio::spawn(async move {
+            // 格式合法、查无此码的 12 位码
+            let digits = format!("{i:012}");
+            let wrong = format!("{}-{}-{}", &digits[0..4], &digits[4..8], &digits[8..12]);
+            let reply = redeem(&world, &wrong, "x").await;
+            (reply.status, reply.reason().to_string())
+        }));
+    }
+    let (mut reached_lookup, mut limited) = (0, 0);
+    for handle in handles {
+        match handle.await.unwrap() {
+            (StatusCode::BAD_REQUEST, reason) if reason == "pairing_code_invalid" => {
+                reached_lookup += 1;
+            }
+            (StatusCode::TOO_MANY_REQUESTS, reason) if reason == "pairing_rate_limited" => {
+                limited += 1;
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+    assert_eq!(reached_lookup, 20, "at most the limit reaches the lookup");
+    assert_eq!(limited, 180);
+    // 连正确的码也被限速（名额被猜码占满了），窗口滑过去之后恢复
+    let blocked = redeem(&world, &good, "x").await;
+    assert_eq!(blocked.status, StatusCode::TOO_MANY_REQUESTS);
+    world.clock.advance(60_001);
+    assert_eq!(
+        redeem(&world, &good, "now fine").await.status,
+        StatusCode::CREATED
+    );
+}
+
+#[tokio::test]
+async fn a_successful_or_recognized_redemption_gives_its_slot_back() {
+    // 名额是先占的，所以只有「猜错」（查无此码、格式不对）才一直占着；兑换成功、码已用 / 过期 / 被撤销
+    // （码是认得出的，不是在猜）把名额还回去，正常使用不会攒出限速
+    let world = World::new();
+    world.people().await;
+    for round in 0..30 {
+        let (code, _) = pairing_code(&world, "m-kid2").await;
+        let reply = redeem(&world, &code, &format!("device {round}")).await;
+        // 前 10 台成功，之后设备名额满：这也是「认得出的码」，不是猜
+        let expected = if round < 10 {
+            (StatusCode::CREATED, None)
+        } else {
+            (StatusCode::CONFLICT, Some("device_limit_reached"))
+        };
+        assert_eq!(
+            (reply.status, reply.json["error"]["reason_code"].as_str()),
+            expected,
+            "round {round}: {}",
+            reply.raw
+        );
+    }
+    // 30 次下来没有任何一次猜错：全局限速一个名额都没占
+    let (fresh, _) = pairing_code(&world, "m-kid1").await;
+    assert_eq!(
+        redeem(&world, &fresh, "not limited").await.status,
         StatusCode::CREATED
     );
 }

@@ -6,8 +6,10 @@
 //! 随机数来自仓库已有的安全随机源——`Uuid::new_v4()`（平台 RNG；虚拟 key 和 Admin token 也是这么生成的）——
 //! 只取 UUID 里**没有固定位**的字节（版本、变体所在的第 6、8 字节不用）。
 //!
-//! 60 位 + 短有效期（默认 10 分钟）+ 全局失败限速（见 [`FailureLimiter`]）：在一个码的有效期内，
-//! 攻击者最多能试几百次，空间是 2^60，不可行。库里只存 `SHA-256(域前缀 || 规范化后的 12 个字符)`，
+//! 60 位 + 短有效期（默认 10 分钟）+ 全局限速（见 [`FailureLimiter`]）：限速器**先占名额、再查库**——一分钟的窗口里
+//! 最多 20 次「还没确认是不是猜错」的尝试能走到数据库查询，并发的猜码也一样（旧版本先检查、查完才记失败，
+//! 200 个并发的错码全部走到了查询）。所以在一个码的有效期内攻击者最多能试 `20 × 有效期的分钟数` 次，默认是 200 次，
+//! 空间是 2^60，不可行。库里只存 `SHA-256(域前缀 || 规范化后的 12 个字符)`，
 //! 查表用哈希，查到之后存储层再用常数时间比较一次哈希（`subtle::ConstantTimeEq`）。
 //!
 //! 输入规范化：大小写不敏感，忽略空格和连字符，`I`/`L` 当作 `1`，`O` 当作 `0`（Crockford 的约定）；
@@ -115,7 +117,13 @@ pub(super) fn hash_input(input: &str) -> Option<[u8; 32]> {
     normalize(input).map(|normalized| hash_normalized(&normalized))
 }
 
-/// 兑换失败的滑动窗口限速器：窗口内失败次数达到上限，就拒绝所有兑换，直到窗口滑过去。
+/// 兑换的滑动窗口限速器：**先占名额，再查库**。
+///
+/// 每次兑换在碰数据库之前先 [`acquire`](Self::acquire) 一个名额（窗口内占着的名额已经满了就拒绝，不查库）；
+/// 查完以后，只有「猜错」（查无此码、格式不对）的尝试一直占着名额直到窗口滑过去，其余的（兑换成功，或者码是认得出的——
+/// 已用、已过期、已撤销、签发者失去资格……不是在猜）用 [`release`](Self::release) 把名额还回去。
+///
+/// 为什么不是「先检查、查完记失败」：失败要等查询返回才记，并发的猜码在记上之前全都过了检查，限速对并发的攻击者不起作用。
 ///
 /// 这是**全局**的，不按来源地址分：控制面在反向代理后面时，来源地址全是代理的，按地址限速没有意义，
 /// 而地址头不可信。代价是有人能用垃圾码把配对暂时堵住（拒绝服务，不是越权）；换来的是码的暴力破解
@@ -123,49 +131,62 @@ pub(super) fn hash_input(input: &str) -> Option<[u8; 32]> {
 pub(super) struct FailureLimiter {
     window_ms: i64,
     max_failures: usize,
-    failures: Mutex<VecDeque<i64>>,
+    state: Mutex<LimiterState>,
 }
+
+#[derive(Default)]
+struct LimiterState {
+    next_ticket: u64,
+    /// （名额编号，占用的时刻），按时刻排序。
+    held: VecDeque<(u64, i64)>,
+}
+
+/// 占到的一个名额。要么 [`release`](FailureLimiter::release) 还回去，要么留着（记为一次失败，窗口滑过去自动失效）。
+#[derive(Debug)]
+pub(super) struct Ticket(u64);
 
 impl FailureLimiter {
     pub(super) fn new(window_ms: i64, max_failures: usize) -> Self {
         Self {
             window_ms,
             max_failures,
-            failures: Mutex::new(VecDeque::new()),
+            state: Mutex::new(LimiterState::default()),
         }
     }
 
-    /// 一分钟内最多 20 次失败。
+    /// 一分钟内最多 20 个名额。
     pub(super) fn standard() -> Self {
         Self::new(60_000, 20)
     }
 
-    /// 现在还允许兑换吗。拿不到锁（中毒）一律不允许：失败即关闭。
-    pub(super) fn allow(&self, now_ms: i64) -> bool {
-        let Ok(mut failures) = self.failures.lock() else {
-            return false;
+    /// 占一个名额；窗口里的名额已满返回 `None`（调用方必须在查库之前就拒绝）。拿不到锁（中毒）一律不允许：失败即关闭。
+    pub(super) fn acquire(&self, now_ms: i64) -> Option<Ticket> {
+        let Ok(mut state) = self.state.lock() else {
+            return None;
         };
-        Self::prune(&mut failures, now_ms, self.window_ms);
-        failures.len() < self.max_failures
+        Self::prune(&mut state.held, now_ms, self.window_ms);
+        if state.held.len() >= self.max_failures {
+            return None;
+        }
+        let ticket = state.next_ticket;
+        state.next_ticket = state.next_ticket.wrapping_add(1);
+        state.held.push_back((ticket, now_ms));
+        Some(Ticket(ticket))
     }
 
-    pub(super) fn record_failure(&self, now_ms: i64) {
-        if let Ok(mut failures) = self.failures.lock() {
-            Self::prune(&mut failures, now_ms, self.window_ms);
-            failures.push_back(now_ms);
-            // 内存上界：只留最近 max 次（再多的失败对判定没有区别）。
-            while failures.len() > self.max_failures {
-                failures.pop_front();
-            }
+    /// 把名额还回去（这次尝试不是在猜）。已经因为窗口滑过去而失效的名额什么都不做。
+    pub(super) fn release(&self, ticket: Ticket) {
+        if let Ok(mut state) = self.state.lock() {
+            state.held.retain(|(held, _)| *held != ticket.0);
         }
     }
 
-    fn prune(failures: &mut VecDeque<i64>, now_ms: i64, window_ms: i64) {
-        while failures
+    fn prune(held: &mut VecDeque<(u64, i64)>, now_ms: i64, window_ms: i64) {
+        while held
             .front()
-            .is_some_and(|at| now_ms.saturating_sub(*at) >= window_ms)
+            .is_some_and(|(_, at)| now_ms.saturating_sub(*at) >= window_ms)
         {
-            failures.pop_front();
+            held.pop_front();
         }
     }
 }
@@ -253,25 +274,63 @@ mod tests {
     #[test]
     fn the_limiter_closes_after_the_limit_and_reopens_when_the_window_slides() {
         let limiter = FailureLimiter::new(1_000, 3);
-        assert!(limiter.allow(0));
-        for at in [0, 100, 200] {
-            limiter.record_failure(at);
-        }
+        // 占满：三个名额，不管有没有人「失败」，第四个就是拒绝（先占名额，再查库）
+        let tickets: Vec<_> = [0, 100, 200]
+            .into_iter()
+            .map(|at| limiter.acquire(at).expect("a free slot"))
+            .collect();
+        assert_eq!(tickets.len(), 3);
         assert!(
-            !limiter.allow(300),
-            "three failures inside the window: closed"
+            limiter.acquire(300).is_none(),
+            "three slots held inside the window: closed"
         );
-        assert!(!limiter.allow(999));
+        assert!(limiter.acquire(999).is_none());
         assert!(
-            limiter.allow(1_000),
-            "the oldest failure left the window (half-open)"
+            limiter.acquire(1_000).is_some(),
+            "the oldest slot left the window (half-open)"
         );
-        limiter.record_failure(1_000);
-        assert!(!limiter.allow(1_001));
+        assert!(limiter.acquire(1_001).is_none());
         // 内存有上界
         for at in 0..1_000 {
-            limiter.record_failure(2_000 + at);
+            let _ = limiter.acquire(2_000 + at);
         }
-        assert!(limiter.failures.lock().unwrap().len() <= 3);
+        assert!(limiter.state.lock().unwrap().held.len() <= 3);
+    }
+
+    #[test]
+    fn a_released_slot_is_free_again_and_releasing_twice_or_late_is_harmless() {
+        let limiter = FailureLimiter::new(1_000, 2);
+        let first = limiter.acquire(0).unwrap();
+        let second = limiter.acquire(10).unwrap();
+        assert!(limiter.acquire(20).is_none());
+        // 还回去的名额马上能再占；只还一次那个编号的名额
+        limiter.release(first);
+        let third = limiter.acquire(30).unwrap();
+        assert!(limiter.acquire(40).is_none());
+        // 窗口滑过去之后再还：名额早已失效，不会误删别人新占的
+        let fresh = limiter.acquire(5_000).unwrap();
+        limiter.release(second);
+        limiter.release(third);
+        assert_eq!(
+            limiter.state.lock().unwrap().held.len(),
+            1,
+            "only the fresh slot is held"
+        );
+        limiter.release(fresh);
+        assert!(limiter.state.lock().unwrap().held.is_empty());
+    }
+
+    #[test]
+    fn parallel_acquires_never_hand_out_more_than_the_limit() {
+        use std::sync::Arc;
+        let limiter = Arc::new(FailureLimiter::new(60_000, 20));
+        let handles: Vec<_> = (0..16)
+            .map(|_| {
+                let limiter = limiter.clone();
+                std::thread::spawn(move || (0..50).filter(|_| limiter.acquire(5).is_some()).count())
+            })
+            .collect();
+        let granted: usize = handles.into_iter().map(|h| h.join().unwrap()).sum();
+        assert_eq!(granted, 20, "800 racing attempts, 20 slots");
     }
 }
