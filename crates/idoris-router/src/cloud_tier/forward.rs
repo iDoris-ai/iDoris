@@ -158,10 +158,17 @@ fn error_reason(body: &[u8], header: Option<&str>) -> Option<String> {
         .or_else(|| header.and_then(reason_shape))
 }
 
-fn usage_of(body: &Value) -> (Option<u64>, Option<u64>) {
+/// 云端 `usage` 里的 token 数（没有或不是非负整数就是 `None`）。
+///
+/// 数字必须能写进调用记录（`tokens_*` 列是 i64）：超出范围的值（云端的 JSON 里可以写任意 u64）整个返回 `None`，
+/// 调用方把这个回答归为 `invalid_response`。不能留到写库的时候才发现——那时 `pending` 守卫已经解除，终态写不进去，
+/// 这一行会永远 `pending`，对账游标越不过它（审查 r4 Medium#5）。
+fn usage_of(body: &Value) -> Option<(Option<u64>, Option<u64>)> {
     let usage = body.get("usage");
     let count = |key: &str| usage.and_then(|u| u.get(key)).and_then(Value::as_u64);
-    (count("prompt_tokens"), count("completion_tokens"))
+    let (tokens_in, tokens_out) = (count("prompt_tokens"), count("completion_tokens"));
+    let storable = |tokens: Option<u64>| tokens.is_none_or(|value| i64::try_from(value).is_ok());
+    (storable(tokens_in) && storable(tokens_out)).then_some((tokens_in, tokens_out))
 }
 
 fn classify_transport(error: &reqwest::Error) -> CloudFailure {
@@ -280,7 +287,9 @@ async fn read_answer(
     else {
         return Err(answered(CallOutcome::InvalidResponse, None));
     };
-    let (tokens_in, tokens_out) = usage_of(&parsed);
+    let Some((tokens_in, tokens_out)) = usage_of(&parsed) else {
+        return Err(answered(CallOutcome::InvalidResponse, None));
+    };
     Ok(CloudAnswer {
         body: Bytes::from(body),
         status,
@@ -644,6 +653,102 @@ mod tests {
                     ..
                 } => {}
                 other => panic!("{name}: {other:?}"),
+            }
+        }
+    }
+
+    /// `forward` 交出去的每一个 `Ok(CloudAnswer)` 都必须能被调用记录原样写成 `served`；记录存不下的（超出 i64 的用量）
+    /// 在这里就被拒绝成 `invalid_response`，而不是留到写库的时候才发现（审查 r4 Medium#5）。
+    #[tokio::test]
+    async fn every_answer_forward_accepts_can_be_recorded_and_the_ones_the_record_cannot_hold_are_refused()
+     {
+        use idoris_tenancy::cloud_tier::{CallFinish, CloudTierStore};
+        let server = MockServer::start().await;
+        let store = CloudTierStore::open_in_memory().unwrap();
+        let max = i64::MAX;
+        // (名字, usage, 记录存得下吗)
+        let cases: Vec<(&str, serde_json::Value, bool)> = vec![
+            ("no usage at all", json!(null), true),
+            (
+                "zero",
+                json!({"prompt_tokens": 0, "completion_tokens": 0}),
+                true,
+            ),
+            (
+                "i64::MAX",
+                json!({"prompt_tokens": max, "completion_tokens": max}),
+                true,
+            ),
+            (
+                "prompt_tokens = i64::MAX + 1",
+                json!({"prompt_tokens": u64::try_from(max).unwrap() + 1, "completion_tokens": 1}),
+                false,
+            ),
+            (
+                "completion_tokens = i64::MAX + 1",
+                json!({"prompt_tokens": 1, "completion_tokens": u64::try_from(max).unwrap() + 1}),
+                false,
+            ),
+            (
+                "u64::MAX",
+                json!({"prompt_tokens": u64::MAX, "completion_tokens": 0}),
+                false,
+            ),
+            // 不是非负整数的值当作没有（和以前一样），不是错误
+            ("negative", json!({"prompt_tokens": -1}), true),
+            ("fraction", json!({"prompt_tokens": 1.5}), true),
+            ("string", json!({"prompt_tokens": "12"}), true),
+        ];
+        for (n, (name, usage, storable)) in cases.into_iter().enumerate() {
+            let mut body = json!({"id": "c", "choices": [{"message": {"content": "x"}}]});
+            if !usage.is_null() {
+                body["usage"] = usage;
+            }
+            server.reset().await;
+            Mock::given(method("POST"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("x-idoris-record-id", format!("rec-{n}").as_str())
+                        .set_body_raw(body.to_string(), "application/json"),
+                )
+                .mount(&server)
+                .await;
+            match call(&server, "").await {
+                Ok(answer) => {
+                    assert!(
+                        storable,
+                        "{name}: a usage the record cannot hold was accepted"
+                    );
+                    let ticket = store.begin_call(&format!("local-{n}"), 1, 1).unwrap();
+                    store
+                        .finish_call(
+                            &ticket,
+                            &CallFinish {
+                                outcome: CallOutcome::Served,
+                                finished_at_ms: 2,
+                                cloud_record_id: Some(&answer.cloud_record_id),
+                                http_status: Some(answer.status),
+                                cloud_reason: answer.reason.as_deref(),
+                                tokens_in: answer.tokens_in,
+                                tokens_out: answer.tokens_out,
+                            },
+                        )
+                        .unwrap_or_else(|error| panic!("{name}: {error}"));
+                }
+                Err(failure) => {
+                    assert!(!storable, "{name}: refused although the record can hold it");
+                    assert!(
+                        matches!(
+                            failure,
+                            CloudFailure::Answered {
+                                outcome: CallOutcome::InvalidResponse,
+                                status: 200,
+                                ..
+                            }
+                        ),
+                        "{name}: {failure:?}"
+                    );
+                }
             }
         }
     }
