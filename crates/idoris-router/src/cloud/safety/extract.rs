@@ -300,8 +300,14 @@ fn decode_nested_json(text: &str, out: &mut Vec<String>, depth: usize) -> Result
     if !(trimmed.starts_with('{') || trimmed.starts_with('[')) {
         return Ok(());
     }
-    let Ok(parsed) = serde_json::from_str::<Value>(text) else {
-        return Ok(());
+    let parsed = match serde_json::from_str::<Value>(text) {
+        Ok(parsed) => parsed,
+        // 嵌套深到 serde_json 自己都不肯解析（超过 128 层）：我们看不到里面的东西，客户端 / 模型未必也看不到，失败即关闭
+        Err(error) if error.to_string().contains("recursion limit exceeded") => {
+            return Err(ExtractError::Malformed);
+        }
+        // 只是恰好以 `{` / `[` 开头的普通文本
+        Err(_) => return Ok(()),
     };
     collect_value(&parsed, out, depth.saturating_add(NESTED_JSON_COST))
 }
@@ -477,7 +483,15 @@ pub fn extract_input_with(
     max_bytes: usize,
     trusted: &TrustedOperatorText,
 ) -> Result<CheckedInput, ExtractError> {
-    let forwarded = forwarded_view(body);
+    extract_view(&forwarded_view(body), max_bytes, trusted)
+}
+
+/// 从「会被转发的那份请求」（[`forwarded_view`]）里取出要检查的文本。
+fn extract_view(
+    forwarded: &Map<String, Value>,
+    max_bytes: usize,
+    trusted: &TrustedOperatorText,
+) -> Result<CheckedInput, ExtractError> {
     let mut input = CheckedInput::default();
     let mut total = 0usize;
 
@@ -539,12 +553,23 @@ pub fn extract_input_with(
     }
 
     // 其余转发出去的字段（`tools`、`tool_choice`、`response_format`、`stop`、数字和布尔……）：
-    // 按白名单的顺序，每个字段里的每一个键和值。客户端写的，一律按孩子写的话。
-    for field in FORWARDED_FIELDS {
-        if *field == "messages" {
-            continue;
-        }
-        let Some(value) = forwarded.get(*field) else {
+    // **转发的请求里有什么字段就取什么字段**（不是白名单里有什么：将来 `build_chat_body` 多转发一个字段，这里不用改也不会漏），
+    // 顺序固定（白名单的顺序在前，其余按名字排序），每个字段里的每一个键和值。客户端写的，一律按孩子写的话。
+    let mut fields: Vec<&String> = forwarded
+        .keys()
+        .filter(|key| key.as_str() != "messages")
+        .collect();
+    fields.sort_by_key(|key| {
+        (
+            FORWARDED_FIELDS
+                .iter()
+                .position(|field| *field == key.as_str())
+                .unwrap_or(usize::MAX),
+            (*key).clone(),
+        )
+    });
+    for field in fields {
+        let Some(value) = forwarded.get(field) else {
             continue;
         };
         let mut pieces: Vec<String> = Vec::new();
@@ -1063,6 +1088,59 @@ mod tests {
             )
             .unwrap_err(),
             ExtractError::Malformed
+        );
+    }
+
+    #[test]
+    fn a_field_the_builder_forwards_in_the_future_is_checked_without_being_listed_anywhere() {
+        // 取文本从「转发的请求里有什么字段」出发，不是白名单里有什么：将来 `build_chat_body` 多转发一个字段，
+        // 这里不用改也不会漏
+        let view = body(json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "a_field_added_to_the_builder_later": {"nested key": ["nested value"]},
+            "stop": "END",
+        }));
+        let input = extract_view(&view, 1 << 20, &TrustedOperatorText::none()).unwrap();
+        let all: String = input
+            .segments
+            .iter()
+            .map(|s| s.text.expose().to_string())
+            .collect::<Vec<_>>()
+            .join("|");
+        for expected in ["nested key", "nested value", "END"] {
+            assert!(all.contains(expected), "{expected} missing from {all}");
+        }
+        // 顺序固定：白名单里的字段在前（stop），其余按名字排序在后
+        let order: Vec<&str> = input
+            .segments
+            .iter()
+            .map(|s| s.text.expose())
+            .skip(1)
+            .collect();
+        assert_eq!(order, ["END", "nested key\nnested value"]);
+    }
+
+    #[test]
+    fn a_json_string_nested_deeper_than_the_parser_allows_fails_closed() {
+        // 超过 serde_json 的递归上限（128 层）：它不肯解析，我们看不到里面的东西，失败即关闭；
+        // 只是以 `[` 开头的普通文本不受影响
+        let deep = format!("{}1{}", "[".repeat(200), "]".repeat(200));
+        assert_eq!(
+            extract_input(
+                &body(json!({"messages": [{"role": "user", "content": deep}]})),
+                1 << 20
+            )
+            .unwrap_err(),
+            ExtractError::Malformed
+        );
+        assert!(
+            extract_input(
+                &body(
+                    json!({"messages": [{"role": "user", "content": "[1] first, [2] second {x"}]})
+                ),
+                1 << 20
+            )
+            .is_ok()
         );
     }
 
@@ -1622,6 +1700,110 @@ mod tests {
                     "seed {seed}: the forwarded string {string:?} is not in the checked text\nbody: {}",
                     Value::Object(client.clone())
                 );
+            }
+        }
+    }
+
+    /// 一份随机的上游响应：会被检查的位置里是 `chk…` 标签，不会被检查的位置（`id`、`model`、工具调用 `id`、推理内容、
+    /// 注释、供应商字段、第二个 choice……）里是 `unk…` 标签。
+    fn random_upstream_response(seed: u64) -> (Vec<u8>, usize) {
+        let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+        let (mut checked, mut unchecked) = (0usize, 0usize);
+        let mut chk = || {
+            checked += 1;
+            format!("chk{checked}tag")
+        };
+        let mut unk = || {
+            unchecked += 1;
+            format!("unk{unchecked}tag")
+        };
+        let mut message = Map::new();
+        message.insert("role".into(), json!("assistant"));
+        match rng.below(3) {
+            0 => {
+                message.insert("content".into(), json!(chk()));
+            }
+            1 => {
+                message.insert("content".into(), Value::Null);
+            }
+            _ => {
+                message.insert(
+                    "content".into(),
+                    json!([{"type": "text", "text": chk()}, {"type": "refusal", "refusal": chk()}]),
+                );
+            }
+        }
+        if rng.below(2) == 0 {
+            message.insert("refusal".into(), json!(chk()));
+        }
+        message.insert("reasoning_content".into(), json!(unk()));
+        message.insert("reasoning".into(), json!(unk()));
+        message.insert("annotations".into(), json!([{"title": unk()}]));
+        message.insert("audio".into(), json!({"data": unk()}));
+        let calls: Vec<Value> = (0..rng.below(3))
+            .map(|n| {
+                let arguments = if rng.below(2) == 0 {
+                    json!(serde_json::to_string(&json!({chk(): chk()})).unwrap())
+                } else {
+                    json!({chk(): chk()})
+                };
+                json!({"id": unk(), "type": "function", "index": n, unk(): unk(),
+                       "function": {"name": chk(), "arguments": arguments, unk(): unk()}})
+            })
+            .collect();
+        if !calls.is_empty() {
+            message.insert("tool_calls".into(), Value::Array(calls));
+        }
+        let body = json!({
+            "id": unk(), "object": unk(), "created": 1_700_000_000u64, "model": unk(),
+            "system_fingerprint": unk(), "provider": unk(),
+            "usage": {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3,
+                      "cost": 0.5, "prompt_tokens_details": {"cached_tokens": 1, unk(): unk()}},
+            "choices": [
+                {"index": 0, "finish_reason": unk(), "logprobs": {"content": unk()},
+                 "message": Value::Object(message)},
+                {"index": 1, "message": {"role": "assistant", "content": unk()}},
+            ],
+        });
+        (body.to_string().into_bytes(), unchecked)
+    }
+
+    #[test]
+    fn every_string_the_client_receives_is_checked_text_or_written_by_the_server() {
+        // 性质：重建后的响应里，凡是上游写的字符串，要么是会被检查的文本（回答、拒绝语、工具名和参数），要么不在里面；
+        // 不会被检查的位置（`id`、`model`、工具调用 `id`、推理内容、注释、供应商字段、第二个 choice）里的任何东西都到不了客户端
+        for seed in 1..=300u64 {
+            let (upstream, _) = random_upstream_response(seed);
+            let rebuilt = rebuild_response(&upstream, &ident("req-r3"), 1 << 20).unwrap();
+            let text = String::from_utf8(rebuilt.body.clone()).unwrap();
+            assert!(
+                !text.contains("unk"),
+                "seed {seed}: an unchecked string leaked: {text}"
+            );
+            // 反过来：每个会被检查的标签都在发给客户端的响应里，也在检查的文本里
+            let checked_texts = rebuilt.output.all_texts().join("\n");
+            let mut tag = 1;
+            while String::from_utf8_lossy(&upstream).contains(&format!("chk{tag}tag")) {
+                let needle = format!("chk{tag}tag");
+                assert!(
+                    text.contains(&needle),
+                    "seed {seed}: {needle} was dropped: {text}"
+                );
+                assert!(
+                    checked_texts.contains(&needle),
+                    "seed {seed}: {needle} was forwarded but not checked"
+                );
+                tag += 1;
+            }
+            assert!(tag > 1 || text.contains("\"content\":null"), "seed {seed}");
+            // 服务端写的标识
+            let value: Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(value["id"], "req-r3");
+            assert_eq!(value["model"], "example-org/chat-70b");
+            if let Some(calls) = value["choices"][0]["message"]["tool_calls"].as_array() {
+                for (index, call) in calls.iter().enumerate() {
+                    assert_eq!(call["id"], format!("call_reqr3_{index}"));
+                }
             }
         }
     }

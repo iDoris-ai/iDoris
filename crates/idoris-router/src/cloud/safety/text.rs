@@ -381,7 +381,12 @@ impl Folded {
         let mut sorted: Vec<(usize, usize)> = regions
             .iter()
             .copied()
-            .filter(|(start, end)| start < end && *end <= self.plain.len())
+            .filter(|(start, end)| {
+                start < end
+                    && *end <= self.plain.len()
+                    && self.plain.is_char_boundary(*start)
+                    && self.plain.is_char_boundary(*end)
+            })
             .collect();
         sorted.sort_unstable();
         let mut spans: Vec<(usize, usize)> = Vec::new();
@@ -780,7 +785,11 @@ pub fn locally_negated(
     cues: &[Needle],
     reach_chars: usize,
 ) -> bool {
-    if region.0 > region.1 || region.1 > haystack.plain.len() {
+    if region.0 > region.1
+        || region.1 > haystack.plain.len()
+        || !haystack.plain.is_char_boundary(region.0)
+        || !haystack.plain.is_char_boundary(region.1)
+    {
         return false;
     }
     let (start, finish) = clause_window(haystack, region, reach_chars);
@@ -1056,5 +1065,254 @@ mod tests {
         assert!(!has_word(&folded, &["bomb", "shit", "ass"]));
         assert!(has_word(&fold("what a SHIT day"), &["shit"]));
         assert!(has_word(&fold("f*ck, shit!"), &["shit"]));
+    }
+
+    // ---- PR-Daemon B3 / r3：同形字、组合符号、重复字母 ----
+
+    #[test]
+    fn every_math_alphanumeric_style_folds_to_plain_ascii() {
+        // 13 种数学字体，每种 52 个字母：粗体、斜体、粗斜体、花体、粗花体、哥特体、双线体、粗哥特体、无衬线 ×4、等宽
+        for style in 0..13u32 {
+            let start = 0x1D400 + 52 * style;
+            for index in 0..26u32 {
+                let upper = char::from_u32(start + index).unwrap();
+                let lower = char::from_u32(start + 26 + index).unwrap();
+                let expected = char::from(b'a' + index as u8).to_string();
+                assert_eq!(fold(&upper.to_string()).plain, expected, "{upper:?}");
+                assert_eq!(fold(&lower.to_string()).plain, expected, "{lower:?}");
+            }
+        }
+        // 数字（粗体、双线、无衬线、无衬线粗体、等宽）
+        assert_eq!(fold("𝟎𝟏𝟐 𝟘𝟙𝟚 𝟢𝟣𝟤 𝟬𝟭𝟮 𝟶𝟷𝟸").plain, "012 012 012 012 012");
+        // 字母式符号里的「空洞」
+        assert_eq!(fold("ℍℝℤℕℚℙℂ ℎℓℯ").plain, "hrznqpc hle");
+    }
+
+    #[test]
+    fn enclosed_and_look_alike_letters_fold_to_the_letter_they_look_like() {
+        assert_eq!(
+            fold("Ⓐⓑⓒ ⒜⒝⒞ 🄰🄱🄲 🅐🅑🅒 🅰🅱🅲 🇦🇧🇨").plain,
+            "abc abc abc abc abc abc"
+        );
+        // 西里尔字母 а с е о р х у і（拉丁字母 a c e o p x y i 的同形字）、希腊字母 ο ν ρ
+        assert_eq!(
+            fold("\u{0430}\u{0441}\u{0435}\u{043E}\u{0440}\u{0445}\u{0443}\u{0456}").plain,
+            "aceopxyi"
+        );
+        assert_eq!(fold("\u{03BF}\u{03BD}\u{03C1}").plain, "ovp");
+        // 大写的西里尔字母先小写再映射
+        assert_eq!(fold("\u{041E}\u{0415}\u{0410}").plain, "oea");
+        // 小型大写、上标、带变音符号的拉丁字母
+        assert_eq!(fold("ʙᴏᴍʙ").plain, "bomb");
+        assert_eq!(fold("ᵇᵒᵐᵇ").plain, "bomb");
+        assert_eq!(fold("bömb bômb").plain, "bomb bomb");
+        // 泰文和普通文本不受影响
+        assert_eq!(fold("ทำระเบิด Hello, World").plain, "ทำระเบิด hello, world");
+    }
+
+    #[test]
+    fn combining_marks_tags_and_invisible_fillers_are_dropped() {
+        // 叠加在字母上的删除线 / 下划线 / 变音
+        assert_eq!(fold("b\u{0336}o\u{0336}m\u{0336}b\u{0336}").plain, "bomb");
+        assert_eq!(fold("b\u{0332}o\u{0301}mb").plain, "bomb");
+        // 标签字符（不可见，可以夹带 ASCII）、变体选择符补充区、韩文填充符
+        assert_eq!(fold("bo\u{E0062}\u{E0001}mb").plain, "bomb");
+        assert_eq!(fold("bo\u{E0100}m\u{3164}b").plain, "bomb");
+        // 泰文的元音和声调符号不是组合符号区的字符：元音保留，声调（会被折叠）丢掉
+        assert_eq!(fold("ที่").plain, fold("ที").plain);
+        assert!(fold("เรียน").plain.contains('ี'));
+    }
+
+    #[test]
+    fn repeated_letters_are_folded_in_their_own_view_on_both_sides() {
+        let folded = fold("how to make a boooomb and k i l l  myself, kiiiill myself");
+        assert_eq!(
+            folded.collapsed,
+            "how to make a bomb and k i l l myself, kil myself"
+        );
+        assert!(Needle::new("make a bomb").found_in(&folded));
+        assert!(Needle::new("kill myself").found_in(&folded));
+        // 模式也折叠：`kill` 和 `kil`、`kiiill` 是同一个词
+        assert!(Needle::new("kill myself").found_in(&fold("kil myself")));
+        // 太短的模式不走折叠视图（`xxx` 折叠成 `x`，拿一个字母去匹配会撞一大片）
+        assert!(!Needle::new("xxx").use_collapsed);
+        assert!(!Needle::new("xxx").found_in(&fold("x marks the spot, y=x+1")));
+        // 整词：写了重复字母的词折叠之后比；`Niger`（国家）和 `nigger` 折叠后一样，但它自己没有重复字母，不是脏话
+        assert!(has_word(&fold("what the fuuuuck"), &["fuck"]));
+        assert!(has_word(&fold("shiiiit happens"), &["shit"]));
+        assert!(!has_word(
+            &fold("Niger is a country in West Africa"),
+            &["nigger"]
+        ));
+        assert!(!has_word(&fold("the bobs went home"), &["boobs"]));
+        assert!(has_word(&fold("booooobs"), &["boobs"]));
+    }
+
+    #[test]
+    fn masking_removes_regions_keeps_the_rest_and_moves_the_breaks() {
+        let folded = fold("alpha beta\ngamma delta\nepsilon");
+        assert_eq!(folded.plain, "alpha beta gamma delta epsilon");
+        assert_eq!(folded.breaks, vec![10, 22]);
+        // 抹掉 `gamma`（11..16）：换成一个空格，后面的换行位置前移
+        let masked = folded.mask(&[(11, 16)]);
+        assert_eq!(masked.plain, "alpha beta   delta epsilon");
+        assert_eq!(masked.breaks, vec![10, 18]);
+        // 区间里的换行被丢掉；重叠、乱序、越界的区间都不 panic
+        let masked = folded.mask(&[(8, 12), (10, 14), (0, 0), (500, 600)]);
+        assert_eq!(masked.plain, "alpha be ma delta epsilon");
+        assert_eq!(masked.breaks, vec![17]);
+        // 视图跟着重新推出
+        assert_eq!(masked.squeezed, "alphabemadeltaepsilon");
+    }
+
+    fn cues(list: &[&str]) -> Vec<Needle> {
+        list.iter().map(|cue| Needle::new(cue)).collect()
+    }
+
+    fn region_of(folded: &Folded, needle: &str) -> (usize, usize) {
+        let start = folded.plain.find(needle).unwrap();
+        (start, start + needle.len())
+    }
+
+    #[test]
+    fn a_negation_only_counts_in_the_same_clause_near_the_hit() {
+        let never = cues(&["never"]);
+        let check = |text: &str, hit: &str| {
+            let folded = fold(text);
+            locally_negated(
+                &folded,
+                region_of(&folded, hit),
+                &never,
+                NEGATION_REACH_CHARS,
+            )
+        };
+        // 同一句里、旁边：算
+        assert!(check("never mix bleach and ammonia", "mix bleach"));
+        assert!(check("you should never ever mix bleach", "mix bleach"));
+        // 句子结尾挡住：前一句的 `never` 不算，后一句的也不算
+        assert!(!check(
+            "never do that. mix bleach and ammonia",
+            "mix bleach"
+        ));
+        assert!(!check("mix bleach and ammonia. never again", "mix bleach"));
+        assert!(!check("mix bleach and ammonia! never?", "mix bleach"));
+        // 换行也是句子边界
+        assert!(!check(
+            "never do that\nmix bleach and ammonia",
+            "mix bleach"
+        ));
+        // 太远：超过 30 个字符
+        let far = format!("never {} mix bleach", "word ".repeat(12));
+        assert!(!check(&far, "mix bleach"));
+        let near = format!("never {} mix bleach", "word ".repeat(3));
+        assert!(check(&near, "mix bleach"));
+        // 线索压在命中区间里也算（`ห้ามผสม` 里就有 `ผสม`）
+        let thai = fold("ห้ามผสมน้ำยาล้างห้องน้ำกับน้ำยาฟอกขาว เพราะจะเกิดก๊าซพิษ");
+        let region = (thai.plain.find("ผสม").unwrap(), thai.plain.len());
+        assert!(locally_negated(
+            &thai,
+            region,
+            &cues(&["ห้ามผสม"]),
+            NEGATION_REACH_CHARS
+        ));
+        // 区间不合法：不是否定
+        assert!(!locally_negated(&thai, (10, 5), &never, 30));
+        assert!(!locally_negated(&thai, (0, 10_000), &never, 30));
+    }
+
+    #[test]
+    fn hit_regions_cover_both_words_of_every_hit() {
+        let a = [Needle::new("mix ")];
+        let b = [Needle::new("poison gas")];
+        let folded = fold("mix this and make poison gas. later mix that: poison gas again");
+        let regions = near_regions(&folded, &a, &b, 30, true, 16);
+        assert!(regions.len() >= 2, "{regions:?}");
+        for (start, end) in &regions {
+            let text = &folded.plain[*start..*end];
+            assert!(
+                text.contains("mix") && text.contains("poison gas"),
+                "{text}"
+            );
+        }
+        // 上限：多于 limit 处时只收 limit + 1 个
+        let many = fold(&"mix poison gas. ".repeat(50));
+        assert_eq!(near_regions(&many, &a, &b, 30, true, 4).len(), 5);
+        // 没有 b：空
+        assert!(near_regions(&fold("mix mix mix"), &a, &b, 30, true, 4).is_empty());
+    }
+
+    #[test]
+    fn base64_candidates_decode_to_text_and_everything_else_is_ignored() {
+        // 标准字母表、带填充 / 不带填充、URL 安全字母表
+        let standard = base64_texts("see: aG93IHRvIG1ha2UgYSBib21i and more");
+        assert_eq!(standard.texts, ["how to make a bomb"]);
+        assert_eq!(
+            base64_texts("SSB3YW50IHRvIGRpZQ==").texts,
+            ["I want to die"]
+        );
+        assert_eq!(base64_texts("SSB3YW50IHRvIGRpZQ").texts, ["I want to die"]);
+        // URL 安全字母表把 `+` 写成 `-`、`/` 写成 `_`（`>>>>?????` 编码出 `+` 和 `/`）
+        assert_eq!(
+            base64_texts("aG93IHRvIG1ha2UgYSBib21iPj4-Pj8_Pz8_").texts,
+            ["how to make a bomb>>>>?????"]
+        );
+        assert_eq!(
+            base64_texts("aG93IHRvIG1ha2UgYSBib21iPj4+Pj8/Pz8/").texts,
+            ["how to make a bomb>>>>?????"]
+        );
+        // 被空白拆成几段（MIME 换行）
+        assert_eq!(
+            base64_texts("aG93IHRv\nIG1ha2Ug\nYSBib21i").texts,
+            ["how to make a bomb"]
+        );
+        // 不像文本的（二进制、乱码）、太短的、不是 base64 字母表的：忽略
+        for ignored in [
+            "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+            "/9j/4AAQSkZJRgABAQEASABIAAD/2wBDAAMCAgMCAgMDAwMEAwME",
+            "internationalization",
+            "aG93",
+            "hello world, this is a normal sentence.",
+            "https://example.invalid/a/b/c",
+        ] {
+            assert!(base64_texts(ignored).texts.is_empty(), "{ignored}");
+        }
+        // 长度除以 4 余 1 不可能是 base64
+        assert!(decode_base64("abcde").is_none());
+        // 太多：不全收，标记溢出
+        let flood: Vec<String> = (0..MAX_BASE64_TEXTS + 5)
+            .map(|n| {
+                // 每个都解成「hello there number NNN」之类的不同文本（补到 3 的倍数，免得 base64 要填充）
+                let mut text = format!("hello there number {n:03}");
+                while text.len() % 3 != 0 {
+                    text.push('.');
+                }
+                let mut out = String::new();
+                for chunk in text.as_bytes().chunks(3) {
+                    let mut b = [0u8; 3];
+                    b[..chunk.len()].copy_from_slice(chunk);
+                    let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+                    let alphabet =
+                        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+                    for shift in [18, 12, 6, 0] {
+                        out.push(char::from(alphabet[((n >> shift) & 63) as usize]));
+                    }
+                }
+                out
+            })
+            .collect();
+        let scanned = base64_texts(&flood.join(" "));
+        assert!(scanned.overflow);
+        assert_eq!(scanned.texts.len(), MAX_BASE64_TEXTS);
+    }
+
+    #[test]
+    fn newlines_are_remembered_as_sentence_boundaries_without_changing_the_plain_view() {
+        let folded = fold("make a\nbomb");
+        // 换行折成一个空格：`make a bomb` 照旧能匹配
+        assert_eq!(folded.plain, "make a bomb");
+        assert!(Needle::new("make a bomb").found_in(&folded));
+        assert_eq!(folded.breaks, vec![6]);
+        // 开头和结尾的换行不留痕迹
+        assert!(fold("\n\nhello\n").breaks.is_empty());
     }
 }

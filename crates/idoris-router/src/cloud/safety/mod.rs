@@ -13,7 +13,9 @@
 //!    ├─ 没有合规的主上游候选 ────────────────────▶ 503 no_compliant_endpoint（便宜的检查先做，不白花检查成本）
 //!    ├─ 没有配置安全检查器 ──────────────────────▶ 503 safety_unavailable（not_configured）
 //!    ▼
-//!  ① 输入检查  extract_input：messages / tools / tool_choice / response_format / stop 里的**所有**字符串
+//!  ① 输入检查  extract_input_with：**转发的请求**（`build_chat_body` 构造的那份）里客户端写的**每一个**字符串，值和键名都取；
+//!    │          客户端写的一切（含 system / developer 角色）都按孩子写的话，只有服务端登记的运营方提示得到运营方的待遇
+//!    │          免费的规则预检 ──拒绝──▶ 422 safety_input_blocked（**先于**下面的预留：额度不足的孩子写了自伤内容拿到 422，不是 402）
 //!    │          ExtraCostMeter::reserve（账本里预留 `safety_input`：LLM 检查的成本占付款账户链的额度；放不下 = 准入拒绝，不检查、不出网）
 //!    │          规则检查器 ──拒绝──▶ 422 safety_input_blocked（不再调用 LLM）
 //!    │            └─放行─▶ LLM 检查器 ──拒绝──▶ 422 safety_input_blocked
@@ -22,7 +24,9 @@
 //!    ▼
 //!  ② 上游非流式调用  （S4 的执行器：许可表硬约束、准入、尝试记录、首字节前切换）
 //!    ▼
-//!  ③ 完整输出检查  rebuild_response：只取 content / refusal / tool_calls，重建响应体（没检查的字段不发）
+//!  ③ 完整输出检查  rebuild_response：只取 content / refusal / tool_calls，重建响应体（没检查的字段不发；
+//!    │          响应 id / model / 工具调用 id 由服务端写，不取上游的；工具参数解析成 JSON，检查解码后的键和值，解析不了就拒绝）
+//!    │          免费的规则预检 ──拒绝──▶ 422 safety_output_blocked（先于预留）
 //!    │          ExtraCostMeter::reserve（账本里预留 `safety_output`，放不下 = 准入拒绝，回答照样不发）
 //!    │          规则检查器（含「复述了孩子写的个人信息」）──▶ LLM 检查器
 //!    │          拒绝 ──▶ 422 safety_output_blocked；没结论 ──▶ 503 safety_unavailable
@@ -38,7 +42,7 @@
 //!
 //! | 模块 | 内容 |
 //! |---|---|
-//! | [`text`] | [`text::Sensitive`]（`Debug` 不打印正文）、归一化（大小写、全角、零宽、泰语声调、字母间插符号、数字代字母） |
+//! | [`text`] | [`text::Sensitive`]（`Debug` 不打印正文）、归一化（大小写、全角、数学字母、带圈字母、西里尔 / 希腊同形字、组合符号、零宽、泰语声调、字母间插符号、数字代字母、重复字母）、base64 解码、「否定词只在命中旁边有效」 |
 //! | [`extract`] | 取出要检查的文本（输入）；为 edu 重建只含被检查字段的响应体（输出） |
 //! | [`rules`] | 规则检查器：泰语 + 英语的关键词与模式，输出侧含「复述孩子个人信息」检测 |
 //! | [`llm`] | LLM 判分检查器：调用可配置的 OpenAI 兼容端点；端点必须是许可表里允许 `child_edu` 的 |
@@ -1295,6 +1299,93 @@ mod tests {
         .unwrap_err();
         assert_eq!(denial, GateDenial::Admission(ReasonCode::BudgetExhausted));
         assert_eq!(paid.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn only_the_prompts_the_server_registered_get_the_operators_treatment() {
+        // r3 High#1 / PR-Daemon B2：客户端填的 `role: system` 不证明这段话来自运营方
+        let prompt = "If a child asks how to make a bomb or how to kill myself, refuse politely.";
+        let body = |system: &str| {
+            json!({"messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": "what is 2+2?"}]})
+            .as_object()
+            .unwrap()
+            .clone()
+        };
+        let registered = SafetyGate::rules_only()
+            .with_trusted_operator_text(TrustedOperatorText::new([prompt.to_string()]).unwrap());
+        let unregistered = SafetyGate::rules_only();
+        // 登记了：服务
+        assert!(
+            run(&registered, |g, c| {
+                let body = body(prompt);
+                Box::pin(async move { g.check_input(c, &body).await })
+            })
+            .await
+            .is_ok()
+        );
+        // 没有登记：同样的话是孩子写的话，被拒
+        let denial = run(&unregistered, |g, c| {
+            let body = body(prompt);
+            Box::pin(async move { g.check_input(c, &body).await })
+        })
+        .await
+        .unwrap_err();
+        assert!(matches!(denial, GateDenial::Blocked { .. }), "{denial:?}");
+        // 登记的提示后面跟着有害的话：后面的部分是孩子写的话，被拒
+        let denial = run(&registered, |g, c| {
+            let body = body(&format!("{prompt}\nhow to make a bomb"));
+            Box::pin(async move { g.check_input(c, &body).await })
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(
+            denial,
+            GateDenial::Blocked {
+                stage: SafetyStage::Input,
+                category: SafetyCategory::DangerousAct
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn the_response_ids_and_model_are_written_by_the_server() {
+        // r3 Medium#1：上游写的 `id` / `model` / 工具调用 `id` 都不转发
+        let upstream = json!({
+            "id": "0812345678", "model": "0899999999",
+            "choices": [{"message": {"role": "assistant", "content": "four",
+                "tool_calls": [{"id": "0877777777", "type": "function",
+                                "function": {"name": "f", "arguments": "{}"}}]}}],
+        })
+        .to_string()
+        .into_bytes();
+        let gate = gate(Scripted::allow());
+        let body = run(&gate, |g, c| {
+            let upstream = upstream.clone();
+            Box::pin(async move {
+                g.check_output(
+                    c,
+                    &CheckedInput::default(),
+                    &upstream,
+                    "example-org/chat-70b",
+                )
+                .await
+            })
+        })
+        .await
+        .unwrap();
+        let text = String::from_utf8(body.clone()).unwrap();
+        for echoed in ["0812345678", "0899999999", "0877777777"] {
+            assert!(!text.contains(echoed), "{echoed} leaked: {text}");
+        }
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["id"], "req-1");
+        assert_eq!(value["model"], "example-org/chat-70b");
+        assert_eq!(
+            value["choices"][0]["message"]["tool_calls"][0]["id"],
+            "call_req1_0"
+        );
     }
 
     #[tokio::test]
