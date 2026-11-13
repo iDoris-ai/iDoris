@@ -268,7 +268,7 @@ admitted ─▶ attempt[i]: sending ─▶ maybe_executed ─▶ executed(usage 
 ### 已拍板（owner，2026-11-13）
 
 - **计费：已发送尝试报 0 用量就按 0 收费。** 用户付 0，平台成本也是 0。基础最低费用和最低计费量以后再做；本分支代码里没有这两项。代码今天已经按 0 结算（`crates/idoris-router/src/cloud/mod.rs` 模块文档第 34 条，`crates/idoris-router/tests/cloud_r2_fixes.rs`）。模块文档里这条曾标成需要 owner 确认，现已拍板。（审查修复后变更，提交 a6859b8c）
-- **儿童租户安全检查器：方案 B。** 默认必须配 LLM 检查器。运营方可在 `safety` 配置里写 `rules_only_acknowledgement`（`reason`、`acknowledged_by`、`expires_on`，最长 90 天）显式放宽到只用规则检查器，启动日志醒目记录。实现进行中，在分支 `task/compute-child-rules-ack`。本分支还没有这个字段：有儿童调用方或云入口儿童租户时，`safety.mode: rules_only` 启动失败（`crates/idoris-router/src/cloud/config.rs` 的 `require_llm_judge_for_child_tenants`）。没有儿童数据时，`rules_only` 仍可加载并打一行警告。切片条目见 S6-08。（审查修复后变更，提交 a6859b8c）
+- **儿童租户安全检查器：方案 B。** 默认必须配 LLM 检查器。运营方可在 `safety` 配置里写 `rules_only_acknowledgement`（`reason`、`acknowledged_by`、`expires_on`，最长 90 天）显式放宽到只用规则检查器，启动日志醒目记录。已实现（提交 688fa0f3）：有儿童调用方或云入口儿童租户时，`safety.mode: rules_only` 没有有效的 `rules_only_acknowledgement` 就启动失败；有效时允许启动，并打印含原因、确认人、到期日的 WARNING（`crates/idoris-router/src/cloud/config.rs` 的 `require_llm_judge_for_child_tenants`、`src/cloud/safety/config.rs`）。没有儿童数据时，`rules_only` 仍可加载并打一行警告。切片条目见 S6-08。（审查修复后变更，提交 a6859b8c）
 
 ### S0 契约（`crates/idoris-compute-contracts`）
 
@@ -367,7 +367,7 @@ admitted ─▶ attempt[i]: sending ─▶ maybe_executed ─▶ executed(usage 
 - **S6-05**：`safety_input_blocked` 和 `safety_output_blocked` 用 HTTP 422；`safety_unavailable` 用 503。代码：`crates/idoris-router/src/cloud/mod.rs:91-92`、`src/cloud/handler.rs:36-38`。设计稿 §7。
 - **S6-06**：拦截类别只出现在当次响应里，不写入请求记录、日志或审计。记录里只有 `safety_input_blocked` 这一类粗码。代码：`crates/idoris-router/src/cloud/mod.rs:93-94`、`crates/idoris-compute-contracts/src/safety.rs:25-26`。设计稿 §7。
 - **S6-07**：客户端写的内容一律按孩子的话查，包括 `system`、`developer`、工具定义、结构化输出和 `stop`。角色名不证明这段话来自运营方。运营方待遇和助手历史见 S6-15、S6-16。代码：`crates/idoris-router/src/cloud/safety/extract.rs:17-30`、`src/cloud/safety/rules.rs:14-18`。设计稿 §7。（审查修复后变更，提交 05cb15b4）
-- **S6-08**：已拍板，见本附录开头「儿童租户安全检查器：方案 B」。本分支的生产启动：有儿童数据时必须 `rules_and_llm`，`rules_only` 启动失败；确认字段尚未实现。没有儿童数据时，`rules_only` 仍是显式选择，加载时打一行警告。代码：`crates/idoris-router/src/cloud/config.rs:1001-1029`、`src/cloud/safety/config.rs:35-39`。设计稿 §7。（审查修复后变更，提交 a6859b8c）
+- **S6-08**：已拍板，见本附录开头「儿童租户安全检查器：方案 B」。生产启动：有儿童数据时默认必须 `rules_and_llm`；`rules_only` 须带有效的 `rules_only_acknowledgement`（≤90 天）才能启动（提交 688fa0f3）。没有儿童数据时，`rules_only` 仍是显式选择，加载时打一行警告。代码：`crates/idoris-router/src/cloud/config.rs:1001-1029`、`src/cloud/safety/config.rs:35-39`。设计稿 §7。（审查修复后变更，提交 a6859b8c）
 - **S6-09**：给出结论的检查（放行或拦截）按实际用量向付款账户收费，用量未知按预留额，并且封顶在预留额。规则检查器直接拦下、以及超时、出错、返回无法解析、客户端断开，收费 0。代码：`crates/idoris-router/src/cloud/mod.rs:113-116`。设计稿 §7。
 - **S6-10**：检查端点的供应商成本（上游币种）不记入账本。账本只记付款账户一侧的价。代码：`crates/idoris-router/src/cloud/mod.rs:115-116`。设计稿 §4、§7。
 - **S6-11**：免费的规则预检在占检查费用之前。规则命中直接 422，不占额度；额度不足的孩子写出规则能拦住的有害内容，得到的是 422，不是 402。规则没拦住、接下来的检查要花钱时，才先预留；放不下返回准入原因码（402 / 429 / 403），不检查、不出网。规则拦下不收费。代码：`crates/idoris-router/src/cloud/safety/mod.rs:16-20`、`src/cloud/safety/mod.rs:541-559`。设计稿 §5、§7。（审查修复后变更，提交 05cb15b4）
