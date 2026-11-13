@@ -29,7 +29,10 @@
 //! # 成本
 //!
 //! 每次调用的 usage 来自上游（通过 `parse_usage` 的结构检查才算数），按配置里这个端点的成本价目折算；用量未知按预留上界。
-//! 事前的上界由 [`SafetyChecker::estimate`] 给出，gate 用它占额度，见 [`super::cost`]。
+//! 事前的上界来自 [`SafetyChecker::plan`]：**先生成最终要发出的每一个调用（payload 和分块），再按它们算全部调用的上界**，
+//! gate 用这个上界占额度（见 [`super::cost`]），发送的就是同一份计划里的调用（[`SafetyChecker::execute`]）。
+//! 预留和发送不会各算各的：旧做法按原始文本的字节估一个分块数，解码展开、贪心装箱和每块都带的上下文让真正发出的调用比估算多，
+//! 超出预留的部分由平台承担（round2-r3 N3）。
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -49,8 +52,10 @@ use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
 use super::extract::{CheckedInput, CheckedOutput, Origin};
+use super::text::Sensitive;
 use super::{
-    BoxFuture, CheckContext, CheckReport, ExtraCostEstimate, SafetyChecker, SpendItem, Verdict,
+    BoxFuture, CheckContext, CheckPlan, CheckReport, ExtraCostEstimate, SafetyChecker, SpendItem,
+    Verdict,
 };
 
 /// 默认的检查模型输出上限（一个 JSON 对象，几十个 token 足够）。
@@ -63,6 +68,12 @@ pub const DEFAULT_MAX_CHUNKS: usize = 4;
 const CONTEXT_BYTES: usize = 2_000;
 /// 每次调用的系统提示 + 包装的 token 开销（估算上界用）。
 pub const PROMPT_OVERHEAD_TOKENS: u64 = 600;
+
+/// 一次调用的输入 token 上界：提示开销 + 这次调用的 payload 字节（保守地按每字节一个 token）。
+/// 预留（[`LlmJudge::plan`] 按计划里的每个调用相加）和用量未知时的挂账（`judge_once`）用的是同一个公式。
+fn call_input_tokens(payload: &str) -> u64 {
+    PROMPT_OVERHEAD_TOKENS.saturating_add(payload.len() as u64)
+}
 
 /// 系统提示（英文：检查模型对英文指令的遵从性最稳；被检查的文本可以是任何语言）。
 pub const SYSTEM_PROMPT: &str = r#"You are the content-safety classifier of a learning assistant for children in Thailand (ages 6 to 15).
@@ -407,13 +418,13 @@ impl LlmJudge {
     async fn judge_once(
         &self,
         ctx: &CheckContext<'_>,
-        payload: String,
+        payload: &str,
     ) -> (Verdict, Option<SpendItem>) {
         let remaining = ctx.deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             return (Verdict::unavailable(SafetyUnavailableCause::Timeout), None);
         }
-        let input_tokens = PROMPT_OVERHEAD_TOKENS.saturating_add(payload.len() as u64);
+        let input_tokens = call_input_tokens(payload);
         let body = json!({
             "messages": [
                 {"role": "system", "content": SYSTEM_PROMPT},
@@ -492,10 +503,10 @@ impl LlmJudge {
         }
     }
 
-    /// 按顺序判每一块，任一非放行就停。
-    async fn judge_chunks(&self, ctx: &CheckContext<'_>, payloads: Vec<String>) -> CheckReport {
+    /// 按顺序判计划里的每一个调用，任一非放行就停。
+    async fn judge_chunks(&self, ctx: &CheckContext<'_>, calls: &[Sensitive]) -> CheckReport {
         let mut spend = Vec::new();
-        for payload in payloads {
+        for payload in calls {
             if ctx.cancel.is_cancelled() {
                 // 判到一半客户端断开了：后面还有没判的块，**不能**当作放行（旧的 `break` 之后落到末尾返回 `Allow`）。
                 // gate 自己盯着取消信号并优先处理它；这里是检查器自己看到取消的路径，同样失败即关闭。
@@ -504,7 +515,7 @@ impl LlmJudge {
                     spend,
                 };
             }
-            let (verdict, item) = self.judge_once(ctx, payload).await;
+            let (verdict, item) = self.judge_once(ctx, payload.expose()).await;
             spend.extend(item);
             if !verdict.is_allow() {
                 return CheckReport { verdict, spend };
@@ -603,25 +614,68 @@ impl LlmJudge {
     }
 }
 
+impl LlmJudge {
+    /// 按计划里**全部**调用算花费上界（预留用）：每次调用 = 提示开销 + 这次调用的 payload 字节（保守地按每字节一个 token，
+    /// 和用量未知时的挂账是同一个公式 [`call_input_tokens`]）+ 输出上限；各次相加。
+    /// token 数一并给出：账本要付款单位的价，用检查端点的价目表按同样的 token 数折算（见 `ledger_cost`）。
+    fn estimate_calls(&self, payloads: &[String]) -> Option<ExtraCostEstimate> {
+        let calls = u64::try_from(payloads.len()).ok()?;
+        let input_tokens = payloads.iter().fold(0u64, |total, payload| {
+            total.saturating_add(call_input_tokens(payload))
+        });
+        let output_cap = self.settings.max_output_tokens.saturating_mul(calls);
+        let reserved = reserve(
+            &ReservePolicy::new(output_cap, 1).ok()?,
+            &ReserveRequest {
+                requested_max_tokens: Some(output_cap),
+                input_tokens_estimate: input_tokens,
+            },
+            &self.settings.cost_rates,
+        )
+        .ok()?;
+        Some(ExtraCostEstimate {
+            endpoint: self.settings.endpoint.clone(),
+            max_cost: reserved.amount,
+            max_input_tokens: input_tokens,
+            max_output_tokens: reserved.effective_max_tokens,
+        })
+    }
+
+    /// 按计划发送：许可表现在还允许这个端点处理儿童数据吗（核验在运行中过期了就不再发）-> 计划里的每一个调用。
+    /// 发送的就是 gate 预留时用的那一份计划，不重新展开、分块。
+    async fn run_plan(&self, ctx: &CheckContext<'_>, plan: &CheckPlan) -> CheckReport {
+        if !self.compliant_for(ctx) {
+            return CheckReport::free(Verdict::unavailable(
+                SafetyUnavailableCause::NoCompliantChecker,
+            ));
+        }
+        if let Some(cause) = plan.refusal() {
+            return CheckReport::free(Verdict::unavailable(cause));
+        }
+        if plan.is_free() {
+            // 没有任何要检查的文本（空回答）：没有什么可放行的，也没有什么可拦的
+            return CheckReport::free(Verdict::Allow);
+        }
+        match (plan.estimate(), plan.calls()) {
+            (Some(estimate), Some(calls)) if estimate.endpoint == self.settings.endpoint => {
+                self.judge_chunks(ctx, calls).await
+            }
+            // 计划不是这个检查器自己定的（没有调用列表，或者是别的端点的）：没法发，也不放行
+            _ => CheckReport::free(Verdict::unavailable(SafetyUnavailableCause::Internal)),
+        }
+    }
+}
+
 impl SafetyChecker for LlmJudge {
     fn check_input<'a>(
         &'a self,
         ctx: &'a CheckContext<'a>,
         input: &'a CheckedInput,
     ) -> BoxFuture<'a, CheckReport> {
+        // 单独调用（没有 gate 给的计划）：自己定一份计划再按它发
         Box::pin(async move {
-            if !self.compliant_for(ctx) {
-                return CheckReport::free(Verdict::unavailable(
-                    SafetyUnavailableCause::NoCompliantChecker,
-                ));
-            }
-            let Some(payloads) = self.input_payloads(input) else {
-                return CheckReport::free(Verdict::unavailable(SafetyUnavailableCause::TooLarge));
-            };
-            if payloads.is_empty() {
-                return CheckReport::free(Verdict::Allow);
-            }
-            self.judge_chunks(ctx, payloads).await
+            let plan = self.plan(SafetyStage::Input, input, None);
+            self.run_plan(ctx, &plan).await
         })
     }
 
@@ -632,50 +686,47 @@ impl SafetyChecker for LlmJudge {
         output: &'a CheckedOutput,
     ) -> BoxFuture<'a, CheckReport> {
         Box::pin(async move {
-            if !self.compliant_for(ctx) {
-                return CheckReport::free(Verdict::unavailable(
-                    SafetyUnavailableCause::NoCompliantChecker,
-                ));
-            }
-            let Some(payloads) = self.output_payloads(input, output) else {
-                return CheckReport::free(Verdict::unavailable(SafetyUnavailableCause::TooLarge));
-            };
-            if payloads.is_empty() {
-                // 没有任何要检查的文本（空回答）：没有什么可放行的，也没有什么可拦的
-                return CheckReport::free(Verdict::Allow);
-            }
-            self.judge_chunks(ctx, payloads).await
+            let plan = self.plan(SafetyStage::Output, input, Some(output));
+            self.run_plan(ctx, &plan).await
         })
     }
 
-    fn estimate(&self, stage: SafetyStage, text_bytes: usize) -> Option<ExtraCostEstimate> {
-        let _ = stage;
-        let chunk_bytes = self.settings.max_chunk_bytes.max(1);
-        let chunks = text_bytes
-            .div_ceil(chunk_bytes)
-            .clamp(1, self.settings.max_chunks) as u64;
-        // 每块：提示开销 + 这块的文本（保守地按每字节一个 token）；上界 = 最多 max_chunks 块
-        let input_tokens = chunks
-            .saturating_mul(PROMPT_OVERHEAD_TOKENS)
-            .saturating_add(text_bytes as u64);
-        // 多块时输出 token 也按块数累加（一块时就是一次调用的上界）
-        let output_cap = self.settings.max_output_tokens.saturating_mul(chunks);
-        let reserved = reserve(
-            &ReservePolicy::new(output_cap, 1).ok()?,
-            &ReserveRequest {
-                requested_max_tokens: Some(output_cap),
-                input_tokens_estimate: input_tokens,
-            },
-            &self.settings.cost_rates,
-        )
-        .ok()?;
-        // token 数一并给出：账本要付款单位的价，用检查端点的价目表按同样的 token 数折算（见 `ledger_cost`）
-        Some(ExtraCostEstimate {
-            endpoint: self.settings.endpoint.clone(),
-            max_cost: reserved.amount,
-            max_input_tokens: input_tokens,
-            max_output_tokens: reserved.effective_max_tokens,
-        })
+    /// **先生成最终要发出的每一个调用（payload 和分块），再按它们算全部调用的上界**（round2-r3 N3）。
+    /// 旧做法是按原始文本的字节估一个分块数：解码展开让检查模型看到的内容比原始参数长得多、贪心装箱让块数比
+    /// `ceil(字节数 / 块大小)` 多、每块都带着上下文和包装，真正发出的调用比估算多，超出预留的部分由平台承担。
+    fn plan(
+        &self,
+        _stage: SafetyStage,
+        input: &CheckedInput,
+        output: Option<&CheckedOutput>,
+    ) -> CheckPlan {
+        let payloads = match output {
+            None => self.input_payloads(input),
+            Some(output) => self.output_payloads(input, output),
+        };
+        // 内容分不进允许的块数：检查不了，不能放行
+        let Some(payloads) = payloads else {
+            return CheckPlan::refused(SafetyUnavailableCause::TooLarge);
+        };
+        if payloads.is_empty() {
+            // 没有任何要检查的文本：没有调用，也就没有什么要预留
+            return CheckPlan::free();
+        }
+        match self.estimate_calls(&payloads) {
+            Some(estimate) => CheckPlan::paid_calls(payloads, estimate),
+            // 成本算不出来（价目溢出）：没法预留，就不能发
+            None => CheckPlan::refused(SafetyUnavailableCause::Internal),
+        }
+    }
+
+    fn execute<'a>(
+        &'a self,
+        ctx: &'a CheckContext<'a>,
+        _input: &'a CheckedInput,
+        _output: Option<&'a CheckedOutput>,
+        plan: &'a CheckPlan,
+    ) -> BoxFuture<'a, CheckReport> {
+        Box::pin(async move { self.run_plan(ctx, plan).await })
     }
 }
 
@@ -1037,5 +1088,153 @@ mod tests {
             .map(|(_, text)| text.as_str())
             .expect("the decoded view is a supplement");
         assert!(decoded.contains("kill yourself"), "{decoded}");
+    }
+
+    // ---- 计划：预留和发送共用同一份（round2-r3 N3）----
+
+    /// 嵌套的 JSON 字符串（7000 个 a）加一个 `\u` 转义：检查模型看到的内容（原文 + 解码补充）是原始参数的两倍多。
+    fn expanding_arguments() -> String {
+        let inner = serde_json::to_string(&json!({"value": "a".repeat(7_000)})).unwrap();
+        let backslash = '\\';
+        format!(
+            "{{\"payload\":{},\"note\":\"{backslash}u0041\"}}",
+            serde_json::to_string(&inner).unwrap()
+        )
+    }
+
+    #[test]
+    fn the_plan_reserves_every_call_it_will_send_and_nothing_less() {
+        let judge = offline_judge(8 * 1024, 4);
+        let arguments = expanding_arguments();
+        let output = answer_with_tool_call("f", &arguments);
+        let input = CheckedInput::default();
+        let plan = judge.plan(SafetyStage::Output, &input, Some(&output));
+        // 计划里的调用就是 `output_payloads` 的结果：一个字节都不差
+        let payloads = judge.output_payloads(&input, &output).unwrap();
+        let calls: Vec<&str> = plan
+            .calls()
+            .expect("the plan carries its calls")
+            .iter()
+            .map(Sensitive::expose)
+            .collect();
+        assert_eq!(
+            calls,
+            payloads.iter().map(String::as_str).collect::<Vec<_>>()
+        );
+        assert!(
+            calls.len() >= 3,
+            "the review's fixture needs several calls: {}",
+            calls.len()
+        );
+        // 预留 = 全部调用之和：每次调用 = 提示开销 + 这次调用的字节；输出上限按调用个数累加
+        let estimate = plan.estimate().expect("a paid plan");
+        let needed_input: u64 = calls
+            .iter()
+            .map(|call| PROMPT_OVERHEAD_TOKENS + call.len() as u64)
+            .sum();
+        assert_eq!(estimate.max_input_tokens, needed_input);
+        assert_eq!(estimate.max_output_tokens, 32 * calls.len() as u64);
+        assert_eq!(estimate.endpoint, *judge.endpoint());
+        // 旧的估法（按原始文本的字节估一次分块）会少估：原始参数一个块就装得下
+        let old_chunks = (output.total_bytes() + input.last_user_text().map_or(0, str::len))
+            .div_ceil(8 * 1024)
+            .clamp(1, 4);
+        assert!(old_chunks < calls.len(), "{old_chunks} vs {}", calls.len());
+        // 同一份输入，同一份计划（确定的）
+        let again = judge.plan(SafetyStage::Output, &input, Some(&output));
+        assert_eq!(again.estimate(), plan.estimate());
+        assert_eq!(again.calls().map(<[_]>::len), plan.calls().map(<[_]>::len));
+    }
+
+    #[test]
+    fn the_plan_refuses_what_cannot_be_split_into_the_allowed_number_of_calls() {
+        let judge = offline_judge(64, 2);
+        // 每块最多 64 字节、最多 2 块：一段很长的回答分不进去 -> 计划是拒绝（太大），没有上界、没有调用
+        let output = CheckedOutput {
+            content: Some(Sensitive::new("x".repeat(1_000))),
+            refusal: None,
+            tool_calls: Vec::new(),
+        };
+        let plan = judge.plan(SafetyStage::Output, &CheckedInput::default(), Some(&output));
+        assert_eq!(plan.refusal(), Some(SafetyUnavailableCause::TooLarge));
+        assert!(plan.estimate().is_none() && plan.calls().is_none());
+        // 同样的话分得进去就是一个付费计划
+        let small = CheckedOutput {
+            content: Some(Sensitive::new("four")),
+            refusal: None,
+            tool_calls: Vec::new(),
+        };
+        let judge = offline_judge(8 * 1024, 4);
+        let plan = judge.plan(SafetyStage::Output, &CheckedInput::default(), Some(&small));
+        assert_eq!(plan.calls().map(<[_]>::len), Some(1));
+        assert_eq!(plan.estimate().unwrap().max_output_tokens, 32);
+    }
+
+    #[test]
+    fn nothing_to_check_is_a_free_plan() {
+        // 空回答：没有调用，也就没有什么要预留
+        let judge = offline_judge(8 * 1024, 4);
+        let empty = CheckedOutput::default();
+        let plan = judge.plan(SafetyStage::Output, &CheckedInput::default(), Some(&empty));
+        assert!(plan.is_free());
+        assert!(plan.estimate().is_none() && plan.refusal().is_none());
+        // 输入没有任何文本片段：同样
+        assert!(
+            judge
+                .plan(SafetyStage::Input, &CheckedInput::default(), None)
+                .is_free()
+        );
+    }
+
+    #[tokio::test]
+    async fn the_judge_only_executes_a_plan_it_made_itself() {
+        use idoris_compute_contracts::ids::{RequestId, TimestampMs};
+        use idoris_compute_contracts::permit::{Billing, DataClass, Retention, TenantDataPolicy};
+        use tokio_util::sync::CancellationToken;
+
+        let judge = offline_judge(8 * 1024, 4);
+        let request_id = RequestId::new("req-plan").unwrap();
+        let tenant = TenantDataPolicy::new(
+            std::collections::BTreeSet::from([DataClass::ChildEdu]),
+            None,
+            Retention::Zdr,
+            true,
+        )
+        .unwrap();
+        let cancel = CancellationToken::new();
+        // 2026-11-13：检查端点核验（2026-11-12）后一天，仍然合规
+        let ctx = CheckContext {
+            request_id: &request_id,
+            tenant: &tenant,
+            billing: Billing::Paid,
+            now: TimestampMs(1_794_528_000_000),
+            cancel: &cancel,
+            deadline: Instant::now() + std::time::Duration::from_secs(5),
+        };
+        let input = CheckedInput::default();
+        // 别的检查器的计划（只有上界、没有调用列表）：不能照着它发，也不能放行
+        let foreign = CheckPlan::paid(ExtraCostEstimate {
+            endpoint: EndpointKey::new("example-other", "example-org/other-8b", "openai-compat")
+                .unwrap(),
+            max_cost: Cost::from_micros(idoris_compute_contracts::money::Unit::Usd, 1).unwrap(),
+            max_input_tokens: 1,
+            max_output_tokens: 1,
+        });
+        let report = judge.execute(&ctx, &input, None, &foreign).await;
+        assert_eq!(
+            report.verdict,
+            Verdict::unavailable(SafetyUnavailableCause::Internal)
+        );
+        assert!(report.spend.is_empty(), "nothing was sent");
+        // 没法进行的计划：按计划的原因拒绝，不发
+        let refused = CheckPlan::refused(SafetyUnavailableCause::TooLarge);
+        let report = judge.execute(&ctx, &input, None, &refused).await;
+        assert_eq!(
+            report.verdict,
+            Verdict::unavailable(SafetyUnavailableCause::TooLarge)
+        );
+        // 免费的计划（没有文本）：放行，没有花费
+        let report = judge.execute(&ctx, &input, None, &CheckPlan::free()).await;
+        assert_eq!(report.verdict, Verdict::Allow);
     }
 }

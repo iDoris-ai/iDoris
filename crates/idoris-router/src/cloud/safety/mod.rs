@@ -18,7 +18,8 @@
 //!  ① 输入检查  extract_input_with：**转发的请求**（`build_chat_body` 构造的那份）里客户端写的**每一个**字符串，值和键名都取；
 //!    │          客户端写的一切（含 system / developer 角色）都按孩子写的话，只有服务端登记的运营方提示得到运营方的待遇
 //!    │          免费的规则预检 ──拒绝──▶ 422 safety_input_blocked（**先于**下面的预留：额度不足的孩子写了自伤内容拿到 422，不是 402）
-//!    │          ExtraCostMeter::reserve（账本里预留 `safety_input`：LLM 检查的成本占付款账户链的额度；放不下 = 准入拒绝，不检查、不出网）
+//!    │          SafetyChecker::plan（先生成最终要发出的每一个调用，分块已定；内容分不进允许的块数 = 503 too_large，不预留）
+//!    │          ExtraCostMeter::reserve（账本里预留 `safety_input`：按计划里**全部**调用算的上界占付款账户链的额度；放不下 = 准入拒绝，不检查、不出网）
 //!    │          规则检查器 ──拒绝──▶ 422 safety_input_blocked（不再调用 LLM）
 //!    │            └─放行─▶ LLM 检查器 ──拒绝──▶ 422 safety_input_blocked
 //!    │          超时 / 出错 / 返回垃圾 / 分类器不可用 ──▶ 503 safety_unavailable
@@ -170,6 +171,125 @@ impl std::fmt::Debug for CheckContext<'_> {
     }
 }
 
+/// 一次检查的**最终计划**（round2-r3 N3）。
+///
+/// 花钱的检查（LLM）要先占额度、再发调用。旧做法是按原始文本的字节估一个调用数去占额度，检查器自己再把文本展开、分块、发出去：
+/// 展开（工具参数的解码视图）和分块（贪心装箱，每块都带着上下文和包装）会让真正发出的调用比估算多，超出预留的部分由平台承担。
+/// 现在顺序反过来：**先生成最终要发出的每一个调用的内容（分块已经定了），再按这些调用算全部的花费上界去预留，最后发送的
+/// 就是这同一份**：[`SafetyChecker::plan`] -> [`SafetyGate`] 按 [`CheckPlan::estimate`] 预留 -> [`SafetyChecker::execute`]
+/// 逐个发送计划里的调用。预留和发送不会各算各的。
+#[derive(Clone)]
+pub struct CheckPlan {
+    kind: PlanKind,
+}
+
+#[derive(Clone)]
+enum PlanKind {
+    /// 免费的检查（规则检查器，或者这次没有任何要检查的文本）：没有调用要预留。
+    Free,
+    /// 花钱的检查。`estimate` 是按计划里**全部**调用算出的花费上界；`calls` 是要发出的每一个调用的最终内容
+    /// （检查器自己的计划；`None` = 旧接口 [`SafetyChecker::estimate`] 只给了上界，没有调用列表）。
+    Paid {
+        estimate: ExtraCostEstimate,
+        calls: Option<Arc<Vec<text::Sensitive>>>,
+    },
+    /// 这是一次花钱的检查，但没法进行（内容分不进允许的块数、成本算不出来）：不花钱、不放行，gate 按这个原因拒绝。
+    Refused(SafetyUnavailableCause),
+}
+
+impl CheckPlan {
+    /// 免费的检查：没有调用要预留。
+    pub fn free() -> Self {
+        Self {
+            kind: PlanKind::Free,
+        }
+    }
+
+    /// 花钱的检查，只有上界、没有自己的调用列表（旧接口 [`SafetyChecker::estimate`] 的结果）。
+    pub fn paid(estimate: ExtraCostEstimate) -> Self {
+        Self {
+            kind: PlanKind::Paid {
+                estimate,
+                calls: None,
+            },
+        }
+    }
+
+    /// 花钱的检查：`calls` 是要发出的每一个调用的最终内容，`estimate` 必须是按它们算出的全部调用的花费上界。
+    pub fn paid_calls(calls: Vec<String>, estimate: ExtraCostEstimate) -> Self {
+        Self {
+            kind: PlanKind::Paid {
+                estimate,
+                calls: Some(Arc::new(
+                    calls.into_iter().map(text::Sensitive::new).collect(),
+                )),
+            },
+        }
+    }
+
+    /// 花钱的检查没法进行：不花钱、不放行。
+    pub fn refused(cause: SafetyUnavailableCause) -> Self {
+        Self {
+            kind: PlanKind::Refused(cause),
+        }
+    }
+
+    /// 是免费的检查（没有调用要预留）吗？
+    pub fn is_free(&self) -> bool {
+        matches!(self.kind, PlanKind::Free)
+    }
+
+    /// 要按它占额度的上界；免费的、或者没法进行的计划没有。
+    pub fn estimate(&self) -> Option<&ExtraCostEstimate> {
+        match &self.kind {
+            PlanKind::Paid { estimate, .. } => Some(estimate),
+            PlanKind::Free | PlanKind::Refused(_) => None,
+        }
+    }
+
+    /// 没法进行的原因（内容分不进允许的块数……）。
+    pub fn refusal(&self) -> Option<SafetyUnavailableCause> {
+        match &self.kind {
+            PlanKind::Refused(cause) => Some(*cause),
+            PlanKind::Free | PlanKind::Paid { .. } => None,
+        }
+    }
+
+    /// 要发出的每一个调用的最终内容（检查器自己的计划）。
+    pub fn calls(&self) -> Option<&[text::Sensitive]> {
+        match &self.kind {
+            PlanKind::Paid { calls, .. } => calls.as_deref().map(Vec::as_slice),
+            PlanKind::Free | PlanKind::Refused(_) => None,
+        }
+    }
+}
+
+impl std::fmt::Debug for CheckPlan {
+    // 只有个数和 token 上界，没有调用的内容
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.kind {
+            PlanKind::Free => f.write_str("CheckPlan::Free"),
+            PlanKind::Paid { estimate, calls } => f
+                .debug_struct("CheckPlan::Paid")
+                .field("calls", &calls.as_ref().map(|calls| calls.len()))
+                .field("max_input_tokens", &estimate.max_input_tokens)
+                .field("max_output_tokens", &estimate.max_output_tokens)
+                .finish_non_exhaustive(),
+            PlanKind::Refused(cause) => write!(f, "CheckPlan::Refused({cause})"),
+        }
+    }
+}
+
+/// 旧接口 [`SafetyChecker::estimate`] 要的文本字节数：输入检查是请求里要检查的全部文本；输出检查是回答里的文本加上孩子最后一句话（上下文）。
+fn legacy_text_bytes(input: &CheckedInput, output: Option<&CheckedOutput>) -> usize {
+    match output {
+        None => input.total_bytes(),
+        Some(output) => output
+            .total_bytes()
+            .saturating_add(input.last_user_text().map_or(0, str::len)),
+    }
+}
+
 /// 安全检查器：输入检查和完整输出检查。
 ///
 /// 实现的约束（gate 会再兜一层，但实现自己也必须遵守）：
@@ -194,8 +314,46 @@ pub trait SafetyChecker: Send + Sync + std::fmt::Debug {
     ) -> BoxFuture<'a, CheckReport>;
 
     /// 这次检查最多花多少钱（上界）；免费的检查器返回 `None`。用于事前占额度，见 [`cost`]。
+    ///
+    /// 这是**按原始文本字节数估**的旧接口，只给没有自己调用列表的检查器用（[`SafetyChecker::plan`] 的默认实现用它）。
+    /// 会真的发出多次调用的检查器（LLM）必须覆盖 [`SafetyChecker::plan`]：估算和发送要共用同一份调用列表。
     fn estimate(&self, _stage: SafetyStage, _text_bytes: usize) -> Option<ExtraCostEstimate> {
         None
+    }
+
+    /// **检查之前**：定下这次检查的最终计划（见 [`CheckPlan`]）。gate 按计划里的上界占额度，再把**同一份**计划交给
+    /// [`SafetyChecker::execute`]。`output` 为 `None` 是输入检查。
+    ///
+    /// 默认：没有自己的调用列表，按旧接口 [`SafetyChecker::estimate`] 的上界（有就是花钱的检查，没有就是免费的）。
+    /// 会花钱的检查器（LLM）必须覆盖它：先生成最终要发出的每个调用，再按它们算全部调用的上界。
+    fn plan(
+        &self,
+        stage: SafetyStage,
+        input: &CheckedInput,
+        output: Option<&CheckedOutput>,
+    ) -> CheckPlan {
+        match self.estimate(stage, legacy_text_bytes(input, output)) {
+            Some(estimate) => CheckPlan::paid(estimate),
+            None => CheckPlan::free(),
+        }
+    }
+
+    /// **按计划**检查（`output` 为 `None` 是输入检查）：gate 用的入口，`plan` 就是预留时用的那一份。
+    ///
+    /// 默认忽略计划，直接调用 [`SafetyChecker::check_input`] / [`SafetyChecker::check_output`]（免费的检查器、没有自己的
+    /// 调用列表的检查器）。有自己的调用列表的检查器（LLM）覆盖它：发送的就是计划里的调用，不再重新展开、分块。
+    fn execute<'a>(
+        &'a self,
+        ctx: &'a CheckContext<'a>,
+        input: &'a CheckedInput,
+        output: Option<&'a CheckedOutput>,
+        plan: &'a CheckPlan,
+    ) -> BoxFuture<'a, CheckReport> {
+        let _ = plan;
+        match output {
+            None => self.check_input(ctx, input),
+            Some(output) => self.check_output(ctx, input, output),
+        }
     }
 
     /// **免费的预检**（输入）：gate 在**占检查费用的额度之前**调用它。返回 `Some` 就是已经能拒绝了，gate 直接拒绝，
@@ -239,6 +397,32 @@ impl SafetyPipeline {
     fn checkers(&self) -> impl Iterator<Item = &Arc<dyn SafetyChecker>> {
         std::iter::once(&self.first).chain(self.rest.iter())
     }
+
+    /// 按计划把每个检查器跑一遍：任一拒绝即拒绝，后面的不再调用。每个检查器拿到的是**同一份**计划，
+    /// 用不用由它自己决定（免费的检查器不用，LLM 检查器发送计划里的调用）。
+    async fn run_all(
+        &self,
+        ctx: &CheckContext<'_>,
+        input: &CheckedInput,
+        output: Option<&CheckedOutput>,
+        plan: &CheckPlan,
+    ) -> CheckReport {
+        let mut spend = Vec::new();
+        for checker in self.checkers() {
+            let report = checker.execute(ctx, input, output, plan).await;
+            spend.extend(report.spend);
+            if !report.verdict.is_allow() {
+                return CheckReport {
+                    verdict: report.verdict,
+                    spend,
+                };
+            }
+        }
+        CheckReport {
+            verdict: Verdict::Allow,
+            spend,
+        }
+    }
 }
 
 impl SafetyChecker for SafetyPipeline {
@@ -247,22 +431,10 @@ impl SafetyChecker for SafetyPipeline {
         ctx: &'a CheckContext<'a>,
         input: &'a CheckedInput,
     ) -> BoxFuture<'a, CheckReport> {
+        // 单独调用（没有 gate 给的计划）：自己定一份计划再按它跑
         Box::pin(async move {
-            let mut spend = Vec::new();
-            for checker in self.checkers() {
-                let report = checker.check_input(ctx, input).await;
-                spend.extend(report.spend);
-                if !report.verdict.is_allow() {
-                    return CheckReport {
-                        verdict: report.verdict,
-                        spend,
-                    };
-                }
-            }
-            CheckReport {
-                verdict: Verdict::Allow,
-                spend,
-            }
+            let plan = self.plan(SafetyStage::Input, input, None);
+            self.run_all(ctx, input, None, &plan).await
         })
     }
 
@@ -273,21 +445,8 @@ impl SafetyChecker for SafetyPipeline {
         output: &'a CheckedOutput,
     ) -> BoxFuture<'a, CheckReport> {
         Box::pin(async move {
-            let mut spend = Vec::new();
-            for checker in self.checkers() {
-                let report = checker.check_output(ctx, input, output).await;
-                spend.extend(report.spend);
-                if !report.verdict.is_allow() {
-                    return CheckReport {
-                        verdict: report.verdict,
-                        spend,
-                    };
-                }
-            }
-            CheckReport {
-                verdict: Verdict::Allow,
-                spend,
-            }
+            let plan = self.plan(SafetyStage::Output, input, Some(output));
+            self.run_all(ctx, input, Some(output), &plan).await
         })
     }
 
@@ -295,6 +454,29 @@ impl SafetyChecker for SafetyPipeline {
         // 管线里至多一个会花钱的检查器（LLM）；有多个时只能占第一个的额度，所以配置层只允许一个
         self.checkers()
             .find_map(|checker| checker.estimate(stage, text_bytes))
+    }
+
+    fn plan(
+        &self,
+        stage: SafetyStage,
+        input: &CheckedInput,
+        output: Option<&CheckedOutput>,
+    ) -> CheckPlan {
+        // 管线里至多一个会花钱的检查器（LLM）：取第一个不是免费的计划（免费的检查器的计划都是空的）
+        self.checkers()
+            .map(|checker| checker.plan(stage, input, output))
+            .find(|plan| !plan.is_free())
+            .unwrap_or_else(CheckPlan::free)
+    }
+
+    fn execute<'a>(
+        &'a self,
+        ctx: &'a CheckContext<'a>,
+        input: &'a CheckedInput,
+        output: Option<&'a CheckedOutput>,
+        plan: &'a CheckPlan,
+    ) -> BoxFuture<'a, CheckReport> {
+        Box::pin(async move { self.run_all(ctx, input, output, plan).await })
     }
 
     fn precheck_input(&self, input: &CheckedInput) -> Option<Denial> {
@@ -589,17 +771,15 @@ impl SafetyGate {
         input: &CheckedInput,
         output: Option<&CheckedOutput>,
     ) -> Result<(), GateDenial> {
-        let text_bytes = match output {
-            None => input.total_bytes(),
-            Some(output) => output
-                .total_bytes()
-                .saturating_add(input.last_user_text().map_or(0, str::len)),
-        };
-        let estimate = self.checker.estimate(stage, text_bytes);
+        // ---- 先定计划：最终要发出的每一个调用（分块已经定了），和按它们算出的**全部**调用的花费上界 ----
+        // 预留和发送共用这一份（round2-r3 N3）：下面按 `plan.estimate()` 占额度，最后把同一份计划交给检查器去发。
+        // 不再是「按原始文本的字节估一个调用数去占额度，检查器自己再展开、分块、发出去」——展开（工具参数解码）和分块
+        // （贪心装箱、每块都带上下文和包装）会让真正发出的调用比估算多，超出预留的部分由平台承担。
+        let plan = self.checker.plan(stage, input, output);
         // ---- 免费的预检在前：规则命中就直接拒绝，不占检查费用的额度 ----
         // 只有这次检查要花钱时才值得单独做一遍（免费的检查器在后面的完整检查里本来就先跑）。
         // 额度不足的孩子写了自伤内容，得到的应该是 422 `self_harm`（eduai 要靠它升级），不是 402（PR-Daemon S5 F4）。
-        if estimate.is_some() {
+        if !plan.is_free() {
             let precheck = match output {
                 None => self.checker.precheck_input(input),
                 Some(output) => self.checker.precheck_output(input, output),
@@ -614,8 +794,12 @@ impl SafetyGate {
                 None => {}
             }
         }
+        // ---- 这次花钱的检查没法进行（内容分不进允许的块数、成本算不出来）：不占额度、不出网、不放行 ----
+        if let Some(cause) = plan.refusal() {
+            return Err(self.deny(call, GateDenial::Unavailable { stage, cause }));
+        }
         // ---- 准入：这次检查要花钱，先占额度。放不下就不检查、不调用上游 ----
-        let guard = match &estimate {
+        let guard = match plan.estimate() {
             None => None,
             Some(estimate) => match self.cost.reserve(&ExtraCostRequest {
                 request_id: call.request_id,
@@ -650,12 +834,8 @@ impl SafetyGate {
             deadline: Instant::now() + self.limits.check_timeout,
         };
         let outcome = {
-            let check = async {
-                match output {
-                    None => self.checker.check_input(&ctx, input).await,
-                    Some(output) => self.checker.check_output(&ctx, input, output).await,
-                }
-            };
+            // 发送的就是预留时的那一份计划（调用写在 async 块里：检查器同步地 panic 也被 `catch_unwind` 接住）
+            let check = async { self.checker.execute(&ctx, input, output, &plan).await };
             let guarded = std::panic::AssertUnwindSafe(check).catch_unwind();
             tokio::select! {
                 biased;
@@ -1255,6 +1435,195 @@ mod tests {
             other => panic!("{other:?}"),
         }
         assert_eq!(meter.open_tickets(), 0);
+    }
+
+    /// 有自己调用列表的付费检查器：计划里是三个调用，`execute` 记下它拿到的计划；gate 不该绕过计划去调 `check_input` / `check_output`。
+    #[derive(Debug, Default)]
+    struct Planned {
+        /// 每次 `execute` 看到的计划里的调用个数。
+        executed: std::sync::Mutex<Vec<usize>>,
+        legacy_calls: AtomicUsize,
+    }
+
+    impl Planned {
+        fn estimate() -> ExtraCostEstimate {
+            ExtraCostEstimate {
+                endpoint: test_support::endpoint_key(),
+                // 三个调用的上界之和（和单个调用的上界不一样）
+                max_cost: idoris_compute_contracts::pricing::Cost::from_micros(
+                    idoris_compute_contracts::money::Unit::Usd,
+                    300,
+                )
+                .unwrap(),
+                max_input_tokens: 1_950,
+                max_output_tokens: 96,
+            }
+        }
+    }
+
+    impl SafetyChecker for Planned {
+        fn check_input<'a>(
+            &'a self,
+            _ctx: &'a CheckContext<'a>,
+            _input: &'a CheckedInput,
+        ) -> BoxFuture<'a, CheckReport> {
+            self.legacy_calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { CheckReport::free(Verdict::Allow) })
+        }
+
+        fn check_output<'a>(
+            &'a self,
+            _ctx: &'a CheckContext<'a>,
+            _input: &'a CheckedInput,
+            _output: &'a CheckedOutput,
+        ) -> BoxFuture<'a, CheckReport> {
+            self.legacy_calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { CheckReport::free(Verdict::Allow) })
+        }
+
+        fn plan(
+            &self,
+            _stage: SafetyStage,
+            _input: &CheckedInput,
+            _output: Option<&CheckedOutput>,
+        ) -> CheckPlan {
+            CheckPlan::paid_calls(
+                vec!["call-1".into(), "call-2".into(), "call-3".into()],
+                Self::estimate(),
+            )
+        }
+
+        fn execute<'a>(
+            &'a self,
+            _ctx: &'a CheckContext<'a>,
+            _input: &'a CheckedInput,
+            _output: Option<&'a CheckedOutput>,
+            plan: &'a CheckPlan,
+        ) -> BoxFuture<'a, CheckReport> {
+            let calls = plan.calls().map_or(0, <[_]>::len);
+            self.executed.lock().unwrap().push(calls);
+            Box::pin(async {
+                CheckReport {
+                    verdict: Verdict::Allow,
+                    spend: vec![test_support_spend(40)],
+                }
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn the_reservation_comes_from_the_plan_and_the_plan_is_what_gets_executed() {
+        // round2-r3 N3：先定计划（最终要发出的全部调用 + 按它们算的全部上界），按计划预留，发送的是同一份计划
+        let checker = Arc::new(Planned::default());
+        let meter = Arc::new(SimpleExtraCost::new());
+        let gate = SafetyGate::new(checker.clone(), SafetyLimits::default(), meter.clone());
+        run(&gate, |g, c| {
+            Box::pin(async move { g.check_input(c, &request_body()).await })
+        })
+        .await
+        .unwrap();
+        run(&gate, |g, c| {
+            Box::pin(async move {
+                g.check_output(c, &CheckedInput::default(), &upstream_body(), "route-model")
+                    .await
+            })
+        })
+        .await
+        .unwrap();
+        let entries = meter.entries();
+        assert_eq!(entries.len(), 2);
+        for entry in &entries {
+            assert_eq!(
+                entry.reserved,
+                Planned::estimate().max_cost,
+                "{:?} reserves the plan's upper bound for all of its calls",
+                entry.stage
+            );
+        }
+        assert_eq!(
+            *checker.executed.lock().unwrap(),
+            vec![3, 3],
+            "the checker executed the same three-call plan that was reserved"
+        );
+        assert_eq!(
+            checker.legacy_calls.load(Ordering::SeqCst),
+            0,
+            "the gate goes through the plan, not around it"
+        );
+    }
+
+    /// 付费、但内容分不进允许的块数：计划是拒绝；任何一个检查接口都不该被调用。
+    #[derive(Debug)]
+    struct TooBig;
+
+    impl SafetyChecker for TooBig {
+        fn check_input<'a>(
+            &'a self,
+            _ctx: &'a CheckContext<'a>,
+            _input: &'a CheckedInput,
+        ) -> BoxFuture<'a, CheckReport> {
+            panic!("a refused plan must not be executed");
+        }
+
+        fn check_output<'a>(
+            &'a self,
+            _ctx: &'a CheckContext<'a>,
+            _input: &'a CheckedInput,
+            _output: &'a CheckedOutput,
+        ) -> BoxFuture<'a, CheckReport> {
+            panic!("a refused plan must not be executed");
+        }
+
+        fn plan(
+            &self,
+            _stage: SafetyStage,
+            _input: &CheckedInput,
+            _output: Option<&CheckedOutput>,
+        ) -> CheckPlan {
+            CheckPlan::refused(SafetyUnavailableCause::TooLarge)
+        }
+    }
+
+    #[tokio::test]
+    async fn a_refused_plan_reserves_nothing_calls_nothing_and_still_lets_the_free_rules_speak_first()
+     {
+        let meter = Arc::new(SimpleExtraCost::new());
+        let pipeline = SafetyPipeline::new(Arc::new(RuleChecker::new())).then(Arc::new(TooBig));
+        let gate = SafetyGate::new(Arc::new(pipeline), SafetyLimits::default(), meter.clone());
+        // 没有规则命中：按计划拒绝（太大），没有任何预留
+        let denial = run(&gate, |g, c| {
+            Box::pin(async move { g.check_input(c, &request_body()).await })
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(
+            denial,
+            GateDenial::Unavailable {
+                stage: SafetyStage::Input,
+                cause: SafetyUnavailableCause::TooLarge
+            }
+        );
+        assert!(meter.entries().is_empty(), "nothing was reserved");
+        assert_eq!(meter.open_tickets(), 0);
+        // 规则先说话：有害的输入是 422 + 类别，不是「太大」
+        let harmful = json!({"messages": [{"role": "user", "content": "i want to die"}]})
+            .as_object()
+            .unwrap()
+            .clone();
+        let denial = run(&gate, |g, c| {
+            let harmful = harmful.clone();
+            Box::pin(async move { g.check_input(c, &harmful).await })
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(
+            denial,
+            GateDenial::Blocked {
+                stage: SafetyStage::Input,
+                category: SafetyCategory::SelfHarm
+            }
+        );
+        assert!(meter.entries().is_empty());
     }
 
     #[tokio::test]

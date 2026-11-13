@@ -5,7 +5,8 @@
 //!
 //! - **N1（round2-r2 与 round2-r3 同一问题）**：`rules_only_acknowledgement` 的到期日要在运行期间生效——进程不重启，时钟拨过
 //!   到期日（跨 UTC 日期、长期运行），儿童请求就在调用任何上游之前被拒绝；
-//! - **N2**：LLM 检查器看到的工具参数不能丢掉数字、布尔和 `null`。
+//! - **N2**：LLM 检查器看到的工具参数不能丢掉数字、布尔和 `null`；
+//! - **N3**：LLM 检查器的预留按最终要发出的全部调用算，不是按原始文本的字节估一次。
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 #[path = "support/child_safety.rs"]
@@ -17,14 +18,18 @@ mod harness;
 
 use std::sync::Arc;
 
-use child_safety::{answer, benign_question, child_body, child_with, judge_allow};
+use child_safety::{Child, answer, benign_question, child_body, child_with, judge_allow};
 use fake_upstream::{Behavior, FakeUpstream, usage};
 use harness::{
     Caller, DAY_MS, Endpoint, NOW_MS, Options, RecordingAdmission, VERIFIED_MS, build, post,
 };
 use idoris_compute_contracts::ids::TimestampMs;
-use idoris_router::cloud::ManualClock;
-use serde_json::json;
+use idoris_compute_contracts::money::Unit;
+use idoris_compute_contracts::pricing::{Cost, RateCard, USAGE_ROUNDING, amount_for_tokens};
+use idoris_compute_contracts::safety::SafetyStage;
+use idoris_router::cloud::safety::llm::PROMPT_OVERHEAD_TOKENS;
+use idoris_router::cloud::{ManualClock, SimpleExtraCost};
+use serde_json::{Value, json};
 
 fn unavailable(reply: &harness::Reply, stage: &str, cause: &str) {
     assert_eq!(reply.status, 503, "{}", reply.text());
@@ -202,4 +207,80 @@ async fn the_judge_sees_the_numbers_booleans_and_nulls_of_the_tool_call_argument
             "the judge never saw {scalar}: {output_payload}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// N3：预留按最终要发出的全部调用算
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn every_judge_call_is_covered_by_the_reservation_made_before_the_first_is_sent() {
+    // 一个 `payload` 字符串里内嵌 `{"value":"…7000 个 a…"}`，另外有一个 `\u` 转义（让解码视图出现）：原始参数约 7 KB，
+    // 检查模型看到的内容（原文 + 解码补充）有 21 KB，配合单字符工具名，默认分块（每块 8 KiB）要发出好几次调用。
+    // 旧实现按原始文本的字节估一次分块（一次调用）去占额度，检查器自己再展开、分块、发出去：超出预留的部分由平台承担
+    let inner = serde_json::to_string(&json!({"value": "a".repeat(7_000)})).unwrap();
+    let bs = '\\';
+    let arguments = format!(
+        "{{\"payload\":{},\"note\":\"{bs}u0041\"}}",
+        serde_json::to_string(&inner).unwrap()
+    );
+    let meter = Arc::new(SimpleExtraCost::new());
+    let c: Child = child_with(
+        vec![tool_call_answer("f", &arguments)],
+        vec![judge_allow(); 8],
+        5_000,
+        {
+            let meter = meter.clone();
+            move |options| options.extra_cost = Some(meter)
+        },
+    )
+    .await;
+    let reply = post(&c.h.app, &child_body("hi")).await;
+    assert_eq!(reply.status, 200, "{}", reply.text());
+
+    // 输出阶段实际发给检查模型的每一个调用（的 payload 字节数）
+    let output_calls: Vec<usize> = c
+        .judge
+        .requests()
+        .iter()
+        .filter_map(|request| {
+            let payload = request.json()["messages"][1]["content"]
+                .as_str()?
+                .to_string();
+            let parsed: Value = serde_json::from_str(&payload).ok()?;
+            (parsed["stage"] == "output").then_some(payload.len())
+        })
+        .collect();
+    assert!(
+        output_calls.len() >= 2,
+        "the fixture must need several judge calls, got {output_calls:?}"
+    );
+    // 这些调用的上界之和：每次调用 = 提示开销 + 这次调用的文本字节（按每字节一个 token 算）+ 输出上限（假检查服务配置 32）
+    let needed_input: u64 = output_calls
+        .iter()
+        .map(|len| PROMPT_OVERHEAD_TOKENS + *len as u64)
+        .sum();
+    let needed_output = 32 * output_calls.len() as u64;
+    // 检查端点的成本价目：USD 0.26 / 0.38 每百万 token（`cloud_harness` 的夹具）
+    let rates = RateCard::new(
+        Cost::from_micros(Unit::Usd, 260_000).unwrap(),
+        Cost::from_micros(Unit::Usd, 380_000).unwrap(),
+        None,
+    )
+    .unwrap();
+    let needed = amount_for_tokens(&rates, needed_input, needed_output, USAGE_ROUNDING).unwrap();
+    let entries = meter.entries();
+    let reserved = entries
+        .iter()
+        .find(|entry| entry.stage == SafetyStage::Output)
+        .expect("the output check reserved its cost")
+        .reserved
+        .clone();
+    assert!(
+        reserved.micros() >= needed.micros(),
+        "the reservation ({}) must cover all {} calls that were sent ({} needed)",
+        reserved.micros(),
+        output_calls.len(),
+        needed.micros()
+    );
 }
