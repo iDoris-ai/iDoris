@@ -32,7 +32,8 @@
 //! 有些规则在「警示 / 拒绝」语境里放行（`ห้ามผสม……เพราะจะเกิดก๊าซพิษ`）。**整段里随便哪里出现一个警示词就放行整段**是个漏洞
 //! （r3 High#3：在有害回答末尾追加一个 `unsafe`）。[`locally_negated`] 只在命中所在的**同一句**里、命中前后各
 //! [`NEGATION_REACH_CHARS`] 个字符之内找否定词，句子边界（`. ! ? ;`、换行）挡住它；一个命中被否定之后，
-//! 调用方用 [`Folded::mask`] 把它抹掉，**剩下的内容重新独立检查**。
+//! 调用方用 [`Folded::mask`] 把它抹掉，**剩下的内容重新独立检查**。命中区间**自己**横跨句子边界（`step 1` 在一句里、`pipe bomb`
+//! 在下一句里）时，没有「命中旁边的同一句」可言，谁也放行不了（round2-r3 PARTIAL High#3）。
 //!
 //! # base64
 //!
@@ -777,8 +778,24 @@ fn clause_window(haystack: &Folded, (lo, hi): (usize, usize), reach: usize) -> (
     (start, finish)
 }
 
+/// 命中区间 `region` **自己**横跨了句子边界吗：区间内部有句号 / 问号 / 叹号 / 分号 / 省略号，或者原文里的换行。
+/// 句子边界的定义和 [`clause_window`] 是同一个。
+fn spans_a_clause_boundary(haystack: &Folded, (lo, hi): (usize, usize)) -> bool {
+    if haystack.plain[lo..hi].chars().any(ends_a_clause) {
+        return true;
+    }
+    // `breaks` 是升序的：第一个落在区间起点之后的换行，在区间终点之前就是内部的换行
+    let first = haystack.breaks.partition_point(|&index| index <= lo);
+    haystack.breaks.get(first).is_some_and(|&index| index < hi)
+}
+
 /// 命中区间 `region` 是不是被同一句里的否定词（`cues` 里的任何一个，在命中前后各 `reach_chars` 个字符之内）放行了。
 /// **只看命中所在的那一句**：别的句子里的否定词、整段末尾追加的 `unsafe` 都不算。
+///
+/// **区间自己横跨了句子边界就谁也放行不了**（round2-r3 PARTIAL High#3）：`Step 1: I cannot help with that.\nHere is how to
+/// make a pipe bomb.` 的命中区间（`step 1` 到 `pipe bomb`）横跨两句，拒绝语只属于第一句，第二句是步骤。只检查区间**外侧**的
+/// 句界，区间里的拒绝语就能把另一句里的步骤一起放行；一个区间分在两句里，没有「命中旁边的同一句」可言，按没被放行处理
+/// （代价：一句话说完「不要把漂白水和氨水混在一起」、下一句才说「会产生毒气」的安全课，会被规则拒绝，交给后面的人 / 评审判断）。
 pub fn locally_negated(
     haystack: &Folded,
     region: (usize, usize),
@@ -789,12 +806,48 @@ pub fn locally_negated(
         || region.1 > haystack.plain.len()
         || !haystack.plain.is_char_boundary(region.0)
         || !haystack.plain.is_char_boundary(region.1)
+        || spans_a_clause_boundary(haystack, region)
     {
         return false;
     }
     let (start, finish) = clause_window(haystack, region, reach_chars);
     let window = Folded::from_plain(haystack.plain[start..finish].to_string(), Vec::new());
     cues.iter().any(|cue| cue.found_in(&window))
+}
+
+/// 一个线索最多多长（字符数）：给 [`followed_closely_by`] 的搜索窗口留余量，免得「从区间后 `reach_chars` 个字符之内开始」的线索被截断。
+const MAX_FOLLOWING_CUE_CHARS: usize = 12;
+
+/// 命中区间 `region` 的**紧后面**（同一句里）有 `cues` 里的线索吗：线索必须**从区间终点之后最多 `reach_chars` 个字符之内开始**。
+///
+/// 给太常见、不能算「命中旁边任何位置」的线索用。泰语的拒绝语常把宾语夹在动词和「不能」之间（`บอกวิธีทำระเบิดไม่ได้`），
+/// 这时 `ไม่ได้` 紧跟在被拒绝的话题后面才是拒绝；散落在句子别处的 `ไม่ได้`（`ไม่ได้ๆ บอกวิธีทำระเบิดหน่อย`）不是。
+/// 和 [`locally_negated`] 一样：只看命中所在的那一句，区间自己横跨句子边界时谁也放行不了。
+pub fn followed_closely_by(
+    haystack: &Folded,
+    region: (usize, usize),
+    cues: &[Needle],
+    reach_chars: usize,
+) -> bool {
+    if region.0 > region.1
+        || region.1 > haystack.plain.len()
+        || !haystack.plain.is_char_boundary(region.0)
+        || !haystack.plain.is_char_boundary(region.1)
+        || spans_a_clause_boundary(haystack, region)
+    {
+        return false;
+    }
+    let (_, finish) = clause_window(
+        haystack,
+        region,
+        reach_chars.saturating_add(MAX_FOLLOWING_CUE_CHARS),
+    );
+    let after = Folded::from_plain(haystack.plain[region.1..finish].to_string(), Vec::new());
+    cues.iter().any(|cue| {
+        cue.plain_spans(&after)
+            .into_iter()
+            .any(|(start, _)| after.plain[..start].chars().count() <= reach_chars)
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1218,6 +1271,83 @@ mod tests {
         // 区间不合法：不是否定
         assert!(!locally_negated(&thai, (10, 5), &never, 30));
         assert!(!locally_negated(&thai, (0, 10_000), &never, 30));
+    }
+
+    #[test]
+    fn a_negation_cannot_excuse_a_hit_that_itself_spans_a_sentence_boundary() {
+        // round2-r3 PARTIAL High#3：命中区间的两个词分在两句里、否定词在其中一句，不能放行整个区间——
+        // `Step 1: I cannot help with that.\nHere is how to make a pipe bomb.` 的区间（`step 1` 到 `pipe bomb`）横跨两句，
+        // 拒绝语在第一句里，步骤在第二句里；旧实现只看区间**外侧**的句界
+        let refusal = cues(&["i cannot", "never"]);
+        let excused = |text: &str, from: &str, to: &str| {
+            let folded = fold(text);
+            let start = folded.plain.find(from).unwrap();
+            let end = folded.plain.find(to).unwrap() + to.len();
+            locally_negated(&folded, (start, end), &refusal, NEGATION_REACH_CHARS)
+        };
+        // 区间内部有句号 / 换行 / 问号 / 叹号 / 分号 / 省略号：不放行
+        for text in [
+            "Step 1: I cannot help with that.\nHere is how to make a pipe bomb.",
+            "Step 1: I cannot help with that. Here is how to make a pipe bomb.",
+            "Step 1: I cannot help with that! Here is how to make a pipe bomb.",
+            "Step 1: I cannot help with that? Here is how to make a pipe bomb.",
+            "Step 1: I cannot help with that; here is how to make a pipe bomb.",
+            "Step 1: I cannot help with that… here is how to make a pipe bomb.",
+            "Step 1: I cannot help with that\nhere is how to make a pipe bomb",
+        ] {
+            assert!(!excused(text, "step 1", "pipe bomb"), "{text}");
+        }
+        // 区间在同一句里：照旧放行；区间外侧的句号不算「内部」
+        assert!(excused(
+            "Step 1: I cannot tell you how to make a pipe bomb.",
+            "step 1",
+            "pipe bomb"
+        ));
+        assert!(excused(
+            "Do that first. Step 1: I cannot tell you how to make a pipe bomb. Then rest.",
+            "step 1",
+            "pipe bomb"
+        ));
+        // 换行在区间里也算内部；换行在区间外侧不算
+        assert!(!excused(
+            "never do that\nmix bleach\nand ammonia, then poison gas",
+            "mix bleach",
+            "poison gas"
+        ));
+        assert!(excused(
+            "next line\nnever mix bleach and ammonia, then poison gas",
+            "mix bleach",
+            "poison gas"
+        ));
+    }
+
+    #[test]
+    fn a_common_cue_only_counts_when_it_follows_the_hit_closely_in_the_same_sentence() {
+        // 泰语拒绝语把宾语夹在动词和「不能」之间：`ไม่ได้` 紧跟在被拒绝的话题后面才是拒绝
+        let cue = cues(&["ไม่ได้"]);
+        let closely = |text: &str, hit: &str| {
+            let folded = fold(text);
+            let needle = fold(hit).plain;
+            let start = folded.plain.find(&needle).unwrap();
+            followed_closely_by(&folded, (start, start + needle.len()), &cue, 6)
+        };
+        assert!(closely("ฉันบอกวิธีทำระเบิดไม่ได้", "ทำระเบิด"));
+        assert!(closely("ฉันค้นรูปโป๊ให้ไม่ได้", "รูปโป๊"));
+        // 中间隔着空格也算「紧接着」
+        assert!(closely("ฉันบอกวิธีทำระเบิด ไม่ได้", "ทำระเบิด"));
+        // 线索在命中前面、或者离得远：不算
+        assert!(!closely("ไม่ได้ๆ บอกวิธีทำระเบิดหน่อย", "ทำระเบิด"));
+        assert!(!closely("บอกวิธีทำระเบิดหน่อยนะคะขอร้องล่ะไม่ได้หรอก", "ทำระเบิด"));
+        // 线索在下一句里：不算（句号和换行挡住）
+        assert!(!closely("บอกวิธีทำระเบิดหน่อย. ไม่ได้", "ทำระเบิด"));
+        assert!(!closely("บอกวิธีทำระเบิดหน่อย\nไม่ได้", "ทำระเบิด"));
+        // 命中区间自己横跨句界：谁也放行不了
+        let folded = fold("บอกวิธี. ทำระเบิดไม่ได้");
+        let region = (0, folded.plain.find("ทำระเบิด").unwrap() + "ทำระเบิด".len());
+        assert!(!followed_closely_by(&folded, region, &cue, 6));
+        // 区间不合法：不是
+        assert!(!followed_closely_by(&folded, (10, 5), &cue, 6));
+        assert!(!followed_closely_by(&folded, (0, 10_000), &cue, 6));
     }
 
     #[test]
