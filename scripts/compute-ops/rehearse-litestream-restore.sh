@@ -16,7 +16,7 @@ if ! command -v sqlite3 >/dev/null; then
   exit 1
 fi
 if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
-  echo "本机没有镜像 $IMAGE。脚本不会拉取。请在有网时自行 docker pull，再离线重跑。" >&2
+  echo "本机没有镜像 ${IMAGE}。脚本不会拉取。请在有网时自行 docker pull，再离线重跑。" >&2
   exit 1
 fi
 
