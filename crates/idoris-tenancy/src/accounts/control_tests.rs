@@ -1477,10 +1477,46 @@ fn free_tier_allocations_are_idempotent_per_member_and_month() {
     env.allocation_chain();
     let root = env.issue_as_operator(Issue::service("eduai", all_ops("eduai", 100_000_000)));
     let who = root.who();
+    // 免费额度的窗口必须恰好是这个月（账本时区，默认 UTC）：授权方 eduai 自己的额度要盖住整个月，
+    // 补贴池要给这两个月各设总上限（没设就是 0，什么都发不出去）。
+    const NOV_START: i64 = T0 - 12 * 3_600_000;
+    const DEC_START: i64 = NOV_START + 30 * DAY_MS;
+    const JAN_START: i64 = DEC_START + 31 * DAY_MS;
+    for (id, parent, child, micros) in [
+        ("a-pool-wide", "platform", "pool", 10_000_000_000_i64),
+        ("a-edu-wide", "pool", "eduai", 1_000_000_000),
+    ] {
+        let rid = env.rid();
+        env.store
+            .control_grant_allocation(
+                &Env::operator(),
+                &env.meta(T0, &rid),
+                &GrantAllocation {
+                    valid_from: ts(T0 - DAY_MS),
+                    valid_until: ts(T0 + 90 * DAY_MS),
+                    ..grant(id, parent, child, micros)
+                },
+            )
+            .unwrap();
+    }
+    for month in ["2026-11", "2026-12"] {
+        env.store
+            .set_pool_cap(
+                &aid("pool"),
+                month.parse::<BillingMonth>().unwrap(),
+                &thb(100_000_000),
+                ts(T0),
+            )
+            .unwrap();
+    }
     let free = |id: &str, month: &str, micros: i64| {
         let mut request = grant(id, "eduai", "s2", micros);
         request.purpose = Purpose::FreeTier;
         request.month = Some(month.parse::<BillingMonth>().unwrap());
+        (request.valid_from, request.valid_until) = match month {
+            "2026-11" => (ts(NOV_START), ts(DEC_START)),
+            _ => (ts(DEC_START), ts(JAN_START)),
+        };
         request
     };
     let rid = env.rid();

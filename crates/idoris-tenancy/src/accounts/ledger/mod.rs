@@ -37,8 +37,8 @@
 //!
 //! | 函数 | 做什么 |
 //! |---|---|
-//! | [`set_credit_line`](AccountStore::set_credit_line) / [`disable_credit_line`](AccountStore::disable_credit_line) | 担保人（账户的父账户）给下级开 / 关授信（有担保的负值），追加版本，最新一条生效 |
-//! | [`issue_free_tier`](AccountStore::issue_free_tier) | 免费额度发放，幂等键 `subsidy:<主体>:<YYYY-MM>`，受补贴池该账期总上限约束，可以安全地重复调用 |
+//! | [`set_credit_line`](AccountStore::set_credit_line) / [`disable_credit_line`](AccountStore::disable_credit_line) | 担保人（账户的父账户）给下级开 / 关授信（有担保的负值）。**授信的权威数据源是 `allocations`（purpose = `credit_line`）**，S2 控制面开通的授信和这里开的是同一份记录：设置 = 撤销还生效的旧额度、写一条新的，关掉 = 撤销 |
+//! | [`issue_free_tier`](AccountStore::issue_free_tier) | 免费额度发放，幂等键 `subsidy:<主体>:<YYYY-MM>`，受补贴池该账期总上限约束，可以安全地重复调用。S2 控制面发放免费额度走同样的上限检查和承诺登记（同一个事务里），窗口必须恰好是这个月 |
 //! | [`set_pool_cap`](AccountStore::set_pool_cap) | 补贴池某个账期的总上限（没设 = 0） |
 //! | [`set_account_limits`](AccountStore::set_account_limits) | 速率闸门（分钟 / 小时花费）与在途总额上限 |
 //! | [`fund_account`](AccountStore::fund_account) | 充值（自有资金，幂等键）。P0 免费档不用；预付（P2）会用 |
@@ -68,8 +68,9 @@
 //!
 //! 1. **宽限那一轮超出可用额度的部分由谁承担**（S0 含糊点 6）：账户自己的可用额度加担保人授信之内的部分，
 //!    和普通请求一样；**超出这个下限的部分（至多一次预留）由平台承担**，记 `grace_absorbed`，不冻结凭证，
-//!    不转嫁给担保人或用户。备选：让担保人承担（要担保人事先同意，不保守）；让账户变成负数等充值
-//!    （P0 没有充值）。
+//!    不转嫁给担保人或用户：这一块**不记到付款账户链上**（用户和担保人的余额只扣 `charged - grace_absorbed`，
+//!    后续充值不会先去填它）。备选：让担保人承担（要担保人事先同意，不保守）；让账户变成负数等充值
+//!    （P0 没有充值）。分摊守恒：`charged = user_borne + sponsor_covered + platform_loss + grace_absorbed`。
 //! 2. 宽限的「周期」是账本时区的**自然月**（和免费额度同一个账期）；作废规则：宽限放行的预留最后没有向用户收费，
 //!    这次宽限作废（候选失败切换不会烧掉孩子唯一的宽限）。
 //! 3. 补贴池的「总上限」是**每个账期**的上限（按月授权，每月花了多少一眼可见），没设置的账期是 0。
@@ -97,6 +98,9 @@ mod types;
 #[cfg(feature = "mutation-test-hooks")]
 pub mod hooks;
 
+#[cfg(test)]
+mod migration_tests;
+
 pub use error::LedgerError;
 pub use hook::LedgerAttemptHook;
 pub use subsidy::PoolReport;
@@ -121,7 +125,12 @@ use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior};
 use super::{AccountStore, AccountStoreError};
 use crate::attempts::AttemptLedgerHook;
 
-const MIGRATIONS: &[&str] = &[include_str!("migrations/0001_ledger.sql")];
+/// 迁移按顺序执行，版本号 = 下标 + 1。**只能在末尾追加**，已经发布的文件不能改。
+/// 0001 是 S3 的账本；0002 把授信的权威数据源统一到 `allocations`（并补登控制面发出的免费额度的承诺）。
+const MIGRATIONS: &[&str] = &[
+    include_str!("migrations/0001_ledger.sql"),
+    include_str!("migrations/0002_credit_lines_are_allocations.sql"),
+];
 
 /// 应用账本迁移（在账户迁移之后、同一条连接上）。版本记在 `ledger_schema_migrations`。
 pub(super) fn run_migrations(conn: &mut Connection) -> Result<(), AccountStoreError> {
@@ -163,6 +172,27 @@ fn emit(outcome: &SettleOutcome) {
     for line in &outcome.logs {
         eprintln!("{line}");
     }
+}
+
+/// 免费额度在账本时区里这个账期的窗口 `[start_ms, end_ms)`。给 S2 控制面用：控制面发放的免费额度窗口必须恰好是它。
+pub(super) fn free_tier_window(
+    conn: &Connection,
+    month: BillingMonth,
+) -> Result<(i64, i64), LedgerError> {
+    subsidy::free_tier_window_in(conn, month)
+}
+
+/// 给 S2 控制面用（在控制面自己的事务里）：一笔刚写进 `allocations` 的（或幂等重放的）免费额度，检查补贴池该账期的
+/// 总上限并登记承诺（`ledger_subsidy_grants`）。已经登记过的什么都不写；超出上限返回 [`LedgerError::PoolCapExceeded`]，
+/// 调用方让事务（保存点）回滚，额度行随之撤掉。
+pub(super) fn commit_free_tier(
+    conn: &Connection,
+    allocation: &idoris_compute_contracts::account::Allocation,
+    principal: &idoris_compute_contracts::ids::PrincipalId,
+    month: BillingMonth,
+    now: TimestampMs,
+) -> Result<(), LedgerError> {
+    subsidy::commit_free_tier_in(conn, allocation, principal, month, now)
 }
 
 impl AccountStore {

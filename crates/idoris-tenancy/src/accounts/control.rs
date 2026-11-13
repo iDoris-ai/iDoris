@@ -52,6 +52,7 @@ use idoris_contracts::common::PrivacyClass;
 use rusqlite::{Connection, OptionalExtension};
 
 use super::error::AccountStoreError;
+use super::ledger::{self, LedgerError};
 use super::pairing::{PairingRow, resolve_pairing_caller};
 use super::rows::{
     AllocationRecord, load_account, load_allocation_record, load_ancestors, load_credential,
@@ -159,6 +160,33 @@ pub(super) enum Ctx {
 }
 
 impl Failure {
+    /// 账本（S3）的错误映射成控制面原因码。细节里**不放**补贴池的余量等数字：池是平台级的、被很多组织共用，
+    /// 剩余额度会泄露别的组织的用量。
+    pub(super) fn from_ledger(error: LedgerError) -> Self {
+        match error {
+            LedgerError::Store(inner) => Failure::from_store(inner, Ctx::Allocation),
+            LedgerError::PoolCapExceeded { .. } => Failure::with_detail(
+                ControlReason::AllocationExceedsGrantor,
+                "the subsidy pool's cap for this month cannot cover this free-tier allocation",
+            ),
+            LedgerError::NoSubsidyPool(_) => Failure::with_detail(
+                ControlReason::InvalidAllocation,
+                "no subsidy pool sits above the member account, so there is no cap to grant a free-tier allowance against",
+            ),
+            LedgerError::GrantConflict(_) => Failure::with_detail(
+                ControlReason::IdempotencyConflict,
+                "this free-tier idempotency key was already used for a different allocation",
+            ),
+            LedgerError::Invalid(detail) => {
+                Failure::with_detail(ControlReason::InvalidAllocation, detail)
+            }
+            LedgerError::Money(money) => {
+                Failure::with_detail(ControlReason::from(&money), money.to_string())
+            }
+            other => Failure::internal(other.to_string()),
+        }
+    }
+
     pub(super) fn from_store(error: AccountStoreError, ctx: Ctx) -> Self {
         let detail = error.to_string();
         let invalid = |generic: ControlReason| match ctx {
@@ -1512,6 +1540,8 @@ impl AccountStore {
                     "the allocation's validity window has already ended",
                 ));
             }
+            // 免费额度：补贴池的承诺要在同一个事务里登记（见下面 `commit_free_tier`）
+            let mut free_tier: Option<(PrincipalId, BillingMonth)> = None;
             let idempotency_key = match (request.purpose, request.month) {
                 (Purpose::FreeTier, Some(month)) => {
                     let principal: Option<String> = conn
@@ -1528,10 +1558,23 @@ impl AccountStore {
                         ));
                     };
                     let principal = PrincipalId::new(principal).map_err(AccountStoreError::from)?;
-                    Some(
-                        subsidy_idempotency_key(&principal, month)
-                            .map_err(AccountStoreError::from)?,
-                    )
+                    // 账期和有效窗口不能脱钩：幂等键 `(成员, 月份)` 只管「这个月只发一份」，要真的只有一份，
+                    // 窗口就必须恰好是这个月（账本时区）。否则同一个主体换个 `month` 标签、配同一段窗口，
+                    // 就能在同一段时间里拿到两份（PR #600 评审 #8）。
+                    let (month_start, month_end) =
+                        ledger::free_tier_window(conn, month).map_err(Failure::from_ledger)?;
+                    if request.valid_from.0 != month_start || request.valid_until.0 != month_end {
+                        return Err(Failure::with_detail(
+                            ControlReason::InvalidAllocation,
+                            format!(
+                                "a free-tier allocation for {month} must be valid exactly for that month in the billing time zone: valid_from_ms {month_start}, valid_until_ms {month_end}"
+                            ),
+                        ));
+                    }
+                    let key = subsidy_idempotency_key(&principal, month)
+                        .map_err(AccountStoreError::from)?;
+                    free_tier = Some((principal, month));
+                    Some(key)
                 }
                 (Purpose::FreeTier, None) => {
                     return Err(Failure::with_detail(
@@ -1582,10 +1625,17 @@ impl AccountStore {
             }
             let outcome = create_allocation_in(conn, &allocation, meta.now)
                 .map_err(|error| Failure::from_store(error, Ctx::Allocation))?;
-            let (result, id) = match outcome {
-                AllocationOutcome::Created => (WriteResult::Created, allocation.id.clone()),
-                AllocationOutcome::Replayed(existing) => (WriteResult::Replayed, existing.id),
+            let (result, stored) = match outcome {
+                AllocationOutcome::Created => (WriteResult::Created, allocation.clone()),
+                AllocationOutcome::Replayed(existing) => (WriteResult::Replayed, existing),
             };
+            // 免费额度：同一个事务里检查补贴池该账期的总上限并登记承诺（超出就返回错误，保存点回滚，额度行随之撤掉）。
+            // 幂等重放也走这一步：已经登记过的什么都不写，没登记过的（旧数据）补登。
+            if let Some((principal, month)) = &free_tier {
+                ledger::commit_free_tier(conn, &stored, principal, *month, meta.now)
+                    .map_err(Failure::from_ledger)?;
+            }
+            let id = stored.id;
             let record = load_allocation_record(conn, &id)?.ok_or_else(|| {
                 Failure::internal("allocation vanished inside its own transaction")
             })?;
