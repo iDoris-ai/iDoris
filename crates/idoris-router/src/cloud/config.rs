@@ -57,6 +57,10 @@
 //!
 //! 价格是**十进制字符串**（每百万 token 多少单位，最多 6 位小数，精确换成微单位整数），不接受 YAML 浮点数：
 //! 钱不能经过浮点。所有对象拒绝未知字段。
+//!
+//! `safety:` 段的字段和示例在 [`super::safety::config`]。有儿童租户时生产启动默认要求 LLM 检查器；
+//! `rules_only` 必须另写 `rules_only_acknowledgement`（原因、确认人、UTC 到期日，且不超过今天起 90 天），否则启动失败。
+//! 没有儿童租户时，`rules_only` 不需要这份确认。
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -998,36 +1002,49 @@ pub fn parse_with_ingress_tenants(
     })
 }
 
-/// **生产启动的额外要求**（PR-Daemon B3，**需要 owner 确认**）：有处理儿童数据的调用方 / 租户（静态调用方簿里的，或云入口
-/// 配置里声明的）就必须配 LLM 安全检查器（`safety.mode: rules_and_llm`）；只有规则检查器启动失败。
+/// **生产启动的额外要求**（owner 2026-11-13 方案 B）：有处理儿童数据的调用方 / 租户（静态调用方簿里的，或云入口
+/// 配置里声明的）就必须配 LLM 安全检查器（`safety.mode: rules_and_llm`）。只写 `rules_only` 启动失败，除非同一段里有一份
+/// **此刻仍然有效**的 `rules_only_acknowledgement`（原因、确认人、UTC 到期日，且到期日不晚于 `now` 起 90 天）。
 ///
 /// 为什么：规则检查器是关键词 / 正则，换个字体（数学粗体字母）、西里尔字母的 o、拉长拼写（`boooomb`）、base64、
-/// 藏在工具描述里的有害内容都能绕过输入规则；儿童数据不该把这道防线只押在它上面。以前只是启动时留一行警告
-/// （`rules_only` 必须显式写出来），现在是错误。
+/// 藏在工具描述里的有害内容都能绕过输入规则；儿童数据不该把这道防线只押在它上面。显式放宽是有期限的例外，过期就回到默认。
+///
+/// `now` 和加载配置时用的是同一个时钟读数（生产装配先取一次 [`crate::cloud::Clock::now`]）。只看「写了这个块」不够：
+/// 到期日相对 `now` 已经无效，仍然拒绝。
 ///
 /// 不放进 [`parse_with_ingress_tenants`]：它是各种测试夹具共用的解析入口（很多测试用 `rules_only` 单独验证规则检查器的
 /// 行为，不需要 LLM 检查器）；生产装配 [`crate::cloud::CloudUpstream::from_file_with_ingress_tenants`] 加载之后调用它。
+/// 没有儿童租户时，`rules_only` 不需要这份确认。
 pub fn require_llm_judge_for_child_tenants(
     parts: &CloudParts,
     ingress_tenants: &[IngressTenant],
+    now: TimestampMs,
 ) -> Result<(), String> {
     let has_child = parts.callers.has_child_data_callers()
         || ingress_tenants
             .iter()
             .any(|tenant| tenant.policy.handles_child_data());
-    if has_child
-        && parts
-            .safety
-            .as_ref()
-            .is_none_or(|setup| setup.judge.is_none())
-    {
-        return Err(bad(
-            "有调用方（含云入口配置里的租户）处理儿童数据（data_classes 含 child_edu），safety: 段必须配置 LLM 检查器\
-             （mode: rules_and_llm + llm_judge），不能只用规则检查器（rules_only）：规则检查器靠关键词和正则，\
-             换字体、拼写变形、base64、藏在工具描述里的内容都能绕过",
-        ));
+    if !has_child {
+        return Ok(());
     }
-    Ok(())
+    let setup = parts.safety.as_ref();
+    if setup.is_some_and(|safety| safety.judge.is_some()) {
+        return Ok(());
+    }
+    if let Some(ack) = setup.and_then(|safety| safety.acknowledgement.as_ref()) {
+        return ack.ensure_current(now).map_err(|error| {
+            bad(format!(
+                "儿童租户的 rules_only 显式放宽已失效（{error}）。要继续只用规则检查器，请更新 reason、acknowledged_by 和 expires_on；否则改为 mode: rules_and_llm 并配置 llm_judge"
+            ))
+        });
+    }
+    Err(bad(
+        "有调用方（含云入口配置里的租户）处理儿童数据（data_classes 含 child_edu），safety: 段必须配置 LLM 检查器\
+         （mode: rules_and_llm + llm_judge），不能只用规则检查器（rules_only）：规则检查器靠关键词和正则，\
+         换字体、拼写变形、base64、藏在工具描述里的内容都能绕过。若暂时只能用规则检查器，必须在 \
+         safety.rules_only_acknowledgement 里显式放宽，三项都要写：reason（去掉首尾空白后至少 10 个字符）、\
+         acknowledged_by（非空）、expires_on（YYYY-MM-DD，UTC，不早于今天且不超过今天起 90 天）",
+    ))
 }
 
 /// 从文件加载。
@@ -1137,10 +1154,13 @@ callers:
     max_retention: with_exceptions
 ";
 
+    /// 2026-11-13T00:00:00Z。和 safety 确认窗口的单测用同一个「今天」。
+    const NOW: TimestampMs = TimestampMs(1_794_528_000_000);
+
     fn load(yaml: &str) -> Result<CloudParts, String> {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("permits.yaml"), PERMITS).unwrap();
-        parse(yaml, dir.path(), TimestampMs(1_794_528_000_000))
+        parse(yaml, dir.path(), NOW)
     }
 
     fn expect_error(yaml: &str, needle: &str) {
@@ -1325,12 +1345,19 @@ callers:
         };
         // 只有成人调用方、也没有儿童租户：不要求
         let adult_only = load(VALID).unwrap();
-        require_llm_judge_for_child_tenants(&adult_only, &[]).unwrap();
+        require_llm_judge_for_child_tenants(&adult_only, &[], NOW).unwrap();
         // 云入口声明了儿童租户，云上游配置只有规则检查器：失败
         let rules_only = load(&format!("{VALID}safety:\n  mode: rules_only\n")).unwrap();
-        let error = require_llm_judge_for_child_tenants(&rules_only, &[child()]).unwrap_err();
+        let error = require_llm_judge_for_child_tenants(&rules_only, &[child()], NOW).unwrap_err();
         assert!(
             error.contains("LLM 检查器") && error.contains("rules_only"),
+            "{error}"
+        );
+        assert!(
+            error.contains("rules_only_acknowledgement")
+                && error.contains("reason")
+                && error.contains("acknowledged_by")
+                && error.contains("expires_on"),
             "{error}"
         );
         // 静态调用方簿里的儿童调用方同样
@@ -1348,9 +1375,97 @@ safety:
 "
         ))
         .unwrap();
-        assert!(require_llm_judge_for_child_tenants(&child_caller, &[]).is_err());
-        // 对照：没有儿童租户时，规则检查器不被要求加 LLM
-        require_llm_judge_for_child_tenants(&rules_only, &[]).unwrap();
+        assert!(require_llm_judge_for_child_tenants(&child_caller, &[], NOW).is_err());
+        // 对照：没有儿童租户时，规则检查器不被要求加 LLM，也不需要 acknowledgement
+        require_llm_judge_for_child_tenants(&rules_only, &[], NOW).unwrap();
+    }
+
+    fn rules_only_ack(expires_on: &str) -> String {
+        format!(
+            "{VALID}safety:\n  mode: rules_only\n  rules_only_acknowledgement:\n    reason: \"内测：尚无签了 DPA 的检查器模型\"\n    acknowledged_by: \"jason\"\n    expires_on: \"{expires_on}\"\n"
+        )
+    }
+
+    /// 显式放宽只在窗口内放行儿童租户的 `rules_only`。过期的确认块即使还挂在已加载的配置上，生产启动也拒绝。
+    #[test]
+    fn an_explicit_acknowledgement_lets_child_tenants_use_rules_only_until_it_expires() {
+        use std::collections::BTreeSet;
+
+        use idoris_compute_contracts::permit::DataClass;
+
+        let child = || IngressTenant {
+            name: "eduai".to_string(),
+            policy: TenantDataPolicy::new(
+                BTreeSet::from([DataClass::ChildEdu]),
+                None,
+                Retention::Zdr,
+                true,
+            )
+            .unwrap(),
+        };
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("permits.yaml"), PERMITS).unwrap();
+        let parts =
+            parse_with_ingress_tenants(&rules_only_ack("2026-11-13"), dir.path(), NOW, &[child()])
+                .unwrap();
+        require_llm_judge_for_child_tenants(&parts, &[child()], NOW).unwrap();
+        let safety = parts.safety.as_ref().unwrap();
+        assert_eq!(
+            safety.startup_label(),
+            "rules_only (acknowledged until 2026-11-13)"
+        );
+        assert_eq!(
+            safety.warnings,
+            [
+                "WARNING child-data tenants run on the RULE CHECKER ONLY by explicit acknowledgement: reason=\"内测：尚无签了 DPA 的检查器模型\" acknowledged_by=\"jason\" expires_on=2026-11-13"
+            ]
+        );
+        // 没有儿童租户时，同一份确认不打这行儿童警告
+        let adult_with_ack = load(&rules_only_ack("2026-11-13")).unwrap();
+        assert!(adult_with_ack.safety.as_ref().unwrap().warnings.is_empty());
+        // 今天 + 90 天仍然有效（边界）
+        let until = load(&rules_only_ack("2027-02-11")).unwrap();
+        require_llm_judge_for_child_tenants(&until, &[child()], NOW).unwrap();
+        // 加载时就已经超出窗口：根本进不了 require
+        let too_far = match load(&rules_only_ack("2027-02-12")) {
+            Ok(_) => panic!("today+91 must not load"),
+            Err(error) => error,
+        };
+        assert!(
+            too_far.contains("90") && too_far.contains("2027-02-12"),
+            "{too_far}"
+        );
+        let already_expired = match load(&rules_only_ack("2026-11-12")) {
+            Ok(_) => panic!("an expired acknowledgement must not load"),
+            Err(error) => error,
+        };
+        assert!(already_expired.contains("已经过期"), "{already_expired}");
+        // 和 rules_and_llm 写在一起：加载失败（这条要是被接受，下面的变异就看不出来）
+        let both = match load(
+            &rules_only_ack("2026-11-13").replace("mode: rules_only", "mode: rules_and_llm"),
+        ) {
+            Ok(_) => panic!("rules_and_llm must reject the acknowledgement block"),
+            Err(error) => error,
+        };
+        assert!(
+            both.contains("rules_and_llm") && both.contains("rules_only_acknowledgement"),
+            "{both}"
+        );
+        // 加载时有效、require 用的 now 已经是第二天：只看「块在不在」会放行，必须看有效性
+        let next_day = TimestampMs(NOW.0 + 86_400_000);
+        let error = require_llm_judge_for_child_tenants(&parts, &[child()], next_day).unwrap_err();
+        assert!(
+            error.contains("已经过期") && error.contains("2026-11-13"),
+            "{error}"
+        );
+        // 没有儿童租户：不需要这份确认，有一份有效的也不挡
+        require_llm_judge_for_child_tenants(&parts, &[], next_day).unwrap();
+        let adult_rules = load(&format!("{VALID}safety:\n  mode: rules_only\n")).unwrap();
+        require_llm_judge_for_child_tenants(&adult_rules, &[], NOW).unwrap();
+        assert_eq!(
+            adult_rules.safety.as_ref().unwrap().startup_label(),
+            "rules_only"
+        );
     }
 
     #[test]

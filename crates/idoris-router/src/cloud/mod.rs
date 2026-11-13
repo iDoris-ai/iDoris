@@ -95,8 +95,9 @@
 //! 19. **系统消息只查越狱类规则**：运营方的系统提示会复述要拒绝的话题（评测集的 `DEFAULT_SYSTEM` 就是），按话题规则查会把
 //!     自己的提示拒掉。代价是：孩子的话被塞进 `system` 角色时，规则检查器只会按越狱类查它（LLM 检查器查全部）。
 //!     要更严需要系统提示白名单（哈希），P0 没做，等 owner 决定。
-//! 20. **只用规则检查器必须显式确认**：`safety.mode` 必填，`rules_only` 启动时留一行警告。是否强制 child_edu 必须配 LLM 检查器
-//!     （建议是），等 owner 决定。
+//! 20. **儿童租户默认必须有 LLM 检查器**（owner 2026-11-13 方案 B）：有 `child_edu` 时，`rules_only` 不能启动，除非
+//!     `safety.rules_only_acknowledgement` 写了原因、确认人和不超过 90 天（UTC）的到期日。没有儿童租户时 `rules_only` 照旧。
+//!     显式放宽生效时打一行醒目警告，启动摘要写成 `rules_only (acknowledged until YYYY-MM-DD)`。
 //! 21. **安全检查的成本走 S3 的账本**（[`safety::LedgerExtraCost`]，生产装配 [`CloudUpstream::from_file`] 装上）：输入检查在任何
 //!     尝试之前、输出检查在回答出来之后，各用 `reserve_request_component` 预留一次（component `safety_input` / `safety_output`，
 //!     都挂在这个请求的 `#0` 名下，不依赖作答的是哪一次尝试），检查完用 `settle_component` 按实际用量结算。预留被账本拒绝
@@ -312,9 +313,10 @@ impl CloudUpstream {
         ingress_tenants: &[config::IngressTenant],
     ) -> Result<Self, String> {
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
-        let parts = config::load_with_ingress_tenants(path, clock.now(), ingress_tenants)?;
-        // 儿童数据必须有 LLM 安全检查器，只用规则检查器启动失败（PR-Daemon B3；需 owner 确认）
-        config::require_llm_judge_for_child_tenants(&parts, ingress_tenants)?;
+        let now = clock.now();
+        let parts = config::load_with_ingress_tenants(path, now, ingress_tenants)?;
+        // 儿童数据默认必须有 LLM 安全检查器。rules_only 只有在显式确认仍有效时才能启动（owner 2026-11-13 方案 B）。
+        config::require_llm_judge_for_child_tenants(&parts, ingress_tenants, now)?;
         // 启动日志（S6）：哪些调用方走儿童安全管线（只有租户标识）。运营方一眼能核对「edu 租户的属性确实是 child_edu」
         let (mut child, mut other) = parts.callers.caller_summary();
         for tenant in ingress_tenants {
@@ -329,13 +331,10 @@ impl CloudUpstream {
             "[idoris] cloud: child-data callers (safety pipeline ON): [{}]; other callers (no safety pipeline): [{}]; safety: {}",
             child.join(", "),
             other.join(", "),
-            parts
-                .safety
-                .as_ref()
-                .map_or("not configured", |safety| match safety.mode {
-                    safety::config::SafetyMode::RulesOnly => "rules_only",
-                    safety::config::SafetyMode::RulesAndLlm => "rules_and_llm",
-                })
+            parts.safety.as_ref().map_or_else(
+                || "not configured".to_string(),
+                safety::config::SafetySetup::startup_label,
+            )
         );
         if let Some(safety) = &parts.safety {
             for warning in &safety.warnings {
