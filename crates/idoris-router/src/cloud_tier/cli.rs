@@ -7,8 +7,10 @@
 //! $ idoris cloud unpair                                                    # 云端撤销 + 删除本机凭证
 //! ```
 //!
-//! 这些命令**只读写设备凭证文件**（`<state_dir>/device.json`，见 [`super::credential`]），不打开 SQLite 库、不碰 Admin、
-//! 不碰本地数据密钥。stdout 是 JSON（机器可读，没有任何密钥）；给人看的说明和警告写 stderr。
+//! 这些命令**只读写设备凭证文件**（`<state_dir>/device.json`，见 [`super::credential`]），不碰 Admin、不碰本地数据密钥。
+//! `pair` / `unpair` 的整个流程在状态目录的跨进程锁（`<state_dir>/.lock`）里，两个进程不会互相穿插；安装不覆盖已有的凭证，
+//! 兑换成功却装不上时（写不下，或者兑换期间别的进程装了一张）立刻撤销新兑换的那张。
+//! stdout 是 JSON（机器可读，没有任何密钥）；给人看的说明和警告写 stderr。
 //!
 //! # 退出码
 //!
@@ -25,12 +27,45 @@ use serde_json::json;
 
 use super::config::{CONFIG_ENV, CloudTierConfig, CredentialSourceConfig};
 use super::credential::{
-    CredentialProvider, DeviceRecord, DeviceStore, NodeEnvProvider, NodeFileProvider,
+    CredentialError, CredentialProvider, DeviceRecord, DeviceStore, NodeEnvProvider,
+    NodeFileProvider, StateLock,
 };
 use super::pairing::{DEFAULT_DEVICE_LABEL, PairingClient, PairingError, validate_device_label};
 
 /// 配对码输入的最大长度：码是 12 个字符加连字符，`pairing_codes::normalize` 的上限是 64。
 const MAX_CODE_INPUT: usize = 64;
+
+/// 另一个 `pair` / `unpair` 占着状态目录的锁时，最多等多久再放弃（异步地等，不卡运行时）。
+/// 不是排队：并发地配对 / 解绑同一台机器本来就不是正常用法，等一小会儿只是为了让紧挨着的两个命令别互相误伤。
+const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+const LOCK_POLL: std::time::Duration = std::time::Duration::from_millis(25);
+
+/// 拿状态目录的跨进程锁（[`DeviceStore::try_lock`]）。配对和解绑的**整个流程**都在它里面：「有没有配对」的检查、
+/// 兑换、安装是一个整体，不能被另一个进程的同一个流程穿插（审查 r4 Medium#4）。
+/// 别人占着时短暂地等（异步地等），等不到返回 [`CredentialError::Busy`]。
+/// `create_dir` 为假（解绑）且目录不存在时返回 `None`：没有目录就没有配对，不用锁。
+async fn lock_state_dir(
+    store: &DeviceStore,
+    create_dir: bool,
+) -> Result<Option<StateLock>, CredentialError> {
+    let deadline = tokio::time::Instant::now() + LOCK_WAIT;
+    loop {
+        match store.try_lock(create_dir) {
+            Err(CredentialError::Busy) if tokio::time::Instant::now() < deadline => {
+                tokio::time::sleep(LOCK_POLL).await;
+            }
+            other => return other,
+        }
+    }
+}
+
+fn lock_busy_message(store: &DeviceStore) -> String {
+    format!(
+        "另一个 idoris cloud pair / unpair 正在这台机器上运行（设备凭证目录 \"{}\" 的锁被占着）：\
+         等它结束后重试。这个命令什么都没做（没有兑换配对码，也没有动凭证）",
+        store.dir().display()
+    )
+}
 
 /// `idoris cloud …` 的子命令。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -127,6 +162,19 @@ pub async fn run_pair(
     let label = label.unwrap_or(DEFAULT_DEVICE_LABEL);
     validate_device_label(label)?;
     let store = DeviceStore::new(config.state_dir_for(db_path));
+    // 整个配对流程（检查、预检、兑换、安装）在状态目录的跨进程锁里：两个进程各兑换一个账号的配对码，
+    // 不能都先读到「还没有配对」、再互相覆盖（以前先装的那张云凭证仍然有效、本机却丢了它）。
+    let _lock = match lock_state_dir(&store, true).await {
+        Ok(lock) => lock,
+        Err(CredentialError::Busy) => return Err(lock_busy_message(&store)),
+        // 目录建不出来、锁文件写不了：和预检一样，兑换之前就停下（配对码是一次性的）
+        Err(error) => {
+            return Err(format!(
+                "设备凭证目录 \"{}\" 不能写入（{error}）：没有兑换配对码，请先解决再重试",
+                store.dir().display()
+            ));
+        }
+    };
 
     // 已经配对（或者有一个不可用的凭证文件）：不兑换。配对码是一次性的，不能在已经有凭证的机器上烧掉一个。
     match store.read() {
@@ -166,8 +214,9 @@ pub async fn run_pair(
         paired_at_ms: now_ms,
         secret: redeemed.secret.clone(),
     };
-    if let Err(error) = store.write(&record) {
-        // 兑换成功但写不下：立刻用手里的凭证把云端那张撤销，免得它成了没人持有的孤儿
+    if let Err(error) = store.install(&record) {
+        // 兑换成功但装不上（写不下，或者兑换期间别的进程已经装了一张——安装不覆盖已有的凭证）：
+        // 立刻用手里的新凭证把云端那张撤销，免得它成了没人持有的孤儿
         let revoked = client.unpair(&redeemed.secret).await;
         let tail = match revoked {
             Ok(()) | Err(PairingError::CredentialNotAccepted) => {
@@ -178,7 +227,14 @@ pub async fn run_pair(
                 record.summary().credential_id_prefix
             ),
         };
-        return Err(format!("兑换成功但本机无法保存凭证（{error}）。{tail}"));
+        let what = match error {
+            CredentialError::AlreadyPaired => {
+                "兑换成功，但兑换期间这台机器上已经出现了一张设备凭证（别的进程装的），没有覆盖它"
+                    .to_string()
+            }
+            other => format!("兑换成功但本机无法保存凭证（{other}）"),
+        };
+        return Err(format!("{what}。{tail}"));
     }
     let summary = record.summary();
     let _ = writeln!(
@@ -297,6 +353,17 @@ pub async fn run_unpair(
     } = ctx;
     paired_device_only(config, "idoris cloud unpair ")?;
     let store = DeviceStore::new(config.state_dir_for(db_path));
+    // 和配对同一把锁：解绑（读凭证、通知云端、删文件）也是一个整体，不能和一次配对穿插。没有目录就没有配对，不用锁。
+    let _lock = match lock_state_dir(&store, false).await {
+        Ok(lock) => lock,
+        Err(CredentialError::Busy) => return Err(lock_busy_message(&store)),
+        Err(error) => {
+            return Err(format!(
+                "无法获取设备凭证目录 \"{}\" 的锁（{error}）：这个命令什么都没做",
+                store.dir().display()
+            ));
+        }
+    };
     let (record, unreadable) = match store.read() {
         Ok(Some(record)) => (Some(record), None),
         Ok(None) => {

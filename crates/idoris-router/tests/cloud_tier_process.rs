@@ -379,6 +379,55 @@ async fn an_unreachable_cloud_does_not_burn_the_code_and_unpair_still_removes_th
     assert_eq!(reply.status, 200, "{}", reply.text());
 }
 
+/// 跨进程（审查 r4 Medium#4）：这个测试进程占着状态目录的锁，真实的 `idoris cloud pair` / `unpair` 子进程都不动手——
+/// 不兑换配对码（码不会被烧掉）、不碰云端、不碰凭证文件。锁放开之后同一个码照常能用。
+#[tokio::test]
+async fn pair_and_unpair_do_nothing_while_another_process_holds_the_state_directory_lock() {
+    let _guard = PROCESS_TEST_LOCK.lock().await;
+    let cloud = TcpCloud::start().await;
+    let f = fixture();
+    let config = f.tier_config(&cloud);
+    let admin = cloud.issue_agent24_admin();
+    let code = cloud.mint_pairing_code(&admin, "m-agent-1", 600).await;
+    cloud.log.clear();
+    let store = idoris_router::cloud_tier::DeviceStore::new(f.state_dir());
+    // 这个测试进程就是「另一个进程」
+    let lock = store.try_lock(true).unwrap().expect("a lock");
+
+    let (pair, unpair) = tokio::join!(
+        f.cloud_cmd(Some(&config), &["pair"], Some(&code)),
+        f.cloud_cmd(Some(&config), &["unpair"], None)
+    );
+    for (name, out) in [("pair", &pair), ("unpair", &unpair)] {
+        assert_eq!(out.status.code(), Some(1), "{name}: {:?}", text(out));
+        assert!(
+            text(out).1.contains("正在这台机器上运行"),
+            "{name}: {:?}",
+            text(out)
+        );
+        assert!(
+            text(out).1.contains("什么都没做"),
+            "{name}: {:?}",
+            text(out)
+        );
+    }
+    assert_eq!(
+        cloud.log.count(),
+        0,
+        "a command that could not take the lock must not reach the cloud (and must not burn the code)"
+    );
+    assert!(!store.path().exists());
+
+    drop(lock);
+    let out = f.cloud_cmd(Some(&config), &["pair"], Some(&code)).await;
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the code must still be unused once the lock is free: {:?}",
+        text(&out)
+    );
+}
+
 #[tokio::test]
 async fn pairing_checks_that_it_can_save_the_credential_before_it_spends_the_one_time_code() {
     let _guard = PROCESS_TEST_LOCK.lock().await;

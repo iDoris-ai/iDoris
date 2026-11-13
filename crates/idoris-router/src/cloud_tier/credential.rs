@@ -20,8 +20,10 @@
 //! # 设备凭证文件（个人形态）
 //!
 //! `idoris cloud pair` 把兑换出来的凭证写成 `<state_dir>/device.json`（JSON，含明文密钥）：
-//! 目录 0700（我们创建时）、文件 **0600**，原子写（同目录里 `O_EXCL|0600` 的临时文件 → `fsync` → `rename` → `fsync` 目录），
-//! 所以任何时刻磁盘上看到的要么没有、要么是完整的、权限正确的文件。读取时**再检查一次**：必须是普通文件（不是符号链接）、
+//! 目录 0700（我们创建时）、文件 **0600**，原子**新装**（同目录里 `O_EXCL|0600` 的临时文件 → `fsync` → 硬链接到目标名 →
+//! 删临时名 → `fsync` 目录；**不覆盖**已有的文件，见 [`DeviceStore::install`]），所以任何时刻磁盘上看到的要么没有、要么是完整的、
+//! 权限正确的文件。`pair` / `unpair` 的整个流程在状态目录的跨进程锁里（[`DeviceStore::try_lock`]）。
+//! 读取时**再检查一次**：先用 `O_NOFOLLOW|O_NONBLOCK` 打开，再用描述符验证：必须是普通文件（不是符号链接）、
 //! 权限不能有 group / other 位，否则按「不可用」处理（失败即关闭，并告诉用户 `chmod 600`），不会拿一个别人也读得到的密钥去出网。
 //!
 //! 文件里还记了**凭证被签发的源**（`origin`）：配置里的云端地址换了源，这张凭证就不再被使用（`OriginMismatch`）——
@@ -64,6 +66,10 @@ pub enum CredentialError {
     LocalKeyRefused,
     /// 本平台不支持（凭证文件的权限检查只做了 Unix）。
     Unsupported,
+    /// 状态目录的锁被另一个 `idoris cloud pair` / `unpair` 占着。
+    Busy,
+    /// 设备凭证文件已经存在：安装不覆盖已有的凭证。
+    AlreadyPaired,
 }
 
 impl CredentialError {
@@ -77,6 +83,8 @@ impl CredentialError {
             CredentialError::OriginMismatch => "credential_origin_mismatch",
             CredentialError::LocalKeyRefused => "credential_is_a_local_key",
             CredentialError::Unsupported => "unsupported_platform",
+            CredentialError::Busy => "state_busy",
+            CredentialError::AlreadyPaired => "credential_already_present",
         }
     }
 }
@@ -97,6 +105,10 @@ impl std::fmt::Display for CredentialError {
                 "这把密钥是本机的本地数据密钥，不能当云凭证（本地密钥不发给云端）"
             }
             CredentialError::Unsupported => "云凭证文件的权限检查只支持 Unix 系统",
+            CredentialError::Busy => {
+                "另一个 idoris cloud pair / unpair 正在这台机器上运行（它占着设备凭证目录的锁）"
+            }
+            CredentialError::AlreadyPaired => "设备凭证文件已经存在（安装不会覆盖已有的凭证）",
         })
     }
 }
@@ -253,6 +265,15 @@ fn valid_display_id(text: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b':'))
 }
 
+/// 状态目录里的锁文件名（`flock` 的对象）。文件一直留在目录里：锁在文件描述符上，不在文件的有无上。
+pub const LOCK_FILE: &str = ".lock";
+
+/// 状态目录上的跨进程独占锁（见 [`DeviceStore::try_lock`]）。丢掉它（或者进程退出）就释放。
+#[derive(Debug)]
+pub struct StateLock {
+    _file: std::fs::File,
+}
+
 /// 设备凭证文件的存储：一个目录里的 `device.json`。
 #[derive(Debug, Clone)]
 pub struct DeviceStore {
@@ -322,9 +343,17 @@ impl DeviceStore {
         Err(CredentialError::Unsupported)
     }
 
-    /// 原子地写设备凭证：同目录里 `O_EXCL|0600` 的临时文件 → `fsync` → `rename` → `fsync` 目录。
+    /// 原子地**新装**设备凭证，**不覆盖**已有的文件（已经有一张就是 [`CredentialError::AlreadyPaired`]）。
+    ///
+    /// 同目录里 `O_EXCL|0600` 的临时文件 → `fsync` → **硬链接**到目标名（`link` 在目标已存在时失败，不会覆盖，
+    /// 也不跟随目标处的符号链接）→ 删掉临时名 → `fsync` 目录。所以任何时刻磁盘上看到的要么没有、要么是完整的、权限正确的文件，
+    /// 并且两个进程同时安装，恰好一个成功。文件系统不支持硬链接（FAT 之类）时退到 `O_EXCL` 直接创建目标文件，同样不覆盖
+    /// （那条路上写完之前读取者可能读到半截文件，读取是失败即关闭的，不会拿它出网）。
+    ///
+    /// 以前这里是 `rename`：它会覆盖已有文件。两个进程各兑换一个账号的配对码、都先读到文件不存在，先装的那张被后装的覆盖，
+    /// 两个都报告成功，先装的那张云凭证仍然有效、本机却丢了它（审查 r4 Medium#4）。
     #[cfg(unix)]
-    pub fn write(&self, record: &DeviceRecord) -> Result<(), CredentialError> {
+    pub fn install(&self, record: &DeviceRecord) -> Result<(), CredentialError> {
         let dir = self.create_private_dir()?;
         let file = DeviceFile {
             version: DEVICE_FILE_VERSION,
@@ -335,32 +364,77 @@ impl DeviceStore {
             paired_at_ms: record.paired_at_ms,
             secret: record.secret.expose_secret().to_string(),
         };
-        let bytes = serde_json::to_vec_pretty(&file).map_err(|_| CredentialError::Unreadable)?;
+        let mut bytes =
+            serde_json::to_vec_pretty(&file).map_err(|_| CredentialError::Unreadable)?;
+        bytes.push(b'\n');
+        let target = self.path();
         let tmp = dir.join(format!(
             ".device.json.{}.tmp",
             uuid::Uuid::new_v4().simple()
         ));
-        let result = (|| -> std::io::Result<()> {
-            let mut out = open_private_new(&tmp)?;
+        let staged = open_private_new(&tmp).and_then(|mut out| {
             out.write_all(&bytes)?;
-            out.write_all(b"\n")?;
-            out.sync_all()?;
-            drop(out);
-            std::fs::rename(&tmp, self.path())?;
+            out.sync_all()
+        });
+        if staged.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(CredentialError::Unreadable);
+        }
+        let outcome = match std::fs::hard_link(&tmp, &target) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                Err(CredentialError::AlreadyPaired)
+            }
+            Err(_) => create_exclusive(&target, &bytes),
+        };
+        let _ = std::fs::remove_file(&tmp);
+        if outcome.is_ok() {
             // 目录项也落盘；失败不致命（文件已经完整地在位）
             if let Ok(handle) = std::fs::File::open(&dir) {
                 let _ = handle.sync_all();
             }
-            Ok(())
-        })();
-        if result.is_err() {
-            let _ = std::fs::remove_file(&tmp);
         }
-        result.map_err(|_| CredentialError::Unreadable)
+        outcome
     }
 
     #[cfg(not(unix))]
-    pub fn write(&self, _record: &DeviceRecord) -> Result<(), CredentialError> {
+    pub fn install(&self, _record: &DeviceRecord) -> Result<(), CredentialError> {
+        Err(CredentialError::Unsupported)
+    }
+
+    /// 拿状态目录上的**跨进程独占锁**（`<state_dir>/.lock` 上的 `flock`，立即返回，不等）：`idoris cloud pair` 和
+    /// `idoris cloud unpair` 的整个流程都在它里面——「有没有配对」的检查、兑换、安装是一个整体，不能被另一个进程的同一个
+    /// 流程穿插（审查 r4 Medium#4：两个进程各兑换一个账号的配对码，先装的被后装的覆盖）。
+    ///
+    /// 内核在持有者退出（包括崩溃）时释放它，没有陈旧锁；文件是 close-on-exec 的，子进程不继承。服务进程读凭证不拿这把锁
+    /// （安装是原子的，读到的要么没有要么完整）。
+    ///
+    /// `create_dir` 为真时目录不存在就建（0700，配对用）；为假时目录不存在返回 `Ok(None)`：没有目录就没有配对，
+    /// 解绑不需要为了拿锁去建一个目录。已经被别人占着是 [`CredentialError::Busy`]。
+    #[cfg(unix)]
+    pub fn try_lock(&self, create_dir: bool) -> Result<Option<StateLock>, CredentialError> {
+        use std::os::unix::fs::OpenOptionsExt;
+        if create_dir {
+            self.create_private_dir()?;
+        } else if !self.dir.is_dir() {
+            return Ok(None);
+        }
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .mode(0o600)
+            .open(self.dir.join(LOCK_FILE))
+            .map_err(|_| CredentialError::Unreadable)?;
+        match file.try_lock() {
+            Ok(()) => Ok(Some(StateLock { _file: file })),
+            Err(std::fs::TryLockError::WouldBlock) => Err(CredentialError::Busy),
+            Err(std::fs::TryLockError::Error(_)) => Err(CredentialError::Unreadable),
+        }
+    }
+
+    #[cfg(not(unix))]
+    pub fn try_lock(&self, _create_dir: bool) -> Result<Option<StateLock>, CredentialError> {
         Err(CredentialError::Unsupported)
     }
 
@@ -452,6 +526,26 @@ fn check_opened_credential_file(metadata: &std::fs::Metadata) -> Result<(), Cred
     use std::os::unix::fs::PermissionsExt;
     if !metadata.file_type().is_file() || metadata.permissions().mode() & 0o077 != 0 {
         return Err(CredentialError::InsecureFile);
+    }
+    Ok(())
+}
+
+/// 硬链接不可用的文件系统上的安装：`O_EXCL` 直接创建目标文件（已存在就是 `AlreadyPaired`），写完 `fsync`。
+/// 写到一半失败就把半截的目标文件删掉：留着它，下一次就成了一个「不可用的凭证文件」。
+#[cfg(unix)]
+fn create_exclusive(target: &Path, bytes: &[u8]) -> Result<(), CredentialError> {
+    let mut out = match open_private_new(target) {
+        Ok(out) => out,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            return Err(CredentialError::AlreadyPaired);
+        }
+        Err(_) => return Err(CredentialError::Unreadable),
+    };
+    let written = out.write_all(bytes).and_then(|()| out.sync_all());
+    drop(out);
+    if written.is_err() {
+        let _ = std::fs::remove_file(target);
+        return Err(CredentialError::Unreadable);
     }
     Ok(())
 }
@@ -676,6 +770,8 @@ mod tests {
             CredentialError::OriginMismatch,
             CredentialError::LocalKeyRefused,
             CredentialError::Unsupported,
+            CredentialError::Busy,
+            CredentialError::AlreadyPaired,
         ] {
             let text = format!("{error} {error:?} {}", error.code());
             // 提示文案里可以写「idk_ 加 64 位十六进制」这种格式说明，但不能出现任何一段像密钥的十六进制
@@ -702,7 +798,7 @@ mod tests {
         let store = DeviceStore::new(dir.path().join("cloud-tier"));
         assert!(store.read().unwrap().is_none(), "no file = not paired");
         store.preflight().unwrap();
-        store.write(&record("https://idoris.ai", 'a')).unwrap();
+        store.install(&record("https://idoris.ai", 'a')).unwrap();
         let mode = std::fs::metadata(store.path())
             .unwrap()
             .permissions()
@@ -721,11 +817,17 @@ mod tests {
             .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
             .collect();
         assert_eq!(names, [DEVICE_FILE]);
-        // 覆盖写：新内容原子替换，权限仍然是 0600
-        store.write(&record("https://idoris.ai", 'b')).unwrap();
+        // 安装不覆盖（审查 r4 Medium#4：以前这里是 rename，会覆盖已有的凭证）：已经有一张就拒绝，已有的原样不动，
+        // 权限仍然是 0600，也没有留下临时文件
+        assert_eq!(
+            store
+                .install(&record("https://idoris.ai", 'b'))
+                .unwrap_err(),
+            CredentialError::AlreadyPaired
+        );
         assert_eq!(
             store.read().unwrap().unwrap().secret.expose_secret(),
-            secret('b')
+            secret('a')
         );
         assert_eq!(
             std::fs::metadata(store.path())
@@ -735,9 +837,20 @@ mod tests {
                 & 0o777,
             0o600
         );
+        let names: Vec<String> = std::fs::read_dir(store.dir())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(names, [DEVICE_FILE]);
+        // 删掉之后可以重新安装
         assert!(store.remove().unwrap());
         assert!(!store.remove().unwrap(), "already gone is not an error");
         assert!(store.read().unwrap().is_none());
+        store.install(&record("https://idoris.ai", 'b')).unwrap();
+        assert_eq!(
+            store.read().unwrap().unwrap().secret.expose_secret(),
+            secret('b')
+        );
     }
 
     #[cfg(unix)]
@@ -746,7 +859,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let store = DeviceStore::new(dir.path());
-        store.write(&record("https://idoris.ai", 'a')).unwrap();
+        store.install(&record("https://idoris.ai", 'a')).unwrap();
         for mode in [0o640, 0o604, 0o644, 0o660, 0o666, 0o700 | 0o077] {
             std::fs::set_permissions(store.path(), std::fs::Permissions::from_mode(mode)).unwrap();
             assert_eq!(
@@ -769,7 +882,7 @@ mod tests {
     fn a_corrupt_or_extended_device_file_fails_closed() {
         let dir = tempfile::tempdir().unwrap();
         let store = DeviceStore::new(dir.path());
-        store.write(&record("https://idoris.ai", 'a')).unwrap();
+        store.install(&record("https://idoris.ai", 'a')).unwrap();
         let good = std::fs::read_to_string(store.path()).unwrap();
         let tamper = |edit: &dyn Fn(&str) -> String| {
             use std::os::unix::fs::PermissionsExt;
@@ -806,10 +919,10 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let store = DeviceStore::new(dir.path().join("ro"));
-        store.write(&record("https://idoris.ai", 'a')).unwrap();
+        store.install(&record("https://idoris.ai", 'a')).unwrap();
         // 目录变成只读：写失败，旧凭证原样还在，没有 .tmp 残留
         std::fs::set_permissions(store.dir(), std::fs::Permissions::from_mode(0o500)).unwrap();
-        let outcome = store.write(&record("https://idoris.ai", 'b'));
+        let outcome = store.install(&record("https://idoris.ai", 'b'));
         // 以 root 运行时只读目录不拦人，这个用例没有意义（要在恢复权限之前探测）
         let blocks_writes = std::fs::File::create(store.dir().join(".probe")).is_err();
         std::fs::set_permissions(store.dir(), std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -827,6 +940,136 @@ mod tests {
             .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
             .collect();
         assert_eq!(names, [DEVICE_FILE]);
+    }
+
+    /// 安装是「新装」：同时有很多个进程安装，恰好一个成功，其它的都是 `AlreadyPaired`，文件里是赢家的内容，
+    /// 谁都没有被半截覆盖，也没有留下临时文件。
+    #[cfg(unix)]
+    #[test]
+    fn many_concurrent_installs_have_exactly_one_winner_and_nobody_overwrites_anybody() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(DeviceStore::new(dir.path().join("cloud-tier")));
+        let seeds: Vec<char> = vec!['a', 'b', 'c', 'd', 'e', 'f', '0', '1']; // 十六进制字符：密钥只认小写十六进制
+        let start = Arc::new(std::sync::Barrier::new(seeds.len()));
+        let handles: Vec<_> = seeds
+            .iter()
+            .map(|&seed| {
+                let store = store.clone();
+                let start = start.clone();
+                std::thread::spawn(move || {
+                    start.wait();
+                    (seed, store.install(&record("https://idoris.ai", seed)))
+                })
+            })
+            .collect();
+        let results: Vec<(char, Result<(), CredentialError>)> =
+            handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let winners: Vec<char> = results
+            .iter()
+            .filter(|(_, outcome)| outcome.is_ok())
+            .map(|(seed, _)| *seed)
+            .collect();
+        assert_eq!(winners.len(), 1, "{results:?}");
+        for (seed, outcome) in &results {
+            if *seed != winners[0] {
+                assert_eq!(
+                    outcome.as_ref().unwrap_err(),
+                    &CredentialError::AlreadyPaired,
+                    "{seed}"
+                );
+            }
+        }
+        assert_eq!(
+            store.read().unwrap().unwrap().secret.expose_secret(),
+            secret(winners[0])
+        );
+        let names: Vec<String> = std::fs::read_dir(store.dir())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(names, [DEVICE_FILE], "no temp file may be left behind");
+    }
+
+    /// 目标处是个悬空的符号链接：安装不跟随它，也不在链接指向的地方创建文件。
+    #[cfg(unix)]
+    #[test]
+    fn an_install_never_follows_a_symlink_that_sits_at_the_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DeviceStore::new(dir.path());
+        let elsewhere = dir.path().join("elsewhere.json");
+        std::os::unix::fs::symlink(&elsewhere, store.path()).unwrap();
+        assert_eq!(
+            store
+                .install(&record("https://idoris.ai", 'a'))
+                .unwrap_err(),
+            CredentialError::AlreadyPaired
+        );
+        assert!(!elsewhere.exists(), "the link target must not be created");
+        assert_eq!(store.read().unwrap_err(), CredentialError::InsecureFile);
+    }
+
+    /// 文件系统不支持硬链接时的退路：`O_EXCL` 直接创建，同样不覆盖，权限 0600。
+    #[cfg(unix)]
+    #[test]
+    fn the_exclusive_create_fallback_does_not_overwrite_either() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("device.json");
+        create_exclusive(&target, b"first").unwrap();
+        assert_eq!(
+            create_exclusive(&target, b"second").unwrap_err(),
+            CredentialError::AlreadyPaired
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), b"first");
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    /// 状态目录的跨进程锁：立即返回，不等；丢掉就释放；没有目录就没有锁（解绑不为了拿锁去建目录）。
+    #[cfg(unix)]
+    #[test]
+    fn the_state_lock_excludes_a_second_holder_and_is_released_when_dropped() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let store = DeviceStore::new(dir.path().join("cloud-tier"));
+        // 目录不存在：不建（解绑），也就没有锁可拿
+        assert!(store.try_lock(false).unwrap().is_none());
+        assert!(!store.dir().exists());
+        // 配对：建目录（0700）拿锁
+        let first = store.try_lock(true).unwrap().expect("a lock");
+        assert_eq!(
+            std::fs::metadata(store.dir()).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(store.dir().join(LOCK_FILE))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        // 第二个持有者（另一个 DeviceStore、另一个文件描述符，和另一个进程里的情形一样）：立即 Busy，pair / unpair 都一样
+        let other = DeviceStore::new(store.dir());
+        let started = std::time::Instant::now();
+        assert_eq!(other.try_lock(true).unwrap_err(), CredentialError::Busy);
+        assert_eq!(other.try_lock(false).unwrap_err(), CredentialError::Busy);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "it must not wait"
+        );
+        // 释放之后别人能拿；锁文件留在目录里
+        drop(first);
+        let second = other
+            .try_lock(false)
+            .unwrap()
+            .expect("the lock is free again");
+        assert_eq!(store.try_lock(true).unwrap_err(), CredentialError::Busy);
+        drop(second);
+        assert!(store.dir().join(LOCK_FILE).exists());
+        assert!(store.try_lock(true).unwrap().is_some());
     }
 
     #[cfg(unix)]
@@ -855,7 +1098,7 @@ mod tests {
         let none = PairedDeviceProvider::new(store.clone(), "https://idoris.ai", None);
         assert_eq!(none.load().unwrap_err(), CredentialError::NotPaired);
 
-        store.write(&record("https://idoris.ai", 'a')).unwrap();
+        store.install(&record("https://idoris.ai", 'a')).unwrap();
         let ok = PairedDeviceProvider::new(store.clone(), "https://idoris.ai", None);
         let loaded = ok.load().unwrap();
         assert_eq!(loaded.secret.expose_secret(), secret('a'));
