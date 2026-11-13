@@ -136,23 +136,50 @@ pub(crate) enum Ingested {
     Malformed,
 }
 
-/// 流的观察器：供应商请求号、最终 usage、是否见过 `[DONE]`。
+/// 流的观察器：供应商请求号、最近的 usage、新内容出现的位置、choice 有没有完成、是否见过 `[DONE]`。
+///
+/// # 一个 usage 什么时候可信（R3 N3 + B4）
+///
+/// 上游可以在流中途发一个 usage（比如累计用量），后面还有内容。客户端在那之后断开、或者流在那之后失败，甚至流最后
+/// 干净地 `[DONE]` 了，中途的数字也只是已生成部分的用量，不是整个响应的用量：按它结算会少收钱（上游已经生成并计费的
+/// 部分没有算进去），而且状态机里写成「用量已知」之后，这次尝试既不挂账也不会被对账看到。反过来，一个确实已经是最终
+/// 用量的 usage，也不能因为后面又来了一个**没有任何新内容**的块（空 delta 的结束块）就被作废：那样本来按实际用量收的
+/// 变成按整笔预留收（多收）。所以分三样分别跟踪，**不是**一个「是不是最终」的布尔：
+///
+/// - 最近的 usage，以及携带它的那个事件的位置（[`Self::usage`] / `usage_at`）；
+/// - 最后一次出现**新内容**的事件的位置（`content_at`）；只有 `delta` 里有新的生成内容才算
+///   （见 `idoris_upstream::cloud::ChunkInfo::has_content`），空 delta 的结束块、只带 `role` 的块都不算；
+/// - choice 有没有完成（`finished`：见过非空的 `finish_reason`）。
+///
+/// [`Self::usage_is_trusted`] 的规则：
+///
+/// 1. 没有 usage：不可信（没有东西可信）；
+/// 2. **usage 之后出现了新内容**（`content_at` 严格晚于 `usage_at`）：不可信，**不论流后来怎么结束，包括 `[DONE]`**；
+///    usage 和内容在同一个事件里不算「之后」（每个 chunk 带累计 usage 的实现，最后一个内容块带的就是最终值）；
+/// 3. usage 之后没有新内容：单独的 usage 块（`choices` 为空或没有）可信——OpenAI 约定它就是整个请求的最终用量；
+///    夹带在内容块里的 usage，要等到这个 choice 完成（本块带 `finish_reason`，或者之后来了空 delta 的结束块）或者见到
+///    `[DONE]` 才可信：还没有任何结束的迹象就断了，生成可能还在继续。
+///
+/// 不可信时（并且 usage 确实是有效的）：**按原规则**——预留价、成本挂账待核销，上游声称的数字原样记进 `usage_claim_json`
+/// （判定 `untrusted:not_final`）供对账。
 #[derive(Debug)]
 pub(crate) struct StreamTracker {
     wants_usage_chunk: bool,
     pub(crate) id: Option<String>,
     /// 流中途出现的、与第一个不同的请求号（上游出问题的信号；对账时要标注）。
     pub(crate) changed_id: Option<String>,
-    /// 最近一个带 usage 的事件的判定。**不一定是最终用量**，见 [`Self::usage_is_final`]。
+    /// 最近一个带 usage 的事件的判定。**不一定可信**，见 [`Self::usage_is_trusted`]。
     pub(crate) usage: UsageParse,
-    /// [`Self::usage`] 看起来是**最终用量**：它来自一个像「最后一块」的事件（单独的 usage 块，`choices` 为空或没有；
-    /// 或者带着 `finish_reason` 的最后一块内容），而且这之后流里没有再出现过带内容的块。
-    ///
-    /// 为什么要问：上游可以在流中途发一个 usage（比如累计用量），后面还有内容。客户端在那之后断开、或者流在那之后失败，
-    /// 中途的数字只是已生成部分的用量，不是整个响应的用量。按它结算会少收钱（上游已经生成并计费的部分没有算进去），
-    /// 而且状态机里写成「用量已知」之后，这次尝试既不挂账也不会被对账看到。所以**只有流正常完成，或者这个 usage 本身
-    /// 就是最终用量**，它才能当结算依据；否则按「用量未知 / 可能已执行」走原来的规则（预留价、挂账待核销）。
-    pub(crate) usage_is_final: bool,
+    /// 已经处理的 JSON 事件个数：给事件编号，只用来比较先后。
+    events: u64,
+    /// 携带 [`Self::usage`] 的那个事件的编号。
+    usage_at: Option<u64>,
+    /// [`Self::usage`] 来自单独的 usage 块（`choices` 为空或没有）。
+    usage_standalone: bool,
+    /// 最后一个带**新内容**的事件的编号。
+    content_at: Option<u64>,
+    /// 见过非空的 `finish_reason`：choice 的生成已经结束。
+    finished: bool,
     pub(crate) saw_done: bool,
 }
 
@@ -163,9 +190,28 @@ impl StreamTracker {
             id: None,
             changed_id: None,
             usage: UsageParse::Absent,
-            usage_is_final: false,
+            events: 0,
+            usage_at: None,
+            usage_standalone: false,
+            content_at: None,
+            finished: false,
             saw_done: false,
         }
+    }
+
+    /// 最近的 usage 可以当结算依据吗？规则见类型文档。
+    pub(crate) fn usage_is_trusted(&self) -> bool {
+        let Some(usage_at) = self.usage_at else {
+            return false;
+        };
+        // usage 之后又生成了新内容：那个数字只是到它为止的用量，后来的 `[DONE]` 也改变不了这一点
+        if self
+            .content_at
+            .is_some_and(|content_at| content_at > usage_at)
+        {
+            return false;
+        }
+        self.usage_standalone || self.finished || self.saw_done
     }
 
     pub(crate) fn ingest(&mut self, event: &SseEvent) -> Ingested {
@@ -181,9 +227,10 @@ impl StreamTracker {
                     return Ingested::UpstreamError;
                 }
                 let carries_usage = !matches!(info.usage, UsageParse::Absent);
-                // 合法的 chunk 只有两种：completion chunk（`choices` 是对象数组），和单独的 usage 块（带 usage，
-                // `choices` 为空或者没有）。其它任意 JSON 对象（`{}`、`{"x":1}`）不是回答：不能转发，更不能让它
-                // 跨过发布边界（之后就不能切换候选，用户没有拿到回答却要按预留价付费）。
+                // 合法的 chunk 只有两种：completion chunk（`choices` 是数组，每个元素是像样的 choice：带 `delta` 对象，
+                // 或带已结束的 `finish_reason`），和单独的 usage 块（带 usage，`choices` 为空或者没有）。其它任意 JSON
+                // 对象（`{}`、`{"x":1}`、`{"choices":[{}]}`）不是回答：不能转发，更不能让它跨过发布边界（之后就不能切换
+                // 候选，用户没有拿到回答却要按预留价付费）。
                 let completion_chunk = info.has_choices && info.choices_well_formed;
                 let usage_only_chunk = carries_usage && (!info.has_choices || info.choices_empty);
                 if !completion_chunk && !usage_only_chunk {
@@ -196,14 +243,17 @@ impl StreamTracker {
                     }
                     _ => {}
                 }
+                self.events += 1;
                 if carries_usage {
                     self.usage = info.usage.clone();
-                    // 「最后一块」的两种样子：单独的 usage 块，或者带着 finish_reason 的最后一块内容
-                    self.usage_is_final =
-                        !info.has_choices || info.choices_empty || info.has_finish_reason;
-                } else if info.has_choices && !info.choices_empty {
-                    // 上一个 usage 之后又来了内容：它不是最终用量
-                    self.usage_is_final = false;
+                    self.usage_at = Some(self.events);
+                    self.usage_standalone = !info.has_choices || info.choices_empty;
+                }
+                if info.has_content {
+                    self.content_at = Some(self.events);
+                }
+                if info.has_finish_reason {
+                    self.finished = true;
                 }
                 if carries_usage && !self.wants_usage_chunk {
                     // 客户端没要 usage：整块只有 usage 就不转发，内容块里夹带的 usage 去掉
@@ -356,10 +406,10 @@ impl StreamState {
         match next {
             Err(end) => self.phase = Phase::Finishing(end),
             Ok(None) => {
-                // 连接结束：`[DONE]` 或**最终** usage 已经到了才算完成；否则是被截断
+                // 连接结束：`[DONE]` 或**可信的**最终 usage 已经到了才算完成；否则是被截断
                 // （中途的 usage 之后还有内容、连接却断了，不是完成）
                 let complete = self.tracker.saw_done
-                    || (self.tracker.usage_is_final
+                    || (self.tracker.usage_is_trusted()
                         && self.tracker.usage.valid_usage().is_some()
                         && !self.parser.has_partial_event());
                 if complete {
@@ -429,12 +479,13 @@ impl StreamState {
             self.tracker.id.as_deref(),
             self.head.supplier_request_id_header.as_deref(),
         );
-        // usage：**只信最终用量**。流正常完成（`[DONE]` / 最终 usage 之后干净结束）时，最近一个 usage 就是上游对整个
-        // 响应的最终计数；流没有正常完成（客户端断开、上游中途失败）时，只有那个 usage 本身就是最后一块
-        // （`usage_is_final`）才信：中途的 usage 之后还有内容，那个数字只是已生成部分的用量，按它结算会少收钱，
-        // 而且「用量已知」会盖过下面「保持 maybe_executed」的诚实标注，成本既不挂账也不会被对账看到。
-        // 不被信任的 usage 原文照样记进 `usage_claim_json`（判定 `untrusted:not_final`）供对账。
-        let trusted = end == End::Complete || self.tracker.usage_is_final;
+        // usage：**只信最终用量**，而且**不看流是怎么结束的**：`[DONE]` 不能把中途的 usage 变成最终用量（R3 B4）——
+        // usage 之后又生成了新内容，那个数字只是已生成部分的用量，按它结算会少收钱，而且「用量已知」会盖过下面
+        // 「保持 maybe_executed」的诚实标注，成本既不挂账也不会被对账看到。反过来，usage 之后只有没有新内容的块
+        // （空 delta 的结束块、`[DONE]`）时它就是最终用量，客户端读到结束标志就断开也照样按它结算（R3 N3：不多收）。
+        // 规则见 [`StreamTracker::usage_is_trusted`]。不被信任的 usage 原文照样记进 `usage_claim_json`
+        // （判定 `untrusted:not_final`）供对账。
+        let trusted = self.tracker.usage_is_trusted();
         let (usage, claim) = if trusted || matches!(self.tracker.usage, UsageParse::Absent) {
             judge_usage(&self.tracker.usage, &attempt)
         } else {
@@ -686,12 +737,12 @@ mod tests {
         // 单独的 usage 块（choices 为空）：最终
         let mut tracker = StreamTracker::new(false);
         tracker.ingest(&ev(&content("a")));
-        assert!(!tracker.usage_is_final, "no usage yet");
+        assert!(!tracker.usage_is_trusted(), "no usage yet");
         tracker.ingest(&ev(&format!(r#"{{"choices":[],{usage}}}"#)));
-        assert!(tracker.usage_is_final);
+        assert!(tracker.usage_is_trusted());
         // 之后又来了内容：不是最终用量
         tracker.ingest(&ev(&content("b")));
-        assert!(!tracker.usage_is_final, "content followed the usage");
+        assert!(!tracker.usage_is_trusted(), "content followed the usage");
         assert_eq!(
             tracker.usage.valid_usage().unwrap().completion_tokens,
             2,
@@ -701,24 +752,309 @@ mod tests {
         let mut tracker = StreamTracker::new(false);
         tracker.ingest(&ev(&format!(r#"{{"choices":[],{usage}}}"#)));
         tracker.ingest(&ev(r#"{"choices":[]}"#));
-        assert!(tracker.usage_is_final);
+        assert!(tracker.usage_is_trusted());
 
         // 夹带在内容块里的 usage：没有 finish_reason 的不是最终用量，带 finish_reason 的是
         let mut tracker = StreamTracker::new(false);
         tracker.ingest(&ev(&format!(
             r#"{{"choices":[{{"delta":{{"content":"a"}},"finish_reason":null}}],{usage}}}"#
         )));
-        assert!(!tracker.usage_is_final, "a cumulative usage mid-stream");
+        assert!(!tracker.usage_is_trusted(), "a cumulative usage mid-stream");
         tracker.ingest(&ev(&format!(
             r#"{{"choices":[{{"delta":{{}},"finish_reason":"stop"}}],{usage}}}"#
         )));
-        assert!(tracker.usage_is_final);
+        assert!(tracker.usage_is_trusted());
 
         // 没有 usage 的流：什么都不是最终用量
         let mut tracker = StreamTracker::new(false);
         tracker.ingest(&ev(&content("a")));
         tracker.ingest(&SseEvent::from_lines(&[b"data: [DONE]"]));
-        assert!(tracker.saw_done && !tracker.usage_is_final);
+        assert!(tracker.saw_done && !tracker.usage_is_trusted());
+    }
+
+    /// 喂给观察器的事件序列。每个词是一种 chunk（usage 都是 12 入 2 出）：
+    ///
+    /// - `content`：带内容、没有 usage；`content+usage`：带内容、夹带 usage、没有 `finish_reason`；
+    /// - `content+usage+finish`：最后一块内容，夹带 usage 并带 `finish_reason`；
+    /// - `usage`：单独的 usage 块（`choices` 为空）；`usage-no-choices`：单独的 usage 块（没有 `choices`）；
+    /// - `finish`：只有结束标志（空 delta、`finish_reason: stop`），没有 usage、没有新内容；`finish+usage`：同上并带 usage；
+    /// - `role`：只有 `role` 的开场块；`empty-delta`：`delta: {}`、没有 `finish_reason`；`blank-finish`：`finish_reason: ""`；
+    /// - `tool-call`：带工具调用参数的块；`empty-choices`：`{"choices":[]}`；`done`：`[DONE]`。
+    fn track(steps: &[&str]) -> StreamTracker {
+        let usage = r#""usage":{"prompt_tokens":12,"completion_tokens":2}"#;
+        let mut tracker = StreamTracker::new(false);
+        for step in steps {
+            let data = match *step {
+                "content" => r#"{"id":"c","choices":[{"delta":{"content":"hi"}}]}"#.to_string(),
+                "content+usage" => format!(
+                    r#"{{"id":"c","choices":[{{"delta":{{"content":"hi"}}}}],{usage}}}"#
+                ),
+                "content+usage+finish" => format!(
+                    r#"{{"id":"c","choices":[{{"delta":{{"content":"hi"}},"finish_reason":"stop"}}],{usage}}}"#
+                ),
+                "usage" => format!(r#"{{"id":"c","choices":[],{usage}}}"#),
+                "usage-no-choices" => format!(r#"{{"id":"c",{usage}}}"#),
+                "finish" => {
+                    r#"{"id":"c","choices":[{"delta":{},"finish_reason":"stop"}]}"#.to_string()
+                }
+                "finish+usage" => format!(
+                    r#"{{"id":"c","choices":[{{"delta":{{}},"finish_reason":"stop"}}],{usage}}}"#
+                ),
+                "role" => {
+                    r#"{"id":"c","choices":[{"delta":{"role":"assistant","content":""}}]}"#
+                        .to_string()
+                }
+                "empty-delta" => r#"{"id":"c","choices":[{"delta":{}}]}"#.to_string(),
+                "blank-finish" => {
+                    r#"{"id":"c","choices":[{"delta":{},"finish_reason":""}]}"#.to_string()
+                }
+                "tool-call" => r#"{"id":"c","choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"a\":1}"}}]}}]}"#.to_string(),
+                "empty-choices" => r#"{"id":"c","choices":[]}"#.to_string(),
+                "done" => "[DONE]".to_string(),
+                other => panic!("unknown step {other}"),
+            };
+            let ingested = tracker.ingest(&ev(&data));
+            assert!(
+                !matches!(ingested, Ingested::Malformed | Ingested::UpstreamError),
+                "{step}: {data}"
+            );
+        }
+        tracker
+    }
+
+    /// R3 N3 + B4 的场景表：usage 什么时候可信（结算按它收实际用量），什么时候不可信（按原规则：预留价、挂账待核销）。
+    /// 规则只看三样东西：最近的 usage、最后一次新内容的位置、choice 有没有完成；**不看流是怎么结束的**。
+    #[test]
+    fn the_usage_trust_table() {
+        // (场景, 事件序列, 可信吗)
+        let cases: &[(&str, &[&str], bool)] = &[
+            // ---- 没有 usage ----
+            ("no usage at all", &["content", "finish", "done"], false),
+            ("nothing yet", &[], false),
+            // ---- 单独的 usage 块（OpenAI 约定：整个请求的最终用量）----
+            (
+                "usage-only chunk after the content",
+                &["content", "usage"],
+                true,
+            ),
+            (
+                "usage-only chunk without a choices field",
+                &["content", "usage-no-choices"],
+                true,
+            ),
+            (
+                "content, finish, usage-only",
+                &["content", "finish", "usage"],
+                true,
+            ),
+            (
+                "content, finish, usage-only, done",
+                &["content", "finish", "usage", "done"],
+                true,
+            ),
+            // usage 之后没有新内容的块：空 choices、空 delta 的结束块、`[DONE]` 都不算
+            (
+                "usage-only then an empty choices chunk",
+                &["content", "usage", "empty-choices"],
+                true,
+            ),
+            (
+                "usage-only then a bare finish chunk",
+                &["content", "usage", "finish"],
+                true,
+            ),
+            (
+                "usage-only then a bare finish chunk and done",
+                &["content", "usage", "finish", "done"],
+                true,
+            ),
+            (
+                "usage-only then an empty delta",
+                &["content", "usage", "empty-delta"],
+                true,
+            ),
+            // ---- usage 之后又有新内容：不可信，不论流怎么结束 ----
+            (
+                "usage-only then more content (client leaves / stream fails)",
+                &["content", "usage", "content"],
+                false,
+            ),
+            (
+                "usage-only then lots of content",
+                &[
+                    "content", "usage", "content", "content", "content", "content",
+                ],
+                false,
+            ),
+            (
+                "usage-only then lots of content and a finish",
+                &["content", "usage", "content", "content", "finish"],
+                false,
+            ),
+            (
+                "usage-only then lots of content, a finish and DONE: DONE does not make the mid-stream number final",
+                &["content", "usage", "content", "content", "finish", "done"],
+                false,
+            ),
+            (
+                "usage-only then a tool call",
+                &["content", "usage", "tool-call", "finish", "done"],
+                false,
+            ),
+            (
+                "usage on the first chunk, the answer after it",
+                &["content+usage", "content", "finish", "done"],
+                false,
+            ),
+            (
+                "an early usage-only chunk, then the answer, no later usage",
+                &["usage", "content", "content", "finish", "done"],
+                false,
+            ),
+            // 后面又来了更新的 usage（最新的一个才算）：用新的位置重新判断
+            (
+                "a later usage-only chunk replaces the early one",
+                &["content", "usage", "content", "usage", "finish", "done"],
+                true,
+            ),
+            // ---- 夹带在内容块里的 usage ----
+            (
+                "cumulative usage mid-stream, nothing says the generation ended",
+                &["content+usage"],
+                false,
+            ),
+            (
+                "cumulative usage mid-stream, then the client leaves after a role chunk",
+                &["content+usage", "role"],
+                false,
+            ),
+            (
+                "cumulative usage, an empty-string finish_reason is not a finish",
+                &["content+usage", "blank-finish"],
+                false,
+            ),
+            (
+                "cumulative usage then DONE",
+                &["content+usage", "done"],
+                true,
+            ),
+            (
+                "cumulative usage in the last content chunk, then a bare finish chunk (N3)",
+                &["content", "content+usage", "finish"],
+                true,
+            ),
+            (
+                "... and DONE",
+                &["content", "content+usage", "finish", "done"],
+                true,
+            ),
+            (
+                "the finish_reason rides the usage-carrying content chunk",
+                &["content", "content+usage+finish"],
+                true,
+            ),
+            (
+                "... and the usage rides the finish chunk",
+                &["content", "finish+usage"],
+                true,
+            ),
+            (
+                "usage on every content chunk, then the finish chunk (cumulative stats)",
+                &["content+usage", "content+usage", "content+usage", "finish"],
+                true,
+            ),
+            (
+                "usage on every content chunk but the stream stops before any finish",
+                &["content+usage", "content+usage", "content+usage"],
+                false,
+            ),
+            (
+                "cumulative usage, then content without usage, then finish",
+                &["content+usage", "content", "finish"],
+                false,
+            ),
+            (
+                "cumulative usage, then content without usage, then finish and DONE",
+                &["content+usage", "content", "finish", "done"],
+                false,
+            ),
+            // ---- 结束标志先于 usage（顺序颠倒）----
+            (
+                "finish chunk first, usage-only after",
+                &["content", "finish", "usage"],
+                true,
+            ),
+            (
+                "finish chunk first, usage on a later content-free chunk",
+                &["content", "finish", "finish+usage"],
+                true,
+            ),
+        ];
+        for (name, steps, trusted) in cases {
+            let tracker = track(steps);
+            assert_eq!(
+                tracker.usage_is_trusted(),
+                *trusted,
+                "{name}: {steps:?} (usage_at={:?} content_at={:?} finished={} done={})",
+                tracker.usage_at,
+                tracker.content_at,
+                tracker.finished,
+                tracker.saw_done
+            );
+        }
+    }
+
+    /// 可信的判定看的是**最近**的 usage：后面一个无效的 usage 会把前面有效的顶掉（保守：宁可当未知）。
+    #[test]
+    fn the_latest_usage_is_the_one_that_is_judged() {
+        let mut tracker = track(&["content", "usage"]);
+        assert!(tracker.usage_is_trusted());
+        assert_eq!(tracker.usage.valid_usage().unwrap().completion_tokens, 2);
+        // 一个新的、数值不同的 usage 块替换它
+        tracker.ingest(&ev(
+            r#"{"id":"c","choices":[],"usage":{"prompt_tokens":12,"completion_tokens":5}}"#,
+        ));
+        assert!(tracker.usage_is_trusted());
+        assert_eq!(tracker.usage.valid_usage().unwrap().completion_tokens, 5);
+        // 无效的 usage（缺 completion_tokens）也是「最近的」：可信与否没意义了，结算时它是无效的 -> 用量未知
+        tracker.ingest(&ev(
+            r#"{"id":"c","choices":[],"usage":{"prompt_tokens":12}}"#,
+        ));
+        assert!(tracker.usage.valid_usage().is_none());
+    }
+
+    /// R3 Medium-3：空 choice（`{"choices":[{}]}` 之类）不是合法的流事件：不转发、不认供应商请求号、不改变任何判断。
+    #[test]
+    fn an_empty_choice_is_not_a_valid_stream_event() {
+        let mut tracker = StreamTracker::new(false);
+        for data in [
+            r#"{"choices":[{}]}"#,
+            r#"{"id":"c","choices":[{}]}"#,
+            r#"{"id":"c","choices":[{"index":0}]}"#,
+            r#"{"id":"c","choices":[{"delta":"text"}]}"#,
+            r#"{"id":"c","choices":[{"delta":null,"finish_reason":null}]}"#,
+            // 带 usage 也一样：空 choice 不是「单独的 usage 块」（choices 不为空）
+            r#"{"id":"c","choices":[{}],"usage":{"prompt_tokens":1,"completion_tokens":1}}"#,
+        ] {
+            assert!(
+                matches!(tracker.ingest(&ev(data)), Ingested::Malformed),
+                "{data}"
+            );
+        }
+        assert!(tracker.id.is_none(), "a malformed chunk teaches us nothing");
+        assert!(matches!(tracker.usage, UsageParse::Absent));
+        assert!(!tracker.usage_is_trusted());
+        // 对照：像样的 choice 都转发
+        for data in [
+            r#"{"choices":[{"delta":{}}]}"#,
+            r#"{"choices":[{"delta":{"content":"x"}}]}"#,
+            r#"{"choices":[{"finish_reason":"stop"}]}"#,
+        ] {
+            assert!(
+                matches!(tracker.ingest(&ev(data)), Ingested::Forward(_)),
+                "{data}"
+            );
+        }
     }
 
     #[test]

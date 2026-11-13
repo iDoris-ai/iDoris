@@ -3,7 +3,9 @@
 //! 只读取我们要用的结构化字段，**不解读、不记录消息内容**：
 //! - `id`：供应商请求号（OpenAI 兼容各家把它放在每个 chunk 的顶层 `id`），对账用；
 //! - `usage`：`stream_options.include_usage` 之后，最后一个 chunk（`choices` 为空数组）带的用量；
-//! - `error`：有些上游在 HTTP 200 之后用一个 `{"error": ...}` 事件报错。
+//! - `error`：有些上游在 HTTP 200 之后用一个 `{"error": ...}` 事件报错；
+//! - `choices` 的形状、有没有 `finish_reason`、`delta` 里有没有**新的生成内容**（只看「有没有」，不读内容本身）：
+//!   调用方据此判断一个 chunk 是不是合法的 completion chunk，以及一个 usage 之后生成有没有继续（见 `ChunkInfo`）。
 
 use serde_json::Value;
 
@@ -26,10 +28,19 @@ pub struct ChunkInfo {
     pub has_choices: bool,
     /// `choices` 是空数组（usage 单独成块时的样子）。
     pub choices_empty: bool,
-    /// `choices` 是数组，而且每个元素都是对象（一个合法的 completion chunk 的最低要求）。
+    /// `choices` 是数组，而且每个元素都是**像样的 choice**（一个合法的 completion chunk 的最低要求）：对象，并且带 `delta`
+    /// 对象（内容块、空 delta 的块都行），或者带已结束的 `finish_reason`（有的实现最后一块没有 `delta`）。
+    /// `{"choices":[{}]}` 这种空 choice 不是（R3 Medium-3）：它不带任何东西，却会被当成回答转发、跨过发布边界。
+    /// 空数组是合法的（单独的 usage 块的样子）。
     pub choices_well_formed: bool,
-    /// 某个 choice 带了非空的 `finish_reason`：这个 choice 的生成已经结束（「最后一块内容」的标志）。
+    /// 某个 choice 带了已结束的 `finish_reason`（非 `null`、也不是空字符串；有的兼容实现在没结束的块里写 `""`）：
+    /// 这个 choice 的生成已经结束。
     pub has_finish_reason: bool,
+    /// 某个 choice 的 `delta` 带了**新的生成内容**：除顶层 `role` 之外的任何地方出现非空字符串（`content`、`refusal`、
+    /// `reasoning_content`、工具调用的名字和参数……）。`role: assistant`、`content: ""`、`null`、空数组、空对象、
+    /// 空 delta 的结束块都不算。故意不按字段名列白名单：不认识的新字段里有文字也当内容——误判的方向是「不信 usage」
+    /// （按预留价），不是「少收」。
+    pub has_content: bool,
 }
 
 /// 一个 SSE 事件的分类。
@@ -43,6 +54,38 @@ pub enum ChunkKind {
     Json(ChunkInfo),
     /// `data:` 不是 JSON 对象（解析失败、数组、标量）。
     Opaque,
+}
+
+/// 这个 choice 的 `finish_reason` 表示生成已经结束：非 `null`，也不是空字符串。
+fn choice_finished(choice: &Value) -> bool {
+    match choice.get("finish_reason") {
+        None | Some(Value::Null) => false,
+        Some(Value::String(reason)) => !reason.is_empty(),
+        Some(_) => true,
+    }
+}
+
+/// 一个像样的 choice：是对象，并且带 `delta` 对象，或者带已结束的 `finish_reason`。
+fn choice_is_well_formed(choice: &Value) -> bool {
+    choice.is_object()
+        && (choice.get("delta").is_some_and(Value::is_object) || choice_finished(choice))
+}
+
+/// `delta` 里有没有新的生成内容（见 [`ChunkInfo::has_content`]）。
+fn delta_carries_content(delta: &Value) -> bool {
+    fn has_text(value: &Value) -> bool {
+        match value {
+            Value::String(text) => !text.is_empty(),
+            Value::Array(items) => items.iter().any(has_text),
+            Value::Object(fields) => fields.values().any(has_text),
+            _ => false,
+        }
+    }
+    delta.as_object().is_some_and(|fields| {
+        fields
+            .iter()
+            .any(|(key, value)| key != "role" && has_text(value))
+    })
 }
 
 fn trimmed(bytes: &[u8]) -> &[u8] {
@@ -80,13 +123,12 @@ pub fn classify(event: &SseEvent) -> ChunkKind {
                 error: object.get("error").is_some_and(|e| !e.is_null()),
                 has_choices: choices.is_some(),
                 choices_empty: choices.is_some_and(Vec::is_empty),
-                choices_well_formed: choices.is_some_and(|list| list.iter().all(Value::is_object)),
-                has_finish_reason: choices.is_some_and(|list| {
-                    list.iter().any(|choice| {
-                        choice
-                            .get("finish_reason")
-                            .is_some_and(|reason| !reason.is_null())
-                    })
+                choices_well_formed: choices
+                    .is_some_and(|list| list.iter().all(choice_is_well_formed)),
+                has_finish_reason: choices.is_some_and(|list| list.iter().any(choice_finished)),
+                has_content: choices.is_some_and(|list| {
+                    list.iter()
+                        .any(|choice| choice.get("delta").is_some_and(delta_carries_content))
                 }),
             })
         }
@@ -169,6 +211,108 @@ mod tests {
             let bad = info(data);
             assert!(!bad.choices_well_formed, "{data}");
         }
+    }
+
+    /// R3 Medium-3：一个 choice 必须像样（带 `delta` 对象，或已结束的 `finish_reason`），`{"choices":[{}]}` 之类的空 choice
+    /// 不是合法的 completion chunk（只检查「元素是对象」会把它当回答转发、让它跨过发布边界）。
+    #[test]
+    fn a_choice_with_nothing_in_it_is_not_a_completion_chunk() {
+        let info = |data: &str| match classify(&event(data)) {
+            ChunkKind::Json(info) => info,
+            other => panic!("expected a JSON chunk, got {other:?}"),
+        };
+        for data in [
+            r#"{"choices":[{}]}"#,
+            r#"{"choices":[{"index":0}]}"#,
+            r#"{"choices":[{"delta":null}]}"#,
+            r#"{"choices":[{"delta":"text"}]}"#,
+            r#"{"choices":[{"delta":[]}]}"#,
+            r#"{"choices":[{"finish_reason":null}]}"#,
+            r#"{"choices":[{"index":0,"finish_reason":""}]}"#,
+            // 一个像样的、一个空的：整体不合法
+            r#"{"choices":[{"delta":{"content":"x"}},{}]}"#,
+        ] {
+            let parsed = info(data);
+            assert!(parsed.has_choices, "{data}");
+            assert!(!parsed.choices_well_formed, "{data}");
+        }
+        for data in [
+            r#"{"choices":[{"delta":{}}]}"#,
+            r#"{"choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}"#,
+            r#"{"choices":[{"delta":{"content":"x"}}]}"#,
+            // 有的实现最后一块没有 delta，只有 finish_reason
+            r#"{"choices":[{"finish_reason":"stop"}]}"#,
+            r#"{"choices":[{"finish_reason":"length","index":0}]}"#,
+            // 单独的 usage 块：空数组
+            r#"{"choices":[]}"#,
+        ] {
+            assert!(info(data).choices_well_formed, "{data}");
+        }
+    }
+
+    /// 空字符串的 `finish_reason` 不是「已结束」（有的兼容实现在没结束的块里写 `""`）。
+    #[test]
+    fn an_empty_finish_reason_does_not_mean_the_choice_finished() {
+        let info = |data: &str| match classify(&event(data)) {
+            ChunkKind::Json(info) => info,
+            other => panic!("expected a JSON chunk, got {other:?}"),
+        };
+        for data in [
+            r#"{"choices":[{"delta":{"content":"x"},"finish_reason":""}]}"#,
+            r#"{"choices":[{"delta":{"content":"x"},"finish_reason":null}]}"#,
+            r#"{"choices":[{"delta":{"content":"x"}}]}"#,
+        ] {
+            assert!(!info(data).has_finish_reason, "{data}");
+        }
+        for data in [
+            r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
+            r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
+            r#"{"choices":[{"delta":{"content":"x"},"finish_reason":"length"}]}"#,
+        ] {
+            assert!(info(data).has_finish_reason, "{data}");
+        }
+    }
+
+    /// R3 N3：只有**新的生成内容**算内容；空 delta 的结束块、只带 `role` 的块、空字符串 / `null` / 空容器都不算。
+    #[test]
+    fn only_generated_text_counts_as_new_content() {
+        let content = |data: &str| match classify(&event(data)) {
+            ChunkKind::Json(info) => info.has_content,
+            other => panic!("expected a JSON chunk, got {other:?}"),
+        };
+        for data in [
+            r#"{"choices":[]}"#,
+            r#"{"choices":[{"delta":{}}]}"#,
+            r#"{"choices":[{"delta":{"role":"assistant"}}]}"#,
+            r#"{"choices":[{"delta":{"role":"assistant","content":""}}]}"#,
+            r#"{"choices":[{"delta":{"content":null,"refusal":null,"tool_calls":[]}}]}"#,
+            r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
+            r#"{"choices":[{"finish_reason":"stop"}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":""}}]}}]}"#,
+            r#"{"choices":[{"delta":{"function_call":{"name":"","arguments":""}}}]}"#,
+            // 没有 choices 的单独 usage 块
+            r#"{"usage":{"prompt_tokens":1,"completion_tokens":1}}"#,
+        ] {
+            assert!(!content(data), "{data}");
+        }
+        for data in [
+            r#"{"choices":[{"delta":{"content":"x"}}]}"#,
+            r#"{"choices":[{"delta":{"content":" "}}]}"#,
+            r#"{"choices":[{"delta":{"refusal":"no"}}]}"#,
+            r#"{"choices":[{"delta":{"reasoning_content":"hmm"}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"f","arguments":""}}]}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"a\""}}]}}]}"#,
+            // 最后一块内容 + finish_reason：有内容
+            r#"{"choices":[{"delta":{"content":"x"},"finish_reason":"stop"}]}"#,
+            // 不认识的新字段里有文字：当内容（宁可不信 usage，不能少收）
+            r#"{"choices":[{"delta":{"some_new_field":{"deep":["text"]}}}]}"#,
+        ] {
+            assert!(content(data), "{data}");
+        }
+        // 内容跟着 role 一起来：有内容
+        assert!(content(
+            r#"{"choices":[{"delta":{"role":"assistant","content":"x"}}]}"#
+        ));
     }
 
     #[test]

@@ -10,6 +10,8 @@
 //! | R2 Medium#4 | 首个网络块就含 `[DONE]`：流立刻完成，不等上游，不处理 `[DONE]` 之后的事件 |
 //! | R2 Medium#6 | 非流式的总期限是「响应头 + 响应体」合起来算 |
 //! | PD B4 | 流中途的 usage 块不是最终用量：客户端断开 / 流失败之后不能按它结算 |
+//! | R3 N3 + B4 | 用量可信只看「最近的 usage / 最后一次新内容的位置 / choice 有没有完成」：usage 之后没有新内容（空 delta 的结束块、`[DONE]`）就可信，按实际用量收；usage 之后有新内容不可信，**即使最后是 `[DONE]`**，按预留价收、挂账 |
+//! | R3 Medium-3 | 空 choice（`{"choices":[{}]}`）不是合法的 completion chunk：发布之前失败，允许切换候选 |
 //!
 //! 数字约定同 `cloud_upstream_e2e.rs`：`simple_body(100)` 预留价 4110 微泰铢、预留成本 41 微美元；
 //! 12 入 2 出的实际价 200 微泰铢。全部对本地假上游（`127.0.0.1`）进行，不连接任何真实的推理供应商。
@@ -537,6 +539,349 @@ async fn a_final_usage_chunk_is_trusted_even_when_the_client_leaves_before_done(
     let request = h.store.request_row(&id).unwrap().unwrap();
     assert_eq!(request.charged_micros, Some(200));
     assert_eq!(request.charged_basis.as_deref(), Some("actual_usage"));
+}
+
+// ---------------------------------------------------------------------------
+// R3 N3 + B4：用量可信的判定（不多收也不少收）
+//
+// 三样东西分开跟踪：最近的 usage、最后一次「新内容」出现的位置、choice 有没有完成（`finish_reason`）。
+//   - usage 之后没有新内容（只有空 delta 的 finish 块、`[DONE]`）：可信，按它结算；
+//   - usage 之后有新内容：不可信，**即使最后是 `[DONE]` 也不可信**，按「用量未知」的原规则（预留价 + 挂账待核销）。
+// ---------------------------------------------------------------------------
+
+/// 带内容、同时夹带 usage 的 chunk（没有 `finish_reason`）。
+fn content_with_usage_event(id: &str, text: &str, usage: Value) -> String {
+    let chunk = json!({
+        "id": id, "object": "chat.completion.chunk",
+        "choices": [{"index": 0, "delta": {"content": text}}],
+        "usage": usage,
+    });
+    format!("data: {chunk}\n\n")
+}
+
+/// 只有结束标志的 chunk：空 delta、`finish_reason: stop`，没有 usage、没有新内容。
+fn finish_event(id: &str) -> String {
+    let chunk = json!({
+        "id": id, "object": "chat.completion.chunk",
+        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+    });
+    format!("data: {chunk}\n\n")
+}
+
+/// 结算：用户付的钱、依据，和这次尝试的最终状态。
+fn charged(h: &Harness, id: &RequestId) -> (Option<i64>, Option<String>, AttemptState) {
+    let request = h.store.request_row(id).unwrap().unwrap();
+    let attempts = rows(h, id);
+    assert_eq!(attempts.len(), 1);
+    (
+        request.charged_micros,
+        request.charged_basis,
+        attempts[0].state.clone(),
+    )
+}
+
+fn actual_12_2() -> AttemptState {
+    AttemptState::Settled {
+        basis: SettleBasis::ActualUsage(Usage::new(12, 2, 0).unwrap()),
+    }
+}
+
+fn reserved() -> AttemptState {
+    AttemptState::Settled {
+        basis: SettleBasis::ReservedAmount,
+    }
+}
+
+/// N3 的原场景：最后一个内容块携带最终 usage，随后单独一个只有结束标志的块；客户端读到结束标志就断开。
+/// 第一块没有 `finish_reason`、第二块没有 usage：原来的判定把无内容的结束块当成「usage 之后又有内容」，
+/// 本来按实际用量收的（200）变成按整笔预留收（4110）。
+#[tokio::test]
+async fn usage_on_the_last_content_chunk_then_a_bare_finish_chunk_is_billed_the_actual_usage() {
+    let a = FakeUpstream::start(vec![Behavior::sse(vec![
+        SseStep::Send(content_event("c", "Hel")),
+        SseStep::Send(content_with_usage_event("c", "lo", usage(12, 2))),
+        SseStep::Send(finish_event("c")),
+        SseStep::Hang,
+    ])])
+    .await;
+    let h = build(
+        vec![Endpoint::adult("example-alpha", a.url())],
+        Options::default(),
+    );
+    let id = read_until_then_disconnect(&h, &streaming_body(), "\"finish_reason\":\"stop\"").await;
+    assert!(a.client_closed(0, Duration::from_secs(3)).await);
+    wait_closed(&h, &id).await;
+    assert_eq!(
+        charged(&h, &id),
+        (Some(200), Some("actual_usage".to_string()), actual_12_2()),
+        "nothing was generated after the usage: it is the final count"
+    );
+    let booked = postings(&h, &id);
+    assert!(
+        booked.iter().all(|row| row.1 != "hold"),
+        "nothing is held for reconciliation: {booked:?}"
+    );
+}
+
+/// 同一个场景，客户端把流读完（`[DONE]`）：也按实际用量。
+#[tokio::test]
+async fn usage_on_the_last_content_chunk_then_a_bare_finish_chunk_and_done_is_billed_the_actual_usage()
+ {
+    let a = FakeUpstream::start(vec![Behavior::sse(vec![
+        SseStep::Send(content_event("c", "Hel")),
+        SseStep::Send(content_with_usage_event("c", "lo", usage(12, 2))),
+        SseStep::Send(finish_event("c")),
+        SseStep::Send(done_event()),
+        SseStep::Finish,
+    ])])
+    .await;
+    let h = build(
+        vec![Endpoint::adult("example-alpha", a.url())],
+        Options::default(),
+    );
+    let reply = post(&h.app, &streaming_body()).await;
+    assert_eq!(reply.status, 200);
+    let events = sse_data(&reply.text());
+    assert_eq!(events.last().map(String::as_str), Some("[DONE]"));
+    assert_eq!(
+        charged(&h, &reply.request_id()),
+        (Some(200), Some("actual_usage".to_string()), actual_12_2())
+    );
+}
+
+/// 每个 chunk 都带累计 usage（一些兼容实现的写法）：最后一个内容块带着最新的累计值，之后只有结束标志。
+/// usage 和内容在**同一个事件**里不算「usage 之后又有内容」。
+#[tokio::test]
+async fn a_cumulative_usage_on_every_content_chunk_is_final_once_the_choice_finished() {
+    let a = FakeUpstream::start(vec![Behavior::sse(vec![
+        SseStep::Send(content_with_usage_event("c", "He", usage(12, 1))),
+        SseStep::Send(content_with_usage_event("c", "llo", usage(12, 2))),
+        SseStep::Send(finish_event("c")),
+        SseStep::Send(done_event()),
+        SseStep::Finish,
+    ])])
+    .await;
+    let h = build(
+        vec![Endpoint::adult("example-alpha", a.url())],
+        Options::default(),
+    );
+    let reply = post(&h.app, &streaming_body()).await;
+    assert_eq!(reply.status, 200);
+    assert_eq!(
+        charged(&h, &reply.request_id()),
+        (Some(200), Some("actual_usage".to_string()), actual_12_2())
+    );
+}
+
+/// B4 剩下的场景：中途一个 usage（12 入 2 出），之后还有大量内容，最后 `[DONE]`。`[DONE]` 不能把那个中途的数字
+/// 变成最终用量（原来 `End::Complete` 无条件恢复信任，按 200 结算、不挂账：少收，对账也看不到）。
+/// 用量不可信：按原规则收预留价，成本挂账待核销；中途的数字留给对账看。
+#[tokio::test]
+async fn a_mid_stream_usage_followed_by_a_lot_of_content_is_not_trusted_even_when_the_stream_ends_with_done()
+ {
+    let mut steps = vec![
+        SseStep::Send(content_event("c", "Hel")),
+        SseStep::Send(usage_event("c", usage(12, 2))),
+    ];
+    steps.extend((0..40).map(|n| SseStep::Send(content_event("c", &format!("more-{n}")))));
+    steps.push(SseStep::Send(finish_event("c")));
+    steps.push(SseStep::Send(done_event()));
+    steps.push(SseStep::Finish);
+    let a = FakeUpstream::start(vec![Behavior::sse(steps)]).await;
+    let h = build(
+        vec![Endpoint::adult("example-alpha", a.url())],
+        Options::default(),
+    );
+    let reply = post(&h.app, &streaming_body()).await;
+    assert_eq!(reply.status, 200);
+    let events = sse_data(&reply.text());
+    assert_eq!(
+        events.last().map(String::as_str),
+        Some("[DONE]"),
+        "the stream itself completed"
+    );
+    let id = reply.request_id();
+    assert_eq!(
+        charged(&h, &id),
+        (
+            Some(RESERVED_PRICE),
+            Some("reserved_amount".to_string()),
+            reserved()
+        ),
+        "the mid-stream number only covers what was generated up to then"
+    );
+    assert_eq!(
+        postings(&h, &id),
+        vec![
+            p(0, "user_price", RESERVED_PRICE, "THB"),
+            p(0, "hold", RESERVED_COST, "USD"),
+        ]
+    );
+    let claim = rows(&h, &id)[0].usage_claim.clone().unwrap();
+    assert_eq!(claim["verdict"], "untrusted:not_final");
+    assert_eq!(claim["raw"]["completion_tokens"], 2);
+}
+
+/// 夹带在内容块里的累计 usage，没有结束标志、也没有 `[DONE]`：客户端读到它就断开。生成是否结束不知道，
+/// 那个数字只是到这一块为止的用量，不信：预留价，挂账。
+#[tokio::test]
+async fn a_cumulative_usage_with_no_finish_and_no_done_is_not_final_when_the_client_leaves() {
+    let a = FakeUpstream::start(vec![Behavior::sse(vec![
+        SseStep::Send(content_with_usage_event("c", "Hel", usage(12, 2))),
+        SseStep::Hang,
+    ])])
+    .await;
+    let h = build(
+        vec![Endpoint::adult("example-alpha", a.url())],
+        Options::default(),
+    );
+    let id = read_until_then_disconnect(&h, &streaming_body(), "Hel").await;
+    assert!(a.client_closed(0, Duration::from_secs(3)).await);
+    wait_closed(&h, &id).await;
+    assert_eq!(
+        charged(&h, &id),
+        (
+            Some(RESERVED_PRICE),
+            Some("reserved_amount".to_string()),
+            reserved()
+        )
+    );
+}
+
+/// 流在结束标志之后、没写 `[DONE]` 就正常结束，usage 已经可信：流完整，补一个 `[DONE]`，按实际用量收。
+/// （原来把结束标志块当作「usage 之后又有内容」，这种流被判成截断，按预留价收。）
+#[tokio::test]
+async fn a_stream_that_ends_cleanly_after_the_finish_chunk_with_a_trusted_usage_is_complete() {
+    let a = FakeUpstream::start(vec![Behavior::sse(vec![
+        SseStep::Send(content_event("c", "Hel")),
+        SseStep::Send(content_with_usage_event("c", "lo", usage(12, 2))),
+        SseStep::Send(finish_event("c")),
+        SseStep::Finish, // 没有 [DONE]
+    ])])
+    .await;
+    let h = build(
+        vec![Endpoint::adult("example-alpha", a.url())],
+        Options::default(),
+    );
+    let reply = post(&h.app, &streaming_body()).await;
+    assert_eq!(reply.status, 200);
+    let events = sse_data(&reply.text());
+    assert_eq!(
+        events.last().map(String::as_str),
+        Some("[DONE]"),
+        "the proxy completes the stream for the client: {events:?}"
+    );
+    assert!(
+        !events.iter().any(|e| e.contains("stream_truncated")),
+        "{events:?}"
+    );
+    assert_eq!(
+        charged(&h, &reply.request_id()),
+        (Some(200), Some("actual_usage".to_string()), actual_12_2())
+    );
+}
+
+/// 对照：中途的 usage 之后又有新内容，连接随后**干净地**结束（没有 `[DONE]`）：这是被截断的流，不是完整的流——
+/// 客户端收到截断错误（不是补出来的 `[DONE]`），用户按预留价付，成本挂账。
+#[tokio::test]
+async fn a_stream_that_ends_cleanly_after_a_mid_stream_usage_and_more_content_is_truncated() {
+    let a = FakeUpstream::start(vec![Behavior::sse(vec![
+        SseStep::Send(content_event("c", "Hel")),
+        SseStep::Send(usage_event("c", usage(12, 2))),
+        SseStep::Send(content_event("c", "lo-more")),
+        SseStep::Finish, // 连接正常结束，但没有 [DONE]、没有结束标志
+    ])])
+    .await;
+    let h = build(
+        vec![Endpoint::adult("example-alpha", a.url())],
+        Options::default(),
+    );
+    let reply = post(&h.app, &streaming_body()).await;
+    assert_eq!(reply.status, 200);
+    let events = sse_data(&reply.text());
+    assert!(
+        !events.iter().any(|e| e == "[DONE]"),
+        "the proxy does not vouch for a stream that was cut short: {events:?}"
+    );
+    let last: Value = serde_json::from_str(events.last().unwrap()).unwrap();
+    assert_eq!(last["error"]["reason_code"], "stream_truncated");
+    let id = reply.request_id();
+    assert_eq!(
+        charged(&h, &id),
+        (
+            Some(RESERVED_PRICE),
+            Some("reserved_amount".to_string()),
+            reserved()
+        )
+    );
+    assert_eq!(
+        postings(&h, &id),
+        vec![
+            p(0, "user_price", RESERVED_PRICE, "THB"),
+            p(0, "hold", RESERVED_COST, "USD"),
+        ]
+    );
+}
+
+// ---------------------------------------------------------------------------
+// R3 Medium-3：空 choice 不是合法的 completion chunk
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_chunk_with_an_empty_choice_never_crosses_the_publish_boundary() {
+    for first in [
+        "data: {\"choices\":[{}]}\n\n",
+        "data: {\"choices\":[{\"index\":0}]}\n\n",
+        "data: {\"id\":\"x\",\"choices\":[{}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}}\n\n",
+    ] {
+        let alpha = FakeUpstream::start(vec![Behavior::sse(vec![
+            // 上游先发一个只有空 choice 的事件，随后报错
+            SseStep::Send(first.to_string()),
+            SseStep::Send("data: {\"error\":{\"message\":\"boom\"}}\n\n".to_string()),
+            SseStep::Finish,
+        ])])
+        .await;
+        let beta = FakeUpstream::start(vec![Behavior::sse(vec![
+            SseStep::Send(content_event("b", "from-beta")),
+            SseStep::Send(usage_event("b", usage(12, 2))),
+            SseStep::Send(done_event()),
+            SseStep::Finish,
+        ])])
+        .await;
+        let h = build(
+            vec![
+                Endpoint::adult("example-alpha", alpha.url()),
+                Endpoint::adult("example-beta", beta.url()),
+            ],
+            Options::default(),
+        );
+        let reply = post(&h.app, &streaming_body()).await;
+        assert_eq!(reply.status, 200, "{first}");
+        let events = sse_data(&reply.text());
+        assert!(
+            events.iter().any(|e| e.contains("from-beta")),
+            "the second candidate answered: {events:?}"
+        );
+        let junk = first.trim().strip_prefix("data: ").unwrap();
+        assert!(
+            !events.iter().any(|e| e == junk),
+            "the empty-choice event was never forwarded: {events:?}"
+        );
+        assert_eq!((alpha.request_count(), beta.request_count()), (1, 1));
+        // 第一次没有发布，用户付 0；只付第二次（实际用量 200）
+        let id = reply.request_id();
+        let attempts = rows(&h, &id);
+        assert_eq!(attempts.len(), 2, "{first}");
+        assert!(!attempts[0].pays_user && attempts[1].pays_user);
+        assert_eq!(
+            attempts[0].failure_kind.as_deref(),
+            Some("stream_malformed"),
+            "{first}"
+        );
+        let request = h.store.request_row(&id).unwrap().unwrap();
+        assert_eq!(request.published_attempt, Some(1));
+        assert_eq!(request.charged_micros, Some(200));
+    }
 }
 
 // ---------------------------------------------------------------------------
