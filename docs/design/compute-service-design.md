@@ -263,7 +263,12 @@ admitted ─▶ attempt[i]: sending ─▶ maybe_executed ─▶ executed(usage 
 
 ## 附录：实现时的暂定理解（待 owner 确认）
 
-本附录只记录 `feat/compute-service` 上已经写进代码的做法。出处是各切片模块文档（`//!`）和对应实现。正文不改。与正文直接冲突的条目放在文末「与正文不一致」，编号仍按切片。
+本附录只记录 `feat/compute-service` 上已经写进代码的做法。出处是各切片模块文档（`//!`）和对应实现。正文不改。与正文直接冲突的条目放在文末「与正文不一致」，编号仍按切片。下一节「已拍板」里的条目不再待确认。审查修复改过的条目在句末注明提交。
+
+### 已拍板（owner，2026-11-13）
+
+- **计费：已发送尝试报 0 用量就按 0 收费。** 用户付 0，平台成本也是 0。基础最低费用和最低计费量以后再做；本分支代码里没有这两项。代码今天已经按 0 结算（`crates/idoris-router/src/cloud/mod.rs` 模块文档第 34 条，`crates/idoris-router/tests/cloud_r2_fixes.rs`）。模块文档里这条曾标成需要 owner 确认，现已拍板。（审查修复后变更，提交 a6859b8c）
+- **儿童租户安全检查器：方案 B。** 默认必须配 LLM 检查器。运营方可在 `safety` 配置里写 `rules_only_acknowledgement`（`reason`、`acknowledged_by`、`expires_on`，最长 90 天）显式放宽到只用规则检查器，启动日志醒目记录。实现进行中，在分支 `task/compute-child-rules-ack`。本分支还没有这个字段：有儿童调用方或云入口儿童租户时，`safety.mode: rules_only` 启动失败（`crates/idoris-router/src/cloud/config.rs` 的 `require_llm_judge_for_child_tenants`）。没有儿童数据时，`rules_only` 仍可加载并打一行警告。切片条目见 S6-08。（审查修复后变更，提交 a6859b8c）
 
 ### S0 契约（`crates/idoris-compute-contracts`）
 
@@ -288,15 +293,18 @@ admitted ─▶ attempt[i]: sending ─▶ maybe_executed ─▶ executed(usage 
 ### S2 控制面与配对
 
 - **S2-01**：配对码有效期默认 10 分钟，允许范围 30 秒到 15 分钟；过期不改行，读取时按时间判定。代码：`crates/idoris-tenancy/src/accounts/pairing.rs:57-59`、`src/accounts/pairing.rs:68`。设计稿 §3。
-- **S2-02**：同一个成员关系最多 10 台未撤销的设备凭证。代码：`crates/idoris-tenancy/src/accounts/pairing.rs:61-63`。设计稿 §3。
+- **S2-02**：同一个成员关系最多 10 个仍可能被用上的成员凭证。配对出来的设备和直接签发的成员凭证合起来数。已撤销、已过期、验证器已撤销或过期的不占名额；冻结的占着。代码：`crates/idoris-tenancy/src/accounts/pairing.rs:61-66`、`src/accounts/pairing.rs:266-273`。设计稿 §3。（审查修复后变更，提交 ba70ea93）
 - **S2-03**：创建配对码时不写 `device_ttl_days`，设备凭证不过期；若签发者自己有有效期，设备凭证不晚于它。代码：`crates/idoris-router/src/control/wire.rs:135-136`、`crates/idoris-tenancy/src/accounts/pairing.rs:516-529`。设计稿 §3。
 - **S2-04**：`/control/v1` 挂在数据面同一个监听上，只在显式的组织或云形态挂载；请求来源不参与授权。代码：`crates/idoris-router/src/control/mod.rs:8-26`。设计稿 §9 第 1 项。
 - **S2-05**：读操作不写审计；认不出的密钥也不写审计。代码：`crates/idoris-tenancy/src/accounts/control_reads.rs:7`、`crates/idoris-router/src/control/mod.rs:29-32`。设计稿 §9。
 - **S2-06**：平台根上的开户、额度、第一张管理凭证只走本机 `idoris control bootstrap`；没有任何一张云凭证能管到平台根。代码：`crates/idoris-router/src/control/bootstrap.rs:6-12`。设计稿 §9。
+- **S2-07**：撤销主体时，登记它的组织永远要有 `revoke_principal` 权限，不管这个主体现在有没有成员关系。把已登记的主体关联到别的组织时，登记组织必须是成员关系所属组织的祖先（或它自己），否则调用者要对登记组织有 `revoke_principal`。别的组织重复登记同一个主体得到固定的 `already_exists`，不带主体、状态或登记人。没有登记记录的老主体，只有本机运维能再次登记。代码：`crates/idoris-tenancy/src/accounts/control.rs:836-856`、`src/accounts/control.rs:874-881`、`src/accounts/control.rs:1174-1191`。设计稿 §3、§7。（审查修复后新增，提交 ba70ea93）
+- **S2-08**：控制面发放免费额度时，`month` 和有效窗口不能脱钩。窗口必须恰好是这个月在账本时区里的 `[valid_from_ms, valid_until_ms)`，否则 400 `invalid_allocation`。代码：`crates/idoris-tenancy/src/accounts/control.rs:1643-1654`、`crates/idoris-router/src/control/wire.rs:117-120`。设计稿 §4。（审查修复后新增，提交 3a76d7d5）
+- **S2-09**：控制面发放免费额度在同一个事务里检查补贴池该账期总上限并登记承诺。超出整笔回滚，原因码是 409 `allocation_exceeds_grantor`。错误细节不写池余量。没设上限的账期仍是 0，发不出去。代码：`crates/idoris-tenancy/src/accounts/control.rs:165-172`、`src/accounts/control.rs:1714-1718`、`crates/idoris-router/src/control/wire.rs:122-123`。设计稿 §4。（审查修复后新增，提交 3a76d7d5）
 
 ### S3 准入账本
 
-- **S3-01**：宽限那一轮里，账户可用额度加担保人授信之内的部分按普通请求记账；超出这个下限的部分（至多一次预留）记 `grace_absorbed`，由平台承担，不冻结凭证。代码：`crates/idoris-tenancy/src/accounts/ledger/mod.rs:69-71`、`src/accounts/ledger/holds.rs:518-519`。设计稿 §5。
+- **S3-01**：宽限那一轮里，账户可用额度加担保人授信之内的部分按普通请求记账。超出这个下限、且仍在预留之内的部分记 `grace_absorbed`，由平台承担，不冻结凭证，也不记到付款账户链上。用户和担保人的余额只扣 `charged - grace_absorbed`。分摊守恒：`charged = user_borne + sponsor_covered + platform_loss + grace_absorbed`。代码：`crates/idoris-tenancy/src/accounts/ledger/mod.rs:69-73`、`src/accounts/ledger/holds.rs:531-543`、`src/accounts/ledger/hook.rs:15-17`。设计稿 §5。（审查修复后变更，提交 37c53fad）
 - **S3-02**：宽限周期是账本时区的自然月。宽限放行的预留最后没有向用户收费，这次宽限作废，本周期还可以再用。代码：`crates/idoris-tenancy/src/accounts/ledger/mod.rs:73-74`、`src/accounts/ledger/holds.rs:478`。设计稿 §5。
 - **S3-03**：从未充过值、也从未有过 `free_tier` / `prepaid` / `org_quota` 的账户不给宽限。代码：`crates/idoris-tenancy/src/accounts/ledger/admit.rs:388-391`。设计稿 §5。
 - **S3-04**：补贴池总上限按账期；没设过的账期上限是 0。代码：`crates/idoris-tenancy/src/accounts/ledger/mod.rs:75`、`src/accounts/ledger/project.rs:12`。设计稿 §4、§5。
@@ -306,8 +314,11 @@ admitted ─▶ attempt[i]: sending ─▶ maybe_executed ─▶ executed(usage 
 - **S3-08**：钱不够同时又被速率等挡住时，拒绝码取 `blocking_codes` 的第一个。原因码按声明顺序，`budget_exhausted` 在 `rate_limited` 之前。代码：`crates/idoris-tenancy/src/accounts/ledger/admit.rs:309-315`、`crates/idoris-compute-contracts/src/admission.rs:245-252`、`crates/idoris-compute-contracts/src/reason.rs:44-60`。设计稿 §5。
 - **S3-09**：账期时区的库默认值是 `UTC`。类型注释写明泰国首发应改成 `Asia/Bangkok`。代码：`crates/idoris-tenancy/src/accounts/ledger/migrations/0001_ledger.sql:32`、`src/accounts/ledger/types.rs:23`。设计稿 §5 没写时区。
 - **S3-10**：预留 TTL 的库默认值是 `1800000` 毫秒。代码：`crates/idoris-tenancy/src/accounts/ledger/migrations/0001_ledger.sql:32`。设计稿 §5。
-- **S3-11**：切换候选时，新候选准入的同一个事务里先释放这个请求此前失败候选占着的价预留。代码：`crates/idoris-tenancy/src/accounts/ledger/admit.rs:217-226`。设计稿 §6。
+- **S3-11**：切换候选时，新候选准入的同一个事务里先释放这个请求此前失败候选占着的价预留。尝试记录里仍是 `admitted` 或 `sending` 的不算失败，预留不放。尝试记录表不存在时没有这一层，仍全部释放。代码：`crates/idoris-tenancy/src/accounts/ledger/admit.rs:246-256`、`src/accounts/ledger/holds.rs:191-210`。设计稿 §6。（审查修复后变更，提交 e43f01be）
 - **S3-12**：除平台根和补贴池外，既没充值也从没发过额度的账户，授权额度剩余是 0，不是不设限。代码：`crates/idoris-tenancy/src/accounts/ledger/project.rs:14-16`。设计稿 §5。
+- **S3-14**：overage 里记成 `platform_loss` 的那一份仍算进付款账户链的已花（链上已花 = `charged - grace_absorbed`），另在平台损失账户记一条 `platform_loss` 责任分录，并告警、冻结凭证。代码：`crates/idoris-tenancy/src/accounts/ledger/holds.rs:652-669`、`src/accounts/ledger/holds.rs:729-743`、`crates/idoris-tenancy/tests/ledger_conservation.rs:11-12`、`tests/ledger_conservation.rs:526`。设计稿 §5。（审查修复后新增，提交 37c53fad）
+- **S3-15**：宽限承担不进付款账户链的已花，因此结算之后也不计入补贴池账户上的消耗（池剩余仍是账期上限减去该账户的 `Σ (held + spent)`）。宽限也不能绕过补贴池：补贴池那一层不够时不给宽限。在途预留仍按整笔价占着额度，直到结算。代码：`crates/idoris-tenancy/src/accounts/ledger/hook.rs:15-17`、`src/accounts/ledger/project.rs:12`、`src/accounts/ledger/admit.rs:391-392`。设计稿 §4、§5。（审查修复后新增，提交 37c53fad）
+- **S3-16**：授信的权威数据源是 `allocations` 里 `purpose = credit_line`、窗口内、没被撤销的额度之和。控制面逐笔发放是叠加的。存储层 `set_credit_line` 是替换：先撤销这个账户上还生效的授信额度，再写一条新的；`disable_credit_line` 只撤销。代码：`crates/idoris-tenancy/src/accounts/ledger/limits.rs:7-9`、`src/accounts/ledger/limits.rs:55-57`、`src/accounts/ledger/project.rs:9`、`src/accounts/ledger/project.rs:133-134`。设计稿 §3、§5。（审查修复后新增，提交 3a76d7d5）
 
 ### S4 云上游与尝试记录
 
@@ -316,7 +327,7 @@ admitted ─▶ attempt[i]: sending ─▶ maybe_executed ─▶ executed(usage 
 - **S4-03**：首字节前，400 / 413 / 422 以及其余未点名的 4xx 不切换候选；401、402、403、404、408、425、429 以及 3xx、5xx 会切换。代码：`crates/idoris-router/src/cloud/executor.rs:258-269`。设计稿 §6。
 - **S4-04**：usage 结构不对、`total_tokens` 对不上、缓存大于输入、输出超过发给上游的 `max_tokens`、金额溢出，都当 usage 未知，用户按预留价付。代码：`crates/idoris-router/src/cloud/mod.rs:57-58`。设计稿 §6。
 - **S4-05**：首字节前客户端取消，尝试保持 `maybe_executed`。首字节后断开：端点有取消能力则记已执行且 usage 未知，没有则保持 `maybe_executed`。两种情况用户都按预留价付。代码：`crates/idoris-router/src/cloud/mod.rs:59-61`。设计稿 §6。
-- **S4-06**：供应商请求号优先取响应正文的 `id`，其次是配置的响应头。格式不对、重复、流中途换号都留标注，不因此拒绝服务。代码：`crates/idoris-router/src/cloud/mod.rs:62-63`。设计稿 §6、§10。
+- **S4-06**：供应商请求号优先取响应正文的 `id`，其次是配置的响应头。格式不对、重复、流中途换号都留标注，不因此拒绝服务。处理儿童数据的请求不存原文，见 S6-17。代码：`crates/idoris-router/src/cloud/mod.rs:62-63`、`src/cloud/run.rs:202-207`。设计稿 §6、§10。（审查修复后变更，提交 05cb15b4）
 - **S4-07**：结算分录分 `user_price`、`platform_cost`、`hold`、`release`。零金额不记。一个请求至多一条正的 `user_price`。代码：`crates/idoris-router/src/cloud/mod.rs:64-66`。设计稿 §6。
 - **S4-08**：请求记录里还有 S0 原因码之外的稳定字符串，例如 `upstream_unavailable`、`client_cancelled`、`upstream_stream_failed`；HTTP `error.type` 还有 `upstream_error`、`streaming_not_allowed` 等。代码：`crates/idoris-router/src/cloud/mod.rs:67-69`。设计稿 §5、§6。
 - **S4-09**：`child_edu` 的流式请求在任何上游调用之前拒绝，HTTP 400，`streaming_not_allowed`。代码：`crates/idoris-router/src/cloud/handler.rs:30-31`。设计稿 §6。
@@ -324,6 +335,11 @@ admitted ─▶ attempt[i]: sending ─▶ maybe_executed ─▶ executed(usage 
 - **S4-11**：云形态拒绝 `QUOTA` 付款单位。代码：`crates/idoris-router/src/cloud/ingress/caller.rs:127-129`、`crates/idoris-router/src/cloud/config.rs:586-588`。设计稿 §9。
 - **S4-12**：体验分级响应头的名字是 `X-iDoris-Reason`、`X-iDoris-Tier`、`X-iDoris-Max-Tokens`，并列入 CORS 暴露头。代码：`crates/idoris-router/src/cloud/handler.rs:18-22`、`src/cloud/handler.rs:169`。设计稿 §5。
 - **S4-13**：没有合规候选时 HTTP 503，原因码 `no_compliant_endpoint`。代码：`crates/idoris-router/src/cloud/handler.rs:21`。设计稿 §8。
+- **S4-14**：`billing: unbilled` 没有实现。加载云上游配置时拒绝。准入、预留和结算都不认这个计费性质。契约里 `Billing::Unbilled` 对流式 usage 的豁免没有改。代码：`crates/idoris-router/src/cloud/config.rs:664-673`、`src/cloud/mod.rs:130-131`。设计稿 §4、§9。（审查修复后新增，提交 a6859b8c）
+- **S4-15**：端点配置的 `extra_body` 不能写协议、计费、身份、留存字段。加载时拒绝；构造请求时这些字段最后写入。保留字段是 `model`、`messages`、`stream`、`stream_options`、`max_tokens`、`max_completion_tokens`、`n`、`best_of`、`service_tier`、`logprobs`、`top_logprobs`、`logit_bias`、`prediction`、`tools`、`tool_choice`、`parallel_tool_calls`、`functions`、`function_call`、`response_format`、`user`、`metadata`、`store`、`safety_identifier`。这张表是实现时拟的。代码：`crates/idoris-upstream/src/cloud/wire.rs:54-89`、`crates/idoris-router/src/cloud/mod.rs:132-133`。设计稿 §6、§8。（审查修复后新增，提交 a6859b8c）
+- **S4-16**：流中途出现的 usage 不当最终用量。只有流正常完成，或者 usage 来自最后一块且之后没有再出现内容，才按它结算。否则按用量未知、可能已执行：用户按预留价付，成本挂账待核销。客户端在最终 usage 之后、`[DONE]` 之前断开时，这次 usage 已经算最终用量，按它结算。代码：`crates/idoris-router/src/cloud/answer.rs:146-155`、`src/cloud/mod.rs:134-137`。设计稿 §6。（审查修复后新增，提交 a6859b8c）
+- **S4-17**：迟到 usage 的对账只处理没有向用户收费的 `maybe_executed` 尝试：同一个事务里冲销旧挂账、记实际成本，并按 S0 的转移结清。向用户收过费的那一次在这里拒绝，不在这一层退差价。代码：`crates/idoris-router/src/cloud/mod.rs:148-149`、`crates/idoris-tenancy/src/attempts/mod.rs` 的 `reconcile_late_usage`。设计稿 §6、§10。（审查修复后新增，提交 2575871d）
+- **S4-18**：执行器和尝试记录里的同步账本操作用 `block_in_place` 跑，不再直接占住 tokio 工作线程。儿童安全检查的成本计量、`RunState::record_supplier_id` 里两处同步标注写入，以及账户存储里的其它同步调用不在这个范围内。代码：`crates/idoris-router/src/cloud/mod.rs:150-152`。设计稿 §10。（审查修复后新增，提交 a6859b8c）
 
 ### S5 云入口
 
@@ -337,23 +353,31 @@ admitted ─▶ attempt[i]: sending ─▶ maybe_executed ─▶ executed(usage 
 - **S5-08**：慢速请求头超时交给反向代理。本进程只对已经通过认证和限流的请求做请求体读取期限。代码：`crates/idoris-router/src/cloud/ingress/mod.rs:92-93`。设计稿 §2。
 - **S5-09**：云形态数据面不挂载 `/v1/*`。旧推理路由在云入口上是 404，不是 403。代码：`crates/idoris-router/src/cloud/ingress/mod.rs:36-40`、`src/cloud/ingress/mod.rs:96-100`。设计稿 §9。
 - **S5-10**：`/control/v1` 默认不挂在公网监听上。配置 `control_plane.public: true` 才挂在同一个公网监听上，并且不发 CORS 头。代码：`crates/idoris-router/src/cloud/ingress/mod.rs:42-49`。设计稿 §2、§9。
+- **S5-11**：云入口上，没声明隐私不等于 `local_only`。显式 `local_only`（请求头，或请求体顶层 `privacy` / `metadata.privacy`）在任何候选选择、准入、安全检查和上游请求之前拒绝，HTTP 403，`local_only_refused`；执行器再查一道。头不合法（重复、空、不认识的值）是 400 `invalid_privacy`，不当成没声明。这和本机云端档「没声明按不能出网」（S7-06）不是同一条规则。代码：`crates/idoris-router/src/cloud/mod.rs:126-129`、`src/cloud/request.rs:53-60`、`src/cloud/executor.rs:74-88`、`src/cloud/handler.rs:391-397`。设计稿 §2。（审查修复后新增，提交 a6859b8c）
+- **S5-12**：认证之前有界。默认同时最多 64 个在途认证查询；最近没有认证成功过的凭证前缀每分钟 1200 次、突发 200。满了直接 429 `auth_capacity_limited`，不碰库。最近认证成功过的前缀不消耗这份查询预算，只受在途个数约束。默认值是实现时拟的。代码：`crates/idoris-router/src/cloud/ingress/config.rs:92`、`src/cloud/ingress/config.rs:178-182`、`src/cloud/ingress/abuse.rs:125-136`、`crates/idoris-router/src/cloud/mod.rs:141-142`。设计稿 §9。（审查修复后新增，提交 a6859b8c）
+- **S5-13**：许可表里已核验的供应商，`base_url` 的主机必须落在静态表 `VERIFIED_PROVIDER_HOSTS` 上。回环地址永远允许。表里没有的供应商标签不受限。`together`、`google-vertex`、`siliconflow`、`moonshot` 的主机列表是空的，不能配到非回环地址。已绑定主机的有 `deepinfra`、`openrouter`、`deepseek-official`、`groq`、`opentyphoon`、`fireworks`、`alibaba-model-studio-intl`。表是实现时按 `config/compute/endpoint-urls.md` 拟的，没有写进许可表 schema。代码：`crates/idoris-router/src/cloud/config.rs:582-609`、`src/cloud/mod.rs:143-145`。设计稿 §8。（审查修复后新增，提交 a6859b8c）
+- **S5-14**：儿童判定看整条付款链。顶层客户之外的任何账户声明了 `child_edu`，这个请求就按儿童处理：数据类别取并集，留存取更严，区域取交集，交集为空就拒绝。租户身份（限额的键、计费性质）仍是顶层客户。已经存在、却不是顶层客户的 `child_edu` 声明，启动失败。代码：`crates/idoris-router/src/cloud/ingress/caller.rs:20-30`、`src/cloud/mod.rs:138-140`。设计稿 §7、§9。（审查修复后新增，提交 a6859b8c）
 
 ### S6 儿童安全
 
 - **S6-01**：是否走儿童管线只看 `TenantDataPolicy` 是否含 `child_edu`。模型名、别名、请求头和请求体改不了它。生产环境这份策略来自云入口配置的 `tenants:`。代码：`crates/idoris-router/src/cloud/mod.rs:80-83`。设计稿 §7。
 - **S6-02**：管线在执行器里。儿童请求的回答没有「输出检查放行」标记就不能发布。代码：`crates/idoris-router/src/cloud/mod.rs:84-86`。设计稿 §7。
-- **S6-03**：edu 的响应体是重建的，只保留检查过的字段。非 edu 的响应体原样转发。代码：`crates/idoris-router/src/cloud/mod.rs:87-88`。设计稿 §7。
+- **S6-03**：edu 的响应体是重建的，只保留检查过的字段。响应 `id`、`model`、工具调用 `id` 由服务端写，不取上游的。非 edu 的响应体原样转发。代码：`crates/idoris-router/src/cloud/safety/extract.rs:35-43`、`src/cloud/mod.rs:87-88`。设计稿 §7。（审查修复后变更，提交 05cb15b4）
 - **S6-04**：输出被拒后不换候选重试。用户付 0，上游成本由平台承担。代码：`crates/idoris-router/src/cloud/mod.rs:89-90`、`crates/idoris-compute-contracts/src/safety.rs:18`。设计稿 §6、§7。
 - **S6-05**：`safety_input_blocked` 和 `safety_output_blocked` 用 HTTP 422；`safety_unavailable` 用 503。代码：`crates/idoris-router/src/cloud/mod.rs:91-92`、`src/cloud/handler.rs:36-38`。设计稿 §7。
 - **S6-06**：拦截类别只出现在当次响应里，不写入请求记录、日志或审计。记录里只有 `safety_input_blocked` 这一类粗码。代码：`crates/idoris-router/src/cloud/mod.rs:93-94`、`crates/idoris-compute-contracts/src/safety.rs:25-26`。设计稿 §7。
-- **S6-07**：系统角色的文本只查越狱类规则。孩子的话若放在 `system` 里，规则检查器也只按越狱类查；LLM 检查器仍查全部。代码：`crates/idoris-router/src/cloud/mod.rs:95-97`、`crates/idoris-router/src/cloud/safety/rules.rs:14-16`。设计稿 §7。
-- **S6-08**：`safety.mode` 必填。`rules_only` 可以启动，并打一行警告。代码没有强制 `child_edu` 必须配 LLM 检查器。代码：`crates/idoris-router/src/cloud/safety/config.rs:22-23`、`crates/idoris-router/src/cloud/mod.rs:98-99`。设计稿 §7。
+- **S6-07**：客户端写的内容一律按孩子的话查，包括 `system`、`developer`、工具定义、结构化输出和 `stop`。角色名不证明这段话来自运营方。运营方待遇和助手历史见 S6-15、S6-16。代码：`crates/idoris-router/src/cloud/safety/extract.rs:17-30`、`src/cloud/safety/rules.rs:14-18`。设计稿 §7。（审查修复后变更，提交 05cb15b4）
+- **S6-08**：已拍板，见本附录开头「儿童租户安全检查器：方案 B」。本分支的生产启动：有儿童数据时必须 `rules_and_llm`，`rules_only` 启动失败；确认字段尚未实现。没有儿童数据时，`rules_only` 仍是显式选择，加载时打一行警告。代码：`crates/idoris-router/src/cloud/config.rs:1001-1029`、`src/cloud/safety/config.rs:35-39`。设计稿 §7。（审查修复后变更，提交 a6859b8c）
 - **S6-09**：给出结论的检查（放行或拦截）按实际用量向付款账户收费，用量未知按预留额，并且封顶在预留额。规则检查器直接拦下、以及超时、出错、返回无法解析、客户端断开，收费 0。代码：`crates/idoris-router/src/cloud/mod.rs:113-116`。设计稿 §7。
 - **S6-10**：检查端点的供应商成本（上游币种）不记入账本。账本只记付款账户一侧的价。代码：`crates/idoris-router/src/cloud/mod.rs:115-116`。设计稿 §4、§7。
-- **S6-11**：预留发生在规则检查之前。额度不足时，有害输入返回准入原因码（402 / 429 / 403），不是 422。规则拦下之后释放这次预留，不收费。代码：`crates/idoris-router/src/cloud/mod.rs:121-122`、`src/cloud/handler.rs:42`。设计稿 §5、§7。
+- **S6-11**：免费的规则预检在占检查费用之前。规则命中直接 422，不占额度；额度不足的孩子写出规则能拦住的有害内容，得到的是 422，不是 402。规则没拦住、接下来的检查要花钱时，才先预留；放不下返回准入原因码（402 / 429 / 403），不检查、不出网。规则拦下不收费。代码：`crates/idoris-router/src/cloud/safety/mod.rs:16-20`、`src/cloud/safety/mod.rs:541-559`。设计稿 §5、§7。（审查修复后变更，提交 05cb15b4）
 - **S6-12**：非文本内容按 `unsupported_content` 拒绝。超过检查上限的文本按 `safety_unavailable`（`too_large`）拒绝。代码：`crates/idoris-router/src/cloud/mod.rs:106-107`。设计稿 §7。
 - **S6-13**：在没有云入口的 `build_app` 上，`/v1/messages`、`/v1/embeddings`、`/v1/rerank` 对儿童租户返回 403。云入口形态下这些路由不存在（见 S5-09）。代码：`crates/idoris-router/src/cloud/mod.rs:108-111`。设计稿 §7。
 - **S6-14**：规则检查器把含 `suicide` 的句子算作自伤，包括 “Can you explain suicide prevention?”。测试把这类误拒列出来，不把它当成放行。代码：`crates/idoris-router/src/cloud/safety/rules.rs:200`、`crates/idoris-router/src/cloud/safety/rules/tests.rs:470-476`。设计稿 §7。
+- **S6-15**：运营方待遇必须事先登记在 `safety.trusted_operator_prompts`。`system` / `developer` 消息的内容以某条登记提示逐字开头时，这一段只查越狱类规则，后面接着的文字仍按孩子的话查。不以登记提示开头的，整条按孩子的话查。没登记任何提示时，没有任何豁免。每条至少 32 个字符、至多 16 KiB，最多 64 条，不能重复；登记的提示自己要先过越狱类规则，否则配置加载失败。代码：`crates/idoris-router/src/cloud/safety/config.rs:20-32`、`src/cloud/safety/extract.rs:23-30`。设计稿 §7。（审查修复后新增，提交 05cb15b4）
+- **S6-16**：对话历史里的 `assistant` 消息按输出规则查。拒绝语里会提到有害词，不能把拒绝语当成有害请求。客户端伪造的助手消息靠 LLM 检查器和输出检查兜底。代码：`crates/idoris-router/src/cloud/safety/extract.rs:25`、`src/cloud/safety/rules.rs:18`、`src/cloud/safety/rules.rs:33-34`。设计稿 §7。（审查修复后新增，提交 05cb15b4）
+- **S6-17**：处理儿童数据的请求，供应商请求号不原样落盘。存 SHA-256 的前 128 位，形式是 `sha256:` 加 32 个十六进制字符。对账时对账单上的请求号做同样的摘要再比对。格式仍按原文校验，不对的只留标注。代码：`crates/idoris-router/src/cloud/run.rs:40-50`、`src/cloud/run.rs:202-227`。设计稿 §6、§7、§10。（审查修复后新增，提交 05cb15b4）
+- **S6-18**：工具参数必须是合法 JSON。解析不了，或嵌套深到解析上限，整条按失败即关闭拒绝：HTTP 503，`safety_unavailable`，细节 `malformed`。输入侧在出网前拒绝；输出侧不把回答交给客户端。历史消息里的工具参数同样。代码：`crates/idoris-router/src/cloud/safety/extract.rs:15`、`src/cloud/safety/mod.rs:459-466`、`src/cloud/handler.rs:413-418`。设计稿 §7。（审查修复后新增，提交 05cb15b4）
 
 ### S7 云端档
 
@@ -368,6 +392,9 @@ admitted ─▶ attempt[i]: sending ─▶ maybe_executed ─▶ executed(usage 
 - **S7-09**：同一个 `X-iDoris-Request-Id` 重试云端档时，每次都是新的云端请求，不复用本机 60 秒幂等缓存。代码：`crates/idoris-router/src/cloud_tier/mod.rs:90-91`。设计稿 §7、§9。
 - **S7-10**：个人形态只用已配对的设备凭证；组织形态只用节点凭证文件或环境变量。没声明 `IDORIS_FORM` 的存量 tenant 部署不能启用云端档。代码：`crates/idoris-router/src/cloud_tier/mod.rs:92-93`。设计稿 §9。
 - **S7-11**：流式请求不回落。并发槽用 `try_acquire`，满了记 `saturated` 并返回本机原来的失败，不排队。代码：`crates/idoris-router/src/cloud_tier/gate.rs:214-215`、`crates/idoris-router/src/cloud_tier/mod.rs:63`、`src/cloud_tier/mod.rs:700-701`。设计稿 §6、§9 第 4 项。
+- **S7-12**：远程熔断以出网那一刻的值为准，不使用请求进来时的快照。最后一道门拦下时，`pending` 行已经落下，写成 `cancelled`（没有出网、没有云端 id、没有金额）。调用方拿到的响应和没有云端档时逐字节相同，连 `X-iDoris-Cloud-Attempt` 都没有。代码：`crates/idoris-router/src/cloud_tier/mod.rs:39-45`、`src/cloud_tier/forward.rs:34`、`src/cloud_tier/forward.rs:89-102`。设计稿 §2、§9。（审查修复后新增，提交 4a300ff4）
+- **S7-13**：已撤销或已过期的本地数据密钥仍然算本地密钥，不能当云凭证发出去。探针读不出库、判不了时按「是本地密钥」处理。`idoris cloud unpair` 在发送之前做同样的识别：判成本地密钥或判不了都不发，本机凭证仍删除，退出码 2，`reason: local_key_refused`。代码：`crates/idoris-router/src/cloud_tier/tests.rs:855-859`、`src/cloud_tier/tests.rs:887-894`、`src/cloud_tier/cli.rs:11-12`、`src/cloud_tier/cli.rs:355-367`。设计稿 §3。（审查修复后新增，提交 f2b4153d）
+- **S7-14**：`idoris cloud pair` 和 `unpair` 的整个流程在状态目录的跨进程锁里。锁被别人占着时最多等 2 秒，等不到就放弃，不排队。安装不覆盖已有凭证。代码：`crates/idoris-router/src/cloud_tier/cli.rs:39-46`、`src/cloud_tier/credential.rs:405-413`。设计稿 §3。（审查修复后新增，提交 9ec03542）
 
 ### S8 许可表与评测材料
 
