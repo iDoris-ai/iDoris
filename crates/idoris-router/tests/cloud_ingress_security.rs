@@ -461,22 +461,128 @@ async fn the_control_plane_is_mounted_on_the_public_listener_only_when_configure
     assert_eq!(anonymous.status, 401);
 }
 
+/// PR #600 第二轮 S2（NOT FIXED）：控制面原来合并在 `edge_guard` **之外**，所以云入口配置里列出的来源的浏览器控制台
+/// 连预检都过不去（预检落到控制面的 404），响应也没有 CORS 头；客户端来源、`X-iDoris-Record-Id` 这些最外层的东西也都不经过。
+/// 现在它和数据面挂在同一组外层中间件里：来源名单是同一份，列出的来源预检通过、响应带同样的 CORS 头，没列出的来源照旧
+/// 预检 403、响应不带 CORS 头。控制面自己的认证、授权、审计一个字没动（来源地址、`Origin` 都不参与授权）。
 #[tokio::test]
-async fn the_control_plane_never_carries_cors_headers_even_when_browsers_are_allowed_on_the_data_plane()
- {
+async fn the_control_plane_sits_behind_the_same_edge_guard_as_the_data_plane() {
     let w = World::new(WorldOptions {
         ingress: IngressYaml::default().cors(&["https://app.example.com"]),
         ..WorldOptions::default()
     })
     .await;
+    let admin = w.cred("svc_eduai_admin");
+    // 名单里的来源：控制面的响应和数据面一样带 CORS 头（认证照旧：这里带着有效的控制面凭证）
     let reply = w
         .send(
-            &Req::models(w.cred("svc_eduai_admin"))
+            &Req::models(admin)
+                .uri("/control/v1/whoami")
+                .header("origin", "https://app.example.com"),
+        )
+        .await;
+    assert_eq!(reply.status, 200, "{}", reply.text());
+    assert_eq!(
+        reply.header("access-control-allow-origin"),
+        Some("https://app.example.com")
+    );
+    assert_eq!(reply.header("vary"), Some("Origin"));
+    assert!(reply.header("access-control-allow-credentials").is_none());
+    // 没列出的来源：不给任何 CORS 头（请求本身照常处理，是浏览器拦住响应）
+    let reply = w
+        .send(
+            &Req::models(admin)
+                .uri("/control/v1/whoami")
+                .header("origin", "https://evil.example.net"),
+        )
+        .await;
+    assert_eq!(reply.status, 200);
+    assert!(reply.header("access-control-allow-origin").is_none());
+    // 被控制面自己拒绝的响应（没有凭证）同样带 CORS 头：浏览器里的 JS 才读得到 401
+    let reply = w
+        .send(
+            &Req::models(admin)
+                .uri("/control/v1/whoami")
+                .bearer_raw(None)
+                .header("origin", "https://app.example.com"),
+        )
+        .await;
+    assert_eq!(reply.status, 401);
+    assert_eq!(
+        reply.header("access-control-allow-origin"),
+        Some("https://app.example.com")
+    );
+
+    // 预检：列出的来源通过，浏览器能带 authorization 和 content-type 发 POST / GET
+    let preflight = |origin: &str, uri: &str| {
+        Req::models(admin)
+            .method("OPTIONS")
+            .uri(uri)
+            .bearer_raw(None)
+            .header("origin", origin)
+            .header("access-control-request-method", "POST")
+            .header(
+                "access-control-request-headers",
+                "authorization, content-type",
+            )
+    };
+    for uri in ["/control/v1/principals", "/control/v1/accounts/eduai"] {
+        let reply = w.send(&preflight("https://app.example.com", uri)).await;
+        assert_eq!(reply.status, 204, "{uri}: {}", reply.text());
+        assert_eq!(
+            reply.header("access-control-allow-origin"),
+            Some("https://app.example.com")
+        );
+        assert_eq!(
+            reply.header("access-control-allow-headers"),
+            Some("authorization, content-type")
+        );
+        // 预检在边缘就答掉了，同样经过最外层的记录号中间件
+        assert!(reply.header("x-idoris-record-id").is_some());
+    }
+    // 没列出的来源：预检 403，不碰控制面
+    let reply = w
+        .send(&preflight(
+            "https://evil.example.net",
+            "/control/v1/principals",
+        ))
+        .await;
+    assert_eq!(reply.status, 403);
+    assert_eq!(reply.code(), "origin_not_allowed");
+    assert!(reply.header("access-control-allow-origin").is_none());
+    // 控制面也过最外层的记录号中间件：每个响应（包括被拒的）都有 X-iDoris-Record-Id
+    let reply = w.send(&Req::models(admin).uri("/control/v1/whoami")).await;
+    assert_eq!(reply.status, 200);
+    assert!(reply.header("x-idoris-record-id").is_some());
+}
+
+#[tokio::test]
+async fn without_a_cors_list_the_control_plane_still_carries_no_cors_headers_and_preflights_are_404()
+ {
+    // 默认配置（没有列出任何来源）：控制面和改动之前一样——没有 CORS 头，预检就是一个未知的 OPTIONS（404）
+    let w = World::new(WorldOptions::default()).await;
+    let admin = w.cred("svc_eduai_admin");
+    let reply = w
+        .send(
+            &Req::models(admin)
                 .uri("/control/v1/whoami")
                 .header("origin", "https://app.example.com"),
         )
         .await;
     assert_eq!(reply.status, 200);
+    assert!(reply.header("access-control-allow-origin").is_none());
+    assert!(reply.header("vary").is_none());
+    let reply = w
+        .send(
+            &Req::models(admin)
+                .method("OPTIONS")
+                .uri("/control/v1/principals")
+                .bearer_raw(None)
+                .header("origin", "https://app.example.com")
+                .header("access-control-request-method", "POST"),
+        )
+        .await;
+    assert_eq!(reply.status, 404);
     assert!(reply.header("access-control-allow-origin").is_none());
 }
 

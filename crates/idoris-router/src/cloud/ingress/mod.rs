@@ -45,8 +45,11 @@
 //! 所以**可以**安全地对公网开放（一张被盗的凭证最多只能动它自己子树里的东西，平台层面的写操作只有本机运维命令
 //! `idoris control bootstrap` 能做）；但这是一个必须有人有意为之的攻击面，所以默认不挂。P0 里 eduai 的后端要用它做在线
 //! 开通，配置里写一行 `control_plane.public: true` 就挂在同一个公网监听上（不单开端口：多一个监听器就多一套要保护、
-//! 要测试的启动路径，S2 的设计本来就是「挂在数据面的同一个监听上」）。挂上之后它只多一道请求体读取期限，
-//! 其它（认证、授权、审计、响应）一概不动，也永远不发 CORS 头：它是后端对后端的接口。
+//! 要测试的启动路径，S2 的设计本来就是「挂在数据面的同一个监听上」）。挂上之后它和数据面站在同一个边缘上：
+//! 最外层的几层中间件（`X-iDoris-Tenant` 的剥离、`X-iDoris-Record-Id`、`edge_guard` 的客户端来源与 CORS）也包着它，
+//! 另外多一道请求体读取期限；它自己的认证、授权、审计、响应一概不动（来源地址、`Origin` 都不参与授权）。CORS 用的是
+//! 数据面的同一份来源名单：默认没有列出任何来源，控制面就不发任何 CORS 头、预检也是 404；列出的来源的浏览器控制台才能
+//! 通过预检直接调它（凭证仍然是 `Authorization` 里的 bearer，不是 cookie）。
 //!
 //! # 一个请求的付款上下文怎么来的
 //!
@@ -293,7 +296,10 @@ async fn models(State(state): State<Arc<AppState>>) -> Response {
 
 /// 云形态的整个 HTTP 应用。见模块文档的路由表和中间件顺序（`guard`）。
 ///
-/// 控制面（`/control/v1`）合并在数据面的层**之后**，和 `build_app` 一样：它不经过数据面的中间件，自己认证、自己授权。
+/// 控制面（`/control/v1`）合并在**最外层那几层中间件之内**（`strip_untrusted_headers`、`record_id_middleware`、
+/// `request_lifecycle`、`edge_guard`：客户端来源、CORS 预检与响应头）：它和数据面站在同一个边缘上，来源名单也是同一份
+/// （PR #600 第二轮 S2：原来合并在这些层**之后**，配置里列出的来源的浏览器控制台连预检都过不去）。
+/// 它不经过 `data_plane_guard`（那是数据面自己的认证、成员 id、三级限流）：控制面自己认证、自己授权。
 pub fn build_cloud_app(state: AppState, ingress: Arc<CloudIngress>) -> Router {
     let state = Arc::new(state);
     // `MethodRouter::route_layer`：认证只包住真正匹配到方法的处理函数，不包住 `fallback`。所以没有的路径、
@@ -321,15 +327,9 @@ pub fn build_cloud_app(state: AppState, ingress: Arc<CloudIngress>) -> Router {
     }
     let mut app = app
         .fallback(crate::not_found)
-        .layer(from_fn_with_state(Arc::clone(&ingress), guard::edge_guard))
-        .layer(from_fn(crate::connection::request_lifecycle_middleware))
-        .layer(from_fn_with_state(
-            Arc::clone(&state),
-            crate::record_id_middleware,
-        ))
-        .layer(from_fn(guard::strip_untrusted_headers))
         .with_state(Arc::clone(&state));
 
+    // 控制面先合并进来，再统一套最外层的中间件：它和数据面在同一个边缘（`edge_guard`）之内。
     if ingress.config.control_plane_public
         && let Some(plane) = state.control.clone()
     {
@@ -338,5 +338,11 @@ pub fn build_cloud_app(state: AppState, ingress: Arc<CloudIngress>) -> Router {
             guard::control_body_deadline,
         )));
     }
-    app
+    app.layer(from_fn_with_state(Arc::clone(&ingress), guard::edge_guard))
+        .layer(from_fn(crate::connection::request_lifecycle_middleware))
+        .layer(from_fn_with_state(
+            Arc::clone(&state),
+            crate::record_id_middleware,
+        ))
+        .layer(from_fn(guard::strip_untrusted_headers))
 }
