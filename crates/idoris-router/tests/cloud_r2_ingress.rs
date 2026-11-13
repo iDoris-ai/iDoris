@@ -7,6 +7,7 @@
 //! |---|---|
 //! | R2 High#1 | 显式 `local_only`（头或请求体）在任何上游 / 安全检查调用之前被拒，不论租户是不是儿童租户 |
 //! | R2 High#4 | 随机假凭证打不满认证存储：认证之前有界（在途个数 + 查询预算），在用的凭证不被饿死 |
+//! | R3 N2 | 认证名额跟着真正执行查询的阻塞任务走：请求被取消，名额不提前归还 |
 //! | R2 Medium#5 | 认证排了很久队才完成的请求，按完成那一刻的时间限流 |
 //! | R2 Medium#7 | 入口配置允许的请求体，处理函数的提取器不再用 axum 默认的 2 MiB 上限重复拒绝 |
 //! | PD B3 | 付款链上任何一个 `child_edu` 声明都算；声明写在非顶层账户上启动失败 |
@@ -303,6 +304,110 @@ async fn the_number_of_authentications_in_flight_is_bounded_and_the_overflow_is_
     }
     // 名额都还回来了
     assert_eq!(w.ingress.auth_budget().available_slots(), 2);
+}
+
+/// R3 N2：名额要跟着**真正执行查询的阻塞任务**走。请求被取消（客户端断开）之后，`spawn_blocking` 出去的查询并不会停，
+/// 还在等认证库的锁；名额如果随请求 future 一起还回去，反复「发起再取消」就能攒出远超上限的阻塞任务。
+#[tokio::test]
+async fn a_cancelled_request_does_not_give_its_authentication_slot_back_while_the_query_still_runs()
+{
+    let w = World::new(
+        WorldOptions::plenty().ingress(IngressYaml::default().abuse(&format!(
+            "{ROOMY_ANONYMOUS}  auth_failures: {{max_failures: 1000, window_secs: 60}}\n  auth_max_concurrent: 2\n  auth_unknown: {{requests_per_minute: 600000, burst: 100000}}\n"
+        ))),
+    )
+    .await;
+    let lock = StoreLock::hold(&w);
+    let first = w.spawn(random_credential_request(&w, 1));
+    let second = w.spawn(random_credential_request(&w, 2));
+    for _ in 0..200 {
+        if w.ingress.auth_budget().available_slots() == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(w.ingress.auth_budget().available_slots(), 0);
+
+    // 两个客户端都断开了（请求 future 被丢弃）。两个查询仍卡在被占着的库上：名额必须还占着
+    first.abort();
+    second.abort();
+    assert!(first.await.unwrap_err().is_cancelled());
+    assert!(second.await.unwrap_err().is_cancelled());
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(
+        w.ingress.auth_budget().available_slots(),
+        0,
+        "the queries are still waiting on the authentication store: their slots are still taken"
+    );
+    // 所以再来的请求照样被直接拒绝（不排队、不碰库）：取消再重发，攒不出超过上限的阻塞任务
+    for seed in 3..6 {
+        let overflow = answered_quickly(&w, &random_credential_request(&w, seed)).await;
+        assert_eq!(overflow.status, 429, "{seed}");
+        assert_eq!(overflow.code(), "auth_capacity_limited");
+    }
+    // 库有空了，两个阻塞查询跑完，名额才回来
+    lock.release();
+    for _ in 0..500 {
+        if w.ingress.auth_budget().available_slots() == 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(w.ingress.auth_budget().available_slots(), 2);
+    // 之后照常认证
+    assert_eq!(w.send(&random_credential_request(&w, 9)).await.status, 401);
+}
+
+/// R3 N2 的另一半：用一张**曾经认证成功**的凭证反复「发起再取消」，可以绕开「未知前缀」的查询预算（在用的前缀不消耗它），
+/// 如果名额随请求 future 一起归还，同样能攒出超过上限的阻塞任务、耗尽阻塞线程池。在途名额对在用的凭证同样是真的上限。
+#[tokio::test]
+async fn cancelled_requests_with_a_known_credential_cannot_pile_up_blocking_queries_either() {
+    let w = World::new(
+        WorldOptions::plenty().ingress(IngressYaml::default().abuse(&format!(
+            "{ROOMY_ANONYMOUS}  auth_failures: {{max_failures: 1000, window_secs: 60}}\n  auth_max_concurrent: 2\n  auth_unknown: {{requests_per_minute: 60, burst: 1}}\n"
+        ))),
+    )
+    .await;
+    // 这张凭证先认证成功一次：它的前缀从此是「在用的」，之后不再消耗未知前缀的预算
+    let legit = Req::chat(w.cred("svc_eduai")).member("kid-1");
+    assert_eq!(w.send(&legit).await.status, 200);
+    let lock = StoreLock::hold(&w);
+    let first = w.spawn(legit.clone());
+    let second = w.spawn(legit.clone());
+    for _ in 0..200 {
+        if w.ingress.auth_budget().available_slots() == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(w.ingress.auth_budget().available_slots(), 0);
+    first.abort();
+    second.abort();
+    assert!(first.await.unwrap_err().is_cancelled());
+    assert!(second.await.unwrap_err().is_cancelled());
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(
+        w.ingress.auth_budget().available_slots(),
+        0,
+        "the cancelled requests' queries are still waiting on the store"
+    );
+    // 同一张在用的凭证再来：名额满了，直接拒绝（不是又多放一个阻塞任务进去）
+    for _ in 0..3 {
+        let overflow = answered_quickly(&w, &legit).await;
+        assert_eq!(overflow.status, 429);
+        assert_eq!(overflow.code(), "auth_capacity_limited");
+    }
+    lock.release();
+    for _ in 0..500 {
+        if w.ingress.auth_budget().available_slots() == 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(w.ingress.auth_budget().available_slots(), 2);
+    // 之后这张凭证照常使用
+    let reply = w.send(&legit).await;
+    assert_eq!(reply.status, 200, "{}", reply.text());
 }
 
 #[tokio::test]
