@@ -31,7 +31,7 @@
 //! | 连接不上（DNS、连接被拒、TLS） | `unreachable` |
 //! | 总期限内没读完 | `timeout` |
 //! | 2xx 但 `usage` 里的 token 数超出调用记录能存的范围（i64） | `invalid_response` |
-//! | 出网前的最后一道门（远程熔断）拦下了它——**没有任何字节离开本机** | `cancelled`（调用方拿到本机原来的响应，没有 attempt 头） |
+//! | 出网前的最后一道门（远程熔断）拦下了它，或连接还在建立、正文还没写出去时熔断打开——**请求正文没有离开本机** | `cancelled`（调用方拿到本机原来的响应，没有 attempt 头） |
 
 use axum::body::Bytes;
 use futures_util::StreamExt;
@@ -86,7 +86,8 @@ pub enum CloudFailure {
     },
     /// 传输层在请求发出之后出了别的错（连接中途被重置……）：请求可能已经到达。
     Transport,
-    /// 出网前的最后一道检查（远程熔断）把请求拦下了：**没有任何字节离开本机**。
+    /// 出网前的最后一道检查（远程熔断）把请求拦下了，或者熔断在连接建立期间打开、发送被取消：
+    /// **请求正文没有离开本机**。
     Withheld,
 }
 
@@ -188,7 +189,11 @@ fn classify_transport(error: &reqwest::Error) -> CloudFailure {
 /// `still_allowed` 是**出网边界上的最后一道门**：请求构造好之后、第一次真正去发之前调用，返回 `false` 就什么都不发
 /// （[`CloudFailure::Withheld`]）。凭条只证明「闸门在某一刻放行过」，而放行到发出之间隔着读凭证、占名额、写审计事件、
 /// 落 `pending` 行这些让出点，远程熔断可能在这期间被打开（它是个共享的原子变量）；调用方在这里给出**此刻**的答案，
-/// 而不是闸门那一刻的快照。检查是 `run` 被 poll 的第一件事，和 `request.send()` 之间没有任何让出点。
+/// 而不是闸门那一刻的快照。
+///
+/// 这一下通过之后，`request.send()` 还要等 DNS / 连接 / TLS，正文是在连上之后才写的（审查 r4#1 复审）。等待期间熔断
+/// 再打开，就丢掉这个发送 future（取消还没写完的连接），同样按 [`CloudFailure::Withheld`] 返回。已经拿到响应（正文已经
+/// 写出去）之后不再收回。
 ///
 /// 只有 `cloud_tier` 模块树里的代码能调它（`pub(super)`）；而 [`EgressPermit`] 只有 `gate::grant` 能造，它同样只对这个
 /// 模块树可见：crate 外的代码调不到 `send`，也造不出凭条。文档测试钉住 `send` 的可见性
@@ -225,11 +230,18 @@ pub(super) async fn send(
         if !still_allowed() {
             return Err(CloudFailure::Withheld);
         }
-        let response = request
-            .send()
-            .await
-            .map_err(|error| classify_transport(&error))?;
-        read_answer(response, config.max_response_bytes).await
+        // 先把「熔断打开」放在和发送 future 的同一次 select 里。biased：发送先完成（响应头已经到了，正文早已写出）
+        // 就认这个结果；否则熔断一打开就丢掉发送 future，连接还在等的时候正文不会被写出去。
+        let mut connecting = std::pin::pin!(request.send());
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => Err(CloudFailure::Cancelled),
+            result = &mut connecting => match result {
+                Ok(response) => read_answer(response, config.max_response_bytes).await,
+                Err(error) => Err(classify_transport(&error)),
+            },
+            () = await_revoked(still_allowed) => Err(CloudFailure::Withheld),
+        }
     };
     tokio::select! {
         biased;
@@ -238,6 +250,19 @@ pub(super) async fn send(
             Ok(result) => result,
             Err(_) => Err(CloudFailure::Timeout),
         },
+    }
+}
+
+/// 连接还在建立时，隔一会儿看一次熔断。打开了就结束，好让外面的 `select` 取消发送。
+/// 熔断是个原子变量，没有现成的唤醒；10 毫秒一轮只覆盖「还没写正文」的那段等待，不拿它做超时。
+const KILL_SWITCH_POLL: std::time::Duration = std::time::Duration::from_millis(10);
+
+async fn await_revoked(still_allowed: &(dyn Fn() -> bool + Sync)) {
+    loop {
+        if !still_allowed() {
+            return;
+        }
+        tokio::time::sleep(KILL_SWITCH_POLL).await;
     }
 }
 
@@ -932,6 +957,105 @@ mod tests {
         .await;
         assert!(served.is_ok());
         assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    /// 把接受队列填满，让下一个连接停在 SYN_SENT：握手还没完成，请求正文不可能写进套接字。
+    fn saturate_accept_queue() -> (
+        std::net::TcpListener,
+        std::net::SocketAddr,
+        Vec<std::net::TcpStream>,
+    ) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut fillers = Vec::new();
+        loop {
+            match std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(400)) {
+                Ok(stream) => fillers.push(stream),
+                Err(_) => break,
+            }
+            assert!(
+                fillers.len() < 4096,
+                "the accept queue never filled; a later connect would not block"
+            );
+        }
+        assert!(
+            !fillers.is_empty(),
+            "expected the listener to queue at least one connection"
+        );
+        (listener, addr, fillers)
+    }
+
+    fn waiting_payloads(listener: &std::net::TcpListener) -> Vec<Vec<u8>> {
+        use std::io::Read;
+        listener.set_nonblocking(true).unwrap();
+        let mut payloads = Vec::new();
+        loop {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    stream.set_nonblocking(false).unwrap();
+                    let _ = stream.set_read_timeout(Some(Duration::from_millis(30)));
+                    let mut buf = vec![0u8; 4096];
+                    let n = stream.read(&mut buf).unwrap_or(0);
+                    buf.truncate(n);
+                    payloads.push(buf);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(error) => panic!("accept: {error}"),
+            }
+        }
+        payloads
+    }
+
+    /// 审查 r4#1 复审：最后一道门已经放过，`send().await` 还堵在连接上时熔断打开。
+    /// 云端收不到完整请求（队列里的连接都是测试自己填进去的空连接），调用按没出网返回。
+    #[tokio::test]
+    async fn a_kill_switch_opened_during_connect_cancels_before_the_request_is_written() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let (listener, addr, _fillers) = saturate_accept_queue();
+        let config = CloudTierConfig::parse(
+            &format!(
+                "schema_version: 1\nbase_url: http://{addr}/api\nmodel: idoris/agent\n\
+                 limits: {{connect_timeout_ms: 20000, total_timeout_ms: 30000}}\n"
+            ),
+            Path::new("."),
+        )
+        .unwrap();
+        let opened = Arc::new(AtomicBool::new(false));
+        let flag = opened.clone();
+        let task = tokio::spawn(async move {
+            let started = std::sync::Mutex::new(None);
+            let still_allowed = move || {
+                // 第一次（进 send 之前的那道门）放行，并记下时刻；150ms 之后视为熔断已打开。
+                // 这 150ms 里连接因为队列满了还停在 SYN_SENT，正文还没写。
+                let mut slot = started.lock().unwrap();
+                let start = *slot.get_or_insert_with(std::time::Instant::now);
+                !flag.load(Ordering::SeqCst) && start.elapsed() < Duration::from_millis(150)
+            };
+            send(
+                &client(&config),
+                &config,
+                permit(),
+                &CloudCredential::parse(&secret()).unwrap(),
+                &json!({"model": "idoris/agent", "messages": [{"role": "user", "content": "hi"}]}),
+                &CancellationToken::new(),
+                &still_allowed,
+            )
+            .await
+        });
+        // 连接等待期间打开熔断（和上面 150ms 的时限是同一件事；这里再显式拨一次，贴近「共享原子变量被写上」）。
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        opened.store(true, Ordering::SeqCst);
+        let outcome = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("send stayed blocked in connect after the kill switch opened");
+        assert_eq!(outcome.unwrap().unwrap_err(), CloudFailure::Withheld);
+        let payloads = waiting_payloads(&listener);
+        assert!(
+            payloads.iter().all(|bytes| !bytes.starts_with(b"POST")),
+            "the cloud accepted a request body although the switch opened during connect: {payloads:?}"
+        );
     }
 
     #[test]

@@ -17,6 +17,7 @@
 //! 2. **失败前缀预检**：这个凭证前缀最近认证失败太多 -> 429 `auth_throttled`；不碰库。
 //!    **认证前的有界工作**（`abuse::AuthBudget`）：同时在途的认证查询个数、「最近没有认证成功过的前缀」的查询预算；
 //!    满了 -> 429 `auth_capacity_limited`；不碰库。随机假凭证（前缀各不相同）靠这一道挡住：上一道只认同一个前缀。
+//!    在途名额**跟着真正执行查询的阻塞任务走**（交给认证器，查询跑完才还），请求被取消不会提前归还。
 //! 3. **认证**（虚拟 key + S2 的凭证闸门，每次请求读库、不缓存）：失败 -> 记一次失败、401（不透明：不告诉是哪种失败）。
 //!    认证之后限流用的时间**重新读**（认证可能排了很久队），并且用单调时间。
 //! 4. **成员 id**（`X-iDoris-Member`）格式：不合法 -> 400。
@@ -248,9 +249,13 @@ pub(super) async fn data_plane_guard(
         }
     };
 
-    // 3. 认证。
-    let authenticated = ingress.authenticator.authenticate(request.headers()).await;
-    drop(auth_slot);
+    // 3. 认证。名额**交给认证器**，由它搬进真正执行查询的阻塞任务：查询跑完才还。名额如果留在这个请求 future 上，
+    // 请求被取消（客户端断开）时名额就先还了，而 `spawn_blocking` 出去的查询还在等库的锁——反复「发起再取消」就能攒出
+    // 远超 `auth_max_concurrent` 的阻塞任务（R3 N2）。
+    let authenticated = ingress
+        .authenticator
+        .authenticate_holding(request.headers(), auth_slot)
+        .await;
     // 认证是异步的、可能排了很久队：之后限流和判过期用的时间**重新读**，不用认证之前读到的（乱序完成的请求带着
     // 过期的时间读数去限流，会让令牌桶把同一段时间补两次额度）。
     let now = ingress.clock.now();

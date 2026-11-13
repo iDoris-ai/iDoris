@@ -7,11 +7,12 @@
 //! 逐毫秒回填，不会因为取整永远攒不满一个令牌）。时间由调用方传入（毫秒），所以测试可以拨时钟，
 //! 不需要睡觉。
 //!
-//! **桶里的时间只前进**：同一段时间不能补两次额度。两个请求几乎同时取时、却按相反的顺序抢到桶的锁，晚到的那个带着
+//! **桶里的时间永远只前进**：同一段时间不能补两次额度。两个请求几乎同时取时、却按相反的顺序抢到桶的锁，晚到的那个带着
 //! 更早的时间，如果让它把桶里的时间拨回去，下一个请求就会把「已经补过的那一小段」再补一次（间隔 1 毫秒的两个请求都成功）。
-//! 所以倒退不超过 [`OUT_OF_ORDER_TOLERANCE_MS`] 的时间读数一律当作乱序：不回填，也不拨回桶里的时间。
-//! 倒退得更多才是时钟被拨回（NTP 校时、手动改时间）：不回填、并重新对齐，不会因此冻结一个桶。
-//! 调用方应当传**单调**时间（`Clock::monotonic_ms`），墙上时钟被拨回就不会走到这里。
+//! 所以任何比桶里的时间更早的读数（不论落后多少）都当作乱序：不回填，也不拨回桶里的时间。
+//! 不留「倒退得更多就重新对齐」的例外（原来落后超过 5 秒的读数会重新对齐，一个延迟拿到锁的请求就能借此把桶拨回去、
+//! 让同一段时间补第二次，R3 Medium-5）：调用方传的是**单调**时间（`Clock::monotonic_ms`，进程内的单调时钟），
+//! 墙上时钟被拨回（NTP 校时、手动改时间）根本走不到这里，所以没有「桶因为时钟回拨而冻结」的情形需要兜底。
 //!
 //! 拒绝时算得出**确切**的等待：还差多少单位 ÷ 每毫秒回填多少，向上取整到秒（至少 1 秒），放进 `Retry-After`。
 //!
@@ -28,9 +29,6 @@ use std::hash::Hash;
 
 /// 一个令牌的内部单位数：`60_000` = 一分钟的毫秒数，所以每毫秒回填 `requests_per_minute` 个单位 = 精确。
 pub const UNITS_PER_TOKEN: u64 = 60_000;
-
-/// 时间读数倒退不超过这么多毫秒，当作乱序（见模块文档）：不拨回桶里的时间。
-pub const OUT_OF_ORDER_TOLERANCE_MS: i64 = 5_000;
 
 /// 速率上限：每分钟 `requests_per_minute` 个请求，桶容量 `burst`。两个数都至少是 1。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -94,12 +92,9 @@ impl Bucket {
 
     fn refill(&mut self, limit: &RateLimit, now_ms: i64) {
         self.units = self.units_at(limit, now_ms);
-        // 桶里的时间只前进：乱序到达的较早读数（倒退不超过容忍范围）不拨回它，否则同一段时间会被补两次额度。
-        // 倒退得更多是时钟被拨回：只对齐，不回填，也不让桶因此冻结
-        if now_ms >= self.last_ms || self.last_ms.saturating_sub(now_ms) > OUT_OF_ORDER_TOLERANCE_MS
-        {
-            self.last_ms = now_ms;
-        }
+        // 桶里的时间**永远只前进**：任何比它更早的读数（不论落后多少）都不回填，也不拨回它，否则同一段时间会被补两次额度
+        // （R3 Medium-5：原来落后超过 5 秒的读数会重新对齐，等于把已经补过的那一段再补一次）。
+        self.last_ms = self.last_ms.max(now_ms);
     }
 
     /// 取一个令牌。成功 `Ok`；桶里不够返回 `Err(还要等几秒)`（向上取整，至少 1）。失败不改变令牌数。
@@ -291,15 +286,24 @@ mod tests {
         assert!(!bucket.is_full_at(&l, 0));
     }
 
+    /// 读数从过去来（不论落后多少）：不回填，也不拨回桶里的时间；读数追上桶里的时间之后才正常回填。
+    ///
+    /// 这条原来叫 `a_clock_that_goes_backwards_neither_refills_nor_freezes_the_bucket`，还断言「回拨一小时之后从新的时刻重新
+    /// 对齐、1 秒后就有令牌」。那个「重新对齐」正是 R3 Medium-5 的缺口（落后超过 5 秒的乱序读数会把桶里的时间拨回去，
+    /// 同一段时间被补两次额度），所以断言反过来了：桶里的时间只前进。「时钟被拨回」不需要靠重新对齐来兜底——桶只接收
+    /// `Clock::monotonic_ms`（进程内的单调时钟，墙上时钟被拨回走不到这里）。
     #[test]
-    fn a_clock_that_goes_backwards_neither_refills_nor_freezes_the_bucket() {
+    fn a_reading_from_the_past_neither_refills_nor_rewinds_the_bucket() {
         let l = limit(60, 1);
         let mut bucket = Bucket::full(&l, 10_000);
         bucket.try_take(&l, 10_000).unwrap();
-        // 时钟回拨一小时：不回填
+        // 读数落后一小时：不回填
         assert!(bucket.try_take(&l, 10_000 - 3_600_000).is_err());
-        // 但从新的时刻重新开始走：1 秒之后就有一个令牌（没有冻结一小时）
-        assert_eq!(bucket.try_take(&l, 10_000 - 3_600_000 + 1_000), Ok(()));
+        // 也没有把桶里的时间拨回去：落后读数之后的「新」读数只比 10_000 早 1 秒，仍然没有令牌
+        assert!(bucket.try_take(&l, 10_000 - 3_600_000 + 1_000).is_err());
+        assert!(bucket.try_take(&l, 10_999).is_err());
+        // 读数追上桶里的时间并走过 1 秒（每分钟 60 个 = 每秒 1 个）之后才有下一个
+        assert_eq!(bucket.try_take(&l, 11_000), Ok(()));
     }
 
     /// R2 Medium#5：乱序到达的较早时间读数不能把桶里的时间拨回去，否则同一段时间被补两次额度。
@@ -317,6 +321,54 @@ mod tests {
         );
         // 真正过了 3 秒（每分钟 20 个 = 每 3 秒 1 个）才有下一个
         assert_eq!(bucket.try_take(&l, 6_000), Ok(()));
+    }
+
+    /// R3 Medium-5：落后**超过** 5 秒的乱序读数同样不能拨回桶里的时间（原来的 5 秒「容忍窗口」之外会重新对齐，
+    /// 等于把同一段时间再补一次）。每分钟 20 个、突发 1：B 在 6000ms 用掉令牌；延迟取得锁的 A 带着 0ms 的读数
+    /// （落后 6000ms）；C 在 6001ms：只比 B 晚 1ms，不该再有令牌。
+    #[test]
+    fn a_reading_more_than_five_seconds_stale_does_not_rewind_the_bucket_either() {
+        let l = limit(20, 1);
+        let mut bucket = Bucket::full(&l, 0);
+        assert_eq!(bucket.try_take(&l, 6_000), Ok(())); // B
+        assert!(bucket.try_take(&l, 0).is_err(), "A: 6 s stale and empty"); // A
+        assert!(
+            bucket.try_take(&l, 6_001).is_err(),
+            "C: 1 ms after B must not get a token, however stale A was"
+        );
+        // 真正又过了 3 秒才有下一个
+        assert_eq!(bucket.try_take(&l, 9_000), Ok(()));
+    }
+
+    /// R3 Medium-5（全局性质）：不论读数怎么乱序、倒退多少，一个桶能放行的个数不超过「突发 + 最晚那个读数之前攒出来的令牌」。
+    /// 每分钟 2 个、突发 3，读数在 0..10 分钟里随机乱序（确定性的伪随机序列），每轮 400 次尝试：把桶里的时间拨回去
+    /// 就会把同一段时间补好几次，放行数超过上界。
+    #[test]
+    fn no_order_of_readings_takes_more_tokens_than_the_burst_plus_the_refill_over_the_span() {
+        let l = limit(2, 3);
+        let mut state = 0x2545_F491_4F6C_DD1D_u64;
+        for round in 0..200 {
+            let mut bucket = Bucket::full(&l, 0);
+            let mut granted = 0u64;
+            let mut latest = 0i64;
+            for _ in 0..400 {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                let reading = i64::try_from((state >> 33) % 600_000).unwrap();
+                latest = latest.max(reading);
+                if bucket.try_take(&l, reading).is_ok() {
+                    granted += 1;
+                }
+            }
+            let bound = u64::from(l.burst())
+                + u64::try_from(latest).unwrap() * u64::from(l.requests_per_minute())
+                    / UNITS_PER_TOKEN;
+            assert!(
+                granted <= bound,
+                "round {round}: {granted} granted, but at most {bound} tokens ever existed by {latest} ms"
+            );
+        }
     }
 
     #[test]

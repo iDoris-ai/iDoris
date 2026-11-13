@@ -29,7 +29,7 @@
 //!   - provider: example-provider                 # 以下三项 = 许可表里的端点键 (provider, model, endpoint)
 //!     model: example-org/chat-70b
 //!     endpoint: openai-compat
-//!     base_url: https://api.example.invalid/v1   # https；只有回环地址允许 http
+//!     base_url: https://api.example.invalid/v1   # https；只有回环地址允许 http。非回环的主机必须是这个供应商登记过的 API 主机（`VERIFIED_PROVIDER_HOSTS`），没登记的供应商只能配回环地址
 //!     api_key_env: EXAMPLE_PROVIDER_API_KEY      # 或 api_key_file: /run/secrets/example-provider
 //!     supplier_request_id_header: x-request-id   # 可选：供应商请求号也从这个头里找（正文里的 id 优先）
 //!     extra_body: {provider: {zdr: true}}        # 可选：固定附加字段，盖在客户端字段之上；不能含 model / max_tokens / stream / n / messages / tools / user / store 等协议、计费、身份、留存字段（加载时拒绝）
@@ -590,11 +590,17 @@ pub(crate) fn build_credentials(
 /// 手写的，两边之间原来没有任何绑定：配置里把 `deepinfra` 这一行的 `base_url` 写成别的主机，孩子的数据就会带着
 /// 「已核验」的标签发往一个没人核验过的主机。现在这些供应商的 `base_url` 主机必须在表里。
 ///
-/// 范围（有意收窄，需要 owner 确认更彻底的做法）：
+/// 范围（需要 owner 确认更彻底的做法）：
 /// - 回环地址永远允许（本机测试用的假上游）；
-/// - 表里**没有**的供应商标签（测试里的 `example-*`、以后新增的行）不受限：这里只绑定今天已经核验过的行；
+/// - 表里**没有**的供应商标签（测试里的 `example-*`、以后新增的许可表行）：**默认拒绝**任何非回环地址（R3 S4 Low：原来这些
+///   不受限，新增一条允许儿童数据的已审核行之后，它的 `base_url` 可以误指任意 HTTPS 主机而照样加载，正文和供应商凭证
+///   都会发过去）。要接入新的供应商，先核验它的 API 主机、登记到这张表，再配置；
 /// - 完整 URL / 主机**没核实**的供应商（`together`、`google-vertex`、`siliconflow`、`moonshot`）：主机列表是空的，
 ///   这些行不能配置到任何非回环地址（草案没给出可核对的主机，不补一个猜出来的）。
+///
+/// 为什么主机表放在这里（配置侧校验）而不是许可表的 schema 里：绑定「这一行核验过的主机」最彻底的做法是给 S0 许可表的
+/// 行加一个字段（比如 `api_hosts`），由 S0 在加载时校验、路由时一起过滤；那要改契约，这里没有改。代价是这张表和许可表
+/// 是两份东西，要靠这里的「未登记就拒绝」把它们捆在一起。
 const VERIFIED_PROVIDER_HOSTS: &[(&str, &[&str])] = &[
     ("deepinfra", &["api.deepinfra.com"]),
     ("openrouter", &["openrouter.ai"]),
@@ -632,7 +638,8 @@ fn host_matches(host: &str, pattern: &str) -> bool {
     }
 }
 
-/// 许可表里已核验的供应商，`base_url` 的主机必须是它核验过的 API 主机（见 [`VERIFIED_PROVIDER_HOSTS`]）。
+/// 云上游端点的 `base_url` 必须是回环地址，或者这个供应商核验过的 API 主机（见 [`VERIFIED_PROVIDER_HOSTS`]）；
+/// 供应商没有登记主机的，非回环地址一律拒绝。
 pub(crate) fn check_provider_host(key: &EndpointKey, base_url: &str) -> Result<(), String> {
     // URL 本身不合法由客户端的构造函数报（那边的错误更具体）
     let Ok(url) = idoris_upstream::cloud::validate_base_url(base_url) else {
@@ -648,7 +655,13 @@ pub(crate) fn check_provider_host(key: &EndpointKey, base_url: &str) -> Result<(
         .iter()
         .find(|(provider, _)| *provider == key.provider.as_str())
     else {
-        return Ok(());
+        // 没有登记核验过的主机：默认拒绝（失败即关闭），不是「没登记就不管」
+        return Err(bad(format!(
+            "端点 {key} 的供应商 {} 没有登记核验过的 API 主机（`VERIFIED_PROVIDER_HOSTS`）：base_url 的主机 {host} 不是回环地址，\
+             不能配置。许可表核验的是这个供应商的端点，数据不能带着「已核验」的标签发往没人核验过的主机；要接入新的供应商，\
+             先核验它的 API 主机，再把主机登记到 `VERIFIED_PROVIDER_HOSTS`（并同步 config/compute/endpoint-urls.md）",
+            key.provider
+        )));
     };
     if hosts.iter().any(|pattern| host_matches(host, pattern)) {
         return Ok(());
@@ -1131,7 +1144,7 @@ endpoints:
   - provider: example-alpha
     model: example-org/chat-70b
     endpoint: openai-compat
-    base_url: https://api.example.invalid/v1
+    base_url: http://127.0.0.1:9/v1
     api_key_env: EXAMPLE_ALPHA_API_KEY
     price_version: pv-1
     cost: {unit: USD, input_per_mtok: \"0.26\", output_per_mtok: \"0.38\"}
@@ -1263,7 +1276,7 @@ callers:
             parse(
                 &yaml
                     .replace("deepinfra", provider)
-                    .replace("https://api.example.invalid/v1", base_url),
+                    .replace("http://127.0.0.1:9/v1", base_url),
                 dir.path(),
                 TimestampMs(1_794_528_000_000),
             )
@@ -1291,8 +1304,67 @@ callers:
         let error = load_with("together", "https://api.together.example/v1").unwrap_err();
         assert!(error.contains("没有核实"), "{error}");
         load_with("together", "http://127.0.0.1:9/v1").unwrap();
-        // 表里没有的供应商标签（测试里的 example-*）不受限
-        load_with("example-alpha", "https://api.example.invalid/v1").unwrap();
+        // 表里没有的供应商标签（测试里的 example-*、以后新增的许可表行）：默认拒绝非回环地址（R3 S4 Low：原来不受限，
+        // 新增一条已审核的供应商行之后，它的 base_url 可以误指任意 HTTPS 主机而照样加载）
+        let error = load_with("example-alpha", "https://api.example.invalid/v1").unwrap_err();
+        assert!(
+            error.contains("没有登记核验过的 API 主机") && error.contains("api.example.invalid"),
+            "{error}"
+        );
+        load_with("example-alpha", "http://127.0.0.1:9/v1").unwrap();
+    }
+
+    /// R3 S4 Low：许可表的新行（还没有登记核验过的 API 主机的供应商）默认不能配置到任何非回环地址，不论它被许可了什么
+    /// 数据类别。运维要接入新的供应商，必须先核验它的 API 主机、登记到 `VERIFIED_PROVIDER_HOSTS`，不是在配置里写一个主机就行。
+    #[test]
+    fn a_provider_with_no_registered_host_cannot_be_pointed_at_any_non_loopback_host() {
+        // 一个允许儿童数据（ZDR + 已签 DPA）的新供应商行：许可表放行了数据，但没有人核验过它的主机
+        let permits = PERMITS
+            .replace("example-alpha", "brand-new-vendor")
+            .replace("retention: with_exceptions", "retention: zdr")
+            .replace("dpa: unsigned", "dpa: signed")
+            .replace(
+                "allowed_data_classes: [adult]",
+                "allowed_data_classes: [child_edu, adult]",
+            );
+        let yaml = VALID.replace("example-alpha", "brand-new-vendor");
+        let load_with = |base_url: &str| {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("permits.yaml"), &permits).unwrap();
+            parse(
+                &yaml.replace("http://127.0.0.1:9/v1", base_url),
+                dir.path(),
+                NOW,
+            )
+            .map(|_| ())
+        };
+        for any_https_host in [
+            "https://api.brand-new-vendor.example/v1",
+            "https://evil.example.com/v1",
+            "https://203.0.113.7/v1",
+            "https://[2001:db8::1]/v1",
+            "https://localhost.evil.example/v1",
+        ] {
+            let error = load_with(any_https_host).unwrap_err();
+            assert!(
+                error.contains("brand-new-vendor") && error.contains("没有登记核验过的 API 主机"),
+                "{any_https_host}: {error}"
+            );
+        }
+        // 回环地址永远允许（本机测试用的假上游）
+        for loopback in [
+            "http://127.0.0.1:9/v1",
+            "http://localhost:9/v1",
+            "http://[::1]:9/v1",
+            "https://127.0.0.1:9/v1",
+        ] {
+            load_with(loopback).unwrap_or_else(|e| panic!("{loopback}: {e}"));
+        }
+        // URL 本身不合法（明文 http、带凭证）：仍由客户端的构造函数报更具体的错，不被这一条盖住
+        let error = load_with("http://api.brand-new-vendor.example/v1").unwrap_err();
+        assert!(error.contains("https"), "{error}");
+        let error = load_with("https://user:pw@api.brand-new-vendor.example/v1").unwrap_err();
+        assert!(error.contains("credentials"), "{error}");
     }
 
     #[test]
@@ -1530,15 +1602,12 @@ safety:
         );
         // 明文 http、带凭证的 URL
         expect_error(
-            &VALID.replace(
-                "https://api.example.invalid/v1",
-                "http://api.example.invalid/v1",
-            ),
+            &VALID.replace("http://127.0.0.1:9/v1", "http://api.example.invalid/v1"),
             "https",
         );
         expect_error(
             &VALID.replace(
-                "https://api.example.invalid/v1",
+                "http://127.0.0.1:9/v1",
                 "https://user:pw@api.example.invalid/v1",
             ),
             "credentials",

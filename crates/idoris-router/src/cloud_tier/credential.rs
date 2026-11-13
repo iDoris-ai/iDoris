@@ -410,22 +410,22 @@ impl DeviceStore {
     /// （安装是原子的，读到的要么没有要么完整）。
     ///
     /// `create_dir` 为真时目录不存在就建（0700，配对用）；为假时目录不存在返回 `Ok(None)`：没有目录就没有配对，
-    /// 解绑不需要为了拿锁去建一个目录。已经被别人占着是 [`CredentialError::Busy`]。
+    /// 解绑不需要为了拿锁去建一个目录。调用方拿到 `None` 就到此为止，不能再去读或删这个路径——检查之后目录可能刚被一次配对建出来
+    /// （审查 r4 Medium#4 剩余）。已经被别人占着是 [`CredentialError::Busy`]。
+    ///
+    /// 锁文件和凭证文件同一套打开方式（审查复审：`<state_dir>/.lock` 被换成没有读端的 FIFO 时，阻塞的 `open` 会把
+    /// `pair` / `unpair` 卡死，外层两秒只等得了 `Busy`）：`O_NOFOLLOW|O_NONBLOCK` 打开，再用描述符确认是普通文件、
+    /// 没有 group / other 位，然后才 `flock`。符号链接、FIFO、别人也能写的文件都是 [`CredentialError::InsecureFile`]，立刻返回。
     #[cfg(unix)]
     pub fn try_lock(&self, create_dir: bool) -> Result<Option<StateLock>, CredentialError> {
-        use std::os::unix::fs::OpenOptionsExt;
         if create_dir {
             self.create_private_dir()?;
         } else if !self.dir.is_dir() {
+            #[cfg(test)]
+            fire_absent_dir_hook();
             return Ok(None);
         }
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .mode(0o600)
-            .open(self.dir.join(LOCK_FILE))
-            .map_err(|_| CredentialError::Unreadable)?;
+        let file = open_state_lock(&self.dir.join(LOCK_FILE))?;
         match file.try_lock() {
             Ok(()) => Ok(Some(StateLock { _file: file })),
             Err(std::fs::TryLockError::WouldBlock) => Err(CredentialError::Busy),
@@ -518,6 +518,48 @@ fn read_private_regular_file_with(
         return Err(CredentialError::Malformed);
     }
     Ok(Some(text))
+}
+
+/// 打开状态目录的锁文件（`<state_dir>/.lock`）。
+///
+/// 和 [`read_private_regular_file`] 一样：**先打开，再用这个描述符验证**，中间没有「看过一眼、打开前被换掉」的窗口。
+/// `O_NOFOLLOW` 让最后一级的符号链接直接失败（不跟随，也不锁到链接指向的那个文件上）；`O_NONBLOCK` 让没有读端的 FIFO
+/// 不会把 `open` 卡住。打开成功之后必须是普通文件，且没有 group / other 位（新建时是 0600；已有的文件权限不对就拒绝，
+/// 不把它改掉、也不在上面加锁）。
+#[cfg(unix)]
+fn open_state_lock(path: &Path) -> Result<std::fs::File, CredentialError> {
+    use std::os::unix::fs::OpenOptionsExt;
+    // 读写一起打开：只写的话，没有读端的 FIFO 在 `O_NONBLOCK` 下会以 ENXIO 失败，拿不到描述符做检查；
+    // 读写打开时 FIFO 会立刻返回，随后 `fstat` 拒绝它。普通文件不受影响。
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
+        .open(path)
+        .map_err(lock_open_error)?;
+    let metadata = file.metadata().map_err(|_| CredentialError::Unreadable)?;
+    check_opened_credential_file(&metadata)?;
+    Ok(file)
+}
+
+/// 锁文件打不开。符号链接（`ELOOP`）、没有读端的只写打开（`ENXIO`）、目录（`EISDIR`）都是「这不是一把能用的锁」，
+/// 其余（权限、目录没了）按读不了处理。
+#[cfg(unix)]
+fn lock_open_error(error: std::io::Error) -> CredentialError {
+    match error.raw_os_error() {
+        Some(code)
+            if code == nix::libc::ELOOP
+                || code == nix::libc::EMLINK
+                || code == nix::libc::ENXIO
+                || code == nix::libc::EISDIR =>
+        {
+            CredentialError::InsecureFile
+        }
+        _ => CredentialError::Unreadable,
+    }
 }
 
 /// 用**已打开文件的描述符**的元数据验证它：普通文件、没有 group / other 位。
@@ -695,6 +737,30 @@ impl CredentialProvider for NodeEnvProvider {
             kind: CredentialKind::Node,
         })
     }
+}
+
+// 测试钩子：下一次 `try_lock(false)` 发现目录不存在时调用一次，然后摘掉。
+// 用来把「刚判断完没有目录」和「返回 `Ok(None)`」之间的窗口定在测试线程上：钩子里装上一张凭证，
+// 解绑如果还继续读和删，就会删掉这张刚装上的凭证。只在测试里编译。调用和 `try_lock` 在同一个任务的同一次 poll 里，
+// 所以用线程局部，不和别的测试串。
+#[cfg(test)]
+thread_local! {
+    static ABSENT_DIR_HOOK: std::cell::RefCell<Option<Box<dyn Fn()>>> =
+        std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+fn fire_absent_dir_hook() {
+    let hook = ABSENT_DIR_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+/// 装上 [`fire_absent_dir_hook`] 会跑的那个钩子。`None` 清掉。
+#[cfg(test)]
+pub(crate) fn set_absent_dir_hook_for_test(hook: Option<Box<dyn Fn()>>) {
+    ABSENT_DIR_HOOK.with(|slot| *slot.borrow_mut() = hook);
 }
 
 #[cfg(test)]
@@ -1072,6 +1138,69 @@ mod tests {
         assert!(store.try_lock(true).unwrap().is_some());
     }
 
+    /// 审查复审：锁文件预先被换成没有读端的 FIFO，或指向别处的符号链接。打开必须立刻失败，不能跟着链接去锁那个目标，
+    /// 也不能堵在 `open` 上（以前是阻塞的 `write(true).open`，外层两秒期限等不到这个 `open`）。
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_or_symlink_at_the_lock_path_is_refused_without_blocking_or_following() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        std::fs::create_dir(&state).unwrap();
+        let store = DeviceStore::new(&state);
+
+        let fifo = state.join(LOCK_FILE);
+        make_fifo(&fifo);
+        let fifo_for_watch = fifo.clone();
+        let error = finishes_within(
+            "locking a FIFO",
+            &fifo_for_watch,
+            std::time::Duration::from_secs(2),
+            true,
+            move || store.try_lock(false).unwrap_err(),
+        );
+        assert_eq!(error, CredentialError::InsecureFile);
+        let _ = std::fs::remove_file(&fifo);
+
+        let elsewhere = dir.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        let target = elsewhere.join(LOCK_FILE);
+        std::fs::write(&target, b"").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::os::unix::fs::symlink(&target, state.join(LOCK_FILE)).unwrap();
+        let store = DeviceStore::new(&state);
+        assert_eq!(
+            store.try_lock(false).unwrap_err(),
+            CredentialError::InsecureFile,
+            "a symlink must not be followed"
+        );
+        // 链接指向的那个文件没有被这把「锁」占住：跟着走的话，这里会是 Busy
+        let real = DeviceStore::new(&elsewhere);
+        assert!(real.try_lock(false).unwrap().is_some());
+    }
+
+    /// 已有的锁文件别人也能写（或 group / other 有任何权限位）：不加锁。改回 0600 之后才能拿。
+    #[cfg(unix)]
+    #[test]
+    fn a_lock_file_other_users_can_touch_is_refused_until_it_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        // 临时目录本身就是状态目录（已经存在），不要再 create_dir。
+        let store = DeviceStore::new(dir.path());
+        let path = store.dir().join(LOCK_FILE);
+        std::fs::write(&path, b"").unwrap();
+        for mode in [0o666, 0o606, 0o640, 0o622] {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+            assert_eq!(
+                store.try_lock(false).unwrap_err(),
+                CredentialError::InsecureFile,
+                "mode {mode:o} must not be locked"
+            );
+        }
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(store.try_lock(false).unwrap().is_some());
+    }
+
     #[cfg(unix)]
     #[test]
     fn preflight_fails_when_the_state_directory_cannot_be_written() {
@@ -1200,25 +1329,40 @@ mod tests {
         assert!(!json.contains("0123456789abcdef0123456789abcdef"));
     }
 
-    /// 在另一个线程里跑 `f`，5 秒没返回就判失败。回归（去掉 `O_NONBLOCK`）时 `open` 会永远卡在没有写端的 FIFO 上，
-    /// 不能让它把整个测试进程挂住：先给 FIFO 一个写端放开卡住的线程，再报告失败。
+    /// 在另一个线程里跑 `f`，`limit` 之内没返回就判失败。回归（去掉 `O_NONBLOCK`）时 `open` 会永远卡在 FIFO 上，
+    /// 不能让它把整个测试进程挂住：到点给 FIFO 补上缺的那一端（读凭证是等写端，锁文件是等读端），放开卡住的线程，再报告失败。
     #[cfg(unix)]
-    fn finishes_within_5s<T: Send + 'static>(
+    fn finishes_within<T: Send + 'static>(
         what: &str,
         fifo: &Path,
+        limit: std::time::Duration,
+        unblock_with_reader: bool,
         f: impl FnOnce() -> T + Send + 'static,
     ) -> T {
         let (sender, receiver) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let _ = sender.send(f());
         });
-        match receiver.recv_timeout(std::time::Duration::from_secs(5)) {
+        match receiver.recv_timeout(limit) {
             Ok(value) => value,
             Err(_) => {
-                let _writer = std::fs::OpenOptions::new().write(true).open(fifo);
+                let _unblocked = if unblock_with_reader {
+                    std::fs::File::open(fifo)
+                } else {
+                    std::fs::OpenOptions::new().write(true).open(fifo)
+                };
                 panic!("{what} hung on a FIFO");
             }
         }
+    }
+
+    #[cfg(unix)]
+    fn finishes_within_5s<T: Send + 'static>(
+        what: &str,
+        fifo: &Path,
+        f: impl FnOnce() -> T + Send + 'static,
+    ) -> T {
+        finishes_within(what, fifo, std::time::Duration::from_secs(5), false, f)
     }
 
     #[cfg(unix)]

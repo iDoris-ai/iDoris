@@ -126,7 +126,10 @@ const MAX_KNOWN_ENTRIES: usize = 16_384;
 /// 两道闸，都在**碰库之前**：
 ///
 /// 1. **在途个数**：同时进行的认证查询不超过 `max_concurrent`。满了直接拒绝，不排队（排队就是把攻击者的请求
-///    攒在内存里，等库有空了再一个个查）。名额在认证查询结束时释放（[`AuthSlot`] 丢弃）。
+///    攒在内存里，等库有空了再一个个查）。名额（[`AuthSlot`]）**跟着真正执行查询的阻塞任务走**：调用方把它交给
+///    `VirtualKeyAuthenticator::authenticate_holding`，由认证器搬进 `spawn_blocking` 的闭包，查询跑完才丢弃。
+///    不能留在请求 future 上：请求被取消时 future 先丢，名额先还，而阻塞任务还在等认证库的锁、查 SQLite，
+///    反复「发起再取消」就能攒出远超上限的阻塞任务（R3 N2）。
 /// 2. **查询预算**：一个令牌桶，只有**最近没有认证成功过的凭证前缀**才消耗它。随机假凭证的前缀永远是新的，
 ///    所以它们合起来每分钟最多只能让库查 `unknown` 这么多次；而最近认证成功过的前缀（真实在用的凭证，比如 eduai 后端的
 ///    服务凭证）不消耗它，只受第 1 条的在途个数约束——攻击者把预算耗光，在用的凭证照样能认证。
@@ -149,7 +152,7 @@ impl std::fmt::Debug for AuthBudget {
     }
 }
 
-/// 一次认证查询占着的名额；丢弃时释放。
+/// 一次认证查询占着的名额；丢弃时释放。要交给执行查询的阻塞任务持有（见 [`AuthBudget`]），不能留在会被取消的 future 上。
 #[must_use = "dropping the slot releases the in-flight authentication slot"]
 pub struct AuthSlot {
     _permit: OwnedSemaphorePermit,

@@ -142,12 +142,31 @@ impl VirtualKeyAuthenticator {
         &self,
         headers: &HeaderMap,
     ) -> Result<AuthenticatedVirtualKey, VirtualKeyAuthError> {
+        self.authenticate_holding(headers, ()).await
+    }
+
+    /// 同 [`Self::authenticate`]，另外把 `holder` **搬进真正执行认证查询的阻塞任务**：查询跑完（或者闭包被丢弃，
+    /// 比如运行时关闭）才丢弃它，**调用方取消了 `await`（请求 future 被丢弃）也不会提前丢弃**。
+    ///
+    /// 为什么：云入口的「认证并发名额」（`AuthSlot`）要限制的是同时在库里排队、查询的**阻塞任务**个数。名额如果挂在请求
+    /// future 上，请求一被取消（客户端断开、超时）名额就还回去了，而 `spawn_blocking` 出去的任务不会因此停下，
+    /// 还在等认证库的锁、查 SQLite：反复「发起再取消」就能攒出远超上限的阻塞任务，把阻塞线程池占满、拖累别的库操作
+    /// （R3 N2）。名额跟着阻塞任务走，上限才是真的。
+    ///
+    /// 凭证格式不对（没有发起任何查询）时 `holder` 当场丢弃。
+    pub async fn authenticate_holding<H: Send + 'static>(
+        &self,
+        headers: &HeaderMap,
+        holder: H,
+    ) -> Result<AuthenticatedVirtualKey, VirtualKeyAuthError> {
         let secret = bearer_secret(headers)?;
         let store = self.store.clone();
         let gate = self.gate.clone();
         #[cfg(test)]
         let before_store_lock = self.before_store_lock.clone();
         tokio::task::spawn_blocking(move || {
+            // 注意是具名绑定：`let _ = holder` 会当场丢弃。它活到这个闭包返回
+            let _holder = holder;
             #[cfg(test)]
             if let Some(notify) = before_store_lock {
                 notify.notify_one();
@@ -339,6 +358,87 @@ mod tests {
             .unwrap_err(),
             VirtualKeyAuthError::Unauthorized
         );
+    }
+
+    /// 计数「被丢弃了几次」的守卫（代替云入口的认证并发名额）。
+    struct Probe(Arc<std::sync::atomic::AtomicUsize>);
+
+    impl Drop for Probe {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// R3 N2：交给 `authenticate_holding` 的守卫（云入口的认证并发名额）跟着**阻塞查询**走：调用方取消了 `await`，
+    /// 查询还卡在认证库的锁上，守卫就不能被丢弃；查询跑完才丢弃。
+    #[tokio::test]
+    async fn a_holder_lives_until_the_blocking_query_finishes_even_when_the_caller_gives_up() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        let key = MintedVirtualKey::mint();
+        let started = Arc::new(tokio::sync::Notify::new());
+        let auth = authenticator(&key, None).notify_before_store_lock(started.clone());
+        // 另一个线程占着认证库的锁：查询会卡在锁上
+        let store = auth.store.clone();
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let lock_thread = std::thread::spawn(move || {
+            let _guard = store.lock().unwrap();
+            locked_tx.send(()).unwrap();
+            let _ = release_rx.recv();
+        });
+        locked_rx.recv().unwrap();
+
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let headers = bearer(&format!("Bearer {}", key.secret.expose_secret()));
+        let probe = Probe(dropped.clone());
+        let caller = tokio::spawn({
+            let auth = auth.clone();
+            async move { auth.authenticate_holding(&headers, probe).await }
+        });
+        // 阻塞任务已经开始（马上要等库的锁），然后调用方放弃等待
+        started.notified().await;
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            dropped.load(Ordering::SeqCst),
+            0,
+            "the query is still waiting for the store, so its holder must still be alive"
+        );
+        // 库有空了：查询跑完，守卫才丢弃
+        release_tx.send(()).unwrap();
+        lock_thread.join().unwrap();
+        for _ in 0..500 {
+            if dropped.load(Ordering::SeqCst) == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(dropped.load(Ordering::SeqCst), 1);
+    }
+
+    /// 凭证格式不对：根本没有发起任何查询，守卫当场丢弃（不会被一个永远不会跑的闭包扣着）。
+    #[tokio::test]
+    async fn a_holder_given_with_an_unusable_credential_is_released_at_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let key = MintedVirtualKey::mint();
+        let auth = authenticator(&key, None);
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let error = auth
+            .authenticate_holding(&HeaderMap::new(), Probe(dropped.clone()))
+            .await
+            .unwrap_err();
+        assert_eq!(error, VirtualKeyAuthError::Unauthorized);
+        assert_eq!(dropped.load(Ordering::SeqCst), 1);
+        // 对照：正常的一次认证，守卫在查询之后丢弃，恰好一次
+        let headers = bearer(&format!("Bearer {}", key.secret.expose_secret()));
+        auth.authenticate_holding(&headers, Probe(dropped.clone()))
+            .await
+            .unwrap();
+        assert_eq!(dropped.load(Ordering::SeqCst), 2);
     }
 
     #[test]
