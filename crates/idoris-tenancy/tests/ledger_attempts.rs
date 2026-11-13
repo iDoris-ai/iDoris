@@ -333,6 +333,70 @@ fn a_creating_an_attempt_requires_a_matching_open_reservation() {
 }
 
 #[test]
+fn admitting_the_next_candidate_never_releases_an_attempt_that_is_still_in_flight() {
+    // PR-Daemon S1 F4：准入第 1 个候选时，账本会放掉这个请求里之前失败的候选占着的预留。但尝试 0 如果还在
+    // `admitted` / `sending`（契约里的「在途」，`begin_next_attempt` 会拒绝切换），它没有失败：放掉它的预留，
+    // 它的额度就不在账上了，之后的结算还会报 ChargeAfterRelease。
+    let env = env("attempts-inflight", 1_000);
+    let (req, mut request) = start(&env, "if-1", "cred-e", 100);
+    let next = Req {
+        attempt: idoris_compute_contracts::ids::AttemptId::new(
+            req.attempt.request().clone(),
+            AttemptIndex(1),
+        ),
+        ..req.clone()
+    }
+    .at(T0 + 200);
+    let decision = env.accounts.admit_attempt(&next.input()).unwrap();
+    assert!(decision.is_admitted(), "{decision:?}");
+    assert_eq!(
+        env.accounts
+            .hold(&req.attempt, "model")
+            .unwrap()
+            .unwrap()
+            .state,
+        HoldState::Open,
+        "尝试 0 还在飞：它的预留不能被放掉"
+    );
+    assert_eq!(
+        balance(&env, "emp", T0 + 200),
+        1_000 - 420,
+        "两个预留都占着（保守：宁可多占，不能漏掉）"
+    );
+    // 契约层同样拒绝切换；执行器这时会把第 1 个候选的预留放回去
+    let err = request
+        .begin_next_attempt(candidate(decision, &next))
+        .unwrap_err();
+    assert!(
+        err.to_string().to_lowercase().contains("in flight") || err.to_string().contains("flight"),
+        "{err}"
+    );
+    env.accounts
+        .release_attempt(&next.attempt, ts(T0 + 300))
+        .unwrap();
+    assert_eq!(balance(&env, "emp", T0 + 300), 1_000 - 210);
+    // 尝试 0 之后照常收尾
+    apply(
+        &env,
+        &mut request,
+        0,
+        &[AttemptEvent::Dispatch, AttemptEvent::WireWriteStarted],
+        T0 + 400,
+    );
+    apply(
+        &env,
+        &mut request,
+        0,
+        &[AttemptEvent::UsageReported { usage: usage_70() }],
+        T0 + 500,
+    );
+    publish(&env, &mut request, 0, T0 + 600);
+    finalize(&env, &mut request, T0 + 700).unwrap();
+    assert_eq!(balance(&env, "emp", T0 + 800), 1_000 - 70);
+    assert_clean(&env.accounts);
+}
+
+#[test]
 fn failover_releases_the_failed_attempt_and_charges_only_the_answering_one() {
     let env = env("attempts-failover", 1_000);
     let (req, mut request) = start(&env, "fo-1", "cred-e", 100);

@@ -534,6 +534,40 @@ fn an_account_that_was_never_provisioned_gets_no_grace_but_one_whose_allowance_r
 }
 
 #[test]
+fn a_member_that_was_never_provisioned_gets_no_grace_even_when_every_ancestor_could_pay() {
+    // PR-Daemon S1 F6：上面那个「没配置过的账户没有宽限」的用例里，组织 `paid` 自己也什么都没配置，
+    // 所以宽限在「阻断的失败不全在付款账户自己身上」那一步就被拒了，根本没走到 `is_provisioned`。
+    // 这里组织有钱、只有 `emp` 一个账户没配置过：能拦住它的只有「额度用完才有宽限，从没有过额度的账户没有」这一条。
+    let db = TempDb::new("grace-unprovisioned-rich-parent");
+    let store = world(&db);
+    store
+        .fund_account(&aid("paid"), &thb(1_000_000), &key("f-paid"), t0())
+        .unwrap();
+    let view = store.account_view(&aid("emp"), t0()).unwrap();
+    assert_eq!(
+        (view.balance, view.ceiling_remaining),
+        (None, Some(thb(0))),
+        "emp 什么都没配置：可用额是失败即关闭填出来的 0"
+    );
+    let decision = admit_with_ladder(&store, "r-1", 0, "cred-e", 100, T0);
+    assert_eq!(
+        denied(&decision),
+        Some(ReasonCode::BudgetExhausted),
+        "{decision:?}"
+    );
+    assert!(store.grace_uses(&aid("emp")).unwrap().is_empty());
+    // 对照：充过一次值（哪怕现在用光了）就是「用完」，可以宽限一轮
+    store
+        .fund_account(&aid("emp"), &thb(20), &key("f-emp"), t0())
+        .unwrap();
+    let decision = admit_with_ladder(&store, "r-2", 0, "cred-e", 100, T0);
+    assert!(
+        matches!(decision, AdmissionDecision::Grace { .. }),
+        "{decision:?}"
+    );
+}
+
+#[test]
 fn allow_grace_false_never_returns_grace() {
     let db = TempDb::new("grace-flag");
     let store = paid_chain(&db, 20);

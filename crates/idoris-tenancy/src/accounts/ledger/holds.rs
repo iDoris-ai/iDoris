@@ -189,17 +189,33 @@ pub(super) fn load_hold(
 }
 
 /// 一个请求下、序号小于 `below_index` 的、还没收尾的主要预留（切换候选时释放它们）。
+///
+/// **还在飞的尝试不算失败**：尝试记录（S4 的 `compute_attempts`，和账本在同一个库里）里状态是 `admitted` / `sending`
+/// 的尝试，契约的 `begin_next_attempt` 同样拒绝在它之后切换（`AttemptInFlight`）。它的预留不能因为后面又准入了一个候选
+/// 就被放掉：放掉之后这次尝试的额度不在账上了，它收尾时的结算还会报 `ChargeAfterRelease`（PR-Daemon S1 F4）。
+/// 尝试记录表不存在（只开了账本的库）时没有这一层信息，按原来的规则全部释放。
 fn open_model_holds_below(
     conn: &Connection,
     request: &str,
     below_index: i64,
 ) -> Result<Vec<String>, LedgerError> {
-    let mut stmt = conn.prepare(
+    let attempts_present: bool = conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'compute_attempts')",
+        [],
+        |row| row.get(0),
+    )?;
+    let not_in_flight = if attempts_present {
+        " AND NOT EXISTS (SELECT 1 FROM compute_attempts a
+                           WHERE a.attempt_id = ledger_holds.hold_id AND a.state IN ('admitted', 'sending'))"
+    } else {
+        ""
+    };
+    let mut stmt = conn.prepare(&format!(
         "SELECT hold_id FROM ledger_holds
           WHERE request_id = ?1 AND attempt_index < ?2 AND component = 'model'
-            AND state IN ('open', 'expired')
-          ORDER BY attempt_index",
-    )?;
+            AND state IN ('open', 'expired'){not_in_flight}
+          ORDER BY attempt_index"
+    ))?;
     let rows = stmt.query_map(params![request, below_index], |row| row.get::<_, String>(0))?;
     Ok(rows.collect::<Result<Vec<_>, _>>()?)
 }
