@@ -4,7 +4,8 @@
 //! **不连接任何真实的推理或安全服务**：
 //!
 //! - **N1（round2-r2 与 round2-r3 同一问题）**：`rules_only_acknowledgement` 的到期日要在运行期间生效——进程不重启，时钟拨过
-//!   到期日（跨 UTC 日期、长期运行），儿童请求就在调用任何上游之前被拒绝。
+//!   到期日（跨 UTC 日期、长期运行），儿童请求就在调用任何上游之前被拒绝；
+//! - **N2**：LLM 检查器看到的工具参数不能丢掉数字、布尔和 `null`。
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 #[path = "support/child_safety.rs"]
@@ -16,13 +17,14 @@ mod harness;
 
 use std::sync::Arc;
 
-use child_safety::{answer, benign_question, child_body};
-use fake_upstream::FakeUpstream;
+use child_safety::{answer, benign_question, child_body, child_with, judge_allow};
+use fake_upstream::{Behavior, FakeUpstream, usage};
 use harness::{
     Caller, DAY_MS, Endpoint, NOW_MS, Options, RecordingAdmission, VERIFIED_MS, build, post,
 };
 use idoris_compute_contracts::ids::TimestampMs;
 use idoris_router::cloud::ManualClock;
+use serde_json::json;
 
 fn unavailable(reply: &harness::Reply, stage: &str, cause: &str) {
     assert_eq!(reply.status, 503, "{}", reply.text());
@@ -36,6 +38,22 @@ fn unavailable(reply: &harness::Reply, stage: &str, cause: &str) {
 fn rules_only_ack(expires_on: &str) -> String {
     format!(
         "safety:\n  mode: rules_only\n  rules_only_acknowledgement:\n    reason: \"内测外部测试尚无签了DPA的检查器模型\"\n    acknowledged_by: \"ops-ack\"\n    expires_on: \"{expires_on}\"\n"
+    )
+}
+
+/// 一个带工具调用的上游回答。
+fn tool_call_answer(name: &str, arguments: &str) -> Behavior {
+    Behavior::json(
+        200,
+        json!({
+            "id": "chatcmpl-tool", "object": "chat.completion", "created": 1_700_000_000u64,
+            "model": "example-org/chat-70b",
+            "choices": [{"index": 0, "finish_reason": "tool_calls", "message": {
+                "role": "assistant", "content": null,
+                "tool_calls": [{"id": "call_1", "type": "function",
+                                "function": {"name": name, "arguments": arguments}}]}}],
+            "usage": usage(12, 30),
+        }),
     )
 }
 
@@ -148,4 +166,40 @@ async fn an_expired_acknowledgement_does_not_touch_tenants_that_do_not_handle_ch
         200,
         "only child-data requests depend on the acknowledgement"
     );
+}
+
+// ---------------------------------------------------------------------------
+// N2：检查模型看到完整的工具参数
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn the_judge_sees_the_numbers_booleans_and_nulls_of_the_tool_call_arguments() {
+    // 孩子提供的八位私人密码 `31415926` 被上游放进工具参数的数字里：旧实现只把解码后的键和字符串值交给检查模型，
+    // 数字、布尔、null 全部丢掉，检查模型看不到被回显的密码
+    let arguments = r#"{"answer":31415926,"ok":true,"gone":null,"nested":{"n":[1,2.5,false]}}"#;
+    let c = child_with(
+        vec![tool_call_answer("answer", arguments)],
+        vec![judge_allow(), judge_allow()],
+        2_000,
+        |_| {},
+    )
+    .await;
+    let reply = post(&c.h.app, &child_body(&benign_question())).await;
+    assert_eq!(reply.status, 200, "{}", reply.text());
+    let requests = c.judge.requests();
+    assert_eq!(requests.len(), 2, "one input check and one output check");
+    let output_payload = requests[1].json()["messages"][1]["content"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        output_payload.contains("\"stage\":\"output\""),
+        "{output_payload}"
+    );
+    for scalar in ["31415926", "true", "null", "2.5", "false"] {
+        assert!(
+            output_payload.contains(scalar),
+            "the judge never saw {scalar}: {output_payload}"
+        );
+    }
 }

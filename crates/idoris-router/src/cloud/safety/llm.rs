@@ -62,7 +62,7 @@ pub const DEFAULT_MAX_CHUNKS: usize = 4;
 /// 输出检查时带上的「孩子最后一句话」最多多少字节（给检查模型上下文，帮它判断拒绝语和复述）。
 const CONTEXT_BYTES: usize = 2_000;
 /// 每次调用的系统提示 + 包装的 token 开销（估算上界用）。
-const PROMPT_OVERHEAD_TOKENS: u64 = 600;
+pub const PROMPT_OVERHEAD_TOKENS: u64 = 600;
 
 /// 系统提示（英文：检查模型对英文指令的遵从性最稳；被检查的文本可以是任何语言）。
 pub const SYSTEM_PROMPT: &str = r#"You are the content-safety classifier of a learning assistant for children in Thailand (ages 6 to 15).
@@ -568,11 +568,19 @@ impl LlmJudge {
                 origin: "tool_call_name",
                 text: call.name.expose().to_string(),
             });
-            // 给检查模型看解码之后的参数（`k` 之类的转义已经还原），不是 JSON 文本的字面
+            // 参数的完整原文：客户端收到的就是它，完整的 JSON 结构和每一个标量（数字、布尔、`null`）都在。
+            // 不能只给解码之后的键和字符串值：那是有损的文本列表，数字全丢（round2-r3 N2）
             items.push(Item {
                 origin: "tool_call_arguments",
-                text: call.judge_text(),
+                text: call.arguments.expose().to_string(),
             });
+            // 补充：原文里有 `\u` 转义时，再给一份转义还原之后的键和字符串值。补充，不是替代
+            if let Some(decoded) = call.decoded_supplement() {
+                items.push(Item {
+                    origin: "tool_call_arguments_decoded",
+                    text: decoded,
+                });
+            }
         }
         let chunks = chunk_items(items, self.settings.max_chunk_bytes);
         if chunks.len() > self.settings.max_chunks {
@@ -917,5 +925,117 @@ mod tests {
         let cut = truncate_chars(&text, CONTEXT_BYTES);
         assert!(cut.len() <= CONTEXT_BYTES && text.starts_with(cut));
         assert_eq!(truncate_chars("short", CONTEXT_BYTES), "short");
+    }
+
+    // ---- 检查模型看到的输出内容（round2-r3 N2）----
+
+    struct StaticKey;
+
+    #[async_trait::async_trait]
+    impl idoris_upstream::remote::CredentialSource for StaticKey {
+        async fn api_key(&self, _provider: &str) -> Result<String, idoris_upstream::UpstreamError> {
+            Ok("test-only-key".to_string())
+        }
+    }
+
+    /// 一个不会真的联网的检查器（只用来看它会发出什么内容）。
+    fn offline_judge(max_chunk_bytes: usize, max_chunks: usize) -> LlmJudge {
+        use idoris_compute_contracts::money::Unit;
+        use idoris_upstream::cloud::{CloudEndpointSettings, build_http_client};
+
+        let model = "example-org/judge-8b";
+        let permits = PermitTable::from_yaml_str(&format!(
+            "schema_version: 1\nverification_max_age_days: 90\nendpoints:\n  - provider: example-judge\n    model: {model}\n    endpoint: openai-compat\n    access: api\n    processing_regions: [local-1]\n    retention: zdr\n    dpa: signed\n    allowed_data_classes: [child_edu, adult, public]\n    capabilities: {{tool_calling: false, stream_usage: false, cache_pricing: false, structured_output: false, cancellation: false}}\n    verified_at: \"2026-11-12\"\n"
+        ))
+        .unwrap();
+        LlmJudge::new(
+            Arc::new(permits),
+            CloudEndpointClient::new(
+                CloudEndpointSettings::new("http://127.0.0.1:9/v1", "example-judge"),
+                Arc::new(StaticKey),
+                build_http_client(std::time::Duration::from_secs(1)).unwrap(),
+            )
+            .unwrap(),
+            LlmJudgeSettings {
+                endpoint: EndpointKey::new("example-judge", model, "openai-compat").unwrap(),
+                cost_rates: RateCard::new(
+                    Cost::from_micros(Unit::Usd, 260_000).unwrap(),
+                    Cost::from_micros(Unit::Usd, 380_000).unwrap(),
+                    None,
+                )
+                .unwrap(),
+                max_output_tokens: 32,
+                max_chunk_bytes,
+                max_chunks,
+            },
+        )
+        .unwrap()
+    }
+
+    fn answer_with_tool_call(name: &str, arguments: &str) -> CheckedOutput {
+        use super::super::extract::ToolCallText;
+        use super::super::text::Sensitive;
+
+        CheckedOutput {
+            content: None,
+            refusal: None,
+            tool_calls: vec![ToolCallText {
+                name: Sensitive::new(name),
+                arguments: Sensitive::new(arguments),
+            }],
+        }
+    }
+
+    /// 一个输出检查 payload 里的 (part, text) 列表。
+    fn parts_of(payload: &str) -> Vec<(String, String)> {
+        let parsed: Value = serde_json::from_str(payload).unwrap();
+        parsed["reply"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| {
+                (
+                    item["part"].as_str().unwrap().to_string(),
+                    item["text"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_judge_gets_the_complete_tool_call_arguments_and_the_decoded_view_only_as_a_supplement() {
+        let judge = offline_judge(8 * 1024, 4);
+        // 孩子给的八位私人密码被上游回显成数字：检查模型必须看得到它，也看得到布尔和 null
+        let plain = r#"{"answer":31415926,"ok":true,"gone":null,"nested":{"n":[1,2.5,false]}}"#;
+        let payloads = judge
+            .output_payloads(
+                &CheckedInput::default(),
+                &answer_with_tool_call("answer", plain),
+            )
+            .unwrap();
+        let parts: Vec<_> = payloads.iter().flat_map(|p| parts_of(p)).collect();
+        assert!(parts.contains(&("tool_call_arguments".to_string(), plain.to_string())));
+        assert!(
+            parts
+                .iter()
+                .all(|(part, _)| part != "tool_call_arguments_decoded"),
+            "nothing to decode: no second copy of the same words"
+        );
+        // 有 `\u` 转义：原文照旧完整（含数字），另外多一段转义还原之后的补充
+        let escaped = "{\"text\":\"\\u006bill yourself\",\"n\":31415926}";
+        let payloads = judge
+            .output_payloads(
+                &CheckedInput::default(),
+                &answer_with_tool_call("post", escaped),
+            )
+            .unwrap();
+        let parts: Vec<_> = payloads.iter().flat_map(|p| parts_of(p)).collect();
+        assert!(parts.contains(&("tool_call_arguments".to_string(), escaped.to_string())));
+        let decoded = parts
+            .iter()
+            .find(|(part, _)| part == "tool_call_arguments_decoded")
+            .map(|(_, text)| text.as_str())
+            .expect("the decoded view is a supplement");
+        assert!(decoded.contains("kill yourself"), "{decoded}");
     }
 }

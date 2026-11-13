@@ -108,20 +108,27 @@ pub struct ToolCallText {
 
 impl ToolCallText {
     /// `arguments` 解析成 JSON 之后的每一个键和字符串值（任何层级；字符串值本身又是 JSON 的，再解一层）。
-    /// 规则只看得到 JSON 文本的字面（`k`），客户端解析之后看到的是解码之后的字。解析不了（或者套得太深）返回空：
+    /// 规则只看得到 JSON 文本的字面（`\u` 加四位十六进制数写成的字母），客户端解析之后看到的是解码之后的字。解析不了（或者套得太深）返回空：
     /// 收到上游响应时已经按失败即关闭拒绝过这种参数，见 [`rebuild_response`]。
     pub fn decoded_arguments(&self) -> Vec<String> {
         decoded_pieces(self.arguments.expose()).unwrap_or_default()
     }
 
-    /// 给 LLM 检查器看的参数文本：解码之后的键和值各占一行；解码不出东西就用原文。
-    pub fn judge_text(&self) -> String {
-        let pieces = self.decoded_arguments();
-        if pieces.is_empty() {
-            self.arguments.expose().to_string()
-        } else {
-            pieces.join("\n")
+    /// 给 LLM 检查器看的**补充**：转义还原之后的键和字符串值（一行一个）。**补充，不是替代**（round2-r3 N2）：
+    /// 检查模型先看到的是参数的**完整原文**（[`ToolCallText::arguments`]：客户端收到的就是它，完整的 JSON 结构和每一个标量
+    /// ——数字、布尔、`null`——都在）；解码视图只收键和字符串值，数字全丢，拿它顶替原文，孩子给的八位私人密码
+    /// 被上游回显成 `{"answer":31415926}` 时，检查模型就看不到被回显的东西。
+    ///
+    /// 只有原文里有 `\u` 转义时才有补充：`\u` 加四位十六进制数就是一个字符，能把字母藏起来，解码视图让它现形；没有 `\u` 的话，每个键和
+    /// 字符串值在原文里都是字面出现的（别的转义——`\n`、`\"`、`\\`——只是空白和标点；嵌套的 JSON 文本里的引号必须写成 `\"`，
+    /// 而里面藏字母要靠 `\u`），解码视图不会比原文多出任何东西，不必让检查模型把同样的内容读两遍（也不多花调用次数）。
+    /// 解析不了（收到响应时已经按失败即关闭拒绝过）或者没有任何键和字符串值，也没有补充。
+    pub fn decoded_supplement(&self) -> Option<String> {
+        if !self.arguments.expose().contains("\\u") {
+            return None;
         }
+        let pieces = self.decoded_arguments();
+        (!pieces.is_empty()).then(|| pieces.join("\n"))
     }
 }
 
@@ -1404,6 +1411,46 @@ mod tests {
                 {"id": "c", "type": "function", "function": {"name": "f", "arguments": ok}}]}));
             assert!(rebuild_response(&upstream, &ident("r"), 1 << 20).is_ok());
         }
+    }
+
+    fn call_with(arguments: &str) -> ToolCallText {
+        ToolCallText {
+            name: Sensitive::new("f"),
+            arguments: Sensitive::new(arguments),
+        }
+    }
+
+    #[test]
+    fn the_decoded_view_is_a_supplement_that_exists_only_when_escapes_can_hide_letters() {
+        // round2-r3 N2：检查模型看的是参数的完整原文（`arguments` 本身，数字、布尔、null 都在）；解码视图只收键和字符串值，
+        // 是补充，不是替代
+        let plain =
+            call_with(r#"{"answer":31415926,"ok":true,"gone":null,"nested":{"n":[1,2.5,false]}}"#);
+        assert_eq!(plain.decoded_supplement(), None);
+        // 其它转义（换行、引号、反斜杠）只是空白和标点，没有补充（不让检查模型把同样的内容读两遍）
+        let newlines =
+            call_with("{\"code\":\"line one\\nline two\",\"say\":\"he said \\\"hi\\\"\"}");
+        assert_eq!(newlines.decoded_supplement(), None);
+        // `\u` 转义能把字母藏起来：补充里有还原之后的字
+        let escaped = call_with("{\"text\":\"\\u006bill yourself\",\"n\":7}");
+        let supplement = escaped.decoded_supplement().unwrap();
+        assert!(supplement.contains("kill yourself"), "{supplement}");
+        // 嵌套的 JSON 文本里的 `\u` 转义同样
+        let nested = call_with("{\"payload\":\"{\\\"text\\\":\\\"\\\\u006bill yourself\\\"}\"}");
+        assert!(
+            nested
+                .decoded_supplement()
+                .unwrap()
+                .contains("kill yourself")
+        );
+        // 补充不替代原文：原文（含数字 `7`）一个字节不少
+        assert_eq!(
+            escaped.arguments.expose(),
+            "{\"text\":\"\\u006bill yourself\",\"n\":7}"
+        );
+        // 没有参数、解析不了：没有补充
+        assert_eq!(call_with("").decoded_supplement(), None);
+        assert_eq!(call_with("{\\u0041").decoded_supplement(), None);
     }
 
     #[test]
