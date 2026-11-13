@@ -26,6 +26,10 @@ pub struct ChunkInfo {
     pub has_choices: bool,
     /// `choices` 是空数组（usage 单独成块时的样子）。
     pub choices_empty: bool,
+    /// `choices` 是数组，而且每个元素都是对象（一个合法的 completion chunk 的最低要求）。
+    pub choices_well_formed: bool,
+    /// 某个 choice 带了非空的 `finish_reason`：这个 choice 的生成已经结束（「最后一块内容」的标志）。
+    pub has_finish_reason: bool,
 }
 
 /// 一个 SSE 事件的分类。
@@ -76,6 +80,14 @@ pub fn classify(event: &SseEvent) -> ChunkKind {
                 error: object.get("error").is_some_and(|e| !e.is_null()),
                 has_choices: choices.is_some(),
                 choices_empty: choices.is_some_and(Vec::is_empty),
+                choices_well_formed: choices.is_some_and(|list| list.iter().all(Value::is_object)),
+                has_finish_reason: choices.is_some_and(|list| {
+                    list.iter().any(|choice| {
+                        choice
+                            .get("finish_reason")
+                            .is_some_and(|reason| !reason.is_null())
+                    })
+                }),
             })
         }
         _ => ChunkKind::Opaque,
@@ -133,6 +145,30 @@ mod tests {
         };
         assert!(info.has_choices && info.choices_empty);
         assert_eq!(info.usage.valid_usage().unwrap().completion_tokens, 4);
+    }
+
+    #[test]
+    fn choices_shape_and_finish_reason_are_exposed_for_the_final_chunk_decision() {
+        let info = |data: &str| match classify(&event(data)) {
+            ChunkKind::Json(info) => info,
+            other => panic!("expected a JSON chunk, got {other:?}"),
+        };
+        // 内容块：choices 非空、合法、没有 finish_reason
+        let content = info(r#"{"choices":[{"delta":{"content":"x"},"finish_reason":null}]}"#);
+        assert!(content.choices_well_formed && !content.has_finish_reason);
+        // 最后一块内容：带 finish_reason
+        let last = info(r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#);
+        assert!(last.choices_well_formed && last.has_finish_reason);
+        // 单独的 usage 块：choices 为空，也是合法的
+        let usage_only =
+            info(r#"{"choices":[],"usage":{"prompt_tokens":1,"completion_tokens":1}}"#);
+        assert!(usage_only.choices_well_formed && usage_only.choices_empty);
+        assert!(!usage_only.has_finish_reason);
+        // 畸形：没有 choices、choices 不是数组、元素不是对象
+        for data in [r#"{}"#, r#"{"choices":"x"}"#, r#"{"choices":[1]}"#] {
+            let bad = info(data);
+            assert!(!bad.choices_well_formed, "{data}");
+        }
     }
 
     #[test]
