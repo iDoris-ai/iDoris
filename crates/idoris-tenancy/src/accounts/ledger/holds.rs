@@ -188,6 +188,44 @@ pub(super) fn load_hold(
     .transpose()
 }
 
+/// 这个请求还能不能切换到新的候选（准入序号大于 0 的尝试，在释放任何预留之前先问）。
+///
+/// 契约的 `begin_next_attempt` 在发布边界（已经向客户端输出了第一个字节）之后一律拒绝切换，尝试记录的触发器也拒绝给
+/// 已发布或已关闭的请求追加尝试。账本要在**释放任何东西之前**自己看一遍：发布了的那次尝试是向用户收费的那一次，哪怕它
+/// 还是 `maybe_executed`（流式，usage 还没到，随后按预留价结算），它的预留也不能因为后面又准入了一个候选就被放掉——
+/// 放掉之后它的额度不在账上，之后正金额的结算会报 `ChargeAfterRelease`（PR #600 第二轮 S1 F4）。这时连新的预留也不该占：
+/// 整个准入被拒绝，什么都不写。
+///
+/// 尝试记录表不存在（只开了账本的库），或者这个请求在里面还没有记录时，没有这一层信息，照旧放行。
+pub(super) fn ensure_may_switch(conn: &Connection, request: &RequestId) -> Result<(), LedgerError> {
+    let present: bool = conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'compute_requests')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !present {
+        return Ok(());
+    }
+    let state: Option<(Option<i64>, Option<String>)> = conn
+        .query_row(
+            "SELECT published_attempt, outcome FROM compute_requests WHERE request_id = ?1",
+            [request.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let refuse = |why: &'static str| LedgerError::SwitchRefused {
+        request: request.to_string(),
+        why,
+    };
+    match state {
+        Some((Some(_), _)) => Err(refuse(
+            "the first byte was already published to the client (publish boundary)",
+        )),
+        Some((None, Some(_))) => Err(refuse("the request is already closed")),
+        Some((None, None)) | None => Ok(()),
+    }
+}
+
 /// 一个请求下、序号小于 `below_index` 的、还没收尾的主要预留（切换候选时释放它们）。
 ///
 /// **还在飞的尝试不算失败**：尝试记录（S4 的 `compute_attempts`，和账本在同一个库里）里状态是 `admitted` / `sending`

@@ -43,6 +43,11 @@ pub enum LedgerError {
     /// 预留已经释放（宣告「没有钱要收」），之后又来了一笔要收的钱。
     #[error("hold {hold} was already released; a charge of {requested} micro-units cannot follow")]
     ChargeAfterRelease { hold: String, requested: i64 },
+    /// 这个请求不能再切换到别的候选：已经向客户端输出了第一个字节（发布边界，设计稿 §6），或者请求已经关闭。
+    /// 账本在**释放任何预留之前**先拒绝：发布了的那次尝试是向用户收费的那一次，它的预留不能被放掉，
+    /// 这个请求也不该再占新的预留。整个准入什么都不写。
+    #[error("request {request} cannot switch to another candidate: {why}")]
+    SwitchRefused { request: String, why: &'static str },
     /// 调用方给的输入不合法。
     #[error("invalid ledger input: {0}")]
     Invalid(String),

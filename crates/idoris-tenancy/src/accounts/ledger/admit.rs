@@ -37,8 +37,8 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use super::error::{LedgerError, add};
 use super::holds::{
-    NewAlert, NewHold, hold_id_of, insert_alert, insert_hold_and_reserve, load_hold,
-    release_earlier_attempts, sweep_expired_in,
+    NewAlert, NewHold, ensure_may_switch, hold_id_of, insert_alert, insert_hold_and_reserve,
+    load_hold, release_earlier_attempts, sweep_expired_in,
 };
 use super::period::period_of;
 use super::project::{
@@ -245,7 +245,10 @@ pub(super) fn decide(conn: &Connection, input: &AdmitInput<'_>) -> Result<AdmitP
     }
     // 切换候选：这个请求之前失败的候选不会再是作答的那一次，用户对它们付 0。先放掉它们占的额度，
     // 新候选的检查才看得到（否则余额刚好够一次的孩子会因为上一次失败的尝试还占着额度被拒）。
+    // 但先要确认这个请求**还能切换**：已经发布第一个字节（那一次是向用户收费的）或已经关闭的请求不能，
+    // 这时不放掉任何东西、也不占新的预留（PR #600 第二轮 S1 F4）。
     if input.attempt.index().0 > 0 {
+        ensure_may_switch(conn, input.attempt.request())?;
         release_earlier_attempts(
             conn,
             input.attempt.request(),
