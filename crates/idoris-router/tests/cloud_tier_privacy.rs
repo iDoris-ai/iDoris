@@ -13,9 +13,13 @@
 mod h;
 
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::time::Duration;
 
 use h::*;
-use idoris_router::cloud_tier::CloudTier;
+use idoris_router::cloud::Clock;
+use idoris_router::cloud_tier::{CloudTier, CredentialProvider};
+use idoris_tenancy::cloud_tier::{CallOutcome, CallState};
 use serde_json::json;
 
 const CONSENT: (&str, &str) = ("x-idoris-cloud-fallback", "allow");
@@ -30,15 +34,28 @@ struct Rig {
 }
 
 async fn rig() -> Rig {
+    rig_hooked(
+        |provider| provider,
+        Arc::new(idoris_router::cloud::SystemClock),
+    )
+    .await
+}
+
+/// 同 [`rig`]，但凭证来源和时钟由调用方包一层：测试在「通过闸门之后、出网之前」的某一步做手脚。
+async fn rig_hooked(
+    wrap_provider: impl FnOnce(Arc<dyn CredentialProvider>) -> Arc<dyn CredentialProvider>,
+    clock: Arc<dyn Clock>,
+) -> Rig {
     let cloud = TcpCloud::start().await;
     let dir = tempfile::tempdir().unwrap();
     let state_dir = dir.path().join("cloud-tier");
     let admin = cloud.issue_agent24_admin();
     let code = cloud.mint_pairing_code(&admin, "m-agent-1", 600).await;
     pair_device(&cloud, &state_dir, &code).await.unwrap();
-    let tier = make_tier(
+    let tier = make_tier_with_clock(
         parse_tier_config(&tier_config_yaml(&cloud, Some(&state_dir), "")),
-        paired_provider(&cloud, &state_dir),
+        wrap_provider(paired_provider(&cloud, &state_dir)),
+        clock,
         &dir.path().join("tier.sqlite3"),
     );
     // 配对本身是对云控制面的请求；清掉，之后计数里只剩被测的请求
@@ -425,6 +442,195 @@ async fn the_remote_kill_switch_pins_everything_local() {
     assert_eq!(with.status, 503);
     assert_eq!(with.fingerprint(), without.fingerprint());
     assert_eq!(rig.cloud.log.count(), 0);
+}
+
+// ------------------------------------------------------------------------------------------------
+// 远程熔断以「出网那一刻」的值为准，不是请求进来时的快照（审查 r4 High#1）。
+// 三个窗口各有一个测试，每个测试只对应一道检查：
+//   本机处理期间打开 -> 闸门（第 1 层）读到新值，连凭证都不读；
+//   闸门之后、出网之前打开（读凭证 / 占名额的时候）-> 出网前的第一次复核，不落 pending 行、不写 dispatched 事件；
+//   落 pending 行的时候打开 -> `forward::send` 里最后一道检查，行写成 cancelled。
+// 三种情况调用方拿到的都和没有云端档时逐字节相同（没有出网，连 X-iDoris-Cloud-Attempt 都没有），云端收到 0 个请求。
+// ------------------------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_kill_switch_turned_on_while_the_local_attempt_runs_stops_the_fallback_at_the_gate() {
+    let switch = Arc::new(AtomicBool::new(false));
+    let provider: Arc<std::sync::Mutex<Option<Arc<ProbeProvider>>>> = Default::default();
+    let rig = rig_hooked(
+        {
+            let provider = provider.clone();
+            move |inner| {
+                let counting = ProbeProvider::counting(inner);
+                *provider.lock().unwrap() = Some(counting.clone());
+                counting
+            }
+        },
+        Arc::new(idoris_router::cloud::SystemClock),
+    )
+    .await;
+    let provider = provider.lock().unwrap().clone().unwrap();
+
+    // 请求以 any + 同意进来，那一刻熔断是关的（快照 = 关）；本机加载 `small` 的 400 ms 里熔断被打开；本机随后失败。
+    let mut options = NodeOptions::new(Scenario::RuntimeError, Some(rig.tier.clone()));
+    options.shared_kill_switch = Some(switch.clone());
+    options.local_load_delay = Some(Duration::from_millis(400));
+    let with = LocalNode::build(options)
+        .drive_and_trip_the_kill_switch_while_the_local_load_runs(&[ANY, CONSENT])
+        .await;
+    let mut baseline_options = NodeOptions::new(Scenario::RuntimeError, None);
+    baseline_options.local_load_delay = Some(Duration::from_millis(400));
+    let without = LocalNode::build(baseline_options)
+        .drive_and_trip_the_kill_switch_while_the_local_load_runs(&[ANY, CONSENT])
+        .await;
+
+    assert_ne!(
+        without.status,
+        200,
+        "the scenario must fail locally: {}",
+        without.text()
+    );
+    assert_eq!(
+        with.fingerprint(),
+        without.fingerprint(),
+        "the caller must get exactly what it gets without a cloud tier\nwith:    {}\nwithout: {}",
+        with.text(),
+        without.text()
+    );
+    assert!(with.header("x-idoris-cloud-attempt").is_none());
+    assert_eq!(
+        rig.cloud.log.count(),
+        0,
+        "the cloud received a request although the kill switch was on before the send"
+    );
+    assert_eq!(
+        provider.loads(),
+        0,
+        "the gate must refuse on the live switch, before the credential is even read"
+    );
+    assert_eq!(rig.tier.store().call_count().unwrap(), 0);
+}
+
+#[tokio::test]
+async fn a_kill_switch_turned_on_after_the_gate_but_before_the_send_leaves_no_trace_and_no_request()
+{
+    let switch = Arc::new(AtomicBool::new(false));
+    let provider: Arc<std::sync::Mutex<Option<Arc<ProbeProvider>>>> = Default::default();
+    let rig = rig_hooked(
+        {
+            let provider = provider.clone();
+            let switch = switch.clone();
+            move |inner| {
+                // `load()` 是闸门通过之后的第一步：在这里把熔断打开
+                let tripping = ProbeProvider::tripping(inner, switch);
+                *provider.lock().unwrap() = Some(tripping.clone());
+                tripping
+            }
+        },
+        Arc::new(idoris_router::cloud::SystemClock),
+    )
+    .await;
+    let provider = provider.lock().unwrap().clone().unwrap();
+
+    let mut options = NodeOptions::new(Scenario::RuntimeOffline, Some(rig.tier.clone()));
+    options.shared_kill_switch = Some(switch.clone());
+    options.with_event_log = true;
+    let node = LocalNode::build(options);
+    let with = node.drive(&[ANY, CONSENT]).await;
+    let without = baseline(Scenario::RuntimeOffline)
+        .drive(&[ANY, CONSENT])
+        .await;
+
+    assert_eq!(with.status, 503, "{}", with.text());
+    assert_eq!(
+        with.fingerprint(),
+        without.fingerprint(),
+        "nothing left the machine, so not even the additive attempt header may appear"
+    );
+    assert_eq!(provider.loads(), 1, "the request must have got this far");
+    assert!(
+        switch.load(std::sync::atomic::Ordering::SeqCst),
+        "the hook must have tripped the switch"
+    );
+    assert_eq!(
+        rig.cloud.log.count(),
+        0,
+        "the cloud received a request although the kill switch was on before the send"
+    );
+    // 没有任何副作用：没有 pending 行，没有 dispatched 事件（没有一个有头无尾的出网尝试）
+    assert_eq!(
+        rig.tier.store().call_count().unwrap(),
+        0,
+        "a call that never left must not leave a row"
+    );
+    let local_id = with.header("x-idoris-record-id").unwrap().to_string();
+    let events = node
+        .event_log
+        .as_ref()
+        .unwrap()
+        .events_for_record(Some("personal"), &local_id)
+        .unwrap();
+    assert!(
+        events
+            .iter()
+            .all(|event| event.event.event_type.as_str() != "dispatched"),
+        "a dispatched event was written for a call that never left"
+    );
+}
+
+#[tokio::test]
+async fn a_kill_switch_turned_on_while_the_pending_row_is_written_still_stops_the_send() {
+    let switch = Arc::new(AtomicBool::new(false));
+    // 落 pending 行（`record_begin`）是出网之前最后几步之一，它第一次读时钟：在这里把熔断打开
+    let clock = TrippingClock::new(switch.clone());
+    let rig = rig_hooked(|provider| provider, clock.clone()).await;
+
+    let mut options = NodeOptions::new(Scenario::RuntimeOffline, Some(rig.tier.clone()));
+    options.shared_kill_switch = Some(switch.clone());
+    options.with_event_log = true;
+    let node = LocalNode::build(options);
+    let with = node.drive(&[ANY, CONSENT]).await;
+    let without = baseline(Scenario::RuntimeOffline)
+        .drive(&[ANY, CONSENT])
+        .await;
+
+    assert_eq!(with.status, 503, "{}", with.text());
+    assert_eq!(
+        with.fingerprint(),
+        without.fingerprint(),
+        "nothing left the machine, so not even the additive attempt header may appear"
+    );
+    assert!(clock.calls() >= 1, "the request must have got this far");
+    assert_eq!(
+        rig.cloud.log.count(),
+        0,
+        "the cloud received a request although the kill switch was on before the send"
+    );
+    // 行已经落下了（先写后出网）：它必须有终态，不能一直 pending；没有出网、没有答复、没有云端 id、没有金额
+    let rows = rig.tier.store().calls_after(0, 10).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].state, CallState::Final(CallOutcome::Cancelled));
+    assert_eq!(
+        (
+            rows[0].cloud_record_id.clone(),
+            rows[0].http_status,
+            rows[0].tokens_in,
+            rows[0].tokens_out
+        ),
+        (None, None, None, None)
+    );
+    // 事件流不留一个有头无尾的出网尝试：dispatched 写了，就补一个失败的 completed
+    let events = node
+        .event_log
+        .as_ref()
+        .unwrap()
+        .events_for_record(Some("personal"), &rows[0].local_request_id)
+        .unwrap();
+    let completed = events
+        .iter()
+        .find(|event| event.event.event_type.as_str() == "completed")
+        .expect("a dispatched event needs its completed event");
+    assert_eq!(completed.event.metadata["status"], "failure");
 }
 
 #[tokio::test]

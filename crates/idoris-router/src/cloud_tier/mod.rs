@@ -583,7 +583,10 @@ pub(crate) struct FallbackScope<'a> {
     headers: &'a HeaderMap,
     body: &'a Value,
     parsed: &'a ParsedProfile,
-    privacy: PrivacyFacts,
+    /// 内容检查写回之后的有效隐私类别（请求进来时就定了，之后不会变）。
+    effective_privacy: Option<PrivacyClass>,
+    /// 内容检查把这个请求钉成了本地（同上，请求进来时就定了）。
+    pinned_local_by_content: bool,
     content_tightened: bool,
     prompt: &'a str,
     completion_tokens: u64,
@@ -623,14 +626,8 @@ impl<'a> FallbackScope<'a> {
             headers: inputs.headers,
             body: inputs.body,
             parsed: inputs.parsed,
-            privacy: PrivacyFacts {
-                effective: inputs.parsed.task.privacy,
-                pinned_local_by_content: inputs.pinned_local_by_content,
-                kill_switch: inputs
-                    .state
-                    .remote_kill_switch
-                    .load(std::sync::atomic::Ordering::SeqCst),
-            },
+            effective_privacy: inputs.parsed.task.privacy,
+            pinned_local_by_content: inputs.pinned_local_by_content,
             content_tightened: inputs.content_tightened,
             prompt: inputs.prompt,
             completion_tokens: inputs.completion_tokens,
@@ -640,6 +637,24 @@ impl<'a> FallbackScope<'a> {
             dispatched: inputs.dispatched,
             completed: inputs.completed,
         })
+    }
+
+    /// 远程熔断开关**此刻**的值。熔断是个共享的原子变量，随时可能被打开：每一次要做「能不能出网」的判断都现读，不留快照。
+    /// （以前这里在请求进来时读一次存起来，回落时直接用：请求以 `any` + 同意进来、本机处理期间熔断被打开、本机随后失败，
+    /// 回落仍然会把正文发往云端——审查 r4 High#1。）
+    fn kill_switch_on(&self) -> bool {
+        self.state
+            .remote_kill_switch
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// 闸门的隐私事实：隐私类别和内容检查的结论请求进来时就定了；熔断现读。
+    fn privacy_facts(&self) -> PrivacyFacts {
+        PrivacyFacts {
+            effective: self.effective_privacy,
+            pinned_local_by_content: self.pinned_local_by_content,
+            kill_switch: self.kill_switch_on(),
+        }
     }
 
     fn role_name(&self) -> Option<&'static str> {
@@ -673,7 +688,7 @@ pub(crate) async fn fallback(
     let tier = scope.tier;
     let cloud_model = tier.config.cloud_model_for(scope.role_name());
     let input = GateInput {
-        privacy: scope.privacy,
+        privacy: scope.privacy_facts(),
         dev_no_key: scope.dev_no_key,
         consent: gate::consent(scope.headers),
         stream: scope.wants_stream(),
@@ -700,6 +715,11 @@ pub(crate) async fn fallback(
     let Ok(_slot) = tier.slots.clone().try_acquire_owned() else {
         return annotate(original, "saturated");
     };
+    // 出网前的第一次复核：闸门放行之后，读凭证、占名额期间远程熔断可能已经被打开。还没有任何副作用（没写审计事件、
+    // 没落 pending 行），所以这里拦下来什么都不留；调用方拿到的和没有云端档时逐字节相同。
+    if scope.kill_switch_on() {
+        return original;
+    }
     let body = tier.cloud_body(scope.body, cloud_model);
     if let Some(context) = scope.dispatched
         && crate::append_dispatched(context, &selected).await.is_err()
@@ -723,6 +743,8 @@ pub(crate) async fn fallback(
         &loaded.secret,
         &body,
         &cancel,
+        // 出网边界上的最后一道门：写审计事件、落 pending 行又隔了几个让出点，熔断可能在这期间被打开
+        &|| !scope.kill_switch_on(),
     )
     .await;
     drop(loaded);
@@ -762,6 +784,25 @@ pub(crate) async fn fallback(
             }
             complete_event(scope, &selected, "success").await;
             served_response(&selected, answer)
+        }
+        // 最后一道门把它拦下了：**没有任何字节离开本机**。行已经落下了（先写后出网），写成 cancelled（没有答复、没有云端 id、
+        // 没有金额）；事件流补一个失败的 completed。调用方拿到本机原来的失败响应，一个字节都不改，连 X-iDoris-Cloud-Attempt
+        // 都没有——那个头的意思是「数据可能已经离开本机」，这里没有。
+        Err(forward::CloudFailure::Withheld) => {
+            let withheld = OwnedFinish {
+                outcome: CallOutcome::Cancelled,
+                finished_at_ms: tier.now_ms(),
+                cloud_record_id: None,
+                http_status: None,
+                cloud_reason: None,
+                tokens_in: None,
+                tokens_out: None,
+            };
+            if let Err(error) = tier.record_finish(ticket, withheld).await {
+                eprintln!("[idoris] 云端档：熔断拦下了发送，但无法写入调用结局（{error}）");
+            }
+            complete_event(scope, &selected, "failure").await;
+            original
         }
         Err(failure) => {
             let outcome = failure.outcome();

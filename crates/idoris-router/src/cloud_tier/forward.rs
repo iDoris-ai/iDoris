@@ -84,6 +84,8 @@ pub enum CloudFailure {
     },
     /// 传输层在请求发出之后出了别的错（连接中途被重置……）：请求可能已经到达。
     Transport,
+    /// 出网前的最后一道检查（远程熔断）把请求拦下了：**没有任何字节离开本机**。
+    Withheld,
 }
 
 impl CloudFailure {
@@ -95,6 +97,8 @@ impl CloudFailure {
             CloudFailure::Cancelled => CallOutcome::Cancelled,
             CloudFailure::Answered { outcome, .. } => *outcome,
             CloudFailure::Transport => CallOutcome::CloudError,
+            // 记成 cancelled：这一行在发送之前就落下了（先写后出网），它必须有终态；没有答复、没有云端 id、没有金额
+            CloudFailure::Withheld => CallOutcome::Cancelled,
         }
     }
 }
@@ -171,6 +175,11 @@ fn classify_transport(error: &reqwest::Error) -> CloudFailure {
 }
 
 /// 发请求。`_permit` 是出网凭条（只有 `gate::grant` 能造）：没有它就发不了。
+///
+/// `still_allowed` 是**出网边界上的最后一道门**：请求构造好之后、第一次真正去发之前调用，返回 `false` 就什么都不发
+/// （[`CloudFailure::Withheld`]）。凭条只证明「闸门在某一刻放行过」，而放行到发出之间隔着读凭证、占名额、写审计事件、
+/// 落 `pending` 行这些让出点，远程熔断可能在这期间被打开（它是个共享的原子变量）；调用方在这里给出**此刻**的答案，
+/// 而不是闸门那一刻的快照。检查是 `run` 被 poll 的第一件事，和 `request.send()` 之间没有任何让出点。
 pub async fn send(
     client: &reqwest::Client,
     config: &CloudTierConfig,
@@ -178,6 +187,7 @@ pub async fn send(
     credential: &CloudCredential,
     body: &Value,
     cancel: &CancellationToken,
+    still_allowed: &(dyn Fn() -> bool + Sync),
 ) -> Result<CloudAnswer, CloudFailure> {
     let bytes = serde_json::to_vec(body).map_err(|_| CloudFailure::Transport)?;
     let request = client
@@ -189,6 +199,9 @@ pub async fn send(
         .header(USER_AGENT, USER_AGENT_VALUE)
         .body(bytes);
     let run = async {
+        if !still_allowed() {
+            return Err(CloudFailure::Withheld);
+        }
         let response = request
             .send()
             .await
@@ -365,6 +378,7 @@ mod tests {
             &CloudCredential::parse(&secret()).unwrap(),
             &json!({"model": "idoris/agent", "messages": [{"role": "user", "content": "hi"}]}),
             &CancellationToken::new(),
+            &|| true,
         )
         .await
     }
@@ -698,6 +712,7 @@ mod tests {
             &CloudCredential::parse(&secret()).unwrap(),
             &json!({}),
             &CancellationToken::new(),
+            &|| true,
         )
         .await;
         assert_eq!(outcome.unwrap_err(), CloudFailure::Unreachable);
@@ -719,6 +734,7 @@ mod tests {
             &CloudCredential::parse(&secret()).unwrap(),
             &json!({}),
             &CancellationToken::new(),
+            &|| true,
         )
         .await;
         assert_eq!(outcome.unwrap_err(), CloudFailure::Timeout);
@@ -747,11 +763,54 @@ mod tests {
             &CloudCredential::parse(&secret()).unwrap(),
             &json!({}),
             &cancel,
+            &|| true,
         )
         .await;
         assert_eq!(outcome.unwrap_err(), CloudFailure::Cancelled);
         assert!(started.elapsed() < Duration::from_secs(3));
         assert_eq!(CloudFailure::Cancelled.outcome(), CallOutcome::Cancelled);
+    }
+
+    #[tokio::test]
+    async fn a_request_the_last_guard_refuses_is_not_sent_at_all() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("x-idoris-record-id", "rec-1")
+                    .set_body_raw(ok_body().to_string(), "application/json"),
+            )
+            .mount(&server)
+            .await;
+        let config = config(&server, "");
+        let outcome = send(
+            &client(&config),
+            &config,
+            permit(),
+            &CloudCredential::parse(&secret()).unwrap(),
+            &json!({"model": "idoris/agent", "messages": []}),
+            &CancellationToken::new(),
+            &|| false,
+        )
+        .await;
+        assert_eq!(outcome.unwrap_err(), CloudFailure::Withheld);
+        assert!(
+            server.received_requests().await.unwrap().is_empty(),
+            "a refused request must not reach the network"
+        );
+        // 对照：同样的请求，最后一道门放行就发出去
+        let served = send(
+            &client(&config),
+            &config,
+            permit(),
+            &CloudCredential::parse(&secret()).unwrap(),
+            &json!({"model": "idoris/agent", "messages": []}),
+            &CancellationToken::new(),
+            &|| true,
+        )
+        .await;
+        assert!(served.is_ok());
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
     }
 
     #[test]
@@ -762,6 +821,8 @@ mod tests {
         );
         assert_eq!(CloudFailure::Timeout.outcome(), CallOutcome::Timeout);
         assert_eq!(CloudFailure::Transport.outcome(), CallOutcome::CloudError);
+        // 没出网的那一行也必须有终态：记成 cancelled（没有答复、没有云端 id、没有金额）
+        assert_eq!(CloudFailure::Withheld.outcome(), CallOutcome::Cancelled);
         assert_eq!(
             CloudFailure::Answered {
                 outcome: CallOutcome::RateLimited,
