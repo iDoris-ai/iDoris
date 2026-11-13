@@ -16,6 +16,7 @@ import { parseArgs } from "node:util";
 import {
   buildJudgeUserPayload,
   buildRequestBody,
+  parseExtraBody,
   evaluateRunPlan,
   formatSummary,
   judgeScore,
@@ -48,6 +49,7 @@ export function printHelp() {
     "  EVAL_BASE_URL   OpenAI 兼容根路径，含 /v1，例如 http://127.0.0.1:8088/v1",
     "  EVAL_API_KEY    Bearer 令牌。不会写入结果，也不会打印。",
     "  EVAL_MODEL      模型名，用于请求体和结果文件名。",
+    "  EVAL_EXTRA_BODY 可选。JSON 对象，合并进请求体（不能覆盖 model/messages/stream/tools/tool_choice）。",
     "  EVAL_TIMEOUT_MS 单条超时毫秒。命令行 --timeout（秒）优先。默认 120 秒。",
     "  JUDGE_BASE_URL  可选。与 JUDGE_API_KEY、JUDGE_MODEL 同时设置才启用 judge。",
     "  JUDGE_API_KEY   可选。只从环境变量读取，不落盘、不打印。",
@@ -198,6 +200,12 @@ async function run(argv, env, io, stopSignal) {
     return { exitCode: 1, report };
   }
 
+  const extra = parseExtraBody(env.EVAL_EXTRA_BODY);
+  if (extra.error) {
+    io.error(extra.error);
+    return { exitCode: 1, report: extra.error };
+  }
+
   const secrets = collectSecrets([apiKey, judgeEnv.apiKey], [baseUrl, judgeEnv.baseUrl]);
   const judgePrompt = judgeEnv.enabled ? (await readFile(JUDGE_PROMPT_PATH, "utf8")).trim() : null;
   const started = new Date();
@@ -214,7 +222,7 @@ async function run(argv, env, io, stopSignal) {
         () => postChat({
           baseUrl,
           apiKey,
-          body: buildRequestBody(item, model),
+          body: buildRequestBody(item, model, extra.extraBody),
           timeoutMs: timeout.timeoutMs,
           stopSignal,
           secrets,
@@ -289,6 +297,7 @@ async function run(argv, env, io, stopSignal) {
     interrupted,
     judge: { enabled: judgeEnv.enabled, model: judgeEnv.enabled ? judgeEnv.model : null },
     started_at: started.toISOString(),
+    extra_body: extra.extraBody,
     finished_at: finished.toISOString(),
     case_files: loaded.files,
     case_count: selection.cases.length,

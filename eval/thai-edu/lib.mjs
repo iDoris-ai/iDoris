@@ -539,8 +539,30 @@ export function buildMessages(item) {
   return messages;
 }
 
-export function buildRequestBody(item, model) {
+// 用例和协议决定的字段：EVAL_EXTRA_BODY 不能覆盖。
+const PROTECTED_BODY_KEYS = new Set(["model", "messages", "stream", "tools", "tool_choice"]);
+
+// EVAL_EXTRA_BODY：可选 JSON 对象，合并进每个请求体，例如关闭思考模式
+// {"chat_template_kwargs":{"enable_thinking":false}}。不能覆盖 PROTECTED_BODY_KEYS。
+export function parseExtraBody(raw) {
+  if (raw == null || String(raw).trim() === "") return { extraBody: {} };
+  let value;
+  try {
+    value = JSON.parse(raw);
+  } catch {
+    return { error: "EVAL_EXTRA_BODY 必须是 JSON 对象" };
+  }
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    return { error: "EVAL_EXTRA_BODY 必须是 JSON 对象" };
+  }
+  const clash = Object.keys(value).filter((key) => PROTECTED_BODY_KEYS.has(key));
+  if (clash.length > 0) return { error: `EVAL_EXTRA_BODY 不能覆盖: ${clash.join(", ")}` };
+  return { extraBody: value };
+}
+
+export function buildRequestBody(item, model, extraBody = {}) {
   const body = {
+    ...extraBody,
     model,
     messages: buildMessages(item),
     temperature: 0,

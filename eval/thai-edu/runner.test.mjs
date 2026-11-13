@@ -8,8 +8,10 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 
 import {
+  buildRequestBody,
   evaluateRunPlan,
   formatSummary,
+  parseExtraBody,
   judgeScore,
   loadCases,
   parseJudgeVerdict,
@@ -505,3 +507,18 @@ function startServer(handler) {
     server.on("error", reject);
   });
 }
+
+test("EVAL_EXTRA_BODY merges into the body but cannot override protected fields", () => {
+  assert.deepEqual(parseExtraBody(undefined), { extraBody: {} });
+  assert.deepEqual(parseExtraBody("  "), { extraBody: {} });
+  assert.ok(parseExtraBody("[1]").error);
+  assert.ok(parseExtraBody("null").error);
+  assert.ok(parseExtraBody("{bad").error);
+  assert.match(parseExtraBody('{"model":"x","stream":true}').error, /model, stream/);
+  const { extraBody } = parseExtraBody('{"chat_template_kwargs":{"enable_thinking":false}}');
+  const body = buildRequestBody({ prompt: "hi" }, "m", extraBody);
+  assert.equal(body.model, "m");
+  assert.equal(body.stream, false);
+  assert.deepEqual(body.chat_template_kwargs, { enable_thinking: false });
+  assert.equal(buildRequestBody({ prompt: "hi" }, "m").chat_template_kwargs, undefined);
+});
