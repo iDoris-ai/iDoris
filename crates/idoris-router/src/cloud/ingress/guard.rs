@@ -8,14 +8,17 @@
 //!     request_lifecycle     TCP 对端地址、客户端断开 -> 取消
 //!       edge_guard          客户端来源（受信代理）、CORS 预检与响应头
 //!         ── 路由：没有的路径 / 方法在这里就是 404，不认证、不碰库 ──
-//!           data_plane_guard  认证 -> 成员 id -> 付款上下文与租户 -> 三级上限 -> 读请求体 -> 处理函数
+//!           data_plane_guard  认证前的有界工作 -> 认证 -> 成员 id -> 付款上下文与租户 -> 三级上限 -> 读请求体 -> 处理函数
 //! ```
 //!
 //! `data_plane_guard` 里面的顺序是有讲究的（一步一步，前一步不过就不做后一步）：
 //!
 //! 1. **凭证格式**：没有 / 格式不对的凭证 -> 只扣「没有凭证」的限流器（来源软配额 + 全局总配额），401；不碰库。
 //! 2. **失败前缀预检**：这个凭证前缀最近认证失败太多 -> 429 `auth_throttled`；不碰库。
+//!    **认证前的有界工作**（`abuse::AuthBudget`）：同时在途的认证查询个数、「最近没有认证成功过的前缀」的查询预算；
+//!    满了 -> 429 `auth_capacity_limited`；不碰库。随机假凭证（前缀各不相同）靠这一道挡住：上一道只认同一个前缀。
 //! 3. **认证**（虚拟 key + S2 的凭证闸门，每次请求读库、不缓存）：失败 -> 记一次失败、401（不透明：不告诉是哪种失败）。
+//!    认证之后限流用的时间**重新读**（认证可能排了很久队），并且用单调时间。
 //! 4. **成员 id**（`X-iDoris-Member`）格式：不合法 -> 400。
 //! 5. **付款上下文 + 租户 + 数据处理要求**（`caller`）：失败 -> 401 / 403 / 503，**不回落**。
 //! 6. **三级上限**（成员 -> 租户 -> 平台）：被限 -> 429，带 `Retry-After` 和 `X-iDoris-Limit-Scope`。
@@ -71,6 +74,9 @@ fn throttle(reason: IngressReason, scope: Option<&'static str>, retry_after_secs
     let remediation = match reason {
         IngressReason::AuthThrottled => {
             "too many failed authentications for this credential; wait and retry"
+        }
+        IngressReason::AuthCapacityLimited => {
+            "too many authentications are in progress right now; wait and retry"
         }
         IngressReason::AnonymousRateLimited => {
             "too many requests without a valid credential; wait and retry"
@@ -151,6 +157,13 @@ pub(super) async fn edge_guard(
     mut request: Request,
     next: Next,
 ) -> Response {
+    // 不变量（debug / 测试构建里核对）：最外层的 `strip_untrusted_headers` 已经把 `X-iDoris-Tenant` 删掉了。
+    // 云入口自己不读这个头，删不删从 HTTP 上看不出区别，所以光靠行为测试抓不到「有人把外层的删除拿掉」——
+    // 这里的断言让带着这个头的任何一个测试请求在那种情况下立刻红（PR-Daemon 评审的变异 M7）。
+    debug_assert!(
+        !request.headers().contains_key("x-idoris-tenant"),
+        "X-iDoris-Tenant must be stripped at the outermost layer"
+    );
     let peer = request
         .extensions()
         .get::<crate::connection::RequestLifecycle>()
@@ -200,7 +213,8 @@ pub(super) async fn data_plane_guard(
     request: Request,
     next: Next,
 ) -> Response {
-    let now = ingress.clock.now();
+    // 两种时间读数：墙上时间（凭证过期这类要和账户库里的时刻比），和单调时间（限流的令牌桶、失败计数的窗口）。
+    // 限流只用单调时间：墙上时钟被拨回，不会让桶以为时间倒流、也不会凭空补出额度。
     let source = request
         .extensions()
         .get::<ClientAddr>()
@@ -209,30 +223,52 @@ pub(super) async fn data_plane_guard(
     // 1. 凭证格式。没有凭证的请求没有任何人需要保护：只扣没有凭证的限流器，不碰库。
     let secret = match crate::auth::bearer_secret(request.headers()) {
         Ok(secret) => secret,
-        Err(_) => return deny_unauthenticated(&ingress, source, now.0),
+        Err(_) => return deny_unauthenticated(&ingress, source, ingress.clock.monotonic_ms()),
     };
     let prefix = ingress.failures.key_of(secret.expose_secret());
 
     // 2. 失败前缀预检（内存里，不碰库）。键是凭证前缀，**不是**来源地址：同一个出口后面别的学生的凭证前缀不同，不受影响。
     if let Some(prefix) = prefix
-        && let Err(retry_after) = ingress.failures.check(prefix, now.0)
+        && let Err(retry_after) = ingress.failures.check(prefix, ingress.clock.monotonic_ms())
     {
         return throttle(IngressReason::AuthThrottled, None, retry_after);
     }
 
+    // 2b. 认证之前的有界工作（R2 High#4）：随机的假凭证（格式合法、前缀各不相同）上面两道闸都拦不住——它们只在认证
+    // **失败之后**才计数，每个假凭证照样要进 `spawn_blocking`、抢认证存储的锁、查一次 SQLite。所以认证查询本身要有
+    // 上限：同时在途的个数，以及「最近没有认证成功过的凭证前缀」的查询预算；满了直接拒绝，不碰库。
+    // 不按来源地址：在用的凭证（最近认证成功过）不消耗预算，一个学校的共享出口不会因为别人发垃圾请求而被误伤。
+    let auth_slot = match ingress
+        .auth_budget
+        .admit(prefix, ingress.clock.monotonic_ms())
+    {
+        Ok(slot) => slot,
+        Err(retry_after) => {
+            return throttle(IngressReason::AuthCapacityLimited, None, retry_after);
+        }
+    };
+
     // 3. 认证。
-    let identity = match ingress.authenticator.authenticate(request.headers()).await {
+    let authenticated = ingress.authenticator.authenticate(request.headers()).await;
+    drop(auth_slot);
+    // 认证是异步的、可能排了很久队：之后限流和判过期用的时间**重新读**，不用认证之前读到的（乱序完成的请求带着
+    // 过期的时间读数去限流，会让令牌桶把同一段时间补两次额度）。
+    let now = ingress.clock.now();
+    let mono = ingress.clock.monotonic_ms();
+    let identity = match authenticated {
         Ok(identity) => identity,
         Err(VirtualKeyAuthError::Unauthorized) => {
             if let Some(prefix) = prefix {
-                ingress.failures.record_failure(prefix, now.0);
+                ingress.failures.record_failure(prefix, mono);
+                ingress.auth_budget.record_failure(prefix);
             }
-            return deny_unauthenticated(&ingress, source, now.0);
+            return deny_unauthenticated(&ingress, source, mono);
         }
         Err(VirtualKeyAuthError::Unavailable) => return unavailable(),
     };
     if let Some(prefix) = prefix {
         ingress.failures.record_success(prefix);
+        ingress.auth_budget.record_success(prefix);
     }
 
     // 4. 成员 id 的格式。
@@ -261,11 +297,12 @@ pub(super) async fn data_plane_guard(
         Err(_) => return unavailable(),
     };
 
-    // 6. 三级上限（成员 -> 租户 -> 平台）。
-    let permit = match ingress
-        .limiter
-        .admit(&resolved.keys, &resolved.limits, now.0)
-    {
+    // 6. 三级上限（成员 -> 租户 -> 平台）。时间在限流这一刻重新读（`resolve` 也是 spawn_blocking，可能排过队）。
+    let permit = match ingress.limiter.admit(
+        &resolved.keys,
+        &resolved.limits,
+        ingress.clock.monotonic_ms(),
+    ) {
         Ok(permit) => permit,
         Err(denied) => return limited(denied),
     };

@@ -32,7 +32,7 @@
 //!     base_url: https://api.example.invalid/v1   # https；只有回环地址允许 http
 //!     api_key_env: EXAMPLE_PROVIDER_API_KEY      # 或 api_key_file: /run/secrets/example-provider
 //!     supplier_request_id_header: x-request-id   # 可选：供应商请求号也从这个头里找（正文里的 id 优先）
-//!     extra_body: {provider: {zdr: true}}        # 可选：固定附加字段，盖在客户端字段之上
+//!     extra_body: {provider: {zdr: true}}        # 可选：固定附加字段，盖在客户端字段之上；不能含 model / max_tokens / stream / n / messages / tools / user / store 等协议、计费、身份、留存字段（加载时拒绝）
 //!     price_version: pv-2026-11                  # 价格版本标签，随每次尝试记录，对账用
 //!     cost:   {unit: USD, input_per_mtok: "0.26", output_per_mtok: "0.38", cached_input_per_mtok: "0.13"}
 //!     prices:                                    # 对用户的价：按付款账户的单位各给一份
@@ -48,7 +48,7 @@
 //!     credential_id: cred-agent24
 //!     payer_account: acct-agent24
 //!     unit: USD
-//!     billing: paid                              # paid | subsidized | unbilled
+//!     billing: paid                              # paid | subsidized（unbilled 没有实现，加载时拒绝）
 //!     data_classes: [adult]                      # child_edu | adult | public
 //!     allowed_regions: [sg-1]                    # 可选；不写 = 不限区域
 //!     max_retention: with_exceptions             # zdr | with_exceptions | retained（含 child_edu 时固定 zdr）
@@ -81,6 +81,7 @@ use idoris_compute_contracts::request::MAX_ATTEMPTS_PER_REQUEST;
 use idoris_compute_contracts::reserve::ReservePolicy;
 use idoris_upstream::cloud::{
     CloudEndpointClient, CloudEndpointSettings, FileCredentialSource, build_http_client,
+    reserved_extra_body_field,
 };
 use idoris_upstream::remote::{CredentialSource, EnvCredentialSource};
 use serde::de::{self, Visitor};
@@ -578,10 +579,108 @@ pub(crate) fn build_credentials(
     }
 }
 
+/// 端点许可表里**已有行的供应商**，和它们的 API 主机（`config/compute/endpoint-urls.md`，查询日期 2026-11-12；`*.` 开头的
+/// 条目匹配任何子域名）。
+///
+/// 为什么：许可表（区域、留存、DPA、允许的数据类别）核验的是**某个供应商的某个端点**，而云上游配置里的 `base_url` 是运维
+/// 手写的，两边之间原来没有任何绑定：配置里把 `deepinfra` 这一行的 `base_url` 写成别的主机，孩子的数据就会带着
+/// 「已核验」的标签发往一个没人核验过的主机。现在这些供应商的 `base_url` 主机必须在表里。
+///
+/// 范围（有意收窄，需要 owner 确认更彻底的做法）：
+/// - 回环地址永远允许（本机测试用的假上游）；
+/// - 表里**没有**的供应商标签（测试里的 `example-*`、以后新增的行）不受限：这里只绑定今天已经核验过的行；
+/// - 完整 URL / 主机**没核实**的供应商（`together`、`google-vertex`、`siliconflow`、`moonshot`）：主机列表是空的，
+///   这些行不能配置到任何非回环地址（草案没给出可核对的主机，不补一个猜出来的）。
+const VERIFIED_PROVIDER_HOSTS: &[(&str, &[&str])] = &[
+    ("deepinfra", &["api.deepinfra.com"]),
+    ("openrouter", &["openrouter.ai"]),
+    ("deepseek-official", &["api.deepseek.com"]),
+    ("groq", &["api.groq.com"]),
+    ("opentyphoon", &["api.opentyphoon.ai"]),
+    ("fireworks", &["api.fireworks.ai", "us.api.fireworks.ai"]),
+    (
+        "alibaba-model-studio-intl",
+        &["*.ap-southeast-1.maas.aliyuncs.com"],
+    ),
+    ("together", &[]),
+    ("google-vertex", &[]),
+    ("siliconflow", &[]),
+    ("moonshot", &[]),
+];
+
+fn host_is_loopback(host: &str) -> bool {
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    host.eq_ignore_ascii_case("localhost")
+        || bare
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
+fn host_matches(host: &str, pattern: &str) -> bool {
+    match pattern.strip_prefix("*.") {
+        Some(suffix) => {
+            host.len() > suffix.len() + 1
+                && host
+                    .to_ascii_lowercase()
+                    .ends_with(&format!(".{}", suffix.to_ascii_lowercase()))
+        }
+        None => host.eq_ignore_ascii_case(pattern),
+    }
+}
+
+/// 许可表里已核验的供应商，`base_url` 的主机必须是它核验过的 API 主机（见 [`VERIFIED_PROVIDER_HOSTS`]）。
+pub(crate) fn check_provider_host(key: &EndpointKey, base_url: &str) -> Result<(), String> {
+    // URL 本身不合法由客户端的构造函数报（那边的错误更具体）
+    let Ok(url) = idoris_upstream::cloud::validate_base_url(base_url) else {
+        return Ok(());
+    };
+    let Some(host) = url.host_str() else {
+        return Ok(());
+    };
+    if host_is_loopback(host) {
+        return Ok(());
+    }
+    let Some((_, hosts)) = VERIFIED_PROVIDER_HOSTS
+        .iter()
+        .find(|(provider, _)| *provider == key.provider.as_str())
+    else {
+        return Ok(());
+    };
+    if hosts.iter().any(|pattern| host_matches(host, pattern)) {
+        return Ok(());
+    }
+    Err(bad(format!(
+        "端点 {key} 的 base_url 主机 {host} 不是许可表为供应商 {} 核验过的 API 主机（{}）：\
+         许可表核验的是这个供应商的端点，数据不能带着「已核验」的标签发往别的主机",
+        key.provider,
+        if hosts.is_empty() {
+            "这个供应商的主机没有核实，不能配置到非回环地址".to_string()
+        } else {
+            hosts.join(", ")
+        }
+    )))
+}
+
+/// `billing: unbilled`（不计费）在云形态**没有实现**，加载配置时直接拒绝（失败即关闭）。
+///
+/// 准入账本、预留、结算都不认这个计费性质：只有许可表筛选和请求记录里会看到它。配置成 `unbilled` 的租户，请求照样
+/// 预留、照样向用户记 `user_price`、照样扣余额；流式请求还会因此免掉「必须有流式 usage」的端点约束，
+/// 结算时按整笔预留收费。所以与其让一个名字叫「不计费」的配置悄悄收钱，不如启动失败。
+/// 要免费请用 `subsidized`（补贴池出钱，设计稿 §4）。
+pub(crate) fn reject_unbilled(what: &str, billing: Billing) -> Result<(), String> {
+    if billing == Billing::Unbilled {
+        return Err(bad(format!(
+            "{what}: unbilled 在云形态没有实现（准入、预留和结算都不认它：用户额度照扣）；要免费请用 subsidized"
+        )));
+    }
+    Ok(())
+}
+
 /// 用静态配置里的调用方，经 S0 的 `resolve_payment_context` 得到付款上下文：账户树只有「平台 -> 该组织账户」，
 /// 凭证是绑定到该组织账户的节点凭证（`CredentialBinding::Node`）。付款上下文只能由契约的这个入口产生，
 /// 这里不绕过它。S1/S2/S5 落地后换成账户库里真实的账户、凭证与成员关系。
 fn build_caller(config: &CallerConfig, now: TimestampMs) -> Result<CallerPolicy, String> {
+    reject_unbilled("callers.billing", config.billing)?;
     let unit = parse_unit("callers.unit", &config.unit)?;
     if !unit.is_currency() {
         return Err(bad(
@@ -740,6 +839,17 @@ pub fn parse_with_ingress_tenants(
                 "端点 {key} 不在端点许可表里：表外的端点永远不会被选中，这几乎一定是拼写错误"
             )));
         }
+        // 许可表核验的是这个供应商的端点：`base_url` 的主机必须是它核验过的 API 主机（见 `VERIFIED_PROVIDER_HOSTS`）
+        check_provider_host(&key, &endpoint.base_url)?;
+        // `extra_body` 盖在客户端字段之上，但不能碰协议 / 计费 / 身份 / 留存字段：准入与许可检查是按「这个模型、
+        // 这个 `max_tokens`」算好的，被它改掉就绕过了许可表和预留（见 `idoris_upstream::cloud::wire`）。
+        if let Some(field) = reserved_extra_body_field(&endpoint.extra_body) {
+            return Err(bad(format!(
+                "端点 {key} 的 extra_body 不能包含 {field}：model、max_tokens、stream、n、messages、tools、user、store 一类\
+                 协议 / 计费 / 身份 / 留存字段由请求自己决定（准入时算好的值），extra_body 只用来放供应商自己的路由或策略参数\
+                 （比如 provider: {{zdr: true}}）"
+            )));
+        }
         let mut settings =
             CloudEndpointSettings::new(&endpoint.base_url, endpoint.provider.clone());
         if let Some(header) = &endpoint.supplier_request_id_header {
@@ -886,6 +996,38 @@ pub fn parse_with_ingress_tenants(
         },
         reserve_policy,
     })
+}
+
+/// **生产启动的额外要求**（PR-Daemon B3，**需要 owner 确认**）：有处理儿童数据的调用方 / 租户（静态调用方簿里的，或云入口
+/// 配置里声明的）就必须配 LLM 安全检查器（`safety.mode: rules_and_llm`）；只有规则检查器启动失败。
+///
+/// 为什么：规则检查器是关键词 / 正则，换个字体（数学粗体字母）、西里尔字母的 o、拉长拼写（`boooomb`）、base64、
+/// 藏在工具描述里的有害内容都能绕过输入规则；儿童数据不该把这道防线只押在它上面。以前只是启动时留一行警告
+/// （`rules_only` 必须显式写出来），现在是错误。
+///
+/// 不放进 [`parse_with_ingress_tenants`]：它是各种测试夹具共用的解析入口（很多测试用 `rules_only` 单独验证规则检查器的
+/// 行为，不需要 LLM 检查器）；生产装配 [`crate::cloud::CloudUpstream::from_file_with_ingress_tenants`] 加载之后调用它。
+pub fn require_llm_judge_for_child_tenants(
+    parts: &CloudParts,
+    ingress_tenants: &[IngressTenant],
+) -> Result<(), String> {
+    let has_child = parts.callers.has_child_data_callers()
+        || ingress_tenants
+            .iter()
+            .any(|tenant| tenant.policy.handles_child_data());
+    if has_child
+        && parts
+            .safety
+            .as_ref()
+            .is_none_or(|setup| setup.judge.is_none())
+    {
+        return Err(bad(
+            "有调用方（含云入口配置里的租户）处理儿童数据（data_classes 含 child_edu），safety: 段必须配置 LLM 检查器\
+             （mode: rules_and_llm + llm_judge），不能只用规则检查器（rules_only）：规则检查器靠关键词和正则，\
+             换字体、拼写变形、base64、藏在工具描述里的内容都能绕过",
+        ));
+    }
+    Ok(())
 }
 
 /// 从文件加载。
@@ -1042,6 +1184,173 @@ callers:
         assert!(parts.callers.resolve(Some("stranger")).is_none());
         assert_eq!(parts.limits.max_attempts, 3);
         assert_eq!(parts.reserve_policy.max_tokens_hard_cap, 4_096);
+    }
+
+    /// R2 High#2：`extra_body` 不能带协议 / 计费 / 身份 / 留存字段（它盖在客户端字段之上，能写 `model` 就能把请求发给没被许可的
+    /// 模型，能写 `max_tokens` 就能把余额不足时被压低的上限放大回去）。供应商自己的路由参数照常可以。
+    #[test]
+    fn extra_body_cannot_carry_protocol_billing_or_identity_fields() {
+        let with_extra = |extra: &str| {
+            VALID.replace(
+                "price_version: pv-1",
+                &format!("price_version: pv-1\n    extra_body: {extra}"),
+            )
+        };
+        for field in [
+            "model",
+            "max_tokens",
+            "max_completion_tokens",
+            "stream",
+            "stream_options",
+            "n",
+            "messages",
+            "tools",
+            "service_tier",
+            "user",
+            "store",
+        ] {
+            expect_error(
+                &with_extra(&format!("{{provider: {{zdr: true}}, {field}: 1}}")),
+                &format!("extra_body 不能包含 {field}"),
+            );
+        }
+        // 正当用途：供应商自己的路由 / 策略参数
+        let parts = load(&with_extra(
+            "{provider: {zdr: true, allow_fallbacks: false}}",
+        ))
+        .unwrap();
+        assert_eq!(parts.endpoints.len(), 1);
+    }
+
+    /// PR-Daemon S4 Low：许可表核验的是某个供应商的端点，`base_url` 的主机必须是它核验过的 API 主机，
+    /// 不能带着「已核验」的标签把数据发往别的主机。
+    #[test]
+    fn a_verified_providers_base_url_must_be_one_of_its_verified_hosts() {
+        let permits = PERMITS.replace("example-alpha", "deepinfra");
+        let yaml = VALID
+            .replace("example-alpha", "deepinfra")
+            .replace("EXAMPLE_ALPHA_API_KEY", "DEEPINFRA_API_KEY");
+        let load_with = |provider: &str, base_url: &str| {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(
+                dir.path().join("permits.yaml"),
+                permits.replace("deepinfra", provider),
+            )
+            .unwrap();
+            parse(
+                &yaml
+                    .replace("deepinfra", provider)
+                    .replace("https://api.example.invalid/v1", base_url),
+                dir.path(),
+                TimestampMs(1_794_528_000_000),
+            )
+            .map(|_| ())
+        };
+        for ok in [
+            "https://api.deepinfra.com/v1/openai",
+            "https://API.DeepInfra.com/v1/openai",
+            // 回环地址永远允许（本机测试用的假上游）
+            "http://127.0.0.1:9/v1",
+            "http://localhost:9/v1",
+        ] {
+            load_with("deepinfra", ok).unwrap_or_else(|e| panic!("{ok}: {e}"));
+        }
+        for bad in [
+            "https://api.deepseek.com/v1",
+            "https://evil.example.com/v1",
+            "https://api.deepinfra.com.evil.example/v1",
+            "https://deepinfra.com/v1",
+        ] {
+            let error = load_with("deepinfra", bad).unwrap_err();
+            assert!(error.contains("核验过的 API 主机"), "{bad}: {error}");
+        }
+        // 主机没核实的供应商：不能配置到任何非回环地址
+        let error = load_with("together", "https://api.together.example/v1").unwrap_err();
+        assert!(error.contains("没有核实"), "{error}");
+        load_with("together", "http://127.0.0.1:9/v1").unwrap();
+        // 表里没有的供应商标签（测试里的 example-*）不受限
+        load_with("example-alpha", "https://api.example.invalid/v1").unwrap();
+    }
+
+    #[test]
+    fn a_host_pattern_with_a_leading_wildcard_needs_a_real_subdomain() {
+        let pattern = "*.ap-southeast-1.maas.aliyuncs.com";
+        assert!(host_matches(
+            "ws-1.ap-southeast-1.maas.aliyuncs.com",
+            pattern
+        ));
+        assert!(host_matches(
+            "WS-1.AP-southeast-1.maas.aliyuncs.com",
+            pattern
+        ));
+        assert!(!host_matches("ap-southeast-1.maas.aliyuncs.com", pattern));
+        assert!(!host_matches(
+            "evilap-southeast-1.maas.aliyuncs.com",
+            pattern
+        ));
+        assert!(!host_matches(
+            "ws-1.ap-southeast-1.maas.aliyuncs.com.evil.example",
+            pattern
+        ));
+        assert!(host_matches("API.deepinfra.com", "api.deepinfra.com"));
+    }
+
+    /// R2 High#3：`billing: unbilled` 没有实现（准入、预留、结算都不认它：用户额度照扣），加载配置时直接拒绝。
+    #[test]
+    fn billing_unbilled_is_refused_not_silently_charged() {
+        expect_error(
+            &VALID.replace("billing: paid", "billing: unbilled"),
+            "unbilled 在云形态没有实现",
+        );
+        // 补贴、付费照常
+        assert!(load(&VALID.replace("billing: paid", "billing: subsidized")).is_ok());
+    }
+
+    /// PR-Daemon B3（需 owner 确认）：生产启动时，儿童调用方 / 云入口声明的儿童租户必须配 LLM 检查器，只用规则检查器失败。
+    #[test]
+    fn production_start_up_needs_the_llm_judge_for_child_tenants() {
+        use std::collections::BTreeSet;
+
+        use idoris_compute_contracts::permit::DataClass;
+
+        let child = || IngressTenant {
+            name: "eduai".to_string(),
+            policy: TenantDataPolicy::new(
+                BTreeSet::from([DataClass::ChildEdu]),
+                None,
+                Retention::Zdr,
+                true,
+            )
+            .unwrap(),
+        };
+        // 只有成人调用方、也没有儿童租户：不要求
+        let adult_only = load(VALID).unwrap();
+        require_llm_judge_for_child_tenants(&adult_only, &[]).unwrap();
+        // 云入口声明了儿童租户，云上游配置只有规则检查器：失败
+        let rules_only = load(&format!("{VALID}safety:\n  mode: rules_only\n")).unwrap();
+        let error = require_llm_judge_for_child_tenants(&rules_only, &[child()]).unwrap_err();
+        assert!(
+            error.contains("LLM 检查器") && error.contains("rules_only"),
+            "{error}"
+        );
+        // 静态调用方簿里的儿童调用方同样
+        let head = VALID.split("callers:\n").next().unwrap();
+        let child_caller = load(&format!(
+            "{head}callers:
+  - credential_id: cred-edu
+    payer_account: acct-edu
+    unit: THB
+    billing: paid
+    data_classes: [child_edu]
+    max_retention: zdr
+safety:
+  mode: rules_only
+"
+        ))
+        .unwrap();
+        assert!(require_llm_judge_for_child_tenants(&child_caller, &[]).is_err());
+        // 对照：没有儿童租户时，规则检查器不被要求加 LLM
+        require_llm_judge_for_child_tenants(&rules_only, &[]).unwrap();
     }
 
     #[test]

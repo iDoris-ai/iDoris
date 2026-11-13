@@ -24,6 +24,7 @@ use futures_util::Stream;
 use idoris_compute_contracts::attempt::AttemptEvent;
 use idoris_compute_contracts::ids::AttemptIndex;
 use idoris_compute_contracts::reason::ReasonCode;
+use idoris_tenancy::attempts::UsageClaim;
 use idoris_upstream::cloud::{
     ChunkKind, CloudFailure, ResponseHead, SseEvent, SseParser, UsageParse, classify,
 };
@@ -142,8 +143,16 @@ pub(crate) struct StreamTracker {
     pub(crate) id: Option<String>,
     /// 流中途出现的、与第一个不同的请求号（上游出问题的信号；对账时要标注）。
     pub(crate) changed_id: Option<String>,
-    /// 最近一个带 usage 的事件的判定（最终 usage 在最后）。
+    /// 最近一个带 usage 的事件的判定。**不一定是最终用量**，见 [`Self::usage_is_final`]。
     pub(crate) usage: UsageParse,
+    /// [`Self::usage`] 看起来是**最终用量**：它来自一个像「最后一块」的事件（单独的 usage 块，`choices` 为空或没有；
+    /// 或者带着 `finish_reason` 的最后一块内容），而且这之后流里没有再出现过带内容的块。
+    ///
+    /// 为什么要问：上游可以在流中途发一个 usage（比如累计用量），后面还有内容。客户端在那之后断开、或者流在那之后失败，
+    /// 中途的数字只是已生成部分的用量，不是整个响应的用量。按它结算会少收钱（上游已经生成并计费的部分没有算进去），
+    /// 而且状态机里写成「用量已知」之后，这次尝试既不挂账也不会被对账看到。所以**只有流正常完成，或者这个 usage 本身
+    /// 就是最终用量**，它才能当结算依据；否则按「用量未知 / 可能已执行」走原来的规则（预留价、挂账待核销）。
+    pub(crate) usage_is_final: bool,
     pub(crate) saw_done: bool,
 }
 
@@ -154,6 +163,7 @@ impl StreamTracker {
             id: None,
             changed_id: None,
             usage: UsageParse::Absent,
+            usage_is_final: false,
             saw_done: false,
         }
     }
@@ -170,6 +180,15 @@ impl StreamTracker {
                 if info.error {
                     return Ingested::UpstreamError;
                 }
+                let carries_usage = !matches!(info.usage, UsageParse::Absent);
+                // 合法的 chunk 只有两种：completion chunk（`choices` 是对象数组），和单独的 usage 块（带 usage，
+                // `choices` 为空或者没有）。其它任意 JSON 对象（`{}`、`{"x":1}`）不是回答：不能转发，更不能让它
+                // 跨过发布边界（之后就不能切换候选，用户没有拿到回答却要按预留价付费）。
+                let completion_chunk = info.has_choices && info.choices_well_formed;
+                let usage_only_chunk = carries_usage && (!info.has_choices || info.choices_empty);
+                if !completion_chunk && !usage_only_chunk {
+                    return Ingested::Malformed;
+                }
                 match (&self.id, &info.id) {
                     (None, Some(_)) => self.id.clone_from(&info.id),
                     (Some(first), Some(id)) if first != id && self.changed_id.is_none() => {
@@ -177,13 +196,18 @@ impl StreamTracker {
                     }
                     _ => {}
                 }
-                let carries_usage = !matches!(info.usage, UsageParse::Absent);
                 if carries_usage {
                     self.usage = info.usage.clone();
+                    // 「最后一块」的两种样子：单独的 usage 块，或者带着 finish_reason 的最后一块内容
+                    self.usage_is_final =
+                        !info.has_choices || info.choices_empty || info.has_finish_reason;
+                } else if info.has_choices && !info.choices_empty {
+                    // 上一个 usage 之后又来了内容：它不是最终用量
+                    self.usage_is_final = false;
                 }
                 if carries_usage && !self.wants_usage_chunk {
                     // 客户端没要 usage：整块只有 usage 就不转发，内容块里夹带的 usage 去掉
-                    if info.choices_empty {
+                    if usage_only_chunk {
                         return Ingested::Skip;
                     }
                     return Ingested::Forward(
@@ -260,6 +284,14 @@ pub(crate) struct StreamParts {
 
 impl StreamState {
     pub(crate) fn new(parts: StreamParts) -> Self {
+        // 第一次读流就已经见到 `[DONE]`（回答、usage 和 `[DONE]` 在同一个网络块里，上游随后迟迟不关闭连接）：
+        // 流已经完成，交接之后只把排队的字节发完就收尾，不再等上游的下一块（否则要等到静默超时，
+        // 然后在 `[DONE]` 之后追加一个超时错误事件，还把并发名额多占 30 秒）。
+        let phase = if parts.tracker.saw_done {
+            Phase::Finishing(End::Complete)
+        } else {
+            Phase::Reading
+        };
         Self {
             run: parts.run,
             idx: parts.idx,
@@ -271,7 +303,7 @@ impl StreamState {
             deadline: Instant::now() + parts.stream_total,
             published: false,
             upstream_stops_on_cancel: parts.upstream_stops_on_cancel,
-            phase: Phase::Reading,
+            phase,
             concluded: false,
         }
     }
@@ -324,9 +356,11 @@ impl StreamState {
         match next {
             Err(end) => self.phase = Phase::Finishing(end),
             Ok(None) => {
-                // 连接结束：`[DONE]` 或最终 usage 已经到了才算完成；否则是被截断
+                // 连接结束：`[DONE]` 或**最终** usage 已经到了才算完成；否则是被截断
+                // （中途的 usage 之后还有内容、连接却断了，不是完成）
                 let complete = self.tracker.saw_done
-                    || (self.tracker.usage.valid_usage().is_some()
+                    || (self.tracker.usage_is_final
+                        && self.tracker.usage.valid_usage().is_some()
                         && !self.parser.has_partial_event());
                 if complete {
                     if !self.tracker.saw_done {
@@ -395,13 +429,28 @@ impl StreamState {
             self.tracker.id.as_deref(),
             self.head.supplier_request_id_header.as_deref(),
         );
-        // usage：只要看到了通过判定的最终 usage 就用它（它是上游对整个响应的最终计数），不管流是怎么结束的
-        let (usage, claim) = judge_usage(&self.tracker.usage, &attempt);
+        // usage：**只信最终用量**。流正常完成（`[DONE]` / 最终 usage 之后干净结束）时，最近一个 usage 就是上游对整个
+        // 响应的最终计数；流没有正常完成（客户端断开、上游中途失败）时，只有那个 usage 本身就是最后一块
+        // （`usage_is_final`）才信：中途的 usage 之后还有内容，那个数字只是已生成部分的用量，按它结算会少收钱，
+        // 而且「用量已知」会盖过下面「保持 maybe_executed」的诚实标注，成本既不挂账也不会被对账看到。
+        // 不被信任的 usage 原文照样记进 `usage_claim_json`（判定 `untrusted:not_final`）供对账。
+        let trusted = end == End::Complete || self.tracker.usage_is_final;
+        let (usage, claim) = if trusted || matches!(self.tracker.usage, UsageParse::Absent) {
+            judge_usage(&self.tracker.usage, &attempt)
+        } else {
+            (
+                None,
+                UsageClaim {
+                    verdict: "untrusted:not_final".to_string(),
+                    raw: self.tracker.usage.raw().cloned(),
+                },
+            )
+        };
         if !matches!(self.tracker.usage, UsageParse::Absent) || end == End::Complete {
             self.run.record_usage_claim(self.idx, &claim);
         }
         // 状态机事件：
-        // - 看到了通过判定的最终 usage：`UsageReported`（不管流是怎么结束的）；
+        // - 看到了通过判定的、可信的最终 usage：`UsageReported`；
         // - 否则：确认执行了、usage 未知（`ExecutionObservedUsageUnknown`，按预留结算）——
         //   **除了**客户端断开、而许可表里这个端点没有「取消」能力的情形：我们关掉了连接，但上游可能还在生成、
         //   还在计费，是否停计费不确定，所以不下结论，保持 `maybe_executed`（成本按预留额挂账待核销，
@@ -584,6 +633,92 @@ mod tests {
         assert!(!tracker.saw_done);
         assert!(matches!(tracker.ingest(&ev("[DONE]")), Ingested::Done(_)));
         assert!(tracker.saw_done);
+    }
+
+    /// R2 Medium#3：只有两种 JSON 对象是流里的合法事件——completion chunk（`choices` 是对象数组）和单独的 usage 块
+    /// （带 usage，`choices` 为空或者没有）。其它任意对象不是回答，不能转发（转发了就跨过发布边界，之后不能切换候选）。
+    #[test]
+    fn only_completion_chunks_and_usage_chunks_are_valid_stream_events() {
+        let mut tracker = StreamTracker::new(false);
+        for data in [
+            "{}",
+            r#"{"x":1}"#,
+            r#"{"id":"c"}"#,
+            r#"{"choices":"nope"}"#,
+            r#"{"choices":[1]}"#,
+            r#"{"choices":{}}"#,
+        ] {
+            assert!(
+                matches!(tracker.ingest(&ev(data)), Ingested::Malformed),
+                "{data}"
+            );
+        }
+        assert!(tracker.id.is_none(), "a malformed chunk teaches us nothing");
+        for data in [
+            r#"{"choices":[]}"#,
+            r#"{"choices":[{"delta":{"role":"assistant"}}]}"#,
+            r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
+        ] {
+            assert!(
+                matches!(tracker.ingest(&ev(data)), Ingested::Forward(_)),
+                "{data}"
+            );
+        }
+        // 没有 `choices` 的单独 usage 块：合法；客户端没要就不转发，要了就原样转发
+        let usage_only = ev(r#"{"id":"c","usage":{"prompt_tokens":3,"completion_tokens":4}}"#);
+        assert!(matches!(
+            StreamTracker::new(false).ingest(&usage_only),
+            Ingested::Skip
+        ));
+        assert!(matches!(
+            StreamTracker::new(true).ingest(&usage_only),
+            Ingested::Forward(_)
+        ));
+    }
+
+    /// PR-Daemon B4：中途的 usage 不是最终用量。usage 只有在它来自「最后一块」（单独的 usage 块，或带着 `finish_reason`
+    /// 的最后一块内容）并且之后流里没有再出现过带内容的块时，才是最终用量。
+    #[test]
+    fn a_usage_is_final_only_when_it_rides_the_last_chunk_and_no_content_follows() {
+        let usage = r#""usage":{"prompt_tokens":12,"completion_tokens":2}"#;
+        let content = |text: &str| format!(r#"{{"choices":[{{"delta":{{"content":"{text}"}}}}]}}"#);
+
+        // 单独的 usage 块（choices 为空）：最终
+        let mut tracker = StreamTracker::new(false);
+        tracker.ingest(&ev(&content("a")));
+        assert!(!tracker.usage_is_final, "no usage yet");
+        tracker.ingest(&ev(&format!(r#"{{"choices":[],{usage}}}"#)));
+        assert!(tracker.usage_is_final);
+        // 之后又来了内容：不是最终用量
+        tracker.ingest(&ev(&content("b")));
+        assert!(!tracker.usage_is_final, "content followed the usage");
+        assert_eq!(
+            tracker.usage.valid_usage().unwrap().completion_tokens,
+            2,
+            "the number is still recorded (for the usage claim)"
+        );
+        // 之后的空 choices 块（没有 usage）不改变判断
+        let mut tracker = StreamTracker::new(false);
+        tracker.ingest(&ev(&format!(r#"{{"choices":[],{usage}}}"#)));
+        tracker.ingest(&ev(r#"{"choices":[]}"#));
+        assert!(tracker.usage_is_final);
+
+        // 夹带在内容块里的 usage：没有 finish_reason 的不是最终用量，带 finish_reason 的是
+        let mut tracker = StreamTracker::new(false);
+        tracker.ingest(&ev(&format!(
+            r#"{{"choices":[{{"delta":{{"content":"a"}},"finish_reason":null}}],{usage}}}"#
+        )));
+        assert!(!tracker.usage_is_final, "a cumulative usage mid-stream");
+        tracker.ingest(&ev(&format!(
+            r#"{{"choices":[{{"delta":{{}},"finish_reason":"stop"}}],{usage}}}"#
+        )));
+        assert!(tracker.usage_is_final);
+
+        // 没有 usage 的流：什么都不是最终用量
+        let mut tracker = StreamTracker::new(false);
+        tracker.ingest(&ev(&content("a")));
+        tracker.ingest(&SseEvent::from_lines(&[b"data: [DONE]"]));
+        assert!(tracker.saw_done && !tracker.usage_is_final);
     }
 
     #[test]

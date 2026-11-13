@@ -65,10 +65,28 @@ use super::answer::{
     AnswerMeta, CloudOutcome, CloudStream, Ingested, PendingAnswer, StreamParts, StreamState,
     StreamTracker,
 };
+use super::blocking::blocking;
 use super::clock::Clock;
 use super::config::{CloudLimits, EndpointRegistry, EndpointRuntime};
 use super::run::{RunState, judge_usage};
 use super::safety::{GateDenial, SafetyCall, SafetyGate};
+
+/// 调用方对这次请求的隐私声明（`X-iDoris-Privacy` 头，或请求体里的等价字段），由入口解析、交给执行器。
+///
+/// 为什么要进执行器：`local_only` 的意思是「这份数据不许离开调用方的机器」。云是远端，`local_only` 请求永远不该到这里；
+/// 入口（`handler`）会先拒绝，但执行器自己再查一道：不论哪个入口（现在的云入口、以后新增的路径、测试直接调执行器）
+/// 构造 [`CloudCall`]，都必须把声明带进来，`LocalOnly` 一律在任何候选选择、准入、安全检查模型调用和上游请求**之前**被拒。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CallPrivacy {
+    /// 没有声明。云入口**不**套用本地路由器「没声明 = `local_only`」的默认：普通的 OpenAI 客户端不会发这个头，
+    /// 而它们调的就是云（调用方已经选择了把数据发给这个远端服务）。
+    #[default]
+    Undeclared,
+    /// 显式 `any`：数据允许离开调用方的机器。
+    Any,
+    /// 显式 `local_only`：永远不能由云处理。
+    LocalOnly,
+}
 
 /// 一次云调用的输入。
 pub struct CloudCall {
@@ -76,6 +94,8 @@ pub struct CloudCall {
     pub payment: PaymentContext,
     pub tenant: TenantDataPolicy,
     pub billing: Billing,
+    /// 调用方的隐私声明；`LocalOnly` 在执行器里一律被拒（见 [`CallPrivacy`]）。
+    pub privacy: CallPrivacy,
     /// 客户端的请求体（JSON 对象）。
     pub client_body: Map<String, Value>,
     pub stream: bool,
@@ -150,6 +170,8 @@ pub enum CloudError {
     Internal(String),
     /// edu 租户在 P0 一律非流式（设计稿 §6）：流式请求在任何上游调用之前被拒绝。
     StreamingNotAllowed,
+    /// 调用方显式声明了 `local_only`：这份数据不许离开调用方的机器，云永远不处理。**没有任何上游调用、安全检查模型调用发生。**
+    LocalOnlyRefused,
     /// 儿童安全检查拒绝了内容（S6）。输入阶段上游没有收到任何字节；输出阶段回答没有发给客户端。
     SafetyBlocked {
         stage: SafetyStage,
@@ -198,6 +220,7 @@ impl CloudError {
             CloudError::Admission(_) | CloudError::Ledger(_) => "ledger_unavailable",
             CloudError::Internal(_) => "internal_error",
             CloudError::StreamingNotAllowed => "streaming_not_allowed",
+            CloudError::LocalOnlyRefused => "local_only_refused",
             // 只记粗的稳定码：拦截类别是从孩子的话里推出来的敏感推断，不进账本
             CloudError::SafetyBlocked { stage, .. } => {
                 SafetyReasonCode::blocked_at(*stage).as_str()
@@ -238,6 +261,9 @@ impl std::fmt::Display for CloudError {
             CloudError::Internal(e) => write!(f, "internal error: {e}"),
             CloudError::StreamingNotAllowed => {
                 f.write_str("streaming is not available for child-data tenants")
+            }
+            CloudError::LocalOnlyRefused => {
+                f.write_str("the request declared privacy local_only; the cloud never processes it")
             }
             // 不含类别，更不含内容
             CloudError::SafetyBlocked { stage, .. } => {
@@ -346,6 +372,19 @@ impl CloudExecutor {
     /// 输入检查 -> 上游非流式调用 -> 完整输出检查通过后才返回可发布的回答。其它租户一字不变。
     /// 是否走管线只看 `call.tenant`（服务端从凭证解析出来的），不看模型名、路由别名、请求头。
     pub async fn execute(&self, call: CloudCall) -> Result<CloudOutcome, CloudError> {
+        // 最先做、早于一切：显式 `local_only` 永远不出网，也不送给安全检查模型（那同样是把正文发给远端）。
+        // 入口（`handler`）已经拒绝过一次；这里是纵深防御：不论哪个入口构造 `CloudCall` 都一样。
+        if call.privacy == CallPrivacy::LocalOnly {
+            return Err(self.reject(&call, CloudError::LocalOnlyRefused));
+        }
+        // `unbilled` 没有实现（准入、预留、结算都不认它：用户额度照扣）。配置加载时就拒绝了；这里是纵深防御，
+        // 失败即关闭，不能悄悄按付费处理。
+        if call.billing == Billing::Unbilled {
+            return Err(self.reject(
+                &call,
+                CloudError::Internal("billing mode `unbilled` is not implemented".to_string()),
+            ));
+        }
         if call.tenant.handles_child_data() {
             self.execute_child(&call).await
         } else {
@@ -496,10 +535,10 @@ impl CloudExecutor {
             }
         }
         let classes = call.tenant.data_classes();
-        if let Err(record_error) = self
-            .store
-            .record_rejected_request(&self.new_request(call, classes), error.close_reason())
-        {
+        if let Err(record_error) = blocking(|| {
+            self.store
+                .record_rejected_request(&self.new_request(call, classes), error.close_reason())
+        }) {
             eprintln!("[idoris] cloud: could not record a rejected request: {record_error}");
         }
         error
@@ -599,9 +638,9 @@ impl CloudExecutor {
                         no_price = true;
                         continue;
                     };
-                    let decision = self
-                        .admission
-                        .admit(&AdmissionRequest {
+                    // 准入是同步的账本事务（SQLite）：不在异步 worker 线程上直接阻塞（R2 Medium#2）
+                    let decision = blocking(|| {
+                        self.admission.admit(&AdmissionRequest {
                             request_id: &call.request_id,
                             payment: &call.payment,
                             endpoint: key,
@@ -616,7 +655,8 @@ impl CloudExecutor {
                             now: self.clock.now(),
                             allow_grace,
                         })
-                        .map_err(|e| self.stop(call, slot, CloudError::Admission(e)))?;
+                    })
+                    .map_err(|e| self.stop(call, slot, CloudError::Admission(e)))?;
                     match decision {
                         AdmissionDecision::Reject { reason } => {
                             denial.get_or_insert(reason.code());
@@ -766,10 +806,12 @@ impl CloudExecutor {
 
     /// 释放一个没有成为尝试的候选的预留（见 [`CandidateAdmission::release`]）。
     fn release_unused(&self, call: &CloudCall, ordinal: usize) {
-        self.admission.release(&ReleaseRequest {
-            request_id: &call.request_id,
-            candidate_ordinal: ordinal,
-            now: self.clock.now(),
+        blocking(|| {
+            self.admission.release(&ReleaseRequest {
+                request_id: &call.request_id,
+                candidate_ordinal: ordinal,
+                now: self.clock.now(),
+            });
         });
     }
 
@@ -884,7 +926,7 @@ impl CloudExecutor {
         if call.stream {
             self.start_stream(call, run, idx, head, deadline).await
         } else {
-            self.finish_non_stream(call, run, idx, head).await
+            self.finish_non_stream(call, run, idx, head, deadline).await
         }
     }
 
@@ -908,9 +950,15 @@ impl CloudExecutor {
         run: &mut RunState,
         idx: AttemptIndex,
         head: ResponseHead,
+        deadline: Instant,
     ) -> Result<AttemptResult, CloudError> {
         let header_id = head.supplier_request_id_header.clone();
-        let body = match self.cancellable(call, head.read_body()).await? {
+        // 读正文受整个请求的**绝对**期限约束：用读正文这一刻的剩余时间，不是发送之前算好的（否则总期限实际变成
+        // 「响应头时间 + 响应体时间」：第 29 秒才回响应头、再读 119 秒的正文，约 148 秒仍然成功，超过声明的总期限）
+        let body = match self
+            .cancellable(call, head.read_body_until(Some(deadline)))
+            .await?
+        {
             Ok(body) => body,
             Err(failure) => return Self::observed_but_unusable(run, idx, failure),
         };
@@ -992,6 +1040,9 @@ impl CloudExecutor {
                             );
                         }
                         pending.push_back(bytes);
+                        // `[DONE]` 之后这个网络块里的事件一概不处理（流已经结束）；交接出去的 `tracker.saw_done`
+                        // 为真，`StreamState` 一上来就是「完成收尾」，不会再等上游的下一块
+                        break;
                     }
                     Ingested::UpstreamError => {
                         return Self::observed_but_unusable(

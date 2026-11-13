@@ -804,6 +804,304 @@ fn finalize_charges_the_user_once_and_holds_the_maybe_executed_cost() {
     assert_eq!(loaded.plan_settlement().unwrap(), plan);
 }
 
+/// 评审 r2 Medium#1 的场景：第一次尝试 A 停在 `maybe_executed`，B 作答并结算（A 留下 `hold`）。返回库、内存里的请求，
+/// 以及已经收尾的计划。
+fn finalized_after_a_failover(id: &str) -> (AttemptStore, Request, SettlementPlan) {
+    let (store, mut request) = started(id);
+    apply(
+        &store,
+        &mut request,
+        0,
+        &[AttemptEvent::Dispatch, AttemptEvent::WireWriteStarted],
+        1,
+    );
+    request.begin_next_attempt(candidate("model-b")).unwrap();
+    store
+        .append_attempt(request.id(), &request.attempts()[1], at(2))
+        .unwrap();
+    apply(
+        &store,
+        &mut request,
+        1,
+        &[
+            AttemptEvent::Dispatch,
+            AttemptEvent::WireWriteStarted,
+            AttemptEvent::UsageReported { usage: usage() },
+        ],
+        3,
+    );
+    store
+        .record_publish(request.attempts()[1].id(), at(4))
+        .unwrap();
+    request.publish_first_byte(idx(1)).unwrap();
+    let plan = request.plan_settlement().unwrap();
+    store
+        .finalize_request(
+            &plan,
+            &[request.attempts()[1].id().clone()],
+            RequestClose {
+                outcome: RequestOutcome::Answered,
+                reason: Some(ReasonCode::UpstreamFailover.as_str()),
+                at: at(5),
+            },
+        )
+        .unwrap();
+    (store, request, plan)
+}
+
+fn failover_close() -> RequestClose<'static> {
+    RequestClose {
+        outcome: RequestOutcome::Answered,
+        reason: Some("upstream_failover"),
+        at: at(6),
+    }
+}
+
+/// A 的 usage：100 入 50 出，成本 = 100×0.28 + 50×0.42 = 49 微美元（夹具的成本价目）。
+fn late_usage() -> Usage {
+    Usage::new(100, 50, 0).unwrap()
+}
+
+/// 评审 r2 Medium#1：对账把 A 更新成已知 usage 之后，用重建的计划再调一次 `finalize_request`——修复之前它会跳过 A 的状态
+/// 结算，却追加一条新的 `platform_cost`，原来的 `hold` 还保留：成本重复占账，A 也没有结清。重放必须和当初的收尾完全一致。
+#[test]
+fn a_replayed_settlement_cannot_add_postings_that_the_original_did_not_write() {
+    let (store, request, _plan) = finalized_after_a_failover("req-replay-drift");
+    let a = request.attempts()[0].id().clone();
+    let before = store.postings(request.id()).unwrap();
+    assert_eq!(
+        before
+            .iter()
+            .filter(|p| p.attempt == a)
+            .map(|p| (p.kind.as_str(), p.money.micros))
+            .collect::<Vec<_>>(),
+        vec![("hold", 400), ("release", 20_000)]
+    );
+
+    // 对账把 A 更新成已知 usage，重建计划
+    store
+        .apply_events(
+            &a,
+            &[AttemptEvent::UsageReported {
+                usage: late_usage(),
+            }],
+            at(100),
+        )
+        .unwrap();
+    let rebuilt = store.load_request(request.id()).unwrap().unwrap();
+    let drifted = rebuilt.plan_settlement().unwrap();
+    let error = store
+        .finalize_request(&drifted, std::slice::from_ref(&a), failover_close())
+        .unwrap_err();
+    assert!(matches!(error, AttemptStoreError::Invariant(_)), "{error}");
+    assert!(error.to_string().contains("would add postings"), "{error}");
+    // 什么都没有追加、什么都没有改
+    assert_eq!(store.postings(request.id()).unwrap(), before);
+    assert_eq!(
+        store.attempt_rows(request.id()).unwrap()[0].state,
+        AttemptState::ExecutedUsageKnown {
+            usage: late_usage()
+        },
+        "the replay must not pretend to settle the attempt"
+    );
+
+    // 对照：和当初完全一样的计划，仍然是幂等重放
+    let (store, request, plan) = finalized_after_a_failover("req-replay-same");
+    let again = store
+        .finalize_request(
+            &plan,
+            &[request.attempts()[1].id().clone()],
+            failover_close(),
+        )
+        .unwrap();
+    assert!(again.replayed && again.postings_added == 0);
+}
+
+/// 重放一份**少**了当初分录的计划同样被拒绝（不是悄悄放过）。
+#[test]
+fn a_replayed_plan_that_drops_an_original_posting_is_refused_too() {
+    let (store, request, plan) = finalized_after_a_failover("req-replay-fewer");
+    let mut fewer = plan.clone();
+    // 把用户的收费去掉：当初写过的 user_price 不在这份计划里
+    fewer.user_charge = None;
+    let error = store
+        .finalize_request(&fewer, &[], failover_close())
+        .unwrap_err();
+    assert!(matches!(error, AttemptStoreError::Invariant(_)), "{error}");
+    assert_eq!(store.postings(request.id()).unwrap().len(), 5);
+}
+
+/// 迟到 usage 的独立对账事务：一个事务里按 S0 的转移推进状态（`UsageReported` 之后 `Settle`）、冲销旧挂账、记实际成本。
+#[test]
+fn late_usage_reverses_the_hold_books_the_actual_cost_and_settles_in_one_transaction() {
+    let (store, request, _plan) = finalized_after_a_failover("req-late");
+    let a = request.attempts()[0].id().clone();
+    assert_eq!(
+        store.attempt_rows(request.id()).unwrap()[0].state,
+        AttemptState::MaybeExecuted
+    );
+
+    let outcome = store
+        .reconcile_late_usage(&a, late_usage(), at(1_000))
+        .unwrap();
+    assert_eq!(
+        outcome,
+        LateUsageOutcome::Reconciled {
+            postings_added: 2,
+            actual_cost: money(Unit::Usd, 49),
+        }
+    );
+    // 状态：按实际用量结清，转移日志里是合法的两步
+    let row = &store.attempt_rows(request.id()).unwrap()[0];
+    assert_eq!(
+        row.state,
+        AttemptState::Settled {
+            basis: SettleBasis::ActualUsage(late_usage())
+        }
+    );
+    let events: Vec<(AttemptStateKind, AttemptStateKind)> = store
+        .events(&a)
+        .unwrap()
+        .into_iter()
+        .map(|e| (e.from, e.to))
+        .collect();
+    assert_eq!(
+        events[events.len() - 2..],
+        [
+            (
+                AttemptStateKind::MaybeExecuted,
+                AttemptStateKind::ExecutedUsageKnown
+            ),
+            (
+                AttemptStateKind::ExecutedUsageKnown,
+                AttemptStateKind::Settled
+            ),
+        ]
+    );
+    // 分录：旧挂账 400 被一条 -400 冲销，净挂账为 0；实际成本 49
+    let postings = store.postings(request.id()).unwrap();
+    let of_a = |kind: &str| -> Vec<i64> {
+        postings
+            .iter()
+            .filter(|p| p.attempt == a && p.kind == kind)
+            .map(|p| p.money.micros)
+            .collect()
+    };
+    assert_eq!(of_a("hold"), vec![400, -400]);
+    assert_eq!(
+        of_a("hold").iter().sum::<i64>(),
+        0,
+        "the pending hold is gone"
+    );
+    assert_eq!(of_a("platform_cost"), vec![49]);
+    // 用户侧一分没动：A 不向用户收费，当初整笔释放的价预留还是那一条
+    assert_eq!(of_a("release"), vec![20_000]);
+    assert!(of_a("user_price").is_empty());
+    let reconcile_keys: Vec<&str> = postings
+        .iter()
+        .filter(|p| p.idempotency_key.ends_with("|reconcile"))
+        .map(|p| p.idempotency_key.as_str())
+        .collect();
+    assert_eq!(
+        reconcile_keys,
+        [
+            "req-late#0|hold|reconcile",
+            "req-late#0|platform_cost|reconcile"
+        ]
+    );
+
+    // 幂等：同一个 usage 再来一次什么都不做
+    let count = postings.len();
+    assert_eq!(
+        store
+            .reconcile_late_usage(&a, late_usage(), at(2_000))
+            .unwrap(),
+        LateUsageOutcome::Replayed
+    );
+    assert_eq!(store.postings(request.id()).unwrap().len(), count);
+    // 不同的 usage：冲突，不覆盖
+    let other = Usage::new(1, 1, 0).unwrap();
+    assert!(matches!(
+        store
+            .reconcile_late_usage(&a, other, at(3_000))
+            .unwrap_err(),
+        AttemptStoreError::PostingConflict { .. }
+    ));
+}
+
+#[test]
+fn late_usage_only_reconciles_a_maybe_executed_attempt_that_did_not_charge_the_user() {
+    let (store, request, _plan) = finalized_after_a_failover("req-late-scope");
+    let a = request.attempts()[0].id().clone();
+    let b = request.attempts()[1].id().clone();
+    // 向用户收费的那一次：迟到 usage 要不要退差价是准入账本的事，这里不碰用户的钱
+    let error = store
+        .reconcile_late_usage(&b, late_usage(), at(10))
+        .unwrap_err();
+    assert!(
+        matches!(error, AttemptStoreError::Invariant(_)) && error.to_string().contains("ledger"),
+        "{error}"
+    );
+    // 不存在的尝试
+    let ghost: AttemptId = "req-nope#0".parse().unwrap();
+    assert!(matches!(
+        store
+            .reconcile_late_usage(&ghost, late_usage(), at(10))
+            .unwrap_err(),
+        AttemptStoreError::AttemptNotFound(_)
+    ));
+    // 还没关闭的请求走 finalize_request，不走这里
+    let (open_store, mut open_request) = started("req-late-open");
+    apply(
+        &open_store,
+        &mut open_request,
+        0,
+        &[AttemptEvent::Dispatch, AttemptEvent::WireWriteStarted],
+        1,
+    );
+    let open_a = open_request.attempts()[0].id().clone();
+    assert!(matches!(
+        open_store
+            .reconcile_late_usage(&open_a, late_usage(), at(10))
+            .unwrap_err(),
+        AttemptStoreError::Invariant(_)
+    ));
+    // A 对账成功之后状态已经是 settled；对 usage 未知、已按预留额结清的尝试（没有事件能再改它）同样拒绝
+    store
+        .reconcile_late_usage(&a, late_usage(), at(1_000))
+        .unwrap();
+    let (store2, mut request2) = started("req-late-unknown");
+    apply(
+        &store2,
+        &mut request2,
+        0,
+        &[
+            AttemptEvent::Dispatch,
+            AttemptEvent::WireWriteStarted,
+            AttemptEvent::ExecutionObservedUsageUnknown,
+        ],
+        1,
+    );
+    let plan2 = request2.plan_settlement().unwrap();
+    store2
+        .finalize_request(
+            &plan2,
+            &[request2.attempts()[0].id().clone()],
+            RequestClose {
+                outcome: RequestOutcome::Unanswered,
+                reason: None,
+                at: at(2),
+            },
+        )
+        .unwrap();
+    assert!(matches!(
+        store2
+            .reconcile_late_usage(request2.attempts()[0].id(), late_usage(), at(3))
+            .unwrap_err(),
+        AttemptStoreError::Invariant(_)
+    ));
+}
+
 #[test]
 fn an_unpublished_request_charges_the_user_nothing_and_holds_what_may_have_run() {
     let (store, mut request) = started("req-unpublished");

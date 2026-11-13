@@ -124,7 +124,10 @@ pub mod limits;
 pub mod net;
 pub mod reason;
 
-pub use caller::{CallerResolver, IngressContext, Refusal, ResolvedCaller};
+pub use caller::{
+    CallerResolver, IngressContext, Refusal, ResolvedCaller,
+    refuse_child_declarations_below_the_top, strictest_policy,
+};
 pub use config::{IngressConfig, TenantProfile};
 pub use limits::{CallerLimits, LevelLimits, LimitKeys, Limiter, Scope};
 pub use net::{ClientAddr, TrustedProxies};
@@ -145,6 +148,8 @@ pub struct CloudIngress {
     pub(crate) limiter: Arc<Limiter>,
     pub(crate) anonymous: abuse::AnonymousLimiter,
     pub(crate) failures: abuse::FailureThrottle,
+    /// 认证之前的有界工作：同时在途的认证查询、「最近没有认证成功过的凭证」的查询预算（R2 High#4）。
+    pub(crate) auth_budget: abuse::AuthBudget,
     pub(crate) clock: Arc<dyn Clock>,
 }
 
@@ -185,19 +190,28 @@ impl CloudIngress {
                     .to_string(),
             );
         }
+        // 声明了 child_edu 的账户如果已经存在，就必须是顶层客户：写在下级账户上，顶层客户的声明会胜出，
+        // 孩子就可能按非儿童策略被服务（失败开放）。是启动错误，不是警告。
+        caller::refuse_child_declarations_below_the_top(&config, &accounts)?;
         let config = Arc::new(config);
-        let now = clock.now();
+        // 限流器的时间轴是单调时间（`Clock::monotonic_ms`），不是墙上时间
+        let mono = clock.monotonic_ms();
         Ok(Self {
             resolver: Arc::new(CallerResolver::new(accounts, Arc::clone(&config))),
-            limiter: Limiter::new(config.platform, now.0),
+            limiter: Limiter::new(config.platform, mono),
             anonymous: abuse::AnonymousLimiter::new(
                 config.anonymous_per_source,
                 config.anonymous_global,
-                now.0,
+                mono,
             ),
             failures: abuse::FailureThrottle::new(
                 config.auth_failure_max,
                 config.auth_failure_window_secs,
+            ),
+            auth_budget: abuse::AuthBudget::new(
+                config.auth_max_concurrent,
+                config.auth_unknown,
+                mono,
             ),
             config,
             authenticator,
@@ -245,6 +259,11 @@ impl CloudIngress {
     pub fn limiter(&self) -> &Arc<Limiter> {
         &self.limiter
     }
+
+    /// 认证之前的有界工作（测试和诊断用）：空闲的认证名额等。
+    pub fn auth_budget(&self) -> &abuse::AuthBudget {
+        &self.auth_budget
+    }
 }
 
 /// `GET /api/v1/models`：云路由簿里的模型名，OpenAI 的列表形状。
@@ -287,10 +306,16 @@ pub fn build_cloud_app(state: AppState, ingress: Arc<CloudIngress>) -> Router {
             .route_layer(guard.clone()),
     );
     if state.cloud.is_some() {
+        // 请求体上限只有一处说了算：入口配置的 `abuse.body_max_bytes`（`buffer_body` 在认证和限流之后按它缓冲、
+        // 超出就 413）。处理函数的 `Bytes` 提取器自己还有 axum 的默认上限（2 MiB），不调的话，配置允许 4 MiB 的
+        // 合法请求通过了入口的检查，却在这里被 413 拒绝。这一层让提取器的上限和入口配置一致（请求体到这里
+        // 已经被缓冲、验过大小，不会因此多缓冲任何东西）。
+        let body_limit = axum::extract::DefaultBodyLimit::max(ingress.config.body_max_bytes);
         app = app.route(
             "/api/v1/chat/completions",
             post(super::chat_completions)
                 .fallback(crate::not_found)
+                .layer(body_limit)
                 .route_layer(guard),
         );
     }

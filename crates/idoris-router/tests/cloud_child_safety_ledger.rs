@@ -414,6 +414,7 @@ async fn reserving_the_same_stage_twice_fails_closed_without_reusing_the_reserva
         )
         .unwrap(),
         billing: idoris_compute_contracts::permit::Billing::Paid,
+        privacy: Default::default(),
         client_body: child_body(&benign_question()).as_object().unwrap().clone(),
         stream: false,
         client_wants_usage_chunk: false,

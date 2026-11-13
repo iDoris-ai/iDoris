@@ -363,13 +363,33 @@ impl ResponseHead {
     }
 
     /// 读完整个响应体（非流式）：有总时限，有大小上限。
-    pub async fn read_body(mut self) -> Result<Vec<u8>, CloudFailure> {
+    ///
+    /// 时限是 [`CloudTimeouts::body_total`]，从**调用这个方法时**起算（响应头已经到了）。如果调用方还有一个更大范围的
+    /// 总期限（一个请求含所有切换的总期限），用 [`Self::read_body_until`]：否则「响应头时间 + 响应体时间」会超过总期限。
+    pub async fn read_body(self) -> Result<Vec<u8>, CloudFailure> {
+        self.read_body_until(None).await
+    }
+
+    /// 同 [`Self::read_body`]，另外受一个**绝对期限**约束：读正文的时限是 `min(body_total, 距 deadline 还剩多少)`，
+    /// 用**读正文这一刻**的剩余时间算（不是发送之前算好的）。
+    /// 一个请求的总期限 120 秒，响应头第 29 秒才回来，正文最多还能读 91 秒，不是重新开始的 120 秒。
+    pub async fn read_body_until(
+        mut self,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<Vec<u8>, CloudFailure> {
         if self
             .declared_length
             .is_some_and(|len| len > self.max_response_bytes as u64)
         {
             return Err(CloudFailure::BodyTooLarge);
         }
+        let limit = match deadline {
+            Some(deadline) => self
+                .timeouts
+                .body_total
+                .min(deadline.saturating_duration_since(std::time::Instant::now())),
+            None => self.timeouts.body_total,
+        };
         let max = self.max_response_bytes;
         let read = async {
             let mut body = Vec::new();
@@ -386,7 +406,7 @@ impl ResponseHead {
                 }
             }
         };
-        match tokio::time::timeout(self.timeouts.body_total, read).await {
+        match tokio::time::timeout(limit, read).await {
             Ok(result) => result,
             Err(_) => Err(CloudFailure::BodyTimeout),
         }

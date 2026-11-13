@@ -28,6 +28,9 @@ use axum::http::StatusCode;
 pub enum IngressReason {
     /// 同一个凭证前缀在窗口内认证失败太多次（防爆破，也防一个带着已撤销凭证死循环重试的客户端）。429。
     AuthThrottled,
+    /// 认证之前的有界工作满了：同时在途的认证查询太多，或者「最近没有认证成功过的凭证」的查询预算用完了
+    /// （防随机假凭证把认证存储打满）。没有碰库。429，带 `Retry-After`。
+    AuthCapacityLimited,
     /// 没有带凭证（或带的格式不对）的请求太快了。只作用于「没有凭证」的请求，永远不会拦住带着有效凭证的请求。429。
     AnonymousRateLimited,
     /// 请求速率上限（成员 / 租户 / 平台，哪一级见 `X-iDoris-Limit-Scope`）。429，带 `Retry-After`。
@@ -50,8 +53,9 @@ pub enum IngressReason {
 
 impl IngressReason {
     /// 全部原因码，顺序固定（= 变体声明顺序）。
-    pub const ALL: [IngressReason; 10] = [
+    pub const ALL: [IngressReason; 11] = [
         IngressReason::AuthThrottled,
+        IngressReason::AuthCapacityLimited,
         IngressReason::AnonymousRateLimited,
         IngressReason::RequestRateLimited,
         IngressReason::ConcurrencyLimited,
@@ -67,6 +71,7 @@ impl IngressReason {
     pub fn as_str(self) -> &'static str {
         match self {
             IngressReason::AuthThrottled => "auth_throttled",
+            IngressReason::AuthCapacityLimited => "auth_capacity_limited",
             IngressReason::AnonymousRateLimited => "anonymous_rate_limited",
             IngressReason::RequestRateLimited => "request_rate_limited",
             IngressReason::ConcurrencyLimited => "concurrency_limited",
@@ -83,6 +88,7 @@ impl IngressReason {
     pub fn status(self) -> StatusCode {
         match self {
             IngressReason::AuthThrottled
+            | IngressReason::AuthCapacityLimited
             | IngressReason::AnonymousRateLimited
             | IngressReason::RequestRateLimited
             | IngressReason::ConcurrencyLimited => StatusCode::TOO_MANY_REQUESTS,
@@ -101,6 +107,7 @@ impl IngressReason {
         matches!(
             self,
             IngressReason::AuthThrottled
+                | IngressReason::AuthCapacityLimited
                 | IngressReason::AnonymousRateLimited
                 | IngressReason::RequestRateLimited
                 | IngressReason::ConcurrencyLimited
@@ -121,8 +128,13 @@ mod tests {
     use super::*;
 
     /// 线上契约的权威清单：字符串和状态码。改这里就是在改契约，不允许。
-    const PINNED: [(IngressReason, &str, u16); 10] = [
+    const PINNED: [(IngressReason, &str, u16); 11] = [
         (IngressReason::AuthThrottled, "auth_throttled", 429),
+        (
+            IngressReason::AuthCapacityLimited,
+            "auth_capacity_limited",
+            429,
+        ),
         (
             IngressReason::AnonymousRateLimited,
             "anonymous_rate_limited",
@@ -182,7 +194,7 @@ mod tests {
     }
 
     #[test]
-    fn only_the_four_throttles_carry_retry_after() {
+    fn only_the_five_throttles_carry_retry_after() {
         let throttles: Vec<&str> = IngressReason::ALL
             .into_iter()
             .filter(|code| code.is_throttle())
@@ -192,6 +204,7 @@ mod tests {
             throttles,
             [
                 "auth_throttled",
+                "auth_capacity_limited",
                 "anonymous_rate_limited",
                 "request_rate_limited",
                 "concurrency_limited"

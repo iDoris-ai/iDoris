@@ -150,7 +150,31 @@ impl Fixture {
         endpoint: harness::Endpoint,
         safety_yaml: Option<&str>,
     ) -> PathBuf {
-        let endpoints = vec![endpoint];
+        self.cloud_upstream_config_with(vec![endpoint], safety_yaml, None)
+    }
+
+    /// 儿童租户的云上游配置：主上游 + LLM 检查端点（`example-judge`），路由里只有主上游（检查端点不是推理候选）。
+    /// 儿童租户必须配 LLM 检查器（只用规则检查器启动失败，PR-Daemon B3），所以进程级测试要带一个假的检查服务。
+    fn cloud_upstream_config_with_judge(
+        &self,
+        main: harness::Endpoint,
+        judge: harness::Endpoint,
+    ) -> PathBuf {
+        self.cloud_upstream_config_with(
+            vec![main, judge],
+            Some(
+                "safety:\n  mode: rules_and_llm\n  timeout_ms: 5000\n  llm_judge:\n    endpoint: {provider: example-judge, model: example-org/chat-70b, endpoint: openai-compat}\n    max_output_tokens: 32\n",
+            ),
+            Some(vec![("idoris/agent", vec!["example-alpha"])]),
+        )
+    }
+
+    fn cloud_upstream_config_with(
+        &self,
+        endpoints: Vec<harness::Endpoint>,
+        safety_yaml: Option<&str>,
+        routes: Option<Vec<(&'static str, Vec<&'static str>)>>,
+    ) -> PathBuf {
         fs::write(self.path("upstream.key"), "sk-test-upstream-key\n").unwrap();
         fs::write(
             self.path("permits.yaml"),
@@ -159,6 +183,7 @@ impl Fixture {
         .unwrap();
         let mut options = harness::Options {
             callers: Vec::new(),
+            routes,
             ..harness::Options::default()
         };
         if let Some(safety_yaml) = safety_yaml {
@@ -840,9 +865,22 @@ async fn a_child_tenant_declared_in_the_ingress_config_is_served_through_the_saf
         ),
     )])
     .await;
-    let upstream = f.cloud_upstream_config_for(
+    // 儿童租户必须配 LLM 检查器（PR-Daemon B3）：检查服务按请求顺序回答——被规则拒绝的有害输入不会调用它；
+    // 正常的问题调用两次（输入检查、输出检查），都放行
+    let judge = FakeUpstream::start(vec![
+        Behavior::json(
+            200,
+            completion("judge-1", r#"{"verdict":"allow"}"#, Some(usage(40, 6))),
+        ),
+        Behavior::json(
+            200,
+            completion("judge-2", r#"{"verdict":"allow"}"#, Some(usage(40, 6))),
+        ),
+    ])
+    .await;
+    let upstream = f.cloud_upstream_config_with_judge(
         harness::Endpoint::child_edu_compliant("example-alpha", fake.url()),
-        None,
+        harness::Endpoint::child_edu_compliant("example-judge", judge.url()),
     );
     let ingress = f.path("child-ingress.yaml");
     fs::write(&ingress, CHILD_INGRESS_YAML).unwrap();
@@ -921,12 +959,19 @@ async fn a_child_tenant_declared_in_the_ingress_config_is_served_through_the_saf
     assert_eq!(fake.request_count(), 1);
 
     let (stdout, stderr) = child.stop();
-    // 启动日志：儿童租户来自云入口配置，安全管线开着；只用规则检查器的警告也给了；进程加固开了
+    // 启动日志：儿童租户来自云入口配置，安全管线开着（规则 + LLM 两道检查器；不再有「只用规则检查器」的警告，
+    // 那种配置现在启动失败，见 `cloud_child_safety_binary`）；进程加固开了
     assert!(
         stderr.contains("child-data callers (safety pipeline ON): [eduai (cloud ingress)]"),
         "{stderr}"
     );
-    assert!(stderr.contains("rule checker only"), "{stderr}");
+    assert!(stderr.contains("safety: rules_and_llm"), "{stderr}");
+    assert!(!stderr.contains("rule checker only"), "{stderr}");
+    assert_eq!(
+        judge.request_count(),
+        2,
+        "the benign question was checked by the LLM checker before and after the upstream call"
+    );
     assert!(stderr.contains("儿童数据加固已启用"), "{stderr}");
     assert!(stderr.contains("云入口已启用"), "{stderr}");
     assert!(!stdout.contains(&secret) && !stderr.contains(&secret));

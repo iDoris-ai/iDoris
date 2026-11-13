@@ -6,6 +6,8 @@ S4 的供应商配置按 **EndpointKey**（`provider` + `model` + `endpoint`）�
 
 查询日期：2026-11-12。URL 都来自 `docs/design/compute-service-endpoint-table.draft.yaml` 同一天的记录。草案没给出完整 URL、或写明未核对的，下表写「未核实」，不补一个猜出来的地址。
 
+**这张表的主机列在代码里有一份镜像并且会被检查**：`crates/idoris-router/src/cloud/config.rs` 的 `VERIFIED_PROVIDER_HOSTS`。云上游配置加载时，许可表里已有行的供应商，`base_url` 的主机必须是这里核验过的 API 主机；主机「未核实」的供应商（`together`、`google-vertex`、`siliconflow`、`moonshot`）不能配置到任何非回环地址。改这张表的主机，就要同时改那份镜像（PR-Daemon 评审 S4 Low：许可表原来没有和真实的 `base_url` 主机绑定）。
+
 | EndpointKey | URL | 说明 |
 |---|---|---|
 | `deepinfra` / `deepseek-ai/DeepSeek-V3.2` / `openai-chat-completions` | `POST https://api.deepinfra.com/v1/openai/chat/completions` | 草案原文 |

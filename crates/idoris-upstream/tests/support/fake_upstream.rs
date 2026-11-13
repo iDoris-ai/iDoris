@@ -47,6 +47,14 @@ pub enum Behavior {
         declared_len: usize,
         partial: String,
     },
+    /// 一个完整的非流式响应（`Content-Length`），但**头和正文都慢**：先睡 `head_delay` 才写响应头，
+    /// 再睡 `body_delay` 才写正文。用来证明总期限是「头 + 正文」合起来算的，不是各算各的。
+    SlowJson {
+        status: u16,
+        body: String,
+        head_delay: Duration,
+        body_delay: Duration,
+    },
 }
 
 /// 流式响应的一个步骤。
@@ -548,6 +556,24 @@ async fn respond(
             out.write_all(partial.as_bytes()).await?;
             out.flush().await?;
             Ok(())
+        }
+        Behavior::SlowJson {
+            status,
+            body,
+            head_delay,
+            body_delay,
+        } => {
+            if sleep_or_closed(head_delay, closed).await {
+                return Ok(());
+            }
+            let len = format!("Content-Length: {}", body.len());
+            write_head(out, status, &[], &["Content-Type: application/json", &len]).await?;
+            if sleep_or_closed(body_delay, closed).await {
+                return Ok(());
+            }
+            out.write_all(body.as_bytes()).await?;
+            out.flush().await?;
+            out.shutdown().await
         }
     }
 }

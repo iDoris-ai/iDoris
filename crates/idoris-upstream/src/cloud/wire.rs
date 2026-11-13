@@ -8,12 +8,16 @@
 //!   （既有 `RemoteClient` 的「去关联」立场：只发 `model` 与 `messages`，这里在此基础上加上工具与结构化输出）；
 //! - 不能让客户端指定上游的路由偏好：`provider`、`models`、`route`、`transforms`、`plugins` 之类被丢弃。
 //!   端点许可表里的「具体端点」（比如聚合路由的 `zdr-route`）是靠**配置里的 `extra_body`** 落实的，
-//!   由运维写死、盖在客户端字段之上，客户端改不了；
+//!   由运维写死、盖在客户端字段之上，客户端改不了；**但 `extra_body` 自己也不能碰协议 / 计费 / 身份 / 留存字段**
+//!   （[`RESERVED_EXTRA_BODY_FIELDS`]：`model`、`max_tokens`、`stream`、`n`、`messages`、`tools`、`user`、`store`……）：
+//!   它们决定「发给哪个模型、最多花多少钱、带不带身份、上游留不留存」，是准入与许可检查的前提，配置加载时就拒绝
+//!   （[`reserved_extra_body_field`]），构造请求时这些字段最后写入、永远是准入时算好的值；
 //! - 不能让客户端改变计费倍数：`n` 必须是 1（调用方在构造前拒绝），`logprobs` 之类不转发。
 //!
-//! 一定覆盖的字段：`model`（端点自己的模型 id，不是客户端用的别名）、`max_tokens`（**必须**是预留时算出的有效值，
-//! 客户端的 `max_tokens` / `max_completion_tokens` 都不转发，否则上游可以输出超过预留的内容）、`stream`、
-//! `stream_options`（流式时固定 `{"include_usage": true}`：流内 usage 是付费流式请求的结算依据）。
+//! 一定覆盖的字段（**最后写入**，在客户端字段和 `extra_body` 之后）：`model`（端点自己的模型 id，不是客户端用的别名）、
+//! `max_tokens`（**必须**是预留时算出的有效值，客户端的 `max_tokens` / `max_completion_tokens` 都不转发，否则上游可以
+//! 输出超过预留的内容）、`stream`、`stream_options`（流式时固定 `{"include_usage": true}`：流内 usage 是付费流式请求的
+//! 结算依据；非流式没有这个字段）。
 //!
 //! 工具调用：`tools` / `tool_choice` / `parallel_tool_calls` 原样透传；`messages` 原样透传，所以助手消息里的
 //! `tool_calls` 与 `role: tool` 的回传消息自然带着。结构化输出：`response_format` 原样透传。
@@ -46,6 +50,51 @@ pub const FORWARDED_FIELDS: &[&str] = &[
 
 /// 单次请求里 `tools` 的最大个数（防止把巨大的工具表原样转发）。
 pub const MAX_TOOLS: usize = 128;
+
+/// 端点级固定附加字段（配置里的 `extra_body`）**不允许出现**的字段：协议形状、计费倍数与上限、身份、留存。
+///
+/// 为什么：准入、许可表和预留都是按「这个候选、这个模型、这个 `max_tokens`」算好的。`extra_body` 盖在最上面，
+/// 如果它能写 `model`，一个被许可处理儿童数据的候选 A 实际会把请求发给没被许可的模型 B；如果它能写 `max_tokens`，
+/// 余额只够 16 个 token 时被压低的上限会被放大回 4096，造成超额成本；`n`、`service_tier`、`logprobs` 改变计费倍数；
+/// `stream` / `stream_options` 决定结算依据（流内 usage）；`user`、`metadata`、`store` 是能识别用户、让上游留存的字段。
+/// `extra_body` 的正当用途只是供应商自己的路由 / 策略参数（比如聚合路由的 `provider: {zdr: true}`）。
+pub const RESERVED_EXTRA_BODY_FIELDS: &[&str] = &[
+    // 协议形状与身份
+    "model",
+    "messages",
+    "stream",
+    "stream_options",
+    // 上限与计费倍数
+    "max_tokens",
+    "max_completion_tokens",
+    "n",
+    "best_of",
+    "service_tier",
+    "logprobs",
+    "top_logprobs",
+    "logit_bias",
+    "prediction",
+    // 工具与输出形状（许可表按它们筛能力）
+    "tools",
+    "tool_choice",
+    "parallel_tool_calls",
+    "functions",
+    "function_call",
+    "response_format",
+    // 能识别用户、让上游留存的字段
+    "user",
+    "metadata",
+    "store",
+    "safety_identifier",
+];
+
+/// `extra_body` 里第一个保留字段（按 [`RESERVED_EXTRA_BODY_FIELDS`] 的顺序）；没有返回 `None`。配置加载时用它拒绝。
+pub fn reserved_extra_body_field(extra_body: &Map<String, Value>) -> Option<&'static str> {
+    RESERVED_EXTRA_BODY_FIELDS
+        .iter()
+        .copied()
+        .find(|field| extra_body.contains_key(*field))
+}
 
 /// 构造请求体的错误。信息里没有请求内容。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -125,18 +174,27 @@ pub fn build_chat_body(call: &ChatCall<'_>) -> Result<Vec<u8>, BuildError> {
         }
         body.insert(field.to_string(), value.clone());
     }
+    // 端点级固定字段盖在客户端字段之上（比如聚合路由的「只走 ZDR」路由参数）。保留字段一个都不收：配置加载时
+    // 已经拒绝（`reserved_extra_body_field`），这里再跳过一遍，绕过配置校验直接构造设置的调用方也改不了它们。
+    for (key, value) in call.extra_body {
+        if RESERVED_EXTRA_BODY_FIELDS.contains(&key.as_str()) {
+            continue;
+        }
+        body.insert(key.clone(), value.clone());
+    }
+    // 协议、计费、身份字段**最后写入**：不论客户端或 `extra_body` 写了什么，发出去的永远是准入时算好的值
     body.insert(
         "model".to_string(),
         Value::String(call.upstream_model.to_string()),
     );
     body.insert("max_tokens".to_string(), json!(call.max_tokens));
+    body.remove("max_completion_tokens");
+    body.remove("n");
     body.insert("stream".to_string(), Value::Bool(call.stream));
     if call.stream {
         body.insert("stream_options".to_string(), json!({"include_usage": true}));
-    }
-    // 端点级固定字段盖在最上面（比如聚合路由的「只走 ZDR」路由参数）
-    for (key, value) in call.extra_body {
-        body.insert(key.clone(), value.clone());
+    } else {
+        body.remove("stream_options");
     }
     // 序列化失败只可能是 Map 里有不能序列化的值；全是 serde_json::Value，不会发生
     serde_json::to_vec(&Value::Object(body)).map_err(|_| BuildError::MessagesInvalid)
@@ -320,7 +378,7 @@ mod tests {
     }
 
     #[test]
-    fn the_endpoints_fixed_extra_body_overrides_the_client_and_everything_else() {
+    fn the_endpoints_fixed_extra_body_overrides_the_client_but_never_the_protocol_fields() {
         let body = build(
             json!({
                 "messages": [{"role": "user", "content": "x"}],
@@ -333,8 +391,94 @@ mod tests {
             body["provider"],
             json!({"zdr": true, "allow_fallbacks": false})
         );
-        // 运维写死的字段优先于一切，包括 max_tokens（配置要自己对这个负责；这里只证明优先级）
-        assert_eq!(body["max_tokens"], 1);
+        // R2 High#2：`extra_body` 盖得过客户端，但盖不过准入时算好的有效 `max_tokens`（旧行为：写死的 1 会赢，
+        // 余额不足时被压低的上限同样会被它放大）
+        assert_eq!(body["max_tokens"], 321);
+    }
+
+    /// R2 High#2：`extra_body` 里的保留字段（协议 / 计费 / 身份 / 留存）一个都不会出现在上游请求里；
+    /// 模型、有效 `max_tokens`、`stream`、`stream_options` 永远是调用方给的值。
+    #[test]
+    fn extra_body_can_never_override_model_caps_stream_or_identity_fields() {
+        let hostile = json!({
+            "model": "unlicensed/other-model",
+            "max_tokens": 4096,
+            "max_completion_tokens": 4096,
+            "stream": true,
+            "stream_options": {"include_usage": false},
+            "n": 8,
+            "messages": [{"role": "user", "content": "swapped"}],
+            "tools": [{"type": "function", "function": {"name": "injected"}}],
+            "tool_choice": "required",
+            "service_tier": "priority",
+            "logprobs": true,
+            "user": "student-4711",
+            "metadata": {"tenant": "school-a"},
+            "store": true,
+            "provider": {"zdr": true}
+        });
+        for stream in [false, true] {
+            let body = build(
+                json!({"messages": [{"role": "user", "content": "real"}]}),
+                stream,
+                hostile.clone(),
+            );
+            assert_eq!(body["model"], "example-org/chat-70b", "stream={stream}");
+            assert_eq!(body["max_tokens"], 321, "stream={stream}");
+            assert_eq!(body["stream"], stream);
+            if stream {
+                assert_eq!(body["stream_options"], json!({"include_usage": true}));
+            } else {
+                assert!(body.get("stream_options").is_none());
+            }
+            assert_eq!(body["messages"][0]["content"], "real");
+            for field in [
+                "max_completion_tokens",
+                "n",
+                "tools",
+                "tool_choice",
+                "service_tier",
+                "logprobs",
+                "user",
+                "metadata",
+                "store",
+            ] {
+                assert!(
+                    body.get(field).is_none(),
+                    "{field} leaked (stream={stream})"
+                );
+            }
+            // 正当用途（供应商自己的路由参数）照常带上
+            assert_eq!(body["provider"], json!({"zdr": true}));
+        }
+    }
+
+    #[test]
+    fn the_reserved_field_check_names_the_first_offender_and_passes_provider_routing() {
+        let extra = |value: Value| value.as_object().unwrap().clone();
+        assert_eq!(
+            reserved_extra_body_field(&extra(json!({"provider": {"zdr": true}, "top_k": 40}))),
+            None
+        );
+        assert_eq!(
+            reserved_extra_body_field(&extra(json!({"provider": {}, "model": "x"}))),
+            Some("model")
+        );
+        for field in RESERVED_EXTRA_BODY_FIELDS {
+            let mut one = Map::new();
+            one.insert((*field).to_string(), json!(1));
+            assert_eq!(reserved_extra_body_field(&one), Some(*field));
+        }
+        // 客户端能发的白名单字段里，协议 / 计费相关的都在保留表里
+        for field in [
+            "messages",
+            "tools",
+            "tool_choice",
+            "parallel_tool_calls",
+            "response_format",
+        ] {
+            assert!(RESERVED_EXTRA_BODY_FIELDS.contains(&field), "{field}");
+        }
     }
 
     #[test]

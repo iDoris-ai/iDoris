@@ -10,12 +10,13 @@
 //!    对它们按来源地址分一个软配额；这个软配额是**速率**，不是封禁：窗口过去就恢复，不记仇，不影响同一个地址上
 //!    带着有效凭证的请求。
 //!
-//! # 两个限流器
+//! # 三个限流器
 //!
 //! | | 谁被它限制 | 键 | 作用 |
 //! |---|---|---|---|
 //! | [`AnonymousLimiter`] | 没有凭证、或者认证失败的请求 | 来源地址（IPv6 取 /64）的软配额 + 全局总配额 | 防扫描、防海量垃圾请求把入口占满。**永远不会被带着有效凭证的请求碰到。** |
 //! | [`FailureThrottle`] | 带着格式正确、但认证失败的凭证的请求 | **凭证前缀**（凭证明文 `idk_` 之后的前 16 个十六进制字符，64 位，加盐哈希之后做键） | 防爆破，也防一个带着已撤销凭证死循环重试的客户端把库打满。同一个前缀在窗口内失败太多次，之后同前缀的请求先在内存里被拒绝，不碰数据库。 |
+//! | [`AuthBudget`] | **每一个**要开始认证查询的请求（认证**之前**） | 没有键：全局的在途个数 + 「最近没有认证成功过的凭证前缀」的查询预算 | 防**随机假凭证**：攻击者持续发格式合法、前缀各不相同的凭证，上面两个限流器都只在认证**失败之后**才计数，每个假凭证照样进 `spawn_blocking`、抢认证存储的锁、查一次 SQLite。这里把「认证查询」本身的并发和总量卡住，满了直接拒绝、不碰库。 |
 //!
 //! 失败计数**不按纯 IP**：按凭证前缀。一个学校里一个学生把密钥输错，只会让「这个错的密钥」被限流，同一个出口后面
 //! 其他学生的密钥（前缀不同）完全不受影响。
@@ -36,7 +37,9 @@
 use std::collections::hash_map::RandomState;
 use std::hash::BuildHasher;
 use std::net::{IpAddr, Ipv6Addr};
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use super::bucket::{Bounded, Bucket, RateLimit};
 
@@ -112,6 +115,96 @@ impl AnonymousLimiter {
             return Err(retry);
         }
         Ok(())
+    }
+}
+
+/// 最近认证成功过的凭证前缀表的容量。
+const MAX_KNOWN_ENTRIES: usize = 16_384;
+
+/// 认证之前的有界工作（R2 High#4）：见模块文档。
+///
+/// 两道闸，都在**碰库之前**：
+///
+/// 1. **在途个数**：同时进行的认证查询不超过 `max_concurrent`。满了直接拒绝，不排队（排队就是把攻击者的请求
+///    攒在内存里，等库有空了再一个个查）。名额在认证查询结束时释放（[`AuthSlot`] 丢弃）。
+/// 2. **查询预算**：一个令牌桶，只有**最近没有认证成功过的凭证前缀**才消耗它。随机假凭证的前缀永远是新的，
+///    所以它们合起来每分钟最多只能让库查 `unknown` 这么多次；而最近认证成功过的前缀（真实在用的凭证，比如 eduai 后端的
+///    服务凭证）不消耗它，只受第 1 条的在途个数约束——攻击者把预算耗光，在用的凭证照样能认证。
+///    认证失败（凭证被撤销、过期）会把前缀从「成功过」里去掉。
+///
+/// **不按来源地址**：学校的共享出口下，一个学生的凭证不能因为同一个出口上别人在发垃圾请求而被拒绝
+/// （设计稿 §9 第 3 条）。成员 / 租户 / 平台三级限流（`limits`）照旧在认证之后。
+pub struct AuthBudget {
+    slots: Arc<Semaphore>,
+    unknown_limit: RateLimit,
+    unknown: Mutex<Bucket>,
+    known: Mutex<Bounded<u64, ()>>,
+}
+
+impl std::fmt::Debug for AuthBudget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthBudget")
+            .field("available_slots", &self.slots.available_permits())
+            .finish_non_exhaustive()
+    }
+}
+
+/// 一次认证查询占着的名额；丢弃时释放。
+#[must_use = "dropping the slot releases the in-flight authentication slot"]
+pub struct AuthSlot {
+    _permit: OwnedSemaphorePermit,
+}
+
+impl std::fmt::Debug for AuthSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthSlot").finish_non_exhaustive()
+    }
+}
+
+impl AuthBudget {
+    pub fn new(max_concurrent: usize, unknown: RateLimit, now_ms: i64) -> Self {
+        Self {
+            slots: Arc::new(Semaphore::new(max_concurrent.max(1))),
+            unknown_limit: unknown,
+            unknown: Mutex::new(Bucket::full(&unknown, now_ms)),
+            known: Mutex::new(Bounded::new(MAX_KNOWN_ENTRIES)),
+        }
+    }
+
+    /// 一个请求要开始认证查询了。`prefix` 是 [`FailureThrottle::key_of`] 给的键（格式不对没有键，按「没成功过」算）。
+    /// `Err(秒数)` = 满了，直接拒绝（该等多久，至少 1）；没有碰库。
+    pub fn admit(&self, prefix: Option<u64>, now_ms: i64) -> Result<AuthSlot, u64> {
+        let known = prefix.is_some_and(|prefix| lock(&self.known).get_mut(&prefix).is_some());
+        let mut took_unknown = false;
+        if !known {
+            lock(&self.unknown).try_take(&self.unknown_limit, now_ms)?;
+            took_unknown = true;
+        }
+        match Arc::clone(&self.slots).try_acquire_owned() {
+            Ok(permit) => Ok(AuthSlot { _permit: permit }),
+            Err(_) => {
+                if took_unknown {
+                    // 没有真的开始查：令牌退回去
+                    lock(&self.unknown).give_back(&self.unknown_limit);
+                }
+                Err(1)
+            }
+        }
+    }
+
+    /// 这个前缀认证成功了：之后它的请求不再消耗查询预算。
+    pub fn record_success(&self, prefix: u64) {
+        lock(&self.known).get_or_insert_with(&prefix, || (), |_| false, |_| true);
+    }
+
+    /// 这个前缀认证失败了（撤销、过期、被冻结）：不再算「成功过」。
+    pub fn record_failure(&self, prefix: u64) {
+        lock(&self.known).remove(&prefix);
+    }
+
+    /// 当前空闲的认证名额（测试和诊断用）。
+    pub fn available_slots(&self) -> usize {
+        self.slots.available_permits()
     }
 }
 
@@ -297,6 +390,77 @@ mod tests {
         assert!(limiter.admit(b, 0).is_err()); // b 被全局拒绝，b 的令牌必须退回
         // 一秒后全局恢复 1 个：b 的软配额没有被那次被拒的请求吃掉，所以 b 能过
         assert!(limiter.admit(b, 1_000).is_ok());
+    }
+
+    // ---------- 认证之前的有界工作 ----------
+
+    #[test]
+    fn the_in_flight_authentication_slots_are_bounded_and_released_on_drop() {
+        let budget = AuthBudget::new(2, limit(60_000, 10_000), 0);
+        let a = budget.admit(Some(1), 0).unwrap();
+        let b = budget.admit(Some(2), 0).unwrap();
+        assert_eq!(budget.available_slots(), 0);
+        // 满了：直接拒绝，不排队
+        assert_eq!(budget.admit(Some(3), 0).unwrap_err(), 1);
+        drop(a);
+        assert_eq!(budget.available_slots(), 1);
+        let c = budget.admit(Some(3), 0).unwrap();
+        drop((b, c));
+        assert_eq!(budget.available_slots(), 2);
+    }
+
+    #[test]
+    fn a_flood_of_unknown_prefixes_is_capped_by_the_budget_and_a_refusal_gives_the_token_back() {
+        // 预算：突发 3，每分钟 60（每秒 1 个）
+        let budget = AuthBudget::new(100, limit(60, 3), 0);
+        for prefix in 0..3u64 {
+            drop(budget.admit(Some(prefix), 0).unwrap());
+        }
+        // 第 4 个随机前缀：预算空了，直接拒绝，等 1 秒
+        assert_eq!(budget.admit(Some(1_000), 0).unwrap_err(), 1);
+        assert_eq!(
+            budget.admit(None, 0).unwrap_err(),
+            1,
+            "no prefix counts as unknown"
+        );
+        // 过一秒恢复一个
+        assert!(budget.admit(Some(1_001), 1_000).is_ok());
+
+        // 名额满了拒绝时，刚取的令牌退回去（这次查询没有真的开始）
+        let budget = AuthBudget::new(1, limit(60, 1), 0);
+        let held = budget.admit(Some(1), 0).unwrap(); // 取走唯一的令牌和唯一的名额
+        assert!(budget.admit(Some(2), 1_000).is_err()); // 令牌回来了一个，但名额满了
+        drop(held);
+        assert!(
+            budget.admit(Some(3), 1_000).is_ok(),
+            "the refused attempt did not eat the refilled token"
+        );
+    }
+
+    #[test]
+    fn a_prefix_that_recently_authenticated_is_not_charged_and_a_failure_forgets_it() {
+        let budget = AuthBudget::new(100, limit(60, 1), 0);
+        let legit = 0xAAAA_u64;
+        drop(budget.admit(Some(legit), 0).unwrap()); // 预算的唯一令牌
+        budget.record_success(legit);
+        // 攻击者把预算耗光：新前缀进不来
+        assert!(budget.admit(Some(7), 0).is_err());
+        // 在用的凭证照样能认证，一次又一次
+        for _ in 0..50 {
+            drop(budget.admit(Some(legit), 0).unwrap());
+        }
+        // 它被撤销（认证失败）之后，又要和别的未知前缀一样消耗预算
+        budget.record_failure(legit);
+        assert!(budget.admit(Some(legit), 0).is_err());
+    }
+
+    #[test]
+    fn the_known_prefix_table_stays_bounded() {
+        let budget = AuthBudget::new(10, limit(60_000, 10_000), 0);
+        for prefix in 0..50_000u64 {
+            budget.record_success(prefix);
+        }
+        assert!(lock(&budget.known).len() <= MAX_KNOWN_ENTRIES);
     }
 
     // ---------- 凭证前缀 ----------
