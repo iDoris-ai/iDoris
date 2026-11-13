@@ -36,6 +36,14 @@
 //! 调用方自己的错误（400）、本机自己的 bug。`X-iDoris-Headroom-Breach: confirmed` **不是**出网授权：它只在本机放得下的前提下
 //! 让这一次加载动用保留余量；带了它而本机仍然放不下，`local_only` 请求照旧失败，`any` 请求也还要有第 4 条才能出网。
 //!
+//! ## 远程熔断以出网那一刻的值为准
+//!
+//! 熔断是个共享的原子变量，随时可能被打开（请求以 `any` + 同意进来，本机处理期间熔断被打开，本机随后失败——这个请求
+//! 不能再去云端）。所以云端档不在请求进来时存快照，而是在三个点各自现读：闸门（第 1 层）、出网前的第一次复核（读完凭证、
+//! 占到名额之后，还没有任何副作用：不写审计事件、不落 `pending` 行）、`forward::send` 里的最后一道门（请求构造好之后、
+//! 第一次真正发送之前，中间没有让出点）。任何一处拦下，调用方拿到的都和没有云端档时逐字节相同，云端收到 0 个请求；
+//! 最后一道门拦下时 `pending` 行已经落下，写成 `cancelled`（没有出网）。已经发出去的请求不会因为熔断随后打开而被收回。
+//!
 //! ## 同意机制（第 4 条）
 //!
 //! 请求头 `X-iDoris-Cloud-Fallback: allow`：恰好一个值、恰好是 `allow`（ASCII 不分大小写）；只对这一个请求有效，不记忆。
@@ -183,6 +191,8 @@ pub struct CloudTier {
     clock: Arc<dyn Clock>,
     card: ComponentCard,
     slots: Arc<tokio::sync::Semaphore>,
+    /// 交给后台线程去写的取消终态还有几个没写完（见 [`PendingCall`]）。
+    cancel_writes: Arc<CancelWrites>,
 }
 
 impl std::fmt::Debug for CloudTier {
@@ -205,6 +215,7 @@ impl CloudTier {
             clock: parts.clock,
             card,
             slots,
+            cancel_writes: Arc::new(CancelWrites::default()),
         })
     }
 
@@ -219,6 +230,25 @@ impl CloudTier {
 
     pub fn provider(&self) -> &Arc<dyn CredentialProvider> {
         &self.provider
+    }
+
+    /// 等所有交给后台线程的取消终态（调用方挂断时 `PendingCall` 丢掉之后写的那一行）写完。测试用它做确定性的栅栏；
+    /// 停机时，二进制的 `Runtime::shutdown_timeout` 会等还在跑的阻塞任务（见 `bin/idoris.rs` 的 `RUNTIME_DROP_GRACE`）。
+    pub async fn wait_for_background_writes(&self) {
+        loop {
+            let notified = self.cancel_writes.idle.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self
+                .cancel_writes
+                .in_flight
+                .load(std::sync::atomic::Ordering::SeqCst)
+                == 0
+            {
+                return;
+            }
+            notified.await;
+        }
     }
 
     /// 合成的云端档组件卡（测试读）。
@@ -395,13 +425,14 @@ impl CloudTier {
     async fn record_begin(&self, local_request_id: &str) -> Option<PendingCall> {
         let store = self.store.clone();
         let clock = self.clock.clone();
+        let cancel_writes = self.cancel_writes.clone();
         let id = local_request_id.to_string();
         let now = self.now_ms();
         let (sender, receiver) = tokio::sync::oneshot::channel();
         tokio::task::spawn_blocking(move || match store.begin_call(&id, 1, now) {
             Ok(ticket) => {
                 // `Err(guard)`（接收端已经被丢掉）：guard 在这里被 drop，把刚落下的行写成 cancelled
-                let _ = sender.send(PendingCall::armed(store, clock, ticket));
+                let _ = sender.send(PendingCall::armed(store, clock, cancel_writes, ticket));
             }
             Err(error) => eprintln!("[idoris] 云端档：无法记录出网调用，不发送：{error}"),
         });
@@ -456,18 +487,33 @@ struct OwnedFinish {
 /// 出网的请求随 future 一起被丢掉（连接关闭），所以这时的结局是 `cancelled`：出网了、没有答复、没有金额。
 ///
 /// 正常路径自己写终态：先 [`Self::disarm`]（之后 drop 什么都不做），紧接着（中间没有任何让出点）调 `record_finish`。
+///
+/// # 析构时不等数据库（审查 r4 Medium#7）
+///
+/// 看守多半是在异步任务里被丢掉的。`finish_call` 要等连接的互斥锁和 `BEGIN IMMEDIATE`（busy timeout 5 秒）：别的写事务占着库时，
+/// 同时挂断的几个云请求会把几个异步工作线程全卡住，同一个运行时上的其它请求和计时器也跑不动。所以 `drop` 只做两件不会等的事：
+/// 读一下时钟，把写入交给阻塞线程池（`spawn_blocking`，不等它）。写入在后台线程里做，库忙就重试几次，仍然保证落下；
+/// 实在落不下，这一行还是会在下次启动时被标成 `interrupted`（和进程崩溃同一条路）。
+/// 没有 tokio 运行时（同步环境、运行时已经销毁）就在当前线程直接写：那里没有异步工作线程可卡。
 struct PendingCall {
     store: Arc<CloudTierStore>,
     clock: Arc<dyn Clock>,
+    cancel_writes: Arc<CancelWrites>,
     ticket: CallTicket,
     armed: bool,
 }
 
 impl PendingCall {
-    fn armed(store: Arc<CloudTierStore>, clock: Arc<dyn Clock>, ticket: CallTicket) -> Self {
+    fn armed(
+        store: Arc<CloudTierStore>,
+        clock: Arc<dyn Clock>,
+        cancel_writes: Arc<CancelWrites>,
+        ticket: CallTicket,
+    ) -> Self {
         Self {
             store,
             clock,
+            cancel_writes,
             ticket,
             armed: true,
         }
@@ -485,12 +531,99 @@ impl Drop for PendingCall {
         if !self.armed {
             return;
         }
-        let finish = CallFinish::without_answer(CallOutcome::Cancelled, self.clock.now().0);
-        match self.store.finish_call(&self.ticket, &finish) {
-            Ok(()) | Err(CloudTierStoreError::AlreadyFinal(_)) => {}
-            Err(error) => eprintln!(
-                "[idoris] 云端档：调用方挂断后无法把调用记录写成 cancelled（{error}），这一行会在下次启动时被标成 interrupted"
-            ),
+        let write = CancelWrite {
+            store: self.store.clone(),
+            ticket: self.ticket.clone(),
+            finished_at_ms: self.clock.now().0,
+            // 计数的守卫随写入走：写完、或者写入对象因为别的原因被丢掉，计数都会减回去
+            _in_flight: CancelWriteInFlight::begin(self.cancel_writes.clone()),
+            done: false,
+        };
+        match tokio::runtime::Handle::try_current() {
+            // 不等它：JoinHandle 直接丢掉（任务照常运行）
+            Ok(handle) => drop(handle.spawn_blocking(move || write.run())),
+            // 没有运行时：不是异步线程，直接写
+            Err(_) => write.run(),
+        }
+    }
+}
+
+/// 一次「把这一行写成 cancelled」的写入。[`Self::run`] 把它写完；**没跑就被丢掉**的时候，`Drop` 在当前线程把它写完。
+///
+/// 没跑就被丢掉只发生在运行时关闭的时候：阻塞线程池已经不收新任务了（`spawn_blocking` 当场把闭包丢掉），或者收了但
+/// 关闭时清空队列把它丢掉。关闭中的运行时上没有请求可卡，而这一行必须有终态，所以在这里同步写，不留给下次启动去标
+/// `interrupted`。正常运行时线程池不会拒绝任务，这条路走不到。
+struct CancelWrite {
+    store: Arc<CloudTierStore>,
+    ticket: CallTicket,
+    finished_at_ms: i64,
+    _in_flight: CancelWriteInFlight,
+    done: bool,
+}
+
+impl CancelWrite {
+    fn run(mut self) {
+        write_cancelled(&self.store, &self.ticket, self.finished_at_ms);
+        self.done = true;
+    }
+}
+
+impl Drop for CancelWrite {
+    fn drop(&mut self) {
+        if !self.done {
+            write_cancelled(&self.store, &self.ticket, self.finished_at_ms);
+        }
+    }
+}
+
+/// 取消终态的写入：库忙（别的写事务占着）时重试几次，每次已经包含连接自己的 busy timeout。
+fn write_cancelled(store: &CloudTierStore, ticket: &CallTicket, finished_at_ms: i64) {
+    const ATTEMPTS: u32 = 3;
+    let finish = CallFinish::without_answer(CallOutcome::Cancelled, finished_at_ms);
+    for attempt in 1..=ATTEMPTS {
+        match store.finish_call(ticket, &finish) {
+            Ok(()) | Err(CloudTierStoreError::AlreadyFinal(_)) => return,
+            Err(CloudTierStoreError::Sql(_)) if attempt < ATTEMPTS => {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Err(error) => {
+                eprintln!(
+                    "[idoris] 云端档：调用方挂断后无法把调用记录写成 cancelled（{error}），这一行会在下次启动时被标成 interrupted"
+                );
+                return;
+            }
+        }
+    }
+}
+
+/// 交给后台线程去写的取消终态的记账：还有几个没写完。
+#[derive(Default)]
+struct CancelWrites {
+    in_flight: std::sync::atomic::AtomicUsize,
+    idle: tokio::sync::Notify,
+}
+
+/// 一个还没写完的取消终态。丢掉它（写完了，或者闭包根本没跑成）就把计数减回去。
+struct CancelWriteInFlight(Arc<CancelWrites>);
+
+impl CancelWriteInFlight {
+    fn begin(accounting: Arc<CancelWrites>) -> Self {
+        accounting
+            .in_flight
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Self(accounting)
+    }
+}
+
+impl Drop for CancelWriteInFlight {
+    fn drop(&mut self) {
+        if self
+            .0
+            .in_flight
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst)
+            == 1
+        {
+            self.0.idle.notify_waiters();
         }
     }
 }
@@ -583,7 +716,10 @@ pub(crate) struct FallbackScope<'a> {
     headers: &'a HeaderMap,
     body: &'a Value,
     parsed: &'a ParsedProfile,
-    privacy: PrivacyFacts,
+    /// 内容检查写回之后的有效隐私类别（请求进来时就定了，之后不会变）。
+    effective_privacy: Option<PrivacyClass>,
+    /// 内容检查把这个请求钉成了本地（同上，请求进来时就定了）。
+    pinned_local_by_content: bool,
     content_tightened: bool,
     prompt: &'a str,
     completion_tokens: u64,
@@ -623,14 +759,8 @@ impl<'a> FallbackScope<'a> {
             headers: inputs.headers,
             body: inputs.body,
             parsed: inputs.parsed,
-            privacy: PrivacyFacts {
-                effective: inputs.parsed.task.privacy,
-                pinned_local_by_content: inputs.pinned_local_by_content,
-                kill_switch: inputs
-                    .state
-                    .remote_kill_switch
-                    .load(std::sync::atomic::Ordering::SeqCst),
-            },
+            effective_privacy: inputs.parsed.task.privacy,
+            pinned_local_by_content: inputs.pinned_local_by_content,
             content_tightened: inputs.content_tightened,
             prompt: inputs.prompt,
             completion_tokens: inputs.completion_tokens,
@@ -640,6 +770,24 @@ impl<'a> FallbackScope<'a> {
             dispatched: inputs.dispatched,
             completed: inputs.completed,
         })
+    }
+
+    /// 远程熔断开关**此刻**的值。熔断是个共享的原子变量，随时可能被打开：每一次要做「能不能出网」的判断都现读，不留快照。
+    /// （以前这里在请求进来时读一次存起来，回落时直接用：请求以 `any` + 同意进来、本机处理期间熔断被打开、本机随后失败，
+    /// 回落仍然会把正文发往云端——审查 r4 High#1。）
+    fn kill_switch_on(&self) -> bool {
+        self.state
+            .remote_kill_switch
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// 闸门的隐私事实：隐私类别和内容检查的结论请求进来时就定了；熔断现读。
+    fn privacy_facts(&self) -> PrivacyFacts {
+        PrivacyFacts {
+            effective: self.effective_privacy,
+            pinned_local_by_content: self.pinned_local_by_content,
+            kill_switch: self.kill_switch_on(),
+        }
     }
 
     fn role_name(&self) -> Option<&'static str> {
@@ -673,7 +821,7 @@ pub(crate) async fn fallback(
     let tier = scope.tier;
     let cloud_model = tier.config.cloud_model_for(scope.role_name());
     let input = GateInput {
-        privacy: scope.privacy,
+        privacy: scope.privacy_facts(),
         dev_no_key: scope.dev_no_key,
         consent: gate::consent(scope.headers),
         stream: scope.wants_stream(),
@@ -700,6 +848,11 @@ pub(crate) async fn fallback(
     let Ok(_slot) = tier.slots.clone().try_acquire_owned() else {
         return annotate(original, "saturated");
     };
+    // 出网前的第一次复核：闸门放行之后，读凭证、占名额期间远程熔断可能已经被打开。还没有任何副作用（没写审计事件、
+    // 没落 pending 行），所以这里拦下来什么都不留；调用方拿到的和没有云端档时逐字节相同。
+    if scope.kill_switch_on() {
+        return original;
+    }
     let body = tier.cloud_body(scope.body, cloud_model);
     if let Some(context) = scope.dispatched
         && crate::append_dispatched(context, &selected).await.is_err()
@@ -723,6 +876,8 @@ pub(crate) async fn fallback(
         &loaded.secret,
         &body,
         &cancel,
+        // 出网边界上的最后一道门：写审计事件、落 pending 行又隔了几个让出点，熔断可能在这期间被打开
+        &|| !scope.kill_switch_on(),
     )
     .await;
     drop(loaded);
@@ -762,6 +917,25 @@ pub(crate) async fn fallback(
             }
             complete_event(scope, &selected, "success").await;
             served_response(&selected, answer)
+        }
+        // 最后一道门把它拦下了：**没有任何字节离开本机**。行已经落下了（先写后出网），写成 cancelled（没有答复、没有云端 id、
+        // 没有金额）；事件流补一个失败的 completed。调用方拿到本机原来的失败响应，一个字节都不改，连 X-iDoris-Cloud-Attempt
+        // 都没有——那个头的意思是「数据可能已经离开本机」，这里没有。
+        Err(forward::CloudFailure::Withheld) => {
+            let withheld = OwnedFinish {
+                outcome: CallOutcome::Cancelled,
+                finished_at_ms: tier.now_ms(),
+                cloud_record_id: None,
+                http_status: None,
+                cloud_reason: None,
+                tokens_in: None,
+                tokens_out: None,
+            };
+            if let Err(error) = tier.record_finish(ticket, withheld).await {
+                eprintln!("[idoris] 云端档：熔断拦下了发送，但无法写入调用结局（{error}）");
+            }
+            complete_event(scope, &selected, "failure").await;
+            original
         }
         Err(failure) => {
             let outcome = failure.outcome();
@@ -878,7 +1052,8 @@ fn served_response(selected: &Selected, answer: forward::CloudAnswer) -> Respons
     response
 }
 
-/// 本机虚拟 key 库做的 [`LocalSecretProbe`]：这个密钥是不是本机一把有效的本地数据密钥。
+/// 本机虚拟 key 库做的 [`LocalSecretProbe`]：这个密钥是不是本机的本地数据密钥——**不论状态**：有效的、已撤销的、
+/// 已过期的都算（撤销只是本机不再认它，这串明文仍然是用户当作本地密钥用过的东西，不能当云凭证发出去）。
 /// **判不了（库不可用）按「是」处理**：宁可拒绝一次回落，也不把可能是本地密钥的东西发出去。
 pub struct VirtualKeyProbe(
     pub Arc<std::sync::Mutex<idoris_tenancy::virtual_key::store::VirtualKeyStore>>,
@@ -889,13 +1064,38 @@ impl LocalSecretProbe for VirtualKeyProbe {
         let Ok(parsed) = idoris_tenancy::virtual_key::VirtualKeySecret::parse(secret) else {
             return false;
         };
-        let now = SystemClock.now().0;
         match self.0.lock() {
-            Ok(store) => store
-                .authenticate(&parsed, now)
-                .map_or(true, |found| found.is_some()),
+            Ok(store) => store.contains_secret(&parsed).unwrap_or(true),
             Err(_) => true,
         }
+    }
+}
+
+/// 本机虚拟 key 库**文件**做的 [`LocalSecretProbe`]，给不起服务进程的命令行（`idoris cloud unpair`）用：
+/// 每次现查，只读地打开库文件，不创建文件、不建表。没有库文件（或者还没有 key 表）就是没有签发过任何 key：不是本地密钥。
+/// 和 [`VirtualKeyProbe`] 一样不论状态、判不了按「是」处理（库被锁着、读不出来……）。
+pub struct VirtualKeyFileProbe {
+    db_path: PathBuf,
+}
+
+impl VirtualKeyFileProbe {
+    pub fn new(db_path: impl Into<PathBuf>) -> Self {
+        Self {
+            db_path: db_path.into(),
+        }
+    }
+}
+
+impl LocalSecretProbe for VirtualKeyFileProbe {
+    fn is_local_secret(&self, secret: &str) -> bool {
+        let Ok(parsed) = idoris_tenancy::virtual_key::VirtualKeySecret::parse(secret) else {
+            return false;
+        };
+        idoris_tenancy::virtual_key::store::VirtualKeyStore::path_contains_secret(
+            &self.db_path,
+            &parsed,
+        )
+        .unwrap_or(true)
     }
 }
 

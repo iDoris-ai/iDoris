@@ -18,6 +18,8 @@ use idoris_contracts::ComponentCard;
 use idoris_router::cloud_tier::{CloudTier, DeviceStore};
 use idoris_tenancy::cloud_tier::{CallOutcome, CallState};
 use serde_json::json;
+use wiremock::matchers::{method, path};
+use wiremock::{Mock, MockServer, Respond, ResponseTemplate};
 
 const CONSENT: (&str, &str) = ("x-idoris-cloud-fallback", "allow");
 const ANY: (&str, &str) = ("x-idoris-privacy", "any");
@@ -705,4 +707,226 @@ async fn the_cloud_tier_limits_how_many_calls_are_in_flight_and_does_not_queue()
     );
     let _ = aid("a1");
     let _ = json!({});
+}
+
+// ================================================================================================
+// 配对：同一台机器上的两个配对不能互相覆盖（审查 r4 Medium#4）
+// ================================================================================================
+
+/// 两个配对同时开始（单线程运行时：A 在等兑换响应的时候 B 开始）。以前「尚未配对」的检查和最终的 `rename` 之间没有任何锁，
+/// 而 `rename` 会覆盖已有文件：两个进程各兑换一个账号的配对码、都先读到文件不存在，A 写入之后 B 覆盖它，两个都报告成功——
+/// A 的云凭证仍然有效、但本机已经丢了它（孤儿凭证），之后的请求用的是 B 的付款上下文。
+#[tokio::test]
+async fn two_pairings_racing_on_one_machine_cannot_both_redeem_and_the_loser_does_not_burn_its_code()
+ {
+    let cloud = TcpCloud::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let state_dir = dir.path().join("cloud-tier");
+    let admin = cloud.issue_agent24_admin();
+    let code_a = cloud.mint_pairing_code(&admin, "m-agent-1", 600).await;
+    let code_b = cloud.mint_pairing_code(&admin, "m-agent-1", 600).await;
+    cloud.log.clear();
+
+    let (a, b) = tokio::join!(
+        pair_device(&cloud, &state_dir, &code_a),
+        pair_device(&cloud, &state_dir, &code_b)
+    );
+
+    let redeems = cloud
+        .log
+        .all()
+        .iter()
+        .filter(|seen| seen.path.ends_with("/pairing/redeem"))
+        .count();
+    assert_eq!(
+        redeems, 1,
+        "the second pairing redeemed its one-time code although this machine was being paired: {a:?} / {b:?}"
+    );
+    let winners = [&a, &b].iter().filter(|outcome| outcome.is_ok()).count();
+    assert_eq!(winners, 1, "exactly one pairing may succeed: {a:?} / {b:?}");
+    let loser = [&a, &b]
+        .into_iter()
+        .find_map(|outcome| outcome.as_ref().err())
+        .unwrap();
+    assert!(
+        loser.contains("已经配对") || loser.contains("正在运行"),
+        "{loser}"
+    );
+    // 文件里是赢家的凭证，而且它在云端有效（没有被覆盖、没有被撤销）
+    let device = DeviceStore::new(&state_dir).read().unwrap().unwrap();
+    let reply = cloud
+        .world
+        .send(&Req::chat(&Cred {
+            id: String::new(),
+            secret: device.secret.expose_secret().to_string(),
+        }))
+        .await;
+    assert_eq!(reply.status, 200, "{}", reply.text());
+}
+
+fn control_plane_secret(seed: char) -> String {
+    format!("idk_{}", seed.to_string().repeat(64))
+}
+
+/// 每次兑换发一张不同的凭证（seed 依次是 a、b、c……），兑换响应慢 `delay`（给「兑换期间别的进程动了文件」留出窗口）。
+struct SlowRedeem {
+    delay: Duration,
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+impl Respond for SlowRedeem {
+    fn respond(&self, _request: &wiremock::Request) -> ResponseTemplate {
+        let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let seed = char::from(b'a' + u8::try_from(n).unwrap());
+        ResponseTemplate::new(201)
+            .set_delay(self.delay)
+            .set_body_json(json!({
+                "result": "created", "reason_code": "ok", "request_id": "r",
+                "data": {
+                    "credential": {"id": format!("vk_new_{n}"), "binding": {"kind": "member", "membership": "m-new"}, "status": "active"},
+                    "secret": control_plane_secret(seed), "membership": "m-new", "pairing_id": format!("pc_new_{n}")
+                }
+            }))
+    }
+}
+
+async fn run_pair_against(
+    server: &MockServer,
+    state_dir: &std::path::Path,
+    code: &str,
+) -> Result<u8, String> {
+    let config = parse_tier_config(&tier_config_for(
+        &format!("{}/api", server.uri()),
+        Some(state_dir),
+        "",
+        "",
+    ));
+    let mut stdin = std::io::Cursor::new(format!("{code}\n").into_bytes());
+    let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+    idoris_router::cloud_tier::cli::run_pair(
+        idoris_router::cloud_tier::cli::CliContext {
+            config: &config,
+            db_path: &state_dir.join("idoris.sqlite3"),
+            http: idoris_upstream::http_client().unwrap(),
+            now_ms: 1_700_000_000_000,
+            probe: &NoLocalKeys,
+        },
+        None,
+        &mut stdin,
+        &mut stdout,
+        &mut stderr,
+    )
+    .await
+}
+
+/// 就算有进程不遵守锁（旧版本、手工放文件），安装也不覆盖已有的凭证：兑换成功之后发现装不上，就用手里这张新凭证把云端那张撤销，
+/// 免得它成了没人持有的孤儿；已有的那张原样不动。
+#[tokio::test]
+async fn an_install_never_overwrites_a_credential_that_appeared_meanwhile_and_the_new_one_is_revoked()
+ {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/control/v1/pairing/redeem"))
+        .respond_with(SlowRedeem {
+            delay: Duration::from_millis(700),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        })
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/control/v1/pairing/unpair"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"data": {"credential": {"status": "revoked"}}})),
+        )
+        .mount(&server)
+        .await;
+    let dir = tempfile::tempdir().unwrap();
+    let state_dir = dir.path().join("cloud-tier");
+    let origin = parse_tier_config(&tier_config_for(
+        &format!("{}/api", server.uri()),
+        Some(&state_dir),
+        "",
+        "",
+    ))
+    .origin();
+
+    let state = state_dir.clone();
+    let outcome = {
+        let racer = async {
+            // 等兑换请求到达云端（此时配对流程正在等慢吞吞的兑换响应），然后另一个「进程」把一张凭证放进了状态目录
+            for _ in 0..200 {
+                let seen = server.received_requests().await.unwrap();
+                if seen
+                    .iter()
+                    .any(|r| r.url.path().ends_with("/pairing/redeem"))
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            let file = state.join("device.json");
+            std::fs::write(
+                &file,
+                json!({
+                    "version": 1, "origin": origin, "credential_id": "vk_interloper",
+                    "membership": "m-other", "pairing_id": "pc_interloper",
+                    "paired_at_ms": 1, "secret": control_plane_secret('f'),
+                })
+                .to_string(),
+            )
+            .unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        };
+        let (outcome, ()) = tokio::join!(
+            run_pair_against(&server, &state_dir, "ABCD-EFGH-JKMN"),
+            racer
+        );
+        outcome
+    };
+
+    let message = outcome.expect_err(
+        "the pairing reported success although another credential appeared during the redeem",
+    );
+    assert!(message.contains("没有覆盖"), "{message}");
+    // 已有的那张原样不动
+    assert_eq!(
+        DeviceStore::new(&state_dir)
+            .read()
+            .unwrap()
+            .unwrap()
+            .secret
+            .expose_secret(),
+        control_plane_secret('f')
+    );
+    // 新兑换的那张被撤销了：恰好一次 unpair，带的是新凭证（seed a），不是已有的那张
+    let unpairs: Vec<_> = server
+        .received_requests()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|r| r.url.path().ends_with("/pairing/unpair"))
+        .collect();
+    assert_eq!(
+        unpairs.len(),
+        1,
+        "the freshly redeemed credential must be revoked"
+    );
+    assert_eq!(
+        unpairs[0]
+            .headers
+            .get("authorization")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        format!("Bearer {}", control_plane_secret('a'))
+    );
+    // 没有留下临时文件
+    let names: Vec<String> = std::fs::read_dir(&state_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+        .filter(|name| name != ".lock")
+        .collect();
+    assert_eq!(names, ["device.json"], "{names:?}");
 }

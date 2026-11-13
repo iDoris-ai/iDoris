@@ -30,6 +30,8 @@
 //! | 5xx、3xx、其它 | `cloud_error` |
 //! | 连接不上（DNS、连接被拒、TLS） | `unreachable` |
 //! | 总期限内没读完 | `timeout` |
+//! | 2xx 但 `usage` 里的 token 数超出调用记录能存的范围（i64） | `invalid_response` |
+//! | 出网前的最后一道门（远程熔断）拦下了它——**没有任何字节离开本机** | `cancelled`（调用方拿到本机原来的响应，没有 attempt 头） |
 
 use axum::body::Bytes;
 use futures_util::StreamExt;
@@ -84,6 +86,8 @@ pub enum CloudFailure {
     },
     /// 传输层在请求发出之后出了别的错（连接中途被重置……）：请求可能已经到达。
     Transport,
+    /// 出网前的最后一道检查（远程熔断）把请求拦下了：**没有任何字节离开本机**。
+    Withheld,
 }
 
 impl CloudFailure {
@@ -95,6 +99,8 @@ impl CloudFailure {
             CloudFailure::Cancelled => CallOutcome::Cancelled,
             CloudFailure::Answered { outcome, .. } => *outcome,
             CloudFailure::Transport => CallOutcome::CloudError,
+            // 记成 cancelled：这一行在发送之前就落下了（先写后出网），它必须有终态；没有答复、没有云端 id、没有金额
+            CloudFailure::Withheld => CallOutcome::Cancelled,
         }
     }
 }
@@ -154,10 +160,17 @@ fn error_reason(body: &[u8], header: Option<&str>) -> Option<String> {
         .or_else(|| header.and_then(reason_shape))
 }
 
-fn usage_of(body: &Value) -> (Option<u64>, Option<u64>) {
+/// 云端 `usage` 里的 token 数（没有或不是非负整数就是 `None`）。
+///
+/// 数字必须能写进调用记录（`tokens_*` 列是 i64）：超出范围的值（云端的 JSON 里可以写任意 u64）整个返回 `None`，
+/// 调用方把这个回答归为 `invalid_response`。不能留到写库的时候才发现——那时 `pending` 守卫已经解除，终态写不进去，
+/// 这一行会永远 `pending`，对账游标越不过它（审查 r4 Medium#5）。
+fn usage_of(body: &Value) -> Option<(Option<u64>, Option<u64>)> {
     let usage = body.get("usage");
     let count = |key: &str| usage.and_then(|u| u.get(key)).and_then(Value::as_u64);
-    (count("prompt_tokens"), count("completion_tokens"))
+    let (tokens_in, tokens_out) = (count("prompt_tokens"), count("completion_tokens"));
+    let storable = |tokens: Option<u64>| tokens.is_none_or(|value| i64::try_from(value).is_ok());
+    (storable(tokens_in) && storable(tokens_out)).then_some((tokens_in, tokens_out))
 }
 
 fn classify_transport(error: &reqwest::Error) -> CloudFailure {
@@ -171,13 +184,33 @@ fn classify_transport(error: &reqwest::Error) -> CloudFailure {
 }
 
 /// 发请求。`_permit` 是出网凭条（只有 `gate::grant` 能造）：没有它就发不了。
-pub async fn send(
+///
+/// `still_allowed` 是**出网边界上的最后一道门**：请求构造好之后、第一次真正去发之前调用，返回 `false` 就什么都不发
+/// （[`CloudFailure::Withheld`]）。凭条只证明「闸门在某一刻放行过」，而放行到发出之间隔着读凭证、占名额、写审计事件、
+/// 落 `pending` 行这些让出点，远程熔断可能在这期间被打开（它是个共享的原子变量）；调用方在这里给出**此刻**的答案，
+/// 而不是闸门那一刻的快照。检查是 `run` 被 poll 的第一件事，和 `request.send()` 之间没有任何让出点。
+///
+/// 只有 `cloud_tier` 模块树里的代码能调它（`pub(super)`）；而 [`EgressPermit`] 只有 `gate::grant` 能造，它同样只对这个
+/// 模块树可见：crate 外的代码调不到 `send`，也造不出凭条。文档测试钉住 `send` 的可见性
+/// （`grant` 的在 [`super::gate::grant`] 的文档里）：
+///
+/// ```compile_fail
+/// let _ = idoris_router::cloud_tier::forward::send;
+/// ```
+///
+/// 对照（路径没写错）：
+///
+/// ```
+/// let _: Option<idoris_router::cloud_tier::forward::CloudFailure> = None;
+/// ```
+pub(super) async fn send(
     client: &reqwest::Client,
     config: &CloudTierConfig,
     _permit: EgressPermit,
     credential: &CloudCredential,
     body: &Value,
     cancel: &CancellationToken,
+    still_allowed: &(dyn Fn() -> bool + Sync),
 ) -> Result<CloudAnswer, CloudFailure> {
     let bytes = serde_json::to_vec(body).map_err(|_| CloudFailure::Transport)?;
     let request = client
@@ -189,6 +222,9 @@ pub async fn send(
         .header(USER_AGENT, USER_AGENT_VALUE)
         .body(bytes);
     let run = async {
+        if !still_allowed() {
+            return Err(CloudFailure::Withheld);
+        }
         let response = request
             .send()
             .await
@@ -267,7 +303,9 @@ async fn read_answer(
     else {
         return Err(answered(CallOutcome::InvalidResponse, None));
     };
-    let (tokens_in, tokens_out) = usage_of(&parsed);
+    let Some((tokens_in, tokens_out)) = usage_of(&parsed) else {
+        return Err(answered(CallOutcome::InvalidResponse, None));
+    };
     Ok(CloudAnswer {
         body: Bytes::from(body),
         status,
@@ -365,6 +403,7 @@ mod tests {
             &CloudCredential::parse(&secret()).unwrap(),
             &json!({"model": "idoris/agent", "messages": [{"role": "user", "content": "hi"}]}),
             &CancellationToken::new(),
+            &|| true,
         )
         .await
     }
@@ -634,6 +673,102 @@ mod tests {
         }
     }
 
+    /// `forward` 交出去的每一个 `Ok(CloudAnswer)` 都必须能被调用记录原样写成 `served`；记录存不下的（超出 i64 的用量）
+    /// 在这里就被拒绝成 `invalid_response`，而不是留到写库的时候才发现（审查 r4 Medium#5）。
+    #[tokio::test]
+    async fn every_answer_forward_accepts_can_be_recorded_and_the_ones_the_record_cannot_hold_are_refused()
+     {
+        use idoris_tenancy::cloud_tier::{CallFinish, CloudTierStore};
+        let server = MockServer::start().await;
+        let store = CloudTierStore::open_in_memory().unwrap();
+        let max = i64::MAX;
+        // (名字, usage, 记录存得下吗)
+        let cases: Vec<(&str, serde_json::Value, bool)> = vec![
+            ("no usage at all", json!(null), true),
+            (
+                "zero",
+                json!({"prompt_tokens": 0, "completion_tokens": 0}),
+                true,
+            ),
+            (
+                "i64::MAX",
+                json!({"prompt_tokens": max, "completion_tokens": max}),
+                true,
+            ),
+            (
+                "prompt_tokens = i64::MAX + 1",
+                json!({"prompt_tokens": u64::try_from(max).unwrap() + 1, "completion_tokens": 1}),
+                false,
+            ),
+            (
+                "completion_tokens = i64::MAX + 1",
+                json!({"prompt_tokens": 1, "completion_tokens": u64::try_from(max).unwrap() + 1}),
+                false,
+            ),
+            (
+                "u64::MAX",
+                json!({"prompt_tokens": u64::MAX, "completion_tokens": 0}),
+                false,
+            ),
+            // 不是非负整数的值当作没有（和以前一样），不是错误
+            ("negative", json!({"prompt_tokens": -1}), true),
+            ("fraction", json!({"prompt_tokens": 1.5}), true),
+            ("string", json!({"prompt_tokens": "12"}), true),
+        ];
+        for (n, (name, usage, storable)) in cases.into_iter().enumerate() {
+            let mut body = json!({"id": "c", "choices": [{"message": {"content": "x"}}]});
+            if !usage.is_null() {
+                body["usage"] = usage;
+            }
+            server.reset().await;
+            Mock::given(method("POST"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("x-idoris-record-id", format!("rec-{n}").as_str())
+                        .set_body_raw(body.to_string(), "application/json"),
+                )
+                .mount(&server)
+                .await;
+            match call(&server, "").await {
+                Ok(answer) => {
+                    assert!(
+                        storable,
+                        "{name}: a usage the record cannot hold was accepted"
+                    );
+                    let ticket = store.begin_call(&format!("local-{n}"), 1, 1).unwrap();
+                    store
+                        .finish_call(
+                            &ticket,
+                            &CallFinish {
+                                outcome: CallOutcome::Served,
+                                finished_at_ms: 2,
+                                cloud_record_id: Some(&answer.cloud_record_id),
+                                http_status: Some(answer.status),
+                                cloud_reason: answer.reason.as_deref(),
+                                tokens_in: answer.tokens_in,
+                                tokens_out: answer.tokens_out,
+                            },
+                        )
+                        .unwrap_or_else(|error| panic!("{name}: {error}"));
+                }
+                Err(failure) => {
+                    assert!(!storable, "{name}: refused although the record can hold it");
+                    assert!(
+                        matches!(
+                            failure,
+                            CloudFailure::Answered {
+                                outcome: CallOutcome::InvalidResponse,
+                                status: 200,
+                                ..
+                            }
+                        ),
+                        "{name}: {failure:?}"
+                    );
+                }
+            }
+        }
+    }
+
     #[tokio::test]
     async fn an_oversized_answer_is_refused_and_a_redirect_is_never_followed() {
         let server = MockServer::start().await;
@@ -698,6 +833,7 @@ mod tests {
             &CloudCredential::parse(&secret()).unwrap(),
             &json!({}),
             &CancellationToken::new(),
+            &|| true,
         )
         .await;
         assert_eq!(outcome.unwrap_err(), CloudFailure::Unreachable);
@@ -719,6 +855,7 @@ mod tests {
             &CloudCredential::parse(&secret()).unwrap(),
             &json!({}),
             &CancellationToken::new(),
+            &|| true,
         )
         .await;
         assert_eq!(outcome.unwrap_err(), CloudFailure::Timeout);
@@ -747,11 +884,54 @@ mod tests {
             &CloudCredential::parse(&secret()).unwrap(),
             &json!({}),
             &cancel,
+            &|| true,
         )
         .await;
         assert_eq!(outcome.unwrap_err(), CloudFailure::Cancelled);
         assert!(started.elapsed() < Duration::from_secs(3));
         assert_eq!(CloudFailure::Cancelled.outcome(), CallOutcome::Cancelled);
+    }
+
+    #[tokio::test]
+    async fn a_request_the_last_guard_refuses_is_not_sent_at_all() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("x-idoris-record-id", "rec-1")
+                    .set_body_raw(ok_body().to_string(), "application/json"),
+            )
+            .mount(&server)
+            .await;
+        let config = config(&server, "");
+        let outcome = send(
+            &client(&config),
+            &config,
+            permit(),
+            &CloudCredential::parse(&secret()).unwrap(),
+            &json!({"model": "idoris/agent", "messages": []}),
+            &CancellationToken::new(),
+            &|| false,
+        )
+        .await;
+        assert_eq!(outcome.unwrap_err(), CloudFailure::Withheld);
+        assert!(
+            server.received_requests().await.unwrap().is_empty(),
+            "a refused request must not reach the network"
+        );
+        // 对照：同样的请求，最后一道门放行就发出去
+        let served = send(
+            &client(&config),
+            &config,
+            permit(),
+            &CloudCredential::parse(&secret()).unwrap(),
+            &json!({"model": "idoris/agent", "messages": []}),
+            &CancellationToken::new(),
+            &|| true,
+        )
+        .await;
+        assert!(served.is_ok());
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
     }
 
     #[test]
@@ -762,6 +942,8 @@ mod tests {
         );
         assert_eq!(CloudFailure::Timeout.outcome(), CallOutcome::Timeout);
         assert_eq!(CloudFailure::Transport.outcome(), CallOutcome::CloudError);
+        // 没出网的那一行也必须有终态：记成 cancelled（没有答复、没有云端 id、没有金额）
+        assert_eq!(CloudFailure::Withheld.outcome(), CallOutcome::Cancelled);
         assert_eq!(
             CloudFailure::Answered {
                 outcome: CallOutcome::RateLimited,

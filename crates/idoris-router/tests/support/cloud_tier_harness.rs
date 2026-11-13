@@ -28,9 +28,13 @@ use idoris_backend::mock::{LoadOutcome, UnloadOutcome};
 use idoris_backend::{MockAdapter, ModelInfo};
 use idoris_contracts::ComponentCard;
 use idoris_contracts::RoutingPolicy;
-use idoris_router::cloud::SystemClock;
-use idoris_router::cloud_tier::credential::{NodeFileProvider, PairedDeviceProvider};
-use idoris_router::cloud_tier::{CloudCredential, CloudTier, CloudTierConfig, CredentialProvider};
+use idoris_router::cloud::{Clock, SystemClock};
+use idoris_router::cloud_tier::credential::{
+    LoadedCredential, NodeFileProvider, PairedDeviceProvider,
+};
+use idoris_router::cloud_tier::{
+    CloudCredential, CloudTier, CloudTierConfig, CredentialError, CredentialProvider,
+};
 use idoris_router::connection::{ConnectionInfo, ConnectionListener};
 use idoris_router::runtime::RuntimeRegistry;
 use idoris_router::{AppState, build_app};
@@ -327,6 +331,16 @@ pub fn make_tier(
     provider: Arc<dyn CredentialProvider>,
     db: &Path,
 ) -> Arc<CloudTier> {
+    make_tier_with_clock(config, provider, Arc::new(SystemClock), db)
+}
+
+/// 同上，时钟由调用方给（测试用它在「出网之前的某一步」做手脚）。
+pub fn make_tier_with_clock(
+    config: CloudTierConfig,
+    provider: Arc<dyn CredentialProvider>,
+    clock: Arc<dyn Clock>,
+    db: &Path,
+) -> Arc<CloudTier> {
     let http = idoris_upstream::cloud::build_http_client(config.connect_timeout).unwrap();
     Arc::new(
         CloudTier::new(idoris_router::cloud_tier::CloudTierParts {
@@ -334,10 +348,82 @@ pub fn make_tier(
             store: Arc::new(CloudTierStore::open(db).unwrap()),
             provider,
             http,
-            clock: Arc::new(SystemClock),
+            clock,
         })
         .unwrap(),
     )
+}
+
+/// 包住一个凭证来源：数 `load` 被调了几次（`load` 是闸门通过之后、出网之前的第一步，调了就说明请求走到了这一步）；
+/// 可以在 `load` 里顺手把一个开关打开，模拟「通过闸门之后、出网之前」远程熔断被打开。
+#[derive(Debug)]
+pub struct ProbeProvider {
+    inner: Arc<dyn CredentialProvider>,
+    loads: std::sync::atomic::AtomicUsize,
+    trip_on_load: Option<Arc<std::sync::atomic::AtomicBool>>,
+}
+
+impl ProbeProvider {
+    pub fn counting(inner: Arc<dyn CredentialProvider>) -> Arc<Self> {
+        Arc::new(Self {
+            inner,
+            loads: std::sync::atomic::AtomicUsize::new(0),
+            trip_on_load: None,
+        })
+    }
+
+    pub fn tripping(
+        inner: Arc<dyn CredentialProvider>,
+        switch: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            inner,
+            loads: std::sync::atomic::AtomicUsize::new(0),
+            trip_on_load: Some(switch),
+        })
+    }
+
+    pub fn loads(&self) -> usize {
+        self.loads.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl CredentialProvider for ProbeProvider {
+    fn load(&self) -> Result<LoadedCredential, CredentialError> {
+        self.loads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if let Some(switch) = &self.trip_on_load {
+            switch.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        self.inner.load()
+    }
+}
+
+/// 第一次被问「现在几点」时把开关打开的时钟。云端档在出网路径上第一次读时钟是落 `pending` 行（`record_begin`），
+/// 那是发请求之前最后几步之一：用它模拟「落行的时候熔断被打开」。
+pub struct TrippingClock {
+    switch: Arc<std::sync::atomic::AtomicBool>,
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+impl TrippingClock {
+    pub fn new(switch: Arc<std::sync::atomic::AtomicBool>) -> Arc<Self> {
+        Arc::new(Self {
+            switch,
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        })
+    }
+
+    pub fn calls(&self) -> usize {
+        self.calls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl Clock for TrippingClock {
+    fn now(&self) -> idoris_compute_contracts::ids::TimestampMs {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.switch.store(true, std::sync::atomic::Ordering::SeqCst);
+        SystemClock.now()
+    }
 }
 
 /// 个人形态：设备凭证从 `state_dir` 读。
@@ -479,6 +565,8 @@ pub struct LocalNode {
     pub tier: Option<Arc<CloudTier>>,
     pub event_log: Option<Arc<EventLogStore>>,
     pub ledger: Option<Arc<BudgetLedger>>,
+    /// 这个节点的远程熔断开关（和 `AppState::remote_kill_switch` 是同一个共享原子变量）。
+    pub kill_switch: Arc<std::sync::atomic::AtomicBool>,
     pub scenario: Scenario,
     pub dir: tempfile::TempDir,
 }
@@ -489,6 +577,10 @@ pub struct NodeOptions {
     pub policy: &'static str,
     pub kill_switch: bool,
     pub with_event_log: bool,
+    /// 用调用方给的共享开关当 `remote_kill_switch`（好让别的部件——凭证来源、时钟——持有同一个开关）。
+    pub shared_kill_switch: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// 本机运行时加载 `small` 要花多久（让测试能在「本机正在处理」的窗口里动手）。
+    pub local_load_delay: Option<Duration>,
 }
 
 impl NodeOptions {
@@ -499,6 +591,8 @@ impl NodeOptions {
             policy: POLICY_ALLOWING_REMOTE,
             kill_switch: false,
             with_event_log: false,
+            shared_kill_switch: None,
+            local_load_delay: None,
         }
     }
 }
@@ -533,11 +627,15 @@ impl LocalNode {
             cloud_tier: options.tier.clone(),
             ..AppState::default()
         };
+        if let Some(shared) = options.shared_kill_switch.clone() {
+            state.remote_kill_switch = shared;
+        }
         if options.kill_switch {
             state
                 .remote_kill_switch
                 .store(true, std::sync::atomic::Ordering::SeqCst);
         }
+        let kill_switch = state.remote_kill_switch.clone();
         let mut adapter = None;
         let mut ledger = None;
         match scenario {
@@ -560,6 +658,9 @@ impl LocalNode {
                         mock.set_load_delay("big", Duration::from_millis(600));
                     }
                     _ => {}
+                }
+                if let Some(delay) = options.local_load_delay {
+                    mock.set_load_delay("small", delay);
                 }
                 if scenario == Scenario::BudgetExhausted {
                     // 付费的本机候选 + 额度只有 1：预留一定失败（402）
@@ -606,9 +707,44 @@ impl LocalNode {
             tier: options.tier,
             event_log,
             ledger,
+            kill_switch,
             scenario,
             dir,
         }
+    }
+
+    /// 发一个请求；**本机运行时开始加载 `small` 之后**（它已经在处理这个请求了）把远程熔断打开，然后等响应。
+    /// 要用带 `local_load_delay` 的节点（否则加载一瞬间就完了，来不及动手）。
+    pub async fn drive_and_trip_the_kill_switch_while_the_local_load_runs(
+        &self,
+        headers: &[(&str, &str)],
+    ) -> Captured {
+        let adapter = self.adapter.clone().expect("this needs a local runtime");
+        let app = self.app.clone();
+        let owned: Vec<(String, String)> = headers
+            .iter()
+            .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
+            .collect();
+        let request = tokio::spawn(async move {
+            let borrowed: Vec<(&str, &str)> = owned
+                .iter()
+                .map(|(name, value)| (name.as_str(), value.as_str()))
+                .collect();
+            send_chat(&app, chat_body("small"), &borrowed).await
+        });
+        for _ in 0..300 {
+            if adapter.load_call_count("small") >= 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            adapter.load_call_count("small") >= 1,
+            "the local load never started"
+        );
+        self.kill_switch
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        request.await.unwrap()
     }
 
     /// 在这个场景里发一个请求（`Overloaded` 会先在后台占住加载互斥锁，再发探针）。
@@ -736,6 +872,15 @@ pub async fn send(
     }
 }
 
+/// 「本机没有任何本地密钥」的探针：配对不发任何本地密钥，配对测试用它填 `CliContext::probe`。
+pub struct NoLocalKeys;
+
+impl idoris_router::cloud_tier::LocalSecretProbe for NoLocalKeys {
+    fn is_local_secret(&self, _secret: &str) -> bool {
+        false
+    }
+}
+
 /// 兑换配对码并写下设备凭证（走真实的 `idoris cloud pair` 函数，对 TCP 上的云）。返回 stdout 的 JSON。
 pub async fn pair_device(cloud: &TcpCloud, state_dir: &Path, code: &str) -> Result<Value, String> {
     let config = parse_tier_config(&tier_config_yaml(cloud, Some(state_dir), ""));
@@ -750,6 +895,7 @@ pub async fn pair_device(cloud: &TcpCloud, state_dir: &Path, code: &str) -> Resu
             db_path: &db_path,
             http,
             now_ms: 1_700_000_000_000,
+            probe: &NoLocalKeys,
         },
         None,
         &mut stdin,

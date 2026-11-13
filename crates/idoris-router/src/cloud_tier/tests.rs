@@ -565,6 +565,8 @@ async fn a_pending_call_that_is_dropped_is_finished_as_cancelled_and_a_disarmed_
         .unwrap();
     assert_eq!(row.state, CallState::Pending);
     drop(pending);
+    // 取消终态在后台线程写（析构不等数据库，见 `PendingCall`）：先等它写完，再读——栅栏是确定性的，不是睡一觉
+    tier.wait_for_background_writes().await;
     let row = tier
         .store()
         .call_by_local_id("req-dropped", 1)
@@ -587,6 +589,7 @@ async fn a_pending_call_that_is_dropped_is_finished_as_cancelled_and_a_disarmed_
     let mut pending = tier.record_begin("req-finished").await.unwrap();
     let ticket = pending.disarm();
     drop(pending);
+    tier.wait_for_background_writes().await;
     assert_eq!(
         tier.store()
             .call_by_local_id("req-finished", 1)
@@ -637,6 +640,8 @@ async fn a_pending_call_that_is_dropped_is_finished_as_cancelled_and_a_disarmed_
     .unwrap();
     pending.armed = true;
     drop(pending);
+    // 没有这道栅栏，下面的断言会在后台写入落下之前就通过，什么都没测到
+    tier.wait_for_background_writes().await;
     assert_eq!(
         tier.store()
             .call_by_local_id("req-already-final", 1)
@@ -681,6 +686,133 @@ async fn a_caller_that_hangs_up_while_the_pending_row_is_being_written_still_end
     }
 }
 
+/// 用文件库（别的连接也能打开它）造一个云端档，测试要从另一个连接占住写锁。
+fn tier_with_file_store(db: &Path) -> CloudTier {
+    let config = config_with("");
+    let http = idoris_upstream::cloud::build_http_client(config.connect_timeout).unwrap();
+    CloudTier::new(CloudTierParts {
+        config,
+        store: Arc::new(CloudTierStore::open(db).unwrap()),
+        provider: Arc::new(credential::NodeEnvProvider::new(None, None)),
+        http,
+        clock: Arc::new(SystemClock),
+    })
+    .unwrap()
+}
+
+/// 轮询到这一行有了终态（或超时）。
+async fn wait_for_final_state(
+    tier: &CloudTier,
+    local_request_id: &str,
+    within: std::time::Duration,
+) -> Option<idoris_tenancy::cloud_tier::CallRecord> {
+    use idoris_tenancy::cloud_tier::CallState;
+    let deadline = std::time::Instant::now() + within;
+    loop {
+        if let Some(row) = tier.store().call_by_local_id(local_request_id, 1).unwrap()
+            && row.state != CallState::Pending
+        {
+            return Some(row);
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+/// 审查 r4 Medium#7：看守在异步任务里被丢掉（调用方挂断，hyper 丢掉整个处理 future）时，不能同步等数据库——
+/// `finish_call` 要等连接的互斥锁和 `BEGIN IMMEDIATE`（busy timeout 5 秒）。别的写事务占着库时，同时挂断的几个云请求
+/// 会把几个异步工作线程全卡住，同一个运行时上的其它请求和计时器也跑不动。取消终态交给阻塞线程池去写；写入仍然保证落下。
+#[tokio::test]
+async fn dropping_a_pending_call_never_waits_for_the_database_on_the_async_thread() {
+    use idoris_tenancy::cloud_tier::CallState;
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("tier.sqlite3");
+    let tier = tier_with_file_store(&db);
+    let pending = tier.record_begin("req-held-up").await.unwrap();
+
+    // 另一个连接占着写锁（别的写事务、对账方的长事务）；存储连接的 busy timeout 是 5 秒
+    let holder = rusqlite::Connection::open(&db).unwrap();
+    holder.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+    // `#[tokio::test]` 是单线程运行时：这里卡住的就是整个运行时
+    let started = std::time::Instant::now();
+    drop(pending);
+    let blocked_for = started.elapsed();
+    assert!(
+        blocked_for < std::time::Duration::from_millis(1500),
+        "dropping the guard blocked the async thread for {blocked_for:?} while another connection held the write lock"
+    );
+
+    // 占着库的时候，行还没有终态；锁一放开，后台的写入就把它写成 cancelled
+    assert_eq!(
+        tier.store()
+            .call_by_local_id("req-held-up", 1)
+            .unwrap()
+            .unwrap()
+            .state,
+        CallState::Pending
+    );
+    holder.execute_batch("COMMIT").unwrap();
+    let row = wait_for_final_state(&tier, "req-held-up", std::time::Duration::from_secs(10))
+        .await
+        .expect("the cancelled row was never written after the lock was released");
+    assert_eq!(row.state, CallState::Final(CallOutcome::Cancelled));
+    assert_eq!(
+        (
+            row.cloud_record_id,
+            row.http_status,
+            row.tokens_in,
+            row.tokens_out
+        ),
+        (None, None, None, None)
+    );
+}
+
+/// 停机时：进程收到停机信号，还连着的调用方的处理 future 随运行时一起被丢掉，看守在这时析构。交给阻塞线程池的写入
+/// 要在 `Runtime::shutdown_timeout`（二进制停机时用的就是它）返回之前落下，否则这一行只能等下次启动被标成 interrupted。
+#[test]
+fn a_cancel_write_that_is_in_flight_when_the_runtime_shuts_down_still_lands() {
+    use idoris_tenancy::cloud_tier::CallState;
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("tier.sqlite3");
+    let tier = Arc::new(tier_with_file_store(&db));
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        for n in 0..8 {
+            let pending = tier
+                .record_begin(&format!("req-at-shutdown-{n}"))
+                .await
+                .unwrap();
+            // 一个还没做完的处理 future 持有看守（调用方还连着）
+            tokio::spawn(async move {
+                let _held = pending;
+                std::future::pending::<()>().await;
+            });
+        }
+        tokio::task::yield_now().await;
+    });
+    // 和二进制一样的停机方式：丢掉所有任务（看守析构），再等阻塞任务
+    runtime.shutdown_timeout(std::time::Duration::from_secs(10));
+    for n in 0..8 {
+        let row = tier
+            .store()
+            .call_by_local_id(&format!("req-at-shutdown-{n}"), 1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            row.state,
+            CallState::Final(CallOutcome::Cancelled),
+            "req-at-shutdown-{n} was left pending by the shutdown"
+        );
+    }
+}
+
 // ------------------------------------------------------------------------------------------------
 // 本地密钥探针
 // ------------------------------------------------------------------------------------------------
@@ -720,9 +852,38 @@ fn the_local_key_probe_recognises_active_local_keys_and_fails_closed_when_it_can
         "an unknown key is not a local key"
     );
     assert!(!probe.is_local_secret("not even key-shaped"));
-    // 吊销之后它不再是「有效的本地数据密钥」
+    // 吊销之后它**仍然是**本地密钥（审查 PD S4：已撤销的本地 key 不能被当成云凭证发出去）：撤销只是本机不再认它，
+    // 这串明文仍然是用户当作本地数据密钥用过的东西；以前这里断言的是相反的（吊销之后探针说「不是」）
     store.lock().unwrap().revoke(&key.key_id, 1).unwrap();
-    assert!(!probe.is_local_secret(key.secret.expose_secret()));
+    assert!(
+        probe.is_local_secret(key.secret.expose_secret()),
+        "a revoked local key is still a local secret"
+    );
+    // 已过期的本地 key 同理
+    let expired = MintedVirtualKey::mint();
+    store
+        .lock()
+        .unwrap()
+        .insert_active(
+            &expired.key_id,
+            expired.hash,
+            &VirtualKeyScope {
+                owner: "t".into(),
+                tenant_id: None,
+                allowed_privacy: vec![PrivacyClass::LocalOnly],
+                allowed_roles: vec!["fast".into()],
+                budget_ref: None,
+                expires_at_ms: Some(1),
+                admin_scopes: Vec::new(),
+            },
+        )
+        .unwrap();
+    assert!(
+        probe.is_local_secret(expired.secret.expose_secret()),
+        "an expired local key is still a local secret"
+    );
+    // 没见过的密钥照旧不是
+    assert!(!probe.is_local_secret(&secret('c')));
     // 库被毒化（判不了）：按「是」处理，宁可拒绝
     let poisoned = store.clone();
     let _ = std::thread::spawn(move || {
@@ -731,4 +892,159 @@ fn the_local_key_probe_recognises_active_local_keys_and_fails_closed_when_it_can
     })
     .join();
     assert!(probe.is_local_secret(&secret('c')), "cannot tell -> refuse");
+}
+
+/// 命令行用的探针（`idoris cloud unpair`）：直接查库文件，只读；不论状态；没有库就没有本地密钥；读不出来按「是」处理。
+#[test]
+fn the_file_probe_sees_every_state_creates_nothing_and_fails_closed() {
+    use idoris_tenancy::virtual_key::MintedVirtualKey;
+    use idoris_tenancy::virtual_key::store::{VirtualKeyScope, VirtualKeyStore};
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("keys.sqlite3");
+    let probe = VirtualKeyFileProbe::new(&db);
+    // 没有库文件：没有签发过任何 key；探针不创建它
+    assert!(!probe.is_local_secret(&secret('c')));
+    assert!(!db.exists(), "the probe must not create the database");
+
+    let scope = |expires_at_ms| VirtualKeyScope {
+        owner: "t".into(),
+        tenant_id: None,
+        allowed_privacy: vec![PrivacyClass::LocalOnly],
+        allowed_roles: vec!["fast".into()],
+        budget_ref: None,
+        expires_at_ms,
+        admin_scopes: Vec::new(),
+    };
+    let active = MintedVirtualKey::mint();
+    let revoked = MintedVirtualKey::mint();
+    let expired = MintedVirtualKey::mint();
+    {
+        let store = VirtualKeyStore::open(&db).unwrap();
+        store
+            .insert_active(&active.key_id, active.hash, &scope(None))
+            .unwrap();
+        store
+            .insert_active(&revoked.key_id, revoked.hash, &scope(None))
+            .unwrap();
+        store
+            .insert_active(&expired.key_id, expired.hash, &scope(Some(1)))
+            .unwrap();
+        assert!(store.revoke(&revoked.key_id, 5).unwrap());
+    }
+    assert!(probe.is_local_secret(active.secret.expose_secret()));
+    assert!(
+        probe.is_local_secret(revoked.secret.expose_secret()),
+        "a revoked local key is still a local secret"
+    );
+    assert!(
+        probe.is_local_secret(expired.secret.expose_secret()),
+        "an expired local key is still a local secret"
+    );
+    assert!(!probe.is_local_secret(&secret('c')), "never issued");
+    assert!(!probe.is_local_secret("not even key-shaped"));
+    // 库读不出来：判不了，按「是」处理
+    std::fs::write(&db, b"this is not an sqlite database").unwrap();
+    assert!(probe.is_local_secret(&secret('c')), "cannot tell -> refuse");
+}
+
+// ------------------------------------------------------------------------------------------------
+// 密钥不进 Debug（审查 r4 Medium#3）：每一个持有云凭证明文的类型，`{:?}` / `{:#?}` 都不含密钥——包括经由
+// `dyn CredentialProvider`、`Arc`、`Option`、`Result`、`Vec` 这些包装格式化的情形。
+// ------------------------------------------------------------------------------------------------
+
+#[test]
+fn no_type_that_holds_a_secret_prints_it_in_debug() {
+    use credential::{
+        CredentialKind, DeviceRecord, LoadedCredential, NodeEnvProvider, NodeFileProvider,
+        PairedDeviceProvider,
+    };
+
+    let raw = secret('e');
+    // 整个密钥、以及它的任何一段足够长的十六进制（哪怕只漏出一部分也算漏）
+    let needles = [raw.clone(), "e".repeat(16)];
+    let assert_clean = |what: &str, rendered: String| {
+        for needle in &needles {
+            assert!(
+                !rendered.contains(needle.as_str()),
+                "{what} printed the secret in Debug output: {rendered}"
+            );
+        }
+    };
+
+    // 环境变量来源：值就存在结构体里（启动时读一次）。`NodeEnvProvider` 以前直接 derive(Debug)。
+    let env = NodeEnvProvider::new(Some(raw.clone()), None);
+    assert_clean("NodeEnvProvider {:?}", format!("{env:?}"));
+    assert_clean("NodeEnvProvider {:#?}", format!("{env:#?}"));
+    // 值不是合法密钥的形状（比如 Admin token 被误填）也是密钥：同样不能打印
+    let admin_like = "ab".repeat(32);
+    let misfilled = NodeEnvProvider::new(Some(admin_like.clone()), None);
+    assert!(
+        !format!("{misfilled:?}").contains(&admin_like),
+        "a mis-filled env value must not be printed either"
+    );
+    // 经 `dyn CredentialProvider`（云端档里存的就是这个类型）、`Arc`、`Option`、`Vec` 格式化
+    let dynamic: Arc<dyn CredentialProvider> =
+        Arc::new(NodeEnvProvider::new(Some(raw.clone()), None));
+    assert_clean("Arc<dyn CredentialProvider>", format!("{dynamic:?}"));
+    assert_clean("&dyn CredentialProvider", format!("{:?}", &*dynamic));
+    assert_clean(
+        "Option<Arc<dyn ..>>",
+        format!("{:?}", Some(dynamic.clone())),
+    );
+    assert_clean("Vec<Arc<dyn ..>>", format!("{:#?}", vec![dynamic.clone()]));
+
+    // 云端档本身（持有凭证来源）
+    let config = config_with("");
+    let http = idoris_upstream::cloud::build_http_client(config.connect_timeout).unwrap();
+    let tier = CloudTier::new(CloudTierParts {
+        config,
+        store: Arc::new(CloudTierStore::open_in_memory().unwrap()),
+        provider: dynamic.clone(),
+        http,
+        clock: Arc::new(SystemClock),
+    })
+    .unwrap();
+    assert_clean("CloudTier {:?}", format!("{tier:?}"));
+    assert_clean("CloudTier {:#?}", format!("{tier:#?}"));
+    assert_clean("Arc<CloudTier>", format!("{:?}", Arc::new(tier)));
+
+    // 凭证、加载出来的凭证、设备记录、兑换结果
+    let credential = CloudCredential::parse(&raw).unwrap();
+    let loaded = LoadedCredential {
+        secret: credential.clone(),
+        kind: CredentialKind::Node,
+    };
+    assert_clean("CloudCredential", format!("{credential:?} {credential:#?}"));
+    assert_clean("LoadedCredential", format!("{loaded:?} {loaded:#?}"));
+    assert_clean(
+        "Result<LoadedCredential, _>",
+        format!("{:?}", Ok::<_, CredentialError>(loaded.clone())),
+    );
+    let record = DeviceRecord {
+        origin: "https://idoris.ai".to_string(),
+        credential_id: "vk_0123456789abcdef".to_string(),
+        membership: "m-agent-1".to_string(),
+        pairing_id: "pc_0123456789abcdef".to_string(),
+        paired_at_ms: 1,
+        secret: credential.clone(),
+    };
+    assert_clean("DeviceRecord", format!("{record:?} {record:#?}"));
+    let redeemed = pairing::Redeemed {
+        secret: credential.clone(),
+        credential_id: "vk_0123456789abcdef".to_string(),
+        membership: "m-agent-1".to_string(),
+        pairing_id: "pc_0123456789abcdef".to_string(),
+    };
+    assert_clean("Redeemed", format!("{redeemed:?} {redeemed:#?}"));
+
+    // 文件来源的 provider 只存路径，不存密钥：确认 Debug 里没有密钥
+    let dir = tempfile::tempdir().unwrap();
+    let node_file = NodeFileProvider::new(dir.path().join("node.key"), None);
+    assert_clean("NodeFileProvider", format!("{node_file:?}"));
+    let paired = PairedDeviceProvider::new(
+        credential::DeviceStore::new(dir.path()),
+        "https://idoris.ai",
+        None,
+    );
+    assert_clean("PairedDeviceProvider", format!("{paired:?}"));
 }

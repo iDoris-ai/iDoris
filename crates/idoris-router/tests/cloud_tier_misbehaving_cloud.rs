@@ -246,6 +246,89 @@ async fn whatever_the_cloud_answers_the_caller_keeps_the_local_failure_and_one_r
     }
 }
 
+/// 审查 r4 Medium#5：云端报告的 token 用量必须能写进调用记录（i64）。超出范围的用量以前被当成普通回答：
+/// 终态写不进去，pending 守卫已经解除，处理函数仍把回答交给调用方，那一行永远 pending，对账游标越不过它。
+#[tokio::test]
+async fn usage_the_record_cannot_hold_is_an_invalid_response_with_a_final_row_not_a_stuck_pending_one()
+ {
+    let over_i64 = u64::try_from(i64::MAX).unwrap() + 1;
+    for (name, prompt_tokens, completion_tokens) in [
+        ("prompt_tokens one past i64::MAX", over_i64, 1),
+        ("completion_tokens one past i64::MAX", 1, over_i64),
+        ("both u64::MAX", u64::MAX, u64::MAX),
+    ] {
+        let setup = setup(FAST).await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("x-idoris-record-id", "cloud-rec-huge")
+                    .set_body_raw(
+                        json!({"id": "c", "choices": [{"message": {"role": "assistant", "content": "hi"}}],
+                               "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens}})
+                        .to_string(),
+                        "application/json",
+                    ),
+            )
+            .expect(1)
+            .mount(&setup.server)
+            .await;
+        let (with, without) = exchange(&setup).await;
+        // 调用方拿到本机原来的失败（云端的回答不可信，不交付），只多一个稳定的 attempt 头
+        assert_local_failure_plus_attempt(&with, &without, "invalid_response");
+        // 那一行有终态：invalid_response，带云端 record id（对账指针：云端确实处理了这个请求），没有用量
+        let rows = setup.tier.store().calls_after(0, 10).unwrap();
+        assert_eq!(rows.len(), 1, "{name}");
+        assert_eq!(
+            rows[0].state,
+            CallState::Final(CallOutcome::InvalidResponse),
+            "{name}: the row must not stay pending"
+        );
+        assert_eq!(rows[0].http_status, Some(200), "{name}");
+        assert_eq!(
+            rows[0].cloud_record_id.as_deref(),
+            Some("cloud-rec-huge"),
+            "{name}"
+        );
+        assert_eq!(
+            (rows[0].tokens_in, rows[0].tokens_out),
+            (None, None),
+            "{name}"
+        );
+        // 对账游标能越过它
+        assert_eq!(
+            setup
+                .tier
+                .store()
+                .advance_cursor("reconciler", rows[0].seq, 1)
+                .unwrap(),
+            rows[0].seq,
+            "{name}: the cursor must be able to move past this row"
+        );
+    }
+
+    // 边界：恰好 i64::MAX 是能存的用量，照常交付
+    let setup = setup(FAST).await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("x-idoris-record-id", "cloud-rec-max")
+                .set_body_raw(
+                    json!({"id": "c", "choices": [{"message": {"role": "assistant", "content": "hi"}}],
+                           "usage": {"prompt_tokens": i64::MAX, "completion_tokens": 0}})
+                    .to_string(),
+                    "application/json",
+                ),
+        )
+        .mount(&setup.server)
+        .await;
+    let (with, _) = exchange(&setup).await;
+    assert_eq!(with.status, 200, "{}", with.text());
+    let rows = setup.tier.store().calls_after(0, 10).unwrap();
+    assert_eq!(rows[0].state, CallState::Final(CallOutcome::Served));
+    assert_eq!(rows[0].tokens_in, Some(u64::try_from(i64::MAX).unwrap()));
+}
+
 #[tokio::test]
 async fn a_redirect_is_never_followed_so_the_credential_cannot_be_carried_elsewhere() {
     let setup = setup(FAST).await;
