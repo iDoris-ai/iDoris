@@ -565,6 +565,8 @@ async fn a_pending_call_that_is_dropped_is_finished_as_cancelled_and_a_disarmed_
         .unwrap();
     assert_eq!(row.state, CallState::Pending);
     drop(pending);
+    // 取消终态在后台线程写（析构不等数据库，见 `PendingCall`）：先等它写完，再读——栅栏是确定性的，不是睡一觉
+    tier.wait_for_background_writes().await;
     let row = tier
         .store()
         .call_by_local_id("req-dropped", 1)
@@ -587,6 +589,7 @@ async fn a_pending_call_that_is_dropped_is_finished_as_cancelled_and_a_disarmed_
     let mut pending = tier.record_begin("req-finished").await.unwrap();
     let ticket = pending.disarm();
     drop(pending);
+    tier.wait_for_background_writes().await;
     assert_eq!(
         tier.store()
             .call_by_local_id("req-finished", 1)
@@ -637,6 +640,8 @@ async fn a_pending_call_that_is_dropped_is_finished_as_cancelled_and_a_disarmed_
     .unwrap();
     pending.armed = true;
     drop(pending);
+    // 没有这道栅栏，下面的断言会在后台写入落下之前就通过，什么都没测到
+    tier.wait_for_background_writes().await;
     assert_eq!(
         tier.store()
             .call_by_local_id("req-already-final", 1)
@@ -678,6 +683,133 @@ async fn a_caller_that_hangs_up_while_the_pending_row_is_being_written_still_end
             "the row stayed pending after the caller hung up"
         );
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+/// 用文件库（别的连接也能打开它）造一个云端档，测试要从另一个连接占住写锁。
+fn tier_with_file_store(db: &Path) -> CloudTier {
+    let config = config_with("");
+    let http = idoris_upstream::cloud::build_http_client(config.connect_timeout).unwrap();
+    CloudTier::new(CloudTierParts {
+        config,
+        store: Arc::new(CloudTierStore::open(db).unwrap()),
+        provider: Arc::new(credential::NodeEnvProvider::new(None, None)),
+        http,
+        clock: Arc::new(SystemClock),
+    })
+    .unwrap()
+}
+
+/// 轮询到这一行有了终态（或超时）。
+async fn wait_for_final_state(
+    tier: &CloudTier,
+    local_request_id: &str,
+    within: std::time::Duration,
+) -> Option<idoris_tenancy::cloud_tier::CallRecord> {
+    use idoris_tenancy::cloud_tier::CallState;
+    let deadline = std::time::Instant::now() + within;
+    loop {
+        if let Some(row) = tier.store().call_by_local_id(local_request_id, 1).unwrap()
+            && row.state != CallState::Pending
+        {
+            return Some(row);
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+/// 审查 r4 Medium#7：看守在异步任务里被丢掉（调用方挂断，hyper 丢掉整个处理 future）时，不能同步等数据库——
+/// `finish_call` 要等连接的互斥锁和 `BEGIN IMMEDIATE`（busy timeout 5 秒）。别的写事务占着库时，同时挂断的几个云请求
+/// 会把几个异步工作线程全卡住，同一个运行时上的其它请求和计时器也跑不动。取消终态交给阻塞线程池去写；写入仍然保证落下。
+#[tokio::test]
+async fn dropping_a_pending_call_never_waits_for_the_database_on_the_async_thread() {
+    use idoris_tenancy::cloud_tier::CallState;
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("tier.sqlite3");
+    let tier = tier_with_file_store(&db);
+    let pending = tier.record_begin("req-held-up").await.unwrap();
+
+    // 另一个连接占着写锁（别的写事务、对账方的长事务）；存储连接的 busy timeout 是 5 秒
+    let holder = rusqlite::Connection::open(&db).unwrap();
+    holder.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+    // `#[tokio::test]` 是单线程运行时：这里卡住的就是整个运行时
+    let started = std::time::Instant::now();
+    drop(pending);
+    let blocked_for = started.elapsed();
+    assert!(
+        blocked_for < std::time::Duration::from_millis(1500),
+        "dropping the guard blocked the async thread for {blocked_for:?} while another connection held the write lock"
+    );
+
+    // 占着库的时候，行还没有终态；锁一放开，后台的写入就把它写成 cancelled
+    assert_eq!(
+        tier.store()
+            .call_by_local_id("req-held-up", 1)
+            .unwrap()
+            .unwrap()
+            .state,
+        CallState::Pending
+    );
+    holder.execute_batch("COMMIT").unwrap();
+    let row = wait_for_final_state(&tier, "req-held-up", std::time::Duration::from_secs(10))
+        .await
+        .expect("the cancelled row was never written after the lock was released");
+    assert_eq!(row.state, CallState::Final(CallOutcome::Cancelled));
+    assert_eq!(
+        (
+            row.cloud_record_id,
+            row.http_status,
+            row.tokens_in,
+            row.tokens_out
+        ),
+        (None, None, None, None)
+    );
+}
+
+/// 停机时：进程收到停机信号，还连着的调用方的处理 future 随运行时一起被丢掉，看守在这时析构。交给阻塞线程池的写入
+/// 要在 `Runtime::shutdown_timeout`（二进制停机时用的就是它）返回之前落下，否则这一行只能等下次启动被标成 interrupted。
+#[test]
+fn a_cancel_write_that_is_in_flight_when_the_runtime_shuts_down_still_lands() {
+    use idoris_tenancy::cloud_tier::CallState;
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("tier.sqlite3");
+    let tier = Arc::new(tier_with_file_store(&db));
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        for n in 0..8 {
+            let pending = tier
+                .record_begin(&format!("req-at-shutdown-{n}"))
+                .await
+                .unwrap();
+            // 一个还没做完的处理 future 持有看守（调用方还连着）
+            tokio::spawn(async move {
+                let _held = pending;
+                std::future::pending::<()>().await;
+            });
+        }
+        tokio::task::yield_now().await;
+    });
+    // 和二进制一样的停机方式：丢掉所有任务（看守析构），再等阻塞任务
+    runtime.shutdown_timeout(std::time::Duration::from_secs(10));
+    for n in 0..8 {
+        let row = tier
+            .store()
+            .call_by_local_id(&format!("req-at-shutdown-{n}"), 1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            row.state,
+            CallState::Final(CallOutcome::Cancelled),
+            "req-at-shutdown-{n} was left pending by the shutdown"
+        );
     }
 }
 

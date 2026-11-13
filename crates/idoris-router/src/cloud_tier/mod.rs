@@ -183,6 +183,8 @@ pub struct CloudTier {
     clock: Arc<dyn Clock>,
     card: ComponentCard,
     slots: Arc<tokio::sync::Semaphore>,
+    /// 交给后台线程去写的取消终态还有几个没写完（见 [`PendingCall`]）。
+    cancel_writes: Arc<CancelWrites>,
 }
 
 impl std::fmt::Debug for CloudTier {
@@ -205,6 +207,7 @@ impl CloudTier {
             clock: parts.clock,
             card,
             slots,
+            cancel_writes: Arc::new(CancelWrites::default()),
         })
     }
 
@@ -219,6 +222,25 @@ impl CloudTier {
 
     pub fn provider(&self) -> &Arc<dyn CredentialProvider> {
         &self.provider
+    }
+
+    /// 等所有交给后台线程的取消终态（调用方挂断时 [`PendingCall`] 丢掉之后写的那一行）写完。测试用它做确定性的栅栏；
+    /// 停机时，二进制的 `Runtime::shutdown_timeout` 会等还在跑的阻塞任务（见 `bin/idoris.rs` 的 `RUNTIME_DROP_GRACE`）。
+    pub async fn wait_for_background_writes(&self) {
+        loop {
+            let notified = self.cancel_writes.idle.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self
+                .cancel_writes
+                .in_flight
+                .load(std::sync::atomic::Ordering::SeqCst)
+                == 0
+            {
+                return;
+            }
+            notified.await;
+        }
     }
 
     /// 合成的云端档组件卡（测试读）。
@@ -395,13 +417,14 @@ impl CloudTier {
     async fn record_begin(&self, local_request_id: &str) -> Option<PendingCall> {
         let store = self.store.clone();
         let clock = self.clock.clone();
+        let cancel_writes = self.cancel_writes.clone();
         let id = local_request_id.to_string();
         let now = self.now_ms();
         let (sender, receiver) = tokio::sync::oneshot::channel();
         tokio::task::spawn_blocking(move || match store.begin_call(&id, 1, now) {
             Ok(ticket) => {
                 // `Err(guard)`（接收端已经被丢掉）：guard 在这里被 drop，把刚落下的行写成 cancelled
-                let _ = sender.send(PendingCall::armed(store, clock, ticket));
+                let _ = sender.send(PendingCall::armed(store, clock, cancel_writes, ticket));
             }
             Err(error) => eprintln!("[idoris] 云端档：无法记录出网调用，不发送：{error}"),
         });
@@ -456,18 +479,33 @@ struct OwnedFinish {
 /// 出网的请求随 future 一起被丢掉（连接关闭），所以这时的结局是 `cancelled`：出网了、没有答复、没有金额。
 ///
 /// 正常路径自己写终态：先 [`Self::disarm`]（之后 drop 什么都不做），紧接着（中间没有任何让出点）调 `record_finish`。
+///
+/// # 析构时不等数据库（审查 r4 Medium#7）
+///
+/// 看守多半是在异步任务里被丢掉的。`finish_call` 要等连接的互斥锁和 `BEGIN IMMEDIATE`（busy timeout 5 秒）：别的写事务占着库时，
+/// 同时挂断的几个云请求会把几个异步工作线程全卡住，同一个运行时上的其它请求和计时器也跑不动。所以 `drop` 只做两件不会等的事：
+/// 读一下时钟，把写入交给阻塞线程池（`spawn_blocking`，不等它）。写入在后台线程里做，库忙就重试几次，仍然保证落下；
+/// 实在落不下，这一行还是会在下次启动时被标成 `interrupted`（和进程崩溃同一条路）。
+/// 没有 tokio 运行时（同步环境、运行时已经销毁）就在当前线程直接写：那里没有异步工作线程可卡。
 struct PendingCall {
     store: Arc<CloudTierStore>,
     clock: Arc<dyn Clock>,
+    cancel_writes: Arc<CancelWrites>,
     ticket: CallTicket,
     armed: bool,
 }
 
 impl PendingCall {
-    fn armed(store: Arc<CloudTierStore>, clock: Arc<dyn Clock>, ticket: CallTicket) -> Self {
+    fn armed(
+        store: Arc<CloudTierStore>,
+        clock: Arc<dyn Clock>,
+        cancel_writes: Arc<CancelWrites>,
+        ticket: CallTicket,
+    ) -> Self {
         Self {
             store,
             clock,
+            cancel_writes,
             ticket,
             armed: true,
         }
@@ -485,12 +523,99 @@ impl Drop for PendingCall {
         if !self.armed {
             return;
         }
-        let finish = CallFinish::without_answer(CallOutcome::Cancelled, self.clock.now().0);
-        match self.store.finish_call(&self.ticket, &finish) {
-            Ok(()) | Err(CloudTierStoreError::AlreadyFinal(_)) => {}
-            Err(error) => eprintln!(
-                "[idoris] 云端档：调用方挂断后无法把调用记录写成 cancelled（{error}），这一行会在下次启动时被标成 interrupted"
-            ),
+        let write = CancelWrite {
+            store: self.store.clone(),
+            ticket: self.ticket.clone(),
+            finished_at_ms: self.clock.now().0,
+            // 计数的守卫随写入走：写完、或者写入对象因为别的原因被丢掉，计数都会减回去
+            _in_flight: CancelWriteInFlight::begin(self.cancel_writes.clone()),
+            done: false,
+        };
+        match tokio::runtime::Handle::try_current() {
+            // 不等它：JoinHandle 直接丢掉（任务照常运行）
+            Ok(handle) => drop(handle.spawn_blocking(move || write.run())),
+            // 没有运行时：不是异步线程，直接写
+            Err(_) => write.run(),
+        }
+    }
+}
+
+/// 一次「把这一行写成 cancelled」的写入。[`Self::run`] 把它写完；**没跑就被丢掉**的时候，`Drop` 在当前线程把它写完。
+///
+/// 没跑就被丢掉只发生在运行时关闭的时候：阻塞线程池已经不收新任务了（`spawn_blocking` 当场把闭包丢掉），或者收了但
+/// 关闭时清空队列把它丢掉。关闭中的运行时上没有请求可卡，而这一行必须有终态，所以在这里同步写，不留给下次启动去标
+/// `interrupted`。正常运行时线程池不会拒绝任务，这条路走不到。
+struct CancelWrite {
+    store: Arc<CloudTierStore>,
+    ticket: CallTicket,
+    finished_at_ms: i64,
+    _in_flight: CancelWriteInFlight,
+    done: bool,
+}
+
+impl CancelWrite {
+    fn run(mut self) {
+        write_cancelled(&self.store, &self.ticket, self.finished_at_ms);
+        self.done = true;
+    }
+}
+
+impl Drop for CancelWrite {
+    fn drop(&mut self) {
+        if !self.done {
+            write_cancelled(&self.store, &self.ticket, self.finished_at_ms);
+        }
+    }
+}
+
+/// 取消终态的写入：库忙（别的写事务占着）时重试几次，每次已经包含连接自己的 busy timeout。
+fn write_cancelled(store: &CloudTierStore, ticket: &CallTicket, finished_at_ms: i64) {
+    const ATTEMPTS: u32 = 3;
+    let finish = CallFinish::without_answer(CallOutcome::Cancelled, finished_at_ms);
+    for attempt in 1..=ATTEMPTS {
+        match store.finish_call(ticket, &finish) {
+            Ok(()) | Err(CloudTierStoreError::AlreadyFinal(_)) => return,
+            Err(CloudTierStoreError::Sql(_)) if attempt < ATTEMPTS => {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Err(error) => {
+                eprintln!(
+                    "[idoris] 云端档：调用方挂断后无法把调用记录写成 cancelled（{error}），这一行会在下次启动时被标成 interrupted"
+                );
+                return;
+            }
+        }
+    }
+}
+
+/// 交给后台线程去写的取消终态的记账：还有几个没写完。
+#[derive(Default)]
+struct CancelWrites {
+    in_flight: std::sync::atomic::AtomicUsize,
+    idle: tokio::sync::Notify,
+}
+
+/// 一个还没写完的取消终态。丢掉它（写完了，或者闭包根本没跑成）就把计数减回去。
+struct CancelWriteInFlight(Arc<CancelWrites>);
+
+impl CancelWriteInFlight {
+    fn begin(accounting: Arc<CancelWrites>) -> Self {
+        accounting
+            .in_flight
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Self(accounting)
+    }
+}
+
+impl Drop for CancelWriteInFlight {
+    fn drop(&mut self) {
+        if self
+            .0
+            .in_flight
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst)
+            == 1
+        {
+            self.0.idle.notify_waiters();
         }
     }
 }
