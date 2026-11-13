@@ -45,11 +45,12 @@
 //! 所以**可以**安全地对公网开放（一张被盗的凭证最多只能动它自己子树里的东西，平台层面的写操作只有本机运维命令
 //! `idoris control bootstrap` 能做）；但这是一个必须有人有意为之的攻击面，所以默认不挂。P0 里 eduai 的后端要用它做在线
 //! 开通，配置里写一行 `control_plane.public: true` 就挂在同一个公网监听上（不单开端口：多一个监听器就多一套要保护、
-//! 要测试的启动路径，S2 的设计本来就是「挂在数据面的同一个监听上」）。挂上之后它和数据面站在同一个边缘上：
-//! 最外层的几层中间件（`X-iDoris-Tenant` 的剥离、`X-iDoris-Record-Id`、`edge_guard` 的客户端来源与 CORS）也包着它，
-//! 另外多一道请求体读取期限；它自己的认证、授权、审计、响应一概不动（来源地址、`Origin` 都不参与授权）。CORS 用的是
-//! 数据面的同一份来源名单：默认没有列出任何来源，控制面就不发任何 CORS 头、预检也是 404；列出的来源的浏览器控制台才能
-//! 通过预检直接调它（凭证仍然是 `Authorization` 里的 bearer，不是 cookie）。
+//! 要测试的启动路径，S2 的设计本来就是「挂在数据面的同一个监听上」）。挂上之后它和数据面站在同一个外层上：
+//! 最外层的几层中间件（`X-iDoris-Tenant` 的剥离、`X-iDoris-Record-Id`、请求生命周期）和一个解析客户端来源的边缘
+//! （`control_edge`，受信代理的规则和数据面的 `edge_guard` 是同一份）也包着它，另外多一道请求体读取期限；它自己的认证、
+//! 授权、审计、响应一概不动（来源地址、`Origin` 都不参与授权）。**但控制面的边缘不带 CORS**：它是后端对后端的接口，
+//! 能开账户、发凭证、给额度，开给浏览器只会扩大攻击面，也没有网页管理台要直接调它——不管配置里给数据面列了哪些来源，
+//! 控制面永远不发 CORS 头，浏览器的预检也不放行（就是控制面自己的 404）。要改这条口径需要 owner 明确同意。
 //!
 //! # 一个请求的付款上下文怎么来的
 //!
@@ -104,8 +105,8 @@
 
 use std::sync::Arc;
 
-use axum::extract::State;
-use axum::middleware::{from_fn, from_fn_with_state};
+use axum::extract::{Request, State};
+use axum::middleware::{Next, from_fn, from_fn_with_state};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -294,12 +295,35 @@ async fn models(State(state): State<Arc<AppState>>) -> Response {
     .into_response()
 }
 
+/// 控制面的边缘：和数据面的 `guard::edge_guard` 一样，先从 TCP 对端和受信代理的 `X-Forwarded-For` 算出客户端来源
+/// 放进请求扩展（同一个 `net::resolve_client`，受信代理的规则只有一份），但**没有 CORS**。
+///
+/// 控制面是后端对后端的接口：不管云入口配置里给数据面列了哪些来源，它永远不发 CORS 头，浏览器的预检也不放行
+/// （预检落到控制面自己的 404，浏览器就会拦住）。它能开账户、发凭证、给额度，开给浏览器只会扩大攻击面，
+/// 也没有网页管理台要直接调它；要改这条口径需要 owner 明确同意，不是改一行配置能开的口子。所以控制面不能挂在
+/// `edge_guard` 上（它连预检和响应头一起管）。`Origin` 不参与控制面的任何判断。
+async fn control_edge(
+    State(trusted): State<Arc<TrustedProxies>>,
+    mut request: Request,
+    next: Next,
+) -> Response {
+    let peer = request
+        .extensions()
+        .get::<crate::connection::RequestLifecycle>()
+        .and_then(crate::connection::RequestLifecycle::peer)
+        .map(|peer| peer.ip());
+    let client = net::resolve_client(&trusted, peer, request.headers());
+    request.extensions_mut().insert(client);
+    next.run(request).await
+}
+
 /// 云形态的整个 HTTP 应用。见模块文档的路由表和中间件顺序（`guard`）。
 ///
-/// 控制面（`/control/v1`）合并在**最外层那几层中间件之内**（`strip_untrusted_headers`、`record_id_middleware`、
-/// `request_lifecycle`、`edge_guard`：客户端来源、CORS 预检与响应头）：它和数据面站在同一个边缘上，来源名单也是同一份
-/// （PR #600 第二轮 S2：原来合并在这些层**之后**，配置里列出的来源的浏览器控制台连预检都过不去）。
-/// 它不经过 `data_plane_guard`（那是数据面自己的认证、成员 id、三级限流）：控制面自己认证、自己授权。
+/// 控制面（`/control/v1`）和数据面站在同一个外层上：`strip_untrusted_headers`、`record_id_middleware`、
+/// `request_lifecycle` 也包着它（PR #600 第二轮 S2：原来合并在这些层**之后**，完全不经过最外层）。区别只有一处：
+/// 数据面的边缘是 `edge_guard`（客户端来源 + CORS），控制面的边缘是 [`control_edge`]（只有客户端来源，**没有 CORS**）。
+/// 它不经过 `data_plane_guard`（那是数据面自己的认证、成员 id、三级限流）：控制面自己认证、自己授权，
+/// 另外多一道请求体读取期限（`control_body_deadline`）。
 pub fn build_cloud_app(state: AppState, ingress: Arc<CloudIngress>) -> Router {
     let state = Arc::new(state);
     // `MethodRouter::route_layer`：认证只包住真正匹配到方法的处理函数，不包住 `fallback`。所以没有的路径、
@@ -327,22 +351,168 @@ pub fn build_cloud_app(state: AppState, ingress: Arc<CloudIngress>) -> Router {
     }
     let mut app = app
         .fallback(crate::not_found)
-        .with_state(Arc::clone(&state));
-
-    // 控制面先合并进来，再统一套最外层的中间件：它和数据面在同一个边缘（`edge_guard`）之内。
-    if ingress.config.control_plane_public
-        && let Some(plane) = state.control.clone()
-    {
-        app = app.merge(control::router(plane).layer(from_fn_with_state(
-            Arc::clone(&ingress),
-            guard::control_body_deadline,
-        )));
-    }
-    app.layer(from_fn_with_state(Arc::clone(&ingress), guard::edge_guard))
+        .layer(from_fn_with_state(Arc::clone(&ingress), guard::edge_guard))
         .layer(from_fn(crate::connection::request_lifecycle_middleware))
         .layer(from_fn_with_state(
             Arc::clone(&state),
             crate::record_id_middleware,
         ))
         .layer(from_fn(guard::strip_untrusted_headers))
+        .with_state(Arc::clone(&state));
+
+    if ingress.config.control_plane_public
+        && let Some(plane) = state.control.clone()
+    {
+        // 同样的最外层，边缘换成不带 CORS 的 `control_edge`；再多一道请求体读取期限（最里面，紧贴控制面）。
+        app = app.merge(
+            control::router(plane)
+                .layer(from_fn_with_state(
+                    Arc::clone(&ingress),
+                    guard::control_body_deadline,
+                ))
+                .layer(from_fn_with_state(
+                    Arc::new(ingress.config.trusted_proxies.clone()),
+                    control_edge,
+                ))
+                .layer(from_fn(crate::connection::request_lifecycle_middleware))
+                .layer(from_fn_with_state(
+                    Arc::clone(&state),
+                    crate::record_id_middleware,
+                ))
+                .layer(from_fn(guard::strip_untrusted_headers)),
+        );
+    }
+    app
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use std::net::SocketAddr;
+
+    use axum::Extension;
+    use axum::body::Body;
+    use axum::extract::ConnectInfo;
+    use axum::http::{HeaderMap, Method};
+    use axum::routing::any;
+    use tower::ServiceExt;
+
+    use super::*;
+    use crate::connection::{ConnectionInfo, request_lifecycle_middleware};
+
+    /// 套着控制面边缘的探针：回显它看到的客户端来源，以及请求里的 `Origin` 有没有被留给里面的处理函数。
+    fn probe(trusted: &[&str]) -> Router {
+        let trusted = Arc::new(TrustedProxies::parse(trusted.iter().copied()).unwrap());
+        Router::new()
+            .route(
+                "/probe",
+                any(
+                    |Extension(client): Extension<ClientAddr>, headers: HeaderMap| async move {
+                        format!(
+                            "{}|{}|{}",
+                            client.ip,
+                            client.forwarded,
+                            headers.contains_key("origin")
+                        )
+                    },
+                ),
+            )
+            .layer(from_fn_with_state(trusted, control_edge))
+            .layer(from_fn(request_lifecycle_middleware))
+    }
+
+    async fn send(
+        app: &Router,
+        peer: &str,
+        method: Method,
+        headers: &[(&str, &str)],
+    ) -> (u16, HeaderMap, String) {
+        let mut builder = axum::http::Request::builder().method(method).uri("/probe");
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
+        }
+        let mut request = builder.body(Body::empty()).unwrap();
+        let peer: SocketAddr = format!("{peer}:50000").parse().unwrap();
+        request
+            .extensions_mut()
+            .insert(ConnectInfo(ConnectionInfo::for_peer(peer)));
+        let response = app.clone().oneshot(request).await.unwrap();
+        let status = response.status().as_u16();
+        let headers = response.headers().clone();
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        (status, headers, String::from_utf8(body.to_vec()).unwrap())
+    }
+
+    #[tokio::test]
+    async fn the_control_edge_resolves_the_client_like_the_data_plane_edge() {
+        let app = probe(&["10.0.0.0/8"]);
+        // 受信代理转发的：取 `X-Forwarded-For` 里的真实客户端
+        let (status, _, body) = send(
+            &app,
+            "10.0.0.5",
+            Method::GET,
+            &[("x-forwarded-for", "198.51.100.7")],
+        )
+        .await;
+        assert_eq!((status, body.as_str()), (200, "198.51.100.7|true|false"));
+        // 不受信的对端：自己写的 `X-Forwarded-For` 一律不信
+        let (status, _, body) = send(
+            &app,
+            "203.0.113.9",
+            Method::GET,
+            &[("x-forwarded-for", "198.51.100.7")],
+        )
+        .await;
+        assert_eq!((status, body.as_str()), (200, "203.0.113.9|false|false"));
+    }
+
+    #[tokio::test]
+    async fn the_control_edge_has_no_cors_at_all_it_never_answers_a_preflight_or_decorates_a_response()
+     {
+        // 控制面的边缘根本不知道有 CORS 这回事：形状上就是预检的请求原样交给里面的处理函数（它的 `Origin` 也没被动过），
+        // 响应上不会多出任何 CORS 相关的头——和云入口配置里列了哪些来源无关（它连配置都不读）
+        let app = probe(&[]);
+        let (status, headers, body) = send(
+            &app,
+            "203.0.113.9",
+            Method::OPTIONS,
+            &[
+                ("origin", "https://app.example.com"),
+                ("access-control-request-method", "POST"),
+                (
+                    "access-control-request-headers",
+                    "authorization, content-type",
+                ),
+            ],
+        )
+        .await;
+        assert_eq!((status, body.as_str()), (200, "203.0.113.9|false|true"));
+        for name in [
+            "access-control-allow-origin",
+            "access-control-allow-methods",
+            "access-control-allow-headers",
+            "access-control-expose-headers",
+            "access-control-max-age",
+            "vary",
+        ] {
+            assert!(!headers.contains_key(name), "{name}");
+        }
+        // 带着名单里的来源的普通请求：同样不加任何头
+        let (status, headers, _) = send(
+            &app,
+            "203.0.113.9",
+            Method::GET,
+            &[("origin", "https://app.example.com")],
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert!(
+            headers
+                .keys()
+                .all(|name| !name.as_str().starts_with("access-control-"))
+        );
+    }
 }

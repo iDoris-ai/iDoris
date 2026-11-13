@@ -461,98 +461,196 @@ async fn the_control_plane_is_mounted_on_the_public_listener_only_when_configure
     assert_eq!(anonymous.status, 401);
 }
 
-/// PR #600 第二轮 S2（NOT FIXED）：控制面原来合并在 `edge_guard` **之外**，所以云入口配置里列出的来源的浏览器控制台
-/// 连预检都过不去（预检落到控制面的 404），响应也没有 CORS 头；客户端来源、`X-iDoris-Record-Id` 这些最外层的东西也都不经过。
-/// 现在它和数据面挂在同一组外层中间件里：来源名单是同一份，列出的来源预检通过、响应带同样的 CORS 头，没列出的来源照旧
-/// 预检 403、响应不带 CORS 头。控制面自己的认证、授权、审计一个字没动（来源地址、`Origin` 都不参与授权）。
+/// 控制面是后端对后端的接口：不管云入口配置里给数据面列了哪些来源，它永远不发 CORS 头，浏览器的预检也不放行
+/// （预检落到控制面自己的 404，浏览器就会拦住）。产品口径：控制面能开账户、发凭证、给额度，开给浏览器只会扩大攻击面，
+/// 也没有网页管理台要直接调它；要改这条口径需要 owner 明确同意（PR #600 第二轮 S2：控制面挂进最外层的边缘时，
+/// 必须是**不带 CORS** 的那一份）。
 #[tokio::test]
-async fn the_control_plane_sits_behind_the_same_edge_guard_as_the_data_plane() {
+async fn the_control_plane_never_carries_cors_headers_even_when_browsers_are_allowed_on_the_data_plane()
+ {
     let w = World::new(WorldOptions {
         ingress: IngressYaml::default().cors(&["https://app.example.com"]),
         ..WorldOptions::default()
     })
     .await;
-    let admin = w.cred("svc_eduai_admin");
-    // 名单里的来源：控制面的响应和数据面一样带 CORS 头（认证照旧：这里带着有效的控制面凭证）
     let reply = w
         .send(
-            &Req::models(admin)
+            &Req::models(w.cred("svc_eduai_admin"))
                 .uri("/control/v1/whoami")
                 .header("origin", "https://app.example.com"),
-        )
-        .await;
-    assert_eq!(reply.status, 200, "{}", reply.text());
-    assert_eq!(
-        reply.header("access-control-allow-origin"),
-        Some("https://app.example.com")
-    );
-    assert_eq!(reply.header("vary"), Some("Origin"));
-    assert!(reply.header("access-control-allow-credentials").is_none());
-    // 没列出的来源：不给任何 CORS 头（请求本身照常处理，是浏览器拦住响应）
-    let reply = w
-        .send(
-            &Req::models(admin)
-                .uri("/control/v1/whoami")
-                .header("origin", "https://evil.example.net"),
         )
         .await;
     assert_eq!(reply.status, 200);
     assert!(reply.header("access-control-allow-origin").is_none());
-    // 被控制面自己拒绝的响应（没有凭证）同样带 CORS 头：浏览器里的 JS 才读得到 401
-    let reply = w
+
+    // 对照：同一个世界里，数据面照常给列出的来源开放（所以这里不是「CORS 整个没开」，而是控制面是例外）
+    let admin = w.cred("svc_eduai_admin");
+    let kid1 = w.cred("mem_kid1");
+    let data_preflight = w
         .send(
-            &Req::models(admin)
-                .uri("/control/v1/whoami")
+            &Req::chat(kid1)
+                .method("OPTIONS")
                 .bearer_raw(None)
-                .header("origin", "https://app.example.com"),
+                .header("origin", "https://app.example.com")
+                .header("access-control-request-method", "POST"),
         )
         .await;
-    assert_eq!(reply.status, 401);
+    assert_eq!(data_preflight.status, 204);
     assert_eq!(
-        reply.header("access-control-allow-origin"),
+        data_preflight.header("access-control-allow-origin"),
         Some("https://app.example.com")
     );
 
-    // 预检：列出的来源通过，浏览器能带 authorization 和 content-type 发 POST / GET
-    let preflight = |origin: &str, uri: &str| {
-        Req::models(admin)
-            .method("OPTIONS")
-            .uri(uri)
-            .bearer_raw(None)
-            .header("origin", origin)
-            .header("access-control-request-method", "POST")
-            .header(
-                "access-control-request-headers",
-                "authorization, content-type",
-            )
+    // 控制面的每一种响应都没有任何 CORS 相关的头：成功的、没带凭证被控制面自己拒绝的、没有的路径、列出的和没列出的来源
+    let no_cors = |reply: &Reply, what: &str| {
+        for name in [
+            "access-control-allow-origin",
+            "access-control-allow-credentials",
+            "access-control-allow-methods",
+            "access-control-allow-headers",
+            "access-control-expose-headers",
+            "access-control-max-age",
+            "vary",
+        ] {
+            assert!(reply.header(name).is_none(), "{what}: {name}");
+        }
     };
-    for uri in ["/control/v1/principals", "/control/v1/accounts/eduai"] {
-        let reply = w.send(&preflight("https://app.example.com", uri)).await;
-        assert_eq!(reply.status, 204, "{uri}: {}", reply.text());
-        assert_eq!(
-            reply.header("access-control-allow-origin"),
-            Some("https://app.example.com")
-        );
-        assert_eq!(
-            reply.header("access-control-allow-headers"),
-            Some("authorization, content-type")
-        );
-        // 预检在边缘就答掉了，同样经过最外层的记录号中间件
-        assert!(reply.header("x-idoris-record-id").is_some());
-    }
-    // 没列出的来源：预检 403，不碰控制面
-    let reply = w
-        .send(&preflight(
-            "https://evil.example.net",
+    for origin in ["https://app.example.com", "https://evil.example.net"] {
+        for (what, status, request) in [
+            (
+                "a control read",
+                200,
+                Req::models(admin).uri("/control/v1/whoami"),
+            ),
+            (
+                "a control read the control plane itself refuses",
+                401,
+                Req::models(admin)
+                    .uri("/control/v1/whoami")
+                    .bearer_raw(None),
+            ),
+            (
+                "an unknown control path",
+                404,
+                Req::models(admin).uri("/control/v1/zzz"),
+            ),
+        ] {
+            let reply = w.send(&request.header("origin", origin)).await;
+            assert_eq!(reply.status, status, "{what} from {origin}");
+            no_cors(&reply, &format!("{what} from {origin}"));
+        }
+        // 浏览器预检：不放行（是控制面自己的 404，不是数据面那种 204 / 403 origin_not_allowed）
+        for uri in [
             "/control/v1/principals",
-        ))
+            "/control/v1/allocations",
+            "/control/v1/accounts/eduai",
+        ] {
+            let reply = w
+                .send(
+                    &Req::models(admin)
+                        .method("OPTIONS")
+                        .uri(uri)
+                        .bearer_raw(None)
+                        .header("origin", origin)
+                        .header("access-control-request-method", "POST")
+                        .header(
+                            "access-control-request-headers",
+                            "authorization, content-type",
+                        ),
+                )
+                .await;
+            assert_eq!(reply.status, 404, "preflight of {uri} from {origin}");
+            no_cors(&reply, &format!("preflight of {uri} from {origin}"));
+        }
+    }
+}
+
+/// 控制面和数据面站在同一个外层上（PR #600 第二轮 S2）：最外层的中间件也包着它，不再合并在它们**之后**。
+/// 用和 CORS 无关的可观测效果证明：最外层的记录号中间件给**每个**响应一个 `X-iDoris-Record-Id`——包括那些控制面
+/// 自己的信封根本没机会生成的响应（控制面自己写的响应本来就带记录号，证明不了什么）：请求体超过控制面上限时，
+/// 是 axum 的提取器在任何控制面代码运行之前就回的 413，只有最外层的中间件能给它记录号。
+/// 控制面自己的认证、授权、审计不变（来源地址、`Origin` 都不参与授权）。
+#[tokio::test]
+async fn the_control_plane_sits_behind_the_same_edge_guard_as_the_data_plane() {
+    // 配不配 CORS 名单都一样：这一层和 CORS 无关
+    for ingress in [
+        IngressYaml::default(),
+        IngressYaml::default().cors(&["https://app.example.com"]),
+    ] {
+        let w = World::new(WorldOptions {
+            ingress,
+            ..WorldOptions::default()
+        })
         .await;
-    assert_eq!(reply.status, 403);
-    assert_eq!(reply.code(), "origin_not_allowed");
-    assert!(reply.header("access-control-allow-origin").is_none());
-    // 控制面也过最外层的记录号中间件：每个响应（包括被拒的）都有 X-iDoris-Record-Id
-    let reply = w.send(&Req::models(admin).uri("/control/v1/whoami")).await;
-    assert_eq!(reply.status, 200);
+        let admin = w.cred("svc_eduai_admin");
+        let mut ids = Vec::new();
+        for (what, status, request) in [
+            (
+                "an oversized control body refused by the extractor",
+                413,
+                Req::chat(admin)
+                    .uri("/control/v1/principals")
+                    .raw_body(vec![b'x'; 70 * 1024]),
+            ),
+            (
+                "another oversized control body",
+                413,
+                Req::chat(admin)
+                    .uri("/control/v1/accounts")
+                    .raw_body(vec![b'y'; 80 * 1024]),
+            ),
+            // 对照：数据面本来就有
+            (
+                "an unknown path on the data plane",
+                404,
+                Req::models(w.cred("mem_kid1")).uri("/nope"),
+            ),
+        ] {
+            let reply = w.send(&request).await;
+            assert_eq!(reply.status, status, "{what}: {}", reply.text());
+            let id = reply
+                .header("x-idoris-record-id")
+                .unwrap_or_else(|| panic!("{what} carries no X-iDoris-Record-Id"))
+                .to_string();
+            assert!(!id.is_empty(), "{what}");
+            ids.push(id);
+        }
+        let distinct: std::collections::BTreeSet<_> = ids.iter().collect();
+        assert_eq!(
+            distinct.len(),
+            ids.len(),
+            "one fresh record id per response: {ids:?}"
+        );
+    }
+}
+
+/// 控制面的请求体读取期限（慢请求）照样生效：配置的期限一到，读了一半的请求体就被掐掉，不会一直挂着占住连接
+/// （控制面的处理函数用 `Bytes` 提取器先读完请求体才认证，所以这一道是控制面唯一的慢请求防线）。
+#[tokio::test]
+async fn a_stalled_control_request_body_is_cut_off_at_the_configured_deadline() {
+    let w = World::new(WorldOptions {
+        ingress: IngressYaml::default().abuse("  body_read_timeout_ms: 300\n"),
+        ..WorldOptions::default()
+    })
+    .await;
+    let started = std::time::Instant::now();
+    let reply = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        w.send(
+            &Req::chat(w.cred("svc_eduai_admin"))
+                .uri("/control/v1/principals")
+                .stalled(),
+        ),
+    )
+    .await
+    .expect("a stalled control body must be cut off by the deadline, not hang");
+    assert_eq!(reply.status, 400, "{}", reply.text());
+    assert!(
+        started.elapsed() >= std::time::Duration::from_millis(250),
+        "{:?}",
+        started.elapsed()
+    );
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
     assert!(reply.header("x-idoris-record-id").is_some());
 }
 
