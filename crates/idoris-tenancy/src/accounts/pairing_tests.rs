@@ -792,6 +792,29 @@ fn expired_devices_do_not_occupy_pairing_slots() {
 }
 
 #[test]
+fn an_expired_credential_row_frees_its_slot_even_when_its_verifier_row_carries_no_expiry() {
+    // 凭证行和验证器行的有效期是一起写的，但两边各自都是权威：数据面闸门看凭证行，虚拟 key 认证看验证器行。
+    // 只要有一边已经永远不可用，名额就空出来；这里验证器行没有有效期（被改过），凭证行已经过期
+    let (env, service) = setup();
+    let limit = usize::try_from(MAX_ACTIVE_DEVICES_PER_MEMBERSHIP).unwrap();
+    pair_devices(&env, &service, limit, Some(3_600_000), T0);
+    env.raw()
+        .execute(
+            "UPDATE virtual_keys SET expires_at_ms = NULL \
+              WHERE key_id IN (SELECT credential_id FROM pairing_devices)",
+            [],
+        )
+        .unwrap();
+    let later = T0 + 2 * 3_600_000;
+    assert_eq!(
+        try_one_more(&env, &service, T0 + 10).err(),
+        Some(ControlReason::DeviceLimitReached),
+        "before the credential rows expire the account is full"
+    );
+    assert!(try_one_more(&env, &service, later).is_ok());
+}
+
+#[test]
 fn a_device_whose_key_verifier_was_revoked_or_that_was_unpaired_frees_its_slot_but_a_frozen_one_keeps_it()
  {
     let (env, service) = setup();
