@@ -840,8 +840,11 @@ pub fn evaluate_entry(
 ) -> Vec<ExcludeReason> {
     let mut reasons = Vec::new();
 
-    // 2. 云形态排除 subscription
-    if req.form == DeploymentForm::Cloud && entry.access == AccessPath::Subscription {
+    // 2. subscription 路径只有形态能力表允许的形态才能用（`FormProfile::allows_subscription_path`：只有个人）。
+    // 云形态排除（设计稿 §8）；组织形态的能力表同样写着不允许，这里按能力表判，不再只认云形态
+    // （原来只排除云：组织形态的请求会被路由到走 CLI 的订阅端点，和能力表自相矛盾；PR-Daemon 评审 S0 Low）。
+    // 排除原因沿用 `SubscriptionNotAllowedInCloud` 这个稳定的线上字符串（改名就是改契约）。
+    if !req.form.profile().allows_subscription_path && entry.access == AccessPath::Subscription {
         reasons.push(ExcludeReason::SubscriptionNotAllowedInCloud);
     }
     // 3. 核验
@@ -1884,16 +1887,24 @@ mod tests {
 
     // ---------- 云形态排除 subscription ----------
 
+    /// PR-Daemon 评审 S0 Low：形态能力表（`FormProfile::allows_subscription_path`）只允许个人形态走订阅路径；组织形态的能力表
+    /// 同样写着不允许，所以筛选也要排除它。这条测试原来断言的是「云排除，组织和个人不排除」（`(Organization, true)`），
+    /// 和能力表自相矛盾；现在组织形态也排除，个人形态不变。
     #[test]
-    fn cloud_excludes_the_subscription_path_other_forms_do_not() {
+    fn only_the_personal_form_may_use_the_subscription_path() {
         let t = table();
         let cli = key("example-cli", "example-org/chat-70b", "subscription-cli");
         let adult = tenant(&[DataClass::Adult]);
         for (form, ok) in [
             (DeploymentForm::Cloud, false),
-            (DeploymentForm::Organization, true),
+            (DeploymentForm::Organization, false),
             (DeploymentForm::Personal, true),
         ] {
+            assert_eq!(
+                form.profile().allows_subscription_path,
+                ok,
+                "the selection must follow the capability table: {form:?}"
+            );
             let got = select_compliant(
                 &t,
                 std::slice::from_ref(&cli),
