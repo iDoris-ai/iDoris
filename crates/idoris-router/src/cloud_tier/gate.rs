@@ -11,7 +11,7 @@
 //!    必须不是真）和决策管道（`select_with_gate_snapshot_and_completion`：`local_only` 只收紧不放宽，只有可信本地候选
 //!    过得了），不另造一套。第 1 层的隐私检查和这一层是两道独立的门，对 `local_only` 各自单独就能挡住。
 //!
-//! 两层都通过才会铸出 [`EgressPermit`]；它的字段是私有的，只有这个模块里的 [`grant`] 能造它，而真正发请求的
+//! 两层都通过才会铸出 [`EgressPermit`]；它的字段是私有的，只有这个模块里的 `grant` 能造它，而真正发请求的
 //! `forward::send` 要求按值传入一张。`grant` 和 `send` 都是 `pub(super)`：只有 `cloud_tier` 模块树里的代码能调，
 //! crate 外的代码既造不出凭条、也调不到 `send`（它们文档里的 `compile_fail` 文档测试钉住这一点：谁把可见性改回 `pub`，
 //! 测试就失败）。
@@ -231,7 +231,7 @@ pub fn check(input: &GateInput<'_>) -> Result<(), Denial> {
     Ok(())
 }
 
-/// 通过了闸门的凭条。字段私有：只有 [`grant`] 能造；`forward::send` 要求按值传入一张（用一次就没了）。
+/// 通过了闸门的凭条。字段私有：只有 `grant` 能造；`forward::send` 要求按值传入一张（用一次就没了）。
 #[derive(Debug)]
 pub struct EgressPermit {
     _private: (),
