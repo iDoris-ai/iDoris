@@ -2875,31 +2875,37 @@ async fn parallel_wrong_pairing_codes_cannot_all_get_to_the_database_lookup() {
 
 #[tokio::test]
 async fn a_successful_or_recognized_redemption_gives_its_slot_back() {
-    // 名额是先占的，所以只有「猜错」（查无此码、格式不对）才一直占着；兑换成功、码已用 / 过期 / 被撤销
-    // （码是认得出的，不是在猜）把名额还回去，正常使用不会攒出限速
+    // 名额是先占的，所以只有「猜错」（查无此码、格式不对）才一直占着；兑换成功、码已用 / 过期 / 被撤销 / 设备满
+    // （码是认得出的，不是在猜）把名额还回去，正常使用不会攒出限速。
+    // 30 次成功（三个成员关系各 10 台设备，超过限速的 20）再加 25 次「设备满」，一次猜错都没有：一个名额都不能占。
     let world = World::new();
     world.people().await;
     for round in 0..30 {
-        let (code, _) = pairing_code(&world, "m-kid2").await;
+        let membership = ["m-kid1", "m-kid2", "m-tch"][round / 10];
+        let (code, _) = pairing_code(&world, membership).await;
         let reply = redeem(&world, &code, &format!("device {round}")).await;
-        // 前 10 台成功，之后设备名额满：这也是「认得出的码」，不是猜
-        let expected = if round < 10 {
-            (StatusCode::CREATED, None)
-        } else {
-            (StatusCode::CONFLICT, Some("device_limit_reached"))
-        };
         assert_eq!(
-            (reply.status, reply.json["error"]["reason_code"].as_str()),
-            expected,
+            reply.status,
+            StatusCode::CREATED,
             "round {round}: {}",
             reply.raw
         );
     }
-    // 30 次下来没有任何一次猜错：全局限速一个名额都没占
-    let (fresh, _) = pairing_code(&world, "m-kid1").await;
+    for round in 0..25 {
+        let (code, _) = pairing_code(&world, "m-kid2").await;
+        let reply = redeem(&world, &code, &format!("one too many {round}")).await;
+        assert_eq!(
+            (reply.status, reply.reason()),
+            (StatusCode::CONFLICT, "device_limit_reached"),
+            "round {round}: {}",
+            reply.raw
+        );
+    }
+    // 这 55 次里没有一次猜错：全局限速一个名额都没占
+    let wrong = redeem(&world, "ABCD-EFGH-JKMN", "x").await;
     assert_eq!(
-        redeem(&world, &fresh, "not limited").await.status,
-        StatusCode::CREATED
+        (wrong.status, wrong.reason()),
+        (StatusCode::BAD_REQUEST, "pairing_code_invalid")
     );
 }
 
