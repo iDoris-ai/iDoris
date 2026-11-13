@@ -1197,7 +1197,9 @@ fn a_warning_word_near_the_hit_excuses_it_but_one_elsewhere_does_not() {
 
 #[test]
 fn tool_call_arguments_are_decoded_before_they_are_checked() {
-    // r3 High#4：`{"text":"kill yourself"}` 里规则看到的是字面的转义序列。
+    // r3 High#4：参数里用 `\u` 加四位十六进制数写成的字母，规则看到的是字面的转义序列。
+    // （源码里 JSON 的转义要写成两个反斜杠：原始字符串里写单个反斜杠的 `\u` 会被工具链当成转义吃掉，旧版本的这几处
+    // 因此写成了明文 `kill yourself`，没有真的测到转义。）
     let checker = checker();
     let input = ask("hi");
     let escaped = CheckedOutput {
@@ -1205,7 +1207,7 @@ fn tool_call_arguments_are_decoded_before_they_are_checked() {
         refusal: None,
         tool_calls: vec![ToolCallText {
             name: Sensitive::new("post_message"),
-            arguments: Sensitive::new(r#"{"text":"kill yourself"}"#),
+            arguments: Sensitive::new("{\"text\":\"\\u006bill yourself\"}"),
         }],
     };
     assert_eq!(
@@ -1218,7 +1220,7 @@ fn tool_call_arguments_are_decoded_before_they_are_checked() {
         refusal: None,
         tool_calls: vec![ToolCallText {
             name: Sensitive::new("post_message"),
-            arguments: Sensitive::new(r#"{"kill yourself":1}"#),
+            arguments: Sensitive::new("{\"\\u006bill yourself\":1}"),
         }],
     };
     assert!(checker.scan_output(&input, &key).is_some());
@@ -1237,7 +1239,7 @@ fn tool_call_arguments_are_decoded_before_they_are_checked() {
             {"role": "user", "content": "hi"},
             {"role": "assistant", "content": null, "tool_calls": [
                 {"id": "c1", "type": "function", "function": {
-                    "name": "post", "arguments": r#"{"text":"kill yourself"}"#}}]},
+                    "name": "post", "arguments": "{\"text\":\"\\u006bill yourself\"}"}}]},
         ])),
         1 << 20,
     )
