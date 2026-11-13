@@ -559,7 +559,16 @@ pub(super) fn settle_hold_in(
         load_hold(conn, hold_id)?.ok_or_else(|| LedgerError::HoldNotFound(hold_id.to_string()))?;
     match hold.state {
         HoldState::Settled => {
-            let existing = hold.charged.unwrap_or(0);
+            // 已结算的预留一定记着实际消费额：`ledger_holds` 的状态 CHECK（`0001_ledger.sql`）要求 `state = 'settled'` 时
+            // `charged_micros IS NOT NULL`，新预留只能以 open 开始、终态不可再改（触发器），唯一把预留关成 settled 的写入路径
+            // `close_hold` 在同一条 UPDATE 里写下状态和金额。所以读到没有金额的已结算预留，只可能是库被损坏（关掉了约束检查、
+            // 直接改过库文件）。失败即关闭：**不能**当成「收了 0」——否则重放 `settle(0)` 会得到 AlreadySettled，
+            // 把一笔其实没有写下的结算（少收）当成已经做完。
+            let existing = hold.charged.ok_or_else(|| {
+                LedgerError::Corrupt(format!(
+                    "hold {hold_id} is settled but records no charged amount"
+                ))
+            })?;
             return if existing == charged {
                 Ok(blank_outcome(
                     &hold.unit,

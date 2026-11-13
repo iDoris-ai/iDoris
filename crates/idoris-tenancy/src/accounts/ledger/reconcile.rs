@@ -39,6 +39,7 @@ fn table_exists(conn: &Connection, name: &str) -> Result<bool, LedgerError> {
 /// 对账。账本自己的守恒检查总是做；和 S4 尝试记录的对照只在尝试表存在时做。
 pub(super) fn reconcile_in(conn: &Connection) -> Result<ReconcileReport, LedgerError> {
     let mut report = ReconcileReport::default();
+    check_closed_holds_record_a_charge(conn, &mut report)?;
     check_conservation(conn, &mut report)?;
     check_liabilities(conn, &mut report)?;
     check_grace(conn, &mut report)?;
@@ -46,6 +47,33 @@ pub(super) fn reconcile_in(conn: &Connection) -> Result<ReconcileReport, LedgerE
         check_against_attempts(conn, &mut report)?;
     }
     Ok(report)
+}
+
+/// 已收尾（settled / released）的预留必须记着实际消费额。数据库的状态 CHECK 保证它（`0001_ledger.sql` 的 `ledger_holds`），
+/// 所以正常情况下这里永远没有输出；它是对账的兜底：下面几项检查为了在没收尾的预留上用同一套 SQL，把没有金额的预留按 0 读
+/// （`COALESCE(charged_micros, 0)`），如果一个已收尾的预留真的没有金额（库被损坏：关掉了约束检查、直接改过库文件），
+/// 「没有金额」不能被读成「收了 0」悄悄对上——在这里单独报出来。
+fn check_closed_holds_record_a_charge(
+    conn: &Connection,
+    report: &mut ReconcileReport,
+) -> Result<(), LedgerError> {
+    let mut stmt = conn.prepare(
+        "SELECT hold_id, state FROM ledger_holds
+          WHERE state IN ('settled', 'released') AND charged_micros IS NULL
+          ORDER BY hold_id",
+    )?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    for (hold, state) in rows {
+        report.mismatches.push(mismatch(
+            &hold,
+            format!("the hold is {state} but records no charged amount"),
+        ));
+    }
+    Ok(())
 }
 
 /// 每个预留在付款账户链上每个账户的分录之和：在途 = （open ? R : 0），已花 = （settled ? 实际金额 - 宽限里平台承担的部分 : 0）；
