@@ -5,7 +5,13 @@
 //! 速率写成「每分钟多少个请求」，桶容量是 `burst` 个令牌。令牌数不用浮点：内部单位是 `1/60000` 个令牌，
 //! 这样「每毫秒回填 `requests_per_minute` 个单位」是**精确的整数运算**，没有余数丢失（每分钟 20 个请求的速率，
 //! 逐毫秒回填，不会因为取整永远攒不满一个令牌）。时间由调用方传入（毫秒），所以测试可以拨时钟，
-//! 不需要睡觉。时钟回拨（NTP 校时）时不回填、并重新对齐，不会因此冻结一个桶。
+//! 不需要睡觉。
+//!
+//! **桶里的时间只前进**：同一段时间不能补两次额度。两个请求几乎同时取时、却按相反的顺序抢到桶的锁，晚到的那个带着
+//! 更早的时间，如果让它把桶里的时间拨回去，下一个请求就会把「已经补过的那一小段」再补一次（间隔 1 毫秒的两个请求都成功）。
+//! 所以倒退不超过 [`OUT_OF_ORDER_TOLERANCE_MS`] 的时间读数一律当作乱序：不回填，也不拨回桶里的时间。
+//! 倒退得更多才是时钟被拨回（NTP 校时、手动改时间）：不回填、并重新对齐，不会因此冻结一个桶。
+//! 调用方应当传**单调**时间（`Clock::monotonic_ms`），墙上时钟被拨回就不会走到这里。
 //!
 //! 拒绝时算得出**确切**的等待：还差多少单位 ÷ 每毫秒回填多少，向上取整到秒（至少 1 秒），放进 `Retry-After`。
 //!
@@ -22,6 +28,9 @@ use std::hash::Hash;
 
 /// 一个令牌的内部单位数：`60_000` = 一分钟的毫秒数，所以每毫秒回填 `requests_per_minute` 个单位 = 精确。
 pub const UNITS_PER_TOKEN: u64 = 60_000;
+
+/// 时间读数倒退不超过这么多毫秒，当作乱序（见模块文档）：不拨回桶里的时间。
+pub const OUT_OF_ORDER_TOLERANCE_MS: i64 = 5_000;
 
 /// 速率上限：每分钟 `requests_per_minute` 个请求，桶容量 `burst`。两个数都至少是 1。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -85,8 +94,12 @@ impl Bucket {
 
     fn refill(&mut self, limit: &RateLimit, now_ms: i64) {
         self.units = self.units_at(limit, now_ms);
-        // 时钟没动或者回拨：只对齐，不回填，也不让桶因此冻结
-        self.last_ms = now_ms;
+        // 桶里的时间只前进：乱序到达的较早读数（倒退不超过容忍范围）不拨回它，否则同一段时间会被补两次额度。
+        // 倒退得更多是时钟被拨回：只对齐，不回填，也不让桶因此冻结
+        if now_ms >= self.last_ms || self.last_ms.saturating_sub(now_ms) > OUT_OF_ORDER_TOLERANCE_MS
+        {
+            self.last_ms = now_ms;
+        }
     }
 
     /// 取一个令牌。成功 `Ok`；桶里不够返回 `Err(还要等几秒)`（向上取整，至少 1）。失败不改变令牌数。
@@ -287,6 +300,23 @@ mod tests {
         assert!(bucket.try_take(&l, 10_000 - 3_600_000).is_err());
         // 但从新的时刻重新开始走：1 秒之后就有一个令牌（没有冻结一小时）
         assert_eq!(bucket.try_take(&l, 10_000 - 3_600_000 + 1_000), Ok(()));
+    }
+
+    /// R2 Medium#5：乱序到达的较早时间读数不能把桶里的时间拨回去，否则同一段时间被补两次额度。
+    /// 每分钟 20 个、突发 1：B 在 3000ms 用掉令牌；较早取时、较晚才到的 A（时间 0）被拒，并且不能把桶拨回 0；
+    /// C 在 3001ms：只比 B 晚 1ms，不该再有一个令牌。
+    #[test]
+    fn an_out_of_order_reading_does_not_refill_the_same_span_twice() {
+        let l = limit(20, 1);
+        let mut bucket = Bucket::full(&l, 0);
+        assert_eq!(bucket.try_take(&l, 3_000), Ok(())); // B
+        assert!(bucket.try_take(&l, 0).is_err(), "A: stale and empty"); // A
+        assert!(
+            bucket.try_take(&l, 3_001).is_err(),
+            "C: 1 ms after B must not get a token"
+        );
+        // 真正过了 3 秒（每分钟 20 个 = 每 3 秒 1 个）才有下一个
+        assert_eq!(bucket.try_take(&l, 6_000), Ok(()));
     }
 
     #[test]

@@ -120,6 +120,36 @@
 //!     冻结孩子的凭证）。LLM 检查端点对每个儿童调用方的付款单位都要有价目，否则配置加载失败。
 //! 26. **先占额度再检查**：预留发生在规则检查器之前（规则 + LLM 是一条管线，只占一次额度），所以账户额度耗尽时，连明显有害的输入
 //!     也是 402 而不是 422（规则拦下的那次预留随即释放，不收费）。
+//!
+//! # Codex 审查 r2 与 PR-Daemon 评审之后的口径（需要 owner 确认，没有悄悄拍板）
+//!
+//! 27. **显式 `local_only` 在云入口一律拒绝**（403 `local_only_refused`，早于一切候选选择、准入、安全检查模型调用和上游请求，
+//!     执行器里再查一道）。**没声明不等于 `local_only`**：本地路由器「没声明 = `local_only`」的保守默认在云入口不适用，
+//!     因为普通的 OpenAI 客户端不会发这个头，而它们调的就是云。头不合法（重复、空、不认识的值）是 400 `invalid_privacy`，
+//!     不当作没声明。请求体里的等价声明（顶层 `privacy` 或 `metadata.privacy` 写了 `local_only`）同样拒绝，取最严的。
+//! 28. **`billing: unbilled` 没有实现，加载配置时拒绝**（备选：完整实现「不收用户费用、单独记平台成本」，要改准入、预留、结算）。
+//!     契约（S0）里 `Billing::Unbilled` 对流式 usage 的豁免没有改动。
+//! 29. **`extra_body` 不能碰协议 / 计费 / 身份 / 留存字段**（`idoris_upstream::cloud::RESERVED_EXTRA_BODY_FIELDS`），加载时拒绝，
+//!     构造请求时这些字段最后写入。保留表是我拟的，增减要 owner 看一眼。
+//! 30. **流中途的 usage 不是最终用量**：只有流正常完成，或者这个 usage 来自「最后一块」（单独的 usage 块，或带 `finish_reason`
+//!     的最后一块内容）而且之后没有再出现内容，才按它结算；否则按「用量未知 / 可能已执行」的原规则（预留价、挂账待核销）。
+//!     代价：客户端恰好在最终 usage 之后、`[DONE]` 之前断开时按最终 usage 结算（信），而中途 usage 之后断开按预留价结算（不信，
+//!     多收）——选的是不少收，用户多付的部分对账时才能看出来。
+//! 31. **儿童判定看整条付款链**：顶层客户之外的任何账户声明了 `child_edu`，这个请求就按儿童处理（数据类别并集、留存取更严、
+//!     区域取交集）；声明写在已经存在的非顶层账户上，启动失败。**儿童租户必须配 LLM 检查器**（生产启动，`rules_only` 失败）：
+//!     规则检查器靠关键词和正则，换字体、拼写变形、base64、藏在工具描述里的内容都能绕过。
+//! 32. **认证之前有界**：同时在途的认证查询个数 + 「最近没有认证成功过的凭证前缀」的查询预算（默认 64 个在途、每分钟 1200 次，
+//!     突发 200），满了直接 429 `auth_capacity_limited`，不碰库；在用的凭证不消耗预算。默认值是我拟的，要按真实流量调。
+//! 33. **供应商主机绑定（部分）**：许可表里已核验的供应商，`base_url` 的主机必须是核验过的 API 主机（`config::VERIFIED_PROVIDER_HOSTS`，
+//!     来自 `config/compute/endpoint-urls.md`）；主机没核实的供应商不能配置到非回环地址；表里没有的标签不受限。更彻底的做法
+//!     （把主机写进许可表的 schema，由 S0 校验）要改契约，没做。
+//! 34. **已发送的尝试报 0 用量按 0 结算**（用户付 0、平台成本 0）。真实分词器不会给非空提示算出 0 个输入 token，这多半说明上游出错了：
+//!     是否按最小值收、或按「用量未知」处理，要 owner 定；`cloud_r2_fixes` 里有一条测试钉住今天的行为。
+//! 35. **迟到 usage 对账**（`AttemptStore::reconcile_late_usage`）只处理没有向用户收费的 `maybe_executed` 尝试：冲销旧挂账、记实际成本、
+//!     按 S0 的转移结清，一个事务。向用户收费那一次的迟到 usage 要不要退差价是准入账本的事，这里拒绝。
+//! 36. **同步的账本操作用 `block_in_place` 跑**（`blocking`）：准入、尝试记录、收尾、拒绝记录不再直接阻塞 tokio worker 线程。
+//!     范围：执行器和尝试记录；儿童安全检查的成本计量（`safety::LedgerExtraCost`）、`RunState::record_supplier_id` 里的两处同步
+//!     标注写入（供应商请求号落盘，另有改动在进行，没动）和账户存储里的其它同步调用不在这里。
 
 use std::path::Path;
 use std::sync::Arc;
@@ -130,6 +160,7 @@ use idoris_tenancy::attempts::AttemptStore;
 
 pub mod admission;
 pub mod answer;
+mod blocking;
 pub mod clock;
 pub mod config;
 pub mod executor;
@@ -148,7 +179,9 @@ pub use clock::{Clock, ManualClock, SystemClock};
 pub use config::{
     CallerBook, CallerPolicy, CloudLimits, CloudParts, EndpointRegistry, EndpointRuntime, RouteBook,
 };
-pub use executor::{CloudCall, CloudError, CloudExecutor, FailureInfo, status_allows_failover};
+pub use executor::{
+    CallPrivacy, CloudCall, CloudError, CloudExecutor, FailureInfo, status_allows_failover,
+};
 pub use ingress::{CloudIngress, IngressContext, build_cloud_app};
 pub use run::Settled;
 pub use safety::{
@@ -280,6 +313,8 @@ impl CloudUpstream {
     ) -> Result<Self, String> {
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
         let parts = config::load_with_ingress_tenants(path, clock.now(), ingress_tenants)?;
+        // 儿童数据必须有 LLM 安全检查器，只用规则检查器启动失败（PR-Daemon B3；需 owner 确认）
+        config::require_llm_judge_for_child_tenants(&parts, ingress_tenants)?;
         // 启动日志（S6）：哪些调用方走儿童安全管线（只有租户标识）。运营方一眼能核对「edu 租户的属性确实是 child_edu」
         let (mut child, mut other) = parts.callers.caller_summary();
         for tenant in ingress_tenants {

@@ -23,6 +23,8 @@
 //!   anonymous:            {requests_per_minute: 60, burst: 20}   # 所有「没有凭证」的请求合起来的总配额
 //!   per_source_anonymous: {requests_per_minute: 20, burst: 10}   # 单个来源的软配额（辅助信号，只作用于没有凭证的请求）
 //!   auth_failures: {max_failures: 5, window_secs: 60}            # 同一个凭证前缀的认证失败上限
+//!   auth_max_concurrent: 64                                      # 认证之前：同时在途的认证查询个数，满了直接 429、不碰库
+//!   auth_unknown: {requests_per_minute: 1200, burst: 200}        # 认证之前：「最近没有认证成功过的凭证前缀」的查询预算
 //!
 //! limits:                                   # 三级上限：请求速率（令牌桶）和并发（在途个数）
 //!   platform: {requests_per_minute: 3000, burst: 100, max_concurrent: 128}
@@ -35,7 +37,7 @@
 //!     max_retention: zdr                    # zdr | with_exceptions | retained（含 child_edu 时固定 zdr）
 //!     require_dpa: true                     # 含 child_edu 时固定为要求已签 DPA
 //!     allowed_regions: [sg-1]               # 可选；不写 = 不限区域
-//!     billing: subsidized                   # paid | subsidized | unbilled
+//!     billing: subsidized                   # paid | subsidized（unbilled 没有实现，加载时拒绝）
 //!     limits:                               # 可选：这个租户自己的上限（写就写完整的一块）
 //!       tenant: {requests_per_minute: 1200, burst: 60, max_concurrent: 64}
 //!       member: {requests_per_minute: 30, burst: 10, max_concurrent: 3}
@@ -47,6 +49,12 @@
 //! 也不能由租户自己的管理员通过控制面改（否则一所学校的管理员可以把自己从 `child_edu` 改成 `adult` 来绕过
 //! 儿童保护）。所以它在运维控制的这份配置里，由租户账户 id 索引；改它要改文件、重启，没有任何网络入口能动它。
 //! 一个租户没有在这里声明，它的请求一律被拒（403 `tenant_not_provisioned`）：不知道用什么标准处理数据，就不处理。
+//!
+//! # `child_edu` 只能声明在顶层客户上
+//!
+//! 租户是付款链上离平台根最近的客户（见 `caller.rs`）。`child_edu` 声明写在下级账户（学校、成员）上：如果那个账户已经存在，
+//! 启动失败（`CloudIngress::new`）；启动之后才建的账户，每次请求按整条付款链判定——链上任何一个账户声明了 `child_edu`，
+//! 这个请求就按儿童处理。**云上游配置里有儿童租户，`safety:` 段还必须配 LLM 检查器**（生产启动要求，只用规则检查器失败）。
 //!
 //! # 声明了 `child_edu` 的租户：衔接 S6 的儿童安全管线
 //!
@@ -81,6 +89,8 @@ const MAX_BODY_BYTES: usize = 16 * 1_024 * 1_024;
 const MIN_READ_TIMEOUT_MS: u64 = 100;
 const MAX_READ_TIMEOUT_MS: u64 = 120_000;
 const MAX_FAILURE_WINDOW_SECS: u64 = 3_600;
+const DEFAULT_AUTH_MAX_CONCURRENT: u32 = 64;
+const MAX_AUTH_MAX_CONCURRENT: u32 = 10_000;
 
 // ---------------------------------------------------------------------------
 // 文件形状（serde）
@@ -144,6 +154,8 @@ struct AbuseFile {
     anonymous: RateFile,
     per_source_anonymous: RateFile,
     auth_failures: FailuresFile,
+    auth_max_concurrent: u32,
+    auth_unknown: RateFile,
 }
 
 impl Default for AbuseFile {
@@ -162,6 +174,11 @@ impl Default for AbuseFile {
             auth_failures: FailuresFile {
                 max_failures: 5,
                 window_secs: 60,
+            },
+            auth_max_concurrent: DEFAULT_AUTH_MAX_CONCURRENT,
+            auth_unknown: RateFile {
+                requests_per_minute: 1_200,
+                burst: 200,
             },
         }
     }
@@ -266,6 +283,10 @@ pub struct IngressConfig {
     pub anonymous_per_source: RateLimit,
     pub auth_failure_max: u32,
     pub auth_failure_window_secs: u64,
+    /// 认证之前同时在途的认证查询个数上限（满了直接拒绝，不碰库）。
+    pub auth_max_concurrent: usize,
+    /// 认证之前的查询预算：只有「最近没有认证成功过的凭证前缀」才消耗它（见 `abuse::AuthBudget`）。
+    pub auth_unknown: RateLimit,
     pub platform: LevelLimits,
     /// 没有自己声明上限的租户用这一组。
     pub default_limits: CallerLimits,
@@ -365,6 +386,13 @@ impl IngressConfig {
             )));
         }
 
+        if !(1..=MAX_AUTH_MAX_CONCURRENT).contains(&abuse.auth_max_concurrent) {
+            return Err(bad(format!(
+                "abuse.auth_max_concurrent 必须在 1..={MAX_AUTH_MAX_CONCURRENT} 之间"
+            )));
+        }
+        let auth_unknown = rate("abuse.auth_unknown", &abuse.auth_unknown)?;
+
         let platform = level("limits.platform", &file.limits.platform)?;
         let default_limits = CallerLimits {
             tenant: level("limits.tenant", &file.limits.tenant)?,
@@ -381,6 +409,13 @@ impl IngressConfig {
             let account = AccountId::new(&tenant.account)
                 .map_err(|e| bad(format!("tenants[].account {:?}: {e}", tenant.account)))?;
             let what = |field: &str| format!("租户 {account} 的 {field}");
+            // `unbilled` 没有实现：准入、预留、结算都不认它（用户额度照扣），所以拒绝（失败即关闭）。要免费用 subsidized
+            if tenant.billing == Billing::Unbilled {
+                return Err(bad(format!(
+                    "{}: unbilled 在云形态没有实现（准入、预留和结算都不认它：用户额度照扣）；要免费请用 subsidized",
+                    what("billing")
+                )));
+            }
             let regions = tenant
                 .allowed_regions
                 .as_ref()
@@ -434,6 +469,8 @@ impl IngressConfig {
             anonymous_per_source,
             auth_failure_max: abuse.auth_failures.max_failures,
             auth_failure_window_secs: abuse.auth_failures.window_secs,
+            auth_max_concurrent: usize::try_from(abuse.auth_max_concurrent).unwrap_or(usize::MAX),
+            auth_unknown,
             platform,
             default_limits,
             tenants,
@@ -669,6 +706,52 @@ tenants:
         expect_error(
             &format!("{MINIMAL}limits:\n  tenant: {{requests_per_minute: 5}}\n"),
             "missing field",
+        );
+    }
+
+    /// R2 High#3：`billing: unbilled` 没有实现（准入、预留、结算都不认它，用户额度照扣），加载时拒绝，不是悄悄收钱。
+    #[test]
+    fn billing_unbilled_is_refused_for_a_tenant() {
+        expect_error(
+            &MINIMAL.replace("billing: paid", "billing: unbilled"),
+            "unbilled 在云形态没有实现",
+        );
+        // 付费、补贴照常
+        for billing in ["paid", "subsidized"] {
+            assert!(
+                IngressConfig::parse(
+                    &MINIMAL.replace("billing: paid", &format!("billing: {billing}"))
+                )
+                .is_ok(),
+                "{billing}"
+            );
+        }
+    }
+
+    /// R2 High#4：认证之前的有界并发和查询预算有默认值，也有合法范围。
+    #[test]
+    fn the_pre_authentication_budget_has_defaults_and_bounds() {
+        let config = IngressConfig::parse(MINIMAL).unwrap();
+        assert_eq!(config.auth_max_concurrent, 64);
+        assert_eq!(config.auth_unknown.requests_per_minute(), 1_200);
+        assert_eq!(config.auth_unknown.burst(), 200);
+        let tuned = IngressConfig::parse(&format!(
+            "{MINIMAL}abuse:\n  auth_max_concurrent: 8\n  auth_unknown: {{requests_per_minute: 30, burst: 2}}\n"
+        ))
+        .unwrap();
+        assert_eq!(tuned.auth_max_concurrent, 8);
+        assert_eq!(tuned.auth_unknown.burst(), 2);
+        expect_error(
+            &format!("{MINIMAL}abuse:\n  auth_max_concurrent: 0\n"),
+            "auth_max_concurrent",
+        );
+        expect_error(
+            &format!("{MINIMAL}abuse:\n  auth_max_concurrent: 100000\n"),
+            "auth_max_concurrent",
+        );
+        expect_error(
+            &format!("{MINIMAL}abuse:\n  auth_unknown: {{requests_per_minute: 0, burst: 1}}\n"),
+            "auth_unknown",
         );
     }
 

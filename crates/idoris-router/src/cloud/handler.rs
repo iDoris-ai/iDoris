@@ -45,7 +45,7 @@ use std::sync::Arc;
 
 use axum::body::{Body, Bytes};
 use axum::extract::{Extension, State};
-use axum::http::{HeaderValue, StatusCode, header};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use idoris_compute_contracts::ids::RequestId;
 use idoris_compute_contracts::reason::{ExperienceTier, ReasonCode};
@@ -57,7 +57,7 @@ use idoris_tenancy::virtual_key::store::AuthenticatedVirtualKey;
 use super::answer::{AnswerMeta, CloudOutcome};
 use super::config::CallerPolicy;
 use super::executor::{CloudCall, CloudError};
-use super::request::{RequestProblem, parse_client_request};
+use super::request::{InvalidPrivacy, RequestProblem, declared_privacy, parse_client_request};
 use crate::connection::RequestLifecycle;
 use crate::{
     AppState, HEADER_DEGRADED, HEADER_REASON, HEADER_RECORD_ID, RequestRecordId, error_envelope,
@@ -70,6 +70,7 @@ pub(crate) async fn chat_completions(
     Extension(lifecycle): Extension<RequestLifecycle>,
     identity: Option<Extension<AuthenticatedVirtualKey>>,
     resolved: Option<Extension<CallerPolicy>>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Response {
     let Some(cloud) = state.cloud.as_ref() else {
@@ -79,6 +80,19 @@ pub(crate) async fn chat_completions(
     let request = match parse_client_request(&body) {
         Ok(request) => request,
         Err(problem) => return problem_response(problem),
+    };
+    // 隐私声明（`X-iDoris-Privacy` 或请求体里的等价字段）：不合法就拒绝（失败即关闭，不当作没声明）。
+    // 显式 `local_only` 交给执行器：它在任何候选选择、准入、安全检查和上游请求之前拒绝（并留一行审计记录）。
+    let privacy = match declared_privacy(&headers, &request.body) {
+        Ok(privacy) => privacy,
+        Err(InvalidPrivacy) => {
+            return error_envelope_with_reason(
+                StatusCode::BAD_REQUEST,
+                "invalid_privacy",
+                "invalid_privacy",
+                "X-iDoris-Privacy must be a single, non-blank value: any|local_only",
+            );
+        }
     };
     let caller = match resolved {
         // 云入口（S5）从凭证推导出来的调用方
@@ -124,6 +138,7 @@ pub(crate) async fn chat_completions(
         payment: caller.payment.clone(),
         tenant: caller.tenant.clone(),
         billing: caller.billing,
+        privacy,
         client_body: request.body,
         stream: request.stream,
         client_wants_usage_chunk: request.wants_usage_chunk,
@@ -373,6 +388,21 @@ pub(crate) fn error_response(error: &CloudError) -> Response {
             "streaming_not_allowed",
             "streaming is not available for this tenant; send a non-streaming request",
         ),
+        CloudError::LocalOnlyRefused => {
+            // 调用方说这份数据不许离开它的机器；云是远端，永远不处理。码同时在 `X-iDoris-Reason` 里（浏览器读得到）
+            let mut response = error_envelope_with_reason(
+                StatusCode::FORBIDDEN,
+                "local_only_refused",
+                "local_only_refused",
+                "this request declares privacy local_only; the cloud service never processes it and nothing was sent to any model",
+            );
+            response.headers_mut().insert(
+                HEADER_REASON,
+                HeaderValue::from_static("local_only_refused"),
+            );
+            expose_headers(&mut response);
+            response
+        }
         CloudError::SafetyBlocked { stage, category } => safety_response(
             StatusCode::UNPROCESSABLE_ENTITY,
             SafetyReasonCode::blocked_at(*stage),

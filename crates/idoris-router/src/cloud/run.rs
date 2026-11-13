@@ -33,6 +33,7 @@ use idoris_tenancy::attempts::{
 };
 use idoris_upstream::cloud::UsageParse;
 
+use super::blocking::blocking;
 use super::clock::Clock;
 use super::executor::CloudError;
 
@@ -78,9 +79,7 @@ impl RunState {
             .attempts()
             .first()
             .ok_or_else(|| CloudError::Internal("a new request has no attempt".into()))?;
-        store
-            .create_request(meta, first_attempt)
-            .map_err(CloudError::ledger)?;
+        blocking(|| store.create_request(meta, first_attempt)).map_err(CloudError::ledger)?;
         Ok(Self {
             store,
             clock,
@@ -130,9 +129,11 @@ impl RunState {
         let attempt = trial
             .attempt(idx)
             .ok_or_else(|| CloudError::Internal("the new attempt is missing".into()))?;
-        self.store
-            .append_attempt(self.request.id(), attempt, self.now())
-            .map_err(CloudError::ledger)?;
+        blocking(|| {
+            self.store
+                .append_attempt(self.request.id(), attempt, self.now())
+        })
+        .map_err(CloudError::ledger)?;
         self.request = trial;
         self.admission_reasons.push(reason);
         Ok(idx)
@@ -145,9 +146,7 @@ impl RunState {
         events: &[AttemptEvent],
     ) -> Result<AttemptState, CloudError> {
         let id = self.attempt_id(idx)?;
-        let from_store = self
-            .store
-            .apply_events(&id, events, self.now())
+        let from_store = blocking(|| self.store.apply_events(&id, events, self.now()))
             .map_err(CloudError::ledger)?;
         let mut in_memory = None;
         for event in events {
@@ -173,13 +172,15 @@ impl RunState {
     /// 失败标注（不改变状态）。库写失败只记日志：标注是给对账的人看的，不是账。
     pub(crate) fn note_failure(&self, idx: AttemptIndex, kind: &str, http_status: Option<u16>) {
         if let Ok(id) = self.attempt_id(idx)
-            && let Err(error) = self.store.record_failure(
-                &id,
-                &FailureNote {
-                    kind: kind.to_string(),
-                    http_status,
-                },
-            )
+            && let Err(error) = blocking(|| {
+                self.store.record_failure(
+                    &id,
+                    &FailureNote {
+                        kind: kind.to_string(),
+                        http_status,
+                    },
+                )
+            })
         {
             eprintln!("[idoris] cloud: could not annotate attempt failure: {error}");
         }
@@ -220,7 +221,7 @@ impl RunState {
 
     pub(crate) fn record_usage_claim(&self, idx: AttemptIndex, claim: &UsageClaim) {
         if let Ok(id) = self.attempt_id(idx)
-            && let Err(error) = self.store.record_usage_claim(&id, claim)
+            && let Err(error) = blocking(|| self.store.record_usage_claim(&id, claim))
         {
             eprintln!("[idoris] cloud: could not record the usage claim: {error}");
         }
@@ -237,9 +238,7 @@ impl RunState {
             ));
         }
         let id = self.attempt_id(idx)?;
-        self.store
-            .record_publish(&id, self.now())
-            .map_err(CloudError::ledger)?;
+        blocking(|| self.store.record_publish(&id, self.now())).map_err(CloudError::ledger)?;
         self.request
             .publish_first_byte(idx)
             .map_err(|e| CloudError::Internal(format!("contract refused the publish: {e}")))
@@ -347,8 +346,8 @@ impl RunState {
             self.close_reason
         };
         // 3. 落账
-        self.store
-            .finalize_request(
+        blocking(|| {
+            self.store.finalize_request(
                 &plan,
                 &to_settle,
                 RequestClose {
@@ -357,7 +356,8 @@ impl RunState {
                     at: self.now(),
                 },
             )
-            .map_err(CloudError::ledger)?;
+        })
+        .map_err(CloudError::ledger)?;
         // 4. 内存跟上
         for id in &to_settle {
             let idx = id.index();

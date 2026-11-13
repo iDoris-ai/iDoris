@@ -9,13 +9,25 @@
 //! |---|---|---|
 //! | 付款账户（payer） | [`AccountStore::payment_context`]：凭证的绑定，加上（只对 Service 凭证）`X-iDoris-Member` 里的成员 id，**每次请求逐次验证、不缓存** | 只有那个成员 id，而且它必须在这张凭证的范围内，否则拒绝 |
 //! | 租户 | payer 在账户树里的祖先链：平台根之下的**顶层客户**（跳过平台根和补贴池） | 不能。`X-iDoris-Tenant` 在入口最外层就被删掉，云入口不读、不信 |
-//! | 数据类别（是不是 `child_edu`）、留存、区域、DPA | 租户在云入口配置里的声明（`config`） | 不能 |
+//! | 数据类别（是不是 `child_edu`）、留存、区域、DPA | 租户在云入口配置里的声明（`config`）；付款链上**任何一个**账户声明了 `child_edu`，这个请求就按儿童处理（取最严的合并，见下） | 不能 |
 //! | 计费性质（付费 / 补贴 / 不计费） | 同上 | 不能 |
 //! | 各级上限 | 租户的声明，没写就用默认 | 不能 |
 //!
 //! 租户用 payer 的祖先链推导、不用凭证绑定的账户，是故意的：一张 Service 凭证（eduai 后端）绑在 `eduai` 或者它下面的
 //! 某所学校，断言的成员在它范围内的任何位置，payer 都落在成员自己的账户上；租户永远是这个 payer 往上数的顶层客户。
 //! 凭证没有办法「选」一个租户。
+//!
+//! # 儿童数据：付款链上任何一个 `child_edu` 声明都算（R2 / PR-Daemon B3）
+//!
+//! 声明本来只该写在**顶层客户**上（租户 = 付款链上离平台根最近的客户）。但配置是运维写的，会写错，账户也会在启动之后才建：
+//! 如果顶层客户 `eduai` 声明了 `adult`、学校 `school-a`（`eduai` 的下级）声明了 `child_edu`，「顶层客户的声明胜出」就会让
+//! 学校 A 的孩子按成人策略被服务（不走儿童安全管线）。所以：
+//!
+//! - **启动时**：声明了 `child_edu` 的账户如果已经存在、却不是顶层客户，启动失败（[`refuse_child_declarations_below_the_top`]）；
+//!   不是警告；
+//! - **每次请求**：付款链上任何一个账户（不只是顶层客户）声明了 `child_edu`，这个请求就按儿童处理：数据类别取并集，
+//!   留存取更严的，区域取交集（交集为空就拒绝），DPA 只要有一边要求就要求。启动之后才建的账户同样在这里被判定。
+//!   租户（限额的键、计费性质）仍然是顶层客户，不变。
 //!
 //! # 失败就是失败，不回落
 //!
@@ -39,10 +51,11 @@ use std::sync::Arc;
 use idoris_compute_contracts::account::{Account, AccountKind};
 use idoris_compute_contracts::credential::ResolveError;
 use idoris_compute_contracts::ids::{AccountId, CredentialId, PrincipalId, TimestampMs};
+use idoris_compute_contracts::permit::{Retention, TenantDataPolicy};
 use idoris_compute_contracts::reason::ReasonCode;
-use idoris_tenancy::accounts::{AccountStore, PaymentContextError};
+use idoris_tenancy::accounts::{AccountStore, AccountStoreError, PaymentContextError};
 
-use super::config::IngressConfig;
+use super::config::{IngressConfig, TenantProfile};
 use super::limits::{CallerLimits, LimitKeys};
 use crate::cloud::CallerPolicy;
 
@@ -95,6 +108,68 @@ pub fn derive_tenant(chain: &[Account]) -> Option<&Account> {
     })
 }
 
+/// 两份数据处理要求里**更严**的合并（付款链上有不止一份声明时用）：数据类别取并集，留存取更严的，
+/// 区域有一边限制就限制、两边都限制取交集，DPA 只要有一边要求就要求。交集为空（两边的区域不相交）返回 `None`：
+/// 没有任何区域能同时满足，调用方应当拒绝而不是挑一边。
+pub fn strictest_policy(a: &TenantDataPolicy, b: &TenantDataPolicy) -> Option<TenantDataPolicy> {
+    let classes = a
+        .data_classes()
+        .union(b.data_classes())
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
+    let regions = match (a.allowed_regions(), b.allowed_regions()) {
+        (None, None) => None,
+        (Some(only), None) | (None, Some(only)) => Some(only.clone()),
+        (Some(x), Some(y)) => Some(x.intersection(y).cloned().collect()),
+    };
+    let (ra, rb) = (a.effective_max_retention(), b.effective_max_retention());
+    let retention: Retention = if ra.satisfies(rb) { ra } else { rb };
+    TenantDataPolicy::new(
+        classes,
+        regions,
+        retention,
+        a.effective_require_dpa() || b.effective_require_dpa(),
+    )
+    .ok()
+}
+
+/// 启动检查：声明了 `child_edu` 的账户如果已经在账户库里，就必须是顶层客户（账户树里平台根之下的那一层）。
+/// 声明写在下级账户上永远不会按声明者的意思生效（租户是顶层客户），而「悄悄不生效」对儿童数据是失败开放：
+/// 所以不是警告，是启动错误。账户库里还没有的账户（先写配置、后建账户）这里查不了，请求时按付款链判定（见模块文档）。
+pub fn refuse_child_declarations_below_the_top(
+    config: &IngressConfig,
+    accounts: &AccountStore,
+) -> Result<(), String> {
+    for tenant in config.tenants() {
+        if !tenant.data.handles_child_data() {
+            continue;
+        }
+        match accounts.ancestors(&tenant.account) {
+            Ok(chain) => {
+                let top = derive_tenant(&chain).map(|account| account.id.clone());
+                if top.as_ref() != Some(&tenant.account) {
+                    return Err(format!(
+                        "云入口配置：账户 {} 声明了 child_edu，但它不是账户树里平台根之下的顶层客户（它的顶层客户是 {}）。\
+                         儿童数据的声明只能写在顶层客户上：写在下级账户上，顶层客户的声明会胜出，这个账户下的孩子就可能按非儿童策略被服务。\
+                         请把 child_edu 声明移到顶层客户上",
+                        tenant.account,
+                        top.map_or_else(|| "?".to_string(), |id| id.to_string())
+                    ));
+                }
+            }
+            // 账户还没建：请求时按付款链判定
+            Err(AccountStoreError::NotFound { .. }) => {}
+            Err(error) => {
+                return Err(format!(
+                    "云入口配置：无法检查声明了 child_edu 的账户 {} 的层级（失败即关闭）：{error}",
+                    tenant.account
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// 凭证 -> 调用方。
 pub struct CallerResolver {
     accounts: Arc<AccountStore>,
@@ -145,6 +220,8 @@ impl CallerResolver {
         let Some(profile) = self.config.tenant(&tenant.id) else {
             return Err(Refusal::TenantNotProvisioned);
         };
+        // 付款链上任何一个账户（不只是顶层客户）声明了 child_edu，这个请求就按儿童处理（见模块文档）
+        let data = self.effective_data_policy(&chain, tenant, profile)?;
 
         let principal = payment.principal().cloned();
         let member_key = match &principal {
@@ -164,10 +241,40 @@ impl CallerResolver {
             },
             policy: CallerPolicy {
                 payment,
-                tenant: profile.data.clone(),
+                tenant: data,
                 billing: profile.billing,
             },
         })
+    }
+
+    /// 这个请求的数据处理要求：顶层客户的声明，加上付款链上其它账户里**声明了 `child_edu` 的**（按最严的合并）。
+    /// 其它账户上不是儿童的声明不起作用（租户是顶层客户）。合并不出来（区域不相交）就失败即关闭。
+    fn effective_data_policy(
+        &self,
+        chain: &[Account],
+        top: &Account,
+        profile: &TenantProfile,
+    ) -> Result<TenantDataPolicy, Refusal> {
+        let mut data = profile.data.clone();
+        for account in chain {
+            if account.id == top.id {
+                continue;
+            }
+            let Some(declared) = self.config.tenant(&account.id) else {
+                continue;
+            };
+            if !declared.data.handles_child_data() {
+                continue;
+            }
+            data = strictest_policy(&data, &declared.data).ok_or_else(|| {
+                eprintln!(
+                    "[idoris] cloud ingress: the child_edu declaration of {} and the policy of {} allow no common region; refusing",
+                    account.id, top.id
+                );
+                Refusal::Unavailable
+            })?;
+        }
+        Ok(data)
     }
 }
 
@@ -622,6 +729,191 @@ tenants:
                 "s2x"
             );
         }
+    }
+
+    // ---------- PR-Daemon B3：付款链上任何一个 child_edu 声明都算 ----------
+
+    fn config_of(tenants: &str) -> IngressConfig {
+        IngressConfig::parse(&format!("schema_version: 1\ntenants:\n{tenants}")).unwrap()
+    }
+
+    const ADULT_TOP_CHILD_BELOW: &str = "  - account: agent24
+    data_classes: [adult]
+    max_retention: with_exceptions
+    billing: paid
+  - account: school-x
+    data_classes: [child_edu]
+    max_retention: zdr
+    require_dpa: true
+    billing: subsidized
+";
+
+    #[test]
+    fn a_child_declaration_on_an_existing_account_below_the_top_is_refused_at_start_up() {
+        let w = world();
+        // eduai 是顶层客户；school-a 是它的下级
+        let below = config_of(
+            "  - account: eduai
+    data_classes: [adult]
+    max_retention: with_exceptions
+    billing: paid
+  - account: school-a
+    data_classes: [child_edu]
+    max_retention: zdr
+    require_dpa: true
+    billing: subsidized
+",
+        );
+        let error = refuse_child_declarations_below_the_top(&below, &w.accounts).unwrap_err();
+        assert!(
+            error.contains("school-a") && error.contains("eduai") && error.contains("顶层客户"),
+            "{error}"
+        );
+        // 下级账户（成员账户、中间的组织）都一样
+        let member = config_of(
+            "  - account: s1
+    data_classes: [child_edu]
+    max_retention: zdr
+    billing: paid
+",
+        );
+        assert!(refuse_child_declarations_below_the_top(&member, &w.accounts).is_err());
+        // 声明在顶层客户上：没问题；下级账户上的成人声明不是儿童声明，不在这里拒绝（只是永远不会生效，启动警告）
+        let fine = config_of(
+            "  - account: eduai
+    data_classes: [child_edu]
+    max_retention: zdr
+    billing: subsidized
+  - account: school-a
+    data_classes: [adult]
+    max_retention: with_exceptions
+    billing: paid
+",
+        );
+        refuse_child_declarations_below_the_top(&fine, &w.accounts).unwrap();
+        // 账户还不存在（先写配置、后建账户）：启动检查查不了，请求时判定（下一个测试）
+        refuse_child_declarations_below_the_top(&config_of(ADULT_TOP_CHILD_BELOW), &w.accounts)
+            .unwrap();
+    }
+
+    #[test]
+    fn an_account_created_after_start_up_with_a_child_declaration_makes_its_requests_child_requests()
+     {
+        let w = world();
+        let config = Arc::new(config_of(ADULT_TOP_CHILD_BELOW));
+        let resolver = CallerResolver::new(w.accounts.clone(), config);
+        // 启动之后才建：agent24（成人顶层客户）-> school-x（声明了 child_edu）-> sx1（孩子的账户）
+        w.accounts
+            .create_account(&account("school-x", AccountKind::Org, Some("agent24")), NOW)
+            .unwrap();
+        w.accounts
+            .create_account(&account("sx1", AccountKind::Member, Some("school-x")), NOW)
+            .unwrap();
+        w.accounts.ensure_principal(&pid("kid-x"), NOW).unwrap();
+        w.accounts
+            .create_membership(
+                &Membership {
+                    id: MembershipId::new("m-kid-x").unwrap(),
+                    principal: pid("kid-x"),
+                    org: aid("school-x"),
+                    role: MembershipRole::Member,
+                    account: Some(aid("sx1")),
+                    status: MembershipStatus::Active,
+                },
+                NOW,
+            )
+            .unwrap();
+        let at = |credential: &str, member: &str| {
+            resolver
+                .resolve(&cid(credential), Some(&pid(member)), NOW)
+                .unwrap()
+        };
+        // 顶层客户 agent24 声明成人，但付款链上的 school-x 声明了 child_edu：这个请求按儿童处理
+        let kid = at("svc-agent24", "kid-x");
+        assert_eq!(kid.policy.payment.payer().as_str(), "sx1");
+        assert!(kid.policy.tenant.handles_child_data());
+        assert!(kid.policy.tenant.effective_require_dpa());
+        assert_eq!(kid.policy.tenant.effective_max_retention(), Retention::Zdr);
+        // 数据类别是并集：成人也在里面（端点要同时许可两类才合规——更严）
+        assert!(
+            kid.policy
+                .tenant
+                .data_classes()
+                .contains(&idoris_compute_contracts::permit::DataClass::Adult)
+        );
+        // 租户（限额的键）和计费性质仍然是顶层客户的
+        assert_eq!(kid.context.tenant.as_str(), "agent24");
+        assert_eq!(kid.keys.tenant, "agent24");
+        assert_eq!(kid.policy.billing, Billing::Paid);
+        // 同一个租户里不在 school-x 下面的成员不受影响：仍然是成人
+        let agent = at("svc-agent24", "agent-1");
+        assert!(!agent.policy.tenant.handles_child_data());
+    }
+
+    #[test]
+    fn the_strictest_policy_unions_classes_keeps_the_stricter_retention_and_intersects_regions() {
+        use std::collections::BTreeSet;
+
+        use idoris_compute_contracts::permit::{DataClass, Region};
+
+        let regions = |names: &[&str]| -> Option<BTreeSet<Region>> {
+            Some(names.iter().map(|r| Region::new(*r).unwrap()).collect())
+        };
+        let policy = |classes: &[DataClass], regions, retention, dpa| {
+            TenantDataPolicy::new(classes.iter().copied().collect(), regions, retention, dpa)
+                .unwrap()
+        };
+        let adult = policy(
+            &[DataClass::Adult],
+            regions(&["sg-1", "th-1"]),
+            Retention::Retained,
+            false,
+        );
+        let child = policy(
+            &[DataClass::ChildEdu],
+            regions(&["sg-1"]),
+            Retention::Zdr,
+            true,
+        );
+        let both = strictest_policy(&adult, &child).unwrap();
+        assert!(both.handles_child_data());
+        assert_eq!(both.data_classes().len(), 2);
+        assert_eq!(both.effective_max_retention(), Retention::Zdr);
+        assert!(both.effective_require_dpa());
+        assert_eq!(both.allowed_regions(), regions(&["sg-1"]).as_ref());
+        // 对称
+        assert_eq!(strictest_policy(&child, &adult), Some(both));
+        // 只有一边限制区域：限制
+        let unrestricted = policy(&[DataClass::Adult], None, Retention::WithExceptions, false);
+        assert_eq!(
+            strictest_policy(&unrestricted, &child)
+                .unwrap()
+                .allowed_regions(),
+            regions(&["sg-1"]).as_ref()
+        );
+        // 两边都不限制：不限制；留存取更严的（成人 retained、儿童 zdr -> zdr；两个都宽松取更严的那个）
+        let loose_child = policy(&[DataClass::ChildEdu], None, Retention::Retained, false);
+        let merged = strictest_policy(&unrestricted, &loose_child).unwrap();
+        assert_eq!(merged.allowed_regions(), None);
+        assert_eq!(
+            merged.effective_max_retention(),
+            Retention::Zdr,
+            "child_edu is always zdr"
+        );
+        // 区域不相交：没有任何区域能同时满足，不挑一边（返回 None，调用方失败即关闭）
+        let elsewhere = policy(
+            &[DataClass::ChildEdu],
+            regions(&["th-1"]),
+            Retention::Zdr,
+            true,
+        );
+        let sg_only = policy(
+            &[DataClass::Adult],
+            regions(&["sg-1"]),
+            Retention::Zdr,
+            false,
+        );
+        assert_eq!(strictest_policy(&sg_only, &elsewhere), None);
     }
 
     #[test]
