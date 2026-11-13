@@ -188,6 +188,44 @@ pub(super) fn load_hold(
     .transpose()
 }
 
+/// 这个请求还能不能切换到新的候选（准入序号大于 0 的尝试，在释放任何预留之前先问）。
+///
+/// 契约的 `begin_next_attempt` 在发布边界（已经向客户端输出了第一个字节）之后一律拒绝切换，尝试记录的触发器也拒绝给
+/// 已发布或已关闭的请求追加尝试。账本要在**释放任何东西之前**自己看一遍：发布了的那次尝试是向用户收费的那一次，哪怕它
+/// 还是 `maybe_executed`（流式，usage 还没到，随后按预留价结算），它的预留也不能因为后面又准入了一个候选就被放掉——
+/// 放掉之后它的额度不在账上，之后正金额的结算会报 `ChargeAfterRelease`（PR #600 第二轮 S1 F4）。这时连新的预留也不该占：
+/// 整个准入被拒绝，什么都不写。
+///
+/// 尝试记录表不存在（只开了账本的库），或者这个请求在里面还没有记录时，没有这一层信息，照旧放行。
+pub(super) fn ensure_may_switch(conn: &Connection, request: &RequestId) -> Result<(), LedgerError> {
+    let present: bool = conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'compute_requests')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !present {
+        return Ok(());
+    }
+    let state: Option<(Option<i64>, Option<String>)> = conn
+        .query_row(
+            "SELECT published_attempt, outcome FROM compute_requests WHERE request_id = ?1",
+            [request.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let refuse = |why: &'static str| LedgerError::SwitchRefused {
+        request: request.to_string(),
+        why,
+    };
+    match state {
+        Some((Some(_), _)) => Err(refuse(
+            "the first byte was already published to the client (publish boundary)",
+        )),
+        Some((None, Some(_))) => Err(refuse("the request is already closed")),
+        Some((None, None)) | None => Ok(()),
+    }
+}
+
 /// 一个请求下、序号小于 `below_index` 的、还没收尾的主要预留（切换候选时释放它们）。
 ///
 /// **还在飞的尝试不算失败**：尝试记录（S4 的 `compute_attempts`，和账本在同一个库里）里状态是 `admitted` / `sending`
@@ -559,7 +597,16 @@ pub(super) fn settle_hold_in(
         load_hold(conn, hold_id)?.ok_or_else(|| LedgerError::HoldNotFound(hold_id.to_string()))?;
     match hold.state {
         HoldState::Settled => {
-            let existing = hold.charged.unwrap_or(0);
+            // 已结算的预留一定记着实际消费额：`ledger_holds` 的状态 CHECK（`0001_ledger.sql`）要求 `state = 'settled'` 时
+            // `charged_micros IS NOT NULL`，新预留只能以 open 开始、终态不可再改（触发器），唯一把预留关成 settled 的写入路径
+            // `close_hold` 在同一条 UPDATE 里写下状态和金额。所以读到没有金额的已结算预留，只可能是库被损坏（关掉了约束检查、
+            // 直接改过库文件）。失败即关闭：**不能**当成「收了 0」——否则重放 `settle(0)` 会得到 AlreadySettled，
+            // 把一笔其实没有写下的结算（少收）当成已经做完。
+            let existing = hold.charged.ok_or_else(|| {
+                LedgerError::Corrupt(format!(
+                    "hold {hold_id} is settled but records no charged amount"
+                ))
+            })?;
             return if existing == charged {
                 Ok(blank_outcome(
                     &hold.unit,

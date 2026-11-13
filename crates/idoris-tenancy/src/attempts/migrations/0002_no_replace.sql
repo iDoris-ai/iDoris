@@ -37,3 +37,43 @@ WHEN (NEW.posting_id IS NOT NULL
       AND EXISTS (SELECT 1 FROM compute_postings WHERE posting_id = NEW.posting_id))
   OR EXISTS (SELECT 1 FROM compute_postings WHERE idempotency_key = NEW.idempotency_key)
 BEGIN SELECT RAISE(ABORT, 'posting already exists, or its idempotency key was already used'); END;
+
+-- ---------------------------------------------------------------------------------------------
+-- 带 WHERE 的（部分）唯一索引同样要配（PR #600 第二轮 S1 F5）
+-- ---------------------------------------------------------------------------------------------
+--
+-- 上面每张表配的是主键和**无条件**的唯一约束。0001 里还有两个**部分唯一索引**，它们同样是 REPLACE 的冲突点：
+--
+--   * `idx_compute_postings_one_user_price (request_id) WHERE kind = 'user_price' AND amount_micros > 0`
+--     「每个请求至多一笔正的 user_price」：换一个新的幂等键（不指定 posting_id）执行 `INSERT OR REPLACE`，
+--     posting_id、幂等键都不冲突，只撞这个索引，REPLACE 就把已经落定的那笔分录**整行删掉**再插入一笔金额随便写的新分录
+--     （例如把 18_000 改成 1），`compute_postings` 只追加的触发器管不到这一行是怎么没的；
+--   * `idx_compute_attempts_one_payer (request_id) WHERE pays_user = 1`
+--     「每个请求至多一个向用户收费的尝试」：新尝试的 INSERT 有发布边界触发器挡着，但 `UPDATE OR REPLACE ... SET pays_user = 1`
+--     撞上索引时，原来那个收费的尝试会被整行删掉。
+--
+-- 做法和上面一样：BEFORE 触发器先于冲突处理执行，所以对这两个索引的范围内（谓词和索引的 WHERE 完全一致）、
+-- 会与已有行冲突的写入一律拒绝，REPLACE 没有机会生效。负数冲正（`amount_micros <= 0`）、`pays_user = 0` 的写入
+-- 不在索引范围内，不受影响。加新的部分唯一索引时在这里补一条。
+--
+-- 对存量数据没有影响：只加触发器，不动任何行。
+
+CREATE TRIGGER IF NOT EXISTS compute_postings_one_user_price_no_conflict
+BEFORE INSERT ON compute_postings
+WHEN NEW.kind = 'user_price' AND NEW.amount_micros > 0
+ AND EXISTS (SELECT 1 FROM compute_postings
+              WHERE request_id = NEW.request_id AND kind = 'user_price' AND amount_micros > 0)
+BEGIN SELECT RAISE(ABORT, 'a request has at most one positive user_price posting'); END;
+
+CREATE TRIGGER IF NOT EXISTS compute_attempts_one_payer_insert_no_conflict
+BEFORE INSERT ON compute_attempts
+WHEN NEW.pays_user = 1
+ AND EXISTS (SELECT 1 FROM compute_attempts WHERE request_id = NEW.request_id AND pays_user = 1)
+BEGIN SELECT RAISE(ABORT, 'a request has at most one paying attempt'); END;
+
+CREATE TRIGGER IF NOT EXISTS compute_attempts_one_payer_update_no_conflict
+BEFORE UPDATE OF pays_user ON compute_attempts
+WHEN NEW.pays_user = 1
+ AND EXISTS (SELECT 1 FROM compute_attempts
+              WHERE request_id = NEW.request_id AND pays_user = 1 AND attempt_id <> NEW.attempt_id)
+BEGIN SELECT RAISE(ABORT, 'a request has at most one paying attempt'); END;

@@ -22,7 +22,7 @@ use idoris_compute_contracts::permit::{Billing, DataClass};
 use idoris_compute_contracts::pricing::Usage;
 use idoris_compute_contracts::request::{AdmittedCandidate, Request};
 use idoris_tenancy::accounts::AccountStore;
-use idoris_tenancy::accounts::ledger::{AlertKind, ComponentDecision, HoldState};
+use idoris_tenancy::accounts::ledger::{AlertKind, ComponentDecision, HoldState, LedgerError};
 use idoris_tenancy::attempts::{
     AttemptStore, AttemptStoreError, NewRequest, RequestClose, RequestOutcome,
 };
@@ -393,6 +393,83 @@ fn admitting_the_next_candidate_never_releases_an_attempt_that_is_still_in_fligh
     publish(&env, &mut request, 0, T0 + 600);
     finalize(&env, &mut request, T0 + 700).unwrap();
     assert_eq!(balance(&env, "emp", T0 + 800), 1_000 - 70);
+    assert_clean(&env.accounts);
+}
+
+#[test]
+fn admitting_the_next_candidate_never_releases_the_attempt_that_already_published_its_first_byte() {
+    // PR #600 第二轮 S1 F4（PARTIAL）：上面只保护了 `admitted` / `sending`。尝试 0 已经向客户端输出了第一个字节、
+    // 状态是 `maybe_executed`（流式，usage 还没到）时，它不是在飞，也没有失败——它是向用户收费的那一次，随后按预留价结算。
+    // 旧代码：对第 1 个候选的准入仍然选中并放掉尝试 0 的预留；契约随后因发布边界拒绝切换，尝试 0 的正金额结算又报 ChargeAfterRelease。
+    let env = env("attempts-published", 1_000);
+    let (req, mut request) = start(&env, "pub-1", "cred-e", 100);
+    apply(
+        &env,
+        &mut request,
+        0,
+        &[AttemptEvent::Dispatch, AttemptEvent::WireWriteStarted],
+        T0 + 100,
+    );
+    publish(&env, &mut request, 0, T0 + 200);
+    assert_eq!(
+        request.attempt(AttemptIndex(0)).unwrap().state().kind(),
+        idoris_compute_contracts::attempt::AttemptStateKind::MaybeExecuted
+    );
+
+    // 之后又有人给第 1 个候选做准入（执行器不会这么做，账本要自己守住）：整个准入被拒，什么都不写
+    let next = Req {
+        attempt: idoris_compute_contracts::ids::AttemptId::new(
+            req.attempt.request().clone(),
+            AttemptIndex(1),
+        ),
+        ..req.clone()
+    }
+    .at(T0 + 300);
+    let err = env.accounts.admit_attempt(&next.input()).unwrap_err();
+    assert!(matches!(&err, LedgerError::SwitchRefused { .. }), "{err:?}");
+    assert_eq!(
+        env.accounts
+            .hold(&req.attempt, "model")
+            .unwrap()
+            .unwrap()
+            .state,
+        HoldState::Open,
+        "已发布的尝试 0：它的预留不能被放掉"
+    );
+    assert!(
+        env.accounts.hold(&next.attempt, "model").unwrap().is_none(),
+        "被拒的准入没有占任何新的预留"
+    );
+    assert_eq!(balance(&env, "emp", T0 + 300), 1_000 - 210);
+
+    // 尝试 0 照常收尾：按预留价向用户收费，没有 ChargeAfterRelease
+    finalize(&env, &mut request, T0 + 400).unwrap();
+    let hold = env.accounts.hold(&req.attempt, "model").unwrap().unwrap();
+    assert_eq!(
+        (hold.state, hold.charged),
+        (HoldState::Settled, Some(thb(210)))
+    );
+    assert_eq!(balance(&env, "emp", T0 + 500), 1_000 - 210);
+    assert_clean(&env.accounts);
+}
+
+#[test]
+fn a_closed_request_cannot_switch_candidates_either() {
+    // 请求已经收尾：没有尝试再能被追加（尝试记录的触发器同样拒绝）。账本不为它占新的预留。
+    let env = env("attempts-closed", 1_000);
+    let (req, mut request) = start(&env, "closed-1", "cred-e", 100);
+    finalize(&env, &mut request, T0 + 100).unwrap();
+    let next = Req {
+        attempt: idoris_compute_contracts::ids::AttemptId::new(
+            req.attempt.request().clone(),
+            AttemptIndex(1),
+        ),
+        ..req.clone()
+    }
+    .at(T0 + 200);
+    let err = env.accounts.admit_attempt(&next.input()).unwrap_err();
+    assert!(matches!(&err, LedgerError::SwitchRefused { .. }), "{err:?}");
+    assert!(env.accounts.hold(&next.attempt, "model").unwrap().is_none());
     assert_clean(&env.accounts);
 }
 

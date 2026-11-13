@@ -1849,7 +1849,9 @@ fn principal_revocation_cannot_reach_into_other_organizations_or_squatted_ids() 
         .run(&env, &edu.who(), T0 + 6),
         Err(ControlReason::PrincipalRevoked)
     );
-    // 一个主体在两个组织都有成员关系：一个组织不能把它整个撤销，只能撤销自己这边的成员关系
+    // 一个主体在两个组织都有成员关系：一个组织不能把它整个撤销，只能撤销自己这边的成员关系。
+    // 这个足迹要由对两边都有授权的一方（本机运维）建出来：school-b 自己给 eduai 在用的老主体 `kid2` 挂成员关系会被拒绝
+    // （PR #600 第二轮 S2 F3，见 `another_organization_cannot_attach_itself_to_a_legacy_principal_in_use_elsewhere`）
     env.account("acct-shared", AccountKind::Member, Some("school-b"));
     assert_eq!(
         Action::CreateMembership {
@@ -1858,7 +1860,7 @@ fn principal_revocation_cannot_reach_into_other_organizations_or_squatted_ids() 
             org: "school-b",
             account: "acct-shared"
         }
-        .run(&env, &other.who(), T0 + 7),
+        .run(&env, &Env::operator(), T0 + 7),
         Ok(WriteResult::Created)
     );
     assert_eq!(
@@ -1974,6 +1976,127 @@ fn another_organization_cannot_attach_itself_to_a_principal_it_did_not_register(
             .unwrap()
             .result,
         WriteResult::Created
+    );
+}
+
+#[test]
+fn another_organization_cannot_attach_itself_to_a_legacy_principal_in_use_elsewhere() {
+    // PR #600 第二轮 S2 F3（PARTIAL）：没有登记记录的老主体（存储层直接建的，比如夹具里 `kid2` 已经是 eduai 的成员）。
+    // 上一轮对它整个跳过了「关联已有主体需要授权」：旧主体 `kid2` 已有 eduai 的成员关系时，school-b 的管理员仍能给它加一个
+    // school-b 的成员关系，eduai 随后因为对 school-b 没有撤销权限，再也撤销不了它。
+    // 没有登记记录就用已经在用它的组织当归属方：要给它加别的组织的成员关系，要么新成员关系就在归属方的子树里，
+    // 要么调用者对归属方（已有成员关系的账户）有 `revoke_principal` 权限。
+    let env = Env::new();
+    env.tree();
+    let edu = env.issue_as_operator(Issue::service("eduai", all_ops("eduai", 1)));
+    let other = env.issue_as_operator(Issue::service("school-b", all_ops("school-b", 1)));
+    env.account("acct-b-new", AccountKind::Member, Some("school-b"));
+    let attach = Action::CreateMembership {
+        id: "m-evil",
+        principal: "kid2",
+        org: "school-b",
+        account: "acct-b-new",
+    };
+    assert_eq!(
+        attach.run(&env, &other.who(), T0 + 1),
+        Err(ControlReason::OutOfScope),
+        "school-b 不能给 eduai 在用的老主体挂自己的成员关系"
+    );
+    assert_eq!(env.last_audit().outcome, "denied");
+    assert!(env.store.get_membership(&mid("m-evil")).unwrap().is_none());
+    // Codex 的原场景是给它加一个 school-b 的 admin 关系（没有付款账户，授权看组织）：同样被拒
+    let rid = env.rid();
+    let admin_attach = env.store.control_create_membership(
+        &other.who(),
+        &env.meta(T0 + 1, &rid),
+        &CreateMembership {
+            membership: admin_membership("m-evil-admin", "kid2", "school-b"),
+        },
+    );
+    assert_eq!(failure_reason(admin_attach), ControlReason::OutOfScope);
+    assert!(
+        env.store
+            .get_membership(&mid("m-evil-admin"))
+            .unwrap()
+            .is_none()
+    );
+    // 归属方自己（它的子树里）当然可以再给它挂成员关系
+    env.account("acct-edu-new", AccountKind::Member, Some("eduai"));
+    assert_eq!(
+        Action::CreateMembership {
+            id: "m-edu-second",
+            principal: "kid2",
+            org: "eduai",
+            account: "acct-edu-new"
+        }
+        .run(&env, &edu.who(), T0 + 2),
+        Ok(WriteResult::Created)
+    );
+    // 对归属方有授权的一方（本机运维）可以把它关联到别的组织
+    assert_eq!(
+        attach.run(&env, &Env::operator(), T0 + 3),
+        Ok(WriteResult::Created)
+    );
+    // 没有任何组织在用、也没有登记记录的老主体没有归属方可保护：照旧谁都可以第一个挂上去
+    env.store.ensure_principal(&pid("loose"), ts(T0)).unwrap();
+    env.account("acct-b-loose", AccountKind::Member, Some("school-b"));
+    assert_eq!(
+        Action::CreateMembership {
+            id: "m-loose",
+            principal: "loose",
+            org: "school-b",
+            account: "acct-b-loose"
+        }
+        .run(&env, &other.who(), T0 + 4),
+        Ok(WriteResult::Created)
+    );
+    // 新的归属方一旦挂上去，eduai 也不能再把别的组织挂到这个主体上去
+    env.account("acct-edu-loose", AccountKind::Member, Some("eduai"));
+    assert_eq!(
+        Action::CreateMembership {
+            id: "m-edu-loose",
+            principal: "loose",
+            org: "eduai",
+            account: "acct-edu-loose"
+        }
+        .run(&env, &edu.who(), T0 + 5),
+        Err(ControlReason::OutOfScope)
+    );
+}
+
+#[test]
+fn a_denied_attach_to_a_legacy_principal_leaves_its_owner_able_to_revoke_it() {
+    // 上面那个测试的另一半：被拒的关联没有留下任何足迹，所以归属方照样能整体撤销主体
+    let env = Env::new();
+    env.tree();
+    let edu = env.issue_as_operator(Issue::service("eduai", all_ops("eduai", 1)));
+    let other = env.issue_as_operator(Issue::service("school-b", all_ops("school-b", 1)));
+    env.account("acct-b-new", AccountKind::Member, Some("school-b"));
+    assert_eq!(
+        Action::CreateMembership {
+            id: "m-evil",
+            principal: "kid2",
+            org: "school-b",
+            account: "acct-b-new"
+        }
+        .run(&env, &other.who(), T0 + 1),
+        Err(ControlReason::OutOfScope)
+    );
+    assert_eq!(
+        Action::RevokePrincipal {
+            principal: "kid2",
+            org: "eduai"
+        }
+        .run(&env, &edu.who(), T0 + 2),
+        Ok(WriteResult::Updated)
+    );
+    assert_eq!(
+        env.store
+            .get_principal(&pid("kid2"))
+            .unwrap()
+            .unwrap()
+            .status,
+        idoris_compute_contracts::account::PrincipalStatus::Revoked
     );
 }
 

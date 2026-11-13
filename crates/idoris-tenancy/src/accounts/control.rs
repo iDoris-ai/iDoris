@@ -799,6 +799,48 @@ pub(super) fn registrant_of(
         .transpose()
 }
 
+/// 主体的一个归属方：谁有资格对它的足迹负责。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct PrincipalOwner {
+    /// 归属方所在的组织：新的成员关系就在它的子树里（它是新成员关系所属组织的祖先或自己）时，它自己的管理员仍然管得到。
+    pub(super) org: AccountId,
+    /// 判定「调用者管不管得到归属方」用的资源范围：登记它的组织，或者已有成员关系的付款账户（管理员关系用组织）。
+    pub(super) target: AccountId,
+}
+
+/// 一个主体已有的归属方。
+///
+/// * **有登记记录**的主体：登记它的组织（`principal_registrations`，只追加，之后不会变）；
+/// * **没有登记记录**的老主体（存储层直接建的，控制面出现之前的数据）：没有别的可信线索，所以**已经在用它的组织就是它的
+///   归属方**——它已有的每个成员关系（不管现在有没有被撤销：和 `control_revoke_principal` 检查的范围一致）所在的组织，
+///   授权看那个成员关系的付款账户。一个老主体还没有任何成员关系，就没有归属方（第一个挂上去的组织成为它的归属方）。
+///
+/// 用它来回答「把这个主体关联到别的组织需要谁的授权」：谁能让主体的足迹扩大，谁就该能把它整体撤销，
+/// 否则任何组织猜到一个主体 id 就能挂一个成员关系上去，让原来的归属方再也撤销不了它
+/// （Codex r1 #1 / PR-Daemon S2 F3 / PR #600 第二轮 S2 F3：老主体曾经被整个跳过）。
+pub(super) fn principal_owners(
+    conn: &Connection,
+    principal: &PrincipalId,
+) -> Result<Vec<PrincipalOwner>, Failure> {
+    if let Some(registrant) = registrant_of(conn, principal)? {
+        return Ok(vec![PrincipalOwner {
+            org: registrant.clone(),
+            target: registrant,
+        }]);
+    }
+    let mut owners: Vec<PrincipalOwner> = Vec::new();
+    for membership in load_memberships_of(conn, principal)? {
+        let owner = PrincipalOwner {
+            org: membership.org.clone(),
+            target: membership_target(&membership).clone(),
+        };
+        if !owners.contains(&owner) {
+            owners.push(owner);
+        }
+    }
+    Ok(owners)
+}
+
 /// 登记主体。`org` 是以谁的名义登记（授权的资源范围）；同时记下最早登记它的组织。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreatePrincipal {
@@ -1171,23 +1213,26 @@ impl AccountStore {
                 }
                 Some(_) => {}
             }
-            // 把已经登记的主体关联到别的组织需要明确的授权：登记它的组织要么就是这个成员关系所属组织的祖先（或它自己），
-            // 要么调用者对登记组织有 `revoke_principal` 权限（谁能让主体的足迹扩大，谁就该能把它整体撤销）。
-            // 否则任何组织猜到一个主体 id 就能挂一个成员关系上去，既能越过登记组织的撤销检查，又会让登记组织
-            // 再也撤销不了它（Codex r1 #1 / PR-Daemon S2 F3）。没有登记记录的老主体不受这条限制。
-            if let Some(registrant) = registrant_of(conn, &membership.principal)? {
-                let inside = load_ancestors(conn, &membership.org)?
-                    .iter()
-                    .any(|account| account.id == registrant);
-                if !inside {
-                    authorize_op(
-                        conn,
-                        caller,
-                        meta.now,
-                        ControlOp::RevokePrincipal,
-                        &registrant,
-                        None,
-                    )?;
+            // 把已有归属方的主体关联到别的组织需要明确的授权：每个归属方要么就是这个成员关系所属组织的祖先（或它自己），
+            // 要么调用者对它有 `revoke_principal` 权限（谁能让主体的足迹扩大，谁就该能把它整体撤销）。
+            // 归属方 = 登记它的组织；没有登记记录的老主体（存储层直接建的）= 已经在用它的组织（见 `principal_owners`）。
+            // 否则任何组织猜到一个主体 id 就能挂一个成员关系上去，既能越过归属方的撤销检查，又会让归属方
+            // 再也撤销不了它（Codex r1 #1 / PR-Daemon S2 F3 / PR #600 第二轮 S2 F3：老主体曾经被整个跳过）。
+            let owners = principal_owners(conn, &membership.principal)?;
+            if !owners.is_empty() {
+                let ancestors = load_ancestors(conn, &membership.org)?;
+                for owner in &owners {
+                    let inside = ancestors.iter().any(|account| account.id == owner.org);
+                    if !inside {
+                        authorize_op(
+                            conn,
+                            caller,
+                            meta.now,
+                            ControlOp::RevokePrincipal,
+                            &owner.target,
+                            None,
+                        )?;
+                    }
                 }
             }
             create_membership_in(conn, membership, meta.now)
