@@ -406,8 +406,14 @@ impl CloudExecutor {
             CloudOutcome::Complete(mut pending) => {
                 // 上游调用可能花了很久：输出检查用「现在」判断检查端点的核验有没有过期，不用请求开始时的时间
                 safety_call.now = self.clock.now();
+                // 响应里的 `model` 是已选路由的模型（作答的那次尝试的端点），不取上游写的（r3 Medium#1）
+                let response_model = pending
+                    .run
+                    .attempt(pending.idx)
+                    .map(|attempt| attempt.endpoint().model.to_string())
+                    .unwrap_or_default();
                 match gate
-                    .check_output(&safety_call, &input, pending.body())
+                    .check_output(&safety_call, &input, pending.body(), &response_model)
                     .await
                 {
                     Ok(body) => {

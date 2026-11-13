@@ -85,11 +85,14 @@ pub use cost::{
     ExtraCostEntry, ExtraCostEstimate, ExtraCostGuard, ExtraCostMeter, ExtraCostOutcome,
     ExtraCostRefusal, ExtraCostRequest, ExtraCostTicket, SimpleExtraCost, SpendItem,
 };
-pub use extract::{CheckedInput, CheckedOutput, ExtractError, Origin, Segment, ToolCallText};
+pub use extract::{
+    CheckedInput, CheckedOutput, ExtractError, Origin, ResponseIdentity, Segment, ToolCallText,
+    TrustedOperatorText,
+};
 pub use ledger_cost::LedgerExtraCost;
 pub use rules::RuleChecker;
 
-use extract::{extract_input, rebuild_response};
+use extract::{extract_input_with, rebuild_response};
 
 /// 手写的盒装 future（不引入 `async-trait`）。
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -187,6 +190,21 @@ pub trait SafetyChecker: Send + Sync + std::fmt::Debug {
     fn estimate(&self, _stage: SafetyStage, _text_bytes: usize) -> Option<ExtraCostEstimate> {
         None
     }
+
+    /// **免费的预检**（输入）：gate 在**占检查费用的额度之前**调用它。返回 `Some` 就是已经能拒绝了，gate 直接拒绝，
+    /// 不占额度、不花钱。默认没有预检（返回 `None`）；规则检查器实现它。
+    ///
+    /// 为什么要有它：配了花钱的检查器（LLM）时，如果先占额度再跑免费的规则，额度不足的孩子写了自伤内容得到的是 402（没钱），
+    /// 不是 422 `self_harm`，eduai 就收不到升级信号（PR-Daemon S5 F4）。
+    /// 实现必须只做免费、确定、不出网的检查；返回 `None` 不代表放行，放行与否由后面的完整检查决定。
+    fn precheck_input(&self, _input: &CheckedInput) -> Option<Denial> {
+        None
+    }
+
+    /// 免费的预检（输出），见 [`SafetyChecker::precheck_input`]。
+    fn precheck_output(&self, _input: &CheckedInput, _output: &CheckedOutput) -> Option<Denial> {
+        None
+    }
 }
 
 /// 多个检查器串起来：按顺序检查，**任一拒绝即拒绝**，前一个拒绝后面的不再调用（规则先行，规则放行后再过 LLM）。
@@ -271,6 +289,16 @@ impl SafetyChecker for SafetyPipeline {
         self.checkers()
             .find_map(|checker| checker.estimate(stage, text_bytes))
     }
+
+    fn precheck_input(&self, input: &CheckedInput) -> Option<Denial> {
+        self.checkers()
+            .find_map(|checker| checker.precheck_input(input))
+    }
+
+    fn precheck_output(&self, input: &CheckedInput, output: &CheckedOutput) -> Option<Denial> {
+        self.checkers()
+            .find_map(|checker| checker.precheck_output(input, output))
+    }
 }
 
 /// 检查的时间与大小上限。
@@ -344,6 +372,8 @@ pub struct SafetyGate {
     checker: Arc<dyn SafetyChecker>,
     limits: SafetyLimits,
     cost: Arc<dyn ExtraCostMeter>,
+    /// 服务端配置里登记的受信运营方提示。默认没有：客户端写的内容一律按孩子写的话检查。
+    trusted: TrustedOperatorText,
 }
 
 impl std::fmt::Debug for SafetyGate {
@@ -351,6 +381,7 @@ impl std::fmt::Debug for SafetyGate {
         f.debug_struct("SafetyGate")
             .field("checker", &self.checker)
             .field("limits", &self.limits)
+            .field("trusted_operator_prompts", &self.trusted.len())
             .finish_non_exhaustive()
     }
 }
@@ -373,7 +404,15 @@ impl SafetyGate {
             checker,
             limits,
             cost,
+            trusted: TrustedOperatorText::none(),
         }
+    }
+
+    /// 装上服务端登记的受信运营方提示（`safety.trusted_operator_prompts`）：`system` / `developer` 消息的内容以它开头的那一段
+    /// 按运营方的待遇检查（只查越狱类规则），其余一律按孩子写的话。**客户端填的角色、凭证的种类、请求头都不能代替这份配置。**
+    pub fn with_trusted_operator_text(mut self, trusted: TrustedOperatorText) -> Self {
+        self.trusted = trusted;
+        self
     }
 
     /// 只有规则检查器的 gate（没有 LLM，没有成本）。
@@ -402,7 +441,7 @@ impl SafetyGate {
         body: &Map<String, Value>,
     ) -> Result<CheckedInput, GateDenial> {
         let stage = SafetyStage::Input;
-        let input = match extract_input(body, self.limits.max_input_bytes) {
+        let input = match extract_input_with(body, self.limits.max_input_bytes, &self.trusted) {
             Ok(input) => input,
             Err(ExtractError::TooLarge) => {
                 return Err(self.deny(
@@ -438,18 +477,23 @@ impl SafetyGate {
     }
 
     /// 完整输出检查：只取会被检查的字段重建响应体，检查通过才返回**可以发给客户端的字节**。
+    ///
+    /// `response_model` 是已选路由的模型（作答的那次尝试的端点）：响应的 `model` 是它，响应的 `id` 是请求号，
+    /// 工具调用的 `id` 从请求号派生——**都不取上游写的**（上游能把孩子写的电话号码回显成一个合法的「短标识」）。
     pub async fn check_output(
         &self,
         call: &SafetyCall<'_>,
         input: &CheckedInput,
         upstream_body: &[u8],
+        response_model: &str,
     ) -> Result<Vec<u8>, GateDenial> {
         let stage = SafetyStage::Output;
-        let rebuilt = match rebuild_response(
-            upstream_body,
-            call.request_id.as_str(),
-            self.limits.max_output_bytes,
-        ) {
+        let identity = ResponseIdentity {
+            id: call.request_id.as_str(),
+            model: response_model,
+        };
+        let rebuilt = match rebuild_response(upstream_body, &identity, self.limits.max_output_bytes)
+        {
             Ok(rebuilt) => rebuilt,
             Err(ExtractError::TooLarge) => {
                 return Err(self.deny(
@@ -489,8 +533,26 @@ impl SafetyGate {
                 .total_bytes()
                 .saturating_add(input.last_user_text().map_or(0, str::len)),
         };
-        // ---- 准入：这次检查要花钱，先占额度。放不下就不检查、不调用上游 ----
         let estimate = self.checker.estimate(stage, text_bytes);
+        // ---- 免费的预检在前：规则命中就直接拒绝，不占检查费用的额度 ----
+        // 只有这次检查要花钱时才值得单独做一遍（免费的检查器在后面的完整检查里本来就先跑）。
+        // 额度不足的孩子写了自伤内容，得到的应该是 422 `self_harm`（eduai 要靠它升级），不是 402（PR-Daemon S5 F4）。
+        if estimate.is_some() {
+            let precheck = match output {
+                None => self.checker.precheck_input(input),
+                Some(output) => self.checker.precheck_output(input, output),
+            };
+            match precheck {
+                Some(Denial::Blocked(category)) => {
+                    return Err(self.deny(call, GateDenial::Blocked { stage, category }));
+                }
+                Some(Denial::Unavailable(cause)) => {
+                    return Err(self.deny(call, GateDenial::Unavailable { stage, cause }));
+                }
+                None => {}
+            }
+        }
+        // ---- 准入：这次检查要花钱，先占额度。放不下就不检查、不调用上游 ----
         let guard = match &estimate {
             None => None,
             Some(estimate) => match self.cost.reserve(&ExtraCostRequest {
@@ -749,7 +811,10 @@ mod tests {
         .unwrap();
         let rebuilt = run(&allow, |g, c| {
             let input = input.clone();
-            Box::pin(async move { g.check_output(c, &input, &upstream_body()).await })
+            Box::pin(async move {
+                g.check_output(c, &input, &upstream_body(), "route-model")
+                    .await
+            })
         })
         .await
         .unwrap();
@@ -774,7 +839,10 @@ mod tests {
         assert_eq!(
             run(&blocked, |g, c| {
                 let input = input.clone();
-                Box::pin(async move { g.check_output(c, &input, &upstream_body()).await })
+                Box::pin(async move {
+                    g.check_output(c, &input, &upstream_body(), "route-model")
+                        .await
+                })
             })
             .await
             .unwrap_err(),
@@ -831,7 +899,7 @@ mod tests {
         // 输出阶段同样
         let denial = run(&gate, |g, c| {
             Box::pin(async move {
-                g.check_output(c, &CheckedInput::default(), &upstream_body())
+                g.check_output(c, &CheckedInput::default(), &upstream_body(), "route-model")
                     .await
             })
         })
@@ -920,7 +988,10 @@ mod tests {
         let gate = gate(Scripted::allow());
         for bad in [&b"not json"[..], b"[]", br#"{"choices":[]}"#] {
             let denial = run(&gate, |g, c| {
-                Box::pin(async move { g.check_output(c, &CheckedInput::default(), bad).await })
+                Box::pin(async move {
+                    g.check_output(c, &CheckedInput::default(), bad, "route-model")
+                        .await
+                })
             })
             .await
             .unwrap_err();
@@ -1203,7 +1274,7 @@ mod tests {
         let denial = run(&broke, |g, c| {
             let harmful_answer = harmful_answer.clone();
             Box::pin(async move {
-                g.check_output(c, &CheckedInput::default(), &harmful_answer)
+                g.check_output(c, &CheckedInput::default(), &harmful_answer, "route-model")
                     .await
             })
         })

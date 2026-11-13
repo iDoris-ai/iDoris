@@ -13,7 +13,23 @@
 //!     max_output_tokens: 64        # 可选。检查模型的输出上限
 //!     max_chunk_bytes: 8192        # 可选。每次调用最多送多少字节的文本
 //!     max_chunks: 4                # 可选。一次检查最多分几块；更长的拒绝（too_large）
+//!   trusted_operator_prompts:      # 可选，默认没有。服务端登记的、受信的运营方提示（见下）
+//!     - "You are a learning assistant for children. If a child asks for ..., refuse politely."
 //! ```
+//!
+//! # 受信的运营方提示（`trusted_operator_prompts`）
+//!
+//! 运营方的系统提示会复述要拒绝的话题（「如果孩子要求自伤……就拒绝」），规则检查器对运营方的话只查越狱类规则。
+//! 但**客户端填的 `role: system` 不证明这段话来自运营方**（入口只认证了凭证，成员凭证也能发 `system`；
+//! 请求体里的任何字段都是客户端写的）。所以默认**客户端写的内容一律按孩子写的话检查**，运营方的待遇只给这里登记的文本：
+//!
+//! - `system` / `developer` 消息的内容**以**某条登记的提示**开头**（逐字）时，这一段开头按运营方的话检查，
+//!   后面跟着的（比如动态拼上去的年级）仍按孩子写的话检查；不以登记的提示开头的，整条都按孩子写的话；
+//! - 每条至少 32 个字符（太短的片段任何消息都能以它开头）、至多 16 KiB，最多 64 条，不能重复；
+//! - 登记的提示自己要先过越狱类规则：一条会关掉安全过滤的「运营方提示」不会被当成运营方的，配置加载失败。
+//!
+//! 没有登记任何提示时，评测集那种复述了拒绝话题的系统提示会被规则按孩子写的话检查，可能被拒——运营方要把自己的系统提示
+//! 的固定开头登记在这里。
 //!
 //! # 规则
 //!
@@ -38,10 +54,12 @@ use idoris_compute_contracts::permit::{
 use idoris_upstream::cloud::{CloudEndpointClient, CloudEndpointSettings};
 use serde::Deserialize;
 
+use super::extract::{CheckedInput, Origin, Segment, TrustedOperatorText};
 use super::llm::{
     DEFAULT_MAX_CHUNK_BYTES, DEFAULT_MAX_CHUNKS, DEFAULT_MAX_OUTPUT_TOKENS, LlmJudge,
     LlmJudgeSettings,
 };
+use super::text::Sensitive;
 use super::{ExtraCostMeter, RuleChecker, SafetyChecker, SafetyGate, SafetyLimits, SafetyPipeline};
 use crate::cloud::config::{
     EndpointConfig, EndpointRef, build_credentials, key_of, rate_card_cost,
@@ -102,6 +120,9 @@ pub struct SafetyConfig {
     pub max_output_bytes: usize,
     #[serde(default)]
     pub llm_judge: Option<JudgeConfig>,
+    /// 服务端登记的受信运营方提示（逐字、只认消息内容的开头），见模块文档。默认没有。
+    #[serde(default)]
+    pub trusted_operator_prompts: Vec<String>,
 }
 
 /// 加载好的安全配置：检查器、上限，以及要留在日志里的警告。
@@ -109,6 +130,8 @@ pub struct SafetySetup {
     pub mode: SafetyMode,
     pub limits: SafetyLimits,
     pub judge: Option<LlmJudge>,
+    /// 服务端登记的受信运营方提示。
+    pub trusted: TrustedOperatorText,
     /// 启动时要打印的警告（比如只有规则检查器）。
     pub warnings: Vec<String>,
 }
@@ -119,6 +142,7 @@ impl std::fmt::Debug for SafetySetup {
             .field("mode", &self.mode)
             .field("limits", &self.limits)
             .field("judge", &self.judge)
+            .field("trusted_operator_prompts", &self.trusted.len())
             .finish_non_exhaustive()
     }
 }
@@ -131,8 +155,31 @@ impl SafetySetup {
             Some(judge) => Arc::new(SafetyPipeline::new(rules).then(Arc::new(judge))),
             None => rules,
         };
-        SafetyGate::new(checker, self.limits, cost)
+        SafetyGate::new(checker, self.limits, cost).with_trusted_operator_text(self.trusted)
     }
+}
+
+/// 校验登记的运营方提示：长度、数量、重复，并且每一条自己要先过越狱类规则（运营方的待遇是「只查越狱类」，
+/// 一条会关掉安全过滤的提示不能因为登记在这里就被信任）。
+fn build_trusted(prompts: &[String]) -> Result<TrustedOperatorText, String> {
+    let trusted = TrustedOperatorText::new(prompts.iter().cloned()).map_err(bad)?;
+    let rules = RuleChecker::new();
+    for (index, prompt) in trusted.prompts().enumerate() {
+        let input = CheckedInput {
+            segments: vec![Segment {
+                origin: Origin::Operator,
+                text: Sensitive::new(prompt),
+            }],
+            ..CheckedInput::default()
+        };
+        if rules.scan_input(&input).is_some() {
+            return Err(bad(format!(
+                "第 {} 条受信的运营方提示（按长度从长到短排序）没有通过越狱类规则：它会关掉或绕过安全过滤，不能当作运营方的话登记",
+                index + 1
+            )));
+        }
+    }
+    Ok(trusted)
 }
 
 /// 构造 LLM 检查器需要的外部输入。
@@ -194,10 +241,12 @@ pub(crate) fn build(
         }
         (SafetyMode::RulesAndLlm, Some(judge)) => Some(build_judge(judge, inputs)?),
     };
+    let trusted = build_trusted(&config.trusted_operator_prompts)?;
     Ok(SafetySetup {
         mode: config.mode,
         limits,
         judge,
+        trusted,
         warnings,
     })
 }

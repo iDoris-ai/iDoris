@@ -1,21 +1,33 @@
 //! 从请求和上游响应里取出**要检查的文本**，并为 edu 重建发给客户端的响应体。
 //!
-//! # 输入：检查的是「真正会送到模型的所有文本」
+//! # 输入：检查的就是「真正会送到模型的所有文本」
 //!
 //! 上游请求体由 `idoris_upstream::cloud::wire::build_chat_body` 用**白名单**构造（[`FORWARDED_FIELDS`]）。
-//! 会被模型读到的文本只可能在 `messages`、`tools`、`tool_choice`、`response_format`、`stop` 里，其余白名单字段
-//! 是数字或布尔。这里对这五个字段做**递归取串**（任何层级的字符串值都取，不只是 `content`）：
-//! 孩子的话可能躲在 `name`、助手历史消息的 `tool_calls[].function.arguments`、`content` 数组的分段里。
-//! 测试 `every_forwarded_field_is_classified` 保证：将来有人往白名单里加字段，不分类就编译不过测试，不会悄悄漏检。
+//! 这里**用同一个函数构造一份同样的请求**，再把里面客户端写的每一个字符串——**值和键名**，任何层级——都取出来
+//! （[`forwarded_view`]）：检查的和转发的是同一份东西，不靠「我们认为哪些字段会被转发」的另一张表。
+//! 将来有人给 `build_chat_body` 加字段、改形状，这里自动跟着变。性质测试
+//! `every_string_in_the_forwarded_request_is_in_the_checked_text` 用随机的请求体证明：转发请求里的每一个字符串都在检查内容里。
+//!
+//! 取文本时还做三件事（r3 的 High#2 / High#4）：
+//!
+//! - **键名也是文本**：工具 schema 的属性名、消息对象里的任意额外键，模型都读得到；
+//! - **看起来是 JSON 的字符串解码之后再取一遍**（`{"text":"kill yourself"}` 里的转义）；
+//! - **`arguments` 必须是合法的 JSON**，解析不了就是 [`ExtractError::Malformed`]（失败即关闭），历史消息里的工具调用参数同样。
+//!
+//! # 来源：客户端自己挣不到豁免
 //!
 //! 每条消息按**来源**分类（[`Origin`]），规则检查器按来源用不同的规则集：
 //!
-//! | 来源 | 角色 | 为什么分开 |
+//! | 来源 | 谁 | 为什么分开 |
 //! |---|---|---|
-//! | `User` | `user`、未知角色 | 孩子写的话，最严 |
+//! | `User` | `user`、**`system`、`developer`**、未知角色、`tools` / `tool_choice` / `response_format` / `stop` 和其它一切客户端写的文本 | 孩子写的话，最严。**客户端填的角色不证明这段话来自运营方**（入口只认证了凭证，成员凭证也能发 `system`） |
 //! | `Tool` | `tool`、`function` | 工具返回的引用内容（可能是网页摘录），不可信，最严 |
-//! | `Operator` | `system`、`developer`，以及 `tools` / `tool_choice` / `response_format` / `stop` | 运营方写的指令，会复述要拒绝的话题（「如果孩子要求自伤……就拒绝」），只查越狱类规则 |
 //! | `Assistant` | `assistant` | 对话历史里模型说过的话，按**输出**规则查（拒绝语里会提到有害词，不能把拒绝语当成有害请求） |
+//! | `Operator` | **只有服务端配置里登记的运营方提示**（[`TrustedOperatorText`]） | 运营方的系统提示会复述要拒绝的话题（「如果孩子要求自伤……就拒绝」），只查越狱类规则 |
+//!
+//! 运营方内容只能来自服务端受信配置：`system` / `developer` 消息的内容**以**某条登记的提示**开头**时，这一段开头算运营方的，
+//! 后面跟着的（比如 `ช่วงชั้นของผู้เรียน: 初中`）仍然按孩子写的话检查；不以登记的提示开头的，整条都按孩子写的话。
+//! 没有登记任何提示（默认）时，客户端写的内容没有任何一个字节能得到豁免。
 //!
 //! 非文本内容（图片、音频、文件……）规则检查器无法检查：置 [`CheckedInput::has_uncheckable_content`]，
 //! 由 gate 按失败即关闭拒绝。语音转写是 P1，不在这里。
@@ -25,9 +37,15 @@
 //! 非 edu 的响应体原样交给客户端（S4 的行为，一字不变）。edu 的**不是**：上游的响应里有我们没有检查的文本字段
 //! （`reasoning_content`、`annotations`、`provider`……），原样转发就等于把没检查的字节交给孩子。
 //! [`rebuild_response`] 只取 `choices[0].message` 的 `content`、`refusal`、`tool_calls[].function.{name,arguments}`
-//! ——这些全部会被检查——再加上只含数字的 `usage` 和经过格式校验的 `id`、`model`、`finish_reason`，
-//! 重新序列化。**客户端收到的每一个字符串，要么是被检查过的文本，要么是被校验为短标识的字段。**
+//! ——这些全部会被检查——再加上只含数字的 `usage` 和词表里的 `finish_reason`，重新序列化。
+//! **响应 `id`、`model`、工具调用 `id` 都不取上游的**（r3 Medium#1）：上游能把孩子写的电话号码回显成一个合法的「短标识」，
+//! 它们不在被检查的文本里，会绕过 PII 输出检查。`id` 由服务端生成（请求号），`model` 是已选路由的模型，工具调用 `id` 从请求号派生。
+//! **客户端收到的每一个字符串，要么是被检查过的文本，要么是服务端自己写的。**
 
+use std::borrow::Cow;
+use std::sync::Arc;
+
+use idoris_upstream::cloud::wire::{ChatCall, FORWARDED_FIELDS, build_chat_body};
 use serde_json::{Map, Value, json};
 
 use super::text::Sensitive;
@@ -54,6 +72,9 @@ pub struct CheckedInput {
     pub segments: Vec<Segment>,
     /// 请求里有无法检查的非文本内容（图片、音频、文件……）。
     pub has_uncheckable_content: bool,
+    /// 最后一条孩子说的话（`user` 或未知角色的消息）在 `segments` 里的位置。`system` 消息、`tools`、`stop` 现在也是
+    /// `Origin::User`（客户端写的内容一律按孩子写的话检查），所以「最后一个 `Origin::User` 的片段」不再等于孩子最后一句话。
+    pub last_user_segment: Option<usize>,
 }
 
 impl CheckedInput {
@@ -71,10 +92,8 @@ impl CheckedInput {
 
     /// 最后一条用户消息（给 LLM 检查器当输出检查的上下文）。
     pub fn last_user_text(&self) -> Option<&str> {
-        self.segments
-            .iter()
-            .rev()
-            .find(|s| s.origin == Origin::User)
+        self.last_user_segment
+            .and_then(|index| self.segments.get(index))
             .map(|s| s.text.expose())
     }
 }
@@ -83,7 +102,27 @@ impl CheckedInput {
 #[derive(Debug, Clone)]
 pub struct ToolCallText {
     pub name: Sensitive,
+    /// 原样转发给客户端的 `arguments`（JSON 文本）。检查的是它解码之后的键和值，见 [`ToolCallText::decoded_arguments`]。
     pub arguments: Sensitive,
+}
+
+impl ToolCallText {
+    /// `arguments` 解析成 JSON 之后的每一个键和字符串值（任何层级；字符串值本身又是 JSON 的，再解一层）。
+    /// 规则只看得到 JSON 文本的字面（`k`），客户端解析之后看到的是解码之后的字。解析不了（或者套得太深）返回空：
+    /// 收到上游响应时已经按失败即关闭拒绝过这种参数，见 [`rebuild_response`]。
+    pub fn decoded_arguments(&self) -> Vec<String> {
+        decoded_pieces(self.arguments.expose()).unwrap_or_default()
+    }
+
+    /// 给 LLM 检查器看的参数文本：解码之后的键和值各占一行；解码不出东西就用原文。
+    pub fn judge_text(&self) -> String {
+        let pieces = self.decoded_arguments();
+        if pieces.is_empty() {
+            self.arguments.expose().to_string()
+        } else {
+            pieces.join("\n")
+        }
+    }
 }
 
 /// 模型回答里所有要检查的文本。
@@ -95,7 +134,7 @@ pub struct CheckedOutput {
 }
 
 impl CheckedOutput {
-    /// 所有文本（回答、拒绝语、工具名和参数）。
+    /// 回答、拒绝语、工具名和参数的原文。
     pub fn texts(&self) -> Vec<&str> {
         let mut texts = Vec::new();
         if let Some(content) = &self.content {
@@ -107,6 +146,23 @@ impl CheckedOutput {
         for call in &self.tool_calls {
             texts.push(call.name.expose());
             texts.push(call.arguments.expose());
+        }
+        texts
+    }
+
+    /// 全部要检查的文本：[`texts`](Self::texts) 加上工具参数解码之后的每个键和值。规则检查器看这一份。
+    pub fn all_texts(&self) -> Vec<Cow<'_, str>> {
+        let mut texts: Vec<Cow<'_, str>> = Vec::new();
+        if let Some(content) = &self.content {
+            texts.push(Cow::Borrowed(content.expose()));
+        }
+        if let Some(refusal) = &self.refusal {
+            texts.push(Cow::Borrowed(refusal.expose()));
+        }
+        for call in &self.tool_calls {
+            texts.push(Cow::Borrowed(call.name.expose()));
+            texts.push(Cow::Borrowed(call.arguments.expose()));
+            texts.extend(call.decoded_arguments().into_iter().map(Cow::Owned));
         }
         texts
     }
@@ -126,38 +182,164 @@ pub enum ExtractError {
 /// 递归取串的最大深度。
 const MAX_DEPTH: usize = 48;
 
-/// 白名单字段里**会装文本**的那几个（运营方写的，来源 `Operator`）；`messages` 单独处理。
-const OPERATOR_TEXT_FIELDS: &[&str] = &["tools", "tool_choice", "response_format", "stop"];
+/// 一个字符串本身又是 JSON（`arguments`、被双重编码的内容）时，解开它要多花多少「深度」：
+/// 一共最多解 `MAX_DEPTH / NESTED_JSON_COST` = 4 层（再多的不是正常的内容，按 `Malformed` 拒绝）。
+const NESTED_JSON_COST: usize = 12;
 
-/// 白名单字段里**只会是数字或布尔**的（不装文本，不检查）。只给 `every_forwarded_field_is_classified` 用：
-/// 它存在的意义就是让「白名单里新增了字段却没人分类」变成一条失败的测试。
-#[cfg(test)]
-const NON_TEXT_FIELDS: &[&str] = &[
-    "temperature",
-    "top_p",
-    "top_k",
-    "min_p",
-    "presence_penalty",
-    "frequency_penalty",
-    "repetition_penalty",
-    "seed",
-    "parallel_tool_calls",
+/// 消息里不是客户端文本的固定结构：角色名（词表是封闭的）。它们装不下任何内容，不当文本取。
+const KNOWN_ROLES: &[&str] = &[
+    "system",
+    "developer",
+    "user",
+    "assistant",
+    "tool",
+    "function",
 ];
 
-fn collect_strings(value: &Value, out: &mut Vec<String>, depth: usize) -> Result<(), ExtractError> {
+/// `build_chat_body` 自己写进去的、不是客户端的字段（模型、上限、流式开关由服务端决定）。
+const SERVER_SET_FIELDS: &[&str] = &["model", "max_tokens", "stream", "stream_options"];
+
+// ---------------------------------------------------------------------------
+// 服务端受信的运营方提示
+// ---------------------------------------------------------------------------
+
+/// 登记的运营方提示至少多少个字符：太短的片段（「你是」）相当于通配符，任何消息都能以它开头。
+pub const MIN_TRUSTED_PROMPT_CHARS: usize = 32;
+/// 单条登记的运营方提示最多多少字节。
+pub const MAX_TRUSTED_PROMPT_BYTES: usize = 16 * 1024;
+/// 最多登记多少条。
+pub const MAX_TRUSTED_PROMPTS: usize = 64;
+
+/// 服务端配置里登记的、受信的运营方提示（`safety.trusted_operator_prompts`）。
+///
+/// 只有这里登记过的文本能得到运营方的待遇（只查越狱类规则）；客户端填的 `role`、凭证的种类、请求头都不能。
+/// 匹配是**逐字、只认开头**：一条 `system` / `developer` 消息的内容以某条登记的提示开头，这一段开头是运营方的，
+/// 后面的部分仍然是孩子写的话。只认开头（不认中间、结尾）是为了不让人拿登记的提示当分隔符把有害的话拆开。
+#[derive(Clone, Default)]
+pub struct TrustedOperatorText {
+    /// 按长度从长到短排好：开头匹配取最长的那条。
+    prompts: Arc<Vec<String>>,
+}
+
+impl std::fmt::Debug for TrustedOperatorText {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TrustedOperatorText")
+            .field("prompts", &self.prompts.len())
+            .finish()
+    }
+}
+
+impl TrustedOperatorText {
+    /// 没有登记任何提示：客户端写的内容没有任何一个字节能得到豁免。
+    pub fn none() -> Self {
+        Self::default()
+    }
+
+    /// 校验并登记。每条至少 [`MIN_TRUSTED_PROMPT_CHARS`] 个字符、至多 [`MAX_TRUSTED_PROMPT_BYTES`] 字节，不重复，
+    /// 最多 [`MAX_TRUSTED_PROMPTS`] 条。错误信息里没有提示的内容。
+    pub fn new(prompts: impl IntoIterator<Item = String>) -> Result<Self, String> {
+        let mut list: Vec<String> = Vec::new();
+        for (index, prompt) in prompts.into_iter().enumerate() {
+            let position = index + 1;
+            if prompt.chars().count() < MIN_TRUSTED_PROMPT_CHARS {
+                return Err(format!(
+                    "第 {position} 条受信的运营方提示太短（至少 {MIN_TRUSTED_PROMPT_CHARS} 个字符）：太短的片段任何消息都能以它开头，等于没有检查"
+                ));
+            }
+            if prompt.len() > MAX_TRUSTED_PROMPT_BYTES {
+                return Err(format!(
+                    "第 {position} 条受信的运营方提示太长（最多 {MAX_TRUSTED_PROMPT_BYTES} 字节）"
+                ));
+            }
+            if list.contains(&prompt) {
+                return Err(format!("第 {position} 条受信的运营方提示重复了"));
+            }
+            list.push(prompt);
+        }
+        if list.len() > MAX_TRUSTED_PROMPTS {
+            return Err(format!(
+                "最多登记 {MAX_TRUSTED_PROMPTS} 条受信的运营方提示，现在有 {}",
+                list.len()
+            ));
+        }
+        list.sort_by_key(|prompt| std::cmp::Reverse(prompt.len()));
+        Ok(Self {
+            prompts: Arc::new(list),
+        })
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.prompts.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.prompts.len()
+    }
+
+    /// 登记的提示（长的在前）。
+    pub fn prompts(&self) -> impl Iterator<Item = &str> {
+        self.prompts.iter().map(String::as_str)
+    }
+
+    /// `text` 以某条登记的提示开头：返回 `(那条提示, 后面剩下的)`。
+    fn strip_prefix<'a>(&self, text: &'a str) -> Option<(&'a str, &'a str)> {
+        self.prompts
+            .iter()
+            .find(|prompt| text.starts_with(prompt.as_str()))
+            .map(|prompt| text.split_at(prompt.len()))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 输入
+// ---------------------------------------------------------------------------
+
+/// 一个字符串本身看起来是 JSON 对象或数组时，把它解码之后的键和值也取出来。解析不了就只是文本。
+fn decode_nested_json(text: &str, out: &mut Vec<String>, depth: usize) -> Result<(), ExtractError> {
+    let trimmed = text.trim_start();
+    if !(trimmed.starts_with('{') || trimmed.starts_with('[')) {
+        return Ok(());
+    }
+    let Ok(parsed) = serde_json::from_str::<Value>(text) else {
+        return Ok(());
+    };
+    collect_value(&parsed, out, depth.saturating_add(NESTED_JSON_COST))
+}
+
+/// `arguments`：必须是合法的 JSON 文本（空白算「没有参数」）。原文先取，再取解码之后的键和值。解析不了是 `Malformed`。
+fn collect_arguments(text: &str, out: &mut Vec<String>, depth: usize) -> Result<(), ExtractError> {
+    out.push(text.to_string());
+    if text.trim().is_empty() {
+        return Ok(());
+    }
+    let parsed: Value = serde_json::from_str(text).map_err(|_| ExtractError::Malformed)?;
+    collect_value(&parsed, out, depth.saturating_add(NESTED_JSON_COST))
+}
+
+/// 递归取出一个 JSON 值里的每一个字符串：值，**还有键名**；`arguments` 要能解析，看起来是 JSON 的字符串再解一层。
+fn collect_value(value: &Value, out: &mut Vec<String>, depth: usize) -> Result<(), ExtractError> {
     if depth > MAX_DEPTH {
         return Err(ExtractError::Malformed);
     }
     match value {
-        Value::String(text) => out.push(text.clone()),
+        Value::String(text) => {
+            out.push(text.clone());
+            decode_nested_json(text, out, depth)?;
+        }
         Value::Array(items) => {
             for item in items {
-                collect_strings(item, out, depth + 1)?;
+                collect_value(item, out, depth + 1)?;
             }
         }
         Value::Object(map) => {
-            for item in map.values() {
-                collect_strings(item, out, depth + 1)?;
+            for (key, item) in map {
+                out.push(key.clone());
+                match item {
+                    Value::String(text) if key == "arguments" => {
+                        collect_arguments(text, out, depth + 1)?;
+                    }
+                    _ => collect_value(item, out, depth + 1)?,
+                }
             }
         }
         Value::Null | Value::Bool(_) | Value::Number(_) => {}
@@ -165,37 +347,77 @@ fn collect_strings(value: &Value, out: &mut Vec<String>, depth: usize) -> Result
     Ok(())
 }
 
+/// 一段 JSON 文本解析之后的每一个键和字符串值（不含原文）。
+fn decoded_pieces(raw: &str) -> Result<Vec<String>, ExtractError> {
+    if raw.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    let parsed: Value = serde_json::from_str(raw).map_err(|_| ExtractError::Malformed)?;
+    let mut out = Vec::new();
+    collect_value(&parsed, &mut out, NESTED_JSON_COST)?;
+    Ok(out)
+}
+
 fn origin_of(role: &str) -> Origin {
     match role {
-        "system" | "developer" => Origin::Operator,
         "assistant" => Origin::Assistant,
         "tool" | "function" => Origin::Tool,
-        // `user` 和任何未知角色：最严
+        // `user`、**`system` 和 `developer`**、任何未知角色：最严。角色是客户端填的，不证明这段话来自运营方。
         _ => Origin::User,
     }
 }
 
-/// `content`：字符串，或分段数组（只有 `text` 分段能检查）。
+/// 一段内容文本：开头是登记过的运营方提示的话，这一段开头归运营方，后面的按孩子写的话；其余全是孩子写的话。
+fn push_text(
+    text: &str,
+    trusted: Option<&TrustedOperatorText>,
+    pieces: &mut Vec<String>,
+    operator: &mut Vec<String>,
+) -> Result<(), ExtractError> {
+    let rest = match trusted.and_then(|trusted| trusted.strip_prefix(text)) {
+        Some((prompt, rest)) => {
+            operator.push(prompt.to_string());
+            rest
+        }
+        None => text,
+    };
+    if rest.is_empty() {
+        return Ok(());
+    }
+    pieces.push(rest.to_string());
+    decode_nested_json(rest, pieces, 0)
+}
+
+/// `content`：字符串，或分段数组（只有 `text` 分段能检查）。分段里的其它键和值同样会被转发，所以同样取出来。
 fn collect_content(
     content: &Value,
-    out: &mut Vec<String>,
+    trusted: Option<&TrustedOperatorText>,
+    pieces: &mut Vec<String>,
+    operator: &mut Vec<String>,
     uncheckable: &mut bool,
 ) -> Result<(), ExtractError> {
     match content {
         Value::Null => Ok(()),
-        Value::String(text) => {
-            out.push(text.clone());
-            Ok(())
-        }
+        Value::String(text) => push_text(text, trusted, pieces, operator),
         Value::Array(parts) => {
             for part in parts {
                 match part {
-                    Value::String(text) => out.push(text.clone()),
+                    Value::String(text) => push_text(text, trusted, pieces, operator)?,
                     Value::Object(object) => match object.get("type").and_then(Value::as_str) {
-                        Some("text") => match object.get("text") {
-                            Some(Value::String(text)) => out.push(text.clone()),
-                            _ => return Err(ExtractError::Malformed),
-                        },
+                        Some("text") => {
+                            match object.get("text") {
+                                Some(Value::String(text)) => {
+                                    push_text(text, trusted, pieces, operator)?;
+                                }
+                                _ => return Err(ExtractError::Malformed),
+                            }
+                            for (key, value) in object {
+                                if key != "type" && key != "text" {
+                                    pieces.push(key.clone());
+                                    collect_value(value, pieces, 1)?;
+                                }
+                            }
+                        }
                         _ => *uncheckable = true,
                     },
                     _ => return Err(ExtractError::Malformed),
@@ -207,15 +429,59 @@ fn collect_content(
     }
 }
 
+/// 客户端请求体里**会被转发**的那一部分：用真正构造上游请求的 `build_chat_body` 构造一份（模型、上限换成占位值，
+/// 端点级固定字段不放进来：那是运营方写的，不是客户端的），再去掉服务端自己写的字段。
+///
+/// 构造不出来（字段类型不对）说明这个请求不会被转发，执行器会在发出任何字节之前拒绝它；
+/// 这时仍然按白名单把客户端写的字段都过一遍，让检查先于那个拒绝，结论和以前一样。
+pub fn forwarded_view(client: &Map<String, Value>) -> Map<String, Value> {
+    let no_extra = Map::new();
+    let probe = ChatCall {
+        client_body: client,
+        upstream_model: "probe",
+        max_tokens: 1,
+        stream: false,
+        extra_body: &no_extra,
+    };
+    if let Ok(bytes) = build_chat_body(&probe)
+        && let Ok(Value::Object(mut map)) = serde_json::from_slice::<Value>(&bytes)
+    {
+        for key in SERVER_SET_FIELDS {
+            map.remove(*key);
+        }
+        return map;
+    }
+    FORWARDED_FIELDS
+        .iter()
+        .filter_map(|field| {
+            client
+                .get(*field)
+                .filter(|value| !value.is_null())
+                .map(|value| ((*field).to_string(), value.clone()))
+        })
+        .collect()
+}
+
 /// 从客户端请求体里取出所有要检查的文本。`max_bytes` 是文本总量上限（超过返回 `TooLarge`）。
+/// 没有登记任何受信的运营方提示：客户端写的内容一律按孩子写的话检查。
 pub fn extract_input(
     body: &Map<String, Value>,
     max_bytes: usize,
 ) -> Result<CheckedInput, ExtractError> {
+    extract_input_with(body, max_bytes, &TrustedOperatorText::none())
+}
+
+/// 同 [`extract_input`]，另外认服务端登记的运营方提示（`system` / `developer` 消息的内容以它开头的那一段归运营方）。
+pub fn extract_input_with(
+    body: &Map<String, Value>,
+    max_bytes: usize,
+    trusted: &TrustedOperatorText,
+) -> Result<CheckedInput, ExtractError> {
+    let forwarded = forwarded_view(body);
     let mut input = CheckedInput::default();
     let mut total = 0usize;
 
-    let messages = body
+    let messages = forwarded
         .get("messages")
         .and_then(Value::as_array)
         .ok_or(ExtractError::Malformed)?;
@@ -225,36 +491,64 @@ pub fn extract_input(
             .get("role")
             .and_then(Value::as_str)
             .ok_or(ExtractError::Malformed)?;
+        let trusted_here = matches!(role, "system" | "developer").then_some(trusted);
         let mut pieces: Vec<String> = Vec::new();
+        let mut operator: Vec<String> = Vec::new();
+        if !KNOWN_ROLES.contains(&role) {
+            // 未知角色的名字也会被转发
+            pieces.push(role.to_string());
+        }
         for (key, value) in object {
             match key.as_str() {
                 "role" => {}
-                "content" => {
-                    collect_content(value, &mut pieces, &mut input.has_uncheckable_content)?
+                "content" => collect_content(
+                    value,
+                    trusted_here,
+                    &mut pieces,
+                    &mut operator,
+                    &mut input.has_uncheckable_content,
+                )?,
+                _ => {
+                    pieces.push(key.clone());
+                    match value {
+                        Value::String(text) if key == "arguments" => {
+                            collect_arguments(text, &mut pieces, 0)?;
+                        }
+                        _ => collect_value(value, &mut pieces, 0)?,
+                    }
                 }
-                _ => collect_strings(value, &mut pieces, 0)?,
             }
         }
-        if pieces.is_empty() {
-            continue;
+        for (origin, texts) in [(Origin::Operator, operator), (origin_of(role), pieces)] {
+            if texts.is_empty() {
+                continue;
+            }
+            let text = texts.join("\n");
+            total = total.saturating_add(text.len());
+            if total > max_bytes {
+                return Err(ExtractError::TooLarge);
+            }
+            if origin == Origin::User && !matches!(role, "system" | "developer") {
+                input.last_user_segment = Some(input.segments.len());
+            }
+            input.segments.push(Segment {
+                origin,
+                text: Sensitive::new(text),
+            });
         }
-        let text = pieces.join("\n");
-        total = total.saturating_add(text.len());
-        if total > max_bytes {
-            return Err(ExtractError::TooLarge);
-        }
-        input.segments.push(Segment {
-            origin: origin_of(role),
-            text: Sensitive::new(text),
-        });
     }
 
-    for field in OPERATOR_TEXT_FIELDS {
-        let Some(value) = body.get(*field) else {
+    // 其余转发出去的字段（`tools`、`tool_choice`、`response_format`、`stop`、数字和布尔……）：
+    // 按白名单的顺序，每个字段里的每一个键和值。客户端写的，一律按孩子写的话。
+    for field in FORWARDED_FIELDS {
+        if *field == "messages" {
+            continue;
+        }
+        let Some(value) = forwarded.get(*field) else {
             continue;
         };
         let mut pieces: Vec<String> = Vec::new();
-        collect_strings(value, &mut pieces, 0)?;
+        collect_value(value, &mut pieces, 0)?;
         if pieces.is_empty() {
             continue;
         }
@@ -264,7 +558,7 @@ pub fn extract_input(
             return Err(ExtractError::TooLarge);
         }
         input.segments.push(Segment {
-            origin: Origin::Operator,
+            origin: Origin::User,
             text: Sensitive::new(text),
         });
     }
@@ -277,17 +571,6 @@ pub fn extract_input(
 
 /// `finish_reason` 的词表（OpenAI 兼容）。词表之外的值按 `stop` 处理。
 const FINISH_REASONS: &[&str] = &["stop", "length", "tool_calls", "content_filter"];
-
-/// 短标识：只含 ASCII 字母数字和 `._:-`（`model` 还允许 `/`、`~`），长度有限。
-fn is_short_token(text: &str, allow_slash: bool) -> bool {
-    !text.is_empty()
-        && text.len() <= 128
-        && text.bytes().all(|b| {
-            b.is_ascii_alphanumeric()
-                || matches!(b, b'.' | b'_' | b':' | b'-')
-                || (allow_slash && matches!(b, b'/' | b'~'))
-        })
-}
 
 fn numeric_usage(usage: Option<&Value>) -> Option<Value> {
     let object = usage?.as_object()?;
@@ -307,11 +590,34 @@ pub struct RebuiltResponse {
     pub body: Vec<u8>,
 }
 
+/// 响应里由服务端写的标识：不取上游响应里的 `id`、`model`、工具调用 `id`。
+#[derive(Debug, Clone, Copy)]
+pub struct ResponseIdentity<'a> {
+    /// 响应的 `id`：请求号。
+    pub id: &'a str,
+    /// 响应的 `model`：已选路由的模型。
+    pub model: &'a str,
+}
+
+impl ResponseIdentity<'_> {
+    /// 第 `index` 个工具调用的 `id`：从请求号派生（同一段对话里不同请求的工具调用 `id` 不会撞），只含字母、数字、`_`。
+    fn tool_call_id(&self, index: usize) -> String {
+        let stem: String = self
+            .id
+            .chars()
+            .filter(char::is_ascii_alphanumeric)
+            .take(12)
+            .collect();
+        format!("call_{stem}_{index}")
+    }
+}
+
 /// 从上游的非流式响应里只取会被检查的字段，重建发给客户端的响应体。
-/// `fallback_id` 在上游的 `id` 不是短标识时用。结构不符合约定返回 `Malformed`（失败即关闭）。
+/// 标识（响应 `id`、`model`、工具调用 `id`）由 `identity` 和请求号决定，不取上游的。
+/// 结构不符合约定返回 `Malformed`（失败即关闭）：包括工具调用的 `arguments` 不是合法的 JSON。
 pub fn rebuild_response(
     upstream: &[u8],
-    fallback_id: &str,
+    identity: &ResponseIdentity<'_>,
     max_bytes: usize,
 ) -> Result<RebuiltResponse, ExtractError> {
     let value: Value = serde_json::from_slice(upstream).map_err(|_| ExtractError::Malformed)?;
@@ -375,11 +681,11 @@ pub fn rebuild_response(
     }
 
     // tool_calls
-    let mut calls: Vec<(String, String, String)> = Vec::new(); // (id, name, arguments)
+    let mut calls: Vec<(String, String)> = Vec::new(); // (name, arguments)
     match message.get("tool_calls") {
         None | Some(Value::Null) => {}
         Some(Value::Array(items)) => {
-            for (index, item) in items.iter().enumerate() {
+            for item in items {
                 let object = item.as_object().ok_or(ExtractError::Malformed)?;
                 if let Some(kind) = object.get("type")
                     && kind.as_str() != Some("function")
@@ -402,12 +708,9 @@ pub fn rebuild_response(
                     Some(other @ (Value::Object(_) | Value::Array(_))) => other.to_string(),
                     Some(_) => return Err(ExtractError::Malformed),
                 };
-                let id = object
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .filter(|id| is_short_token(id, false))
-                    .map_or_else(|| format!("call_{index}"), str::to_string);
-                calls.push((id, name, arguments));
+                // 参数必须是合法的 JSON（解析不了、或者套得太深，客户端和我们看到的就可能不是同一份东西）
+                decoded_pieces(&arguments)?;
+                calls.push((name, arguments));
             }
         }
         Some(_) => return Err(ExtractError::Malformed),
@@ -418,7 +721,7 @@ pub fn rebuild_response(
         refusal: refusal_text.clone().map(Sensitive::new),
         tool_calls: calls
             .iter()
-            .map(|(_, name, arguments)| ToolCallText {
+            .map(|(name, arguments)| ToolCallText {
                 name: Sensitive::new(name.clone()),
                 arguments: Sensitive::new(arguments.clone()),
             })
@@ -444,9 +747,10 @@ pub fn rebuild_response(
             Value::Array(
                 calls
                     .iter()
-                    .map(|(id, name, arguments)| {
+                    .enumerate()
+                    .map(|(index, (name, arguments))| {
                         json!({
-                            "id": id,
+                            "id": identity.tool_call_id(index),
                             "type": "function",
                             "function": {"name": name, "arguments": arguments},
                         })
@@ -465,29 +769,13 @@ pub fn rebuild_response(
         "tool_calls"
     };
     let mut rebuilt = Map::new();
-    rebuilt.insert(
-        "id".into(),
-        json!(
-            root.get("id")
-                .and_then(Value::as_str)
-                .filter(|id| is_short_token(id, false))
-                .unwrap_or(fallback_id)
-        ),
-    );
+    rebuilt.insert("id".into(), json!(identity.id));
     rebuilt.insert("object".into(), json!("chat.completion"));
     rebuilt.insert(
         "created".into(),
         json!(root.get("created").and_then(Value::as_u64).unwrap_or(0)),
     );
-    rebuilt.insert(
-        "model".into(),
-        json!(
-            root.get("model")
-                .and_then(Value::as_str)
-                .filter(|model| is_short_token(model, true))
-                .unwrap_or("unknown")
-        ),
-    );
+    rebuilt.insert("model".into(), json!(identity.model));
     rebuilt.insert(
         "choices".into(),
         json!([{
@@ -507,35 +795,23 @@ pub fn rebuild_response(
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-    use idoris_upstream::cloud::wire::{ChatCall, FORWARDED_FIELDS, build_chat_body};
-
     use super::*;
 
     fn body(value: Value) -> Map<String, Value> {
         value.as_object().unwrap().clone()
     }
 
-    #[test]
-    fn every_forwarded_field_is_classified() {
-        // 白名单里的每一个字段都必须被明确分类：装文本的（检查）或只会是数字/布尔的（不检查）。
-        // 将来有人给 `FORWARDED_FIELDS` 加字段，不在这里分类，这条测试就失败，不会悄悄漏检。
-        for field in FORWARDED_FIELDS {
-            let classified = *field == "messages"
-                || OPERATOR_TEXT_FIELDS.contains(field)
-                || NON_TEXT_FIELDS.contains(field);
-            assert!(
-                classified,
-                "forwarded field {field:?} is neither checked nor known to carry no text"
-            );
-        }
-        // 反过来：分类表里没有白名单已经不转发的字段
-        for field in OPERATOR_TEXT_FIELDS.iter().chain(NON_TEXT_FIELDS) {
-            assert!(
-                FORWARDED_FIELDS.contains(field),
-                "{field:?} is not forwarded"
-            );
+    /// 响应里由服务端写的标识：请求号 + 已选路由的模型。
+    fn ident(id: &str) -> ResponseIdentity<'_> {
+        ResponseIdentity {
+            id,
+            model: "example-org/chat-70b",
         }
     }
+
+    // 旧的 `every_forwarded_field_is_classified`（白名单里的每个字段都要在「装文本的 / 只会是数字」两张表里）：
+    // 取文本不再依赖那两张表——转发的请求由 `build_chat_body` 构造，里面的每个字符串都取，白名单里新增字段不需要分类
+    // 也不会漏检。它守的保证由下面的 `every_string_in_the_forwarded_request_is_in_the_checked_text`（更强）接管。
 
     #[test]
     fn every_string_anywhere_in_the_forwarded_text_fields_is_extracted() {
@@ -605,22 +881,210 @@ mod tests {
         assert_eq!(
             origins,
             vec![
-                Origin::Operator,
-                Origin::Operator,
+                // r3 High#1：客户端填的 system / developer 角色、工具定义、stop 都不是运营方：没有登记任何受信的运营方提示，
+                // 客户端写的内容一律按孩子写的话（旧的预期是 Operator）
+                Origin::User, // system
+                Origin::User, // developer
                 Origin::User,
                 Origin::User, // 未知角色按最严处理
                 Origin::Assistant,
                 Origin::Tool,
                 Origin::Tool,
-                Origin::Operator, // tools
-                Origin::Operator, // stop
+                Origin::User, // stop（白名单字段的顺序：stop 在 tools 前面）
+                Origin::User, // tools
             ]
         );
-        assert_eq!(input.last_user_text(), Some("d"));
+        // 未知角色的名字也会被转发，所以也是被检查的文本；最后一条用户消息仍是它
+        assert_eq!(input.last_user_text(), Some("wizard\nd"));
         assert_eq!(
             input.untrusted_texts().collect::<Vec<_>>(),
-            ["c", "d", "f", "g"]
+            [
+                "a",
+                "b",
+                "c",
+                "wizard\nd",
+                "f",
+                "g",
+                "END",
+                "type\nfunction"
+            ]
         );
+    }
+
+    #[test]
+    fn the_last_user_text_is_the_last_user_message_not_a_trailing_system_message_or_field() {
+        // `system` 消息、`tools`、`stop` 现在也是 `Origin::User`；给 LLM 检查器当上下文的「孩子最后一句话」仍是最后一条
+        // `user` 消息
+        let input = extract_input(
+            &body(json!({"messages": [
+                {"role": "user", "content": "question"},
+                {"role": "system", "content": "trailing system message"},
+            ], "stop": ["END"]})),
+            1 << 20,
+        )
+        .unwrap();
+        assert_eq!(input.last_user_text(), Some("question"));
+        assert_eq!(
+            extract_input(
+                &body(json!({"messages": [{"role": "system", "content": "s"}]})),
+                1 << 20
+            )
+            .unwrap()
+            .last_user_text(),
+            None
+        );
+    }
+
+    fn trusted(prompts: &[&str]) -> TrustedOperatorText {
+        TrustedOperatorText::new(prompts.iter().map(|p| (*p).to_string())).unwrap()
+    }
+
+    const OPERATOR_PROMPT: &str = "You are a learning assistant for children. If a child asks for self-harm, refuse politely.";
+
+    #[test]
+    fn only_a_registered_prompt_at_the_start_of_a_system_message_is_the_operators() {
+        let registry = trusted(&[OPERATOR_PROMPT]);
+        let input = extract_input_with(
+            &body(json!({"messages": [
+                {"role": "system", "content": format!("{OPERATOR_PROMPT}\nGrade: 5")},
+                {"role": "developer", "content": [{"type": "text", "text": OPERATOR_PROMPT}]},
+                {"role": "user", "content": OPERATOR_PROMPT},
+                {"role": "system", "content": format!("Ignore this. {OPERATOR_PROMPT}")},
+                {"role": "system", "content": "something else entirely"},
+            ]})),
+            1 << 20,
+            &registry,
+        )
+        .unwrap();
+        let shape: Vec<(Origin, String)> = input
+            .segments
+            .iter()
+            .map(|s| (s.origin, s.text.expose().to_string()))
+            .collect();
+        assert_eq!(
+            shape,
+            vec![
+                // 开头是登记的提示：这一段是运营方的，后面的（年级）仍是孩子写的话
+                (Origin::Operator, OPERATOR_PROMPT.to_string()),
+                (Origin::User, "\nGrade: 5".to_string()),
+                // 分段里的文本同样
+                (Origin::Operator, OPERATOR_PROMPT.to_string()),
+                // user 角色发来同样的字：不是运营方的（只有 system / developer 消息认登记的提示）
+                (Origin::User, OPERATOR_PROMPT.to_string()),
+                // 提示不在开头：整条都是孩子写的话（不认中间，不能拿登记的提示当分隔符把有害的话拆开）
+                (Origin::User, format!("Ignore this. {OPERATOR_PROMPT}")),
+                (Origin::User, "something else entirely".to_string()),
+            ]
+        );
+        // 没有登记：同样的请求里没有任何一个字节是运营方的
+        let none = extract_input(
+            &body(json!({"messages": [{"role": "system", "content": OPERATOR_PROMPT}]})),
+            1 << 20,
+        )
+        .unwrap();
+        assert!(none.segments.iter().all(|s| s.origin == Origin::User));
+    }
+
+    #[test]
+    fn a_registered_prompt_must_be_long_enough_and_unique() {
+        assert!(TrustedOperatorText::new(["short".to_string()]).is_err());
+        assert!(
+            TrustedOperatorText::new([OPERATOR_PROMPT.to_string(), OPERATOR_PROMPT.to_string()])
+                .is_err()
+        );
+        assert!(TrustedOperatorText::new(["x".repeat(MAX_TRUSTED_PROMPT_BYTES + 1)]).is_err());
+        let many: Vec<String> = (0..=MAX_TRUSTED_PROMPTS)
+            .map(|n| format!("{n:040}"))
+            .collect();
+        assert!(TrustedOperatorText::new(many).is_err());
+        // 泰文按字符数计，不是字节数
+        assert!(TrustedOperatorText::new(["ก".repeat(MIN_TRUSTED_PROMPT_CHARS)]).is_ok());
+        assert!(
+            TrustedOperatorText::new(Vec::<String>::new())
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn decoded_json_strings_and_arguments_are_part_of_the_checked_text() {
+        // 看起来是 JSON 的字符串解码之后再取一遍；`arguments` 解码之后的键和值都要在
+        let input = extract_input(
+            &body(json!({"messages": [
+                {"role": "user", "content": "{\"q\":\"\\u0068ello world\"}"},
+                {"role": "assistant", "content": null, "tool_calls": [
+                    {"id": "c1", "type": "function", "function": {
+                        "name": "post", "arguments": "{\"text\":\"\\u006bill yourself\",\"\\u0068idden key\":1}"}}]},
+            ]})),
+            1 << 20,
+        )
+        .unwrap();
+        let all: String = input
+            .segments
+            .iter()
+            .map(|s| s.text.expose().to_string())
+            .collect::<Vec<_>>()
+            .join("|");
+        for expected in ["hello world", "kill yourself", "hidden key"] {
+            assert!(all.contains(expected), "{expected} missing from {all}");
+        }
+        // 解析不了的 `arguments`、套得太深的 JSON 字符串：失败即关闭；空的 `arguments` 是「没有参数」
+        for bad in ["{not json", "nope", "[1,2"] {
+            assert_eq!(
+                extract_input(
+                    &body(json!({"messages": [{"role": "assistant", "content": null, "tool_calls": [
+                        {"id": "c", "type": "function", "function": {"name": "f", "arguments": bad}}]}]})),
+                    1 << 20
+                )
+                .unwrap_err(),
+                ExtractError::Malformed,
+                "{bad}"
+            );
+        }
+        for ok in ["", "  ", "{}"] {
+            assert!(
+                extract_input(
+                    &body(json!({"messages": [{"role": "assistant", "content": null, "tool_calls": [
+                        {"id": "c", "type": "function", "function": {"name": "f", "arguments": ok}}]}]})),
+                    1 << 20
+                )
+                .is_ok(),
+                "{ok:?}"
+            );
+        }
+        let mut nested = json!("x").to_string();
+        for _ in 0..8 {
+            nested = json!({"a": nested}).to_string();
+        }
+        assert_eq!(
+            extract_input(
+                &body(json!({"messages": [{"role": "user", "content": nested}]})),
+                1 << 20
+            )
+            .unwrap_err(),
+            ExtractError::Malformed
+        );
+    }
+
+    #[test]
+    fn a_request_the_upstream_builder_refuses_is_still_checked_so_the_check_comes_first() {
+        // 字段类型不对（`temperature` 是字符串）：`build_chat_body` 构造不出请求，执行器会在发出任何字节之前拒绝它；
+        // 检查仍然先看过客户端写的话（结论和以前一样：有害就是 422，没有害处就让执行器去报 invalid_request）
+        let input = extract_input(
+            &body(
+                json!({"messages": [{"role": "user", "content": "i want to die"}],
+                "temperature": "hot", "stop": ["a stop"]}),
+            ),
+            1 << 20,
+        )
+        .unwrap();
+        let all: String = input
+            .segments
+            .iter()
+            .map(|s| s.text.expose().to_string())
+            .collect::<Vec<_>>()
+            .join("|");
+        assert!(all.contains("i want to die") && all.contains("a stop"));
     }
 
     #[test]
@@ -710,7 +1174,7 @@ mod tests {
     }
 
     #[test]
-    fn the_rebuilt_response_carries_only_checked_text_and_validated_tokens() {
+    fn the_rebuilt_response_carries_only_checked_text_and_server_written_identifiers() {
         let upstream = completion(json!({
             "role": "assistant", "content": "ANSWER",
             "reasoning_content": "UNCHECKED-REASONING",
@@ -719,7 +1183,7 @@ mod tests {
             "tool_calls": [{"id": "call_a", "type": "function",
                             "function": {"name": "calc", "arguments": "{\"x\":1}"}}],
         }));
-        let rebuilt = rebuild_response(&upstream, "fallback", 1 << 20).unwrap();
+        let rebuilt = rebuild_response(&upstream, &ident("fallback"), 1 << 20).unwrap();
         let text = String::from_utf8(rebuilt.body.clone()).unwrap();
         for dropped in [
             "UNCHECKED",
@@ -731,7 +1195,8 @@ mod tests {
             assert!(!text.contains(dropped), "{dropped} leaked into {text}");
         }
         let value: Value = serde_json::from_slice(&rebuilt.body).unwrap();
-        assert_eq!(value["id"], "chatcmpl-1");
+        // r3 Medium#1：`id` 是服务端给的（请求号），不是上游的 `chatcmpl-1`；`model` 是已选路由的模型（传进来的值）
+        assert_eq!(value["id"], "fallback");
         assert_eq!(value["object"], "chat.completion");
         assert_eq!(value["created"], 1_700_000_000u64);
         assert_eq!(value["model"], "example-org/chat-70b");
@@ -752,7 +1217,7 @@ mod tests {
     }
 
     #[test]
-    fn identifiers_are_validated_and_replaced_when_they_are_not_short_tokens() {
+    fn identifiers_are_always_written_by_the_server_whatever_the_upstream_says() {
         let upstream = json!({
             "id": "an id with spaces and Thai สวัสดี",
             "model": "<script>",
@@ -762,13 +1227,15 @@ mod tests {
                 "finish_reason": "weird_reason"}],
         })
         .to_string();
-        let rebuilt = rebuild_response(upstream.as_bytes(), "req-123", 1 << 20).unwrap();
+        let rebuilt = rebuild_response(upstream.as_bytes(), &ident("req-123"), 1 << 20).unwrap();
         let value: Value = serde_json::from_slice(&rebuilt.body).unwrap();
         assert_eq!(value["id"], "req-123");
-        assert_eq!(value["model"], "unknown");
+        // 旧的预期是 `unknown`（上游的 model 不是短标识时的兜底）；现在 model 永远是已选路由的模型
+        assert_eq!(value["model"], "example-org/chat-70b");
+        // 工具调用 id 从请求号派生（旧的预期是 `call_0`），同一段对话里不同请求的不会撞
         assert_eq!(
             value["choices"][0]["message"]["tool_calls"][0]["id"],
-            "call_0"
+            "call_req123_0"
         );
         // 对象形式的参数被序列化成字符串，并且被检查
         assert_eq!(
@@ -783,7 +1250,7 @@ mod tests {
         let plain =
             json!({"choices": [{"message": {"content": "x"}, "finish_reason": "eos"}]}).to_string();
         let value: Value = serde_json::from_slice(
-            &rebuild_response(plain.as_bytes(), "r", 1 << 20)
+            &rebuild_response(plain.as_bytes(), &ident("r"), 1 << 20)
                 .unwrap()
                 .body,
         )
@@ -796,13 +1263,57 @@ mod tests {
         let upstream = completion(json!({"role": "assistant", "content": [
             {"type": "text", "text": "A"}, {"type": "text", "text": "B"},
             {"type": "refusal", "refusal": "NO"}], "refusal": "MORE"}));
-        let rebuilt = rebuild_response(&upstream, "r", 1 << 20).unwrap();
+        let rebuilt = rebuild_response(&upstream, &ident("r"), 1 << 20).unwrap();
         assert_eq!(rebuilt.output.content.as_ref().unwrap().expose(), "AB");
         assert_eq!(rebuilt.output.refusal.as_ref().unwrap().expose(), "NOMORE");
         // 空回答：没有什么要检查的，也不是错误
         let empty = completion(json!({"role": "assistant", "content": null}));
-        let rebuilt = rebuild_response(&empty, "r", 1 << 20).unwrap();
+        let rebuilt = rebuild_response(&empty, &ident("r"), 1 << 20).unwrap();
         assert!(rebuilt.output.texts().is_empty());
+    }
+
+    #[test]
+    fn tool_call_arguments_must_be_json_and_are_checked_decoded() {
+        // r3 High#4：`arguments` 里的转义（`k`）解码之后才是客户端看到的字；解析不了的参数不发
+        let upstream = completion(json!({"role": "assistant", "content": null, "tool_calls": [
+            {"id": "c", "type": "function", "function": {
+                "name": "post", "arguments": r#"{"text":"kill yourself","key":"v"}"#}}]}));
+        let rebuilt = rebuild_response(&upstream, &ident("r"), 1 << 20).unwrap();
+        let call = &rebuilt.output.tool_calls[0];
+        let mut decoded = call.decoded_arguments();
+        decoded.sort();
+        assert_eq!(decoded, ["key", "kill yourself", "text", "v"]);
+        // 全部要检查的文本里有解码之后的字，也有原文（原文就是发给客户端的）
+        let all = rebuilt.output.all_texts();
+        assert!(all.iter().any(|t| t == "kill yourself"));
+        assert!(all.iter().any(|t| t.contains(r"kill")));
+        // 嵌套的 JSON 字符串再解一层
+        let nested = completion(json!({"role": "assistant", "content": null, "tool_calls": [
+            {"id": "c", "type": "function", "function": {
+                "name": "post", "arguments": r#"{"payload":"{\"text\":\"\\u006bill yourself\"}"}"#}}]}));
+        let rebuilt = rebuild_response(&nested, &ident("r"), 1 << 20).unwrap();
+        assert!(
+            rebuilt
+                .output
+                .all_texts()
+                .iter()
+                .any(|t| t == "kill yourself")
+        );
+        // 不是 JSON：失败即关闭。没有参数（空串、null、缺省）不是错误
+        for bad in ["{not json", "nope", "{\"a\":"] {
+            let upstream = completion(json!({"role": "assistant", "content": null, "tool_calls": [
+                {"id": "c", "type": "function", "function": {"name": "f", "arguments": bad}}]}));
+            assert_eq!(
+                rebuild_response(&upstream, &ident("r"), 1 << 20).unwrap_err(),
+                ExtractError::Malformed,
+                "{bad}"
+            );
+        }
+        for ok in [json!(""), Value::Null] {
+            let upstream = completion(json!({"role": "assistant", "content": null, "tool_calls": [
+                {"id": "c", "type": "function", "function": {"name": "f", "arguments": ok}}]}));
+            assert!(rebuild_response(&upstream, &ident("r"), 1 << 20).is_ok());
+        }
     }
 
     #[test]
@@ -822,14 +1333,14 @@ mod tests {
             json!({"choices": [{"message": {"content": "x", "refusal": 3}}]}).to_string(),
         ] {
             assert_eq!(
-                rebuild_response(bad.as_bytes(), "r", 1 << 20).unwrap_err(),
+                rebuild_response(bad.as_bytes(), &ident("r"), 1 << 20).unwrap_err(),
                 ExtractError::Malformed,
                 "{bad}"
             );
         }
         let huge = completion(json!({"role": "assistant", "content": "y".repeat(50)}));
         assert_eq!(
-            rebuild_response(&huge, "r", 49).unwrap_err(),
+            rebuild_response(&huge, &ident("r"), 49).unwrap_err(),
             ExtractError::TooLarge
         );
     }
@@ -846,11 +1357,19 @@ mod tests {
                                 "function": {"name": "f", "arguments": "{}"}}]}}],
         })
         .to_string();
-        let rebuilt = rebuild_response(upstream.as_bytes(), "req-1", 1 << 20).unwrap();
+        let rebuilt = rebuild_response(upstream.as_bytes(), &ident("req-1"), 1 << 20).unwrap();
         let text = String::from_utf8(rebuilt.body).unwrap();
         for echoed in ["0812345678", "CHILDINPUT-SENTINEL", "0899999999"] {
             assert!(!text.contains(echoed), "{echoed} leaked into {text}");
         }
+        // 取而代之的是服务端写的：请求号、已选路由的模型、从请求号派生的工具调用 id
+        let value: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["id"], "req-1");
+        assert_eq!(value["model"], "example-org/chat-70b");
+        assert_eq!(
+            value["choices"][0]["message"]["tool_calls"][0]["id"],
+            "call_req1_0"
+        );
     }
 
     // ---- 「检查的 = 转发的」：性质测试 ----
@@ -1076,7 +1595,11 @@ mod tests {
                 extra_body: &none,
             })
             .unwrap();
-            let forwarded: Value = serde_json::from_slice(&forwarded).unwrap();
+            let mut forwarded: Value = serde_json::from_slice(&forwarded).unwrap();
+            // 服务端写的字段（模型、上限、流式开关）不是客户端的文本
+            for field in SERVER_SET_FIELDS {
+                forwarded.as_object_mut().unwrap().remove(*field);
+            }
             let mut strings = Vec::new();
             every_string(&forwarded, &mut strings);
             let checked = extract_input(&client, 1 << 22).unwrap();
@@ -1109,7 +1632,7 @@ mod tests {
             {"message": {"role": "assistant", "content": "FIRST"}},
             {"message": {"role": "assistant", "content": "SECOND-UNCHECKED"}}]})
         .to_string();
-        let rebuilt = rebuild_response(upstream.as_bytes(), "r", 1 << 20).unwrap();
+        let rebuilt = rebuild_response(upstream.as_bytes(), &ident("r"), 1 << 20).unwrap();
         let text = String::from_utf8(rebuilt.body).unwrap();
         assert!(text.contains("FIRST") && !text.contains("SECOND"));
     }

@@ -35,8 +35,11 @@ use std::collections::BTreeSet;
 use idoris_compute_contracts::safety::SafetyCategory;
 
 use super::extract::{CheckedInput, CheckedOutput, Origin};
-use super::text::{Folded, Needle, fold, has_word, near};
-use super::{BoxFuture, CheckContext, CheckReport, SafetyChecker, Verdict};
+use super::text::{
+    Folded, NEGATION_REACH_CHARS, Needle, base64_texts, fold, has_word, locally_negated, near,
+    near_regions,
+};
+use super::{BoxFuture, CheckContext, CheckReport, Denial, SafetyChecker, Verdict};
 
 // ---------------------------------------------------------------------------
 // 词表（折叠前的原文；Needle::new 会用同一个函数折叠）
@@ -60,9 +63,11 @@ const PROTECTIVE_CUES: &[&str] = &[
     "should i",
 ];
 
-/// 拒绝语线索：回答里有这些，说明模型多半在拒绝，不是在提供步骤。
+/// 拒绝语线索：模型明确在拒绝，不是在提供步骤。
+///
+/// 只收**明确的拒绝**，不收单纯的道歉（`ขอโทษ`、`i'm sorry`）：「抱歉，不过步骤如下……」是顺从，不是拒绝。
+/// 它们和 [`NEGATION_CUES`] 一样只在命中所在的那一句里、命中旁边才有效，见 [`super::text::locally_negated`]。
 const REFUSAL_CUES: &[&str] = &[
-    "ขอโทษ",
     "ไม่สามารถบอก",
     "ไม่สามารถช่วย",
     "ไม่สามารถให้",
@@ -77,8 +82,6 @@ const REFUSAL_CUES: &[&str] = &[
     "อย่าทำ",
     "ห้ามทำ",
     "ผู้ใหญ่ที่ไว้ใจ",
-    "i'm sorry",
-    "i am sorry",
     "i can't",
     "i cannot",
     "i won't",
@@ -88,12 +91,15 @@ const REFUSAL_CUES: &[&str] = &[
     "not able to",
 ];
 
-/// 警示语境：文本在讲「不要 / 为什么不能 / 注意安全」，不是在索要方法。
+/// 否定词：文本在讲「不要 / 不能」，不是在索要或给出方法。
 /// （「ห้ามผสมน้ำยาล้างห้องน้ำกับน้ำยาฟอกขาว เพราะจะเกิดก๊าซพิษ」是家庭化学安全课，不是配方。）
+///
+/// **只在命中所在的那一句里、命中旁边有效**（[`super::text::locally_negated`]）：整段里别处出现的否定词、
+/// 追加在有害回答末尾的 `never` 都不算（r3 High#3）。
 ///
 /// 注意**声调折叠带来的撞词**：`อย่า`（别）折叠成 `อยา`，是 `อยาก`（想）和 `อย่าง`（样）的子串，所以不能单独当线索；
 /// `ห้าม`（禁止）折叠成 `หาม`，是 `ค้นหามีด` 的子串。下面一律用带动词的复合形式（`อย่าผสม`、`ห้ามจุด`……）。
-const WARNING_CUES: &[&str] = &[
+const NEGATION_CUES: &[&str] = &[
     "ห้ามผสม",
     "ห้ามจุด",
     "ห้ามเล่น",
@@ -109,16 +115,14 @@ const WARNING_CUES: &[&str] = &[
     "อย่าราด",
     "อย่าเปิด",
     "ไม่ควร",
-    "ทำไม",
-    "ระวัง",
-    "ป้องกัน",
-    "ปลอดภัย",
     "don't",
     "do not",
     "never",
-    "dangerous",
-    "unsafe",
 ];
+
+/// 话题词（只给输入侧）：孩子在问「为什么 / 要注意什么 / 怎样才安全」，是安全教育的问题，不是索要方法。
+/// 它们不是否定：**回答**里出现 `unsafe` 不能让一份步骤变得无害，所以输出侧不用这一组。
+const TOPICAL_CUES: &[&str] = &["ทำไม", "ระวัง", "ป้องกัน", "ปลอดภัย", "dangerous", "unsafe"];
 
 /// 孩子表示「这是秘密 / 不要重复」的话：之后出现的「ชื่อ X」「เรียนที่ Y」按个人信息处理。
 const SECRET_CUES: &[&str] = &[
@@ -653,24 +657,66 @@ enum Matcher {
         gap: usize,
         either: bool,
     },
-    /// 同 `Near`（前后都算），但文本里有 `unless` 线索时不算。
+    /// 同 `Near`（前后都算），但**每一处命中**旁边（同一句里、前后各 [`NEGATION_REACH_CHARS`] 个字符之内）
+    /// 有 `unless` 线索的那一处不算。别处的线索不算；一处被放行之后，剩下的内容独立重新检查。
     NearUnless {
         a: Vec<Needle>,
         b: Vec<Needle>,
         gap: usize,
         unless: CueSet,
     },
-    /// 任一模式出现，但文本里有 `unless` 线索时不算。
+    /// 任一模式出现，但每一处出现旁边有 `unless` 线索的那一处不算（同上）。
     AnyUnless(Vec<Needle>, CueSet),
 }
 
-/// 哪一组线索能让一条规则放行。
+/// 哪一组线索能让一条规则的某一处命中放行。
 #[derive(Clone, Copy)]
 enum CueSet {
-    /// 警示语境（「ห้าม……」「ทำไม……」）：输入侧，孩子在问为什么不能，不是在索要方法。
+    /// 输入侧：否定词（「ห้าม……」）或话题词（「ทำไม……」「ปลอดภัย」）：孩子在问为什么不能、怎样才安全，不是在索要方法。
     Warning,
-    /// 拒绝语或警示语境：输出侧，模型在拒绝或在讲安全知识，不是在给步骤。
+    /// 输出侧：否定词或明确的拒绝语：模型在拒绝或在讲「不要这样做」，不是在给步骤。话题词不算。
     RefusalOrWarning,
+}
+
+/// 一条规则里最多逐个判断多少处命中；再多的话不逐个判断，规则直接成立（没有正常的文本会有这么多处被否定的有害命中）。
+const MAX_NEGATED_HITS: usize = 16;
+/// 抹掉被放行的命中、重新检查剩下内容的最多轮数。
+const MAX_MASK_ROUNDS: usize = 4;
+
+/// 「命中旁边有否定词才放行」的通用流程。
+///
+/// `any` 问「任一视图里有命中吗」，`regions` 给出 `plain` 视图里每一处命中的区间。
+/// 1. 没有命中：规则不成立；
+/// 2. 有命中，但 `plain` 视图里一处都没有（只有被拆开 / 数字代字母 / 重复字母的变形命中）：没法判断旁边有没有否定词，规则成立；
+/// 3. 每一处 `plain` 命中都要被放行；任何一处没被放行：规则成立；
+/// 4. 全部放行之后，把这些命中抹掉，**剩下的内容重新检查**（别的视图里、或者抹掉之后才凑到一起的命中）：还有命中就回到 2。
+fn unless_matches(
+    folded: &Folded,
+    cues: &[Needle],
+    any: impl Fn(&Folded) -> bool,
+    regions: impl Fn(&Folded) -> Vec<(usize, usize)>,
+) -> bool {
+    if !any(folded) {
+        return false;
+    }
+    let mut current = folded.clone();
+    for _ in 0..MAX_MASK_ROUNDS {
+        let hits = regions(&current);
+        if hits.is_empty() || hits.len() > MAX_NEGATED_HITS {
+            return true;
+        }
+        if hits
+            .iter()
+            .any(|&hit| !locally_negated(&current, hit, cues, NEGATION_REACH_CHARS))
+        {
+            return true;
+        }
+        current = current.mask(&hits);
+        if !any(&current) {
+            return false;
+        }
+    }
+    true
 }
 
 /// 一条规则用在哪些来源的文本上。
@@ -720,28 +766,39 @@ impl Rule {
             Matcher::Any(list) => list.iter().any(|needle| needle.found_in(folded)),
             Matcher::Words(words) => has_word(folded, words),
             Matcher::Near { a, b, gap, either } => near(folded, a, b, *gap, *either),
-            Matcher::NearUnless { a, b, gap, unless } => {
-                !cues.present(*unless, folded) && near(folded, a, b, *gap, true)
-            }
-            Matcher::AnyUnless(list, unless) => {
-                !cues.present(*unless, folded) && list.iter().any(|needle| needle.found_in(folded))
-            }
+            Matcher::NearUnless { a, b, gap, unless } => unless_matches(
+                folded,
+                cues.of(*unless),
+                |f| near(f, a, b, *gap, true),
+                |f| near_regions(f, a, b, *gap, true, MAX_NEGATED_HITS),
+            ),
+            Matcher::AnyUnless(list, unless) => unless_matches(
+                folded,
+                cues.of(*unless),
+                |f| list.iter().any(|needle| needle.found_in(f)),
+                |f| {
+                    list.iter()
+                        .flat_map(|needle| needle.plain_spans(f))
+                        .collect()
+                },
+            ),
         }
     }
 }
 
-/// 放行线索的查找器（预先折叠）。
+/// 放行线索（预先折叠）：输入侧和输出侧各一组。
 struct Cues<'a> {
-    warning: &'a [Needle],
-    refusal: &'a [Needle],
+    /// 否定词 + 话题词。
+    input: &'a [Needle],
+    /// 否定词 + 明确的拒绝语。
+    output: &'a [Needle],
 }
 
 impl Cues<'_> {
-    fn present(&self, set: CueSet, folded: &Folded) -> bool {
-        let found = |list: &[Needle]| list.iter().any(|cue| cue.found_in(folded));
+    fn of(&self, set: CueSet) -> &[Needle] {
         match set {
-            CueSet::Warning => found(self.warning),
-            CueSet::RefusalOrWarning => found(self.warning) || found(self.refusal),
+            CueSet::Warning => self.input,
+            CueSet::RefusalOrWarning => self.output,
         }
     }
 }
@@ -1057,10 +1114,16 @@ const LABELS: &[&str] = &[
 /// 第一人称代词（紧挨在标签前面时，说明是孩子在报自己的名字：「ผมชื่อ……」）。
 const PRONOUNS: &[&str] = &["ผม", "หนู", "ฉัน", "เรา", "ดิฉัน", "ชั้น"];
 
-fn token_after(plain: &str, end: usize) -> Option<&str> {
-    let rest = plain[end..].trim_start_matches([' ', ':']);
-    let token = rest.split(' ').next()?;
-    (!token.is_empty()).then_some(token)
+/// `plain[end..]` 里跳过空格和冒号之后的第一个词，以及这个词在 `plain` 里的结束位置。
+///
+/// 返回结束位置而不是让调用方自己用 `token.len() + 1` 推算：跳过的分隔符可能是一个字节（空格）也可能是两个字节（「: 」），
+/// 推算错了就落在泰文字符中间，字符串切片 panic（r3 Medium#3）。
+fn token_after(plain: &str, end: usize) -> Option<(&str, usize)> {
+    let rest = &plain[end..];
+    let trimmed = rest.trim_start_matches([' ', ':']);
+    let start = end + (rest.len() - trimmed.len());
+    let token = trimmed.split(' ').next()?;
+    (!token.is_empty()).then_some((token, start + token.len()))
 }
 
 /// 取出文本里的电话（泰国手机、座机、+66 国际格式）和 13 位身份证号，返回标准化后的纯数字。
@@ -1138,13 +1201,13 @@ pub(crate) fn personal_spans<'a>(texts: impl Iterator<Item = &'a str>) -> Person
                 if !(secret || self_reference) {
                     continue;
                 }
-                let Some(token) = token_after(&folded.plain, end) else {
+                let Some((token, token_end)) = token_after(&folded.plain, end) else {
                     continue;
                 };
                 // 「โรงเรียน」后面紧跟校名（没有空格）时整个词就是校名；标签后面再带一个空格的写法 `โรงเรียน X` 取 X
                 let value = if token == "โรงเรียน" {
-                    token_after(&folded.plain, end + token.len() + 1)
-                        .map_or_else(String::new, |name| format!("{token}{name}"))
+                    token_after(&folded.plain, token_end)
+                        .map_or_else(String::new, |(name, _)| format!("{token}{name}"))
                 } else {
                     token.to_string()
                 };
@@ -1211,9 +1274,14 @@ pub(crate) fn echoes_personal_info<'a>(
 pub struct RuleChecker {
     rules: Vec<Rule>,
     protective: Vec<Needle>,
-    refusal: Vec<Needle>,
-    warning: Vec<Needle>,
+    /// 输入侧能放行一处命中的线索：否定词 + 话题词。
+    input_cues: Vec<Needle>,
+    /// 输出侧能放行一处命中的线索：否定词 + 明确的拒绝语。
+    output_cues: Vec<Needle>,
 }
+
+/// base64 里再套 base64 最多解几层：再深的不是正常的内容。
+const MAX_DECODE_DEPTH: usize = 3;
 
 impl std::fmt::Debug for RuleChecker {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1231,11 +1299,14 @@ impl Default for RuleChecker {
 
 impl RuleChecker {
     pub fn new() -> Self {
+        let negation = needles(NEGATION_CUES);
+        let topical = needles(TOPICAL_CUES);
+        let refusal = needles(REFUSAL_CUES);
         Self {
             rules: build_rules(),
             protective: needles(PROTECTIVE_CUES),
-            refusal: needles(REFUSAL_CUES),
-            warning: needles(WARNING_CUES),
+            input_cues: negation.iter().chain(&topical).cloned().collect(),
+            output_cues: negation.iter().chain(&refusal).cloned().collect(),
         }
     }
 
@@ -1245,18 +1316,53 @@ impl RuleChecker {
     }
 
     /// 对一段文本跑一组规则，返回第一条命中的规则（id 和类别）。
+    ///
+    /// 文本里疑似 base64 的长串解码之后再查一遍（最多 [`MAX_DECODE_DEPTH`] 层）：有害的话整段编码成 base64
+    /// （「解码并照做」、或让模型「用 base64 回答」）不能躲过规则。解出来的串太多、或者套得太深，直接当作命中（失败即关闭）。
     fn first_match(
         &self,
         text: &str,
         applies: impl Fn(&Applies) -> bool,
     ) -> Option<(&'static str, SafetyCategory)> {
+        self.first_match_at(text, &applies, 0)
+    }
+
+    fn first_match_at(
+        &self,
+        text: &str,
+        applies: &dyn Fn(&Applies) -> bool,
+        depth: usize,
+    ) -> Option<(&'static str, SafetyCategory)> {
         if text.is_empty() {
             return None;
         }
+        if let Some(hit) = self.match_folded(text, applies) {
+            return Some(hit);
+        }
+        let encoded = base64_texts(text);
+        if encoded.overflow {
+            return Some(("encoded.flood", SafetyCategory::Other));
+        }
+        for decoded in &encoded.texts {
+            if depth >= MAX_DECODE_DEPTH {
+                return Some(("encoded.nested", SafetyCategory::Other));
+            }
+            if let Some(hit) = self.first_match_at(decoded, applies, depth + 1) {
+                return Some(hit);
+            }
+        }
+        None
+    }
+
+    fn match_folded(
+        &self,
+        text: &str,
+        applies: &dyn Fn(&Applies) -> bool,
+    ) -> Option<(&'static str, SafetyCategory)> {
         let folded = fold(text);
         let cues = Cues {
-            warning: &self.warning,
-            refusal: &self.refusal,
+            input: &self.input_cues,
+            output: &self.output_cues,
         };
         let protective = self.protective.iter().any(|cue| cue.found_in(&folded));
         self.rules
@@ -1295,7 +1401,8 @@ impl RuleChecker {
         input: &CheckedInput,
         output: &CheckedOutput,
     ) -> Option<(&'static str, SafetyCategory)> {
-        let texts = output.texts();
+        // 工具参数里的 JSON 转义（`k`）解码之后才是模型要表达的字：检查的是解码后的键和值（见 `CheckedOutput::all_texts`）
+        let texts = output.all_texts();
         for text in &texts {
             if let Some(hit) = self.first_match(text, |a| a.model) {
                 return Some(hit);
@@ -1309,7 +1416,7 @@ impl RuleChecker {
             }
         }
         let spans = personal_spans(input.untrusted_texts());
-        if echoes_personal_info(&spans, texts.iter().copied()) {
+        if echoes_personal_info(&spans, texts.iter().map(AsRef::as_ref)) {
             return Some(("output.pii_echo", SafetyCategory::PiiDisclosure));
         }
         None
@@ -1317,6 +1424,16 @@ impl RuleChecker {
 }
 
 impl SafetyChecker for RuleChecker {
+    fn precheck_input(&self, input: &CheckedInput) -> Option<Denial> {
+        self.scan_input(input)
+            .map(|(_rule, category)| Denial::Blocked(category))
+    }
+
+    fn precheck_output(&self, input: &CheckedInput, output: &CheckedOutput) -> Option<Denial> {
+        self.scan_output(input, output)
+            .map(|(_rule, category)| Denial::Blocked(category))
+    }
+
     fn check_input<'a>(
         &'a self,
         _ctx: &'a CheckContext<'a>,

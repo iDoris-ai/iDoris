@@ -757,7 +757,8 @@ async fn the_cost_of_the_safety_checks_is_reserved_before_and_settled_after_with
     }
     assert_eq!(meter.open_tickets(), 0);
 
-    // 规则拒绝：LLM 没有被调用，花费是零笔，但预留照样被结算（不悬空）
+    // 规则拒绝：LLM 没有被调用。PR-Daemon S5 F4：免费的规则**先于**检查费用的预留，命中就直接 422，根本没有预留
+    // （旧的预期是「预留了，再按零笔花费结算」：额度不足的孩子写了自伤内容会因为预留不了而得到 402，不是 422）
     let meter = Arc::new(SimpleExtraCost::new());
     let c = child_with(
         vec![answer("never")],
@@ -768,11 +769,13 @@ async fn the_cost_of_the_safety_checks_is_reserved_before_and_settled_after_with
     .await;
     let reply = post(&c.h.app, &child_body(&harmful_question())).await;
     assert_eq!(reply.status, 422);
-    assert_eq!(
-        meter.entries()[0].outcome,
-        ExtraCostOutcome::Spent(Vec::new())
+    assert!(
+        meter.entries().is_empty(),
+        "the free rules refused before anything was reserved: {:?}",
+        meter.entries()
     );
     assert_eq!(meter.open_tickets(), 0);
+    assert_eq!(c.judge.request_count(), 0);
 }
 
 /// 拒绝额度的计量器：付款账户链放不下安全检查的成本。
