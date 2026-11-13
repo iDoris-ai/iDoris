@@ -194,15 +194,21 @@ pub struct SettleOutcome {
     pub result: SettleResult,
     /// 预留过期之后才来的结算（额度早已放回去）。
     pub late: bool,
-    /// 最终向付款账户记的金额（释放为 0）。
+    /// 这次结算的实际消费（释放为 0）。
     pub charged: Money,
-    /// 超出预留的部分（迟到结算按全额算）。
+    /// 超出预留的部分（迟到结算是整笔扣掉 [`grace_absorbed`](Self::grace_absorbed) 之后的部分：预留已经放回去，
+    /// 剩下的都在预留之外）。
     pub overage: Money,
+    /// 用户承担的部分：预留之内、没有被平台承担的那一份（迟到的结算没有「预留之内」，是 0）。
+    pub user_borne: Money,
     /// overage 里在担保人授信范围内、由担保人承担的部分。
     pub sponsor_covered: Money,
     /// overage 里超出授信、记入平台损失账户的部分。
     pub platform_loss: Money,
-    /// 宽限那一轮超出授信下限、由平台承担的部分。
+    /// 宽限那一轮超出授信下限、由平台承担的部分。它不记到付款账户链上（不扣用户和担保人的余额）。
+    ///
+    /// **守恒**：`charged = user_borne + sponsor_covered + platform_loss + grace_absorbed`，每一次结算都成立
+    /// （`reconcile` 逐个预留核对，测试里按分录再核对一遍）。
     pub grace_absorbed: Money,
     /// 因为平台损失冻结了这张凭证。
     pub credential_frozen: bool,

@@ -1,9 +1,12 @@
 //! 账本和 S4 尝试记录的对账，以及账本自己的守恒检查。
 //!
-//! 对账必须能同时回答两个问题：
+//! 对账必须能同时回答三个问题：
 //!
 //! 1. **两张账对得上吗**（账本 ↔ S4 的 `compute_attempts` / `compute_postings`，对应关系见 `hook.rs` 的表）；
-//! 2. **账本自己守恒吗**（每个预留在付款账户链上每个账户的分录之和，和预留的状态、金额一致）。
+//! 2. **账本自己守恒吗**（每个预留在付款账户链上每个账户的分录之和，和预留的状态、金额一致）；
+//! 3. **实际消费分得对吗**（`charged = 用户承担 + 担保人承担 + 平台承担`：每个已结算的预留，宽限里平台承担的部分、
+//!    担保人承担和平台损失的合计，都能从预留自己的字段（金额、宽限下限、是否迟到、实际消费）推出来，并且和责任分录
+//!    一致；没有结算的预留不能有任何责任分录）。同一块缺口被算两遍（责任合计大于实际消费）会在这里现形。
 //!
 //! 它只读，不修复任何东西：发现不一致只是列出来（`Mismatch`），怎么处理（补账、冲正、人工核对）是运维的事，
 //! 和 `docs/design/compute-service-ops.md` §7 的恢复后对账是同一个思路——**不自动改账，不靠把旧分录再放一遍**。
@@ -37,6 +40,7 @@ fn table_exists(conn: &Connection, name: &str) -> Result<bool, LedgerError> {
 pub(super) fn reconcile_in(conn: &Connection) -> Result<ReconcileReport, LedgerError> {
     let mut report = ReconcileReport::default();
     check_conservation(conn, &mut report)?;
+    check_liabilities(conn, &mut report)?;
     check_grace(conn, &mut report)?;
     if table_exists(conn, "compute_attempts")? {
         check_against_attempts(conn, &mut report)?;
@@ -44,7 +48,7 @@ pub(super) fn reconcile_in(conn: &Connection) -> Result<ReconcileReport, LedgerE
     Ok(report)
 }
 
-/// 每个预留在付款账户链上每个账户的分录之和：在途 = （open ? R : 0），已花 = （settled ? 实际金额 : 0）；
+/// 每个预留在付款账户链上每个账户的分录之和：在途 = （open ? R : 0），已花 = （settled ? 实际金额 - 宽限里平台承担的部分 : 0）；
 /// 并且每个预留的分录恰好覆盖付款账户链上的每个账户。
 fn check_conservation(conn: &Connection, report: &mut ReconcileReport) -> Result<(), LedgerError> {
     struct Row {
@@ -56,11 +60,15 @@ fn check_conservation(conn: &Connection, report: &mut ReconcileReport) -> Result
         account: String,
         held: i64,
         spent: i64,
+        /// 这个预留在宽限里由平台承担的部分（不记到付款账户链上）。
+        absorbed: i64,
     }
     let rows: Vec<Row> = {
         let mut stmt = conn.prepare(
             "SELECT h.hold_id, h.state, h.reserved_micros, COALESCE(h.charged_micros, 0), h.payer_account,
-                    e.account_id, SUM(e.held_micros), SUM(e.spent_micros)
+                    e.account_id, SUM(e.held_micros), SUM(e.spent_micros),
+                    COALESCE((SELECT SUM(g.liability_micros) FROM ledger_entries g
+                               WHERE g.hold_id = h.hold_id AND g.kind = 'grace_absorbed'), 0)
                FROM ledger_holds h
                JOIN ledger_entries e ON e.hold_id = h.hold_id
               WHERE e.kind IN ('reserve', 'settle', 'release', 'expire', 'late_settle')
@@ -77,6 +85,7 @@ fn check_conservation(conn: &Connection, report: &mut ReconcileReport) -> Result
                 account: row.get(5)?,
                 held: row.get(6)?,
                 spent: row.get(7)?,
+                absorbed: row.get(8)?,
             })
         })?;
         mapped.collect::<Result<Vec<_>, _>>()?
@@ -86,7 +95,7 @@ fn check_conservation(conn: &Connection, report: &mut ReconcileReport) -> Result
     for row in &rows {
         let expected_held = if row.state == "open" { row.reserved } else { 0 };
         let expected_spent = if row.state == "settled" {
-            row.charged
+            row.charged.saturating_sub(row.absorbed)
         } else {
             0
         };
@@ -103,8 +112,8 @@ fn check_conservation(conn: &Connection, report: &mut ReconcileReport) -> Result
             report.mismatches.push(mismatch(
                 &row.hold,
                 format!(
-                    "account {}: spent entries sum to {} but a {} hold charged {} should leave {}",
-                    row.account, row.spent, row.state, row.charged, expected_spent
+                    "account {}: spent entries sum to {} but a {} hold charged {} (of which the platform absorbed {}) should leave {}",
+                    row.account, row.spent, row.state, row.charged, row.absorbed, expected_spent
                 ),
             ));
         }
@@ -130,6 +139,115 @@ fn check_conservation(conn: &Connection, report: &mut ReconcileReport) -> Result
         }
     }
     report.holds_checked = accounts_by_hold.len();
+    Ok(())
+}
+
+/// 实际消费分得对吗：每个预留的责任分录（担保人承担 / 平台损失 / 宽限里平台承担的部分）都能从预留自己的字段推出来。
+///
+/// 对已结算的预留（`A` = 实际消费，`R` = 预留，`F` = 宽限放行时的下限）：
+///
+/// * 宽限承担 `G = max(min(A, R) - F, 0)`（没有宽限的预留是 0）；
+/// * overage：没迟到是 `max(A - R, 0)`，迟到是 `A - G`；
+/// * 担保人承担 + 平台损失 = overage（付款账户是平台根、没有担保人时不写担保人分录，这种预留跳过这一项）；
+/// * 所以 `用户承担 + 担保人承担 + 平台承担 = (A - G - overage) + overage + G = A`，责任合计永远不超过实际消费。
+///
+/// 没有结算的预留（在途、过期、释放）不能有任何责任分录。
+fn check_liabilities(conn: &Connection, report: &mut ReconcileReport) -> Result<(), LedgerError> {
+    struct Row {
+        hold: String,
+        state: String,
+        reserved: i64,
+        charged: i64,
+        floor: Option<i64>,
+        late: bool,
+        has_guarantor: bool,
+        sponsor: i64,
+        loss: i64,
+        absorbed: i64,
+    }
+    let rows: Vec<Row> = {
+        let mut stmt = conn.prepare(
+            "SELECT h.hold_id, h.state, h.reserved_micros, COALESCE(h.charged_micros, 0),
+                    h.grace_floor_micros, h.late,
+                    EXISTS (SELECT 1 FROM accounts a WHERE a.account_id = h.payer_account AND a.parent_id IS NOT NULL),
+                    COALESCE((SELECT SUM(e.liability_micros) FROM ledger_entries e
+                               WHERE e.hold_id = h.hold_id AND e.kind = 'sponsor_covered'), 0),
+                    COALESCE((SELECT SUM(e.liability_micros) FROM ledger_entries e
+                               WHERE e.hold_id = h.hold_id AND e.kind = 'platform_loss'), 0),
+                    COALESCE((SELECT SUM(e.liability_micros) FROM ledger_entries e
+                               WHERE e.hold_id = h.hold_id AND e.kind = 'grace_absorbed'), 0)
+               FROM ledger_holds h
+              ORDER BY h.hold_id",
+        )?;
+        let mapped = stmt.query_map([], |row| {
+            Ok(Row {
+                hold: row.get(0)?,
+                state: row.get(1)?,
+                reserved: row.get(2)?,
+                charged: row.get(3)?,
+                floor: row.get(4)?,
+                late: row.get::<_, i64>(5)? == 1,
+                has_guarantor: row.get(6)?,
+                sponsor: row.get(7)?,
+                loss: row.get(8)?,
+                absorbed: row.get(9)?,
+            })
+        })?;
+        mapped.collect::<Result<Vec<_>, _>>()?
+    };
+    for row in rows {
+        if row.state != "settled" {
+            if row.sponsor != 0 || row.loss != 0 || row.absorbed != 0 {
+                report.mismatches.push(mismatch(
+                    &row.hold,
+                    format!(
+                        "a {} hold carries liabilities (sponsor {}, platform loss {}, grace absorbed {}) but only a settled hold may",
+                        row.state, row.sponsor, row.loss, row.absorbed
+                    ),
+                ));
+            }
+            continue;
+        }
+        let within = row.charged.min(row.reserved);
+        let expected_absorbed = row.floor.map_or(0, |floor| (within - floor).max(0));
+        let expected_overage = if row.late {
+            row.charged - expected_absorbed
+        } else {
+            (row.charged - row.reserved).max(0)
+        };
+        if row.absorbed != expected_absorbed {
+            report.mismatches.push(mismatch(
+                &row.hold,
+                format!(
+                    "the platform absorbed {} of the grace round but charged {} against a reservation of {} with floor {:?} implies {}",
+                    row.absorbed, row.charged, row.reserved, row.floor, expected_absorbed
+                ),
+            ));
+        }
+        if row.has_guarantor && row.sponsor + row.loss != expected_overage {
+            report.mismatches.push(mismatch(
+                &row.hold,
+                format!(
+                    "the guarantor ({}) and the platform loss ({}) add up to {} but the overage of a {}settlement is {}",
+                    row.sponsor,
+                    row.loss,
+                    row.sponsor + row.loss,
+                    if row.late { "late " } else { "" },
+                    expected_overage
+                ),
+            ));
+        }
+        let borne = row.sponsor + row.loss + row.absorbed;
+        if borne > row.charged {
+            report.mismatches.push(mismatch(
+                &row.hold,
+                format!(
+                    "liabilities of {borne} exceed the charge of {}: the same amount was assigned twice",
+                    row.charged
+                ),
+            ));
+        }
+    }
     Ok(())
 }
 

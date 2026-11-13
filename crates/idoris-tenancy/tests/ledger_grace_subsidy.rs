@@ -123,20 +123,21 @@ fn only_one_grace_per_member_per_period_and_it_resets_in_the_next_period() {
     let store = paid_chain(&db, 20);
     let first = admit_with_ladder(&store, "r-1", 0, "cred-e", 100, T0);
     assert!(matches!(first, AdmissionDecision::Grace { .. }));
-    // 把这一轮结算掉：实际 100，账户 20 - 100 = -80（透支了）
+    // 把这一轮结算掉：实际 100，账户自己的 20 先付，超出的 80 由平台承担（不记到账户上），账户用完了：0
     store
         .settle_attempt(&attempt("r-1", 0), &price(100), ts(T0 + 1_000))
         .unwrap();
-    // 同一周期再来：账户已经透支，也用过宽限了 -> 402
+    assert_eq!(balance(&store, "emp", T0 + 1_000), 0);
+    // 同一周期再来：账户没有钱了，也用过宽限了 -> 402
     let again = admit_with_ladder(&store, "r-2", 0, "cred-e", 100, T0 + 2_000);
     assert_eq!(
         denied(&again),
         Some(ReasonCode::BudgetExhausted),
         "{again:?}"
     );
-    // 账户补一点钱，让它回到「没有透支」（-80 + 100 = 20）：本周期宽限已经用过，仍然 402
+    // 账户补 20（回到宽限那一轮开始之前的状态）：本周期宽限已经用过，仍然 402
     store
-        .fund_account(&aid("emp"), &thb(100), &key("f-emp-2"), ts(T0 + 3_000))
+        .fund_account(&aid("emp"), &thb(20), &key("f-emp-2"), ts(T0 + 3_000))
         .unwrap();
     assert_eq!(balance(&store, "emp", T0 + 3_000), 20);
     let still = admit_with_ladder(&store, "r-3", 0, "cred-e", 100, T0 + 3_000);
@@ -192,10 +193,11 @@ fn the_period_is_the_calendar_month_in_the_ledger_time_zone() {
         store
             .settle_attempt(&attempt("r-1", 0), &price(100), ts(before_midnight + 1_000))
             .unwrap();
+        // 宽限那一轮平台承担了超出的 80，账户用完了自己的 20：补 20 就回到 20
         store
             .fund_account(
                 &aid("emp"),
-                &thb(100),
+                &thb(20),
                 &key("f-emp-2"),
                 ts(before_midnight + 2_000),
             )

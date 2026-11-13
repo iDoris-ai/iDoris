@@ -500,6 +500,7 @@ fn blank_outcome(unit: &Unit, result: SettleResult, charged: i64, late: bool) ->
         late,
         charged: Money::new(unit.clone(), charged),
         overage: zero(),
+        user_borne: zero(),
         sponsor_covered: zero(),
         platform_loss: zero(),
         grace_absorbed: zero(),
@@ -511,12 +512,21 @@ fn blank_outcome(unit: &Unit, result: SettleResult, charged: i64, late: bool) ->
 /// 结算一个预留（`charged` 微单位，0 = 释放）。**幂等**：同一个金额重放返回 `AlreadySettled` /
 /// `AlreadyReleased`，什么都不写；金额对不上是错误，不会悄悄覆盖。
 ///
-/// - 预留还活着（`open` 且没到 TTL）：在途 `-R`、已花 `+A`；`A > R` 的部分是 overage。
-/// - 预留已经过期（`expired`，或 `open` 但已过 TTL）：迟到的结算。额度早已放回去，所以**整笔** `A` 都当 overage。
-/// - overage 按 S0 的 [`split_overage`] 分：链上「剩余额度加授信」还能吸收的由担保人承担，超出的记入平台损失账户，
-///   告警，并冻结这张凭证。能吸收多少是事务里现读的整条链在「钱」这个维度上的余量（见 [`credit_headroom`]）。
-/// - 宽限放行的预留：账户自己的可用额度加授信之内的部分和普通请求一样；超出这个下限的部分（至多一次预留）
-///   由平台承担，记 `grace_absorbed`，不冻结凭证（那是平台批准的一次例外，不是失控）。
+/// # 实际消费怎么分（守恒）
+///
+/// `charged = 用户承担 + 担保人承担 + 平台承担`，每一次结算都成立：
+///
+/// 1. **宽限里平台承担的部分** `G`（只有宽限放行的预留有）：预留之内、超出放行时下限（账户自己的可用额度加授信）
+///    的部分 `max(min(A, R) - 下限, 0)`。这是平台批准的一次例外，**不记到付款账户链上**（不扣用户和担保人的余额，
+///    后续充值也不会先去填它），只在平台损失账户记一条 `grace_absorbed`。迟到的结算同样先分出 `G`。
+/// 2. **记到链上的** `A - G`：沿所有祖先各记一条已花（结算 / 迟到结算）。
+/// 3. **overage**：预留还活着时是 `max(A - R, 0)`；预留已经过期（额度早已放回去）时，扣掉 `G` 之后的整笔
+///    `A - G` 都在预留之外。链上「剩余额度加授信」还能吸收的由担保人承担（S0 的 [`split_overage`]），超出的记入
+///    平台损失账户，告警，并冻结这张凭证。能吸收多少是事务里现读的整条链在「钱」这个维度上的余量（见 [`credit_headroom`]）。
+/// 4. 其余是**用户承担**：`user_borne = (A - G) - overage`。
+///
+/// **不依赖扫描顺序**：读余量之前，在同一个事务里把整个账本里所有到期的预留都过期（和准入一样），所以别的到期预留
+/// 有没有被人扫过、谁先结算，都不会改变这一笔的余量。
 pub(super) fn settle_hold_in(
     conn: &Connection,
     hold_id: &str,
@@ -567,7 +577,16 @@ pub(super) fn settle_hold_in(
         HoldState::Open | HoldState::Expired => {}
     }
 
-    // 迟到由时间决定：到了 TTL 的预留先补一次过期。
+    // 要收钱的结算先把整个账本里所有到期的预留都过期（和准入一样），再读余量：否则别的已经到期、但还没人扫过的预留
+    // 仍占着额度，同一笔结算会因为扫描有没有跑过、谁先结算而得到不同的担保人 / 平台损失归类，还可能因此冻结凭证。
+    // 放在幂等重放的检查之后：重放什么都不写。
+    if charged > 0 {
+        sweep_expired_in(conn, now_ms)?;
+        // 重新读：这个预留自己也可能刚被扫成了 expired
+        hold = load_hold(conn, hold_id)?
+            .ok_or_else(|| LedgerError::HoldNotFound(hold_id.to_string()))?;
+    }
+    // 迟到由时间决定：到了 TTL 的预留先补一次过期（释放走这里；要收钱的上面已经统一扫过了）。
     if hold.state == HoldState::Open && now_ms >= hold.expires_at {
         expire_hold_in(conn, &hold, now_ms)?;
         hold.state = HoldState::Expired;
@@ -608,10 +627,18 @@ pub(super) fn settle_hold_in(
 
     // ---- 结算：先读（预留还占着或已放回去，正是 overage 要面对的状态），再写 ----
     let unit = hold.unit.clone();
+    // 宽限里平台承担的部分：预留之内、超出放行时下限的那一块。先分出来，再对剩下的算 overage，所以同一块缺口不会算两遍。
+    let within_reservation = charged.min(hold.reserved);
+    let grace_absorbed = match hold.grace_floor {
+        Some(floor) => sub(within_reservation, floor)?.max(0),
+        None => 0,
+    };
+    // 记到付款账户链上的金额：平台承担的宽限不进用户和担保人的账。
+    let chain_charge = sub(charged, grace_absorbed)?;
     let views = project_chain(conn, &chain, now_ms, config)?;
     let headroom = credit_headroom(&views)?;
     let overage = if late {
-        charged
+        chain_charge
     } else {
         sub(charged, hold.reserved)?.max(0)
     };
@@ -623,6 +650,8 @@ pub(super) fn settle_hold_in(
     )?;
     let sponsor = split.sponsor.micros();
     let loss = split.platform_loss.micros();
+    // 用户承担：记到链上的部分里，不是 overage 的那一份（迟到的结算整笔都是 overage，所以是 0）。
+    let user_borne = sub(chain_charge, overage)?;
 
     if late {
         post_chain(
@@ -632,7 +661,7 @@ pub(super) fn settle_hold_in(
             &ChainPosting {
                 kind: "late_settle",
                 held: 0,
-                spent: charged,
+                spent: chain_charge,
                 window_at_ms: now_ms,
                 at_ms: now_ms,
             },
@@ -646,7 +675,7 @@ pub(super) fn settle_hold_in(
             &ChainPosting {
                 kind: "settle",
                 held: release,
-                spent: charged,
+                spent: chain_charge,
                 window_at_ms: hold.created_at,
                 at_ms: now_ms,
             },
@@ -656,6 +685,7 @@ pub(super) fn settle_hold_in(
     let guarantor = chain.get(1).map(|account| account.id.as_str());
     let mut outcome = blank_outcome(&unit, SettleResult::Settled, charged, late);
     outcome.overage = Money::new(unit.clone(), overage);
+    outcome.user_borne = Money::new(unit.clone(), user_borne);
     outcome.sponsor_covered = Money::new(unit.clone(), sponsor);
     outcome.platform_loss = Money::new(unit.clone(), loss);
 
@@ -766,28 +796,24 @@ pub(super) fn settle_hold_in(
         ));
     }
 
-    if let Some(floor) = hold.grace_floor {
-        let used = charged.min(hold.reserved);
-        let absorbed = sub(used, floor)?.max(0);
-        if absorbed > 0 {
-            insert_entry(
-                conn,
-                &EntryDraft {
-                    account: PLATFORM_LOSS_ACCOUNT,
-                    hold: Some(&hold.hold_id),
-                    kind: "grace_absorbed",
-                    unit: &unit,
-                    held: 0,
-                    spent: 0,
-                    funds: 0,
-                    liability: absorbed,
-                    window_at_ms: now_ms,
-                    at_ms: now_ms,
-                    key: format!("{}|grace_absorbed|{PLATFORM_LOSS_ACCOUNT}", hold.hold_id),
-                },
-            )?;
-            outcome.grace_absorbed = Money::new(unit.clone(), absorbed);
-        }
+    if grace_absorbed > 0 {
+        insert_entry(
+            conn,
+            &EntryDraft {
+                account: PLATFORM_LOSS_ACCOUNT,
+                hold: Some(&hold.hold_id),
+                kind: "grace_absorbed",
+                unit: &unit,
+                held: 0,
+                spent: 0,
+                funds: 0,
+                liability: grace_absorbed,
+                window_at_ms: now_ms,
+                at_ms: now_ms,
+                key: format!("{}|grace_absorbed|{PLATFORM_LOSS_ACCOUNT}", hold.hold_id),
+            },
+        )?;
+        outcome.grace_absorbed = Money::new(unit.clone(), grace_absorbed);
     }
 
     close_hold(conn, hold_id, HoldState::Settled, now_ms, charged, late)?;
