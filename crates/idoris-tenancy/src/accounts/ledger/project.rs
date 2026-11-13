@@ -15,6 +15,16 @@
 //! （不是 `None`）。S0 把 `None` 解释成「没配置、不设限」，对一个会花钱的账户这是最危险的默认值：
 //! 新开的组织、新加的成员什么都没配置就能无限花平台的钱。所以默认是什么都不允许，要先发额度或充值。
 //!
+//! **仅授信账户的累计债务**（PR #600 第二轮评审 High）：授信是「有担保的负值」，它限制的是**累计**透支，不是单笔。
+//! 有充值的账户，余额 `funds − Σ (held + spent)` 本来就带着已欠的钱；有此刻生效的花费类额度的账户，`ceiling_remaining`
+//! 减去了窗口内的消耗。但**没充值、此刻也没有任何生效的花费类额度、只有一笔授信**的账户（经控制面开通授信的成员）
+//! 这两个数都不记它的消耗：旧代码给它填固定的 `Some(0)`，于是不管它已经花了多少、还有多少在途，每次准入看到的都是
+//! 「0 + 授信」的全额余量，授信变成了单笔上限，重复、并发的请求都能一直透支下去。现在这种账户的 `ceiling_remaining`
+//! 是 `-债务`，债务 = 它自己账上从「最后一次有别的钱覆盖它」起累计的 `Σ (held + spent)`（已花 + 在途预留）：
+//! 最后一次覆盖 = 它名下没被撤销的花费类额度里最晚到期的那个的到期时刻（从没有过 = 从头算起）。授信窗口、授信是不是被
+//! 「设置」替换过都不影响债务：重发一遍授信不会把已经欠下的勾销（和有充值的账户一样，债务只会被还掉，不会被忘掉）。
+//! 授信已经失效（关闭、过期、被撤销）的账户仍是 `Some(0)`：什么都不允许，用不着算债务。
+//!
 //! 所有求和都在调用方已经开着的写事务里读，所以和同一事务里随后写下的预留之间没有缝。
 //! SQLite 的 `SUM` 溢出会报错（不是回绕），那个错误原样往上走：准入失败即关闭。
 
@@ -150,6 +160,38 @@ pub(super) fn credit_limit_micros(
     )?)
 }
 
+/// 一个仅靠授信花钱的账户（没充值、此刻也没有生效的花费类额度）的**累计债务**：它自己账上从「最后一次有别的钱覆盖它」
+/// 起的 `Σ (held + spent)`，也就是已花加在途预留。
+///
+/// 「最后一次覆盖」= 它名下没被撤销的花费类额度里已经到期的那些，最晚的到期时刻（`valid_until <= now`；此刻生效的不在
+/// 这里：有生效额度的账户不走这条路）。从没有过额度 = 从头算起。被撤销的额度不算覆盖过任何东西（撤销之后它不再给任何人
+/// 授权，和 `not_revoked_clause` 同一条规矩），所以保守：它名下花掉的钱也算债务，只会让授信余量更小，不会更大。
+/// 债务与授信自己的窗口无关：授信被「设置」替换、关掉又重开，都不会把已经欠下的勾销。
+fn credit_debt_micros(
+    conn: &Connection,
+    account: &str,
+    now_ms: i64,
+    not_revoked: &str,
+) -> Result<i64, LedgerError> {
+    let covered_until: i64 = conn.query_row(
+        &format!(
+            "SELECT COALESCE(MAX(valid_until_ms), 0) FROM allocations
+              WHERE child_id = ?1 AND purpose IN {SPENDABLE_PURPOSES}
+                AND valid_until_ms <= ?2{not_revoked}"
+        ),
+        rusqlite::params![account, now_ms],
+        |row| row.get(0),
+    )?;
+    let committed: i64 = conn.query_row(
+        "SELECT COALESCE(SUM(held_micros + spent_micros), 0) FROM ledger_entries
+          WHERE account_id = ?1 AND window_at_ms >= ?2",
+        rusqlite::params![account, covered_until],
+        |row| row.get(0),
+    )?;
+    // 同一个预留的在途、已花分录落在同一个时刻上，净额不会是负的；万一读出负数，按 0 算（不会借此多出授信余量）
+    Ok(committed.max(0))
+}
+
 /// 一个账户此刻生效的限额（微单位；`None` = 不设限）。
 #[derive(Debug, Clone, Copy, Default)]
 pub(super) struct LimitMicros {
@@ -245,14 +287,21 @@ pub(super) fn project_chain(
         } else {
             None
         };
-        if balance.is_none()
-            && ceiling_remaining.is_none()
-            && !matches!(
-                account.kind,
-                AccountKind::Platform | AccountKind::SubsidyPool
-            )
-        {
+        let spends_money = !matches!(
+            account.kind,
+            AccountKind::Platform | AccountKind::SubsidyPool
+        );
+        if balance.is_none() && ceiling_remaining.is_none() && spends_money {
             ceiling_remaining = Some(money(0));
+        }
+        // 此刻有效的授信额度。
+        let credit_limit = credit_limit_micros(conn, id, now_ms)?;
+        // 仅授信账户（没充值、此刻也没有生效的花费类额度）：授信是它唯一的钱，所以授信限制的是它的累计债务。
+        // 它的 `ceiling_remaining` 记成 `-债务`，`available + 授信` 就是还能再欠多少；已花和在途预留都在债务里，
+        // 重复请求、并发请求每一次都看得到前面欠下的（见模块文档）。授信失效的账户保持 `Some(0)`：什么都不允许。
+        if spends_money && !sums.has_funds && active == 0 && credit_limit > 0 {
+            let debt = credit_debt_micros(conn, id, now_ms, not_revoked)?;
+            ceiling_remaining = Some(money(sub(0, debt)?));
         }
 
         let LimitMicros {
@@ -293,7 +342,7 @@ pub(super) fn project_chain(
             account: account.id.clone(),
             balance,
             ceiling_remaining,
-            credit_limit: money(credit_limit_micros(conn, id, now_ms)?),
+            credit_limit: money(credit_limit),
             rate_windows,
             in_flight: inflight_cap.map(|cap| InFlightView {
                 current: money(sums.held),
