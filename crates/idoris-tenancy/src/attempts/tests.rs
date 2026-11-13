@@ -555,6 +555,172 @@ fn insert_or_replace_cannot_rewrite_postings_events_requests_or_attempts() {
     assert_ne!(version, "pv-forged");
 }
 
+/// 一个已经收尾的请求（有一条正的 `user_price` 分录 18_000）。
+fn finalized(id: &str) -> (AttemptStore, Request) {
+    let (store, mut request) = started(id);
+    apply(
+        &store,
+        &mut request,
+        0,
+        &[AttemptEvent::Dispatch, AttemptEvent::WireWriteStarted],
+        1,
+    );
+    apply(
+        &store,
+        &mut request,
+        0,
+        &[AttemptEvent::UsageReported { usage: usage() }],
+        2,
+    );
+    store
+        .record_publish(request.attempts()[0].id(), at(3))
+        .unwrap();
+    request.publish_first_byte(idx(0)).unwrap();
+    let plan = request.plan_settlement().unwrap();
+    store
+        .finalize_request(
+            &plan,
+            &[request.attempts()[0].id().clone()],
+            RequestClose {
+                outcome: RequestOutcome::Answered,
+                reason: None,
+                at: at(4),
+            },
+        )
+        .unwrap();
+    (store, request)
+}
+
+/// PR #600 第二轮 S1 F5（PARTIAL）：上面那个测试只覆盖了主键和普通唯一约束。0001 里还有两个**带 WHERE 的唯一索引**
+/// （「每请求一笔正的 user_price」「每请求一个向用户收费的尝试」），REPLACE 撞上它们同样是「先删旧行再插新行」，
+/// 而 `compute_postings` 只追加、`compute_attempts` 不删行的触发器都管不到 REPLACE 删掉的那一行。
+/// 旧迁移的缺口：换一个新的幂等键（posting_id、幂等键都不冲突，只撞这个部分唯一索引）执行 REPLACE，
+/// 就能把已经落定的 18_000 分录悄悄替换成 1。
+#[test]
+fn replace_cannot_rewrite_the_one_positive_user_price_of_a_request() {
+    let (store, _request) = finalized("req-replace-price");
+    let user_price_total = |store: &AttemptStore| -> (i64, i64) {
+        store
+            .lock()
+            .query_row(
+                "SELECT COUNT(*), COALESCE(SUM(amount_micros), 0) FROM compute_postings WHERE kind = 'user_price'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+    };
+    let before = user_price_total(&store);
+    assert_eq!(before, (1, 18_000));
+    {
+        let conn = store.lock();
+        for sql in [
+            // 新的幂等键、不指定 posting_id：只撞「每请求一笔正 user_price」的部分唯一索引
+            "INSERT OR REPLACE INTO compute_postings
+                (request_id, attempt_id, kind, role, basis, unit, amount_micros, idempotency_key, created_at_ms)
+             SELECT request_id, attempt_id, 'user_price', role, basis, unit, 1, 'forged-key-1', created_at_ms
+               FROM compute_postings WHERE kind = 'user_price'",
+            "REPLACE INTO compute_postings
+                (request_id, attempt_id, kind, role, basis, unit, amount_micros, idempotency_key, created_at_ms)
+             SELECT request_id, attempt_id, 'user_price', role, basis, unit, 999999, 'forged-key-2', created_at_ms
+               FROM compute_postings WHERE kind = 'user_price'",
+        ] {
+            let result = conn.execute(sql, []);
+            assert!(result.is_err(), "must be refused: {sql}");
+        }
+    }
+    assert_eq!(
+        user_price_total(&store),
+        before,
+        "the settled user_price was not rewritten"
+    );
+    // 对照：负数冲正是合法的新分录（它不在部分唯一索引的范围内），不能被新触发器误伤
+    store
+        .lock()
+        .execute(
+            "INSERT INTO compute_postings
+                (request_id, attempt_id, kind, role, basis, unit, amount_micros, idempotency_key, created_at_ms)
+             SELECT request_id, attempt_id, 'user_price', role, basis, unit, -18000, 'reversal-key', created_at_ms
+               FROM compute_postings WHERE kind = 'user_price'",
+            [],
+        )
+        .unwrap();
+}
+
+/// 同一类缺口在 `compute_attempts` 上：「每请求一个向用户收费的尝试」是部分唯一索引。`INSERT OR REPLACE` 新尝试被发布边界
+/// 触发器挡住，但 `UPDATE OR REPLACE ... SET pays_user = 1` 撞上索引时，REPLACE 会把原来那个收费的尝试**整行删掉**
+/// （DELETE 触发器不触发）。
+#[test]
+fn replace_cannot_replace_the_paying_attempt_of_a_request() {
+    let (store, mut request) = started("req-replace-payer");
+    apply(
+        &store,
+        &mut request,
+        0,
+        &[AttemptEvent::Dispatch, AttemptEvent::WireWriteStarted],
+        1,
+    );
+    request.begin_next_attempt(candidate("model-b")).unwrap();
+    store
+        .append_attempt(request.id(), &request.attempts()[1], at(2))
+        .unwrap();
+    apply(
+        &store,
+        &mut request,
+        1,
+        &[AttemptEvent::Dispatch, AttemptEvent::WireWriteStarted],
+        3,
+    );
+    // 最新的一次（序号 1）发布，它是向用户收费的那一次
+    store
+        .record_publish(request.attempts()[1].id(), at(4))
+        .unwrap();
+    let a0 = request.attempts()[0].id().to_string();
+    let a1 = request.attempts()[1].id().to_string();
+    let payers = |store: &AttemptStore| -> Vec<String> {
+        let conn = store.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT attempt_id FROM compute_attempts WHERE pays_user = 1 ORDER BY attempt_id",
+            )
+            .unwrap();
+        stmt.query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    };
+    assert_eq!(payers(&store), [a1.clone()]);
+    {
+        let conn = store.lock();
+        // 不开外键的连接（任何别的连接默认就是这样）：REPLACE 删掉旧行时没有外键挡着
+        conn.pragma_update(None, "foreign_keys", false).unwrap();
+        let result = conn.execute(
+            "UPDATE OR REPLACE compute_attempts SET pays_user = 1 WHERE attempt_id = ?1",
+            [&a0],
+        );
+        assert!(result.is_err(), "a second paying attempt must be refused");
+        // 直接插一个新的、已经标成收费的尝试：同样不行（发布边界和「至多一个收费的」两道都在）
+        let result = conn.execute(
+            "INSERT OR REPLACE INTO compute_attempts
+                (attempt_id, request_id, attempt_index, provider, model, endpoint, price_version, effective_max_tokens,
+                 reserved_price_micros, reserved_price_unit, reserved_cost_micros, reserved_cost_unit, snapshot_json,
+                 state, state_json, pays_user, created_at_ms, updated_at_ms)
+             SELECT 'req-replace-payer#2', request_id, 2, provider, model, endpoint, price_version, effective_max_tokens,
+                    reserved_price_micros, reserved_price_unit, reserved_cost_micros, reserved_cost_unit, snapshot_json,
+                    state, state_json, 1, created_at_ms, updated_at_ms
+               FROM compute_attempts WHERE attempt_id = ?1",
+            [&a1],
+        );
+        assert!(result.is_err(), "a new paying attempt must be refused");
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+    }
+    assert_eq!(
+        payers(&store),
+        [a1],
+        "the paying attempt is still the one that published"
+    );
+    assert_eq!(store.attempt_rows(request.id()).unwrap().len(), 2);
+}
+
 /// 「用户只付一次」在数据库里也是结构保证：一个请求至多一个向用户收费的尝试、至多一条正的 user_price 分录。
 /// 进程在「已发布、还没结算」时崩溃：只靠数据库就能恢复并结算（重放幂等），用户只付一次。
 #[test]

@@ -7,6 +7,8 @@
 //! 新预留只能以 `open` 开始，终态不可再改（触发器），唯一把预留关成 `settled` 的写入路径 `close_hold` 在同一条 UPDATE 里写下状态和金额。
 //! 第一个测试用真实的库钉住这些约束；第二个测试**关掉约束检查**（`PRAGMA ignore_check_constraints`）伪造一行损坏的预留，
 //! 证明读到它时账本失败即关闭、对账把它报出来，而不是当成 0。
+//!
+//! 第三个测试是同一类「库层面的完整性」：宽限的部分唯一索引（每账户每账期至多一行没作废的）也要挡住 `INSERT OR REPLACE`。
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 #[path = "support/ledger_fixture.rs"]
@@ -118,5 +120,64 @@ fn a_settled_hold_without_a_charged_amount_is_corruption_not_a_charge_of_zero() 
             .any(|m| m.subject == "r-1#0" && m.detail.contains("records no charged amount")),
         "{:#?}",
         report.mismatches
+    );
+}
+
+#[test]
+fn replace_cannot_swap_out_the_active_grace_use_of_a_period() {
+    // PR #600 第二轮 S1 F5 的同一类缺口：宽限的「每账户每账期至多一行没作废的」是部分唯一索引，
+    // `INSERT OR REPLACE` 一个别的预留的宽限只撞这个索引，REPLACE 就把已经记下的那行整行删掉再插新的
+    // （DELETE 触发器不触发），宽限记录被悄悄换掉。
+    use idoris_compute_contracts::admission::AdmissionDecision;
+    let db = TempDb::new("hold-integrity-grace-replace");
+    let store = world(&db);
+    store
+        .fund_account(&aid("emp"), &thb(20), &key("f-emp"), t0())
+        .unwrap();
+    store
+        .fund_account(&aid("paid"), &thb(1_000_000), &key("f-paid"), t0())
+        .unwrap();
+    let granted = Req::new(&store, "r-1", 0, "cred-e", 100).grace();
+    let decision = store.admit_attempt(&granted.input()).unwrap();
+    assert!(
+        matches!(decision, AdmissionDecision::Grace { .. }),
+        "{decision:?}"
+    );
+    let conn = rusqlite::Connection::open(db.path()).unwrap();
+    // 绕过 Rust 层：塞一个同账户同账期的（伪造的）开放预留，再 REPLACE 一行属于它的宽限
+    conn.execute(
+        "INSERT INTO ledger_holds (hold_id, attempt_id, component, request_id, attempt_index, payer_account,
+                                   credential_id, unit, reserved_micros, period, created_at_ms, expires_at_ms,
+                                   grace_floor_micros, state)
+         SELECT 'r-9#0', 'r-9#0', 'model', 'r-9', 0, payer_account, credential_id, unit, reserved_micros, period,
+                created_at_ms, expires_at_ms, grace_floor_micros, 'open'
+           FROM ledger_holds WHERE hold_id = 'r-1#0'",
+        [],
+    )
+    .unwrap();
+    for verb in ["INSERT OR REPLACE", "REPLACE"] {
+        let result = conn.execute(
+            &format!(
+                "{verb} INTO ledger_grace_uses (account_id, period, hold_id, unit, reserve_micros, shortfall_micros,
+                                                floor_micros, used_at_ms)
+                 VALUES ('emp', '2026-11', 'r-9#0', 'THB', 210, 190, 20, 0)"
+            ),
+            [],
+        );
+        assert!(result.is_err(), "{verb} must be refused");
+    }
+    let holds: Vec<String> = {
+        let mut stmt = conn
+            .prepare("SELECT hold_id FROM ledger_grace_uses ORDER BY use_id")
+            .unwrap();
+        stmt.query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    };
+    assert_eq!(
+        holds,
+        ["r-1#0"],
+        "the recorded grace use is still the original one"
     );
 }

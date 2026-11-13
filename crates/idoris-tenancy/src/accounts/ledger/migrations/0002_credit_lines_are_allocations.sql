@@ -83,3 +83,21 @@ SELECT f.idempotency_key, f.pool_id, substr(f.idempotency_key, 9, length(f.idemp
            AND NOT EXISTS (SELECT 1 FROM ledger_subsidy_grants g WHERE g.idempotency_key = al.idempotency_key)
        ) f
  WHERE f.pool_id IS NOT NULL;
+
+-- # 宽限的部分唯一索引也要配 REPLACE 保护（和 S4 尝试记录的 `0002_no_replace.sql` 同一个缺口，PR #600 第二轮 S1 F5）
+--
+-- 0001 的 `ledger_grace_one_active_per_period (account_id, period) WHERE voided_at_ms IS NULL` 是部分唯一索引：
+-- 「每个付款账户每个账期至多一行没作废的宽限」。0001 给 `ledger_grace_uses` 配的「不许冲突」触发器只看 hold_id 和 use_id，
+-- 所以 `INSERT OR REPLACE` 一个新的（别的预留的）宽限，只会撞上这个索引，REPLACE 就把已经记下的那行宽限整行删掉
+-- （DELETE 触发器不触发）再插入新的，宽限记录被悄悄换掉。BEFORE 触发器先于冲突处理，所以这里对「会与已有的没作废宽限冲突」
+-- 的写入一律拒绝；报错文字沿用唯一约束的写法（`UNIQUE constraint failed: ...`），调用方和测试看到的还是一条唯一约束被违反。
+-- 新写入的宽限必须是没作废的（`ledger_grace_uses_insert_rules`），作废只能由没作废变成作废（`void_once`），
+-- 所以没有 UPDATE 能制造这种冲突，只需要补 INSERT 这一条。没有改动任何已有的行。
+CREATE TRIGGER IF NOT EXISTS ledger_grace_one_active_insert_no_conflict
+BEFORE INSERT ON ledger_grace_uses
+WHEN NEW.voided_at_ms IS NULL
+ AND EXISTS (SELECT 1 FROM ledger_grace_uses
+              WHERE account_id = NEW.account_id AND period = NEW.period AND voided_at_ms IS NULL)
+BEGIN
+    SELECT RAISE(ABORT, 'UNIQUE constraint failed: ledger_grace_uses.account_id, ledger_grace_uses.period (one active grace use per account per period)');
+END;
