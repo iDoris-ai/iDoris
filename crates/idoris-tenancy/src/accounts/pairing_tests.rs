@@ -656,6 +656,227 @@ fn the_number_of_active_devices_per_account_is_bounded() {
 }
 
 #[test]
+fn a_code_cannot_be_redeemed_once_the_issuers_key_verifier_is_revoked() {
+    // Codex r1 #2：`idoris key revoke <issuer>` 只撤销 virtual_keys 里的验证器，credentials 行仍是 active。
+    // 旧代码兑换时只读 credentials，持有码的人仍然能兑出新的 active 设备密钥，绕过撤销。
+    let (env, service) = setup();
+    let code = new_code("vk");
+    create_code(&env, &service.who(), &code, "m-kid1", T0);
+    assert!(env.keys.revoke(service.id(), T0 + 5).unwrap());
+    assert_eq!(
+        env.store
+            .get_credential(&cid(service.id()))
+            .unwrap()
+            .unwrap()
+            .status(),
+        CredentialStatus::Active,
+        "only the verifier was revoked"
+    );
+    assert_eq!(
+        redeem(&env, &code, "x", T0 + 10).err(),
+        Some(ControlReason::CredentialRevoked)
+    );
+    // 码没有被消耗，也没有设备凭证
+    let conn = env.raw();
+    let record = super::pairing::load_pairing_by_id(&conn, &code.pairing_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(record.status, PairingStatus::Pending);
+    let devices: i64 = conn
+        .query_row("SELECT count(*) FROM pairing_devices", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(devices, 0);
+    assert_eq!(env.last_audit().reason_code, "credential_revoked");
+}
+
+#[test]
+fn redemption_rechecks_the_issuers_current_data_plane_ceilings_and_expiry() {
+    // 兑换重新走一遍完整的认证：验证器的有效期、数据面上限（隐私等级、角色、租户）都按签发者此刻的样子再核一次
+    let (env, service) = setup();
+    for (label, update, expected) in [
+        (
+            "verifier narrowed to no roles",
+            "UPDATE virtual_keys SET allowed_roles = '[]' WHERE key_id = ?1",
+            ControlReason::CeilingExceedsGrantor,
+        ),
+        (
+            "verifier tenant changed",
+            "UPDATE virtual_keys SET tenant_id = 'tenant-other' WHERE key_id = ?1",
+            ControlReason::CeilingExceedsGrantor,
+        ),
+        (
+            "verifier expired",
+            "UPDATE virtual_keys SET expires_at_ms = 5 WHERE key_id = ?1",
+            ControlReason::CredentialExpired,
+        ),
+    ] {
+        let code = new_code("ceil2");
+        create_code(&env, &service.who(), &code, "m-kid2", T0);
+        env.raw().execute(update, [service.id()]).unwrap();
+        assert_eq!(
+            redeem(&env, &code, "x", T0 + 10).err(),
+            Some(expected),
+            "{label}"
+        );
+        // 还原，下一个用例从干净状态开始
+        env.raw()
+            .execute(
+                "UPDATE virtual_keys SET allowed_roles = '[\"fast\"]', tenant_id = 'tenant-edu', expires_at_ms = NULL WHERE key_id = ?1",
+                [service.id()],
+            )
+            .unwrap();
+        assert!(
+            redeem(&env, &code, "ok", T0 + 11).is_ok(),
+            "{label}: back to normal"
+        );
+    }
+}
+
+/// 兑换 `n` 个设备（每个带 `device_ttl_ms`），码各不相同。
+fn pair_devices(
+    env: &Env,
+    service: &Minted,
+    n: usize,
+    device_ttl_ms: Option<i64>,
+    now: i64,
+) -> Vec<Device> {
+    (0..n)
+        .map(|i| {
+            let base = new_code("slots");
+            let code = Code {
+                pairing_id: format!("{}-{i}", base.pairing_id),
+                ..base
+            };
+            let mut request = create_request(&code, "m-kid1", TTL);
+            request.device_ttl_ms = device_ttl_ms;
+            let rid = env.rid();
+            env.store
+                .control_create_pairing_code(&service.who(), &env.meta(now, &rid), &request)
+                .unwrap();
+            redeem(env, &code, "d", now + 1).unwrap()
+        })
+        .collect()
+}
+
+fn try_one_more(env: &Env, service: &Minted, now: i64) -> Result<Device, ControlReason> {
+    let code = new_code("more");
+    create_code(env, &service.who(), &code, "m-kid1", now);
+    redeem(env, &code, "one more", now + 1)
+}
+
+#[test]
+fn expired_devices_do_not_occupy_pairing_slots() {
+    // Codex r1 #9 / PR-Daemon S2 F2：旧代码只排除 revoked，累计配对 10 张短期设备凭证、全部过期之后仍是
+    // device_limit_reached；旧设备过期了又没法自己解绑，只能管理员逐张清理
+    let (env, service) = setup();
+    let limit = usize::try_from(MAX_ACTIVE_DEVICES_PER_MEMBERSHIP).unwrap();
+    let devices = pair_devices(&env, &service, limit, Some(3_600_000), T0);
+    assert_eq!(devices.len(), limit);
+    assert_eq!(
+        try_one_more(&env, &service, T0 + 10).err(),
+        Some(ControlReason::DeviceLimitReached),
+        "10 台都还有效"
+    );
+    // 一小时之后（设备寿命 1 小时）全部过期：名额自动空出来
+    let later = T0 + 2 * 3_600_000;
+    assert!(
+        try_one_more(&env, &service, later).is_ok(),
+        "expired devices free their slots"
+    );
+    for device in &devices {
+        assert_eq!(
+            gate(&env, device.id(), later),
+            GateVerdict::Denied(ReasonCode::CredentialExpired)
+        );
+    }
+}
+
+#[test]
+fn a_device_whose_key_verifier_was_revoked_or_that_was_unpaired_frees_its_slot_but_a_frozen_one_keeps_it()
+ {
+    let (env, service) = setup();
+    let limit = usize::try_from(MAX_ACTIVE_DEVICES_PER_MEMBERSHIP).unwrap();
+    let devices = pair_devices(&env, &service, limit, None, T0);
+    assert_eq!(
+        try_one_more(&env, &service, T0 + 10).err(),
+        Some(ControlReason::DeviceLimitReached)
+    );
+    // 冻结的设备解冻后还能用：它的名额保留，不然解冻就会超限
+    env.store
+        .set_credential_status(&cid(devices[0].id()), CredentialStatus::Frozen, ts(T0 + 20))
+        .unwrap();
+    assert_eq!(
+        try_one_more(&env, &service, T0 + 30).err(),
+        Some(ControlReason::DeviceLimitReached),
+        "a frozen device keeps its slot"
+    );
+    // 只撤销验证器（`idoris key revoke <设备>`）：这张设备凭证永远不可用了，名额空出来
+    assert!(env.keys.revoke(devices[1].id(), T0 + 40).unwrap());
+    assert!(try_one_more(&env, &service, T0 + 50).is_ok());
+    assert_eq!(
+        try_one_more(&env, &service, T0 + 60).err(),
+        Some(ControlReason::DeviceLimitReached),
+        "the freed slot is taken again"
+    );
+    // 解冻之后设备数仍不超限（它一直占着名额）
+    env.store
+        .set_credential_status(&cid(devices[0].id()), CredentialStatus::Active, ts(T0 + 70))
+        .unwrap();
+    assert_eq!(gate(&env, devices[0].id(), T0 + 71), GateVerdict::Allowed);
+    // 设备自己解绑：照旧空出名额
+    let rid = env.rid();
+    env.store
+        .control_unpair_device(&devices[2].who(), &env.meta(T0 + 80, &rid))
+        .unwrap();
+    assert!(try_one_more(&env, &service, T0 + 90).is_ok());
+}
+
+#[test]
+fn issuing_member_credentials_directly_cannot_get_around_the_device_cap() {
+    // PR-Daemon S2 低：上限只数配对出来的设备，直接给同一个成员关系签发成员凭证就绕过去了
+    let (env, service) = setup();
+    let limit = usize::try_from(MAX_ACTIVE_DEVICES_PER_MEMBERSHIP).unwrap();
+    let issue = |now: i64| {
+        let key = MintedVirtualKey::mint();
+        let rid = env.rid();
+        env.store
+            .control_issue_credential(
+                &service.who(),
+                &env.meta(now, &rid),
+                &Issue::member("m-kid1").request(&key),
+            )
+            .map(|w| w.value)
+    };
+    // 一半直接签发、一半配对：合起来才是这个成员关系的有效设备凭证
+    let half = limit / 2;
+    for i in 0..half {
+        issue(T0 + i64::try_from(i).unwrap()).unwrap();
+    }
+    pair_devices(&env, &service, limit - half, None, T0 + 100);
+    assert_eq!(
+        issue(T0 + 200).unwrap_err().reason,
+        ControlReason::DeviceLimitReached,
+        "direct issuance counts toward the same cap"
+    );
+    assert_eq!(
+        try_one_more(&env, &service, T0 + 210).err(),
+        Some(ControlReason::DeviceLimitReached)
+    );
+    // 别的成员关系不受影响
+    let key = MintedVirtualKey::mint();
+    let rid = env.rid();
+    assert!(
+        env.store
+            .control_issue_credential(
+                &service.who(),
+                &env.meta(T0 + 220, &rid),
+                &Issue::member("m-kid2").request(&key)
+            )
+            .is_ok()
+    );
+}
+
+#[test]
 fn losing_authority_before_redemption_voids_the_code() {
     // 「签发者过期」不在这里：码不能比签发者活得久（创建时就拒绝，见另一个测试），所以签发者过期的时候码早已过期。
     let cases: Vec<(&str, ControlReason)> = vec![

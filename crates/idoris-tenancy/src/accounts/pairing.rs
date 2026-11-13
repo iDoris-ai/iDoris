@@ -45,8 +45,8 @@ use subtle::ConstantTimeEq;
 
 use super::control::{
     Actor, AuditSpec, Caller, Ctx, Failure, Identity, Meta, NewKey, TargetKind, Who, Written,
-    authorize_op, check_ceilings, insert_issuance, insert_virtual_key, revoke_virtual_key,
-    slice_directory,
+    authorize_op, check_ceilings, insert_issuance, insert_virtual_key, load_key_by_id,
+    revoke_virtual_key, slice_directory,
 };
 use super::error::AccountStoreError;
 use super::rows::{load_ancestors, load_credential, load_membership, load_principal};
@@ -60,6 +60,9 @@ pub const MAX_PAIRING_TTL_MS: i64 = 15 * 60 * 1000;
 
 /// 同一个成员关系（云账号）最多同时有几台有效设备。设计稿没有给数；取 10：够一个人的电脑、笔记本、家里和办公室的
 /// 机器，又不至于让一个被盗的登录服务凭证无限制地给账号挂设备。
+///
+/// 「有效」见 [`occupied_device_slots`]：配对出来的设备和直接签发的成员凭证合起来数；已撤销、已过期、验证器已撤销
+/// 或过期的不占名额，冻结的占着（解冻之后还能用，不能因此超限）。
 pub const MAX_ACTIVE_DEVICES_PER_MEMBERSHIP: i64 = 10;
 
 /// 设备显示名的最大长度（字符）。
@@ -258,6 +261,32 @@ pub struct PairedDevice {
     pub credential: Credential,
     pub membership: MembershipId,
     pub pairing_id: String,
+}
+
+/// 这个成员关系此刻占着名额的设备凭证数：绑定到它的成员凭证（配对出来的设备，和直接签发的成员凭证）里，
+/// **还可能再被用上的**那些。
+///
+/// * 凭证已撤销、已过期（`now >= expires_at`），或者数据面验证器（`virtual_keys`）已撤销、已过期（比如运维用
+///   `idoris key revoke` 只撤销了验证器）：永远不可用了，不占名额——否则累计配对 10 张短期凭证、全部过期之后，
+///   账号就卡在 `device_limit_reached`，旧设备过期了又没法自己解绑，只能管理员逐张清理（Codex r1 #9）；
+/// * **冻结的占着名额**：冻结可以解冻，解冻之后它又能用，不能因为冻结期间空出过名额而让解冻之后超限；
+/// * 没有验证器行的凭证（存储层直接建的）按有效算，宁可多占不少占。
+pub(super) fn occupied_device_slots(
+    conn: &Connection,
+    membership: &MembershipId,
+    now: TimestampMs,
+) -> Result<i64, Failure> {
+    Ok(conn.query_row(
+        "SELECT count(*) FROM credentials c
+           LEFT JOIN virtual_keys k ON k.key_id = c.credential_id
+          WHERE c.binding_kind = 'member' AND c.membership_id = ?1
+            AND c.status IN ('active', 'frozen')
+            AND (c.expires_at_ms IS NULL OR c.expires_at_ms > ?2)
+            AND (k.key_id IS NULL
+                 OR (k.status = 'active' AND (k.expires_at_ms IS NULL OR k.expires_at_ms > ?2)))",
+        rusqlite::params![membership.as_str(), now.0],
+        |row| row.get(0),
+    )?)
 }
 
 /// 付款账户链上第一个不是 Active 的账户。
@@ -478,12 +507,29 @@ impl AccountStore {
             };
             spec.target_id = Some(row.pairing_id.clone());
             spec.related_id = Some(row.membership.to_string());
-            // 1. 签发者此刻还有资格
+            // 1. 签发者此刻还有资格：凭证行（撤销 / 冻结 / 过期），以及它在 `virtual_keys` 里的验证器
+            //    （`idoris key revoke` 只撤销验证器、不动凭证行；验证器的有效期、数据面上限也可能变）。
+            //    和数据面认证、控制面认证看的是同一份东西（`resolve_caller`），不能只看其中一半（Codex r1 #2）。
             let issuer = load_credential(conn, &row.issued_by)?
                 .ok_or_else(|| Failure::internal("the pairing code's issuer credential is missing"))?;
             issuer
                 .check_usable_at(meta.now)
                 .map_err(|error| Failure::new(ControlReason::from(&error)))?;
+            let Some(issuer_key) = load_key_by_id(conn, row.issued_by.as_str())? else {
+                // 没有验证器 = 这张凭证已经认证不了任何请求：和已撤销同一个答案
+                return Err(Failure::new(ControlReason::CredentialRevoked));
+            };
+            if !issuer_key.active {
+                return Err(Failure::new(ControlReason::CredentialRevoked));
+            }
+            if issuer_key
+                .ceilings
+                .expires_at_ms
+                .is_some_and(|expires| expires <= meta.now.0)
+            {
+                return Err(Failure::new(ControlReason::CredentialExpired));
+            }
+
             // 2. 成员关系、主体、账户仍有效
             let found = load_membership(conn, &row.membership)?
                 .ok_or_else(|| Failure::internal("the pairing code's membership is missing"))?;
@@ -502,15 +548,17 @@ impl AccountStore {
                 None,
             )
             .map_err(Failure::new)?;
-            // 4. 设备数没满
-            let active_devices: i64 = conn.query_row(
-                "SELECT count(*) FROM pairing_devices d \
-                   JOIN credentials c ON c.credential_id = d.credential_id \
-                  WHERE d.membership_id = ?1 AND c.status <> 'revoked'",
-                [row.membership.as_str()],
-                |r| r.get(0),
+            // 码上记的设备数据面上限（创建时已经按签发者校验过）不能超过签发者**此刻**验证器上的上限
+            check_ceilings(
+                &issuer_key.ceilings,
+                &row.device_privacy,
+                &row.device_roles,
+                &row.device_tenant_id,
             )?;
-            if active_devices >= MAX_ACTIVE_DEVICES_PER_MEMBERSHIP {
+            // 4. 设备数没满（已撤销、已过期、验证器已撤销的不占名额，冻结的占着；见 `occupied_device_slots`）
+            if occupied_device_slots(conn, &row.membership, meta.now)?
+                >= MAX_ACTIVE_DEVICES_PER_MEMBERSHIP
+            {
                 return Err(Failure::new(ControlReason::DeviceLimitReached));
             }
             // 5. 设备凭证：Member 绑定、没有管理权限；有效期 = min(设备寿命, 签发者有效期)

@@ -1787,14 +1787,15 @@ fn principal_revocation_cannot_reach_into_other_organizations_or_squatted_ids() 
         .run(&env, &other.who(), T0 + 1),
         Err(ControlReason::OutOfScope)
     );
-    // 别的组织也「登记」同一个 id：只是返回已有的那一个，登记人仍然是 eduai
+    // 别的组织也「登记」同一个 id：拿不到那个主体（也看不到它的状态），只有固定的「已存在」，登记人仍然是 eduai
+    // （PR-Daemon S2 F3：旧代码这里返回 Replayed，原样把别的组织的主体交给了调用者）
     assert_eq!(
         Action::CreatePrincipal {
             principal: "fresh",
             org: "school-b"
         }
         .run(&env, &other.who(), T0 + 2),
-        Ok(WriteResult::Replayed)
+        Err(ControlReason::AlreadyExists)
     );
     assert_eq!(
         Action::RevokePrincipal {
@@ -1892,6 +1893,267 @@ fn principal_revocation_cannot_reach_into_other_organizations_or_squatted_ids() 
         }
         .run(&env, &edu.who(), T0 + 11),
         Err(ControlReason::OutOfScope)
+    );
+}
+
+/// 一个组织里登记的主体 `victim`（还没有成员关系）；返回两个组织各自的管理凭证。
+fn principal_world(env: &Env) -> (Minted, Minted) {
+    env.tree();
+    let edu = env.issue_as_operator(Issue::service("eduai", all_ops("eduai", 1)));
+    let other = env.issue_as_operator(Issue::service("school-b", all_ops("school-b", 1)));
+    assert_eq!(
+        Action::CreatePrincipal {
+            principal: "victim",
+            org: "eduai"
+        }
+        .run(env, &edu.who(), T0 + 1),
+        Ok(WriteResult::Created)
+    );
+    (edu, other)
+}
+
+fn admin_membership(id: &str, principal: &str, org: &str) -> Membership {
+    Membership {
+        id: mid(id),
+        principal: pid(principal),
+        org: aid(org),
+        role: MembershipRole::Admin,
+        account: None,
+        status: MembershipStatus::Active,
+    }
+}
+
+#[test]
+fn another_organization_cannot_attach_itself_to_a_principal_it_did_not_register() {
+    // Codex r1 #1 / PR-Daemon S2 F3：eduai 登记了主体 `victim`（还没有成员关系）。school-b 的管理员给它加一个属于
+    // school-b 的 admin 成员关系——旧代码只检查目标账户的权限（school-b 自己的），放行；之后撤销时有了成员关系，
+    // 就不再看登记它的组织，school-b 一个人就把 eduai 的主体永久撤销了。
+    let env = Env::new();
+    let (edu, other) = principal_world(&env);
+    let rid = env.rid();
+    let attach = env.store.control_create_membership(
+        &other.who(),
+        &env.meta(T0 + 2, &rid),
+        &CreateMembership {
+            membership: admin_membership("m-evil", "victim", "school-b"),
+        },
+    );
+    assert_eq!(
+        failure_reason(attach),
+        ControlReason::OutOfScope,
+        "跨组织关联已有主体需要对登记它的组织有授权"
+    );
+    assert_eq!(env.last_audit().outcome, "denied");
+    assert!(env.store.get_membership(&mid("m-evil")).unwrap().is_none());
+    // 登记它的组织自己（或它子树里的组织）仍然可以建
+    let rid = env.rid();
+    assert_eq!(
+        env.store
+            .control_create_membership(
+                &edu.who(),
+                &env.meta(T0 + 3, &rid),
+                &CreateMembership {
+                    membership: admin_membership("m-edu-admin", "victim", "eduai")
+                },
+            )
+            .unwrap()
+            .result,
+        WriteResult::Created
+    );
+    // 对登记它的组织有授权的调用者（这里是本机运维）可以把主体关联到别的组织
+    let rid = env.rid();
+    assert_eq!(
+        env.store
+            .control_create_membership(
+                &Env::operator(),
+                &env.meta(T0 + 4, &rid),
+                &CreateMembership {
+                    membership: admin_membership("m-b-admin", "victim", "school-b")
+                },
+            )
+            .unwrap()
+            .result,
+        WriteResult::Created
+    );
+}
+
+#[test]
+fn revoking_a_principal_always_needs_authority_over_the_organization_that_registered_it() {
+    // 就算一个别的组织的成员关系已经挂在主体上（比如运维建的、或旧数据），也不能靠它绕开登记组织的授权：
+    // 有成员关系的主体，撤销时登记它的组织照样要检查（旧代码只在「没有任何成员关系」时才看登记组织）
+    let env = Env::new();
+    let (edu, other) = principal_world(&env);
+    let rid = env.rid();
+    env.store
+        .control_create_membership(
+            &Env::operator(),
+            &env.meta(T0 + 2, &rid),
+            &CreateMembership {
+                membership: admin_membership("m-b-admin", "victim", "school-b"),
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        Action::RevokePrincipal {
+            principal: "victim",
+            org: "school-b"
+        }
+        .run(&env, &other.who(), T0 + 3),
+        Err(ControlReason::OutOfScope)
+    );
+    assert_eq!(
+        env.store
+            .get_principal(&pid("victim"))
+            .unwrap()
+            .unwrap()
+            .status,
+        idoris_compute_contracts::account::PrincipalStatus::Active
+    );
+    // 登记组织的凭证也不能越过别人的成员关系（一个组织不能撤销别的组织也在用的主体）
+    assert_eq!(
+        Action::RevokePrincipal {
+            principal: "victim",
+            org: "eduai"
+        }
+        .run(&env, &edu.who(), T0 + 4),
+        Err(ControlReason::OutOfScope)
+    );
+    // 本机运维不受授权约束
+    assert_eq!(
+        Action::RevokePrincipal {
+            principal: "victim",
+            org: "eduai"
+        }
+        .run(&env, &Env::operator(), T0 + 5),
+        Ok(WriteResult::Updated)
+    );
+}
+
+#[test]
+fn registering_an_existing_principal_never_discloses_another_organizations_principal_or_its_status()
+{
+    // PR-Daemon S2 F3 补充：重复登记一个别的组织登记的主体，旧代码原样返回它（带着状态）
+    let env = Env::new();
+    let (edu, other) = principal_world(&env);
+    let create = |who: &Who<'_>, org: &'static str, now: i64| {
+        Action::CreatePrincipal {
+            principal: "victim",
+            org,
+        }
+        .run(&env, who, now)
+    };
+    // 登记它的组织重发：照旧是 replayed
+    assert_eq!(
+        create(&edu.who(), "eduai", T0 + 2),
+        Ok(WriteResult::Replayed)
+    );
+    // 别的组织：什么都不返回，只有固定的「已存在」，不带状态
+    assert_eq!(
+        create(&other.who(), "school-b", T0 + 3),
+        Err(ControlReason::AlreadyExists)
+    );
+    // 主体被撤销之后，别的组织得到的答案一模一样（看不出状态）
+    assert_eq!(
+        Action::RevokePrincipal {
+            principal: "victim",
+            org: "eduai"
+        }
+        .run(&env, &edu.who(), T0 + 4),
+        Ok(WriteResult::Updated)
+    );
+    assert_eq!(
+        create(&other.who(), "school-b", T0 + 5),
+        Err(ControlReason::AlreadyExists)
+    );
+    let rid = env.rid();
+    let failure = env
+        .store
+        .control_create_principal(
+            &other.who(),
+            &env.meta(T0 + 6, &rid),
+            &CreatePrincipal {
+                principal: pid("victim"),
+                org: aid("school-b"),
+            },
+        )
+        .unwrap_err();
+    assert!(
+        failure.detail.is_empty(),
+        "no detail that could reveal the principal: {failure:?}"
+    );
+    // 对登记组织有授权的调用者（eduai 对它子树里的 teacher 登记的主体）看得到
+    assert_eq!(
+        Action::CreatePrincipal {
+            principal: "by-teacher",
+            org: "teacher"
+        }
+        .run(&env, &edu.who(), T0 + 7),
+        Ok(WriteResult::Created)
+    );
+    assert_eq!(
+        Action::CreatePrincipal {
+            principal: "by-teacher",
+            org: "eduai"
+        }
+        .run(&env, &edu.who(), T0 + 8),
+        Ok(WriteResult::Replayed)
+    );
+    // 没有登记人的老主体（存储层直接建的）：HTTP 调用者拿不到它
+    env.store.ensure_principal(&pid("legacy"), ts(T0)).unwrap();
+    assert_eq!(
+        Action::CreatePrincipal {
+            principal: "legacy",
+            org: "eduai"
+        }
+        .run(&env, &edu.who(), T0 + 9),
+        Err(ControlReason::AlreadyExists)
+    );
+    assert_eq!(
+        Action::CreatePrincipal {
+            principal: "legacy",
+            org: "eduai"
+        }
+        .run(&env, &Env::operator(), T0 + 9),
+        Ok(WriteResult::Replayed)
+    );
+}
+
+#[test]
+fn an_unauthenticated_write_does_not_take_the_database_write_lock() {
+    // PR-Daemon S2 低：认不出的密钥在鉴权之前就 `BEGIN IMMEDIATE` 拿了账本库的写锁，公网上的垃圾请求能和真实流量
+    // 抢锁。现在先在只读事务里认人，认不出就直接返回，不碰写锁。另开一条连接握着写锁，短 busy_timeout：
+    // 旧代码这里等不到锁，返回 store_busy；现在认不出的密钥是 unauthenticated，认得出的才需要写锁。
+    let env = Env::new();
+    env.tree();
+    let admin = env.issue_as_operator(Issue::service("eduai", all_ops("eduai", 1)));
+    let store =
+        AccountStore::open_with_busy_timeout(&env.path, std::time::Duration::from_millis(50))
+            .unwrap();
+    let holder = env.raw();
+    holder.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let unknown = MintedVirtualKey::mint();
+    let rid = env.rid();
+    let meta = env.meta(T0 + 1, &rid);
+    let request = CreatePrincipal {
+        principal: pid("someone"),
+        org: aid("eduai"),
+    };
+    let failure = store
+        .control_create_principal(&Who::Secret(&unknown.hash), &meta, &request)
+        .unwrap_err();
+    assert_eq!(failure.reason, ControlReason::Unauthenticated);
+    // 对照：认得出的调用者要写，写锁被别人握着，就是 store_busy
+    let failure = store
+        .control_create_principal(&admin.who(), &meta, &request)
+        .unwrap_err();
+    assert_eq!(failure.reason, ControlReason::StoreBusy);
+    holder.execute_batch("ROLLBACK").unwrap();
+    assert_eq!(
+        store
+            .control_create_principal(&admin.who(), &meta, &request)
+            .unwrap()
+            .result,
+        WriteResult::Created
     );
 }
 

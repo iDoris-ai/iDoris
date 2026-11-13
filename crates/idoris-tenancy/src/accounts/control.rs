@@ -53,7 +53,9 @@ use rusqlite::{Connection, OptionalExtension};
 
 use super::error::AccountStoreError;
 use super::ledger::{self, LedgerError};
-use super::pairing::{PairingRow, resolve_pairing_caller};
+use super::pairing::{
+    MAX_ACTIVE_DEVICES_PER_MEMBERSHIP, PairingRow, occupied_device_slots, resolve_pairing_caller,
+};
 use super::rows::{
     AllocationRecord, load_account, load_allocation_record, load_ancestors, load_credential,
     load_membership, load_memberships_of, load_platform_roots, load_principal, merge_chains,
@@ -426,6 +428,18 @@ impl AccountStore {
         mut spec: AuditSpec,
         body: impl FnOnce(&Connection, &Caller, &mut AuditSpec) -> Result<Written<T>, Failure>,
     ) -> Result<Written<T>, Failure> {
+        // 先在只读事务里认人：认不出是哪张凭证（未知密钥、格式不对、查无此码）的请求直接返回，**不碰写锁**。
+        // 这个库同时是账本，公网上的垃圾请求不能靠「先 BEGIN IMMEDIATE 再认人」和真实流量抢写锁。
+        // 这只是挡在前面的一道快速拒绝：认出来的调用者在下面的写事务里**重新**认一遍，撤销依然没有缝。
+        {
+            let mut conn = self.lock();
+            let tx = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)
+                .map_err(Failure::from)?;
+            if let Err((None, failure)) = resolve_caller(&tx, who, meta.now) {
+                return Err(failure);
+            }
+        }
         let mut conn = self.lock();
         let mut tx = conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
@@ -568,6 +582,14 @@ pub(super) fn load_key_by_hash(
     hash: &VirtualKeyHash,
 ) -> Result<Option<KeyRow>, AccountStoreError> {
     load_key(conn, "key_hash", &hash.as_bytes()[..])
+}
+
+/// 按凭证 id（= `virtual_keys.key_id`）取验证器那一行。配对码兑换时要重新验证签发者的验证器用它。
+pub(super) fn load_key_by_id(
+    conn: &Connection,
+    key_id: &str,
+) -> Result<Option<KeyRow>, AccountStoreError> {
+    load_key(conn, "key_id", key_id)
 }
 
 fn load_key(
@@ -758,6 +780,25 @@ pub(super) fn authorize_op(
 // 主体
 // ================================================================================================
 
+/// 最早登记这个主体的组织（没有登记记录——存储层直接建的老主体——是 `None`）。
+pub(super) fn registrant_of(
+    conn: &Connection,
+    principal: &PrincipalId,
+) -> Result<Option<AccountId>, Failure> {
+    let registrant: Option<String> = conn
+        .query_row(
+            "SELECT org_id FROM principal_registrations WHERE principal_id = ?1",
+            [principal.as_str()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    registrant
+        .map(|org| {
+            AccountId::new(org).map_err(|error| Failure::from(AccountStoreError::from(error)))
+        })
+        .transpose()
+}
+
 /// 登记主体。`org` 是以谁的名义登记（授权的资源范围）；同时记下最早登记它的组织。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreatePrincipal {
@@ -791,21 +832,42 @@ impl AccountStore {
                 &request.org,
                 None,
             )?;
-            let existed = load_principal(conn, &request.principal)?.is_some();
-            let principal = ensure_principal_in(conn, &request.principal, meta.now)?;
-            if !existed {
-                conn.execute(
-                    "INSERT INTO principal_registrations (principal_id, org_id, registered_at_ms) \
-                     VALUES (?1, ?2, ?3)",
-                    rusqlite::params![request.principal.as_str(), request.org.as_str(), meta.now.0],
-                )?;
+            if let Some(existing) = load_principal(conn, &request.principal)? {
+                // 已经有这个主体了。主体 id 是全局的假名，只有登记它的组织（或对登记组织有授权的调用者）能看到它——
+                // 别的组织重复登记同一个 id，得到的是固定的「已存在」，**不带**主体、状态或登记人：
+                // 不能靠重复登记去探测别的组织的主体有没有被撤销（PR-Daemon S2 F3）。
+                // 没有登记记录的老主体（存储层直接建的）只有本机运维能「再次登记」。
+                let visible = match registrant_of(conn, &request.principal)? {
+                    Some(registrant) => {
+                        registrant == request.org
+                            || authorize_op(
+                                conn,
+                                caller,
+                                meta.now,
+                                ControlOp::CreatePrincipal,
+                                &registrant,
+                                None,
+                            )
+                            .is_ok()
+                    }
+                    None => caller.is_operator(),
+                };
+                if !visible {
+                    return Err(Failure::new(ControlReason::AlreadyExists));
+                }
+                return Ok(Written {
+                    result: WriteResult::Replayed,
+                    value: existing,
+                });
             }
+            let principal = ensure_principal_in(conn, &request.principal, meta.now)?;
+            conn.execute(
+                "INSERT INTO principal_registrations (principal_id, org_id, registered_at_ms) \
+                 VALUES (?1, ?2, ?3)",
+                rusqlite::params![request.principal.as_str(), request.org.as_str(), meta.now.0],
+            )?;
             Ok(Written {
-                result: if existed {
-                    WriteResult::Replayed
-                } else {
-                    WriteResult::Created
-                },
+                result: WriteResult::Created,
                 value: principal,
             })
         })
@@ -813,8 +875,10 @@ impl AccountStore {
 
     /// 撤销主体（同意撤回，设计稿 §7：撤销后相关凭证和成员立即失效）。
     ///
-    /// 范围规则：调用者必须对**该主体每一个成员关系所在的账户**都有 `revoke_principal` 权限（一个组织不能撤销
-    /// 别的组织也在用的主体）；主体还没有任何成员关系时，只有最早登记它的组织能撤销。
+    /// 范围规则：调用者必须对**登记它的组织**和**该主体每一个成员关系所在的账户**都有 `revoke_principal` 权限
+    /// （一个组织不能撤销别的组织也在用的主体）。登记组织**永远**要检查，不管主体现在有没有成员关系：
+    /// 别的组织（或旧数据）给主体加一个自己的成员关系，不能靠它绕开登记组织的授权（Codex r1 #1）。
+    /// 没有登记记录的老主体（存储层直接建的）：没有成员关系时只有本机运维能撤销，有成员关系时看成员关系。
     pub fn control_revoke_principal(
         &self,
         who: &Who<'_>,
@@ -838,31 +902,23 @@ impl AccountStore {
                 return Err(out_of_scope());
             };
             let memberships = load_memberships_of(conn, &principal.id)?;
-            if memberships.is_empty() {
-                let registrant: Option<String> = conn
-                    .query_row(
-                        "SELECT org_id FROM principal_registrations WHERE principal_id = ?1",
-                        [principal.id.as_str()],
-                        |row| row.get(0),
-                    )
-                    .optional()?;
-                match registrant {
-                    Some(registrant) => {
-                        let registrant =
-                            AccountId::new(registrant).map_err(AccountStoreError::from)?;
-                        authorize_op(
-                            conn,
-                            caller,
-                            meta.now,
-                            ControlOp::RevokePrincipal,
-                            &registrant,
-                            None,
-                        )?;
-                    }
-                    // 没人登记过、也没有任何成员关系：不是任何组织的主体，只有本机运维能动它。
-                    None if caller.is_operator() => {}
-                    None => return Err(out_of_scope()),
+            match registrant_of(conn, &principal.id)? {
+                // 登记它的组织永远要检查（见上面的范围规则）
+                Some(registrant) => {
+                    authorize_op(
+                        conn,
+                        caller,
+                        meta.now,
+                        ControlOp::RevokePrincipal,
+                        &registrant,
+                        None,
+                    )?;
                 }
+                // 没人登记过、也没有任何成员关系：不是任何组织的主体，只有本机运维能动它。
+                None if memberships.is_empty() && !caller.is_operator() => {
+                    return Err(out_of_scope());
+                }
+                None => {}
             }
             for membership in &memberships {
                 let target = membership_target(membership);
@@ -1114,6 +1170,25 @@ impl AccountStore {
                     ));
                 }
                 Some(_) => {}
+            }
+            // 把已经登记的主体关联到别的组织需要明确的授权：登记它的组织要么就是这个成员关系所属组织的祖先（或它自己），
+            // 要么调用者对登记组织有 `revoke_principal` 权限（谁能让主体的足迹扩大，谁就该能把它整体撤销）。
+            // 否则任何组织猜到一个主体 id 就能挂一个成员关系上去，既能越过登记组织的撤销检查，又会让登记组织
+            // 再也撤销不了它（Codex r1 #1 / PR-Daemon S2 F3）。没有登记记录的老主体不受这条限制。
+            if let Some(registrant) = registrant_of(conn, &membership.principal)? {
+                let inside = load_ancestors(conn, &membership.org)?
+                    .iter()
+                    .any(|account| account.id == registrant);
+                if !inside {
+                    authorize_op(
+                        conn,
+                        caller,
+                        meta.now,
+                        ControlOp::RevokePrincipal,
+                        &registrant,
+                        None,
+                    )?;
+                }
             }
             create_membership_in(conn, membership, meta.now)
                 .map_err(|error| Failure::from_store(error, Ctx::Membership))?;
@@ -1392,6 +1467,13 @@ impl AccountStore {
                     ControlReason::InvalidCredential,
                     "the new credential would already be expired",
                 ));
+            }
+            // 成员凭证和配对出来的设备共用同一个名额上限：直接给同一个成员关系签发成员凭证不能绕过它
+            if let CredentialBinding::Member { membership } = &request.binding
+                && occupied_device_slots(conn, membership, meta.now)?
+                    >= MAX_ACTIVE_DEVICES_PER_MEMBERSHIP
+            {
+                return Err(Failure::new(ControlReason::DeviceLimitReached));
             }
             insert_virtual_key(
                 conn,
