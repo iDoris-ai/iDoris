@@ -225,13 +225,17 @@ impl RunState {
                 Ok(valid)
             }
         });
+        // 两处都是同步的 SQLite 写：另一个连接持有写事务时会在 busy 等待里阻塞，所以和这个文件里别的库操作一样走
+        // `blocking`，不直接占住 tokio worker 线程（R3 Medium-2）
         match stored {
             Err(_) => {
-                if let Err(error) = self.store.note_supplier_id_invalid(&id) {
+                if let Err(error) = blocking(|| self.store.note_supplier_id_invalid(&id)) {
                     eprintln!("[idoris] cloud: could not annotate supplier id: {error}");
                 }
             }
-            Ok(supplier_id) => match self.store.record_supplier_request_id(&id, &supplier_id) {
+            Ok(supplier_id) => match blocking(|| {
+                self.store.record_supplier_request_id(&id, &supplier_id)
+            }) {
                 Ok(SupplierIdOutcome::Recorded | SupplierIdOutcome::DuplicateOf(_)) => {
                     if let Err(error) = self.request.record_supplier_request_id(idx, supplier_id) {
                         eprintln!("[idoris] cloud: supplier id mirror failed: {error}");
@@ -469,6 +473,14 @@ mod tests {
 
     /// 一个已经发出请求（`maybe_executed`，可以发布）的运行状态。
     fn running(classes: &[DataClass]) -> (RunState, AttemptIndex, Arc<AttemptStore>, RequestId) {
+        running_on(Arc::new(AttemptStore::open_in_memory().unwrap()), classes)
+    }
+
+    /// 同 [`running`]，库由调用方给（比如落在文件上的库，另一个连接可以去占它的写锁）。
+    fn running_on(
+        store: Arc<AttemptStore>,
+        classes: &[DataClass],
+    ) -> (RunState, AttemptIndex, Arc<AttemptStore>, RequestId) {
         let payment = payment_context();
         let endpoint =
             EndpointKey::new("example-zdr", "example-org/chat-70b", "openai-compat").unwrap();
@@ -490,7 +502,6 @@ mod tests {
             cost_rates: RateCard::new(cost(260_000), cost(380_000), None).unwrap(),
             price_rates: RateCard::new(price(10_000_000), price(40_000_000), None).unwrap(),
         };
-        let store = Arc::new(AttemptStore::open_in_memory().unwrap());
         let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(TimestampMs(1)));
         let id = RequestId::new("req-guard-1").unwrap();
         let data_classes: BTreeSet<DataClass> = classes.iter().copied().collect();
@@ -543,6 +554,73 @@ mod tests {
         for classes in [vec![DataClass::Adult], vec![DataClass::Public]] {
             let (mut run, idx, _store, _id) = running(&classes);
             run.publish(idx).unwrap();
+        }
+    }
+
+    /// R3 Medium-2：供应商请求号的落盘（`record_supplier_id` 里的两处同步写：合法的请求号 / 格式不对只留标注）也走
+    /// `blocking`。另一个连接持有写事务时，这两处写在 SQLite 的 busy 等待里阻塞；直接在 worker 线程上写，运行时就被一起
+    /// 占死（健康检查、网络读写、取消计时、别的请求都排不上）。只有一个 worker 线程的多线程运行时里，旁边的心跳任务
+    /// 在这段阻塞期间必须照常跑。
+    #[test]
+    fn recording_the_supplier_request_id_does_not_starve_the_runtime_while_the_ledger_is_busy() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        // 合法的请求号走 `record_supplier_request_id`；带空格的格式不对，走 `note_supplier_id_invalid`
+        for supplier_id in ["chatcmpl-busy-1", "has a space"] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("attempts.sqlite3");
+            let store = Arc::new(AttemptStore::open(&path).unwrap());
+            let (mut run, idx, _store, _id) = running_on(store, &[DataClass::Adult]);
+
+            // 另一个连接占着写事务 500 ms
+            let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+            let holder = {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    let conn = rusqlite::Connection::open(&path).unwrap();
+                    conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+                    locked_tx.send(()).unwrap();
+                    std::thread::sleep(Duration::from_millis(500));
+                    conn.execute_batch("COMMIT").unwrap();
+                })
+            };
+            locked_rx.recv().unwrap();
+
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_time()
+                .build()
+                .unwrap();
+            let beats = Arc::new(AtomicUsize::new(0));
+            let during = runtime.block_on(async {
+                let heartbeat = {
+                    let beats = Arc::clone(&beats);
+                    tokio::spawn(async move {
+                        loop {
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                            beats.fetch_add(1, Ordering::SeqCst);
+                        }
+                    })
+                };
+                tokio::time::sleep(Duration::from_millis(60)).await;
+                let before = beats.load(Ordering::SeqCst);
+                // 写跑在运行时的 worker 线程上（spawn），不是测试自己的线程上
+                tokio::spawn(async move {
+                    run.record_supplier_id(idx, Some(supplier_id), None);
+                    run
+                })
+                .await
+                .unwrap();
+                let during = beats.load(Ordering::SeqCst) - before;
+                heartbeat.abort();
+                during
+            });
+            holder.join().unwrap();
+            assert!(
+                during >= 10,
+                "{supplier_id:?}: the other tasks kept running while the ledger write waited: {during} beats"
+            );
         }
     }
 }
