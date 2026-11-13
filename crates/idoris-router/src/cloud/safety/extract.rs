@@ -302,8 +302,12 @@ fn decode_nested_json(text: &str, out: &mut Vec<String>, depth: usize) -> Result
     }
     let parsed = match serde_json::from_str::<Value>(text) {
         Ok(parsed) => parsed,
-        // 嵌套深到 serde_json 自己都不肯解析（超过 128 层）：我们看不到里面的东西，客户端 / 模型未必也看不到，失败即关闭
-        Err(error) if error.to_string().contains("recursion limit exceeded") => {
+        // 嵌套深到 serde_json 自己都不肯解析（超过 128 层）：我们看不到里面的东西，客户端 / 模型未必也看不到，失败即关闭。
+        // 只对「看起来是完整的 JSON」（以 `}` 或 `]` 结尾）这样处理：孩子敲了一长串没有闭合的 `[[[[[` 只是普通文本
+        Err(error)
+            if text.trim_end().ends_with(['}', ']'])
+                && error.to_string().contains("recursion limit exceeded") =>
+        {
             return Err(ExtractError::Malformed);
         }
         // 只是恰好以 `{` / `[` 开头的普通文本
@@ -1138,6 +1142,14 @@ mod tests {
                 &body(
                     json!({"messages": [{"role": "user", "content": "[1] first, [2] second {x"}]})
                 ),
+                1 << 20
+            )
+            .is_ok()
+        );
+        // 没有闭合的一长串括号（孩子敲着玩）也只是普通文本
+        assert!(
+            extract_input(
+                &body(json!({"messages": [{"role": "user", "content": "[".repeat(300)}]})),
                 1 << 20
             )
             .is_ok()

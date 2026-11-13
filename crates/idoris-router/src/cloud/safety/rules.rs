@@ -679,9 +679,9 @@ enum Matcher {
 #[derive(Clone, Copy)]
 enum CueSet {
     /// 输入侧：否定词（「ห้าม……」）或话题词（「ทำไม……」「ปลอดภัย」）：孩子在问为什么不能、怎样才安全，不是在索要方法。
-    Warning,
+    NegationOrTopical,
     /// 输出侧：否定词或明确的拒绝语：模型在拒绝或在讲「不要这样做」，不是在给步骤。话题词不算。
-    RefusalOrWarning,
+    NegationOrRefusal,
 }
 
 /// 一条规则里最多逐个判断多少处命中；再多的话不逐个判断，规则直接成立（没有正常的文本会有这么多处被否定的有害命中）。
@@ -803,8 +803,8 @@ struct Cues<'a> {
 impl Cues<'_> {
     fn of(&self, set: CueSet) -> &[Needle] {
         match set {
-            CueSet::Warning => self.input,
-            CueSet::RefusalOrWarning => self.output,
+            CueSet::NegationOrTopical => self.input,
+            CueSet::NegationOrRefusal => self.output,
         }
     }
 }
@@ -857,7 +857,7 @@ fn build_rules() -> Vec<Rule> {
                 a: needles(IGNITE_A),
                 b: needles(IGNITE_B),
                 gap: 20,
-                unless: CueSet::Warning,
+                unless: CueSet::NegationOrTopical,
             },
             exempt_when_protective: false,
         },
@@ -869,7 +869,7 @@ fn build_rules() -> Vec<Rule> {
                 a: needles(HAZARD_MIX_A),
                 b: needles(HAZARD_MIX_B),
                 gap: 20,
-                unless: CueSet::Warning,
+                unless: CueSet::NegationOrTopical,
             },
             exempt_when_protective: false,
         },
@@ -977,7 +977,7 @@ fn build_rules() -> Vec<Rule> {
                 a: needles(OUTPUT_SELF_HARM_STEP_A),
                 b: needles(OUTPUT_SELF_HARM_STEP_B),
                 gap: 80,
-                unless: CueSet::RefusalOrWarning,
+                unless: CueSet::NegationOrRefusal,
             },
             exempt_when_protective: false,
         },
@@ -989,7 +989,7 @@ fn build_rules() -> Vec<Rule> {
                 a: needles(OUTPUT_DANGER_STEP_A),
                 b: needles(OUTPUT_DANGER_STEP_B),
                 gap: 80,
-                unless: CueSet::RefusalOrWarning,
+                unless: CueSet::NegationOrRefusal,
             },
             exempt_when_protective: false,
         },
@@ -1011,7 +1011,7 @@ fn build_rules() -> Vec<Rule> {
             id: "output.adult_mention",
             category: AdultContent,
             applies: MODEL_ONLY,
-            matcher: Matcher::AnyUnless(needles(OUTPUT_ADULT_MENTION), CueSet::RefusalOrWarning),
+            matcher: Matcher::AnyUnless(needles(OUTPUT_ADULT_MENTION), CueSet::NegationOrRefusal),
             exempt_when_protective: false,
         },
         Rule {

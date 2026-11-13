@@ -35,6 +35,17 @@ fn ok(id: &str) -> Behavior {
     Behavior::json(200, completion(id, "ok", Some(usage(12, 30))))
 }
 
+/// 回答的**正文**就是标记：谁作答要靠正文认，不靠响应 `id`。edu 的响应是重建的（r3 Medium#1：响应 `id` 由服务端写，
+/// 不再是上游的 `id`，因为上游能把孩子写的东西回显成合法的「短标识」），正文是会被检查的文本，原样到达客户端。
+fn marked(marker: &str) -> Behavior {
+    Behavior::json(200, completion(marker, marker, Some(usage(12, 30))))
+}
+
+/// 响应正文里的回答。
+fn answer_text(reply: &harness::Reply) -> Value {
+    reply.json()["choices"][0]["message"]["content"].clone()
+}
+
 /// 今天的现实（S8）：没有任何端点同时满足「ZDR + 已签 DPA + 允许 child_edu」。
 /// 成人端点留存有例外、DPA 未签；调研过但没核实出结论的端点按最坏值写（允许的类别为空）。
 fn todays_reality(a: &FakeUpstream, b: &FakeUpstream, c: &FakeUpstream) -> Vec<Endpoint> {
@@ -132,7 +143,7 @@ async fn child_edu_streaming_is_refused_before_any_upstream_or_admission() {
 async fn child_edu_only_ever_reaches_a_zdr_signed_dpa_endpoint_even_when_listed_last() {
     let a = FakeUpstream::start(vec![ok("never")]).await;
     let b = FakeUpstream::start(vec![ok("never")]).await;
-    let z = FakeUpstream::start(vec![ok("from-zdr")]).await;
+    let z = FakeUpstream::start(vec![marked("from-zdr")]).await;
     let admission = RecordingAdmission::new();
     let h = build(
         vec![
@@ -155,7 +166,9 @@ async fn child_edu_only_ever_reaches_a_zdr_signed_dpa_endpoint_even_when_listed_
     );
     let reply = post(&h.app, &simple_body(100)).await;
     assert_eq!(reply.status, 200);
-    assert_eq!(reply.json()["id"], "from-zdr");
+    // 旧的断言是 `reply.json()["id"] == "from-zdr"`：edu 的响应 id 现在是服务端写的请求号，作答者由正文认
+    assert_eq!(answer_text(&reply), "from-zdr");
+    assert_eq!(reply.json()["id"], reply.request_id().as_str());
     assert_eq!((a.connection_count(), b.connection_count()), (0, 0));
     assert_eq!(z.request_count(), 1);
     assert_eq!(admission.providers(), vec!["example-zdr"]);
@@ -259,7 +272,7 @@ async fn each_hard_constraint_excludes_an_endpoint_on_its_own() {
     ];
     for case in cases {
         let bad = FakeUpstream::start(vec![ok("must-never-be-called")]).await;
-        let good = FakeUpstream::start(vec![ok("from-compliant")]).await;
+        let good = FakeUpstream::start(vec![marked("from-compliant")]).await;
         let admission = RecordingAdmission::new();
         let mut violating = Endpoint::adult("example-violating", bad.url());
         (case.violating)(&mut violating);
@@ -275,7 +288,9 @@ async fn each_hard_constraint_excludes_an_endpoint_on_its_own() {
         );
         let reply = post(&h.app, &simple_body(100)).await;
         assert_eq!(reply.status, 200, "{}", case.name);
-        assert_eq!(reply.json()["id"], "from-compliant", "{}", case.name);
+        // 旧的断言是 `reply.json()["id"] == "from-compliant"`：edu 的响应 id 现在是服务端写的请求号，作答者由正文认
+        // （成人租户的响应原样转发，正文同样原样到达）
+        assert_eq!(answer_text(&reply), "from-compliant", "{}", case.name);
         assert_eq!(
             bad.connection_count(),
             0,
