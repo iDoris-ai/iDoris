@@ -474,7 +474,7 @@ const MAX_CREDENTIAL_FILE_BYTES: u64 = 16 * 1024;
 /// - 打开之后 `fstat` 描述符（[`check_opened_credential_file`]）：必须是普通文件、没有 group / other 位。
 ///
 /// 审查还建议验证属主和目录的安全性。验证属主要取得进程的有效 uid：工作区 `forbid(unsafe_code)`，而 `nix` 没有开
-/// `user` feature（`Uid` 在那里面），改依赖的声明不在这次修复的范围内，所以没做，留给 owner 决定（见交付说明）。
+/// `user` feature（`Uid` 在那里面），改依赖的声明不在这次修复的范围内，所以没做，留给 owner 决定。
 #[cfg(unix)]
 fn read_private_regular_file(path: &Path) -> Result<Option<String>, CredentialError> {
     read_private_regular_file_with(path, &mut || {})

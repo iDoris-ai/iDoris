@@ -10,7 +10,7 @@
 //!                                                 │ POST /control/v1/pairing/redeem {code, device_label}   ← 不带凭证，码本身是凭据
 //!                                                 ▼
 //!                                       一张绑定到该云账号付款上下文的设备凭证（Member 绑定，只有数据面权限）
-//!                                                 │ 原子写入 0600 文件（credential::DeviceStore）
+//!                                                 │ 原子新装 0600 文件，不覆盖已有的（credential::DeviceStore::install）
 //!                                                 ▼
 //!                                              idoris cloud status   只显示是否配对、账号绑定、凭证 id 前缀
 //!                                              idoris cloud unpair   POST /control/v1/pairing/unpair（用这张凭证撤销它自己）

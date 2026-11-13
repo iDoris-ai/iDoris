@@ -76,7 +76,7 @@ pub enum CloudCommand {
     Unpair,
 }
 
-/// 读环境变量 [`CONFIG_ENV`] 指向的配置，并取数据库路径（只用来定位设备凭证目录）。
+/// 读环境变量 [`CONFIG_ENV`] 指向的配置，并取数据库路径（定位设备凭证目录；`unpair` 的本地密钥识别也只读地查它）。
 pub fn load_from_env() -> Result<(CloudTierConfig, std::path::PathBuf), String> {
     let path = crate::config::optional_env_path(CONFIG_ENV)?.ok_or_else(|| {
         format!(
