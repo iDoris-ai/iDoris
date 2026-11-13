@@ -633,6 +633,77 @@ async fn a_kill_switch_turned_on_while_the_pending_row_is_written_still_stops_th
     assert_eq!(completed.event.metadata["status"], "failure");
 }
 
+// ------------------------------------------------------------------------------------------------
+// 先写后出网：pending 行落不下，就不出网（审查 PD S4：变异 M6 存活——没有测试证明这一点）
+// ------------------------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn when_the_pending_row_cannot_be_written_nothing_is_sent_and_the_caller_is_told_why() {
+    let rig = rig().await;
+    // 另一个连接给调用记录表装一个会让每次 INSERT 失败的触发器：模拟落行失败（磁盘满、库只读、被锁住……）
+    let side = rusqlite::Connection::open(rig._dir.path().join("tier.sqlite3")).unwrap();
+    side.execute_batch(
+        "CREATE TRIGGER fail_every_begin BEFORE INSERT ON cloud_tier_calls
+         BEGIN SELECT RAISE(ABORT, 'simulated: the call log cannot be written'); END;",
+    )
+    .unwrap();
+
+    let mut options = NodeOptions::new(Scenario::RuntimeOffline, Some(rig.tier.clone()));
+    options.with_event_log = true;
+    let node = LocalNode::build(options);
+    let with = node.drive(&[ANY, CONSENT]).await;
+    let without = baseline(Scenario::RuntimeOffline)
+        .drive(&[ANY, CONSENT])
+        .await;
+
+    // 没有行就没有出网：云端收到 0 个请求
+    assert_eq!(
+        rig.cloud.log.count(),
+        0,
+        "the request was sent although its pending row could not be written"
+    );
+    assert_eq!(rig.tier.store().call_count().unwrap(), 0);
+    // 调用方拿到本机原来的失败，只多一个稳定的头，告诉它本该回落却没能回落
+    assert_eq!(with.status, 503, "{}", with.text());
+    assert_eq!(
+        with.header("x-idoris-cloud-attempt"),
+        Some("store_unavailable")
+    );
+    let mut fingerprint = with.fingerprint();
+    fingerprint
+        .1
+        .retain(|(name, _)| name != "x-idoris-cloud-attempt");
+    assert_eq!(fingerprint, without.fingerprint());
+    // 事件流不留一个有头无尾的出网尝试：dispatched 已经写了，就补一个失败的 completed
+    let local_id = with.header("x-idoris-record-id").unwrap().to_string();
+    let events = node
+        .event_log
+        .as_ref()
+        .unwrap()
+        .events_for_record(Some("personal"), &local_id)
+        .unwrap();
+    let kinds: Vec<&str> = events
+        .iter()
+        .map(|event| event.event.event_type.as_str())
+        .collect();
+    assert!(kinds.contains(&"dispatched"), "{kinds:?}");
+    let completed = events
+        .iter()
+        .find(|event| event.event.event_type.as_str() == "completed")
+        .expect("a dispatched event needs its completed event");
+    assert_eq!(completed.event.metadata["status"], "failure");
+
+    // 对照：触发器拿掉，同一个请求就出网了（证明上面零出网的原因就是落行失败，而不是别的）
+    side.execute_batch("DROP TRIGGER fail_every_begin").unwrap();
+    let served = rig
+        .node(Scenario::RuntimeOffline)
+        .drive(&[ANY, CONSENT])
+        .await;
+    assert_eq!(served.status, 200, "{}", served.text());
+    assert_eq!(rig.cloud.log.chats().len(), 1);
+    assert_eq!(rig.tier.store().call_count().unwrap(), 1);
+}
+
 #[tokio::test]
 async fn streaming_requests_are_never_sent_to_the_cloud() {
     let rig = rig().await;
