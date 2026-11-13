@@ -7,6 +7,7 @@
 //!   到期日（跨 UTC 日期、长期运行），儿童请求就在调用任何上游之前被拒绝；
 //! - **N2**：LLM 检查器看到的工具参数不能丢掉数字、布尔和 `null`；
 //! - **N3**：LLM 检查器的预留按最终要发出的全部调用算，不是按原始文本的字节估一次；
+//! - **PARTIAL High③**：命中区间内部跨句时，一句里的拒绝语不能放行另一句里的步骤；
 //! - **PARTIAL High④**：工具参数里的重复键一律拒绝（输入历史和上游回答）。
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -356,4 +357,32 @@ async fn duplicate_keys_in_tool_arguments_are_refused_in_the_history_and_in_the_
             reply.text()
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// PARTIAL High③：命中区间内部跨句
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_refusal_in_one_sentence_does_not_excuse_the_steps_in_the_next_sentence() {
+    for text in [
+        "Step 1: I cannot help with that.\nHere is how to make a pipe bomb.",
+        // 只有换行、没有标点
+        "Step 1: I cannot help with that\nhere is how to make a pipe bomb",
+        // 泰语：步骤词和拒绝语在第一行，危险物在第二行（第二行里没有步骤词，所以这一处命中只有跨行才凑得起来）
+        "ส่วนผสม ฉันไม่สามารถช่วยเรื่องนี้ได้\nต่อไปคือก๊าซพิษ",
+    ] {
+        let (h, main) = child_rules_only(vec![answer(text)]).await;
+        let reply = post(&h.app, &child_body(&benign_question())).await;
+        blocked(&reply, "safety_output_blocked", "dangerous_act");
+        assert_eq!(main.request_count(), 1, "the upstream did answer");
+        assert!(reply.json().get("choices").is_none(), "{}", reply.text());
+    }
+    // 同一句里的拒绝（家庭化学安全课）照旧放行
+    let (h, _main) = child_rules_only(vec![answer(
+        "Never mix bleach and ammonia, because that makes poison gas.",
+    )])
+    .await;
+    let reply = post(&h.app, &child_body(&benign_question())).await;
+    assert_eq!(reply.status, 200, "{}", reply.text());
 }

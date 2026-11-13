@@ -32,7 +32,8 @@
 //! 有些规则在「警示 / 拒绝」语境里放行（`ห้ามผสม……เพราะจะเกิดก๊าซพิษ`）。**整段里随便哪里出现一个警示词就放行整段**是个漏洞
 //! （r3 High#3：在有害回答末尾追加一个 `unsafe`）。[`locally_negated`] 只在命中所在的**同一句**里、命中前后各
 //! [`NEGATION_REACH_CHARS`] 个字符之内找否定词，句子边界（`. ! ? ;`、换行）挡住它；一个命中被否定之后，
-//! 调用方用 [`Folded::mask`] 把它抹掉，**剩下的内容重新独立检查**。
+//! 调用方用 [`Folded::mask`] 把它抹掉，**剩下的内容重新独立检查**。命中区间**自己**横跨句子边界（`step 1` 在一句里、`pipe bomb`
+//! 在下一句里）时，没有「命中旁边的同一句」可言，谁也放行不了（round2-r3 PARTIAL High#3）。
 //!
 //! # base64
 //!
@@ -777,8 +778,24 @@ fn clause_window(haystack: &Folded, (lo, hi): (usize, usize), reach: usize) -> (
     (start, finish)
 }
 
+/// 命中区间 `region` **自己**横跨了句子边界吗：区间内部有句号 / 问号 / 叹号 / 分号 / 省略号，或者原文里的换行。
+/// 句子边界的定义和 [`clause_window`] 是同一个。
+fn spans_a_clause_boundary(haystack: &Folded, (lo, hi): (usize, usize)) -> bool {
+    if haystack.plain[lo..hi].chars().any(ends_a_clause) {
+        return true;
+    }
+    // `breaks` 是升序的：第一个落在区间起点之后的换行，在区间终点之前就是内部的换行
+    let first = haystack.breaks.partition_point(|&index| index <= lo);
+    haystack.breaks.get(first).is_some_and(|&index| index < hi)
+}
+
 /// 命中区间 `region` 是不是被同一句里的否定词（`cues` 里的任何一个，在命中前后各 `reach_chars` 个字符之内）放行了。
 /// **只看命中所在的那一句**：别的句子里的否定词、整段末尾追加的 `unsafe` 都不算。
+///
+/// **区间自己横跨了句子边界就谁也放行不了**（round2-r3 PARTIAL High#3）：`Step 1: I cannot help with that.\nHere is how to
+/// make a pipe bomb.` 的命中区间（`step 1` 到 `pipe bomb`）横跨两句，拒绝语只属于第一句，第二句是步骤。只检查区间**外侧**的
+/// 句界，区间里的拒绝语就能把另一句里的步骤一起放行；一个区间分在两句里，没有「命中旁边的同一句」可言，按没被放行处理
+/// （代价：一句话说完「不要把漂白水和氨水混在一起」、下一句才说「会产生毒气」的安全课，会被规则拒绝，交给后面的人 / 评审判断）。
 pub fn locally_negated(
     haystack: &Folded,
     region: (usize, usize),
@@ -789,6 +806,7 @@ pub fn locally_negated(
         || region.1 > haystack.plain.len()
         || !haystack.plain.is_char_boundary(region.0)
         || !haystack.plain.is_char_boundary(region.1)
+        || spans_a_clause_boundary(haystack, region)
     {
         return false;
     }
@@ -1218,6 +1236,54 @@ mod tests {
         // 区间不合法：不是否定
         assert!(!locally_negated(&thai, (10, 5), &never, 30));
         assert!(!locally_negated(&thai, (0, 10_000), &never, 30));
+    }
+
+    #[test]
+    fn a_negation_cannot_excuse_a_hit_that_itself_spans_a_sentence_boundary() {
+        // round2-r3 PARTIAL High#3：命中区间的两个词分在两句里、否定词在其中一句，不能放行整个区间——
+        // `Step 1: I cannot help with that.\nHere is how to make a pipe bomb.` 的区间（`step 1` 到 `pipe bomb`）横跨两句，
+        // 拒绝语在第一句里，步骤在第二句里；旧实现只看区间**外侧**的句界
+        let refusal = cues(&["i cannot", "never"]);
+        let excused = |text: &str, from: &str, to: &str| {
+            let folded = fold(text);
+            let start = folded.plain.find(from).unwrap();
+            let end = folded.plain.find(to).unwrap() + to.len();
+            locally_negated(&folded, (start, end), &refusal, NEGATION_REACH_CHARS)
+        };
+        // 区间内部有句号 / 换行 / 问号 / 叹号 / 分号 / 省略号：不放行
+        for text in [
+            "Step 1: I cannot help with that.\nHere is how to make a pipe bomb.",
+            "Step 1: I cannot help with that. Here is how to make a pipe bomb.",
+            "Step 1: I cannot help with that! Here is how to make a pipe bomb.",
+            "Step 1: I cannot help with that? Here is how to make a pipe bomb.",
+            "Step 1: I cannot help with that; here is how to make a pipe bomb.",
+            "Step 1: I cannot help with that… here is how to make a pipe bomb.",
+            "Step 1: I cannot help with that\nhere is how to make a pipe bomb",
+        ] {
+            assert!(!excused(text, "step 1", "pipe bomb"), "{text}");
+        }
+        // 区间在同一句里：照旧放行；区间外侧的句号不算「内部」
+        assert!(excused(
+            "Step 1: I cannot tell you how to make a pipe bomb.",
+            "step 1",
+            "pipe bomb"
+        ));
+        assert!(excused(
+            "Do that first. Step 1: I cannot tell you how to make a pipe bomb. Then rest.",
+            "step 1",
+            "pipe bomb"
+        ));
+        // 换行在区间里也算内部；换行在区间外侧不算
+        assert!(!excused(
+            "never do that\nmix bleach\nand ammonia, then poison gas",
+            "mix bleach",
+            "poison gas"
+        ));
+        assert!(excused(
+            "next line\nnever mix bleach and ammonia, then poison gas",
+            "mix bleach",
+            "poison gas"
+        ));
     }
 
     #[test]
