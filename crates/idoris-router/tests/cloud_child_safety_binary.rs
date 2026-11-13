@@ -5,7 +5,8 @@
 //! 真的 stderr 管道），证明启动接线是对的：
 //!
 //! - 配置里有儿童租户却没有 `safety:` 段、LLM 检查端点不满足许可表的儿童约束：**进程拒绝启动**（退出码 1，什么都没监听）；
-//! - 儿童租户只开规则检查器（`rules_only`）：**进程拒绝启动**（必须配 LLM 检查器，PR-Daemon B3）；
+//! - 儿童租户只开规则检查器（`rules_only`）：**进程拒绝启动**，除非写了仍在有效期内的
+//!   `rules_only_acknowledgement`（owner 2026-11-13 方案 B）；写了就允许启动，并在 stderr 打一行醒目警告；
 //! - 正常启动后：走真实的 HTTP 和认证，成功 / 输入被拒 / 输出被拒 / 安全服务超时 / 旧路由 / 流式 / 冒用租户，
 //!   然后**杀掉进程**（WAL 没有检查点，库里所有写过的东西都还在 WAL 里），扫描整个运行目录（数据库、WAL、SHM、配置、
 //!   所有文件）和进程的 stdout / stderr：两个哨兵、孩子的泰语原文、模型的有害回答片段都不在任何地方。
@@ -531,6 +532,47 @@ async fn rules_only_is_refused_for_child_tenants_and_adult_only_configs_need_no_
     assert!(!stderr.contains("WARNING"), "{stderr}");
     assert!(
         stderr.contains("child-data callers (safety pipeline ON): []; other callers (no safety pipeline): [eduai (cloud ingress)]; safety: not configured"),
+        "{stderr}"
+    );
+}
+
+/// 儿童租户 + `rules_only` + 仍在 90 天窗口内的显式确认：进程能起来，stderr 有那一行醒目警告。
+/// 不带确认的对照仍由上面的测试钉着（启动失败）。
+#[tokio::test]
+async fn rules_only_with_a_valid_acknowledgement_starts_and_logs_the_warning() {
+    let _guard = PROCESS_TEST_LOCK.lock().await;
+    let f = fixture();
+    let tenants = f.tenants();
+    let main = FakeUpstream::start(vec![]).await;
+    let judge = FakeUpstream::start(vec![]).await;
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    let expires = idoris_router::cloud::safety::config::utc_calendar_date_plus(
+        idoris_compute_contracts::ids::TimestampMs(now_ms),
+        30,
+    )
+    .unwrap();
+    let reason = "内测外部测试尚无签了DPA的检查器模型";
+    let acknowledged_by = "ops-ack";
+    let safety = format!(
+        "safety:\n  mode: rules_only\n  rules_only_acknowledgement:\n    reason: \"{reason}\"\n    acknowledged_by: \"{acknowledged_by}\"\n    expires_on: \"{expires}\"\n"
+    );
+    let cloud = f.cloud_config(&main.url(), &judge.url(), &safety);
+    let (port, admin) = (free_port(), free_port());
+    let env = f.server_env(port, admin, &tenants, &cloud);
+    let mut server = f.spawn(&env);
+    wait_healthy(&mut server, port).await;
+    let (_stdout, stderr) = server.kill();
+    let line = format!(
+        "[idoris] cloud: WARNING child-data tenants run on the RULE CHECKER ONLY by explicit acknowledgement: reason=\"{reason}\" acknowledged_by=\"{acknowledged_by}\" expires_on={expires}"
+    );
+    assert!(stderr.contains(&line), "{stderr}");
+    assert!(
+        stderr.contains(&format!(
+            "safety: rules_only (acknowledged until {expires})"
+        )),
         "{stderr}"
     );
 }
