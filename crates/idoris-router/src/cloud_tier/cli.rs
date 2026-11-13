@@ -7,7 +7,8 @@
 //! $ idoris cloud unpair                                                    # 云端撤销 + 删除本机凭证
 //! ```
 //!
-//! 这些命令**只读写设备凭证文件**（`<state_dir>/device.json`，见 [`super::credential`]），不碰 Admin、不碰本地数据密钥。
+//! 这些命令读写设备凭证文件（`<state_dir>/device.json`，见 [`super::credential`]），不碰 Admin、不改本地数据密钥；
+//! `unpair` 发凭证之前**只读地**查一下本机的虚拟 key 库，确认它不是本机的本地数据密钥（不创建库、不建表）。
 //! `pair` / `unpair` 的整个流程在状态目录的跨进程锁（`<state_dir>/.lock`）里，两个进程不会互相穿插；安装不覆盖已有的凭证，
 //! 兑换成功却装不上时（写不下，或者兑换期间别的进程装了一张）立刻撤销新兑换的那张。
 //! stdout 是 JSON（机器可读，没有任何密钥）；给人看的说明和警告写 stderr。
@@ -18,7 +19,7 @@
 //! |---|---|
 //! | 0 | 成功（`status` 能读出状态；`unpair` 云端确认已撤销或本来就没有配对） |
 //! | 1 | 失败（配对码被拒、云端不可达、本机写不进去、配置有问题……）；stderr 有原因 |
-//! | 2 | `unpair` 部分完成：**本机凭证已删除，但云端没有确认撤销**（不可达、报错）。云端那张凭证可能仍然有效，需要在控制面撤销（stderr 有凭证 id 前缀） |
+//! | 2 | `unpair` 部分完成：**本机凭证已删除，但云端没有确认撤销**（不可达、报错；或者文件里是本机的本地数据密钥，没有发送：`reason: local_key_refused`）。云端那张凭证可能仍然有效，需要在控制面撤销（stderr 有凭证 id 前缀） |
 
 use std::io::{BufRead, Read, Write};
 use std::path::Path;
@@ -27,8 +28,8 @@ use serde_json::json;
 
 use super::config::{CONFIG_ENV, CloudTierConfig, CredentialSourceConfig};
 use super::credential::{
-    CredentialError, CredentialProvider, DeviceRecord, DeviceStore, NodeEnvProvider,
-    NodeFileProvider, StateLock,
+    CredentialError, CredentialProvider, DeviceRecord, DeviceStore, LocalSecretProbe,
+    NodeEnvProvider, NodeFileProvider, StateLock,
 };
 use super::pairing::{DEFAULT_DEVICE_LABEL, PairingClient, PairingError, validate_device_label};
 
@@ -136,12 +137,17 @@ fn read_code(stdin: &mut dyn BufRead) -> Result<String, String> {
     Ok(code.to_string())
 }
 
-/// 一次 CLI 调用共用的上下文：配置、数据库路径（只用来定位设备凭证目录）、HTTP 客户端、「现在」。
+/// 一次 CLI 调用共用的上下文：配置、数据库路径（定位设备凭证目录；`unpair` 的本地密钥识别也用它）、HTTP 客户端、「现在」，
+/// 以及本地密钥探针。
+///
+/// `probe` 是**必填**的：所有会把凭证发往云端的入口都要先问「这是不是本机的本地数据密钥」（审查 r4 High#2：解绑以前直接发
+/// `record.secret`，没有经过它）。生产里是 [`super::VirtualKeyFileProbe`]（只读地查本机虚拟 key 库，库不可用按「是」处理）。
 pub struct CliContext<'a> {
     pub config: &'a CloudTierConfig,
     pub db_path: &'a Path,
     pub http: reqwest::Client,
     pub now_ms: i64,
+    pub probe: &'a dyn LocalSecretProbe,
 }
 
 /// `idoris cloud pair`。
@@ -157,6 +163,7 @@ pub async fn run_pair(
         db_path,
         http,
         now_ms,
+        ..
     } = ctx;
     paired_device_only(config, "idoris cloud pair ")?;
     let label = label.unwrap_or(DEFAULT_DEVICE_LABEL);
@@ -339,7 +346,50 @@ fn node_status(
     }
 }
 
+/// 解绑时云端没有确认撤销的原因：稳定码给 stdout（机器可读，不塞人话），人话给 stderr。
+enum CloudNotConfirmed {
+    /// 配置里的云端地址和这张凭证签发的地址不一致：凭证只会发往签发它的源。
+    OriginMismatch,
+    /// 设备凭证文件不可用（权限、格式……）：读不出密钥。
+    FileUnusable(CredentialError),
+    /// 凭证文件里的密钥是本机的本地数据密钥（有效、已撤销、已过期都算），或者本机密钥库读不出来、判不了（按「是」处理）：
+    /// **没有发出去**。
+    LocalKey,
+    /// 发了，云端没有确认（不可达、报错）。
+    Cloud(PairingError),
+}
+
+impl CloudNotConfirmed {
+    fn code(&self) -> &'static str {
+        match self {
+            CloudNotConfirmed::OriginMismatch => "origin_mismatch",
+            CloudNotConfirmed::FileUnusable(_) => "credential_file_unusable",
+            CloudNotConfirmed::LocalKey => "local_key_refused",
+            CloudNotConfirmed::Cloud(_) => "cloud_not_confirmed",
+        }
+    }
+
+    fn text(&self) -> String {
+        match self {
+            CloudNotConfirmed::OriginMismatch => {
+                "配置里的云端地址和这张凭证签发的地址不一致，凭证没有被发出去".to_string()
+            }
+            CloudNotConfirmed::FileUnusable(error) => {
+                format!("本机的设备凭证文件不可用（{error}），读不出密钥，无法通知云端")
+            }
+            CloudNotConfirmed::LocalKey => {
+                "无法确认这个文件里的密钥不是本机的本地数据密钥（本地密钥永远不发给云端），没有发出去"
+                    .to_string()
+            }
+            CloudNotConfirmed::Cloud(error) => error.to_string(),
+        }
+    }
+}
+
 /// `idoris cloud unpair`：云端撤销 + 删除本机凭证。**本机凭证无论如何都会删除**。
+///
+/// 凭证发往云端之前和推理路径一样先问本地密钥探针（`ctx.probe`）：认得（本机的本地数据密钥误填进了设备凭证文件）就**不发**，
+/// 只删本地文件，按「本机已删、云端未确认」处理（退出码 2，`reason: local_key_refused`）。
 pub async fn run_unpair(
     ctx: CliContext<'_>,
     stdout: &mut dyn Write,
@@ -349,6 +399,7 @@ pub async fn run_unpair(
         config,
         db_path,
         http,
+        probe,
         ..
     } = ctx;
     paired_device_only(config, "idoris cloud unpair ")?;
@@ -379,17 +430,18 @@ pub async fn run_unpair(
         Err(error) => (None, Some(error)),
     };
 
-    // 云端那一步：只在凭证可用、并且和配置的云端是同一个源时才做——凭证只会发往签发它的源。
+    // 云端那一步：只在凭证可用、和配置的云端是同一个源、并且不是本机的本地数据密钥时才做——凭证只会发往签发它的源，
+    // 本地密钥永远不发给云端。
     let mut cloud_confirmed = false;
-    let mut cloud_note: Option<String> = None;
+    let mut not_confirmed: Option<CloudNotConfirmed> = None;
     let mut id_prefix: Option<String> = None;
     match (&record, unreadable) {
         (Some(record), _) => {
             id_prefix = Some(record.summary().credential_id_prefix);
             if record.origin != config.origin() {
-                cloud_note = Some(
-                    "配置里的云端地址和这张凭证签发的地址不一致，凭证没有被发出去".to_string(),
-                );
+                not_confirmed = Some(CloudNotConfirmed::OriginMismatch);
+            } else if probe.is_local_secret(record.secret.expose_secret()) {
+                not_confirmed = Some(CloudNotConfirmed::LocalKey);
             } else {
                 let client = PairingClient::new(http, config.control_url.clone());
                 match client.unpair(&record.secret).await {
@@ -401,15 +453,11 @@ pub async fn run_unpair(
                             "云端已经不认这张凭证（之前就被撤销或已过期），本机凭证现在删除。"
                         );
                     }
-                    Err(error) => cloud_note = Some(error.to_string()),
+                    Err(error) => not_confirmed = Some(CloudNotConfirmed::Cloud(error)),
                 }
             }
         }
-        (None, Some(error)) => {
-            cloud_note = Some(format!(
-                "本机的设备凭证文件不可用（{error}），读不出密钥，无法通知云端"
-            ));
-        }
+        (None, Some(error)) => not_confirmed = Some(CloudNotConfirmed::FileUnusable(error)),
         (None, None) => {}
     }
 
@@ -441,13 +489,30 @@ pub async fn run_unpair(
         let _ = writeln!(stderr, "已解绑：云端已撤销这张凭证，本机凭证已删除。");
         return Ok(0);
     }
-    let note = cloud_note.unwrap_or_else(|| "未知原因".to_string());
-    let _ = writeln!(
-        stderr,
-        "本机凭证已删除，但云端没有确认撤销（{note}）。\n\
-         云端那张凭证（{prefix}…）可能仍然有效：请在云账号的控制面撤销它\
-         （POST /control/v1/credentials/<凭证 id>/status，status 设为 revoked），或让云账号的管理员撤销。"
-    );
+    let reason = not_confirmed
+        .as_ref()
+        .map_or("cloud_not_confirmed", CloudNotConfirmed::code);
+    if matches!(not_confirmed, Some(CloudNotConfirmed::LocalKey)) {
+        // 这不是「云端那张凭证可能仍然有效」的情形：文件里根本不是云凭证。说清楚没发出去什么、什么没有被动过
+        let _ = writeln!(
+            stderr,
+            "本机凭证文件已删除，但没有通知云端：这个文件里的密钥是本机的本地数据密钥，或者本机的密钥库读不出来、\
+             无法确认它不是（本地密钥永远不发给云端），所以没有发给云端。本地数据密钥本身没有被动过\
+             （它仍在本机的密钥库里，是否吊销由你决定：idoris key revoke <key_id>）。\n\
+             这台机器如果真的配对过云账号，那张云凭证不在这个文件里、本机无从知道它的 id：请在云账号的控制面查看并撤销，\
+             然后重新运行 idoris cloud pair。"
+        );
+    } else {
+        let note = not_confirmed
+            .as_ref()
+            .map_or_else(|| "未知原因".to_string(), CloudNotConfirmed::text);
+        let _ = writeln!(
+            stderr,
+            "本机凭证已删除，但云端没有确认撤销（{note}）。\n\
+             云端那张凭证（{prefix}…）可能仍然有效：请在云账号的控制面撤销它\
+             （POST /control/v1/credentials/<凭证 id>/status，status 设为 revoked），或让云账号的管理员撤销。"
+        );
+    }
     writeln!(
         stdout,
         "{}",
@@ -456,22 +521,11 @@ pub async fn run_unpair(
             "cloud_revoked": false,
             "credential_id_prefix": id_prefix,
             "local_credential_deleted": true,
-            "reason": cloud_note_code(&note),
+            "reason": reason,
         })
     )
     .map_err(|_| "无法写 stdout".to_string())?;
     Ok(2)
-}
-
-/// 给 stdout 的机器可读原因：不把人话塞进 JSON，只留一个稳定码。
-fn cloud_note_code(note: &str) -> &'static str {
-    if note.contains("没有被发出去") {
-        "origin_mismatch"
-    } else if note.contains("不可用") {
-        "credential_file_unusable"
-    } else {
-        "cloud_not_confirmed"
-    }
 }
 
 /// `idoris cloud …` 的入口（给 `bin/idoris.rs`）。返回退出码；`Err` 是一行错误（退出码 1）。
@@ -484,11 +538,14 @@ pub async fn run(command: CloudCommand) -> Result<u8, String> {
     };
     let stdout = &mut std::io::stdout().lock();
     let stderr = &mut std::io::stderr().lock();
+    // 本地密钥探针：只读地查本机虚拟 key 库（不创建文件、不建表）；库读不出来就按「是本地密钥」处理，不发
+    let probe = super::VirtualKeyFileProbe::new(db_path.clone());
     let ctx = CliContext {
         config: &config,
         db_path: &db_path,
         http,
         now_ms,
+        probe: &probe,
     };
     match command {
         CloudCommand::Pair { label } => {

@@ -852,9 +852,38 @@ fn the_local_key_probe_recognises_active_local_keys_and_fails_closed_when_it_can
         "an unknown key is not a local key"
     );
     assert!(!probe.is_local_secret("not even key-shaped"));
-    // 吊销之后它不再是「有效的本地数据密钥」
+    // 吊销之后它**仍然是**本地密钥（审查 PD S4：已撤销的本地 key 不能被当成云凭证发出去）：撤销只是本机不再认它，
+    // 这串明文仍然是用户当作本地数据密钥用过的东西；以前这里断言的是相反的（吊销之后探针说「不是」）
     store.lock().unwrap().revoke(&key.key_id, 1).unwrap();
-    assert!(!probe.is_local_secret(key.secret.expose_secret()));
+    assert!(
+        probe.is_local_secret(key.secret.expose_secret()),
+        "a revoked local key is still a local secret"
+    );
+    // 已过期的本地 key 同理
+    let expired = MintedVirtualKey::mint();
+    store
+        .lock()
+        .unwrap()
+        .insert_active(
+            &expired.key_id,
+            expired.hash,
+            &VirtualKeyScope {
+                owner: "t".into(),
+                tenant_id: None,
+                allowed_privacy: vec![PrivacyClass::LocalOnly],
+                allowed_roles: vec!["fast".into()],
+                budget_ref: None,
+                expires_at_ms: Some(1),
+                admin_scopes: Vec::new(),
+            },
+        )
+        .unwrap();
+    assert!(
+        probe.is_local_secret(expired.secret.expose_secret()),
+        "an expired local key is still a local secret"
+    );
+    // 没见过的密钥照旧不是
+    assert!(!probe.is_local_secret(&secret('c')));
     // 库被毒化（判不了）：按「是」处理，宁可拒绝
     let poisoned = store.clone();
     let _ = std::thread::spawn(move || {
@@ -862,6 +891,59 @@ fn the_local_key_probe_recognises_active_local_keys_and_fails_closed_when_it_can
         panic!("poison the key store");
     })
     .join();
+    assert!(probe.is_local_secret(&secret('c')), "cannot tell -> refuse");
+}
+
+/// 命令行用的探针（`idoris cloud unpair`）：直接查库文件，只读；不论状态；没有库就没有本地密钥；读不出来按「是」处理。
+#[test]
+fn the_file_probe_sees_every_state_creates_nothing_and_fails_closed() {
+    use idoris_tenancy::virtual_key::MintedVirtualKey;
+    use idoris_tenancy::virtual_key::store::{VirtualKeyScope, VirtualKeyStore};
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("keys.sqlite3");
+    let probe = VirtualKeyFileProbe::new(&db);
+    // 没有库文件：没有签发过任何 key；探针不创建它
+    assert!(!probe.is_local_secret(&secret('c')));
+    assert!(!db.exists(), "the probe must not create the database");
+
+    let scope = |expires_at_ms| VirtualKeyScope {
+        owner: "t".into(),
+        tenant_id: None,
+        allowed_privacy: vec![PrivacyClass::LocalOnly],
+        allowed_roles: vec!["fast".into()],
+        budget_ref: None,
+        expires_at_ms,
+        admin_scopes: Vec::new(),
+    };
+    let active = MintedVirtualKey::mint();
+    let revoked = MintedVirtualKey::mint();
+    let expired = MintedVirtualKey::mint();
+    {
+        let store = VirtualKeyStore::open(&db).unwrap();
+        store
+            .insert_active(&active.key_id, active.hash, &scope(None))
+            .unwrap();
+        store
+            .insert_active(&revoked.key_id, revoked.hash, &scope(None))
+            .unwrap();
+        store
+            .insert_active(&expired.key_id, expired.hash, &scope(Some(1)))
+            .unwrap();
+        assert!(store.revoke(&revoked.key_id, 5).unwrap());
+    }
+    assert!(probe.is_local_secret(active.secret.expose_secret()));
+    assert!(
+        probe.is_local_secret(revoked.secret.expose_secret()),
+        "a revoked local key is still a local secret"
+    );
+    assert!(
+        probe.is_local_secret(expired.secret.expose_secret()),
+        "an expired local key is still a local secret"
+    );
+    assert!(!probe.is_local_secret(&secret('c')), "never issued");
+    assert!(!probe.is_local_secret("not even key-shaped"));
+    // 库读不出来：判不了，按「是」处理
+    std::fs::write(&db, b"this is not an sqlite database").unwrap();
     assert!(probe.is_local_secret(&secret('c')), "cannot tell -> refuse");
 }
 

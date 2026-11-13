@@ -872,6 +872,15 @@ pub async fn send(
     }
 }
 
+/// 「本机没有任何本地密钥」的探针：配对不发任何本地密钥，配对测试用它填 `CliContext::probe`。
+pub struct NoLocalKeys;
+
+impl idoris_router::cloud_tier::LocalSecretProbe for NoLocalKeys {
+    fn is_local_secret(&self, _secret: &str) -> bool {
+        false
+    }
+}
+
 /// 兑换配对码并写下设备凭证（走真实的 `idoris cloud pair` 函数，对 TCP 上的云）。返回 stdout 的 JSON。
 pub async fn pair_device(cloud: &TcpCloud, state_dir: &Path, code: &str) -> Result<Value, String> {
     let config = parse_tier_config(&tier_config_yaml(cloud, Some(state_dir), ""));
@@ -886,6 +895,7 @@ pub async fn pair_device(cloud: &TcpCloud, state_dir: &Path, code: &str) -> Resu
             db_path: &db_path,
             http,
             now_ms: 1_700_000_000_000,
+            probe: &NoLocalKeys,
         },
         None,
         &mut stdin,

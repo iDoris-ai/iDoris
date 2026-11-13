@@ -428,6 +428,117 @@ async fn pair_and_unpair_do_nothing_while_another_process_holds_the_state_direct
     );
 }
 
+/// 审查 r4 High#2：解绑以前直接读设备凭证文件、只检查 origin，就把 `record.secret` 放进云端控制面请求的 Authorization——
+/// 没有经过本地密钥识别。合法的 0600 `device.json` 里误填了一把本机的本地数据密钥（推理路径会拒绝它，因为库里认得），
+/// `idoris cloud unpair` 却会把它整个发给云端。现在解绑和推理路径一样先问本地密钥库：认得就不发，只删本地文件，
+/// 退出码 2（本机已删、云端未确认）。**已撤销的本地密钥也算本地密钥**（审查 PD S4）：撤销只是不再被本机认，
+/// 它仍然是用户当作本地密钥用过的明文，不能发给云端。
+#[tokio::test]
+async fn unpair_never_sends_a_local_data_key_that_was_misfiled_as_the_device_credential() {
+    let _guard = PROCESS_TEST_LOCK.lock().await;
+    for revoked in [false, true] {
+        let cloud = TcpCloud::start().await;
+        let f = fixture();
+        let config = f.tier_config(&cloud);
+        let (key_id, local_key) = issue_data_key_with_id(&f, &[], None).await;
+        if revoked {
+            let mut command = f.command(&[]);
+            command.args(["key", "revoke", &key_id]);
+            let out = run(command, None).await;
+            assert!(out.status.success(), "{:?}", text(&out));
+        }
+        // 合法的设备凭证文件（0600、origin 对得上），里面却是本机的本地数据密钥
+        let store = idoris_router::cloud_tier::DeviceStore::new(f.state_dir());
+        store
+            .install(&idoris_router::cloud_tier::credential::DeviceRecord {
+                origin: cloud.origin(),
+                credential_id: "vk_misfiled0123456789".to_string(),
+                membership: "m-agent-1".to_string(),
+                pairing_id: "pc_misfiled0123456789".to_string(),
+                paired_at_ms: 1_700_000_000_000,
+                secret: idoris_router::cloud_tier::CloudCredential::parse(&local_key).unwrap(),
+            })
+            .unwrap();
+        cloud.log.clear();
+
+        let out = f.cloud_cmd(Some(&config), &["unpair"], None).await;
+        let label = if revoked { "revoked key" } else { "active key" };
+        // 本机已删、云端未确认：退出码 2；一个字节都没有发给云端
+        assert_eq!(
+            cloud.log.count(),
+            0,
+            "{label}: the local data key reached the cloud: {:?}",
+            cloud.log.all()
+        );
+        assert_eq!(out.status.code(), Some(2), "{label}: {:?}", text(&out));
+        let result = json_of(&out);
+        assert_eq!(result["unpaired"], true, "{label}");
+        assert_eq!(result["cloud_revoked"], false, "{label}");
+        assert_eq!(result["local_credential_deleted"], true, "{label}");
+        assert_eq!(result["reason"], "local_key_refused", "{label}");
+        assert!(
+            !store.path().exists(),
+            "{label}: the local file must be removed"
+        );
+        assert!(
+            text(&out).1.contains("没有发给云端"),
+            "{label}: {:?}",
+            text(&out)
+        );
+        assert_no_secret(&out, &[&local_key]);
+    }
+}
+
+/// 本机的密钥库读不出来（文件坏了）：判不了这张凭证是不是本地密钥，按「是」处理——不发，只删本地文件，退出码 2。
+/// 宁可这一次没能向云端撤销（stderr 告诉用户去控制面撤销），也不把可能是本地密钥的东西发出去。
+#[tokio::test]
+async fn unpair_does_not_send_when_it_cannot_tell_whether_the_secret_is_a_local_key() {
+    let _guard = PROCESS_TEST_LOCK.lock().await;
+    let cloud = TcpCloud::start().await;
+    let f = fixture();
+    let config = f.tier_config(&cloud);
+    pair_with_cli(&f, &cloud, &config).await;
+    cloud.log.clear();
+    // 库文件被弄坏了：读不出来
+    std::fs::write(f.db(), b"this is not an sqlite database").unwrap();
+    let out = f.cloud_cmd(Some(&config), &["unpair"], None).await;
+    assert_eq!(
+        cloud.log.count(),
+        0,
+        "nothing may be sent when the key store cannot be read"
+    );
+    assert_eq!(out.status.code(), Some(2), "{:?}", text(&out));
+    assert_eq!(json_of(&out)["reason"], "local_key_refused");
+    assert_eq!(json_of(&out)["local_credential_deleted"], true);
+    assert!(
+        !idoris_router::cloud_tier::DeviceStore::new(f.state_dir())
+            .path()
+            .exists()
+    );
+}
+
+/// 对照：一张不在本地密钥库里的凭证（真正兑换出来的设备凭证）解绑照常发往云端——识别本地密钥没有误伤正常的解绑。
+#[tokio::test]
+async fn unpair_still_revokes_a_real_device_credential_even_though_it_now_asks_the_local_key_store()
+{
+    let _guard = PROCESS_TEST_LOCK.lock().await;
+    let cloud = TcpCloud::start().await;
+    let f = fixture();
+    let config = f.tier_config(&cloud);
+    // 本机库里有别的本地密钥（库存在、表在），设备凭证不是其中任何一把
+    let _other = issue_data_key(&f, &[], None).await;
+    pair_with_cli(&f, &cloud, &config).await;
+    cloud.log.clear();
+    let out = f.cloud_cmd(Some(&config), &["unpair"], None).await;
+    assert_eq!(out.status.code(), Some(0), "{:?}", text(&out));
+    assert_eq!(json_of(&out)["cloud_revoked"], true);
+    assert_eq!(
+        cloud.log.count(),
+        1,
+        "exactly one call, to the control plane"
+    );
+}
+
 #[tokio::test]
 async fn pairing_checks_that_it_can_save_the_credential_before_it_spends_the_one_time_code() {
     let _guard = PROCESS_TEST_LOCK.lock().await;
@@ -670,6 +781,15 @@ async fn serve(f: &Fixture, env: &[(&str, &str)], tenant: Option<&str>) -> Servi
 
 /// 离线签发一把本地数据密钥（和 launcher 一样：`idoris key issue --spec-stdin`）。
 async fn issue_data_key(f: &Fixture, env: &[(&str, &str)], tenant: Option<&str>) -> String {
+    issue_data_key_with_id(f, env, tenant).await.1
+}
+
+/// 同上，返回 (key_id, 密钥明文)。
+async fn issue_data_key_with_id(
+    f: &Fixture,
+    env: &[(&str, &str)],
+    tenant: Option<&str>,
+) -> (String, String) {
     let mut command = f.command(env);
     command.args(["key", "issue", "--spec-stdin"]);
     let spec = json!({
@@ -680,7 +800,11 @@ async fn issue_data_key(f: &Fixture, env: &[(&str, &str)], tenant: Option<&str>)
     });
     let out = run(command, Some(spec.to_string())).await;
     assert!(out.status.success(), "{:?}", text(&out));
-    json_of(&out)["secret"].as_str().unwrap().to_string()
+    let issued = json_of(&out);
+    (
+        issued["key_id"].as_str().unwrap().to_string(),
+        issued["secret"].as_str().unwrap().to_string(),
+    )
 }
 
 /// 启动必须失败：以 1 退出，stderr 含 `expected`，从来没有监听过（stdout 为空）。

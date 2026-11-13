@@ -1044,7 +1044,8 @@ fn served_response(selected: &Selected, answer: forward::CloudAnswer) -> Respons
     response
 }
 
-/// 本机虚拟 key 库做的 [`LocalSecretProbe`]：这个密钥是不是本机一把有效的本地数据密钥。
+/// 本机虚拟 key 库做的 [`LocalSecretProbe`]：这个密钥是不是本机的本地数据密钥——**不论状态**：有效的、已撤销的、
+/// 已过期的都算（撤销只是本机不再认它，这串明文仍然是用户当作本地密钥用过的东西，不能当云凭证发出去）。
 /// **判不了（库不可用）按「是」处理**：宁可拒绝一次回落，也不把可能是本地密钥的东西发出去。
 pub struct VirtualKeyProbe(
     pub Arc<std::sync::Mutex<idoris_tenancy::virtual_key::store::VirtualKeyStore>>,
@@ -1055,13 +1056,38 @@ impl LocalSecretProbe for VirtualKeyProbe {
         let Ok(parsed) = idoris_tenancy::virtual_key::VirtualKeySecret::parse(secret) else {
             return false;
         };
-        let now = SystemClock.now().0;
         match self.0.lock() {
-            Ok(store) => store
-                .authenticate(&parsed, now)
-                .map_or(true, |found| found.is_some()),
+            Ok(store) => store.contains_secret(&parsed).unwrap_or(true),
             Err(_) => true,
         }
+    }
+}
+
+/// 本机虚拟 key 库**文件**做的 [`LocalSecretProbe`]，给不起服务进程的命令行（`idoris cloud unpair`）用：
+/// 每次现查，只读地打开库文件，不创建文件、不建表。没有库文件（或者还没有 key 表）就是没有签发过任何 key：不是本地密钥。
+/// 和 [`VirtualKeyProbe`] 一样不论状态、判不了按「是」处理（库被锁着、读不出来……）。
+pub struct VirtualKeyFileProbe {
+    db_path: PathBuf,
+}
+
+impl VirtualKeyFileProbe {
+    pub fn new(db_path: impl Into<PathBuf>) -> Self {
+        Self {
+            db_path: db_path.into(),
+        }
+    }
+}
+
+impl LocalSecretProbe for VirtualKeyFileProbe {
+    fn is_local_secret(&self, secret: &str) -> bool {
+        let Ok(parsed) = idoris_tenancy::virtual_key::VirtualKeySecret::parse(secret) else {
+            return false;
+        };
+        idoris_tenancy::virtual_key::store::VirtualKeyStore::path_contains_secret(
+            &self.db_path,
+            &parsed,
+        )
+        .unwrap_or(true)
     }
 }
 

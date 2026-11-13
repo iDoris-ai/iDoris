@@ -125,6 +125,60 @@ impl VirtualKeyStore {
         row.map(raw_to_identity).transpose()
     }
 
+    /// Whether this secret's verifier is in the store **in any state** (active,
+    /// revoked or expired). [`Self::authenticate`] folds all non-active states
+    /// into `None`, which is right for authentication but wrong for asking "was
+    /// this string ever one of our local data keys?": a revoked key is still a
+    /// secret the user treated as a local credential, so it must never be sent
+    /// anywhere else (the cloud tier uses this to refuse local keys misfiled as
+    /// cloud credentials).
+    pub fn contains_secret(&self, secret: &VirtualKeySecret) -> Result<bool, VirtualKeyStoreError> {
+        let hash = secret.hash();
+        let present: i64 = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM virtual_keys WHERE key_hash = ?1)",
+            rusqlite::params![&hash.0[..]],
+            |row| row.get(0),
+        )?;
+        Ok(present == 1)
+    }
+
+    /// [`Self::contains_secret`] against a database *file*, for command-line
+    /// tools that must not start a store: opens read-only, never creates the
+    /// file, never creates or migrates a table. No file, or no `virtual_keys`
+    /// table yet, means no key was ever issued (`false`). Any other failure
+    /// (locked, corrupt, unreadable) is an error: callers must treat it as
+    /// "cannot tell" and fail closed.
+    pub fn path_contains_secret(
+        path: impl AsRef<Path>,
+        secret: &VirtualKeySecret,
+    ) -> Result<bool, VirtualKeyStoreError> {
+        let path = path.as_ref();
+        if let Err(error) = std::fs::symlink_metadata(path)
+            && error.kind() == std::io::ErrorKind::NotFound
+        {
+            return Ok(false);
+        }
+        let conn = Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        let has_table: i64 = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'virtual_keys')",
+            [],
+            |row| row.get(0),
+        )?;
+        if has_table == 0 {
+            return Ok(false);
+        }
+        let hash = secret.hash();
+        let present: i64 = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM virtual_keys WHERE key_hash = ?1)",
+            rusqlite::params![&hash.0[..]],
+            |row| row.get(0),
+        )?;
+        Ok(present == 1)
+    }
+
     /// Startup authority check for exposing the data-plane listener beyond
     /// loopback. Revoked/expired rows do not count as active authority.
     pub fn has_active_key(&self, now_ms: i64) -> Result<bool, VirtualKeyStoreError> {
@@ -498,6 +552,99 @@ mod tests {
         assert!(store.has_active_key(200).unwrap());
         assert!(store.revoke(&active.key_id, 201).unwrap());
         assert!(!store.has_active_key(202).unwrap());
+    }
+
+    #[test]
+    fn contains_secret_sees_every_state_while_authenticate_sees_only_active() {
+        let store = VirtualKeyStore::new(Connection::open_in_memory().unwrap()).unwrap();
+        let active = MintedVirtualKey::mint();
+        let revoked = MintedVirtualKey::mint();
+        let expired = MintedVirtualKey::mint();
+        store
+            .insert_active(&active.key_id, active.hash, &scope(None))
+            .unwrap();
+        store
+            .insert_active(&revoked.key_id, revoked.hash, &scope(None))
+            .unwrap();
+        store
+            .insert_active(&expired.key_id, expired.hash, &scope(Some(100)))
+            .unwrap();
+        assert!(store.revoke(&revoked.key_id, 50).unwrap());
+        for (name, key, authenticates) in [
+            ("active", &active, true),
+            ("revoked", &revoked, false),
+            ("expired", &expired, false),
+        ] {
+            assert_eq!(
+                store.authenticate(&key.secret, 200).unwrap().is_some(),
+                authenticates,
+                "{name}"
+            );
+            assert!(
+                store.contains_secret(&key.secret).unwrap(),
+                "{name}: it was a local key, whatever state it is in"
+            );
+        }
+        assert!(
+            !store
+                .contains_secret(&MintedVirtualKey::mint().secret)
+                .unwrap(),
+            "a secret the store has never seen"
+        );
+    }
+
+    #[test]
+    fn path_contains_secret_is_read_only_and_creates_nothing() {
+        let dir = std::env::temp_dir().join(format!(
+            "idoris-virtual-key-readonly-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("keys.sqlite3");
+        let stranger = MintedVirtualKey::mint();
+        // 没有库文件：没有任何 key 签发过；不创建文件
+        assert!(!VirtualKeyStore::path_contains_secret(&path, &stranger.secret).unwrap());
+        assert!(
+            !path.exists(),
+            "a read-only probe must not create the database"
+        );
+        // 有库文件、但还没有 virtual_keys 表（别的 store 的库）：同样没有；不建表
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch("CREATE TABLE unrelated (x INTEGER)")
+            .unwrap();
+        assert!(!VirtualKeyStore::path_contains_secret(&path, &stranger.secret).unwrap());
+        let tables: i64 = Connection::open(&path)
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name = 'virtual_keys'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(tables, 0, "a read-only probe must not create the table");
+        // 真正的库：有效、已撤销、已过期的都认得，没见过的不认得
+        std::fs::remove_file(&path).unwrap();
+        let active = MintedVirtualKey::mint();
+        let revoked = MintedVirtualKey::mint();
+        {
+            let store = VirtualKeyStore::open(&path).unwrap();
+            store
+                .insert_active(&active.key_id, active.hash, &scope(None))
+                .unwrap();
+            store
+                .insert_active(&revoked.key_id, revoked.hash, &scope(None))
+                .unwrap();
+            assert!(store.revoke(&revoked.key_id, 50).unwrap());
+            // 库被另一个（写）连接打开着，只读的探针照样能读
+            assert!(VirtualKeyStore::path_contains_secret(&path, &active.secret).unwrap());
+            assert!(VirtualKeyStore::path_contains_secret(&path, &revoked.secret).unwrap());
+            assert!(!VirtualKeyStore::path_contains_secret(&path, &stranger.secret).unwrap());
+        }
+        // 不是 SQLite 文件：读不出来就是错误（调用方按「判不了」处理，失败即关闭），不是 false
+        std::fs::write(&path, b"this is not a database").unwrap();
+        assert!(VirtualKeyStore::path_contains_secret(&path, &active.secret).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

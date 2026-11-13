@@ -809,6 +809,7 @@ async fn run_pair_against(
             db_path: &state_dir.join("idoris.sqlite3"),
             http: idoris_upstream::http_client().unwrap(),
             now_ms: 1_700_000_000_000,
+            probe: &NoLocalKeys,
         },
         None,
         &mut stdin,
