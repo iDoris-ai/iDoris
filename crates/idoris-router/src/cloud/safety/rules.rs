@@ -166,8 +166,8 @@ const HISTORY_AFTER_REACH_CHARS: usize = 6;
 
 /// 对话历史里 `assistant` 消息按输入规则查时，**命中旁边有拒绝语就放行**的规则（请求类 / 话题类：拒绝语会复述这些话题）。
 /// 不在名单里的输入规则一律不放行：自伤的第一人称表达（`self_harm.ideation`）、自伤词（`self_harm.words`）、越狱人格
-/// （`jailbreak.no_limits`）；别的输入规则里没有 `Words` 以外的，`Words` 类（英文整词）没有命中区间，也一律不放行。
-/// 名单里的 id 由测试对着 [`build_rules`] 核对。
+/// （`jailbreak.no_limits`）；英文整词类（`adult_content.english_words`、`pii_solicit.words`）没有命中区间，没法判断旁边有没有
+/// 拒绝语，同样不放行。名单里的 id 由测试对着 [`build_rules`] 核对。
 const HISTORY_REFUSAL_EXEMPT: &[&str] = &[
     "self_harm.method_request",
     "dangerous_act.compound",
