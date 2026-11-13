@@ -512,16 +512,23 @@ async fn a_paid_or_subsidized_stream_is_only_routed_to_an_endpoint_with_stream_u
     assert_eq!(reply.json()["error"]["type"], "no_compliant_endpoint");
     assert_eq!(n.connection_count(), 0);
 
-    // 不计费的流式请求不受这条约束（它不需要拿 usage 来结算）
-    let n = FakeUpstream::start(vec![Behavior::sse(vec![
-        SseStep::Send(content_event("s", "x")),
-        SseStep::Send(done_event()),
-        SseStep::Finish,
-    ])])
-    .await;
-    let h = build(
-        vec![Endpoint::adult("example-nostream", n.url()).no_stream_usage()],
-        Options {
+    // R2 High#3：这里原来断言「不计费的流式请求不受这条约束（不需要拿 usage 来结算），200」。`billing: unbilled` 没有实现
+    // （准入、预留、结算都不认它：用户额度照扣，流式请求还会因此免掉流式 usage 约束，按整笔预留收费），所以现在加载配置
+    // 就直接拒绝——「不计费的流式请求」这个场景不再存在。契约（S0）里 `Billing::Unbilled` 对流式 usage 的豁免仍由
+    // `idoris-compute-contracts` 自己的测试钉着，没有改动。
+    let endpoints = vec![
+        Endpoint::adult("example-nostream", "http://127.0.0.1:9/v1".to_string()).no_stream_usage(),
+    ];
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("permits.yaml"),
+        harness::permit_table_yaml(&endpoints),
+    )
+    .unwrap();
+    let yaml = harness::config_yaml(
+        &endpoints,
+        "/dev/null",
+        &Options {
             callers: vec![Caller {
                 billing: "unbilled",
                 ..Caller::adult_default()
@@ -529,8 +536,15 @@ async fn a_paid_or_subsidized_stream_is_only_routed_to_an_endpoint_with_stream_u
             ..Options::default()
         },
     );
-    let reply = post(&h.app, &body).await;
-    assert_eq!(reply.status, 200);
+    let error = match idoris_router::cloud::config::parse(
+        &yaml,
+        dir.path(),
+        idoris_compute_contracts::ids::TimestampMs(NOW_MS),
+    ) {
+        Ok(_) => panic!("billing: unbilled must be refused when the config is loaded"),
+        Err(error) => error,
+    };
+    assert!(error.contains("unbilled"), "{error}");
 }
 
 #[tokio::test]

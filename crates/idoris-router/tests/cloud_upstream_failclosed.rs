@@ -56,6 +56,7 @@ fn direct_call(
         )
         .unwrap(),
         billing: Billing::Paid,
+        privacy: Default::default(),
         client_body: body.as_object().unwrap().clone(),
         stream: false,
         client_wants_usage_chunk: false,

@@ -191,6 +191,7 @@ async fn streaming_is_refused_for_children_at_the_handler_and_again_in_the_execu
         )
         .unwrap(),
         billing: Billing::Paid,
+        privacy: Default::default(),
         client_body: streaming_body.as_object().unwrap().clone(),
         stream: true,
         client_wants_usage_chunk: false,

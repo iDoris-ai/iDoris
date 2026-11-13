@@ -5,7 +5,7 @@
 //! 真的 stderr 管道），证明启动接线是对的：
 //!
 //! - 配置里有儿童租户却没有 `safety:` 段、LLM 检查端点不满足许可表的儿童约束：**进程拒绝启动**（退出码 1，什么都没监听）；
-//! - 只开规则检查器（`rules_only`）：启动日志里有一行警告；
+//! - 儿童租户只开规则检查器（`rules_only`）：**进程拒绝启动**（必须配 LLM 检查器，PR-Daemon B3）；
 //! - 正常启动后：走真实的 HTTP 和认证，成功 / 输入被拒 / 输出被拒 / 安全服务超时 / 旧路由 / 流式 / 冒用租户，
 //!   然后**杀掉进程**（WAL 没有检查点，库里所有写过的东西都还在 WAL 里），扫描整个运行目录（数据库、WAL、SHM、配置、
 //!   所有文件）和进程的 stdout / stderr：两个哨兵、孩子的泰语原文、模型的有害回答片段都不在任何地方。
@@ -487,27 +487,32 @@ async fn the_process_refuses_to_start_when_the_child_safety_configuration_is_mis
 }
 
 #[tokio::test]
-async fn rules_only_starts_with_a_loud_warning_and_adult_only_configs_need_no_safety_section() {
+async fn rules_only_is_refused_for_child_tenants_and_adult_only_configs_need_no_safety_section() {
     let _guard = PROCESS_TEST_LOCK.lock().await;
     let f = fixture();
     let tenants = f.tenants();
     let main = FakeUpstream::start(vec![]).await;
     let judge = FakeUpstream::start(vec![]).await;
 
-    // rules_only + 儿童调用方：能启动，但日志里有警告
+    // rules_only + 儿童调用方：启动失败（PR-Daemon B3）。这条原来的断言是「能启动，但日志里有警告」：
+    // 规则检查器靠关键词和正则，换字体、拼写变形、base64、藏在工具描述里的内容都能绕过，
+    // 儿童数据不该只押在它上面，所以警告升级成了启动错误（需 owner 确认）
     let cloud = f.cloud_config(&main.url(), &judge.url(), "safety:\n  mode: rules_only\n");
+    let (port, admin) = (free_port(), free_port());
+    let env = f.server_env(port, admin, &tenants, &cloud);
+    let stderr = must_fail(f.spawn(&env), "LLM 检查器");
+    assert!(stderr.contains("rules_only"), "{stderr}");
+    // 对照：规则 + LLM 两道检查器能启动，启动日志把「谁走儿童安全管线」列出来：
+    // 运营方一眼能核对 edu 租户的属性确实是 child_edu，也没有「只用规则检查器」的警告
+    let cloud = f.cloud_config(&main.url(), &judge.url(), &child_safety::judge_yaml(5_000));
     let (port, admin) = (free_port(), free_port());
     let env = f.server_env(port, admin, &tenants, &cloud);
     let mut server = f.spawn(&env);
     wait_healthy(&mut server, port).await;
     let (_stdout, stderr) = server.kill();
+    assert!(!stderr.contains("WARNING"), "{stderr}");
     assert!(
-        stderr.contains("WARNING: child-data tenants are protected by the rule checker only"),
-        "{stderr}"
-    );
-    // 启动日志把「谁走儿童安全管线」列出来：运营方一眼能核对 edu 租户的属性确实是 child_edu
-    assert!(
-        stderr.contains("child-data callers (safety pipeline ON): [eduai (cloud ingress)]; other callers (no safety pipeline): []; safety: rules_only"),
+        stderr.contains("child-data callers (safety pipeline ON): [eduai (cloud ingress)]; other callers (no safety pipeline): []; safety: rules_and_llm"),
         "{stderr}"
     );
 
