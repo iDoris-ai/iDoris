@@ -180,6 +180,9 @@ pub enum CredentialKind {
 }
 
 /// 云凭证的来源。每次调用 `load` 都重新取（设备凭证被 `unpair` 删掉、Node 凭证文件被轮换，下一次调用立刻生效）。
+///
+/// **实现者的 `Debug` 不能打印密钥**：这个 trait 要求 `Debug`，所以任何持有 `dyn CredentialProvider` 的地方
+/// （比如 [`super::CloudTier`]）都可能被 `{:?}`。持有明文的实现必须手写脱敏的 `Debug`，不能 derive。
 pub trait CredentialProvider: Send + Sync + std::fmt::Debug {
     fn load(&self) -> Result<LoadedCredential, CredentialError>;
 }
@@ -528,10 +531,22 @@ impl CredentialProvider for NodeFileProvider {
 }
 
 /// 组织形态：Node 凭证放在环境变量里（启动时读一次；不推荐，同用户的进程读得到环境变量）。
-#[derive(Debug)]
+///
+/// `Debug` 是手写的：`secret` 里存的是明文（启动时读到的环境变量值）。不能 derive：`CredentialProvider: Debug`，
+/// 云端档这样持有 `dyn CredentialProvider` 的地方随手一个 `{:?}` 就会把整个密钥打出来（审查 r4 Medium#3）。
 pub struct NodeEnvProvider {
     secret: Option<String>,
     probe: Option<Arc<dyn LocalSecretProbe>>,
+}
+
+impl std::fmt::Debug for NodeEnvProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NodeEnvProvider")
+            // 只说有没有，不说是什么
+            .field("secret", &self.secret.as_ref().map(|_| "[REDACTED]"))
+            .field("probe", &self.probe)
+            .finish()
+    }
 }
 
 impl NodeEnvProvider {

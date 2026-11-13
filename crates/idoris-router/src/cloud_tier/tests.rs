@@ -732,3 +732,105 @@ fn the_local_key_probe_recognises_active_local_keys_and_fails_closed_when_it_can
     .join();
     assert!(probe.is_local_secret(&secret('c')), "cannot tell -> refuse");
 }
+
+// ------------------------------------------------------------------------------------------------
+// 密钥不进 Debug（审查 r4 Medium#3）：每一个持有云凭证明文的类型，`{:?}` / `{:#?}` 都不含密钥——包括经由
+// `dyn CredentialProvider`、`Arc`、`Option`、`Result`、`Vec` 这些包装格式化的情形。
+// ------------------------------------------------------------------------------------------------
+
+#[test]
+fn no_type_that_holds_a_secret_prints_it_in_debug() {
+    use credential::{
+        CredentialKind, DeviceRecord, LoadedCredential, NodeEnvProvider, NodeFileProvider,
+        PairedDeviceProvider,
+    };
+
+    let raw = secret('e');
+    // 整个密钥、以及它的任何一段足够长的十六进制（哪怕只漏出一部分也算漏）
+    let needles = [raw.clone(), "e".repeat(16)];
+    let assert_clean = |what: &str, rendered: String| {
+        for needle in &needles {
+            assert!(
+                !rendered.contains(needle.as_str()),
+                "{what} printed the secret in Debug output: {rendered}"
+            );
+        }
+    };
+
+    // 环境变量来源：值就存在结构体里（启动时读一次）。`NodeEnvProvider` 以前直接 derive(Debug)。
+    let env = NodeEnvProvider::new(Some(raw.clone()), None);
+    assert_clean("NodeEnvProvider {:?}", format!("{env:?}"));
+    assert_clean("NodeEnvProvider {:#?}", format!("{env:#?}"));
+    // 值不是合法密钥的形状（比如 Admin token 被误填）也是密钥：同样不能打印
+    let admin_like = "ab".repeat(32);
+    let misfilled = NodeEnvProvider::new(Some(admin_like.clone()), None);
+    assert!(
+        !format!("{misfilled:?}").contains(&admin_like),
+        "a mis-filled env value must not be printed either"
+    );
+    // 经 `dyn CredentialProvider`（云端档里存的就是这个类型）、`Arc`、`Option`、`Vec` 格式化
+    let dynamic: Arc<dyn CredentialProvider> =
+        Arc::new(NodeEnvProvider::new(Some(raw.clone()), None));
+    assert_clean("Arc<dyn CredentialProvider>", format!("{dynamic:?}"));
+    assert_clean("&dyn CredentialProvider", format!("{:?}", &*dynamic));
+    assert_clean(
+        "Option<Arc<dyn ..>>",
+        format!("{:?}", Some(dynamic.clone())),
+    );
+    assert_clean("Vec<Arc<dyn ..>>", format!("{:#?}", vec![dynamic.clone()]));
+
+    // 云端档本身（持有凭证来源）
+    let config = config_with("");
+    let http = idoris_upstream::cloud::build_http_client(config.connect_timeout).unwrap();
+    let tier = CloudTier::new(CloudTierParts {
+        config,
+        store: Arc::new(CloudTierStore::open_in_memory().unwrap()),
+        provider: dynamic.clone(),
+        http,
+        clock: Arc::new(SystemClock),
+    })
+    .unwrap();
+    assert_clean("CloudTier {:?}", format!("{tier:?}"));
+    assert_clean("CloudTier {:#?}", format!("{tier:#?}"));
+    assert_clean("Arc<CloudTier>", format!("{:?}", Arc::new(tier)));
+
+    // 凭证、加载出来的凭证、设备记录、兑换结果
+    let credential = CloudCredential::parse(&raw).unwrap();
+    let loaded = LoadedCredential {
+        secret: credential.clone(),
+        kind: CredentialKind::Node,
+    };
+    assert_clean("CloudCredential", format!("{credential:?} {credential:#?}"));
+    assert_clean("LoadedCredential", format!("{loaded:?} {loaded:#?}"));
+    assert_clean(
+        "Result<LoadedCredential, _>",
+        format!("{:?}", Ok::<_, CredentialError>(loaded.clone())),
+    );
+    let record = DeviceRecord {
+        origin: "https://idoris.ai".to_string(),
+        credential_id: "vk_0123456789abcdef".to_string(),
+        membership: "m-agent-1".to_string(),
+        pairing_id: "pc_0123456789abcdef".to_string(),
+        paired_at_ms: 1,
+        secret: credential.clone(),
+    };
+    assert_clean("DeviceRecord", format!("{record:?} {record:#?}"));
+    let redeemed = pairing::Redeemed {
+        secret: credential.clone(),
+        credential_id: "vk_0123456789abcdef".to_string(),
+        membership: "m-agent-1".to_string(),
+        pairing_id: "pc_0123456789abcdef".to_string(),
+    };
+    assert_clean("Redeemed", format!("{redeemed:?} {redeemed:#?}"));
+
+    // 文件来源的 provider 只存路径，不存密钥：确认 Debug 里没有密钥
+    let dir = tempfile::tempdir().unwrap();
+    let node_file = NodeFileProvider::new(dir.path().join("node.key"), None);
+    assert_clean("NodeFileProvider", format!("{node_file:?}"));
+    let paired = PairedDeviceProvider::new(
+        credential::DeviceStore::new(dir.path()),
+        "https://idoris.ai",
+        None,
+    );
+    assert_clean("PairedDeviceProvider", format!("{paired:?}"));
+}
