@@ -380,6 +380,108 @@ fn settling_both_expired_holds_loses_the_same_total_in_either_order() {
 }
 
 // ------------------------------------------------------------------------------------------
+// 对账：同一块缺口被算两遍、责任记错了归属，都在对账里现形（PR-Daemon S1 F2：旧对账从不看责任分录）
+// ------------------------------------------------------------------------------------------
+
+#[test]
+fn reconcile_flags_a_double_counted_or_misattributed_liability() {
+    let forge = |db: &TempDb, hold: &str, kind: &str, account: &str, micros: i64, key: &str| {
+        let conn = rusqlite::Connection::open(db.path()).unwrap();
+        conn.execute(
+            "INSERT INTO ledger_entries (account_id, hold_id, kind, unit, held_micros, spent_micros, funds_micros,
+                                         liability_micros, window_at_ms, at_ms, idempotency_key)
+             VALUES (?1, ?2, ?3, 'THB', 0, 0, 0, ?4, 0, 0, ?5)",
+            rusqlite::params![account, hold, kind, micros, key],
+        )
+        .unwrap();
+    };
+    let mismatches = |store: &AccountStore| -> Vec<String> {
+        store
+            .reconcile_with_attempts()
+            .unwrap()
+            .mismatches
+            .into_iter()
+            .map(|m| format!("{}: {}", m.subject, m.detail))
+            .collect()
+    };
+
+    // 干净的宽限结算：对账通过
+    let db = TempDb::new("conserve-reconcile-grace");
+    let store = paid_chain(&db, 20);
+    admit_with_ladder(&store, "r-1", "cred-e", 100, T0);
+    store
+        .settle_attempt(&attempt("r-1", 0), &price(100), ts(T0 + 1_000))
+        .unwrap();
+    assert!(mismatches(&store).is_empty());
+    // 旧代码的错账：同一块缺口再记一次平台损失，责任合计 80 + 80 = 160 > 实际消费 100
+    forge(
+        &db,
+        "r-1#0",
+        "platform_loss",
+        "platform-loss",
+        80,
+        "forged-loss",
+    );
+    let found = mismatches(&store);
+    assert!(
+        found
+            .iter()
+            .any(|line| line.starts_with("r-1#0") && line.contains("exceed the charge")),
+        "{found:?}"
+    );
+    assert!(
+        found.iter().any(|line| line.contains("overage")),
+        "担保人 + 平台损失必须等于 overage（这笔没有 overage）: {found:?}"
+    );
+
+    // 没有宽限的预留不能有宽限承担
+    let db = TempDb::new("conserve-reconcile-plain");
+    let store = paid_chain(&db, 1_000);
+    let req = Req::new(&store, "r-2", 0, "cred-e", 100);
+    store.admit_attempt(&req.input()).unwrap();
+    store
+        .settle_attempt(&req.attempt, &price(80), ts(T0 + 1_000))
+        .unwrap();
+    assert!(mismatches(&store).is_empty());
+    forge(
+        &db,
+        "r-2#0",
+        "grace_absorbed",
+        "platform-loss",
+        10,
+        "forged-grace",
+    );
+    let found = mismatches(&store);
+    assert!(
+        found
+            .iter()
+            .any(|line| line.starts_with("r-2#0") && line.contains("the platform absorbed 10")),
+        "{found:?}"
+    );
+
+    // 还没结算的预留（在途）不能有任何责任分录
+    let db = TempDb::new("conserve-reconcile-open");
+    let store = paid_chain(&db, 1_000);
+    let req = Req::new(&store, "r-3", 0, "cred-e", 100);
+    store.admit_attempt(&req.input()).unwrap();
+    forge(
+        &db,
+        "r-3#0",
+        "platform_loss",
+        "platform-loss",
+        5,
+        "forged-open",
+    );
+    let found = mismatches(&store);
+    assert!(
+        found
+            .iter()
+            .any(|line| line.starts_with("r-3#0") && line.contains("only a settled hold may")),
+        "{found:?}"
+    );
+}
+
+// ------------------------------------------------------------------------------------------
 // 守恒：把「余额、授信、预留、实际消费、是否迟到」排成一张表，每一格都核对等式
 // ------------------------------------------------------------------------------------------
 

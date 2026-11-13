@@ -2831,6 +2831,136 @@ async fn wrong_pairing_codes_are_rate_limited_globally_and_cannot_be_enumerated(
 }
 
 #[tokio::test]
+async fn free_tier_over_http_is_bounded_by_the_pool_cap_and_its_window_must_be_the_month() {
+    // Codex r1 #7 / #8 经 HTTP：补贴池 12 月总上限 100，两个主体各发 60，第二个 409；月份和窗口对不上 400
+    let world = World::new();
+    world.people().await;
+    world
+        .accounts
+        .set_pool_cap(
+            &idoris_compute_contracts::ids::AccountId::new("pool").unwrap(),
+            "2026-12".parse().unwrap(),
+            &idoris_compute_contracts::money::Money::new(
+                idoris_compute_contracts::money::Unit::Thb,
+                100,
+            ),
+            TimestampMs(T0),
+        )
+        .unwrap();
+    // 2026-12 在账本时区（默认 UTC）里的窗口；窗口在授权方（teacher / eduai）的额度窗口之内
+    let dec_start = T0 + 30 * DAY_MS - 12 * 3_600_000;
+    let jan_start = dec_start + 31 * DAY_MS;
+    let free = |id: &str, parent: &str, child: &str, micros: i64, from: i64, until: i64| {
+        json!({"allocation_id": id, "parent": parent, "child": child,
+               "amount": {"unit": "THB", "micros": micros}, "purpose": "free_tier",
+               "valid_from_ms": from, "valid_until_ms": until, "month": "2026-12"})
+    };
+    let root = world.root.secret.clone();
+    let first = world
+        .call(
+            "POST",
+            "/control/v1/allocations",
+            Some(&root),
+            Some(free("f-1", "teacher", "s1", 60, dec_start, jan_start)),
+        )
+        .await;
+    assert_eq!(first.status, StatusCode::CREATED, "{}", first.raw);
+    let second = world
+        .call(
+            "POST",
+            "/control/v1/allocations",
+            Some(&root),
+            Some(free("f-2", "eduai", "s2", 60, dec_start, jan_start)),
+        )
+        .await;
+    assert_eq!(
+        (second.status, second.reason()),
+        (StatusCode::CONFLICT, "allocation_exceeds_grantor"),
+        "{}",
+        second.raw
+    );
+    assert_eq!(
+        second.json["error"]["message"],
+        "the subsidy pool's cap for this month cannot cover this free-tier allocation",
+        "the pool's remaining cap is shared across organizations and is not disclosed"
+    );
+    let mislabelled = world
+        .call(
+            "POST",
+            "/control/v1/allocations",
+            Some(&root),
+            Some(free(
+                "f-3",
+                "eduai",
+                "s2",
+                10,
+                dec_start - DAY_MS,
+                jan_start,
+            )),
+        )
+        .await;
+    assert_eq!(
+        (mislabelled.status, mislabelled.reason()),
+        (StatusCode::BAD_REQUEST, "invalid_allocation"),
+        "{}",
+        mislabelled.raw
+    );
+    let conn = world.db();
+    let (grants, allocations): (i64, i64) = (
+        conn.query_row("SELECT count(*) FROM ledger_subsidy_grants", [], |r| {
+            r.get(0)
+        })
+        .unwrap(),
+        conn.query_row(
+            "SELECT count(*) FROM allocations WHERE purpose = 'free_tier'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap(),
+    );
+    assert_eq!((grants, allocations), (1, 1), "only the first grant exists");
+}
+
+#[tokio::test]
+async fn registering_another_organizations_principal_over_http_is_a_plain_conflict() {
+    // PR-Daemon S2 F3 补充：重复登记别的组织的主体，得到固定的 409，没有主体、状态、登记人
+    let world = World::new();
+    world.people().await;
+    let other = world.other.secret.clone();
+    let reply = world
+        .call(
+            "POST",
+            "/control/v1/principals",
+            Some(&other),
+            Some(json!({"principal_id": "kid1", "org": "school-b"})),
+        )
+        .await;
+    assert_eq!(
+        (reply.status, reply.reason()),
+        (StatusCode::CONFLICT, "already_exists"),
+        "{}",
+        reply.raw
+    );
+    assert!(reply.json.get("data").is_none(), "{}", reply.raw);
+    assert!(
+        !reply.raw.contains("active") && !reply.raw.contains("revoked"),
+        "no status: {}",
+        reply.raw
+    );
+    // 登记它的组织自己重发：照旧是 replayed，带状态
+    let again = world
+        .call(
+            "POST",
+            "/control/v1/principals",
+            Some(&world.root.secret),
+            Some(json!({"principal_id": "kid1", "org": "eduai"})),
+        )
+        .await;
+    assert_eq!(again.json["result"], "replayed", "{}", again.raw);
+    assert_eq!(again.json["data"]["principal"]["status"], "active");
+}
+
+#[tokio::test]
 async fn parallel_wrong_pairing_codes_cannot_all_get_to_the_database_lookup() {
     // PR-Daemon S2 F1：限速器「先检查、后记录」——失败要等数据库查完才记，所以并发的猜码全都先过了检查。
     // 200 个并发的错码，旧代码全部走到了查询（200 个 pairing_code_invalid）。现在先占名额再查：窗口里最多 20 次
