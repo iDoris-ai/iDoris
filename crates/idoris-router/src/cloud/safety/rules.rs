@@ -15,7 +15,10 @@
 //!   `system` / `developer` 角色、工具定义、结构化输出、`stop`：角色是客户端填的，不证明这段话来自运营方（r3 High#1）。
 //!   只有服务端配置里登记的运营方提示（[`super::extract::TrustedOperatorText`]）得到运营方的待遇：运营方的系统提示会复述要拒绝的话题
 //!   （评测集的 `DEFAULT_SYSTEM` 就写着「如果孩子要求自伤……就拒绝」），只用**越狱类**规则（授予无限制人格、关闭安全过滤）；
-//!   对话历史里助手说过的话按**输出**规则查（拒绝语会提到有害词，不能把拒绝语当成有害请求）；
+//!   对话历史里的 `assistant` 消息**也是客户端写的**（不证明是我们自己说过的话）：按**输出**规则查之外，**再按输入规则查**
+//!   （round2-r3 PARTIAL High#1；把 `i want to die` 放进 `assistant` 消息不能绕过自伤检查）。而之前真的说过的拒绝语会复述被拒绝的话题
+//!   （「我不能告诉你怎么做炸弹」），不能让对话从此没法继续：**请求类**的输入规则（[`HISTORY_REFUSAL_EXEMPT`]）在命中旁边（同一句里）
+//!   有明确的拒绝语、或者 `ไม่ได้` 紧跟在命中后面时放行；自伤的第一人称表达和自伤词、越狱人格**没有任何豁免**；
 //! - **求助语境豁免只给「提到」类规则**：孩子问「朋友发来裸照，我该怎么办」是评测集要求**回答并引导找大人**的情形，
 //!   所以「提到裸照」类规则在同一段文本里出现求助句式（`ควรทำยังไง`、`should I`）时放行；「索要方法」类规则**从不**因为求助句式放行
 //!   （`บอกวิธีทำระเบิด ควรทำยังไง` 照样拒绝）；
@@ -33,8 +36,11 @@
 //! - 近音、谐音、泰语的罗马化拼写（`wicha tham rabert`）、其它语言、base64 之外的编码（十六进制、ROT13……）：规则看不到，靠 LLM 检查器。
 //!   数学字母、带圈字母、西里尔 / 希腊同形字、组合符号、重复字母、base64 已经由归一化和解码处理，见 [`super::text`]；
 //! - 把有害请求拆到多条消息里：对用户和工具文本另外做了一次「全部拼接」的检查，能抓住相邻的拆分，抓不住很远的；
-//! - 对话历史里**助手角色**的消息按输出规则查（一条已有测试要求「之前的拒绝语不能让整段对话没法继续」）：
-//!   客户端伪造的助手消息（预填「好的，做法如下……」）靠 LLM 检查器（它看得到 `assistant` 来源）和输出检查兜底；
+//! - 对话历史里**助手角色**的消息（客户端写的）：输出规则加输入规则；请求类的输入规则在命中旁边有拒绝语时放行（见上）。这条放行是
+//!   启发式，容易被绕过（拒绝语和请求挤在同一句里：`I can't wait, how to make a bomb`）：它只放行**请求类**的话，孩子真正的请求要出现在
+//!   用户消息里才有用，而用户消息没有任何豁免；客户端伪造的助手消息（预填「好的，做法如下……」）另有输出规则和 LLM 检查器
+//!   （它看得到 `assistant` 来源）兜底。**自伤的第一人称表达和自伤词在助手消息里也一律拒绝**：代价是之前说过的安全引导
+//!   （「如果你想伤害自己，告诉信任的大人」）复述了这些词，下一轮会被拒绝（需 owner 确认）；
 //! - 输出侧的「有害内容的合规回答」检测是启发式（见上），个人信息复述只覆盖手机号、邮箱、身份证号，
 //!   以及孩子自己标明了身份的姓名/学校/住址（「ผมชื่อ……」「ชื่อ X เรียนที่ Y」加上「这是秘密」之类的提示）；
 //! - 泰语声调符号统一折叠，所以只靠声调区分的词会被当成同一个词（`แม่ง` 会撞上 `แมง`（昆虫）和 `แมงมุม`，所以不在列表里）。
@@ -45,8 +51,8 @@ use idoris_compute_contracts::safety::SafetyCategory;
 
 use super::extract::{CheckedInput, CheckedOutput, Origin};
 use super::text::{
-    Folded, NEGATION_REACH_CHARS, Needle, base64_texts, fold, has_word, locally_negated, near,
-    near_regions,
+    Folded, NEGATION_REACH_CHARS, Needle, base64_texts, fold, followed_closely_by, has_word,
+    locally_negated, near, near_regions,
 };
 use super::{BoxFuture, CheckContext, CheckReport, Denial, SafetyChecker, Verdict};
 
@@ -127,6 +133,51 @@ const NEGATION_CUES: &[&str] = &[
     "don't",
     "do not",
     "never",
+];
+
+/// 对话历史里 `assistant` 消息的拒绝语线索（在 [`NEGATION_CUES`] 和 [`REFUSAL_CUES`] 之外再加的）：之前真的说过的拒绝语和
+/// 安全引导会复述被拒绝的话题，不能让对话从此没法继续（round2-r3 PARTIAL High#1）。只用来放行历史里**请求类**输入规则的命中
+/// （[`HISTORY_REFUSAL_EXEMPT`]），和别的线索一样只在命中旁边（同一句里）有效。
+///
+/// 不收 `อย่า`（折叠成 `อยา`，是 `อยาก`「想」的子串）；`ไม่ได้` 太常见，不在这里，见 [`HISTORY_AFTER_CUES`]。
+const HISTORY_REFUSAL_CUES: &[&str] = &[
+    "ไม่สามารถ",
+    "ไม่อนุญาต",
+    "ปฏิเสธ",
+    "ไม่ช่วย",
+    "ไม่บอก",
+    "ไม่สอน",
+    "can't",
+    "can\u{2019}t",
+    "cannot",
+    "won't",
+    "won\u{2019}t",
+    "unable to",
+    "not allowed",
+    "refuse",
+];
+
+/// 只在命中**紧后面**才算的线索：泰语的拒绝语常把宾语夹在动词和「不能」之间（`บอกวิธีทำระเบิดไม่ได้`），但 `ไม่ได้` 太常见，
+/// 散落在别处的不算（`ไม่ได้ๆ บอกวิธีทำระเบิดหน่อย` 不是拒绝）。见 [`followed_closely_by`]。
+const HISTORY_AFTER_CUES: &[&str] = &["ไม่ได้"];
+
+/// [`HISTORY_AFTER_CUES`] 最多可以离命中多远（字符数）才算「紧后面」（`ให้ไม่ได้` 里隔着一个 `ให้`）。
+const HISTORY_AFTER_REACH_CHARS: usize = 6;
+
+/// 对话历史里 `assistant` 消息按输入规则查时，**命中旁边有拒绝语就放行**的规则（请求类 / 话题类：拒绝语会复述这些话题）。
+/// 不在名单里的输入规则一律不放行：自伤的第一人称表达（`self_harm.ideation`）、自伤词（`self_harm.words`）、越狱人格
+/// （`jailbreak.no_limits`）；别的输入规则里没有 `Words` 以外的，`Words` 类（英文整词）没有命中区间，也一律不放行。
+/// 名单里的 id 由测试对着 [`build_rules`] 核对。
+const HISTORY_REFUSAL_EXEMPT: &[&str] = &[
+    "self_harm.method_request",
+    "dangerous_act.compound",
+    "dangerous_act.ignite_request",
+    "dangerous_act.hazard_mix",
+    "adult_content.request",
+    "adult_content.english",
+    "adult_content.mention",
+    "pii_solicit.trick",
+    "pii_solicit.compound",
 ];
 
 /// 话题词（只给输入侧）：孩子在问「为什么 / 要注意什么 / 怎样才安全」，是安全教育的问题，不是索要方法。
@@ -705,6 +756,21 @@ fn unless_matches(
     any: impl Fn(&Folded) -> bool,
     regions: impl Fn(&Folded) -> Vec<(usize, usize)>,
 ) -> bool {
+    unless_matches_with(
+        folded,
+        |current, hit| locally_negated(current, hit, cues, NEGATION_REACH_CHARS),
+        any,
+        regions,
+    )
+}
+
+/// [`unless_matches`]，放行的判断由 `excused` 给：`excused(当前文本, 一处命中的区间)`。
+fn unless_matches_with(
+    folded: &Folded,
+    excused: impl Fn(&Folded, (usize, usize)) -> bool,
+    any: impl Fn(&Folded) -> bool,
+    regions: impl Fn(&Folded) -> Vec<(usize, usize)>,
+) -> bool {
     if !any(folded) {
         return false;
     }
@@ -714,10 +780,7 @@ fn unless_matches(
         if hits.is_empty() || hits.len() > MAX_NEGATED_HITS {
             return true;
         }
-        if hits
-            .iter()
-            .any(|&hit| !locally_negated(&current, hit, cues, NEGATION_REACH_CHARS))
-        {
+        if hits.iter().any(|&hit| !excused(&current, hit)) {
             return true;
         }
         current = current.mask(&hits);
@@ -760,6 +823,31 @@ const UNTRUSTED_AND_MODEL: Applies = Applies {
     model: true,
 };
 
+/// 规则用在哪一类文本上（[`Origin`] 到规则集的映射）。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Scope {
+    /// 孩子和工具写的文本：最严的一套输入规则。
+    Untrusted,
+    /// 服务端登记的运营方提示：只查越狱类。
+    Operator,
+    /// 模型写的文本（回答、工具参数）：输出规则。
+    Model,
+    /// 对话历史里客户端写的 `assistant` 消息：输出规则，**再加**输入规则（请求类的命中旁边有拒绝语就放行，
+    /// 见 [`HISTORY_REFUSAL_EXEMPT`]；round2-r3 PARTIAL High#1）。
+    History,
+}
+
+impl Scope {
+    fn includes(self, applies: &Applies) -> bool {
+        match self {
+            Scope::Untrusted => applies.untrusted,
+            Scope::Operator => applies.operator,
+            Scope::Model => applies.model,
+            Scope::History => applies.model || applies.untrusted,
+        }
+    }
+}
+
 struct Rule {
     id: &'static str,
     category: SafetyCategory,
@@ -770,6 +858,45 @@ struct Rule {
 }
 
 impl Rule {
+    /// 对话历史里的 `assistant` 消息：模型写的规则照常；只在输入侧的规则，**请求类**（[`HISTORY_REFUSAL_EXEMPT`]）在每一处命中
+    /// 旁边（同一句里）有拒绝语、或者 `ไม่ได้` 紧跟在命中后面时放行，别的输入规则一律不放行。
+    fn matches_in_history(&self, folded: &Folded, cues: &Cues<'_>) -> bool {
+        if self.applies.model || !HISTORY_REFUSAL_EXEMPT.contains(&self.id) {
+            return self.matches(folded, cues);
+        }
+        let excused_by = |here: &[Needle], current: &Folded, hit: (usize, usize)| {
+            locally_negated(current, hit, here, NEGATION_REACH_CHARS)
+                || followed_closely_by(current, hit, cues.history_after, HISTORY_AFTER_REACH_CHARS)
+        };
+        match &self.matcher {
+            Matcher::Any(list) => unless_matches_with(
+                folded,
+                |current, hit| excused_by(cues.history, current, hit),
+                |f| list.iter().any(|needle| needle.found_in(f)),
+                |f| {
+                    list.iter()
+                        .flat_map(|needle| needle.plain_spans(f))
+                        .collect()
+                },
+            ),
+            Matcher::Near { a, b, gap, either } => unless_matches_with(
+                folded,
+                |current, hit| excused_by(cues.history, current, hit),
+                |f| near(f, a, b, *gap, *either),
+                |f| near_regions(f, a, b, *gap, *either, MAX_NEGATED_HITS),
+            ),
+            // 本来就能被否定词和话题词放行的两条（点火、混合毒气）：历史里再加上拒绝语
+            Matcher::NearUnless { a, b, gap, .. } => unless_matches_with(
+                folded,
+                |current, hit| excused_by(cues.history_topical, current, hit),
+                |f| near(f, a, b, *gap, true),
+                |f| near_regions(f, a, b, *gap, true, MAX_NEGATED_HITS),
+            ),
+            // 没有命中区间的（整词匹配）：名单里没有，不会走到这里；万一走到，按不放行
+            Matcher::Words(_) | Matcher::AnyUnless(..) => self.matches(folded, cues),
+        }
+    }
+
     fn matches(&self, folded: &Folded, cues: &Cues<'_>) -> bool {
         match &self.matcher {
             Matcher::Any(list) => list.iter().any(|needle| needle.found_in(folded)),
@@ -795,12 +922,18 @@ impl Rule {
     }
 }
 
-/// 放行线索（预先折叠）：输入侧和输出侧各一组。
+/// 放行线索（预先折叠）：输入侧和输出侧各一组，再加对话历史里 `assistant` 消息用的几组。
 struct Cues<'a> {
     /// 否定词 + 话题词。
     input: &'a [Needle],
     /// 否定词 + 明确的拒绝语。
     output: &'a [Needle],
+    /// 历史里的请求类规则：否定词 + 明确的拒绝语 + [`HISTORY_REFUSAL_CUES`]（命中旁边，同一句里）。
+    history: &'a [Needle],
+    /// 历史里本来就带话题词的两条规则（点火、混合毒气）：上面那一组再加话题词。
+    history_topical: &'a [Needle],
+    /// 只在命中紧后面才算的线索（[`HISTORY_AFTER_CUES`]）。
+    history_after: &'a [Needle],
 }
 
 impl Cues<'_> {
@@ -1287,6 +1420,12 @@ pub struct RuleChecker {
     input_cues: Vec<Needle>,
     /// 输出侧能放行一处命中的线索：否定词 + 明确的拒绝语。
     output_cues: Vec<Needle>,
+    /// 对话历史里 `assistant` 消息的请求类规则：否定词 + 明确的拒绝语 + [`HISTORY_REFUSAL_CUES`]。
+    history_cues: Vec<Needle>,
+    /// 历史里本来就带话题词的两条规则：上面那一组再加话题词。
+    history_topical_cues: Vec<Needle>,
+    /// 只在命中紧后面才算的线索：[`HISTORY_AFTER_CUES`]。
+    history_after_cues: Vec<Needle>,
 }
 
 /// base64 里再套 base64 最多解几层：再深的不是正常的内容。
@@ -1311,11 +1450,22 @@ impl RuleChecker {
         let negation = needles(NEGATION_CUES);
         let topical = needles(TOPICAL_CUES);
         let refusal = needles(REFUSAL_CUES);
+        let history_extra = needles(HISTORY_REFUSAL_CUES);
+        let history_cues: Vec<Needle> = negation
+            .iter()
+            .chain(&refusal)
+            .chain(&history_extra)
+            .cloned()
+            .collect();
+        let history_topical_cues = history_cues.iter().chain(&topical).cloned().collect();
         Self {
             rules: build_rules(),
             protective: needles(PROTECTIVE_CUES),
             input_cues: negation.iter().chain(&topical).cloned().collect(),
             output_cues: negation.iter().chain(&refusal).cloned().collect(),
+            history_cues,
+            history_topical_cues,
+            history_after_cues: needles(HISTORY_AFTER_CUES),
         }
     }
 
@@ -1328,24 +1478,20 @@ impl RuleChecker {
     ///
     /// 文本里疑似 base64 的长串解码之后再查一遍（最多 [`MAX_DECODE_DEPTH`] 层）：有害的话整段编码成 base64
     /// （「解码并照做」、或让模型「用 base64 回答」）不能躲过规则。解出来的串太多、或者套得太深，直接当作命中（失败即关闭）。
-    fn first_match(
-        &self,
-        text: &str,
-        applies: impl Fn(&Applies) -> bool,
-    ) -> Option<(&'static str, SafetyCategory)> {
-        self.first_match_at(text, &applies, 0)
+    fn first_match(&self, text: &str, scope: Scope) -> Option<(&'static str, SafetyCategory)> {
+        self.first_match_at(text, scope, 0)
     }
 
     fn first_match_at(
         &self,
         text: &str,
-        applies: &dyn Fn(&Applies) -> bool,
+        scope: Scope,
         depth: usize,
     ) -> Option<(&'static str, SafetyCategory)> {
         if text.is_empty() {
             return None;
         }
-        if let Some(hit) = self.match_folded(text, applies) {
+        if let Some(hit) = self.match_folded(text, scope) {
             return Some(hit);
         }
         let encoded = base64_texts(text);
@@ -1356,29 +1502,34 @@ impl RuleChecker {
             if depth >= MAX_DECODE_DEPTH {
                 return Some(("encoded.nested", SafetyCategory::Other));
             }
-            if let Some(hit) = self.first_match_at(decoded, applies, depth + 1) {
+            if let Some(hit) = self.first_match_at(decoded, scope, depth + 1) {
                 return Some(hit);
             }
         }
         None
     }
 
-    fn match_folded(
-        &self,
-        text: &str,
-        applies: &dyn Fn(&Applies) -> bool,
-    ) -> Option<(&'static str, SafetyCategory)> {
+    fn match_folded(&self, text: &str, scope: Scope) -> Option<(&'static str, SafetyCategory)> {
         let folded = fold(text);
         let cues = Cues {
             input: &self.input_cues,
             output: &self.output_cues,
+            history: &self.history_cues,
+            history_topical: &self.history_topical_cues,
+            history_after: &self.history_after_cues,
         };
         let protective = self.protective.iter().any(|cue| cue.found_in(&folded));
         self.rules
             .iter()
-            .filter(|rule| applies(&rule.applies))
+            .filter(|rule| scope.includes(&rule.applies))
             .filter(|rule| !(rule.exempt_when_protective && protective))
-            .find(|rule| rule.matches(&folded, &cues))
+            .find(|rule| {
+                if scope == Scope::History {
+                    rule.matches_in_history(&folded, &cues)
+                } else {
+                    rule.matches(&folded, &cues)
+                }
+            })
             .map(|rule| (rule.id, rule.category))
     }
 
@@ -1387,9 +1538,10 @@ impl RuleChecker {
         for segment in &input.segments {
             let text = segment.text.expose();
             let hit = match segment.origin {
-                Origin::User | Origin::Tool => self.first_match(text, |a| a.untrusted),
-                Origin::Operator => self.first_match(text, |a| a.operator),
-                Origin::Assistant => self.first_match(text, |a| a.model),
+                Origin::User | Origin::Tool => self.first_match(text, Scope::Untrusted),
+                Origin::Operator => self.first_match(text, Scope::Operator),
+                // 客户端写的 `assistant` 消息：输出规则 + 输入规则（请求类的命中旁边有拒绝语才放行）
+                Origin::Assistant => self.first_match(text, Scope::History),
             };
             if hit.is_some() {
                 return hit;
@@ -1399,7 +1551,7 @@ impl RuleChecker {
         let joined: Vec<&str> = input.untrusted_texts().collect();
         if joined.len() > 1 {
             let blob = joined.join(" \n ");
-            return self.first_match(&blob, |a| a.untrusted);
+            return self.first_match(&blob, Scope::Untrusted);
         }
         None
     }
@@ -1413,14 +1565,14 @@ impl RuleChecker {
         // 工具参数里的 JSON 转义（`k`）解码之后才是模型要表达的字：检查的是解码后的键和值（见 `CheckedOutput::all_texts`）
         let texts = output.all_texts();
         for text in &texts {
-            if let Some(hit) = self.first_match(text, |a| a.model) {
+            if let Some(hit) = self.first_match(text, Scope::Model) {
                 return Some(hit);
             }
         }
         // 工具名 + 参数拼在一起再查一遍（拆分）
         if texts.len() > 1 {
             let blob = texts.join(" \n ");
-            if let Some(hit) = self.first_match(&blob, |a| a.model) {
+            if let Some(hit) = self.first_match(&blob, Scope::Model) {
                 return Some(hit);
             }
         }

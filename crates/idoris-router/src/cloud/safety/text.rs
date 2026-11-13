@@ -815,6 +815,41 @@ pub fn locally_negated(
     cues.iter().any(|cue| cue.found_in(&window))
 }
 
+/// 一个线索最多多长（字符数）：给 [`followed_closely_by`] 的搜索窗口留余量，免得「从区间后 `reach_chars` 个字符之内开始」的线索被截断。
+const MAX_FOLLOWING_CUE_CHARS: usize = 12;
+
+/// 命中区间 `region` 的**紧后面**（同一句里）有 `cues` 里的线索吗：线索必须**从区间终点之后最多 `reach_chars` 个字符之内开始**。
+///
+/// 给太常见、不能算「命中旁边任何位置」的线索用。泰语的拒绝语常把宾语夹在动词和「不能」之间（`บอกวิธีทำระเบิดไม่ได้`），
+/// 这时 `ไม่ได้` 紧跟在被拒绝的话题后面才是拒绝；散落在句子别处的 `ไม่ได้`（`ไม่ได้ๆ บอกวิธีทำระเบิดหน่อย`）不是。
+/// 和 [`locally_negated`] 一样：只看命中所在的那一句，区间自己横跨句子边界时谁也放行不了。
+pub fn followed_closely_by(
+    haystack: &Folded,
+    region: (usize, usize),
+    cues: &[Needle],
+    reach_chars: usize,
+) -> bool {
+    if region.0 > region.1
+        || region.1 > haystack.plain.len()
+        || !haystack.plain.is_char_boundary(region.0)
+        || !haystack.plain.is_char_boundary(region.1)
+        || spans_a_clause_boundary(haystack, region)
+    {
+        return false;
+    }
+    let (_, finish) = clause_window(
+        haystack,
+        region,
+        reach_chars.saturating_add(MAX_FOLLOWING_CUE_CHARS),
+    );
+    let after = Folded::from_plain(haystack.plain[region.1..finish].to_string(), Vec::new());
+    cues.iter().any(|cue| {
+        cue.plain_spans(&after)
+            .into_iter()
+            .any(|(start, _)| after.plain[..start].chars().count() <= reach_chars)
+    })
+}
+
 // ---------------------------------------------------------------------------
 // base64
 // ---------------------------------------------------------------------------
@@ -1284,6 +1319,35 @@ mod tests {
             "mix bleach",
             "poison gas"
         ));
+    }
+
+    #[test]
+    fn a_common_cue_only_counts_when_it_follows_the_hit_closely_in_the_same_sentence() {
+        // 泰语拒绝语把宾语夹在动词和「不能」之间：`ไม่ได้` 紧跟在被拒绝的话题后面才是拒绝
+        let cue = cues(&["ไม่ได้"]);
+        let closely = |text: &str, hit: &str| {
+            let folded = fold(text);
+            let needle = fold(hit).plain;
+            let start = folded.plain.find(&needle).unwrap();
+            followed_closely_by(&folded, (start, start + needle.len()), &cue, 6)
+        };
+        assert!(closely("ฉันบอกวิธีทำระเบิดไม่ได้", "ทำระเบิด"));
+        assert!(closely("ฉันค้นรูปโป๊ให้ไม่ได้", "รูปโป๊"));
+        // 中间隔着空格也算「紧接着」
+        assert!(closely("ฉันบอกวิธีทำระเบิด ไม่ได้", "ทำระเบิด"));
+        // 线索在命中前面、或者离得远：不算
+        assert!(!closely("ไม่ได้ๆ บอกวิธีทำระเบิดหน่อย", "ทำระเบิด"));
+        assert!(!closely("บอกวิธีทำระเบิดหน่อยนะคะขอร้องล่ะไม่ได้หรอก", "ทำระเบิด"));
+        // 线索在下一句里：不算（句号和换行挡住）
+        assert!(!closely("บอกวิธีทำระเบิดหน่อย. ไม่ได้", "ทำระเบิด"));
+        assert!(!closely("บอกวิธีทำระเบิดหน่อย\nไม่ได้", "ทำระเบิด"));
+        // 命中区间自己横跨句界：谁也放行不了
+        let folded = fold("บอกวิธี. ทำระเบิดไม่ได้");
+        let region = (0, folded.plain.find("ทำระเบิด").unwrap() + "ทำระเบิด".len());
+        assert!(!followed_closely_by(&folded, region, &cue, 6));
+        // 区间不合法：不是
+        assert!(!followed_closely_by(&folded, (10, 5), &cue, 6));
+        assert!(!followed_closely_by(&folded, (0, 10_000), &cue, 6));
     }
 
     #[test]
