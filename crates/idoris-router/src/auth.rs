@@ -97,9 +97,26 @@ pub fn enforce_scope(
     Ok(())
 }
 
+/// The last gate of data-plane authentication (compute service S2): after a bearer secret has been
+/// matched to an active, unexpired virtual key, ask whether the *credential* behind that key is still
+/// usable right now. Implemented by the account store in the organization and cloud forms; absent
+/// (`None`) in the personal form and in every legacy tenant deployment, where authentication is exactly
+/// what it was before.
+///
+/// The check runs on **every** request and nothing is cached, so revoking a credential, freezing it,
+/// revoking its membership or principal, or freezing/closing any account above it takes effect on the
+/// very next request. `Ok(())` lets the request through (including keys the gate does not manage, such
+/// as local data keys issued with `idoris key issue`); `Err(Unauthorized)` refuses it, with the same
+/// opaque answer as an unknown key; `Err(Unavailable)` means the answer could not be determined and the
+/// request fails closed.
+pub trait CredentialGate: Send + Sync {
+    fn check(&self, key_id: &str, now_ms: i64) -> Result<(), VirtualKeyAuthError>;
+}
+
 #[derive(Clone)]
 pub struct VirtualKeyAuthenticator {
     store: Arc<Mutex<VirtualKeyStore>>,
+    gate: Option<Arc<dyn CredentialGate>>,
     #[cfg(test)]
     before_store_lock: Option<Arc<tokio::sync::Notify>>,
 }
@@ -108,9 +125,17 @@ impl VirtualKeyAuthenticator {
     pub fn new(store: Arc<Mutex<VirtualKeyStore>>) -> Self {
         Self {
             store,
+            gate: None,
             #[cfg(test)]
             before_store_lock: None,
         }
+    }
+
+    /// Installs the credential gate (organization and cloud forms). Without it authentication is
+    /// byte-for-byte the pre-S2 behaviour.
+    pub fn with_gate(mut self, gate: Arc<dyn CredentialGate>) -> Self {
+        self.gate = Some(gate);
+        self
     }
 
     pub async fn authenticate(
@@ -119,6 +144,7 @@ impl VirtualKeyAuthenticator {
     ) -> Result<AuthenticatedVirtualKey, VirtualKeyAuthError> {
         let secret = bearer_secret(headers)?;
         let store = self.store.clone();
+        let gate = self.gate.clone();
         #[cfg(test)]
         let before_store_lock = self.before_store_lock.clone();
         tokio::task::spawn_blocking(move || {
@@ -126,7 +152,7 @@ impl VirtualKeyAuthenticator {
             if let Some(notify) = before_store_lock {
                 notify.notify_one();
             }
-            authenticate_secret(&store, secret)
+            authenticate_secret(&store, gate.as_deref(), secret)
         })
         .await
         .map_err(|_| VirtualKeyAuthError::Unavailable)?
@@ -139,7 +165,7 @@ impl VirtualKeyAuthenticator {
         now_ms: i64,
     ) -> Result<AuthenticatedVirtualKey, VirtualKeyAuthError> {
         let secret = bearer_secret(headers)?;
-        authenticate_secret_with_clock(&self.store, secret, || Ok(now_ms))
+        authenticate_secret_with_clock(&self.store, self.gate.as_deref(), secret, || Ok(now_ms))
     }
 
     #[cfg(test)]
@@ -151,32 +177,41 @@ impl VirtualKeyAuthenticator {
 
 fn authenticate_secret(
     store: &Arc<Mutex<VirtualKeyStore>>,
+    gate: Option<&dyn CredentialGate>,
     secret: VirtualKeySecret,
 ) -> Result<AuthenticatedVirtualKey, VirtualKeyAuthError> {
-    authenticate_secret_with_clock(store, secret, server_now_ms)
+    authenticate_secret_with_clock(store, gate, secret, server_now_ms)
 }
 
 fn authenticate_secret_with_clock(
     store: &Arc<Mutex<VirtualKeyStore>>,
+    gate: Option<&dyn CredentialGate>,
     secret: VirtualKeySecret,
     mut now_ms: impl FnMut() -> Result<i64, VirtualKeyAuthError>,
 ) -> Result<AuthenticatedVirtualKey, VirtualKeyAuthError> {
-    let store = store.lock().map_err(|_| VirtualKeyAuthError::Unavailable)?;
-    let lookup_now = now_ms()?;
-    let identity = store
-        .authenticate(&secret, lookup_now)
-        .map_err(|_| VirtualKeyAuthError::Unavailable)?
-        .ok_or(VirtualKeyAuthError::Unauthorized)?;
-    let decision_now = now_ms()?;
-    if decision_now < lookup_now {
-        return Err(VirtualKeyAuthError::Unavailable);
-    }
-    if identity
-        .scope
-        .expires_at_ms
-        .is_some_and(|expires| expires <= decision_now)
-    {
-        return Err(VirtualKeyAuthError::Unauthorized);
+    // The key store lock is released before the gate runs: the gate reads another store.
+    let (identity, decision_now) = {
+        let store = store.lock().map_err(|_| VirtualKeyAuthError::Unavailable)?;
+        let lookup_now = now_ms()?;
+        let identity = store
+            .authenticate(&secret, lookup_now)
+            .map_err(|_| VirtualKeyAuthError::Unavailable)?
+            .ok_or(VirtualKeyAuthError::Unauthorized)?;
+        let decision_now = now_ms()?;
+        if decision_now < lookup_now {
+            return Err(VirtualKeyAuthError::Unavailable);
+        }
+        if identity
+            .scope
+            .expires_at_ms
+            .is_some_and(|expires| expires <= decision_now)
+        {
+            return Err(VirtualKeyAuthError::Unauthorized);
+        }
+        (identity, decision_now)
+    };
+    if let Some(gate) = gate {
+        gate.check(&identity.key_id, decision_now)?;
     }
     Ok(identity)
 }
@@ -190,7 +225,7 @@ fn server_now_ms() -> Result<i64, VirtualKeyAuthError> {
         .map_err(|_| VirtualKeyAuthError::Unavailable)
 }
 
-fn bearer_secret(headers: &HeaderMap) -> Result<VirtualKeySecret, VirtualKeyAuthError> {
+pub(crate) fn bearer_secret(headers: &HeaderMap) -> Result<VirtualKeySecret, VirtualKeyAuthError> {
     let mut values = headers.get_all(AUTHORIZATION).iter();
     let first = values.next().ok_or(VirtualKeyAuthError::Unauthorized)?;
     if values.next().is_some() {

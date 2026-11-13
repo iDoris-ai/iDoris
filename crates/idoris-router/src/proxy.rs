@@ -329,7 +329,7 @@ impl EgressCounter {
 /// off-host provider. Loopback runtimes retain the caller's original payload.
 const IDENTITY_FIELDS: &[&str] = &["user", "safety_identifier", "prompt_cache_key", "metadata"];
 
-fn decorrelate(payload: &Value) -> Value {
+pub(crate) fn decorrelate(payload: &Value) -> Value {
     let mut stripped = payload.clone();
     if let Some(object) = stripped.as_object_mut() {
         for field in IDENTITY_FIELDS {
@@ -539,6 +539,9 @@ pub struct ChatProxy {
     /// still says persistent 5xx is passed through verbatim, so enabling
     /// breakers by default is an owner decision, not a silent change.
     breaker_enabled: std::sync::atomic::AtomicBool,
+    /// S6（儿童安全）：不使用幂等缓存的租户（取值是缓存键里的租户范围，见 [`cache_key`]）。
+    /// 这些租户的响应正文不在代理里留存：不写响应缓存，也不登记重放（飞行表）。空 = 所有租户照旧。
+    uncached_tenants: std::sync::RwLock<std::collections::BTreeSet<String>>,
     #[cfg(test)]
     test_clock_ms: std::sync::atomic::AtomicU64,
     pub(crate) window: Duration,
@@ -570,6 +573,25 @@ impl ChatProxy {
 
     fn breakers_enabled(&self) -> bool {
         self.breaker_enabled.load(Ordering::SeqCst)
+    }
+
+    /// S6：关闭这些租户的响应缓存。`scopes` 是缓存键里的租户范围（租户 id；没有租户的默认调用方是 `"\u{0}personal"`）。
+    /// 关闭之后，这些租户的请求不读缓存、不写缓存、不登记重放：响应正文不在代理里留存（设计稿 §7：edu 关缓存）。
+    /// 只增不减：进程运行期间不会重新打开。
+    pub fn disable_cache_for_tenants(&self, scopes: impl IntoIterator<Item = String>) {
+        let mut set = self
+            .uncached_tenants
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        set.extend(scopes);
+    }
+
+    /// 这个租户范围的缓存是否被关闭。**读不到名单（锁损坏）按「关闭」处理**：失败即关闭，宁可不缓存。
+    fn cache_disabled_for(&self, tenant_scope: &str) -> bool {
+        match self.uncached_tenants.read() {
+            Ok(set) => set.contains(tenant_scope),
+            Err(_) => true,
+        }
     }
 
     fn now_ms(&self) -> u64 {
@@ -796,6 +818,7 @@ impl ChatProxy {
             egress: Arc::new(EgressCounter::default()),
             breakers: Mutex::new(idoris_policy::breaker::BreakerBook::new()),
             breaker_enabled: std::sync::atomic::AtomicBool::new(true),
+            uncached_tenants: std::sync::RwLock::new(std::collections::BTreeSet::new()),
             #[cfg(test)]
             test_clock_ms: std::sync::atomic::AtomicU64::new(u64::MAX),
             window: DEFAULT_WINDOW,
@@ -1197,7 +1220,9 @@ impl ChatProxy {
             return Ok(Self::failure(502, 0));
         };
         let url = format!("{}{}", endpoint.trim_end_matches('/'), path.path);
-        let Some(request_id) = opts.request_id else {
+        // S6：这个租户的缓存被关闭时，当作「没有幂等键」：不读缓存、不写缓存、不登记重放，正文不在代理里留存
+        let cache_off = self.cache_disabled_for(opts.tenant_id.unwrap_or("\u{0}personal"));
+        let Some(request_id) = opts.request_id.filter(|_| !cache_off) else {
             let mut uncertain = false;
             let outcome = self
                 .forward_once_observed(&url, &payload, opts, &fingerprint, &mut uncertain, observer)
@@ -1474,7 +1499,10 @@ impl ChatProxy {
     {
         let tenant_scope = opts.tenant_id.unwrap_or("\u{0}personal");
 
-        if let Some(request_id) = opts.request_id {
+        if let Some(request_id) = opts
+            .request_id
+            .filter(|_| !self.cache_disabled_for(tenant_scope))
+        {
             let key = cache_key(tenant_scope, url, opts.provider_id, request_id);
             if let Some(hit) = self.lookup_cached(&key, fingerprint, opts) {
                 return Ok(hit);

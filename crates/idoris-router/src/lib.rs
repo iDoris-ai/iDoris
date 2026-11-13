@@ -71,6 +71,8 @@ pub mod key_issue;
 pub mod key_manage;
 /// Stable four-way routing/audit reason taxonomy.
 pub mod reason;
+/// Deployment form (`IDORIS_FORM`) wired into start-up (compute service S1).
+pub mod startup_form;
 /// Persistent record/budget storage bootstrap (B1 task18).
 pub mod storage;
 mod usage;
@@ -98,6 +100,26 @@ pub mod connection;
 
 /// Subscription registration/runtime/dispatch gates.
 pub mod subscription;
+
+/// idoris.ai/api compute service S4: the cloud upstream (OpenAI-compatible
+/// third-party endpoints driven by the `idoris-compute-contracts` state
+/// machine). Default off: `AppState::cloud` is `None` unless
+/// `IDORIS_CLOUD_UPSTREAM_CONFIG` is set, and then nothing else changes.
+pub mod cloud;
+
+/// idoris.ai/api compute service S2: the write-side control plane
+/// (`/control/v1`, separate from the read-only Admin v0) and the data-plane
+/// credential gate. Default off: `AppState::control` is `None` unless the
+/// organization or cloud form is declared (`IDORIS_FORM`), and then the
+/// personal form and every legacy tenant deployment behave exactly as before.
+pub mod control;
+
+/// idoris.ai/api compute service S7: the local / organization **cloud tier** — a fallback channel from this node to
+/// idoris.ai/api for requests whose privacy class allows it, whose caller explicitly consented and which this node
+/// cannot serve. Default off: `AppState::cloud_tier` is `None` unless `IDORIS_CLOUD_TIER_CONFIG` is set, and then every
+/// existing route, header and error body is exactly as it was (the hooks in `chat_completions` return the local
+/// response untouched). `local_only` requests never reach it.
+pub mod cloud_tier;
 
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -273,6 +295,22 @@ pub struct AppState {
     /// `Arc` because `ChatProxy` holds a `Mutex`-guarded cache, same reason
     /// `budget_ledger` above is `Arc`-wrapped rather than `Clone`.
     pub proxy: Arc<proxy::ChatProxy>,
+    /// idoris.ai/api cloud upstream (S4). `None` (the default) leaves every
+    /// existing route and behavior exactly as it was; `Some` replaces the
+    /// `POST /v1/chat/completions` handler with the cloud one in `build_app`.
+    pub cloud: Option<Arc<cloud::CloudUpstream>>,
+    /// idoris.ai/api control plane (S2). `None` (the default, and always in the
+    /// personal form and in legacy tenant deployments) mounts nothing; `Some`
+    /// makes `build_app` merge the `/control/v1` routes in.
+    pub control: Option<Arc<control::ControlPlane>>,
+    /// idoris.ai/api cloud ingress (S5): the public `/api/v1` surface, credential-derived callers, the three-level
+    /// limits and the public abuse protection. `None` (the default, and always outside the cloud form) leaves
+    /// `build_app` exactly as it was; `Some` makes `build_app` hand over to [`cloud::ingress::build_cloud_app`].
+    pub cloud_ingress: Option<Arc<cloud::ingress::CloudIngress>>,
+    /// idoris.ai/api cloud tier (S7): the local node's fallback channel to the cloud. `None` (the default) leaves every
+    /// existing behaviour byte-for-byte as it was; `Some` is consulted only after the local path has failed, and only
+    /// for requests that pass the privacy gate and carry the caller's explicit consent (see `cloud_tier`).
+    pub cloud_tier: Option<Arc<cloud_tier::CloudTier>>,
 }
 
 impl std::fmt::Debug for AppState {
@@ -311,6 +349,16 @@ impl std::fmt::Debug for AppState {
             )
             .field("subscriptions", &self.subscriptions.len())
             .field("proxy", &"ChatProxy { .. }")
+            .field("cloud", &self.cloud.as_ref().map(|_| "configured"))
+            .field("control", &self.control.as_ref().map(|_| "configured"))
+            .field(
+                "cloud_ingress",
+                &self.cloud_ingress.as_ref().map(|_| "configured"),
+            )
+            .field(
+                "cloud_tier",
+                &self.cloud_tier.as_ref().map(|_| "configured"),
+            )
             .finish()
     }
 }
@@ -351,6 +399,10 @@ impl Default for AppState {
             capabilities: None,
             subscriptions: subscription::runtime::SubscriptionRuntimeRegistry::default(),
             proxy: Arc::new(proxy::ChatProxy::new(http_client.clone())),
+            cloud: None,
+            control: None,
+            cloud_ingress: None,
+            cloud_tier: None,
             http_client,
         }
     }
@@ -360,8 +412,36 @@ impl Default for AppState {
 /// `501` fallback for everything else, and the `X-iDoris-Record-Id`
 /// middleware applied to every response.
 pub fn build_app(state: AppState) -> Router {
+    // Cloud form (S5): the public data plane is a different router (`/api/v1`, credential-derived callers, the
+    // ingress guards); nothing of the local pipeline below is mounted there.
+    if let Some(ingress) = state.cloud_ingress.clone() {
+        return cloud::ingress::build_cloud_app(state, ingress);
+    }
     let state = Arc::new(state);
-    Router::new()
+    // Cloud upstream (S4): only when configured; otherwise the router is built exactly as before.
+    let chat_completions_route = if state.cloud.is_some() {
+        post(cloud::chat_completions).fallback(not_found)
+    } else {
+        post(chat_completions).fallback(not_found)
+    };
+    // S6：云形态打开时，这三条旧的推理路由没有儿童安全管线，对处理儿童数据的租户一律关闭（不然换个路径就绕过了）。
+    // 云形态没打开时一字不变：路由、顺序、层都和以前一样。
+    let legacy_inference_routes = Router::new()
+        .route("/v1/embeddings", post(embeddings).fallback(not_found))
+        .route("/v1/rerank", post(rerank).fallback(not_found))
+        .route("/v1/messages", post(messages).fallback(not_found));
+    let legacy_inference_routes = if state.cloud.is_some() {
+        legacy_inference_routes.route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            cloud::child_route_guard,
+        ))
+    } else {
+        legacy_inference_routes
+    };
+    // Control plane (S2): merged in *after* the data-plane layers below, so it never passes through the
+    // data-plane middleware (it authenticates and authorizes every request itself). Absent = nothing is mounted.
+    let control = state.control.clone();
+    let app = Router::new()
         .route("/health", get(health))
         .route("/v1/models", get(list_models).fallback(not_found))
         .route("/capabilities", get(get_capabilities).fallback(not_found))
@@ -381,18 +461,13 @@ pub fn build_app(state: AppState) -> Router {
             "/idoris/tenants/{tenant_id}/budget",
             get(get_tenant_budget).fallback(not_found),
         )
-        .route(
-            "/v1/chat/completions",
-            post(chat_completions).fallback(not_found),
-        )
+        .route("/v1/chat/completions", chat_completions_route)
         .route("/v1/feedback", post(post_feedback).fallback(not_found))
         .route(
             "/v1/inspect",
             post(inspect::post_inspect).fallback(not_found),
         )
-        .route("/v1/embeddings", post(embeddings).fallback(not_found))
-        .route("/v1/rerank", post(rerank).fallback(not_found))
-        .route("/v1/messages", post(messages).fallback(not_found))
+        .merge(legacy_inference_routes)
         .fallback(not_found)
         .layer(middleware::from_fn(
             connection::request_lifecycle_middleware,
@@ -405,7 +480,11 @@ pub fn build_app(state: AppState) -> Router {
             state.clone(),
             record_id_middleware,
         ))
-        .with_state(state)
+        .with_state(state);
+    match control {
+        Some(plane) => app.merge(control::router(plane)),
+        None => app,
+    }
 }
 
 async fn post_feedback(
@@ -789,9 +868,19 @@ async fn embeddings(
             "paid embeddings are unavailable until embeddings usage settlement is defined",
         );
     }
+    // Recorded under the real virtual key (from the authenticated identity the middleware attached)
+    // and the model forwarded upstream (S1).
+    let budget_identity = budget::BudgetIdentity::for_request(
+        remote_identity
+            .as_ref()
+            .map(|identity| identity.0.key_id.as_str()),
+        &value,
+        &selected.card.provider.id,
+    );
     let _reservation = match dispatch::ReservationGuard::reserve(
         state.budget_ledger.as_deref(),
         parsed.tenant_id.as_deref(),
+        &budget_identity,
         &selected.card.provider.id,
         selected.estimated_cost_minor,
     ) {
@@ -1024,9 +1113,19 @@ async fn rerank(
             "paid rerank is unavailable until rerank usage settlement is defined",
         );
     }
+    // Recorded under the real virtual key (from the authenticated identity the middleware attached)
+    // and the model forwarded upstream (S1).
+    let budget_identity = budget::BudgetIdentity::for_request(
+        remote_identity
+            .as_ref()
+            .map(|identity| identity.0.key_id.as_str()),
+        &value,
+        &selected.card.provider.id,
+    );
     let _reservation = match dispatch::ReservationGuard::reserve(
         state.budget_ledger.as_deref(),
         parsed.tenant_id.as_deref(),
+        &budget_identity,
         &selected.card.provider.id,
         selected.estimated_cost_minor,
     ) {
@@ -1273,9 +1372,19 @@ async fn messages(
             "paid messages are unavailable until Anthropic usage settlement is defined",
         );
     }
+    // Recorded under the real virtual key (from the authenticated identity the middleware attached)
+    // and the model forwarded upstream (S1).
+    let budget_identity = budget::BudgetIdentity::for_request(
+        remote_identity
+            .as_ref()
+            .map(|identity| identity.0.key_id.as_str()),
+        &value,
+        &selected.card.provider.id,
+    );
     let _reservation = match dispatch::ReservationGuard::reserve(
         state.budget_ledger.as_deref(),
         parsed.tenant_id.as_deref(),
+        &budget_identity,
         &selected.card.provider.id,
         selected.estimated_cost_minor,
     ) {
@@ -2494,6 +2603,9 @@ async fn chat_completions(
     };
     let authorization_present = headers.contains_key(axum::http::header::AUTHORIZATION);
     let dev_no_key_request = state.dev_no_key_enabled && !authorization_present;
+    // The id of the virtual key that authenticated this request (S1): the budget records the
+    // reservation under it instead of a placeholder. `None` = no virtual key was involved.
+    let mut budget_key_id: Option<String> = None;
     if dev_no_key_request {
         if parsed.task.privacy.unwrap_or(PrivacyClass::LocalOnly) != PrivacyClass::LocalOnly {
             return dev_no_key_scope_response();
@@ -2506,6 +2618,7 @@ async fn chat_completions(
         if let Err(error) = auth::enforce_scope(&identity, &parsed) {
             return virtual_key_scope_response(error);
         }
+        budget_key_id = Some(identity.key_id);
     } else if state.dev_no_key_enabled && authorization_present {
         return virtual_key_unauthorized_response();
     }
@@ -2636,6 +2749,27 @@ async fn chat_completions(
         .collect::<Vec<_>>()
         .join("\n");
 
+    // Cloud tier (S7): `None` unless one is configured, in which case every hook below returns the local response
+    // untouched. It is consulted only after the local path has already failed (see `cloud_tier`).
+    let cloud_scope = cloud_tier::FallbackScope::new(cloud_tier::ScopeInputs {
+        state: &state,
+        headers: &headers,
+        body: &value,
+        parsed: &parsed,
+        pinned_local_by_content: inspection.tightened
+            || inspection.killed
+            || inspection.failed
+            || inspection.uninspectable,
+        content_tightened: inspection.tightened && !inspection.killed,
+        prompt: &prompt,
+        completion_tokens: completion_reservation,
+        record_id: &record_id,
+        lifecycle: &lifecycle,
+        dev_no_key: dev_no_key_request,
+        dispatched: dispatched_event_context.as_ref(),
+        completed: completed_event_context.as_ref(),
+    });
+
     let policy_cards = dispatch::policy_cards(&state.cards, &state.routing_policy, &parsed);
     if policy_cards.cards.is_empty() {
         let reason = if policy_cards.route.fail_closed {
@@ -2658,7 +2792,7 @@ async fn chat_completions(
         {
             return event_log_unavailable_response();
         }
-        return if policy_cards.route.fail_closed {
+        let original = if policy_cards.route.fail_closed {
             rejection_response(idoris_policy::Rejection::LocalOnlyUnavailable)
         } else {
             error_envelope(
@@ -2667,6 +2801,12 @@ async fn chat_completions(
                 "no candidate matches routing policy",
             )
         };
+        return cloud_tier::fallback(
+            cloud_scope.as_ref(),
+            cloud_tier::LocalFailure::NoCandidate,
+            original,
+        )
+        .await;
     }
 
     // Freeze one exact lifecycle-readiness view for every decision this
@@ -2869,6 +3009,7 @@ async fn chat_completions(
                     dispatched: dispatched_event_context.as_ref(),
                     completed: completed_event_context.as_ref(),
                 },
+                budget_key_id.as_deref(),
             )
             .await;
         }
@@ -2905,7 +3046,15 @@ async fn chat_completions(
     // the actual connection does.
     let selected_for_dispatch = match selection {
         Ok(selected) => Some(selected),
-        Err(DispatchError::Rejection(rejection)) => return rejection_response(rejection),
+        Err(DispatchError::Rejection(rejection)) => {
+            let original = rejection_response(rejection.clone());
+            return cloud_tier::fallback(
+                cloud_scope.as_ref(),
+                cloud_tier::LocalFailure::Rejection(&rejection),
+                original,
+            )
+            .await;
+        }
         Err(DispatchError::Internal(message)) => {
             return error_envelope(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", message);
         }
@@ -2931,6 +3080,7 @@ async fn chat_completions(
             )
             .with_native(&native)
             .with_headroom_breach_confirmed(headroom_breach_confirmed(&headers))
+            .with_budget_key_id(budget_key_id.as_deref())
             .with_provider_admission(state.proxy.as_ref()),
             &parsed,
             dispatch::DispatchInput::with_model(model, &prompt).with_affinity(affinity_key),
@@ -2958,7 +3108,21 @@ async fn chat_completions(
             error_envelope(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", message)
         }
         Ok(outcome) => match &outcome.result {
-            Err(failure) => dispatch_failure_response(failure, &outcome),
+            Err(failure) => {
+                let original = dispatch_failure_response(failure, &outcome);
+                match failure {
+                    DispatchFailure::Backend(error) => {
+                        cloud_tier::fallback(
+                            cloud_scope.as_ref(),
+                            cloud_tier::LocalFailure::Backend(error),
+                            original,
+                        )
+                        .await
+                    }
+                    // A local budget decision (402) is a commercial constraint, never a reason to go to the cloud.
+                    DispatchFailure::Budget(_) => original,
+                }
+            }
             Ok(chat_response) => {
                 let (body, prompt_tokens, completion_tokens) =
                     if let Some(body) = &chat_response.native {
@@ -3026,10 +3190,15 @@ async fn chat_via_proxy(
     body_value: &serde_json::Value,
     record_id: &str,
     events: ProxyEventContexts<'_>,
+    budget_key_id: Option<&str>,
 ) -> Response {
+    // Record the reservation under the real virtual key and the model forwarded upstream (S1).
+    let budget_identity =
+        budget::BudgetIdentity::for_request(budget_key_id, body_value, &selected.card.provider.id);
     let proxy_budget = match proxy_budget::ProxyBudget::new(
         state.budget_ledger.as_deref(),
         parsed.tenant_id.as_deref(),
+        budget_identity,
         &selected.card.provider.id,
         selected.estimated_cost_minor,
     ) {
@@ -3816,6 +3985,9 @@ mod kill_switch_wiring_tests;
 
 #[cfg(test)]
 mod budget_concurrency_wiring_tests;
+
+#[cfg(test)]
+mod budget_identity_wiring_tests;
 
 #[cfg(test)]
 mod breaker_wiring_tests;

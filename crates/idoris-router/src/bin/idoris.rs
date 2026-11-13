@@ -23,11 +23,20 @@ use idoris_router::{
     auth::VirtualKeyAuthenticator,
     build_app,
     capabilities::{CapabilitiesProvider, LiveCapabilitiesProvider},
-    cli, components, config,
+    cli,
+    cloud::SystemClock,
+    cloud::ingress::{
+        CloudIngress, IngressConfig, bind::ListenPlan, bind::parse_cloud_bind_host,
+        bind::validate_public_bind,
+    },
+    components, config,
     connection::{ConnectionInfo, ConnectionListener},
+    control::{AccountGate, ControlPlane, SystemControlClock},
     host_facts, parse_port, profile, routing_policy,
     runtime::RuntimeRegistry,
-    runtime_launch_config, storage,
+    runtime_launch_config,
+    startup_form::StartupForm,
+    storage,
     subscription::{
         config::SubscriptionConfig,
         runtime::{SubscriptionRuntimeHandle, SubscriptionRuntimeRegistry, authorize_subscription},
@@ -153,8 +162,53 @@ async fn real_main() -> u8 {
                 return 1;
             }
         }
+        cli::Command::Control(command) => {
+            if let Err(message) = run_control_command(command) {
+                eprintln!("[idoris] {message}");
+                return 1;
+            }
+        }
+        // Device side of the cloud-account pairing (compute service S7). Reads and writes only the device credential
+        // file; opens no database, touches no Admin or local-key state.
+        cli::Command::Cloud(command) => match idoris_router::cloud_tier::cli::run(command).await {
+            Ok(0) => {}
+            Ok(code) => return code,
+            Err(message) => {
+                eprintln!("[idoris] {message}");
+                return 1;
+            }
+        },
     }
     0
+}
+
+/// Local operator commands of the control plane (compute service S2). Only the organization and cloud
+/// forms have an account store, so anything else is refused before the database is touched.
+fn run_control_command(command: cli::ControlCommand) -> Result<(), String> {
+    let deploy_mode =
+        profile::deploy_mode_from_env(std::env::var("IDORIS_DEPLOY_MODE").ok().as_deref());
+    let form_raw = match std::env::var(StartupForm::ENV_VAR) {
+        Ok(value) => Some(value),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err(format!("{} 不是有效的 Unicode", StartupForm::ENV_VAR));
+        }
+    };
+    let startup_form = StartupForm::from_env_value(deploy_mode, form_raw.as_deref())
+        .map_err(|err| format!("{} 无效：{err}", StartupForm::ENV_VAR))?;
+    let accounts = storage::open_account_store_process(startup_form)?;
+    match command {
+        cli::ControlCommand::Bootstrap => {
+            let mut stdin = std::io::stdin().lock();
+            let mut stdout = std::io::stdout().lock();
+            idoris_router::control::bootstrap::run(
+                &accounts,
+                &mut stdin,
+                &mut stdout,
+                &SystemControlClock,
+            )
+        }
+    }
 }
 
 fn run_key_command(command: cli::KeyCommand) -> Result<(), String> {
@@ -278,8 +332,32 @@ async fn run(options: cli::ServeOptions) -> Result<(), String> {
         AdminBindConfig::parse(admin_port.as_deref()).map_err(|err| err.to_string())?;
     let deploy_mode =
         profile::deploy_mode_from_env(std::env::var("IDORIS_DEPLOY_MODE").ok().as_deref());
+    // Compute-service deployment form (S1). Unset = exactly the pre-S1 behaviour. Unlike
+    // IDORIS_DEPLOY_MODE this variable is strict: an unknown value, a non-Unicode value or a form
+    // that conflicts with the deploy mode stops start-up instead of being guessed.
+    let form_raw = match std::env::var(StartupForm::ENV_VAR) {
+        Ok(value) => Some(value),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err(format!("{} 不是有效的 Unicode", StartupForm::ENV_VAR));
+        }
+    };
+    let startup_form = StartupForm::from_env_value(deploy_mode, form_raw.as_deref())
+        .map_err(|err| format!("{} 无效：{err}", StartupForm::ENV_VAR))?;
     let dev_no_key_enabled = env_flag("IDORIS_DEV_NO_KEY");
-    let bind_host = parse_bind_host(std::env::var(BIND_HOST_ENV).ok().as_deref())?;
+    // Compute service S5: only the cloud form may listen beyond loopback (with an explicit public configuration,
+    // checked below once the ingress configuration is loaded). Every other form parses `IDORIS_BIND_HOST` exactly
+    // as before.
+    let cloud = startup_form.is_cloud();
+    if cloud && dev_no_key_enabled {
+        return Err("IDORIS_DEV_NO_KEY=1 在云形态下不允许：云入口没有免密钥的路径".to_string());
+    }
+    let bind_host_raw = std::env::var(BIND_HOST_ENV).ok();
+    let bind_host = if cloud {
+        parse_cloud_bind_host(bind_host_raw.as_deref(), BIND_HOST_ENV)?
+    } else {
+        parse_bind_host(bind_host_raw.as_deref())?
+    };
 
     let components_dir =
         config::resolve_env("IDORIS_COMPONENTS_DIR", components::DEFAULT_COMPONENTS_DIR)?;
@@ -358,7 +436,7 @@ async fn run(options: cli::ServeOptions) -> Result<(), String> {
     // Preserve startup-gate precedence: component/policy/runtime validation
     // (including subscription authorization and fixed card gates) must fail
     // before tenant storage/config bootstrap can surface a later error.
-    let persistent = storage::bootstrap_process(deploy_mode)
+    let persistent = storage::bootstrap_process_with_form(startup_form)
         .map_err(|err| format!("无法初始化持久化存储：{err}"))?;
     // Never run without the lock: if the early attempt was deferred, retry
     // now that storage is known to be usable.
@@ -381,8 +459,28 @@ async fn run(options: cli::ServeOptions) -> Result<(), String> {
             .has_active_key(now_ms)
             .map_err(|err| format!("无法检查 virtual key 启动权限：{err}"))?
     };
-    validate_bind_authority(bind_host, deploy_mode, dev_no_key_enabled, has_active_key)?;
-    let virtual_key_authenticator = VirtualKeyAuthenticator::new(persistent.virtual_keys.clone());
+    if !cloud {
+        validate_bind_authority(bind_host, deploy_mode, dev_no_key_enabled, has_active_key)?;
+    }
+    let mut virtual_key_authenticator =
+        VirtualKeyAuthenticator::new(persistent.virtual_keys.clone());
+    // Compute service S2 (organization and cloud forms only: the account store exists only there). The gate makes
+    // revocation immediate on the data plane; the control plane serves `/control/v1`. In the personal form and in
+    // legacy tenant deployments `persistent.accounts` is `None` and neither is installed.
+    let control = match &persistent.accounts {
+        Some(accounts) => {
+            virtual_key_authenticator =
+                virtual_key_authenticator.with_gate(Arc::new(AccountGate::new(accounts.clone())));
+            Some(Arc::new(ControlPlane::new(
+                accounts.clone(),
+                startup_form.form(),
+            )?))
+        }
+        None => None,
+    };
+
+    // The cloud ingress authenticates with the very same authenticator (virtual keys + the account gate).
+    let ingress_authenticator = cloud.then(|| virtual_key_authenticator.clone());
 
     let catalog_path = config::resolve_env("IDORIS_CATALOG", "config/catalog.yaml")?;
     let capabilities = match host_facts::current_host_facts() {
@@ -429,20 +527,112 @@ async fn run(options: cli::ServeOptions) -> Result<(), String> {
         ..AppState::default()
     };
 
+    // idoris.ai/api cloud upstream (S4, form rule from S5): the cloud form requires it
+    // (IDORIS_CLOUD_UPSTREAM_CONFIG), every other form refuses it.
+    // The cloud ingress configuration is loaded first: the tenants it declares as child-data tenants take part in S6's
+    // start-up validation of the cloud upstream (a safety section is mandatory, the LLM checker must satisfy their data
+    // policies), exactly like the child callers of the static book do.
+    let ingress_config = if cloud {
+        Some(IngressConfig::from_env()?)
+    } else {
+        None
+    };
+    let ingress_tenants = ingress_config
+        .as_ref()
+        .map(IngressConfig::tenant_policies)
+        .unwrap_or_default();
+    let ingress_child_tenants = ingress_tenants
+        .iter()
+        .filter(|tenant| tenant.policy.handles_child_data())
+        .count();
+    let mut state = state;
+    state.cloud =
+        idoris_router::cloud::CloudUpstream::from_env_for_form(&startup_form, &ingress_tenants)?;
+    state.control = control;
+    // idoris.ai/api cloud tier (S7): default off. Unset (`IDORIS_CLOUD_TIER_CONFIG`) = nothing is read, opened or sent and
+    // every existing behaviour is byte-for-byte as before. Set = the local node may fall back to the cloud for requests
+    // that are `any`, explicitly consented and not servable locally. No network request is made at start-up.
+    {
+        let local_key_probe: Arc<dyn idoris_router::cloud_tier::LocalSecretProbe> = Arc::new(
+            idoris_router::cloud_tier::VirtualKeyProbe(persistent.virtual_keys.clone()),
+        );
+        state.cloud_tier = idoris_router::cloud_tier::CloudTier::from_env_for_form(
+            &startup_form,
+            Some(local_key_probe),
+        )?;
+        if let Some(tier) = &state.cloud_tier {
+            eprintln!(
+                "[idoris] 云端档已启用：{}（只在调用方带 X-iDoris-Cloud-Fallback: allow、隐私为 any、本机服务不了时才会出网；local_only 永不出网）",
+                tier.config().origin()
+            );
+        }
+    }
+    // S6（儿童安全）：配置里有处理儿童数据的租户时，进程要保证正文只在内存里：
+    // 旧代理路径对这些租户关闭响应缓存；panic 信息脱敏（只打位置，不打 payload）；关闭 core dump。
+    // 任何一步做不到就拒绝启动（失败即关闭）。
+    if let Some(cloud) = &state.cloud
+        && (cloud.has_child_data_callers() || ingress_child_tenants > 0)
+    {
+        state
+            .proxy
+            .disable_cache_for_tenants(cloud.child_data_tenant_scopes());
+        idoris_router::cloud::safety::hardening::harden_process_for_child_data()?;
+        eprintln!(
+            "[idoris] 儿童数据加固已启用：core dump 已关闭，panic 信息已脱敏（只打位置）；处理儿童数据的租户：静态调用方簿 {} 个，云入口配置 {} 个",
+            cloud.child_data_tenant_scopes().len(),
+            ingress_child_tenants
+        );
+    }
+
+    // idoris.ai/api cloud ingress (S5): `/api/v1`, credential-derived callers, three-level limits, public abuse
+    // protection. Cloud form only; it also decides whether the public bind is acceptable.
+    if let (Some(authenticator), Some(accounts), Some(upstream), Some(config)) = (
+        ingress_authenticator,
+        persistent.accounts.clone(),
+        state.cloud.clone(),
+        ingress_config,
+    ) {
+        let ingress = Arc::new(CloudIngress::new(
+            config,
+            accounts.clone(),
+            authenticator,
+            Arc::new(SystemClock),
+            &upstream,
+        )?);
+        validate_public_bind(bind_host, ingress.config(), has_active_key, BIND_HOST_ENV)?;
+        for warning in ingress.startup_warnings(&accounts) {
+            eprintln!("[idoris] 警告：{warning}");
+        }
+        eprintln!(
+            "[idoris] 云入口已启用：/api/v1；受信反向代理 {} 条；控制面{}",
+            ingress.config().trusted_proxies.len(),
+            if ingress.config().control_plane_public {
+                "挂在公网监听上（control_plane.public: true）"
+            } else {
+                "不挂在公网监听上（本机运维命令仍可用）"
+            }
+        );
+        state.cloud_ingress = Some(ingress);
+    } else if cloud {
+        return Err("云形态缺少账户存储或云上游（不应该发生）".to_string());
+    }
+
     // M5-14: provider breakers stay off unless explicitly enabled; see
     // ChatProxy::set_breakers_enabled.
     state
         .proxy
         .set_breakers_enabled(env_flag("IDORIS_PROVIDER_BREAKER"));
 
-    let addr = std::net::SocketAddr::from((bind_host, port));
+    // The listen plan is the single source of both listen addresses; Admin v0 stays on loopback whatever the data
+    // plane binds (compute service S5).
+    let plan = ListenPlan::new(bind_host, port, admin_bind)?;
+    let addr = plan.data;
     let data_listener = tokio::net::TcpListener::bind(addr)
         .await
         .map_err(|err| format!("无法绑定 {addr}：{err}"))?;
-    let admin_listener = admin_bind
-        .bind()
+    let admin_listener = tokio::net::TcpListener::bind(plan.admin)
         .await
-        .map_err(|err| format!("无法绑定 Admin {}：{err}", admin_bind.addr()))?;
+        .map_err(|err| format!("无法绑定 Admin {}：{err}", plan.admin))?;
     let admin_token = if options.admin_token_stdin {
         read_admin_token_from_stdin()?
     } else {

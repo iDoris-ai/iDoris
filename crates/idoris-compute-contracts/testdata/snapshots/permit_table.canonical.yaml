@@ -1,0 +1,157 @@
+schema_version: 1
+verification_max_age_days: 90
+endpoints:
+- provider: example-zdr-host
+  model: example-org/chat-70b
+  endpoint: openai-compat
+  access: api
+  processing_regions:
+  - sg-1
+  retention: zdr
+  dpa: signed
+  allowed_data_classes:
+  - child_edu
+  - adult
+  - public
+  capabilities:
+    tool_calling: true
+    stream_usage: true
+    cache_pricing: false
+    structured_output: true
+    cancellation: true
+  verified_at: 2026-11-05T00:00:00Z
+  notes: 假数据：单区域的 ZDR 托管方。
+  evidence:
+  - https://example.invalid/dpa/example-zdr-host
+- provider: example-router
+  model: example-org/chat-70b
+  endpoint: zdr-route
+  access: api
+  processing_regions:
+  - sg-1
+  - eu-1
+  retention: zdr
+  dpa: signed
+  allowed_data_classes:
+  - child_edu
+  - adult
+  - public
+  capabilities:
+    tool_calling: true
+    stream_usage: true
+    cache_pricing: true
+    structured_output: true
+    cancellation: true
+  verified_at: 2026-11-05T08:30:00Z
+  notes: 假数据：聚合路由的「只走 ZDR」路由；推理可能落在 sg-1 或 eu-1，所以两个区域都要列。
+- provider: example-router
+  model: example-org/chat-70b
+  endpoint: default-route
+  access: api
+  processing_regions:
+  - sg-1
+  - eu-1
+  retention: with_exceptions
+  dpa: signed
+  allowed_data_classes:
+  - adult
+  - public
+  capabilities:
+    tool_calling: true
+    stream_usage: true
+    cache_pricing: true
+    structured_output: true
+    cancellation: true
+  verified_at: 2026-11-05T00:00:00Z
+  notes: 假数据：同一个聚合路由的默认路由，有例外留存（比如安全留存），所以不能用于 child_edu。
+- provider: example-official
+  model: example-org/chat-70b
+  endpoint: official-api
+  access: api
+  processing_regions:
+  - cn-1
+  retention: retained
+  dpa: unsigned
+  allowed_data_classes:
+  - adult
+  - public
+  capabilities:
+    tool_calling: true
+    stream_usage: false
+    cache_pricing: false
+    structured_output: true
+    cancellation: false
+  verified_at: 2026-11-05T00:00:00Z
+- provider: example-cheap-host
+  model: example-org/small-8b
+  endpoint: openai-compat
+  access: api
+  processing_regions:
+  - th-1
+  retention: zdr
+  dpa: signed
+  allowed_data_classes:
+  - public
+  capabilities:
+    tool_calling: false
+    stream_usage: false
+    cache_pricing: false
+    structured_output: false
+    cancellation: true
+  verified_at: 2026-11-05T00:00:00Z
+- provider: example-cli
+  model: example-org/chat-70b
+  endpoint: subscription-cli
+  access: subscription
+  processing_regions:
+  - sg-1
+  retention: retained
+  dpa: unsigned
+  allowed_data_classes:
+  - adult
+  - public
+  capabilities:
+    tool_calling: false
+    stream_usage: false
+    cache_pricing: false
+    structured_output: false
+    cancellation: false
+  verified_at: 2026-11-05T00:00:00Z
+  notes: 假数据：订阅账号走 CLI，云形态必须排除。
+- provider: example-stale-host
+  model: example-org/chat-70b
+  endpoint: openai-compat
+  access: api
+  processing_regions:
+  - sg-1
+  retention: zdr
+  dpa: signed
+  allowed_data_classes:
+  - child_edu
+  - adult
+  - public
+  capabilities:
+    tool_calling: true
+    stream_usage: true
+    cache_pricing: true
+    structured_output: true
+    cancellation: true
+  verified_at: 2026-06-01T00:00:00Z
+  notes: 假数据：核验时间很早，用来演示过期自动停用。
+- provider: example-unverified-host
+  model: example-org/chat-70b
+  endpoint: openai-compat
+  access: api
+  processing_regions:
+  - unknown
+  retention: retained
+  dpa: unsigned
+  allowed_data_classes: []
+  capabilities:
+    tool_calling: false
+    stream_usage: false
+    cache_pricing: false
+    structured_output: false
+    cancellation: false
+  verified_at: 2026-11-05T00:00:00Z
+  notes: 假数据：调研过，但留存、DPA、区域、能力都没核实出来。没核实的值一律写成最坏的那个（见 permit.rs 的模块文档），所以这个端点永远不会被任何请求选中。

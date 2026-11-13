@@ -31,3 +31,27 @@ pub mod event_log;
 /// issuance; persistence layers store [`virtual_key::VirtualKeyHash`] plus
 /// non-secret scope metadata.
 pub mod virtual_key;
+
+/// Shared SQLite connection setup for the compute-service forms (S1):
+/// `journal_mode=WAL`, an explicit `busy_timeout` and `foreign_keys=ON`,
+/// applied only to the organization and cloud forms; personal and legacy
+/// tenant deployments keep their connections exactly as they were.
+pub mod sqlite_conn;
+
+/// Account storage for the compute service (S1): principals, memberships,
+/// payment accounts (the allocation-delegation tree), credentials and
+/// allocations, stored as the frozen S0 contract types. Opened only by the
+/// organization and cloud forms.
+pub mod accounts;
+
+#[cfg(test)]
+pub(crate) mod test_support;
+
+/// idoris.ai/api 计算服务 S4：每次请求的每次尝试、转移日志与结算分录（SQLite，只追加），
+/// 持久化 S0 契约（`idoris-compute-contracts`）的状态机与结算计划。
+pub mod attempts;
+
+/// idoris.ai/api 计算服务 S7：本机云端档的调用记录与对账游标（SQLite，只追加）：本机请求 id 与云端
+/// `X-iDoris-Record-Id` 的对应关系，加上云端报告的 token 用量；没有余额、没有额度、没有正文。
+/// 只有配置了云端档才会打开，默认不碰数据库文件。
+pub mod cloud_tier;

@@ -1,0 +1,61 @@
+{
+  "deploy_config_existing_shape": {
+    "deploy_mode": "tenant"
+  },
+  "deploy_config_with_form": {
+    "deploy_mode": "tenant",
+    "form": "cloud"
+  },
+  "forms": [
+    "personal",
+    "organization",
+    "cloud"
+  ],
+  "profiles": {
+    "cloud": {
+      "allows_subscription_path": false,
+      "billing": "currency",
+      "cloud_identity": "not_applicable",
+      "control_plane": true,
+      "ledger_authority": "cloud_ledger",
+      "listen": "public",
+      "local_models": false,
+      "prunes_unlisted_tenants_on_startup": false,
+      "public_abuse_protection": true,
+      "subsidy_pool": true,
+      "tenant_source": "from_credential",
+      "uses_cloud_tier": false,
+      "uses_endpoint_permit_table": true
+    },
+    "organization": {
+      "allows_subscription_path": false,
+      "billing": "quota",
+      "cloud_identity": "org_payment_account_only",
+      "control_plane": true,
+      "ledger_authority": "org_internal",
+      "listen": "lan",
+      "local_models": true,
+      "prunes_unlisted_tenants_on_startup": false,
+      "public_abuse_protection": false,
+      "subsidy_pool": false,
+      "tenant_source": "tenant_header",
+      "uses_cloud_tier": true,
+      "uses_endpoint_permit_table": false
+    },
+    "personal": {
+      "allows_subscription_path": true,
+      "billing": "none",
+      "cloud_identity": "personal_cloud_account",
+      "control_plane": false,
+      "ledger_authority": "local",
+      "listen": "loopback",
+      "local_models": true,
+      "prunes_unlisted_tenants_on_startup": true,
+      "public_abuse_protection": false,
+      "subsidy_pool": false,
+      "tenant_source": "fixed_personal",
+      "uses_cloud_tier": true,
+      "uses_endpoint_permit_table": false
+    }
+  }
+}

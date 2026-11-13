@@ -22,6 +22,10 @@ use super::clock::{Clock, SystemClock};
 use super::error::{BudgetError, checked_add_i64, checked_sub_i64};
 use super::period::billing_period_key;
 use super::scope::BudgetScope;
+use crate::sqlite_conn::{
+    ConnectionProfile, ConnectionSetupError, PragmaSnapshot, STANDARD_BUSY_TIMEOUT, apply_standard,
+    snapshot,
+};
 
 /// Opus Tier-2 re-review B-8: a deterministic way to prove the concurrency
 /// tests in `tests/budget_concurrency.rs` would actually catch a "split the
@@ -130,6 +134,7 @@ const SCHEMA_MIGRATIONS: &[&str] = &[
     include_str!("migrations/0003_tenant_scope.sql"),
     include_str!("migrations/0004_tenant_period_column.sql"),
     include_str!("migrations/0005_integer_amounts.sql"),
+    include_str!("migrations/0006_tenant_bootstrap.sql"),
 ];
 
 /// Default reservation TTL: long enough to cover a slow upstream call,
@@ -207,6 +212,50 @@ pub struct TenantBudgetReadView {
     pub available_minor: i64,
     pub billing_timezone: String,
     pub scope: SpendGate,
+}
+
+/// One tenant's initial values from the trusted configuration file, for
+/// [`BudgetLedger::seed_tenant`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TenantSeed {
+    pub tenant_id: String,
+    pub limit_minor: i64,
+    pub billing_timezone: String,
+    pub gate: SpendGate,
+}
+
+/// What [`BudgetLedger::seed_tenant`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SeedOutcome {
+    /// First time this tenant id was seen: written from the file.
+    Seeded,
+    /// The database already had this tenant's configuration (written by an
+    /// older start-up) but no seed marker: the row was kept as is and only
+    /// the marker was added.
+    Adopted,
+    /// Seeded before: nothing was written.
+    Kept,
+}
+
+/// How the database's tenant configuration compares with the file's values
+/// after [`BudgetLedger::seed_tenant`]. The database always wins; this only
+/// tells the operator when the file is stale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SeedDrift {
+    /// The database row has exactly the file's values.
+    InSync,
+    /// The database row exists with different values.
+    Changed,
+    /// The database has no configuration row for this tenant (it was deleted
+    /// after seeding); the file does **not** bring it back.
+    MissingInDb,
+}
+
+/// Result of [`BudgetLedger::seed_tenant`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SeedReport {
+    pub outcome: SeedOutcome,
+    pub drift: SeedDrift,
 }
 
 impl SpendGate {
@@ -290,18 +339,65 @@ impl BudgetLedger {
         ttl_ms: i64,
         busy_timeout: Duration,
     ) -> Result<Self, BudgetError> {
+        Self::open_with_options(path, clock, ttl_ms, busy_timeout, ConnectionProfile::Legacy)
+    }
+
+    /// Open with the real system clock and the default TTL, using the given
+    /// connection profile. [`ConnectionProfile::Standard`] (organization and
+    /// cloud forms) additionally verifies `journal_mode=wal` and turns
+    /// `foreign_keys` on; see [`crate::sqlite_conn`].
+    pub fn open_with_profile(
+        path: impl AsRef<Path>,
+        profile: ConnectionProfile,
+    ) -> Result<Self, BudgetError> {
+        Self::open_with_options(
+            path,
+            Arc::new(SystemClock),
+            DEFAULT_RESERVATION_TTL_MS,
+            STANDARD_BUSY_TIMEOUT,
+            profile,
+        )
+    }
+
+    /// Every knob at once: injected clock, TTL, `busy_timeout` and
+    /// connection profile. All other `open*` constructors delegate here.
+    ///
+    /// [`ConnectionProfile::Legacy`] is exactly what this constructor did
+    /// before S1: `journal_mode=WAL` (result not inspected) and the given
+    /// `busy_timeout`, nothing else.
+    pub fn open_with_options(
+        path: impl AsRef<Path>,
+        clock: Arc<dyn Clock>,
+        ttl_ms: i64,
+        busy_timeout: Duration,
+        profile: ConnectionProfile,
+    ) -> Result<Self, BudgetError> {
         if ttl_ms <= 0 {
             return Err(BudgetError::InvalidTtl { ttl_ms });
         }
         let mut conn = Connection::open(path.as_ref())?;
-        conn.pragma_update(None, "journal_mode", "WAL")?;
-        conn.busy_timeout(busy_timeout)?;
+        match profile {
+            ConnectionProfile::Legacy => {
+                conn.pragma_update(None, "journal_mode", "WAL")?;
+                conn.busy_timeout(busy_timeout)?;
+            }
+            ConnectionProfile::Standard => {
+                apply_standard(&conn, busy_timeout).map_err(setup_error)?;
+            }
+        }
         run_migrations(&mut conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
             clock,
             ttl_ms,
         })
+    }
+
+    /// The connection's current `journal_mode` / `busy_timeout` /
+    /// `foreign_keys`, for assertions and diagnostics.
+    pub fn connection_pragmas(&self) -> Result<PragmaSnapshot, BudgetError> {
+        let conn = self.lock();
+        snapshot(&conn).map_err(BudgetError::from)
     }
 
     /// A poisoned mutex only happens if a previous call panicked mid-method.
@@ -480,6 +576,131 @@ impl BudgetLedger {
         }
         tx.commit()?;
         Ok(stale.len())
+    }
+
+    /// Database-authoritative tenant initialization for the organization and
+    /// cloud forms (design §9 item 2): the trusted file seeds a tenant **at
+    /// most once in the database's lifetime**; afterwards the database is the
+    /// source of truth.
+    ///
+    /// In one `BEGIN IMMEDIATE` transaction, keyed on the `tenant_bootstrap`
+    /// marker:
+    ///
+    /// - marker present → write nothing ([`SeedOutcome::Kept`]); the
+    ///   configuration row is neither refreshed from the file nor recreated
+    ///   if it was deleted;
+    /// - no marker, but a `tenant_config` row exists (older start-up) → keep
+    ///   the row, add the marker ([`SeedOutcome::Adopted`]);
+    /// - no marker, no row → insert both ([`SeedOutcome::Seeded`]).
+    ///
+    /// It never deletes anything and never updates an existing
+    /// `tenant_config` row, so, unlike [`configure_tenant`](Self::configure_tenant),
+    /// repeated starts cannot overwrite a limit that was changed in the
+    /// database. Inputs are validated exactly like `configure_tenant` even
+    /// when nothing is written, so a typo in the file fails start-up in every
+    /// form.
+    pub fn seed_tenant(&self, seed: &TenantSeed) -> Result<SeedReport, BudgetError> {
+        let tenant_id = seed.tenant_id.as_str();
+        if tenant_id.trim().is_empty() {
+            return Err(BudgetError::InvalidScope { field: "tenant_id" });
+        }
+        if seed.limit_minor < 0 {
+            return Err(BudgetError::InvalidLimit {
+                limit_minor: seed.limit_minor,
+            });
+        }
+        if !idoris_contracts::tenant::is_iana_time_zone(&seed.billing_timezone) {
+            return Err(BudgetError::InvalidTimeZone {
+                billing_timezone: seed.billing_timezone.clone(),
+            });
+        }
+        let now_ms = self.clock.now_ms();
+        let mut conn = self.lock();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let marker: Option<String> = tx
+            .query_row(
+                "SELECT source FROM tenant_bootstrap WHERE tenant_id = ?1",
+                [tenant_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let existing = load_tenant_config(&tx, tenant_id)?;
+        let drift_of = |row: &Option<TenantConfig>| match row {
+            None => SeedDrift::MissingInDb,
+            Some(config)
+                if config.limit_minor == seed.limit_minor
+                    && config.billing_timezone == seed.billing_timezone
+                    && config.gate == seed.gate =>
+            {
+                SeedDrift::InSync
+            }
+            Some(_) => SeedDrift::Changed,
+        };
+        if marker.is_some() {
+            tx.commit()?;
+            return Ok(SeedReport {
+                outcome: SeedOutcome::Kept,
+                drift: drift_of(&existing),
+            });
+        }
+        if existing.is_some() {
+            tx.execute(
+                "INSERT INTO tenant_bootstrap (tenant_id, seeded_at_ms, source) \
+                 VALUES (?1, ?2, 'adopted')",
+                rusqlite::params![tenant_id, now_ms],
+            )?;
+            tx.commit()?;
+            return Ok(SeedReport {
+                outcome: SeedOutcome::Adopted,
+                drift: drift_of(&existing),
+            });
+        }
+        // Same cross-dimension zone agreement as `configure_tenant` (B-2).
+        if let Some(sibling_tz) = sibling_sub_scope_timezone(&tx, tenant_id, None)?
+            && sibling_tz != seed.billing_timezone
+        {
+            tx.rollback().ok();
+            return Err(BudgetError::InvalidConfig {
+                tenant_id: tenant_id.to_string(),
+                existing: sibling_tz,
+                requested: seed.billing_timezone.clone(),
+            });
+        }
+        tx.execute(
+            "INSERT INTO tenant_config (tenant_id, limit_minor, billing_timezone, scope) \
+             VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![
+                tenant_id,
+                seed.limit_minor,
+                seed.billing_timezone,
+                seed.gate.as_sql()
+            ],
+        )?;
+        tx.execute(
+            "INSERT INTO tenant_bootstrap (tenant_id, seeded_at_ms, source) \
+             VALUES (?1, ?2, 'config')",
+            rusqlite::params![tenant_id, now_ms],
+        )?;
+        tx.commit()?;
+        Ok(SeedReport {
+            outcome: SeedOutcome::Seeded,
+            drift: SeedDrift::InSync,
+        })
+    }
+
+    /// How many tenants a database-authoritative start-up has ever initialised: the number of rows in
+    /// `tenant_bootstrap`. Zero for a database that has only run the personal form or a legacy tenant start
+    /// (the table exists after the additive migration, but those paths never write to it).
+    ///
+    /// Start-up uses it to refuse a *file-authoritative* start on a database that was once initialised by the
+    /// organization or cloud form: that start would overwrite the limit of every listed tenant with the file's
+    /// and revoke the tenants the file does not list, which is exactly what those forms exist to prevent.
+    pub fn seeded_tenant_count(&self) -> Result<usize, BudgetError> {
+        let conn = self.lock();
+        let count: i64 = conn.query_row("SELECT count(*) FROM tenant_bootstrap", [], |row| {
+            row.get(0)
+        })?;
+        Ok(usize::try_from(count).unwrap_or(usize::MAX))
     }
 
     /// Read-only remaining balance for `scope`: `limit - settled_spend -
@@ -1276,6 +1497,13 @@ fn find_reservation(
         None => Err(BudgetError::ReservationNotFound {
             reservation_id: reservation_id.0.clone(),
         }),
+    }
+}
+
+fn setup_error(error: ConnectionSetupError) -> BudgetError {
+    match error {
+        ConnectionSetupError::Sql(error) => BudgetError::from(error),
+        other => BudgetError::Storage(other.to_string()),
     }
 }
 

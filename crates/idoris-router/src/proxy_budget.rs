@@ -1,5 +1,5 @@
 //! Leader-only paid reservation state; transport wiring follows separately.
-use crate::budget::{self, UsageEvidence};
+use crate::budget::{self, BudgetIdentity, UsageEvidence};
 use crate::dispatch::ReservationGuard;
 use crate::proxy::{ExecutionDisposition, ForwardOutcome, SuccessFinalizeError};
 use idoris_contracts::provider::Cost;
@@ -24,6 +24,9 @@ struct State<'a> {
 pub(crate) struct ProxyBudget<'a> {
     ledger: Option<&'a BudgetLedger>,
     tenant_id: Option<&'a str>,
+    /// The real virtual key and model this request is recorded under (S1);
+    /// kept so the later paid reservation uses the same identity as admission.
+    identity: BudgetIdentity,
     provider_id: &'a str,
     estimate: i64,
     state: Mutex<State<'a>>,
@@ -32,23 +35,29 @@ impl<'a> ProxyBudget<'a> {
     pub(crate) fn new(
         ledger: Option<&'a BudgetLedger>,
         tenant_id: Option<&'a str>,
+        identity: BudgetIdentity,
         provider_id: &'a str,
         estimate: i64,
     ) -> Result<Self, BudgetError> {
         if budget::is_paid(Some(estimate)) && ledger.is_none() {
-            return Err(budget::ledger_unavailable_error(tenant_id, provider_id));
+            return Err(budget::ledger_unavailable_error(
+                tenant_id,
+                &identity,
+                provider_id,
+            ));
         }
         let admission = if budget::is_paid(Some(estimate)) {
             if let Some(ledger) = ledger {
-                budget::check_admission(ledger, tenant_id, provider_id, 0)?;
+                budget::check_admission(ledger, tenant_id, &identity, provider_id, 0)?;
             }
             ReservationGuard::vacant(ledger, tenant_id)
         } else {
-            ReservationGuard::reserve(ledger, tenant_id, provider_id, 0)?
+            ReservationGuard::reserve(ledger, tenant_id, &identity, provider_id, 0)?
         };
         Ok(Self {
             ledger,
             tenant_id,
+            identity,
             provider_id,
             estimate,
             state: Mutex::new(State {
@@ -72,6 +81,7 @@ impl<'a> ProxyBudget<'a> {
         state.paid = Some(ReservationGuard::reserve(
             self.ledger,
             self.tenant_id,
+            &self.identity,
             self.provider_id,
             self.estimate,
         )?);
@@ -161,6 +171,11 @@ impl<'a> ProxyBudget<'a> {
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
+    /// No virtual key involved, no model named: the placeholder identity these
+    /// tests were written against.
+    fn paid_identity() -> BudgetIdentity {
+        BudgetIdentity::resolve(None, None, "paid")
+    }
     fn outcome(execution: ExecutionDisposition) -> ForwardOutcome {
         ForwardOutcome {
             status: 200,
@@ -178,7 +193,7 @@ mod tests {
         let (_dir, ledger) = crate::tests::configured_budget_ledger(2052);
         let cost = crate::tests::paid_component_card("paid").provider.cost;
         let quote = budget::estimate_cost_minor(&cost, "headroom").unwrap();
-        let first = ProxyBudget::new(Some(&ledger), None, "paid", quote).unwrap();
+        let first = ProxyBudget::new(Some(&ledger), None, paid_identity(), "paid", quote).unwrap();
         first.prepare_for_post().unwrap();
         first.arm().unwrap();
         first
@@ -188,12 +203,12 @@ mod tests {
             .finish(&outcome(ExecutionDisposition::Executed))
             .unwrap();
         assert_eq!(first.settlement().unwrap().unwrap().0, 9);
-        let cached = ProxyBudget::new(Some(&ledger), None, "paid", quote).unwrap();
+        let cached = ProxyBudget::new(Some(&ledger), None, paid_identity(), "paid", quote).unwrap();
         cached
             .finish(&outcome(ExecutionDisposition::Replay))
             .unwrap();
         assert!(cached.settlement().unwrap().is_none());
-        let denied = ProxyBudget::new(Some(&ledger), None, "paid", quote).unwrap();
+        let denied = ProxyBudget::new(Some(&ledger), None, paid_identity(), "paid", quote).unwrap();
         match denied.prepare_for_post().unwrap_err() {
             ProxyBudgetError::Ledger(error) => assert!(error.to_402_body().is_some()),
             ProxyBudgetError::StateUnavailable => panic!("expected ledger denial"),
@@ -229,14 +244,15 @@ mod tests {
                 .unwrap()
         };
         let before = count();
-        assert!(ProxyBudget::new(Some(&ledger), None, "paid", quote).is_err());
+        assert!(ProxyBudget::new(Some(&ledger), None, paid_identity(), "paid", quote).is_err());
         assert_eq!(count(), before);
     }
     #[test]
     fn cancelled_before_send_releases_but_armed_execution_retains() {
         let (_dir, ledger) = crate::tests::configured_budget_ledger(1_000_000);
         {
-            let pending = ProxyBudget::new(Some(&ledger), None, "paid", 2051).unwrap();
+            let pending =
+                ProxyBudget::new(Some(&ledger), None, paid_identity(), "paid", 2051).unwrap();
             pending.prepare_for_post().unwrap();
             assert_eq!(
                 ledger
@@ -254,7 +270,8 @@ mod tests {
             0
         );
         {
-            let sent = ProxyBudget::new(Some(&ledger), None, "paid", 2051).unwrap();
+            let sent =
+                ProxyBudget::new(Some(&ledger), None, paid_identity(), "paid", 2051).unwrap();
             sent.prepare_for_post().unwrap();
             sent.arm().unwrap();
             // Dropping the armed request models cancellation before a terminal result.

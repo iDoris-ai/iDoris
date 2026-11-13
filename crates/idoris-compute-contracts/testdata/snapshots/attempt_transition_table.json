@@ -1,0 +1,247 @@
+[
+  {
+    "event": "dispatch",
+    "from": "admitted",
+    "to": "sending"
+  },
+  {
+    "event": "never_left_host",
+    "from": "admitted",
+    "to": "not_sent"
+  },
+  {
+    "event": "wire_write_started",
+    "from": "admitted",
+    "to": null
+  },
+  {
+    "event": "upstream_refused",
+    "from": "admitted",
+    "to": null
+  },
+  {
+    "event": "usage_reported",
+    "from": "admitted",
+    "to": null
+  },
+  {
+    "event": "execution_observed_usage_unknown",
+    "from": "admitted",
+    "to": null
+  },
+  {
+    "event": "settle",
+    "from": "admitted",
+    "to": null
+  },
+  {
+    "event": "dispatch",
+    "from": "sending",
+    "to": null
+  },
+  {
+    "event": "never_left_host",
+    "from": "sending",
+    "to": "not_sent"
+  },
+  {
+    "event": "wire_write_started",
+    "from": "sending",
+    "to": "maybe_executed"
+  },
+  {
+    "event": "upstream_refused",
+    "from": "sending",
+    "to": "not_sent"
+  },
+  {
+    "event": "usage_reported",
+    "from": "sending",
+    "to": null
+  },
+  {
+    "event": "execution_observed_usage_unknown",
+    "from": "sending",
+    "to": null
+  },
+  {
+    "event": "settle",
+    "from": "sending",
+    "to": null
+  },
+  {
+    "event": "dispatch",
+    "from": "not_sent",
+    "to": null
+  },
+  {
+    "event": "never_left_host",
+    "from": "not_sent",
+    "to": null
+  },
+  {
+    "event": "wire_write_started",
+    "from": "not_sent",
+    "to": null
+  },
+  {
+    "event": "upstream_refused",
+    "from": "not_sent",
+    "to": null
+  },
+  {
+    "event": "usage_reported",
+    "from": "not_sent",
+    "to": null
+  },
+  {
+    "event": "execution_observed_usage_unknown",
+    "from": "not_sent",
+    "to": null
+  },
+  {
+    "event": "settle",
+    "from": "not_sent",
+    "to": null
+  },
+  {
+    "event": "dispatch",
+    "from": "maybe_executed",
+    "to": null
+  },
+  {
+    "event": "never_left_host",
+    "from": "maybe_executed",
+    "to": null
+  },
+  {
+    "event": "wire_write_started",
+    "from": "maybe_executed",
+    "to": null
+  },
+  {
+    "event": "upstream_refused",
+    "from": "maybe_executed",
+    "to": "not_sent"
+  },
+  {
+    "event": "usage_reported",
+    "from": "maybe_executed",
+    "to": "executed_usage_known"
+  },
+  {
+    "event": "execution_observed_usage_unknown",
+    "from": "maybe_executed",
+    "to": "executed_usage_unknown"
+  },
+  {
+    "event": "settle",
+    "from": "maybe_executed",
+    "to": null
+  },
+  {
+    "event": "dispatch",
+    "from": "executed_usage_known",
+    "to": null
+  },
+  {
+    "event": "never_left_host",
+    "from": "executed_usage_known",
+    "to": null
+  },
+  {
+    "event": "wire_write_started",
+    "from": "executed_usage_known",
+    "to": null
+  },
+  {
+    "event": "upstream_refused",
+    "from": "executed_usage_known",
+    "to": null
+  },
+  {
+    "event": "usage_reported",
+    "from": "executed_usage_known",
+    "to": null
+  },
+  {
+    "event": "execution_observed_usage_unknown",
+    "from": "executed_usage_known",
+    "to": null
+  },
+  {
+    "event": "settle",
+    "from": "executed_usage_known",
+    "to": "settled"
+  },
+  {
+    "event": "dispatch",
+    "from": "executed_usage_unknown",
+    "to": null
+  },
+  {
+    "event": "never_left_host",
+    "from": "executed_usage_unknown",
+    "to": null
+  },
+  {
+    "event": "wire_write_started",
+    "from": "executed_usage_unknown",
+    "to": null
+  },
+  {
+    "event": "upstream_refused",
+    "from": "executed_usage_unknown",
+    "to": null
+  },
+  {
+    "event": "usage_reported",
+    "from": "executed_usage_unknown",
+    "to": "executed_usage_known"
+  },
+  {
+    "event": "execution_observed_usage_unknown",
+    "from": "executed_usage_unknown",
+    "to": null
+  },
+  {
+    "event": "settle",
+    "from": "executed_usage_unknown",
+    "to": "settled"
+  },
+  {
+    "event": "dispatch",
+    "from": "settled",
+    "to": null
+  },
+  {
+    "event": "never_left_host",
+    "from": "settled",
+    "to": null
+  },
+  {
+    "event": "wire_write_started",
+    "from": "settled",
+    "to": null
+  },
+  {
+    "event": "upstream_refused",
+    "from": "settled",
+    "to": null
+  },
+  {
+    "event": "usage_reported",
+    "from": "settled",
+    "to": null
+  },
+  {
+    "event": "execution_observed_usage_unknown",
+    "from": "settled",
+    "to": null
+  },
+  {
+    "event": "settle",
+    "from": "settled",
+    "to": null
+  }
+]
