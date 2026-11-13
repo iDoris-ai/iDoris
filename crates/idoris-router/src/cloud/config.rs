@@ -1012,6 +1012,9 @@ pub fn parse_with_ingress_tenants(
 /// `now` 和加载配置时用的是同一个时钟读数（生产装配先取一次 [`crate::cloud::Clock::now`]）。只看「写了这个块」不够：
 /// 到期日相对 `now` 已经无效，仍然拒绝。
 ///
+/// **这只管启动那一刻**。进程一直跑下去，到期日也要生效：确认随 [`SafetySetup::into_gate`] 带进运行期的 gate，每次儿童请求
+/// 按当前时钟再核对一次（见 [`crate::cloud::safety::config`] 的模块文档），过期就拒绝（round2-r2 / r3 N1）。
+///
 /// 不放进 [`parse_with_ingress_tenants`]：它是各种测试夹具共用的解析入口（很多测试用 `rules_only` 单独验证规则检查器的
 /// 行为，不需要 LLM 检查器）；生产装配 [`crate::cloud::CloudUpstream::from_file_with_ingress_tenants`] 加载之后调用它。
 /// 没有儿童租户时，`rules_only` 不需要这份确认。
@@ -1466,6 +1469,26 @@ safety:
             adult_rules.safety.as_ref().unwrap().startup_label(),
             "rules_only"
         );
+    }
+
+    /// round2-r2 / r3 N1：确认的到期日要带进运行期的 gate。只在启动时核对一次的话，进程一直跑下去，期限就成了永久豁免。
+    #[test]
+    fn the_assembled_gate_carries_the_acknowledgement_expiry_into_the_running_service() {
+        use crate::cloud::safety::SimpleExtraCost;
+
+        let with_ack = load(&rules_only_ack("2026-11-13")).unwrap();
+        let gate = with_ack
+            .safety
+            .unwrap()
+            .into_gate(Arc::new(SimpleExtraCost::new()));
+        assert_eq!(gate.rules_only_expires_on(), Some("2026-11-13"));
+        // 没有写确认：没有期限（没有儿童租户的 rules_only 部署，或者测试装配）
+        let plain = load(&format!("{VALID}safety:\n  mode: rules_only\n")).unwrap();
+        let gate = plain
+            .safety
+            .unwrap()
+            .into_gate(Arc::new(SimpleExtraCost::new()));
+        assert_eq!(gate.rules_only_expires_on(), None);
     }
 
     #[test]

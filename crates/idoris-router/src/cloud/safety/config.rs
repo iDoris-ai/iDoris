@@ -49,6 +49,11 @@
 //!   `mode: rules_and_llm` 再写这个块，加载失败。放宽生效时启动日志打一行醒目警告，摘要写成
 //!   `rules_only (acknowledged until YYYY-MM-DD)`。「今天」用调用方传入的 `now`（生产是 [`crate::cloud::SystemClock`]），
 //!   不在这里读系统时钟。
+//! - **到期日在运行期间同样生效**（round2-r2 / r3 N1）：启动时有效不等于一直有效。[`SafetySetup::into_gate`] 把确认带进 gate
+//!   （[`crate::cloud::SafetyGate::with_rules_only_acknowledgement`]），每次儿童请求的输入检查和输出检查都按执行器当次的时钟
+//!   （测试里可以拨）再核对一次；到期（UTC 日历日，到期日当天含）之后，没有 LLM 检查器的儿童请求一律
+//!   `safety_unavailable`（`no_compliant_checker`，503），在调用任何上游和检查器之前被拒，日志里有一行说明原因。
+//!   进程不用重启就会生效；要恢复服务，更新确认或者改配成 `rules_and_llm`。
 //! - **LLM 检查端点必须用端点许可表校验**：在表里、`allowed_data_classes` 含 `child_edu`（于是 ZDR + 已签 DPA）、核验没过期、
 //!   满足**每个**儿童调用方的区域 / 留存 / DPA 要求。不合规启动失败，错误里写明被排除的原因（枚举，没有任何内容）。
 //!   本机开发和测试只能指向已经在跑的 oMLX，生产上它必须同样是许可表里允许 `child_edu` 的端点，没有例外。
@@ -223,13 +228,25 @@ impl SafetySetup {
     }
 
     /// 装成 gate：规则检查器先行，有 LLM 检查器就接在后面。
+    ///
+    /// **没有 LLM 检查器时，显式确认（连同它的到期日）要带进 gate**：启动时核对过一次不够，进程一直跑下去，期限就成了摆设
+    /// （round2-r2 / r3 N1）；gate 每次儿童请求都按当前时钟再核对，过期就拒绝。有 LLM 检查器的装配没有这份确认（加载时就拒绝了
+    /// 同时写两者），也不受期限约束。
     pub fn into_gate(self, cost: Arc<dyn ExtraCostMeter>) -> SafetyGate {
         let rules: Arc<dyn SafetyChecker> = Arc::new(RuleChecker::new());
+        let rules_only = self.judge.is_none();
         let checker: Arc<dyn SafetyChecker> = match self.judge {
             Some(judge) => Arc::new(SafetyPipeline::new(rules).then(Arc::new(judge))),
             None => rules,
         };
-        SafetyGate::new(checker, self.limits, cost).with_trusted_operator_text(self.trusted)
+        let gate =
+            SafetyGate::new(checker, self.limits, cost).with_trusted_operator_text(self.trusted);
+        match self.acknowledgement {
+            Some(acknowledgement) if rules_only => {
+                gate.with_rules_only_acknowledgement(acknowledgement)
+            }
+            _ => gate,
+        }
     }
 }
 

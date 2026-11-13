@@ -12,6 +12,8 @@
 //!    ├─ stream=true ─────────────────────────────▶ 400 streaming_not_allowed（handler 与执行器各查一次）
 //!    ├─ 没有合规的主上游候选 ────────────────────▶ 503 no_compliant_endpoint（便宜的检查先做，不白花检查成本）
 //!    ├─ 没有配置安全检查器 ──────────────────────▶ 503 safety_unavailable（not_configured）
+//!    ├─ 只用规则检查器的显式确认到期了 ───────────▶ 503 safety_unavailable（no_compliant_checker）
+//!    │          （没有 LLM 检查器的装配带着确认的到期日，输入检查和输出检查每次都按当前时钟核对，不是只在启动时）
 //!    ▼
 //!  ① 输入检查  extract_input_with：**转发的请求**（`build_chat_body` 构造的那份）里客户端写的**每一个**字符串，值和键名都取；
 //!    │          客户端写的一切（含 system / developer 角色）都按孩子写的话，只有服务端登记的运营方提示得到运营方的待遇
@@ -96,6 +98,7 @@ pub use extract::{
 pub use ledger_cost::LedgerExtraCost;
 pub use rules::RuleChecker;
 
+use config::RulesOnlyAcknowledgement;
 use extract::{extract_input_with, rebuild_response};
 
 /// 手写的盒装 future（不引入 `async-trait`）。
@@ -378,6 +381,11 @@ pub struct SafetyGate {
     cost: Arc<dyn ExtraCostMeter>,
     /// 服务端配置里登记的受信运营方提示。默认没有：客户端写的内容一律按孩子写的话检查。
     trusted: TrustedOperatorText,
+    /// 「只用规则检查器」的显式确认（`safety.rules_only_acknowledgement`，owner 2026-11-13 方案 B）。**只有没有 LLM 检查器的
+    /// 装配才带着它**：确认有到期日，而启动时核对一次不够（进程一直跑下去，期限就成了摆设），所以 gate 留着它，
+    /// 每次儿童请求的输入检查和输出检查都按当次的时钟再核对；过期了就在调用任何检查器之前拒绝（round2-r2 / r3 N1）。
+    /// 默认没有：测试装配、有 LLM 检查器的装配不受期限约束。
+    rules_only_acknowledgement: Option<RulesOnlyAcknowledgement>,
 }
 
 impl std::fmt::Debug for SafetyGate {
@@ -386,6 +394,7 @@ impl std::fmt::Debug for SafetyGate {
             .field("checker", &self.checker)
             .field("limits", &self.limits)
             .field("trusted_operator_prompts", &self.trusted.len())
+            .field("rules_only_expires_on", &self.rules_only_expires_on())
             .finish_non_exhaustive()
     }
 }
@@ -409,6 +418,7 @@ impl SafetyGate {
             limits,
             cost,
             trusted: TrustedOperatorText::none(),
+            rules_only_acknowledgement: None,
         }
     }
 
@@ -417,6 +427,50 @@ impl SafetyGate {
     pub fn with_trusted_operator_text(mut self, trusted: TrustedOperatorText) -> Self {
         self.trusted = trusted;
         self
+    }
+
+    /// 带上「只用规则检查器」的显式确认：到期之后（按每次请求的 `SafetyCall::now`，UTC 日历日，到期日当天含）这个 gate 对儿童请求
+    /// 一律返回 `safety_unavailable`（`no_compliant_checker`），不调用任何检查器。只给**没有 LLM 检查器**的装配用
+    /// （[`config::SafetySetup::into_gate`] 保证）。
+    pub fn with_rules_only_acknowledgement(
+        mut self,
+        acknowledgement: RulesOnlyAcknowledgement,
+    ) -> Self {
+        self.rules_only_acknowledgement = Some(acknowledgement);
+        self
+    }
+
+    /// 这个 gate 带着的确认的到期日（`YYYY-MM-DD`，UTC）；没有带确认就是 `None`。
+    pub fn rules_only_expires_on(&self) -> Option<&str> {
+        self.rules_only_acknowledgement
+            .as_ref()
+            .map(|acknowledgement| acknowledgement.expires_on.as_str())
+    }
+
+    /// 确认在 `call.now` 这一刻还有效吗？没有带确认的 gate 不受限。过期（或者时钟读数不可信：超出可表示范围、
+    /// 离到期日超过 90 天，和启动时是同一套判断）就是拒绝：**选用 `NoCompliantChecker`，不新增线上字符串**——
+    /// 它的含义「没有满足硬约束的检查器」正是这里的情形，和检查端点的核验在运行中过期是同一类（时间到了，原来合规的检查器不再合规）；
+    /// `NotConfigured` 说的是「根本没配置检查器」，运营方会去查错地方。
+    fn ensure_acknowledgement_current(
+        &self,
+        call: &SafetyCall<'_>,
+        stage: SafetyStage,
+    ) -> Result<(), GateDenial> {
+        let Some(acknowledgement) = &self.rules_only_acknowledgement else {
+            return Ok(());
+        };
+        if acknowledgement.ensure_current(call.now).is_ok() {
+            return Ok(());
+        }
+        // 只有请求号、阶段和到期日（配置里的日期，不是内容）
+        eprintln!(
+            "[idoris] safety: request {} refused at the {stage} stage: the rules_only acknowledgement (expires_on={}) is no longer valid and no LLM checker is configured; child-data requests stay refused until safety.llm_judge is configured or the acknowledgement is renewed",
+            call.request_id, acknowledgement.expires_on
+        );
+        Err(GateDenial::Unavailable {
+            stage,
+            cause: SafetyUnavailableCause::NoCompliantChecker,
+        })
     }
 
     /// 只有规则检查器的 gate（没有 LLM，没有成本）。
@@ -445,6 +499,8 @@ impl SafetyGate {
         body: &Map<String, Value>,
     ) -> Result<CheckedInput, GateDenial> {
         let stage = SafetyStage::Input;
+        // 最先做：确认过期了，儿童请求在取文本、调用任何检查器、也在任何上游调用之前就被拒绝
+        self.ensure_acknowledgement_current(call, stage)?;
         let input = match extract_input_with(body, self.limits.max_input_bytes, &self.trusted) {
             Ok(input) => input,
             Err(ExtractError::TooLarge) => {
@@ -492,6 +548,8 @@ impl SafetyGate {
         response_model: &str,
     ) -> Result<Vec<u8>, GateDenial> {
         let stage = SafetyStage::Output;
+        // 上游调用可能花了很久（请求跨过了到期日）：输出检查也用**当前**的时钟核对一次，过期了回答不发
+        self.ensure_acknowledgement_current(call, stage)?;
         let identity = ResponseIdentity {
             id: call.request_id.as_str(),
             model: response_model,
@@ -1386,6 +1444,125 @@ mod tests {
             value["choices"][0]["message"]["tool_calls"][0]["id"],
             "call_req1_0"
         );
+    }
+
+    /// 2026-11-13T00:00:00Z。
+    const EXPIRY_DAY_START: i64 = 1_794_528_000_000;
+    const DAY: i64 = 86_400_000;
+
+    fn acknowledgement_until(expires_on: &str) -> RulesOnlyAcknowledgement {
+        RulesOnlyAcknowledgement {
+            reason: "内测外部测试尚无签了DPA的检查器模型".to_string(),
+            acknowledged_by: "ops".to_string(),
+            expires_on: expires_on.to_string(),
+        }
+    }
+
+    /// 在 `now` 这一刻跑一次输入检查和一次输出检查（各自一个全新的调用）。
+    async fn both_stages_at(
+        gate: &SafetyGate,
+        now: i64,
+    ) -> (
+        Result<CheckedInput, GateDenial>,
+        Result<Vec<u8>, GateDenial>,
+    ) {
+        let id = request_id("req-1");
+        let payment = payment_context();
+        let tenant = child_tenant();
+        let cancel = CancellationToken::new();
+        let call = SafetyCall {
+            request_id: &id,
+            payment: &payment,
+            tenant: &tenant,
+            billing: Billing::Paid,
+            now: TimestampMs(now),
+            cancel: &cancel,
+        };
+        let input = gate.check_input(&call, &request_body()).await;
+        let output = gate
+            .check_output(
+                &call,
+                &CheckedInput::default(),
+                &upstream_body(),
+                "route-model",
+            )
+            .await;
+        (input, output)
+    }
+
+    #[tokio::test]
+    async fn an_expired_rules_only_acknowledgement_refuses_every_child_request_before_any_check_runs()
+     {
+        // round2-r2 / r3 N1：启动时有效的确认，进程一直跑下去，期限不能变成摆设
+        let checker = Scripted::allow();
+        let gate = gate(checker.clone())
+            .with_rules_only_acknowledgement(acknowledgement_until("2026-11-13"));
+        assert_eq!(gate.rules_only_expires_on(), Some("2026-11-13"));
+        let denied = |stage| {
+            Err::<(), _>(GateDenial::Unavailable {
+                stage,
+                cause: SafetyUnavailableCause::NoCompliantChecker,
+            })
+        };
+        for (now, served) in [
+            // 到期日的前一天、当天零点、当天最后一毫秒（到期日含）：照常
+            (EXPIRY_DAY_START - DAY, true),
+            (EXPIRY_DAY_START, true),
+            (EXPIRY_DAY_START + DAY - 1, true),
+            // 跨过 UTC 午夜：到期
+            (EXPIRY_DAY_START + DAY, false),
+            (EXPIRY_DAY_START + 2 * DAY, false),
+            // 长期运行：几个月之后、几年之后
+            (EXPIRY_DAY_START + 120 * DAY, false),
+            (EXPIRY_DAY_START + 1_000 * DAY, false),
+            // 时钟读数不可信（回到 1970、离到期日远超 90 天）：和启动时同一套判断，失败即关闭
+            (0, false),
+            (-DAY, false),
+        ] {
+            let before = checker.calls.load(Ordering::SeqCst);
+            let (input, output) = both_stages_at(&gate, now).await;
+            if served {
+                assert!(
+                    input.is_ok() && output.is_ok(),
+                    "now={now}: {input:?} {output:?}"
+                );
+                assert_eq!(
+                    checker.calls.load(Ordering::SeqCst),
+                    before + 2,
+                    "now={now}"
+                );
+            } else {
+                assert_eq!(input.map(|_| ()), denied(SafetyStage::Input), "now={now}");
+                assert_eq!(output.map(|_| ()), denied(SafetyStage::Output), "now={now}");
+                assert_eq!(
+                    checker.calls.load(Ordering::SeqCst),
+                    before,
+                    "now={now}: no checker was called for an expired acknowledgement"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_gate_without_an_acknowledgement_has_no_expiry() {
+        // 有 LLM 检查器的装配、测试装配：没有确认就没有期限，什么时候都照常（没有「悄悄变成永久拒绝」的情形）
+        let checker = Scripted::allow();
+        let gate = gate(checker.clone());
+        assert_eq!(gate.rules_only_expires_on(), None);
+        for now in [0, EXPIRY_DAY_START, EXPIRY_DAY_START + 5_000 * DAY] {
+            let (input, output) = both_stages_at(&gate, now).await;
+            assert!(input.is_ok() && output.is_ok(), "now={now}");
+        }
+    }
+
+    #[test]
+    fn the_acknowledgement_survives_the_clone_that_swaps_in_the_cost_meter() {
+        // 生产装配先建 gate，再 `with_extra_cost_meter` 克隆一份换计量器：期限不能在这一步丢掉
+        let gate = SafetyGate::rules_only()
+            .with_rules_only_acknowledgement(acknowledgement_until("2026-12-31"));
+        let swapped = gate.clone().with_cost(Arc::new(SimpleExtraCost::new()));
+        assert_eq!(swapped.rules_only_expires_on(), Some("2026-12-31"));
+        assert!(format!("{swapped:?}").contains("2026-12-31"));
     }
 
     #[tokio::test]
