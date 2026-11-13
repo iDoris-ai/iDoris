@@ -9,7 +9,8 @@
 //! - **N3**：LLM 检查器的预留按最终要发出的全部调用算，不是按原始文本的字节估一次；
 //! - **PARTIAL High①**：客户端填写的 `assistant` 消息也要过输入规则，而之前的拒绝语不能让对话无法继续；
 //! - **PARTIAL High③**：命中区间内部跨句时，一句里的拒绝语不能放行另一句里的步骤；
-//! - **PARTIAL High④**：工具参数里的重复键一律拒绝（输入历史和上游回答）。
+//! - **PARTIAL High④**：工具参数里的重复键一律拒绝（输入历史和上游回答）；
+//! - **检查端点的主机绑定**（协调者追加）：LLM 检查端点和主上游一样，只能是回环地址或这个供应商核验过的 API 主机。
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 #[path = "support/child_safety.rs"]
@@ -439,4 +440,47 @@ async fn a_refusal_in_one_sentence_does_not_excuse_the_steps_in_the_next_sentenc
     .await;
     let reply = post(&h.app, &child_body(&benign_question())).await;
     assert_eq!(reply.status, 200, "{}", reply.text());
+}
+
+// ---------------------------------------------------------------------------
+// 检查端点的主机绑定
+// ---------------------------------------------------------------------------
+
+/// 用夹具生成云上游配置（含 `safety:` 段）并加载，不起服务。
+fn load_config(endpoints: &[Endpoint], safety_yaml: &str) -> Result<(), String> {
+    let dir = tempfile::tempdir().unwrap();
+    let key_file = dir.path().join("upstream.key");
+    std::fs::write(&key_file, "sk-test\n").unwrap();
+    std::fs::write(
+        dir.path().join("permits.yaml"),
+        harness::permit_table_yaml(endpoints),
+    )
+    .unwrap();
+    let options = Options {
+        callers: vec![Caller::child_edu()],
+        safety_yaml: safety_yaml.to_string(),
+        routes: Some(vec![("idoris/agent", vec!["example-zdr"])]),
+        ..Options::default()
+    };
+    let yaml = harness::config_yaml(endpoints, key_file.to_str().unwrap(), &options);
+    idoris_router::cloud::config::parse(&yaml, dir.path(), TimestampMs(NOW_MS)).map(|_| ())
+}
+
+#[test]
+fn a_judge_endpoint_on_an_unverified_host_does_not_load() {
+    // 孩子的原文和模型的回答都会发到检查端点：它的 `base_url` 和主上游一样，只能是回环地址或者这个供应商核验过的 API 主机。
+    // 云上游配置对 `endpoints:` 里每一行的校验和检查器自己的校验（`safety::config` 的 `build_judge`，单测直接构造它）各拦一次
+    let main = Endpoint::child_edu_compliant("example-zdr", "http://127.0.0.1:9/v1".to_string());
+    let judge = |url: &str| Endpoint::child_edu_compliant("example-judge", url.to_string());
+    let safety = child_safety::judge_yaml(1_000);
+    // 回环地址（本机的假检查服务）：能加载
+    load_config(&[main.clone(), judge("http://127.0.0.1:9/v1")], &safety).unwrap();
+    // 没登记核验过主机的供应商标签 + 任意 HTTPS 主机：加载失败，错误里是主机和供应商标签，没有密钥
+    let error =
+        load_config(&[main, judge("https://judge.example.invalid/v1")], &safety).unwrap_err();
+    assert!(
+        error.contains("没有登记核验过的 API 主机") && error.contains("example-judge"),
+        "{error}"
+    );
+    assert!(!error.contains("sk-"), "{error}");
 }

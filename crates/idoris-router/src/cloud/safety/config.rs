@@ -57,6 +57,10 @@
 //! - **LLM 检查端点必须用端点许可表校验**：在表里、`allowed_data_classes` 含 `child_edu`（于是 ZDR + 已签 DPA）、核验没过期、
 //!   满足**每个**儿童调用方的区域 / 留存 / DPA 要求。不合规启动失败，错误里写明被排除的原因（枚举，没有任何内容）。
 //!   本机开发和测试只能指向已经在跑的 oMLX，生产上它必须同样是许可表里允许 `child_edu` 的端点，没有例外。
+//! - **LLM 检查端点的 `base_url` 主机也要核验**（和主上游同一个 [`crate::cloud::config::check_provider_host`]）：孩子的原文和模型的
+//!   回答都会发到那里。只能是回环地址，或者这个供应商核验过的 API 主机；没有登记主机的供应商标签、主机没核实的供应商不能配置到任何
+//!   非回环地址。云上游配置加载时对 `endpoints:` 里的每一行已经查过一遍；检查器自己的构造（`build_judge`）**不依赖那一步**，
+//!   自己再查一次（单测直接构造它），失败即启动失败。
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -79,7 +83,7 @@ use super::llm::{
 use super::text::Sensitive;
 use super::{ExtraCostMeter, RuleChecker, SafetyChecker, SafetyGate, SafetyLimits, SafetyPipeline};
 use crate::cloud::config::{
-    EndpointConfig, EndpointRef, build_credentials, key_of, rate_card_cost,
+    EndpointConfig, EndpointRef, build_credentials, check_provider_host, key_of, rate_card_cost,
 };
 
 /// 一个阶段总预算的上限（毫秒）：再长就不是「检查」而是「等」。
@@ -559,6 +563,13 @@ fn build_judge(config: &JudgeConfig, inputs: &BuildInputs<'_>) -> Result<LlmJudg
                 "LLM 检查端点 {key} 没有在 endpoints 里配置（它的地址、密钥来源和成本价目写在那里）"
             ))
         })?;
+    // ---- 主机绑定：孩子的原文（输入检查）和模型的回答（输出检查）都会发到这个地址 ----
+    // 和主上游同一套规则（`check_provider_host`）：回环地址，或者这个供应商核验过的 API 主机；没有登记主机的供应商标签、
+    // 主机没核实的供应商不能配置到任何非回环地址。云上游配置加载时对 `endpoints:` 里的每一行已经查过一遍，这里**不依赖那一步**：
+    // 检查端点的构造路径自己证明目标主机是核验过的（否则许可表里「允许儿童数据」的标签可以被误指向任意 HTTPS 主机）。
+    check_provider_host(&key, &endpoint.base_url).map_err(|error| {
+        format!("{error}（这是 safety.llm_judge 的检查端点：孩子的原文和模型的回答会发到这个主机）")
+    })?;
 
     // ---- 用许可表校验：对每一个儿童调用方都必须合规 ----
     let synthetic;
@@ -846,6 +857,64 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    // ---- LLM 检查端点的主机绑定（和主上游同一套 `check_provider_host`）----
+
+    /// 直接用 `build` 构造一个只有检查器的 `safety:` 段（绕过云上游配置里对 `endpoints:` 逐行的校验）：
+    /// 检查端点的 `base_url` 是孩子的原文要发去的地方，这里自己必须证明主机是核验过的。
+    fn build_judge_setup(provider: &str, base_url: &str) -> Result<SafetySetup, String> {
+        let model = "example-org/judge-8b";
+        let permits = Arc::new(
+            PermitTable::from_yaml_str(&format!(
+                "schema_version: 1\nverification_max_age_days: 90\nendpoints:\n  - provider: {provider}\n    model: {model}\n    endpoint: openai-compat\n    access: api\n    processing_regions: [local-1]\n    retention: zdr\n    dpa: signed\n    allowed_data_classes: [child_edu, adult, public]\n    capabilities: {{tool_calling: false, stream_usage: false, cache_pricing: false, structured_output: false, cancellation: false}}\n    verified_at: \"2026-11-12\"\n"
+            ))
+            .unwrap(),
+        );
+        let endpoint: EndpointConfig = serde_yaml::from_str(&format!(
+            "provider: {provider}\nmodel: {model}\nendpoint: openai-compat\nbase_url: {base_url}\napi_key_env: EXAMPLE_JUDGE_API_KEY\nprice_version: pv-judge\ncost: {{unit: USD, input_per_mtok: \"0.26\", output_per_mtok: \"0.38\"}}\nprices:\n  - {{unit: THB, input_per_mtok: \"10\", output_per_mtok: \"40\"}}\n"
+        ))
+        .unwrap();
+        let config: SafetyConfig = serde_yaml::from_str(&format!(
+            "mode: rules_and_llm\nllm_judge:\n  endpoint: {{provider: {provider}, model: {model}, endpoint: openai-compat}}\n  max_output_tokens: 32\n"
+        ))
+        .unwrap();
+        let http = idoris_upstream::cloud::build_http_client(Duration::from_secs(1)).unwrap();
+        build(
+            &config,
+            &BuildInputs {
+                permits: &permits,
+                endpoints: &[endpoint],
+                http: &http,
+                child_policies: Vec::new(),
+                now: NOW,
+            },
+        )
+    }
+
+    #[test]
+    fn the_judge_endpoint_must_sit_on_a_loopback_or_a_verified_host_like_the_main_upstream() {
+        // 回环地址（本机的假检查服务）：允许
+        build_judge_setup("example-judge", "http://127.0.0.1:9/v1").unwrap();
+        // 没有登记核验过主机的供应商标签：任何非回环地址一律拒绝（孩子的原文会发去那个主机）
+        let error =
+            build_judge_setup("example-judge", "https://judge.example.invalid/v1").unwrap_err();
+        assert!(
+            error.contains("没有登记核验过的 API 主机") && error.contains("example-judge"),
+            "{error}"
+        );
+        // 已核验的供应商：只有它登记过的主机
+        build_judge_setup("deepinfra", "https://api.deepinfra.com/v1").unwrap();
+        let error = build_judge_setup("deepinfra", "https://evil.example.invalid/v1").unwrap_err();
+        assert!(
+            error.contains("不是许可表为供应商 deepinfra 核验过的 API 主机"),
+            "{error}"
+        );
+        // 主机没核实的供应商：不能配置到任何非回环地址
+        let error = build_judge_setup("together", "https://api.together.xyz/v1").unwrap_err();
+        assert!(error.contains("没有核实"), "{error}");
+        // 错误里是配置里的主机和供应商标签，没有任何密钥或内容
+        assert!(!error.contains("sk-"));
     }
 
     #[test]
