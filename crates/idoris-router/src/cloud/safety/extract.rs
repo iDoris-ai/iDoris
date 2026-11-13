@@ -12,7 +12,9 @@
 //!
 //! - **键名也是文本**：工具 schema 的属性名、消息对象里的任意额外键，模型都读得到；
 //! - **看起来是 JSON 的字符串解码之后再取一遍**（`{"text":"kill yourself"}` 里的转义）；
-//! - **`arguments` 必须是合法的 JSON**，解析不了就是 [`ExtractError::Malformed`]（失败即关闭），历史消息里的工具调用参数同样。
+//! - **`arguments` 必须是合法的 JSON**，解析不了就是 [`ExtractError::Malformed`]（失败即关闭），历史消息里的工具调用参数同样；
+//! - **重复的键一律拒绝**（任何一层，输入历史和上游回答里的工具参数，以及嵌套的 JSON 字符串）：覆盖重复键的解析只看得到最后
+//!   一个值，采用「先值」语义的工具消费者读到的却是被覆盖的那个，检查看到的和交付的就不是同一份参数（round2-r3 PARTIAL High#4）。
 //!
 //! # 来源：客户端自己挣不到豁免
 //!
@@ -46,7 +48,9 @@ use std::borrow::Cow;
 use std::sync::Arc;
 
 use idoris_upstream::cloud::wire::{ChatCall, FORWARDED_FIELDS, build_chat_body};
-use serde_json::{Map, Value, json};
+use serde::Deserialize;
+use serde::de::{Deserializer, MapAccess, SeqAccess, Visitor};
+use serde_json::{Map, Number, Value, json};
 
 use super::text::Sensitive;
 
@@ -301,13 +305,127 @@ impl TrustedOperatorText {
 // 输入
 // ---------------------------------------------------------------------------
 
-/// 一个字符串本身看起来是 JSON 对象或数组时，把它解码之后的键和值也取出来。解析不了就只是文本。
+/// 一份解析好的 JSON，加上「任何一层有没有重复的键」（round2-r3 PARTIAL High#4）。
+///
+/// `serde_json::Value` 遇到重复的键是后值覆盖前值（`{"a":1,"a":2}` 只剩 `2`）。工具参数是**原样**转发给客户端的 JSON 文本，
+/// 采用「先值」语义的消费者读到的是被覆盖掉的那个值：检查看到的（解码之后只剩最后一个值）和交付的不是同一份参数——
+/// 把被禁止的话写在前一个值里，后面再放一个无害的同名键，解码检查就只看得到无害的那个。所以**重复的键一律拒绝**，
+/// 按解析失败同等处理（`Malformed`，失败即关闭）。同名判断在键解码之后：`"text"` 和用 `\u` 转义写成的 `"text"` 是同一个键。
+struct Parsed {
+    value: Value,
+    duplicate_keys: bool,
+}
+
+impl Parsed {
+    fn leaf(value: Value) -> Self {
+        Self {
+            value,
+            duplicate_keys: false,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Parsed {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_any(ParsedVisitor)
+    }
+}
+
+/// 和 `serde_json::Value` 的解析一样（同一个解析器、同样的递归深度上限），只多记一个「有没有重复的键」。
+struct ParsedVisitor;
+
+impl<'de> Visitor<'de> for ParsedVisitor {
+    type Value = Parsed;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("any valid JSON value")
+    }
+
+    fn visit_bool<E>(self, value: bool) -> Result<Parsed, E> {
+        Ok(Parsed::leaf(Value::Bool(value)))
+    }
+
+    fn visit_i64<E>(self, value: i64) -> Result<Parsed, E> {
+        Ok(Parsed::leaf(Value::from(value)))
+    }
+
+    fn visit_u64<E>(self, value: u64) -> Result<Parsed, E> {
+        Ok(Parsed::leaf(Value::from(value)))
+    }
+
+    fn visit_f64<E>(self, value: f64) -> Result<Parsed, E> {
+        Ok(Parsed::leaf(
+            Number::from_f64(value).map_or(Value::Null, Value::Number),
+        ))
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Parsed, E> {
+        Ok(Parsed::leaf(Value::String(value.to_owned())))
+    }
+
+    fn visit_string<E>(self, value: String) -> Result<Parsed, E> {
+        Ok(Parsed::leaf(Value::String(value)))
+    }
+
+    fn visit_unit<E>(self) -> Result<Parsed, E> {
+        Ok(Parsed::leaf(Value::Null))
+    }
+
+    fn visit_none<E>(self) -> Result<Parsed, E> {
+        Ok(Parsed::leaf(Value::Null))
+    }
+
+    fn visit_some<D: Deserializer<'de>>(self, deserializer: D) -> Result<Parsed, D::Error> {
+        Parsed::deserialize(deserializer)
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Parsed, A::Error> {
+        let mut items = Vec::new();
+        let mut duplicate_keys = false;
+        while let Some(item) = seq.next_element::<Parsed>()? {
+            duplicate_keys |= item.duplicate_keys;
+            items.push(item.value);
+        }
+        Ok(Parsed {
+            value: Value::Array(items),
+            duplicate_keys,
+        })
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Parsed, A::Error> {
+        let mut object = Map::new();
+        let mut duplicate_keys = false;
+        while let Some(key) = map.next_key::<String>()? {
+            let item: Parsed = map.next_value()?;
+            duplicate_keys |= item.duplicate_keys;
+            if object.insert(key, item.value).is_some() {
+                duplicate_keys = true;
+            }
+        }
+        Ok(Parsed {
+            value: Value::Object(object),
+            duplicate_keys,
+        })
+    }
+}
+
+/// 工具参数（JSON 文本）解析成 `Value`：解析不了、**有重复的键**（任何一层）都是 `Malformed`。
+fn parse_unique_keys(text: &str) -> Result<Value, ExtractError> {
+    let parsed: Parsed = serde_json::from_str(text).map_err(|_| ExtractError::Malformed)?;
+    if parsed.duplicate_keys {
+        return Err(ExtractError::Malformed);
+    }
+    Ok(parsed.value)
+}
+
+/// 一个字符串本身看起来是 JSON 对象或数组时，把它解码之后的键和值也取出来。解析不了就只是文本；
+/// **有重复的键**（任何一层）不是「只是文本」：解码视图会丢掉被覆盖的值，同样失败即关闭。
 fn decode_nested_json(text: &str, out: &mut Vec<String>, depth: usize) -> Result<(), ExtractError> {
     let trimmed = text.trim_start();
     if !(trimmed.starts_with('{') || trimmed.starts_with('[')) {
         return Ok(());
     }
-    let parsed = match serde_json::from_str::<Value>(text) {
+    let parsed = match serde_json::from_str::<Parsed>(text) {
         Ok(parsed) => parsed,
         // 嵌套深到 serde_json 自己都不肯解析（超过 128 层）：我们看不到里面的东西，客户端 / 模型未必也看不到，失败即关闭。
         // 只对「看起来是完整的 JSON」（以 `}` 或 `]` 结尾）这样处理：孩子敲了一长串没有闭合的 `[[[[[` 只是普通文本
@@ -320,16 +438,20 @@ fn decode_nested_json(text: &str, out: &mut Vec<String>, depth: usize) -> Result
         // 只是恰好以 `{` / `[` 开头的普通文本
         Err(_) => return Ok(()),
     };
-    collect_value(&parsed, out, depth.saturating_add(NESTED_JSON_COST))
+    if parsed.duplicate_keys {
+        return Err(ExtractError::Malformed);
+    }
+    collect_value(&parsed.value, out, depth.saturating_add(NESTED_JSON_COST))
 }
 
-/// `arguments`：必须是合法的 JSON 文本（空白算「没有参数」）。原文先取，再取解码之后的键和值。解析不了是 `Malformed`。
+/// `arguments`：必须是合法的 JSON 文本（空白算「没有参数」）。原文先取，再取解码之后的键和值。
+/// 解析不了、或者有重复的键（任何一层）是 `Malformed`：检查和转发必须是同一份参数。
 fn collect_arguments(text: &str, out: &mut Vec<String>, depth: usize) -> Result<(), ExtractError> {
     out.push(text.to_string());
     if text.trim().is_empty() {
         return Ok(());
     }
-    let parsed: Value = serde_json::from_str(text).map_err(|_| ExtractError::Malformed)?;
+    let parsed = parse_unique_keys(text)?;
     collect_value(&parsed, out, depth.saturating_add(NESTED_JSON_COST))
 }
 
@@ -364,12 +486,12 @@ fn collect_value(value: &Value, out: &mut Vec<String>, depth: usize) -> Result<(
     Ok(())
 }
 
-/// 一段 JSON 文本解析之后的每一个键和字符串值（不含原文）。
+/// 一段 JSON 文本（工具调用的 `arguments`）解析之后的每一个键和字符串值（不含原文）。解析不了、有重复的键都是 `Malformed`。
 fn decoded_pieces(raw: &str) -> Result<Vec<String>, ExtractError> {
     if raw.trim().is_empty() {
         return Ok(Vec::new());
     }
-    let parsed: Value = serde_json::from_str(raw).map_err(|_| ExtractError::Malformed)?;
+    let parsed = parse_unique_keys(raw)?;
     let mut out = Vec::new();
     collect_value(&parsed, &mut out, NESTED_JSON_COST)?;
     Ok(out)
@@ -1451,6 +1573,90 @@ mod tests {
         // 没有参数、解析不了：没有补充
         assert_eq!(call_with("").decoded_supplement(), None);
         assert_eq!(call_with("{\\u0041").decoded_supplement(), None);
+    }
+
+    /// 重复键的工具参数：覆盖重复键的解析只看得到最后一个值，采用「先值」语义的工具消费者读到的是另一份参数。
+    /// （JSON 的 `\u006b` 转义在源码里写成 `\\u006b`：原始字符串里写单个反斜杠的 `\u` 会被工具链当成转义吃掉。）
+    const DUPLICATE_KEY_ARGUMENTS: &[&str] = &[
+        "{\"text\":\"\\u006bill yourself\",\"text\":\"ok\"}",
+        "{\"text\":\"ok\",\"text\":\"\\u006bill yourself\"}",
+        "{\"outer\":{\"text\":\"\\u006bill yourself\",\"text\":\"ok\"}}",
+        "[{\"text\":\"\\u006bill yourself\",\"text\":\"ok\"}]",
+        "{\"a\":1,\"b\":[{\"c\":2,\"c\":3}]}",
+        // 两个写法不同、解码之后相同的键也是重复
+        "{\"text\":1,\"\\u0074ext\":2}",
+        // 嵌套的 JSON 字符串里的重复键
+        "{\"payload\":\"{\\\"text\\\":\\\"\\\\u006bill yourself\\\",\\\"text\\\":\\\"ok\\\"}\"}",
+    ];
+
+    #[test]
+    fn duplicate_keys_in_tool_call_arguments_are_refused_in_the_history() {
+        // round2-r3 PARTIAL High#4：重复键一律拒绝（解析失败同等处理），检查和转发使用同一份参数
+        for arguments in DUPLICATE_KEY_ARGUMENTS {
+            let history = body(json!({"messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": null, "tool_calls": [
+                    {"id": "c", "type": "function", "function": {"name": "post", "arguments": arguments}}]}]}));
+            assert_eq!(
+                extract_input(&history, 1 << 20).unwrap_err(),
+                ExtractError::Malformed,
+                "{arguments}"
+            );
+        }
+        // 没有重复键的同样形状：照常
+        for ok in [
+            "{\"text\":\"\\u006bill yourself\",\"other\":\"ok\"}",
+            r#"{"a":{"b":1},"c":{"b":2}}"#,
+            r#"[{"k":1},{"k":2}]"#,
+            r#"{"payload":"{\"a\":1}","other":"{\"a\":2}"}"#,
+        ] {
+            let history = body(json!({"messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": null, "tool_calls": [
+                    {"id": "c", "type": "function", "function": {"name": "post", "arguments": ok}}]}]}));
+            assert!(extract_input(&history, 1 << 20).is_ok(), "{ok}");
+        }
+    }
+
+    #[test]
+    fn duplicate_keys_in_tool_call_arguments_are_refused_in_the_answer() {
+        for arguments in DUPLICATE_KEY_ARGUMENTS {
+            let upstream = completion(json!({"role": "assistant", "content": null, "tool_calls": [
+                {"id": "c", "type": "function", "function": {"name": "post", "arguments": arguments}}]}));
+            assert_eq!(
+                rebuild_response(&upstream, &ident("r"), 1 << 20).unwrap_err(),
+                ExtractError::Malformed,
+                "{arguments}"
+            );
+        }
+        // 没有重复键的同样形状：照常
+        let upstream = completion(json!({"role": "assistant", "content": null, "tool_calls": [
+            {"id": "c", "type": "function", "function": {
+                "name": "post", "arguments": r#"{"a":{"b":1},"c":{"b":2}}"#}}]}));
+        assert!(rebuild_response(&upstream, &ident("r"), 1 << 20).is_ok());
+    }
+
+    #[test]
+    fn json_looking_text_with_duplicate_keys_is_refused_wherever_the_service_decodes_it() {
+        // 看起来是 JSON 的字符串解码之后再取一遍：重复键会让解码视图丢掉被覆盖的那个值，同样拒绝
+        let history = body(json!({"messages": [
+            {"role": "user", "content": "{\"q\":\"\\u006bill yourself\",\"q\":\"ok\"}"}]}));
+        assert_eq!(
+            extract_input(&history, 1 << 20).unwrap_err(),
+            ExtractError::Malformed
+        );
+        let tool_result = body(json!({"messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "tool", "tool_call_id": "c", "content": r#"[{"a":1,"a":2}]"#}]}));
+        assert_eq!(
+            extract_input(&tool_result, 1 << 20).unwrap_err(),
+            ExtractError::Malformed
+        );
+        // 只是恰好以 `{` 开头的普通文本、没有重复键的 JSON：照旧
+        for ok in [r#"{not json, a: 1, a: 2}"#, r#"{"a":1,"b":2}"#, "[1, 2, 3]"] {
+            let request = body(json!({"messages": [{"role": "user", "content": ok}]}));
+            assert!(extract_input(&request, 1 << 20).is_ok(), "{ok}");
+        }
     }
 
     #[test]

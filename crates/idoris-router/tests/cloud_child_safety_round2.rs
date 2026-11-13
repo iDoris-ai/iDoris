@@ -6,7 +6,8 @@
 //! - **N1（round2-r2 与 round2-r3 同一问题）**：`rules_only_acknowledgement` 的到期日要在运行期间生效——进程不重启，时钟拨过
 //!   到期日（跨 UTC 日期、长期运行），儿童请求就在调用任何上游之前被拒绝；
 //! - **N2**：LLM 检查器看到的工具参数不能丢掉数字、布尔和 `null`；
-//! - **N3**：LLM 检查器的预留按最终要发出的全部调用算，不是按原始文本的字节估一次。
+//! - **N3**：LLM 检查器的预留按最终要发出的全部调用算，不是按原始文本的字节估一次；
+//! - **PARTIAL High④**：工具参数里的重复键一律拒绝（输入历史和上游回答）。
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 #[path = "support/child_safety.rs"]
@@ -18,7 +19,9 @@ mod harness;
 
 use std::sync::Arc;
 
-use child_safety::{Child, answer, benign_question, child_body, child_with, judge_allow};
+use child_safety::{
+    Child, answer, benign_question, child_body, child_rules_only, child_with, judge_allow,
+};
 use fake_upstream::{Behavior, FakeUpstream, usage};
 use harness::{
     Caller, DAY_MS, Endpoint, NOW_MS, Options, RecordingAdmission, VERIFIED_MS, build, post,
@@ -37,6 +40,22 @@ fn unavailable(reply: &harness::Reply, stage: &str, cause: &str) {
     assert_eq!(reply.json()["error"]["stage"], stage, "{}", reply.text());
     assert_eq!(reply.json()["error"]["cause"], cause, "{}", reply.text());
     assert_eq!(reply.header("x-idoris-reason"), Some("safety_unavailable"));
+}
+
+fn blocked(reply: &harness::Reply, error_type: &str, category: &str) {
+    assert_eq!(reply.status, 422, "{}", reply.text());
+    assert_eq!(
+        reply.json()["error"]["type"],
+        error_type,
+        "{}",
+        reply.text()
+    );
+    assert_eq!(
+        reply.json()["error"]["category"],
+        category,
+        "{}",
+        reply.text()
+    );
 }
 
 /// 只用规则检查器、带显式确认的 `safety:` 段。
@@ -283,4 +302,58 @@ async fn every_judge_call_is_covered_by_the_reservation_made_before_the_first_is
         output_calls.len(),
         needed.micros()
     );
+}
+
+// ---------------------------------------------------------------------------
+// PARTIAL High④：重复的键
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn duplicate_keys_in_tool_arguments_are_refused_in_the_history_and_in_the_answer() {
+    // 形状是 `{"text":"（用转义写成的 kill yourself）","text":"ok"}`：覆盖重复键的解析只看得到 `ok`，采用首值语义的
+    // 工具消费者读到的是禁止内容。检查和转发必须是同一份参数：重复键一律拒绝。
+    // （JSON 里用 `\u` 加四位十六进制数写成的字符，在源码里要写成两个反斜杠：原始字符串里写单个反斜杠的 `\u` 会被工具链当成转义吃掉。）
+    let duplicate_arguments = [
+        "{\"text\":\"\\u006bill yourself\",\"text\":\"ok\"}",
+        "{\"outer\":{\"text\":\"\\u006bill yourself\",\"text\":\"ok\"}}",
+        "[{\"text\":\"\\u006bill yourself\",\"text\":\"ok\"}]",
+        // 嵌套的 JSON 字符串里的重复键
+        "{\"payload\":\"{\\\"text\\\":\\\"\\\\u006bill yourself\\\",\\\"text\\\":\\\"ok\\\"}\"}",
+    ];
+    let (h, main) = child_rules_only(vec![answer("never")]).await;
+    let user = json!({"role": "user", "content": "2 บวก 2 ได้เท่าไร"});
+    for arguments in duplicate_arguments {
+        let reply = post(
+            &h.app,
+            &json!({"model": "idoris/agent", "messages": [user.clone(),
+                {"role": "assistant", "content": null, "tool_calls": [
+                    {"id": "c1", "type": "function", "function": {"name": "post", "arguments": arguments}}]}]}),
+        )
+        .await;
+        unavailable(&reply, "input", "malformed");
+    }
+    assert_eq!(main.connection_count(), 0, "the history never left");
+    // 没有重复键的同样的参数：照常（转义解码之后是自伤内容，被规则拒绝，不是 malformed）
+    let reply = post(
+        &h.app,
+        &json!({"model": "idoris/agent", "messages": [user,
+            {"role": "assistant", "content": null, "tool_calls": [
+                {"id": "c1", "type": "function", "function": {
+                    "name": "post", "arguments": "{\"text\":\"\\u006bill yourself\"}"}}]}]}),
+    )
+    .await;
+    blocked(&reply, "safety_input_blocked", "self_harm");
+
+    // 上游回答里的工具参数：回答不发给客户端
+    for arguments in duplicate_arguments {
+        let (h, main) = child_rules_only(vec![tool_call_answer("post", arguments)]).await;
+        let reply = post(&h.app, &child_body(&benign_question())).await;
+        unavailable(&reply, "output", "malformed");
+        assert_eq!(main.request_count(), 1);
+        assert!(
+            reply.json().get("choices").is_none(),
+            "nothing of the answer was delivered: {}",
+            reply.text()
+        );
+    }
 }
