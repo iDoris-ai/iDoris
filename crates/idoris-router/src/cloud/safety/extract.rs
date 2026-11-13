@@ -1535,6 +1535,31 @@ mod tests {
         }
     }
 
+    #[test]
+    fn the_checked_history_keeps_every_scalar_of_the_tool_call_arguments() {
+        // round2-r3 N2 的输入侧：历史消息里的工具调用参数，检查文本里先是**完整的原文**（数字、布尔、null 都在），
+        // 再是解码之后的键和字符串值；不能只剩解码列表
+        let history = body(json!({"messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": null, "tool_calls": [
+                {"id": "c", "type": "function", "function": {"name": "f",
+                    "arguments": r#"{"answer":31415926,"ok":true,"gone":null}"#}}]}]}));
+        let input = extract_input(&history, 1 << 20).unwrap();
+        let assistant = input
+            .segments
+            .iter()
+            .find(|segment| segment.origin == Origin::Assistant)
+            .unwrap()
+            .text
+            .expose();
+        for scalar in ["31415926", "true", "null"] {
+            assert!(
+                assistant.contains(scalar),
+                "{scalar} is missing: {assistant}"
+            );
+        }
+    }
+
     fn call_with(arguments: &str) -> ToolCallText {
         ToolCallText {
             name: Sensitive::new("f"),
