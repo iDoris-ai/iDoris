@@ -31,6 +31,15 @@ fn exec(conn: &Connection, sql: &str) {
         .unwrap_or_else(|e| panic!("{sql}: {e}"));
 }
 
+/// `(allocation_id, ceiling_micros)` 的列表。
+fn allocation_amounts(conn: &Connection, sql: &str) -> Vec<(String, i64)> {
+    let mut stmt = conn.prepare(sql).unwrap();
+    stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+}
+
 fn table_exists(conn: &Connection, name: &str) -> bool {
     conn.query_row(
         "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
@@ -147,6 +156,107 @@ fn an_old_database_keeps_its_latest_enabled_credit_lines_as_allocations_and_lose
             .unwrap()
     };
     assert_eq!(applied, [1, 2]);
+}
+
+/// PR #600 第二轮评审 Medium：迁移固定生成 `cl-v<旧版本号>`，旧库里如果恰好已经有一笔叫这个名字的合法额度
+/// （控制面的调用方可以随意取名），INSERT 撞上 `allocation already exists`，整个迁移失败，账户库打不开。
+/// 现在 id 在迁移语句里分配并验证唯一：被占用就往后试 `-1`、`-2`……，旧版本号永远带在开头；已有的额度一行不动。
+#[test]
+fn credit_lines_whose_generated_ids_are_already_taken_still_migrate_under_the_next_free_id() {
+    let mut conn = database_at_ledger_version_1();
+    legacy_tree(&conn);
+    // 已有的额度恰好占了 `cl-v1`、`cl-v1-1`（预付）和 `cl-v3`（别人的授信）
+    exec(
+        &conn,
+        "INSERT INTO allocations
+            (allocation_id, parent_id, child_id, ceiling_unit, ceiling_micros, purpose,
+             valid_from_ms, valid_until_ms, transferable, idempotency_key, created_at_ms) VALUES
+            ('cl-v1',   'teacher', 'kid',  'THB', 5, 'prepaid',     0, 100, 0, NULL, 0),
+            ('cl-v1-1', 'teacher', 'emp3', 'THB', 6, 'prepaid',     0, 100, 0, NULL, 0),
+            ('cl-v3',   'teacher', 'kid',  'THB', 7, 'credit_line', 0, 100, 0, NULL, 0)",
+    );
+    // 旧表：emp 的版本 1、emp2 的版本 2、emp3 的版本 3，都是各自最新一条、启用
+    exec(
+        &conn,
+        "INSERT INTO ledger_credit_lines (account_id, guarantor_id, enabled, limit_micros, valid_until_ms, set_at_ms) VALUES
+            ('emp', 'teacher', 1, 100, NULL, 10),
+            ('emp2', 'teacher', 1, 50, 9000, 20),
+            ('emp3', 'teacher', 1, 70, NULL, 30)",
+    );
+    let before = allocation_amounts(
+        &conn,
+        "SELECT allocation_id, ceiling_micros FROM allocations ORDER BY allocation_id",
+    );
+
+    run_migrations(&mut conn).unwrap();
+
+    // 每条旧授信都迁了，id 是第一个没被占用的 `cl-v<版本>[-<序号>]`
+    let migrated: Vec<(String, String, i64, i64, i64)> = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT allocation_id, child_id, ceiling_micros, valid_from_ms, valid_until_ms
+                   FROM allocations
+                  WHERE purpose = 'credit_line' AND allocation_id NOT IN ('cl-v3')
+                  ORDER BY child_id",
+            )
+            .unwrap();
+        stmt.query_map([], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
+        })
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+    };
+    assert_eq!(
+        migrated,
+        [
+            (
+                "cl-v1-2".to_string(),
+                "emp".to_string(),
+                100,
+                10,
+                super::limits::OPEN_ENDED_UNTIL_MS
+            ),
+            ("cl-v2".to_string(), "emp2".to_string(), 50, 20, 9000),
+            (
+                "cl-v3-1".to_string(),
+                "emp3".to_string(),
+                70,
+                30,
+                super::limits::OPEN_ENDED_UNTIL_MS
+            ),
+        ]
+    );
+    // 已有的额度一行没动
+    let after_old = allocation_amounts(
+        &conn,
+        "SELECT allocation_id, ceiling_micros FROM allocations
+          WHERE allocation_id IN ('cl-v1', 'cl-v1-1', 'cl-v3') ORDER BY allocation_id",
+    );
+    assert_eq!(after_old, before);
+    assert!(!table_exists(&conn, "ledger_credit_lines"));
+    // 版本记上了，再跑一次什么都不变
+    let applied: Vec<i64> = {
+        let mut stmt = conn
+            .prepare("SELECT version FROM ledger_schema_migrations ORDER BY version")
+            .unwrap();
+        stmt.query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    };
+    assert_eq!(applied, [1, 2]);
+    run_migrations(&mut conn).unwrap();
+    let count: i64 = conn
+        .query_row("SELECT count(*) FROM allocations", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(count, 6);
 }
 
 #[test]

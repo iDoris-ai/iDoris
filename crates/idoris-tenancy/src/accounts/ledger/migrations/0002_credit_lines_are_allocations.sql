@@ -21,22 +21,47 @@
 -- # 对存量数据的影响
 --
 -- 这个功能尚未上线，没有存量生产数据。开发 / 预发库里如果有旧数据：
---   * `ledger_credit_lines` 里每个账户**最新一条**、启用的授信迁成一笔 credit_line 额度（id `cl-v<旧版本号>`，窗口 =
+--   * `ledger_credit_lines` 里每个账户**最新一条**、启用的授信迁成一笔 credit_line 额度（窗口 =
 --     [设置时间, 旧的到期时间)；没有到期时间的用公元 10000 年——额度必须有到期时间，没有「永不过期」）。其余版本
 --     （被替换的、关掉的）本来就不生效，不迁；已经过期的额度迁过去也读不到（窗口检查），无害。迁完旧表删除，不再有第二份记录。
 --   * 经控制面发出、还没有承诺行的免费额度补登承诺行（池 = 成员账户祖先里最近的补贴池；找不到池的额度没有可记的池，跳过）。
 --     补登只记账，不重新检查上限：旧数据里就算已经超发，之后的新发放会因为剩余是 0 被拒绝（偏保守）。
+--
+-- # 迁出来的授信额度的 id（PR #600 第二轮评审 Medium）
+--
+-- 额度 id 在 `allocations` 里是全局唯一的，而控制面的调用方可以随意取名。旧版本固定生成 `cl-v<旧版本号>`：旧库里如果恰好
+-- 已经有一笔叫 `cl-v1` 的合法额度，这一条 INSERT 就撞上「allocation already exists」，整个迁移失败，账户库打不开，
+-- 依赖它的启动全部失败。现在 id 在**同一条语句里**分配并验证唯一：先试 `cl-v<旧版本号>`，已经被占用就依次试
+-- `cl-v<旧版本号>-1`、`-2`……直到找到一个库里还没有的（递归 CTE 一步步往后试，只有「库里已经有」才继续往后走）。
+-- 旧版本号永远带在 id 的开头，所以 id 本身就是「旧版本 → 新额度」的对应，不需要另存一张映射表；不同旧版本的 id
+-- 不会互相撞（`cl-v<版本>` 之后只可能跟 `-<序号>`，版本号不含 `-`），所以只需要对照库里已有的 id。
+-- 每条要迁的授信恰好选中一个 id，INSERT 要么全部写入要么整个失败，不会悄悄漏掉哪一条。
 
+WITH RECURSIVE
+legacy (version, guarantor_id, account_id, unit, limit_micros, valid_from_ms, valid_until_ms) AS (
+    SELECT l.version, l.guarantor_id, l.account_id, a.unit, l.limit_micros, l.set_at_ms,
+           COALESCE(l.valid_until_ms, 253402300800000)
+      FROM ledger_credit_lines l
+      JOIN accounts a ON a.account_id = l.account_id
+     WHERE l.enabled = 1
+       AND l.version = (SELECT MAX(version) FROM ledger_credit_lines WHERE account_id = l.account_id)
+       AND COALESCE(l.valid_until_ms, 253402300800000) > l.set_at_ms
+),
+candidate (version, n, id) AS (
+    SELECT version, 0, 'cl-v' || version FROM legacy
+    UNION ALL
+    SELECT c.version, c.n + 1, 'cl-v' || c.version || '-' || (c.n + 1)
+      FROM candidate c
+     WHERE EXISTS (SELECT 1 FROM allocations WHERE allocation_id = c.id)
+)
 INSERT INTO allocations
     (allocation_id, parent_id, child_id, ceiling_unit, ceiling_micros, purpose,
      valid_from_ms, valid_until_ms, transferable, idempotency_key, created_at_ms)
-SELECT 'cl-v' || l.version, l.guarantor_id, l.account_id, a.unit, l.limit_micros, 'credit_line',
-       l.set_at_ms, COALESCE(l.valid_until_ms, 253402300800000), 0, NULL, l.set_at_ms
-  FROM ledger_credit_lines l
-  JOIN accounts a ON a.account_id = l.account_id
- WHERE l.enabled = 1
-   AND l.version = (SELECT MAX(version) FROM ledger_credit_lines WHERE account_id = l.account_id)
-   AND COALESCE(l.valid_until_ms, 253402300800000) > l.set_at_ms;
+SELECT c.id, g.guarantor_id, g.account_id, g.unit, g.limit_micros, 'credit_line',
+       g.valid_from_ms, g.valid_until_ms, 0, NULL, g.valid_from_ms
+  FROM legacy g
+  JOIN candidate c ON c.version = g.version
+ WHERE NOT EXISTS (SELECT 1 FROM allocations WHERE allocation_id = c.id);
 
 DROP TABLE ledger_credit_lines;
 
