@@ -9,7 +9,7 @@
 //! |---|---|
 //! | [`wire`] | 请求体构造（**白名单**转发客户端字段，`tools` / `tool_choice` / 结构化输出透传，`max_tokens` 与 `model` 强制覆盖，流式固定 `stream_options.include_usage`）与非流式响应解析 |
 //! | [`sse`] | 增量 SSE 解析（按事件，限长，文件结束时没完成的事件不算数） |
-//! | [`chunk`] | 流里一个事件的含义：`[DONE]`、注释、带 `id` / `usage` / `error` 的 JSON chunk |
+//! | [`chunk`] | 流里一个事件的含义：`[DONE]`、注释、带 `id` / `usage` / `error` 的 JSON chunk，以及 `choices` 的形状（是不是合法的 completion chunk）、`finish_reason`、`delta` 里有没有新的生成内容 |
 //! | [`usage`] | 上游声称的 usage 的判定：结构不对、前后矛盾的一律「无效」，由调用方按「usage 未知」处理 |
 //! | [`client`] | HTTP 传输：`prepare`（没有字节离开本机）/ `send`（字节可能已经出去）两步；超时、大小上限、不跟随重定向、密钥不外泄 |
 //! | [`failure`] | 失败的稳定代码 |
