@@ -389,31 +389,53 @@ impl DeviceStore {
 #[cfg(unix)]
 const MAX_CREDENTIAL_FILE_BYTES: u64 = 16 * 1024;
 
-/// 读一个只有属主能读写的普通文件（`Ok(None)` = 不存在）。检查和读取落在**同一个 inode** 上：
-/// 先 `lstat`（不跟随符号链接：必须是普通文件、没有 group / other 位），再打开，再 `fstat` 已打开的文件，
-/// 要求设备号和 inode 号与 `lstat` 看到的一致——检查完、读取前文件被换成符号链接或别的文件，会被发现，不会被读出来。
+/// 读一个只有属主能读写的普通文件（`Ok(None)` = 不存在）。
+///
+/// **先打开，再用描述符验证**——检查和读取落在同一个已打开的文件上，中间没有「检查完、打开前被换掉」的窗口：
+///
+/// - `O_NOFOLLOW`：最后一级是符号链接就直接打开失败，不跟随；
+/// - `O_NONBLOCK`：打开 FIFO 不会阻塞在「没有写端」的 `open` 上。以前先 `lstat` 检查、再阻塞地 `open`：检查之后目录项被换成
+///   FIFO，`open` 永远不返回，`fstat` 也没机会做，读取线程被无限挂住（凭证加载发生在并发槽位之前，不受云请求总超时限制）——
+///   审查 r4 Medium#6。对普通文件没有影响；
+/// - 打开之后 `fstat` 描述符（[`check_opened_credential_file`]）：必须是普通文件、没有 group / other 位。
+///
+/// 审查还建议验证属主和目录的安全性。验证属主要取得进程的有效 uid：工作区 `forbid(unsafe_code)`，而 `nix` 没有开
+/// `user` feature（`Uid` 在那里面），改依赖的声明不在这次修复的范围内，所以没做，留给 owner 决定（见交付说明）。
 #[cfg(unix)]
 fn read_private_regular_file(path: &Path) -> Result<Option<String>, CredentialError> {
-    use std::io::Read;
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    read_private_regular_file_with(path, &mut || {})
+}
 
-    let before = match std::fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
+/// [`read_private_regular_file`]；`before_open` 在打开之前被调用（测试用它模拟另一个进程在最坏的时刻换掉目录项）。
+#[cfg(unix)]
+fn read_private_regular_file_with(
+    path: &Path,
+    before_open: &mut dyn FnMut(),
+) -> Result<Option<String>, CredentialError> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    before_open();
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
+        .open(path)
+    {
+        Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        // 最后一级是符号链接：带 O_NOFOLLOW 的 open 以 ELOOP 失败（个别 BSD 是 EMLINK）。符号链接一概不用
+        Err(error)
+            if matches!(
+                error.raw_os_error(),
+                Some(code) if code == nix::libc::ELOOP || code == nix::libc::EMLINK
+            ) =>
+        {
+            return Err(CredentialError::InsecureFile);
+        }
         Err(_) => return Err(CredentialError::Unreadable),
     };
-    if !before.file_type().is_file() || before.permissions().mode() & 0o077 != 0 {
-        return Err(CredentialError::InsecureFile);
-    }
-    let file = std::fs::File::open(path).map_err(|_| CredentialError::Unreadable)?;
-    let after = file.metadata().map_err(|_| CredentialError::Unreadable)?;
-    if !after.file_type().is_file()
-        || after.dev() != before.dev()
-        || after.ino() != before.ino()
-        || after.permissions().mode() & 0o077 != 0
-    {
-        return Err(CredentialError::InsecureFile);
-    }
+    let metadata = file.metadata().map_err(|_| CredentialError::Unreadable)?;
+    check_opened_credential_file(&metadata)?;
     let mut text = String::new();
     file.take(MAX_CREDENTIAL_FILE_BYTES + 1)
         .read_to_string(&mut text)
@@ -422,6 +444,16 @@ fn read_private_regular_file(path: &Path) -> Result<Option<String>, CredentialEr
         return Err(CredentialError::Malformed);
     }
     Ok(Some(text))
+}
+
+/// 用**已打开文件的描述符**的元数据验证它：普通文件、没有 group / other 位。
+#[cfg(unix)]
+fn check_opened_credential_file(metadata: &std::fs::Metadata) -> Result<(), CredentialError> {
+    use std::os::unix::fs::PermissionsExt;
+    if !metadata.file_type().is_file() || metadata.permissions().mode() & 0o077 != 0 {
+        return Err(CredentialError::InsecureFile);
+    }
+    Ok(())
 }
 
 /// 新建（`O_EXCL`）一个只有属主能读写的文件。
@@ -923,6 +955,121 @@ mod tests {
         let json = serde_json::to_string(&summary).unwrap();
         assert!(!json.contains("idk_") && !json.contains("secret"));
         assert!(!json.contains("0123456789abcdef0123456789abcdef"));
+    }
+
+    /// 在另一个线程里跑 `f`，5 秒没返回就判失败。回归（去掉 `O_NONBLOCK`）时 `open` 会永远卡在没有写端的 FIFO 上，
+    /// 不能让它把整个测试进程挂住：先给 FIFO 一个写端放开卡住的线程，再报告失败。
+    #[cfg(unix)]
+    fn finishes_within_5s<T: Send + 'static>(
+        what: &str,
+        fifo: &Path,
+        f: impl FnOnce() -> T + Send + 'static,
+    ) -> T {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(f());
+        });
+        match receiver.recv_timeout(std::time::Duration::from_secs(5)) {
+            Ok(value) => value,
+            Err(_) => {
+                let _writer = std::fs::OpenOptions::new().write(true).open(fifo);
+                panic!("{what} hung on a FIFO");
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn make_fifo(path: &Path) {
+        let made = std::process::Command::new("mkfifo")
+            .arg(path)
+            .status()
+            .unwrap();
+        assert!(made.success(), "mkfifo failed");
+    }
+
+    /// 审查 r4 Medium#6：以前先 `lstat` 检查、再 `File::open`。检查之后、打开之前，目录项被另一个进程换成一个没有写端的 FIFO，
+    /// 阻塞的 `open` 永远不返回，后面的 `fstat` 也没机会做（读取线程被无限挂住；凭证加载发生在并发槽位之前，也不受云请求总超时限制）。
+    /// 现在用 `O_NONBLOCK` 打开（FIFO 的 open 立刻返回），再用描述符验证它是不是普通文件。
+    #[cfg(unix)]
+    #[test]
+    fn a_path_swapped_for_a_fifo_right_before_the_open_is_refused_and_never_hangs_the_reader() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("node.key");
+        std::fs::write(&path, secret('a')).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let reader_path = path.clone();
+        let result =
+            finishes_within_5s("reading the credential after the swap", &path, move || {
+                let swap_path = reader_path.clone();
+                read_private_regular_file_with(&reader_path, &mut || {
+                    // 另一个进程在这个窗口里把文件换成 FIFO（没有任何写端）
+                    std::fs::remove_file(&swap_path).unwrap();
+                    make_fifo(&swap_path);
+                })
+            });
+        assert_eq!(result.unwrap_err(), CredentialError::InsecureFile);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_path_swapped_for_a_symlink_right_before_the_open_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("node.key");
+        let elsewhere = dir.path().join("elsewhere.key");
+        for file in [&path, &elsewhere] {
+            std::fs::write(file, secret('a')).unwrap();
+            std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let result = read_private_regular_file_with(&path, &mut || {
+            std::fs::remove_file(&path).unwrap();
+            std::os::unix::fs::symlink(&elsewhere, &path).unwrap();
+        });
+        assert_eq!(result.unwrap_err(), CredentialError::InsecureFile);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_or_a_directory_at_the_path_is_refused_at_once_and_a_symlinked_parent_directory_is_fine()
+     {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        // 一直就是 FIFO（没有写端）：`O_NONBLOCK` 的 open 立刻返回，`fstat` 说它不是普通文件
+        let fifo = dir.path().join("fifo.key");
+        make_fifo(&fifo);
+        let loader = NodeFileProvider::new(&fifo, None);
+        let error = finishes_within_5s("loading a FIFO", &fifo, move || loader.load().unwrap_err());
+        assert_eq!(error, CredentialError::InsecureFile);
+        // 目录
+        assert_eq!(
+            NodeFileProvider::new(dir.path(), None).load().unwrap_err(),
+            CredentialError::InsecureFile
+        );
+        // `O_NOFOLLOW` 只管最后一级：路径中间有符号链接（比如 macOS 的 /var -> /private/var）照常能读
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let file = real.join("node.key");
+        std::fs::write(&file, secret('c')).unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let linked_dir = dir.path().join("linked");
+        std::os::unix::fs::symlink(&real, &linked_dir).unwrap();
+        assert_eq!(
+            NodeFileProvider::new(linked_dir.join("node.key"), None)
+                .load()
+                .unwrap()
+                .secret
+                .expose_secret(),
+            secret('c')
+        );
+        // 检查本身：描述符的元数据是普通文件且没有 group / other 位才放行
+        let metadata = std::fs::metadata(&file).unwrap();
+        assert!(check_opened_credential_file(&metadata).is_ok());
+        assert_eq!(
+            check_opened_credential_file(&std::fs::metadata(dir.path()).unwrap()).unwrap_err(),
+            CredentialError::InsecureFile
+        );
     }
 
     #[cfg(unix)]
