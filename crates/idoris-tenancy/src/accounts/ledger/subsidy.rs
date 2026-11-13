@@ -33,7 +33,7 @@ use idoris_compute_contracts::account::{
     AccountKind, AccountStatus, Allocation, subsidy_idempotency_key,
 };
 use idoris_compute_contracts::grant::{Grant, Purpose};
-use idoris_compute_contracts::ids::{AllocationId, TimestampMs};
+use idoris_compute_contracts::ids::{AllocationId, BillingMonth, PrincipalId, TimestampMs};
 use idoris_compute_contracts::money::Money;
 use rusqlite::{Connection, OptionalExtension, params};
 
@@ -199,21 +199,7 @@ pub(super) fn issue_free_tier_in(
 
     // 5. 补贴池该账期的总上限：发出去的免费额度之和不能超过它
     let period = input.month.to_string();
-    let cap = pool_cap_micros(conn, pool.id.as_str(), &period)?;
-    let granted: i64 = conn.query_row(
-        "SELECT COALESCE(SUM(amount_micros), 0) FROM ledger_subsidy_grants WHERE pool_id = ?1 AND period = ?2",
-        params![pool.id.as_str(), period],
-        |row| row.get(0),
-    )?;
-    let remaining = sub(cap, granted)?;
-    if input.amount.micros > remaining {
-        return Err(LedgerError::PoolCapExceeded {
-            pool: pool.id.clone(),
-            period: input.month,
-            requested: input.amount.micros,
-            remaining: remaining.max(0),
-        });
-    }
+    check_pool_cap(conn, pool, input.month, input.amount.micros)?;
 
     // 6. 写额度行和池的承诺行（同一个事务）
     let allocation = Allocation {
@@ -246,24 +232,137 @@ pub(super) fn issue_free_tier_in(
             now_ms,
         ],
     )?;
+    insert_grant(
+        conn,
+        &GrantRow {
+            key: key.as_str(),
+            pool: pool.id.as_str(),
+            principal: input.principal.as_str(),
+            member: member.id.as_str(),
+            period: &period,
+            unit: &input.amount.unit.to_string(),
+            amount_micros: input.amount.micros,
+            allocation: allocation.id.as_str(),
+            now_ms,
+        },
+    )?;
+    Ok(FreeTierOutcome::Granted(allocation))
+}
+
+/// 补贴池某个账期的承诺检查：已经发出去的免费额度之和（`ledger_subsidy_grants`）加上这一笔不能超过总上限
+/// （没设置上限的账期是 0，失败即关闭）。存储层的 `issue_free_tier` 和 S2 控制面发放走的是同一个函数。
+fn check_pool_cap(
+    conn: &Connection,
+    pool: &idoris_compute_contracts::account::Account,
+    month: BillingMonth,
+    amount_micros: i64,
+) -> Result<(), LedgerError> {
+    let period = month.to_string();
+    let cap = pool_cap_micros(conn, pool.id.as_str(), &period)?;
+    let granted: i64 = conn.query_row(
+        "SELECT COALESCE(SUM(amount_micros), 0) FROM ledger_subsidy_grants WHERE pool_id = ?1 AND period = ?2",
+        params![pool.id.as_str(), period],
+        |row| row.get(0),
+    )?;
+    let remaining = sub(cap, granted)?;
+    if amount_micros > remaining {
+        return Err(LedgerError::PoolCapExceeded {
+            pool: pool.id.clone(),
+            period: month,
+            requested: amount_micros,
+            remaining: remaining.max(0),
+        });
+    }
+    Ok(())
+}
+
+/// 一行补贴池承诺。
+struct GrantRow<'a> {
+    key: &'a str,
+    pool: &'a str,
+    principal: &'a str,
+    member: &'a str,
+    period: &'a str,
+    unit: &'a str,
+    amount_micros: i64,
+    allocation: &'a str,
+    now_ms: i64,
+}
+
+fn insert_grant(conn: &Connection, row: &GrantRow<'_>) -> Result<(), LedgerError> {
     conn.execute(
         "INSERT INTO ledger_subsidy_grants
             (idempotency_key, pool_id, principal_id, member_account, period, unit, amount_micros,
              allocation_id, granted_at_ms)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         params![
-            key.as_str(),
-            pool.id.as_str(),
-            input.principal.as_str(),
-            member.id.as_str(),
-            period,
-            input.amount.unit.to_string(),
-            input.amount.micros,
-            allocation.id.as_str(),
-            now_ms,
+            row.key,
+            row.pool,
+            row.principal,
+            row.member,
+            row.period,
+            row.unit,
+            row.amount_micros,
+            row.allocation,
+            row.now_ms,
         ],
     )?;
-    Ok(FreeTierOutcome::Granted(allocation))
+    Ok(())
+}
+
+/// 免费额度在账本时区里这个账期的窗口 `[start_ms, end_ms)`。
+pub(super) fn free_tier_window_in(
+    conn: &Connection,
+    month: BillingMonth,
+) -> Result<(i64, i64), LedgerError> {
+    let config = load_config(conn)?;
+    period_bounds(month, &config.billing_timezone)
+}
+
+/// S2 控制面发放免费额度时调用（在控制面自己的事务里，额度行已经由 `create_allocation_in` 写好或幂等重放）：
+/// 登记补贴池的承诺。已经登记过的什么都不写；没登记过的先检查池该账期的总上限，再登记。
+///
+/// 控制面不能绕开池的上限（PR #600 评审 #7）：额度行和承诺行在同一个事务里，超出上限返回
+/// [`LedgerError::PoolCapExceeded`]，控制面的保存点回滚，额度行随之撤掉，库里没有半笔发放。
+pub(super) fn commit_free_tier_in(
+    conn: &Connection,
+    allocation: &Allocation,
+    principal: &PrincipalId,
+    month: BillingMonth,
+    now: TimestampMs,
+) -> Result<(), LedgerError> {
+    let key = allocation.idempotency_key.as_ref().ok_or_else(|| {
+        LedgerError::Invalid("a free-tier allocation needs its idempotency key".into())
+    })?;
+    let registered: bool = conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM ledger_subsidy_grants WHERE idempotency_key = ?1)",
+        [key.as_str()],
+        |row| row.get(0),
+    )?;
+    if registered {
+        return Ok(());
+    }
+    let chain = load_ancestors(conn, &allocation.child)?;
+    let pool = chain
+        .iter()
+        .find(|account| account.kind == AccountKind::SubsidyPool)
+        .ok_or_else(|| LedgerError::NoSubsidyPool(allocation.child.clone()))?;
+    let amount = allocation.ceiling.amount();
+    check_pool_cap(conn, pool, month, amount.micros)?;
+    insert_grant(
+        conn,
+        &GrantRow {
+            key: key.as_str(),
+            pool: pool.id.as_str(),
+            principal: principal.as_str(),
+            member: allocation.child.as_str(),
+            period: &month.to_string(),
+            unit: &amount.unit.to_string(),
+            amount_micros: amount.micros,
+            allocation: allocation.id.as_str(),
+            now_ms: now.millis(),
+        },
+    )
 }
 
 /// 补贴池某个账期已经发出去多少免费额度、总上限多少、花了多少（报表用：免费档每月花了多少一眼可见）。

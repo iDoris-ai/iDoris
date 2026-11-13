@@ -6,7 +6,7 @@
 //! |---|---|
 //! | `balance`（自有资金） | 有充值分录才有：`Σ funds − Σ (held + spent)`（所有时间）。没有充值过 = `None` |
 //! | `ceiling_remaining`（授权额度剩余） | 流入这个账户的、此刻有效的**花费类**额度（免费额度、预付、组织配额，不含授信）之和，减去这些额度**窗口内**（从最早的有效起点算起）的 `Σ (held + spent)`。曾经有过额度、现在一个都不生效（比如上个月的免费额度过期了）= `Some(0)`，**不是** `None` |
-//! | `credit_limit` | 最新一条授信设置（`enabled` 且没过期）的额度，否则 0 |
+//! | `credit_limit` | 此刻有效的**授信额度**（`allocations` 里 purpose = `credit_line`、窗口内、没被撤销的）之和，没有 = 0 |
 //! | `rate_windows` | 配了分钟 / 小时上限才有：`Σ (held + spent)` 里 `window_at` 落在最近 60 秒 / 3600 秒（滑动窗口，不是日历桶：任意一个窗口长度的区间里都不会超过上限）的部分 |
 //! | `in_flight` | 配了在途上限才有：当前在途 = `Σ held`；过期的预留已经有 `expire` 分录冲掉 |
 //! | `subsidy_pool_remaining` | 只有补贴池账户：当前账期的总上限（`ledger_pool_caps` 最新一条，没有 = 0）减去该账期池账户上的 `Σ (held + spent)` |
@@ -128,24 +128,26 @@ fn entry_sums(
     )?)
 }
 
-/// 账户此刻有效的授信额度（没有 / 关闭 / 过期 = 0）。
+/// 账户此刻有效的授信额度（没有 / 关闭 / 过期 / 还没生效 = 0）。
+///
+/// **授信的权威数据源是 `allocations`**（purpose = `credit_line`）：窗口内（`valid_from <= now < valid_until`）、
+/// 没有被 S2 撤销的授信额度按子账户求和。S2 控制面开通 / 撤销授信、存储层的 `set_credit_line` / `disable_credit_line`
+/// 写的都是这份记录，所以开通、有效期、撤销、准入读取始终一致（PR #600 评审 #6）。担保人就是额度的授权方（父账户）。
 pub(super) fn credit_limit_micros(
     conn: &Connection,
     account: &str,
     now_ms: i64,
 ) -> Result<i64, LedgerError> {
-    let latest: Option<(i64, i64, Option<i64>)> = conn
-        .query_row(
-            "SELECT enabled, limit_micros, valid_until_ms FROM ledger_credit_lines
-              WHERE account_id = ?1 ORDER BY version DESC LIMIT 1",
-            [account],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )
-        .optional()?;
-    Ok(match latest {
-        Some((1, limit, valid_until)) if valid_until.is_none_or(|until| now_ms < until) => limit,
-        _ => 0,
-    })
+    let not_revoked = not_revoked_clause(conn)?;
+    Ok(conn.query_row(
+        &format!(
+            "SELECT COALESCE(SUM(ceiling_micros), 0) FROM allocations
+              WHERE child_id = ?1 AND purpose = 'credit_line'
+                AND valid_from_ms <= ?2 AND ?2 < valid_until_ms{not_revoked}"
+        ),
+        rusqlite::params![account, now_ms],
+        |row| row.get(0),
+    )?)
 }
 
 /// 一个账户此刻生效的限额（微单位；`None` = 不设限）。

@@ -37,19 +37,19 @@
 //!
 //! | 路由 | 操作 | 授权（`ControlOp` × 目标账户） |
 //! |---|---|---|
-//! | `/principals` | 登记主体 | `create_principal` × `org` |
-//! | `/principals/{id}/revoke` | 撤销主体（同意撤回） | `revoke_principal` × 它每个成员关系的账户（或登记它的组织） |
+//! | `/principals` | 登记主体（已经被别的组织登记过的 id 是固定的 409 `already_exists`，不带主体和状态） | `create_principal` × `org` |
+//! | `/principals/{id}/revoke` | 撤销主体（同意撤回） | `revoke_principal` × **登记它的组织**和它每个成员关系的账户 |
 //! | `/accounts` | 建付款账户（子账户） | `create_account` × 父账户 |
 //! | `/accounts/{id}/status` | 冻结 / 解冻 / 关闭 | `set_account_status` × 账户自己 |
-//! | `/memberships` | 建成员关系 | `manage_membership` × 付款账户（管理员关系用组织） |
+//! | `/memberships` | 建成员关系（关联别的组织登记的主体还要对登记组织有 `revoke_principal` 权限） | `manage_membership` × 付款账户（管理员关系用组织） |
 //! | `/memberships/{id}/revoke` | 撤销成员关系 | 同上 |
 //! | `/credentials` | 签发凭证（响应里有一次性明文密钥） | `issue_credential` × 绑定账户，另加「新权限 ⊆ 授权者权限」 |
 //! | `/credentials/{id}/status` | 冻结 / 解冻 / 撤销凭证 | `freeze_credential` / `revoke_credential` × 凭证的绑定账户 |
-//! | `/allocations` | 发额度（含按 `(成员, 月份)` 幂等的免费额度、授信） | `grant_allocation` × **授权方（父）账户**，金额 ≤ 单笔上限 |
+//! | `/allocations` | 发额度（含按 `(成员, 月份)` 幂等的免费额度——窗口必须恰好是这个月、受补贴池该账期总上限约束；授信——`purpose = credit_line`，准入读的就是这笔额度） | `grant_allocation` × **授权方（父）账户**，金额 ≤ 单笔上限 |
 //! | `/allocations/{id}/revoke` | 撤销额度（关授信） | 同上（撤销资格 = 发这笔额度的资格） |
 //! | `/pairing/codes` | 创建配对码（响应里有一次性明文码） | `issue_credential` × 成员关系的付款账户 |
 //! | `/pairing/codes/{id}/revoke` | 撤销还没兑换的码 | 同上 |
-//! | `/pairing/redeem` | 兑换配对码（**不带凭证，码本身是凭据**） | 无；码有效、未过期、签发者仍有资格 |
+//! | `/pairing/redeem` | 兑换配对码（**不带凭证，码本身是凭据**；限速先占名额再查库，一分钟最多 20 次「猜错」） | 无；码有效、未过期、签发者的凭证行和验证器都仍有效、设备名额没满 |
 //! | `/pairing/unpair` | 设备解绑自己 | 无管理权限，只能撤销**自己**这张设备凭证 |
 //!
 //! 读（`GET`，授权 `read` × 被查询的账户，不写审计）：`/whoami`、`/accounts/{id}`、`/accounts/{id}/subtree`、

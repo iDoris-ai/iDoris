@@ -27,7 +27,7 @@ use idoris_compute_contracts::admission::{
     AdmissionDecision, AdmissionReport, Admitted, CheckKind, CheckOutcome, DegradeReason,
     GraceDenied, Reservation, check_grace, evaluate_admission,
 };
-use idoris_compute_contracts::credential::PaymentContext;
+use idoris_compute_contracts::credential::{PaymentContext, resolve_payment_context};
 use idoris_compute_contracts::ids::AccountId;
 use idoris_compute_contracts::money::Unit;
 use idoris_compute_contracts::pricing::Price;
@@ -45,7 +45,8 @@ use super::project::{
     SPENDABLE_PURPOSES, available_of, load_config, not_revoked_clause, project_chain,
 };
 use super::types::{AdmitInput, AlertKind, MODEL_COMPONENT};
-use crate::accounts::rows::load_ancestors;
+use crate::accounts::rows::{load_ancestors, load_credential};
+use crate::accounts::store::directory_slice;
 
 /// `decide` 的结果：决定本身，加上 `apply` 要写的东西（拒绝时没有）。
 pub(super) struct AdmitPlan {
@@ -81,6 +82,10 @@ fn reject(code: ReasonCode) -> Result<AdmitPlan, LedgerError> {
 /// 这些都必须在**占预留的同一个事务里**拦住，不留「撤销了还放行一次」的缝。
 ///
 /// 顺序与 S0 `resolve_payment_context` 一致：凭证（撤销 → 冻结 → 过期）→ 主体 → 成员关系 → 账户。
+///
+/// 最后还要**重新解析一遍**付款上下文并要求完全相等：`PaymentContext` 的字段虽然私有，但它能从 JSON 反序列化出来，
+/// 所以调用方手里的上下文不一定是 `resolve_payment_context` 的产物（PR-Daemon S1 F3：别人的付款人、别的凭证、
+/// 别的主体都能写进去）。账本不信任它的来历，用库里的凭证、成员关系重新算出「这张凭证此刻唯一的付款上下文」，对不上就拒绝。
 pub(super) fn gate(
     conn: &Connection,
     payment: &PaymentContext,
@@ -147,7 +152,31 @@ pub(super) fn gate(
     {
         return Ok(Some(ReasonCode::AccountInactive));
     }
-    Ok(None)
+    provenance(conn, payment, now_ms)
+}
+
+/// 重新解析付款上下文，要求和调用方给的完全相等（凭证、付款人、单位、主体、成员关系）。
+fn provenance(
+    conn: &Connection,
+    payment: &PaymentContext,
+    now_ms: i64,
+) -> Result<Option<ReasonCode>, LedgerError> {
+    let Some(credential) = load_credential(conn, payment.credential())? else {
+        return Ok(Some(ReasonCode::PaymentContextInvalid));
+    };
+    let directory = directory_slice(conn, &credential, payment.principal())?;
+    Ok(
+        match resolve_payment_context(
+            &directory,
+            &credential,
+            payment.principal(),
+            idoris_compute_contracts::ids::TimestampMs(now_ms),
+        ) {
+            Ok(resolved) if resolved == *payment => None,
+            Ok(_) => Some(ReasonCode::PaymentContextInvalid),
+            Err(error) => Some(error.reason_code()),
+        },
+    )
 }
 
 /// 链上哪些账户靠授信放行（`CreditFloor` 是 `PassUsingCredit`）。

@@ -114,9 +114,13 @@ pub(super) struct GrantAllocationBody {
     pub child: AccountId,
     pub amount: Money,
     pub purpose: Purpose,
+    /// 有效窗口 `[valid_from_ms, valid_until_ms)`。**免费额度**（`free_tier`）的窗口必须恰好是 `month` 在账本时区里的窗口，
+    /// 对不上是 400 `invalid_allocation`（错误信息里写着应有的两个值）：月份和窗口不能脱钩，否则同一个主体换个月份标签
+    /// 就能在同一段时间里拿到两份。
     pub valid_from_ms: i64,
     pub valid_until_ms: i64,
-    /// 免费额度（`free_tier`）的账期 `YYYY-MM`；幂等键 `(成员, 月份)` 由服务端生成。
+    /// 免费额度（`free_tier`）的账期 `YYYY-MM`；幂等键 `(成员, 月份)` 由服务端生成。免费额度在同一个事务里还要过补贴池
+    /// 该账期的总上限（没设上限 = 0，发不出去；超出是 409 `allocation_exceeds_grantor`）并登记承诺。
     #[serde(default)]
     pub month: Option<BillingMonth>,
 }

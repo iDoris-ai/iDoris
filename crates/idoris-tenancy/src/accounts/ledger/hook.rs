@@ -12,6 +12,10 @@
 //! | `compute_postings` 的 `user_price`（只有发布了的那次） | 预留的 `charged_micros`（`settled`） | 相等；没有 `user_price` 的尝试预留是 `released`（用户付 0） |
 //! | `compute_postings` 的 `release`（价预留的释放） | 预留 `R - min(charged, R)` | 相等（发布了的那次释放没用掉的部分，其余尝试释放整笔） |
 //!
+//! 注意 `charged`（= S4 的 `user_price`）是这次的**实际消费**。宽限放行的预留里平台承担的那部分（`grace_absorbed`）
+//! 不记到付款账户链上：链上每个账户的已花是 `charged - grace_absorbed`，平台承担的部分在平台损失账户里有一条
+//! `grace_absorbed` 分录（`reconcile` 逐个预留核对这条守恒，见 `reconcile.rs`）。
+//!
 //! 收尾时两边**同一个事务**：[`request_finalized`](AttemptLedgerHook::request_finalized) 在 `finalize_request` 的事务里按
 //! 同一份 `SettlementPlan` 结算账本，任何一边失败都整体回滚。账本一侧按预留幂等，所以重放同一次收尾不会重复扣，
 //! 崩溃后用 S4 的恢复接口重新收尾也能把账本补上（那时预留可能已经过期，走迟到结算的规则）。

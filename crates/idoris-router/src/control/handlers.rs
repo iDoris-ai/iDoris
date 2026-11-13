@@ -585,7 +585,9 @@ pub(super) async fn unpair_device(
     .await
 }
 
-/// 兑换配对码：**没有凭证**，码本身就是凭据。先过全局的失败限速，再把输入规范化、哈希、交给存储层。
+/// 兑换配对码：**没有凭证**，码本身就是凭据。**先占限速名额、再碰数据库**（见 `pairing_codes::FailureLimiter`），
+/// 然后把输入规范化、哈希、交给存储层。只有「猜错」（查无此码、格式不对）的尝试一直占着名额；兑换成功、
+/// 码是认得出的（已用、已过期、已撤销、签发者失去资格、设备名额满……）、请求体畸形（不是在猜）都把名额还回去。
 pub(super) async fn redeem_pairing_code(
     State(plane): Plane,
     _headers: HeaderMap,
@@ -593,24 +595,24 @@ pub(super) async fn redeem_pairing_code(
 ) -> Response {
     let request_id = new_request_id();
     let now = plane.clock.now();
-    if !plane.redeem_limiter.allow(now.0) {
+    let Some(ticket) = plane.redeem_limiter.acquire(now.0) else {
         return failure_response(
             &request_id,
             &Failure::new(ControlReason::PairingRateLimited),
         );
-    }
+    };
     let parsed = match parse_body::<RedeemBody>(&body) {
         Ok(parsed) => parsed,
         Err(detail) => {
+            plane.redeem_limiter.release(ticket);
             return failure_response(
                 &request_id,
                 &Failure::with_detail(ControlReason::InvalidRequest, detail),
             );
         }
     };
-    // 长度或字符集不对的输入当作「猜错了」：同样计入失败限速，并且和「查无此码」同一个答案。
+    // 长度或字符集不对的输入当作「猜错了」：名额不还，并且和「查无此码」同一个答案。
     let Some(code_hash) = pairing_codes::hash_input(&parsed.code) else {
-        plane.redeem_limiter.record_failure(now.0);
         return failure_response(
             &request_id,
             &Failure::new(ControlReason::PairingCodeInvalid),
@@ -640,23 +642,30 @@ pub(super) async fn redeem_pairing_code(
     })
     .await;
     match outcome {
-        Ok(Ok((written, secret))) => written_response(
-            &request_id,
-            written.result,
-            json!({
-                "credential": to_json(&written.value.credential),
-                "secret": secret,
-                "membership": written.value.membership,
-                "pairing_id": written.value.pairing_id,
-            }),
-        ),
+        Ok(Ok((written, secret))) => {
+            plane.redeem_limiter.release(ticket);
+            written_response(
+                &request_id,
+                written.result,
+                json!({
+                    "credential": to_json(&written.value.credential),
+                    "secret": secret,
+                    "membership": written.value.membership,
+                    "pairing_id": written.value.pairing_id,
+                }),
+            )
+        }
         Ok(Err(failure)) => {
-            if failure.reason == ControlReason::PairingCodeInvalid {
-                plane.redeem_limiter.record_failure(now.0);
+            // 查无此码才是「猜错」，名额留着；其余的码是认得出的，不是在猜
+            if failure.reason != ControlReason::PairingCodeInvalid {
+                plane.redeem_limiter.release(ticket);
             }
             failure_response(&request_id, &failure)
         }
-        Err(_) => blocking_failed(&request_id),
+        Err(_) => {
+            plane.redeem_limiter.release(ticket);
+            blocking_failed(&request_id)
+        }
     }
 }
 

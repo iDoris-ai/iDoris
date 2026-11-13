@@ -373,7 +373,9 @@ fn is_payable_role(role: MembershipRole) -> bool {
 ///
 /// 1. 凭证本身：撤销 → 冻结 → 过期（[`Credential::check_usable_at`]）；
 /// 2. 按绑定种类解析付款账户（见模块文档的表），其中：成员 id 缺失/多余/越界/不匹配，
-///    主体已撤销，成员关系已撤销，同一主体在范围内有多个有效的成员子账户（歧义）；
+///    主体已撤销，成员关系已撤销，同一主体在范围内有多个有效的成员子账户（歧义）。
+///    服务凭证**先判范围、再看主体状态**：不在凭证范围里的主体（不管存在与否、是否已撤销）一律是
+///    `MemberNotInScope`，所以一个组织的凭证探测不到别的组织的主体有没有被撤销；
 /// 3. 付款账户本身及其**所有祖先**都必须是 `Active`（冻结/关闭连带整个子树）。
 ///
 /// 请求侧能提供的唯一输入是 `asserted_member`；它没有任何办法选择别的付款账户。
@@ -402,9 +404,6 @@ pub fn resolve_payment_context(
                 // 不区分「主体不存在」和「不在范围内」，避免被拿来探测主体是否存在。
                 return Err(ResolveError::MemberNotInScope);
             };
-            if principal.status == PrincipalStatus::Revoked {
-                return Err(ResolveError::PrincipalRevoked(principal.id.clone()));
-            }
             // 该主体在 `anchor` 子树里的全部「可付款」成员关系（成员或担保人角色，都有付款账户）
             let candidates: Vec<_> = dir
                 .memberships_of(who)
@@ -415,8 +414,14 @@ pub fn resolve_payment_context(
                         .is_some_and(|a| tree.is_descendant_or_self(a, &anchor.id))
                 })
                 .collect();
+            // **先判范围，再看主体有没有被撤销**：不在这张凭证范围里的主体，不管存在与否、有没有被撤销，答案都是
+            // 同一个 `MemberNotInScope`。否则一个组织的服务凭证断言别的组织的主体，就能靠 `principal_revoked`
+            // 和 `payment_context_invalid` 的区别探测它有没有被撤销（跨租户的状态预言）。
             if candidates.is_empty() {
                 return Err(ResolveError::MemberNotInScope);
+            }
+            if principal.status == PrincipalStatus::Revoked {
+                return Err(ResolveError::PrincipalRevoked(principal.id.clone()));
             }
             let active: Vec<_> = candidates
                 .iter()
@@ -993,6 +998,50 @@ mod tests {
             resolve(&dir, &mk(CredentialStatus::Frozen, Some(1)), None).unwrap_err(),
             ResolveError::CredentialFrozen(_)
         ));
+    }
+
+    #[test]
+    fn a_service_credential_cannot_tell_a_revoked_foreign_principal_from_one_that_is_out_of_scope()
+    {
+        // PR-Daemon S0 F1：服务凭证断言了一个不在它范围里的主体。旧代码先看主体有没有被撤销：已撤销的返回
+        // `principal_revoked`，没撤销的 / 不存在的返回 `payment_context_invalid`——对别的组织的主体是一个存在性 /
+        // 状态预言（跨租户）。现在先判范围：不在范围里的主体，不管存在与否、有没有撤销，都是同一个答案。
+        let revoked = sample_directory_with(sample_tree(), |parts| {
+            for p in &mut parts.principals {
+                if p.id == pid("adult") {
+                    p.status = PrincipalStatus::Revoked;
+                }
+            }
+        });
+        let active = sample_directory();
+        // school-b 的服务凭证；adult 只有 platform 下的成员关系，不在 school-b 的子树里
+        let foreign = service("c-b", "school-b");
+        let answers = [
+            resolve(&revoked, &foreign, Some("adult")).unwrap_err(),
+            resolve(&active, &foreign, Some("adult")).unwrap_err(),
+            resolve(&active, &foreign, Some("nobody-at-all")).unwrap_err(),
+        ];
+        for answer in &answers {
+            assert_eq!(answer, &ResolveError::MemberNotInScope);
+            assert_eq!(answer.reason_code(), ReasonCode::PaymentContextInvalid);
+        }
+        // 范围里的主体被撤销，照旧是 principal_revoked（组织自己知道自己的学生）
+        let in_scope = sample_directory_with(sample_tree(), |parts| {
+            for p in &mut parts.principals {
+                if p.id == pid("kid1") {
+                    p.status = PrincipalStatus::Revoked;
+                }
+            }
+        });
+        assert_eq!(
+            resolve(&in_scope, &service("c-edu", "eduai"), Some("kid1")).unwrap_err(),
+            ResolveError::PrincipalRevoked(pid("kid1"))
+        );
+        // 同一个主体，别的组织的服务凭证：不在范围里
+        assert_eq!(
+            resolve(&in_scope, &foreign, Some("kid1")).unwrap_err(),
+            ResolveError::MemberNotInScope
+        );
     }
 
     #[test]

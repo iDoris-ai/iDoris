@@ -1027,6 +1027,58 @@ fn a_credential_revoked_or_frozen_after_the_context_was_resolved_is_refused_at_a
 }
 
 #[test]
+fn a_payment_context_that_names_someone_elses_payer_is_refused_at_admission() {
+    // `PaymentContext` 能从 JSON 反序列化出来（PR-Daemon S1 F3）：付款人不是凭证自己解析出来的，而是调用方写的。
+    // 准入必须在占预留的事务里重新解析一遍，对不上就拒绝，不能替别人的账户付款。
+    use idoris_compute_contracts::credential::PaymentContext;
+    let forge = |store: &AccountStore, field: &str, value: &str| -> PaymentContext {
+        let mut json = serde_json::to_value(payment(store, "cred-e")).unwrap();
+        json[field] = serde_json::json!(value);
+        serde_json::from_value(json).unwrap()
+    };
+    let db = TempDb::new("gate-forged-context");
+    let store = funded_paid_chain(&db);
+    // 凭证是 emp 的，付款人改成了它的组织 paid / 别的凭证 / 别的主体
+    for (label, field, value) in [
+        ("payer", "payer", "paid"),
+        ("credential", "credential", "cred-a"),
+        ("principal", "principal", "p-a"),
+        ("membership", "membership", "m-a"),
+    ] {
+        let forged = forge(&store, field, value);
+        let req = Req::with_payment("r-forged", 0, forged, 100);
+        assert_eq!(
+            denied(&admit(&store, &req)),
+            Some(ReasonCode::PaymentContextInvalid),
+            "{label}"
+        );
+        assert_eq!(
+            scalar(&db, "SELECT count(*) FROM ledger_holds"),
+            0,
+            "{label}: nothing was reserved"
+        );
+    }
+    // 对照：没改过的上下文照常放行
+    let honest = Req::with_payment("r-honest", 0, payment(&store, "cred-e"), 100);
+    assert!(matches!(
+        admit(&store, &honest),
+        AdmissionDecision::Allow { .. }
+    ));
+    // 附加成本（输入检查）也走同一道闸门
+    let forged = forge(&store, "payer", "paid");
+    let request = RequestId::new("r-forged-extra").unwrap();
+    let decision = store
+        .reserve_request_component(&request, "safety_input", &forged, &price(30), t0())
+        .unwrap();
+    assert_eq!(
+        decision,
+        idoris_tenancy::accounts::ledger::ComponentDecision::Rejected(
+            ReasonCode::PaymentContextInvalid
+        )
+    );
+}
+
+#[test]
 fn an_inactive_account_anywhere_in_the_chain_is_refused() {
     use idoris_compute_contracts::account::AccountStatus;
     for frozen in ["emp", "paid"] {
