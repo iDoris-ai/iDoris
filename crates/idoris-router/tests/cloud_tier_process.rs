@@ -1244,16 +1244,12 @@ async fn the_three_secrets_are_not_interchangeable_in_any_direction() {
     start_must_fail(&f, &org_env, "格式不对").await;
     // 5. 本机的本地数据密钥被当成 Node 凭证：库里认得它，启动拒绝（本地密钥不发给云端）
     let local_key_file = f.path("node-local-key");
-    let key = issue_data_key(
-        &f,
-        &[
-            ("IDORIS_DB_PATH", org_db.to_str().unwrap()),
-            ("IDORIS_DEPLOY_MODE", "tenant"),
-            ("IDORIS_FORM", "organization"),
-        ],
-        Some("acme"),
-    )
-    .await;
+    let key_env = [
+        ("IDORIS_DB_PATH", org_db.to_str().unwrap()),
+        ("IDORIS_DEPLOY_MODE", "tenant"),
+        ("IDORIS_FORM", "organization"),
+    ];
+    let (key_id, key) = issue_data_key_with_id(&f, &key_env, Some("acme")).await;
     std::fs::write(&local_key_file, format!("{key}\n")).unwrap();
     std::fs::set_permissions(&local_key_file, std::fs::Permissions::from_mode(0o600)).unwrap();
     std::fs::write(
@@ -1268,6 +1264,12 @@ async fn the_three_secrets_are_not_interchangeable_in_any_direction() {
         ),
     )
     .unwrap();
+    start_must_fail(&f, &org_env, "本地数据密钥").await;
+    // 吊销之后它仍然是本地密钥（审查 PD S4）：撤销只是本机不再认它，明文仍然不能当云凭证发出去
+    let mut revoke = f.command(&key_env);
+    revoke.args(["key", "revoke", &key_id]);
+    let revoked = run(revoke, None).await;
+    assert!(revoked.status.success(), "{:?}", text(&revoked));
     start_must_fail(&f, &org_env, "本地数据密钥").await;
     assert_eq!(
         cloud.log.count(),

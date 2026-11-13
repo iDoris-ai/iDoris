@@ -647,6 +647,46 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// 声明了形态的部署用的是标准连接设置（WAL）。只读探针在 WAL 库上也要能读：写连接还开着的时候，和它已经关掉
+    /// （WAL 文件被清掉）之后都一样；读不出来就是错误（调用方失败即关闭），所以这里要证明正常情形是读得出来的。
+    #[test]
+    fn path_contains_secret_also_reads_a_wal_mode_database() {
+        let dir = std::env::temp_dir().join(format!(
+            "idoris-virtual-key-wal-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("keys.sqlite3");
+        let key = MintedVirtualKey::mint();
+        let revoked = MintedVirtualKey::mint();
+        let stranger = MintedVirtualKey::mint();
+        {
+            let conn = crate::sqlite_conn::open_standard(&path).unwrap();
+            let store = VirtualKeyStore::new(conn).unwrap();
+            assert_eq!(
+                store.connection_pragmas().unwrap().journal_mode,
+                "wal",
+                "this test must run on a WAL database"
+            );
+            store
+                .insert_active(&key.key_id, key.hash, &scope(None))
+                .unwrap();
+            store
+                .insert_active(&revoked.key_id, revoked.hash, &scope(None))
+                .unwrap();
+            assert!(store.revoke(&revoked.key_id, 50).unwrap());
+            // 写连接还开着
+            assert!(VirtualKeyStore::path_contains_secret(&path, &key.secret).unwrap());
+            assert!(VirtualKeyStore::path_contains_secret(&path, &revoked.secret).unwrap());
+            assert!(!VirtualKeyStore::path_contains_secret(&path, &stranger.secret).unwrap());
+        }
+        // 写连接已经关掉
+        assert!(VirtualKeyStore::path_contains_secret(&path, &key.secret).unwrap());
+        assert!(VirtualKeyStore::path_contains_secret(&path, &revoked.secret).unwrap());
+        assert!(!VirtualKeyStore::path_contains_secret(&path, &stranger.secret).unwrap());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn active_key_presence_ignores_revoked_and_expired_rows() {
         let store = VirtualKeyStore::new(Connection::open_in_memory().unwrap()).unwrap();
