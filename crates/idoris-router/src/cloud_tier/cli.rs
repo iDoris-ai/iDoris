@@ -42,9 +42,10 @@ const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 const LOCK_POLL: std::time::Duration = std::time::Duration::from_millis(25);
 
 /// 拿状态目录的跨进程锁（[`DeviceStore::try_lock`]）。配对和解绑的**整个流程**都在它里面：「有没有配对」的检查、
-/// 兑换、安装是一个整体，不能被另一个进程的同一个流程穿插（审查 r4 Medium#4）。
+/// 兑换、安装、撤销、删除是一个整体，不能被另一个进程的同一个流程穿插（审查 r4 Medium#4）。
 /// 别人占着时短暂地等（异步地等），等不到返回 [`CredentialError::Busy`]。
-/// `create_dir` 为假（解绑）且目录不存在时返回 `None`：没有目录就没有配对，不用锁。
+/// `create_dir` 为假（解绑）且目录不存在时返回 `None`：没有目录就没有配对。调用方必须把它当成「没有配对」直接返回，
+/// 不能再读、再撤销、再按路径删除——没拿到锁还继续删，会删掉检查之后才装上的那张凭证。
 async fn lock_state_dir(
     store: &DeviceStore,
     create_dir: bool,
@@ -63,7 +64,7 @@ async fn lock_state_dir(
 fn lock_busy_message(store: &DeviceStore) -> String {
     format!(
         "另一个 idoris cloud pair / unpair 正在这台机器上运行（设备凭证目录 \"{}\" 的锁被占着）：\
-         等它结束后重试。这个命令什么都没做（没有兑换配对码，也没有动凭证）",
+         请稍后重试。这个命令什么都没做（没有兑换配对码，也没有动凭证）",
         store.dir().display()
     )
 }
@@ -172,12 +173,19 @@ pub async fn run_pair(
     // 整个配对流程（检查、预检、兑换、安装）在状态目录的跨进程锁里：两个进程各兑换一个账号的配对码，
     // 不能都先读到「还没有配对」、再互相覆盖（以前先装的那张云凭证仍然有效、本机却丢了它）。
     let _lock = match lock_state_dir(&store, true).await {
-        Ok(lock) => lock,
+        Ok(Some(lock)) => lock,
+        // 配对总会去建目录；仍然没有拿到锁就不能兑换（配对码是一次性的）
+        Ok(None) => {
+            return Err(format!(
+                "无法获取设备凭证目录 \"{}\" 的锁：没有兑换配对码，这个命令什么都没做，请稍后重试",
+                store.dir().display()
+            ));
+        }
         Err(CredentialError::Busy) => return Err(lock_busy_message(&store)),
-        // 目录建不出来、锁文件写不了：和预检一样，兑换之前就停下（配对码是一次性的）
+        // 目录建不出来、锁文件写不了、锁文件不是一把安全的锁：和预检一样，兑换之前就停下
         Err(error) => {
             return Err(format!(
-                "设备凭证目录 \"{}\" 不能写入（{error}）：没有兑换配对码，请先解决再重试",
+                "设备凭证目录 \"{}\" 不能写入（{error}）：没有兑换配对码，这个命令什么都没做，请稍后重试",
                 store.dir().display()
             ));
         }
@@ -386,7 +394,20 @@ impl CloudNotConfirmed {
     }
 }
 
-/// `idoris cloud unpair`：云端撤销 + 删除本机凭证。**本机凭证无论如何都会删除**。
+/// 没有配对：退出码 0，不读、不删。
+fn report_not_paired(stdout: &mut dyn Write, stderr: &mut dyn Write) -> Result<u8, String> {
+    let _ = writeln!(stderr, "这台机器没有配对，什么都没做。");
+    writeln!(
+        stdout,
+        "{}",
+        json!({"unpaired": false, "reason": "not_paired"})
+    )
+    .map_err(|_| "无法写 stdout".to_string())?;
+    Ok(0)
+}
+
+/// `idoris cloud unpair`：云端撤销 + 删除本机凭证。**拿到锁之后，本机凭证无论如何都会删除**。
+/// 没拿到锁则什么都不删：别人占着锁、锁文件不能用，退出码 1，请稍后重试；目录当时不存在，按没有配对（退出码 0）。
 ///
 /// 凭证发往云端之前和推理路径一样先问本地密钥探针（`ctx.probe`）：认得（本机的本地数据密钥误填进了设备凭证文件）就**不发**，
 /// 只删本地文件，按「本机已删、云端未确认」处理（退出码 2，`reason: local_key_refused`）。
@@ -404,29 +425,23 @@ pub async fn run_unpair(
     } = ctx;
     paired_device_only(config, "idoris cloud unpair ")?;
     let store = DeviceStore::new(config.state_dir_for(db_path));
-    // 和配对同一把锁：解绑（读凭证、通知云端、删文件）也是一个整体，不能和一次配对穿插。没有目录就没有配对，不用锁。
+    // 和配对同一把锁：解绑（读凭证、通知云端、删文件）也是一个整体，不能和一次配对穿插。
+    // 没有拿到锁（目录当时不存在，或者锁被占着、锁文件不能用）就绝不能往下删：
+    // 「没有目录」和「返回」之间，另一次配对可能已经把凭证装上了（审查 r4 Medium#4 剩余）。
     let _lock = match lock_state_dir(&store, false).await {
-        Ok(lock) => lock,
+        Ok(Some(lock)) => lock,
+        Ok(None) => return report_not_paired(stdout, stderr),
         Err(CredentialError::Busy) => return Err(lock_busy_message(&store)),
         Err(error) => {
             return Err(format!(
-                "无法获取设备凭证目录 \"{}\" 的锁（{error}）：这个命令什么都没做",
+                "无法获取设备凭证目录 \"{}\" 的锁（{error}）：这个命令什么都没做，请稍后重试",
                 store.dir().display()
             ));
         }
     };
     let (record, unreadable) = match store.read() {
         Ok(Some(record)) => (Some(record), None),
-        Ok(None) => {
-            let _ = writeln!(stderr, "这台机器没有配对，什么都没做。");
-            writeln!(
-                stdout,
-                "{}",
-                json!({"unpaired": false, "reason": "not_paired"})
-            )
-            .map_err(|_| "无法写 stdout".to_string())?;
-            return Ok(0);
-        }
+        Ok(None) => return report_not_paired(stdout, stderr),
         Err(error) => (None, Some(error)),
     };
 
@@ -554,5 +569,258 @@ pub async fn run(command: CloudCommand) -> Result<u8, String> {
         }
         CloudCommand::Status => run_status(&config, &db_path, stdout, stderr),
         CloudCommand::Unpair => run_unpair(ctx, stdout, stderr).await,
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use std::io::Cursor;
+    use std::path::{Path, PathBuf};
+    use std::time::{Duration, Instant};
+
+    use super::*;
+    use crate::cloud_tier::credential::{self, CloudCredential, DeviceRecord, LOCK_FILE};
+
+    struct NotLocal;
+    impl LocalSecretProbe for NotLocal {
+        fn is_local_secret(&self, _: &str) -> bool {
+            false
+        }
+    }
+
+    fn config_for(state: &Path) -> CloudTierConfig {
+        CloudTierConfig::parse(
+            &format!(
+                "schema_version: 1\nbase_url: http://127.0.0.1:9/api\nmodel: idoris/agent\n\
+                 state_dir: {}\ncredential: {{source: paired_device}}\n\
+                 limits: {{connect_timeout_ms: 200, total_timeout_ms: 400}}\n",
+                state.display()
+            ),
+            Path::new("."),
+        )
+        .unwrap()
+    }
+
+    fn sample_record() -> DeviceRecord {
+        DeviceRecord {
+            origin: "http://127.0.0.1:9".to_string(),
+            credential_id: "vk_0123456789abcdef0123456789abcdef".to_string(),
+            membership: "m-agent-1".to_string(),
+            pairing_id: "pc_0123456789abcdef".to_string(),
+            paired_at_ms: 1_700_000_000_000,
+            secret: CloudCredential::parse(&format!("idk_{}", "a".repeat(64))).unwrap(),
+        }
+    }
+
+    struct Harness {
+        config: CloudTierConfig,
+        db: PathBuf,
+        http: reqwest::Client,
+        probe: NotLocal,
+    }
+
+    impl Harness {
+        fn new(state: &Path) -> Self {
+            Self {
+                config: config_for(state),
+                db: state.join("unused.sqlite3"),
+                http: idoris_upstream::cloud::build_http_client(Duration::from_millis(200))
+                    .unwrap(),
+                probe: NotLocal,
+            }
+        }
+
+        fn ctx(&self) -> CliContext<'_> {
+            CliContext {
+                config: &self.config,
+                db_path: &self.db,
+                http: self.http.clone(),
+                now_ms: 1_700_000_000_000,
+                probe: &self.probe,
+            }
+        }
+    }
+
+    fn make_fifo(path: &Path) {
+        let made = std::process::Command::new("mkfifo")
+            .arg(path)
+            .status()
+            .unwrap();
+        assert!(made.success(), "mkfifo failed");
+    }
+
+    /// 阻塞的 `open` 会把运行时线程卡住，`timeout` 轮不到。到点给 FIFO 一个读端，让旧的写打开能返回，测试才能把失败判出来。
+    fn arm_fifo_reader(fifo: &Path) -> std::thread::JoinHandle<()> {
+        let fifo = fifo.to_path_buf();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(1500));
+            let _ = std::fs::File::open(fifo);
+        })
+    }
+
+    #[tokio::test]
+    async fn pair_and_unpair_reject_a_fifo_lock_within_2s_and_delete_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        std::fs::create_dir(&state).unwrap();
+        let store = DeviceStore::new(&state);
+        store.install(&sample_record()).unwrap();
+        let before = std::fs::read(store.path()).unwrap();
+        let fifo = state.join(LOCK_FILE);
+        make_fifo(&fifo);
+        let harness = Harness::new(&state);
+        let _watch = arm_fifo_reader(&fifo);
+
+        let started = Instant::now();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut stdin = Cursor::new(b"ABCD-EFGH-JKMN\n".as_slice());
+        let paired = run_pair(harness.ctx(), None, &mut stdin, &mut stdout, &mut stderr).await;
+        let pair_err = paired.expect_err("pair must refuse the fifo lock");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "pair hung on the lock file: {pair_err}"
+        );
+        assert!(
+            pair_err.contains("请稍后重试") && pair_err.contains("没有兑换配对码"),
+            "{pair_err}"
+        );
+        assert!(
+            pair_err.contains("不是普通文件") || pair_err.contains("符号链接"),
+            "{pair_err}"
+        );
+        assert_eq!(std::fs::read(store.path()).unwrap(), before);
+
+        let started = Instant::now();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let unpaired = run_unpair(harness.ctx(), &mut stdout, &mut stderr).await;
+        let unpair_err = unpaired.expect_err("unpair must refuse the fifo lock");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "unpair hung on the lock file: {unpair_err}"
+        );
+        assert!(
+            unpair_err.contains("请稍后重试") && unpair_err.contains("什么都没做"),
+            "{unpair_err}"
+        );
+        assert_eq!(
+            std::fs::read(store.path()).unwrap(),
+            before,
+            "unpair deleted the credential without a usable lock"
+        );
+    }
+
+    #[tokio::test]
+    async fn pair_and_unpair_reject_a_symlink_lock_and_do_not_follow_it() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        let elsewhere = dir.path().join("elsewhere");
+        std::fs::create_dir(&state).unwrap();
+        std::fs::create_dir(&elsewhere).unwrap();
+        let store = DeviceStore::new(&state);
+        store.install(&sample_record()).unwrap();
+        let before = std::fs::read(store.path()).unwrap();
+        let target = elsewhere.join(LOCK_FILE);
+        std::fs::write(&target, b"not-the-lock").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::os::unix::fs::symlink(&target, state.join(LOCK_FILE)).unwrap();
+        let harness = Harness::new(&state);
+
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut stdin = Cursor::new(b"ABCD-EFGH-JKMN\n".as_slice());
+        let pair_err = run_pair(harness.ctx(), None, &mut stdin, &mut stdout, &mut stderr)
+            .await
+            .expect_err("pair must refuse a symlink lock");
+        assert!(
+            pair_err.contains("请稍后重试")
+                && (pair_err.contains("不是普通文件") || pair_err.contains("符号链接")),
+            "{pair_err}"
+        );
+
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let unpair_err = run_unpair(harness.ctx(), &mut stdout, &mut stderr)
+            .await
+            .expect_err("unpair must refuse a symlink lock");
+        assert!(unpair_err.contains("请稍后重试"), "{unpair_err}");
+        assert_eq!(std::fs::read(store.path()).unwrap(), before);
+        // 没有跟着符号链接去锁目标文件
+        assert!(
+            DeviceStore::new(&elsewhere)
+                .try_lock(false)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn unpair_deletes_nothing_while_another_holder_has_the_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        let store = DeviceStore::new(&state);
+        store.install(&sample_record()).unwrap();
+        let before = std::fs::read(store.path()).unwrap();
+        let _held = store.try_lock(true).unwrap().expect("lock");
+        let harness = Harness::new(&state);
+        let started = Instant::now();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let error = run_unpair(harness.ctx(), &mut stdout, &mut stderr)
+            .await
+            .expect_err("unpair must stop when it cannot take the lock");
+        // 锁被占着时会按设计等到两秒期限再放弃（不是卡在 open 上）。超过这个期限才算没返回。
+        assert!(started.elapsed() < Duration::from_secs(3), "{error}");
+        assert!(
+            error.contains("请稍后重试") && error.contains("什么都没做"),
+            "{error}"
+        );
+        assert!(stdout.is_empty(), "stdout must stay empty on exit 1");
+        assert_eq!(std::fs::read(store.path()).unwrap(), before);
+        assert!(state.join(LOCK_FILE).exists(), "the lock file must stay");
+    }
+
+    /// 审查 r4#4 剩余：`try_lock` 看到目录不存在之后、返回之前，另一次配对把凭证装上了。
+    /// 解绑没有拿到锁，必须按「没有配对」返回，不能把这张新凭证删掉。
+    #[tokio::test]
+    async fn unpair_does_not_delete_a_credential_installed_after_it_saw_no_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        let harness = Harness::new(&state);
+        let installed = state.clone();
+        credential::set_absent_dir_hook_for_test(Some(Box::new(move || {
+            DeviceStore::new(&installed)
+                .install(&sample_record())
+                .unwrap();
+        })));
+        struct Clear;
+        impl Drop for Clear {
+            fn drop(&mut self) {
+                credential::set_absent_dir_hook_for_test(None);
+            }
+        }
+        let _clear = Clear;
+
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let code = run_unpair(harness.ctx(), &mut stdout, &mut stderr)
+            .await
+            .expect("not paired is exit 0, not an error");
+        assert_eq!(code, 0);
+        let text = String::from_utf8(stdout).unwrap();
+        assert!(
+            text.contains("\"reason\":\"not_paired\"") || text.contains("not_paired"),
+            "{text}"
+        );
+        let device = state.join("device.json");
+        assert!(
+            device.exists(),
+            "unpair deleted a credential it did not hold the lock for"
+        );
+        assert!(!std::fs::read(&device).unwrap().is_empty());
     }
 }
