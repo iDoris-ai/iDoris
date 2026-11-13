@@ -1164,6 +1164,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_free_rules_run_before_the_check_cost_is_reserved() {
+        // PR-Daemon S5 F4：配了 LLM 检查器时，检查费用在免费的规则检查之前预留，额度不足的孩子写自伤内容得到 402，不是 422。
+        let paid = Arc::new(Paid {
+            calls: AtomicUsize::new(0),
+        });
+        let pipeline = SafetyPipeline::new(Arc::new(RuleChecker::new())).then(paid.clone());
+        let broke = SafetyGate::new(
+            Arc::new(pipeline),
+            SafetyLimits::default(),
+            Arc::new(Refusing(ExtraCostRefusal::Denied(
+                ReasonCode::BudgetExhausted,
+            ))),
+        );
+        let harmful = json!({"messages": [{"role": "user", "content": "i want to die"}]})
+            .as_object()
+            .unwrap()
+            .clone();
+        let denial = run(&broke, |g, c| {
+            let harmful = harmful.clone();
+            Box::pin(async move { g.check_input(c, &harmful).await })
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(
+            denial,
+            GateDenial::Blocked {
+                stage: SafetyStage::Input,
+                category: SafetyCategory::SelfHarm
+            },
+            "the rules refuse first; the child's account having no money must not turn that into a 402"
+        );
+        // 输出阶段同样：有害的回答被规则拦下，不是因为钱不够
+        let harmful_answer = json!({"id": "x", "choices": [{"message": {
+            "role": "assistant", "content": "ไปตายซะ ไม่มีใครต้องการเธอหรอก"}}]})
+        .to_string()
+        .into_bytes();
+        let denial = run(&broke, |g, c| {
+            let harmful_answer = harmful_answer.clone();
+            Box::pin(async move {
+                g.check_output(c, &CheckedInput::default(), &harmful_answer)
+                    .await
+            })
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(
+            denial,
+            GateDenial::Blocked {
+                stage: SafetyStage::Output,
+                category: SafetyCategory::SelfHarm
+            }
+        );
+        // 没有被规则拦下的请求照常走到预留：钱不够就是准入拒绝，付费检查器一次也没被调用
+        let denial = run(&broke, |g, c| {
+            Box::pin(async move { g.check_input(c, &request_body()).await })
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(denial, GateDenial::Admission(ReasonCode::BudgetExhausted));
+        assert_eq!(paid.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
     async fn a_timed_out_paid_check_is_settled_as_unknown_not_forgotten() {
         #[derive(Debug)]
         struct Hanging;

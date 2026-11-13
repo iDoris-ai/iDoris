@@ -734,6 +734,88 @@ mod tests {
     }
 
     #[test]
+    fn contradictory_verdicts_are_bad_responses_not_the_last_value_winning() {
+        // r3 Medium#2：`serde_json::Value` 对重复键后值覆盖前值，`{"verdict":"block","verdict":"allow"}` 变成 allow。
+        for text in [
+            r#"{"verdict":"block","verdict":"allow"}"#,
+            r#"{"verdict":"allow","verdict":"block"}"#,
+            r#"{"verdict":"block","category":"self_harm","verdict":"allow"}"#,
+            r#"{"verdict":"allow","category":"self_harm","category":null}"#,
+            r#"{"verdict":"block","category":"self_harm","category":"other"}"#,
+            "```json\n{\"verdict\":\"block\",\"verdict\":\"allow\"}\n```",
+        ] {
+            assert_eq!(parse_verdict(text), None, "{text}");
+        }
+    }
+
+    #[test]
+    fn an_error_or_ambiguous_envelope_is_never_an_allow() {
+        let allow = json!({"verdict": "allow"}).to_string();
+        let ok = json!({"choices": [{"message": {"role": "assistant", "content": allow}}]});
+        assert_eq!(
+            parse_judge_response(ok.to_string().as_bytes()).unwrap().0,
+            Verdict::Allow
+        );
+        // HTTP 200 里同时有非空的 error 和一个 allow
+        for error in [
+            json!({"message": "overloaded"}),
+            json!("rate limited"),
+            json!(true),
+            json!({}),
+        ] {
+            let mut body = ok.clone();
+            body["error"] = error;
+            assert!(parse_judge_response(body.to_string().as_bytes()).is_none());
+        }
+        // `error: null` 等于没有
+        let mut null_error = ok.clone();
+        null_error["error"] = Value::Null;
+        assert!(parse_judge_response(null_error.to_string().as_bytes()).is_some());
+        // 重复的顶层键、重复的 message / content 键：后值覆盖前值，信封自相矛盾
+        let block = json!({"verdict": "block", "category": "self_harm"}).to_string();
+        let message =
+            |content: &str| format!(r#"{{"role":"assistant","content":{}}}"#, json!(content));
+        for text in [
+            // 重复的 `choices`
+            format!(
+                r#"{{"choices":[{{"message":{}}}],"choices":[{{"message":{}}}]}}"#,
+                message(&block),
+                message(&allow)
+            ),
+            // 重复的 `message`
+            format!(
+                r#"{{"choices":[{{"message":{},"message":{}}}]}}"#,
+                message(&block),
+                message(&allow)
+            ),
+            // 重复的 `content`
+            format!(
+                r#"{{"choices":[{{"message":{{"role":"assistant","content":{},"content":{}}}}}]}}"#,
+                json!(block),
+                json!(allow)
+            ),
+        ] {
+            assert!(parse_judge_response(text.as_bytes()).is_none(), "{text}");
+        }
+        // 多于一个 choice：第一个说 block、第二个说 allow（或反过来）都是矛盾
+        let two = json!({"choices": [
+            {"message": {"content": block}}, {"message": {"content": allow}}]});
+        assert!(parse_judge_response(two.to_string().as_bytes()).is_none());
+        // 检查模型的回答里夹了工具调用 / 拒绝语：不是约定的形状
+        for extra in [
+            json!({"tool_calls": [{"id": "c", "type": "function", "function": {"name": "f", "arguments": "{}"}}]}),
+            json!({"refusal": "I cannot"}),
+            json!({"function_call": {"name": "f", "arguments": "{}"}}),
+        ] {
+            let mut body = ok.clone();
+            for (key, value) in extra.as_object().unwrap() {
+                body["choices"][0]["message"][key] = value.clone();
+            }
+            assert!(parse_judge_response(body.to_string().as_bytes()).is_none());
+        }
+    }
+
+    #[test]
     fn long_text_is_split_on_character_boundaries_and_chunked() {
         let thai = "สวัสดีครับ".repeat(40); // 多字节字符
         for max in [4usize, 7, 10, 33, 100] {

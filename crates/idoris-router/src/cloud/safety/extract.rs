@@ -507,7 +507,7 @@ pub fn rebuild_response(
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-    use idoris_upstream::cloud::wire::FORWARDED_FIELDS;
+    use idoris_upstream::cloud::wire::{ChatCall, FORWARDED_FIELDS, build_chat_body};
 
     use super::*;
 
@@ -832,6 +832,275 @@ mod tests {
             rebuild_response(&huge, "r", 49).unwrap_err(),
             ExtractError::TooLarge
         );
+    }
+
+    #[test]
+    fn nothing_the_upstream_says_about_ids_or_the_model_reaches_the_client() {
+        // r3 Medium#1：孩子输入里的电话号码被上游回显成顶层 `id`（或 `model`、工具调用 `id`）。
+        // 它们都是合法的「短标识」，所以旧实现原样放行，而且绕过了 PII 输出检查。
+        let upstream = json!({
+            "id": "0812345678",
+            "model": "CHILDINPUT-SENTINEL-4f81c2d7",
+            "choices": [{"message": {"role": "assistant", "content": "ok",
+                "tool_calls": [{"id": "0899999999", "type": "function",
+                                "function": {"name": "f", "arguments": "{}"}}]}}],
+        })
+        .to_string();
+        let rebuilt = rebuild_response(upstream.as_bytes(), "req-1", 1 << 20).unwrap();
+        let text = String::from_utf8(rebuilt.body).unwrap();
+        for echoed in ["0812345678", "CHILDINPUT-SENTINEL", "0899999999"] {
+            assert!(!text.contains(echoed), "{echoed} leaked into {text}");
+        }
+    }
+
+    // ---- 「检查的 = 转发的」：性质测试 ----
+
+    /// 可复现的伪随机数（不引入依赖）。
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            self.0 = x;
+            x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
+    }
+
+    /// 每个标签都独一无二，也不会撞上任何规则的词。
+    struct Tags(usize);
+
+    impl Tags {
+        fn tag(&mut self) -> String {
+            self.0 += 1;
+            format!("zqx{}tag", self.0)
+        }
+    }
+
+    fn random_value(rng: &mut Rng, tags: &mut Tags, depth: usize) -> Value {
+        match if depth >= 3 {
+            rng.below(4)
+        } else {
+            rng.below(7)
+        } {
+            0 => json!(tags.tag()),
+            1 => json!(rng.below(100)),
+            2 => json!(rng.below(2) == 0),
+            3 => Value::Null,
+            4 | 5 => Value::Array(
+                (0..rng.below(3))
+                    .map(|_| random_value(rng, tags, depth + 1))
+                    .collect(),
+            ),
+            _ => Value::Object(
+                (0..rng.below(3))
+                    .map(|_| (tags.tag(), random_value(rng, tags, depth + 1)))
+                    .collect(),
+            ),
+        }
+    }
+
+    fn random_message(rng: &mut Rng, tags: &mut Tags) -> Value {
+        let role = match rng.below(8) {
+            0 => "system".to_string(),
+            1 => "developer".to_string(),
+            2 | 3 => "user".to_string(),
+            4 => "assistant".to_string(),
+            5 => "tool".to_string(),
+            6 => "function".to_string(),
+            _ => tags.tag(), // 未知角色：它的名字也会被转发
+        };
+        let mut message = Map::new();
+        message.insert("role".into(), json!(role));
+        match rng.below(4) {
+            0 => {
+                message.insert("content".into(), json!(tags.tag()));
+            }
+            1 => {
+                let mut part = Map::new();
+                part.insert("type".into(), json!("text"));
+                part.insert("text".into(), json!(tags.tag()));
+                if rng.below(2) == 0 {
+                    part.insert(tags.tag(), random_value(rng, tags, 1));
+                }
+                message.insert(
+                    "content".into(),
+                    json!([Value::Object(part), json!(tags.tag())]),
+                );
+            }
+            2 => {
+                message.insert("content".into(), Value::Null);
+            }
+            _ => {}
+        }
+        if rng.below(2) == 0 {
+            message.insert("name".into(), json!(tags.tag()));
+        }
+        if rng.below(2) == 0 {
+            let arguments = serde_json::to_string(&json!({tags.tag(): tags.tag()})).unwrap();
+            message.insert(
+                "tool_calls".into(),
+                json!([{"id": tags.tag(), "type": "function",
+                        "function": {"name": tags.tag(), "arguments": arguments}}]),
+            );
+        }
+        if rng.below(3) == 0 {
+            message.insert(tags.tag(), random_value(rng, tags, 1));
+        }
+        Value::Object(message)
+    }
+
+    /// 一个随机的客户端请求体：每个白名单字段都有可能出现，还有不会被转发的字段。
+    fn random_client_body(seed: u64) -> Map<String, Value> {
+        let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+        let mut tags = Tags(0);
+        let mut body = Map::new();
+        body.insert("model".into(), json!("idoris/agent"));
+        let messages: Vec<Value> = (0..=rng.below(4))
+            .map(|_| random_message(&mut rng, &mut tags))
+            .collect();
+        body.insert("messages".into(), Value::Array(messages));
+        if rng.below(2) == 0 {
+            let tools: Vec<Value> = (0..=rng.below(2))
+                .map(|_| {
+                    json!({"type": "function", "function": {
+                        "name": tags.tag(), "description": tags.tag(),
+                        "parameters": {"type": "object", "properties": {
+                            tags.tag(): {"type": "string", "description": tags.tag()}}}}})
+                })
+                .collect();
+            body.insert("tools".into(), Value::Array(tools));
+        }
+        if rng.below(2) == 0 {
+            body.insert(
+                "tool_choice".into(),
+                if rng.below(2) == 0 {
+                    json!(tags.tag())
+                } else {
+                    json!({"type": "function", "function": {"name": tags.tag()}})
+                },
+            );
+        }
+        if rng.below(2) == 0 {
+            body.insert(
+                "response_format".into(),
+                json!({"type": "json_schema", "json_schema": {
+                    "name": tags.tag(), "schema": random_value(&mut rng, &mut tags, 0)}}),
+            );
+        }
+        if rng.below(2) == 0 {
+            body.insert(
+                "stop".into(),
+                if rng.below(2) == 0 {
+                    json!(tags.tag())
+                } else {
+                    json!([tags.tag(), tags.tag()])
+                },
+            );
+        }
+        for field in NUMBER_FIELDS {
+            if rng.below(2) == 0 {
+                body.insert((*field).into(), json!(rng.below(10)));
+            }
+        }
+        if rng.below(2) == 0 {
+            body.insert("parallel_tool_calls".into(), json!(true));
+        }
+        // 白名单之外的字段不会被转发，检查与否都不影响「检查的 = 转发的」
+        body.insert("user".into(), json!(tags.tag()));
+        body.insert("metadata".into(), json!({tags.tag(): tags.tag()}));
+        body
+    }
+
+    const NUMBER_FIELDS: &[&str] = &[
+        "temperature",
+        "top_p",
+        "top_k",
+        "min_p",
+        "presence_penalty",
+        "frequency_penalty",
+        "repetition_penalty",
+        "seed",
+    ];
+
+    /// 固定的结构词：不是客户端能写的文本（白名单字段名、上游请求里由服务端写的字段、消息结构里固定的键和角色名）。
+    /// 它们出现与否不影响检查，因为里面装不下任何内容。
+    const STRUCTURAL: &[&str] = &[
+        "model",
+        "max_tokens",
+        "stream",
+        "role",
+        "content",
+        "type",
+        "text",
+        "system",
+        "developer",
+        "user",
+        "assistant",
+        "tool",
+        "function",
+    ];
+
+    fn every_string(value: &Value, out: &mut Vec<String>) {
+        match value {
+            Value::String(text) => out.push(text.clone()),
+            Value::Array(items) => items.iter().for_each(|item| every_string(item, out)),
+            Value::Object(map) => {
+                for (key, item) in map {
+                    out.push(key.clone());
+                    every_string(item, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn every_string_in_the_forwarded_request_is_in_the_checked_text() {
+        // 性质：`build_chat_body` 真正会发给上游的请求里，**每一个**字符串（值和键名，任何深度）都出现在检查内容里。
+        // 随机的请求体里每个字符串都是独一无二的标签；上游请求由真正的 `build_chat_body` 构造。
+        let none = Map::new();
+        for seed in 1..=400u64 {
+            let client = random_client_body(seed);
+            let forwarded = build_chat_body(&ChatCall {
+                client_body: &client,
+                upstream_model: "upstream-model",
+                max_tokens: 64,
+                stream: false,
+                extra_body: &none,
+            })
+            .unwrap();
+            let forwarded: Value = serde_json::from_slice(&forwarded).unwrap();
+            let mut strings = Vec::new();
+            every_string(&forwarded, &mut strings);
+            let checked = extract_input(&client, 1 << 22).unwrap();
+            let all: String = checked
+                .segments
+                .iter()
+                .map(|s| s.text.expose().to_string())
+                .collect::<Vec<_>>()
+                .join("\n");
+            let tagged = strings.iter().filter(|s| s.starts_with("zqx")).count();
+            assert!(tagged > 0, "seed {seed} generated nothing to check");
+            for string in &strings {
+                if STRUCTURAL.contains(&string.as_str())
+                    || FORWARDED_FIELDS.contains(&string.as_str())
+                {
+                    continue;
+                }
+                assert!(
+                    all.contains(string.as_str()),
+                    "seed {seed}: the forwarded string {string:?} is not in the checked text\nbody: {}",
+                    Value::Object(client.clone())
+                );
+            }
+        }
     }
 
     #[test]
