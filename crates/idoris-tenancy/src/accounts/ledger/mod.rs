@@ -230,7 +230,9 @@ impl AccountStore {
     /// 拒绝没有占任何额度。
     ///
     /// 同一个尝试只能准入一次（[`LedgerError::HoldExists`]）。尝试序号大于 0（切换候选）时，同一个请求里之前
-    /// 失败的候选的预留会在**同一个事务里**先释放（用户对它们付 0），新候选的检查才看得到腾出来的额度。
+    /// 失败的候选的预留会在**同一个事务里**先释放（用户对它们付 0），新候选的检查才看得到腾出来的额度；
+    /// 仍在 `admitted` / `sending` 的尝试不算失败，它的预留不放。请求已经向客户端输出了第一个字节（那一次是向用户收费的）
+    /// 或者已经关闭时，不能再切换：返回 [`LedgerError::SwitchRefused`]，什么都不放、什么都不写。
     ///
     /// 数据库错误（含等锁超时 [`LedgerError::is_busy`]）一律是 `Err`：调用方必须失败即关闭，不能当成放行。
     pub fn admit_attempt(&self, input: &AdmitInput<'_>) -> Result<AdmissionDecision, LedgerError> {

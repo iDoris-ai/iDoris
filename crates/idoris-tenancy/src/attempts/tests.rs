@@ -688,7 +688,7 @@ fn replace_cannot_replace_the_paying_attempt_of_a_request() {
             .collect::<Result<_, _>>()
             .unwrap()
     };
-    assert_eq!(payers(&store), [a1.clone()]);
+    assert_eq!(payers(&store), std::slice::from_ref(&a1));
     {
         let conn = store.lock();
         // 不开外键的连接（任何别的连接默认就是这样）：REPLACE 删掉旧行时没有外键挡着

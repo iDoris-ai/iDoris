@@ -2004,6 +2004,22 @@ fn another_organization_cannot_attach_itself_to_a_legacy_principal_in_use_elsewh
     );
     assert_eq!(env.last_audit().outcome, "denied");
     assert!(env.store.get_membership(&mid("m-evil")).unwrap().is_none());
+    // Codex 的原场景是给它加一个 school-b 的 admin 关系（没有付款账户，授权看组织）：同样被拒
+    let rid = env.rid();
+    let admin_attach = env.store.control_create_membership(
+        &other.who(),
+        &env.meta(T0 + 1, &rid),
+        &CreateMembership {
+            membership: admin_membership("m-evil-admin", "kid2", "school-b"),
+        },
+    );
+    assert_eq!(failure_reason(admin_attach), ControlReason::OutOfScope);
+    assert!(
+        env.store
+            .get_membership(&mid("m-evil-admin"))
+            .unwrap()
+            .is_none()
+    );
     // 归属方自己（它的子树里）当然可以再给它挂成员关系
     env.account("acct-edu-new", AccountKind::Member, Some("eduai"));
     assert_eq!(
