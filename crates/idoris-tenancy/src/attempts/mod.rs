@@ -33,7 +33,7 @@
 //! 与仓库里其它 SQLite store 一样是同步 API（`rusqlite`），内部一把 `Mutex<Connection>`。每个方法都是
 //! 一个短事务，调用方可以在 `Drop` 里直接调用（客户端断开时的收尾）。
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
@@ -45,7 +45,7 @@ use idoris_compute_contracts::form::DeploymentForm;
 use idoris_compute_contracts::ids::{AttemptId, RequestId, SupplierRequestId, TimestampMs};
 use idoris_compute_contracts::money::{Money, Unit};
 use idoris_compute_contracts::permit::{Billing, DataClass};
-use idoris_compute_contracts::pricing::Usage;
+use idoris_compute_contracts::pricing::{USAGE_ROUNDING, Usage, usage_amount};
 use idoris_compute_contracts::request::{
     Attempt, AttemptRole, ChargeBasis, CostBasis, MAX_ATTEMPTS_PER_REQUEST, Request, SettlementPlan,
 };
@@ -388,6 +388,20 @@ pub struct FinalizeReport {
     pub settled: Vec<AttemptId>,
     /// 请求此前就已关闭、这次是幂等重放。
     pub replayed: bool,
+}
+
+/// 迟到 usage 对账（[`AttemptStore::reconcile_late_usage`]）的结果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LateUsageOutcome {
+    /// 这次对了账：冲销了旧挂账、记了实际成本、尝试按实际用量结清。
+    Reconciled {
+        /// 这次追加的分录数（冲销一条 + 实际成本一条；零金额不记）。
+        postings_added: usize,
+        /// 按实际用量和这次尝试快照里的成本价目算出的成本。
+        actual_cost: Money,
+    },
+    /// 同一个 usage 已经对过账（幂等重放）：什么都没有改。
+    Replayed,
 }
 
 /// 准入账本（S3）和尝试记录的**同一个事务**的接口。
@@ -863,6 +877,10 @@ impl AttemptStore {
                 "the close outcome disagrees with the recorded publish",
             ));
         }
+        // 重放必须和当初的收尾完全一致：不能借重放追加新的成本分录（见 `verify_replay`）
+        if replayed {
+            verify_replay(&tx, request, plan)?;
+        }
 
         let mut settled = Vec::new();
         if !replayed {
@@ -954,55 +972,164 @@ impl AttemptStore {
         })
     }
 
+    /// **迟到 usage 的对账**（独立的对账事务，不是重放 [`Self::finalize_request`]）：请求已经关闭之后，供应商账单 / 对账查到了
+    /// 一次 `maybe_executed` 的尝试的实际用量。一个事务里：
+    ///
+    /// 1. 这次尝试走 S0 的转移推进：`UsageReported`（`maybe_executed` -> `executed_usage_known`）、`Settle`（-> `settled`，
+    ///    依据是实际用量）；
+    /// 2. **冲销**当初挂账的 `hold`（一条负数分录，键 `<尝试>|hold|reconcile`，依据和原来的挂账相同）；
+    /// 3. 记**实际成本**（`platform_cost`，键 `<尝试>|platform_cost|reconcile`，按这次尝试快照里的成本价目和实际用量算；
+    ///    零不记）。
+    ///
+    /// 为什么不是用重建的计划再调 `finalize_request`：重放会把计划里的新分录追加进去（实际成本），原来的挂账却还在，
+    /// 成本重复占账、这次尝试也没有结清。现在重放一份和当初不一致的计划会被拒绝（`verify_replay`），迟到 usage 只有这一个入口。
+    ///
+    /// 范围（有意收窄）：只处理**没有向用户收费**的 `maybe_executed` 尝试（切换时被放弃的那次、或没有发布的请求里的尝试）；
+    /// 向用户收费的那一次（`pays_user`）迟到 usage 要不要退差价、怎么退，是准入账本的事（`accounts::ledger` 的迟到结算），
+    /// 这里拒绝，不碰用户的钱。幂等：同一个 usage 再调一次返回 [`LateUsageOutcome::Replayed`]，不同的 usage 返回
+    /// [`AttemptStoreError::PostingConflict`]。
+    pub fn reconcile_late_usage(
+        &self,
+        attempt: &AttemptId,
+        usage: Usage,
+        at: TimestampMs,
+    ) -> Result<LateUsageOutcome, AttemptStoreError> {
+        let mut conn = self.lock();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let row: Option<(i64, String, Option<String>)> = tx
+            .query_row(
+                "SELECT a.pays_user, a.state_json, r.outcome
+                   FROM compute_attempts a JOIN compute_requests r ON r.request_id = a.request_id
+                  WHERE a.attempt_id = ?1",
+                [attempt.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        let Some((pays_user, state_json, outcome)) = row else {
+            return Err(AttemptStoreError::AttemptNotFound(attempt.clone()));
+        };
+        if outcome.is_none() {
+            return Err(AttemptStoreError::Invariant(
+                "a late usage is reconciled after the request closed; an open request settles through finalize_request",
+            ));
+        }
+        if pays_user == 1 {
+            return Err(AttemptStoreError::Invariant(
+                "the answering attempt's late usage needs a ledger adjustment, not a cost reconciliation",
+            ));
+        }
+        match serde_json::from_str::<AttemptState>(&state_json)? {
+            AttemptState::MaybeExecuted => {}
+            // 已经按实际用量结清（这个函数上一次调用，或者当初就是按实际用量结算的）：同一个 usage 是幂等重放，
+            // 不同的 usage 是冲突
+            AttemptState::Settled {
+                basis: SettleBasis::ActualUsage(done),
+            } => {
+                return if done == usage {
+                    Ok(LateUsageOutcome::Replayed)
+                } else {
+                    Err(AttemptStoreError::PostingConflict {
+                        key: format!("{attempt}|platform_cost|reconcile"),
+                    })
+                };
+            }
+            _ => {
+                return Err(AttemptStoreError::Invariant(
+                    "only a maybe_executed attempt can be reconciled with a late usage",
+                ));
+            }
+        }
+        // 这次尝试快照里的成本价目（重建整个请求再取：快照不是独立可反序列化的）
+        let request = load_request_from(&tx, attempt.request())?
+            .ok_or_else(|| AttemptStoreError::RequestNotFound(attempt.request().clone()))?;
+        let cost_rates = request
+            .attempt(attempt.index())
+            .ok_or_else(|| AttemptStoreError::AttemptNotFound(attempt.clone()))?
+            .cost_rates()
+            .clone();
+        let actual_cost = usage_amount(&cost_rates, &usage, USAGE_ROUNDING).map_err(|_| {
+            AttemptStoreError::Invariant("the usage amount does not fit the cost rates")
+        })?;
+        let hold: Option<(i64, String, String)> = tx
+            .query_row(
+                "SELECT amount_micros, unit, role FROM compute_postings WHERE idempotency_key = ?1",
+                [format!("{attempt}|hold|settle")],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        // 没有挂账（预留成本是零，零金额不记）：没有什么可冲销，只记实际成本
+        let (held, hold_unit, role) = hold.unwrap_or_else(|| {
+            (
+                0,
+                actual_cost.money().unit.to_string(),
+                role_str(AttemptRole::Extra).to_string(),
+            )
+        });
+        let reversal_key = format!("{attempt}|hold|reconcile");
+        let cost_key = format!("{attempt}|platform_cost|reconcile");
+
+        // 1. 状态：走 S0 的转移（UsageReported 之后 Settle）
+        apply_events_in(
+            &tx,
+            attempt,
+            &[AttemptEvent::UsageReported { usage }, AttemptEvent::Settle],
+            at,
+        )?;
+        // 2. 冲销旧挂账；3. 记实际成本
+        let mut posted = 0usize;
+        let post = |key: &str, kind: PostingKind, basis: PostingBasis, unit: &str, micros: i64| {
+            tx.execute(
+                "INSERT INTO compute_postings
+                   (request_id, attempt_id, kind, role, basis, unit, amount_micros, idempotency_key, created_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    attempt.request().as_str(),
+                    attempt.to_string(),
+                    kind.as_str(),
+                    role,
+                    basis.as_str(),
+                    unit,
+                    micros,
+                    key,
+                    at.millis(),
+                ],
+            )
+        };
+        if held != 0 {
+            post(
+                &reversal_key,
+                PostingKind::Hold,
+                PostingBasis::ReservedPendingReconciliation,
+                &hold_unit,
+                held.checked_neg()
+                    .ok_or(AttemptStoreError::Invariant("the held amount overflows"))?,
+            )?;
+            posted += 1;
+        }
+        if !actual_cost.is_zero() {
+            post(
+                &cost_key,
+                PostingKind::PlatformCost,
+                PostingBasis::ActualUsage,
+                &actual_cost.money().unit.to_string(),
+                actual_cost.micros(),
+            )?;
+            posted += 1;
+        }
+        tx.commit()?;
+        Ok(LateUsageOutcome::Reconciled {
+            postings_added: posted,
+            actual_cost: actual_cost.money().clone(),
+        })
+    }
+
     // -----------------------------------------------------------------------
     // 读
     // -----------------------------------------------------------------------
 
     /// 把库里的请求重建成 S0 的 [`Request`]（经 serde 重新校验全部结构不变式）。恢复后对账和测试用。
     pub fn load_request(&self, id: &RequestId) -> Result<Option<Request>, AttemptStoreError> {
-        let conn = self.lock();
-        let head: Option<(String, Option<i64>)> = conn
-            .query_row(
-                "SELECT payment_json, published_attempt FROM compute_requests WHERE request_id = ?1",
-                [id.as_str()],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()?;
-        let Some((payment_json, published)) = head else {
-            return Ok(None);
-        };
-        let mut stmt = conn.prepare(
-            "SELECT snapshot_json, state_json, supplier_request_id
-             FROM compute_attempts WHERE request_id = ?1 ORDER BY attempt_index",
-        )?;
-        let rows = stmt.query_map([id.as_str()], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, Option<String>>(2)?,
-            ))
-        })?;
-        let mut attempts = Vec::new();
-        for row in rows {
-            let (snapshot, state, supplier) = row?;
-            let mut attempt: Value = serde_json::from_str(&snapshot)?;
-            attempt["state"] = serde_json::from_str(&state)?;
-            if let Some(supplier) = supplier {
-                attempt["supplier_request_id"] = Value::String(supplier);
-            }
-            attempts.push(attempt);
-        }
-        let mut doc = json!({
-            "id": id.as_str(),
-            "payment": serde_json::from_str::<Value>(&payment_json)?,
-            "attempts": attempts,
-        });
-        if let Some(index) = published {
-            doc["published"] = Value::from(index);
-        }
-        let request: Request = serde_json::from_value(doc)
-            .map_err(|e| AttemptStoreError::Corrupt(format!("cannot rebuild the request: {e}")))?;
-        Ok(Some(request))
+        load_request_from(&self.lock(), id)
     }
 
     pub fn request_row(&self, id: &RequestId) -> Result<Option<RequestRow>, AttemptStoreError> {
@@ -1247,6 +1374,99 @@ impl AttemptStore {
 // ---------------------------------------------------------------------------
 // 内部实现
 // ---------------------------------------------------------------------------
+
+/// 把库里的请求重建成 S0 的 [`Request`]（经 serde 重新校验全部结构不变式）。在已有的连接 / 事务上读（`load_request` 和
+/// 迟到 usage 对账共用）。
+fn load_request_from(
+    conn: &Connection,
+    id: &RequestId,
+) -> Result<Option<Request>, AttemptStoreError> {
+    let head: Option<(String, Option<i64>)> = conn
+        .query_row(
+            "SELECT payment_json, published_attempt FROM compute_requests WHERE request_id = ?1",
+            [id.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((payment_json, published)) = head else {
+        return Ok(None);
+    };
+    let mut stmt = conn.prepare(
+        "SELECT snapshot_json, state_json, supplier_request_id
+         FROM compute_attempts WHERE request_id = ?1 ORDER BY attempt_index",
+    )?;
+    let rows = stmt.query_map([id.as_str()], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, Option<String>>(2)?,
+        ))
+    })?;
+    let mut attempts = Vec::new();
+    for row in rows {
+        let (snapshot, state, supplier) = row?;
+        let mut attempt: Value = serde_json::from_str(&snapshot)?;
+        attempt["state"] = serde_json::from_str(&state)?;
+        if let Some(supplier) = supplier {
+            attempt["supplier_request_id"] = Value::String(supplier);
+        }
+        attempts.push(attempt);
+    }
+    let mut doc = json!({
+        "id": id.as_str(),
+        "payment": serde_json::from_str::<Value>(&payment_json)?,
+        "attempts": attempts,
+    });
+    if let Some(index) = published {
+        doc["published"] = Value::from(index);
+    }
+    let request: Request = serde_json::from_value(doc)
+        .map_err(|e| AttemptStoreError::Corrupt(format!("cannot rebuild the request: {e}")))?;
+    Ok(Some(request))
+}
+
+/// 重放（请求已经关闭又收尾一次）必须和当初的收尾**完全一致**：
+///
+/// - 计划产生的每一条分录都已经在库里、金额相同（金额不同是 `PostingConflict`）；
+/// - 计划不能产生库里没有的分录；
+/// - 库里当初收尾写的每一条 `...|settle` 分录也都在计划里。
+///
+/// 为什么：幂等键是 `<尝试>|<类别>|settle`，如果只核对「计划里有的」，一份和当初不同的计划（比如对账把一次 `maybe_executed`
+/// 的尝试更新成已知 usage 之后，用重建的计划再来一遍）会因为键不同而追加新的成本分录（`platform_cost`），
+/// 原来的挂账（`hold`）却还保留：成本重复占账，这次尝试也没有结清。迟到 usage 要走 [`AttemptStore::reconcile_late_usage`]。
+fn verify_replay(
+    tx: &rusqlite::Transaction<'_>,
+    request: &RequestId,
+    plan: &SettlementPlan,
+) -> Result<(), AttemptStoreError> {
+    let mut stmt = tx.prepare(
+        "SELECT idempotency_key, amount_micros FROM compute_postings
+          WHERE request_id = ?1 AND idempotency_key LIKE '%|settle'",
+    )?;
+    let stored: BTreeMap<String, i64> = stmt
+        .query_map([request.as_str()], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<Result<_, _>>()?;
+    let mut planned = BTreeSet::new();
+    for draft in postings_for_plan(plan) {
+        let key = draft.idempotency_key();
+        match stored.get(&key) {
+            Some(amount) if *amount == draft.amount.micros => {}
+            Some(_) => return Err(AttemptStoreError::PostingConflict { key }),
+            None => {
+                return Err(AttemptStoreError::Invariant(
+                    "a replayed settlement plan would add postings the original settlement did not write",
+                ));
+            }
+        }
+        planned.insert(key);
+    }
+    if stored.keys().any(|key| !planned.contains(key)) {
+        return Err(AttemptStoreError::Invariant(
+            "a replayed settlement plan does not cover every posting the original settlement wrote",
+        ));
+    }
+    Ok(())
+}
 
 fn corrupt(error: impl std::fmt::Display) -> AttemptStoreError {
     AttemptStoreError::Corrupt(error.to_string())
