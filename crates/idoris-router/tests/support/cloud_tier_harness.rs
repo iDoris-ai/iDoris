@@ -291,6 +291,92 @@ impl TcpCloud {
 }
 
 // ================================================================================================
+// 慢连接：接受队列填满之后，下一个 connect 停在 SYN_SENT，请求正文还写不出去
+// ================================================================================================
+
+/// 监听套接字的接受队列已被填满。这些 filler 连接是测试自己连上去的，上面没有 HTTP。
+/// 不要在被测请求结束之前 `accept`：腾出队列位置的话，被测的 `connect` 就会完成并把正文写进去。
+pub struct HeldQueue {
+    pub listener: std::net::TcpListener,
+    pub addr: std::net::SocketAddr,
+    _fillers: Vec<std::net::TcpStream>,
+}
+
+impl HeldQueue {
+    pub fn bind() -> Self {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut fillers = Vec::new();
+        loop {
+            match std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(400)) {
+                Ok(stream) => fillers.push(stream),
+                Err(_) => break,
+            }
+            assert!(
+                fillers.len() < 4096,
+                "accept queue never filled; the next connect would not block"
+            );
+        }
+        assert!(!fillers.is_empty(), "listener queued nothing");
+        Self {
+            listener,
+            addr,
+            _fillers: fillers,
+        }
+    }
+}
+
+/// `port` 上是否有一条还停在 SYN_SENT / SYN-SENT 的连接（macOS `netstat` 或 Linux `ss`）。
+pub fn tcp_syn_sent_to(port: u16) -> bool {
+    let port = port.to_string();
+    let field_is_port = |field: &str| {
+        field
+            .rsplit(['.', ':'])
+            .next()
+            .is_some_and(|tail| tail == port)
+    };
+    let texts = [
+        ("netstat", &["-an", "-p", "tcp"][..]),
+        ("ss", &["-tan"][..]),
+    ];
+    for (cmd, args) in texts {
+        let Ok(output) = std::process::Command::new(cmd).args(args).output() else {
+            continue;
+        };
+        let text = String::from_utf8_lossy(&output.stdout);
+        for line in text.lines() {
+            let pending = line.contains("SYN_SENT") || line.contains("SYN-SENT");
+            if pending && line.split_whitespace().any(field_is_port) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// 把已经排在监听套接字上的连接读出来（非阻塞 accept）。调用前被测请求必须已经结束。
+pub fn payloads_waiting_on(listener: &std::net::TcpListener) -> Vec<Vec<u8>> {
+    use std::io::Read;
+    listener.set_nonblocking(true).unwrap();
+    let mut payloads = Vec::new();
+    loop {
+        match listener.accept() {
+            Ok((mut stream, _)) => {
+                stream.set_nonblocking(false).unwrap();
+                let _ = stream.set_read_timeout(Some(Duration::from_millis(30)));
+                let mut buf = vec![0u8; 4096];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                buf.truncate(n);
+                payloads.push(buf);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(error) => panic!("accept: {error}"),
+        }
+    }
+    payloads
+}
+
+// ================================================================================================
 // 云端档配置
 // ================================================================================================
 

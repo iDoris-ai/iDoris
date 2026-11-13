@@ -633,6 +633,117 @@ async fn a_kill_switch_turned_on_while_the_pending_row_is_written_still_stops_th
     assert_eq!(completed.event.metadata["status"], "failure");
 }
 
+/// 审查 r4#1 复审：最后一道门已经放过，请求还堵在连接上（假云端的接受队列是满的，握手完不成）时把熔断打开。
+/// 云端没有收到完整请求；`pending` 行写成 cancelled；调用方拿到的和没有云端档时逐字节相同。
+#[tokio::test]
+async fn a_kill_switch_opened_while_the_cloud_connect_is_still_waiting_matches_no_cloud_tier() {
+    use std::sync::atomic::Ordering;
+
+    let queue = HeldQueue::bind();
+    let saw_leftover = tcp_syn_sent_to(queue.addr.port());
+    // 填队列时那次超时的探测连接可能还留着 SYN；等它消失，避免把别人的 SYN 当成被测请求。
+    for _ in 0..50 {
+        if !tcp_syn_sent_to(queue.addr.port()) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        !tcp_syn_sent_to(queue.addr.port()),
+        "a SYN was still in flight before the request started (leftover={saw_leftover})"
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let secret = format!("idk_{}", "b".repeat(64));
+    let file = node_file(dir.path(), &secret);
+    let yaml = tier_config_for(
+        &format!("http://{}/api", queue.addr),
+        None,
+        &format!(
+            "credential: {{source: node_file, file: {}}}",
+            file.display()
+        ),
+        "limits: {connect_timeout_ms: 20000, total_timeout_ms: 30000}",
+    );
+    let tier = make_tier(
+        parse_tier_config(&yaml),
+        Arc::new(idoris_router::cloud_tier::credential::NodeFileProvider::new(&file, None)),
+        &dir.path().join("tier.sqlite3"),
+    );
+    let switch = Arc::new(AtomicBool::new(false));
+    let mut options = NodeOptions::new(Scenario::RuntimeOffline, Some(tier.clone()));
+    options.shared_kill_switch = Some(switch.clone());
+    options.with_event_log = true;
+    let node = LocalNode::build(options);
+    let without = baseline(Scenario::RuntimeOffline)
+        .drive(&[ANY, CONSENT])
+        .await;
+
+    let app = node.app.clone();
+    let request =
+        tokio::spawn(async move { send_chat(&app, chat_body("small"), &[ANY, CONSENT]).await });
+    let mut saw_syn = false;
+    for _ in 0..300 {
+        if tcp_syn_sent_to(queue.addr.port()) {
+            saw_syn = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        saw_syn,
+        "the cloud connect never blocked; the switch would not be opening during the wait"
+    );
+    switch.store(true, Ordering::SeqCst);
+    let with = tokio::time::timeout(Duration::from_secs(2), request)
+        .await
+        .expect("the fallback stayed blocked in connect after the kill switch opened")
+        .unwrap();
+
+    assert_ne!(without.status, 200, "{}", without.text());
+    assert_eq!(
+        with.fingerprint(),
+        without.fingerprint(),
+        "the caller must get exactly the no-cloud-tier response\nwith:    {}\nwithout: {}",
+        with.text(),
+        without.text()
+    );
+    assert!(with.header("x-idoris-cloud-attempt").is_none());
+    let rows = tier.store().calls_after(0, 10).unwrap();
+    assert_eq!(
+        rows.len(),
+        1,
+        "the pending row is written before the connect"
+    );
+    assert_eq!(rows[0].state, CallState::Final(CallOutcome::Cancelled));
+    assert_eq!(
+        (
+            rows[0].cloud_record_id.clone(),
+            rows[0].http_status,
+            rows[0].tokens_in,
+            rows[0].tokens_out
+        ),
+        (None, None, None, None)
+    );
+    let events = node
+        .event_log
+        .as_ref()
+        .unwrap()
+        .events_for_record(Some("personal"), &rows[0].local_request_id)
+        .unwrap();
+    let completed = events
+        .iter()
+        .find(|event| event.event.event_type.as_str() == "completed")
+        .expect("a dispatched event needs its completed event");
+    assert_eq!(completed.event.metadata["status"], "failure");
+
+    let payloads = payloads_waiting_on(&queue.listener);
+    assert!(
+        payloads.iter().all(|bytes| !bytes.starts_with(b"POST")),
+        "the cloud received a request body while the connect was still waiting: {payloads:?}"
+    );
+}
+
 // ------------------------------------------------------------------------------------------------
 // 先写后出网：pending 行落不下，就不出网（审查 PD S4：变异 M6 存活——没有测试证明这一点）
 // ------------------------------------------------------------------------------------------------
