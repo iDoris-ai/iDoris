@@ -12,7 +12,15 @@
 //!    过得了），不另造一套。第 1 层的隐私检查和这一层是两道独立的门，对 `local_only` 各自单独就能挡住。
 //!
 //! 两层都通过才会铸出 [`EgressPermit`]；它的字段是私有的，只有这个模块里的 [`grant`] 能造它，而真正发请求的
-//! `forward::send` 要求按值传入一张。所以**类型层面**就没有绕过闸门去发请求的路。
+//! `forward::send` 要求按值传入一张。`grant` 和 `send` 都是 `pub(super)`：只有 `cloud_tier` 模块树里的代码能调，
+//! crate 外的代码既造不出凭条、也调不到 `send`（它们文档里的 `compile_fail` 文档测试钉住这一点：谁把可见性改回 `pub`，
+//! 测试就失败）。
+//!
+//! **这条保证有边界，别说过头**：类型系统保证的是「出网必须经过 `grant`」，**不**保证「交给 `grant` 的事实是真的」——
+//! `grant` 的输入（有效隐私类别、同意、熔断……）由调用方填。crate 内非测试的调用点目前只有 `cloud_tier::fallback` 一处，
+//! 它从请求里取真实的事实；这一处的正确性靠 `tests/cloud_tier_privacy.rs` 的集成测试（`local_only` 永不出网、没有同意不出网、
+//! 远程熔断……）兜底，不是类型层面的保证。以前这里写的是「类型层面就没有绕过闸门去发请求的路」，而 `grant` 当时是 `pub`——
+//! 说过头了（PR-Daemon 的评审指出过）。
 //!
 //! # 「本机服务不了」是什么（[`LocalFailure::is_unavailability`]）
 //!
@@ -231,7 +239,28 @@ pub struct EgressPermit {
 
 /// 两层闸门：先纯检查，再跑既有的路由策略 + 决策管道（`select`，第 2 层）。两层都通过才铸出凭条，
 /// 并带着第 2 层选出来的 [`Selected`]（原因码、落点）。
-pub fn grant<'a>(
+///
+/// # 可见性是这条保证的一部分
+///
+/// 只有 `cloud_tier` 模块树里的代码能调它（`pub(super)`）：crate 外的代码既造不出凭条，也调不到
+/// [`forward::send`](super::forward)。下面的文档测试钉住这一点——谁把它改回 `pub`，`compile_fail` 那一条就会失败：
+///
+/// ```compile_fail
+/// use idoris_router::cloud_tier::gate::{self, GateInput};
+/// fn mint(input: &GateInput<'_>) {
+///     let _ = gate::grant(input, || unreachable!());
+/// }
+/// ```
+///
+/// 对照：同一条 `use`、同一个类型，只要不去碰 `grant`，就能编译（所以上面那条是因为 `grant` 不可见才编译失败，不是路径写错了）：
+///
+/// ```
+/// use idoris_router::cloud_tier::gate::{self, GateInput};
+/// fn only_the_pure_check_is_public(input: &GateInput<'_>) -> bool {
+///     gate::check(input).is_ok()
+/// }
+/// ```
+pub(super) fn grant<'a>(
     input: &GateInput<'a>,
     select: impl FnOnce() -> Result<Selected, Denial>,
 ) -> Result<(EgressPermit, Selected), Denial> {

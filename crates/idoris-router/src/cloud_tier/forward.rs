@@ -30,6 +30,8 @@
 //! | 5xx、3xx、其它 | `cloud_error` |
 //! | 连接不上（DNS、连接被拒、TLS） | `unreachable` |
 //! | 总期限内没读完 | `timeout` |
+//! | 2xx 但 `usage` 里的 token 数超出调用记录能存的范围（i64） | `invalid_response` |
+//! | 出网前的最后一道门（远程熔断）拦下了它——**没有任何字节离开本机** | `cancelled`（调用方拿到本机原来的响应，没有 attempt 头） |
 
 use axum::body::Bytes;
 use futures_util::StreamExt;
@@ -187,7 +189,21 @@ fn classify_transport(error: &reqwest::Error) -> CloudFailure {
 /// （[`CloudFailure::Withheld`]）。凭条只证明「闸门在某一刻放行过」，而放行到发出之间隔着读凭证、占名额、写审计事件、
 /// 落 `pending` 行这些让出点，远程熔断可能在这期间被打开（它是个共享的原子变量）；调用方在这里给出**此刻**的答案，
 /// 而不是闸门那一刻的快照。检查是 `run` 被 poll 的第一件事，和 `request.send()` 之间没有任何让出点。
-pub async fn send(
+///
+/// 只有 `cloud_tier` 模块树里的代码能调它（`pub(super)`）；而 [`EgressPermit`] 只有 `gate::grant` 能造，它同样只对这个
+/// 模块树可见：crate 外的代码调不到 `send`，也造不出凭条。文档测试钉住 `send` 的可见性
+/// （`grant` 的在 [`super::gate::grant`] 的文档里）：
+///
+/// ```compile_fail
+/// let _ = idoris_router::cloud_tier::forward::send;
+/// ```
+///
+/// 对照（路径没写错）：
+///
+/// ```
+/// let _: Option<idoris_router::cloud_tier::forward::CloudFailure> = None;
+/// ```
+pub(super) async fn send(
     client: &reqwest::Client,
     config: &CloudTierConfig,
     _permit: EgressPermit,
