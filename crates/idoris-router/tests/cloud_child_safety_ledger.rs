@@ -184,7 +184,8 @@ async fn a_blocked_request_is_charged_for_the_check_that_ran_and_the_upstream_ge
 
 #[tokio::test]
 async fn a_rule_block_that_never_called_the_llm_costs_nothing() {
-    // 规则先行：规则就拦下了，LLM 没有被调用——预留释放，不收钱
+    // 规则先行：规则就拦下了，LLM 没有被调用，不收钱。PR-Daemon S5 F4：免费的规则**先于**检查费用的预留，
+    // 所以根本没有预留（旧的预期是「预留了再释放」：额度不足的孩子会因为预留不了而得到 402，不是 422）
     let c = ledgered(vec![answer(ANSWER_SENTINEL)], vec![judge_allow()], FUNDS).await;
     let reply = post(&c.h.app, &child_body(&harmful_question())).await;
     assert_eq!(reply.status, 422);
@@ -196,7 +197,7 @@ async fn a_rule_block_that_never_called_the_llm_costs_nothing() {
     );
     assert_eq!(c.main.connection_count(), 0);
     let id = reply.request_id();
-    assert_eq!(state_of(&c, &id, INPUT), Some(HoldState::Released));
+    assert_eq!(state_of(&c, &id, INPUT), None);
     assert_eq!(spent_total(&c), 0);
     assert_ledger_is_clean(&c);
 }
@@ -315,6 +316,41 @@ async fn a_check_that_cannot_be_afforded_is_refused_with_the_admission_code_and_
         assert!(hold(&c, &id, component).is_none(), "{component}");
     }
     assert_eq!(spent_total(&c), 0);
+}
+
+#[tokio::test]
+async fn a_child_with_no_money_who_writes_self_harm_text_gets_the_422_category_not_a_402() {
+    // PR-Daemon S5 F4：配了 LLM 检查器时，检查费用在免费的规则检查之前预留，额度不足的孩子写了自伤内容得到 402，
+    // eduai 就收不到升级信号。现在规则先行：命中直接 422 self_harm，不预留、不出网。
+    let c = ledgered(
+        vec![answer(ANSWER_SENTINEL)],
+        vec![judge_allow(), judge_allow()],
+        0,
+    )
+    .await;
+    let reply = post(
+        &c.h.app,
+        &child_body(&format!("หนูอยากตาย {CHILD_SENTINEL}")),
+    )
+    .await;
+    assert_eq!(reply.status, 422, "{}", reply.text());
+    assert_eq!(reply.json()["error"]["type"], "safety_input_blocked");
+    assert_eq!(reply.json()["error"]["category"], "self_harm");
+    assert_eq!(
+        reply.header("x-idoris-reason"),
+        Some("safety_input_blocked")
+    );
+    assert_no_content(&reply);
+    assert_eq!(c.judge.connection_count(), 0);
+    assert_eq!(c.main.connection_count(), 0);
+    let id = reply.request_id();
+    for component in [INPUT, OUTPUT, "model"] {
+        assert!(hold(&c, &id, component).is_none(), "{component}");
+    }
+    assert_eq!(spent_total(&c), 0);
+    // 没有被规则拦下的请求照旧：钱不够就是 402
+    let reply = post(&c.h.app, &child_body(&benign_question())).await;
+    assert_eq!(reply.status, 402, "{}", reply.text());
 }
 
 #[tokio::test]

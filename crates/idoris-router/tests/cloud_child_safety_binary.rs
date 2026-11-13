@@ -786,8 +786,9 @@ async fn through_the_real_process_nothing_of_the_child_or_the_answer_is_written_
     let expected = [
         // (输入检查, 输出检查, 回答本身)
         (Some(Settled), Some(Settled), Some(Settled)),
-        (Some(Released), None, None),
-        (Some(Settled), Some(Released), Some(Released)),
+        // PR-Daemon S5 F4：免费的规则先于检查费用的预留，规则拦下的阶段根本没有预留（旧的预期是预留了再释放）
+        (None, None, None),
+        (Some(Settled), None, Some(Released)),
         (Some(Settled), Some(Released), Some(Released)),
         (Some(Settled), None, Some(Released)),
         (Some(Released), None, None),

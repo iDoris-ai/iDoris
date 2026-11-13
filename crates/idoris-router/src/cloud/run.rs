@@ -37,6 +37,19 @@ use super::blocking::blocking;
 use super::clock::Clock;
 use super::executor::CloudError;
 
+/// 供应商请求号的摘要（儿童数据的请求存这个，不存原文）：`sha256:` 加 SHA-256 的前 16 个字节。
+pub(crate) fn supplier_id_digest(raw: &str) -> String {
+    use std::fmt::Write as _;
+
+    let digest = ring::digest::digest(&ring::digest::SHA256, raw.as_bytes());
+    let mut out = String::from("sha256:");
+    for byte in digest.as_ref().iter().take(16) {
+        // 写进 String 不会失败
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
+}
+
 /// 收尾的结果。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Settled {
@@ -187,6 +200,11 @@ impl RunState {
     }
 
     /// 记下供应商请求号（正文里的 id 优先，其次是配置的响应头）。格式不对的只留标注。
+    ///
+    /// **处理儿童数据的请求不原样落盘**（r3 Medium#1）：上游能把孩子写的东西（电话号码、哨兵……）回显成一个合法的
+    /// 「短标识」，而这一步发生在完整输出检查**之前**，原样存进账本就是把正文写进了磁盘，之后回答被拦也撤销不了。
+    /// 存的是它的 SHA-256 摘要（前 128 位，`sha256:<32 个十六进制字符>`）：对账时对供应商账单上的请求号做同样的摘要再比对，
+    /// 同一个供应商请求号出现在两个请求里的重复检测照样有效。
     pub(crate) fn record_supplier_id(
         &mut self,
         idx: AttemptIndex,
@@ -199,7 +217,15 @@ impl RunState {
         let Ok(id) = self.attempt_id(idx) else {
             return;
         };
-        match SupplierRequestId::new(raw) {
+        // 格式先按原文校验（不对的只留标注），再决定存什么
+        let stored = SupplierRequestId::new(raw).and_then(|valid| {
+            if self.requires_clearance {
+                SupplierRequestId::new(supplier_id_digest(valid.as_str()))
+            } else {
+                Ok(valid)
+            }
+        });
+        match stored {
             Err(_) => {
                 if let Err(error) = self.store.note_supplier_id_invalid(&id) {
                     eprintln!("[idoris] cloud: could not annotate supplier id: {error}");
