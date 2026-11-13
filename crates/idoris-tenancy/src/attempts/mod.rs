@@ -57,7 +57,12 @@ use thiserror::Error;
 #[cfg(test)]
 mod tests;
 
-const MIGRATION_0001: &str = include_str!("migrations/0001_compute_attempts.sql");
+/// 迁移按顺序执行，版本号 = 下标 + 1。**只能在末尾追加**，已经发布的文件不能改。
+/// 0001 是请求 / 尝试 / 转移日志 / 结算分录；0002 堵住 `INSERT OR REPLACE`（每张表的主键和唯一约束配「不许冲突」触发器）。
+const MIGRATIONS: &[&str] = &[
+    include_str!("migrations/0001_compute_attempts.sql"),
+    include_str!("migrations/0002_no_replace.sql"),
+];
 
 /// `usage_claim_json` 里上游原文的最大字节数（超出截断；只为对账时看一眼，不是账目）。
 const MAX_USAGE_CLAIM_BYTES: usize = 512;
@@ -1260,20 +1265,23 @@ fn run_migrations(conn: &mut Connection) -> Result<(), AttemptStoreError> {
             applied_at_ms INTEGER NOT NULL
         )",
     )?;
-    let applied: Option<i64> = tx
-        .query_row(
-            "SELECT version FROM compute_attempt_schema_migrations WHERE version = 1",
-            [],
-            |row| row.get(0),
-        )
-        .optional()?;
-    if applied.is_none() {
-        tx.execute_batch(MIGRATION_0001)?;
-        tx.execute(
-            "INSERT INTO compute_attempt_schema_migrations (version, applied_at_ms)
-             VALUES (1, CAST(strftime('%s','now') AS INTEGER) * 1000)",
-            [],
-        )?;
+    for (index, sql) in MIGRATIONS.iter().enumerate() {
+        let version = i64::try_from(index + 1).unwrap_or(i64::MAX);
+        let applied: Option<i64> = tx
+            .query_row(
+                "SELECT version FROM compute_attempt_schema_migrations WHERE version = ?1",
+                [version],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if applied.is_none() {
+            tx.execute_batch(sql)?;
+            tx.execute(
+                "INSERT INTO compute_attempt_schema_migrations (version, applied_at_ms)
+                 VALUES (?1, CAST(strftime('%s','now') AS INTEGER) * 1000)",
+                [version],
+            )?;
+        }
     }
     tx.commit()?;
     Ok(())

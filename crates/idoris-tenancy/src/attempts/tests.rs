@@ -140,7 +140,7 @@ fn migrations_are_idempotent_and_reopening_keeps_the_data() {
     let store = AttemptStore::open(&path).unwrap();
     let loaded = store.load_request(&rid("req-1")).unwrap().unwrap();
     assert_eq!(loaded, request);
-    // 版本表只有一行
+    // 版本表每个迁移一行（0001、0002），重开不重复应用
     let conn = store.lock();
     let versions: i64 = conn
         .query_row(
@@ -149,7 +149,7 @@ fn migrations_are_idempotent_and_reopening_keeps_the_data() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(versions, 1);
+    assert_eq!(versions, 2);
 }
 
 fn tempfile_dir() -> std::path::PathBuf {
@@ -444,6 +444,115 @@ fn history_and_postings_are_append_only_and_identity_is_immutable() {
         [],
     );
     assert!(err.is_err(), "state and state_json must agree");
+}
+
+/// PR-Daemon S1 F5：`INSERT OR REPLACE` 在主键 / 唯一约束冲突时先删旧行再插新行，而 `recursive_triggers` 默认关闭，
+/// DELETE 触发器不触发——「只追加」「身份不可改」「请求关闭后冻结」都能被它绕过去，直接改写已经落定的分录。
+/// 迁移 0002 给每张表的每个主键和唯一约束配一条 BEFORE INSERT 的「不许冲突」触发器（和账户、账本的迁移同一个做法）。
+#[test]
+fn insert_or_replace_cannot_rewrite_postings_events_requests_or_attempts() {
+    let (store, mut request) = started("req-replace");
+    apply(
+        &store,
+        &mut request,
+        0,
+        &[AttemptEvent::Dispatch, AttemptEvent::WireWriteStarted],
+        1,
+    );
+    apply(
+        &store,
+        &mut request,
+        0,
+        &[AttemptEvent::UsageReported { usage: usage() }],
+        2,
+    );
+    store
+        .record_publish(request.attempts()[0].id(), at(3))
+        .unwrap();
+    request.publish_first_byte(idx(0)).unwrap();
+    let plan = request.plan_settlement().unwrap();
+    store
+        .finalize_request(
+            &plan,
+            &[request.attempts()[0].id().clone()],
+            RequestClose {
+                outcome: RequestOutcome::Answered,
+                reason: None,
+                at: at(4),
+            },
+        )
+        .unwrap();
+    let (open_store, _open_request) = started("req-replace-open");
+
+    let postings_total = |store: &AttemptStore| -> i64 {
+        store
+            .lock()
+            .query_row(
+                "SELECT COALESCE(SUM(amount_micros), 0) FROM compute_postings",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+    };
+    let before = postings_total(&store);
+    assert!(before > 0, "the finalized request has postings");
+    {
+        let conn = store.lock();
+        for sql in [
+            // 分录：同一个 posting_id / 同一个幂等键，金额改成 0
+            "INSERT OR REPLACE INTO compute_postings
+                (posting_id, request_id, attempt_id, kind, role, basis, unit, amount_micros, idempotency_key, created_at_ms)
+             SELECT posting_id, request_id, attempt_id, kind, role, basis, unit, 0, idempotency_key, created_at_ms
+               FROM compute_postings",
+            "REPLACE INTO compute_postings
+                (request_id, attempt_id, kind, role, basis, unit, amount_micros, idempotency_key, created_at_ms)
+             SELECT request_id, attempt_id, kind, role, basis, unit, 0, idempotency_key, created_at_ms
+               FROM compute_postings",
+            // 转移日志
+            "INSERT OR REPLACE INTO compute_attempt_events (event_seq, attempt_id, from_state, event_json, to_state, at_ms)
+             SELECT event_seq, attempt_id, from_state, '{}', to_state, 0 FROM compute_attempt_events",
+            // 已经关闭的请求：改写它的付款账户和结算摘要
+            "INSERT OR REPLACE INTO compute_requests
+                (request_id, payment_json, payer_account, credential_id, price_unit, form, billing, stream, data_classes,
+                 created_at_ms, published_attempt, published_at_ms, outcome, reason_code, closed_at_ms, charged_micros,
+                 charged_basis, reserved_micros, overage_micros)
+             SELECT request_id, payment_json, 'someone-else', credential_id, price_unit, form, billing, stream, data_classes,
+                    created_at_ms, published_attempt, published_at_ms, outcome, reason_code, closed_at_ms, 0,
+                    charged_basis, reserved_micros, overage_micros
+               FROM compute_requests",
+        ] {
+            let result = conn.execute(sql, []);
+            assert!(result.is_err(), "must be refused: {sql}");
+        }
+    }
+    assert_eq!(postings_total(&store), before, "no posting was rewritten");
+    let payer: String = store
+        .lock()
+        .query_row("SELECT payer_account FROM compute_requests", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_ne!(payer, "someone-else");
+    // 还开着的请求里的尝试：身份和定价（预留额）不能被改写
+    let conn = open_store.lock();
+    let result = conn.execute(
+        "INSERT OR REPLACE INTO compute_attempts
+            (attempt_id, request_id, attempt_index, provider, model, endpoint, price_version, effective_max_tokens,
+             reserved_price_micros, reserved_price_unit, reserved_cost_micros, reserved_cost_unit, snapshot_json,
+             state, state_json, pays_user, created_at_ms, updated_at_ms)
+         SELECT attempt_id, request_id, attempt_index, provider, model, endpoint, 'pv-forged', effective_max_tokens,
+                0, reserved_price_unit, reserved_cost_micros, reserved_cost_unit, snapshot_json,
+                state, state_json, pays_user, created_at_ms, updated_at_ms
+           FROM compute_attempts",
+        [],
+    );
+    assert!(result.is_err(), "an attempt cannot be replaced");
+    let version: String = conn
+        .query_row("SELECT price_version FROM compute_attempts", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_ne!(version, "pv-forged");
 }
 
 /// 「用户只付一次」在数据库里也是结构保证：一个请求至多一个向用户收费的尝试、至多一条正的 user_price 分录。
