@@ -712,7 +712,7 @@ function row(label, stats) {
 
 function displayWidth(text) {
   let width = 0;
-  for (const ch of String(text)) width += /[^\u0000-\u00ff]/u.test(ch) ? 2 : 1;
+  for (const ch of String(text)) width += ch.codePointAt(0) > 0xff ? 2 : 1;
   return width;
 }
 
