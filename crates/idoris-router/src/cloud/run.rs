@@ -8,8 +8,8 @@
 //!   不继续）；
 //! - **先落库，再改内存**：对「先记 `WireWriteStarted` 再写字节」尤其重要——库写失败就**不发**；
 //! - **收尾恰好一次**（[`RunState::finalize`]）：算计划（S0 `plan_settlement`，纯函数）、同一个事务里把可结算的
-//!   尝试推进到 `settled`、追加分录、关闭请求。`Drop` 兜底：客户端断开、future 被取消、流被丢弃，都会走到这里，
-//!   所以不会留下永远「进行中」的请求；
+//!   尝试推进到 `settled`、追加分录、关闭请求。`Drop` 会再调一次 [`RunState::finalize`]：只有 `finalize_request` 成功之后
+//!   才把 `finalized` 设上，请求才关闭。收尾写库失败时只打印，`finalized` 保持 false，`Drop` 不再试，请求可以留在进行中；
 //! - **`maybe_executed` 的尝试不释放**：没有任何事件能结算它，它的成本以预留额挂账（`hold` 分录），状态保持，
 //!   等对账（设计稿 §6、ops §7）。
 //!

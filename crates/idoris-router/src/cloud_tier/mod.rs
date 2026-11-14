@@ -493,8 +493,9 @@ struct OwnedFinish {
 ///
 /// 看守多半是在异步任务里被丢掉的。`finish_call` 要等连接的互斥锁和 `BEGIN IMMEDIATE`（busy timeout 5 秒）：别的写事务占着库时，
 /// 同时挂断的几个云请求会把几个异步工作线程全卡住，同一个运行时上的其它请求和计时器也跑不动。所以 `drop` 只做两件不会等的事：
-/// 读一下时钟，把写入交给阻塞线程池（`spawn_blocking`，不等它）。写入在后台线程里做，库忙就重试几次，仍然保证落下；
-/// 实在落不下，这一行还是会在下次启动时被标成 `interrupted`（和进程崩溃同一条路）。
+/// 读一下时钟，把写入交给阻塞线程池（`spawn_blocking`，不等它）。写入在后台线程里做，库忙（`Sql`）时最多重试 3 次
+/// （[`write_cancelled`]）；三次都失败就打印并返回，这一行保持 `pending`，不保证落下。下次启动把它标成 `interrupted`
+/// （和进程崩溃同一条路）。
 /// 没有 tokio 运行时（同步环境、运行时已经销毁）就在当前线程直接写：那里没有异步工作线程可卡。
 struct PendingCall {
     store: Arc<CloudTierStore>,

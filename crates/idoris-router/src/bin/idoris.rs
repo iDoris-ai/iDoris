@@ -168,8 +168,10 @@ async fn real_main() -> u8 {
                 return 1;
             }
         }
-        // Device side of the cloud-account pairing (compute service S7). Reads and writes only the device credential
-        // file; opens no database, touches no Admin or local-key state.
+        // Device side of the cloud-account pairing (compute service S7). Reads and writes the device credential
+        // file; does not touch Admin state and does not rewrite local data keys. It does resolve the process
+        // database path (`cloud_tier::cli::load_from_env`). `unpair` read-only opens the virtual-key file
+        // (`VirtualKeyFileProbe`) so a local data key is never sent; it does not create that database or its tables.
         cli::Command::Cloud(command) => match idoris_router::cloud_tier::cli::run(command).await {
             Ok(0) => {}
             Ok(code) => return code,
@@ -345,9 +347,9 @@ async fn run(options: cli::ServeOptions) -> Result<(), String> {
     let startup_form = StartupForm::from_env_value(deploy_mode, form_raw.as_deref())
         .map_err(|err| format!("{} 无效：{err}", StartupForm::ENV_VAR))?;
     let dev_no_key_enabled = env_flag("IDORIS_DEV_NO_KEY");
-    // Compute service S5: only the cloud form may listen beyond loopback (with an explicit public configuration,
-    // checked below once the ingress configuration is loaded). Every other form parses `IDORIS_BIND_HOST` exactly
-    // as before.
+    // Compute service S5: the cloud form may listen on an explicit unicast address (the public configuration is
+    // checked below once the ingress configuration is loaded). Every other form still parses `IDORIS_BIND_HOST`
+    // with `parse_bind_host`: loopback, or a Tailscale tailnet address. Non-cloud forms are not loopback-only.
     let cloud = startup_form.is_cloud();
     if cloud && dev_no_key_enabled {
         return Err("IDORIS_DEV_NO_KEY=1 在云形态下不允许：云入口没有免密钥的路径".to_string());
