@@ -640,16 +640,26 @@ async fn a_kill_switch_opened_while_the_cloud_connect_is_still_waiting_matches_n
     use std::sync::atomic::Ordering;
 
     let queue = HeldQueue::bind();
-    let saw_leftover = tcp_syn_sent_to(queue.addr.port());
+    let Some(mut saw_leftover) = observe_syn(queue.addr.port()) else {
+        return;
+    };
     // 填队列时那次超时的探测连接可能还留着 SYN；等它消失，避免把别人的 SYN 当成被测请求。
     for _ in 0..50 {
-        if !tcp_syn_sent_to(queue.addr.port()) {
-            break;
+        match observe_syn(queue.addr.port()) {
+            Some(false) => {
+                saw_leftover = false;
+                break;
+            }
+            Some(true) => saw_leftover = true,
+            None => return,
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+    let Some(still_there) = observe_syn(queue.addr.port()) else {
+        return;
+    };
     assert!(
-        !tcp_syn_sent_to(queue.addr.port()),
+        !still_there,
         "a SYN was still in flight before the request started (leftover={saw_leftover})"
     );
 
@@ -684,9 +694,13 @@ async fn a_kill_switch_opened_while_the_cloud_connect_is_still_waiting_matches_n
         tokio::spawn(async move { send_chat(&app, chat_body("small"), &[ANY, CONSENT]).await });
     let mut saw_syn = false;
     for _ in 0..300 {
-        if tcp_syn_sent_to(queue.addr.port()) {
-            saw_syn = true;
-            break;
+        match observe_syn(queue.addr.port()) {
+            Some(true) => {
+                saw_syn = true;
+                break;
+            }
+            Some(false) => {}
+            None => return,
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
@@ -742,6 +756,170 @@ async fn a_kill_switch_opened_while_the_cloud_connect_is_still_waiting_matches_n
         payloads.iter().all(|bytes| !bytes.starts_with(b"POST")),
         "the cloud received a request body while the connect was still waiting: {payloads:?}"
     );
+}
+
+/// 假云端读完整个请求正文后不回应，这时打开熔断。正文已经离开本机，响应必须带
+/// `X-iDoris-Cloud-Attempt`，记录行仍是 `cancelled`。
+#[tokio::test]
+async fn a_kill_switch_after_the_cloud_read_the_whole_body_sets_the_attempt_header() {
+    use std::io::Read;
+    use std::sync::atomic::Ordering;
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let ready = Arc::new(AtomicBool::new(false));
+    let seen = ready.clone();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 2048];
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            match stream.read(&mut tmp) {
+                Ok(0) => break,
+                Ok(n) => {
+                    buf.extend_from_slice(&tmp[..n]);
+                    if request_body_complete(&buf) {
+                        break;
+                    }
+                }
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock
+                        || error.kind() == std::io::ErrorKind::TimedOut =>
+                {
+                    if request_body_complete(&buf) {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        seen.store(true, Ordering::SeqCst);
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+        let mut rest = [0u8; 64];
+        let _ = stream.read(&mut rest);
+        buf
+    });
+
+    let dir = tempfile::tempdir().unwrap();
+    let secret = format!("idk_{}", "c".repeat(64));
+    let file = node_file(dir.path(), &secret);
+    let yaml = tier_config_for(
+        &format!("http://{addr}/api"),
+        None,
+        &format!(
+            "credential: {{source: node_file, file: {}}}",
+            file.display()
+        ),
+        "limits: {connect_timeout_ms: 2000, total_timeout_ms: 30000}",
+    );
+    let tier = make_tier(
+        parse_tier_config(&yaml),
+        Arc::new(idoris_router::cloud_tier::credential::NodeFileProvider::new(&file, None)),
+        &dir.path().join("tier.sqlite3"),
+    );
+    let switch = Arc::new(AtomicBool::new(false));
+    let mut options = NodeOptions::new(Scenario::RuntimeOffline, Some(tier.clone()));
+    options.shared_kill_switch = Some(switch.clone());
+    let node = LocalNode::build(options);
+    let app = node.app.clone();
+    let request =
+        tokio::spawn(async move { send_chat(&app, chat_body("small"), &[ANY, CONSENT]).await });
+
+    let started = std::time::Instant::now();
+    while !ready.load(Ordering::SeqCst) {
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the fake cloud never finished reading the request body"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    switch.store(true, Ordering::SeqCst);
+    let with = tokio::time::timeout(Duration::from_secs(2), request)
+        .await
+        .expect("the fallback stayed blocked after the cloud had the body")
+        .unwrap();
+    let received = server.join().unwrap();
+    assert!(
+        request_body_complete(&received),
+        "the fake cloud did not receive a complete request: {received:?}"
+    );
+    assert!(
+        String::from_utf8_lossy(&received).contains("hello cloud tier"),
+        "the request body never arrived: {received:?}"
+    );
+    assert_eq!(
+        with.header("x-idoris-cloud-attempt"),
+        Some("cancelled"),
+        "a body that already left must not look like zero egress: {}",
+        with.text()
+    );
+    let rows = tier.store().calls_after(0, 10).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].state, CallState::Final(CallOutcome::Cancelled));
+    assert_eq!(
+        (
+            rows[0].cloud_record_id.clone(),
+            rows[0].http_status,
+            rows[0].tokens_in,
+            rows[0].tokens_out
+        ),
+        (None, None, None, None)
+    );
+}
+
+/// 探测不可用时打印原因并让测试返回。不能把「看不了」当成「没有 SYN」。
+fn observe_syn(port: u16) -> Option<bool> {
+    match tcp_syn_sent_to(port) {
+        Ok(seen) => Some(seen),
+        Err(reason) => {
+            eprintln!("skipped: 无法观察 SYN_SENT（{reason}）");
+            None
+        }
+    }
+}
+
+#[test]
+fn proc_net_tcp_syn_sent_is_state_02_on_the_remote_port() {
+    let port = 0x1F90;
+    let syn = format!(
+        "   0: 0100007F:C3A2 0100007F:{port:04X} 02 00000000:00000000 00:00000000 00000000     0        0 0 1 0000000000000000 100 0 0 10 0"
+    );
+    let established = syn.replace(" 02 ", " 01 ");
+    let other_port = syn.replace(&format!("{port:04X}"), "0050");
+    let text = format!("  sl  local_address rem_address   st tx_queue rx_queue\n{syn}\n");
+    assert!(proc_net_tcp_has_syn_sent(&text, port));
+    assert!(!proc_net_tcp_has_syn_sent(&established, port));
+    assert!(!proc_net_tcp_has_syn_sent(&other_port, port));
+    assert!(!proc_net_tcp_has_syn_sent(
+        "  sl  local_address rem_address   st tx_queue rx_queue\n",
+        port
+    ));
+}
+
+fn request_body_complete(buf: &[u8]) -> bool {
+    let Some(split) = buf.windows(4).position(|window| window == b"\r\n\r\n") else {
+        return false;
+    };
+    let Ok(head) = std::str::from_utf8(&buf[..split]) else {
+        return false;
+    };
+    let body = &buf[split + 4..];
+    for line in head.split("\r\n") {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        if name.eq_ignore_ascii_case("content-length") {
+            let Ok(len) = value.trim().parse::<usize>() else {
+                return false;
+            };
+            return body.len() >= len && len > 0;
+        }
+    }
+    false
 }
 
 // ------------------------------------------------------------------------------------------------

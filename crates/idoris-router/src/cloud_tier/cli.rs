@@ -28,7 +28,7 @@ use serde_json::json;
 
 use super::config::{CONFIG_ENV, CloudTierConfig, CredentialSourceConfig};
 use super::credential::{
-    CredentialError, CredentialProvider, DeviceRecord, DeviceStore, LocalSecretProbe,
+    CredentialError, CredentialProvider, DeviceRecord, DeviceStore, LOCK_FILE, LocalSecretProbe,
     NodeEnvProvider, NodeFileProvider, StateLock,
 };
 use super::pairing::{DEFAULT_DEVICE_LABEL, PairingClient, PairingError, validate_device_label};
@@ -67,6 +67,31 @@ fn lock_busy_message(store: &DeviceStore) -> String {
          请稍后重试。这个命令什么都没做（没有兑换配对码，也没有动凭证）",
         store.dir().display()
     )
+}
+
+/// 锁文件打不开、不是普通文件、或权限过宽。点名 `<state_dir>/.lock` 的完整路径。
+/// 「请稍后重试」只留给 [`lock_busy_message`]（别人正占着锁）；这里重试解决不了符号链接、FIFO 或权限。
+fn lock_unusable_message(
+    store: &DeviceStore,
+    error: &CredentialError,
+    during_pair: bool,
+) -> String {
+    let lock_path = store.dir().join(LOCK_FILE);
+    let done = if during_pair {
+        "没有兑换配对码，这个命令什么都没做"
+    } else {
+        "这个命令什么都没做"
+    };
+    match error {
+        CredentialError::InsecureFile => format!(
+            "设备凭证目录的锁文件 \"{}\" 不能用（不是普通文件，比如符号链接或 FIFO，或者其他用户能读写它）：{done}",
+            lock_path.display()
+        ),
+        other => format!(
+            "无法获取设备凭证目录的锁文件 \"{}\"（{other}）：{done}",
+            lock_path.display()
+        ),
+    }
 }
 
 /// `idoris cloud …` 的子命令。
@@ -177,17 +202,15 @@ pub async fn run_pair(
         // 配对总会去建目录；仍然没有拿到锁就不能兑换（配对码是一次性的）
         Ok(None) => {
             return Err(format!(
-                "无法获取设备凭证目录 \"{}\" 的锁：没有兑换配对码，这个命令什么都没做，请稍后重试",
+                "无法获取设备凭证目录 \"{}\" 的锁：没有兑换配对码，这个命令什么都没做",
                 store.dir().display()
             ));
         }
         Err(CredentialError::Busy) => return Err(lock_busy_message(&store)),
-        // 目录建不出来、锁文件写不了、锁文件不是一把安全的锁：和预检一样，兑换之前就停下
+        // 目录建不出来、锁文件写不了、锁文件不是一把安全的锁：和预检一样，兑换之前就停下。
+        // 锁文件自己的问题（符号链接、FIFO、权限过宽）必须点名 `.lock`，不能套用「云凭证文件」的文案。
         Err(error) => {
-            return Err(format!(
-                "设备凭证目录 \"{}\" 不能写入（{error}）：没有兑换配对码，这个命令什么都没做，请稍后重试",
-                store.dir().display()
-            ));
+            return Err(lock_unusable_message(&store, &error, true));
         }
     };
 
@@ -407,7 +430,8 @@ fn report_not_paired(stdout: &mut dyn Write, stderr: &mut dyn Write) -> Result<u
 }
 
 /// `idoris cloud unpair`：云端撤销 + 删除本机凭证。**拿到锁之后，本机凭证无论如何都会删除**。
-/// 没拿到锁则什么都不删：别人占着锁、锁文件不能用，退出码 1，请稍后重试；目录当时不存在，按没有配对（退出码 0）。
+/// 没拿到锁则什么都不删：别人占着锁时退出码 1，请稍后重试；锁文件不能用同样是退出码 1，但报错点名
+/// `<state_dir>/.lock` 的完整路径，不说「稍后重试」（重试解决不了符号链接、FIFO 或权限）。目录当时不存在，按没有配对（退出码 0）。
 ///
 /// 凭证发往云端之前和推理路径一样先问本地密钥探针（`ctx.probe`）：认得（本机的本地数据密钥误填进了设备凭证文件）就**不发**，
 /// 只删本地文件，按「本机已删、云端未确认」处理（退出码 2，`reason: local_key_refused`）。
@@ -433,10 +457,7 @@ pub async fn run_unpair(
         Ok(None) => return report_not_paired(stdout, stderr),
         Err(CredentialError::Busy) => return Err(lock_busy_message(&store)),
         Err(error) => {
-            return Err(format!(
-                "无法获取设备凭证目录 \"{}\" 的锁（{error}）：这个命令什么都没做，请稍后重试",
-                store.dir().display()
-            ));
+            return Err(lock_unusable_message(&store, &error, false));
         }
     };
     let (record, unreadable) = match store.read() {
@@ -643,6 +664,28 @@ mod tests {
         }
     }
 
+    /// 锁文件被拒时，错误必须点名这把锁的完整路径，并且不能叫人「稍后重试」（那句只属于锁被别人占着）。
+    /// 也不能再套用凭证文件的文案（「云凭证文件」），那是另一份文件。
+    fn assert_lock_file_refusal(error: &str, lock_path: &Path) {
+        let path = lock_path.display().to_string();
+        assert!(
+            error.contains(&path),
+            "error must name the lock file {path}: {error}"
+        );
+        assert!(
+            error.contains("锁文件"),
+            "error must say this is the lock file: {error}"
+        );
+        assert!(
+            !error.contains("稍后重试"),
+            "only a busy lock asks the operator to retry shortly: {error}"
+        );
+        assert!(
+            !error.contains("云凭证文件"),
+            "the lock file was described as the credential file: {error}"
+        );
+    }
+
     fn make_fifo(path: &Path) {
         let made = std::process::Command::new("mkfifo")
             .arg(path)
@@ -683,14 +726,8 @@ mod tests {
             started.elapsed() < Duration::from_secs(2),
             "pair hung on the lock file: {pair_err}"
         );
-        assert!(
-            pair_err.contains("请稍后重试") && pair_err.contains("没有兑换配对码"),
-            "{pair_err}"
-        );
-        assert!(
-            pair_err.contains("不是普通文件") || pair_err.contains("符号链接"),
-            "{pair_err}"
-        );
+        assert!(pair_err.contains("没有兑换配对码"), "{pair_err}");
+        assert_lock_file_refusal(&pair_err, &fifo);
         assert_eq!(std::fs::read(store.path()).unwrap(), before);
 
         let started = Instant::now();
@@ -702,10 +739,8 @@ mod tests {
             started.elapsed() < Duration::from_secs(2),
             "unpair hung on the lock file: {unpair_err}"
         );
-        assert!(
-            unpair_err.contains("请稍后重试") && unpair_err.contains("什么都没做"),
-            "{unpair_err}"
-        );
+        assert!(unpair_err.contains("什么都没做"), "{unpair_err}");
+        assert_lock_file_refusal(&unpair_err, &fifo);
         assert_eq!(
             std::fs::read(store.path()).unwrap(),
             before,
@@ -736,18 +771,16 @@ mod tests {
         let pair_err = run_pair(harness.ctx(), None, &mut stdin, &mut stdout, &mut stderr)
             .await
             .expect_err("pair must refuse a symlink lock");
-        assert!(
-            pair_err.contains("请稍后重试")
-                && (pair_err.contains("不是普通文件") || pair_err.contains("符号链接")),
-            "{pair_err}"
-        );
+        assert!(pair_err.contains("没有兑换配对码"), "{pair_err}");
+        assert_lock_file_refusal(&pair_err, &state.join(LOCK_FILE));
 
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         let unpair_err = run_unpair(harness.ctx(), &mut stdout, &mut stderr)
             .await
             .expect_err("unpair must refuse a symlink lock");
-        assert!(unpair_err.contains("请稍后重试"), "{unpair_err}");
+        assert!(unpair_err.contains("什么都没做"), "{unpair_err}");
+        assert_lock_file_refusal(&unpair_err, &state.join(LOCK_FILE));
         assert_eq!(std::fs::read(store.path()).unwrap(), before);
         // 没有跟着符号链接去锁目标文件
         assert!(
