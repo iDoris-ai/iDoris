@@ -27,8 +27,10 @@
 //! 8. 交给处理函数。非流式的 JSON 回答（带确切的 `Content-Length`）处理完就释放并发名额；流式响应的响应体持有名额，
 //!    直到整个流发完、出错或客户端断开。
 //!
-//! 控制面（`/control/v1`，只有配置里 `control_plane.public: true` 才挂）不经过上面这些：它自己认证、自己授权。
-//! 只给它加了一道请求体读取期限（慢请求），其它一概不动。
+//! 控制面（`/control/v1`，只有配置里 `control_plane.public: true` 才挂）不经过 `edge_guard` 和 `data_plane_guard`：
+//! 它自己认证、自己授权，边缘是 `control_edge`（只解析客户端来源，不读 CORS 配置、不答预检、不加 CORS 响应头）。
+//! 它仍然经过最外层的 `strip_untrusted_headers`、`record_id_middleware`、`request_lifecycle`，再加一道请求体读取期限
+//! （`control_body_deadline`）。挂载见 `build_cloud_app`。
 
 use std::net::{IpAddr, Ipv4Addr};
 use std::pin::Pin;

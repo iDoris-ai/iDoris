@@ -19,9 +19,12 @@
 //!
 //! # 默认关闭
 //!
-//! 只有设了环境变量 [`config::CONFIG_ENV`]（`IDORIS_CLOUD_UPSTREAM_CONFIG`）、并且 `deploy_mode=tenant`
-//! （云形态映射到既有的 `tenant`）才会启用；不设就是 `AppState::cloud == None`，`build_app` 挂的还是原来的
-//! 处理函数，**现有的本地 oMLX 路径、订阅中转和全部既有 HTTP 行为一字不变**。个人形态永远不会把请求送到云上游
+//! 启动入口是 [`CloudUpstream::from_env_for_form`]：云形态（`IDORIS_FORM=cloud`）没设
+//! [`config::CONFIG_ENV`]（`IDORIS_CLOUD_UPSTREAM_CONFIG`）是启动错误，不是 `None`；非云形态设了这个变量也是启动错误。
+//! 非云且没设才是 `AppState::cloud == None`，`build_app` 挂的还是原来的处理函数，
+//! **现有的本地 oMLX 路径、订阅中转和全部既有 HTTP 行为一字不变**。
+//! 旧入口 [`CloudUpstream::from_env`] 仍只看 `deploy_mode=tenant`（设了且是 tenant 才启用），启动不用它。
+//! 个人形态永远不会把请求送到云上游
 //! （「个人 iDoris 不改成 SaaS」，设计稿 §1 决定 4；`local_only` 失败即关闭）。
 //!
 //! # 交接给 S1 / S3 / S5 / S6
@@ -158,7 +161,7 @@
 //!     来自 `config/compute/endpoint-urls.md`）；主机没核实的供应商不能配置到非回环地址；**没有登记主机的供应商（许可表的新行、
 //!     `example-*`）默认拒绝非回环地址**（原来不受限：新增一条允许儿童数据的已审核行之后，它的 `base_url` 能误指任意 HTTPS 主机）。
 //!     更彻底的做法（把主机写进许可表的 schema，由 S0 校验、路由时一起过滤）要改契约，没做（需要 owner 确认）。儿童安全的 LLM 检查端点
-//!     （`safety/config.rs`）同样应该过这条检查，那一处不在本次改动范围内。
+//!     在 `safety/config.rs` 的 `build_judge` 里调用同一个 `check_provider_host`，不依赖 `endpoints:` 逐行校验先跑过。
 //! 34. **已发送的尝试报 0 用量按 0 结算**（用户付 0、平台成本 0）。真实分词器不会给非空提示算出 0 个输入 token，这多半说明上游出错了：
 //!     是否按最小值收、或按「用量未知」处理，要 owner 定；`cloud_r2_fixes` 里有一条测试钉住今天的行为。
 //! 35. **迟到 usage 对账**（`AttemptStore::reconcile_late_usage`）只处理没有向用户收费的 `maybe_executed` 尝试：冲销旧挂账、记实际成本、
