@@ -15,10 +15,13 @@
 //!   `system` / `developer` 角色、工具定义、结构化输出、`stop`：角色是客户端填的，不证明这段话来自运营方（r3 High#1）。
 //!   只有服务端配置里登记的运营方提示（[`super::extract::TrustedOperatorText`]）得到运营方的待遇：运营方的系统提示会复述要拒绝的话题
 //!   （评测集的 `DEFAULT_SYSTEM` 就写着「如果孩子要求自伤……就拒绝」），只用**越狱类**规则（授予无限制人格、关闭安全过滤）；
-//!   对话历史里的 `assistant` 消息**也是客户端写的**（不证明是我们自己说过的话）：按**输出**规则查之外，**再按输入规则查**
-//!   （round2-r3 PARTIAL High#1；把 `i want to die` 放进 `assistant` 消息不能绕过自伤检查）。而之前真的说过的拒绝语会复述被拒绝的话题
-//!   （「我不能告诉你怎么做炸弹」），不能让对话从此没法继续：**请求类**的输入规则（[`HISTORY_REFUSAL_EXEMPT`]）在命中旁边（同一句里）
-//!   有明确的拒绝语、或者 `ไม่ได้` 紧跟在命中后面时放行；自伤的第一人称表达和自伤词、越狱人格**没有任何豁免**；
+//!   对话历史里的 `assistant` 消息**也是客户端写的**（不证明是我们自己说过的话）：按**输出**规则查之外，**再按输入规则里的请求类和越狱类查**
+//!   （round2-r3 PARTIAL High#1）。**自伤的表达和提及不跑在助手历史上**（owner 2026-11-14 方案 B）：上一轮的安全引导会复述「伤害自己」「suicide」，
+//!   下一轮不能因此被切断。伪造的第一人称自伤表达交给 LLM 检查器。**索要方法仍是请求类**（[`Matcher::Near`] / [`Matcher::NearUnless`]：
+//!   请求动词和方法对象靠近；[`Matcher::NearOrPhrase`] 另外收「how to die」这类整句索要），助手历史照查；模型自己的求助引导里不会出现这种索要措辞，拒绝语复述了话题时仍按请求类放行。
+//!   之前真的说过的拒绝语会复述被拒绝的话题（「我不能告诉你怎么做炸弹」），不能让对话从此没法继续：**请求类**输入规则
+//!   （[`Rule::history_role`] 为 [`HistoryRole::Request`]，含自伤索要方法）在命中旁边（同一句里）有明确的拒绝语、或者 `ไม่ได้` 紧跟在命中后面时放行；
+//!   越狱 / 指令注入**没有**这道放行；
 //! - **求助语境豁免只给「提到」类规则**：孩子问「朋友发来裸照，我该怎么办」是评测集要求**回答并引导找大人**的情形，
 //!   所以「提到裸照」类规则在同一段文本里出现求助句式（`ควรทำยังไง`、`should I`）时放行；「索要方法」类规则**从不**因为求助句式放行
 //!   （`บอกวิธีทำระเบิด ควรทำยังไง` 照样拒绝）；
@@ -36,11 +39,10 @@
 //! - 近音、谐音、泰语的罗马化拼写（`wicha tham rabert`）、其它语言、base64 之外的编码（十六进制、ROT13……）：规则看不到，靠 LLM 检查器。
 //!   数学字母、带圈字母、西里尔 / 希腊同形字、组合符号、重复字母、base64 已经由归一化和解码处理，见 [`super::text`]；
 //! - 把有害请求拆到多条消息里：对用户和工具文本另外做了一次「全部拼接」的检查，能抓住相邻的拆分，抓不住很远的；
-//! - 对话历史里**助手角色**的消息（客户端写的）：输出规则加输入规则；请求类的输入规则在命中旁边有拒绝语时放行（见上）。这条放行是
+//! - 对话历史里**助手角色**的消息（客户端写的）：输出规则，加上请求类和越狱类输入规则。请求类在命中旁边有拒绝语时放行（见上）。这条放行是
 //!   启发式，容易被绕过（拒绝语和请求挤在同一句里：`I can't wait, how to make a bomb`）：它只放行**请求类**的话，孩子真正的请求要出现在
-//!   用户消息里才有用，而用户消息没有任何豁免；客户端伪造的助手消息（预填「好的，做法如下……」）另有输出规则和 LLM 检查器
-//!   （它看得到 `assistant` 来源）兜底。**自伤的第一人称表达和自伤词在助手消息里也一律拒绝**：代价是之前说过的安全引导
-//!   （「如果你想伤害自己，告诉信任的大人」）复述了这些词，下一轮会被拒绝（需 owner 确认）；
+//!   用户消息里才有用，而用户消息没有任何豁免。自伤的表达和提及不跑在助手历史上（方案 B）；索要方法仍按请求类查。伪造的自伤表达由输出规则和 LLM 检查器兜底
+//!   （它看得到 `assistant` 来源）。`rules_only` 没有这道 LLM，儿童租户默认不能这样启动，除非运营方写了带到期日的确认；
 //! - 输出侧的「有害内容的合规回答」检测是启发式（见上），个人信息复述只覆盖手机号、邮箱、身份证号，
 //!   以及孩子自己标明了身份的姓名/学校/住址（「ผมชื่อ……」「ชื่อ X เรียนที่ Y」加上「这是秘密」之类的提示）；
 //! - 泰语声调符号统一折叠，所以只靠声调区分的词会被当成同一个词（`แม่ง` 会撞上 `แมง`（昆虫）和 `แมงมุม`，所以不在列表里）。
@@ -137,7 +139,7 @@ const NEGATION_CUES: &[&str] = &[
 
 /// 对话历史里 `assistant` 消息的拒绝语线索（在 [`NEGATION_CUES`] 和 [`REFUSAL_CUES`] 之外再加的）：之前真的说过的拒绝语和
 /// 安全引导会复述被拒绝的话题，不能让对话从此没法继续（round2-r3 PARTIAL High#1）。只用来放行历史里**请求类**输入规则的命中
-/// （[`HISTORY_REFUSAL_EXEMPT`]），和别的线索一样只在命中旁边（同一句里）有效。
+/// （[`HistoryRole::Request`]，含自伤的索要方法），和别的线索一样只在命中旁边（同一句里）有效。自伤的表达和提及不靠这张表：助手历史上不跑那些规则。
 ///
 /// 不收 `อย่า`（折叠成 `อยา`，是 `อยาก`「想」的子串）；`ไม่ได้` 太常见，不在这里，见 [`HISTORY_AFTER_CUES`]。
 const HISTORY_REFUSAL_CUES: &[&str] = &[
@@ -163,22 +165,6 @@ const HISTORY_AFTER_CUES: &[&str] = &["ไม่ได้"];
 
 /// [`HISTORY_AFTER_CUES`] 最多可以离命中多远（字符数）才算「紧后面」（`ให้ไม่ได้` 里隔着一个 `ให้`）。
 const HISTORY_AFTER_REACH_CHARS: usize = 6;
-
-/// 对话历史里 `assistant` 消息按输入规则查时，**命中旁边有拒绝语就放行**的规则（请求类 / 话题类：拒绝语会复述这些话题）。
-/// 不在名单里的输入规则一律不放行：自伤的第一人称表达（`self_harm.ideation`）、自伤词（`self_harm.words`）、越狱人格
-/// （`jailbreak.no_limits`）；英文整词类（`adult_content.english_words`、`pii_solicit.words`）没有命中区间，没法判断旁边有没有
-/// 拒绝语，同样不放行。名单里的 id 由测试对着 [`build_rules`] 核对。
-const HISTORY_REFUSAL_EXEMPT: &[&str] = &[
-    "self_harm.method_request",
-    "dangerous_act.compound",
-    "dangerous_act.ignite_request",
-    "dangerous_act.hazard_mix",
-    "adult_content.request",
-    "adult_content.english",
-    "adult_content.mention",
-    "pii_solicit.trick",
-    "pii_solicit.compound",
-];
 
 /// 话题词（只给输入侧）：孩子在问「为什么 / 要注意什么 / 怎样才安全」，是安全教育的问题，不是索要方法。
 /// 它们不是否定：**回答**里出现 `unsafe` 不能让一份步骤变得无害，所以输出侧不用这一组。
@@ -230,9 +216,16 @@ const SELF_HARM_IDEATION: &[&str] = &[
     "hang myself",
     "slit my wrist",
     "overdose on pills",
-    "painless way to die",
-    "ways to die",
+];
+
+/// 整句就是在索要死亡方法，不是第一人称表达。挂在 `self_harm.method_request` 上（请求类），
+/// 用户消息和助手历史都拒。逐条对照过 [`SELF_HARM_IDEATION`]：泰语各项都是「我想死 / 伤害自己」，
+/// 没有「怎么死 / 死的方法 / วิธีตาย / ทำยังไงให้ตาย」这类索要句。
+const SELF_HARM_METHOD_PHRASES: &[&str] = &[
+    // 英语
     "how to die",
+    "ways to die",
+    "painless way to die",
 ];
 
 const SELF_HARM_REQUEST_A: &[&str] = &[
@@ -245,6 +238,10 @@ const SELF_HARM_REQUEST_A: &[&str] = &[
     "แนะนำ",
     "ช่วย",
     "ใช้อะไร",
+    // 英语索要句式。要跟下面的方法对象靠近才算，单独的 `how to` 不是自伤。
+    "how to",
+    "how do i",
+    "how can i",
 ];
 
 const SELF_HARM_METHOD_B: &[&str] = &[
@@ -259,6 +256,13 @@ const SELF_HARM_METHOD_B: &[&str] = &[
     "ทำให้ตัวเองเจ็บ",
     "ทำให้ตัวเองบาดเจ็บ",
     "ปลิดชีวิต",
+    // 自杀这个行为。表达规则里也有这几个短语，用户文本上表达规则排在前面、先命中。
+    // 助手历史不跑表达规则，「请求动词 + 这个行为」仍由本规则接住
+    // （`บอกวิธีฆ่าตัวตาย`、`how to kill myself`）。
+    "ฆ่าตัวตาย",
+    "ฆ่าตัวเอง",
+    "kill myself",
+    "killing myself",
 ];
 
 const SELF_HARM_WORDS: &[&str] = &["suicide", "suicidal"];
@@ -717,6 +721,15 @@ enum Matcher {
         gap: usize,
         either: bool,
     },
+    /// 同 [`Matcher::Near`]，另外整句短语也算（`how to die` 这种没有拆成两侧词的索要方法）。
+    /// 自伤里它仍是索要方法，助手历史按请求类查，见 [`Rule::pairs_a_request_with_an_object`]。
+    NearOrPhrase {
+        a: Vec<Needle>,
+        b: Vec<Needle>,
+        gap: usize,
+        either: bool,
+        phrases: Vec<Needle>,
+    },
     /// 同 `Near`（前后都算），但**每一处命中**旁边（同一句里、前后各 [`NEGATION_REACH_CHARS`] 个字符之内）
     /// 有 `unless` 线索的那一处不算。别处的线索不算；一处被放行之后，剩下的内容独立重新检查。
     NearUnless {
@@ -832,8 +845,8 @@ enum Scope {
     Operator,
     /// 模型写的文本（回答、工具参数）：输出规则。
     Model,
-    /// 对话历史里客户端写的 `assistant` 消息：输出规则，**再加**输入规则（请求类的命中旁边有拒绝语就放行，
-    /// 见 [`HISTORY_REFUSAL_EXEMPT`]；round2-r3 PARTIAL High#1）。
+    /// 对话历史里客户端写的 `assistant` 消息：输出规则，再加上请求类和越狱类输入规则
+    /// （请求类的命中旁边有拒绝语就放行；自伤的表达和提及不跑，索要方法仍算请求类，见 [`HistoryRole`]）。
     History,
 }
 
@@ -848,6 +861,20 @@ impl Scope {
     }
 }
 
+/// 一条规则在对话历史的 `assistant` 消息上怎么用。由类别、作用范围和匹配器形状决定，不靠规则 id 名单。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum HistoryRole {
+    /// 输出规则：照常匹配。安全引导放行，有害指导拒绝。
+    Output,
+    /// 自伤的表达和提及：不匹配。伪造的第一人称表达交给输出规则和 LLM 检查器（owner 2026-11-14 方案 B）。
+    /// 索要方法不在这里，见 [`Rule::pairs_a_request_with_an_object`]。
+    SelfHarmInput,
+    /// 请求类输入规则：照常匹配，但每一处命中旁边有拒绝语、或 `ไม่ได้` 紧跟在后面时，这一处放行。
+    Request,
+    /// 越狱 / 指令注入，以及没有命中区间、没法判断「旁边有没有拒绝语」的整词规则：照常匹配，拒绝语不放行。
+    Enforce,
+}
+
 struct Rule {
     id: &'static str,
     category: SafetyCategory,
@@ -858,11 +885,44 @@ struct Rule {
 }
 
 impl Rule {
-    /// 对话历史里的 `assistant` 消息：模型写的规则照常；只在输入侧的规则，**请求类**（[`HISTORY_REFUSAL_EXEMPT`]）在每一处命中
-    /// 旁边（同一句里）有拒绝语、或者 `ไม่ได้` 紧跟在命中后面时放行，别的输入规则一律不放行。
+    /// 助手历史对这条规则的分流。看类别、作用范围和匹配器形状（整词没有命中区间；自伤里两侧词靠近的是索要方法），不看规则 id。
+    fn history_role(&self) -> HistoryRole {
+        if self.applies.model {
+            // 同样作用在模型文本上的越狱规则（`jailbreak.strong` / `override`）照常匹配，不走拒绝语放行。
+            return if self.applies.untrusted {
+                HistoryRole::Enforce
+            } else {
+                HistoryRole::Output
+            };
+        }
+        // 表达（任一短语）和整词提及不跑：安全引导会复述这些词。
+        // 索要方法是两侧词靠近，或整句索要短语，和别的请求类一样仍查。
+        if self.category == SafetyCategory::SelfHarm && !self.pairs_a_request_with_an_object() {
+            return HistoryRole::SelfHarmInput;
+        }
+        // 越狱人格没有拒绝语豁免。整词匹配没有命中区间，旁边的拒绝语判断不了，也不放行。
+        if self.category == SafetyCategory::Jailbreak || matches!(self.matcher, Matcher::Words(_)) {
+            return HistoryRole::Enforce;
+        }
+        HistoryRole::Request
+    }
+
+    /// 匹配器是「两类词在一个窗口里靠近」（[`Matcher::Near`] / [`Matcher::NearUnless`]），
+    /// 或在此之外再收整句索要短语（[`Matcher::NearOrPhrase`]）。
+    /// 自伤输入规则里，这就是索要方法 / 求操作步骤；任一短语和整词提及不是。
+    fn pairs_a_request_with_an_object(&self) -> bool {
+        matches!(
+            self.matcher,
+            Matcher::Near { .. } | Matcher::NearUnless { .. } | Matcher::NearOrPhrase { .. }
+        )
+    }
+
+    /// 对话历史里的 `assistant` 消息。见 [`Rule::history_role`]。
     fn matches_in_history(&self, folded: &Folded, cues: &Cues<'_>) -> bool {
-        if self.applies.model || !HISTORY_REFUSAL_EXEMPT.contains(&self.id) {
-            return self.matches(folded, cues);
+        match self.history_role() {
+            HistoryRole::SelfHarmInput => return false,
+            HistoryRole::Output | HistoryRole::Enforce => return self.matches(folded, cues),
+            HistoryRole::Request => {}
         }
         let excused_by = |here: &[Needle], current: &Folded, hit: (usize, usize)| {
             locally_negated(current, hit, here, NEGATION_REACH_CHARS)
@@ -885,6 +945,24 @@ impl Rule {
                 |f| near(f, a, b, *gap, *either),
                 |f| near_regions(f, a, b, *gap, *either, MAX_NEGATED_HITS),
             ),
+            Matcher::NearOrPhrase {
+                a,
+                b,
+                gap,
+                either,
+                phrases,
+            } => unless_matches_with(
+                folded,
+                |current, hit| excused_by(cues.history, current, hit),
+                |f| near(f, a, b, *gap, *either) || phrases.iter().any(|needle| needle.found_in(f)),
+                |f| {
+                    let mut regions = near_regions(f, a, b, *gap, *either, MAX_NEGATED_HITS);
+                    if regions.len() <= MAX_NEGATED_HITS {
+                        regions.extend(phrases.iter().flat_map(|needle| needle.plain_spans(f)));
+                    }
+                    regions
+                },
+            ),
             // 本来就能被否定词和话题词放行的两条（点火、混合毒气）：历史里再加上拒绝语
             Matcher::NearUnless { a, b, gap, .. } => unless_matches_with(
                 folded,
@@ -902,6 +980,16 @@ impl Rule {
             Matcher::Any(list) => list.iter().any(|needle| needle.found_in(folded)),
             Matcher::Words(words) => has_word(folded, words),
             Matcher::Near { a, b, gap, either } => near(folded, a, b, *gap, *either),
+            Matcher::NearOrPhrase {
+                a,
+                b,
+                gap,
+                either,
+                phrases,
+            } => {
+                near(folded, a, b, *gap, *either)
+                    || phrases.iter().any(|needle| needle.found_in(folded))
+            }
             Matcher::NearUnless { a, b, gap, unless } => unless_matches(
                 folded,
                 cues.of(*unless),
@@ -969,11 +1057,12 @@ fn build_rules() -> Vec<Rule> {
             id: "self_harm.method_request",
             category: SelfHarm,
             applies: UNTRUSTED_ONLY,
-            matcher: Matcher::Near {
+            matcher: Matcher::NearOrPhrase {
                 a: needles(SELF_HARM_REQUEST_A),
                 b: needles(SELF_HARM_METHOD_B),
                 gap: 40,
                 either: true,
+                phrases: needles(SELF_HARM_METHOD_PHRASES),
             },
             exempt_when_protective: false,
         },
@@ -1540,7 +1629,7 @@ impl RuleChecker {
             let hit = match segment.origin {
                 Origin::User | Origin::Tool => self.first_match(text, Scope::Untrusted),
                 Origin::Operator => self.first_match(text, Scope::Operator),
-                // 客户端写的 `assistant` 消息：输出规则 + 输入规则（请求类的命中旁边有拒绝语才放行）
+                // 客户端写的 `assistant` 消息：输出规则 + 请求类 / 越狱类输入规则。自伤的表达和提及不跑，索要方法仍查。
                 Origin::Assistant => self.first_match(text, Scope::History),
             };
             if hit.is_some() {

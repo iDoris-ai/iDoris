@@ -758,7 +758,9 @@ pub struct ResponseIdentity<'a> {
 }
 
 impl ResponseIdentity<'_> {
-    /// 第 `index` 个工具调用的 `id`：从请求号派生（同一段对话里不同请求的工具调用 `id` 不会撞），只含字母、数字、`_`。
+    /// 第 `index` 个工具调用的 `id`：`call_` + 请求号里前 12 个 ASCII 字母或数字 + `_` + 下标。
+    /// 只含字母、数字、`_`。两个请求号去掉非字母数字之后的前 12 个字符一样，就会得到同一个 id；
+    /// 这里不保证同一段对话里不同请求的工具调用 id 互不重复。
     fn tool_call_id(&self, index: usize) -> String {
         let stem: String = self
             .id
@@ -1451,7 +1453,7 @@ mod tests {
         assert_eq!(value["id"], "req-123");
         // 旧的预期是 `unknown`（上游的 model 不是短标识时的兜底）；现在 model 永远是已选路由的模型
         assert_eq!(value["model"], "example-org/chat-70b");
-        // 工具调用 id 从请求号派生（旧的预期是 `call_0`），同一段对话里不同请求的不会撞
+        // 工具调用 id 从请求号派生（旧的预期是 `call_0`）：前 12 个字母数字加下标。前 12 个字母数字相同的请求号会得到同一个 id
         assert_eq!(
             value["choices"][0]["message"]["tool_calls"][0]["id"],
             "call_req123_0"
