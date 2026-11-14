@@ -1567,6 +1567,50 @@ const ASSISTANT_SELF_HARM_GUIDANCE: &[&str] = &[
     "If you are thinking about suicide, please talk to a trusted adult or call a helpline",
 ];
 
+/// 从 ideation 移过来的整句索要。第一人称（`i want to die`、`hang myself` 等）不在这里。
+const WAYS_TO_DIE_PHRASES: &[&str] = &["how to die", "ways to die", "painless way to die"];
+
+#[test]
+fn assistant_history_treats_asking_how_to_die_as_a_method_request() {
+    // 这些短语是索要死亡方法，不是第一人称表达。助手历史仍由 `self_harm.method_request` 拒绝。
+    // 变异：把其中一条移回 `SELF_HARM_IDEATION`（并从本规则的短语表拿掉）后，助手历史不再命中，
+    // 这里变成 `None`，断言变红。
+    let checker = checker();
+    for text in WAYS_TO_DIE_PHRASES {
+        assert_eq!(
+            checker
+                .scan_input(&with_assistant(text))
+                .map(|hit| (hit.0, hit.1)),
+            Some(("self_harm.method_request", SafetyCategory::SelfHarm)),
+            "{text}"
+        );
+    }
+    // 第一人称表达留在 ideation：助手历史仍放行。
+    assert_eq!(checker.scan_input(&with_assistant("i want to die")), None);
+}
+
+#[test]
+fn user_asking_how_to_die_is_still_refused_as_self_harm() {
+    // 用户消息上的类别和拦截结果不变：仍是 SelfHarm，仍拒。规则 id 跟着短语走到 method_request。
+    for text in WAYS_TO_DIE_PHRASES {
+        assert_eq!(
+            blocks_input(text),
+            Some(("self_harm.method_request", SafetyCategory::SelfHarm)),
+            "{text}"
+        );
+        assert_blocked(text, SafetyCategory::SelfHarm);
+    }
+    // 第一人称仍走 ideation。
+    assert_eq!(
+        blocks_input("i want to die"),
+        Some(("self_harm.ideation", SafetyCategory::SelfHarm))
+    );
+    assert_eq!(
+        blocks_input("hang myself"),
+        Some(("self_harm.ideation", SafetyCategory::SelfHarm))
+    );
+}
+
 #[test]
 fn assistant_history_self_harm_guidance_passes_the_input_rules() {
     let checker = checker();

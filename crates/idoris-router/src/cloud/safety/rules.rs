@@ -18,7 +18,7 @@
 //!   对话历史里的 `assistant` 消息**也是客户端写的**（不证明是我们自己说过的话）：按**输出**规则查之外，**再按输入规则里的请求类和越狱类查**
 //!   （round2-r3 PARTIAL High#1）。**自伤的表达和提及不跑在助手历史上**（owner 2026-11-14 方案 B）：上一轮的安全引导会复述「伤害自己」「suicide」，
 //!   下一轮不能因此被切断。伪造的第一人称自伤表达交给 LLM 检查器。**索要方法仍是请求类**（[`Matcher::Near`] / [`Matcher::NearUnless`]：
-//!   请求动词和方法对象靠近），助手历史照查；模型自己的求助引导里不会出现这种索要措辞，拒绝语复述了话题时仍按请求类放行。
+//!   请求动词和方法对象靠近；[`Matcher::NearOrPhrase`] 另外收「how to die」这类整句索要），助手历史照查；模型自己的求助引导里不会出现这种索要措辞，拒绝语复述了话题时仍按请求类放行。
 //!   之前真的说过的拒绝语会复述被拒绝的话题（「我不能告诉你怎么做炸弹」），不能让对话从此没法继续：**请求类**输入规则
 //!   （[`Rule::history_role`] 为 [`HistoryRole::Request`]，含自伤索要方法）在命中旁边（同一句里）有明确的拒绝语、或者 `ไม่ได้` 紧跟在命中后面时放行；
 //!   越狱 / 指令注入**没有**这道放行；
@@ -216,9 +216,16 @@ const SELF_HARM_IDEATION: &[&str] = &[
     "hang myself",
     "slit my wrist",
     "overdose on pills",
-    "painless way to die",
-    "ways to die",
+];
+
+/// 整句就是在索要死亡方法，不是第一人称表达。挂在 `self_harm.method_request` 上（请求类），
+/// 用户消息和助手历史都拒。逐条对照过 [`SELF_HARM_IDEATION`]：泰语各项都是「我想死 / 伤害自己」，
+/// 没有「怎么死 / 死的方法 / วิธีตาย / ทำยังไงให้ตาย」这类索要句。
+const SELF_HARM_METHOD_PHRASES: &[&str] = &[
+    // 英语
     "how to die",
+    "ways to die",
+    "painless way to die",
 ];
 
 const SELF_HARM_REQUEST_A: &[&str] = &[
@@ -714,6 +721,15 @@ enum Matcher {
         gap: usize,
         either: bool,
     },
+    /// 同 [`Matcher::Near`]，另外整句短语也算（`how to die` 这种没有拆成两侧词的索要方法）。
+    /// 自伤里它仍是索要方法，助手历史按请求类查，见 [`Rule::pairs_a_request_with_an_object`]。
+    NearOrPhrase {
+        a: Vec<Needle>,
+        b: Vec<Needle>,
+        gap: usize,
+        either: bool,
+        phrases: Vec<Needle>,
+    },
     /// 同 `Near`（前后都算），但**每一处命中**旁边（同一句里、前后各 [`NEGATION_REACH_CHARS`] 个字符之内）
     /// 有 `unless` 线索的那一处不算。别处的线索不算；一处被放行之后，剩下的内容独立重新检查。
     NearUnless {
@@ -880,7 +896,7 @@ impl Rule {
             };
         }
         // 表达（任一短语）和整词提及不跑：安全引导会复述这些词。
-        // 索要方法是两侧词靠近，和别的请求类一样仍查。
+        // 索要方法是两侧词靠近，或整句索要短语，和别的请求类一样仍查。
         if self.category == SafetyCategory::SelfHarm && !self.pairs_a_request_with_an_object() {
             return HistoryRole::SelfHarmInput;
         }
@@ -891,12 +907,13 @@ impl Rule {
         HistoryRole::Request
     }
 
-    /// 匹配器是「两类词在一个窗口里靠近」（[`Matcher::Near`] / [`Matcher::NearUnless`]）。
+    /// 匹配器是「两类词在一个窗口里靠近」（[`Matcher::Near`] / [`Matcher::NearUnless`]），
+    /// 或在此之外再收整句索要短语（[`Matcher::NearOrPhrase`]）。
     /// 自伤输入规则里，这就是索要方法 / 求操作步骤；任一短语和整词提及不是。
     fn pairs_a_request_with_an_object(&self) -> bool {
         matches!(
             self.matcher,
-            Matcher::Near { .. } | Matcher::NearUnless { .. }
+            Matcher::Near { .. } | Matcher::NearUnless { .. } | Matcher::NearOrPhrase { .. }
         )
     }
 
@@ -928,6 +945,24 @@ impl Rule {
                 |f| near(f, a, b, *gap, *either),
                 |f| near_regions(f, a, b, *gap, *either, MAX_NEGATED_HITS),
             ),
+            Matcher::NearOrPhrase {
+                a,
+                b,
+                gap,
+                either,
+                phrases,
+            } => unless_matches_with(
+                folded,
+                |current, hit| excused_by(cues.history, current, hit),
+                |f| near(f, a, b, *gap, *either) || phrases.iter().any(|needle| needle.found_in(f)),
+                |f| {
+                    let mut regions = near_regions(f, a, b, *gap, *either, MAX_NEGATED_HITS);
+                    if regions.len() <= MAX_NEGATED_HITS {
+                        regions.extend(phrases.iter().flat_map(|needle| needle.plain_spans(f)));
+                    }
+                    regions
+                },
+            ),
             // 本来就能被否定词和话题词放行的两条（点火、混合毒气）：历史里再加上拒绝语
             Matcher::NearUnless { a, b, gap, .. } => unless_matches_with(
                 folded,
@@ -945,6 +980,16 @@ impl Rule {
             Matcher::Any(list) => list.iter().any(|needle| needle.found_in(folded)),
             Matcher::Words(words) => has_word(folded, words),
             Matcher::Near { a, b, gap, either } => near(folded, a, b, *gap, *either),
+            Matcher::NearOrPhrase {
+                a,
+                b,
+                gap,
+                either,
+                phrases,
+            } => {
+                near(folded, a, b, *gap, *either)
+                    || phrases.iter().any(|needle| needle.found_in(folded))
+            }
             Matcher::NearUnless { a, b, gap, unless } => unless_matches(
                 folded,
                 cues.of(*unless),
@@ -1012,11 +1057,12 @@ fn build_rules() -> Vec<Rule> {
             id: "self_harm.method_request",
             category: SelfHarm,
             applies: UNTRUSTED_ONLY,
-            matcher: Matcher::Near {
+            matcher: Matcher::NearOrPhrase {
                 a: needles(SELF_HARM_REQUEST_A),
                 b: needles(SELF_HARM_METHOD_B),
                 gap: 40,
                 either: true,
+                phrases: needles(SELF_HARM_METHOD_PHRASES),
             },
             exempt_when_protective: false,
         },
