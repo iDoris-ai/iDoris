@@ -201,13 +201,15 @@ impl ExtraCostMeter for LedgerExtraCost {
             // 价目是 0（比如免费的本地检查模型）：没有额度可占，账本里也不留一行零额的预留
             return Ok(ticket);
         }
-        match self.accounts.reserve_request_component(
-            request.request_id,
-            component_of(stage),
-            request.payment,
-            &amount,
-            request.now,
-        ) {
+        match crate::cloud::blocking::blocking(|| {
+            self.accounts.reserve_request_component(
+                request.request_id,
+                component_of(stage),
+                request.payment,
+                &amount,
+                request.now,
+            )
+        }) {
             Ok(ComponentDecision::Reserved { .. }) => Ok(ticket),
             // 付款账户链放不下（余额、速率、在途、补贴池、凭证状态……）：准入类的原因码，不占任何额度
             Ok(ComponentDecision::Rejected(code)) => Err(ExtraCostRefusal::Denied(code)),
@@ -236,12 +238,14 @@ impl ExtraCostMeter for LedgerExtraCost {
         });
         let attempt = AttemptId::new(ticket.request_id.clone(), AttemptIndex(0));
         // 实际价为 0 就是释放；幂等：同样的金额重放什么都不写
-        if let Err(error) = self.accounts.settle_component(
-            &attempt,
-            component_of(ticket.stage),
-            &charged,
-            self.clock.now(),
-        ) {
+        if let Err(error) = crate::cloud::blocking::blocking(|| {
+            self.accounts.settle_component(
+                &attempt,
+                component_of(ticket.stage),
+                &charged,
+                self.clock.now(),
+            )
+        }) {
             eprintln!(
                 "[idoris] safety: request {} stage {}: the ledger could not settle the check cost ({}); the reservation expires on its own",
                 ticket.request_id,

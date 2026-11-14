@@ -155,7 +155,7 @@
 //!     规则检查器靠关键词和正则，换字体、拼写变形、base64、藏在工具描述里的内容都能绕过。
 //! 32. **认证之前有界**：同时在途的认证查询个数 + 「最近没有认证成功过的凭证前缀」的查询预算（默认 64 个在途、每分钟 1200 次，
 //!     突发 200），满了直接 429 `auth_capacity_limited`，不碰库；在用的凭证不消耗预算。默认值是我拟的，要按真实流量调。
-//!     在途名额**跟着真正执行认证查询的阻塞任务走**（`VirtualKeyAuthenticator::authenticate_holding`）：请求被取消（客户端断开）
+//!     在途名额**跟着真正执行认证查询和其后调用方解析的阻塞任务走**（同一个 `AuthSlot`，两段都结束才还）：请求被取消（客户端断开）
 //!     名额不提前归还，所以「发起再取消」攒不出超过上限的阻塞任务。令牌桶里的时间永远只前进（落后多少的读数都不拨回它）。
 //! 33. **供应商主机绑定**：云上游端点的 `base_url` 必须是回环地址，或者这个供应商核验过的 API 主机（`config::VERIFIED_PROVIDER_HOSTS`，
 //!     来自 `config/compute/endpoint-urls.md`）；主机没核实的供应商不能配置到非回环地址；**没有登记主机的供应商（许可表的新行、
@@ -167,8 +167,9 @@
 //! 35. **迟到 usage 对账**（`AttemptStore::reconcile_late_usage`）只处理没有向用户收费的 `maybe_executed` 尝试：冲销旧挂账、记实际成本、
 //!     按 S0 的转移结清，一个事务。向用户收费那一次的迟到 usage 要不要退差价是准入账本的事，这里拒绝。
 //! 36. **同步的账本操作用 `block_in_place` 跑**（`blocking`）：准入、尝试记录、收尾、拒绝记录、供应商请求号落盘
-//!     （`RunState::record_supplier_id` 里的两处同步写）不再直接阻塞 tokio worker 线程。
-//!     范围：执行器和尝试记录；儿童安全检查的成本计量（`safety::LedgerExtraCost`）和账户存储里的其它同步调用不在这里。
+//!     （`RunState::record_supplier_id` 里的两处同步写），以及儿童安全检查的成本计量
+//!     （`LedgerExtraCost` 的预留和结算）不再直接阻塞 tokio worker 线程。
+//!     账户存储里的其它同步调用不在这里。
 
 use std::path::Path;
 use std::sync::Arc;

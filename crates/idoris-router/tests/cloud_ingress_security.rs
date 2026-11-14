@@ -565,6 +565,94 @@ async fn the_control_plane_never_carries_cors_headers_even_when_browsers_are_all
     }
 }
 
+/// `/control/v1/`（末尾斜杠）不是 `/control/v1`，也匹配不了 `/control/v1/{*rest}`。
+/// 漏登记时它落到数据面的兜底 404，名单里的 Origin 会带上 CORS。它必须留在控制面。
+#[tokio::test]
+async fn a_trailing_slash_on_the_control_prefix_stays_on_the_control_plane_without_cors() {
+    let w = World::new(WorldOptions {
+        ingress: IngressYaml::default().cors(&["https://app.example.com"]),
+        ..WorldOptions::default()
+    })
+    .await;
+    let no_cors = |reply: &Reply, what: &str| {
+        for name in [
+            "access-control-allow-origin",
+            "access-control-allow-credentials",
+            "access-control-allow-methods",
+            "access-control-allow-headers",
+            "access-control-expose-headers",
+            "access-control-max-age",
+            "vary",
+        ] {
+            assert!(reply.header(name).is_none(), "{what}: {name}");
+        }
+    };
+    for method in ["GET", "OPTIONS"] {
+        let reply = w
+            .send(
+                &Req::models(w.cred("svc_eduai_admin"))
+                    .method(method)
+                    .uri("/control/v1/")
+                    .bearer_raw(None)
+                    .header("origin", "https://app.example.com")
+                    .header("access-control-request-method", "GET")
+                    .header("access-control-request-headers", "authorization"),
+            )
+            .await;
+        assert_eq!(reply.status, 404, "{method}: {}", reply.text());
+        assert_eq!(reply.json()["error"]["reason_code"], "not_found");
+        assert_eq!(
+            reply.json()["error"]["message"],
+            "no such control-plane route"
+        );
+        no_cors(&reply, method);
+    }
+}
+
+/// 控制面写操作的 `X-iDoris-Record-Id` 必须等于响应体里的 `request_id`，也等于审计行。
+/// 最外层 `record_id_middleware` 无条件写这个头；控制面如果再生成一个号，头会被盖掉，和正文、审计对不上。
+/// 数据面仍然不接受调用方自己带的记录号。
+#[tokio::test]
+async fn a_control_write_record_id_matches_the_body_and_the_audit_row() {
+    let w = World::new(WorldOptions::default()).await;
+    let reply = w
+        .send(
+            &Req::chat(w.cred("svc_eduai_admin"))
+                .uri("/control/v1/principals")
+                .body(json!({"principal_id": "kid-fix4a", "org": "eduai"})),
+        )
+        .await;
+    assert_eq!(reply.status, 201, "{}", reply.text());
+    let header = reply
+        .header("x-idoris-record-id")
+        .expect("the response carries a record id")
+        .to_string();
+    let body = reply.json();
+    let body_id = body["request_id"]
+        .as_str()
+        .expect("the body carries request_id");
+    assert_eq!(header, body_id);
+    let audit: String = rusqlite::Connection::open(&w.db_path)
+        .unwrap()
+        .query_row(
+            "SELECT request_id FROM control_audit \
+             WHERE op = 'create_principal' AND target_id = 'kid-fix4a'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(audit, header);
+
+    let models = w
+        .send(&Req::models(w.cred("mem_kid1")).header("x-idoris-record-id", "caller-record"))
+        .await;
+    let data_id = models
+        .header("x-idoris-record-id")
+        .expect("the data plane still stamps a record id");
+    assert_ne!(data_id, "caller-record");
+    assert!(!data_id.is_empty());
+}
+
 /// 控制面和数据面站在同一个外层上（PR #600 第二轮 S2）：最外层的中间件也包着它，不再合并在它们**之后**。
 /// 用和 CORS 无关的可观测效果证明：最外层的记录号中间件给**每个**响应一个 `X-iDoris-Record-Id`——包括那些控制面
 /// 自己的信封根本没机会生成的响应（控制面自己写的响应本来就带记录号，证明不了什么）：请求体超过控制面上限时，

@@ -12,8 +12,8 @@
 //! 单线程运行时（`#[tokio::test]` 默认）和没有运行时的线程（`spawn_blocking` 线程、同步测试）直接跑：`block_in_place` 在
 //! 单线程运行时里会 panic，在运行时之外没有意义。
 //!
-//! **范围**：执行器的准入、尝试记录（`run`）、收尾，和处理函数的发布 / 拒绝。儿童安全检查的成本计量
-//! （`safety::LedgerExtraCost`，也是同步的账本操作）不在这里：它在 `safety/` 里。
+//! **范围**：执行器的准入、尝试记录（`run`）、收尾、处理函数的发布 / 拒绝，以及儿童安全检查的成本计量
+//! （`safety::LedgerExtraCost` 的 `reserve_request_component` / `settle_component`）。账户存储里的其它同步调用不在这里。
 
 use tokio::runtime::{Handle, RuntimeFlavor};
 

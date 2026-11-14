@@ -486,6 +486,7 @@ async fn reserving_the_same_stage_twice_fails_closed_without_reusing_the_reserva
 /// 单独装一个账本和一个 `LedgerExtraCost`（不经过执行器），直接验证预留额和结算额的算法。
 struct MeterFixture {
     _dir: tempfile::TempDir,
+    db: std::path::PathBuf,
     accounts: Arc<AccountStore>,
     meter: LedgerExtraCost,
     payment: PaymentContext,
@@ -546,6 +547,7 @@ fn meter_fixture(price_for_judge: bool, funds: i64) -> Option<MeterFixture> {
     )
     .unwrap();
     Some(MeterFixture {
+        db: dir.path().join("idoris.sqlite3"),
         _dir: dir,
         accounts,
         meter,
@@ -609,6 +611,106 @@ fn the_reservation_is_priced_with_the_check_endpoints_price_card_in_the_payers_u
         .unwrap();
     assert_eq!(row.state, HoldState::Settled);
     assert_eq!(row.charged.as_ref().map(|m| m.micros), Some(1_400));
+}
+
+/// L-4：安全检查的预留和结算是同步 SQLite。另一个连接占着写事务时，这两处如果直接跑在 tokio worker 上，
+/// 只有一个 worker 的运行时里旁边的心跳会停。它们必须走 `blocking`（`block_in_place`）。
+#[test]
+fn reserving_and_settling_a_safety_check_does_not_starve_the_runtime_while_the_ledger_is_busy() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    fn heartbeats_while_the_ledger_is_locked(
+        db: &std::path::Path,
+        work: impl FnOnce() + Send + 'static,
+    ) -> usize {
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let holder = {
+            let path = db.to_path_buf();
+            std::thread::spawn(move || {
+                let conn = rusqlite::Connection::open(&path).unwrap();
+                conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+                locked_tx.send(()).unwrap();
+                std::thread::sleep(Duration::from_millis(500));
+                conn.execute_batch("COMMIT").unwrap();
+            })
+        };
+        locked_rx.recv().unwrap();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_time()
+            .build()
+            .unwrap();
+        let beats = Arc::new(AtomicUsize::new(0));
+        let during = runtime.block_on(async {
+            let heartbeat = {
+                let beats = Arc::clone(&beats);
+                tokio::spawn(async move {
+                    loop {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                        beats.fetch_add(1, Ordering::SeqCst);
+                    }
+                })
+            };
+            tokio::time::sleep(Duration::from_millis(60)).await;
+            let before = beats.load(Ordering::SeqCst);
+            tokio::spawn(async move {
+                work();
+            })
+            .await
+            .unwrap();
+            let during = beats.load(Ordering::SeqCst) - before;
+            heartbeat.abort();
+            during
+        });
+        holder.join().unwrap();
+        during
+    }
+
+    {
+        let f = meter_fixture(true, FUNDS).unwrap();
+        let estimate = estimate(&f.judge);
+        let payment = f.payment.clone();
+        let meter = f.meter;
+        let during = heartbeats_while_the_ledger_is_locked(&f.db, move || {
+            meter
+                .reserve(&ExtraCostRequest {
+                    request_id: &RequestId::new("req-busy-reserve").unwrap(),
+                    payment: &payment,
+                    stage: SafetyStage::Input,
+                    estimate: &estimate,
+                    now: TimestampMs(NOW_MS),
+                })
+                .unwrap();
+        });
+        assert!(
+            during >= 10,
+            "reserve waited on the ledger without starving the runtime: {during} beats"
+        );
+    }
+    {
+        let f = meter_fixture(true, FUNDS).unwrap();
+        let estimate = estimate(&f.judge);
+        let request_id = RequestId::new("req-busy-settle").unwrap();
+        let ticket = f
+            .meter
+            .reserve(&ExtraCostRequest {
+                request_id: &request_id,
+                payment: &f.payment,
+                stage: SafetyStage::Input,
+                estimate: &estimate,
+                now: TimestampMs(NOW_MS),
+            })
+            .unwrap();
+        let meter = f.meter;
+        let during = heartbeats_while_the_ledger_is_locked(&f.db, move || {
+            meter.settle(ticket, ExtraCostOutcome::NotRun);
+        });
+        assert!(
+            during >= 10,
+            "settle waited on the ledger without starving the runtime: {during} beats"
+        );
+    }
 }
 
 #[test]

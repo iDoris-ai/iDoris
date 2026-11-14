@@ -5,8 +5,12 @@
 //!
 //! # 在哪里
 //!
-//! 路由前缀 [`CONTROL_PREFIX`] = `/control/v1`，挂在**数据面的同一个监听上**（不是新端口，也不是 Admin 端口），
-//! 但完全自带认证和授权，不经过数据面的中间件。**只在组织和云形态下挂载**（`AppState::control` 为 `Some`，
+//! 路由前缀 [`CONTROL_PREFIX`] = `/control/v1`（末尾多一个斜杠的 `/control/v1/` 也是控制面，不是数据面），
+//! 挂在**数据面的同一个监听上**（不是新端口，也不是 Admin 端口），自己认证、自己授权。
+//! 云形态下，控制面和数据面站在同一组最外层上：`strip_untrusted_headers`、`record_id_middleware`、
+//! `request_lifecycle`，再加上 `control_edge`（只解析客户端来源）。**不带 CORS**，也不经过数据面的
+//! `edge_guard` 和 `data_plane_guard`。组织形态（`build_app`）仍把控制面合并在数据面中间件之后，
+//! 不经过 `record_id_middleware`。**只在组织和云形态下挂载**（`AppState::control` 为 `Some`，
 //! 启动时只有显式声明 `IDORIS_FORM=organization|cloud` 才会构造）；个人形态和存量 tenant 部署里这些路径不存在（404），
 //! 与改动前一字不差。
 //!
@@ -41,7 +45,7 @@
 //! | `/principals/{id}/revoke` | 撤销主体（同意撤回） | `revoke_principal` × **登记它的组织**和它每个成员关系的账户 |
 //! | `/accounts` | 建付款账户（子账户） | `create_account` × 父账户 |
 //! | `/accounts/{id}/status` | 冻结 / 解冻 / 关闭 | `set_account_status` × 账户自己 |
-//! | `/memberships` | 建成员关系（关联别的组织登记的主体还要对登记组织有 `revoke_principal` 权限） | `manage_membership` × 付款账户（管理员关系用组织） |
+//! | `/memberships` | 建成员关系（关联别的组织登记的主体还要对登记组织有 `revoke_principal` 权限；没有登记记录的老主体，归属方按已经在用它的组织算） | `manage_membership` × 付款账户（管理员关系用组织） |
 //! | `/memberships/{id}/revoke` | 撤销成员关系 | 同上 |
 //! | `/credentials` | 签发凭证（响应里有一次性明文密钥） | `issue_credential` × 绑定账户，另加「新权限 ⊆ 授权者权限」 |
 //! | `/credentials/{id}/status` | 冻结 / 解冻 / 撤销凭证 | `freeze_credential` / `revoke_credential` × 凭证的绑定账户 |
@@ -270,9 +274,28 @@ pub(crate) fn router(plane: Arc<ControlPlane>) -> Router {
             "/control/v1/audit",
             get(read_audit).fallback(not_found_handler),
         )
-        // 前缀下其它的一切：JSON 404（精确的路由优先匹配，这条只兜底）
+        // 前缀下其它的一切：JSON 404（精确的路由优先匹配，这条只兜底）。
+        // `/control/v1/` 和 `/control/v1`、`/control/v1/{*rest}` 都不是同一条路由；不登记的话它会落到数据面，带上 CORS。
         .route("/control/v1", not_found())
+        .route("/control/v1/", not_found())
         .route("/control/v1/{*rest}", not_found())
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
+        // 最外层（相对这个路由器）：用云入口 `record_id_middleware` 放进扩展的那个记录号。
+        // 中间件仍然无条件覆盖响应头（调用方自己带的 `X-iDoris-Record-Id` 不能留下来）；
+        // 控制面的响应体和审计行改读同一个号，而不是再生成一个然后被盖掉。
+        .layer(axum::middleware::from_fn(bind_request_id))
         .with_state(plane)
+}
+
+/// 见 [`router`] 上这一层的注释。扩展里没有记录号时（组织形态、单独测这个路由器）现生成一个。
+async fn bind_request_id(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let bound = req
+        .extensions()
+        .get::<crate::RequestRecordId>()
+        .map(|id| id.0.clone())
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    handlers::scope_request_id(bound, next.run(req)).await
 }

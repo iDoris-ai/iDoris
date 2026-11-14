@@ -46,7 +46,8 @@
 //! - 租户没有在配置里声明：403 `tenant_not_provisioned`。
 //! - 账户库读不出来：503，失败即关闭。
 
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use idoris_compute_contracts::account::{Account, AccountKind};
 use idoris_compute_contracts::credential::ResolveError;
@@ -170,15 +171,48 @@ pub fn refuse_child_declarations_below_the_top(
     Ok(())
 }
 
+/// 测试用：让 [`CallerResolver::resolve`] 在读库之前停住，并数已经进来多少次。
+/// 没人调用 [`CallerResolver::pause_for_test`] 时生产路径不看它。
+pub struct ResolvePause {
+    /// 已经进入 `resolve`、正要等闸门的次数（进闸之前加一）。
+    pub arrived: AtomicUsize,
+    gate: Mutex<()>,
+}
+
+impl ResolvePause {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            arrived: AtomicUsize::new(0),
+            gate: Mutex::new(()),
+        })
+    }
+
+    /// 占住闸门。`resolve` 进到这里就会停住，直到这个守卫丢掉。
+    pub fn lock_gate(&self) -> MutexGuard<'_, ()> {
+        self.gate.lock().unwrap_or_else(|error| error.into_inner())
+    }
+}
+
 /// 凭证 -> 调用方。
 pub struct CallerResolver {
     accounts: Arc<AccountStore>,
     config: Arc<IngressConfig>,
+    /// 只有测试会放进去。生产构造出来是 `None`。
+    pause: Mutex<Option<Arc<ResolvePause>>>,
 }
 
 impl CallerResolver {
     pub fn new(accounts: Arc<AccountStore>, config: Arc<IngressConfig>) -> Self {
-        Self { accounts, config }
+        Self {
+            accounts,
+            config,
+            pause: Mutex::new(None),
+        }
+    }
+
+    /// 下一次以及之后的 `resolve` 在读库之前停在 `pause` 的闸门上。测试用来数在途的阻塞解析。
+    pub fn pause_for_test(&self, pause: Arc<ResolvePause>) {
+        *self.pause.lock().unwrap_or_else(|error| error.into_inner()) = Some(pause);
     }
 
     /// 解析这一次请求的调用方。**同步、会读库**（账户存储是 SQLite）：异步调用方要放进 `spawn_blocking`。
@@ -189,6 +223,16 @@ impl CallerResolver {
         member: Option<&PrincipalId>,
         now: TimestampMs,
     ) -> Result<ResolvedCaller, Refusal> {
+        // 测试闸门：先复制出 `Arc` 再放开这把锁，避免和闸门锁交叉。没设置时就是一次很短的锁。
+        let pause = self
+            .pause
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
+        let _pause_hold = pause.as_ref().map(|pause| {
+            pause.arrived.fetch_add(1, Ordering::SeqCst);
+            pause.lock_gate()
+        });
         // 1. 付款上下文：S1/S2 的逐次验证，不缓存。失败一律拒绝，没有「退回凭证自己的账户」。
         let payment = match self.accounts.payment_context(credential, member, now) {
             Ok(payment) => payment,
