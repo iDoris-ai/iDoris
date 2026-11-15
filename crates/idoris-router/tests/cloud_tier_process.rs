@@ -379,6 +379,68 @@ async fn an_unreachable_cloud_does_not_burn_the_code_and_unpair_still_removes_th
     assert_eq!(reply.status, 200, "{}", reply.text());
 }
 
+/// 锁文件是 FIFO 或符号链接时，真实进程的 stderr 要写出这把锁的完整路径，并且不能说「稍后重试」。
+#[tokio::test]
+async fn pair_and_unpair_name_the_lock_file_when_it_is_a_fifo_or_a_symlink() {
+    let _guard = PROCESS_TEST_LOCK.lock().await;
+    for kind in ["fifo", "symlink"] {
+        let f = fixture();
+        let config = f.path("cloud-tier.yaml");
+        std::fs::write(
+            &config,
+            tier_config_for(
+                "http://127.0.0.1:9/api",
+                Some(&f.state_dir()),
+                "",
+                "limits: {connect_timeout_ms: 500, total_timeout_ms: 2000}",
+            ),
+        )
+        .unwrap();
+        std::fs::create_dir_all(f.state_dir()).unwrap();
+        let lock = f.state_dir().join(".lock");
+        match kind {
+            "fifo" => {
+                let made = std::process::Command::new("mkfifo")
+                    .arg(&lock)
+                    .status()
+                    .unwrap();
+                assert!(made.success(), "mkfifo failed");
+            }
+            "symlink" => {
+                let target = f.path("not-the-lock");
+                std::fs::write(&target, b"not-the-lock").unwrap();
+                std::os::unix::fs::symlink(&target, &lock).unwrap();
+            }
+            _ => unreachable!(),
+        }
+        let pair = tokio::time::timeout(
+            Duration::from_secs(3),
+            f.cloud_cmd(Some(&config), &["pair"], Some("ABCD-EFGH-JKMN")),
+        )
+        .await
+        .expect("pair hung on the lock file");
+        let unpair = tokio::time::timeout(
+            Duration::from_secs(3),
+            f.cloud_cmd(Some(&config), &["unpair"], None),
+        )
+        .await
+        .expect("unpair hung on the lock file");
+        let lock_text = lock.display().to_string();
+        for (name, out) in [("pair", &pair), ("unpair", &unpair)] {
+            assert_eq!(out.status.code(), Some(1), "{kind} {name}: {:?}", text(out));
+            let stderr = text(out).1;
+            assert!(
+                stderr.contains(&lock_text),
+                "{kind} {name} stderr must name the lock file {lock_text}: {stderr}"
+            );
+            assert!(
+                !stderr.contains("稍后重试"),
+                "{kind} {name} stderr must not ask to retry shortly: {stderr}"
+            );
+        }
+    }
+}
+
 /// 跨进程（审查 r4 Medium#4）：这个测试进程占着状态目录的锁，真实的 `idoris cloud pair` / `unpair` 子进程都不动手——
 /// 不兑换配对码（码不会被烧掉）、不碰云端、不碰凭证文件。锁放开之后同一个码照常能用。
 #[tokio::test]

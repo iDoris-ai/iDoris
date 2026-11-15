@@ -41,9 +41,11 @@
 //! 熔断是个共享的原子变量，随时可能被打开（请求以 `any` + 同意进来，本机处理期间熔断被打开，本机随后失败——这个请求
 //! 不能再去云端）。所以云端档不在请求进来时存快照，而是在这些点各自现读：闸门（第 1 层）、出网前的第一次复核（读完凭证、
 //! 占到名额之后，还没有任何副作用：不写审计事件、不落 `pending` 行）、`forward::send` 里的最后一道门（请求构造好之后、
-//! 第一次真正发送之前），以及连接还在建立、正文还没写出去的那段等待（`send` 和「熔断打开」放在同一次 select 里，打开就取消发送）。
-//! 任何一处拦下，调用方拿到的都和没有云端档时逐字节相同，请求正文没有离开本机；
-//! 最后一道门或连接等待期间拦下时 `pending` 行已经落下，写成 `cancelled`（没有出网）。已经把正文写出去的请求不会因为熔断随后打开而被收回。
+//! 第一次真正发送之前），以及连接还在建立、请求体还没被 poll 的那段等待（`send` 和「熔断打开」放在同一次 select 里）。
+//! 还能证明正文没开始发送时，调用方拿到的和没有云端档时逐字节相同；
+//! 最后一道门或这段等待拦下时 `pending` 行已经落下，写成 `cancelled`（没有出网）。
+//! 请求体一旦被 poll，熔断再打开就按「可能已经发出」处理：行仍写成 `cancelled`（不新增结局），响应带 `X-iDoris-Cloud-Attempt: cancelled`。
+//! 已经拿到响应的请求不会因为熔断随后打开而被收回。
 //!
 //! ## 同意机制（第 4 条）
 //!
@@ -878,8 +880,8 @@ pub(crate) async fn fallback(
         &loaded.secret,
         &body,
         &cancel,
-        // 出网边界上的最后一道门，并且在连接建立期间继续看：写审计事件、落 pending 行又隔了几个让出点，
-        // 熔断可能在这期间被打开；连上之前再打开，发送会被取消（审查 r4#1 复审）。
+        // 出网边界上的最后一道门，并且在 `send()` 整段继续看：写审计事件、落 pending 行又隔了几个让出点，
+        // 熔断可能在这期间被打开。请求体还没被 poll 就取消，算没出网；已经 poll 过则可能已经发出（审查 r4#1 复审）。
         &|| !scope.kill_switch_on(),
     )
     .await;
@@ -921,9 +923,9 @@ pub(crate) async fn fallback(
             complete_event(scope, &selected, "success").await;
             served_response(&selected, answer)
         }
-        // 最后一道门把它拦下了：**没有任何字节离开本机**。行已经落下了（先写后出网），写成 cancelled（没有答复、没有云端 id、
-        // 没有金额）；事件流补一个失败的 completed。调用方拿到本机原来的失败响应，一个字节都不改，连 X-iDoris-Cloud-Attempt
-        // 都没有——那个头的意思是「数据可能已经离开本机」，这里没有。
+        // 最后一道门把它拦下了，并且请求体还没被 poll：**请求正文没有离开本机**。行已经落下了（先写后出网），写成
+        // cancelled（没有答复、没有云端 id、没有金额）；事件流补一个失败的 completed。调用方拿到本机原来的失败响应，
+        // 一个字节都不改，连 X-iDoris-Cloud-Attempt 都没有——那个头的意思是「数据可能已经离开本机」，这里没有。
         Err(forward::CloudFailure::Withheld) => {
             let withheld = OwnedFinish {
                 outcome: CallOutcome::Cancelled,
@@ -968,6 +970,12 @@ pub(crate) async fn fallback(
                 eprintln!("[idoris] 云端档：调用结局写入失败（{error}），去掉云端 id 重记");
                 finish.cloud_record_id = None;
                 let _ = tier.record_finish(ticket, finish).await;
+            }
+            if matches!(failure, forward::CloudFailure::PossiblySent) {
+                // 记录行和调用方断开一样是 cancelled，日志把「正文可能已经发出」说清楚。
+                eprintln!(
+                    "[idoris] 云端档：熔断在请求正文开始发送之后打开，这次请求可能已经到达云端；调用方得到本机原来的失败响应，并带 X-iDoris-Cloud-Attempt: cancelled"
+                );
             }
             eprintln!(
                 "[idoris] 云端档：这次回落没有拿到回答（{}），调用方得到本机原来的失败响应",

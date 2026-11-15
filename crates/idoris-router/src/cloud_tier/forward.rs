@@ -31,12 +31,15 @@
 //! | 连接不上（DNS、连接被拒、TLS） | `unreachable` |
 //! | 总期限内没读完 | `timeout` |
 //! | 2xx 但 `usage` 里的 token 数超出调用记录能存的范围（i64） | `invalid_response` |
-//! | 出网前的最后一道门（远程熔断）拦下了它，或连接还在建立、正文还没写出去时熔断打开——**请求正文没有离开本机** | `cancelled`（调用方拿到本机原来的响应，没有 attempt 头） |
+//! | 出网前的最后一道门拦下了它，或连接还在建立、请求体还没被 poll（正文还没开始发送）时熔断打开 | `cancelled`（[`CloudFailure::Withheld`]：调用方拿到本机原来的响应，没有 attempt 头） |
+//! | 请求体已经被 poll（正文可能已经写出）之后熔断才打开 | `cancelled`（[`CloudFailure::PossiblySent`]：调用方拿到本机原来的响应，并带 `X-iDoris-Cloud-Attempt: cancelled`） |
 
 use axum::body::Bytes;
 use futures_util::StreamExt;
 use idoris_tenancy::cloud_tier::CallOutcome;
-use reqwest::header::{ACCEPT, ACCEPT_ENCODING, AUTHORIZATION, CONTENT_TYPE, USER_AGENT};
+use reqwest::header::{
+    ACCEPT, ACCEPT_ENCODING, AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, USER_AGENT,
+};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
@@ -86,9 +89,14 @@ pub enum CloudFailure {
     },
     /// 传输层在请求发出之后出了别的错（连接中途被重置……）：请求可能已经到达。
     Transport,
-    /// 出网前的最后一道检查（远程熔断）把请求拦下了，或者熔断在连接建立期间打开、发送被取消：
-    /// **请求正文没有离开本机**。
+    /// 出网前的最后一道检查（远程熔断）把请求拦下了，或者熔断打开时还能证明请求正文没有开始发送
+    /// （hyper 还没有 poll 过请求体，典型是连接还停在 SYN_SENT）：**请求正文没有离开本机**。
     Withheld,
+    /// 熔断在请求体已经被 poll 之后才打开。正文可能已经写进套接字，不能再当成零出网。
+    /// 结局仍是 [`CallOutcome::Cancelled`]：调用记录表的 `outcome` CHECK 没有单独的取值，不加新结局。
+    /// 调用方靠 `X-iDoris-Cloud-Attempt: cancelled` 知道「可能已经发出」；仅凭记录行分不出
+    /// 这一支、[`Withheld`](CloudFailure::Withheld) 和调用方自己断开（三者都是 `cancelled`，没有云端 id、没有金额）。
+    PossiblySent,
 }
 
 impl CloudFailure {
@@ -100,8 +108,9 @@ impl CloudFailure {
             CloudFailure::Cancelled => CallOutcome::Cancelled,
             CloudFailure::Answered { outcome, .. } => *outcome,
             CloudFailure::Transport => CallOutcome::CloudError,
-            // 记成 cancelled：这一行在发送之前就落下了（先写后出网），它必须有终态；没有答复、没有云端 id、没有金额
-            CloudFailure::Withheld => CallOutcome::Cancelled,
+            // 记成 cancelled：这一行在发送之前就落下了（先写后出网），它必须有终态；没有答复、没有云端 id、没有金额。
+            // Withheld 是正文还没开始发送；PossiblySent 是正文可能已经发出。表的 CHECK 没有第三种写法，所以两者都记 cancelled。
+            CloudFailure::Withheld | CloudFailure::PossiblySent => CallOutcome::Cancelled,
         }
     }
 }
@@ -191,9 +200,10 @@ fn classify_transport(error: &reqwest::Error) -> CloudFailure {
 /// 落 `pending` 行这些让出点，远程熔断可能在这期间被打开（它是个共享的原子变量）；调用方在这里给出**此刻**的答案，
 /// 而不是闸门那一刻的快照。
 ///
-/// 这一下通过之后，`request.send()` 还要等 DNS / 连接 / TLS，正文是在连上之后才写的（审查 r4#1 复审）。等待期间熔断
-/// 再打开，就丢掉这个发送 future（取消还没写完的连接），同样按 [`CloudFailure::Withheld`] 返回。已经拿到响应（正文已经
-/// 写出去）之后不再收回。
+/// 这一下通过之后，`request.send()` 要等连接，并且要等云端把响应头送回来，请求正文是在连上之后才写的
+/// （审查 r4#1 复审）。等待期间熔断再打开，就丢掉这个发送 future。只有还能证明请求体没被 poll 过
+/// （[`BodyPollFlag`] 仍是 false，连接多半还停在 SYN_SENT）才按 [`CloudFailure::Withheld`] 返回。
+/// 请求体一旦被 poll，正文可能已经离开本机，按 [`CloudFailure::PossiblySent`] 返回。已经拿到响应不再收回。
 ///
 /// 只有 `cloud_tier` 模块树里的代码能调它（`pub(super)`）；而 [`EgressPermit`] 只有 `gate::grant` 能造，它同样只对这个
 /// 模块树可见：crate 外的代码调不到 `send`，也造不出凭条。文档测试钉住 `send` 的可见性
@@ -218,20 +228,28 @@ pub(super) async fn send(
     still_allowed: &(dyn Fn() -> bool + Sync),
 ) -> Result<CloudAnswer, CloudFailure> {
     let bytes = serde_json::to_vec(body).map_err(|_| CloudFailure::Transport)?;
+    // 显式 Content-Length：流式 body 的 size_hint 是未知的，不设这个头 hyper 会改成 chunked。
+    // 已有 Content-Length 时 hyper 按定长写正文，并且要等连接建立、开始写正文时才 poll 请求体
+    // （hyper 1.11.1 `Client::set_length`，2026-11-12 核对：
+    // https://github.com/hyperium/hyper/blob/v1.11.1/src/proto/h1/role.rs ）。
+    // reqwest 0.13 的 `Body::wrap_stream`（本仓库 Cargo.lock 是 0.13.5，2026-11-12 核对：
+    // https://docs.rs/reqwest/0.13.5/reqwest/struct.Body.html#method.wrap_stream ）。
+    let (body, body_started) = body_polled_on_first_frame(bytes.clone());
     let request = client
         .post(config.chat_url.clone())
         .header(AUTHORIZATION, credential.authorization())
         .header(CONTENT_TYPE, "application/json")
         .header(ACCEPT, "application/json")
         .header(ACCEPT_ENCODING, "identity")
+        .header(CONTENT_LENGTH, bytes.len())
         .header(USER_AGENT, USER_AGENT_VALUE)
-        .body(bytes);
+        .body(body);
     let run = async {
         if !still_allowed() {
             return Err(CloudFailure::Withheld);
         }
-        // 先把「熔断打开」放在和发送 future 的同一次 select 里。biased：发送先完成（响应头已经到了，正文早已写出）
-        // 就认这个结果；否则熔断一打开就丢掉发送 future，连接还在等的时候正文不会被写出去。
+        // biased：发送先完成（响应头已经到了）就认这个结果，不再收回。
+        // 熔断先打开时，只有请求体还没被 poll 才能说正文没离开本机。
         let mut connecting = std::pin::pin!(request.send());
         tokio::select! {
             biased;
@@ -240,7 +258,11 @@ pub(super) async fn send(
                 Ok(response) => read_answer(response, config.max_response_bytes).await,
                 Err(error) => Err(classify_transport(&error)),
             },
-            () = await_revoked(still_allowed) => Err(CloudFailure::Withheld),
+            () = await_revoked(still_allowed) => Err(if body_started.load(std::sync::atomic::Ordering::SeqCst) {
+                CloudFailure::PossiblySent
+            } else {
+                CloudFailure::Withheld
+            }),
         }
     };
     tokio::select! {
@@ -253,9 +275,42 @@ pub(super) async fn send(
     }
 }
 
-/// 连接还在建立时，隔一会儿看一次熔断。打开了就结束，好让外面的 `select` 取消发送。
-/// 熔断是个原子变量，没有现成的唤醒；10 毫秒一轮只覆盖「还没写正文」的那段等待，不拿它做超时。
+/// 隔一会儿看一次熔断。打开了就结束，好让外面的 `select` 取消发送。
+/// 熔断是个原子变量，没有现成的唤醒；10 毫秒一轮覆盖整段 `send()`（连上之前，以及正文已经写出、还在等响应头），不拿它做超时。
+/// 到底算没出网还是可能已发出，看请求体有没有被 poll 过，不看这一轮等多久。
 const KILL_SWITCH_POLL: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// 包一层请求体：hyper 第一次 poll 它时把 `started` 置位。在这之前可以证明正文还没开始发送。
+fn body_polled_on_first_frame(
+    bytes: Vec<u8>,
+) -> (reqwest::Body, std::sync::Arc<std::sync::atomic::AtomicBool>) {
+    let started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let body = reqwest::Body::wrap_stream(BodyPollFlag {
+        started: started.clone(),
+        chunk: Some(Bytes::from(bytes)),
+    });
+    (body, started)
+}
+
+/// [`body_polled_on_first_frame`] 交给 `reqwest::Body::wrap_stream` 的流。
+struct BodyPollFlag {
+    started: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    chunk: Option<Bytes>,
+}
+
+impl futures_util::Stream for BodyPollFlag {
+    type Item = Result<Bytes, std::convert::Infallible>;
+
+    fn poll_next(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        this.started
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        std::task::Poll::Ready(this.chunk.take().map(Ok))
+    }
+}
 
 async fn await_revoked(still_allowed: &(dyn Fn() -> bool + Sync)) {
     loop {
@@ -1058,6 +1113,132 @@ mod tests {
         );
     }
 
+    /// 假云端把整个请求正文读完之后一直不回应，这时再打开熔断。
+    /// `send()` 要等响应头，正文其实已经离开本机。不能再报 [`CloudFailure::Withheld`]。
+    #[tokio::test]
+    async fn a_kill_switch_after_the_body_was_fully_read_is_not_reported_as_withheld() {
+        use std::io::Read;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let body =
+            json!({"model": "idoris/agent", "messages": [{"role": "user", "content": "hi"}]});
+        let expected = serde_json::to_vec(&body).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let ready = Arc::new(AtomicBool::new(false));
+        let seen = ready.clone();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let buf = read_full_http_request(&mut stream);
+            seen.store(true, Ordering::SeqCst);
+            // 不写任何响应，把连接留着，让客户端一直等响应头。
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+            let mut rest = [0u8; 64];
+            let _ = stream.read(&mut rest);
+            buf
+        });
+
+        let config = CloudTierConfig::parse(
+            &format!(
+                "schema_version: 1\nbase_url: http://{addr}/api\nmodel: idoris/agent\n\
+                 limits: {{connect_timeout_ms: 2000, total_timeout_ms: 30000}}\n"
+            ),
+            Path::new("."),
+        )
+        .unwrap();
+        let opened = Arc::new(AtomicBool::new(false));
+        let flag = opened.clone();
+        let task = tokio::spawn(async move {
+            send(
+                &client(&config),
+                &config,
+                permit(),
+                &CloudCredential::parse(&secret()).unwrap(),
+                &body,
+                &CancellationToken::new(),
+                &move || !flag.load(Ordering::SeqCst),
+            )
+            .await
+        });
+        let started = std::time::Instant::now();
+        while !ready.load(Ordering::SeqCst) {
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "the fake cloud never finished reading the request body"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        opened.store(true, Ordering::SeqCst);
+        let outcome = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("send stayed blocked after the body had left and the kill switch opened")
+            .unwrap()
+            .unwrap_err();
+        let received = server.join().unwrap();
+        assert!(
+            received
+                .windows(expected.len())
+                .any(|window| window == expected),
+            "the fake cloud did not receive the full body: {received:?}"
+        );
+        assert_eq!(outcome, CloudFailure::PossiblySent);
+        assert_eq!(outcome.outcome(), CallOutcome::Cancelled);
+    }
+
+    fn read_full_http_request(stream: &mut std::net::TcpStream) -> Vec<u8> {
+        use std::io::Read;
+        stream
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 2048];
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            match stream.read(&mut tmp) {
+                Ok(0) => break,
+                Ok(n) => {
+                    buf.extend_from_slice(&tmp[..n]);
+                    if http_request_complete(&buf) {
+                        break;
+                    }
+                }
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock
+                        || error.kind() == std::io::ErrorKind::TimedOut =>
+                {
+                    if http_request_complete(&buf) {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        buf
+    }
+
+    fn http_request_complete(buf: &[u8]) -> bool {
+        let Some(split) = buf.windows(4).position(|window| window == b"\r\n\r\n") else {
+            return false;
+        };
+        let Ok(head) = std::str::from_utf8(&buf[..split]) else {
+            return false;
+        };
+        let body = &buf[split + 4..];
+        for line in head.split("\r\n") {
+            let Some((name, value)) = line.split_once(':') else {
+                continue;
+            };
+            if name.eq_ignore_ascii_case("content-length") {
+                let Ok(len) = value.trim().parse::<usize>() else {
+                    return false;
+                };
+                return body.len() >= len;
+            }
+        }
+        false
+    }
+
     #[test]
     fn failures_map_to_recorded_outcomes() {
         assert_eq!(
@@ -1068,6 +1249,7 @@ mod tests {
         assert_eq!(CloudFailure::Transport.outcome(), CallOutcome::CloudError);
         // 没出网的那一行也必须有终态：记成 cancelled（没有答复、没有云端 id、没有金额）
         assert_eq!(CloudFailure::Withheld.outcome(), CallOutcome::Cancelled);
+        assert_eq!(CloudFailure::PossiblySent.outcome(), CallOutcome::Cancelled);
         assert_eq!(
             CloudFailure::Answered {
                 outcome: CallOutcome::RateLimited,

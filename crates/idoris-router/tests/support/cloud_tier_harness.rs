@@ -326,32 +326,126 @@ impl HeldQueue {
     }
 }
 
-/// `port` 上是否有一条还停在 SYN_SENT / SYN-SENT 的连接（macOS `netstat` 或 Linux `ss`）。
-pub fn tcp_syn_sent_to(port: u16) -> bool {
+/// `port` 上是否有一条还停在 SYN_SENT 的连接。
+///
+/// Linux 先跑 `ss -tan`；没有 `ss` 时读 `/proc/net/tcp`（`st` 为 `02` 表示 SYN_SENT）。
+/// macOS 用 `netstat -an -p tcp`。工具和 `/proc` 都不可用时返回 `Err`，调用方必须 skip 并打印原因，不能当成「没有这条连接」。
+pub fn tcp_syn_sent_to(port: u16) -> Result<bool, String> {
+    #[cfg(target_os = "linux")]
+    {
+        linux_syn_sent(port)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        macos_syn_sent(port)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = port;
+        Err(format!(
+            "当前系统是 {}，没有实现 SYN_SENT 探测（Linux 用 ss 或 /proc/net/tcp，macOS 用 netstat）",
+            std::env::consts::OS
+        ))
+    }
+}
+
+/// `ss` / `netstat` 的一行：状态是 SYN_SENT 或 SYN-SENT，并且某个地址字段的端口等于 `port`。
+fn text_line_is_syn_sent_to(line: &str, port: u16) -> bool {
+    let pending = line.contains("SYN_SENT") || line.contains("SYN-SENT");
+    if !pending {
+        return false;
+    }
     let port = port.to_string();
-    let field_is_port = |field: &str| {
+    line.split_whitespace().any(|field| {
         field
             .rsplit(['.', ':'])
             .next()
             .is_some_and(|tail| tail == port)
+    })
+}
+
+/// `/proc/net/tcp` 的一行。远端地址是 `十六进制IP:十六进制端口`，下一字段 `st` 为两位十六进制。
+/// `TCP_ESTABLISHED = 1`，紧接着的 `TCP_SYN_SENT` 是 2，所以 SYN_SENT 印成 `02`。
+/// 行格式 `%4d: %08X:%04X %08X:%04X %02X`（序号、本地、远端、状态）。
+/// 核对日期 2026-11-12：
+/// <https://raw.githubusercontent.com/torvalds/linux/v6.12/include/net/tcp_states.h>
+/// <https://raw.githubusercontent.com/torvalds/linux/v6.12/net/ipv4/tcp_ipv4.c>（`get_tcp4_sock`）
+pub fn proc_net_tcp_has_syn_sent(text: &str, port: u16) -> bool {
+    text.lines()
+        .any(|line| proc_net_tcp_line_is_syn_sent_to(line, port))
+}
+
+fn proc_net_tcp_line_is_syn_sent_to(line: &str, port: u16) -> bool {
+    let mut fields = line.split_whitespace();
+    let _index = fields.next();
+    let _local = fields.next();
+    let Some(remote) = fields.next() else {
+        return false;
     };
-    let texts = [
-        ("netstat", &["-an", "-p", "tcp"][..]),
-        ("ss", &["-tan"][..]),
-    ];
-    for (cmd, args) in texts {
-        let Ok(output) = std::process::Command::new(cmd).args(args).output() else {
-            continue;
-        };
-        let text = String::from_utf8_lossy(&output.stdout);
-        for line in text.lines() {
-            let pending = line.contains("SYN_SENT") || line.contains("SYN-SENT");
-            if pending && line.split_whitespace().any(field_is_port) {
-                return true;
+    let Some(state) = fields.next() else {
+        return false;
+    };
+    if state != "02" {
+        return false;
+    }
+    let Some((_, port_hex)) = remote.rsplit_once(':') else {
+        return false;
+    };
+    u16::from_str_radix(port_hex, 16).ok() == Some(port)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_syn_sent(port: u16) -> Result<bool, String> {
+    match std::process::Command::new("ss").args(["-tan"]).output() {
+        Ok(output) if output.status.success() => {
+            let text = String::from_utf8_lossy(&output.stdout);
+            Ok(text
+                .lines()
+                .any(|line| text_line_is_syn_sent_to(line, port)))
+        }
+        Ok(output) => {
+            let ss_error = format!("ss -tan 退出状态 {}", output.status);
+            match read_proc_net_tcp(port) {
+                Ok(seen) => Ok(seen),
+                Err(proc_error) => Err(format!("{ss_error}；{proc_error}")),
             }
         }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => read_proc_net_tcp(port),
+        Err(error) => match read_proc_net_tcp(port) {
+            Ok(seen) => Ok(seen),
+            Err(proc_error) => Err(format!("无法运行 ss（{error}）；{proc_error}")),
+        },
     }
-    false
+}
+
+#[cfg(target_os = "linux")]
+fn read_proc_net_tcp(port: u16) -> Result<bool, String> {
+    match std::fs::read_to_string("/proc/net/tcp") {
+        Ok(text) => Ok(proc_net_tcp_has_syn_sent(&text, port)),
+        Err(error) => Err(format!(
+            "没有可用的 ss，而且读不了 /proc/net/tcp（{error}）"
+        )),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_syn_sent(port: u16) -> Result<bool, String> {
+    let output = std::process::Command::new("netstat")
+        .args(["-an", "-p", "tcp"])
+        .output()
+        .map_err(|error| {
+            format!("macOS 上无法运行 netstat -an -p tcp（{error}），不能观察 SYN_SENT")
+        })?;
+    if !output.status.success() {
+        return Err(format!(
+            "macOS 上 netstat -an -p tcp 退出状态 {}，不能观察 SYN_SENT",
+            output.status
+        ));
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    Ok(text
+        .lines()
+        .any(|line| text_line_is_syn_sent_to(line, port)))
 }
 
 /// 把已经排在监听套接字上的连接读出来（非阻塞 accept）。调用前被测请求必须已经结束。
