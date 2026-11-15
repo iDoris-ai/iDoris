@@ -4,6 +4,9 @@
 //! 它自己账上的已花和在途预留一个也没进去，所以每次准入看到的都是「0 + 授信」的全额余量：授信 200，连续三笔 100 全部放行，
 //! 并发的请求也一样。现在这种账户的 `ceiling_remaining` 是 `-债务`（已花 + 在途预留），授信限制的是累计。
 //!
+//! 第五轮（owner 2026-11-15，方案 C）把债务改成「没被额度覆盖的部分」，新额度不抵旧债、被撤销的额度撤销之前覆盖过的花费不算债务：
+//! 那些场景在 `ledger_credit_books.rs`。这个文件里的场景（没有额度的账户、额度整段花费都在窗口内）在新口径下数字不变。
+//!
 //! 数字约定见 `support/ledger_fixture.rs`：`10` 个输入 token 加 `max_tokens = M` 的预留是 `10 + 2M` 微泰铢，
 //! 所以 `max_tokens = 45` 的预留正好是 100。
 #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -347,7 +350,7 @@ fn setting_the_credit_line_again_does_not_forgive_the_debt() {
 #[test]
 fn spending_covered_by_an_allowance_that_has_ended_is_not_credit_debt() {
     // 额度（预付）窗口 [T0 - 1 天, T0 + 1 天)：窗口里花掉的 100 是额度覆盖的，不是授信债务。
-    // 额度到期之后改靠授信：债务只从额度到期那一刻算起，所以授信 200 还能放两笔 100，第三笔拒绝。
+    // 额度到期之后改靠授信：那 100 是额度覆盖的，授信债务从 0 算起，所以授信 200 还能放两笔 100，第三笔拒绝。
     let db = TempDb::new("credit-debt-after-allowance");
     let store = credit_only_world(&db);
     store

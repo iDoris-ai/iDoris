@@ -190,7 +190,14 @@ pub fn allocate(store: &AccountStore, id: &str, parent: &str, child: &str, micro
 /// 撤销一笔额度（S2 的「关授信」）。撤销记在 S2 的侧表 `allocation_revocations` 里（只追加，`allocations` 不动）。
 /// 这张表在 S2 合入之前不存在，所以这里模拟它：只建账本读到的那一列（账本看到这张表就把有撤销行的额度排除）。
 /// S2 合入之后表是它的迁移建的、还有「谁撤销的」两列，这里按表里有没有这两列决定怎么插，所以夹具两种情形都能用。
+///
+/// 撤销时刻固定记成 `T0`；要指定撤销时刻（比如「花完之后才撤销」）用 [`revoke_allocation_at`]。
 pub fn revoke_allocation(db: &TempDb, allocation_id: &str) {
+    revoke_allocation_at(db, allocation_id, T0);
+}
+
+/// 同 [`revoke_allocation`]，但撤销时刻由调用方指定（`allocation_revocations.revoked_at_ms`）。
+pub fn revoke_allocation_at(db: &TempDb, allocation_id: &str, revoked_at_ms: i64) {
     let conn = rusqlite::Connection::open(db.path()).unwrap();
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS allocation_revocations (
@@ -212,7 +219,7 @@ pub fn revoke_allocation(db: &TempDb, allocation_id: &str) {
     } else {
         "INSERT INTO allocation_revocations (allocation_id, revoked_at_ms) VALUES (?1, ?2)"
     };
-    conn.execute(sql, rusqlite::params![allocation_id, T0])
+    conn.execute(sql, rusqlite::params![allocation_id, revoked_at_ms])
         .unwrap();
 }
 

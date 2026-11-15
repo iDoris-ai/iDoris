@@ -42,7 +42,7 @@ use super::holds::{
 };
 use super::period::period_of;
 use super::project::{
-    SPENDABLE_PURPOSES, available_of, load_config, not_revoked_clause, project_chain,
+    SPENDABLE_PURPOSES, available_of, load_config, not_revoked_clause, owes_credit, project_chain,
 };
 use super::types::{AdmitInput, AlertKind, MODEL_COMPONENT};
 use crate::accounts::rows::{load_ancestors, load_credential};
@@ -322,6 +322,7 @@ pub(super) fn decide(conn: &Connection, input: &AdmitInput<'_>) -> Result<AdmitP
                         &report,
                         &full.amount,
                         &period.to_string(),
+                        now_ms,
                     )?
                 } else {
                     None
@@ -395,7 +396,9 @@ pub(super) fn decide(conn: &Connection, input: &AdmitInput<'_>) -> Result<AdmitP
 ///   不是宽限能解决的：那是别人的钱，或者平台的保护）；
 /// - 本账期这个账户还没用过宽限（没作废的）；
 /// - 账户没有透支（可用额度 >= 0），缺口不超过一次预留。后两条由 S0 的 [`check_grace`] 判定，
-///   **不读 settle 的 overage**（评审 B4）。
+///   **不读 settle 的 overage**（评审 B4）；
+/// - 账户没有欠着授信的钱（[`owes_credit`]）：授信此刻有效时债务已经带在可用额度里，S0 自己会拒绝；授信关掉、过期之后
+///   债务不再往额度里扣（新额度不被旧债吃掉），可用额度可能恰好是 0，所以这里单独看一眼。
 fn try_grace(
     conn: &Connection,
     chain: &[Account],
@@ -403,6 +406,7 @@ fn try_grace(
     report: &AdmissionReport,
     reserve_price: &Price,
     period: &str,
+    now_ms: i64,
 ) -> Result<Option<(i64, i64)>, LedgerError> {
     let (Some(payer_account), Some(payer_view)) = (chain.first(), views.first()) else {
         return Ok(None);
@@ -420,6 +424,9 @@ fn try_grace(
     // 宽限是「额度用完之后的最后一单」：账户必须有过额度或资金。一个什么都没配置过的账户（可用额是失败即关闭
     // 填出来的 0）没有「用完」这回事，给它宽限就是让每个新账户每月白拿一次完整的预留（平台买单）。
     if !is_provisioned(conn, &payer_account.id)? {
+        return Ok(None);
+    }
+    if owes_credit(conn, &payer_account.id, now_ms)? {
         return Ok(None);
     }
     let used = active_grace_uses(conn, &payer_account.id, period)?;
