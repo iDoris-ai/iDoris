@@ -1153,8 +1153,51 @@ pub(super) fn membership_target(membership: &Membership) -> &AccountId {
     membership.account.as_ref().unwrap_or(&membership.org)
 }
 
+/// 调用者有没有资格知道这个主体现在是什么状态。
+///
+/// 没有资格时，活跃、已撤销、不存在必须是同一个 `out_of_scope`（细节为空）。状态如果在归属方授权之前就返回，
+/// 外部组织就能靠原因码区分这三种情况（r1-M2）。本机运维始终看得到。没有归属方的活跃老主体仍允许第一个挂上去
+/// （挂上去本身就会成功，不靠失败原因泄露状态）；没有归属方的已撤销主体和根本不存在的主体同一个答案。
+fn caller_may_know_principal(
+    conn: &Connection,
+    caller: &Caller,
+    now: TimestampMs,
+    principal: Option<&Principal>,
+    owners: &[PrincipalOwner],
+    membership_org: &AccountId,
+) -> Result<bool, Failure> {
+    if caller.is_operator() {
+        return Ok(true);
+    }
+    if owners.is_empty() {
+        return Ok(matches!(
+            principal,
+            Some(found) if found.status == PrincipalStatus::Active
+        ));
+    }
+    let ancestors = load_ancestors(conn, membership_org)?;
+    for owner in owners {
+        let inside = ancestors.iter().any(|account| account.id == owner.org);
+        if !inside {
+            authorize_op(
+                conn,
+                caller,
+                now,
+                ControlOp::RevokePrincipal,
+                &owner.target,
+                None,
+            )?;
+        }
+    }
+    Ok(true)
+}
+
 impl AccountStore {
-    /// 建成员关系。授权看成员关系的付款账户（管理员关系看组织）。主体必须已经登记、且没有被撤销。
+    /// 建成员关系。授权看成员关系的付款账户（管理员关系看组织）。
+    ///
+    /// 主体状态（没登记、已撤销）只告诉**有资格知道的人**：本机运维，或者这个主体的归属方（登记组织，或老主体已经在用它的组织）
+    /// 自己的管理员。其他人——包括调用者对目标账户有 `manage_membership`、但对归属方没有 `revoke_principal` 的外部组织——
+    /// 对活跃、已撤销、不存在拿到同一个 `out_of_scope`，细节为空。没有归属方的活跃老主体仍可以由第一个组织挂上去。
     pub fn control_create_membership(
         &self,
         who: &Who<'_>,
@@ -1198,7 +1241,25 @@ impl AccountStore {
                     ))
                 };
             }
-            match load_principal(conn, &membership.principal)? {
+            // 先判「调用者是不是归属方」，再谈主体状态。顺序反了的话，外部组织能靠
+            // `invalid_membership` / `principal_revoked` / `out_of_scope` 区分不存在、已撤销、活跃（r1-M2）。
+            // 归属方 = 登记它的组织；没有登记记录的老主体 = 已经在用它的组织（见 `principal_owners`）。
+            // 把已有归属方的主体关联到别的组织，每个归属方要么就是这个成员关系所属组织的祖先（或它自己），
+            // 要么调用者对它有 `revoke_principal` 权限。否则任何组织猜到一个主体 id 就能挂一个成员关系上去
+            // （Codex r1 #1 / PR-Daemon S2 F3 / PR #600 第二轮 S2 F3）。
+            let found = load_principal(conn, &membership.principal)?;
+            let owners = principal_owners(conn, &membership.principal)?;
+            if !caller_may_know_principal(
+                conn,
+                caller,
+                meta.now,
+                found.as_ref(),
+                &owners,
+                &membership.org,
+            )? {
+                return Err(Failure::new(ControlReason::OutOfScope));
+            }
+            match found {
                 None => {
                     return Err(Failure::with_detail(
                         ControlReason::InvalidMembership,
@@ -1212,28 +1273,6 @@ impl AccountStore {
                     ));
                 }
                 Some(_) => {}
-            }
-            // 把已有归属方的主体关联到别的组织需要明确的授权：每个归属方要么就是这个成员关系所属组织的祖先（或它自己），
-            // 要么调用者对它有 `revoke_principal` 权限（谁能让主体的足迹扩大，谁就该能把它整体撤销）。
-            // 归属方 = 登记它的组织；没有登记记录的老主体（存储层直接建的）= 已经在用它的组织（见 `principal_owners`）。
-            // 否则任何组织猜到一个主体 id 就能挂一个成员关系上去，既能越过归属方的撤销检查，又会让归属方
-            // 再也撤销不了它（Codex r1 #1 / PR-Daemon S2 F3 / PR #600 第二轮 S2 F3：老主体曾经被整个跳过）。
-            let owners = principal_owners(conn, &membership.principal)?;
-            if !owners.is_empty() {
-                let ancestors = load_ancestors(conn, &membership.org)?;
-                for owner in &owners {
-                    let inside = ancestors.iter().any(|account| account.id == owner.org);
-                    if !inside {
-                        authorize_op(
-                            conn,
-                            caller,
-                            meta.now,
-                            ControlOp::RevokePrincipal,
-                            &owner.target,
-                            None,
-                        )?;
-                    }
-                }
             }
             create_membership_in(conn, membership, meta.now)
                 .map_err(|error| Failure::from_store(error, Ctx::Membership))?;

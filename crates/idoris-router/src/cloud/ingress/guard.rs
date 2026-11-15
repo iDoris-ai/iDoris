@@ -17,7 +17,8 @@
 //! 2. **失败前缀预检**：这个凭证前缀最近认证失败太多 -> 429 `auth_throttled`；不碰库。
 //!    **认证前的有界工作**（`abuse::AuthBudget`）：同时在途的认证查询个数、「最近没有认证成功过的前缀」的查询预算；
 //!    满了 -> 429 `auth_capacity_limited`；不碰库。随机假凭证（前缀各不相同）靠这一道挡住：上一道只认同一个前缀。
-//!    在途名额**跟着真正执行查询的阻塞任务走**（交给认证器，查询跑完才还），请求被取消不会提前归还。
+//!    在途名额**跟着真正执行查询的阻塞任务走**（认证查询和其后的 `resolve` 共用同一个名额，两段都跑完才还），
+//!    请求被取消不会提前归还。
 //! 3. **认证**（虚拟 key + S2 的凭证闸门，每次请求读库、不缓存）：失败 -> 记一次失败、401（不透明：不告诉是哪种失败）。
 //!    认证之后限流用的时间**重新读**（认证可能排了很久队），并且用单调时间。
 //! 4. **成员 id**（`X-iDoris-Member`）格式：不合法 -> 400。
@@ -251,12 +252,13 @@ pub(super) async fn data_plane_guard(
         }
     };
 
-    // 3. 认证。名额**交给认证器**，由它搬进真正执行查询的阻塞任务：查询跑完才还。名额如果留在这个请求 future 上，
-    // 请求被取消（客户端断开）时名额就先还了，而 `spawn_blocking` 出去的查询还在等库的锁——反复「发起再取消」就能攒出
-    // 远超 `auth_max_concurrent` 的阻塞任务（R3 N2）。
+    // 3. 认证。名额放进 `Arc`，认证的阻塞任务和后面的 `resolve` 各持有一份：两段都结束（或者还没开始 `resolve`
+    // 就失败返回）才还。名额如果在认证返回时就丢，`resolve` 的 `spawn_blocking` 不受名额约束——反复「发起再取消」
+    // 照样能攒出远超 `auth_max_concurrent` 的阻塞任务（R3 N2，认证那段；L-5，解析那段）。
+    let slot_hold = Arc::new(auth_slot);
     let authenticated = ingress
         .authenticator
-        .authenticate_holding(request.headers(), auth_slot)
+        .authenticate_holding(request.headers(), Arc::clone(&slot_hold))
         .await;
     // 认证是异步的、可能排了很久队：之后限流和判过期用的时间**重新读**，不用认证之前读到的（乱序完成的请求带着
     // 过期的时间读数去限流，会让令牌桶把同一段时间补两次额度）。
@@ -290,14 +292,17 @@ pub(super) async fn data_plane_guard(
         }
     };
 
-    // 5. 付款上下文、租户、数据处理要求。会读库：放进 spawn_blocking。
+    // 5. 付款上下文、租户、数据处理要求。会读库：放进 spawn_blocking。名额跟着这个阻塞任务走（具名绑定，
+    // `let _ = slot_hold` 会当场还掉）。
     let Ok(credential) = CredentialId::new(identity.key_id.as_str()) else {
         return virtual_key_unauthorized_response();
     };
     let resolver = Arc::clone(&ingress.resolver);
-    let resolved =
-        tokio::task::spawn_blocking(move || resolver.resolve(&credential, member.as_ref(), now))
-            .await;
+    let resolved = tokio::task::spawn_blocking(move || {
+        let _hold = slot_hold;
+        resolver.resolve(&credential, member.as_ref(), now)
+    })
+    .await;
     let resolved = match resolved {
         Ok(Ok(resolved)) => resolved,
         Ok(Err(refusal)) => return refusal_response(refusal, member_sent),

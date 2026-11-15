@@ -268,6 +268,11 @@ impl CloudIngress {
     pub fn auth_budget(&self) -> &abuse::AuthBudget {
         &self.auth_budget
     }
+
+    /// 测试用：让调用方解析在读库之前停住。生产不调用。
+    pub fn pause_resolve_for_test(&self, pause: Arc<caller::ResolvePause>) {
+        self.resolver.pause_for_test(pause);
+    }
 }
 
 /// `GET /api/v1/models`：云路由簿里的模型名，OpenAI 的列表形状。

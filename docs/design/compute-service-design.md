@@ -272,7 +272,7 @@ admitted ─▶ attempt[i]: sending ─▶ maybe_executed ─▶ executed(usage 
 
 ### 已拍板（owner，2026-11-14）
 
-- **客户端发来的 assistant 历史。** 自伤类内容只按输出规则 + LLM 检查器判断（求助引导不切断对话）；请求类与越狱类仍按输入规则检查。本分支的代码还是第三轮的更严口径（自伤类在 assistant 历史里也按输入规则拒绝，见 S6-16）。按本条收窄的实现进行中（分支 `task/compute-assistant-selfharm`），不在本分支。
+- **客户端发来的 assistant 历史。** 自伤类内容只按输出规则 + LLM 检查器判断（求助引导不切断对话）；请求类与越狱类仍按输入规则检查。收窄已经合入（合并提交 ffe71855）：助手历史按输出规则，再加上请求类和越狱类输入规则；自伤的表达和提及不跑在助手历史上，索要方法仍拦。见 S6-16。
 - **跨句否定保持严格。** 命中区间自己横跨句子边界时，否定词不放行。两句连讲的安全课（一句说「不要混」、下一句才说「会产生毒气」）被规则拦下，记为已知误拦，以后用评测数据再定。代码已经是这个口径，见 S6-20。
 
 ### S0 契约（`crates/idoris-compute-contracts`）
@@ -382,7 +382,7 @@ admitted ─▶ attempt[i]: sending ─▶ maybe_executed ─▶ executed(usage 
 - **S6-13**：在没有云入口的 `build_app` 上，`/v1/messages`、`/v1/embeddings`、`/v1/rerank` 对儿童租户返回 403。云入口形态下这些路由不存在（见 S5-09）。代码：`crates/idoris-router/src/cloud/mod.rs:108-111`。设计稿 §7。
 - **S6-14**：规则检查器把含 `suicide` 的句子算作自伤，包括 “Can you explain suicide prevention?”。测试把这类误拒列出来，不把它当成放行。代码：`crates/idoris-router/src/cloud/safety/rules.rs:200`、`crates/idoris-router/src/cloud/safety/rules/tests.rs:470-476`。设计稿 §7。
 - **S6-15**：运营方待遇必须事先登记在 `safety.trusted_operator_prompts`。`system` / `developer` 消息的内容以某条登记提示逐字开头时，这一段只查越狱类规则，后面接着的文字仍按孩子的话查。不以登记提示开头的，整条按孩子的话查。没登记任何提示时，没有任何豁免。每条至少 32 个字符、至多 16 KiB，最多 64 条，不能重复；登记的提示自己要先过越狱类规则，否则配置加载失败。代码：`crates/idoris-router/src/cloud/safety/config.rs:20-32`、`src/cloud/safety/extract.rs:23-30`。设计稿 §7。（审查修复后新增，提交 05cb15b4）
-- **S6-16**：对话历史里的 `assistant` 消息是客户端写的。本分支按输出规则查，再按输入规则查。请求类输入规则（`HISTORY_REFUSAL_EXEMPT`：自伤方法请求、危险复合短语、点火、混合毒气、成人内容请求 / 提到、诱导泄露）在命中旁边同一句里有明确拒绝语，或 `ไม่ได้` 紧跟在命中后面（6 个字符之内）时放行。自伤的第一人称表达、自伤词、越狱人格没有豁免；整词匹配、没有命中区间的规则也不放行。拒绝语因此不会让对话永远继续不下去，但安全引导里复述的自伤表达会被规则拦下。owner 2026-11-14 已改口径：自伤类只按输出规则 + LLM 检查器判断，实现不在本分支（见本附录「已拍板（owner，2026-11-14）」）。代码：`crates/idoris-router/src/cloud/safety/extract.rs:27`、`src/cloud/safety/rules.rs:18-21`、`src/cloud/safety/rules.rs:39-43`。设计稿 §7。（审查修复后新增，提交 05cb15b4；第三轮修复，提交 c8717442）
+- **S6-16**：对话历史里的 `assistant` 消息是客户端写的。按输出规则查，再加上请求类和越狱类输入规则。自伤的表达和提及不跑在助手历史上（伪造的第一人称交给输出规则和 LLM 检查器）；索要方法仍是请求类，照查。请求类输入规则在命中旁边同一句里有明确拒绝语，或 `ไม่ได้` 紧跟在命中后面（6 个字符之内）时放行。越狱类没有这道放行。owner 2026-11-14 方案 B 已合入（合并提交 ffe71855）。代码：`crates/idoris-router/src/cloud/safety/rules.rs:18-21`、`src/cloud/safety/rules.rs:848-849`、`src/cloud/safety/rules.rs:864-869`。设计稿 §7。（审查修复后新增，提交 05cb15b4；第三轮修复，提交 c8717442；方案 B 合入，提交 ffe71855）
 - **S6-17**：处理儿童数据的请求，供应商请求号不原样落盘。存 SHA-256 的前 128 位，形式是 `sha256:` 加 32 个十六进制字符。对账时对账单上的请求号做同样的摘要再比对。格式仍按原文校验，不对的只留标注。代码：`crates/idoris-router/src/cloud/run.rs:40-50`、`src/cloud/run.rs:202-227`。设计稿 §6、§7、§10。（审查修复后新增，提交 05cb15b4）
 - **S6-18**：工具参数必须是合法 JSON，且任何一层都不能有重复键（键解码之后同名也算，包括嵌套 JSON 字符串里的对象）。解析不了、嵌套深到解析上限、或有重复键，整条按失败即关闭拒绝：HTTP 503，`safety_unavailable`，细节 `malformed`。输入侧在出网前拒绝；输出侧不把回答交给客户端。只是恰好以 `{` 或 `[` 开头、解析不了的普通文本仍当文本。代码：`crates/idoris-router/src/cloud/safety/extract.rs:15-17`、`src/cloud/safety/extract.rs:412-417`、`src/cloud/safety/mod.rs:697-703`、`src/cloud/handler.rs:413-418`。设计稿 §7。（审查修复后新增，提交 05cb15b4；第三轮修复，提交 7d6776fd）
 - **S6-19**：LLM 检查器先看工具参数的完整原文（`part: tool_call_arguments`，数字、布尔、`null` 都在）。原文里有 `\u` 转义时再补一段还原之后的键和字符串值（`part: tool_call_arguments_decoded`），补充，不是替代。没有 `\u` 不重复发。规则检查器的输入侧同样先取原文，再取解码之后的键和字符串值。代码：`crates/idoris-router/src/cloud/safety/extract.rs:121-136`、`src/cloud/safety/llm.rs:583-595`。设计稿 §7。（第三轮修复，提交 341a5766）

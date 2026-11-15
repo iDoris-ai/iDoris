@@ -1926,6 +1926,105 @@ fn admin_membership(id: &str, principal: &str, org: &str) -> Membership {
 }
 
 #[test]
+fn an_outsider_cannot_tell_whether_a_principal_is_active_revoked_or_missing_when_attaching_a_membership()
+ {
+    // r1-M2：建成员关系时，主体状态如果在归属方授权之前返回，外部组织就能区分
+    // 活跃（out_of_scope）、已撤销（principal_revoked）、不存在（invalid_membership）。
+    // 三种失败必须逐字节相同；归属方自己仍然看得到原来的具体原因。
+    let env = Env::new();
+    let (edu, other) = principal_world(&env);
+    assert_eq!(
+        Action::CreatePrincipal {
+            principal: "dead",
+            org: "eduai"
+        }
+        .run(&env, &edu.who(), T0 + 2),
+        Ok(WriteResult::Created)
+    );
+    assert_eq!(
+        Action::RevokePrincipal {
+            principal: "dead",
+            org: "eduai"
+        }
+        .run(&env, &edu.who(), T0 + 3),
+        Ok(WriteResult::Updated)
+    );
+    env.account("acct-b", AccountKind::Member, Some("school-b"));
+
+    let attach = |principal: &str, id: &str| {
+        let rid = env.rid();
+        env.store.control_create_membership(
+            &other.who(),
+            &env.meta(T0 + 4, &rid),
+            &CreateMembership {
+                membership: Membership {
+                    id: mid(id),
+                    principal: pid(principal),
+                    org: aid("school-b"),
+                    role: MembershipRole::Member,
+                    account: Some(aid("acct-b")),
+                    status: MembershipStatus::Active,
+                },
+            },
+        )
+    };
+    let active = attach("victim", "m-active").expect_err("active principal");
+    let revoked = attach("dead", "m-dead").expect_err("revoked principal");
+    let missing = attach("ghost", "m-ghost").expect_err("missing principal");
+    assert_eq!(active, Failure::new(ControlReason::OutOfScope));
+    assert_eq!(active, revoked, "活跃和已撤销必须是同一个失败");
+    assert_eq!(active, missing, "活跃和不存在必须是同一个失败");
+    assert_eq!(active.to_string(), revoked.to_string());
+    assert_eq!(active.to_string(), missing.to_string());
+
+    env.account("acct-dead", AccountKind::Member, Some("eduai"));
+    let rid = env.rid();
+    let owner = env
+        .store
+        .control_create_membership(
+            &edu.who(),
+            &env.meta(T0 + 5, &rid),
+            &CreateMembership {
+                membership: Membership {
+                    id: mid("m-owner-dead"),
+                    principal: pid("dead"),
+                    org: aid("eduai"),
+                    role: MembershipRole::Member,
+                    account: Some(aid("acct-dead")),
+                    status: MembershipStatus::Active,
+                },
+            },
+        )
+        .expect_err("the owner still learns the concrete reason");
+    assert_eq!(
+        owner,
+        Failure::with_detail(
+            ControlReason::PrincipalRevoked,
+            "principal dead has been revoked"
+        )
+    );
+
+    let rid = env.rid();
+    let operator = env
+        .store
+        .control_create_membership(
+            &Env::operator(),
+            &env.meta(T0 + 6, &rid),
+            &CreateMembership {
+                membership: admin_membership("m-op-ghost", "ghost", "school-b"),
+            },
+        )
+        .expect_err("the operator still sees that the principal is not registered");
+    assert_eq!(
+        operator,
+        Failure::with_detail(
+            ControlReason::InvalidMembership,
+            "principal ghost is not registered"
+        )
+    );
+}
+
+#[test]
 fn another_organization_cannot_attach_itself_to_a_principal_it_did_not_register() {
     // Codex r1 #1 / PR-Daemon S2 F3：eduai 登记了主体 `victim`（还没有成员关系）。school-b 的管理员给它加一个属于
     // school-b 的 admin 成员关系——旧代码只检查目标账户的权限（school-b 自己的），放行；之后撤销时有了成员关系，
@@ -2514,7 +2613,10 @@ fn accounts_and_memberships_are_idempotent_and_validated_by_the_contract() {
             account: "acct-y"
         }
         .run(&env, &who, T0 + 11),
-        Err(ControlReason::InvalidMembership)
+        // 主体不存在，而这张凭证不是它的归属方（不存在的主体没有归属方）：和「活跃 / 已撤销但不归自己」
+        // 同一个 out_of_scope。原来这里是 invalid_membership（「principal nobody is not registered」），
+        // 外部组织能靠它判断主体有没有登记（r1-M2）。本机运维仍然看得到那句细节。
+        Err(ControlReason::OutOfScope)
     );
     // 一个付款账户只能属于一个成员关系
     assert_eq!(

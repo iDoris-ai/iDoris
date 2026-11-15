@@ -37,8 +37,24 @@ use idoris_compute_contracts::control::ControlReason;
 
 type Plane = State<Arc<ControlPlane>>;
 
+tokio::task_local! {
+    static BOUND_REQUEST_ID: String;
+}
+
+/// 把这一次请求的记录号放进任务本地变量。云入口最外层的 `record_id_middleware` 已经生成过一个
+/// （`RequestRecordId`）；控制面的响应体、审计行和响应头必须用同一个。没有这层中间件时（组织形态、
+/// 直接测 `control::router`）就在这里现生成一个。
+pub(super) async fn scope_request_id<F>(id: String, future: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    BOUND_REQUEST_ID.scope(id, future).await
+}
+
 fn new_request_id() -> String {
-    Uuid::new_v4().to_string()
+    BOUND_REQUEST_ID
+        .try_with(Clone::clone)
+        .unwrap_or_else(|_| Uuid::new_v4().to_string())
 }
 
 /// 从 `Authorization` 头认出密钥的哈希。头缺失、重复、格式不对（包括 Admin token：没有 `idk_` 前缀）一律返回 `None`，

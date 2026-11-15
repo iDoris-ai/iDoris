@@ -358,6 +358,78 @@ async fn a_cancelled_request_does_not_give_its_authentication_slot_back_while_th
     assert_eq!(w.send(&random_credential_request(&w, 9)).await.status, 401);
 }
 
+/// L-5：认证通过之后的 `resolve` 也占着同一个名额，直到解析的阻塞任务结束。
+/// 有效凭证反复「发起再取消」时，在途的解析不能超过名额。
+#[tokio::test]
+async fn cancelled_requests_cannot_pile_up_blocking_resolves_past_the_auth_slot_cap() {
+    use idoris_router::cloud::ingress::caller::ResolvePause;
+
+    let w = World::new(
+        WorldOptions::plenty().ingress(IngressYaml::default().abuse(&format!(
+            "{ROOMY_ANONYMOUS}  auth_failures: {{max_failures: 1000, window_secs: 60}}\n  auth_max_concurrent: 2\n  auth_unknown: {{requests_per_minute: 60, burst: 1}}\n"
+        ))),
+    )
+    .await;
+    let legit = Req::chat(w.cred("svc_eduai")).member("kid-1");
+    let warmed = w.send(&legit).await;
+    assert_eq!(warmed.status, 200, "{}", warmed.text());
+
+    let pause = ResolvePause::new();
+    let (held_tx, held_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let holder = {
+        let pause = Arc::clone(&pause);
+        std::thread::spawn(move || {
+            let _guard = pause.lock_gate();
+            held_tx.send(()).unwrap();
+            let _ = release_rx.recv();
+        })
+    };
+    held_rx.recv().unwrap();
+    w.ingress.pause_resolve_for_test(Arc::clone(&pause));
+
+    let first = w.spawn(legit.clone());
+    let second = w.spawn(legit.clone());
+    for _ in 0..200 {
+        if pause.arrived.load(Ordering::SeqCst) >= 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(pause.arrived.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        w.ingress.auth_budget().available_slots(),
+        0,
+        "the two resolves are in flight and must still hold their auth slots"
+    );
+    first.abort();
+    second.abort();
+    assert!(first.await.unwrap_err().is_cancelled());
+    assert!(second.await.unwrap_err().is_cancelled());
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(w.ingress.auth_budget().available_slots(), 0);
+    for _ in 0..3 {
+        let overflow = answered_quickly(&w, &legit).await;
+        assert_eq!(overflow.status, 429);
+        assert_eq!(overflow.code(), "auth_capacity_limited");
+    }
+    assert_eq!(
+        pause.arrived.load(Ordering::SeqCst),
+        2,
+        "the overflow was refused before resolve, so it did not start another blocking task"
+    );
+    release_tx.send(()).unwrap();
+    holder.join().unwrap();
+    for _ in 0..500 {
+        if w.ingress.auth_budget().available_slots() == 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(w.ingress.auth_budget().available_slots(), 2);
+    assert_eq!(w.send(&legit).await.status, 200);
+}
+
 /// R3 N2 的另一半：用一张**曾经认证成功**的凭证反复「发起再取消」，可以绕开「未知前缀」的查询预算（在用的前缀不消耗它），
 /// 如果名额随请求 future 一起归还，同样能攒出超过上限的阻塞任务、耗尽阻塞线程池。在途名额对在用的凭证同样是真的上限。
 #[tokio::test]
