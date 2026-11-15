@@ -893,14 +893,34 @@ fn a_monthly_free_tier_for_three_months_never_pushes_credit_use_past_the_credit_
         "授信占用从不超过授信额度: {books:?}"
     );
     assert_eq!(
-        books.spent, 430,
-        "三个月一共花了 3 个月的免费额度（100 + 100 + 30）加授信 200"
+        (books.covered, books.credit_debt, books.spent),
+        (230, 200, 430),
+        "三个月一共花了 430：三个月免费额度里花掉的 100 + 100 + 30，加授信 200"
     );
 
-    // 守恒：三个月花的钱 = 额度覆盖的 + 授信承担的，补贴池只为免费额度买单
-    assert_eq!(books.covered, 230);
-    let report = store.pool_report(&aid("pool"), month(2026, 11)).unwrap();
-    assert_eq!(report.granted, thb(100));
+    // 守恒：沿链每一层账都对得上。链上每个账户对同一笔花费各记一条，所以补贴池每个账期的消耗就是成员那个月花掉的钱
+    // （含授信承担的那部分：池的上限卡的是整条链的总消耗），老师账上的总额是三个月的总和；池发出去的免费额度每月 100，
+    // 2 月没发。
+    for (y, m, consumed, granted) in [
+        (2026, 11, 300, 100),
+        (2026, 12, 100, 100),
+        (2027, 1, 30, 100),
+        (2027, 2, 0, 0),
+    ] {
+        let report = store.pool_report(&aid("pool"), month(y, m)).unwrap();
+        assert_eq!(
+            (report.consumed, report.granted),
+            (thb(consumed), thb(granted)),
+            "{y}-{m}"
+        );
+    }
+    assert_eq!(
+        scalar(
+            &db,
+            "SELECT COALESCE(SUM(held_micros + spent_micros), 0) FROM ledger_entries WHERE account_id = 'teacher'"
+        ),
+        430
+    );
     assert_clean(&store);
 }
 
@@ -1087,6 +1107,63 @@ fn a_revoked_allowance_is_never_spendable_even_when_the_books_are_read_before_it
     assert_clean(&store);
 }
 
+#[test]
+fn a_late_settlement_lands_in_the_window_of_its_settlement_time() {
+    // 预留过了 TTL 才结算：过期那一刻额度放回去（`expire` 记在预留创建的时刻上，净额回到 0），迟到的结算记在结算的时刻上
+    // （`late_settle`），所以它落在结算那一刻的额度窗口里：额度还在，就由额度覆盖；额度已经到期，就是授信债务（overage）。
+    for (window_minutes, covered_by_allowance) in [(60_i64, true), (10, false)] {
+        let db = TempDb::new(&format!("books-late-settle-{window_minutes}"));
+        let store = credit_only_world(&db);
+        credit_line(&store, "emp", 200, T0);
+        prepaid(
+            &store,
+            "emp-prepaid-1",
+            100,
+            T0,
+            T0 + window_minutes * MINUTE,
+            T0,
+        );
+        let req = Req::new(&store, "r-late", 0, "cred-e", M100).at(T0 + 1_000);
+        assert!(admit(&store, &req).is_admitted());
+        // 在途：占着额度
+        let books = check_books(&store, &db, "emp", T0 + 2_000);
+        assert_eq!(
+            (books.allowance_left, books.covered, books.credit_debt),
+            (0, 100, 0)
+        );
+
+        // 过了 TTL，扫掉过期的预留：占着的额度放回账上（10 分钟的那笔额度此时已经到期了，放回去也没有额度可用）
+        let ttl = store.ledger_config().unwrap().reservation_ttl_ms;
+        let settle_at = T0 + 1_000 + ttl + 5_000;
+        assert_eq!(store.sweep_expired_holds(ts(settle_at - 1_000)).unwrap(), 1);
+        let books = check_books(&store, &db, "emp", settle_at - 500);
+        assert_eq!((books.covered, books.credit_debt, books.spent), (0, 0, 0));
+        assert_eq!(
+            books.allowance_left,
+            if covered_by_allowance { 100 } else { 0 },
+            "{window_minutes} 分钟的窗口"
+        );
+
+        // 迟到的结算：整笔是预留之外的（overage），担保人在授信范围内吸收；账上记在结算那一刻
+        let outcome = store
+            .settle_attempt(&req.attempt, &price(100), ts(settle_at))
+            .unwrap();
+        assert!(outcome.late, "{outcome:?}");
+        let books = check_books(&store, &db, "emp", settle_at + 500);
+        let expected = if covered_by_allowance {
+            (0, 100, 0)
+        } else {
+            (0, 0, 100)
+        };
+        assert_eq!(
+            (books.allowance_left, books.covered, books.credit_debt),
+            expected,
+            "{window_minutes} 分钟的窗口：{books:?}"
+        );
+        assert_clean(&store);
+    }
+}
+
 // ------------------------------------------------------------------------------------------
 // 并发：24 个线程同时来，额度和授信各自恰好用掉该用的
 // ------------------------------------------------------------------------------------------
@@ -1259,7 +1336,7 @@ fn an_account_with_funds_is_unchanged_by_separate_books() {
 // 随机历史：视图、独立模型、准入决定三方对得上
 // ------------------------------------------------------------------------------------------
 
-/// xorshift64*：不要依赖，确定性。
+/// xorshift64*：不引入依赖，结果确定。
 struct Rng(u64);
 
 impl Rng {
@@ -1302,8 +1379,8 @@ struct Reached {
     released: u32,
     half_settled: u32,
     in_flight_at_check: u32,
-    /// 有额度到期之后债务仍留着。
-    debt_after_expiry: u32,
+    /// 已经发过额度，但此刻额度剩余是 0（花光、到期或被撤销之后），债务仍留着。
+    debt_without_allowance: u32,
 }
 
 impl Reached {
@@ -1317,7 +1394,7 @@ impl Reached {
         self.released += other.released;
         self.half_settled += other.half_settled;
         self.in_flight_at_check += other.in_flight_at_check;
-        self.debt_after_expiry += other.debt_after_expiry;
+        self.debt_without_allowance += other.debt_without_allowance;
     }
 }
 
@@ -1428,7 +1505,7 @@ fn run_random_history(seed: u64, steps: usize) -> Reached {
             reached.credit_full += 1;
         }
         if books.allowance_left == 0 && books.credit_debt > 0 && !allowances.is_empty() {
-            reached.debt_after_expiry += 1;
+            reached.debt_without_allowance += 1;
         }
         reached.in_flight_at_check += u32::from(!open.is_empty());
     }
@@ -1453,7 +1530,7 @@ fn random_histories_agree_with_the_independent_model_and_the_owner_rule() {
     assert!(total.released >= 3, "{total:?}");
     assert!(total.half_settled >= 3, "{total:?}");
     assert!(total.in_flight_at_check >= 10, "{total:?}");
-    assert!(total.debt_after_expiry >= 10, "{total:?}");
+    assert!(total.debt_without_allowance >= 10, "{total:?}");
 }
 
 fn attempt_of(request: &str) -> idoris_compute_contracts::ids::AttemptId {
