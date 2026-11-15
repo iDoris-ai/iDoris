@@ -102,8 +102,8 @@
 //!     `safety.rules_only_acknowledgement` 写了原因、确认人和不超过 90 天（UTC）的到期日。没有儿童租户时 `rules_only` 照旧。
 //!     显式放宽生效时打一行醒目警告，启动摘要写成 `rules_only (acknowledged until YYYY-MM-DD)`。**到期日在运行期间同样生效**：
 //!     确认随 `SafetySetup::into_gate` 带进 gate，每次儿童请求（输入检查、输出检查）按执行器当次的时钟再核对，到期（UTC 日历日，
-//!     到期日当天含）后没有 LLM 检查器的儿童请求一律 503 `safety_unavailable`（`cause: no_compliant_checker`），在任何上游和
-//!     检查器调用之前被拒；没有新增线上字符串，选这个已有的 cause 是因为它的含义就是「没有满足硬约束的检查器」（需 owner 确认）。
+//!     到期日当天含）后没有 LLM 检查器的儿童请求不再放行，在上游调用和检查器的完整检查之前被拒：免费的规则预检先跑，命中是
+//!     422（带类别，自伤是 `self_harm`），其余是 503 `safety_unavailable`（`cause: no_compliant_checker`）；没有新增线上字符串，选这个已有的 cause 是因为它的含义就是「没有满足硬约束的检查器」（需 owner 确认）。
 //! 21. **安全检查的成本走 S3 的账本**（[`safety::LedgerExtraCost`]，生产装配 [`CloudUpstream::from_file`] 装上）：输入检查在任何
 //!     尝试之前、输出检查在回答出来之后，各用 `reserve_request_component` 预留一次（component `safety_input` / `safety_output`，
 //!     都挂在这个请求的 `#0` 名下，不依赖作答的是哪一次尝试），检查完用 `settle_component` 按实际用量结算。预留额按检查器**最终要
