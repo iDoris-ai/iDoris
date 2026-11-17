@@ -31,8 +31,12 @@
 //! | 连接不上（DNS、连接被拒、TLS） | `unreachable` |
 //! | 总期限内没读完 | `timeout` |
 //! | 2xx 但 `usage` 里的 token 数超出调用记录能存的范围（i64） | `invalid_response` |
-//! | 出网前的最后一道门拦下了它，或连接还在建立、请求体还没被 poll（正文还没开始发送）时熔断打开 | `cancelled`（[`CloudFailure::Withheld`]：调用方拿到本机原来的响应，没有 attempt 头） |
-//! | 请求体已经被 poll（正文可能已经写出）之后熔断才打开 | `cancelled`（[`CloudFailure::PossiblySent`]：调用方拿到本机原来的响应，并带 `X-iDoris-Cloud-Attempt: cancelled`） |
+//! | 出网前的最后一道门拦下了它；或熔断取消在「取消 / 正文开始交付」的原子竞争里**赢了**（请求体此后拒绝交付任何字节） | `cancelled`（[`CloudFailure::Withheld`]：调用方拿到本机原来的响应，没有 attempt 头） |
+//! | 熔断打开时请求体已经**赢得**了交付（正文可能已经写出） | `cancelled`（[`CloudFailure::PossiblySent`]：调用方拿到本机原来的响应，并带 `X-iDoris-Cloud-Attempt: cancelled`） |
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::time::Duration;
 
 use axum::body::Bytes;
 use futures_util::StreamExt;
@@ -89,10 +93,11 @@ pub enum CloudFailure {
     },
     /// 传输层在请求发出之后出了别的错（连接中途被重置……）：请求可能已经到达。
     Transport,
-    /// 出网前的最后一道检查（远程熔断）把请求拦下了，或者熔断打开时还能证明请求正文没有开始发送
-    /// （hyper 还没有 poll 过请求体，典型是连接还停在 SYN_SENT）：**请求正文没有离开本机**。
+    /// 出网前的最后一道检查（远程熔断）把请求拦下了，或者熔断取消在「取消 / 正文开始交付」的原子竞争里**赢了**
+    /// （`EgressLatch` 上的 `Idle -> Cancelled`）：请求体从此拒绝交付任何字节，请求头也没有被写出——**请求没有离开本机**。
+    /// 只有赢了这场竞争才能说这句话；证明不了就是 [`PossiblySent`](CloudFailure::PossiblySent)。
     Withheld,
-    /// 熔断在请求体已经被 poll 之后才打开。正文可能已经写进套接字，不能再当成零出网。
+    /// 熔断打开时，请求体已经**赢得**了交付（`Idle -> Streaming`）：正文可能已经写进套接字，不能再当成零出网。
     /// 结局仍是 [`CallOutcome::Cancelled`]：调用记录表的 `outcome` CHECK 没有单独的取值，不加新结局。
     /// 调用方靠 `X-iDoris-Cloud-Attempt: cancelled` 知道「可能已经发出」；仅凭记录行分不出
     /// 这一支、[`Withheld`](CloudFailure::Withheld) 和调用方自己断开（三者都是 `cancelled`，没有云端 id、没有金额）。
@@ -109,7 +114,7 @@ impl CloudFailure {
             CloudFailure::Answered { outcome, .. } => *outcome,
             CloudFailure::Transport => CallOutcome::CloudError,
             // 记成 cancelled：这一行在发送之前就落下了（先写后出网），它必须有终态；没有答复、没有云端 id、没有金额。
-            // Withheld 是正文还没开始发送；PossiblySent 是正文可能已经发出。表的 CHECK 没有第三种写法，所以两者都记 cancelled。
+            // Withheld 是取消赢了、正文一个字节都没有交付；PossiblySent 是正文可能已经发出。表的 CHECK 没有第三种写法，所以两者都记 cancelled。
             CloudFailure::Withheld | CloudFailure::PossiblySent => CallOutcome::Cancelled,
         }
     }
@@ -193,6 +198,12 @@ fn classify_transport(error: &reqwest::Error) -> CloudFailure {
     }
 }
 
+/// 出网边界上「此刻还能不能发」的答案：`true` = 还能发。
+///
+/// 共享（`Arc`）、可跨线程、`'static`：请求体在 hyper 的**后台连接任务**里被 poll，它要在**交付字节的那一刻**自己再问一次
+/// （见 [`EgressLatch`]）；借来的闭包做不到这一点。
+pub(super) type StillAllowed = Arc<dyn Fn() -> bool + Send + Sync>;
+
 /// 发请求。`_permit` 是出网凭条（只有 `gate::grant` 能造）：没有它就发不了。
 ///
 /// `still_allowed` 是**出网边界上的最后一道门**：请求构造好之后、第一次真正去发之前调用，返回 `false` 就什么都不发
@@ -200,10 +211,29 @@ fn classify_transport(error: &reqwest::Error) -> CloudFailure {
 /// 落 `pending` 行这些让出点，远程熔断可能在这期间被打开（它是个共享的原子变量）；调用方在这里给出**此刻**的答案，
 /// 而不是闸门那一刻的快照。
 ///
-/// 这一下通过之后，`request.send()` 要等连接，并且要等云端把响应头送回来，请求正文是在连上之后才写的
-/// （审查 r4#1 复审）。等待期间熔断再打开，就丢掉这个发送 future。只有还能证明请求体没被 poll 过
-/// （[`BodyPollFlag`] 仍是 false，连接多半还停在 SYN_SENT）才按 [`CloudFailure::Withheld`] 返回。
-/// 请求体一旦被 poll，正文可能已经离开本机，按 [`CloudFailure::PossiblySent`] 返回。已经拿到响应不再收回。
+/// # 熔断和「正文开始交付」是同一个原子转换（审查 r4 复审、第六轮）
+///
+/// 这一下通过之后，`request.send()` 要等连接，并且要等云端把响应头送回来。请求正文是 hyper 在**独立的后台连接任务**里取走的：
+/// 连接就绪之后，它先把请求头写进缓冲，**第一次 poll 请求体**，再一起写出。这个动作和这里的 `select!`（熔断分支）不在同一个任务里，
+/// 没有天然的先后；只靠「轮询一个标志」做不到安全：
+///
+/// - 熔断轮询（10 毫秒一轮）和请求体交付之间有窗口：轮询看过之后熔断才打开，下一次轮询之前连接就绪，正文照样发出去；
+/// - 熔断那一边「读到标志还没置位，于是报 `Withheld`」，和请求体「随后置位、取走正文、写出」之间没有任何同步：读标志不阻止后面的发送，
+///   结果是正文实际外送了，却报成没出网（审查 r4 新问题）。
+///
+/// 所以两边不再靠读标志约定，而是在**同一个原子变量**（[`EgressLatch`]）上竞争同一个状态转换，只有一方能赢：
+///
+/// - 请求体第一次被 poll、要交付字节时：**先复核熔断此刻的值**（`still_allowed`），仍然放行才去抢 `Idle -> Streaming`；熔断已经打开、
+///   或者抢输了，就拒绝交付——返回一个错误，一个字节都不给 hyper（请求头还在缓冲里，也不会被写出）；
+/// - 熔断分支看到熔断打开：去抢 `Idle -> Cancelled`。抢到了，请求体此后永远拒绝交付，**这时才报 [`CloudFailure::Withheld`]**；
+///   抢输了（请求体已经赢得交付），一律 [`CloudFailure::PossiblySent`]；
+/// - 请求体因为熔断而拒绝时，`request.send()` 会带着错误返回；此时原子变量已经是 `Cancelled`，同样按 `Withheld` 返回，
+///   而不是 `Transport`。
+///
+/// 因此 `Withheld` 蕴含「请求头和正文都没有写出」，不论后台连接任务什么时候才被调度；轮询间隔只影响多快放弃等待，不影响这个保证。
+/// 熔断恰好在请求体复核通过**之后**才打开，是真的「在交付之后打开」，按 `PossiblySent` 处理——共享原子变量上不存在比这更细的切分。
+/// `send` 无论怎么结束（成功、失败、超时、调用方断开、future 被丢弃）都会把还没交付的请求体取消（[`CancelOnExit`]）：
+/// 它返回之后，后台任务不会再把正文补发出去。已经拿到响应不再收回。
 ///
 /// 只有 `cloud_tier` 模块树里的代码能调它（`pub(super)`）；而 [`EgressPermit`] 只有 `gate::grant` 能造，它同样只对这个
 /// 模块树可见：crate 外的代码调不到 `send`，也造不出凭条。文档测试钉住 `send` 的可见性
@@ -221,27 +251,63 @@ fn classify_transport(error: &reqwest::Error) -> CloudFailure {
 pub(super) async fn send(
     client: &reqwest::Client,
     config: &CloudTierConfig,
+    permit: EgressPermit,
+    credential: &CloudCredential,
+    body: &Value,
+    cancel: &CancellationToken,
+    still_allowed: StillAllowed,
+) -> Result<CloudAnswer, CloudFailure> {
+    send_probed(
+        client,
+        config,
+        permit,
+        credential,
+        body,
+        cancel,
+        still_allowed,
+        BodyProbe::default(),
+    )
+    .await
+}
+
+/// [`send`] 的实现。`probe` 在生产里是个空结构；测试用它在请求体做决定的前后停住、调整熔断轮询间隔，
+/// 把「取消」和「正文开始交付」的各种交错确定性地摆出来。
+#[allow(clippy::too_many_arguments)]
+async fn send_probed(
+    client: &reqwest::Client,
+    config: &CloudTierConfig,
     _permit: EgressPermit,
     credential: &CloudCredential,
     body: &Value,
     cancel: &CancellationToken,
-    still_allowed: &(dyn Fn() -> bool + Sync),
+    still_allowed: StillAllowed,
+    probe: BodyProbe,
 ) -> Result<CloudAnswer, CloudFailure> {
     let bytes = serde_json::to_vec(body).map_err(|_| CloudFailure::Transport)?;
+    let content_length = bytes.len();
+    let latch = Arc::new(EgressLatch::new());
+    // 不论怎么离开这个函数（返回、超时、调用方断开、future 被丢弃），还没交付的请求体都不会再交付。
+    let _settle = CancelOnExit(latch.clone());
+    let poll_period = probe.poll_period();
     // 显式 Content-Length：流式 body 的 size_hint 是未知的，不设这个头 hyper 会改成 chunked。
     // 已有 Content-Length 时 hyper 按定长写正文，并且要等连接建立、开始写正文时才 poll 请求体
     // （hyper 1.11.1 `Client::set_length`，2026-11-12 核对：
     // https://github.com/hyperium/hyper/blob/v1.11.1/src/proto/h1/role.rs ）。
     // reqwest 0.13 的 `Body::wrap_stream`（本仓库 Cargo.lock 是 0.13.5，2026-11-12 核对：
     // https://docs.rs/reqwest/0.13.5/reqwest/struct.Body.html#method.wrap_stream ）。
-    let (body, body_started) = body_polled_on_first_frame(bytes.clone());
+    let body = reqwest::Body::wrap_stream(GatedBody {
+        state: BodyState::Unsent(Bytes::from(bytes)),
+        latch: latch.clone(),
+        still_allowed: still_allowed.clone(),
+        probe,
+    });
     let request = client
         .post(config.chat_url.clone())
         .header(AUTHORIZATION, credential.authorization())
         .header(CONTENT_TYPE, "application/json")
         .header(ACCEPT, "application/json")
         .header(ACCEPT_ENCODING, "identity")
-        .header(CONTENT_LENGTH, bytes.len())
+        .header(CONTENT_LENGTH, content_length)
         .header(USER_AGENT, USER_AGENT_VALUE)
         .body(body);
     let run = async {
@@ -249,20 +315,19 @@ pub(super) async fn send(
             return Err(CloudFailure::Withheld);
         }
         // biased：发送先完成（响应头已经到了）就认这个结果，不再收回。
-        // 熔断先打开时，只有请求体还没被 poll 才能说正文没离开本机。
         let mut connecting = std::pin::pin!(request.send());
         tokio::select! {
             biased;
             () = cancel.cancelled() => Err(CloudFailure::Cancelled),
             result = &mut connecting => match result {
                 Ok(response) => read_answer(response, config.max_response_bytes).await,
+                // 请求体在交付边界上看到熔断已经打开、拒绝了交付（原子变量已经是 `Cancelled`）：
+                // 请求头和正文都没有写出，不是传输层的错
+                Err(_) if latch.is_cancelled() => Err(CloudFailure::Withheld),
                 Err(error) => Err(classify_transport(&error)),
             },
-            () = await_revoked(still_allowed) => Err(if body_started.load(std::sync::atomic::Ordering::SeqCst) {
-                CloudFailure::PossiblySent
-            } else {
-                CloudFailure::Withheld
-            }),
+            // 熔断打开了：去抢 `Idle -> Cancelled`。抢到就是 `Withheld`（此后请求体拒绝交付任何字节），抢输了就是 `PossiblySent`
+            () = await_revoked(&still_allowed, poll_period) => Err(latch.cancel()),
         }
     };
     tokio::select! {
@@ -275,49 +340,187 @@ pub(super) async fn send(
     }
 }
 
-/// 隔一会儿看一次熔断。打开了就结束，好让外面的 `select` 取消发送。
-/// 熔断是个原子变量，没有现成的唤醒；10 毫秒一轮覆盖整段 `send()`（连上之前，以及正文已经写出、还在等响应头），不拿它做超时。
-/// 到底算没出网还是可能已发出，看请求体有没有被 poll 过，不看这一轮等多久。
-const KILL_SWITCH_POLL: std::time::Duration = std::time::Duration::from_millis(10);
+/// 隔一会儿看一次熔断。打开了就结束，好让外面的 `select` 去取消发送。
+/// 熔断是个原子变量，没有现成的唤醒；这一轮只决定「多快放弃等待」（10 毫秒一轮覆盖整段 `send()`：连上之前，以及正文已经写出、
+/// 还在等响应头），**不**决定安全：请求体在交付字节的那一刻自己再复核熔断，取消和交付在同一个原子变量上竞争
+/// （见 [`send`] 的说明），所以把这个间隔缩短、拉长，都不会让正文在熔断打开之后发出去，也不会让 `Withheld` 说错。
+const KILL_SWITCH_POLL: Duration = Duration::from_millis(10);
 
-/// 包一层请求体：hyper 第一次 poll 它时把 `started` 置位。在这之前可以证明正文还没开始发送。
-fn body_polled_on_first_frame(
-    bytes: Vec<u8>,
-) -> (reqwest::Body, std::sync::Arc<std::sync::atomic::AtomicBool>) {
-    let started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let body = reqwest::Body::wrap_stream(BodyPollFlag {
-        started: started.clone(),
-        chunk: Some(Bytes::from(bytes)),
-    });
-    (body, started)
+async fn await_revoked(still_allowed: &StillAllowed, period: Duration) {
+    loop {
+        if !still_allowed() {
+            return;
+        }
+        tokio::time::sleep(period).await;
+    }
 }
 
-/// [`body_polled_on_first_frame`] 交给 `reqwest::Body::wrap_stream` 的流。
-struct BodyPollFlag {
-    started: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    chunk: Option<Bytes>,
+// 出网的原子状态。
+const IDLE: u8 = 0;
+const STREAMING: u8 = 1;
+const CANCELLED: u8 = 2;
+
+/// 「熔断取消成功」和「正文开始交付字节」是**同一个原子变量上两个互斥的转换**，谁先到谁赢，只有一方能赢：
+///
+/// ```text
+///               begin_delivery()  请求体第一次被 poll，熔断仍然放行
+///   Idle ───────────────────────────────▶ Streaming   正文可能已经写出；此后熔断只能报 PossiblySent
+///     │
+///     └───────────────────────────────▶ Cancelled   取消赢了；请求体此后拒绝交付任何字节；可以报 Withheld
+///               cancel()  熔断分支看到熔断打开
+/// ```
+///
+/// 状态不会倒退：`Streaming` 和 `Cancelled` 都是终态。
+struct EgressLatch(AtomicU8);
+
+impl EgressLatch {
+    fn new() -> Self {
+        Self(AtomicU8::new(IDLE))
+    }
+
+    /// 请求体要开始交付字节了。`true` = 可以交付（这一次赢得了 `Idle -> Streaming`，或者早就在交付中）；
+    /// `false` = 取消已经赢了，一个字节都不能交。
+    fn begin_delivery(&self) -> bool {
+        matches!(
+            self.0
+                .compare_exchange(IDLE, STREAMING, Ordering::SeqCst, Ordering::SeqCst),
+            Ok(_) | Err(STREAMING)
+        )
+    }
+
+    /// 熔断要取消这次发送。赢了（`Idle -> Cancelled`，或者已经被取消）：[`CloudFailure::Withheld`]，
+    /// 此后请求体拒绝交付任何字节；输了（请求体已经在交付）：[`CloudFailure::PossiblySent`]，正文可能已经写出。
+    fn cancel(&self) -> CloudFailure {
+        match self
+            .0
+            .compare_exchange(IDLE, CANCELLED, Ordering::SeqCst, Ordering::SeqCst)
+        {
+            Ok(_) | Err(CANCELLED) => CloudFailure::Withheld,
+            Err(_) => CloudFailure::PossiblySent,
+        }
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::SeqCst) == CANCELLED
+    }
 }
 
-impl futures_util::Stream for BodyPollFlag {
-    type Item = Result<Bytes, std::convert::Infallible>;
+/// `send` 结束（不论怎么结束）时取消还没交付的请求体：返回之后，后台连接任务不会再把正文补发出去。
+/// 已经在交付（`Streaming`）的不受影响。
+struct CancelOnExit(Arc<EgressLatch>);
+
+impl Drop for CancelOnExit {
+    fn drop(&mut self) {
+        let _ = self.0.cancel();
+    }
+}
+
+/// 请求体在交付边界上拒绝交付时给 hyper 的错误。不含任何请求内容或密钥。
+#[derive(Debug)]
+struct BodyRefused;
+
+impl std::fmt::Display for BodyRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the request body was not delivered: the remote kill switch is on")
+    }
+}
+
+impl std::error::Error for BodyRefused {}
+
+enum BodyState {
+    /// 正文还没交付。
+    Unsent(Bytes),
+    /// 已经交付（流到头了）。
+    Sent,
+    /// 拒绝了交付（熔断赢了，或者熔断此刻是开着的）。之后每一次 poll 都还是拒绝。
+    Refused,
+}
+
+/// 交给 `reqwest::Body::wrap_stream` 的请求体：**第一次被 poll 就是交付边界**，在这里做决定，不在别处。
+///
+/// 它必须**立刻**给出结果（`Ready`），不能 `Pending`：hyper 在 poll 请求体返回 `Pending` 时会先把已经缓冲的请求头
+/// （含 `Authorization`）冲出去。拒绝时返回的 `Err` 则不会：hyper 1.11.1 的 `Dispatcher::poll_write` 里，`write_head` 只把请求头
+/// 写进缓冲，紧接着在同一个循环里 poll 请求体，请求体出错就直接返回错误，连接被丢弃时缓冲里的请求头没有被冲出去
+/// （2026-11-17 核对：https://github.com/hyperium/hyper/blob/v1.11.1/src/proto/h1/dispatch.rs ）。
+/// 这是依赖的行为，不是我们的保证：`interleaving` 测试里「云端收到 0 字节」的断言就是钉它的，升级 hyper 之后若变了，
+/// 那些测试会失败。
+struct GatedBody {
+    state: BodyState,
+    latch: Arc<EgressLatch>,
+    still_allowed: StillAllowed,
+    probe: BodyProbe,
+}
+
+impl futures_util::Stream for GatedBody {
+    type Item = Result<Bytes, BodyRefused>;
 
     fn poll_next(
         self: std::pin::Pin<&mut Self>,
         _cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
         let this = self.get_mut();
-        this.started
-            .store(true, std::sync::atomic::Ordering::SeqCst);
-        std::task::Poll::Ready(this.chunk.take().map(Ok))
+        match std::mem::replace(&mut this.state, BodyState::Sent) {
+            BodyState::Sent => std::task::Poll::Ready(None),
+            BodyState::Refused => {
+                this.state = BodyState::Refused;
+                std::task::Poll::Ready(Some(Err(BodyRefused)))
+            }
+            BodyState::Unsent(chunk) => {
+                this.probe.before_decision();
+                // 交付边界上的复核：熔断此刻是不是开着。开着就是取消赢了（我们自己去抢 `Idle -> Cancelled`，
+                // 熔断分支的轮询来不来得及看到，不影响结果）；还放行才去抢 `Idle -> Streaming`，抢输了说明取消已经赢了。
+                let deliver = if (this.still_allowed)() {
+                    this.latch.begin_delivery()
+                } else {
+                    let _ = this.latch.cancel();
+                    false
+                };
+                if !deliver {
+                    this.state = BodyState::Refused;
+                    return std::task::Poll::Ready(Some(Err(BodyRefused)));
+                }
+                this.probe.delivery_won();
+                std::task::Poll::Ready(Some(Ok(chunk)))
+            }
+        }
     }
 }
 
-async fn await_revoked(still_allowed: &(dyn Fn() -> bool + Sync)) {
-    loop {
-        if !still_allowed() {
-            return;
+/// 测试注入点。生产里是个空结构，什么都不做。
+#[derive(Clone, Default)]
+struct BodyProbe {
+    /// 请求体第一次被 poll、还没做决定之前调用（可以停住这个线程）。
+    #[cfg(test)]
+    before_decision: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// 请求体赢得 `Idle -> Streaming`、还没把字节交给 hyper 之前调用。
+    #[cfg(test)]
+    delivery_won: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// 熔断轮询的间隔（缺省 [`KILL_SWITCH_POLL`]）。拉得很长，取消那一边就来不及看：这时拦住正文的只有交付边界上的复核。
+    #[cfg(test)]
+    poll_period: Option<Duration>,
+}
+
+impl BodyProbe {
+    fn before_decision(&self) {
+        #[cfg(test)]
+        if let Some(hook) = &self.before_decision {
+            hook();
         }
-        tokio::time::sleep(KILL_SWITCH_POLL).await;
+    }
+
+    fn delivery_won(&self) {
+        #[cfg(test)]
+        if let Some(hook) = &self.delivery_won {
+            hook();
+        }
+    }
+
+    fn poll_period(&self) -> Duration {
+        #[cfg(test)]
+        if let Some(period) = self.poll_period {
+            return period;
+        }
+        KILL_SWITCH_POLL
     }
 }
 
@@ -474,6 +677,11 @@ mod tests {
         idoris_upstream::cloud::build_http_client(config.connect_timeout).unwrap()
     }
 
+    /// 把一个闭包包成 `send` 要的共享形状。
+    fn still(check: impl Fn() -> bool + Send + Sync + 'static) -> StillAllowed {
+        Arc::new(check)
+    }
+
     async fn call(server: &MockServer, extra: &str) -> Result<CloudAnswer, CloudFailure> {
         let config = config(server, extra);
         send(
@@ -483,7 +691,7 @@ mod tests {
             &CloudCredential::parse(&secret()).unwrap(),
             &json!({"model": "idoris/agent", "messages": [{"role": "user", "content": "hi"}]}),
             &CancellationToken::new(),
-            &|| true,
+            still(|| true),
         )
         .await
     }
@@ -913,7 +1121,7 @@ mod tests {
             &CloudCredential::parse(&secret()).unwrap(),
             &json!({}),
             &CancellationToken::new(),
-            &|| true,
+            still(|| true),
         )
         .await;
         assert_eq!(outcome.unwrap_err(), CloudFailure::Unreachable);
@@ -935,7 +1143,7 @@ mod tests {
             &CloudCredential::parse(&secret()).unwrap(),
             &json!({}),
             &CancellationToken::new(),
-            &|| true,
+            still(|| true),
         )
         .await;
         assert_eq!(outcome.unwrap_err(), CloudFailure::Timeout);
@@ -964,7 +1172,7 @@ mod tests {
             &CloudCredential::parse(&secret()).unwrap(),
             &json!({}),
             &cancel,
-            &|| true,
+            still(|| true),
         )
         .await;
         assert_eq!(outcome.unwrap_err(), CloudFailure::Cancelled);
@@ -991,7 +1199,7 @@ mod tests {
             &CloudCredential::parse(&secret()).unwrap(),
             &json!({"model": "idoris/agent", "messages": []}),
             &CancellationToken::new(),
-            &|| false,
+            still(|| false),
         )
         .await;
         assert_eq!(outcome.unwrap_err(), CloudFailure::Withheld);
@@ -1007,7 +1215,7 @@ mod tests {
             &CloudCredential::parse(&secret()).unwrap(),
             &json!({"model": "idoris/agent", "messages": []}),
             &CancellationToken::new(),
-            &|| true,
+            still(|| true),
         )
         .await;
         assert!(served.is_ok());
@@ -1095,7 +1303,7 @@ mod tests {
                 &CloudCredential::parse(&secret()).unwrap(),
                 &json!({"model": "idoris/agent", "messages": [{"role": "user", "content": "hi"}]}),
                 &CancellationToken::new(),
-                &still_allowed,
+                Arc::new(still_allowed),
             )
             .await
         });
@@ -1157,7 +1365,7 @@ mod tests {
                 &CloudCredential::parse(&secret()).unwrap(),
                 &body,
                 &CancellationToken::new(),
-                &move || !flag.load(Ordering::SeqCst),
+                still(move || !flag.load(Ordering::SeqCst)),
             )
             .await
         });
@@ -1184,6 +1392,512 @@ mod tests {
         );
         assert_eq!(outcome, CloudFailure::PossiblySent);
         assert_eq!(outcome.outcome(), CallOutcome::Cancelled);
+    }
+
+    /// 原子状态只有一方能赢，而且状态不会倒退。
+    #[test]
+    fn the_egress_latch_lets_exactly_one_side_win() {
+        // 取消先到：之后一个字节都不能交
+        let latch = EgressLatch::new();
+        assert_eq!(latch.cancel(), CloudFailure::Withheld);
+        assert!(!latch.begin_delivery(), "a cancelled latch never delivers");
+        assert!(!latch.begin_delivery());
+        assert_eq!(latch.cancel(), CloudFailure::Withheld, "cancelling twice");
+        assert!(latch.is_cancelled());
+        // 交付先到：取消只能报「可能已经发出」，而且撤不回已经开始的交付
+        let latch = EgressLatch::new();
+        assert!(latch.begin_delivery());
+        assert!(latch.begin_delivery(), "already delivering");
+        assert_eq!(latch.cancel(), CloudFailure::PossiblySent);
+        assert!(!latch.is_cancelled());
+        assert!(
+            latch.begin_delivery(),
+            "a late cancel does not undo a delivery"
+        );
+        assert_eq!(latch.cancel(), CloudFailure::PossiblySent);
+    }
+
+    /// 两个线程同时抢：要么（请求体交付、取消报 PossiblySent），要么（请求体拒绝、取消报 Withheld）。
+    /// 绝不会出现「交付了却报 Withheld」，也不会出现「拒绝了却报 PossiblySent」。
+    #[test]
+    fn the_egress_latch_never_lets_both_sides_win_under_contention() {
+        for round in 0..5000 {
+            let latch = Arc::new(EgressLatch::new());
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            let (mine, gate) = (latch.clone(), barrier.clone());
+            let body = std::thread::spawn(move || {
+                gate.wait();
+                mine.begin_delivery()
+            });
+            let (mine, gate) = (latch.clone(), barrier.clone());
+            let cancel = std::thread::spawn(move || {
+                gate.wait();
+                mine.cancel()
+            });
+            let delivered = body.join().unwrap();
+            let outcome = cancel.join().unwrap();
+            assert_eq!(
+                delivered,
+                outcome == CloudFailure::PossiblySent,
+                "round {round}: delivered={delivered} but the cancel reported {outcome:?}"
+            );
+        }
+    }
+
+    /// 第六轮（审查 r4 新问题 + r4#1 复审）：「熔断取消成功」和「正文开始交付字节」的确定性交错。
+    ///
+    /// 两个窗口，都不是轮询能封住的：
+    /// - 熔断在「熔断轮询看过之后、连接就绪之前」打开，连接又在下一次轮询之前就绪，hyper 取走正文并发送——
+    ///   请求体在交付字节的那一刻必须自己再复核熔断；
+    /// - 熔断分支读到「请求体还没被 poll」就报 `Withheld`，而后台连接任务随后才 poll 请求体、写出正文——
+    ///   「取消成功」和「开始交付」必须是同一个原子变量上的两个互斥转换，不能是「读一个标志」。
+    ///
+    /// 测试用 [`BodyProbe`] 把请求体停在做决定之前 / 之后（std 的阻塞通道，停的是 hyper 的连接任务所在的线程，
+    /// 所以用多线程运行时），在那一刻打开熔断，再放行。假云端从不回应，只记它收到的字节。
+    mod interleaving {
+        use std::net::SocketAddr;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Mutex, mpsc};
+        use std::time::{Duration, Instant};
+
+        use super::*;
+
+        type Allowed = Arc<dyn Fn() -> bool + Send + Sync>;
+
+        /// 假云端：接受一个连接，一直读到对方关闭（或 5 秒），返回读到的全部字节。从不回应，也从不先关连接。
+        /// 没有连接进来（`send` 在连接之前就被拦下）时，`finish` 让它尽快收工。
+        struct SilentCloud {
+            addr: SocketAddr,
+            stop: Arc<AtomicBool>,
+            thread: std::thread::JoinHandle<Vec<u8>>,
+        }
+
+        impl SilentCloud {
+            fn start() -> Self {
+                use std::io::Read;
+                let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                listener.set_nonblocking(true).unwrap();
+                let addr = listener.local_addr().unwrap();
+                let stop = Arc::new(AtomicBool::new(false));
+                let flag = stop.clone();
+                let thread = std::thread::spawn(move || {
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    let mut stream = loop {
+                        match listener.accept() {
+                            Ok((stream, _)) => break stream,
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                                if flag.load(Ordering::SeqCst) || Instant::now() >= deadline {
+                                    return Vec::new();
+                                }
+                                std::thread::sleep(Duration::from_millis(1));
+                            }
+                            Err(error) => panic!("accept: {error}"),
+                        }
+                    };
+                    stream.set_nonblocking(false).unwrap();
+                    stream
+                        .set_read_timeout(Some(Duration::from_millis(20)))
+                        .unwrap();
+                    let mut received = Vec::new();
+                    let mut buf = [0u8; 4096];
+                    while Instant::now() < deadline {
+                        match stream.read(&mut buf) {
+                            Ok(0) => break,
+                            Ok(n) => received.extend_from_slice(&buf[..n]),
+                            Err(error)
+                                if matches!(
+                                    error.kind(),
+                                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                                ) => {}
+                            Err(_) => break,
+                        }
+                    }
+                    received
+                });
+                Self { addr, stop, thread }
+            }
+
+            /// 收工：等到对方关闭连接（或根本没有连接），返回云端收到的全部字节。
+            fn finish(self) -> Vec<u8> {
+                self.stop.store(true, Ordering::SeqCst);
+                self.thread.join().unwrap()
+            }
+        }
+
+        fn config_for(addr: SocketAddr, total_timeout_ms: u64) -> CloudTierConfig {
+            // 总期限不能小于连接期限
+            let connect_timeout_ms = total_timeout_ms.min(5000);
+            CloudTierConfig::parse(
+                &format!(
+                    "schema_version: 1\nbase_url: http://{addr}/api\nmodel: idoris/agent\n\
+                     limits: {{connect_timeout_ms: {connect_timeout_ms}, total_timeout_ms: {total_timeout_ms}}}\n"
+                ),
+                Path::new("."),
+            )
+            .unwrap()
+        }
+
+        /// 熔断关着才放行；`switch` 置位就是熔断打开。
+        fn allowed_while_off(switch: &Arc<AtomicBool>) -> Allowed {
+            let switch = switch.clone();
+            Arc::new(move || !switch.load(Ordering::SeqCst))
+        }
+
+        /// 停住请求体：走到那一点时先通知测试「到了」，再等测试说「放行」（最多 5 秒）。
+        struct Pause {
+            reached: Option<tokio::sync::oneshot::Receiver<()>>,
+            release: mpsc::Sender<()>,
+            hook: Arc<dyn Fn() + Send + Sync>,
+        }
+
+        impl Pause {
+            fn new() -> Self {
+                let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+                let (release_tx, release_rx) = mpsc::channel();
+                let reached_tx = Mutex::new(Some(reached_tx));
+                let release_rx = Mutex::new(release_rx);
+                Self {
+                    reached: Some(reached_rx),
+                    release: release_tx,
+                    hook: Arc::new(move || {
+                        if let Some(tx) = reached_tx.lock().unwrap().take() {
+                            let _ = tx.send(());
+                        }
+                        // `block_in_place`：这个钩子跑在 hyper 的连接任务里（运行时的工作线程上）。直接阻塞会让
+                        // 运行时的定时器和 I/O 驱动没人轮询，熔断轮询的 10 毫秒定时器也就不响了。
+                        tokio::task::block_in_place(|| {
+                            let _ = release_rx
+                                .lock()
+                                .unwrap()
+                                .recv_timeout(Duration::from_secs(5));
+                        });
+                    }),
+                }
+            }
+
+            fn hook(&self) -> Arc<dyn Fn() + Send + Sync> {
+                self.hook.clone()
+            }
+
+            /// 等请求体走到停住的那一点。
+            async fn reached(&mut self) {
+                let reached = self.reached.take().expect("reached() called twice");
+                tokio::time::timeout(Duration::from_secs(5), reached)
+                    .await
+                    .expect("the request body was never polled: the connection never came up")
+                    .unwrap();
+            }
+
+            fn release(&self) {
+                let _ = self.release.send(());
+            }
+        }
+
+        async fn run_probed(
+            addr: SocketAddr,
+            still_allowed: Allowed,
+            probe: BodyProbe,
+        ) -> Result<CloudAnswer, CloudFailure> {
+            run_probed_until(addr, 30_000, CancellationToken::new(), still_allowed, probe).await
+        }
+
+        async fn run_probed_until(
+            addr: SocketAddr,
+            total_timeout_ms: u64,
+            cancel: CancellationToken,
+            still_allowed: Allowed,
+            probe: BodyProbe,
+        ) -> Result<CloudAnswer, CloudFailure> {
+            let config = config_for(addr, total_timeout_ms);
+            send_probed(
+                &client(&config),
+                &config,
+                permit(),
+                &CloudCredential::parse(&secret()).unwrap(),
+                &json!({"model": "idoris/agent", "messages": [{"role": "user", "content": "hi"}]}),
+                &cancel,
+                still_allowed,
+                probe,
+            )
+            .await
+        }
+
+        async fn finish(cloud: SilentCloud) -> Vec<u8> {
+            tokio::task::spawn_blocking(move || cloud.finish())
+                .await
+                .unwrap()
+        }
+
+        /// 熔断取消先到：请求体已经被 hyper 的连接任务取走、停在第一次 poll 之前（还没做决定）。这时熔断打开，
+        /// 取消那一边（轮询）看到它、赢得 `Idle -> Cancelled`，报 `Withheld`。再放行请求体：它必须拒绝交付，
+        /// 云端一个字节都收不到。（原来：熔断那一边读到「请求体还没被 poll」就报 `Withheld`，放行之后请求体才置位、
+        /// 取走正文、写出——正文实际外送了，却报成没出网。）
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn a_cancel_that_wins_before_the_body_is_polled_keeps_every_byte_off_the_wire() {
+            let cloud = SilentCloud::start();
+            let switch = Arc::new(AtomicBool::new(false));
+            let mut pause = Pause::new();
+            let probe = BodyProbe {
+                before_decision: Some(pause.hook()),
+                ..BodyProbe::default()
+            };
+            let send = tokio::spawn(run_probed(cloud.addr, allowed_while_off(&switch), probe));
+            pause.reached().await;
+            switch.store(true, Ordering::SeqCst);
+            let outcome = tokio::time::timeout(Duration::from_secs(3), send)
+                .await
+                .expect("the kill switch opened but the send never noticed")
+                .unwrap();
+            assert_eq!(outcome.unwrap_err(), CloudFailure::Withheld);
+            pause.release();
+            let received = finish(cloud).await;
+            assert!(
+                received.is_empty(),
+                "the cloud received bytes although the call was reported as withheld: {:?}",
+                String::from_utf8_lossy(&received)
+            );
+        }
+
+        /// 取消赢了就是赢了：调用方已经被告知「没出网」，之后即使熔断又被关上，请求体也不能再把正文交出去。
+        /// 这是「同一个原子转换」和「各自读一次标志」的区别：如果取消那一边只是读了状态、没有真的把它推进到 `Cancelled`，
+        /// 熔断关上之后请求体复核通过、抢到 `Idle -> Streaming`，正文就出去了，而调用方拿到的是 `Withheld`。
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn a_cancel_that_won_stays_won_even_if_the_switch_is_closed_again() {
+            let cloud = SilentCloud::start();
+            let switch = Arc::new(AtomicBool::new(false));
+            let mut pause = Pause::new();
+            let probe = BodyProbe {
+                before_decision: Some(pause.hook()),
+                ..BodyProbe::default()
+            };
+            let send = tokio::spawn(run_probed(cloud.addr, allowed_while_off(&switch), probe));
+            pause.reached().await;
+            switch.store(true, Ordering::SeqCst);
+            let outcome = tokio::time::timeout(Duration::from_secs(3), send)
+                .await
+                .expect("the kill switch opened but the send never noticed")
+                .unwrap();
+            assert_eq!(outcome.unwrap_err(), CloudFailure::Withheld);
+            // 熔断又被关上了；请求体这时才第一次做决定
+            switch.store(false, Ordering::SeqCst);
+            pause.release();
+            let received = finish(cloud).await;
+            assert!(
+                received.is_empty(),
+                "the call was reported as withheld, the switch was closed again, and the body left anyway: {:?}",
+                String::from_utf8_lossy(&received)
+            );
+        }
+
+        /// 复审 r4#1 的窗口：熔断在「熔断轮询看过之后、下一次轮询之前」打开，连接恰好在这段时间里就绪。
+        /// 轮询间隔拉到 60 秒，取消那一边根本来不及看——能拦住正文的只有请求体在交付边界上自己复核熔断。
+        /// （原来：请求体不看熔断，照样把正文和 `Authorization` 发出去；缩短轮询间隔也只是缩小窗口。）
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn a_kill_switch_opened_before_hyper_polls_the_body_is_caught_at_the_delivery_boundary()
+         {
+            let cloud = SilentCloud::start();
+            let switch = Arc::new(AtomicBool::new(false));
+            let flip = switch.clone();
+            let probe = BodyProbe {
+                // 连接已经就绪，hyper 正要第一次 poll 请求体：熔断恰好在这一刻打开
+                before_decision: Some(Arc::new(move || flip.store(true, Ordering::SeqCst))),
+                poll_period: Some(Duration::from_secs(60)),
+                ..BodyProbe::default()
+            };
+            let outcome = tokio::time::timeout(
+                Duration::from_secs(3),
+                run_probed(cloud.addr, allowed_while_off(&switch), probe),
+            )
+            .await
+            .expect(
+                "the kill switch was open when hyper polled the body, but the body was delivered anyway \
+                 (nothing re-checked the switch at the delivery boundary)",
+            );
+            assert_eq!(outcome.unwrap_err(), CloudFailure::Withheld);
+            let received = finish(cloud).await;
+            assert!(
+                received.is_empty(),
+                "the cloud received bytes although the switch was open at the delivery boundary: {:?}",
+                String::from_utf8_lossy(&received)
+            );
+        }
+
+        /// 正文先赢：请求体已经赢得交付（还没把字节交给 hyper），这时熔断打开。取消输了这场竞争，必须报 `PossiblySent`，
+        /// 绝不能报 `Withheld`。
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn a_cancel_that_loses_to_the_body_is_possibly_sent_and_never_withheld() {
+            let cloud = SilentCloud::start();
+            let switch = Arc::new(AtomicBool::new(false));
+            let mut pause = Pause::new();
+            let probe = BodyProbe {
+                delivery_won: Some(pause.hook()),
+                ..BodyProbe::default()
+            };
+            let send = tokio::spawn(run_probed(cloud.addr, allowed_while_off(&switch), probe));
+            pause.reached().await;
+            switch.store(true, Ordering::SeqCst);
+            let outcome = tokio::time::timeout(Duration::from_secs(3), send)
+                .await
+                .expect("the kill switch opened but the send never noticed")
+                .unwrap();
+            assert_eq!(outcome.unwrap_err(), CloudFailure::PossiblySent);
+            pause.release();
+            // 这一支云端可能收到完整请求，也可能一个字节都没收到（请求体放行时 `send` 已经返回）：
+            // 保守地报 PossiblySent 都是对的，这里不断言字节数
+            let _ = finish(cloud).await;
+        }
+
+        /// `send` 不论怎么结束，还没交付的请求体都不会在它返回**之后**才发出去：调用方断开（`Cancelled`）、总期限到了（`Timeout`）。
+        /// 请求体停在做决定之前；`send` 先因为别的原因返回；再放行请求体——熔断一直是关着的，只有 [`CancelOnExit`] 能拦住它。
+        /// （原来：`send` 返回之后，后台连接任务照样取走正文写出去，调用记录却已经按「调用方断开 / 超时」写完了。）
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn a_send_that_ends_for_any_other_reason_never_lets_the_body_leave_afterwards() {
+            for ending in ["the caller goes away", "the total deadline passes"] {
+                let cloud = SilentCloud::start();
+                let switch = Arc::new(AtomicBool::new(false));
+                let mut pause = Pause::new();
+                let probe = BodyProbe {
+                    before_decision: Some(pause.hook()),
+                    ..BodyProbe::default()
+                };
+                let cancel = CancellationToken::new();
+                let send = tokio::spawn(run_probed_until(
+                    cloud.addr,
+                    if ending == "the caller goes away" {
+                        30_000
+                    } else {
+                        300
+                    },
+                    cancel.clone(),
+                    allowed_while_off(&switch),
+                    probe,
+                ));
+                pause.reached().await;
+                if ending == "the caller goes away" {
+                    cancel.cancel();
+                }
+                let outcome = tokio::time::timeout(Duration::from_secs(3), send)
+                    .await
+                    .expect("the send never ended")
+                    .unwrap();
+                assert_eq!(
+                    outcome.unwrap_err(),
+                    if ending == "the caller goes away" {
+                        CloudFailure::Cancelled
+                    } else {
+                        CloudFailure::Timeout
+                    },
+                    "{ending}"
+                );
+                pause.release();
+                let received = finish(cloud).await;
+                assert!(
+                    received.is_empty(),
+                    "{ending}: the body left the machine after the send had already returned: {:?}",
+                    String::from_utf8_lossy(&received)
+                );
+            }
+        }
+
+        /// 200 次交错：四种摆法各 50 次，每一次都必须守住「报了 `Withheld` 就一个字节都没出网」。
+        ///
+        /// - 0：取消先到（请求体停在决定之前，熔断在那一刻打开）——必须 `Withheld`；
+        /// - 1：正文先赢（请求体停在赢得交付之后）——必须 `PossiblySent`；
+        /// - 2：复核在轮询之前（轮询间隔 60 秒）——必须 `Withheld`；
+        /// - 3：自由竞争（请求体和熔断各自随机抖动 0–3 毫秒）——`Withheld` 或 `PossiblySent`，只检查不变量。
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn withheld_never_coexists_with_bytes_on_the_wire_across_200_interleavings() {
+            let mut counts = [0u32; 2];
+            for round in 0u32..200 {
+                let mode = round % 4;
+                let cloud = SilentCloud::start();
+                let switch = Arc::new(AtomicBool::new(false));
+                let mut probe = BodyProbe::default();
+                let mut pause = None;
+                let mut flip_after = None;
+                match mode {
+                    0 => {
+                        let p = Pause::new();
+                        probe.before_decision = Some(p.hook());
+                        pause = Some(p);
+                    }
+                    1 => {
+                        let p = Pause::new();
+                        probe.delivery_won = Some(p.hook());
+                        pause = Some(p);
+                    }
+                    2 => {
+                        let flip = switch.clone();
+                        probe.before_decision =
+                            Some(Arc::new(move || flip.store(true, Ordering::SeqCst)));
+                        probe.poll_period = Some(Duration::from_secs(60));
+                    }
+                    _ => {
+                        // 确定性的伪随机抖动（线性同余），同一轮每次都一样
+                        let mix = |salt: u64| {
+                            (u64::from(round) + salt)
+                                .wrapping_mul(6_364_136_223_846_793_005)
+                                .wrapping_add(1_442_695_040_888_963_407)
+                                >> 33
+                        };
+                        let body_delay = Duration::from_micros(mix(1) % 3000);
+                        probe.before_decision = Some(Arc::new(move || {
+                            tokio::task::block_in_place(|| std::thread::sleep(body_delay));
+                        }));
+                        flip_after = Some(Duration::from_micros(mix(7) % 3000));
+                    }
+                }
+                let send = tokio::spawn(run_probed(cloud.addr, allowed_while_off(&switch), probe));
+                if let Some(pause) = pause.as_mut() {
+                    pause.reached().await;
+                    switch.store(true, Ordering::SeqCst);
+                } else if let Some(delay) = flip_after {
+                    tokio::time::sleep(delay).await;
+                    switch.store(true, Ordering::SeqCst);
+                }
+                let outcome = tokio::time::timeout(Duration::from_secs(5), send)
+                    .await
+                    .unwrap_or_else(|_| panic!("round {round} (mode {mode}): the send never ended"))
+                    .unwrap();
+                if mode == 0 {
+                    // 取消赢了就是赢了：熔断又关上，请求体放行之后仍然不能交付
+                    switch.store(false, Ordering::SeqCst);
+                }
+                if let Some(pause) = &pause {
+                    pause.release();
+                }
+                let received = finish(cloud).await;
+                match outcome.as_ref().unwrap_err() {
+                    CloudFailure::Withheld => {
+                        counts[0] += 1;
+                        assert!(
+                            received.is_empty(),
+                            "round {round} (mode {mode}): reported Withheld but the cloud received {:?}",
+                            String::from_utf8_lossy(&received)
+                        );
+                    }
+                    CloudFailure::PossiblySent => counts[1] += 1,
+                    other => panic!("round {round} (mode {mode}): unexpected outcome {other:?}"),
+                }
+                match mode {
+                    0 | 2 => assert_eq!(
+                        outcome.unwrap_err(),
+                        CloudFailure::Withheld,
+                        "round {round} (mode {mode})"
+                    ),
+                    1 => assert_eq!(
+                        outcome.unwrap_err(),
+                        CloudFailure::PossiblySent,
+                        "round {round} (mode {mode})"
+                    ),
+                    _ => {}
+                }
+            }
+            eprintln!(
+                "200 interleavings: {} withheld (0 bytes on the wire), {} possibly sent",
+                counts[0], counts[1]
+            );
+        }
     }
 
     fn read_full_http_request(stream: &mut std::net::TcpStream) -> Vec<u8> {
