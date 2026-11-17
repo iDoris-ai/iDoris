@@ -4,13 +4,14 @@
 //! `attempts/0002` 和 `ledger/0002`：**新库**有这些触发器，但已经跑过旧 0002 的开发 / 预发库（版本表里已经有 2）
 //! 升级之后一条都得不到，更换幂等键的 `INSERT OR REPLACE` 仍然能把已经落定的 18_000 分录整行换掉。
 //!
-//! 这个文件做两件事：
+//! 这个文件做三件事：
 //!
 //! 1. **旧 v2 库 -> HEAD 的升级测试**：用首次发布时的 0002（`tests/fixtures/*_first_release.sql`，原样取自 git 历史）建库、写入数据，
 //!    先证明旧库确实缺这些保护（REPLACE 能改写），再用 HEAD 的代码打开，断言新触发器装上了、REPLACE 被拒、数据一行没动、
 //!    版本号往后走。另有一份「已经被原地改过一次的 0002」（`*_with_inplace_*.sql`，第二轮之后建出来的库长这样）：
 //!    升级同样成功，每个保护只有一份；
-//! 2. **已发布的迁移文件按内容钉死**：以后谁再改它们，这里立刻红，提示改成追加新编号。
+//! 2. **账本分录序号的回填**（账本迁移 0004）：旧库里已有的额度、撤销按时间折算出序号，新写入的由触发器记下；
+//! 3. **已发布的迁移文件按内容钉死**：以后谁再改它们，这里立刻红，提示改成追加新编号。
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::path::{Path, PathBuf};
@@ -99,7 +100,7 @@ fn digest(text: &str) -> String {
 }
 
 /// 已经发布过的迁移文件（开发 / 预发库已经跑过它们）。账户 0001 / 0002、账本 0001 / 0002、尝试 0001 / 0002 的内容在这里钉死；
-/// 要改行为，追加新的编号（账户 0003、账本 0004、尝试 0004……），**不要改这些文件**：迁移器对已登记的版本直接跳过，
+/// 要改行为，追加新的编号（账户 0003、账本 0005、尝试 0004……），**不要改这些文件**：迁移器对已登记的版本直接跳过，
 /// 已有的库得不到你的改动。
 ///
 /// 账本 0002 钉的是「迁出的授信额度 id 不撞已有额度」那一版（`c31a874d`）：旧文本在撞 id 时整个迁移失败、库打不开，
@@ -480,8 +481,8 @@ fn a_ledger_database_that_already_ran_the_first_0002_gets_the_grace_guard_from_0
 
     assert_eq!(
         versions(db.path(), "ledger_schema_migrations"),
-        [1, 2, 3],
-        "0003 carries the REPLACE guard; 0002 is untouched"
+        [1, 2, 3, 4],
+        "0003 carries the REPLACE guard, 0004 the allocation order marks; 0002 is untouched"
     );
     assert_eq!(
         versions(db.path(), "account_schema_migrations"),
@@ -504,7 +505,10 @@ fn a_ledger_database_that_already_ran_the_first_0002_gets_the_grace_guard_from_0
     );
 
     drop(AccountStore::open(db.path()).unwrap());
-    assert_eq!(versions(db.path(), "ledger_schema_migrations"), [1, 2, 3]);
+    assert_eq!(
+        versions(db.path(), "ledger_schema_migrations"),
+        [1, 2, 3, 4]
+    );
 }
 
 #[test]
@@ -516,7 +520,10 @@ fn a_ledger_database_created_after_the_in_place_edit_upgrades_cleanly_with_one_c
         "it came with 0002"
     );
     drop(AccountStore::open(db.path()).unwrap());
-    assert_eq!(versions(db.path(), "ledger_schema_migrations"), [1, 2, 3]);
+    assert_eq!(
+        versions(db.path(), "ledger_schema_migrations"),
+        [1, 2, 3, 4]
+    );
     assert_eq!(trigger_count(db.path(), GRACE_GUARD), 1);
     assert!(
         open_raw(db.path())
@@ -540,6 +547,115 @@ fn a_fresh_ledger_database_has_the_same_objects_as_an_upgraded_one() {
     assert_eq!(objects(fresh.path()), objects(upgraded.path()));
     assert_eq!(
         versions(fresh.path(), "ledger_schema_migrations"),
-        [1, 2, 3]
+        [1, 2, 3, 4]
     );
+}
+
+// ------------------------------------------------------------------------------------------
+// 账本 0004：额度创建 / 撤销在账本里的先后
+// ------------------------------------------------------------------------------------------
+
+fn marks(path: &Path) -> Vec<(String, String, i64)> {
+    let conn = open_raw(path);
+    let mut stmt = conn
+        .prepare(
+            "SELECT allocation_id, event, after_entry FROM ledger_allocation_marks
+              ORDER BY allocation_id, event",
+        )
+        .unwrap();
+    stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+}
+
+#[test]
+fn allocations_that_predate_the_marks_get_their_order_worked_out_from_the_old_timestamps() {
+    let db = ledger_database_at_version_2("ledger-marks", FIRST_LEDGER_0002);
+    drop(AccountStore::open(db.path()).unwrap());
+    // 旧库只有毫秒：额度创建时刻之前 `emp` 上已经有的最大分录号，就是它的序号（严格早于：同一毫秒的分录算在它之后，
+    // 和旧口径「窗口从创建时刻起、含这一毫秒」一致）。撤销同理
+    assert_eq!(
+        marks(db.path()),
+        [
+            ("a-first".to_string(), "created".to_string(), 0),
+            ("a-mid".to_string(), "created".to_string(), 2),
+            ("a-mid".to_string(), "revoked".to_string(), 3),
+            ("a-same-ms".to_string(), "created".to_string(), 1),
+        ]
+    );
+}
+
+#[test]
+fn an_allocation_written_after_the_upgrade_is_stamped_with_the_ledger_position_not_its_timestamp() {
+    let db = ledger_database_at_version_2("ledger-stamp", FIRST_LEDGER_0002);
+    drop(AccountStore::open(db.path()).unwrap());
+    let conn = open_raw(db.path());
+    // 创建时刻写成 100（比所有分录都早）：序号仍然是此刻账本里最后一条分录（3）
+    conn.execute(
+        "INSERT INTO allocations
+            (allocation_id, parent_id, child_id, ceiling_unit, ceiling_micros, purpose,
+             valid_from_ms, valid_until_ms, transferable, idempotency_key, created_at_ms)
+         VALUES ('a-new', 'paid', 'emp', 'THB', 100, 'prepaid', 0, 9000000, 0, NULL, 100)",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO allocation_revocations (allocation_id, revoked_at_ms, revoked_by_kind, revoked_by_id)
+         VALUES ('a-new', 1, 'operator', 'upgrade-test')",
+        [],
+    )
+    .unwrap();
+    let new: Vec<_> = marks(db.path())
+        .into_iter()
+        .filter(|(id, _, _)| id == "a-new")
+        .collect();
+    assert_eq!(
+        new,
+        [
+            ("a-new".to_string(), "created".to_string(), 3),
+            ("a-new".to_string(), "revoked".to_string(), 3),
+        ]
+    );
+    // 往账本里再追加一条分录，之后创建的额度序号跟着走
+    conn.execute(
+        "INSERT INTO ledger_entries
+            (account_id, hold_id, kind, unit, held_micros, spent_micros, funds_micros, liability_micros,
+             window_at_ms, at_ms, idempotency_key)
+         VALUES ('emp', 'r1#0', 'release', 'THB', -100, 0, 0, 0, 1000, 5, 'k4')",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO allocations
+            (allocation_id, parent_id, child_id, ceiling_unit, ceiling_micros, purpose,
+             valid_from_ms, valid_until_ms, transferable, idempotency_key, created_at_ms)
+         VALUES ('a-newer', 'paid', 'emp', 'THB', 100, 'prepaid', 0, 9000000, 0, NULL, 0)",
+        [],
+    )
+    .unwrap();
+    assert!(marks(db.path()).contains(&("a-newer".to_string(), "created".to_string(), 4)));
+}
+
+#[test]
+fn the_marks_are_append_only_and_cannot_be_replaced_or_forged() {
+    let db = ledger_database_at_version_2("ledger-marks-immutable", FIRST_LEDGER_0002);
+    drop(AccountStore::open(db.path()).unwrap());
+    let conn = open_raw(db.path());
+    for sql in [
+        "UPDATE ledger_allocation_marks SET after_entry = 0 WHERE allocation_id = 'a-mid'",
+        "DELETE FROM ledger_allocation_marks WHERE allocation_id = 'a-mid'",
+        "INSERT OR REPLACE INTO ledger_allocation_marks (allocation_id, event, after_entry)
+         VALUES ('a-mid', 'created', 0)",
+        "REPLACE INTO ledger_allocation_marks (allocation_id, event, after_entry)
+         VALUES ('a-first', 'created', 99)",
+        // 不存在的额度；撤销序号记在没被撤销的额度上
+        "INSERT INTO ledger_allocation_marks (allocation_id, event, after_entry)
+         VALUES ('no-such-allocation', 'created', 0)",
+        "INSERT INTO ledger_allocation_marks (allocation_id, event, after_entry)
+         VALUES ('a-first', 'revoked', 0)",
+    ] {
+        assert!(conn.execute(sql, []).is_err(), "must be refused: {sql}");
+    }
+    assert_eq!(marks(db.path()).len(), 4, "nothing changed");
 }

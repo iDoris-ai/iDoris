@@ -86,7 +86,9 @@
 //!    （先到期的先用），用完才记成授信债务。债务不因新额度的窗口而重置，不因额度到期、授信被重设或关掉再开而勾销，只因上级充值而
 //!    减少（有了充值，账户按有充值的口径记账，余额带着全部已花）。新发的额度（比如每月免费额度）照常可花，但不抵旧债：授信 200
 //!    已用光，月初发 10，这个月能花 10，授信可用仍是 0。被撤销的额度，撤销**之前**在额度内的花费不算债务。账记在
-//!    `ceiling_remaining` 里（净头寸 `额度剩余 - min(债务, 授信额度)`）；欠着授信的钱不给宽限。详见 `project.rs`。
+//!    `ceiling_remaining` 里（净头寸 `额度剩余 - min(债务, 授信额度)`）；欠着授信的钱不给宽限。「额度存在之后 / 撤销之前」
+//!    看**提交顺序**（额度创建、撤销时记下的分录序号，迁移 0004 的 `ledger_allocation_marks`），不看进事务之前取的毫秒——
+//!    排队让毫秒和提交顺序对不上（PR #600 第四轮复审 Medium 3）。详见 `project.rs`。
 
 mod admit;
 mod components;
@@ -134,11 +136,12 @@ use crate::attempts::AttemptLedgerHook;
 /// 迁移按顺序执行，版本号 = 下标 + 1。**只能在末尾追加**，已经发布的文件不能改（迁移器对已登记的版本直接跳过，
 /// 已经跑过旧文本的库得不到任何改动；`tests/migration_upgrade.rs` 把已发布的文件按内容钉死）。
 /// 0001 是 S3 的账本；0002 把授信的权威数据源统一到 `allocations`（并补登控制面发出的免费额度的承诺）；
-/// 0003 补上宽限的部分唯一索引的 REPLACE 保护。
+/// 0003 补上宽限的部分唯一索引的 REPLACE 保护；0004 记下额度创建 / 撤销在账本里的先后（分录序号）。
 const MIGRATIONS: &[&str] = &[
     include_str!("migrations/0001_ledger.sql"),
     include_str!("migrations/0002_credit_lines_are_allocations.sql"),
     include_str!("migrations/0003_grace_no_replace.sql"),
+    include_str!("migrations/0004_allocation_marks.sql"),
 ];
 
 /// 应用账本迁移（在账户迁移之后、同一条连接上）。版本记在 `ledger_schema_migrations`。
