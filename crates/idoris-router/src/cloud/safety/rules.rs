@@ -23,7 +23,11 @@
 //!   `steps to`、`teach me`……）**在对象前面**，并且离对象只隔十几个字符。`บอก` / `ช่วย` / `ขอ` / `ดู` 这类泛词、对象在前请求词在后
 //!   （「การทำร้ายตัวเองไม่ใช่วิธีแก้ปัญหา」「ถ้าอยากทำร้ายตัวเอง บอกคุณครูได้นะ」）、光有对象（「การทำระเบิดเป็นสิ่งผิดกฎหมาย」）都不是索要。
 //!   之前真的说过的拒绝语会复述被拒绝的话题（「我不能告诉你怎么做炸弹」），不能让对话从此没法继续：请求类在命中旁边（同一句里）有明确的拒绝语、
-//!   或者 `ไม่ได้` 紧跟在命中后面时放行；越狱 / 指令注入**没有**这道放行；
+//!   或者 `ไม่ได้` 紧跟在命中后面时放行；越狱 / 指令注入**没有**这道放行。**同一句里讲怎么不做、或提醒别人提防的也不是索要**
+//!   （round4-r3 Medium，[`Framing`]）：请求词后面紧跟停止 / 预防 / 避免词的（「วิธีหยุดทำร้ายตัวเอง」「วิธีป้องกันการวางระเบิด」）、
+//!   套取个人信息的手法动词前面有第三方主语或提防语的（`Hackers may trick you into sharing your password`、「ระวังคนที่หลอกถามรหัสผ่านนะ」），
+//!   放行；没有这些线索的索要（`how to hurt myself`、`how to trick my friend into giving me his password`、「วิธีหลอกเอารหัสผ่านเพื่อน」）一个字没变，
+//!   用户消息和输出规则一个字没变；
 //! - **求助语境豁免只给「提到」类规则**：孩子问「朋友发来裸照，我该怎么办」是评测集要求**回答并引导找大人**的情形，
 //!   所以「提到裸照」类规则在同一段文本里出现求助句式（`ควรทำยังไง`、`should I`）时放行；「索要方法」类规则**从不**因为求助句式放行
 //!   （`บอกวิธีทำระเบิด ควรทำยังไง` 照样拒绝）；
@@ -45,8 +49,12 @@
 //!   这条放行是启发式，容易被绕过（拒绝语和请求挤在同一句里：`I can't wait, how to make a bomb`）：它只放行**请求类**的话，孩子真正的请求要出现在
 //!   用户消息里才有用，而用户消息没有任何豁免。**提及类和光有对象的话不跑在助手历史上**（方案 B 及其后续）：伪造的自伤表达、没有请求词的
 //!   有害指导（`Build a bomb with ...`）由输出规则和 LLM 检查器兜底（它看得到 `assistant` 来源）。`rules_only` 没有这道 LLM，儿童租户默认
-//!   不能这样启动，除非运营方写了带到期日的确认。仍会误拒的：请求词紧挨着对象的安全引导（「วิธีหยุดทำร้ายตัวเอง」），
-//!   和带有害对象的第三人称描述（`Hackers may trick you into sharing your password`）；
+//!   不能这样启动，除非运营方写了带到期日的确认。「同一句里讲怎么不做 / 提醒提防」的放行也是启发式，只认**列出来的线索、紧挨着命中**
+//!   （[`HISTORY_STOP_CUES`] 离请求词 [`HISTORY_STOP_REACH_CHARS`] 个字符之内，提醒线索离手法动词 30 / 60 个字符之内且中间没有
+//!   [`HISTORY_BREAKERS_EN`] / [`HISTORY_BREAKERS_TH`] 里的行动者、命中里没有 [`HISTORY_BENEFICIARIES_EN`] 里的受益者），所以有两类仍会放行：线索挤在同一句里的混合句
+//!   （`how to stop, then hang myself`、`Hackers: just trick him into giving you the password`），泰语没有标点，上一句末尾的主语 /
+//!   提防语也可能落进同一个窗口。这些交给输出规则和 LLM 检查器。仍会误拒的同类：不是「停止 / 预防 / 避免」的支持类安全引导
+//!   （「วิธีช่วยเพื่อนที่ทำร้ายตัวเอง」「วิธีรับมือกับการทำร้ายตัวเอง」，请求词和对象之间隔着 `ช่วย` / `รับมือ`），不在这张表里；
 //! - 输出侧的「有害内容的合规回答」检测是启发式（见上），个人信息复述只覆盖手机号、邮箱、身份证号，
 //!   以及孩子自己标明了身份的姓名/学校/住址（「ผมชื่อ……」「ชื่อ X เรียนที่ Y」加上「这是秘密」之类的提示）；
 //! - 泰语声调符号统一折叠，所以只靠声调区分的词会被当成同一个词（`แม่ง` 会撞上 `แมง`（昆虫）和 `แมงมุม`，所以不在列表里）。
@@ -58,7 +66,7 @@ use idoris_compute_contracts::safety::SafetyCategory;
 use super::extract::{CheckedInput, CheckedOutput, Origin};
 use super::text::{
     Folded, NEGATION_REACH_CHARS, Needle, base64_texts, fold, followed_closely_by, has_word,
-    locally_negated, near, near_regions,
+    led_in_by, locally_negated, near, near_regions, stop_follows_ask,
 };
 use super::{BoxFuture, CheckContext, CheckReport, Denial, SafetyChecker, Verdict};
 
@@ -213,6 +221,247 @@ const HISTORY_ASK_GAP_CHARS: usize = 12;
 /// 助手历史里「套取个人信息」的手法动词和对象之间最多隔多少个字符：`trick my friend into sending me his password`
 /// 要隔 31 个字符才到对象，所以比 [`HISTORY_ASK_GAP_CHARS`] 宽（用户文本里这条规则的窗口也是 40）。
 const HISTORY_SOLICIT_GAP_CHARS: usize = 40;
+
+/// 助手历史里请求词**后面紧跟**的**停止 / 预防 / 避免**词（[`Framing::HowTo`]）：`วิธีหยุดทำร้ายตัวเอง`（怎么停止伤害自己）、
+/// `วิธีป้องกันการวางระเบิด`、`how to avoid ...` 讲的是怎么**不做**，不是索要做法（round4-r3 Medium：这类安全引导输出规则放行，
+/// 回放成历史却被输入规则拒绝，对话从此废掉，LLM 检查器也没有机会放行）。
+///
+/// 只收**意思就是停止 / 预防 / 避免**的词，不收会和实施混在一起的：`ลด`（减轻）、`รักษา`（治疗 / 保守）、`ไม่`、`ไม่ให้`
+/// （「วิธีทำร้ายตัวเองโดยไม่ให้ใครรู้」「วิธีรักษาความลับ กรีดข้อมือ」是索要）。泰语的 `ห้าม` 折叠成 `หาม`、`อย่า` 折叠成 `อยา`
+/// （撞上 `อยาก`「想」），一律不放进这张表。规则表里没有中文词，这张表也没有。
+/// 它们不能是任何请求词或对象的子串（`the_stop_and_lead_in_words_are_not_part_of_any_request_word_or_object` 守着），否则光是一个请求就把自己放行了。
+const HISTORY_STOP_CUES: &[&str] = &[
+    // 泰语：停止、戒掉、预防、避开、保护、遏制、中止
+    "หยุด",
+    "เลิก",
+    "ป้องกัน",
+    "หลีกเลี่ยง",
+    "ปกป้อง",
+    "ยับยั้ง",
+    "ระงับ",
+    "ยุติ",
+    // 英语（整词匹配：`stopping` 不是 `stop`；英语的对象是动词原形，所以接在请求词后面的是 `how to stop hurt ...` 这种形式）
+    "stop",
+    "quit",
+    "avoid",
+    "prevent",
+    "not",
+    "refrain from",
+    "give up",
+    "protect yourself from",
+    "protect yourself against",
+    "stay away from",
+    "keep away from",
+];
+
+/// 停止 / 预防 / 避免词最多可以离请求词多远（字符数）才算「紧跟」：泰语的 `การ`（2）、`ที่จะ`（4）、`ที่ดีที่จะ`（8）这类连接词算紧挨。
+const HISTORY_STOP_REACH_CHARS: usize = 8;
+
+/// 助手历史里「套取个人信息」的手法动词**前面**（同一句里）的**第三方主语**和**提防语**（[`Framing::Manipulation`]）：
+/// `Hackers may trick you into sharing your password`、「ระวังคนที่หลอกถามรหัสผ่านนะ」讲的是坏人的手法、提醒孩子提防，
+/// 不是在索要（round4-r3 Medium）。泰语没有空格也很少有标点，所以主语和提防语放在一张表里，离动词不超过
+/// [`HISTORY_LEAD_IN_REACH_TH_CHARS`]；英语见 [`HISTORY_THIRD_PARTY_EN`]。
+const HISTORY_THIRD_PARTY_TH: &[&str] = &[
+    // 坏人：骗子、黑客、罪犯、小偷、陌生人、不怀好意的人
+    "มิจฉาชีพ",
+    "แฮกเกอร์",
+    "แฮ็กเกอร์",
+    "คนร้าย",
+    "โจร",
+    "คนแปลกหน้า",
+    "คนไม่หวังดี",
+    "ผู้ไม่หวังดี",
+    "ผู้ไม่ประสงค์ดี",
+    // 泛指的人：「有人 / 有些人 / 某人 / 谁来…… / 不管是谁 / ……的人」
+    "ใครบางคน",
+    "บางคน",
+    "มีคน",
+    "มีใคร",
+    "ใครมา",
+    "ใครก็ตาม",
+    "คนที่",
+    // 不是人的坏东西：假网站、假应用、假链接、假邮件、假消息、病毒（`ข้อความหลอกลวง` 这类里面带着手法动词 `หลอก` 的不收：
+    // 线索必须整个在动词前面）
+    "เว็บปลอม",
+    "เว็บไซต์ปลอม",
+    "แอปปลอม",
+    "ลิงก์ปลอม",
+    "อีเมลปลอม",
+    "ข้อความปลอม",
+    "มัลแวร์",
+    "ไวรัส",
+    // 提防：小心、识破、远离
+    "ระวัง",
+    "รู้ทัน",
+    "ห่างจาก",
+];
+
+/// 离手法动词很近（[`HISTORY_LEAD_IN_REACH_STOP_TH_CHARS`] 个字符之内）的**停止 / 预防**词：`หยุดหลอกเอารหัสผ่านเพื่อน`（别再骗朋友的密码）、
+/// `ป้องกันการถูกหลอกให้บอกรหัสผ่าน`（`การถูก` 算紧挨）。比 [`HISTORY_THIRD_PARTY_TH`] 窄得多：这类词离动词远了
+/// 就和「怎么躲开被抓住再去骗」混在一起（`วิธีหลีกเลี่ยงการถูกจับตอนหลอกเอารหัสผ่านเพื่อน` 是索要）。
+const HISTORY_STOP_BEFORE_VERB_TH: &[&str] = &["หยุด", "เลิก", "ป้องกัน", "หลีกเลี่ยง", "ปกป้อง"];
+
+/// **紧挨**手法动词（0 个字符）的**禁止**词：`ห้ามหลอกเอารหัสผ่านเพื่อนนะ`（不许骗朋友的密码）。`อย่า` 折叠成 `อยา`，是 `อยาก`「想」
+/// 的前缀（`อยากหลอกเอารหัสผ่านเพื่อน` 是索要，`อยา` 和动词之间隔着一个 `ก`），`ห้าม` 折叠成 `หาม`，所以这两个词只在紧挨动词时才算，
+/// 绝不能放进上一张表那样「离动词几个字符之内」的窗口里。
+const HISTORY_PROHIBIT_BEFORE_VERB_TH: &[&str] = &["อย่า", "ห้าม"];
+
+/// 泰语提醒线索离手法动词最多多少个字符（线索结束到动词开始）：和否定词的窗口 [`NEGATION_REACH_CHARS`] 一样宽
+/// （「มิจฉาชีพอาจหลอกให้หนูบอกรหัสผ่านและแอบขโมยข้อมูลส่วนตัว」里第二个动词离主语 24 个字符）。
+const HISTORY_LEAD_IN_REACH_TH_CHARS: usize = 30;
+
+/// 停止 / 预防词最多隔多少个字符还算离动词很近：`การถูก`（6）算。
+const HISTORY_LEAD_IN_REACH_STOP_TH_CHARS: usize = 6;
+
+/// 禁止词必须**紧挨**动词：0 个字符。
+const HISTORY_LEAD_IN_REACH_PROHIBIT_TH_CHARS: usize = 0;
+
+/// 英语的**第三方主语**和**提防语**（手法动词前面、同一句里）：坏人的名字，和「提防……」类的短语。
+/// 泛指的人（`someone`、`people`……）不在这里，见 [`HISTORY_GENERIC_SUBJECTS_EN`]。
+const HISTORY_THIRD_PARTY_EN: &[&str] = &[
+    "hackers",
+    "hacker",
+    "scammers",
+    "scammer",
+    "strangers",
+    "stranger",
+    "criminals",
+    "criminal",
+    "thieves",
+    "thief",
+    "fraudsters",
+    "fraudster",
+    "predators",
+    "predator",
+    "attackers",
+    "attacker",
+    "cybercriminals",
+    "phishers",
+    "phishing",
+    "bad people",
+    "bad guys",
+    "bad actors",
+    "dishonest people",
+    // 不是人的坏东西
+    "fake websites",
+    "fake website",
+    "fake sites",
+    "fake apps",
+    "fake links",
+    "fake emails",
+    "fake messages",
+    "scam websites",
+    "scam emails",
+    "scam messages",
+    "scams",
+    "scam",
+    "malware",
+    "viruses",
+    "spyware",
+    // 提防
+    "beware of",
+    "watch out for",
+    "look out for",
+    "be careful of",
+    "be careful with",
+    "protect yourself from",
+    "protect yourself against",
+    "stay safe from",
+    "stay away from",
+    "keep away from",
+    "steer clear of",
+];
+
+/// 泛指的第三方：**只有后面紧跟情态词或关系词才算主语**（[`HISTORY_SUBJECT_FOLLOWERS_EN`]）：`someone may trick you`、
+/// `people who steal passwords` 是在描述；「teach people to trick others」「help someone trick his friend」里的 `people` / `someone`
+/// 是被指使的对象，不是主语。
+const HISTORY_GENERIC_SUBJECTS_EN: &[&str] = &[
+    "someone",
+    "somebody",
+    "anyone",
+    "people",
+    "others",
+    "person",
+    "some people",
+    "other people",
+];
+
+const HISTORY_SUBJECT_FOLLOWERS_EN: &[&str] = &[
+    "may",
+    "might",
+    "could",
+    "can",
+    "will",
+    "would",
+    "often",
+    "sometimes",
+    "usually",
+    "always",
+    "who",
+    "that",
+    "tries to",
+    "try to",
+    "trying to",
+    "wants to",
+    "want to",
+];
+
+/// 英语提醒线索离手法动词最多多少个字符：英语有句号、问号、换行挡住别的句子，可以比泰语宽
+/// （「Hackers may trick you into sharing your password and steal your OTP.」里第二个动词离主语 47 个字符）。
+const HISTORY_LEAD_IN_REACH_EN_CHARS: usize = 60;
+
+/// 夹在英语线索和手法动词之间、或出现在命中里（手法动词到对象）就**不算提醒**的话：第一 / 第二人称的行动者或直接的请求，
+/// 动手的是说话的人，不是第三方（`Hackers: I want to trick my friend into giving me his password`、
+/// `Scammers say you can trick him into ...`、`Hackers: how do I trick my friend ...`）。
+/// 直角引号和弯引号两种写法都收（归一化不会把 `’` 变成 `'`）。受益者见 [`HISTORY_BENEFICIARIES_EN`]。
+const HISTORY_BREAKERS_EN: &[&str] = &[
+    "how do i",
+    "how can i",
+    "how would i",
+    "how should i",
+    "teach me",
+    "tell me",
+    "show me",
+    "help me",
+    "let me",
+    "let's",
+    "let\u{2019}s",
+    "lets",
+    "i want",
+    "i'd like",
+    "i\u{2019}d like",
+    "i will",
+    "i'll",
+    "i\u{2019}ll",
+    "i can",
+    "i need",
+    "you can",
+    "you could",
+    "you should",
+    "you will",
+    "you may",
+    "you might",
+    "you must",
+    "you need",
+    "we can",
+    "we will",
+    "we could",
+    "we should",
+    "please",
+];
+
+/// 出现在**命中里**（手法动词到对象）就**不算提醒**的受益者：要把东西拿给说话的人
+/// （`Hackers: how to trick my friend into giving me his password` 里的 `my` / `me`；提醒里的受害者是 `you` / `your` / `kids`，
+/// 没有人 `me` / `my` / `us`）。只看命中里面，不看线索和手法动词之间：助手代表产品说话时会提到自己
+/// （「Hackers may pretend to be from our school and trick you into ……」）。
+const HISTORY_BENEFICIARIES_EN: &[&str] = &["me", "my", "mine", "myself", "us", "our"];
+
+/// 泰语的同一张表：直接要模型「教我 / 告诉我」。不收 `วิธี` 本身：「มิจฉาชีพมีวิธีหลอกเอารหัสผ่านหลายแบบ」（骗子有好几种骗密码的办法）
+/// 是正常的提醒；也不收 `ช่วย`（「มิจฉาชีพอาจแกล้งช่วยแล้วหลอกถามรหัสผ่าน」）和 `ผม` / `ฉัน` / `หนู` 这类代词：助手对孩子说话时
+/// `หนู` 是「你」（「มิจฉาชีพอาจหลอกให้หนูบอกรหัสผ่าน」），不能当第一人称用。
+/// 泰语线索和英语线索（[`build_lead_ins`]）都同时用这张表、[`HISTORY_BREAKERS_EN`] 和 [`HISTORY_BENEFICIARIES_EN`]：两种语言混写的话
+/// （`มิจฉาชีพ ... trick my friend into giving me his password`）一样不是提醒。
+const HISTORY_BREAKERS_TH: &[&str] = &["สอน", "ช่วยบอก", "บอกวิธี", "อยากรู้วิธี", "ขอวิธี"];
 
 /// 话题词（只给输入侧）：孩子在问「为什么 / 要注意什么 / 怎样才安全」，是安全教育的问题，不是索要方法。
 /// 它们不是否定：**回答**里出现 `unsafe` 不能让一份步骤变得无害，所以输出侧不用这一组。
@@ -998,10 +1247,11 @@ enum History {
 
 /// 助手历史里一条请求类规则认的索要句式：**请求词在对象前面**，隔不过 `gap` 个字符，或者整句就是索要（`phrases`）。
 ///
-/// 和用户文本里同一条规则相比收窄了三处（用户文本一律不变）：
+/// 和用户文本里同一条规则相比收窄了四处（用户文本一律不变）：
 /// 1. 请求词是明确的索要 / 操作词（[`HISTORY_HOW_TO`] 等），不是 `บอก` / `ช่วย` / `ขอ` / `ดู` 这类泛词；
 /// 2. 请求词要在对象前面：安全引导里对象在前、请求词在后（「การทำร้ายตัวเองไม่ใช่วิธีแก้ปัญหา」）；
-/// 3. 光有对象不算（「การทำระเบิดเป็นสิ่งผิดกฎหมาย」「Making a pipe bomb is illegal」）。
+/// 3. 光有对象不算（「การทำระเบิดเป็นสิ่งผิดกฎหมาย」「Making a pipe bomb is illegal」）；
+/// 4. 同一句里讲怎么**不做**、或提醒别人提防的不算：见 [`Framing`]（round4-r3 Medium）。
 ///
 /// 没有请求词的伪造内容（`Build a bomb with ...`）交给输出规则和 LLM 检查器。
 struct HistoryRequest {
@@ -1015,9 +1265,58 @@ struct HistoryRequest {
     phrases: Vec<Needle>,
     /// 命中旁边的话题词（`ปลอดภัย`、`ระวัง`）也能放行（点火那一条用户文本里本来就有这道放行）。
     topical: bool,
+    /// 怎么区分「索要」和「讲怎么不做 / 提醒别人提防」。**每条请求类规则自己声明**，漏写编译不过。
+    framing: Framing,
+}
+
+/// 助手历史里一条请求类规则怎么区分真正的索要和同一句里的安全引导（round4-r3 Medium）。这是**同一句里**的区分，
+/// 不是跨句否定（跨句的否定放行不了，owner 已拍板保持严格）；两种都只认**同一句里、紧挨着命中**的线索，
+/// 而且都只放行**真正出现了线索**的命中：没有线索的索要（`how to hurt myself`、`how to trick my friend into giving me his password`、
+/// 「วิธีหลอกเอารหัสผ่านเพื่อน」）一个字没变。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Framing {
+    /// 请求词是「怎么做」（`วิธี`、`ขั้นตอน`、`how to`……），对象是有害的行为：请求词**后面紧跟**停止 / 预防 / 避免词
+    /// （[`HISTORY_STOP_CUES`]）的，讲的是怎么不做（`วิธีหยุดทำร้ายตัวเอง`、`วิธีป้องกันการวางระเบิด`），不是索要。
+    HowTo,
+    /// 「请求词」是坏人的手法动词（`หลอก`、`trick`、`steal`……），对象是个人信息：手法动词**前面**（同一句里）有第三方主语或提防语、
+    /// 并且中间没有第一 / 第二人称的行动者（[`LeadIn`]）的，讲的是坏人的手法、提醒孩子提防
+    /// （`Hackers may trick you into sharing your password`、「ระวังคนที่หลอกถามรหัสผ่านนะ」），不是索要。
+    Manipulation,
+}
+
+/// 一组「手法动词前面的提醒线索」（[`Framing::Manipulation`]）：`cues` 结束在命中起点之前 `reach_chars` 个字符之内（同一句里），
+/// 并且线索到命中结尾之间没有 `breakers`（第一 / 第二人称的行动者或直接的请求），命中里面没有 `beneficiaries`（受益者）。
+struct LeadIn {
+    cues: Vec<Needle>,
+    breakers: Vec<Needle>,
+    beneficiaries: Vec<Needle>,
+    reach_chars: usize,
 }
 
 impl HistoryRequest {
+    /// 这一处命中是在讲怎么不做 / 提醒别人提防，不是索要吗（拒绝语那一路在 [`HistoryRequest::matches`] 里）。
+    fn is_not_a_request(&self, folded: &Folded, hit: (usize, usize), cues: &Cues<'_>) -> bool {
+        match self.framing {
+            Framing::HowTo => stop_follows_ask(
+                folded,
+                hit,
+                &self.asks,
+                cues.history_stops,
+                HISTORY_STOP_REACH_CHARS,
+            ),
+            Framing::Manipulation => cues.lead_ins.iter().any(|lead| {
+                led_in_by(
+                    folded,
+                    hit,
+                    &lead.cues,
+                    &lead.breakers,
+                    &lead.beneficiaries,
+                    lead.reach_chars,
+                )
+            }),
+        }
+    }
+
     fn matches(&self, folded: &Folded, cues: &Cues<'_>) -> bool {
         let here = if self.topical {
             cues.history_topical
@@ -1035,6 +1334,7 @@ impl HistoryRequest {
                         cues.history_after,
                         HISTORY_AFTER_REACH_CHARS,
                     )
+                    || self.is_not_a_request(current, hit, cues)
             },
             |f| asked(f) || self.phrases.iter().any(|needle| needle.found_in(f)),
             |f| {
@@ -1123,6 +1423,10 @@ struct Cues<'a> {
     history_topical: &'a [Needle],
     /// 只在命中紧后面才算的线索（[`HISTORY_AFTER_CUES`]）。
     history_after: &'a [Needle],
+    /// 请求词后面紧跟的停止 / 预防 / 避免词（[`HISTORY_STOP_CUES`]，[`Framing::HowTo`]）。
+    history_stops: &'a [Needle],
+    /// 手法动词前面的提醒线索（[`Framing::Manipulation`]），泰语、英语、紧挨动词的禁止词各一组。
+    lead_ins: &'a [LeadIn],
 }
 
 impl Cues<'_> {
@@ -1177,6 +1481,8 @@ fn build_rules() -> Vec<Rule> {
                 gap: HISTORY_ASK_GAP_CHARS,
                 phrases: needles(SELF_HARM_METHOD_PHRASES),
                 topical: false,
+                // 「วิธีหยุดทำร้ายตัวเอง」（怎么停止伤害自己）是安全引导，不是索要
+                framing: Framing::HowTo,
             }),
         },
         // ---- 危险行为 ----
@@ -1197,6 +1503,7 @@ fn build_rules() -> Vec<Rule> {
                 gap: HISTORY_ASK_GAP_CHARS,
                 phrases: needles(DANGEROUS_REQUEST_PHRASES),
                 topical: false,
+                framing: Framing::HowTo,
             }),
         },
         Rule {
@@ -1217,6 +1524,7 @@ fn build_rules() -> Vec<Rule> {
                 gap: HISTORY_ASK_GAP_CHARS,
                 phrases: Vec::new(),
                 topical: true,
+                framing: Framing::HowTo,
             }),
         },
         Rule {
@@ -1253,6 +1561,7 @@ fn build_rules() -> Vec<Rule> {
                 gap: HISTORY_ASK_GAP_CHARS,
                 phrases: Vec::new(),
                 topical: false,
+                framing: Framing::HowTo,
             }),
         },
         Rule {
@@ -1267,6 +1576,7 @@ fn build_rules() -> Vec<Rule> {
                 gap: HISTORY_ASK_GAP_CHARS,
                 phrases: needles(ADULT_EN_REQUEST_PHRASES),
                 topical: false,
+                framing: Framing::HowTo,
             }),
         },
         Rule {
@@ -1298,13 +1608,16 @@ fn build_rules() -> Vec<Rule> {
             },
             exempt_when_protective: false,
             // 手法动词（`หลอก` / `trick` / `steal`……）在对象（密码、住址）前面；「ถ้ามีคนหลอกถามรหัสผ่าน อย่าบอกเขานะ」
-            // 靠 `อย่าบอก` 放行，「ระวังรหัสผ่านของหนู อย่าให้ใครมาหลอก」对象在前，不算
+            // 靠 `อย่าบอก` 放行，「ระวังรหัสผ่านของหนู อย่าให้ใครมาหลอก」对象在前，不算。
+            // 动词前面（同一句里）有第三方主语或提防语的是在讲坏人的手法（`Hackers may trick you into sharing your password`、
+            // 「ระวังคนที่หลอกถามรหัสผ่านนะ」），见 `Framing::Manipulation`
             history: History::Request(HistoryRequest {
                 asks: needles(HISTORY_SOLICIT_VERBS),
                 objects: needles(SOLICIT_B),
                 gap: HISTORY_SOLICIT_GAP_CHARS,
                 phrases: Vec::new(),
                 topical: false,
+                framing: Framing::Manipulation,
             }),
         },
         Rule {
@@ -1319,6 +1632,7 @@ fn build_rules() -> Vec<Rule> {
                 gap: HISTORY_ASK_GAP_CHARS,
                 phrases: Vec::new(),
                 topical: false,
+                framing: Framing::HowTo,
             }),
         },
         Rule {
@@ -1706,6 +2020,60 @@ pub struct RuleChecker {
     history_topical_cues: Vec<Needle>,
     /// 只在命中紧后面才算的线索：[`HISTORY_AFTER_CUES`]。
     history_after_cues: Vec<Needle>,
+    /// 历史里请求词后面紧跟的停止 / 预防 / 避免词：[`HISTORY_STOP_CUES`]（[`Framing::HowTo`]）。
+    history_stop_cues: Vec<Needle>,
+    /// 历史里手法动词前面的提醒线索（[`Framing::Manipulation`]）：泰语、英语、紧挨动词的泰语禁止词各一组，见 [`build_lead_ins`]。
+    lead_ins: Vec<LeadIn>,
+}
+
+/// 手法动词前面的提醒线索，四组（[`Framing::Manipulation`]）：
+/// 1. 泰语的第三方主语和提防语（离动词 [`HISTORY_LEAD_IN_REACH_TH_CHARS`] 个字符之内）；
+/// 2. 英语的第三方主语（坏人的名字、泛指的人 + 情态词 / 关系词）和提防语（离动词 [`HISTORY_LEAD_IN_REACH_EN_CHARS`] 个字符之内）；
+/// 3. 泰语离动词很近的停止 / 预防词（[`HISTORY_LEAD_IN_REACH_STOP_TH_CHARS`] 个字符之内）；
+/// 4. 泰语紧挨动词的禁止词（[`HISTORY_LEAD_IN_REACH_PROHIBIT_TH_CHARS`] 个字符：词和动词之间放不下别的话）。
+///
+/// 后两组没有 `breakers`：线索和动词挨得这么近，中间放不下 `I want to` / `you can` 之类的话。
+fn build_lead_ins() -> Vec<LeadIn> {
+    let generic_subjects: Vec<String> = HISTORY_GENERIC_SUBJECTS_EN
+        .iter()
+        .flat_map(|subject| {
+            HISTORY_SUBJECT_FOLLOWERS_EN
+                .iter()
+                .map(move |follower| format!("{subject} {follower}"))
+        })
+        .collect();
+    let mut english = needles(HISTORY_THIRD_PARTY_EN);
+    english.extend(generic_subjects.iter().map(|phrase| Needle::new(phrase)));
+    // 泰语文本里夹着英语的请求 / 受益者（`มิจฉาชีพ ... trick my friend into giving me his password`）、英语文本里夹着泰语的请求，
+    // 同样不是提醒：两组线索都用两种语言的 breakers 和英语的受益者
+    let breakers = || needles_of(&[HISTORY_BREAKERS_TH, HISTORY_BREAKERS_EN]);
+    let beneficiaries = || needles(HISTORY_BENEFICIARIES_EN);
+    vec![
+        LeadIn {
+            cues: needles(HISTORY_THIRD_PARTY_TH),
+            breakers: breakers(),
+            beneficiaries: beneficiaries(),
+            reach_chars: HISTORY_LEAD_IN_REACH_TH_CHARS,
+        },
+        LeadIn {
+            cues: english,
+            breakers: breakers(),
+            beneficiaries: beneficiaries(),
+            reach_chars: HISTORY_LEAD_IN_REACH_EN_CHARS,
+        },
+        LeadIn {
+            cues: needles(HISTORY_STOP_BEFORE_VERB_TH),
+            breakers: Vec::new(),
+            beneficiaries: Vec::new(),
+            reach_chars: HISTORY_LEAD_IN_REACH_STOP_TH_CHARS,
+        },
+        LeadIn {
+            cues: needles(HISTORY_PROHIBIT_BEFORE_VERB_TH),
+            breakers: Vec::new(),
+            beneficiaries: Vec::new(),
+            reach_chars: HISTORY_LEAD_IN_REACH_PROHIBIT_TH_CHARS,
+        },
+    ]
 }
 
 /// base64 里再套 base64 最多解几层：再深的不是正常的内容。
@@ -1746,6 +2114,8 @@ impl RuleChecker {
             history_cues,
             history_topical_cues,
             history_after_cues: needles(HISTORY_AFTER_CUES),
+            history_stop_cues: needles(HISTORY_STOP_CUES),
+            lead_ins: build_lead_ins(),
         }
     }
 
@@ -1797,6 +2167,8 @@ impl RuleChecker {
             history: &self.history_cues,
             history_topical: &self.history_topical_cues,
             history_after: &self.history_after_cues,
+            history_stops: &self.history_stop_cues,
+            lead_ins: &self.lead_ins,
         };
         let protective = self.protective.iter().any(|cue| cue.found_in(&folded));
         self.rules

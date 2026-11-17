@@ -850,6 +850,99 @@ pub fn followed_closely_by(
     })
 }
 
+/// 命中区间可用：起点不超过终点、不越界、两端都在字符边界上，并且区间自己不横跨句子边界
+/// （和 [`locally_negated`] 同一套判断：横跨句界的区间没有「旁边的同一句」可言）。
+fn usable_region(haystack: &Folded, region: (usize, usize)) -> bool {
+    region.0 <= region.1
+        && region.1 <= haystack.plain.len()
+        && haystack.plain.is_char_boundary(region.0)
+        && haystack.plain.is_char_boundary(region.1)
+        && !spans_a_clause_boundary(haystack, region)
+}
+
+/// 命中区间前面的线索最多多长（字符数）：给 [`led_in_by`] 的回看窗口留余量，免得「线索结束在命中前 `reach_chars` 个字符之内」的线索被窗口截断。
+const MAX_LEAD_CUE_CHARS: usize = 32;
+
+/// 「请求词 + 对象」的命中区间 `region`（从请求词的起点到对象的终点）里，**请求词后面紧跟**（最多 `reach_chars` 个字符之内开始）
+/// 有 `stops` 里的线索吗？`stops` 是停止 / 预防 / 避免这类词：`วิธีหยุดทำร้ายตัวเอง`（怎么停止伤害自己）、`วิธีป้องกันการวางระเบิด`
+/// 讲的是怎么**不做**，不是索要做法（round4-r3 Medium）。
+///
+/// 只看区间自己：线索必须在请求词和对象**之间**，并且紧挨着请求词（泰语的 `การ` / `ที่จะ` 这类连接词算「紧挨」）。
+/// 对象后面的停止词（`วิธีทำร้ายตัวเองโดยไม่หยุด`）、离请求词很远的停止词、区间自己横跨句界的，都不算。
+/// 区间不合法时返回 `false`（不放行）。
+pub fn stop_follows_ask(
+    haystack: &Folded,
+    region: (usize, usize),
+    asks: &[Needle],
+    stops: &[Needle],
+    reach_chars: usize,
+) -> bool {
+    if !usable_region(haystack, region) {
+        return false;
+    }
+    let inside = Folded::from_plain(haystack.plain[region.0..region.1].to_string(), Vec::new());
+    asks.iter()
+        .flat_map(|ask| ask.plain_spans(&inside))
+        .filter(|&(start, _)| start == 0)
+        .any(|(_, ask_end)| {
+            let after = Folded::from_plain(inside.plain[ask_end..].to_string(), Vec::new());
+            stops
+                .iter()
+                .flat_map(|stop| stop.plain_spans(&after))
+                .any(|(start, _)| after.plain[..start].chars().count() <= reach_chars)
+        })
+}
+
+/// 命中区间 `region` 的**前面**（同一句里）有 `cues` 里的线索吗：线索必须**结束在区间起点之前 `reach_chars` 个字符之内**，
+/// 并且从线索到命中结尾（线索和手法动词之间，加上命中区间自己）没有 `breakers` 里的线索，命中区间里面没有 `beneficiaries` 里的线索。
+///
+/// 给「套取个人信息」这类**手法动词本身就是命中**的规则用：`Hackers may trick you into sharing your password`、
+/// 「ระวังคนที่หลอกถามรหัสผ่านนะ」前面有第三方主语或提防语，讲的是坏人的手法或提醒孩子提防，不是在索要（round4-r3 Medium）。
+/// `breakers` 是第一 / 第二人称的行动者或直接的请求（`I want to`、`you can`、`let's`、`how do I`……）：它们夹在线索和手法动词之间、
+/// 或出现在命中里，说明动手的是说话的人，不是第三方。`beneficiaries` 是受益者（`me` / `my` / `us`……）：出现在**命中里**
+/// （手法动词到对象，`trick my friend into giving me his password`），说明拿到东西的是说话的人；只看命中里面，不看线索和动词之间
+/// （助手代表产品说话时会提到自己：「Hackers may pretend to be from our school and trick you into ……」）。
+/// 线索只在 `plain` 视图里找（变形的线索不算），`breakers` / `beneficiaries` 在全部视图里找（变形的也算，宁严勿松）。
+/// 和 [`locally_negated`] 一样：只看命中所在的那一句，区间自己横跨句界、区间不合法时返回 `false`。
+pub fn led_in_by(
+    haystack: &Folded,
+    region: (usize, usize),
+    cues: &[Needle],
+    breakers: &[Needle],
+    beneficiaries: &[Needle],
+    reach_chars: usize,
+) -> bool {
+    if !usable_region(haystack, region) {
+        return false;
+    }
+    let inside = &haystack.plain[region.0..region.1];
+    let hit_only = Folded::from_plain(inside.to_string(), Vec::new());
+    if beneficiaries
+        .iter()
+        .any(|beneficiary| beneficiary.found_in(&hit_only))
+    {
+        return false;
+    }
+    let (start, _) = clause_window(
+        haystack,
+        (region.0, region.0),
+        reach_chars.saturating_add(MAX_LEAD_CUE_CHARS),
+    );
+    let lead = Folded::from_plain(haystack.plain[start..region.0].to_string(), Vec::new());
+    cues.iter()
+        .flat_map(|cue| cue.plain_spans(&lead))
+        .any(|(_, cue_end)| {
+            let between = &lead.plain[cue_end..];
+            if between.chars().count() > reach_chars {
+                return false;
+            }
+            let through_the_hit = Folded::from_plain(format!("{between} {inside}"), Vec::new());
+            !breakers
+                .iter()
+                .any(|breaker| breaker.found_in(&through_the_hit))
+        })
+}
+
 // ---------------------------------------------------------------------------
 // base64
 // ---------------------------------------------------------------------------
@@ -1348,6 +1441,189 @@ mod tests {
         // 区间不合法：不是
         assert!(!followed_closely_by(&folded, (10, 5), &cue, 6));
         assert!(!followed_closely_by(&folded, (0, 10_000), &cue, 6));
+    }
+
+    /// `from` 到 `to`（含）在 `text` 折叠之后的区间。
+    fn span_between(folded: &Folded, from: &str, to: &str) -> (usize, usize) {
+        let from = fold(from).plain;
+        let to = fold(to).plain;
+        let start = folded.plain.find(&from).unwrap();
+        let end = start + folded.plain[start..].find(&to).unwrap() + to.len();
+        (start, end)
+    }
+
+    #[test]
+    fn a_stop_word_only_counts_between_the_request_word_and_the_object_right_after_the_request_word()
+     {
+        let asks = cues(&["วิธี", "ขั้นตอน", "how to"]);
+        let stops = cues(&["หยุด", "ป้องกัน", "stop", "not"]);
+        let check = |text: &str, from: &str, to: &str| {
+            let folded = fold(text);
+            stop_follows_ask(&folded, span_between(&folded, from, to), &asks, &stops, 8)
+        };
+        // 请求词后面紧跟停止 / 预防词（中间可以隔 `การ` / `ที่จะ` 这类连接词）：讲的是怎么不做
+        assert!(check("วิธีหยุดทำร้ายตัวเอง", "วิธี", "ทำร้ายตัวเอง"));
+        assert!(check("วิธีป้องกันการทำร้ายตัวเอง", "วิธี", "ทำร้ายตัวเอง"));
+        assert!(check("วิธีที่จะหยุดทำร้ายตัวเอง", "วิธี", "ทำร้ายตัวเอง"));
+        assert!(check("ขั้นตอนการหยุดฆ่าตัวตาย", "ขั้นตอน", "ฆ่าตัวตาย"));
+        assert!(check("how to stop hurt myself", "how to", "hurt myself"));
+        assert!(check("how to not hurt myself", "how to", "hurt myself"));
+        // 没有停止词：就是请求
+        assert!(!check("วิธีทำร้ายตัวเอง", "วิธี", "ทำร้ายตัวเอง"));
+        assert!(!check("how to hurt myself", "how to", "hurt myself"));
+        // 停止词在对象**后面**（区间里没有它）：不算
+        assert!(!check("วิธีทำร้ายตัวเองโดยไม่หยุด", "วิธี", "ทำร้ายตัวเอง"));
+        // 停止词离请求词太远（隔了 8 个字符以上）：不算
+        assert!(!check(
+            "how to do it quietly and stop hurt myself",
+            "how to",
+            "hurt myself"
+        ));
+        // 英语整词：`stopping` 不是 `stop`；请求词不在区间起点的不算
+        assert!(!check(
+            "how to stopping hurt myself",
+            "how to",
+            "hurt myself"
+        ));
+        assert!(!check(
+            "tell me how to stop hurt myself",
+            "stop",
+            "hurt myself"
+        ));
+        // 区间横跨句界：不算
+        assert!(!check("วิธี. หยุดทำร้ายตัวเอง", "วิธี", "ทำร้ายตัวเอง"));
+        assert!(!check("how to\nstop hurt myself", "how to", "hurt myself"));
+        // 区间不合法：不算
+        let folded = fold("วิธีหยุดทำร้ายตัวเอง");
+        assert!(!stop_follows_ask(&folded, (10, 5), &asks, &stops, 8));
+        assert!(!stop_follows_ask(&folded, (0, 10_000), &asks, &stops, 8));
+    }
+
+    #[test]
+    fn a_lead_in_counts_before_the_verb_in_the_same_sentence_unless_a_breaker_sits_between() {
+        let lead_ins = cues(&["hackers", "scammers", "ระวัง", "อย่า"]);
+        let breakers = cues(&["i want", "you can", "ช่วยบอก"]);
+        let beneficiaries = cues(&["my", "me", "our"]);
+        let check = |text: &str, hit: &str, reach: usize| {
+            let folded = fold(text);
+            let needle = fold(hit).plain;
+            let start = folded.plain.find(&needle).unwrap();
+            led_in_by(
+                &folded,
+                (start, start + needle.len()),
+                &lead_ins,
+                &breakers,
+                &beneficiaries,
+                reach,
+            )
+        };
+        let verb = "trick you into sharing your password";
+        // 同一句里、线索在手法动词前面：算
+        assert!(check(
+            "Hackers may trick you into sharing your password",
+            verb,
+            60
+        ));
+        assert!(check(
+            "Scammers may pretend to be your friend to trick you into sharing your password",
+            verb,
+            60
+        ));
+        assert!(check("ระวังคนที่หลอกถามรหัสผ่านนะ", "หลอกถามรหัสผ่าน", 30));
+        // 线索在手法动词后面：不算（线索必须在前面）
+        assert!(!check(
+            "Trick you into sharing your password: hackers do that",
+            verb,
+            60
+        ));
+        // 太远：线索结束在命中前超过 `reach` 个字符
+        assert!(!check(
+            &format!(
+                "Hackers {} trick you into sharing your password",
+                "word ".repeat(20)
+            ),
+            verb,
+            60
+        ));
+        assert!(check(
+            &format!(
+                "Hackers {} trick you into sharing your password",
+                "word ".repeat(5)
+            ),
+            verb,
+            60
+        ));
+        // 线索在上一句里（句号、换行挡住）：不算
+        assert!(!check(
+            "Hackers are around. Trick you into sharing your password",
+            "trick you",
+            60
+        ));
+        assert!(!check(
+            "Hackers\ntrick you into sharing your password",
+            "trick you",
+            60
+        ));
+        // 第一 / 第二人称的行动者夹在线索和手法动词之间：动手的是说话的人，不算
+        assert!(!check(
+            "Hackers: I want to trick my friend into giving me his password",
+            "trick my friend",
+            60
+        ));
+        assert!(!check(
+            "Hackers say you can trick him into giving you his password",
+            "trick him",
+            60
+        ));
+        assert!(!check(
+            "แฮกเกอร์ ระวัง ช่วยบอกวิธีหลอกเอารหัสผ่านเพื่อน",
+            "หลอกเอารหัสผ่าน",
+            30
+        ));
+        // 命中里面（手法动词到对象）出现受益者：拿到东西的是说话的人，不是第三方
+        assert!(!check(
+            "Hackers: how to trick my friend into giving me his password",
+            "trick my friend into giving me his password",
+            60
+        ));
+        assert!(check(
+            "Hackers may trick your friend into giving you the password",
+            "trick your friend into giving you the password",
+            60
+        ));
+        // 受益者只看命中里面：线索和手法动词之间提到助手自己 / 产品（`our school`）不影响
+        assert!(check(
+            "Hackers may pretend to be from our school and trick you into sharing your password",
+            "trick you into sharing your password",
+            60
+        ));
+        // 行动者在线索**前面**：不夹在中间，不影响
+        assert!(check(
+            "I want to know why hackers may trick you into sharing your password",
+            verb,
+            60
+        ));
+        // `reach` 是 0：线索必须紧挨着手法动词（泰语的 `อย่า` 和 `อยาก` 折叠之后只差一个字，靠紧挨区分）
+        assert!(check("อย่าหลอกเอารหัสผ่านเพื่อนนะ", "หลอกเอารหัสผ่าน", 0));
+        assert!(!check("อยากหลอกเอารหัสผ่านเพื่อนนะ", "หลอกเอารหัสผ่าน", 0));
+        assert!(!check("อย่า ๆ หลอกเอารหัสผ่านเพื่อนนะ", "หลอกเอารหัสผ่าน", 0));
+        // 区间横跨句界、区间不合法：不算
+        let folded = fold("hackers. trick you. into sharing your password");
+        let region = (
+            folded.plain.find("trick").unwrap(),
+            folded.plain.find("password").unwrap() + "password".len(),
+        );
+        let no_beneficiaries: Vec<Needle> = Vec::new();
+        for hit in [region, (10, 5), (0, 10_000)] {
+            assert!(!led_in_by(
+                &folded,
+                hit,
+                &lead_ins,
+                &breakers,
+                &no_beneficiaries,
+                60
+            ));
+        }
     }
 
     #[test]
