@@ -26,7 +26,7 @@ use idoris_compute_contracts::ids::AttemptIndex;
 use idoris_compute_contracts::reason::ReasonCode;
 use idoris_tenancy::attempts::UsageClaim;
 use idoris_upstream::cloud::{
-    ChunkKind, CloudFailure, ResponseHead, SseEvent, SseParser, UsageParse, classify,
+    ChoiceFacts, ChunkKind, CloudFailure, ResponseHead, SseEvent, SseParser, UsageParse, classify,
 };
 use serde_json::Value;
 use tokio::time::Instant;
@@ -136,9 +136,9 @@ pub(crate) enum Ingested {
     Malformed,
 }
 
-/// 流的观察器：供应商请求号、最近的 usage、新内容出现的位置、choice 有没有完成、是否见过 `[DONE]`。
+/// 流的观察器：供应商请求号、最近的 usage、新内容出现的位置、每个 choice 的结束位置、是否见过 `[DONE]`。
 ///
-/// # 一个 usage 什么时候可信（R3 N3 + B4）
+/// # 一个 usage 什么时候可信（R3 N3 + B4 + R6 ②）
 ///
 /// 上游可以在流中途发一个 usage（比如累计用量），后面还有内容。客户端在那之后断开、或者流在那之后失败，甚至流最后
 /// 干净地 `[DONE]` 了，中途的数字也只是已生成部分的用量，不是整个响应的用量：按它结算会少收钱（上游已经生成并计费的
@@ -149,7 +149,20 @@ pub(crate) enum Ingested {
 /// - 最近的 usage，以及携带它的那个事件的位置（[`Self::usage`] / `usage_at`）；
 /// - 最后一次出现**新内容**的事件的位置（`content_at`）；只有 `delta` 里有新的生成内容才算
 ///   （见 `idoris_upstream::cloud::ChunkInfo::has_content`），空 delta 的结束块、只带 `role` 的块都不算；
-/// - choice 有没有完成（`finished`：见过非空的 `finish_reason`）。
+/// - 每个 choice 最近一次**结束**（非空字符串的 `finish_reason`）和最近一次**新内容**的事件位置（`choices`）。
+///   **结束不是永久的**：一个 choice 的结束只在它**不早于**这个 choice 最近一次新内容时才算数
+///   （[`ChoiceProgress::is_finished`]）。已经结束的 choice 又出现新内容，旧的结束标志就作废——它不能确认当前这一段
+///   生成已经完成，直到这个 choice 再次结束。原来这里是个永不清除的 `finished` 布尔：内容 -> `finish_reason: "stop"` ->
+///   新内容 + 累计 usage（`finish_reason: null`）-> 上游错误 / 客户端断开，第三块使 `content_at == usage_at`，前面那个
+///   结束标志却仍然为真，累计数字被当成最终用量结清、不挂账（少收，对账也看不到）。
+///
+/// 为什么选「结束标志作废」而不是「把这条流判成畸形」：两条路对这个场景的结算一样（预留价，用量未知），但作废保留了
+/// 上游声称的累计数字（`usage_claim_json`，判定 `untrusted:not_final`）供对账，也不会因为一个不守约定的上游把用户
+/// 已经收到的回答在半路掐断；而且后面如果这个 choice 又结束了、或者 `[DONE]` 到了，流就按最终 usage 正常结算。
+///
+/// 每个 choice 单独看（按 `index`，没写按它在数组里的位置）：只有**出现过的每一个** choice 都结束了，夹带在内容块里的
+/// usage 才算跟着结束标志。我们从不请求 `n > 1`，正常的上游只有一个 choice；不守约定时，一个 choice 的结束不能代替
+/// 另一个。最多分别跟踪 [`MAX_TRACKED_CHOICES`] 个，超出的跟踪不了，保守地当作「没有结束」（`untracked_choice`）。
 ///
 /// [`Self::usage_is_trusted`] 的规则：
 ///
@@ -157,7 +170,7 @@ pub(crate) enum Ingested {
 /// 2. **usage 之后出现了新内容**（`content_at` 严格晚于 `usage_at`）：不可信，**不论流后来怎么结束，包括 `[DONE]`**；
 ///    usage 和内容在同一个事件里不算「之后」（每个 chunk 带累计 usage 的实现，最后一个内容块带的就是最终值）；
 /// 3. usage 之后没有新内容：单独的 usage 块（`choices` 为空或没有）可信——OpenAI 约定它就是整个请求的最终用量；
-///    夹带在内容块里的 usage，要等到这个 choice 完成（本块带 `finish_reason`，或者之后来了空 delta 的结束块）或者见到
+///    夹带在内容块里的 usage，要等到所有 choice 都完成（本块带 `finish_reason`，或者之后来了空 delta 的结束块）或者见到
 ///    `[DONE]` 才可信：还没有任何结束的迹象就断了，生成可能还在继续。
 ///
 /// 不可信时（并且 usage 确实是有效的）：**按原规则**——预留价、成本挂账待核销，上游声称的数字原样记进 `usage_claim_json`
@@ -176,11 +189,33 @@ pub(crate) struct StreamTracker {
     usage_at: Option<u64>,
     /// [`Self::usage`] 来自单独的 usage 块（`choices` 为空或没有）。
     usage_standalone: bool,
-    /// 最后一个带**新内容**的事件的编号。
+    /// 最后一个带**新内容**的事件的编号（任何 choice）。
     content_at: Option<u64>,
-    /// 见过非空的 `finish_reason`：choice 的生成已经结束。
-    finished: bool,
+    /// 每个出现过的 choice 的结束 / 新内容位置。
+    choices: Vec<ChoiceProgress>,
+    /// 出现过跟踪不了的 choice（超过 [`MAX_TRACKED_CHOICES`] 个不同的 `index`）：保守地当作没有结束。
+    untracked_choice: bool,
     pub(crate) saw_done: bool,
+}
+
+/// 最多分别跟踪几个 choice。我们从不请求 `n > 1`，正常的上游只有一个。
+const MAX_TRACKED_CHOICES: usize = 8;
+
+/// 一个 choice 最近一次「结束」和最近一次「新内容」的事件编号。
+#[derive(Debug, Clone, Copy)]
+struct ChoiceProgress {
+    index: u64,
+    finish_at: Option<u64>,
+    content_at: Option<u64>,
+}
+
+impl ChoiceProgress {
+    /// 这个 choice 的最近一次结束**不早于**它最近一次新内容（同一个事件里既有新内容又有结束也算结束）。
+    /// 从没结束过：没有结束；从没有新内容：结束过就是结束了。
+    fn is_finished(&self) -> bool {
+        self.finish_at
+            .is_some_and(|finish| self.content_at.is_none_or(|content| finish >= content))
+    }
 }
 
 impl StreamTracker {
@@ -194,8 +229,43 @@ impl StreamTracker {
             usage_at: None,
             usage_standalone: false,
             content_at: None,
-            finished: false,
+            choices: Vec::new(),
+            untracked_choice: false,
             saw_done: false,
+        }
+    }
+
+    /// 出现过的每一个 choice 都已经结束（并且结束没有被之后的新内容作废）。
+    fn generation_finished(&self) -> bool {
+        !self.untracked_choice
+            && !self.choices.is_empty()
+            && self.choices.iter().all(ChoiceProgress::is_finished)
+    }
+
+    /// 记下一个 choice 在当前事件里的动静：新内容、结束。
+    fn note_choice(&mut self, facts: &ChoiceFacts) {
+        if !self.choices.iter().any(|known| known.index == facts.index) {
+            if self.choices.len() >= MAX_TRACKED_CHOICES {
+                self.untracked_choice = true;
+                return;
+            }
+            self.choices.push(ChoiceProgress {
+                index: facts.index,
+                finish_at: None,
+                content_at: None,
+            });
+        }
+        if let Some(progress) = self
+            .choices
+            .iter_mut()
+            .find(|known| known.index == facts.index)
+        {
+            if facts.has_content {
+                progress.content_at = Some(self.events);
+            }
+            if facts.finished {
+                progress.finish_at = Some(self.events);
+            }
         }
     }
 
@@ -211,7 +281,7 @@ impl StreamTracker {
         {
             return false;
         }
-        self.usage_standalone || self.finished || self.saw_done
+        self.usage_standalone || self.generation_finished() || self.saw_done
     }
 
     pub(crate) fn ingest(&mut self, event: &SseEvent) -> Ingested {
@@ -252,8 +322,8 @@ impl StreamTracker {
                 if info.has_content {
                     self.content_at = Some(self.events);
                 }
-                if info.has_finish_reason {
-                    self.finished = true;
+                for choice in &info.choices {
+                    self.note_choice(choice);
                 }
                 if carries_usage && !self.wants_usage_chunk {
                     // 客户端没要 usage：整块只有 usage 就不转发，内容块里夹带的 usage 去掉
@@ -780,11 +850,19 @@ mod tests {
     /// - `finish`：只有结束标志（空 delta、`finish_reason: stop`），没有 usage、没有新内容；`finish+usage`：同上并带 usage；
     /// - `role`：只有 `role` 的开场块；`empty-delta`：`delta: {}`、没有 `finish_reason`；`blank-finish`：`finish_reason: ""`；
     /// - `tool-call`：带工具调用参数的块；`empty-choices`：`{"choices":[]}`；`done`：`[DONE]`。
+    ///
+    /// 任何一个带 choice 的词后面可以接 `@N`（比如 `content@1`、`finish@1`）：这个块的 choice 是 `index: N`
+    /// （没有 `@N` 的块里 choice 没写 `index`，按它在数组里的位置算 0）。上游本来不该有第二个 choice
+    /// （我们从不请求 `n > 1`），这些词用来钉住「不守约定的上游」那一类流。
     fn track(steps: &[&str]) -> StreamTracker {
         let usage = r#""usage":{"prompt_tokens":12,"completion_tokens":2}"#;
         let mut tracker = StreamTracker::new(false);
         for step in steps {
-            let data = match *step {
+            let (name, choice_index) = match step.split_once('@') {
+                Some((name, index)) => (name, Some(index.parse::<u64>().unwrap())),
+                None => (*step, None),
+            };
+            let mut data = match name {
                 "content" => r#"{"id":"c","choices":[{"delta":{"content":"hi"}}]}"#.to_string(),
                 "content+usage" => format!(
                     r#"{{"id":"c","choices":[{{"delta":{{"content":"hi"}}}}],{usage}}}"#
@@ -813,6 +891,11 @@ mod tests {
                 "done" => "[DONE]".to_string(),
                 other => panic!("unknown step {other}"),
             };
+            if let Some(index) = choice_index {
+                let mut value: Value = serde_json::from_str(&data).unwrap();
+                value["choices"][0]["index"] = serde_json::json!(index);
+                data = value.to_string();
+            }
             let ingested = tracker.ingest(&ev(&data));
             assert!(
                 !matches!(ingested, Ingested::Malformed | Ingested::UpstreamError),
@@ -998,8 +1081,208 @@ mod tests {
                 "{name}: {steps:?} (usage_at={:?} content_at={:?} finished={} done={})",
                 tracker.usage_at,
                 tracker.content_at,
-                tracker.finished,
+                tracker.generation_finished(),
                 tracker.saw_done
+            );
+        }
+    }
+
+    /// 第六轮（R4-r2 新问题②）：结束标志不是永久生效的。一个 choice 的「结束」只在它**不早于**这个 choice 最近一次
+    /// 新内容时才算数：已经结束的 choice 又出现新内容，说明那个结束标志不能确认当前这一段生成已经完成，
+    /// 夹带在这个新内容块里的累计 usage 就还不是最终值。原来 `finished` 是个永不清除的布尔：
+    /// 内容 -> `finish_reason: "stop"` -> 新内容 + 累计 usage（`finish_reason: null`）-> 上游报错 / 客户端断开，
+    /// 第三块使 `content_at == usage_at`，前面的结束标志却仍然为真，那个累计数字被当成最终用量结清、不挂账（少收，
+    /// 对账也看不到）。
+    #[test]
+    fn the_usage_trust_table_after_a_finish_event() {
+        // (场景, 事件序列, 可信吗)
+        let cases: &[(&str, &[&str], bool)] = &[
+            // ---- 报告里的序列：结束之后又来新内容 + 累计 usage ----
+            (
+                "REPORT: content, finish, content + cumulative usage, then the stream fails / the client leaves",
+                &["content", "finish", "content+usage"],
+                false,
+            ),
+            (
+                "the same, with a role-only chunk and an empty delta in between",
+                &["content", "finish", "role", "empty-delta", "content+usage"],
+                false,
+            ),
+            // 之后有了新的结束标志（或 `[DONE]`、单独的 usage 块）：这一段生成确实完成了
+            (
+                "... then a new finish chunk: the latest finish is not earlier than the latest content",
+                &["content", "finish", "content+usage", "finish"],
+                true,
+            ),
+            (
+                "... then DONE",
+                &["content", "finish", "content+usage", "done"],
+                true,
+            ),
+            (
+                "... then a usage-only chunk",
+                &["content", "finish", "content+usage", "usage"],
+                true,
+            ),
+            (
+                "... then finish+usage",
+                &["content", "finish", "content+usage", "finish+usage"],
+                true,
+            ),
+            (
+                "the new content carries the new finish_reason itself",
+                &["content", "finish", "content+usage+finish"],
+                true,
+            ),
+            // ---- 反复结束 / 反复重开 ----
+            (
+                "finish, content, finish, content+usage: the last finish is older than the last content",
+                &["content", "finish", "content", "finish", "content+usage"],
+                false,
+            ),
+            (
+                "... and one more finish at the end",
+                &[
+                    "content",
+                    "finish",
+                    "content",
+                    "finish",
+                    "content+usage",
+                    "finish",
+                ],
+                true,
+            ),
+            (
+                "finish, more content without usage, then a usage-only chunk (the usage-only chunk is final by convention)",
+                &["content", "finish", "content", "usage"],
+                true,
+            ),
+            // usage 之后的新内容仍然使它不可信（第 2 条规则不受影响）
+            (
+                "finish, usage-carrying finish chunk, then more content",
+                &["content", "finish+usage", "content"],
+                false,
+            ),
+            (
+                "usage on the first chunk, finish, content + a later cumulative usage",
+                &["content+usage", "finish", "content+usage"],
+                false,
+            ),
+            (
+                "... and a finish after it",
+                &["content+usage", "finish", "content+usage", "finish"],
+                true,
+            ),
+            // ---- 对照：结束标志之后没有新内容，原来的行为不变 ----
+            (
+                "control: content, finish, finish+usage (the finish chunk repeats, no new content)",
+                &["content", "finish", "finish+usage"],
+                true,
+            ),
+            (
+                "control: content, content+usage, finish",
+                &["content", "content+usage", "finish"],
+                true,
+            ),
+            (
+                "control: content+usage+finish alone",
+                &["content+usage+finish"],
+                true,
+            ),
+            // ---- 不守约定的上游：不止一个 choice（我们从不请求 n > 1）----
+            // 每个 choice 单独看：所有出现过的 choice 都已结束，夹带在内容块里的 usage 才算跟着结束标志
+            (
+                "two choices: only choice 0 finished, choice 1 is still generating",
+                &["content", "content@1", "finish", "content+usage@1"],
+                false,
+            ),
+            (
+                "two choices: choice 1 finishes afterwards, both are finished",
+                &[
+                    "content",
+                    "content@1",
+                    "finish",
+                    "content+usage@1",
+                    "finish@1",
+                ],
+                true,
+            ),
+            (
+                "two choices: choice 1's finish comes first, choice 0 has the later content",
+                &["content", "content@1", "finish@1", "content+usage"],
+                false,
+            ),
+            (
+                "two choices: the last finish event belongs to choice 0, choice 1 never finished",
+                &["content@1", "content+usage", "finish"],
+                false,
+            ),
+            (
+                "two choices: both finished long ago, then choice 1 re-opens with content + usage",
+                &[
+                    "content",
+                    "content@1",
+                    "finish",
+                    "finish@1",
+                    "content+usage@1",
+                ],
+                false,
+            ),
+            (
+                "two choices: both finished, the usage rides the last finish chunk",
+                &["content", "content@1", "finish", "finish+usage@1"],
+                true,
+            ),
+        ];
+        for (name, steps, trusted) in cases {
+            let tracker = track(steps);
+            assert_eq!(
+                tracker.usage_is_trusted(),
+                *trusted,
+                "{name}: {steps:?} (usage_at={:?} content_at={:?} done={})",
+                tracker.usage_at,
+                tracker.content_at,
+                tracker.saw_done
+            );
+        }
+    }
+
+    /// 第六轮（R4-r2 Medium-3 残留）：`finish_reason` 不是字符串（布尔值、数字、对象、数组）的 choice 不是合法的流事件：
+    /// 不转发（转发了就跨过发布边界，不能再切换候选，用户没拿到回答却要按预留价付费），不认供应商请求号，不改变任何判断。
+    #[test]
+    fn a_finish_reason_that_is_not_a_string_is_not_a_valid_stream_event() {
+        let mut tracker = StreamTracker::new(false);
+        for data in [
+            r#"{"choices":[{"finish_reason":false}]}"#,
+            r#"{"id":"c","choices":[{"finish_reason":true}]}"#,
+            r#"{"id":"c","choices":[{"finish_reason":0}]}"#,
+            r#"{"id":"c","choices":[{"finish_reason":{}}]}"#,
+            r#"{"id":"c","choices":[{"finish_reason":[]}]}"#,
+            r#"{"id":"c","choices":[{"delta":{},"finish_reason":false}]}"#,
+            r#"{"id":"c","choices":[{"delta":{"content":"x"},"finish_reason":1}]}"#,
+            // 带 usage 也一样
+            r#"{"id":"c","choices":[{"finish_reason":false}],"usage":{"prompt_tokens":1,"completion_tokens":1}}"#,
+            // `delta` / `index` 类型不对
+            r#"{"id":"c","choices":[{"delta":"text","finish_reason":"stop"}]}"#,
+            r#"{"id":"c","choices":[{"index":"0","delta":{}}]}"#,
+        ] {
+            assert!(
+                matches!(tracker.ingest(&ev(data)), Ingested::Malformed),
+                "{data}"
+            );
+        }
+        assert!(tracker.id.is_none(), "a malformed chunk teaches us nothing");
+        assert!(matches!(tracker.usage, UsageParse::Absent));
+        assert!(!tracker.usage_is_trusted());
+        // 对照：字符串的 finish_reason 和缺省 / null 都转发
+        for data in [
+            r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
+            r#"{"choices":[{"delta":{"content":"x"},"finish_reason":null}]}"#,
+            r#"{"choices":[{"finish_reason":"length"}]}"#,
+        ] {
+            assert!(
+                matches!(tracker.ingest(&ev(data)), Ingested::Forward(_)),
+                "{data}"
             );
         }
     }
