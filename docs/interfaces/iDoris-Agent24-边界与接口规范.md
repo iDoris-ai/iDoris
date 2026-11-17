@@ -177,16 +177,24 @@ agent24d 托管 iDoris 时，按下表执行。表中都是已冻结的接口，
 
 **分工**：iDoris 负责「这台机器的 chat 用哪个模型」——档位表、量化选择、是否已安装、内存是否放得下、下载与加载。Agent24 负责首次启动时调用、把用户的选择保存为默认 chat 模型、Settings 的模型选择器，以及 iDoris 未安装时回落到 `Qwen3-8B-4bit`。
 
-**档位表（owner 2026-11-15 拍板，按物理内存 `ram_gb`）**
+**档位表（owner 2026-11-15 拍板，按物理内存）**
 
-| 物理内存 | 推荐 chat 模型（oMLX 目录名） | 备选 |
-|---|---|---|
-| ≤ 8 GB | 不推荐本地 chat（`model_id: null`，`reason: insufficient_memory`） | — |
-| 16 / 24 / 32 GB | `Qwen3-8B-4bit` | — |
-| 48 GB 及以上 | `Qwen3.8-27B-OptiQ-4bit` | `Qwen3-8B-4bit` |
-| 64 GB 及以上 | `Qwen3.8-27B-OptiQ-4bit` | `Qwen3.6-35B-A3B-OptiQ-4bit`、`Qwen3-8B-4bit` |
+档位按 `host.ram_bytes`（物理内存字节数）落在哪个左闭右开区间判断，单位是 GiB（1 GiB = 1073741824 字节；Apple 标称的「16GB」就是 16 GiB）。模型体积与内存估算（`size_bytes`、`est_memory_bytes`）用十进制字节。每台机器恰好落在一行：
 
-档位按真实物理 RAM 判断（与 §2.4 的 min_ram 门一致）。「放得下」（`fits`）另按 iDoris 的内存公式判断：设置了 `IDORIS_ALLOCATED_BUDGET_BYTES` 时按该额度，否则按 iDoris 自探的可用 GPU 内存。档位推荐的模型放不下时，`model_id` 回退到下一档里放得下的最大模型，并在 `reason` 说明。内存依据（实测，2026-11-15）：`Qwen3.8-27B-OptiQ-4bit` 权重 20.68 GB，加 8k 上下文 KV（全注意力上界约 2.1 GB）与约 1 GB 开销，约 23.8 GB；24 GB 机器可用约 15.8–16.8 GB，32 GB 约 21.1–22.4 GB，均放不下。
+| `ram_bytes` 区间 | 档位推荐（oMLX 目录名） | `alternatives` | 档位 `reason` |
+|---|---|---|---|
+| [0, 16 GiB) | `Qwen3-8B-4bit`，**仅当它放得下**；放不下则 `model_id: null` | 无 | `tier_below_16gib` |
+| [16 GiB, 48 GiB) | `Qwen3-8B-4bit` | 无 | `tier_16_48gib` |
+| [48 GiB, 64 GiB) | `Qwen3.8-27B-OptiQ-4bit` | `Qwen3-8B-4bit` | `tier_48_64gib` |
+| [64 GiB, ∞) | `Qwen3.8-27B-OptiQ-4bit` | `Qwen3.6-35B-A3B-OptiQ-4bit`、`Qwen3-8B-4bit` | `tier_64gib_plus` |
+
+（owner 原话「≤8GB 不推荐本地 chat；16/24/32GB → 8B；48GB+ → 27B；64GB+ 可选 35B-A3B」。8 GiB 机器在第一行按放不下返回 `null`；18 / 36 GiB 等落在第二行。）
+
+档位按真实物理 RAM 判断（与 §2.4 的 min_ram 门一致）。「放得下」（`fits`）另按 iDoris 的内存公式判断：设置了 `IDORIS_ALLOCATED_BUDGET_BYTES` 时按该额度，否则按 iDoris 自探的可用 GPU 内存。
+
+**回落规则**：档位推荐的模型放不下时，按 `Qwen3.6-35B-A3B-OptiQ-4bit` → `Qwen3.8-27B-OptiQ-4bit` → `Qwen3-8B-4bit` 的顺序，从档位推荐的下一个起找第一个放得下的作为 `model_id`，此时 `reason` 为 `fallback_does_not_fit`；一个都放不下时 `model_id: null`，`reason` 为 `insufficient_memory`。`alternatives` 只列档位表里该行的备选，每项各自带 `fits`。
+
+内存依据（实测，2026-11-15）：`Qwen3.8-27B-OptiQ-4bit` 权重 20.68 GB，加 8k 上下文 KV（全注意力上界约 2.1 GB）与约 1 GB 开销，约 23.8 GB；24 GiB 机器可用约 15.8–16.8 GB，32 GiB 约 21.1–22.4 GB，均放不下。
 
 **`GET /v1/recommendation?role=chat`**（只读，需要数据 key，与 `/v1/models` 同级鉴权）
 
@@ -200,19 +208,19 @@ agent24d 托管 iDoris 时，按下表执行。表中都是已冻结的接口，
     "size_bytes": 4620000000,
     "est_memory_bytes": 6100000000,
     "fits": true,
-    "reason": "tier_16_32gb",
+    "reason": "tier_16_48gib",
     "host": {"ram_bytes": 17179869184, "allocated_budget_bytes": null},
     "alternatives": [
-      {"model_id": "…", "installed": false, "size_bytes": 0, "est_memory_bytes": 0, "fits": true, "reason": "…"}
+      {"model_id": "…", "installed": false, "size_bytes": null, "est_memory_bytes": null, "fits": true, "reason": "…"}
     ]
   }
   ```
-- `model_id` 是 oMLX 目录名（即 `/v1/chat/completions` 的 `model` 应填的值），可为 `null`。`installed` 表示 `~/.omlx/models/<model_id>` 已存在且完整。`size_bytes` 为磁盘/下载体积（未安装时为预计下载体积，未知为 `null`）。`reason` 是稳定的代码（`tier_16_32gb`、`tier_48gb`、`tier_64gb`、`insufficient_memory`、`fallback_does_not_fit` 等），供程序判断；给人看的说明另放 `remediation`，不属于契约。
+- `model_id` 是 oMLX 目录名（即 `/v1/chat/completions` 的 `model` 应填的值），可为 `null`。`installed` 表示 `~/.omlx/models/<model_id>` 已存在且完整。`size_bytes` 为磁盘/下载体积（未安装时为预计下载体积），`est_memory_bytes` 为加载后的内存估算；两者未知时都为 `null`（不用 0），`alternatives` 里的同名字段相同。`reason` 只取上面档位表与回落规则里的代码（`tier_below_16gib`、`tier_16_48gib`、`tier_48_64gib`、`tier_64gib_plus`、`fallback_does_not_fit`、`insufficient_memory`），供程序判断；给人看的说明另放 `remediation`，不属于契约。
 - 本接口不加载、不下载、不改任何状态。Agent24 保存用户的选择，iDoris 不记忆。
 
 **`idoris recommend --role chat --json`**（CLI，同一响应形状）
 
-- 只需要 iDoris 可执行文件：不开数据库、不取实例锁、不启动 runtime、不需要 serve 在跑，也不需要完整 setup。自探硬件，读取 `~/.omlx/models` 判断是否已安装；可用 `--allocated-budget-bytes <u64>` 覆盖额度。
+- 只需要 iDoris 可执行文件：不开数据库、不取实例锁、不启动 runtime、不需要 serve 在跑，也不需要完整 setup。自探硬件，读取 `~/.omlx/models` 判断是否已安装；不连接 oMLX，因此不读取任何 oMLX 密钥（下面「oMLX 密钥」一节只适用于 iDoris 连接 oMLX 的场景）；可用 `--allocated-budget-bytes <u64>` 覆盖额度。
 - 退出码：0 成功（含 `model_id: null`）；1 失败（stderr 一行说明）。
 
 **`GET /v1/models/local`**（只读，需要数据 key）
@@ -220,7 +228,7 @@ agent24d 托管 iDoris 时，按下表执行。表中都是已冻结的接口，
 - 列出 `~/.omlx/models` 下的模型：`{"models": [{"omlx_id": "Qwen3-8B-4bit", "kind": "chat", "size_bytes": 4620000000, "catalog_id": "qwen3-8b"}]}`。
 - `kind` 取值：`chat`、`vision`、`embedding`、`rerank`、`image`、`ocr`、`tts`、`unknown`。来源优先级：iDoris catalog（`config/catalog.yaml`，新增 `omlx_id` 与 `kind`）→ 按模型目录的 `config.json`（`architectures` / `model_type` 等）推断 → 推断不了为 `unknown`。`catalog_id` 不在 catalog 时为 `null`。
 - Agent24 的 chat 选择器只列 `kind` 为 `chat` 或 `vision` 的条目；`unknown` 不列入。
-- 同形状 CLI：`idoris models local --json`，运行条件与 `idoris recommend` 相同。
+- 同形状 CLI：`idoris models local --json`，运行条件与 `idoris recommend` 相同（只读文件系统，不连接 oMLX、不读密钥）。HTTP 版同样只读 `~/.omlx/models`，不为列表去调用 oMLX。
 
 **下载（归 iDoris）**
 
