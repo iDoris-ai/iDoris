@@ -41,7 +41,9 @@ use idoris_compute_contracts::control::WriteResult;
 use idoris_compute_contracts::grant::Purpose;
 use idoris_compute_contracts::ids::{AllocationId, IdempotencyKey};
 use idoris_compute_contracts::reason::ReasonCode;
-use idoris_tenancy::accounts::ledger::{CreditLineSetting, FreeTierIssue, FreeTierOutcome};
+use idoris_tenancy::accounts::ledger::{
+    CreditLineSetting, FreeTierIssue, FreeTierOutcome, LedgerError,
+};
 use idoris_tenancy::accounts::{AccountStore, GrantAllocation, Meta, Who};
 
 /// `max_tokens = 45`：预留 100。
@@ -1393,6 +1395,41 @@ fn a_revoked_allowance_does_not_cover_a_spend_that_committed_after_its_revocatio
         (0, 0, 100)
     );
     assert_clean(&store);
+}
+
+#[test]
+fn an_allocation_that_lost_its_order_mark_fails_admission_closed() {
+    // 每笔额度都由触发器记了创建序号、每笔撤销都记了撤销序号。缺了就是库被改坏了（先拆掉只追加的触发器才删得掉）：
+    // 失败即关闭，不能按「没有序号」当成「很早就存在」，让它覆盖不该覆盖的花费、把授信空出来。
+    for (what, drop_mark) in [("creation", "'created'"), ("revocation", "'revoked'")] {
+        let db = TempDb::new(&format!("books-lost-mark-{what}"));
+        let store = credit_only_world(&db);
+        credit_line(&store, "emp", 200, T0);
+        prepaid(&store, "emp-prepaid", 100, T0, T0 + 30 * DAY, T0);
+        revoke_allocation_at(&db, "emp-prepaid", T0 + 5_000);
+        let conn = rusqlite::Connection::open(db.path()).unwrap();
+        conn.execute_batch(&format!(
+            "DROP TRIGGER ledger_allocation_marks_append_only_delete;
+             DELETE FROM ledger_allocation_marks WHERE allocation_id = 'emp-prepaid' AND event = {drop_mark}"
+        ))
+        .unwrap();
+        let req = Req::new(&store, "r-1", 0, "cred-e", M100).at(T0 + 6_000);
+        let error = store
+            .admit_attempt(&req.input())
+            .expect_err("admission must fail closed");
+        assert!(
+            matches!(error, LedgerError::Corrupt(_)),
+            "{what}: {error:?}"
+        );
+        assert!(
+            store.hold(&req.attempt, "model").unwrap().is_none(),
+            "{what}: nothing was reserved"
+        );
+        assert!(
+            store.account_view(&aid("emp"), ts(T0 + 6_000)).is_err(),
+            "{what}: the view fails closed too"
+        );
+    }
 }
 
 // ------------------------------------------------------------------------------------------
