@@ -297,6 +297,10 @@ impl StreamTracker {
                     return Ingested::UpstreamError;
                 }
                 let carries_usage = !matches!(info.usage, UsageParse::Absent);
+                // 顶层 `choices` 的类型不对（字符串、数字、对象……）：不是「没有 choices 的单独 usage 块」，也不是 completion chunk
+                if !info.choices_typed {
+                    return Ingested::Malformed;
+                }
                 // 合法的 chunk 只有两种：completion chunk（`choices` 是数组，每个元素是像样的 choice：带 `delta` 对象，
                 // 或带已结束的 `finish_reason`），和单独的 usage 块（带 usage，`choices` 为空或者没有）。其它任意 JSON
                 // 对象（`{}`、`{"x":1}`、`{"choices":[{}]}`）不是回答：不能转发，更不能让它跨过发布边界（之后就不能切换
@@ -1284,6 +1288,43 @@ mod tests {
                 matches!(tracker.ingest(&ev(data)), Ingested::Forward(_)),
                 "{data}"
             );
+        }
+    }
+
+    /// 第六轮：顶层 `choices` 类型不对的 chunk 不是合法的流事件，哪怕带着有效的 usage（原来被当成「没有 choices 的单独 usage 块」
+    /// 转发，还会被记下 usage）。`null` 和缺省仍然是合法的单独 usage 块。
+    #[test]
+    fn a_usage_chunk_with_a_mistyped_choices_field_is_not_a_valid_stream_event() {
+        let usage = r#""usage":{"prompt_tokens":3,"completion_tokens":4}"#;
+        let mut tracker = StreamTracker::new(true);
+        for choices in [
+            r#""choices":"nope""#,
+            r#""choices":0"#,
+            r#""choices":false"#,
+            r#""choices":{}"#,
+            r#""choices":{"delta":{"content":"x"}}"#,
+        ] {
+            assert!(
+                matches!(
+                    tracker.ingest(&ev(&format!(r#"{{"id":"c",{choices},{usage}}}"#))),
+                    Ingested::Malformed
+                ),
+                "{choices}"
+            );
+        }
+        assert!(tracker.id.is_none(), "a malformed chunk teaches us nothing");
+        assert!(matches!(tracker.usage, UsageParse::Absent));
+        assert!(!tracker.usage_is_trusted());
+        for choices in [r#""choices":null"#, r#""choices":[]"#] {
+            let mut fresh = StreamTracker::new(true);
+            assert!(
+                matches!(
+                    fresh.ingest(&ev(&format!(r#"{{"id":"c",{choices},{usage}}}"#))),
+                    Ingested::Forward(_)
+                ),
+                "{choices}"
+            );
+            assert!(fresh.usage_is_trusted(), "{choices}");
         }
     }
 

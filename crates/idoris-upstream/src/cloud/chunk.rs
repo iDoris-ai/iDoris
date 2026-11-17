@@ -40,6 +40,9 @@ pub struct ChunkInfo {
     pub error: bool,
     /// 顶层 `choices` 是数组。
     pub has_choices: bool,
+    /// 顶层 `choices` 的类型对：缺省、`null` 或数组。字符串、数字、布尔值、对象是类型错误，整个 chunk 不合法——
+    /// 哪怕它带着有效的 usage（原来这样的 chunk 会被当成「没有 `choices` 的单独 usage 块」转发）。
+    pub choices_typed: bool,
     /// `choices` 是空数组（usage 单独成块时的样子）。
     pub choices_empty: bool,
     /// `choices` 是数组，而且每个元素都是**像样的 choice**（一个合法的 completion chunk 的最低要求）：对象，字段类型都对，
@@ -170,6 +173,10 @@ pub fn classify(event: &SseEvent) -> ChunkKind {
                 usage: parse_usage(object.get("usage")),
                 error: object.get("error").is_some_and(|e| !e.is_null()),
                 has_choices: choices.is_some(),
+                choices_typed: matches!(
+                    object.get("choices"),
+                    None | Some(Value::Null | Value::Array(_))
+                ),
                 choices_empty: choices.is_some_and(Vec::is_empty),
                 choices_well_formed: choices.is_some()
                     && parsed
@@ -344,6 +351,41 @@ mod tests {
             assert!(parsed.choices_well_formed, "{data}");
             assert_eq!(parsed.has_finish_reason, finished, "{data}");
         }
+    }
+
+    /// 第六轮：顶层 `choices` 只能是缺省、`null` 或数组。别的类型不是「没有 choices 的单独 usage 块」。
+    #[test]
+    fn a_top_level_choices_field_of_the_wrong_type_is_flagged() {
+        let info = |data: &str| match classify(&event(data)) {
+            ChunkKind::Json(info) => info,
+            other => panic!("expected a JSON chunk, got {other:?}"),
+        };
+        let usage = r#""usage":{"prompt_tokens":1,"completion_tokens":1}"#;
+        for choices in [
+            r#""choices":"nope""#,
+            r#""choices":1"#,
+            r#""choices":true"#,
+            r#""choices":{}"#,
+            r#""choices":{"0":{"delta":{}}}"#,
+        ] {
+            let parsed = info(&format!("{{{choices},{usage}}}"));
+            assert!(!parsed.choices_typed, "{choices}");
+            assert!(!parsed.has_choices, "{choices}");
+        }
+        for choices in [
+            r#""choices":null"#,
+            r#""choices":[]"#,
+            r#""choices":[{"delta":{}}]"#,
+        ] {
+            assert!(
+                info(&format!("{{{choices},{usage}}}")).choices_typed,
+                "{choices}"
+            );
+        }
+        assert!(
+            info(&format!("{{{usage}}}")).choices_typed,
+            "absent is fine"
+        );
     }
 
     /// 第六轮：choice 其它字段的类型也要对——`delta` 不是对象（也不是 `null`）、`index` 不是非负整数，整个 chunk 不合法。

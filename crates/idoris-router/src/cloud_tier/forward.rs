@@ -1766,7 +1766,8 @@ mod tests {
                     if ending == "the caller goes away" {
                         30_000
                     } else {
-                        300
+                        // 总期限：要比「连接就绪、请求体第一次被 poll」长得多（满载的机器上也一样），否则 `reached` 永远等不到
+                        1_000
                     },
                     cancel.clone(),
                     allowed_while_off(&switch),
