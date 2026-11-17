@@ -2960,6 +2960,130 @@ async fn registering_another_organizations_principal_over_http_is_a_plain_confli
     assert_eq!(again.json["data"]["principal"]["status"], "active");
 }
 
+/// 响应的状态、头和正文，去掉每次请求都不一样的关联 id（头 `X-iDoris-Record-Id` 和正文里的 `request_id`）。
+fn answer_without_the_correlation_id(reply: &Reply) -> (StatusCode, Vec<(String, String)>, Value) {
+    let mut headers: Vec<(String, String)> = reply
+        .headers
+        .iter()
+        .filter(|(name, _)| name.as_str() != "x-idoris-record-id")
+        .map(|(name, value)| (name.to_string(), value.to_str().unwrap().to_string()))
+        .collect();
+    headers.sort();
+    let mut body = reply.json.clone();
+    body["error"]["request_id"] = Value::Null;
+    (reply.status, headers, body)
+}
+
+#[tokio::test]
+async fn an_outsider_gets_the_same_http_answer_for_an_active_a_revoked_and_a_missing_principal() {
+    // PR #600 第四轮复审新问题 2：外部组织（school-b）建成员关系时，
+    // （a）伪造 `org` 字段（org = eduai，付款账户是 school-b 自己的账户），
+    // （b）只有 `manage_membership`、没有 `revoke_principal` 的凭证提交真实的 `org`，
+    // 对「eduai 登记的活跃主体」「eduai 登记后撤销的主体」「根本不存在的主体」必须得到逐字节相同的回答
+    // （状态码、头、正文，只有每次请求都不一样的关联 id 除外），不能靠原因码或文案区分。
+    let world = World::new();
+    world.people().await;
+    let (root, other) = (world.root.secret.clone(), world.other.secret.clone());
+    world
+        .ok(
+            "/control/v1/principals",
+            &root,
+            json!({"principal_id": "dead", "org": "eduai"}),
+        )
+        .await;
+    world
+        .ok(
+            "/control/v1/principals/dead/revoke",
+            &root,
+            json!({"org": "eduai"}),
+        )
+        .await;
+    world
+        .ok(
+            "/control/v1/accounts",
+            &other,
+            json!({"account_id": "acct-b", "kind": "member", "parent": "school-b", "unit": "THB"}),
+        )
+        .await;
+    // 只有 manage_membership 的凭证（school-b 子树）
+    let narrow = world
+        .ok(
+            "/control/v1/credentials",
+            &other,
+            json!({
+                "binding": {"kind": "service", "account": "school-b"},
+                "admin_scopes": [{"op": "manage_membership", "subtree": "school-b"}],
+                "owner": "narrow", "tenant_id": "tenant-b",
+                "allowed_privacy": ["local_only"], "allowed_roles": ["fast"]
+            }),
+        )
+        .await["secret"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    for (label, bearer, org) in [
+        ("forged org", other.as_str(), "eduai"),
+        ("only manage_membership", narrow.as_str(), "school-b"),
+    ] {
+        let mut answers = Vec::new();
+        for (principal, id) in [
+            ("kid1", "m-probe-active"),
+            ("dead", "m-probe-revoked"),
+            ("ghost", "m-probe-missing"),
+        ] {
+            let reply = world
+                .call(
+                    "POST",
+                    "/control/v1/memberships",
+                    Some(bearer),
+                    Some(
+                        json!({"membership_id": id, "principal_id": principal, "org": org,
+                                "role": "member", "account": "acct-b"}),
+                    ),
+                )
+                .await;
+            assert!(
+                !reply.status.is_success(),
+                "{label} {principal}: {}",
+                reply.raw
+            );
+            for name in ["kid1", "dead", "ghost"] {
+                assert!(
+                    !reply.raw.contains(name),
+                    "{label} {principal}: the answer must not echo a principal id: {}",
+                    reply.raw
+                );
+            }
+            answers.push(answer_without_the_correlation_id(&reply));
+        }
+        assert!(
+            answers.iter().all(|answer| *answer == answers[0]),
+            "{label}: the three principal states must be indistinguishable: {answers:?}"
+        );
+    }
+    // 对照：归属方自己仍然看得到具体原因（已撤销的主体）
+    world
+        .ok(
+            "/control/v1/accounts",
+            &root,
+            json!({"account_id": "acct-dead", "kind": "member", "parent": "eduai", "unit": "THB"}),
+        )
+        .await;
+    let owner = world
+        .call(
+            "POST",
+            "/control/v1/memberships",
+            Some(&root),
+            Some(
+                json!({"membership_id": "m-owner-dead", "principal_id": "dead", "org": "eduai",
+                        "role": "member", "account": "acct-dead"}),
+            ),
+        )
+        .await;
+    assert_eq!(owner.reason(), "principal_revoked", "{}", owner.raw);
+}
+
 #[tokio::test]
 async fn parallel_wrong_pairing_codes_cannot_all_get_to_the_database_lookup() {
     // PR-Daemon S2 F1：限速器「先检查、后记录」——失败要等数据库查完才记，所以并发的猜码全都先过了检查。

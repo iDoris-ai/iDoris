@@ -16,7 +16,7 @@ use idoris_compute_contracts::money::{Money, Unit};
 use rusqlite::{Connection, OptionalExtension};
 
 use super::control::membership_target;
-use super::control::{CallerInfo, Failure, Who, authorize_op};
+use super::control::{CallerInfo, Failure, Who, authorize_op, binding_anchor};
 use super::error::AccountStoreError;
 use super::rows::{
     AllocationRecord, RawAccount, RawAllocation, RawMembership, load_account, load_credential,
@@ -114,6 +114,29 @@ fn read_scope(
     target: &AccountId,
 ) -> Result<(), Failure> {
     authorize_op(conn, caller, now, ControlOp::Read, target, None).map(|_| ())
+}
+
+/// 与读的**目标**无关的那几步授权判定：凭证此刻可用、绑定账户没被冻结、调用者有没有 `read` 这个操作。
+///
+/// 读一个按 id 查的资源（主体）之前先做：没有 `read` 权限的调用者，无论资源存在与否都得到同一个答案
+/// （契约 `authorize` 的检查顺序：有没有这个操作的权限先于目标存不存在）。否则已有的主体得到 `op_not_granted`，
+/// 不存在的主体在授权判定之前就得到 `out_of_scope`，没有 `read` 权限的凭证就能靠它探测别的组织登记过哪些主体。
+/// 范围问题（读权限的子树不含自己的绑定账户）不在这里判，交给后面按目标判。本机运维不受授权约束。
+fn require_read_capability(
+    conn: &Connection,
+    caller: &super::control::Caller,
+    now: TimestampMs,
+) -> Result<(), Failure> {
+    let Some(credential) = caller.credential() else {
+        return Ok(());
+    };
+    let Some(anchor) = binding_anchor(conn, credential.binding()).map_err(internal)? else {
+        return Ok(());
+    };
+    match read_scope(conn, caller, now, &anchor) {
+        Err(failure) if failure.reason == ControlReason::OutOfScope => Ok(()),
+        other => other,
+    }
 }
 
 /// 把存储层的错误当作内部错误（读路径里没有「调用者的请求不合法」这一类）。
@@ -338,6 +361,8 @@ impl AccountStore {
         id: &PrincipalId,
     ) -> Result<Principal, Failure> {
         self.control_read(who, now, |conn, caller| {
+            // 先做与目标无关的判定，再去碰主体（见 `require_read_capability`）
+            require_read_capability(conn, caller, now)?;
             let principal = load_principal(conn, id)
                 .map_err(internal)?
                 .ok_or_else(|| Failure::new(ControlReason::OutOfScope))?;

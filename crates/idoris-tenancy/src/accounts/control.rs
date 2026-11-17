@@ -32,8 +32,8 @@
 use std::collections::BTreeMap;
 
 use idoris_compute_contracts::account::{
-    Account, AccountStatus, AccountTree, Allocation, AllocationError, Directory, Membership,
-    MembershipStatus, Principal, PrincipalStatus, subsidy_idempotency_key,
+    Account, AccountStatus, AccountTree, Allocation, AllocationError, Directory, DirectoryError,
+    Membership, MembershipStatus, Principal, PrincipalStatus, subsidy_idempotency_key,
 };
 use idoris_compute_contracts::control::{
     AuditOutcome, ControlReason, WriteResult, authorize, would_disable_caller,
@@ -882,15 +882,14 @@ impl AccountStore {
                 let visible = match registrant_of(conn, &request.principal)? {
                     Some(registrant) => {
                         registrant == request.org
-                            || authorize_op(
+                            || authority_is_visible(authorize_op(
                                 conn,
                                 caller,
                                 meta.now,
                                 ControlOp::CreatePrincipal,
                                 &registrant,
                                 None,
-                            )
-                            .is_ok()
+                            ))?
                     }
                     None => caller.is_operator(),
                 };
@@ -1153,6 +1152,20 @@ pub(super) fn membership_target(membership: &Membership) -> &AccountId {
     membership.account.as_ref().unwrap_or(&membership.org)
 }
 
+/// 授权判定的结果折成「调用者有没有资格看到」。
+///
+/// 授权类的失败（[`ControlReason::is_denial`]：没有这个操作的权限、不在范围内、凭证 / 账户状态不可用……）一律是「没有」，
+/// 调用方回无细节的 `out_of_scope`：内部授权判定用的是哪个原因码（`op_not_granted` 还是 `out_of_scope`）取决于调用者自己有哪些
+/// 权限，原样透传就等于告诉调用者「这里有一个你看不见的主体」。数据库忙、内部错误这类基础设施问题**不是**「看不见」，
+/// 原样往上走，让调用方重试 / 告警，不能被悄悄当成「主体不在范围内」。
+pub(super) fn authority_is_visible<T>(result: Result<T, Failure>) -> Result<bool, Failure> {
+    match result {
+        Ok(_) => Ok(true),
+        Err(failure) if failure.reason.is_denial() => Ok(false),
+        Err(failure) => Err(failure),
+    }
+}
+
 /// 调用者有没有资格知道这个主体现在是什么状态。
 ///
 /// 没有资格时，活跃、已撤销、不存在必须是同一个 `out_of_scope`（细节为空）。状态如果在归属方授权之前就返回，
@@ -1175,29 +1188,80 @@ fn caller_may_know_principal(
             Some(found) if found.status == PrincipalStatus::Active
         ));
     }
+    // `membership_org` 在这里已经被 `check_membership_structure` 验过：它确实是付款账户的祖先（或管理员关系自己的组织），
+    // 所以「归属方就在新成员关系所属组织的上面」是一个可信的结论，不是客户端随手填的 `org` 说了算。
     let ancestors = load_ancestors(conn, membership_org)?;
     for owner in owners {
         let inside = ancestors.iter().any(|account| account.id == owner.org);
-        if !inside {
-            authorize_op(
+        // 授权失败（没有 `revoke_principal` 这个操作、归属方不在范围里……）一律是「看不见」，不把内部判定的原因码透出去
+        if !inside
+            && !authority_is_visible(authorize_op(
                 conn,
                 caller,
                 now,
                 ControlOp::RevokePrincipal,
                 &owner.target,
                 None,
-            )?;
+            ))?
+        {
+            return Ok(false);
         }
     }
     Ok(true)
 }
 
+/// 成员关系自己声明的结构：`org` 必须是付款账户的祖先（管理员关系没有付款账户，`org` 就是授权的那个组织），
+/// 角色和账户种类对得上。同一套规则 S0 的 `Directory::build` 在 `create_membership_in` 里会再校验一遍，
+/// 这里**提前到任何主体状态的判断之前**。
+///
+/// 为什么要提前：`org` 是客户端提交的，授权只看付款账户。外部组织 B 的管理员提交 `account = B 自己的账户、org = A、
+/// principal = A 登记的主体`：授权通过（付款账户是 B 的），归属检查却会相信 `org = A`，把「归属方 A 就是新成员关系所属组织」
+/// 当成不需要对 A 授权，随后才报主体状态——活跃、已撤销、不存在得到三种不同的失败（PR #600 第四轮复审新问题 2）。
+/// 结构错只取决于请求里的账户、组织和库里的账户树，和主体无关（这里用一个占位主体跑目录校验，主体是否登记、是否撤销一概不看），
+/// 所以三种主体得到逐字节相同的失败。
+///
+/// 组织不存在、不是组织、账户不在它下面是同一个失败、同一句话（不带任何 id）：不泄露别的租户有没有这个账户
+/// （和授权判定里「不存在和不在范围内是同一个 `out_of_scope`」一个规矩）。
+fn check_membership_structure(conn: &Connection, membership: &Membership) -> Result<(), Failure> {
+    let not_inside = || {
+        Failure::with_detail(
+            ControlReason::InvalidMembership,
+            "the membership's account is not inside its org",
+        )
+    };
+    let mut accounts: BTreeMap<AccountId, Account> = BTreeMap::new();
+    merge_chains(&mut accounts, load_ancestors(conn, &membership.org)?);
+    if !accounts.contains_key(&membership.org) {
+        return Err(not_inside());
+    }
+    if let Some(account) = &membership.account {
+        merge_chains(&mut accounts, load_ancestors(conn, account)?);
+    }
+    let tree = AccountTree::build(accounts.into_values().collect())
+        .map_err(|error| Failure::from_store(error.into(), Ctx::Membership))?;
+    let placeholder = Principal {
+        id: membership.principal.clone(),
+        status: PrincipalStatus::Active,
+    };
+    match Directory::build(tree, vec![placeholder], vec![membership.clone()]) {
+        Ok(_) => Ok(()),
+        Err(
+            DirectoryError::UnknownOrg { .. }
+            | DirectoryError::NotAnOrg { .. }
+            | DirectoryError::AccountNotUnderOrg { .. },
+        ) => Err(not_inside()),
+        Err(other) => Err(Failure::from_store(other.into(), Ctx::Membership)),
+    }
+}
+
 impl AccountStore {
     /// 建成员关系。授权看成员关系的付款账户（管理员关系看组织）。
     ///
-    /// 主体状态（没登记、已撤销）只告诉**有资格知道的人**：本机运维，或者这个主体的归属方（登记组织，或老主体已经在用它的组织）
-    /// 自己的管理员。其他人——包括调用者对目标账户有 `manage_membership`、但对归属方没有 `revoke_principal` 的外部组织——
-    /// 对活跃、已撤销、不存在拿到同一个 `out_of_scope`，细节为空。没有归属方的活跃老主体仍可以由第一个组织挂上去。
+    /// 顺序：授权（付款账户）-> 请求自己声明的结构（`org` 必须是付款账户的祖先，见 [`check_membership_structure`]）-> 成员关系 id 的重放 /
+    /// 冲突 -> 主体。主体状态（没登记、已撤销）只告诉**有资格知道的人**：本机运维，或者这个主体的归属方（登记组织，或老主体已经在用它的
+    /// 组织）自己的管理员。其他人——包括调用者对目标账户有 `manage_membership`、但对归属方没有 `revoke_principal` 的外部组织，
+    /// 和伪造 `org` 字段的外部组织——对活跃、已撤销、不存在拿到同一个失败（结构错是固定的 `invalid_membership`，可见性授权失败是
+    /// 无细节的 `out_of_scope`）。没有归属方的活跃老主体仍可以由第一个组织挂上去。
     pub fn control_create_membership(
         &self,
         who: &Who<'_>,
@@ -1225,6 +1289,8 @@ impl AccountStore {
                     "a new membership must be active",
                 ));
             }
+            // 先验请求自己声明的结构（`org` 与付款账户的关系），再碰别人的数据（成员关系 id、主体）：见 `check_membership_structure`
+            check_membership_structure(conn, membership)?;
             if let Some(existing) = load_membership(conn, &membership.id)? {
                 return if existing == *membership {
                     Ok(Written {
