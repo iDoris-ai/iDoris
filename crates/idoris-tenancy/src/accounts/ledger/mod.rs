@@ -131,11 +131,14 @@ use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior};
 use super::{AccountStore, AccountStoreError};
 use crate::attempts::AttemptLedgerHook;
 
-/// 迁移按顺序执行，版本号 = 下标 + 1。**只能在末尾追加**，已经发布的文件不能改。
-/// 0001 是 S3 的账本；0002 把授信的权威数据源统一到 `allocations`（并补登控制面发出的免费额度的承诺）。
+/// 迁移按顺序执行，版本号 = 下标 + 1。**只能在末尾追加**，已经发布的文件不能改（迁移器对已登记的版本直接跳过，
+/// 已经跑过旧文本的库得不到任何改动；`tests/migration_upgrade.rs` 把已发布的文件按内容钉死）。
+/// 0001 是 S3 的账本；0002 把授信的权威数据源统一到 `allocations`（并补登控制面发出的免费额度的承诺）；
+/// 0003 补上宽限的部分唯一索引的 REPLACE 保护。
 const MIGRATIONS: &[&str] = &[
     include_str!("migrations/0001_ledger.sql"),
     include_str!("migrations/0002_credit_lines_are_allocations.sql"),
+    include_str!("migrations/0003_grace_no_replace.sql"),
 ];
 
 /// 应用账本迁移（在账户迁移之后、同一条连接上）。版本记在 `ledger_schema_migrations`。

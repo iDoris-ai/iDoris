@@ -101,9 +101,10 @@ fn the_two_stores_share_one_database_without_touching_each_others_schema() {
         }
         assert_eq!(objects(db.path()), union, "accounts_first={accounts_first}");
         assert_eq!(versions(db.path(), "account_schema_migrations"), [1, 2]);
+        assert_eq!(versions(db.path(), "ledger_schema_migrations"), [1, 2, 3]);
         assert_eq!(
             versions(db.path(), "compute_attempt_schema_migrations"),
-            [1, 2]
+            [1, 2, 3]
         );
 
         // 再打开几次：什么都不变，也不重复应用迁移。
@@ -113,9 +114,10 @@ fn the_two_stores_share_one_database_without_touching_each_others_schema() {
         }
         assert_eq!(objects(db.path()), union, "accounts_first={accounts_first}");
         assert_eq!(versions(db.path(), "account_schema_migrations"), [1, 2]);
+        assert_eq!(versions(db.path(), "ledger_schema_migrations"), [1, 2, 3]);
         assert_eq!(
             versions(db.path(), "compute_attempt_schema_migrations"),
-            [1, 2]
+            [1, 2, 3]
         );
     }
 }

@@ -57,11 +57,14 @@ use thiserror::Error;
 #[cfg(test)]
 mod tests;
 
-/// 迁移按顺序执行，版本号 = 下标 + 1。**只能在末尾追加**，已经发布的文件不能改。
-/// 0001 是请求 / 尝试 / 转移日志 / 结算分录；0002 堵住 `INSERT OR REPLACE`（每张表的主键和唯一约束配「不许冲突」触发器）。
+/// 迁移按顺序执行，版本号 = 下标 + 1。**只能在末尾追加**，已经发布的文件不能改（迁移器对已登记的版本直接跳过，
+/// 已经跑过旧文本的库得不到任何改动；`tests/migration_upgrade.rs` 把已发布的文件按内容钉死）。
+/// 0001 是请求 / 尝试 / 转移日志 / 结算分录；0002 堵住 `INSERT OR REPLACE`（每张表的主键和无条件唯一约束配「不许冲突」触发器）；
+/// 0003 补上两个带 `WHERE` 的部分唯一索引的同类触发器。
 const MIGRATIONS: &[&str] = &[
     include_str!("migrations/0001_compute_attempts.sql"),
     include_str!("migrations/0002_no_replace.sql"),
+    include_str!("migrations/0003_partial_unique_no_replace.sql"),
 ];
 
 /// `usage_claim_json` 里上游原文的最大字节数（超出截断；只为对账时看一眼，不是账目）。
