@@ -41,11 +41,13 @@
 //! 熔断是个共享的原子变量，随时可能被打开（请求以 `any` + 同意进来，本机处理期间熔断被打开，本机随后失败——这个请求
 //! 不能再去云端）。所以云端档不在请求进来时存快照，而是在这些点各自现读：闸门（第 1 层）、出网前的第一次复核（读完凭证、
 //! 占到名额之后，还没有任何副作用：不写审计事件、不落 `pending` 行）、`forward::send` 里的最后一道门（请求构造好之后、
-//! 第一次真正发送之前），以及连接还在建立、请求体还没被 poll 的那段等待（`send` 和「熔断打开」放在同一次 select 里）。
-//! 还能证明正文没开始发送时，调用方拿到的和没有云端档时逐字节相同；
+//! 第一次真正发送之前）、`send()` 整段等待里的熔断分支（连接还在建立，或者正文已经写出、还在等响应头；`send` 和「熔断打开」
+//! 放在同一次 select 里），以及**请求体第一次被 hyper 取走、要交付字节的那一刻**（hyper 的后台连接任务里，请求体自己再读一次熔断）。
+//! 熔断取消和「正文开始交付」是**同一个原子变量上两个互斥的转换**，谁先到谁赢：取消赢了，请求体此后拒绝交付任何字节
+//! （请求头也不会被写出），这时才算没出网，调用方拿到的和没有云端档时逐字节相同；
 //! 最后一道门或这段等待拦下时 `pending` 行已经落下，写成 `cancelled`（没有出网）。
-//! 请求体一旦被 poll，熔断再打开就按「可能已经发出」处理：行仍写成 `cancelled`（不新增结局），响应带 `X-iDoris-Cloud-Attempt: cancelled`。
-//! 已经拿到响应的请求不会因为熔断随后打开而被收回。
+//! 请求体已经赢得交付之后熔断才打开，一律按「可能已经发出」处理：行仍写成 `cancelled`（不新增结局），响应带 `X-iDoris-Cloud-Attempt: cancelled`。
+//! 已经拿到响应的请求不会因为熔断随后打开而被收回。轮询的间隔只影响多快放弃等待，不影响这些保证。
 //!
 //! ## 同意机制（第 4 条）
 //!
@@ -785,6 +787,11 @@ impl<'a> FallbackScope<'a> {
             .load(std::sync::atomic::Ordering::SeqCst)
     }
 
+    /// 熔断开关本身（共享的原子变量）。交给 `forward::send`，好让请求体在交付字节的那一刻自己再读一次。
+    fn kill_switch_handle(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        Arc::clone(&self.state.remote_kill_switch)
+    }
+
     /// 闸门的隐私事实：隐私类别和内容检查的结论请求进来时就定了；熔断现读。
     fn privacy_facts(&self) -> PrivacyFacts {
         PrivacyFacts {
@@ -873,6 +880,9 @@ pub(crate) async fn fallback(
     // Not `cancellation_token()`: that one is cancelled when the local dispatch finishes (`dispatch::CancelOnDrop`),
     // which is already the case here. This sibling fires only when the caller's connection goes away.
     let cancel = scope.lifecycle.fallback_cancellation_token();
+    // 熔断开关本身（共享的原子变量）交给 `send`，不是借来的闭包：请求体在 hyper 的后台连接任务里被 poll，
+    // 它要在**交付字节的那一刻**自己再读一次熔断；取消和交付又在同一个原子变量上竞争，谁赢谁说了算（见 `forward::send`）。
+    let kill_switch = scope.kill_switch_handle();
     let result = forward::send(
         &tier.http,
         &tier.config,
@@ -881,8 +891,9 @@ pub(crate) async fn fallback(
         &body,
         &cancel,
         // 出网边界上的最后一道门，并且在 `send()` 整段继续看：写审计事件、落 pending 行又隔了几个让出点，
-        // 熔断可能在这期间被打开。请求体还没被 poll 就取消，算没出网；已经 poll 过则可能已经发出（审查 r4#1 复审）。
-        &|| !scope.kill_switch_on(),
+        // 熔断可能在这期间被打开。取消赢了（请求体此后拒绝交付任何字节）才算没出网；请求体已经赢得交付则可能已经发出
+        // （审查 r4#1 复审、r4 新问题）。
+        Arc::new(move || !kill_switch.load(std::sync::atomic::Ordering::SeqCst)),
     )
     .await;
     drop(loaded);
@@ -923,7 +934,8 @@ pub(crate) async fn fallback(
             complete_event(scope, &selected, "success").await;
             served_response(&selected, answer)
         }
-        // 最后一道门把它拦下了，并且请求体还没被 poll：**请求正文没有离开本机**。行已经落下了（先写后出网），写成
+        // 最后一道门把它拦下了，或者熔断取消赢了与「正文开始交付」的原子竞争（请求体此后拒绝交付任何字节）：
+        // **请求正文没有离开本机**。行已经落下了（先写后出网），写成
         // cancelled（没有答复、没有云端 id、没有金额）；事件流补一个失败的 completed。调用方拿到本机原来的失败响应，
         // 一个字节都不改，连 X-iDoris-Cloud-Attempt 都没有——那个头的意思是「数据可能已经离开本机」，这里没有。
         Err(forward::CloudFailure::Withheld) => {
