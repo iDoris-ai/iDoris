@@ -7,7 +7,7 @@
 //!
 //! | 阶段 | 调用 | 说明 |
 //! |---|---|---|
-//! | 检查之前 | [`ExtraCostMeter::reserve`] | 按检查器给出的**上界**占额度：上界来自 [`super::SafetyChecker::plan`]——先生成最终要发出的每一个调用，再按它们算**全部**调用的上界，发送的是同一份计划（round2-r3 N3）。被拒（付款账户链放不下）就不检查、不调用上游：返回准入类的拒绝（`budget_exhausted` 等） |
+//! | 检查之前 | [`ExtraCostMeter::reserve`] | 按检查器给出的**上界**占额度：上界来自 [`super::SafetyChecker::plan`]——先生成最终要发出的每一个调用，再按它们算**全部**调用的上界（每次调用各自取整再相加，和结算同一个粒度，见 [`ExtraCostEstimate`]），发送的是同一份计划（round2-r3 N3、round4-r3 Low）。被拒（付款账户链放不下）就不检查、不调用上游：返回准入类的拒绝（`budget_exhausted` 等） |
 //! | 检查之后 | [`ExtraCostMeter::settle`] | 按实际用量结算；用量未知按预留额结算；检查根本没跑就释放。**每个 ticket 恰好结算一次**（[`ExtraCostGuard`] 在被丢弃时兜底） |
 //!
 //! # 两个实现
@@ -33,18 +33,37 @@ use idoris_compute_contracts::pricing::{Cost, Price, Usage};
 use idoris_compute_contracts::reason::ReasonCode;
 use idoris_compute_contracts::safety::SafetyStage;
 
+/// 一次调用的 token 上界（计划里的每一次调用各有一份）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CallTokens {
+    /// 这次调用的输入 token 上界。
+    pub input_tokens: u64,
+    /// 这次调用的输出 token 上界。
+    pub output_tokens: u64,
+}
+
 /// 检查器事前给出的成本上界。
+///
+/// **多次调用的取整粒度**（round4-r3 Low）：价格按用量算出来要取整（向上，[`idoris_compute_contracts::pricing::USAGE_ROUNDING`]），
+/// 而结算是**每次调用各算各的价、各自取整、再相加**。所以预留也必须按同样的粒度：`calls` 里每一次调用各自算价、各自取整、再相加。
+/// 把所有调用的 token 合并起来只取整一次，会比逐调用结算的总和少最多「调用数 - 1」个微单位，预留就不是结算的上界了
+/// （最终收费被预留额封顶，差额由平台承担）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExtraCostEstimate {
     /// 这次检查会调用的上游端点（数据处理方，也在端点许可表里）。
     pub endpoint: EndpointKey,
-    /// 这次检查最多花多少（上游成本，供应商币种）。
+    /// 这次检查最多花多少（上游成本，供应商币种）。有 `calls` 时是**各次调用各自取整之后的和**。
     pub max_cost: Cost,
-    /// `max_cost` 用到的输入 token 上界。账本要的是付款单位的**价**，不是供应商币种的成本：用**同样的 token 数**
-    /// 乘检查端点配置里的 `prices`（付款单位的价目表）折算，见 [`super::ledger_cost::LedgerExtraCost`]。
+    /// `max_cost` 用到的输入 token 上界（多块检查时是各块之和）。账本要的是付款单位的**价**，不是供应商币种的成本：
+    /// 用检查端点配置里的 `prices`（付款单位的价目表）折算，见 [`super::ledger_cost::LedgerExtraCost`]。
     pub max_input_tokens: u64,
     /// `max_cost` 用到的输出 token 上界（多块检查时是各块之和）。
     pub max_output_tokens: u64,
+    /// 计划里**每一次调用**各自的 token 上界。账本按它逐次调用算价、各自向上取整、再相加
+    /// （[`super::ledger_cost::reserved_price`]）。空的话，检查器只给了一个总上界（旧接口 [`super::SafetyChecker::estimate`]、
+    /// 没有自己的调用列表）：整体当作一次调用。有的话，`max_input_tokens` / `max_output_tokens` 是它们的和
+    /// （检查器自己构造时保证；账本只看 `calls`）。
+    pub calls: Vec<CallTokens>,
 }
 
 /// 一次实际的花费。
@@ -251,6 +270,7 @@ mod tests {
             max_cost: Cost::from_micros(Unit::Usd, 500).unwrap(),
             max_input_tokens: 100,
             max_output_tokens: 10,
+            calls: Vec::new(),
         }
     }
 

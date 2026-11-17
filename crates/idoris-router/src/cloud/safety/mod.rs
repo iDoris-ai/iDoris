@@ -90,8 +90,9 @@ pub mod text;
 pub(crate) mod test_support;
 
 pub use cost::{
-    ExtraCostEntry, ExtraCostEstimate, ExtraCostGuard, ExtraCostMeter, ExtraCostOutcome,
-    ExtraCostRefusal, ExtraCostRequest, ExtraCostTicket, SimpleExtraCost, SpendItem,
+    CallTokens, ExtraCostEntry, ExtraCostEstimate, ExtraCostGuard, ExtraCostMeter,
+    ExtraCostOutcome, ExtraCostRefusal, ExtraCostRequest, ExtraCostTicket, SimpleExtraCost,
+    SpendItem,
 };
 pub use extract::{
     CheckedInput, CheckedOutput, ExtractError, Origin, ResponseIdentity, Segment, ToolCallText,
@@ -1385,6 +1386,7 @@ mod tests {
                 .unwrap(),
                 max_input_tokens: 100,
                 max_output_tokens: 10,
+                calls: Vec::new(),
             })
         }
     }
@@ -1462,6 +1464,14 @@ mod tests {
                 .unwrap(),
                 max_input_tokens: 1_950,
                 max_output_tokens: 96,
+                // 三个调用各自的上界（它们的和就是上面两个总数）
+                calls: vec![
+                    CallTokens {
+                        input_tokens: 650,
+                        output_tokens: 32,
+                    };
+                    3
+                ],
             }
         }
     }
@@ -2265,6 +2275,7 @@ mod tests {
                     .unwrap(),
                     max_input_tokens: 100,
                     max_output_tokens: 10,
+                    calls: Vec::new(),
                 })
             }
         }

@@ -32,6 +32,7 @@
 //! 每次调用的 usage 来自上游（通过 `parse_usage` 的结构检查才算数），按配置里这个端点的成本价目折算；用量未知按预留上界。
 //! 事前的上界来自 [`SafetyChecker::plan`]：**先生成最终要发出的每一个调用（payload 和分块），再按它们算全部调用的上界**，
 //! gate 用这个上界占额度（见 [`super::cost`]），发送的就是同一份计划里的调用（[`SafetyChecker::execute`]）。
+//! 上界和结算是**同一个取整粒度**：每次调用各自算价、各自向上取整、再相加，所以预留是结算的上界（round4-r3 Low）。
 //! 预留和发送不会各算各的：旧做法按原始文本的字节估一个分块数，解码展开、贪心装箱和每块都带的上下文让真正发出的调用比估算多，
 //! 超出预留的部分由平台承担（round2-r3 N3）。
 
@@ -55,8 +56,8 @@ use serde_json::{Map, Value, json};
 use super::extract::{CheckedInput, CheckedOutput, Origin};
 use super::text::Sensitive;
 use super::{
-    BoxFuture, CheckContext, CheckPlan, CheckReport, ExtraCostEstimate, SafetyChecker, SpendItem,
-    Verdict,
+    BoxFuture, CallTokens, CheckContext, CheckPlan, CheckReport, ExtraCostEstimate, SafetyChecker,
+    SpendItem, Verdict,
 };
 
 /// 默认的检查模型输出上限（一个 JSON 对象，几十个 token 足够）。
@@ -622,28 +623,45 @@ impl LlmJudge {
 
 impl LlmJudge {
     /// 按计划里**全部**调用算花费上界（预留用）：每次调用 = 提示开销 + 这次调用的 payload 字节（保守地按每字节一个 token，
-    /// 和用量未知时的挂账是同一个公式 [`call_input_tokens`]）+ 输出上限；各次相加。
-    /// token 数一并给出：账本要付款单位的价，用检查端点的价目表按同样的 token 数折算（见 `ledger_cost`）。
+    /// 和用量未知时的挂账是同一个公式 [`call_input_tokens`]）+ 输出上限。
+    ///
+    /// **每次调用各自算价、各自向上取整、再相加**（round4-r3 Low）：结算是逐调用取整再相加（`ledger_cost::charge_for`），
+    /// 预留必须是同样的粒度。把全部 token 合并起来只取整一次，会比逐调用结算的总和少最多「调用数 - 1」个微单位
+    /// （两次调用、每次输出上限 64 个 token 实际用 10 个、输出价每百万 token 0.001 单位：合并预留 1 微单位，逐次结算 2 微单位，
+    /// 最终收费被预留额封顶，差额由平台承担）。这里上游成本 `max_cost` 和每次调用的 token 数 `calls` 都是逐调用的，
+    /// 账本拿 `calls` 按付款单位的价目表逐次折算（见 `ledger_cost::reserved_price`）。
     fn estimate_calls(&self, payloads: &[String]) -> Option<ExtraCostEstimate> {
-        let calls = u64::try_from(payloads.len()).ok()?;
-        let input_tokens = payloads.iter().fold(0u64, |total, payload| {
-            total.saturating_add(call_input_tokens(payload))
-        });
-        let output_cap = self.settings.max_output_tokens.saturating_mul(calls);
-        let reserved = reserve(
-            &ReservePolicy::new(output_cap, 1).ok()?,
-            &ReserveRequest {
-                requested_max_tokens: Some(output_cap),
-                input_tokens_estimate: input_tokens,
-            },
-            &self.settings.cost_rates,
-        )
-        .ok()?;
+        if payloads.is_empty() {
+            return None;
+        }
+        let mut calls = Vec::with_capacity(payloads.len());
+        let mut max_cost = Cost::zero(self.settings.cost_rates.unit().clone());
+        let (mut input_total, mut output_total) = (0u64, 0u64);
+        for payload in payloads {
+            let input_tokens = call_input_tokens(payload);
+            let reserved = reserve(
+                &self.reserve_policy,
+                &ReserveRequest {
+                    requested_max_tokens: Some(self.settings.max_output_tokens),
+                    input_tokens_estimate: input_tokens,
+                },
+                &self.settings.cost_rates,
+            )
+            .ok()?;
+            max_cost = max_cost.checked_add(&reserved.amount).ok()?;
+            input_total = input_total.saturating_add(input_tokens);
+            output_total = output_total.saturating_add(reserved.effective_max_tokens);
+            calls.push(CallTokens {
+                input_tokens,
+                output_tokens: reserved.effective_max_tokens,
+            });
+        }
         Some(ExtraCostEstimate {
             endpoint: self.settings.endpoint.clone(),
-            max_cost: reserved.amount,
-            max_input_tokens: input_tokens,
-            max_output_tokens: reserved.effective_max_tokens,
+            max_cost,
+            max_input_tokens: input_total,
+            max_output_tokens: output_total,
+            calls,
         })
     }
 
@@ -997,6 +1015,16 @@ mod tests {
 
     /// 一个不会真的联网的检查器（只用来看它会发出什么内容）。
     fn offline_judge(max_chunk_bytes: usize, max_chunks: usize) -> LlmJudge {
+        offline_judge_priced(max_chunk_bytes, max_chunks, 260_000, 380_000)
+    }
+
+    /// 同上，上游成本价目自己定（每百万 token 的微美元数）。
+    fn offline_judge_priced(
+        max_chunk_bytes: usize,
+        max_chunks: usize,
+        input_per_mtok_micros: i64,
+        output_per_mtok_micros: i64,
+    ) -> LlmJudge {
         use idoris_compute_contracts::money::Unit;
         use idoris_upstream::cloud::{CloudEndpointSettings, build_http_client};
 
@@ -1016,8 +1044,8 @@ mod tests {
             LlmJudgeSettings {
                 endpoint: EndpointKey::new("example-judge", model, "openai-compat").unwrap(),
                 cost_rates: RateCard::new(
-                    Cost::from_micros(Unit::Usd, 260_000).unwrap(),
-                    Cost::from_micros(Unit::Usd, 380_000).unwrap(),
+                    Cost::from_micros(Unit::Usd, input_per_mtok_micros).unwrap(),
+                    Cost::from_micros(Unit::Usd, output_per_mtok_micros).unwrap(),
                     None,
                 )
                 .unwrap(),
@@ -1171,6 +1199,87 @@ mod tests {
     }
 
     #[test]
+    fn the_plan_rounds_the_cost_of_every_call_on_its_own_not_the_merged_total_once() {
+        use idoris_compute_contracts::pricing::amount_for_tokens;
+
+        // round4-r3 Low：输入价 0、输出价每百万 token 0.001 单位（1000 微单位）、每次调用输出上限 32。
+        // 一次调用的上界 ceil(32 x 1000 / 1e6) = 1 微单位；把 N 次调用合并只取整一次，ceil(32 N x 1000 / 1e6) 远小于 N，
+        // 而结算是逐调用取整再相加：预留就不是结算的上界了
+        let judge = offline_judge_priced(8 * 1024, 4, 0, 1_000);
+        let output = answer_with_tool_call("f", &expanding_arguments());
+        let input = CheckedInput::default();
+        let plan = judge.plan(SafetyStage::Output, &input, Some(&output));
+        let estimate = plan.estimate().expect("a paid plan");
+        let calls = plan.calls().expect("the plan carries its calls");
+        assert!(
+            calls.len() >= 3,
+            "the fixture needs several calls: {}",
+            calls.len()
+        );
+        // 每次调用各自的 token 上界：提示开销 + 这次调用的字节、输出上限
+        assert_eq!(estimate.calls.len(), calls.len());
+        for (bound, call) in estimate.calls.iter().zip(calls) {
+            assert_eq!(
+                bound.input_tokens,
+                PROMPT_OVERHEAD_TOKENS + call.expose().len() as u64
+            );
+            assert_eq!(bound.output_tokens, 32);
+        }
+        // 总数是各次之和
+        assert_eq!(
+            estimate.max_input_tokens,
+            estimate
+                .calls
+                .iter()
+                .map(|call| call.input_tokens)
+                .sum::<u64>()
+        );
+        assert_eq!(
+            estimate.max_output_tokens,
+            estimate
+                .calls
+                .iter()
+                .map(|call| call.output_tokens)
+                .sum::<u64>()
+        );
+        // 上游成本上界：每次调用各自取整再相加（每次 1 微单位）；合并只取整一次会少
+        let rates = &judge.settings.cost_rates;
+        let per_call: i64 = estimate
+            .calls
+            .iter()
+            .map(|call| {
+                amount_for_tokens(rates, call.input_tokens, call.output_tokens, USAGE_ROUNDING)
+                    .unwrap()
+                    .micros()
+            })
+            .sum();
+        let merged = amount_for_tokens(
+            rates,
+            estimate.max_input_tokens,
+            estimate.max_output_tokens,
+            USAGE_ROUNDING,
+        )
+        .unwrap()
+        .micros();
+        assert_eq!(estimate.max_cost.micros(), per_call);
+        assert_eq!(per_call, calls.len() as i64);
+        assert!(merged < per_call, "{merged} vs {per_call}");
+        // 用量未知时每次调用挂账的上界（`spend(None, ..)`）就是这次调用自己的预留：各次之和正好是预留
+        let unknown_usage: i64 = estimate
+            .calls
+            .iter()
+            .map(|call| {
+                judge
+                    .spend(None, call.input_tokens)
+                    .expect("the bound can be priced")
+                    .cost
+                    .micros()
+            })
+            .sum();
+        assert_eq!(unknown_usage, estimate.max_cost.micros());
+    }
+
+    #[test]
     fn the_plan_refuses_what_cannot_be_split_into_the_allowed_number_of_calls() {
         let judge = offline_judge(64, 2);
         // 每块最多 64 字节、最多 2 块：一段很长的回答分不进去 -> 计划是拒绝（太大），没有上界、没有调用
@@ -1243,6 +1352,7 @@ mod tests {
             max_cost: Cost::from_micros(idoris_compute_contracts::money::Unit::Usd, 1).unwrap(),
             max_input_tokens: 1,
             max_output_tokens: 1,
+            calls: Vec::new(),
         });
         let report = judge.execute(&ctx, &input, None, &foreign).await;
         assert_eq!(

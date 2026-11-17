@@ -42,8 +42,8 @@ use idoris_compute_contracts::reason::ReasonCode;
 use idoris_compute_contracts::safety::SafetyStage;
 use idoris_router::cloud::config::{self};
 use idoris_router::cloud::safety::{
-    ExtraCostEstimate, ExtraCostOutcome, ExtraCostRefusal, ExtraCostRequest, LedgerExtraCost,
-    SpendItem,
+    CallTokens, ExtraCostEstimate, ExtraCostOutcome, ExtraCostRefusal, ExtraCostRequest,
+    LedgerExtraCost, SpendItem,
 };
 use idoris_router::cloud::{ExtraCostMeter, ManualClock};
 use idoris_tenancy::accounts::AccountStore;
@@ -493,7 +493,28 @@ struct MeterFixture {
     judge: EndpointKey,
 }
 
+/// 检查端点（第二个端点）对付款单位（THB）的价目。
+enum JudgePrice<'a> {
+    /// 和聊天端点一样（夹具默认）：输入 10 / 输出 40 泰铢每百万 token。
+    Default,
+    /// 没有这个单位的价目：配置层启动就拒绝。
+    Missing,
+    /// 自定的价目（YAML 里的十进制字符串，泰铢每百万 token）。
+    Custom { input: &'a str, output: &'a str },
+}
+
 fn meter_fixture(price_for_judge: bool, funds: i64) -> Option<MeterFixture> {
+    meter_fixture_priced(
+        if price_for_judge {
+            JudgePrice::Default
+        } else {
+            JudgePrice::Missing
+        },
+        funds,
+    )
+}
+
+fn meter_fixture_priced(judge_price: JudgePrice<'_>, funds: i64) -> Option<MeterFixture> {
     let dir = tempfile::tempdir().unwrap();
     let key_file = dir.path().join("upstream.key");
     std::fs::write(&key_file, format!("{}\n", harness::KEY)).unwrap();
@@ -513,21 +534,36 @@ fn meter_fixture(price_for_judge: bool, funds: i64) -> Option<MeterFixture> {
         ..Options::default()
     };
     let mut yaml = config_yaml(&endpoints, key_file.to_str().unwrap(), &options);
-    if !price_for_judge {
-        // 去掉检查端点（第二个端点）的 THB 价目
-        let line = "      - {unit: THB, input_per_mtok: \"10\", output_per_mtok: \"40\"}\n";
-        let at = yaml.rfind(line).expect("the judge's THB price line");
-        yaml.replace_range(at..at + line.len(), "");
-        // 配置层在启动时就拒绝这种配置：检查的成本无法折算成付款单位
-        let error = match config::parse(&yaml, dir.path(), TimestampMs(NOW_MS)) {
-            Ok(_) => panic!("a check endpoint without a price for the payer's unit must not load"),
-            Err(error) => error,
-        };
-        assert!(
-            error.contains("example-judge") && error.contains("THB") && error.contains("价目"),
-            "{error}"
-        );
-        return None;
+    // 检查端点（第二个端点）的 THB 价目行
+    let line = "      - {unit: THB, input_per_mtok: \"10\", output_per_mtok: \"40\"}\n";
+    match judge_price {
+        JudgePrice::Default => {}
+        JudgePrice::Custom { input, output } => {
+            let at = yaml.rfind(line).expect("the judge's THB price line");
+            yaml.replace_range(
+                at..at + line.len(),
+                &format!(
+                    "      - {{unit: THB, input_per_mtok: \"{input}\", output_per_mtok: \"{output}\"}}\n"
+                ),
+            );
+        }
+        JudgePrice::Missing => {
+            // 去掉检查端点的 THB 价目
+            let at = yaml.rfind(line).expect("the judge's THB price line");
+            yaml.replace_range(at..at + line.len(), "");
+            // 配置层在启动时就拒绝这种配置：检查的成本无法折算成付款单位
+            let error = match config::parse(&yaml, dir.path(), TimestampMs(NOW_MS)) {
+                Ok(_) => {
+                    panic!("a check endpoint without a price for the payer's unit must not load")
+                }
+                Err(error) => error,
+            };
+            assert!(
+                error.contains("example-judge") && error.contains("THB") && error.contains("价目"),
+                "{error}"
+            );
+            return None;
+        }
     }
     let parts = config::parse(&yaml, dir.path(), TimestampMs(NOW_MS)).unwrap();
     let db = dir.path().join("idoris.sqlite3");
@@ -563,6 +599,8 @@ fn estimate(judge: &EndpointKey) -> ExtraCostEstimate {
         max_cost: Cost::from_micros(Unit::Usd, 7).unwrap(),
         max_input_tokens: 1_000,
         max_output_tokens: 100,
+        // 旧接口只给了一个总上界、没有逐次调用的清单：整体当作一次调用
+        calls: Vec::new(),
     }
 }
 
@@ -611,6 +649,86 @@ fn the_reservation_is_priced_with_the_check_endpoints_price_card_in_the_payers_u
         .unwrap();
     assert_eq!(row.state, HoldState::Settled);
     assert_eq!(row.charged.as_ref().map(|m| m.micros), Some(1_400));
+}
+
+/// round4-r3 Low：一次检查有几次调用时，预留和结算必须是同一个取整粒度（每次调用各自取整、再相加）。
+/// 检查端点输入价 0、输出价每百万 token 0.001 泰铢（1000 微泰铢），两次调用、每次输出上限 64、实际输出 10：
+/// 合并预留 ceil(128 x 1000 / 1e6) = 1 微泰铢，逐次结算 2 x ceil(10 x 1000 / 1e6) = 2 微泰铢，收费被预留额封顶成 1，差额由平台承担。
+#[test]
+fn a_check_with_several_calls_is_reserved_and_settled_at_the_same_rounding_granularity() {
+    let f = meter_fixture_priced(
+        JudgePrice::Custom {
+            input: "0",
+            output: "0.001",
+        },
+        FUNDS,
+    )
+    .unwrap();
+    let call = CallTokens {
+        input_tokens: 960,
+        output_tokens: 64,
+    };
+    let estimate = ExtraCostEstimate {
+        endpoint: f.judge.clone(),
+        max_cost: Cost::from_micros(Unit::Usd, 2).unwrap(),
+        max_input_tokens: 1_920,
+        max_output_tokens: 128,
+        calls: vec![call, call],
+    };
+    let spend = |output_tokens: u64| SpendItem {
+        endpoint: f.judge.clone(),
+        cost: Cost::from_micros(Unit::Usd, 1).unwrap(),
+        usage: Some(Usage::new(960, output_tokens, 0).unwrap()),
+        estimated: false,
+    };
+    let reserve = |name: &str| {
+        let request_id = RequestId::new(name).unwrap();
+        let ticket = f
+            .meter
+            .reserve(&ExtraCostRequest {
+                request_id: &request_id,
+                payment: &f.payment,
+                stage: SafetyStage::Input,
+                estimate: &estimate,
+                now: TimestampMs(NOW_MS),
+            })
+            .unwrap();
+        (request_id, ticket)
+    };
+
+    // 预留：2 x ceil(64 x 1000 / 1e6) = 2 微泰铢（合并只取整一次是 1）
+    let (id, ticket) = reserve("req-two-calls");
+    assert_eq!(
+        ticket.reserved_price.as_ref().map(|price| price.micros()),
+        Some(2)
+    );
+    let row = f.accounts.hold(&attempt0(&id), INPUT).unwrap().unwrap();
+    assert_eq!(row.state, HoldState::Open);
+    assert_eq!(row.reserved.micros, 2);
+    // 结算：两次各 10 个输出 token = 2 x ceil(10 x 1000 / 1e6) = 2：没有被预留额封顶，账本里收到的是真实的 2
+    f.meter
+        .settle(ticket, ExtraCostOutcome::Spent(vec![spend(10), spend(10)]));
+    let row = f.accounts.hold(&attempt0(&id), INPUT).unwrap().unwrap();
+    assert_eq!(row.state, HoldState::Settled);
+    assert_eq!(row.charged.as_ref().map(|money| money.micros), Some(2));
+
+    // 零用量仍收零：两次调用都报告 0 个输出 token（输入价是 0），预留释放，一分钱不收
+    let (id, ticket) = reserve("req-two-calls-zero");
+    assert_eq!(
+        ticket.reserved_price.as_ref().map(|price| price.micros()),
+        Some(2)
+    );
+    let free = SpendItem {
+        endpoint: f.judge.clone(),
+        cost: Cost::from_micros(Unit::Usd, 0).unwrap(),
+        usage: Some(Usage::new(0, 0, 0).unwrap()),
+        estimated: false,
+    };
+    f.meter
+        .settle(ticket, ExtraCostOutcome::Spent(vec![free.clone(), free]));
+    let row = f.accounts.hold(&attempt0(&id), INPUT).unwrap().unwrap();
+    assert_eq!(row.state, HoldState::Released);
+    assert!(row.charged.as_ref().is_none_or(|money| money.micros == 0));
 }
 
 /// L-4：安全检查的预留和结算是同步 SQLite。另一个连接占着写事务时，这两处如果直接跑在 tokio worker 上，
