@@ -2024,6 +2024,243 @@ fn an_outsider_cannot_tell_whether_a_principal_is_active_revoked_or_missing_when
     );
 }
 
+/// 在 [`principal_world`] 的基础上：eduai 另外登记并撤销了主体 `dead`（`victim` 活跃，`ghost` 不存在）；
+/// school-b 有一个成员账户 `acct-b`。
+fn principals_of_another_organization(env: &Env, edu: &Minted) {
+    assert_eq!(
+        Action::CreatePrincipal {
+            principal: "dead",
+            org: "eduai"
+        }
+        .run(env, &edu.who(), T0 + 2),
+        Ok(WriteResult::Created)
+    );
+    assert_eq!(
+        Action::RevokePrincipal {
+            principal: "dead",
+            org: "eduai"
+        }
+        .run(env, &edu.who(), T0 + 3),
+        Ok(WriteResult::Updated)
+    );
+    env.account("acct-b", AccountKind::Member, Some("school-b"));
+}
+
+fn member_membership(id: &str, principal: &str, org: &str, account: &str) -> Membership {
+    Membership {
+        id: mid(id),
+        principal: pid(principal),
+        org: aid(org),
+        role: MembershipRole::Member,
+        account: Some(aid(account)),
+        status: MembershipStatus::Active,
+    }
+}
+
+/// 调用一次建成员关系，返回失败（成功就 panic）。
+fn attach_failure(env: &Env, who: &Who<'_>, now: i64, membership: Membership) -> Failure {
+    let rid = env.rid();
+    env.store
+        .control_create_membership(who, &env.meta(now, &rid), &CreateMembership { membership })
+        .expect_err("the attach must be refused")
+}
+
+/// PR #600 第四轮复审新问题 2（a）：成员关系的 `org` 是客户端提交的。school-b 的管理员提交
+/// `role = member、account = school-b 自己的账户、org = eduai（别人的组织）、principal = eduai 登记的主体`：
+/// 授权只看付款账户（school-b 自己的），通过；归属检查却相信客户端的 `org = eduai`，把「归属方是 eduai」当成
+/// 「新成员关系就在归属方的子树里」，跳过了对 eduai 的授权，之后才报主体状态——活跃的主体得到 `invalid_membership`
+/// （结构校验挡下来），已撤销的得到 `principal_revoked`，不存在的得到 `out_of_scope`。
+/// 修复：先校验 `org` 与付款账户的关系（`org` 必须是付款账户的祖先），再谈主体；三种主体得到逐字节相同的失败。
+#[test]
+fn forging_the_org_field_does_not_reveal_whether_a_principal_is_active_revoked_or_missing() {
+    let env = Env::new();
+    let (edu, other) = principal_world(&env);
+    principals_of_another_organization(&env, &edu);
+
+    let attempt = |principal: &str, id: &str| {
+        attach_failure(
+            &env,
+            &other.who(),
+            T0 + 4,
+            // org 是 eduai（伪造），付款账户是 school-b 自己的 acct-b
+            member_membership(id, principal, "eduai", "acct-b"),
+        )
+    };
+    let active = attempt("victim", "m-forged-active");
+    let revoked = attempt("dead", "m-forged-dead");
+    let missing = attempt("ghost", "m-forged-ghost");
+    assert_eq!(
+        active.reason,
+        ControlReason::InvalidMembership,
+        "the org is not above the account: a plain structural rejection"
+    );
+    assert_eq!(active, revoked, "活跃和已撤销必须是同一个失败");
+    assert_eq!(active, missing, "活跃和不存在必须是同一个失败");
+    assert_eq!(active.to_string(), revoked.to_string());
+    assert_eq!(active.to_string(), missing.to_string());
+    for failure in [&active, &revoked, &missing] {
+        for name in ["victim", "dead", "ghost"] {
+            assert!(
+                !failure.detail.contains(name),
+                "the detail must not echo the principal: {failure:?}"
+            );
+        }
+    }
+    // 审计行也一样：结果、原因码相同（只有请求里自己提交的主体 id 不同）
+    let audit: Vec<(String, String)> = env
+        .audit()
+        .into_iter()
+        .filter(|row| row.op == "create_membership")
+        .map(|row| (row.outcome, row.reason_code))
+        .collect();
+    assert_eq!(audit.len(), 3);
+    assert!(audit.iter().all(|row| *row == audit[0]), "{audit:?}");
+    for id in ["m-forged-active", "m-forged-dead", "m-forged-ghost"] {
+        assert!(env.store.get_membership(&mid(id)).unwrap().is_none());
+    }
+
+    // 管理员关系（没有付款账户）用组织授权：对 eduai 没有权限，三种主体同样是同一个 out_of_scope
+    let admin = |principal: &str, id: &str| {
+        attach_failure(
+            &env,
+            &other.who(),
+            T0 + 5,
+            admin_membership(id, principal, "eduai"),
+        )
+    };
+    let (a, r, m) = (
+        admin("victim", "m-admin-active"),
+        admin("dead", "m-admin-dead"),
+        admin("ghost", "m-admin-ghost"),
+    );
+    assert_eq!(a, Failure::new(ControlReason::OutOfScope));
+    assert_eq!(a, r);
+    assert_eq!(a, m);
+
+    // 对照：自己的组织、自己的账户、自己登记的主体，照常建得出来；归属方自己照旧看得到具体原因
+    assert_eq!(
+        Action::CreatePrincipal {
+            principal: "bee",
+            org: "school-b"
+        }
+        .run(&env, &other.who(), T0 + 6),
+        Ok(WriteResult::Created)
+    );
+    assert_eq!(
+        Action::CreateMembership {
+            id: "m-bee",
+            principal: "bee",
+            org: "school-b",
+            account: "acct-b"
+        }
+        .run(&env, &other.who(), T0 + 7),
+        Ok(WriteResult::Created)
+    );
+    env.account("acct-dead", AccountKind::Member, Some("eduai"));
+    let owner = attach_failure(
+        &env,
+        &edu.who(),
+        T0 + 8,
+        member_membership("m-owner-dead", "dead", "eduai", "acct-dead"),
+    );
+    assert_eq!(owner.reason, ControlReason::PrincipalRevoked);
+}
+
+/// PR #600 第四轮复审新问题 2（b）：只有 `manage_membership`、没有任何 `revoke_principal` 权限的合法凭证，
+/// 即使提交真实的 `org`（自己的组织），归属方授权失败的内部错误也被直接透传：已有的外部主体得到 `op_not_granted`，
+/// 不存在的得到 `out_of_scope`，调用方就能探测别的组织登记过哪些主体。主体可见性的授权失败一律是无细节的 `out_of_scope`。
+#[test]
+fn a_credential_with_only_manage_membership_cannot_tell_an_external_principal_from_a_missing_one() {
+    let env = Env::new();
+    let (edu, _other) = principal_world(&env);
+    principals_of_another_organization(&env, &edu);
+    // 没有登记记录、但已经被 eduai 在用的老主体（夹具里的 kid2）
+    let narrow = env.issue_as_operator(Issue::service(
+        "school-b",
+        vec![sc(ControlOp::ManageMembership, "school-b", None)],
+    ));
+    // 对照：这张凭证连 `revoke_principal` 这个操作都没有，所以内部的授权判定会得到 `op_not_granted`
+    assert_eq!(
+        Action::RevokePrincipal {
+            principal: "victim",
+            org: "school-b"
+        }
+        .run(&env, &narrow.who(), T0 + 3),
+        Err(ControlReason::OpNotGranted)
+    );
+
+    let attempt = |principal: &str, id: &str| {
+        attach_failure(
+            &env,
+            &narrow.who(),
+            T0 + 4,
+            member_membership(id, principal, "school-b", "acct-b"),
+        )
+    };
+    let expected = Failure::new(ControlReason::OutOfScope);
+    for (principal, id) in [
+        ("victim", "m-narrow-active"),
+        ("dead", "m-narrow-dead"),
+        ("ghost", "m-narrow-ghost"),
+        ("kid2", "m-narrow-legacy"),
+    ] {
+        let failure = attempt(principal, id);
+        assert_eq!(failure, expected, "{principal}");
+        assert_eq!(failure.to_string(), expected.to_string(), "{principal}");
+    }
+    for id in [
+        "m-narrow-active",
+        "m-narrow-dead",
+        "m-narrow-ghost",
+        "m-narrow-legacy",
+    ] {
+        assert!(env.store.get_membership(&mid(id)).unwrap().is_none());
+    }
+    let audit: Vec<(String, String)> = env
+        .audit()
+        .into_iter()
+        .filter(|row| row.op == "create_membership")
+        .map(|row| (row.outcome, row.reason_code))
+        .collect();
+    assert_eq!(audit.len(), 4);
+    assert!(
+        audit
+            .iter()
+            .all(|row| *row == ("denied".to_string(), "out_of_scope".to_string())),
+        "{audit:?}"
+    );
+}
+
+#[test]
+fn a_database_failure_while_checking_visibility_is_not_turned_into_a_plain_out_of_scope() {
+    // 「调用者没有资格」这一类折成「看不见」；数据库忙、内部错误是基础设施问题，原样往上走，让调用方重试 / 告警，
+    // 不能被悄悄当成「主体不在范围内」。
+    use super::control::authority_is_visible;
+    assert_eq!(authority_is_visible(Ok(())), Ok(true));
+    for reason in [
+        ControlReason::OpNotGranted,
+        ControlReason::OutOfScope,
+        ControlReason::AccountInactive,
+        ControlReason::AmountExceedsAuthority,
+    ] {
+        assert_eq!(
+            authority_is_visible::<()>(Err(Failure::new(reason))),
+            Ok(false),
+            "{reason}"
+        );
+    }
+    for failure in [
+        Failure::new(ControlReason::StoreBusy),
+        Failure::internal("directory slice is inconsistent"),
+        Failure::new(ControlReason::AuditUnavailable),
+    ] {
+        assert_eq!(
+            authority_is_visible::<()>(Err(failure.clone())),
+            Err(failure)
+        );
+    }
+}
+
 #[test]
 fn another_organization_cannot_attach_itself_to_a_principal_it_did_not_register() {
     // Codex r1 #1 / PR-Daemon S2 F3：eduai 登记了主体 `victim`（还没有成员关系）。school-b 的管理员给它加一个属于
@@ -3399,6 +3636,61 @@ fn reads_are_limited_to_the_callers_read_subtree() {
     assert_eq!(info.credential.id().as_str(), writer.id());
     assert_eq!(info.ceilings.allowed_roles, vec!["fast".to_string()]);
     assert!(!format!("{info:?}").contains(writer.secret()));
+}
+
+/// 同一类探测的读路径：读主体的状态，调用者没有 `read` 这个操作时，已有的主体得到 `op_not_granted`（授权判定先于一切），
+/// 不存在的主体却在授权判定之前就得到 `out_of_scope`——没有 `read` 权限的凭证就能区分「有这个主体」和「没有」。
+/// 契约（`authorize` 的检查顺序）早就写明：没有这个操作权限的调用者，无论目标存在与否都得到同一个答案。
+#[test]
+fn a_credential_without_the_read_operation_cannot_tell_a_principal_that_exists_from_one_that_does_not()
+ {
+    let env = Env::new();
+    env.tree();
+    let narrow = env.issue_as_operator(Issue::service(
+        "eduai",
+        vec![sc(ControlOp::ManageMembership, "eduai", None)],
+    ));
+    let read = |principal: &str| {
+        env.store
+            .control_read_principal(&narrow.who(), ts(T0 + 1), &pid(principal))
+            .expect_err("a credential without `read` reads nothing")
+    };
+    // kid1 在 eduai 里，kb1 在别的组织，ghost 不存在
+    let expected = Failure::new(ControlReason::OpNotGranted);
+    for principal in ["kid1", "kb1", "ghost"] {
+        assert_eq!(read(principal), expected, "{principal}");
+    }
+    // 对照：有 `read` 权限的凭证，范围外和不存在仍然是同一个 out_of_scope
+    let reader = env.issue_as_operator(Issue::service(
+        "eduai",
+        vec![sc(ControlOp::Read, "eduai", None)],
+    ));
+    for principal in ["kb1", "ghost"] {
+        assert_eq!(
+            env.store
+                .control_read_principal(&reader.who(), ts(T0 + 1), &pid(principal))
+                .unwrap_err(),
+            Failure::new(ControlReason::OutOfScope),
+            "{principal}"
+        );
+    }
+    // 凭证状态类的失败（绑定账户被冻结）对存在和不存在的主体同样一致
+    env.store
+        .set_account_status(&aid("eduai"), AccountStatus::Frozen)
+        .unwrap();
+    let frozen: Vec<Failure> = ["kid1", "kb1", "ghost"]
+        .into_iter()
+        .map(|principal| {
+            env.store
+                .control_read_principal(&reader.who(), ts(T0 + 2), &pid(principal))
+                .unwrap_err()
+        })
+        .collect();
+    assert_eq!(frozen[0], Failure::new(ControlReason::AccountInactive));
+    assert!(
+        frozen.iter().all(|failure| *failure == frozen[0]),
+        "{frozen:?}"
+    );
 }
 
 #[test]

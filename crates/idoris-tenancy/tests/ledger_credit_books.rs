@@ -16,9 +16,10 @@
 //! ```
 //!
 //! 这个文件有一个**独立于被测代码**的模型（[`model`]）：只读原始表（`allocations`、`allocation_revocations`、
-//! `ledger_entries`），按事件逐笔回放「先额度后授信」，不经过被测的投影函数，也不按「窗口段」求和（被测实现按额度边界切段求和，
-//! 模型按每一笔花费回放），所以两边对不上就是实现有 bug。所有场景都核对金额守恒：额度覆盖的 + 授信承担的 = 分录里的已花，
-//! 授信承担的永远不超过授信额度。
+//! `ledger_allocation_marks`、`ledger_entries`），把「额度创建」「额度撤销」「一笔花费」当成同一条时间线上的事件，按提交先后
+//! 逐件回放「先额度后授信」，不经过被测的投影函数，也不共用被测实现里「这笔额度能不能覆盖这笔花费」的判断（被测实现拿花费的第一条
+//! 分录号和额度的序号直接比，模型靠事件顺序维护「此刻已经存在、没被撤销的额度」），所以两边对不上就是实现有 bug。
+//! 所有场景都核对金额守恒：额度覆盖的 + 授信承担的 = 分录里的已花，授信承担的永远不超过授信额度。
 //!
 //! 数字约定见 `support/ledger_fixture.rs`：`10` 个输入 token 加 `max_tokens = M` 的预留是 `10 + 2M` 微泰铢，
 //! 所以 `max_tokens = 45` 的预留正好是 100，`max_tokens = 10` 是最低有用的预留 30。
@@ -40,7 +41,9 @@ use idoris_compute_contracts::control::WriteResult;
 use idoris_compute_contracts::grant::Purpose;
 use idoris_compute_contracts::ids::{AllocationId, IdempotencyKey};
 use idoris_compute_contracts::reason::ReasonCode;
-use idoris_tenancy::accounts::ledger::{CreditLineSetting, FreeTierIssue, FreeTierOutcome};
+use idoris_tenancy::accounts::ledger::{
+    CreditLineSetting, FreeTierIssue, FreeTierOutcome, LedgerError,
+};
 use idoris_tenancy::accounts::{AccountStore, GrantAllocation, Meta, Who};
 
 /// `max_tokens = 45`：预留 100。
@@ -216,30 +219,78 @@ struct Books {
 
 /// 读原始表，按事件逐笔回放（不经过被测代码）：
 ///
-/// * 一笔额度只覆盖它**自己窗口内、它存在之后**的花费：覆盖区间 `[max(生效起点, 创建时刻), min(到期, 撤销时刻))`，
-///   额度剩余只算此刻生效、没被撤销的；
-/// * 同一时刻先到期、再生效、最后才是花费（区间都是左闭右开）；
-/// * 一笔花费先用此刻生效的额度里**先到期**的，用完才记成授信债务；
-/// * 一个预留的花费 = 它在这个归属时刻上的 `held + spent` 净额（结算、释放、过期都折算进去了）。
+/// * 事件按**提交先后**排：分录号是提交的先后；额度创建 / 撤销的序号 `after_entry` 是「它提交那一刻账本里最后一条分录的号」，
+///   所以它排在这个号的分录之后、下一个号的分录之前；毫秒只用来判断额度自己的窗口 `[valid_from, valid_until)`；
+/// * 一笔花费 = 一个预留在这个账户上、同一个归属时刻上的 `held + spent` 净额（结算、释放、过期都折算进去了），先后看它第一条分录的号；
+/// * 回放时维护「此刻已经创建、没被撤销的额度」：一笔花费先用其中窗口包含它的归属时刻的额度里**先到期**的（同时到期的先创建的先用），
+///   用完才记成授信债务；
+/// * 额度剩余只算此刻（毫秒 `now`）窗口内、没被撤销的。
 fn model(db_path: &Path, account: &str, now: i64) -> Books {
-    let conn = rusqlite::Connection::open(db_path).unwrap();
-    conn.busy_timeout(Duration::from_secs(10)).unwrap();
     struct Bucket {
-        start: i64,
-        end: i64,
+        from: i64,
+        until: i64,
         left: i64,
         revoked: bool,
     }
+    // 事件在时间线上的位置：`(分录号, 种类, 下标)`。种类 0 = 一笔花费（排在它第一条分录的号上），1 = 额度创建，2 = 额度撤销。
+    // 同一个号上花费排在额度事件之前：创建序号 c 的额度只覆盖号大于 c 的花费，撤销序号 r 的额度仍然覆盖号不大于 r 的花费。
     let mut buckets: Vec<Bucket> = Vec::new();
+    let mut events: Vec<(i64, u8, usize)> = Vec::new();
+    let mut spends: Vec<(i64, i64)> = Vec::new(); // (归属时刻, 净额)
     {
+        let conn = rusqlite::Connection::open(db_path).unwrap();
+        conn.busy_timeout(Duration::from_secs(10)).unwrap();
+        // 一个读事务里读完所有表：竞争测试里采样者线程读的时候别的线程还在写，分开读会读到不一致的快照
+        conn.execute_batch("BEGIN").unwrap();
         let mut stmt = conn
             .prepare(
-                "SELECT a.valid_from_ms, a.valid_until_ms, a.created_at_ms, a.ceiling_micros,
-                        (SELECT r.revoked_at_ms FROM allocation_revocations r
-                          WHERE r.allocation_id = a.allocation_id)
+                "SELECT a.valid_from_ms, a.valid_until_ms, a.ceiling_micros,
+                        (SELECT m.after_entry FROM ledger_allocation_marks m
+                          WHERE m.allocation_id = a.allocation_id AND m.event = 'created'),
+                        (SELECT m.after_entry FROM ledger_allocation_marks m
+                          WHERE m.allocation_id = a.allocation_id AND m.event = 'revoked')
                    FROM allocations a
                   WHERE a.child_id = ?1 AND a.purpose IN ('free_tier', 'prepaid', 'org_quota')
+                    AND a.valid_from_ms <= ?2 AND a.ceiling_micros > 0
                   ORDER BY a.rowid",
+            )
+            .unwrap();
+        let rows = stmt
+            .query_map(rusqlite::params![account, now], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                ))
+            })
+            .unwrap();
+        for row in rows {
+            let (from, until, cap, created_after, revoked_after) = row.unwrap();
+            let index = buckets.len();
+            buckets.push(Bucket {
+                from,
+                until,
+                left: cap,
+                revoked: false,
+            });
+            events.push((
+                created_after.expect("every allocation has a creation mark"),
+                1,
+                index,
+            ));
+            if let Some(after) = revoked_after {
+                events.push((after, 2, index));
+            }
+        }
+        drop(stmt);
+        let mut stmt = conn
+            .prepare(
+                "SELECT MIN(entry_id), window_at_ms, SUM(held_micros + spent_micros) FROM ledger_entries
+                  WHERE account_id = ?1 AND hold_id IS NOT NULL
+                  GROUP BY hold_id, window_at_ms
+                 HAVING SUM(held_micros + spent_micros) <> 0",
             )
             .unwrap();
         let rows = stmt
@@ -248,75 +299,46 @@ fn model(db_path: &Path, account: &str, now: i64) -> Books {
                     row.get::<_, i64>(0)?,
                     row.get::<_, i64>(1)?,
                     row.get::<_, i64>(2)?,
-                    row.get::<_, i64>(3)?,
-                    row.get::<_, Option<i64>>(4)?,
                 ))
             })
             .unwrap();
         for row in rows {
-            let (from, until, created, cap, revoked_at) = row.unwrap();
-            buckets.push(Bucket {
-                start: from.max(created),
-                end: until.min(revoked_at.unwrap_or(i64::MAX)),
-                left: cap,
-                revoked: revoked_at.is_some(),
-            });
+            let (first_entry, at, amount) = row.unwrap();
+            assert!(amount > 0, "a hold never nets to a negative amount");
+            // 读的是比这笔花费更早的某一刻（排队乱序时取到的时间比前面已经提交的花费更早）：往后的花费按读的那一刻算，
+            // 也就是用读的那一刻此刻生效的额度
+            events.push((first_entry, 0, spends.len()));
+            spends.push((at.min(now), amount));
         }
-    }
-    let mut spends: Vec<(i64, i64)> = Vec::new();
-    {
-        let mut stmt = conn
-            .prepare(
-                "SELECT window_at_ms, SUM(held_micros + spent_micros) FROM ledger_entries
-                  WHERE account_id = ?1 AND hold_id IS NOT NULL
-                  GROUP BY hold_id, window_at_ms
-                 HAVING SUM(held_micros + spent_micros) <> 0
-                  ORDER BY window_at_ms, MIN(entry_id)",
-            )
-            .unwrap();
-        let rows = stmt
-            .query_map([account], |row| Ok((row.get(0)?, row.get(1)?)))
-            .unwrap();
-        for row in rows {
-            spends.push(row.unwrap());
-        }
-    }
-    // (时刻, 先后: 0 到期 1 生效 2 花费, 下标)
-    let mut events: Vec<(i64, u8, usize)> = Vec::new();
-    for (index, bucket) in buckets.iter().enumerate() {
-        if bucket.start >= bucket.end {
-            continue; // 空窗口：从来没有覆盖过任何东西
-        }
-        if bucket.start <= now {
-            events.push((bucket.start, 1, index));
-        }
-        if bucket.end <= now {
-            events.push((bucket.end, 0, index));
-        }
-    }
-    for (index, (at, amount)) in spends.iter().enumerate() {
-        assert!(
-            *at <= now,
-            "the model views the books at or after the last entry"
-        );
-        assert!(*amount > 0, "a hold never nets to a negative amount");
-        events.push((*at, 2, index));
+        drop(stmt);
+        conn.execute_batch("COMMIT").unwrap();
     }
     events.sort_unstable();
 
-    let mut live: Vec<usize> = Vec::new();
+    let mut known: Vec<usize> = Vec::new();
     let (mut covered, mut credit_debt, mut spent) = (0_i64, 0_i64, 0_i64);
-    for (_, rank, index) in events {
-        match rank {
-            0 => live.retain(|i| *i != index),
-            1 => live.push(index),
+    for (_, kind, index) in events {
+        match kind {
+            // 额度创建：此后的花费才可能用它
+            1 => known.push(index),
+            // 额度撤销：此后的花费不再用它，剩下的额度作废
+            2 => buckets[index].revoked = true,
             _ => {
-                let mut rest = spends[index].1;
-                spent += rest;
-                live.sort_by_key(|i| (buckets[*i].end, *i));
-                for i in &live {
-                    let take = rest.min(buckets[*i].left);
-                    buckets[*i].left -= take;
+                let (at, amount) = spends[index];
+                spent += amount;
+                let mut rest = amount;
+                let mut usable: Vec<usize> = known
+                    .iter()
+                    .copied()
+                    .filter(|i| {
+                        !buckets[*i].revoked && buckets[*i].from <= at && at < buckets[*i].until
+                    })
+                    .collect();
+                // 先到期的先用；同时到期的先创建的先用
+                usable.sort_by_key(|i| (buckets[*i].until, *i));
+                for i in usable {
+                    let take = rest.min(buckets[i].left);
+                    buckets[i].left -= take;
                     rest -= take;
                     covered += take;
                 }
@@ -324,10 +346,10 @@ fn model(db_path: &Path, account: &str, now: i64) -> Books {
             }
         }
     }
-    let allowance_left = live
+    let allowance_left = buckets
         .iter()
-        .filter(|i| !buckets[**i].revoked)
-        .map(|i| buckets[*i].left)
+        .filter(|bucket| !bucket.revoked && bucket.from <= now && now < bucket.until)
+        .map(|bucket| bucket.left)
         .sum();
     Books {
         allowance_left,
@@ -1029,12 +1051,15 @@ fn spending_inside_an_allowance_before_it_was_revoked_is_not_credit_debt() {
 
 #[test]
 fn spending_from_the_revocation_instant_on_is_not_covered_by_the_revoked_allowance() {
-    // 撤销时刻本身起（区间左闭右开，撤销那一刻已经不再授权）的花费不被它覆盖：只有授信能承担
+    // 撤销（提交）之后的花费不被它覆盖：只有授信能承担。
+    // 第四轮复审之前这里把撤销先提交、毫秒写成「将来」的 T0 + 5_000，再去花 T0 + 4_999 的一笔，靠毫秒比出「撤销之前」。
+    // 撤销行的时刻是撤销请求在进事务之前取的，从来不会比它之后提交的花费更「将来」；而拿毫秒比先后，排队乱序时会让已撤销的额度
+    // 回头覆盖撤销之后才提交的花费（见 `a_revoked_allowance_does_not_cover_a_spend_that_committed_after_its_revocation`）。
+    // 所以这里按真实的顺序：先花，再撤销（取到的时刻是 T0 + 5_000），再花；断言的数值一个没变。
     let db = TempDb::new("books-revoked-boundary");
     let store = credit_only_world(&db);
     credit_line(&store, "emp", 200, T0);
     allocate(&store, "emp-prepaid", "paid", "emp", 1_000);
-    revoke_allocation_at(&db, "emp-prepaid", T0 + 5_000);
 
     assert!(spend(&store, "r-1", T0 + 4_999, M100).is_admitted());
     let books = check_books(&store, &db, "emp", T0 + 4_999 + 600);
@@ -1043,6 +1068,7 @@ fn spending_from_the_revocation_instant_on_is_not_covered_by_the_revoked_allowan
         (100, 0),
         "撤销前一毫秒花的 100 在额度内"
     );
+    revoke_allocation_at(&db, "emp-prepaid", T0 + 5_000);
     // 撤销那一刻：额度不再授权，这一笔只能走授信
     let at_revocation = spend(&store, "r-2", T0 + 5_000, M100);
     assert!(at_revocation.is_admitted(), "{at_revocation:?}");
@@ -1161,6 +1187,248 @@ fn a_late_settlement_lands_in_the_window_of_its_settlement_time() {
             "{window_minutes} 分钟的窗口：{books:?}"
         );
         assert_clean(&store);
+    }
+}
+
+// ------------------------------------------------------------------------------------------
+// 先后看提交顺序，不看入事务之前取的毫秒（PR #600 第四轮复审 Medium 3）
+// ------------------------------------------------------------------------------------------
+//
+// 额度的创建时间、撤销时间、花费的归属时间，都是调用方在**进事务之前**取的毫秒（HTTP 处理函数取时之后还要等工作线程和写锁）。
+// 排队时间能让「先提交」和「时间更早」对不上，所以拿毫秒比先后，会让后来才存在的额度追溯偿还它存在之前的授信债务
+// （方案 C 的底线：新额度不抵旧债），或者让已经撤销的额度继续覆盖撤销之后的花费。账本在额度创建 / 撤销的事务里记下
+// 「此刻账本里最后一条分录是第几号」（`ledger_allocation_marks`，迁移 0004），一笔花费的先后看它第一条分录的号。
+//
+// 这几个测试里「额度窗口结束之后授信仍占满」是区分点：旧口径下新额度追溯覆盖了旧花费，窗口结束之后债务凭空少了一块。
+// 表里的时间故意写成和提交顺序相反：`prepaid(.., created)` 的 `created` 是发额度的请求取到的毫秒，调用顺序才是提交顺序。
+
+/// 授信 200 已经被 r-1（T0 + 1_100）、r-2（T0 + 1_200）用光。返回时 emp 的授信债务是 200。
+fn credit_used_up_by_two_spends(db: &TempDb) -> AccountStore {
+    let store = credit_only_world(db);
+    credit_line(&store, "emp", 200, T0);
+    for (request, at) in [("r-1", T0 + 1_100), ("r-2", T0 + 1_200)] {
+        assert!(spend(&store, request, at, M100).is_admitted(), "{request}");
+    }
+    store
+}
+
+/// 额度窗口结束之后：没有人用过这笔额度，授信仍占满（债务 200），再小的预留也放不下。
+fn assert_old_debt_survives_the_allowance(store: &AccountStore, db: &TempDb, after: i64) {
+    let books = check_books(store, db, "emp", after);
+    assert_eq!(
+        (
+            books.allowance_left,
+            books.covered,
+            books.credit_debt,
+            books.spent
+        ),
+        (0, 0, 200, 200),
+        "额度过期了，没有覆盖过任何一笔花费"
+    );
+    let v = view(store, after);
+    assert_eq!(
+        v.ceiling_remaining,
+        Some(thb(-200)),
+        "新额度没有被后来的请求用过，窗口结束了，旧的授信债务一分没少"
+    );
+    assert_eq!(headroom(&v), 0, "授信仍是 0");
+    let blocked = admit_with_ladder(store, "cred-e", "r-after", M30, after + 1_000);
+    assert_eq!(
+        denied(&blocked),
+        Some(ReasonCode::BudgetExhausted),
+        "{blocked:?}"
+    );
+    assert_clean(store);
+}
+
+#[test]
+fn an_allowance_that_commits_after_the_spends_it_was_timed_before_does_not_pay_their_debt() {
+    // 复审场景（排队乱序）：发额度的请求先取到时间 T0 + 1_000，随后等工作线程 / 锁；另一个请求在 T0 + 1_100 起花光了
+    // 200 授信并结算。发额度的事务随后才提交，它保存的创建时间（T0 + 1_000）比那两笔花费的归属时间早，
+    // 可它是在两笔花费**之后**才存在的。旧口径把 T0 + 1_100 的旧花费算成这笔后来才存在的额度覆盖的，债务从 200 降到 100。
+    let db = TempDb::new("books-queued-issue");
+    let store = credit_used_up_by_two_spends(&db);
+    assert_eq!(view(&store, T0 + 2_000).ceiling_remaining, Some(thb(-200)));
+
+    prepaid(
+        &store,
+        "emp-queued",
+        100,
+        T0 - DAY,
+        T0 + 30 * DAY,
+        T0 + 1_000,
+    );
+    let v = view(&store, T0 + 2_000);
+    assert_eq!(
+        v.ceiling_remaining,
+        Some(thb(-100)),
+        "额度整整 100 还在，旧债 200"
+    );
+    assert_eq!(headroom(&v), 100, "能花的只有新额度；授信仍是 0");
+    let books = check_books(&store, &db, "emp", T0 + 2_000);
+    assert_eq!(
+        (books.allowance_left, books.covered, books.credit_debt),
+        (100, 0, 200),
+        "旧花费不是这笔后来才存在的额度覆盖的"
+    );
+
+    assert_old_debt_survives_the_allowance(&store, &db, T0 + 31 * DAY);
+}
+
+#[test]
+fn an_allowance_stamped_in_the_same_millisecond_as_an_earlier_spend_does_not_pay_for_it() {
+    // 同毫秒：花费先提交（归属时间 T0 + 2_000），额度后提交、创建时间也是 T0 + 2_000。两个时间一样，毫秒分不出先后；
+    // 旧口径把「创建时刻 <= 花费时刻」当成额度先存在。
+    let db = TempDb::new("books-same-ms");
+    let store = credit_used_up_by_two_spends(&db);
+    prepaid(
+        &store,
+        "emp-same-ms",
+        100,
+        T0 - DAY,
+        T0 + 30 * DAY,
+        T0 + 1_200,
+    );
+    let books = check_books(&store, &db, "emp", T0 + 2_000);
+    assert_eq!(
+        (books.allowance_left, books.covered, books.credit_debt),
+        (100, 0, 200)
+    );
+    assert_old_debt_survives_the_allowance(&store, &db, T0 + 31 * DAY);
+}
+
+#[test]
+fn an_allowance_committed_first_covers_a_spend_in_the_same_millisecond() {
+    // 对照：额度先提交，花费后来、同一毫秒——那一笔是它存在之后的花费，由它覆盖，授信一分没动
+    let db = TempDb::new("books-same-ms-first");
+    let store = credit_only_world(&db);
+    credit_line(&store, "emp", 200, T0);
+    prepaid(
+        &store,
+        "emp-first",
+        100,
+        T0 - DAY,
+        T0 + 30 * DAY,
+        T0 + 1_000,
+    );
+    assert!(spend(&store, "r-1", T0 + 1_000, M100).is_admitted());
+    let after = T0 + 31 * DAY;
+    let v = view(&store, after);
+    assert_eq!(
+        v.ceiling_remaining,
+        Some(thb(0)),
+        "额度覆盖了它，授信没有债务"
+    );
+    assert_eq!(headroom(&v), 200);
+    let books = check_books(&store, &db, "emp", after);
+    assert_eq!((books.covered, books.credit_debt), (100, 0));
+    assert_clean(&store);
+}
+
+#[test]
+fn a_spend_committed_after_the_allowance_is_covered_even_when_its_timestamp_is_older() {
+    // 反方向：额度先提交（创建时间 T0 + 5_000），花费排在它后面提交，但它的归属时间（T0 + 1_000）比额度的创建时间早。
+    // 准入那一刻额度已经在库里，窗口也包含 T0 + 1_000，所以这笔花费用的是额度；之后任何时候再读，账都必须一样：
+    // 旧口径按毫秒，把它算成额度创建之前的花费，授信平白多出 100 的债务。
+    let db = TempDb::new("books-stale-spend");
+    let store = credit_only_world(&db);
+    credit_line(&store, "emp", 200, T0);
+    prepaid(
+        &store,
+        "emp-first",
+        100,
+        T0 - DAY,
+        T0 + 30 * DAY,
+        T0 + 5_000,
+    );
+    let decision = spend(&store, "r-1", T0 + 1_000, M100);
+    assert!(
+        matches!(decision, AdmissionDecision::Allow { .. }),
+        "{decision:?}"
+    );
+    let v = view(&store, T0 + 6_000);
+    assert_eq!(
+        v.ceiling_remaining,
+        Some(thb(0)),
+        "额度 100 被它用掉了，授信没有债务"
+    );
+    assert_eq!(headroom(&v), 200);
+    let books = check_books(&store, &db, "emp", T0 + 6_000);
+    assert_eq!(
+        (books.allowance_left, books.covered, books.credit_debt),
+        (0, 100, 0)
+    );
+    let after = T0 + 31 * DAY;
+    let v = view(&store, after);
+    assert_eq!(
+        v.ceiling_remaining,
+        Some(thb(0)),
+        "窗口结束之后也一样：这一笔是额度覆盖的，不是授信债务"
+    );
+    assert_eq!(headroom(&v), 200, "授信一分没动");
+    let books = check_books(&store, &db, "emp", after);
+    assert_eq!((books.covered, books.credit_debt), (100, 0));
+    assert_clean(&store);
+}
+
+#[test]
+fn a_revoked_allowance_does_not_cover_a_spend_that_committed_after_its_revocation() {
+    // 撤销同理：撤销请求取到的毫秒（T0 + 5_000）比后来提交的花费的归属时间（T0 + 4_000）晚。撤销提交之后，额度不再授权：
+    // 准入那一刻这笔花费只能走授信，之后再读，账也必须是「授信承担」，不能因为撤销的毫秒更晚，就让已撤销的额度回头覆盖它，
+    // 把授信空出来。
+    let db = TempDb::new("books-queued-revoke");
+    let store = credit_only_world(&db);
+    credit_line(&store, "emp", 200, T0);
+    allocate(&store, "emp-prepaid", "paid", "emp", 1_000);
+    revoke_allocation_at(&db, "emp-prepaid", T0 + 5_000);
+    assert!(spend(&store, "r-1", T0 + 4_000, M100).is_admitted());
+    let v = view(&store, T0 + 6_000);
+    assert_eq!(
+        v.ceiling_remaining,
+        Some(thb(-100)),
+        "撤销之后才提交的花费是授信债务"
+    );
+    assert_eq!(headroom(&v), 100, "授信 200 里还剩 100");
+    let books = check_books(&store, &db, "emp", T0 + 6_000);
+    assert_eq!(
+        (books.allowance_left, books.covered, books.credit_debt),
+        (0, 0, 100)
+    );
+    assert_clean(&store);
+}
+
+#[test]
+fn an_allocation_that_lost_its_order_mark_fails_admission_closed() {
+    // 每笔额度都由触发器记了创建序号、每笔撤销都记了撤销序号。缺了就是库被改坏了（先拆掉只追加的触发器才删得掉）：
+    // 失败即关闭，不能按「没有序号」当成「很早就存在」，让它覆盖不该覆盖的花费、把授信空出来。
+    for (what, drop_mark) in [("creation", "'created'"), ("revocation", "'revoked'")] {
+        let db = TempDb::new(&format!("books-lost-mark-{what}"));
+        let store = credit_only_world(&db);
+        credit_line(&store, "emp", 200, T0);
+        prepaid(&store, "emp-prepaid", 100, T0, T0 + 30 * DAY, T0);
+        revoke_allocation_at(&db, "emp-prepaid", T0 + 5_000);
+        let conn = rusqlite::Connection::open(db.path()).unwrap();
+        conn.execute_batch(&format!(
+            "DROP TRIGGER ledger_allocation_marks_append_only_delete;
+             DELETE FROM ledger_allocation_marks WHERE allocation_id = 'emp-prepaid' AND event = {drop_mark}"
+        ))
+        .unwrap();
+        let req = Req::new(&store, "r-1", 0, "cred-e", M100).at(T0 + 6_000);
+        let error = store
+            .admit_attempt(&req.input())
+            .expect_err("admission must fail closed");
+        assert!(
+            matches!(error, LedgerError::Corrupt(_)),
+            "{what}: {error:?}"
+        );
+        assert!(
+            store.hold(&req.attempt, "model").unwrap().is_none(),
+            "{what}: nothing was reserved"
+        );
+        assert!(
+            store.account_view(&aid("emp"), ts(T0 + 6_000)).is_err(),
+            "{what}: the view fails closed too"
+        );
     }
 }
 
@@ -1381,6 +1649,8 @@ struct Reached {
     in_flight_at_check: u32,
     /// 已经发过额度，但此刻额度剩余是 0（花光、到期或被撤销之后），债务仍留着。
     debt_without_allowance: u32,
+    /// 写进表里的毫秒取的是排队之前的旧时间的步骤数（只有抖动的随机历史才有）。
+    stale_stamped: u32,
 }
 
 impl Reached {
@@ -1395,12 +1665,14 @@ impl Reached {
         self.half_settled += other.half_settled;
         self.in_flight_at_check += other.in_flight_at_check;
         self.debt_without_allowance += other.debt_without_allowance;
+        self.stale_stamped += other.stale_stamped;
     }
 }
 
-fn run_random_history(seed: u64, steps: usize) -> Reached {
+/// `jitter`：一部分步骤写进表里的毫秒比提交顺序更早（排队乱序），也会和前一步相同（同毫秒）；先后仍是调用顺序。
+fn run_random_history(seed: u64, steps: usize, jitter: bool) -> Reached {
     const CREDIT: i64 = 200;
-    let db = TempDb::new(&format!("books-random-{seed}"));
+    let db = TempDb::new(&format!("books-random-{seed}-{jitter}"));
     let store = credit_only_world(&db);
     credit_line(&store, "emp", CREDIT, T0);
     let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
@@ -1412,14 +1684,33 @@ fn run_random_history(seed: u64, steps: usize) -> Reached {
     let mut reached = Reached::default();
     for step in 0..steps {
         now += 1_000 * (1 + rng.below(4));
+        // 这一步写进表里的毫秒（额度的创建时间、撤销时间、请求的准入时间）。不抖动时就是 `now`；抖动时三分之一的步骤
+        // 取到的是排队之前的旧时间（最多早 2 秒），所以会比前面已经提交的花费更早，也会和前一步的毫秒相同。
+        let stamp = if jitter && rng.below(3) == 0 {
+            reached.stale_stamped += 1;
+            now - 1_000 * rng.below(3)
+        } else {
+            now
+        };
         match rng.below(10) {
             0 | 1 => {
-                // 新额度：起点在 [now - 2 秒, now + 3 秒]，长度 5 ~ 44 秒，额度 50 / 100 / 150 / 250
-                let from = now + 1_000 * (rng.below(6) - 2);
-                let until = from + 1_000 * (5 + rng.below(40));
+                // 新额度：起点在 [stamp - 2 秒, stamp + 3 秒]，长度 5 ~ 44 秒，额度 50 / 100 / 150 / 250。
+                // 抖动的历史里一半的额度是「迟发、起点倒填」的：起点比创建时刻早 3 ~ 10 秒，窗口里已经有更早的花费，
+                // 它们不是这笔额度覆盖的（只有创建之后提交的花费才可能是）。
+                let backdated = jitter && rng.below(2) == 0;
+                let from = if backdated {
+                    stamp - 1_000 * (3 + rng.below(8))
+                } else {
+                    stamp + 1_000 * (rng.below(6) - 2)
+                };
+                let until = if backdated {
+                    stamp + 1_000 * (5 + rng.below(40))
+                } else {
+                    from + 1_000 * (5 + rng.below(40))
+                };
                 let cap = [50_i64, 100, 150, 250][usize::try_from(rng.below(4)).unwrap()];
                 let id = format!("rnd-{seed}-{step}");
-                prepaid(&store, &id, cap, from, until, now);
+                prepaid(&store, &id, cap, from, until, stamp);
                 allowances.push(id);
             }
             2 => {
@@ -1427,7 +1718,7 @@ fn run_random_history(seed: u64, steps: usize) -> Reached {
                     if model(db.path(), "emp", now).covered > 0 {
                         reached.revoked_after_cover += 1;
                     }
-                    revoke_allocation_at(&db, &id, now);
+                    revoke_allocation_at(&db, &id, stamp);
                     revoked.push(id);
                 }
             }
@@ -1455,7 +1746,7 @@ fn run_random_history(seed: u64, steps: usize) -> Reached {
                 next_request += 1;
                 let max_tokens = [10_u64, 20, 45, 100][usize::try_from(rng.below(4)).unwrap()];
                 let reserve = i64::try_from(10 + 2 * max_tokens).unwrap();
-                let before = model(db.path(), "emp", now);
+                let before = model(db.path(), "emp", stamp);
                 let want = expected_price(&before, CREDIT, reserve);
                 let req = Req::new(
                     &store,
@@ -1464,7 +1755,7 @@ fn run_random_history(seed: u64, steps: usize) -> Reached {
                     "cred-e",
                     max_tokens,
                 )
-                .at(now);
+                .at(stamp);
                 let decision = admit(&store, &req);
                 let got = decision
                     .admitted()
@@ -1517,7 +1808,7 @@ fn run_random_history(seed: u64, steps: usize) -> Reached {
 fn random_histories_agree_with_the_independent_model_and_the_owner_rule() {
     let mut total = Reached::default();
     for seed in [1_u64, 2, 3, 4, 5, 6] {
-        total.add(run_random_history(seed, 50));
+        total.add(run_random_history(seed, 50, false));
     }
     eprintln!("random histories reached: {total:?}");
     // 没有走到这些状态，上面「三方对得上」就没有说服力
@@ -1530,6 +1821,23 @@ fn random_histories_agree_with_the_independent_model_and_the_owner_rule() {
     assert!(total.released >= 3, "{total:?}");
     assert!(total.half_settled >= 3, "{total:?}");
     assert!(total.in_flight_at_check >= 10, "{total:?}");
+    assert!(total.debt_without_allowance >= 10, "{total:?}");
+}
+
+#[test]
+fn random_histories_with_out_of_order_timestamps_still_agree_with_the_independent_model() {
+    // 同样的随机历史，但额度的创建时间、撤销时间、请求的准入时间有三分之一取的是排队之前的旧时间：比前面已经提交的花费更早，
+    // 也会和前一步同一毫秒。先后始终是调用顺序（提交顺序），视图、独立模型、准入决定三方必须仍然对得上，授信占用仍不超过授信额度。
+    let mut total = Reached::default();
+    for seed in [11_u64, 12, 13, 14, 15, 16, 17, 18] {
+        total.add(run_random_history(seed, 60, true));
+    }
+    eprintln!("jittered random histories reached: {total:?}");
+    assert!(total.stale_stamped >= 40, "{total:?}");
+    assert!(total.allowed >= 40, "{total:?}");
+    assert!(total.rejected >= 10, "{total:?}");
+    assert!(total.allowance_and_debt >= 10, "{total:?}");
+    assert!(total.credit_full >= 10, "{total:?}");
     assert!(total.debt_without_allowance >= 10, "{total:?}");
 }
 

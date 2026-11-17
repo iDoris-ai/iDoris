@@ -140,7 +140,7 @@ fn migrations_are_idempotent_and_reopening_keeps_the_data() {
     let store = AttemptStore::open(&path).unwrap();
     let loaded = store.load_request(&rid("req-1")).unwrap().unwrap();
     assert_eq!(loaded, request);
-    // 版本表每个迁移一行（0001、0002），重开不重复应用
+    // 版本表每个迁移一行（0001、0002、0003），重开不重复应用
     let conn = store.lock();
     let versions: i64 = conn
         .query_row(
@@ -149,7 +149,7 @@ fn migrations_are_idempotent_and_reopening_keeps_the_data() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(versions, 2);
+    assert_eq!(versions, 3);
 }
 
 fn tempfile_dir() -> std::path::PathBuf {
