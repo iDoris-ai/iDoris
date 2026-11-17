@@ -16,13 +16,18 @@
 //! # 预留额怎么算：用检查端点的价目表折算
 //!
 //! 检查器给的上界是**上游成本**（`Cost`，供应商币种，比如 USD）。账本要的是付款账户单位的**价**（`Price`，比如 THB），
-//! 两者不能直接换算。规则：检查器同时给出这个上界用到的 token 数（[`ExtraCostEstimate::max_input_tokens`] /
-//! [`ExtraCostEstimate::max_output_tokens`]），这里用**检查端点配置里的 `prices`**（付款单位的价目表，和聊天端点是同一份配置）
-//! 按同样的 token 数算：`amount_for_tokens(价目表[付款单位], 输入 token 上界, 输出 token 上界)`，**向上取整**
-//! （[`USAGE_ROUNDING`]，宁可多占 1 微单位）。检查端点没有付款单位的价目 = 没法计价，失败即关闭（启动时的配置校验会先拒绝
-//! 这种配置，见 `cloud::config`）。
+//! 两者不能直接换算。规则：检查器同时给出这个上界用到的 token 数，**计划里每一次调用各有一份**
+//! （[`ExtraCostEstimate::calls`]；没有逐次清单的旧接口只给总数 [`ExtraCostEstimate::max_input_tokens`] /
+//! [`ExtraCostEstimate::max_output_tokens`]，整体当作一次调用），这里用**检查端点配置里的 `prices`**（付款单位的价目表，
+//! 和聊天端点是同一份配置）按同样的 token 数**逐次调用**算：`amount_for_tokens(价目表[付款单位], 这次调用的输入 token 上界,
+//! 这次调用的输出 token 上界)`，各自**向上取整**（[`USAGE_ROUNDING`]，宁可多占 1 微单位），再相加（[`reserved_price`]）。
+//! 检查端点没有付款单位的价目 = 没法计价，失败即关闭（启动时的配置校验会先拒绝这种配置，见 `cloud::config`）。
 //!
-//! 结算同一张价目表：每次调用的实际 `Usage` 用 `usage_amount(价目表[付款单位], usage)`，各次相加，**封顶在预留额**。
+//! 结算同一张价目表：每次调用的实际 `Usage` 用 `usage_amount(价目表[付款单位], usage)`，**各自取整**，各次相加，**封顶在预留额**。
+//! **预留和结算是同一个取整粒度**（round4-r3 Low）：把全部调用的 token 合并起来只取整一次，会比逐调用结算的总和少最多
+//! 「调用数 - 1」个微单位（两次调用、输入价 0、输出价每百万 token 0.001 单位、每次输出上限 64 个实际用 10 个：合并预留 1 微单位，
+//! 逐次结算 2 微单位，收费被预留额封顶成 1，差额由平台承担）；逐调用取整之后，每次调用的结算不超过它自己的预留（用量没超过上界时），
+//! 所以总预留是总结算的上界，零用量仍收零。
 //! 封顶的原因：检查模型的 tokenizer 和我们的字节估算对不上时，实际可能略超预留；账本对超出预留的部分有 overage 规则
 //! （担保人承担 / 平台损失 / **冻结凭证**），不能让孩子的凭证因为检查模型的估算误差被冻结，超出的部分由平台承担。
 //!
@@ -50,7 +55,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use idoris_compute_contracts::ids::{AttemptId, AttemptIndex, EndpointKey};
-use idoris_compute_contracts::money::Unit;
+use idoris_compute_contracts::money::{MoneyError, Unit};
 use idoris_compute_contracts::pricing::{
     Price, RateCard, USAGE_ROUNDING, amount_for_tokens, usage_amount,
 };
@@ -59,8 +64,8 @@ use idoris_tenancy::accounts::AccountStore;
 use idoris_tenancy::accounts::ledger::{ComponentDecision, LedgerError};
 
 use super::cost::{
-    ExtraCostMeter, ExtraCostOutcome, ExtraCostRefusal, ExtraCostRequest, ExtraCostTicket,
-    SpendItem,
+    ExtraCostEstimate, ExtraCostMeter, ExtraCostOutcome, ExtraCostRefusal, ExtraCostRequest,
+    ExtraCostTicket, SpendItem,
 };
 use crate::cloud::clock::Clock;
 use crate::cloud::config::EndpointRegistry;
@@ -123,6 +128,32 @@ fn error_kind(error: &LedgerError) -> &'static str {
     }
 }
 
+/// 预留额（付款单位的价，纯函数）：计划里的**每一次调用各自**按价目表算价、各自向上取整，再相加。
+///
+/// 和结算（[`charge_for`]：每次调用的 `usage_amount` 各自取整再相加）是同一个取整粒度，所以预留是结算的上界：
+/// 把全部调用的 token 合并起来只取整一次会少最多「调用数 - 1」个微单位。没有逐次清单（`calls` 为空：旧接口只给了总上界）时，
+/// 整体当作一次调用。任何一步溢出都返回错误（调用方失败即关闭）。
+pub fn reserved_price(
+    card: &RateCard<Price>,
+    estimate: &ExtraCostEstimate,
+) -> Result<Price, MoneyError> {
+    if estimate.calls.is_empty() {
+        return amount_for_tokens(
+            card,
+            estimate.max_input_tokens,
+            estimate.max_output_tokens,
+            USAGE_ROUNDING,
+        );
+    }
+    let mut total = Price::zero(card.unit().clone());
+    for call in &estimate.calls {
+        let amount =
+            amount_for_tokens(card, call.input_tokens, call.output_tokens, USAGE_ROUNDING)?;
+        total = total.checked_add(&amount)?;
+    }
+    Ok(total)
+}
+
 /// 结算金额（纯函数，见模块文档的表）。`price_of` 给出某个端点对付款单位的价目表。
 pub(crate) fn charge_for<'a>(
     outcome: &ExtraCostOutcome,
@@ -177,12 +208,7 @@ impl ExtraCostMeter for LedgerExtraCost {
             );
             return Err(ExtraCostRefusal::Unavailable);
         };
-        let Ok(amount) = amount_for_tokens(
-            card,
-            estimate.max_input_tokens,
-            estimate.max_output_tokens,
-            USAGE_ROUNDING,
-        ) else {
+        let Ok(amount) = reserved_price(card, estimate) else {
             eprintln!(
                 "[idoris] safety: request {} stage {stage}: the check cost cannot be priced; failing closed",
                 request.request_id
@@ -263,6 +289,7 @@ mod tests {
     use idoris_compute_contracts::money::Unit;
     use idoris_compute_contracts::pricing::{Cost, Usage};
 
+    use super::super::cost::CallTokens;
     use super::*;
 
     fn thb(micros: i64) -> Price {
@@ -348,6 +375,131 @@ mod tests {
         let outcome = ExtraCostOutcome::Spent(vec![item(Some((40, 6)), false)]);
         let charged = charge_for(&outcome, &thb(5_000), |_| None).micros();
         assert_eq!(charged, 5_000);
+    }
+
+    /// 一个有逐次清单的计划：每一项是 (输入 token 上界, 输出 token 上界)，总数是它们的和。
+    fn planned(calls: &[(u64, u64)]) -> ExtraCostEstimate {
+        ExtraCostEstimate {
+            endpoint: key(),
+            max_cost: Cost::from_micros(Unit::Usd, 1).unwrap(),
+            max_input_tokens: calls.iter().map(|call| call.0).sum(),
+            max_output_tokens: calls.iter().map(|call| call.1).sum(),
+            calls: calls
+                .iter()
+                .map(|&(input_tokens, output_tokens)| CallTokens {
+                    input_tokens,
+                    output_tokens,
+                })
+                .collect(),
+        }
+    }
+
+    fn charge_with(card: &RateCard<Price>, outcome: &ExtraCostOutcome, reserved: &Price) -> i64 {
+        charge_for(outcome, reserved, |endpoint| {
+            (*endpoint == key()).then_some(card)
+        })
+        .micros()
+    }
+
+    #[test]
+    fn the_reservation_rounds_every_call_on_its_own_so_two_calls_are_never_under_reserved() {
+        // round4-r3 Low 的场景：两次 judge 调用，输入价 0，输出价每百万 token 0.001 单位（1000 微单位），
+        // 每次输出上限 64、实际输出 10。
+        let card = RateCard::new(thb(0), thb(1_000), None).unwrap();
+        let estimate = planned(&[(960, 64), (960, 64)]);
+        // 把两次调用合并只取整一次（旧做法）：ceil(128 x 1000 / 1e6) = 1
+        let merged = amount_for_tokens(&card, 1_920, 128, USAGE_ROUNDING).unwrap();
+        assert_eq!(merged.micros(), 1);
+        // 逐次取整再相加：2 x ceil(64 x 1000 / 1e6) = 2
+        let reserved = reserved_price(&card, &estimate).unwrap();
+        assert_eq!(reserved.micros(), 2);
+        // 结算逐次取整：2 x ceil(10 x 1000 / 1e6) = 2，没有被预留额封顶，付款账户付的是真实的 2
+        let spent =
+            ExtraCostOutcome::Spent(vec![item(Some((0, 10)), false), item(Some((0, 10)), false)]);
+        assert_eq!(charge_with(&card, &spent, &reserved), 2);
+        // 对照：旧的合并预留（1）会把同一笔结算封顶成 1，差额由平台承担
+        assert_eq!(charge_with(&card, &spent, &merged), 1);
+    }
+
+    #[test]
+    fn the_per_call_reservation_bounds_the_per_call_settlement_for_any_price_and_any_usage_within_the_bound()
+     {
+        // 一般性：任意价目、1 到 5 次调用，只要每次调用的实际用量不超过它自己的上界，结算的各次之和就不超过预留
+        for (input_rate, output_rate) in [
+            (0, 1_000),
+            (1, 1),
+            (7, 13),
+            (333_333, 777_777),
+            (260_000, 380_000),
+            (10_000_000, 40_000_000),
+        ] {
+            let card = RateCard::new(thb(input_rate), thb(output_rate), None).unwrap();
+            for call_count in 1..=5u64 {
+                let bounds: Vec<(u64, u64)> = (0..call_count)
+                    .map(|index| (960 + 37 * index, 64 + index))
+                    .collect();
+                let reserved = reserved_price(&card, &planned(&bounds)).unwrap();
+                for (numerator, denominator) in [(0, 1), (1, 64), (1, 3), (1, 2), (63, 64), (1, 1)]
+                {
+                    let items: Vec<SpendItem> = bounds
+                        .iter()
+                        .map(|&(input, output)| {
+                            item(
+                                Some((
+                                    input * numerator / denominator,
+                                    output * numerator / denominator,
+                                )),
+                                false,
+                            )
+                        })
+                        .collect();
+                    let summed: i64 = items
+                        .iter()
+                        .map(|spend| {
+                            usage_amount(&card, spend.usage.as_ref().unwrap(), USAGE_ROUNDING)
+                                .unwrap()
+                                .micros()
+                        })
+                        .sum();
+                    assert!(
+                        summed <= reserved.micros(),
+                        "rates {input_rate}/{output_rate}, {call_count} calls, usage {numerator}/{denominator}: settled {summed} > reserved {}",
+                        reserved.micros()
+                    );
+                    // 没有被封顶：收的就是各次之和
+                    assert_eq!(
+                        charge_with(&card, &ExtraCostOutcome::Spent(items), &reserved),
+                        summed
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn zero_reported_usage_is_still_charged_zero_however_many_calls_were_reserved() {
+        let card = RateCard::new(thb(10_000_000), thb(40_000_000), None).unwrap();
+        let reserved =
+            reserved_price(&card, &planned(&[(960, 64), (1_200, 64), (960, 64)])).unwrap();
+        assert!(reserved.micros() > 0);
+        let zero = ExtraCostOutcome::Spent(vec![
+            item(Some((0, 0)), false),
+            item(Some((0, 0)), false),
+            item(Some((0, 0)), false),
+        ]);
+        assert_eq!(charge_with(&card, &zero, &reserved), 0);
+    }
+
+    #[test]
+    fn an_estimate_without_a_per_call_list_is_priced_as_one_call() {
+        // 旧接口只给总上界（没有逐次清单）：整体当作一次调用，和之前一样
+        let card = RateCard::new(thb(0), thb(1_000), None).unwrap();
+        let mut estimate = planned(&[(960, 64), (960, 64)]);
+        estimate.calls.clear();
+        assert_eq!(reserved_price(&card, &estimate).unwrap().micros(), 1);
+        // 一次调用的清单和没有清单是同一个价
+        let one = planned(&[(1_920, 128)]);
+        assert_eq!(reserved_price(&card, &one).unwrap().micros(), 1);
     }
 
     #[test]
