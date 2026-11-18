@@ -54,7 +54,7 @@
 //! | `/pairing/codes` | 创建配对码（响应里有一次性明文码） | `issue_credential` × 成员关系的付款账户 |
 //! | `/pairing/codes/{id}/revoke` | 撤销还没兑换的码 | 同上 |
 //! | `/pairing/redeem` | 兑换配对码（**不带凭证，码本身是凭据**；限速先占名额再查库，一分钟最多 20 次「猜错」） | 无；码有效、未过期、签发者的凭证行和验证器都仍有效、设备名额没满 |
-//! | `/pairing/unpair` | 设备解绑自己 | 无管理权限，只能撤销**自己**这张设备凭证 |
+//! | `/pairing/unpair` | 设备解绑自己 | 无管理权限，只能撤销**自己**这张设备凭证；凭证已过期 / 已撤销 / 已冻结的设备调不了（`credential_expired` 等），过期的本来就不占名额 |
 //!
 //! 读（`GET`，授权 `read` × 被查询的账户，不写审计）：`/whoami`、`/accounts/{id}`、`/accounts/{id}/subtree`、
 //! `/accounts/{id}/allocations`、`/accounts/{id}/credentials`、`/accounts/{id}/memberships`、`/principals/{id}`、

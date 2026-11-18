@@ -3564,3 +3564,60 @@ fn the_operator_command_exists_only_in_the_organization_and_cloud_forms() {
         );
     }
 }
+
+#[tokio::test]
+async fn a_caller_without_the_operation_gets_the_same_http_answer_for_an_existing_and_a_missing_id()
+{
+    // issue #603 N7：撤销成员关系 / 撤销额度 / 改凭证状态是按 id 查的写操作。没有这个操作权限的调用者（reader 只有 read），
+    // 对「自己组织的」「别的组织的」「不存在的」id 必须得到逐字节相同的回答（状态码、头、正文，只有每次请求都不一样的
+    // 关联 id 除外），不能靠状态码或文案探测别的组织有哪些 id。
+    let world = World::new();
+    world.people().await;
+    let (root, reader) = (world.root.secret.clone(), world.reader.secret.clone());
+    let grant = json!({"allocation_id": "g1", "parent": "teacher", "child": "s1",
+        "amount": {"unit": "THB", "micros": 2_000_000}, "purpose": "prepaid",
+        "valid_from_ms": T0, "valid_until_ms": T0 + DAY_MS});
+    world.ok("/control/v1/allocations", &root, grant).await;
+
+    type Call = (String, Option<Value>);
+    let probes: Vec<(&str, Vec<Call>)> = vec![
+        (
+            "revoke membership",
+            ["m-kid1", "m-nope-1", "m-nope-2"]
+                .iter()
+                .map(|id| (format!("/control/v1/memberships/{id}/revoke"), None))
+                .collect(),
+        ),
+        (
+            "revoke allocation",
+            ["g1", "g-nope-1", "g-nope-2"]
+                .iter()
+                .map(|id| (format!("/control/v1/allocations/{id}/revoke"), None))
+                .collect(),
+        ),
+        (
+            "credential status",
+            [world.root.id.as_str(), "k-nope-1", "k-nope-2"]
+                .iter()
+                .map(|id| {
+                    (
+                        format!("/control/v1/credentials/{id}/status"),
+                        Some(json!({"status": "revoked"})),
+                    )
+                })
+                .collect(),
+        ),
+    ];
+    for (label, calls) in probes {
+        let mut answers = Vec::new();
+        for (path, body) in calls {
+            let reply = world.call("POST", &path, Some(&reader), body).await;
+            assert!(!reply.status.is_success(), "{label} {path}: {}", reply.raw);
+            answers.push(answer_without_the_correlation_id(&reply));
+        }
+        assert!(
+            answers.iter().all(|answer| *answer == answers[0]),
+            "{label}: an existing and a missing id must be indistinguishable: {answers:?}"
+        );
+    }
+}

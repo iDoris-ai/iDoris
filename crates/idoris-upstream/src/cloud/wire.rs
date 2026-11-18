@@ -11,7 +11,7 @@
 //!   由运维写死、盖在客户端字段之上，客户端改不了；**但 `extra_body` 自己也不能碰协议 / 计费 / 身份 / 留存字段**
 //!   （[`RESERVED_EXTRA_BODY_FIELDS`]：`model`、`max_tokens`、`stream`、`n`、`messages`、`tools`、`user`、`store`……）：
 //!   它们决定「发给哪个模型、最多花多少钱、带不带身份、上游留不留存」，是准入与许可检查的前提，配置加载时就拒绝
-//!   （[`reserved_extra_body_field`]），构造请求时这些字段最后写入、永远是准入时算好的值；
+//!   （[`disallowed_extra_body_field`]），构造请求时这些字段最后写入、永远是准入时算好的值；
 //! - 不能让客户端改变计费倍数：`n` 必须是 1（调用方在构造前拒绝），`logprobs` 之类不转发。
 //!
 //! 一定覆盖的字段（**最后写入**，在客户端字段和 `extra_body` 之后）：`model`（端点自己的模型 id，不是客户端用的别名）、
@@ -88,12 +88,44 @@ pub const RESERVED_EXTRA_BODY_FIELDS: &[&str] = &[
     "safety_identifier",
 ];
 
-/// `extra_body` 里第一个保留字段（按 [`RESERVED_EXTRA_BODY_FIELDS`] 的顺序）；没有返回 `None`。配置加载时用它拒绝。
-pub fn reserved_extra_body_field(extra_body: &Map<String, Value>) -> Option<&'static str> {
-    RESERVED_EXTRA_BODY_FIELDS
+/// 端点配置的 `extra_body` 允许的顶层键（**白名单**）：只有 `provider`，且里面只能是 [`ALLOWED_EXTRA_BODY_PROVIDER_KEYS`]。
+/// 查实际用到的：`config/compute/` 的正式许可表与示例配置里没有任何端点写 `extra_body`；配置加载测试和传输测试里
+/// 只出现过 `provider: {zdr: true, allow_fallbacks: false}`。聚合路由的 `models` / `route` / `plugins` / `reasoning` /
+/// `web_search_options` / `provider.order` 等会改变「实际落到哪个模型 / 哪家下游 / 带不带联网与插件」，
+/// 与端点许可表核验的对象不是同一回事，所以不收。要加新键，先改许可表与设计稿，再改这里。
+pub const ALLOWED_EXTRA_BODY_FIELDS: &[&str] = &["provider"];
+
+/// `extra_body.provider` 里允许的键（值必须是布尔）：`zdr`（只走零留存的下游）、`allow_fallbacks`（不许悄悄换下游）。
+pub const ALLOWED_EXTRA_BODY_PROVIDER_KEYS: &[&str] = &["zdr", "allow_fallbacks"];
+
+/// `extra_body` 里第一个不被允许的键（点号路径，比如 `model`、`models`、`provider.order`）；全部合规返回 `None`。
+/// 配置加载时用它拒绝。先查保留字段（协议 / 计费 / 身份 / 留存），再按白名单查其余。
+pub fn disallowed_extra_body_field(extra_body: &Map<String, Value>) -> Option<String> {
+    if let Some(field) = RESERVED_EXTRA_BODY_FIELDS
         .iter()
         .copied()
         .find(|field| extra_body.contains_key(*field))
+    {
+        return Some(field.to_string());
+    }
+    for (key, value) in extra_body {
+        if !ALLOWED_EXTRA_BODY_FIELDS.contains(&key.as_str()) {
+            return Some(key.clone());
+        }
+        if key == "provider" {
+            let Some(provider) = value.as_object() else {
+                return Some(key.clone());
+            };
+            for (inner, inner_value) in provider {
+                if !ALLOWED_EXTRA_BODY_PROVIDER_KEYS.contains(&inner.as_str())
+                    || !inner_value.is_boolean()
+                {
+                    return Some(format!("provider.{inner}"));
+                }
+            }
+        }
+    }
+    None
 }
 
 /// 构造请求体的错误。信息里没有请求内容。
@@ -174,10 +206,12 @@ pub fn build_chat_body(call: &ChatCall<'_>) -> Result<Vec<u8>, BuildError> {
         }
         body.insert(field.to_string(), value.clone());
     }
-    // 端点级固定字段盖在客户端字段之上（比如聚合路由的「只走 ZDR」路由参数）。保留字段一个都不收：配置加载时
-    // 已经拒绝（`reserved_extra_body_field`），这里再跳过一遍，绕过配置校验直接构造设置的调用方也改不了它们。
+    // 端点级固定字段盖在客户端字段之上（比如聚合路由的「只走 ZDR」路由参数）。保留字段与白名单外的键一个都不收：配置加载时
+    // 已经拒绝（`disallowed_extra_body_field`），这里再跳过一遍，绕过配置校验直接构造设置的调用方也改不了它们。
     for (key, value) in call.extra_body {
-        if RESERVED_EXTRA_BODY_FIELDS.contains(&key.as_str()) {
+        if RESERVED_EXTRA_BODY_FIELDS.contains(&key.as_str())
+            || !ALLOWED_EXTRA_BODY_FIELDS.contains(&key.as_str())
+        {
             continue;
         }
         body.insert(key.clone(), value.clone());
@@ -457,17 +491,20 @@ mod tests {
     fn the_reserved_field_check_names_the_first_offender_and_passes_provider_routing() {
         let extra = |value: Value| value.as_object().unwrap().clone();
         assert_eq!(
-            reserved_extra_body_field(&extra(json!({"provider": {"zdr": true}, "top_k": 40}))),
+            disallowed_extra_body_field(&extra(json!({"provider": {"zdr": true}}))),
             None
         );
         assert_eq!(
-            reserved_extra_body_field(&extra(json!({"provider": {}, "model": "x"}))),
-            Some("model")
+            disallowed_extra_body_field(&extra(json!({"provider": {}, "model": "x"}))),
+            Some("model".to_string())
         );
         for field in RESERVED_EXTRA_BODY_FIELDS {
             let mut one = Map::new();
             one.insert((*field).to_string(), json!(1));
-            assert_eq!(reserved_extra_body_field(&one), Some(*field));
+            assert_eq!(
+                disallowed_extra_body_field(&one),
+                Some((*field).to_string())
+            );
         }
         // 客户端能发的白名单字段里，协议 / 计费相关的都在保留表里
         for field in [
@@ -593,5 +630,50 @@ mod tests {
                 "response_no_choices"
             ]
         );
+    }
+
+    /// issue #603 N6：`extra_body` 是白名单。聚合路由的 `models` / `route` / `plugins` / `reasoning` /
+    /// `web_search_options` / `provider.order` 等不在保留表里、但能改变实际路由与能力，加载时一律拒绝；
+    /// 正当的 `provider: {zdr, allow_fallbacks}`（真实配置里唯一用到的）照常通过。
+    #[test]
+    fn extra_body_is_an_allow_list_not_a_deny_list() {
+        let extra = |value: Value| value.as_object().unwrap().clone();
+        for (body, offender) in [
+            (json!({"models": ["a", "b"]}), "models"),
+            (json!({"route": "fallback"}), "route"),
+            (json!({"plugins": [{"id": "web"}]}), "plugins"),
+            (json!({"reasoning": {"effort": "high"}}), "reasoning"),
+            (json!({"web_search_options": {}}), "web_search_options"),
+            (json!({"transforms": ["middle-out"]}), "transforms"),
+            (json!({"top_k": 40}), "top_k"),
+            (json!({"provider": {"order": ["x"]}}), "provider.order"),
+            (
+                json!({"provider": {"zdr": true, "only": ["x"]}}),
+                "provider.only",
+            ),
+            (json!({"provider": {"zdr": "yes"}}), "provider.zdr"),
+            (json!({"provider": "x"}), "provider"),
+        ] {
+            assert_eq!(
+                disallowed_extra_body_field(&extra(body.clone())),
+                Some(offender.to_string()),
+                "{body}"
+            );
+        }
+        assert_eq!(
+            disallowed_extra_body_field(&extra(
+                json!({"provider": {"zdr": true, "allow_fallbacks": false}})
+            )),
+            None
+        );
+        assert_eq!(disallowed_extra_body_field(&Map::new()), None);
+        // 构造请求时也不带白名单外的键（绕过加载校验直接构造的调用方同样改不了）
+        let body = build(
+            json!({"messages": [{"role": "user", "content": "x"}]}),
+            false,
+            json!({"provider": {"zdr": true}, "models": ["a"], "plugins": [1]}),
+        );
+        assert_eq!(body["provider"], json!({"zdr": true}));
+        assert!(body.get("models").is_none() && body.get("plugins").is_none());
     }
 }

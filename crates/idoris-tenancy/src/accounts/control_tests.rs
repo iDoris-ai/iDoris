@@ -3886,3 +3886,174 @@ fn a_credential_issued_by_the_control_plane_authenticates_through_the_regular_ke
         super::GateVerdict::Allowed
     );
 }
+
+// ------------------------------------------------------------------------------------------------
+// issue #603 N7：按 id 查的写操作，「存在」与「不存在」对无权调用者不可区分
+// ------------------------------------------------------------------------------------------------
+
+/// 建成员关系：外部组织拿别的组织的成员关系 id 去建（付款账户是自己的），旧代码在「调用者是不是主体的归属方」之前就报
+/// `already_exists`，靠它能探测别的组织有哪些成员关系 id。现在先判可见性：不是归属方的调用者，对已有的 id 和不存在的 id
+/// 得到同一个（无细节的）`out_of_scope`。
+#[test]
+fn creating_a_membership_never_probes_whether_a_membership_id_exists_for_an_outsider() {
+    let env = Env::new();
+    env.tree();
+    let other = env.issue_as_operator(Issue::service("school-b", all_ops("school-b", 1)));
+    env.store
+        .create_account(
+            &Account {
+                id: aid("acct-b2"),
+                kind: AccountKind::Member,
+                parent: Some(aid("school-b")),
+                unit: Unit::Thb,
+                status: AccountStatus::Active,
+            },
+            ts(T0),
+        )
+        .unwrap();
+    let create = |id: &str, principal: &str| {
+        let rid = env.rid();
+        env.store
+            .control_create_membership(
+                &other.who(),
+                &env.meta(T0 + 1, &rid),
+                &CreateMembership {
+                    membership: Membership {
+                        id: mid(id),
+                        principal: pid(principal),
+                        org: aid("school-b"),
+                        role: MembershipRole::Member,
+                        account: Some(aid("acct-b2")),
+                        status: MembershipStatus::Active,
+                    },
+                },
+            )
+            .expect_err("an outsider attaching a principal it does not own must be refused")
+    };
+    // m-kid1 是 eduai 的成员关系（已有），kid1 是 eduai 的主体；m-probe-missing 不存在
+    let existing = create("m-kid1", "kid1");
+    let missing = create("m-probe-missing", "kid1");
+    assert_eq!(existing, missing, "{existing:?} vs {missing:?}");
+    assert_eq!(existing, Failure::new(ControlReason::OutOfScope));
+    // 对照：管得到它的人（eduai 的管理员）重发同一个成员关系仍是 replayed，定义不同仍是 already_exists
+    let root = env.issue_as_operator(Issue::service("eduai", all_ops("eduai", 1)));
+    assert_eq!(
+        Action::CreateMembership {
+            id: "m-kid1",
+            principal: "kid1",
+            org: "eduai",
+            account: "s1"
+        }
+        .run(&env, &root.who(), T0 + 2),
+        Ok(WriteResult::Replayed)
+    );
+    assert_eq!(
+        Action::CreateMembership {
+            id: "m-kid1",
+            principal: "kid1",
+            org: "eduai",
+            account: "s2"
+        }
+        .run(&env, &root.who(), T0 + 3),
+        Err(ControlReason::AlreadyExists)
+    );
+}
+
+/// 撤销成员关系 / 撤销额度 / 改凭证状态：没有这个操作权限的调用者，目标存在、在别的组织、不存在，得到同一个失败
+/// （旧代码：不存在的目标在授权判定之前就是 `out_of_scope`，已有的是 `op_not_granted`）。
+#[test]
+fn id_keyed_writes_do_not_tell_a_caller_without_the_operation_whether_the_id_exists() {
+    let env = Env::new();
+    env.tree();
+    env.allocation_chain();
+    // 只有 read：三个操作都没有
+    let reader = env.issue_as_operator(Issue::service(
+        "eduai",
+        vec![sc(ControlOp::Read, "eduai", None)],
+    ));
+    let victim = env.issue_as_operator(Issue::service("school-b", all_ops("school-b", 1)));
+    let expected = Failure::new(ControlReason::OpNotGranted);
+    // 成员关系：m-kid1（自己的）、m-kb1（别的组织）、m-ghost
+    for id in ["m-kid1", "m-kb1", "m-ghost"] {
+        let rid = env.rid();
+        let got = env
+            .store
+            .control_revoke_membership(
+                &reader.who(),
+                &env.meta(T0 + 1, &rid),
+                &RevokeMembership {
+                    membership: mid(id),
+                },
+            )
+            .map(|_| ());
+        assert_eq!(got, Err(expected.clone()), "revoke_membership {id}");
+    }
+    // 额度：a-teacher（自己的）、a-b（别的组织）、a-ghost
+    for id in ["a-teacher", "a-b", "a-ghost"] {
+        let rid = env.rid();
+        let got = env
+            .store
+            .control_revoke_allocation(
+                &reader.who(),
+                &env.meta(T0 + 1, &rid),
+                &RevokeAllocation {
+                    id: AllocationId::new(id).unwrap(),
+                },
+            )
+            .map(|_| ());
+        assert_eq!(got, Err(expected.clone()), "revoke_allocation {id}");
+    }
+    // 凭证：reader 自己的、别的组织的、不存在的；撤销与冻结两种
+    for status in [CredentialStatus::Revoked, CredentialStatus::Frozen] {
+        for id in [
+            reader.id().to_string(),
+            victim.id().to_string(),
+            "k-ghost".to_string(),
+        ] {
+            let rid = env.rid();
+            let got = env
+                .store
+                .control_set_credential_status(
+                    &reader.who(),
+                    &env.meta(T0 + 1, &rid),
+                    &SetCredentialStatus {
+                        credential: cid(&id),
+                        status,
+                    },
+                )
+                .map(|_| ());
+            assert_eq!(
+                got,
+                Err(expected.clone()),
+                "set_credential_status {status:?} {id}"
+            );
+        }
+    }
+    // 对照：有操作权限的调用者，范围外和不存在仍然是同一个 out_of_scope；范围内的照常
+    let edu = env.issue_as_operator(Issue::service("eduai", all_ops("eduai", 1_000_000_000)));
+    for (action, label) in [
+        (
+            Action::RevokeMembership { id: "m-kb1" },
+            "foreign membership",
+        ),
+        (
+            Action::RevokeMembership { id: "m-ghost" },
+            "missing membership",
+        ),
+        (Action::RevokeAllocation { id: "a-b" }, "foreign allocation"),
+        (
+            Action::RevokeAllocation { id: "a-ghost" },
+            "missing allocation",
+        ),
+    ] {
+        assert_eq!(
+            action.run(&env, &edu.who(), T0 + 2),
+            Err(ControlReason::OutOfScope),
+            "{label}"
+        );
+    }
+    assert_eq!(
+        Action::RevokeMembership { id: "m-kid1" }.run(&env, &edu.who(), T0 + 3),
+        Ok(WriteResult::Updated)
+    );
+}
