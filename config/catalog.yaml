@@ -23,6 +23,9 @@
 #     @idoris/contracts 的 LoadPolicy.mode=on_demand（catalog 尚未直接建模完整
 #     LoadPolicy，先用这个薄字段占位；**目前没有代码读取 load_hint**，纯声明）。
 #   min_ram_gb: 硬门槛，ram_gb < min_ram_gb 一律 BLOCKED（docs/13 §9.2 ①）
+#   omlx_id / kind: 可选，接口规范 §2.9（wire 1.2.0）。omlx_id 是 oMLX 模型目录名（~/.omlx/models/<omlx_id>，
+#     也是 /v1/chat/completions 的 model 值）；kind ∈ chat|vision|embedding|rerank|image|ocr|tts|unknown。
+#     只供「本机 chat 模型推荐 / 本地模型列表」使用；不参与角色路由，也不进自动推荐。
 #   status: experiment 的条目不进自动推荐（docs/13 §1.4 Ornith 系警告）
 #
 # 已知冲突（T4.2 评审 M4，本 PR 不改推荐结果，只记录）：
@@ -173,6 +176,8 @@ catalog:
 
 - id: qwen3-8b
   family: qwen
+  omlx_id: Qwen3-8B-4bit
+  kind: chat
   params_total_b: 8.19
   params_active_b: 8.19
   arch: {n_layers: 36, n_kv_heads: 8, head_dim: 128}
@@ -203,6 +208,8 @@ catalog:
 
 - id: qwen3.6-35b-a3b
   family: qwen
+  omlx_id: Qwen3.6-35B-A3B-OptiQ-4bit
+  kind: chat
   params_total_b: 35
   params_active_b: 3
   arch: {n_layers: 40, n_kv_heads: 2, head_dim: 256}
@@ -219,6 +226,8 @@ catalog:
 
 - id: qwen3.8-27b
   family: qwen
+  omlx_id: Qwen3.8-27B-OptiQ-4bit
+  kind: chat
   params_total_b: 27
   params_active_b: 27
   arch: {n_layers: 64, n_kv_heads: 4, head_dim: 256}

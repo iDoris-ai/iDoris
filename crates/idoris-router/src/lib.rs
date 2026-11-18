@@ -71,6 +71,7 @@ pub mod key_issue;
 pub mod key_manage;
 /// Stable four-way routing/audit reason taxonomy.
 pub mod reason;
+pub mod recommendation;
 /// Deployment form (`IDORIS_FORM`) wired into start-up (compute service S1).
 pub mod startup_form;
 /// Persistent record/budget storage bootstrap (B1 task18).
@@ -288,6 +289,9 @@ pub struct AppState {
     /// Capacity surface provider. `None` is deliberately unavailable rather
     /// than a fake static snapshot; task33 installs the live implementation.
     pub capabilities: Option<Arc<dyn capabilities::CapabilitiesProvider>>,
+    /// 接口规范 §2.9（wire 1.2.0）：`GET /v1/recommendation`、`GET /v1/models/local` 的数据源。
+    /// `None`（默认）时两条路由返回 503 `recommendation_unavailable`；只读，不改任何状态。
+    pub local_chat: Option<Arc<recommendation::LocalChatSource>>,
     /// Authorized subscription CLI runtimes. Empty means default-off/disabled.
     pub subscriptions: subscription::runtime::SubscriptionRuntimeRegistry,
     /// R2-G: direct-forward path for a `LoadMode::Resident` `http_service`
@@ -397,6 +401,7 @@ impl Default for AppState {
             audit_failures: Arc::new(AtomicU64::new(0)),
             models_health: Arc::new(health::HealthTracker::default()),
             capabilities: None,
+            local_chat: None,
             subscriptions: subscription::runtime::SubscriptionRuntimeRegistry::default(),
             proxy: Arc::new(proxy::ChatProxy::new(http_client.clone())),
             cloud: None,
@@ -444,6 +449,14 @@ pub fn build_app(state: AppState) -> Router {
     let app = Router::new()
         .route("/health", get(health))
         .route("/v1/models", get(list_models).fallback(not_found))
+        .route(
+            "/v1/models/local",
+            get(recommendation::get_local_models).fallback(not_found),
+        )
+        .route(
+            "/v1/recommendation",
+            get(recommendation::get_recommendation).fallback(not_found),
+        )
         .route("/capabilities", get(get_capabilities).fallback(not_found))
         .route(
             "/idoris/tenants/{tenant_id}/usage",
@@ -4207,6 +4220,8 @@ mod tests {
         });
         let routes = [
             ("GET", "/v1/models"),
+            ("GET", "/v1/models/local"),
+            ("GET", "/v1/recommendation?role=chat"),
             ("GET", "/capabilities"),
             ("GET", "/idoris/tenants/acme/usage"),
             ("GET", "/idoris/tenants/acme/audit"),

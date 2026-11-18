@@ -156,6 +156,19 @@ async fn real_main() -> u8 {
                 }
             }
         }
+        // 接口规范 §2.9：只读本机文件系统，不开数据库、不取实例锁、不连 oMLX、不读任何密钥。
+        cli::Command::Recommend(options) => {
+            if let Err(message) = run_recommend(options) {
+                eprintln!("[idoris] {message}");
+                return 1;
+            }
+        }
+        cli::Command::ModelsLocal => {
+            if let Err(message) = run_models_local() {
+                eprintln!("[idoris] {message}");
+                return 1;
+            }
+        }
         cli::Command::Key(command) => {
             if let Err(message) = run_key_command(command) {
                 eprintln!("[idoris] {message}");
@@ -229,6 +242,43 @@ fn run_key_command(command: cli::KeyCommand) -> Result<(), String> {
 }
 
 const ALLOCATED_BUDGET_ENV: &str = "IDORIS_ALLOCATED_BUDGET_BYTES";
+
+/// 推荐 / 本地模型列表的数据源：目录取 `IDORIS_CATALOG`（默认可执行文件旁的 `config/catalog.yaml`），
+/// 模型目录取 `$HOME/.omlx/models`。这里不碰数据库、实例锁、oMLX 或任何密钥。
+fn local_chat_source(
+    allocated_budget_bytes: Option<u64>,
+) -> Result<idoris_router::recommendation::LocalChatSource, String> {
+    let catalog_path = config::resolve_env("IDORIS_CATALOG", "config/catalog.yaml")?;
+    let home = std::env::var_os("HOME")
+        .filter(|home| !home.is_empty())
+        .ok_or_else(|| "HOME 未设置，无法定位 ~/.omlx/models".to_string())?;
+    idoris_router::recommendation::LocalChatSource::probe(
+        &catalog_path,
+        std::path::Path::new(&home),
+        allocated_budget_bytes,
+    )
+}
+
+fn print_json_line(value: &serde_json::Value) -> Result<(), String> {
+    use std::io::Write;
+    writeln!(std::io::stdout().lock(), "{value}")
+        .map_err(|error| format!("写 stdout 失败：{error}"))
+}
+
+fn run_recommend(options: cli::RecommendOptions) -> Result<(), String> {
+    if options.role != "chat" {
+        return Err("unsupported_role：本版只支持 --role chat".to_string());
+    }
+    let budget = match options.allocated_budget_bytes {
+        Some(bytes) => Some(bytes),
+        None => parse_allocated_budget(std::env::var_os(ALLOCATED_BUDGET_ENV).as_deref())?,
+    };
+    print_json_line(&local_chat_source(budget)?.recommendation_json()?)
+}
+
+fn run_models_local() -> Result<(), String> {
+    print_json_line(&local_chat_source(None)?.local_models_json()?)
+}
 
 fn parse_allocated_budget(raw: Option<&std::ffi::OsStr>) -> Result<Option<u64>, String> {
     raw.map(|value| {
@@ -505,6 +555,16 @@ async fn run(options: cli::ServeOptions) -> Result<(), String> {
         }
     };
 
+    // 接口规范 §2.9 的只读推荐 / 本地模型列表。探测不到（没有 HOME、探不到内存）只让这两条路由返回 503，
+    // 不影响其他功能。
+    let local_chat = match local_chat_source(allocated_budget_bytes) {
+        Ok(source) => Some(Arc::new(source)),
+        Err(error) => {
+            eprintln!("[idoris] recommendation unavailable: {error}");
+            None
+        }
+    };
+
     let component_list = cards
         .iter()
         .map(|c| format!("{}({:?})", c.provider.id, c.form))
@@ -516,6 +576,7 @@ async fn run(options: cli::ServeOptions) -> Result<(), String> {
         routing_policy,
         runtimes,
         capabilities,
+        local_chat,
         subscriptions: subscriptions.clone(),
         budget_ledger: Some(persistent.budget),
         record_store: Some(persistent.records),

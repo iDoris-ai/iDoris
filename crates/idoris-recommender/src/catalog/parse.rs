@@ -39,6 +39,9 @@ pub fn parse_catalog(raw: &Value) -> Result<Catalog, CatalogError> {
         ),
     };
 
+    // §2.9 的 omlx_id / kind 不进 CatalogModel，但非法值在加载目录时就要拒绝。
+    super::omlx::parse_omlx_bindings(raw)?;
+
     Ok(Catalog {
         version,
         catalog,
