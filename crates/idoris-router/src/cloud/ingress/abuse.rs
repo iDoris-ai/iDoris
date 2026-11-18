@@ -6,6 +6,9 @@
 //!
 //! 1. **资格 = 凭证。** 带着有效凭证的请求，不论它从哪个地址来、这个地址刚刚有多少人认证失败，都不会被任何
 //!    和来源地址有关的东西拦住。三级上限（`limits`）的键全部来自凭证推导出来的身份，没有地址。
+//!    **唯一的例外是「冷」的凭证**（还没认证成功过：刚签发、进程重启之后、被挤出「已知」表）：认证之前分不出它和随机假凭证，
+//!    只能和同一个来源上其它「没认证成功过」的请求共用这个来源在 [`AuthBudget`] 里的份额（#603 N4，设计稿 S5-12）。
+//!    它认证成功一次，之后就是「已知」的，永远不再看来源。
 //! 2. **地址只用在「没有资格的请求」上。** 没有凭证（或凭证格式根本不对）的请求没有任何人需要保护，
 //!    对它们按来源地址分一个软配额；这个软配额是**速率**，不是封禁：窗口过去就恢复，不记仇，不影响同一个地址上
 //!    带着有效凭证的请求。
@@ -16,7 +19,7 @@
 //! |---|---|---|---|
 //! | [`AnonymousLimiter`] | 没有凭证、或者认证失败的请求 | 来源地址（IPv6 取 /64）的软配额 + 全局总配额 | 防扫描、防海量垃圾请求把入口占满。**永远不会被带着有效凭证的请求碰到。** |
 //! | [`FailureThrottle`] | 带着格式正确、但认证失败的凭证的请求 | **凭证前缀**（凭证明文 `idk_` 之后的前 16 个十六进制字符，64 位，加盐哈希之后做键） | 防爆破，也防一个带着已撤销凭证死循环重试的客户端把库打满。同一个前缀在窗口内失败太多次，之后同前缀的请求先在内存里被拒绝，不碰数据库。 |
-//! | [`AuthBudget`] | **每一个**要开始认证查询的请求（认证**之前**） | 没有键：全局的在途个数 + 「最近没有认证成功过的凭证前缀」的查询预算 | 防**随机假凭证**：攻击者持续发格式合法、前缀各不相同的凭证，上面两个限流器都只在认证**失败之后**才计数，每个假凭证照样进 `spawn_blocking`、抢认证存储的锁、查一次 SQLite。这里把「认证查询」本身的并发和总量卡住，满了直接拒绝、不碰库。 |
+//! | [`AuthBudget`] | **每一个**要开始认证查询的请求（认证**之前**） | 全局的在途个数 + 「最近没有认证成功过的凭证前缀」的全局查询预算（总闸）+ 同样条件下**按来源**的份额（来源地址，IPv6 取 /64；先扣份额、再扣总闸） | 防**随机假凭证**：攻击者持续发格式合法、前缀各不相同的凭证，上面两个限流器都只在认证**失败之后**才计数，每个假凭证照样进 `spawn_blocking`、抢认证存储的锁、查一次 SQLite。这里把「认证查询」本身的并发和总量卡住，满了直接拒绝、不碰库；按来源的份额让一个来源耗不光总闸，别的来源冷的合法凭证不会跟着被拒。 |
 //!
 //! 失败计数**不按纯 IP**：按凭证前缀。一个学校里一个学生把密钥输错，只会让「这个错的密钥」被限流，同一个出口后面
 //! 其他学生的密钥（前缀不同）完全不受影响。
@@ -31,8 +34,10 @@
 //!
 //! # 表的大小
 //!
-//! 两张表的键（地址、前缀）有一部分来自攻击者，所以都是 [`Bounded`]：满了先丢空闲条目，再丢最老的，
-//! 内存用量不由攻击者决定（见 `bucket`）。
+//! 这些表的键（地址、前缀）有一部分来自攻击者，所以都是 [`Bounded`]：满了先丢空闲条目，再丢最老的，
+//! 内存用量不由攻击者决定（见 `bucket`）。「最老」有两种：来源软配额表和失败计数表按进表先后（`Bounded::new`）；
+//! `AuthBudget` 的两张表（按来源的份额、最近认证成功过的前缀）按最近使用（`Bounded::lru`）——热的条目每次取用都刷新，
+//! 不会因为表被别的键挤满就被第一个丢掉。
 
 use std::collections::hash_map::RandomState;
 use std::hash::BuildHasher;
@@ -121,26 +126,38 @@ impl AnonymousLimiter {
 /// 最近认证成功过的凭证前缀表的容量。
 const MAX_KNOWN_ENTRIES: usize = 16_384;
 
-/// 认证之前的有界工作（R2 High#4）：见模块文档。
+/// 认证之前的有界工作（R2 High#4；#603 N4 加上按来源的份额）：见模块文档。
 ///
-/// 两道闸，都在**碰库之前**：
+/// 三道闸，都在**碰库之前**：
 ///
 /// 1. **在途个数**：同时进行的认证查询不超过 `max_concurrent`。满了直接拒绝，不排队（排队就是把攻击者的请求
 ///    攒在内存里，等库有空了再一个个查）。名额（[`AuthSlot`]）**跟着真正执行查询的阻塞任务走**：认证查询和其后的
 ///    调用方解析（`CallerResolver::resolve`）共用同一个名额，两段阻塞任务都结束才丢弃。
 ///    不能留在请求 future 上：请求被取消时 future 先丢，名额先还，而阻塞任务还在等库的锁、查 SQLite，
 ///    反复「发起再取消」就能攒出远超上限的阻塞任务（R3 N2；解析那段是 L-5）。
-/// 2. **查询预算**：一个令牌桶，只有**最近没有认证成功过的凭证前缀**才消耗它。随机假凭证的前缀永远是新的，
+/// 2. **全局查询预算（总闸）**：一个令牌桶，只有**最近没有认证成功过的凭证前缀**才消耗它。随机假凭证的前缀永远是新的，
 ///    所以它们合起来每分钟最多只能让库查 `unknown` 这么多次；而最近认证成功过的前缀（真实在用的凭证，比如 eduai 后端的
 ///    服务凭证）不消耗它，只受第 1 条的在途个数约束——攻击者把预算耗光，在用的凭证照样能认证。
 ///    认证失败（凭证被撤销、过期）会把前缀从「成功过」里去掉。
+/// 3. **按来源的份额**：每个来源（IPv6 取 /64）有自己的一个令牌桶，只有同样「没有认证成功过的前缀」才消耗它，
+///    而且**在全局预算之前扣**：一个来源先用自己的份额，用完了就被自己的份额挡住，**不会碰全局预算**；全局预算拒绝时，
+///    刚扣的来源令牌退回去。这样一个来源刷随机 `idk_` key，最多耗掉它自己那一份，耗不光全局预算——别的来源冷的合法凭证
+///    （重启之后、刚签发、被挤出「已知」表）照常拿得到全局预算里的令牌（#603 N4：原来全局预算只有一个桶，
+///    一个来源 10 秒就能耗光 200 个令牌，之后 100/100 个冷的合法 key 全拿 429）。
 ///
-/// **不按来源地址**：学校的共享出口下，一个学生的凭证不能因为同一个出口上别人在发垃圾请求而被拒绝
-/// （设计稿 §9 第 3 条）。成员 / 租户 / 平台三级限流（`limits`）照旧在认证之后。
+/// **来源地址的作用到此为止**：它只决定一个「没有认证成功过的前缀」从哪个桶里扣令牌。最近认证成功过的前缀完全不看来源
+/// （学校共享出口下，一个学生在用的凭证不会因为同一个出口上别人在发垃圾请求而被拒绝，设计稿 §9 第 3 条）。
+/// 代价写在设计稿 S5-12：同一个来源下**冷的**凭证（还没认证成功过，认证之前分不出它和随机假凭证）要和那个来源上的垃圾请求
+/// 共用这一份额；它认证成功一次，之后就是「已知」的，不再受影响。成员 / 租户 / 平台三级限流（`limits`）照旧在认证之后。
+///
+/// 数据库查询次数的上界：`min(全局突发 + 全局速率 × t, 来源数 × (单来源突发 + 单来源速率 × t))`，和请求个数无关。
 pub struct AuthBudget {
     slots: Arc<Semaphore>,
     unknown_limit: RateLimit,
     unknown: Mutex<Bucket>,
+    source_limit: RateLimit,
+    sources: Mutex<Bounded<IpAddr, Bucket>>,
+    /// 最近认证成功过的前缀。LRU：热凭证每个请求都在被用，表满了丢的是最久没用的（见 [`Bounded::lru`]）。
     known: Mutex<Bounded<u64, ()>>,
 }
 
@@ -165,33 +182,71 @@ impl std::fmt::Debug for AuthSlot {
 }
 
 impl AuthBudget {
-    pub fn new(max_concurrent: usize, unknown: RateLimit, now_ms: i64) -> Self {
+    /// `unknown` 是全局的查询预算（总闸），`per_source` 是单个来源的份额。后者应当明显小于前者（见 [`AuthBudget`]：
+    /// 一个来源耗不光总闸靠的就是这个比例；启动时 `IngressConfig::budget_warnings` 会对不满足的配置打警告）。
+    pub fn new(
+        max_concurrent: usize,
+        unknown: RateLimit,
+        per_source: RateLimit,
+        now_ms: i64,
+    ) -> Self {
         Self {
             slots: Arc::new(Semaphore::new(max_concurrent.max(1))),
             unknown_limit: unknown,
             unknown: Mutex::new(Bucket::full(&unknown, now_ms)),
-            known: Mutex::new(Bounded::new(MAX_KNOWN_ENTRIES)),
+            source_limit: per_source,
+            sources: Mutex::new(Bounded::lru(MAX_SOURCE_ENTRIES)),
+            known: Mutex::new(Bounded::lru(MAX_KNOWN_ENTRIES)),
         }
     }
 
-    /// 一个请求要开始认证查询了。`prefix` 是 [`FailureThrottle::key_of`] 给的键（格式不对没有键，按「没成功过」算）。
+    /// 一个请求要开始认证查询了。`source` 是请求的客户端来源（受信代理规则解析过的，没有来源信息时是 `0.0.0.0`），
+    /// `prefix` 是 [`FailureThrottle::key_of`] 给的键（格式不对没有键，按「没成功过」算）。
     /// `Err(秒数)` = 满了，直接拒绝（该等多久，至少 1）；没有碰库。
-    pub fn admit(&self, prefix: Option<u64>, now_ms: i64) -> Result<AuthSlot, u64> {
+    ///
+    /// 「没成功过」的前缀依次过三关，每一关拒绝时前面扣的都退回去：来源自己的份额 -> 全局预算 -> 在途名额。
+    /// 来源的份额排在全局预算**前面**：被自己份额挡住的来源根本碰不到全局预算。一次只持一把锁，不嵌套。
+    pub fn admit(&self, source: IpAddr, prefix: Option<u64>, now_ms: i64) -> Result<AuthSlot, u64> {
+        // 「已知」表是 LRU：这一次取用同时把前缀标成最近用过，热凭证不会被别的凭证挤出表
         let known = prefix.is_some_and(|prefix| lock(&self.known).get_mut(&prefix).is_some());
-        let mut took_unknown = false;
+        let mut charged = None;
         if !known {
-            lock(&self.unknown).try_take(&self.unknown_limit, now_ms)?;
-            took_unknown = true;
+            let key = source_key(source);
+            self.take_from_source(key, now_ms)?;
+            if let Err(retry) = lock(&self.unknown).try_take(&self.unknown_limit, now_ms) {
+                self.give_back_to_source(key);
+                return Err(retry);
+            }
+            charged = Some(key);
         }
         match Arc::clone(&self.slots).try_acquire_owned() {
             Ok(permit) => Ok(AuthSlot { _permit: permit }),
             Err(_) => {
-                if took_unknown {
-                    // 没有真的开始查：令牌退回去
+                if let Some(key) = charged {
+                    // 没有真的开始查：两个令牌都退回去
                     lock(&self.unknown).give_back(&self.unknown_limit);
+                    self.give_back_to_source(key);
                 }
                 Err(1)
             }
+        }
+    }
+
+    fn take_from_source(&self, key: IpAddr, now_ms: i64) -> Result<(), u64> {
+        let limit = self.source_limit;
+        lock(&self.sources)
+            .get_or_insert_with(
+                &key,
+                || Bucket::full(&limit, now_ms),
+                |bucket| bucket.is_full_at(&limit, now_ms),
+                |_| true,
+            )
+            .try_take(&limit, now_ms)
+    }
+
+    fn give_back_to_source(&self, key: IpAddr) {
+        if let Some(bucket) = lock(&self.sources).get_mut(&key) {
+            bucket.give_back(&self.source_limit);
         }
     }
 
@@ -324,6 +379,16 @@ mod tests {
         RateLimit::new(rpm, burst).unwrap()
     }
 
+    /// 不会成为约束的按来源份额（只看全局预算的测试用它）。
+    fn roomy() -> RateLimit {
+        limit(600_000, 100_000)
+    }
+
+    /// 单一来源的测试请求。
+    fn src() -> IpAddr {
+        ip("203.0.113.9")
+    }
+
     // ---------- 来源键 ----------
 
     #[test]
@@ -399,15 +464,15 @@ mod tests {
 
     #[test]
     fn the_in_flight_authentication_slots_are_bounded_and_released_on_drop() {
-        let budget = AuthBudget::new(2, limit(60_000, 10_000), 0);
-        let a = budget.admit(Some(1), 0).unwrap();
-        let b = budget.admit(Some(2), 0).unwrap();
+        let budget = AuthBudget::new(2, limit(60_000, 10_000), roomy(), 0);
+        let a = budget.admit(src(), Some(1), 0).unwrap();
+        let b = budget.admit(src(), Some(2), 0).unwrap();
         assert_eq!(budget.available_slots(), 0);
         // 满了：直接拒绝，不排队
-        assert_eq!(budget.admit(Some(3), 0).unwrap_err(), 1);
+        assert_eq!(budget.admit(src(), Some(3), 0).unwrap_err(), 1);
         drop(a);
         assert_eq!(budget.available_slots(), 1);
-        let c = budget.admit(Some(3), 0).unwrap();
+        let c = budget.admit(src(), Some(3), 0).unwrap();
         drop((b, c));
         assert_eq!(budget.available_slots(), 2);
     }
@@ -415,55 +480,182 @@ mod tests {
     #[test]
     fn a_flood_of_unknown_prefixes_is_capped_by_the_budget_and_a_refusal_gives_the_token_back() {
         // 预算：突发 3，每分钟 60（每秒 1 个）
-        let budget = AuthBudget::new(100, limit(60, 3), 0);
+        let budget = AuthBudget::new(100, limit(60, 3), roomy(), 0);
         for prefix in 0..3u64 {
-            drop(budget.admit(Some(prefix), 0).unwrap());
+            drop(budget.admit(src(), Some(prefix), 0).unwrap());
         }
         // 第 4 个随机前缀：预算空了，直接拒绝，等 1 秒
-        assert_eq!(budget.admit(Some(1_000), 0).unwrap_err(), 1);
+        assert_eq!(budget.admit(src(), Some(1_000), 0).unwrap_err(), 1);
         assert_eq!(
-            budget.admit(None, 0).unwrap_err(),
+            budget.admit(src(), None, 0).unwrap_err(),
             1,
             "no prefix counts as unknown"
         );
         // 过一秒恢复一个
-        assert!(budget.admit(Some(1_001), 1_000).is_ok());
+        assert!(budget.admit(src(), Some(1_001), 1_000).is_ok());
 
         // 名额满了拒绝时，刚取的令牌退回去（这次查询没有真的开始）
-        let budget = AuthBudget::new(1, limit(60, 1), 0);
-        let held = budget.admit(Some(1), 0).unwrap(); // 取走唯一的令牌和唯一的名额
-        assert!(budget.admit(Some(2), 1_000).is_err()); // 令牌回来了一个，但名额满了
+        let budget = AuthBudget::new(1, limit(60, 1), roomy(), 0);
+        let held = budget.admit(src(), Some(1), 0).unwrap(); // 取走唯一的令牌和唯一的名额
+        assert!(budget.admit(src(), Some(2), 1_000).is_err()); // 令牌回来了一个，但名额满了
         drop(held);
         assert!(
-            budget.admit(Some(3), 1_000).is_ok(),
+            budget.admit(src(), Some(3), 1_000).is_ok(),
             "the refused attempt did not eat the refilled token"
         );
     }
 
     #[test]
     fn a_prefix_that_recently_authenticated_is_not_charged_and_a_failure_forgets_it() {
-        let budget = AuthBudget::new(100, limit(60, 1), 0);
+        let budget = AuthBudget::new(100, limit(60, 1), roomy(), 0);
         let legit = 0xAAAA_u64;
-        drop(budget.admit(Some(legit), 0).unwrap()); // 预算的唯一令牌
+        drop(budget.admit(src(), Some(legit), 0).unwrap()); // 预算的唯一令牌
         budget.record_success(legit);
         // 攻击者把预算耗光：新前缀进不来
-        assert!(budget.admit(Some(7), 0).is_err());
+        assert!(budget.admit(src(), Some(7), 0).is_err());
         // 在用的凭证照样能认证，一次又一次
         for _ in 0..50 {
-            drop(budget.admit(Some(legit), 0).unwrap());
+            drop(budget.admit(src(), Some(legit), 0).unwrap());
         }
         // 它被撤销（认证失败）之后，又要和别的未知前缀一样消耗预算
         budget.record_failure(legit);
-        assert!(budget.admit(Some(legit), 0).is_err());
+        assert!(budget.admit(src(), Some(legit), 0).is_err());
     }
 
     #[test]
     fn the_known_prefix_table_stays_bounded() {
-        let budget = AuthBudget::new(10, limit(60_000, 10_000), 0);
+        let budget = AuthBudget::new(10, limit(60_000, 10_000), roomy(), 0);
         for prefix in 0..50_000u64 {
             budget.record_success(prefix);
         }
         assert!(lock(&budget.known).len() <= MAX_KNOWN_ENTRIES);
+    }
+
+    /// #603 N4：「已知前缀」表满了淘汰的是**最久没用过**的（LRU），不是最早进表的（FIFO）。热凭证每次请求都在被用，
+    /// 表被别的凭证挤满之后它必须还在表里；原来按进表先后淘汰，最早进表的热凭证第一个被丢，下一次请求当成「冷」的去抢
+    /// 未知前缀预算——预算被攻击者耗光时，它就拿 429。
+    #[test]
+    fn a_hot_prefix_stays_known_after_the_table_overflows_and_the_least_recently_used_one_goes() {
+        // 未知前缀的预算只有一个令牌，下面第一步就把它用掉：之后 `admit` 成功 = 这个前缀此刻在「已知」表里
+        let budget = AuthBudget::new(10, limit(60, 1), roomy(), 0);
+        drop(budget.admit(src(), Some(1), 0).unwrap());
+        assert!(
+            budget.admit(src(), Some(2), 0).is_err(),
+            "the budget is spent"
+        );
+
+        let hot = u64::MAX;
+        let first_cold = 1_000_000_u64;
+        budget.record_success(hot);
+        // 往表里连续塞进三倍容量的别的凭证（都是成功认证过的）；热凭证夹在中间被一直使用
+        for round in 0..(3 * MAX_KNOWN_ENTRIES as u64) {
+            budget.record_success(first_cold + round);
+            if round.is_multiple_of(64) {
+                assert!(
+                    budget.admit(src(), Some(hot), 0).is_ok(),
+                    "the hot prefix fell out of the known table after {round} other insertions"
+                );
+            }
+        }
+        assert!(budget.admit(src(), Some(hot), 0).is_ok());
+        assert!(lock(&budget.known).len() <= MAX_KNOWN_ENTRIES);
+        // 最久没用过的那个才是被丢的：第一个塞进去、之后再没碰过的冷凭证早就不在表里了
+        assert!(
+            budget.admit(src(), Some(first_cold), 0).is_err(),
+            "an entry nobody touched since the start is the one that leaves"
+        );
+    }
+
+    // ---------- 认证之前：按来源的份额（#603 N4） ----------
+
+    /// 一个来源先用自己的份额；用完了被自己的份额挡住，不会碰全局预算——它刷不光全局预算，别的来源还有。
+    #[test]
+    fn a_source_spends_its_own_share_first_and_can_never_drain_the_global_budget() {
+        // 全局 3 个令牌（突发 3，每秒 1 个），每个来源 2 个（突发 2）
+        let budget = AuthBudget::new(100, limit(60, 3), limit(60, 2), 0);
+        let (noisy, other, third) = (ip("198.51.100.1"), ip("198.51.100.2"), ip("198.51.100.3"));
+        let mut admitted = 0;
+        for prefix in 0..50u64 {
+            if budget.admit(noisy, Some(prefix), 0).map(drop).is_ok() {
+                admitted += 1;
+            }
+        }
+        assert_eq!(admitted, 2, "the noisy source got exactly its own share");
+        // 全局预算只被用掉 2 个，不是 3 个：被自己份额挡住的那 48 次没有碰它
+        assert!(budget.admit(other, Some(1_000), 0).is_ok());
+        // 现在全局空了（总闸是真的）：第三个来源（它自己的份额是满的）也进不来
+        assert_eq!(budget.admit(third, Some(1_001), 0).unwrap_err(), 1);
+        // 过一秒全局补一个，第三个来源就能进（它被全局拒绝的那一次没有吃掉它自己的令牌）
+        assert!(budget.admit(third, Some(1_001), 1_000).is_ok());
+    }
+
+    #[test]
+    fn a_refusal_by_the_global_budget_gives_the_source_token_back() {
+        // 全局只有 1 个令牌，每个来源 1 个
+        let budget = AuthBudget::new(100, limit(60, 1), limit(60, 1), 0);
+        let (a, b) = (ip("198.51.100.1"), ip("198.51.100.2"));
+        assert!(budget.admit(a, Some(1), 0).is_ok()); // 全局用完
+        assert!(budget.admit(b, Some(2), 0).is_err()); // b 被全局拒绝：它自己的令牌必须退回
+        // 一秒后全局恢复 1 个。b 的份额没有被那次被拒的请求吃掉，所以 b 能过
+        assert!(budget.admit(b, Some(3), 1_000).is_ok());
+    }
+
+    #[test]
+    fn a_refusal_for_lack_of_a_slot_gives_both_tokens_back() {
+        // 只有 1 个在途名额；全局 1 个令牌、来源 1 个令牌
+        let budget = AuthBudget::new(1, limit(60, 1), limit(60, 1), 0);
+        let source = ip("198.51.100.1");
+        budget.record_success(77);
+        let held = budget.admit(source, Some(77), 0).unwrap(); // 已知前缀：只占名额，不动令牌
+        assert!(
+            budget.admit(source, Some(1), 0).is_err(),
+            "no slot: refused before the lookup"
+        );
+        drop(held);
+        assert!(
+            budget.admit(source, Some(1), 0).is_ok(),
+            "neither the global nor the source token was eaten by the refused attempt"
+        );
+    }
+
+    /// 最近认证成功过的前缀完全不看来源：来源的份额和全局预算都空了，它照样进。
+    #[test]
+    fn a_recently_authenticated_prefix_ignores_the_source_entirely() {
+        let budget = AuthBudget::new(100, limit(60, 1), limit(60, 1), 0);
+        let source = ip("198.51.100.1");
+        budget.record_success(7);
+        drop(budget.admit(source, Some(1), 0).unwrap()); // 令牌（全局和来源的）都用光
+        assert!(budget.admit(source, Some(2), 0).is_err());
+        for _ in 0..50 {
+            drop(budget.admit(source, Some(7), 0).unwrap());
+        }
+        // 别的来源带着这个前缀（比如同一张凭证从另一个出口来）同样不看来源
+        drop(budget.admit(ip("203.0.113.9"), Some(7), 0).unwrap());
+    }
+
+    #[test]
+    fn the_source_share_is_keyed_by_the_normalised_source_and_the_table_stays_bounded() {
+        let budget = AuthBudget::new(100, limit(600_000, 100_000), limit(60, 2), 0);
+        // IPv6 取 /64：同一个 /64 里的两个地址是同一个来源（共用 2 个令牌）
+        assert!(budget.admit(ip("2001:db8:1:2:aaaa::1"), Some(1), 0).is_ok());
+        assert!(budget.admit(ip("2001:db8:1:2:bbbb::7"), Some(2), 0).is_ok());
+        assert!(
+            budget
+                .admit(ip("2001:db8:1:2:cccc::3"), Some(3), 0)
+                .is_err()
+        );
+        assert!(budget.admit(ip("2001:db8:1:3::1"), Some(4), 0).is_ok());
+        // IPv4 映射地址就是它的 IPv4 地址
+        assert!(budget.admit(ip("203.0.113.7"), Some(5), 0).is_ok());
+        assert!(budget.admit(ip("::ffff:203.0.113.7"), Some(6), 0).is_ok());
+        assert!(budget.admit(ip("203.0.113.7"), Some(7), 0).is_err());
+        // 来源表有上限：攻击者没法靠换来源把内存撑大
+        let many = AuthBudget::new(100, limit(600_000, 100_000), limit(60, 2), 0);
+        for n in 0..50_000u32 {
+            let source = IpAddr::from(std::net::Ipv4Addr::from(0x0A00_0000 + n));
+            drop(many.admit(source, Some(u64::from(n)), 0));
+        }
+        assert!(lock(&many.sources).len() <= MAX_SOURCE_ENTRIES);
     }
 
     // ---------- 凭证前缀 ----------

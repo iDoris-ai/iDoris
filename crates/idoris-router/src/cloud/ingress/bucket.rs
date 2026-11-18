@@ -134,18 +134,37 @@ struct Slot<V> {
 }
 
 /// 有上限的键值表，见模块文档。
+///
+/// 满了之后「最老」的先丢，「老」按条目的 `seq` 比，`seq` 什么时候更新由构造方式决定：
+///
+/// - [`Bounded::new`]：只在**插入**时定（先进先出）。限流表用它：一个条目的存废只看它出现得早不早。
+/// - [`Bounded::lru`]：每次**取用**（[`Bounded::get_mut`]、命中已有条目的 [`Bounded::get_or_insert_with`]）都刷新成最新
+///   （最久没用的先丢）。「最近认证成功过的凭证前缀」表用它：热凭证每个请求都在被用，不能因为它是最早进表的、之后表被别的凭证
+///   挤满，就第一个被丢（#603 N4：丢了之后它的下一个请求被当成「冷」的，去抢未知前缀预算，预算被攻击者耗光时拿 429）。
+///   刷新是 O(1)，只改一个整数，所以可以放在每个请求都走的路径上。
 pub struct Bounded<K, V> {
     map: HashMap<K, Slot<V>>,
     cap: usize,
     next_seq: u64,
+    refresh_on_use: bool,
 }
 
 impl<K: Hash + Eq + Clone, V> Bounded<K, V> {
+    /// 按进表先后淘汰（先进先出）。
     pub fn new(cap: usize) -> Self {
         Self {
             map: HashMap::new(),
             cap: cap.max(1),
             next_seq: 0,
+            refresh_on_use: false,
+        }
+    }
+
+    /// 按最近使用淘汰（LRU）：取用一个条目就把它标成最新。
+    pub fn lru(cap: usize) -> Self {
+        Self {
+            refresh_on_use: true,
+            ..Self::new(cap)
         }
     }
 
@@ -157,8 +176,14 @@ impl<K: Hash + Eq + Clone, V> Bounded<K, V> {
         self.map.is_empty()
     }
 
+    /// 取一个已有的条目（LRU 表里同时把它标成最新）。
     pub fn get_mut(&mut self, key: &K) -> Option<&mut V> {
-        self.map.get_mut(key).map(|entry| &mut entry.value)
+        let entry = self.map.get_mut(key)?;
+        if self.refresh_on_use {
+            entry.seq = self.next_seq;
+            self.next_seq = self.next_seq.wrapping_add(1);
+        }
+        Some(&mut entry.value)
     }
 
     pub fn remove(&mut self, key: &K) -> Option<V> {
@@ -179,7 +204,14 @@ impl<K: Hash + Eq + Clone, V> Bounded<K, V> {
         }
         let seq = self.next_seq;
         match self.map.entry(key.clone()) {
-            MapEntry::Occupied(slot) => &mut slot.into_mut().value,
+            MapEntry::Occupied(slot) => {
+                let entry = slot.into_mut();
+                if self.refresh_on_use {
+                    entry.seq = seq;
+                    self.next_seq = self.next_seq.wrapping_add(1);
+                }
+                &mut entry.value
+            }
             MapEntry::Vacant(slot) => {
                 self.next_seq = self.next_seq.wrapping_add(1);
                 &mut slot.insert(Slot { value: make(), seq }).value
@@ -187,6 +219,11 @@ impl<K: Hash + Eq + Clone, V> Bounded<K, V> {
         }
     }
 
+    /// 表满了：先丢空闲的，还不够就丢最老的一批（`cap / 8` 个，至少 1 个）可丢的条目。
+    ///
+    /// 这是在调用方的锁里做的，所以不把整张表排序（`n log n`），只用 `select_nth_unstable` 挑出最老的那一批（`n`）：
+    /// 表有一万多个条目时，持锁时间是几十微秒的量级，不会让走同一把锁的每个请求都等一次排序。`seq` 各不相同，
+    /// 挑出来的集合和「全排序后取前 `drop_count` 个」一样。
     fn make_room(&mut self, idle: impl Fn(&V) -> bool, droppable: impl Fn(&V) -> bool) {
         self.map.retain(|_, entry| !idle(&entry.value));
         if self.map.len() < self.cap {
@@ -198,9 +235,12 @@ impl<K: Hash + Eq + Clone, V> Bounded<K, V> {
             .filter(|(_, entry)| droppable(&entry.value))
             .map(|(key, entry)| (entry.seq, key.clone()))
             .collect();
-        candidates.sort_by_key(|(seq, _)| *seq);
         let drop_count = (self.cap / 8).max(1);
-        for (_, key) in candidates.into_iter().take(drop_count) {
+        if candidates.len() > drop_count {
+            candidates.select_nth_unstable_by_key(drop_count - 1, |(seq, _)| *seq);
+            candidates.truncate(drop_count);
+        }
+        for (_, key) in candidates {
             self.map.remove(&key);
         }
     }
@@ -431,6 +471,90 @@ mod tests {
         assert_eq!(table.len(), 5);
         for key in [0, 1, 2, 3, 99] {
             assert!(table.get_mut(&key).is_some(), "{key}");
+        }
+    }
+
+    /// #603 N4：LRU 表丢的是最久没用过的，FIFO 表丢的是最早进表的——同样的操作序列，两种表丢的不一样。
+    #[test]
+    fn an_lru_table_drops_the_least_recently_used_where_a_fifo_table_drops_the_first_inserted() {
+        let idle = |_: &u8| false;
+        let droppable = |_: &u8| true;
+        let run = |mut table: Bounded<u32, u8>| {
+            for key in 0..8 {
+                table.get_or_insert_with(&key, || 0, idle, droppable);
+            }
+            // 键 0 是最早进表的，但它刚被用过
+            assert!(table.get_mut(&0).is_some());
+            // 再来一个新键：表是满的（8），丢最老的一批（8 / 8 = 1 个）
+            table.get_or_insert_with(&100, || 0, idle, droppable);
+            let mut kept: Vec<u32> = table.map.keys().copied().collect();
+            kept.sort_unstable();
+            kept
+        };
+        assert_eq!(
+            run(Bounded::lru(8)),
+            vec![0, 2, 3, 4, 5, 6, 7, 100],
+            "the entry that was just used stays; the one nobody touched goes"
+        );
+        assert_eq!(
+            run(Bounded::new(8)),
+            vec![1, 2, 3, 4, 5, 6, 7, 100],
+            "a FIFO table ignores use: the first inserted goes (the rate-limit tables keep this behaviour)"
+        );
+    }
+
+    /// 命中已有条目的 `get_or_insert_with` 在 LRU 表里同样刷新（`record_success` 走的是这条路）。
+    #[test]
+    fn an_lru_table_refreshes_on_get_or_insert_with_hits_too() {
+        let idle = |_: &u8| false;
+        let droppable = |_: &u8| true;
+        let mut table: Bounded<u32, u8> = Bounded::lru(8);
+        for key in 0..8 {
+            table.get_or_insert_with(&key, || 0, idle, droppable);
+        }
+        table.get_or_insert_with(&0, || 0, idle, droppable); // 命中
+        table.get_or_insert_with(&100, || 0, idle, droppable);
+        assert!(table.get_mut(&0).is_some());
+        assert!(table.get_mut(&1).is_none());
+    }
+
+    /// 淘汰那一批用 `select_nth_unstable`（不排序整张表，因为是在锁里做的）：挑出来的集合必须和「按最近使用排好序、
+    /// 丢最老的 `cap / 8` 个」的简单模型一模一样。确定性的伪随机序列：一半是取用已有的键，一半是插入新键。
+    #[test]
+    fn the_batch_eviction_matches_a_plain_least_recently_used_model() {
+        let idle = |_: &u8| false;
+        let droppable = |_: &u8| true;
+        let cap = 64;
+        let drop_count = cap / 8;
+        let mut table: Bounded<u32, u8> = Bounded::lru(cap);
+        let mut model: Vec<u32> = Vec::new(); // 最老的在前
+        let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+        let mut next_new = 0_u32;
+        for step in 0..5_000 {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let touch_existing = !model.is_empty() && (state >> 40).is_multiple_of(2);
+            if touch_existing {
+                let index =
+                    usize::try_from((state >> 20) % u64::try_from(model.len()).unwrap()).unwrap();
+                let key = model.remove(index);
+                model.push(key);
+                table.get_or_insert_with(&key, || 0, idle, droppable);
+            } else {
+                let key = next_new;
+                next_new += 1;
+                if model.len() >= cap {
+                    model.drain(..drop_count);
+                }
+                model.push(key);
+                table.get_or_insert_with(&key, || 0, idle, droppable);
+            }
+            let mut in_table: Vec<u32> = table.map.keys().copied().collect();
+            let mut expected = model.clone();
+            in_table.sort_unstable();
+            expected.sort_unstable();
+            assert_eq!(in_table, expected, "step {step}");
         }
     }
 

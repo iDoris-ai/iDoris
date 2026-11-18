@@ -10,7 +10,7 @@
 //! | [`net`] | 客户端来源：只信任配置里列出的反向代理的 `X-Forwarded-For`，其它来源的一律不信 |
 //! | [`caller`] | 从凭证推导付款上下文、租户、数据类别（成员 id 逐次验证，失败不回落） |
 //! | [`limits`] | 平台 / 租户 / 成员三级的请求速率与并发上限（和 S3 的花费闸门互补） |
-//! | [`abuse`] | 公网防滥用：没有凭证请求的限流、按凭证前缀的认证失败计数；来源地址只是辅助信号 |
+//! | [`abuse`] | 公网防滥用：没有凭证请求的限流、按凭证前缀的认证失败计数、认证之前的有界工作（在途个数 + 全局总闸 + 按来源的份额）；来源地址只是辅助信号 |
 //! | [`bucket`] | 令牌桶（精确整数、时钟可拨）和有上限的键值表 |
 //! | [`cors`] | 跨域：默认不开放，开放时只对配置里列出的来源、暴露 S3 的 `EXPOSED_HEADERS` |
 //! | [`bind`] | 云形态的公网监听：云形态可听明确的非 loopback 单播；其它形态仍可听 Tailscale；Admin v0 永远只听 loopback |
@@ -152,7 +152,8 @@ pub struct CloudIngress {
     pub(crate) limiter: Arc<Limiter>,
     pub(crate) anonymous: abuse::AnonymousLimiter,
     pub(crate) failures: abuse::FailureThrottle,
-    /// 认证之前的有界工作：同时在途的认证查询、「最近没有认证成功过的凭证」的查询预算（R2 High#4）。
+    /// 认证之前的有界工作：同时在途的认证查询、「最近没有认证成功过的凭证」的查询预算——来源自己的份额和全局总闸
+    /// （R2 High#4；按来源的份额是 #603 N4）。
     pub(crate) auth_budget: abuse::AuthBudget,
     pub(crate) clock: Arc<dyn Clock>,
 }
@@ -215,6 +216,7 @@ impl CloudIngress {
             auth_budget: abuse::AuthBudget::new(
                 config.auth_max_concurrent,
                 config.auth_unknown,
+                config.auth_unknown_per_source,
                 mono,
             ),
             config,
@@ -231,7 +233,7 @@ impl CloudIngress {
     /// 配置里声明的租户在账户库里不存在，或者不是账户树里平台根之下的顶层客户——后者的声明永远不会生效，
     /// 因为租户总是从付款账户往上数的顶层客户（见 [`caller`]）。
     pub fn startup_warnings(&self, accounts: &AccountStore) -> Vec<String> {
-        let mut warnings = Vec::new();
+        let mut warnings = self.config.budget_warnings();
         for tenant in self.config.tenants() {
             match accounts.ancestors(&tenant.account) {
                 Ok(chain) => {
