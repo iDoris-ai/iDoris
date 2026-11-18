@@ -7,8 +7,9 @@
 //! 1. **资格 = 凭证。** 带着有效凭证的请求，不论它从哪个地址来、这个地址刚刚有多少人认证失败，都不会被任何
 //!    和来源地址有关的东西拦住。三级上限（`limits`）的键全部来自凭证推导出来的身份，没有地址。
 //!    **唯一的例外是「冷」的凭证**（还没认证成功过：刚签发、进程重启之后、被挤出「已知」表）：认证之前分不出它和随机假凭证，
-//!    只能和同一个来源上其它「没认证成功过」的请求共用这个来源在 [`AuthBudget`] 里的份额（#603 N4，设计稿 S5-12）。
-//!    它认证成功一次，之后就是「已知」的，永远不再看来源。
+//!    只能和同一个来源上其它「没认证成功过」的请求共用这个来源在 [`AuthBudget`] 里的份额（#603 N4，设计稿 S5-15）。
+//!    它认证成功一次，之后就是「已知」的：只要还在「已知」表里（容量有限、按最近使用淘汰；进程重启清空；认证失败时移除），
+//!    就不再看来源。
 //! 2. **地址只用在「没有资格的请求」上。** 没有凭证（或凭证格式根本不对）的请求没有任何人需要保护，
 //!    对它们按来源地址分一个软配额；这个软配额是**速率**，不是封禁：窗口过去就恢复，不记仇，不影响同一个地址上
 //!    带着有效凭证的请求。
@@ -205,7 +206,7 @@ impl AuthBudget {
     /// `Err(秒数)` = 满了，直接拒绝（该等多久，至少 1）；没有碰库。
     ///
     /// 「没成功过」的前缀依次过三关，每一关拒绝时前面扣的都退回去：来源自己的份额 -> 全局预算 -> 在途名额。
-    /// 来源的份额排在全局预算**前面**：被自己份额挡住的来源根本碰不到全局预算。一次只持一把锁，不嵌套。
+    /// 来源的份额排在全局预算**前面**：被自己份额挡住的来源根本碰不到全局预算。每一步各自在自己的锁里原子完成，一次只持一把锁，不嵌套。
     pub fn admit(&self, source: IpAddr, prefix: Option<u64>, now_ms: i64) -> Result<AuthSlot, u64> {
         // 「已知」表是 LRU：这一次取用同时把前缀标成最近用过，热凭证不会被别的凭证挤出表
         let known = prefix.is_some_and(|prefix| lock(&self.known).get_mut(&prefix).is_some());
@@ -213,7 +214,9 @@ impl AuthBudget {
         if !known {
             let key = source_key(source);
             self.take_from_source(key, now_ms)?;
-            if let Err(retry) = lock(&self.unknown).try_take(&self.unknown_limit, now_ms) {
+            // 先放掉 `unknown` 的锁再去退来源令牌：一次只持一把锁
+            let taken = lock(&self.unknown).try_take(&self.unknown_limit, now_ms);
+            if let Err(retry) = taken {
                 self.give_back_to_source(key);
                 return Err(retry);
             }
@@ -587,6 +590,51 @@ mod tests {
         assert_eq!(budget.admit(third, Some(1_001), 0).unwrap_err(), 1);
         // 过一秒全局补一个，第三个来源就能进（它被全局拒绝的那一次没有吃掉它自己的令牌）
         assert!(budget.admit(third, Some(1_001), 1_000).is_ok());
+    }
+
+    /// 真并发：许多 OS 线程从许多来源同时抢。不论怎么交错，放行总数恰好是全局突发量（来源份额加起来比它多），
+    /// 每个来源放行的不超过它自己的份额——「先扣来源、再扣全局、失败退回」在交错下也守恒，不会多放也不会漏退。
+    #[test]
+    fn concurrent_admits_never_exceed_the_global_budget_or_any_source_share() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        const SOURCES: usize = 20;
+        const THREADS_PER_SOURCE: usize = 4;
+        const TRIES: u64 = 25;
+        for _ in 0..20 {
+            // 全局突发 50；每个来源突发 5（20 个来源合计 100 > 50）；时间不动，谁都补不回来
+            let budget = AuthBudget::new(100_000, limit(1, 50), limit(1, 5), 0);
+            let per_source: Vec<AtomicUsize> = (0..SOURCES).map(|_| AtomicUsize::new(0)).collect();
+            std::thread::scope(|scope| {
+                for source in 0..SOURCES {
+                    for thread in 0..THREADS_PER_SOURCE {
+                        let (budget, per_source) = (&budget, &per_source);
+                        scope.spawn(move || {
+                            let address = ip(&format!("198.51.100.{}", source + 1));
+                            for attempt in 0..TRIES {
+                                let prefix =
+                                    ((source * THREADS_PER_SOURCE + thread) as u64) << 32 | attempt;
+                                if budget.admit(address, Some(prefix), 0).is_ok() {
+                                    per_source[source].fetch_add(1, Ordering::Relaxed);
+                                }
+                            }
+                        });
+                    }
+                }
+            });
+            let counts: Vec<usize> = per_source
+                .iter()
+                .map(|c| c.load(Ordering::Relaxed))
+                .collect();
+            assert_eq!(
+                counts.iter().sum::<usize>(),
+                50,
+                "exactly the global burst: {counts:?}"
+            );
+            assert!(
+                counts.iter().all(|&c| c <= 5),
+                "no source above its share: {counts:?}"
+            );
+        }
     }
 
     #[test]
