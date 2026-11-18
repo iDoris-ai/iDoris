@@ -40,6 +40,17 @@ ignore = [
   # needs compatibility testing across those formats. Keep the exception
   # scoped to this advisory so new vulnerability reports still fail CI.
   "RUSTSEC-2024-0449",
+  # RUSTSEC-2026-0543 / RUSTSEC-2026-0555 (2026-11) flag `chrono` and
+  # `chrono-tz` as unmaintained — maintenance-status notices, not
+  # vulnerabilities; both advisories say "No safe upgrade is available".
+  # We use them only for calendar arithmetic on billing periods
+  # (`billing_timezone`, contract-tenancy §3/§6) and RFC 3339 / IANA zone
+  # name parsing, with default features off; every parse error maps to a
+  # rejection. main carries the same dependency.
+  # Revisit by moving to `jiff` (or `time` + a tzdb crate) in a dedicated PR;
+  # a CVE against either crate is not silenced by these entries' scope.
+  "RUSTSEC-2026-0543",
+  "RUSTSEC-2026-0555",
 ]
 
 [sources]

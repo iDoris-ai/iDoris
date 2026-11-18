@@ -1,0 +1,159 @@
+{
+  "request": {
+    "attempts": [
+      {
+        "cost_rates": {
+          "input_per_mtok": {
+            "micros": 280000,
+            "unit": "USD"
+          },
+          "output_per_mtok": {
+            "micros": 420000,
+            "unit": "USD"
+          }
+        },
+        "effective_max_tokens": 400,
+        "endpoint": {
+          "endpoint": "openai-compat",
+          "model": "example-org/chat-70b",
+          "provider": "example-zdr-host"
+        },
+        "id": "req-1#0",
+        "price_rates": {
+          "input_per_mtok": {
+            "micros": 10000000,
+            "unit": "THB"
+          },
+          "output_per_mtok": {
+            "micros": 40000000,
+            "unit": "THB"
+          }
+        },
+        "price_version": "pv-2026-11-01",
+        "reservation": {
+          "cost": {
+            "micros": 400,
+            "unit": "USD"
+          },
+          "price": {
+            "micros": 20000,
+            "unit": "THB"
+          }
+        },
+        "state": {
+          "state": "maybe_executed"
+        },
+        "supplier_request_id": "gen-late-0001"
+      },
+      {
+        "cost_rates": {
+          "input_per_mtok": {
+            "micros": 280000,
+            "unit": "USD"
+          },
+          "output_per_mtok": {
+            "micros": 420000,
+            "unit": "USD"
+          }
+        },
+        "effective_max_tokens": 400,
+        "endpoint": {
+          "endpoint": "openai-compat",
+          "model": "example-org/chat-70b-b",
+          "provider": "example-zdr-host"
+        },
+        "id": "req-1#1",
+        "price_rates": {
+          "input_per_mtok": {
+            "micros": 10000000,
+            "unit": "THB"
+          },
+          "output_per_mtok": {
+            "micros": 40000000,
+            "unit": "THB"
+          }
+        },
+        "price_version": "pv-2026-11-01",
+        "reservation": {
+          "cost": {
+            "micros": 400,
+            "unit": "USD"
+          },
+          "price": {
+            "micros": 20000,
+            "unit": "THB"
+          }
+        },
+        "state": {
+          "basis": {
+            "actual_usage": {
+              "cached_prompt_tokens": 0,
+              "completion_tokens": 200,
+              "prompt_tokens": 1000
+            }
+          },
+          "state": "settled"
+        },
+        "supplier_request_id": "chatcmpl-0002"
+      }
+    ],
+    "id": "req-1",
+    "payment": {
+      "credential": "c-kid1",
+      "membership": "m-kid1",
+      "payer": "s1",
+      "principal": "kid1",
+      "unit": "THB"
+    },
+    "published": 1
+  },
+  "settlement_plan": {
+    "lines": [
+      {
+        "attempt": "req-1#0",
+        "certainty": "maybe",
+        "cost": {
+          "micros": 400,
+          "unit": "USD"
+        },
+        "cost_basis": "reserved_pending_reconciliation",
+        "price_reservation_released": {
+          "micros": 20000,
+          "unit": "THB"
+        },
+        "role": "extra"
+      },
+      {
+        "attempt": "req-1#1",
+        "certainty": "executed",
+        "cost": {
+          "micros": 364,
+          "unit": "USD"
+        },
+        "cost_basis": "actual_usage",
+        "price_reservation_released": {
+          "micros": 2000,
+          "unit": "THB"
+        },
+        "role": "answering"
+      }
+    ],
+    "request": "req-1",
+    "user_charge": {
+      "attempt": "req-1#1",
+      "basis": "actual_usage",
+      "charged": {
+        "micros": 18000,
+        "unit": "THB"
+      },
+      "overage": {
+        "micros": 0,
+        "unit": "THB"
+      },
+      "reserved": {
+        "micros": 20000,
+        "unit": "THB"
+      }
+    }
+  }
+}

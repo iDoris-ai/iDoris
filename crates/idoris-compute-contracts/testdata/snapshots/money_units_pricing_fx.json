@@ -1,0 +1,81 @@
+{
+  "converted": {
+    "amount": {
+      "micros": 43827129,
+      "unit": "THB"
+    },
+    "rate": {
+      "as_of": 1000,
+      "from": "USD",
+      "rate_e9": 35500000000,
+      "to": "THB"
+    }
+  },
+  "cost": {
+    "micros": 364,
+    "unit": "USD"
+  },
+  "display": [
+    {
+      "decimals": 2,
+      "minor_units": 124,
+      "unit": "THB"
+    },
+    {
+      "decimals": 2,
+      "minor_units": -1,
+      "unit": "THB"
+    },
+    {
+      "decimals": 0,
+      "minor_units": 2,
+      "unit": "QUOTA:mac-studio-1"
+    }
+  ],
+  "display_text": [
+    "THB 1.24",
+    "USD 0.00"
+  ],
+  "fx_rate": {
+    "as_of": 1000,
+    "from": "USD",
+    "rate_e9": 35500000000,
+    "to": "THB"
+  },
+  "money": {
+    "micros": -1500000,
+    "unit": "QUOTA:mac-studio-1"
+  },
+  "price": {
+    "micros": 18000,
+    "unit": "THB"
+  },
+  "rate_card": {
+    "cached_input_per_mtok": {
+      "micros": 1000000,
+      "unit": "THB"
+    },
+    "input_per_mtok": {
+      "micros": 10000000,
+      "unit": "THB"
+    },
+    "output_per_mtok": {
+      "micros": 40000000,
+      "unit": "THB"
+    }
+  },
+  "units": [
+    "THB",
+    "USD",
+    "QUOTA:mac-studio-1"
+  ],
+  "usage": {
+    "cached_prompt_tokens": 100,
+    "completion_tokens": 200,
+    "prompt_tokens": 1000
+  },
+  "usage_price": {
+    "micros": 17100,
+    "unit": "THB"
+  }
+}

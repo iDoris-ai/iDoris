@@ -1,0 +1,422 @@
+# 端点级许可表（正式文件，schema_version 1）
+#
+# 由 docs/design/compute-service-endpoint-table.draft.yaml 按
+# crates/idoris-compute-contracts/src/permit.rs 的 schema 收成。
+# 叙述和出处见 docs/design/compute-service-endpoint-verification.md（查询日期 2026-11-12）。
+# 调用 URL 不在本文件。S4 按 (provider, model, endpoint) 这个 EndpointKey 去
+# config/compute/endpoint-urls.md 找 URL。
+#
+# 最坏值（permit.rs「没核实的值怎么写」）：
+#   allowed_data_classes: [] 、retention: retained 、dpa: unsigned 、
+#   能力 false 、processing_regions: [unknown]
+# 草案写 unverified、或该字段没有核实到可以放宽的结论时，用上面的值。
+# dpa 一律 unsigned：本项目没有签署任何一份 DPA。
+# 因此没有任何一条写入 child_edu（加载器会拒绝 unsigned 或非 zdr 的 child_edu）。
+#
+# verification_max_age_days 用 schema 示例里的 90。设计稿 §8 只说过期停用，没有另定天数。
+# 留存：草案写明「有例外」或「会留存」的，照实映射；
+# 留存本身没核实，或「有例外」依赖一条没核实的前提时，写 retained。
+
+schema_version: 1
+verification_max_age_days: 90
+
+endpoints:
+  - provider: deepinfra
+    model: deepseek-ai/DeepSeek-V3.2
+    endpoint: openai-chat-completions
+    access: api
+    processing_regions: [unknown]
+    retention: with_exceptions
+    dpa: unsigned
+    allowed_data_classes: []
+    capabilities:
+      tool_calling: true
+      stream_usage: true
+      cache_pricing: true
+      structured_output: true
+      cancellation: false
+    verified_at: "2026-11-12"
+    notes: |
+      留存为有例外：条款第 7(b) 条把排障（解决后 30 天）、不含正文的元数据、法律与滥用、批量、图像、第三方模型和付费缓存列为 ZDR 例外。本型号不是 Google 或 Anthropic 通道。转售默认禁止，除非服务订单明文允许。没有查到儿童业务专条，允许的数据类别草案为 unverified，故为空列表。首页和隐私政策写美国数据中心，但城市、美国以外节点未核实，条款又允许迁移基础设施，区域未合同锁定，所以区域写 unknown。取消未核实。标准档 USD/1M token：输入 0.26，缓存输入 0.13，输出 0.38。DPA 正文未打开，本项目未签。
+    evidence:
+      - "https://deepinfra.com/terms"
+      - "https://deepinfra.com/privacy"
+      - "https://deepinfra.com/"
+      - "https://trust.deepinfra.com/"
+      - "https://docs.deepinfra.com/account/data-privacy"
+      - "https://docs.deepinfra.com/chat/streaming"
+      - "https://docs.deepinfra.com/api-reference/chat-completions/openai-chat-completions"
+      - "https://deepinfra.com/deepseek-ai/DeepSeek-V3.2"
+      - "https://deepinfra.com/pricing"
+
+  - provider: deepinfra
+    model: deepseek-ai/DeepSeek-V4-Flash
+    endpoint: openai-chat-completions
+    access: api
+    processing_regions: [unknown]
+    retention: with_exceptions
+    dpa: unsigned
+    allowed_data_classes: []
+    capabilities:
+      tool_calling: false
+      stream_usage: true
+      cache_pricing: true
+      structured_output: false
+      cancellation: false
+    verified_at: "2026-11-12"
+    notes: |
+      法律限制与 DeepSeek-V3.2 那一行相同，留存为有例外。区域只核实到供应商级的「美国」，更细区域未核实，写 unknown。供应商 OpenAPI 含 stream_options.include_usage。型号页有缓存价。工具调用的型号页徽章、结构化输出是否与文档示例 DeepSeek-V4-Flash-0731 同级、取消，草案都标了 unverified，写 false。USD/1M token：输入 0.09，缓存输入 0.018，输出 0.18。Priority 1.5 倍，Flex 0.8 倍。定价页上的 V4-Flash-0731 与 V4-Pro 不并入本行。允许的数据类别未核实。DPA 未签。
+    evidence:
+      - "https://deepinfra.com/deepseek-ai/DeepSeek-V4-Flash/api"
+      - "https://deepinfra.com/pricing"
+      - "https://deepinfra.com/terms"
+      - "https://docs.deepinfra.com/chat/structured-outputs"
+      - "https://docs.deepinfra.com/chat/prompt-cache-retention"
+
+  - provider: deepinfra
+    model: Qwen/Qwen3.6-35B-A3B
+    endpoint: openai-chat-completions
+    access: api
+    processing_regions: [unknown]
+    retention: retained
+    dpa: unsigned
+    allowed_data_classes: []
+    capabilities:
+      tool_calling: false
+      stream_usage: false
+      cache_pricing: true
+      structured_output: false
+      cancellation: false
+    verified_at: "2026-11-12"
+    notes: |
+      定价页 USD/1M token：输入 0.10，缓存输入 0.10，输出 0.95，故 cache_pricing 为 true。草案的留存栏写「有例外」，但同一条注明未核对是不是 DeepInfra 自托管；条款写第三方模型不适用 ZDR。这个前提没核实，留存取最坏值 retained，不写成 with_exceptions。工具调用、本型号是否返回流式 usage、结构化输出、取消均为 unverified。区域更细的部分未核实，写 unknown。允许的数据类别未核实。DPA 未签。
+    evidence:
+      - "https://deepinfra.com/pricing"
+      - "https://deepinfra.com/terms"
+
+  - provider: openrouter
+    model: route-policy
+    endpoint: zdr-only-exclude-safety-retention
+    access: api
+    processing_regions: [unknown]
+    retention: with_exceptions
+    dpa: unsigned
+    allowed_data_classes: []
+    capabilities:
+      tool_calling: true
+      stream_usage: true
+      cache_pricing: false
+      structured_output: true
+      cancellation: false
+    verified_at: "2026-11-12"
+    notes: |
+      本行不是自助默认。它要求人把账户或请求设成 ZDR only，并排除 Safety Retention。即便如此，疑似 CSAM 仍可能被留存，所以留存是有例外，不是 zdr。具体模型当前落到哪家下游，本次未登录，未核实，因此模型 id 用 route-policy，不填某一个模型名。处理区域未核实：企业与商业方案另有 eu 与 us 主机名，没有公开的亚太主机名。网关接受 OpenAI 形状的 tools，流在结束前带 usage，并支持 json_schema；下游不支持时会失败或改写。缓存是否打折取决于下游，写 false。取消只覆盖名单内下游，本行不绑定单一下游，写 false。自助条款禁止为转售 API 或建设竞争服务而使用。企业协议第 2.1(a)(ii) 条允许提供给终端客户，第 2.3.7 条禁止转租转卖，定性待律师确认。账户持有人须年满 18 岁。DPA 未签。抽成和模型现价未核实。允许的数据类别未核实。
+    evidence:
+      - "https://openrouter.ai/docs/guides/features/zdr"
+      - "https://openrouter.ai/docs/guides/privacy/data-collection"
+      - "https://openrouter.ai/docs/guides/privacy/provider-logging"
+      - "https://openrouter.ai/docs/api_reference/streaming"
+      - "https://openrouter.ai/docs/api_reference/parameters"
+      - "https://openrouter.ai/docs/features/structured-outputs"
+      - "https://openrouter.ai/docs/guides/administration/usage-accounting"
+      - "https://openrouter.ai/terms"
+      - "https://openrouter.ai/data-processing-agreement"
+      - "https://openrouter.ai/terms-of-service-enterprise"
+      - "https://openrouter.ai/pricing.md"
+      - "https://openrouter.ai/blog/announcements/csam-screening"
+
+  - provider: deepseek-official
+    model: deepseek-flash
+    endpoint: chat-completions
+    access: api
+    processing_regions: [unknown]
+    retention: retained
+    dpa: unsigned
+    allowed_data_classes: []
+    capabilities:
+      tool_calling: true
+      stream_usage: false
+      cache_pricing: true
+      structured_output: false
+      cancellation: false
+    verified_at: "2026-11-12"
+    notes: |
+      文档中的版本名是 DeepSeek-V4.1-Flash-1017。上下文 1M，最大输出 384K。使用条款第 4.3 条允许去标识化后把输入输出用于改进服务；API 上是否有退出开关，未核实。因此留存写 retained，不写 zdr。隐私政策写个人数据在中华人民共和国收集、处理、存储，但开放平台条款写终端用户个人信息不由该隐私政策覆盖，终端用户 prompt 的机房未核实，区域写 unknown，不写 cn。没有找到公开 DPA。设计稿排除 child_edu；允许的数据类别草案仍是 unverified，空列表，不补上 adult。价目表标了工具调用和 Json Output；json_schema 严格模式、stream_options.include_usage、取消未核实。磁盘缓存有命中价。美元低峰/高峰（每百万 token）：命中输入 0.003/0.006，未命中 0.15/0.30，输出 0.60/1.20。缓存正文保留时长未核实。中文人民币价目是否用于同一账户，未核实。
+    evidence:
+      - "https://cdn.deepseek.com/policies/en-US/deepseek-privacy-policy.html"
+      - "https://cdn.deepseek.com/policies/en-US/deepseek-terms-of-use.html"
+      - "https://cdn.deepseek.com/policies/en-US/deepseek-open-platform-terms-of-service.html"
+      - "https://api-docs.deepseek.com/quick_start/pricing/"
+      - "https://api-docs.deepseek.com/zh-cn/quick_start/pricing"
+      - "https://api-docs.deepseek.com/news/news0802"
+      - "https://api-docs.deepseek.com/zh-cn/api/create-chat-completion"
+      - "https://api-docs.deepseek.com/zh-cn/faq"
+
+  - provider: deepseek-official
+    model: deepseek-v4-pro
+    endpoint: chat-completions
+    access: api
+    processing_regions: [unknown]
+    retention: retained
+    dpa: unsigned
+    allowed_data_classes: []
+    capabilities:
+      tool_calling: true
+      stream_usage: false
+      cache_pricing: true
+      structured_output: false
+      cancellation: false
+    verified_at: "2026-11-12"
+    notes: |
+      文档中的版本名是 DeepSeek-V4-Pro-0813。不支持视觉。法律条件与 deepseek-flash 相同：会留存，没有公开 DPA，不用于 child_edu。允许的数据类别未核实，保持空列表。终端用户 prompt 的机房未核实，区域写 unknown。价目表标了工具调用和 Json Output。include_usage、严格 json_schema、取消未核实。美元低峰/高峰（每百万 token）：命中输入 0.022/0.044，未命中 0.66/1.32，输出 1.98/3.96。高峰时段为周一至周五 01:00–04:00 与 06:00–10:00 UTC，不含中国法定节假日。
+    evidence:
+      - "https://api-docs.deepseek.com/quick_start/pricing/"
+      - "https://cdn.deepseek.com/policies/en-US/deepseek-privacy-policy.html"
+      - "https://cdn.deepseek.com/policies/en-US/deepseek-open-platform-terms-of-service.html"
+
+  - provider: together
+    model: serverless-default
+    endpoint: prompt-storage-on
+    access: api
+    processing_regions: [unknown]
+    retention: retained
+    dpa: unsigned
+    allowed_data_classes: []
+    capabilities:
+      tool_calling: false
+      stream_usage: false
+      cache_pricing: true
+      structured_output: false
+      cancellation: false
+    verified_at: "2026-11-12"
+    notes: |
+      本行是组织设置里 Prompt storage 开着的无服务器默认，不是 ZDR。关掉 Prompt storage 才是 Together 定义的 ZDR，透传模型会随之关闭。即便 ZDR，仍保留用量元数据，以及客户上传的微调与批量文件。训练他人模型默认关闭。默认无服务器的处理区域未核实，写 unknown。文档里的美国端点只保证所选模型的推理处理在美国，不保证存储与日志，而且不是本行。没有查到新加坡无服务器区域。完整调用 URL 本次未核对。无服务器前缀缓存为尽力而为、短时，故 cache_pricing 为 true；具体型号价未全面抄录。工具调用、流式 usage、结构化输出，以及 Together 自己的断开语义，未核实。Trust Center 列有 DPA，正文未读，本项目未签。转售与儿童未核实。允许的数据类别未核实。
+    evidence:
+      - "https://docs.together.ai/docs/privacy-and-security"
+      - "https://docs.together.ai/docs/zero-data-retention"
+      - "https://docs.together.ai/docs/serverless/overview"
+      - "https://trust.together.ai/"
+
+  - provider: fireworks
+    model: open-models
+    endpoint: serverless-chat
+    access: api
+    processing_regions: [unknown]
+    retention: with_exceptions
+    dpa: unsigned
+    allowed_data_classes: []
+    capabilities:
+      tool_calling: false
+      stream_usage: false
+      cache_pricing: false
+      structured_output: false
+      cancellation: false
+    verified_at: "2026-11-12"
+    notes: |
+      开放模型默认不把 prompt 写入持久存储，除非选择加入会记录内容的功能。法律或防止滥用仍可能留存，所以是有例外，不是 zdr。Responses API 在默认 store=true 时最多留 30 天。企业 ZDR 策略会拒绝 store=true、后台任务、批量和训练。公开驻留表只有不限制与美国。策略 API 枚举含 APAC，没有公开的新加坡无服务器端点。未限制时的实际区域未核实，写 unknown。prompt 缓存可在易失内存中保留数分钟，但标价未核实，cache_pricing 写 false。工具调用、流式 usage、结构化输出，以及 Fireworks 自己的断开语义，未核实。DPA 在 Trust Center，正文未读，未签。转售与儿童未核实。允许的数据类别未核实。
+    evidence:
+      - "https://docs.fireworks.ai/guides/security_compliance/data_handling"
+      - "https://docs.fireworks.ai/accounts/zero-data-retention"
+      - "https://docs.fireworks.ai/accounts/data-residency"
+      - "https://docs.fireworks.ai/api-reference/get-policy-settings"
+      - "https://docs.fireworks.ai/nexus/enterprise-controls"
+
+  - provider: groq
+    model: unspecified
+    endpoint: openai-chat-completions
+    access: api
+    processing_regions: [unknown]
+    retention: with_exceptions
+    dpa: unsigned
+    allowed_data_classes: []
+    capabilities:
+      tool_calling: false
+      stream_usage: false
+      cache_pricing: false
+      structured_output: false
+      cancellation: false
+    verified_at: "2026-11-12"
+    notes: |
+      草案把生产与预览型号放在同一行，模型 id 用 unspecified，不拆成尚未逐个核完能力的具体型号。默认不留推理正文。可靠性或滥用调查可留最多 30 天，批量与微调另计，所以留存是有例外；供应商仍把该推理路径标为 ZDR Eligible。被保留的客户数据位于美国 GCP。推理执行区域未核实，写 unknown，不写成 us。处理者协议列在政策索引，正文未读，未签。工具调用、流式 usage、缓存计价、结构化输出未核实。OpenRouter 把 Groq 列为流式取消尚未支持。转售与儿童未核实。允许的数据类别未核实。USD/1M token：gpt-oss-120b 输入 0.15、输出 0.60；gpt-oss-20b 输入 0.075、输出 0.30；qwen/qwen3.8-27b 输入 0.80、输出 4.00（预览）。Llama 企业版单价为 Contact Sales。
+    evidence:
+      - "https://console.groq.com/docs/your-data"
+      - "https://console.groq.com/docs/models"
+      - "https://console.groq.com/docs/model/qwen/qwen3.8-27b"
+      - "https://console.groq.com/docs/terms-of-use-ksa/"
+      - "https://openrouter.ai/docs/api_reference/streaming"
+
+  - provider: alibaba-model-studio-intl
+    model: workspace-default
+    endpoint: singapore-workspace
+    access: api
+    processing_regions: [unknown]
+    retention: retained
+    dpa: unsigned
+    allowed_data_classes: []
+    capabilities:
+      tool_calling: false
+      stream_usage: false
+      cache_pricing: false
+      structured_output: false
+      cancellation: false
+    verified_at: "2026-11-12"
+    notes: |
+      新加坡工作空间、ZDR 未开通时的默认。prompt 与响应留存不超过 30 天，法律或安全需要时可更长，故 retained。政策写未经另行同意不用于训练基础模型。接入和静态请求数据在新加坡，推理部署范围是不含中国大陆的全球节点，不是钉在新加坡。节点没有列全，区域写 unknown，不能写成 sg。企业 ZDR 不是本行。DPA、转售、儿童未核实。工具调用、流式 usage、结构化输出未核实。角色模型文档提到会话缓存按隐式缓存计费，是否覆盖全部聊天型号未核实，cache_pricing 写 false。OpenRouter 把 Alibaba 列为流式取消尚未支持，阿里云自己的断开语义未核实。qwen-plus（文档称当前等同 qwen-plus-2025-12-01），International，输入不超过 256K：USD/1M 输入 0.40，非思考输出 1.20，思考输出 4.00。256K 至 1M：输入 1.20，非思考输出 3.60，思考输出 12.00。允许的数据类别未核实。
+    evidence:
+      - "https://www.alibabacloud.com/help/en/model-studio/data-retention-policy"
+      - "https://www.alibabacloud.com/help/en/model-studio/regions/"
+      - "https://www.alibabacloud.com/help/en/model-studio/model-pricing"
+      - "https://www.alibabacloud.com/help/en/model-studio/role-play"
+
+  - provider: alibaba-model-studio-intl
+    model: zdr-adapted
+    endpoint: singapore-workspace
+    access: api
+    processing_regions: [unknown]
+    retention: with_exceptions
+    dpa: unsigned
+    allowed_data_classes: []
+    capabilities:
+      tool_calling: false
+      stream_usage: false
+      cache_pricing: false
+      structured_output: false
+      cancellation: false
+    verified_at: "2026-11-12"
+    notes: |
+      本行只描述「客户经理已开通 ZDR，且型号在留存政策第 4.1 节已适配清单内」。本项目没有这种工作空间，开通与否未核实。未适配型号不会被拦截，仍按最多 30 天留存。安全过滤标记的日志最长 2 年。RAG、批量、应用编排、控制台、有状态 Responses API 不在 ZDR 内。加密缓存窗口最长约 24 小时，所以留存是有例外，不能写成 zdr。文本系列起点见该政策：qwen3.8-max、qwen3.7-plus、qwen3.8-flash、deepseek-v4-pro-0813、deepseek-v4-flash-0731、glm-5.2、kimi-k2.7-code 及之后版本。第三方直接提供的模型不覆盖。接入在新加坡，推理仍是不含中国大陆的全球节点；能否收成单城未核实，区域写 unknown。标价随型号，未核实。各项能力、转售、儿童、DPA 正文未核实。允许的数据类别未核实。
+    evidence:
+      - "https://www.alibabacloud.com/help/en/model-studio/data-retention-policy"
+      - "https://www.alibabacloud.com/help/en/model-studio/regions/"
+
+  - provider: google-vertex
+    model: unspecified
+    endpoint: regional-sg
+    access: api
+    processing_regions: [sg]
+    retention: with_exceptions
+    dpa: unsigned
+    allowed_data_classes: []
+    capabilities:
+      tool_calling: false
+      stream_usage: false
+      cache_pricing: false
+      structured_output: false
+      cancellation: false
+    verified_at: "2026-11-12"
+    notes: |
+      只表示区域端点 asia-southeast1，不是全球端点。数据驻留文档写：机器学习处理发生在发出请求的区域或多区域，静态数据留在所选位置，故区域标签写 sg。2026-11-12 当天该区域在售型号清单未逐行核完，模型 id 用 unspecified，不填具体型号。不经许可不用于训练。滥用监测可能记录 prompt，零留存需要申请例外。Grounding 与 Interactions API 默认 store=true 会存储。持久缓存最长约 24 小时。留存为有例外，不写成 zdr。隐式缓存默认开启，但是留存控制，草案写明不是一张公开单价，cache_pricing 写 false。Cloud Data Processing Addendum 有公开 URL，正文未通读，本项目未签。OpenAI 兼容、工具调用、流式 usage、结构化输出未核实。OpenRouter 把 Google 列为流式取消尚未支持。价格未核实。允许的数据类别未核实。
+    evidence:
+      - "https://docs.cloud.google.com/gemini-enterprise-agent-platform/resources/zero-data-retention"
+      - "https://cloud.google.com/vertex-ai/generative-ai/docs/learn/data-residency"
+      - "https://cloud.google.com/terms/data-processing-addendum"
+      - "https://openrouter.ai/docs/guides/features/zdr"
+
+  - provider: siliconflow
+    model: unspecified
+    endpoint: inference-api
+    access: api
+    processing_regions: [unknown]
+    retention: retained
+    dpa: unsigned
+    allowed_data_classes: []
+    capabilities:
+      tool_calling: false
+      stream_usage: false
+      cache_pricing: false
+      structured_output: false
+      cancellation: false
+    verified_at: "2026-11-12"
+    notes: |
+      英文政策写：除非法律或服务规则要求，没有义务存储 Interaction Data。中文摘要把输入 prompt 和输出列为内容安全所收集的个人信息。两份一手政策冲突，英文站与中文站哪一份适用于国际调用未核实。冲突解开前不授予任何数据类别。留存、区域、DPA 和各项能力都取最坏值。中文价目页有缓存列，但适用站点和时区未核实，不能写成 cache_pricing。OpenRouter 把它标成零留存，那是路由商分类，不采用。中文站摘录 deepseek-ai/DeepSeek-V4.1-Flash（人民币/百万 token）：0点–2点与 8点–24点为输入 2.00、输出 8.00、缓存 0.04；2点–8点为输入 1.00、输出 4.00、缓存 0.02。时区未标明。
+    evidence:
+      - "https://docs.siliconflow.com/en/legals/privacy-policy"
+      - "https://docs.siliconflow.cn/docs/legals/privacy-policy-summary"
+      - "https://www.siliconflow.cn/pricing"
+      - "https://openrouter.ai/docs/guides/privacy/provider-logging"
+
+  - provider: opentyphoon
+    model: typhoon-v2.5-30b-a3b-instruct
+    endpoint: chat-completions
+    access: api
+    processing_regions: [unknown]
+    retention: retained
+    dpa: unsigned
+    allowed_data_classes: []
+    capabilities:
+      tool_calling: false
+      stream_usage: false
+      cache_pricing: false
+      structured_output: false
+      cancellation: false
+    verified_at: "2026-11-12"
+    notes: |
+      FAQ 写收集使用数据以改进模型与 API，不与第三方分享，故留存为 retained。这排除 child_edu。处理区域未核实。发布说明称模型适合工具调用，但 API 是否接受 OpenAI tools 字段未核实。文档索引写支持流式，include_usage 未核实；非流式示例含 usage 对象。没有 API 单价，FAQ 写免费。博客里的每百万 token 0.10 美元是自算的 H100 成本，不是 API 价，cache_pricing 写 false。结构化输出和取消未核实。速率：5 请求/秒，200 请求/分钟。上下文文档写 128K。文档站 2026-11-12 仍可打开，页内发布时间是 2025-12-12；当天是否仍提供该模型 ID 未核实。同站的 typhoon-v2.1-12b-instruct、typhoon-ocr、typhoon-asr-realtime 不另开行。DPA 未核实，按未签写。允许的数据类别未核实。
+    evidence:
+      - "https://docs.opentyphoon.ai/en/models/"
+      - "https://docs.opentyphoon.ai/en/faq/"
+      - "https://docs.opentyphoon.ai/en/rate-limits/"
+      - "https://docs.opentyphoon.ai/en/"
+      - "https://opentyphoon.ai/blog/en/introducing-typhoon-2-api-pro-accessible-production-grade-thai-llms-3e139c077aab"
+      - "https://opentyphoon.ai/blog/en/typhoon2-5-release"
+
+  - provider: together
+    model: scb10x/Typhoon-2-8B-instruct
+    endpoint: serverless
+    access: api
+    processing_regions: [unknown]
+    retention: retained
+    dpa: unsigned
+    allowed_data_classes: []
+    capabilities:
+      tool_calling: false
+      stream_usage: false
+      cache_pricing: false
+      structured_output: false
+      cancellation: false
+    verified_at: "2026-11-12"
+    notes: |
+      Together 型号页写：This model is not available on Together's Serverless API. 因此没有可引用的无服务器价格，也不能把本行当成可调用的无服务器端点。草案中间段含空格（scb10x Typhoon-2-8B-instruct）；模型 id 不能含空格，写成 scb10x/Typhoon-2-8B-instruct。这不是从该页抄来的调用名。处理区域、留存、工具调用、流式 usage、缓存计价、结构化输出、取消均未核实，取最坏值。DPA 未签。其他 Typhoon 型号的专属部署未核实。历史价格不填本行。允许的数据类别未核实。
+    evidence:
+      - "https://www.together.ai/models/typhoon-2-8b-instruct"
+
+  - provider: openrouter
+    model: scb10x/llama3.1-typhoon2-70b-instruct
+    endpoint: model-page
+    access: api
+    processing_regions: [unknown]
+    retention: retained
+    dpa: unsigned
+    allowed_data_classes: []
+    capabilities:
+      tool_calling: false
+      stream_usage: false
+      cache_pricing: false
+      structured_output: false
+      cancellation: false
+    verified_at: "2026-11-12"
+    notes: |
+      该 URL 返回站点外壳。价格、下游供应商和是否仍在售都没有从正文读到。不能把这个 URL 当成仍可购买的调用端点，endpoint 因此叫 model-page，不是 chat-completions。处理区域、留存和各项能力未核实，取最坏值。DPA 未签。Typhoon 博客曾通知 70B 计划于 2025-08-20 弃用；这条旧通知不能单独证明 2026-11-12 的上下架。允许的数据类别未核实。
+    evidence:
+      - "https://openrouter.ai/scb10x/llama3.1-typhoon2-70b-instruct"
+      - "https://opentyphoon.ai/blog/en/introducing-typhoon-2-api-pro-accessible-production-grade-thai-llms-3e139c077aab"
+
+  - provider: moonshot
+    model: unspecified
+    endpoint: official-api
+    access: api
+    processing_regions: [unknown]
+    retention: retained
+    dpa: unsigned
+    allowed_data_classes: []
+    capabilities:
+      tool_calling: false
+      stream_usage: false
+      cache_pricing: false
+      structured_output: false
+      cancellation: false
+    verified_at: "2026-11-12"
+    notes: |
+      线索只来自 OpenRouter 供应商表：总部新加坡、Zero retention、不训练。一手隐私政策、DPA、推理区域、型号、URL 和价格都没有打开。型号与 URL 未核实。全部取最坏值。本行不是许可，允许的数据类别为空。
+    evidence:
+      - "https://openrouter.ai/docs/guides/privacy/provider-logging"

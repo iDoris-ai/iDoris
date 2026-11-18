@@ -1,0 +1,308 @@
+{
+  "decisions": [
+    {
+      "admitted": {
+        "effective_max_tokens": 400,
+        "endpoint": {
+          "endpoint": "openai-compat",
+          "model": "example-org/chat-70b",
+          "provider": "example-zdr-host"
+        },
+        "payer": "s1",
+        "reservation": {
+          "cost": {
+            "micros": 300,
+            "unit": "USD"
+          },
+          "price": {
+            "micros": 588,
+            "unit": "THB"
+          }
+        }
+      },
+      "decision": "allow"
+    },
+    {
+      "admitted": {
+        "effective_max_tokens": 400,
+        "endpoint": {
+          "endpoint": "openai-compat",
+          "model": "example-org/chat-70b",
+          "provider": "example-zdr-host"
+        },
+        "payer": "s1",
+        "reservation": {
+          "cost": {
+            "micros": 300,
+            "unit": "USD"
+          },
+          "price": {
+            "micros": 588,
+            "unit": "THB"
+          }
+        }
+      },
+      "decision": "degrade",
+      "reason": "budget_degraded"
+    },
+    {
+      "admitted": {
+        "effective_max_tokens": 400,
+        "endpoint": {
+          "endpoint": "openai-compat",
+          "model": "example-org/chat-70b",
+          "provider": "example-zdr-host"
+        },
+        "payer": "s1",
+        "reservation": {
+          "cost": {
+            "micros": 300,
+            "unit": "USD"
+          },
+          "price": {
+            "micros": 588,
+            "unit": "THB"
+          }
+        }
+      },
+      "decision": "degrade",
+      "reason": "capacity_degraded"
+    },
+    {
+      "admitted": {
+        "effective_max_tokens": 400,
+        "endpoint": {
+          "endpoint": "openai-compat",
+          "model": "example-org/chat-70b",
+          "provider": "example-zdr-host"
+        },
+        "payer": "s1",
+        "reservation": {
+          "cost": {
+            "micros": 300,
+            "unit": "USD"
+          },
+          "price": {
+            "micros": 588,
+            "unit": "THB"
+          }
+        }
+      },
+      "decision": "degrade",
+      "reason": "upstream_failover"
+    },
+    {
+      "admitted": {
+        "effective_max_tokens": 400,
+        "endpoint": {
+          "endpoint": "openai-compat",
+          "model": "example-org/chat-70b",
+          "provider": "example-zdr-host"
+        },
+        "payer": "s1",
+        "reservation": {
+          "cost": {
+            "micros": 300,
+            "unit": "USD"
+          },
+          "price": {
+            "micros": 588,
+            "unit": "THB"
+          }
+        }
+      },
+      "decision": "grace"
+    },
+    {
+      "decision": "reject",
+      "reason": "budget_exhausted"
+    },
+    {
+      "decision": "reject",
+      "reason": "no_compliant_endpoint"
+    }
+  ],
+  "grace_grant": {
+    "shortfall": {
+      "micros": 50,
+      "unit": "THB"
+    }
+  },
+  "report": {
+    "max_admissible": {
+      "micros": 150,
+      "unit": "THB"
+    },
+    "reserve": {
+      "micros": 140,
+      "unit": "THB"
+    },
+    "results": [
+      {
+        "account": "s1",
+        "check": "funds",
+        "outcome": {
+          "result": "fail",
+          "shortfall": {
+            "micros": 20,
+            "unit": "THB"
+          }
+        }
+      },
+      {
+        "account": "s1",
+        "check": "credit_floor",
+        "outcome": {
+          "overdraft": {
+            "micros": 20,
+            "unit": "THB"
+          },
+          "result": "pass_using_credit"
+        }
+      },
+      {
+        "account": "s1",
+        "check": "rate_gate",
+        "outcome": {
+          "result": "not_configured"
+        }
+      },
+      {
+        "account": "s1",
+        "check": "in_flight_cap",
+        "outcome": {
+          "result": "not_configured"
+        }
+      },
+      {
+        "account": "s1",
+        "check": "subsidy_pool_cap",
+        "outcome": {
+          "result": "not_configured"
+        }
+      },
+      {
+        "account": "teacher",
+        "check": "funds",
+        "outcome": {
+          "result": "pass"
+        }
+      },
+      {
+        "account": "teacher",
+        "check": "credit_floor",
+        "outcome": {
+          "result": "not_needed"
+        }
+      },
+      {
+        "account": "teacher",
+        "check": "rate_gate",
+        "outcome": {
+          "result": "not_configured"
+        }
+      },
+      {
+        "account": "teacher",
+        "check": "in_flight_cap",
+        "outcome": {
+          "result": "not_configured"
+        }
+      },
+      {
+        "account": "teacher",
+        "check": "subsidy_pool_cap",
+        "outcome": {
+          "result": "not_configured"
+        }
+      },
+      {
+        "account": "eduai",
+        "check": "funds",
+        "outcome": {
+          "result": "not_configured"
+        }
+      },
+      {
+        "account": "eduai",
+        "check": "credit_floor",
+        "outcome": {
+          "result": "not_configured"
+        }
+      },
+      {
+        "account": "eduai",
+        "check": "rate_gate",
+        "outcome": {
+          "result": "pass"
+        },
+        "window": "minute"
+      },
+      {
+        "account": "eduai",
+        "check": "in_flight_cap",
+        "outcome": {
+          "result": "pass"
+        }
+      },
+      {
+        "account": "eduai",
+        "check": "subsidy_pool_cap",
+        "outcome": {
+          "result": "not_configured"
+        }
+      },
+      {
+        "account": "pool",
+        "check": "funds",
+        "outcome": {
+          "result": "not_configured"
+        }
+      },
+      {
+        "account": "pool",
+        "check": "credit_floor",
+        "outcome": {
+          "result": "not_configured"
+        }
+      },
+      {
+        "account": "pool",
+        "check": "rate_gate",
+        "outcome": {
+          "result": "not_configured"
+        }
+      },
+      {
+        "account": "pool",
+        "check": "in_flight_cap",
+        "outcome": {
+          "result": "not_configured"
+        }
+      },
+      {
+        "account": "pool",
+        "check": "subsidy_pool_cap",
+        "outcome": {
+          "result": "pass"
+        }
+      }
+    ]
+  },
+  "reserve": {
+    "amount": {
+      "micros": 2100,
+      "unit": "THB"
+    },
+    "effective_max_tokens": 4000,
+    "source": "as_requested"
+  },
+  "reserve_reduced_to_fit": {
+    "amount": {
+      "micros": 587,
+      "unit": "THB"
+    },
+    "effective_max_tokens": 397,
+    "source": "reduced_to_fit"
+  }
+}

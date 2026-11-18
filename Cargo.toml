@@ -3,6 +3,7 @@ resolver = "2"
 exclude = ["vendor/genai"]
 members = [
     "crates/idoris-contracts",
+    "crates/idoris-compute-contracts",
     "crates/idoris-backend",
     "crates/idoris-router",
     "crates/idoris-tenancy",
@@ -80,7 +81,7 @@ jsonschema = { version = "0.30", default-features = false }
 # advisories and source-registry policy, not "is a newer version out").
 # Track and bump `rusqlite`/`libsqlite3-sys` the moment a release bundling
 # SQLite >= 3.53.3 is available.
-rusqlite = { version = "0.40", default-features = false, features = ["bundled"] }
+rusqlite = { version = "0.42", default-features = false, features = ["bundled"] }
 # Billing-period boundaries need the tenant's explicit IANA time zone
 # (contract-tenancy §3/§6, `billing_timezone`); `chrono-tz` carries the real
 # IANA tzdata (public domain), which is what makes DST/offset math track
@@ -95,6 +96,7 @@ chrono = { version = "0.4", default-features = false, features = ["std"] }
 chrono-tz = "0.10"
 
 idoris-contracts = { path = "crates/idoris-contracts" }
+idoris-compute-contracts = { path = "crates/idoris-compute-contracts" }
 idoris-backend = { path = "crates/idoris-backend" }
 idoris-tenancy = { path = "crates/idoris-tenancy" }
 idoris-recommender = { path = "crates/idoris-recommender" }

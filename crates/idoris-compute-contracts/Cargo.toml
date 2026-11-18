@@ -1,0 +1,28 @@
+[package]
+name = "idoris-compute-contracts"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "idoris.ai/api 计算服务 S0 契约冻结：带类型的金额、核心对象、准入原因码、请求/尝试状态机、端点许可表、部署形态。只有类型、校验、纯函数，没有存储、IO 和接线。"
+
+[lints]
+workspace = true
+
+[dependencies]
+# 仅为 `DeploymentForm` 与既有 `deploy_mode: personal | tenant` 共存（form.rs）。
+# 单向依赖：本 crate -> idoris-contracts，反向没有，也不修改 idoris-contracts。
+idoris-contracts = { workspace = true }
+serde = { workspace = true }
+# 端点许可表从 YAML 加载（permit.rs）。workspace 里已有，不是新依赖。
+serde_yaml = { workspace = true }
+thiserror = { workspace = true }
+# 许可表的 `verified_at` 接受 RFC 3339 / 纯日期，日期解析不手写（permit.rs）。
+# workspace 里已有（idoris-tenancy 在用），只用 std 特性，不带 clock。
+chrono = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+# 仓库已有做法：idoris-policy 的性质测试就用 proptest。
+proptest = "1"

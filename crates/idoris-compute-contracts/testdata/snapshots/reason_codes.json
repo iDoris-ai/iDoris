@@ -1,0 +1,34 @@
+{
+  "codes": [
+    "budget_degraded",
+    "capacity_degraded",
+    "upstream_failover",
+    "grace_used",
+    "budget_exhausted",
+    "rate_limited",
+    "in_flight_limited",
+    "subsidy_pool_exhausted",
+    "no_compliant_endpoint",
+    "credential_frozen",
+    "credential_revoked",
+    "credential_expired",
+    "principal_revoked",
+    "membership_revoked",
+    "account_inactive",
+    "payment_context_invalid"
+  ],
+  "tiers": {
+    "degraded": [
+      "budget_degraded",
+      "capacity_degraded",
+      "upstream_failover"
+    ],
+    "exhausted": [
+      "budget_exhausted"
+    ],
+    "grace": [
+      "grace_used"
+    ],
+    "normal": []
+  }
+}

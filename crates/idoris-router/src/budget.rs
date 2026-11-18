@@ -45,14 +45,90 @@ pub(crate) fn completion_reservation_tokens(body: &Value) -> Result<u64, &'stati
     Ok(completion)
 }
 
-/// No virtual-key system exists yet (interface spec §3.2's key vault isn't
-/// implemented) — every reservation uses this fixed key id until one is.
-const DEFAULT_KEY_ID: &str = "default";
+/// The `key_id` the ledger records for a request that carries **no virtual
+/// key**: the personal-deployment `IDORIS_DEV_NO_KEY=1` path, and library
+/// callers that wire no authenticator.
+///
+/// This is deliberately the very value every ledger row used before the
+/// virtual-key system was wired into the budget (the old private
+/// `DEFAULT_KEY_ID`). Historical rows, and any sub-scope limit configured
+/// against them, are keyed on it, so keeping the value keeps those rows
+/// readable and keeps them counting toward the same tenant total. It is a
+/// named, tested constant rather than an empty string or a new sentinel;
+/// a real virtual key id is always `vk_` plus 32 hex digits, so the two
+/// can never collide.
+pub const NO_VIRTUAL_KEY_ID: &str = "default";
 
 /// Ledger bookkeeping key for a personal deployment (no `X-iDoris-Tenant`
 /// header, no tenant mode) — purely internal, distinct from the wire-level
 /// "tenant mode requires X-iDoris-Tenant" gate in `profile.rs`.
 pub const PERSONAL_TENANT_ID: &str = "personal";
+
+/// Which virtual key and which model a reservation is recorded under.
+///
+/// Before S1 every reservation was written as `(default, provider, provider)`:
+/// the key was a placeholder and the model column held the provider id.
+/// Now both are the real values known when the reservation is made — the
+/// authenticated virtual key's id, and the model that will actually serve the
+/// request. A settlement needs neither again: it inherits both from the
+/// reservation row it settles.
+///
+/// The tenant total is unaffected by either field; the ledger sums spend and
+/// in-flight reservations per tenant, so changing which key or model a request
+/// is recorded under never creates a fresh allowance.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BudgetIdentity {
+    key_id: String,
+    model_id: String,
+}
+
+impl BudgetIdentity {
+    /// - `key_id`: the id of the virtual key that authenticated the request,
+    ///   or `None` when no virtual key is involved (recorded as
+    ///   [`NO_VIRTUAL_KEY_ID`]).
+    /// - `model`: the model name that will serve the request (the backend
+    ///   model for a local call, the model forwarded upstream for a direct
+    ///   call). Recorded as given when it is a valid S0 `ModelId` (at most 128
+    ///   bytes of letters, digits and `. _ - : ~ /`, which covers
+    ///   `gpt-4o`, `qwen3:4b`, `org/model-name`).
+    /// - `provider_id`: the component card's id, used as the model when none
+    ///   was named or the name is not a valid `ModelId`. An unbounded,
+    ///   caller-chosen string must not be written into every ledger row, so
+    ///   an odd name degrades to the card (which is what was recorded before
+    ///   S1) instead of being stored or rejected.
+    pub fn resolve(key_id: Option<&str>, model: Option<&str>, provider_id: &str) -> Self {
+        Self {
+            key_id: key_id.unwrap_or(NO_VIRTUAL_KEY_ID).to_string(),
+            model_id: ledger_model_id(model, provider_id),
+        }
+    }
+
+    /// As [`resolve`](Self::resolve), taking the model from a request body's
+    /// top-level `"model"` string (the value forwarded upstream). A missing
+    /// or non-string `model` is "none named".
+    pub fn for_request(key_id: Option<&str>, body: &serde_json::Value, provider_id: &str) -> Self {
+        Self::resolve(
+            key_id,
+            body.get("model").and_then(serde_json::Value::as_str),
+            provider_id,
+        )
+    }
+
+    pub fn key_id(&self) -> &str {
+        &self.key_id
+    }
+
+    pub fn model_id(&self) -> &str {
+        &self.model_id
+    }
+}
+
+fn ledger_model_id(model: Option<&str>, provider_id: &str) -> String {
+    match model {
+        Some(name) if idoris_compute_contracts::ids::ModelId::new(name).is_ok() => name.to_string(),
+        _ => provider_id.to_string(),
+    }
+}
 
 /// Shared math for [`estimate_cost_minor`]/[`estimate_actual_cost_minor`]:
 /// `Some(0)` for exactly-free, `None` for malformed (negative/non-finite)
@@ -185,9 +261,13 @@ pub fn estimate_actual_cost_minor(
 /// is wired at all — same shape `reserve` would fail with against an
 /// unconfigured scope, so callers can treat "no ledger" and "ledger has no
 /// config for this scope" identically.
-pub fn ledger_unavailable_error(tenant_id: Option<&str>, provider_id: &str) -> BudgetError {
+pub fn ledger_unavailable_error(
+    tenant_id: Option<&str>,
+    identity: &BudgetIdentity,
+    provider_id: &str,
+) -> BudgetError {
     BudgetError::NotConfigured {
-        scope: scope(tenant_id, provider_id),
+        scope: scope(tenant_id, identity, provider_id),
     }
 }
 
@@ -197,21 +277,28 @@ pub fn is_paid(estimated_cost_minor: Option<i64>) -> bool {
     estimated_cost_minor.is_some_and(|v| v > 0)
 }
 
-fn scope(tenant_id: Option<&str>, provider_id: &str) -> BudgetScope {
+fn scope(tenant_id: Option<&str>, identity: &BudgetIdentity, provider_id: &str) -> BudgetScope {
     let tenant_id = tenant_id.unwrap_or(PERSONAL_TENANT_ID);
-    BudgetScope::new(tenant_id, DEFAULT_KEY_ID, provider_id, provider_id)
+    BudgetScope::new(
+        tenant_id,
+        identity.key_id(),
+        provider_id,
+        identity.model_id(),
+    )
 }
 
 /// Reserves `estimated_cost_minor` for `provider_id` against `tenant_id`
-/// (`None` → [`PERSONAL_TENANT_ID`]).
+/// (`None` → [`PERSONAL_TENANT_ID`]), recorded under `identity`'s real key
+/// and model.
 pub fn reserve(
     ledger: &BudgetLedger,
     tenant_id: Option<&str>,
+    identity: &BudgetIdentity,
     provider_id: &str,
     estimated_cost_minor: i64,
 ) -> Result<ReservationId, BudgetError> {
     ledger.reserve(
-        &scope(tenant_id, provider_id),
+        &scope(tenant_id, identity, provider_id),
         Price::Known(estimated_cost_minor),
     )
 }
@@ -220,11 +307,12 @@ pub fn reserve(
 pub fn check_admission(
     ledger: &BudgetLedger,
     tenant_id: Option<&str>,
+    identity: &BudgetIdentity,
     provider_id: &str,
     estimated_cost_minor: i64,
 ) -> Result<(), BudgetError> {
     ledger.check_admission(
-        &scope(tenant_id, provider_id),
+        &scope(tenant_id, identity, provider_id),
         Price::Known(estimated_cost_minor),
     )
 }
@@ -386,12 +474,23 @@ mod tests {
         );
     }
 
+    /// No virtual key, no model named: records exactly what every pre-S1 row carries.
+    fn unkeyed() -> BudgetIdentity {
+        BudgetIdentity::resolve(None, None, "omlx")
+    }
+
     #[test]
     fn ledger_unavailable_error_matches_a_real_not_configured_rejection() {
         let (_dir, ledger) = ledger();
-        let via_helper = ledger_unavailable_error(Some("acme"), "omlx");
-        let via_real_call = reserve(&ledger, Some("acme"), "omlx", 500).unwrap_err();
+        let via_helper = ledger_unavailable_error(Some("acme"), &unkeyed(), "omlx");
+        let via_real_call = reserve(&ledger, Some("acme"), &unkeyed(), "omlx", 500).unwrap_err();
         assert_eq!(via_helper, via_real_call);
+        // The same holds for a real key and model: the "no ledger" error names the same scope.
+        let real = BudgetIdentity::resolve(Some("vk_abc"), Some("qwen3:4b"), "omlx");
+        assert_eq!(
+            ledger_unavailable_error(Some("acme"), &real, "omlx"),
+            reserve(&ledger, Some("acme"), &real, "omlx", 500).unwrap_err()
+        );
     }
 
     fn ledger() -> (TempDir, BudgetLedger) {
@@ -401,19 +500,169 @@ mod tests {
     }
 
     #[test]
+    fn the_no_key_value_is_the_one_every_historical_row_carries() {
+        // Pinned on purpose: changing it would orphan every historical row and any sub-scope limit
+        // configured against it.
+        assert_eq!(NO_VIRTUAL_KEY_ID, "default");
+        assert!(!NO_VIRTUAL_KEY_ID.is_empty());
+        // A real key id (`vk_` + 32 hex) can never equal it.
+        assert!(!NO_VIRTUAL_KEY_ID.starts_with("vk_"));
+    }
+
+    #[test]
+    fn no_key_and_no_model_reproduces_the_pre_s1_scope_exactly() {
+        // The legacy tuple: (tenant, "default", provider, provider).
+        assert_eq!(
+            scope(None, &unkeyed(), "omlx"),
+            BudgetScope::new(PERSONAL_TENANT_ID, "default", "omlx", "omlx")
+        );
+        assert_eq!(
+            scope(Some("acme"), &unkeyed(), "omlx"),
+            BudgetScope::new("acme", "default", "omlx", "omlx")
+        );
+    }
+
+    #[test]
+    fn a_real_key_and_model_replace_both_placeholders() {
+        let identity = BudgetIdentity::resolve(
+            Some("vk_0123456789abcdef0123456789abcdef"),
+            Some("mlx-community/Qwen3-4B-4bit"),
+            "omlx",
+        );
+        assert_eq!(identity.key_id(), "vk_0123456789abcdef0123456789abcdef");
+        assert_eq!(identity.model_id(), "mlx-community/Qwen3-4B-4bit");
+        assert_eq!(
+            scope(Some("acme"), &identity, "omlx"),
+            BudgetScope::new(
+                "acme",
+                "vk_0123456789abcdef0123456789abcdef",
+                "omlx",
+                "mlx-community/Qwen3-4B-4bit"
+            )
+        );
+        // The provider column is still the provider, never the model, and the model is no longer the provider.
+        let scope = scope(None, &identity, "omlx");
+        assert_eq!(scope.provider_id, "omlx");
+        assert_ne!(scope.model_id, scope.provider_id);
+    }
+
+    #[test]
+    fn an_unnamed_or_unusable_model_name_degrades_to_the_provider_id() {
+        let long_ok = "m".repeat(128);
+        let too_long = "m".repeat(129);
+        for ok in [
+            "gpt-4o",
+            "qwen3:4b",
+            "org/model-name",
+            "mlx-community/Qwen3-4B-4bit",
+            "a.b_c~d-9",
+            long_ok.as_str(),
+        ] {
+            assert_eq!(
+                BudgetIdentity::resolve(None, Some(ok), "omlx").model_id(),
+                ok,
+                "{ok}"
+            );
+        }
+        for odd in [
+            "",
+            " ",
+            "has space",
+            "a@b",
+            "line\nbreak",
+            "学生",
+            "model#1",
+            too_long.as_str(),
+        ] {
+            assert_eq!(
+                BudgetIdentity::resolve(None, Some(odd), "omlx").model_id(),
+                "omlx",
+                "{odd:?} must not be written into the ledger"
+            );
+        }
+        assert_eq!(
+            BudgetIdentity::resolve(None, None, "omlx").model_id(),
+            "omlx"
+        );
+    }
+
+    #[test]
+    fn for_request_reads_the_forwarded_model_from_the_body() {
+        let named = serde_json::json!({"model": "vendor/model-v2", "messages": []});
+        assert_eq!(
+            BudgetIdentity::for_request(Some("vk_1"), &named, "omlx"),
+            BudgetIdentity::resolve(Some("vk_1"), Some("vendor/model-v2"), "omlx")
+        );
+        // Missing, null, or a non-string `model` count as "none named".
+        for body in [
+            serde_json::json!({"messages": []}),
+            serde_json::json!({"model": null}),
+            serde_json::json!({"model": 7}),
+            serde_json::json!({"model": ["a"]}),
+            serde_json::json!("not an object"),
+        ] {
+            let identity = BudgetIdentity::for_request(None, &body, "omlx");
+            assert_eq!(identity.model_id(), "omlx", "{body}");
+            assert_eq!(identity.key_id(), NO_VIRTUAL_KEY_ID);
+        }
+    }
+
+    #[test]
+    fn a_reservation_and_its_settlement_land_under_the_real_key_and_model() {
+        let (dir, ledger) = ledger();
+        ledger
+            .configure_tenant("acme", 10_000, "UTC", SpendGate::PaidOnly)
+            .unwrap();
+        let identity = BudgetIdentity::resolve(Some("vk_real"), Some("qwen3:4b"), "omlx");
+        let id = reserve(&ledger, Some("acme"), &identity, "omlx", 500).unwrap();
+        settle(&ledger, Some("acme"), &id, 400).unwrap();
+
+        let conn = rusqlite::Connection::open(dir.path().join("budget.sqlite3")).unwrap();
+        let row: (String, String, String) = conn
+            .query_row(
+                "SELECT key_id, provider_id, model_id FROM reservations WHERE id = ?1",
+                [&id.0],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(row, ("vk_real".into(), "omlx".into(), "qwen3:4b".into()));
+        // Settlement inherits both from the row: spend is booked under the same real scope.
+        let spent: i64 = conn
+            .query_row(
+                "SELECT spent_minor FROM budget_periods WHERE tenant_id='acme' AND key_id='vk_real' \
+                 AND provider_id='omlx' AND model_id='qwen3:4b'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(spent, 400);
+        let placeholders: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM reservations WHERE key_id = 'default' OR model_id = provider_id",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            placeholders, 0,
+            "no placeholder may be written once the identity is known"
+        );
+    }
+
+    #[test]
     fn reserve_settle_release_round_trip() {
         let (_dir, ledger) = ledger();
         ledger
             .configure_tenant("acme", 10_000, "UTC", SpendGate::PaidOnly)
             .unwrap();
 
-        let id = reserve(&ledger, Some("acme"), "omlx", 500).unwrap();
+        let id = reserve(&ledger, Some("acme"), &unkeyed(), "omlx", 500).unwrap();
         let charged = settle(&ledger, Some("acme"), &id, 400).unwrap();
         assert_eq!(charged, 400);
 
         // A second reservation, released instead of settled, must not count
         // against the balance afterward.
-        let id2 = reserve(&ledger, Some("acme"), "omlx", 500).unwrap();
+        let id2 = reserve(&ledger, Some("acme"), &unkeyed(), "omlx", 500).unwrap();
         release(&ledger, Some("acme"), &id2).unwrap();
         let balance = ledger.tenant_balance("acme").unwrap();
         assert_eq!(balance, 10_000 - 400);
@@ -426,7 +675,7 @@ mod tests {
             .configure_tenant("acme", 10_000, "UTC", SpendGate::PaidOnly)
             .unwrap();
 
-        let id = reserve(&ledger, Some("acme"), "omlx", 1).unwrap();
+        let id = reserve(&ledger, Some("acme"), &unkeyed(), "omlx", 1).unwrap();
         assert_eq!(settle_replayable(&ledger, Some("acme"), &id, 5).unwrap(), 5);
         let once = ledger.tenant_readview("acme").unwrap();
         assert_eq!((once.spent_minor, once.reserved_minor), (5, 0));
@@ -439,7 +688,7 @@ mod tests {
     #[test]
     fn reserve_without_configuration_fails_closed() {
         let (_dir, ledger) = ledger();
-        let err = reserve(&ledger, Some("nobody"), "omlx", 500).unwrap_err();
+        let err = reserve(&ledger, Some("nobody"), &unkeyed(), "omlx", 500).unwrap_err();
         assert!(matches!(err, BudgetError::NotConfigured { .. }));
     }
 
@@ -449,7 +698,7 @@ mod tests {
         ledger
             .configure_tenant(PERSONAL_TENANT_ID, 1_000, "UTC", SpendGate::PaidOnly)
             .unwrap();
-        let id = reserve(&ledger, None, "omlx", 100).unwrap();
+        let id = reserve(&ledger, None, &unkeyed(), "omlx", 100).unwrap();
         settle(&ledger, None, &id, 100).unwrap();
         assert_eq!(ledger.tenant_balance(PERSONAL_TENANT_ID).unwrap(), 900);
     }

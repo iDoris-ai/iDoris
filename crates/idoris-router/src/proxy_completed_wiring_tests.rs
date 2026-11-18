@@ -393,6 +393,7 @@ async fn chat_open_breaker_without_dispatch_never_records_completed() {
             let reservation = proxy_budget::ProxyBudget::new(
                 state.budget_ledger.as_deref(),
                 None,
+                budget::BudgetIdentity::resolve(None, None, &selected.card.provider.id),
                 &selected.card.provider.id,
                 selected.estimated_cost_minor,
             )
