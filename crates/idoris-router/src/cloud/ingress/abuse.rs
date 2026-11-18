@@ -591,8 +591,9 @@ mod tests {
 
     #[test]
     fn a_refusal_by_the_global_budget_gives_the_source_token_back() {
-        // 全局只有 1 个令牌，每个来源 1 个
-        let budget = AuthBudget::new(100, limit(60, 1), limit(60, 1), 0);
+        // 全局只有 1 个令牌（每秒补 1 个）；每个来源也只有 1 个，但每分钟才补 1 个——一秒钟之内来源自己补不回来，
+        // 所以 b 之后能不能过，只取决于它被全局拒绝的那一次有没有把令牌退回去
+        let budget = AuthBudget::new(100, limit(60, 1), limit(1, 1), 0);
         let (a, b) = (ip("198.51.100.1"), ip("198.51.100.2"));
         assert!(budget.admit(a, Some(1), 0).is_ok()); // 全局用完
         assert!(budget.admit(b, Some(2), 0).is_err()); // b 被全局拒绝：它自己的令牌必须退回

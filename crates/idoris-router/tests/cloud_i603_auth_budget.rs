@@ -273,3 +273,28 @@ async fn a_source_refused_by_its_own_share_never_spends_the_global_budget() {
         "the global budget is the shared gate in front of the database"
     );
 }
+
+#[tokio::test]
+async fn a_source_share_that_is_not_below_the_global_budget_is_reported_at_startup() {
+    // 比例配反（单来源的份额不小于全局总闸）等于没修：一个来源还是能耗光总闸。启动时要对运维说一声
+    let risky = World::new(WorldOptions::plenty().ingress(
+        IngressYaml::default().abuse("  auth_unknown: {requests_per_minute: 60, burst: 3}\n"),
+    ))
+    .await;
+    let warnings = risky.ingress.startup_warnings(&risky.accounts);
+    assert!(
+        warnings
+            .iter()
+            .any(|warning| warning.contains("per_source_auth_unknown")),
+        "{warnings:?}"
+    );
+    // 默认配置没有这条警告
+    let sane = World::new(WorldOptions::plenty()).await;
+    let warnings = sane.ingress.startup_warnings(&sane.accounts);
+    assert!(
+        warnings
+            .iter()
+            .all(|warning| !warning.contains("per_source_auth_unknown")),
+        "{warnings:?}"
+    );
+}

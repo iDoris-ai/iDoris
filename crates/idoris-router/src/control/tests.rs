@@ -3021,6 +3021,63 @@ async fn requests_without_a_known_source_share_one_bucket_apart_from_every_real_
 }
 
 #[tokio::test]
+async fn authorization_outcomes_never_depend_on_the_tcp_peer_even_though_the_redeem_limiter_reads_it()
+ {
+    // 兑换的失败限速按来源分桶，是控制面里唯一读来源的地方。授权不能因此和来源有关：同一个请求从任何来源发来
+    // （没有对端、loopback、局域网、公网、IPv6），状态码和原因码都一样
+    let world = World::new();
+    let root = world.root.secret.clone();
+    let reader = world.reader.secret.clone();
+    let account = json!({"account_id": "z", "kind": "member", "parent": "s1", "unit": "THB"});
+    let cases: Vec<(&str, &str, Option<&str>, Option<Value>)> = vec![
+        ("GET", "/control/v1/whoami", Some(root.as_str()), None),
+        (
+            "GET",
+            "/control/v1/accounts/eduai",
+            Some(reader.as_str()),
+            None,
+        ),
+        // 超出范围、没有这个操作的权限、没有凭证：照样是各自固定的拒绝
+        (
+            "GET",
+            "/control/v1/accounts/school-b",
+            Some(reader.as_str()),
+            None,
+        ),
+        (
+            "POST",
+            "/control/v1/accounts",
+            Some(reader.as_str()),
+            Some(account),
+        ),
+        ("GET", "/control/v1/whoami", None, None),
+    ];
+    for (verb, uri, bearer, body) in cases {
+        let mut outcomes = std::collections::BTreeSet::new();
+        for peer in [
+            None,
+            Some("127.0.0.1"),
+            Some("10.0.0.5"),
+            Some("203.0.113.9"),
+            Some("::1"),
+            Some("2001:db8::7"),
+        ] {
+            let reply = send_from(&world.app, peer, verb, uri, bearer, body.clone(), &[]).await;
+            let reason = reply.json["error"]["reason_code"]
+                .as_str()
+                .unwrap_or("ok")
+                .to_string();
+            outcomes.insert((reply.status.as_u16(), reason));
+        }
+        assert_eq!(
+            outcomes.len(),
+            1,
+            "{verb} {uri}: the answer depends on where the request came from: {outcomes:?}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn the_real_listener_gives_every_redeem_request_its_tcp_peer_as_the_source() {
     // 上面的测试是把对端地址手工挂到请求上；这一条走真的监听器（组织形态：控制面合并在数据面之后，不经过任何边缘中间件），
     // 证明生产里每个兑换请求的来源就是 TCP 对端，而不是「来源未知」的那个共用桶。
