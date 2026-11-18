@@ -207,11 +207,27 @@ pub fn build_chat_body(call: &ChatCall<'_>) -> Result<Vec<u8>, BuildError> {
         body.insert(field.to_string(), value.clone());
     }
     // 端点级固定字段盖在客户端字段之上（比如聚合路由的「只走 ZDR」路由参数）。保留字段与白名单外的键一个都不收：配置加载时
-    // 已经拒绝（`disallowed_extra_body_field`），这里再跳过一遍，绕过配置校验直接构造设置的调用方也改不了它们。
+    // 已经拒绝（`disallowed_extra_body_field`），这里再按同一张白名单过滤一遍（顶层键，以及 `provider` 里的子键与取值类型），
+    // 绕过配置校验直接构造设置的调用方也改不了它们。`provider` 里坏的子键只丢它自己，不连带丢掉 `zdr`。
     for (key, value) in call.extra_body {
         if RESERVED_EXTRA_BODY_FIELDS.contains(&key.as_str())
             || !ALLOWED_EXTRA_BODY_FIELDS.contains(&key.as_str())
         {
+            continue;
+        }
+        if key == "provider" {
+            let Some(provider) = value.as_object() else {
+                continue;
+            };
+            let kept: Map<String, Value> = provider
+                .iter()
+                .filter(|(inner, inner_value)| {
+                    ALLOWED_EXTRA_BODY_PROVIDER_KEYS.contains(&inner.as_str())
+                        && inner_value.is_boolean()
+                })
+                .map(|(inner, inner_value)| (inner.clone(), inner_value.clone()))
+                .collect();
+            body.insert(key.clone(), Value::Object(kept));
             continue;
         }
         body.insert(key.clone(), value.clone());
@@ -675,5 +691,19 @@ mod tests {
         );
         assert_eq!(body["provider"], json!({"zdr": true}));
         assert!(body.get("models").is_none() && body.get("plugins").is_none());
+        // `provider` 里的子键同样只带白名单内的布尔值；坏的子键不能连带丢掉 `zdr`（丢掉就可能路由到留存数据的供应商）
+        let body = build(
+            json!({"messages": [{"role": "user", "content": "x"}]}),
+            false,
+            json!({"provider": {"zdr": true, "order": ["a"], "allow_fallbacks": "yes", "data_collection": "allow"}}),
+        );
+        assert_eq!(body["provider"], json!({"zdr": true}));
+        // `provider` 不是对象：整个不带
+        let body = build(
+            json!({"messages": [{"role": "user", "content": "x"}]}),
+            false,
+            json!({"provider": "x"}),
+        );
+        assert!(body.get("provider").is_none());
     }
 }
