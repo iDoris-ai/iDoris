@@ -50,8 +50,19 @@ name = "budget_mutation_hooks"
 path = "tests/budget_mutation_hooks.rs"
 required-features = ["mutation-test-hooks"]
 
+# S3 准入账本的同类钩子（`accounts::ledger::hooks`）：证明并发测试抓得住「检查和写预留不在同一个事务」。
+# 同样是进程全局状态，所以单独一个测试二进制。
+[[test]]
+name = "ledger_mutation_hooks"
+path = "tests/ledger_mutation_hooks.rs"
+required-features = ["mutation-test-hooks"]
+
 [dependencies]
 idoris-contracts = { workspace = true }
+# S1: the account store maps its rows onto the frozen S0 contract types (workspace-internal path
+# dependency, not a third-party crate).
+# S4：尝试记录与结算分录（`attempts`）持久化 S0 契约类型，状态变更只走契约的 `transition`。
+idoris-compute-contracts = { workspace = true }
 rusqlite = { workspace = true }
 uuid = { workspace = true }
 sha2 = { workspace = true }

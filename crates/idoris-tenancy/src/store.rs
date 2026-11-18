@@ -71,6 +71,12 @@ impl TenantStore {
         Ok(Self { conn })
     }
 
+    /// This connection's `journal_mode` / `busy_timeout` / `foreign_keys`, for
+    /// assertions and diagnostics (see [`crate::sqlite_conn`]).
+    pub fn connection_pragmas(&self) -> Result<crate::sqlite_conn::PragmaSnapshot, StoreError> {
+        crate::sqlite_conn::snapshot(&self.conn).map_err(StoreError::from)
+    }
+
     /// Reject mismatched tenants and duplicate keys without overwriting records.
     pub fn put(&self, scope: Option<&str>, record: &TenantRecord) -> Result<(), StoreError> {
         let scope = required_scope(scope)?;

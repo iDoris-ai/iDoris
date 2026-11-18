@@ -20,6 +20,9 @@ dev-mock = ["idoris-policy/dev-mock"]
 
 [dependencies]
 idoris-contracts = { workspace = true }
+# S4：云上游（`cloud` 模块）用 S0 契约的类型和纯函数驱动真实的上游调用。
+# S1: deployment form (`IDORIS_FORM`) and the frozen model-id type; workspace-internal path dependency.
+idoris-compute-contracts = { workspace = true }
 idoris-policy = { workspace = true }
 idoris-backend = { workspace = true }
 idoris-tenancy = { workspace = true }
@@ -59,7 +62,9 @@ ring = "0.17"
 subtle = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
-nix = { workspace = true, features = ["poll"] }
+# S6：`resource` 只用来调用 `setrlimit(RLIMIT_CORE, 0, 0)`（处理儿童数据的部署关闭崩溃转储，见
+# `cloud::safety::hardening`）。这是已有依赖的一个 feature，没有新增任何 crate，Cargo.lock 不变。
+nix = { workspace = true, features = ["poll", "resource"] }
 
 [dev-dependencies]
 async-trait = { workspace = true }

@@ -110,6 +110,13 @@ impl EventLogStore {
         Ok(Self(Mutex::new(conn)))
     }
 
+    /// This connection's `journal_mode` / `busy_timeout` / `foreign_keys`, for
+    /// assertions and diagnostics (see [`crate::sqlite_conn`]).
+    pub fn connection_pragmas(&self) -> Result<crate::sqlite_conn::PragmaSnapshot, EventLogError> {
+        let conn = self.0.lock().map_err(|_| EventLogError::LockPoisoned)?;
+        crate::sqlite_conn::snapshot(&conn).map_err(EventLogError::from)
+    }
+
     pub fn append(&self, scope: Option<&str>, event: &NewEvent) -> Result<i64, EventLogError> {
         let scope = required_scope(scope)?;
         validate_event(scope, event)?;

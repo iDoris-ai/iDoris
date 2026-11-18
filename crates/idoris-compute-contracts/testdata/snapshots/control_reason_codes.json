@@ -1,0 +1,190 @@
+{
+  "audit_outcomes": [
+    "success",
+    "replayed",
+    "unchanged",
+    "denied",
+    "rejected",
+    "error"
+  ],
+  "operations": [
+    "create_account",
+    "set_account_status",
+    "manage_membership",
+    "issue_credential",
+    "revoke_credential",
+    "freeze_credential",
+    "grant_allocation",
+    "create_principal",
+    "revoke_principal",
+    "read"
+  ],
+  "reasons": [
+    {
+      "audit_outcome": "denied",
+      "code": "unauthenticated"
+    },
+    {
+      "audit_outcome": "denied",
+      "code": "credential_revoked"
+    },
+    {
+      "audit_outcome": "denied",
+      "code": "credential_frozen"
+    },
+    {
+      "audit_outcome": "denied",
+      "code": "credential_expired"
+    },
+    {
+      "audit_outcome": "denied",
+      "code": "account_inactive"
+    },
+    {
+      "audit_outcome": "denied",
+      "code": "not_a_control_credential"
+    },
+    {
+      "audit_outcome": "denied",
+      "code": "op_not_granted"
+    },
+    {
+      "audit_outcome": "denied",
+      "code": "out_of_scope"
+    },
+    {
+      "audit_outcome": "denied",
+      "code": "amount_exceeds_authority"
+    },
+    {
+      "audit_outcome": "denied",
+      "code": "amount_unit_mismatch"
+    },
+    {
+      "audit_outcome": "denied",
+      "code": "scope_exceeds_grantor"
+    },
+    {
+      "audit_outcome": "denied",
+      "code": "scope_outside_binding"
+    },
+    {
+      "audit_outcome": "denied",
+      "code": "ceiling_exceeds_grantor"
+    },
+    {
+      "audit_outcome": "denied",
+      "code": "expiry_exceeds_grantor"
+    },
+    {
+      "audit_outcome": "denied",
+      "code": "would_disable_caller"
+    },
+    {
+      "audit_outcome": "rejected",
+      "code": "invalid_request"
+    },
+    {
+      "audit_outcome": "rejected",
+      "code": "invalid_account"
+    },
+    {
+      "audit_outcome": "rejected",
+      "code": "invalid_membership"
+    },
+    {
+      "audit_outcome": "rejected",
+      "code": "invalid_credential"
+    },
+    {
+      "audit_outcome": "rejected",
+      "code": "invalid_allocation"
+    },
+    {
+      "audit_outcome": "rejected",
+      "code": "invalid_amount"
+    },
+    {
+      "audit_outcome": "rejected",
+      "code": "principal_revoked"
+    },
+    {
+      "audit_outcome": "rejected",
+      "code": "membership_revoked"
+    },
+    {
+      "audit_outcome": "rejected",
+      "code": "already_exists"
+    },
+    {
+      "audit_outcome": "rejected",
+      "code": "idempotency_conflict"
+    },
+    {
+      "audit_outcome": "rejected",
+      "code": "illegal_transition"
+    },
+    {
+      "audit_outcome": "rejected",
+      "code": "allocation_exceeds_grantor"
+    },
+    {
+      "audit_outcome": "rejected",
+      "code": "grantor_has_no_authority"
+    },
+    {
+      "audit_outcome": "rejected",
+      "code": "allocation_revoked"
+    },
+    {
+      "audit_outcome": "rejected",
+      "code": "subsidy_key_invalid"
+    },
+    {
+      "audit_outcome": "rejected",
+      "code": "pairing_code_invalid"
+    },
+    {
+      "audit_outcome": "rejected",
+      "code": "pairing_code_expired"
+    },
+    {
+      "audit_outcome": "rejected",
+      "code": "pairing_code_used"
+    },
+    {
+      "audit_outcome": "rejected",
+      "code": "pairing_code_revoked"
+    },
+    {
+      "audit_outcome": "rejected",
+      "code": "pairing_rate_limited"
+    },
+    {
+      "audit_outcome": "rejected",
+      "code": "device_limit_reached"
+    },
+    {
+      "audit_outcome": "rejected",
+      "code": "not_a_device"
+    },
+    {
+      "audit_outcome": "error",
+      "code": "store_busy"
+    },
+    {
+      "audit_outcome": "error",
+      "code": "audit_unavailable"
+    },
+    {
+      "audit_outcome": "error",
+      "code": "internal_error"
+    }
+  ],
+  "write_results": [
+    "created",
+    "replayed",
+    "updated",
+    "unchanged"
+  ]
+}

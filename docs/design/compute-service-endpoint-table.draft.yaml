@@ -1,0 +1,367 @@
+# 端点级许可表草案（S8 核验首版）
+#
+# 这是草案，不是路由授权。schema 以后续 S0 契约为准。
+# 字段对齐 docs/design/compute-service-design.md 第 8 节：
+#   端点、处理区域、留存、DPA、允许的数据类别、能力、核验时间。
+# notes / sources / confidence 只为追溯，不进入契约。
+# 没核实的值写 unverified。不允许的数据类别不要填成已允许。
+# 叙述、引述和「仍要人做的事」见 compute-service-endpoint-verification.md。
+#
+# 查询日期：2026-11-12
+# grants_permission: false
+
+schema_note: "草案。端点许可表的正式 schema 由 S0 契约规定。本文件多出的 notes、sources、confidence 不属于该契约。"
+verified_on: "2026-11-12"
+grants_permission: false
+
+endpoints:
+  - endpoint: "deepinfra / deepseek-ai/DeepSeek-V3.2 / POST https://api.deepinfra.com/v1/openai/chat/completions"
+    processing_region: "美国（首页写自有美国数据中心；隐私政策写可能在美国处理；Trust Center 基础设施项写 GCP / United States）。城市以及是否还有美国以外节点：unverified。条款允许供应商迁移基础设施，区域未合同锁定。"
+    retention: "有例外"
+    dpa: "未签"
+    allowed_data_classes: unverified
+    capabilities:
+      tool_calls: "型号页标 Function；供应商文档支持 OpenAI 兼容工具调用，不支持嵌套调用"
+      stream_usage: "OpenAPI 含 stream_options.include_usage；流式文档写最后一块带 prompt_tokens 与 completion_tokens"
+      cache_pricing: "自动前缀缓存，cached_tokens；标价见 notes。付费 5 分钟/1 小时保留属于 ZDR 例外，儿童流量不应开启"
+      structured_output: "型号页标 JSON；供应商文档支持 json_object 与 json_schema"
+      cancel: unverified
+    verified_at: "2026-11-12"
+    confidence: "高（条款与型号页）；取消为 unverified"
+    notes: "留存例外见条款第 7(b) 条：排障（解决后 30 天）、不含正文的元数据、法律与滥用、批量/图像/第三方模型/付费缓存。本型号不是 Google 或 Anthropic 通道。转售默认禁止，除非服务订单明文允许。未见儿童业务专条。价格 USD / 1M token：输入 0.26，缓存输入 0.13，输出 0.38（标准档）。DPA 由条款并入 Trust Center，正文本次未打开。"
+    sources:
+      - "https://deepinfra.com/terms"
+      - "https://deepinfra.com/privacy"
+      - "https://deepinfra.com/"
+      - "https://trust.deepinfra.com/"
+      - "https://docs.deepinfra.com/account/data-privacy"
+      - "https://docs.deepinfra.com/chat/streaming"
+      - "https://docs.deepinfra.com/api-reference/chat-completions/openai-chat-completions"
+      - "https://deepinfra.com/deepseek-ai/DeepSeek-V3.2"
+      - "https://deepinfra.com/pricing"
+
+  - endpoint: "deepinfra / deepseek-ai/DeepSeek-V4-Flash / POST https://api.deepinfra.com/v1/openai/chat/completions"
+    processing_region: "与 DeepInfra 供应商级陈述相同：美国。更细的区域：unverified"
+    retention: "有例外"
+    dpa: "未签"
+    allowed_data_classes: unverified
+    capabilities:
+      tool_calls: "供应商文档支持；本型号页未单独核对徽章，型号级：unverified"
+      stream_usage: "供应商 OpenAPI 含 stream_options.include_usage"
+      cache_pricing: "型号页给出缓存价。付费保留窗口是 ZDR 例外"
+      structured_output: "供应商文档支持 json_object 与 json_schema；文档示例使用 DeepSeek-V4-Flash-0731，本型号是否同级：unverified"
+      cancel: unverified
+    verified_at: "2026-11-12"
+    confidence: "高（供应商条款与本型号价格页）"
+    notes: "价格 USD / 1M token：输入 0.09，缓存输入 0.018，输出 0.18。Priority 1.5 倍，Flex 0.8 倍。同一供应商的法律限制与 DeepSeek-V3.2 那一行相同。定价页另有 DeepSeek-V4-Flash-0731（输入 0.06 / 缓存 0.015 / 输出 0.18）与 V4-Pro（输入 1.30 / 缓存 0.10 / 输出 2.60），法律条件未逐型号拆开。"
+    sources:
+      - "https://deepinfra.com/deepseek-ai/DeepSeek-V4-Flash/api"
+      - "https://deepinfra.com/pricing"
+      - "https://deepinfra.com/terms"
+      - "https://docs.deepinfra.com/chat/structured-outputs"
+      - "https://docs.deepinfra.com/chat/prompt-cache-retention"
+
+  - endpoint: "deepinfra / Qwen/Qwen3.6-35B-A3B / POST https://api.deepinfra.com/v1/openai/chat/completions"
+    processing_region: "与 DeepInfra 供应商级陈述相同：美国。更细的区域：unverified"
+    retention: "有例外"
+    dpa: "未签"
+    allowed_data_classes: unverified
+    capabilities:
+      tool_calls: unverified
+      stream_usage: "供应商 OpenAPI 含 stream_options.include_usage；本型号是否返回该字段：unverified"
+      cache_pricing: "定价页列出缓存价，且与输入价相同"
+      structured_output: unverified
+      cancel: unverified
+    verified_at: "2026-11-12"
+    confidence: "中（价格来自定价页；能力未打开该型号页）"
+    notes: "价格 USD / 1M token：输入 0.10，缓存输入 0.10，输出 0.95。若型号实际走第三方（非 DeepInfra 自托管），条款写明 ZDR 不适用。本次未核对它是不是自托管。脑暴稿里的旧模型名不能代替本行。"
+    sources:
+      - "https://deepinfra.com/pricing"
+      - "https://deepinfra.com/terms"
+
+  - endpoint: "openrouter / 账户或请求强制 ZDR only 且排除 Safety Retention / POST https://openrouter.ai/api/v1/chat/completions"
+    processing_region: "unverified。企业与商业方案另有 eu.openrouter.ai 与 us.openrouter.ai，没有公开的亚太区域主机名。实际处理区域随被选中的下游端点变化，本次未登录核对。"
+    retention: "有例外"
+    dpa: "未签"
+    allowed_data_classes: unverified
+    capabilities:
+      tool_calls: "网关接受 OpenAI 形状的 tools；下游不支持时的行为随模型变化"
+      stream_usage: "Chat Completions 流在结束前必带 usage。stream_options.include_usage 已弃用且不起作用"
+      cache_pricing: "网关返回 cached_tokens 与 cache_write_tokens；是否打折取决于下游。内存缓存仍被视为可在 ZDR 路由中使用"
+      structured_output: "网关支持 json_schema；模型不支持则失败"
+      cancel: "仅流式，且仅名单内下游会停算停计费。DeepInfra、Together、Fireworks、DeepSeek 在名单内。Groq、Google、Alibaba 写明尚未支持"
+    verified_at: "2026-11-12"
+    confidence: "高（路由规则）；具体模型当前端点政策为 unverified"
+    notes: "自助账户未选择时默认允许 Safety Retention，那不是本行。本行要求人在后台设为 ZDR only 并排除 Safety Retention。即便如此，疑似 CSAM 仍可能被留存。自助条款禁止为转售 API 或建设竞争服务而使用；企业协议第 2.1(a)(ii) 条明文允许提供给终端客户，第 2.3.7 条禁止转租转卖访问权，定性待律师确认（2026-11-12 主会话复核原文）。账户持有人须年满 18 岁。DPA 对商业使用经条款并入，签字件需向企业方案申请。下游默认分类见 OpenRouter provider-logging 页，与各家自己的条款可能不一致。抽成与模型现价：unverified。"
+    sources:
+      - "https://openrouter.ai/docs/guides/features/zdr"
+      - "https://openrouter.ai/docs/guides/privacy/data-collection"
+      - "https://openrouter.ai/docs/guides/privacy/provider-logging"
+      - "https://openrouter.ai/docs/api_reference/streaming"
+      - "https://openrouter.ai/docs/api_reference/parameters"
+      - "https://openrouter.ai/docs/features/structured-outputs"
+      - "https://openrouter.ai/docs/guides/administration/usage-accounting"
+      - "https://openrouter.ai/terms"
+      - "https://openrouter.ai/data-processing-agreement"
+      - "https://openrouter.ai/terms-of-service-enterprise"
+      - "https://openrouter.ai/pricing.md"
+      - "https://openrouter.ai/blog/announcements/csam-screening"
+
+  - endpoint: "deepseek-official / deepseek-flash / POST https://api.deepseek.com/chat/completions"
+    processing_region: "隐私政策写个人数据在中华人民共和国收集、处理、存储。开放平台条款写终端用户个人信息的处理规则不由该隐私政策覆盖。终端用户 prompt 的机房：unverified"
+    retention: "会留存"
+    dpa: unverified
+    allowed_data_classes: unverified
+    capabilities:
+      tool_calls: "价目表标支持"
+      stream_usage: "支持 SSE 流。stream_options.include_usage 是否接受：unverified。响应含缓存命中与未命中 token 字段"
+      cache_pricing: "磁盘上下文缓存自动启用。美元低峰/高峰（每百万 token）：命中输入 0.003/0.006，未命中输入 0.15/0.30，输出 0.60/1.20。缓存正文保留时长：unverified"
+      structured_output: "价目表标 Json Output。是否等于 OpenAI json_schema 严格模式：unverified"
+      cancel: unverified
+    verified_at: "2026-11-12"
+    confidence: "高（官方文档与隐私政策）；DPA 是否存在为 unverified"
+    notes: "文档中的版本名为 DeepSeek-V4.1-Flash-1017。上下文 1M，最大输出 384K。使用条款第 4.3 条允许去标识化后把输入输出用于改进服务，退出方式为关闭 Improve the model for everyone；该开关在 API 上是否存在：unverified。服务不以儿童为对象。开放平台第 1.1 条允许接入下游系统并服务终端用户。中文价目为人民币，是否与英文美元价目适用于同一账户：unverified。设计稿已排除 child_edu。没有找到公开 DPA，故 dpa 不写未签。"
+    sources:
+      - "https://cdn.deepseek.com/policies/en-US/deepseek-privacy-policy.html"
+      - "https://cdn.deepseek.com/policies/en-US/deepseek-terms-of-use.html"
+      - "https://cdn.deepseek.com/policies/en-US/deepseek-open-platform-terms-of-service.html"
+      - "https://api-docs.deepseek.com/quick_start/pricing/"
+      - "https://api-docs.deepseek.com/zh-cn/quick_start/pricing"
+      - "https://api-docs.deepseek.com/news/news0802"
+      - "https://api-docs.deepseek.com/zh-cn/api/create-chat-completion"
+      - "https://api-docs.deepseek.com/zh-cn/faq"
+
+  - endpoint: "deepseek-official / deepseek-v4-pro / POST https://api.deepseek.com/chat/completions"
+    processing_region: "与 deepseek-flash 相同"
+    retention: "会留存"
+    dpa: unverified
+    allowed_data_classes: unverified
+    capabilities:
+      tool_calls: "价目表标支持"
+      stream_usage: "与 deepseek-flash 相同；include_usage：unverified"
+      cache_pricing: "美元低峰/高峰（每百万 token）：命中输入 0.022/0.044，未命中输入 0.66/1.32，输出 1.98/3.96"
+      structured_output: "价目表标 Json Output。严格 json_schema：unverified"
+      cancel: unverified
+    verified_at: "2026-11-12"
+    confidence: "高（价目与条款）；DPA 为 unverified"
+    notes: "文档中的版本名为 DeepSeek-V4-Pro-0813。不支持视觉。法律条件与 deepseek-flash 相同，不用于 child_edu。高峰时段为周一至周五 01:00–04:00 与 06:00–10:00 UTC，不含中国法定节假日。"
+    sources:
+      - "https://api-docs.deepseek.com/quick_start/pricing/"
+      - "https://cdn.deepseek.com/policies/en-US/deepseek-privacy-policy.html"
+      - "https://cdn.deepseek.com/policies/en-US/deepseek-open-platform-terms-of-service.html"
+
+  - endpoint: "together / serverless 默认（Prompt storage 开） / OpenAI 兼容基址见供应商文档，本次未核对完整 URL"
+    processing_region: "默认无服务器的处理区域：unverified。可选美国端点 us-api.together.ai，只保证所选模型的推理处理在美国，不保证存储与日志，价格为标准的 1.25 倍。没有查到新加坡无服务器区域。"
+    retention: "会留存"
+    dpa: "未签"
+    allowed_data_classes: unverified
+    capabilities:
+      tool_calls: unverified
+      stream_usage: unverified
+      cache_pricing: "无服务器前缀缓存为尽力而为、短时。具体型号价未全面抄录"
+      structured_output: unverified
+      cancel: "OpenRouter 名单含 Together。Together 自己的断开语义：unverified"
+    verified_at: "2026-11-12"
+    confidence: "高（默认留存与美国端点）；能力大多 unverified"
+    notes: "关掉组织设置中的 Prompt storage 才是 Together 定义的 ZDR，透传模型会随之关闭。ZDR 仍保留用量元数据，以及客户上传的微调与批量文件。训练他人模型默认关闭。Trust Center 列有 DPA，正文未读。转售与儿童条款：unverified。本行是默认配置，不是 ZDR 配置。"
+    sources:
+      - "https://docs.together.ai/docs/privacy-and-security"
+      - "https://docs.together.ai/docs/zero-data-retention"
+      - "https://docs.together.ai/docs/serverless/overview"
+      - "https://trust.together.ai/"
+
+  - endpoint: "fireworks / 开放模型无服务器聊天补全 / api.fireworks.ai（美国限制时为 us.api.fireworks.ai）"
+    processing_region: "公开驻留表只有不限制与美国。策略 API 枚举含 APAC，没有公开的新加坡无服务器端点。未限制时的实际区域：unverified"
+    retention: "有例外"
+    dpa: "未签"
+    allowed_data_classes: unverified
+    capabilities:
+      tool_calls: unverified
+      stream_usage: unverified
+      cache_pricing: "prompt 缓存可在易失内存中保留数分钟。标价：unverified"
+      structured_output: unverified
+      cancel: "OpenRouter 名单含 Fireworks。Fireworks 自己的文档：unverified"
+    verified_at: "2026-11-12"
+    confidence: "中（默认不落盘有文档；亚太没有文档证明）"
+    notes: "开放模型默认不把 prompt 写入持久存储，除非选择加入会记录内容的功能。法律或防止滥用仍可能留存。Responses API 默认 store=true 时最多留 30 天。企业 ZDR 策略会拒绝 store=true、后台任务、批量和训练。DPA 位于 Trust Center，正文未读。转售与儿童：unverified。"
+    sources:
+      - "https://docs.fireworks.ai/guides/security_compliance/data_handling"
+      - "https://docs.fireworks.ai/accounts/zero-data-retention"
+      - "https://docs.fireworks.ai/accounts/data-residency"
+      - "https://docs.fireworks.ai/api-reference/get-policy-settings"
+      - "https://docs.fireworks.ai/nexus/enterprise-controls"
+
+  - endpoint: "groq / POST https://api.groq.com/openai/v1/chat/completions（生产与预览型号不同，见 notes）"
+    processing_region: "文档写被保留的客户数据位于美国 GCP。推理执行区域：unverified"
+    retention: "有例外"
+    dpa: "未签"
+    allowed_data_classes: unverified
+    capabilities:
+      tool_calls: unverified
+      stream_usage: unverified
+      cache_pricing: unverified
+      structured_output: unverified
+      cancel: "OpenRouter 把 Groq 列为流式取消尚未支持"
+    verified_at: "2026-11-12"
+    confidence: "高（留存例外）；推理区域与大部分能力为 unverified"
+    notes: "默认不留推理正文。可靠性或滥用调查可留最多 30 天。批量与微调另计。他们仍把该推理路径标为 ZDR Eligible，与「最多 30 天」并列，故留存写有例外。处理者协议列在政策索引，正文未读。价格 USD / 1M token：gpt-oss-120b 输入 0.15 输出 0.60；gpt-oss-20b 输入 0.075 输出 0.30；qwen/qwen3.8-27b 输入 0.80 输出 4.00（预览）。Llama 企业版单价为 Contact Sales。转售与儿童：unverified。"
+    sources:
+      - "https://console.groq.com/docs/your-data"
+      - "https://console.groq.com/docs/models"
+      - "https://console.groq.com/docs/model/qwen/qwen3.8-27b"
+      - "https://console.groq.com/docs/terms-of-use-ksa/"
+      - "https://openrouter.ai/docs/api_reference/streaming"
+
+  - endpoint: "alibaba-model-studio-intl / 新加坡工作空间默认（ZDR 未开通） / {WorkspaceId}.ap-southeast-1.maas.aliyuncs.com"
+    processing_region: "接入与静态请求数据在新加坡（ap-southeast-1）。推理部署范围为 International：不含中国大陆的全球节点。不是钉在新加坡。"
+    retention: "会留存"
+    dpa: unverified
+    allowed_data_classes: unverified
+    capabilities:
+      tool_calls: unverified
+      stream_usage: unverified
+      cache_pricing: "角色模型文档提到会话缓存按隐式缓存计费。通用单价见 notes 的 qwen-plus 行"
+      structured_output: unverified
+      cancel: "OpenRouter 把 Alibaba 列为流式取消尚未支持。阿里云自己的断开语义：unverified"
+    verified_at: "2026-11-12"
+    confidence: "高（默认留存与部署范围）；DPA、转售、儿童、多数能力为 unverified"
+    notes: "默认 prompt 与响应留存不超过 30 天，法律或安全需要时可更长。政策写未经另行同意不用于训练基础模型。企业 ZDR 不是本行。OpenAI 兼容 Chat Completions 在角色模型文档中给出新加坡 compatible-mode 基址；是否覆盖全部聊天型号：unverified。qwen-plus（文档称当前等同 qwen-plus-2025-12-01）International、输入不超过 256K：USD / 1M token 输入 0.40，非思考输出 1.20，思考输出 4.00。256K 至 1M：输入 1.20，非思考输出 3.60，思考输出 12.00。"
+    sources:
+      - "https://www.alibabacloud.com/help/en/model-studio/data-retention-policy"
+      - "https://www.alibabacloud.com/help/en/model-studio/regions/"
+      - "https://www.alibabacloud.com/help/en/model-studio/model-pricing"
+      - "https://www.alibabacloud.com/help/en/model-studio/role-play"
+
+  - endpoint: "alibaba-model-studio-intl / 新加坡工作空间且客户经理已开通 ZDR / 仅政策第 4.1 节列出的已适配型号"
+    processing_region: "与默认新加坡工作空间相同：接入在新加坡，推理在不含中国大陆的全球节点。能否收成单城：unverified"
+    retention: "有例外"
+    dpa: unverified
+    allowed_data_classes: unverified
+    capabilities:
+      tool_calls: unverified
+      stream_usage: unverified
+      cache_pricing: "ZDR 描述包含最长约 24 小时的加密缓存窗口，窗口内不计为持久存储。标价：unverified（随型号）"
+      structured_output: unverified
+      cancel: unverified
+    verified_at: "2026-11-12"
+    confidence: "中（政策已读；本项目没有这种工作空间，开通与否未核实）"
+    notes: "未适配型号不会被拦截，仍按最多 30 天留存。安全过滤标记的日志最长 2 年。RAG、批量、应用编排、控制台、有状态 Responses API 不在 ZDR 内。文本系列起点见留存政策：qwen3.8-max、qwen3.7-plus、qwen3.8-flash、deepseek-v4-pro-0813、deepseek-v4-flash-0731、glm-5.2、kimi-k2.7-code 及之后版本。第三方直接提供的模型不覆盖。转售、儿童、DPA 正文：unverified。"
+    sources:
+      - "https://www.alibabacloud.com/help/en/model-studio/data-retention-policy"
+      - "https://www.alibabacloud.com/help/en/model-studio/regions/"
+
+  # AWS Bedrock：按 owner 2026-11-12 决定排除。
+
+  - endpoint: "google-vertex / 区域端点 asia-southeast1 / 生成式模型（具体型号 ID：unverified）"
+    processing_region: "数据驻留文档写：机器学习处理发生在发出请求的区域或多区域；静态数据留在所选位置。新加坡列在驻留表中。2026-11-12 当天该区域在售型号清单：unverified。全球端点不在本行，其缓存可以来自任何区域。"
+    retention: "有例外"
+    dpa: "未签"
+    allowed_data_classes: unverified
+    capabilities:
+      tool_calls: unverified
+      stream_usage: unverified
+      cache_pricing: "隐式缓存默认开启。持久缓存把派生 KV 写入静态存储，最长约 24 小时，可按项目关闭。这是留存控制，不是一张公开单价"
+      structured_output: unverified
+      cancel: "OpenRouter 把 Google 列为流式取消尚未支持。Google 自己的断开语义：unverified"
+    verified_at: "2026-11-12"
+    confidence: "高（零留存条件文档，最后更新 2026-11-10）；型号清单与 OpenAI 兼容为 unverified"
+    notes: "不经许可不用于训练。滥用监测可能记录 prompt，零留存需要申请例外。Grounding 与 Interactions API 默认 store=true 会存储。Cloud Data Processing Addendum 有公开 URL，正文未通读，本项目未签。OpenRouter 把 Vertex 供应商默认标成零留存，同时把 Vertex 上的 Google 模型写成 Safety Retention；以 Google 文档为准。OpenAI 兼容：unverified。价格：unverified。"
+    sources:
+      - "https://docs.cloud.google.com/gemini-enterprise-agent-platform/resources/zero-data-retention"
+      - "https://cloud.google.com/vertex-ai/generative-ai/docs/learn/data-residency"
+      - "https://cloud.google.com/terms/data-processing-addendum"
+      - "https://openrouter.ai/docs/guides/features/zdr"
+
+  - endpoint: "siliconflow / 推理 API（英文站与中文站哪一个适用于国际调用：unverified）"
+    processing_region: unverified
+    retention: unverified
+    dpa: unverified
+    allowed_data_classes: unverified
+    capabilities:
+      tool_calls: unverified
+      stream_usage: unverified
+      cache_pricing: "中文价目页有缓存列。适用站点与时区：unverified"
+      structured_output: unverified
+      cancel: unverified
+    verified_at: "2026-11-12"
+    confidence: "低（两份一手政策冲突）"
+    notes: "英文政策写除非法律或服务规则要求，没有义务存储 Interaction Data。中文摘要把输入 prompt 和输出列为内容安全所收集的个人信息。OpenRouter 将 SiliconFlow 标为零留存且不训练，这只是路由分类。在冲突解开前不授予任何数据类别。中文站摘录 deepseek-ai/DeepSeek-V4.1-Flash：0点–2点与8点–24点为输入 2.00 元、输出 8.00 元、缓存 0.04 元 / 百万 token；2点–8点为输入 1.00 元、输出 4.00 元、缓存 0.02 元。时区未标明。"
+    sources:
+      - "https://docs.siliconflow.com/en/legals/privacy-policy"
+      - "https://docs.siliconflow.cn/docs/legals/privacy-policy-summary"
+      - "https://www.siliconflow.cn/pricing"
+      - "https://openrouter.ai/docs/guides/privacy/provider-logging"
+
+  - endpoint: "opentyphoon / typhoon-v2.5-30b-a3b-instruct / POST https://api.opentyphoon.ai/v1/chat/completions"
+    processing_region: unverified
+    retention: "会留存"
+    dpa: unverified
+    allowed_data_classes: unverified
+    capabilities:
+      tool_calls: "发布说明称模型适合工具调用。API 是否接受 OpenAI tools 字段：unverified"
+      stream_usage: "文档索引写支持流式。include_usage：unverified。非流式示例含 usage 对象"
+      cache_pricing: "无 API 单价。FAQ 写免费。博客中的每百万 token 0.10 美元是自算的 H100 成本，不是 API 价"
+      structured_output: unverified
+      cancel: unverified
+    verified_at: "2026-11-12"
+    confidence: "中（文档站 2026-11-12 仍可打开，页内发布时间是 2025-12-12；当天是否仍提供该模型 ID：unverified）"
+    notes: "FAQ：收集使用数据以改进模型与 API，不与第三方分享。这排除 child_edu。速率：5 请求/秒，200 请求/分钟。上下文文档写 128K。同一文档站仍把 Together 列为官方伙伴，与 Together 现页和 Typhoon 自己的 API Pro 下线通知矛盾。预告的 AWS 生产 API 是否已上线：unverified。同站还有 typhoon-v2.1-12b-instruct、typhoon-ocr、typhoon-asr-realtime，价格同为文档所述免费，留存条件相同，不另开行。"
+    sources:
+      - "https://docs.opentyphoon.ai/en/models/"
+      - "https://docs.opentyphoon.ai/en/faq/"
+      - "https://docs.opentyphoon.ai/en/rate-limits/"
+      - "https://docs.opentyphoon.ai/en/"
+      - "https://opentyphoon.ai/blog/en/introducing-typhoon-2-api-pro-accessible-production-grade-thai-llms-3e139c077aab"
+      - "https://opentyphoon.ai/blog/en/typhoon2-5-release"
+
+  - endpoint: "together / scb10x Typhoon-2-8B-instruct / serverless"
+    processing_region: unverified
+    retention: unverified
+    dpa: "未签"
+    allowed_data_classes: unverified
+    capabilities:
+      tool_calls: unverified
+      stream_usage: unverified
+      cache_pricing: unverified
+      structured_output: unverified
+      cancel: unverified
+    verified_at: "2026-11-12"
+    confidence: "高（该页写明不在无服务器上提供）"
+    notes: "Together 型号页原文：This model is not available on Together’s Serverless API. 因此没有可引用的无服务器价格。其他 Typhoon 型号的专属部署：unverified。历史 API Pro 价格不要填进本行。"
+    sources:
+      - "https://www.together.ai/models/typhoon-2-8b-instruct"
+
+  - endpoint: "openrouter / scb10x/llama3.1-typhoon2-70b-instruct"
+    processing_region: unverified
+    retention: unverified
+    dpa: "未签"
+    allowed_data_classes: unverified
+    capabilities:
+      tool_calls: unverified
+      stream_usage: unverified
+      cache_pricing: unverified
+      structured_output: unverified
+      cancel: unverified
+    verified_at: "2026-11-12"
+    confidence: "低"
+    notes: "该 URL 返回站点外壳，价格、下游供应商和是否仍在售都没有从正文读到。Typhoon 博客曾通知 70B 计划于 2025-08-20 弃用。不能把这个 URL 当成仍可购买的端点。"
+    sources:
+      - "https://openrouter.ai/scb10x/llama3.1-typhoon2-70b-instruct"
+      - "https://opentyphoon.ai/blog/en/introducing-typhoon-2-api-pro-accessible-production-grade-thai-llms-3e139c077aab"
+
+  - endpoint: "moonshot / 官方 API（型号与 URL：unverified）"
+    processing_region: unverified
+    retention: unverified
+    dpa: unverified
+    allowed_data_classes: unverified
+    capabilities:
+      tool_calls: unverified
+      stream_usage: unverified
+      cache_pricing: unverified
+      structured_output: unverified
+      cancel: unverified
+    verified_at: "2026-11-12"
+    confidence: "低"
+    notes: "线索仅来自 OpenRouter 供应商表：总部新加坡、Zero retention、不训练。一手隐私政策、DPA、推理区域和价格都没有打开。本行不是许可。"
+    sources:
+      - "https://openrouter.ai/docs/guides/privacy/provider-logging"

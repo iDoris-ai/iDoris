@@ -12,3 +12,6 @@ packages/contracts/src/generated/*.js
 packages/contracts/src/generated/*.js.map
 packages/contracts/src/generated/*.d.ts
 packages/contracts/src/generated/*.d.ts.map
+
+# S8 泰语 edu 评测的模型输出含题面，不入库
+eval/thai-edu/results/*.json

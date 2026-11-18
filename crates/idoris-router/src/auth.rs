@@ -97,9 +97,26 @@ pub fn enforce_scope(
     Ok(())
 }
 
+/// The last gate of data-plane authentication (compute service S2): after a bearer secret has been
+/// matched to an active, unexpired virtual key, ask whether the *credential* behind that key is still
+/// usable right now. Implemented by the account store in the organization and cloud forms; absent
+/// (`None`) in the personal form and in every legacy tenant deployment, where authentication is exactly
+/// what it was before.
+///
+/// The check runs on **every** request and nothing is cached, so revoking a credential, freezing it,
+/// revoking its membership or principal, or freezing/closing any account above it takes effect on the
+/// very next request. `Ok(())` lets the request through (including keys the gate does not manage, such
+/// as local data keys issued with `idoris key issue`); `Err(Unauthorized)` refuses it, with the same
+/// opaque answer as an unknown key; `Err(Unavailable)` means the answer could not be determined and the
+/// request fails closed.
+pub trait CredentialGate: Send + Sync {
+    fn check(&self, key_id: &str, now_ms: i64) -> Result<(), VirtualKeyAuthError>;
+}
+
 #[derive(Clone)]
 pub struct VirtualKeyAuthenticator {
     store: Arc<Mutex<VirtualKeyStore>>,
+    gate: Option<Arc<dyn CredentialGate>>,
     #[cfg(test)]
     before_store_lock: Option<Arc<tokio::sync::Notify>>,
 }
@@ -108,25 +125,53 @@ impl VirtualKeyAuthenticator {
     pub fn new(store: Arc<Mutex<VirtualKeyStore>>) -> Self {
         Self {
             store,
+            gate: None,
             #[cfg(test)]
             before_store_lock: None,
         }
+    }
+
+    /// Installs the credential gate (organization and cloud forms). Without it authentication is
+    /// byte-for-byte the pre-S2 behaviour.
+    pub fn with_gate(mut self, gate: Arc<dyn CredentialGate>) -> Self {
+        self.gate = Some(gate);
+        self
     }
 
     pub async fn authenticate(
         &self,
         headers: &HeaderMap,
     ) -> Result<AuthenticatedVirtualKey, VirtualKeyAuthError> {
+        self.authenticate_holding(headers, ()).await
+    }
+
+    /// 同 [`Self::authenticate`]，另外把 `holder` **搬进真正执行认证查询的阻塞任务**：查询跑完（或者闭包被丢弃，
+    /// 比如运行时关闭）才丢弃它，**调用方取消了 `await`（请求 future 被丢弃）也不会提前丢弃**。
+    ///
+    /// 为什么：云入口的「认证并发名额」（`AuthSlot`）要限制的是同时在库里排队、查询的**阻塞任务**个数。名额如果挂在请求
+    /// future 上，请求一被取消（客户端断开、超时）名额就还回去了，而 `spawn_blocking` 出去的任务不会因此停下，
+    /// 还在等认证库的锁、查 SQLite：反复「发起再取消」就能攒出远超上限的阻塞任务，把阻塞线程池占满、拖累别的库操作
+    /// （R3 N2）。名额跟着阻塞任务走，上限才是真的。
+    ///
+    /// 凭证格式不对（没有发起任何查询）时 `holder` 当场丢弃。
+    pub async fn authenticate_holding<H: Send + 'static>(
+        &self,
+        headers: &HeaderMap,
+        holder: H,
+    ) -> Result<AuthenticatedVirtualKey, VirtualKeyAuthError> {
         let secret = bearer_secret(headers)?;
         let store = self.store.clone();
+        let gate = self.gate.clone();
         #[cfg(test)]
         let before_store_lock = self.before_store_lock.clone();
         tokio::task::spawn_blocking(move || {
+            // 注意是具名绑定：`let _ = holder` 会当场丢弃。它活到这个闭包返回
+            let _holder = holder;
             #[cfg(test)]
             if let Some(notify) = before_store_lock {
                 notify.notify_one();
             }
-            authenticate_secret(&store, secret)
+            authenticate_secret(&store, gate.as_deref(), secret)
         })
         .await
         .map_err(|_| VirtualKeyAuthError::Unavailable)?
@@ -139,7 +184,7 @@ impl VirtualKeyAuthenticator {
         now_ms: i64,
     ) -> Result<AuthenticatedVirtualKey, VirtualKeyAuthError> {
         let secret = bearer_secret(headers)?;
-        authenticate_secret_with_clock(&self.store, secret, || Ok(now_ms))
+        authenticate_secret_with_clock(&self.store, self.gate.as_deref(), secret, || Ok(now_ms))
     }
 
     #[cfg(test)]
@@ -151,32 +196,41 @@ impl VirtualKeyAuthenticator {
 
 fn authenticate_secret(
     store: &Arc<Mutex<VirtualKeyStore>>,
+    gate: Option<&dyn CredentialGate>,
     secret: VirtualKeySecret,
 ) -> Result<AuthenticatedVirtualKey, VirtualKeyAuthError> {
-    authenticate_secret_with_clock(store, secret, server_now_ms)
+    authenticate_secret_with_clock(store, gate, secret, server_now_ms)
 }
 
 fn authenticate_secret_with_clock(
     store: &Arc<Mutex<VirtualKeyStore>>,
+    gate: Option<&dyn CredentialGate>,
     secret: VirtualKeySecret,
     mut now_ms: impl FnMut() -> Result<i64, VirtualKeyAuthError>,
 ) -> Result<AuthenticatedVirtualKey, VirtualKeyAuthError> {
-    let store = store.lock().map_err(|_| VirtualKeyAuthError::Unavailable)?;
-    let lookup_now = now_ms()?;
-    let identity = store
-        .authenticate(&secret, lookup_now)
-        .map_err(|_| VirtualKeyAuthError::Unavailable)?
-        .ok_or(VirtualKeyAuthError::Unauthorized)?;
-    let decision_now = now_ms()?;
-    if decision_now < lookup_now {
-        return Err(VirtualKeyAuthError::Unavailable);
-    }
-    if identity
-        .scope
-        .expires_at_ms
-        .is_some_and(|expires| expires <= decision_now)
-    {
-        return Err(VirtualKeyAuthError::Unauthorized);
+    // The key store lock is released before the gate runs: the gate reads another store.
+    let (identity, decision_now) = {
+        let store = store.lock().map_err(|_| VirtualKeyAuthError::Unavailable)?;
+        let lookup_now = now_ms()?;
+        let identity = store
+            .authenticate(&secret, lookup_now)
+            .map_err(|_| VirtualKeyAuthError::Unavailable)?
+            .ok_or(VirtualKeyAuthError::Unauthorized)?;
+        let decision_now = now_ms()?;
+        if decision_now < lookup_now {
+            return Err(VirtualKeyAuthError::Unavailable);
+        }
+        if identity
+            .scope
+            .expires_at_ms
+            .is_some_and(|expires| expires <= decision_now)
+        {
+            return Err(VirtualKeyAuthError::Unauthorized);
+        }
+        (identity, decision_now)
+    };
+    if let Some(gate) = gate {
+        gate.check(&identity.key_id, decision_now)?;
     }
     Ok(identity)
 }
@@ -190,7 +244,7 @@ fn server_now_ms() -> Result<i64, VirtualKeyAuthError> {
         .map_err(|_| VirtualKeyAuthError::Unavailable)
 }
 
-fn bearer_secret(headers: &HeaderMap) -> Result<VirtualKeySecret, VirtualKeyAuthError> {
+pub(crate) fn bearer_secret(headers: &HeaderMap) -> Result<VirtualKeySecret, VirtualKeyAuthError> {
     let mut values = headers.get_all(AUTHORIZATION).iter();
     let first = values.next().ok_or(VirtualKeyAuthError::Unauthorized)?;
     if values.next().is_some() {
@@ -304,6 +358,87 @@ mod tests {
             .unwrap_err(),
             VirtualKeyAuthError::Unauthorized
         );
+    }
+
+    /// 计数「被丢弃了几次」的守卫（代替云入口的认证并发名额）。
+    struct Probe(Arc<std::sync::atomic::AtomicUsize>);
+
+    impl Drop for Probe {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// R3 N2：交给 `authenticate_holding` 的守卫（云入口的认证并发名额）跟着**阻塞查询**走：调用方取消了 `await`，
+    /// 查询还卡在认证库的锁上，守卫就不能被丢弃；查询跑完才丢弃。
+    #[tokio::test]
+    async fn a_holder_lives_until_the_blocking_query_finishes_even_when_the_caller_gives_up() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        let key = MintedVirtualKey::mint();
+        let started = Arc::new(tokio::sync::Notify::new());
+        let auth = authenticator(&key, None).notify_before_store_lock(started.clone());
+        // 另一个线程占着认证库的锁：查询会卡在锁上
+        let store = auth.store.clone();
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let lock_thread = std::thread::spawn(move || {
+            let _guard = store.lock().unwrap();
+            locked_tx.send(()).unwrap();
+            let _ = release_rx.recv();
+        });
+        locked_rx.recv().unwrap();
+
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let headers = bearer(&format!("Bearer {}", key.secret.expose_secret()));
+        let probe = Probe(dropped.clone());
+        let caller = tokio::spawn({
+            let auth = auth.clone();
+            async move { auth.authenticate_holding(&headers, probe).await }
+        });
+        // 阻塞任务已经开始（马上要等库的锁），然后调用方放弃等待
+        started.notified().await;
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            dropped.load(Ordering::SeqCst),
+            0,
+            "the query is still waiting for the store, so its holder must still be alive"
+        );
+        // 库有空了：查询跑完，守卫才丢弃
+        release_tx.send(()).unwrap();
+        lock_thread.join().unwrap();
+        for _ in 0..500 {
+            if dropped.load(Ordering::SeqCst) == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(dropped.load(Ordering::SeqCst), 1);
+    }
+
+    /// 凭证格式不对：根本没有发起任何查询，守卫当场丢弃（不会被一个永远不会跑的闭包扣着）。
+    #[tokio::test]
+    async fn a_holder_given_with_an_unusable_credential_is_released_at_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let key = MintedVirtualKey::mint();
+        let auth = authenticator(&key, None);
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let error = auth
+            .authenticate_holding(&HeaderMap::new(), Probe(dropped.clone()))
+            .await
+            .unwrap_err();
+        assert_eq!(error, VirtualKeyAuthError::Unauthorized);
+        assert_eq!(dropped.load(Ordering::SeqCst), 1);
+        // 对照：正常的一次认证，守卫在查询之后丢弃，恰好一次
+        let headers = bearer(&format!("Bearer {}", key.secret.expose_secret()));
+        auth.authenticate_holding(&headers, Probe(dropped.clone()))
+            .await
+            .unwrap();
+        assert_eq!(dropped.load(Ordering::SeqCst), 2);
     }
 
     #[test]

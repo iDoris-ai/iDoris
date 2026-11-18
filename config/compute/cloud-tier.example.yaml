@@ -1,0 +1,52 @@
+# 云端档配置示例（计算服务 S7）：本机 / 组织的 iDoris 在「本机服务不了、隐私允许、调用方显式同意」时，
+# 主动调用 idoris.ai/api。默认关闭：不设 IDORIS_CLOUD_TIER_CONFIG，什么都不会读、不会开、不会发。
+#
+# 启用（个人形态，Agent24 托管的那种）：
+#   1. 把这份文件放到本机（比如 ~/Library/Application Support/iDoris/cloud-tier.yaml），按需改掉地址和模型名；
+#   2. 启动 iDoris 的环境里设 IDORIS_CLOUD_TIER_CONFIG=<这份文件的路径>；
+#   3. 在云账号侧生成一次性配对码，然后在本机：
+#        echo 'ABCD-EFGH-JKMN' | idoris cloud pair        # 配对码从 stdin 读，不进 argv、不进环境变量
+#        idoris cloud status                               # 是否已配对、云账号绑定（成员关系 id）、凭证 id 前缀；绝不显示密钥
+#        idoris cloud unpair                               # 云端撤销 + 删除本机凭证
+#   4. 路由策略要允许这个请求用 remote 层（仓库自带的 config/routing-policy.yaml 只有 complexity: complex 允许；
+#      想让所有 any 请求都能回落，写一条 `- if: { privacy: any }  then: { tiers: [local, remote] }`）；
+#   5. 调用方（Agent24）对愿意回落的请求发 X-iDoris-Privacy: any 和 X-iDoris-Cloud-Fallback: allow。
+#      没有这个同意头，永远不会出网；X-iDoris-Privacy: local_only（以及没声明隐私）永远不会出网。
+#
+# 启用（组织形态，IDORIS_DEPLOY_MODE=tenant、IDORIS_FORM=organization）：
+#   云端只认组织付款账户。运维用云控制面给节点签发一张 Node 凭证（POST /control/v1/credentials，
+#   binding: {kind: node, account: <组织的付款账户>}），把明文密钥写进一个 0600 的文件，下面 credential 改成 node_file。
+#   节点不用配对；不带成员头；云端成本记在组织账户上，本机的 QUOTA（预算账本）不被云端档读写。
+
+schema_version: 1
+
+# 数据面：POST {base_url}/v1/chat/completions。必须是 https（回环地址才允许 http，给本机测试用）。
+base_url: https://idoris.ai/api
+
+# 控制面（配对用）。缺省 = base_url 的源 + /control/v1，并且必须和 base_url 同源。
+# control_url: https://idoris.ai/control/v1
+
+# 云凭证从哪来。密钥永远不写在这份配置里，只写来源。
+credential:
+  source: paired_device          # 个人：idoris cloud pair 兑换出来的设备凭证（缺省）
+  # source: node_file            # 组织：运维签发的 Node 凭证，放在一个权限 0600 的文件里（每次调用重新读，轮换不用重启）
+  # file: /etc/idoris/cloud-node-credential
+  # source: node_env             # 组织：同上，放在环境变量里（不推荐：同用户的进程读得到环境变量）
+  # env: IDORIS_CLOUD_NODE_CREDENTIAL
+
+# 发往云端的模型名（云端路由簿里的名字，GET {base_url}/v1/models 能列出来）。
+# 本机请求里的 model（idoris/daily 这样的角色别名，或本机某个模型的 id）是本机的东西，不出网：发往云端之前一律替换成这里的名字。
+model: idoris/agent              # 没有声明角色的请求（具体模型名、idoris/auto）
+role_models:                     # 声明了角色的请求：角色 -> 云端模型名。没有列出的角色没有云端档（不猜模型名）
+  fast: idoris/agent             # 只允许 fast / daily / deep：decide 是本机判定器，永远不出网；embed / rerank / vision 不是这个端点的能力
+  daily: idoris/agent
+  deep: idoris/agent
+
+# 设备凭证放哪（个人形态）。缺省 = 数据库文件所在目录下的 cloud-tier/（目录 0700，device.json 0600）。
+# state_dir: ./cloud-tier
+
+limits:                          # 全部可选，括号里是默认值
+  connect_timeout_ms: 5000
+  total_timeout_ms: 150000       # 一次调用从开始到读完响应体（云端自己的总期限是 120 s，这里留出余量）
+  max_response_bytes: 4194304
+  max_concurrent: 8              # 同时在途的云端档调用数；满了不排队，当作「云端档繁忙」（X-iDoris-Cloud-Attempt: saturated）
