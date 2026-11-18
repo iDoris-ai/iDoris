@@ -222,8 +222,8 @@ impl<K: Hash + Eq + Clone, V> Bounded<K, V> {
     /// 表满了：先丢空闲的，还不够就丢最老的一批（`cap / 8` 个，至少 1 个）可丢的条目。
     ///
     /// 这是在调用方的锁里做的，所以不把整张表排序（`n log n`），只用 `select_nth_unstable` 挑出最老的那一批（`n`）：
-    /// 表有一万多个条目时，持锁时间是几十微秒的量级，不会让走同一把锁的每个请求都等一次排序。`seq` 各不相同，
-    /// 挑出来的集合和「全排序后取前 `drop_count` 个」一样。
+    /// 走同一把锁的每个请求，在表满的那一次只多等一趟线性扫描，不是一次全排序。`seq` 各不相同，
+    /// 挑出来的集合和「全排序后取前 `drop_count` 个」一样（`the_batch_eviction_matches_a_plain_least_recently_used_model` 钉着）。
     fn make_room(&mut self, idle: impl Fn(&V) -> bool, droppable: impl Fn(&V) -> bool) {
         self.map.retain(|_, entry| !idle(&entry.value));
         if self.map.len() < self.cap {
