@@ -147,8 +147,9 @@ pub(crate) enum Ingested {
 /// 变成按整笔预留收（多收）。所以分三样分别跟踪，**不是**一个「是不是最终」的布尔：
 ///
 /// - 最近的 usage，以及携带它的那个事件的位置（[`Self::usage`] / `usage_at`）；
-/// - 最后一次出现**新内容**的事件的位置（`content_at`）；只有 `delta` 里有新的生成内容才算
-///   （见 `idoris_upstream::cloud::ChunkInfo::has_content`），空 delta 的结束块、只带 `role` 的块都不算；
+/// - 最后一次出现**新内容**的事件的位置（`content_at`）；只有 `delta` 里（或 choice 自己的 `text` 里：旧的 completions 接口的字段，
+///   issue #603 N1 的 Low）有新的生成内容才算（见 `idoris_upstream::cloud::ChunkInfo::has_content`），空 delta 的结束块、
+///   只带 `role` 的块都不算；
 /// - 每个 choice 最近一次**结束**（非空字符串的 `finish_reason`）和最近一次**新内容**的事件位置（`choices`）。
 ///   **结束不是永久的**：一个 choice 的结束只在它**不早于**这个 choice 最近一次新内容时才算数
 ///   （[`ChoiceProgress::is_finished`]）。已经结束的 choice 又出现新内容，旧的结束标志就作废——它不能确认当前这一段
@@ -892,6 +893,10 @@ mod tests {
                 }
                 "tool-call" => r#"{"id":"c","choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"a\":1}"}}]}}]}"#.to_string(),
                 "empty-choices" => r#"{"id":"c","choices":[]}"#.to_string(),
+                // 只有 choice 自己的 `text`（旧的 completions 接口的字段），`delta` 是空的
+                "text-only" => {
+                    r#"{"id":"c","choices":[{"delta":{},"text":"SMUGGLED"}]}"#.to_string()
+                }
                 "done" => "[DONE]".to_string(),
                 other => panic!("unknown step {other}"),
             };
@@ -1249,6 +1254,74 @@ mod tests {
                 tracker.saw_done
             );
         }
+    }
+
+    /// issue #603 N1 的 Low（PR-Daemon P7）：choice 自己的 `text`（旧的 completions 接口的字段）里有文字也是新内容。
+    /// `{"choices":[{"delta":{},"text":"SMUGGLED"}]}` 会被原样转发给客户端，原来却在计费上不算内容：它出现在一个可信的 usage 之后，
+    /// 那个 usage 仍被当成最终用量结清（按实际用量收，而上游还在生成）。现在它和 `delta` 里的内容一样使 usage 作废、使结束标志作废。
+    /// 下面的序列都不靠「单独的 usage 块」（`usage_standalone`）：可信与否只来自结束标志。
+    #[test]
+    fn text_outside_the_delta_is_new_content_for_the_usage_trust() {
+        let cases: &[(&str, &[&str], bool)] = &[
+            (
+                "REPORT P7: a trusted usage (it rides the finish chunk), then text outside the delta",
+                &["content", "finish+usage", "text-only"],
+                false,
+            ),
+            (
+                "the usage rides the last content chunk with its finish_reason, then text outside the delta",
+                &["content", "content+usage+finish", "text-only"],
+                false,
+            ),
+            (
+                "DONE does not make the mid-stream number final",
+                &["content", "finish+usage", "text-only", "done"],
+                false,
+            ),
+            (
+                "text after the usage: a later finish does not make the earlier number final",
+                &["content", "finish+usage", "text-only", "finish"],
+                false,
+            ),
+            (
+                "text re-opens the finished choice, then a new usage rides its new finish",
+                &["content", "finish+usage", "text-only", "finish+usage"],
+                true,
+            ),
+            (
+                "text re-opens the finished choice, a cumulative usage rides the next chunk",
+                &["content", "finish", "text-only", "content+usage"],
+                false,
+            ),
+            (
+                "control: an empty delta after the same usage is not new content",
+                &["content", "finish+usage", "empty-delta"],
+                true,
+            ),
+            (
+                "control: a bare finish chunk after the same usage is not new content",
+                &["content", "finish+usage", "finish"],
+                true,
+            ),
+        ];
+        for (name, steps, trusted) in cases {
+            let tracker = track(steps);
+            assert_eq!(
+                tracker.usage_is_trusted(),
+                *trusted,
+                "{name}: {steps:?} (usage_at={:?} content_at={:?} finished={} done={})",
+                tracker.usage_at,
+                tracker.content_at,
+                tracker.generation_finished(),
+                tracker.saw_done
+            );
+        }
+        // `text` 也要经过「choice 必须像样」的检查：没有 delta、没有结束标志的 text 块不是合法的流事件
+        let mut tracker = StreamTracker::new(false);
+        assert!(matches!(
+            tracker.ingest(&ev(r#"{"id":"c","choices":[{"text":"x"}]}"#)),
+            Ingested::Malformed
+        ));
     }
 
     /// 第六轮（R4-r2 Medium-3 残留）：`finish_reason` 不是字符串（布尔值、数字、对象、数组）的 choice 不是合法的流事件：

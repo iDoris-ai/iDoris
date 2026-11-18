@@ -14,6 +14,7 @@
 //! | R3 Medium-3 | 空 choice（`{"choices":[{}]}`）不是合法的 completion chunk：发布之前失败，允许切换候选 |
 //! | R6 ② | 已结束的 choice 又出现新内容：旧的结束标志不能确认新块里的累计 usage（内容 -> finish -> 新内容 + 累计 usage -> 错误 / 断开 / 截断，按预留价收，不按累计数字结清） |
 //! | R6 Medium-3 残留 | `finish_reason` 不是字符串（布尔值、数字、对象、数组）的 choice 不是合法的流事件：发布之前失败，允许切换候选 |
+//! | #603 N1 的 Low | choice 自己的 `text`（旧 completions 接口的字段）里有文字也是新内容：一个可信的 usage 之后又来这样的 chunk，usage 作废、按预留价收；`delta` 和 `text` 各写一份的兼容实现不受影响；OpenAI 规范流（结束块在前、单独的 usage 块在后）仍按实际用量结算 |
 //!
 //! 数字约定同 `cloud_upstream_e2e.rs`：`simple_body(100)` 预留价 4110 微泰铢、预留成本 41 微美元；
 //! 12 入 2 出的实际价 200 微泰铢。全部对本地假上游（`127.0.0.1`）进行，不连接任何真实的推理供应商。
@@ -1224,5 +1225,168 @@ async fn a_slow_ledger_does_not_starve_the_runtime_while_a_request_is_admitted()
     assert!(
         during >= 10,
         "the other tasks kept running while the admission blocked: {during} beats"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// issue #603 N1（PR #600 合入后 PR-Daemon 的发现）：choice 自己的 `text` 是新内容；OpenAI 规范流的结算不变
+// ---------------------------------------------------------------------------
+
+/// 结束标志和 usage 在同一个 chunk 里（空 delta、`finish_reason: stop`、累计的 usage）。
+fn finish_with_usage_event(id: &str, usage: Value) -> String {
+    let chunk = json!({
+        "id": id, "object": "chat.completion.chunk",
+        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+        "usage": usage,
+    });
+    format!("data: {chunk}\n\n")
+}
+
+/// 空 `delta`、只有 choice 自己的 `text`：旧的 completions 接口的字段。原来会被原样转发给客户端，却在计费上不算内容。
+fn smuggled_text_event(id: &str, text: &str) -> String {
+    let chunk = json!({
+        "id": id, "object": "chat.completion.chunk",
+        "choices": [{"index": 0, "delta": {}, "text": text}],
+    });
+    format!("data: {chunk}\n\n")
+}
+
+/// PR-Daemon P7：一个可信的 usage 之后，上游又发了一个空 delta、只有 `text` 的 chunk（它到了客户端）。
+/// 修复之前它不算新内容：usage 仍被当成最终用量，按实际用量（200）结清、不挂账，而上游还在生成。
+#[tokio::test]
+async fn text_outside_the_delta_after_a_trusted_usage_is_new_content_so_the_usage_is_not_final() {
+    let a = FakeUpstream::start(vec![Behavior::sse(vec![
+        SseStep::Send(content_event("c", "Hel")),
+        SseStep::Send(finish_with_usage_event("c", usage(12, 2))),
+        SseStep::Send(smuggled_text_event("c", "SMUGGLED")),
+        SseStep::Hang,
+    ])])
+    .await;
+    let h = build(
+        vec![Endpoint::adult("example-alpha", a.url())],
+        Options::default(),
+    );
+    let id = read_until_then_disconnect(&h, &streaming_body(), "SMUGGLED").await;
+    assert!(a.client_closed(0, Duration::from_secs(3)).await);
+    wait_closed(&h, &id).await;
+    // 预留价结清、成本挂账、上游声称的数字只记在用量声明里
+    assert_billed_the_reservation_not_the_cumulative_usage(&h, &id);
+    assert_eq!(
+        rows(&h, &id)[0].failure_kind.as_deref(),
+        Some("client_gone")
+    );
+}
+
+/// 同一条流，客户端读完：上游没写 `[DONE]` 就断开，也不是完整的流（用量不可信）。
+#[tokio::test]
+async fn text_outside_the_delta_after_a_trusted_usage_makes_a_cut_stream_a_truncated_one() {
+    let a = FakeUpstream::start(vec![Behavior::sse(vec![
+        SseStep::Send(content_event("c", "Hel")),
+        SseStep::Send(finish_with_usage_event("c", usage(12, 2))),
+        SseStep::Send(smuggled_text_event("c", "SMUGGLED")),
+        SseStep::Close,
+    ])])
+    .await;
+    let h = build(
+        vec![Endpoint::adult("example-alpha", a.url())],
+        Options::default(),
+    );
+    let reply = post(&h.app, &streaming_body()).await;
+    assert_eq!(reply.status, 200);
+    let events = sse_data(&reply.text());
+    let last: Value = serde_json::from_str(events.last().unwrap()).unwrap();
+    assert_eq!(last["error"]["reason_code"], "stream_truncated");
+    assert_billed_the_reservation_not_the_cumulative_usage(&h, &reply.request_id());
+}
+
+/// 对照：有的兼容实现在 chat 的流式 chunk 里把内容在 `delta` 和 `text` 各写一份。两处一样，什么都没变：
+/// 照常按实际用量收（`[DONE]` 收尾）。
+#[tokio::test]
+async fn a_text_field_that_duplicates_the_delta_changes_nothing() {
+    let dup = |text: &str| {
+        let chunk = json!({
+            "id": "c", "object": "chat.completion.chunk",
+            "choices": [{"index": 0, "text": text, "delta": {"content": text}}],
+        });
+        format!("data: {chunk}\n\n")
+    };
+    let a = FakeUpstream::start(vec![Behavior::sse(vec![
+        SseStep::Send(dup("Hel")),
+        SseStep::Send(dup("lo")),
+        SseStep::Send(finish_with_usage_event("c", usage(12, 2))),
+        SseStep::Send(done_event()),
+        SseStep::Finish,
+    ])])
+    .await;
+    let h = build(
+        vec![Endpoint::adult("example-alpha", a.url())],
+        Options::default(),
+    );
+    let reply = post(&h.app, &streaming_body()).await;
+    assert_eq!(reply.status, 200);
+    assert_eq!(
+        charged(&h, &reply.request_id()),
+        (Some(200), Some("actual_usage".to_string()), actual_12_2())
+    );
+}
+
+/// OpenAI 规范流（`stream_options.include_usage`）：带 `finish_reason` 的块之后，**单独**一个 usage 块（`choices: []`），然后才是 `[DONE]`。
+/// 客户端读到 usage 块就断开、没等 `[DONE]`：上游已经生成完了（结束标志在 usage 之前），按实际用量结算，不是预留价。
+/// 这条在 usage 的可信判定里**不依赖**「单独的 usage 块自己可信」（`usage_standalone`）：可信来自它前面的结束标志。
+/// issue #603 N1 把可信判定收紧到只认结束标志 / `[DONE]` 时，这一条必须仍然成立（它钉住规范流不被误伤）。
+#[tokio::test]
+async fn an_openai_style_stream_settles_on_the_actual_usage_when_the_client_leaves_before_done() {
+    let a = FakeUpstream::start(vec![Behavior::sse(vec![
+        SseStep::Send(content_event("c", "Hel")),
+        SseStep::Send(content_event("c", "lo")),
+        SseStep::Send(finish_event("c")),
+        SseStep::Send(usage_event("c", usage(12, 2))),
+        SseStep::Hang,
+    ])])
+    .await;
+    let h = build(
+        vec![Endpoint::adult("example-alpha", a.url())],
+        Options::default(),
+    );
+    let mut body = streaming_body();
+    body["stream_options"] = json!({"include_usage": true});
+    let id = read_until_then_disconnect(&h, &body, "prompt_tokens").await;
+    assert!(a.client_closed(0, Duration::from_secs(3)).await);
+    wait_closed(&h, &id).await;
+    assert_eq!(
+        charged(&h, &id),
+        (Some(200), Some("actual_usage".to_string()), actual_12_2()),
+        "the finish chunk came before the usage chunk: the generation was over"
+    );
+    let booked = postings(&h, &id);
+    assert!(
+        booked.iter().all(|row| row.1 != "hold"),
+        "nothing is held for reconciliation: {booked:?}"
+    );
+}
+
+/// 同一条规范流，客户端读完 `[DONE]`：同样按实际用量。
+#[tokio::test]
+async fn an_openai_style_stream_read_to_done_settles_on_the_actual_usage() {
+    let a = FakeUpstream::start(vec![Behavior::sse(vec![
+        SseStep::Send(content_event("c", "Hel")),
+        SseStep::Send(content_event("c", "lo")),
+        SseStep::Send(finish_event("c")),
+        SseStep::Send(usage_event("c", usage(12, 2))),
+        SseStep::Send(done_event()),
+        SseStep::Finish,
+    ])])
+    .await;
+    let h = build(
+        vec![Endpoint::adult("example-alpha", a.url())],
+        Options::default(),
+    );
+    let mut body = streaming_body();
+    body["stream_options"] = json!({"include_usage": true});
+    let reply = post(&h.app, &body).await;
+    assert_eq!(reply.status, 200);
+    assert_eq!(
+        charged(&h, &reply.request_id()),
+        (Some(200), Some("actual_usage".to_string()), actual_12_2())
     );
 }
