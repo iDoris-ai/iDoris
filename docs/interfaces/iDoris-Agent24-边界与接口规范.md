@@ -1,5 +1,7 @@
 # iDoris × Agent24 分工边界与接口数据规范
 
+> **文档修订 1.4，2026-11-15**：owner 要求装了 oMLX 的机器首次启动时按硬件自动选默认 chat 模型，由 iDoris 负责推荐。新增 §2.9（本机 chat 模型推荐、本地模型类别与下载，拟议 wire 1.2.0，只新增），档位表由 owner 拍板，iDoris 与 Agent24 两个会话各确认一次。iDoris 侧接口尚未实现，实现发布前 §2.8 的 wire 1.1.0 仍是当前契约。
+>
 > **文档修订 1.3，2026-10-28**：owner 要求 Agent24 桌面端一站式「下载 → 运行 → 连接」iDoris，这定下了 R9 的 OD-1（launcher 宿主为 agent24d）和 OD-2（由用户在桌面端同意）。§2.1 第一条随之改写，新增 §2.7（launcher 托管契约，iDoris v0.4.0 起）与 §2.8（wire 契约 1.1.0）。已接受条款以正文为准。
 >
 > **文档修订 1.2，2026-10-15**：将 R0–R8 已接受条款合并到正文，消除“后补章节覆盖前文”的阅读方式；当时新增的 v0.3.1 范围及 R9 三项决策仍是 **OWNER REVIEW PENDING**。（其中 OD-1、OD-2 已由修订 1.3 决定，见 §2.7；fast/daily 标签重标仍待定。）
@@ -11,7 +13,7 @@
 
 | 标识 | 含义与基线 |
 |---|---|
-| 文档修订 `1.3` | 文字修订；不是服务 wire version。wire 契约版本见 §2.8 |
+| 文档修订 `1.4` | 文字修订；不是服务 wire version。wire 契约版本见 §2.8；§2.9 拟议的 wire 1.2.0 在 iDoris 实现发布前不生效 |
 | iDoris release `v0.3.0` | 实现提交 `03c079c70611331a8c85a1666e32a75df6359d09`（下称 I0） |
 | runtime `contract_version=1.0.1` | I0 的 `crates/idoris-contracts/src/version.rs::CONTRACT_VERSION`；TS `packages/contracts/src/version.ts` 同值 |
 | Agent24 审计基线 | `6072fd373142eb3dbf1a6a4a3222e6eec82c74f6`（下称 A0，固定历史快照，非当前 main）；main 源码状态不等于 stable 已发给用户 |
@@ -169,6 +171,82 @@ agent24d 托管 iDoris 时，按下表执行。表中都是已冻结的接口，
 - 带了确认也放不下（超过整个额度）时，`error.type` 是 `local_only_unavailable`，`reason_code` 不是 `headroom_confirmation_required`，为终态，不应弹出确认。其它 503 按原规则处理。
 - `remediation` 是给人看的说明文字，不属于契约，不得用于匹配。
 
+### 2.9 本机 chat 模型推荐、本地模型类别与下载（wire 1.2.0，2026-11-15 双方确认；iDoris 侧待实现）
+
+只有新增，1.1.x 的调用方不受影响。本节落地前，§2.3「下载/预热的功能归属在 iDoris，但归属不表示已有下载服务」仍然成立。
+
+**分工**：iDoris 负责「这台机器的 chat 用哪个模型」——档位表、量化选择、是否已安装、内存是否放得下、下载与加载。Agent24 负责首次启动时调用、把用户的选择保存为默认 chat 模型、Settings 的模型选择器，以及 iDoris 未安装时回落到 `Qwen3-8B-4bit`。
+
+**档位表（owner 2026-11-15 拍板，按物理内存）**
+
+档位按 `host.ram_bytes`（物理内存字节数）落在哪个左闭右开区间判断，单位是 GiB（1 GiB = 1073741824 字节；Apple 标称的「16GB」就是 16 GiB）。模型体积与内存估算（`size_bytes`、`est_memory_bytes`）用十进制字节。每台机器恰好落在一行：
+
+| `ram_bytes` 区间 | 档位推荐（oMLX 目录名） | `alternatives` | 档位 `reason` |
+|---|---|---|---|
+| [0, 16 GiB) | `Qwen3-8B-4bit`，**仅当它放得下**；放不下则 `model_id: null` | 无 | `tier_below_16gib` |
+| [16 GiB, 48 GiB) | `Qwen3-8B-4bit` | 无 | `tier_16_48gib` |
+| [48 GiB, 64 GiB) | `Qwen3.8-27B-OptiQ-4bit` | `Qwen3-8B-4bit` | `tier_48_64gib` |
+| [64 GiB, ∞) | `Qwen3.8-27B-OptiQ-4bit` | `Qwen3.6-35B-A3B-OptiQ-4bit`、`Qwen3-8B-4bit` | `tier_64gib_plus` |
+
+（owner 原话「≤8GB 不推荐本地 chat；16/24/32GB → 8B；48GB+ → 27B；64GB+ 可选 35B-A3B」。8 GiB 机器在第一行按放不下返回 `null`；18 / 36 GiB 等落在第二行。）
+
+档位按真实物理 RAM 判断（与 §2.4 的 min_ram 门一致）。「放得下」（`fits`）另按 iDoris 的内存公式判断：设置了 `IDORIS_ALLOCATED_BUDGET_BYTES` 时按该额度，否则按 iDoris 自探的可用 GPU 内存。
+
+**回落规则**：档位推荐的模型放不下时，按 `Qwen3.6-35B-A3B-OptiQ-4bit` → `Qwen3.8-27B-OptiQ-4bit` → `Qwen3-8B-4bit` 的顺序，从档位推荐的下一个起找第一个放得下的作为 `model_id`，此时 `reason` 为 `fallback_does_not_fit`；一个都放不下时 `model_id: null`，`reason` 为 `insufficient_memory`。`alternatives` 只列档位表里该行的备选，每项各自带 `fits`。
+
+内存依据（实测，2026-11-15）：`Qwen3.8-27B-OptiQ-4bit` 权重 20.68 GB，加 8k 上下文 KV（全注意力上界约 2.1 GB）与约 1 GB 开销，约 23.8 GB；24 GiB 机器可用约 15.8–16.8 GB，32 GiB 约 21.1–22.4 GB，均放不下。
+
+**`GET /v1/recommendation?role=chat`**（只读，需要数据 key，与 `/v1/models` 同级鉴权）
+
+- 查询参数：`role`，本版只支持 `chat`，其他值返回 400，`error.reason_code` 为 `unsupported_role`。
+- 响应 200：
+  ```json
+  {
+    "role": "chat",
+    "model_id": "Qwen3-8B-4bit",
+    "installed": true,
+    "size_bytes": 4620000000,
+    "est_memory_bytes": 6100000000,
+    "fits": true,
+    "reason": "tier_16_48gib",
+    "host": {"ram_bytes": 17179869184, "allocated_budget_bytes": null},
+    "alternatives": [
+      {"model_id": "…", "installed": false, "size_bytes": null, "est_memory_bytes": null, "fits": true, "reason": "…"}
+    ]
+  }
+  ```
+- `model_id` 是 oMLX 目录名（即 `/v1/chat/completions` 的 `model` 应填的值），可为 `null`。`installed` 表示 `~/.omlx/models/<model_id>` 已存在且完整。`size_bytes` 为磁盘/下载体积（未安装时为预计下载体积），`est_memory_bytes` 为加载后的内存估算；两者未知时都为 `null`（不用 0），`alternatives` 里的同名字段相同。`reason` 只取上面档位表与回落规则里的代码（`tier_below_16gib`、`tier_16_48gib`、`tier_48_64gib`、`tier_64gib_plus`、`fallback_does_not_fit`、`insufficient_memory`），供程序判断；给人看的说明另放 `remediation`，不属于契约。
+- 本接口不加载、不下载、不改任何状态。Agent24 保存用户的选择，iDoris 不记忆。
+
+**`idoris recommend --role chat --json`**（CLI，同一响应形状）
+
+- 只需要 iDoris 可执行文件：不开数据库、不取实例锁、不启动 runtime、不需要 serve 在跑，也不需要完整 setup。自探硬件，读取 `~/.omlx/models` 判断是否已安装；不连接 oMLX，因此不读取任何 oMLX 密钥（下面「oMLX 密钥」一节只适用于 iDoris 连接 oMLX 的场景）；可用 `--allocated-budget-bytes <u64>` 覆盖额度。
+- 退出码：0 成功（含 `model_id: null`）；1 失败（stderr 一行说明）。
+
+**`GET /v1/models/local`**（只读，需要数据 key）
+
+- 列出 `~/.omlx/models` 下的模型：`{"models": [{"omlx_id": "Qwen3-8B-4bit", "kind": "chat", "size_bytes": 4620000000, "catalog_id": "qwen3-8b"}]}`。
+- `kind` 取值：`chat`、`vision`、`embedding`、`rerank`、`image`、`ocr`、`tts`、`unknown`。来源优先级：iDoris catalog（`config/catalog.yaml`，新增 `omlx_id` 与 `kind`）→ 按模型目录的 `config.json`（`architectures` / `model_type` 等）推断 → 推断不了为 `unknown`。`catalog_id` 不在 catalog 时为 `null`。
+- Agent24 的 chat 选择器只列 `kind` 为 `chat` 或 `vision` 的条目；`unknown` 不列入。
+- 同形状 CLI：`idoris models local --json`，运行条件与 `idoris recommend` 相同（只读文件系统，不连接 oMLX、不读密钥）。HTTP 版同样只读 `~/.omlx/models`，不为列表去调用 oMLX。
+
+**下载（归 iDoris）**
+
+- iDoris 负责下载与校验，拒绝下载内存放不下的模型（`fits: false`）。大文件下载必须由用户在 Agent24 界面确认后才开始，iDoris 不自动下载。
+- 接口形状（下载进度、取消、错误码）在 iDoris 实现时另行修订本节，双方确认后再冻结；本版只冻结归属与「必须用户确认」这一条。Agent24 负责向用户说明体积、征得同意、显示进度。
+
+**oMLX 密钥**
+
+- 优先级：`IDORIS_OMLX_API_KEY`（§2.7，保持不变）→ `~/.omlx/settings.json` 的 `auth.api_key` → 无鉴权连接。
+- 只从文件读取，不打印、不写日志、不进 argv 或响应体。不硬编码任何默认值（Agent24 侧同样不再假定默认 key）。
+- oMLX 开了鉴权而两处都没有 key 时，iDoris 按 401 处理并在 `remediation` 说明，不重试。
+
+**Agent24 的调用顺序**：iDoris serve 在跑且有数据 key → 走上面的 HTTP 接口；否则本机有 iDoris 可执行文件 → 走 CLI（`idoris recommend` / `idoris models local --json`）；都没有 → 回落 `Qwen3-8B-4bit`，选择器按 oMLX `/v1/models` 列出（不按 `kind` 过滤；Agent24 内部按名称启发式排除图像 / OCR / 语音类，属 Agent24 内部行为，不进本契约）。
+
+**Agent24 侧的 oMLX 密钥**：与 iDoris 同一顺序的后两步——`~/.omlx/settings.json` 的 `auth.api_key` → 无鉴权；不再假定任何默认 key。
+
+**不承诺**：`chat` 以外角色的推荐（embedding / vision / image 以后另行修订）；自动升级已安装的模型；Linux / x86。
+
 ## 3. 拟议 v0.3.1 local_only 数据面切片（待联合验收）
 
 1. 用户独立准备并启动 iDoris/后端/已安装权重；数据面与 launcher 独立。Agent24 显式配置 loopback IDORIS_URL 与 iDoris 签发的 local_only 数据 key，目标安全存储为 Keychain，不把 Admin token 当数据 key。未决定 keychain service/account、轮换 CLI 或期限默认值。
@@ -248,3 +326,4 @@ agent24d 托管 iDoris 时，按下表执行。表中都是已冻结的接口，
 | R8 | 2026-09-27 | Agent24 | 审阅 v1.1：无异议；建议 loopback 免 key 仅作为显式开发者选项，免 key 时视为 local_only | 已采纳，写入 §3.2 |
 | R9 | 2026-10-15 | iDoris | [文档修订 1.2 整合与三个 owner 决策](negotiation/R9-v1.2-协商提案.md)；local_only v0.3.1 最小数据面与 launcher 解耦 | OD-1/OD-2 已由修订 1.3 决定（见 §2.7）；fast/daily 标签重标仍 **OWNER REVIEW PENDING** |
 | R10 | 2026-10-28 | jason / 双方 | 文档修订 1.3：owner 要求 Agent24 桌面端一站式「下载 → 运行 → 连接」，由此定下 OD-1（宿主为 agent24d）、OD-2（用户在桌面端同意）；新增 §2.7 launcher 托管契约（iDoris v0.4.0 起）、§2.8 wire 契约 1.1.0 | launcher 设计已合入 [Agent24#1437](https://github.com/iDoris-ai/Agent24/pull/1437)；按 v0.4.0 的实现与验收是 Agent24 的 IL-01 起各项，尚未完成。其中「额度紧时 503 `headroom_confirmation_required` → 用户确认 → 重发」的确认交互登记为 ID-HR，见 [Agent24#1442](https://github.com/iDoris-ai/Agent24/pull/1442) |
+| R11 | 2026-11-15 | jason / 双方 | 文档修订 1.4：新增 §2.9 本机 chat 模型推荐（`GET /v1/recommendation?role=chat`、`idoris recommend --role chat --json`）、本地模型类别（`GET /v1/models/local`、`kind`）、下载归 iDoris 且须用户确认、oMLX 密钥读取顺序；档位 16/24/32GB → Qwen3-8B-4bit，48GB+ → Qwen3.8-27B-OptiQ-4bit，64GB+ 可选 Qwen3.6-35B-A3B-OptiQ-4bit | iDoris 与 Agent24 会话各确认一次（2026-11-15）；iDoris 侧实现排在计算服务 PR #600 之后；Agent24 先做不依赖 iDoris 的部分 |
