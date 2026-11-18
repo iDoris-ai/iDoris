@@ -353,6 +353,20 @@ async fn send(
     body: Option<Value>,
     headers: &[(&str, &str)],
 ) -> Reply {
+    send_from(app, None, verb, uri, bearer, body, headers).await
+}
+
+/// 和 [`send`] 一样，只是可以指定 TCP 对端地址：真实的监听器会给每个请求挂上对端地址（`ConnectInfo`），
+/// 直接 `oneshot` 驱动路由的测试默认没有（来源未知）。
+async fn send_from(
+    app: &Router,
+    peer: Option<&str>,
+    verb: &str,
+    uri: &str,
+    bearer: Option<&str>,
+    body: Option<Value>,
+    headers: &[(&str, &str)],
+) -> Reply {
     let mut builder = Request::builder().method(verb).uri(uri);
     if let Some(token) = bearer {
         builder = builder.header("authorization", format!("Bearer {token}"));
@@ -360,13 +374,19 @@ async fn send(
     for (name, value) in headers {
         builder = builder.header(*name, *value);
     }
-    let request = match body {
+    let mut request = match body {
         Some(body) => builder
             .header("content-type", "application/json")
             .body(Body::from(body.to_string()))
             .unwrap(),
         None => builder.body(Body::empty()).unwrap(),
     };
+    if let Some(peer) = peer {
+        let peer = std::net::SocketAddr::new(peer.parse().unwrap(), 50_000);
+        request.extensions_mut().insert(axum::extract::ConnectInfo(
+            crate::connection::ConnectionInfo::for_peer(peer),
+        ));
+    }
     let response = app.clone().oneshot(request).await.unwrap();
     let status = response.status();
     let headers = response.headers().clone();
@@ -2499,6 +2519,26 @@ async fn redeem(world: &World, code: &str, label: &str) -> Reply {
         .await
 }
 
+/// 从指定的 TCP 对端地址兑换（真实的监听器会给每个请求挂上它）。
+async fn redeem_from(world: &World, peer: &str, code: &str, label: &str) -> Reply {
+    send_from(
+        &world.app,
+        Some(peer),
+        "POST",
+        "/control/v1/pairing/redeem",
+        None,
+        Some(json!({"code": code, "device_label": label})),
+        &[],
+    )
+    .await
+}
+
+/// 格式合法、查无此码的第 `n` 个猜测（12 位数字，每个不一样）。
+fn wrong_code(n: u32) -> String {
+    let digits = format!("{n:012}");
+    format!("{}-{}-{}", &digits[0..4], &digits[4..8], &digits[8..12])
+}
+
 #[tokio::test]
 async fn pairing_over_http_one_code_one_device_each_device_independently_revocable() {
     let world = World::new();
@@ -2827,6 +2867,264 @@ async fn wrong_pairing_codes_are_rate_limited_globally_and_cannot_be_enumerated(
     assert_eq!(
         redeem(&world, &another, "still open").await.status,
         StatusCode::CREATED
+    );
+}
+
+// ---- #603 N3：配对失败限速按来源分桶，全局总闸只是总速率的上界 ----
+
+#[tokio::test]
+async fn one_noisy_source_cannot_lock_every_other_source_out_of_pairing() {
+    // 限速原来是全局的（一分钟 20 次、鉴权前）：一个来源每分钟约 20 个垃圾码，所有租户的合法配对都拿 429。
+    // 现在每个来源有自己的份额，总闸调到远高于单来源上限，一个来源打不满它。
+    let world = World::new();
+    world.people().await;
+    let (good_a, _) = pairing_code(&world, "m-kid1").await;
+    let (good_b, _) = pairing_code(&world, "m-kid2").await;
+    let (noisy, honest, other) = ("198.51.100.1", "198.51.100.2", "198.51.100.3");
+    // 吵闹的来源：20 个猜错（查无此码、格式不对）用完它自己的份额
+    for attempt in 0..20 {
+        let wrong = if attempt % 2 == 0 {
+            "ABCD-EFGH-JKMN"
+        } else {
+            "not a code"
+        };
+        let reply = redeem_from(&world, noisy, wrong, "x").await;
+        assert_eq!(
+            (reply.status, reply.reason()),
+            (StatusCode::BAD_REQUEST, "pairing_code_invalid"),
+            "attempt {attempt}"
+        );
+    }
+    // 它自己的下一次（连正确的码也一样）被限速：这是它自己的份额
+    let blocked = redeem_from(&world, noisy, &good_a, "noisy").await;
+    assert_eq!(
+        (blocked.status, blocked.reason()),
+        (StatusCode::TOO_MANY_REQUESTS, "pairing_rate_limited")
+    );
+    assert!(blocked.headers.contains_key("retry-after"));
+    // 别的来源的合法码照常兑换：不受吵闹来源的失败影响
+    for (peer, code) in [(honest, &good_a), (other, &good_b)] {
+        let reply = redeem_from(&world, peer, code, "legitimate").await;
+        assert_eq!(reply.status, StatusCode::CREATED, "{peer}: {}", reply.raw);
+    }
+    // 吵闹的来源仍然被限速；窗口滑过去之后恢复（恢复成「有机会再猜」，不是「放行」）
+    assert_eq!(
+        redeem_from(&world, noisy, "ABCD-EFGH-JKMN", "x")
+            .await
+            .status,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    world.clock.advance(60_001);
+    assert_eq!(
+        redeem_from(&world, noisy, "ABCD-EFGH-JKMN", "x")
+            .await
+            .status,
+        StatusCode::BAD_REQUEST
+    );
+}
+
+#[tokio::test]
+async fn many_sources_together_are_still_capped_by_the_global_gate() {
+    // 总闸：所有来源合起来一分钟最多 600 次「猜错」（暴力破解的总速率上界，和有多少个来源无关）。
+    // 30 个来源各用满自己的 20 个；第 31 个来源自己一次都没猜错，也要等窗口滑过去。
+    let world = World::new();
+    world.people().await;
+    let (good, _) = pairing_code(&world, "m-kid1").await;
+    let mut counter = 0_u32;
+    for source in 1..=30 {
+        for attempt in 0..20 {
+            counter += 1;
+            let reply = redeem_from(
+                &world,
+                &format!("198.51.100.{source}"),
+                &wrong_code(counter),
+                "x",
+            )
+            .await;
+            assert_eq!(
+                (reply.status, reply.reason()),
+                (StatusCode::BAD_REQUEST, "pairing_code_invalid"),
+                "source {source}, attempt {attempt}"
+            );
+        }
+    }
+    assert_eq!(counter, 600);
+    let blocked = redeem_from(&world, "198.51.100.31", &good, "x").await;
+    assert_eq!(
+        (blocked.status, blocked.reason()),
+        (StatusCode::TOO_MANY_REQUESTS, "pairing_rate_limited"),
+        "the global gate is full: nobody else may start a lookup"
+    );
+    world.clock.advance(60_001);
+    assert_eq!(
+        redeem_from(&world, "198.51.100.31", &good, "now")
+            .await
+            .status,
+        StatusCode::CREATED
+    );
+}
+
+#[tokio::test]
+async fn a_forged_forwarding_header_never_buys_another_failure_budget() {
+    // 组织形态没有「受信代理」的配置：头里写的地址一律不可信，来源只有 TCP 对端
+    let world = World::new();
+    world.people().await;
+    let (good, _) = pairing_code(&world, "m-kid1").await;
+    for round in 0..30 {
+        let forged = format!("198.51.100.{}", round + 1);
+        let reply = send_from(
+            &world.app,
+            Some("203.0.113.9"),
+            "POST",
+            "/control/v1/pairing/redeem",
+            None,
+            Some(json!({"code": "ABCD-EFGH-JKMN", "device_label": "x"})),
+            &[
+                ("x-forwarded-for", forged.as_str()),
+                ("x-real-ip", "198.51.100.200"),
+                ("forwarded", "for=198.51.100.201"),
+            ],
+        )
+        .await;
+        let expected = if round < 20 {
+            StatusCode::BAD_REQUEST
+        } else {
+            StatusCode::TOO_MANY_REQUESTS
+        };
+        assert_eq!(reply.status, expected, "round {round}");
+    }
+    // 真正的另一个客户端（另一个 TCP 对端）不受影响，头里写没写它的地址都一样
+    assert_eq!(
+        redeem_from(&world, "203.0.113.10", &good, "a real second client")
+            .await
+            .status,
+        StatusCode::CREATED
+    );
+}
+
+#[tokio::test]
+async fn requests_without_a_known_source_share_one_bucket_apart_from_every_real_source() {
+    // 直接驱动路由、没有对端地址的请求（只有测试会这样）：全部归在同一个「来源未知」的桶里，不占任何真实来源的份额
+    let world = World::new();
+    world.people().await;
+    let (good, _) = pairing_code(&world, "m-kid1").await;
+    for n in 0..20 {
+        let reply = redeem(&world, &wrong_code(n), "x").await;
+        assert_eq!(reply.status, StatusCode::BAD_REQUEST, "attempt {n}");
+    }
+    assert_eq!(
+        redeem(&world, &wrong_code(99), "x").await.status,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    let reply = redeem_from(&world, "198.51.100.1", &good, "real source").await;
+    assert_eq!(reply.status, StatusCode::CREATED, "{}", reply.raw);
+}
+
+#[tokio::test]
+async fn the_real_listener_gives_every_redeem_request_its_tcp_peer_as_the_source() {
+    // 上面的测试是把对端地址手工挂到请求上；这一条走真的监听器（组织形态：控制面合并在数据面之后，不经过任何边缘中间件），
+    // 证明生产里每个兑换请求的来源就是 TCP 对端，而不是「来源未知」的那个共用桶。
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let world = World::new();
+    world.people().await;
+    let (good, _) = pairing_code(&world, "m-kid1").await;
+    // 先把「来源未知」的桶用满（直接驱动路由、没有对端地址）
+    for n in 0..20 {
+        let reply = redeem(&world, &wrong_code(n), "x").await;
+        assert_eq!(reply.status, StatusCode::BAD_REQUEST, "attempt {n}");
+    }
+    assert_eq!(
+        redeem(&world, &wrong_code(99), "x").await.status,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let app = world.app.clone();
+    let server = tokio::spawn(async move {
+        axum::serve(
+            crate::connection::ConnectionListener::new(listener, shutdown).unwrap(),
+            app.into_make_service_with_connect_info::<crate::connection::ConnectionInfo>(),
+        )
+        .await
+        .unwrap();
+    });
+    let raw = |code: String, extra_header: &'static str| async move {
+        let body = json!({"code": code, "device_label": "x"}).to_string();
+        let request = format!(
+            "POST /control/v1/pairing/redeem HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n{extra_header}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await.unwrap();
+        String::from_utf8_lossy(&response).to_string()
+    };
+    // 真的 TCP 连接有自己的来源（127.0.0.1），不受「来源未知」那个桶已满的影响：前 20 次猜错各得到查库的答案，
+    // 请求头里写的地址（每次不同）不换桶；第 21 次被它自己的份额挡住
+    for n in 0..21 {
+        let reply = raw(wrong_code(n), "X-Forwarded-For: 198.51.100.77\r\n").await;
+        let expected = if n < 20 { " 400 " } else { " 429 " };
+        assert!(
+            reply.starts_with("HTTP/1.1") && reply.lines().next().unwrap().contains(expected),
+            "attempt {n}: {reply}"
+        );
+    }
+    server.abort();
+    // 对照：这个码没有被动过（猜码都是别的码），从别的来源照常兑换
+    let ok = redeem_from(&world, "198.51.100.9", &good, "elsewhere").await;
+    assert_eq!(ok.status, StatusCode::CREATED, "{}", ok.raw);
+}
+
+#[tokio::test]
+async fn ipv6_sources_share_their_64_bit_prefix_and_ipv4_mapped_addresses_count_as_ipv4() {
+    // 来源取法和云入口的来源软配额一致（`abuse::source_key`）：IPv6 取 /64，IPv4 映射地址还原成 IPv4
+    let world = World::new();
+    world.people().await;
+    let (good, _) = pairing_code(&world, "m-kid1").await;
+    for n in 0..10 {
+        let reply = redeem_from(&world, "2001:db8:1:2:aaaa::1", &wrong_code(n), "x").await;
+        assert_eq!(reply.status, StatusCode::BAD_REQUEST, "attempt {n}");
+    }
+    for n in 10..20 {
+        // 同一个 /64 里的另一个地址：同一个桶
+        let reply = redeem_from(&world, "2001:db8:1:2:bbbb::7", &wrong_code(n), "x").await;
+        assert_eq!(reply.status, StatusCode::BAD_REQUEST, "attempt {n}");
+    }
+    assert_eq!(
+        redeem_from(&world, "2001:db8:1:2:cccc::3", &wrong_code(99), "x")
+            .await
+            .status,
+        StatusCode::TOO_MANY_REQUESTS,
+        "the whole /64 is one source"
+    );
+    // 另一个 /64 是另一个来源
+    let reply = redeem_from(&world, "2001:db8:1:3::1", &good, "another /64").await;
+    assert_eq!(reply.status, StatusCode::CREATED, "{}", reply.raw);
+    // 映射地址和它的 IPv4 地址是同一个来源：交替用两种写法，一共 20 次猜错，第 21 次被限速
+    for n in 20..40 {
+        let peer = if n % 2 == 0 {
+            "203.0.113.7"
+        } else {
+            "::ffff:203.0.113.7"
+        };
+        let reply = redeem_from(&world, peer, &wrong_code(n), "x").await;
+        assert_eq!(reply.status, StatusCode::BAD_REQUEST, "attempt {n}");
+    }
+    assert_eq!(
+        redeem_from(&world, "::ffff:203.0.113.7", &wrong_code(99), "x")
+            .await
+            .status,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    assert_eq!(
+        redeem_from(&world, "203.0.113.7", &wrong_code(98), "x")
+            .await
+            .status,
+        StatusCode::TOO_MANY_REQUESTS
     );
 }
 
