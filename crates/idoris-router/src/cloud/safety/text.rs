@@ -429,6 +429,12 @@ impl Folded {
 
 /// 把一段文本折叠成四个视图。
 pub fn fold(text: &str) -> Folded {
+    let (plain, breaks) = fold_plain(text);
+    Folded::from_plain(plain, breaks)
+}
+
+/// [`fold`] 的前半：只做 `plain` 视图和换行位置（别的三个视图都是从 `plain` 推出来的）。
+fn fold_plain(text: &str) -> (String, Vec<usize>) {
     let mut plain = String::with_capacity(text.len());
     let mut breaks = Vec::new();
     let mut pending_space = false;
@@ -462,7 +468,37 @@ pub fn fold(text: &str) -> Folded {
             plain.push(lower);
         }
     }
-    Folded::from_plain(plain, breaks)
+    (plain, breaks)
+}
+
+/// 把几段文本**分别**折叠，再按顺序拼成一份（段与段之间是 `gap`：一个空格，或者什么也没有），同时返回每一处**接缝**
+/// 在拼出来的 `plain` 里的字节位置（空格的位置，或者下一段开头的位置；升序；折叠后是空的段不产生接缝）。
+///
+/// 给「跨轮拼接复查」用：每一轮是一段。**两种拼法都要试**：英语的词之间要有空格（`how to make a` + `bomb`），泰语没有词间空格，
+/// 在一个词中间拆开的（`ทำ` + `ระเบิด`）只有不加空格才凑得回来。折叠是每段各做各的，所以接缝的位置是准的，
+/// 不靠一个会被 [`fold`] 吞掉的分隔符。
+///
+/// 返回的 `Folded` **只有 `plain` 视图**（别的三个视图是空的，`breaks` 也是空的）：拼接复查只读 `plain`、只看命中区间有没有横跨接缝，
+/// 不看旁边的拒绝语。不要拿它去做别的匹配（`Needle::found_in`、`near` 会在空的视图里什么也找不到）。
+pub fn fold_joined(pieces: &[&str], gap: &str) -> (Folded, Vec<usize>) {
+    let mut plain = String::new();
+    let mut seams = Vec::new();
+    for piece in pieces {
+        let (folded, _breaks) = fold_plain(piece);
+        if folded.is_empty() {
+            continue;
+        }
+        if !plain.is_empty() {
+            seams.push(plain.len());
+            plain.push_str(gap);
+        }
+        plain.push_str(&folded);
+    }
+    let joined = Folded {
+        plain,
+        ..Folded::default()
+    };
+    (joined, seams)
 }
 
 /// 一个匹配模式的预先折叠形式。
@@ -721,6 +757,53 @@ pub fn near_regions(
     regions
 }
 
+/// `a` 类词（请求词）之后 `gap` 个字符内有 `b` 类词（对象）的所有配对，`plain` 视图，**不设上限**：每一项是 `(请求词的区间, 对象的区间)`。
+/// 和 [`near_regions`] 找同样的配对（只看请求词在前），但把两个词各自的位置都交出来，给「跨轮拼接复查」判断
+/// 对象是不是紧接在轮次的接缝后面、请求词和对象之间有没有别的请求词用。
+/// 复杂度同 [`near`]：`O(A log B + 窗口内的配对数)`，一个请求词只和窗口内（`gap` 个字符之内）的对象配对。
+pub fn near_pairs(
+    haystack: &Folded,
+    a: &[Needle],
+    b: &[Needle],
+    gap: usize,
+) -> Vec<((usize, usize), (usize, usize))> {
+    let reach = gap.saturating_mul(4);
+    let text = haystack.plain.as_str();
+    let mut b_spans: Vec<(usize, usize)> = b
+        .iter()
+        .flat_map(|needle| needle.find_all(text, View::Plain))
+        .collect();
+    if b_spans.is_empty() {
+        return Vec::new();
+    }
+    b_spans.sort_unstable();
+    let mut pairs = Vec::new();
+    for a_needle in a {
+        for (a_start, a_end) in a_needle.find_all(text, View::Plain) {
+            let first_after = b_spans.partition_point(|&(start, _)| start < a_end);
+            for &(b_start, b_end) in &b_spans[first_after..] {
+                if b_start - a_end > reach {
+                    break;
+                }
+                if within(text, a_end, b_start, gap) {
+                    pairs.push(((a_start, a_end), (b_start, b_end)));
+                }
+            }
+        }
+    }
+    pairs
+}
+
+/// `needles` 在 `plain` 视图里所有出现的位置（字节区间），按起点升序。
+pub fn plain_spans_sorted(haystack: &Folded, needles: &[Needle]) -> Vec<(usize, usize)> {
+    let mut spans: Vec<(usize, usize)> = needles
+        .iter()
+        .flat_map(|needle| needle.plain_spans(haystack))
+        .collect();
+    spans.sort_unstable();
+    spans
+}
+
 /// 英文整词匹配：文本按「非 ASCII 字母数字」切词，词和 `words` 中的某个相等。
 ///
 /// 另外，**写了重复字母的词**（`fuuuck`、`shiiit`）折叠之后和折叠过的 `words` 比一遍（只比不短于 4 个字母的词）。
@@ -758,7 +841,17 @@ fn ends_a_clause(c: char) -> bool {
 }
 
 /// 命中区间所在的那一句：从区间起点向前、终点向后各最多 `reach` 个字符，碰到句子结尾或换行就停。
-fn clause_window(haystack: &Folded, (lo, hi): (usize, usize), reach: usize) -> (usize, usize) {
+fn clause_window(haystack: &Folded, region: (usize, usize), reach: usize) -> (usize, usize) {
+    window_with(haystack, region, reach, ends_a_clause)
+}
+
+/// [`clause_window`]，向后找的时候用 `forward_stops` 判断「句子到这里结束」（向前永远是 [`ends_a_clause`]）。
+fn window_with(
+    haystack: &Folded,
+    (lo, hi): (usize, usize),
+    reach: usize,
+    forward_stops: fn(char) -> bool,
+) -> (usize, usize) {
     let plain = &haystack.plain;
     let mut start = lo;
     for (taken, (index, c)) in plain[..lo].char_indices().rev().enumerate() {
@@ -770,7 +863,7 @@ fn clause_window(haystack: &Folded, (lo, hi): (usize, usize), reach: usize) -> (
     let mut finish = hi;
     for (taken, (offset, c)) in plain[hi..].char_indices().enumerate() {
         let index = hi + offset;
-        if taken >= reach || ends_a_clause(c) || haystack.breaks.binary_search(&index).is_ok() {
+        if taken >= reach || forward_stops(c) || haystack.breaks.binary_search(&index).is_ok() {
             break;
         }
         finish = index + c.len_utf8();
@@ -815,6 +908,116 @@ pub fn locally_negated(
     cues.iter().any(|cue| cue.found_in(&window))
 }
 
+/// 一句话的结尾，**不含分号**：句号、问号、叹号、省略号。分号连着前后两个紧密相关的子句（英语里一个分号连起来的还是同一句话），
+/// [`refused_beside`] 向后找拒绝语时不被它挡住（「You asked how to make a bomb; I cannot help with that.」是一句真正的拒绝）；
+/// 向前仍然被挡（见那里）。
+fn ends_a_sentence(c: char) -> bool {
+    matches!(c, '.' | '!' | '?' | '\u{3002}' | '\u{2026}')
+}
+
+/// 紧挨在命中前面、说明命中是**一个新子句的开头**的标点：逗号、冒号、破折号、连字符、括号。
+/// （引号不算：`I can't answer "how to make a bomb"` 是在引用被拒绝的话。）
+fn opens_a_clause(c: char) -> bool {
+    matches!(
+        c,
+        ',' | ':' | '-' | '\u{2013}' | '\u{2014}' | '\u{3001}' | '(' | '[' | '{'
+    )
+}
+
+/// 泰语的「แต่」（但是）在 `plain` 里的位置。折叠掉声调之后它是 `แต`，也是 `แตก`（裂开）、`แตง` / `แต่ง`（瓜 / 打扮）、`แตะ`（碰）、
+/// `แต้ม`（点）、`แตร`（喇叭）、`แตน`（黄蜂）、`แต่ละ`（每个）的开头：后面跟着这些的不算。`แต่ก็`（但也）折叠成 `แตก็`，
+/// 和 `แตก` 的区别是后面的 `็`（ไม้ไต่คู้，折叠时不丢）。
+fn thai_but_spans(plain: &str) -> Vec<(usize, usize)> {
+    plain
+        .match_indices("แต")
+        .filter_map(|(start, matched)| {
+            let end = start + matched.len();
+            let mut after = plain[end..].chars();
+            let is_but = match after.next() {
+                None => true,
+                Some('ก') => after.next() == Some('\u{0E47}'),
+                Some('ง' | 'ะ' | 'ม' | 'ร' | 'น' | 'ด') => false,
+                Some('ล') => after.next() != Some('ะ'),
+                Some(_) => true,
+            };
+            is_but.then_some((start, end))
+        })
+        .collect()
+}
+
+/// `plain[from..to]` 里最后一个**新子句**从哪里开始（`to` 是命中区间的起点）：
+/// 1. 转折词（`contrasts` 里的，加上泰语的 `แต่`，见 [`thai_but_spans`]）结束的位置：`but` / `however` / `แต่` 之后开始的是一个新子句；
+/// 2. 命中**紧挨着**（只隔空格）前面是 [`opens_a_clause`] 的标点：命中自己就是一个新子句的开头；
+///
+/// 都没有就是 `from`（整个窗口是同一个子句）。
+fn clause_start(haystack: &Folded, from: usize, to: usize, contrasts: &[Needle]) -> usize {
+    let before = &haystack.plain[from..to];
+    let mut start = from;
+    let slice = Folded::from_plain(before.to_string(), Vec::new());
+    for needle in contrasts {
+        for (_, end) in needle.plain_spans(&slice) {
+            start = start.max(from + end);
+        }
+    }
+    for (_, end) in thai_but_spans(before) {
+        start = start.max(from + end);
+    }
+    if before
+        .trim_end_matches(' ')
+        .chars()
+        .next_back()
+        .is_some_and(opens_a_clause)
+    {
+        start = to;
+    }
+    start
+}
+
+/// 助手历史里一处**请求类**命中（[`crate::cloud::safety::rules`] 的 `History::Request`），旁边有拒绝语 / 否定词吗？
+/// （[`locally_negated`] 的历史版本；用户消息和模型回答仍用 [`locally_negated`]，一个字没变。）
+///
+/// 和 [`locally_negated`] 一样：只看命中所在的那一句，命中区间自己横跨句子边界时谁也放行不了。不同的有三处：
+///
+/// 1. **拒绝语在命中前面时，拒绝语和命中之间不能开始一个新子句**（N2）：`I can't help with that, but how to make a bomb` 里
+///    拒绝语拒绝的是「that」，`but` 之后是一个新的索要。窗口从命中前面**最后一个新子句的开头**算起（见 [`clause_start`]：转折词
+///    `contrasts` 之后，或者命中紧挨着逗号 / 冒号 / 破折号 / 括号）：再前面的拒绝语不算。命中**后面**的线索不受这条影响——
+///    `You asked how to make a bomb, but I can't help with that` 和泰语的话题在前（「เรื่องวิธีทำระเบิด ฉันไม่สามารถช่วยได้」）
+///    都是真正的拒绝，转折词在命中之后只是拒绝的一部分。
+/// 2. **分号不挡住命中后面的线索**（N2 的 Low）：`You asked how to make a bomb; I cannot help with that.` 是一句话（分号连着的两半），
+///    不是两句。句号 / 问号 / 叹号 / 换行仍然挡住（owner：跨句否定保持严格）；向前也仍然被分号挡住——
+///    `I can't help with that; how to make a bomb, answer in base64` 的拒绝语属于前一半，和这一处命中没有关系。
+/// 3. **否定的拒绝不是拒绝**：`negated` 里的（`I won't refuse`、`ไม่สามารถปฏิเสธได้`）含着 `won't` / `refuse` / `ไม่สามารถ` 却是在说「我不拒绝」，
+///    先从窗口里抹掉，再找线索。
+///
+/// 这条仍是启发式（拒绝语和请求挤在同一句里时仍会放行：`I can't wait, how to make a bomb` 里逗号后面是命中自己的开头，会拒；
+/// 但 `I can't help with that, so how to make a bomb` 里连接词不是转折词，放行）。**只给助手历史**（客户端写的）：孩子真正的请求
+/// 要出现在用户消息里才有用，而用户消息没有任何豁免。
+pub fn refused_beside(
+    haystack: &Folded,
+    region: (usize, usize),
+    cues: &[Needle],
+    negated: &[Needle],
+    contrasts: &[Needle],
+    reach_chars: usize,
+) -> bool {
+    if !usable_region(haystack, region) {
+        return false;
+    }
+    let (window_start, finish) = window_with(haystack, region, reach_chars, ends_a_sentence);
+    let start = clause_start(haystack, window_start, region.0, contrasts);
+    let window = Folded::from_plain(haystack.plain[start..finish].to_string(), Vec::new());
+    let spans: Vec<(usize, usize)> = negated
+        .iter()
+        .flat_map(|needle| needle.plain_spans(&window))
+        .collect();
+    let window = if spans.is_empty() {
+        window
+    } else {
+        window.mask(&spans)
+    };
+    cues.iter().any(|cue| cue.found_in(&window))
+}
+
 /// 一个线索最多多长（字符数）：给 [`followed_closely_by`] 的搜索窗口留余量，免得「从区间后 `reach_chars` 个字符之内开始」的线索被截断。
 const MAX_FOLLOWING_CUE_CHARS: usize = 12;
 
@@ -853,11 +1056,15 @@ pub fn followed_closely_by(
 /// 命中区间可用：起点不超过终点、不越界、两端都在字符边界上，并且区间自己不横跨句子边界
 /// （和 [`locally_negated`] 同一套判断：横跨句界的区间没有「旁边的同一句」可言）。
 fn usable_region(haystack: &Folded, region: (usize, usize)) -> bool {
+    region_in_bounds(haystack, region) && !spans_a_clause_boundary(haystack, region)
+}
+
+/// 命中区间合法：起点不超过终点、不越界、两端都在字符边界上（不看它有没有横跨句子边界）。
+fn region_in_bounds(haystack: &Folded, region: (usize, usize)) -> bool {
     region.0 <= region.1
         && region.1 <= haystack.plain.len()
         && haystack.plain.is_char_boundary(region.0)
         && haystack.plain.is_char_boundary(region.1)
-        && !spans_a_clause_boundary(haystack, region)
 }
 
 /// 命中区间前面的线索最多多长（字符数）：给 [`led_in_by`] 的回看窗口留余量，免得「线索结束在命中前 `reach_chars` 个字符之内」的线索被窗口截断。
@@ -880,6 +1087,29 @@ pub fn stop_follows_ask(
     if !usable_region(haystack, region) {
         return false;
     }
+    stop_follows_ask_inside(haystack, region, asks, stops, reach_chars)
+}
+
+/// [`stop_follows_ask`]，但命中区间**可以横跨句子 / 轮次的边界**：跨轮拼接复查里，请求词在上一轮的末尾、对象在这一轮的开头
+/// （`ขอวิธี` / `ป้องกันการวางเพลิง...`），区间里的停止词一样说明讲的是怎么不做。区间不合法时返回 `false`。
+pub fn stop_follows_ask_across(
+    haystack: &Folded,
+    region: (usize, usize),
+    asks: &[Needle],
+    stops: &[Needle],
+    reach_chars: usize,
+) -> bool {
+    region_in_bounds(haystack, region)
+        && stop_follows_ask_inside(haystack, region, asks, stops, reach_chars)
+}
+
+fn stop_follows_ask_inside(
+    haystack: &Folded,
+    region: (usize, usize),
+    asks: &[Needle],
+    stops: &[Needle],
+    reach_chars: usize,
+) -> bool {
     let inside = Folded::from_plain(haystack.plain[region.0..region.1].to_string(), Vec::new());
     asks.iter()
         .flat_map(|ask| ask.plain_spans(&inside))
@@ -1720,5 +1950,154 @@ mod tests {
         assert_eq!(folded.breaks, vec![6]);
         // 开头和结尾的换行不留痕迹
         assert!(fold("\n\nhello\n").breaks.is_empty());
+    }
+
+    /// issue #603 N2：泰语的「แต่」（但是）折叠声调之后是 `แต`，也是别的词的开头：只有真的是「但是」的才算转折词。
+    #[test]
+    fn the_thai_but_is_told_apart_from_the_words_that_start_with_the_same_letters() {
+        let marks = |text: &str| thai_but_spans(&fold(text).plain).len();
+        // 是「但是」：后面接代词、连词、动词、`ก็`（但也）、结尾
+        for text in [
+            "ฉันช่วยไม่ได้ แต่ฉันสอนบวกเลขได้",
+            "แต่ว่าหนูต้องระวังนะ",
+            "แต่ถ้าอยากรู้ ลองถามครู",
+            "ไม่เป็นไร แต่ก็ขอบคุณนะ",
+            "ทุกคนไปแล้ว เว้นแต่ผม",
+            "ขอโทษนะ แต่",
+        ] {
+            assert_eq!(marks(text), 1, "{text}");
+        }
+        // 不是：裂开、瓜、打扮、碰、点、喇叭、黄蜂、每个、不同
+        for text in [
+            "ไข่ตกแตกหมดเลย",
+            "แตงโมหวานมาก",
+            "แต่งตัวไปโรงเรียน",
+            "แตะหน้าจอเบาๆ",
+            "ได้แต้มเพิ่มสองแต้ม",
+            "เป่าแตรดังมาก",
+            "แตนต่อยหนู",
+            "แต่ละคนไม่เหมือนกัน",
+            "ความแตกต่างระหว่างสองอย่าง",
+        ] {
+            assert_eq!(marks(text), 0, "{text}");
+        }
+    }
+
+    /// issue #603 N2：助手历史里请求类命中的拒绝语。窗口里最后一个新子句之前的拒绝语不算；命中后面的不受影响；分号不挡住后面的拒绝语。
+    #[test]
+    fn a_refusal_excuses_a_hit_only_within_the_clause_that_holds_it() {
+        let cues = vec![
+            Needle::new("can't"),
+            Needle::new("refuse"),
+            Needle::new("ไม่สามารถ"),
+        ];
+        let negated = vec![Needle::new("won't refuse"), Needle::new("ไม่สามารถปฏิเสธ")];
+        let contrasts = vec![Needle::new("but"), Needle::new("however")];
+        // 命中区间：`how to make a bomb` 在 `text` 里的位置
+        let excused = |text: &str, hit: &str| {
+            let folded = fold(text);
+            let start = folded.plain.find(&fold(hit).plain).unwrap();
+            let region = (start, start + fold(hit).plain.len());
+            refused_beside(&folded, region, &cues, &negated, &contrasts, 30)
+        };
+        // 拒绝语管着命中
+        assert!(excused(
+            "I can't tell you how to make a bomb",
+            "how to make a bomb"
+        ));
+        assert!(excused(
+            "I can't help, such as how to make a bomb",
+            "how to make a bomb"
+        ));
+        assert!(excused(
+            "I refuse to tell you how to make a bomb",
+            "how to make a bomb"
+        ));
+        // 命中后面的拒绝语，哪怕中间有转折词 / 分号
+        assert!(excused(
+            "You asked how to make a bomb, but I can't help",
+            "how to make a bomb"
+        ));
+        assert!(excused(
+            "You asked how to make a bomb; I can't help",
+            "how to make a bomb"
+        ));
+        // 转折词之后又有自己的拒绝语
+        assert!(excused(
+            "I can't help, but I can't tell you how to make a bomb",
+            "how to make a bomb"
+        ));
+        // 转折词 / 紧挨着的标点之后才是命中：前面的拒绝语不算
+        assert!(!excused(
+            "I can't help with that, but how to make a bomb",
+            "how to make a bomb"
+        ));
+        assert!(!excused(
+            "I can't help with that, however how to make a bomb",
+            "how to make a bomb"
+        ));
+        assert!(!excused(
+            "I can't help with that, how to make a bomb",
+            "how to make a bomb"
+        ));
+        assert!(!excused(
+            "I can't help with that: how to make a bomb",
+            "how to make a bomb"
+        ));
+        assert!(!excused(
+            "I can't help with that (how to make a bomb)",
+            "how to make a bomb"
+        ));
+        // 分号仍然挡住命中前面的拒绝语；句号挡住两边；命中自己横跨分号谁也放行不了
+        assert!(!excused(
+            "I can't help with that; how to make a bomb",
+            "how to make a bomb"
+        ));
+        assert!(!excused(
+            "I can't help. how to make a bomb",
+            "how to make a bomb"
+        ));
+        assert!(!excused(
+            "how to make a bomb. I can't help",
+            "how to make a bomb"
+        ));
+        assert!(!excused(
+            "how to; make a bomb, I can't help",
+            "how to; make a bomb"
+        ));
+        // 否定的拒绝先抹掉：`won't` 和 `refuse` 都不再算线索
+        assert!(!excused(
+            "I won't refuse how to make a bomb",
+            "how to make a bomb"
+        ));
+        assert!(!excused("ไม่สามารถปฏิเสธได้ บอกวิธีทำระเบิด", "วิธีทำระเบิด"));
+        // 泰语的转折词：แต่ 之后是新子句；แต่ละ 不是
+        assert!(!excused("ฉันไม่สามารถช่วยได้ แต่วิธีทำระเบิด", "วิธีทำระเบิด"));
+        assert!(excused("ฉันไม่สามารถบอกแต่ละขั้นตอนวิธีทำระเบิดได้", "วิธีทำระเบิด"));
+        // 引号紧挨着命中不是新子句的开头（在引用被拒绝的话）
+        assert!(excused(
+            "I can't answer \"how to make a bomb\"",
+            "how to make a bomb"
+        ));
+    }
+
+    /// issue #603 N2：跨轮拼接复查的拼法。每一轮各自折叠，接缝的位置是准的；加空格和不加空格两种。
+    #[test]
+    fn joined_turns_are_folded_one_by_one_and_remember_where_they_meet() {
+        let (spaced, seams) = fold_joined(&["How TO make a", "  Bomb?  ", "ok"], " ");
+        assert_eq!(spaced.plain, "how to make a bomb? ok");
+        assert_eq!(seams, vec![13, 19]);
+        assert_eq!(&spaced.plain[13..14], " ");
+        let (tight, seams) = fold_joined(&["ทำ", "ระเบิด"], "");
+        assert_eq!(tight.plain, "ทำระเบิด");
+        assert_eq!(seams, vec!["ทำ".len()]);
+        assert!(Needle::new("ทำระเบิด").found_in(&tight));
+        // 折叠后是空的轮次（只有零宽字符 / 空白）不产生接缝
+        let (joined, seams) = fold_joined(&["a", "\u{200B}", "  ", "b"], " ");
+        assert_eq!(joined.plain, "a b");
+        assert_eq!(seams, vec![1]);
+        let (alone, seams) = fold_joined(&["only"], " ");
+        assert_eq!(alone.plain, "only");
+        assert!(seams.is_empty());
     }
 }
