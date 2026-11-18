@@ -19,6 +19,7 @@ mod admin;
 #[cfg(test)]
 mod admin_tests;
 mod http;
+pub mod key;
 mod pin;
 mod status;
 
@@ -98,14 +99,14 @@ impl std::fmt::Debug for OmlxAdapterConfig {
 }
 
 impl Default for OmlxAdapterConfig {
-    /// Reads the API key from [`OMLX_API_KEY_ENV`] — the one place this
+    /// Resolves the API key via [`key::resolve_omlx_api_key`] (env, then settings.json) — the one place this
     /// adapter touches the environment for it; every other constructor
     /// path takes the key as an explicit value instead of reaching for the
     /// environment itself.
     fn default() -> Self {
         Self {
             base_url: DEFAULT_BASE_URL.to_string(),
-            api_key: std::env::var(OMLX_API_KEY_ENV).ok(),
+            api_key: key::resolve_omlx_api_key(),
             call_timeout: DEFAULT_CALL_TIMEOUT,
         }
     }

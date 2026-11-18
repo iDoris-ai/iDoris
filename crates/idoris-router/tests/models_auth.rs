@@ -127,6 +127,8 @@ async fn model_listing_auth_configuration_is_fail_closed() {
             "--nocapture",
         ])
         .env(CHILD, case)
+        // §2.9：key 也可能来自 ~/.omlx/settings.json；子进程用不存在的家目录，不受本机真实配置影响。
+        .env("HOME", "/nonexistent-idoris-test-home")
         .env_remove(KEY_ENV);
         if let Some(key) = key {
             cmd.env(KEY_ENV, key);

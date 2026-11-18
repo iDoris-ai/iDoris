@@ -784,7 +784,7 @@ impl ChatProxy {
     fn outbound(&self, url: &str, payload: &Value, provider_id: &str) -> reqwest::RequestBuilder {
         let mut request = self.client.post(url);
         if provider_id == OMLX_PROVIDER_ID
-            && let Ok(key) = std::env::var(idoris_upstream::omlx::OMLX_API_KEY_ENV)
+            && let Some(key) = idoris_upstream::omlx::key::resolve_omlx_api_key()
         {
             request = request.bearer_auth(key);
         }
@@ -1966,7 +1966,7 @@ impl ChatProxy {
         ForwardOutcome {
             status: 502,
             body: Bytes::from_static(
-                br#"{"error":{"type":"upstream_auth_failed","reason_code":"upstream_auth_failed"}}"#,
+                "{\"error\":{\"type\":\"upstream_auth_failed\",\"reason_code\":\"upstream_auth_failed\",\"remediation\":\"上游拒绝了 iDoris 持有的凭证。上游是 oMLX 时，请设置环境变量 IDORIS_OMLX_API_KEY，或在 ~/.omlx/settings.json 的 auth.api_key 中配置；iDoris 不会重试\"}}".as_bytes(),
             ),
             content_type: Some("application/json".into()),
             cached: false,

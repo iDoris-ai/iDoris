@@ -335,6 +335,11 @@ async fn resident_omlx_key_attachment_and_auth_error_mapping() {
         ("breaker_sequence", None),
         ("oversized_401", None),
     ] {
+        let fake_home = std::env::temp_dir().join(format!(
+            "idoris-resident-key-home-{}-{case}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&fake_home).unwrap();
         let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
         cmd.args([
             "--exact",
@@ -342,6 +347,8 @@ async fn resident_omlx_key_attachment_and_auth_error_mapping() {
             "--nocapture",
         ])
         .env(CHILD, case)
+        // §2.9：key 也可能来自 ~/.omlx/settings.json；子进程用空的临时家目录（on_demand 用例要往里写加载围栏），不受本机真实配置影响。
+        .env("HOME", &fake_home)
         .env_remove(KEY_ENV);
         if let Some(key) = key {
             cmd.env(KEY_ENV, key);

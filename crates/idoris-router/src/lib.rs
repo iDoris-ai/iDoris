@@ -1850,7 +1850,7 @@ async fn list_models(State(state): State<Arc<AppState>>) -> impl IntoResponse {
                 StatusCode::BAD_GATEWAY,
                 "upstream_error",
                 "upstream_authentication_failed",
-                "Model discovery authentication failed; check the upstream credential configuration",
+                "Model discovery authentication failed; set IDORIS_OMLX_API_KEY or auth.api_key in ~/.omlx/settings.json (no retry)",
             );
             response.headers_mut().insert(
                 HEADER_SERVED_LOCALITY,
