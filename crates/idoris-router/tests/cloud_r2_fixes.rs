@@ -515,10 +515,16 @@ async fn a_stream_that_fails_after_a_mid_stream_usage_chunk_is_billed_the_reserv
 
 #[tokio::test]
 async fn a_final_usage_chunk_is_trusted_even_when_the_client_leaves_before_done() {
-    // 对照：usage 块是最后一块（choices 为空，之后没有内容）。客户端要了 usage 块、读到它就断开，没等 [DONE]：
-    // 上游已经生成完了，这个 usage 就是整个响应的用量，按它结算（不是预留价）。
+    // 对照：usage 块是最后一块（choices 为空，之后没有内容），**跟在带 finish_reason 的块后面**（OpenAI 规范流）。客户端要了 usage 块、
+    // 读到它就断开，没等 [DONE]：上游已经生成完了（结束标志在 usage 之前），这个 usage 就是整个响应的用量，按它结算（不是预留价）。
+    //
+    // issue #603 N1：这条夹具原来**没有**结束块（内容 -> 单独的 usage 块 -> 挂起），期望按实际用量收。那个期望是错的：
+    // 没有任何 `finish_reason` 就来了一个单独的 usage 块，生成可能还在继续（无法取消的端点上，客户端离开之后上游照样生成、照样计费），
+    // 按那个数字收 200 而不是预留价 4110 就是少收。夹具补上结束块之后才是规范流；没有结束块的那种见
+    // `a_standalone_usage_chunk_with_no_finish_reason_is_not_final_when_the_client_leaves`。
     let a = FakeUpstream::start(vec![Behavior::sse(vec![
         SseStep::Send(content_event("c", "Hel")),
+        SseStep::Send(finish_event("c")),
         SseStep::Send(usage_event("c", usage(12, 2))),
         SseStep::Hang,
     ])])
@@ -1389,4 +1395,102 @@ async fn an_openai_style_stream_read_to_done_settles_on_the_actual_usage() {
         charged(&h, &reply.request_id()),
         (Some(200), Some("actual_usage".to_string()), actual_12_2())
     );
+}
+
+// ---------------------------------------------------------------------------
+// issue #603 N1：没有 finish_reason 的单独 usage 块不是最终用量（PR-Daemon P1 / P2 / P2b）
+// ---------------------------------------------------------------------------
+
+/// 上游：内容、一个单独的 usage 块（`choices` 为空，12 入 2 出）、没有任何 `finish_reason`。调用方接上自己的结尾。
+fn content_then_a_standalone_usage_without_a_finish() -> Vec<SseStep> {
+    vec![
+        SseStep::Send(content_event("c", "Hel")),
+        SseStep::Send(usage_event("c", usage(12, 2))),
+    ]
+}
+
+/// PR-Daemon 的复现：「Hel」、usage {12,2}（`choices: []`），客户端在读下一块之前断开。原来按 `ActualUsage(12,2)` 收 200；
+/// 上游还在生成（`lo-more` 还没发），应该按预留价 4110、成本挂账待核销。
+#[tokio::test]
+async fn a_standalone_usage_chunk_with_no_finish_reason_is_not_final_when_the_client_leaves() {
+    let mut steps = content_then_a_standalone_usage_without_a_finish();
+    steps.push(SseStep::Hang);
+    let a = FakeUpstream::start(vec![Behavior::sse(steps)]).await;
+    let h = build(
+        vec![Endpoint::adult("example-alpha", a.url())],
+        Options::default(),
+    );
+    let mut body = streaming_body();
+    body["stream_options"] = json!({"include_usage": true});
+    let id = read_until_then_disconnect(&h, &body, "prompt_tokens").await;
+    assert!(a.client_closed(0, Duration::from_secs(3)).await);
+    wait_closed(&h, &id).await;
+    assert_billed_the_reservation_not_the_cumulative_usage(&h, &id);
+    assert_eq!(
+        rows(&h, &id)[0].failure_kind.as_deref(),
+        Some("client_gone")
+    );
+}
+
+/// 同一条流，端点「取消」能力是 false：断开之后上游可能还在生成，保持 maybe_executed，对账看得到。
+#[tokio::test]
+async fn a_standalone_usage_chunk_with_no_finish_reason_keeps_maybe_executed_on_an_endpoint_that_cannot_cancel()
+ {
+    let mut steps = content_then_a_standalone_usage_without_a_finish();
+    steps.push(SseStep::Hang);
+    let a = FakeUpstream::start(vec![Behavior::sse(steps)]).await;
+    let h = build(
+        vec![Endpoint::adult("example-alpha", a.url()).no_cancellation()],
+        Options::default(),
+    );
+    let mut body = streaming_body();
+    body["stream_options"] = json!({"include_usage": true});
+    let id = read_until_then_disconnect(&h, &body, "prompt_tokens").await;
+    assert!(a.client_closed(0, Duration::from_secs(3)).await);
+    wait_closed(&h, &id).await;
+    assert_eq!(rows(&h, &id)[0].state, AttemptState::MaybeExecuted);
+    assert_eq!(
+        h.store
+            .attempts_in_states(&[AttemptStateKind::MaybeExecuted], 10)
+            .unwrap()
+            .len(),
+        1,
+        "reconciliation can find it"
+    );
+    let request = h.store.request_row(&id).unwrap().unwrap();
+    assert_eq!(request.charged_micros, Some(RESERVED_PRICE));
+}
+
+/// 同一条流，上游在 usage 块之后截断 / 报错：不是补一个 `[DONE]` 就完整了，按预留价收。
+#[tokio::test]
+async fn a_standalone_usage_chunk_with_no_finish_reason_does_not_make_a_cut_or_failed_stream_final()
+{
+    for ending in [
+        vec![SseStep::Close],
+        vec![
+            SseStep::Send("data: {\"error\":{\"message\":\"boom\"}}\n\n".to_string()),
+            SseStep::Finish,
+        ],
+    ] {
+        let mut steps = content_then_a_standalone_usage_without_a_finish();
+        steps.extend(ending);
+        let a = FakeUpstream::start(vec![Behavior::sse(steps)]).await;
+        let h = build(
+            vec![Endpoint::adult("example-alpha", a.url())],
+            Options::default(),
+        );
+        let mut body = streaming_body();
+        body["stream_options"] = json!({"include_usage": true});
+        let reply = post(&h.app, &body).await;
+        assert_eq!(reply.status, 200);
+        let events = sse_data(&reply.text());
+        let last: Value = serde_json::from_str(events.last().unwrap()).unwrap();
+        assert!(
+            ["stream_truncated", "stream_error_event"]
+                .contains(&last["error"]["reason_code"].as_str().unwrap()),
+            "{last}"
+        );
+        assert!(!events.iter().any(|e| e == "[DONE]"), "{events:?}");
+        assert_billed_the_reservation_not_the_cumulative_usage(&h, &reply.request_id());
+    }
 }

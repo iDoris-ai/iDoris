@@ -170,9 +170,11 @@ pub(crate) enum Ingested {
 /// 1. 没有 usage：不可信（没有东西可信）；
 /// 2. **usage 之后出现了新内容**（`content_at` 严格晚于 `usage_at`）：不可信，**不论流后来怎么结束，包括 `[DONE]`**；
 ///    usage 和内容在同一个事件里不算「之后」（每个 chunk 带累计 usage 的实现，最后一个内容块带的就是最终值）；
-/// 3. usage 之后没有新内容：单独的 usage 块（`choices` 为空或没有）可信——OpenAI 约定它就是整个请求的最终用量；
-///    夹带在内容块里的 usage，要等到所有 choice 都完成（本块带 `finish_reason`，或者之后来了空 delta 的结束块）或者见到
-///    `[DONE]` 才可信：还没有任何结束的迹象就断了，生成可能还在继续。
+/// 3. usage 之后没有新内容：要等到所有 choice 都完成（`finish_reason` 在 usage 之前、同一个块、或者之后来了空 delta 的结束块）
+///    或者见到 `[DONE]` 才可信：还没有任何结束的迹象就断了，生成可能还在继续。**单独的 usage 块（`choices` 为空或没有）自己不算结束的迹象**
+///    （issue #603 N1）：OpenAI 规范流里它跟在带 `finish_reason` 的块**后面**（结束标志先到、`[DONE]` 在它后面），所以规范流照旧按实际用量
+///    结算；上游没发任何 `finish_reason` 就中途发了一个单独的 usage，随后连接断了 / 报错 / 客户端离开，那个数字只是已生成部分的用量
+///    （无法取消的端点上，上游还在继续生成、继续计费），按预留价、挂账待核销。
 ///
 /// 不可信时（并且 usage 确实是有效的）：**按原规则**——预留价、成本挂账待核销，上游声称的数字原样记进 `usage_claim_json`
 /// （判定 `untrusted:not_final`）供对账。
@@ -188,8 +190,6 @@ pub(crate) struct StreamTracker {
     events: u64,
     /// 携带 [`Self::usage`] 的那个事件的编号。
     usage_at: Option<u64>,
-    /// [`Self::usage`] 来自单独的 usage 块（`choices` 为空或没有）。
-    usage_standalone: bool,
     /// 最后一个带**新内容**的事件的编号（任何 choice）。
     content_at: Option<u64>,
     /// 每个出现过的 choice 的结束 / 新内容位置。
@@ -228,7 +228,6 @@ impl StreamTracker {
             usage: UsageParse::Absent,
             events: 0,
             usage_at: None,
-            usage_standalone: false,
             content_at: None,
             choices: Vec::new(),
             untracked_choice: false,
@@ -282,7 +281,7 @@ impl StreamTracker {
         {
             return false;
         }
-        self.usage_standalone || self.generation_finished() || self.saw_done
+        self.generation_finished() || self.saw_done
     }
 
     pub(crate) fn ingest(&mut self, event: &SseEvent) -> Ingested {
@@ -322,7 +321,6 @@ impl StreamTracker {
                 if carries_usage {
                     self.usage = info.usage.clone();
                     self.usage_at = Some(self.events);
-                    self.usage_standalone = !info.has_choices || info.choices_empty;
                 }
                 if info.has_content {
                     self.content_at = Some(self.events);
@@ -809,10 +807,19 @@ mod tests {
         let usage = r#""usage":{"prompt_tokens":12,"completion_tokens":2}"#;
         let content = |text: &str| format!(r#"{{"choices":[{{"delta":{{"content":"{text}"}}}}]}}"#);
 
-        // 单独的 usage 块（choices 为空）：最终
+        // 单独的 usage 块（choices 为空），跟在带结束标志的块后面（OpenAI 规范流）：最终。
+        // issue #603 N1：没有结束标志的单独 usage 块不再自己可信（原来这里是 content -> usage 就可信）
         let mut tracker = StreamTracker::new(false);
         tracker.ingest(&ev(&content("a")));
         assert!(!tracker.usage_is_trusted(), "no usage yet");
+        tracker.ingest(&ev(&format!(r#"{{"choices":[],{usage}}}"#)));
+        assert!(
+            !tracker.usage_is_trusted(),
+            "a standalone usage chunk with no finish_reason is not evidence that the generation ended"
+        );
+        let mut tracker = StreamTracker::new(false);
+        tracker.ingest(&ev(&content("a")));
+        tracker.ingest(&ev(r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#));
         tracker.ingest(&ev(&format!(r#"{{"choices":[],{usage}}}"#)));
         assert!(tracker.usage_is_trusted());
         // 之后又来了内容：不是最终用量
@@ -825,6 +832,8 @@ mod tests {
         );
         // 之后的空 choices 块（没有 usage）不改变判断
         let mut tracker = StreamTracker::new(false);
+        tracker.ingest(&ev(&content("a")));
+        tracker.ingest(&ev(r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#));
         tracker.ingest(&ev(&format!(r#"{{"choices":[],{usage}}}"#)));
         tracker.ingest(&ev(r#"{"choices":[]}"#));
         assert!(tracker.usage_is_trusted());
@@ -923,16 +932,18 @@ mod tests {
             // ---- 没有 usage ----
             ("no usage at all", &["content", "finish", "done"], false),
             ("nothing yet", &[], false),
-            // ---- 单独的 usage 块（OpenAI 约定：整个请求的最终用量）----
+            // ---- 单独的 usage 块（OpenAI 约定：整个请求的最终用量，跟在带 finish_reason 的块后面）----
+            // issue #603 N1：下面没有结束标志的几行原来是「可信」（单独的 usage 块自己就算最终用量）。PR-Daemon 的复现正是
+            // 「内容、单独的 usage 块、然后客户端离开」：上游在无法取消的端点上还在生成，却按中途的数字收了 200 而不是预留价 4110。
             (
-                "usage-only chunk after the content",
+                "N1: usage-only chunk after the content, no finish_reason",
                 &["content", "usage"],
-                true,
+                false,
             ),
             (
-                "usage-only chunk without a choices field",
+                "N1: usage-only chunk without a choices field, no finish_reason",
                 &["content", "usage-no-choices"],
-                true,
+                false,
             ),
             (
                 "content, finish, usage-only",
@@ -946,9 +957,9 @@ mod tests {
             ),
             // usage 之后没有新内容的块：空 choices、空 delta 的结束块、`[DONE]` 都不算
             (
-                "usage-only then an empty choices chunk",
+                "N1: usage-only then an empty choices chunk, still no finish_reason",
                 &["content", "usage", "empty-choices"],
-                true,
+                false,
             ),
             (
                 "usage-only then a bare finish chunk",
@@ -961,9 +972,9 @@ mod tests {
                 true,
             ),
             (
-                "usage-only then an empty delta",
+                "N1: usage-only then an empty delta, still no finish_reason",
                 &["content", "usage", "empty-delta"],
-                true,
+                false,
             ),
             // ---- usage 之后又有新内容：不可信，不论流怎么结束 ----
             (
@@ -1128,10 +1139,11 @@ mod tests {
                 &["content", "finish", "content+usage", "done"],
                 true,
             ),
+            // issue #603 N1：新内容之后没有新的结束标志，单独的 usage 块自己不算结束的迹象
             (
-                "... then a usage-only chunk",
+                "N1: ... then a usage-only chunk (no new finish_reason after the new content)",
                 &["content", "finish", "content+usage", "usage"],
-                true,
+                false,
             ),
             (
                 "... then finish+usage",
@@ -1162,8 +1174,13 @@ mod tests {
                 true,
             ),
             (
-                "finish, more content without usage, then a usage-only chunk (the usage-only chunk is final by convention)",
+                "N1: finish, more content without usage, then a usage-only chunk (no new finish_reason after the new content)",
                 &["content", "finish", "content", "usage"],
+                false,
+            ),
+            (
+                "... and the new content finishes before the usage-only chunk",
+                &["content", "finish", "content", "finish", "usage"],
                 true,
             ),
             // usage 之后的新内容仍然使它不可信（第 2 条规则不受影响）
@@ -1253,6 +1270,48 @@ mod tests {
                 tracker.content_at,
                 tracker.saw_done
             );
+        }
+    }
+
+    /// issue #603 N1（PR-Daemon）：`usage_is_trusted` 只认 `generation_finished() || saw_done`。单独的 usage 块自己不算结束的迹象；
+    /// OpenAI 规范流里结束标志先到（`finish_reason` 的块在 usage 块之前），所以规范流不受影响。
+    #[test]
+    fn a_standalone_usage_chunk_is_final_only_because_of_what_came_before_it() {
+        let cases: &[(&str, &[&str], bool)] = &[
+            (
+                "REPORT: content, a standalone usage chunk, then the client leaves / the stream fails",
+                &["content", "usage"],
+                false,
+            ),
+            (
+                "the OpenAI stream: content, the finish_reason chunk, then the standalone usage chunk",
+                &["content", "finish", "usage"],
+                true,
+            ),
+            (
+                "the OpenAI stream, read to the end",
+                &["content", "finish", "usage", "done"],
+                true,
+            ),
+            (
+                "no finish_reason anywhere, but DONE came: the stream ended cleanly",
+                &["content", "usage", "done"],
+                true,
+            ),
+            (
+                "a usage-only chunk first, the answer after it",
+                &["usage", "content", "content", "finish", "done"],
+                false,
+            ),
+            (
+                "a usage-only chunk with nothing before it",
+                &["usage"],
+                false,
+            ),
+        ];
+        for (name, steps, trusted) in cases {
+            let tracker = track(steps);
+            assert_eq!(tracker.usage_is_trusted(), *trusted, "{name}: {steps:?}");
         }
     }
 
@@ -1397,14 +1456,16 @@ mod tests {
                 ),
                 "{choices}"
             );
-            assert!(fresh.usage_is_trusted(), "{choices}");
+            // issue #603 N1：合法的单独 usage 块，但没有结束标志：被记下（`usage` 有效），自己不可信
+            assert!(fresh.usage.valid_usage().is_some(), "{choices}");
+            assert!(!fresh.usage_is_trusted(), "{choices}");
         }
     }
 
     /// 可信的判定看的是**最近**的 usage：后面一个无效的 usage 会把前面有效的顶掉（保守：宁可当未知）。
     #[test]
     fn the_latest_usage_is_the_one_that_is_judged() {
-        let mut tracker = track(&["content", "usage"]);
+        let mut tracker = track(&["content", "finish", "usage"]);
         assert!(tracker.usage_is_trusted());
         assert_eq!(tracker.usage.valid_usage().unwrap().completion_tokens, 2);
         // 一个新的、数值不同的 usage 块替换它
