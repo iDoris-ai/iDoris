@@ -2,6 +2,8 @@
 //! 那里的一个事务里完成）-> 渲染响应。存储层是阻塞的（SQLite），所以都在 `spawn_blocking` 里调用。
 //!
 //! 这里**不做任何授权判断**，也不看来源地址、`Host`、`X-Forwarded-For` 之类的头：授权只由凭证和它的权限范围决定。
+//! 唯一用到「请求从哪来」的是兑换配对码的失败限速（那个端点没有凭证，限速要按来源分桶）：来源由
+//! `pairing_codes::RedeemSource` 取出，只决定限速的桶，不参与任何授权；读来源的代码不在这个文件里。
 
 use std::sync::Arc;
 
@@ -25,6 +27,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
+use super::pairing_codes::RedeemSource;
 use super::wire::{
     AccountStatusBody, CreateAccountBody, CreateMembershipBody, CreatePairingBody,
     CreatePrincipalBody, CredentialStatusBody, EmptyBody, GrantAllocationBody, IssueCredentialBody,
@@ -601,17 +604,19 @@ pub(super) async fn unpair_device(
     .await
 }
 
-/// 兑换配对码：**没有凭证**，码本身就是凭据。**先占限速名额、再碰数据库**（见 `pairing_codes::FailureLimiter`），
-/// 然后把输入规范化、哈希、交给存储层。只有「猜错」（查无此码、格式不对）的尝试一直占着名额；兑换成功、
-/// 码是认得出的（已用、已过期、已撤销、签发者失去资格、设备名额满……）、请求体畸形（不是在猜）都把名额还回去。
+/// 兑换配对码：**没有凭证**，码本身就是凭据。**先占限速名额、再碰数据库**（见 `pairing_codes::FailureLimiter`：
+/// 名额按来源分桶，另有一个全局总闸），然后把输入规范化、哈希、交给存储层。只有「猜错」（查无此码、格式不对）的尝试
+/// 一直占着名额；兑换成功、码是认得出的（已用、已过期、已撤销、签发者失去资格、设备名额满……）、请求体畸形（不是在猜）
+/// 都把名额还回去。
 pub(super) async fn redeem_pairing_code(
     State(plane): Plane,
+    RedeemSource(source): RedeemSource,
     _headers: HeaderMap,
     body: Bytes,
 ) -> Response {
     let request_id = new_request_id();
     let now = plane.clock.now();
-    let Some(ticket) = plane.redeem_limiter.acquire(now.0) else {
+    let Some(ticket) = plane.redeem_limiter.acquire(source, now.0) else {
         return failure_response(
             &request_id,
             &Failure::new(ControlReason::PairingRateLimited),

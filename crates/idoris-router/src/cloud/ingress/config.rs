@@ -24,7 +24,8 @@
 //!   per_source_anonymous: {requests_per_minute: 20, burst: 10}   # 单个来源的软配额（辅助信号，只作用于没有凭证的请求）
 //!   auth_failures: {max_failures: 5, window_secs: 60}            # 同一个凭证前缀的认证失败上限
 //!   auth_max_concurrent: 64                                      # 认证之前：同时在途的认证查询个数，满了直接 429、不碰库
-//!   auth_unknown: {requests_per_minute: 1200, burst: 200}        # 认证之前：「最近没有认证成功过的凭证前缀」的查询预算
+//!   auth_unknown: {requests_per_minute: 1200, burst: 200}        # 认证之前：「最近没有认证成功过的凭证前缀」的全局查询预算（总闸）
+//!   per_source_auth_unknown: {requests_per_minute: 120, burst: 20}  # 同上，单个来源的份额（先扣它、再扣总闸；应明显小于总闸）
 //!
 //! limits:                                   # 三级上限：请求速率（令牌桶）和并发（在途个数）
 //!   platform: {requests_per_minute: 3000, burst: 100, max_concurrent: 128}
@@ -156,6 +157,7 @@ struct AbuseFile {
     auth_failures: FailuresFile,
     auth_max_concurrent: u32,
     auth_unknown: RateFile,
+    per_source_auth_unknown: RateFile,
 }
 
 impl Default for AbuseFile {
@@ -179,6 +181,11 @@ impl Default for AbuseFile {
             auth_unknown: RateFile {
                 requests_per_minute: 1_200,
                 burst: 200,
+            },
+            // 总闸的十分之一：一个来源耗不光总闸，至少要十个来源一起才行（见 `IngressConfig::budget_warnings`）
+            per_source_auth_unknown: RateFile {
+                requests_per_minute: 120,
+                burst: 20,
             },
         }
     }
@@ -285,8 +292,11 @@ pub struct IngressConfig {
     pub auth_failure_window_secs: u64,
     /// 认证之前同时在途的认证查询个数上限（满了直接拒绝，不碰库）。
     pub auth_max_concurrent: usize,
-    /// 认证之前的查询预算：只有「最近没有认证成功过的凭证前缀」才消耗它（见 `abuse::AuthBudget`）。
+    /// 认证之前的全局查询预算（总闸）：只有「最近没有认证成功过的凭证前缀」才消耗它（见 `abuse::AuthBudget`）。
     pub auth_unknown: RateLimit,
+    /// 认证之前，单个来源在 [`Self::auth_unknown`] 里的份额：同样只有「没成功过的前缀」消耗它，**先于**总闸扣，
+    /// 所以一个来源刷随机凭证耗不光总闸（#603 N4）。
+    pub auth_unknown_per_source: RateLimit,
     pub platform: LevelLimits,
     /// 没有自己声明上限的租户用这一组。
     pub default_limits: CallerLimits,
@@ -334,6 +344,30 @@ impl IngressConfig {
                 policy: tenant.data.clone(),
             })
             .collect()
+    }
+
+    /// 配置层面的启动体检，每条是一句给运维看的警告（不是错误：运维可能有意这么配，比如只有一个来源的内网部署）。
+    ///
+    /// 认证之前，单个来源的份额（`per_source_auth_unknown`）如果不小于全局总闸（`auth_unknown`）——突发或速率任何一项——
+    /// 一个来源就能耗光总闸，别的来源冷的合法凭证会跟着被拒（429 `auth_capacity_limited`）：#603 N4 要防的正是这个，
+    /// 比例配反了等于没修。
+    pub fn budget_warnings(&self) -> Vec<String> {
+        let (source, global) = (&self.auth_unknown_per_source, &self.auth_unknown);
+        let mut warnings = Vec::new();
+        if source.burst() >= global.burst()
+            || source.requests_per_minute() >= global.requests_per_minute()
+        {
+            warnings.push(format!(
+                "abuse.per_source_auth_unknown（每分钟 {}、突发 {}）不小于 abuse.auth_unknown（每分钟 {}、突发 {}）：\
+                 单个来源就能耗光认证之前的全局查询预算，别的来源冷的合法凭证会跟着被拒（429 auth_capacity_limited）；\
+                 建议单来源份额明显小于总闸（默认是总闸的十分之一）",
+                source.requests_per_minute(),
+                source.burst(),
+                global.requests_per_minute(),
+                global.burst()
+            ));
+        }
+        warnings
     }
 
     /// 读环境变量 [`CONFIG_ENV`] 指向的文件。**云形态必须配**：没设就是启动错误。
@@ -392,6 +426,10 @@ impl IngressConfig {
             )));
         }
         let auth_unknown = rate("abuse.auth_unknown", &abuse.auth_unknown)?;
+        let auth_unknown_per_source = rate(
+            "abuse.per_source_auth_unknown",
+            &abuse.per_source_auth_unknown,
+        )?;
 
         let platform = level("limits.platform", &file.limits.platform)?;
         let default_limits = CallerLimits {
@@ -471,6 +509,7 @@ impl IngressConfig {
             auth_failure_window_secs: abuse.auth_failures.window_secs,
             auth_max_concurrent: usize::try_from(abuse.auth_max_concurrent).unwrap_or(usize::MAX),
             auth_unknown,
+            auth_unknown_per_source,
             platform,
             default_limits,
             tenants,
@@ -735,6 +774,13 @@ tenants:
         assert_eq!(config.auth_max_concurrent, 64);
         assert_eq!(config.auth_unknown.requests_per_minute(), 1_200);
         assert_eq!(config.auth_unknown.burst(), 200);
+        // #603 N4：单个来源的份额，默认是总闸的十分之一
+        assert_eq!(config.auth_unknown_per_source.requests_per_minute(), 120);
+        assert_eq!(config.auth_unknown_per_source.burst(), 20);
+        assert!(
+            config.budget_warnings().is_empty(),
+            "the defaults keep the source share well below the global gate"
+        );
         let tuned = IngressConfig::parse(&format!(
             "{MINIMAL}abuse:\n  auth_max_concurrent: 8\n  auth_unknown: {{requests_per_minute: 30, burst: 2}}\n"
         ))
@@ -752,6 +798,50 @@ tenants:
         expect_error(
             &format!("{MINIMAL}abuse:\n  auth_unknown: {{requests_per_minute: 0, burst: 1}}\n"),
             "auth_unknown",
+        );
+        // 单个来源的份额：可以配，也要正数；写错键名同样是启动错误
+        let tuned = IngressConfig::parse(&format!(
+            "{MINIMAL}abuse:\n  per_source_auth_unknown: {{requests_per_minute: 30, burst: 4}}\n"
+        ))
+        .unwrap();
+        assert_eq!(tuned.auth_unknown_per_source.requests_per_minute(), 30);
+        assert_eq!(tuned.auth_unknown_per_source.burst(), 4);
+        expect_error(
+            &format!(
+                "{MINIMAL}abuse:\n  per_source_auth_unknown: {{requests_per_minute: 0, burst: 1}}\n"
+            ),
+            "per_source_auth_unknown",
+        );
+        expect_error(
+            &format!(
+                "{MINIMAL}abuse:\n  per_source_auth_unknown: {{requests_per_minute: 5, burst: 0}}\n"
+            ),
+            "per_source_auth_unknown",
+        );
+    }
+
+    /// #603 N4：单个来源的份额不小于全局总闸（突发或速率任何一项）：一个来源就能耗光总闸，启动时对运维说一声。
+    #[test]
+    fn a_source_share_that_is_not_below_the_global_gate_is_warned_about_at_startup() {
+        let warnings = |abuse: &str| {
+            IngressConfig::parse(&format!("{MINIMAL}abuse:\n{abuse}"))
+                .unwrap()
+                .budget_warnings()
+        };
+        for risky in [
+            // 突发不小于总闸
+            "  auth_unknown: {requests_per_minute: 1200, burst: 20}\n  per_source_auth_unknown: {requests_per_minute: 60, burst: 20}\n",
+            // 速率不小于总闸
+            "  auth_unknown: {requests_per_minute: 120, burst: 200}\n  per_source_auth_unknown: {requests_per_minute: 120, burst: 20}\n",
+            // 只调了总闸，默认的单来源份额（20 / 120）反而大了
+            "  auth_unknown: {requests_per_minute: 60, burst: 3}\n",
+        ] {
+            let found = warnings(risky);
+            assert_eq!(found.len(), 1, "{risky}: {found:?}");
+            assert!(found[0].contains("per_source_auth_unknown"), "{found:?}");
+        }
+        assert!(
+            warnings("  auth_unknown: {requests_per_minute: 1200, burst: 200}\n  per_source_auth_unknown: {requests_per_minute: 119, burst: 199}\n").is_empty()
         );
     }
 
