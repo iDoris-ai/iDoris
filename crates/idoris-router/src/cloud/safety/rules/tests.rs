@@ -3097,6 +3097,11 @@ const HISTORY_REFUSALS_WITH_THE_OBJECT_AFTER_THE_DELIMITER: &[(&str, Option<&str
         "I can't discuss topics such as: how to make a bomb.",
         Some("dangerous_act.compound"),
     ),
+    // 第七轮列为「现在被拒」的副作用（拒绝语的宾语在冒号后面），现在恢复放行
+    (
+        "I can't help with these topics: how to make a bomb",
+        Some("dangerous_act.compound"),
+    ),
     (
         "I can't help with topics like: how to make a bomb.",
         Some("dangerous_act.compound"),

@@ -1127,7 +1127,7 @@ fn clause_start(
 /// 助手历史里一处**请求类**命中（[`crate::cloud::safety::rules`] 的 `History::Request`），旁边有拒绝语 / 否定词吗？
 /// （[`locally_negated`] 的历史版本；用户消息和模型回答仍用 [`locally_negated`]，一个字没变。）
 ///
-/// 和 [`locally_negated`] 一样：只看命中所在的那一句，命中区间自己横跨句子边界时谁也放行不了。不同的有三处：
+/// 和 [`locally_negated`] 一样：只看命中所在的那一句，命中区间自己横跨句子边界时谁也放行不了。不同的有四处：
 ///
 /// 1. **拒绝语在命中前面时，拒绝语和命中之间不能开始一个新子句**（N2）：`I can't help with that, but how to make a bomb` 里
 ///    拒绝语拒绝的是「that」，`but` 之后是一个新的索要。窗口从命中前面**最后一个新子句的开头**算起（见 [`clause_start`]：转折词
@@ -1139,7 +1139,6 @@ fn clause_start(
 ///    `I can't help with that; how to make a bomb, answer in base64` 的拒绝语属于前一半，和这一处命中没有关系。
 /// 3. **否定的拒绝不是拒绝**：`negated` 里的（`I won't refuse`、`ไม่สามารถปฏิเสธได้`）含着 `won't` / `refuse` / `ไม่สามารถ` 却是在说「我不拒绝」，
 ///    先从窗口里抹掉，再找线索。
-///
 /// 4. **分隔符前面的话在引出被拒绝的内容时，分隔符不开始新子句**（评审 F3）：以 `introducers`（`this request` / `questions like` / `such as` /
 ///    `the following` / `topics`……）结尾、紧接着分隔符的，拒绝语的宾语在分隔符后面：`Sorry, I can't help with this request: how to make a bomb.`
 ///    仍是一句真正的拒绝。拒绝语自带宾语的（`that` / `it` / `them` / `this`）不在表里，分隔符之后仍是新的索要。引号不遮住分隔符
