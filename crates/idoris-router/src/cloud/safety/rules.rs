@@ -60,7 +60,9 @@
 //!   **已知抓不住的、和一个已知的误拦**（PR #606 评审 F1 / F2 / F4，`what_the_cross_turn_recheck_cannot_tell_is_listed_not_hidden` 钉着，
 //!   设计稿 S6-16 第八轮）：F1：「请求词 + 对象」的对象离接缝超过 [`CROSS_TURN_OBJECT_REACH_CHARS`] 个字符的（连接词在接缝**后面**：
 //!   `tell me how` / `I could make a bomb`；放在接缝**前面**的 `how to quickly` / `make a bomb` 抓得住），上限放宽会误拒正常对话；
-//!   F2：只试「每个接缝都加一个空格」和「每个接缝都紧拼」两种拼法，要「一处紧拼、一处加空格」才能还原的拆分（`how to ma` / `ke a` / `bomb`）抓不住；
+//!   F2（已修，残余很小）：拼法有三种——每个接缝都加空格、每个接缝都紧拼、每个接缝**各自**选（[`fold_joined_guided`](super::text::fold_joined_guided)：
+//!   接缝两边连着的字母粘得成模式里某个词的一部分就紧拼），所以「一处在词中间拆开、另一处在词和词之间拆开」（`how to ma` / `ke a` / `bomb`）抓得住；
+//!   残余：单字母的词加上下一段的开头粘成了另一条模式里某个词的前缀（`a` + `bo` → `abo`，`above` 的前缀），空格丢了，抓不住（3449 段随机三段拆分里漏 3 段）；
 //!   两半各自被标点隔开的（`'how to make'` / `'a bomb'`）整句短语抓不住（「请求词 + 对象」的配对不受影响，12 个字符之内允许标点）；
 //!   F4（误拦）：用户问「'how to' 是什么意思？」、助手举例「'Make a bomb' 是我不能解释的例子」会被配成一次索要，不修：被引号包住 / 后接 `?`
 //!   的请求片段不配对，等于告诉攻击者给每一半加一对引号就能躲过「请求词 + 对象」的拆分（实测见设计稿），而误拦要孩子和助手恰好各用一个引号包住的片段，较刻意；
@@ -90,9 +92,10 @@ use idoris_compute_contracts::safety::SafetyCategory;
 
 use super::extract::{CheckedInput, CheckedOutput, Origin};
 use super::text::{
-    Folded, NEGATION_REACH_CHARS, Needle, base64_texts, fold, fold_joined, followed_closely_by,
-    has_word, led_in_by, locally_negated, near, near_pairs, near_regions, plain_spans_sorted,
-    refused_beside, stop_follows_ask, stop_follows_ask_across,
+    Folded, NEGATION_REACH_CHARS, Needle, SplitWords, base64_texts, fold, fold_joined,
+    fold_joined_guided, followed_closely_by, has_word, led_in_by, locally_negated, near,
+    near_pairs, near_regions, plain_spans_sorted, refused_beside, stop_follows_ask,
+    stop_follows_ask_across,
 };
 use super::{BoxFuture, CheckContext, CheckReport, Denial, SafetyChecker, Verdict};
 
@@ -1614,6 +1617,24 @@ impl Rule {
         }
     }
 
+    /// 这条规则在跨轮拼接复查里要还原的模式（请求词、对象、整句短语）：没有声明 [`Rule::across_turns`] 的规则没有。
+    /// 给「每个接缝各自选拼法」的词表用（[`SplitWords`]），和 [`Rule::crosses_a_turn`] 认的是同一批。
+    fn cross_turn_needles(&self) -> Vec<&Needle> {
+        if !self.across_turns {
+            return Vec::new();
+        }
+        match (&self.history, &self.matcher) {
+            (History::Request(request), _) => request
+                .asks
+                .iter()
+                .chain(&request.objects)
+                .chain(&request.phrases)
+                .collect(),
+            (History::AsWritten, Matcher::Any(list)) => list.iter().collect(),
+            _ => Vec::new(),
+        }
+    }
+
     /// 跨轮拼接复查里这条规则成立吗：命中的区间（请求词到对象，或者整句短语）**横跨了一处接缝**（`seams`：轮次之间的分隔在 `folded.plain`
     /// 里的位置，见 [`fold_joined`]）。只看 `plain` 视图，只数横跨的命中（轮次里面自己的命中逐轮检查过了，在这里数它们只会重复，
     /// 并且把「已放行」的算成命中）。横跨轮次的区间没有「命中旁边的同一句」可言，不看拒绝语。
@@ -2356,6 +2377,8 @@ pub struct RuleChecker {
     history_contrast_words: Vec<Needle>,
     /// 历史里引出被拒绝内容的词（[`HISTORY_OBJECT_INTRODUCERS`]）。
     history_introducer_words: Vec<Needle>,
+    /// 跨轮拼接复查「每个接缝各自选拼法」用的词表：参与跨轮复查的规则（[`Rule::across_turns`]）的请求词、对象和整句短语里的英语单词。
+    split_words: SplitWords,
 }
 
 /// 手法动词前面的提醒线索，四组（[`Framing::Manipulation`]）：
@@ -2438,8 +2461,11 @@ impl RuleChecker {
             .cloned()
             .collect();
         let history_topical_cues = history_cues.iter().chain(&topical).cloned().collect();
+        let rules = build_rules();
+        let split_words = SplitWords::from_needles(rules.iter().flat_map(Rule::cross_turn_needles));
         Self {
-            rules: build_rules(),
+            rules,
+            split_words,
             protective: needles(PROTECTIVE_CUES),
             input_cues: negation.iter().chain(&topical).cloned().collect(),
             output_cues: negation.iter().chain(&refusal).cloned().collect(),
@@ -2552,8 +2578,8 @@ impl RuleChecker {
     /// 跨轮拼接复查（N2）：把请求拆到「用户 / 工具 / **客户端写的助手**」相邻的几轮里（`user: how to make a` / `assistant: bomb?`
     /// / `user: yes, steps`），每一轮单独看都是无害的，上面只拼用户和工具文本的那一次复查看不到助手轮里的字。
     ///
-    /// 按**原顺序**把这几种来源的文本拼起来（每一轮各自折叠，再用一个空格、或者什么也不放拼成一份，见 [`fold_joined`]），**只数命中区间
-    /// 横跨了一处接缝的命中**（见 [`Rule::crosses_a_turn`]）：轮次里面自己的命中逐轮检查过了；横跨轮次的没有「旁边的同一句」可言，
+    /// 按**原顺序**把这几种来源的文本拼起来（每一轮各自折叠，再用一个空格、或者什么也不放拼成一份，见 [`fold_joined`]；每个接缝各自选加不加空格的
+    /// 第三种拼法见 [`fold_joined_guided`]，评审 F2），**只数命中区间横跨了一处接缝的命中**（见 [`Rule::crosses_a_turn`]）：轮次里面自己的命中逐轮检查过了；横跨轮次的没有「旁边的同一句」可言，
     /// 拒绝语放行不了。
     /// 只有声明了 [`Rule::across_turns`] 的规则参与：危险行为和越狱 / 指令注入的精确句式，**不对自伤表达加严**（owner 拍板：自伤表达交给
     /// 输出规则 + LLM 检查器，不能因为模型给过求助引导就切断孩子的对话），也不让套取个人信息 / 成人内容 / 输出规则参与（会让正常的多轮对话误拒，
@@ -2569,14 +2595,25 @@ impl RuleChecker {
         if turns.len() < 2 {
             return None;
         }
-        // 英语的词之间要有空格，泰语在一个词中间拆开的只有不加空格才凑得回来：两种拼法都试
-        [" ", ""].into_iter().find_map(|gap| {
-            let (folded, seams) = fold_joined(&turns, gap);
+        let crossing = |folded: &Folded, seams: &[usize]| {
             self.rules
                 .iter()
-                .find(|rule| rule.crosses_a_turn(&folded, &seams, &self.history_stop_cues))
+                .find(|rule| rule.crosses_a_turn(folded, seams, &self.history_stop_cues))
                 .map(|rule| (rule.id, rule.category))
-        })
+        };
+        // 英语的词之间要有空格，泰语在一个词中间拆开的只有不加空格才凑得回来：每个接缝都加空格、每个接缝都紧拼，两种拼法都试
+        [" ", ""]
+            .into_iter()
+            .find_map(|gap| {
+                let (folded, seams) = fold_joined(&turns, gap);
+                crossing(&folded, &seams)
+            })
+            // 第三种：每个接缝各自选（评审 F2）。要「一处在词中间拆开、另一处在词和词之间拆开」才能还原的拆分
+            // （`how to ma` / `ke a` / `bomb`），上面两种都还原不了。按接缝两边连着的字母能不能粘成模式里某个词的一部分来选，线性时间
+            .or_else(|| {
+                let (folded, seams) = fold_joined_guided(&turns, &self.split_words);
+                crossing(&folded, &seams)
+            })
     }
 
     /// 输出检查（同步版）。输出里的每一段文本都按「模型写的文本」规则查，并检查有没有复述孩子写的个人信息。

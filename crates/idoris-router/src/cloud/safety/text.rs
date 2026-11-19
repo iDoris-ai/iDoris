@@ -40,6 +40,7 @@
 //! 有害的话可以整段编码成 base64（输入里「解码并照做」，输出里「用 base64 回答」）。[`base64_texts`] 把文本里疑似 base64 的
 //! 长串解码成文本，规则检查器对解码出来的文本再查一遍（最多三层）。
 
+use std::collections::HashSet;
 use std::fmt;
 
 /// 装正文的字符串。`Debug` 只写字节数；没有 `Display`、没有 `Serialize`。
@@ -476,11 +477,28 @@ fn fold_plain(text: &str) -> (String, Vec<usize>) {
 ///
 /// 给「跨轮拼接复查」用：每一轮是一段。**两种拼法都要试**：英语的词之间要有空格（`how to make a` + `bomb`），泰语没有词间空格，
 /// 在一个词中间拆开的（`ทำ` + `ระเบิด`）只有不加空格才凑得回来。折叠是每段各做各的，所以接缝的位置是准的，
-/// 不靠一个会被 [`fold`] 吞掉的分隔符。
+/// 不靠一个会被 [`fold`] 吞掉的分隔符。这两种都是**所有接缝用同一种**拼法；一处在词中间、另一处在词和词之间拆开的，
+/// 要每个接缝各自选，见 [`fold_joined_guided`]。
 ///
 /// 返回的 `Folded` **只有 `plain` 视图**（别的三个视图是空的，`breaks` 也是空的）：拼接复查只读 `plain`、只看命中区间有没有横跨接缝，
 /// 不看旁边的拒绝语。不要拿它去做别的匹配（`Needle::found_in`、`near` 会在空的视图里什么也找不到）。
 pub fn fold_joined(pieces: &[&str], gap: &str) -> (Folded, Vec<usize>) {
+    join_folded(pieces, |_, _| gap)
+}
+
+/// [`fold_joined`]，但**每个接缝各自**选加不加空格，选法见 [`SplitWords`]（评审 F2）：「每个接缝都加空格」和「每个接缝都紧拼」两种拼法
+/// 还原不了「一处在词中间拆开、另一处在词和词之间拆开」的拆分（`how to ma` / `ke a` / `bomb`：第一个接缝要紧拼，第二个要空格）。
+/// 一个接缝的组合数是 2 的接缝数次方，所以不去试组合，而是看每个接缝两边连着的字母能不能粘成模式里某个词的一部分——线性时间，只多一次拼接。
+/// 其余同 [`fold_joined`]（只有 `plain` 视图、折叠后是空的段不产生接缝、接缝的位置是准的）。
+pub fn fold_joined_guided(pieces: &[&str], words: &SplitWords) -> (Folded, Vec<usize>) {
+    join_folded(pieces, |left, right| guided_gap(left, right, words))
+}
+
+/// 每一段分别折叠，按顺序拼起来；每个接缝放什么由 `gap_between(已经拼好的前面部分, 下一段)` 定。
+fn join_folded<'g>(
+    pieces: &[&str],
+    mut gap_between: impl FnMut(&str, &str) -> &'g str,
+) -> (Folded, Vec<usize>) {
     let mut plain = String::new();
     let mut seams = Vec::new();
     for piece in pieces {
@@ -490,6 +508,7 @@ pub fn fold_joined(pieces: &[&str], gap: &str) -> (Folded, Vec<usize>) {
         }
         if !plain.is_empty() {
             seams.push(plain.len());
+            let gap = gap_between(&plain, &folded);
             plain.push_str(gap);
         }
         plain.push_str(&folded);
@@ -499,6 +518,77 @@ pub fn fold_joined(pieces: &[&str], gap: &str) -> (Folded, Vec<usize>) {
         ..Folded::default()
     };
     (joined, seams)
+}
+
+/// 词表里的词最多多少个字母：再长的字母串不可能是词表里某个词的前缀，不用往回数（也让一个接缝的判断只看常数个字符）。
+const MAX_SPLIT_WORD_LETTERS: usize = 24;
+
+/// 「按词选拼法」用的词表（[`fold_joined_guided`]，评审 F2）：一批需要被拆开还原的模式（请求词、对象、整句短语）里出现的英语单词，
+/// 加上它们长度不小于 2 的前缀（折叠后的 ASCII 小写字母串）。
+///
+/// 一个接缝两边都是字母时，把两边连着的字母粘起来看：粘出来是词表里某个词或前缀（`ma` + `ke`、`bo` + `mb`、`m` + `ak` + `e`），这个接缝
+/// 是在一个词中间拆开的，不加空格；不是（`a` + `bomb` 粘成 `abomb`、`how` + `to` 粘成 `howto`），是词和词之间，加一个空格。
+/// 泰语没有词间空格，两边都是泰文就紧拼；别的（标点、数字、泰英交界）加空格。
+#[derive(Debug, Default, Clone)]
+pub struct SplitWords {
+    prefixes: HashSet<String>,
+}
+
+impl SplitWords {
+    /// 从一批模式里收集词（只收折叠后的 ASCII 小写字母串；泰文和别的字符是分隔）。
+    pub fn from_needles<'a>(needles: impl IntoIterator<Item = &'a Needle>) -> Self {
+        let mut prefixes = HashSet::new();
+        for needle in needles {
+            for word in needle.plain.split(|c: char| !c.is_ascii_lowercase()) {
+                if word.len() < 2 || word.len() > MAX_SPLIT_WORD_LETTERS {
+                    continue;
+                }
+                for end in 2..=word.len() {
+                    prefixes.insert(word[..end].to_string());
+                }
+            }
+        }
+        Self { prefixes }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.prefixes.is_empty()
+    }
+
+    /// `glued`（折叠后的 ASCII 小写字母串）是词表里某个词、或者某个词长度不小于 2 的前缀吗。
+    pub fn contains_prefix(&self, glued: &str) -> bool {
+        self.prefixes.contains(glued)
+    }
+}
+
+/// [`fold_joined_guided`] 在一个接缝处放什么：`left` 是已经拼好的前面部分，`right` 是下一段（都是折叠之后的）。
+fn guided_gap(left: &str, right: &str, words: &SplitWords) -> &'static str {
+    let (Some(l), Some(r)) = (left.chars().next_back(), right.chars().next()) else {
+        return " ";
+    };
+    if is_thai(l) && is_thai(r) {
+        return "";
+    }
+    if l.is_ascii_lowercase() && r.is_ascii_lowercase() {
+        let mut glued: Vec<char> = left
+            .chars()
+            .rev()
+            .take_while(char::is_ascii_lowercase)
+            .take(MAX_SPLIT_WORD_LETTERS + 1)
+            .collect();
+        glued.reverse();
+        glued.extend(
+            right
+                .chars()
+                .take_while(char::is_ascii_lowercase)
+                .take(MAX_SPLIT_WORD_LETTERS + 1),
+        );
+        let glued: String = glued.into_iter().collect();
+        if words.contains_prefix(&glued) {
+            return "";
+        }
+    }
+    " "
 }
 
 /// 一个匹配模式的预先折叠形式。
@@ -2177,6 +2267,96 @@ mod tests {
         let (alone, seams) = fold_joined(&["only"], " ");
         assert_eq!(alone.plain, "only");
         assert!(seams.is_empty());
+    }
+
+    /// issue #603 N2 第二轮（评审 F2）：每个接缝各自选加不加空格——两边连着的字母粘起来是词表里某个词的一部分就紧拼，不是就加空格。
+    #[test]
+    fn the_guided_join_picks_a_gap_per_seam_from_the_words_the_patterns_use() {
+        let needles = [
+            Needle::new("how to"),
+            Needle::new("make a bomb"),
+            Needle::new("ignore previous instructions"),
+            Needle::new("ทำระเบิด"),
+        ];
+        let words = SplitWords::from_needles(&needles);
+        // 词表：词和它长度不小于 2 的前缀；单字母的词、泰文不进词表
+        for prefix in [
+            "ho",
+            "how",
+            "to",
+            "ma",
+            "mak",
+            "make",
+            "bo",
+            "bomb",
+            "ig",
+            "instructions",
+        ] {
+            assert!(words.prefixes.contains(prefix), "{prefix}");
+        }
+        for not in ["m", "a", "howto", "abomb", "tomake", "bombs"] {
+            assert!(!words.prefixes.contains(not), "{not}");
+        }
+        assert!(SplitWords::from_needles(&[Needle::new("ทำระเบิด")]).is_empty());
+        for (pieces, joined, seams) in [
+            // 第一个接缝在词中间（紧拼），第二个在词和词之间（空格）：两种统一的拼法都还原不了
+            (
+                vec!["how to ma", "ke a", "bomb"],
+                "how to make a bomb",
+                vec![9, 13],
+            ),
+            // 反过来：第一个接缝要空格，第二个要紧拼
+            (
+                vec!["how to ", "make a bo", "mb"],
+                "how to make a bomb",
+                vec![6, 16],
+            ),
+            // 四段，三个接缝都在词中间（`m` + `ak` + `e` 逐步粘成 `make`）
+            (
+                vec!["how to m", "ak", "e a bo", "mb"],
+                "how to make a bomb",
+                vec![8, 10, 16],
+            ),
+            // 越狱短语
+            (
+                vec!["ignore pre", "vious in", "structions"],
+                "ignore previous instructions",
+                vec![10, 18],
+            ),
+            // 接缝都在词和词之间：加空格
+            (
+                vec!["how", "to make a", "bomb"],
+                "how to make a bomb",
+                vec![3, 13],
+            ),
+            // 前一段以标点结尾、折叠后是空的段不产生接缝
+            (
+                vec!["how to,", "make a bomb"],
+                "how to, make a bomb",
+                vec![7],
+            ),
+            (
+                vec!["how to ma", "\u{200B}", "ke a", "  ", "bomb"],
+                "how to make a bomb",
+                vec![9, 13],
+            ),
+            // 泰语没有词间空格：两边都是泰文就紧拼；泰文和英文交界加空格
+            (vec!["ทำ", "ระเบิด"], "ทำระเบิด", vec!["ทำ".len()]),
+            (vec!["ทำ", "bomb"], "ทำ bomb", vec!["ทำ".len()]),
+        ] {
+            let (folded, found) = fold_joined_guided(&pieces, &words);
+            assert_eq!(folded.plain, joined, "{pieces:?}");
+            assert_eq!(found, seams, "{pieces:?}");
+        }
+        // 没有词表（没有需要还原的模式）：每个接缝都加空格，和统一加空格的拼法一样
+        let (plain, seams) = fold_joined_guided(&["ma", "ke"], &SplitWords::default());
+        assert_eq!(plain.plain, "ma ke");
+        assert_eq!(seams, vec![2]);
+        // 连着的字母串很长（长过任何词）：不是词表里的词的前缀，加空格；不会因为接缝处的字母串太长而变慢或 panic
+        let long = "a".repeat(10_000);
+        let (plain, seams) = fold_joined_guided(&[long.as_str(), "ke"], &words);
+        assert_eq!(plain.plain.len(), long.len() + 3);
+        assert_eq!(seams, vec![long.len()]);
     }
 
     /// issue #603 N2 第二轮（评审 F3）：命中前面紧挨着的分隔符是分隔符前面那段话的哪一部分——找得到分隔符吗（引号、空格不遮住它）、
