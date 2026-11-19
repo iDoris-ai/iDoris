@@ -70,10 +70,9 @@ impl BoundSupervisor {
 
     /// Constructs the adapter from the same card used for the binding.
     pub fn spawn_omlx(card: &ComponentCard) -> Result<Self, String> {
-        let adapter = idoris_upstream::OmlxAdapter::new(idoris_upstream::OmlxAdapterConfig {
-            base_url: card.endpoint.clone(),
-            ..idoris_upstream::OmlxAdapterConfig::default()
-        })
+        let adapter = idoris_upstream::OmlxAdapter::new(
+            idoris_upstream::OmlxAdapterConfig::for_base_url(card.endpoint.clone()),
+        )
         .map_err(|err| format!("无法构造 oMLX 适配器（{}）：{err}", card.provider.id))?;
         let handle = idoris_backend::Supervisor::spawn(
             std::sync::Arc::new(adapter),

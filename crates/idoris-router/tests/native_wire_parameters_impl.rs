@@ -312,7 +312,19 @@ async fn parameters_cannot_bypass_supervisor_memory_admission() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     let requests = upstream.received_requests().await.unwrap();
-    assert!(requests.iter().all(|request| request.method != "POST"));
+    // 被内存准入拦下：不加载模型、不发推理请求。进程里带着 oMLX key（环境变量或
+    // ~/.omlx/settings.json）时，适配器会先 POST /admin/api/login 取会话读内存状态——
+    // 这不是加载也不是推理，不算绕过；其余任何 POST 都算。
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.method != "POST" || request.url.path() == "/admin/api/login"),
+        "{:?}",
+        requests
+            .iter()
+            .map(|request| (request.method.to_string(), request.url.path().to_owned()))
+            .collect::<Vec<_>>()
+    );
 }
 
 #[tokio::test]

@@ -238,6 +238,7 @@ agent24d 托管 iDoris 时，按下表执行。表中都是已冻结的接口，
 **oMLX 密钥**
 
 - 优先级：`IDORIS_OMLX_API_KEY`（§2.7，保持不变）→ `~/.omlx/settings.json` 的 `auth.api_key` → 无鉴权连接。
+- `settings.json` 的 key 只发给 loopback 的 oMLX（base URL 非 loopback 时视为没有）；文件必须是常规文件（符号链接不算），key 取 trim 后的值，含内部空白或控制字符视为没有。环境变量的 key 维持原行为。
 - 只从文件读取，不打印、不写日志、不进 argv 或响应体。不硬编码任何默认值（Agent24 侧同样不再假定默认 key）。
 - oMLX 开了鉴权而两处都没有 key 时，iDoris 按 401 处理并在 `remediation` 说明，不重试。
 
