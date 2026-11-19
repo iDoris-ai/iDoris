@@ -791,6 +791,26 @@ fn expired_devices_do_not_occupy_pairing_slots() {
     }
 }
 
+/// issue #603 N7：过期的设备**不能**自己解绑（它的凭证已经不可用，控制面一开始就拒绝，`credential_expired`），
+/// 也不需要：过期的凭证不占名额。「设备永远有权离开」只对还可用的设备凭证成立。
+#[test]
+fn an_expired_device_cannot_unpair_itself_and_does_not_need_to() {
+    let (env, service) = setup();
+    let limit = usize::try_from(MAX_ACTIVE_DEVICES_PER_MEMBERSHIP).unwrap();
+    let devices = pair_devices(&env, &service, limit, Some(3_600_000), T0);
+    let later = T0 + 2 * 3_600_000;
+    let rid = env.rid();
+    let failure = env
+        .store
+        .control_unpair_device(&devices[0].who(), &env.meta(later, &rid))
+        .expect_err("an expired device credential cannot call the control plane");
+    assert_eq!(failure.reason, ControlReason::CredentialExpired);
+    assert!(
+        try_one_more(&env, &service, later).is_ok(),
+        "the expired devices hold no slots, so nobody has to unpair them"
+    );
+}
+
 #[test]
 fn an_expired_credential_row_frees_its_slot_even_when_its_verifier_row_carries_no_expiry() {
     // 凭证行和验证器行的有效期是一起写的，但两边各自都是权威：数据面闸门看凭证行，虚拟 key 认证看验证器行。

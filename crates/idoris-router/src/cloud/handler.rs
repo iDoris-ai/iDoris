@@ -90,7 +90,7 @@ pub(crate) async fn chat_completions(
                 StatusCode::BAD_REQUEST,
                 "invalid_privacy",
                 "invalid_privacy",
-                "X-iDoris-Privacy must be a single, non-blank value: any|local_only",
+                "X-iDoris-Privacy (and body `privacy`) must be a single, non-blank value: any|local_only",
             );
         }
     };

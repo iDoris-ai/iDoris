@@ -74,8 +74,9 @@ use super::safety::{GateDenial, SafetyCall, SafetyGate};
 /// 调用方对这次请求的隐私声明（`X-iDoris-Privacy` 头，或请求体里的等价字段），由入口解析、交给执行器。
 ///
 /// 为什么要进执行器：`local_only` 的意思是「这份数据不许离开调用方的机器」。云是远端，`local_only` 请求永远不该到这里；
-/// 入口（`handler`）会先拒绝，但执行器自己再查一道：不论哪个入口（现在的云入口、以后新增的路径、测试直接调执行器）
-/// 构造 [`CloudCall`]，都必须把声明带进来，`LocalOnly` 一律在任何候选选择、准入、安全检查模型调用和上游请求**之前**被拒。
+/// 入口（`handler`）只解析声明、拒绝不合法的声明，**不**拒绝 `local_only`：显式 `local_only` 由执行器在 [`CloudExecutor::execute`]
+/// 的最开头拒绝（现在这是唯一的一道闸，不是纵深防御的第二道）。不论哪个入口（现在的云入口、以后新增的路径、测试直接调
+/// 执行器）构造 [`CloudCall`]，都必须把声明带进来，`LocalOnly` 一律在任何候选选择、准入、安全检查模型调用和上游请求**之前**被拒。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CallPrivacy {
     /// 没有声明。云入口**不**套用本地路由器「没声明 = `local_only`」的默认：普通的 OpenAI 客户端不会发这个头，
@@ -373,7 +374,8 @@ impl CloudExecutor {
     /// 是否走管线只看 `call.tenant`（服务端从凭证解析出来的），不看模型名、路由别名、请求头。
     pub async fn execute(&self, call: CloudCall) -> Result<CloudOutcome, CloudError> {
         // 最先做、早于一切：显式 `local_only` 永远不出网，也不送给安全检查模型（那同样是把正文发给远端）。
-        // 入口（`handler`）已经拒绝过一次；这里是纵深防御：不论哪个入口构造 `CloudCall` 都一样。
+        // 入口（`handler`）不拒绝 `local_only`（只校验声明本身合不合法，然后原样交给这里）：这是唯一的一道闸，
+        // 不论哪个入口构造 `CloudCall` 都一样。
         if call.privacy == CallPrivacy::LocalOnly {
             return Err(self.reject(&call, CloudError::LocalOnlyRefused));
         }

@@ -776,6 +776,43 @@ pub(super) fn authorize_op(
     Ok(Some(dir))
 }
 
+/// 与操作**目标**无关的那几步授权判定：凭证此刻可用、绑定账户没被冻结、调用者有没有 `op` 这个操作（任何范围里）。
+///
+/// 按 id 查的写操作（撤销成员关系 / 额度、改凭证状态）在碰目标之前先做：没有这个操作权限的调用者，无论目标存在与否
+/// 都得到同一个答案（契约 `authorize` 的检查顺序：有没有这个操作的权限先于目标存不存在）。否则已有的目标得到
+/// `op_not_granted`，不存在的目标在授权判定之前就得到 `out_of_scope`，靠它能探测别的组织有哪些 id。
+/// 范围问题（`op` 的子树不含自己的绑定账户）不在这里判，交给后面按目标判。本机运维不受授权约束。
+pub(super) fn require_op_capability(
+    conn: &Connection,
+    caller: &Caller,
+    now: TimestampMs,
+    op: ControlOp,
+) -> Result<(), Failure> {
+    let Identity::Credential { credential, .. } = &caller.identity else {
+        // 运维不受约束；配对码没有任何授权（按目标判时同样得到 `op_not_granted`）
+        return match &caller.identity {
+            Identity::PairingCode(_) => Err(Failure::new(ControlReason::OpNotGranted)),
+            _ => Ok(()),
+        };
+    };
+    let Some(anchor) = binding_anchor(conn, credential.binding())? else {
+        return Ok(());
+    };
+    match authorize_op(conn, caller, now, op, &anchor, None) {
+        // 范围、金额都是按目标 / 按请求判的，不在这里
+        Err(failure)
+            if matches!(
+                failure.reason,
+                ControlReason::OutOfScope | ControlReason::AmountExceedsAuthority
+            ) =>
+        {
+            Ok(())
+        }
+        Err(failure) => Err(failure),
+        Ok(_) => Ok(()),
+    }
+}
+
 // ================================================================================================
 // 主体
 // ================================================================================================
@@ -1291,24 +1328,9 @@ impl AccountStore {
             }
             // 先验请求自己声明的结构（`org` 与付款账户的关系），再碰别人的数据（成员关系 id、主体）：见 `check_membership_structure`
             check_membership_structure(conn, membership)?;
-            if let Some(existing) = load_membership(conn, &membership.id)? {
-                return if existing == *membership {
-                    Ok(Written {
-                        result: WriteResult::Replayed,
-                        value: existing,
-                    })
-                } else {
-                    Err(Failure::with_detail(
-                        ControlReason::AlreadyExists,
-                        format!(
-                            "membership {} already exists with a different definition",
-                            membership.id
-                        ),
-                    ))
-                };
-            }
-            // 先判「调用者是不是归属方」，再谈主体状态。顺序反了的话，外部组织能靠
-            // `invalid_membership` / `principal_revoked` / `out_of_scope` 区分不存在、已撤销、活跃（r1-M2）。
+            // 先判「调用者是不是归属方」（可见性），再谈成员关系 id 是否已存在、主体状态。顺序反了的话，外部组织能靠
+            // `already_exists` / `invalid_membership` / `principal_revoked` / `out_of_scope` 区分不存在、已撤销、活跃（r1-M2），
+            // 也能拿一个别的组织的成员关系 id 来探测它存在与否（issue #603 N7）。
             // 归属方 = 登记它的组织；没有登记记录的老主体 = 已经在用它的组织（见 `principal_owners`）。
             // 把已有归属方的主体关联到别的组织，每个归属方要么就是这个成员关系所属组织的祖先（或它自己），
             // 要么调用者对它有 `revoke_principal` 权限。否则任何组织猜到一个主体 id 就能挂一个成员关系上去
@@ -1324,6 +1346,35 @@ impl AccountStore {
                 &membership.org,
             )? {
                 return Err(Failure::new(ControlReason::OutOfScope));
+            }
+            if let Some(existing) = load_membership(conn, &membership.id)? {
+                // 已有的成员关系可能属于别的付款账户：调用者对它所属的账户没有 `manage_membership` 时，不告诉他它存在
+                // （同样的 `out_of_scope`），只有管得到它的人才看得到 replayed / already_exists。
+                if membership_target(&existing) != &target {
+                    authorize_op(
+                        conn,
+                        caller,
+                        meta.now,
+                        ControlOp::ManageMembership,
+                        membership_target(&existing),
+                        None,
+                    )
+                    .map_err(|_| Failure::new(ControlReason::OutOfScope))?;
+                }
+                return if existing == *membership {
+                    Ok(Written {
+                        result: WriteResult::Replayed,
+                        value: existing,
+                    })
+                } else {
+                    Err(Failure::with_detail(
+                        ControlReason::AlreadyExists,
+                        format!(
+                            "membership {} already exists with a different definition",
+                            membership.id
+                        ),
+                    ))
+                };
             }
             match found {
                 None => {
@@ -1360,6 +1411,8 @@ impl AccountStore {
         let spec =
             AuditSpec::new("revoke_membership", TargetKind::Membership).target(&request.membership);
         self.control_write(who, meta, spec, |conn, caller, spec| {
+            // 先做与目标无关的授权判定，再按 id 去查（见 `require_op_capability`）
+            require_op_capability(conn, caller, meta.now, ControlOp::ManageMembership)?;
             let Some(found) = load_membership(conn, &request.membership)? else {
                 return Err(Failure::new(ControlReason::OutOfScope));
             };
@@ -1662,17 +1715,19 @@ impl AccountStore {
             CredentialStatus::Active => "unfreeze_credential",
         };
         let spec = AuditSpec::new(op_name, TargetKind::Credential).target(&request.credential);
+        let op = match request.status {
+            CredentialStatus::Revoked => ControlOp::RevokeCredential,
+            CredentialStatus::Frozen | CredentialStatus::Active => ControlOp::FreezeCredential,
+        };
         self.control_write(who, meta, spec, |conn, caller, spec| {
+            // 先做与目标无关的授权判定，再按 id 去查（见 `require_op_capability`）
+            require_op_capability(conn, caller, meta.now, op)?;
             let Some(found) = load_credential(conn, &request.credential)? else {
                 return Err(Failure::new(ControlReason::OutOfScope));
             };
             let anchor = binding_anchor(conn, found.binding())?
                 .ok_or_else(|| Failure::new(ControlReason::OutOfScope))?;
             spec.scope_account = Some(anchor.to_string());
-            let op = match request.status {
-                CredentialStatus::Revoked => ControlOp::RevokeCredential,
-                CredentialStatus::Frozen | CredentialStatus::Active => ControlOp::FreezeCredential,
-            };
             authorize_op(conn, caller, meta.now, op, &anchor, None)?;
             if found.status() == request.status {
                 return Ok(Written {
@@ -1889,6 +1944,8 @@ impl AccountStore {
     ) -> Result<Written<AllocationRecord>, Failure> {
         let spec = AuditSpec::new("revoke_allocation", TargetKind::Allocation).target(&request.id);
         self.control_write(who, meta, spec, |conn, caller, spec| {
+            // 先做与目标无关的授权判定，再按 id 去查（见 `require_op_capability`）
+            require_op_capability(conn, caller, meta.now, ControlOp::GrantAllocation)?;
             let Some(record) = load_allocation_record(conn, &request.id)? else {
                 return Err(Failure::new(ControlReason::OutOfScope));
             };

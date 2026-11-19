@@ -131,14 +131,15 @@
 //!
 //! # Codex 审查 r2 与 PR-Daemon 评审之后的口径（需要 owner 确认，没有悄悄拍板）
 //!
-//! 27. **显式 `local_only` 在云入口一律拒绝**（403 `local_only_refused`，早于一切候选选择、准入、安全检查模型调用和上游请求，
-//!     执行器里再查一道）。**没声明不等于 `local_only`**：本地路由器「没声明 = `local_only`」的保守默认在云入口不适用，
-//!     因为普通的 OpenAI 客户端不会发这个头，而它们调的就是云。头不合法（重复、空、不认识的值）是 400 `invalid_privacy`，
+//! 27. **显式 `local_only` 在云入口一律拒绝**（403 `local_only_refused`，早于一切候选选择、准入、安全检查模型调用和上游请求；
+//!     入口只校验声明是否合法，拒绝 `local_only` 的是执行器 `CloudExecutor::execute` 的最开头，这是唯一的一道闸）。**没声明不等于 `local_only`**：本地路由器「没声明 = `local_only`」的保守默认在云入口不适用，
+//!     因为普通的 OpenAI 客户端不会发这个头，而它们调的就是云。头不合法（重复、空、不认识的值）、请求体里写了 `privacy` / `metadata.privacy` 却不是 `any` / `local_only` 都是 400 `invalid_privacy`，
 //!     不当作没声明。请求体里的等价声明（顶层 `privacy` 或 `metadata.privacy` 写了 `local_only`）同样拒绝，取最严的。
 //! 28. **`billing: unbilled` 没有实现，加载配置时拒绝**（备选：完整实现「不收用户费用、单独记平台成本」，要改准入、预留、结算）。
 //!     契约（S0）里 `Billing::Unbilled` 对流式 usage 的豁免没有改动。
 //! 29. **`extra_body` 不能碰协议 / 计费 / 身份 / 留存字段**（`idoris_upstream::cloud::RESERVED_EXTRA_BODY_FIELDS`），加载时拒绝，
-//!     构造请求时这些字段最后写入。保留表是我拟的，增减要 owner 看一眼。
+//!     构造请求时这些字段最后写入。另外是**白名单**（issue #603 N6）：顶层只收 `provider`，里面只收布尔值的 `zdr`、`allow_fallbacks`，
+//!     其余加载时拒绝，构造请求时按同一张白名单再过滤一遍。保留表与白名单是我拟的，增减要 owner 看一眼。
 //! 30. **流里的 usage 什么时候可信**（`answer::StreamTracker::usage_is_trusted`，owner 口径：**不多收也不少收**）：分开跟踪最近的
 //!     usage、最后一次「新内容」出现的位置、每个 choice 的结束位置（非空**字符串**的 `finish_reason`）。usage 之后**没有新内容**
 //!     （只有空 delta 的结束块、`[DONE]`）就可信：单独的 usage 块（`choices` 为空）直接可信；夹带在内容块里的 usage 要等到所有 choice
