@@ -779,12 +779,13 @@ impl ChatProxy {
     /// The request is built from scratch, so no caller header (notably the
     /// iDoris virtual key in `Authorization`) can reach the upstream. The
     /// oMLX inference key is attached only for the `omlx` provider — the same
-    /// selector the lifecycle path's `create_adapter` uses — from the same
-    /// env var, and is never logged.
+    /// selector the lifecycle path's `create_adapter` uses — from the
+    /// env var, or from `~/.omlx/settings.json` only when `url` is loopback,
+    /// and is never logged.
     fn outbound(&self, url: &str, payload: &Value, provider_id: &str) -> reqwest::RequestBuilder {
         let mut request = self.client.post(url);
         if provider_id == OMLX_PROVIDER_ID
-            && let Some(key) = idoris_upstream::omlx::key::resolve_omlx_api_key()
+            && let Some(key) = idoris_upstream::omlx::key::resolve_omlx_api_key_for(url)
         {
             request = request.bearer_auth(key);
         }
@@ -1966,7 +1967,7 @@ impl ChatProxy {
         ForwardOutcome {
             status: 502,
             body: Bytes::from_static(
-                "{\"error\":{\"type\":\"upstream_auth_failed\",\"reason_code\":\"upstream_auth_failed\",\"remediation\":\"上游拒绝了 iDoris 持有的凭证。上游是 oMLX 时，请设置环境变量 IDORIS_OMLX_API_KEY，或在 ~/.omlx/settings.json 的 auth.api_key 中配置；iDoris 不会重试\"}}".as_bytes(),
+                "{\"error\":{\"type\":\"upstream_auth_failed\",\"reason_code\":\"upstream_auth_failed\",\"remediation\":\"The upstream rejected the credential iDoris holds. For oMLX, set IDORIS_OMLX_API_KEY or auth.api_key in ~/.omlx/settings.json (iDoris will not retry) / 上游拒绝了 iDoris 持有的凭证；上游是 oMLX 时请设置 IDORIS_OMLX_API_KEY 或 ~/.omlx/settings.json 的 auth.api_key，iDoris 不会重试\"}}".as_bytes(),
             ),
             content_type: Some("application/json".into()),
             cached: false,
@@ -2062,6 +2063,81 @@ mod tests {
             body: Bytes::from_static(b"{}"),
             record_id: "rec-1".to_string(),
             served_locality: Locality::Loopback,
+        }
+    }
+
+    /// 文件里的 oMLX key 只发给 loopback；环境变量的 key 照旧发。key 取自进程环境，
+    /// 所以每个用例在子进程里跑。金丝雀值只在子进程内比对，不打印。
+    #[test]
+    fn omlx_settings_key_is_only_attached_for_loopback_urls() {
+        const CASE: &str = "IDORIS_PROXY_KEY_CASE";
+        const FILE_KEY: &str = "canary-proxy-file-key-q1w2";
+        const ENV_KEY: &str = "canary-proxy-env-key-e3r4";
+        const REMOTE: &str = "http://203.0.113.7:8088/v1/chat/completions";
+        const LOCAL: &str = "http://127.0.0.1:8088/v1/chat/completions";
+        if let Ok(case) = std::env::var(CASE) {
+            let proxy = ChatProxy::new(reqwest::Client::new());
+            let auth = |url: &str, provider: &str| {
+                proxy
+                    .outbound(url, &serde_json::json!({"model": "m"}), provider)
+                    .build()
+                    .unwrap()
+                    .headers()
+                    .get("authorization")
+                    .map(|v| v.to_str().unwrap().to_owned())
+            };
+            match case.as_str() {
+                "file" => {
+                    assert_eq!(
+                        auth(REMOTE, "omlx"),
+                        None,
+                        "file key must not leave loopback"
+                    );
+                    assert_eq!(auth(LOCAL, "omlx"), Some(format!("Bearer {FILE_KEY}")));
+                    assert_eq!(auth(LOCAL, "other"), None);
+                }
+                "env" => {
+                    let want = Some(format!("Bearer {ENV_KEY}"));
+                    assert_eq!(auth(REMOTE, "omlx"), want);
+                    assert_eq!(auth(LOCAL, "omlx"), want);
+                }
+                other => panic!("unknown case {other}"),
+            }
+            return;
+        }
+        for (case, env_key) in [("file", None), ("env", Some(ENV_KEY))] {
+            let home = std::env::temp_dir()
+                .join(format!("idoris-proxy-key-{}-{case}", std::process::id()));
+            std::fs::create_dir_all(home.join(".omlx")).unwrap();
+            std::fs::write(
+                home.join(".omlx/settings.json"),
+                format!(r#"{{"auth":{{"api_key":"{FILE_KEY}"}}}}"#),
+            )
+            .unwrap();
+            let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+            cmd.args([
+                "--exact",
+                "proxy::tests::omlx_settings_key_is_only_attached_for_loopback_urls",
+                "--nocapture",
+            ])
+            .env(CASE, case)
+            .env("HOME", &home)
+            .env_remove(idoris_upstream::omlx::OMLX_API_KEY_ENV);
+            if let Some(key) = env_key {
+                cmd.env(idoris_upstream::omlx::OMLX_API_KEY_ENV, key);
+            }
+            let output = cmd.output().unwrap();
+            let _ = std::fs::remove_dir_all(&home);
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                output.status.success(),
+                "case {case}: {}",
+                text.replace(FILE_KEY, "<file>").replace(ENV_KEY, "<env>")
+            );
         }
     }
 
