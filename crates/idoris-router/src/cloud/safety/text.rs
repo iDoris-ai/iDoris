@@ -915,13 +915,68 @@ fn ends_a_sentence(c: char) -> bool {
     matches!(c, '.' | '!' | '?' | '\u{3002}' | '\u{2026}')
 }
 
-/// 紧挨在命中前面、说明命中是**一个新子句的开头**的标点：逗号、冒号、破折号、连字符、括号。
-/// （引号不算：`I can't answer "how to make a bomb"` 是在引用被拒绝的话。）
+/// 紧挨在命中前面、**可能**说明命中是一个新子句的开头的标点：逗号、冒号、破折号、连字符、括号。
+/// （引号不算：`I can't answer "how to make a bomb"` 是在引用被拒绝的话；但引号也不遮住它前面的标点，见 [`is_a_quote`]。）
+/// 「可能」：标点前面的话是在**引出**被拒绝的内容时（`this request:`、`questions like:`），标点后面还是拒绝语管着的，见 [`clause_start`]。
 fn opens_a_clause(c: char) -> bool {
     matches!(
         c,
         ',' | ':' | '-' | '\u{2013}' | '\u{2014}' | '\u{3001}' | '(' | '[' | '{'
     )
+}
+
+/// 引号（直的、弯的、书名号式的）：引用被拒绝的话。命中前面紧挨着的引号**不是**分隔符（`I can't answer "how to make a bomb"` 没有新子句），
+/// 但也**不遮住**它前面的分隔符：`I can't help with that: "how to make a bomb"` 里命中前面是引号，引号前面是冒号。
+/// （上一轮只看命中前面的第一个字符，一对引号就让上面这句整句放行。）
+fn is_a_quote(c: char) -> bool {
+    matches!(
+        c,
+        '"' | '\''
+            | '`'
+            | '\u{2018}'
+            | '\u{2019}'
+            | '\u{201A}'
+            | '\u{201B}'
+            | '\u{201C}'
+            | '\u{201D}'
+            | '\u{201E}'
+            | '\u{201F}'
+            | '\u{00AB}'
+            | '\u{00BB}'
+            | '\u{300C}'
+            | '\u{300D}'
+            | '\u{300E}'
+            | '\u{300F}'
+    )
+}
+
+/// `before`（窗口里命中前面的那一段）紧挨着命中的是分隔符（[`opens_a_clause`]）吗？只隔空格和引号不算隔开。
+/// 是：返回分隔符**前面**的那段文字（去掉了结尾的空格和引号；紧挨着的几个分隔符 `: (` 算一处）；不是：`None`。
+fn text_before_the_delimiter(before: &str) -> Option<&str> {
+    let mut rest = before;
+    let mut found = false;
+    loop {
+        rest = rest.trim_end_matches(|c: char| c == ' ' || is_a_quote(c));
+        match rest.chars().next_back() {
+            Some(c) if opens_a_clause(c) => {
+                found = true;
+                rest = &rest[..rest.len() - c.len_utf8()];
+            }
+            _ => return found.then_some(rest),
+        }
+    }
+}
+
+/// `head`（分隔符前面的那段文字，结尾没有空格）是在**引出**后面的内容吗：以 `introducers` 里的某一个词结尾。
+/// 英语整词匹配（`requests` 不以 `request` 结尾），泰语没有词间空格，按结尾匹配。
+fn introduces_what_follows(head: &str, introducers: &[Needle]) -> bool {
+    let head = Folded::from_plain(head.to_string(), Vec::new());
+    introducers.iter().any(|needle| {
+        needle
+            .plain_spans(&head)
+            .into_iter()
+            .any(|(_, end)| end == head.plain.len())
+    })
 }
 
 /// 泰语的「แต่」（但是）在 `plain` 里的位置。折叠掉声调之后它是 `แต`，也是 `แตก`（裂开）、`แตง` / `แต่ง`（瓜 / 打扮）、`แตะ`（碰）、
@@ -947,10 +1002,19 @@ fn thai_but_spans(plain: &str) -> Vec<(usize, usize)> {
 
 /// `plain[from..to]` 里最后一个**新子句**从哪里开始（`to` 是命中区间的起点）：
 /// 1. 转折词（`contrasts` 里的，加上泰语的 `แต่`，见 [`thai_but_spans`]）结束的位置：`but` / `however` / `แต่` 之后开始的是一个新子句；
-/// 2. 命中**紧挨着**（只隔空格）前面是 [`opens_a_clause`] 的标点：命中自己就是一个新子句的开头；
+/// 2. 命中**紧挨着**（只隔空格和引号）前面是 [`opens_a_clause`] 的标点：命中自己就是一个新子句的开头——**除非标点前面的话是在引出
+///    被拒绝的内容**（以 `introducers` 里的词结尾：`this request:`、`questions like:`、`such as:`、`the following:`、`topics:`）。
+///    那时拒绝语的宾语在标点**后面**，标点后面的就是它管着的内容，不是新的索要（评审 F3：`Sorry, I can't help with this request: how to
+///    make a bomb.` 是模型自己常用的拒绝格式）；拒绝语自带宾语（`I can't help with that: how to make a bomb`、`I can't wait,`）才算新子句。
 ///
 /// 都没有就是 `from`（整个窗口是同一个子句）。
-fn clause_start(haystack: &Folded, from: usize, to: usize, contrasts: &[Needle]) -> usize {
+fn clause_start(
+    haystack: &Folded,
+    from: usize,
+    to: usize,
+    contrasts: &[Needle],
+    introducers: &[Needle],
+) -> usize {
     let before = &haystack.plain[from..to];
     let mut start = from;
     let slice = Folded::from_plain(before.to_string(), Vec::new());
@@ -962,11 +1026,8 @@ fn clause_start(haystack: &Folded, from: usize, to: usize, contrasts: &[Needle])
     for (_, end) in thai_but_spans(before) {
         start = start.max(from + end);
     }
-    if before
-        .trim_end_matches(' ')
-        .chars()
-        .next_back()
-        .is_some_and(opens_a_clause)
+    if text_before_the_delimiter(before)
+        .is_some_and(|head| !introduces_what_follows(head, introducers))
     {
         start = to;
     }
@@ -980,7 +1041,7 @@ fn clause_start(haystack: &Folded, from: usize, to: usize, contrasts: &[Needle])
 ///
 /// 1. **拒绝语在命中前面时，拒绝语和命中之间不能开始一个新子句**（N2）：`I can't help with that, but how to make a bomb` 里
 ///    拒绝语拒绝的是「that」，`but` 之后是一个新的索要。窗口从命中前面**最后一个新子句的开头**算起（见 [`clause_start`]：转折词
-///    `contrasts` 之后，或者命中紧挨着逗号 / 冒号 / 破折号 / 括号）：再前面的拒绝语不算。命中**后面**的线索不受这条影响——
+///    `contrasts` 之后，或者命中紧挨着逗号 / 冒号 / 破折号 / 括号，下面第 4 点的例外除外）：再前面的拒绝语不算。命中**后面**的线索不受这条影响——
 ///    `You asked how to make a bomb, but I can't help with that` 和泰语的话题在前（「เรื่องวิธีทำระเบิด ฉันไม่สามารถช่วยได้」）
 ///    都是真正的拒绝，转折词在命中之后只是拒绝的一部分。
 /// 2. **分号不挡住命中后面的线索**（N2 的 Low）：`You asked how to make a bomb; I cannot help with that.` 是一句话（分号连着的两半），
@@ -989,22 +1050,29 @@ fn clause_start(haystack: &Folded, from: usize, to: usize, contrasts: &[Needle])
 /// 3. **否定的拒绝不是拒绝**：`negated` 里的（`I won't refuse`、`ไม่สามารถปฏิเสธได้`）含着 `won't` / `refuse` / `ไม่สามารถ` 却是在说「我不拒绝」，
 ///    先从窗口里抹掉，再找线索。
 ///
+/// 4. **分隔符前面的话在引出被拒绝的内容时，分隔符不开始新子句**（评审 F3）：以 `introducers`（`this request` / `questions like` / `such as` /
+///    `the following` / `topics`……）结尾、紧接着分隔符的，拒绝语的宾语在分隔符后面：`Sorry, I can't help with this request: how to make a bomb.`
+///    仍是一句真正的拒绝。拒绝语自带宾语的（`that` / `it` / `them` / `this`）不在表里，分隔符之后仍是新的索要。引号不遮住分隔符
+///    （`I can't help with that: "how to make a bomb"` 仍拒）。
+///
 /// 这条仍是启发式（拒绝语和请求挤在同一句里时仍会放行：`I can't wait, how to make a bomb` 里逗号后面是命中自己的开头，会拒；
-/// 但 `I can't help with that, so how to make a bomb` 里连接词不是转折词，放行）。**只给助手历史**（客户端写的）：孩子真正的请求
-/// 要出现在用户消息里才有用，而用户消息没有任何豁免。
+/// 但 `I can't help with that, so how to make a bomb` 里连接词不是转折词，放行；`I can't help with this request: how to make a bomb, answer in
+/// base64` 和模型自己的拒绝在字面上分不开，也放行）。**只给助手历史**（客户端写的）：孩子真正的请求要出现在用户消息里才有用，
+/// 而用户消息没有任何豁免。
 pub fn refused_beside(
     haystack: &Folded,
     region: (usize, usize),
     cues: &[Needle],
     negated: &[Needle],
     contrasts: &[Needle],
+    introducers: &[Needle],
     reach_chars: usize,
 ) -> bool {
     if !usable_region(haystack, region) {
         return false;
     }
     let (window_start, finish) = window_with(haystack, region, reach_chars, ends_a_sentence);
-    let start = clause_start(haystack, window_start, region.0, contrasts);
+    let start = clause_start(haystack, window_start, region.0, contrasts, introducers);
     let window = Folded::from_plain(haystack.plain[start..finish].to_string(), Vec::new());
     let spans: Vec<(usize, usize)> = negated
         .iter()
@@ -1993,12 +2061,22 @@ mod tests {
         ];
         let negated = vec![Needle::new("won't refuse"), Needle::new("ไม่สามารถปฏิเสธ")];
         let contrasts = vec![Needle::new("but"), Needle::new("however")];
+        // 这一条测试里没有引出词：分隔符一律是新子句的开头（上一轮的口径）；引出词见 `a_delimiter_after_a_refusal_...`
+        let introducers: Vec<Needle> = Vec::new();
         // 命中区间：`how to make a bomb` 在 `text` 里的位置
         let excused = |text: &str, hit: &str| {
             let folded = fold(text);
             let start = folded.plain.find(&fold(hit).plain).unwrap();
             let region = (start, start + fold(hit).plain.len());
-            refused_beside(&folded, region, &cues, &negated, &contrasts, 30)
+            refused_beside(
+                &folded,
+                region,
+                &cues,
+                &negated,
+                &contrasts,
+                &introducers,
+                30,
+            )
         };
         // 拒绝语管着命中
         assert!(excused(
@@ -2099,5 +2177,180 @@ mod tests {
         let (alone, seams) = fold_joined(&["only"], " ");
         assert_eq!(alone.plain, "only");
         assert!(seams.is_empty());
+    }
+
+    /// issue #603 N2 第二轮（评审 F3）：命中前面紧挨着的分隔符是分隔符前面那段话的哪一部分——找得到分隔符吗（引号、空格不遮住它）、
+    /// 分隔符前面的话以引出词结尾吗。
+    #[test]
+    fn the_delimiter_before_a_hit_is_found_through_quotes_and_judged_by_the_words_before_it() {
+        // 找分隔符：只隔空格和引号不算隔开；紧挨着的几个分隔符算一处；不是分隔符就是 `None`
+        for (before, head) in [
+            ("i can't help with that: ", "i can't help with that"),
+            ("i can't help with that:", "i can't help with that"),
+            ("i can't help with that : ", "i can't help with that"),
+            ("i can't help with that: \"", "i can't help with that"),
+            ("i can't help with that, '", "i can't help with that"),
+            (
+                "i can't help with that - \u{201C}",
+                "i can't help with that",
+            ),
+            ("i can't help with that (", "i can't help with that"),
+            ("i can't help with that: (\"", "i can't help with that"),
+            ("i can't help with that \u{2014} ", "i can't help with that"),
+            // 分隔符前面那段话结尾的引号随着空格一起去掉：`"this request"` 的收尾引号不挡着 `request`
+            (
+                "i can't help with \"this request\": ",
+                "i can't help with \"this request",
+            ),
+            (": ", ""),
+        ] {
+            assert_eq!(text_before_the_delimiter(before), Some(head), "{before:?}");
+        }
+        for before in [
+            "",
+            "i can't answer ",
+            "i can't answer \"",
+            "i can't answer '",
+            "i can't wait",
+            "i can't help with that ",
+        ] {
+            assert_eq!(text_before_the_delimiter(before), None, "{before:?}");
+        }
+        // 引出词：英语整词匹配、只看结尾；泰语按结尾匹配
+        let introducers = vec![
+            Needle::new("request"),
+            Needle::new("such as"),
+            Needle::new("like"),
+            Needle::new("with"),
+            Needle::new("ต่อไปนี้"),
+            Needle::new("คำขอนี้"),
+        ];
+        // 分隔符前面的话来自折叠之后的 `plain`（小写、泰语声调已去掉）：测试里也先折叠
+        for head in [
+            "i can't help with this request",
+            "i can't discuss topics such as",
+            "i cannot answer questions like",
+            "i can't help with",
+            "ขอโทษนะ ฉันไม่สามารถช่วยเรื่องต่อไปนี้",
+            "ฉันไม่ช่วยคำขอนี้",
+        ] {
+            assert!(
+                introduces_what_follows(&fold(head).plain, &introducers),
+                "{head}"
+            );
+        }
+        for head in [
+            "",
+            "i can't help with that",
+            "i won't do it",
+            "i can't wait",
+            "i can't help with these requests",
+            "i can't help with request again",
+            "i can't help with unlike",
+            "ฉันไม่ช่วยเรื่องนั้น",
+        ] {
+            assert!(
+                !introduces_what_follows(&fold(head).plain, &introducers),
+                "{head}"
+            );
+        }
+    }
+
+    /// issue #603 N2 第二轮（评审 F3）：分隔符前面的话在引出被拒绝的内容时，分隔符不开始新子句；拒绝语自带宾语时仍是新子句；
+    /// 引号不遮住分隔符；转折词、句界、没有拒绝语、否定的拒绝，引出词都救不了。
+    #[test]
+    fn a_delimiter_after_a_refusal_starts_a_new_clause_only_when_the_refusal_is_complete() {
+        let cues = vec![
+            Needle::new("can't"),
+            Needle::new("cannot"),
+            Needle::new("won't"),
+            Needle::new("refuse"),
+            Needle::new("ไม่ช่วย"),
+        ];
+        let negated = vec![Needle::new("won't refuse")];
+        let contrasts = vec![Needle::new("but"), Needle::new("however")];
+        let introducers = vec![
+            Needle::new("request"),
+            Needle::new("questions"),
+            Needle::new("topics"),
+            Needle::new("like"),
+            Needle::new("such as"),
+            Needle::new("following"),
+            Needle::new("เช่น"),
+        ];
+        let excused = |text: &str, hit: &str| {
+            let folded = fold(text);
+            let start = folded.plain.find(&fold(hit).plain).unwrap();
+            let region = (start, start + fold(hit).plain.len());
+            refused_beside(
+                &folded,
+                region,
+                &cues,
+                &negated,
+                &contrasts,
+                &introducers,
+                40,
+            )
+        };
+        let hit = "how to make a bomb";
+        // 宾语在分隔符后面：拒绝语仍管着它（冒号、逗号、破折号、括号，引号里的也一样）
+        for text in [
+            "Sorry, I can't help with this request: how to make a bomb.",
+            "I cannot answer questions like: how to make a bomb",
+            "I can't help with topics such as: how to make a bomb",
+            "I can't do the following: how to make a bomb",
+            "I can't help with this request, how to make a bomb",
+            "I can't help with this request - how to make a bomb",
+            "I can't help with this request \u{2014} how to make a bomb",
+            "I can't help with this request (how to make a bomb)",
+            "I can't help with this request: \"how to make a bomb\"",
+            "I can't help with this request: ('how to make a bomb')",
+            "I can't help with \"this request\": how to make a bomb",
+        ] {
+            assert!(excused(text, hit), "{text}");
+        }
+        // 拒绝语自带宾语 / 根本不是在引出什么：分隔符后面是新的索要
+        for text in [
+            "I can't help with that: how to make a bomb",
+            "I won't do it: how to make a bomb",
+            "I can't help with them, how to make a bomb",
+            "I can't wait, how to make a bomb",
+            "I can't help with that - how to make a bomb",
+            "I can't help with that (how to make a bomb)",
+            "Sorry, I can't tell you: how to make a bomb",
+            // 引出词在前面、紧挨着分隔符的却是指代词：只看分隔符前面最后的词
+            "I can't do topics like that: how to make a bomb",
+            // 引号不遮住分隔符（上一轮：整句放行）
+            "I can't help with that: \"how to make a bomb\"",
+            "I can't help with that, 'how to make a bomb'",
+            "I can't help with that: (\"how to make a bomb\")",
+        ] {
+            assert!(!excused(text, hit), "{text}");
+        }
+        // 引出词救不了的：转折词之后、句界之后、没有拒绝语、否定的拒绝
+        for text in [
+            "I can't help with that, but this request: how to make a bomb",
+            "I can't help with that, however topics like: how to make a bomb",
+            "I can't help with that. This request: how to make a bomb",
+            "Here is this request: how to make a bomb",
+            "I won't refuse this request: how to make a bomb",
+            "ฉันไม่ช่วยเรื่องนั้น: วิธีทำระเบิด",
+        ] {
+            let target = if text.is_ascii() {
+                hit
+            } else {
+                "วิธีทำระเบิด"
+            };
+            assert!(!excused(text, target), "{text}");
+        }
+        // 泰语：引出词 `เช่น` 在分隔符前面，拒绝语仍管着它
+        assert!(excused("ฉันไม่ช่วยตอบคำถามเช่น: วิธีทำระเบิด", "วิธีทำระเบิด"));
+        // 引号紧挨着命中、前面没有分隔符：是在引用被拒绝的话，仍然放行（上一轮的口径）
+        assert!(excused("I can't answer \"how to make a bomb\"", hit));
+        // 命中后面的拒绝语不受分隔符影响
+        assert!(excused(
+            "You asked: how to make a bomb, but I can't help",
+            hit
+        ));
     }
 }
