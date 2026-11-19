@@ -1,5 +1,14 @@
 use idoris_recommender::probe::{HostFacts, probed_host_facts};
 
+/// 物理内存的精确字节数（接口规范 §2.9 的档位按它判断；`HostFacts.ram_gb` 是四舍五入的 GiB，不够精确）。
+pub fn current_ram_bytes() -> Result<u64, String> {
+    let (total_mem_bytes, _, _) = platform_sample()?;
+    if !(1.0..9.0e15).contains(&total_mem_bytes) {
+        return Err("物理内存字节数无效".into());
+    }
+    Ok(total_mem_bytes as u64)
+}
+
 pub fn current_host_facts() -> Result<HostFacts, String> {
     let (total_mem_bytes, cpu_model, platform) = platform_sample()?;
     probed_host_facts(total_mem_bytes, cpu_model.as_deref(), platform)

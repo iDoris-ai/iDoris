@@ -14,4 +14,8 @@
 /// fields (`degraded_alternative`, `degraded_alternatives`,
 /// `headroom_breach_option`), and `POST /v1/chat/completions` accepts the
 /// per-request `X-iDoris-Headroom-Breach: confirmed` header.
-pub const CONTRACT_VERSION: &str = "1.1.0";
+///
+/// `1.2.0`: additive only (interface spec §2.9). New read-only endpoints
+/// `GET /v1/recommendation?role=chat` and `GET /v1/models/local`; every 1.1.x
+/// field and behavior is unchanged.
+pub const CONTRACT_VERSION: &str = "1.2.0";
