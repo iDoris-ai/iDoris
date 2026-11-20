@@ -803,7 +803,7 @@ mod tests {
         let slow = models_server(
             ResponseTemplate::new(200)
                 .set_body_json(json!({"data": []}))
-                .set_delay(Duration::from_millis(600)),
+                .set_delay(Duration::from_secs(5)),
         )
         .await;
         let card = resident_card("r", &slow.uri(), "fixture@1");
@@ -812,7 +812,8 @@ mod tests {
             probe_resident(&client(), &card, Duration::from_millis(100)).await,
             Observation::Unavailable(None)
         );
-        assert!(started.elapsed() < Duration::from_millis(500));
+        // 在探测时限（100 毫秒）就返回，没有等完服务器的 5 秒延迟；阈值留足调度余量。
+        assert!(started.elapsed() < Duration::from_secs(4));
     }
 
     #[tokio::test]

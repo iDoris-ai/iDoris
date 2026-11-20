@@ -1432,8 +1432,8 @@ mod tests {
         use std::io::{Read, Write};
         let address = std::net::SocketAddr::from(([127, 0, 0, 1], port));
         let mut stream =
-            std::net::TcpStream::connect_timeout(&address, std::time::Duration::from_secs(2))?;
-        stream.set_read_timeout(Some(std::time::Duration::from_secs(2)))?;
+            std::net::TcpStream::connect_timeout(&address, std::time::Duration::from_secs(5))?;
+        stream.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
         stream
             .write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")?;
         let mut response = String::new();

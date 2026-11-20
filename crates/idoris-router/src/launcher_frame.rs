@@ -821,7 +821,7 @@ mod tests {
         let started = std::time::Instant::now();
         let error = read_with_timeout(
             || {
-                std::thread::sleep(Duration::from_millis(500));
+                std::thread::sleep(Duration::from_secs(5));
                 Err(FrameError::new(FrameErrorCode::FrameNotJson))
             },
             Duration::from_millis(20),
@@ -829,7 +829,8 @@ mod tests {
         .unwrap_err();
         assert_eq!(error.code(), FrameErrorCode::Timeout);
         assert_eq!(error.to_string(), "launcher 帧无效（timeout）");
-        assert!(started.elapsed() < Duration::from_millis(400));
+        // 在时限（20 毫秒）就返回，没有等读线程睡完 5 秒；阈值留足调度余量。
+        assert!(started.elapsed() < Duration::from_secs(4));
     }
 
     #[test]

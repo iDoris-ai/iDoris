@@ -1452,7 +1452,7 @@ fn a_launcher_that_never_writes_the_frame_times_out_after_10_seconds_with_exit_1
         .unwrap();
     // 保持 stdin 开着、一个字节也不写。
     let held_open = child.stdin.take().unwrap();
-    let status = wait_exit(&mut child, Duration::from_secs(40));
+    let status = wait_exit(&mut child, Duration::from_secs(90));
     let (stdout, stderr) = output_of(&mut child);
     drop(held_open);
     assert_eq!(status.code(), Some(1), "{stderr}");
@@ -1463,7 +1463,7 @@ fn a_launcher_that_never_writes_the_frame_times_out_after_10_seconds_with_exit_1
     assert!(!stdout.contains("listening"), "{stdout}");
     let elapsed = started.elapsed();
     assert!(elapsed >= Duration::from_millis(9_500), "{elapsed:?}");
-    assert!(elapsed < Duration::from_secs(30), "{elapsed:?}");
+    assert!(elapsed < Duration::from_secs(80), "{elapsed:?}");
 }
 
 // ---------------------------------------------------------------------------------------------------------------

@@ -4424,9 +4424,10 @@ mod tests {
         .unwrap();
         let runtimes =
             runtime::RuntimeRegistry::from(dispatch::BoundSupervisor::new(&card, handle));
-        let started = Instant::now();
+        // Supervisor 的启动采样要睡 30 秒；`/health` 若去问它（哪怕带超时）就会超出这里的 3 秒。
+        // 阈值留足调度余量，因为这个测试要在很忙的机器上稳定通过；它锁的是「不等上游」，不是具体毫秒数。
         let json = tokio::time::timeout(
-            std::time::Duration::from_millis(200),
+            std::time::Duration::from_secs(3),
             health_json(AppState {
                 cards: vec![card],
                 runtimes,
@@ -4436,7 +4437,6 @@ mod tests {
         .await
         .expect("/health must not wait for an upstream or a supervisor");
         assert_eq!(json["status"], "ok");
-        assert!(started.elapsed() < std::time::Duration::from_millis(200));
     }
 
     #[tokio::test]
