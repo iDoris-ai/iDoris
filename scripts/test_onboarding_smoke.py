@@ -168,6 +168,12 @@ def main(binary, late_backend_only=False):
     env = {k: v for k, v in os.environ.items() if not k.startswith('IDORIS_')}
     with tempfile.TemporaryDirectory(prefix='idoris-onboarding-') as temp:
         root = Path(temp)
+        # 临时 HOME：iDoris 会读 ~/.omlx/settings.json 的 auth.api_key，
+        # 不隔离的话开发机的真实 key 会发给本地 fixture，测试也不密封。
+        home = root / 'home'
+        home.mkdir()
+        env.update(HOME=str(home), XDG_DATA_HOME=str(home / 'data'),
+                   XDG_STATE_HOME=str(home / 'state'), LOCALAPPDATA=str(home / 'appdata'))
         env.update(IDORIS_DB_PATH=str(root / 'state.sqlite3'),
                    IDORIS_STATE_DIR=str(root / 'state'),
                    IDORIS_PORT=str(port()), IDORIS_ADMIN_PORT=str(port()))

@@ -20,7 +20,9 @@ permissions:
 jobs:
   build:
     name: build + test + unsigned package (aarch64-apple-darwin)
-    runs-on: macos-14
+    # 与 ci.yml 的 macOS job 一致用 macos-latest（arm64）。曾固定 macos-14，
+    # 该镜像被 GitHub 下线后 v0.5.0 的 tag 构建 1 秒内被 cancelled。
+    runs-on: macos-latest
     steps:
       # fetch-depth: 0 —— 下面的「tag 必须指向 main 上的提交」检查要用
       # `git merge-base --is-ancestor`，需要完整历史，浅克隆不够。
@@ -59,6 +61,10 @@ jobs:
         run: python3 -B -m unittest discover -s scripts -p 'test_*release*.py' -v
 
       - name: cargo test --workspace
+        # macos-latest 的 runner 核数少、比 macos-14 慢，满并行时一批带短超时的集成测试（100 ms 级）
+        # 会因争抢 CPU 偶发失败。降低单个测试二进制内的并行度，换稳定性。
+        env:
+          RUST_TEST_THREADS: "2"
         run: cargo test --workspace --locked
 
       - name: cargo build --release -p idoris-router
