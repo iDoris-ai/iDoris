@@ -33,7 +33,7 @@ use idoris_upstream::engine::{
     ProcessInspector, ReadyPolicy, Recovery, StopOnExit, SystemInspector, UnreadableReason,
     probe_http, recorded_ports, verify_identity,
 };
-use idoris_upstream::omlx::engine::OmlxRecipe;
+use idoris_upstream::omlx::engine::{OmlxRecipe, base_path_in, prepare_base_dir};
 use serde_json::json;
 use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -214,6 +214,18 @@ impl Rig {
     /// 假引擎（种类 `fakeserve`）在端口 `port` 上的实例。
     fn fake_instance(&self, port: u16) -> EngineInstance {
         self.instance(fake_recipe(), port)
+    }
+
+    /// iDoris 自己的 oMLX base：状态目录下的 `omlx-base`，准备好了（0700）。oMLX 的配方没有它不拉起。
+    fn omlx_base(&self) -> PathBuf {
+        let base = base_path_in(self.state.path());
+        prepare_base_dir(&base).unwrap();
+        base
+    }
+
+    /// 配好 iDoris 自己的 base 的 oMLX 配方。
+    fn omlx_recipe(&self) -> OmlxRecipe {
+        OmlxRecipe::new().with_base_path(self.omlx_base())
     }
 
     /// 规范 §2.7.6：`<状态目录>/engines-owned/<engine_kind>`。
@@ -1503,9 +1515,7 @@ async fn the_omlx_engine_gets_the_designed_argv_and_environment() {
     let rig = Rig::new();
     let key = EngineKey::generate().unwrap();
     let port = free_port();
-    let omlx = OmlxRecipe::new()
-        .with_model_dir("/Volumes/models")
-        .with_base_path("/Volumes/omlx-base");
+    let omlx = rig.omlx_recipe().with_model_dir("/Volumes/models");
     let instance = rig.instance(Arc::new(omlx), port);
     let (parent_env, planted) = parent_env_with_planted();
     let dump = dump_launch(
@@ -1553,10 +1563,21 @@ async fn the_omlx_engine_gets_the_designed_argv_and_environment() {
         Some(key.expose()),
         "the private key, not the user's own OMLX_API_KEY"
     );
+    // oMLX writes its command-line settings into its base: the engine gets iDoris's own, under the
+    // state directory, not the parent's `OMLX_BASE_PATH` (`/planted/omlx-base`) and nothing derived
+    // from the parent's `HOME` (`/planted/home`).
     assert_eq!(
-        dump.env.get("OMLX_BASE_PATH").map(String::as_str),
-        Some("/Volumes/omlx-base"),
-        "the configured base path, not the parent's"
+        dump.env.get("OMLX_BASE_PATH").map(PathBuf::from),
+        Some(rig.state.path().join("omlx-base")),
+        "iDoris's own base, not the parent's"
+    );
+    assert_eq!(
+        std::fs::metadata(rig.state.path().join("omlx-base"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
     );
     assert_eq!(
         dump.cwd,
@@ -1616,7 +1637,7 @@ async fn the_omlx_engine_runs_the_whole_lifecycle_through_its_own_readiness_prob
     let port = http.address().port();
     let fake = rig.fake("omlx", Behavior::Obedient);
     let inspector = TestInspector::new(Some(port));
-    let instance = rig.instance(Arc::new(OmlxRecipe::new()), port);
+    let instance = rig.instance(Arc::new(rig.omlx_recipe()), port);
 
     let mut engine = OwnedEngine::spawn(
         rig.launch(&instance, &fake.exe, &key, StopOnExit::Never),
@@ -1675,7 +1696,7 @@ async fn engines_of_different_kinds_and_two_of_one_kind_live_side_by_side() {
     let fake_script = rig.fake("fake-server", Behavior::Obedient);
     let fake_too_script = rig.fake("fake-server-2", Behavior::Obedient);
 
-    let omlx = rig.instance(Arc::new(OmlxRecipe::new()), omlx_port);
+    let omlx = rig.instance(Arc::new(rig.omlx_recipe()), omlx_port);
     let fake = rig.fake_instance(fake_port);
     let fake_too = rig.fake_instance(fake_too_port); // the same kind as `fake`, another endpoint
 

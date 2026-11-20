@@ -11,37 +11,55 @@
 //!   `~/.omlx/bin/omlx`、`/opt/homebrew/bin/omlx`、`/usr/local/bin/omlx` 都只是指向 app 内 `omlx-cli`
 //!   的包装或符号链接，不作为发现目标。
 //! - **怎么拉起**：`serve --host 127.0.0.1 --port <port> [--memory-guard-gb <N>] [--model-dir <dir>]`
-//!   （flags 对照本机 oMLX 0.6.4 的 `omlx serve --help`）；私有 key 走 `OMLX_API_KEY`，根目录走
+//!   （flags 对照本机 oMLX 0.6.4 的 `omlx serve --help`）；私有 key 走 `OMLX_API_KEY`，base 目录走
 //!   `OMLX_BASE_PATH`；不使用 `--api-key`（argv 同 UID 可见）。
-//!   - `--memory-guard-gb`：额度字节数除以 2^30 向下取整（整数 GiB）。目的是让 oMLX 自己的上限不高于 iDoris 的额度
-//!     账本（`docs/13-…md` B-11：不开 memory guard，第二个模型载入会让 server 无响应）。`--help` 没写单位，也没有对真实
-//!     oMLX 验证过：这个取法在两种解释下都不超过额度（按 GiB 解释时正好是向下取整，按十进制 GB 解释时更小）。
-//!     不足 1 GiB 的额度不拉起，原因码 `budget_zero`：取不到不超过额度的整数；不传这个 flag 会让 oMLX 用它自己的缺省，
-//!     传 0 的含义没有实测，两者都可能超过额度。额度为 0 由通用层拒绝，不足 1 GiB 由本配方拒绝。
-//!   - `--model-dir` 默认不传（设计稿 §2.7.3：不传则引擎用默认 `~/.omlx/models`；宿主有 oMLX.app 的
-//!     base-path 引导文件时由 `OMLX_BASE_PATH` 指向，见 [`bootstrap_base_path`]）；
-//!     [`OmlxRecipe::with_model_dir`] 是显式覆盖的口子（附录 A 已确认这个 flag 存在）。
+//!   - **oMLX 会把命令行参数落盘到 base，所以 iDoris 用自己的 base，不用用户的。** oMLX 0.6.4 的 `serve` 只要命令行里有
+//!     `--host`、`--port`、`--model-dir`、`--memory-guard-gb` 中的任何一个，就把命令行设置连同 base 里已有的设置写回
+//!     `<base>/settings.json`（`omlx/cli.py` 的 `_has_cli_overrides`，`omlx/settings.py` 的 `save_cli_overrides`；
+//!     0.6.4 没有不落盘的开关）；
+//!     没给 `--base-path` 时 base 依次取 `OMLX_BASE_PATH`、oMLX.app 的引导文件
+//!     `~/Library/Application Support/oMLX/base-path`、`~/.omlx`。本配方每次都带 `--host` 与 `--port`：让引擎自己找 base，
+//!     就会改写用户自己的 oMLX 设置（端口、host、内存护栏档位），用户设置里的 `skip_api_key_verification` 与 sub keys
+//!     也会对 iDoris 的私有引擎生效（`omlx/server.py` 的 `verify_api_key`），私有 key 的隔离随之失效。
+//!     所以拉起必须配 [`OmlxRecipe::with_base_path`]：状态目录下的专用目录（约定 `<状态目录>/omlx-base`，见 [`base_path_in`]，
+//!     由 [`prepare_base_dir`] 建成 0700）。[`OmlxRecipe::launch_plan`] 每次拉起时只读地核对它是当前用户自己的真目录
+//!     （符号链接不算，组和其他人没有任何权限）；没配或核对不过，拒绝拉起（`LaunchError::Invalid("base_path")`，原因码
+//!     `base_unavailable`），不让引擎自己找。`OMLX_BASE_PATH` 就是这个目录，父进程的同名变量进不了引擎的环境，
+//!     oMLX.app 的引导文件不再读。落盘的设置下次启动照样生效：这次传过 `--model-dir` 或 `--memory-guard-gb`，下次不传，
+//!     用的仍是落盘的值。
+//!   - **base 之外的写入**：oMLX 0.6.4 的 `serve` 启动时还会写 `~/.omlx/bin/omlx-cluster-python`（给集群里别的 Mac 经 SSH
+//!     找解释器的垫片，`omlx/cluster/worker_shim.py`，启动流程直接调用，内容变了才改写）。路径取自 `HOME`，而 `HOME`
+//!     是通用层白名单里原样继承的变量，`OMLX_BASE_PATH` 管不到；本配方不改 `HOME`（会连带改掉 HF 缓存等其他位置，没有实测过）。
+//!   - `--memory-guard-gb`：额度字节数除以 2^30 向下取整（整数 GiB），设置了额度才传，让 oMLX 自己的上限不高于 iDoris 的
+//!     额度账本（`docs/13-…md` B-11：不开 memory guard，第二个模型载入会让 server 无响应）。oMLX 0.6.4 里它是正浮点
+//!     （`cli.py` 的 `_positive_float`：0、负数、非有限数在命令行解析时就被拒绝，启动即退出），单位是 GiB
+//!     （`process_memory_enforcer.py`：`int(gb * 1024**3)`）；取整数是本配方的选择，不是 oMLX 的限制。额度不足 1 GiB 时
+//!     整数部分是 0；不传则 oMLX 用缺省的 balanced 档位，可能超过额度。所以不拉起，原因码 `budget_zero`（额度为 0 由通用层拒绝）。
+//!   - `--model-dir` 默认不传：引擎用 iDoris 自己 base 下的 `models`，起初是空的；要用用户已有的模型，由调用方显式给
+//!     [`OmlxRecipe::with_model_dir`]（落在 iDoris 自己的 `settings.json` 里）。oMLX 把这个值按逗号拆成多个目录，路径里带逗号会被拆开。
+//!   - 以上 oMLX 的行为来自静态阅读 `/Applications/oMLX.app/Contents/Resources/omlx/` 里的 0.6.4 源码，没有运行过真实的 oMLX。
 //! - **怎么判就绪**：`GET /v1/models` 返回 200 且 JSON 里有 `data` 数组即可（空列表也算：模型目录可能是空的）。
-//!   oMLX 没有 `/health`。这是**引擎**就绪，不是某个**模型**就绪（后者是 [`crate::OmlxAdapter::probe_ready`]）。
+//!   oMLX 没有 `/health`。这是**引擎**就绪，不是某个**模型**就绪（后者是 [`crate::OmlxAdapter::probe_ready`]）。这个形状任何
+//!   OpenAI 兼容服务都满足，证明不了对端是 oMLX；端口上的进程是不是我们拉起的，由通用层的 pid 封印（[`crate::engine::OwnedEngine::seal`]）确认。
 //! - **版本**：默认的 `<exe> --version`（`omlx/cli.py` 的 argparse `version=__version__`，只打印版本号；
 //!   静态阅读源码确认，没有运行过真实的 oMLX）。
 //!
-//! 一个 [`OmlxRecipe`] 就是一份配置好的 oMLX 引擎定义：家目录、搜索目录、签名策略、模型目录、根目录都在实例里。
+//! 一个 [`OmlxRecipe`] 就是一份配置好的 oMLX 引擎定义：家目录、搜索目录、签名策略、模型目录、base 目录都在实例里。
 //! 用 [`crate::engine::EngineInstance::new`] 给它一个端口（与状态目录）就能被管理；它的 `engine_kind` 是
 //! 规范的保留名 `omlx`（[`crate::engine::EngineKind::OMLX`]）。
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
-use std::io::Read;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use async_trait::async_trait;
 
 use crate::engine::{
-    CodesignCheck, CodesignPolicy, DiscoveryPlan, ENGINE_HOST, EngineKind, EngineProbe,
-    EngineRecipe, LaunchError, LaunchInput, LaunchPlan, probe_http,
+    CodesignCheck, CodesignPolicy, DirError, DiscoveryPlan, ENGINE_HOST, EngineKind, EngineProbe,
+    EngineRecipe, LaunchError, LaunchInput, LaunchPlan, effective_uid, ensure_private_dir,
+    probe_http,
 };
 
 /// oMLX 发行包的签名团队（本机 0.6.4，设计稿附录 A）。
@@ -56,12 +74,10 @@ pub const BINARY_NAME: &str = "omlx";
 pub const API_KEY_ENV: &str = "OMLX_API_KEY";
 /// oMLX 读取根目录的环境变量（`omlx/settings.py` 的 `resolve_default_base_path`）。
 pub const BASE_PATH_ENV: &str = "OMLX_BASE_PATH";
-/// oMLX.app 的 base-path 引导文件，相对家目录。
-pub const BASE_PATH_BOOTSTRAP: &str = "Library/Application Support/oMLX/base-path";
-const BASE_PATH_MAX_FILE_BYTES: u64 = 4096;
-const BASE_PATH_MAX_BYTES: usize = 1024;
+/// iDoris 自己的 oMLX base 在状态目录下的目录名：`<状态目录>/omlx-base`（[`base_path_in`]）。
+pub const BASE_DIR_NAME: &str = "omlx-base";
 
-/// 一份配置好的 oMLX 引擎定义（配方）。
+/// 一份配置好的 oMLX 引擎定义（配方）。拉起前要用 [`OmlxRecipe::with_base_path`] 配上 iDoris 自己的 base。
 #[derive(Debug, Clone)]
 pub struct OmlxRecipe {
     home: Option<PathBuf>,
@@ -78,7 +94,7 @@ impl Default for OmlxRecipe {
 }
 
 impl OmlxRecipe {
-    /// 设计稿 §2.7.3 的缺省：系统级的 `oMLX.app`，签名检查开，不查 PATH，不传模型目录。
+    /// 设计稿 §2.7.3 的缺省：系统级的 `oMLX.app`，签名检查开，不查 PATH，不传模型目录；没有 base（拉起前要配）。
     pub fn new() -> Self {
         Self {
             home: None,
@@ -107,17 +123,69 @@ impl OmlxRecipe {
         self
     }
 
-    /// 显式的 `--model-dir`（绝对路径）；缺省不传。
+    /// 显式的 `--model-dir`（绝对路径）；缺省不传，引擎用 iDoris 自己 base 下的 `models`（起初是空的）。
+    /// 要共用用户已有的模型，传用户的模型目录。
     pub fn with_model_dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.model_dir = Some(dir.into());
         self
     }
 
-    /// `OMLX_BASE_PATH`（绝对路径）；缺省不传。宿主上有 oMLX.app 的引导文件时用 [`bootstrap_base_path`] 取。
+    /// iDoris 自己的 oMLX base（`OMLX_BASE_PATH`，绝对路径；约定 [`base_path_in`]，用 [`prepare_base_dir`] 建好）。
+    /// 没配、或磁盘上的目录核对不过，[`OmlxRecipe::launch_plan`] 拒绝。同一状态目录下的两个 oMLX 实例各配各的，
+    /// 共用会互相覆盖 `settings.json`。
     pub fn with_base_path(mut self, dir: impl Into<PathBuf>) -> Self {
         self.base_path = Some(dir.into());
         self
     }
+}
+
+/// iDoris 自己的 oMLX base：`<状态目录>/omlx-base`（[`BASE_DIR_NAME`]）。只算路径，不碰磁盘。
+pub fn base_path_in(state_dir: &Path) -> PathBuf {
+    state_dir.join(BASE_DIR_NAME)
+}
+
+/// 建或核对 iDoris 自己的 oMLX base 失败。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum BaseDirError {
+    /// 路径不是绝对路径。
+    #[error("the oMLX base directory path is not absolute")]
+    NotAbsolute,
+    /// 路径上的东西不合格，不碰它：不是当前用户自己的真目录（符号链接、别人的目录），或组和其他人有权限
+    /// （拉起时的核对；[`prepare_base_dir`] 会先把自己的目录收紧）。
+    #[error("the oMLX base directory is a symlink, someone else's, or open to other users")]
+    Insecure,
+    /// 读不了或建不了（路径上是个普通文件时是 `AlreadyExists`）。
+    #[error("cannot create or inspect the oMLX base directory: {0:?}")]
+    Io(std::io::ErrorKind),
+}
+
+/// 磁盘上的 base 合格：当前用户（`uid`）自己的真目录（`meta` 来自 `symlink_metadata`，符号链接不是目录），
+/// 组和其他人没有任何权限（0700 或更严）。
+fn base_dir_is_private(meta: &std::fs::Metadata, uid: u32) -> bool {
+    meta.file_type().is_dir() && meta.uid() == uid && meta.permissions().mode() & 0o077 == 0
+}
+
+/// 只读地核对磁盘上的 base：不存在、读不了、不合格都是错误。
+fn check_base_dir(dir: &Path) -> Result<(), BaseDirError> {
+    let meta = std::fs::symlink_metadata(dir).map_err(|error| BaseDirError::Io(error.kind()))?;
+    if base_dir_is_private(&meta, effective_uid()) {
+        Ok(())
+    } else {
+        Err(BaseDirError::Insecure)
+    }
+}
+
+/// 建好 iDoris 自己的 oMLX base：不存在就建成 0700（缺的上级一并建）；已存在的要是当前用户自己的真目录（符号链接、别人的
+/// 目录、不是目录的拒绝，不碰），比 0700 宽的收紧到 0700，与记录目录、日志目录一样。oMLX 自己建的 base 权限跟着 umask，
+/// 所以由 iDoris 先建。每次拉起前调一次：`prepare_base_dir` → [`crate::engine::EngineLaunch::new`]（核对）→ [`crate::engine::OwnedEngine::spawn`]。
+pub fn prepare_base_dir(dir: &Path) -> Result<(), BaseDirError> {
+    if !dir.is_absolute() {
+        return Err(BaseDirError::NotAbsolute);
+    }
+    ensure_private_dir(dir).map_err(|error| match error {
+        DirError::Io(kind) => BaseDirError::Io(kind),
+        DirError::Insecure => BaseDirError::Insecure,
+    })
 }
 
 const BYTES_PER_GIB: u64 = 1 << 30;
@@ -155,11 +223,12 @@ impl EngineRecipe for OmlxRecipe {
         {
             return Err(LaunchError::Invalid("model_dir"));
         }
-        if self
-            .base_path
-            .as_deref()
-            .is_some_and(|dir| !dir.is_absolute())
-        {
+        // oMLX 会把命令行参数落盘到 base（模块文档）：base 要是 iDoris 自己的、配好的、磁盘上核对过的；
+        // 没配就拒绝，不让引擎自己去找（`~/.omlx`、oMLX.app 的引导文件）。
+        let Some(base_path) = self.base_path.as_deref() else {
+            return Err(LaunchError::Invalid("base_path"));
+        };
+        if !base_path.is_absolute() || check_base_dir(base_path).is_err() {
             return Err(LaunchError::Invalid("base_path"));
         }
 
@@ -171,8 +240,9 @@ impl EngineRecipe for OmlxRecipe {
             input.port.to_string().into(),
         ];
         if let Some(budget) = input.allocated_budget_bytes {
-            // 整数 GiB 的粒度下，不足 1 GiB 的额度没有不超过额度的值可传：不传会让 oMLX 用它自己的缺省，传 0 的含义
-            // 没有实测。按「额度为 0 不拉起」的同一精神拒绝，复用原因码 `budget_zero`，不新增原因码。
+            // 整数 GiB 的粒度下，不足 1 GiB 的额度取整得 0，oMLX 不接受 0（`--memory-guard-gb` 要正数）；
+            // 不传则 oMLX 用它自己的缺省档位，可能超过额度。按「额度为 0 不拉起」的同一精神拒绝，
+            // 复用原因码 `budget_zero`，不新增原因码。
             let Some(gib) = memory_guard_gib(budget) else {
                 return Err(LaunchError::BudgetZero);
             };
@@ -188,12 +258,10 @@ impl EngineRecipe for OmlxRecipe {
         if let Some(key) = input.api_key {
             env.insert(OsString::from(API_KEY_ENV), OsString::from(key.expose()));
         }
-        if let Some(base_path) = &self.base_path {
-            env.insert(
-                OsString::from(BASE_PATH_ENV),
-                base_path.as_os_str().to_owned(),
-            );
-        }
+        env.insert(
+            OsString::from(BASE_PATH_ENV),
+            base_path.as_os_str().to_owned(),
+        );
         Ok(LaunchPlan { args, env })
     }
 
@@ -211,44 +279,6 @@ impl EngineRecipe for OmlxRecipe {
         })
         .await
     }
-}
-
-/// oMLX.app 的 base-path 引导文件 `<home>/Library/Application Support/oMLX/base-path` 的内容，
-/// 用作引擎的 `OMLX_BASE_PATH`（设计稿 §2.7.3；`~/.omlx/bin/omlx` 包装脚本做的是同一件事）。
-///
-/// 只取第一行，去掉首尾空白；必须是非空的绝对路径、不含控制字符。文件不存在、读不了、不是普通文件
-/// （符号链接也不跟随）、超过 4 KiB、内容不合格，一律 `None`：不传 `OMLX_BASE_PATH`，
-/// 引擎自己会按它的规则（环境变量，再引导文件，再 `~/.omlx`）找。以 `~` 开头的路径同样不算：
-/// 那是引擎自己展开的写法，由它去读。
-pub fn bootstrap_base_path(home: &Path) -> Option<PathBuf> {
-    if !home.is_absolute() {
-        return None;
-    }
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
-        .open(home.join(BASE_PATH_BOOTSTRAP))
-        .ok()?;
-    let meta = file.metadata().ok()?;
-    let euid = rustix::process::geteuid().as_raw();
-    if !meta.file_type().is_file()
-        || meta.len() > BASE_PATH_MAX_FILE_BYTES
-        || (meta.uid() != euid && meta.uid() != 0)
-    {
-        return None;
-    }
-    let mut bytes = Vec::new();
-    file.take(BASE_PATH_MAX_FILE_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .ok()?;
-    let text = String::from_utf8(bytes).ok()?;
-    let line = text.lines().next()?.trim();
-    let path = PathBuf::from(line);
-    (!line.is_empty()
-        && line.len() <= BASE_PATH_MAX_BYTES
-        && !line.chars().any(char::is_control)
-        && path.is_absolute())
-    .then_some(path)
 }
 
 #[cfg(test)]
@@ -301,6 +331,41 @@ mod tests {
             .collect()
     }
 
+    /// 一个准备好的、iDoris 自己的 base：`<临时状态目录>/omlx-base`，0700。
+    struct Base {
+        state: tempfile::TempDir,
+    }
+
+    impl Base {
+        fn new() -> Self {
+            let state = tempfile::tempdir().unwrap();
+            prepare_base_dir(&base_path_in(state.path())).unwrap();
+            Self { state }
+        }
+
+        fn path(&self) -> PathBuf {
+            base_path_in(self.state.path())
+        }
+
+        /// 配好这个 base 的配方。
+        fn recipe(&self) -> OmlxRecipe {
+            OmlxRecipe::new().with_base_path(self.path())
+        }
+    }
+
+    fn mode(path: &Path) -> u32 {
+        std::fs::symlink_metadata(path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777
+    }
+
+    /// 拉起这份配方，期望被拒绝。
+    fn refused(engine: OmlxRecipe) -> LaunchError {
+        EngineLaunch::new(&instance(engine), spec(), env(&[])).unwrap_err()
+    }
+
     #[test]
     fn the_kind_is_the_specs_reserved_name_omlx() {
         let kind = OmlxRecipe::new().kind();
@@ -314,7 +379,8 @@ mod tests {
 
     #[test]
     fn the_default_argv_is_exactly_the_design_form() {
-        let l = launch(OmlxRecipe::new(), spec());
+        let base = Base::new();
+        let l = launch(base.recipe(), spec());
         assert_eq!(
             argv(&l),
             ["serve", "--host", "127.0.0.1", "--port", "19731"]
@@ -336,13 +402,14 @@ mod tests {
     #[test]
     fn memory_guard_is_whole_gibibytes_rounded_down() {
         const GIB: u64 = 1 << 30;
+        let base = Base::new();
         let guard = |bytes: u64| {
             let mut s = spec();
             s.allocated_budget_bytes = Some(bytes);
-            argv(&launch(OmlxRecipe::new(), s))
+            argv(&launch(base.recipe(), s))
         };
         assert_eq!(
-            argv(&launch(OmlxRecipe::new(), spec())).len(),
+            argv(&launch(base.recipe(), spec())).len(),
             5,
             "no budget set: no flag"
         );
@@ -352,8 +419,9 @@ mod tests {
         assert_eq!(guard(16 * GIB)[5..], ["--memory-guard-gb", "16"]);
         assert_eq!(guard(16 * GIB - 1)[5..], ["--memory-guard-gb", "15"]);
         assert_eq!(guard(16 * GIB + 1)[5..], ["--memory-guard-gb", "16"]);
-        // The point of the unit choice: whatever oMLX takes the number for (GiB or decimal GB),
-        // the limit it is given does not exceed the budget.
+        // oMLX 0.6.4 reads the number as GiB (static reading of its source; it was not run). The
+        // check also holds for the decimal reading, so a version that changed the unit would still
+        // not be handed a limit above the budget.
         for budget in [
             GIB,
             GIB + 1,
@@ -378,19 +446,21 @@ mod tests {
     #[test]
     fn a_budget_below_one_gibibyte_is_refused_like_zero() {
         const GIB: u64 = 1 << 30;
-        // Below one whole GiB there is no integer that stays within the budget: leaving the flag
-        // out keeps oMLX's own default, and what 0 means was not tried. Same reason code as a
-        // zero budget (which the generic layer refuses before oMLX is asked).
+        // Below one whole GiB the integer is 0, and oMLX does not accept 0 (`--memory-guard-gb`
+        // takes a positive number); leaving the flag out keeps oMLX's own default tier, which may
+        // exceed the budget. Same reason code as a zero budget (which the generic layer refuses
+        // before oMLX is asked).
+        let base = Base::new();
         for bytes in [1, 999_999_999, 1_000_000_000, GIB - 1] {
             let mut s = spec();
             s.allocated_budget_bytes = Some(bytes);
-            let error = EngineLaunch::new(&instance(OmlxRecipe::new()), s, env(&[])).unwrap_err();
+            let error = EngineLaunch::new(&instance(base.recipe()), s, env(&[])).unwrap_err();
             assert_eq!(error, LaunchError::BudgetZero, "{bytes}");
             assert_eq!(error.reason_code(), "budget_zero");
         }
         let mut s = spec();
         s.allocated_budget_bytes = Some(GIB);
-        assert!(EngineLaunch::new(&instance(OmlxRecipe::new()), s, env(&[])).is_ok());
+        assert!(EngineLaunch::new(&instance(base.recipe()), s, env(&[])).is_ok());
     }
 
     #[test]
@@ -402,20 +472,137 @@ mod tests {
     }
 
     #[test]
-    fn model_dir_and_base_path_are_passed_only_when_configured() {
-        let l = launch(OmlxRecipe::new().with_model_dir("/Volumes/models"), spec());
-        assert_eq!(argv(&l)[5..], ["--model-dir", "/Volumes/models"]);
-        assert!(!l.env().contains_key(OsStr::new(BASE_PATH_ENV)));
+    fn the_model_dir_is_passed_only_when_configured() {
+        let base = Base::new();
+        let l = launch(base.recipe(), spec());
+        assert_eq!(argv(&l).len(), 5, "no model dir configured: no flag");
 
-        let l = launch(
-            OmlxRecipe::new().with_base_path("/Volumes/omlx-base"),
-            spec(),
-        );
+        let l = launch(base.recipe().with_model_dir("/Volumes/models"), spec());
+        assert_eq!(argv(&l)[5..], ["--model-dir", "/Volumes/models"]);
+    }
+
+    // ---- base directory: oMLX writes the command-line settings into it ----
+
+    #[test]
+    fn the_default_plan_carries_idoris_own_base_path() {
+        // 配的是状态目录下准备好的专用目录；父进程环境里的 `OMLX_BASE_PATH` 与 `HOME` 指向用户自己的 oMLX，
+        // 引擎拿到的 `OMLX_BASE_PATH` 仍然是 iDoris 自己的那个。
+        let base = Base::new();
+        let engine =
+            EngineInstance::new(Arc::new(base.recipe()), base.state.path(), 19731).unwrap();
+        let parent = env(&[("HOME", "/Users/x"), ("OMLX_BASE_PATH", "/Users/x/.omlx")]);
+        let l = EngineLaunch::new(&engine, spec(), parent).unwrap();
+        let seen = Path::new(l.env().get(OsStr::new(BASE_PATH_ENV)).unwrap());
+        assert_eq!(seen, base.state.path().join(BASE_DIR_NAME));
+        assert_eq!(seen.parent(), Some(l.working_dir()), "under the state dir");
+        assert_eq!(mode(seen), 0o700);
+    }
+
+    #[test]
+    fn an_unconfigured_base_is_refused_not_inherited() {
+        // 没配 base，oMLX 会自己按环境变量、oMLX.app 的引导文件、`~/.omlx` 去找，再把命令行设置写进去：
+        // 所以不拉起。用户的引导文件与 `OMLX_BASE_PATH` 哪怕指向一个完全合格的私有目录，也不能顶替。
+        let user_home = tempfile::tempdir().unwrap();
+        let users_base = tempfile::tempdir().unwrap();
+        let bootstrap = user_home
+            .path()
+            .join("Library/Application Support/oMLX/base-path");
+        std::fs::create_dir_all(bootstrap.parent().unwrap()).unwrap();
+        std::fs::write(&bootstrap, users_base.path().to_str().unwrap()).unwrap();
+        let parent = env(&[
+            ("HOME", user_home.path().to_str().unwrap()),
+            ("OMLX_BASE_PATH", users_base.path().to_str().unwrap()),
+        ]);
+        let recipe = OmlxRecipe::new().with_home(user_home.path());
+        let error = EngineLaunch::new(&instance(recipe), spec(), parent).unwrap_err();
+        assert_eq!(error, LaunchError::Invalid("base_path"));
+        assert_eq!(error.reason_code(), "base_unavailable");
+    }
+
+    #[test]
+    fn a_missing_base_is_refused_until_it_is_prepared() {
+        let state = tempfile::tempdir().unwrap();
+        let base = base_path_in(state.path());
+        let recipe = || OmlxRecipe::new().with_base_path(&base);
+        assert_eq!(refused(recipe()), LaunchError::Invalid("base_path"));
+        prepare_base_dir(&base).unwrap();
+        assert!(EngineLaunch::new(&instance(recipe()), spec(), env(&[])).is_ok());
+    }
+
+    #[test]
+    fn a_symlinked_base_is_refused_even_when_it_points_at_a_private_directory() {
+        // oMLX 用 `Path.resolve()` 解析 `OMLX_BASE_PATH`，会跟着符号链接走：链接指到哪，设置就写到哪。
+        let state = tempfile::tempdir().unwrap();
+        let real = state.path().join("real");
+        prepare_base_dir(&real).unwrap();
+        let link = base_path_in(state.path());
+        symlink(&real, &link).unwrap();
         assert_eq!(
-            l.env().get(OsStr::new(BASE_PATH_ENV)).unwrap(),
-            "/Volumes/omlx-base"
+            refused(OmlxRecipe::new().with_base_path(&link)),
+            LaunchError::Invalid("base_path")
         );
-        assert_eq!(argv(&l).len(), 5);
+        // 对照：链接指向的那个目录本身没问题。
+        let recipe = OmlxRecipe::new().with_base_path(&real);
+        assert!(EngineLaunch::new(&instance(recipe), spec(), env(&[])).is_ok());
+    }
+
+    #[test]
+    fn a_base_open_to_group_or_others_is_refused() {
+        let base = Base::new();
+        let chmod = |bits: u32| {
+            std::fs::set_permissions(base.path(), std::fs::Permissions::from_mode(bits)).unwrap();
+        };
+        // 组与其他人的每一位都单独试：掩码少一位，就有一个放过去。
+        for open in [
+            0o710, 0o740, 0o720, 0o701, 0o704, 0o702, 0o770, 0o707, 0o755, 0o777,
+        ] {
+            chmod(open);
+            assert_eq!(
+                refused(base.recipe()),
+                LaunchError::Invalid("base_path"),
+                "{open:o}"
+            );
+        }
+        chmod(0o700);
+        assert!(EngineLaunch::new(&instance(base.recipe()), spec(), env(&[])).is_ok());
+    }
+
+    #[test]
+    fn a_base_that_is_not_a_directory_is_refused() {
+        // 普通文件，权限 0600、属主是自己：能拒绝它的是「是不是目录」这一道核对。
+        let state = tempfile::tempdir().unwrap();
+        let file = base_path_in(state.path());
+        std::fs::write(&file, b"").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            refused(OmlxRecipe::new().with_base_path(&file)),
+            LaunchError::Invalid("base_path")
+        );
+    }
+
+    #[test]
+    fn a_base_owned_by_someone_else_is_not_private() {
+        // 测试进程不是 root，造不出别人的目录：把「当前用户」换成另一个 uid，去判同一个目录。
+        let base = Base::new();
+        let meta = std::fs::symlink_metadata(base.path()).unwrap();
+        let me = effective_uid();
+        assert!(base_dir_is_private(&meta, me));
+        assert!(!base_dir_is_private(&meta, me.wrapping_add(1)));
+    }
+
+    #[test]
+    fn a_relative_base_is_refused_even_when_it_names_a_private_directory() {
+        // 相对路径按进程的当前目录解释，换个目录就指到别处。这里造一个从当前目录出发、落在准备好的 base 上的
+        // 相对路径：磁盘上的核对本身会通过，能拒绝它的是「是不是绝对路径」这一道。
+        let base = Base::new();
+        let up: PathBuf = std::iter::repeat_n("..", 64).collect();
+        let relative = up.join(base.path().strip_prefix("/").unwrap());
+        assert!(!relative.is_absolute());
+        assert_eq!(check_base_dir(&relative), Ok(()));
+        assert_eq!(
+            refused(OmlxRecipe::new().with_base_path(&relative)),
+            LaunchError::Invalid("base_path")
+        );
     }
 
     #[test]
@@ -435,7 +622,8 @@ mod tests {
 
     #[test]
     fn the_key_goes_to_the_environment_never_to_argv() {
-        let l = launch(OmlxRecipe::new(), spec());
+        let base = Base::new();
+        let l = launch(base.recipe(), spec());
         let key = "ab".repeat(32);
         assert_eq!(l.env().get(OsStr::new(API_KEY_ENV)).unwrap(), key.as_str());
         assert!(l.args().iter().all(|a| !a.to_string_lossy().contains(&key)));
@@ -444,12 +632,12 @@ mod tests {
         // No key, no variable: an engine started without a private key has none to read.
         let mut s = spec();
         s.api_key = None;
-        let l = launch(OmlxRecipe::new(), s);
+        let l = launch(base.recipe(), s);
         assert!(!l.env().contains_key(OsStr::new(API_KEY_ENV)));
     }
 
     #[test]
-    fn the_environment_is_the_allowlist_plus_the_engine_key_and_nothing_else() {
+    fn the_environment_is_the_allowlist_plus_the_engine_key_and_base_and_nothing_else() {
         let parent = env(&[
             ("PATH", "/opt/homebrew/bin:/Users/x/bin"),
             ("HOME", "/Users/x"),
@@ -473,7 +661,8 @@ mod tests {
             ("DYLD_INSERT_LIBRARIES", "/evil.dylib"),
             ("LC_MESSAGES", "C"),
         ]);
-        let l = EngineLaunch::new(&instance(OmlxRecipe::new()), spec(), parent).unwrap();
+        let base = Base::new();
+        let l = EngineLaunch::new(&instance(base.recipe()), spec(), parent).unwrap();
         let seen: BTreeMap<String, String> = l
             .env()
             .iter()
@@ -493,6 +682,8 @@ mod tests {
             ("LC_CTYPE", "UTF-8"),
             ("TZ", "Asia/Bangkok"),
             ("OMLX_API_KEY", &"ab".repeat(32)),
+            // iDoris 自己的 base，不是父进程环境里那个（`/Users/x/elsewhere`）
+            ("OMLX_BASE_PATH", base.path().to_str().unwrap()),
         ]
         .into_iter()
         .map(|(k, v)| (k.to_owned(), v.to_owned()))
@@ -592,8 +783,8 @@ mod tests {
         assert_eq!(version.as_deref(), Ok("0.6.4"));
     }
 
-    /// The real tool against the real app, read-only: `codesign` hashes the bundle (about 5 s on
-    /// oMLX 0.6.4) and nothing of oMLX itself is executed. Not part of the default run.
+    /// The real tool against the real app; it writes nothing: `codesign` hashes the bundle (about
+    /// 5 s on oMLX 0.6.4) and nothing of oMLX itself is executed. Not part of the default run.
     /// `cargo test -p idoris-upstream --lib real_codesign -- --ignored`
     #[tokio::test]
     #[ignore = "runs the real codesign on the installed oMLX.app (about 5 s)"]
@@ -639,8 +830,11 @@ mod tests {
         }
     }
 
+    // 「`data` 数组」这个形状任何 OpenAI 兼容服务都满足：这里测的是什么样的应答算就绪、其余怎么归类，不证明对端
+    // 是 oMLX。端口上的进程是不是我们拉起的那个，由通用层的 pid 封印确认：见 tests/engine_lifecycle.rs 的
+    // `another_server_answering_on_the_port_is_not_mistaken_for_the_engine`。
     #[tokio::test]
-    async fn only_the_omlx_models_shape_counts_as_omlx() {
+    async fn only_a_models_list_reply_is_ready_and_other_replies_are_classified() {
         for template in [
             ResponseTemplate::new(200).set_body_string("<html>hello</html>"),
             ResponseTemplate::new(200).set_body_json(serde_json::json!({"models": []})),
@@ -675,75 +869,57 @@ mod tests {
         assert_eq!(probe_with(&server, None).await, EngineProbe::NotThisEngine);
     }
 
-    // ---- base path ----
-
-    fn home_with(content: &[u8]) -> tempfile::TempDir {
-        let home = tempfile::tempdir().unwrap();
-        let file = home.path().join(BASE_PATH_BOOTSTRAP);
-        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
-        std::fs::write(file, content).unwrap();
-        home
-    }
+    // ---- prepare_base_dir ----
 
     #[test]
-    fn the_bootstrap_files_first_line_is_the_base_path() {
-        for (content, expected) in [
-            (&b"/Volumes/omlx-base\n"[..], "/Volumes/omlx-base"),
-            (b"/Volumes/omlx-base", "/Volumes/omlx-base"),
-            (
-                b"  /Volumes/with space/base  \r\n",
-                "/Volumes/with space/base",
-            ),
-            (b"/first\n/second\n", "/first"),
-        ] {
-            let home = home_with(content);
-            assert_eq!(
-                bootstrap_base_path(home.path()),
-                Some(PathBuf::from(expected)),
-                "{content:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn anything_else_means_no_override() {
-        for content in [
-            &b""[..],
-            b"\n",
-            b"relative/base\n",
-            b"~/omlx\n",
-            b"\n/not-the-first-line\n",
-            b"/with\x07bell\n",
-            b"\xff\xfe/not-utf8\n",
-        ] {
-            let home = home_with(content);
-            assert_eq!(bootstrap_base_path(home.path()), None, "{content:?}");
-        }
-        let huge = vec![b'/'; BASE_PATH_MAX_FILE_BYTES as usize + 1];
-        assert_eq!(bootstrap_base_path(home_with(&huge).path()), None);
-        let long = format!("/{}", "a".repeat(BASE_PATH_MAX_BYTES));
-        assert_eq!(bootstrap_base_path(home_with(long.as_bytes()).path()), None);
-    }
-
-    #[test]
-    fn a_missing_symlinked_or_non_regular_file_is_no_override() {
-        let home = tempfile::tempdir().unwrap();
-        assert_eq!(bootstrap_base_path(home.path()), None, "missing");
+    fn prepare_builds_a_missing_base_private_and_tightens_a_wider_one() {
+        let state = tempfile::tempdir().unwrap();
+        // 不存在、上级也不存在：建成 0700。
+        let nested = state.path().join("a/b").join(BASE_DIR_NAME);
+        prepare_base_dir(&nested).unwrap();
+        assert_eq!(mode(&nested), 0o700);
+        assert_eq!(mode(&state.path().join("a")), 0o700, "created parents too");
         assert_eq!(
-            bootstrap_base_path(Path::new("relative")),
-            None,
-            "relative home"
+            mode(&state.path().join("a/b")),
+            0o700,
+            "created parents too"
         );
+        // 已存在而权限宽：收紧到 0700；再调一次没有变化。
+        let wide = state.path().join("wide");
+        std::fs::create_dir(&wide).unwrap();
+        std::fs::set_permissions(&wide, std::fs::Permissions::from_mode(0o755)).unwrap();
+        prepare_base_dir(&wide).unwrap();
+        assert_eq!(mode(&wide), 0o700);
+        prepare_base_dir(&wide).unwrap();
+        assert_eq!(mode(&wide), 0o700);
+        // 建好的目录过得了拉起时的核对。
+        assert_eq!(check_base_dir(&nested), Ok(()));
+        assert_eq!(check_base_dir(&wide), Ok(()));
+    }
 
-        let file = home.path().join(BASE_PATH_BOOTSTRAP);
-        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
-        let target = home.path().join("elsewhere");
-        std::fs::write(&target, b"/Volumes/omlx-base\n").unwrap();
-        symlink(&target, &file).unwrap();
-        assert_eq!(bootstrap_base_path(home.path()), None, "symlink");
-        std::fs::remove_file(&file).unwrap();
-        std::fs::create_dir(&file).unwrap();
-        assert_eq!(bootstrap_base_path(home.path()), None, "directory");
+    #[test]
+    fn prepare_leaves_alone_what_is_not_ours_to_touch() {
+        let state = tempfile::tempdir().unwrap();
+        // 符号链接：拒绝，也不去改它指向的目录。
+        let target = state.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let link = state.path().join("link");
+        symlink(&target, &link).unwrap();
+        assert_eq!(prepare_base_dir(&link), Err(BaseDirError::Insecure));
+        assert_eq!(mode(&target), 0o755, "the link's target is not touched");
+        // 路径上是个普通文件。
+        let file = state.path().join("file");
+        std::fs::write(&file, b"").unwrap();
+        assert_eq!(
+            prepare_base_dir(&file),
+            Err(BaseDirError::Io(std::io::ErrorKind::AlreadyExists))
+        );
+        // 相对路径：不建。
+        assert_eq!(
+            prepare_base_dir(Path::new("relative-omlx-base")),
+            Err(BaseDirError::NotAbsolute)
+        );
     }
 
     // ---- state ----
