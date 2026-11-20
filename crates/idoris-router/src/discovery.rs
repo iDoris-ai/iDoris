@@ -1234,8 +1234,9 @@ mod tests {
         target.publish(&stale).unwrap();
         let stale_bytes = std::fs::read(&path).unwrap();
 
+        // 旁路锁文件换成 FIFO（已经建好的先删掉；不假设发布一定建过它）。
         let lock_path = dir.join("idoris.json.lock");
-        std::fs::remove_file(&lock_path).unwrap();
+        let _ = std::fs::remove_file(&lock_path);
         nix::unistd::mkfifo(&lock_path, stat_mode(0o600)).unwrap();
 
         assert_eq!(
@@ -1273,10 +1274,12 @@ mod tests {
         stale.instance_id = stale_id.to_string();
         target.publish(&stale).unwrap();
 
-        // 消费者：持锁，读，比对出旧 instance_id。
+        // 消费者：持锁（锁文件没有就建，不依赖发布建过它），读，比对出旧 instance_id。
         let consumer = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
+            .create(true)
+            .truncate(false)
             .open(dir.join("idoris.json.lock"))
             .unwrap();
         consumer.lock().unwrap();
@@ -1340,6 +1343,8 @@ mod tests {
         let consumer = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
+            .create(true)
+            .truncate(false)
             .open(dir.join("idoris.json.lock"))
             .unwrap();
         consumer.lock().unwrap();
