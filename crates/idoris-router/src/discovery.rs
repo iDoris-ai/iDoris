@@ -1266,7 +1266,7 @@ mod tests {
     /// 「发布」与「消费者持锁清理」真正竞争（规范 §2.7.3、R12 已确认项 4：消费者清理陈旧文件时持同一把旁路锁，
     /// 持锁、读、比对出旧 `instance_id`、unlink）。新实例的发布必须等锁，拿到锁之后再复核目标、`renameat`：
     /// 于是消费者持锁期间做的 unlink 不会删掉新文件。如果发布不持锁，它会在消费者「读完、unlink 之前」把新文件
-    /// rename 进来，消费者的 unlink 就把新文件删了（这条测试里发布方会在消费者持锁期间提前完成，或最后文件不见了）。
+    /// rename 进来，消费者的 unlink 就把新文件删了（这条测试里表现为发布方在消费者持锁期间提前完成，测试因此失败）。
     #[test]
     fn a_publish_racing_a_consumer_that_holds_the_sidecar_lock_waits_for_it_and_is_not_undone() {
         let (_temp, dir) = private_dir();
@@ -1290,7 +1290,7 @@ mod tests {
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(seen["instance_id"], stale_id);
 
-        // 新实例开始发布。等锁时限给得很宽：很忙的机器上也不会因为等锁超时而误报。
+        // 新实例开始发布。等锁时限给得很宽（30 秒）：很忙的机器上也不太会因为等锁超时而误报。
         let (done_sender, done_receiver) = std::sync::mpsc::channel();
         let publisher = {
             let target = target.clone();

@@ -830,8 +830,8 @@ async fn run(options: cli::ServeOptions) -> Result<(), String> {
     Ok(())
 }
 
-/// 退出时删发现文件：只在文件属于自己时删；删不掉（等旁路锁超时、IO 失败）只留一行日志，文件成为崩溃残留，
-/// 由下一个拿到实例锁的实例覆盖。日志不含路径与文件内容。
+/// 退出时删发现文件：只在文件属于自己时删；删不掉（旁路锁不可用或等锁超时、IO 失败）只留一行日志，文件成为崩溃残留，
+/// 由下一个拿到实例锁的实例覆盖。日志不含路径与文件内容（`launcher_discovery.rs` 里两条进程级测试逐字断言了这两行）。
 async fn remove_discovery_file(target: Arc<discovery::DiscoveryTarget>, instance_id: String) {
     let outcome = tokio::task::spawn_blocking(move || target.remove_if_owner(&instance_id)).await;
     match outcome {
