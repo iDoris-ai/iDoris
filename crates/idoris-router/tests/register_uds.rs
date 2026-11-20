@@ -1082,9 +1082,14 @@ async fn a_malformed_frame_in_a_session_gets_bad_frame_and_a_reconnect() {
     at_limit.extend(std::iter::repeat_n(b'p', pad));
     at_limit.extend_from_slice(b"\"}\n");
     assert_eq!(at_limit.len(), 16_384);
+    // 比上限多 1 字节（含 LF 共 16385）的合规 JSON 帧：超长，必须按 bad_frame 拒绝。
+    let mut one_over = at_limit.clone();
+    one_over.insert(one_over.len() - 3, b'p');
+    assert_eq!(one_over.len(), 16_385);
 
     let bad: Vec<(&str, Vec<u8>)> = vec![
         ("an oversized frame", oversized),
+        ("a well-formed frame one byte over the limit", one_over),
         (
             "a frame without any LF within 16384 bytes",
             vec![b'y'; 20_000],
