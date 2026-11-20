@@ -1698,8 +1698,8 @@ async fn an_instance_conflict_that_arrives_before_register_is_not_a_reason_to_ex
 }
 
 /// 收到 `instance_conflict` 之后不再自愈重写发现文件（规范 §2.7.3、§2.10.4）：自愈在冲突的那一刻立即停止，
-/// 即使停止流程（排空等）还要很久。做法：一个后台线程不停地删文件，保证每一轮自愈都有东西可写；
-/// 冲突之前自愈在重写（对照），冲突之后重写次数不再增加。
+/// 即使停止流程（排空等）还要很久。做法：冲突之前自愈在工作（对照：删掉的文件会被写回）；冲突之后（等在途的那一次
+/// 重写落地）再删一次文件，自愈每 20ms 一轮，之后再也不会把它写回来。
 #[tokio::test]
 async fn instance_conflict_stops_the_discovery_self_heal_for_good() {
     let rig = Rig::new();
@@ -1707,6 +1707,7 @@ async fn instance_conflict_stops_the_discovery_self_heal_for_good() {
     let (target, record) = discovery_for(&rig);
     target.publish(&record).unwrap();
     let path = rig.dir_path.join("idoris.json");
+    let original = fs::read(&path).unwrap();
     let registration = rig.start_with(StartOptions {
         discovery: Some(SelfHeal {
             target: target.clone(),
@@ -1717,33 +1718,9 @@ async fn instance_conflict_stops_the_discovery_self_heal_for_good() {
             ..fast()
         })
     });
-    let rewrites = {
-        let logs = rig.logs.clone();
-        move || {
-            logs.lines()
-                .iter()
-                .filter(|line| line.contains("已按原子发布重写"))
-                .count()
-        }
-    };
-
-    // 后台不停地删发现文件（直到 `stop`）：只要自愈还在跑，就会不断重写。
-    let stop = Arc::new(AtomicUsize::new(0));
-    let deleter = {
-        let (path, stop) = (path.clone(), stop.clone());
-        std::thread::spawn(move || {
-            while stop.load(Ordering::SeqCst) == 0 {
-                let _ = fs::remove_file(&path);
-                std::thread::sleep(ms(3));
-            }
-        })
-    };
-    wait_until(
-        "the self-heal to rewrite the deleted file at least three times",
-        secs(20),
-        || rewrites() >= 3,
-    )
-    .await;
+    // 对照：冲突之前自愈在工作。
+    fs::remove_file(&path).unwrap();
+    wait_for_file(&path, &original).await;
 
     // 握手走到 register，然后冲突。
     let mut peer = server.accept().await;
@@ -1757,18 +1734,80 @@ async fn instance_conflict_stops_the_discovery_self_heal_for_good() {
             .unwrap(),
         StopCause::InstanceConflict
     );
-    // 给已经在途的那一次重写一点时间落地，然后取基线。
+    // 给已经在途的那一次重写（如果有）一点时间落地，再删文件。
     tokio::time::sleep(ms(150)).await;
-    let baseline = rewrites();
+    let _ = fs::remove_file(&path);
     tokio::time::sleep(ms(700)).await;
-    assert_eq!(
-        rewrites(),
-        baseline,
+    assert!(
+        !path.exists(),
         "the self-heal must not rewrite the file after instance_conflict (it ticks every 20 ms)"
     );
+    registration.finish().await;
+}
+
+/// 日志不刷屏：一次误删只记一行；两个实例共用一个路径、各自的自愈互相覆盖（这里用一个后台线程不停地删文件来模拟）时，
+/// 连续的重写只记第 1、10、20… 次。
+#[tokio::test]
+async fn repeated_self_heal_rewrites_are_logged_for_the_first_and_every_tenth_time_only() {
+    let rig = Rig::new();
+    let (target, record) = discovery_for(&rig);
+    target.publish(&record).unwrap();
+    let path = rig.dir_path.join("idoris.json");
+    let registration = rig.start_with(StartOptions {
+        with_socket: false,
+        discovery: Some(SelfHeal {
+            target: target.clone(),
+            record: record.clone(),
+        }),
+        ..StartOptions::new(Timings {
+            self_heal_interval: ms(5),
+            ..fast()
+        })
+    });
+    let stop = Arc::new(AtomicUsize::new(0));
+    let deleter = {
+        let (path, stop) = (path.clone(), stop.clone());
+        std::thread::spawn(move || {
+            while stop.load(Ordering::SeqCst) == 0 {
+                let _ = fs::remove_file(&path);
+                std::thread::sleep(ms(1));
+            }
+        })
+    };
+    let rewrite_lines = {
+        let logs = rig.logs.clone();
+        move || {
+            logs.lines()
+                .into_iter()
+                .filter(|line| line.contains("已按原子发布重写"))
+                .collect::<Vec<_>>()
+        }
+    };
+    wait_until("ten consecutive rewrites to be logged", secs(60), || {
+        rewrite_lines()
+            .iter()
+            .any(|line| line.contains("连续第 10 次"))
+    })
+    .await;
     stop.store(1, Ordering::SeqCst);
     deleter.join().unwrap();
     registration.finish().await;
+
+    let lines = rewrite_lines();
+    // 第一行没有次数，之后每一行的次数都是 10 的倍数。
+    assert!(!lines[0].contains("连续第"), "{lines:?}");
+    for line in &lines[1..] {
+        let number: u64 = line
+            .split("连续第 ")
+            .nth(1)
+            .and_then(|rest| rest.split(' ').next())
+            .and_then(|number| number.parse().ok())
+            .unwrap_or_else(|| panic!("a repeated rewrite line without a count: {line}"));
+        assert!(number.is_multiple_of(10), "{lines:?}");
+    }
+    // 路径与 nonce 不在日志里。
+    rig.logs
+        .assert_no_secret(&[rig.nonce_hex.as_str(), "idoris.json"]);
 }
 
 fn discovery_for(rig: &Rig) -> (Arc<DiscoveryTarget>, Arc<DiscoveryRecord>) {

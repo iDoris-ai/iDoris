@@ -413,8 +413,8 @@ fn the_error_code_table_maps_to_the_specified_waits() {
 }
 
 #[test]
-fn failure_logging_is_throttled_to_the_first_and_every_tenth_failure() {
-    let logged: Vec<u64> = (0..=35).filter(|n| should_log_failure(*n)).collect();
+fn repeated_events_are_logged_only_for_the_first_and_every_tenth_occurrence() {
+    let logged: Vec<u64> = (0..=35).filter(|n| should_log_repeat(*n)).collect();
     assert_eq!(logged, [1, 10, 20, 30]);
 }
 
@@ -425,6 +425,10 @@ fn stop_causes_map_to_exit_codes_and_stop_on_exit_never_only_counts_for_exit_0()
     assert_eq!(StopCause::OrphanTimeout.exit_code(), 4);
     assert_eq!(EXIT_INSTANCE_CONFLICT, 3);
     assert_eq!(EXIT_ORPHAN_TIMEOUT, 4);
+    // `bye` 只在信号停止时发：孤儿超时与 `instance_conflict` 都发生在没有已 ack 的会话时。
+    assert!(StopCause::Signal.says_bye());
+    assert!(!StopCause::InstanceConflict.says_bye());
+    assert!(!StopCause::OrphanTimeout.says_bye());
     // 规范 §2.7.5：`never` 只对退出码 0 有效；退出码 4、因 `instance_conflict` 退出的 3 一律停自己拉起的引擎。
     assert!(StopCause::Signal.stops_owned_engines(StopOnExit::Owned));
     assert!(!StopCause::Signal.stops_owned_engines(StopOnExit::Never));

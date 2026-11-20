@@ -83,6 +83,16 @@ impl StopCause {
         }
     }
 
+    /// 停止时要不要在已建立的登记会话上发 `bye`（规范 §2.10.8：优雅停止时尽力发，让 agent24d 区分「预期停止」与「崩溃」）。
+    /// 孤儿超时与 `instance_conflict` 都发生在**没有已 `ack` 的会话**时，没有会话可发；信号停止发。
+    /// 以后的「自有引擎失效，退出码 5」（S5）是优雅停止、会话还在，规范明确列在发 `bye` 的路径里：那个原因在这里返回 `true`。
+    pub fn says_bye(self) -> bool {
+        match self {
+            Self::Signal => true,
+            Self::InstanceConflict | Self::OrphanTimeout => false,
+        }
+    }
+
     /// 停止时要不要停掉**自己拉起**的引擎（规范 §2.7.5）：`engine.stop_on_exit:"never"` **只对退出码 0 有效**
     /// （正常停止，升级重启时保留引擎给下一个 iDoris 接管）；孤儿超时（4）、因 `instance_conflict` 退出的 3
     /// （以及以后的 5）一律停，否则会留下没有任何管理者的引擎，正是孤儿策略要避免的「孤儿占内存」。
@@ -762,8 +772,9 @@ pub fn stderr_log() -> LogSink {
     Arc::new(|line| eprintln!("{line}"))
 }
 
-/// 登记失败日志的节流（规范 §2.10.7「日志」：只记状态变化，以及首次失败和之后每第 10 次失败，不刷屏）。
-pub fn should_log_failure(consecutive: u64) -> bool {
+/// 重复发生的事情的日志节流（规范 §2.10.7「日志」：只记状态变化，以及首次失败和之后每第 10 次失败，不刷屏）：
+/// 连续第 1、10、20、30… 次才记。登记失败与发现文件的连续重写都用它。
+pub fn should_log_repeat(consecutive: u64) -> bool {
     consecutive == 1 || (consecutive > 0 && consecutive.is_multiple_of(10))
 }
 
@@ -781,7 +792,8 @@ pub struct SelfHeal {
 pub struct RegistrationConfig {
     /// launcher 帧的 `register_socket`；没有就不登记（但发现文件自愈照常）。
     pub socket: Option<PathBuf>,
-    /// launcher 帧的 `orphan_timeout_s`（非 0）；没有就不因「无登记会话」退出。
+    /// launcher 帧的 `orphan_timeout_s`（非 0）；没有就不因「无登记会话」退出。孤儿计时跟着登记客户端走，
+    /// 所以没有 `socket` 时不起作用（帧校验保证 `orphan_timeout_s` 非 0 则 `register_socket` 必填）。
     pub orphan_timeout: Option<Duration>,
     pub identity: Identity,
     pub nonce: InstanceNonce,
@@ -922,7 +934,7 @@ impl Registration {
     /// 已建立的会话上尽力发 `bye`（至多 0.5 秒，与 HTTP 排空并行），其余原因（没有已 `ack` 的会话）不发。
     pub fn begin_stop(&self, cause: StopCause) {
         self.inner.heal_cancel.cancel();
-        let mode = if cause == StopCause::Signal {
+        let mode = if cause.says_bye() {
             StopMode::Bye
         } else {
             StopMode::Silent
@@ -988,6 +1000,9 @@ async fn run_self_heal(
         }
     }
     let mut failures: u64 = 0;
+    // 连续被重写的次数：核对到完好的文件就清零。一次误删只记一行；两个实例共用一个路径、各自的自愈互相覆盖时，
+    // 每 10 秒都会重写一次，这时只记第 1、10、20… 次，不刷屏。
+    let mut rewrites: u64 = 0;
     loop {
         tokio::select! {
             _ = cancel.cancelled() => return,
@@ -1001,14 +1016,24 @@ async fn run_self_heal(
         // 删除发现文件才不会和它赛跑）。
         let outcome = tokio::task::spawn_blocking(move || heal_once(&target, &record)).await;
         match outcome {
-            Ok(HealOutcome::Intact) => failures = 0,
+            Ok(HealOutcome::Intact) => {
+                failures = 0;
+                rewrites = 0;
+            }
             Ok(HealOutcome::Rewritten) => {
                 failures = 0;
-                log("[idoris] 发现文件被删除或改动，已按原子发布重写");
+                rewrites += 1;
+                if rewrites == 1 {
+                    log("[idoris] 发现文件被删除或改动，已按原子发布重写");
+                } else if should_log_repeat(rewrites) {
+                    log(&format!(
+                        "[idoris] 发现文件被删除或改动，已按原子发布重写（连续第 {rewrites} 次：有别的实例或进程在反复改动它）"
+                    ));
+                }
             }
             Ok(HealOutcome::Failed(error)) => {
                 failures += 1;
-                if should_log_failure(failures) {
+                if should_log_repeat(failures) {
                     log(&format!(
                         "[idoris] 发现文件自愈失败（{}，连续第 {failures} 次）；文件保持原样，下一轮再试",
                         error.code()
@@ -1017,7 +1042,7 @@ async fn run_self_heal(
             }
             Err(_) => {
                 failures += 1;
-                if should_log_failure(failures) {
+                if should_log_repeat(failures) {
                     log(&format!(
                         "[idoris] 发现文件自愈任务异常结束（连续第 {failures} 次）"
                     ));
@@ -1274,7 +1299,7 @@ mod client {
                 Event::AttemptFailed {
                     reason,
                     consecutive,
-                } if should_log_failure(*consecutive) => Some(format!(
+                } if should_log_repeat(*consecutive) => Some(format!(
                     "[idoris] 登记失败（{}，连续第 {consecutive} 次）；iDoris 继续服务，按退避重试",
                     reason.code()
                 )),
