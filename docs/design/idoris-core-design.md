@@ -118,7 +118,7 @@
 | Agent24 闸门 | iDoris 提案 | 需要 Agent24 做的 |
 |---|---|---|
 | ① 用 `LOCAL_PEERTOKEN` 与 codesign team 校验登记方，不看 pid | 保持标识符 `ai.idoris.cli` 与 Team `HYAP444FN9` 不变（`scripts/macos_signed_release.py:313`，规范 §2.7 下载行）；建议要求串 `identifier "ai.idoris.cli" and anchor apple generic and certificate leaf[subject.OU] = "HYAP444FN9"`。`register` 里的 `pid` 只供日志与交叉核对。iDoris 在收到 `challenge` 之前不写任何字节（配合 Agent24 R8 的入队检查）；UDS fd 是 close-on-exec（tokio 默认），不会被 oMLX 子进程继承。未签名的开发构建：iDoris 不提供绕过，由 Agent24 的开发开关处理 | 允许清单加 `ai.idoris.cli`；按安装路径核对可执行文件 |
-| ② 新 agent24d 没有旧 nonce 与 admin token | nonce：从发现文件读，登记时用 HMAC 证明，nonce 本身不上线（2.5）。admin token：会话内可轮换，`set_admin_token` 帧，旧 token 立即失效（2.5） | 接管后生成新 token，通过 `set_admin_token` 设给 iDoris，再交给 Electron main；确认 Electron main 能重新取 token（Q3） |
+| ② 新 agent24d 没有旧 nonce 与 admin token | nonce：从发现文件读，登记时用 HMAC 证明，nonce 本身不上线（2.5）。admin token：会话内可轮换，`set_admin_token` 帧，旧 token 立即失效（2.5） | 接管后生成新 token，通过 `set_admin_token` 设给 iDoris，再交给 Electron main；Agent24 已答复：Electron main 不持有 admin token（Q3） |
 | ③ 发现文件里的端口确实是登记进程在监听 | 登记帧带 `pid`、`data_port`、`admin_port`；Agent24 现有的 `listeners_owned`（按进程组核对 LISTEN 属主，`A24: …/agent24-idoris/src/supervisor.rs:764-802`）改成「`LOCAL_PEERTOKEN` 校验过的 pid 持有这两个端口」即可；`/health.instance_id` 与登记的 `instance_id` 一致作为第二道 | **不要带数据 key 调 `/health`**：它免鉴权，带上 key 反而可能把 key 发给占着端口的冒充者。key 只在上述核对全部通过之后才发 |
 
 ### 2.2 launcher stdin 帧 v2
@@ -236,7 +236,7 @@ macOS 上 `fsync` 不保证落盘到磁盘缓存，但这里不需要掉电后�
 - 由 Supervisor 管理的卡，状态要问 `RuntimeRegistry` 的 `status()`（`R/runtime.rs:209-217`），带 200 毫秒超时；`status()` 返回启动错误就报 `unavailable` 加 `reason:"startup_latched"`，不能因为 `/v1/models` 能通就报 `ready`（聊天实际是 503）。
 - resident 卡由探测器周期探测（`GET /v1/models`，带 `key.rs` 的 key，间隔 5 秒、2 秒超时）；401/403 报 `auth_required` 或 `auth_failed`。
 
-**两级就绪（需要 Agent24 同意，见 Q4）：** Agent24 现在的 `ready()` 等 `/health` 加端口属主加 Admin `status` 200，窗口 30 秒（`A24: …/supervisor.rs:606-693`、`Timings.ready`）。托管 oMLX 冷启动（Python 加 MLX 加载加扫描模型目录）可能超过 30 秒，因此「iDoris 进程可用」（`status=="ok"`、端口、Admin）和「模型可用」（`phase=="ready"`）必须分开：前者用现有 30 秒窗口，后者允许 `starting` 持续到引擎启动超时（默认 90 秒），界面显示「模型服务启动中」，而不是把 iDoris 判为失败并重启。
+**两级就绪（Agent24 已同意，见 Q4；chat 等待上限 120 秒，只在 starting / restarting 时等）：** Agent24 现在的 `ready()` 等 `/health` 加端口属主加 Admin `status` 200，窗口 30 秒（`A24: …/supervisor.rs:606-693`、`Timings.ready`）。托管 oMLX 冷启动（Python 加 MLX 加载加扫描模型目录）可能超过 30 秒，因此「iDoris 进程可用」（`status=="ok"`、端口、Admin）和「模型可用」（`phase=="ready"`）必须分开：前者用现有 30 秒窗口，后者允许 `starting` 持续到引擎启动超时（默认 90 秒），界面显示「模型服务启动中」，而不是把 iDoris 判为失败并重启。
 
 ### 2.5 登记协议 v1（iDoris 为客户端，agent24d 为服务端）
 
