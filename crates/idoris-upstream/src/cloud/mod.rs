@@ -44,6 +44,7 @@ pub use failure::CloudFailure;
 pub use sse::{SseError, SseEvent, SseParser};
 pub use usage::{RawUsage, UsageParse, parse_usage};
 pub use wire::{
-    BuildError, ChatCall, CompletionError, ParsedCompletion, RESERVED_EXTRA_BODY_FIELDS,
-    build_chat_body, parse_completion, reserved_extra_body_field,
+    ALLOWED_EXTRA_BODY_FIELDS, ALLOWED_EXTRA_BODY_PROVIDER_KEYS, BuildError, ChatCall,
+    CompletionError, ParsedCompletion, RESERVED_EXTRA_BODY_FIELDS, build_chat_body,
+    disallowed_extra_body_field, parse_completion,
 };

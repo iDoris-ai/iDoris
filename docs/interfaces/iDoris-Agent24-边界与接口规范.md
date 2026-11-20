@@ -1,6 +1,8 @@
 # iDoris × Agent24 分工边界与接口数据规范
 
-> **文档修订 1.4，2026-11-15**：owner 要求装了 oMLX 的机器首次启动时按硬件自动选默认 chat 模型，由 iDoris 负责推荐。新增 §2.9（本机 chat 模型推荐、本地模型类别与下载，拟议 wire 1.2.0，只新增），档位表由 owner 拍板，iDoris 与 Agent24 两个会话各确认一次。iDoris 侧接口尚未实现，实现发布前 §2.8 的 wire 1.1.0 仍是当前契约。
+> **文档修订 1.5，2026-11-19**：只改状态说法，不改契约内容。§2.9 中的推荐接口、本地模型列表和 oMLX 密钥顺序已在 iDoris v0.5.0 实现，wire 契约 1.2.0 随该版本生效；§2.9 的下载部分仍未实现，接口形状待另行修订。
+>
+> **文档修订 1.4，2026-11-15**：owner 要求装了 oMLX 的机器首次启动时按硬件自动选默认 chat 模型，由 iDoris 负责推荐。新增 §2.9（本机 chat 模型推荐、本地模型类别与下载，拟议 wire 1.2.0，只新增），档位表由 owner 拍板，iDoris 与 Agent24 两个会话各确认一次。iDoris 侧推荐、本地模型列表与密钥顺序已在 v0.5.0 实现（见修订 1.5）；下载部分仍未实现。
 >
 > **文档修订 1.3，2026-10-28**：owner 要求 Agent24 桌面端一站式「下载 → 运行 → 连接」iDoris，这定下了 R9 的 OD-1（launcher 宿主为 agent24d）和 OD-2（由用户在桌面端同意）。§2.1 第一条随之改写，新增 §2.7（launcher 托管契约，iDoris v0.4.0 起）与 §2.8（wire 契约 1.1.0）。已接受条款以正文为准。
 >
@@ -13,7 +15,7 @@
 
 | 标识 | 含义与基线 |
 |---|---|
-| 文档修订 `1.4` | 文字修订；不是服务 wire version。wire 契约版本见 §2.8；§2.9 拟议的 wire 1.2.0 在 iDoris 实现发布前不生效 |
+| 文档修订 `1.5` | 文字修订；不是服务 wire version。wire 契约版本见 §2.8；§2.9 的 wire 1.2.0 随 iDoris v0.5.0 生效（下载部分除外，尚未实现） |
 | iDoris release `v0.3.0` | 实现提交 `03c079c70611331a8c85a1666e32a75df6359d09`（下称 I0） |
 | runtime `contract_version=1.0.1` | I0 的 `crates/idoris-contracts/src/version.rs::CONTRACT_VERSION`；TS `packages/contracts/src/version.ts` 同值 |
 | Agent24 审计基线 | `6072fd373142eb3dbf1a6a4a3222e6eec82c74f6`（下称 A0，固定历史快照，非当前 main）；main 源码状态不等于 stable 已发给用户 |
@@ -171,7 +173,7 @@ agent24d 托管 iDoris 时，按下表执行。表中都是已冻结的接口，
 - 带了确认也放不下（超过整个额度）时，`error.type` 是 `local_only_unavailable`，`reason_code` 不是 `headroom_confirmation_required`，为终态，不应弹出确认。其它 503 按原规则处理。
 - `remediation` 是给人看的说明文字，不属于契约，不得用于匹配。
 
-### 2.9 本机 chat 模型推荐、本地模型类别与下载（wire 1.2.0，2026-11-15 双方确认；iDoris 侧待实现）
+### 2.9 本机 chat 模型推荐、本地模型类别与下载（wire 1.2.0，2026-11-15 双方确认；iDoris 侧推荐、列表与密钥顺序已在 v0.5.0 实现；下载待实现）
 
 只有新增，1.1.x 的调用方不受影响。本节落地前，§2.3「下载/预热的功能归属在 iDoris，但归属不表示已有下载服务」仍然成立。
 
@@ -238,6 +240,7 @@ agent24d 托管 iDoris 时，按下表执行。表中都是已冻结的接口，
 **oMLX 密钥**
 
 - 优先级：`IDORIS_OMLX_API_KEY`（§2.7，保持不变）→ `~/.omlx/settings.json` 的 `auth.api_key` → 无鉴权连接。
+- `settings.json` 的 key 只发给 loopback 的 oMLX（base URL 非 loopback 时视为没有）；文件必须是常规文件（符号链接不算），key 取 trim 后的值，含内部空白或控制字符视为没有。环境变量的 key 维持原行为。
 - 只从文件读取，不打印、不写日志、不进 argv 或响应体。不硬编码任何默认值（Agent24 侧同样不再假定默认 key）。
 - oMLX 开了鉴权而两处都没有 key 时，iDoris 按 401 处理并在 `remediation` 说明，不重试。
 
@@ -326,4 +329,4 @@ agent24d 托管 iDoris 时，按下表执行。表中都是已冻结的接口，
 | R8 | 2026-09-27 | Agent24 | 审阅 v1.1：无异议；建议 loopback 免 key 仅作为显式开发者选项，免 key 时视为 local_only | 已采纳，写入 §3.2 |
 | R9 | 2026-10-15 | iDoris | [文档修订 1.2 整合与三个 owner 决策](negotiation/R9-v1.2-协商提案.md)；local_only v0.3.1 最小数据面与 launcher 解耦 | OD-1/OD-2 已由修订 1.3 决定（见 §2.7）；fast/daily 标签重标仍 **OWNER REVIEW PENDING** |
 | R10 | 2026-10-28 | jason / 双方 | 文档修订 1.3：owner 要求 Agent24 桌面端一站式「下载 → 运行 → 连接」，由此定下 OD-1（宿主为 agent24d）、OD-2（用户在桌面端同意）；新增 §2.7 launcher 托管契约（iDoris v0.4.0 起）、§2.8 wire 契约 1.1.0 | launcher 设计已合入 [Agent24#1437](https://github.com/iDoris-ai/Agent24/pull/1437)；按 v0.4.0 的实现与验收是 Agent24 的 IL-01 起各项，尚未完成。其中「额度紧时 503 `headroom_confirmation_required` → 用户确认 → 重发」的确认交互登记为 ID-HR，见 [Agent24#1442](https://github.com/iDoris-ai/Agent24/pull/1442) |
-| R11 | 2026-11-15 | jason / 双方 | 文档修订 1.4：新增 §2.9 本机 chat 模型推荐（`GET /v1/recommendation?role=chat`、`idoris recommend --role chat --json`）、本地模型类别（`GET /v1/models/local`、`kind`）、下载归 iDoris 且须用户确认、oMLX 密钥读取顺序；档位 16/24/32GB → Qwen3-8B-4bit，48GB+ → Qwen3.8-27B-OptiQ-4bit，64GB+ 可选 Qwen3.6-35B-A3B-OptiQ-4bit | iDoris 与 Agent24 会话各确认一次（2026-11-15）；iDoris 侧实现排在计算服务 PR #600 之后；Agent24 先做不依赖 iDoris 的部分 |
+| R11 | 2026-11-15 | jason / 双方 | 文档修订 1.4：新增 §2.9 本机 chat 模型推荐（`GET /v1/recommendation?role=chat`、`idoris recommend --role chat --json`）、本地模型类别（`GET /v1/models/local`、`kind`）、下载归 iDoris 且须用户确认、oMLX 密钥读取顺序；档位 16/24/32GB → Qwen3-8B-4bit，48GB+ → Qwen3.8-27B-OptiQ-4bit，64GB+ 可选 Qwen3.6-35B-A3B-OptiQ-4bit | iDoris 与 Agent24 会话各确认一次（2026-11-15）；iDoris 侧推荐、列表与密钥顺序已在 v0.5.0 实现（#604、#605，文档修订 1.5）；下载未实现；Agent24 先做不依赖 iDoris 的部分 |

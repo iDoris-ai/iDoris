@@ -19,6 +19,7 @@ mod admin;
 #[cfg(test)]
 mod admin_tests;
 mod http;
+pub mod key;
 mod pin;
 mod status;
 
@@ -97,15 +98,28 @@ impl std::fmt::Debug for OmlxAdapterConfig {
     }
 }
 
+impl OmlxAdapterConfig {
+    /// Default config pointed at `base_url`; the settings.json key is attached
+    /// only when `base_url` is loopback (the env key keeps its old behaviour).
+    pub fn for_base_url(base_url: impl Into<String>) -> Self {
+        let base_url = base_url.into();
+        Self {
+            api_key: key::resolve_omlx_api_key_for(&base_url),
+            base_url,
+            call_timeout: DEFAULT_CALL_TIMEOUT,
+        }
+    }
+}
+
 impl Default for OmlxAdapterConfig {
-    /// Reads the API key from [`OMLX_API_KEY_ENV`] — the one place this
+    /// Resolves the API key via [`key::resolve_omlx_api_key_for`] (env, then settings.json for loopback only) — the one place this
     /// adapter touches the environment for it; every other constructor
     /// path takes the key as an explicit value instead of reaching for the
     /// environment itself.
     fn default() -> Self {
         Self {
             base_url: DEFAULT_BASE_URL.to_string(),
-            api_key: std::env::var(OMLX_API_KEY_ENV).ok(),
+            api_key: key::resolve_omlx_api_key_for(DEFAULT_BASE_URL),
             call_timeout: DEFAULT_CALL_TIMEOUT,
         }
     }

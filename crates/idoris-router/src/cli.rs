@@ -8,6 +8,11 @@ pub enum Command {
     Admin(AdminCommand),
     Key(KeyCommand),
     SetupOmlx(SetupOmlxOptions),
+    /// `idoris recommend --role chat --json [--allocated-budget-bytes <u64>]`（接口规范 §2.9）。
+    /// 只读本机文件系统；不开数据库、不取实例锁、不读任何密钥。
+    Recommend(RecommendOptions),
+    /// `idoris models local --json`（接口规范 §2.9）。运行条件同 `recommend`。
+    ModelsLocal,
     /// Local operator commands of the compute-service control plane (S2); organization and cloud forms only.
     Control(ControlCommand),
     /// `idoris cloud pair|status|unpair`: the device side of the cloud-account pairing (S7, personal form).
@@ -85,6 +90,44 @@ fn parse_setup_omlx(args: &[OsString]) -> Result<SetupOmlxOptions, String> {
     })
 }
 
+/// `role` 保持原样交给运行期判断：不支持的角色要给出明确的一行说明，而不是笼统的用法提示。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecommendOptions {
+    pub role: String,
+    /// `--allocated-budget-bytes`；缺省时由调用方退到环境变量 `IDORIS_ALLOCATED_BUDGET_BYTES`。
+    pub allocated_budget_bytes: Option<u64>,
+}
+
+fn parse_recommend(args: &[OsString]) -> Result<RecommendOptions, String> {
+    let (mut role, mut budget, mut json) = (None, None, false);
+    let mut it = args.iter();
+    while let Some(flag) = it.next() {
+        match flag.to_str().ok_or_else(|| USAGE.to_string())? {
+            "--json" if !json => json = true,
+            "--role" if role.is_none() => {
+                let value = it.next().and_then(|v| v.to_str()).ok_or(USAGE)?;
+                role = Some(value.to_string());
+            }
+            "--allocated-budget-bytes" if budget.is_none() => {
+                let value = it.next().and_then(|v| v.to_str()).ok_or(USAGE)?;
+                // 与 IDORIS_ALLOCATED_BUDGET_BYTES 同口径：无符号整数字节，不接受符号、空白、小数。
+                if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+                    return Err(USAGE.to_string());
+                }
+                budget = Some(value.parse::<u64>().map_err(|_| USAGE.to_string())?);
+            }
+            _ => return Err(USAGE.to_string()),
+        }
+    }
+    match (role, json) {
+        (Some(role), true) => Ok(RecommendOptions {
+            role,
+            allocated_budget_bytes: budget,
+        }),
+        _ => Err(USAGE.to_string()),
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ServeOptions {
     pub admin_token_stdin: bool,
@@ -128,7 +171,7 @@ pub enum KeyCommand {
     Revoke(String),
 }
 
-const USAGE: &str = "用法: idoris [serve [--admin-token-stdin]] | idoris admin <status|backends|models|roles|runtimes> --token-stdin | idoris key issue --spec-stdin | idoris key list | idoris key revoke <key_id> | idoris control bootstrap --spec-stdin | idoris cloud pair [--label <设备名>] | idoris cloud status | idoris cloud unpair | idoris setup omlx --endpoint <url> --out-dir <dir> [--bind <role>=<model>]... [--load-mode on_demand|resident] [--api-key-stdin] [--force]";
+const USAGE: &str = "用法: idoris [serve [--admin-token-stdin]] | idoris admin <status|backends|models|roles|runtimes> --token-stdin | idoris key issue --spec-stdin | idoris key list | idoris key revoke <key_id> | idoris control bootstrap --spec-stdin | idoris cloud pair [--label <设备名>] | idoris cloud status | idoris cloud unpair | idoris recommend --role chat --json [--allocated-budget-bytes <u64>] | idoris models local --json | idoris setup omlx --endpoint <url> --out-dir <dir> [--bind <role>=<model>]... [--load-mode on_demand|resident] [--api-key-stdin] [--force]";
 
 pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Command, String> {
     let args = args.into_iter().collect::<Vec<_>>();
@@ -167,6 +210,12 @@ pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Command, S
             if control == "control" && bootstrap == "bootstrap" && option == "--spec-stdin" =>
         {
             Ok(Command::Control(ControlCommand::Bootstrap))
+        }
+        [recommend, rest @ ..] if recommend == "recommend" => {
+            parse_recommend(rest).map(Command::Recommend)
+        }
+        [models, local, option] if models == "models" && local == "local" && option == "--json" => {
+            Ok(Command::ModelsLocal)
         }
         [setup, omlx, rest @ ..] if setup == "setup" && omlx == "omlx" => {
             parse_setup_omlx(rest).map(Command::SetupOmlx)
@@ -314,6 +363,113 @@ mod tests {
             ],
         ] {
             assert_eq!(parse_args(args).unwrap_err(), USAGE);
+        }
+    }
+
+    fn parse(args: &[&str]) -> Result<Command, String> {
+        parse_args(args.iter().map(OsString::from))
+    }
+
+    #[test]
+    fn parses_recommend_and_models_local_forms() {
+        assert_eq!(
+            parse(&["recommend", "--role", "chat", "--json"]).unwrap(),
+            Command::Recommend(RecommendOptions {
+                role: "chat".into(),
+                allocated_budget_bytes: None
+            })
+        );
+        // 旗标顺序不限；额度可选。
+        assert_eq!(
+            parse(&[
+                "recommend",
+                "--allocated-budget-bytes",
+                "18446744073709551615",
+                "--json",
+                "--role",
+                "chat"
+            ])
+            .unwrap(),
+            Command::Recommend(RecommendOptions {
+                role: "chat".into(),
+                allocated_budget_bytes: Some(u64::MAX)
+            })
+        );
+        // 角色值原样保留，由运行期给出专门的错误说明。
+        assert_eq!(
+            parse(&["recommend", "--role", "vision", "--json"]).unwrap(),
+            Command::Recommend(RecommendOptions {
+                role: "vision".into(),
+                allocated_budget_bytes: None
+            })
+        );
+        assert_eq!(
+            parse(&["models", "local", "--json"]).unwrap(),
+            Command::ModelsLocal
+        );
+        for bad in [
+            vec!["recommend"],
+            vec!["recommend", "--json"],
+            vec!["recommend", "--role", "chat"],
+            vec!["recommend", "--role", "--json"],
+            vec!["recommend", "--role", "chat", "--json", "--json"],
+            vec!["recommend", "--role", "chat", "--role", "chat", "--json"],
+            vec!["recommend", "--role", "chat", "--json", "extra"],
+            vec![
+                "recommend",
+                "--role",
+                "chat",
+                "--json",
+                "--allocated-budget-bytes",
+            ],
+            vec![
+                "recommend",
+                "--role",
+                "chat",
+                "--json",
+                "--allocated-budget-bytes",
+                "-1",
+            ],
+            vec![
+                "recommend",
+                "--role",
+                "chat",
+                "--json",
+                "--allocated-budget-bytes",
+                "+1",
+            ],
+            vec![
+                "recommend",
+                "--role",
+                "chat",
+                "--json",
+                "--allocated-budget-bytes",
+                " 1",
+            ],
+            vec![
+                "recommend",
+                "--role",
+                "chat",
+                "--json",
+                "--allocated-budget-bytes",
+                "18446744073709551616",
+            ],
+            vec![
+                "recommend",
+                "--role",
+                "chat",
+                "--json",
+                "--allocated-budget-bytes",
+                "1",
+                "--allocated-budget-bytes",
+                "2",
+            ],
+            vec!["models"],
+            vec!["models", "local"],
+            vec!["models", "local", "--json", "extra"],
+            vec!["models", "remote", "--json"],
+        ] {
+            assert_eq!(parse(&bad).unwrap_err(), USAGE, "{bad:?}");
         }
     }
 

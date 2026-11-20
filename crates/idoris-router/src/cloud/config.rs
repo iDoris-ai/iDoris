@@ -32,7 +32,7 @@
 //!     base_url: https://api.example.invalid/v1   # https；只有回环地址允许 http。非回环的主机必须是这个供应商登记过的 API 主机（`VERIFIED_PROVIDER_HOSTS`），没登记的供应商只能配回环地址
 //!     api_key_env: EXAMPLE_PROVIDER_API_KEY      # 或 api_key_file: /run/secrets/example-provider
 //!     supplier_request_id_header: x-request-id   # 可选：供应商请求号也从这个头里找（正文里的 id 优先）
-//!     extra_body: {provider: {zdr: true}}        # 可选：固定附加字段，盖在客户端字段之上；不能含 model / max_tokens / stream / n / messages / tools / user / store 等协议、计费、身份、留存字段（加载时拒绝）
+//!     extra_body: {provider: {zdr: true}}        # 可选：固定附加字段，盖在客户端字段之上；白名单：只收 provider: {zdr: bool, allow_fallbacks: bool}；其余（含 model / max_tokens / stream / n / messages / tools / user / store 等协议、计费、身份、留存字段，以及 models / route / plugins / provider.order）加载时拒绝
 //!     price_version: pv-2026-11                  # 价格版本标签，随每次尝试记录，对账用
 //!     cost:   {unit: USD, input_per_mtok: "0.26", output_per_mtok: "0.38", cached_input_per_mtok: "0.13"}
 //!     prices:                                    # 对用户的价：按付款账户的单位各给一份
@@ -85,7 +85,7 @@ use idoris_compute_contracts::request::MAX_ATTEMPTS_PER_REQUEST;
 use idoris_compute_contracts::reserve::ReservePolicy;
 use idoris_upstream::cloud::{
     CloudEndpointClient, CloudEndpointSettings, FileCredentialSource, build_http_client,
-    reserved_extra_body_field,
+    disallowed_extra_body_field,
 };
 use idoris_upstream::remote::{CredentialSource, EnvCredentialSource};
 use serde::de::{self, Visitor};
@@ -860,11 +860,11 @@ pub fn parse_with_ingress_tenants(
         check_provider_host(&key, &endpoint.base_url)?;
         // `extra_body` 盖在客户端字段之上，但不能碰协议 / 计费 / 身份 / 留存字段：准入与许可检查是按「这个模型、
         // 这个 `max_tokens`」算好的，被它改掉就绕过了许可表和预留（见 `idoris_upstream::cloud::wire`）。
-        if let Some(field) = reserved_extra_body_field(&endpoint.extra_body) {
+        if let Some(field) = disallowed_extra_body_field(&endpoint.extra_body) {
             return Err(bad(format!(
                 "端点 {key} 的 extra_body 不能包含 {field}：model、max_tokens、stream、n、messages、tools、user、store 一类\
-                 协议 / 计费 / 身份 / 留存字段由请求自己决定（准入时算好的值），extra_body 只用来放供应商自己的路由或策略参数\
-                 （比如 provider: {{zdr: true}}）"
+                 协议 / 计费 / 身份 / 留存字段由请求自己决定（准入时算好的值）；extra_body 是白名单，\
+                 只收 provider: {{zdr: bool, allow_fallbacks: bool}}，models / route / plugins / provider.order 等路由与能力参数一律不收"
             )));
         }
         let mut settings =
@@ -1248,6 +1248,21 @@ callers:
             expect_error(
                 &with_extra(&format!("{{provider: {{zdr: true}}, {field}: 1}}")),
                 &format!("extra_body 不能包含 {field}"),
+            );
+        }
+        // issue #603 N6：白名单，不是黑名单——不在保留表里的路由 / 能力参数同样在加载时拒绝
+        for (extra, offender) in [
+            ("{models: [a, b]}", "models"),
+            ("{route: fallback}", "route"),
+            ("{plugins: [{id: web}]}", "plugins"),
+            ("{reasoning: {effort: high}}", "reasoning"),
+            ("{web_search_options: {}}", "web_search_options"),
+            ("{provider: {zdr: true, order: [x]}}", "provider.order"),
+            ("{provider: {only: [x]}}", "provider.only"),
+        ] {
+            expect_error(
+                &with_extra(extra),
+                &format!("extra_body 不能包含 {offender}"),
             );
         }
         // 正当用途：供应商自己的路由 / 策略参数

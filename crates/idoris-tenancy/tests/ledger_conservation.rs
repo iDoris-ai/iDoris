@@ -282,6 +282,52 @@ fn a_late_settlement_of_a_grace_hold_that_overshoots_the_reservation_is_split_wi
     assert_clean(&store);
 }
 
+/// issue #603 N7（现状锁定，**不是**口径裁决）：同样一笔「用户自己余额里的 20」，按时结算记成 `user_borne`，
+/// 迟到结算记成 `sponsor_covered`（迟到的结算整笔都是 overage，设计稿 §5「预留过期后迟到的结算，同样按这条规则走」，
+/// 代码 `holds.rs` 的 `user_borne = chain_charge - overage`）。两种结算里用户余额扣的钱一样多，只有标签不同。
+/// 标签是否该统一、统一成哪边，涉及用户 / 担保人对账口径，需要 owner 确认；这条测试只锁住现状，防止被悄悄改动。
+#[test]
+fn the_same_users_money_is_labelled_user_borne_on_time_and_sponsor_covered_when_late() {
+    let on_time = {
+        let db = TempDb::new("conserve-label-on-time");
+        let store = paid_chain(&db, 20);
+        admit_with_ladder(&store, "r-1", "cred-e", 100, T0);
+        let outcome = store
+            .settle_attempt(&attempt("r-1", 0), &price(100), ts(T0 + 1_000))
+            .unwrap();
+        (outcome.clone(), balance(&store, "emp", T0 + 1_000))
+    };
+    let late = {
+        let db = TempDb::new("conserve-label-late");
+        let store = paid_chain(&db, 20);
+        admit_with_ladder(&store, "r-1", "cred-e", 100, T0);
+        let late_at = T0 + ttl(&store) + 1_000;
+        let outcome = store
+            .settle_attempt(&attempt("r-1", 0), &price(100), ts(late_at))
+            .unwrap();
+        (outcome.clone(), balance(&store, "emp", late_at))
+    };
+    // 用户余额扣的一样多
+    assert_eq!((on_time.1, late.1), (0, 0));
+    // 标签不同（现状）
+    assert_eq!(
+        (
+            on_time.0.user_borne.clone(),
+            on_time.0.sponsor_covered.clone()
+        ),
+        (thb(20), thb(0)),
+        "{:?}",
+        on_time.0
+    );
+    assert_eq!(
+        (late.0.user_borne.clone(), late.0.sponsor_covered.clone()),
+        (thb(0), thb(20)),
+        "{:?}",
+        late.0
+    );
+    assert_eq!(on_time.0.grace_absorbed, late.0.grace_absorbed);
+}
+
 // ------------------------------------------------------------------------------------------
 // #5 结果不依赖扫描顺序
 // ------------------------------------------------------------------------------------------

@@ -33,20 +33,27 @@ fn header_privacy(headers: &HeaderMap) -> Result<CallPrivacy, InvalidPrivacy> {
     }
 }
 
-/// 请求体里的等价声明：顶层 `privacy`，或 `metadata.privacy`，值是 `local_only`。别的值（以及没有）不说明任何事
-/// （这个字段从来不转发给上游；`metadata` 是调用方自己的标签，只在它明确写了 `local_only` 时才当作声明）。
-fn body_declares_local_only(body: &Map<String, Value>) -> bool {
-    let declares = |value: Option<&Value>| {
-        value
-            .and_then(Value::as_str)
-            .is_some_and(|text| text.trim().eq_ignore_ascii_case("local_only"))
-    };
-    declares(body.get("privacy"))
-        || declares(
-            body.get("metadata")
-                .and_then(Value::as_object)
-                .and_then(|metadata| metadata.get("privacy")),
-        )
+/// 请求体里的一处声明（顶层 `privacy` 或 `metadata.privacy`）：没写 / `null` / `any` 不说明任何事（这个字段从来不转发给
+/// 上游）；`local_only`（不分大小写、可带空白）= 显式本地；**写了别的任何东西**（`"local-only"`、`true`、对象……）= 不合法，
+/// 与请求头同样失败即关闭，不当作「没声明」放行。
+fn body_field_privacy(value: Option<&Value>) -> Result<bool, InvalidPrivacy> {
+    match value {
+        None | Some(Value::Null) => Ok(false),
+        Some(Value::String(text)) if text == "any" => Ok(false),
+        Some(Value::String(text)) if text.trim().eq_ignore_ascii_case("local_only") => Ok(true),
+        Some(_) => Err(InvalidPrivacy),
+    }
+}
+
+/// 请求体里的等价声明：顶层 `privacy`，或 `metadata.privacy`（调用方自己的标签里只有 `privacy` 这一个键被当作声明）。
+fn body_declares_local_only(body: &Map<String, Value>) -> Result<bool, InvalidPrivacy> {
+    let top = body_field_privacy(body.get("privacy"))?;
+    let nested = body_field_privacy(
+        body.get("metadata")
+            .and_then(Value::as_object)
+            .and_then(|metadata| metadata.get("privacy")),
+    )?;
+    Ok(top || nested)
 }
 
 /// 调用方对这次请求的隐私声明（头 + 请求体）。两处里有任何一处写了 `local_only` 就是 `LocalOnly`（取最严的）；
@@ -56,7 +63,9 @@ pub(crate) fn declared_privacy(
     body: &Map<String, Value>,
 ) -> Result<CallPrivacy, InvalidPrivacy> {
     let from_header = header_privacy(headers)?;
-    if from_header == CallPrivacy::LocalOnly || body_declares_local_only(body) {
+    // 请求体的错写先于头里的取值判断：头写 `any` 不能掩盖它
+    let body_local_only = body_declares_local_only(body)?;
+    if from_header == CallPrivacy::LocalOnly || body_local_only {
         return Ok(CallPrivacy::LocalOnly);
     }
     Ok(from_header)
@@ -415,8 +424,8 @@ mod tests {
             Ok(CallPrivacy::LocalOnly),
             "the strictest of header and body wins"
         );
-        // 别的值、别的类型不说明任何事
-        for other in [json!("any"), json!(5), json!(null), json!({"x": 1})] {
+        // 合法取值（`any`、`null` = 没写）行为不变：不说明任何事
+        for other in [json!("any"), json!(null)] {
             let mut body = plain.clone();
             body.insert("privacy".into(), other);
             body.insert("metadata".into(), json!({"privacy": "any", "tag": "x"}));
@@ -425,6 +434,60 @@ mod tests {
                 Ok(CallPrivacy::Undeclared)
             );
         }
+        // 没有 `privacy` 的 metadata 不受影响
+        let mut tagged = plain.clone();
+        tagged.insert("metadata".into(), json!({"tag": "x"}));
+        assert_eq!(
+            declared_privacy(&headers(&[]), &tagged),
+            Ok(CallPrivacy::Undeclared)
+        );
+    }
+
+    /// issue #603 N5：请求体里写了 `privacy` 却不是已定义的取值（`local-only`、`true`、对象……）
+    /// 与请求头同样拒绝，不能被当成「没声明」而上云。`metadata.privacy` 同理（现有代码本来就读它）。
+    #[test]
+    fn an_unknown_body_privacy_value_is_rejected_like_a_bad_header() {
+        let plain = object(base());
+        let bad_values = [
+            json!("local-only"),
+            json!("localonly"),
+            json!("Any"),
+            json!(""),
+            json!(" "),
+            json!(true),
+            json!(5),
+            json!({"local_only": true}),
+            json!(["local_only"]),
+        ];
+        for bad in bad_values {
+            let mut body = plain.clone();
+            body.insert("privacy".into(), bad.clone());
+            assert_eq!(
+                declared_privacy(&headers(&[]), &body),
+                Err(InvalidPrivacy),
+                "body privacy {bad}"
+            );
+            // 头写了 any 也不能掩盖请求体里的错写
+            assert_eq!(
+                declared_privacy(&headers(&["any"]), &body),
+                Err(InvalidPrivacy),
+                "body privacy {bad} with header any"
+            );
+            let mut body = plain.clone();
+            body.insert("metadata".into(), json!({"privacy": bad.clone()}));
+            assert_eq!(
+                declared_privacy(&headers(&[]), &body),
+                Err(InvalidPrivacy),
+                "metadata.privacy {bad}"
+            );
+        }
+        // 对照：合法取值不变
+        let mut ok = plain.clone();
+        ok.insert("privacy".into(), json!(" LOCAL_ONLY "));
+        assert_eq!(
+            declared_privacy(&headers(&[]), &ok),
+            Ok(CallPrivacy::LocalOnly)
+        );
     }
 
     #[test]

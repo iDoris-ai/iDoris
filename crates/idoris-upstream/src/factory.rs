@@ -9,8 +9,7 @@ use idoris_contracts::ComponentCard;
 pub fn create_adapter(card: &ComponentCard) -> Result<Arc<dyn RuntimeAdapter>, BackendError> {
     match card.provider.id.as_str() {
         "omlx" => {
-            let mut config = super::OmlxAdapterConfig::default();
-            config.base_url.clone_from(&card.endpoint);
+            let config = super::OmlxAdapterConfig::for_base_url(card.endpoint.clone());
             Ok(Arc::new(super::OmlxAdapter::new(config)?))
         }
         provider => Err(BackendError::invalid_request(format!(

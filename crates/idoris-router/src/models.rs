@@ -182,7 +182,9 @@ pub(crate) async fn observe_http_models(
     if suppress_untrusted_remote(card, remote_kill_switch) {
         return Ok(HttpModelObservation::Suppressed);
     }
-    let api_key = std::env::var_os(idoris_upstream::omlx::OMLX_API_KEY_ENV);
+    // `fetch_models_body` attaches a key only to loopback oMLX cards, so the
+    // settings.json key (loopback-only) is safe to resolve here.
+    let api_key = idoris_upstream::omlx::key::resolve_omlx_api_key_os(true);
     let Some(body) = fetch_models_body(client, card, api_key.as_deref()).await? else {
         return Ok(HttpModelObservation::Unavailable);
     };
@@ -213,7 +215,9 @@ pub async fn list_models(
     health: &HealthTracker,
     remote_kill_switch: bool,
 ) -> Result<ModelsResponse, ModelsError> {
-    let api_key = std::env::var_os(idoris_upstream::omlx::OMLX_API_KEY_ENV);
+    // `fetch_models_body` attaches a key only to loopback oMLX cards, so the
+    // settings.json key (loopback-only) is safe to resolve here.
+    let api_key = idoris_upstream::omlx::key::resolve_omlx_api_key_os(true);
     let mut data = Vec::new();
     for card in cards {
         let id = &card.provider.id;
