@@ -1345,8 +1345,6 @@ pub const REFUSED_OBJECTS: &[&str] = &[
     "it",
     "those",
     "these",
-    "anything",
-    "something",
     "details",
     "detail",
     "instructions",
