@@ -75,8 +75,9 @@ mod tests {
             worker.await.unwrap();
             let during = beats.load(Ordering::SeqCst) - before;
             heartbeat.abort();
+            // 阻塞时 worker 被占死，心跳是 0–2；理想情况约 30 次。门槛取 4：慢的 macOS CI runner 上曾只跑到 7–9 次
             assert!(
-                during >= 10,
+                during >= 4,
                 "the heartbeat kept running while the synchronous section blocked: {during} beats"
             );
         });
