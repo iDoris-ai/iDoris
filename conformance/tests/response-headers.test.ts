@@ -38,7 +38,8 @@ describe("GET /health 服务身份", () => {
     expect(body.status).toBe("ok");
     expect(body.service).toBe("idoris");
     expect(typeof body.version).toBe("string");
-    // contract_version 是规范文档标注的值（当前 v1.2.0），不是随便一个字符串。
+    // contract_version 是规范文档标注的值（当前 v1.2.0），不是随便一个字符串。下面「GET /health 新字段」的
+    // 字段已经从 IDORIS-CORE 切片 S1 起出现在 Rust 实现里，但版本号要到 v0.6.0 发版才升 1.3.0（规范 §2.11）。
     expect(body.contract_version).toBe("1.2.0");
     expect(typeof body.instance_id).toBe("string");
     expect((body.instance_id as string).length).toBeGreaterThan(0);
@@ -49,6 +50,106 @@ describe("GET /health 服务身份", () => {
     const a = (await (await fetch(server.baseUrl + "/health")).json()) as { instance_id: string };
     const b = (await (await fetch(server.baseUrl + "/health")).json()) as { instance_id: string };
     expect(b.instance_id).toBe(a.instance_id);
+  });
+});
+
+// `/health` 新字段（接口规范修订 1.6 §2.11.1，IDORIS-CORE）：phase / ready / started_at_ms / registered /
+// upstreams[]。这批字段从 IDORIS-CORE 切片 S1 起就出现在 Rust 实现的 `/health` 里，但 `contract_version`
+// 到 v0.6.0 发版才升到 1.3.0（规范 §2.11：发版前仍是 1.2.0；切片 S11 统一升）——所以上面的版本断言仍是 1.2.0，
+// 调用方按字段是否存在判断，不要看版本号。这批字段由 Rust 实现承载；TS 参考实现不含它们
+// （同 v1.2.0 的先例，见 packages/contracts/src/version.ts），所以这里只对 Rust 被测实现锁形状。
+const isRust = process.env.IDORIS_CONFORMANCE_IMPLEMENTATION === "rust";
+const UPSTREAM_STATES = ["ready", "starting", "unavailable", "restarting", "failed", "stopped", "absent"];
+const UPSTREAM_REASONS = [
+  "engine_not_found",
+  "port_in_use",
+  "auth_required",
+  "auth_failed",
+  "startup_timeout",
+  "crash_loop",
+  "fence_pending",
+  "budget_zero",
+  "startup_latched",
+];
+const ENGINE_KIND_RE = /^[a-z][a-z0-9_]{0,31}$/;
+
+interface HealthWire {
+  status: string;
+  phase: string;
+  ready: boolean;
+  started_at_ms: number;
+  registered: boolean;
+  upstreams: Array<Record<string, unknown>>;
+  [key: string]: unknown;
+}
+
+/** 轮询 /health 直到 `done` 为真。探测器在后台跑，第一轮探测完成之前 phase 是 starting。 */
+async function healthUntil(done: (body: HealthWire) => boolean): Promise<HealthWire> {
+  const deadline = Date.now() + 10_000;
+  for (;;) {
+    const body = (await (await fetch(server.baseUrl + "/health")).json()) as HealthWire;
+    if (done(body) || Date.now() > deadline) return body;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+}
+
+describe.skipIf(!isRust)("GET /health 新字段（规范修订 1.6 §2.11.1，S1 起出现，仅 Rust）", () => {
+  it("恰好这十二个键；status 仍恒为 ok，instance_nonce 之类的秘密不出现", async () => {
+    const body = await healthUntil((b) => b.phase !== "starting");
+    expect(Object.keys(body).sort()).toEqual(
+      [
+        "components",
+        "contract_version",
+        "dev_no_key_enabled",
+        "instance_id",
+        "phase",
+        "ready",
+        "registered",
+        "service",
+        "started_at_ms",
+        "status",
+        "upstreams",
+        "version",
+      ].sort(),
+    );
+    expect(body.status).toBe("ok");
+    // 没有任何 64 位 hex 的字符串（nonce、token 的形状）：`instance_id` 是带连字符的 UUID，不会命中。
+    expect(JSON.stringify(body)).not.toMatch(/[0-9a-f]{64}/);
+    expect(JSON.stringify(body)).not.toMatch(/nonce/i);
+  });
+
+  it("phase / ready / started_at_ms / registered 的类型与相互关系", async () => {
+    const body = await healthUntil((b) => b.phase !== "starting");
+    expect(["starting", "ready", "degraded"]).toContain(body.phase);
+    expect(body.ready).toBe(body.phase === "ready");
+    expect(Number.isInteger(body.started_at_ms)).toBe(true);
+    // 进程启动时刻：夹具刚刚拉起它，不会是很久以前，也不会在将来。
+    expect(body.started_at_ms).toBeGreaterThan(Date.now() - 10 * 60_000);
+    expect(body.started_at_ms).toBeLessThanOrEqual(Date.now() + 5_000);
+    // 没有 launcher、没有登记会话：恒为 false。
+    expect(body.registered).toBe(false);
+  });
+
+  it("upstreams[]：resident 的 loopback 卡带 engine_kind（来自 version_pin 的产品名），探测通过后是 ready", async () => {
+    const body = await healthUntil((b) => b.phase === "ready");
+    expect(body.phase).toBe("ready");
+    expect(body.ready).toBe(true);
+    expect(body.upstreams).toEqual([
+      { id: "omlx", engine_kind: "omlx", state: "ready", managed: false, owned: false },
+    ]);
+    for (const upstream of body.upstreams) {
+      expect(typeof upstream.id).toBe("string");
+      // 开放集合：每一项都有 engine_kind，格式固定，消费者对不认识的取值要容忍。
+      expect(String(upstream.engine_kind)).toMatch(ENGINE_KIND_RE);
+      expect(UPSTREAM_STATES).toContain(upstream.state);
+      expect(typeof upstream.managed).toBe("boolean");
+      expect(typeof upstream.owned).toBe("boolean");
+      // reason 可选；出现时是稳定原因码，且 state 不是 ready。
+      if (upstream.reason !== undefined) {
+        expect(UPSTREAM_REASONS).toContain(upstream.reason);
+        expect(upstream.state).not.toBe("ready");
+      }
+    }
   });
 });
 

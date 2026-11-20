@@ -130,7 +130,11 @@ fn parse_recommend(args: &[OsString]) -> Result<RecommendOptions, String> {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ServeOptions {
+    /// `--admin-token-stdin`：stdin 上一帧 65 字节（64 位小写 hex 加 LF）的 Admin token。v0.4.0 起的既有契约，不变。
     pub admin_token_stdin: bool,
+    /// `--launcher-stdin`：stdin 上一行 UTF-8 JSON 帧（接口规范 §2.7.1，修订 1.6），带 Admin token 与发现文件、
+    /// 登记、引擎等启动输入。与 `--admin-token-stdin` 互斥：同时给出是用法错误。
+    pub launcher_stdin: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -171,7 +175,7 @@ pub enum KeyCommand {
     Revoke(String),
 }
 
-const USAGE: &str = "用法: idoris [serve [--admin-token-stdin]] | idoris admin <status|backends|models|roles|runtimes> --token-stdin | idoris key issue --spec-stdin | idoris key list | idoris key revoke <key_id> | idoris control bootstrap --spec-stdin | idoris cloud pair [--label <设备名>] | idoris cloud status | idoris cloud unpair | idoris recommend --role chat --json [--allocated-budget-bytes <u64>] | idoris models local --json | idoris setup omlx --endpoint <url> --out-dir <dir> [--bind <role>=<model>]... [--load-mode on_demand|resident] [--api-key-stdin] [--force]";
+const USAGE: &str = "用法: idoris [serve [--admin-token-stdin | --launcher-stdin]] | idoris admin <status|backends|models|roles|runtimes> --token-stdin | idoris key issue --spec-stdin | idoris key list | idoris key revoke <key_id> | idoris control bootstrap --spec-stdin | idoris cloud pair [--label <设备名>] | idoris cloud status | idoris cloud unpair | idoris recommend --role chat --json [--allocated-budget-bytes <u64>] | idoris models local --json | idoris setup omlx --endpoint <url> --out-dir <dir> [--bind <role>=<model>]... [--load-mode on_demand|resident] [--api-key-stdin] [--force]";
 
 pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Command, String> {
     let args = args.into_iter().collect::<Vec<_>>();
@@ -181,6 +185,15 @@ pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Command, S
         [command, option] if command == "serve" && option == "--admin-token-stdin" => {
             Ok(Command::Serve(ServeOptions {
                 admin_token_stdin: true,
+                ..ServeOptions::default()
+            }))
+        }
+        // `--launcher-stdin` 与 `--admin-token-stdin` 互斥：两个 flag 同时出现（任何顺序、重复）没有匹配的分支，
+        // 落到最后的 `_` 成为用法错误，退出码 1。
+        [command, option] if command == "serve" && option == "--launcher-stdin" => {
+            Ok(Command::Serve(ServeOptions {
+                launcher_stdin: true,
+                ..ServeOptions::default()
             }))
         }
         [admin, resource, option] if admin == "admin" && option == "--token-stdin" => {
@@ -257,7 +270,8 @@ mod tests {
             ])
             .unwrap(),
             Command::Serve(ServeOptions {
-                admin_token_stdin: true
+                admin_token_stdin: true,
+                ..ServeOptions::default()
             })
         );
         assert_eq!(
@@ -368,6 +382,47 @@ mod tests {
 
     fn parse(args: &[&str]) -> Result<Command, String> {
         parse_args(args.iter().map(OsString::from))
+    }
+
+    #[test]
+    fn parses_serve_launcher_stdin_and_keeps_the_legacy_token_flag_unchanged() {
+        assert_eq!(
+            parse(&["serve", "--launcher-stdin"]).unwrap(),
+            Command::Serve(ServeOptions {
+                admin_token_stdin: false,
+                launcher_stdin: true
+            })
+        );
+        // 旧 flag 一字不变。
+        assert_eq!(
+            parse(&["serve", "--admin-token-stdin"]).unwrap(),
+            Command::Serve(ServeOptions {
+                admin_token_stdin: true,
+                launcher_stdin: false
+            })
+        );
+        assert_eq!(
+            parse(&["serve"]).unwrap(),
+            Command::Serve(ServeOptions::default())
+        );
+    }
+
+    /// 接口规范 §2.7.1：两个 stdin flag 互斥，同时给出是用法错误（退出码 1），不是静默取其一。
+    #[test]
+    fn launcher_stdin_and_admin_token_stdin_are_mutually_exclusive() {
+        for args in [
+            vec!["serve", "--launcher-stdin", "--admin-token-stdin"],
+            vec!["serve", "--admin-token-stdin", "--launcher-stdin"],
+            vec!["serve", "--launcher-stdin", "--launcher-stdin"],
+            vec!["serve", "--admin-token-stdin", "--admin-token-stdin"],
+            vec!["serve", "--launcher-stdin", "extra"],
+            vec!["--launcher-stdin"],
+            vec!["serve", "--launcher-stdin=1"],
+            vec!["serve", "--launcher-stdin", "--discovery-file", "/tmp/x"],
+        ] {
+            assert_eq!(parse(&args).unwrap_err(), USAGE, "{args:?}");
+        }
+        assert!(USAGE.contains("--launcher-stdin"));
     }
 
     #[test]
