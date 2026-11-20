@@ -15,6 +15,10 @@
  * - v1.2.0：加法新增 —— 只读端点 `GET /v1/recommendation?role=chat` 与
  *   `GET /v1/models/local`（接口规范 §2.9，由 Rust 实现承载；TS 参考实现不含这两个端点，
  *   版本号只为三处常量保持一致）。1.1.x 的字段和行为不变。
+ * - v1.3.0：加法新增 —— `GET /health` 的 `phase`、`ready`、`started_at_ms`、`registered`、
+ *   `upstreams[]`（含 `engine_kind`；接口规范修订 1.6 §2.11.1，IDORIS-CORE，由 Rust 实现承载；
+ *   TS 参考实现不含这些字段，版本号只为常量保持一致，同 v1.2.0 的先例）。`status` 仍恒为 `"ok"`，
+ *   1.2.x 的字段和行为不变。
  *
  * 后续演进按同文档 G-5「加法优先、零回归」处理：
  * - 加法新增字段/端点/枚举值 → 升 minor；
@@ -23,4 +27,4 @@
  * `pnpm check:contract-drift` 会把本常量、Rust 常量与 conformance 的 health
  * 期望机械比对；任何一侧单独修改都会失败（B1 task39 / FU-21 的常量漂移部分）。
  */
-export const CONTRACT_VERSION = "1.2.0";
+export const CONTRACT_VERSION = "1.3.0";

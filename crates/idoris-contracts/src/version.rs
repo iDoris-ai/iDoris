@@ -18,4 +18,10 @@
 /// `1.2.0`: additive only (interface spec §2.9). New read-only endpoints
 /// `GET /v1/recommendation?role=chat` and `GET /v1/models/local`; every 1.1.x
 /// field and behavior is unchanged.
-pub const CONTRACT_VERSION: &str = "1.2.0";
+///
+/// `1.3.0`: additive only (interface spec revision 1.6 §2.11, IDORIS-CORE). `GET /health` gains
+/// `phase`, `ready`, `started_at_ms`, `registered` and `upstreams[]` (each with `engine_kind`);
+/// `status` stays `"ok"`, every 1.2.x field and behavior is unchanged. The launcher-hosting
+/// additions of the same revision (the `--launcher-stdin` frame, dynamic ports, the discovery
+/// file) are launcher contract (§2.7), not HTTP wire.
+pub const CONTRACT_VERSION: &str = "1.3.0";

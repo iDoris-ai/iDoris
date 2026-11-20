@@ -89,7 +89,7 @@ fn auth_failure(card: &ComponentCard, field: &str, value: Value) -> ModelsError 
     }
 }
 
-fn is_loopback_omlx(card: &ComponentCard) -> bool {
+pub(crate) fn is_loopback_omlx(card: &ComponentCard) -> bool {
     if card.provider.family != idoris_contracts::provider::Family::Local
         || card.provider.locality != Locality::Loopback
         || !card.version_pin.starts_with("omlx@")
