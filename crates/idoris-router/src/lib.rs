@@ -83,6 +83,8 @@ pub mod engine_kind;
 pub mod instance_nonce;
 pub mod launcher_frame;
 pub mod readiness;
+/// IDORIS-CORE S2（接口规范 §2.10，修订 1.6）：向 agent24d 登记与心跳（UDS 客户端）、发现文件自愈、孤儿计时。
+pub mod register;
 /// Persistent record/budget storage bootstrap (B1 task18).
 pub mod storage;
 mod usage;

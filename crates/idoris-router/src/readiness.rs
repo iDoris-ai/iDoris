@@ -209,7 +209,8 @@ impl HealthState {
         self.inner.started_at_ms
     }
 
-    /// 当前是否有已 `ack` 的登记会话。S1 没有登记（S2 才有），恒为 false；S2 在会话建立与断开时调用 `set_registered`。
+    /// 当前是否有已 `ack` 的登记会话。没有 launcher、没有 `register_socket`、或登记不上时恒为 false；登记客户端
+    /// （`register`）在会话建立（`ack.proof` 校验通过）时设为 true，会话断开或停止时设回 false。
     pub fn registered(&self) -> bool {
         self.inner.registered.load(Ordering::SeqCst)
     }
