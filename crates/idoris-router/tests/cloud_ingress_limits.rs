@@ -46,6 +46,10 @@ fn assert_limited(reply: &Reply, code: &str, scope: &str) -> u64 {
 // 成员级
 // ---------------------------------------------------------------------------
 
+/// 慢上游的响应头延迟：要让前几个请求在发下一个请求时仍在途，又要远低于测试配置的
+/// `response_head_timeout_ms: 800`（原来 700 ms 只留 100 ms 余量，慢的 macOS CI runner 上会变成 504）。
+const SLOW_UPSTREAM: Duration = Duration::from_millis(400);
+
 #[tokio::test]
 async fn the_member_rate_limit_triggers_alone_names_its_scope_and_recovers_with_the_clock() {
     // 成员：每分钟 20 个（每 3 秒 1 个），突发 2
@@ -90,7 +94,7 @@ async fn the_member_concurrency_limit_triggers_alone_and_the_slot_comes_back() {
     let slow = Behavior::slow_json(
         200,
         completion("slow", "hello", Some(usage(12, 30))),
-        Duration::from_millis(700),
+        SLOW_UPSTREAM,
     );
     let w = World::new(WorldOptions {
         script: vec![slow, ok_behavior(), ok_behavior(), ok_behavior()],
@@ -169,7 +173,7 @@ async fn the_tenant_concurrency_limit_counts_every_member_together() {
         Behavior::slow_json(
             200,
             completion(id, "hello", Some(usage(12, 30))),
-            Duration::from_millis(700),
+            SLOW_UPSTREAM,
         )
     };
     let w = World::new(WorldOptions {
@@ -225,7 +229,7 @@ async fn the_platform_concurrency_limit_caps_the_whole_node() {
     let slow = Behavior::slow_json(
         200,
         completion("slow", "hello", Some(usage(12, 30))),
-        Duration::from_millis(700),
+        SLOW_UPSTREAM,
     );
     let w = World::new(WorldOptions {
         script: vec![slow, ok_behavior(), ok_behavior()],

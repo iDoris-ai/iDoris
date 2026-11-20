@@ -617,8 +617,9 @@ mod tests {
                 during
             });
             holder.join().unwrap();
+            // 阻塞时 worker 被占死，心跳是 0–2；理想情况约 30 次。门槛取 4：慢的 macOS CI runner 上曾只跑到 7–9 次
             assert!(
-                during >= 10,
+                during >= 4,
                 "{supplier_id:?}: the other tasks kept running while the ledger write waited: {during} beats"
             );
         }
