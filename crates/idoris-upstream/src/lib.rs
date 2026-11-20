@@ -14,6 +14,9 @@
 //!   code.
 //! - [`omlx`] — [`omlx::OmlxAdapter`], a complete `RuntimeAdapter`
 //!   implementation (built up across the PRs on this branch stack).
+//! - [`engine`] (unix) — engine-agnostic process management for local inference engines:
+//!   spawn, ownership record, orphan adoption, stop (IDORIS-CORE S3). What differs per engine
+//!   lives behind [`engine::EngineRecipe`]; `omlx::engine::OmlxRecipe` is the first recipe.
 //! - [`remote`] — the concrete `RemoteChat` client(s) (landing across
 //!   further PRs on this stack; this PR has
 //!   [`remote::CredentialSource`] only).
@@ -21,6 +24,8 @@
 pub mod chat;
 pub mod cloud;
 pub mod detect;
+#[cfg(unix)]
+pub mod engine;
 pub mod error;
 pub mod factory;
 pub mod local_http_runtime;
