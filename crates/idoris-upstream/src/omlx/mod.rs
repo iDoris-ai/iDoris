@@ -14,10 +14,16 @@
 //!
 //! **The API key is read from an env var and never logged** — see
 //! [`OMLX_API_KEY_ENV`] and `http`'s module doc.
+//!
+//! [`engine`] is oMLX as an *engine*: the process-level side (find the executable, how to launch
+//! it, how to tell it is ready), written against the engine-agnostic layer in
+//! [`crate::engine`] (IDORIS-CORE S3). `OmlxAdapter` itself is unchanged; it keeps talking HTTP.
 
 mod admin;
 #[cfg(test)]
 mod admin_tests;
+#[cfg(unix)]
+pub mod engine;
 mod http;
 pub mod key;
 mod pin;
