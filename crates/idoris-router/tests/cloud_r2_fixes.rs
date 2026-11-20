@@ -1221,8 +1221,9 @@ async fn a_slow_ledger_does_not_starve_the_runtime_while_a_request_is_admitted()
     let during = beats.load(Ordering::SeqCst) - before;
     heartbeat.abort();
     assert_eq!(reply.status, 200);
+    // 阻塞时 worker 被占死，心跳是 0–2；门槛取 4：慢的 macOS CI runner 上曾只跑到 7–9 次
     assert!(
-        during >= 10,
+        during >= 4,
         "the other tasks kept running while the admission blocked: {during} beats"
     );
 }

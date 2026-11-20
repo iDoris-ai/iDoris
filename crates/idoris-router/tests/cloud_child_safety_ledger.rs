@@ -801,8 +801,9 @@ fn reserving_and_settling_a_safety_check_does_not_starve_the_runtime_while_the_l
                 })
                 .unwrap();
         });
+        // 阻塞时 worker 被占死，心跳是 0–2；门槛取 4：慢的 macOS CI runner 上曾只跑到 7–9 次
         assert!(
-            during >= 10,
+            during >= 4,
             "reserve waited on the ledger without starving the runtime: {during} beats"
         );
     }
@@ -824,8 +825,9 @@ fn reserving_and_settling_a_safety_check_does_not_starve_the_runtime_while_the_l
         let during = heartbeats_while_the_ledger_is_locked(&f.db, move || {
             meter.settle(ticket, ExtraCostOutcome::NotRun);
         });
+        // 阻塞时 worker 被占死，心跳是 0–2；门槛取 4：慢的 macOS CI runner 上曾只跑到 7–9 次
         assert!(
-            during >= 10,
+            during >= 4,
             "settle waited on the ledger without starving the runtime: {during} beats"
         );
     }
