@@ -824,8 +824,10 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), b"stale");
     }
 
-    fn stat_mode(bits: u32) -> nix::sys::stat::Mode {
-        nix::sys::stat::Mode::from_bits_truncate(bits as nix::libc::mode_t)
+    /// `mode_t` 在 macOS 上是 u16、在 Linux 上是 u32：参数直接取 `mode_t`，调用点的字面量自己推断类型，
+    /// 不写任何在某个平台上多余（会触发 `clippy::unnecessary_cast`）的转换。
+    fn stat_mode(bits: nix::libc::mode_t) -> nix::sys::stat::Mode {
+        nix::sys::stat::Mode::from_bits_truncate(bits)
     }
 
     #[test]
