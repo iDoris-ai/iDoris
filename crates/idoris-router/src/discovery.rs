@@ -1222,8 +1222,11 @@ mod tests {
     }
 
     /// 旁路锁文件是 FIFO：`O_RDWR` 打开 FIFO 不会阻塞，所以它越过 `lock_sidecar` 里的 `open`（符号链接则被 `O_NOFOLLOW`
-    /// 在更早处拦下，见上一条），一直走到 `open` 之后的类型核对，被它拒绝。没有这道核对，`flock` 对 FIFO 同样成功，
-    /// 发布会悄悄成功，所以 `publish` 必须失败。
+    /// 在更早处拦下，见上一条），一直走到 `open` 之后的类型核对。macOS 上 `flock` 对 FIFO 本身就失败（`ENOTSUP`，
+    /// 本机实测），同一个结果也会由 `try_lock` 的失败分支给出，所以在 macOS 上单靠这条抓不住类型核对被拿掉；
+    /// Linux 上 `flock` 不按文件类型拒绝（没有在 Linux 上验证过，等 CI），预期没有这道核对发布会悄悄成功，
+    /// 这条测试在那里单独钉住核对被调用。类型与属主的判据由 `the_sidecar_lock_must_be_a_regular_file_owned_by_us`
+    /// 在所有平台上钉住。
     #[test]
     fn a_sidecar_lock_that_is_a_fifo_is_refused_by_the_type_check_after_it_was_opened() {
         let (_temp, dir) = private_dir();
