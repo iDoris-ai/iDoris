@@ -1069,15 +1069,21 @@ async fn kill_9_leaves_a_recognizable_stale_file_and_a_new_instance_overwrites_i
     // 崩溃残留：文件还在，内容原样；但 pid 已死、旧端口上没有人答话，所以消费者能认出它是陈旧的。
     assert_eq!(fs::read(&path).unwrap(), stale_bytes);
     assert!(!pid_alive(stale_pid), "pid {stale_pid} should be gone");
-    assert!(
-        http()
-            .get(format!("http://127.0.0.1:{stale_data_port}/health"))
-            .timeout(Duration::from_secs(2))
-            .send()
-            .await
-            .is_err(),
-        "nothing answers on the stale port"
-    );
+    // 旧端口上要么没有人答话，要么答话的是别的实例（端口一释放就可能被别的进程重新绑走）；
+    // 绝不会再有人以残留文件里的 instance_id 答话。
+    if let Ok(response) = http()
+        .get(format!("http://127.0.0.1:{stale_data_port}/health"))
+        .timeout(Duration::from_secs(2))
+        .send()
+        .await
+    {
+        let answered: Value = response.json().await.unwrap_or_default();
+        assert_ne!(
+            answered["instance_id"],
+            json!(stale_id),
+            "nobody may answer on the stale port as the dead instance"
+        );
+    }
 
     // 第二种识别方式：旧端口上现在是另一个实例在答话（端口被别的进程占用的情形），它的
     // `/health.instance_id` 与残留文件里的不符。这个实例用的是另一个数据库和旧的 `--admin-token-stdin`，
@@ -1147,8 +1153,11 @@ async fn kill_9_leaves_a_recognizable_stale_file_and_a_new_instance_overwrites_i
 async fn second_instance_exits_3_before_reading_the_frame_and_never_touches_the_discovery_file() {
     let env = Env::new();
     let path = env.discovery_path();
+    let first_started = Instant::now();
     let mut first = env.spawn_launcher(&env.frame(json!({})));
     let (before, before_bytes) = wait_discovery(&path, &mut first);
+    // 第一个实例从启动到写出发现文件用了多久：第二实例走到实例锁的那一段是它的真子集。
+    let first_startup = first_started.elapsed();
     let before_meta = fs::metadata(&path).unwrap();
     let listing = dir_listing(&env.run_dir);
 
@@ -1165,10 +1174,11 @@ async fn second_instance_exits_3_before_reading_the_frame_and_never_touches_the_
     let (stdout, stderr) = output_of(&mut second);
     drop(held_open);
     assert_eq!(status.code(), Some(3), "{stderr}");
-    // 比读帧的 10 秒超时早得多：它根本没有去读 stdin（实例锁排在读帧、绑定端口之前）。
+    // 它根本没有去读 stdin（实例锁排在读帧、绑定端口之前）：如果它等了读帧的 10 秒超时，耗时会比第一个实例
+    // 从启动到写出发现文件还多出十秒；机器再忙，两者的差也远小于 8 秒。
     assert!(
-        second_elapsed < Duration::from_secs(8),
-        "exit 3 took {second_elapsed:?}: the second instance must not wait for the frame"
+        second_elapsed < first_startup + Duration::from_secs(8),
+        "exit 3 took {second_elapsed:?} (the first instance needed {first_startup:?} to start): the second instance must not wait for the frame"
     );
     assert!(
         stderr.contains("[idoris] 启动失败：已有 iDoris 实例在使用同一数据库"),
@@ -1427,12 +1437,8 @@ async fn nothing_is_served_while_waiting_for_the_frame_and_nothing_after_a_bad_o
     let (stdout, stderr) = output_of(&mut child);
     assert_eq!(status.code(), Some(1), "{stderr}");
     assert!(!stdout.contains("listening"), "{stdout}");
-    assert!(
-        tokio::net::TcpStream::connect(("127.0.0.1", port))
-            .await
-            .is_err(),
-        "the data port is closed after the failure"
-    );
+    // 进程已经退出，内核随之关掉了它的全部 socket；不再断言「这个端口拒绝连接」：端口一释放，机器上别的进程
+    // （比如并行的测试）随时可能把它重新绑走。
 }
 
 #[test]

@@ -1481,7 +1481,9 @@ mod tests {
     /// 钩子失败（发现文件写不了）= 启动失败：两个监听器都停下，错误原样带出去，退出码由调用方定为 1。
     #[tokio::test]
     async fn a_failing_serving_hook_stops_both_servers_and_surfaces_its_error() {
-        let (data, admin, data_port, admin_port) = bind_pair().await;
+        let (data, admin, data_port, _admin_port) = bind_pair().await;
+        let state = AppState::default();
+        let our_instance_id = state.instance_id.clone();
         let signal = CancellationToken::new();
         let signal_wait = signal.clone();
         let result = tokio::time::timeout(
@@ -1489,7 +1491,7 @@ mod tests {
             serve_bound_with_hooks(
                 data,
                 admin,
-                AppState::default(),
+                state,
                 AdminSessionToken::mint(),
                 async move { signal_wait.cancelled().await },
                 ServeHooks {
@@ -1502,12 +1504,20 @@ mod tests {
         .await
         .unwrap_or_else(|_| panic!("a failing hook must end the serve loop on its own"));
         assert_eq!(result.unwrap_err(), "发现文件不可用（write_failed）");
-        for port in [data_port, admin_port] {
-            assert!(
-                tokio::net::TcpStream::connect(("127.0.0.1", port))
-                    .await
-                    .is_err(),
-                "listener on {port} must be closed after the failure"
+        // 我们这个实例不再应答。不能断言「端口一定拒绝连接」：端口一释放，机器上别的进程（比如并行的测试）
+        // 随时可能把它重新绑走；所以只要求「没有应答，或应答的不是我们的 instance_id」。
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        if let Ok(response) = client
+            .get(format!("http://127.0.0.1:{data_port}/health"))
+            .timeout(std::time::Duration::from_secs(2))
+            .send()
+            .await
+        {
+            let body: serde_json::Value = response.json().await.unwrap_or_default();
+            assert_ne!(
+                body["instance_id"],
+                serde_json::json!(our_instance_id),
+                "the failed instance must not keep serving"
             );
         }
     }
