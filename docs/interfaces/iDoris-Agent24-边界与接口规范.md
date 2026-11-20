@@ -1,6 +1,6 @@
 # iDoris × Agent24 分工边界与接口数据规范
 
-> **文档修订 1.6（拟议，wire 1.3.0，2026-11-20，待双方确认）**：Agent24 的 IDORIS-CORE（[Agent24#1937](https://github.com/iDoris-ai/Agent24/pull/1937)）要求 iDoris 成为 Agent24 的必选核心：动态端口与发现、登记与心跳、由 iDoris 托管 oMLX、embeddings 与预热。本修订新增 §2.10（登记协议 v1）与 §2.11（wire 契约 1.3.0，只新增），增补 §2.1、§2.2、§2.3、§2.5、§2.7、§2.8、§2.9、§4.2，协商记录见 R12。依据是 iDoris 侧评估与接口提案（[PR #614](https://github.com/iDoris-ai/iDoris/pull/614)，下称设计稿）和 Agent24 2026-11-20 对设计稿 §3.3 七个问题的答复。**本修订的所有条款都是拟议，待双方确认后冻结；冻结前不改变任何已冻结条款的承诺，增补处逐处标注，被取代的句子保留原文并注明。** 修订号说明：Agent24 方案里的「§2.7 修订 1.4」已被 §2.9（修订 1.4）占用，故本次记为修订 1.6。
+> **文档修订 1.6（拟议，wire 1.3.0，2026-11-20，待双方确认）**：Agent24 的 IDORIS-CORE（[Agent24#1937](https://github.com/iDoris-ai/Agent24/pull/1937)）要求 iDoris 成为 Agent24 的必选核心：动态端口与发现、登记与心跳、由 iDoris 托管本地推理引擎（首个实现是 oMLX）、embeddings 与预热。owner 同日追加：契约按多引擎设计，v0.6.0 只实现 oMLX。本修订新增 §2.10（登记协议 v1）、§2.11（wire 契约 1.3.0，只新增）与 §2.12（多引擎，预留），增补 §2.1、§2.2、§2.3、§2.5、§2.7、§2.8、§2.9、§4.2，协商记录见 R12。依据是 iDoris 侧评估与接口提案（[PR #614](https://github.com/iDoris-ai/iDoris/pull/614)，下称设计稿）和 Agent24 2026-11-20 对设计稿 §3.3 七个问题的答复。**本修订的所有条款都是拟议，待双方确认后冻结；冻结前不改变任何已冻结条款的承诺，增补处逐处标注，被取代的句子保留原文并注明。** 修订号说明：Agent24 方案里的「§2.7 修订 1.4」已被 §2.9（修订 1.4）占用，故本次记为修订 1.6。
 >
 > **文档修订 1.5，2026-11-19**：只改状态说法，不改契约内容。§2.9 中的推荐接口、本地模型列表和 oMLX 密钥顺序已在 iDoris v0.5.0 实现，wire 契约 1.2.0 随该版本生效；§2.9 的下载部分仍未实现，接口形状待另行修订。
 >
@@ -18,7 +18,7 @@
 | 标识 | 含义与基线 |
 |---|---|
 | 文档修订 `1.5` | 文字修订；不是服务 wire version。wire 契约版本见 §2.8；§2.9 的 wire 1.2.0 随 iDoris v0.5.0 生效（下载部分除外，尚未实现） |
-| 文档修订 `1.6`（拟议，2026-11-20，待双方确认） | 文字修订；不是服务 wire version。新增 §2.10、§2.11，增补 §2.1/2.2/2.3/2.5/2.7/2.8/2.9/4.2，协商记录 R12。条款拟议，待双方确认后冻结；冻结前以修订 1.5 及更早的已冻结条款为准，不得当作已发布契约，也不得据此宣称 iDoris 已实现 |
+| 文档修订 `1.6`（拟议，2026-11-20，待双方确认） | 文字修订；不是服务 wire version。新增 §2.10、§2.11、§2.12，增补 §2.1/2.2/2.3/2.5/2.7/2.8/2.9/4.2，协商记录 R12。条款拟议，待双方确认后冻结（§2.12 的预留项另待后续修订冻结）；冻结前以修订 1.5 及更早的已冻结条款为准，不得当作已发布契约，也不得据此宣称 iDoris 已实现 |
 | iDoris release `v0.3.0` | 实现提交 `03c079c70611331a8c85a1666e32a75df6359d09`（下称 I0） |
 | runtime `contract_version=1.0.1` | I0 的 `crates/idoris-contracts/src/version.rs::CONTRACT_VERSION`；TS `packages/contracts/src/version.ts` 同值 |
 | Agent24 审计基线 | `6072fd373142eb3dbf1a6a4a3222e6eec82c74f6`（下称 A0，固定历史快照，非当前 main）；main 源码状态不等于 stable 已发给用户 |
@@ -71,7 +71,7 @@
 ### 2.1 接入、生命周期与四类凭证
 
 - **修订 1.3**：agent24d 是 iDoris 的执行宿主，负责下载、安装、生成配置、签发 key、启动和停止，契约见 §2.7。iDoris daemon 不启动 Agent24。用户也可以自己手动启动 iDoris，这条路径继续支持。
-- **修订 1.6（拟议，待双方确认后冻结）**：launcher 托管时，iDoris 还负责拉起并管理 oMLX 引擎（§2.7.6）；iDoris 仍不启动 Agent24。Agent24 完成 R12 的 Q7 迁移后，不再直连 oMLX，Agent24 源码里不再出现任何 oMLX 地址，所有模型调用只经 iDoris。
+- **修订 1.6（拟议，待双方确认后冻结）**：launcher 托管时，iDoris 还负责拉起并管理本地推理引擎（首个实现是 oMLX，§2.7.6；多引擎见 §2.12）；iDoris 仍不启动 Agent24。Agent24 完成 R12 的 Q7 迁移后，不再直连 oMLX，Agent24 源码里不再出现任何 oMLX 地址（Agent24 方案对所有模型服务同样适用），所有模型调用只经 iDoris。
 - `IDORIS_URL` 必须显式配置，无隐含端口。D-1(a)：配置后独占 iDoris，不留直连 oMLX/Ollama 回退；缺 key、服务不可用或身份不符都明确失败。〔修订 1.6，拟议，待双方确认后冻结：launcher 托管时 iDoris 绑定内核分配的动态端口（§2.7.2），agent24d 经发现文件（§2.7.3）与登记（§2.10）取得实际端口并自行构造数据面地址，所以仍然没有隐含端口；手工启动、固定端口的路径不变，Agent24 用什么开关显式给出该地址不属于本契约。〕
 - 已接受完整模型是两个逻辑 provider：`idoris-local`=Local，固定 `local_only`；`idoris-any`=Remote，固定 `any`。按 URL 去重 models/容量，不能相加。D-6 两把 key 分别限定 `[local_only]` 与 `[local_only,any]`。§3 提议仅交付 local 子集，第二 provider/key 延后，不撤销 D-6。
 - 模块 manifest 未声明或声明 `local_only` 时使用 `idoris-local`；只有 `remote_allowed` 才有资格进入 `idoris-any`，仍不能扩大调用方已授予的权限。
@@ -91,7 +91,7 @@ I0 `idoris key issue --spec-stdin` 的实际 spec 为 `owner, tenant_id?, allowe
 
 Admin v0 为独立 loopback listener，只有 `status/backends/models/runtimes/roles` 五个只读 GET 和只读控制台。Electron main 固定客户端；renderer 只得零参数 `idorisStatus()`，不得提供 URL/path/port/header/token/FD selector。沿用 ADR-035 已接受的 65-byte canonical frame（64 小写 hex + LF）、读后关闭、秘密不继承到后代；选择器是分开的 `--idoris-admin-token-fd <n>`，不是 `=n`。此处不新增 framing、bootstrap HTTP 或 Admin 写接口。无 handoff 显示 `handoff-missing`，不读 env/file 猜 token。producer launcher 尚未交付，已有 consumer 不等于组合交付。
 
-**修订 1.6（拟议，待双方确认后冻结）取代上段两处**：「只有 `status/backends/models/runtimes/roles` 五个只读 GET 和只读控制台」，以及「此处不新增 … Admin 写接口」中的「Admin 写接口」一项。Admin 仍是独立 loopback listener，仍用同一个 Admin token，既有五个只读 GET 的形状不变；另新增只读 `GET /admin/api/v1/upstreams` 和受限写接口 `POST /admin/api/v1/upstreams/{id}/start|stop|restart`（§2.11.4，owner 已定）。写接口只作用于 iDoris 自己拥有的上游进程，不给外部进程发信号；模型 load/unload（[#611](https://github.com/iDoris-ai/iDoris/issues/611)）与 §2.9 的下载仍未交付，将沿用同一套 Admin 写接口通则（§2.11.4）另行修订。「不新增 framing、bootstrap HTTP」两项不变：`--launcher-stdin`（§2.7.1）是 launcher 到 iDoris 的 stdin 帧，不是 Admin 的 framing，上段的 ADR-035 65 字节帧与 `--idoris-admin-token-fd` 选择器不受影响。launcher 托管路径下 Electron main 不再持有 Admin token（R12-Q3），所以上段关于 Electron main 取 token 的 FD 交接在该路径下不再适用；ADR-035 本身是 Agent24 的内部决定，本修订不改它。§2.5「远程熔断开关」一条里的「当前 Admin v0 只读」同理，已在该处标注；§4 与 §5 表中「Admin 只读」的说法是对 I0 及历史材料的记述，不改。
+**修订 1.6（拟议，待双方确认后冻结）取代上段两处**：「只有 `status/backends/models/runtimes/roles` 五个只读 GET 和只读控制台」，以及「此处不新增 … Admin 写接口」中的「Admin 写接口」一项。Admin 仍是独立 loopback listener，仍用同一个 Admin token，既有五个只读 GET 的形状不变；另新增只读 `GET /admin/api/v1/upstreams` 和受限写接口 `POST /admin/api/v1/upstreams/{id}/start|stop|restart`（§2.11.4，owner 已定）。写接口只作用于 iDoris 自己拥有的上游进程，不给外部进程发信号；模型 load/unload（[#611](https://github.com/iDoris-ai/iDoris/issues/611)）与 §2.9 的下载仍未交付，将沿用同一套 Admin 写接口通则（§2.11.4）另行修订，预留的默认引擎切换 `make_default`（§2.12.3）同理。「不新增 framing、bootstrap HTTP」两项不变：`--launcher-stdin`（§2.7.1）是 launcher 到 iDoris 的 stdin 帧，不是 Admin 的 framing，上段的 ADR-035 65 字节帧与 `--idoris-admin-token-fd` 选择器不受影响。launcher 托管路径下 Electron main 不再持有 Admin token（R12-Q3），所以上段关于 Electron main 取 token 的 FD 交接在该路径下不再适用；ADR-035 本身是 Agent24 的内部决定，本修订不改它。§2.5「远程熔断开关」一条里的「当前 Admin v0 只读」同理，已在该处标注；§4 与 §5 表中「Admin 只读」的说法是对 I0 及历史材料的记述，不改。
 
 ### 2.2 凭证模块 vault（保留 J-4/J-5/J-7/J-8 的已接受设计，非 M4 已交付清单）
 
@@ -109,7 +109,7 @@ Admin v0 为独立 loopback listener，只有 `status/backends/models/runtimes/r
 - **法律边界**：组织内部共享付费账号可以；**跨用户转售托管账号不做**（PGL「平台不充当资金池」）。
 - **Agent24 侧前置（J-6）**：在 M4 接入 iDoris 之前，Agent24 修补 `shell_exec` 与 MCP 子进程继承环境变量的缺口（`env_clear` + 白名单，mcp.json 支持按 server 配置 env），防止 `IDORIS_API_KEY` 外泄。
 
-**修订 1.6 增补（拟议，待双方确认后冻结）**：vault 仍然没有接线，下面两件事都不经过它。（1）oMLX 上游 key 的注入，由「`provider.id` 等于 `omlx`」改为「loopback 的 `omlx@` 卡」（判据与 `GET /v1/models` 现有的 loopback `omlx` 卡判据一致），这样 §2.3 的伴生卡 `omlx-embed` 才能带 key；key 的来源顺序仍是 §2.9「oMLX 密钥」，iDoris 私有引擎的 key 见 §2.7.7。（2）自定义 OpenAI 兼容上游（§2.3 的 `idoris_upstream`）在 v0.6.x 只做 loopback、不带密钥：非 oMLX 的卡没有任何凭据注入；需要密钥的上游，以及局域网、远程上游（隐私等级 `any`、egress 计数、同意流程），等 vault (a) 接线之后另行修订。
+**修订 1.6 增补（拟议，待双方确认后冻结）**：vault 仍然没有接线，下面两件事都不经过它。（1）oMLX 上游 key 的注入，由「`provider.id` 等于 `omlx`」改为按卡的引擎种类识别：loopback 的、`engine_kind` 为 `omlx` 的卡（§2.12.1；这与 `GET /v1/models` 现有的 loopback `omlx@` 卡判据一致，v0.5.0 生成的卡因此不用改），这样 §2.3 的伴生卡 `omlx-embed` 才能带 key；key 的来源顺序仍是 §2.9「oMLX 密钥」，iDoris 私有引擎的 key 见 §2.7.7；其他引擎种类在 v0.6.0 不注入任何 key。（2）自定义 OpenAI 兼容上游（§2.3 的 `idoris_upstream`）在 v0.6.x 只做 loopback、不带密钥：非 oMLX 的卡没有任何凭据注入；需要密钥的上游，以及局域网、远程上游（隐私等级 `any`、egress 计数、同意流程），等 vault (a) 接线之后另行修订。
 
 ### 2.3 角色、实际模型与容量
 
@@ -117,7 +117,7 @@ Admin v0 为独立 loopback listener，只有 `status/backends/models/runtimes/r
 
 **运维 role map 目标**：仅在 HTTP 后端组件卡使用 `extensions.idoris_role_models`，由 iDoris 运维/自己的工具写配置；Agent24 只通过 HTTP 请求角色、展示实际模型，不写 YAML、不直接调加载/驱逐，也不使用库 API 旁路。每个 role（包括 `auto`）都要显式绑定具体 backend model ID；`auto` 不等于“选发现列表第一个”。缺绑定、未知/不可用模型或不符 local_only 时 fail-closed（无本地可用候选为 503），不跨角色猜测、不默认上云。候选支持范围与交付限制见 §4；不承诺订阅/进程后端也支持该扩展。
 
-**修订 1.6 增补（拟议，待双方确认后冻结）**：卡的 `extensions` 新增两个键，同 `idoris_role_models` 一样必须带 `_degradation`。`idoris_managed: {engine: omlx, mode: auto}`：该卡的引擎由 iDoris 托管（§2.7.6）；可执行文件路径、模型目录这类宿主信息不进卡，端点取卡的 `endpoint`。`idoris_upstream: {kind: openai_compat, flavor: <字符串>}`：自定义 OpenAI 兼容上游（LM Studio 等）；`Form` 枚举与卡 schema 是冻结契约，不新增 kind，上游种类只放在这里；生成这类卡的 `setup upstream` 子命令后移 v0.6.1，本修订不冻结它的形状。`embed` 角色在 HTTP 路径上由一张伴生 resident 卡承载：`setup omlx` 在 `omlx.yaml` 之外再写 `omlx-embed.yaml`（`provider.id` 为 `omlx-embed`，`endpoint` 与 `omlx.yaml` 相同，能力只有 `embedding`，`load_policy` 为 `resident` 加 `keepalive.pinned: true` 加 `admission: coexist`；给了 `--bind embed=<模型>` 时，`extensions.idoris_role_models.embed` 绑定该具体 embedding 模型，未绑定时这张卡对 embeddings 请求 fail-closed，返回 503）。随包文件仍是 5 个，伴生卡由 `setup` 生成，并列入 `--force` 的整体替换范围（§2.7.8）。行为约定见 §2.11.3。
+**修订 1.6 增补（拟议，待双方确认后冻结）**：卡的 `extensions` 新增两个键，同 `idoris_role_models` 一样必须带 `_degradation`。`idoris_managed: {engine: <engine_kind>, mode: auto}`：该卡的引擎由 iDoris 托管（§2.7.6），v0.6.0 只有 `{engine: omlx, mode: auto}`；`engine` 是引擎种类（`engine_kind`，§2.12.1，开放集合），本版本不认识的取值按卡校验失败处理，启动失败，不静默忽略；可执行文件路径、模型目录这类宿主信息不进卡，端点取卡的 `endpoint`。`idoris_upstream: {kind: openai_compat, flavor: <引擎种类>}`：自定义 OpenAI 兼容上游（LM Studio 等），`flavor` 就是该卡的 `engine_kind`，必须与 `version_pin` 的产品名一致；`Form` 枚举与卡 schema 是冻结契约，不新增 kind，上游种类只放在这里；生成这类卡的 `setup upstream` 子命令后移 v0.6.1，本修订不冻结它的形状。**每张引擎型卡的 `engine_kind` 恰好有一个来源**：有 `idoris_managed` 的卡取它的 `engine`；否则取 `version_pin` 里 `@` 之前的产品名（`omlx@0.6.4` 得 `omlx`，`lmstudio@unknown` 得 `lmstudio`；这与 v0.5.0 判断 oMLX 卡用的约定一致，已生成的卡不用改）；产品名不符合 §2.12.1 的格式时为 `unknown`；两者同时存在而不一致，卡校验失败。`setup` 生成的卡保证 `version_pin` 的产品名等于它的种类名。`embed` 角色在 HTTP 路径上由一张伴生 resident 卡承载：`setup omlx` 在 `omlx.yaml` 之外再写 `omlx-embed.yaml`（`provider.id` 为 `omlx-embed`，`endpoint` 与 `omlx.yaml` 相同，能力只有 `embedding`，`load_policy` 为 `resident` 加 `keepalive.pinned: true` 加 `admission: coexist`；给了 `--bind embed=<模型>` 时，`extensions.idoris_role_models.embed` 绑定该具体 embedding 模型，未绑定时这张卡对 embeddings 请求 fail-closed，返回 503）。随包文件仍是 5 个，伴生卡由 `setup` 生成，并列入 `--force` 的整体替换范围（§2.7.8）。行为约定见 §2.11.3。
 
 iDoris 拥有 catalog、推荐、实际模型身份、后端/量化选择以及分配额内的加载和驱逐。下载/预热/升级/回滚的功能归属也在 iDoris，但归属不表示已有下载服务。推荐 ID、provider ID、角色名与真实权重 ID 不可混为一谈；调用成功应使 load、上游 POST 和 `response.model` 的身份一致。
 
@@ -186,11 +186,11 @@ agent24d 托管 iDoris 时，按下表执行。表中都是已冻结的接口，
 | 启动 | 新增 `idoris serve --launcher-stdin`（§2.7.1）；`--admin-token-stdin` 与 65 字节旧帧不变，二者互斥 | 无 |
 | 就绪 | 两级就绪（§2.7.4）：「iDoris 可用」是本行判据加 Admin 可答，「模型可用」另看 `/health.phase` | 「启动前应确认 oMLX 可达」：对声明了托管的卡不再适用，iDoris 自己探测、拉起或报因（§2.7.6） |
 | 停止 | 自有引擎一并停止，分配在原 17 秒预算内（§2.7.5） | 无 |
-| 退出码 | 新增 4、5，并增加 1 的触发条件（§2.7.5） | 无，0、1、3 的含义不变 |
+| 退出码 | 新增 4、5，并增加 1 与 3 的触发条件（§2.7.5） | 无，0、1、3 的既有含义不变 |
 | 组件配置 | `setup omlx` 扩展（§2.7.8）；11 个既有错误码的语义不变 | 无 |
 | 布局 | 随包仍恰好 5 个文件，伴生卡等由 `setup` 生成（§2.7.9） | 无 |
 | 不承诺 | 更新（§2.7.9） | 无，只增加不承诺项 |
-| （新增） | 动态端口（§2.7.2）、发现文件（§2.7.3）、登记（§2.10）、oMLX 生命周期（§2.7.6）、引擎密钥（§2.7.7） | — |
+| （新增） | 动态端口（§2.7.2）、发现文件（§2.7.3）、登记（§2.10）、引擎生命周期（§2.7.6，首个实现是 oMLX）、引擎私有 key（§2.7.7）、多引擎预留（§2.12） | — |
 
 #### 2.7.1 `--launcher-stdin` 帧（拟议，待双方确认后冻结）
 
@@ -206,7 +206,7 @@ agent24d 托管 iDoris 时，按下表执行。表中都是已冻结的接口，
 | `register_socket` | string | 否 | 绝对路径，≤ 103 字节（macOS `sun_path` 为 104 字节含 NUL），不含 NUL。**出现则 `discovery_path` 必填**，否则 agent24d 拿不到 `instance_nonce`；缺省则不登记 |
 | `orphan_timeout_s` | integer | 否 | 0 到 86400；0 或缺省 = 不因「无登记会话」退出（§2.10.8）。**非 0 则 `register_socket` 必填**，否则永远登记不上，到时间就会自行退出。Agent24 取 900 |
 | `instance_nonce` | string | 否 | 64 位小写 hex；缺省由 iDoris 生成，生产用法不给这个字段，只给确定性测试用 |
-| `engine` | object | 否 | `{"omlx_executable"?: 绝对路径, "stop_on_exit"?: "owned" 或 "never"}`，未知子字段同样拒绝；缺省 `stop_on_exit` 为 `"owned"`（§2.7.6） |
+| `engine` | object | 否 | `{"executables"?: {"<engine_kind>": 绝对路径, …}, "stop_on_exit"?: "owned" 或 "never"}`。`executables` 的键是引擎种类（§2.12.1），v0.6.0 只认 `omlx`，其他键按 `field_invalid`（`engine.executables`）拒绝；值是 launcher 已校验过的可执行文件，视为可信，不再校验团队。未知子字段同样拒绝；缺省 `stop_on_exit` 为 `"owned"`（§2.7.6）。加引擎种类只是 `executables` 多一个键，不改这个字段的形状 |
 
 - 解析严格：未知字段一律拒绝。launcher 与 iDoris 是锁版本一起发的，字段拼错而静默失效，比直接失败更危险（这与 §2.10 的 UDS 帧「忽略未知字段」是两种有意的不同）。任何错误都只输出固定文案 `[idoris] 启动失败：launcher 帧无效（<原因码>[：<字段名>]）`，退出码 1，**绝不回显字段值**（不得把解析库的默认错误信息带出，里面会有输入片段）。原因码取值：`frame_too_long`、`frame_not_json`、`unsupported_frame_version`、`field_invalid`、`unknown_field`、`timeout`。
 - 已否决的做法：argv 传路径（`ps` 可见，且 `parse_args` 是精确匹配）、环境变量（会被 iDoris 自己的子进程继承）、替换旧 65 字节帧（破坏 ADR-035 与既有测试）。
@@ -232,7 +232,7 @@ agent24d 托管 iDoris 时，按下表执行。表中都是已冻结的接口，
 - **内容**：紧凑的一行 JSON 加 LF，≤ 4096 字节，UTF-8，权限 0600。
 
 ```
-{"schema":1,"service":"idoris","instance_id":"3f0c6a52-6a0e-4c0e-9a6e-0d2f1c7a9b11","instance_nonce":"000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f","pid":41234,"data_port":51234,"admin_port":51235,"version":"0.6.0","contract_version":"1.3.0","started_at_ms":1763625330123,"launch":{"db_path":"/Users/x/.agent24/idoris/idoris.sqlite3","state_dir":"/Users/x/.agent24/idoris/state","components_dir":"/Users/x/.agent24/components/idoris-config","allocated_budget_bytes":17179869184}}
+{"schema":1,"service":"idoris","instance_id":"3f0c6a52-6a0e-4c0e-9a6e-0d2f1c7a9b11","instance_nonce":"000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f","pid":41234,"data_port":51234,"admin_port":51235,"version":"0.6.0","contract_version":"1.3.0","started_at_ms":1763625330123,"launch":{"db_path":"/Users/x/.agent24/idoris/idoris.sqlite3","state_dir":"/Users/x/.agent24/idoris/state","components_dir":"/Users/x/.agent24/components/idoris-config","allocated_budget_bytes":17179869184,"engines":[{"id":"omlx","engine_kind":"omlx","managed":true},{"id":"omlx-embed","engine_kind":"omlx","managed":false}]}}
 ```
 
 | 字段 | 类型 | 说明 |
@@ -245,109 +245,112 @@ agent24d 托管 iDoris 时，按下表执行。表中都是已冻结的接口，
 | `data_port`、`admin_port` | integer | 1 到 65535，取自绑定之后的 `local_addr()`，不是请求值 |
 | `version`、`contract_version` | string | 等于 `/health` 同名字段 |
 | `started_at_ms` | integer | iDoris 开始 `run()` 时的 Unix 毫秒（墙钟）。时间字段名用 `started_at_ms`，不用 Agent24 方案里的 `started_at`（R12-Q2） |
-| `launch` | object，可选 | 启动输入快照：`db_path`（canonical 锁基路径）、`state_dir`、`components_dir`（canonical）、`allocated_budget_bytes`（u64 或 null）。供 agent24d 判断「这个孤儿的启动输入还是不是我要的」：不一致就重启，不接管 |
+| `launch` | object，可选 | 启动输入快照：`db_path`（canonical 锁基路径）、`state_dir`、`components_dir`（canonical）、`allocated_budget_bytes`（u64 或 null）、`engines`（数组，启动时从组件卡读到的引擎型上游的静态清单，元素 `{id, engine_kind, managed}`：`id` 是上游 id，`engine_kind` 见 §2.12.1，`managed` 同 `/health.upstreams[].managed`；没有引擎型上游时为空数组；不含状态，也不含默认引擎，这两样读 `/health` 与 Admin）。供 agent24d 判断「这个孤儿的启动输入还是不是我要的」：不一致就重启，不接管 |
 
 不含 `pid_start`：iDoris 取自己的内核启动时间需要不安全代码，而 workspace 禁用 unsafe。消费者自己读内核启动时间，与 `started_at_ms` 粗略比对（几秒内）即可；pid 复用由登记（HMAC）与 `/health.instance_id` 兜底。
 
 - **原子写法**：在同目录创建不可预测名字的临时文件 `.idoris-discovery.<pid>.<16 位随机 hex>.tmp`（`O_CREAT|O_EXCL|O_NOFOLLOW|O_CLOEXEC`，权限 0600，并 `fchmod` 到 0600 以不受 umask 影响），写入并 `fsync`，`rename` 覆盖目标，再尽力 `fsync` 目录；失败路径删临时文件。读者要么看到旧文件，要么看到完整的新文件。不用 `F_FULLFSYNC`：重启后 pid 本来就没了，不需要掉电后文件仍在。
 - **何时写**：同时满足（a）已持有实例锁，（b）数据面与 Admin 都已绑定，（c）服务已启动且 `/health` 能答（含 `phase:"starting"`）。登记（§2.10）在写文件之后。launcher 要求了发现文件而写失败，就是启动失败（退出码 1，固定文案），不允许「跑着但找不到」。
-- **自愈**：每 10 秒（与是否已登记无关）`lstat` 目标并核对 `instance_id`，缺失或不一致就重写，`rm -rf` 误删可以恢复。
-- **何时删**：优雅退出（SIGTERM、SIGINT、孤儿超时、退出码 5 的路径）时，在监听关闭之后、实例锁释放之前，**仅当文件里的 `instance_id` 等于自己**才删；读、比对、删除在同目录旁路锁文件 `<发现文件>.lock` 的独占 flock 下完成。SIGKILL、panic、掉电不删，即「崩溃残留」。
-- **残留的识别**（消费者侧，建议顺序）：读文件（≤ 4 KiB、普通文件、属主正确、`schema==1`）；`kill(pid, 0)` 存活、uid 相同、可执行路径等于安装路径；`GET /health`（不带任何凭据，2 秒）返回 `service=="idoris"` 且 `instance_id` 相等；LISTEN 属主核对；最后以登记为准（§2.10.9）。任何一步失败即视为陈旧，pid 已死才可以删文件，删除前同样持旁路锁并复核 `instance_id`。
+- **自愈**：每 10 秒（与是否已登记无关）`lstat` 目标并核对 `instance_id`，缺失或不一致就重写，`rm -rf` 误删可以恢复（收到 `instance_conflict` 之后不再重写，§2.10.4）。
+- **何时删**：优雅退出（SIGTERM、SIGINT、孤儿超时、退出码 5 与 `instance_conflict` 的路径）时，在监听关闭之后、实例锁释放之前，**仅当文件里的 `instance_id` 等于自己**才删；读、比对、删除在同目录旁路锁文件 `<发现文件>.lock` 的独占 flock 下完成。SIGKILL、panic、掉电不删，即「崩溃残留」。
+- **残留的识别**（消费者侧，建议顺序）：读文件（≤ 4 KiB、普通文件、属主正确、`schema==1`）；`kill(pid, 0)` 存活、uid 相同、可执行路径等于安装路径；`GET /health`（不带任何凭据，2 秒）返回 `service=="idoris"` 且 `instance_id` 相等；LISTEN 属主核对；最后以登记为准（§2.10.9）。任何一步失败即视为陈旧，pid 已死才可以删文件。删除残留的发现文件时，同样要持有旁路锁 `<发现文件>.lock` 并复核 `instance_id`（Agent24 2026-11-20 已确认，R12 已确认项 4）。
 - **iDoris 自己遇到陈旧文件**：实例锁是唯一事实来源。拿到锁的新实例把已有文件视为陈旧并覆盖；没拿到锁（退出码 3）的实例**不碰**文件，因为它属于还活着的那个实例。
 
 #### 2.7.4 两级就绪（拟议，待双方确认后冻结）
 
-托管 oMLX 冷启动（Python 加 MLX 加载加扫描模型目录）可能超过 launcher 现有的就绪窗口，所以「iDoris 可用」与「模型可用」分开判断（R12-Q4）：
+托管引擎冷启动可能超过 launcher 现有的就绪窗口（例如 oMLX：Python 加 MLX 加载加扫描模型目录），所以「iDoris 可用」与「模型可用」分开判断（R12-Q4）：
 
 | 级 | 判据 | 用途 | 时限 |
 |---|---|---|---|
 | iDoris 可用 | 上表「就绪」行的判据（`status=="ok"`、`version` 符合锁定版本、`contract_version` 的 major 为 1、进程仍存活），并且 Admin `GET /admin/api/v1/status` 以 Admin token 能答 200 | Agent24 发布网关槽位（发布之前还须通过 §2.10.9 的核对） | 沿用 launcher 自己的就绪窗口（Agent24 现为 30 秒，属 Agent24 内部参数，不在本契约内冻结），超时按启动失败处理 |
-| 模型可用 | `/health.phase=="ready"`，即 `ready==true`（§2.11.1） | Agent24 的 chat 放行 | `starting` 最长到引擎启动超时（默认 90 秒），期间界面显示「模型服务启动中」，**不得**因此把 iDoris 判为失败并重启 |
+| 模型可用 | `/health.phase=="ready"`，即 `ready==true`（§2.11.1） | Agent24 的 chat 放行 | `starting` 最长到引擎启动超时（oMLX 默认 90 秒，各引擎种类各有默认值），期间界面显示「模型服务启动中」，**不得**因此把 iDoris 判为失败并重启 |
 
 - `/health.status` 仍恒为 `"ok"`，只表示进程活着并在服务（设计稿 D8）；`phase` 与 `ready` 才表示模型可用。「iDoris 可用」之后、「模型可用」之前，数据面除 `/health` 外的路径返回 503 `idoris_starting`（§2.11.1）。
-- Agent24 侧承诺：chat 在 `phase!="ready"` 时有界等待，上限 120 秒，超时向调用方返回 503 加 `retry_after`（这是 Agent24 自己的响应，不是 iDoris 的）。
+- Agent24 侧承诺（Agent24 2026-11-20 已确认，含 R12 已确认项 1 的细化）：chat 只有在 `phase=="starting"`，或有上游处于 `restarting` 时才有界等待，上限 120 秒，超时向调用方返回 503 加 `retry_after`（这是 Agent24 自己的响应，不是 iDoris 的）。`phase=="degraded"` 且所有上游的 `reason` 都是终态原因（`engine_not_found`、`auth_required`、`auth_failed`、`budget_zero`）时不等待，立即返回 503 并带上该 `reason`，界面按 `reason` 引导用户；`engine_not_found` 引导安装引擎，是哪一种引擎看同一个上游元素里的 `engine_kind`（§2.11.1）。
 
 #### 2.7.5 停止顺序与退出码（拟议，待双方确认后冻结）
 
-**停止**：SIGTERM 与 SIGINT 仍走同一条优雅路径，总预算不变（iDoris 自己约 15 秒，即排空 10 秒加销毁 runtime 5 秒；launcher 17 秒后才 SIGKILL）。收到信号后并行执行：（1）向 agent24d 发 `bye`（至多 0.5 秒，§2.10.8）；（2）停止自己拥有的 oMLX（SIGTERM 整个进程组，8 秒宽限，之后 SIGKILL）；（3）HTTP 排空（沿用现有 10 秒上限）。然后：（4）删发现文件（监听关闭之后、实例锁释放之前，仅当 `instance_id` 匹配，§2.7.3）；（5）销毁 runtime（Drop 会 SIGKILL 剩余进程组，是最后一道兜底）；进程退出时内核释放实例锁。孤儿超时与退出码 5 走同一条路径。`engine.stop_on_exit` 为 `"never"` 时跳过（2），它只对 SIGTERM、SIGINT 的正常退出（退出码 0）有效；退出码 4、5 一律停止自己拥有的引擎。
+**停止**：SIGTERM 与 SIGINT 仍走同一条优雅路径，总预算不变（iDoris 自己约 15 秒，即排空 10 秒加销毁 runtime 5 秒；launcher 17 秒后才 SIGKILL）。收到信号后并行执行：（1）向 agent24d 发 `bye`（至多 0.5 秒，§2.10.8）；（2）停止自己拥有的引擎（SIGTERM 整个进程组，8 秒宽限，之后 SIGKILL）；（3）HTTP 排空（沿用现有 10 秒上限）。然后：（4）删发现文件（监听关闭之后、实例锁释放之前，仅当 `instance_id` 匹配，§2.7.3）；（5）销毁 runtime（Drop 会 SIGKILL 剩余进程组，是最后一道兜底）；进程退出时内核释放实例锁。孤儿超时、退出码 5 与 `instance_conflict` 的退出（§2.10.4）走同一条路径。`engine.stop_on_exit` 为 `"never"` 时跳过（2），它只对 SIGTERM、SIGINT 的正常退出（退出码 0）有效；退出码 4、5，以及因 `instance_conflict` 退出的 3，一律停止自己拥有的引擎。
 
-**退出码**（0、1、3 的含义不变，新增 4、5）：
+**退出码**（0、1、3 的既有含义不变，其中 1、3 增加了触发条件；新增 4、5）：
 
 | 码 | 含义 | launcher 行为 |
 |---|---|---|
 | 0 | 正常停止（SIGTERM、SIGINT） | 按预期 |
 | 1 | 启动失败或停止失败。修订 1.6 增加：launcher 帧无效、发现文件路径校验或写入失败 | 按崩溃处理，退避重启 |
-| 3 | 同一数据库已有实例在运行 | 去接管，不要重启 |
+| 3 | 同一数据库已有实例在运行。修订 1.6 增加：登记被 agent24d 以 `instance_conflict` 拒绝，即 agent24d 已有另一个健康实例（§2.10.4；定义是 Agent24 2026-11-20 确认的，iDoris 侧处理待 Agent24 复核） | 不要重启：前一种情形去接管那个实例，后一种情形 agent24d 已在监管它 |
 | 4（新） | 孤儿超时：launcher 给了 `orphan_timeout_s`，超过该时间没有已 `ack` 的登记会话（§2.10.8），主动优雅停止 | 按预期停止，**不计入**崩溃熔断（R12-Q5） |
 | 5（新） | iDoris 自己拉起（`owned`）的引擎失效，v0.6.0 无法在进程内恢复，优雅停止以让上层重启（§2.7.6） | **计入**崩溃熔断（R12-Q5），重启后走全新的启动门控 |
 
-#### 2.7.6 oMLX 生命周期（拟议，待双方确认后冻结）
+#### 2.7.6 引擎生命周期（首个实现是 oMLX）（拟议，待双方确认后冻结）
 
-**范围与已定决策。** 「引擎」指 oMLX 服务进程，「模型」指引擎里的权重。现有 Supervisor 管模型（load、unload、chat），新增的引擎管理器在它之下，只管进程；`OmlxAdapter` 继续用 HTTP 与引擎对话，不变。owner 已定：（设计稿 D2a）adopt 优先，找不到才拉起，拉起的实例是 iDoris 私有的；（设计稿 D2b）v0.6.0 的引擎由用户自装，iDoris 探测并报 `engine_not_found`，由 Agent24 界面引导安装，附带或按需下载 oMLX 以后再议。**只对声明了 `extensions.idoris_managed` 的卡生效**（§2.3）；没有托管卡时完全走 v0.5.0 的现有路径，行为不变。
+**范围与已定决策。** 「引擎」指 iDoris 经 HTTP 对话的本地推理服务进程，种类用 `engine_kind` 区分（§2.12.1，首个实现是 `omlx`），「模型」指引擎里的权重。本节的流程是**通用的**：引擎管理器按「引擎实例」建模，每个实例带自己的 `engine_kind`、状态机、所有权记录与日志，并按种类分派到该种类的「配方」（怎么探测、怎么发现与校验可执行文件、怎么拉起、是否支持私有 key）。v0.6.0 只实现 `omlx` 配方（本节标明「oMLX 配方」的段落）；以后加引擎种类只是增加配方，不改本节的通用字段与流程（owner 2026-11-20 的多引擎需求，§2.12）。现有 Supervisor 管模型（load、unload、chat），引擎管理器在它之下，只管进程；`OmlxAdapter` 继续用 HTTP 与 oMLX 引擎对话，不变。owner 已定：（设计稿 D2a）adopt 优先，找不到才拉起，拉起的实例是 iDoris 私有的；（设计稿 D2b）v0.6.0 的引擎由用户自装，iDoris 探测并报 `engine_not_found`，由 Agent24 界面引导安装，附带或按需下载引擎以后再议。**只对声明了 `extensions.idoris_managed` 的卡生效**（§2.3）；没有托管卡时完全走 v0.5.0 的现有路径，行为不变。
 
 **启动决策。** 对每张托管卡，在创建 Supervisor 之前依次：
 
 1. 读所有权记录（见下）。这一步必须先于探测：`kill -9` 之后遗留的自有引擎仍在监听，先探测会把它当成外部引擎，或者因为它的私有 key 而得到 401。记录存在且进程身份全部吻合，就接管自己遗留的引擎（`owned=true`，沿用记录里的 key，进入第 2 步用该 key 确认就绪）；记录存在但进程不吻合，丢弃记录；吻合但存在 `load.pending` 围栏时按下文处理。
-2. 探测卡的 `endpoint`：`GET /v1/models`，key 按 §2.9「oMLX 密钥」的顺序解析（接管了遗留引擎时用记录里的 key）；判据同 `setup omlx`，另要求 `/v1/models/status` 与 `/api/status` 也是 oMLX 的形状。200 且形状是 oMLX：就绪；接管的遗留引擎 `owned=true`，其余是外部引擎，`owned=false`，**iDoris 永远不给外部引擎发信号，退出时也不停它**。401/403 且没有可用 key：`unavailable`，`reason:"auth_required"`（或 `auth_failed`），**不再拉起第二个**。连接被拒：进入第 3 步。其他，即端口被非 oMLX 的服务占用（含形状不符）：`failed`，`reason:"port_in_use"`。
-3. 发现并校验可执行文件（见下）。找不到：该上游 `absent`，`reason:"engine_not_found"`，iDoris 本身继续服务，`/health` 给出原因，由 Agent24 界面引导用户安装。
-4. 拉起（见下）并等就绪：探测同第 2 步，默认 90 秒超时，轮询间隔从 250 毫秒退避到 1 秒。
+2. 按该种类配方的判据探测卡的 `endpoint`（oMLX 配方见下），key 按配方的顺序解析（oMLX 是 §2.9「oMLX 密钥」，接管了遗留引擎时用记录里的 key）。判据通过：就绪；接管的遗留引擎 `owned=true`，其余是外部引擎，`owned=false`，**iDoris 永远不给外部引擎发信号，退出时也不停它**。401/403 且没有可用 key：`unavailable`，`reason:"auth_required"`（或 `auth_failed`），**不再拉起第二个**。连接被拒：进入第 3 步。其他，即端口被不是这种引擎的服务占用（含形状不符）：`failed`，`reason:"port_in_use"`。
+3. 按配方发现并校验可执行文件（oMLX 配方见下）。找不到：该上游 `absent`，`reason:"engine_not_found"`，iDoris 本身继续服务；`/health` 与 Admin 的同一个上游元素里的 `engine_kind` 说明是哪种引擎没找到，由 Agent24 界面据此引导用户安装那一种（§2.11.1）。
+4. 按配方拉起（oMLX 配方见下）并等就绪：探测同第 2 步，启动超时（oMLX 默认 90 秒）内轮询，间隔从 250 毫秒退避到 1 秒。
 
-**可执行文件的发现与校验。** 发现顺序：（1）stdin 帧的 `engine.omlx_executable`（launcher 已校验，视为可信）；（2）`/Applications/oMLX.app/Contents/MacOS/omlx-cli`；（3）`~/Applications/oMLX.app/Contents/MacOS/omlx-cli`。**不使用 PATH 查找**：Agent24 启动 iDoris 时把 PATH 固定为 `/usr/bin:/bin:/usr/sbin:/sbin`，Homebrew 路径本来就不在里面；`~/.omlx/bin/omlx`、`/opt/homebrew/bin/omlx`、`/usr/local/bin/omlx` 只是指向 app 内 `omlx-cli` 的包装或链接，不作为发现目标。校验：`canonicalize` 之后必须是普通可执行文件；位于 `.app` 内时用 `/usr/bin/codesign --verify --strict` 并要求 `TeamIdentifier` 为 `PSK5Q5T46L`；launcher 显式给的路径不再校验团队。以上路径与团队标识来自设计稿附录 A 在 oMLX 0.6.4 上的只读实测，其他版本未实测，oMLX 换签名团队会使校验失败。模型目录：`~/Library/Application Support/oMLX/base-path` 存在且可读时，其内容作为 `OMLX_BASE_PATH` 传给引擎，否则不传，引擎用默认的 `~/.omlx/models`。
+**oMLX 配方 · 识别与探测。** `GET /v1/models`（key 按 §2.9「oMLX 密钥」的顺序）返回 200 且 JSON 里有 `data` 数组，就算就绪，空列表也算（模型目录可能是空的）；判据同 `setup omlx`，另要求 `/v1/models/status` 与 `/api/status` 也是 oMLX 的形状，形状不符按「端口被不是这种引擎的服务占用」处理。oMLX 没有 `/health`。
 
-**启动命令**（flags 已对照 oMLX 0.6.4 的 `omlx serve --help`，其他版本未实测）：
+**oMLX 配方 · 可执行文件的发现与校验。** 发现顺序：（1）stdin 帧的 `engine.executables.omlx`（launcher 已校验，视为可信）；（2）`/Applications/oMLX.app/Contents/MacOS/omlx-cli`；（3）`~/Applications/oMLX.app/Contents/MacOS/omlx-cli`。**不使用 PATH 查找**：Agent24 启动 iDoris 时把 PATH 固定为 `/usr/bin:/bin:/usr/sbin:/sbin`，Homebrew 路径本来就不在里面；`~/.omlx/bin/omlx`、`/opt/homebrew/bin/omlx`、`/usr/local/bin/omlx` 只是指向 app 内 `omlx-cli` 的包装或链接，不作为发现目标。校验：`canonicalize` 之后必须是普通可执行文件；位于 `.app` 内时用 `/usr/bin/codesign --verify --strict` 并要求 `TeamIdentifier` 为 `PSK5Q5T46L`；launcher 显式给的路径不再校验团队。以上路径与团队标识来自设计稿附录 A 在 oMLX 0.6.4 上的只读实测，其他版本未实测，oMLX 换签名团队会使校验失败。模型目录：`~/Library/Application Support/oMLX/base-path` 存在且可读时，其内容作为 `OMLX_BASE_PATH` 传给引擎，否则不传，引擎用默认的 `~/.omlx/models`。
+
+**oMLX 配方 · 启动命令**（flags 已对照 oMLX 0.6.4 的 `omlx serve --help`，其他版本未实测）：
 
 | 项 | 取值 |
 |---|---|
 | 可执行文件与参数 | 上面解析出的 `omlx-cli`；`serve --host 127.0.0.1 --port <卡 endpoint 的端口>`；设置了 `IDORIS_ALLOCATED_BUDGET_BYTES` 且换算后（十进制 GB，向下取整）≥ 1 时再加 `--memory-guard-gb <整数>` |
 | 环境 | `env_clear`，只放 `PATH=/usr/bin:/bin:/usr/sbin:/sbin`、`HOME`、`TMPDIR`、`LANG`、`LC_ALL`、`LC_CTYPE`、`TZ`、`OMLX_API_KEY`（§2.7.7）、`OMLX_BASE_PATH`（有才放）。iDoris 自己的 `IDORIS_*` 一个都不传给引擎 |
-| 工作目录与 stdio | 工作目录为状态目录；stdin 为 null；stdout 与 stderr 追加到 `<IDORIS_STATE_DIR>/logs/omlx.log`（超过 10 MiB 滚动，保留 3 份） |
+| 工作目录与 stdio | 工作目录为状态目录；stdin 为 null；stdout 与 stderr 追加到 `<IDORIS_STATE_DIR>/logs/<engine_kind>.log`（oMLX 即 `omlx.log`，超过 10 MiB 滚动，保留 3 份） |
 | 进程组 | 独立进程组；停止时 SIGTERM 整个组，8 秒宽限后 SIGKILL |
 
-`--memory-guard-gb` 让 oMLX 自己的内存上限与 iDoris 的额度账本一致，这是 iDoris 托管比外部引擎更稳的一个具体理由；`omlx serve --help` 没写单位，取十进制整数 GB 向下取整，偏保守。额度为 0 时不拉起（`reason:"budget_zero"`），因为什么都装不下。不使用 `--api-key` 命令行参数（argv 同 UID 可见）。
+oMLX 配方：`--memory-guard-gb` 让 oMLX 自己的内存上限与 iDoris 的额度账本一致，这是 iDoris 托管比外部引擎更稳的一个具体理由；`omlx serve --help` 没写单位，取十进制整数 GB 向下取整，偏保守。额度为 0 时不拉起（`reason:"budget_zero"`），因为什么都装不下。不使用 `--api-key` 命令行参数（argv 同 UID 可见）。
 
-**所有权记录与孤儿引擎。** iDoris 被 SIGKILL 时来不及停引擎，引擎成为孤儿，继续占着端口和内存，所以拉起成功后写所有权记录 `<IDORIS_STATE_DIR>/omlx-owned/<endpoint 编码>.json`（文件 0600、目录 0700，原子写法同 §2.7.3）：
+**所有权记录与孤儿引擎。** iDoris 被 SIGKILL 时来不及停引擎，引擎成为孤儿，继续占着端口和内存，所以拉起成功后写所有权记录 `<IDORIS_STATE_DIR>/engines-owned/<engine_kind>/<endpoint 编码>.json`（文件 0600、目录 0700，原子写法同 §2.7.3；按引擎种类分目录，同一种类的多个实例各一份）：
 
 ```json
-{"schema":1,"pid":51234,"port":19731,"started_at":"Fri Nov 20 15:14:05 2026","executable":"/Applications/oMLX.app/Contents/MacOS/omlx-cli","api_key":"<引擎私有 key>","launched_by_instance":"3f0c6a52-6a0e-4c0e-9a6e-0d2f1c7a9b11"}
+{"schema":1,"engine_kind":"omlx","pid":51234,"port":19731,"started_at":"Fri Nov 20 15:14:05 2026","executable":"/Applications/oMLX.app/Contents/MacOS/omlx-cli","api_key":"<引擎私有 key>","launched_by_instance":"3f0c6a52-6a0e-4c0e-9a6e-0d2f1c7a9b11"}
 ```
 
-`started_at` 是 `ps -o lstart= -p <pid>` 的原文（用 `ps` 子进程取是实现细节，契约只要求下面的四项身份校验）。新 iDoris 启动时：pid、启动时间、命令、监听端口四项全部吻合才算同一个进程，就接管，沿用记录里的 key，不重启引擎，已加载的模型继续在内存里；读不出来不算不吻合（不发信号，记录保留）；记录存在但进程不吻合（pid 被复用或已死）则丢弃记录。吻合但存在 `load.pending` 围栏时，引擎可能正处于加载中：**对自己拥有的引擎，杀掉整个进程组、确认已消失、清围栏、重新拉起**。这是托管比外部引擎多出来的一项能力，也是 Agent24 的「`kill -9` iDoris 后自动恢复」在加载进行中被杀时能过的前提；外部引擎的围栏保持原样，仍需人工处理，因为没有证据证明加载已经停止。`engine.stop_on_exit` 为 `"never"` 时，正常退出也保留引擎和记录，由下一个 iDoris 接管（适合 iDoris 升级重启时不想重新加载大模型）；默认 `"owned"`，退出时停掉自己拉起的引擎，避免孤儿占内存（`"never"` 与退出码 4、5 的关系见 §2.7.5）。
+`api_key` 只有支持私有 key 的引擎种类才有（§2.7.7）。`started_at` 是 `ps -o lstart= -p <pid>` 的原文（用 `ps` 子进程取是实现细节，契约只要求下面的四项身份校验）。新 iDoris 启动时：pid、启动时间、命令、监听端口四项全部吻合才算同一个进程，就接管，沿用记录里的 key，不重启引擎，已加载的模型继续在内存里；读不出来不算不吻合（不发信号，记录保留）；记录存在但进程不吻合（pid 被复用或已死）则丢弃记录。吻合但存在 `load.pending` 围栏时，引擎可能正处于加载中：**对自己拥有的引擎，杀掉整个进程组、确认已消失、清围栏、重新拉起**。这是托管比外部引擎多出来的一项能力，也是 Agent24 的「`kill -9` iDoris 后自动恢复」在加载进行中被杀时能过的前提；外部引擎的围栏保持原样，仍需人工处理，因为没有证据证明加载已经停止。`engine.stop_on_exit` 为 `"never"` 时，正常退出也保留引擎和记录，由下一个 iDoris 接管（适合 iDoris 升级重启时不想重新加载大模型）；默认 `"owned"`，退出时停掉自己拉起的引擎，避免孤儿占内存（`"never"` 与退出码 4、5 的关系见 §2.7.5）。
 
-**状态机、退避与就绪探测。** 状态即 `/health.upstreams[].state`（§2.11.1）：`starting` 到 `ready`；`ready` 探测失败或进程退出到 `restarting`（退避 1、2、4 秒起翻倍，封顶 30 秒，±20% 抖动；只适用于自有引擎，外部引擎探测失败只报 `unavailable`，iDoris 不重启它）；5 分钟内失败超过 5 次到 `failed`（`reason:"crash_loop"`），之后每 60 秒半开重试一次，不永久放弃（与 Agent24 方案 §3.1 同一套参数，两层口径一致）；Admin 显式停止到 `stopped`；找不到引擎到 `absent`。就绪探测：`GET /v1/models` 返回 200 且 JSON 里有 `data` 数组即可，空列表也算（模型目录可能是空的）；oMLX 没有 `/health`。
+**状态机、退避与就绪探测。** 状态即 `/health.upstreams[].state`（§2.11.1）：`starting` 到 `ready`；`ready` 探测失败或进程退出到 `restarting`（退避 1、2、4 秒起翻倍，封顶 30 秒，±20% 抖动；只适用于自有引擎，外部引擎探测失败只报 `unavailable`，iDoris 不重启它）；5 分钟内失败超过 5 次到 `failed`（`reason:"crash_loop"`），之后每 60 秒半开重试一次，不永久放弃（与 Agent24 方案 §3.1 同一套参数，两层口径一致）；Admin 显式停止到 `stopped`；找不到引擎到 `absent`。就绪探测由配方定义（oMLX 配方的判据见上）。
 
-**与 Supervisor、围栏、`/health` 的关系。** Supervisor 在创建时只对引擎采样一次，失败就把启动错误粘滞住，之后 list、status、chat、load、unload 一直返回该错误，必须重启 iDoris（v0.5.0 的行为，所以现在要求「先起 oMLX 再起 iDoris」）。因此托管时必须「引擎就绪之后才创建 Supervisor」，而引擎可能要 90 秒才好，期间 iDoris 要能答 `/health`。做法是可替换的服务体：数据面与 Admin 两个监听器照旧最先绑定，各自服务一个可原子替换的 Router。（1）启动期服务「starting 体」：`/health` 返回 `phase:"starting"`，Admin `status` 可用，数据面其余路径 503 `idoris_starting` 并带 `Retry-After`；（2）引擎管理器按上面的启动决策把引擎带到就绪；（3）用真实的服务状态构建完整 Router 并替换，此时 Supervisor 面对的是一个已就绪的引擎，不会再锁住启动错误。没有托管卡时跳过（1）到（3）。托管引擎一直没有就绪（`absent`、`failed`、`unavailable`）时替换不会发生，数据面保持（1）的 503，`/health` 用 `phase`（`starting` 或 `degraded`）与 `upstreams[].reason` 说明原因；引擎后来就绪（用户装好 oMLX 后 `start`，或半开重试成功）再替换。**待定**：门控未成功期间，同一进程里其他卡（例如非托管的 resident 卡）的可用性，设计稿未写，S5 实现前由 iDoris 补充并回填本节。
+**与 Supervisor、围栏、`/health` 的关系。** 下面以 oMLX 引擎为例：它的模型级生命周期由 Supervisor 管理；没有模型级生命周期的 resident 型引擎（如伴生卡、自定义上游）不经 Supervisor，也就没有这个问题。Supervisor 在创建时只对引擎采样一次，失败就把启动错误粘滞住，之后 list、status、chat、load、unload 一直返回该错误，必须重启 iDoris（v0.5.0 的行为，所以现在要求「先起 oMLX 再起 iDoris」）。因此托管时必须「引擎就绪之后才创建 Supervisor」，而引擎可能要 90 秒才好，期间 iDoris 要能答 `/health`。做法是可替换的服务体：数据面与 Admin 两个监听器照旧最先绑定，各自服务一个可原子替换的 Router。（1）启动期服务「starting 体」：`/health` 返回 `phase:"starting"`，Admin `status` 可用，数据面其余路径 503 `idoris_starting` 并带 `Retry-After`；（2）引擎管理器按上面的启动决策把引擎带到就绪；（3）用真实的服务状态构建完整 Router 并替换，此时 Supervisor 面对的是一个已就绪的引擎，不会再锁住启动错误。没有托管卡时跳过（1）到（3）。托管引擎一直没有就绪（`absent`、`failed`、`unavailable`）时替换不会发生，数据面保持（1）的 503，`/health` 用 `phase`（`starting` 或 `degraded`）与 `upstreams[].reason` 说明原因；引擎后来就绪（用户装好 oMLX 后 `start`，或半开重试成功）再替换。**待定**：门控未成功期间，同一进程里其他卡（例如非托管的 resident 卡）的可用性，设计稿未写，S5 实现前由 iDoris 补充并回填本节。
 
 **v0.6.0 与 v0.6.1 的边界。** v0.6.0 只做启动门控加拉起、停止、重启、孤儿接管（设计稿 3a）。运行期引擎换代（崩溃重启、外部引擎被用户重启）之后，Supervisor 的账本已过期，它以为 `Ready` 的模型其实已不在引擎里；热恢复（重建加替换，含围栏代际，设计稿 3b）后移 v0.6.1。v0.6.0 的兜底（设计稿 D4 的 B）：iDoris 自己拥有的引擎失效且无法在进程内恢复时，iDoris 优雅停止并以退出码 5 退出，由 agent24d 重启，重启后走全新的启动门控。外部引擎被用户重启这件事 v0.5.0 就存在，本修订不引入新问题，只在这里写明。退出码 5 的精确触发条件（进程一退出即退，还是 `restarting` 退避若干次之后才退）由实现定，发版时回填本节，launcher 不需要区分。
 
 **停止、重启与启动**（经 Admin，§2.11.4）。`stop`：向自己拥有的引擎进程组发 SIGTERM，8 秒宽限后 SIGKILL，状态 `stopped`；对 `owned=false` 的上游一律拒绝（409 `upstream_not_owned`），iDoris 不去停别人的进程。`restart`：`stop` 之后重新走启动决策，对 `owned=false` 的上游同样拒绝。`start`：从 `stopped`、`failed`、`absent` 或 `unavailable` 重新走启动决策，已经 `ready` 时幂等。
 
-#### 2.7.7 引擎密钥（拟议，待双方确认后冻结；设计稿 D10 待实测，结论回填）
+#### 2.7.7 引擎私有 key（拟议，待双方确认后冻结；oMLX 配方，设计稿 D10 待实测，结论回填）
 
-- 拟议做法：iDoris 自己拥有的引擎，每次拉起时由 CSPRNG 生成一个随机 key，经环境变量 `OMLX_API_KEY` 交给引擎子进程（不用 `--api-key`，argv 同 UID 可见），并记入 0600 的所有权记录（§2.7.6）。别的进程不带这个 key 访问该引擎得到 401，「所有模型调用只经 iDoris」才成为技术约束，而不只是约定。iDoris 内部 oMLX key 的解析仍是单一入口：私有引擎的 key 优先，其次才是 §2.9「oMLX 密钥」的顺序；外部（adopt）引擎不适用，仍按 §2.9 的顺序。该 key 只在 iDoris 与该引擎之间，不是 virtual key，也不会交给 Agent24。
+- 拟议做法（oMLX 配方；其他引擎种类各自声明是否支持私有 key 以及怎么传，不支持的种类没有这种隔离，不影响其他设计）：iDoris 自己拥有的引擎，每次拉起时由 CSPRNG 生成一个随机 key，经环境变量 `OMLX_API_KEY` 交给引擎子进程（不用 `--api-key`，argv 同 UID 可见），并记入 0600 的所有权记录（§2.7.6）。别的进程不带这个 key 访问该引擎得到 401，「所有模型调用只经 iDoris」才成为技术约束，而不只是约定。iDoris 内部 oMLX key 的解析仍是单一入口：私有引擎的 key 优先，其次才是 §2.9「oMLX 密钥」的顺序；外部（adopt）引擎不适用，仍按 §2.9 的顺序。该 key 只在 iDoris 与该引擎之间，不是 virtual key，也不会交给 Agent24。
 - **待实测，结论待回填**：环境变量 `OMLX_API_KEY` 与用户 `~/.omlx/settings.json` 里的 `auth.api_key` 同时存在时 oMLX 认哪个，尚未验证（设计稿起草时没有起引擎做实测）。验证办法：在一个空闲端口临时起 `omlx serve`，设环境变量，另用一份 settings.json，分别带两个 key 请求 `/v1/models`，看谁被接受，不加载任何模型。通过则启用上述做法；`settings.json` 优先则私有 key 不生效，退回现有 key 顺序，失去隔离，其余设计不变，并把本节改成「不隔离」。回填格式：结论（环境变量优先或 `settings.json` 优先）、oMLX 版本、日期。
 - 结论：**待实测**。
 
 #### 2.7.8 `setup omlx` 的扩展（拟议，待双方确认后冻结）
 
-解除 Agent24 connect 流程对「oMLX 必须在线」的依赖，并让 Agent24 里不再出现任何 oMLX 地址（R12-Q7）。上表「组件配置」行的命令形状保持有效，新增：
+解除 Agent24 connect 流程对「oMLX 必须在线」的依赖，并让 Agent24 里不再出现任何 oMLX 地址（R12-Q7）。上表「组件配置」行的命令形状保持有效。`setup omlx` 是 oMLX 专用的 setup，名字与既有的 11 个错误码不变；其他引擎种类的 setup 属预留（§2.12.1）：每种需要托管的引擎各有一个 `setup <engine_kind>`，不托管的 OpenAI 兼容引擎由 `setup upstream`（§2.3，v0.6.1）统一生成，不做通用的 `setup engine --kind`。新增：
 
 ```
 idoris setup omlx --out-dir <dir> [--endpoint <url> | --auto] [--managed] [--managed-port <n>]
                   [--bind role=model]… [--load-mode on_demand|resident] [--api-key-stdin] [--force] [--no-probe]
 ```
 
-- `--auto`：只读探测候选端点 `127.0.0.1` 的 8088、8000、8001（Agent24 现在在自己代码里探测的同一组，迁入 iDoris 之后 Agent24 才能真正删掉所有 oMLX 地址；多个同时可达时按这个顺序取第一个形状是 oMLX 的）。找到则等同 `--endpoint <找到的>`（adopt，卡不带 `idoris_managed`）；没找到则必须同时带 `--managed` 才继续，否则报 `unreachable`（保持现状）。
+- `--auto`：只读探测候选端点 `127.0.0.1` 的 8088、8000、8001（Agent24 现在在自己代码里探测的同一组，迁入 iDoris 之后 Agent24 才能真正删掉所有 oMLX 地址；多个同时可达时按这个顺序取第一个形状是 oMLX 的）。**不做候选列表接口**（Agent24 2026-11-20 已确认，R12 已确认项 2）：桌面端只显示结果（输出 JSON 的 `mode`、`endpoint`、`engine.installed`），本节不再补字段。找到则等同 `--endpoint <找到的>`（adopt，卡不带 `idoris_managed`）；没找到则必须同时带 `--managed` 才继续，否则报 `unreachable`（保持现状）。
 - `--managed`：卡带 `extensions.idoris_managed`，端点取 `--managed-port`；缺省时在 19000 到 19999 里挑一个此刻空闲的端口写进卡（私有端口，不占 oMLX 官方默认的 8000，避免用户之后启动 oMLX.app 时端口冲突）。`--managed` 与 `--auto` 联用且找到了外部 oMLX 时，本修订取保守的一边：adopt 外部引擎且不托管（待确认）。
 - `--no-probe`（`--managed` 隐含）：不连引擎。`--bind role=model` 改为对照 `~/.omlx/models` 目录校验（`idoris models local` 已能离线读取），所以 `--bind embed=bge-m3-mlx-fp16` 在引擎没起时也能写。
 - 新增错误码，现有 11 个不变：`engine_not_installed`（`--managed` 时找不到引擎可执行文件）、`port_in_use`（`--managed-port` 指定的端口已被占用）、`model_not_installed`（离线绑定时 `~/.omlx/models` 里没有该模型）。
-- 输出 JSON 增加 `mode`（`"adopt"` 或 `"managed"`）与 `engine`（`{installed, executable, version?}`）；伴生 resident 卡 `omlx-embed.yaml` 随 `omlx.yaml` 一并写入，并列入 `--force` 的整体替换范围（§2.3）。
-- Agent24 侧承诺（R12-Q7）：删除 `omlx_probe`，候选与配置全部改为调用 `idoris setup omlx --auto`（或 iDoris 另行提供的候选接口）；之后 Agent24 源码不再出现任何 oMLX 地址。
+- 输出 JSON 增加 `mode`（`"adopt"` 或 `"managed"`）与 `engine`（`{engine_kind, installed, executable, version?}`，`engine_kind` 是引擎种类，`setup omlx` 恒为 `"omlx"`）；既有字段（含 `endpoint`）不变。伴生 resident 卡 `omlx-embed.yaml` 随 `omlx.yaml` 一并写入，并列入 `--force` 的整体替换范围（§2.3）。
+- Agent24 侧承诺（R12-Q7）：删除 `omlx_probe`，候选与配置全部改为调用 `idoris setup omlx --auto`（不做候选列表接口，已确认）；之后 Agent24 源码不再出现任何 oMLX 地址。
+- 不承诺 / 以后修订（Agent24 2026-11-20 已确认，R12 已确认项 3）：`setup omlx` 的可执行文件路径参数（如 `--omlx-executable`）。v0.6.0 不随包附带 oMLX.app，引擎可执行文件只按默认位置发现（§2.7.6，oMLX 配方）；以后要随包时另行修订，届时与帧字段 `engine.executables.omlx` 对称地加上。
 
 #### 2.7.9 布局与不承诺（拟议，待双方确认后冻结）
 
 - 布局：随包仍恰好 5 个文件（上表「布局」行不变），Agent24 的锁文件里逐个列出的 5 个文件不变；伴生卡 `omlx-embed.yaml` 等都由 `setup` 生成在 `--out-dir`，不是随包文件。
-- 不承诺（在上表「不承诺」行之外增加）：iDoris 下载或安装 oMLX 引擎（v0.6.0 由用户自装；附带、按需下载以后再议）；运行期引擎换代后的热恢复（v0.6.1，v0.6.0 以退出码 5 兜底）；`setup upstream`（自定义上游的生成器）、Admin 的模型 load/unload（#611）、§2.9 的下载（后移 v0.6.1）；动态端口下 `idoris admin <资源> --token-stdin` 自动从发现文件取端口；embeddings 并入 Supervisor 的内存账本（§2.11.3，设计稿 E2，以后再做）。
+- 不承诺（在上表「不承诺」行之外增加）：iDoris 下载或安装任何引擎（v0.6.0 的 oMLX 由用户自装；附带、按需下载以后再议）；`setup omlx` 的可执行文件路径参数（以后修订，§2.7.8）；多引擎的实现（预留，§2.12）；运行期引擎换代后的热恢复（v0.6.1，v0.6.0 以退出码 5 兜底）；`setup upstream`（自定义上游的生成器）、Admin 的模型 load/unload（#611）、§2.9 的下载（后移 v0.6.1）；动态端口下 `idoris admin <资源> --token-stdin` 自动从发现文件取端口；embeddings 并入 Supervisor 的内存账本（§2.11.3，设计稿 E2，以后再做）。
 
 ### 2.8 wire 契约 1.1.0（iDoris v0.4.0）
 
@@ -440,7 +443,7 @@ idoris setup omlx --out-dir <dir> [--endpoint <url> | --auto] [--managed] [--man
 
 **不承诺**：`chat` 以外角色的推荐（embedding / vision / image 以后另行修订）；自动升级已安装的模型；Linux / x86。
 
-**修订 1.6 增补（拟议，待双方确认后冻结）**：Agent24 在 R12-Q7 中承诺删除 `omlx_probe`，候选与配置全部改为调用 `idoris setup omlx --auto`（§2.7.8），之后不再直连 oMLX。迁移完成后，上文「Agent24 的调用顺序」末句里「都没有 → 回落 `Qwen3-8B-4bit`，选择器按 oMLX `/v1/models` 列出」的直连回落，以及「Agent24 侧的 oMLX 密钥」一段，都只对迁移前的 Agent24 版本有效；迁移后 iDoris 不可用时 Agent24 的降级行为由 Agent24 自己定义，不属于本契约。下载部分的归属与状态不变。
+**修订 1.6 增补（拟议，待双方确认后冻结）**：Agent24 在 R12-Q7 中承诺删除 `omlx_probe`，候选与配置全部改为调用 `idoris setup omlx --auto`（§2.7.8），之后不再直连 oMLX。迁移完成后，上文「Agent24 的调用顺序」末句里「都没有 → 回落 `Qwen3-8B-4bit`，选择器按 oMLX `/v1/models` 列出」的直连回落，以及「Agent24 侧的 oMLX 密钥」一段，都只对迁移前的 Agent24 版本有效；迁移后 iDoris 不可用时 Agent24 的降级行为由 Agent24 自己定义，不属于本契约。多引擎时推荐按默认引擎可用的模型来给（预留，§2.12.5），v0.6.0 只有 oMLX，行为不变。下载部分的归属与状态不变。
 
 ### 2.10 登记协议 v1（修订 1.6，拟议，待双方确认后冻结）
 
@@ -448,14 +451,14 @@ idoris setup omlx --out-dir <dir> [--endpoint <url> | --auto] [--managed] [--man
 
 iDoris 是客户端，在 launcher 给的 Unix domain socket 上向 agent24d 登记，之后定期发心跳。它让 agent24d 知道「这个端口上跑的是哪个实例、是否健康」，也让 iDoris 知道有没有 launcher 还在。帧风格与 Agent24 已有的 `enroll.sock` 一致（一行一帧、单帧 ≤ 16 KiB、服务端先发 challenge、逐帧复核 `LOCAL_PEERTOKEN`），agent24d 可以复用同一套帧读取与复核代码。字节级测试向量见 §2.10.5。
 
-**活性只看 `/health`，心跳只用于发现连接断开并重新握手。** 登记连接静默、心跳停止，都不是判卡死的依据：被 `kill -STOP` 的进程与「agent24d 自己卡住」无法区分。卡死判定与重启只由 agent24d 对 `/health` 的探测决定（探测间隔与超时是 Agent24 内部参数，不在本契约内冻结）。登记失败也永远不使 iDoris 退出，唯一例外是 launcher 显式给了非 0 的 `orphan_timeout_s`（§2.10.8）。
+**活性只看 `/health`，心跳只用于发现连接断开并重新握手。** 登记连接静默、心跳停止，都不是判卡死的依据：被 `kill -STOP` 的进程与「agent24d 自己卡住」无法区分。卡死判定与重启只由 agent24d 对 `/health` 的探测决定（探测间隔与超时是 Agent24 内部参数，不在本契约内冻结）。登记失败（连不上、身份或证明被拒、版本不兼容等）永远不使 iDoris 退出；仅有的两个例外是：launcher 显式给了非 0 的 `orphan_timeout_s`（§2.10.8），以及 agent24d 回 `instance_conflict`（§2.10.4）。
 
 #### 2.10.1 传输与帧
 
 - 传输：AF_UNIX、SOCK_STREAM，路径来自 launcher 帧的 `register_socket`（§2.7.1）。同一时刻 iDoris 只持有一个连接。
 - 帧：一行一个 UTF-8 JSON 对象，以 LF 结尾，**每帧（含 LF）≤ 16384 字节**，不含 CR 和 BOM。超长、非 UTF-8、非对象、空行一律按 `bad_frame` 处理并关闭连接。接收方忽略未知字段（前向兼容），必填字段严格校验，`v` 必须等于 1。本协议最大的帧也只有约 350 字节。
 - 选 NDJSON 而不是长度前缀：与 `enroll.sock` 一致，全是文本，用 `socat` 可以直接调试，没有二进制载荷。
-- 两条与 `LOCAL_PEERTOKEN` 语义有关的义务：iDoris 在收到 `challenge` 之前不写任何字节（提前到达的字节可能被 agent24d 按 `identity_rejected` 拒绝并关闭连接）；UDS 的 fd 带 close-on-exec，不得被任何子进程（含 oMLX 引擎）继承。
+- 两条与 `LOCAL_PEERTOKEN` 语义有关的义务：iDoris 在收到 `challenge` 之前不写任何字节（提前到达的字节可能被 agent24d 按 `identity_rejected` 拒绝并关闭连接）；UDS 的 fd 带 close-on-exec，不得被任何子进程（含引擎进程）继承。
 
 #### 2.10.2 时序与计时
 
@@ -553,10 +556,12 @@ iDoris                                   agent24d
 | `bad_frame` | 双向 | 帧不合规 | 关闭连接，按默认退避重连 |
 | `timeout` | agent24d | 等待 iDoris 的帧超时 | 关闭连接，按默认退避重连 |
 | `busy` | agent24d | 并发已满 | 关闭连接，5 秒后重连 |
-| `instance_conflict` | agent24d | 实例冲突（确切语义待 Agent24 补充，见 R12 待确认项） | 关闭连接，按默认退避重连 |
+| `instance_conflict` | agent24d | agent24d 已有一个 `ack` 过、心跳正常的会话（`instance_id`=A），并且 A 的 `/health` 仍以 `instance_id`=A 应答，这时 `instance_id`=B 来登记：两个活实例同时出现，拒绝后来者，不顶掉现有会话。A 已经失联（心跳超时，或 `/health` 不通、`instance_id` 不符）时，B 正常登记，A 视为陈旧（Agent24 2026-11-20 已确认，§2.10.9） | **不重连**：优雅停止，退出码 3（§2.7.5；处理与理由见下） |
 | `internal` | 双向 | 内部错误 | 关闭连接，按默认退避重连 |
 
 iDoris 自己发 `error` 只用 `bad_frame`（服务端帧不合规）、`proof_invalid`（`ack.proof` 校验失败）、`internal`，而且只在已经收到 `challenge` 之后才发，尽力发送、不等应答，之后关闭连接。等 `challenge`、`ack`、`heartbeat_ack` 超时时 iDoris 不发 `error`，直接关闭连接：收到 `challenge` 之前它不写任何字节。agent24d 收到任何 `error` 都应结束该会话。
+
+**`instance_conflict` 之后 iDoris 的处理（iDoris 补，待 Agent24 复核）**：iDoris 不重连，也不继续服务，走正常的优雅停止路径（停止自己拥有的引擎、排空，发现文件仅当 `instance_id` 是自己的才删，§2.7.5），退出码 3，日志写 `idoris: 登记被 agent24d 以 instance_conflict 拒绝（已有另一个健康实例），已停止`；收到之后不再自愈重写发现文件；没有已 `ack` 的会话，所以不发 `bye`。选「退出」而不是「继续服务并按退避重试」，理由有四：（1）能同时出现两个活实例，说明它们用的不是同一个数据库（同一个数据库已被实例锁挡在退出码 3），所以后来者的数据 key、预算账和审计与 agent24d 已签发的 key 对不上，就算先到的 A 之后失联，让 B 顶上也只会得到一片 401，后来者没有候补价值；（2）agent24d 不知道 B 的端口，也不会用它，继续服务只是白占内存和它托管的引擎，重试只是在 A 健康期间反复被拒；（3）B 若继续存活，两个实例共用同一个发现文件路径时，各自每 10 秒的自愈会互相覆盖，agent24d 可能读到 B 的 `instance_nonce` 而使 A 的重新握手失败，B 退出才会停止这种覆盖；（4）退出码复用 3：launcher 对 3 的既有处理（不重启）正是此时要的，Agent24 不需要新增退出码，也不必重开已确认的退出码表。A 之后失联时，agent24d 本来就会按监管策略重启或接管，B 提前退出不影响恢复。同一个 `instance_id` 的重连不是冲突，新会话替换旧会话，`resume` 为 true。
 
 #### 2.10.5 `proof`：不让秘密上线（HMAC-SHA256）与测试向量
 
@@ -619,15 +624,15 @@ idoris-ack/v1\n0123456789abcdef\n00112233445566778899aabbccddeeff\na1b2c3d4e5f60
 | iDoris 判失联 | 连续 3 次心跳未应答（约 30 秒），或任何读写错误，或 EOF |
 | 服务端判失联（建议） | 3 倍 `heartbeat_ms`（缺省 30 秒）没有收到任何帧 |
 | 重连退避 | 第 1 次立即；之后 0.25、0.5、1、2、4、8 秒，再之后固定 10 秒；每次 ±20% 抖动；会话持续满 60 秒后清零 |
-| 特殊原因的固定等待 | `identity_rejected`、`unsupported_version`、`contract_incompatible`：60 秒；`proof_invalid`：30 秒；`busy`：5 秒 |
+| 特殊原因的固定等待 | `identity_rejected`、`unsupported_version`、`contract_incompatible`：60 秒；`proof_invalid`：30 秒；`busy`：5 秒；`instance_conflict` 不重连，iDoris 退出（§2.10.4） |
 | 日志 | 只记状态变化，以及首次失败和之后每第 10 次失败，不刷屏（Agent24 会把子进程输出管道读走，别写满） |
 
 - 退避上限取 10 秒而不是常见的 30 秒：本机 UDS 连接几乎没有成本，不存在惊群，而 agent24d 被 launchd 重启之后希望尽快重新握手，延迟上限就是退避上限。
-- **agent24d 拒绝或不在时，iDoris 继续服务，永不因为登记失败而退出**：`/health.registered` 为 false，数据面与 Admin 不受影响，按上表退避重试；agent24d 被重启之后，iDoris 重连、重新握手，`resume` 为 true。
+- **agent24d 拒绝或不在时，iDoris 继续服务，不因为登记失败而退出**（`instance_conflict` 与孤儿超时除外，§2.10.4、§2.10.8）：`/health.registered` 为 false，数据面与 Admin 不受影响，按上表退避重试；agent24d 被重启之后，iDoris 重连、重新握手，`resume` 为 true。
 
 #### 2.10.8 孤儿策略与 `bye`
 
-- **孤儿计时**：launcher 在帧里给了非 0 的 `orphan_timeout_s` 才启用（Agent24 取 900，R12-Q5）。从「没有已 `ack` 的登记会话」开始计时（包含进程启动后一直没登记上的情形），任何一次成功的 `ack` 把计时清零。超过 `orphan_timeout_s` 就走优雅停机（§2.7.5），退出码 4，日志写 `idoris: 无启动器登记超过 N 秒，已停止`。这条补上的缺口是：agent24d 被永久卸载或停掉之后，孤儿 iDoris 连同它托管的 oMLX 和已加载的模型会一直占着内存。手工运行（帧里没给）不受影响。
+- **孤儿计时**：launcher 在帧里给了非 0 的 `orphan_timeout_s` 才启用（Agent24 取 900，R12-Q5）。从「没有已 `ack` 的登记会话」开始计时（包含进程启动后一直没登记上的情形），任何一次成功的 `ack` 把计时清零。超过 `orphan_timeout_s` 就走优雅停机（§2.7.5），退出码 4，日志写 `idoris: 无启动器登记超过 N 秒，已停止`。这条补上的缺口是：agent24d 被永久卸载或停掉之后，孤儿 iDoris 连同它托管的引擎和已加载的模型会一直占着内存。手工运行（帧里没给）不受影响。
 - **`bye`**：优雅停止（SIGTERM、SIGINT、孤儿超时、退出码 5 的路径）时，iDoris 在已有的登记会话上尽力发 `bye`，至多 0.5 秒，不等应答，让 agent24d 区分「预期停止」与「崩溃」，对应 Agent24 方案里卡死与崩溃分开记录的要求。`reason` 本版只定义 `shutdown`，具体退出原因以退出码为准（§2.7.5）。
 
 #### 2.10.9 登记方校验与核对顺序（Agent24 承诺，R12-Q1，2026-11-20）
@@ -639,6 +644,7 @@ idoris-ack/v1\n0123456789abcdef\n00112233445566778899aabbccddeeff\na1b2c3d4e5f60
 3. **实例标识**：`GET /health`（**不带任何凭据**）返回的 `instance_id` 等于登记的 `instance_id`。
 4. **最后才发数据 key**：以上全部通过之后，才把数据 key 发给该数据面地址并发布网关槽位。`/health` 免鉴权，带上 key 反而可能把 key 发给占着端口的冒充者，所以 `/health` 请求永不带 key。
 5. **开发构建**：只有 agent24d 本身是非打包的开发构建，并且显式设置了 `AGENT24_DEV_ALLOW_UNSIGNED_IDORIS=1`，才接受未签名的登记方；打包版一律拒绝。iDoris 不提供任何绕过。
+6. **单实例会话**（Agent24 2026-11-20 已确认，R12 已确认项 4）：agent24d 同一时刻只持有一个健康会话。已有一个 `ack` 过、心跳正常的会话（`instance_id`=A），并且 A 的 `/health` 仍以 `instance_id`=A 应答时，另一个 `instance_id`=B 来登记，回 `instance_conflict`，拒绝后来者，不顶掉现有会话。A 已经失联（心跳超时，或 `/health` 不通、`instance_id` 不符）时，B 正常登记，A 视为陈旧；删除 A 留下的发现文件时，同样要持有旁路锁 `<发现文件>.lock` 并复核 `instance_id`（§2.7.3）。同一个 `instance_id` 重新登记（`resume:true`）不是冲突，新会话替换旧会话。
 
 另有一点：新 agent24d 没有旧 nonce，`instance_nonce` 从发现文件读，不经 stdin 传递（nonce 由 iDoris 生成，设计稿 D1）。
 
@@ -653,27 +659,29 @@ idoris-ack/v1\n0123456789abcdef\n00112233445566778899aabbccddeeff\na1b2c3d4e5f60
 ```json
 {"status":"ok","service":"idoris","version":"0.6.0","contract_version":"1.3.0","instance_id":"3f0c6a52-6a0e-4c0e-9a6e-0d2f1c7a9b11","components":2,"dev_no_key_enabled":false,
  "phase":"ready","ready":true,"started_at_ms":1763625330123,"registered":true,
- "upstreams":[{"id":"omlx","state":"ready","managed":true,"owned":true},
-              {"id":"omlx-embed","state":"ready","managed":false,"owned":false}]}
+ "upstreams":[{"id":"omlx","engine_kind":"omlx","state":"ready","managed":true,"owned":true},
+              {"id":"omlx-embed","engine_kind":"omlx","state":"ready","managed":false,"owned":false}]}
 ```
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
-| `phase` | string | `starting`：已绑定、已在答 `/health`，但启动门控未完成（正在探测或拉起 oMLX）；`ready`：至少一个 upstream 为 `ready`；`degraded`：进程正常，但没有 upstream 为 `ready` |
+| `phase` | string | `starting`：已绑定、已在答 `/health`，但启动门控未完成（正在探测或拉起引擎）；`ready`：至少一个 upstream 为 `ready`；`degraded`：进程正常，但没有 upstream 为 `ready` |
 | `ready` | boolean | 等于 `phase=="ready"` |
 | `started_at_ms` | integer | 同发现文件（§2.7.3） |
 | `registered` | boolean | 当前是否有已 `ack` 的登记会话；没有 launcher 时恒为 false |
 | `upstreams` | array | 上游列表：Supervisor 管理的卡与 resident 的 HTTP 卡。订阅中转这类进程卡是否列入待定，S1 实现前由 iDoris 确认；`components` 仍计所有卡 |
 | `upstreams[].id` | string | 卡的 `provider.id` |
+| `upstreams[].engine_kind` | string | 引擎种类，开放集合（§2.12.1）：小写字母、数字、下划线，首字符为字母，≤ 32 字符；v0.6.0 的引擎型上游是 `omlx`，无法识别时为 `unknown`。**每一项都有**；消费者对不认识的取值必须容忍，原样显示，不当错误，也不假定它的行为。来源规则见 §2.3 |
 | `upstreams[].state` | string | `ready`、`starting`、`unavailable`、`restarting`、`failed`、`stopped`、`absent`；状态机见 §2.7.6 |
 | `upstreams[].reason` | string，可选 | 稳定原因码：`engine_not_found`、`port_in_use`、`auth_required`、`auth_failed`、`startup_timeout`、`crash_loop`、`fence_pending`、`budget_zero`、`startup_latched`。给人看的文字另放，不属于契约 |
 | `upstreams[].managed` | boolean | 卡声明了由 iDoris 管理引擎（`extensions.idoris_managed`，§2.3） |
 | `upstreams[].owned` | boolean | 引擎进程是 iDoris 自己拉起的；外部引擎、被接管的外部引擎为 false，iDoris 永远不会给它发信号 |
 
-- 示例里的伴生卡 `omlx-embed` 与 `omlx` 共用同一个 endpoint，但不带 `idoris_managed`，所以 `managed` 与 `owned` 都是 false，状态由探测器给出；引擎的启停只经托管卡 `omlx`，对 `omlx-embed` 的 `stop`、`restart` 会被拒绝（§2.11.4）。
+- 示例里的伴生卡 `omlx-embed` 与 `omlx` 共用同一个 endpoint，但不带 `idoris_managed`，所以 `managed` 与 `owned` 都是 false，状态由探测器给出，`engine_kind` 仍是 `omlx`（来源是 `version_pin`，§2.3）；引擎的启停只经托管卡 `omlx`，对 `omlx-embed` 的 `stop`、`restart` 会被拒绝（§2.11.4）。
 - **`/health` 必须 O(1)，不做任何上游 I/O，响应 ≤ 200 毫秒。** 状态来自后台探测器与引擎管理器写入的快照。Agent24 每 5 秒探测、2 秒超时、连续 3 次超时就判卡死并 SIGTERM（Agent24 方案 §3.2，Agent24 内部参数），一个会被慢上游拖住的 `/health` 会造成误杀与重启风暴。
 - 由 Supervisor 管理的卡，状态取自 Supervisor，带 200 毫秒超时；Supervisor 返回启动错误时报 `unavailable` 加 `reason:"startup_latched"`，**不能**因为 `/v1/models` 能通就报 `ready`（聊天实际是 503）。resident 卡由探测器周期探测：`GET /v1/models`，key 按 §2.9「oMLX 密钥」的顺序解析，间隔 5 秒、2 秒超时；401/403 报 `auth_required` 或 `auth_failed`。
 - 调用方按 `state` 判可用性，按 `reason` 判原因，不要假定二者一一对应；`reason` 出现时 `state` 不是 `ready`。已定的配对：`engine_not_found` 对应 `absent`，`startup_latched` 与 `auth_required`、`auth_failed` 对应 `unavailable`，`crash_loop`、`port_in_use` 对应 `failed`；其余原因码的配对以实现为准。
+- **`engine_not_found` 总是和同一元素里的 `engine_kind` 一起出现**，说明是哪一种引擎没找到：界面据此引导用户安装那一种（`engine_kind` 为 `omlx` 就引导安装 oMLX），不用猜。
 - **启动期行为**（§2.7.6）：`phase:"starting"` 期间，数据面除 `/health` 外的路径返回 503，`error.type` 与 `error.reason_code` 都是 `idoris_starting`（写法同 §2.8 的 `headroom_confirmation_required`），带 `Retry-After`；Admin 的 `GET /admin/api/v1/status` 照常可用。
 
 #### 2.11.2 `POST /v1/models/warmup`
@@ -697,7 +705,7 @@ Content-Type: application/json
 | `timeout_ms` | 否 | 1000 到 300000，缺省 120000；未知字段一律 400 `unsupported_field`（G-6「不静默」） |
 
 - 鉴权与 key 范围同聊天：聊天在该模型上会被拒的 key，预热也被拒。
-- 选卡同聊天。**生命周期卡（oMLX）**：复用聊天路径里的加载前置（取 catalog、加载前占用检查、带余量确认的 load），加载完成即返回，**不生成任何 token**。**resident 卡**：没有生命周期可管，按能力发一个最小的真实请求（chat 用 `max_tokens:1`，embedding 用输入 `"warmup"`），受 `timeout_ms` 约束。
+- 选卡同聊天。**生命周期卡（目前只有 oMLX）**：复用聊天路径里的加载前置（取 catalog、加载前占用检查、带余量确认的 load），加载完成即返回，**不生成任何 token**。**resident 卡**：没有生命周期可管，按能力发一个最小的真实请求（chat 用 `max_tokens:1`，embedding 用输入 `"warmup"`），受 `timeout_ms` 约束。
 - 200 响应带 `X-iDoris-Record-Id` 与 `X-iDoris-Served-Locality`：
 
 ```json
@@ -714,7 +722,7 @@ Content-Type: application/json
 
 - **请求写 `model:"idoris/embed"`，数据 key 的 `allowed_roles` 含 `embed`。** Agent24 的本地数据 key 角色为 `daily`、`deep`、`embed`（R12-Q6，最小权限，不发全角色 key）。写具体模型名（如 Agent24 现在的 `bge-m3-mlx-fp16`）会被当作无角色请求，无角色请求要求 key 具备全部角色，否则 403 `role_forbidden`。
 - `local_only`：缺省即 `local_only`；只有可信本地卡（loopback、`local_only`、egress 只有 none 或 loopback）有资格；响应带 `X-iDoris-Served-Locality: loopback`，Agent24 的 embedding 客户端要求这个值。远程或局域网卡必须 `X-iDoris-Privacy: any` 且 key 允许 `any`；付费卡直接 503 `paid_proxy_unavailable`。多张 embedding 卡走现有的确定性选择管线，不做负载均衡。
-- 已知限制（要写进发行说明）：（a）resident 路径绕过 Supervisor，embedding 模型的内存不在 iDoris 账本里，由 oMLX 自己的内存上限兜底（托管引擎有 `--memory-guard-gb`，§2.7.6）；（b）冷加载 embedding 模型可能超过代理的 10 秒 header 超时，所以首次启用向量召回前应先调预热（§2.11.2），iDoris 另拟把 embeddings 路径的上游响应头超时放宽到 30 秒（实现参数，不是 wire 契约）；（c）Agent24 一批最多 64 条，响应远小于代理的 8 MiB 上限。
+- 已知限制（要写进发行说明）：（a）resident 路径绕过 Supervisor，embedding 模型的内存不在 iDoris 账本里，由 oMLX 自己的内存上限兜底（oMLX 配方的托管引擎有 `--memory-guard-gb`，§2.7.6）；（b）冷加载 embedding 模型可能超过代理的 10 秒 header 超时，所以首次启用向量召回前应先调预热（§2.11.2），iDoris 另拟把 embeddings 路径的上游响应头超时放宽到 30 秒（实现参数，不是 wire 契约）；（c）Agent24 一批最多 64 条，响应远小于代理的 8 MiB 上限。
 - 以后再做：给 Supervisor 加 embed 命令（带在途计数、驱逐感知、容量记账），账本最准确但改动大，v0.7 以后（设计稿 E2）。
 - **v0.5.0 的过渡写法**（不属于 wire 1.3.0，现在就能用）：`setup omlx --load-mode resident --bind embed=bge-m3-mlx-fp16`，2026-11-20 实测返回 200；代价是整张 oMLX 卡变成 resident，chat 失去生命周期内存管理。v0.6.0 起改用伴生 resident 卡，chat 保持 `on_demand`。
 
@@ -724,12 +732,12 @@ Admin 从「只有只读接口」改为「有受限写接口」（§2.1 已标�
 
 | 方法与路径 | 说明 |
 |---|---|
-| `GET /admin/api/v1/upstreams` | 只读；响应 `{"upstreams":[…]}`，元素字段同 `/health.upstreams[]`（§2.11.1） |
+| `GET /admin/api/v1/upstreams` | 只读；响应 `{"upstreams":[…]}`，元素字段同 `/health.upstreams[]`（含 `engine_kind`，§2.11.1） |
 | `POST /admin/api/v1/upstreams/{id}/start` | 从 `stopped`、`failed`、`absent` 或 `unavailable` 重新走启动决策（§2.7.6） |
 | `POST /admin/api/v1/upstreams/{id}/stop` | 停止 iDoris 自己拥有的引擎，状态 `stopped` |
 | `POST /admin/api/v1/upstreams/{id}/restart` | 先 `stop`，再重新走启动决策 |
 
-**Admin 写接口通则**（#611 的模型 load/unload 与 §2.9 的下载另行修订时沿用，本版不冻结它们的路径与字段）：
+**Admin 写接口通则**（#611 的模型 load/unload、§2.9 的下载与预留的默认引擎切换 `make_default`（§2.12.3）另行修订时沿用，本版不冻结它们的路径与字段）：
 
 - 方法 POST，不需要请求体；路径形如 `/admin/api/v1/<资源>/{id}/<动作>`；鉴权同其余 Admin 路由（Admin token）。
 - 幂等：目标状态已达成时，重复请求仍返回 202 与当前状态。
@@ -739,6 +747,82 @@ Admin 从「只有只读接口」改为「有受限写接口」（§2.1 已标�
 #### 2.11.5 工件与验收
 
 本节没有 JSON Schema（§4.2）：`/health` 新字段的形状由 conformance 用例锁定，warmup 的状态码矩阵和 Admin `upstreams` 由各自的集成测试覆盖，都在实现片里补，不在本修订里创建。发版时 `CONTRACT_VERSION` 升到 `1.3.0`。
+
+### 2.12 多引擎（修订 1.6，预留，v0.6.0 只实现 oMLX；待后续修订冻结）
+
+owner 2026-11-20 追加：iDoris 以后要支持多个引擎（oMLX、LM Studio、Ollama、llama.cpp、mlx_lm 等），引擎之间可以切换，默认引擎可以指定、可以修改。v0.6.0 只实现 oMLX，但契约按多引擎设计，以后加引擎时不改已冻结的字段。本节分两类：**进入 wire 1.3.0 的**只有「现在不定下就会返工」的那几项，它们已经写在 §2.2、§2.3、§2.7、§2.11 的对应位置，§2.12.6 的总表逐项指出，和修订 1.6 的其余部分一样拟议，待双方确认后冻结；**其余都是预留**，待后续修订冻结，v0.6.0 不实现，也不得当作当前 API（同 §0 末句）。本节写出方向和理由，目的是让 v0.6.0 的实现不返工。
+
+#### 2.12.1 引擎、引擎种类与配方（`engine_kind` 进入 wire 1.3.0，拟议，待双方确认后冻结；其余预留，待后续修订冻结）
+
+- **引擎种类 `engine_kind`**：开放集合的字符串，小写 ASCII 字母、数字、下划线，首字符为字母，≤ 32 字符（`^[a-z][a-z0-9_]{0,31}$`）。保留名，拼写现在定下，不接受别名：`omlx`（v0.6.0 唯一的实现）、`lmstudio`、`ollama`、`llama_cpp`、`mlx_lm`、`openai_compat`（不属于任何具体产品的 OpenAI 兼容服务，只探测、不托管）；`unknown` 表示无法识别种类。保留名不等于已实现。
+- **开放集合规则**：消费者对不认识的取值必须容忍：原样显示，不当错误，不假定它的行为。加一种引擎只是加一个取值，不改任何已冻结字段的形状。iDoris 自己遇到本版本不认识的 `idoris_managed.engine`，按卡校验失败处理，启动失败，不静默忽略。
+- **引擎与上游**：上游是组件卡在 `/health` 与 Admin 里的呈现，id 是 `provider.id`。一个引擎实例（种类加 endpoint）可以对应多张卡：主卡承载引擎的生命周期与聊天类能力，伴生卡（§2.3）共用同一个引擎，没有自己的生命周期。
+- **`engine_kind` 的来源**（每张引擎型卡恰好一个，规则见 §2.3）：有 `idoris_managed` 的卡取它的 `engine`；否则取 `version_pin` 里 `@` 之前的产品名（`omlx@0.6.4` 得 `omlx`），不符合上面的格式则为 `unknown`；两者同时存在而不一致，卡校验失败。
+- **配方**：每种引擎种类有一套配方：怎么识别并探测（是不是这种引擎、是否就绪、是否要鉴权）、怎么发现并校验可执行文件、怎么拉起、是否支持私有 key、模型级适配器怎么对话。v0.6.0 只有 `omlx` 配方（§2.7.6、§2.7.7）。加一种引擎需要且只需要：一个新的 `engine_kind` 取值（保留名已定）、一套配方、该种类的 setup 子命令（需要托管时）、launcher 帧 `engine.executables` 里的一个新键（需要托管时）；**不需要**改 `/health`、Admin、发现文件、登记协议、launcher 帧里任何已有字段。
+- **setup 的形态（预留，二选一已定）**：每种需要托管（拉起与停止）的引擎各有一个 `setup <engine_kind>` 子命令；`setup omlx` 的名字、形状和既有的 11 个错误码保持不变；不托管的 OpenAI 兼容引擎统一由 `setup upstream`（§2.3，计划 v0.6.1）生成；**不做**通用的 `setup engine --kind`。理由：（1）`setup omlx` 的形状与错误码已冻结，而且是 oMLX 专用语义（`not_omlx`、`--managed` 等），保持原样就不需要别名与兼容规则；（2）各引擎的探测方式、可托管的程度、要不要模型路径参数差别很大，通用命令要么变成「随种类变化的 flag 矩阵」，要么丢掉各自的错误码；（3）多数引擎（LM Studio、Ollama 的兼容端点、llama-server 等）只需要登记一个 loopback 端点，由 `setup upstream` 一个命令覆盖，不会出现每种引擎一个命令的局面。
+
+#### 2.12.2 引擎登记：同时知道多个引擎（预留，待后续修订冻结）
+
+- 引擎登记就是组件目录里有哪些引擎型卡：iDoris 启动时读取，对每张引擎型卡建立一个引擎条目。一个 iDoris 可以同时知道多个引擎实例，同种类的也可以有多个（例如两个端口上的 LM Studio）。每个实例独立：状态机、所有权记录、日志、Admin 的 `upstreams/{id}`（路径按上游 id 寻址，与引擎种类无关，多引擎下保持不变）。v0.6.0 里组件目录本来就能装多张卡，引擎型的只有一个 oMLX 实例。
+- **实现要求**（不是 wire 字段）：v0.6.0 的引擎管理器按「引擎实例」建模，实例带 `engine_kind`，按它分派到配方，不得写成「全局只有一个 oMLX」；这样加引擎种类不用重构。
+- 增删引擎：预留阶段是 `setup` 写卡后重启 iDoris 生效；免重启的热登记（Admin 写接口）留待后续修订。
+- 内存额度 `IDORIS_ALLOCATED_BUDGET_BYTES` 是整机分给 iDoris 的总额度，**不按引擎拆分**。多个引擎同时驻留模型时的统一账本与跨引擎驱逐属于预留，在第一个多引擎版本之前要定下；v0.6.0 里 Supervisor 的账本只覆盖 oMLX，切换时的影响见 §2.12.4。
+
+#### 2.12.3 默认引擎（预留，待后续修订冻结）
+
+- **含义**：默认引擎是一个上游 id（引擎主卡的 `provider.id`），表示调用方没有另行指定时、聊天类角色优先使用的引擎。它只是选择阶段的**优先项**，排在隐私、角色与能力、预算、容量这些闸门之后，不放宽任何闸门，也不改变候选资格：默认引擎合格就先选它；不合格（未就绪、没有该角色的绑定、被闸门排除）时，沿用现有的确定性选择顺序选下一个合格候选，不为此新增例外。「默认」不是「独占」。
+- **指定（静态）**：（a）`setup <engine_kind>` 的 `--default`，在该卡上写 `extensions.idoris_default: true`，至多一张卡带它，两张以上卡校验失败；（b）launcher 帧 `engine.default_upstream`（上游 id），由 Agent24 在每次启动时按它保存的用户选择下发，优先于（a）。`default_upstream` 指向的上游不存在或没有聊天能力时，iDoris 照常启动，按没有指定处理并记一行日志，不因此失败（用户可能已经删掉那个引擎）。都没有指定时：只有一个具备聊天能力的引擎型上游，它就是默认；有多个而没有指定，则没有默认，选择顺序沿用现有规则。v0.6.0 的 `--launcher-stdin` 不接受 `default_upstream`，`setup omlx` 也没有 `--default`；加上它们时 iDoris 与 launcher 一起升版本。
+- **修改（运行期）**：选定 `POST /admin/api/v1/upstreams/{id}/make_default`。理由（对比 `PUT /admin/api/v1/upstreams/default`）：（1）它属于 §2.11.4 的同一族写接口：POST、不需要请求体、返回 202 加该上游的当前状态、幂等、同一个 Admin token，Agent24 与测试夹具只多一条同形的路径，也不用再冻结新的请求体形状；（2）`PUT /admin/api/v1/upstreams/default` 与 `provider.id` 恰好叫 `default` 的上游同路径，而 id 是自由字符串，`{id}/make_default` 的动作段取自封闭集合，不会撞名；（3）错误沿用 §2.11.4 同一族的码：id 不存在是 404 `upstream_not_found`，不具备资格（不是引擎型上游，或没有聊天能力，例如伴生卡）是 409 `upstream_not_eligible`（同族新增）；（4）对当前默认再调一次，仍是 202 加当前状态。代价是没有「取消默认」：默认只会换到另一个引擎，不会变回「没有」，要回到「没有」就去掉静态指定后重启，这对偏好型的默认可以接受。修改不要求目标处于 `ready`（允许先选后装），响应里的 `state` 与 `reason` 让调用方决定要不要提示用户。
+- **不持久化**：iDoris 不记忆用户的选择（同 §2.9：Agent24 保存，iDoris 不记）。运行期的修改在重启后回到静态指定，Agent24 保存用户的选择，并在每次启动时经（b）下发。这样不用让 iDoris 去写 launcher 与 Agent24 拥有的配置，也只有一处事实来源。
+
+#### 2.12.4 切换的语义（预留，待后续修订冻结）
+
+- **只影响之后的新请求**：每个请求在选择阶段读取一次默认引擎。`make_default` 返回 202 之后才开始选择的请求用新的默认，此前已经选定引擎的请求不受影响。
+- **在途请求**：不中断、不重试、不迁移，在原引擎上跑完，`response.model` 如实反映原引擎；已经派发给原引擎、在它的生命周期队列里等待加载的请求同样留在原引擎；已开始 token 后不重试（既有规则）。预热同理：切换前发出的预热在原引擎上完成，所以 Agent24 应当先切换、再预热。
+- **内存里已加载的模型**：切换本身不加载、不卸载、不停止任何东西。旧引擎里的模型保留到它自己的空闲回收（oMLX 的 `idle_ttl_s`）、显式 `stop`（自有引擎，§2.11.4）或 `unload`（#611，另行修订）。理由：切换只是路由偏好，副作用越小越好，一次点击不应触发大模型的卸载与加载。
+- **切换与内存**：新默认引擎的首次请求走它自己的容量准入（含 §2.8 的 1GB 余量确认）。旧引擎的驻留模型仍占着整机内存，iDoris 不会为新引擎去驱逐另一个引擎里的模型（跨引擎账本是预留，§2.12.2），放不下就按既有的 503 规则失败。Settings 在切换后可以提示用户停止旧引擎（Admin `stop`，仅自有引擎）。
+- **`/health.phase` 的含义不变**：至少一个上游 `ready` 就是 `ready`，不看默认引擎。默认引擎暂时不可用时，Agent24 的「模型可用」门不会因此卡住，请求落到其他合格引擎。
+- **落点如实回传**：默认引擎不合格时请求会落到别的引擎（§2.12.3），`response.model` 已是具体模型 id；另预留响应头 `X-iDoris-Upstream`（实际服务的上游 id，名字待定），让调用方发现「没有落在默认引擎」（G-6「不静默」）。需要「默认引擎不可用就失败」的严格模式时，建议用请求头显式声明（类似 `X-iDoris-Fallback`），不做成全局开关；是否需要由 Agent24 提出。
+
+#### 2.12.5 与角色绑定、§2.9 推荐的关系（预留，待后续修订冻结）
+
+- `idoris_role_models` 是**每张卡自己的**：角色到该引擎里具体模型 id 的映射。`idoris/<role>` 解析时默认引擎的卡排第一，所以**同一个角色名在切换默认引擎之后会指向另一个具体模型**（`response.model` 随之变）；默认引擎没有该角色的绑定时，该卡不是候选，落到其他引擎的绑定（同样如实回传）。
+- **`embed`、`rerank` 不随默认引擎变化**：它们的候选顺序不受默认引擎影响，沿用现有的确定性选择，由各自的绑定决定。理由：embedding 模型决定向量空间，切换引擎而悄悄换了模型，会让 Agent24 已存的向量全部失效。要换 embedding 模型，须显式改绑定（`--bind embed=…`），并由 Agent24 重建索引。
+- **§2.9 的推荐按默认引擎可用的模型来给**：`GET /v1/recommendation?role=chat` 与 `GET /v1/models/local` 默认针对默认引擎，并预留查询参数 `engine=<上游 id>`（切换前预览另一个引擎）和响应里的 `engine: {id, engine_kind}`；`idoris recommend`、`idoris models local` 的命令行对应预留 `--engine`。§2.9 的档位表给的是 oMLX 目录名，只对 `engine_kind` 为 `omlx` 的引擎有意义；没有目录映射的引擎种类返回 `model_id: null`、`reason:"engine_not_supported"`。v0.6.0 里这些都不变（只有 oMLX），也不发出新字段。
+- 切换之后，Agent24 保存的默认 chat 模型（§2.9）是原引擎的具体模型 id，可能不存在于新引擎，Settings 应当在切换后重新取推荐与模型列表。
+
+#### 2.12.6 Agent24 Settings 的读接口与总表（拟议，待双方确认后冻结；其中标「预留」的待后续修订冻结）
+
+Agent24 经 agent24d 的 `/api/v1/idoris/*` 访问 Admin（R12-Q3）。Settings 需要的读接口：
+
+| 需要 | 接口 | 状态 |
+|---|---|---|
+| 引擎列表（种类、状态、是否托管、是否自有） | Admin `GET /admin/api/v1/upstreams`，以及免 token 的 `/health.upstreams`，元素都带 `engine_kind`（§2.11） | wire 1.3.0，v0.6.0 实现 |
+| 当前默认引擎 | 同一元素里新增布尔字段 `default`：至多一个 true，没有默认时全为 false | 预留 |
+| 每个引擎的模型 | Admin `GET /admin/api/v1/models`（Admin v0 已有，按 `provider_id` 分组）；`GET /v1/models/local` 的 `engine` 参数 | Admin v0 已有；`engine` 参数预留 |
+| 每个引擎已绑定的角色（切换前提示缺哪些） | 同一元素里新增 `roles`（角色名数组） | 预留 |
+| 本版本支持哪些引擎种类（「添加引擎」用） | 只读路由，名字待定 | 预留 |
+| 切换默认引擎 | `POST /admin/api/v1/upstreams/{id}/make_default`（§2.12.3） | 预留 |
+
+哪些进入 wire 1.3.0，哪些只是预留：
+
+| 项 | 状态 |
+|---|---|
+| `engine_kind`：取值规则、保留名、开放集合的容忍规则（§2.12.1） | wire 1.3.0 |
+| `/health.upstreams[].engine_kind` 与 Admin `upstreams` 的元素（§2.11.1、§2.11.4） | wire 1.3.0 |
+| `engine_kind` 的来源规则，`idoris_managed.engine` 的取值就是 `engine_kind`（§2.3） | wire 1.3.0 |
+| `engine_not_found` 与同一元素里的 `engine_kind` 同时出现（§2.11.1） | wire 1.3.0 |
+| 发现文件 `launch.engines`（§2.7.3） | wire 1.3.0 |
+| launcher 帧 `engine.executables`，键为 `engine_kind`（§2.7.1） | wire 1.3.0 |
+| `setup omlx` 输出的 `engine` 对象里的 `engine_kind`（§2.7.8） | wire 1.3.0 |
+| 所有权记录按种类分目录并带 `engine_kind`，日志按种类命名（§2.7.6） | 内部格式，随 v0.6.0 |
+| 多个引擎实例同时登记、独立管理（§2.12.2） | 预留 |
+| 默认引擎：`idoris_default`、`engine.default_upstream`、`make_default`、元素 `default`（§2.12.3） | 预留 |
+| 切换的语义、响应头 `X-iDoris-Upstream`（§2.12.4） | 预留 |
+| 推荐与本地模型列表的 `engine` 参数、`engine_not_supported`（§2.12.5） | 预留 |
+| 元素 `roles`、引擎种类清单路由（本节上表） | 预留 |
+| `setup <engine_kind>`、`setup upstream`（§2.12.1、§2.3） | 预留，`setup upstream` 计划 v0.6.1 |
+| 免重启的热登记、跨引擎的内存账本（§2.12.2） | 预留 |
 
 ## 3. 拟议 v0.3.1 local_only 数据面切片（待联合验收）
 
@@ -821,11 +905,11 @@ Admin 从「只有只读接口」改为「有受限写接口」（§2.1 已标�
 | R9 | 2026-10-15 | iDoris | [文档修订 1.2 整合与三个 owner 决策](negotiation/R9-v1.2-协商提案.md)；local_only v0.3.1 最小数据面与 launcher 解耦 | OD-1/OD-2 已由修订 1.3 决定（见 §2.7）；fast/daily 标签重标仍 **OWNER REVIEW PENDING** |
 | R10 | 2026-10-28 | jason / 双方 | 文档修订 1.3：owner 要求 Agent24 桌面端一站式「下载 → 运行 → 连接」，由此定下 OD-1（宿主为 agent24d）、OD-2（用户在桌面端同意）；新增 §2.7 launcher 托管契约（iDoris v0.4.0 起）、§2.8 wire 契约 1.1.0 | launcher 设计已合入 [Agent24#1437](https://github.com/iDoris-ai/Agent24/pull/1437)；按 v0.4.0 的实现与验收是 Agent24 的 IL-01 起各项，尚未完成。其中「额度紧时 503 `headroom_confirmation_required` → 用户确认 → 重发」的确认交互登记为 ID-HR，见 [Agent24#1442](https://github.com/iDoris-ai/Agent24/pull/1442) |
 | R11 | 2026-11-15 | jason / 双方 | 文档修订 1.4：新增 §2.9 本机 chat 模型推荐（`GET /v1/recommendation?role=chat`、`idoris recommend --role chat --json`）、本地模型类别（`GET /v1/models/local`、`kind`）、下载归 iDoris 且须用户确认、oMLX 密钥读取顺序；档位 16/24/32GB → Qwen3-8B-4bit，48GB+ → Qwen3.8-27B-OptiQ-4bit，64GB+ 可选 Qwen3.6-35B-A3B-OptiQ-4bit | iDoris 与 Agent24 会话各确认一次（2026-11-15）；iDoris 侧推荐、列表与密钥顺序已在 v0.5.0 实现（#604、#605，文档修订 1.5）；下载未实现；Agent24 先做不依赖 iDoris 的部分 |
-| R12 | 2026-11-20 | iDoris / Agent24 | 文档修订 1.6（拟议，wire 1.3.0）：IDORIS-CORE（[Agent24#1937](https://github.com/iDoris-ai/Agent24/pull/1937)）。iDoris 提案见设计稿（[PR #614](https://github.com/iDoris-ai/iDoris/pull/614)）；新增 §2.10 登记协议 v1、§2.11 wire 契约 1.3.0，增补 §2.1/2.2/2.3/2.5/2.7/2.8/2.9/4.2。Agent24 2026-11-20 对设计稿 §3.3 七个问题的答复：<br>• Q1：登记方允许清单含 identifier `ai.idoris.cli`（Team `HYAP444FN9`）；只有 agent24d 本身是非打包的开发构建、且显式设置 `AGENT24_DEV_ALLOW_UNSIGNED_IDORIS=1` 时才接受未签名登记方，打包版一律拒绝。<br>• Q2：发现文件的时间字段用 `started_at_ms`（毫秒整数），不用 Agent24 方案里的 `started_at`。<br>• Q3：Electron main 不持有 Admin token，桌面端所有 Admin 操作走 agent24d 的 `/api/v1/idoris/*`，`set_admin_token` 轮换只是 agent24d 内部的事。<br>• Q4：两级就绪：`status=="ok"` 且 Admin 可答为 iDoris 可用（Agent24 发布网关槽位），`phase=="ready"` 为模型可用，`starting` 最长 90 秒；Agent24 的 chat 在 `phase!="ready"` 时有界等待，上限 120 秒，超时 503 加 `retry_after`。<br>• Q5：退出码 4（孤儿超时）不计入 Agent24 崩溃熔断，5（自有引擎无法恢复）计入。<br>• Q6：embeddings 请求发 `model:"idoris/embed"`，数据 key 的角色为 `daily`、`deep`、`embed`（最小权限，不发全角色 key）；v0.5.0 的过渡写法见 §2.11.3，v0.6.0 用伴生 resident 卡，chat 保持 `on_demand`。<br>• Q7：Agent24 删除 `omlx_probe`，候选与配置全部改为调用 `idoris setup omlx --auto`（或 iDoris 提供的候选接口），之后 Agent24 源码不再出现任何 oMLX 地址。<br>另已商定：nonce 由 iDoris 生成，写进 0600 发现文件，登记用 HMAC 证明，nonce 不上线；`/health` 只返回公开的 `instance_id`；Agent24 的核对顺序是先 `LOCAL_PEERTOKEN` 与端口属主，再 `/health.instance_id`，最后才发数据 key，`/health` 不带 key；孤儿超时 `orphan_timeout_s` 由 launcher 给（Agent24 取 900）；Admin 新增受限写接口 `upstreams/{id}/start\ owner 2026-11-20：OD-2（安装 iDoris 须用户在桌面端同意）被取代，iDoris 随 Agent24 自动安装、不弹同意。 |stop\|restart`；引擎在 v0.6.0 由用户自装，iDoris 报 `engine_not_found` | **拟议，待 Agent24 评审**。上列 Q1–Q7 是 Agent24 已给出的答复，规范文字本身评审后才冻结；冻结前不改变任何已冻结条款，也不是 iDoris 已实现的功能。Agent24 方案里的「§2.7 修订 1.4」编号改记为修订 1.6 |
+| R12 | 2026-11-20 | iDoris / Agent24 | 文档修订 1.6（拟议，wire 1.3.0）：IDORIS-CORE（[Agent24#1937](https://github.com/iDoris-ai/Agent24/pull/1937)）。iDoris 提案见设计稿（[PR #614](https://github.com/iDoris-ai/iDoris/pull/614)）；新增 §2.10 登记协议 v1、§2.11 wire 契约 1.3.0、§2.12 多引擎（预留），增补 §2.1/2.2/2.3/2.5/2.7/2.8/2.9/4.2。Agent24 2026-11-20 对设计稿 §3.3 七个问题的答复：<br>• Q1：登记方允许清单含 identifier `ai.idoris.cli`（Team `HYAP444FN9`）；只有 agent24d 本身是非打包的开发构建、且显式设置 `AGENT24_DEV_ALLOW_UNSIGNED_IDORIS=1` 时才接受未签名登记方，打包版一律拒绝。<br>• Q2：发现文件的时间字段用 `started_at_ms`（毫秒整数），不用 Agent24 方案里的 `started_at`。<br>• Q3：Electron main 不持有 Admin token，桌面端所有 Admin 操作走 agent24d 的 `/api/v1/idoris/*`，`set_admin_token` 轮换只是 agent24d 内部的事。<br>• Q4：两级就绪：`status=="ok"` 且 Admin 可答为 iDoris 可用（Agent24 发布网关槽位），`phase=="ready"` 为模型可用，`starting` 最长 90 秒；Agent24 的 chat 在 `phase!="ready"` 时有界等待，上限 120 秒，超时 503 加 `retry_after`（Agent24 随后细化为只在 `starting` 或有上游 `restarting` 时才等待，见下方「已确认项」第 1 条）。<br>• Q5：退出码 4（孤儿超时）不计入 Agent24 崩溃熔断，5（自有引擎无法恢复）计入。<br>• Q6：embeddings 请求发 `model:"idoris/embed"`，数据 key 的角色为 `daily`、`deep`、`embed`（最小权限，不发全角色 key）；v0.5.0 的过渡写法见 §2.11.3，v0.6.0 用伴生 resident 卡，chat 保持 `on_demand`。<br>• Q7：Agent24 删除 `omlx_probe`，候选与配置全部改为调用 `idoris setup omlx --auto`（原答复里「或 iDoris 提供的候选接口」已由下方「已确认项」第 2 条确认为不做候选接口），之后 Agent24 源码不再出现任何 oMLX 地址。<br>另已商定：nonce 由 iDoris 生成，写进 0600 发现文件，登记用 HMAC 证明，nonce 不上线；`/health` 只返回公开的 `instance_id`；Agent24 的核对顺序是先 `LOCAL_PEERTOKEN` 与端口属主，再 `/health.instance_id`，最后才发数据 key，`/health` 不带 key；孤儿超时 `orphan_timeout_s` 由 launcher 给（Agent24 取 900）；Admin 新增受限写接口 `upstreams/{id}/start\|stop\|restart`；引擎在 v0.6.0 由用户自装，iDoris 报 `engine_not_found`。<br>owner 2026-11-20：OD-2（安装 iDoris 须用户在桌面端同意）被取代，iDoris 随 Agent24 自动安装、不弹同意（§6）。<br>owner 2026-11-20（追加）：多引擎需求。iDoris 以后要支持多个引擎（oMLX、LM Studio、Ollama、llama.cpp、mlx_lm 等），引擎之间可以切换，默认引擎可以指定、可以修改；v0.6.0 只实现 oMLX，预留字段与契约见 §2.12（`engine_kind` 进入 wire 1.3.0，其余预留），实现另排。<br>Agent24 承诺（自身实现的注意事项，不改规范正文）：agent24d 拉起 iDoris 时用 `setsid` 放进独立会话，这样 launchd 回收 agent24d 时不会连带杀掉 iDoris，接管孤儿才能成立；核对端口属主用 `proc_pidfdinfo`（libproc），不用 `lsof` 子进程。 | **拟议；Agent24 已评审并同意冻结（#615，2026-11-20）。** 上列 Q1–Q7 与下方「已确认项」都是 Agent24 的答复；评审之后追加的内容（§2.12 多引擎预留、`instance_conflict` 的 iDoris 侧处理）待 Agent24 复核。冻结前不改变任何已冻结条款，也不是 iDoris 已实现的功能；§2.12 的预留项另待后续修订冻结。Agent24 方案里的「§2.7 修订 1.4」编号改记为修订 1.6 |
 
-**R12 待确认项（拟议，请 Agent24 评审时回答）**：
+**R12 已确认项（Agent24 2026-11-20；原为待确认项，已回填进正文对应位置）**：
 
-1. `phase=="degraded"` 且所有上游的 `reason` 都是终态原因（`engine_not_found`、`auth_required`、`auth_failed`、`budget_zero`）时，chat 是否仍等满 120 秒？iDoris 建议只在 `starting`，或存在 `restarting` 的上游时才等待（§2.7.4）。
-2. Q7 的「候选接口」：`idoris setup omlx --auto` 只按 8088、8000、8001 的顺序取第一个可达的 oMLX（§2.7.8）。桌面端若需要列出全部候选供用户选择，请给出字段需求，在 iDoris 实现 `--auto` 之前补进 §2.7.8。
-3. `setup omlx --managed` 的可执行文件发现只看默认位置；而 `serve` 另有帧字段 `engine.omlx_executable`。Agent24 若要指定位置（例如将来随包附带 oMLX.app），`setup omlx` 是否也要接受一个对应的 `--omlx-executable <path>`？
-4. 登记错误码 `instance_conflict` 的确切语义（设计稿只列了码，§2.10.4），请 Agent24 补充；发现文件残留的删除是否同样持旁路锁并复核 `instance_id`（§2.7.3，建议如此）。
+1. 已确认（Agent24 2026-11-20）：chat 只有在 `phase=="starting"`，或有上游处于 `restarting` 时才有界等待，上限 120 秒。`phase=="degraded"` 且所有上游的 `reason` 都是终态原因（`engine_not_found`、`auth_required`、`auth_failed`、`budget_zero`）时，立即返回 503 并带上 `reason`，界面按 `reason` 引导（例如 `engine_not_found` 引导安装引擎）。正文见 §2.7.4。
+2. 已确认（Agent24 2026-11-20）：不做候选列表接口。`idoris setup omlx --auto` 按 8088、8000、8001 的顺序取第一个可达的，桌面端只显示结果（`mode`、`endpoint`、`engine.installed`），§2.7.8 不再补字段。正文见 §2.7.8。
+3. 已确认（Agent24 2026-11-20）：v0.6.0 不加 `--omlx-executable`（不随包附带 oMLX.app）。以后要随包时另行修订，届时与帧字段对称地加上；规范里写作「不承诺 / 以后修订」，见 §2.7.8、§2.7.9。
+4. 已确认（Agent24 2026-11-20）：`instance_conflict` 的定义是，agent24d 已有一个 `ack` 过、心跳正常的会话（`instance_id`=A），并且 A 的 `/health` 仍以 `instance_id`=A 应答，这时 `instance_id`=B 来登记，就回 `instance_conflict`。也就是两个活实例同时出现：拒绝后来者，不顶掉现有会话。A 已经失联（心跳超时，或 `/health` 不通、`instance_id` 不符）时，B 正常登记，A 视为陈旧。删除残留的发现文件时，同样持有旁路锁 `<发现文件>.lock` 并复核 `instance_id`。正文见 §2.10.4、§2.10.9、§2.7.3。**iDoris 侧口径（iDoris 补，待 Agent24 复核）**：收到 `instance_conflict` 后优雅停止并以退出码 3 退出，不继续服务、不重试，理由见 §2.10.4。
