@@ -717,7 +717,7 @@ async fn run(options: cli::ServeOptions) -> Result<(), String> {
         .await
         .map_err(|err| format!("无法绑定 Admin {}：{err}", plan.admin))?;
     // 请求的端口可以是 0（接口规范 §2.7.2）：实际端口只以绑定之后的 `local_addr()` 为准。
-    // 这里不再打印请求地址（会打出 `:0`）；实际地址由 `serve_bound` 打印。stdout 不属于契约。
+    // 这里不再打印请求地址（会打出 `:0`）；实际地址由 `serve_bound_with_hooks` 打印。stdout 不属于契约。
     let data_port = data_listener
         .local_addr()
         .map_err(|err| format!("无法读取 data listener 地址：{err}"))?
@@ -737,7 +737,8 @@ async fn run(options: cli::ServeOptions) -> Result<(), String> {
     } else {
         (AdminSessionToken::mint(), LauncherConfig::default())
     };
-    // 帧的 `instance_nonce` 只给确定性测试用；生产不给这个字段，用上面生成的那个。
+    // 帧的 `instance_nonce`：规范约定只给确定性测试用、生产不给这个字段，但代码不拒绝，给了就用它；
+    // 没给就用上面生成的那个。
     if let Some(nonce) = launcher.instance_nonce {
         instance_nonce = nonce;
     }
@@ -1158,8 +1159,9 @@ where
     let result = tokio::time::timeout(SHUTDOWN_GRACE, drain)
         .await
         .unwrap_or_else(|_| Err(shutdown_timeout_message()));
-    // 信号来得比发布更早：让正在进行的发布走完（它有界），调用方随后的「仅当 instance_id 匹配才删」
-    // 才能看到它的最终状态，而不是和一个还在 rename 的后台线程赛跑。
+    // 信号来得比发布更早：让正在进行的发布走完，调用方随后的「仅当 instance_id 匹配才删」才能看到它的最终状态，
+    // 而不是和一个还在 rename 的后台线程赛跑。这一步在上面 `SHUTDOWN_GRACE` 的超时之外：等旁路锁至多 5 秒
+    // （`discovery.rs` 的 `PUBLISH_LOCK_WAIT`），文件系统调用本身（`fsync`、`renameat`）没有时限。
     if let Some(handle) = running_hook.take() {
         let _ = handle.await;
     }
@@ -1442,7 +1444,10 @@ mod tests {
     }
 
     /// 接口规范 §2.7.3「何时写」第（c）条：钩子（发现文件的发布）运行时，`/health` 已经能答。
-    /// 钩子本身就在阻塞线程里对数据面发一个真实的 `GET /health`：若钩子在服务启动之前运行，这个请求拿不到应答。
+    /// 钩子本身就在阻塞线程里对数据面发一个真实的 `GET /health`。本测试跑在单线程运行时上：若钩子**同步地**先于
+    /// 服务运行（直接在运行时线程上调用），它会占住运行时线程，这个请求拿不到应答。它钉不住更细的次序：
+    /// 钩子经 `spawn_blocking` 先于两个 serve future 的第一次 poll 启动时，请求仍会被答复。这个次序由
+    /// `serve_bound_with_hooks` 里 `select!` 的 `biased` 排列保证。
     #[tokio::test]
     async fn serving_hook_runs_only_once_health_can_answer() {
         let (data, admin, data_port, _admin_port) = bind_pair().await;

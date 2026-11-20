@@ -95,8 +95,8 @@ impl FrameError {
         }
     }
 
-    /// 未知字段：名字只在是「普通名字」时才带出（小写字母、数字、下划线，≤ 32），
-    /// 不是的话（控制字符、过长、像一个 token）只给原因码。
+    /// 未知字段：名字只在是「普通名字」时才带出（小写字母开头，之后小写字母、数字、下划线，≤ 32 个字符），
+    /// 不是的话（控制字符、过长、像一个 token、以数字或下划线开头）只给原因码。
     fn unknown(name: &str, parent: Option<&'static str>) -> Self {
         let field = plain_field_name(name).map(|name| match parent {
             Some(parent) => Cow::Owned(format!("{parent}.{name}")),
@@ -161,7 +161,7 @@ pub struct LauncherFrame {
     pub register_socket: Option<PathBuf>,
     /// 0 = 不因「无登记会话」退出。S2 使用。
     pub orphan_timeout_s: u32,
-    /// 只给确定性测试用；缺省由 iDoris 自己生成。
+    /// 规范约定只给确定性测试用（生产不给这个字段，代码不拒绝）；缺省由 iDoris 自己生成。
     pub instance_nonce: Option<InstanceNonce>,
     pub engine: EngineFrame,
 }
@@ -784,7 +784,7 @@ mod tests {
             FrameErrorCode::FrameTooLong,
             None,
         );
-        // 一个字符串里的 LF 不会让帧变长：第二行根本不读。
+        // 两行输入只取第一行：读到第一个 LF 就停，第二行根本不读。
         let two = b"{\"v\":1}\n{\"v\":2}\n".to_vec();
         let mut reader = std::io::Cursor::new(two);
         assert_eq!(read_frame_line(&mut reader).unwrap(), b"{\"v\":1}");

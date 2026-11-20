@@ -4384,8 +4384,9 @@ mod tests {
         assert_eq!(health_json(state).await["registered"], true);
     }
 
-    /// `/health` 必须 O(1)、不做任何上游 I/O：即便 Supervisor 的 actor 正卡在启动采样里、一个字都不答，
-    /// `/health` 也要立刻返回（Agent24 对它有 2 秒超时，连续 3 次超时就判卡死并 SIGTERM）。
+    /// `/health` 只读后台探测器写好的快照、不做上游 I/O（这由 `health()` 处理函数的结构保证）：Supervisor 的 actor
+    /// 正卡在启动采样里、一个字都不答时，它也照常返回（Agent24 对它有 2 秒超时，连续 3 次超时就判卡死并 SIGTERM）。
+    /// 本测试只能抓住「无界地等上游」这一类退化（阈值 3 秒，给很忙的机器留足余量），不是 200 毫秒预算的断言。
     #[tokio::test]
     async fn health_answers_immediately_even_when_a_supervisor_never_answers() {
         use idoris_backend::{
@@ -4434,8 +4435,9 @@ mod tests {
         .unwrap();
         let runtimes =
             runtime::RuntimeRegistry::from(dispatch::BoundSupervisor::new(&card, handle));
-        // Supervisor 的启动采样要睡 30 秒；`/health` 若去问它（哪怕带超时）就会超出这里的 3 秒。
-        // 阈值留足调度余量，因为这个测试要在很忙的机器上稳定通过；它锁的是「不等上游」，不是具体毫秒数。
+        // Supervisor 的启动采样要睡 30 秒；处理函数若无界地等它，就会超出这里的 3 秒。阈值留足调度余量，
+        // 因为这个测试要在很忙的机器上稳定通过；它锁的是「不会无界地等上游」，不是 200 毫秒的预算
+        // （一个带 200 毫秒超时去问 Supervisor 的实现，这条测试也会通过）。
         let json = tokio::time::timeout(
             std::time::Duration::from_secs(3),
             health_json(AppState {

@@ -1538,7 +1538,7 @@ async fn everything_observable(
 
 #[tokio::test]
 async fn the_instance_nonce_never_appears_outside_the_discovery_file() {
-    // 两轮：一次用金丝雀 nonce（帧里给的，仅供确定性测试），一次用 iDoris 自己生成的随机 nonce。
+    // 两轮：一次用金丝雀 nonce（帧里给的；规范约定这个字段只给确定性测试用），一次用 iDoris 自己生成的随机 nonce。
     for supply_canary in [true, false] {
         let env = Env::new();
         let canary = "c0ffee00deadbeef".repeat(4);

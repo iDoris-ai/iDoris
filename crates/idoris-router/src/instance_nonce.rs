@@ -42,7 +42,8 @@ impl InstanceNonce {
         Ok(Self(hex_lower(&bytes)))
     }
 
-    /// 只接受 64 位小写 hex（launcher 帧的 `instance_nonce` 字段，仅供确定性测试）。
+    /// 只接受 64 位小写 hex（launcher 帧的 `instance_nonce` 字段）。规范约定生产不给这个字段、只给确定性测试用；
+    /// 代码不拒绝它。
     pub fn from_hex(value: &str) -> Option<Self> {
         is_lower_hex(value, NONCE_HEX_LEN).then(|| Self(value.to_string()))
     }

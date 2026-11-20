@@ -9,9 +9,9 @@
 //!
 //! # 快照，不是探测
 //!
-//! `/health` 必须 O(1)，不做任何上游 I/O，响应 ≤ 200 毫秒：Agent24 每 5 秒探测、2 秒超时、连续 3 次超时就判卡死
-//! 并 SIGTERM，一个会被慢上游拖住的 `/health` 会造成误杀与重启风暴。所以 `/health` 只读 [`HealthState`]，
-//! 状态由后台探测器（[`spawn_prober`]）写入。
+//! `/health` 必须 O(1)，不做任何上游 I/O。规范的设计目标是响应 ≤ 200 毫秒，靠「不做 I/O」达到，没有测试直接钉住
+//! 这个毫秒数。Agent24 每 5 秒探测、2 秒超时、连续 3 次超时就判卡死并 SIGTERM，一个会被慢上游拖住的 `/health`
+//! 会造成误杀与重启风暴。所以 `/health` 只读 [`HealthState`]，状态由后台探测器（[`spawn_prober`]）写入。
 //!
 //! # 哪些卡算「上游」
 //!
@@ -19,7 +19,7 @@
 //! 远程 / 局域网卡不是本机引擎，探测它们等于让 iDoris 在没有任何用户请求时对外发流量（违背本项目的出站
 //! 纪律）；订阅中转（`provider.id == "subscription"`，进程卡）不是引擎，也没有 O(1) 的就绪判据。这两类都不列入
 //! `upstreams` 与发现文件的 `launch.engines`（规范 §2.11.1 把「订阅中转是否列入」留给 S1 实现前确认，
-//! 这是 S1 的取舍，报告里列为「需要 owner 确认」）。`components` 仍计所有卡。
+//! 这是 S1 的取舍，PR 说明里列为「需要 owner 确认」）。`components` 仍计所有卡。
 //!
 //! # 状态来源
 //!
@@ -35,8 +35,10 @@
 //! # `phase`
 //!
 //! 任一上游还是 `starting`（没有第一次观测）→ `starting`；否则至少一个 `ready` → `ready`；否则 `degraded`。
-//! S1 没有引擎管理（那是 S5 的启动门控），`starting` 只覆盖「第一轮探测还没做完」这一小段，期间数据面照常服务
-//! （没有托管卡时行为不变，规范 §2.7.6）。`status` 仍恒为 `"ok"`。
+//! S1 没有引擎管理（那是 S5 的启动门控）：`starting` 持续到每个上游都有了第一次观测为止。resident 卡通常一轮探测
+//! 就有结论；Supervisor 管理的卡在它还在做启动采样时，状态查询超时按「没有新信息」处理、保持 `starting`，所以会更久
+//! （单次调用上限是 `adapter_call_timeout`，默认 30 秒）。期间数据面照常服务（没有托管卡时行为不变，规范 §2.7.6）。
+//! `status` 仍恒为 `"ok"`。
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, PoisonError, RwLock};
@@ -488,7 +490,7 @@ pub fn starting_wait(base: Duration, round: u32) -> Duration {
 }
 
 /// 启动后台探测器：立即做第一轮，之后每 [`PROBE_INTERVAL`] 一轮；还有上游没有第一次观测时按 [`starting_wait`] 更勤地重试。
-/// 没有上游就不起任务。`cancel` 触发后尽快退出。
+/// 没有上游就不起探测循环（仍返回一个立即结束的空任务，保持返回类型一致）。`cancel` 触发后尽快退出。
 pub fn spawn_prober(
     context: ProberContext,
     cancel: CancellationToken,
@@ -845,7 +847,8 @@ mod tests {
 
     #[tokio::test]
     async fn probe_maps_401_and_403_to_auth_required_when_no_key_was_sent() {
-        // 非 oMLX 的卡永远不带 key；oMLX 卡在这个进程里也没有设 key 时同样不带。
+        // 非 oMLX 的卡永远不带 key，所以 401/403 是 `auth_required`。「oMLX 卡、而且哪里都没有 key」这个组合取决于
+        // 环境（`resolve_omlx_api_key_os` 还会读 `~/.omlx/settings.json`），在不密封的单元测试里固定不了，这里不测。
         for status_code in [401, 403] {
             let server = models_server(ResponseTemplate::new(status_code)).await;
             let card = resident_card("lm", &server.uri(), "lmstudio@1");
@@ -1169,7 +1172,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn no_upstreams_means_no_task_and_a_degraded_phase() {
+    async fn no_upstreams_means_no_probe_loop_and_a_degraded_phase() {
         let context = prober_context(Vec::new(), RuntimeRegistry::default(), false);
         let handle = spawn_prober(context.clone(), CancellationToken::new());
         tokio::time::timeout(Duration::from_secs(1), handle)
@@ -1191,7 +1194,7 @@ mod tests {
         );
         // 第 0 轮（还没开始重试）等同第 1 轮，不会下溢。
         assert_eq!(starting_wait(base, 0), base);
-        // 即便一直卡 30 秒，追加给 Supervisor（邮箱容量 64）的状态消息也远少于容量。
+        // 一直卡 30 秒，追加给 Supervisor（邮箱容量 64）的状态消息也少于容量（约一半，所以下面断言 < 40）。
         let mut elapsed = Duration::ZERO;
         let mut sent = 1;
         let mut round = 1;

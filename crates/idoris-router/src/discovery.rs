@@ -1,7 +1,8 @@
 //! 发现文件（接口规范 §2.7.3，修订 1.6）：iDoris 就绪后写给 launcher 的一份实例快照。
 //!
 //! 它**只是提示，不是事实来源**：同一个数据库只能有一个实例，由实例锁保证（退出码 3）。拿到锁的新实例把
-//! 已有文件视为陈旧并覆盖；没拿到锁（退出码 3）的实例**不碰**文件，因为它属于还活着的那个实例。
+//! 已有文件视为陈旧并覆盖（前提是它是属主正确的普通文件；已有目标是符号链接、目录、FIFO、socket 或别人属主的
+//! 文件时，启动失败、不删除）；没拿到锁（退出码 3）的实例**不碰**文件，因为它属于还活着的那个实例。
 //!
 //! # 目录操作全部基于已打开的 parent fd（PR-Daemon 对设计稿 D3 的评审补充）
 //!
@@ -119,7 +120,8 @@ pub enum RemoveOutcome {
     Absent,
     /// 文件存在但不属于自己（`instance_id` 不同、不是普通文件、属主不对、内容读不懂）：原样保留。
     NotOwned,
-    /// 等旁路锁超时：没有删，文件保持原样（成为「崩溃残留」，下一个实例会覆盖它）。
+    /// 旁路锁不可用：打不开、不是普通文件、属主不对，或者等锁超时。没有删，文件保持原样
+    /// （成为「崩溃残留」，下一个实例会覆盖它）。
     LockUnavailable,
     Failed,
 }
@@ -137,7 +139,8 @@ pub struct EngineEntry {
 pub struct LaunchSnapshot {
     /// canonical 的锁基路径（与实例锁用的是同一个）。
     pub db_path: String,
-    /// `IDORIS_STATE_DIR`，或 `$HOME/.local/state/idoris`；两者都没有绝对路径可用时为 null。
+    /// `IDORIS_STATE_DIR`（设置了就只看它，相对路径即「没有」）；没设置时 `$HOME/.local/state/idoris`；
+    /// 得不到绝对路径时为 null。
     pub state_dir: Option<String>,
     pub components_dir: String,
     pub allocated_budget_bytes: Option<u64>,
@@ -887,7 +890,8 @@ mod tests {
         let (_temp, dir) = private_dir();
         let path = dir.join("idoris.json");
         let target = DiscoveryTarget::open(&path).unwrap();
-        // 校验之后目标被换成一个非空目录：rename 必然失败（且 check_target 在锁下也会先拒绝）。
+        // 校验之后目标被换成一个目录（里面有东西）：`install` 持锁后的 `check_target` 先拒绝（`TargetNotRegular`）；
+        // 就算它放行，把普通文件 rename 到一个目录上也会失败（`EISDIR`，与目录是否为空无关），所以两种结果都接受。
         std::fs::create_dir(&path).unwrap();
         std::fs::write(path.join("inside"), b"x").unwrap();
         let error = target.publish(&record()).unwrap_err();
