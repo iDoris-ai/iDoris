@@ -3,8 +3,8 @@
 //! [`OwnedEngine`] 是「iDoris 拥有的一个本地推理引擎进程」，不论是哪种引擎（引擎相关的部分都在
 //! [`super::EngineRecipe`] 里，这里只在 [`OwnedEngine::wait_ready`] 里经它判就绪）。它有两种来历：本进程刚
 //! [`OwnedEngine::spawn`] 的，或上一个 iDoris 留下的孤儿经 [`OwnedEngine::recover`] 认回的。外部引擎
-//! （用户自己的 oMLX.app、别人的服务）**没有**对应的类型：本模块里没有任何一条路径能对一个没有所有权记录的
-//! pid 发信号，「adopt 的外部引擎永不发信号」由类型保证，不靠约定。
+//! （用户自己的 oMLX.app、别人的服务）没有对应的类型：本模块里发信号的函数都是私有的，入口只有 `spawn`（自己拉起
+//! 的子进程）与 `recover`（核对过身份的记录）。这靠模块私有性，不是类型系统的保证（`signal_group` 在 crate 内可见）。
 //!
 //! # 所有权记录的两个阶段
 //!
@@ -30,10 +30,10 @@
 //! # 停止
 //!
 //! SIGTERM 整组，宽限期内等整组消失，仍在就 SIGKILL 整组，再等到消失才算完成；完成后删记录。
-//! 对自己 spawn 的引擎走 [`ManagedRuntimeProcess::shutdown`]（未回收的直接子进程锚住 PGID，
-//! 不会打到被复用的组）；对认回的孤儿，先过一遍身份闸（pid 存活、启动时间与进程组吻合）才发 SIGTERM；
-//! 之后只要组里还有活成员就说明它仍是那个组（只要组还有成员，组 id 就不会被分给别的进程），
-//! 再发 SIGKILL 前不必也不能重新核对 leader（leader 可能已经先退出了）。
+//! 对自己 spawn 的引擎走 [`ManagedRuntimeProcess::shutdown`]（未回收的直接子进程占着 PGID，发信号时这个组 id 不会已被
+//! 复用）；对认回的孤儿，发 SIGTERM 前先过身份闸（pid 存活、启动时间吻合、仍是自己进程组的组长），闸与第一次信号之间有
+//! 微秒级的非原子窗口（没有 pidfd），误伤要求这个 pid 恰在窗口内被复用并成为另一个进程组的组长。之后组里还有活成员时，
+//! 组 id 不会被重新分配（成员检查与 SIGKILL 之间同样有这个窗口），再发 SIGKILL 前不重新核对 leader（它可能已经先退出了）。
 //!
 //! # Drop
 //!
@@ -274,7 +274,7 @@ impl OwnedEngine {
     /// 步骤：（1）这个实例（种类加 endpoint）已有记录而描述的引擎可能还活着 → [`EngineError::AlreadyOwned`]
     /// （陈旧的记录先清掉）；（2）滚动并打开日志；（3）spawn；（4）读启动时间
     /// （重试几次），写记录。（3）与（4）之间的几十毫秒里 iDoris 被杀，会留下一个没有记录的引擎，
-    /// 这个窗口无法消除。读不出启动时间或写不了记录：把刚拉起的引擎停掉再报错，不留一个认不回的引擎。
+    /// 这个窗口无法消除。读不出启动时间或写不了记录：尽力停掉刚拉起的引擎再报错（`abort` 忽略 `shutdown` 的失败，不保证停得掉）。
     ///
     /// `launched_by` 是这个 iDoris 进程的标识（`/health.instance_id`），写进记录，只用于排查。
     pub async fn spawn(
@@ -661,7 +661,7 @@ async fn stop_recovered(
     if wait_group_gone(group, grace).await? {
         return Ok(());
     }
-    // 组里仍有活成员：它还是那个组（只要有成员，组 id 就不会被重新分配），整组 SIGKILL。
+    // 组里仍有活成员：组 id 此刻没有被重新分配（成员检查与 SIGKILL 之间有微秒级的非原子窗口），整组 SIGKILL。
     if sweep_until_gone(group, grace).await? {
         Ok(())
     } else {
@@ -689,9 +689,9 @@ fn deadline_after(after: Duration) -> tokio::time::Instant {
 
 /// 整组 SIGKILL，直到整组消失（`true`）或 `grace` 用完（`false`）。
 ///
-/// 每一轮都先确认组里还有活成员再发信号：只要组里有成员，这个组 id 就不会被分配给别的进程，所以信号只会
-/// 落在这个组的成员上；组空了就不再发。要一轮一轮地扫，是因为 SIGKILL 扫过的那一刻刚 fork 出来的子进程
-/// 不在那一轮的名单里，下一轮才收得掉（引擎正在 fork worker 时被停，是真实会遇到的）。
+/// 每一轮都先确认组里还有活成员再发信号：组里有成员时这个组 id 不会被分配给别的进程，组空了就不再发。成员检查与
+/// `signal_group` 之间有微秒级的非原子窗口（组恰好清空、pid 又被复用成另一个组的组长，才会误伤），没有办法消除。要一轮
+/// 一轮地扫，是因为 SIGKILL 扫过的那一刻刚 fork 出来的子进程不在那一轮的名单里，下一轮才收得掉（引擎正在 fork worker 时被停，会遇到）。
 async fn sweep_until_gone(group: i32, grace: Duration) -> Result<bool, EngineError> {
     let deadline = deadline_after(grace);
     loop {

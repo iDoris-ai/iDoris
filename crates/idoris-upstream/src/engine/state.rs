@@ -13,8 +13,8 @@ pub const STATE_DIR_ENV: &str = "IDORIS_STATE_DIR";
 /// （相对的 `IDORIS_STATE_DIR` 不会被悄悄换成 `HOME` 下的缺省值）。
 ///
 /// 与 oMLX 加载围栏（`omlx/<endpoint>/load.pending`，`OmlxAdapter::load_fence_path`）用的是同一条规则：
-/// 同一台机器上 iDoris 的状态只有一个根。两处各写一遍，由 `omlx::engine` 的测试
-/// 断言它们的根始终相同。
+/// 同一台机器上 iDoris 的状态只有一个根。两处各写一遍；`omlx::engine::tests::the_engine_state_dir_is_the_same_root_the_load_fence_uses`
+/// 随 oMLX 配方一起提交（它要调 `OmlxAdapter` 的私有方法 `load_fence_path`），在测试进程当前的环境下比较两条规则的结果。
 pub fn default_state_dir() -> Option<PathBuf> {
     state_dir_from(std::env::var_os(STATE_DIR_ENV), std::env::var_os("HOME"))
 }

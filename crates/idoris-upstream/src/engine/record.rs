@@ -383,7 +383,7 @@ impl OwnershipStore {
         }
     }
 
-    /// 只在文件内容仍是 `expected` 时删（别的实例换过记录就不动它）。
+    /// 读到文件内容仍是 `expected` 才删（别的实例换过记录就不动它）；读与删之间没有锁，不是原子的，同一实例的调用由调用方串行化。
     pub fn remove_if_same(&self, expected: &OwnershipRecord) -> Result<bool, RecordError> {
         match self.read() {
             Ok(Some(current)) if current == *expected => self.remove(),

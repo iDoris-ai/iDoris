@@ -22,7 +22,7 @@ use tokio::process::Command;
 
 /// 工具的 `PATH`（只用于工具自己找它的辅助程序）。
 const TOOL_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
-/// 工具输出的上限；`ps` / `lsof -t` 的答案只有一行。
+/// 工具输出的上限，超限按「没有答案」处理；`ps` 的答案是一行（`ps_value` 要求不含换行），`lsof -t` 每个 pid 一行（`listens_on` 逐行比对）。
 const MAX_TOOL_OUTPUT_BYTES: usize = 64 * 1024;
 
 /// `kill(pid, 0)` 的结果。
@@ -192,7 +192,7 @@ pub(super) struct ToolOutput {
 }
 
 /// Runs a system tool with a cleared environment (`PATH`, `TZ=UTC`, `LC_ALL=C` only), no stdin,
-/// piped and size-capped output, and a hard timeout (the tool is killed when it expires).
+/// piped output (read in full, then rejected if over the cap; the timeout bounds the memory), and a hard timeout (the tool is killed when it expires).
 pub(super) async fn run_tool(
     program: &Path,
     args: &[OsString],

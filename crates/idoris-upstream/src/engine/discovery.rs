@@ -204,8 +204,8 @@ pub async fn discover_executable(
     explicit: Option<&Path>,
 ) -> Result<EngineExecutable, DiscoveryError> {
     if let Some(explicit) = explicit {
-        // Explicit paths come from the launcher and are trusted: no app-level signature check
-        // (the check only applies to auto-discovered app bundles).
+        // Explicit paths come from the launcher: no app-level signature check (that applies to
+        // auto-discovered app bundles); the file checks in `file_rejection` still run on them.
         return match check_candidate(explicit, ExecutableSource::Explicit, &plan.codesign).await {
             Outcome::Accepted(executable) => Ok(executable),
             Outcome::Missing => Err(rejected_one(explicit, RejectReason::Missing)),
@@ -771,7 +771,7 @@ mod tests {
         let custom = root.path().join("homebrew/engine");
         script(&custom, "echo 1", 0o755);
         let mut cfg = config(Vec::new());
-        // Even a codesign that fails every call is never consulted.
+        // Even a codesign that fails every call does not change the outcome: the code path never reaches it.
         cfg.codesign = CodesignPolicy::Verify(fake_codesign(root.path(), 9, "TeamIdentifier=EVIL"));
         let found = discover_executable(&cfg, Some(&custom)).await.unwrap();
         assert_eq!(found.source, ExecutableSource::Explicit);

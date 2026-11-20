@@ -2,7 +2,7 @@
 //!
 //! iDoris 自己拉起的引擎，每次拉起生成一个随机 key，经环境变量交给子进程（变量名由各引擎的配方决定，
 //! oMLX 是 `OMLX_API_KEY`；通用层不允许它出现在 argv 里）、记进所有权记录（0600）；别的进程不知道它，
-//! 打这个引擎得到 401。本模块只负责生成与承载：谁来用这个 key 说话（`U/omlx/key.rs` 的「私有引擎 key 表」）
+//! 打这个引擎得到 401。本模块只负责生成与承载：谁来用这个 key 说话（设计稿里放在 `omlx/key.rs` 的「私有引擎 key 表」）
 //! 是 S5 的事。不支持私有 key 的引擎不设它（[`super::LaunchInput::api_key`] 为 `None`）。
 //!
 //! - 32 字节取自 `/dev/urandom`（macOS 与 Linux 都有；不引入新依赖），小写 hex 编码成 64 字符。
@@ -45,7 +45,7 @@ impl EngineKey {
         }
     }
 
-    /// 明文。只在把它交给子进程环境、写所有权记录、或放进 `Authorization` 头时调用。
+    /// 明文。调用点：交给子进程环境（配方）、写所有权记录、放进 `Authorization` 头（`wait_ready`）、在 `EngineLaunch::new` 里扫描 argv 有没有泄露。
     pub fn expose(&self) -> &str {
         &self.0
     }
