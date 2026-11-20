@@ -872,8 +872,8 @@ async fn run(options: cli::ServeOptions) -> Result<u8, String> {
                 // 立即返回：自愈马上停止；信号停止时 `bye`（至多 0.5 秒）与下面的 HTTP 排空并行。
                 registration.begin_stop(cause);
             }
-            // S3、S5 的引擎停止也在这里并行启动：`cause.stops_owned_engines(launcher.engine.stop_on_exit)`
-            // 决定停不停（`stop_on_exit:"never"` 只对退出码 0 有效）。S2 还没有引擎。
+            // S3、S5 接入引擎之后，引擎的停止也在这里并行启动，由 `cause.stops_owned_engines(launcher.engine.stop_on_exit)`
+            // 决定停不停（`stop_on_exit:"never"` 只对退出码 0 有效）。S2 还没有引擎，这里什么也不停。
             *stop_cause.lock().unwrap_or_else(PoisonError::into_inner) = Some(cause);
         }
     };

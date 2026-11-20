@@ -63,14 +63,17 @@ const ACK_LABEL: &str = "idoris-ack/v1";
 // 停止原因与退出码
 // ---------------------------------------------------------------------------------------------------------------
 
-/// 优雅停止的原因。三者走同一条停止路径（规范 §2.7.5），区别只在退出码与是否发 `bye`。
+/// 停止的原因。三者走同一条优雅停止路径（规范 §2.7.5）；区别在退出码、是否发 `bye`、结束时打印的日志（信号写 stdout，
+/// 另两种写 stderr），以及 S3、S5 接入引擎之后是否停掉自己拉起的引擎（[`StopCause::stops_owned_engines`]）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StopCause {
     /// SIGTERM、SIGINT：退出码 0，在已有的登记会话上尽力发 `bye`。
     Signal,
-    /// agent24d 回了 `instance_conflict`：退出码 3，不重连、不再自愈重写发现文件，没有已 `ack` 的会话所以不发 `bye`。
+    /// agent24d 回了 `instance_conflict`（发出 `register` 之后：等 `ack` 期间，或 `ack` 之后的会话里，规范 §2.10.10 第 5 条）：
+    /// 退出码 3，不重连、不再自愈重写发现文件，不发 `bye`（规范 §2.10.10 第 10 条：`bye` 只在信号停止与退出码 5 的停止时发，
+    /// 这里不是这两种；会话里收到时，服务端也刚用 `error` 结束了它）。
     InstanceConflict,
-    /// 超过 `orphan_timeout_s` 没有已 `ack` 的登记会话：退出码 4，同样没有会话所以不发 `bye`。
+    /// 超过 `orphan_timeout_s` 没有已 `ack` 的登记会话：退出码 4，不发 `bye`（同一条规则；按定义也没有会话可发）。
     OrphanTimeout,
 }
 
@@ -83,9 +86,9 @@ impl StopCause {
         }
     }
 
-    /// 停止时要不要在已建立的登记会话上发 `bye`（规范 §2.10.8：优雅停止时尽力发，让 agent24d 区分「预期停止」与「崩溃」）。
-    /// 孤儿超时与 `instance_conflict` 都发生在**没有已 `ack` 的会话**时，没有会话可发；信号停止发。
-    /// 以后的「自有引擎失效，退出码 5」（S5）是优雅停止、会话还在，规范明确列在发 `bye` 的路径里：那个原因在这里返回 `true`。
+    /// 停止时要不要在已建立的登记会话上发 `bye`（规范 §2.10.8、§2.10.10 第 10 条：信号停止，或退出码 5 的停止，并且当时存在
+    /// 已 `ack` 的会话，才尽力发，让 agent24d 区分「预期停止」与「崩溃」；其他退出路径不发）。信号停止发；孤儿超时与
+    /// `instance_conflict`（包括会话里收到的）不是这两种停止，不发。S5 加上「自有引擎失效，退出码 5」之后，那个原因在这里返回 `true`。
     pub fn says_bye(self) -> bool {
         match self {
             Self::Signal => true,
@@ -225,8 +228,11 @@ impl Default for Timings {
 
 /// 重连退避：第 1 次立即；之后 0.25、0.5、1、2、4、8 秒，再之后固定 10 秒；每次 ±20% 抖动；会话持续满 60 秒后清零。
 ///
-/// 计数的是「连续几次重连」：连接失败、握手失败、会话断开都算一次；只有持续满 [`Timings::backoff_reset_after`]
-/// 的会话才清零（一个建立后很快又断开的会话不清零，所以反复抖动的服务端得到的是逐步变长的等待，不是每次立即重连）。
+/// 计数的是「按默认退避安排的重连」：连接失败、没有固定等待的握手失败、会话断开都算一次。对端 `error` 码带固定等待的握手失败
+/// （`identity_rejected`、`unsupported_version`、`contract_incompatible`、`proof_invalid`、`busy`，见 [`ServerError`]）不经过这里：
+/// 固定等待只替代当次的退避等待，不推进计数，也不加抖动（规范 §2.10.10 第 3 条）。只有持续满 [`Timings::backoff_reset_after`]
+/// 的会话才清零（一个建立后很快又断开的会话不清零，所以反复抖动的服务端得到的是逐步变长的等待，不是每次立即重连，
+/// §2.10.10 第 4 条）。
 #[derive(Debug, Clone, Default)]
 pub struct Backoff {
     retries: usize,
@@ -434,7 +440,7 @@ pub enum Fault {
     BadField(&'static str),
 }
 
-/// 不进日志的字符串（`set_admin_token` 带来的 token）：`Debug` 一律输出 `[REDACTED]`，所以解析出来的帧即使被
+/// 不进日志的字符串（`set_admin_token` 带来的 token）：`Debug` 只输出 `Secret([REDACTED])`，所以解析出来的帧即使被
 /// `{:?}` 写进日志或错误信息，也不会带出 token；取原文只有一个显式入口 [`Secret::expose`]。
 #[derive(Clone, PartialEq, Eq)]
 pub struct Secret(String);
@@ -485,7 +491,9 @@ pub enum ServerFrame {
 /// 解析并严格校验一帧（不含结尾的 LF）：非 UTF-8、空行、含 CR 或 BOM、非 JSON、非对象、`v` 不是 1、`op` 不是字符串、
 /// 必填字段缺失或形状不对，一律是 [`Fault`]；未知字段忽略（前向兼容）。
 pub fn parse_server_frame(line: &[u8]) -> Result<ServerFrame, Fault> {
-    if line.is_empty() || line.contains(&b'\r') || line.starts_with(&[0xEF, 0xBB, 0xBF]) {
+    // 空行与以 BOM 开头的输入，下面的 `serde_json` 同样得到 `Fault::Malformed`（单元测试与集成测试各有一行钉住）；CR 它当作
+    // 空白放过去，而规范要求拒绝（§2.10.1），所以这里先拦的是 CR。
+    if line.contains(&b'\r') {
         return Err(Fault::Malformed);
     }
     let text = std::str::from_utf8(line).map_err(|_| Fault::NotUtf8)?;
@@ -931,7 +939,7 @@ impl Registration {
     }
 
     /// iDoris 开始停止（任何原因）时调用，立即返回：自愈立刻停止（之后不再重写发现文件）；原因是信号就让登记客户端在
-    /// 已建立的会话上尽力发 `bye`（至多 0.5 秒，与 HTTP 排空并行），其余原因（没有已 `ack` 的会话）不发。
+    /// 已建立的会话上尽力发 `bye`（至多 0.5 秒，与 HTTP 排空并行），其余原因不发（见 [`StopCause::says_bye`]）。
     pub fn begin_stop(&self, cause: StopCause) {
         self.inner.heal_cancel.cancel();
         let mode = if cause.says_bye() {
@@ -1118,7 +1126,7 @@ mod client {
     use std::path::Path;
 
     use nix::fcntl::{self, FcntlArg, FdFlag};
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
     use tokio::net::UnixStream;
     use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
     use tokio::time::{Instant, sleep, sleep_until, timeout};
@@ -1164,13 +1172,17 @@ mod client {
     }
 
     /// 带缓冲的帧读取器：一行一帧，每帧（含 LF）≤ 16384 字节。`next` 可取消（半帧留在缓冲里，下次接着读）。
-    struct FrameReader {
-        half: OwnedReadHalf,
+    ///
+    /// 对读端泛型：生产里就是 UDS 的读半边；单元测试（`register_tests.rs`）注入一个会出错的读端。真实的 UDS 上没法稳定地造出
+    /// 读错误（Linux 上要对端带着没读的数据关闭才会 ECONNRESET，macOS 上不会；`register` 发出之前我们也没写过字节，对端
+    /// 没有未读的数据），而 `Read::Io` 在握手里的两个分支都必须有测试钉住。
+    pub(super) struct FrameReader<R = OwnedReadHalf> {
+        half: R,
         buf: Vec<u8>,
     }
 
-    impl FrameReader {
-        fn new(half: OwnedReadHalf) -> Self {
+    impl<R: AsyncRead + Unpin> FrameReader<R> {
+        pub(super) fn new(half: R) -> Self {
             Self {
                 half,
                 buf: Vec::with_capacity(512),
@@ -1204,12 +1216,12 @@ mod client {
         }
     }
 
-    struct Conn {
-        reader: FrameReader,
-        writer: OwnedWriteHalf,
+    pub(super) struct Conn<R = OwnedReadHalf> {
+        pub(super) reader: FrameReader<R>,
+        pub(super) writer: OwnedWriteHalf,
     }
 
-    impl Conn {
+    impl<R> Conn<R> {
         /// 在 `within` 内写完一帧。失败（超时、对端已关闭）返回 `false`。
         async fn send(&mut self, bytes: &[u8], within: Duration) -> bool {
             let write = async {
@@ -1221,12 +1233,12 @@ mod client {
     }
 
     /// 握手成功得到的会话。
-    struct Session {
+    pub(super) struct Session {
         conn: Conn,
         heartbeat_every: Duration,
     }
 
-    enum Handshake {
+    pub(super) enum Handshake {
         Established(Session),
         Retry(Plan),
         /// 服务端回了 `instance_conflict`。
@@ -1496,7 +1508,9 @@ mod client {
         }
 
         /// 等 `challenge`。**不写任何东西**：服务端先发的 `error`（例如 `busy`）、别的帧、读错误都只决定怎么重连。
-        async fn read_challenge(conn: &mut Conn) -> Result<(String, String), Plan> {
+        pub(super) async fn read_challenge<R: AsyncRead + Unpin>(
+            conn: &mut Conn<R>,
+        ) -> Result<(String, String), Plan> {
             loop {
                 match conn.reader.next().await {
                     Read::Frame(ServerFrame::Challenge { conn_id, nonce }) => {
@@ -1521,9 +1535,9 @@ mod client {
         }
 
         /// 等 `ack` 并校验 `ack.proof`。返回 `(session_id, heartbeat_ms)`；其余结局都是 [`Handshake`]。
-        async fn read_ack(
+        pub(super) async fn read_ack<R: AsyncRead + Unpin>(
             &self,
-            conn: &mut Conn,
+            conn: &mut Conn<R>,
             conn_id: &str,
             challenge_nonce: &str,
         ) -> Result<(String, Option<u64>), Handshake> {
@@ -1578,7 +1592,12 @@ mod client {
         }
 
         /// 尽力发一个 `error` 帧（至多 `bye_budget`，不等应答）。只在已经收到过 `challenge` 之后调用。
-        async fn send_error(&self, conn: &mut Conn, code: &'static str, message: &'static str) {
+        async fn send_error<R>(
+            &self,
+            conn: &mut Conn<R>,
+            code: &'static str,
+            message: &'static str,
+        ) {
             if let Some(bytes) = error_frame(code, message) {
                 let _ = conn.send(&bytes, self.t.bye_budget).await;
             }
