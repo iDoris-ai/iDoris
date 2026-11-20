@@ -2,7 +2,8 @@
 //! 新字段从 S1 起出现，但 `contract_version` 到 v0.6.0 发版才升 1.3.0（规范 §2.11），本文件里它仍是 1.2.0。
 //!
 //! 起真二进制验证：端口 0（数据面与 Admin 都是 0）、发现文件的内容与权限、校验失败的各情形、读者并发读不到半截文件、
-//! `kill -9` 之后残留文件可识别且被下一个实例覆盖、第二实例退出码 3 且不碰文件、SIGTERM 删除自己的文件、
+//! `kill -9` 之后残留文件可识别且被下一个实例覆盖、第二实例退出码 3 且不碰文件、SIGTERM 删除自己的文件
+//! （删不掉时文件原样保留、只留一行固定日志，退出码仍是 0）、
 //! 帧错误退出 1 且 stderr / stdout 不含 token、`instance_nonce` 金丝雀不出现在 `/health` / Admin / 日志 / argv / 环境变量。
 //! 旧的 `--admin-token-stdin` 路径由 `launcher_lifecycle.rs` 继续覆盖，本文件只补「互斥」与「不写发现文件」。
 //!
@@ -334,6 +335,23 @@ fn sigterm_and_collect(child: &mut Child) -> (std::process::ExitStatus, String, 
     let status = wait_exit(child, Duration::from_secs(20));
     let (stdout, stderr) = output_of(child);
     (status, stdout, stderr)
+}
+
+/// 把目录权限恢复成 0700：断言失败时也要恢复，否则临时目录删不掉。
+struct RestoreMode(PathBuf);
+
+impl Drop for RestoreMode {
+    fn drop(&mut self) {
+        let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o700));
+    }
+}
+
+/// 退出时「发现文件未删除」的那几行日志。
+fn kept_file_log_lines(stderr: &str) -> Vec<&str> {
+    stderr
+        .lines()
+        .filter(|line| line.contains("发现文件未删除"))
+        .collect()
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -1260,6 +1278,78 @@ async fn a_file_that_belongs_to_another_instance_is_left_alone_on_shutdown() {
         fs::read(&path).unwrap(),
         foreign_bytes,
         "only a file that carries our instance_id may be removed"
+    );
+}
+
+/// 退出时删除要等旁路锁（至多 2 秒）：消费者正持着它，等不到就放弃。文件保留、原样（成为崩溃残留，下一个实例会覆盖），
+/// 日志是一行固定文案：不含路径、`instance_id`、nonce；退出码仍是 0。
+#[test]
+fn a_sidecar_lock_held_at_shutdown_keeps_the_file_and_logs_one_fixed_line() {
+    let env = Env::new();
+    let path = env.discovery_path();
+    let mut child = env.spawn_launcher(&env.frame(json!({})));
+    let (_, bytes) = wait_discovery(&path, &mut child);
+
+    // 消费者（Agent24）正持着旁路锁清理陈旧文件。
+    let consumer = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(env.run_dir.join("idoris.json.lock"))
+        .unwrap();
+    consumer.lock().unwrap();
+
+    let started = Instant::now();
+    let (status, stdout, stderr) = sigterm_and_collect(&mut child);
+    assert_eq!(status.code(), Some(0), "{stderr}");
+    assert!(stdout.contains("idoris: 已停止"), "{stdout}");
+    // 它等过锁，不是一开始就放弃（等锁时限 2 秒；下界是安全的，上界不断言）。
+    assert!(
+        started.elapsed() >= Duration::from_millis(1_500),
+        "{:?}",
+        started.elapsed()
+    );
+
+    assert_eq!(
+        fs::read(&path).unwrap(),
+        bytes,
+        "the file must be kept as is"
+    );
+    assert_eq!(
+        kept_file_log_lines(&stderr),
+        ["[idoris] 发现文件未删除：旁路锁不可用或等待超时（文件保留，下一个实例会覆盖）"],
+        "{stderr}"
+    );
+    consumer.unlock().unwrap();
+}
+
+/// 退出时 unlink 失败（目录对属主也不可写）：文件读得到、旁路锁文件早已存在也打得开，只有 unlink 得到 `EACCES`。
+/// 文件保留、原样，日志是一行固定文案，退出码仍是 0。
+#[test]
+fn a_file_that_cannot_be_unlinked_at_shutdown_is_kept_and_one_fixed_line_is_logged() {
+    // root 不受目录权限限制，没有这个前提：跳过。
+    if nix::unistd::geteuid().is_root() {
+        return;
+    }
+    let env = Env::new();
+    let path = env.discovery_path();
+    let mut child = env.spawn_launcher(&env.frame(json!({})));
+    let (_, bytes) = wait_discovery(&path, &mut child);
+
+    fs::set_permissions(&env.run_dir, fs::Permissions::from_mode(0o500)).unwrap();
+    let _restore = RestoreMode(env.run_dir.clone());
+
+    let (status, stdout, stderr) = sigterm_and_collect(&mut child);
+    assert_eq!(status.code(), Some(0), "{stderr}");
+    assert!(stdout.contains("idoris: 已停止"), "{stdout}");
+    assert_eq!(
+        fs::read(&path).unwrap(),
+        bytes,
+        "the file must be kept as is"
+    );
+    assert_eq!(
+        kept_file_log_lines(&stderr),
+        ["[idoris] 发现文件未删除：删除失败（文件保留，下一个实例会覆盖）"],
+        "{stderr}"
     );
 }
 
