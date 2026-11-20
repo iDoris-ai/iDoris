@@ -840,7 +840,9 @@ async fn remove_discovery_file(target: Arc<discovery::DiscoveryTarget>, instance
             | discovery::RemoveOutcome::NotOwned,
         ) => {}
         Ok(discovery::RemoveOutcome::LockUnavailable) => {
-            eprintln!("[idoris] 发现文件未删除：等旁路锁超时（文件保留，下一个实例会覆盖）");
+            eprintln!(
+                "[idoris] 发现文件未删除：旁路锁不可用或等待超时（文件保留，下一个实例会覆盖）"
+            );
         }
         Ok(discovery::RemoveOutcome::Failed) | Err(_) => {
             eprintln!("[idoris] 发现文件未删除：删除失败（文件保留，下一个实例会覆盖）");

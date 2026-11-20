@@ -1025,24 +1025,39 @@ async fn kill_9_leaves_a_recognizable_stale_file_and_a_new_instance_overwrites_i
     let stale_data_port = stale["data_port"].as_u64().unwrap();
     health(&http(), stale_data_port).await;
 
-    // 读者一直在读：任何时刻读到的都必须是完整的 JSON（崩溃、覆盖期间也是）。
+    // 读者一直在读：任何时刻读到的都必须是完整的 JSON（崩溃、覆盖期间也是）。它读到过哪些 instance_id
+    // 记在共享集合里，主线程据此等到它真的见过旧文件和新文件（机器忙时读线程可能晚一点才被调度到）。
     let stop = Arc::new(AtomicBool::new(false));
+    let seen = Arc::new(std::sync::Mutex::new(
+        std::collections::BTreeSet::<String>::new(),
+    ));
     let reader = {
-        let (path, stop) = (path.clone(), stop.clone());
+        let (path, stop, seen) = (path.clone(), stop.clone(), seen.clone());
         std::thread::spawn(move || {
-            let mut seen_ids = std::collections::BTreeSet::new();
             while !stop.load(Ordering::Relaxed) {
                 if let Ok(bytes) = fs::read(&path) {
                     let value: Value = serde_json::from_slice(&bytes).unwrap_or_else(|error| {
                         panic!("partial file ({} bytes): {error}", bytes.len())
                     });
                     assert!(bytes.ends_with(b"\n"));
-                    seen_ids.insert(value["instance_id"].as_str().unwrap().to_string());
+                    seen.lock()
+                        .unwrap()
+                        .insert(value["instance_id"].as_str().unwrap().to_string());
                 }
             }
-            seen_ids
         })
     };
+    let wait_until_seen = |id: &str| {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !seen.lock().unwrap().contains(id) {
+            assert!(
+                Instant::now() < deadline,
+                "the reader never observed instance {id}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    };
+    wait_until_seen(&stale_id);
 
     send("-KILL", &first);
     let status = wait_exit(&mut first, Duration::from_secs(10));
@@ -1063,6 +1078,32 @@ async fn kill_9_leaves_a_recognizable_stale_file_and_a_new_instance_overwrites_i
             .is_err(),
         "nothing answers on the stale port"
     );
+
+    // 第二种识别方式：旧端口上现在是另一个实例在答话（端口被别的进程占用的情形），它的
+    // `/health.instance_id` 与残留文件里的不符。这个实例用的是另一个数据库和旧的 `--admin-token-stdin`，
+    // 不会碰发现文件。
+    let other_state = tempfile::tempdir().unwrap();
+    let mut impostor = env.command(&stale_data_port.to_string(), "0");
+    impostor.env("IDORIS_DB_PATH", other_state.path().join("other.sqlite3"));
+    let mut impostor = impostor
+        .args(["serve", "--admin-token-stdin"])
+        .spawn()
+        .unwrap();
+    impostor
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(format!("{TOKEN}\n").as_bytes())
+        .unwrap();
+    let answered = wait_healthy(&http(), stale_data_port, &mut impostor).await;
+    assert_ne!(
+        answered["instance_id"],
+        json!(stale_id),
+        "a different instance answering on the stale port does not match the stale file"
+    );
+    assert_eq!(fs::read(&path).unwrap(), stale_bytes);
+    let (status, _, stderr) = sigterm_and_collect(&mut impostor);
+    assert_eq!(status.code(), Some(0), "{stderr}");
 
     // 再起一个实例（实例锁已经被内核释放）：拿到锁的新实例把陈旧文件视为陈旧并覆盖。
     let mut second = env.spawn_launcher(&env.frame(json!({})));
@@ -1089,10 +1130,10 @@ async fn kill_9_leaves_a_recognizable_stale_file_and_a_new_instance_overwrites_i
         fresh["instance_id"]
     );
 
+    // 读者见过旧文件，也见过新文件；而且从头到尾没有读到过半截内容（读线程里的断言）。
+    wait_until_seen(fresh["instance_id"].as_str().unwrap());
     stop.store(true, Ordering::Relaxed);
-    let seen = reader.join().unwrap();
-    assert!(seen.contains(&stale_id));
-    assert!(seen.contains(fresh["instance_id"].as_str().unwrap()));
+    reader.join().unwrap();
 
     let (status, _, stderr) = sigterm_and_collect(&mut second);
     assert_eq!(status.code(), Some(0), "{stderr}");
@@ -1112,6 +1153,7 @@ async fn second_instance_exits_3_before_reading_the_frame_and_never_touches_the_
     let listing = dir_listing(&env.run_dir);
 
     // 第二实例：同一个数据库、同一个发现文件路径。stdin 一个字节都不写也不关：它在绑定端口、读帧之前就该退出 3。
+    let second_started = Instant::now();
     let mut second = env
         .command("0", "0")
         .args(["serve", "--launcher-stdin"])
@@ -1119,9 +1161,15 @@ async fn second_instance_exits_3_before_reading_the_frame_and_never_touches_the_
         .unwrap();
     let held_open = second.stdin.take().unwrap();
     let status = wait_exit(&mut second, Duration::from_secs(30));
+    let second_elapsed = second_started.elapsed();
     let (stdout, stderr) = output_of(&mut second);
     drop(held_open);
     assert_eq!(status.code(), Some(3), "{stderr}");
+    // 比读帧的 10 秒超时早得多：它根本没有去读 stdin（实例锁排在读帧、绑定端口之前）。
+    assert!(
+        second_elapsed < Duration::from_secs(8),
+        "exit 3 took {second_elapsed:?}: the second instance must not wait for the frame"
+    );
     assert!(
         stderr.contains("[idoris] 启动失败：已有 iDoris 实例在使用同一数据库"),
         "{stderr}"

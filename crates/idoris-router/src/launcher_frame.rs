@@ -31,8 +31,8 @@ pub const MAX_FRAME_BYTES: usize = 4096;
 pub const FRAME_VERSION: u64 = 1;
 /// 读完整帧的时限。
 pub const FRAME_READ_TIMEOUT: Duration = Duration::from_secs(10);
-/// `discovery_path` 的字节上限。
-pub const MAX_DISCOVERY_PATH_BYTES: usize = 1024;
+/// `discovery_path` 的字节上限（与发现文件模块校验路径用的是同一个常量）。
+pub const MAX_DISCOVERY_PATH_BYTES: usize = crate::discovery::MAX_PATH_BYTES;
 /// `register_socket` 的字节上限（macOS `sun_path` 为 104 字节含 NUL）。
 pub const MAX_REGISTER_SOCKET_BYTES: usize = 103;
 /// `orphan_timeout_s` 的上限（一天）。
