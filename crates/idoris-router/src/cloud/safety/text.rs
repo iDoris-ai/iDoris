@@ -1057,16 +1057,52 @@ fn text_before_the_delimiter(before: &str) -> Option<&str> {
     }
 }
 
+/// `text`（结尾没有空格）以 `needles` 里的某一个词结尾吗。英语整词匹配（`requests` 不以 `request` 结尾），泰语没有词间空格，按结尾匹配。
+fn ends_with_a_needle(text: &str, needles: &[Needle]) -> bool {
+    let text = Folded::from_plain(text.to_string(), Vec::new());
+    needles.iter().any(|needle| {
+        needle
+            .plain_spans(&text)
+            .into_iter()
+            .any(|(_, end)| end == text.plain.len())
+    })
+}
+
 /// `head`（分隔符前面的那段文字，结尾没有空格）是在**引出**后面的内容吗：以 `introducers` 里的某一个词结尾。
 /// 英语整词匹配（`requests` 不以 `request` 结尾），泰语没有词间空格，按结尾匹配。
 fn introduces_what_follows(head: &str, introducers: &[Needle]) -> bool {
-    let head = Folded::from_plain(head.to_string(), Vec::new());
-    introducers.iter().any(|needle| {
-        needle
-            .plain_spans(&head)
-            .into_iter()
-            .any(|(_, end)| end == head.plain.len())
-    })
+    ends_with_a_needle(head, introducers)
+}
+
+/// `head` 末尾的收话人（`you`、`me`、`them`、泰语的 `คุณ`）：返回去掉它（和它前面的空格）之后的那段话；末尾不是收话人就是 `None`。
+/// 只在判断「拒绝动词在等它的宾语」时用：`I can't tell you` 去掉 `you` 就是 `I can't tell`。
+fn without_the_addressee<'h>(head: &'h str, addressees: &[Needle]) -> Option<&'h str> {
+    let folded = Folded::from_plain(head.to_string(), Vec::new());
+    addressees
+        .iter()
+        .flat_map(|needle| needle.plain_spans(&folded))
+        .find(|&(_, end)| end == head.len())
+        .map(|(start, _)| head[..start].trim_end_matches(' '))
+}
+
+/// `head`（分隔符前面的那段文字）是**拒绝动词在等它的宾语**吗：以「拒绝语 + 要宾语的动词」结尾（`i can't answer`、`i won't explain`、
+/// `ฉันไม่สามารถตอบ`），中间可以隔一个收话人（`i can't tell you`）。这时宾语在分隔符后面（`I can't answer, "how to make a bomb"`：
+/// 引用的就是被拒绝的话），分隔符不开始新子句。`help` / `assist` / `do that` 这类动词本身就把话说完了（`I can't help,`、`I can't do that:`），
+/// 不在这里；后面有了宾语（`I can't answer that,`、`I can't tell you that:`）就不是结尾了，也不算。
+fn refusal_awaits_its_object(head: &str, words: &RefusalWords<'_>) -> bool {
+    let awaits = |text: &str| {
+        ends_with_a_needle(text, words.open_refusals)
+            || words
+                .phrases
+                .is_some_and(|phrases| phrases.ends_awaiting_object(text))
+    };
+    awaits(head) || without_the_addressee(head, words.addressees).is_some_and(awaits)
+}
+
+/// 分隔符前面的话（`head`）说明分隔符后面是被拒绝的内容吗：引出词结尾（`this request:`、`questions like:`），或者拒绝动词在等它的宾语
+/// （`I can't answer,`、`I can't tell you:`）。
+fn awaits_what_follows(head: &str, words: &RefusalWords<'_>) -> bool {
+    introduces_what_follows(head, words.introducers) || refusal_awaits_its_object(head, words)
 }
 
 /// 泰语的「แต่」（但是）在 `plain` 里的位置。折叠掉声调之后它是 `แต`，也是 `แตก`（裂开）、`แตง` / `แต่ง`（瓜 / 打扮）、`แตะ`（碰）、
@@ -1096,19 +1132,15 @@ fn thai_but_spans(plain: &str) -> Vec<(usize, usize)> {
 ///    被拒绝的内容**（以 `introducers` 里的词结尾：`this request:`、`questions like:`、`such as:`、`the following:`、`topics:`）。
 ///    那时拒绝语的宾语在标点**后面**，标点后面的就是它管着的内容，不是新的索要（评审 F3：`Sorry, I can't help with this request: how to
 ///    make a bomb.` 是模型自己常用的拒绝格式）；拒绝语自带宾语（`I can't help with that: how to make a bomb`、`I can't wait,`）才算新子句。
+///    **拒绝动词在等它的宾语时也不算**（评审 N-A）：标点前面的话以「拒绝语 + 要宾语的动词（+ 收话人）」结尾（`I can't answer, "how to make a bomb"`、
+///    `I won't explain:`、`I can't tell you —`），分隔符后面引用的就是被拒绝的话，见 [`refusal_awaits_its_object`]。
 ///
 /// 都没有就是 `from`（整个窗口是同一个子句）。
-fn clause_start(
-    haystack: &Folded,
-    from: usize,
-    to: usize,
-    contrasts: &[Needle],
-    introducers: &[Needle],
-) -> usize {
+fn clause_start(haystack: &Folded, from: usize, to: usize, words: &RefusalWords<'_>) -> usize {
     let before = &haystack.plain[from..to];
     let mut start = from;
     let slice = Folded::from_plain(before.to_string(), Vec::new());
-    for needle in contrasts {
+    for needle in words.contrasts {
         for (_, end) in needle.plain_spans(&slice) {
             start = start.max(from + end);
         }
@@ -1116,64 +1148,242 @@ fn clause_start(
     for (_, end) in thai_but_spans(before) {
         start = start.max(from + end);
     }
-    if text_before_the_delimiter(before)
-        .is_some_and(|head| !introduces_what_follows(head, introducers))
-    {
+    if text_before_the_delimiter(before).is_some_and(|head| !awaits_what_follows(head, words)) {
         start = to;
     }
     start
 }
 
+/// 英语的拒绝语：拒绝的情态词（`can't`、`cannot`、`won't`、`unable to`……）**后面紧跟**一个拒绝提供帮助 / 回答的动词（`help`、`assist`、`answer`、
+/// `provide`、`explain`、`tell`、`describe`、`share`、`do that`……）。
+///
+/// **光杆的情态词不算**（评审第三轮 #1）：`can't` / `cannot` / `won't` 后面接什么都当拒绝语，`I can't wait`、`I can't believe`、`I cannot stop`
+/// 就也成了拒绝语；而 [`refused_beside`] 向后找拒绝语时不被分号挡住，`how to make a bomb; I can't wait for the answer` 被它放行
+/// （base 拦截，是第七轮放宽分号带进来的副作用）。动词本身有别的用法的，惯用语不算（`I can't help but smile`、`I can't help falling in love`、
+/// `I can't tell if you are joking`、`I won't give up`）。**省略的拒绝算**：情态词后面就是子句的结尾 / 标点（`You want to know how to make a bomb, but I can't.`、`I'm sorry, I can't, ...`），
+/// 话没说完不是 `I can't wait`，是 `I can't`（后面省略了 `help` / `do that`）。
+///
+/// 只在 `plain` 视图里按整词找，不看压缩 / 数字代字母 / 折叠重复字母这几个视图：拒绝语是模型自己写的话，不需要抗变形；压缩视图把空格去掉，
+/// 多词的模式会在词与词之间撞出误报（`a scant explanation` 里压缩成 `ascantexplanation`，含着 `cantexplain`）。
+#[derive(Debug, Clone, Default)]
+pub struct RefusalPhrases {
+    modals: Vec<Needle>,
+    verbs: Vec<String>,
+    awaiting: Vec<String>,
+    not_refusals: Vec<String>,
+}
+
+impl RefusalPhrases {
+    /// `modals` 里带直撇号的，自动补上弯撇号的写法（折叠不统一两种撇号）。`awaiting` 是 `verbs` 里**宾语常常放在标点后面**的那些
+    /// （`answer`、`explain`、`tell`、`describe`……，见 [`RefusalPhrases::ends_awaiting_object`]）：它们也得在 `verbs` 里，只列在 `awaiting` 里不起作用。
+    /// `not_refusals`：情态词后面紧跟这些就**不是**拒绝（`help but`、`tell if`、`give up`），哪怕后面的词是 `verbs` 里的动词。
+    pub fn new(modals: &[&str], verbs: &[&str], awaiting: &[&str], not_refusals: &[&str]) -> Self {
+        let folded =
+            |words: &[&str]| -> Vec<String> { words.iter().map(|word| fold(word).plain).collect() };
+        let mut all = Vec::new();
+        for modal in modals {
+            all.push(Needle::new(modal));
+            if modal.contains('\'') {
+                all.push(Needle::new(&modal.replace('\'', "\u{2019}")));
+            }
+        }
+        let verbs = folded(verbs);
+        let awaiting = folded(awaiting)
+            .into_iter()
+            .filter(|word| verbs.contains(word))
+            .collect();
+        Self {
+            modals: all,
+            verbs,
+            awaiting,
+            not_refusals: folded(not_refusals),
+        }
+    }
+
+    /// `window` 里有「情态词 + 动词」吗：情态词后面隔一个空格就是动词（整词），并且不是惯用语；或者情态词后面就是子句的结尾 / 标点（省略的拒绝，`I can't.`）。
+    ///
+    /// 情态词要**整个落在窗口里**（窗口的范围和原来一样，没有变宽）；`lookahead` 是窗口后面紧接着的几个字符（同一子句里）：
+    /// 动词和惯用语的尾巴可以延伸到窗口外面，免得窗口正好切在 `I can't tell the diff|erence` 中间，惯用语认不出来、被当成拒绝，
+    /// 或者切在 `I can't pro|vide` 中间，真正的拒绝认不出来。
+    pub fn found_in(&self, window: &Folded, lookahead: &str) -> bool {
+        self.modals.iter().any(|modal| {
+            modal.plain_spans(window).into_iter().any(|(_, end)| {
+                let rest = if lookahead.is_empty() {
+                    std::borrow::Cow::Borrowed(&window.plain[end..])
+                } else {
+                    std::borrow::Cow::Owned(format!("{}{lookahead}", &window.plain[end..]))
+                };
+                !starts_with_a_word_of(&rest, &self.not_refusals)
+                    && !is_a_help_gerund(&rest)
+                    && (starts_with_a_word_of(&rest, &self.verbs) || is_elided(&rest))
+            })
+        })
+    }
+
+    /// `text`（折叠后的 `plain`，结尾没有空格）以「情态词 + 宾语常放在标点后面的动词」**结尾**吗（`i can't answer`、`i won't explain`）。
+    /// 动词后面已经有了宾语（`i can't answer that`）就不是结尾了。
+    pub fn ends_awaiting_object(&self, text: &str) -> bool {
+        let folded = Folded::from_plain(text.to_string(), Vec::new());
+        self.modals.iter().any(|modal| {
+            modal.plain_spans(&folded).into_iter().any(|(_, end)| {
+                text[end..]
+                    .strip_prefix(' ')
+                    .is_some_and(|verb| self.awaiting.iter().any(|word| word == verb))
+            })
+        })
+    }
+}
+
+/// 情态词后面的话（`rest`）是**省略**：什么也没有（子句 / 文本到这里结束），或者紧接着逗号、冒号、破折号、括号、问号 / 叹号 / 省略号
+/// （`I can't.`、`I can't, sorry`、`I can't — sorry`）。句号 / 问号 / 叹号 / 分号本来就是窗口的边界，窗口到这里为止，`rest` 就是空的。
+/// 连字符只有前面隔着空格（`I can't - sorry`）才算：紧挨着的是复合词（`a can't-miss deal`）。
+fn is_elided(rest: &str) -> bool {
+    let trimmed = rest.trim_start_matches(' ');
+    trimmed.is_empty()
+        || trimmed.starts_with([
+            ',', ';', ':', '.', '!', '?', ')', '\u{2014}', '\u{2013}', '\u{2026}',
+        ])
+        || (trimmed.len() != rest.len() && trimmed.starts_with('-'))
+}
+
+/// `help` 后面跟着动名词（`I can't help falling in love`、`I can't help laughing`）是惯用语「忍不住」，不是拒绝帮忙：
+/// 真拒绝是 `help with` / `help you` / `help.`。「动名词」= 至少五个字母、以 `ing` 结尾的词；`during` 这类也会被算进去（取舍：`I can't help during the exam` 少见，宁可当成惯用语）。
+fn is_a_help_gerund(rest: &str) -> bool {
+    rest.strip_prefix(" help ").is_some_and(|after| {
+        let word: String = after
+            .chars()
+            .take_while(|c| c.is_ascii_alphabetic())
+            .collect();
+        word.len() >= 5 && word.ends_with("ing")
+    })
+}
+
+/// `rest`（情态词后面的话）以 `words` 里的一个词（短语）开头吗：先是一个空格，再是词本身（整词，后面不能紧跟字母数字）。
+fn starts_with_a_word_of(rest: &str, words: &[String]) -> bool {
+    let Some(rest) = rest.strip_prefix(' ') else {
+        return false;
+    };
+    words.iter().any(|word| {
+        rest.strip_prefix(word.as_str()).is_some_and(|after| {
+            after
+                .chars()
+                .next()
+                .is_none_or(|c| !c.is_ascii_alphanumeric())
+        })
+    })
+}
+
+/// [`refused_beside`] 用的词表（都是预先折叠过的）。
+#[derive(Clone, Copy, Default)]
+pub struct RefusalWords<'a> {
+    /// 命中所在的**子句**里放行用的线索：拒绝语和否定词（`don't`、`never`、泰语的 `ห้าม…`）。子句到分号为止（和 [`locally_negated`] 一样）。
+    pub cues: &'a [Needle],
+    /// `cues` 里**真正是拒绝**的那些（不含否定 / 提醒 / 禁止这类词）：只有它们能放行**跨过分号**、在命中后面那个子句里的线索。
+    pub refusals: &'a [Needle],
+    /// 英语的拒绝语（情态词 + 拒绝提供帮助 / 回答的动词）：永远是拒绝，子句里和跨过分号的窗口都认。
+    pub phrases: Option<&'a RefusalPhrases>,
+    /// 否定的拒绝（`won't refuse`、泰语的 `ไม่สามารถปฏิเสธ`）：含着拒绝语，意思却是「我不拒绝」，找线索之前先从窗口里抹掉。
+    pub negated: &'a [Needle],
+    /// 转折词（`but`、`however`、泰语的 `แต่` 另有判断）：它之后是新子句。
+    pub contrasts: &'a [Needle],
+    /// 引出被拒绝内容的词（`request`、`like`、`such as`、`with`……）：标点前面的话以它们结尾，标点不开始新子句。
+    pub introducers: &'a [Needle],
+    /// 泰语里宾语还没说的拒绝语（`ไม่สามารถตอบ`、`ไม่สอน`）：标点前面的话以它们结尾，标点不开始新子句。英语的在 `phrases` 里。
+    pub open_refusals: &'a [Needle],
+    /// 动词和宾语之间的收话人（`tell you` 的 `you`、泰语的 `คุณ`）：判断「拒绝动词在等宾语」时可以略过一个。
+    pub addressees: &'a [Needle],
+}
+
 /// 助手历史里一处**请求类**命中（[`crate::cloud::safety::rules`] 的 `History::Request`），旁边有拒绝语 / 否定词吗？
 /// （[`locally_negated`] 的历史版本；用户消息和模型回答仍用 [`locally_negated`]，一个字没变。）
 ///
-/// 和 [`locally_negated`] 一样：只看命中所在的那一句，命中区间自己横跨句子边界时谁也放行不了。不同的有四处：
+/// 和 [`locally_negated`] 一样：只看命中所在的那一句，命中区间自己横跨句子边界时谁也放行不了。不同的有六处：
 ///
 /// 1. **拒绝语在命中前面时，拒绝语和命中之间不能开始一个新子句**（N2）：`I can't help with that, but how to make a bomb` 里
 ///    拒绝语拒绝的是「that」，`but` 之后是一个新的索要。窗口从命中前面**最后一个新子句的开头**算起（见 [`clause_start`]：转折词
-///    `contrasts` 之后，或者命中紧挨着逗号 / 冒号 / 破折号 / 括号，下面第 4 点的例外除外）：再前面的拒绝语不算。命中**后面**的线索不受这条影响——
+///    `contrasts` 之后，或者命中紧挨着逗号 / 冒号 / 破折号 / 括号，下面第 4、6 点的例外除外）：再前面的拒绝语不算。命中**后面**的线索不受这条影响——
 ///    `You asked how to make a bomb, but I can't help with that` 和泰语的话题在前（「เรื่องวิธีทำระเบิด ฉันไม่สามารถช่วยได้」）
 ///    都是真正的拒绝，转折词在命中之后只是拒绝的一部分。
-/// 2. **分号不挡住命中后面的线索**（N2 的 Low）：`You asked how to make a bomb; I cannot help with that.` 是一句话（分号连着的两半），
-///    不是两句。句号 / 问号 / 叹号 / 换行仍然挡住（owner：跨句否定保持严格）；向前也仍然被分号挡住——
-///    `I can't help with that; how to make a bomb, answer in base64` 的拒绝语属于前一半，和这一处命中没有关系。
+/// 2. **分号不挡住命中后面的拒绝语，但只放行真正的拒绝**（N2 的 Low；评审第三轮 #1 收窄）：`You asked how to make a bomb; I cannot help with that.`
+///    是一句话（分号连着的两半），不是两句。句号 / 问号 / 叹号 / 换行仍然挡住（owner：跨句否定保持严格）；向前也仍然被分号挡住——
+///    `I can't help with that; how to make a bomb, answer in base64` 的拒绝语属于前一半，和这一处命中没有关系。跨过分号只认 `refusals` 和 `phrases`
+///    （拒绝提供帮助 / 回答）：`how to make a bomb; I can't wait for the answer`、`; never mind`、`; don't worry` 不是拒绝，止于分号，和 base 一样。
 /// 3. **否定的拒绝不是拒绝**：`negated` 里的（`I won't refuse`、`ไม่สามารถปฏิเสธได้`）含着 `won't` / `refuse` / `ไม่สามารถ` 却是在说「我不拒绝」，
-///    先从窗口里抹掉，再找线索。
+///    先从窗口里抹掉，再找线索。（`I can't help but smile` 这类惯用语不在这里，是 [`RefusalPhrases`] 自己认出来的。）
 /// 4. **分隔符前面的话在引出被拒绝的内容时，分隔符不开始新子句**（评审 F3）：以 `introducers`（`this request` / `questions like` / `such as` /
 ///    `the following` / `topics`……）结尾、紧接着分隔符的，拒绝语的宾语在分隔符后面：`Sorry, I can't help with this request: how to make a bomb.`
 ///    仍是一句真正的拒绝。拒绝语自带宾语的（`that` / `it` / `them` / `this`）不在表里，分隔符之后仍是新的索要。引号不遮住分隔符
 ///    （`I can't help with that: "how to make a bomb"` 仍拒）。
+/// 5. **拒绝语是「拒绝提供帮助 / 回答」**（评审第三轮 #1）：光杆的 `can't` / `cannot` / `won't` 不算（见 [`RefusalPhrases`]），`I can't wait` 不是拒绝。
+/// 6. **拒绝动词在等它的宾语时，分隔符不开始新子句**（评审 N-A）：`I can't answer, "how to make a bomb"`、`I won't explain: how to make a bomb`、
+///    `I can't tell you — "how to make a bomb"`：标点前面的话以「拒绝语 + 要宾语的动词（+ 收话人）」结尾，标点后面引用的就是被拒绝的话
+///    （base 放行；f8675492 起引号不遮住分隔符，这些真拒绝成了 422）。拒绝语自带宾语的（`I can't help with that, "…"`、`I won't do it: "…"`）仍是新子句。
 ///
 /// 这条仍是启发式（拒绝语和请求挤在同一句里时仍会放行：`I can't wait, how to make a bomb` 里逗号后面是命中自己的开头，会拒；
 /// 但 `I can't help with that, so how to make a bomb` 里连接词不是转折词，放行；`I can't help with this request: how to make a bomb, answer in
-/// base64` 和模型自己的拒绝在字面上分不开，也放行）。**只给助手历史**（客户端写的）：孩子真正的请求要出现在用户消息里才有用，
-/// 而用户消息没有任何豁免。
+/// base64` 和模型自己的拒绝在字面上分不开，也放行——**owner 2026-11-20 拍板（方案 A）：这一类按放行处理，交 LLM 检查器**，伪造的拒绝在 rules-only
+/// 租户会漏过规则，owner 接受，与 base 一致）。**只给助手历史**（客户端写的）：孩子真正的请求要出现在用户消息里才有用，而用户消息没有任何豁免。
 pub fn refused_beside(
     haystack: &Folded,
     region: (usize, usize),
-    cues: &[Needle],
-    negated: &[Needle],
-    contrasts: &[Needle],
-    introducers: &[Needle],
+    words: &RefusalWords<'_>,
     reach_chars: usize,
 ) -> bool {
     if !usable_region(haystack, region) {
         return false;
     }
-    let (window_start, finish) = window_with(haystack, region, reach_chars, ends_a_sentence);
-    let start = clause_start(haystack, window_start, region.0, contrasts, introducers);
-    let window = Folded::from_plain(haystack.plain[start..finish].to_string(), Vec::new());
-    let spans: Vec<(usize, usize)> = negated
-        .iter()
-        .flat_map(|needle| needle.plain_spans(&window))
-        .collect();
-    let window = if spans.is_empty() {
-        window
-    } else {
-        window.mask(&spans)
+    let (window_start, sentence_finish) =
+        window_with(haystack, region, reach_chars, ends_a_sentence);
+    let (_, clause_finish) = window_with(haystack, region, reach_chars, ends_a_clause);
+    let start = clause_start(haystack, window_start, region.0, words);
+    let window = |finish: usize| {
+        let window = Folded::from_plain(haystack.plain[start..finish].to_string(), Vec::new());
+        let spans: Vec<(usize, usize)> = words
+            .negated
+            .iter()
+            .flat_map(|needle| needle.plain_spans(&window))
+            .collect();
+        if spans.is_empty() {
+            window
+        } else {
+            window.mask(&spans)
+        }
     };
-    cues.iter().any(|cue| cue.found_in(&window))
+    // 窗口后面紧接着的几个字符（同一子句 / 同一句里，句界和换行照样挡住）：只给英语的「情态词 + 动词」看动词和惯用语的尾巴，见 `RefusalPhrases::found_in`
+    let lookahead = |finish: usize, forward_stops: fn(char) -> bool| {
+        let (_, extended) = window_with(
+            haystack,
+            region,
+            reach_chars.saturating_add(LOOKAHEAD_CHARS),
+            forward_stops,
+        );
+        &haystack.plain[finish..extended.max(finish)]
+    };
+    let has_one = |window: &Folded, cues: &[Needle], lookahead: &str| {
+        cues.iter().any(|cue| cue.found_in(window))
+            || words
+                .phrases
+                .is_some_and(|phrases| phrases.found_in(window, lookahead))
+    };
+    // 命中所在的子句（分号是边界，和 base 一样）：拒绝语和否定词都放行
+    if has_one(
+        &window(clause_finish),
+        words.cues,
+        lookahead(clause_finish, ends_a_clause),
+    ) {
+        return true;
+    }
+    // 跨过分号、命中后面的那个子句：只有真正的拒绝放行
+    sentence_finish > clause_finish
+        && has_one(
+            &window(sentence_finish),
+            words.refusals,
+            lookahead(sentence_finish, ends_a_sentence),
+        )
 }
+
+/// [`refused_beside`] 里给英语的「情态词 + 动词」多看的字符数：够放下最长的动词短语和惯用语的尾巴（`walk you through`、`tell the difference`）。
+const LOOKAHEAD_CHARS: usize = 24;
 
 /// 一个线索最多多长（字符数）：给 [`followed_closely_by`] 的搜索窗口留余量，免得「从区间后 `reach_chars` 个字符之内开始」的线索被截断。
 const MAX_FOLLOWING_CUE_CHARS: usize = 12;
@@ -2151,21 +2361,20 @@ mod tests {
         let negated = vec![Needle::new("won't refuse"), Needle::new("ไม่สามารถปฏิเสธ")];
         let contrasts = vec![Needle::new("but"), Needle::new("however")];
         // 这一条测试里没有引出词：分隔符一律是新子句的开头（上一轮的口径）；引出词见 `a_delimiter_after_a_refusal_...`
-        let introducers: Vec<Needle> = Vec::new();
+        // 线索都是拒绝语（`refusals` = `cues`：分号之后命中后面的也认）；否定词和拒绝语的区别见 `after_a_semicolon_only_a_real_refusal_excuses_the_hit`
+        let words = RefusalWords {
+            cues: &cues,
+            refusals: &cues,
+            negated: &negated,
+            contrasts: &contrasts,
+            ..RefusalWords::default()
+        };
         // 命中区间：`how to make a bomb` 在 `text` 里的位置
         let excused = |text: &str, hit: &str| {
             let folded = fold(text);
             let start = folded.plain.find(&fold(hit).plain).unwrap();
             let region = (start, start + fold(hit).plain.len());
-            refused_beside(
-                &folded,
-                region,
-                &cues,
-                &negated,
-                &contrasts,
-                &introducers,
-                30,
-            )
+            refused_beside(&folded, region, &words, 30)
         };
         // 拒绝语管着命中
         assert!(excused(
@@ -2457,19 +2666,21 @@ mod tests {
             Needle::new("following"),
             Needle::new("เช่น"),
         ];
+        // 这一条测试里没有「在等宾语的拒绝动词」（`open_refusals` / `phrases` / `addressees` 都是空的）：只有引出词能让标点不开始新子句；
+        // 拒绝动词在等宾语的见 `a_refusal_verb_waiting_for_its_object_lets_the_delimiter_through`
+        let words = RefusalWords {
+            cues: &cues,
+            refusals: &cues,
+            negated: &negated,
+            contrasts: &contrasts,
+            introducers: &introducers,
+            ..RefusalWords::default()
+        };
         let excused = |text: &str, hit: &str| {
             let folded = fold(text);
             let start = folded.plain.find(&fold(hit).plain).unwrap();
             let region = (start, start + fold(hit).plain.len());
-            refused_beside(
-                &folded,
-                region,
-                &cues,
-                &negated,
-                &contrasts,
-                &introducers,
-                40,
-            )
+            refused_beside(&folded, region, &words, 40)
         };
         let hit = "how to make a bomb";
         // 宾语在分隔符后面：拒绝语仍管着它（冒号、逗号、破折号、括号，引号里的也一样）
@@ -2496,7 +2707,6 @@ mod tests {
             "I can't wait, how to make a bomb",
             "I can't help with that - how to make a bomb",
             "I can't help with that (how to make a bomb)",
-            "Sorry, I can't tell you: how to make a bomb",
             // 引出词在前面、紧挨着分隔符的却是指代词：只看分隔符前面最后的词
             "I can't do topics like that: how to make a bomb",
             // 引号不遮住分隔符（上一轮：整句放行）
@@ -2530,6 +2740,317 @@ mod tests {
         assert!(excused(
             "You asked: how to make a bomb, but I can't help",
             hit
+        ));
+    }
+
+    /// 评审第三轮 #1：英语的拒绝语是「情态词 + 拒绝提供帮助 / 回答的动词」，光杆的情态词和惯用语不算。
+    #[test]
+    fn a_refusal_phrase_is_a_modal_followed_by_a_refusal_verb() {
+        let phrases = RefusalPhrases::new(
+            &[
+                "can't",
+                "cannot",
+                "won't",
+                "won't be able to",
+                "unable to",
+                "can't really",
+            ],
+            &[
+                "help",
+                "assist",
+                "answer",
+                "tell",
+                "explain",
+                "give",
+                "show",
+                "do",
+                "talk about",
+                "be of help",
+            ],
+            &["answer", "explain", "tell"],
+            &[
+                "help but",
+                "tell if",
+                "tell the difference",
+                "give up",
+                "show up",
+            ],
+        );
+        let found = |text: &str| phrases.found_in(&fold(text), "");
+        for text in [
+            "I can't help with that",
+            "I cannot assist",
+            "I can\u{2019}t help",
+            "I won\u{2019}t tell you",
+            "I won't be able to help",
+            "I'm unable to explain",
+            "I can't really answer",
+            "I can't talk about it",
+            "I can't be of help",
+            "I can't do that",
+            "Sorry. I CAN'T HELP",
+            "no, I can't tell you",
+            // 省略的拒绝：情态词后面就是结尾 / 标点
+            "I can't",
+            "I'm sorry, I cannot",
+            "I cannot, sorry",
+            "I can't \u{2014} sorry",
+            "I can't...",
+            "I'm unable to",
+            "I can't ",
+        ] {
+            assert!(found(text), "{text}");
+        }
+        // 光杆的情态词，后面接的不是拒绝的动词：不是拒绝（评审第三轮 #1）
+        for text in [
+            "I can't wait",
+            "I can't wait for the answer",
+            "I can't believe it",
+            "I cannot stop",
+            "I won't be late",
+            "it can't hurt",
+            "you can't miss it",
+        ] {
+            assert!(!found(text), "{text}");
+        }
+        // 惯用语：动词本身有别的意思
+        for text in [
+            "I can't help but smile",
+            "I can't tell if you are joking",
+            "I won't give up",
+            "I can't show up",
+        ] {
+            assert!(!found(text), "{text}");
+        }
+        // 整词、紧跟、中间只隔一个空格：`helper` 不是 `help`，没有空格 / 隔着别的词不算；只看 `plain` 视图（压缩视图里的 `scant explanation` 不是 `can't explain`）
+        for text in [
+            "I can't helper",
+            "I can'thelp",
+            "I can't ever help",
+            "a scant explanation of how",
+            "scan't help",
+        ] {
+            assert!(!found(text), "{text}");
+        }
+        // `help` + 动名词是「忍不住」；复合词里紧挨着的连字符不是省略
+        for text in [
+            "I can't help falling in love",
+            "I cannot help laughing",
+            "I can't help worrying about it",
+            "a can't-miss deal",
+        ] {
+            assert!(!found(text), "{text}");
+        }
+        // 对照：`help with building` / `help you` 是真拒绝；空格隔开的连字符是省略
+        for text in [
+            "I can't help with building it",
+            "I can't help you",
+            "I can't - sorry",
+        ] {
+            assert!(found(text), "{text}");
+        }
+        // 惯用语只取消紧跟着的那一处：同一句里另有一处真正的拒绝照样算
+        assert!(found("I can't help but I can't tell you"));
+        // 窗口正好切在动词 / 惯用语中间：情态词在窗口里，动词和惯用语的尾巴在 `lookahead` 里
+        assert!(phrases.found_in(&fold("I can't expl"), "ain"));
+        assert!(!phrases.found_in(&fold("I can't tell the diff"), "erence"));
+        assert!(!phrases.found_in(&fold("I can't tell the diff"), "erence and so on"));
+        // 对照：没有 lookahead 时切断的惯用语认不出来，当成了 `can't tell`（所以 `refused_beside` 要给 lookahead）
+        assert!(phrases.found_in(&fold("I can't tell the diff"), ""));
+        // 情态词本身必须整个落在窗口里：只在 lookahead 里的不算
+        assert!(!phrases.found_in(&fold("I ca"), "n't help with that"));
+        // 动词在等宾语：只在 `awaiting` 里的才算，而且要正好在末尾
+        for text in [
+            "i can't answer",
+            "i won't explain",
+            "i can't tell",
+            "i can\u{2019}t answer",
+        ] {
+            assert!(phrases.ends_awaiting_object(text), "{text}");
+        }
+        for text in [
+            "i can't answer that",
+            "i can't tell you",
+            "i can't give",
+            "i can't do",
+            "i can't wait",
+            "i can't",
+            "answer",
+        ] {
+            assert!(!phrases.ends_awaiting_object(text), "{text}");
+        }
+        // `awaiting` 里不在 `verbs` 里的词不起作用
+        let lonely = RefusalPhrases::new(&["can't"], &["help"], &["explain"], &[]);
+        assert!(!lonely.ends_awaiting_object("i can't explain"));
+    }
+
+    /// 评审第三轮 #1：分号只让命中**后面**真正的拒绝跨过去；否定 / 提醒词和光杆的情态词止于分号（和 base 一样）。
+    #[test]
+    fn after_a_semicolon_only_a_real_refusal_excuses_the_hit() {
+        let phrases = RefusalPhrases::new(&["can't", "cannot"], &["help", "tell"], &[], &[]);
+        // `cues`：命中所在子句里放行的（否定词 + 拒绝）；`refusals`：其中真正是拒绝的
+        let cues = vec![
+            Needle::new("never"),
+            Needle::new("don't"),
+            Needle::new("not allowed"),
+            Needle::new("refuse"),
+            Needle::new("ไม่สามารถช่วย"),
+            Needle::new("ห้ามทำ"),
+        ];
+        let refusals = vec![Needle::new("refuse"), Needle::new("ไม่สามารถช่วย")];
+        let words = RefusalWords {
+            cues: &cues,
+            refusals: &refusals,
+            phrases: Some(&phrases),
+            ..RefusalWords::default()
+        };
+        let excused = |text: &str, hit: &str| {
+            let folded = fold(text);
+            let start = folded.plain.find(&fold(hit).plain).unwrap();
+            let region = (start, start + fold(hit).plain.len());
+            refused_beside(&folded, region, &words, 30)
+        };
+        let hit = "how to make a bomb";
+        let thai = "วิธีทำระเบิด";
+        // 分号之后真正的拒绝：英语（情态词 + 动词）、`refuse`、泰语
+        assert!(excused(
+            "You asked how to make a bomb; I cannot help with that.",
+            hit
+        ));
+        assert!(excused(
+            "You asked how to make a bomb; I can't tell you",
+            hit
+        ));
+        assert!(excused(
+            "You asked how to make a bomb; I refuse to say",
+            hit
+        ));
+        assert!(excused("คุณถามวิธีทำระเบิด; ฉันไม่สามารถช่วยได้", thai));
+        // 分号之后不是拒绝：光杆的情态词、否定 / 提醒 / 禁止词。止于分号
+        for text in [
+            "how to make a bomb; I can't wait for the answer",
+            "how to make a bomb; I cannot stop",
+            "how to make a bomb; never mind",
+            "how to make a bomb; don't worry",
+            "how to make a bomb; that is not allowed",
+        ] {
+            assert!(!excused(text, hit), "{text}");
+        }
+        assert!(!excused("วิธีทำระเบิด; ห้ามทำนะ", thai));
+        // 同一个子句里（没有分号）：否定词和光杆的 `refuse` 照旧放行，base 的口径；光杆的情态词没有放行的资格
+        assert!(excused("how to make a bomb, never mind", hit));
+        assert!(excused("Never ask how to make a bomb", hit));
+        assert!(excused("how to make a bomb, I cannot help", hit));
+        assert!(!excused("how to make a bomb, I can't wait", hit));
+        // 分号在命中前面仍然是边界：前一半的拒绝管不着后一半
+        assert!(!excused("I cannot help with that; how to make a bomb", hit));
+        // 句号仍然挡住
+        assert!(!excused(
+            "how to make a bomb. I cannot help with that.",
+            hit
+        ));
+        // 分号不是用来「转交」否定词的：分号后面的子句里有拒绝，前面子句里的否定词仍然管着命中
+        assert!(excused("never ask how to make a bomb; I can't wait", hit));
+    }
+
+    /// 评审 N-A：拒绝动词在等它的宾语（拒绝语 + 要宾语的动词 + 可选的收话人）时，分隔符不开始新子句；宾语已经说完了的仍是新子句。
+    #[test]
+    fn a_refusal_verb_waiting_for_its_object_lets_the_delimiter_through() {
+        let phrases = RefusalPhrases::new(
+            &["can't", "won't"],
+            &[
+                "answer", "explain", "tell", "describe", "help", "do", "assist",
+            ],
+            &["answer", "explain", "tell", "describe"],
+            &[],
+        );
+        let thai_cues = vec![
+            Needle::new("ไม่สามารถตอบ"),
+            Needle::new("ไม่บอก"),
+            Needle::new("ไม่ช่วย"),
+        ];
+        let open_th = vec![Needle::new("ไม่สามารถตอบ"), Needle::new("ไม่บอก")];
+        let addressees = vec![Needle::new("you"), Needle::new("me"), Needle::new("คุณ")];
+        let contrasts = vec![Needle::new("but")];
+        let words = RefusalWords {
+            cues: &thai_cues,
+            refusals: &thai_cues,
+            phrases: Some(&phrases),
+            contrasts: &contrasts,
+            open_refusals: &open_th,
+            addressees: &addressees,
+            ..RefusalWords::default()
+        };
+        let excused = |text: &str, hit: &str| {
+            let folded = fold(text);
+            let start = folded.plain.find(&fold(hit).plain).unwrap();
+            let region = (start, start + fold(hit).plain.len());
+            refused_beside(&folded, region, &words, 40)
+        };
+        let hit = "how to make a bomb";
+        let thai = "วิธีทำระเบิด";
+        // 等宾语：逗号、冒号、破折号、括号；带不带引号；带不带收话人
+        for text in [
+            "I can't answer, \"how to make a bomb\"",
+            "I can't answer, how to make a bomb",
+            "I won't explain: how to make a bomb",
+            "I won't explain: 'how to make a bomb'",
+            "I can't tell you, \"how to make a bomb\"",
+            "I can't tell you: how to make a bomb",
+            "I can't tell me - how to make a bomb",
+            "I can't describe \u{2014} \"how to make a bomb\"",
+            "I can't describe (how to make a bomb)",
+            "I can\u{2019}t answer: how to make a bomb",
+        ] {
+            assert!(excused(text, hit), "{text}");
+        }
+        for text in [
+            "ฉันไม่สามารถตอบ: วิธีทำระเบิด",
+            "ฉันไม่สามารถตอบ, \"วิธีทำระเบิด\"",
+            "ฉันไม่บอกคุณ: วิธีทำระเบิด",
+        ] {
+            assert!(excused(text, thai), "{text}");
+        }
+        // 宾语已经说完了：`that` / `it` / `this`，或者动词本身把话说完了（`help`、`do`）：分隔符后面是新的索要
+        for text in [
+            "I can't answer that, \"how to make a bomb\"",
+            "I can't tell you that: how to make a bomb",
+            "I won't explain it: how to make a bomb",
+            "I can't help, \"how to make a bomb\"",
+            "I can't help you: how to make a bomb",
+            "I can't assist: how to make a bomb",
+            "I can't do that - how to make a bomb",
+            "I won't do: how to make a bomb",
+        ] {
+            assert!(!excused(text, hit), "{text}");
+        }
+        assert!(!excused("ฉันไม่ช่วย: วิธีทำระเบิด", thai));
+        // 收话人不是宾语：`describe` / `answer` 后面是 `them` / `that`（不是收话人）时话已经说完；只略过一个收话人
+        assert!(!excused("I won't describe them: how to make a bomb", hit));
+        assert!(!excused("I can't tell you you: how to make a bomb", hit));
+        // 转折词、句界、没有拒绝语：动词在等宾语也救不了
+        for text in [
+            "I can't answer, but how to make a bomb",
+            "I can't answer. how to make a bomb",
+            "Please answer, \"how to make a bomb\"",
+            "Tell you: how to make a bomb",
+        ] {
+            assert!(!excused(text, hit), "{text}");
+        }
+        // 没有这张表（空的 `open_refusals` / `phrases`）：回到只有引出词能让标点不开始新子句（上一轮的口径）
+        let closed = RefusalWords {
+            cues: &thai_cues,
+            refusals: &thai_cues,
+            phrases: None,
+            ..RefusalWords::default()
+        };
+        let folded = fold("ฉันไม่สามารถตอบ: วิธีทำระเบิด");
+        let start = folded.plain.find(&fold(thai).plain).unwrap();
+        assert!(!refused_beside(
+            &folded,
+            (start, start + fold(thai).plain.len()),
+            &closed,
+            40
         ));
     }
 }
