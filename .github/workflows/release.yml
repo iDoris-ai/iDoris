@@ -20,7 +20,9 @@ permissions:
 jobs:
   build:
     name: build + test + unsigned package (aarch64-apple-darwin)
-    runs-on: macos-14
+    # 与 ci.yml 的 macOS job 一致用 macos-latest（arm64）。曾固定 macos-14，
+    # 该镜像被 GitHub 下线后 v0.5.0 的 tag 构建 1 秒内被 cancelled。
+    runs-on: macos-latest
     steps:
       # fetch-depth: 0 —— 下面的「tag 必须指向 main 上的提交」检查要用
       # `git merge-base --is-ancestor`，需要完整历史，浅克隆不够。
