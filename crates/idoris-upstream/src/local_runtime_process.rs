@@ -6,6 +6,14 @@
 //! process group.
 //! Engine/model readiness stays with [`idoris_backend::RuntimeAdapter::probe_ready`];
 //! there is no generic health endpoint shared by the B8 runtimes.
+//!
+//! `ManagedRuntimeProcess::spawn_engine` is the second constructor, for an
+//! engine-level server process (oMLX, IDORIS-CORE S3): cleaned environment,
+//! working directory and stdout/stderr files chosen by the caller, and a
+//! per-handle choice of whether `Drop` kills the process group
+//! (`stop_on_exit: "owned"`) or leaves the engine running (`"never"`). The
+//! B8 constructor and everything the two share (`shutdown`, the group
+//! signalling and cleanup checks) are unchanged.
 
 use std::process::Stdio;
 use std::time::Duration;
@@ -21,6 +29,22 @@ pub struct ManagedRuntimeProcess {
     process_group: i32,
     #[cfg(unix)]
     armed: bool,
+}
+
+/// Everything [`ManagedRuntimeProcess::spawn_engine`] needs. The environment is
+/// the complete child environment (the parent's is not inherited).
+#[cfg(unix)]
+pub(crate) struct EngineSpawn {
+    pub(crate) executable: std::path::PathBuf,
+    pub(crate) args: Vec<std::ffi::OsString>,
+    pub(crate) env: Vec<(std::ffi::OsString, std::ffi::OsString)>,
+    pub(crate) current_dir: std::path::PathBuf,
+    pub(crate) stdout: std::fs::File,
+    pub(crate) stderr: std::fs::File,
+    /// `true`: `Drop` SIGKILLs the whole process group (`stop_on_exit:
+    /// "owned"`, the B8 behaviour). `false`: `Drop` leaves the engine running
+    /// (`"never"`); only an explicit [`ManagedRuntimeProcess::shutdown`] stops it.
+    pub(crate) kill_group_on_drop: bool,
 }
 
 impl ManagedRuntimeProcess {
@@ -70,6 +94,46 @@ impl ManagedRuntimeProcess {
         args: Vec<std::ffi::OsString>,
     ) -> Result<Self, BackendError> {
         Self::spawn_command(executable, args)
+    }
+
+    /// Spawns an engine-level server process (see [`EngineSpawn`]).
+    ///
+    /// Same ownership model as [`Self::spawn`]: the child leads its own process
+    /// group, and the unreaped direct child anchors that PGID for
+    /// [`Self::shutdown`]. Differences, all chosen by the caller through `spec`:
+    /// the environment is cleared down to `spec.env`, the working directory
+    /// and stdout/stderr are explicit, and `Drop` only kills the process group
+    /// when `spec.kill_group_on_drop` is set. `kill_on_drop` is always off here:
+    /// tokio's variant signals only the direct child, which is both weaker than
+    /// the group kill in `Drop` and wrong for `stop_on_exit: "never"`.
+    #[cfg(unix)]
+    pub(crate) fn spawn_engine(spec: EngineSpawn) -> std::io::Result<Self> {
+        use std::os::unix::process::CommandExt;
+
+        let mut command = Command::new(&spec.executable);
+        command
+            .args(&spec.args)
+            .env_clear()
+            .envs(spec.env.iter().map(|(name, value)| (name, value)))
+            .current_dir(&spec.current_dir)
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(spec.stdout))
+            .stderr(Stdio::from(spec.stderr))
+            .kill_on_drop(false);
+        command.as_std_mut().process_group(0);
+
+        let mut child = command.spawn()?;
+        let Some(process_group) = child.id().and_then(|pid| i32::try_from(pid).ok()) else {
+            // Unreachable in practice (a just-spawned child has a pid that fits
+            // an i32), but a live child without a handle must not leak.
+            let _ = child.start_kill();
+            return Err(std::io::Error::other("spawned engine has no process id"));
+        };
+        Ok(Self {
+            child,
+            process_group,
+            armed: spec.kill_group_on_drop,
+        })
     }
 
     pub fn id(&self) -> Option<u32> {
@@ -195,7 +259,10 @@ fn child_running_without_reap(pid: i32) -> Result<bool, BackendError> {
 }
 
 #[cfg(unix)]
-fn signal_group(process_group: i32, signal: nix::sys::signal::Signal) -> Result<(), BackendError> {
+pub(crate) fn signal_group(
+    process_group: i32,
+    signal: nix::sys::signal::Signal,
+) -> Result<(), BackendError> {
     classify_signal_result(nix::sys::signal::killpg(
         nix::unistd::Pid::from_raw(process_group),
         signal,
@@ -231,7 +298,7 @@ async fn wait_group_cleanup(process_group: i32, grace: Duration) -> Result<bool,
 }
 
 #[cfg(target_os = "linux")]
-fn group_has_live_members(process_group: i32) -> Result<bool, BackendError> {
+pub(crate) fn group_has_live_members(process_group: i32) -> Result<bool, BackendError> {
     if !group_exists(process_group)? {
         return Ok(false);
     }
@@ -348,7 +415,7 @@ fn zombie_leader_has_live_threads(
 }
 
 #[cfg(all(unix, not(target_os = "linux")))]
-fn group_has_live_members(process_group: i32) -> Result<bool, BackendError> {
+pub(crate) fn group_has_live_members(process_group: i32) -> Result<bool, BackendError> {
     group_exists(process_group)
 }
 

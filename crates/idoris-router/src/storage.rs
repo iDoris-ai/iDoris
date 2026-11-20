@@ -219,6 +219,13 @@ pub(crate) fn process_db_path() -> Result<PathBuf, String> {
     }
 }
 
+/// The canonical lock base of this process's database: the path the instance lock (`<this>.lock`) is derived from,
+/// so every alias of one database maps to one value. IDORIS-CORE S1 puts it in the discovery file's
+/// `launch.db_path` (接口规范 §2.7.3) so a launcher can tell whether an orphan was started on the database it wants.
+pub fn canonical_process_db_path() -> Result<PathBuf, String> {
+    process_db_path().map(|path| canonical_lock_base(&path))
+}
+
 /// Opens the persistent stores with the pre-S1 behaviour (no deployment form
 /// declared). Identical to [`bootstrap_with_form`] with
 /// [`StartupForm::legacy`]: the configuration file is the authority for
