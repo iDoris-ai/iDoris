@@ -15,6 +15,14 @@
  * - v1.2.0：加法新增 —— 只读端点 `GET /v1/recommendation?role=chat` 与
  *   `GET /v1/models/local`（接口规范 §2.9，由 Rust 实现承载；TS 参考实现不含这两个端点，
  *   版本号只为三处常量保持一致）。1.1.x 的字段和行为不变。
+ * - v1.3.0（iDoris v0.6.0 的目标，**尚未生效**）：加法新增 —— `GET /health` 的 `phase`、`ready`、
+ *   `started_at_ms`、`registered`、`upstreams[]`（含 `engine_kind`；接口规范修订 1.6 §2.11.1，
+ *   IDORIS-CORE，由 Rust 实现承载；TS 参考实现不含这些字段，同 v1.2.0 的先例）。`status` 仍恒为
+ *   `"ok"`，1.2.x 的字段和行为不变。
+ *   **这些新字段从 IDORIS-CORE 切片 S1 起就出现在 Rust 实现的 `/health` 里，但本常量（以及
+ *   `/health.contract_version`）要到 v0.6.0 发版才升到 1.3.0（切片 S11 统一升）：** 规范 §2.11
+ *   写明发版前仍是 1.2.0，免得 warmup、embeddings 伴生卡、Admin `upstreams` 等 1.3.0 的功能还没
+ *   做齐，调用方就从版本号误以为齐了。调用方按字段是否存在判断，不要看版本号。
  *
  * 后续演进按同文档 G-5「加法优先、零回归」处理：
  * - 加法新增字段/端点/枚举值 → 升 minor；
