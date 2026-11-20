@@ -13,9 +13,11 @@
 //! - **怎么拉起**：`serve --host 127.0.0.1 --port <port> [--memory-guard-gb <N>] [--model-dir <dir>]`
 //!   （flags 对照本机 oMLX 0.6.4 的 `omlx serve --help`）；私有 key 走 `OMLX_API_KEY`，根目录走
 //!   `OMLX_BASE_PATH`；不使用 `--api-key`（argv 同 UID 可见）。
-//!   - `--memory-guard-gb`：`floor(额度字节 / 1e9)`，仅当这个整数 ≥ 1。让 oMLX 自己的上限与 iDoris 的额度
-//!     账本一致（`docs/13-…md` B-11：不开 memory guard，第二个模型载入会让 server 无响应）。`--help` 没说
-//!     单位是 GB 还是 GiB，取十进制 GB 向下取整（偏保守）。额度为 0 不拉起，由通用层拒绝。
+//!   - `--memory-guard-gb`：额度字节数除以 2^30 向下取整（整数 GiB）。目的是让 oMLX 自己的上限不高于 iDoris 的额度
+//!     账本（`docs/13-…md` B-11：不开 memory guard，第二个模型载入会让 server 无响应）。`--help` 没写单位，也没有对真实
+//!     oMLX 验证过：这个取法在两种解释下都不超过额度（按 GiB 解释时正好是向下取整，按十进制 GB 解释时更小）。
+//!     不足 1 GiB 的额度不拉起，原因码 `budget_zero`：取不到不超过额度的整数；不传这个 flag 会让 oMLX 用它自己的缺省，
+//!     传 0 的含义没有实测，两者都可能超过额度。额度为 0 由通用层拒绝，不足 1 GiB 由本配方拒绝。
 //!   - `--model-dir` 默认不传（设计稿 §2.7.3：不传则引擎用默认 `~/.omlx/models`；宿主有 oMLX.app 的
 //!     base-path 引导文件时由 `OMLX_BASE_PATH` 指向，见 [`bootstrap_base_path`]）；
 //!     [`OmlxRecipe::with_model_dir`] 是显式覆盖的口子（附录 A 已确认这个 flag 存在）。
@@ -118,10 +120,12 @@ impl OmlxRecipe {
     }
 }
 
-/// `floor(额度字节 / 1e9)`，仅当 ≥ 1：额度不足 1 GB（但不为 0）时不传这个 flag，引擎用它自己的缺省。
-fn memory_guard_gb(budget_bytes: u64) -> Option<u64> {
-    let gb = budget_bytes / 1_000_000_000;
-    (gb >= 1).then_some(gb)
+const BYTES_PER_GIB: u64 = 1 << 30;
+
+/// 传给 `--memory-guard-gb` 的整数：额度字节数除以 2^30 向下取整（整数 GiB）；不足 1 时是 `None`，调用方据此拒绝拉起。
+fn memory_guard_gib(budget_bytes: u64) -> Option<u64> {
+    let gib = budget_bytes / BYTES_PER_GIB;
+    (gib >= 1).then_some(gib)
 }
 
 #[async_trait]
@@ -166,9 +170,14 @@ impl EngineRecipe for OmlxRecipe {
             "--port".into(),
             input.port.to_string().into(),
         ];
-        if let Some(gb) = input.allocated_budget_bytes.and_then(memory_guard_gb) {
+        if let Some(budget) = input.allocated_budget_bytes {
+            // 整数 GiB 的粒度下，不足 1 GiB 的额度没有不超过额度的值可传：不传会让 oMLX 用它自己的缺省，传 0 的含义
+            // 没有实测。按「额度为 0 不拉起」的同一精神拒绝，复用原因码 `budget_zero`，不新增原因码。
+            let Some(gib) = memory_guard_gib(budget) else {
+                return Err(LaunchError::BudgetZero);
+            };
             args.push("--memory-guard-gb".into());
-            args.push(gb.to_string().into());
+            args.push(gib.to_string().into());
         }
         if let Some(dir) = &self.model_dir {
             args.push("--model-dir".into());
@@ -325,22 +334,63 @@ mod tests {
     }
 
     #[test]
-    fn memory_guard_is_whole_decimal_gigabytes_rounded_down_and_only_from_one() {
-        let guard = |bytes: Option<u64>| {
+    fn memory_guard_is_whole_gibibytes_rounded_down() {
+        const GIB: u64 = 1 << 30;
+        let guard = |bytes: u64| {
             let mut s = spec();
-            s.allocated_budget_bytes = bytes;
+            s.allocated_budget_bytes = Some(bytes);
             argv(&launch(OmlxRecipe::new(), s))
         };
-        assert_eq!(guard(None).len(), 5, "no budget set: no flag");
-        assert_eq!(guard(Some(1)).len(), 5, "under 1 GB: no flag, not guard 0");
-        assert_eq!(guard(Some(999_999_999)).len(), 5);
-        assert_eq!(guard(Some(1_000_000_000))[5..], ["--memory-guard-gb", "1"]);
-        assert_eq!(guard(Some(1_999_999_999))[5..], ["--memory-guard-gb", "1"]);
-        // 16 GiB, the budget the design uses as its example, is 17 decimal GB.
         assert_eq!(
-            guard(Some(17_179_869_184))[5..],
-            ["--memory-guard-gb", "17"]
+            argv(&launch(OmlxRecipe::new(), spec())).len(),
+            5,
+            "no budget set: no flag"
         );
+        assert_eq!(guard(GIB)[5..], ["--memory-guard-gb", "1"]);
+        assert_eq!(guard(2 * GIB - 1)[5..], ["--memory-guard-gb", "1"]);
+        // 16 GiB, the budget the design uses as its example: exactly 16; one byte less: 15.
+        assert_eq!(guard(16 * GIB)[5..], ["--memory-guard-gb", "16"]);
+        assert_eq!(guard(16 * GIB - 1)[5..], ["--memory-guard-gb", "15"]);
+        assert_eq!(guard(16 * GIB + 1)[5..], ["--memory-guard-gb", "16"]);
+        // The point of the unit choice: whatever oMLX takes the number for (GiB or decimal GB),
+        // the limit it is given does not exceed the budget.
+        for budget in [
+            GIB,
+            GIB + 1,
+            3 * GIB - 1,
+            16 * GIB - 1,
+            16 * GIB,
+            64 * GIB + 12_345,
+            u64::MAX,
+        ] {
+            let n: u64 = guard(budget)[6].parse().unwrap();
+            assert!(
+                u128::from(n) * u128::from(GIB) <= u128::from(budget),
+                "{budget}: as GiB"
+            );
+            assert!(
+                u128::from(n) * 1_000_000_000 <= u128::from(budget),
+                "{budget}: as decimal GB"
+            );
+        }
+    }
+
+    #[test]
+    fn a_budget_below_one_gibibyte_is_refused_like_zero() {
+        const GIB: u64 = 1 << 30;
+        // Below one whole GiB there is no integer that stays within the budget: leaving the flag
+        // out keeps oMLX's own default, and what 0 means was not tried. Same reason code as a
+        // zero budget (which the generic layer refuses before oMLX is asked).
+        for bytes in [1, 999_999_999, 1_000_000_000, GIB - 1] {
+            let mut s = spec();
+            s.allocated_budget_bytes = Some(bytes);
+            let error = EngineLaunch::new(&instance(OmlxRecipe::new()), s, env(&[])).unwrap_err();
+            assert_eq!(error, LaunchError::BudgetZero, "{bytes}");
+            assert_eq!(error.reason_code(), "budget_zero");
+        }
+        let mut s = spec();
+        s.allocated_budget_bytes = Some(GIB);
+        assert!(EngineLaunch::new(&instance(OmlxRecipe::new()), s, env(&[])).is_ok());
     }
 
     #[test]

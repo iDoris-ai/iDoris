@@ -1512,7 +1512,7 @@ async fn the_omlx_engine_gets_the_designed_argv_and_environment() {
         &rig,
         &instance,
         Some(&key),
-        Some(17_179_869_184),
+        Some(17_179_869_184), // 16 GiB
         parent_env,
     )
     .await;
@@ -1526,7 +1526,7 @@ async fn the_omlx_engine_gets_the_designed_argv_and_environment() {
             "--port",
             port.to_string().as_str(),
             "--memory-guard-gb",
-            "17",
+            "16",
             "--model-dir",
             "/Volumes/models"
         ]
