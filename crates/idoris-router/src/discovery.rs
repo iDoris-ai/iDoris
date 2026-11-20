@@ -323,6 +323,32 @@ mod unix_impl {
         unistd::geteuid().as_raw()
     }
 
+    /// `fstat(parent)` 之后对 parent 的三项核对，顺序固定：是目录、属主是当前有效 uid、组与其他人不可写。
+    /// 拆成只吃事实值的纯函数，是因为第一项在真实文件系统上走不到（`O_DIRECTORY` 已经先拒绝了非目录），
+    /// 第二项需要别的用户的目录（以 root 运行时没有这个前提）：单元测试直接喂事实值，逐项钉住。
+    pub(super) fn check_parent_stat(
+        mode: libc::mode_t,
+        uid: u32,
+        euid: u32,
+    ) -> Result<(), DiscoveryError> {
+        if file_type(mode) != libc::S_IFDIR {
+            return Err(DiscoveryError::ParentNotDirectory);
+        }
+        if uid != euid {
+            return Err(DiscoveryError::ParentWrongOwner);
+        }
+        if mode & 0o022 != 0 {
+            return Err(DiscoveryError::ParentWritableByOthers);
+        }
+        Ok(())
+    }
+
+    /// 旁路锁文件打开之后的核对：必须是属主为当前有效 uid 的普通文件。同样拆成纯函数：属主不对需要 root 才能造出来，
+    /// 类型不对（FIFO）可以在文件系统上造，两种都由单元测试逐项钉住。
+    pub(super) fn sidecar_lock_is_ours(mode: libc::mode_t, uid: u32, euid: u32) -> bool {
+        file_type(mode) == libc::S_IFREG && uid == euid
+    }
+
     fn lock_file_name(file_name: &OsStr) -> OsString {
         let mut name = file_name.to_os_string().into_vec();
         name.extend_from_slice(b".lock");
@@ -374,15 +400,7 @@ mod unix_impl {
                 _ => DiscoveryError::ParentUnusable,
             })?;
             let parent_stat = stat::fstat(&parent).map_err(|_| DiscoveryError::ParentUnusable)?;
-            if file_type(parent_stat.st_mode) != libc::S_IFDIR {
-                return Err(DiscoveryError::ParentNotDirectory);
-            }
-            if parent_stat.st_uid != effective_uid() {
-                return Err(DiscoveryError::ParentWrongOwner);
-            }
-            if parent_stat.st_mode & 0o022 != 0 {
-                return Err(DiscoveryError::ParentWritableByOthers);
-            }
+            check_parent_stat(parent_stat.st_mode, parent_stat.st_uid, effective_uid())?;
             let target = Self {
                 parent,
                 lock_name: lock_file_name(file_name),
@@ -416,9 +434,19 @@ mod unix_impl {
         /// 以不受 umask 影响），写入并 `fsync`，持旁路锁 `renameat` 覆盖目标，再尽力 `fsync` 目录；失败路径删临时文件。
         /// 读者要么看到旧文件，要么看到完整的新文件。
         pub fn publish(&self, record: &DiscoveryRecord) -> Result<(), DiscoveryError> {
+            self.publish_with_lock_wait(record, PUBLISH_LOCK_WAIT)
+        }
+
+        /// [`Self::publish`] 的等锁时限可调版本：生产只用 [`PUBLISH_LOCK_WAIT`]；测试用它把「等锁超时」压到毫秒级，
+        /// 或者放宽到足以在很忙的机器上等完一次与消费者的竞争。
+        pub(crate) fn publish_with_lock_wait(
+            &self,
+            record: &DiscoveryRecord,
+            lock_wait: Duration,
+        ) -> Result<(), DiscoveryError> {
             let line = record.to_line()?;
             let temp_name = self.write_temp_file(&line)?;
-            let installed = self.install(&temp_name);
+            let installed = self.install(&temp_name, lock_wait);
             if installed.is_err() {
                 let _ =
                     unistd::unlinkat(&self.parent, temp_name.as_str(), UnlinkatFlags::NoRemoveDir);
@@ -480,9 +508,9 @@ mod unix_impl {
             Err(DiscoveryError::TempCreateFailed)
         }
 
-        /// 持旁路锁，复核目标仍然是自己该替换的东西，再 `renameat`。
-        fn install(&self, temp_name: &str) -> Result<(), DiscoveryError> {
-            let _lock = self.lock_sidecar(PUBLISH_LOCK_WAIT)?;
+        /// 持旁路锁（至多等 `lock_wait`），复核目标仍然是自己该替换的东西，再 `renameat`。
+        fn install(&self, temp_name: &str, lock_wait: Duration) -> Result<(), DiscoveryError> {
+            let _lock = self.lock_sidecar(lock_wait)?;
             self.check_target()?;
             fcntl::renameat(
                 &self.parent,
@@ -503,8 +531,7 @@ mod unix_impl {
             )
             .map_err(|_| DiscoveryError::LockUnavailable)?;
             let lock_stat = stat::fstat(&fd).map_err(|_| DiscoveryError::LockUnavailable)?;
-            if file_type(lock_stat.st_mode) != libc::S_IFREG || lock_stat.st_uid != effective_uid()
-            {
+            if !sidecar_lock_is_ours(lock_stat.st_mode, lock_stat.st_uid, effective_uid()) {
                 return Err(DiscoveryError::LockUnavailable);
             }
             let file = std::fs::File::from(fd);
@@ -579,13 +606,16 @@ mod unix_impl {
     }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
+#[cfg(unix)]
 mod tests {
     #![allow(clippy::unwrap_used)]
 
+    use super::unix_impl::{check_parent_stat, sidecar_lock_is_ours};
     use super::*;
-    use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+    use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt, symlink};
     use std::path::Path;
+    use std::time::{Duration, Instant};
 
     const NONCE: &str = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
     const INSTANCE_ID: &str = "3f0c6a52-6a0e-4c0e-9a6e-0d2f1c7a9b11";
@@ -635,6 +665,35 @@ mod tests {
 
     fn open_error(path: &Path) -> DiscoveryError {
         DiscoveryTarget::open(path).unwrap_err()
+    }
+
+    /// 目录里有没有发布方的临时文件。
+    fn has_temp_file(dir: &Path) -> bool {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|entry| {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                name.starts_with(".idoris-discovery.") && name.ends_with(".tmp")
+            })
+    }
+
+    fn listing(dir: &Path) -> Vec<String> {
+        let mut names = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        names.sort();
+        names
+    }
+
+    /// 把目录权限恢复成 0700：断言失败时也要恢复，否则临时目录删不掉。
+    struct RestoreMode(PathBuf);
+
+    impl Drop for RestoreMode {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o700));
+        }
     }
 
     #[test]
@@ -1079,6 +1138,227 @@ mod tests {
         );
         assert_eq!(std::fs::read(&victim).unwrap(), b"keep");
         assert!(!path.exists());
+    }
+
+    /// `open` 之后的 `fstat(parent)` 核对（`check_parent_stat`）：类型、属主、权限，顺序固定。第一项在真实文件系统上
+    /// 走不到（`O_DIRECTORY` 已经先拒绝了非目录），第二项需要别的用户的目录，所以直接喂事实值，逐项钉住。
+    #[test]
+    fn fstat_facts_about_the_parent_are_checked_type_first_then_owner_then_mode() {
+        use nix::libc::{S_IFDIR, S_IFIFO, S_IFLNK, S_IFREG};
+        let (me, other) = (1000_u32, 1001_u32);
+
+        // 干净的 parent：目录、属主是自己、组与其他人不可写（0500、0750、0755 都只要求不可写）。
+        for mode in [
+            S_IFDIR | 0o700,
+            S_IFDIR | 0o750,
+            S_IFDIR | 0o755,
+            S_IFDIR | 0o500,
+        ] {
+            assert_eq!(check_parent_stat(mode, me, me), Ok(()), "{mode:o}");
+        }
+        // 第一项：不是目录。排在属主与权限之前：别人属主、别人可写的非目录也报 `ParentNotDirectory`。
+        for kind in [S_IFREG, S_IFIFO, S_IFLNK] {
+            for (uid, permissions) in [(me, 0o700), (other, 0o700), (me, 0o777), (other, 0o777)] {
+                assert_eq!(
+                    check_parent_stat(kind | permissions, uid, me),
+                    Err(DiscoveryError::ParentNotDirectory),
+                    "{kind:o} {permissions:o} uid {uid}"
+                );
+            }
+        }
+        // 第二项：属主不是当前有效 uid。排在权限之前。
+        for permissions in [0o700, 0o777] {
+            assert_eq!(
+                check_parent_stat(S_IFDIR | permissions, other, me),
+                Err(DiscoveryError::ParentWrongOwner),
+                "{permissions:o}"
+            );
+        }
+        // 第三项：组或其他人可写。
+        for permissions in [0o770, 0o707, 0o722, 0o720, 0o702, 0o1777] {
+            assert_eq!(
+                check_parent_stat(S_IFDIR | permissions, me, me),
+                Err(DiscoveryError::ParentWritableByOthers),
+                "{permissions:o}"
+            );
+        }
+    }
+
+    /// 发布时建临时文件失败（不是 `EEXIST`）：报 `temp_create_failed`，什么都不留。`0500` 的 parent 通过 `open` 的
+    /// 「组与其他人不可写」校验，之后对属主也不可写，在里面建文件得到 `EACCES`。把这一支改成重试得到的是同一个错误，
+    /// 所以这条测试钉的是「不是 `EEXIST` 的失败如实报告、不留任何东西」，不是「只试一次」。
+    #[test]
+    fn an_uncreatable_temp_file_fails_publish_as_temp_create_failed_and_leaves_nothing() {
+        // root 不受目录权限限制，没有这个前提：跳过。
+        if nix::unistd::geteuid().is_root() {
+            return;
+        }
+        let (_temp, dir) = private_dir();
+        let path = dir.join("idoris.json");
+        let target = DiscoveryTarget::open(&path).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let _restore = RestoreMode(dir.clone());
+
+        assert_eq!(
+            target.publish(&record()).unwrap_err(),
+            DiscoveryError::TempCreateFailed
+        );
+        // 没有临时文件、没有目标、没有旁路锁（锁是 `install` 才建的，发布在它之前就失败了）。
+        assert!(listing(&dir).is_empty(), "{:?}", listing(&dir));
+    }
+
+    /// 旁路锁文件的核对（`sidecar_lock_is_ours`）：必须是属主为当前有效 uid 的普通文件。属主不对需要 root 才造得出来，
+    /// 所以喂事实值；类型不对的真实文件系统版本见下一条（FIFO）。
+    #[test]
+    fn the_sidecar_lock_must_be_a_regular_file_owned_by_us() {
+        use nix::libc::{S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFLNK, S_IFREG, S_IFSOCK};
+        let (me, other) = (1000_u32, 1001_u32);
+        assert!(sidecar_lock_is_ours(S_IFREG | 0o600, me, me));
+        for kind in [S_IFIFO, S_IFDIR, S_IFLNK, S_IFSOCK, S_IFCHR, S_IFBLK] {
+            assert!(!sidecar_lock_is_ours(kind | 0o600, me, me), "{kind:o}");
+        }
+        assert!(!sidecar_lock_is_ours(S_IFREG | 0o600, other, me));
+        assert!(!sidecar_lock_is_ours(S_IFREG | 0o666, other, me));
+    }
+
+    /// 旁路锁文件是 FIFO：`O_RDWR` 打开 FIFO 不会阻塞，所以它越过 `lock_sidecar` 里的 `open`（符号链接则被 `O_NOFOLLOW`
+    /// 在更早处拦下，见上一条），一直走到 `open` 之后的类型核对，被它拒绝。没有这道核对，`flock` 对 FIFO 同样成功，
+    /// 发布会悄悄成功，所以 `publish` 必须失败。
+    #[test]
+    fn a_sidecar_lock_that_is_a_fifo_is_refused_by_the_type_check_after_it_was_opened() {
+        let (_temp, dir) = private_dir();
+        let path = dir.join("idoris.json");
+        let target = DiscoveryTarget::open(&path).unwrap();
+        let mut stale = record();
+        stale.instance_id = "11111111-2222-4333-8444-555555555555".to_string();
+        target.publish(&stale).unwrap();
+        let stale_bytes = std::fs::read(&path).unwrap();
+
+        let lock_path = dir.join("idoris.json.lock");
+        std::fs::remove_file(&lock_path).unwrap();
+        nix::unistd::mkfifo(&lock_path, stat_mode(0o600)).unwrap();
+
+        assert_eq!(
+            target.publish(&record()).unwrap_err(),
+            DiscoveryError::LockUnavailable
+        );
+        // 失败的发布没有动旧文件，没有留下临时文件，FIFO 还是 FIFO。
+        assert_eq!(std::fs::read(&path).unwrap(), stale_bytes);
+        assert!(!has_temp_file(&dir));
+        assert!(
+            std::fs::symlink_metadata(&lock_path)
+                .unwrap()
+                .file_type()
+                .is_fifo()
+        );
+        // 同一个类型核对也挡住退出时的删除：`remove_if_owner` 报 `LockUnavailable`，文件原样。
+        assert_eq!(
+            target.remove_if_owner(&stale.instance_id),
+            RemoveOutcome::LockUnavailable
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), stale_bytes);
+    }
+
+    /// 「发布」与「消费者持锁清理」真正竞争（规范 §2.7.3、R12 已确认项 4：消费者清理陈旧文件时持同一把旁路锁，
+    /// 持锁、读、比对出旧 `instance_id`、unlink）。新实例的发布必须等锁，拿到锁之后再复核目标、`renameat`：
+    /// 于是消费者持锁期间做的 unlink 不会删掉新文件。如果发布不持锁，它会在消费者「读完、unlink 之前」把新文件
+    /// rename 进来，消费者的 unlink 就把新文件删了（这条测试里发布方会在消费者持锁期间提前完成，或最后文件不见了）。
+    #[test]
+    fn a_publish_racing_a_consumer_that_holds_the_sidecar_lock_waits_for_it_and_is_not_undone() {
+        let (_temp, dir) = private_dir();
+        let path = dir.join("idoris.json");
+        let target = std::sync::Arc::new(DiscoveryTarget::open(&path).unwrap());
+        let stale_id = "11111111-2222-4333-8444-555555555555";
+        let mut stale = record();
+        stale.instance_id = stale_id.to_string();
+        target.publish(&stale).unwrap();
+
+        // 消费者：持锁，读，比对出旧 instance_id。
+        let consumer = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(dir.join("idoris.json.lock"))
+            .unwrap();
+        consumer.lock().unwrap();
+        let seen: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(seen["instance_id"], stale_id);
+
+        // 新实例开始发布。等锁时限给得很宽：很忙的机器上也不会因为等锁超时而误报。
+        let (done_sender, done_receiver) = std::sync::mpsc::channel();
+        let publisher = {
+            let target = target.clone();
+            std::thread::spawn(move || {
+                let result = target.publish_with_lock_wait(&record(), Duration::from_secs(30));
+                let _ = done_sender.send(());
+                result
+            })
+        };
+        // 等到发布方确实走到了等锁这一步（它的临时文件已经写好）。它在这之前就完成了，说明它没有等锁。
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !has_temp_file(&dir) {
+            assert!(
+                done_receiver.try_recv().is_err(),
+                "the publish finished without waiting for the sidecar lock"
+            );
+            assert!(
+                Instant::now() < deadline,
+                "the publisher never wrote its temp file"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // 再给它一个越过锁的机会：消费者仍持锁，发布方不得完成。
+        assert!(
+            done_receiver
+                .recv_timeout(Duration::from_millis(300))
+                .is_err(),
+            "the publish finished while the consumer still held the sidecar lock"
+        );
+        // 消费者 unlink 它读到的旧文件，然后放锁。
+        std::fs::remove_file(&path).unwrap();
+        consumer.unlock().unwrap();
+
+        publisher.join().unwrap().unwrap();
+        // 在的是新文件：不是被消费者的 unlink 删掉了。目录里只有发现文件与旁路锁，没有临时文件残留。
+        let now: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(now["instance_id"], INSTANCE_ID);
+        assert_eq!(listing(&dir), ["idoris.json", "idoris.json.lock"]);
+    }
+
+    /// 发布方等不到旁路锁：到了时限就失败，旧文件原样，临时文件被清掉；放锁之后同一个 target 能正常发布。
+    #[test]
+    fn a_publish_that_cannot_get_the_sidecar_lock_in_time_fails_cleanly_and_keeps_the_old_file() {
+        let (_temp, dir) = private_dir();
+        let path = dir.join("idoris.json");
+        let target = DiscoveryTarget::open(&path).unwrap();
+        let mut stale = record();
+        stale.instance_id = "11111111-2222-4333-8444-555555555555".to_string();
+        target.publish(&stale).unwrap();
+        let stale_bytes = std::fs::read(&path).unwrap();
+
+        let consumer = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(dir.join("idoris.json.lock"))
+            .unwrap();
+        consumer.lock().unwrap();
+
+        let started = Instant::now();
+        let error = target
+            .publish_with_lock_wait(&record(), Duration::from_millis(200))
+            .unwrap_err();
+        assert_eq!(error, DiscoveryError::LockUnavailable);
+        // 它等满了时限（时限从取锁开始算，所以不会比 200 毫秒短）。
+        assert!(started.elapsed() >= Duration::from_millis(200));
+        assert_eq!(std::fs::read(&path).unwrap(), stale_bytes);
+        assert!(!has_temp_file(&dir));
+
+        consumer.unlock().unwrap();
+        target.publish(&record()).unwrap();
+        let now: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(now["instance_id"], INSTANCE_ID);
     }
 
     #[test]
