@@ -340,18 +340,6 @@ pub fn plan_upstreams(cards: &[ComponentCard]) -> Result<Vec<UpstreamPlan>, Engi
     Ok(plans)
 }
 
-/// 可信本地三条件：实际 loopback、`local_only`、出站仅 none/loopback（与 `/v1/models` 的熔断口径同一个判据）。
-fn is_trusted_local(card: &ComponentCard) -> bool {
-    idoris_policy::privacy::is_local_capable(&idoris_policy::Card {
-        component: card.clone(),
-        roles: Vec::new(),
-        experiment: false,
-        min_ram_gb: 0.0,
-        estimated_cost_minor: None,
-        admission_status: idoris_policy::AdmissionStatus::Ready,
-    })
-}
-
 /// 读完响应体并解析成 JSON，最多 `cap` 字节；读不完、超限、不是 JSON 都是 `None`。
 async fn read_capped_json(
     mut response: reqwest::Response,
@@ -451,8 +439,11 @@ pub struct ProberContext {
 impl ProberContext {
     /// 对一个上游做一次观测。
     pub async fn observe(&self, plan: &UpstreamPlan) -> Observation {
-        // 熔断闭合：不可信本地的卡一个请求都不发。
-        if self.remote_kill_switch.load(Ordering::SeqCst) && !is_trusted_local(plan.card()) {
+        // 熔断闭合：不可信本地的卡一个请求都不发。可信本地三条件（实际 loopback、`local_only`、出站仅 none/loopback）
+        // 与 `GET /v1/models` 共用 `models::is_trusted_local`，所以两处的熔断口径是同一个判据。
+        if self.remote_kill_switch.load(Ordering::SeqCst)
+            && !crate::models::is_trusted_local(plan.card())
+        {
             return Observation::Unavailable(None);
         }
         match plan.kind {

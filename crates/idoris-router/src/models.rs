@@ -61,7 +61,9 @@ enum OneList {
 
 /// Trusted-local is the same three-part gate the router uses for `local_only`:
 /// effective loopback, `local_only` privacy, and egress limited to none/loopback.
-fn is_trusted_local(card: &ComponentCard) -> bool {
+/// Shared with the `/health` upstream prober (`readiness`), so the kill switch treats
+/// `/v1/models` and the prober identically.
+pub(crate) fn is_trusted_local(card: &ComponentCard) -> bool {
     idoris_policy::privacy::is_local_capable(&idoris_policy::Card {
         component: card.clone(),
         roles: Vec::new(),
