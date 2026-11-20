@@ -757,8 +757,12 @@ async fn a_managed_declaration_is_reported_as_managed_but_never_owned_in_s1() {
     assert_eq!(status.code(), Some(0), "{stderr}");
 }
 
+/// `register_socket` 与 `orphan_timeout_s` 从 S2 起由 `register` 使用（登记客户端、孤儿计时），它们的行为由
+/// `register_uds.rs` 覆盖；本测试只钉住「没有任何 agent24d 在监听」这一种情形：照常服务、登记不上，
+/// iDoris 是 UDS 客户端、不会自己创建这个 socket。`engine.*` 要等 S3/S5 才使用，这里只是被解析、被接受。
 #[tokio::test]
-async fn frame_fields_for_later_slices_are_parsed_and_accepted_but_do_not_change_s1_behaviour() {
+async fn a_register_socket_nobody_listens_on_leaves_serving_unchanged_and_the_instance_unregistered()
+ {
     let env = Env::new();
     let socket = env.run_dir.join("idoris-register.sock");
     let frame = env.frame(json!({
@@ -772,7 +776,7 @@ async fn frame_fields_for_later_slices_are_parsed_and_accepted_but_do_not_change
     let mut child = env.spawn_launcher(&frame);
     let (file, _) = wait_discovery(&env.discovery_path(), &mut child);
     let body = health(&http(), file["data_port"].as_u64().unwrap()).await;
-    // S1 没有登记：registered 恒为 false；iDoris 是 UDS 客户端，不会自己创建这个 socket。
+    // 没有 agent24d 在监听，登记不上：registered 为 false；iDoris 是 UDS 客户端，不会自己创建这个 socket。
     assert_eq!(body["registered"], false);
     assert!(!socket.exists());
     let (status, _, stderr) = sigterm_and_collect(&mut child);
@@ -1263,7 +1267,9 @@ async fn a_file_that_belongs_to_another_instance_is_left_alone_on_shutdown() {
     let (file, _) = wait_discovery(&path, &mut child);
     health(&http(), file["data_port"].as_u64().unwrap()).await;
 
-    // 别的实例（比如被接管之后的新实例）已经把文件换成了它自己的。
+    // 别的实例（比如被接管之后的新实例）已经把文件换成了它自己的。注意 S2 起运行中的实例每 10 秒自愈一次
+    // （缺失或 `instance_id` 不一致就重写，接口规范 §2.7.3），所以「别人的文件原样保留」只对退出时的删除成立：
+    // 这里换文件之后立刻 SIGTERM，远在第一轮自愈（发布之后 10 秒）之前。
     let mut foreign = file.clone();
     foreign["instance_id"] = json!("11111111-2222-4333-8444-555555555555");
     foreign["pid"] = json!(1);
