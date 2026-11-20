@@ -736,6 +736,22 @@ mod tests {
         }
     }
 
+    /// 在另一个线程里跑 `work`；`limit` 内没有返回就让测试失败，而不是无限期挂起（FIFO 上不带 `O_NONBLOCK` 的 `open` 就是这样
+    /// 卡死的）。卡住的线程留到进程结束；测试已经失败，进程很快就退出。
+    fn finishes_within<T: Send + 'static>(
+        limit: Duration,
+        what: &str,
+        work: impl FnOnce() -> T + Send + 'static,
+    ) -> T {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(work());
+        });
+        receiver.recv_timeout(limit).unwrap_or_else(|_| {
+            panic!("{what} did not return within {limit:?}: it is blocked on a FIFO")
+        })
+    }
+
     /// 一个属主为当前用户、0700 的 canonical 目录（macOS 的临时目录在 `/var` 下，实为 `/private/var`）。
     fn private_dir() -> (tempfile::TempDir, PathBuf) {
         let temp = tempfile::tempdir().unwrap();
@@ -1148,7 +1164,7 @@ mod tests {
     fn remove_if_owner_never_follows_a_symlink_or_opens_a_fifo() {
         let (_temp, dir) = private_dir();
         let path = dir.join("idoris.json");
-        let target = DiscoveryTarget::open(&path).unwrap();
+        let target = std::sync::Arc::new(DiscoveryTarget::open(&path).unwrap());
 
         // 校验之后，目标被换成指向「自己 instance_id 文件」的符号链接：不跟随、不删除、不删链接指向的文件。
         let elsewhere = dir.join("elsewhere.json");
@@ -1164,9 +1180,15 @@ mod tests {
         );
         std::fs::remove_file(&path).unwrap();
 
-        // 换成 FIFO：打开不会卡住，按「不是普通文件」处理。
+        // 换成 FIFO：打开不会卡住，按「不是普通文件」处理。卡住会让测试失败（限时），而不是无限期挂起。
         nix::unistd::mkfifo(&path, stat_mode(0o600)).unwrap();
-        assert_eq!(target.remove_if_owner(INSTANCE_ID), RemoveOutcome::NotOwned);
+        let outcome = {
+            let target = std::sync::Arc::clone(&target);
+            finishes_within(Duration::from_secs(10), "remove_if_owner", move || {
+                target.remove_if_owner(INSTANCE_ID)
+            })
+        };
+        assert_eq!(outcome, RemoveOutcome::NotOwned);
         assert!(path.exists());
     }
 
@@ -1557,7 +1579,7 @@ mod tests {
     fn inspect_never_follows_a_symlink_and_never_blocks_on_a_fifo() {
         let (_temp, dir) = private_dir();
         let path = dir.join("idoris.json");
-        let target = DiscoveryTarget::open(&path).unwrap();
+        let target = std::sync::Arc::new(DiscoveryTarget::open(&path).unwrap());
         target.publish(&record()).unwrap();
         let copy = dir.join("copy.json");
         std::fs::copy(&path, &copy).unwrap();
@@ -1572,8 +1594,15 @@ mod tests {
         assert_eq!(target.inspect(INSTANCE_ID), InspectOutcome::Foreign);
         std::fs::remove_dir(&path).unwrap();
 
+        // 卡在 FIFO 上会让测试失败（限时），而不是无限期挂起。
         nix::unistd::mkfifo(&path, stat_mode(0o600)).unwrap();
-        assert_eq!(target.inspect(INSTANCE_ID), InspectOutcome::Foreign);
+        let outcome = {
+            let target = std::sync::Arc::clone(&target);
+            finishes_within(Duration::from_secs(10), "inspect", move || {
+                target.inspect(INSTANCE_ID)
+            })
+        };
+        assert_eq!(outcome, InspectOutcome::Foreign);
     }
 
     #[test]

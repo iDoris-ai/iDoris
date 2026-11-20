@@ -1750,4 +1750,73 @@ mod tests {
         );
         assert_eq!(status_of(new_secret.clone()).await, StatusCode::OK);
     }
+
+    /// 接口规范 §2.10.6：替换是原子的，之后任何带旧 token 的 Admin 请求得到 401，「已经在处理的请求不受影响」。
+    /// 带认证中间件的路由上，一个处理函数被信号卡住：请求在它里面时（已经通过认证）换 token；这个请求照常完成（200），
+    /// 换了之后新来的请求按新值认证（旧 token 401、新 token 200）。
+    #[tokio::test]
+    async fn a_request_already_past_authentication_survives_the_replacement_and_new_requests_follow_it()
+     {
+        let old = AdminSessionToken::mint();
+        let old_secret = old.expose_secret().to_string();
+        let new = AdminSessionToken::mint();
+        let new_secret = new.expose_secret().to_string();
+        let shared = SharedAdminToken::new(old);
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let slow = {
+            let (entered, release) = (entered.clone(), release.clone());
+            move || {
+                let (entered, release) = (entered.clone(), release.clone());
+                async move {
+                    entered.notify_one();
+                    release.notified().await;
+                    StatusCode::OK
+                }
+            }
+        };
+        let state = AdminHttpState {
+            app: Arc::new(AppState::default()),
+            token: shared.clone(),
+        };
+        let app = Router::new()
+            .route("/slow", get(slow))
+            .route("/fast", get(|| async { StatusCode::OK }))
+            .layer(middleware::from_fn_with_state(state, require_admin_auth));
+
+        let in_flight = tokio::spawn({
+            let (app, secret) = (app.clone(), old_secret.clone());
+            async move {
+                app.oneshot(admin_request("/slow", "Bearer", &secret))
+                    .await
+                    .unwrap()
+                    .status()
+            }
+        });
+        // 请求已经在处理函数里（认证早就通过了）。
+        entered.notified().await;
+        shared.replace(new);
+
+        let status_of = |secret: String| {
+            let app = app.clone();
+            async move {
+                app.oneshot(admin_request("/fast", "Bearer", &secret))
+                    .await
+                    .unwrap()
+                    .status()
+            }
+        };
+        assert_eq!(status_of(old_secret).await, StatusCode::UNAUTHORIZED);
+        assert_eq!(status_of(new_secret).await, StatusCode::OK);
+
+        release.notify_one();
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), in_flight)
+                .await
+                .unwrap_or_else(|_| panic!("the request in flight must finish"))
+                .unwrap(),
+            StatusCode::OK,
+            "a request that already passed authentication is not affected by the replacement"
+        );
+    }
 }

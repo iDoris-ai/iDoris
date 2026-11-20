@@ -475,6 +475,19 @@ fn fast() -> Timings {
     }
 }
 
+/// 握手各步的超时拉到 60 秒：一条路径是「立即关闭」还是「等超时才关闭」，在 [`PROMPTLY`]（5 秒）的期限里就分得开了。
+/// （`fast()` 的 5 秒超时配上 10 秒的 drain 期限分不开：去掉握手阶段的某个守卫，连接仍然会在 5 秒后被超时关掉。）
+fn patient() -> Timings {
+    Timings {
+        challenge_wait: secs(60),
+        ack_wait: secs(60),
+        ..fast()
+    }
+}
+
+/// 「立即」的期限：远短于 `patient()` 的 60 秒，远长于一次本机往返（机器忙时也不会误判）。
+const PROMPTLY: Duration = Duration::from_secs(5);
+
 fn ready_upstream() -> UpstreamStatus {
     UpstreamStatus {
         id: "omlx".to_string(),
@@ -759,12 +772,13 @@ async fn an_error_before_the_challenge_gets_no_reply_bytes_at_all() {
 }
 
 /// 同样：challenge 之前的坏帧（乱码、非对象、`v` 不对、`set_admin_token`）只会让客户端关闭连接，不写任何东西
-/// （收到 challenge 之前不写任何字节，所以连 `error bad_frame` 也不发）。
+/// （收到 challenge 之前不写任何字节，所以连 `error bad_frame` 也不发）。握手各步的超时是 60 秒（`patient()`），而关闭必须在
+/// 5 秒内发生、安排的重连原因必须是 `bad_frame`：「立即关闭」与「忽略这一帧、等 `challenge_wait` 到了再关」靠这个分得开。
 #[tokio::test]
 async fn garbage_before_the_challenge_closes_the_connection_without_writing() {
     let rig = Rig::new();
     let server = rig.server();
-    let registration = rig.start(fast());
+    let registration = rig.start(patient());
     let bad_frames: [&[u8]; 4] = [
         b"this is not json\n",
         b"[1,2,3]\n",
@@ -773,12 +787,31 @@ async fn garbage_before_the_challenge_closes_the_connection_without_writing() {
         b"{\"v\":1,\"op\":\"set_admin_token\",\"token\":\"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\"}\n",
     ];
     for bad in bad_frames {
+        let seen = rig.events.snapshot().len();
         let mut peer = server.accept().await;
         peer.send_raw(bad).await;
-        let frames = peer.drain_until_eof(secs(10)).await;
+        let frames = peer.drain_until_eof(PROMPTLY).await;
         assert!(
             frames.is_empty(),
             "no byte may be written before the challenge: {frames:?} (after {:?})",
+            String::from_utf8_lossy(bad)
+        );
+        let scheduled = rig
+            .events
+            .wait_after(seen, "the retry scheduled after the bad frame", |e| {
+                matches!(e, Event::RetryScheduled { .. })
+            })
+            .await;
+        assert!(
+            matches!(
+                scheduled,
+                Event::RetryScheduled {
+                    reason: RetryReason::BadFrame,
+                    fixed: false,
+                    ..
+                }
+            ),
+            "{scheduled:?} (after {:?})",
             String::from_utf8_lossy(bad)
         );
     }
@@ -787,27 +820,117 @@ async fn garbage_before_the_challenge_closes_the_connection_without_writing() {
     registration.finish().await;
 }
 
-/// 收到 challenge 之后、`ack` 之前的坏帧：客户端尽力发 `error bad_frame` 再关闭连接，然后重连。
+/// 收到 challenge 之后、`ack` 之前的坏帧：客户端尽力发 `error bad_frame` 再关闭连接，然后重连。握手各步的超时是 60 秒
+/// （`patient()`），关闭必须在 5 秒内发生，原因是 `bad_frame`：分得开「立即关闭」与「`error` 发完之后继续等 `ack` 到超时」。
 #[tokio::test]
 async fn a_bad_frame_after_the_challenge_is_answered_with_bad_frame_and_the_connection_is_closed() {
     let rig = Rig::new();
     let server = rig.server();
-    let registration = rig.start(fast());
+    let registration = rig.start(patient());
     let mut peer = server.accept().await;
     let (conn_id, nonce, _) = fresh_ids();
     let (register, _) = peer.challenge(&conn_id, &nonce).await;
     assert_eq!(register["op"], "register");
     peer.send_raw(b"{\"v\":1,\"op\":\"ack\",\"session_id\":\"SHORT\",\"proof\":\"x\"}\n")
         .await;
-    let frames = peer.drain_until_eof(secs(10)).await;
+    let frames = peer.drain_until_eof(PROMPTLY).await;
     assert_eq!(frames.len(), 1, "{frames:?}");
     let error: Value = serde_json::from_slice(&frames[0]).unwrap();
     assert_eq!(error["op"], "error");
     assert_eq!(error["code"], "bad_frame");
     assert!(error["message"].as_str().unwrap().chars().count() <= 200);
     assert!(!rig.health.registered());
+    let scheduled = rig
+        .events
+        .wait("the retry scheduled after the bad frame", |e| {
+            matches!(e, Event::RetryScheduled { .. })
+        })
+        .await;
+    assert_eq!(
+        scheduled,
+        Event::RetryScheduled {
+            delay: Duration::ZERO,
+            fixed: false,
+            reason: RetryReason::BadFrame
+        }
+    );
     // 重连（默认退避，第一次立即）。
     let _second = server.accept().await;
+    registration.finish().await;
+}
+
+/// challenge 之前服务端就关闭了连接（EOF）：客户端立即按 `disconnected` 重连（退避的第 1 次，等待为零），而不是在已经没有
+/// 对端的连接上空等到 `challenge_wait`（这里是 60 秒）。
+#[tokio::test]
+async fn an_eof_before_the_challenge_means_a_reconnect_at_once_not_a_wait_for_the_timeout() {
+    let rig = Rig::new();
+    let server = rig.server();
+    let registration = rig.start(patient());
+    drop(server.accept().await);
+    let scheduled = tokio::time::timeout(
+        PROMPTLY,
+        rig.events.wait("the retry after the EOF", |e| {
+            matches!(e, Event::RetryScheduled { .. })
+        }),
+    )
+    .await
+    .expect(
+        "an EOF before the challenge must schedule the reconnect at once, not after challenge_wait",
+    );
+    assert_eq!(
+        scheduled,
+        Event::RetryScheduled {
+            delay: Duration::ZERO,
+            fixed: false,
+            reason: RetryReason::Disconnected
+        }
+    );
+    // 重连真的发生了，而且新连接上仍然什么都没写。
+    let mut again = server
+        .try_accept(PROMPTLY)
+        .await
+        .expect("the client must reconnect");
+    assert!(matches!(again.read_line(ms(300)).await, Got::Timeout));
+    registration.finish().await;
+}
+
+/// `register` 发出之后、`ack` 之前服务端关闭了连接（EOF）：同样立即按 `disconnected` 重连，不是等到 `ack_wait`（这里是 60 秒）。
+#[tokio::test]
+async fn an_eof_after_register_means_a_reconnect_at_once_not_a_wait_for_the_ack_timeout() {
+    let rig = Rig::new();
+    let server = rig.server();
+    let registration = rig.start(patient());
+    let mut peer = server.accept().await;
+    let (conn_id, nonce, _) = fresh_ids();
+    let (register, _) = peer.challenge(&conn_id, &nonce).await;
+    assert_eq!(register["op"], "register");
+    drop(peer);
+    let scheduled = tokio::time::timeout(
+        PROMPTLY,
+        rig.events.wait("the retry after the EOF", |e| {
+            matches!(e, Event::RetryScheduled { .. })
+        }),
+    )
+    .await
+    .expect(
+        "an EOF while waiting for the ack must schedule the reconnect at once, not after ack_wait",
+    );
+    assert_eq!(
+        scheduled,
+        Event::RetryScheduled {
+            delay: Duration::ZERO,
+            fixed: false,
+            reason: RetryReason::Disconnected
+        }
+    );
+    assert!(!rig.health.registered());
+    // 重连之后能照常完成握手。
+    let mut again = server
+        .try_accept(PROMPTLY)
+        .await
+        .expect("the client must reconnect");
+    again.handshake(&rig.nonce_hex, Some(50)).await;
+    rig.wait_registered(true).await;
     registration.finish().await;
 }
 
@@ -1639,7 +1762,9 @@ async fn failure_logs_are_throttled_to_the_first_and_every_tenth_failure() {
 // instance_conflict
 // ---------------------------------------------------------------------------------------------------------------
 
-/// agent24d 以 `instance_conflict` 拒绝：客户端不重连，要求 iDoris 以退出码 3 停止；没有已 `ack` 的会话所以不发 `bye`。
+/// agent24d 以 `instance_conflict` 拒绝（`register` 之后、`ack` 之前）：客户端不重连，要求 iDoris 以退出码 3 停止，不发 `bye`
+/// （`bye` 只在信号停止与退出码 5 的停止时发，规范 §2.10.10 第 10 条）。`ack` 之后的会话里收到的情形见
+/// `an_instance_conflict_inside_an_acked_session_also_requests_exit_3_without_bye_or_reconnect`。
 #[tokio::test]
 async fn instance_conflict_requests_exit_3_and_the_client_never_reconnects_or_says_bye() {
     let rig = Rig::new();
@@ -1746,6 +1871,79 @@ async fn instance_conflict_stops_the_discovery_self_heal_for_good() {
     assert!(
         !path.exists(),
         "the self-heal must not rewrite the file after instance_conflict (it ticks every 20 ms)"
+    );
+    registration.finish().await;
+}
+
+/// 会话中途（`ack` 之后）收到 `instance_conflict`：规范 §2.10.10 第 5 条是「发出 `register` 之后收到就令进程退出」，会话里收到
+/// 也一样：退出码 3、不重连、不再自愈重写发现文件；`bye` 只在信号停止与退出码 5 的停止时发（第 10 条），所以这里也不发——
+/// 连接关闭之前只可能有在途的心跳。
+#[tokio::test]
+async fn an_instance_conflict_inside_an_acked_session_also_requests_exit_3_without_bye_or_reconnect()
+ {
+    let rig = Rig::new();
+    let server = rig.server();
+    let (target, record) = discovery_for(&rig);
+    target.publish(&record).unwrap();
+    let path = rig.dir_path.join("idoris.json");
+    let original = fs::read(&path).unwrap();
+    let registration = rig.start_with(StartOptions {
+        discovery: Some(SelfHeal {
+            target: target.clone(),
+            record: record.clone(),
+        }),
+        ..StartOptions::new(Timings {
+            self_heal_interval: ms(20),
+            ..fast()
+        })
+    });
+    let mut peer = server.accept().await;
+    peer.handshake(&rig.nonce_hex, Some(2_000)).await;
+    rig.wait_registered(true).await;
+    // 对照：会话建立之后自愈在工作。
+    fs::remove_file(&path).unwrap();
+    wait_for_file(&path, &original).await;
+
+    peer.send(&json!({"v": 1, "op": "error", "code": "instance_conflict", "message": "x"}))
+        .await;
+    let cause = tokio::time::timeout(secs(10), registration.wants_stop())
+        .await
+        .expect("an instance_conflict inside a session must request a stop");
+    assert_eq!(cause, StopCause::InstanceConflict);
+    assert_eq!(cause.exit_code(), 3);
+    // 连接被关闭；关闭之前最多有在途的心跳，没有 `bye`，也没有别的帧。
+    let frames = peer.drain_until_eof(secs(10)).await;
+    for frame in &frames {
+        let frame: Value = serde_json::from_slice(frame).unwrap();
+        assert_eq!(
+            frame["op"], "heartbeat",
+            "only heartbeats may precede the close"
+        );
+    }
+    // 不重连，也没有安排任何重连。
+    assert!(
+        server.try_accept(ms(700)).await.is_none(),
+        "instance_conflict means: do not reconnect"
+    );
+    assert!(!rig.health.registered());
+    assert_eq!(
+        rig.events
+            .count(|e| matches!(e, Event::RetryScheduled { .. })),
+        0,
+        "no retry is ever scheduled after instance_conflict"
+    );
+    assert_eq!(
+        rig.events
+            .count(|e| matches!(e, Event::ExitRequested(StopCause::InstanceConflict))),
+        1
+    );
+    // 自愈在冲突的那一刻就停了：之后删掉的文件不会再被写回来（它每 20 毫秒一轮）。
+    tokio::time::sleep(ms(150)).await;
+    let _ = fs::remove_file(&path);
+    tokio::time::sleep(ms(700)).await;
+    assert!(
+        !path.exists(),
+        "the self-heal must not rewrite the file after instance_conflict"
     );
     registration.finish().await;
 }
@@ -1971,7 +2169,8 @@ async fn a_graceful_stop_says_bye_on_the_live_session() {
     assert!(server.try_accept(ms(300)).await.is_none());
 }
 
-/// 孤儿超时、`instance_conflict` 的停止没有已 ack 的会话，不发 `bye`；直接 `finish`（出错路径）也不发。
+/// 孤儿超时、`instance_conflict` 的停止不发 `bye`（规范 §2.10.10 第 10 条：只在信号停止与退出码 5 的停止、且有已 `ack` 的会话时发）；
+/// 直接 `finish`（出错路径）也不发。
 #[tokio::test]
 async fn only_a_signal_stop_says_bye_and_only_when_a_session_exists() {
     // 没有会话的时候收到信号：什么都不发（这时连接可能还没建立好，或者在等 challenge）。
@@ -2243,13 +2442,123 @@ async fn a_second_token_inside_the_rate_window_is_refused_and_one_after_it_is_ac
     registration.finish().await;
 }
 
+/// 限频是进程级的（规范 §2.10.10 第 6 条）：每个进程每 10 秒（这里 30 秒，远长于测试）至多接受一次，跨会话、跨重连合计，
+/// 重连不重置。第一个会话里设了 token 之后，服务端结束这个会话；agent24d「重连」得到的新会话里，窗口之内再设一个合规的 token，
+/// 仍然被拒（`error bad_frame`、关闭该会话），token 保持第一次设的值。
+#[tokio::test]
+async fn the_token_rate_limit_counts_across_sessions_and_reconnects() {
+    let rig = Rig::new();
+    let app = build_admin_app_with_token(AppState::default(), rig.admin_token.clone());
+    let server = rig.server();
+    let registration = rig.start(Timings {
+        admin_token_interval: secs(30),
+        ..fast()
+    });
+
+    let mut first = server.accept().await;
+    first.handshake(&rig.nonce_hex, Some(2_000)).await;
+    rig.wait_registered(true).await;
+    first
+        .send(&json!({"v": 1, "op": "set_admin_token", "token": NEW_TOKEN}))
+        .await;
+    wait_until("the first token", secs(10), || {
+        rig.admin_token.matches(NEW_TOKEN)
+    })
+    .await;
+    // 服务端结束这个会话；客户端重连，新会话。
+    drop(first);
+    rig.wait_registered(false).await;
+    let mut second = server.accept().await;
+    second.handshake(&rig.nonce_hex, Some(2_000)).await;
+    rig.wait_registered(true).await;
+
+    // 新会话里、窗口之内再设一个：被拒，token 保持第一次设的值。
+    second
+        .send(&json!({"v": 1, "op": "set_admin_token", "token": OTHER_TOKEN}))
+        .await;
+    let frames = second.drain_until_eof(PROMPTLY).await;
+    let errors: Vec<Value> = frames
+        .iter()
+        .map(|frame| serde_json::from_slice::<Value>(frame).unwrap())
+        .filter(|frame| frame["op"] == "error")
+        .collect();
+    assert_eq!(errors.len(), 1, "{frames:?}");
+    assert_eq!(errors[0]["code"], "bad_frame");
+    assert_eq!(
+        admin_status(&app, NEW_TOKEN).await,
+        StatusCode::OK,
+        "the first new token stays"
+    );
+    assert_eq!(
+        admin_status(&app, OTHER_TOKEN).await,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        rig.events.count(|e| matches!(
+            e,
+            Event::AdminTokenRejected {
+                reason: TokenRejection::RateLimited
+            }
+        )),
+        1
+    );
+    assert_eq!(
+        rig.events.count(|e| matches!(e, Event::AdminTokenReplaced)),
+        1
+    );
+    registration.finish().await;
+}
+
+/// 替换先于 `admin_token_ack` 的写：写失败（对端已经没了）时会话断开，但新 token 已经生效，不会因为 ack 没发出去就
+/// 退回旧值。做法：服务端读走第一个心跳，发 `set_admin_token` 之后立刻关闭连接，客户端读到这一帧、替换、再写 ack 时对端已经
+/// 不在了。（只看「收到 ack 时新 token 已生效」分不出先后：写完立刻替换，测试任务在客户端让出之前看不到差别。）
+#[tokio::test]
+async fn the_token_is_replaced_before_the_ack_is_written_even_when_that_write_then_fails() {
+    let rig = Rig::new();
+    let server = rig.server();
+    let registration = rig.start(fast());
+    let mut peer = server.accept().await;
+    peer.handshake(&rig.nonce_hex, Some(2_000)).await;
+    rig.wait_registered(true).await;
+    // ack 之后立即发的第一个心跳读走，这样对端关闭时没有未读的数据。
+    assert_eq!(peer.recv().await["op"], "heartbeat");
+    peer.send(&json!({"v": 1, "op": "set_admin_token", "token": NEW_TOKEN}))
+        .await;
+    drop(peer);
+
+    wait_until("the token to be replaced", secs(10), || {
+        rig.admin_token.matches(NEW_TOKEN)
+    })
+    .await;
+    assert!(!rig.admin_token.matches(TOKEN), "the old token is dead");
+    let lost = rig
+        .events
+        .wait("the lost session", |e| {
+            matches!(e, Event::SessionLost { .. })
+        })
+        .await;
+    assert_eq!(
+        lost,
+        Event::SessionLost {
+            reason: RetryReason::WriteFailed
+        },
+        "the ack could not be written"
+    );
+    assert_eq!(
+        rig.events.count(|e| matches!(e, Event::AdminTokenReplaced)),
+        1
+    );
+    registration.finish().await;
+}
+
 /// 只在 `ack.proof` 已通过的会话上接受：`ack` 之前（`register` 之后）收到的 `set_admin_token`，一律不处理并关闭连接；
-/// 证明没过的连接上更不会处理。
+/// 证明没过的连接上更不会处理。握手各步的超时是 60 秒（`patient()`），关闭必须在 5 秒内发生：分得开「立即关闭」与「`error`
+/// 发完之后继续等 `ack` 到超时」。
 #[tokio::test]
 async fn set_admin_token_before_the_ack_is_never_applied() {
     let rig = Rig::new();
     let server = rig.server();
-    let registration = rig.start(fast());
+    let registration = rig.start(patient());
     let mut peer = server.accept().await;
     let (conn_id, nonce, _) = fresh_ids();
     let (register, _) = peer.challenge(&conn_id, &nonce).await;
@@ -2257,12 +2566,34 @@ async fn set_admin_token_before_the_ack_is_never_applied() {
     // 不回 ack，直接设 token。
     peer.send(&json!({"v": 1, "op": "set_admin_token", "token": NEW_TOKEN}))
         .await;
-    let frames = peer.drain_until_eof(secs(10)).await;
+    let frames = peer.drain_until_eof(PROMPTLY).await;
     assert!(
         frames
             .iter()
             .all(|frame| !String::from_utf8_lossy(frame).contains("admin_token_ack")),
         "{frames:?}"
+    );
+    // 客户端尽力发了一个 `error bad_frame` 再关闭，原因记作 `bad_frame`。
+    assert_eq!(frames.len(), 1, "{frames:?}");
+    let error: Value = serde_json::from_slice(&frames[0]).unwrap();
+    assert_eq!(error["op"], "error");
+    assert_eq!(error["code"], "bad_frame");
+    let scheduled = rig
+        .events
+        .wait("the retry scheduled after the refused token", |e| {
+            matches!(e, Event::RetryScheduled { .. })
+        })
+        .await;
+    assert!(
+        matches!(
+            scheduled,
+            Event::RetryScheduled {
+                reason: RetryReason::BadFrame,
+                fixed: false,
+                ..
+            }
+        ),
+        "{scheduled:?}"
     );
     assert!(
         rig.admin_token.matches(TOKEN),
@@ -2283,7 +2614,7 @@ async fn set_admin_token_before_the_ack_is_never_applied() {
         format!("{{\"v\":1,\"op\":\"set_admin_token\",\"token\":\"{NEW_TOKEN}\"}}\n").as_bytes(),
     )
     .await;
-    peer.drain_until_eof(secs(10)).await;
+    peer.drain_until_eof(PROMPTLY).await;
     assert!(rig.admin_token.matches(TOKEN));
     assert_eq!(
         rig.events.count(|e| matches!(e, Event::AdminTokenReplaced)),
@@ -2500,6 +2831,57 @@ async fn the_self_heal_waits_for_the_publish_gate() {
     );
     registration.publish_gate().open();
     wait_until("the file after the gate opened", secs(10), || path.exists()).await;
+    registration.finish().await;
+}
+
+/// 登记客户端也等发布闸门（规范 §2.7.3「何时写」、§2.10：登记在写发现文件之后，agent24d 要读这份文件才拿得到 nonce）：闸门没开
+/// 之前不连（服务端在监听，第一次连接尝试本来是立即的）；闸门一开就连，握手照常完成。
+#[tokio::test]
+async fn the_client_does_not_connect_until_the_publish_gate_opens() {
+    let rig = Rig::new();
+    let server = rig.server();
+    let registration = rig.start_with(StartOptions {
+        open_gate: false,
+        ..StartOptions::new(fast())
+    });
+    assert!(
+        server.try_accept(ms(600)).await.is_none(),
+        "the client must not connect before the discovery file is published"
+    );
+    assert_eq!(rig.events.count(|e| matches!(e, Event::Connecting)), 0);
+
+    registration.publish_gate().open();
+    let mut peer = server.accept().await;
+    peer.handshake(&rig.nonce_hex, Some(50)).await;
+    rig.wait_registered(true).await;
+    registration.finish().await;
+}
+
+/// 孤儿计时在等发布闸门期间也在走（规范 §2.10.10 第 7 条：从「没有已 `ack` 的登记会话」起算，进程启动之后一直没登记上也算）：
+/// 闸门一直没开、一次连接都没发生，超时照样到点要求停止（退出码 4）。
+#[tokio::test]
+async fn the_orphan_clock_runs_while_the_client_waits_for_the_publish_gate() {
+    let rig = Rig::new();
+    let server = rig.server();
+    let started = Instant::now();
+    let registration = rig.start_with(StartOptions {
+        orphan: Some(ms(300)),
+        open_gate: false,
+        ..StartOptions::new(fast())
+    });
+    let cause = tokio::time::timeout(secs(10), registration.wants_stop())
+        .await
+        .expect("the orphan clock must run while the client waits for the publish gate");
+    assert_eq!(cause, StopCause::OrphanTimeout);
+    assert_eq!(cause.exit_code(), 4);
+    assert!(
+        started.elapsed() >= ms(280),
+        "it must not fire early: {:?}",
+        started.elapsed()
+    );
+    // 它从来没有连过。
+    assert!(server.try_accept(ms(50)).await.is_none());
+    assert_eq!(rig.events.count(|e| matches!(e, Event::Connecting)), 0);
     registration.finish().await;
 }
 

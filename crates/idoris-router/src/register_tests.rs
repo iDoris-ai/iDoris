@@ -672,3 +672,227 @@ fn a_parsed_set_admin_token_frame_never_renders_the_token() {
     };
     assert_eq!(secret.expose(), token);
 }
+
+// ---------------------------------------------------------------------------------------------------------------
+// 握手阶段的读错误与写不出去的 `error`：真实的 UDS 上没法稳定地造出来，所以给握手函数注入一个会出错的读端
+// ---------------------------------------------------------------------------------------------------------------
+
+#[cfg(unix)]
+mod handshake_reads {
+    #![allow(clippy::expect_used)]
+
+    use std::collections::VecDeque;
+    use std::io;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    use std::time::Instant;
+
+    use tokio::io::{AsyncRead, ReadBuf};
+    use tokio::net::{UnixStream, unix::OwnedWriteHalf};
+
+    use super::client::{Conn, FrameReader, Handshake, Supervisor};
+    use super::*;
+    use crate::admin::AdminSessionToken;
+
+    fn secs(n: u64) -> Duration {
+        Duration::from_secs(n)
+    }
+
+    /// 读端的一步：给出这些字节（只给一次），或者读错误（一直重复）。脚本用完之后读端永远 `Pending`。
+    enum Step {
+        Bytes(Vec<u8>),
+        Error,
+    }
+
+    /// 按脚本一步步给出读结果的读端。每隔一次轮询先让出一次（`Pending` 并唤醒自己）：去掉守卫之后，握手循环会在一个一直
+    /// 出错的读端上空转；如果读端从不让出，它会霸占运行时线程，外层的 `timeout` 没有机会让测试失败，测试会挂死。
+    struct Scripted {
+        steps: VecDeque<Step>,
+        yielded: bool,
+    }
+
+    impl Scripted {
+        fn new(steps: impl IntoIterator<Item = Step>) -> Self {
+            Self {
+                steps: steps.into_iter().collect(),
+                yielded: false,
+            }
+        }
+    }
+
+    impl AsyncRead for Scripted {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            if !self.yielded {
+                self.yielded = true;
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+            self.yielded = false;
+            match self.steps.front_mut() {
+                None => Poll::Pending,
+                Some(Step::Error) => {
+                    Poll::Ready(Err(io::Error::from(io::ErrorKind::ConnectionReset)))
+                }
+                Some(Step::Bytes(bytes)) => {
+                    let n = bytes.len().min(buf.remaining());
+                    buf.put_slice(&bytes[..n]);
+                    bytes.drain(..n);
+                    if bytes.is_empty() {
+                        self.steps.pop_front();
+                    }
+                    Poll::Ready(Ok(()))
+                }
+            }
+        }
+    }
+
+    /// 读端是 `Scripted` 的连接；写端是一对真实 socket 的一半，另一半（一起返回）不读。
+    fn scripted(steps: impl IntoIterator<Item = Step>) -> (Conn<Scripted>, UnixStream) {
+        let (ours, theirs) = UnixStream::pair().unwrap();
+        let (_unused_read_half, writer) = ours.into_split();
+        (
+            Conn {
+                reader: FrameReader::new(Scripted::new(steps)),
+                writer,
+            },
+            theirs,
+        )
+    }
+
+    /// 把写端的发送缓冲区塞满（对端不读）：之后的写会一直等下去。写端连续 100 毫秒不可写就认为满了。
+    async fn fill_send_buffer(writer: &OwnedWriteHalf) {
+        let chunk = [0_u8; 8192];
+        loop {
+            match tokio::time::timeout(Duration::from_millis(100), writer.writable()).await {
+                Err(_) => return,
+                Ok(Err(error)) => panic!("{error}"),
+                Ok(Ok(())) => {}
+            }
+            match writer.try_write(&chunk) {
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                Err(error) => panic!("{error}"),
+            }
+        }
+    }
+
+    fn supervisor(timings: Timings) -> Supervisor {
+        let (_stop_sender, stop) = watch::channel(StopMode::Run);
+        let (_gate_sender, published) = watch::channel(true);
+        Supervisor::new(ClientParts {
+            socket: PathBuf::from("/nonexistent/register.sock"),
+            orphan_timeout: None,
+            identity: vector_identity(),
+            nonce: InstanceNonce::from_hex(VECTOR_NONCE).unwrap(),
+            health: HealthState::with_upstreams(1_763_625_330_123, Vec::new()),
+            admin_token: SharedAdminToken::new(
+                AdminSessionToken::from_launcher_secret(&[b'a'; 64]).unwrap(),
+            ),
+            timings,
+            observer: None,
+            log: Arc::new(|_: &str| {}),
+            stop,
+            exit: Arc::new(watch::channel(None).0),
+            heal_cancel: CancellationToken::new(),
+            published,
+        })
+    }
+
+    fn challenge_frame() -> Vec<u8> {
+        format!(
+            "{{\"v\":1,\"op\":\"challenge\",\"conn_id\":\"{CONN_ID}\",\"nonce\":\"{CHALLENGE_NONCE}\"}}\n"
+        )
+        .into_bytes()
+    }
+
+    fn ack_frame() -> Vec<u8> {
+        format!(
+            "{{\"v\":1,\"op\":\"ack\",\"session_id\":\"{SESSION_ID}\",\"proof\":\"{ACK_PROOF}\"}}\n"
+        )
+        .into_bytes()
+    }
+
+    /// `challenge` 之前读出错：这次尝试立即结束、按 `io_error` 重连；不是接着读下去直到 5 秒的超时（那是 `Read::Io => {}`
+    /// 的样子：循环在出错的读端上空转到超时才结束）。对照：同一个读端装置读得到一帧 `challenge`。
+    #[tokio::test]
+    async fn a_read_error_before_the_challenge_ends_the_attempt_at_once() {
+        let (mut conn, _peer) = scripted([Step::Bytes(challenge_frame())]);
+        let control = tokio::time::timeout(secs(2), Supervisor::read_challenge(&mut conn))
+            .await
+            .expect("the control read must finish");
+        assert_eq!(
+            control,
+            Ok((CONN_ID.to_string(), CHALLENGE_NONCE.to_string()))
+        );
+
+        let (mut conn, _peer) = scripted([Step::Error]);
+        let ended = tokio::time::timeout(secs(2), Supervisor::read_challenge(&mut conn))
+            .await
+            .expect("a read error before the challenge must end the attempt at once");
+        assert_eq!(ended, Err(Plan::backoff(RetryReason::IoError)));
+    }
+
+    /// `register` 发出之后、`ack` 之前读出错：同样立即结束、按 `io_error` 重连。对照：同一个装置读得到一帧合法的 `ack`。
+    #[tokio::test]
+    async fn a_read_error_while_waiting_for_the_ack_ends_the_attempt_at_once() {
+        let supervisor = supervisor(Timings::default());
+        let (mut conn, _peer) = scripted([Step::Bytes(ack_frame())]);
+        let control = tokio::time::timeout(
+            secs(2),
+            supervisor.read_ack(&mut conn, CONN_ID, CHALLENGE_NONCE),
+        )
+        .await
+        .expect("the control read must finish");
+        assert!(
+            matches!(control, Ok((ref session_id, None)) if session_id == SESSION_ID),
+            "the harness must be able to deliver a valid ack"
+        );
+
+        let (mut conn, _peer) = scripted([Step::Error]);
+        let ended = tokio::time::timeout(
+            secs(2),
+            supervisor.read_ack(&mut conn, CONN_ID, CHALLENGE_NONCE),
+        )
+        .await
+        .expect("a read error while waiting for the ack must end the attempt at once");
+        match ended {
+            Err(Handshake::Retry(plan)) => assert_eq!(plan, Plan::backoff(RetryReason::IoError)),
+            Err(_) => panic!("expected a retry"),
+            Ok(_) => panic!("a read error is not an ack"),
+        }
+    }
+
+    /// 写不出去的 `error`：握手最多为它等 `bye_budget`（规范 §2.10.4：尽力发送、不等应答），之后放弃并照常结束；不会被一个
+    /// 不读数据的对端无限期拖住。坏帧让 `read_ack` 先尽力发 `error bad_frame`；对端不读，写端的缓冲区先被塞满。
+    #[tokio::test]
+    async fn an_error_frame_that_cannot_be_written_holds_the_handshake_no_longer_than_the_bye_budget()
+     {
+        let supervisor = supervisor(Timings {
+            bye_budget: Duration::from_millis(150),
+            ..Timings::default()
+        });
+        let (mut conn, _peer) = scripted([Step::Bytes(b"this is not json\n".to_vec())]);
+        fill_send_buffer(&conn.writer).await;
+        let started = Instant::now();
+        let ended = tokio::time::timeout(
+            secs(5),
+            supervisor.read_ack(&mut conn, CONN_ID, CHALLENGE_NONCE),
+        )
+        .await
+        .expect("the error frame must be given up on after bye_budget");
+        match ended {
+            Err(Handshake::Retry(plan)) => assert_eq!(plan, Plan::backoff(RetryReason::BadFrame)),
+            Err(_) => panic!("expected a retry"),
+            Ok(_) => panic!("a bad frame is not an ack"),
+        }
+        assert!(
+            started.elapsed() >= Duration::from_millis(100),
+            "the write really was blocked (otherwise this test proves nothing): {:?}",
+            started.elapsed()
+        );
+    }
+}
