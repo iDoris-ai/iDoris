@@ -75,8 +75,9 @@ pub mod recommendation;
 /// Deployment form (`IDORIS_FORM`) wired into start-up (compute service S1).
 pub mod startup_form;
 
-/// IDORIS-CORE S1（接口规范 §2.7.1–§2.7.3、§2.11.1、§2.12.1，修订 1.6，wire 1.3.0）：
-/// `--launcher-stdin` 帧、`instance_nonce`、发现文件、引擎种类与 `/health` 的就绪快照。
+/// IDORIS-CORE S1（接口规范 §2.7.1–§2.7.3、§2.11.1、§2.12.1，修订 1.6；wire 契约 1.3.0 的一部分，
+/// `contract_version` 到 v0.6.0 发版才升）：`--launcher-stdin` 帧、`instance_nonce`、发现文件、
+/// 引擎种类与 `/health` 的就绪快照。
 pub mod discovery;
 pub mod engine_kind;
 pub mod instance_nonce;
@@ -222,8 +223,12 @@ pub fn parse_port(raw: Option<&str>) -> Result<u16, PortError> {
 }
 
 /// `GET /health`。前七个字段是 Agent24 的就绪校验依赖的（`status` 恒为 `"ok"`，语义是「进程活着并在服务」，
-/// **不是**「模型可用」）；后五个是 wire 1.3.0 的新增（接口规范 §2.11.1）：模型可用看 `ready`（等于
+/// **不是**「模型可用」）；后五个是 wire 契约 1.3.0 的新增（接口规范 §2.11.1）：模型可用看 `ready`（等于
 /// `phase == "ready"`）。`instance_id` 是公开的实例标识；`instance_nonce` 永远不出现在这里或任何响应里。
+///
+/// **新字段从 IDORIS-CORE 切片 S1 起就出现，但 `contract_version` 到 v0.6.0 发版才升到 1.3.0**（规范 §2.11：
+/// 发版前 `/health.contract_version` 仍是 1.2.0；warmup、embeddings 伴生卡等 1.3.0 的其他功能还没做齐，
+/// 调用方不能从版本号推断它们已经有了）。调用方按字段是否存在判断，不要看版本号。
 #[derive(Debug, Clone, Serialize)]
 pub struct HealthResponse {
     pub status: &'static str,
@@ -331,9 +336,10 @@ pub struct AppState {
     /// existing behaviour byte-for-byte as it was; `Some` is consulted only after the local path has failed, and only
     /// for requests that pass the privacy gate and carry the caller's explicit consent (see `cloud_tier`).
     pub cloud_tier: Option<Arc<cloud_tier::CloudTier>>,
-    /// `/health` 的就绪快照（wire 1.3.0，接口规范 §2.11.1）：`phase`、`ready`、`started_at_ms`、`registered`、
-    /// `upstreams`。默认没有任何上游（库调用方与测试）；启动时由 `idoris` 二进制按组件卡装配并起后台探测器
-    /// （`readiness::spawn_prober`）。`/health` 只读它，O(1)，不做任何上游 I/O。
+    /// `/health` 的就绪快照（接口规范 §2.11.1；新字段从 S1 起出现，`contract_version` 到 v0.6.0 发版才升 1.3.0）：
+    /// `phase`、`ready`、`started_at_ms`、`registered`、`upstreams`。默认没有任何上游（库调用方与测试）；
+    /// 启动时由 `idoris` 二进制按组件卡装配并起后台探测器（`readiness::spawn_prober`）。
+    /// `/health` 只读它，O(1)，不做任何上游 I/O。
     pub health_state: readiness::HealthState,
 }
 
@@ -4269,10 +4275,11 @@ mod tests {
         serde_json::from_slice(&bytes).unwrap()
     }
 
-    /// wire 1.3.0（接口规范 §2.11.1）：七个既有字段不变，新增 `phase`、`ready`、`started_at_ms`、`registered`、
-    /// `upstreams`；`status` 恒为 `"ok"`，和 `phase` 无关。
+    /// 接口规范 §2.11.1：七个既有字段不变，新增 `phase`、`ready`、`started_at_ms`、`registered`、`upstreams`；
+    /// `status` 恒为 `"ok"`，和 `phase` 无关。新字段从 S1 起出现，`contract_version` 仍是 1.2.0（到 v0.6.0
+    /// 发版才升 1.3.0），所以调用方按字段是否存在判断：这里在新字段全部出现的同时，也断言版本号还没有升。
     #[tokio::test]
-    async fn health_has_the_wire_1_3_0_fields_and_status_stays_ok_in_every_phase() {
+    async fn health_has_the_s1_fields_and_status_stays_ok_in_every_phase() {
         use readiness::{UpstreamReason, UpstreamState, UpstreamStatus};
         let upstream = |id: &str, state, reason| UpstreamStatus {
             id: id.to_string(),
@@ -4322,6 +4329,9 @@ mod tests {
             assert_eq!(json["status"], "ok", "{phase}");
             assert_eq!(json["service"], "idoris");
             assert_eq!(json["contract_version"], idoris_contracts::CONTRACT_VERSION);
+            // 故意写死字面量（同 TS 的 health-identity 测试）：新字段已经出现，版本号仍是 1.2.0，
+            // 到 v0.6.0 发版（切片 S11）才升 1.3.0；谁提前把常量改了，这里会失败。
+            assert_eq!(json["contract_version"], "1.2.0");
             assert!(json["version"].is_string());
             assert!(json["instance_id"].is_string());
             assert_eq!(json["components"], 0);

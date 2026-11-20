@@ -1,4 +1,5 @@
-//! IDORIS-CORE 切片 S1（接口规范修订 1.6，wire 1.3.0）：动态端口、`--launcher-stdin` 帧、发现文件、`/health` 新字段。
+//! IDORIS-CORE 切片 S1（接口规范修订 1.6）：动态端口、`--launcher-stdin` 帧、发现文件、`/health` 新字段。
+//! 新字段从 S1 起出现，但 `contract_version` 到 v0.6.0 发版才升 1.3.0（规范 §2.11），本文件里它仍是 1.2.0。
 //!
 //! 起真二进制验证：端口 0（数据面与 Admin 都是 0）、发现文件的内容与权限、校验失败的各情形、读者并发读不到半截文件、
 //! `kill -9` 之后残留文件可识别且被下一个实例覆盖、第二实例退出码 3 且不碰文件、SIGTERM 删除自己的文件、
@@ -455,7 +456,9 @@ async fn discovery_file_has_the_specified_fields_permissions_and_launch_snapshot
     );
     assert_eq!(file["pid"].as_u64().unwrap(), u64::from(child.id()));
     assert_eq!(file["version"], env!("CARGO_PKG_VERSION"));
-    assert_eq!(file["contract_version"], "1.3.0");
+    // 故意写死字面量：发现文件的 `contract_version` 等于 `/health.contract_version`，发版前仍是 1.2.0
+    // （到 v0.6.0 发版、切片 S11 统一升 1.3.0 时，这里与 TS、conformance 的期望一起改）。
+    assert_eq!(file["contract_version"], "1.2.0");
     assert!(file["started_at_ms"].as_u64().unwrap() > 1_735_689_600_000);
 
     // 紧凑的一行 JSON 加 LF，≤ 4096 字节，0600，属主是当前用户；不含 Admin token。
@@ -1587,7 +1590,7 @@ fn sample_record(pid: u32) -> DiscoveryRecord {
         data_port: 51234,
         admin_port: 51235,
         version: "0.6.0".to_string(),
-        contract_version: "1.3.0".to_string(),
+        contract_version: "1.2.0".to_string(),
         started_at_ms: 1_763_625_330_123,
         launch: None,
     }

@@ -12,10 +12,9 @@ const routerPkg = JSON.parse(readFileSync(join(testsDir, "..", "package.json"), 
 // 断言如果引用的是同一个常量，契约版本改错了（比如漏升级、多打个字符）测试
 // 依然会自己跟自己保持"一致"而全绿，量纲对不上"契约版本是否等于规范文档
 // 标注的那个值"这件事。规范当前定的版本见
-// crates/idoris-contracts/src/version.rs 的 1.1.0/1.2.0/1.3.0 说明（/capabilities 选项字段、
-// X-iDoris-Headroom-Breach 请求头、推荐与本地模型端点、/health 的 phase/ready/upstreams 新字段；
-// 1.3.0 的新字段由 Rust 实现承载，TS 参考实现只跟版本号）。
-const EXPECTED_CONTRACT_VERSION = "1.3.0";
+// crates/idoris-contracts/src/version.rs 的 1.1.0/1.2.0 说明（/capabilities 选项字段、
+// X-iDoris-Headroom-Breach 请求头）。
+const EXPECTED_CONTRACT_VERSION = "1.2.0";
 
 let running: Router | undefined;
 
