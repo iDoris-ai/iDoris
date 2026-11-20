@@ -617,8 +617,9 @@ mod tests {
                 during
             });
             holder.join().unwrap();
+            // 阻塞时 worker 被占死，心跳是 0（最多 1）；理想情况约 30 次。门槛取 3：慢的 CI runner（macOS）上计时器粒度粗，曾只跑到 7–9 次
             assert!(
-                during >= 10,
+                during >= 3,
                 "{supplier_id:?}: the other tasks kept running while the ledger write waited: {during} beats"
             );
         }
