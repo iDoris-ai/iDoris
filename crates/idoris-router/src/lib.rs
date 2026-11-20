@@ -74,6 +74,15 @@ pub mod reason;
 pub mod recommendation;
 /// Deployment form (`IDORIS_FORM`) wired into start-up (compute service S1).
 pub mod startup_form;
+
+/// IDORIS-CORE S1（接口规范 §2.7.1–§2.7.3、§2.11.1、§2.12.1，修订 1.6；wire 契约 1.3.0 的一部分，
+/// `contract_version` 到 v0.6.0 发版才升）：`--launcher-stdin` 帧、`instance_nonce`、发现文件、
+/// 引擎种类与 `/health` 的就绪快照。
+pub mod discovery;
+pub mod engine_kind;
+pub mod instance_nonce;
+pub mod launcher_frame;
+pub mod readiness;
 /// Persistent record/budget storage bootstrap (B1 task18).
 pub mod storage;
 mod usage;
@@ -181,9 +190,13 @@ impl std::fmt::Display for PortError {
 
 impl std::error::Error for PortError {}
 
-/// Parses `IDORIS_PORT`. Mirrors `packages/router/src/cli.ts`'s `parsePort`
-/// (PR #46) exactly: unset or blank (after trimming) means [`DEFAULT_PORT`];
-/// anything else must be a plain base-10 integer in `1..=65535`.
+/// Parses `IDORIS_PORT`. Unset or blank (after trimming) means
+/// [`DEFAULT_PORT`]; anything else must be a plain base-10 integer in
+/// `0..=65535`.
+///
+/// `0` asks the kernel for a free port (接口规范 §2.7.2，修订 1.6；v0.5.0 的解析会拒绝它)。
+/// 请求值 `0` 不是端口：实际端口只以绑定之后的 `local_addr()` 为准，经发现文件传出；
+/// 1 到 65535 的取值与固定端口路径不变。
 ///
 /// **Never silently falls back to the default on an invalid value** — a
 /// silent fallback would make an operator believe the service is listening
@@ -199,20 +212,23 @@ pub fn parse_port(raw: Option<&str>) -> Result<u16, PortError> {
     }
     let out_of_range = || {
         PortError(format!(
-            "IDORIS_PORT 不是合法的端口号：\"{raw}\"。请设置为 1-65535 之间的整数，或不设置以使用默认值 {DEFAULT_PORT}。"
+            "IDORIS_PORT 不是合法的端口号：\"{raw}\"。请设置为 0-65535 之间的整数（0 表示由内核分配动态端口），或不设置以使用默认值 {DEFAULT_PORT}。"
         ))
     };
     if !raw.bytes().all(|b| b.is_ascii_digit()) {
         return Err(out_of_range());
     }
     let port: u64 = raw.parse().map_err(|_| out_of_range())?;
-    if !(1..=65535).contains(&port) {
-        return Err(out_of_range());
-    }
-    #[allow(clippy::unwrap_used)] // just range-checked against 65535 above
-    Ok(u16::try_from(port).unwrap())
+    u16::try_from(port).map_err(|_| out_of_range())
 }
 
+/// `GET /health`。前七个字段是 Agent24 的就绪校验依赖的（`status` 恒为 `"ok"`，语义是「进程活着并在服务」，
+/// **不是**「模型可用」）；后五个是 wire 契约 1.3.0 的新增（接口规范 §2.11.1）：模型可用看 `ready`（等于
+/// `phase == "ready"`）。`instance_id` 是公开的实例标识；`instance_nonce` 永远不出现在这里或任何响应里。
+///
+/// **新字段从 IDORIS-CORE 切片 S1 起就出现，但 `contract_version` 到 v0.6.0 发版才升到 1.3.0**（规范 §2.11：
+/// 发版前 `/health.contract_version` 仍是 1.2.0；warmup、embeddings 伴生卡等 1.3.0 的其他功能还没做齐，
+/// 调用方不能从版本号推断它们已经有了）。调用方按字段是否存在判断，不要看版本号。
 #[derive(Debug, Clone, Serialize)]
 pub struct HealthResponse {
     pub status: &'static str,
@@ -222,6 +238,11 @@ pub struct HealthResponse {
     pub instance_id: String,
     pub components: usize,
     pub dev_no_key_enabled: bool,
+    pub phase: &'static str,
+    pub ready: bool,
+    pub started_at_ms: u64,
+    pub registered: bool,
+    pub upstreams: Vec<readiness::UpstreamStatus>,
 }
 
 /// Shared server state. `instance_id` is generated once per process and
@@ -315,6 +336,11 @@ pub struct AppState {
     /// existing behaviour byte-for-byte as it was; `Some` is consulted only after the local path has failed, and only
     /// for requests that pass the privacy gate and carry the caller's explicit consent (see `cloud_tier`).
     pub cloud_tier: Option<Arc<cloud_tier::CloudTier>>,
+    /// `/health` 的就绪快照（接口规范 §2.11.1；新字段从 S1 起出现，`contract_version` 到 v0.6.0 发版才升 1.3.0）：
+    /// `phase`、`ready`、`started_at_ms`、`registered`、`upstreams`。默认没有任何上游（库调用方与测试）；
+    /// 启动时由 `idoris` 二进制按组件卡装配并起后台探测器（`readiness::spawn_prober`）。
+    /// `/health` 只读它，O(1)，不做任何上游 I/O。
+    pub health_state: readiness::HealthState,
 }
 
 impl std::fmt::Debug for AppState {
@@ -363,6 +389,7 @@ impl std::fmt::Debug for AppState {
                 "cloud_tier",
                 &self.cloud_tier.as_ref().map(|_| "configured"),
             )
+            .field("health_state", &self.health_state)
             .finish()
     }
 }
@@ -408,6 +435,7 @@ impl Default for AppState {
             control: None,
             cloud_ingress: None,
             cloud_tier: None,
+            health_state: readiness::HealthState::default(),
             http_client,
         }
     }
@@ -1875,6 +1903,8 @@ async fn list_models(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 }
 
 async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    // O(1)：只读后台探测器写好的快照，不做任何上游 I/O（Agent24 对 `/health` 有 2 秒超时，连续 3 次超时判卡死）。
+    let view = state.health_state.view();
     Json(HealthResponse {
         status: "ok",
         service: "idoris",
@@ -1883,6 +1913,11 @@ async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         instance_id: state.instance_id.clone(),
         components: state.cards.len(),
         dev_no_key_enabled: state.dev_no_key_enabled,
+        phase: view.phase.as_str(),
+        ready: view.ready,
+        started_at_ms: view.started_at_ms,
+        registered: view.registered,
+        upstreams: view.upstreams,
     })
 }
 
@@ -4164,6 +4199,18 @@ mod tests {
         assert_eq!(parse_port(Some("65535")).unwrap(), 65535);
     }
 
+    /// 接口规范 §2.7.2：`IDORIS_PORT=0` 被放行（请求值，实际端口以绑定后的 `local_addr()` 为准）。
+    #[test]
+    fn parse_port_accepts_zero_as_the_dynamic_port_request() {
+        for raw in ["0", " 0 ", "00", "000"] {
+            assert_eq!(parse_port(Some(raw)).unwrap(), 0, "{raw:?}");
+        }
+        // 0 的放行不能让别的非法值溜进来。
+        for bad in ["-0", "+0", "0x0", "0.0", "0 0", "65536", "-1"] {
+            assert!(parse_port(Some(bad)).is_err(), "{bad:?} should be rejected");
+        }
+    }
+
     #[test]
     fn parse_port_rejects_non_integers() {
         assert!(parse_port(Some("abc")).is_err());
@@ -4173,7 +4220,8 @@ mod tests {
 
     #[test]
     fn parse_port_rejects_out_of_range() {
-        for bad in ["0", "-1", "70000"] {
+        // `"0"` 不再在这里：规范 §2.7.2（修订 1.6）放行了端口 0，见 `parse_port_accepts_zero_as_the_dynamic_port_request`。
+        for bad in ["-1", "70000"] {
             assert!(parse_port(Some(bad)).is_err(), "{bad} should be rejected");
         }
     }
@@ -4210,6 +4258,197 @@ mod tests {
         assert!(json["version"].is_string());
         assert!(json["instance_id"].is_string());
         assert_eq!(json["components"], 0);
+    }
+
+    async fn health_json(state: AppState) -> serde_json::Value {
+        let response = build_app(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    /// 接口规范 §2.11.1：七个既有字段不变，新增 `phase`、`ready`、`started_at_ms`、`registered`、`upstreams`；
+    /// `status` 恒为 `"ok"`，和 `phase` 无关。新字段从 S1 起出现，`contract_version` 仍是 1.2.0（到 v0.6.0
+    /// 发版才升 1.3.0），所以调用方按字段是否存在判断：这里在新字段全部出现的同时，也断言版本号还没有升。
+    #[tokio::test]
+    async fn health_has_the_s1_fields_and_status_stays_ok_in_every_phase() {
+        use readiness::{UpstreamReason, UpstreamState, UpstreamStatus};
+        let upstream = |id: &str, state, reason| UpstreamStatus {
+            id: id.to_string(),
+            engine_kind: "omlx".to_string(),
+            state,
+            reason,
+            managed: false,
+            owned: false,
+        };
+        let cases = [
+            (vec![], "degraded", false),
+            (
+                vec![upstream("a", UpstreamState::Starting, None)],
+                "starting",
+                false,
+            ),
+            (
+                vec![
+                    upstream("a", UpstreamState::Ready, None),
+                    upstream(
+                        "b",
+                        UpstreamState::Unavailable,
+                        Some(UpstreamReason::AuthRequired),
+                    ),
+                ],
+                "ready",
+                true,
+            ),
+            (
+                vec![upstream(
+                    "a",
+                    UpstreamState::Unavailable,
+                    Some(UpstreamReason::StartupLatched),
+                )],
+                "degraded",
+                false,
+            ),
+        ];
+        for (upstreams, phase, ready) in cases {
+            let expected_upstreams = serde_json::to_value(&upstreams).unwrap();
+            let json = health_json(AppState {
+                health_state: readiness::HealthState::with_upstreams(1_763_625_330_123, upstreams),
+                ..AppState::default()
+            })
+            .await;
+            // 既有字段不变。
+            assert_eq!(json["status"], "ok", "{phase}");
+            assert_eq!(json["service"], "idoris");
+            assert_eq!(json["contract_version"], idoris_contracts::CONTRACT_VERSION);
+            // 故意写死字面量（同 TS 的 health-identity 测试）：新字段已经出现，版本号仍是 1.2.0，
+            // 到 v0.6.0 发版（切片 S11）才升 1.3.0；谁提前把常量改了，这里会失败。
+            assert_eq!(json["contract_version"], "1.2.0");
+            assert!(json["version"].is_string());
+            assert!(json["instance_id"].is_string());
+            assert_eq!(json["components"], 0);
+            assert_eq!(json["dev_no_key_enabled"], false);
+            // 新增字段。
+            assert_eq!(json["phase"], phase);
+            assert_eq!(json["ready"], ready);
+            assert_eq!(json["started_at_ms"], 1_763_625_330_123_u64);
+            assert_eq!(json["registered"], false);
+            assert_eq!(json["upstreams"], expected_upstreams);
+            // 恰好这十二个键：没有多出任何字段（尤其没有任何形式的 nonce）。
+            let mut keys = json
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>();
+            keys.sort_unstable();
+            assert_eq!(
+                keys,
+                [
+                    "components",
+                    "contract_version",
+                    "dev_no_key_enabled",
+                    "instance_id",
+                    "phase",
+                    "ready",
+                    "registered",
+                    "service",
+                    "started_at_ms",
+                    "status",
+                    "upstreams",
+                    "version",
+                ]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn health_registered_follows_the_snapshot_and_a_default_state_is_degraded_with_no_upstreams()
+     {
+        let state = AppState::default();
+        let json = health_json(state.clone()).await;
+        assert_eq!(json["phase"], "degraded");
+        assert_eq!(json["ready"], false);
+        assert_eq!(json["registered"], false);
+        assert_eq!(json["upstreams"], json!([]));
+        assert!(json["started_at_ms"].as_u64().unwrap() > 1_735_689_600_000);
+        state.health_state.set_registered(true);
+        assert_eq!(health_json(state).await["registered"], true);
+    }
+
+    /// `/health` 只读后台探测器写好的快照、不做上游 I/O（这由 `health()` 处理函数的结构保证）：Supervisor 的 actor
+    /// 正卡在启动采样里、一个字都不答时，它也照常返回（Agent24 对它有 2 秒超时，连续 3 次超时就判卡死并 SIGTERM）。
+    /// 本测试只能抓住「无界地等上游」这一类退化（阈值 3 秒，给很忙的机器留足余量），不是 200 毫秒预算的断言。
+    #[tokio::test]
+    async fn health_answers_immediately_even_when_a_supervisor_never_answers() {
+        use idoris_backend::{
+            BackendError, BackendStatus, ChatRequest, ChatResponse, ModelInfo, RuntimeAdapter,
+            Supervisor, SupervisorConfig,
+        };
+        struct StuckAdapter;
+        #[async_trait::async_trait]
+        impl RuntimeAdapter for StuckAdapter {
+            fn load_fence_path(&self) -> Result<std::path::PathBuf, BackendError> {
+                Ok(idoris_backend::mock::temporary_load_fence_path())
+            }
+            async fn list(&self) -> Result<Vec<ModelInfo>, BackendError> {
+                Ok(Vec::new())
+            }
+            async fn load(
+                &self,
+                _id: &str,
+                _policy: Option<&idoris_contracts::LoadPolicy>,
+            ) -> Result<(), BackendError> {
+                Ok(())
+            }
+            async fn unload(&self, _id: &str) -> Result<(), BackendError> {
+                Ok(())
+            }
+            async fn status(&self) -> Result<BackendStatus, BackendError> {
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                Err(BackendError::internal("never"))
+            }
+            async fn probe_ready(&self, _id: &str) -> Result<bool, BackendError> {
+                Ok(false)
+            }
+            async fn chat(
+                &self,
+                _req: ChatRequest,
+                _cancel: tokio_util::sync::CancellationToken,
+            ) -> Result<ChatResponse, BackendError> {
+                Err(BackendError::internal("chat"))
+            }
+        }
+        let card = sample_component_card("stuck");
+        let handle = Supervisor::spawn(
+            std::sync::Arc::new(StuckAdapter),
+            SupervisorConfig::default(),
+        )
+        .unwrap();
+        let runtimes =
+            runtime::RuntimeRegistry::from(dispatch::BoundSupervisor::new(&card, handle));
+        // Supervisor 的启动采样要睡 30 秒；处理函数若无界地等它，就会超出这里的 3 秒。阈值留足调度余量，
+        // 因为这个测试要在很忙的机器上稳定通过；它锁的是「不会无界地等上游」，不是 200 毫秒的预算
+        // （一个带 200 毫秒超时去问 Supervisor 的实现，这条测试也会通过）。
+        let json = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            health_json(AppState {
+                cards: vec![card],
+                runtimes,
+                ..AppState::default()
+            }),
+        )
+        .await
+        .expect("/health must not wait for an upstream or a supervisor");
+        assert_eq!(json["status"], "ok");
     }
 
     #[tokio::test]

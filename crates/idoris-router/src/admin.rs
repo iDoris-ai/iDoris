@@ -54,7 +54,11 @@ pub struct AdminBindConfig {
 
 impl AdminBindConfig {
     /// Parse the dedicated Admin listener port. Unset/blank uses the public
-    /// Admin default; explicit values must be plain decimal TCP ports.
+    /// Admin default; explicit values must be plain decimal TCP ports in
+    /// `0..=65535`.
+    ///
+    /// `0` asks the kernel for a free port (接口规范 §2.7.2，修订 1.6)。它只是请求值，不是端口：
+    /// 实际端口以绑定之后的 `local_addr()` 为准，经发现文件传出（见 [`Self::is_dynamic`]）。
     pub fn parse(raw: Option<&str>) -> Result<Self, AdminPortError> {
         let raw = match raw.map(str::trim) {
             None | Some("") => {
@@ -64,26 +68,27 @@ impl AdminBindConfig {
             }
             Some(raw) => raw,
         };
-        if !raw.bytes().all(|byte| byte.is_ascii_digit()) {
-            return Err(AdminPortError(format!(
-                "{ADMIN_PORT_ENV} 不是合法的端口号：'{raw}'。请设置为 1-65535 之间的整数"
-            )));
-        }
-        let port: u64 = raw.parse().map_err(|_| {
+        let invalid = || {
             AdminPortError(format!(
-                "{ADMIN_PORT_ENV} 不是合法的端口号：'{raw}'。请设置为 1-65535 之间的整数"
+                "{ADMIN_PORT_ENV} 不是合法的端口号：'{raw}'。请设置为 0-65535 之间的整数（0 表示由内核分配动态端口）"
             ))
-        })?;
-        if !(1..=u16::MAX as u64).contains(&port) {
-            return Err(AdminPortError(format!(
-                "{ADMIN_PORT_ENV} 不是合法的端口号：'{raw}'。请设置为 1-65535 之间的整数"
-            )));
+        };
+        if !raw.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err(invalid());
         }
-        Ok(Self { port: port as u16 })
+        let port: u64 = raw.parse().map_err(|_| invalid())?;
+        Ok(Self {
+            port: u16::try_from(port).map_err(|_| invalid())?,
+        })
     }
 
     pub fn port(self) -> u16 {
         self.port
+    }
+
+    /// 请求的是动态端口（`IDORIS_ADMIN_PORT=0`）：这个值本身连不上任何东西。
+    pub fn is_dynamic(self) -> bool {
+        self.port == 0
     }
 
     pub fn addr(self) -> std::net::SocketAddr {
@@ -639,12 +644,36 @@ mod tests {
                 DEFAULT_ADMIN_PORT
             );
         }
-        for raw in [Some("0"), Some("65536"), Some("-1"), Some("+9"), Some("8x")] {
+        // `Some("0")` 不再在这里：规范 §2.7.2（修订 1.6）放行了端口 0，见下一个测试。
+        for raw in [Some("65536"), Some("-1"), Some("+9"), Some("8x")] {
             assert!(AdminBindConfig::parse(raw).is_err(), "{raw:?}");
         }
         assert_eq!(AdminBindConfig::parse(Some(" 1 ")).unwrap().port(), 1);
         assert_eq!(AdminBindConfig::parse(Some("9000")).unwrap().port(), 9000);
         assert_eq!(AdminBindConfig::parse(Some("65535")).unwrap().port(), 65535);
+    }
+
+    /// 接口规范 §2.7.2：`IDORIS_ADMIN_PORT=0` 被放行，只是请求值；绑定后的实际端口由内核分配。
+    #[tokio::test]
+    async fn admin_port_zero_is_a_dynamic_request_and_binds_a_real_loopback_port() {
+        for raw in ["0", " 0 ", "00"] {
+            let config = AdminBindConfig::parse(Some(raw)).unwrap();
+            assert_eq!(config.port(), 0, "{raw:?}");
+            assert!(config.is_dynamic());
+        }
+        assert!(!AdminBindConfig::parse(Some("9000")).unwrap().is_dynamic());
+        assert!(!AdminBindConfig::parse(None).unwrap().is_dynamic());
+        for bad in ["-0", "+0", "0x0", "0.0", "0 0"] {
+            assert!(AdminBindConfig::parse(Some(bad)).is_err(), "{bad:?}");
+        }
+        let listener = AdminBindConfig::parse(Some("0"))
+            .unwrap()
+            .bind()
+            .await
+            .unwrap();
+        let actual = listener.local_addr().unwrap();
+        assert_eq!(actual.ip(), std::net::IpAddr::V4(ADMIN_BIND_HOST));
+        assert_ne!(actual.port(), 0, "the kernel assigns the real port");
     }
 
     #[tokio::test]

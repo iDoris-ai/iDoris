@@ -120,8 +120,11 @@ fn fallback_skips_models_at_or_above_the_tier_pick_and_takes_the_first_that_fits
     assert_eq!(at.reason, "tier_64gib_plus");
     assert_eq!(at.host.allocated_budget_bytes, Some(est_27b));
 
-    // 35B-A3B 的估算比 27B 小：额度落在两者之间时，35B 单看放得下，但回落从「档位推荐的下一个」起，
-    // 不会倒回去选 35B，只能到 8B。
+    // 35B-A3B 现在按实测 24.694 GB 估算，估算内存比 27B 大：任何装得下 35B 的额度也装得下 27B，
+    // 原先「额度落在两者之间」的构造不再存在。原意图（回落只从档位推荐的下一个往后找，不倒回选更靠前的
+    // 模型）改用两个等价性质钉住：
+    // (a) 额度远大于 35B 的估算时，35B 单看放得下，推荐仍是 27B，不会因为更靠前就被选中；
+    // (b) 额度少 1 字节装不下 27B 时，回落到 8B，35B 因为更大而 fits=false，且不会被回落选中。
     let est_35b = at
         .alternatives
         .iter()
@@ -129,7 +132,17 @@ fn fallback_skips_models_at_or_above_the_tier_pick_and_takes_the_first_that_fits
         .unwrap()
         .est_memory_bytes
         .unwrap();
-    assert!(est_35b < est_27b);
+    assert!(est_35b > est_27b);
+    let roomy = run(&fx, 64 * GIB, Some(est_35b), &[]);
+    assert_eq!(roomy.model_id.as_deref(), Some(MODEL_27B));
+    assert_eq!(roomy.reason, "tier_64gib_plus");
+    let roomy_35 = roomy
+        .alternatives
+        .iter()
+        .find(|alt| alt.model_id == MODEL_35B)
+        .unwrap();
+    assert!(roomy_35.fits, "35B 自己放得下，只是档位推荐不是它");
+
     let between = run(&fx, 64 * GIB, Some(est_27b - 1), &[]);
     assert_eq!(between.model_id.as_deref(), Some(MODEL_8B));
     assert_eq!(between.reason, "fallback_does_not_fit");
@@ -139,9 +152,25 @@ fn fallback_skips_models_at_or_above_the_tier_pick_and_takes_the_first_that_fits
         .iter()
         .find(|alt| alt.model_id == MODEL_35B)
         .unwrap();
-    assert!(alt_35.fits, "35B 自己放得下，只是回落顺序不回头选它");
+    assert!(!alt_35.fits, "35B 比 27B 大，27B 放不下时它也放不下");
 
     assert_eq!(FALLBACK_ORDER, [MODEL_35B, MODEL_27B, MODEL_8B]);
+}
+
+#[test]
+fn a_budget_that_only_fits_27b_does_not_fit_35b_by_measured_weights() {
+    let fx = fixture();
+    let est_27b = run(&fx, 64 * GIB, None, &[]).est_memory_bytes.unwrap();
+    let rec = run(&fx, 64 * GIB, Some(est_27b), &[]);
+    assert_eq!(rec.model_id.as_deref(), Some(MODEL_27B));
+    let alt_35b = rec
+        .alternatives
+        .iter()
+        .find(|alt| alt.model_id == MODEL_35B)
+        .unwrap();
+    // 旧估算（目录最小量化 22.13 GB）会得到 true，是不安全的乐观方向。
+    assert!(!alt_35b.fits);
+    assert!(alt_35b.est_memory_bytes.unwrap() > est_27b);
 }
 
 #[test]
@@ -220,10 +249,10 @@ fn installed_and_size_come_from_the_local_scan_else_known_download_size() {
     assert_eq!(alt_8b.model_id, MODEL_8B);
     assert!(alt_8b.installed);
     assert_eq!(alt_8b.size_bytes, Some(4_700_000_001));
-    // 规范没有 35B 的实测体积：未安装时 size_bytes 为 null（不是 0），内存估算仍有值。
+    // 35B 未安装：预计下载体积取 2026-11-20 本机实测值，不再是 null。
     let alt_35b = &rec.alternatives[0];
     assert_eq!(alt_35b.model_id, MODEL_35B);
-    assert_eq!(alt_35b.size_bytes, None);
+    assert_eq!(alt_35b.size_bytes, Some(24_694_000_000));
     assert!(alt_35b.est_memory_bytes.is_some());
 
     let rec = run(&fx, 16 * GIB, None, &installed);

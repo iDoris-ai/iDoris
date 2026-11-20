@@ -32,7 +32,10 @@ use idoris_router::{
     components, config,
     connection::{ConnectionInfo, ConnectionListener},
     control::{AccountGate, ControlPlane, SystemControlClock},
-    host_facts, parse_port, profile, routing_policy,
+    discovery, host_facts,
+    instance_nonce::InstanceNonce,
+    launcher_frame::{self, LauncherConfig},
+    parse_port, profile, readiness, routing_policy,
     runtime::RuntimeRegistry,
     runtime_launch_config,
     startup_form::StartupForm,
@@ -369,6 +372,11 @@ fn validate_bind_authority(
 }
 
 async fn run(options: cli::ServeOptions) -> Result<(), String> {
+    // 接口规范 §2.7.3：`started_at_ms` 是 iDoris 开始 `run()` 时的 Unix 毫秒（墙钟），发现文件与 `/health` 用同一个值。
+    let started_at_ms = readiness::unix_millis_now();
+    // 接口规范 §2.1：`instance_nonce` 每次启动一个，CSPRNG 取 256 位。秘密：只在这个进程的内存和发现文件里，
+    // 不放进 `AppState`（所以 `/health`、Admin 没有任何路径能读到它），不进日志和错误信息。
+    let mut instance_nonce = InstanceNonce::generate().map_err(|error| error.to_string())?;
     let allocated_budget_bytes =
         parse_allocated_budget(std::env::var_os(ALLOCATED_BUDGET_ENV).as_deref())?;
     let port =
@@ -446,6 +454,17 @@ async fn run(options: cli::ServeOptions) -> Result<(), String> {
         }
     }
     let cards = active_cards;
+    // 接口规范 §2.3 / §2.12.1：引擎型上游（loopback 的 `http_service` 卡）及其 `engine_kind`、托管声明。
+    // `idoris_managed` 声明不合法（引擎种类不认识、与 `version_pin` 不一致）是卡校验失败：启动失败，
+    // 排在实例锁之前，和其他组件校验同一个优先级。
+    let upstream_plans = readiness::plan_upstreams(&cards).map_err(|error| error.to_string())?;
+    let health_state = readiness::HealthState::with_upstreams(
+        started_at_ms,
+        upstream_plans
+            .iter()
+            .map(readiness::UpstreamPlan::initial_status)
+            .collect(),
+    );
 
     // Load once and retain the validated policy for both execution paths.
     let routing_policy_path = config::resolve_env(
@@ -587,6 +606,7 @@ async fn run(options: cli::ServeOptions) -> Result<(), String> {
             remote_kill_switch,
         )),
         event_log: Some(persistent.event_log),
+        health_state: health_state.clone(),
         ..AppState::default()
     };
 
@@ -696,13 +716,65 @@ async fn run(options: cli::ServeOptions) -> Result<(), String> {
     let admin_listener = tokio::net::TcpListener::bind(plan.admin)
         .await
         .map_err(|err| format!("无法绑定 Admin {}：{err}", plan.admin))?;
-    let admin_token = if options.admin_token_stdin {
-        read_admin_token_from_stdin()?
+    // 请求的端口可以是 0（接口规范 §2.7.2）：实际端口只以绑定之后的 `local_addr()` 为准。
+    // 这里不再打印请求地址（会打出 `:0`）；实际地址由 `serve_bound_with_hooks` 打印。stdout 不属于契约。
+    let data_port = data_listener
+        .local_addr()
+        .map_err(|err| format!("无法读取 data listener 地址：{err}"))?
+        .port();
+    let admin_actual_port = admin_listener
+        .local_addr()
+        .map_err(|err| format!("无法读取 Admin listener 地址：{err}"))?
+        .port();
+    // stdin 在端口绑定之后、对外服务之前读：帧无效（或超时）在服务任何请求之前以退出码 1 退出，
+    // 且只输出固定文案，绝不回显字段值。读取位置与旧的 65 字节帧相同。
+    let (admin_token, launcher): (AdminSessionToken, LauncherConfig) = if options.launcher_stdin {
+        launcher_frame::read_launcher_frame_from_stdin()
+            .map_err(|error| error.to_string())?
+            .split()
+    } else if options.admin_token_stdin {
+        (read_admin_token_from_stdin()?, LauncherConfig::default())
     } else {
-        AdminSessionToken::mint()
+        (AdminSessionToken::mint(), LauncherConfig::default())
+    };
+    // 帧的 `instance_nonce`：规范约定只给确定性测试用、生产不给这个字段，但代码不拒绝，给了就用它；
+    // 没给就用上面生成的那个。
+    if let Some(nonce) = launcher.instance_nonce {
+        instance_nonce = nonce;
+    }
+    // 接口规范 §2.7.3：路径校验都在写任何东西之前，失败即退出码 1，此时尚未对外服务。
+    let discovery_target = match launcher.discovery_path.as_deref() {
+        Some(path) => Some(Arc::new(
+            discovery::DiscoveryTarget::open(path).map_err(|error| error.to_string())?,
+        )),
+        None => None,
+    };
+    let instance_id = state.instance_id.clone();
+    let serving_hook: Option<ServingHook> = match &discovery_target {
+        Some(target) => {
+            let record = discovery::DiscoveryRecord {
+                instance_id: instance_id.clone(),
+                instance_nonce,
+                pid: std::process::id(),
+                data_port,
+                admin_port: admin_actual_port,
+                version: env!("CARGO_PKG_VERSION").to_string(),
+                contract_version: idoris_contracts::CONTRACT_VERSION.to_string(),
+                started_at_ms,
+                launch: Some(launch_snapshot(
+                    &components_dir,
+                    allocated_budget_bytes,
+                    &upstream_plans,
+                )?),
+            };
+            let target = target.clone();
+            Some(Box::new(move || {
+                target.publish(&record).map_err(|error| error.to_string())
+            }))
+        }
+        None => None,
     };
 
-    println!("idoris listening on http://{addr}");
     if dev_no_key_enabled {
         eprintln!(
             "[idoris] IDORIS_DEV_NO_KEY=1: unauthenticated chat is limited to free loopback local_only execution"
@@ -722,16 +794,88 @@ async fn run(options: cli::ServeOptions) -> Result<(), String> {
             &component_list
         }
     );
-    serve_bound(
+    // 上游就绪探测器（接口规范 §2.11.1）：`/health` 只读它写的快照，O(1)。
+    let prober_cancel = CancellationToken::new();
+    let prober = readiness::spawn_prober(
+        readiness::ProberContext {
+            health: health_state,
+            plans: upstream_plans,
+            runtimes: state.runtimes.clone(),
+            client: state.http_client.clone(),
+            remote_kill_switch: state.remote_kill_switch.clone(),
+            timings: readiness::ProberTimings::default(),
+        },
+        prober_cancel.clone(),
+    );
+    let served = serve_bound_with_hooks(
         data_listener,
         admin_listener,
         state,
         admin_token,
         termination_signal(),
+        ServeHooks {
+            on_serving: serving_hook,
+        },
     )
-    .await?;
+    .await;
+    prober_cancel.cancel();
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(1), prober).await;
+    // 接口规范 §2.7.3「何时删」：监听关闭之后、实例锁释放之前（`_instance_lock` 在本函数返回时才释放），
+    // 仅当文件里的 `instance_id` 等于自己。SIGKILL、panic、掉电走不到这里：那是「崩溃残留」。
+    if let Some(target) = discovery_target {
+        remove_discovery_file(target, instance_id).await;
+    }
+    served?;
     println!("idoris: 已停止");
     Ok(())
+}
+
+/// 退出时删发现文件：只在文件属于自己时删；删不掉（旁路锁不可用或等锁超时、IO 失败）只留一行日志，文件成为崩溃残留，
+/// 由下一个拿到实例锁的实例覆盖。日志不含路径与文件内容（`launcher_discovery.rs` 里两条进程级测试逐字断言了这两行）。
+async fn remove_discovery_file(target: Arc<discovery::DiscoveryTarget>, instance_id: String) {
+    let outcome = tokio::task::spawn_blocking(move || target.remove_if_owner(&instance_id)).await;
+    match outcome {
+        Ok(
+            discovery::RemoveOutcome::Removed
+            | discovery::RemoveOutcome::Absent
+            | discovery::RemoveOutcome::NotOwned,
+        ) => {}
+        Ok(discovery::RemoveOutcome::LockUnavailable) => {
+            eprintln!(
+                "[idoris] 发现文件未删除：旁路锁不可用或等待超时（文件保留，下一个实例会覆盖）"
+            );
+        }
+        Ok(discovery::RemoveOutcome::Failed) | Err(_) => {
+            eprintln!("[idoris] 发现文件未删除：删除失败（文件保留，下一个实例会覆盖）");
+        }
+    }
+}
+
+/// 发现文件的 `launch`：启动输入快照（接口规范 §2.7.3）。
+fn launch_snapshot(
+    components_dir: &std::path::Path,
+    allocated_budget_bytes: Option<u64>,
+    plans: &[readiness::UpstreamPlan],
+) -> Result<discovery::LaunchSnapshot, String> {
+    let lossy = |path: &std::path::Path| path.to_string_lossy().into_owned();
+    // 与实例锁用的同一个 canonical 基路径；组件目录同样给 canonical（拿不到就退到绝对路径）。
+    let components_dir = std::fs::canonicalize(components_dir)
+        .or_else(|_| std::path::absolute(components_dir))
+        .map_err(|error| format!("无法解析组件目录的绝对路径：{error}"))?;
+    Ok(discovery::LaunchSnapshot {
+        db_path: lossy(&storage::canonical_process_db_path()?),
+        state_dir: discovery::resolve_state_dir().map(|path| lossy(&path)),
+        components_dir: lossy(&components_dir),
+        allocated_budget_bytes,
+        engines: plans
+            .iter()
+            .map(|plan| discovery::EngineEntry {
+                id: plan.id.clone(),
+                engine_kind: plan.identity.engine_kind.clone(),
+                managed: plan.identity.managed,
+            })
+            .collect(),
+    })
 }
 
 fn read_admin_token_from_stdin() -> Result<AdminSessionToken, String> {
@@ -796,6 +940,13 @@ async fn admin_read(
         }
     };
     let bind = AdminBindConfig::parse(admin_port.as_deref()).map_err(|err| err.to_string())?;
+    // 动态端口（`IDORIS_ADMIN_PORT=0`）只是给 serve 的请求值，连不上任何东西；规范 §2.7.9 不承诺本命令
+    // 自动从发现文件取端口，所以明确拒绝，而不是去连端口 0。
+    if bind.is_dynamic() {
+        return Err(format!(
+            "{ADMIN_PORT_ENV}=0 是动态端口的请求值，不是 Admin 的实际端口；请改用实际端口（发现文件里的 admin_port）"
+        ));
+    }
     let value = fetch_admin_resource(bind, &token, resource).await?;
     println!(
         "{}",
@@ -842,12 +993,67 @@ async fn fetch_admin_resource(
     Ok(value)
 }
 
+/// 服务开始之后运行一次的工作（发现文件的发布）。在阻塞线程上执行。
+type ServingHook = Box<dyn FnOnce() -> Result<(), String> + Send + 'static>;
+
+#[derive(Default)]
+struct ServeHooks {
+    /// 数据面与 Admin 两个 serve future 都**已经被 poll 过**（accept 循环在跑、`/health` 能答）之后运行一次：
+    /// 接口规范 §2.7.3「何时写」的第（c）条，发现文件在 `/health` 能答之后才出现。返回 `Err` 按启动失败处理：
+    /// 先优雅停机，再把错误带出去（退出码 1，不允许「跑着但找不到」）。
+    on_serving: Option<ServingHook>,
+}
+
+/// 驱动 [`ServeHooks::on_serving`]：第一次被 poll 时才把钩子交给阻塞线程，并一直等到它结束。
+/// 可以被 `select!` 取消：join handle 留在调用方的槽里，取消后下一次 poll 或最终的收尾 await 仍能拿到它。
+async fn drive_serving_hook(
+    pending: &mut Option<ServingHook>,
+    running: &mut Option<tokio::task::JoinHandle<Result<(), String>>>,
+) -> Result<(), String> {
+    if let Some(hook) = pending.take() {
+        *running = Some(tokio::task::spawn_blocking(hook));
+    }
+    let Some(handle) = running.as_mut() else {
+        return Ok(());
+    };
+    let joined = handle.await;
+    *running = None;
+    match joined {
+        Ok(result) => result,
+        Err(_) => Err("发现文件发布任务异常结束".to_string()),
+    }
+}
+
+/// 没有钩子的形式：只有单元测试直接用它（生产走 [`serve_bound_with_hooks`]）。
+#[cfg(test)]
 async fn serve_bound<S>(
     data_listener: tokio::net::TcpListener,
     admin_listener: tokio::net::TcpListener,
     state: AppState,
     admin_token: AdminSessionToken,
     shutdown_signal: S,
+) -> Result<(), String>
+where
+    S: Future<Output = ()>,
+{
+    serve_bound_with_hooks(
+        data_listener,
+        admin_listener,
+        state,
+        admin_token,
+        shutdown_signal,
+        ServeHooks::default(),
+    )
+    .await
+}
+
+async fn serve_bound_with_hooks<S>(
+    data_listener: tokio::net::TcpListener,
+    admin_listener: tokio::net::TcpListener,
+    state: AppState,
+    admin_token: AdminSessionToken,
+    shutdown_signal: S,
+    hooks: ServeHooks,
 ) -> Result<(), String>
 where
     S: Future<Output = ()>,
@@ -887,11 +1093,26 @@ where
         Signal,
         Data(std::io::Result<()>),
         Admin(std::io::Result<()>),
+        /// 服务开始后要做的工作失败了（发现文件写不了）。
+        Hook(String),
     }
-    let exit = tokio::select! {
-        result = &mut data_server => Exit::Data(result),
-        result = &mut admin_server => Exit::Admin(result),
-        _ = &mut shutdown_signal => Exit::Signal,
+    let mut pending_hook = hooks.on_serving;
+    let mut running_hook: Option<tokio::task::JoinHandle<Result<(), String>>> = None;
+    let exit = loop {
+        // `biased`：两个 serve future 排在钩子之前，同一轮里它们先被 poll，钩子才被启动。
+        tokio::select! {
+            biased;
+            result = &mut data_server => break Exit::Data(result),
+            result = &mut admin_server => break Exit::Admin(result),
+            _ = &mut shutdown_signal => break Exit::Signal,
+            outcome = drive_serving_hook(&mut pending_hook, &mut running_hook),
+                if pending_hook.is_some() || running_hook.is_some() =>
+            {
+                if let Err(message) = outcome {
+                    break Exit::Hook(message);
+                }
+            }
+        }
     };
     shutdown.cancel();
 
@@ -903,6 +1124,11 @@ where
                     Err(err) => Err(format!("data server error: {err}")),
                     Ok(()) => admin.map_err(|err| format!("admin server error: {err}")),
                 }
+            }
+            Exit::Hook(message) => {
+                let (data, admin) = tokio::join!(&mut data_server, &mut admin_server);
+                let _ = (data, admin);
+                Err(message)
             }
             Exit::Data(result) => {
                 let _peer = admin_server.await;
@@ -930,9 +1156,16 @@ where
             (Err(server), Err(subscription)) => Err(format!("{server}; {subscription}")),
         }
     };
-    tokio::time::timeout(SHUTDOWN_GRACE, drain)
+    let result = tokio::time::timeout(SHUTDOWN_GRACE, drain)
         .await
-        .unwrap_or_else(|_| Err(shutdown_timeout_message()))
+        .unwrap_or_else(|_| Err(shutdown_timeout_message()));
+    // 信号来得比发布更早：让正在进行的发布走完，调用方随后的「仅当 instance_id 匹配才删」才能看到它的最终状态，
+    // 而不是和一个还在 rename 的后台线程赛跑。这一步在上面 `SHUTDOWN_GRACE` 的超时之外：等旁路锁至多 5 秒
+    // （`discovery.rs` 的 `PUBLISH_LOCK_WAIT`），文件系统调用本身（`fsync`、`renameat`）没有时限。
+    if let Some(handle) = running_hook.take() {
+        let _ = handle.await;
+    }
+    result
 }
 
 #[cfg(test)]
@@ -1180,6 +1413,184 @@ mod tests {
 
         signal.cancel();
         tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+
+    async fn bind_pair() -> (tokio::net::TcpListener, tokio::net::TcpListener, u16, u16) {
+        let data = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let admin = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (data_port, admin_port) = (
+            data.local_addr().unwrap().port(),
+            admin.local_addr().unwrap().port(),
+        );
+        (data, admin, data_port, admin_port)
+    }
+
+    /// Blocking `GET /health` over a raw socket, to be called from the (blocking-thread) serving hook.
+    fn blocking_health_status_line(port: u16) -> std::io::Result<String> {
+        use std::io::{Read, Write};
+        let address = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+        let mut stream =
+            std::net::TcpStream::connect_timeout(&address, std::time::Duration::from_secs(5))?;
+        stream.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
+        stream
+            .write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")?;
+        let mut response = String::new();
+        stream.read_to_string(&mut response)?;
+        Ok(response.lines().next().unwrap_or_default().to_string())
+    }
+
+    /// 接口规范 §2.7.3「何时写」第（c）条：钩子（发现文件的发布）运行时，`/health` 已经能答。
+    /// 钩子本身就在阻塞线程里对数据面发一个真实的 `GET /health`。本测试跑在单线程运行时上：若钩子**同步地**先于
+    /// 服务运行（直接在运行时线程上调用），它会占住运行时线程，这个请求拿不到应答。它钉不住更细的次序：
+    /// 钩子经 `spawn_blocking` 先于两个 serve future 的第一次 poll 启动时，请求仍会被答复。这个次序由
+    /// `serve_bound_with_hooks` 里 `select!` 的 `biased` 排列保证。
+    #[tokio::test]
+    async fn serving_hook_runs_only_once_health_can_answer() {
+        let (data, admin, data_port, _admin_port) = bind_pair().await;
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let hook_seen = seen.clone();
+        let signal = CancellationToken::new();
+        let signal_wait = signal.clone();
+        let task = tokio::spawn(serve_bound_with_hooks(
+            data,
+            admin,
+            AppState::default(),
+            AdminSessionToken::mint(),
+            async move { signal_wait.cancelled().await },
+            ServeHooks {
+                on_serving: Some(Box::new(move || {
+                    *hook_seen.lock().unwrap() = Some(blocking_health_status_line(data_port));
+                    Ok(())
+                })),
+            },
+        ));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while seen.lock().unwrap().is_none() {
+            assert!(std::time::Instant::now() < deadline, "hook never ran");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        signal.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let status_line = seen.lock().unwrap().take().unwrap().unwrap();
+        assert!(status_line.starts_with("HTTP/1.1 200"), "{status_line}");
+    }
+
+    /// 钩子失败（发现文件写不了）= 启动失败：两个监听器都停下，错误原样带出去，退出码由调用方定为 1。
+    #[tokio::test]
+    async fn a_failing_serving_hook_stops_both_servers_and_surfaces_its_error() {
+        let (data, admin, data_port, _admin_port) = bind_pair().await;
+        let state = AppState::default();
+        let our_instance_id = state.instance_id.clone();
+        let signal = CancellationToken::new();
+        let signal_wait = signal.clone();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            serve_bound_with_hooks(
+                data,
+                admin,
+                state,
+                AdminSessionToken::mint(),
+                async move { signal_wait.cancelled().await },
+                ServeHooks {
+                    on_serving: Some(Box::new(|| {
+                        Err("发现文件不可用（write_failed）".to_string())
+                    })),
+                },
+            ),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("a failing hook must end the serve loop on its own"));
+        assert_eq!(result.unwrap_err(), "发现文件不可用（write_failed）");
+        // 我们这个实例不再应答。不能断言「端口一定拒绝连接」：端口一释放，机器上别的进程（比如并行的测试）
+        // 随时可能把它重新绑走；所以只要求「没有应答，或应答的不是我们的 instance_id」。
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        if let Ok(response) = client
+            .get(format!("http://127.0.0.1:{data_port}/health"))
+            .timeout(std::time::Duration::from_secs(2))
+            .send()
+            .await
+        {
+            let body: serde_json::Value = response.json().await.unwrap_or_default();
+            assert_ne!(
+                body["instance_id"],
+                serde_json::json!(our_instance_id),
+                "the failed instance must not keep serving"
+            );
+        }
+    }
+
+    /// 信号比发布来得更早：`serve_bound_with_hooks` 返回之前必须等发布走完，调用方随后的清理才不会和
+    /// 一个还在写的后台线程赛跑。
+    #[tokio::test]
+    async fn a_signal_arriving_during_the_hook_still_waits_for_the_hook_to_finish() {
+        let (data, admin, _data_port, _admin_port) = bind_pair().await;
+        let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let hook_finished = finished.clone();
+        let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let hook_started = started.clone();
+        let signal = CancellationToken::new();
+        let signal_wait = signal.clone();
+        let task = tokio::spawn(serve_bound_with_hooks(
+            data,
+            admin,
+            AppState::default(),
+            AdminSessionToken::mint(),
+            async move { signal_wait.cancelled().await },
+            ServeHooks {
+                on_serving: Some(Box::new(move || {
+                    hook_started.store(true, std::sync::atomic::Ordering::SeqCst);
+                    std::thread::sleep(std::time::Duration::from_millis(400));
+                    hook_finished.store(true, std::sync::atomic::Ordering::SeqCst);
+                    Ok(())
+                })),
+            },
+        ));
+        while !started.load(std::sync::atomic::Ordering::SeqCst) {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        signal.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(
+            finished.load(std::sync::atomic::Ordering::SeqCst),
+            "serve_bound_with_hooks returned while the hook was still running"
+        );
+    }
+
+    /// 没有钩子时和以前完全一样：信号之前一直服务，信号之后干净退出。
+    #[tokio::test]
+    async fn without_a_hook_serve_bound_with_hooks_behaves_like_the_plain_serve() {
+        let (data, admin, data_port, _admin_port) = bind_pair().await;
+        let signal = CancellationToken::new();
+        let signal_wait = signal.clone();
+        let task = tokio::spawn(serve_bound_with_hooks(
+            data,
+            admin,
+            AppState::default(),
+            AdminSessionToken::mint(),
+            async move { signal_wait.cancelled().await },
+            ServeHooks::default(),
+        ));
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let health = client
+            .get(format!("http://127.0.0.1:{data_port}/health"))
+            .send()
+            .await
+            .unwrap();
+        assert!(health.status().is_success());
+        signal.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(5), task)
             .await
             .unwrap()
             .unwrap()
