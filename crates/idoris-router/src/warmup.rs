@@ -3,8 +3,9 @@
 //!
 //! - **鉴权与 key 范围同聊天**：聊天在该模型上会被拒的 key，预热也被拒（`auth::enforce_scope`，与 embeddings 同一个入口
 //!   `enforce_protocol_key_scope`）。
-//! - **选卡同聊天**（同一套 `policy_cards` + `select_with_gate_fallback`，含角色绑定、隐私、熔断的就绪快照），只多两条：
-//!   订阅中转卡不参与（没有「加载」可言），请求的能力由角色定（`embed` 是 embedding，其余是 chat）。
+//! - **选卡同聊天**（同一套 `policy_cards` + `select_with_gate_fallback`，含角色绑定、隐私、熔断的就绪快照），另有三条：
+//!   订阅中转卡不参与（没有「加载」可言）；请求的能力由角色定（`embed` 是 embedding，其余是 chat，`rerank` 没有最小请求，
+//!   明确拒绝）；单价非零的卡拒绝（预热只服务本地免费卡）。
 //! - **生命周期卡（oMLX 等）**：走 [`dispatch::ensure_loaded`]——和聊天的按需加载是同一段代码（读 catalog、拒未知模型、
 //!   Supervisor 的幂等 load：余量确认与驱逐都在里面）；加载完成即返回，**不生成任何 token**。同一模型的并发预热与并发的
 //!   首个聊天请求由 Supervisor 合并成一次加载。
@@ -12,7 +13,7 @@
 //!   响应头超时是请求的 `timeout_ms`（不是聊天的 10 秒）。
 //! - **`timeout_ms` 到点只是放弃等待**：返回 504 `warmup_timeout`，**不取消、不缩短**引擎里的加载——Supervisor 的加载任务与请求
 //!   的 future 无关，照常跑完并清掉 `load.pending`，之后的预热或聊天直接看到「已就绪」。引擎自己的加载超时是另一回事
-//!   （`RuntimeAdapter::load_timeout`，缺省 180 秒），只有它才会把结果变成「未知」并留下围栏。
+//!   （`RuntimeAdapter::load_timeout`，生产缺省 180 秒）：加载超过它，结果才是「未知」，围栏保留（行为同聊天，没有变）。
 //! - 不进用量与预算记录（本地免费；付费卡直接拒绝），写一条 `intent: warmup` 的审计事件（见 `record_id_middleware`）。
 
 use std::sync::Arc;

@@ -128,7 +128,7 @@ async fn a_resident_warmup_is_bounded_by_its_own_timeout_ms_not_by_the_chat_head
 
 #[tokio::test]
 async fn timeout_ms_still_bounds_the_resident_request_when_it_is_shorter_than_the_upstream() {
-    let upstream = slow_upstream(Duration::from_millis(2_500)).await;
+    let upstream = slow_upstream(Duration::from_millis(5_000)).await;
     let app = app_with_short_header_timeouts(vec![resident(
         "lmstudio",
         &upstream.uri(),
@@ -145,15 +145,15 @@ async fn timeout_ms_still_bounds_the_resident_request_when_it_is_shorter_than_th
     assert_eq!(status, StatusCode::GATEWAY_TIMEOUT, "{body}");
     assert_eq!(body["error"]["type"], "warmup_timeout");
     assert!(
-        started.elapsed() < Duration::from_millis(2_000),
-        "{:?}",
+        started.elapsed() < Duration::from_millis(4_000),
+        "gave up at timeout_ms, did not wait for the upstream: {:?}",
         started.elapsed()
     );
 }
 
 #[tokio::test]
 async fn the_explicit_header_deadline_replaces_the_path_default_and_none_keeps_it() {
-    let upstream = slow_upstream(Duration::from_millis(600)).await;
+    let upstream = slow_upstream(Duration::from_millis(1_000)).await;
     let mut proxy = proxy::ChatProxy::new(idoris_upstream::http_client().unwrap());
     proxy.header_timeout = Duration::from_millis(150);
     proxy.embeddings_header_timeout = Duration::from_millis(150);

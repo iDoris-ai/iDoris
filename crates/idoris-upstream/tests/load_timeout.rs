@@ -92,7 +92,7 @@ async fn a_load_slower_than_call_timeout_succeeds_once_the_adapter_has_its_own_l
 
 #[tokio::test]
 async fn without_one_a_load_keeps_call_timeout_and_is_an_unknown_outcome() {
-    let server = engine(Duration::from_millis(700), Duration::ZERO).await;
+    let server = engine(Duration::from_millis(1_500), Duration::ZERO).await;
     let error = adapter(&server)
         .load("m", Some(&on_demand()))
         .await
@@ -102,13 +102,13 @@ async fn without_one_a_load_keeps_call_timeout_and_is_an_unknown_outcome() {
 
 #[tokio::test]
 async fn a_load_that_outlasts_its_own_load_timeout_is_still_an_unknown_outcome() {
-    let server = engine(Duration::from_millis(900), Duration::ZERO).await;
+    let server = engine(Duration::from_millis(3_000), Duration::ZERO).await;
     let adapter = adapter(&server).with_load_timeout(Duration::from_millis(400));
     let started = Instant::now();
     let error = adapter.load("m", Some(&on_demand())).await.unwrap_err();
     assert_eq!(error.reason_code(), "load_unconfirmed", "{error}");
     assert!(
-        started.elapsed() < Duration::from_millis(800),
+        started.elapsed() < Duration::from_millis(2_500),
         "the load timeout fired, not the engine's answer: {:?}",
         started.elapsed()
     );
@@ -117,9 +117,9 @@ async fn a_load_that_outlasts_its_own_load_timeout_is_still_an_unknown_outcome()
 
 #[tokio::test]
 async fn the_load_timeout_does_not_loosen_any_other_call() {
-    // Every management call answers after 700 ms, longer than call_timeout (250 ms) and far shorter
-    // than the 5 s load timeout: all of them must still time out at call_timeout.
-    let server = engine(Duration::ZERO, Duration::from_millis(700)).await;
+    // Every management call answers after 2 s, longer than call_timeout (250 ms) and shorter than the
+    // 5 s load timeout: all of them must still time out at call_timeout.
+    let server = engine(Duration::ZERO, Duration::from_millis(2_000)).await;
     let adapter = adapter(&server).with_load_timeout(Duration::from_secs(5));
     for (name, error) in [
         ("list", adapter.list().await.unwrap_err()),
@@ -132,7 +132,7 @@ async fn the_load_timeout_does_not_loosen_any_other_call() {
     let started = Instant::now();
     assert!(!adapter.probe_ready("m").await.unwrap());
     assert!(
-        started.elapsed() < Duration::from_millis(600),
+        started.elapsed() < Duration::from_millis(1_500),
         "{:?}",
         started.elapsed()
     );

@@ -502,6 +502,44 @@ async fn header_and_role_errors_are_the_chat_ones() {
 }
 
 #[tokio::test]
+async fn header_errors_come_before_the_key_scope_check() {
+    let ring = keyring(&[("daily", &["daily"], LOCAL)]);
+    let rig = authed_standard(&ring);
+    // The key may not warm `deep`, but a malformed privacy header is a 400 first (same order as chat).
+    let reply = warm_as(
+        &rig.app,
+        json!({"model": "idoris/deep"}),
+        &ring.secrets["daily"],
+        &[("X-iDoris-Privacy", "bogus")],
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{}", reply.raw);
+    assert_eq!(reply.error_type(), "invalid_privacy");
+    let reply = warm_as(
+        &rig.app,
+        json!({"model": "idoris/deep"}),
+        &ring.secrets["daily"],
+        &[],
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::FORBIDDEN, "{}", reply.raw);
+}
+
+#[tokio::test]
+async fn idoris_auto_is_warmed_as_an_ordinary_role_binding() {
+    let rig = rig_with(
+        vec![lifecycle_card(&[("auto", "qwen-auto")])],
+        &[("qwen-auto", 1.0)],
+        None,
+        |_| {},
+    );
+    let reply = warm(&rig.app, json!({"model": "idoris/auto"})).await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.raw);
+    assert_eq!(reply.body["model"], "qwen-auto");
+    assert_eq!(rig.adapter.inner.load_call_count("qwen-auto"), 1);
+}
+
+#[tokio::test]
 async fn rerank_has_no_minimal_request_and_is_refused_explicitly() {
     let rig = rig_with(
         vec![lifecycle_card(&[("rerank", "qwen-rerank")])],
@@ -607,6 +645,37 @@ async fn a_lifecycle_card_without_a_supervisor_fails_closed() {
     );
     assert_eq!(reply.error_type(), "local_only_unavailable");
     assert_eq!(reply.reason(), "supervisor_unavailable");
+}
+
+#[tokio::test]
+async fn a_supervisor_bound_to_a_different_endpoint_is_not_used() {
+    let adapter = Arc::new(Spy::new(&[("qwen-daily", 1.0)]));
+    let bound = lifecycle_card(&[("daily", "qwen-daily")]);
+    let factory_adapter = adapter.clone();
+    let runtimes = RuntimeRegistry::spawn_with_factory_and_budget(
+        std::slice::from_ref(&bound),
+        None,
+        move |_| Ok(factory_adapter.clone() as Arc<dyn RuntimeAdapter>),
+    )
+    .unwrap();
+    // The card that routes is not the card the Supervisor was built for (another endpoint): like chat,
+    // fail closed instead of driving somebody else's engine.
+    let mut served = bound.clone();
+    served.endpoint = "http://127.0.0.1:9".into();
+    let app = build_app(AppState {
+        cards: vec![served],
+        runtimes,
+        ..AppState::default()
+    });
+    let reply = warm(&app, json!({"model": "idoris/daily"})).await;
+    assert_eq!(
+        reply.status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "{}",
+        reply.raw
+    );
+    assert_eq!(reply.reason(), "supervisor_unavailable");
+    assert_eq!(adapter.inner.load_call_count("qwen-daily"), 0);
 }
 
 #[tokio::test]
@@ -764,9 +833,11 @@ async fn the_header_on_a_chat_request_does_not_confirm_a_later_warmup() {
 #[tokio::test]
 async fn warming_another_model_while_one_loads_is_503_supervisor_busy() {
     let rig = standard();
+    // The second request arrives 150 ms in, with 1.35 s to spare before the load ends: a slow machine
+    // cannot make the first load finish before the second one is admitted.
     rig.adapter
         .inner
-        .set_load_delay("qwen-daily", Duration::from_millis(600));
+        .set_load_delay("qwen-daily", Duration::from_millis(1_500));
     let late = async {
         tokio::time::sleep(Duration::from_millis(150)).await;
         warm(&rig.app, json!({"model": "idoris/deep"})).await
@@ -789,9 +860,9 @@ async fn a_warmup_cannot_join_a_load_admitted_with_a_different_confirmation() {
     let rig = budgeted();
     rig.adapter
         .inner
-        .set_load_delay("small", Duration::from_millis(500));
+        .set_load_delay("small", Duration::from_millis(1_500));
     let late = async {
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(Duration::from_millis(150)).await;
         warm_with(&rig.app, json!({"model": "small"}), &[CONFIRM]).await
     };
     let (plain, confirmed) = tokio::join!(warm(&rig.app, json!({"model": "small"})), late);
@@ -845,7 +916,7 @@ async fn concurrent_warmups_and_the_first_chat_of_one_model_load_it_once() {
     let rig = standard();
     rig.adapter
         .inner
-        .set_load_delay("qwen-daily", Duration::from_millis(600));
+        .set_load_delay("qwen-daily", Duration::from_millis(1_000));
     let body = || json!({"model": "idoris/daily"});
     let (a, b, c, first_chat) = tokio::join!(
         warm(&rig.app, body()),
@@ -875,7 +946,7 @@ async fn timeout_ms_expiring_is_504_warmup_timeout_and_the_load_finishes_without
     let rig = standard();
     rig.adapter
         .inner
-        .set_load_delay("qwen-daily", Duration::from_millis(2_000));
+        .set_load_delay("qwen-daily", Duration::from_millis(3_000));
     let started = Instant::now();
     let reply = warm(
         &rig.app,
@@ -887,7 +958,7 @@ async fn timeout_ms_expiring_is_504_warmup_timeout_and_the_load_finishes_without
     assert_eq!(reply.error_type(), "warmup_timeout");
     assert_eq!(reply.reason(), "warmup_timeout");
     assert!(
-        waited >= Duration::from_millis(900) && waited < Duration::from_millis(1_800),
+        waited >= Duration::from_millis(900) && waited < Duration::from_millis(2_500),
         "等了 timeout_ms，没有等到加载结束: {waited:?}"
     );
     assert_eq!(reply.header("x-idoris-served-locality"), Some("loopback"));
@@ -938,7 +1009,7 @@ async fn a_chat_that_arrives_after_a_warmup_timeout_joins_the_load_that_is_still
     let rig = standard();
     rig.adapter
         .inner
-        .set_load_delay("qwen-daily", Duration::from_millis(1_800));
+        .set_load_delay("qwen-daily", Duration::from_millis(3_000));
     let reply = warm(
         &rig.app,
         json!({"model": "idoris/daily", "timeout_ms": 1000}),
@@ -956,7 +1027,7 @@ async fn a_client_that_hangs_up_does_not_cancel_the_load_either() {
     let rig = standard();
     rig.adapter
         .inner
-        .set_load_delay("qwen-daily", Duration::from_millis(800));
+        .set_load_delay("qwen-daily", Duration::from_millis(1_500));
     let abandoned = tokio::time::timeout(
         Duration::from_millis(200),
         warm(&rig.app, json!({"model": "idoris/daily"})),
@@ -1502,6 +1573,7 @@ async fn resident_upstream_answers_map_onto_the_warmup_error_matrix() {
         reply.raw
     );
     assert_eq!(reply.body, json!({"engine": "broke"}));
+    assert_eq!(reply.header("content-type"), Some("application/json"));
     assert_eq!(reply.header("x-idoris-served-locality"), Some("loopback"));
 }
 
@@ -1509,7 +1581,7 @@ async fn resident_upstream_answers_map_onto_the_warmup_error_matrix() {
 async fn a_resident_upstream_slower_than_timeout_ms_is_504_warmup_timeout() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
-        .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_millis(1_800)))
+        .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_millis(4_000)))
         .mount(&server)
         .await;
     let app = resident_app(vec![resident_card(
@@ -1525,8 +1597,8 @@ async fn a_resident_upstream_slower_than_timeout_ms_is_504_warmup_timeout() {
     assert_eq!(reply.error_type(), "warmup_timeout");
     assert_eq!(reply.reason(), "warmup_timeout");
     assert!(
-        started.elapsed() < Duration::from_millis(1_700),
-        "{:?}",
+        started.elapsed() < Duration::from_millis(3_500),
+        "gave up at timeout_ms, did not wait for the upstream: {:?}",
         started.elapsed()
     );
     assert_eq!(reply.header("x-idoris-served-locality"), Some("loopback"));
@@ -1590,6 +1662,96 @@ async fn the_callers_virtual_key_never_reaches_the_resident_upstream() {
         "自定义上游不带任何 Authorization: {:?}",
         seen[0].headers
     );
+}
+
+#[tokio::test]
+async fn a_cooling_resident_card_is_skipped_when_another_card_can_warm() {
+    // Card `a-bad` answers 500: two consecutive faults open its (loopback) provider breaker, after which
+    // the readiness snapshot excludes it from selection, as for chat.
+    let bad = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&bad)
+        .await;
+    let good = upstream().await;
+    let app = resident_app(vec![
+        resident_card("a-bad", &bad.uri(), "chat", "daily: \"m\"", false),
+        resident_card("b-good", &good.uri(), "chat", "daily: \"m\"", false),
+    ]);
+    for attempt in 0..2 {
+        let reply = warm(&app, json!({"model": "idoris/daily"})).await;
+        assert_eq!(
+            reply.status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "attempt {attempt}: {}",
+            reply.raw
+        );
+    }
+    let reply = warm(&app, json!({"model": "idoris/daily"})).await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.raw);
+    assert_eq!(reply.body["provider_id"], "b-good");
+}
+
+#[tokio::test]
+async fn a_subscription_card_is_never_a_warmup_candidate() {
+    let subscription: ComponentCard =
+        serde_yaml::from_str(include_str!("../../../config/components/subscription.yaml")).unwrap();
+    // Remote-tier cards are eligible for `any` here, so only the warmup's own exclusion keeps it out.
+    let routing_policy = idoris_contracts::RoutingPolicy {
+        routing_policy: idoris_contracts::routing_policy::RoutingPolicyInner {
+            version: 1,
+            rules: Vec::new(),
+            default: idoris_contracts::routing_policy::Action {
+                tiers: Some(vec![
+                    idoris_contracts::common::Tier::Local,
+                    idoris_contracts::common::Tier::Remote,
+                ]),
+                fail_closed: Some(false),
+                ..Default::default()
+            },
+        },
+    };
+    let app = build_app(AppState {
+        cards: vec![subscription],
+        routing_policy,
+        ..AppState::default()
+    });
+    let reply = warm_with(
+        &app,
+        json!({"model": "some-model"}),
+        &[("X-iDoris-Privacy", "any")],
+    )
+    .await;
+    assert_eq!(
+        reply.status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "{}",
+        reply.raw
+    );
+    // With the subscription card excluded there is no candidate at all. (Were it a candidate, it would
+    // be selected and fail as `supervisor_unavailable`: it has no lifecycle runtime.)
+    assert_eq!(reply.error_type(), "no_eligible_candidate", "{}", reply.raw);
+}
+
+#[tokio::test]
+async fn content_that_tightens_privacy_is_reported_in_the_reason_header() {
+    let rig = rig_with(
+        vec![omlx_template()],
+        &[("carol@example.com", 1.0), ("plain-model", 1.0)],
+        None,
+        |_| {},
+    );
+    let any = [("X-iDoris-Privacy", "any")];
+    // The model id is inspected like any other string of the body: an e-mail address pins `any` to local.
+    let tightened = warm_with(&rig.app, json!({"model": "carol@example.com"}), &any).await;
+    assert_eq!(tightened.status, StatusCode::OK, "{}", tightened.raw);
+    let reason = tightened.header("x-idoris-reason").unwrap_or("");
+    assert!(reason.contains("PrivacyTightenedByContent"), "{reason:?}");
+    // Control: without such content the same `any` request carries no tightening reason.
+    let plain = warm_with(&rig.app, json!({"model": "plain-model"}), &any).await;
+    assert_eq!(plain.status, StatusCode::OK, "{}", plain.raw);
+    let reason = plain.header("x-idoris-reason").unwrap_or("");
+    assert!(!reason.contains("PrivacyTightenedByContent"), "{reason:?}");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1957,7 +2119,7 @@ async fn a_cold_load_slower_than_the_management_timeout_warms_up_without_leaving
 async fn without_a_separate_load_timeout_the_same_cold_load_is_an_unknown_outcome_that_leaves_the_fence()
  {
     // 对照：v0.5.0 的行为（load 与别的管理调用共用 call_timeout）。这就是设计稿 R2 要避免的事。
-    let server = fake_omlx("m", Duration::from_millis(900)).await;
+    let server = fake_omlx("m", Duration::from_millis(1_500)).await;
     let (app, fence) = omlx_rig(&server, None);
     let reply = warm(&app, json!({"model": "idoris/daily", "timeout_ms": 10_000})).await;
     assert_eq!(
@@ -1973,7 +2135,7 @@ async fn without_a_separate_load_timeout_the_same_cold_load_is_an_unknown_outcom
 
 #[tokio::test]
 async fn a_warmup_timeout_over_a_real_adapter_neither_cancels_the_load_nor_leaves_a_fence() {
-    let server = fake_omlx("m", Duration::from_millis(1_800)).await;
+    let server = fake_omlx("m", Duration::from_millis(3_000)).await;
     let (app, fence) = omlx_rig(&server, Some(Duration::from_secs(10)));
     let reply = warm(&app, json!({"model": "idoris/daily", "timeout_ms": 1000})).await;
     assert_eq!(reply.status, StatusCode::GATEWAY_TIMEOUT, "{}", reply.raw);

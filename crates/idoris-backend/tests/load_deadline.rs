@@ -94,15 +94,15 @@ async fn an_adapter_without_a_load_budget_is_still_bounded_by_the_generic_call_t
     let adapter = Arc::new(Declared::new(None));
     adapter
         .inner
-        .set_load_delay("m", Duration::from_millis(600));
+        .set_load_delay("m", Duration::from_millis(3_000));
     let fence = adapter.inner.load_fence_path().unwrap();
     let handle = Supervisor::spawn(adapter, short_calls()).unwrap();
     let started = Instant::now();
     let error = handle.load("m", 1.0, on_demand()).await.unwrap_err();
     assert_eq!(error.reason_code(), "adapter_timed_out", "{error}");
     assert!(
-        started.elapsed() < Duration::from_millis(550),
-        "the 200 ms generic deadline fired, not the engine's 600 ms: {:?}",
+        started.elapsed() < Duration::from_millis(2_500),
+        "the 200 ms generic deadline fired, not the engine's 3 s: {:?}",
         started.elapsed()
     );
     assert!(
@@ -151,14 +151,14 @@ async fn only_the_load_call_gets_the_longer_deadline_unload_keeps_the_generic_on
     let adapter = Arc::new(Declared::new(Some(Duration::from_secs(5))));
     adapter
         .inner
-        .set_unload_delay("m", Duration::from_millis(600));
+        .set_unload_delay("m", Duration::from_millis(3_000));
     let handle = Supervisor::spawn(adapter.clone(), short_calls()).unwrap();
     handle.load("m", 1.0, on_demand()).await.unwrap();
     let started = Instant::now();
     let error = handle.unload("m").await.unwrap_err();
     assert_eq!(error.reason_code(), "adapter_timed_out", "{error}");
     assert!(
-        started.elapsed() < Duration::from_millis(550),
+        started.elapsed() < Duration::from_millis(2_500),
         "{:?}",
         started.elapsed()
     );
