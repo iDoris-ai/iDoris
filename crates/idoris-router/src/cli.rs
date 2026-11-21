@@ -8,6 +8,8 @@ pub enum Command {
     Admin(AdminCommand),
     Key(KeyCommand),
     SetupOmlx(SetupOptions),
+    /// `idoris setup upstream`（接口规范 §2.7.8，最小版）：登记 loopback 上的 OpenAI 兼容上游，往组件目录里加一张卡。
+    SetupUpstream(UpstreamOptions),
     /// `idoris recommend --role chat --json [--allocated-budget-bytes <u64>]`（接口规范 §2.9）。
     /// 只读本机文件系统；不开数据库、不取实例锁、不读任何密钥。
     Recommend(RecommendOptions),
@@ -59,6 +61,56 @@ pub struct ManagedOptions {
     pub port: Option<u16>,
 }
 
+/// `idoris setup upstream --kind`：上游的种类。最小版（v0.6.0）只有 `openai_compat`；规范 §2.12.1 的其余保留名
+/// （`lmstudio`、`ollama` 等）不是 `--kind` 的取值：它们都是同一种形状，由 `openai_compat` 覆盖。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpstreamKind {
+    OpenAiCompat,
+}
+
+impl UpstreamKind {
+    /// 命令行与卡里的写法。它同时是卡的 `version_pin` 产品名、`extensions.idoris_upstream` 的 `kind` 与 `flavor`、
+    /// `/health.upstreams[].engine_kind`。
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::OpenAiCompat => "openai_compat",
+        }
+    }
+}
+
+/// `idoris setup upstream` 的选项（规范 §2.7.8，最小版）：登记一个 loopback 上的 OpenAI 兼容上游。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpstreamOptions {
+    pub kind: UpstreamKind,
+    pub endpoint: String,
+    pub out_dir: std::path::PathBuf,
+    /// `(role, model_id)` in command-line order; roles are unique, at least one.
+    pub bindings: Vec<(String, String)>,
+    /// `--id`：卡的 `provider.id`，也是文件名 `<id>.yaml`。没给就由种类与端口派生（`setup_upstream`）。
+    pub id: Option<String>,
+    /// `--default`：卡带 `extensions.idoris_default: true`。
+    pub default: bool,
+    /// `--force`：替换同名的卡（只有这一个文件）。
+    pub force: bool,
+}
+
+/// `--bind role=model`：`=` 两边都非空，同一个角色只能绑一次（模型 id 里可以再有 `=`）。
+fn push_binding(
+    bindings: &mut Vec<(String, String)>,
+    value: &std::ffi::OsStr,
+) -> Result<(), String> {
+    let (role, model) = value
+        .to_str()
+        .and_then(|v| v.split_once('='))
+        .filter(|(r, m)| !r.is_empty() && !m.is_empty())
+        .ok_or_else(|| USAGE.to_string())?;
+    if bindings.iter().any(|(r, _)| r == role) {
+        return Err(USAGE.to_string());
+    }
+    bindings.push((role.to_string(), model.to_string()));
+    Ok(())
+}
+
 fn parse_setup(args: &[OsString]) -> Result<SetupOptions, String> {
     use idoris_contracts::load_policy::LoadMode;
     let (mut endpoint, mut out_dir, mut load_mode) = (None, None, None);
@@ -90,17 +142,7 @@ fn parse_setup(args: &[OsString]) -> Result<SetupOptions, String> {
                     "--managed-port" if managed_port.is_none() => {
                         managed_port = Some(parse_port(value.to_str().ok_or(USAGE)?)?)
                     }
-                    "--bind" => {
-                        let (role, model) = value
-                            .to_str()
-                            .and_then(|v| v.split_once('='))
-                            .filter(|(r, m)| !r.is_empty() && !m.is_empty())
-                            .ok_or_else(|| USAGE.to_string())?;
-                        if bindings.iter().any(|(r, _): &(String, String)| r == role) {
-                            return Err(USAGE.to_string());
-                        }
-                        bindings.push((role.to_string(), model.to_string()));
-                    }
+                    "--bind" => push_binding(&mut bindings, value)?,
                     _ => return Err(USAGE.to_string()),
                 }
             }
@@ -150,6 +192,54 @@ fn parse_port(value: &str) -> Result<u16, String> {
         Ok(port) if port != 0 => Ok(port),
         _ => Err(USAGE.to_string()),
     }
+}
+
+/// `idoris setup upstream --kind openai_compat --endpoint <url> --out-dir <dir> --bind <role>=<model>…
+/// [--id <id>] [--default] [--force]`：旗标顺序不限，除 `--bind` 外都只能出现一次；`--kind`、`--endpoint`、`--out-dir`
+/// 与至少一个 `--bind` 必须有。没有 `--api-key-stdin`：这个命令不带密钥（规范 §2.7.8）。`--id` 的取值不在这里核对，
+/// 不合规是运行期的 JSON 错误 `invalid_id`，调用方解析 stdout 就能拿到原因。
+fn parse_setup_upstream(args: &[OsString]) -> Result<UpstreamOptions, String> {
+    let (mut kind, mut endpoint, mut out_dir, mut id) = (None, None, None, None);
+    let (mut bindings, mut default, mut force) = (Vec::new(), false, false);
+    let mut it = args.iter();
+    while let Some(flag) = it.next() {
+        let flag = flag.to_str().ok_or_else(|| USAGE.to_string())?;
+        match flag {
+            "--default" if !default => default = true,
+            "--force" if !force => force = true,
+            "--kind" | "--endpoint" | "--out-dir" | "--bind" | "--id" => {
+                let value = it.next().ok_or_else(|| USAGE.to_string())?;
+                match flag {
+                    "--kind" if kind.is_none() => {
+                        kind = Some(match value.to_str() {
+                            Some("openai_compat") => UpstreamKind::OpenAiCompat,
+                            _ => return Err(USAGE.to_string()),
+                        })
+                    }
+                    "--endpoint" if endpoint.is_none() => {
+                        endpoint = Some(value.to_str().ok_or(USAGE)?.to_string())
+                    }
+                    "--out-dir" if out_dir.is_none() => out_dir = Some(value.into()),
+                    "--id" if id.is_none() => id = Some(value.to_str().ok_or(USAGE)?.to_string()),
+                    "--bind" => push_binding(&mut bindings, value)?,
+                    _ => return Err(USAGE.to_string()),
+                }
+            }
+            _ => return Err(USAGE.to_string()),
+        }
+    }
+    if bindings.is_empty() {
+        return Err(USAGE.to_string());
+    }
+    Ok(UpstreamOptions {
+        kind: kind.ok_or_else(|| USAGE.to_string())?,
+        endpoint: endpoint.ok_or_else(|| USAGE.to_string())?,
+        out_dir: out_dir.ok_or_else(|| USAGE.to_string())?,
+        bindings,
+        id,
+        default,
+        force,
+    })
 }
 
 /// `role` 保持原样交给运行期判断：不支持的角色要给出明确的一行说明，而不是笼统的用法提示。
@@ -237,7 +327,7 @@ pub enum KeyCommand {
     Revoke(String),
 }
 
-const USAGE: &str = "用法: idoris [serve [--admin-token-stdin | --launcher-stdin]] | idoris admin <status|backends|models|roles|runtimes> --token-stdin | idoris key issue --spec-stdin | idoris key list | idoris key revoke <key_id> | idoris control bootstrap --spec-stdin | idoris cloud pair [--label <设备名>] | idoris cloud status | idoris cloud unpair | idoris recommend --role chat --json [--allocated-budget-bytes <u64>] | idoris models local --json | idoris setup omlx --out-dir <dir> (--endpoint <url> [--api-key-stdin] | --auto | --managed) [--managed-port <n>] [--bind <role>=<model>]... [--load-mode on_demand|resident] [--force] [--no-probe]";
+const USAGE: &str = "用法: idoris [serve [--admin-token-stdin | --launcher-stdin]] | idoris admin <status|backends|models|roles|runtimes> --token-stdin | idoris key issue --spec-stdin | idoris key list | idoris key revoke <key_id> | idoris control bootstrap --spec-stdin | idoris cloud pair [--label <设备名>] | idoris cloud status | idoris cloud unpair | idoris recommend --role chat --json [--allocated-budget-bytes <u64>] | idoris models local --json | idoris setup omlx --out-dir <dir> (--endpoint <url> [--api-key-stdin] | --auto | --managed) [--managed-port <n>] [--bind <role>=<model>]... [--load-mode on_demand|resident] [--force] [--no-probe] | idoris setup upstream --kind openai_compat --endpoint <url> --out-dir <dir> --bind <role>=<model>... [--id <id>] [--default] [--force]";
 
 pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Command, String> {
     let args = args.into_iter().collect::<Vec<_>>();
@@ -294,6 +384,9 @@ pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Command, S
         }
         [setup, omlx, rest @ ..] if setup == "setup" && omlx == "omlx" => {
             parse_setup(rest).map(Command::SetupOmlx)
+        }
+        [setup, upstream, rest @ ..] if setup == "setup" && upstream == "upstream" => {
+            parse_setup_upstream(rest).map(Command::SetupUpstream)
         }
         [cloud, rest @ ..] if cloud == "cloud" => {
             let rest = rest
@@ -831,6 +924,230 @@ mod tests {
     fn the_usage_text_lists_the_new_setup_flags() {
         for flag in ["--auto", "--managed", "--managed-port", "--no-probe"] {
             assert!(USAGE.contains(flag), "{flag}");
+        }
+    }
+
+    fn upstream(args: &[&str]) -> Result<UpstreamOptions, String> {
+        let mut all = vec![OsString::from("setup"), OsString::from("upstream")];
+        all.extend(args.iter().map(OsString::from));
+        match parse_args(all)? {
+            Command::SetupUpstream(options) => Ok(options),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    /// 规范 §2.7.8 的形状：`--kind openai_compat --endpoint <url> --out-dir <dir> --bind role=model [--id <id>] [--default]`，
+    /// 加 `--force`；旗标顺序不限。
+    #[test]
+    fn parses_setup_upstream_flags_in_any_order() {
+        let min = upstream(&[
+            "--kind",
+            "openai_compat",
+            "--endpoint",
+            "http://127.0.0.1:1234",
+            "--out-dir",
+            "o",
+            "--bind",
+            "daily=qwen3-8b",
+        ])
+        .unwrap();
+        assert_eq!(
+            min,
+            UpstreamOptions {
+                kind: UpstreamKind::OpenAiCompat,
+                endpoint: "http://127.0.0.1:1234".into(),
+                out_dir: "o".into(),
+                bindings: vec![("daily".into(), "qwen3-8b".into())],
+                id: None,
+                default: false,
+                force: false,
+            }
+        );
+        let all = upstream(&[
+            "--default",
+            "--bind",
+            "daily=a=b",
+            "--force",
+            "--id",
+            "lmstudio",
+            "--out-dir",
+            "o",
+            "--bind",
+            "fast=m",
+            "--endpoint",
+            "e",
+            "--kind",
+            "openai_compat",
+        ])
+        .unwrap();
+        assert_eq!(
+            all.bindings,
+            [("daily".into(), "a=b".into()), ("fast".into(), "m".into())],
+            "命令行顺序，模型 id 里可以有 ="
+        );
+        assert_eq!(all.id.as_deref(), Some("lmstudio"));
+        assert!(all.default && all.force);
+    }
+
+    /// `--id` 的取值在解析时不核对（不合规是运行期的 JSON 错误，调用方解析 stdout 就能拿到原因）。
+    #[test]
+    fn the_id_value_is_not_judged_at_parse_time() {
+        for id in ["", "Bad Id", "omlx", "../x"] {
+            let options = upstream(&[
+                "--kind",
+                "openai_compat",
+                "--endpoint",
+                "e",
+                "--out-dir",
+                "o",
+                "--bind",
+                "daily=m",
+                "--id",
+                id,
+            ])
+            .unwrap();
+            assert_eq!(options.id.as_deref(), Some(id));
+        }
+    }
+
+    #[test]
+    fn rejects_malformed_setup_upstream_forms() {
+        let required = [
+            "--kind",
+            "openai_compat",
+            "--endpoint",
+            "e",
+            "--out-dir",
+            "o",
+            "--bind",
+            "daily=m",
+        ];
+        assert!(upstream(&required).is_ok());
+        fn with<'a>(base: &[&'a str], extra: &[&'a str]) -> Vec<&'a str> {
+            let mut args = base.to_vec();
+            args.extend_from_slice(extra);
+            args
+        }
+        fn without<'a>(base: &[&'a str], flag: &str) -> Vec<&'a str> {
+            let mut args = base.to_vec();
+            let at = args.iter().position(|a| *a == flag).unwrap();
+            args.drain(at..at + 2);
+            args
+        }
+        let mut bad: Vec<Vec<&str>> = vec![
+            // 缺必选项：`--kind`、`--endpoint`、`--out-dir`、至少一个 `--bind`。
+            without(&required, "--kind"),
+            without(&required, "--endpoint"),
+            without(&required, "--out-dir"),
+            without(&required, "--bind"),
+            vec![],
+            // 没有密钥通道，也不是 setup omlx 的目标与加载模式旗标。
+            with(&required, &["--api-key-stdin"]),
+            with(&required, &["--api-key", "secret"]),
+            with(&required, &["--no-probe"]),
+            with(&required, &["--auto"]),
+            with(&required, &["--managed"]),
+            with(&required, &["--managed-port", "19000"]),
+            with(&required, &["--load-mode", "resident"]),
+            with(&required, &["--nope"]),
+            with(&required, &["positional"]),
+            // 重复。
+            with(&required, &["--force", "--force"]),
+            with(&required, &["--default", "--default"]),
+            with(&required, &["--kind", "openai_compat"]),
+            with(&required, &["--endpoint", "f"]),
+            with(&required, &["--out-dir", "p"]),
+            with(&required, &["--id", "a", "--id", "b"]),
+            with(&required, &["--bind", "daily=other"]),
+            // 值缺失。
+            with(&required, &["--id"]),
+            with(&required, &["--bind"]),
+        ];
+        // `--kind` 只有 `openai_compat`：别的保留名、大小写变体、空值、带空白都不是。
+        for kind in [
+            "lmstudio",
+            "ollama",
+            "omlx",
+            "OpenAI_Compat",
+            "openai_compat ",
+            "",
+        ] {
+            let mut args = required.to_vec();
+            args[1] = kind;
+            bad.push(args);
+        }
+        // `--bind` 的形状。
+        for bind in ["daily", "=m", "daily="] {
+            let mut args = required.to_vec();
+            args[7] = bind;
+            bad.push(args);
+        }
+        for args in bad {
+            assert_eq!(upstream(&args).unwrap_err(), USAGE, "{args:?}");
+        }
+    }
+
+    /// 不是 UTF-8 的取值与旗标名是用法错误，不会被有损转换成别的东西；`--out-dir` 的值是路径，不要求是 UTF-8
+    /// （与 `setup omlx` 相同）。
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_setup_upstream_values_are_usage_errors() {
+        use std::os::unix::ffi::OsStringExt;
+        let invalid = || OsString::from_vec(vec![0xff, 0xfe]);
+        let base: Vec<OsString> = [
+            "setup",
+            "upstream",
+            "--kind",
+            "openai_compat",
+            "--endpoint",
+            "e",
+            "--out-dir",
+            "o",
+            "--bind",
+            "daily=m",
+            "--id",
+            "lm",
+        ]
+        .map(OsString::from)
+        .to_vec();
+        assert!(parse_args(base.clone()).is_ok());
+        for flag in ["--kind", "--endpoint", "--bind", "--id"] {
+            let mut args = base.clone();
+            let at = args.iter().position(|a| a == flag).unwrap();
+            args[at + 1] = invalid();
+            assert_eq!(parse_args(args).unwrap_err(), USAGE, "{flag}");
+        }
+        let mut args = base.clone();
+        args.push(invalid());
+        assert_eq!(parse_args(args).unwrap_err(), USAGE, "旗标名不是 UTF-8");
+        let mut args = base;
+        let at = args.iter().position(|a| a == "--out-dir").unwrap();
+        args[at + 1] = invalid();
+        assert!(parse_args(args).is_ok());
+    }
+
+    #[test]
+    fn the_usage_text_lists_setup_upstream_and_none_of_its_absent_flags() {
+        let upstream_usage = USAGE.split("idoris setup upstream").nth(1).unwrap();
+        for flag in [
+            "--kind openai_compat",
+            "--endpoint <url>",
+            "--out-dir <dir>",
+            "--bind <role>=<model>",
+            "[--id <id>]",
+            "[--default]",
+            "[--force]",
+        ] {
+            assert!(upstream_usage.contains(flag), "{flag}");
+        }
+        for absent in [
+            "--api-key-stdin",
+            "--no-probe",
+            "--auto",
+            "--managed",
+            "--load-mode",
+        ] {
+            assert!(!upstream_usage.contains(absent), "{absent}");
         }
     }
 }

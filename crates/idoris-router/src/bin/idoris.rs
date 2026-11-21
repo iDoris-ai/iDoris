@@ -235,6 +235,16 @@ async fn real_main() -> u8 {
                 }
             }
         }
+        // 接口规范 §2.7.8：不读 stdin（没有密钥通道）；探测只连 `--endpoint`，那是 loopback。
+        cli::Command::SetupUpstream(options) => {
+            match idoris_router::setup_upstream::run(&options).await {
+                Ok(report) => println!("{report}"),
+                Err(error) => {
+                    println!("{}", error.to_json());
+                    return 1;
+                }
+            }
+        }
         // 接口规范 §2.9：只读本机文件系统，不开数据库、不取实例锁、不连 oMLX、不读任何密钥。
         cli::Command::Recommend(options) => {
             if let Err(message) = run_recommend(options) {

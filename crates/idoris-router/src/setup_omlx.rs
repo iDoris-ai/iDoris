@@ -6,7 +6,6 @@
 
 use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use idoris_contracts::ComponentCard;
 use idoris_recommender::local_models::{default_models_dir, scan_local_models};
@@ -18,58 +17,28 @@ use crate::cli::SetupOptions;
 #[cfg(unix)]
 use crate::setup_engine::recipe_backed;
 use crate::setup_engine::{
-    FindFailure, FoundExecutable, MANAGED_PORT_RANGE, Probed, SetupEngine, run_setup,
+    Accept, FindFailure, FoundExecutable, MANAGED_PORT_RANGE, Probed, Reply, SetupEngine, get_json,
+    probe_client, run_setup,
 };
 pub use crate::setup_engine::{SetupError, read_api_key};
 
 const OMLX_CARD: &str = include_str!("../../../config/components/omlx.yaml");
 const SUBSCRIPTION_CARD: &str = include_str!("../../../config/components/subscription.yaml");
-const MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
-const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// `--auto` 依次探测的 loopback 端口（接口规范 §2.7.8；Agent24 原来在自己代码里探测的同一组）。
 pub const AUTO_PORTS: [u16; 3] = [8088, 8000, 8001];
 
-enum Reply {
-    Ok(Value),
-    Denied,
+fn not_omlx() -> SetupError {
+    SetupError::new("not_omlx", "endpoint 的响应不像 oMLX")
 }
 
 async fn get(client: &reqwest::Client, url: &str, key: Option<&str>) -> Result<Reply, SetupError> {
-    let unreachable = || SetupError::new("unreachable", "无法连接 oMLX endpoint");
-    let not_omlx = || SetupError::new("not_omlx", "endpoint 的响应不像 oMLX");
-    let mut request = client.get(url);
-    if let Some(key) = key {
-        request = request.bearer_auth(key);
-    }
-    let mut response = request.send().await.map_err(|_| unreachable())?;
-    let status = response.status();
-    if matches!(status.as_u16(), 401 | 403) {
-        return Ok(Reply::Denied);
-    }
-    if !status.is_success() {
-        return Err(not_omlx());
-    }
-    let mut body = Vec::new();
-    while let Some(chunk) = response.chunk().await.map_err(|_| unreachable())? {
-        body.extend_from_slice(&chunk);
-        if body.len() > MAX_BODY_BYTES {
-            return Err(not_omlx());
-        }
-    }
-    serde_json::from_slice(&body)
-        .map(Reply::Ok)
-        .map_err(|_| not_omlx())
+    get_json(client, url, key, "oMLX", Accept::AnySuccess, not_omlx).await
 }
 
 /// `lifecycle` 为真时还要求 `/v1/models/status` 与 `/api/status`（oMLX 生命周期适配器用的两个接口）。
 async fn probe(base: &str, key: Option<&str>, lifecycle: bool) -> Result<Probed, SetupError> {
-    let client = reqwest::Client::builder()
-        .no_proxy()
-        .redirect(reqwest::redirect::Policy::none())
-        .timeout(PROBE_TIMEOUT)
-        .build()
-        .map_err(|_| SetupError::new("unreachable", "无法创建 HTTP 客户端"))?;
+    let client = probe_client()?;
     let models_url = format!("{base}/v1/models");
     let denied = |has_key| {
         if has_key {
@@ -100,7 +69,7 @@ async fn probe(base: &str, key: Option<&str>, lifecycle: bool) -> Result<Probed,
                 .map(|r| r.get("id").and_then(Value::as_str).map(str::to_string))
                 .collect::<Option<Vec<_>>>()
         })
-        .ok_or_else(|| SetupError::new("not_omlx", "endpoint 的响应不像 oMLX"))?;
+        .ok_or_else(not_omlx)?;
     if lifecycle {
         // The lifecycle adapter needs these two; their absence means this is
         // not an oMLX the on_demand mode can drive.

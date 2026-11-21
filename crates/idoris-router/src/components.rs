@@ -74,6 +74,15 @@ impl std::fmt::Display for LoadError {
 
 impl std::error::Error for LoadError {}
 
+/// 加载器读哪些文件：目录下直接的 `*.yaml` / `*.yml`。`setup upstream` 往已有目录里加卡之前，按同一个判据
+/// 镜像现有的卡去校验整个目录（`setup_engine::write_added`）。
+pub(crate) fn is_card_file(path: &Path) -> bool {
+    matches!(
+        path.extension().and_then(|e| e.to_str()),
+        Some("yaml") | Some("yml")
+    )
+}
+
 fn is_mock_card(card: &ComponentCard) -> bool {
     card.provider.id == "mock"
 }
@@ -119,12 +128,7 @@ pub fn load_components(dir: &Path, allow_mock_env: bool) -> Result<Vec<Component
     let mut paths: Vec<_> = read_dir
         .filter_map(|entry| entry.ok())
         .map(|entry| entry.path())
-        .filter(|path| {
-            matches!(
-                path.extension().and_then(|e| e.to_str()),
-                Some("yaml") | Some("yml")
-            )
-        })
+        .filter(|path| is_card_file(path))
         .collect();
     paths.sort();
 

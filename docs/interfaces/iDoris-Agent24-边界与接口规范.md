@@ -6,6 +6,8 @@
 >
 > **文档修订 1.6 勘误二（S4 验收定案，不改 wire，2026-11-21）**：§2.7.6（3）托管引擎的模型目录取 iDoris 运行用户的 `~/.omlx/models` 并显式传 `--model-dir`（取代勘误一里「不给就用自有 base 下的默认模型目录」的口径），`setup` 对该路径校验绝对路径与逗号；§2.7.8 `--auto` 与 `--api-key-stdin` 互斥，#619 落地之后可放宽；`--auto --managed` 找到外部 oMLX 就采纳，已确认。
 >
+> **文档修订 1.6 勘误三（`setup upstream` 最小版回填，不改 wire，2026-11-21）**：§2.7.8 本来写明「以 v0.6.0 发版时的实现为准并回填」的几处，按实现写进 `setup upstream` 一节：`--out-dir` 是已有的组件目录（加一张卡、不动别的文件）、`--id` 的格式与缺省值、`--force` 的替换范围、`--default` 的卡面效果、`--bind` 接受的角色、输出 JSON 与新增错误码；另记一处与卡契约的出入：回环主机的写法。不改任何已冻结字段，不改 wire。
+>
 > **文档修订 1.5，2026-11-19**：只改状态说法，不改契约内容。§2.9 中的推荐接口、本地模型列表和 oMLX 密钥顺序已在 iDoris v0.5.0 实现，wire 契约 1.2.0 随该版本生效；§2.9 的下载部分仍未实现，接口形状待另行修订。
 >
 > **文档修订 1.4，2026-11-15**：owner 要求装了 oMLX 的机器首次启动时按硬件自动选默认 chat 模型，由 iDoris 负责推荐。新增 §2.9（本机 chat 模型推荐、本地模型类别与下载，拟议 wire 1.2.0，只新增），档位表由 owner 拍板，iDoris 与 Agent24 两个会话各确认一次。iDoris 侧推荐、本地模型列表与密钥顺序已在 v0.5.0 实现（见修订 1.5）；下载部分仍未实现。
@@ -361,11 +363,20 @@ idoris setup upstream --kind openai_compat --endpoint <loopback-url> --out-dir <
                       --bind role=model [--id <provider-id>] [--default]
 ```
 
-- **只 loopback**：`--endpoint` 的主机必须是回环地址（`127.0.0.0/8`、`::1` 或字面量 `localhost`），否则拒绝，不写卡。局域网与远程上游需要隐私等级、egress 计数与同意流程，不在 v0.6.0（§2.2 修订 1.6 增补）。
+- **只 loopback**：`--endpoint` 的主机必须是回环地址（`127.0.0.0/8`、`::1` 或字面量 `localhost`），否则拒绝，不写卡。局域网与远程上游需要隐私等级、egress 计数与同意流程，不在 v0.6.0（§2.2 修订 1.6 增补）。**实现口径（回填）**：v0.6.0 只接受 `127.0.0.1`、`[::1]`、`localhost` 三种写法：卡契约声明 `locality: loopback` 的卡，endpoint 主机只能是这三种（`idoris-policy` 的回环主机白名单），`127.0.0.2` 这样的写法写出来的卡在启动时就加载不了，所以在 `setup` 里就按 `invalid_endpoint` 拒绝；`127.0.0.0/8` 里的其余地址随卡契约的白名单以后一并放宽。`--endpoint` 的协议是 http 或 https，不含路径（写 `http://127.0.0.1:1234`，不带 `/v1`）、凭据、查询与片段。
 - **无 key**：不接受任何密钥参数，生成的卡不带凭据；需要密钥的上游等 vault 接线之后另行修订。
 - **只 chat**：`--bind` 只接受 chat 类角色，不能绑定 `embed` 等其他角色（embedding 由 `setup omlx` 的伴生卡承载，§2.3）。
 - **探测**：写卡之前 `GET <endpoint>/v1/models`（不带凭据），要求 200 且 JSON 里有 `data` 数组；连不上或形状不符就报错，不写卡。
 - 生成的卡是 resident 的 HTTP 卡，`extensions.idoris_upstream: {kind: openai_compat, flavor: openai_compat}`（§2.3），`engine_kind` 为 `openai_compat`；`--id` 缺省值、`--default` 的卡面效果（`extensions.idoris_default`，选择语义仍是预留，§2.12.3）和输出 JSON 的字段，以 v0.6.0 发版时的实现为准并回填本节，既有 `setup omlx` 的错误码与形状不受影响。
+- **回填（取自 v0.6.0 的实现，2026-11-21；规范没写处取最保守的一边，上面各条不变）**：
+  - **卡面**：`privacy_class: local_only`、`allowed_egress: [loopback]`、`fail_closed`、`fallback_policy: fail_closed`、免费（`cost` 为 0）、能力只有 `chat`、`load_policy` 为 `resident` 加 `keepalive.pinned: true` 加 `admission: coexist`；`version_pin` 为 `openai_compat@unknown`（产品名等于种类名，§2.3）；`extensions` 带 `idoris_upstream`、`idoris_role_models` 与 `_degradation`。除这些标注与 `version_pin` 外，与 Agent24 在 v0.5.0 上手写并实测的 LM Studio 卡逐字段相同，所以行为等价；差别只有 `engine_kind`：这张卡是 `openai_compat`，手写卡写 `lmstudio@0` 得到的是 `lmstudio`。
+  - **`--out-dir`** 是已有的组件目录（不存在就创建），写 `<id>.yaml` 这一个文件，目录里别的文件原样不动；落盘前把「现有的卡加新卡」放进暂存目录，用服务启动时同一个加载器校验整个目录：别的文件里已有同一个 `provider.id`、现有的卡本身加载不了，都不写，`--out-dir` 不变。与 `setup omlx` 不同，目录不必为空。
+  - **`--id`**：卡的 `provider.id`，也是文件名 `<id>.yaml`。取值 `[a-z0-9][a-z0-9_-]{0,47}`，不得是 `omlx`、`omlx-embed`、`mock`、`subscription`、`idoris-cloud`（前两个是 `setup omlx` 的卡的 id，不能被占用：v0.5.0 按 `provider.id == "omlx"` 注入 oMLX 的 key；后三个在加载时有特殊含义：`mock` 被跳过，`subscription` 有固定的卡边界，`idoris-cloud` 是云端档合成卡的 id）。缺省 `<种类>-<端口>`，如 `openai_compat-1234`：同一个端点每次得到同一个 id。
+  - **`--force`**：同名卡（`<id>.yaml`）已经在时才需要，替换的只有这一个文件，且它得是普通文件；别的文件里已经有同一个 `provider.id` 时，`--force` 也不能覆盖（`id_conflict`）。同一条命令加 `--force` 重新生成，文件逐字节相同。
+  - **`--default`**：卡带 `extensions.idoris_default: true`（布尔真；不给就没有这个键）。至多一张卡带它：目录里已经有别的默认卡时拒绝（`validation_failed`，说明里点名那张卡），要换默认，先把旧的默认卡不带 `--default` 重新生成（`--force`）。选择语义仍是预留（§2.12.3）：v0.6.0 的路由不读这个键，带不带它，请求落到哪张卡都一样。
+  - **`--bind`**：至少一个，且只接受 chat 类角色 `fast`、`daily`、`deep`、`decide`、`auto`；`vision`、`embed`、`rerank` 报 `invalid_role`；同一个角色只能绑一次（命令行是用法错误，库入口报 `invalid_role`）。所绑模型要在探测到的列表里，否则 `model_not_found`。
+  - **输出 JSON**：`setup omlx` 的全部字段，另加 `id`、`card_file`（`<id>.yaml`）、`default`（这次写出的卡有没有带 `idoris_default`）。`mode` 恒为 `"adopt"`，`auth` 恒为 `"none"`，`engine` 是 `{engine_kind: "openai_compat", installed: false, executable: null}`（这种上游没有可执行文件的概念，是否可用看探测，不看 `installed`）。
+  - **错误码**：沿用 `invalid_endpoint`、`invalid_role`、`unreachable`、`auth_required`（上游对不带凭据的探测回 401 / 403）、`model_not_found`、`out_dir_not_empty`（`--out-dir` 不是目录）、`validation_failed`、`write_failed`；新增 `not_openai_compatible`（`GET /v1/models` 的响应不是 200 加带 `data` 数组的 JSON，每一项要有字符串 `id`，响应体上限 2 MiB，不跟随重定向）、`id_conflict`（同名卡已在而没有 `--force`，或别的文件里已有同一个 `provider.id`）、`invalid_id`。用法错误（缺必选旗标、`--kind` 不是 `openai_compat`、没有 `--bind`、出现本命令没有的旗标如 `--api-key-stdin`）与 `setup omlx` 一样，退出码 1、stderr 给用法说明、stdout 为空。
 
 #### 2.7.9 布局与不承诺（已冻结）
 
