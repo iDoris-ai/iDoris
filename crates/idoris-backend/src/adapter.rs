@@ -49,6 +49,20 @@ pub trait RuntimeAdapter: Send + Sync {
     /// must return the same path across process restarts for the same engine.
     fn load_fence_path(&self) -> Result<std::path::PathBuf, BackendError>;
 
+    /// The engine **generation** the credentials this adapter would use *right now* belong to (IDORIS-CORE
+    /// S6; see [`crate::generation`]). `None` — the default — means this adapter has no notion of
+    /// generations (its credentials do not follow an engine that can be replaced), and nothing is bound.
+    ///
+    /// The Supervisor reads this once per admitted operation, in its single-writer loop, and runs the
+    /// whole operation inside [`crate::generation::pinned_generation`]'s scope. An implementation that
+    /// returns `Some` promises to refuse — **before sending anything** — any request made while
+    /// `pinned_generation()` is `Some(g)` and `g` is no longer the generation it would return now: work
+    /// admitted for an engine process that has since been replaced must never carry the new process's
+    /// credentials (nor its request body).
+    fn engine_generation(&self) -> Option<u64> {
+        None
+    }
+
     /// Every model this engine instance *could* route to, whether or not it
     /// is currently loaded (mirrors `/v1/models`'s "list routable models"
     /// semantics per `docs/research/Rust基础选型-2026-09-27.md` §4).

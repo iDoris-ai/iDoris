@@ -143,6 +143,18 @@ enum Command {
         sample: bool,
         reply: LoadReply,
     },
+    /// Stop admitting new work — see [`SupervisorHandle::close_admission`].
+    Close {
+        reply: LoadReply,
+    },
+    /// Admit new work again — see [`SupervisorHandle::reopen_admission`].
+    Reopen {
+        reply: LoadReply,
+    },
+    /// Is nothing in flight? — see [`SupervisorHandle::is_quiescent`].
+    Quiescent {
+        reply: oneshot::Sender<Result<bool, BackendError>>,
+    },
 }
 
 /// What a background op reports to the single-writer loop; only the loop
@@ -245,6 +257,9 @@ enum ActiveKind {
         /// (state is already `Stopping`, blocking *new* chats) until
         /// `ActorMsg::ChatDone` observes `inflight` reach 0 and flips this.
         started: bool,
+        /// The engine generation this unload was admitted under (see [`crate::generation`]); a deferred
+        /// start must still run under it, not under whatever generation is current when the chats drain.
+        generation: Option<u64>,
     },
 }
 
@@ -389,6 +404,44 @@ impl SupervisorHandle {
     pub async fn engine_replaced(&self, sample: bool) -> Result<(), BackendError> {
         let (reply, rx) = oneshot::channel();
         self.send(ActorMsg::Cmd(Command::Reset { sample, reply }))
+            .await?;
+        rx.await
+            .map_err(|_| BackendError::supervisor_unavailable())?
+    }
+
+    /// Stop admitting new work (IDORIS-CORE S6): from the moment this returns, a `load`, `unload`,
+    /// `chat` or `list` is answered [`BackendError::SupervisorUnavailable`] without touching the adapter
+    /// or the ledger. Work already admitted **keeps running** to its end (against the engine process it
+    /// was admitted for, with that process's credentials): wait for it with [`Self::is_quiescent`]. `status`
+    /// and `is_ready` still answer from the ledger. Idempotent.
+    ///
+    /// Whoever owns the engine's lifecycle calls this **before** it stops, replaces or abandons the engine
+    /// process (the order is close, drain, stop, reset, reopen), so that no operation can be admitted for a
+    /// process that is going away, and none is still running when the next one starts. It is the one gate
+    /// every path funnels through (Admin, chat, warm-up all reach the engine through this actor's `load`
+    /// and `chat`); the HTTP layer's own state check is only a courtesy in front of it.
+    pub async fn close_admission(&self) -> Result<(), BackendError> {
+        let (reply, rx) = oneshot::channel();
+        self.send(ActorMsg::Cmd(Command::Close { reply })).await?;
+        rx.await
+            .map_err(|_| BackendError::supervisor_unavailable())?
+    }
+
+    /// Admit new work again, after [`Self::close_admission`] — **after** [`Self::engine_replaced`] has
+    /// rebuilt the ledger for the process that is there now. Idempotent.
+    pub async fn reopen_admission(&self) -> Result<(), BackendError> {
+        let (reply, rx) = oneshot::channel();
+        self.send(ActorMsg::Cmd(Command::Reopen { reply })).await?;
+        rx.await
+            .map_err(|_| BackendError::supervisor_unavailable())?
+    }
+
+    /// `true` iff nothing is in flight: no load or unload is active and no chat is running. (The same
+    /// predicate [`Self::engine_replaced`] insists on.) Only meaningful as "drained" while admission is
+    /// closed — otherwise new work can start the next instant.
+    pub async fn is_quiescent(&self) -> Result<bool, BackendError> {
+        let (reply, rx) = oneshot::channel();
+        self.send(ActorMsg::Cmd(Command::Quiescent { reply }))
             .await?;
         rx.await
             .map_err(|_| BackendError::supervisor_unavailable())?
@@ -1064,6 +1117,9 @@ struct Env<'a> {
     aggregate_covered: HashMap<String, f64>,
     runtime_capacity: Option<StartupCapacityTracking>,
     startup_error: Option<BackendError>,
+    /// [`SupervisorHandle::close_admission`]: refuse every new `load`, `unload`, `chat` and `list` (work already
+    /// admitted keeps running). Open at start; closed and reopened only by the engine's lifecycle owner.
+    admission_closed: bool,
 }
 
 impl Env<'_> {
@@ -1360,6 +1416,11 @@ fn start_load(
     // though `run_load_flow`'s own `victim_results` was lost with its
     // panicking stack frame (Medium, Opus Tier-2 review — see below).
     let evict_for_panic_fallback = evict.clone();
+    // Bound to the engine generation in force at admission (this runs in the same loop turn as the
+    // admission): everything the load flow asks of the adapter — victims' unloads, the status polls,
+    // `load`, the OOM back-off and retry, the readiness probes — is refused by an adapter that resolves
+    // credentials per request once the engine has been replaced. See [`crate::generation`].
+    let generation = env.adapter.engine_generation();
     tokio::spawn(async move {
         // `run_load_flow` runs as its OWN spawned task so a panic inside it
         // (an adapter implementation bug) is isolated to that task — tokio
@@ -1367,18 +1428,21 @@ fn start_load(
         // unwinding straight through this outer task and skipping the
         // `OpDone` send below. Without this, a single panicking adapter
         // call would leave `active_op` set forever (llama-swap Issue #946).
-        let inner = tokio::spawn(run_load_flow(
-            adapter,
-            config,
-            LoadFlowContext {
-                release_limits,
-                inherited,
-                load_fence,
-            },
-            id_for_task.clone(),
-            policy,
-            evict,
-            previous,
+        let inner = tokio::spawn(crate::generation::scoped(
+            generation,
+            run_load_flow(
+                adapter,
+                config,
+                LoadFlowContext {
+                    release_limits,
+                    inherited,
+                    load_fence,
+                },
+                id_for_task.clone(),
+                policy,
+                evict,
+                previous,
+            ),
         ));
         let _ownership = ownership;
         let outcome = match inner.await {
@@ -1651,7 +1715,7 @@ fn handle_load(
 }
 
 /// Standalone unloads also confirm release before freeing ledger capacity.
-fn start_unload(id: String, max_used_gb: f64, env: &Env<'_>) {
+fn start_unload(id: String, max_used_gb: f64, env: &Env<'_>, generation: Option<u64>) {
     let adapter = env.adapter.clone();
     let self_tx = env.self_tx.clone();
     let config = env.config.clone();
@@ -1660,7 +1724,7 @@ fn start_unload(id: String, max_used_gb: f64, env: &Env<'_>) {
         // Same panic-isolation shape as `start_load` — see its doc comment.
         let id_for_inner = id.clone();
         let inner_ownership = ownership.clone();
-        let inner = tokio::spawn(async move {
+        let inner = tokio::spawn(crate::generation::scoped(generation, async move {
             let _ownership = inner_ownership;
             with_adapter_timeout(
                 adapter.unload(&id_for_inner),
@@ -1669,7 +1733,7 @@ fn start_unload(id: String, max_used_gb: f64, env: &Env<'_>) {
             )
             .await?;
             confirm_memory_released(&adapter, &[id_for_inner], max_used_gb, &config).await
-        });
+        }));
         let (result, status) = match inner.await {
             Ok(Ok(status)) => (Ok(()), Some(status)),
             Ok(Err(err)) => (Err(err), None),
@@ -1750,18 +1814,28 @@ fn handle_unload(
     // `ActorMsg::ChatDone`, which will call it once `inflight` reaches 0.
     set_state_or_panic(models, &id, ModelState::Stopping);
     let inflight = models.get(&id).map_or(0, |s| s.inflight);
+    // Bound to the engine generation in force now (admission): a start deferred until the chats drain
+    // still runs under it.
+    let generation = env.adapter.engine_generation();
     *active_op = Some(ActiveOp {
         id: id.clone(),
         kind: ActiveKind::Unload {
             waiters: vec![reply],
             started: inflight == 0,
+            generation,
         },
     });
     if inflight == 0 {
         let max_used_gb =
             ledger_used_except(models, &id) + env.effective_reserved_gb_except(models, Some(&id));
-        start_unload(id, max_used_gb, env);
+        start_unload(id, max_used_gb, env, generation);
     }
+}
+
+/// Nothing is in flight: no load or unload is active and no chat is running. The one predicate behind
+/// both [`SupervisorHandle::is_quiescent`] and the guard of [`handle_reset`].
+fn is_quiescent(models: &HashMap<String, ModelSlot>, active_op: &Option<ActiveOp>) -> bool {
+    active_op.is_none() && models.values().all(|slot| slot.inflight == 0)
 }
 
 /// An engine-resident model the Supervisor did not load itself (it was already in the process when the
@@ -2002,6 +2076,7 @@ async fn run_actor(
         startup_error: load_fence_error
             .or(startup_capacity_error)
             .or_else(|| startup.err()),
+        admission_closed: false,
     };
 
     while let Some(msg) = rx.recv().await {
@@ -2030,10 +2105,36 @@ async fn run_actor(
                     Command::Reset { reply, .. } => {
                         let _ = reply.send(Err(BackendError::invariant_violation(msg)));
                     }
+                    Command::Close { reply } | Command::Reopen { reply } => {
+                        let _ = reply.send(Err(BackendError::invariant_violation(msg)));
+                    }
+                    Command::Quiescent { reply } => {
+                        let _ = reply.send(Err(BackendError::invariant_violation(msg)));
+                    }
                 }
             }
 
+            // Admission control (IDORIS-CORE S6): never guarded by `startup_error` (a latched ledger is
+            // still closed and reopened), and `Quiescent` is a plain read of the ledger.
+            ActorMsg::Cmd(Command::Close { reply }) => {
+                env.admission_closed = true;
+                let _ = reply.send(Ok(()));
+            }
+
+            ActorMsg::Cmd(Command::Reopen { reply }) => {
+                env.admission_closed = false;
+                let _ = reply.send(Ok(()));
+            }
+
+            ActorMsg::Cmd(Command::Quiescent { reply }) => {
+                let _ = reply.send(Ok(is_quiescent(&models, &active_op)));
+            }
+
             ActorMsg::Cmd(Command::List { reply }) => {
+                if env.admission_closed {
+                    let _ = reply.send(Err(BackendError::supervisor_unavailable()));
+                    continue;
+                }
                 if let Some(err) = &env.startup_error {
                     let _ = reply.send(Err(err.clone()));
                     continue;
@@ -2049,11 +2150,12 @@ async fn run_actor(
                 let adapter = adapter.clone();
                 let timeout = config.adapter_call_timeout;
                 let ownership = load_fence.clone();
-                tokio::spawn(async move {
+                let generation = adapter.engine_generation();
+                tokio::spawn(crate::generation::scoped(generation, async move {
                     let _ownership = ownership;
                     let _permit = permit;
                     let _ = reply.send(with_adapter_timeout(adapter.list(), timeout, "list").await);
-                });
+                }));
             }
 
             ActorMsg::Cmd(Command::Status { reply }) => {
@@ -2098,6 +2200,10 @@ async fn run_actor(
             }
 
             ActorMsg::Cmd(Command::Chat { req, cancel, reply }) => {
+                if env.admission_closed {
+                    let _ = reply.send(Err(BackendError::supervisor_unavailable()));
+                    continue;
+                }
                 if let Some(err) = &env.startup_error {
                     let _ = reply.send(Err(err.clone()));
                     continue;
@@ -2127,6 +2233,10 @@ async fn run_actor(
                         let timeout = config.chat_call_timeout;
                         let self_tx = self_tx.clone();
                         let ownership = load_fence.clone();
+                        // Bound to the engine generation in force at admission: a chat that has not yet
+                        // written its request when the engine is replaced is refused, never sent to the
+                        // new process (see [`crate::generation`]).
+                        let generation = adapter.engine_generation();
                         tokio::spawn(async move {
                             let _ownership = ownership;
                             let _permit = permit;
@@ -2138,15 +2248,16 @@ async fn run_actor(
                             // `active_op` (Critical, Opus Tier-2 review, P6).
                             let model_for_chat = model.clone();
                             let inner_ownership = _ownership.clone();
-                            let inner = tokio::spawn(async move {
-                                let _ownership = inner_ownership;
-                                with_adapter_timeout(
-                                    adapter.chat(req, cancel),
-                                    timeout,
-                                    &model_for_chat,
-                                )
-                                .await
-                            });
+                            let inner =
+                                tokio::spawn(crate::generation::scoped(generation, async move {
+                                    let _ownership = inner_ownership;
+                                    with_adapter_timeout(
+                                        adapter.chat(req, cancel),
+                                        timeout,
+                                        &model_for_chat,
+                                    )
+                                    .await
+                                }));
                             let result = match inner.await {
                                 Ok(result) => result,
                                 Err(join_err) => Err(BackendError::adapter_panicked(
@@ -2170,6 +2281,10 @@ async fn run_actor(
                 allow_headroom_breach,
                 reply,
             }) => {
+                if env.admission_closed {
+                    let _ = reply.send(Err(BackendError::supervisor_unavailable()));
+                    continue;
+                }
                 if let Some(err) = &env.startup_error {
                     let _ = reply.send(Err(err.clone()));
                     continue;
@@ -2187,6 +2302,10 @@ async fn run_actor(
             }
 
             ActorMsg::Cmd(Command::Unload { id, reply }) => {
+                if env.admission_closed {
+                    let _ = reply.send(Err(BackendError::supervisor_unavailable()));
+                    continue;
+                }
                 if let Some(err) = &env.startup_error {
                     let _ = reply.send(Err(err.clone()));
                     continue;
@@ -2404,13 +2523,18 @@ async fn run_actor(
                         if inflight == 0
                             && let Some(active) = active_op.as_mut()
                             && active.id == model
-                            && let ActiveKind::Unload { started, .. } = &mut active.kind
+                            && let ActiveKind::Unload {
+                                started,
+                                generation,
+                                ..
+                            } = &mut active.kind
                             && !*started
                         {
                             *started = true;
+                            let generation = *generation;
                             let max_used_gb = ledger_used_except(&models, &model)
                                 + env.effective_reserved_gb_except(&models, Some(&model));
-                            start_unload(model, max_used_gb, &env);
+                            start_unload(model, max_used_gb, &env, generation);
                         }
                     }
                     None => poisoned = Some(format!("ledger has no entry for {model:?}")),
@@ -4926,6 +5050,7 @@ mod tests {
                 exact_claim: None,
             }),
             startup_error: None,
+            admission_closed: false,
         };
 
         let error = env
